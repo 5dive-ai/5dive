@@ -571,5 +571,21 @@ _grader_spawn_session() {  # <seat> <ident>
     return 2
   fi
   5dive task assign "$ident" "$seat" >/dev/null 2>&1 || return 1
+  # DIVE-4295: guard the wake so a spooled copy is dropped rather than typed if
+  # the row closes or moves to another seat while it waits. `assignee_owns`, not
+  # a verifier clause: this seat is a grading session on a POOL seat, which is
+  # not the row's `verifier` column. Exported through the environment because
+  # this call crosses a process boundary into the `5dive` CLI.
+  #
+  # KNOWN LIMIT, stated rather than left to be discovered: on a SCOPED-sudo
+  # caller `cmd_send` re-execs through `sudo -n ... agent _deliver`
+  # (cmd_agent_runtime.sh:2421) and sudo SCRUBS the environment, so on that path
+  # this variable does not arrive and the wake spools UNGUARDED. It fails in the
+  # safe direction -- unguarded means delivered, which is exactly today's
+  # behaviour, never a new drop -- and the two rails this ticket was filed on
+  # (_hb_stall_sweep (a) and (a4)) call cmd_send IN-PROCESS and are unaffected.
+  # Closing it properly needs an env_keep entry or a new `_deliver` argument, and
+  # a sudoers wildcard is not something to widen inside this change.
+  _A2A_GUARD="task:${ident}:${seat}:assignee_owns" \
   5dive agent send "$seat" "Grade delivered task ${ident}. Read the row, grade the delivery, then run 5dive task done or 5dive task reject. Checkpoint each verified arm to the row as you go." >/dev/null 2>&1
 }

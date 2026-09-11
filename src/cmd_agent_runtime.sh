@@ -1094,7 +1094,7 @@ _a2a_queue_dir() { printf '%s\n' "/home/agent-${1}/.5dive/a2a-queue"; }
 # Append one payload to the target's spool. rc 0 = queued, rc 1 = could not.
 # The filename carries a nanosecond stamp so the flush drains in send order.
 _a2a_queue_put() {
-  local name="$1" payload="$2" dir id tmp dst
+  local name="$1" payload="$2" guard="${3:-}" dir id tmp dst
   dir="$(_a2a_queue_dir "$name")"
   id="$(date +%s%N)-$$-${RANDOM}"
   tmp="${dir}/.${id}.msg.part"
@@ -1107,6 +1107,15 @@ _a2a_queue_put() {
     sudo -u "agent-${name}" rm -f "$tmp" 2>/dev/null || true
     return 1
   }
+  # DIVE-4295: the guard sidecar, written AFTER the .msg is in place. A message
+  # with no sidecar delivers unconditionally (every pre-existing caller), so the
+  # ordering choice is which way a crash between the two writes fails: this way
+  # the message survives and is delivered unguarded; the other way a guard could
+  # outlive a message that no longer exists. Losing the re-check is a stale nag;
+  # losing the message is a rail that went silent.
+  if [[ -n "$guard" ]]; then
+    printf '%s' "$guard" | sudo -u "agent-${name}" tee "${dir}/${id}.guard" >/dev/null 2>&1 || true
+  fi
   return 0
 }
 
@@ -1152,6 +1161,113 @@ _a2a_queued_reason() {
   printf '%s\n' "$base"
 }
 
+# _a2a_guard_holds <guard> — is a SPOOLED message still true at DELIVERY time?
+#
+# DIVE-4295. The task-engine nags assert CURRENT ownership in their own text
+# ("still unacknowledged", "grading is yours"), but a send to a busy seat is
+# SPOOLED (DIVE-4214) and drains one message per idle observation. Measured on
+# quinn's seat 2026-09-11: 18 messages spooled between 07:20 and 08:55, so a
+# predicate that was true when the sweep ran is read out up to an hour later
+# against a row that has since been merged, closed, or bounced back to its
+# maker. The nag is not wrong when it is written; it goes wrong in the spool.
+#
+# WHY THE RE-CHECK LIVES HERE AND NOT IN THE SWEEP. Re-running the sweep's own
+# SELECT more often fixes nothing: the staleness is entirely between the
+# enqueue and the flush, and the flush is the only code that runs at the moment
+# the seat actually reads the message. "Send time" for a queued message is this
+# function, not cmd_send.
+#
+# GRAMMAR (one line, colon-separated): task:<ident>:<seat>:<cond>
+#   verifier_unacked — the (a) delivered-unacked nag. Still true iff the row is
+#     open, still assigned to this seat as its verifier, and still unacked.
+#   verifier_owns    — the (a4) answered-gate nag. Still true iff the row is
+#     open and still assigned to this seat as its verifier. No ack clause: that
+#     rail exists precisely for rows whose ack is already stamped — which is why
+#     it needs the graded clause below explicitly, where verifier_unacked got it
+#     for free.
+#   assignee_owns    — the grader-pool "go grade this" wake. Assignment only,
+#     NO verifier clause: the pool assigns a grading session to a pool seat that
+#     is not the row's `verifier` column, so requiring verifier=seat there would
+#     read false on every healthy row and drop the wake that makes the pool work.
+#
+# EVERY condition additionally drops a row that already carries a verifier
+# verdict for its CURRENT iteration — the third drop condition in the row's DO,
+# reasoned out at the clause itself below.
+#
+# rc 0 = still true, deliver · rc 1 = no longer true, DROP · rc 2 = could not
+# be evaluated.
+#
+# rc 2 IS DELIVERED BY THE CALLER, and that direction is deliberate. A message
+# that cannot be judged is delivered, because the cost of a wrong delivery is
+# one re-investigation while the cost of a wrong drop is permanent: the sweep
+# stamps its throttle column (handoff_stale_pinged_at / gate_answered_nudged_at)
+# at enqueue time, so a dropped nag never fires again for that row. Fail-open on
+# an unreadable board, and log it.
+_a2a_guard_holds() {
+  local guard="$1" kind ident seat cond n
+  declare -F sqlq >/dev/null 2>&1 || return 2
+  IFS=':' read -r kind ident seat cond <<<"$guard"
+  [[ "$kind" == "task" && -n "$ident" && -n "$seat" && -n "$cond" ]] || return 2
+  declare -F db >/dev/null 2>&1 || return 2
+  declare -F sqlq >/dev/null 2>&1 || return 2
+  local extra="" vclause
+  vclause="AND verifier=$(sqlq "$seat")"
+  case "$cond" in
+    assignee_owns) vclause="" ;;
+  esac
+  case "$cond" in
+    verifier_unacked) extra="AND handoff_ack_at IS NULL" ;;
+    verifier_owns)    extra="" ;;
+    assignee_owns)    extra="" ;;
+    *) return 2 ;;
+  esac
+  # THE THIRD DROP CONDITION (DIVE-4295 iteration 2, quinn's reject). The row's
+  # DO lists three: done/cancelled, assignee moved, "or if a verifier result is
+  # already recorded for the current iteration". Iteration 1 implemented the
+  # first two and got the third only ACCIDENTALLY, on the verifier_unacked rail,
+  # via `handoff_ack_at IS NULL` — so the answered-gate rail (verifier_owns)
+  # still nagged a row its own grader had already graded. Measured: at 11:02:15Z
+  # quinn read the answered-gate nag for DIVE-4295 ITSELF ("grading is yours ...
+  # `task start` then `task done`/`task reject`") while the row read
+  # status=in_progress, assignee=quinn, verifier=quinn, handoff_ack_at=10:52:21,
+  # graded_verdict=pass at 10:55:47. Under iteration 1's predicate every clause
+  # passed and it was delivered.
+  #
+  # WHY IT IS NOT DEFENSIBLE TO KEEP NAGGING A GRADED ROW. The close IS still
+  # owed on such a row, so there is an argument for waking someone — but not
+  # this someone with this verb. Both rails tell the seat to run `task start`
+  # then `task done`/`task reject`, which on a row that already carries a
+  # verdict is an instruction to write a SECOND verdict over a first. That is
+  # the exact hazard this ticket was filed on ("a grader who starts trusting
+  # these will eventually re-grade something"). A row waiting on a merge it does
+  # not own is a MERGE-owner problem (merge_owner, DIVE-4137), not a grading
+  # nag, so the right move is silence on this rail rather than a softer verb.
+  #
+  # CURRENT iteration, not "ever graded": handoff_delivered_at is stamped fresh
+  # on EVERY delivery (src/task/delivery.sh), so a verdict older than it belongs
+  # to a previous iteration and must NOT mute the new one — otherwise one grade
+  # would silence the rail for the life of the row. COALESCE picks up a legacy
+  # row graded before graded_verdict_at existed (DIVE-3430); graded_at is
+  # COALESCE'd at write time (first grade wins), so on a re-delivered row it is
+  # older than handoff_delivered_at and correctly does not mute.
+  #
+  # Both NULLs deliver, which is the fail-open direction this whole function
+  # takes: no verdict recorded, or no delivery recorded (a row that never went
+  # through the maker->verifier loop at all), means nothing establishes a
+  # current-iteration verdict and the message is not ours to drop.
+  extra+=" AND (COALESCE(graded_verdict_at, graded_at) IS NULL
+                OR handoff_delivered_at IS NULL
+                OR COALESCE(graded_verdict_at, graded_at) < handoff_delivered_at)"
+  n=$(db "SELECT COUNT(*) FROM tasks
+          WHERE COALESCE(ident,'DIVE-'||id)=$(sqlq "$ident")
+            AND status NOT IN ('done','cancelled')
+            AND assignee=$(sqlq "$seat")
+            ${vclause}
+            ${extra};" 2>/dev/null) || return 2
+  [[ "$n" =~ ^[0-9]+$ ]] || return 2
+  (( n > 0 ))
+}
+
 # Drain ONE spooled message into a seat that is idle right now. One per call on
 # purpose: typing the second message straight after the first would land it
 # inside the turn the first just started, which is the defect this ticket is
@@ -1166,7 +1282,7 @@ _a2a_queued_reason() {
 # would have stopped grading what it names. Renaming here keeps the control
 # pointed at cmd_send rather than widening the control to admit this line.
 a2a_queue_flush_one() {
-  local seat="$1" dir f msg _rc=0 reason i
+  local seat="$1" dir f msg _rc=0 reason i guard grc
   dir="$(_a2a_queue_dir "$seat")"
   # DIVE-4296 iteration 2: the WHOLE spool in delivery order, not just its head.
   # The staleness predicate needs to see what is queued BEHIND a message to spot
@@ -1181,8 +1297,27 @@ a2a_queue_flush_one() {
     f="${files[i]}"
     msg="$(sudo -u "agent-${seat}" cat "$f" 2>/dev/null)" || return 1
     if [[ -z "$msg" ]]; then
-      sudo -u "agent-${seat}" rm -f "$f" 2>/dev/null || return 1
+      sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" 2>/dev/null || return 1
       continue
+    fi
+    # DIVE-4295: the SENDING RAIL'S OWN condition, recorded at enqueue in a
+    # `<id>.guard` sidecar and re-run against the board here. Checked before the
+    # text-derived predicate below because it names the clause the sender
+    # actually asserted instead of re-deriving one from the prose — it is how
+    # `verifier_unacked` can drop a row that is still open AND still assigned to
+    # this seat (already acknowledged), which no ident-and-assignee reading can
+    # see. NO SIDECAR = UNCONDITIONAL, so every pre-existing a2a caller is
+    # byte-identical. Fails OPEN: only an explicit rc 1 (the condition was read
+    # and is false) drops.
+    guard="$(sudo -u "agent-${seat}" cat "${f%.msg}.guard" 2>/dev/null || true)"
+    if [[ -n "$guard" ]]; then
+      grc=0; _a2a_guard_holds "$guard" || grc=$?
+      if (( grc == 1 )); then
+        sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" 2>/dev/null || return 1
+        declare -F _hb_log >/dev/null 2>&1 \
+          && _hb_log "[a2a-queue] ${seat}: dropped a spooled message whose guard no longer holds (${guard})"
+        continue
+      fi
     fi
     # A machine nudge whose statement is no longer true is unlinked, not typed —
     # and the drop does NOT consume the round, because nothing was delivered.
@@ -1190,7 +1325,7 @@ a2a_queue_flush_one() {
     # context that never loaded it must DELIVER, not drop. Fails open by design.
     if declare -F _a2a_stale_nudge_reason >/dev/null 2>&1 \
        && reason="$(_a2a_stale_nudge_reason "$seat" "$msg" "${files[@]:i+1}")"; then
-      sudo -u "agent-${seat}" rm -f "$f" 2>/dev/null || return 1
+      sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" 2>/dev/null || return 1
       if declare -F _hb_log >/dev/null 2>&1; then
         _hb_log "[${seat}] dropped stale spooled nudge (${reason})"
       fi
@@ -1199,7 +1334,7 @@ a2a_queue_flush_one() {
     # Unlink BEFORE typing. A message delivered twice is worse than one lost: the
     # duplicate costs the recipient a second full re-investigation, which is the
     # burn this ticket exists to remove.
-    sudo -u "agent-${seat}" rm -f "$f" 2>/dev/null || return 1
+    sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" 2>/dev/null || return 1
     _A2A_INTERRUPTING=1 inject_and_submit "$seat" "$msg" || _rc=$?
     (( _rc == 0 ))
     return
@@ -1239,7 +1374,12 @@ inject_and_submit() {
   # a seat parked on a login prompt lose a message the spool would have kept.
   # Distinct rc 4 so callers report "queued", never "failed" and never "sent".
   if _a2a_should_queue "$name" "$payload"; then
-    _a2a_queue_put "$name" "$payload" && return 4
+    # DIVE-4295: ${_A2A_GUARD} rides in on the environment rather than as a flag,
+    # matching _A2A_INTERRUPTING above. It is internal plumbing between the
+    # heartbeat's nag sites and the spool, not a CLI surface, and threading it as
+    # an argument would mean a new positional on cmd_send, cmd_ask and _deliver
+    # for a value none of them interpret.
+    _a2a_queue_put "$name" "$payload" "${_A2A_GUARD:-}" && return 4
   fi
   _agent_pane_safe_to_type "$name" || return 3
   # DIVE-4246: COMPOSER HYGIENE, then the payload — the same pair DIVE-4242 gave

@@ -4921,7 +4921,16 @@ _hb_stall_sweep() {
     IFS=$'\x1f' read -r vid vident vfier vdelivered <<<"$vrow"
     [[ -n "$vid" && -n "$vfier" ]] || continue
     vmins=$(( ($(date -u +%s) - $(date -u -d "$vdelivered" +%s 2>/dev/null || date -u +%s)) / 60 ))
-    ( cmd_send "$vfier" --from="task-engine" \
+    # DIVE-4295: the guard is re-read at DELIVERY time, not here. This send is
+    # SPOOLED whenever the verifier is mid-attempt (DIVE-4214) and drains one
+    # message per idle observation, so a sentence asserting "still
+    # unacknowledged" can be typed into the seat an hour after it stopped being
+    # true — measured on quinn 2026-09-11: a nag for a row that had been done
+    # and MERGED for ~50 minutes. _a2a_guard_holds re-runs this rail's own three
+    # clauses (open, still this verifier's, still unacked) against the board at
+    # the moment the seat reads it, and drops the message instead.
+    ( _A2A_GUARD="task:${vident}:${vfier}:verifier_unacked" \
+      cmd_send "$vfier" --from="task-engine" \
         --message="📥 ${vident} was delivered to you for review ${vmins}m ago and is still unacknowledged — run \`5dive task start ${vident}\` then \`task done\`/\`task reject\` so it doesn't rot in your queue." ) >/dev/null 2>&1 || true
     # DIVE-4206 removed the third-seat COPY that used to fire here:
     #
@@ -5218,6 +5227,11 @@ _hb_stall_sweep() {
     # sweep does not re-examine the row every tick, and the log line still records
     # that this arm saw it — what changes is that the DELIVERY is now the tick's
     # dispatch, which is the one mechanism that knows who owns the row NOW.
+    # DIVE-4295 note: this arm's two sends were where "grading is genuinely yours
+    # again" was asserted next to ${gmins}, a figure that measures the GATE'S
+    # ANSWER and never ownership. DIVE-4296 deleted both sends outright, so the
+    # send-time guard this ticket adds has nothing left to guard HERE — the other
+    # two rails (a, a4) and the grader-pool wake carry it.
     db "UPDATE tasks SET gate_answered_nudged_at=datetime('now') WHERE id=${gid};"
     _hb_log "[stall-sweep] ${gident} gate answered ${gmins}m ago, back on ${gfier} -> left to the queue (no a2a; DIVE-4296)"
   done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||verifier||x'1f'||need_answered_at
