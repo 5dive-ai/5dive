@@ -646,8 +646,32 @@ _task_status_cmd() {
       # permanently unclosable, since the "only '$_vfier' can grade it" exit
       # requires a grader the customer has declined to pay for. The guard is
       # unchanged wherever a grader IS granted, which is every row on our fleet.
+      # DIVE-4261: A GRADED ROW IS NOT AN UNGRADED ONE. This guard reads only
+      # the DELIVERY tokens, so it fired identically on a row that had already
+      # been graded PASS and was sitting at graded->merge waiting for its merge
+      # owner to press the button -- and told that owner the row "has NOT been
+      # graded" and that only the verifier may close it, which is false twice
+      # over: the grade exists, and `task merge` refuses anyone but the grader
+      # ("graded by X, not by you"). DIVE-4253 landed in exactly that corner on
+      # 2026-09-10 -- PR #864 merged 23:12Z, the grade recorded, and neither the
+      # maker, the merge owner nor main could close the row, which then kept the
+      # GRADER busy-skipped for the next hour (the other half of this ticket).
+      # The grader's press is moot once the delivery is merged, so the merge
+      # OWNER may close it.
+      #
+      # This removes no evidence requirement. The exemption is narrow -- the
+      # same graded-and-bound predicate the board, the picker and the busy guard
+      # read, plus actor == that row's merge owner -- and the DIVE-1830 merge
+      # gate below is untouched, so the close still has to prove the pull
+      # request actually reached main. An unmerged row refuses there, citing the
+      # rule that is actually stopping it.
+      local _gm_owner=''
+      _gm_owner=$(db "SELECT COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
+                                      COALESCE(assignee,'?'))
+                        FROM tasks WHERE id=${id} AND (${_TASKS_TFV_SQL});" 2>/dev/null || true)
       if [[ -n "$_maker" && "$_actor" != "$_vfier" && "$_actor" != "cli" \
-            && "$_st" != "done" && "$_st" != "cancelled" ]] \
+            && "$_st" != "done" && "$_st" != "cancelled" \
+            && ! ( -n "$_gm_owner" && "$_gm_owner" == "$_actor" ) ]] \
          && _task_verify_grants "$id"; then
         policy_refuse "$E_CONFLICT" done-over-delivered-loop DIVE-2007 "$ident" \
           "$ident is DELIVERED to verifier '${_vfier}' (iteration ${_iter}, maker '${_maker}') and has NOT been graded — a 'task done' from '${_actor}' would close it ungraded, which is the maker grading its own work (writer != grader, DIVE-477). Only '${_vfier}' can grade it. To CORRECT the result text do NOT re-run done: send the correction to '${_vfier}' (5dive agent send ${_vfier} \"...\") and let them fold it in. Real exits: '5dive task reject $ident --feedback="FINDING/FIX/VERIFY"' (verifier bounces it back), '5dive task verify $ident --no-done --cmd=\"<acceptance test>\"' (record machine evidence and hold at graded->merge), or '5dive task cancel $ident --result=...' (abandon)."

@@ -5599,8 +5599,36 @@ cmd_heartbeat_tick() {
         sk_notdue=$((sk_notdue + 1)); _hb_log "[$name] not due ($(( (lastRun + everyMin*60 - now + 59) / 60 ))m left)"; continue
       fi
     fi
+    # DIVE-4261 — A GRADE THIS SEAT CANNOT MERGE IS NOT WORK IN PROGRESS.
+    # After `task verify` PASS the row stays status=in_progress with
+    # assignee=<the grader>, and the merge is owed by a different seat (the
+    # board paints it graded->merge:<owner>). Counted raw, every such row reads
+    # as this seat being busy, so a grader holding one grade it has already
+    # passed is busy-skipped on EVERY tick until some other seat presses the
+    # button -- measured 2026-09-11 00:55-01:05Z, quinn logged
+    # "busy -- 1 in_progress, skip" each tick while sitting at an empty prompt
+    # with 4 graded->merge rows and nothing it could act on; ops the same hour.
+    # That is the maker-side wedge DIVE-4206 fixed, arriving from the grader
+    # side: there the reclaimer drops the stale claim, but a GRADER's claim is
+    # not stale -- it is the record of who graded -- so it must not be
+    # reclaimed, only discounted here.
+    #
+    # SCOPED TO OTHER SEATS' MERGES, exactly like the picker clause and the
+    # reclaimer's merge_elsewhere column: when the owner IS this seat the merge
+    # is its next move, the picker will hand the row back, and it is correctly
+    # busy. The owner expression is the board's, character for character, so
+    # the busy guard, the picker and the board cannot disagree about whose move
+    # a row is.
+    #
+    # NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT -- the whole statement
+    # below is one double-quoted bash string (the trap already recorded on the
+    # picker and reclaimer queries).
     local inprog
-    inprog=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null || echo 0)
+    inprog=$(db "SELECT COUNT(*) FROM tasks
+                  WHERE assignee=$(sqlq "$name") AND status='in_progress'
+                    AND NOT ( (${_TASKS_TFV_SQL})
+                              AND COALESCE(NULLIF(merge_owner,''), NULLIF(maker_agent,''),
+                                           COALESCE(assignee,'?')) <> $(sqlq "$name") );" 2>/dev/null || echo 0)
     if [[ "${inprog:-0}" != "0" ]]; then
       sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"; continue
     fi
