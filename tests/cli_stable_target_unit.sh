@@ -15,7 +15,10 @@ if [[ -n "$block" ]] && grep -q 'resolve_cli_target()' <<<"$block"; then ok "sta
 else bad "stable resolver is missing"; echo "$PASS passed, $FAIL failed"; exit 1; fi
 
 handoff="$(sed -n '/^[[:space:]]*# >>> DIVE-4140 stable installer handoff/,/^[[:space:]]*# <<< DIVE-4140 stable installer handoff/p' src/cmd_selfupdate.sh)"
-if [[ -n "$handoff" ]] && grep -q 'CLI_VERSION_URL=' <<<"$handoff" \
+# DIVE-4256 iteration 2: anchor on the ROUTE, not the presence of the var — a presence
+# grep passes on a repointed literal, which is the value this arm exists to protect.
+if [[ -n "$handoff" ]] \
+   && grep -q 'CLI_VERSION_URL="${CLI_VERSION_URL:-https://api.5dive.com/cli-version}"' <<<"$handoff" \
    && grep -q 'bash "$installer" --upgrade' <<<"$handoff"; then
   ok "self-update installer handoff is extractable from src/cmd_selfupdate.sh"
 else
