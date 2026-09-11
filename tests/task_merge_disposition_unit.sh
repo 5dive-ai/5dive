@@ -591,6 +591,12 @@ eq "F9b ...and the reason survives intact" \
 #   M11  the add-vs-removal comparison deleted (any removal reads EJECTED)
 #                                                          killed 1 arm  (G5)
 #   M12  `_gate_mq_note` UNKNOWN arm -> the NEVER wording   killed 1 arm  (G16)
+#   M13  the whole reason `case` reverted to the order-only removal arm this
+#        iteration replaced (any trailing removal reads EJECTED)
+#                             killed 6 arms (G4, G21, G22, G25, G26, G27)
+#   M14  the unrecognised-reason case -> EJECTED   killed 3 arms (G4, G25, G26)
+#   M15  `_gate_mq_note`'s MERGED arm reworded with the EJECTED sentence
+#                                                          killed 1 arm  (G22)
 # M9 and M12 are the polarity this section exists to protect, in the two places
 # it can be lost: an unreadable read must never classify as, or READ as, "nobody
 # pressed merge" (DIVE-2318 — an unreached question printed as a measured no).
@@ -607,19 +613,19 @@ eq "G1  a live entry                     -> QUEUED at its position" \
    "QUEUED|1|AWAITING_CHECKS" "$(_gate_mq_classify "$(mq 1 1 AWAITING_CHECKS "$T1" '' '')")"
 eq "G2  isInMergeQueue true, entry unreadable under this scope -> still QUEUED" \
    "QUEUED|?|state-unread" "$(_gate_mq_classify "$(mq 1 '' '' "$T1" '' '')")"
-eq "G3  added, then REMOVED, no entry    -> EJECTED with the time and the reason" \
-   "EJECTED|$T2|the merge group failed required checks" \
-   "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'the merge group failed required checks')")"
-eq "G4  ...and a removal GitHub gave no reason for still EJECTS" \
-   "EJECTED|$T2|reason not stated by GitHub" \
+eq "G3  added, then REMOVED for failed_checks, no entry -> EJECTED, time and reason" \
+   "EJECTED|$T2|failed_checks" \
+   "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'failed_checks')")"
+eq "G4  ...and a removal GitHub stated NO reason for is NOT an ejection — UNKNOWN" \
+   "UNKNOWN|removal-reason-unrecognised" \
    "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" '')")"
 eq "G5  RE-ENQUEUED after an eviction (add is LATER than the removal) -> not ejected" \
    "ENQUEUED|2026-09-11T19:05:00Z" \
-   "$(_gate_mq_classify "$(mq 0 '' '' 2026-09-11T19:05:00Z "$T2" 'over budget')")"
+   "$(_gate_mq_classify "$(mq 0 '' '' 2026-09-11T19:05:00Z "$T2" 'failed_checks')")"
 eq "G6  no add event has ever existed    -> NEVER ENQUEUED" \
    "NEVER" "$(_gate_mq_classify "$(mq 0 '' '' '' '' '')")"
 eq "G7  a removal with no add at all (history truncated) -> still EJECTED, not NEVER" \
-   "EJECTED|$T2|over budget" "$(_gate_mq_classify "$(mq 0 '' '' '' "$T2" 'over budget')")"
+   "EJECTED|$T2|failed_checks" "$(_gate_mq_classify "$(mq 0 '' '' '' "$T2" 'failed_checks')")"
 
 # --- THE POLARITY. An unreached question is never a measured no. ---
 eq "G8  EMPTY payload                    -> UNKNOWN, never NEVER" \
@@ -637,19 +643,19 @@ _gate_gh() { [[ -n "$GH_RAW" ]] && printf '%s' "$GH_RAW"; return "$GH_RC"; }
 eq "G12 the ONE gh read fails             -> UNKNOWN (the read is the only input)" \
    "UNKNOWN|queue-state-unreadable" \
    "$(_gate_pr_queue_state "https://github.com/o/r/pull/897" tok "o/r")"
-GH_RAW="$(mq 0 '' '' "$T1" "$T2" 'over budget')"; GH_RC=0
+GH_RAW="$(mq 0 '' '' "$T1" "$T2" 'failed_checks')"; GH_RC=0
 eq "G13 the read ANSWERS with an eviction -> EJECTED, through the live leaf" \
-   "EJECTED|$T2|over budget" \
+   "EJECTED|$T2|failed_checks" \
    "$(_gate_pr_queue_state "https://github.com/o/r/pull/897" tok "o/r")"
 eq "G14 a bare PR number resolves the same way" \
-   "EJECTED|$T2|over budget" "$(_gate_pr_queue_state "897" tok "o/r")"
+   "EJECTED|$T2|failed_checks" "$(_gate_pr_queue_state "897" tok "o/r")"
 
 # --- the WORDING, because both call sites (the DIVE-1830 close refusal and
 #     `task show`'s merge_queue line) render through this one function, and a
 #     NOT-MEASURED that reads like a NEVER is the defect with a new coat. ---
-case "$(_gate_mq_note "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'over budget')")")" in
-  *EJECTED*"$T2"*"over budget"*) ok_t "G15 the ejected note names WHEN and WHY" ;;
-  *) bad_t "G15 the ejected note names WHEN and WHY" "got: $(_gate_mq_note "EJECTED|$T2|over budget")" ;;
+case "$(_gate_mq_note "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'failed_checks')")")" in
+  *EJECTED*"$T2"*failed_checks*) ok_t "G15 the ejected note names WHEN and WHY" ;;
+  *) bad_t "G15 the ejected note names WHEN and WHY" "got: $(_gate_mq_note "EJECTED|$T2|failed_checks")" ;;
 esac
 _g16=$(_gate_mq_note "UNKNOWN|queue-state-unreadable")
 if [[ "$_g16" == *"NOT MEASURED"* && "$_g16" != *"NEVER ENQUEUED"* ]]; then
@@ -682,6 +688,58 @@ if grep -q 'FIVE_TASK_SHOW_QUEUE' "$SRC/task/crud.sh"; then
 else
   bad_t "G20 ...and that read is fenced and switchable off" "no fence in src/task/crud.sh"
 fi
+
+# --- G21-G27  THE REASON, NOT THE ORDER (iteration 1, quinn's finding).
+#     A SUCCESSFUL MERGE ALSO EMITS RemovedFromMergeQueueEvent — with
+#     reason=merged. Deciding EJECTED on add-vs-removal ORDER therefore reported
+#     the PR that LANDED as thrown out, and `task show`'s fence (merge_owner set
+#     + row open + a pull URL, blind to PR state) reaches that window in
+#     production: 24 minutes of merged-but-not-yet-closed on DIVE-4299.
+#
+#     The payloads below are the LIVE ones ops read off 5dive-ai/5dive on
+#     2026-09-11, so these arms are the canned-payload harness's answer to the
+#     one class of fixture it could not invent for itself. #897 carries one
+#     removal of EACH kind, so the ejection arm and its inverse sit on the same
+#     pull request.
+#
+#     Mutants driven by hand against the shipped classifier:
+#       M13  the `merged)` case deleted (falls to the failed_checks arm)
+#                                                       killed 2 arms (G21, G22)
+#       M14  the `*)` unrecognised case -> EJECTED       killed 2 arms (G24, G25)
+P897_MERGED="$(mq 0 '' '' 2026-09-11T19:01:41Z 2026-09-11T19:42:26Z merged)"
+P897_EJECT="$(mq 0 '' '' 2026-09-11T18:15:27Z 2026-09-11T19:00:30Z failed_checks)"
+P894_EJECT="$(mq 0 '' '' 2026-09-11T18:21:00Z 2026-09-11T19:00:56Z failed_checks)"
+
+GH_RAW="$P897_MERGED"; GH_RC=0
+eq "G21 #897's real removal reason=merged -> MERGED, NOT ejected (through the leaf)" \
+   "MERGED|2026-09-11T19:42:26Z" \
+   "$(_gate_pr_queue_state "https://github.com/5dive-ai/5dive/pull/897" tok "5dive-ai/5dive")"
+_g22=$(_gate_mq_note "$(_gate_pr_queue_state "https://github.com/5dive-ai/5dive/pull/897" tok "5dive-ai/5dive")")
+if [[ "$_g22" == *"MERGED at 2026-09-11T19:42:26Z"* && "$_g22" == *"LANDED"* \
+      && "$_g22" != *EJECTED* && "$_g22" != *unmerged* ]]; then
+  ok_t "G22 ...and the note a merge owner reads says it landed, never ejected/unmerged"
+else
+  bad_t "G22 ...and the note a merge owner reads says it landed, never ejected/unmerged" "got: $_g22"
+fi
+GH_RAW="$P897_EJECT"; GH_RC=0
+eq "G23 the SAME pull request's earlier removal, reason=failed_checks -> EJECTED" \
+   "EJECTED|2026-09-11T19:00:30Z|failed_checks" \
+   "$(_gate_pr_queue_state "https://github.com/5dive-ai/5dive/pull/897" tok "5dive-ai/5dive")"
+GH_RAW="$P894_EJECT"; GH_RC=0
+eq "G24 #894, the budget eviction this row was filed on -> EJECTED" \
+   "EJECTED|2026-09-11T19:00:56Z|failed_checks" \
+   "$(_gate_pr_queue_state "https://github.com/5dive-ai/5dive/pull/894" tok "5dive-ai/5dive")"
+eq "G25 a reason outside the observed enum -> UNKNOWN, never an ejection" \
+   "UNKNOWN|removal-reason-unrecognised" \
+   "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'dequeued_by_a_human')")"
+_g26=$(_gate_mq_note "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'dequeued_by_a_human')")")
+if [[ "$_g26" == *"NOT MEASURED"* && "$_g26" != *EJECTED* && "$_g26" != *"NEVER ENQUEUED"* ]]; then
+  ok_t "G26 ...and it RENDERS as NOT MEASURED — not an ejection and not a never-pressed"
+else
+  bad_t "G26 ...and it RENDERS as NOT MEASURED — not an ejection and not a never-pressed" "got: $_g26"
+fi
+eq "G27 the enum arrives upper-cased -> still MERGED, not 'unrecognised'" \
+   "MERGED|$T2" "$(_gate_mq_classify "$(mq 0 '' '' "$T1" "$T2" 'MERGED')")"
 
 printf '\n%s\n' "----------------------------------------------------------"
 printf 'PASS=%s FAIL=%s\n' "$PASS" "$FAIL"

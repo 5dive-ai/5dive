@@ -1106,6 +1106,16 @@ cmd_task_show() {
     # including NOT MEASURED — an omitted line is how "we did not look" becomes
     # indistinguishable from "there is nothing there", which is the defect this
     # whole row is against.
+    #
+    # STATE-BLIND ON PURPOSE, and that is a decision (DIVE-4337 iteration 1).
+    # This fence reads merge_owner + open row + a pull URL and nothing about the
+    # pull request's own state, so it fires during the merged-but-not-yet-closed
+    # window — 24 minutes on DIVE-4299. That window is the one where the owner
+    # most needs an answer, so the fix is not to hide the line there: it is that
+    # `_gate_mq_classify` reads `reason` and says MERGED, which renders as "it
+    # landed, close the row". A reason-blind classifier would have said EJECTED
+    # here, and fencing on PR state would only have hidden that bug instead of
+    # removing it.
     if [[ "${FIVE_TASK_SHOW_QUEUE:-1}" != "0" ]] && declare -F _gate_pr_queue_state >/dev/null 2>&1; then
       local _mq_dref _mq_own _mq_st
       _mq_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id} AND COALESCE(merge_owner,'')<>'' AND status NOT IN ('done','cancelled');" 2>/dev/null || printf '')

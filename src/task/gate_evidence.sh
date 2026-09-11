@@ -1787,11 +1787,29 @@ readonly _GATE_MQ_JQ='
 # _gate_mq_classify <us-joined-fields> -> one machine token:
 #
 #   QUEUED|<position>|<entry-state>   in the queue right now
-#   EJECTED|<when>|<reason>           enqueued, then removed, and NOT re-enqueued
+#   MERGED|<when>                     removed because IT LANDED (reason=merged)
+#   EJECTED|<when>|<reason>           removed UNMERGED by the queue (reason=failed_checks)
 #   ENQUEUED|<when>                   an add with no entry and no later removal -
 #                                     the race window, deliberately not EJECTED
 #   NEVER                             no add event has ever been recorded
 #   UNKNOWN|<why>                     nothing was measured; never a negative
+#
+# THE REASON DECIDES, NOT THE ORDER (DIVE-4337 iteration 1, quinn). A SUCCESSFUL
+# MERGE ALSO EMITS `RemovedFromMergeQueueEvent` - with `reason=merged`. So "the
+# last queue event is a removal" is not ejection: on #897 three of six removals
+# across the sampled PRs were merges, and #897 itself carries one of each
+# (19:00:30Z failed_checks, then 19:42:26Z merged). Deciding on add-vs-removal
+# ORDER reported the PR that LANDED as thrown out - a false record about merge
+# state, the exact class this row exists to end. The order test still runs first
+# (a re-enqueue after a removal is ENQUEUED whatever the removal said), but the
+# verdict for a trailing removal comes from `reason` alone.
+#
+# AND AN UNRECOGNISED REASON IS NOT AN EJECTION EITHER. The observed enum is
+# `failed_checks` and `merged` (ops, live read, 2026-09-11); anything else -
+# including the empty string GitHub gives when it states no reason - is
+# UNKNOWN|removal-reason-unrecognised and RENDERS as NOT MEASURED. Same fail-safe
+# direction as the rest of this classifier: a value we cannot read must never be
+# printed as a measured claim about what happened to the merge.
 #
 # PURE, and that is the whole point of the split: UNKNOWN must be reachable in a
 # harness with no network, because an unreadable queue read rendered as NEVER is
@@ -1816,7 +1834,14 @@ _gate_mq_classify() {
   # Not a member. These are ISO-8601 UTC strings from one API, so they compare
   # correctly AS STRINGS - which is why no date parsing happens here.
   if [[ -n "$rmv" && ( -z "$add" || ! "$add" > "$rmv" ) ]]; then
-    printf 'EJECTED|%s|%s' "$rmv" "${why:-reason not stated by GitHub}"; return 0
+    # The removal is the last queue event. WHICH removal it is, is `reason`.
+    # Lowercased first: the observed values are lowercase, but this is a GraphQL
+    # field and an upper-case enum must not silently become "unrecognised".
+    case "${why,,}" in
+      merged)        printf 'MERGED|%s' "$rmv"; return 0 ;;
+      failed_checks) printf 'EJECTED|%s|%s' "$rmv" "$why"; return 0 ;;
+      *)             printf 'UNKNOWN|removal-reason-unrecognised'; return 0 ;;
+    esac
   fi
   [[ -n "$add" ]] && { printf 'ENQUEUED|%s' "$add"; return 0; }
   printf 'NEVER'
@@ -1830,6 +1855,7 @@ _gate_mq_note() {
   case "$tok" in
     QUEUED\|*)   a="${tok#QUEUED|}"; b="${a#*|}"; a="${a%%|*}"
                  printf 'MERGE QUEUE: QUEUED at position %s (%s) - it is pressed and waiting, so nobody owes this row an action yet.' "$a" "$b" ;;
+    MERGED\|*)   printf 'MERGE QUEUE: MERGED at %s - the queue removed it because IT LANDED, not because it was thrown out. `reason=merged` on the removal event; a successful merge and a merge-group eviction are BOTH RemovedFromMergeQueueEvent, and only the reason separates them (DIVE-4337). Nothing is owed here but closing the row.' "${tok#MERGED|}" ;;
     EJECTED\|*)  a="${tok#EJECTED|}"; b="${a#*|}"; a="${a%%|*}"
                  printf 'MERGE QUEUE: EJECTED at %s - %s. It WAS enqueued and the queue removed it unmerged, which leaves no trace on the pull request (DIVE-4337): every other field here reads exactly as it would had it never been pressed. A merge group prices `main@HEAD + this PR`, re-sharded, so a head that was green can still red in the queue on a time budget or on another PR in the same group. Re-enqueue it, or read the merge-group run before charging this to the diff.' "$a" "$b" ;;
     ENQUEUED\|*) printf 'MERGE QUEUE: an ADD was recorded at %s with no live entry and no removal - read it again in a moment; this is the window between the add and the entry appearing.' "${tok#ENQUEUED|}" ;;
