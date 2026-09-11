@@ -4537,7 +4537,16 @@ _hb_stall_sweep() {
     IFS=$'\x1f' read -r vid vident vfier vdelivered <<<"$vrow"
     [[ -n "$vid" && -n "$vfier" ]] || continue
     vmins=$(( ($(date -u +%s) - $(date -u -d "$vdelivered" +%s 2>/dev/null || date -u +%s)) / 60 ))
-    ( cmd_send "$vfier" --from="task-engine" \
+    # DIVE-4295: the guard is re-read at DELIVERY time, not here. This send is
+    # SPOOLED whenever the verifier is mid-attempt (DIVE-4214) and drains one
+    # message per idle observation, so a sentence asserting "still
+    # unacknowledged" can be typed into the seat an hour after it stopped being
+    # true — measured on quinn 2026-09-11: a nag for a row that had been done
+    # and MERGED for ~50 minutes. _a2a_guard_holds re-runs this rail's own three
+    # clauses (open, still this verifier's, still unacked) against the board at
+    # the moment the seat reads it, and drops the message instead.
+    ( _A2A_GUARD="task:${vident}:${vfier}:verifier_unacked" \
+      cmd_send "$vfier" --from="task-engine" \
         --message="📥 ${vident} was delivered to you for review ${vmins}m ago and is still unacknowledged — run \`5dive task start ${vident}\` then \`task done\`/\`task reject\` so it doesn't rot in your queue." ) >/dev/null 2>&1 || true
     # DIVE-4206 removed the third-seat COPY that used to fire here:
     #
@@ -4815,9 +4824,23 @@ _hb_stall_sweep() {
     IFS=$'\x1f' read -r gid gident gfier ganswered <<<"$grow"
     [[ -n "$gid" && -n "$gfier" ]] || continue
     gmins=$(( ($(date -u +%s) - $(date -u -d "$ganswered" +%s 2>/dev/null || date -u +%s)) / 60 ))
-    ( cmd_send "$gfier" --from="task-engine" \
-        --message="✅ ${gident}: the human gate that was blocking it was ANSWERED ${gmins}m ago, so grading is genuinely yours again — nothing is waiting on a person. Pick it back up: \`5dive task start ${gident}\` then \`task done\`/\`task reject\` (DIVE-2207)." ) >/dev/null 2>&1 || true
-    ( cmd_send "ops" --from="task-engine" \
+    # DIVE-4295 — TWO changes, and the wording one is not cosmetic.
+    #
+    # (i) The guard, as on (a) above. Measured on quinn 2026-09-11: this exact
+    # message arrived for a row quinn had already GRADED and rejected to dev2,
+    # i.e. one that was neither theirs nor waiting.
+    #
+    # (ii) "grading is genuinely yours again" is gone. ${gmins} measures the age
+    # of the GATE'S ANSWER and nothing else; the ownership clause it was welded
+    # to was never computed from ownership at all, which is how a post-reject row
+    # got described as genuinely yours. The number now sits only on the clause it
+    # actually measures, and the ownership claim is underwritten by the
+    # send-time guard rather than asserted next to an unrelated figure.
+    ( _A2A_GUARD="task:${gident}:${gfier}:verifier_owns" \
+      cmd_send "$gfier" --from="task-engine" \
+        --message="✅ ${gident}: the human gate that was blocking it was ANSWERED ${gmins}m ago — nothing is waiting on a person, and the row is still assigned to you for grading. Pick it back up: \`5dive task start ${gident}\` then \`task done\`/\`task reject\` (DIVE-2207)." ) >/dev/null 2>&1 || true
+    ( _A2A_GUARD="task:${gident}:${gfier}:verifier_owns" \
+      cmd_send "ops" --from="task-engine" \
         --message="✅ Answered-gate delivery: ${gident} is back on verifier '${gfier}' — its gate was answered ${gmins}m ago and the row had left gap#2's view, so it is surfaced here rather than sitting invisible (DIVE-2207)." ) >/dev/null 2>&1 || true
     db "UPDATE tasks SET gate_answered_nudged_at=datetime('now') WHERE id=${gid};"
     _hb_log "[stall-sweep] ${gident} gate answered ${gmins}m ago, back on ${gfier} -> surfaced"
