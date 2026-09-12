@@ -237,7 +237,13 @@ probe_gh_do 1 genuine-failure-from-root-gh
 grep -q "printf '%s\\\\0' \"\$@\" | sudo -n /usr/local/bin/5dive _gh_do" "$SRC/cmd_gh.sh" \
   && ok_t "cmd_gh hands argv to _gh_do over STDIN, never argv" \
   || bad_t "cmd_gh hands argv over STDIN" "no NUL-separated stdin handoff found"
-grep -q 'GH_TOKEN="$tok" GITHUB_TOKEN="" gh "${args\[@\]}"' "$SRC/cmd_gh.sh" \
+# DIVE-4341 widened this from a literal to a regex: a THIRD assignment (GH_CONFIG_DIR)
+# now sits in the same prefix, and pinning the exact byte sequence would have made any
+# added env var read as "the token moved into argv". What the arm is actually about is
+# unchanged and still pinned — GH_TOKEN is an ASSIGNMENT PREFIX on the gh call and the
+# arguments come from the array, so neither the token nor the argv appears in the
+# process table any other way.
+grep -qE 'GH_TOKEN="\$tok" GITHUB_TOKEN=""( [A-Za-z_][A-Za-z0-9_]*="[^"]*")* gh "\$\{args\[@\]\}"' "$SRC/cmd_gh.sh" \
   && ok_t "_gh_do passes the token as an env prefix, never in argv" \
   || bad_t "_gh_do passes the token as an env prefix" "token not applied as an environment prefix"
 # A missing sudo grant must be told apart from a failed gh call. sudo exits 1 for
