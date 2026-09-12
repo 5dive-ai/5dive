@@ -145,6 +145,20 @@ grep -qF 'of 1 tap,' <<<"$L7" \
   && ok_t "T7 one tap reads 'of 1 tap,' not 'of 1 taps,'" \
   || bad_t "T7 plural" "got: $L7"
 
+# --- T8 DIVE-4346 iteration 3: a DERIVED capability is never reported as a
+# declaration. A floor hit now derives the class and stores it, and a derived
+# class is a GUESS read out of the ask's wording — counting it as "named" would
+# hide exactly the mis-classification the split exists to make countable.
+printf '[{"cap":"human_tap","derived":0,"n":1},{"cap":"spend_authority","derived":1,"n":1},{"cap":"","derived":0,"n":1}]\n' > "$TMP/capd.json"
+L8=$(ratio_line "$TMP/tasks.json" "$TMP/capd.json")
+grep -qF "1 named a capability, 1 named none (1 derived from the ask's wording, not declared)" <<<"$L8" \
+  && ok_t "T8 a derived capability is rendered apart from a declared one" \
+  || bad_t "T8 derived split" "got: $L8"
+# CONTROL: a board with no derived taps must not carry the parenthetical at all.
+grep -qF "derived from the ask" <<<"$L" \
+  && bad_t "T8b no derived taps renders no derived clause" "got: $L" \
+  || ok_t "T8b a window with no derived taps says nothing about derivation"
+
 printf '\ndigest_tap_ratio_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 SUMMARY_PRINTED=1
 [[ "$FAIL" -eq 0 ]]
