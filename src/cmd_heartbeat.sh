@@ -2813,17 +2813,39 @@ _hb_quota_park_until_seat() {
   local row cls sigts deadline base_epoch
   # ORDER BY id, not ts: two observations can share a second and `id` is the
   # only total order the table guarantees.
+  local dl_ep
   row=$(db "SELECT classification || '|' || ts || '|' ||
+                   COALESCE(json_extract(signals, '\$.signals.quotaDeadlineEpoch'), '') || '|' ||
                    COALESCE(json_extract(signals, '\$.signals.quotaDeadline'), '')
               FROM supervisor_events
              WHERE agent=$(sqlq "$name")
              ORDER BY id DESC LIMIT 1;" 2>/dev/null) || return 0
   [[ -n "$row" ]] || return 0
   cls="${row%%|*}"; row="${row#*|}"
-  sigts="${row%%|*}"; deadline="${row#*|}"
+  sigts="${row%%|*}"; row="${row#*|}"
+  dl_ep="${row%%|*}"; deadline="${row#*|}"
   [[ "$cls" == "quota-exhausted" ]] || return 0
-  # A deadline the wall named and we can parse: park to it plus one tick.
-  if [[ -n "$deadline" && "$deadline" != "unknown" && "$deadline" != "null" ]]; then
+  # DIVE-4328 — THE WALL'S OWN RESET TIME, and it is the FIRST question asked.
+  # Until this row the only stored column was the one above, which holds the
+  # three-state parse (live/lapsed/unknown) and never a time — so the `date -d`
+  # below could not succeed on any input the supervisor has ever written, and
+  # every park on this box silently took the 6h fallback. A fallback rebased on
+  # the newest observation does not expire while the pane keeps rendering the
+  # same dead refusal: codex held DIVE-4290 for 5h past a reset time its own
+  # wall had printed and the supervisor had already parsed.
+  #
+  # A PAST EPOCH IS AN ANSWER, NOT AN ABSTENTION. It is returned exactly as a
+  # future one is, so `_hb_quota_parked` reads `now >= until` and the park is
+  # over — that is the whole self-un-parking half of this fix. Falling through
+  # to the 6h cap on a lapsed deadline would be the wedge again, one branch
+  # further down.
+  if [[ "$dl_ep" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$(( dl_ep + everyMin * 60 ))"; return 0
+  fi
+  # Back-compat, and only that: events written BEFORE this row carry no epoch
+  # column. If the string one ever holds something `date` can read, honour it.
+  if [[ -n "$deadline" && "$deadline" != "unknown" && "$deadline" != "null" \
+        && "$deadline" != "live" && "$deadline" != "lapsed" ]]; then
     local dl_epoch
     dl_epoch=$(date -u -d "$deadline" +%s 2>/dev/null) || dl_epoch=""
     if [[ "$dl_epoch" =~ ^[0-9]+$ ]]; then
@@ -2888,6 +2910,115 @@ _hb_quota_parked() {
   now=$(date -u +%s)
   (( now < until_epoch )) || return 1
   printf '%s' "$(( (until_epoch - now) / 60 ))"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# DIVE-4328 — A PARK A HUMAN HAS TO END IS NOT A PARK.
+#
+# The two arms in `_hb_reclaim` below HOLD a claim while the seat is walled, and
+# that half worked. What had no owner was the other edge. When the wall's own
+# reset time passes, the claim stops being parked and the seat is an idle
+# process holding an in_progress row nothing is driving — and the claim age the
+# park froze is still on the clock. Measured 2026-09-11 on codex/DIVE-4290: the
+# reset time passed, no tick restarted or woke the seat, and when a human
+# eventually forced a wake the very next tick reaped the row on a `started_at`
+# from before the park.
+#
+# THE PARK IS NOT RECORDED ANYWHERE, AND IT MUST NOT BE. The first cut of this
+# dropped a marker file at park time naming the epoch it ran to. That is a
+# second copy of a fact the record already holds, and a copy is a thing that can
+# be stale — it leaked across scenarios inside a single test run on the first
+# try. Everything needed is already in the seat's newest observation: the
+# classification says a wall was read, the reset epoch (DIVE-4328's new signal)
+# says when it lifts. A park that has ENDED is therefore a derivable state, not
+# a stored one:
+#
+#     newest observation is quota-exhausted
+#   AND it carries a reset time the WALL ITSELF printed
+#   AND that time, plus the one-tick grace the park adds, has passed
+#
+# ONLY A WALL-NAMED TIME. A park that fell to the blind 6h cap
+# (_HB_QUOTA_PARK_FALLBACK_SEC — an unparseable refusal, which is most of them)
+# is NOT un-parked here and its rows keep their clocks. The cap is a guess that
+# the wall is probably over by now; crediting a full fresh budget off a guess is
+# a guess on a guess, and this row's axis is the reset time the wall named. The
+# ordinary rules own those rows exactly as they did before.
+#
+# THE RE-STAMP IS ITS OWN LATCH. It moves only rows whose clock predates the
+# park end, so the tick after it fires matches zero rows and the whole function
+# is a silent no-op — no marker, no column, nothing to keep in sync. A row
+# claimed after the wall lifted keeps its real age for the same reason.
+#
+# RESIDUAL, stated: this reads the seat's OWN observation. DIVE-4206 also parks
+# a seat on a PEER's wall (same auth profile, one readable pane); such a seat is
+# still released by `_hb_quota_parked` on the same deadline, but its clock is
+# not re-stamped here. Fixing that means walking the profile a second time and
+# the peer's deadline is second-hand evidence for a write to this seat's rows.
+#
+# THE COMMON TICK PAYS NOTHING (DIVE-4328 iteration 3). The newest-observation
+# read used to be an unconditional `db` call at the top of every `_hb_reclaim`,
+# i.e. one extra sqlite3 fork per seat per tick on the overwhelmingly common
+# path where no seat is parked at all. `_hb_reclaim` now folds that read into
+# the SAME sqlite invocation it already makes for the seat's rows and hands the
+# answer down as $3 (`_HB_QUOTA_UNPARK_PREFETCHED` says it did), so the cheap
+# predicate below — is this seat quota-exhausted, and does the record carry a
+# wall-named epoch — is decided in bash with no process at all, and a tick with
+# nothing parked spends exactly zero queries here. The two-argument form still
+# queries for itself, so a direct caller keeps the old contract.
+#
+# _HB_UNPARK_RESTAMPED is set on every call: 1 only when this call actually
+# moved a clock, which is the caller's signal that any row ages it read before
+# the un-park are now stale and must be re-read.
+_hb_quota_unpark() {  # <name> <everyMin> [<prefetched record>] — rc is ALWAYS 0; never aborts a tick
+  local name="$1" everyMin="${2:-5}" row cls dl_ep until_epoch now restamped held
+  _HB_UNPARK_RESTAMPED=0
+  if (( $# >= 3 )); then
+    row="$3"
+  else
+    row=$(db "SELECT classification || '|' ||
+                     COALESCE(json_extract(signals, '\$.signals.quotaDeadlineEpoch'), '')
+                FROM supervisor_events
+               WHERE agent=$(sqlq "$name")
+               ORDER BY id DESC LIMIT 1;" 2>/dev/null) || return 0
+  fi
+  [[ -n "$row" ]] || return 0
+  cls="${row%%|*}"; dl_ep="${row#*|}"
+  [[ "$cls" == "quota-exhausted" ]] || return 0
+  [[ "$dl_ep" =~ ^[0-9]+$ ]] || return 0
+  until_epoch=$(( dl_ep + everyMin * 60 ))
+  now=$(date -u +%s)
+  # Still inside the park (including the deliberate one-tick grace that lets the
+  # seat resume on its own before anything is taken off it) — nothing to do.
+  (( now >= until_epoch )) || return 0
+  # (1) the budget clock. A park is time the seat was TOLD not to work; charging
+  # it to the claim is how this invariant failed. `first_started_at` is NOT in
+  # this UPDATE — the board-visible evidence that work started stays where
+  # DIVE-3251 put it, and only the reclaimer's clock moves.
+  restamped=$(db "UPDATE tasks SET started_at=datetime('now'), updated_at=datetime('now')
+                   WHERE assignee=$(sqlq "$name") AND status='in_progress'
+                     AND started_at IS NOT NULL
+                     AND started_at <= datetime(${until_epoch}, 'unixepoch');
+                  SELECT changes();" 2>/dev/null) || restamped=0
+  [[ "$restamped" =~ ^[0-9]+$ ]] || restamped=0
+  # Zero is the steady state, not a failure: either the park was already ended
+  # by an earlier tick, or the seat holds nothing. Silent, and NO wake — a wake
+  # on every tick of a stale observation is the churn this file exists to stop.
+  (( restamped > 0 )) || return 0
+  _HB_UNPARK_RESTAMPED=1
+  _hb_log "[$name] quota park ENDED at the reset time its own wall printed — un-parked by this tick; re-stamped the budget clock on ${restamped} held row(s) so none is reaped on a pre-park claim age (DIVE-4328)"
+  # (2) the wake. Only onto a row the seat is genuinely still holding. `_hb_wake`
+  # is the single choke point that already starts the unit if it is down, waits
+  # for the session and injects the goal — the deliverable's "restart, tick,
+  # wake" is that function, not a second copy of it.
+  held=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='in_progress'
+              ORDER BY COALESCE(started_at, created_at) ASC LIMIT 1;" 2>/dev/null) || held=""
+  [[ "$held" =~ ^[0-9]+$ ]] || return 0
+  if _hb_wake "$name" false "$held" "$(_hb_ident "$held")"; then
+    _hb_log "[$name] un-park woke the seat onto $(_hb_ident "$held") (DIVE-4328)"
+  else
+    _hb_log "[$name] un-park could NOT wake the seat onto $(_hb_ident "$held"): ${_HB_WAKE_FAIL_REASON:-<no reason recorded>} — the claim is un-parked and its clock is fresh either way (DIVE-4328)"
+  fi
   return 0
 }
 
@@ -3079,7 +3210,87 @@ _hb_reclaim() {
   (( budget < _HB_STALE_MIN_MINUTES )) && budget=$_HB_STALE_MIN_MINUTES
   local proc_start; proc_start=$(_hb_claude_started "$name" 2>/dev/null || true)
   local reclaimed=0 escalated=0 id started_epoch age_min awaiting_verifier delivered_live merge_elsewhere
-  while IFS='|' read -r id started_epoch age_min awaiting_verifier delivered_live merge_elsewhere; do
+  # DIVE-4328 iteration 3 — ONE QUERY, NOT TWO. The un-park needs the seat's
+  # newest supervisor observation, and this function was already about to ask
+  # sqlite for the seat's rows. Iteration 2 asked in a second `db` call at the
+  # top of every reclaim, which is an extra sqlite3 fork per seat per tick even
+  # when nothing on the box is parked — the overwhelmingly common case, and one
+  # the corpus pays thousands of times. The observation now rides the SAME
+  # invocation as the rows, tagged with a `Q|` sentinel (a task row always
+  # begins with an integer id, so the two can never be confused), and the
+  # un-park decides in bash from that string. A tick with no parked seat
+  # therefore costs exactly ZERO queries beyond what origin/main already spent.
+  #
+  # THE ROWS ARE ASKED FOR FIRST, and that order is load-bearing rather than
+  # cosmetic: sqlite3 runs the statements in sequence, so if `supervisor_events`
+  # is missing (an old store that predates it) statement 2 fails AFTER the rows
+  # have already been emitted. Put the sentinel first and that same failure
+  # would swallow the row set and silently reclaim nothing.
+  local _rows_sql="SELECT id || '|' ||
+                 strftime('%s', COALESCE(started_at, created_at)) || '|' ||
+                 CAST((julianday('now') - julianday(COALESCE(started_at, created_at))) * 1440 AS INTEGER) || '|' ||
+                 CASE WHEN verifier IS NOT NULL AND verifier = assignee
+                           AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
+                      THEN 1 ELSE 0 END || '|' ||
+                 -- DIVE-4104: a LIVE DELIVERY, which is a different question from
+                 -- the awaiting_verifier flag above and deliberately does not ask who
+                 -- holds the row. The pass is delivered and ungraded; the maker owes
+                 -- nothing. It stays true across a reclaim, and across another writer
+                 -- moving the assignee column off the verifier -- which is precisely
+                 -- the state in which the row must NOT be handed back as buildable.
+                 -- NO BACKTICKS IN THIS COMMENT, and that is not style: the whole
+                 -- statement is one double-quoted bash string, so a backtick here RUNS
+                 -- A COMMAND before sqlite ever sees the SQL. The first cut of this
+                 -- comment quoted two column names that way and every reclaim tick
+                 -- printed 'assignee: command not found' to stderr.
+                 CASE WHEN verifier IS NOT NULL AND maker_agent IS NOT NULL
+                           AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
+                      THEN 1 ELSE 0 END || '|' ||
+                 -- DIVE-4206: graded, bound, and the merge is owed by a seat that
+                 -- is not this one. Same predicate the board paints graded-to-merge
+                 -- with, and the same owner expression, so the reclaimer and the
+                 -- board cannot disagree about whose move a row is. Same two
+                 -- lexical traps as the comment above: no backticks, no double
+                 -- quotes -- either one silently truncates or executes part of
+                 -- this statement.
+                 CASE WHEN (${_TASKS_TFV_SQL})
+                           AND $(_tasks_merge_owner_sql) <> $(sqlq "$name")
+                      THEN 1 ELSE 0 END
+               FROM tasks
+               WHERE assignee=$(sqlq "$name") AND status='in_progress';"
+  local _q_sql="SELECT 'Q|' || classification || '|' ||
+                       COALESCE(json_extract(signals, '\$.signals.quotaDeadlineEpoch'), '')
+                  FROM supervisor_events
+                 WHERE agent=$(sqlq "$name")
+                 ORDER BY id DESC LIMIT 1;"
+  local -a _rows=() _keep=()
+  local _line _qrec=""
+  mapfile -t _rows < <(db "${_rows_sql}
+${_q_sql}" 2>/dev/null || true)
+  for _line in ${_rows[@]+"${_rows[@]}"}; do
+    if [[ "$_line" == 'Q|'* ]]; then _qrec="${_line#Q|}"; else _keep+=("$_line"); fi
+  done
+  _rows=(${_keep[@]+"${_keep[@]}"})
+  # DIVE-4328 — BEFORE any row is judged. A park that ended must end the claim
+  # ages it froze too, and the re-stamp has to land before the budget arm below
+  # reads them: run it after, and the first tick past the wall reaps exactly the
+  # rows the park was protecting (codex/DIVE-4290, reaped one tick after a
+  # forced wake on a pre-park started_at). Guarded — it never aborts a tick.
+  #
+  # An empty `_qrec` is the ordinary answer (no observation, or a store with no
+  # supervisor_events at all) and the third argument still suppresses the query:
+  # "nothing observed" is a complete answer, not a reason to go and ask again.
+  _hb_quota_unpark "$name" "$everyMin" "$_qrec" || true
+  # Only a call that actually MOVED a clock invalidates what we read: the ages
+  # above were computed before the re-stamp, so judging them would reap exactly
+  # the rows the un-park just protected. This is the rare path by construction
+  # (the re-stamp is its own latch), so the second read costs nothing on a tick
+  # that did not un-park anything.
+  if (( ${_HB_UNPARK_RESTAMPED:-0} )); then
+    mapfile -t _rows < <(db "$_rows_sql" 2>/dev/null || true)
+  fi
+  for _line in ${_rows[@]+"${_rows[@]}"}; do
+    IFS='|' read -r id started_epoch age_min awaiting_verifier delivered_live merge_elsewhere <<<"$_line"
     [[ -n "$id" ]] || continue
     # DIVE-4206 — GRADED, AND THE MERGE IS ANOTHER SEAT'S. Recorded here for
     # the log ONLY; the three rules below still run and the row still reclaims.
@@ -3305,38 +3516,7 @@ _hb_reclaim() {
       _hb_reclaim_to_todo "$name" "$id" "idle ${age_min}m with the task still open (claimed then went idle)"
       reclaimed=$((reclaimed + 1)); continue
     fi
-  done < <(db "SELECT id || '|' ||
-                 strftime('%s', COALESCE(started_at, created_at)) || '|' ||
-                 CAST((julianday('now') - julianday(COALESCE(started_at, created_at))) * 1440 AS INTEGER) || '|' ||
-                 CASE WHEN verifier IS NOT NULL AND verifier = assignee
-                           AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
-                      THEN 1 ELSE 0 END || '|' ||
-                 -- DIVE-4104: a LIVE DELIVERY, which is a different question from
-                 -- the awaiting_verifier flag above and deliberately does not ask who
-                 -- holds the row. The pass is delivered and ungraded; the maker owes
-                 -- nothing. It stays true across a reclaim, and across another writer
-                 -- moving the assignee column off the verifier -- which is precisely
-                 -- the state in which the row must NOT be handed back as buildable.
-                 -- NO BACKTICKS IN THIS COMMENT, and that is not style: the whole
-                 -- statement is one double-quoted bash string, so a backtick here RUNS
-                 -- A COMMAND before sqlite ever sees the SQL. The first cut of this
-                 -- comment quoted two column names that way and every reclaim tick
-                 -- printed 'assignee: command not found' to stderr.
-                 CASE WHEN verifier IS NOT NULL AND maker_agent IS NOT NULL
-                           AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
-                      THEN 1 ELSE 0 END || '|' ||
-                 -- DIVE-4206: graded, bound, and the merge is owed by a seat that
-                 -- is not this one. Same predicate the board paints graded-to-merge
-                 -- with, and the same owner expression, so the reclaimer and the
-                 -- board cannot disagree about whose move a row is. Same two
-                 -- lexical traps as the comment above: no backticks, no double
-                 -- quotes -- either one silently truncates or executes part of
-                 -- this statement.
-                 CASE WHEN (${_TASKS_TFV_SQL})
-                           AND $(_tasks_merge_owner_sql) <> $(sqlq "$name")
-                      THEN 1 ELSE 0 END
-               FROM tasks
-               WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null || true)
+  done
   printf '%s %s\n' "$reclaimed" "$escalated"
 }
 
