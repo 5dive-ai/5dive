@@ -123,9 +123,15 @@ LOGICAL="$(sed -e '/>>> DIVE-4350 optional-at-pin download contract/,/<<< DIVE-4
 #   TOLERANT — only two shapes, each STRUCTURALLY proven unable to abort:
 #     T1  the line routes through `fetch_optional_at_pin`, whose contract is
 #         tested arm-by-arm in tests/install_pin_compat_unit.sh;
-#     T2  the curl is the CONDITION of an `if`/`elif` whose whole construct —
-#         to its matching `fi` at the same indentation — contains no `die`, no
-#         `exit` and no `return`. Nothing in it can end the install.
+#     T2  the curl is the CONDITION of an `if`/`elif` whose FAILURE BRANCH is
+#         positively shown to ABSORB the failure: the branch taken when the
+#         download fails (the `then` block when the condition is negated with
+#         `if !`, the `else` block otherwise, and NO `else` block at all means
+#         nothing absorbs it) consists SOLELY of log-only statements —
+#         echo/printf/warn/note/log/`:`/true. Absence of an abort token is NOT
+#         evidence of absorption: `if ! curl …; then _failed=1; fi` followed by
+#         `[[ -n "$_failed" ]] && die` has no abort token inside the construct
+#         and takes the box down two lines later (quinn, iteration 2).
 #
 #   FAIL-CLOSED — graded against the pin:
 #     F1  the result is CAPTURED in a command substitution. The failure is
@@ -158,27 +164,71 @@ printf '%s\n' "$LOGICAL" | awk '
     }
     return 0
   }
-  function construct_aborts(i,   e, k, body) {
-    e = construct_end(i)
-    if (e == 0) return -1          # unresolved structure -> caller fails closed
+  function body_aborts(i, e,   k, body) {
     body = ""
     for (k = i; k <= e; k++) body = body "\n" L[k]
     return (body ~ /(^|[^A-Za-z0-9_])(die|exit|return)([^A-Za-z0-9_]|$)/) ? 1 : 0
+  }
+  # the first `else`/`elif` belonging to THIS construct (same indentation),
+  # i.e. not one of a nested construct. 0 when the construct has none.
+  function top_level_else(i, e,   myind, k) {
+    myind = ind(L[i])
+    for (k = i + 1; k < e; k++) {
+      if (L[k] ~ /^[[:space:]]*$/ || L[k] ~ /^[[:space:]]*#/) continue
+      if (ind(L[k]) != myind) continue
+      if (L[k] ~ /^[[:space:]]*(else|elif)([[:space:];&|)]|$)/) return k
+    }
+    return 0
+  }
+  # every non-blank, non-comment line in [s,e] is a log-only statement.
+  # An EMPTY range is not positive evidence, so it is not absorption.
+  function log_only(s, e,   k, t, seen) {
+    seen = 0
+    for (k = s; k <= e; k++) {
+      t = L[k]
+      if (t ~ /^[[:space:]]*$/ || t ~ /^[[:space:]]*#/) continue
+      if (t ~ /^[[:space:]]*(echo|printf|warn|note|log|:|true)([[:space:]]|$)/) { seen = 1; continue }
+      return 0
+    }
+    return seen
+  }
+  # POSITIVE evidence that an if-construct absorbs the failure of the download.
+  #   1  absorbed  -> T2
+  #   0  failure branch exists but is not log-only (it may escape)
+  #  -1  no else branch: nothing absorbs the failure
+  #  -2  the failure runs into an `elif`: another test, not an absorption
+  function branch_absorbs(i, e,   negated, br, bs, be) {
+    negated = (L[i] ~ /^[[:space:]]*(el)?if[[:space:]]+!/)
+    br = top_level_else(i, e)
+    if (negated) {
+      # failure takes the `then` block: from just after the condition line to
+      # the first else/elif of this construct, or to the `fi`.
+      bs = i + 1
+      be = (br > 0) ? br - 1 : e - 1
+      return log_only(bs, be) ? 1 : 0
+    }
+    if (br == 0) return -1
+    if (L[br] ~ /^[[:space:]]*elif([[:space:];&|)]|$)/) return -2
+    return log_only(br + 1, e - 1) ? 1 : 0
   }
   function captured(l,   p, c) {   # is the curl inside a command substitution?
     p = index(l, "$("); c = index(l, "curl")
     return (p > 0 && c > p)
   }
   function has_abort(l) { return (l ~ /(^|[^A-Za-z0-9_])(die|exit|return)([^A-Za-z0-9_]|$)/) }
-  function classify(i,   l, a) {
+  function classify(i,   l, a, e) {
     l = L[i]
     if (l ~ /fetch_optional_at_pin/)                 return "tolerant\tT1 helper"
     if (captured(l))                                 return "closed\tF1 captured in $(…); failure deferred"
     if (l ~ /^[[:space:]]*(el)?if[[:space:]]/) {
-      a = construct_aborts(i)
-      if (a == 0)                                    return "tolerant\tT2 if-construct cannot abort"
-      if (a == 1)                                    return "closed\tF2 if-construct dies"
-      return "closed\tF2 if-construct end not resolvable"
+      e = construct_end(i)
+      if (e == 0)                                    return "closed\tF2 if-construct end not resolvable"
+      if (body_aborts(i, e))                         return "closed\tF2 if-construct dies"
+      a = branch_absorbs(i, e)
+      if (a == 1)                                    return "tolerant\tT2 failure branch is log-only"
+      if (a == -1)                                   return "unclassified\tif-construct has no else branch, so nothing absorbs the download failure"
+      if (a == -2)                                   return "unclassified\tthe failure of this if-construct runs into an elif, which tests again rather than absorbing it"
+      return "unclassified\tthe failure branch of this if-construct is not log-only, so the failure may escape to code this construct cannot show"
     }
     if (l ~ /\|\|/) {
       if (has_abort(l))                              return "closed\tF3 || then die/exit/return"
@@ -277,13 +327,13 @@ UNCLASSIFIED_N=0
 if [[ -n "$UNCLASSIFIED" ]]; then
   {
     printf '\n### UNCLASSIFIED download shapes — this job fails on these\n\n'
-    printf 'A `$REPO/…` download that matches neither the tolerant set (the helper, or an `if` construct that cannot abort) nor the fail-closed set has no grounded disposition, and iteration 1 of this guard proved what happens when the ungrounded half is assumed safe: three fail-closed idioms were reported as tolerated and never graded.\n\n'
+    printf 'A `$REPO/…` download that matches neither the tolerant set (the helper, or an `if` construct whose failure branch is log-only) nor the fail-closed set has no grounded disposition, and iteration 1 of this guard proved what happens when the ungrounded half is assumed safe: three fail-closed idioms were reported as tolerated and never graded.\n\n'
   } >> "$SUMMARY"
   while IFS=$'\t' read -r snip why; do
     [[ -n "$snip" ]] || continue
     UNCLASSIFIED_N=$((UNCLASSIFIED_N+1))
     printf 'UNCLASSIFIED - %s\n           (%s)\n' "$snip" "$why"
-    printf '::error file=%s::install-pin-compat cannot classify this `$REPO` download as fail-closed or tolerant: `%s` (%s). It is therefore NOT graded against the fleet pin, and this guard will not report a pass it did not earn. Route it through `fetch_optional_at_pin`, or write the failure handling in a shape the guard recognises (a `||` that dies, or an `if` construct that demonstrably cannot abort).\n' \
+    printf '::error file=%s::install-pin-compat cannot classify this `$REPO` download as fail-closed or tolerant: `%s` (%s). It is therefore NOT graded against the fleet pin, and this guard will not report a pass it did not earn. Route it through `fetch_optional_at_pin`, or write the failure handling in a shape the guard recognises (a `||` that dies, or an `if` construct whose failure branch does nothing but log).\n' \
       "$INSTALL_SH" "$snip" "$why" >&2
     printf -- '- `%s` — %s\n' "$snip" "$why" >> "$SUMMARY"
   done <<< "$UNCLASSIFIED"

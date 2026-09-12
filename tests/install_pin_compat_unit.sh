@@ -198,6 +198,68 @@ else
         "the PR body names {5dive, 5dive.sha256} as the fail-closed set; iteration 1 never checked the second; rc=$rc out=$out"
 fi
 
+echo "# ARMS O-Q — T2 now needs POSITIVE evidence of absorption (quinn, iteration 2)"
+echo "# ARM O — collect-then-check: no abort token INSIDE the construct, dies two lines later"
+mk_install '  curl -fsSL "$REPO/hooks/old.sh" -o "$LIB_DIR/old.sh"
+  if ! curl -fsSL "$REPO/hooks/new.sh" -o "$LIB_DIR/new.sh"; then
+    _failed=1
+  fi
+  [[ -n "${_failed:-}" ]] && die "new.sh missing"'
+out="$(run_guard)"; rc=$?
+if [[ $rc -ne 0 ]] && grep -q 'UNCLASSIFIED' <<<"$out"; then
+  ok_t "ARM O: a failure branch that RECORDS the failure is not absorption — refused, not tolerated"
+else
+  bad_t "ARM O: a failure branch that RECORDS the failure is not absorption — refused, not tolerated" \
+        "this aborts the whole install on a 404 at the pin, which is DIVE-4349 exactly; rc=$rc out=$out"
+fi
+
+echo "# ARM P — the failure branch calls a local aborting function: not the token die/exit/return"
+mk_install '  curl -fsSL "$REPO/hooks/old.sh" -o "$LIB_DIR/old.sh"
+  bail() { echo "fatal: $*" >&2; exit 1; }
+  if ! curl -fsSL "$REPO/hooks/new.sh" -o "$LIB_DIR/new.sh"; then
+    bail "new.sh missing"
+  fi'
+out="$(run_guard)"; rc=$?
+if [[ $rc -ne 0 ]] && grep -q 'UNCLASSIFIED' <<<"$out"; then
+  ok_t "ARM P: a non-log-only failure branch is refused even when it carries no die/exit/return token"
+else
+  bad_t "ARM P: a non-log-only failure branch is refused even when it carries no die/exit/return token" \
+        "an absence-of-token test cannot see bail(); only positive evidence of absorption can; rc=$rc out=$out"
+fi
+
+echo "# ARM Q — no else branch at all: nothing absorbs the failure, so nothing to claim"
+mk_install '  curl -fsSL "$REPO/hooks/old.sh" -o "$LIB_DIR/old.sh"
+  if curl -fsSL "$REPO/hooks/new.sh" -o "$LIB_DIR/new.sh"; then
+    chmod 644 "$LIB_DIR/new.sh"
+  fi'
+out="$(run_guard)"; rc=$?
+if [[ $rc -ne 0 ]] && grep -q 'UNCLASSIFIED' <<<"$out"; then
+  ok_t "ARM Q: an if-construct with no else branch shows no absorption and is refused"
+else
+  bad_t "ARM Q: an if-construct with no else branch shows no absorption and is refused" \
+        "rc=$rc out=$out"
+fi
+
+echo "# ARM R — the REAL pii-guard shape: assignment + nested if inside, log-only else. Still tolerant."
+mk_install '  curl -fsSL "$REPO/hooks/old.sh" -o "$LIB_DIR/old.sh"
+  if curl -fsSL "$REPO/hooks/new.sh" -o "$LIB_DIR/new.sh"; then
+    chmod 644 "$LIB_DIR/new.sh"
+    if _out="$(cat "$LIB_DIR/new.sh" 2>&1)"; then
+      echo "ok ${_out}"
+    else
+      echo "warn: could not read it" >&2
+    fi
+  else
+    echo "warn: not staged this run" >&2
+  fi'
+out="$(run_guard)"; rc=$?
+if [[ $rc -eq 0 ]]; then
+  ok_t "ARM R: absorption is about the failure branch, not about assignments in the body"
+else
+  bad_t "ARM R: absorption is about the failure branch, not about assignments in the body" \
+        "the naive 'body contains an assignment => not tolerant' rule reds install.sh:1332 pii-guard, which is genuinely fail-soft; rc=$rc out=$out"
+fi
+
 cd "$ROOT" || exit 1
 
 # ------------------------------------------- fetch_optional_at_pin, verbatim
