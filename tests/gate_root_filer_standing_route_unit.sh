@@ -213,7 +213,12 @@ cmd_task_need DIVE-3901 --type=approval --ask="$ENG_ASK" --from=olivia >/dev/nul
 # — the fallback must not become a way to launder a hard gate past a person.
 a2_arm() {  # $1=ident $2=label $3=ask $4=extra-flag
   route_reset; seed "$1"; fixture_actor olivia
-  cmd_task_need "$1" --type=approval --ask="$3" ${4:+"$4"} --from=olivia >/dev/null 2>&1
+  # DIVE-4346: the audited escape, applied to the whole A2 family. These arms grade
+  # that the ELIGIBILITY conjunct refuses to route and the gate stays on the human in
+  # its own shape -- an explicit pin, a money ask, a deny-listed provisioning ask, a
+  # non-engineering ask. A declared capability would supply a second, uniform reason
+  # for staying human and the arms would stop discriminating between those four causes.
+  cmd_task_need "$1" --type=approval --ask-ok="fixture: the A2 family grades WHICH conjunct keeps each gate on the human; a declared capability would give all four the same cause and the arms would stop discriminating" --ask="$3" ${4:+"$4"} --from=olivia >/dev/null 2>&1
   [[ "$HUMAN_PINGED" == "1" && "$(route_sent)" == "0" && -z "$(rr_of "$1")" ]] \
     && ok_t "A2 $2 filed by the root stays HUMAN and reaches no agent" \
     || bad_t "A2 $2 stays human" "human=$HUMAN_PINGED sent=$(route_sent) routed_reviewer=$(rr_of "$1") tier=$(tier_of "$1") spy=$(spy_last)"

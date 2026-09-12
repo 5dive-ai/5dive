@@ -27,7 +27,13 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 set -o pipefail
-trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2573: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
+# DIVE-4346: ABORT backstop. A refused FIXTURE kills the harness before its
+# summary, and a harness with no verdict is indistinguishable from one that was
+# never reached -- how three of these produced silence instead of a red.
+# tests/truncation_marker_guard_unit.sh discovers this trap by grep and grades it.
+exec 8>&2
+SUMMARY_PRINTED=0
+trap 'rc=$?; rm -rf "${TMP:-}"; [[ "${SUMMARY_PRINTED:-0}" == 1 ]] || printf "ABORTED - gate_t2_nonce_proof_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2573: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-t2-nonce-proof.XXXXXX)"
@@ -210,7 +216,11 @@ anchor_to marcus
 #     `decision` got nothing, so its answer row had no non-forgeable field at all.
 # --------------------------------------------------------------------------------------
 seed_task DIVE-506 "pick the rollout order"
-cmd_task_need DIVE-506 --type=decision --tier=2 --options="A|B" --recommend=A \
+# DIVE-4346: --needs=human_tap is the HONEST declaration, not an escape. S10 needs a
+# genuine hard-human tier-2 decision to prove the mint happens on that shape, and a
+# hard-human gate consumes a human capability by definition. Nonce minting is decided
+# on type and tier, so the declaration does not move what this arm measures.
+cmd_task_need DIVE-506 --type=decision --tier=2 --options="A|B" --recommend=A --needs=human_tap \
   --rubber-stamp-ok="fixture: this case needs a tier-2 decision to prove it mints a nonce (DIVE-2848 cap)" \
   --ask="which rollout order" --from=dev >/dev/null 2>&1
 [[ "$(tierof DIVE-506)" == "2" && -n "$(hashof DIVE-506)" ]] \
@@ -382,7 +392,7 @@ out=$(cmd_task_answer DIVE-506 --value=A --from=main --human --human-proof="$T2_
 #     ever true by accident of who ran it. That is what the pin above now establishes.)
 # --------------------------------------------------------------------------------------
 seed_task DIVE-508 "pick the rollout order"
-cmd_task_need DIVE-508 --type=decision --tier=2 --options="A|B" \
+cmd_task_need DIVE-508 --type=decision --tier=2 --needs=human_tap --options="A|B" \
   --ask="which rollout order" --from=dev >/dev/null 2>&1
 SAVED_UID="$SUDO_UID"; export SUDO_UID=0   # root: a real, non-agent uid
 _gate_is_root() { return 0; }
@@ -417,7 +427,7 @@ agent_caller_on                            # back to the AGENT pin for S16/S17 b
 #     to "has a nonce" rather than to the tier.
 # --------------------------------------------------------------------------------------
 seed_task DIVE-509 "pick the rollout order"
-cmd_task_need DIVE-509 --type=decision --tier=2 --options="A|B" \
+cmd_task_need DIVE-509 --type=decision --tier=2 --needs=human_tap --options="A|B" \
   --ask="which rollout order" --from=dev >/dev/null 2>&1
 db "UPDATE tasks SET human_nonce_hash=NULL WHERE ident='DIVE-509';"   # the pre-fix row shape
 out=$(cmd_task_answer DIVE-509 --value=A --from=main --human 2>&1); rc=$?
@@ -430,7 +440,7 @@ out=$(cmd_task_answer DIVE-509 --value=A --from=main --human 2>&1); rc=$?
 #     than value.
 # --------------------------------------------------------------------------------------
 seed_task DIVE-510 "pick the rollout order"
-cmd_task_need DIVE-510 --type=decision --tier=2 --options="A|B" \
+cmd_task_need DIVE-510 --type=decision --tier=2 --needs=human_tap --options="A|B" \
   --ask="which rollout order" --from=dev >/dev/null 2>&1
 assert_agent_caller S17
 out=$(cmd_task_answer DIVE-510 --value=A --from=main --human --human-proof="$(printf '0%.0s' {1..32})" 2>&1); rc=$?
@@ -462,7 +472,7 @@ out=$(cmd_task_answer DIVE-510 --value=A --from=main --human --human-proof="$(pr
 _af_reset 2>/dev/null || true
 seed_task DIVE-520 "rotate the prod signing key"
 out=$( _human_nonce_mint() { return 1; }
-       cmd_task_need DIVE-520 --type=decision --tier=2 --options="A|B" \
+       cmd_task_need DIVE-520 --type=decision --tier=2 --needs=human_tap --options="A|B" \
          --ask="which rollout order" --from=dev 2>&1 ); rc=$?
 [[ $rc -ne 0 ]] \
   && ok_t "M2 a tier-2 gate whose nonce cannot be minted REFUSES to file (rc=$rc)" \
@@ -489,13 +499,14 @@ out=$( _human_nonce_mint() { return 1; }
 #    this, an M2 that passed because `cmd_task_need` is broken for every tier-2 gate
 #    would be indistinguishable from one that passed for the right reason.
 seed_task DIVE-522 "rotate the prod signing key"
-out=$(cmd_task_need DIVE-522 --type=decision --tier=2 --options="A|B" \
+out=$(cmd_task_need DIVE-522 --type=decision --tier=2 --needs=human_tap --options="A|B" \
         --ask="which rollout order" --from=dev 2>&1); rc=$?
 [[ $rc -eq 0 && -n "$(hashof DIVE-522)" ]] \
   && ok_t "M4 the SAME gate with a working mint files and stores a hash (M2 is not vacuous)" \
   || bad_t "M4 non-vacuity" "rc=$rc hash='$(hashof DIVE-522)' out=$out"
 
 printf '\n%s\n' "-----------------------------------------------"
+SUMMARY_PRINTED=1
 printf 'DIVE-2233 item 2 — tier-2 nonce: mint, emit, verify: %d passed, %d failed\n' "$PASS" "$FAIL"
 rc=0; [[ $FAIL -eq 0 ]] || rc=1
 exit "$rc"
