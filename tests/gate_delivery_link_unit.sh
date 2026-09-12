@@ -29,6 +29,16 @@
 #          Both sites get a NEGATIVE arm: a row with no delivery_ref must render
 #          byte-identically to before — no orphan line, no empty line.
 #
+#   R1-R5  THE RE-NAG BATCH (_hb_gate_renag_batch_one, DIVE-1490's +1h/24h
+#          reminder) — the THIRD composer, found on iteration 1's bounce. It is
+#          the path this row's motivation describes best: a gate that has SAT is
+#          when "which PR was this?" gets asked. It was invisible to a grep for
+#          `_task_gate_ask_line` because it inlines substr(ask,1,240) instead.
+#          Because the loop renders MANY rows in ONE message, these arms prove
+#          PER-ROW attachment, not mere presence: R4/R5 drive a MIXED batch (one
+#          row with a URL, one without) and require exactly ONE link, inside the
+#          right row's bullet block.
+#
 #   T1-T2  THE TYPE RULE, taken deliberately on this row and graded so a later
 #          narrowing is a visible choice rather than a drift. The line is keyed
 #          on the row holding a bound PR, NOT on the gate's type: a decision gate
@@ -53,7 +63,8 @@ TMP="$(mktemp -d /tmp/gate-delivery-link.XXXXXX)"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_agent.sh \
+         cmd_heartbeat.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -222,6 +233,87 @@ _task_need_notify_deliver DIVE-9404 secret "hand over the credential" "" "" "" "
 [[ "$CAPTURED" == *"🔗 Review: ${PR_URL}"* && "$CAPTURED" == *"credential"* ]] \
   && ok_t "T2 a SECRET gate keeps its credential CTA and gains the review link" \
   || bad_t "T2 a SECRET gate keeps its credential CTA and gains the review link" "text: ${CAPTURED:0:400}"
+
+# ============ R: THE RE-NAG BATCH (the third composer) =======================
+# Driven through the REAL _hb_gate_renag_batch_one. Only its EDGES are stubbed —
+# the paired-channel precondition and the send sink — never the text it builds.
+RENAG_T="$TMP/renag.txt"
+_task_agent_channel() { TASK_CH_TYPE=claude; TASK_CH_TOKEN=x; TASK_CH_ACCESS=/dev/null; TASK_CH_AGENT=t; return 0; }
+_task_send_gate_owner() { printf '%s' "$1" >"$RENAG_T"; TASK_SEND_DELIVERED=1; TASK_SEND_MESSAGE_IDS="901"; return 0; }
+_hb_log() { :; }
+
+seed_renag() { # <ident> <need_type> <delivery_ref> <recommend>
+  db "INSERT INTO tasks (ident, title, status, priority, assignee, created_by, need_type,
+                         tier, ask, recommend, need_options, delivery_ref, need_asked_at)
+      VALUES ($(sqlq "$1"),'t','blocked','high','dev','main',$(sqlq "$2"),2,
+              'look at this and decide', $(sqlq "$4"), 'A|B',
+              $( [[ -n "${3:-}" ]] && sqlq "$3" || printf 'NULL'), datetime('now','-2 hours'));"
+}
+run_renag() { # <comma-separated row ids>
+  : >"$RENAG_T"
+  _hb_gate_renag_batch_one main "$1" "test" >/dev/null 2>&1
+  cat "$RENAG_T" 2>/dev/null
+}
+# The batch is ONE message holding N bullets. Presence of the link in that blob
+# says nothing about WHICH row it decorates, so every R assertion is made against
+# the slice of the message belonging to one bullet: from its own `• [IDENT]` line
+# up to (not including) the next one.
+bullet_block() { # <text> <ident>
+  printf '%s\n' "$1" | awk -v id="$2" '
+    /^• \[/ { inb = ($0 ~ ("^• \\[" id "\\]")) }
+    inb { print }'
+}
+
+seed_renag DIVE-9405 approval "$PR_URL" "Push it"
+R_URL=$(rid DIVE-9405)
+_rt=$(run_renag "$R_URL")
+[[ "$_rt" == *"🔗 Review: ${PR_URL}"* ]] \
+  && ok_t "R1 the +1h/24h RE-NAG batch carries the bound PR link" \
+  || bad_t "R1 the +1h/24h RE-NAG batch carries the bound PR link" "text: ${_rt:0:500}"
+
+# R2 PLACEMENT inside the bullet: the link is the bullet's FIRST continuation
+# line (directly under `• ... /task_<id>`, above Recommended/Options) and carries
+# the same two-space indent as those lines, so it reads as part of that row.
+_blk=$(bullet_block "$_rt" DIVE-9405)
+_l2=$(printf '%s\n' "$_blk" | sed -n '2p')
+_rec_pos=$(printf '%s\n' "$_blk" | grep -n 'Recommended:' | head -1 | cut -d: -f1)
+[[ "$_l2" == "  🔗 Review: ${PR_URL}" && "${_rec_pos:-0}" -gt 2 ]] \
+  && ok_t "R2 the link is the bullet's first continuation line, indented, above Recommended" \
+  || bad_t "R2 the link is the bullet's first continuation line, indented, above Recommended" \
+          "line2=[${_l2}] recommended@${_rec_pos:-none}"
+
+# R3 THE NEGATIVE: a link-less row in the re-nag renders exactly as before — no
+# label, no orphan indent, no blank continuation line under the bullet.
+seed_renag DIVE-9406 approval "" "Push it"
+R_NONE=$(rid DIVE-9406)
+_rt_none=$(run_renag "$R_NONE")
+if [[ -n "$_rt_none" && "$_rt_none" != *"🔗"* && "$_rt_none" != *"Review:"* ]]; then
+  ok_t "R3 a re-nag bullet for a row with NO delivery_ref carries no link"
+else
+  bad_t "R3 a re-nag bullet for a row with NO delivery_ref carries no link" "text: ${_rt_none:0:500}"
+fi
+
+# R4/R5 THE MIXED BATCH — the arm a presence-only test cannot make. Two rows in
+# one message, one with a URL and one without: exactly ONE link in the whole
+# message (R4), and it belongs to the row that holds the ref while the other
+# bullet stays bare (R5). A call hoisted out of the loop, or one keyed on the
+# wrong id, passes R1-R3 and dies here.
+_rt_mix=$(run_renag "${R_URL},${R_NONE}")
+_nlinks=$(printf '%s\n' "$_rt_mix" | grep -c '🔗 Review:')
+[[ "$_nlinks" == "1" ]] \
+  && ok_t "R4 a MIXED batch renders exactly one review link, not one per bullet" \
+  || bad_t "R4 a MIXED batch renders exactly one review link, not one per bullet" \
+          "links=${_nlinks} text: ${_rt_mix:0:600}"
+
+_mix_url=$(bullet_block "$_rt_mix" DIVE-9405)
+_mix_none=$(bullet_block "$_rt_mix" DIVE-9406)
+if [[ "$_mix_url" == *"  🔗 Review: ${PR_URL}"* && "$_mix_none" != *"🔗"* \
+      && "$(printf '%s\n' "$_mix_url" | sed -n '2p')" == "  🔗 Review: ${PR_URL}" ]]; then
+  ok_t "R5 the link is attached to the bullet that owns the ref, not the other one"
+else
+  bad_t "R5 the link is attached to the bullet that owns the ref, not the other one" \
+        "with-ref block: [${_mix_url}] | link-less block: [${_mix_none}]"
+fi
 
 printf '\n%s\n' "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))

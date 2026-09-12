@@ -4330,13 +4330,26 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
   local text="🔁 Gate reminder — unanswered gates (${route_label}):"
   [[ -n "$_escalated_from" ]] \
     && text+=$'\n'"↑ filed by ${_escalated_from} (no channel of its own) — escalated to you"
-  local rows='[]' row id ident ntype options recommend gtier ask nonce="" markup="" _mint_n=0
+  local rows='[]' row id ident ntype options recommend gtier ask nonce="" markup="" _mint_n=0 _dlink=""
   local -a nonce_ids=() nonce_hashes=()
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     IFS=$'\x1f' read -r id ident ntype options recommend gtier ask <<<"$row"
     [[ -n "$id" && -n "$ident" ]] || continue
     text+=$'\n\n'"• [${ident}] ${ntype} — ${ask} /task_${id}"
+    # DIVE-4381 iteration 2: the THIRD human-facing gate composer, and the one
+    # that best matches this row's motivation — the re-nag is the message a
+    # founder reads when a gate has SAT for an hour or a day, which is exactly
+    # when "which PR was this again?" is the question. It was missed because it
+    # inlines substr(ask,1,240) instead of calling _task_gate_ask_line, so a grep
+    # on that helper finds the other two sites and hides this one (DIVE-1490's
+    # own rule — one affordance must not drift between the first ping and the
+    # reminders — is what made the /inbox site mandatory, and it applies here
+    # unchanged). Indented to the bullet's continuation shape because this loop
+    # renders MANY rows in one message: the link has to read as belonging to ITS
+    # bullet, not to the batch. Appends nothing when the row carries no URL.
+    _dlink=$(_task_gate_delivery_link_line "$id")
+    [[ -n "$_dlink" ]] && text+=$'\n'"  ${_dlink}"
     [[ -n "$recommend" ]] && text+=$'\n'"  ✅ Recommended: ${recommend}"
     [[ -n "$options" ]] && text+=$'\n'"  Options: ${options}"
 
