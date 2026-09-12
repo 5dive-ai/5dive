@@ -1691,10 +1691,19 @@ _gate_is_human_tap() {
 # look` aimed at a preview is the shape. `see`, `seen`, `tap` and `check` are
 # DELIBERATELY ABSENT: with them the arm eats DIVE-3860 ("Publish the finished
 # dashboard change for review now, so it can be seen on a live preview page?"),
-# which is a push approval and a legitimate gate. Likewise "run a test on a
-# preview build" (DIVE-4239) carries no look-verb and survives, which is correct:
-# a person logging in through a real box is a real human_tap, and DIVE-4329 is
-# the measurement that says re-routing it is the defect.
+# which is a push approval and a legitimate gate.
+#
+# DIVE-4239 IS CAUGHT, and an earlier draft of this comment claimed the opposite
+# (quinn, 2026-09-12, reading the code against the hit list — the behaviour was
+# always right, the sentence was not). Its ask is an instruction list ending
+# "...fresh box, open https://<...>.vercel.app", so the comma boundary below fires
+# and it appears in the 30-day hit set beside DIVE-4294 and DIVE-4307. That is the
+# CORRECT outcome and it is worth saying why, because the gate underneath it is a
+# real one: logging in on a live box IS a human_tap, and DIVE-4329 is the
+# measurement that re-routing such a gate is the defect. What is refused is not
+# the tap, it is the ADDRESS — the preview link the holder cannot open either.
+# The refusal's first exit says so in one line ("verify on a real box"), so the
+# re-file keeps the same human and changes only where they are sent.
 #
 # WHAT THE FILER SHOULD DO INSTEAD is in the message: verify on a box, or ask for
 # a reusable test login (a `secret` gate, which IS a human capability). Neither

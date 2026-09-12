@@ -254,7 +254,14 @@ actor_seam_as main; cmd_task_need DIVE-932 --type=decision --from=main \
 # --- 12: SAFETY — an EXPLICIT --tier=2 is the caller's hard-human contract
 #         (DIVE-1957). No advice, because there is nothing to appeal.
 reset; seedloop DIVE-926
+# DIVE-4346, and this one takes the AUDITED ESCAPE rather than the honest
+# declaration, for the same reason gate_approval_routing_unit A8 does: the arm
+# grades that the EXPLICIT --tier=2 PIN is itself the hard-human contract. Give it
+# --needs=human_tap and the capability becomes the source of the tier, and the arm
+# stops grading the pin. The undeclared shape is the subject, so it is bought with
+# --ask-ok and a written reason, which leaves an audit row and stays countable.
 actor_seam_as dev; cmd_task_need DIVE-926 --type=decision --from=dev --tier=2 \
+  --ask-ok="fixture: this arm grades that an explicit --tier=2 pin is the caller's own hard-human contract (DIVE-1957), so the gate must reach the human with NO declared capability -- --needs= would make the capability the source of the tier and grade a different thing" \
   --ask="$SCOPE_ASK" --options="split|keep" --recommend="split" 2>"$ERR" >/dev/null
 [[ "$(tierof DIVE-926)" == "2" ]] && ! warned "CANNOT clear it" \
   && ok_t "safety: explicit --tier=2 stays hard-human and gets no appeal advice" \
