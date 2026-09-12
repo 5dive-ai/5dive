@@ -125,9 +125,16 @@ file_gate CAP-2 --type=approval --ask="approve the internal refactor of the help
 # ============ B. the shapes that MUST still reach a person ===================
 # B1 — a gate with NO recommendation is not a rubber stamp. Nothing was decided,
 # so there is nothing to take back.
+# DIVE-4346: every arm in this FILE takes the audited --ask-ok, never --needs=, and
+# the reason is structural rather than per-arm. The keystroke cap this file grades is
+# itself gated on `_needs_human != 1` (src/task/need.sh) — declaring a capability
+# SWITCHES THE CAP OFF. So --needs= here would not be an honest declaration, it would
+# delete the control under test and every arm below would pass for the wrong reason.
+# The undeclared tier-2 shape IS this file's subject.
 seed KEEP-1
 file_gate KEEP-1 --type=decision --ask="pick a name for the internal helper" \
-          --options="alpha|beta" --tier=2
+          --options="alpha|beta" --tier=2 \
+          --ask-ok="fixture: this file grades the DIVE-2848 keystroke cap, which is gated on no-declared-capability; --needs= would switch the cap off and the arm would pass vacuously"
 eq_t "B1: --tier=2 decision with NO --recommend still files (rc 0)" "$RC" "0"
 eq_t "B1b: ... at tier 2" "$(field KEEP-1 tier)" "2"
 
@@ -166,6 +173,7 @@ eq_t "B4b: ... and is still tier 2 by type" "$(field KEEP-4 tier)" "2"
 seed ESC-1
 file_gate ESC-1 --type=decision --ask="pick a name for the internal helper" \
           --options="alpha|beta" --recommend="alpha" --tier=2 \
+          --ask-ok="fixture: this file grades the DIVE-2848 keystroke cap, which is gated on no-declared-capability; --needs= would switch the cap off and the arm would pass vacuously" \
           --rubber-stamp-ok="lodar asked to see this exact wording himself before it lands"
 eq_t "C1: --rubber-stamp-ok lets the gate file (rc 0)" "$RC" "0"
 eq_t "C1b: ... at tier 2" "$(field ESC-1 tier)" "2"
@@ -210,7 +218,7 @@ seed_prec() { db "INSERT INTO tasks (ident,title,priority,assignee,created_by,ki
                         datetime('now'), datetime('now','-2 days'));"; }
 seed_prec PREC-1; seed_prec PREC-2
 seed PREFILL-1
-file_gate PREFILL-1 --type=approval --ask="$PREC_ASK" --tier=2
+file_gate PREFILL-1 --type=approval --ask="$PREC_ASK" --tier=2 --ask-ok="fixture: this file grades the DIVE-2848 keystroke cap, which is gated on no-declared-capability; --needs= would switch the cap off and the arm would pass vacuously"
 eq_t "C6: a gate whose recommend was PREFILLED from precedent is not capped (rc 0)" "$RC" "0"
 eq_t "C6b: ... and it really did get a prefilled recommendation (the case is live)" \
      "$(field PREFILL-1 recommend)" "approved"
@@ -266,6 +274,7 @@ seed RATE-3
 OUT=$( (cmd_task_need RATE-3 --from=newbie --type=decision \
         --ask="pick a name for the internal helper" --options="alpha|beta" \
         --recommend="alpha" --tier=2 \
+        --ask-ok="fixture: this file grades the DIVE-2848 keystroke cap, which is gated on no-declared-capability; --needs= would switch the cap off and the arm would pass vacuously" \
         --rubber-stamp-ok="first gate I have filed and it wants a person") 2>&1 ); RC=$?
 eq_t "D8: a filer with no history is not rate-limited (rc 0)" "$RC" "0"
 

@@ -146,8 +146,13 @@ cmd_task_need DIVE-207 --type=secret --ask="drop the deploy key" --secret-key=DE
 
 # --- A8: an explicit --tier=2 on an approval is honored (caller's hard-human contract).
 seed_task DIVE-208
+# DIVE-4346: a gate reaching the human must now NAME the capability it consumes.
+# This fixture must keep the explicit --tier=2 pin as the SOURCE of the tier (that is
+# what A8 grades), so it takes the audited --ask-ok exception rather than --needs=,
+# which would make the declaration the source and grade a different thing.
 cmd_task_need DIVE-208 --type=approval --ask="approve the mechanical README sync?" --recommend="yes" --tier=2 \
-  --rubber-stamp-ok="fixture: this case grades that an explicit --tier=2 pin is honored, so it must BE one (DIVE-2848 cap)" >/dev/null 2>&1
+  --rubber-stamp-ok="fixture: this case grades that an explicit --tier=2 pin is honored, so it must BE one (DIVE-2848 cap)" \
+  --ask-ok="fixture: A8 grades that the --tier=2 pin itself is honored, so the gate must reach the human WITHOUT a declared capability (DIVE-4346)" >/dev/null 2>&1
 [[ "$(tierof DIVE-208)" == "2" ]] \
   && ok_t "A8 explicit --tier=2 on approval honored (hard-human contract preserved)" \
   || bad_t "A8 explicit tier 2 honored" "got tier '$(tierof DIVE-208)'"

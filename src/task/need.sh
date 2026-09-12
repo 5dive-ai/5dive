@@ -506,7 +506,7 @@ _gate_redact_branch_refs() {
 # lowered — the floor still fires on every listed signal, and a missed one lands a
 # tier-1 gate at a routed seat rather than nothing at all. Widen the list here if a
 # real spend is ever measured slipping; do not widen it on a hypothetical.
-_GATE_PRICE_SPEND_SIGNAL_RX='\$[0-9]|€[0-9]|£[0-9]|[0-9] ?(usd|eur|gbp|dollar|euro|cent)|pay|paid|buy|bought|purchas|charg|bill|invoic|spend|spent|refund|subscri|budget|revenue|monetiz|checkout|quote|discount|upgrade|downgrade|rais|lower|increas|decreas|hike|cost|tariff|fee|plan|tier|seat|sku|deal|margin|vendor|supplier|contract|customer|enterprise'
+_GATE_PRICE_SPEND_SIGNAL_RX='\$[0-9]+|€[0-9]+|£[0-9]|[0-9] ?(usd|eur|gbp|dollar|euro|cent)|pay|paid|buy|bought|purchas|charg|bill|invoic|spend|spent|refund|subscri|budget|revenue|monetiz|checkout|quote|discount|upgrade|downgrade|rais|lower|increas|decreas|hike|cost|tariff|fee|plan|tier|seat|sku|deal|margin|vendor|supplier|contract|customer|enterprise'
 # _gate_redact_bare_price <lowercased text>: blank out `price`/`pricing` when the
 # field carries no spend signal. Same shape as DIVE-2629's branch-ref redaction —
 # the transform is on the TEXT at the match site, never on $floor_rx, because the
@@ -519,7 +519,87 @@ _gate_redact_bare_price() {
   [[ "$text" =~ $_GATE_PRICE_SPEND_SIGNAL_RX ]] && { printf '%s' "$text"; return 0; }
   printf '%s' "$text" | sed -E 's/(pricing|price)/ /g'
 }
-_GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
+# DIVE-4346: the tail is now BOUNDED too (see the match site below), so every
+# inflection this floor must keep catching is written out here rather than left to
+# substring containment. Two terms are DELIBERATELY not inflected, and both are
+# measured, not guessed:
+#   * `spends` — in the audit window it appears only as a third-person clause
+#     DESCRIBING a subject that is not the reader's money ("every hand-in then
+#     spends some of our shared AI allowance", DIVE-4218). The authorisation forms
+#     are `spend` and `spending`, and a real money ask still floors on those, on a
+#     currency amount, or on billing/invoice/payment.
+#   * `tokens` — same shape: the plural is the AI-usage noun ("tokens per run"),
+#     the singular is the credential one. A credential ask floors on `credential`,
+#     `credentials`, `api key`, `password`, or `--type=secret`.
+# A term that stops flooring is NOT a hole: a gate that reaches the paired human
+# and declares nothing is now REFUSED by the capability default below, which is a
+# strictly safer failure than a silent waiver of the same question.
+_GATE_T2_FLOOR_RX='spend|spending|billing|invoice|invoices|invoiced|charge|charges|charged|charging|payment|payments|refund|refunds|refunded|subscription|subscriptions|price|prices|pricing|\$[0-9]+|€[0-9]+|publish|publishes|published|publishing|public post|announce|announces|announced|announcing|launch post|press|pressing|customer email|email customers|newsletter|blast|blasts|blasted|blasting|secret|secrets|credential|credentials|api key|api keys|token|password|passwords|delete|deletes|deleted|deleting|destroy|destroys|destroyed|destroying|teardown|wipe|wipes|wiped|wiping|purge|purges|purged|purging|drop[^.]{0,20}table|truncate|truncated|irreversible|revoke|revokes|revoked|revoking|dns|domain transfer'
+# DIVE-4346 — THE TRAILING BOUNDARY. DIVE-2301 bounded the LEADING side only and
+# said so deliberately, to keep inflections matching. Measured cost of leaving the
+# tail open, quinn replaying the shipped predicate over this row's own audit
+# window: `spend` fired inside "every hand-in then SPENDS some of our shared AI
+# allowance" and `token` inside "the TOKENmaxxing board", and a floor hit was (until
+# this change) a full WAIVER of the capability question below — so two of the gates
+# lodar named when he filed this row were exempted by a substring of an unrelated
+# word. The inflections that must keep firing are now written into the shipped
+# regexes instead of inferred from containment, which also makes each one readable
+# and countable in the policy data rather than implied by the matcher.
+#
+# APPLIED TO THE SHIPPED DEFAULT ONLY, exactly like DIVE-4001's bare-price
+# requirement and for a harder reason than symmetry: a constitution term may END IN
+# A CHARACTER CLASS THAT CONSUMES ONE CHARACTER OF A LONGER RUN. `\$[0-9]` matches
+# "$5" of "$500" and a trailing boundary then refuses it, so bounding an org's
+# regex would silently DELETE its money class — caught by
+# tests/gate_floor_word_boundary_unit.sh T7 and constitution_gate_floor_unit while
+# this was being written. The shipped terms are bounded because they are words and
+# their inflections are written out above; an org's list is enforced verbatim.
+_GATE_FLOOR_TAIL='($|[^[:alnum:]_])'
+# DIVE-4346 — THE PUSH-RAIL NOUN. A delegated-push approval is INERT by
+# construction (it opens a PR; DIVE-2629 already redacts the branch name it
+# carries for exactly this reason), and its boilerplate names the rail's own
+# missing credential: "direct GitHub push lacks credentials". That sentence is a
+# statement about the FILER's access, never a request that a person hand one over
+# — measured on DIVE-4052 and DIVE-4125, both of which the floor exempted from the
+# capability question below on the word `credentials`. Scoped exactly like the
+# branch-ref redaction: only the noun inside that clause is blanked, and the rest
+# of the ask is graded unchanged, so "push this, and send me a new bot key"
+# still floors on the second clause.
+# DIVE-4346 — THE BARE `token`. Same shape as DIVE-4001's bare `price`, and
+# measured the same way: in this org's own corpus the unqualified noun is the
+# AI-usage one ("which token limit should the summariser use, 8k or 16k?", quinn's
+# fresh probe), while the credential sense always arrives with a credential
+# signal next to it. `tokens` was dropped from the floor list outright for the
+# same reason; the singular keeps its class only when the text says so. A
+# credential ask that names none of these signals still cannot reach a person
+# undeclared — it is refused by the capability default, not waived.
+_GATE_TOKEN_SECRET_SIGNAL_RX='secret|cred|password|api key|auth|oauth|bearer|rotate|rotation|leak|revoke|provision|paste|issue|bot |github|telegram|stripe|key |keys|env|vault|expired'
+_gate_redact_bare_token() {
+  local text="${1-}"
+  [[ "$text" =~ (^|[^[:alnum:]_])token([^[:alnum:]_]|$) ]] || { printf '%s' "$text"; return 0; }
+  [[ "$text" =~ $_GATE_TOKEN_SECRET_SIGNAL_RX ]] && { printf '%s' "$text"; return 0; }
+  printf '%s' "$text" | sed -E 's/(^|[^[:alnum:]_])token([^[:alnum:]_]|$)/\1 \2/g'
+}
+_GATE_PUSH_RAIL_NOUN_SED='s/(push[^.]{0,60}(lacks|lacking|without|refuses|refuse|cannot|denied)[^.]{0,40})(credentials?|tokens?|api keys?)/\1 /g'
+_gate_redact_push_rail_nouns() {
+  printf '%s' "${1-}" | sed -E "$_GATE_PUSH_RAIL_NOUN_SED"
+}
+# _gate_floor_capability_class <floor term> -> the human capability that term's
+# reserved class consumes. DIVE-4346: a floor hit used to WAIVE the capability
+# question (the gate reached the paired human with needs_capability empty, which
+# is byte-identical to what an undeclared gate records — nothing). It now ANSWERS
+# it: the class the floor already decided is stored on the row, so the counter can
+# see it and a WRONG derivation is countable rather than invisible.
+_gate_floor_capability_class() {
+  local t; t=$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]')
+  case "$t" in
+    spend|spending|billing|invoice*|charge*|payment*|refund*|subscription*|price|prices|pricing|\$*|€*)
+      printf 'spend_authority' ;;
+    secret|secrets|credential*|api\ key*|token|password*)
+      printf 'secret_provision' ;;
+    *) printf 'human_tap' ;;
+  esac
+}
 _gate_tier2_floor_hit() {
   local text floor_rx="$_GATE_T2_FLOOR_RX" loaded_rx="" constitution_path="" ere_rc=0
   text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
@@ -601,7 +681,12 @@ _gate_tier2_floor_hit() {
   if [[ "$floor_rx" == "$_GATE_T2_FLOOR_RX" ]]; then
     text=$(_gate_redact_bare_price "$text")
   fi
-  [[ "$text" =~ (^|[^[:alnum:]_])($floor_rx) ]]
+  if [[ "$floor_rx" == "$_GATE_T2_FLOOR_RX" ]]; then
+    text=$(_gate_redact_push_rail_nouns "$text")
+    text=$(_gate_redact_bare_token "$text")
+  fi
+  local tail=""; [[ "$floor_rx" == "$_GATE_T2_FLOOR_RX" ]] && tail="$_GATE_FLOOR_TAIL"
+  [[ "$text" =~ (^|[^[:alnum:]_])($floor_rx)$tail ]]
 }
 
 # DIVE-2224: NEVER concatenate two SUBJECTS into one classifier input. The ASK is
@@ -1376,12 +1461,15 @@ _gate_internal_residual() {
 # This lowers nothing — the floor still fires, the gate still exists, it still
 # needs clearing; it restores the appeal path `token` and `secret` already have.
 # The money class is NOT carved out with it: `spend|billing|invoice|charge|
-# payment|refund|subscription|\$[0-9]|€[0-9]` all stay non-appealable and all
+# payment|refund|subscription|\$[0-9]+|€[0-9]+` all stay non-appealable and all
 # still fire bare, so an ask that actually moves money is refused an appeal on
 # its own words. Companion change at _GATE_PRICE_SPEND_SIGNAL_RX makes the bare
 # noun require a spend signal before it fires at all — the two are independent:
 # this one makes a price false positive RECOVERABLE, that one makes it rarer.
-_GATE_FLOOR_APPEALABLE_RX='secret|credential|api key|token|password|publish|public post|announce|launch post|delete|destroy|wipe|purge|pricing|price'
+# DIVE-4346: kept term-for-term in step with the inflections written into
+# _GATE_T2_FLOOR_RX. An inflected form present in the floor but ABSENT here would
+# be silently reclassified as non-appealable by the residual test below.
+_GATE_FLOOR_APPEALABLE_RX='secret|secrets|credential|credentials|api key|api keys|token|password|passwords|publish|publishes|published|publishing|public post|announce|announces|announced|announcing|launch post|delete|deletes|deleted|deleting|destroy|destroys|destroyed|destroying|wipe|wipes|wiped|wiping|purge|purges|purged|purging|pricing|price|prices'
 # NON-APPEALABLE (everything else in the floor, stated positively so a future
 # edit to the floor regex cannot silently widen what an appeal reaches): money,
 # real outbound comms, and irreversible infra/access. Never carved out.
@@ -1399,7 +1487,7 @@ _GATE_FLOOR_APPEALABLE_RX='secret|credential|api key|token|password|publish|publ
 # may be a substring of a NON-APPEALABLE one, or stripping the former would erase
 # the latter and hand an appeal to a class that has none. Asserted in
 # tests/gate_floor_word_boundary_unit.sh rather than left to review.
-_GATE_FLOOR_NONAPPEALABLE_RX='spend|billing|invoice|charge|payment|refund|subscription|\$[0-9]|€[0-9]|press|customer email|email customers|newsletter|blast|teardown|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
+_GATE_FLOOR_NONAPPEALABLE_RX='spend|spending|billing|invoice|invoices|invoiced|charge|charges|charged|charging|payment|payments|refund|refunds|refunded|subscription|subscriptions|\$[0-9]+|€[0-9]+|press|pressing|customer email|email customers|newsletter|blast|blasts|blasted|blasting|teardown|drop[^.]{0,20}table|truncate|truncated|irreversible|revoke|revokes|revoked|revoking|dns|domain transfer'
 # _gate_floor_appeal_residual <text>: lower-case <text> and remove ONLY the
 # appealable terms. The caller re-tests the full floor against the result; if it
 # still fires, a non-appealable class is present and the appeal is refused.
@@ -1451,7 +1539,14 @@ _gate_tier2_floor_term() {
   if [[ "$rx" == "$_GATE_T2_FLOOR_RX" ]]; then
     text=$(_gate_redact_bare_price "$text")
   fi
-  [[ "$text" =~ (^|[^[:alnum:]_])($rx) ]] && printf '%s' "${BASH_REMATCH[2]}"
+  # DIVE-4346: mirrored for the same invariant — this helper must never report a
+  # term the floor itself no longer matches.
+  if [[ "$rx" == "$_GATE_T2_FLOOR_RX" ]]; then
+    text=$(_gate_redact_push_rail_nouns "$text")
+    text=$(_gate_redact_bare_token "$text")
+  fi
+  local tail=""; [[ "$rx" == "$_GATE_T2_FLOOR_RX" ]] && tail="$_GATE_FLOOR_TAIL"
+  [[ "$text" =~ (^|[^[:alnum:]_])($rx)$tail ]] && printf '%s' "${BASH_REMATCH[2]}"
 }
 
 # OSS-11 (DIVE-976) — _gate_ask_shape <ask>: normalize an ask into its "shape
@@ -1664,6 +1759,102 @@ _gate_is_human_tap() {
   [[ " $needs " == *" human_tap "* ]] && return 0
   case "$needs" in *human_tap*) [[ "$needs" =~ (^|[^a-z_])human_tap([^a-z_]|$) ]] && return 0 ;; esac
   return 1
+}
+
+# ============================================================================
+# DIVE-4346 — TWO ASKS A PERSON CANNOT ANSWER, REFUSED AT FILING.
+#
+# lodar, Telegram 2026-09-12 01:06Z: "human gate is still the most annoying part
+# of 5dive." The DIVE-4176 refusal above grades whether the ask is READABLE. These
+# two grade whether it is ANSWERABLE — a different question, and the one that
+# produced the taps he was complaining about. A readable ask that no human can act
+# on is worse than an unreadable one: it looks like a decision, so he reads it.
+#
+# ARM 1 — "GO LOOK AT THE PREVIEW" IS UNSATISFIABLE ON AN AUTH-GATED ROUTE.
+# Behind the Vercel SSO wall there is a second wall: a PRODUCTION Clerk instance
+# refuses preview domains outright, and `x-vercel-protection-bypass` has no
+# authority over Clerk. So the link cannot be opened by the holder either — this
+# is not "the agent cannot, so ask the person", it is unreachable by construction.
+# Measured on DIVE-4263 (2026-09-11): the false premise cost about a day and six
+# gates, three of which reached lodar, before the change was verified on a box
+# instead. Replayed over gate_history, 30 days to 2026-09-12, FIVE tier-2 asks
+# match — DIVE-3594, DIVE-3613, DIVE-3618, DIVE-3644, DIVE-4263 — and every one
+# of them points at a dashboard or agent-detail route, i.e. auth-gated.
+#
+# THE VERB LIST IS WHAT KEEPS THIS NARROW, and it was tuned against that same
+# corpus with every match printed. `open / view / visit / screenshot / eyeball /
+# look` aimed at a preview is the shape. `see`, `seen`, `tap` and `check` are
+# DELIBERATELY ABSENT: with them the arm eats DIVE-3860 ("Publish the finished
+# dashboard change for review now, so it can be seen on a live preview page?"),
+# which is a push approval and a legitimate gate.
+#
+# DIVE-4239 IS CAUGHT, and an earlier draft of this comment claimed the opposite
+# (quinn, 2026-09-12, reading the code against the hit list — the behaviour was
+# always right, the sentence was not). Its ask is an instruction list ending
+# "...fresh box, open https://<...>.vercel.app", so the comma boundary below fires
+# and it appears in the 30-day hit set beside DIVE-4294 and DIVE-4307. That is the
+# CORRECT outcome and it is worth saying why, because the gate underneath it is a
+# real one: logging in on a live box IS a human_tap, and DIVE-4329 is the
+# measurement that re-routing such a gate is the defect. What is refused is not
+# the tap, it is the ADDRESS — the preview link the holder cannot open either.
+# The refusal's first exit says so in one line ("verify on a real box"), so the
+# re-file keeps the same human and changes only where they are sent.
+#
+# WHAT THE FILER SHOULD DO INSTEAD is in the message: verify on a box, or ask for
+# a reusable test login (a `secret` gate, which IS a human capability). Neither
+# is a re-route, because the DIVE-4329 lesson holds here too — a check about the
+# ANSWERABILITY of an ask must not be satisfiable by sending it to someone else.
+_GATE_ASK_PREVIEW_RX='preview|vercel\.app'
+# The look-verb must be an INSTRUCTION TO THE READER, not a mention of looking.
+# That distinction is the whole false-positive budget, and it was measured: the
+# 30-day corpus holds two push-approval asks whose PRIMARY request is answerable
+# and which merely note, in a subordinate clause, that a preview will have to be
+# looked at later ("...this seat cannot render screenshots, so the Vercel preview
+# must be looked at before merge" — DIVE-3984; "it only opens the change for
+# review" — DIVE-3978). Both are legitimate gates, both carry a preview token and
+# a look-verb, and a bare co-occurrence test refuses both. So the verb is
+# required to sit at an INSTRUCTION BOUNDARY: the start of the ask, after a
+# sentence end, after a comma in an instruction list ("fresh box, open https://"
+# — DIVE-4239), or behind can/could/would/will/please/you. The one non-imperative
+# form kept is the "does X look right" question (DIVE-3594), which is an
+# instruction to go and look wearing a question mark.
+_GATE_ASK_LOOK_RX='(^|[.!?]([[:space:]]|$)|,[[:space:]]+|\b(can|could|would|will|please|you)[[:space:]]+(you[[:space:]]+)?)(open|view|visit|screenshot|eyeball|look)\b'
+_GATE_ASK_LOOK_Q_RX='\b(does|do|is|are)\b[^.?!]{0,60}\blooks?\b'
+_gate_ask_unsatisfiable_preview() {   # <ask> -> 0 when it asks the reader to LOOK at a preview
+  local s="${1:-}"
+  LC_ALL=C grep -Eiq "$_GATE_ASK_PREVIEW_RX" <<<"$s" || return 1
+  LC_ALL=C grep -Eiq "$_GATE_ASK_LOOK_RX" <<<"$s" && return 0
+  LC_ALL=C grep -Eiq "$_GATE_ASK_LOOK_Q_RX" <<<"$s" && return 0
+  return 1
+}
+
+# ARM 2 — A CODE-HOSTING RULE IS NOT A DECISION.
+# lodar on DIVE-4196, asked to approve something a repository setting demanded:
+# "why asking me then?" A CODEOWNERS entry, a branch-protection rule or a
+# required-reviewer setting is repo CONFIG. The person tapping cannot change the
+# outcome by tapping — the rule fires again on the next PR — so the tap buys one
+# merge and zero decisions. The real row is "move or drop the rule" (DIVE-4334),
+# which is a genuine decision and is NOT caught here: its ask names the effect
+# ("Changes to the script that installs our product wait for your approval. Move
+# that approval off you, or drop it entirely?") and none of the tokens below.
+# That separation is the whole point — this arm fires on an ask that cites the
+# RULE AS THE REASON, not on an ask about the rule.
+#
+# THE APPROVAL-SHAPE CLAUSE IS LOAD-BEARING, and it is the difference between
+# this arm and a rule that eats its own remedy. An ask that wants the RULE
+# CHANGED — "will a repository admin make that branch-protection change?"
+# (DIVE-4086) — is a browser-only action a person really does hold, and refusing
+# it would leave the rule in place forever. What is refused is an ask that wants
+# a PER-CHANGE TAP whose reason is the rule: "Approve PR #779 as code owner of
+# install.sh?" (DIVE-4020) — the single true positive in the 30-day corpus, and
+# the exact shape lodar answered with "why asking me then?" (DIVE-4196).
+_GATE_ASK_CODEHOST_RX='codeowner|code[- ]owner|branch protection|protected branch|required review|required approval|required reviewer|requires? (a )?(review|approval)'
+_GATE_ASK_CODEHOST_APPROVE_RX='\b(approve|approves|approval|approving|sign[- ]off|signoff|rubber)\b'
+_gate_ask_codehost_rule() {   # <ask> -> 0 when a per-change tap is asked for BECAUSE of a repo rule
+  local s="${1:-}"
+  LC_ALL=C grep -Eiq "$_GATE_ASK_CODEHOST_RX" <<<"$s" || return 1
+  LC_ALL=C grep -Eiq "$_GATE_ASK_CODEHOST_APPROVE_RX" <<<"$s" || return 1
+  return 0
 }
 
 # Word count on whitespace. Deliberately the same unit the human experiences —
@@ -1892,6 +2083,9 @@ _gate_record_line() {
 cmd_task_need() {
   tasks_db_init
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode="" ask_ok=""
+  # DIVE-4346: the capability class DERIVED from a tier-2 floor hit when the filer
+  # declared none. Declared always wins; this is only ever a fallback.
+  local _cu_derived=""
   local gate_owner=""   # DIVE-3342
   local urgent=0        # DIVE-3474 arm 2
   local self_minted=0 escalate=0   # DIVE-4365 part 1
@@ -3369,6 +3563,149 @@ THE ONE EXIT THIS REFUSAL DOES NOT OFFER IS A DIFFERENT DESTINATION. --tier=1 wo
     elif [[ -n "$ask_ok" ]]; then
       warn "--ask-ok changed nothing on this gate — the readability check passed on its own (${_ar_words} words, no internal names)."
     fi
+    # DIVE-4346 — THE ANSWERABILITY REFUSALS. Placed inside `_ar_human` for the
+    # same reason the readability refusal is: only a gate that actually reaches
+    # the paired human is graded on whether a person can act on it. A tier-1 ask
+    # telling an AGENT to open a preview is a different (and fine) instruction.
+    # Each carries its own `--ask-ok` escape, because a gate must never become
+    # unfileable (DIVE-2216) and an exception that leaves a row is countable.
+    local _un_why=""
+    if _gate_ask_unsatisfiable_preview "$ask"; then
+      _un_why="it asks the reader to open or look at a preview deployment"
+    elif _gate_ask_codehost_rule "$ask"; then
+      _un_why="its stated reason is a code-hosting rule (a repository setting), not an outcome the reader chooses"
+    fi
+    if [[ -n "$_un_why" ]]; then
+      if [[ -z "$ask_ok" ]]; then
+        _task_store_audit_log "task need ask-answerable" "refused" 0 -- \
+          "task=$ident" "filer=${actor:-}" "type=$type" "why=${_un_why}" || true
+        fail "$E_VALIDATION" "$ident: refusing this gate because ${_un_why} — so tapping it does not produce an answer.
+A preview deployment is unreachable by the holder too, not just by an agent: behind the sign-in wall on the hosting side there is a SECOND wall — our live login provider refuses preview addresses outright, and the hosting bypass key has no authority over it. Measured 2026-09-11: that false premise cost about a day and six gates, three of which reached the paired human, before the change was verified on a real box instead. A repository rule is the mirror image — the person tapping cannot change the outcome, because the rule fires again on the very next change, so the tap buys one merge and zero decisions.
+  verify on a real box       the route is auth-gated; a running box is the only place it renders. This is the exit that is wanted.
+  ask for a test login       if nobody here can sign in, that is a credential a person must issue — file it as --type=secret, which IS a human capability.
+  move or drop the rule      a repository setting is its own decision row (\"take this approval off you, or drop it?\"), not a per-change tap.
+  --ask-ok=\"<why a person can still act on this>\"    the audited exception. Recorded on the gate and countable afterwards.
+As with the readability refusal, NO EXIT HERE CHANGES THE DESTINATION: nothing about an ask being unanswerable says a different reader could answer it."
+      fi
+      [[ ${#ask_ok} -ge 12 ]] \
+        || fail "$E_VALIDATION" "--ask-ok must state WHY a person can still act on this ask (it is recorded on the gate and read by whoever counts these exceptions later)"
+      _task_store_audit_log "task need ask-answerable" "escaped" 0 -- \
+        "task=$ident" "filer=${actor:-}" "type=$type" "why=${_un_why}" "declared=$ask_ok" || true
+      warn "answerability escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". This ask ${_un_why}, and the human is still being sent it."
+    fi
+
+    # DIVE-4346 — A TAP ON THE CUSTOMER MUST NAME THE CAPABILITY IT CONSUMES.
+    #
+    # THE PRODUCT DEFAULT this row exists to set: a person is tapped only for
+    # money, a secret, an irreversible step, or something only a person at a
+    # browser can do. Those four are exactly `_GATE_HUMAN_CAPABILITIES` plus the
+    # `secret` type, and `--needs=` is the sentence that names one.
+    #
+    # MEASURED ON THIS BOARD, the 7 days to 2026-09-12: 35 gates reached the
+    # paired human. 16 of them (46%) named NO capability at all. That is the
+    # before-number, and it is the population this refusal addresses — not the
+    # 17 that did declare one, which are the honest taps and are untouched.
+    #
+    # WHY A REFUSAL AND NOT A ROUTE, and this is the one thing that must not be
+    # got wrong here. The row as filed asked for a needs-less manual/approval
+    # gate to be ROUTED to a lead or verifier seat instead. That is precisely the
+    # behaviour DIVE-4329 removed ONE DAY EARLIER, on a measurement: on 2026-09-11
+    # a manual gate asking a person to try a login took a re-route exit, queued on
+    # a lead seat that cannot open a browser, and NOBODY WAS EVER PINGED. A gate
+    # that reaches nobody is a stall with a receipt, and it is worse than the tap
+    # it replaced because it is silent. So the default is enforced where it can
+    # only ever cost a re-file: the filer must SAY what the ask consumes. Declaring
+    # it is free and correct; not being able to name it is the diagnostic that the
+    # gate did not belong on a person.
+    #
+    # SCOPE, and every exemption here is a type that ALREADY NAMES ITS CAPABILITY.
+    #   * `secret` names `secret_provision` in its own name; its tier-2 floor is
+    #     permanent and must stay so.
+    #   * `access` is lead-clearable BY TYPE (DIVE-1243), so it is not a customer
+    #     tap in the first place.
+    #   * a tier-2 `manual` gate is the type whose definition IS "a step only a
+    #     person can perform" — `_gate_is_human_tap` has said exactly that since
+    #     DIVE-4329 and the URL exception above already depends on it. Requiring
+    #     the flag on top would be asking the filer to repeat the type, and it
+    #     would refuse the product's OWN iteration-cap escalation gate
+    #     (src/task/delivery.sh), which is a correct manual gate — caught by
+    #     tests/gate_ask_readability_unit.sh arm F while this was being built.
+    #   * a category-floored gate (tier_floored on the ask/title axis): the floor
+    #     already said which reserved class it belongs to, and refusing it here
+    #     would make a floored gate unfileable rather than declared.
+    # What is LEFT is exactly the population the audit measured: `decision` and
+    # `approval` gates that reach a person and say nothing about what they need
+    # from one.
+    #   * a category-floored gate: the floor already said which reserved class it
+    #     belongs to, and refusing it here would make a floored gate unfileable
+    #     rather than declared.
+    #
+    # AND `tier_floored` IS THE WRONG WAY TO ASK THAT — found by quinn's core-tier
+    # sweep (gate_recommend_cap_unit B3, "approve the monthly spend on the paid
+    # Hetzner plan"), and the cap 90 lines below had already written the reason down
+    # in full before this shipped: the T2 category floor only ever runs to RAISE a
+    # tier below 2, so there is nothing for it to raise when the filer TYPED
+    # --tier=2, and a money gate filed at tier 2 arrives here with tier_floored
+    # still 0 — indistinguishable from an undeclared judgement call. Reading the
+    # flag therefore refused exactly the reserved classes the exemption exists for.
+    # Re-run the classifier over the ask AND the title, the same way the cap does.
+    # Not a widening: a floored gate was always meant to be exempt, and this is the
+    # only instrument that answers whether it is floored on this path.
+    #
+    # AND THE EXEMPTION IS AN ANSWER, NOT A WAIVER (DIVE-4346 iteration 3, quinn's
+    # finding, and it is the whole reason this block moved). As shipped in
+    # iteration 2 a floor hit simply SKIPPED the question: the gate reached the
+    # paired human with `needs_capability` empty — the identical record an
+    # undeclared gate leaves, which is nothing. Replayed over this row's own audit
+    # population that exempted 14 of the 16 gates the default was supposed to
+    # reach, so the deliverable moved its number by 2. The floor, however, has
+    # ALREADY decided which reserved class the ask belongs to; it names the term in
+    # `floor_provenance`. So derive the class from that term and STORE it. Two
+    # things follow, and both are the point:
+    #   * the counter and any later audit can see what a floored tap consumed,
+    #     instead of finding the column blank;
+    #   * a WRONG derivation is now countable — `floor_provenance` carries
+    #     `needs=derived:<class>`, so "the floor guessed" is one query away, where
+    #     before it was indistinguishable from "nobody asked".
+    # The declared value always wins: `--needs=` is never overwritten by this.
+    local _cu_title=""
+    _cu_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+    if [[ -z "${needs//[[:space:]]/}" && "$type" != "secret" && "$type" != "access" ]] \
+       && ! _gate_is_human_tap "$type" "$tier" "$needs"; then
+     if [[ "$tier_floored" == "1" ]] \
+        || _gate_hit_either _gate_tier2_floor_hit "$ask" "$_cu_title"; then
+      local _cu_term=""
+      _cu_term=$(_gate_tier2_floor_term "$ask" 2>/dev/null) || _cu_term=""
+      [[ -n "$_cu_term" ]] || { _cu_term=$(_gate_tier2_floor_term "$_cu_title" 2>/dev/null) || _cu_term=""; }
+      if [[ -n "$_cu_term" ]]; then
+        _cu_derived=$(_gate_floor_capability_class "$_cu_term")
+        _floor_prov="${_floor_prov:+${_floor_prov};}needs=derived:${_cu_derived}"
+        _task_store_audit_log "task need capability-derived" "derived" 0 -- \
+          "task=$ident" "filer=${actor:-}" "type=$type" "term=$_cu_term" "class=$_cu_derived" || true
+        warn "this gate declares no capability, but the tier-2 floor already classified it on the word '${_cu_term}' — recording needs_capability=${_cu_derived} as DERIVED, not declared. If that is the wrong class, re-file with --needs=<the right one>: a derived class is countable and correctable, an empty one is neither."
+      fi
+     else
+      if [[ -z "$ask_ok" ]]; then
+        _task_store_audit_log "task need capability-undeclared" "refused" 0 -- \
+          "task=$ident" "filer=${actor:-}" "type=$type" "tier=$tier" || true
+        fail "$E_VALIDATION" "$ident: refusing this gate because it reaches the paired human and does not say what it needs FROM a human. A customer is tapped for exactly four things: money, a secret, something irreversible, or something only a person at a browser or keyboard can do. Name the one this ask consumes:
+  --needs=spend_authority     it spends money or commits to a paid account.
+  --needs=secret_provision    a token or credential must come FROM a person (or file it as --type=secret).
+  --needs=human_tap           a person's own call — brand, strategy, an irreversible choice — or a step only a person at a browser can perform.
+IF YOU CANNOT NAME ONE, this is not a gate on a person. Your exits:
+  --tier=0                    apply your own --recommend now: no ping, permanent record, a line in the digest. On this board 81% of answered decision gates came back as the human tapping the filer's recommendation, so if you wrote one you have already decided.
+  --tier=1                    the lead or this task's verifier answers it. Correct when the ask needs a JUDGEMENT an agent can make.
+  --ask-ok=\"<why a person must answer this though it consumes none of the four>\"    the audited exception. Recorded and countable.
+Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired human and 16 of them named no capability at all — and 313 changes shipped in the same week, so the ratio a customer would read is 0.11 taps per shipped change."
+      fi
+      [[ ${#ask_ok} -ge 12 ]] \
+        || fail "$E_VALIDATION" "--ask-ok must state WHY a person must answer a gate that consumes none of the four human capabilities"
+      _task_store_audit_log "task need capability-undeclared" "escaped" 0 -- \
+        "task=$ident" "filer=${actor:-}" "type=$type" "declared=$ask_ok" || true
+      warn "undeclared-capability escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". This gate reaches the paired human and names no capability."
+     fi
+    fi
+
     # DIVE-4176, THE HALF THAT STAYS ADVISORY AND WHY. "Consequence-first, a
     # choice between outcomes" is the rule that matters most and it is the one
     # with no honest mechanical predicate. The closest proxy is "the ask asks a
@@ -3471,7 +3808,7 @@ THE ONE EXIT THIS REFUSAL DOES NOT OFFER IS A DIFFERENT DESTINATION. --tier=1 wo
             -- including one that resolved to nothing. What was claimed is the
             -- provenance; whether it resolved is recomputable from the sealed
             -- list, and a mis-declaration you cannot see is one you cannot correct.
-            needs_capability=$(sqlq_or_null "$needs"),
+            needs_capability=$(sqlq_or_null "${needs:-${_cu_derived:-}}"),
             -- DIVE-2848: the declared reason a gate carrying its own recommendation
             -- still went to a person. The cap's value is that the exception is
             -- COUNTABLE afterwards — an escape that leaves no row is --tier=2 with

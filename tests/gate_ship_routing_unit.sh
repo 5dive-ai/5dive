@@ -20,7 +20,13 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
+# DIVE-4346: ABORT backstop. A refused FIXTURE kills the harness before its
+# summary, and a harness with no verdict is indistinguishable from one that was
+# never reached -- how three of these produced silence instead of a red.
+# tests/truncation_marker_guard_unit.sh discovers this trap by grep and grades it.
+exec 8>&2
+SUMMARY_PRINTED=0
+trap 'rc=$?; rm -rf "${TMP:-}"; [[ "${SUMMARY_PRINTED:-0}" == 1 ]] || printf "ABORTED - gate_ship_routing_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 # DIVE-2518: identity comes from the uid now; `USER=agent-x` / `--from=x` no longer
 # move it. Impersonate through the sealed seam. tests/lib/actor_seam.sh.
@@ -161,7 +167,9 @@ actor_seam_as dev; cmd_task_need DIVE-8 --type=approval --needs=spend_authority 
 # --- DIVE-1182: explicit --tier=2 approval is NOT routed (hard-human contract) -
 # NB: ask must NOT name an eng-ship action, else DIVE-1359 downgrades it (below).
 seed DIVE-9; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-9 --type=approval --tier=2 --ask="make the final go/no-go call on this?" --from=dev >/dev/null 2>&1
+# DIVE-4346: audited escape — this arm's subject is the explicit --tier=2 pin as a
+# hard-human contract; --needs= would make the capability the reason it is not routed.
+actor_seam_as dev; cmd_task_need DIVE-9 --type=approval --tier=2 --ask-ok="fixture: this arm grades the explicit --tier=2 pin as the hard-human contract that defeats routing; --needs= would make the capability the reason instead" --ask="make the final go/no-go call on this?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: explicit --tier=2 approval → human (not routed)" || bad_t "explicit T2 approval → human" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # --- DIVE-1359: eng-ship class — a builder CANNOT hard-human-gate an eng ship/ --
@@ -189,7 +197,7 @@ actor_seam_as dev; cmd_task_need DIVE-32 --type=approval --needs=spend_authority
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1359: floor beats eng-ship (deploy+\$invoice stays human)" || bad_t "floor beats eng-ship" "HUMAN_PINGED=$HUMAN_PINGED"
 # a lead's OWN eng-ship gate is NOT downgraded (no distinct reviewer → human)
 seed DIVE-33; HUMAN_PINGED=0; route_reset
-actor_seam_as main; cmd_task_need DIVE-33 --type=approval --tier=2 --ask="approve the prod push?" --from=main >/dev/null 2>&1
+actor_seam_as main; cmd_task_need DIVE-33 --type=approval --tier=2 --ask-ok="fixture: this file grades ROUTING, and every explicit --tier=2 arm exists to prove the pin itself defeats it; --needs= would make the capability the reason and the arm would stop measuring the pin" --ask="approve the prod push?" --from=main >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-33';")" == "2" ]] && ok_t "DIVE-1359: a lead's own eng-ship --tier=2 stays hard-human" || bad_t "lead eng-ship not downgraded" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-33';")'"
 
 # --- DIVE-1555: a delegated PUSH-FOR-REVIEW (5dive push / DIVE-1376) is eng-ship. A
@@ -299,7 +307,7 @@ actor_seam_as dev; cmd_task_need DIVE-44 --type=approval --needs=human_tap --ask
 
 # a lead's OWN curation gate is NOT downgraded (no distinct reviewer → human)
 seed DIVE-45; HUMAN_PINGED=0; route_reset
-actor_seam_as main; cmd_task_need DIVE-45 --type=approval --tier=2 --ask="approve persona 'doc' ready to publish to the drip queue?" --from=main >/dev/null 2>&1
+actor_seam_as main; cmd_task_need DIVE-45 --type=approval --tier=2 --ask-ok="fixture: this file grades ROUTING, and every explicit --tier=2 arm exists to prove the pin itself defeats it; --needs= would make the capability the reason and the arm would stop measuring the pin" --ask="approve persona 'doc' ready to publish to the drip queue?" --from=main >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-45';")" == "2" ]] && ok_t "DIVE-1381: a lead's own curation --tier=2 stays hard-human" || bad_t "lead curation not downgraded" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-45';")'"
 
 # substring guard: 'accurate' / 'personalize' must NOT trip the curation class.
@@ -355,7 +363,7 @@ actor_seam_as dev; cmd_task_need DIVE-5 --type=decision --needs=spend_authority 
 # Guards the hard-human contract: 2 = never auto-applies, always pings. Before
 # the effective-tier fix this left tier_floored=0 and silently routed to the lead.
 seed DIVE-6; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-6 --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --ask="pick the launch date?" --options="mon|tue" --recommend="mon" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-6 --type=decision --tier=2 --ask-ok="fixture: this file grades ROUTING, and every explicit --tier=2 arm exists to prove the pin itself defeats it; --needs= would make the capability the reason and the arm would stop measuring the pin" --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --ask="pick the launch date?" --options="mon|tue" --recommend="mon" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: explicit --tier=2 decision → human (not routed)" || bad_t "explicit T2 decision → human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ ! -s "$ROUTE_FILE" && "$(queued_for DIVE-6 main)" == "0" ]] && ok_t "explicit --tier=2 decision: no lead route fired AND not queued for the lead" || bad_t "explicit T2 no route" "sent=$(route_last) queued=$(queued_for DIVE-6 main)"
 
@@ -529,7 +537,7 @@ actor_seam_as main; cmd_task_need DIVE-60 --type=decision --ask="$ESHIP_ASK" --f
 # original advice is true for them and must still print. Without this arm, deleting
 # the clause outright would pass C.
 seed DIVE-61; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-61 --type=decision --tier=2 --ask="$ESHIP_ASK" --from=dev >/dev/null 2>"$TMP/n61"
+actor_seam_as dev; cmd_task_need DIVE-61 --type=decision --tier=2 --ask-ok="fixture: this file grades ROUTING, and every explicit --tier=2 arm exists to prove the pin itself defeats it; --needs= would make the capability the reason and the arm would stop measuring the pin" --ask="$ESHIP_ASK" --from=dev >/dev/null 2>"$TMP/n61"
 { [[ "$(w2004_of "$TMP/n61")" -ge 1 ]] && [[ "$(remedy_of "$TMP/n61")" -ge 1 ]]; } \
   && ok_t "DIVE-2612: a filer whose resolver DOES return someone still gets the re-file remedy" \
   || bad_t "DIVE-2612 remedy still prints when a reviewer exists" "w2004=$(w2004_of "$TMP/n61") remedy=$(remedy_of "$TMP/n61")"
@@ -549,5 +557,6 @@ actor_seam_as main; cmd_task_need DIVE-63 --type=approval --tier=1 --ask="which 
   && ok_t "DIVE-2612: a non-eng-ship unrouted approval does NOT warn (no wallpaper)" \
   || bad_t "DIVE-2612 non-eng-ship approval must not warn" "warn=$(w2612_of "$TMP/n63")"
 
+SUMMARY_PRINTED=1
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == "0" ]]

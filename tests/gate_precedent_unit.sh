@@ -24,7 +24,16 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
+# DIVE-4346: ABORT backstop, and the filing calls below are deliberately NOT
+# subshelled. Subshelling them is the obvious hardening and it is WRONG HERE: the
+# citation arms read what a stubbed `task_need_notify` recorded into a shell
+# variable during the filing call, and a subshell discards it — measured, it reds
+# "prefill/fuzzy: citation handed to notifier". So this harness keeps the marker
+# instead: a refused fixture still ends the run, but it ends it with a VERDICT
+# rather than with silence, which is the half that actually misleads a reader.
+exec 8>&2
+SUMMARY_PRINTED=0
+trap 'rc=$?; rm -rf "${TMP:-}"; [[ "${SUMMARY_PRINTED:-0}" == 1 ]] || printf "ABORTED - gate_precedent_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-precedent-unit.XXXXXX)"
@@ -280,7 +289,11 @@ ASK_T2="approve the migration runbook"; SHAPE_T2="$(_gate_ask_shape "$ASK_T2")"
 seed_prec_by DIVE-1240 approval 2 "$SHAPE_T2" approved "human:mark"
 seed_prec_by DIVE-1241 approval 2 "$SHAPE_T2" approved "human:mark"
 seed_task DIVE-1242
-cmd_task_need DIVE-1242 --type=approval --ask="$ASK_T2" --tier=2 >/dev/null 2>&1
+# DIVE-4346: --needs=human_tap is the honest declaration. A5 needs a REAL tier-2
+# approval sitting on a person's desk to grade that auto-clear never touches one, and
+# signing off a migration runbook is a person's own call. Auto-clear eligibility is
+# decided on type and tier, so the declaration does not move what A5 measures.
+cmd_task_need DIVE-1242 --type=approval --ask="$ASK_T2" --tier=2 --needs=human_tap >/dev/null 2>&1
 eq_t "autoclear A5: T2 tier unchanged"        "$(field DIVE-1242 tier)"             "2"
 eq_t "autoclear A5: T2 stays blocked"         "$(field DIVE-1242 status)"           "blocked"
 eq_t "autoclear A5: T2 unanswered"            "$(field DIVE-1242 need_answered_at)" "∅"
@@ -363,5 +376,6 @@ eq_t "autoclear A11: approval never precedent-cleared" "$(field DIVE-1292 need_a
 eq_t "autoclear A11: approval stays blocked"           "$(field DIVE-1292 status)"           "blocked"
 
 echo "-------------------------------------"
+SUMMARY_PRINTED=1
 echo "gate_precedent_unit: ${PASS} passed, ${FAIL} failed"
 [[ "$FAIL" -eq 0 ]]

@@ -38,7 +38,13 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
+# DIVE-4346: ABORT backstop. A refused FIXTURE kills the harness before its
+# summary, and a harness with no verdict is indistinguishable from one that was
+# never reached -- how three of these produced silence instead of a red.
+# tests/truncation_marker_guard_unit.sh discovers this trap by grep and grades it.
+exec 8>&2
+SUMMARY_PRINTED=0
+trap 'rc=$?; rm -rf "${TMP:-}"; [[ "${SUMMARY_PRINTED:-0}" == 1 ]] || printf "ABORTED - gate_row_state_routing_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 . "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
@@ -266,7 +272,11 @@ OUT=$(file_gate DIVE-132 dev --type=approval --needs=spend_authority --ask="appr
   || bad_t "E3 floored cause must be named" "out=$OUT"
 
 seed DIVE-133 'gate routing bug report'
-OUT=$(file_gate DIVE-133 dev --type=approval --tier=2 --ask="make the final go/no-go call?")
+# DIVE-4346: the audited escape, because E4 grades that the gate names THE PIN as the
+# reason it is human-only. Declare a capability and the cause named becomes the
+# declaration (which is what E3 one arm above already grades), so the two arms would
+# collapse into one and the pin would go ungraded.
+OUT=$(file_gate DIVE-133 dev --type=approval --tier=2 --ask-ok="fixture: E4 grades that an explicit --tier=2 pin is named as the cause; --needs= would make the declaration the cause and duplicate E3" --ask="make the final go/no-go call?")
 [[ "$OUT" == *"NOT ROUTED"* && "$OUT" == *"--tier=2"* ]] \
   && ok_t "E4 an explicitly pinned gate says the pin is why" \
   || bad_t "E4 tier-2 pin cause must be named" "out=$OUT"
@@ -278,5 +288,6 @@ OUT=$(file_gate DIVE-134 dev --type=approval --tier=1 --ask="$ASK_MISS")
   && ok_t "E5 a ROUTED gate carries no NOT-ROUTED note" \
   || bad_t "E5 routed gate must not claim it landed on the human" "out=$OUT"
 
+SUMMARY_PRINTED=1
 printf '\n%s\n' "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]] || exit 1

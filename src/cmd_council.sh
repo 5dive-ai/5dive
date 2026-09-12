@@ -480,10 +480,10 @@ export const THRESHOLD_POLICY = {
 // CNCL-14 — constitution-as-data. Missing or malformed files fall back to these
 // exact pre-constitution values; a valid constitution.yaml may replace them per org.
 export const DEFAULT_HARD_GATE_CLASSES = {
-  spend_billing: 'spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\\$[0-9]|€[0-9]',
-  public_comms: 'publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast',
-  secrets: 'secret|credential|api key|token|password',
-  destructive: 'delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer',
+  spend_billing: 'spend|spending|billing|invoice|invoices|invoiced|charge|charges|charged|charging|payment|payments|refund|refunds|refunded|subscription|subscriptions|price|prices|pricing|\\$[0-9]+|€[0-9]+',
+  public_comms: 'publish|publishes|published|publishing|public post|announce|announces|announced|announcing|launch post|press|pressing|customer email|email customers|newsletter|blast|blasts|blasted|blasting',
+  secrets: 'secret|secrets|credential|credentials|api key|api keys|token|password|passwords',
+  destructive: 'delete|deletes|deleted|deleting|destroy|destroys|destroyed|destroying|teardown|wipe|wipes|wiped|wiping|purge|purges|purged|purging|drop[^.]{0,20}table|truncate|truncated|irreversible|revoke|revokes|revoked|revoking|dns|domain transfer',
 }
 export const DEFAULT_HARD_GATE_RX = Object.values(DEFAULT_HARD_GATE_CLASSES).join('|')
 
