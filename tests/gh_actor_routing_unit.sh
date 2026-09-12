@@ -37,9 +37,12 @@ done
 JSON_MODE=0
 set +e
 
-PASS=0; FAIL=0
-ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
-bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
+PASS=0; FAIL=0; SKIP=0
+ok_t()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
+bad_t()  { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
+# A skip must be COUNTED and NAMED (DIVE-3729): an arm this euid cannot express is
+# not a pass and not a failure, and a silent one turns into a vacuous green.
+skip_t() { SKIP=$((SKIP+1)); printf 'SKIP - %s\n   %s\n' "$1" "${2:-}"; }
 
 cls() { # <expected> <gh args...>
   local want="$1"; shift
@@ -187,10 +190,19 @@ unset -f gh
 
 # --- _gh_do: root-only, and it re-derives the class rather than trusting the
 # caller. The refusal has to survive a caller that routes an admin call anyway.
-out=$( ( cmd_gh_do ) 2>&1 )
-[[ "$out" == *"root-only"* ]] \
-  && ok_t "_gh_do refuses a non-root caller" \
-  || bad_t "_gh_do refuses a non-root caller" "$out"
+# DIVE-3729's rule: a negative control that ROOT cannot express must SKIP by name,
+# not fail. This arm asserts a refusal keyed on EUID, so running the harness as root
+# (the pre-push rail does) made it red on origin/main as well as on any branch — a
+# standing red that says nothing about anyone's diff. Named skip, and the positive
+# arm below still runs, so the file does not go quietly vacuous under root.
+if [[ "$(id -u)" -eq 0 ]]; then
+  skip_t "_gh_do refuses a non-root caller" "running as root — this euid IS the caller the refusal exempts, so the arm cannot express its own negative"
+else
+  out=$( ( cmd_gh_do ) 2>&1 )
+  [[ "$out" == *"root-only"* ]] \
+    && ok_t "_gh_do refuses a non-root caller" \
+    || bad_t "_gh_do refuses a non-root caller" "$out"
+fi
 grep -q '_gh_route_class "${args\[@\]}"' "$SRC/cmd_gh.sh" \
   && ok_t "_gh_do re-derives the routing class as root (never trusts the caller)" \
   || bad_t "_gh_do re-derives the routing class as root" "no authoritative re-derivation in cmd_gh.sh"
@@ -237,7 +249,13 @@ probe_gh_do 1 genuine-failure-from-root-gh
 grep -q "printf '%s\\\\0' \"\$@\" | sudo -n /usr/local/bin/5dive _gh_do" "$SRC/cmd_gh.sh" \
   && ok_t "cmd_gh hands argv to _gh_do over STDIN, never argv" \
   || bad_t "cmd_gh hands argv over STDIN" "no NUL-separated stdin handoff found"
-grep -q 'GH_TOKEN="$tok" GITHUB_TOKEN="" gh "${args\[@\]}"' "$SRC/cmd_gh.sh" \
+# DIVE-4341 widened this from a literal to a regex: a THIRD assignment (GH_CONFIG_DIR)
+# now sits in the same prefix, and pinning the exact byte sequence would have made any
+# added env var read as "the token moved into argv". What the arm is actually about is
+# unchanged and still pinned — GH_TOKEN is an ASSIGNMENT PREFIX on the gh call and the
+# arguments come from the array, so neither the token nor the argv appears in the
+# process table any other way.
+grep -qE 'GH_TOKEN="\$tok" GITHUB_TOKEN=""( [A-Za-z_][A-Za-z0-9_]*="[^"]*")* gh "\$\{args\[@\]\}"' "$SRC/cmd_gh.sh" \
   && ok_t "_gh_do passes the token as an env prefix, never in argv" \
   || bad_t "_gh_do passes the token as an env prefix" "token not applied as an environment prefix"
 # A missing sudo grant must be told apart from a failed gh call. sudo exits 1 for
@@ -305,5 +323,5 @@ grep -q '5dive gh whoami' "$SRC/main.sh" \
   || bad_t "wiring: the verb is advertised in help" "no help line"
 
 echo "-----"
-printf 'gh_actor_routing_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
+printf 'gh_actor_routing_unit: %d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

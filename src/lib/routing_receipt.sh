@@ -101,13 +101,55 @@ _routing_receipt_queue_pos() {
   fi
 }
 
+# DIVE-4342: does a DISPATCHER ACTUALLY EXIST on this box?
+#
+# `next wake: due now (dispatcher ticks every 5 min)` was printed unconditionally
+# — the arithmetic only ever asked whether lastRun+everyMin had passed, never
+# whether anything was going to run. On the box this was reported from,
+# `systemctl list-timers` listed zero 5dive timers and the root crontab held no
+# tick, so every receipt promised a wake that could not happen and `task doctor`
+# said "4/4 seats carry a heartbeat" one line above "the supervisor tick is not
+# armed". A heartbeat CONFIG is not a heartbeat DRIVER.
+#
+# Three states, and the third does not fold into either neighbour:
+#   installed:<how>  we found the tick and can name where.
+#   absent           every source we could read was readable and held nothing.
+#   unknown:<why>    the place it normally lives is not readable from this uid
+#                    (root's crontab), so we do not know. NOT "absent": telling
+#                    an operator to wake every seat by hand on a box that is
+#                    ticking fine is the same false claim in the other direction.
+_routing_receipt_dispatcher() {
+  local f hit=""
+  # /etc/cron.d is world-readable on every box we install on.
+  for f in /etc/cron.d/*; do
+    [[ -r "$f" ]] || continue
+    grep -qE '^[^#].*(5dive|five).*heartbeat[[:space:]]+tick' "$f" 2>/dev/null \
+      && { printf 'installed:%s\n' "$f"; return 0; }
+  done
+  # A systemd timer, if one is how this box drives it.
+  if command -v systemctl >/dev/null 2>&1; then
+    # No matching timer is the normal case here, so the no-match path must be a
+    # value, not a death (DIVE-2566/2603/2604).
+    hit=$(systemctl list-timers --all --no-pager 2>/dev/null \
+          | grep -oE '[[:alnum:]_.-]*(heartbeat|dispatch)[[:alnum:]_.-]*\.timer' | head -1) || hit=""
+    [[ -n "$hit" ]] && { printf 'installed:%s\n' "$hit"; return 0; }
+  fi
+  # root's crontab — the usual home for the tick, and readable only as root.
+  if [[ "$(id -u)" == "0" ]]; then
+    if crontab -l -u root 2>/dev/null | grep -qE '^[^#].*heartbeat[[:space:]]+tick'; then
+      printf 'installed:root crontab\n'; return 0
+    fi
+    printf 'absent\n'; return 0
+  fi
+  printf 'unknown:root crontab is not readable as %s\n' "$(id -un 2>/dev/null || echo "this uid")"
+}
+
 # When the dispatcher may next hand this seat a row. Same arithmetic as
 # `heartbeat ls` (lastRunAt + everyMin*60 - now), stated here rather than
 # imported because that value lives inside a display loop.
 #
-# "due now" is bounded by the cron driver's own 5-minute tick, and the line says
-# so: a sender told "due now" who then watches nothing happen for four minutes
-# has been given a new reason to ping, which is the defect this file is about.
+# "due now" is bounded by the cron driver's own tick — when there IS one. The
+# line says which of those two facts it is standing on.
 _routing_receipt_next_wake() {
   local owner="$1"
   command -v jq >/dev/null 2>&1 || { echo "next wake: unknown"; return 0; }
@@ -128,9 +170,25 @@ _routing_receipt_next_wake() {
   [[ "$lastRun" =~ ^[0-9]+$ ]] || lastRun=0
   now=$(date +%s)
   nextIn=$(( lastRun + everyMin * 60 - now ))
+  local disp; disp=$(_routing_receipt_dispatcher)
+  case "$disp" in
+    absent)
+      # The seat is due and nothing will ever notice. Say the actionable thing,
+      # not the arithmetic: this is the one branch where the sender genuinely
+      # must do something else.
+      echo "next wake: NO DISPATCHER INSTALLED on this box — nothing runs \`5dive heartbeat tick\`, so ${owner} will not be woken by a schedule. Wake it by hand: 5dive heartbeat wake-task <ident>"
+      return 0 ;;
+    unknown:*)
+      if (( nextIn <= 0 )); then
+        echo "next wake: due now, IF a dispatcher is installed — ${disp#unknown:}, so this receipt cannot confirm one runs. Check with: sudo crontab -l | grep 'heartbeat tick'"
+      else
+        echo "next wake: in ~$(( (nextIn + 59) / 60 ))m, IF a dispatcher is installed (${disp#unknown:})"
+      fi
+      return 0 ;;
+  esac
   if (( nextIn <= 0 )); then
-    echo "next wake: due now (dispatcher ticks every 5 min)"
+    echo "next wake: due now (dispatcher: ${disp#installed:})"
   else
-    echo "next wake: in ~$(( (nextIn + 59) / 60 ))m"
+    echo "next wake: in ~$(( (nextIn + 59) / 60 ))m (dispatcher: ${disp#installed:})"
   fi
 }

@@ -185,7 +185,9 @@ _gh_bot_available() {
 # DIVE-3135: the banner used to assert `actor=your own gh credential` on a seat
 # that has none — the same defect class as DIVE-3128's `human:<relaying agent>`,
 # an identity named before it was resolved.
-_gh_caller_credential() { gh auth token >/dev/null 2>&1; }
+# DIVE-4341: under a config dir this uid cannot read, gh exits non-zero on the
+# config read and this predicate renders it as "you hold no credential".
+_gh_caller_credential() { GH_CONFIG_DIR="$(gh_config_dir)" gh auth token >/dev/null 2>&1; }
 
 # _gh_child_exit <rc> — a non-zero from the WRAPPED gh is gh's failure, not ours.
 #
@@ -329,7 +331,7 @@ cmd_gh() {
 # infer from a config file and becomes something you can measure in one call.
 cmd_gh_whoami() {
   local caller bot
-  caller=$(gh api user --jq .login 2>/dev/null || true)
+  caller=$(GH_CONFIG_DIR="$(gh_config_dir)" gh api user --jq .login 2>/dev/null || true)
   printf 'caller : %s\n' "${caller:-UNRESOLVED (no gh credential in this environment)}"
   bot=$(printf '%s\0' api user --jq .login | sudo -n /usr/local/bin/5dive _gh_do 2>/dev/null || true)
   # Three causes, and naming only the first two would send a reader hunting a
@@ -376,7 +378,7 @@ cmd_gh_do() {
   # the root helper did run gh and therefore must not emit the silent-exit bug
   # report on top of gh's own output.
   local rc=0
-  GH_TOKEN="$tok" GITHUB_TOKEN="" gh "${args[@]}" || rc=$?
+  GH_TOKEN="$tok" GITHUB_TOKEN="" GH_CONFIG_DIR="$(gh_config_dir)" gh "${args[@]}" || rc=$?
   (( rc != 0 )) && mark_reported
   return "$rc"
 }

@@ -2263,9 +2263,20 @@ _task_start_preflight() {
             _pf "origin is an SSH remote but no SSH key found under ~/.ssh — a push will fail; stage the key before you plan to push."
           fi ;;
         https://*)
-          if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
-            _pf "origin is an HTTPS remote but 'gh auth' isn't logged in — a push will prompt/fail; authenticate before you plan to push."
-          fi ;;
+          # DIVE-4341: this asked `gh auth status` and nothing else, so it fired on
+          # EVERY agent seat of every provisioned box — twice wrong. (a) the shared
+          # GH_CONFIG_DIR that profile.d exports is claude's 0600 one, so gh exits on
+          # a config read and "no login" is what an unreadable config looks like from
+          # here; (b) an agent seat is not SUPPOSED to hold its own login — it pushes
+          # through the delegated rail, which the check never asked about. Name the
+          # rail that WILL carry the push, and warn only when there is genuinely none.
+          local _rail; _rail=$(gh_credential_rail)
+          case "$_rail" in
+            none)
+              _pf "origin is an HTTPS remote and NO push credential is reachable from this seat — not your own gh login, not the delegated claude rail, not the machine account. A push will prompt/fail; authenticate (gh auth login) or land it with '5dive push' from a seat that can." ;;
+            claude|bot)
+              : ;;  # the delegated rail carries it; warning here is the cry-wolf
+          esac ;;
       esac
     fi
   fi
