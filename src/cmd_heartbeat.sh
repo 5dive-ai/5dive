@@ -4253,6 +4253,23 @@ _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
   AND (COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-1 hour')
        OR (gate_pinged_at IS NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-15 minutes')))
+  -- DIVE-4365 part 2: THE RE-NAG MUST NOT OUTRUN THE LEAD-REVIEW HOLD. A tier-2
+  -- gate's phone ping is now held up to 30 minutes so the lead can catch a false
+  -- one (src/task/notify.sh, the lead-review hold). The clause above makes a
+  -- never-pinged gate re-nag-eligible at 15, which is INSIDE that hold — so
+  -- without this the recovery path becomes the first contact and the hold is a
+  -- no-op on exactly the gates it was built for. Same ordering argument, and the
+  -- same 60s margin, as the 840-not-900 sizing one layer down: the re-nag is the
+  -- net under a ping lost to a dead box, never the normal first ring.
+  --
+  -- SCOPED TO never-pinged TIER-2 ROWS ONLY, and scoped by AGE, not by a flag:
+  -- an hour-old gate, an urgent one (the hold skips those outright, so they are
+  -- pinged already and gate_pinged_at is set), and every tier-1 row are
+  -- unaffected. A gate whose hold child died with its box still re-nags — one
+  -- window later instead of at 15 minutes, which is a delay, never a swallow.
+  AND NOT (COALESCE(tier,2)=2 AND gate_pinged_at IS NULL
+           AND COALESCE(gate_urgent,0)=0
+           AND COALESCE(need_asked_at,updated_at,created_at) > datetime('now','-31 minutes'))
   AND NOT (tier=1 AND recommend IS NOT NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-48 hours'))
   AND (gate_pinged_at IS NULL
@@ -4469,20 +4486,27 @@ _hb_gate_renag_sweep() {
   # lose than a pin. So an empty or unpaired coordinator falls straight back to the
   # historical per-filer fan-out: the human gets duplicates again, which is the old
   # behaviour and is loud, rather than silence, which is not.
+  # DIVE-4365 part 3: the SENDER is now the resolved gate notifier, not the org
+  # coordinator. `_task_resolve_gate_notifier` falls back to the coordinator when
+  # no role carries the ` gate notifier` marker, so an untagged chart re-nags from
+  # exactly the bot it re-nags from today and DIVE-3742's one-sender property is
+  # untouched — what changes is that an operator can now move the phone ping to
+  # the lead WITHOUT moving default assignment, default planning and the loop
+  # owner with it (see the split at src/task/routing.sh).
   local _renag_coord=""
-  _renag_coord=$(_task_resolve_coordinator 2>/dev/null || true)
+  _renag_coord=$(_task_resolve_gate_notifier 2>/dev/null || true)
   if [[ -n "$_renag_coord" ]] && _task_agent_channel "$_renag_coord"; then
     ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}
               AND COALESCE(tier,2)=2
               ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;" | paste -sd, -)
     if [[ -n "$ids" ]]; then
-      _hb_log "[gate-renag] T2 collapsed onto coordinator ${_renag_coord}; rows=${ids} (DIVE-3742)"
+      _hb_log "[gate-renag] T2 collapsed onto gate notifier ${_renag_coord}; rows=${ids} (DIVE-3742/4365)"
       _hb_gate_renag_batch "$_renag_coord" "$ids" "paired human"
     fi
   else
     [[ -n "$_renag_coord" ]] \
-      && _hb_log "[gate-renag] coordinator ${_renag_coord} has no paired channel; T2 falls back to per-filer fan-out (DIVE-3742)" \
-      || _hb_log "[gate-renag] no coordinator resolved; T2 falls back to per-filer fan-out (DIVE-3742/2031)"
+      && _hb_log "[gate-renag] gate notifier ${_renag_coord} has no paired channel; T2 falls back to per-filer fan-out (DIVE-3742/4365)" \
+      || _hb_log "[gate-renag] no gate notifier resolved; T2 falls back to per-filer fan-out (DIVE-3742/2031)"
     while IFS= read -r owner; do
       [[ -n "$owner" ]] || continue
       ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}

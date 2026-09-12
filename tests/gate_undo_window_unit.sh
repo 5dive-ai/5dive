@@ -58,11 +58,21 @@ MARK="$TMP/delivered"
 _task_need_notify_deliver_now() { printf '%s\n' "$1" >>"$MARK"; TASK_SEND_DELIVERED=1; return 0; }
 delivered() { grep -qx "$1" "$MARK" 2>/dev/null; }
 
-mkgate() {   # $1=ident $2=priority
-  local ident="$1" prio="${2:-high}"
+# DIVE-4365: the fixture now writes an EXPLICIT tier, and it must. A tier-2 gate
+# is human-bound, and its ping is held for the lead-review window instead of the
+# windows this file grades (src/task/notify.sh, the lead-review hold) — so a row
+# left at NULL, which `COALESCE(tier,2)` reads as 2, silently moved every arm here
+# onto the other mechanism's ceiling. Tier 1 is what these arms were written on:
+# `need_type='decision'` is the type whose default tier IS 1, so this restores the
+# fixture to the gate it always described rather than re-pointing the assertions.
+# Arms that grade the manual/secret TYPE ceiling keep tier 1 deliberately — an
+# explicit `--tier=1` on a manual gate is a real, reachable filing, and the type
+# ceiling is exactly what it resolves.
+mkgate() {   # $1=ident $2=priority $3=tier (default 1)
+  local ident="$1" prio="${2:-high}" tier="${3:-1}"
   db "INSERT INTO tasks (ident,title,status,priority,assignee,created_by)
       VALUES ($(sqlq "$ident"),'undo window fixture','blocked',$(sqlq "$prio"),'dev','dev');"
-  db "UPDATE tasks SET need_asked_at=datetime('now'), need_type='decision'
+  db "UPDATE tasks SET need_asked_at=datetime('now'), need_type='decision', tier=${tier}
         WHERE ident=$(sqlq "$ident");"
 }
 reset() { : >"$FIVEDIVE_GATE_NOTIFY_LOG"; : >"$MARK"; TASK_GATE_DELIVERY_ROWS=0; TASK_GATE_ROUTE_URGENT=0; }

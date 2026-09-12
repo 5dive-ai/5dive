@@ -1894,6 +1894,7 @@ cmd_task_need() {
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode="" ask_ok=""
   local gate_owner=""   # DIVE-3342
   local urgent=0        # DIVE-3474 arm 2
+  local self_minted=0 escalate=0   # DIVE-4365 part 1
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local ask_src="" recommend_src=""
   local -a positional=()
@@ -1928,6 +1929,25 @@ cmd_task_need() {
       # routed gate is QUEUED for the reviewer's next natural wake instead of
       # waking their window; with it, the file-time a2a ping fires as it did before.
       --urgent)      urgent=1 ;;
+      # DIVE-4365 part 1: THE VALUE IS OURS TO INVENT AND OURS TO PLACE. A
+      # `secret` gate is tier 2 by TYPE because the historical secret gate asks a
+      # person for a credential only they can issue (a Stripe key, an OAuth token).
+      # A SELF-MINTED secret is the opposite shape: we generate the string
+      # ourselves and place it with credentials the box already holds. Nothing in
+      # it is human-held, so a human tap on it is a manual step counted against the
+      # autonomy number for no decision at all — DIVE-4359, where the gate rang a
+      # phone and the lead then did the whole step in one command.
+      #
+      # DECLARED, NEVER INFERRED, and the ask text is deliberately not read for it.
+      # Guessing "invent any random string" out of prose is the keyword-floor
+      # mistake (DIVE-4175 arm C) pointed the other way, and pointed the other way
+      # it is far worse: the floor over-fires toward a human, this would under-fire
+      # AWAY from one. Only the filer can state that the value is self-minted, and
+      # the statement is on the record.
+      --self-minted) self_minted=1 ;;
+      # DIVE-4365 part 1: the lead's explicit forward — the ONE route from a
+      # lead-reviewed gate to a person. See the branch below.
+      --escalate)    escalate=1 ;;
       --withdraw)    withdraw=1 ;;
       # DIVE-931 secure credential drop: name WHERE a secret gate's value lands.
       # Both together enable the burnable drop link in the gate message.
@@ -1985,6 +2005,100 @@ cmd_task_need() {
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id> --type=decision|secret|approval|manual|access --ask=\"...\"  (flags: 5dive task --help)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
 
+
+  # ── DIVE-4365 part 1 — THE LEAD'S ESCALATION ────────────────────────────────
+  #
+  # Parts 1 and 2 both put a LEAD in front of the human: a self-minted secret gate
+  # is routed to the lead outright, and every human-bound gate's phone ping is held
+  # for a lead-review window. Both need exactly one exit, or they are not a review,
+  # they are a block — and the exit has to be cheap enough that a lead who is
+  # unsure takes it. This is it: one flag, no re-file, the gate keeps its ident,
+  # its ask, its recommendation and its history, and the phone rings now.
+  #
+  # RAISING THE TIER IS THE WHOLE ACT. It sets tier=2 (the human tier), stamps WHY
+  # (`axis=lead-escalated`, so a reader can tell a lead's forward from the category
+  # floor and from a hand-typed --tier=2 — the DIVE-2615 distinction), clears
+  # gate_pinged_at so the ping is owed again, and sets gate_urgent so the
+  # lead-review hold skips: a gate a lead has already read does not need a second
+  # window in front of it.
+  #
+  # AUTHORIZED LIKE A WITHDRAW, and for the symmetric reason. A withdraw retires a
+  # question; an escalation promotes one, and neither is a GRANT — no secret and no
+  # approval is recorded as provided by this path, so it never touches
+  # cmd_task_answer's human-only clear. The authorized set is the same one, minus
+  # nothing: the gate's filer of record, the filer's routed lead, the gate's own
+  # routed reviewer, the org coordinator, or a CORROBORATED human caller — every
+  # rung requiring BOTH the caller and the authorizer to have actually resolved
+  # (see the fail-closed note at the comparisons).
+  if [[ -n "$escalate" && "$escalate" != "0" ]]; then
+    [[ -z "$type$ask$options$recommend$tier$secret_key$connector$oob$probe$discusses$needs$withdraw" && "$self_minted" == "0" ]] \
+      || fail "$E_USAGE" "--escalate takes no other gate flags (it forwards the EXISTING gate to the paired human; it does not re-file one)"
+    local e_type e_ans e_status e_tier e_filer e_lead e_coord e_routed e_id e_kind e_name="" e_ok=0
+    e_status=$(db "SELECT status FROM tasks WHERE id=${id};")
+    [[ "$e_status" == "done" || "$e_status" == "cancelled" ]] \
+      && fail "$E_CONFLICT" "$ident is $e_status — nothing to escalate"
+    e_type=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
+    e_ans=$(db  "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
+    e_tier=$(db "SELECT COALESCE(tier,2)              FROM tasks WHERE id=${id};")
+    [[ -n "$e_type" ]] || fail "$E_CONFLICT" "$ident has no gate to escalate"
+    [[ -z "$e_ans" ]]  || fail "$E_CONFLICT" "$ident's gate is already answered — --escalate only applies to a still-pending gate"
+    [[ "$e_tier" != "2" ]] \
+      || fail "$E_CONFLICT" "$ident's gate is already tier 2 (bound for the paired human) — there is nothing above it to escalate to. If the ping has not arrived, the heartbeat re-nag owns that; it is answerable now with: 5dive task answer ${ident}"
+    e_filer=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),'') FROM tasks WHERE id=${id};")
+    e_routed=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE id=${id};")
+    e_id=$(_gate_withdraw_actor)                          # "agent <name>" | "human" | "none"
+    e_kind="${e_id%% *}"
+    [[ "$e_kind" == "agent" ]] && e_name="${e_id#agent }"
+    e_lead=$(_gate_route_reviewer "$e_filer") || e_lead=""
+    e_coord=$(_task_resolve_coordinator) || e_coord=""
+    # FAILS CLOSED WHERE THE CALLER CANNOT BE IDENTIFIED. Iteration 1 shipped this
+    # guard open in exactly that state, and CI caught what this box could not: the
+    # harness runs as ROOT with no SUDO_* (DIVE-4341), where _gate_withdraw_actor's
+    # human rung is a NAME test alone — `root` is not `agent-*`, so it printed
+    # `human` and the guard admitted a caller it had not identified. Measured
+    # 2026-09-12: `sudo -n env -u SUDO_USER -u SUDO_UID bash
+    # tests/gate_lead_review_routing_unit.sh` forwarded an unauthorized gate to the
+    # paired human, rc=0. On an agent seat the same sha refused it, which is why a
+    # local run cannot see this.
+    #
+    # So the human rung takes the SEALED predicate cmd_task_answer already demands
+    # of a human-only clear (_gate_human_principal = the uid test AND the DIVE-2371
+    # cgroup corroboration), not the weaker name test. The two paths now agree: the
+    # identity good enough to ANSWER a tier-2 gate is the identity good enough to
+    # CREATE one. A root shell with no session scope, a CI container and any other
+    # unenumerated principal are refused — the DIVE-2371 rule, that a human-evidence
+    # test whose default is *human* has its fail direction backwards, applied to the
+    # one rung on this row that had not been given it.
+    #
+    # _gate_withdraw_actor itself is UNCHANGED: --withdraw retires a question and
+    # --escalate promotes one to a person, and only the promoting half is this row's.
+    [[ "$e_kind" == "human" ]] && _gate_human_principal && e_ok=1
+    # BOTH SIDES NON-EMPTY on every comparison below, so an unresolved authorizer can
+    # never match an unresolved caller. e_name is already gated non-empty, which is
+    # what kept this half closed in practice; the filer rung is the one that read only
+    # one side, and a rung that is correct by accident is not a rung.
+    [[ -n "$e_name" && -n "$e_filer" && "$e_name" == "$e_filer" ]] && e_ok=1
+    [[ -n "$e_name" && -n "$e_lead"   && "$e_name" == "$e_lead"   ]] && e_ok=1
+    [[ -n "$e_name" && -n "$e_routed" && "$e_name" == "$e_routed" ]] && e_ok=1
+    [[ -n "$e_name" && -n "$e_coord"  && "$e_name" == "$e_coord"  ]] && e_ok=1
+    (( e_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-escalate-not-authorized DIVE-4365 "$ident" "only the gate's filer (${e_filer:-unrecorded}), their lead (${e_lead:-none}), the gate's routed reviewer (${e_routed:-none}), the org coordinator (${e_coord:-none}) or a human at a real login session can forward this gate to the paired human. If that is not you and the gate is genuinely a person's call, say so on the row and let one of those seats forward it — do not re-file it as --tier=2, which loses this gate's history."
+    db "UPDATE tasks
+          SET tier=2, floor_provenance='axis=lead-escalated', gate_urgent=1,
+              gate_pinged_at=NULL, updated_at=datetime('now')
+        WHERE id=${id};"
+    _task_store_audit_log "task.gate-escalated-to-human" ok 0 -- "$ident" "by=$(task_actor "$from")" "type=$e_type" "from_tier=$e_tier" || true
+    local e_ask e_opts e_rec e_sk e_conn
+    e_ask=$(db  "SELECT COALESCE(ask,'')           FROM tasks WHERE id=${id};")
+    e_opts=$(db "SELECT COALESCE(need_options,'')  FROM tasks WHERE id=${id};")
+    e_rec=$(db  "SELECT COALESCE(recommend,'')     FROM tasks WHERE id=${id};")
+    e_sk=$(db   "SELECT COALESCE(secret_key,'')    FROM tasks WHERE id=${id};")
+    e_conn=$(db "SELECT COALESCE(connector,'')     FROM tasks WHERE id=${id};")
+    TASK_GATE_FILER="$e_filer" task_need_notify "$ident" "$e_type" "$e_ask" "$e_opts" "$e_rec" "$e_sk" "$e_conn" || true
+    ok "$ident: gate forwarded to the paired human (tier ${e_tier} -> 2, recorded as lead-escalated). The lead-review hold is skipped — this gate has already been read by a lead." \
+       '{id:($i|tonumber), ident:$id, escalated:true, need_type:$ty, from_tier:($ft|tonumber), tier:2, floor_provenance:"axis=lead-escalated"}' \
+       --arg i "$id" --arg id "$ident" --arg ty "$e_type" --arg ft "$e_tier"
+    return 0
+  fi
 
   # DIVE-1401: --withdraw path. Secret/approval/manual gates are human-only to
   # CLEAR by deliberate security scope (an agent can't fake a secret grant). But
@@ -2313,6 +2427,19 @@ cmd_task_need() {
   elif [[ "$type" == "secret" && -z "$secret_key$connector" ]]; then
     fail "$E_VALIDATION" "a secret gate must name a delivery path — pass --secret-key=<ENV> --connector=<stem>, or --out-of-band=\"<where>\""
   fi
+  # DIVE-4365 part 1: --self-minted is a claim about a SECRET'S VALUE, so it is
+  # only meaningful where there is a secret. Refused, not ignored, on every other
+  # type: a flag that silently does nothing on `--type=decision` is a filer
+  # believing they routed a gate they did not route, which is the DIVE-2241
+  # near-miss class (a typo'd --needs falling through to a weaker gate) with the
+  # same failure direction. `--needs=secret_provision` counts as naming a secret
+  # even without --type=secret, because that is the other vocabulary for the same
+  # ask and refusing it would push filers into re-typing the type to get the flag.
+  if (( self_minted )); then
+    if [[ "$type" != "secret" ]] && ! { [[ -n "$needs" ]] && _gate_needs_human "$needs" && [[ "$(printf '%s' "$needs" | tr '[:upper:]-' '[:lower:]_')" == *secret_provision* ]]; }; then
+      fail "$E_VALIDATION" "--self-minted only applies to a secret gate (--type=secret, or --needs=secret_provision). It declares that the VALUE is one we generate and place ourselves; on a ${type:-?} gate there is no value for it to describe. If this ask is a judgement call your lead should make, it is already lead-routed by tier — see --tier."
+    fi
+  fi
   if [[ -n "$secret_key" || -n "$connector" ]]; then
     [[ "$type" == "secret" ]] || fail "$E_VALIDATION" "--secret-key/--connector only apply to --type=secret"
     [[ -n "$secret_key" && -n "$connector" ]] \
@@ -2368,7 +2495,15 @@ cmd_task_need() {
     [[ "$tier" == "0" || "$tier" == "1" || "$tier" == "2" ]] \
       || fail "$E_VALIDATION" "bad --tier '$tier' (0=auto-clear | 1=48h-TTL-applies-rec | 2=hard human gate)"
   else
-    case "$type" in decision|approval) tier=1 ;; *) tier=2 ;; esac  # DIVE-1284
+    # DIVE-4365 part 1: a SELF-MINTED secret defaults to the lead-review tier, the
+    # same tier a `decision` gets — because that is what it is. The value is ours
+    # to generate and ours to place; what is left to decide is whether we should,
+    # which is a lead's call. An EXPLICIT --tier still wins (this branch only runs
+    # when the caller passed none), so a filer who really does want the human can
+    # still say so, and the lead can always forward it with --escalate.
+    if (( self_minted )); then tier=1
+    else case "$type" in decision|approval) tier=1 ;; *) tier=2 ;; esac  # DIVE-1284
+    fi
   fi
   local tier_floored=0
   local _floored_by_title=0 _floor_axis=none _ft_title=""   # DIVE-2224
@@ -2400,9 +2535,19 @@ cmd_task_need() {
     if [[ "$tier_arg" == "2" ]]; then _floor_prov="axis=pinned"; else _floor_prov="axis=type-default"; fi
   fi
   if [[ "$tier" != "2" ]]; then
-    if [[ "$type" == "secret" ]]; then
+    # DIVE-4365 part 1: the secret-type floor is what makes `secret` permanently
+    # human, and it is correct for every secret a person must ISSUE. It is wrong
+    # for one we MINT. The declaration lifts exactly this floor and nothing else —
+    # the category floor below still runs on the ask, so a self-minted secret whose
+    # ask also asks to spend money or to destroy something is floored on THAT and
+    # still reaches the person. The provenance records which of the two happened,
+    # so "how many gates did this declaration take off the phone?" stays a question
+    # the store can answer.
+    if [[ "$type" == "secret" ]] && (( ! self_minted )); then
       tier=2; tier_floored=1
       _floor_prov="axis=secret-type"
+    elif [[ "$type" == "secret" ]]; then
+      _floor_prov="axis=self-minted-secret"
     else
       local ttl_title; ttl_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
       # DIVE-2224: per-field, never the join; and the ASK is the subject (answer A).
@@ -2559,8 +2704,26 @@ cmd_task_need() {
   # turns a mis-declared gate into a STUCK one, and the whole point of the class
   # is that a mis-declaration should cost a re-file, not a block. `--needs=`
   # (empty) is the same as absent: undeclared, never non-holding.
+  # DIVE-4365 part 1: `--needs=secret_provision --self-minted` is not a
+  # contradiction, it is the precise case this row exists for — the filer names the
+  # capability the ask consumes AND states that this particular value is not one a
+  # human holds. The declaration of self-minting wins over the declaration of the
+  # capability because it is the MORE SPECIFIC claim about the same value, and both
+  # stay on the record: needs_capability is still written, so nothing is erased,
+  # and floor_provenance says which way it resolved.
   local _needs_human=0
-  if [[ -n "$needs" ]]; then
+  # SCOPED TO secret_provision, and the scoping is the guard that keeps
+  # --self-minted from becoming a general escape from the human tier. Self-minting
+  # is a claim about a SECRET'S VALUE and about nothing else: it can say "no person
+  # has to issue this string", and it cannot say "no person has to authorise this
+  # spend" or "no person has to make this brand call". A filer who declares
+  # spend_authority or human_tap alongside it has named a second, unrelated
+  # human-held capability, and that one stands — the gate is tier 2 on THAT.
+  local _sm_norm=""
+  [[ -n "$needs" ]] && _sm_norm=$(printf '%s' "$needs" | tr '[:upper:]-' '[:lower:]_')
+  if [[ -n "$needs" ]] && (( self_minted )) && _gate_needs_human "$needs" && [[ "$_sm_norm" == *secret_provision* ]]; then
+    warn "--needs=${needs} names a human-held capability, but --self-minted states this value is one WE generate and place with credentials the box already holds. The self-minting declaration wins and this gate goes to your lead, not to a person. Drop --self-minted if the credential genuinely has to come FROM a human; the lead can forward it either way with: 5dive task need ${ident} --escalate"
+  elif [[ -n "$needs" ]]; then
     if _gate_needs_human "$needs"; then
       _needs_human=1
       tier=2; tier_floored=1
@@ -3088,6 +3251,8 @@ cmd_task_need() {
   --tier=0    apply \"${recommend}\" NOW. No ping, and still a permanent gate record plus a digest line. This is the exit you want on a decision you have already made — it was used 0 times in the 346 gates measured, which is a discoverability failure, not a missing feature.
   --tier=1    route to your lead, or to this task's verifier if it carries a loop — except a push-for-review ask, which goes to the LEAD even on a loop, because the verifier cannot read the diff until it is pushed (DIVE-3117); the 48h TTL applies your recommendation if nobody answers, on a decision (NOT on approval/manual/access/secret, which the sweep excludes — DIVE-2235). Use it when you want a second pair of eyes, not a person's authority. DIVE-3694: if YOUR OWN recent tier-1 decisions have been coming back as your recommendation (run \`5dive task track-record\` to see your rate, your count, and what would revoke it), this gate applies itself and pings nobody — one answer against you revokes that. DIVE-3481: an --type=approval ask that is an INERT branch push, on a row whose 'Branch:' binding names a non-protected ref, clears at filing instead and pings nobody (\`5dive task pfr-autoclear off\` restores the ping).
   --needs=human_tap|spend_authority|secret_provision    DECLARE the human-held capability this ask consumes (a person's call on brand/strategy, money, or a credential only a human can issue). Tier 2 by declaration, never refused here.
+  --self-minted                                        DECLARE that this secret's VALUE is one we invent and place with credentials the box already holds (no human issues it). Routes to your lead for review instead of to the paired human. --type=secret only.
+  --escalate                                           (no other flags) forward an EXISTING pending lead-tier gate to the paired human, keeping its ident, ask and history. The one exit from a lead review.
   --rubber-stamp-ok=\"<why a person must answer this despite your recommendation>\"    the audited exception. Recorded on the gate row and readable afterwards.
 If you cannot name the capability, this is a decision you find uncomfortable, not a human gate."
     fi
