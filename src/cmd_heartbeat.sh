@@ -4048,6 +4048,38 @@ _hb_materialize_recurring() {
 #       the batch to weekly. Never auto-applies, never expires.
 # Isolated by the caller (|| log) — a sweep failure must never abort the wake
 # loop (the heartbeat-never-woke bug class).
+# DIVE-4381 iteration 3: the FOURTH human-facing gate composer is pass (3) of
+# _hb_gate_ttl_sweep — the 72h stale-gate BACKLOG batch. Its two bullet lists were
+# built entirely inside SQL, so there was nowhere to call the bash-side link
+# predicate and the backlog reminder shipped bare while the other three carried
+# the link. The complete sweep is `grep -rn '_task_send_gate_owner ' src/`: DIVE-3342
+# made that the single door a gate message leaves by, so enumerating its callers is
+# complete BY CONSTRUCTION, where the previous two sweeps (on _task_gate_ask_line,
+# then on the rendered /task_ token) were each complete only by luck.
+#
+# PER ROW, NOT PER BATCH: this composer renders MANY rows in ONE message, so a link
+# appended at batch level would be present-but-unattached — the R4/R5 mixed-batch
+# defect already armed for on the re-nag. The loop is restructured (rather than the
+# predicate re-expressed as a SQL join) so that `_task_gate_delivery_link_line`
+# stays the ONE place the http(s):// rule lives; a SQL copy of it would be a second
+# predicate free to drift from the first.
+_hb_gate_backlog_bullets() { # <sql: SELECT id||x'1f'||bullet ...> -> bullets, each with its own link line
+  local _row _rid _rline _dl _out=""
+  while IFS= read -r _row; do
+    [[ -n "$_row" ]] || continue
+    _rid="${_row%%$'\x1f'*}"; _rline="${_row#*$'\x1f'}"
+    [[ -n "$_rid" && "$_rline" != "$_row" ]] || continue
+    [[ -n "$_out" ]] && _out+=$'\n'
+    _out+="$_rline"
+    # Two-space continuation indent, the same shape the re-nag uses, so the URL
+    # reads as belonging to ITS bullet rather than to the batch. Appends nothing
+    # at all when the row carries no URL — no label, no orphan indent.
+    _dl=$(_task_gate_delivery_link_line "$_rid")
+    [[ -n "$_dl" ]] && _out+=$'\n'"  ${_dl}"
+  done < <(db "$1")
+  printf '%s' "$_out"
+}
+
 _hb_gate_ttl_sweep() {
   local tid
   # (1) wake parked
@@ -4117,10 +4149,10 @@ _hb_gate_ttl_sweep() {
     local lines_main lines_manual reminder_ids
     reminder_ids=$(db "SELECT id FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname")
                        ORDER BY COALESCE(need_asked_at,updated_at),id;" | paste -sd, -)
-    lines_main=$(db "SELECT '• /task_'||id||' ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
+    lines_main=$(_hb_gate_backlog_bullets "SELECT id||x'1f'||'• /task_'||id||' ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
                      FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type != 'manual'
                      ORDER BY COALESCE(need_asked_at,updated_at);")
-    lines_manual=$(db "SELECT '• /task_'||id||' ['||ident||'] '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
+    lines_manual=$(_hb_gate_backlog_bullets "SELECT id||x'1f'||'• /task_'||id||' ['||ident||'] '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
                        FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type = 'manual'
                        ORDER BY COALESCE(need_asked_at,updated_at);")
     [[ -n "$lines_main" || -n "$lines_manual" ]] || continue
@@ -4139,6 +4171,16 @@ _hb_gate_ttl_sweep() {
     # of stalling on one recipient. Rides this same weekly gate_pinged_at
     # throttle (computed before the UPDATE below). One level (immediate manager);
     # never auto-answers — a human still clears the gate.
+    # DIVE-4381 iteration 3 — DECIDED OUT, and deliberately so. This block is not a
+    # gate message: it goes over the AGENT rail (cmd_send to an org-chart parent),
+    # not through _task_send_gate_owner, which DIVE-3342 made the one door a message
+    # that asks a human to CLEAR a gate leaves by. Its bullets carry no /task_ link
+    # either — the recipient is an agent at a terminal with `5dive task show`, and the
+    # ask is "help chase the answer or re-scope", not "go look at this diff". Putting a
+    # review URL here would be the only affordance in a message that has none, i.e. a
+    # fix to a different and unfiled gap, on a surface outside this row's axis (the
+    # human gate notification). Arm E1 in tests/gate_delivery_link_unit.sh pins the
+    # decision so that changing it is deliberate rather than drift.
     local _mgr _esc_lines
     _mgr=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$aname");")
     if [[ -n "$_mgr" && "$_mgr" != "$aname" ]] && _task_agent_channel "$_mgr"; then

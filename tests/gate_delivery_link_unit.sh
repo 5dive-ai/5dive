@@ -39,6 +39,15 @@
 #          row with a URL, one without) and require exactly ONE link, inside the
 #          right row's bullet block.
 #
+#   B1-B6  THE 72h BACKLOG DIGEST (_hb_gate_ttl_sweep pass 3) — the FOURTH
+#          composer, found on iteration 2's bounce. Both of its bullet lists were
+#          built in SQL, so the loop is restructured to call the predicate per row
+#          rather than the predicate re-expressed as a join (one rule, one place).
+#          B6 grades the MANUAL sub-list, which is a second statement and a live
+#          mutant on its own. E1 pins the org-parent escalation as decided OUT.
+#          The sweep that is complete BY CONSTRUCTION, and the one to use, is
+#          `grep -rn '_task_send_gate_owner ' src/` — DIVE-3342's single door.
+#
 #   T1-T2  THE TYPE RULE, taken deliberately on this row and graded so a later
 #          narrowing is a visible choice rather than a drift. The line is keyed
 #          on the row holding a bound PR, NOT on the gate's type: a decision gate
@@ -313,6 +322,136 @@ if [[ "$_mix_url" == *"  🔗 Review: ${PR_URL}"* && "$_mix_none" != *"🔗"* \
 else
   bad_t "R5 the link is attached to the bullet that owns the ref, not the other one" \
         "with-ref block: [${_mix_url}] | link-less block: [${_mix_none}]"
+fi
+
+# ====== B: THE 72h BACKLOG BATCH (the fourth composer) =======================
+# Found on iteration 2's bounce. `_hb_gate_ttl_sweep` pass (3) is the weekly
+# "these have been waiting on you 3+ days" digest, and it built BOTH of its bullet
+# lists inside SQL — so there was no seam to call the bash-side predicate from and
+# the message shipped bare while the other three composers carried the link.
+#
+# THE SWEEP THAT FOUND IT, and the one to use from here on:
+# `grep -rn '_task_send_gate_owner ' src/` returns exactly the four composers plus
+# one overflow footer that renders no row. DIVE-3342 made that function the single
+# door a gate message leaves by, so enumerating its callers is complete BY
+# CONSTRUCTION — where the iteration-1 sweep (on the shared _task_gate_ask_line
+# helper) and the iteration-2 sweep (on the rendered /task_ token) were each
+# complete only by luck, and each missed exactly one path.
+#
+# B1-B5 are the same per-row shape as R1-R5 because this composer has the same
+# many-rows-one-message hazard. B6 is the arm the re-nag did not need: this pass
+# builds TWO lists (main + manual) from two separate statements, so wiring one and
+# not the other is a live mutant. E1 pins the org-parent escalation decision.
+BACKLOG_T="$TMP/backlog.txt"; ESC_T="$TMP/esc.txt"
+_task_send_gate_owner() { printf '%s' "$1" >"$BACKLOG_T"; TASK_SEND_DELIVERED=1; TASK_SEND_MESSAGE_IDS="902"; return 0; }
+cmd_send() { printf '%s\n' "$*" >>"$ESC_T"; return 0; }
+
+seed_backlog() { # <ident> <need_type> <delivery_ref>
+  db "INSERT INTO tasks (ident, title, status, priority, assignee, created_by, need_type,
+                         tier, ask, delivery_ref, need_asked_at)
+      VALUES ($(sqlq "$1"),'t','blocked','high','bdev','main',$(sqlq "$2"),2,
+              'look at this and decide',
+              $( [[ -n "${3:-}" ]] && sqlq "$3" || printf 'NULL'), datetime('now','-100 hours'));"
+}
+# Exactly the named idents are made backlog-eligible; every other bdev row is
+# pushed back inside the 72h window, so each run grades one known batch. The
+# ping receipt is cleared too — the pass is throttled weekly on gate_pinged_at.
+run_backlog() { # <hours-back> <ident>...
+  local _h="$1"; shift
+  : >"$BACKLOG_T"; : >"$ESC_T"
+  db "UPDATE tasks SET need_asked_at=datetime('now','-2 hours'), gate_pinged_at=NULL WHERE assignee='bdev';"
+  local _i
+  for _i in "$@"; do
+    db "UPDATE tasks SET need_asked_at=datetime('now','-${_h} hours'), gate_pinged_at=NULL
+        WHERE ident=$(sqlq "$_i");"
+  done
+  _hb_gate_ttl_sweep >/dev/null 2>&1
+  cat "$BACKLOG_T" 2>/dev/null
+}
+# Slice one bullet out of the digest. Bullets here are `• /task_<id> [IDENT] ...`,
+# and the block ends at the next bullet, the manual sub-header, or the footer —
+# so a link sitting in the footer can never be credited to the last bullet.
+bl_block() { # <text> <ident>
+  printf '%s\n' "$1" | awk -v id="$2" '
+    /^• / { inb = ($0 ~ ("\\[" id "\\]")) }
+    /^🛠/ || /^Answer from/ { inb = 0 }
+    inb { print }'
+}
+
+seed_backlog DIVE-9410 approval "$PR_URL"
+seed_backlog DIVE-9411 approval ""
+seed_backlog DIVE-9412 manual  "$PR_URL"
+
+_bt=$(run_backlog 100 DIVE-9410)
+[[ "$_bt" == *"🔗 Review: ${PR_URL}"* ]] \
+  && ok_t "B1 the 72h gate-BACKLOG digest carries the bound PR link" \
+  || bad_t "B1 the 72h gate-BACKLOG digest carries the bound PR link" "text: ${_bt:0:600}"
+
+# B2 PLACEMENT: first continuation line of its own bullet, two-space indent —
+# the same shape the re-nag uses, so the affordance does not drift between the
+# file-time ping, the /inbox re-send, the re-nag and this digest.
+_bblk=$(bl_block "$_bt" DIVE-9410)
+[[ "$(printf '%s\n' "$_bblk" | sed -n '2p')" == "  🔗 Review: ${PR_URL}" ]] \
+  && ok_t "B2 the digest link is its bullet's first continuation line, indented" \
+  || bad_t "B2 the digest link is its bullet's first continuation line, indented" \
+          "block: [${_bblk}]"
+
+# B3 THE NEGATIVE: a link-less row's bullet is byte-identical to before.
+_bt_none=$(run_backlog 100 DIVE-9411)
+if [[ -n "$_bt_none" && "$_bt_none" != *"🔗"* && "$_bt_none" != *"Review:"* ]]; then
+  ok_t "B3 a digest bullet for a row with NO delivery_ref carries no link"
+else
+  bad_t "B3 a digest bullet for a row with NO delivery_ref carries no link" "text: ${_bt_none:0:600}"
+fi
+
+# B4/B5 THE MIXED BATCH. A link appended at BATCH level — the shape a SQL-side
+# join tempts you into, and the one the iteration-2 grade named — passes B1 and
+# dies here.
+_bt_mix=$(run_backlog 100 DIVE-9410 DIVE-9411)
+_bn=$(printf '%s\n' "$_bt_mix" | grep -c '🔗 Review:')
+[[ "$_bn" == "1" ]] \
+  && ok_t "B4 a MIXED digest renders exactly one review link, not one per batch" \
+  || bad_t "B4 a MIXED digest renders exactly one review link, not one per batch" \
+          "links=${_bn} text: ${_bt_mix:0:800}"
+
+_bmix_url=$(bl_block "$_bt_mix" DIVE-9410); _bmix_none=$(bl_block "$_bt_mix" DIVE-9411)
+if [[ "$(printf '%s\n' "$_bmix_url" | sed -n '2p')" == "  🔗 Review: ${PR_URL}" \
+      && "$_bmix_none" != *"🔗"* ]]; then
+  ok_t "B5 the digest link is attached to the bullet that owns the ref"
+else
+  bad_t "B5 the digest link is attached to the bullet that owns the ref" \
+        "with-ref: [${_bmix_url}] | link-less: [${_bmix_none}]"
+fi
+
+# B6 THE SECOND LIST. `manual` gates are pulled by their own statement into the
+# "🛠 Manual steps" sub-block; wiring only the main list leaves this one bare and
+# passes B1-B5. The link must land under the MANUAL bullet, not the header.
+_bt_man=$(run_backlog 100 DIVE-9412)
+_bman=$(bl_block "$_bt_man" DIVE-9412)
+if [[ "$_bt_man" == *"🛠 Manual steps"* \
+      && "$(printf '%s\n' "$_bman" | sed -n '2p')" == "  🔗 Review: ${PR_URL}" ]]; then
+  ok_t "B6 the MANUAL sub-list of the digest carries the link too"
+else
+  bad_t "B6 the MANUAL sub-list of the digest carries the link too" "text: ${_bt_man:0:800}"
+fi
+
+# E1 THE DECISION, PINNED. The org-parent SLA escalation in the same function is
+# DECIDED OUT: it leaves over the agent rail (cmd_send to a manager), not through
+# _task_send_gate_owner, and its bullets carry no /task_ affordance at all — the
+# recipient is an agent at a terminal, and the ask is "chase or re-scope", not "go
+# look at this diff". This arm exists so that changing that is a deliberate edit
+# to a written decision rather than an accident.
+db "INSERT OR REPLACE INTO agents_org (name, reports_to) VALUES ('bdev','bmgr');" 2>/dev/null \
+  || db "INSERT OR REPLACE INTO agents_org (name, reports_to, updated_at) VALUES ('bdev','bmgr',datetime('now'));" 2>/dev/null
+_bt_esc=$(run_backlog 200 DIVE-9410)
+_esc=$(cat "$ESC_T" 2>/dev/null)
+if [[ "$_esc" == *"Gate escalation"* && "$_esc" == *"DIVE-9410"* && "$_esc" != *"🔗"* ]]; then
+  ok_t "E1 the org-parent escalation stays link-less (decided OUT, and pinned)"
+elif [[ -z "$_esc" ]]; then
+  bad_t "E1 the org-parent escalation stays link-less (decided OUT, and pinned)" \
+        "no escalation fired — arm is vacuous; agents_org row or the ${_HB_GATE_ESCALATE_DAYS}d clock is wrong"
+else
+  bad_t "E1 the org-parent escalation stays link-less (decided OUT, and pinned)" "esc: ${_esc:0:500}"
 fi
 
 printf '\n%s\n' "PASS=$PASS FAIL=$FAIL"
