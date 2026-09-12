@@ -29,13 +29,14 @@ set -uo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/verify-policy-matrix.XXXXXX)"
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
-         lib/registry.sh lib/disk.sh lib/verify_policy.sh lib/tasks_db.sh \
+         lib/registry.sh lib/disk.sh lib/verify_policy.sh lib/tasks_db.sh lib/runs.sh \
          lib/actor.sh cmd_task.sh cmd_push.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
@@ -101,6 +102,21 @@ expect "never      + no flag     -> none"   never          ""           none
 expect "never      + --no-verify -> none"   never          --no-verify  none
 expect "never      + --verify    -> grader" never          --verify     grader
 
+echo "── unset means delivered-only, through the real add/deliver path ─"
+printf '{}\n' > "$BOX_CONFIG"
+_u=$(cmd_task_add "unset default flow $RANDOM" --assignee=dev2 --from=main --priority=high 2>/dev/null)
+_ui=$(jq -r '.data.ident // empty' <<<"$_u")
+_uv_before=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE ident=$(sqlq "$_ui");")
+FIVE_DELIVER_NO_REACH_PROBE=1
+_ud=$( ( actor_seam_as dev2; cmd_task_start "$_ui" >/dev/null 2>&1; cmd_task_deliver "$_ui" --pr='https://github.com/o/r/pull/2' ) 2>&1)
+_uv_after=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE ident=$(sqlq "$_ui");")
+if [[ "$(box_verify_policy)" == "delivered-only" && -z "$_uv_before" && "$_uv_after" == "grader" ]]; then
+  ok_t "unset policy defers a standard row at add, then attaches its grader at delivery"
+else
+  bad_t "unset policy follows delivered-only through add and delivery" \
+        "policy=$(box_verify_policy) before='$_uv_before' after='$_uv_after' out=${_ud:0:180}"
+fi
+
 echo "── the override is PERSISTED, not just consumed ─────────────────"
 set_policy never
 _o=$(cmd_task_add "forced row $RANDOM" --assignee=dev2 --from=main --priority=high --verify 2>/dev/null)
@@ -153,10 +169,12 @@ echo "── the surface that writes it: 5dive config ────────�
 # and is exercised for real by the CLI on every set).
 source "$SRC/cmd_box_config.sh"
 require_root() { return 0; }
-rm -f "$BOX_CONFIG"
+printf '{}\n' > "$BOX_CONFIG"
 JSON_MODE=0
 _r=$(cmd_box_config 2>&1)
-[[ "$_r" == *"verify = always"* && "$_r" == *"unset"* ]]   && ok_t "config with no file reads 'always' and SAYS it is unset"   || bad_t "config with no file reads 'always' and says unset" "got: ${_r:0:200}"
+[[ "$_r" == *"verify = delivered-only (unset — defaulting to 'delivered-only')"* ]] \
+  && ok_t "config with no verify key reads 'delivered-only' and says it is the unset default" \
+  || bad_t "config with no verify key reads 'delivered-only' and says unset" "got: ${_r:0:200}"
 _r=$(cmd_box_config verify=bogus 2>&1)
 [[ "$_r" == *"always, delivered-only, never"* ]]   && ok_t "an out-of-range value is refused and the legal set is named"   || bad_t "an out-of-range value is refused" "got: ${_r:0:200}"
 cmd_box_config verify=never >/dev/null 2>&1
