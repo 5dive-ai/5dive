@@ -33,6 +33,11 @@ out="baseline-reports"
 mkdir -p "$out"
 
 disarm() { # <why>
+  # DIVE-4374: leave NO files behind. The caller globs this directory and passes one
+  # --baseline-report flag per file it finds, so a disarm that left a half-fetched
+  # shard in place would arm the instrument on a PARTIAL baseline — which is the
+  # defect this script's own enumeration fix exists to close, one layer down.
+  rm -f "$out"/*.txt 2>/dev/null || true
   printf 'fetch-budget-baseline: NO BASELINE — %s.\n' "$1"
   printf 'Attribution is DISARMED for this run: an over-budget verdict stands exactly as it\n'
   printf 'did before DIVE-3580. Nothing is weakened by this; only the relief is unavailable.\n'
@@ -65,9 +70,11 @@ arts="$(gh api "repos/$repo/actions/runs/$run_id/artifacts?per_page=100" \
 # red — so the enumeration must come from the artifact listing, which cannot drift
 # out of step with the matrix.
 got=0
+matched=0
 shards_seen=()
 while IFS=$'\t' read -r art_id shard_name; do
   [[ -n "$art_id" ]] || continue
+  matched=$(( matched + 1 ))
   tmp_zip="$(mktemp "${TMPDIR:-/tmp}/budget-baseline.XXXXXX.zip")" || continue
   if gh api "repos/$repo/actions/artifacts/$art_id/zip" > "$tmp_zip" 2>/dev/null \
      && unzip -o -q "$tmp_zip" -d "$out" 2>/dev/null; then
@@ -81,6 +88,15 @@ done < <(awk -F'\t' -v re="^core-$env-[0-9]+$" '$2 ~ re { print $1 "\t" $2 }' <<
 # are the baseline, and passing verdict files would feed the join lines it must skip.
 rm -f "$out"/core-verdict-*.txt 2>/dev/null || true
 
+# DIVE-4374: MATCHED IS NOT FETCHED. A shard artifact the listing named but whose
+# download or unzip failed leaves `got` short, and every remaining line of this
+# script would then hand the confirm job a baseline covering some of the corpus —
+# the same two-of-three shape the enumeration fix above removes, arriving by a
+# different door and at exit 0. A thin baseline fails toward the RED, so it is never
+# a false green; it is a red on harnesses the PR did not touch, which is the whole
+# reason this row exists. All or nothing: either every shard the run carries is
+# priced, or attribution is disarmed and the red stands as it did before DIVE-3580.
+(( got == matched )) || disarm "run $run_id carries $matched core-$env-* shard artifact(s) but only $got could be fetched — a partial baseline prices the missing shard's harnesses as themselves"
 (( got > 0 )) || disarm "run $run_id carried no core-$env-* artifacts"
 # DIVE-4374: NAME THE SHARDS, not just the count. A baseline that silently covers
 # two of three shards reads identically to a complete one in a bare number, and that

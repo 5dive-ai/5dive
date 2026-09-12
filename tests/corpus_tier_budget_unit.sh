@@ -769,6 +769,11 @@ PYZIP
 #!/usr/bin/env bash
 # Minimal gh double: the three calls fetch-budget-baseline.sh makes, nothing else.
 url="\$2"
+# DIVE-4374: an artifact id listed in GH_DOUBLE_FAIL is NAMED by the listing but
+# cannot be downloaded — the partial-baseline shape, not the absent-baseline one.
+for _bad in \${GH_DOUBLE_FAIL:-}; do
+  case "\$url" in *"/actions/artifacts/\$_bad/zip"*) exit 1 ;; esac
+done
 case "\$url" in
   *"/actions/workflows/unit-tests.yml/runs"*) printf '777\tdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\t2026-09-12T00:00:00Z\n' ;;
   *"/actions/runs/777/artifacts"*)
@@ -795,10 +800,16 @@ GHSTUB
   else
     bad "the baseline fetch takes every shard the green run carried" "got [$_blgot] — output: $_blout"
   fi
-  if grep -q '4 shard artifact(s)' <<<"$_blout" && grep -q 'core-installed-4' <<<"$_blout"; then
+  # Graded on the LOG LINE ALONE, pulled out first: the script prints `ls -l` two
+  # lines later, so a grep over the whole transcript is satisfied by the directory
+  # listing and passes with the naming deleted — the detector half of this fix would
+  # then be free to remove silently. The full bracketed list is required, so the old
+  # bare-count format cannot satisfy it as a substring either.
+  _blline="$(grep -m1 'fetch-budget-baseline: baseline is run' <<<"$_blout")"
+  if [[ "$_blline" == *"4 shard artifact(s) [core-installed-1 core-installed-2 core-installed-3 core-installed-4]"* ]]; then
     ok "…and it NAMES the shards it took, so a partial baseline cannot read as a complete one"
   else
-    bad "the fetch names the shards it took" "$_blout"
+    bad "the fetch names the shards it took on its own log line" "line=[$_blline] — output: $_blout"
   fi
   # The decoys: a confirm report is the RED being graded, not a price list, and the
   # other environment's numbers are a different box. Either one joined in would
@@ -813,6 +824,24 @@ GHSTUB
     ok "…and the shards' verdict hand-off files are stripped, leaving only the price reports"
   else
     bad "the verdict hand-off files are stripped from the baseline" "core-verdict-installed-1.txt survived"
+  fi
+  # DIVE-4374 (iteration 2): MATCHED IS NOT FETCHED. Enumerating from the listing
+  # closes the stale hand-written list, but a shard the listing NAMES whose download
+  # or unzip fails leaves the same partial baseline behind at exit 0 — three shards
+  # listed, two priced, and the missing shard's harnesses then priced as themselves
+  # against the very run being graded. Measured before the fix with this same double
+  # failing shard 2 of 4: `3 shard artifact(s) [core-installed-1 core-installed-3
+  # core-installed-4]`, exit 0, three of four price lists handed to the confirm job.
+  # All or nothing: disarm and leave the directory EMPTY, because the caller's glob
+  # is what arms the instrument.
+  mkdir -p "$_blroot/work-partial"
+  _blpout="$( cd "$_blroot/work-partial" && PATH="$_blroot/bin:$PATH" GITHUB_REPOSITORY=5dive-ai/5dive \
+                GH_DOUBLE_FAIL=12 bash "$_blabs" installed 2>&1 )"; _blprc=$?
+  _blpgot="$(ls "$_blroot/work-partial/baseline-reports" 2>/dev/null | sort | paste -sd, -)"
+  if [[ "$_blprc" == 0 && -z "$_blpgot" ]] && grep -q 'NO BASELINE' <<<"$_blpout"; then
+    ok "…and a shard that is LISTED but cannot be fetched disarms attribution rather than thinning the baseline (DIVE-4374)"
+  else
+    bad "an unfetchable shard disarms attribution" "rc=$_blprc left [$_blpgot] — output: $_blpout"
   fi
 else bad "the baseline fetch script is readable from the harness (DIVE-4374)" "no file at $_bl"; fi
 
