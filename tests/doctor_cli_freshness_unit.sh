@@ -245,6 +245,12 @@ EOF
 out=""; prev=""
 for a in "\$@"; do [[ "\$prev" == "-o" ]] && out="\$a"; prev="\$a"; done
 case "\${!#}" in
+  # DIVE-4223: the probe reads the release hold on main before it resolves a
+  # tag. Served OPEN here — this arm grades the SHA256 the probe emits, and a
+  # hold left unreadable would make it emit 'unavailable' with an empty digest,
+  # which is the exact shape the arm below asserts is correct. Green for the
+  # wrong reason in both directions at once.
+  *.release-hold*) printf '# 5dive-release-hold v1\n' ;;
   */5dive.sha256) cp "$STUBS/served.sha256" "\$out" ;;
   */5dive)        cp "$STUBS/served" "\$out" ;;
   *) exit 1 ;;

@@ -1371,10 +1371,45 @@ _published_cli_probe() {
   # `sort -V`, never `sort`. The regex drops anything that is not a plain
   # vMAJOR.MINOR.PATCH release tag, so an rc or a `nightly` can never become the
   # thing we advertise — same filter install.sh applies before installing one.
-  [[ -n "$tags" ]] && ref=$(printf '%s\n' "$tags" \
-    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1) || ref=""
-  if [[ -z "$ref" ]]; then
+  local candidates=""
+  [[ -n "$tags" ]] && candidates=$(printf '%s\n' "$tags" \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V) || candidates=""
+  if [[ -z "$candidates" ]]; then
     _pcp_out unavailable "" "no release tag resolves — the installer could not upgrade this box either"
+    return 0
+  fi
+
+  # DIVE-4223 — THE HOLD IS PART OF "WHAT WOULD THE INSTALLER RESOLVE".
+  # This probe exists because a second resolver that drifts from install.sh's
+  # gives two answers to the one question (DIVE-2287, above). A release hold is
+  # exactly such a drift if only one side reads it: arm a hold and this probe
+  # would keep telling the operator they are behind, naming a version
+  # `self-update` deliberately refuses to install — permanently, and both
+  # messages correct. A control enforced on one path is absent on the parallel
+  # one, so the same file, fetched from the same `main`, gates both.
+  #
+  # Unreadable => `unavailable`, NOT "no hold". install.sh fails CLOSED on the
+  # same condition, and this command's whole job is to report what it would do.
+  local hold_body="" hold_list=""
+  hold_body=$(curl -fsSL --max-time 10 \
+    "https://raw.githubusercontent.com/$org/5dive/main/.release-hold" 2>/dev/null) || hold_body=""
+  if [[ "$hold_body" != "# 5dive-release-hold v1"* ]]; then
+    hold_body=$(curl -fsSL --max-time 10 -H 'Accept: application/vnd.github.raw' \
+      "https://api.github.com/repos/$org/5dive/contents/.release-hold?ref=main" 2>/dev/null) || hold_body=""
+  fi
+  if [[ "$hold_body" != "# 5dive-release-hold v1"* ]]; then
+    _pcp_out unavailable "" "the release hold on main could not be read — this is not 'no hold is armed', and the installer refuses to upgrade on the same condition"
+    return 0
+  fi
+  hold_list=$(printf '%s\n' "$hold_body" \
+    | sed -n 's/^\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)\([[:space:]].*\)\{0,1\}$/\1/p')
+
+  if [[ -n "$hold_list" ]]; then
+    candidates=$(printf '%s\n' "$candidates" | grep -vxF "$hold_list") || candidates=""
+  fi
+  ref=$(printf '%s\n' "$candidates" | tail -1)
+  if [[ -z "$ref" ]]; then
+    _pcp_out unavailable "" "every release tag is held on main — the installer would refuse to upgrade this box too"
     return 0
   fi
 
