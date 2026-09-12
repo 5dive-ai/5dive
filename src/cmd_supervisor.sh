@@ -1257,7 +1257,7 @@ Classification (conservative — see docs/fleet-supervisor-design.md §4):
                   the three top-ranked branches above — verify-challenge,
                   blocked-on-prompt and the pane-refusal half of
                   quota-exhausted — did not run. Not a fault claim: it replaces
-                  the word `healthy` ONLY, because that word would otherwise be
+                  the word \`healthy\` ONLY, because that word would otherwise be
                   produced by not having looked (DIVE-4342). Run as root, or
                   read the summary's DEGRADED mark as "these three signals are
                   missing from this board".
