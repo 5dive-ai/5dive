@@ -818,11 +818,33 @@ JOURNALD
               stop-telegram-reply-check.sh \
               posttool-telegram-relay.sh userprompt-mirror-inter-agent.sh \
               stop-mirror-inter-agent.sh push-notify.sh \
-              sessionstart-resume-context.sh stop-browser-teardown.sh; do
+              sessionstart-resume-context.sh; do
     curl -fsSL "$REPO/hooks/$hook" -o "$LIB_DIR/$hook"
     chmod 755 "$LIB_DIR/$hook"
     ok "$hook"
   done
+  # >>> DIVE-4349 hooks newer than the fleet pin are optional at that pin
+  # This script is fetched from `main` (install.5dive.com) but every $REPO/…
+  # download below resolves against the PINNED tag's tree (DIVE-4140: the
+  # fleet follows api.5dive.com/cli-version, v0.32.3 tonight). A hook that
+  # main's loop above names but the pinned tree does not carry is a 404, and
+  # under `set -e` that 404 was the whole install: the 2026-09-12 01:52Z
+  # nightly smoke aborted at "Installing software"; any fresh customer box
+  # and every pinned box's 04:00Z self-update would do the same from #890
+  # (2026-09-11 18:24Z) onward. The bundle at that
+  # pin never wires a hook it does not ship, so skipping is the correct
+  # outcome — named on stderr, never silent. Move a hook UP into the
+  # fail-closed loop only once the fleet pin is at or past the tag that ships it.
+  for hook in stop-browser-teardown.sh; do
+    if curl -fsSL "$REPO/hooks/$hook" -o "$LIB_DIR/$hook" 2>/dev/null; then
+      chmod 755 "$LIB_DIR/$hook"
+      ok "$hook"
+    else
+      rm -f "$LIB_DIR/$hook"
+      echo "  ! hooks/$hook not shipped at this pin (${GH_PINNED_TAG:-unpinned}) — skipped; the bundle at this pin does not wire it" >&2
+    fi
+  done
+  # <<< DIVE-4349
   curl -fsSL "$REPO/skills/notify-user/SKILL.md" -o "$LIB_DIR/skills/notify-user/SKILL.md"
   chmod 644 "$LIB_DIR/skills/notify-user/SKILL.md"
   ok "notify-user skill"
