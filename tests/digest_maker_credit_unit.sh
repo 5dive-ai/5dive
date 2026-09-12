@@ -62,7 +62,7 @@ eq_t()  { # eq_t <label> <expected> <actual>
 # --- build the board: two graded rows built by dev, one loopless row by dev2 ---
 mk_graded() { # mk_graded <title>
   local id
-  ( actor_seam_as main; cmd_task_add "$1" --assignee=dev --verifier=olivia ) >/dev/null 2>&1
+  ( actor_seam_as main; cmd_task_add "$1" --assignee=dev --verifier=olivia --verify ) >/dev/null 2>&1
   id=$(db "SELECT MAX(id) FROM tasks;")
   ( actor_seam_as dev;    cmd_task_start "$id" )                >/dev/null 2>&1
   ( actor_seam_as dev;    cmd_task_done  "$id" --result="built" )>/dev/null 2>&1

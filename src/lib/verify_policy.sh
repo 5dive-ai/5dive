@@ -47,13 +47,11 @@ _verify_policy_valid() {  # <value>
 
 # `box_verify_policy` — the box default. Prints one of the three values.
 #
-# DEFAULTS TO `always`, NOT to the customer default. Our own fleet is `always`
-# and an unwritten file must not silently downgrade an existing box's grading
-# posture on upgrade: absence means "nobody has chosen", and the safe reading of
-# "nobody has chosen" is the behaviour the box already had. The WIZARD is what
-# writes `delivered-only` onto a NEW customer box — a provisioning choice, made
-# where it can be seen, rather than a default that reaches back over installed
-# boxes.
+# DEFAULTS TO `delivered-only`, the customer default approved on DIVE-4251.
+# Absence means nobody chose a policy, so fresh, pre-wizard, and manually
+# provisioned boxes all get the same answer: unbound knowledge/ops work spends
+# no grader session, while code acquires one when `task deliver --pr=` binds it.
+# An existing box that deliberately chose `always` keeps that explicit value.
 box_verify_policy() {
   local v=""
   # FIVE_VERIFY_DEFAULT=0 is the pre-existing fleet kill-switch. It is honoured
@@ -64,7 +62,7 @@ box_verify_policy() {
   if [[ -r "$f" ]]; then
     v=$(jq -r '.verify // empty' "$f" 2>/dev/null || printf '')
   fi
-  _verify_policy_valid "$v" || v="always"
+  _verify_policy_valid "$v" || v="delivered-only"
   printf '%s' "$v"
 }
 

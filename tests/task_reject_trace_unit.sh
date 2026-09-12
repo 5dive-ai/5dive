@@ -71,7 +71,7 @@ MAKER_TEXT="MAKER RESULT: implemented the thing, graded-sha abc1234, 9/9 unit"
 # assignee main, handoff_delivered_at NON-NULL. That last property is what arm C
 # needs and is the reason the fixture delivers rather than just creating a row.
 seed() {
-  local out id; out=$(JSON_MODE=1 cmd_task_add "$1" --assignee=dev --verifier=main \
+  local out id; out=$(JSON_MODE=1 cmd_task_add "$1" --assignee=dev --verifier=main --verify \
                         --accept="must do the thing" 2>"$TMP"/err)
   id=$(printf '%s' "$out" | jq -r '.data.ident // empty' 2>/dev/null)
   as dev cmd_task_done "$id" --result="$MAKER_TEXT" >/dev/null

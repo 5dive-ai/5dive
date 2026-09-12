@@ -163,7 +163,7 @@ rd=$(run_open "$id2" "DIVE-y" "heartbeat dispatch" "" "someseat")
   || bad_t "done closed wrong" "status=[$(rfld "$r1" status)] outcome=[$(rfld "$r1" outcome)]"
 [[ "$(rfld "$r1" ended_at)" != "NULL" ]] && ok_t "done stamps ended_at" || bad_t "ended_at not stamped"
 
-id3=$(addt "gamma" --assignee="$FIX_MAKER" --verifier="$FIX_VERIFIER")
+id3=$(addt "gamma" --assignee="$FIX_MAKER" --verifier="$FIX_VERIFIER" --verify)
 ( cmd_task_start "$id3" --no-preflight ) >/dev/null 2>&1
 r3=$(open_of "$id3")
 ( cmd_task_done "$id3" --result="for review" ) >/dev/null 2>&1

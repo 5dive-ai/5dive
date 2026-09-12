@@ -905,11 +905,75 @@ quarantine_agent_home() {
   fi
 }
 
+# DIVE-4340: the OS half of a removal can fail, and it used to fail SILENTLY.
+# `deluser` ran as `deluser ... 2>/dev/null || true` and the caller deleted the
+# registry row regardless, so on exact-swallow 8 of 12 `agent-*` accounts
+# outlived the seats that owned them — each still holding its home AND its
+# membership in the shared credential group — while `agent rm` printed
+# "removed." and returned removed:true. With the row gone the supported retry
+# was gone too: `agent rm` answers E_NOT_FOUND for a name the registry no longer
+# knows. So the reason a teardown could not finish is written to the audit log
+# and named on stderr, and `5dive doctor --category=registry --fix` is the
+# second chance (doctor_check_orphan_seats).
+_rm_audit_teardown_failure() {
+  local user="$1" reason="$2"
+  declare -F audit_log >/dev/null 2>&1 || return 0
+  audit_log "agent rm" "os-teardown-incomplete" 1 -- "$user" "$reason" || true
+  return 0
+}
+
+# DIVE-4340 (iteration 2): membership in the shared credential group can
+# OUTLIVE the passwd entry. `deluser` drops a user from every group it belongs
+# to, so the two normally move together — but they come apart exactly in the
+# cases this row exists for: a teardown that half-ran, a group file edited by
+# hand, an account removed by something that was not `agent rm`. Iteration 1
+# returned at the `id -u` guard for such a name and left the membership in
+# place, while the caller (`doctor --fix`) went on to report the seat reaped.
+# That group is what this box scopes its shared credentials to, so a member
+# with no account is the more dangerous half of the pair, not the lesser one.
+#
+# Sets _RM_GROUP_DISPOSITION: absent (never a member) / dropped / present.
+_rm_drop_group_membership() {
+  local user="agent-${1}" group="${AGENT_SHARED_GROUP:-claude}"
+  _RM_GROUP_DISPOSITION="absent"
+  _rm_in_group() {
+    getent group "$group" 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n' \
+      | grep -qx "$user"
+  }
+  _rm_in_group || { unset -f _rm_in_group; return 0; }
+  local gp_err="" gp_rc=0
+  # gpasswd -d is the narrow form: it removes ONE membership and never touches
+  # the account, which is the whole point here — there is no account to touch.
+  gp_err=$(gpasswd -d "$user" "$group" 2>&1) || gp_rc=$?
+  if _rm_in_group; then
+    _RM_GROUP_DISPOSITION="present"
+    local reason
+    if [[ $EUID -ne 0 ]]; then
+      reason="not root (EUID=$EUID): dropping a group membership needs root"
+    else
+      reason="gpasswd -d exited ${gp_rc}: $(printf '%s' "$gp_err" | tr '\n\t' '  ' | cut -c1-200)"
+    fi
+    _rm_audit_teardown_failure "$user" "group ${group}: ${reason}"
+    warn "${user} has no account but is STILL a member of group '${group}' (${reason}) — the group this box's shared credentials are scoped to. Drop it with: sudo gpasswd -d ${user} ${group} (DIVE-4340)"
+  else
+    _RM_GROUP_DISPOSITION="dropped"
+  fi
+  unset -f _rm_in_group
+  return 0
+}
+
 delete_agent_user() {
   local name="$1" purge_home="${2:-0}"
   local user="agent-${name}"
   _RM_HOME_DISPOSITION="absent"
-  id -u "$user" &>/dev/null || return 0
+  _RM_USER_DISPOSITION="absent"
+  _RM_GROUP_DISPOSITION="absent"
+  if ! id -u "$user" &>/dev/null; then
+    # No passwd entry is NOT the same as nothing left to do.
+    _rm_drop_group_membership "$name"
+    return 0
+  fi
+  _RM_USER_DISPOSITION="deleted"
   # DIVE-2138: resolve the home from passwd BEFORE deluser, while the name
   # still resolves — afterwards there is no record of where it was.
   local home
@@ -921,7 +985,25 @@ delete_agent_user() {
   setfacl -x "u:${user}" /home/claude 2>/dev/null || true
   # Skip --remove-home: DIVE-2138 quarantines the home below instead, so the
   # operator keeps whatever was in it while a recycled uid inherits nothing.
-  deluser --quiet "$user" 2>/dev/null || true
+  #
+  # DIVE-4340: keep deluser's own words. The verdict below is not its exit code
+  # but whether the account is STILL THERE afterwards — the two disagree (a
+  # non-root caller, a busy uid, a deluser that half-ran), and only the second
+  # one is the thing an operator cares about.
+  local du_err="" du_rc=0
+  du_err=$(deluser --quiet "$user" 2>&1) || du_rc=$?
+  if id -u "$user" &>/dev/null; then
+    _RM_USER_DISPOSITION="present"
+    local reason group
+    group="${AGENT_SHARED_GROUP:-claude}"
+    if [[ $EUID -ne 0 ]]; then
+      reason="not root (EUID=$EUID): deleting a user needs root"
+    else
+      reason="deluser exited ${du_rc}: $(printf '%s' "$du_err" | tr '\n\t' '  ' | cut -c1-200)"
+    fi
+    _rm_audit_teardown_failure "$user" "$reason"
+    warn "user ${user} SURVIVED the remove (${reason}). It keeps its home and its membership in group '${group}' — the group this box's shared credentials are scoped to. Reap it with: sudo 5dive doctor --category=registry --fix (DIVE-4340)"
+  fi
   rm -f "/etc/sudoers.d/${user}"
   # DIVE-2102: the grant is gone as of the line above, so the capability rows
   # recording it stop being true HERE. Mirrors the mint site: rows are written
