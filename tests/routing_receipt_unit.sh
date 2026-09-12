@@ -196,9 +196,45 @@ grep -q 'next wake: no auto-wake (heartbeat off for dev2)' <<<"$OUT" \
 
 reg dev2 true 30 1
 OUT=$(cmd_task_assign "$I4" dev2 2>/dev/null)
-grep -q 'next wake: due now (dispatcher ticks every 5 min)' <<<"$OUT" \
-  && ok_t "overdue seat -> 'due now', bounded by the 5-min cron tick" \
+# DIVE-4342: the line no longer PROMISES a 5-minute tick it never checked for.
+# Whichever of the three dispatcher states this box is in, the receipt must name
+# it — and must never again assert a tick as a bare fact.
+grep -qE 'next wake: (due now \(dispatcher: |due now, IF a dispatcher is installed|in ~[0-9]+m \(dispatcher: |in ~[0-9]+m, IF a dispatcher|NO DISPATCHER INSTALLED)' <<<"$OUT" \
+  && ok_t "overdue seat -> a wake line that names the dispatcher state it rests on" \
   || bad_t "due-now wake line wrong" "$OUT"
+grep -q 'dispatcher ticks every 5 min' <<<"$OUT" \
+  && bad_t "receipt still asserts a 5-min tick without checking for one" "$OUT" \
+  || ok_t "the unconditional 'dispatcher ticks every 5 min' claim is gone"
+
+# The three dispatcher states, staged on the detector rather than on the box.
+if [[ "$(id -u)" != "0" ]]; then
+  DSP=$(_routing_receipt_dispatcher)
+  case "$DSP" in
+    unknown:*)   ok_t "unprivileged + nothing readable -> UNKNOWN, never 'absent'" ;;
+    installed:*) ok_t "this box publishes a readable dispatcher: ${DSP}" ;;
+    *)           bad_t "unprivileged probe claimed a state it cannot know" "$DSP" ;;
+  esac
+fi
+_routing_receipt_dispatcher() { printf 'absent\n'; }
+OUT=$(cmd_task_assign "$I4" dev2 2>/dev/null)
+grep -q 'NO DISPATCHER INSTALLED' <<<"$OUT" \
+  && ok_t "no dispatcher -> the receipt says wake it by hand instead of promising a tick" \
+  || bad_t "absent dispatcher did not reach the wake line" "$OUT"
+grep -q 'heartbeat wake-task' <<<"$OUT" \
+  && ok_t "and names the verb that actually wakes it" \
+  || bad_t "absent-dispatcher line does not name the manual wake verb" "$OUT"
+_routing_receipt_dispatcher() { printf 'unknown:root crontab is not readable as dev2\n'; }
+OUT=$(cmd_task_assign "$I4" dev2 2>/dev/null)
+grep -q 'IF a dispatcher is installed' <<<"$OUT" \
+  && ok_t "UNKNOWN is carried through as a hedge, not collapsed onto either neighbour" \
+  || bad_t "unknown dispatcher collapsed into a confident wake line" "$OUT"
+_routing_receipt_dispatcher() { printf 'installed:/etc/cron.d/5dive-heartbeat\n'; }
+OUT=$(cmd_task_assign "$I4" dev2 2>/dev/null)
+grep -q 'dispatcher: /etc/cron.d/5dive-heartbeat' <<<"$OUT" \
+  && ok_t "an installed dispatcher is NAMED, so the claim is checkable" \
+  || bad_t "installed dispatcher not named in the wake line" "$OUT"
+# shellcheck source=/dev/null
+source src/lib/routing_receipt.sh
 
 reg dev2 true 30 "$(date +%s)"
 OUT=$(cmd_task_assign "$I4" dev2 2>/dev/null)

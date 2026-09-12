@@ -2428,6 +2428,24 @@ agent_wake_gate_ready() {
   AGENT_WAKE_READY="proven"
 }
 
+# _agent_send_row_hint <message> <recipient> — see the DIVE-4342 comment at the
+# call site. Prints at most one line, only when the message names a row ident,
+# only in human mode. Every path returns 0.
+_agent_send_row_hint() {
+  local msg="${1:-}" to="${2:-}" idents
+  (( JSON_MODE )) && return 0
+  [[ -n "$msg" ]] || return 0
+  # `|| idents=""` states the post-condition the next line reads: no ident in the
+  # message is the common case, and an unguarded substitution would DIE there
+  # under set -euo pipefail with nothing printed (DIVE-2566/2603/2604).
+  idents=$(grep -oE '\b[A-Z][A-Z0-9]{1,9}-[0-9]+\b' <<<"$msg" 2>/dev/null | sort -u | head -3 | tr '\n' ' ') || idents=""
+  idents="${idents% }"
+  [[ -n "$idents" ]] || return 0
+  printf 'note: this message names %s, and a message does NOT reorder %s'"'"'s queue — the dispatcher hands out rows by priority, then age, whatever the text says. To actually put one first: 5dive heartbeat wake-task %s\n' \
+    "$idents" "$to" "${idents%% *}"
+  return 0
+}
+
 cmd_send() {
   local name="" message="" from="" from_set=0 raw=0 wake=0
   local reply_to_chat="" reply_to_msg=""
@@ -2693,6 +2711,19 @@ cmd_send() {
   # returns 0 on every path, so a relay outage can never fail a send that already
   # reached the pane.
   (( raw )) || _buzz_mirror_outbound "$name" "$message"
+
+  # DIVE-4342: a send that NAMES A ROW ("do DIVE-200 first") is silently
+  # outranked by the dispatcher's priority-then-age sort. The message lands, the
+  # recipient reads it, and then picks up whatever its queue puts first — so the
+  # sender watches the wrong row start and has no way to tell that from being
+  # ignored. We do not reorder the queue from a message body (a text match on an
+  # ident is not an authorisation, and honouring it would make "mentioning a row"
+  # a privileged act available to anyone who can type). We say so, and name the
+  # verb that DOES force a row's turn.
+  #
+  # Additive and human-only, on the same constraint routing_receipt is built
+  # under: no new refusal, no new exit code, nothing on stdout in JSON mode.
+  _agent_send_row_hint "$message" "$name"
 
   # DIVE-2385: `woken` distinguishes "delivered to a live agent" from "started the
   # agent in order to deliver". A scheduled caller that logs this line can tell,

@@ -773,11 +773,11 @@ _SUP_INFO_TICK_TOL=120   # seconds. Per-agent rows are written BEFORE the fleet
 # assertable at a fixed epoch and the renderer stays deterministic in its args.
 # args: armed(true/false) tick_epoch row_epoch now
 #       rec_class rec_cause rec_detail open_rows days_since_close(-1 = never)
-#       store_readable(true/false)
+#       store_readable(true/false) account_wall(empty unless AT the wall now)
 _sup_info_status() {
   local armed="$1" tick="${2:-0}" row="${3:-0}" now="${4:-0}" \
         rc="${5:-}" rcause="${6:-}" rdetail="${7:-}" open="${8:-0}" days="${9:--1}" \
-        store="${10:-true}"
+        store="${10:-true}" wall="${11:-}"
   [[ "$store" == "false" ]] || store="true"
   [[ "$tick" =~ ^[0-9]+$ ]] || tick=0
   [[ "$row"  =~ ^[0-9]+$ ]] || row=0
@@ -874,6 +874,17 @@ _sup_info_status() {
   case "$cls" in quota-exhausted|verify-challenge|no-output) verdict="$cls" ;; esac
   [[ -z "$verdict" && "$output" == "dry" ]] && verdict="no-output"
 
+  # DIVE-4342: the account wall is MEASURED here, like `output`, and owes nothing
+  # to the tick. That is the whole point — on the box this was reported from the
+  # tick was not armed, every inherited class was therefore `unobserved`, and
+  # this surface still printed a seat that could not spend a token as healthy.
+  # It overrides the inherited class in BOTH directions: it beats a green one,
+  # and it beats a `quota-lapsed` downgrade, because a pane refusal whose
+  # deadline has passed says nothing about an account measured at 101% now.
+  if [[ -n "$wall" ]]; then
+    cls="quota-exhausted"; cause="account-usage"; detail="$wall"; verdict="quota-exhausted"
+  fi
+
   local state_note sup_line
   case "$verdict" in
     "") case "$output" in
@@ -897,7 +908,11 @@ _sup_info_status() {
 
   local age_s=$(( now > row && row > 0 ? now - row : -1 ))
   local tick_age_s=$(( now > tick && tick > 0 ? now - tick : -1 ))
-  if [[ "$store" != "true" ]]; then
+  if [[ -n "$wall" ]]; then
+    # Deliberately FIRST: the three branches below all describe how fresh the
+    # TICK is, and this reading did not come from the tick.
+    sup_line="quota-exhausted / account-usage — ${wall} (measured from the account-usage snapshot, not from the supervisor tick)"
+  elif [[ "$store" != "true" ]]; then
     sup_line="unobserved — the task store was not readable from here, so NEITHER the event trail nor the output counters were read (this is not an all-clear)"
   elif [[ "$armed" != "true" ]]; then
     sup_line="unobserved — the tick is NOT ARMED on this box, so nothing refreshes this"
@@ -995,7 +1010,14 @@ sup_info_for_agent() {  # <name>
             ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
     IFS=$'\x1f' read -r row rc rcause rdetail <<<"$r"
   fi
-  _sup_info_status "$armed" "$tick" "$row" "$now" "$rc" "$rcause" "$rdetail" "$open" "$days" "$store"
+  # DIVE-4342: seat -> auth profile -> account usage, read unprivileged from the
+  # published snapshot. Empty unless the account is AT the wall right now.
+  local wall="" w_state w_win w_pct w_reset w_age w_note
+  if declare -f quota_wall_seat >/dev/null 2>&1; then
+    IFS=$'\037' read -r w_state w_win w_pct w_reset w_age w_note <<<"$(quota_wall_seat "$name")"
+    [[ "$w_state" == "exhausted" ]] && wall="$(quota_wall_phrase "$w_win" "$w_pct" "$w_reset")"
+  fi
+  _sup_info_status "$armed" "$tick" "$row" "$now" "$rc" "$rcause" "$rdetail" "$open" "$days" "$store" "$wall"
 }
 
 # DIVE-3272: a seat that cannot transact is a FLEET-health event. The entire cost
@@ -1304,7 +1326,8 @@ _sup_classify() {
         loop_stuck="$7" has_work="$8" act_age="$9" cli_stale="${10}" goal_drift_task="${11}" \
         verify_excerpt="${12}" stranded="${13:-0}" \
         open_rows="${14:-0}" no_output_days="${15:--1}" quota_excerpt="${16:-}" \
-        quota_deadline="${17:-unknown}" prompt_excerpt="${18:-}" prompt_mark="${19:-unmarked}"
+        quota_deadline="${17:-unknown}" prompt_excerpt="${18:-}" prompt_mark="${19:-unmarked}" \
+        account_wall="${20:-}"
   # DIVE-3880: the policy lives HERE, in the pure decision, not at the pane
   # probe — the probe owes a distinguishable signal, the classifier owes the
   # verdict (community/wiki/a-fail-open-underneath-a-fail-closed-path-feeds-it-a-lie-in-the-format-it-trusts.md).
@@ -1350,6 +1373,16 @@ _sup_classify() {
     class="stuck"; cause="tmux-dead"; detail="unit active but tmux session '${sess}' gone"
   elif [[ "$poller" == "dead" ]]; then
     class="stuck"; cause="poller-dead"; detail="telegram poller process not running"
+  elif [[ -n "$account_wall" ]]; then
+    # DIVE-4342: the ACCOUNT's own measured usage, above the pane scrape, because
+    # it is better evidence of the same fact and it arrives EARLIER. The pane
+    # branch below can only fire after the seat has tried and been refused —
+    # it reads a refusal in scrollback. This one reads the number the provider
+    # reported: the seat is walled from the first token, not from the first
+    # refusal. Measured on a customer box where `account usage` said 101% and
+    # this classifier said `healthy` because no pane had been refused yet.
+    class="quota-exhausted"; cause="account-usage"
+    detail="auth account measured at the wall: ${account_wall}"
   elif [[ -n "$quota_excerpt" && "$quota_deadline" != "lapsed" ]]; then
     # DIVE-3272: placed ABOVE loop-stuck / no-progress on purpose — a capacity
     # wall EXPLAINS both of those, and the response is different in kind (a
@@ -1533,11 +1566,21 @@ _sup_agent_record() {
 
   # --- CLASSIFY (design §4) — see _sup_classify for the decision chain itself.
   local class cause detail crow
+  # DIVE-4342: join the seat's auth account usage. Empty unless the account is
+  # measured AT the wall right now — `unmeasured` and `clear` both pass through
+  # as empty, so a missing snapshot can never invent a class.
+  local _sup_wall="" _sw_state _sw_win _sw_pct _sw_reset _sw_age _sw_note
+  # declare -f guard: a health read must never die on an unsourced helper, and
+  # several harnesses source this file alone.
+  if declare -f quota_wall_seat >/dev/null 2>&1; then
+    IFS=$'\037' read -r _sw_state _sw_win _sw_pct _sw_reset _sw_age _sw_note <<<"$(quota_wall_seat "$name")"
+    [[ "$_sw_state" == "exhausted" ]] && _sup_wall="$(quota_wall_phrase "$_sw_win" "$_sw_pct" "$_sw_reset")"
+  fi
   crow=$(_sup_classify "$desired" "$svc_running" "$active" "$sess" "$tmux_state" "$poller" \
                         "$loop_stuck" "$has_work" "$act_age" "$_SUP_CLI_STALE" "$goal_drift_task" \
                         "$verify_excerpt" "$stranded" \
                         "$open_rows" "$no_output_days" "$quota_excerpt" "$quota_deadline" \
-                        "$prompt_excerpt" "$prompt_mark")
+                        "$prompt_excerpt" "$prompt_mark" "$_sup_wall")
   IFS=$'\x1f' read -r class cause detail <<<"$crow"
 
   jq -cn \

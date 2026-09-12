@@ -32,6 +32,20 @@ doctor_add() {
   return 0
 }
 
+# _doctor_registry_types — space-separated harness types at least one REGISTERED
+# seat runs on. Empty (so nothing is scoped in) when the registry cannot be read:
+# an unreadable registry must not silence a real credential error, so the caller
+# treats "not in the list" as in-use-unknown only for the soft branches and keeps
+# the hard error whenever we positively know a seat is bound.
+_doctor_registry_types() {
+  local reg out
+  reg=$(registry_read 2>/dev/null) || { printf 'UNREADABLE\n'; return 0; }
+  [[ -n "$reg" ]] || { printf 'UNREADABLE\n'; return 0; }
+  out=$(jq -r '[.agents // {} | .[] | .type // empty] | unique | join(" ")' <<<"$reg" 2>/dev/null) \
+    || { printf 'UNREADABLE\n'; return 0; }
+  printf '%s\n' "$out"
+}
+
 # doctor_check_cmd <name> <executable> [apt-repair-package]
 # Uses the host's PATH (root). Not suitable for "is bun on user claude's
 # PATH" — that needs a sudo hop; handled inline in cmd_doctor.
@@ -977,18 +991,42 @@ cmd_doctor() {
   fi
 
   # --- auth (live probe for installed types) ---
+  #
+  # DIVE-4342: SCOPED TO THE HARNESSES THIS BOX ACTUALLY EMPLOYS. Every type
+  # whose binary happens to be installed used to raise a hard ERROR for having
+  # no credentials, whether or not a single registered seat ran on it — 5 of the
+  # 5 errors in a 69-check run on a customer box were that, and an error list
+  # that is entirely noise is an error list nobody reads. An unused harness with
+  # no credential is not a defect, it is an unused harness; it stays in the
+  # report (silence would be its own absence-reads-as-health bug) as `ok` with
+  # the reason named. A harness a seat is BOUND to keeps the full error.
   if (( run_auth )); then
-    local type status
+    local type status in_use
+    local reg_types; reg_types=$(_doctor_registry_types)
     for type in "${!TYPE_BIN[@]}"; do
       [[ -x "${TYPE_BIN[$type]}" ]] || continue
+      # A registry we could not READ is not evidence that nothing uses this
+      # harness. It keeps the hard error — the soft branch is only ever reached
+      # on a positive read that positively lacks this type.
+      in_use=false
+      [[ "$reg_types" == "UNREADABLE" ]] && in_use=true
+      [[ " ${reg_types} " == *" ${type} "* ]] && in_use=true
       status=$(auth_status_one "$type")
       case "$status" in
         ok)
           doctor_add auth "$type" ok "live probe succeeded" ;;
         needs_login)
-          doctor_add auth "$type" error "no credentials on file — run: sudo 5dive agent auth login $type" false false ;;
+          if [[ "$in_use" == "true" ]]; then
+            doctor_add auth "$type" error "no credentials on file — run: sudo 5dive agent auth login $type" false false
+          else
+            doctor_add auth "$type" ok "no credentials on file, and no registered seat runs on $type — not a defect on this box" false false
+          fi ;;
         stale)
-          doctor_add auth "$type" error "credentials rejected by provider — re-auth required" false false ;;
+          if [[ "$in_use" == "true" ]]; then
+            doctor_add auth "$type" error "credentials rejected by provider — re-auth required" false false
+          else
+            doctor_add auth "$type" warn "credentials rejected by provider, but no registered seat runs on $type" false false
+          fi ;;
         not_installed)
           : ;;  # already flagged by types/
         *)

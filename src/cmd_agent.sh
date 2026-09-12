@@ -25,9 +25,13 @@ _agent_startup_credential_health() { # <name>
 # `active`/`enabled`; this verdict answers the different question operators
 # actually ask: can this seat transact? A liveness word never outranks a known
 # credential or output failure.
-_agent_operational_state() { # <active> <auth-state> <startup-state> [supervisor-json]
+_agent_operational_state() { # <active> <auth-state> <startup-state> [supervisor-json] [quota-state]
   local active="${1:-unknown}" auth="${2:-unknown}" startup="${3:-unknown}" sup="${4:-}"
+  local quota="${5:-unmeasured}"
   [[ "$active" == "active" ]] || { printf '%s\n' "$active"; return 0; }
+  # DIVE-4342: the account's own measured usage outranks every green word below
+  # it. Only `exhausted` gates — `unmeasured` is not evidence about the seat.
+  [[ "$quota" == "exhausted" ]] && { printf 'quota-exhausted\n'; return 0; }
   case "$auth:$startup" in
     needs_login:*|expired:*|*:degraded) printf 'degraded\n'; return 0 ;;
     unknown:*|*:unknown)               printf 'unknown\n'; return 0 ;;
@@ -353,7 +357,11 @@ _cmd_list_legacy() {
     [[ -n "$_hs" ]] || _hs='unknown|credential-start health probe did not run'
     _hs_state="${_hs%%|*}"
     _hs_reason="${_hs#*|}"
-    _op_state=$(_agent_operational_state "$active" "$_ha_state" "$_hs_state")
+    local _q_state="unmeasured"
+    if declare -f quota_wall_account >/dev/null 2>&1; then
+      _q_state="$(quota_wall_account "$lprof")"; _q_state="${_q_state%%$'\037'*}"
+    fi
+    _op_state=$(_agent_operational_state "$active" "$_ha_state" "$_hs_state" "" "$_q_state")
     # DIVE-2088: measure the ENFORCED sudo grant here too. DIVE-2079 fixed the
     # per-agent DRILL-DOWN (`agent info`), but `list` is the SURVEY surface — the
     # command you run to notice something is off, not the one you run once you
@@ -382,6 +390,7 @@ _cmd_list_legacy() {
       --argjson hdeaf "$hdeaf" --argjson hasleep "$hasleep" \
       --arg haState "$_ha_state" --arg haExp "$_ha_exp" --arg haRefresh "$_ha_refresh" \
       --arg hsState "$_hs_state" --arg hsReason "$_hs_reason" --arg opState "$_op_state" \
+      --arg qState "$_q_state" \
       --arg sgClass "$_sg_class" --arg sgRunas "$_sg_runas" \
       --arg sgExtra "$_sg_extra" --arg sgImplied "$_sg_implied" \
       '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b,
@@ -397,7 +406,8 @@ _cmd_list_legacy() {
                                             else ($haExp | tonumber | todate) end),
                                 refreshable: ($haRefresh == "true")},
                          startup: {state: $hsState,
-                                   reason: (if $hsReason == "" then null else $hsReason end)}}}' <<<"$enriched")
+                                   reason: (if $hsReason == "" then null else $hsReason end)},
+                         quota: {state: $qState}}}' <<<"$enriched")
   done
   local merged
   merged=$(jq -c --arg default_wd "$DEFAULT_WORKDIR" --argjson live "$enriched" '.agents | to_entries | map({
@@ -477,6 +487,12 @@ _cmd_list_legacy() {
 # seat.  This process emits only the already-public `agent list` fields.  It
 # never emits credential blobs, allowlist members, or sudoers text.
 _agent_list_snapshot_python() {
+  # DIVE-4342: the survey also reads the account-usage snapshot (world-readable,
+  # published by the root `account usage` read) so a seat whose auth account is
+  # at its rate-limit wall cannot be reported `ready`.
+  QUOTA_SNAPSHOT_FILE="$QUOTA_SNAPSHOT_FILE" \
+  QUOTA_WALL_PCT="$QUOTA_WALL_PCT" \
+  QUOTA_SNAPSHOT_MAX_AGE="$QUOTA_SNAPSHOT_MAX_AGE" \
   /usr/bin/python3 - "$REGISTRY" "$AUTH_PROFILES_DIR" "$CONNECTORS_DIR" \
     "${AGENT_HOME_ROOT:-/home}" "${SUDOERS_D:-/etc/sudoers.d}" "$DEFAULT_WORKDIR" <<'PY'
 # __5DIVE_AGENT_LIST_PY_BEGIN__
@@ -490,6 +506,74 @@ import sys
 import pwd
 
 registry_path, profiles_dir, connectors_dir, home_root, sudoers_dir, default_workdir = sys.argv[1:]
+
+# --- DIVE-4342: the account-usage join -------------------------------------
+# Measurements in, verdict out, decided HERE against this process's clock — the
+# snapshot deliberately stores no classification of its own.
+QUOTA_SNAPSHOT = os.environ.get("QUOTA_SNAPSHOT_FILE") or "/var/lib/5dive/account-usage.json"
+try:
+    QUOTA_WALL = float(os.environ.get("QUOTA_WALL_PCT") or 100)
+except ValueError:
+    QUOTA_WALL = 100.0
+try:
+    QUOTA_MAX_AGE = int(os.environ.get("QUOTA_SNAPSHOT_MAX_AGE") or 600)
+except ValueError:
+    QUOTA_MAX_AGE = 600
+
+
+def quota_by_account():
+    """{account: {"state","window","pct","resetsAt"}} from the published snapshot.
+
+    Absent / stale / unparseable all yield {} — which reads as `unmeasured` per
+    account below, never as `clear`. A missing file must not certify the fleet.
+    """
+    try:
+        with open(QUOTA_SNAPSHOT, "r") as fh:
+            snap = json.load(fh)
+    except (OSError, ValueError):
+        return {}, "no account-usage snapshot at %s" % QUOTA_SNAPSHOT
+    if not isinstance(snap, dict):
+        return {}, "account-usage snapshot is not an object"
+    age = int(dt.datetime.now().timestamp()) - int(snap.get("writtenAt") or 0)
+    if age > QUOTA_MAX_AGE:
+        return {}, "account-usage snapshot is %ds old (>%ds)" % (age, QUOTA_MAX_AGE)
+    out = {}
+    for row in snap.get("accounts") or []:
+        if not isinstance(row, dict):
+            continue
+        usage = row.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        hit = None
+        # The longer window wins: it is the one the operator cannot wait out.
+        for key, label in (("sevenDay", "7d"), ("fiveHour", "5h")):
+            win = usage.get(key)
+            if not isinstance(win, dict):
+                continue
+            pct = win.get("pct")
+            if isinstance(pct, (int, float)) and pct >= QUOTA_WALL:
+                hit = {"state": "exhausted", "window": label, "pct": int(pct),
+                       "resetsAt": win.get("resetsAt")}
+                break
+        out[row.get("name")] = hit or {"state": "clear", "window": None,
+                                       "pct": None, "resetsAt": None}
+    return out, None
+
+
+QUOTA_MAP, QUOTA_NOTE = quota_by_account()
+
+
+def quota_for_profile(profile):
+    if not profile:
+        return {"state": "unmeasured", "window": None, "pct": None,
+                "resetsAt": None, "note": "seat is not bound to an auth account"}
+    hit = QUOTA_MAP.get(profile)
+    if hit is None:
+        return {"state": "unmeasured", "window": None, "pct": None, "resetsAt": None,
+                "note": QUOTA_NOTE or "no usage row for account %s" % profile}
+    out = dict(hit)
+    out["note"] = None
+    return out
 
 def read_bytes(path):
     try:
@@ -847,8 +931,16 @@ for name, value in agents.items():
     startup_state, startup_reason = startup_health(name)
     live = active.get(name) or "unknown"
     unit_enabled = enabled.get(name) or "unknown"
+    quota = quota_for_profile(profile)
     if live != "active":
         operational = live
+    elif quota["state"] == "exhausted":
+        # DIVE-4342. Process up and credential valid, and the seat still cannot
+        # spend a token. `ready` here is the false green a customer box shipped:
+        # agent list ready / liveness alive / supervisor healthy, all while
+        # `account usage` printed 101%. A distinct verdict, not a warning worn
+        # under a green word.
+        operational = "quota-exhausted"
     elif auth_state in ("needs_login", "expired") or startup_state == "degraded":
         operational = "degraded"
     elif auth_state == "unknown" or startup_state == "unknown":
@@ -877,6 +969,7 @@ for name, value in agents.items():
         "sudo": sudo,
         "health": {"deaf": deaf, "asleep": asleep,
                    "auth": {"state": auth_state, "expiresAt": iso_time(auth_exp), "refreshable": auth_refresh},
+                   "quota": quota,
                    "startup": {"state": startup_state, "reason": startup_reason}},
     })
 
@@ -1449,12 +1542,21 @@ cmd_info() {
   [[ -n "$_hs" ]] || _hs='unknown|credential-start health probe did not run'
   _hs_state="${_hs%%|*}"
   _hs_reason="${_hs#*|}"
-  _op_state=$(_agent_operational_state "${active:-unknown}" "$_ha_state" "$_hs_state" "$sup")
+  # DIVE-4342: the auth account's measured usage, joined in the drill-down too.
+  local _iq="" _iq_state="unmeasured" _iq_win="" _iq_pct="" _iq_reset="" _iq_age="" _iq_note=""
+  if declare -f quota_wall_account >/dev/null 2>&1; then
+    _iq=$(quota_wall_account "$_info_prof")
+    IFS=$'\037' read -r _iq_state _iq_win _iq_pct _iq_reset _iq_age _iq_note <<<"$_iq"
+    [[ -n "$_iq_state" ]] || _iq_state="unmeasured"
+  fi
+  _op_state=$(_agent_operational_state "${active:-unknown}" "$_ha_state" "$_hs_state" "$sup" "$_iq_state")
   _auth_line=$(_agent_auth_display "$_ha_state" "$_ha_exp" "$_ha_refresh")
 
   local obj
   obj=$(jq -c \
     --argjson sup "$sup" \
+    --arg qState "$_iq_state" --arg qWin "$_iq_win" --arg qPct "$_iq_pct" \
+    --arg qReset "$_iq_reset" --arg qNote "$_iq_note" \
     --arg n "$name" \
     --arg grantClass "$grant_class" \
     --arg grantRunas "$grant_runas" \
@@ -1532,7 +1634,12 @@ cmd_info() {
                expiresAt: (if $haExp == "-" then null else ($haExp | tonumber | todate) end),
                refreshable: ($haRefresh == "true")},
         startup: {state: $hsState,
-                  reason: (if $hsReason == "" then null else $hsReason end)}
+                  reason: (if $hsReason == "" then null else $hsReason end)},
+        quota: {state: $qState,
+                window: (if $qWin == "" then null else $qWin end),
+                pct: (if $qPct == "" then null else ($qPct | tonumber? // null) end),
+                resetsAt: (if $qReset == "" then null else $qReset end),
+                note: (if $qNote == "" then null else $qNote end)}
       },
       cliName: $cliName,
       cliVersion: (if $cliVersion == "" then null else $cliVersion end),
@@ -1572,6 +1679,7 @@ cmd_info() {
       "isolation:   \(.isolation) (label\(if .isolationLabelled then "" else ", defaulted — unset in registry" end))",
       "sudo:        \(if .sudo.measured then "\(.sudo.grant) — \(.sudo.scope); runas \(.sudo.runas)" else "unknown — not measurable from here; run `sudo -n -l` as agent-\(.name), or re-run this as root" end)\(if .sudo.extraEntries then " (+ entries this CLI did not write)" else "" end)",
       "state:       \(.operationalState) · process \(.active) / \(.enabled) · \(.supervisor.stateNote)",
+      "quota:       \(if .health.quota.state == "exhausted" then "EXHAUSTED — account at \(.health.quota.pct)% of its \(.health.quota.window) limit\(if .health.quota.resetsAt then ", resets \(.health.quota.resetsAt)" else "" end)" elif .health.quota.state == "clear" then "clear (account at \(.health.quota.pct // "?")% of its \(.health.quota.window // "?") limit)" else "unmeasured\(if .health.quota.note then " — \(.health.quota.note)" else "" end)" end)",
       "output:      \(.supervisor.note)",
       "supervisor:  \(.supervisor.line)",
       "created:     \(.createdAt // "unknown")",
@@ -1580,6 +1688,9 @@ cmd_info() {
       # knew was dark, and the seat itself, by construction, cannot read this.
       (if .supervisor.verdict then
          "\nWARNING: this seat is UP and REACHABLE but NOT TRANSACTING (\(.supervisor.verdict)): \(.supervisor.note). Whatever is queued behind it is not moving. The `state:` line above and every other liveness signal (unit / tmux / poller / registry label) read healthy — that agreement is the DIVE-3272 defect, not evidence against this line. Check model capacity (auth-profile, quota reset) and reassign or park the queue: 5dive task ls --assignee=\(.name)"
+       else empty end),
+      (if .health.quota.state == "exhausted" then
+         "\nWARNING: this seat CANNOT EXECUTE A SINGLE TOKEN. Its auth account \(.authProfile // "?") is at \(.health.quota.pct)% of its \(.health.quota.window) rate limit\(if .health.quota.resetsAt then " and does not reset until \(.health.quota.resetsAt)" else "" end). The process is \(.active), the credential parses, and neither fact matters until the window turns over — this is the one measurement that decides whether the seat can work, and before DIVE-4342 none of `agent list`, `liveness` or `supervisor` consulted it. Move the seat to an account with headroom (`sudo 5dive account usage` to find one, then `5dive agent config set auth-profile=<name> --agent=\(.name)`) or reassign what is queued behind it: 5dive task ls --assignee=\(.name)"
        else empty end),
       (if (.health.auth.state == "needs_login" or .health.auth.state == "expired" or .health.startup.state == "degraded") then
          "\nWARNING: this seat is DEGRADED: the process is \(.active), but its provider credential is not usable. Repair with `5dive agent auth status --agent=\(.name)` followed by the appropriate `5dive agent auth start ...`, then restart the seat."
