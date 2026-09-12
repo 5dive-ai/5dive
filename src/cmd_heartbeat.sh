@@ -2714,7 +2714,10 @@ _hb_reclaim_to_todo() {
   if [[ "$mode" == "keep-handoff" ]]; then
     vfier=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};" 2>/dev/null) || vfier=""
     _set_extra=", assignee=verifier"
-    _where_extra=" AND verifier IS NOT NULL AND verifier<>'' AND maker_agent IS NOT NULL AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL"
+    # DIVE-4385 -- "live and ungraded" has to EXCLUDE a bounced delivery, or the
+    # guard's own claim above ("it can never invent a handoff") is false: a
+    # rejected row keeps handoff_delivered_at set and this guard could not tell.
+    _where_extra=" AND verifier IS NOT NULL AND verifier<>'' AND maker_agent IS NOT NULL AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL AND (handoff_rejected_at IS NULL OR handoff_rejected_at < handoff_delivered_at)"
   fi
   db "UPDATE tasks SET status='todo'${_set_extra}, started_at=NULL, updated_at=datetime('now')
       WHERE id=${id} AND status='in_progress'${_where_extra};" 2>/dev/null || true
@@ -3308,8 +3311,16 @@ _hb_reclaim() {
   done < <(db "SELECT id || '|' ||
                  strftime('%s', COALESCE(started_at, created_at)) || '|' ||
                  CAST((julianday('now') - julianday(COALESCE(started_at, created_at))) * 1440 AS INTEGER) || '|' ||
+                 -- DIVE-4385: the same not-bounced clause. Rule (b)'s skip was 0 on a
+                 -- rejected row only because a reject moves the assignee off the
+                 -- verifier -- correct by accident, and an accident is what turns into
+                 -- a hold with no exit the moment any other writer parks a bounced row
+                 -- back on its verifier (which is exactly what the delivered_live bug
+                 -- below was doing). Stated as a predicate it cannot be undone by hand.
                  CASE WHEN verifier IS NOT NULL AND verifier = assignee
                            AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
+                           AND (handoff_rejected_at IS NULL
+                                OR handoff_rejected_at < handoff_delivered_at)
                       THEN 1 ELSE 0 END || '|' ||
                  -- DIVE-4104: a LIVE DELIVERY, which is a different question from
                  -- the awaiting_verifier flag above and deliberately does not ask who
@@ -3322,8 +3333,18 @@ _hb_reclaim() {
                  -- A COMMAND before sqlite ever sees the SQL. The first cut of this
                  -- comment quoted two column names that way and every reclaim tick
                  -- printed 'assignee: command not found' to stderr.
+                 -- DIVE-4385: AND NOT BOUNCED. task reject stamps handoff_rejected_at
+                 -- and deliberately LEAVES handoff_delivered_at set -- that stamp is a
+                 -- token the next delivery spends, not a clock the reject clears -- so
+                 -- without this clause a rejected row reads delivered-and-ungraded
+                 -- forever and rule (a) hands the maker's rework to the verifier who
+                 -- just bounced it. Same predicate task/routing.sh already counts
+                 -- actionable rework with; a re-delivery makes handoff_delivered_at the
+                 -- newer stamp again and the row is live once more.
                  CASE WHEN verifier IS NOT NULL AND maker_agent IS NOT NULL
                            AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
+                           AND (handoff_rejected_at IS NULL
+                                OR handoff_rejected_at < handoff_delivered_at)
                       THEN 1 ELSE 0 END || '|' ||
                  -- DIVE-4206: graded, bound, and the merge is owed by a seat that
                  -- is not this one. Same predicate the board paints graded-to-merge
