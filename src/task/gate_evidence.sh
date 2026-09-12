@@ -53,7 +53,12 @@ _gate_tok_why() {
   # mis-punctuated. Caught by reading the live output, not by the syntax check.
   _t=$(awk '{printf "%s%s", (NR>1?"; ":""), $0}' "$_GATE_TOK_TRACEF" 2>/dev/null || printf '')
   [[ -n "$_t" ]] || { printf 'no token resolution ran in this process'; return 0; }
-  printf 'seat %s: %s' "$(_gate_seat)" "$_t"
+  # DIVE-4341: a RESOLVED token and a gh that cannot start are indistinguishable
+  # downstream — `[4 sudo -u claude gh auth token] RESOLVED` printed four lines under
+  # `this seat CANNOT query GitHub` on a customer box for exactly that reason. When the
+  # substitution fired, say so here, where every refusal and warning already reads.
+  local _cfg; _cfg="$(gh_config_note)"
+  printf 'seat %s: %s%s' "$(_gate_seat)" "$_t" "${_cfg:+; $_cfg}"
 }
 
 # _gate_gh_token — resolve a usable gh auth token for the DIVE-1830 merge-gate's
@@ -97,7 +102,10 @@ _gate_gh_token() {
   # Our own gh login, when we happen to be running as an authed user directly.
   # DIVE-1935: this MUST stay ahead of the `claude` fallback below — a caller's own
   # credential always wins over borrowing another account's.
-  t=$(gh auth token 2>/dev/null || true)
+  # DIVE-4341: without the config dir this arm cannot tell "no login" from "I could
+  # not open claude's config.yml", and it spelled both as the former — a seat that
+  # DID hold a login read as one that did not.
+  t=$(GH_CONFIG_DIR="$(gh_config_dir)" gh auth token 2>/dev/null || true)
   if [[ -n "$t" ]]; then
     _gate_tok_note "[3 own gh auth token] RESOLVED"; printf '%s' "$t"; return 0
   fi
@@ -864,7 +872,12 @@ _gate_gh() {
   _errf="${TMPDIR:-/tmp}/.5dive-gate-gh-err.$$"
   if [[ -n "$tok" ]]; then
     [[ "$secs" != "0" ]] && bound=(timeout "${secs}s")
-    GH_TOKEN="$tok" "${bound[@]}" gh "$@" 2>"$_errf" || _rc=$?
+    # DIVE-4341: GH_CONFIG_DIR is the dir gh loads BEFORE it looks at GH_TOKEN. On a
+    # provisioned box the profile points every seat at claude's 0600 one, so this
+    # call died on a config read with a perfectly good token in hand and the scan
+    # reported `partial-repo-scan-0-of-N`. gh_config_dir returns the seat's own
+    # effective dir unchanged wherever it is readable, so only the dying call moves.
+    GH_TOKEN="$tok" GH_CONFIG_DIR="$(gh_config_dir)" "${bound[@]}" gh "$@" 2>"$_errf" || _rc=$?
     # DIVE-3496: A RESOLVED TOKEN IS NOT A RAIL THAT CAN SEE THE REPO, and until
     # now the first was silently read as the second.
     #
@@ -917,7 +930,7 @@ _gate_gh() {
       _own="$(_gate_owner_from_args "$@")"
       if [[ -n "$_own" ]] && _otok="$(_gate_owner_read_token "$_own")" && [[ "$_otok" != "$tok" ]]; then
         local -a _obound=(); [[ "$secs" != "0" ]] && _obound=(timeout "${secs}s")
-        _oout=$(GH_TOKEN="$_otok" "${_obound[@]}" gh "$@" 2>/dev/null) || _orc=$?
+        _oout=$(GH_TOKEN="$_otok" GH_CONFIG_DIR="$(gh_config_dir)" "${_obound[@]}" gh "$@" 2>/dev/null) || _orc=$?
         if (( _orc == 0 )) && [[ -n "$_oout" ]]; then
           _GATE_GH_LAST_ERR=""
           _gate_tok_note "[5 owner read token GH_READ_TOKEN_${_own^^}] RESOLVED and ANSWERED (DIVE-3888)"

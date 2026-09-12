@@ -484,6 +484,66 @@ NODE_VERSION="22"
 
 die() { echo "error: $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
+
+# >>> DIVE-4350 optional-at-pin download contract
+# ONE helper for every download that main's install.sh may name BEFORE the fleet
+# pin's tree carries it. install.sh is fetched live from `main`, but every
+# `$REPO/…` below resolves against the PINNED tag (DIVE-4140), so main naming a
+# file first shipped in a later tag is a 404 — and under `set -e` that 404 was
+# the whole install (DIVE-4349).
+#
+# THE CONTRACT, and it is the entire point of the helper:
+#
+#   HTTP 404  -> the pinned tree genuinely does not ship this file yet.
+#                Skip it, named on stderr, never silent.
+#   ANYTHING ELSE (DNS failure, connection refused, timeout, TLS, 5xx, a
+#                proxy's 403, a partial body) -> FAIL CLOSED.
+#
+# Why that second line is not defensive padding: the DIVE-4349 hotfix used
+# `curl -fsSL … 2>/dev/null` and `-f` collapses every 4xx/5xx into exit 22, so
+# the `else` arm labelled a transient blip "not shipped at this pin" (quinn, on
+# #908 — proved with a connection-refused fetch under GH_PINNED_TAG=v0.35.1:
+# exit 0, hook absent, false cause on stderr). Once the fleet pin passes the tag
+# that ships a hook, that blip silently un-wires it on that box and lies about
+# why. `-f` is therefore DELIBERATELY ABSENT here: we need the status code back.
+#
+# Usage: fetch_optional_at_pin <repo-relative path> <dest>
+#   returns 0  installed at $2
+#   returns 1  legitimately absent at this pin (caller decides what to unwire)
+#   exits      anything else — a failure that is not a 404 is not a policy
+#              decision this function is allowed to make quietly.
+fetch_optional_at_pin() {
+  local _path="$1" _dest="$2" _tmp _code _rc
+  _tmp="$(mktemp "${_dest}.XXXXXX")" || die "failed to create a temp file beside $_dest"
+  # An explicit file:// source (install-smoke's offline bundle) carries no HTTP
+  # status at all — curl reports 000 for a SUCCESSFUL read — so absence there is
+  # curl's own exit 37, not a code. Kept separate rather than folded in, because
+  # folding it in is what makes 000 ambiguous again.
+  if [[ "$REPO" == file://* ]]; then
+    if curl -sSL -o "$_tmp" "$REPO/$_path" 2>/dev/null; then
+      mv -f "$_tmp" "$_dest"; return 0
+    fi
+    rm -f "$_tmp"
+    echo "  ! $_path is not in this local bundle ($REPO) — skipped" >&2
+    return 1
+  fi
+  if _code="$(curl -sSL --max-time 30 -w '%{http_code}' -o "$_tmp" "$REPO/$_path" 2>/dev/null)"; then
+    _rc=0
+  else
+    _rc=$?
+  fi
+  if [[ $_rc -eq 0 && "$_code" == "200" ]]; then
+    mv -f "$_tmp" "$_dest"
+    return 0
+  fi
+  rm -f "$_tmp"
+  if [[ $_rc -eq 0 && "$_code" == "404" ]]; then
+    echo "  ! $_path not shipped at this pin (${GH_PINNED_TAG:-${GH_PINNED_SHA:-unpinned}}) — skipped; the bundle at this pin does not wire it" >&2
+    return 1
+  fi
+  die "failed to download $_path from $REPO/$_path (http ${_code:-000}, curl rc $_rc) — this is NOT a 404, so it is not 'absent at this pin'; refusing to silently drop a file the pinned tree may well ship (DIVE-4350)"
+}
+# <<< DIVE-4350 optional-at-pin download contract
 say() { echo "→ $*"; }
 
 [[ $EUID -eq 0 ]] || die "run as root: curl -fsSL ... | sudo bash"
@@ -977,28 +1037,25 @@ JOURNALD
     chmod 755 "$LIB_DIR/$hook"
     ok "$hook"
   done
-  # >>> DIVE-4349 hooks newer than the fleet pin are optional at that pin
-  # This script is fetched from `main` (install.5dive.com) but every $REPO/…
-  # download below resolves against the PINNED tag's tree (DIVE-4140: the
-  # fleet follows api.5dive.com/cli-version, v0.32.3 tonight). A hook that
-  # main's loop above names but the pinned tree does not carry is a 404, and
-  # under `set -e` that 404 was the whole install: the 2026-09-12 01:52Z
-  # nightly smoke aborted at "Installing software"; any fresh customer box
-  # and every pinned box's 04:00Z self-update would do the same from #890
-  # (2026-09-11 18:24Z) onward. The bundle at that
-  # pin never wires a hook it does not ship, so skipping is the correct
-  # outcome — named on stderr, never silent. Move a hook UP into the
-  # fail-closed loop only once the fleet pin is at or past the tag that ships it.
+  # >>> DIVE-4349/DIVE-4350 hooks newer than the fleet pin are optional at that pin
+  # These are named by main's copy of this script but may not exist in the
+  # PINNED tag's tree. The bundle at that pin never wires a hook it does not
+  # ship, so skipping is the correct outcome — but ONLY for a real 404, which
+  # is `fetch_optional_at_pin`'s whole contract (see the helper above).
+  #
+  # MOVE A HOOK UP into the fail-closed loop only once the fleet pin is at or
+  # past the tag that ships it. scripts/install-pin-compat.sh grades that on
+  # every PR that touches this file, so "the pin has caught up" is a check
+  # result and not a memory.
   for hook in stop-browser-teardown.sh; do
-    if curl -fsSL "$REPO/hooks/$hook" -o "$LIB_DIR/$hook" 2>/dev/null; then
+    if fetch_optional_at_pin "hooks/$hook" "$LIB_DIR/$hook"; then
       chmod 755 "$LIB_DIR/$hook"
       ok "$hook"
     else
       rm -f "$LIB_DIR/$hook"
-      echo "  ! hooks/$hook not shipped at this pin (${GH_PINNED_TAG:-unpinned}) — skipped; the bundle at this pin does not wire it" >&2
     fi
   done
-  # <<< DIVE-4349
+  # <<< DIVE-4349/DIVE-4350
   curl -fsSL "$REPO/skills/notify-user/SKILL.md" -o "$LIB_DIR/skills/notify-user/SKILL.md"
   chmod 644 "$LIB_DIR/skills/notify-user/SKILL.md"
   ok "notify-user skill"

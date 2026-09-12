@@ -273,6 +273,13 @@ cmd_task_merge_gate_selftest() {
   trace=$(awk '{printf "%s%s", (NR>1?"; ":""), $0}' "$_GATE_TOK_TRACEF" 2>/dev/null || printf '')
   _gate_gh_bot_ok && bot="available" || bot="not permitted on this seat"
   _gate_anon_ok   && anon="usable"   || anon="unusable (no curl/jq, or FIVE_GATE_NO_ANON=1)"
+  # DIVE-4341: the instrument's blind spot was that a RESOLVED token and a gh that
+  # cannot start look identical here — this very line printed `[4 sudo -u claude gh
+  # auth token] RESOLVED` four rows under `this seat CANNOT query GitHub` on a
+  # customer box, and the reason (an unreadable shared GH_CONFIG_DIR) appeared
+  # nowhere. Empty on a seat where nothing was substituted, so the ordinary output
+  # does not grow a sentence about something that did not happen.
+  local cfgnote; cfgnote="$(gh_config_note)"
 
   # The graded probe. `_gate_gh` picks whichever rail this seat actually has, which is
   # deliberately the SAME selection the gate makes — a self-test that hand-picks a rail
@@ -293,10 +300,10 @@ cmd_task_merge_gate_selftest() {
   esac
 
   if [[ "$verdict" == "ok" ]]; then
-    ok "merge-gate selftest: $detail — $seat; token arms: ${trace:-none run}; machine-account rail: $bot; anonymous rail: $anon" \
-       '{verdict:$v, seat:$s, controlPr:$p, state:$st, tokenResolved:($tk=="1"), tokenTrace:$tr, botRail:$b, anonRail:$a}' \
+    ok "merge-gate selftest: $detail — $seat; token arms: ${trace:-none run}; machine-account rail: $bot; anonymous rail: $anon${cfgnote:+; $cfgnote}" \
+       '{verdict:$v, seat:$s, controlPr:$p, state:$st, tokenResolved:($tk=="1"), tokenTrace:$tr, botRail:$b, anonRail:$a, ghConfig:$c}' \
        --arg v "$verdict" --arg s "$seat" --arg p "$pr" --arg st "$state" \
-       --arg tk "$([[ -n "$tok" ]] && printf 1 || printf 0)" --arg tr "$trace" --arg b "$bot" --arg a "$anon"
+       --arg tk "$([[ -n "$tok" ]] && printf 1 || printf 0)" --arg tr "$trace" --arg b "$bot" --arg a "$anon" --arg c "$cfgnote"
     return 0
   fi
   # A failing self-test is a FINDING, not a crash: it is the only surface on which an
@@ -314,14 +321,15 @@ cmd_task_merge_gate_selftest() {
   mark_reported
   if (( JSON_MODE )); then
     ok "merge-gate selftest: $detail" \
-       '{verdict:$v, seat:$s, controlPr:$p, state:$st, tokenResolved:($tk=="1"), tokenTrace:$tr, botRail:$b, anonRail:$a}' \
+       '{verdict:$v, seat:$s, controlPr:$p, state:$st, tokenResolved:($tk=="1"), tokenTrace:$tr, botRail:$b, anonRail:$a, ghConfig:$c}' \
        --arg v "$verdict" --arg s "$seat" --arg p "$pr" --arg st "$state" \
-       --arg tk "$([[ -n "$tok" ]] && printf 1 || printf 0)" --arg tr "$trace" --arg b "$bot" --arg a "$anon"
+       --arg tk "$([[ -n "$tok" ]] && printf 1 || printf 0)" --arg tr "$trace" --arg b "$bot" --arg a "$anon" --arg c "$cfgnote"
     return "$rc"
   fi
   warn "merge-gate selftest FAILED on $seat: $detail"
   warn "  token arms: ${trace:-none run}"
   warn "  machine-account rail: $bot · anonymous rail: $anon"
+  [[ -n "$cfgnote" ]] && warn "  gh config: $cfgnote"
   warn "  a close from this seat is not verified-clean; grade it with \`task merge-audit --limit=1\` or hand the close to a seat that passes."
   return "$rc"
 }
@@ -1600,7 +1608,7 @@ cmd_task_merge_do() {
   [[ -n "$tok" ]] || fail "$E_GENERIC" "$_GH_BOT_ENV exists but carries no ${_GH_BOT_KEY}."
 
   local rc=0
-  GH_TOKEN="$tok" GITHUB_TOKEN="" gh pr merge "$pr" --squash || rc=$?
+  GH_TOKEN="$tok" GITHUB_TOKEN="" GH_CONFIG_DIR="$(gh_config_dir)" gh pr merge "$pr" --squash || rc=$?
   if (( rc != 0 )); then
     mark_reported
     printf '_merge_do: `gh pr merge %s --squash` exited %s as the machine account. That is GitHub'"'"'s answer, not a standing refusal — %s DOES hold merge standing on %s here. A required check that is red or still running, a protected branch the machine account cannot merge, and a conflict all land on this line; read gh'"'"'s message above.\n' \
