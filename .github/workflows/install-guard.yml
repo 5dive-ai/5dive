@@ -28,6 +28,8 @@ on:
     paths:
       - 'install.sh'
       - 'src/cmd_selfupdate.sh'
+      - '.github/fleet-pin'
+      - 'scripts/install-pin-compat.sh'
 
 jobs:
   diff:
@@ -114,3 +116,31 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "::warning::This PR modifies the root-execution path ($(tr '\n' ' ' <<<"$files")). It reaches every box at merge, ungated by any tag. Full diff is in the job summary."
+
+  # DIVE-4350 — install.sh COMES FROM main, ITS DOWNLOADS COME FROM THE PIN.
+  #
+  # The job above makes a root-path change impossible to merge unseen. It does
+  # not, and cannot, tell you that what you added EXISTS on the fleet: install.sh
+  # is served from main, but every `$REPO/…` inside it resolves against the
+  # PINNED tag's tree (DIVE-4140), and with the pin promoted deliberately and
+  # rarely, main is normally ahead. #890 added a fail-closed download of a hook
+  # first shipped two tags later; every test passed, because the file exists on
+  # main — and under `set -e` the 404 at the pin was the entire install, for
+  # every fresh box and every 04:00Z self-update, for eight hours (DIVE-4349).
+  #
+  # This job evaluates the condition the fleet evaluates at 04:00Z, at PR time.
+  # It is a SEPARATE job from `diff` on purpose: that one is a human-facing
+  # summary that must never fail a PR, this one is an assertion that must.
+  pin-compat:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # fetch-depth 0 brings the tags with it; the pin must be an OBJECT here or
+      # `git cat-file -e <pin>:<path>` is vacuously false and the script refuses.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Every fail-closed download in install.sh exists at the fleet pin
+        run: bash scripts/install-pin-compat.sh

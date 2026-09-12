@@ -1,0 +1,14 @@
+# THE FLEET PIN, RECORDED — fallback for scripts/install-pin-compat.sh (DIVE-4350).
+#
+# The live answer is https://api.5dive.com/cli-version (DIVE-4140: managed boxes
+# follow that route, promoted deliberately and rarely). This file exists so the
+# guard has an answer when CI cannot reach the route — never so it becomes the
+# primary source.
+#
+# POLARITY, and it is why a stale value here is safe: the guard asserts that
+# every fail-closed download in install.sh EXISTS at the pin. A value here that
+# lags the real pin makes the guard STRICTER (it demands the file in an older
+# tree), so drift produces a false alarm you can see, never a false pass.
+#
+# Update it when the fleet pin is promoted. First non-comment line wins.
+v0.32.3
