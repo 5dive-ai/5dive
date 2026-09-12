@@ -733,6 +733,89 @@ if [[ "$_bflag" == 2 ]]; then
   ok "no non-confirm CI invocation passes --baseline-report (2 sites, both confirm jobs)"
 else bad "no non-confirm CI invocation passes --baseline-report" "count=$_bflag (want 2)"; fi
 
+# --- DIVE-4374: the fetch must enumerate EVERY shard the green run carried -----
+# The loop in fetch-budget-baseline.sh named `core-$env-1` and `core-$env-2`
+# literally, from a two-shard matrix. unit-tests.yml went to three shards and the
+# list did not, so one shard's per-harness prices were never fetched — and the join
+# in tests/lib/tier.sh prices a harness it has no baseline for AS ITSELF, at the
+# inflated cost of the very run being graded. Replayed on the two merge-group runs
+# that ejected PR #906 (34666831882, 34667348433), against the same green baseline
+# run 34667337255: shards 1+2 give `verdict=corpus common_cover_pct=39
+# new_files=89`; all three give `verdict=runner common_cover_pct=100 new_files=0
+# repriced_s=296`. A partial baseline never fails toward green — it fails toward the
+# red, silently, which is why this is graded BEHAVIOURALLY and not by a grep on the
+# shard count: a grep for "1, 2, 3" would have to be edited in lockstep with the
+# matrix, which is the same coupling that broke.
+_bl=.github/scripts/fetch-budget-baseline.sh
+if [[ -r "$_bl" ]]; then
+  _blroot="$TMP/baseline-fetch"; rm -rf "$_blroot"; mkdir -p "$_blroot/bin" "$_blroot/work"
+  # Four shards, not three: the fixture proves the enumeration has no CEILING, so it
+  # cannot silently go stale the next time the matrix widens.
+  python3 - "$_blroot" <<'PYZIP'
+import sys, zipfile, os
+root = sys.argv[1]
+for n in (1, 2, 3, 4):
+    with zipfile.ZipFile(os.path.join(root, 'art-%d.zip' % n), 'w') as z:
+        z.writestr('core-installed-%d.txt' % n,
+                   '# run-harnesses report\n# tier=core\n# shard=%d/4\n%d\t0\ttests/shard%d_unit.sh\n' % (n, 1000 * n, n))
+        z.writestr('core-verdict-installed-%d.txt' % n, 'shard=%d\n' % n)
+# A decoy every wrong pattern would drag in: the CONFIRM artifact of the same
+# environment, the other environment's shards, and a non-report artifact.
+for name in ('core-installed-confirm-1', 'core-pristine-1', 'selfcheck-installed'):
+    with zipfile.ZipFile(os.path.join(root, 'art-%s.zip' % name), 'w') as z:
+        z.writestr('%s.txt' % name, 'DECOY — this artifact must never be fetched as a baseline\n')
+PYZIP
+  cat > "$_blroot/bin/gh" <<GHSTUB
+#!/usr/bin/env bash
+# Minimal gh double: the three calls fetch-budget-baseline.sh makes, nothing else.
+url="\$2"
+case "\$url" in
+  *"/actions/workflows/unit-tests.yml/runs"*) printf '777\tdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\t2026-09-12T00:00:00Z\n' ;;
+  *"/actions/runs/777/artifacts"*)
+    printf '%b\n' \\
+      '11\tcore-installed-1' '12\tcore-installed-2' '13\tcore-installed-3' '14\tcore-installed-4' \\
+      '21\tcore-installed-confirm-1' '31\tcore-pristine-1' '41\tselfcheck-installed' ;;
+  *"/actions/artifacts/11/zip"*) cat "$_blroot/art-1.zip" ;;
+  *"/actions/artifacts/12/zip"*) cat "$_blroot/art-2.zip" ;;
+  *"/actions/artifacts/13/zip"*) cat "$_blroot/art-3.zip" ;;
+  *"/actions/artifacts/14/zip"*) cat "$_blroot/art-4.zip" ;;
+  *"/actions/artifacts/21/zip"*) cat "$_blroot/art-core-installed-confirm-1.zip" ;;
+  *"/actions/artifacts/31/zip"*) cat "$_blroot/art-core-pristine-1.zip" ;;
+  *"/actions/artifacts/41/zip"*) cat "$_blroot/art-selfcheck-installed.zip" ;;
+  *) printf 'gh double: unexpected url %s\n' "\$url" >&2; exit 1 ;;
+esac
+GHSTUB
+  chmod +x "$_blroot/bin/gh"
+  _blabs="$PWD/$_bl"
+  _blout="$( cd "$_blroot/work" && PATH="$_blroot/bin:$PATH" GITHUB_REPOSITORY=5dive-ai/5dive \
+               bash "$_blabs" installed 2>&1 )"
+  _blgot="$(ls "$_blroot/work/baseline-reports" 2>/dev/null | sort | paste -sd, -)"
+  if [[ "$_blgot" == "core-installed-1.txt,core-installed-2.txt,core-installed-3.txt,core-installed-4.txt" ]]; then
+    ok "the baseline fetch takes EVERY shard the green run carried, not a hand-written 1-and-2 (DIVE-4374)"
+  else
+    bad "the baseline fetch takes every shard the green run carried" "got [$_blgot] — output: $_blout"
+  fi
+  if grep -q '4 shard artifact(s)' <<<"$_blout" && grep -q 'core-installed-4' <<<"$_blout"; then
+    ok "…and it NAMES the shards it took, so a partial baseline cannot read as a complete one"
+  else
+    bad "the fetch names the shards it took" "$_blout"
+  fi
+  # The decoys: a confirm report is the RED being graded, not a price list, and the
+  # other environment's numbers are a different box. Either one joined in would
+  # corrupt the baseline rather than thin it.
+  if [[ -z "$(ls "$_blroot/work/baseline-reports" 2>/dev/null | grep -E 'confirm|pristine|selfcheck' || true)" ]]; then
+    ok "…and it takes NEITHER the same environment's confirm artifact NOR the other environment's shards"
+  else
+    bad "the fetch takes neither the confirm artifact nor the other environment" "$(ls "$_blroot/work/baseline-reports")"
+  fi
+  # The verdict hand-off files ride in the same artifact and are not prices.
+  if [[ ! -e "$_blroot/work/baseline-reports/core-verdict-installed-1.txt" ]]; then
+    ok "…and the shards' verdict hand-off files are stripped, leaving only the price reports"
+  else
+    bad "the verdict hand-off files are stripped from the baseline" "core-verdict-installed-1.txt survived"
+  fi
+else bad "the baseline fetch script is readable from the harness (DIVE-4374)" "no file at $_bl"; fi
+
 # --- DIVE-2667: the tier must run often enough to ATTRIBUTE a break ------------
 # The nightly was red on main for ~17h across ~12 commits because full-sweep ran
 # once a day and is not in the per-PR check set. Two properties are pinned here,
