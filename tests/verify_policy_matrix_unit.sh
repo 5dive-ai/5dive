@@ -169,12 +169,20 @@ echo "── the surface that writes it: 5dive config ────────�
 # and is exercised for real by the CLI on every set).
 source "$SRC/cmd_box_config.sh"
 require_root() { return 0; }
-printf '{}\n' > "$BOX_CONFIG"
 JSON_MODE=0
+rm -f "$BOX_CONFIG"
+_p=$(box_verify_policy)
 _r=$(cmd_box_config 2>&1)
-[[ "$_r" == *"verify = delivered-only (unset — defaulting to 'delivered-only')"* ]] \
-  && ok_t "config with no verify key reads 'delivered-only' and says it is the unset default" \
-  || bad_t "config with no verify key reads 'delivered-only' and says unset" "got: ${_r:0:200}"
+[[ "$_p" == "delivered-only" && "$_r" == *"verify = delivered-only (unset — defaulting to 'delivered-only')"* ]] \
+  && ok_t "config with no box file resolves delivered-only and says it is the unset default" \
+  || bad_t "config with no box file resolves delivered-only and says unset" "policy=$_p output=${_r:0:200}"
+
+printf '{}\n' > "$BOX_CONFIG"
+_p=$(box_verify_policy)
+_r=$(cmd_box_config 2>&1)
+[[ "$_p" == "delivered-only" && "$_r" == *"verify = delivered-only (unset — defaulting to 'delivered-only')"* ]] \
+  && ok_t "config with no verify key resolves delivered-only and says it is the unset default" \
+  || bad_t "config with no verify key resolves delivered-only and says unset" "policy=$_p output=${_r:0:200}"
 _r=$(cmd_box_config verify=bogus 2>&1)
 [[ "$_r" == *"always, delivered-only, never"* ]]   && ok_t "an out-of-range value is refused and the legal set is named"   || bad_t "an out-of-range value is refused" "got: ${_r:0:200}"
 cmd_box_config verify=never >/dev/null 2>&1
