@@ -2027,7 +2027,9 @@ cmd_task_need() {
   # approval is recorded as provided by this path, so it never touches
   # cmd_task_answer's human-only clear. The authorized set is the same one, minus
   # nothing: the gate's filer of record, the filer's routed lead, the gate's own
-  # routed reviewer, the org coordinator, or a genuine human caller.
+  # routed reviewer, the org coordinator, or a CORROBORATED human caller — every
+  # rung requiring BOTH the caller and the authorizer to have actually resolved
+  # (see the fail-closed note at the comparisons).
   if [[ -n "$escalate" && "$escalate" != "0" ]]; then
     [[ -z "$type$ask$options$recommend$tier$secret_key$connector$oob$probe$discusses$needs$withdraw" && "$self_minted" == "0" ]] \
       || fail "$E_USAGE" "--escalate takes no other gate flags (it forwards the EXISTING gate to the paired human; it does not re-file one)"
@@ -2049,12 +2051,37 @@ cmd_task_need() {
     [[ "$e_kind" == "agent" ]] && e_name="${e_id#agent }"
     e_lead=$(_gate_route_reviewer "$e_filer") || e_lead=""
     e_coord=$(_task_resolve_coordinator) || e_coord=""
-    [[ "$e_kind" == "human" ]] && e_ok=1
-    [[ -n "$e_name" && "$e_name" == "$e_filer"  ]] && e_ok=1
+    # FAILS CLOSED WHERE THE CALLER CANNOT BE IDENTIFIED. Iteration 1 shipped this
+    # guard open in exactly that state, and CI caught what this box could not: the
+    # harness runs as ROOT with no SUDO_* (DIVE-4341), where _gate_withdraw_actor's
+    # human rung is a NAME test alone — `root` is not `agent-*`, so it printed
+    # `human` and the guard admitted a caller it had not identified. Measured
+    # 2026-09-12: `sudo -n env -u SUDO_USER -u SUDO_UID bash
+    # tests/gate_lead_review_routing_unit.sh` forwarded an unauthorized gate to the
+    # paired human, rc=0. On an agent seat the same sha refused it, which is why a
+    # local run cannot see this.
+    #
+    # So the human rung takes the SEALED predicate cmd_task_answer already demands
+    # of a human-only clear (_gate_human_principal = the uid test AND the DIVE-2371
+    # cgroup corroboration), not the weaker name test. The two paths now agree: the
+    # identity good enough to ANSWER a tier-2 gate is the identity good enough to
+    # CREATE one. A root shell with no session scope, a CI container and any other
+    # unenumerated principal are refused — the DIVE-2371 rule, that a human-evidence
+    # test whose default is *human* has its fail direction backwards, applied to the
+    # one rung on this row that had not been given it.
+    #
+    # _gate_withdraw_actor itself is UNCHANGED: --withdraw retires a question and
+    # --escalate promotes one to a person, and only the promoting half is this row's.
+    [[ "$e_kind" == "human" ]] && _gate_human_principal && e_ok=1
+    # BOTH SIDES NON-EMPTY on every comparison below, so an unresolved authorizer can
+    # never match an unresolved caller. e_name is already gated non-empty, which is
+    # what kept this half closed in practice; the filer rung is the one that read only
+    # one side, and a rung that is correct by accident is not a rung.
+    [[ -n "$e_name" && -n "$e_filer" && "$e_name" == "$e_filer" ]] && e_ok=1
     [[ -n "$e_name" && -n "$e_lead"   && "$e_name" == "$e_lead"   ]] && e_ok=1
     [[ -n "$e_name" && -n "$e_routed" && "$e_name" == "$e_routed" ]] && e_ok=1
     [[ -n "$e_name" && -n "$e_coord"  && "$e_name" == "$e_coord"  ]] && e_ok=1
-    (( e_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-escalate-not-authorized DIVE-4365 "$ident" "only the gate's filer (${e_filer:-unrecorded}), their lead (${e_lead:-none}), the gate's routed reviewer (${e_routed:-none}), the org coordinator (${e_coord:-none}) or a human can forward this gate to the paired human. If that is not you and the gate is genuinely a person's call, say so on the row and let one of those seats forward it — do not re-file it as --tier=2, which loses this gate's history."
+    (( e_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-escalate-not-authorized DIVE-4365 "$ident" "only the gate's filer (${e_filer:-unrecorded}), their lead (${e_lead:-none}), the gate's routed reviewer (${e_routed:-none}), the org coordinator (${e_coord:-none}) or a human at a real login session can forward this gate to the paired human. If that is not you and the gate is genuinely a person's call, say so on the row and let one of those seats forward it — do not re-file it as --tier=2, which loses this gate's history."
     db "UPDATE tasks
           SET tier=2, floor_provenance='axis=lead-escalated', gate_urgent=1,
               gate_pinged_at=NULL, updated_at=datetime('now')

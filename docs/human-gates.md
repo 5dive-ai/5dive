@@ -51,8 +51,14 @@ No other flags. The gate keeps its ident, its ask, its recommendation and its
 history; the tier goes to 2, the reason is recorded as `axis=lead-escalated`, and
 the ping fires immediately (a gate a lead has already read does not need a second
 window in front of it). Authorized on the trusted unix identity — the gate's
-filer, their lead, the gate's routed reviewer, the org coordinator, or a human —
-never on `--from`, which is a self-declaration.
+filer, their lead, the gate's routed reviewer, the org coordinator, or a human at
+a real login session — never on `--from`, which is a self-declaration.
+
+Every rung needs **both** sides to resolve: a caller the box cannot identify never
+matches an authorizer it could not resolve either. The human rung takes the same
+corroboration a human-only *clear* needs (`task answer`), so a root shell with no
+session of its own, a CI container, or any other unenumerated principal is refused
+rather than admitted by default.
 
 ## 3. Whose bot rings the phone
 

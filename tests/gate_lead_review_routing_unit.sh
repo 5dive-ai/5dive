@@ -172,10 +172,35 @@ out=$(cmd_task_need DIVE-9406 --type=decision --self-minted --from=dev3 \
 # AUTHORIZED ON THE TRUSTED UNIX IDENTITY, NEVER ON --from — the same principal
 # `--withdraw` takes, and for the same reason: --from is a self-declaration, and a
 # flag that promotes a gate to a person must not be forgeable by typing a name.
-# So the fixture makes the RUNNING seat the gate's routed reviewer rather than
-# passing --from=main, which would prove nothing about the authorization.
-ACTOR=$(task_actor "")
-db "UPDATE tasks SET routed_reviewer=$(sqlq "$ACTOR") WHERE ident='DIVE-9404';"
+# So the fixture PINS the caller's unix identity rather than passing --from=main,
+# which would prove nothing about the authorization.
+#
+# PINNED, NOT AMBIENT — and that is iteration 2's correction, forced by CI. The
+# first cut read the RUNNING seat (`task_actor ""`) into routed_reviewer, so these
+# arms graded whoever happened to run them: green on an agent seat, and in CI —
+# root, no SUDO_* (DIVE-4341) — the actor resolved `human` on a name test alone and
+# the guard admitted it, so the refusal arm went red at the same sha that passed
+# here. An authorization arm that reads the runner's own identity is not grading the
+# guard, it is grading the runner.
+#
+# _gate_is_root / _gate_caller_uid / _gate_uid_to_agent / _gate_passwd_stream are
+# the DIVE-2330 seams, so pinning them runs the REAL _gate_withdraw_actor on any
+# host: root or not, agent seat or CI container, every arm below resolves the same
+# principal. _gate_human_principal is stubbed only where the arm is ABOUT the human
+# rung — the predicate itself is graded by gate_cgroup_human_principal_unit, and
+# re-deriving it from /proc here would re-introduce exactly the ambient read this
+# correction removes.
+PINNED_UID=4365
+PINNED_AGENT=""
+PINNED_HUMAN_RC=1                       # 1 = uncorroborated (the CI/root shape)
+_gate_is_root()       { return 1; }
+_gate_caller_uid()    { printf '%s' "$PINNED_UID"; }
+_gate_uid_to_agent()  { printf '%s' "$PINNED_AGENT"; }
+_gate_passwd_stream() { printf 'pinned:x:%s:%s::/nonexistent:/usr/sbin/nologin\n' "$PINNED_UID" "$PINNED_UID"; }
+_gate_human_principal() { return "$PINNED_HUMAN_RC"; }
+
+PINNED_AGENT="main"
+db "UPDATE tasks SET routed_reviewer='main' WHERE ident='DIVE-9404';"
 out=$(cmd_task_need DIVE-9404 --escalate 2>&1); rc=$?
 tier=$(db "SELECT COALESCE(tier,2) FROM tasks WHERE ident='DIVE-9404';")
 prov=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-9404';")
@@ -197,7 +222,7 @@ out=$(cmd_task_need DIVE-9404 --escalate 2>&1); rc=$?
 
 e_id=$(mkrow DIVE-9407)
 db "UPDATE tasks SET need_type='decision', tier=1, ask='x', need_asked_at=datetime('now'), status='blocked', gate_filed_by='dev3' WHERE id=${e_id};"
-db "UPDATE tasks SET routed_reviewer=$(sqlq "$ACTOR") WHERE id=${e_id};"
+db "UPDATE tasks SET routed_reviewer='main' WHERE id=${e_id};"
 out=$(cmd_task_need DIVE-9407 --escalate --type=decision 2>&1); rc=$?
 [[ $rc -ne 0 && "$out" == *"takes no other gate flags"* ]] \
   && ok_t "--escalate refuses to double as a re-file, so a forwarded gate cannot quietly change its ask" \
@@ -205,10 +230,55 @@ out=$(cmd_task_need DIVE-9407 --escalate --type=decision 2>&1); rc=$?
 
 r_id=$(mkrow DIVE-9408)
 db "UPDATE tasks SET need_type='decision', tier=1, ask='x', need_asked_at=datetime('now'), status='blocked', gate_filed_by='dev3', created_by='dev3', assignee='dev3', routed_reviewer='olivia' WHERE id=${r_id};"
+PINNED_AGENT="creative"
 out=$(cmd_task_need DIVE-9408 --escalate 2>&1); rc=$?
 [[ $rc -ne 0 && "$out" == *"can forward this gate to the paired human"* ]] \
   && ok_t "a seat that is neither filer, lead, routed reviewer nor coordinator cannot forward a gate to a person" \
   || fail_t "an unauthorized --escalate returned rc=${rc}: ${out}"
+
+# ── THE FAIL-CLOSED ARMS (iteration 2) ───────────────────────────────────────
+#
+# THE DEFECT CI MEASURED. A caller the box cannot identify as a person — root with
+# no sudo provenance, a CI container, any principal nobody enumerated — resolved
+# `human` on the name test in _gate_withdraw_actor and walked straight through a
+# guard whose whole job is that only a lead's deliberate act reaches a phone. The
+# rung now takes the SEALED predicate (_gate_human_principal), so an unresolved
+# principal is refused here exactly as it is at cmd_task_answer's human-only clear.
+PINNED_AGENT=""                          # actor resolves `human` on the uid walk…
+PINNED_HUMAN_RC=1                        # …but corroborates as nobody
+db "UPDATE tasks SET tier=1, need_answered_at=NULL, gate_pinged_at=NULL, gate_urgent=0 WHERE id=${r_id};"
+out=$(cmd_task_need DIVE-9408 --escalate 2>&1); rc=$?
+tier=$(db "SELECT COALESCE(tier,2) FROM tasks WHERE id=${r_id};")
+[[ $rc -ne 0 && "$tier" == "1" ]] \
+  && ok_t "an UNCORROBORATED human caller cannot forward a gate to a person — the guard fails CLOSED where identity does not resolve" \
+  || fail_t "an uncorroborated human --escalate returned rc=${rc}, tier=${tier}: ${out}"
+
+# THE ARM THE FIX IS CHECKED AGAINST: nothing on either side resolves. No filer of
+# record, no routed reviewer, no lead (the filer column it routes from is empty) and
+# NO COORDINATOR (the org chart is emptied), with a caller that is not an agent. Every
+# comparison is then empty-vs-empty, which is the shape that must never authorize.
+db "DELETE FROM agents_org;"
+n_id=$(mkrow DIVE-9409)
+db "UPDATE tasks SET need_type='decision', tier=1, ask='x', need_asked_at=datetime('now'), status='blocked',
+       gate_filed_by=NULL, created_by=NULL, assignee=NULL, routed_reviewer=NULL WHERE id=${n_id};"
+[[ -z "$(_task_resolve_coordinator)" && -z "$(_gate_route_reviewer '')" ]] \
+  && ok_t "the empty-authorizer fixture really is empty — coordinator, lead and routed reviewer all resolve to nothing" \
+  || fail_t "fixture not empty: coordinator='$(_task_resolve_coordinator)' lead='$(_gate_route_reviewer '')'"
+out=$(cmd_task_need DIVE-9409 --escalate 2>&1); rc=$?
+tier=$(db "SELECT COALESCE(tier,2) FROM tasks WHERE id=${n_id};")
+[[ $rc -ne 0 && "$tier" == "1" ]] \
+  && ok_t "with coordinator, lead, routed reviewer AND filer all empty, --escalate is still refused — no rung matches an unresolved caller" \
+  || fail_t "--escalate with every authorizer empty returned rc=${rc}, tier=${tier}: ${out}"
+
+# THE REFUSAL IS CORROBORATION, NOT A BLANKET BAN ON PEOPLE. lodar at a real login
+# session still forwards his own gate; only the unidentified caller is turned away.
+PINNED_HUMAN_RC=0
+out=$(cmd_task_need DIVE-9409 --escalate 2>&1); rc=$?
+tier=$(db "SELECT COALESCE(tier,2) FROM tasks WHERE id=${n_id};")
+[[ $rc -eq 0 && "$tier" == "2" ]] \
+  && ok_t "a CORROBORATED human still forwards a gate to the paired human — the new rung narrows the principal, it does not close the door" \
+  || fail_t "a corroborated human --escalate returned rc=${rc}, tier=${tier}: ${out}"
+PINNED_HUMAN_RC=1
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
