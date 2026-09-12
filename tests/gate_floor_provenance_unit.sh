@@ -141,7 +141,11 @@ seed DIVE-9002 'ordinary title'
 # --- 3. axis=ask + term — the floor fired on the ask ----------------------------
 seed DIVE-9003 'ordinary title'
 ( cmd_task_need DIVE-9003 --type=decision --ask="approve the spend on a bigger volume" --options="A|B" --recommend=A >/dev/null 2>&1 )
-[[ "$(prov DIVE-9003)" == "axis=ask;term=spend" && "$(tier_of DIVE-9003)" == "2" ]] \
+# DIVE-4346: the provenance field now carries a SECOND clause on a gate whose
+# capability was derived from the floor term (`;needs=derived:<class>`), so these
+# arms assert the CAUSE clause as a prefix rather than the whole field. The
+# derived clause has its own arms in tests/gate_floor_audit_replay_unit.sh.
+[[ "$(prov DIVE-9003)" == "axis=ask;term=spend"* && "$(tier_of DIVE-9003)" == "2" ]] \
   && ok_t 'a floored ask records the axis AND the term that fired' \
   || bad_t 'axis=ask must carry the term' "got [$(prov DIVE-9003)] tier=$(tier_of DIVE-9003)"
 
@@ -161,7 +165,7 @@ seed DIVE-9004 'delete the old customer records table'
 # --- 5. axis=title-fallback — the ask states nothing of its own -----------------
 seed DIVE-9005 'delete the old customer records table'
 ( cmd_task_need DIVE-9005 --type=decision --ask="?" --options="A|B" --recommend=A >/dev/null 2>&1 )
-[[ "$(prov DIVE-9005)" == "axis=title-fallback;term=delete" && "$(tier_of DIVE-9005)" == "2" ]] \
+[[ "$(prov DIVE-9005)" == "axis=title-fallback;term=delete"* && "$(tier_of DIVE-9005)" == "2" ]] \
   && ok_t 'an insubstantial ask floors on the title and records title-fallback' \
   || bad_t 'title-fallback must be recorded and must floor' "got [$(prov DIVE-9005)] tier=$(tier_of DIVE-9005)"
 
@@ -204,7 +208,7 @@ seed DIVE-9008 'ordinary title'
 ( cmd_task_need DIVE-9008 --type=decision --ask="approve the spend on a bigger volume" --options="A|B" --recommend=A >/dev/null 2>&1 )
 ( cmd_task_need DIVE-9008 --type=decision --ask="which rendering library, A or B" --options="A|B" --recommend=A >/dev/null 2>&1 )
 hist=$(db "SELECT COALESCE(floor_provenance,'<NULL>') FROM gate_history WHERE ident='DIVE-9008' ORDER BY id LIMIT 1;")
-[[ "$hist" == "axis=ask;term=spend" ]] \
+[[ "$hist" == "axis=ask;term=spend"* ]] \
   && ok_t 'the archived gate keeps its provenance in gate_history' \
   || bad_t 'gate_history must carry floor_provenance' "got [$hist]"
 [[ "$(prov DIVE-9008)" == "axis=none" ]] \

@@ -573,7 +573,7 @@ _GATE_FLOOR_TAIL='($|[^[:alnum:]_])'
 # same reason; the singular keeps its class only when the text says so. A
 # credential ask that names none of these signals still cannot reach a person
 # undeclared — it is refused by the capability default, not waived.
-_GATE_TOKEN_SECRET_SIGNAL_RX='secret|credential|password|api key|auth|oauth|bearer|rotate|rotation|leak|revoke|provision|paste|issue|bot |github|telegram|stripe|key |keys|env|vault|expired'
+_GATE_TOKEN_SECRET_SIGNAL_RX='secret|cred|password|api key|auth|oauth|bearer|rotate|rotation|leak|revoke|provision|paste|issue|bot |github|telegram|stripe|key |keys|env|vault|expired'
 _gate_redact_bare_token() {
   local text="${1-}"
   [[ "$text" =~ (^|[^[:alnum:]_])token([^[:alnum:]_]|$) ]] || { printf '%s' "$text"; return 0; }
