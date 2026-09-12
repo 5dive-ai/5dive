@@ -506,7 +506,7 @@ _gate_redact_branch_refs() {
 # lowered — the floor still fires on every listed signal, and a missed one lands a
 # tier-1 gate at a routed seat rather than nothing at all. Widen the list here if a
 # real spend is ever measured slipping; do not widen it on a hypothetical.
-_GATE_PRICE_SPEND_SIGNAL_RX='\$[0-9]|€[0-9]|£[0-9]|[0-9] ?(usd|eur|gbp|dollar|euro|cent)|pay|paid|buy|bought|purchas|charg|bill|invoic|spend|spent|refund|subscri|budget|revenue|monetiz|checkout|quote|discount|upgrade|downgrade|rais|lower|increas|decreas|hike|cost|tariff|fee|plan|tier|seat|sku|deal|margin|vendor|supplier|contract|customer|enterprise'
+_GATE_PRICE_SPEND_SIGNAL_RX='\$[0-9]+|€[0-9]+|£[0-9]|[0-9] ?(usd|eur|gbp|dollar|euro|cent)|pay|paid|buy|bought|purchas|charg|bill|invoic|spend|spent|refund|subscri|budget|revenue|monetiz|checkout|quote|discount|upgrade|downgrade|rais|lower|increas|decreas|hike|cost|tariff|fee|plan|tier|seat|sku|deal|margin|vendor|supplier|contract|customer|enterprise'
 # _gate_redact_bare_price <lowercased text>: blank out `price`/`pricing` when the
 # field carries no spend signal. Same shape as DIVE-2629's branch-ref redaction —
 # the transform is on the TEXT at the match site, never on $floor_rx, because the
@@ -519,7 +519,87 @@ _gate_redact_bare_price() {
   [[ "$text" =~ $_GATE_PRICE_SPEND_SIGNAL_RX ]] && { printf '%s' "$text"; return 0; }
   printf '%s' "$text" | sed -E 's/(pricing|price)/ /g'
 }
-_GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
+# DIVE-4346: the tail is now BOUNDED too (see the match site below), so every
+# inflection this floor must keep catching is written out here rather than left to
+# substring containment. Two terms are DELIBERATELY not inflected, and both are
+# measured, not guessed:
+#   * `spends` — in the audit window it appears only as a third-person clause
+#     DESCRIBING a subject that is not the reader's money ("every hand-in then
+#     spends some of our shared AI allowance", DIVE-4218). The authorisation forms
+#     are `spend` and `spending`, and a real money ask still floors on those, on a
+#     currency amount, or on billing/invoice/payment.
+#   * `tokens` — same shape: the plural is the AI-usage noun ("tokens per run"),
+#     the singular is the credential one. A credential ask floors on `credential`,
+#     `credentials`, `api key`, `password`, or `--type=secret`.
+# A term that stops flooring is NOT a hole: a gate that reaches the paired human
+# and declares nothing is now REFUSED by the capability default below, which is a
+# strictly safer failure than a silent waiver of the same question.
+_GATE_T2_FLOOR_RX='spend|spending|billing|invoice|invoices|invoiced|charge|charges|charged|charging|payment|payments|refund|refunds|refunded|subscription|subscriptions|price|prices|pricing|\$[0-9]+|€[0-9]+|publish|publishes|published|publishing|public post|announce|announces|announced|announcing|launch post|press|pressing|customer email|email customers|newsletter|blast|blasts|blasted|blasting|secret|secrets|credential|credentials|api key|api keys|token|password|passwords|delete|deletes|deleted|deleting|destroy|destroys|destroyed|destroying|teardown|wipe|wipes|wiped|wiping|purge|purges|purged|purging|drop[^.]{0,20}table|truncate|truncated|irreversible|revoke|revokes|revoked|revoking|dns|domain transfer'
+# DIVE-4346 — THE TRAILING BOUNDARY. DIVE-2301 bounded the LEADING side only and
+# said so deliberately, to keep inflections matching. Measured cost of leaving the
+# tail open, quinn replaying the shipped predicate over this row's own audit
+# window: `spend` fired inside "every hand-in then SPENDS some of our shared AI
+# allowance" and `token` inside "the TOKENmaxxing board", and a floor hit was (until
+# this change) a full WAIVER of the capability question below — so two of the gates
+# lodar named when he filed this row were exempted by a substring of an unrelated
+# word. The inflections that must keep firing are now written into the shipped
+# regexes instead of inferred from containment, which also makes each one readable
+# and countable in the policy data rather than implied by the matcher.
+#
+# APPLIED TO THE SHIPPED DEFAULT ONLY, exactly like DIVE-4001's bare-price
+# requirement and for a harder reason than symmetry: a constitution term may END IN
+# A CHARACTER CLASS THAT CONSUMES ONE CHARACTER OF A LONGER RUN. `\$[0-9]` matches
+# "$5" of "$500" and a trailing boundary then refuses it, so bounding an org's
+# regex would silently DELETE its money class — caught by
+# tests/gate_floor_word_boundary_unit.sh T7 and constitution_gate_floor_unit while
+# this was being written. The shipped terms are bounded because they are words and
+# their inflections are written out above; an org's list is enforced verbatim.
+_GATE_FLOOR_TAIL='($|[^[:alnum:]_])'
+# DIVE-4346 — THE PUSH-RAIL NOUN. A delegated-push approval is INERT by
+# construction (it opens a PR; DIVE-2629 already redacts the branch name it
+# carries for exactly this reason), and its boilerplate names the rail's own
+# missing credential: "direct GitHub push lacks credentials". That sentence is a
+# statement about the FILER's access, never a request that a person hand one over
+# — measured on DIVE-4052 and DIVE-4125, both of which the floor exempted from the
+# capability question below on the word `credentials`. Scoped exactly like the
+# branch-ref redaction: only the noun inside that clause is blanked, and the rest
+# of the ask is graded unchanged, so "push this, and send me a new bot key"
+# still floors on the second clause.
+# DIVE-4346 — THE BARE `token`. Same shape as DIVE-4001's bare `price`, and
+# measured the same way: in this org's own corpus the unqualified noun is the
+# AI-usage one ("which token limit should the summariser use, 8k or 16k?", quinn's
+# fresh probe), while the credential sense always arrives with a credential
+# signal next to it. `tokens` was dropped from the floor list outright for the
+# same reason; the singular keeps its class only when the text says so. A
+# credential ask that names none of these signals still cannot reach a person
+# undeclared — it is refused by the capability default, not waived.
+_GATE_TOKEN_SECRET_SIGNAL_RX='secret|credential|password|api key|auth|oauth|bearer|rotate|rotation|leak|revoke|provision|paste|issue|bot |github|telegram|stripe|key |keys|env|vault|expired'
+_gate_redact_bare_token() {
+  local text="${1-}"
+  [[ "$text" =~ (^|[^[:alnum:]_])token([^[:alnum:]_]|$) ]] || { printf '%s' "$text"; return 0; }
+  [[ "$text" =~ $_GATE_TOKEN_SECRET_SIGNAL_RX ]] && { printf '%s' "$text"; return 0; }
+  printf '%s' "$text" | sed -E 's/(^|[^[:alnum:]_])token([^[:alnum:]_]|$)/\1 \2/g'
+}
+_GATE_PUSH_RAIL_NOUN_SED='s/(push[^.]{0,60}(lacks|lacking|without|refuses|refuse|cannot|denied)[^.]{0,40})(credentials?|tokens?|api keys?)/\1 /g'
+_gate_redact_push_rail_nouns() {
+  printf '%s' "${1-}" | sed -E "$_GATE_PUSH_RAIL_NOUN_SED"
+}
+# _gate_floor_capability_class <floor term> -> the human capability that term's
+# reserved class consumes. DIVE-4346: a floor hit used to WAIVE the capability
+# question (the gate reached the paired human with needs_capability empty, which
+# is byte-identical to what an undeclared gate records — nothing). It now ANSWERS
+# it: the class the floor already decided is stored on the row, so the counter can
+# see it and a WRONG derivation is countable rather than invisible.
+_gate_floor_capability_class() {
+  local t; t=$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]')
+  case "$t" in
+    spend|spending|billing|invoice*|charge*|payment*|refund*|subscription*|price|prices|pricing|\$*|€*)
+      printf 'spend_authority' ;;
+    secret|secrets|credential*|api\ key*|token|password*)
+      printf 'secret_provision' ;;
+    *) printf 'human_tap' ;;
+  esac
+}
 _gate_tier2_floor_hit() {
   local text floor_rx="$_GATE_T2_FLOOR_RX" loaded_rx="" constitution_path="" ere_rc=0
   text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
@@ -601,7 +681,12 @@ _gate_tier2_floor_hit() {
   if [[ "$floor_rx" == "$_GATE_T2_FLOOR_RX" ]]; then
     text=$(_gate_redact_bare_price "$text")
   fi
-  [[ "$text" =~ (^|[^[:alnum:]_])($floor_rx) ]]
+  if [[ "$floor_rx" == "$_GATE_T2_FLOOR_RX" ]]; then
+    text=$(_gate_redact_push_rail_nouns "$text")
+    text=$(_gate_redact_bare_token "$text")
+  fi
+  local tail=""; [[ "$floor_rx" == "$_GATE_T2_FLOOR_RX" ]] && tail="$_GATE_FLOOR_TAIL"
+  [[ "$text" =~ (^|[^[:alnum:]_])($floor_rx)$tail ]]
 }
 
 # DIVE-2224: NEVER concatenate two SUBJECTS into one classifier input. The ASK is
@@ -1376,12 +1461,15 @@ _gate_internal_residual() {
 # This lowers nothing — the floor still fires, the gate still exists, it still
 # needs clearing; it restores the appeal path `token` and `secret` already have.
 # The money class is NOT carved out with it: `spend|billing|invoice|charge|
-# payment|refund|subscription|\$[0-9]|€[0-9]` all stay non-appealable and all
+# payment|refund|subscription|\$[0-9]+|€[0-9]+` all stay non-appealable and all
 # still fire bare, so an ask that actually moves money is refused an appeal on
 # its own words. Companion change at _GATE_PRICE_SPEND_SIGNAL_RX makes the bare
 # noun require a spend signal before it fires at all — the two are independent:
 # this one makes a price false positive RECOVERABLE, that one makes it rarer.
-_GATE_FLOOR_APPEALABLE_RX='secret|credential|api key|token|password|publish|public post|announce|launch post|delete|destroy|wipe|purge|pricing|price'
+# DIVE-4346: kept term-for-term in step with the inflections written into
+# _GATE_T2_FLOOR_RX. An inflected form present in the floor but ABSENT here would
+# be silently reclassified as non-appealable by the residual test below.
+_GATE_FLOOR_APPEALABLE_RX='secret|secrets|credential|credentials|api key|api keys|token|password|passwords|publish|publishes|published|publishing|public post|announce|announces|announced|announcing|launch post|delete|deletes|deleted|deleting|destroy|destroys|destroyed|destroying|wipe|wipes|wiped|wiping|purge|purges|purged|purging|pricing|price|prices'
 # NON-APPEALABLE (everything else in the floor, stated positively so a future
 # edit to the floor regex cannot silently widen what an appeal reaches): money,
 # real outbound comms, and irreversible infra/access. Never carved out.
@@ -1399,7 +1487,7 @@ _GATE_FLOOR_APPEALABLE_RX='secret|credential|api key|token|password|publish|publ
 # may be a substring of a NON-APPEALABLE one, or stripping the former would erase
 # the latter and hand an appeal to a class that has none. Asserted in
 # tests/gate_floor_word_boundary_unit.sh rather than left to review.
-_GATE_FLOOR_NONAPPEALABLE_RX='spend|billing|invoice|charge|payment|refund|subscription|\$[0-9]|€[0-9]|press|customer email|email customers|newsletter|blast|teardown|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
+_GATE_FLOOR_NONAPPEALABLE_RX='spend|spending|billing|invoice|invoices|invoiced|charge|charges|charged|charging|payment|payments|refund|refunds|refunded|subscription|subscriptions|\$[0-9]+|€[0-9]+|press|pressing|customer email|email customers|newsletter|blast|blasts|blasted|blasting|teardown|drop[^.]{0,20}table|truncate|truncated|irreversible|revoke|revokes|revoked|revoking|dns|domain transfer'
 # _gate_floor_appeal_residual <text>: lower-case <text> and remove ONLY the
 # appealable terms. The caller re-tests the full floor against the result; if it
 # still fires, a non-appealable class is present and the appeal is refused.
@@ -1451,7 +1539,14 @@ _gate_tier2_floor_term() {
   if [[ "$rx" == "$_GATE_T2_FLOOR_RX" ]]; then
     text=$(_gate_redact_bare_price "$text")
   fi
-  [[ "$text" =~ (^|[^[:alnum:]_])($rx) ]] && printf '%s' "${BASH_REMATCH[2]}"
+  # DIVE-4346: mirrored for the same invariant — this helper must never report a
+  # term the floor itself no longer matches.
+  if [[ "$rx" == "$_GATE_T2_FLOOR_RX" ]]; then
+    text=$(_gate_redact_push_rail_nouns "$text")
+    text=$(_gate_redact_bare_token "$text")
+  fi
+  local tail=""; [[ "$rx" == "$_GATE_T2_FLOOR_RX" ]] && tail="$_GATE_FLOOR_TAIL"
+  [[ "$text" =~ (^|[^[:alnum:]_])($rx)$tail ]] && printf '%s' "${BASH_REMATCH[2]}"
 }
 
 # OSS-11 (DIVE-976) — _gate_ask_shape <ask>: normalize an ask into its "shape
@@ -1988,6 +2083,9 @@ _gate_record_line() {
 cmd_task_need() {
   tasks_db_init
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob="" rubber_stamp="" gate_mode="" ask_ok=""
+  # DIVE-4346: the capability class DERIVED from a tier-2 floor hit when the filer
+  # declared none. Declared always wins; this is only ever a fallback.
+  local _cu_derived=""
   local gate_owner=""   # DIVE-3342
   local urgent=0        # DIVE-3474 arm 2
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
@@ -3388,12 +3486,40 @@ As with the readability refusal, NO EXIT HERE CHANGES THE DESTINATION: nothing a
     # Re-run the classifier over the ask AND the title, the same way the cap does.
     # Not a widening: a floored gate was always meant to be exempt, and this is the
     # only instrument that answers whether it is floored on this path.
+    #
+    # AND THE EXEMPTION IS AN ANSWER, NOT A WAIVER (DIVE-4346 iteration 3, quinn's
+    # finding, and it is the whole reason this block moved). As shipped in
+    # iteration 2 a floor hit simply SKIPPED the question: the gate reached the
+    # paired human with `needs_capability` empty — the identical record an
+    # undeclared gate leaves, which is nothing. Replayed over this row's own audit
+    # population that exempted 14 of the 16 gates the default was supposed to
+    # reach, so the deliverable moved its number by 2. The floor, however, has
+    # ALREADY decided which reserved class the ask belongs to; it names the term in
+    # `floor_provenance`. So derive the class from that term and STORE it. Two
+    # things follow, and both are the point:
+    #   * the counter and any later audit can see what a floored tap consumed,
+    #     instead of finding the column blank;
+    #   * a WRONG derivation is now countable — `floor_provenance` carries
+    #     `needs=derived:<class>`, so "the floor guessed" is one query away, where
+    #     before it was indistinguishable from "nobody asked".
+    # The declared value always wins: `--needs=` is never overwritten by this.
     local _cu_title=""
     _cu_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
-    if [[ -z "${needs//[[:space:]]/}" && "$type" != "secret" && "$type" != "access" \
-          && "$tier_floored" != "1" ]] \
-       && ! _gate_hit_either _gate_tier2_floor_hit "$ask" "$_cu_title" \
+    if [[ -z "${needs//[[:space:]]/}" && "$type" != "secret" && "$type" != "access" ]] \
        && ! _gate_is_human_tap "$type" "$tier" "$needs"; then
+     if [[ "$tier_floored" == "1" ]] \
+        || _gate_hit_either _gate_tier2_floor_hit "$ask" "$_cu_title"; then
+      local _cu_term=""
+      _cu_term=$(_gate_tier2_floor_term "$ask" 2>/dev/null) || _cu_term=""
+      [[ -n "$_cu_term" ]] || { _cu_term=$(_gate_tier2_floor_term "$_cu_title" 2>/dev/null) || _cu_term=""; }
+      if [[ -n "$_cu_term" ]]; then
+        _cu_derived=$(_gate_floor_capability_class "$_cu_term")
+        _floor_prov="${_floor_prov:+${_floor_prov};}needs=derived:${_cu_derived}"
+        _task_store_audit_log "task need capability-derived" "derived" 0 -- \
+          "task=$ident" "filer=${actor:-}" "type=$type" "term=$_cu_term" "class=$_cu_derived" || true
+        warn "this gate declares no capability, but the tier-2 floor already classified it on the word '${_cu_term}' — recording needs_capability=${_cu_derived} as DERIVED, not declared. If that is the wrong class, re-file with --needs=<the right one>: a derived class is countable and correctable, an empty one is neither."
+      fi
+     else
       if [[ -z "$ask_ok" ]]; then
         _task_store_audit_log "task need capability-undeclared" "refused" 0 -- \
           "task=$ident" "filer=${actor:-}" "type=$type" "tier=$tier" || true
@@ -3412,6 +3538,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
       _task_store_audit_log "task need capability-undeclared" "escaped" 0 -- \
         "task=$ident" "filer=${actor:-}" "type=$type" "declared=$ask_ok" || true
       warn "undeclared-capability escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". This gate reaches the paired human and names no capability."
+     fi
     fi
 
     # DIVE-4176, THE HALF THAT STAYS ADVISORY AND WHY. "Consequence-first, a
@@ -3516,7 +3643,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
             -- including one that resolved to nothing. What was claimed is the
             -- provenance; whether it resolved is recomputable from the sealed
             -- list, and a mis-declaration you cannot see is one you cannot correct.
-            needs_capability=$(sqlq_or_null "$needs"),
+            needs_capability=$(sqlq_or_null "${needs:-${_cu_derived:-}}"),
             -- DIVE-2848: the declared reason a gate carrying its own recommendation
             -- still went to a person. The cap's value is that the exception is
             -- COUNTABLE afterwards — an escape that leaves no row is --tier=2 with

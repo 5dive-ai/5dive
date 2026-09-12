@@ -312,11 +312,21 @@ cmd_digest() {
   # today without a schema change. A failed read yields null, which renders as
   # "unknown", never as zero: a capability we cannot count is not a capability
   # that was not named (the DIVE-3228 lesson about the buzz count).
-  dbfmt -json "SELECT COALESCE(NULLIF(needs_capability,''), CASE WHEN need_type='secret' THEN 'secret_provision' ELSE '' END) AS cap, COUNT(*) AS n
+  #
+  # DIVE-4346 iteration 3 — DECLARED vs DERIVED. A gate whose ask trips the
+  # tier-2 category floor now has its class DERIVED and stored rather than
+  # reaching the person with the column blank, so the raw column no longer says
+  # who named it. `floor_provenance` does (`needs=derived:<class>`), and the two
+  # must stay visibly apart here: a derived class is a GUESS made from wording,
+  # and a counter that reports it as a declaration would hide exactly the
+  # mis-classification this split exists to make countable.
+  dbfmt -json "SELECT COALESCE(NULLIF(needs_capability,''), CASE WHEN need_type='secret' THEN 'secret_provision' ELSE '' END) AS cap,
+                      CASE WHEN COALESCE(floor_provenance,'') LIKE '%needs=derived:%' THEN 1 ELSE 0 END AS derived,
+                      COUNT(*) AS n
                FROM tasks
                WHERE need_answered_by LIKE 'human:%'
                  AND need_answered_at >= datetime('now','-${window} seconds')
-               GROUP BY 1;" >"$tmpd/cap.json" 2>/dev/null || echo 'null' >"$tmpd/cap.json"
+               GROUP BY 1,2;" >"$tmpd/cap.json" 2>/dev/null || echo 'null' >"$tmpd/cap.json"
   [ -s "$tmpd/cap.json" ] || echo '[]' >"$tmpd/cap.json"
 
   if _bz=$(_digest_buzz_count "$window"); then
@@ -793,8 +803,14 @@ else:
     _ratio = (f"{touches / len(done_l):.2f}" if done_l else ("n/a" if not touches else "∞"))
     if isinstance(cap_rows, list):
         _capless = sum(int(r.get("n") or 0) for r in cap_rows if not (r.get("cap") or "").strip())
-        _named = sum(int(r.get("n") or 0) for r in cap_rows) - _capless
+        _derived = sum(int(r.get("n") or 0) for r in cap_rows
+                       if (r.get("cap") or "").strip() and int(r.get("derived") or 0))
+        _named = sum(int(r.get("n") or 0) for r in cap_rows) - _capless - _derived
         _cap_txt = f"{_named} named a capability, {_capless} named none"
+        # Only rendered when non-zero: a board with no floor-derived taps should
+        # not carry a column explaining a mechanism it never used.
+        if _derived:
+            _cap_txt += f" ({_derived} derived from the ask's wording, not declared)"
     else:
         # Unknown is not zero (DIVE-3228).
         _cap_txt = "capability split: unknown"

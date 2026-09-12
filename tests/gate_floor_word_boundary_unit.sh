@@ -128,8 +128,8 @@ _term=$(_gate_tier2_floor_term "we need a press release")
   && ok_t "T4 reported term is 'press', not ' press' (boundary char not leaked)" \
   || bad_t "T4 reported term clean" "got '${_term}'"
 _term=$(_gate_tier2_floor_term "approve \$500 for ads")
-[[ "$_term" == '$5' ]] \
-  && ok_t "T4 reported term for a money hit is '\$5'" \
+[[ "$_term" == '$500' ]] \
+  && ok_t "T4 reported term for a money hit is the WHOLE amount (DIVE-4346: the money terms consume the full digit run, or the trailing boundary would refuse a 500-dollar amount at its first digit)" \
   || bad_t "T4 money term reported" "got '${_term}'"
 
 # --- T5: THE NON-APPEALABLE HALF, which is where there is no escape path. The
