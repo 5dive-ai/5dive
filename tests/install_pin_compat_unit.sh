@@ -115,6 +115,89 @@ else
   bad_t "ARM E2: zero extracted sites is the extractor breaking, and it refuses" "rc=$rc out=$out"
 fi
 
+# --------------------------------------------------------- ARMS K-N (iteration 2)
+# quinn's finding on iteration 1: the classifier treated fail-closed as the
+# UNASSERTED COMPLEMENT of four tolerance rules, so three ordinary fail-closed
+# idioms were reported as "tolerated" and never graded — the guard greened the
+# exact DIVE-4349 shape. Arms A-E all stayed green through that hole because they
+# only ever exercised the ONE shape #890 used (a bare curl in a for-list). These
+# arms are the hole itself, one arm per idiom.
+echo "# ARMS K1-K3 — the three fail-closed idioms iteration 1 called 'tolerant'"
+
+echo '# ARM K1 — captured in $(…) with an assignment fallback; the die is deferred'
+mk_install '  _x="$(curl -fsSL "$REPO/hooks/new.sh" 2>/dev/null)" || _x=""
+  [[ -n "$_x" ]] || die "absent"'
+out="$(run_guard)"; rc=$?
+if [[ $rc -ne 0 ]] && grep -q 'FAIL - hooks/new.sh' <<<"$out"; then
+  ok_t "ARM K1: \$(curl …) || _x=\"\" is GRADED (the handler that dies is on a later line)"
+else
+  bad_t "ARM K1: \$(curl …) || _x=\"\" is GRADED (the handler that dies is on a later line)" \
+        "this is how install.sh fetches 5dive.sha256; iteration 1 reported it as tolerated; rc=$rc out=$out"
+fi
+
+echo '# ARM K2 — a negated if whose body dies'
+mk_install '  if ! curl -fsSL "$REPO/hooks/new.sh" -o "$LIB_DIR/new.sh"; then
+    die "failed"
+  fi'
+out="$(run_guard)"; rc=$?
+if [[ $rc -ne 0 ]] && grep -q 'FAIL - hooks/new.sh' <<<"$out"; then
+  ok_t "ARM K2: an if-construct containing die is GRADED, not tolerated"
+else
+  bad_t "ARM K2: an if-construct containing die is GRADED, not tolerated" \
+        "iteration 1's blanket ^if/elif rule called every condition tolerant; rc=$rc out=$out"
+fi
+
+echo '# ARM K3 — a || brace block that exits WITHOUT the literal token `die `'
+mk_install '  curl -fsSL "$REPO/hooks/new.sh" -o "$LIB_DIR/new.sh" || { echo "nope" >&2; exit 1; }'
+out="$(run_guard)"; rc=$?
+if [[ $rc -ne 0 ]] && grep -q 'FAIL - hooks/new.sh' <<<"$out"; then
+  ok_t "ARM K3: a || block that exits is GRADED — the test is die OR exit OR return, not the token 'die '"
+else
+  bad_t "ARM K3: a || block that exits is GRADED — the test is die OR exit OR return, not the token 'die '" \
+        "rc=$rc out=$out"
+fi
+
+echo "# ARM L — an if-construct that demonstrably CANNOT abort is still tolerant"
+mk_install '  curl -fsSL "$REPO/hooks/old.sh" -o "$LIB_DIR/old.sh"
+  if curl -fsSL "$REPO/hooks/new.sh" -o "$LIB_DIR/new.sh"; then
+    chmod 644 "$LIB_DIR/new.sh"
+  else
+    echo "warn: not staged" >&2
+  fi'
+out="$(run_guard)"; rc=$?
+if [[ $rc -eq 0 ]]; then
+  ok_t "ARM L: T2 survives the tightening — no die/exit/return in the whole construct is genuinely soft"
+else
+  bad_t "ARM L: T2 survives the tightening — no die/exit/return in the whole construct is genuinely soft" \
+        "over-tightening turns every fail-soft site into a permanent red; rc=$rc out=$out"
+fi
+
+echo "# ARM M — a shape in NEITHER set is a third outcome that FAILS, not a pass"
+mk_install '  curl -fsSL "$REPO/hooks/old.sh" -o "$LIB_DIR/old.sh"
+  curl -fsSL "$REPO/hooks/new.sh" -o "$LIB_DIR/new.sh" || echo "warn" >&2'
+out="$(run_guard)"; rc=$?
+if [[ $rc -ne 0 ]] && grep -q 'UNCLASSIFIED' <<<"$out"; then
+  ok_t "ARM M: an ungrounded shape refuses; fail-closed is no longer an unasserted complement"
+else
+  bad_t "ARM M: an ungrounded shape refuses; fail-closed is no longer an unasserted complement" \
+        "rc=$rc out=$out"
+fi
+
+echo "# ARM N — 5dive.sha256's own shape lands in CHECKED, and never in tolerated"
+mk_install '  _want="$(curl -fsSL "$REPO/hooks/old.sh" 2>/dev/null | tr -d "[:space:]")" || _want=""
+  if [[ -n "$_want" ]]; then
+    :
+  else
+    die "failed to fetch required checksum"
+  fi'
+out="$(run_guard)"; rc=$?
+if [[ $rc -eq 0 ]] && grep -q '^ok   - hooks/old.sh' <<<"$out" && grep -q 'checked=1 ' <<<"$out"; then
+  ok_t "ARM N: the 5dive.sha256 shape is in the checked column (checked=1), not the tolerated one"
+else
+  bad_t "ARM N: the 5dive.sha256 shape is in the checked column (checked=1), not the tolerated one" \
+        "the PR body names {5dive, 5dive.sha256} as the fail-closed set; iteration 1 never checked the second; rc=$rc out=$out"
+fi
+
 cd "$ROOT" || exit 1
 
 # ------------------------------------------- fetch_optional_at_pin, verbatim
