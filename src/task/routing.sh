@@ -49,6 +49,53 @@ _task_resolve_coordinator() {
   fi
 }
 
+# DIVE-4365 part 3 — WHICH BOT RINGS THE PHONE, split out from WHO OWNS THE QUEUE.
+#
+# These were one knob and they are two jobs. `_task_resolve_coordinator` above is
+# read by SIX call sites: the default assignee for an unassigned row
+# (src/task/crud.sh — 44 rows landed on the resolved coordinator in the 14 days to
+# 2026-09-12), the default planner for goals and objectives, the reviewer fallback
+# when a filer has no reports_to, the default loop owner, the owner of the pinned
+# needs-you banner, and — until this row — the SENDER of the tier-2 gate re-nag
+# (DIVE-3742). So "make the lead the gate notifier" was a one-line org edit
+# (`org set main --role='… coordinator'`) that ALSO dumped every unassigned row
+# and every default plan onto that lead's accumulating window. The cheap change
+# was the expensive one; splitting the knob is the change that is actually cheap.
+#
+# WHY THE NOTIFIER SHOULD BE THE LEAD AND NOT THE ROOT: the phone ping and the
+# CONVERSATION about it must land in the same chat. Measured on DIVE-4359
+# (2026-09-12): the re-nag went out from the org root's bot at 04:20:15Z while
+# the human's questions about it were typed into the lead's chat — two surfaces
+# for one gate, and the seat holding the context never saw the reply.
+#
+# Same DIVE-2041 marker shape as the coordinator, and deliberately so: the role
+# column is RENDERED prose, so an exact-match sentinel would destroy the org
+# chart's display text. Space-anchored ('% gate notifier%') so it matches inside
+# prose and uniqueness-checked, because >1 holder is ambiguous and a guess about
+# who pages a person is the wrong place to be clever.
+_GATE_NOTIFIER_MARKER="lower(' '||COALESCE(role,'')) LIKE '% gate notifier%'"
+
+# The EXPLICIT holder only — empty when nothing is tagged. This is the predicate
+# the file-time delivery path reads, and the emptiness is load-bearing: on an
+# untagged chart the gate ping must resolve exactly as it does today (the filer's
+# own channel, then up the org chain), so the notifier preference has to be able
+# to say "nobody asked for this" rather than falling back to a name.
+_task_gate_notifier_explicit() {
+  [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_GATE_NOTIFIER_MARKER};")" == "1" ]] || return 0
+  db "SELECT name FROM agents_org WHERE ${_GATE_NOTIFIER_MARKER} LIMIT 1;"
+}
+
+# The notifier for the re-nag: the tagged holder, else the coordinator. The
+# fallback is what makes swapping the re-nag's resolver a NO-OP on every chart
+# that has not been tagged — DIVE-3742's "one sender, not one per filer" property
+# is preserved byte for byte, and only the CHOICE of that one sender becomes
+# expressible.
+_task_resolve_gate_notifier() {
+  local _n; _n=$(_task_gate_notifier_explicit) || _n=""
+  if [[ -n "$_n" ]]; then printf '%s' "$_n"; return 0; fi
+  _task_resolve_coordinator
+}
+
 # DIVE-969: verifier-by-default posture (Karpathy autonomy slider). Non-trivial
 # work should get graded by someone other than the maker (writer!=grader,
 # DIVE-474/477) UNLESS the creator explicitly opts out. These two helpers decide
