@@ -53,6 +53,18 @@
 readonly _GH_BOT_ENV="/etc/5dive/connectors/github-bot.env"
 readonly _GH_BOT_KEY="GH_BOT_TOKEN"
 
+# DIVE-4334. The ATTESTER credential, and it is deliberately not the bot's.
+# `.github/CODEOWNERS` requires a review on /install.sh and /src/cmd_selfupdate.sh
+# from a GitHub USER (CODEOWNERS resolves users and teams only — never an App
+# identity, which is why 5dive-bot can never be named there), and that user must
+# not be the PR author (GitHub 422s a self-approval and 5dive-bot authors every
+# installer PR). So the attester is a third login, `5dive-reviewer`, holding write
+# and nothing else, and this rail is the ONLY thing on the box that can speak as
+# it. Same posture as the bot: root-side, never held by an agent, passed to gh in
+# the environment and discarded with the process.
+readonly _GH_REVIEWER_ENV="/etc/5dive/connectors/github-reviewer.env"
+readonly _GH_REVIEWER_KEY="GH_REVIEWER_TOKEN"
+
 _gh_usage() {
   cat >&2 <<'EOF'
 5dive gh — run `gh` as the right identity
@@ -64,6 +76,10 @@ _gh_usage() {
                                      operations are still refused: admin=false).
   5dive gh --as=caller <gh args...>  Force your own credential (the pre-2448
                                      behaviour), explicitly and on the record.
+  5dive gh --as=reviewer pr review <n> --approve --body "<why>"
+                                     Submit the CODEOWNERS attestation as
+                                     5dive-reviewer. `pr review` only — this
+                                     credential signs, it does not work.
   5dive gh --explain <gh args...>    Print the routing decision and run nothing.
   5dive gh whoami                    Resolve BOTH identities (caller and bot).
 
@@ -179,6 +195,24 @@ _gh_bot_available() {
   grep -q "^${_GH_BOT_KEY}=" "$_GH_BOT_ENV" 2>/dev/null
 }
 
+# _gh_reviewer_allowed <gh args...> — 0 for the ONE operation the attester
+# credential exists to perform, `gh pr review`. PURE, like `_gh_route_class`, so
+# the root helper can re-derive it instead of trusting the parent (the `_gh_do`
+# posture) and so it is unit-testable without a box.
+#
+# WHY AN ALLOWLIST AND NOT A ROUTING CLASS: the attester holds write on the repo,
+# so a general passthrough would make it a second machine account and undo the
+# attribution DIVE-2448 bought. It is not a credential for doing work; it is a
+# credential for signing one. Everything else routes to bot or caller as before.
+_gh_reviewer_allowed() {
+  [[ "${1:-}" == "pr" && "${2:-}" == "review" ]] && return 0
+  # `api user` is the identity read `whoami` needs. It is the authenticated
+  # account's OWN record and nothing else, so it grants no reach; without it
+  # "which login attests our installer path" would be a config read rather than
+  # a measurement, which is the failure class DIVE-3135 is about.
+  [[ "${1:-}" == "api" && "${2:-}" == "user" ]]
+}
+
 # _gh_caller_credential — 0 when THIS seat actually holds a gh credential.
 # OFFLINE: `gh auth token` resolves GH_TOKEN/GITHUB_TOKEN and the hosts config
 # and makes no network call, so asking before we name an identity costs nothing.
@@ -239,8 +273,8 @@ cmd_gh() {
     esac
   done
 
-  case "$as" in auto|bot|caller) ;; *)
-    fail "$E_VALIDATION" "--as must be auto, bot or caller — got '${as}'." ;;
+  case "$as" in auto|bot|caller|reviewer) ;; *)
+    fail "$E_VALIDATION" "--as must be auto, bot, caller or reviewer — got '${as}'." ;;
   esac
   [[ $# -gt 0 ]] || { _gh_usage; return 2; }
   command -v gh >/dev/null 2>&1 \
@@ -260,6 +294,12 @@ cmd_gh() {
         fail "$E_CONFLICT" "refusing --as=bot for an admin-class operation: 5dive-bot is admin=false — re-run without --as=bot"
       fi
       actor="bot"; reason="you asked for --as=bot" ;;
+    reviewer)
+      # Never auto-routed: nothing INFERS that a call should be signed by the
+      # attester. It is asked for, by name, or it does not happen.
+      _gh_reviewer_allowed "$@" \
+        || fail "$E_CONFLICT" "--as=reviewer carries the CODEOWNERS attester credential and serves 'pr review' (and 'api user') only — got '${1:-}${2:+ $2}'. Use --as=bot for writes and --as=caller for admin-class work."
+      actor="reviewer"; reason="you asked for --as=reviewer: the CODEOWNERS attestation on the installer paths (DIVE-4334)" ;;
     auto)
       if [[ "$class" == "write" ]]; then
         actor="bot"
@@ -284,7 +324,9 @@ cmd_gh() {
       fi ;;
   esac
 
-  if [[ "$actor" == "bot" ]]; then
+  if [[ "$actor" == "reviewer" ]]; then
+    echo "[5dive gh] actor=5dive-reviewer (class=${class}: ${reason})" >&2
+  elif [[ "$actor" == "bot" ]]; then
     echo "[5dive gh] actor=5dive-bot (class=${class}: ${reason})" >&2
   elif _gh_caller_credential; then
     echo "[5dive gh] actor=your own gh credential (class=${class}: ${reason})" >&2
@@ -312,7 +354,15 @@ cmd_gh() {
   # argv, so the NOPASSWD grant stays an exact command path (sudo-rs safe, no arg
   # wildcard) and no argument of a credential-bearing call lands in the process
   # table. The helper re-derives the class and reads the token itself.
-  printf '%s\0' "$@" | sudo -n /usr/local/bin/5dive _gh_do || rc=$?
+  # The identity travels as a leading NUL-separated sentinel rather than as a new
+  # verb, because the NOPASSWD grant names `/usr/local/bin/5dive _gh_do` exactly —
+  # a second root entry point would need a sudoers change on every box, which is a
+  # fleet privilege change and not something a CLI release can carry.
+  if [[ "$actor" == "reviewer" ]]; then
+    { printf '%s\0' --identity=reviewer; printf '%s\0' "$@"; } | sudo -n /usr/local/bin/5dive _gh_do || rc=$?
+  else
+    printf '%s\0' "$@" | sudo -n /usr/local/bin/5dive _gh_do || rc=$?
+  fi
   # Distinguish "you may not route" from "the routed call failed". sudo exits 1
   # for a missing grant, which is indistinguishable from gh's own 1 by rc alone —
   # so ask sudo directly, and only after a failure (the probe costs nothing on the
@@ -339,6 +389,17 @@ cmd_gh_whoami() {
   # so a box that has not rolled this version yet resolves UNRESOLVED with
   # everything else correct.
   printf 'bot    : %s\n' "${bot:-UNRESOLVED (the installed 5dive predates this verb, this account has no _gh_do grant, or the github-bot connector is not provisioned)}"
+  # The attester is resolved through the SAME allowlisted rail, so this line is a
+  # live check that the credential exists and authenticates as a USER — not a
+  # config read. A CODEOWNERS entry is satisfiable only by a user identity, so an
+  # App token here would resolve empty and say so rather than look fine.
+  local reviewer
+  reviewer=$({ printf '%s\0' --identity=reviewer; printf '%s\0' api user --jq .login; } \
+    | sudo -n /usr/local/bin/5dive _gh_do 2>/dev/null || true)
+  printf 'reviewer: %s\n' "${reviewer:-UNRESOLVED (the installed 5dive predates this verb, this account has no _gh_do grant, or the github-reviewer connector is not provisioned)}"
+  if [[ -n "$reviewer" && -n "$bot" && "$reviewer" == "$bot" ]]; then
+    warn "reviewer and bot resolve to the SAME login (${reviewer}) — the attester would be the PR author, and GitHub refuses a self-approval, so the CODEOWNERS gate on the installer paths is unclearable on this box."
+  fi
   if [[ -n "$caller" && -n "$bot" && "$caller" == "$bot" ]]; then
     warn "caller and bot resolve to the SAME login (${caller}) — routing would change nothing, so attribution is not fixed on this box."
   fi
@@ -356,18 +417,43 @@ cmd_gh_do() {
   while IFS= read -r -d '' a; do args+=("$a"); done
   [[ ${#args[@]} -gt 0 ]] || fail "$E_VALIDATION" "_gh_do got no arguments on stdin."
 
-  # Re-derive rather than accept: the caller told us nothing we are willing to
-  # trust about what it is asking the bot to do (the _push_do posture).
-  local class
-  class=$(_gh_route_class "${args[@]}")
-  [[ "$class" == "admin" ]] && fail "$E_CONFLICT" "_gh_do refuses an admin-class operation: 5dive-bot is admin=false on every repo, so this cannot succeed as the bot."
+  # DIVE-4334: an optional LEADING sentinel selects the attester credential. It is
+  # honoured in first position only and stripped before anything else looks at the
+  # argv, so it can never reach gh. A caller who types it by hand buys nothing the
+  # flag does not already give them: the allowlist below is re-derived here, so the
+  # widest thing this sentinel can unlock is `gh pr review` as 5dive-reviewer,
+  # which is the whole purpose of the credential.
+  local identity="bot"
+  if [[ "${args[0]}" == "--identity=reviewer" ]]; then
+    identity="reviewer"
+    args=("${args[@]:1}")
+    [[ ${#args[@]} -gt 0 ]] || fail "$E_VALIDATION" "_gh_do got an identity and no arguments."
+  fi
 
-  [[ -r "$_GH_BOT_ENV" ]] \
-    || fail "$E_GENERIC" "machine-account credential missing ($_GH_BOT_ENV) — 5dive secret write ${_GH_BOT_KEY} --connector=github-bot"
-  local tok
-  # shellcheck disable=SC1090
-  tok=$(set -a; . "$_GH_BOT_ENV"; set +a; printf '%s' "${GH_BOT_TOKEN:-}")
-  [[ -n "$tok" ]] || fail "$E_GENERIC" "$_GH_BOT_ENV exists but carries no ${_GH_BOT_KEY}."
+  local env_file key tok
+  if [[ "$identity" == "reviewer" ]]; then
+    # Re-derive rather than accept, exactly as the bot arm does below.
+    _gh_reviewer_allowed "${args[@]}" \
+      || fail "$E_CONFLICT" "_gh_do refuses '${args[0]}' as 5dive-reviewer: the attester credential serves 'pr review' (and 'api user') only."
+    env_file="$_GH_REVIEWER_ENV"; key="$_GH_REVIEWER_KEY"
+    [[ -r "$env_file" ]] \
+      || fail "$E_GENERIC" "attester credential missing ($env_file) — 5dive secret write ${key} --connector=github-reviewer"
+    # shellcheck disable=SC1090
+    tok=$(set -a; . "$env_file"; set +a; printf '%s' "${GH_REVIEWER_TOKEN:-}")
+  else
+    # Re-derive rather than accept: the caller told us nothing we are willing to
+    # trust about what it is asking the bot to do (the _push_do posture).
+    local class
+    class=$(_gh_route_class "${args[@]}")
+    [[ "$class" == "admin" ]] && fail "$E_CONFLICT" "_gh_do refuses an admin-class operation: 5dive-bot is admin=false on every repo, so this cannot succeed as the bot."
+
+    env_file="$_GH_BOT_ENV"; key="$_GH_BOT_KEY"
+    [[ -r "$env_file" ]] \
+      || fail "$E_GENERIC" "machine-account credential missing ($env_file) — 5dive secret write ${key} --connector=github-bot"
+    # shellcheck disable=SC1090
+    tok=$(set -a; . "$env_file"; set +a; printf '%s' "${GH_BOT_TOKEN:-}")
+  fi
+  [[ -n "$tok" ]] || fail "$E_GENERIC" "$env_file exists but carries no ${key}."
 
   # GITHUB_TOKEN is cleared so a stale one in root's environment cannot win over
   # the token we just resolved — gh prefers GH_TOKEN, but a reader six months out
