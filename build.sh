@@ -84,6 +84,7 @@ CORE_FILES=(
   src/lib/agent_setup.sh
   src/lib/state.sh
   src/lib/env_overrides.sh
+  src/lib/gh_config.sh
   src/lib/capability.sh
   src/lib/broker.sh
   src/lib/durable.sh

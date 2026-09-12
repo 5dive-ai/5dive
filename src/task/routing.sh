@@ -263,12 +263,12 @@ _task_delivery_paths() {
     # A bare `#N` delivery_ref is left to the merge gate's own DIVE-1955 refusal;
     # here it simply reads as unknown rather than being resolved against a guess.
     [[ -n "$_branch" && -n "$_slug" ]] || return 0
-    _n=$(GH_TOKEN="$_tok" gh pr list --repo "$_slug" --head "$_branch" --state all \
+    _n=$(GH_TOKEN="$_tok" GH_CONFIG_DIR="$(gh_config_dir)" gh pr list --repo "$_slug" --head "$_branch" --state all \
            --json number -q '.[0].number' 2>/dev/null || echo "")
     [[ -n "$_n" ]] || return 0
     _pr="https://github.com/${_slug}/pull/${_n}"
   fi
-  GH_TOKEN="$_tok" gh pr view "$_pr" --json files -q '.files[].path' 2>/dev/null || return 0
+  GH_TOKEN="$_tok" GH_CONFIG_DIR="$(gh_config_dir)" gh pr view "$_pr" --json files -q '.files[].path' 2>/dev/null || return 0
 }
 
 # Classify a path list (on stdin) as 'deep' | 'shallow' | '' (unknown/ordinary).
