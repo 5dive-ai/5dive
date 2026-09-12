@@ -208,6 +208,83 @@ else
   FAIL=$((FAIL+1)); printf 'FAIL: account_usage_recall not sourceable\n'
 fi
 
+# ---- iteration 3: A STALE OR SPENT READING IS NOT A MEASUREMENT OF NOW ------
+# quinn's iteration-2 finding. `account usage` republishes a REMEMBERED reading
+# stamped writtenAt=now, so the file's age said "fresh" about a number that was
+# eleven days old, and the exhausted branch compared pct alone — a window that
+# had already reset still printed as a wall, with its own past reset date next
+# to it. Two fences close it: the reading is aged by its OWN asOf, and a reading
+# whose window has already turned over is unmeasured. Both point at
+# `unmeasured` — the direction this file exists to defend — never at `clear`.
+
+# snap3 <asOfAgeSec> <resetsAt> <remembered:true|false> <sevenDayPct> — the
+# published shape with the two fields the file's age cannot see.
+snap3() {
+  jq -cn --argjson at "$NOW" --argjson ao "$(( NOW - $1 ))" --arg r "$2" \
+         --argjson rem "$3" --argjson s "$4" \
+    '{writtenAt:$at, accounts:[{name:"walled", agents:["dev9"],
+      usage:{fiveHour:{pct:1, resetsAt:$r}, sevenDay:{pct:$s, resetsAt:$r},
+             asOf:$ao, source:(if $rem then null else "dev9" end),
+             remembered:$rem}}]}' >"$QUOTA_SNAPSHOT_FILE"
+}
+wnote() { field 5 "$(quota_wall_account "$1")"; }
+
+# quinn's fixture 1, verbatim: resetsAt 2020-01-01 at 101%, measured seconds ago.
+snap3 5 "2020-01-01" false 101
+t "a reading whose window already RESET is unmeasured, not a wall" \
+  "unmeasured" "$(wstate walled)"
+t "and it is certainly not clear" "no" \
+  "$( [[ "$(wstate walled)" == "clear" ]] && printf yes || printf no )"
+t "and the note says WHY, naming the reset it predates" "yes" \
+  "$(wnote walled | grep -q 'predates its own reset' && printf yes || printf no)"
+t "and no past date is handed to a surface to print" "" "$(field 3 "$(quota_wall_account walled)")"
+
+# quinn's fixture 2, verbatim: remembered, measured eleven days ago, 101%.
+snap3 "$(( 11 * 86400 ))" "2026-09-19T00:00:00Z" true 101
+t "a REMEMBERED reading 11 days old is unmeasured, however fresh the file" \
+  "unmeasured" "$(wstate walled)"
+t "and not clear either" "no" \
+  "$( [[ "$(wstate walled)" == "clear" ]] && printf yes || printf no )"
+t "the note ages it by when it was MEASURED, not by when the file was written" "yes" \
+  "$(wnote walled | grep -q 'MEASURED' && printf yes || printf no)"
+t "and it says the number was recalled, so the operator knows what to refresh" "yes" \
+  "$(wnote walled | grep -q 'recalled from the account record' && printf yes || printf no)"
+
+# POSITIVE CONTROLS — the fences must not eat the alarm this row was filed for.
+snap3 5 "2026-09-19T00:00:00Z" false 101
+t "a FRESH reading with a future reset is still the wall" "exhausted" "$(wstate walled)"
+t "and still carries the reset for the surfaces to print" \
+  "2026-09-19T00:00:00Z" "$(field 3 "$(quota_wall_account walled)")"
+snap3 5 "r" false 101
+t "an UNPARSEABLE reset does not discard a fresh measured wall" \
+  "exhausted" "$(wstate walled)"
+snap3 5 "" false 101
+t "a reading with NO reset time at all is still the wall" "exhausted" "$(wstate walled)"
+
+# The reading's age uses the same fence as the file's, and it is a real edge.
+snap3 "$(( QUOTA_SNAPSHOT_MAX_AGE - 5 ))" "2026-09-19T00:00:00Z" false 101
+t "a reading just INSIDE the freshness fence is measured" "exhausted" "$(wstate walled)"
+snap3 "$(( QUOTA_SNAPSHOT_MAX_AGE + 5 ))" "2026-09-19T00:00:00Z" false 101
+t "a reading just OUTSIDE it is unmeasured" "unmeasured" "$(wstate walled)"
+t "the age reported is the READING's, not the file's" "yes" \
+  "$( [[ "$(field 4 "$(quota_wall_account walled)")" -gt "$QUOTA_SNAPSHOT_MAX_AGE" ]] \
+      && printf yes || printf no )"
+
+# An undated reading: we cannot age it, so we do not get to call it anything.
+jq -cn --argjson at "$NOW" '{writtenAt:$at, accounts:[{name:"walled",
+  usage:{sevenDay:{pct:101, resetsAt:"2026-09-19T00:00:00Z"}}}]}' >"$QUOTA_SNAPSHOT_FILE"
+t "a reading with no asOf is unmeasured, in either direction" \
+  "unmeasured" "$(wstate walled)"
+jq -cn --argjson at "$NOW" '{writtenAt:$at, accounts:[{name:"walled",
+  usage:{sevenDay:{pct:12, resetsAt:"2026-09-19T00:00:00Z"}}}]}' >"$QUOTA_SNAPSHOT_FILE"
+t "an undated reading BELOW the wall is also unmeasured, never clear" \
+  "unmeasured" "$(wstate walled)"
+
+# The reset guard is scoped to the exhausted branch: a below-the-wall reading
+# with a stale reset string is still a measurement, and still clear.
+snap3 5 "2020-01-01" false 12
+t "a past reset on a CLEAR reading changes nothing" "clear" "$(wstate walled)"
+
 # --------------------------------------------------- MUTATION CONTROL --------
 # A stub-substituting arm is vacuous. Cut the named term out of the SHIPPING
 # function's own text and prove the cut landed, then prove the suite turns red.
@@ -224,6 +301,35 @@ if declare -f _liv_verdict >/dev/null; then
   t "mutation: restored — the wall outranks the artifact again" \
     "quota-exhausted" "$(_liv_verdict 1 0 exhausted)"
 fi
+
+# Same discipline for the two iteration-3 fences: cut the named term out of the
+# SHIPPING function's own text, prove the cut landed, and show the fixture goes
+# back to the laundered `exhausted` quinn measured.
+snap3 5 "2020-01-01" false 101
+MUTR=$(declare -f quota_wall_reset_guard | sed 's/(( rts < now ))/(( rts < 0 ))/')
+t "mutation: the reset-guard cut landed in the shipping function text" "yes" \
+  "$(grep -q 'rts < 0' <<<"$MUTR" && printf yes || printf no)"
+eval "$MUTR"
+t "mutation: without the reset guard the past-reset reading is a wall again" \
+  "exhausted" "$(wstate walled)"
+# shellcheck source=/dev/null
+source src/lib/quota_wall.sh
+t "mutation: restored — the spent window is unmeasured again" \
+  "unmeasured" "$(wstate walled)"
+
+snap3 "$(( 11 * 86400 ))" "2026-09-19T00:00:00Z" true 101
+MUTA=$(declare -f quota_wall_account | sed 's/\$readage > \$maxage/$readage > 99999999999/')
+t "mutation: the asOf-fence cut landed in the shipping function text" "yes" \
+  "$(grep -q '99999999999' <<<"$MUTA" && printf yes || printf no)"
+t "mutation: and the original comparison is gone from the mutant" "no" \
+  "$(grep -q 'readage > \$maxage' <<<"$MUTA" && printf yes || printf no)"
+eval "$MUTA"
+t "mutation: without the reading fence an 11-day-old number is a wall again" \
+  "exhausted" "$(wstate walled)"
+# shellcheck source=/dev/null
+source src/lib/quota_wall.sh
+t "mutation: restored — the recalled number is unmeasured again" \
+  "unmeasured" "$(wstate walled)"
 
 # ------------- surface 1, PRODUCTION path: the embedded python shaper --------
 # `agent list` does NOT run the bash reference path in production — it runs the
@@ -243,15 +349,22 @@ printf '{"agents":{"dev9":{"type":"claude","authProfile":"walled","workdir":"/tm
 
 # shaper_state <sevenDayPct|absent> -> "<operationalState>|<quota.state>"
 shaper_state() {
-  local pct="$1"
+  local pct="$1" aoage="${2:-0}" reset="${3:-r}" rem="${4:-false}"
   if [[ "$pct" == "absent" ]]; then
     rm -f "$QUOTA_SNAPSHOT_FILE"
   else
-    jq -cn --argjson at "$NOW" --argjson s "$pct" \
+    jq -cn --argjson at "$NOW" --argjson ao "$(( NOW - aoage ))" --argjson s "$pct" \
+           --arg r "$reset" --argjson rem "$rem" \
       '{writtenAt:$at, accounts:[{name:"walled", agents:["dev9"],
-        usage:{fiveHour:{pct:1,resetsAt:"r"}, sevenDay:{pct:$s,resetsAt:"r"},
-               asOf:$at, source:"dev9", remembered:false}}]}' >"$QUOTA_SNAPSHOT_FILE"
+        usage:{fiveHour:{pct:1,resetsAt:$r}, sevenDay:{pct:$s,resetsAt:$r},
+               asOf:$ao, source:"dev9", remembered:$rem}}]}' >"$QUOTA_SNAPSHOT_FILE"
   fi
+  shaper_run
+}
+
+# shaper_run — execute the extracted shipping shaper against whatever snapshot
+# is on disk, and print "<operationalState>|<quota.state>".
+shaper_run() {
   QUOTA_SNAPSHOT_FILE="$QUOTA_SNAPSHOT_FILE" SHAPER="$PYSRC" \
   REGP="$TMP/reg/agents.json" PROFD="$AUTH_PROFILES_DIR" python3 - <<'PYEOF'
 import json, os, subprocess, sys, io
@@ -300,6 +413,53 @@ t "shaper: with no snapshot the quota is UNMEASURED and the verdict is untouched
 t "shaper: the ONLY difference between the walled run and its controls is the snapshot" \
   "yes" "$( [[ "$SH_WALL" == "quota-exhausted|exhausted" && "$SH_CLEAR" != quota-exhausted* \
               && "$SH_NONE" != quota-exhausted* ]] && printf yes || printf no )"
+
+# The two iteration-3 fences on the PRODUCTION path too — the shaper carries its
+# own copy of the join (it cannot source bash), so a fix landed only in
+# src/lib/quota_wall.sh would leave `agent list` laundering on every box.
+SH_PAST=$(shaper_state 101 5 "2020-01-01" false)
+t "shaper (PRODUCTION path): a reading past its own reset is unmeasured" \
+  "unknown|unmeasured" "$SH_PAST"
+SH_OLD=$(shaper_state 101 "$(( 11 * 86400 ))" "2026-09-19T00:00:00Z" true)
+t "shaper (PRODUCTION path): an 11-day-old remembered reading is unmeasured" \
+  "unknown|unmeasured" "$SH_OLD"
+SH_FRESH=$(shaper_state 101 5 "2026-09-19T00:00:00Z" false)
+t "shaper: and a fresh reading with a future reset is STILL the wall" \
+  "quota-exhausted|exhausted" "$SH_FRESH"
+t "shaper: neither fenced run says ready and neither says clear" "yes" \
+  "$( [[ "$SH_PAST" != *"quota-exhausted"* && "$SH_PAST" != *"|clear"* \
+        && "$SH_OLD" != *"quota-exhausted"* && "$SH_OLD" != *"|clear"* ]] \
+      && printf yes || printf no )"
+SH_NOWIN=$(jq -cn --argjson at "$NOW" '{writtenAt:$at, accounts:[{name:"walled",
+  usage:{fiveHour:null, sevenDay:null, asOf:$at, remembered:false}}]}' \
+  >"$QUOTA_SNAPSHOT_FILE"; shaper_run)
+t "shaper: an account reporting NEITHER window is unmeasured, not clear" \
+  "unknown|unmeasured" "$SH_NOWIN"
+
+# MUTATION CONTROL, production path: cut each fence out of the SHIPPING shaper's
+# own text and prove the fixture launders again — the arms above are only worth
+# their runtime if their absence is red.
+PYORIG="$PYSRC"; PYMUT="$TMP/shaper-mut.py"
+sed 's/reset_ts is not None and reset_ts < now/reset_ts is not None and reset_ts < 0/' \
+  "$PYORIG" >"$PYMUT"
+t "shaper mutation: the reset-guard cut landed in the shipping text" "yes" \
+  "$(grep -q 'reset_ts < 0' "$PYMUT" && printf yes || printf no)"
+t "shaper mutation: and the original comparison is gone from the mutant" "no" \
+  "$(grep -q 'reset_ts < now' "$PYMUT" && printf yes || printf no)"
+PYSRC="$PYMUT"; SH_MUT1=$(shaper_state 101 5 "2020-01-01" false); PYSRC="$PYORIG"
+t "shaper mutation: without the guard the past-reset reading is a wall again" \
+  "quota-exhausted|exhausted" "$SH_MUT1"
+
+sed 's/if read_age > QUOTA_MAX_AGE:/if read_age > 99999999999:/' "$PYORIG" >"$PYMUT"
+t "shaper mutation: the reading-age cut landed in the shipping text" "yes" \
+  "$(grep -q 'read_age > 99999999999' "$PYMUT" && printf yes || printf no)"
+PYSRC="$PYMUT"
+SH_MUT2=$(shaper_state 101 "$(( 11 * 86400 ))" "2026-09-19T00:00:00Z" true)
+PYSRC="$PYORIG"
+t "shaper mutation: without it an 11-day-old number is a wall again" \
+  "quota-exhausted|exhausted" "$SH_MUT2"
+t "shaper: restored — the past-reset fixture is unmeasured again" \
+  "unknown|unmeasured" "$(shaper_state 101 5 "2020-01-01" false)"
 
 printf '\nquota_wall_health_surfaces_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

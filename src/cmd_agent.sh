@@ -521,11 +521,45 @@ except ValueError:
     QUOTA_MAX_AGE = 600
 
 
+def quota_parse_ts(v):
+    """Epoch seconds from the vendor's reset timestamp, or None.
+
+    Shapes seen: "2026-09-19T00:00:00Z", "2026-09-15T00:00Z", a bare date, and
+    an epoch number. A naive timestamp is read as LOCAL time, which is what
+    `date -d` does in the bash twin (src/lib/quota_wall.sh) — the two must not
+    disagree about the same string.
+    """
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if not isinstance(v, str) or not v.strip():
+        return None
+    t = v.strip()
+    if t.endswith("Z") or t.endswith("z"):
+        t = t[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    try:
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def quota_by_account():
-    """{account: {"state","window","pct","resetsAt"}} from the published snapshot.
+    """{account: {"state","window","pct","resetsAt","note"}} from the snapshot.
 
     Absent / stale / unparseable all yield {} — which reads as `unmeasured` per
     account below, never as `clear`. A missing file must not certify the fleet.
+
+    Two ages are checked, not one (DIVE-4342 iteration 3): the FILE's, and the
+    READING's own `asOf`. `account usage` republishes a remembered reading with
+    `writtenAt = now`, so ageing the file alone would launder a days-old number
+    into a current measurement. A reading whose window has already reset is
+    unmeasured for the same reason — the percentage belongs to a window that has
+    since turned over. Both point at `unmeasured`; neither may print `clear`.
     """
     try:
         with open(QUOTA_SNAPSHOT, "r") as fh:
@@ -534,29 +568,64 @@ def quota_by_account():
         return {}, "no account-usage snapshot at %s" % QUOTA_SNAPSHOT
     if not isinstance(snap, dict):
         return {}, "account-usage snapshot is not an object"
-    age = int(dt.datetime.now().timestamp()) - int(snap.get("writtenAt") or 0)
+    now = int(dt.datetime.now().timestamp())
+    age = now - int(snap.get("writtenAt") or 0)
     if age > QUOTA_MAX_AGE:
         return {}, "account-usage snapshot is %ds old (>%ds)" % (age, QUOTA_MAX_AGE)
     out = {}
     for row in snap.get("accounts") or []:
         if not isinstance(row, dict):
             continue
+        name = row.get("name")
         usage = row.get("usage")
         if not isinstance(usage, dict):
             continue
+        as_of = usage.get("asOf")
+        if isinstance(as_of, bool) or not isinstance(as_of, (int, float)):
+            out[name] = {"state": "unmeasured", "window": None, "pct": None,
+                         "resetsAt": None,
+                         "note": "reading carries no measurement time"}
+            continue
+        read_age = int(now - as_of)
+        if read_age > QUOTA_MAX_AGE:
+            out[name] = {"state": "unmeasured", "window": None, "pct": None,
+                         "resetsAt": None,
+                         "note": "reading was MEASURED %ds ago (>%ds)%s" % (
+                             read_age, QUOTA_MAX_AGE,
+                             ", recalled from the account record"
+                             if usage.get("remembered") else "")}
+            continue
         hit = None
+        seen = False
         # The longer window wins: it is the one the operator cannot wait out.
         for key, label in (("sevenDay", "7d"), ("fiveHour", "5h")):
             win = usage.get(key)
             if not isinstance(win, dict):
                 continue
             pct = win.get("pct")
-            if isinstance(pct, (int, float)) and pct >= QUOTA_WALL:
+            if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+                continue
+            seen = True
+            if pct >= QUOTA_WALL:
                 hit = {"state": "exhausted", "window": label, "pct": int(pct),
-                       "resetsAt": win.get("resetsAt")}
+                       "resetsAt": win.get("resetsAt"), "note": None}
                 break
-        out[row.get("name")] = hit or {"state": "clear", "window": None,
-                                       "pct": None, "resetsAt": None}
+        if hit is not None:
+            reset_ts = quota_parse_ts(hit["resetsAt"])
+            if reset_ts is not None and reset_ts < now:
+                hit = {"state": "unmeasured", "window": None, "pct": None,
+                       "resetsAt": None,
+                       "note": "reading predates its own reset (that window "
+                               "reset at %s)" % hit["resetsAt"]}
+            out[name] = hit
+        elif not seen:
+            # No window reported a number at all. We did not measure anything;
+            # saying `clear` here is the fail-open this whole row is against.
+            out[name] = {"state": "unmeasured", "window": None, "pct": None,
+                         "resetsAt": None, "note": "reported neither window"}
+        else:
+            out[name] = {"state": "clear", "window": None,
+                         "pct": None, "resetsAt": None, "note": None}
     return out, None
 
 
@@ -572,7 +641,7 @@ def quota_for_profile(profile):
         return {"state": "unmeasured", "window": None, "pct": None, "resetsAt": None,
                 "note": QUOTA_NOTE or "no usage row for account %s" % profile}
     out = dict(hit)
-    out["note"] = None
+    out.setdefault("note", None)
     return out
 
 def read_bytes(path):
