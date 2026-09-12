@@ -186,7 +186,10 @@ fi
 source src/cmd_account.sh 2>/dev/null || true
 if declare -f account_usage_recall >/dev/null; then
   mkdir -p "$AUTH_PROFILES_DIR/cm"
-  LIVE=$(jq -cn '{fiveHour:{pct:0,resetsAt:"r"}, sevenDay:{pct:101,resetsAt:"r"},
+  # Same trap as the arm below: a bare `r` is a PARSEABLE military time zone,
+  # not a nonsense string. Nothing here reads resetsAt, but the literal does not
+  # stay in the file (DIVE-4372).
+  LIVE=$(jq -cn '{fiveHour:{pct:0,resetsAt:"not-a-reset-time"}, sevenDay:{pct:101,resetsAt:"not-a-reset-time"},
                   asOf:1, source:"alex-dev", remembered:false}')
   account_usage_remember cm "$LIVE"
   t "1b: the account remembers its last reading" \
@@ -255,7 +258,18 @@ snap3 5 "2026-09-19T00:00:00Z" false 101
 t "a FRESH reading with a future reset is still the wall" "exhausted" "$(wstate walled)"
 t "and still carries the reset for the surfaces to print" \
   "2026-09-19T00:00:00Z" "$(field 3 "$(quota_wall_account walled)")"
-snap3 5 "r" false 101
+# An "obviously invalid" literal is not a fact about date(1) — it is a guess.
+# This arm was written with `r`, and GNU date reads a bare `r` as the RFC-822
+# military time zone R (UTC+5): `date -d r` is midnight UTC+5 = 05:00Z TODAY,
+# a REAL timestamp that is in the future before 05:00Z and in the past after,
+# so this control passed all night and reddened every day from 05:00Z, on main,
+# with no diff involved (DIVE-4372). So the fixture now PROVES its own premise
+# first: if a future coreutils learns to parse the literal, the arm below fails
+# loudly on the premise instead of silently becoming a clock-dependent flake.
+UNPARSEABLE_RESET="not-a-reset-time"
+t "the unparseable-reset fixture is genuinely unparseable by date(1)" "yes" \
+  "$(date -d "$UNPARSEABLE_RESET" +%s >/dev/null 2>&1 && printf no || printf yes)"
+snap3 5 "$UNPARSEABLE_RESET" false 101
 t "an UNPARSEABLE reset does not discard a fresh measured wall" \
   "exhausted" "$(wstate walled)"
 snap3 5 "" false 101
