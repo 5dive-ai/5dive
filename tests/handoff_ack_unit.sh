@@ -44,7 +44,7 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 jf()    { jq -r "$1" 2>/dev/null; }
 
 tasks_db_init
-out=$(as_agent maker cmd_task_add --assignee=maker --verifier=reviewer \
+out=$(as_agent maker cmd_task_add --assignee=maker --verifier=reviewer --verify \
       --body="implement it" -- "handoff ACK fixture" 2>"$TMP/err")
 tid=$(printf '%s' "$out" | jf '.data.id')
 

@@ -84,7 +84,7 @@ _hb_agent_idle()      { return 0; }  # confident idle by default
 # is simulated the same way the real tick would do it on olivia's next nudge.
 mk_delivered_unacked() {
   local id
-  id=$(addt --assignee=dev --verifier=olivia -- "ship the widget")
+  id=$(addt --assignee=dev --verifier=olivia --verify -- "ship the widget")
   ( cmd_task_done "$id" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
   _hb_claim_task olivia "$id" >/dev/null 2>&1
   printf '%s' "$id"

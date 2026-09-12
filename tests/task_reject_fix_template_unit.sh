@@ -70,7 +70,7 @@ MAKER_TEXT="MAKER RESULT: implemented the thing, graded-sha abc1234, 9/9 unit"
 FIXFB='FINDING: the guard fires only on done rows. FIX: key it on carries-a-result. VERIFY: I will re-run the todo-path arm.'
 
 seed() {
-  local out id; out=$(JSON_MODE=1 cmd_task_add "$1" --assignee=dev --verifier=main \
+  local out id; out=$(JSON_MODE=1 cmd_task_add "$1" --assignee=dev --verifier=main --verify \
                         --accept="must do the thing" 2>"$TMP"/err)
   id=$(printf '%s' "$out" | jq -r '.data.ident // empty' 2>/dev/null)
   as dev cmd_task_done "$id" --result="$MAKER_TEXT" >/dev/null
