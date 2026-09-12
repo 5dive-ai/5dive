@@ -389,6 +389,13 @@ rec() {  # <pane-line> <now>
     # _sup_quota_pane runs and that argument is graded.
     _sup_quota_pane_capture() { printf '%s\n' "$fixture_pane"; }
     _sup_verify_challenge() { :; }
+    # DIVE-4342 it.2: the picker probe is stubbed CLEAN (rc 0) rather than left
+    # to run for real. These arms model a seat whose pane holds the quota line
+    # and nothing else; unstubbed, the real probe runs under this harness's
+    # non-root uid, returns "could not look", and the record correctly comes
+    # back `unprobed` — which is a true statement about the harness and a false
+    # one about the fixture these arms are grading.
+    _sup_prompt_pane() { :; }
     _sup_activity_epoch() { :; }
     _sup_goal_drift() { :; }
     _sup_output_stats() { echo "0|-1"; }
