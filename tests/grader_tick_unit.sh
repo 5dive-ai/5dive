@@ -211,6 +211,92 @@ grep -q '^g1:' "$SPAWNF" && ok_ 'falls through an unreadable seat to a readable 
   || bad_ 'falls through unreadable seat' "$(spawns)"
 _GRADER_READ_PROBE=probe_ok
 
+# ══ THE REFUSAL PATH, UNDER THE REGIME THE SHIPPED CLI ACTUALLY RUNS ═════════
+#                                                                  (DIVE-4380)
+# THE FOUR FLOOR ARMS ABOVE CANNOT SEE THIS CLASS OF DEFECT, and that is why
+# this section is a REGIME and not a fifth fixture. They already make the meter
+# refuse, and they were green against a lane that in production died inside pool
+# iteration 1: this harness runs `set -uo pipefail` (line 17) while the bundle
+# runs `set -euo pipefail` (src/header.sh:14).
+#
+# `_grader_window_ok` is dual-channel by design — verdict on stdout, DECISION in
+# the exit status — so a refusing seat returns non-zero as its ANSWER. Written
+# `verdict=$(…); rc=$?` that is harmless without errexit and fatal with it: the
+# shell aborts on the ASSIGNMENT, so `rc` is never read, the second pool seat is
+# never tried, and `queue (no seat with headroom — …)` is unreachable. Measured
+# on 0.35.1, 2026-09-12: `_GRADER_POOL="quinn main2" 5dive task grader-tick`
+# exited non-zero printing no plan at all, and the caller saw only the CLI's
+# generic `exited 1 without reporting a reason`.
+# community/wiki/a-refusal-verdict-captured-into-a-variable-dies-under-set-e.md
+#
+# THE SENTINEL IS READ OFF STDOUT, AND THE RUN IS NEVER PUT IN A `||` OR `if`
+# CONTEXT. bash's errexit exemption propagates INTO a subshell on the left of
+# `||`, so `( set -e; … ) || echo DIED` can never print DIED — attaching the
+# catch removes the death it was written to catch. `run_e` therefore prints
+# `RC=0` as its LAST statement inside the errexit subshell: the line is present
+# only if the lane both returned 0 and was not killed on the way, and its
+# ABSENCE is the death.
+run_e(){  # run(), but under the bundle's own `set -euo pipefail`
+  : > "$SPAWNF"; : > "$EMITF"
+  (
+    set -euo pipefail
+    cmd_task_grader_tick "$@" 2>/dev/null
+    printf 'RC=0\n'
+  )
+}
+# A: a refusing FIRST seat must not kill the tick — seat 2 is reached and chosen.
+_GRADER_POOL="g9 g1"; _GRADER_READ_PROBE=probe_ok
+oute=$(run_e --cap=5 --commit)
+grep -q '^RC=0$' <<<"$oute" \
+  && ok_ 'ERREXIT: a seat over the floor is a branch, not a death (lane survives)' \
+  || bad_ 'ERREXIT refusing seat does not abort' "lane died before its sentinel; got: $oute"
+grep -q '^g1:' "$SPAWNF" \
+  && ok_ 'ERREXIT: the SECOND pool seat is still reached past a refusing first' \
+  || bad_ 'ERREXIT reaches seat 2' "spawned: $(spawns)"
+[[ "$(grep -c . "$SPAWNF")" == 3 ]] \
+  && ok_ 'ERREXIT: all 3 pending rows are still planned past the refusal' \
+  || bad_ 'ERREXIT spawns 3 past a refusal' "spawned: $(spawns)"
+# B: a pool where EVERY seat refuses must PRINT the queue line, not vanish.
+#    This is the lane's whole throttle-and-park behaviour; unreachable, it has
+#    no observable form at all.
+_GRADER_POOL="g9"
+oute=$(run_e --cap=5 --commit)
+grep -q '^RC=0$' <<<"$oute" \
+  && ok_ 'ERREXIT: an all-refusing pool exits 0, not a silent non-zero' \
+  || bad_ 'ERREXIT all-refusing pool exits 0' "lane died; got: $oute"
+grep -q 'queue   DIVE-1  (no seat with headroom — ' <<<"$oute" \
+  && ok_ 'ERREXIT: prints queue (no seat with headroom — …) — the park behaviour' \
+  || bad_ 'ERREXIT prints the queue line' "$oute"
+grep -q 'g9: queue: spent is at 99%' <<<"$oute" \
+  && ok_ 'ERREXIT: the queue line carries the refusing seat own verdict' \
+  || bad_ 'queue line names the verdict' "$oute"
+[[ ! -s "$SPAWNF" ]] && ok_ 'ERREXIT: an all-refusing pool still spawns nothing' \
+  || bad_ 'all-refusing pool spawns nothing' "spawned: $(spawns)"
+# C: THE OTHER non-zero channel. `_grader_window_ok` returns 1 for "no
+#    measurement" and 2 for "over floor"; a seat the usage document does not
+#    know at all resolves to an empty account and takes the rc=1 door, which is
+#    the exact status the live tick surfaced. Both doors must branch.
+_GRADER_POOL="gNOTINMETER g1"
+oute=$(run_e --cap=5 --commit)
+grep -q '^RC=0$' <<<"$oute" \
+  && ok_ 'ERREXIT: an UNMEASURED seat (rc=1) is a branch too, not a death' \
+  || bad_ 'ERREXIT unmeasured seat does not abort' "lane died; got: $oute"
+grep -q '^g1:' "$SPAWNF" \
+  && ok_ 'ERREXIT: falls through an unmeasured seat to a measured one' \
+  || bad_ 'falls through unmeasured seat' "spawned: $(spawns)"
+# D: THE ADMIT PATH UNDER THE SAME REGIME, which is what grades the `rc=0`
+#    initialiser. `|| rc=$?` leaves `rc` untouched when the guard admits, so
+#    without the initialiser `(( rc == 0 ))` reads an unset variable and
+#    `set -u` kills the tick on the HEALTHY path — the fix's own failure mode,
+#    and the one a refusal fixture can never reach.
+_GRADER_POOL="g1"
+oute=$(run_e --cap=5 --commit)
+grep -q '^RC=0$' <<<"$oute" \
+  && ok_ 'ERREXIT: the ADMIT path survives set -u (rc is initialised)' \
+  || bad_ 'ERREXIT admit path survives nounset' "lane died; got: $oute"
+[[ "$(grep -c . "$SPAWNF")" == 3 ]] \
+  && ok_ 'ERREXIT: the admit path still spawns all 3' || bad_ 'errexit admit spawns 3' "$(spawns)"
+
 # ── structural: exactly one function may touch the fleet ─────────────────────
 tickbody=$(awk '/^cmd_task_grader_tick\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' src/task/grader_pool.sh)
 hits=$(grep -vE '^[[:space:]]*#' <<<"$tickbody" | grep -nE '5dive agent send|systemctl|agent create' || true)

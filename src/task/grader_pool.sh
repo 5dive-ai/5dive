@@ -585,8 +585,23 @@ cmd_task_grader_tick() {
     local seat="" chosen="" why=""
     for seat in $_GRADER_POOL; do
       local acct; acct=$(printf '%s' "$usage" | _grader_account_of "$seat")
-      local verdict rc
-      verdict=$(printf '%s' "$usage" | _grader_window_ok "$acct"); rc=$?
+      # `|| rc=$?`, NOT `; rc=$?`, and the difference is the whole refusal half
+      # of this lane. `_grader_window_ok` is dual-channel BY DESIGN — verdict on
+      # stdout, DECISION in the exit status (0 admit, 1 no measurement, 2 over
+      # floor) — so a refusing seat returns non-zero as its ANSWER, not as an
+      # error. `verdict=$(...)` is a simple command and `rc=$?` is a separate
+      # one: under the bundle's `set -euo pipefail` (src/header.sh) the shell
+      # aborts ON THE ASSIGNMENT, `rc` is never assigned, the second pool seat is
+      # never tried and `queue (no seat with headroom — …)` can never print. The
+      # caller saw only `5dive task exited 1 without reporting a reason`.
+      # Measured on 0.35.1, 2026-09-12 (DIVE-4380); `||` is what suppresses
+      # errexit here, and `rc=0` must be set first because `||` leaves it
+      # untouched on the admit path. A `local verdict=$(...)` would mask it the
+      # other way round (the `local` builtin's own status wins) — the
+      # neighbouring trap, not the fix.
+      # community/wiki/a-refusal-verdict-captured-into-a-variable-dies-under-set-e.md
+      local verdict rc=0
+      verdict=$(printf '%s' "$usage" | _grader_window_ok "$acct") || rc=$?
       if (( rc == 0 )); then
         # Guardrail 2: never a grader without read access to the repo it grades.
         # Checked AFTER the floor because it is the more expensive probe.
