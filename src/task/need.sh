@@ -1666,6 +1666,93 @@ _gate_is_human_tap() {
   return 1
 }
 
+# ============================================================================
+# DIVE-4346 — TWO ASKS A PERSON CANNOT ANSWER, REFUSED AT FILING.
+#
+# lodar, Telegram 2026-09-12 01:06Z: "human gate is still the most annoying part
+# of 5dive." The DIVE-4176 refusal above grades whether the ask is READABLE. These
+# two grade whether it is ANSWERABLE — a different question, and the one that
+# produced the taps he was complaining about. A readable ask that no human can act
+# on is worse than an unreadable one: it looks like a decision, so he reads it.
+#
+# ARM 1 — "GO LOOK AT THE PREVIEW" IS UNSATISFIABLE ON AN AUTH-GATED ROUTE.
+# Behind the Vercel SSO wall there is a second wall: a PRODUCTION Clerk instance
+# refuses preview domains outright, and `x-vercel-protection-bypass` has no
+# authority over Clerk. So the link cannot be opened by the holder either — this
+# is not "the agent cannot, so ask the person", it is unreachable by construction.
+# Measured on DIVE-4263 (2026-09-11): the false premise cost about a day and six
+# gates, three of which reached lodar, before the change was verified on a box
+# instead. Replayed over gate_history, 30 days to 2026-09-12, FIVE tier-2 asks
+# match — DIVE-3594, DIVE-3613, DIVE-3618, DIVE-3644, DIVE-4263 — and every one
+# of them points at a dashboard or agent-detail route, i.e. auth-gated.
+#
+# THE VERB LIST IS WHAT KEEPS THIS NARROW, and it was tuned against that same
+# corpus with every match printed. `open / view / visit / screenshot / eyeball /
+# look` aimed at a preview is the shape. `see`, `seen`, `tap` and `check` are
+# DELIBERATELY ABSENT: with them the arm eats DIVE-3860 ("Publish the finished
+# dashboard change for review now, so it can be seen on a live preview page?"),
+# which is a push approval and a legitimate gate. Likewise "run a test on a
+# preview build" (DIVE-4239) carries no look-verb and survives, which is correct:
+# a person logging in through a real box is a real human_tap, and DIVE-4329 is
+# the measurement that says re-routing it is the defect.
+#
+# WHAT THE FILER SHOULD DO INSTEAD is in the message: verify on a box, or ask for
+# a reusable test login (a `secret` gate, which IS a human capability). Neither
+# is a re-route, because the DIVE-4329 lesson holds here too — a check about the
+# ANSWERABILITY of an ask must not be satisfiable by sending it to someone else.
+_GATE_ASK_PREVIEW_RX='preview|vercel\.app'
+# The look-verb must be an INSTRUCTION TO THE READER, not a mention of looking.
+# That distinction is the whole false-positive budget, and it was measured: the
+# 30-day corpus holds two push-approval asks whose PRIMARY request is answerable
+# and which merely note, in a subordinate clause, that a preview will have to be
+# looked at later ("...this seat cannot render screenshots, so the Vercel preview
+# must be looked at before merge" — DIVE-3984; "it only opens the change for
+# review" — DIVE-3978). Both are legitimate gates, both carry a preview token and
+# a look-verb, and a bare co-occurrence test refuses both. So the verb is
+# required to sit at an INSTRUCTION BOUNDARY: the start of the ask, after a
+# sentence end, after a comma in an instruction list ("fresh box, open https://"
+# — DIVE-4239), or behind can/could/would/will/please/you. The one non-imperative
+# form kept is the "does X look right" question (DIVE-3594), which is an
+# instruction to go and look wearing a question mark.
+_GATE_ASK_LOOK_RX='(^|[.!?]([[:space:]]|$)|,[[:space:]]+|\b(can|could|would|will|please|you)[[:space:]]+(you[[:space:]]+)?)(open|view|visit|screenshot|eyeball|look)\b'
+_GATE_ASK_LOOK_Q_RX='\b(does|do|is|are)\b[^.?!]{0,60}\blooks?\b'
+_gate_ask_unsatisfiable_preview() {   # <ask> -> 0 when it asks the reader to LOOK at a preview
+  local s="${1:-}"
+  LC_ALL=C grep -Eiq "$_GATE_ASK_PREVIEW_RX" <<<"$s" || return 1
+  LC_ALL=C grep -Eiq "$_GATE_ASK_LOOK_RX" <<<"$s" && return 0
+  LC_ALL=C grep -Eiq "$_GATE_ASK_LOOK_Q_RX" <<<"$s" && return 0
+  return 1
+}
+
+# ARM 2 — A CODE-HOSTING RULE IS NOT A DECISION.
+# lodar on DIVE-4196, asked to approve something a repository setting demanded:
+# "why asking me then?" A CODEOWNERS entry, a branch-protection rule or a
+# required-reviewer setting is repo CONFIG. The person tapping cannot change the
+# outcome by tapping — the rule fires again on the next PR — so the tap buys one
+# merge and zero decisions. The real row is "move or drop the rule" (DIVE-4334),
+# which is a genuine decision and is NOT caught here: its ask names the effect
+# ("Changes to the script that installs our product wait for your approval. Move
+# that approval off you, or drop it entirely?") and none of the tokens below.
+# That separation is the whole point — this arm fires on an ask that cites the
+# RULE AS THE REASON, not on an ask about the rule.
+#
+# THE APPROVAL-SHAPE CLAUSE IS LOAD-BEARING, and it is the difference between
+# this arm and a rule that eats its own remedy. An ask that wants the RULE
+# CHANGED — "will a repository admin make that branch-protection change?"
+# (DIVE-4086) — is a browser-only action a person really does hold, and refusing
+# it would leave the rule in place forever. What is refused is an ask that wants
+# a PER-CHANGE TAP whose reason is the rule: "Approve PR #779 as code owner of
+# install.sh?" (DIVE-4020) — the single true positive in the 30-day corpus, and
+# the exact shape lodar answered with "why asking me then?" (DIVE-4196).
+_GATE_ASK_CODEHOST_RX='codeowner|code[- ]owner|branch protection|protected branch|required review|required approval|required reviewer|requires? (a )?(review|approval)'
+_GATE_ASK_CODEHOST_APPROVE_RX='\b(approve|approves|approval|approving|sign[- ]off|signoff|rubber)\b'
+_gate_ask_codehost_rule() {   # <ask> -> 0 when a per-change tap is asked for BECAUSE of a repo rule
+  local s="${1:-}"
+  LC_ALL=C grep -Eiq "$_GATE_ASK_CODEHOST_RX" <<<"$s" || return 1
+  LC_ALL=C grep -Eiq "$_GATE_ASK_CODEHOST_APPROVE_RX" <<<"$s" || return 1
+  return 0
+}
+
 # Word count on whitespace. Deliberately the same unit the human experiences —
 # words on a phone screen — not characters or bytes.
 _gate_ask_word_count() {
@@ -3204,6 +3291,101 @@ THE ONE EXIT THIS REFUSAL DOES NOT OFFER IS A DIFFERENT DESTINATION. --tier=1 wo
     elif [[ -n "$ask_ok" ]]; then
       warn "--ask-ok changed nothing on this gate — the readability check passed on its own (${_ar_words} words, no internal names)."
     fi
+    # DIVE-4346 — THE ANSWERABILITY REFUSALS. Placed inside `_ar_human` for the
+    # same reason the readability refusal is: only a gate that actually reaches
+    # the paired human is graded on whether a person can act on it. A tier-1 ask
+    # telling an AGENT to open a preview is a different (and fine) instruction.
+    # Each carries its own `--ask-ok` escape, because a gate must never become
+    # unfileable (DIVE-2216) and an exception that leaves a row is countable.
+    local _un_why=""
+    if _gate_ask_unsatisfiable_preview "$ask"; then
+      _un_why="it asks the reader to open or look at a preview deployment"
+    elif _gate_ask_codehost_rule "$ask"; then
+      _un_why="its stated reason is a code-hosting rule (a repository setting), not an outcome the reader chooses"
+    fi
+    if [[ -n "$_un_why" ]]; then
+      if [[ -z "$ask_ok" ]]; then
+        _task_store_audit_log "task need ask-answerable" "refused" 0 -- \
+          "task=$ident" "filer=${actor:-}" "type=$type" "why=${_un_why}" || true
+        fail "$E_VALIDATION" "$ident: refusing this gate because ${_un_why} — so tapping it does not produce an answer.
+A preview deployment is unreachable by the holder too, not just by an agent: behind the sign-in wall on the hosting side there is a SECOND wall — our live login provider refuses preview addresses outright, and the hosting bypass key has no authority over it. Measured 2026-09-11: that false premise cost about a day and six gates, three of which reached the paired human, before the change was verified on a real box instead. A repository rule is the mirror image — the person tapping cannot change the outcome, because the rule fires again on the very next change, so the tap buys one merge and zero decisions.
+  verify on a real box       the route is auth-gated; a running box is the only place it renders. This is the exit that is wanted.
+  ask for a test login       if nobody here can sign in, that is a credential a person must issue — file it as --type=secret, which IS a human capability.
+  move or drop the rule      a repository setting is its own decision row (\"take this approval off you, or drop it?\"), not a per-change tap.
+  --ask-ok=\"<why a person can still act on this>\"    the audited exception. Recorded on the gate and countable afterwards.
+As with the readability refusal, NO EXIT HERE CHANGES THE DESTINATION: nothing about an ask being unanswerable says a different reader could answer it."
+      fi
+      [[ ${#ask_ok} -ge 12 ]] \
+        || fail "$E_VALIDATION" "--ask-ok must state WHY a person can still act on this ask (it is recorded on the gate and read by whoever counts these exceptions later)"
+      _task_store_audit_log "task need ask-answerable" "escaped" 0 -- \
+        "task=$ident" "filer=${actor:-}" "type=$type" "why=${_un_why}" "declared=$ask_ok" || true
+      warn "answerability escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". This ask ${_un_why}, and the human is still being sent it."
+    fi
+
+    # DIVE-4346 — A TAP ON THE CUSTOMER MUST NAME THE CAPABILITY IT CONSUMES.
+    #
+    # THE PRODUCT DEFAULT this row exists to set: a person is tapped only for
+    # money, a secret, an irreversible step, or something only a person at a
+    # browser can do. Those four are exactly `_GATE_HUMAN_CAPABILITIES` plus the
+    # `secret` type, and `--needs=` is the sentence that names one.
+    #
+    # MEASURED ON THIS BOARD, the 7 days to 2026-09-12: 35 gates reached the
+    # paired human. 16 of them (46%) named NO capability at all. That is the
+    # before-number, and it is the population this refusal addresses — not the
+    # 17 that did declare one, which are the honest taps and are untouched.
+    #
+    # WHY A REFUSAL AND NOT A ROUTE, and this is the one thing that must not be
+    # got wrong here. The row as filed asked for a needs-less manual/approval
+    # gate to be ROUTED to a lead or verifier seat instead. That is precisely the
+    # behaviour DIVE-4329 removed ONE DAY EARLIER, on a measurement: on 2026-09-11
+    # a manual gate asking a person to try a login took a re-route exit, queued on
+    # a lead seat that cannot open a browser, and NOBODY WAS EVER PINGED. A gate
+    # that reaches nobody is a stall with a receipt, and it is worse than the tap
+    # it replaced because it is silent. So the default is enforced where it can
+    # only ever cost a re-file: the filer must SAY what the ask consumes. Declaring
+    # it is free and correct; not being able to name it is the diagnostic that the
+    # gate did not belong on a person.
+    #
+    # SCOPE, and every exemption here is a type that ALREADY NAMES ITS CAPABILITY.
+    #   * `secret` names `secret_provision` in its own name; its tier-2 floor is
+    #     permanent and must stay so.
+    #   * `access` is lead-clearable BY TYPE (DIVE-1243), so it is not a customer
+    #     tap in the first place.
+    #   * a tier-2 `manual` gate is the type whose definition IS "a step only a
+    #     person can perform" — `_gate_is_human_tap` has said exactly that since
+    #     DIVE-4329 and the URL exception above already depends on it. Requiring
+    #     the flag on top would be asking the filer to repeat the type, and it
+    #     would refuse the product's OWN iteration-cap escalation gate
+    #     (src/task/delivery.sh), which is a correct manual gate — caught by
+    #     tests/gate_ask_readability_unit.sh arm F while this was being built.
+    #   * a category-floored gate (tier_floored on the ask/title axis): the floor
+    #     already said which reserved class it belongs to, and refusing it here
+    #     would make a floored gate unfileable rather than declared.
+    # What is LEFT is exactly the population the audit measured: `decision` and
+    # `approval` gates that reach a person and say nothing about what they need
+    # from one.
+    if [[ -z "${needs//[[:space:]]/}" && "$type" != "secret" && "$type" != "access" \
+          && "$tier_floored" != "1" ]] && ! _gate_is_human_tap "$type" "$tier" "$needs"; then
+      if [[ -z "$ask_ok" ]]; then
+        _task_store_audit_log "task need capability-undeclared" "refused" 0 -- \
+          "task=$ident" "filer=${actor:-}" "type=$type" "tier=$tier" || true
+        fail "$E_VALIDATION" "$ident: refusing this gate because it reaches the paired human and does not say what it needs FROM a human. A customer is tapped for exactly four things: money, a secret, something irreversible, or something only a person at a browser or keyboard can do. Name the one this ask consumes:
+  --needs=spend_authority     it spends money or commits to a paid account.
+  --needs=secret_provision    a token or credential must come FROM a person (or file it as --type=secret).
+  --needs=human_tap           a person's own call — brand, strategy, an irreversible choice — or a step only a person at a browser can perform.
+IF YOU CANNOT NAME ONE, this is not a gate on a person. Your exits:
+  --tier=0                    apply your own --recommend now: no ping, permanent record, a line in the digest. On this board 81% of answered decision gates came back as the human tapping the filer's recommendation, so if you wrote one you have already decided.
+  --tier=1                    the lead or this task's verifier answers it. Correct when the ask needs a JUDGEMENT an agent can make.
+  --ask-ok=\"<why a person must answer this though it consumes none of the four>\"    the audited exception. Recorded and countable.
+Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired human and 16 of them named no capability at all — and 313 changes shipped in the same week, so the ratio a customer would read is 0.11 taps per shipped change."
+      fi
+      [[ ${#ask_ok} -ge 12 ]] \
+        || fail "$E_VALIDATION" "--ask-ok must state WHY a person must answer a gate that consumes none of the four human capabilities"
+      _task_store_audit_log "task need capability-undeclared" "escaped" 0 -- \
+        "task=$ident" "filer=${actor:-}" "type=$type" "declared=$ask_ok" || true
+      warn "undeclared-capability escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". This gate reaches the paired human and names no capability."
+    fi
+
     # DIVE-4176, THE HALF THAT STAYS ADVISORY AND WHY. "Consequence-first, a
     # choice between outcomes" is the rule that matters most and it is the one
     # with no honest mechanical predicate. The closest proxy is "the ask asks a

@@ -169,8 +169,11 @@ fi
 #        write-site row. The refusal `fail`s, so run it in a subshell.
 reset
 t2=$(addt --assignee=dev -- "fixture hard gate")
+# DIVE-4346: a gate reaching the human must name the capability it consumes. This
+# ask genuinely spends money, so the declaration is the honest fixture here — and it
+# keeps the gate a real hard-human tier-2, which is what the case needs to grade.
 cmd_task_need "$t2" --type=decision --options="A|B" --recommend="A" \
-  --ask="spend money on ads" --tier=2 >/dev/null 2>&1
+  --ask="spend money on ads" --tier=2 --needs=spend_authority >/dev/null 2>&1
 ( cmd_task_answer "$t2" --value="A" ) >/dev/null 2>&1
 RC=$?
 if [[ "$RC" != "0" && -z "$(nat "$t2")" ]]; then

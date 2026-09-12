@@ -302,6 +302,23 @@ cmd_digest() {
   else timeout 25 bash "$0" update --check --json >"$tmpd/update.json" 2>/dev/null || echo '{}' >"$tmpd/update.json"; fi
   [ -s "$tmpd/update.json" ] || echo '{}' >"$tmpd/update.json"
 
+  # DIVE-4346 — WHAT THE TAP ACTUALLY CONSUMED. `you answered N×` says a person
+  # was interrupted; it does not say whether the interruption bought anything only
+  # a person holds. The four capabilities are money, a secret, an irreversible
+  # step, and something only a person at a browser can do, and `needs_capability`
+  # is where the filer names one. Read straight from `tasks` because the column is
+  # NOT on `task ls --json` and NOT on `gate_history` — both gaps are real and are
+  # written on the row; reading the live table is what makes the counter shippable
+  # today without a schema change. A failed read yields null, which renders as
+  # "unknown", never as zero: a capability we cannot count is not a capability
+  # that was not named (the DIVE-3228 lesson about the buzz count).
+  dbfmt -json "SELECT COALESCE(NULLIF(needs_capability,''), CASE WHEN need_type='secret' THEN 'secret_provision' ELSE '' END) AS cap, COUNT(*) AS n
+               FROM tasks
+               WHERE need_answered_by LIKE 'human:%'
+                 AND need_answered_at >= datetime('now','-${window} seconds')
+               GROUP BY 1;" >"$tmpd/cap.json" 2>/dev/null || echo 'null' >"$tmpd/cap.json"
+  [ -s "$tmpd/cap.json" ] || echo '[]' >"$tmpd/cap.json"
+
   if _bz=$(_digest_buzz_count "$window"); then
     printf '{"buzzes":%s,"partial":%s}\n' "${_bz%%|*}" "${_bz##*|}" >"$tmpd/buzz.json"
   else
@@ -311,7 +328,7 @@ cmd_digest() {
   DIGEST_TASKS_F="$tmpd/tasks.json" DIGEST_USAGE_F="$tmpd/usage.json" DIGEST_HB_F="$tmpd/hb.txt" \
   DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" DIGEST_OBJ_F="$tmpd/obj.json" \
   DIGEST_UPDATE_F="$tmpd/update.json" DIGEST_HELD_F="$tmpd/held.json" \
-  DIGEST_BUZZ_F="$tmpd/buzz.json" \
+  DIGEST_BUZZ_F="$tmpd/buzz.json" DIGEST_CAP_F="$tmpd/cap.json" \
   DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
 
@@ -329,6 +346,7 @@ def load(env, default):
         return default
 
 buzz_data = load("DIGEST_BUZZ_F", {"buzzes": None, "partial": 1})
+cap_rows = load("DIGEST_CAP_F", None)
 buzzes = buzz_data.get("buzzes") if isinstance(buzz_data, dict) else None
 buzz_partial = bool(buzz_data.get("partial")) if isinstance(buzz_data, dict) else True
 
@@ -766,6 +784,22 @@ else:
     out.append(f"\U0001F9BE Autonomy — {_up} · shipped {len(done_l)}{_trend(len(done_l), prev_ship)}"
                f"{_bz}"
                f" · you answered {len(ht_l)}×{_trend(len(ht_l), prev_ask)}")
+    # DIVE-4346 — THE RATIO IS THE AXIS, and it is the one number a customer
+    # reads about us: human taps per shipped change. Rendered next to the
+    # capability split, because a tap that named none of the four is the tap that
+    # should not have existed. Measured on this board the 7 days to 2026-09-12:
+    # 35 gates reached the paired human, 16 named no capability (46%), 313 changes
+    # shipped: 0.11 taps per shipped change.
+    _ratio = (f"{touches / len(done_l):.2f}" if done_l else ("n/a" if not touches else "∞"))
+    if isinstance(cap_rows, list):
+        _capless = sum(int(r.get("n") or 0) for r in cap_rows if not (r.get("cap") or "").strip())
+        _named = sum(int(r.get("n") or 0) for r in cap_rows) - _capless
+        _cap_txt = f"{_named} named a capability, {_capless} named none"
+    else:
+        # Unknown is not zero (DIVE-3228).
+        _cap_txt = "capability split: unknown"
+    out.append(f"   ↳ {_ratio} taps per shipped change · of {touches} tap"
+               f"{'s' if touches != 1 else ''}, {_cap_txt}")
     if isinstance(buzzes, int) and buzz_partial:
         out.append("   *buzz count covers only the span since gate cards were modelled")
     if objectives:
