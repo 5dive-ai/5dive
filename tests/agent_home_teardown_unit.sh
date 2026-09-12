@@ -242,5 +242,57 @@ else
         "check=$ln_chk user=$ln_usr registry=$ln_reg (did a call site get renamed?)"
 fi
 
+# ---------------------------------------------------------------------------
+# DIVE-4340: the user half of the teardown, when it does NOT succeed.
+#
+# `deluser` used to run as `deluser ... 2>/dev/null || true`, so a teardown that
+# could not delete the account was indistinguishable from one that did — and the
+# caller dropped the registry row either way, which is how 8 accounts on
+# exact-swallow ended up on a box with no command able to reach them. The
+# verdict must be "is the account still there afterwards", not deluser's rc.
+# ---------------------------------------------------------------------------
+DELUSER_RC=0
+id()      { if [[ "${1:-}" == "-u" ]]; then [[ "${2:-}" == "agent-zombie" ]] && { echo 4242; return 0; }; return 1; fi; command id "$@"; }
+getent()  { [[ "${1:-}" == passwd ]] && { printf 'agent-zombie:x:4242:4242::%s/agent-zombie:/bin/bash\n' "$AGENT_HOME_ROOT"; return 0; }; return 1; }
+deluser() { printf 'deluser: /usr/sbin/deluser must be run as root\n' >&2; return "$DELUSER_RC"; }
+setfacl() { return 0; }
+capability_forget_agent() { return 0; }
+AUDITED=""
+audit_log() { AUDITED="$*"; return 0; }
+
+# A deluser that fails and leaves the account behind.
+DELUSER_RC=1
+mkdir -p "$AGENT_HOME_ROOT/agent-zombie"
+_RM_USER_DISPOSITION=""
+# Run it in THIS shell: a command substitution would take the disposition and
+# the audit row into a subshell, and the assertions below would read neither.
+delete_agent_user zombie >/dev/null 2>"$TMP/zombie.err"
+err=$(cat "$TMP/zombie.err")
+[[ "$_RM_USER_DISPOSITION" == "present" ]] \
+  && ok_t "a surviving account is reported as user disposition 'present'" \
+  || bad_t "a surviving account is reported as 'present'" "disposition='$_RM_USER_DISPOSITION'"
+grep -qi "SURVIVED" <<<"$err" \
+  && ok_t "the survivor is loud on stderr, not swallowed" \
+  || bad_t "the survivor is loud on stderr" "$err"
+grep -qi "group" <<<"$err" \
+  && ok_t "the warning names the credential group the account still belongs to" \
+  || bad_t "the warning names the credential group" "$err"
+grep -q "doctor" <<<"$err" \
+  && ok_t "the warning names the command that can still reap it" \
+  || bad_t "the warning names the reap path" "$err"
+[[ "$AUDITED" == *os-teardown-incomplete* && "$AUDITED" == *agent-zombie* ]] \
+  && ok_t "the reason the teardown could not finish is written to the audit log" \
+  || bad_t "the reason is written to the audit log" "audited='$AUDITED'"
+
+# The same code path when the account really is gone: no warning, no audit row.
+id() { if [[ "${1:-}" == "-u" ]]; then return 1; fi; command id "$@"; }
+AUDITED=""; _RM_USER_DISPOSITION=""
+delete_agent_user zombie >/dev/null 2>"$TMP/zombie2.err"
+[[ "$_RM_USER_DISPOSITION" == "absent" && -z "$AUDITED" ]] \
+  && ok_t "an account that is already gone is 'absent' and writes no audit row" \
+  || bad_t "an already-gone account is 'absent'" "disposition='$_RM_USER_DISPOSITION' audited='$AUDITED'"
+
+unset -f id getent deluser setfacl capability_forget_agent audit_log
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

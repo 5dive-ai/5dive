@@ -131,8 +131,16 @@ cmd_rm() {
   # DIVE-2138: also disposes of /home/agent-<name> (quarantine by default,
   # delete under --purge-home) and reports which via _RM_HOME_DISPOSITION.
   _RM_HOME_DISPOSITION="absent"
+  _RM_USER_DISPOSITION="absent"
   delete_agent_user "$name" "$purge_home"
   step "Updating registry"
+  if [[ "${_RM_USER_DISPOSITION:-absent}" == "present" ]]; then
+    # The row goes anyway — the unit, the env files and the channel secrets are
+    # already gone, so keeping the entry would claim a working seat that no
+    # longer exists. But it is now an ORPHAN account, which doctor's new
+    # registry/orphan-seats check is what finds and reaps (DIVE-4340).
+    warn "removing the registry entry for '$name' while the OS account agent-${name} is still on the box — it is now an orphan: sudo 5dive doctor --category=registry --fix"
+  fi
   jq --arg n "$name" 'del(.agents[$n])' <<<"$reg" | registry_write
   # DIVE-1609: cascade the org-chart placement. The agents_org DELETE used to
   # live ONLY in `5dive org rm`, so `agent rm` orphaned the row and the agent
@@ -154,9 +162,15 @@ cmd_rm() {
     _home_path="${_home_state#quarantined:}"
     _home_state="quarantined"
   fi
+  # DIVE-4340: the USER disposition is the other half of that receipt, and it is
+  # the half that was missing. `removed:true` was printed even when the OS
+  # account outlived the removal — and once this function drops the registry row
+  # a second `agent rm` cannot reach the survivor at all. Say it in the receipt,
+  # say it on stderr, and name the path that can still reap it.
+  local _user_state="${_RM_USER_DISPOSITION:-absent}"
   ok "agent '$name' removed." \
-     '{name:$n, removed:true, home:({disposition:$hs} + (if $hp == "" then {} else {path:$hp} end))}' \
-     --arg n "$name" --arg hs "$_home_state" --arg hp "$_home_path"
+     '{name:$n, removed:true, user:{disposition:$us}, home:({disposition:$hs} + (if $hp == "" then {} else {path:$hp} end))}' \
+     --arg n "$name" --arg us "$_user_state" --arg hs "$_home_state" --arg hp "$_home_path"
 }
 
 # DIVE-345: move a path aside as <path>.disabled-<ts> (reversible) if present.

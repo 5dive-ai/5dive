@@ -300,13 +300,28 @@ doctor_check_marketplace_clones() {
   local homes_root="${1:-/home}"
   local ref_sha="${2:-}"
   local rel="${3:-.claude/plugins/marketplaces/5dive-plugins}"
+  # DIVE-4340: the set of agents is the REGISTRY, not the set of directories
+  # under /home. On exact-swallow this check enumerated 21 homes and reported 21
+  # unreadable clones, ~17 of which belonged to seats that no longer existed —
+  # a real staleness warning buried in corpses. Callers pass the registry names
+  # (newline- or space-separated); an EMPTY list means "do not filter", which is
+  # what keeps this callable against a synthetic homes root.
+  local known="${4:-}"
   local home name clone sha behind total msg sev
-  local -a current=() stale=() unknown=() absent=()
+  local -a current=() stale=() unknown=() absent=() skipped=()
 
   for home in "$homes_root"/*/; do
     home="${home%/}"
     name="${home##*/}"
     [[ -d "$home/.claude" ]] || continue   # not an agent home; not part of M
+    if [[ -n "$known" && "$name" == agent-* ]]; then
+      # Only agent-* homes are registry-backed; /home/claude and friends are not
+      # seats and are graded as before.
+      if ! grep -qxF -- "${name#agent-}" <<<"$(tr ' ' '\n' <<<"$known")"; then
+        skipped+=("$name")
+        continue
+      fi
+    fi
     clone="$home/$rel"
     if [[ ! -d "$clone" ]]; then
       if [[ -e "$home/.claude/plugins" && ! -r "$home/.claude/plugins" ]]; then
@@ -361,6 +376,10 @@ doctor_check_marketplace_clones() {
   msg+="$(doctor_mp_list ' | behind:' "${stale[@]}")"
   msg+="$(doctor_mp_list ' | UNKNOWN:' "${unknown[@]}")"
   msg+="$(doctor_mp_list ' | no clone:' "${absent[@]}")"
+  # Named, not hidden: a home whose seat is gone is an orphan for
+  # registry/orphan-seats to reap, and saying so here is what stops this row
+  # from quietly shrinking for the wrong reason.
+  msg+="$(doctor_mp_list ' | not a live seat (orphan home, see registry/orphan-seats):' "${skipped[@]}")"
   if [[ "$sev" == warn ]]; then
     msg+=" — a clone's version is per-AGENT, so one refresh does not fix the fleet; each listed clone is its own git checkout under that agent's \$HOME/$rel"
   fi
@@ -373,6 +392,145 @@ doctor_mp_list() {
   (( $# )) || return 0
   local IFS=', '
   printf '%s %s' "$label" "$*"
+}
+
+# DIVE-4340 — the registry is the list of agents. Every doctor section that
+# wants "each agent" asks HERE, not the /home glob: a directory under /home is
+# a leftover as often as it is a seat. Returns space-separated names, or empty
+# when the registry cannot be read — and empty means "do not filter", so a
+# caller degrades to its old behaviour instead of silently reporting nothing.
+doctor_registry_seat_names() {
+  local reg
+  reg=$(registry_read 2>/dev/null) || return 0
+  jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null | tr '\n' ' '
+}
+
+# DIVE-4340 — the converse check: an `agent-*` account with no registry entry.
+#
+# `doctor`'s registry section asserted one direction only — every registry entry
+# has a user. On exact-swallow that was 4 for 4 green while 8 orphan accounts sat
+# on the same box, each keeping its home and its membership in the shared
+# credential group, plus a unit that had been `failed` for three days. Nothing
+# looked at the other direction, and once a seat's row is gone `agent rm` refuses
+# the name (E_NOT_FOUND) — so the orphans were not merely unreported, they were
+# unreachable by any supported command. This check is that command.
+#
+# Three independent sources, because an orphan does not always leave all three:
+#   passwd  — the account itself (and the home it still owns)
+#   group   — membership in AGENT_SHARED_GROUP, the credential-scoping group;
+#             this is the security-relevant one, so its presence sets `error`
+#   units   — a lingering (often `failed`) 5dive-agent@<name>.service
+#
+# Each is a function so the unit harness can replace it; none of them may be
+# allowed to turn a read failure into a green row (rule 1 of the marketplace
+# check applies here too: a source we could not read is UNKNOWN, never "clean").
+doctor_orphan_passwd_users() {
+  getent passwd 2>/dev/null | awk -F: '$1 ~ /^agent-/ {print $1":"$6}'
+}
+doctor_orphan_group_members() {
+  getent group "${AGENT_SHARED_GROUP:-claude}" 2>/dev/null \
+    | awk -F: '{print $4}' | tr ',' '\n' | grep '^agent-' || true
+}
+doctor_orphan_units() {
+  systemctl list-units --all --no-legend --plain '5dive-agent@*.service' 2>/dev/null \
+    | awk '{print $1" "$4}'
+}
+
+# doctor_check_orphan_seats [want_fix]
+doctor_check_orphan_seats() {
+  local want_fix="${1:-0}"
+  local reg
+  reg=$(registry_read 2>/dev/null) || reg=""
+  if [[ -z "$reg" ]] || ! jq -e '.agents' >/dev/null 2>&1 <<<"$reg"; then
+    doctor_add registry orphan-seats warn \
+      "UNKNOWN: the registry is unreadable, so agent-* accounts cannot be graded against it — nothing was measured, which is not the same as clean"
+    return 0
+  fi
+
+  local known
+  known=$(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null)
+  _is_known() { local n="$1" k; while IFS= read -r k; do [[ "$k" == "$n" ]] && return 0; done <<<"$known"; return 1; }
+
+  # name -> space-separated markers (user / group / unit:<state>)
+  local -A orphan=() orphan_home=()
+  local line user home nm state unit
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    user="${line%%:*}"; home="${line#*:}"; nm="${user#agent-}"
+    _is_known "$nm" && continue
+    orphan["$nm"]="${orphan[$nm]:+${orphan[$nm]},}user"
+    [[ -n "$home" && -d "$home" ]] && orphan_home["$nm"]="$home"
+  done < <(doctor_orphan_passwd_users)
+
+  while IFS= read -r user || [[ -n "$user" ]]; do
+    [[ -n "$user" ]] || continue
+    nm="${user#agent-}"
+    _is_known "$nm" && continue
+    orphan["$nm"]="${orphan[$nm]:+${orphan[$nm]},}group"
+  done < <(doctor_orphan_group_members)
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    unit="${line%% *}"; state="${line##* }"
+    nm="${unit#5dive-agent@}"; nm="${nm%.service}"
+    [[ -n "$nm" && "$nm" != "$unit" ]] || continue
+    _is_known "$nm" && continue
+    orphan["$nm"]="${orphan[$nm]:+${orphan[$nm]},}unit:${state}"
+  done < <(doctor_orphan_units)
+
+  unset -f _is_known
+  if (( ${#orphan[@]} == 0 )); then
+    doctor_add registry orphan-seats ok \
+      "no orphan agent-* account, group member or unit — every OS seat on this box has a registry entry"
+    return 0
+  fi
+
+  # Severity is keyed to CONSEQUENCE. An account still inside the credential
+  # group is a security-hygiene defect (that group is what the shared
+  # credentials are scoped to); a lone stale unit is untidy.
+  local sev=warn n names="" grp_count=0
+  for nm in $(printf '%s\n' "${!orphan[@]}" | sort); do
+    [[ "${orphan[$nm]}" == *group* ]] && grp_count=$((grp_count+1))
+    names+="${names:+, }${nm}(${orphan[$nm]})"
+  done
+  (( grp_count > 0 )) && sev=error
+  n=${#orphan[@]}
+
+  local repaired=false
+  if (( want_fix )); then
+    local failed=0
+    for nm in $(printf '%s\n' "${!orphan[@]}" | sort); do
+      # Same teardown the supported removal path runs, in the same order:
+      # stop + disable the unit, clear its residual failed state, drop the
+      # systemd env + channel secrets, then delete the user and QUARANTINE the
+      # home (never delete it — DIVE-2138's decision, unchanged here).
+      systemctl disable --now "5dive-agent@${nm}.service" >/dev/null 2>&1 || true
+      systemctl reset-failed "5dive-agent@${nm}.service" >/dev/null 2>&1 || true
+      rm -f "${ENV_DIR}/${nm}.env" "${ENV_DIR}/${nm}-auth.env" 2>/dev/null || true
+      if declare -F delete_agent_user >/dev/null 2>&1; then
+        _RM_HOME_DISPOSITION="absent"; _RM_USER_DISPOSITION="absent"
+        delete_agent_user "$nm" 0 >/dev/null 2>&1 || true
+      fi
+      if id -u "agent-${nm}" >/dev/null 2>&1; then failed=$((failed+1)); fi
+    done
+    if (( failed == 0 )); then
+      repaired=true
+      doctor_add registry orphan-seats ok \
+        "reaped $n orphan seat(s): $names — accounts deleted (group membership with them), units cleared, homes quarantined under ${REAPED_DIR:-/home/.5dive-reaped}" true true
+      return 0
+    fi
+    doctor_add registry orphan-seats error \
+      "could not reap $failed of $n orphan seat(s): $names — rerun as root (sudo 5dive doctor --category=registry --fix); the audit log carries the reason per account" true false
+    return 0
+  fi
+
+  local grp_clause=""
+  if (( grp_count > 0 )); then
+    grp_clause=" — ${grp_count} still in group ${AGENT_SHARED_GROUP:-claude}, the group this box shares its credentials through"
+  fi
+  doctor_add registry orphan-seats "$sev" \
+    "$n agent-* seat(s) exist on the box with NO registry entry: ${names}${grp_clause}. 'agent rm' cannot reach them (the registry row is already gone); run with --fix to delete the accounts and quarantine their homes (DIVE-4340)" true false
 }
 
 # doctor_check_reaped_homes [dir]
@@ -1093,6 +1251,10 @@ cmd_doctor() {
           doctor_add registry "agent:$name" ok "entry + user + env file all present"
         fi
       done
+      # DIVE-4340: and now the CONVERSE. Everything above asks "does this
+      # registry entry still have a user?"; nothing asked "does this user still
+      # have a registry entry?", which is the direction the orphans were in.
+      doctor_check_orphan_seats "$want_fix"
     fi
   fi
 
@@ -1496,7 +1658,9 @@ cmd_doctor() {
   if (( run_plugins )); then
     local _mp_ref=""
     _mp_ref=$(doctor_marketplace_reference_sha) || _mp_ref=""
-    doctor_check_marketplace_clones /home "$_mp_ref"
+    # DIVE-4340: pass the registry seat list so orphan homes are not graded as
+    # stale agent clones (they are reported by registry/orphan-seats instead).
+    doctor_check_marketplace_clones /home "$_mp_ref" "" "$(doctor_registry_seat_names)"
   fi
 
   if (( run_memory )); then
@@ -1509,8 +1673,17 @@ cmd_doctor() {
     for wd in /home/claude/projects/5dive/community/wiki; do
       [[ -d "$wd" ]] && mem_roots+=("$wd")
     done
-    local home
-    for home in /home/claude /home/agent-*; do
+    # DIVE-4340: registry-driven, not /home-driven — a reaped seat's leftover
+    # home must not contribute a memory store to the hygiene scan.
+    local home _seat _seats
+    _seats=$(doctor_registry_seat_names)
+    local -a _home_list=(/home/claude)
+    if [[ -n "$_seats" ]]; then
+      for _seat in $_seats; do _home_list+=("/home/agent-${_seat}"); done
+    else
+      for home in /home/agent-*; do [[ -d "$home" ]] && _home_list+=("$home"); done
+    fi
+    for home in "${_home_list[@]}"; do
       [[ -d "$home/.claude/projects" ]] || continue
       local md
       for md in "$home"/.claude/projects/*/memory; do
