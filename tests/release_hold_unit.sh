@@ -77,21 +77,48 @@ git_stub='case "$*" in
 esac'
 
 # $1 = hold body, or "" meaning EVERY hold fetch fails (both rungs).
+# $2 = the tag the FLEET STABLE ROUTE serves (api.5dive.com/cli-version), or ""
+#      meaning the route is unreachable. DIVE-4366: since DIVE-4140 this route is
+#      what a customer box actually follows, so a hold harness that can only
+#      drive the tag-list resolver grades the canary rung and nothing else.
 mk_curl() {
+  local route_arm=""
+  [[ -n "${2:-}" ]] && route_arm="$(printf 'case "$*" in *cli-version*) printf \x27%%s\\n\x27 "%s"; exit 0 ;; esac\n' "$2")"
   if [[ -n "$1" ]]; then
-    printf 'case "$*" in *release-hold*) cat <<%s\n%s\n%s\nexit 0 ;; esac\nexit 22\n' \
-      "'HOLDEOF'" "$1" "HOLDEOF"
+    printf '%s\ncase "$*" in *release-hold*) cat <<%s\n%s\n%s\nexit 0 ;; esac\nexit 22\n' \
+      "$route_arm" "'HOLDEOF'" "$1" "HOLDEOF"
   else
-    printf 'exit 22\n'
+    printf '%s\nexit 22\n' "$route_arm"
   fi
 }
 
 # Run the install.sh block. Echoes REPO=, PIN=, then RC=.
-run_install() { # $1=hold body  [$2=block override]
-  local blk="${2:-$block}" stubs out rc; stubs="$(mktemp -d)"
+#
+# EVERY file resolve_cli_target consults is pointed inside $stubs. Left at its
+# defaults this harness reads the HOST it runs on — /etc/5dive/cli-canary and
+# /usr/local/bin/5dive exist on a 5dive box, so the fixture tags (v0.15.34) sit
+# below the real installed floor (0.35.1) and every behavioural arm fails for a
+# reason that has nothing to do with the hold. A harness whose verdict depends on
+# the machine grades the machine.
+run_install() { # $1=hold body  [$2=block override]  [$3=rung: canary(default)|route]
+  local blk="${2:-$block}" rung="${3:-canary}" stubs out rc route_tag=""
+  stubs="$(mktemp -d)"
+  local canary_file="$stubs/canary-absent"
+  case "$rung" in
+    canary) canary_file="$stubs/canary"; : > "$canary_file" ;;
+    route)  route_tag="$TAG_NEW" ;;
+    *)      bad_t "unknown rung '$rung'" "run_install takes canary|route"; rm -rf "$stubs"; return ;;
+  esac
   printf '#!/usr/bin/env bash\n%s\n' "$git_stub" > "$stubs/git"; chmod +x "$stubs/git"
-  printf '#!/usr/bin/env bash\n%s\n' "$(mk_curl "$1")" > "$stubs/curl"; chmod +x "$stubs/curl"
-  out="$(env -i PATH="$stubs:/usr/bin:/bin" GH_ORG="testorg" bash -c "set -euo pipefail
+  printf '#!/usr/bin/env bash\n%s\n' "$(mk_curl "$1" "$route_tag")" > "$stubs/curl"; chmod +x "$stubs/curl"
+  out="$(env -i PATH="$stubs:/usr/bin:/bin" GH_ORG="testorg" \
+    CLI_VERSION_OVERRIDE_FILE="$stubs/override-absent" \
+    CLI_CANARY_FILE="$canary_file" \
+    CLI_VERSION_KNOWN_FILE="$stubs/last-known" \
+    CLI_VERSION_URL="https://route.invalid/cli-version" \
+    CLI_INSTALLED_BIN="$stubs/installed-absent" \
+    CLI_TARGET_RECEIPT_FILE="$stubs/cli-target.json" \
+    bash -c "set -euo pipefail
 $blk
 printf 'REPO=%s\nPIN=%s\n' \"\$REPO\" \"\$GH_PINNED_SHA\"" install.sh 2>&1)"; rc=$?
   rm -rf "$stubs"; printf '%s\nRC=%s\n' "$out" "$rc"
@@ -189,9 +216,42 @@ else bad_t "a malformed line held the fleet" "got: ${o//$'\n'/ | }"; fi
 # 7. Everything held => refuse, distinctly. Not "no tag resolved": the rail is
 #    healthy and the refusal is deliberate, and the operator page must differ.
 o="$(run_install "$HOLD_ALL")"
-if [[ "$o" == *"EVERY RELEASE TAG IS HELD"* && "$o" == *"RC=1"* && "$o" != *"REPO=https"* ]]; then
-  ok_t "all candidates held: refuses with its own message, not 'NO RELEASE TAG RESOLVED'"
+if [[ "$o" == *"RELEASE TARGET IS HELD"* && "$o" == *"RC=1"* && "$o" != *"REPO=https"* ]] \
+   && [[ "$o" != *"NO STABLE RELEASE TAG RESOLVED"* ]]; then
+  ok_t "all candidates held: refuses with its own message, not 'NO STABLE RELEASE TAG RESOLVED'"
 else bad_t "all-held did not refuse distinctly" "got: ${o//$'\n'/ | }"; fi
+
+# --- THE FLEET RUNG (DIVE-4366) ----------------------------------------------
+# Arms 1-7 drive the CANARY rung, because when this harness was written the
+# tag-list resolver WAS the fleet's resolver. DIVE-4140 moved customer boxes onto
+# the fleet stable route (api.5dive.com/cli-version) and left the tag list
+# answering the canary opt-in only. A hold subtracted from a candidate list is
+# therefore a brake on the handful of canary boxes and on nothing else — the
+# 04:00Z fleet would take a held release exactly as before, which is the same
+# "deployed and connected to nothing" shape the prerelease flag had.
+#
+# The route rung hands back ONE tag, so there is no next-best candidate to fall
+# to: a held target is a REFUSAL. Falling back to last-known would turn a hold
+# into a silent downgrade, and a hold holds boxes back rather than pulling them
+# back — the box keeps the CLI it has.
+route_open_installs() { [[ "$(run_install "$HOLD_NONE" "${1:-$block}" route)" == *"PIN=$SHA_NEW"*"RC=0"* ]]; }
+route_held_refuses()  { local o; o="$(run_install "$HOLD_NEW" "${1:-$block}" route)"
+                        [[ "$o" == *"RELEASE TARGET IS HELD"* && "$o" == *"RC=1"* && "$o" != *"REPO=https"* ]]; }
+route_unreadable_fails_closed() { local o; o="$(run_install "" "${1:-$block}" route)"
+                        [[ "$o" == *"RELEASE HOLD UNREADABLE"* && "$o" == *"RC=1"* && "$o" != *"REPO=https"* ]]; }
+
+if route_open_installs; then
+  ok_t "fleet route rung, hold open: installs the tag the route names ($TAG_NEW) — the brake at rest is a no-op here too"
+else bad_t "an empty hold changed what the fleet route resolved" "got: $(run_install "$HOLD_NONE" "$block" route | tr '\n' '|')"; fi
+
+if route_held_refuses; then
+  ok_t "fleet route rung, target held: REFUSES and pins nothing — the 04:00Z cron is braked, not just the canary"
+else bad_t "a held tag was still installed on the FLEET rung — THE BRAKE REACHES THE CANARY ONLY" \
+      "got: $(run_install "$HOLD_NEW" "$block" route | tr '\n' '|')"; fi
+
+if route_unreadable_fails_closed; then
+  ok_t "fleet route rung, hold unreadable: FAILS CLOSED (an unknown hold is not an open one on the fleet path either)"
+else bad_t "an unreadable hold was treated as open on the fleet rung" "got: $(run_install "" "$block" route | tr '\n' '|')"; fi
 
 # 8. THE HOLD IS READ FROM `main`, NEVER FROM THE TAG. Reading it from the
 #    candidate tree would let a bad release exempt itself — the entire failure
@@ -236,5 +296,10 @@ mutant_red "unreadable hold reported as ok" 's/RELEASE_HOLD_STATE="unreadable"/R
 # (c) and the open case must still be the thing that breaks if the walk breaks,
 #     so the two arms above cannot both be satisfied by refusing everything.
 mutant_red "picks the OLDEST surviving tag" 's/| tail -1)"$/| head -1)"/' installs_newest_when_open
+# (d) DIVE-4366's own defect, as a mutant: the hold wired into the TAG-LIST
+#     resolver only. Every canary arm above still passes under it — which is
+#     precisely why it shipped as a brake once and braked nothing.
+mutant_red "hold checked on the candidate list only (canary braked, fleet not)" \
+  's/if \[\[ -n "\$RELEASE_HOLD_LIST" \]\] && printf/if false \&\& printf/' route_held_refuses
 
 echo; echo "$PASS passed, $FAIL failed"; [[ $FAIL -eq 0 ]]

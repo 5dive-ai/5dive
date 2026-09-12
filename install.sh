@@ -102,6 +102,7 @@ fi
 #   already exist and the error names both — GH_SHA (pin a tree directly) and
 #   REPO (override the source entirely).
 
+# >>> DIVE-4223 release hold
 # DIVE-4223 — THE RELEASE HOLD, and why it lives on `main` rather than on the
 # release object.
 #
@@ -173,6 +174,7 @@ load_release_hold() {
     | sed -n 's/^\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)\([[:space:]].*\)\{0,1\}$/\1/p')"
   RELEASE_HOLD_STATE="ok"
 }
+# <<< DIVE-4223 release hold
 
 # Newest release tag name (e.g. v0.15.34) on stdout.
 #   0  resolved            tag on stdout
