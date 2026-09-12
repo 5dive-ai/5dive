@@ -91,6 +91,7 @@ CORE_FILES=(
   src/lib/audit.sh
   src/lib/reap.sh
   src/lib/registry.sh
+  src/lib/quota_wall.sh
   src/lib/agent_env.sh
   src/lib/verify_policy.sh
   src/lib/tasks_db.sh

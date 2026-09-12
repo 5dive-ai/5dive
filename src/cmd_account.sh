@@ -476,6 +476,40 @@ rotation_live_headroom_candidates() {
 # most recently carries the truest live numbers). usage is null when no
 # bound agent has a readable cache. Needs root to read sibling agents' 0750
 # home dirs — dashboard and telegram both call via `sudo -n 5dive account usage`.
+# DIVE-4342 (1b): where an account's LAST OBSERVED usage is kept, on the account
+# itself rather than on the set of seats bound to it. Measured on a customer box:
+# `cm 0% 101% alex-dev`, then four minutes after the walled seat was moved off
+# that profile, `cm - - -`. The evidence needed to diagnose the outage was
+# destroyed by the fix for it, because the row was assembled from live mappings.
+# The account record outlives the mapping, so the row does too.
+account_usage_record_path() { printf '%s/%s/usage.json\n' "$AUTH_PROFILES_DIR" "$1"; }
+
+# account_usage_remember <name> <usage-json> — persist a live reading onto the
+# account. Best-effort: a profile dir we cannot write is not a reason to fail the
+# table the caller asked for.
+account_usage_remember() {
+  local name="$1" usage="$2" path tmp
+  [[ -n "$usage" && "$usage" != "null" ]] || return 0
+  path=$(account_usage_record_path "$name")
+  [[ -d "$(dirname "$path")" ]] || return 0
+  tmp="${path}.tmp.$$"
+  printf '%s\n' "$usage" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  chmod 0640 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp"
+  return 0
+}
+
+# account_usage_recall <name> — the last persisted reading, re-stamped as
+# remembered. `source` becomes null (no live seat produced it now) and
+# `rememberedAt` carries the asOf it was measured at, so a consumer can age it.
+# We deliberately do NOT store a verdict here — only the numbers we read.
+account_usage_recall() {
+  local name="$1" path
+  path=$(account_usage_record_path "$name")
+  [[ -s "$path" && -r "$path" ]] || { printf 'null'; return 0; }
+  jq -c '. + {source: null, remembered: true}' "$path" 2>/dev/null || printf 'null'
+}
+
 cmd_account_usage() {
   ensure_state
   [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account usage"
@@ -500,13 +534,19 @@ cmd_account_usage() {
                    else {pct: .fiveHourPct, resetsAt: .fiveResetsAt} end),
         sevenDay: (if .sevenDayPct == null then null
                    else {pct: .sevenDayPct, resetsAt: .sevenResetsAt} end),
-        asOf: .asOf, source: $src}' <<<"$best")
+        asOf: .asOf, source: $src, remembered: false}' <<<"$best")
+      account_usage_remember "$name" "$usage"
     else
-      usage="null"
+      # No live mapping carries a cache — fall back to what this ACCOUNT last
+      # reported. A profile with zero bound seats still prints its 5H/7D.
+      usage=$(account_usage_recall "$name")
     fi
     rows=$(jq -c --arg n "$name" --argjson a "$agents" --argjson u "$usage" \
       '. + [{name:$n, agents:$a, usage:$u}]' <<<"$rows")
   done < <(account_each)
+  # Publish for the unprivileged health surfaces (liveness, supervisor,
+  # agent list). See src/lib/quota_wall.sh — measurements, not verdicts.
+  quota_snapshot_publish "$rows"
   if (( JSON_MODE )); then
     echo "$rows" | jq -c '{ok:true, data: .}'
   else
@@ -515,7 +555,9 @@ cmd_account_usage() {
       if length == 0 then "no accounts" else
         (["ACCOUNT","5H","7D","SOURCE"] | @tsv),
         (.[] | [.name, p(.usage.fiveHour), p(.usage.sevenDay),
-                (.usage.source // "-")] | @tsv)
+                (if .usage == null then "-"
+                 elif .usage.remembered then "- (remembered)"
+                 else (.usage.source // "-") end)] | @tsv)
       end' | column -t -s $'\t'
   fi
 }

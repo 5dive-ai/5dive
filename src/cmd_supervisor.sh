@@ -385,6 +385,52 @@ _sup_activity_epoch() {  # <type> <home>
     | sort -rn | head -1 | cut -d. -f1
 }
 
+# ── DIVE-4342 it.2: A PANE PROBE THAT COULD NOT LOOK SAYS SO ────────────────
+#
+# All three pane probes below used to read
+#     (( svc_running )) && [[ $EUID -eq 0 ]] || return 0
+# and every caller tested only `[[ -n "$excerpt" ]]`, so "I was not allowed to
+# look" and "I looked and the pane is clean" were the SAME value. An
+# unprivileged `5dive supervisor` therefore disarmed its three highest-priority
+# branches (verify-challenge, blocked-on-prompt, pane quota) and still printed a
+# clean word with no degradation mark. Measured on a customer box, 0.35.0.
+#
+# The fix is the one this codebase already wrote down for the quota deadline
+# (community/wiki/a-fail-open-underneath-a-fail-closed-path-feeds-it-a-lie-in-the-format-it-trusts.md):
+# the probe owes a DISTINGUISHABLE signal, the classifier owes the verdict. So
+# blindness leaves via the return code — rc 3, never stdout — and the excerpt
+# channel keeps its exact old meaning. A caller that ignores rc sees precisely
+# what it saw before; a caller that reads it can tell blind from clean.
+#
+# THREE STATES, and the middle one is not blindness:
+#   rc 0  — looked. stdout is the excerpt, empty means a clean pane.
+#   rc 1  — N/A: there is nothing to look AT. A non-claude runtime has no
+#           claude challenge/picker to render, and a seat whose unit is down has
+#           no live pane at all — and that down unit is already the more
+#           specific thing the board says about it. Not a degradation.
+#   rc 3  — BLIND: a pane exists and we could not read it (not root, the sudo
+#           hop failed, or the capture came back empty on a live session).
+_SUP_PROBE_BLIND=3
+
+# _sup_pane_gate <svc_running> — may we read this seat's live pane?
+# rc 0 look / rc 1 nothing to look at / rc 3 blind. Pure but for $EUID.
+_sup_pane_gate() {
+  (( ${1:-0} )) || return 1
+  [[ $EUID -eq 0 ]] || return "$_SUP_PROBE_BLIND"
+  return 0
+}
+
+# _sup_probe_state <rc> <rc> ... — fold the three probe return codes into the
+# per-seat verdict the classifier is handed. ANY blind probe makes the seat
+# unprobed: partial sight is not sight, and the branches that went dark are the
+# three highest-ranked ones. `n/a` (rc 1) and clean (rc 0) both read `ok` —
+# neither is a failure to observe.
+_sup_probe_state() {
+  local rc
+  for rc in "$@"; do [[ "$rc" == "$_SUP_PROBE_BLIND" ]] && { printf 'unprobed'; return; }; done
+  printf 'ok'
+}
+
 # DIVE-1127: pure signature match, no I/O — echoes the first pane line that looks
 # like an ID/age-verification challenge (trimmed), empty otherwise. Split out from
 # _sup_verify_challenge so the false-positive-critical regex is unit-testable
@@ -400,11 +446,12 @@ _sup_verify_match() {  # <pane-text-on-stdin>
 # matched pane excerpt when tripped.
 _sup_verify_challenge() {  # <type> <user> <sess> <svc_running>
   local type="$1" user="$2" sess="$3" svc_running="$4"
-  [[ "$type" == "claude" ]] || return 0
-  (( svc_running )) && [[ $EUID -eq 0 ]] || return 0
+  [[ "$type" == "claude" ]] || return 1
+  _sup_pane_gate "$svc_running" || return $?
   local pane
-  pane=$(sudo -n -u "$user" tmux capture-pane -p -t "$sess" -S "-${_SUP_VERIFY_PANE_LINES}" 2>/dev/null) || return 0
-  [[ -n "$pane" ]] || return 0
+  pane=$(sudo -n -u "$user" tmux capture-pane -p -t "$sess" -S "-${_SUP_VERIFY_PANE_LINES}" 2>/dev/null) \
+    || return "$_SUP_PROBE_BLIND"
+  [[ -n "$pane" ]] || return "$_SUP_PROBE_BLIND"
   printf '%s\n' "$pane" | _sup_verify_match
 }
 
@@ -465,15 +512,17 @@ _sup_prompt_recommended() {  # <pane-text-on-stdin>
 # root, or a down service returns empty (false-negative bias). Echoes
 # "<footer-excerpt>\x1f<recommended|unmarked>" when tripped, empty otherwise.
 _sup_prompt_pane_capture() {  # <user> <sess> <svc_running>
-  (( $3 )) && [[ $EUID -eq 0 ]] || return 0
-  sudo -n -u "$1" tmux capture-pane -p -t "$2" -S "-${_SUP_PROMPT_PANE_LINES}" 2>/dev/null || return 0
+  _sup_pane_gate "$3" || return $?
+  sudo -n -u "$1" tmux capture-pane -p -t "$2" -S "-${_SUP_PROMPT_PANE_LINES}" 2>/dev/null \
+    || return "$_SUP_PROBE_BLIND"
 }
 
 _sup_prompt_pane() {  # <type> <user> <sess> <svc_running>
-  local type="$1" pane excerpt
-  [[ "$type" == "claude" ]] || return 0
-  pane=$(_sup_prompt_pane_capture "$2" "$3" "$4") || return 0
-  [[ -n "$pane" ]] || return 0
+  local type="$1" pane excerpt rc
+  [[ "$type" == "claude" ]] || return 1
+  pane=$(_sup_prompt_pane_capture "$2" "$3" "$4"); rc=$?
+  (( rc == 0 )) || return "$rc"
+  [[ -n "$pane" ]] || return "$_SUP_PROBE_BLIND"
   excerpt=$(printf '%s\n' "$pane" | _sup_prompt_match)
   [[ -n "$excerpt" ]] || return 0
   if printf '%s\n' "$pane" | _sup_prompt_recommended; then
@@ -680,14 +729,16 @@ _sup_quota_deadline_hm() {  # <epoch>
 # `"$now"` from the call below survived every arm).
 _sup_quota_pane_capture() {  # <user> <sess> <svc_running>
   local user="$1" sess="$2" svc_running="$3"
-  (( svc_running )) && [[ $EUID -eq 0 ]] || return 0
-  sudo -n -u "$user" tmux capture-pane -p -t "$sess" -S "-${_SUP_QUOTA_PANE_LINES}" 2>/dev/null || return 0
+  _sup_pane_gate "$svc_running" || return $?
+  sudo -n -u "$user" tmux capture-pane -p -t "$sess" -S "-${_SUP_QUOTA_PANE_LINES}" 2>/dev/null \
+    || return "$_SUP_PROBE_BLIND"
 }
 
 _sup_quota_pane() {  # <user> <sess> <svc_running> [now_epoch]
-  local pane=""
-  pane=$(_sup_quota_pane_capture "$1" "$2" "$3") || return 0
-  [[ -n "$pane" ]] || return 0
+  local pane="" rc
+  pane=$(_sup_quota_pane_capture "$1" "$2" "$3"); rc=$?
+  (( rc == 0 )) || return "$rc"
+  [[ -n "$pane" ]] || return "$_SUP_PROBE_BLIND"
   # DIVE-3880 it.2: `now` is forwarded because the SELECTION among several
   # matching lines is clock-dependent (a still-future deadline outranks the
   # newest line). Same tick clock the classifier is handed, never a second read.
@@ -773,11 +824,11 @@ _SUP_INFO_TICK_TOL=120   # seconds. Per-agent rows are written BEFORE the fleet
 # assertable at a fixed epoch and the renderer stays deterministic in its args.
 # args: armed(true/false) tick_epoch row_epoch now
 #       rec_class rec_cause rec_detail open_rows days_since_close(-1 = never)
-#       store_readable(true/false)
+#       store_readable(true/false) account_wall(empty unless AT the wall now)
 _sup_info_status() {
   local armed="$1" tick="${2:-0}" row="${3:-0}" now="${4:-0}" \
         rc="${5:-}" rcause="${6:-}" rdetail="${7:-}" open="${8:-0}" days="${9:--1}" \
-        store="${10:-true}"
+        store="${10:-true}" wall="${11:-}"
   [[ "$store" == "false" ]] || store="true"
   [[ "$tick" =~ ^[0-9]+$ ]] || tick=0
   [[ "$row"  =~ ^[0-9]+$ ]] || row=0
@@ -874,6 +925,17 @@ _sup_info_status() {
   case "$cls" in quota-exhausted|verify-challenge|no-output) verdict="$cls" ;; esac
   [[ -z "$verdict" && "$output" == "dry" ]] && verdict="no-output"
 
+  # DIVE-4342: the account wall is MEASURED here, like `output`, and owes nothing
+  # to the tick. That is the whole point — on the box this was reported from the
+  # tick was not armed, every inherited class was therefore `unobserved`, and
+  # this surface still printed a seat that could not spend a token as healthy.
+  # It overrides the inherited class in BOTH directions: it beats a green one,
+  # and it beats a `quota-lapsed` downgrade, because a pane refusal whose
+  # deadline has passed says nothing about an account measured at 101% now.
+  if [[ -n "$wall" ]]; then
+    cls="quota-exhausted"; cause="account-usage"; detail="$wall"; verdict="quota-exhausted"
+  fi
+
   local state_note sup_line
   case "$verdict" in
     "") case "$output" in
@@ -897,7 +959,11 @@ _sup_info_status() {
 
   local age_s=$(( now > row && row > 0 ? now - row : -1 ))
   local tick_age_s=$(( now > tick && tick > 0 ? now - tick : -1 ))
-  if [[ "$store" != "true" ]]; then
+  if [[ -n "$wall" ]]; then
+    # Deliberately FIRST: the three branches below all describe how fresh the
+    # TICK is, and this reading did not come from the tick.
+    sup_line="quota-exhausted / account-usage — ${wall} (measured from the account-usage snapshot, not from the supervisor tick)"
+  elif [[ "$store" != "true" ]]; then
     sup_line="unobserved — the task store was not readable from here, so NEITHER the event trail nor the output counters were read (this is not an all-clear)"
   elif [[ "$armed" != "true" ]]; then
     sup_line="unobserved — the tick is NOT ARMED on this box, so nothing refreshes this"
@@ -995,7 +1061,14 @@ sup_info_for_agent() {  # <name>
             ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
     IFS=$'\x1f' read -r row rc rcause rdetail <<<"$r"
   fi
-  _sup_info_status "$armed" "$tick" "$row" "$now" "$rc" "$rcause" "$rdetail" "$open" "$days" "$store"
+  # DIVE-4342: seat -> auth profile -> account usage, read unprivileged from the
+  # published snapshot. Empty unless the account is AT the wall right now.
+  local wall="" w_state w_win w_pct w_reset w_age w_note
+  if declare -f quota_wall_seat >/dev/null 2>&1; then
+    IFS=$'\037' read -r w_state w_win w_pct w_reset w_age w_note <<<"$(quota_wall_seat "$name")"
+    [[ "$w_state" == "exhausted" ]] && wall="$(quota_wall_phrase "$w_win" "$w_pct" "$w_reset")"
+  fi
+  _sup_info_status "$armed" "$tick" "$row" "$now" "$rc" "$rcause" "$rdetail" "$open" "$days" "$store" "$wall"
 }
 
 # DIVE-3272: a seat that cannot transact is a FLEET-health event. The entire cost
@@ -1180,6 +1253,14 @@ Classification (conservative — see docs/fleet-supervisor-design.md §4):
                   (Recommended); paged otherwise.
   quota-exhausted pane shows a model-capacity/quota refusal (cause:
                   quota-exhausted) — a fleet event, not the seat's own; alerts
+  unprobed        this run could not READ the seat's pane (it is not root), so
+                  the three top-ranked branches above — verify-challenge,
+                  blocked-on-prompt and the pane-refusal half of
+                  quota-exhausted — did not run. Not a fault claim: it replaces
+                  the word \`healthy\` ONLY, because that word would otherwise be
+                  produced by not having looked (DIVE-4342). Run as root, or
+                  read the summary's DEGRADED mark as "these three signals are
+                  missing from this board".
   stalled         NO active work (no in_progress, no running loop) but a todo
                   task has sat assigned to this agent, untouched, for
                   ${_SUP_T_STRANDED_MIN}m+ (cause: idle-stranded) — gap#3:
@@ -1304,7 +1385,8 @@ _sup_classify() {
         loop_stuck="$7" has_work="$8" act_age="$9" cli_stale="${10}" goal_drift_task="${11}" \
         verify_excerpt="${12}" stranded="${13:-0}" \
         open_rows="${14:-0}" no_output_days="${15:--1}" quota_excerpt="${16:-}" \
-        quota_deadline="${17:-unknown}" prompt_excerpt="${18:-}" prompt_mark="${19:-unmarked}"
+        quota_deadline="${17:-unknown}" prompt_excerpt="${18:-}" prompt_mark="${19:-unmarked}" \
+        account_wall="${20:-}" pane_probe="${21:-ok}"
   # DIVE-3880: the policy lives HERE, in the pure decision, not at the pane
   # probe — the probe owes a distinguishable signal, the classifier owes the
   # verdict (community/wiki/a-fail-open-underneath-a-fail-closed-path-feeds-it-a-lie-in-the-format-it-trusts.md).
@@ -1350,6 +1432,16 @@ _sup_classify() {
     class="stuck"; cause="tmux-dead"; detail="unit active but tmux session '${sess}' gone"
   elif [[ "$poller" == "dead" ]]; then
     class="stuck"; cause="poller-dead"; detail="telegram poller process not running"
+  elif [[ -n "$account_wall" ]]; then
+    # DIVE-4342: the ACCOUNT's own measured usage, above the pane scrape, because
+    # it is better evidence of the same fact and it arrives EARLIER. The pane
+    # branch below can only fire after the seat has tried and been refused —
+    # it reads a refusal in scrollback. This one reads the number the provider
+    # reported: the seat is walled from the first token, not from the first
+    # refusal. Measured on a customer box where `account usage` said 101% and
+    # this classifier said `healthy` because no pane had been refused yet.
+    class="quota-exhausted"; cause="account-usage"
+    detail="auth account measured at the wall: ${account_wall}"
   elif [[ -n "$quota_excerpt" && "$quota_deadline" != "lapsed" ]]; then
     # DIVE-3272: placed ABOVE loop-stuck / no-progress on purpose — a capacity
     # wall EXPLAINS both of those, and the response is different in kind (a
@@ -1407,6 +1499,17 @@ _sup_classify() {
     detail="${stranded} todo task(s) sitting ${_SUP_T_STRANDED_MIN}m+ untouched, no active work"
   else
     detail="idle"
+  fi
+  # DIVE-4342 it.2: LAST, and only over a clean verdict. `healthy` is the one
+  # word this classifier is not entitled to when the pane probes were blind:
+  # verify-challenge, blocked-on-prompt and the pane quota branch sit at the TOP
+  # of the chain above, so a blind pass reaches `healthy` by not having looked.
+  # Ranked under every named fault on purpose — a dead unit, a stuck loop or an
+  # account measured at the wall are all things this DID observe, and replacing
+  # them with "unprobed" would trade a true alarm for a caveat.
+  if [[ "$pane_probe" == "unprobed" && "$class" == "healthy" ]]; then
+    class="unprobed"; cause="pane-unreadable"
+    detail="pane unreadable (needs root): verify-challenge / blocked-on-prompt / pane-refusal did NOT run — observed: ${detail}"
   fi
   printf '%s\x1f%s\x1f%s\n' "$class" "$cause" "$detail"
 }
@@ -1485,10 +1588,15 @@ _sup_agent_record() {
   local goal_drift_task; goal_drift_task=$(_sup_goal_drift "$type" "$home" "$name" "$now" "$act_epoch")
 
   # --- signal: ID/age-verification challenge (DIVE-1127) — pane-scoped tripwire ---
-  local verify_excerpt; verify_excerpt=$(_sup_verify_challenge "$type" "$user" "$sess" "$svc_running")
+  # DIVE-4342 it.2: the RETURN CODE is now load-bearing — rc 3 means the probe
+  # was not allowed to look, which is not the same fact as an empty excerpt.
+  # Captured on its own line because `local x=$(...)` would swallow it.
+  local verify_excerpt verify_rc
+  verify_excerpt=$(_sup_verify_challenge "$type" "$user" "$sess" "$svc_running"); verify_rc=$?
 
   # --- signal: model-capacity refusal in the live pane (DIVE-3272) ---
-  local quota_excerpt; quota_excerpt=$(_sup_quota_pane "$user" "$sess" "$svc_running" "$now")
+  local quota_excerpt quota_rc
+  quota_excerpt=$(_sup_quota_pane "$user" "$sess" "$svc_running" "$now"); quota_rc=$?
   # DIVE-3880: a pane renders a refusal long after it lapses (measured: ops was
   # flagged at 14:17 off a refusal that expired at 14:10, mid-command). The
   # expiry is inside the excerpt itself — read it, and hand the STATE to the
@@ -1524,8 +1632,8 @@ _sup_agent_record() {
   # choice picker right now? Same root tmux hop as the verify/quota probes, and
   # the same false-negative bias: no root, a down unit or a non-claude runtime
   # yields empty and the branch simply never fires.
-  local prompt_excerpt="" prompt_mark="unmarked" prow
-  prow=$(_sup_prompt_pane "$type" "$user" "$sess" "$svc_running")
+  local prompt_excerpt="" prompt_mark="unmarked" prow prompt_rc
+  prow=$(_sup_prompt_pane "$type" "$user" "$sess" "$svc_running"); prompt_rc=$?
   if [[ -n "$prow" ]]; then
     prompt_excerpt="${prow%%$'\x1f'*}"; prompt_mark="${prow##*$'\x1f'}"
     [[ "$prompt_mark" == "recommended" ]] || prompt_mark="unmarked"
@@ -1533,11 +1641,25 @@ _sup_agent_record() {
 
   # --- CLASSIFY (design §4) — see _sup_classify for the decision chain itself.
   local class cause detail crow
+  # DIVE-4342: join the seat's auth account usage. Empty unless the account is
+  # measured AT the wall right now — `unmeasured` and `clear` both pass through
+  # as empty, so a missing snapshot can never invent a class.
+  local _sup_wall="" _sw_state _sw_win _sw_pct _sw_reset _sw_age _sw_note
+  # declare -f guard: a health read must never die on an unsourced helper, and
+  # several harnesses source this file alone.
+  if declare -f quota_wall_seat >/dev/null 2>&1; then
+    IFS=$'\037' read -r _sw_state _sw_win _sw_pct _sw_reset _sw_age _sw_note <<<"$(quota_wall_seat "$name")"
+    [[ "$_sw_state" == "exhausted" ]] && _sup_wall="$(quota_wall_phrase "$_sw_win" "$_sw_pct" "$_sw_reset")"
+  fi
+  # DIVE-4342 it.2: one per-seat verdict out of the three probe return codes.
+  # `unprobed` never invents a fault — it only refuses to let a CLEAN word be
+  # printed by a caller that was never allowed to observe (see _sup_classify).
+  local pane_probe; pane_probe=$(_sup_probe_state "$verify_rc" "$quota_rc" "$prompt_rc")
   crow=$(_sup_classify "$desired" "$svc_running" "$active" "$sess" "$tmux_state" "$poller" \
                         "$loop_stuck" "$has_work" "$act_age" "$_SUP_CLI_STALE" "$goal_drift_task" \
                         "$verify_excerpt" "$stranded" \
                         "$open_rows" "$no_output_days" "$quota_excerpt" "$quota_deadline" \
-                        "$prompt_excerpt" "$prompt_mark")
+                        "$prompt_excerpt" "$prompt_mark" "$_sup_wall" "$pane_probe")
   IFS=$'\x1f' read -r class cause detail <<<"$crow"
 
   jq -cn \
@@ -1553,6 +1675,7 @@ _sup_agent_record() {
     --arg quotaDeadline "$quota_deadline" \
     --arg promptExcerpt "$prompt_excerpt" \
     --arg promptMark "$prompt_mark" \
+    --arg paneProbe "$pane_probe" \
     --argjson openRows "$open_rows" --argjson noOutputDays "$no_output_days" \
     --arg class "$class" --arg cause "$cause" --arg detail "$detail" \
     '{name:$name, type:$type, channels:$channels, unit:$unit,
@@ -1572,7 +1695,12 @@ _sup_agent_record() {
                # whether the HIGHLIGHTED option carries (Recommended). The mark
                # is null when there is no picker to qualify.
                blockedOnPrompt:(if $promptExcerpt == "" then null else $promptExcerpt end),
-               promptRecommended:(if $promptExcerpt == "" then null else ($promptMark == "recommended") end)},
+               promptRecommended:(if $promptExcerpt == "" then null else ($promptMark == "recommended") end),
+               # DIVE-4342 it.2: "ok" = the pane probes ran (or had nothing to
+               # look at); "unprobed" = at least one could not look, so the
+               # three branches above it did not run and a clean reading here
+               # is an ABSENCE OF OBSERVATION, not an observation of absence.
+               paneProbe:$paneProbe},
       classification:$class,
       cause:(if $cause == "" then null else $cause end),
       detail:$detail}'
@@ -1648,6 +1776,13 @@ _sup_summary_line() {
      then " · ⚠ \([.[] | select(.classification == "verify-challenge")] | length) VERIFY-CHALLENGE" else "" end) +
     (if ([.[] | select(.classification == "blocked-on-prompt")] | length) > 0
      then " · ⚠ \([.[] | select(.classification == "blocked-on-prompt")] | length) BLOCKED-ON-PROMPT" else "" end) +
+    # DIVE-4342 it.2: THE DEGRADATION MARK. Counted off the SIGNAL, not the
+    # class, on purpose: a seat that was blind AND independently stuck keeps
+    # `stuck` as its class (the more specific, observed fact) — but this board
+    # still may not imply the pane branches ran for it. So any unprobed seat
+    # degrades the summary, whatever verdict it ended up carrying.
+    (if ([.[] | select(.signals.paneProbe == "unprobed")] | length) > 0
+     then " · ⚠ DEGRADED: \([.[] | select(.signals.paneProbe == "unprobed")] | length) of \(length) seat(s) UNPROBED — this board could not read their panes (run as root for the verify-challenge / blocked-on-prompt / pane-refusal branches)" else "" end) +
     (if $stale == "true" then " · CLI \($cur) STALE (latest \($lat))"
      elif $stale == "unknown" then " · CLI staleness unknown (probe unavailable)"
      else " · CLI \($cur) ok" end) +
@@ -2224,9 +2359,15 @@ _sup_quota_checkpoint_live_tasks() { # <name>
 # _sup_rollup_counts <snap-json>
 # Emits ten tab-separated counts, in this fixed order:
 #   healthy slow stuck drift verify-challenge stalled no-output update-pending
-#   quota-exhausted unclassified
-# `unclassified` is total minus the nine named — it is the invariant that makes
+#   quota-exhausted unprobed unclassified
+# `unclassified` is total minus the ten named — it is the invariant that makes
 # the printed buckets sum to the agent count, and the alarm for a new class.
+#
+# DIVE-4342 it.2: `unprobed` is NAMED here rather than left to fall into
+# `unclassified`. It would have degraded the fleet either way (see
+# _sup_fleet_class), but a heartbeat row that says "1 unclassified" reads as an
+# unknown class needing investigation, and this one is a known state with a
+# known remedy — run the tick as root.
 _sup_rollup_counts() {
   local snap="${1:-[]}"
   jq -r '
@@ -2234,12 +2375,13 @@ _sup_rollup_counts() {
     | ([.[].classification] | group_by(.) | map({key:.[0],value:length}) | from_entries) as $c
     | [ ($c.healthy // 0), ($c.slow // 0), ($c.stuck // 0), ($c.drift // 0),
         ($c["verify-challenge"] // 0), ($c.stalled // 0), ($c["no-output"] // 0),
-        ($c["update-pending"] // 0), ($c["quota-exhausted"] // 0) ]
+        ($c["update-pending"] // 0), ($c["quota-exhausted"] // 0),
+        ($c.unprobed // 0) ]
     | . + [ ($total - add) ] | @tsv' <<<"$snap"
 }
 
-# _sup_fleet_class <the ten counts, in _sup_rollup_counts order>
-# The `(fleet)` heartbeat row's verdict. It takes ALL ten deliberately, so the
+# _sup_fleet_class <the eleven counts, in _sup_rollup_counts order>
+# The `(fleet)` heartbeat row's verdict. It takes ALL eleven deliberately, so the
 # classes it does NOT count are an explicit, testable choice rather than an
 # argument someone forgot to pass:
 #   healthy        — the baseline
@@ -2247,10 +2389,13 @@ _sup_rollup_counts() {
 #   update-pending — "an update signal, NOT a wedged agent"; a fleet-wide publish
 #                    would otherwise paint every box degraded for a night
 # Everything else means WORK IS NOT MOVING, and that is what degraded means here.
-_sup_fleet_class() {  # <healthy> <slow> <stuck> <drift> <vchal> <stalled> <nooutput> <updpend> <quota> <other>
+_sup_fleet_class() {  # <healthy> <slow> <stuck> <drift> <vchal> <stalled> <nooutput> <updpend> <quota> <unprobed> <other>
   local slow="${2:-0}" stuck="${3:-0}" vchal="${5:-0}" stalled="${6:-0}"
-  local nooutput="${7:-0}" quota="${9:-0}" other="${10:-0}"
-  (( slow + stuck + vchal + stalled + nooutput + quota + other > 0 )) \
+  local nooutput="${7:-0}" quota="${9:-0}" unprobed="${10:-0}" other="${11:-0}"
+  # DIVE-4342 it.2: `unprobed` degrades. It is NOT a claim that work stopped —
+  # it is the fleet verdict declining to certify a fleet it could not observe,
+  # which is the same reason `other` is in this sum.
+  (( slow + stuck + vchal + stalled + nooutput + quota + unprobed + other > 0 )) \
     && { printf 'degraded'; return; }
   printf 'healthy'
 }
@@ -2627,9 +2772,9 @@ cmd_supervisor_tick() {
   # _sup_rollup_counts. See the comment on that helper for what the hand-picked
   # five cost. `other` (unclassified) is the invariant that keeps this true for
   # a class added after this commit.
-  local total healthy slow stuck drift vchal stalled nooutput updpend quota other
+  local total healthy slow stuck drift vchal stalled nooutput updpend quota unprobed other
   total=$(jq 'length' <<<"$snap")
-  read -r healthy slow stuck drift vchal stalled nooutput updpend quota other \
+  read -r healthy slow stuck drift vchal stalled nooutput updpend quota unprobed other \
     <<<"$(_sup_rollup_counts "$snap")"
 
   # DIVE-975: one 'heartbeat' row per tick — the observation DENOMINATOR. The
@@ -2646,15 +2791,17 @@ cmd_supervisor_tick() {
   # own verdict.
   local fleet_class sig
   fleet_class=$(_sup_fleet_class "$healthy" "$slow" "$stuck" "$drift" "$vchal" \
-                                 "$stalled" "$nooutput" "$updpend" "$quota" "$other")
+                                 "$stalled" "$nooutput" "$updpend" "$quota" \
+                                 "$unprobed" "$other")
   sig=$(jq -nc \
           --argjson t "$total" --argjson h "$healthy" --argjson sl "$slow" \
           --argjson dr "$drift" --argjson st "$stuck" --argjson sa "$stalled" \
           --argjson vc "$vchal" --argjson no "$nooutput" --argjson up "$updpend" \
-          --argjson qe "$quota" --argjson ot "$other" --argjson ev "$events" \
+          --argjson qe "$quota" --argjson un "$unprobed" \
+          --argjson ot "$other" --argjson ev "$events" \
           '{total:$t, healthy:$h, slow:$sl, drift:$dr, stuck:$st, stalled:$sa,
             verifyChallenge:$vc, noOutput:$no, updatePending:$up,
-            quotaExhausted:$qe, unclassified:$ot, anomalyRows:$ev}')
+            quotaExhausted:$qe, unprobed:$un, unclassified:$ot, anomalyRows:$ev}')
   db "INSERT INTO supervisor_events (agent, event, classification, signals)
       VALUES ('(fleet)', 'heartbeat', $(sqlq "$fleet_class"), $(sqlq "$sig"));" \
     2>/dev/null && events=$((events + 1)) || warn "supervisor: heartbeat insert failed"

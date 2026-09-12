@@ -389,6 +389,21 @@ rec() {  # <pane-line> <now>
     # _sup_quota_pane runs and that argument is graded.
     _sup_quota_pane_capture() { printf '%s\n' "$fixture_pane"; }
     _sup_verify_challenge() { :; }
+    # DIVE-4342 it.2: the picker probe is stubbed CLEAN (rc 0) rather than left
+    # to run for real. These arms model a seat whose pane holds the quota line
+    # and nothing else; unstubbed, the real probe runs under this harness's
+    # non-root uid, returns "could not look", and the record correctly comes
+    # back `unprobed` — which is a true statement about the harness and a false
+    # one about the fixture these arms are grading.
+    _sup_prompt_pane() { :; }
+    # DIVE-4342 it.3: stub the ROOT TMUX HOP for the same reason. `tmux_state`
+    # is probed only as root (`sudo -n -u <user> tmux has-session`), so this
+    # fixture's fictional session reads `dead` under a root grader and
+    # `unknown` under an unprivileged one — and `tmux-dead` outranks every
+    # class these arms grade, so six of them said `stuck` on the pre-push rail
+    # (which runs as root) while reading 102/0 at a normal uid. The grader's
+    # uid must not decide what the fixture says.
+    sudo() { return 0; }
     _sup_activity_epoch() { :; }
     _sup_goal_drift() { :; }
     _sup_output_stats() { echo "0|-1"; }
