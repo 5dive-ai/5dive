@@ -3373,8 +3373,27 @@ As with the readability refusal, NO EXIT HERE CHANGES THE DESTINATION: nothing a
     # What is LEFT is exactly the population the audit measured: `decision` and
     # `approval` gates that reach a person and say nothing about what they need
     # from one.
+    #   * a category-floored gate: the floor already said which reserved class it
+    #     belongs to, and refusing it here would make a floored gate unfileable
+    #     rather than declared.
+    #
+    # AND `tier_floored` IS THE WRONG WAY TO ASK THAT — found by quinn's core-tier
+    # sweep (gate_recommend_cap_unit B3, "approve the monthly spend on the paid
+    # Hetzner plan"), and the cap 90 lines below had already written the reason down
+    # in full before this shipped: the T2 category floor only ever runs to RAISE a
+    # tier below 2, so there is nothing for it to raise when the filer TYPED
+    # --tier=2, and a money gate filed at tier 2 arrives here with tier_floored
+    # still 0 — indistinguishable from an undeclared judgement call. Reading the
+    # flag therefore refused exactly the reserved classes the exemption exists for.
+    # Re-run the classifier over the ask AND the title, the same way the cap does.
+    # Not a widening: a floored gate was always meant to be exempt, and this is the
+    # only instrument that answers whether it is floored on this path.
+    local _cu_title=""
+    _cu_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
     if [[ -z "${needs//[[:space:]]/}" && "$type" != "secret" && "$type" != "access" \
-          && "$tier_floored" != "1" ]] && ! _gate_is_human_tap "$type" "$tier" "$needs"; then
+          && "$tier_floored" != "1" ]] \
+       && ! _gate_hit_either _gate_tier2_floor_hit "$ask" "$_cu_title" \
+       && ! _gate_is_human_tap "$type" "$tier" "$needs"; then
       if [[ -z "$ask_ok" ]]; then
         _task_store_audit_log "task need capability-undeclared" "refused" 0 -- \
           "task=$ident" "filer=${actor:-}" "type=$type" "tier=$tier" || true

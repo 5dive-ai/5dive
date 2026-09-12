@@ -115,8 +115,13 @@ for t in tasks gate_history; do
 done
 
 # --- 1. axis=pinned — the filer chose it ---------------------------------------
+# DIVE-4346 takes the AUDITED --ask-ok here rather than --needs=, and the reason is
+# the arm's own subject: `axis=pinned` means THE PIN decided, and the floor was never
+# consulted. Declare a capability and the human-facing-ness has a second source, so
+# the arm stops being able to tell `pinned` from a capability-driven tier. The
+# undeclared shape IS the case being graded, which is what the escape is for.
 seed DIVE-9001 'ordinary title'
-( cmd_task_need DIVE-9001 --type=decision --ask="pick a lane" --options="A|B" --recommend=A --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1 )
+( cmd_task_need DIVE-9001 --type=decision --ask="pick a lane" --options="A|B" --recommend=A --tier=2 --ask-ok="fixture: axis=pinned means the PIN decided and the floor was never consulted; --needs= would give the tier a second source and the arm could no longer tell pinned from capability-driven" --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1 )
 [[ "$(prov DIVE-9001)" == "axis=pinned" && "$(tier_of DIVE-9001)" == "2" ]] \
   && ok_t 'an explicit --tier=2 records axis=pinned (the filer chose the human, not the floor)' \
   || bad_t 'explicit --tier=2 must record axis=pinned' "got [$(prov DIVE-9001)] tier=$(tier_of DIVE-9001)"

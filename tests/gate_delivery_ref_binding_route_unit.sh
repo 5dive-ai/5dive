@@ -207,7 +207,15 @@ done
 # --- 5. INHERITED EXCLUSION: an EXPLICIT --tier=2 is the caller's hard contract --
 seed DIVE-9005 "$PR_REF"
 actor_seam_as dev
+# DIVE-4346: and it takes the AUDITED --ask-ok, not --needs=. This arm's subject is
+# the PIN: an explicit --tier=2 is the caller's own hard-human contract and must stay
+# unrouted on its own. Declaring a capability here would make the capability the
+# reason the gate is human-facing -- which is exactly what arms 3-4 above already
+# grade -- so arm 5 would stop measuring the pin and start duplicating them. The
+# undeclared shape IS the case, so it is bought with a written reason that leaves an
+# audit row. Same judgement as gate_approval_routing_unit A8.
 OUT5=$(cmd_task_need DIVE-9005 --type=approval --tier=2 --ask="$PLAIN_ASK" --recommend="go" \
+         --ask-ok="fixture: this arm grades that an explicit --tier=2 pin alone keeps an approval on the human; --needs= would make the capability the reason and duplicate arms 3-4 instead of measuring the pin" \
          --rubber-stamp-ok="the release window is the founder's call and no lead holds it" --from=dev 2>&1)
 # NON-VACUITY (quinn, iteration 1): a `--tier=2` approval carrying a `--recommend` and
 # no `--rubber-stamp-ok` can be REFUSED at filing by the DIVE-2848 tapback cap, and a
