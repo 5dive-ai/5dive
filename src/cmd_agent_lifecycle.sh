@@ -132,9 +132,10 @@ cmd_rm() {
   # delete under --purge-home) and reports which via _RM_HOME_DISPOSITION.
   _RM_HOME_DISPOSITION="absent"
   _RM_USER_DISPOSITION="absent"
+  _RM_GROUP_DISPOSITION="absent"
   delete_agent_user "$name" "$purge_home"
   step "Updating registry"
-  if [[ "${_RM_USER_DISPOSITION:-absent}" == "present" ]]; then
+  if [[ "${_RM_USER_DISPOSITION:-absent}" == "present" || "${_RM_GROUP_DISPOSITION:-absent}" == "present" ]]; then
     # The row goes anyway — the unit, the env files and the channel secrets are
     # already gone, so keeping the entry would claim a working seat that no
     # longer exists. But it is now an ORPHAN account, which doctor's new
@@ -168,9 +169,14 @@ cmd_rm() {
   # a second `agent rm` cannot reach the survivor at all. Say it in the receipt,
   # say it on stderr, and name the path that can still reap it.
   local _user_state="${_RM_USER_DISPOSITION:-absent}"
+  # Iteration 2: and the group is a THIRD half, because it can survive the
+  # account. `absent` here means never a member; `present` means the membership
+  # outlived the removal and the credentials it scopes are still reachable.
+  local _group_state="${_RM_GROUP_DISPOSITION:-absent}"
   ok "agent '$name' removed." \
-     '{name:$n, removed:true, user:{disposition:$us}, home:({disposition:$hs} + (if $hp == "" then {} else {path:$hp} end))}' \
-     --arg n "$name" --arg us "$_user_state" --arg hs "$_home_state" --arg hp "$_home_path"
+     '{name:$n, removed:true, user:{disposition:$us}, group:{name:$gn, disposition:$gs}, home:({disposition:$hs} + (if $hp == "" then {} else {path:$hp} end))}' \
+     --arg n "$name" --arg us "$_user_state" --arg gs "$_group_state" \
+     --arg gn "${AGENT_SHARED_GROUP:-claude}" --arg hs "$_home_state" --arg hp "$_home_path"
 }
 
 # DIVE-345: move a path aside as <path>.disabled-<ts> (reversible) if present.

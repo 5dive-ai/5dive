@@ -55,10 +55,45 @@ doctor_orphan_units()       { printf '%s' "$UNIT_LINES"; }
 # A --fix must not touch the real box: stand in for the teardown and record it.
 # NOTE: run_check is called in a command substitution, so the stub records to a
 # FILE — an assignment inside that subshell would never reach these assertions.
-REAP_LOG="$TMP/reaped"; : >"$REAP_LOG"; REAP_REFUSE=""
-systemctl() { return 0; }
-id() { [[ -n "$REAP_REFUSE" && "${2:-}" == "agent-${REAP_REFUSE}" ]] && return 0; command id "$@"; }
-delete_agent_user() { printf '%s\n' "$1" >>"$REAP_LOG"; return 0; }
+REAP_LOG="$TMP/reaped"; : >"$REAP_LOG"; REAP_REFUSE=""; REAP_LEAVE_GROUP=""; REAP_LEAVE_UNIT=""
+# ITERATION 2. The stubs MUTATE the three sources, because the verdict under
+# test is now a RE-READ of those sources rather than a probe of `id -u`. A stub
+# that only logged the call could not tell a reap from a no-op, which is
+# precisely how iteration 1 shipped a green `repaired=true` over a survivor.
+#   REAP_REFUSE      — teardown does nothing at all (non-root box)
+#   REAP_LEAVE_GROUP — account deleted, credential-group membership left behind
+#                      (the survivor `id -u` is structurally unable to see)
+#   REAP_LEAVE_UNIT  — systemctl refused; the unit stays listed
+_drop_matching() {  # <source-var> <glob>
+  local var="$1" pat="$2" out="" line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    # shellcheck disable=SC2053
+    [[ "$line" == $pat ]] && continue
+    out+="${out:+$'\n'}$line"
+  done <<<"${!var}"
+  printf -v "$var" '%s' "$out"
+}
+systemctl() {
+  local a nm=""
+  for a in "$@"; do
+    if [[ "$a" == 5dive-agent@*.service ]]; then nm="${a#5dive-agent@}"; nm="${nm%.service}"; fi
+  done
+  [[ -n "$nm" ]] || return 0
+  if [[ "$nm" == "$REAP_REFUSE" || "$nm" == "$REAP_LEAVE_UNIT" ]]; then return 1; fi
+  _drop_matching UNIT_LINES "5dive-agent@${nm}.service *"
+  return 0
+}
+delete_agent_user() {
+  local nm="$1"
+  printf '%s\n' "$nm" >>"$REAP_LOG"
+  [[ "$nm" == "$REAP_REFUSE" ]] && return 1
+  _drop_matching PASSWD_LINES "agent-${nm}:*"
+  [[ "$nm" == "$REAP_LEAVE_GROUP" ]] || _drop_matching GROUP_LINES "agent-${nm}"
+  return 0
+}
+# Restore a fixture after a --fix has consumed it.
+set_sources() { PASSWD_LINES="$1"; GROUP_LINES="$2"; UNIT_LINES="$3"; }
 
 run_check() {
   DOCTOR_CHECKS='[]'
@@ -86,11 +121,16 @@ assert_row "an unreadable registry is UNKNOWN, not clean" warn "UNKNOWN.*unreada
 REG_JSON='{"agents":{"ceo":{},"devops":{}}}'
 
 # 3. The reported shape: orphan accounts still in the credential group.
-PASSWD_LINES=$'agent-ceo:/home/agent-ceo\nagent-cris:/home/agent-cris\nagent-mp:/home/agent-mp'
+CRIS_HOME="$TMP/homes/agent-cris"; mkdir -p "$CRIS_HOME"
+PASSWD_LINES=$'agent-ceo:/home/agent-ceo\nagent-cris:'"$CRIS_HOME"$'\nagent-mp:/home/agent-mp'
 GROUP_LINES=$'agent-ceo\nagent-cris\nagent-mp'
 UNIT_LINES=$'5dive-agent@codex-ivy.service failed'
 assert_row "orphan accounts in the credential group are an ERROR and are named" error \
   "cris.*mp"
+# The home is the half of the finding an operator can act on. Iteration 1
+# collected it and never printed it (shellcheck SC2034 called it dead code).
+assert_row "the orphan's home directory is named in the message" error \
+  "home $CRIS_HOME"
 row=$(run_check)
 jq -e '.message | test("3 agent")' <<<"$row" >/dev/null \
   && ok_t "all three orphans are counted (two accounts + one unit-only)" \
@@ -112,9 +152,8 @@ UNIT_LINES=$'5dive-agent@codex-ivy.service failed'
 assert_row "a stale unit with no account is a named warn" warn "codex-ivy.*unit:failed"
 
 # 5. --fix reaps every orphan through the supported teardown, and says so.
-PASSWD_LINES=$'agent-cris:/home/agent-cris\nagent-mp:/home/agent-mp'
-GROUP_LINES=$'agent-cris'
-UNIT_LINES=""
+FIX_FIXTURE=($'agent-cris:/home/agent-cris\nagent-mp:/home/agent-mp' 'agent-cris' '')
+set_sources "${FIX_FIXTURE[@]}"
 REAP_REFUSE=""; : >"$REAP_LOG"
 row=$(run_check 1)
 jq -e '.severity == "ok" and .repaired == true and (.message | test("reaped 2 orphan"))' <<<"$row" >/dev/null \
@@ -128,12 +167,62 @@ jq -e '.message | test("quarantin")' <<<"$row" >/dev/null \
 
 # 6. A --fix that cannot finish is an error with repaired:false — never a green
 #    row over a survivor, which is the whole failure this task exists for.
+set_sources "${FIX_FIXTURE[@]}"
 REAP_REFUSE="mp"
 row=$(run_check 1)
-jq -e '.severity == "error" and .repaired == false and (.message | test("could not reap 1 of 2"))' <<<"$row" >/dev/null \
+jq -e '.severity == "error" and .repaired == false and (.message | test("could not reap 1 of 2")) and (.message | test("mp"))' <<<"$row" >/dev/null \
   && ok_t "an account that survives --fix keeps the row red" \
   || bad_t "an account that survives --fix keeps the row red" "$row"
 REAP_REFUSE=""
+
+# 6b. THE ITERATION-1 DEFECT, graded directly. The teardown deletes the passwd
+#     entry and leaves the credential-group membership behind. `id -u` reports
+#     the seat gone; the group source still lists it. Iteration 1 asked `id -u`
+#     and printed "ok / repaired=true — accounts deleted (group membership with
+#     them)". The re-read is the only thing that can see this.
+set_sources "${FIX_FIXTURE[@]}"
+REAP_LEAVE_GROUP="cris"
+row=$(run_check 1)
+jq -e '.severity == "error" and .repaired == false and (.message | test("cris"))' <<<"$row" >/dev/null \
+  && ok_t "a survivor id -u cannot see (group membership only) keeps the row red" \
+  || bad_t "a group-only survivor keeps the row red" "$row"
+jq -e '.message | test("group " + env.AGENT_SHARED_GROUP)' <<<"$row" >/dev/null \
+  && ok_t "the surviving membership names the credential group, not a generic failure" \
+  || bad_t "the surviving membership names the credential group" "$row"
+REAP_LEAVE_GROUP=""
+
+# 6c. GROUP-ONLY orphan, whole-loop: no passwd entry at all, so the teardown's
+#     own `id -u` guard is the thing that must not decide the verdict.
+set_sources '' 'agent-ghost' ''
+REAP_LEAVE_GROUP="ghost"
+row=$(run_check 1)
+jq -e '.severity == "error" and .repaired == false and (.message | test("ghost"))' <<<"$row" >/dev/null \
+  && ok_t "a group-only orphan whose membership survives --fix is error, not a green reap" \
+  || bad_t "a group-only orphan that survives --fix is error" "$row"
+REAP_LEAVE_GROUP=""
+set_sources '' 'agent-ghost' ''
+row=$(run_check 1)
+jq -e '.severity == "ok" and .repaired == true' <<<"$row" >/dev/null \
+  && ok_t "a group-only orphan whose membership IS dropped reports repaired" \
+  || bad_t "a group-only orphan that is really reaped reports repaired" "$row"
+
+# 6d. UNIT-ONLY orphan — codex-ivy's shape, this row's own evidence
+#     (5dive-agent@codex-ivy.service, failed since 2026-09-08). A refused
+#     systemctl left the unit exactly where it was while --fix said
+#     "units cleared".
+set_sources '' '' $'5dive-agent@codex-ivy.service failed'
+REAP_LEAVE_UNIT="codex-ivy"
+row=$(run_check 1)
+jq -e '.severity == "error" and .repaired == false and (.message | test("codex-ivy"))' <<<"$row" >/dev/null \
+  && ok_t "a unit that survives --fix is error, never a green 'units cleared'" \
+  || bad_t "a surviving unit keeps the row red" "$row"
+REAP_LEAVE_UNIT=""
+set_sources '' '' $'5dive-agent@codex-ivy.service failed'
+row=$(run_check 1)
+jq -e '.severity == "ok" and .repaired == true and (.message | test("re-read"))' <<<"$row" >/dev/null \
+  && ok_t "a unit that IS cleared reports repaired, and says the verdict is a re-read" \
+  || bad_t "a cleared unit reports repaired" "$row"
+set_sources $'agent-ceo:/home/agent-ceo' 'agent-ceo' ''
 
 # 7. The marketplace enumeration grades registry seats, not /home directories.
 HOMES="$TMP/homes"
@@ -143,7 +232,10 @@ DOCTOR_CHECKS='[]'
 REF=0000000000000000000000000000000000000000
 doctor_check_marketplace_clones "$HOMES" "$REF" ".claude/plugins/marketplaces/5dive-plugins" "ceo devops" >/dev/null 2>&1
 row=$(jq -c '.[] | select(.name == "marketplace-freshness")' <<<"$DOCTOR_CHECKS")
-jq -e '.message | test("agent-ghost")' <<<"$row" >/dev/null \
+# Assert the LABEL, not the bare name: `agent-ghost` also appears in the
+# UNKNOWN bucket on origin/main, so test("agent-ghost") passed there for the
+# wrong reason and would keep passing with the filter deleted.
+jq -e '.message | test("not a live seat[^|]*agent-ghost")' <<<"$row" >/dev/null \
   && ok_t "an orphan home is named as not-a-live-seat, not counted as a stale clone" \
   || bad_t "an orphan home is named as not-a-live-seat" "$row"
 jq -e '.message | test("of 1 ")' <<<"$row" >/dev/null \

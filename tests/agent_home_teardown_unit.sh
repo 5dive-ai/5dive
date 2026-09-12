@@ -292,6 +292,75 @@ delete_agent_user zombie >/dev/null 2>"$TMP/zombie2.err"
   && ok_t "an account that is already gone is 'absent' and writes no audit row" \
   || bad_t "an already-gone account is 'absent'" "disposition='$_RM_USER_DISPOSITION' audited='$AUDITED'"
 
+# ---------------------------------------------------------------------------
+# DIVE-4340 iteration 2 — NO PASSWD ENTRY IS NOT NOTHING LEFT TO DO.
+#
+# `deluser` drops a user from every group, so the account and its membership in
+# the shared credential group normally die together. They come apart in exactly
+# the cases this row exists for: a half-run teardown, a hand-edited group file,
+# a removal that was not `agent rm`. Iteration 1 returned at the `id -u` guard
+# for such a name, left the membership standing, and let doctor --fix report the
+# seat reaped. The membership is the more dangerous half — that group is what
+# this box scopes its shared credentials to.
+# ---------------------------------------------------------------------------
+export AGENT_SHARED_GROUP="fivedive-test"
+# The membership list lives in a FILE, not a variable: the code under test runs
+# gpasswd inside a command substitution (it keeps the tool's own words for the
+# audit row), so a stub that mutated a shell variable would lose the mutation to
+# the subshell and the harness would grade its own seam instead of the product.
+GROUP_FILE="$TMP/group.members"
+GPASSWD_WORKS=1
+set_members() { printf '%s' "$1" >"$GROUP_FILE"; }
+get_members() { cat "$GROUP_FILE" 2>/dev/null; }
+getent() {
+  if [[ "${1:-}" == "group" ]]; then
+    printf '%s:x:9999:%s\n' "$2" "$(get_members)"; return 0
+  fi
+  return 2   # no passwd entry for anyone in this block
+}
+gpasswd() {   # gpasswd -d <user> <group>
+  (( GPASSWD_WORKS )) || { printf 'gpasswd: Permission denied.\n' >&2; return 1; }
+  local u="$2" out="" m; local -a _m=()
+  IFS=',' read -ra _m <<<"$(get_members)"
+  for m in "${_m[@]}"; do [[ "$m" == "$u" ]] && continue; out+="${out:+,}$m"; done
+  set_members "$out"; return 0
+}
+
+set_members "agent-ghost,agent-ceo"
+AUDITED=""; _RM_GROUP_DISPOSITION=""
+delete_agent_user ghost >/dev/null 2>"$TMP/ghost.err"
+[[ "$_RM_GROUP_DISPOSITION" == "dropped" && ",$(get_members)," != *,agent-ghost,* ]] \
+  && ok_t "a name with NO passwd entry still has its credential-group membership dropped" \
+  || bad_t "group membership dropped for a passwd-less name" "disp='$_RM_GROUP_DISPOSITION' members='$(get_members)'"
+[[ -z "$AUDITED" ]] \
+  && ok_t "a successful group drop writes no teardown-failure audit row" \
+  || bad_t "a successful group drop is silent" "audited='$AUDITED'"
+
+# A refused drop (the non-root box) must be LOUD and audited, never silent.
+set_members "agent-ghost,agent-ceo"; GPASSWD_WORKS=0
+AUDITED=""; _RM_GROUP_DISPOSITION=""
+delete_agent_user ghost >/dev/null 2>"$TMP/ghost2.err"
+err=$(cat "$TMP/ghost2.err")
+[[ "$_RM_GROUP_DISPOSITION" == "present" ]] \
+  && ok_t "a membership that survives the drop is reported as 'present'" \
+  || bad_t "a surviving membership is 'present'" "disp='$_RM_GROUP_DISPOSITION'"
+grep -qi "STILL a member" <<<"$err" && grep -q "fivedive-test" <<<"$err" \
+  && ok_t "the surviving membership is loud on stderr and names the group" \
+  || bad_t "the surviving membership is loud and names the group" "$err"
+[[ "$AUDITED" == *os-teardown-incomplete* && "$AUDITED" == *agent-ghost* ]] \
+  && ok_t "a membership that could not be dropped is written to the audit log" \
+  || bad_t "the surviving membership is audited" "audited='$AUDITED'"
+
+# Negative control: a name that was never in the group does nothing at all —
+# this check must not fire on every clean removal.
+set_members "agent-ceo"; GPASSWD_WORKS=1
+AUDITED=""; _RM_GROUP_DISPOSITION=""
+delete_agent_user nosuch >/dev/null 2>"$TMP/ghost3.err"
+[[ "$_RM_GROUP_DISPOSITION" == "absent" && -z "$AUDITED" && ! -s "$TMP/ghost3.err" ]] \
+  && ok_t "a name that was never a group member is 'absent', silent, unaudited" \
+  || bad_t "a non-member is silent" "disp='$_RM_GROUP_DISPOSITION' audited='$AUDITED' err='$(cat "$TMP/ghost3.err")'"
+
+unset -f gpasswd
 unset -f id getent deluser setfacl capability_forget_agent audit_log
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

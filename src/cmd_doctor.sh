@@ -436,31 +436,31 @@ doctor_orphan_units() {
     | awk '{print $1" "$4}'
 }
 
-# doctor_check_orphan_seats [want_fix]
-doctor_check_orphan_seats() {
-  local want_fix="${1:-0}"
-  local reg
-  reg=$(registry_read 2>/dev/null) || reg=""
-  if [[ -z "$reg" ]] || ! jq -e '.agents' >/dev/null 2>&1 <<<"$reg"; then
-    doctor_add registry orphan-seats warn \
-      "UNKNOWN: the registry is unreadable, so agent-* accounts cannot be graded against it — nothing was measured, which is not the same as clean"
-    return 0
-  fi
-
-  local known
-  known=$(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null)
-  _is_known() { local n="$1" k; while IFS= read -r k; do [[ "$k" == "$n" ]] && return 0; done <<<"$known"; return 1; }
-
-  # name -> space-separated markers (user / group / unit:<state>)
+# doctor_collect_orphan_seats <known-names>
+#
+# DIVE-4340 (iteration 2). The three sources are read HERE and only here, so
+# that a caller can ask the same question twice — before a --fix and after it.
+# The first delivery asked it once and then verified the repair with `id -u`,
+# which can only see the passwd class: a group-only or unit-only orphan was
+# reported correctly and then pronounced reaped while it was still there. That
+# is the row's own bug (a green verdict taken from the command's exit path
+# rather than from the state of the box) reproduced one layer up, so the
+# re-read is not an optimisation — it is the check.
+#
+# Prints one TAB-separated `name<TAB>markers<TAB>home` line per orphan, sorted.
+# Empty output means no orphan in ANY of the three sources.
+doctor_collect_orphan_seats() {
+  local known="$1"
   local -A orphan=() orphan_home=()
   local line user home nm state unit
+  _is_known() { local n="$1" k; while IFS= read -r k; do [[ "$k" == "$n" ]] && return 0; done <<<"$known"; return 1; }
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -n "$line" ]] || continue
     user="${line%%:*}"; home="${line#*:}"; nm="${user#agent-}"
     _is_known "$nm" && continue
     orphan["$nm"]="${orphan[$nm]:+${orphan[$nm]},}user"
-    [[ -n "$home" && -d "$home" ]] && orphan_home["$nm"]="$home"
+    [[ -n "$home" && "$home" != "$user" && -d "$home" ]] && orphan_home["$nm"]="$home"
   done < <(doctor_orphan_passwd_users)
 
   while IFS= read -r user || [[ -n "$user" ]]; do
@@ -480,7 +480,48 @@ doctor_check_orphan_seats() {
   done < <(doctor_orphan_units)
 
   unset -f _is_known
-  if (( ${#orphan[@]} == 0 )); then
+  (( ${#orphan[@]} == 0 )) && return 0
+  for nm in $(printf '%s\n' "${!orphan[@]}" | sort); do
+    printf '%s\t%s\t%s\n' "$nm" "${orphan[$nm]}" "${orphan_home[$nm]:-}"
+  done
+}
+
+# doctor_orphan_render <rows...>  ->  "name(markers, home <path>), name(...)"
+#
+# The home is IN the message because it is the half of the finding an operator
+# can act on: "cris(user,group)" tells them a name, "home /home/agent-cris"
+# tells them what is still sitting on the disk. (It was collected and dropped
+# on the floor in iteration 1 — shellcheck SC2034 caught it as dead, and it was
+# also the missing sentence.)
+doctor_orphan_render() {
+  local row nm markers home out=""
+  for row in "$@"; do
+    nm="${row%%$'\t'*}"; markers="${row#*$'\t'}"; home="${markers#*$'\t'}"; markers="${markers%%$'\t'*}"
+    out+="${out:+, }${nm}(${markers}"
+    [[ -n "$home" ]] && out+=", home ${home}"
+    out+=")"
+  done
+  printf '%s' "$out"
+}
+
+# doctor_check_orphan_seats [want_fix]
+doctor_check_orphan_seats() {
+  local want_fix="${1:-0}"
+  local reg
+  reg=$(registry_read 2>/dev/null) || reg=""
+  if [[ -z "$reg" ]] || ! jq -e '.agents' >/dev/null 2>&1 <<<"$reg"; then
+    doctor_add registry orphan-seats warn \
+      "UNKNOWN: the registry is unreadable, so agent-* accounts cannot be graded against it — nothing was measured, which is not the same as clean"
+    return 0
+  fi
+
+  local known
+  known=$(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null)
+
+  local -a rows=()
+  mapfile -t rows < <(doctor_collect_orphan_seats "$known")
+
+  if (( ${#rows[@]} == 0 )); then
     doctor_add registry orphan-seats ok \
       "no orphan agent-* account, group member or unit — every OS seat on this box has a registry entry"
     return 0
@@ -489,18 +530,17 @@ doctor_check_orphan_seats() {
   # Severity is keyed to CONSEQUENCE. An account still inside the credential
   # group is a security-hygiene defect (that group is what the shared
   # credentials are scoped to); a lone stale unit is untidy.
-  local sev=warn n names="" grp_count=0
-  for nm in $(printf '%s\n' "${!orphan[@]}" | sort); do
-    [[ "${orphan[$nm]}" == *group* ]] && grp_count=$((grp_count+1))
-    names+="${names:+, }${nm}(${orphan[$nm]})"
+  local row nm markers n grp_count=0 names
+  for row in "${rows[@]}"; do
+    markers="${row#*$'\t'}"; markers="${markers%%$'\t'*}"
+    [[ "$markers" == *group* ]] && grp_count=$((grp_count+1))
   done
-  (( grp_count > 0 )) && sev=error
-  n=${#orphan[@]}
+  names=$(doctor_orphan_render "${rows[@]}")
+  n=${#rows[@]}
 
-  local repaired=false
   if (( want_fix )); then
-    local failed=0
-    for nm in $(printf '%s\n' "${!orphan[@]}" | sort); do
+    for row in "${rows[@]}"; do
+      nm="${row%%$'\t'*}"
       # Same teardown the supported removal path runs, in the same order:
       # stop + disable the unit, clear its residual failed state, drop the
       # systemd env + channel secrets, then delete the user and QUARANTINE the
@@ -512,25 +552,39 @@ doctor_check_orphan_seats() {
         _RM_HOME_DISPOSITION="absent"; _RM_USER_DISPOSITION="absent"
         delete_agent_user "$nm" 0 >/dev/null 2>&1 || true
       fi
-      if id -u "agent-${nm}" >/dev/null 2>&1; then failed=$((failed+1)); fi
     done
-    if (( failed == 0 )); then
-      repaired=true
+
+    # THE VERDICT IS THE RE-READ, not any exit code above. Whatever the teardown
+    # returned, the only question is whether the same three sources still name
+    # the seat — a survivor in ANY of them (passwd, credential group, unit) is a
+    # survivor, and `id -u` can see exactly one of those three.
+    local -a left=()
+    mapfile -t left < <(doctor_collect_orphan_seats "$known")
+    if (( ${#left[@]} == 0 )); then
       doctor_add registry orphan-seats ok \
-        "reaped $n orphan seat(s): $names — accounts deleted (group membership with them), units cleared, homes quarantined under ${REAPED_DIR:-/home/.5dive-reaped}" true true
+        "reaped $n orphan seat(s): $names — re-read of passwd, group ${AGENT_SHARED_GROUP:-claude} and the 5dive-agent@ units finds none of them left; homes quarantined under ${REAPED_DIR:-/home/.5dive-reaped}" true true
       return 0
     fi
+    local left_names left_grp=0
+    for row in "${left[@]}"; do
+      markers="${row#*$'\t'}"; markers="${markers%%$'\t'*}"
+      [[ "$markers" == *group* ]] && left_grp=$((left_grp+1))
+    done
+    left_names=$(doctor_orphan_render "${left[@]}")
+    local left_clause=""
+    (( left_grp > 0 )) && left_clause=" — ${left_grp} of them STILL in group ${AGENT_SHARED_GROUP:-claude}, the group this box shares its credentials through"
     doctor_add registry orphan-seats error \
-      "could not reap $failed of $n orphan seat(s): $names — rerun as root (sudo 5dive doctor --category=registry --fix); the audit log carries the reason per account" true false
+      "could not reap ${#left[@]} of $n orphan seat(s); still present after the teardown: ${left_names}${left_clause}. Rerun as root (sudo 5dive doctor --category=registry --fix); the audit log carries the reason per account" true false
     return 0
   fi
 
-  local grp_clause=""
+  local sev=warn grp_clause=""
   if (( grp_count > 0 )); then
+    sev=error
     grp_clause=" — ${grp_count} still in group ${AGENT_SHARED_GROUP:-claude}, the group this box shares its credentials through"
   fi
   doctor_add registry orphan-seats "$sev" \
-    "$n agent-* seat(s) exist on the box with NO registry entry: ${names}${grp_clause}. 'agent rm' cannot reach them (the registry row is already gone); run with --fix to delete the accounts and quarantine their homes (DIVE-4340)" true false
+    "$n agent-* seat(s) exist on the box with NO registry entry: ${names}${grp_clause}. 'agent rm' cannot reach them (the registry row is already gone); run with --fix to delete the accounts, clear the units and quarantine their homes (DIVE-4340)" true false
 }
 
 # doctor_check_reaped_homes [dir]
