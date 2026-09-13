@@ -458,6 +458,11 @@ cmd_task_set_body() {
   else
     newbody="$text"
   fi
+  # DIVE-4419: the check is on the RESULT of the edit, so an append that would
+  # cross the cap is refused while a REPLACE that shrinks an oversized row still
+  # lands — that replace is the documented way out, and a guard that blocked it
+  # would trap exactly the rows it exists to prevent.
+  _task_body_size_guard "$newbody" "$ident" "task set-body"
   db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
   local new_len=${#newbody} new_lines=0
   if [[ -n "$newbody" ]]; then
