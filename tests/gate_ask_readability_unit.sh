@@ -296,8 +296,12 @@ file_gate ROOT-1 --type=decision --tier=1 --recommend=A --options="A|B" \
 has_t "G1b: ... and the refusal says how long it ran" "$OUT" "the cap is 25"
 eq_t  "G1c: NO gate was written by the refused filing" "$(field ROOT-1 need_type)" "∅"
 eq_t  "G1d: ... and the task was not moved to blocked" "$(field ROOT-1 status)" "todo"
+# Scoped to the readability rows the way D1c is: a bare `task=ROOT-1` grep also
+# matches the FILING row (`task need filed ok 0 -- task=ROOT-1 … tier=1 …`), so
+# under a mutant that disables the tier-1 arm the gate files and this arm passes
+# on the wrong evidence. Pin the verb, so the row can only be the refusal.
 has_t "G1e: the refusal is audited at the tier it actually ran on" \
-      "$(grep 'task=ROOT-1' "$AUDIT_ROWS")" "tier=1"
+      "$(grep 'ask-readability.*task=ROOT-1' "$AUDIT_ROWS")" "tier=1"
 
 # G2 — THE CONTROL THAT MAKES G1 MEAN SOMETHING. Same filer, same missing lead,
 # a plain one-sentence ask: it must FILE, at tier 1, and reach the human path.
@@ -309,6 +313,22 @@ eq_t "G2: a plain-English unrouted tier-1 gate still files (rc 0)" "$RC" "0"
 eq_t "G2b: ... and it is a real tier-1 decision gate" \
      "$(field ROOT-2 need_type)|$(field ROOT-2 tier)" "decision|1"
 
+# G6 — THE OTHER HALF OF THE SCOPING DECISION, and it is the arm quinn flagged
+# as ungraded on iteration 2. `_ar_t1_only` also excuses the DIVE-4346
+# answerability refusals (preview / code-host-rule), on the reasoning that a
+# tier-1 ask telling an AGENT to open a preview is a fine instruction. That
+# exclusion is in the NOT-refusing direction, so nothing reds when it is dropped
+# unless a fixture carries the shape: this is that fixture. Drop the
+# `_ar_t1_only` guard from the unsatisfiable-preview block and this gate is
+# refused instead of filed.
+seed ROOT-4
+file_gate ROOT-4 --type=decision --tier=1 --recommend="ship it" \
+  --options="ship it|hold it" \
+  --ask="Please open the preview and say whether the new page looks right?"
+eq_t "G6: an unrouted tier-1 gate is NOT graded on answerability (rc 0)" "$RC" "0"
+eq_t "G6b: ... and no answerability refusal was audited for it" \
+     "$(grep -c 'ask-answerable.*task=ROOT-4' "$AUDIT_ROWS")" "0"
+
 # G4 — the escape works here too: a gate must never become unfileable.
 seed ROOT-3
 file_gate ROOT-3 --type=decision --tier=1 \
@@ -319,8 +339,25 @@ has_t "G4b: ... and the escape is recorded" "$(cat "$AUDIT_ROWS")" "ask-readabil
 
 # G5 — THE RENDER. The ping shows one line of the ask, and a status-first ask
 # used to spend it on the status. Graded on the shipped function.
-_g5=$(_task_gate_ask_line "KAWAMi's casing is fixed and shipped. Do we leave it as one line, or build a page?")
-has_t "G5: the rendered ask carries the QUESTION, not just the status" "$_g5" "or build a page?"
+# THE INPUT HAS TO REACH THE LOOP. `_task_gate_ask_line` returns the ask whole on
+# `(( $# <= SOFT_MAX ))`, so anything at or under 18 words never touches the line
+# this fix edits and grades nothing. A discriminating input needs all three: a
+# short FIRST sentence that ends in a full stop, a question sentence that ALSO
+# ends inside SOFT_MAX, and enough trailing text to push the ask past the budget.
+_G5_IN="The casing is fixed and shipped now. Do we leave it or build it? A long trailing clause that runs well past the budget so truncation is forced."
+_g5=$(_task_gate_ask_line "$_G5_IN")
+# eq_t, not has_t: on main this renders the status sentence alone, and a has_t on
+# a substring of the longer render would pass there as soon as the input is long
+# enough to cut. The whole rendered line is the claim.
+eq_t "G5: the rendered ask carries the QUESTION, not just the status" \
+     "$_g5" "The casing is fixed and shipped now. Do we leave it or build it?"
+# THE CONTROL THAT MAKES G5 MEAN SOMETHING: the same input with the question mark
+# turned into a full stop must still render the FIRST sentence only. That is the
+# unchanged DIVE-3661 behaviour, and it pins that this fix moved WHICH end inside
+# the budget wins — not the budget itself.
+_g5d=$(_task_gate_ask_line "${_G5_IN/build it?/build it.}")
+eq_t "G5d: ... and with no question in it, the first sentence still wins" \
+     "$_g5d" "The casing is fixed and shipped now."
 _g5b=$(_task_gate_ask_line "One two three four five six seven. Eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty.")
 eq_t "G5b: an ask with no question mark renders the first sentence as before" \
      "$_g5b" "One two three four five six seven."
