@@ -113,6 +113,54 @@ grep -qE '@5dive-ai/' <<<"$owners" \
   && ok_t "both installer paths carry the SAME single owner" \
   || bad_t "both installer paths carry the same single owner" "owners: $(tr '\n' ' ' <<<"$owners")"
 
+# --- 7b. AND THE OWNER IS LITERALLY @5dive-reviewer, PER PATH.
+# quinn's iteration-1 finding, and it is the finding that mattered: every arm
+# above asserts a SHAPE (an owner exists / is not the App / is not a team / is
+# exactly one), and @lodar satisfies all four — so did a typo'd @5dive-reviewr,
+# which is the DIVE-2144 header's own silently-requests-nobody failure and would
+# leave both installer paths unclearable by ANYONE. A shape arm cannot grade a
+# move; only the name can. Asserted once per path, not on the deduplicated set,
+# because a file that moved one path and not the other passes a set test.
+REVIEWER_LOGIN=5dive-reviewer
+for _p in '/install.sh' '/src/cmd_selfupdate.sh'; do
+  _line=$(grep -E "^${_p//\//\\/}([[:space:]]|$)" "$CO" | tail -1)
+  case "$_line" in
+    *"@${REVIEWER_LOGIN}"*) ok_t "CODEOWNERS names @${REVIEWER_LOGIN} on ${_p}" ;;
+    '') bad_t "CODEOWNERS names @${REVIEWER_LOGIN} on ${_p}" "no owner line for ${_p}" ;;
+    *)  bad_t "CODEOWNERS names @${REVIEWER_LOGIN} on ${_p}" "got: ${_line}" ;;
+  esac
+done
+# and the name in the file is the name the rail speaks as — a rename on either
+# side alone is a rail that attests as a login the file does not name.
+grep -q "@${REVIEWER_LOGIN}" "$CO" && grep -q "actor=${REVIEWER_LOGIN}" "$SRC/cmd_gh.sh" \
+  && ok_t "the attested login and the login the rail announces are the same string" \
+  || bad_t "the attested login and the login the rail announces are the same string" \
+           "CODEOWNERS and cmd_gh.sh disagree on the attester login"
+
+# --- 8. `api user` IS ADMITTED AS A READ, NOT AS A PATH.
+# quinn's iteration-1 finding (3): the allowlist matched on the sub-command only,
+# so `api user -X PATCH` was admitted — and PATCH /user edits the attester's own
+# account. "An attester signs, it does not work" has to be enforced against the
+# METHOD, not just the path. Both directions, because an allowlist that refuses
+# everything is not a rail.
+_allowed()  { _gh_reviewer_allowed "$@" && ok_t  "api-user read admitted: $*" \
+                                        || bad_t "api-user read admitted: $*" "refused a read the rail makes"; }
+_refused()  { _gh_reviewer_allowed "$@" && bad_t "write refused: $*" "ADMITTED a non-read as the attester" \
+                                        || ok_t  "write refused: $*"; }
+_allowed api user
+_allowed api user --jq .login
+_allowed api user -q .login
+_allowed api user --jq=.login
+_refused api user -X PATCH
+_refused api user --method PATCH
+_refused api user -X DELETE
+_refused api user -f name=pwned
+_refused api user -F name=@f
+_refused api user --input -
+_refused api user --jq            # a flag with no value is not a read we can vouch for
+_refused api user/repos
+_refused api users/lodar
+
 echo "-----"
 printf 'gh_reviewer_rail_unit: %d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

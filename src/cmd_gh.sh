@@ -210,7 +210,25 @@ _gh_reviewer_allowed() {
   # account's OWN record and nothing else, so it grants no reach; without it
   # "which login attests our installer path" would be a config read rather than
   # a measurement, which is the failure class DIVE-3135 is about.
-  [[ "${1:-}" == "api" && "${2:-}" == "user" ]]
+  #
+  # AND IT IS ADMITTED AS A READ ONLY. Iteration 1 of this row matched on the
+  # sub-command alone, so `api user -X PATCH` and `api user -f name=...` were
+  # admitted: a path-but-not-method allowlist does not enforce "an attester
+  # signs, it does not work" — `PATCH /user` edits the attester's own account.
+  # The read flags are ALLOWLISTED rather than the mutating ones denied,
+  # because `gh` grows flags and a deny-list silently admits every one it has
+  # not yet heard of (the DIVE-2144 never-requests-anybody shape, one layer
+  # down). The only call this rail makes is `api user --jq .login`.
+  [[ "${1:-}" == "api" && "${2:-}" == "user" ]] || return 1
+  shift 2
+  while (($#)); do
+    case "$1" in
+      --jq|-q|--template|-t) (($# >= 2)) || return 1; shift 2 ;;
+      --jq=*|--template=*|-q=*|-t=*)                   shift   ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
 }
 
 # _gh_caller_credential — 0 when THIS seat actually holds a gh credential.
