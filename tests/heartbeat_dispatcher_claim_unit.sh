@@ -63,7 +63,7 @@ done
 # and this file would then be testing a tick with a disabled guard. Pinned open,
 # every arm below asks exactly the question it asked before.
 # shellcheck source=/dev/null
-source "$SRC/task/pace.sh"
+source "$SRC/task/grader_pool.sh"
 _pace_open_meter(){ printf '{"agents":[{"account":"acct-dev","sevenDayPct":0,"sevenDayResetsAt":99999999999}]}'; }
 _PACE_USAGE_CMD=_pace_open_meter
 

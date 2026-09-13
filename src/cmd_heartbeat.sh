@@ -6572,10 +6572,10 @@ cmd_heartbeat_tick() {
   # paying for -- and fall through to the read anyway: an empty snapshot is the
   # already-tested blind path, so the floor degrades to its safe side rather
   # than to no floor at all.
-  declare -F _pace_band >/dev/null 2>&1 || _hb_log "[pace] PACKAGING DEFECT: _pace_band is not defined in this process — src/task/pace.sh is missing from the bundle manifest (build.sh) or from this harness's source list. The pacing floor cannot grade anything; every account reads BLIND (DIVE-4430)."
+  declare -F _pace_band >/dev/null 2>&1 || _hb_log "[pace] PACKAGING DEFECT: _pace_band is not defined in this process — src/task/grader_pool.sh is missing from the bundle manifest (build.sh) or from this harness's source list. The pacing floor cannot grade anything; every account reads BLIND (DIVE-4430)."
   # Through the TTL cache, not a raw collect: the tick fires every minute and a
   # `usage --json` is a ~4.4s walk of every seat's transcripts. See the cache
-  # note in src/task/pace.sh for why a five-minute-old reading of a SEVEN-DAY
+  # note in src/task/grader_pool.sh for why a five-minute-old reading of a SEVEN-DAY
   # percentage cannot change a band.
   if declare -F _pace_usage_snapshot >/dev/null 2>&1; then
     _HB_PACE_USAGE=$(_pace_usage_snapshot 2>/dev/null || printf '')

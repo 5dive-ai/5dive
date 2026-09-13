@@ -120,7 +120,7 @@ run_tick() {  # run_tick <path-to-cmd_heartbeat.sh> <logfile> [scan-cap-override
     # arm (a PINNED pre-fix cmd_heartbeat.sh, which has no floor at all) is
     # unaffected either way.
     # shellcheck source=/dev/null
-    source "$SRC/task/pace.sh" 2>/dev/null || true
+    source "$SRC/task/grader_pool.sh" 2>/dev/null || true
     _pace_open_meter(){ printf '{"agents":[{"account":"acct","sevenDayPct":0,"sevenDayResetsAt":99999999999}]}'; }
     _PACE_USAGE_CMD=_pace_open_meter
     [[ -n "$cap" ]] && _HB_PICK_SCAN="$cap"

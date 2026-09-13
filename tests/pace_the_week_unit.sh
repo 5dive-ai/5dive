@@ -30,7 +30,7 @@
 #      would be silent.
 #
 # WHY THE BLIND-METER POLICY IS A KNOB AND NOT A CONSTANT — and why `soft` is
-# the default — is argued in full at the top of src/task/pace.sh, against a
+# the default — is argued in full at the top of src/task/grader_pool.sh, against a
 # measurement of the live fleet. Both readings are exercised below, so a future
 # operator who flips it gets a tested path rather than an untested one.
 set -uo pipefail
@@ -46,7 +46,7 @@ trap 'rc=$?; rm -rf "$TMPD"; echo "HARNESS-RC=$rc"' EXIT
 
 # ── A/B/C: the floor itself ────────────────────────────────────────────────
 # shellcheck source=/dev/null
-source src/task/pace.sh
+source src/task/grader_pool.sh
 NOW=1789294364                       # a fixed clock; every reset below is relative to it
 FAR=$(( NOW + 6*86400 ))             # 6 days out — the soft floor binds
 NEAR=$(( NOW + 2*86400 ))            # 2 days out — inside the reset window
@@ -104,7 +104,7 @@ got=$(band 70 "$(( NOW - 86400 ))")
   || bad_ "B: lapsed reset" "expected 2, got ${got}"
 
 # B — the knobs are knobs.
-( FIVE_PACE_7D_SOFT=40; source src/task/pace.sh
+( FIVE_PACE_7D_SOFT=40; source src/task/grader_pool.sh
   rc=0; printf '%s' "$(printf '{"agents":[{"account":"acct","sevenDayPct":45,"sevenDayResetsAt":%s}]}' "$FAR")" \
     | _pace_band acct "$NOW" >/dev/null || rc=$?
   [[ "$rc" == "2" ]] && exit 0 || exit 1 ) \
@@ -328,7 +328,7 @@ fi
 # read never overwrites a good cache with nothing.
 CF="$TMPD/pace-cache.json"
 ( FIVE_PACE_CACHE_FILE="$CF" FIVE_PACE_CACHE_SEC=300
-  source src/task/pace.sh
+  source src/task/grader_pool.sh
   live_a(){ printf '{"agents":[{"account":"acct","sevenDayPct":11}]}'; }
   live_b(){ printf '{"agents":[{"account":"acct","sevenDayPct":22}]}'; }
   live_dead(){ printf ''; return 1; }
