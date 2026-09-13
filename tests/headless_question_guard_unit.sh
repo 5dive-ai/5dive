@@ -160,6 +160,54 @@ PANE_CURSOR_ELSEWHERE=$(printf '  1. Push both, then stop (Recommended)\n❯ 2. 
 printf '%s\n' "$PANE_CURSOR_ELSEWHERE" | _sup_prompt_recommended \
   && { FAIL=$((FAIL+1)); echo "FAIL: arm3: cursor NOT on the Recommended option must not authorise an answer"; } || PASS=$((PASS+1))
 
+# ── DIVE-4405 iteration 2: OUR OWN ECHO MUST NOT READ AS THE CURSOR ─────────
+# The four other pane readers only page. This one ACTS: _sup_prompt_pane feeds
+# its verdict straight to the auto-answer, so a false "recommended" presses
+# Enter on whatever option the model actually left the cursor on. The TUI draws
+# an inbound a2a/alert inside a box whose gutter is a bare '>', which is exactly
+# the cursor glyph this function reads — so an alert quoting "(Recommended)" in
+# its pane-signature excerpt lands as a later, winning cursor row (`tail -1`).
+PANE_ECHO_AFTER_CURSOR=$(printf '%s\n' \
+  '  1. Patch forward (Recommended)' \
+  '❯ 2. Revert and report' \
+  '' \
+  '  ↑/↓ to navigate · Enter to select' \
+  '> [5dive-msg from main] [TRIPWIRE id-verification] agent-dev' \
+  '>   Pane signature: 2. Patch forward (Recommended)')
+printf '%s\n' "$PANE_ECHO_AFTER_CURSOR" | _sup_prompt_recommended \
+  && { FAIL=$((FAIL+1)); echo "FAIL: DIVE-4405: an echoed alert row quoting (Recommended) must not read as the cursor"; } || PASS=$((PASS+1))
+# CONTROL A — the same pane with the two echoed rows deleted is also unmarked,
+# so the arm above grades the FILTER and not a pane that was never markable.
+PANE_ECHO_CONTROL=$(printf '%s\n' \
+  '  1. Patch forward (Recommended)' \
+  '❯ 2. Revert and report' \
+  '' \
+  '  ↑/↓ to navigate · Enter to select')
+printf '%s\n' "$PANE_ECHO_CONTROL" | _sup_prompt_recommended \
+  && { FAIL=$((FAIL+1)); echo "FAIL: DIVE-4405 control: cursor on a non-recommended option must stay unmarked"; } || PASS=$((PASS+1))
+# CONTROL B — POSITIVE. Without this the two arms above pass on a function that
+# fails closed unconditionally (e.g. a filter that eats every line).
+PANE_ECHO_POSITIVE=$(printf '%s\n' \
+  '  1. Revert and report' \
+  '❯ 2. Patch forward (Recommended)' \
+  '' \
+  '  ↑/↓ to navigate · Enter to select' \
+  '> [5dive-msg from main] [TRIPWIRE id-verification] agent-dev' \
+  '>   Pane signature: 1. Revert and report')
+printf '%s\n' "$PANE_ECHO_POSITIVE" | _sup_prompt_recommended \
+  && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL: DIVE-4405 positive: a genuine cursor on (Recommended) must still authorise an answer"; }
+# CONTROL C — the wrap shape. tmux returns WRAPPED rows, so a long alert puts
+# its excerpt on a continuation row that carries no '[TRIPWIRE'/'[5dive-msg'
+# marker at all; only the `Pane signature:` branch of the alternation covers it.
+PANE_ECHO_WRAPPED=$(printf '%s\n' \
+  '  1. Patch forward (Recommended)' \
+  '❯ 2. Revert and report' \
+  '' \
+  '  ↑/↓ to navigate · Enter to select' \
+  '>   Pane signature: 2. Patch forward (Recommended)')
+printf '%s\n' "$PANE_ECHO_WRAPPED" | _sup_prompt_recommended \
+  && { FAIL=$((FAIL+1)); echo "FAIL: DIVE-4405: a WRAPPED continuation row (Pane signature: only) must not read as the cursor"; } || PASS=$((PASS+1))
+
 crow=$(_sup_classify running 1 active agent-dev2 alive n/a 0 1 30 false "" "" 0 0 -1 "" unknown \
          "↑/↓ to navigate · Enter to select" recommended)
 IFS=$'\x1f' read -r cls cause detail <<<"$crow"

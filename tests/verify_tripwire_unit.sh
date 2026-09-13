@@ -105,6 +105,23 @@ t "DIVE-4405: ...even with the TUI message-box gutter in front of it" "clean" \
   "$(hit "  │ ${ALERT_ECHO}")"
 t "DIVE-4405: an echoed [5dive-msg] line is dropped too" "clean" \
   "$(hit '[5dive-msg from main] please verify your identity was the pane signature')"
+# EACH BRANCH OF _SUP_PANE_ECHO_PAT GETS ITS OWN ARM. The alert-echo arms above
+# carry BOTH a '[TRIPWIRE' marker and a 'Pane signature:' excerpt, so either
+# branch alone keeps them green — an alternation is one guard per branch, and a
+# branch no arm can red is a deletable branch. This line carries ONLY the
+# '[TRIPWIRE' marker (a truncated alert, no signature excerpt); deleting
+# TRIPWIRE from the alternation must red it.
+t "DIVE-4405: a [TRIPWIRE line with no signature excerpt is dropped on that marker alone" "clean" \
+  "$(hit '[TRIPWIRE id-verification] agent-dev: To continue, please verify your identity')"
+# THE WRAP SHAPE, and the only arm that grades the `Pane signature:` branch of
+# _SUP_PANE_ECHO_PAT on its own. tmux capture-pane returns WRAPPED rows: a long
+# alert line puts its pane-signature excerpt on a continuation row that carries
+# NO '[TRIPWIRE'/'[5dive-msg' marker — which is precisely how page 2 happened.
+# Deleting `|Pane signature:` from the alternation must red THIS arm.
+t "DIVE-4405: a wrapped continuation row (Pane signature: only, no marker) is dropped" "clean" \
+  "$(hit 'Pane signature: To continue, please verify your identity with a government-issued ID')"
+t "DIVE-4405: ...and with the message-box gutter tmux leaves on the wrapped row" "clean" \
+  "$(hit '>   Pane signature: You must verify your identity before continuing')"
 # POSITIVE CONTROL: the same payload WITHOUT the machine marker still trips, so
 # the arms above prove the drop, not an inert payload.
 t "DIVE-4405 control: the same signature without the marker still trips" "tripped" \

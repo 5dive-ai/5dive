@@ -538,9 +538,14 @@ _sup_prompt_match() {  # <pane-text-on-stdin>
 # Claude marks the selected row with ❯ (or a bare '>' on a terminal without it).
 # No cursor visible => rc 1 => we do not answer, we page. Fail-closed, because
 # the failure mode of guessing is an irreversible choice made by a watchdog.
+# DIVE-4405 (iteration 2): the pre-filter runs HERE TOO, and this is the reader
+# that most needed it. A TUI renders an inbound a2a/alert inside a box whose
+# gutter is a bare '>', so an echoed alert quoting "…(Recommended)" reads as a
+# cursor row and authorises Enter on whatever the model was actually sitting on.
+# The four other pane-text-on-stdin readers only page; this one ACTS.
 _sup_prompt_recommended() {  # <pane-text-on-stdin>
   local line
-  line=$(grep -E '^[[:space:]]*(❯|>)[[:space:]]' 2>/dev/null | tail -1) || return 1
+  line=$(_sup_pane_drop_echoes | grep -E '^[[:space:]]*(❯|>)[[:space:]]' 2>/dev/null | tail -1) || return 1
   [[ -n "$line" ]] || return 1
   [[ "$line" == *"(Recommended)"* ]]
 }
