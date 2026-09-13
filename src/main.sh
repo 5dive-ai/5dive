@@ -167,13 +167,23 @@ Agents:
                                                      # handle instead of numeric id.
   5dive agent <name> tui                             # attach to an interactive agent tmux session (dispatcher-only seats explain the alternative)
   5dive agent logs <name> [--follow] [--lines=N] [--tmux]
-  5dive agent send <name> <text...>|--message=<text>|--message-file=<path>
+  5dive agent send <name> --message-file=<path>|--message-file=-|--message=<text>|<text...>
                                     [--from=<sender>] [--raw] [--wake]
                                     [--reply-to-chat=<id> [--reply-to-msg=<id>]]
-                                                     # --message-file reads the body VERBATIM from a file (DIVE-2627).
-                                                     # Use it for ANY message that quotes CLI verbs: inside a double-quoted
-                                                     # --message=, backtick-quoted verbs RUN as command substitution (as you),
-                                                     # the words are deleted, and the send still prints OK.
+                                                     # --message-file is FIRST because it is the only form your shell
+                                                     # cannot corrupt: the body is read VERBATIM (DIVE-2627), and '-'
+                                                     # reads it from stdin, so no temp file is needed:
+                                                     #     5dive agent send dev --message-file=- <<'EOF'
+                                                     #     ...your text, quotes and all...
+                                                     #     EOF
+                                                     # Write the heredoc with a QUOTED <<'EOF'; an unquoted <<EOF
+                                                     # expands inside the heredoc and is not safe.
+                                                     # --message=<text> / <text...>: SHORT PLAIN TEXT ONLY. Your shell
+                                                     # expands \$VAR, \`cmd\` and \$(cmd) BEFORE 5dive sees them, so
+                                                     # "US\$4,500" is delivered as "US,500" (\$4 is an empty positional)
+                                                     # and a backtick-quoted CLI verb RUNS as you and is deleted from
+                                                     # the text -- and the send still prints OK on both. Anything with
+                                                     # code, currency, a path, a quote or a newline goes in a file.
                                                      # inject a message (tmux send-keys + Enter).
                                                      # When called from another agent, auto-wraps as
                                                      # [5dive-msg from=<caller> id=<id>] so the
@@ -202,11 +212,15 @@ Agents:
                                                      # keystroke that may have been dropped. --json then
                                                      # reports ready=proven, or ready=unprovable for a
                                                      # runtime whose prompt cannot be detected at all.
-  5dive agent ask <name> <text...> [--from=<sender>] [--timeout=120] [--idle-secs=5] [--poll-secs=2]
+  5dive agent ask <name> --message-file=<path>|--message-file=-|--message=<text>|<text...>
+                                   [--from=<sender>] [--timeout=120] [--idle-secs=5] [--poll-secs=2]
                                    [--reply-to-chat=<id> [--reply-to-msg=<id>]]
                                                      # synchronous send + wait. Polls scrollback after
                                                      # the marker line until it stops growing for
                                                      # --idle-secs, then prints the reply body.
+                                                     # Same body flags, same hazard and same order as
+                                                     # 'agent send' above: --message-file (or '-' for
+                                                     # stdin) is the form your shell cannot corrupt.
   5dive agent stats <name>                           # state, restart count, last exit
   5dive agent install <type> [--upgrade]             # install the CLI for a type if missing (--upgrade forces a reinstall)
   5dive agent set-account <agent> <account|default>  # rebind to a named account; "default" clears

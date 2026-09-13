@@ -368,12 +368,103 @@ _GRADER_SEAT_EXPR="CASE WHEN s.detail LIKE 'grader session on %'
                   ELSE substr(s.detail,19) END
         ELSE '' END"
 
-# The in-flight predicate, shared verbatim with the account-wide cap below.
-# DELIBERATELY THE SAME EXPRESSION, not a second opinion: if the two disagreed,
-# the lane would refuse on one count and spread on the other, and no reader could
-# say which number the plan line meant. See the long DIVE-4322 note on the cap
+# ── DIVE-4418: a grade that never reaches a verdict must not pin its slot ──
+#
+# Every exit below is an EVENT THAT HAS TO HAPPEN. A killed session, a seat
+# parked mid-grade, a wake that never landed — none of them emit anything, so
+# before this bound the spawn row stayed in the in-flight set FOREVER and the
+# slot it held was never returned. That is not a hypothetical: DIVE-4322 exists
+# because merge-parked PASSes froze 19 grades for three hours, and DIVE-4410
+# (the commit this sits on) narrows the tolerance from "1 of 4 account slots" to
+# "1 of 2 seats" — one stuck grade is now HALF the lane and two are all of it.
+#
+# WHY SIX HOURS. Measured on the live store 2026-09-13, all 53 `task.grade.spawned`
+# rows ever emitted, spawn -> first task.graded/done/rejected: 52 resolved, p50
+# 0.5h, p90 ~2.6h, max 5.92h (DIVE-4276, a PASS parked on an unmergeable PR —
+# the very close-lag DIVE-4322 then removed from the exit set). Since that fix
+# landed the tail collapsed: the 21 spawns from 2026-09-12 onward all resolved
+# inside 0.84h. Six hours is therefore above every real grade this lane has ever
+# run INCLUDING the pathological one, so the bound cannot cut a live grader off
+# — it only reclaims a slot nothing is using.
+#
+# IT IS A CEILING ON THE COUNT, NOT A KILL. Nothing is signalled to the seat and
+# no session is stopped; a straggler that does finish still emits its verdict and
+# still grades the row. The only thing the bound changes is whether a spawn with
+# no verdict keeps SPENDING capacity, and the answer after six hours is no.
+_GRADER_STALE_HOURS="${_GRADER_STALE_HOURS:-6}"
+
+# Validated in ONE place because the value is env-supplied and reaches three
+# different consumers — two interpolated into SQL and one into a `%d`. A garbage
+# value must degrade to the default everywhere at once; validating at each use
+# site is how a knob ends up meaning 6 in the query and blowing up in the printf.
+_grader_stale_hours() {
+  local h="${_GRADER_STALE_HOURS}"
+  [[ "$h" =~ ^[0-9]+$ ]] && printf '%s' "$h" || printf '6'
+}
+
+# `_grader_inflight_exits_sql` — the in-flight predicate, and the ONE place it
+# lives. Both readers below (`_grader_seat_loads`, and the account-wide cap in
+# the tick) interpolate THIS, so they cannot drift: if they disagreed, the lane
+# would refuse on one count and spread on the other and no reader could say which
+# number the plan line meant.
+#
+# A FUNCTION RATHER THAN A STRING CONSTANT, deliberately. `_GRADER_STALE_HOURS`
+# is env-overridable, and a constant would bake whatever the value was AT SOURCE
+# TIME — so a harness (or an operator) that set the bound after the bundle loaded
+# would get the default and no error. Printing the fragment at call time means the
+# knob is read when the query is built, which is the only moment it can be right.
+#
+# Assumes the spawn row is aliased `s`, and expects its caller to have already
+# selected which spawn rows it cares about. See the long DIVE-4322 note on the cap
 # for why the exit set is the VERDICT (task.graded / a verdict clock strictly
 # later than this spawn) and not the row's close.
+_grader_inflight_exits_sql() {
+  local hours; hours=$(_grader_stale_hours)
+  cat <<SQL
+           AND s.ts >= datetime('now','-${hours} hours')
+           AND NOT EXISTS (SELECT 1 FROM lifecycle_events d
+                            WHERE d.ident=s.ident
+                              AND d.kind IN ('task.done','task.rejected','task.graded')
+                              AND d.id > s.id)
+           AND NOT EXISTS (SELECT 1 FROM tasks t
+                            WHERE t.ident = s.ident
+                              AND (t.status IN ('done','cancelled')
+                                   OR (COALESCE(t.graded_verdict_at,'') > s.ts
+                                       AND (COALESCE(t.graded_verdict,'') <> ''
+                                            OR COALESCE(t.merge_owner,'') <> ''))))
+SQL
+}
+
+# `_grader_stale_spawns` — the spawns the bound just dropped, so the plan can SAY
+# so. A SILENT EXPIRY IS THE SAME FAILURE WITH A DIFFERENT CLOCK: a lane that
+# quietly stops counting a grade looks exactly like a lane that never had one,
+# and the reason DIVE-4322 took three hours to find is that nothing on the board
+# said a slot was gone. Same rows as the predicate above, with the age test
+# INVERTED and everything else identical — a spawn that exited normally is not
+# stale, it is finished, and must never appear here.
+_grader_stale_spawns() {  # -> "<ident><US><spawn ts><US><age hours>" per dropped spawn
+  local hours; hours=$(_grader_stale_hours)
+  db "SELECT s.ident||x'1f'||s.ts||x'1f'||CAST(ROUND((julianday('now')-julianday(s.ts))*24,1) AS TEXT)
+        FROM lifecycle_events s
+       WHERE s.kind='task.grade.spawned'
+         AND s.id = (SELECT MAX(x.id) FROM lifecycle_events x
+                      WHERE x.ident = s.ident AND x.kind='task.grade.spawned')
+         AND s.ts < datetime('now','-${hours} hours')
+         AND NOT EXISTS (SELECT 1 FROM lifecycle_events d
+                          WHERE d.ident=s.ident
+                            AND d.kind IN ('task.done','task.rejected','task.graded')
+                            AND d.id > s.id)
+         AND NOT EXISTS (SELECT 1 FROM tasks t
+                          WHERE t.ident = s.ident
+                            AND (t.status IN ('done','cancelled')
+                                 OR (COALESCE(t.graded_verdict_at,'') > s.ts
+                                     AND (COALESCE(t.graded_verdict,'') <> ''
+                                          OR COALESCE(t.merge_owner,'') <> ''))))
+       ORDER BY s.ts;" 2>/dev/null || printf ''
+}
+
+# The in-flight predicate is `_grader_inflight_exits_sql`, shared with the
+# account-wide cap below.
 #
 # One row per ident (`s.id = MAX(id) for that ident`) rather than DISTINCT,
 # because here the rows must be GROUPED by seat: a re-spawn that moved an ident
@@ -387,16 +478,7 @@ _grader_seat_loads() {  # → "<seat><US><n>" per busy pool seat
          WHERE s.kind='task.grade.spawned'
            AND s.id = (SELECT MAX(x.id) FROM lifecycle_events x
                         WHERE x.ident = s.ident AND x.kind='task.grade.spawned')
-           AND NOT EXISTS (SELECT 1 FROM lifecycle_events d
-                            WHERE d.ident=s.ident
-                              AND d.kind IN ('task.done','task.rejected','task.graded')
-                              AND d.id > s.id)
-           AND NOT EXISTS (SELECT 1 FROM tasks t
-                            WHERE t.ident = s.ident
-                              AND (t.status IN ('done','cancelled')
-                                   OR (COALESCE(t.graded_verdict_at,'') > s.ts
-                                       AND (COALESCE(t.graded_verdict,'') <> ''
-                                            OR COALESCE(t.merge_owner,'') <> ''))))
+$(_grader_inflight_exits_sql)
       ) WHERE seat<>'' GROUP BY seat;" 2>/dev/null || printf ''
 }
 
@@ -596,19 +678,32 @@ cmd_task_grader_tick() {
   # The count is COUNT(DISTINCT s.ident), not COUNT(*): DIVE-4281 de-dupes a
   # double spawn on one ident so two ledger rows cannot eat two slots. Both
   # rows guard this one expression — keep the DISTINCT and the exits together.
+  #
+  # DIVE-4418: the exit set is no longer written out here. It lives in
+  # `_grader_inflight_exits_sql` — the ONE place — because the per-seat load
+  # query above reads the same set, and a bound added to one copy and not the
+  # other would make the cap and the spread disagree about which grades exist.
+  # That fragment also carries the staleness bound; read its note for why six
+  # hours and why it cannot cut a live grader off.
   local inflight; inflight=$(db "SELECT COUNT(DISTINCT s.ident) FROM lifecycle_events s
                                   WHERE s.kind='task.grade.spawned'
-                                    AND NOT EXISTS (SELECT 1 FROM lifecycle_events d
-                                                     WHERE d.ident=s.ident
-                                                       AND d.kind IN ('task.done','task.rejected','task.graded')
-                                                       AND d.id > s.id)
-                                    AND NOT EXISTS (SELECT 1 FROM tasks t
-                                                     WHERE t.ident = s.ident
-                                                       AND (t.status IN ('done','cancelled')
-                                                            OR (COALESCE(t.graded_verdict_at,'') > s.ts
-                                                                AND (COALESCE(t.graded_verdict,'') <> ''
-                                                                     OR COALESCE(t.merge_owner,'') <> ''))));" 2>/dev/null || printf 0)
+$(_grader_inflight_exits_sql)
+                                ;" 2>/dev/null || printf 0)
   [[ "$inflight" =~ ^[0-9]+$ ]] || inflight=0
+
+  # ══ THE DROP IS ANNOUNCED, NEVER SILENT ══
+  # Read BEFORE the pending loop and printed at the TOP of the plan, so a reader
+  # who is trying to explain why the lane had capacity (or why a grade never came
+  # back) sees the reclaimed slots before the decisions they paid for. Read-only
+  # in every mode — this is the dry-run's answer too, since the bound changes what
+  # the plan SAYS and a plan that hid it would be the wrong plan.
+  local n_stale=0 _st_ident _st_ts _st_age stale_h
+  stale_h=$(_grader_stale_hours)
+  while IFS=$'\x1f' read -r _st_ident _st_ts _st_age; do
+    [[ -n "$_st_ident" ]] || continue
+    n_stale=$((n_stale+1))
+    plan+="stale   $_st_ident  (spawned $_st_ts, ${_st_age}h ago — past the ${stale_h}h bound, no longer counted in flight; its slot is back)"$'\n'
+  done < <(_grader_stale_spawns)
 
   # DIVE-4410: the same reading, split by seat, plus the round-robin cursor.
   # Read ONCE per tick and then maintained in memory as this pass spawns, so two
@@ -770,14 +865,14 @@ cmd_task_grader_tick() {
   done <<<"$pending"
 
   if (( json )); then
-    printf '{"pending":%d,"spawned":%d,"queued":%d,"dark":%d,"cap":%d,"commit":%s,"pool":"%s"}\n' \
-      "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$cap" \
+    printf '{"pending":%d,"spawned":%d,"queued":%d,"dark":%d,"stale":%d,"staleHours":%d,"cap":%d,"commit":%s,"pool":"%s"}\n' \
+      "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_stale" "$stale_h" "$cap" \
       "$( ((commit)) && printf true || printf false )" "$_GRADER_POOL"
     return 0
   fi
   printf '%s' "$plan"
-  printf 'pending=%d spawn=%d queue=%d dark=%d cap=%d %s\n' \
-    "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$cap" \
+  printf 'pending=%d spawn=%d queue=%d dark=%d stale=%d cap=%d %s\n' \
+    "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_stale" "$cap" \
     "$( ((commit)) && printf '(COMMITTED)' || printf '(dry-run — pass --commit to act)' )"
 }
 

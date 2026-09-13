@@ -161,17 +161,47 @@ has "$PAST" "$LQ" \
 # the one this change could actually have broken: that the answer path treats a
 # HELD gate and an unheld one IDENTICALLY. Same refusal, same exit code, on two
 # rows differing only in whether they are inside the hold.
+# THE SIGNED-CLEAR PATH IS STUBBED, AND ITERATION 1 IS WHY. `task answer` reaches
+# for a delegated signer first (src/task/answer.sh, `_task_answer_try_delegated`:
+# `sudo -n /usr/local/bin/5dive _task_answer`), so on a seat that HOLDS the sudo
+# grant the two invocations below go one way and on a seat without it they go
+# another, and quinn's box — which holds none — produced a `warn: the signed clear
+# (_task_answer) refused` in one message and not the other. An arm whose colour is
+# a property of who ran it is not evidence about the diff, so the external is
+# pinned the way every other external here is: a `sudo` that always refuses,
+# ahead on PATH. That is also CI's environment and the strictest of the two, and
+# it makes the comparison below mean what it says on every seat.
+mkdir -p "$TMP/bin"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "sudo: a password is required" >&2' 'exit 1' > "$TMP/bin/sudo"
+chmod +x "$TMP/bin/sudo"
+# `command -v` reads bash's own hash table, which already holds the real sudo, so
+# the check is made in a fresh shell — the same lookup the CLI's own child does.
+[[ "$(PATH="$TMP/bin:$PATH" bash -c 'command -v sudo')" == "$TMP/bin/sudo" ]] \
+  && ok "(e) fixture: the signed-clear external is stubbed, so this arm grades the tree and not the seat" \
+  || bad "(e) fixture: the sudo stub is not ahead on PATH — arm (e) would grade the seat's sudo grant"
 # `rc=$?` on the line AFTER an assignment is dead under `set -e` — the assignment
 # itself is the failing command and the harness is killed before it reads $?.
 ea=""; rca=0; eb=""; rcb=0
-ea=$($CLI task answer "$HELD" --value="done by hand" 2>&1) || rca=$?
-eb=$($CLI task answer "$PAST" --value="done by hand" 2>&1) || rcb=$?
+ea=$(PATH="$TMP/bin:$PATH" $CLI task answer "$HELD" --value="done by hand" 2>&1) || rca=$?
+eb=$(PATH="$TMP/bin:$PATH" $CLI task answer "$PAST" --value="done by hand" 2>&1) || rcb=$?
 [[ "$rca" == "$rcb" ]] \
   && ok "(e) 'task answer' returns the same exit code on a held gate as on an unheld one ($rca)" \
   || bad "(e) 'task answer' exits $rca on a held gate and $rcb on an unheld one — the hold reached the clear path"
-[[ "${ea//$HELD/X}" == "${eb//$PAST/X}" ]] \
-  && ok "(e) and the same message — the hold is invisible to the answer path" \
-  || bad "(e) the answer path says something different about a held gate: $(printf '%s' "$ea" | head -1)"
+# THE FULL-MESSAGE EQUALITY IS GONE ON PURPOSE, and the stub above is not the
+# only reason. `task answer`'s output carries lines from the ENVIRONMENT as well
+# as from the answer path — a sudo refusal, a first-use lecture, a delegation
+# warning — and quinn's rejection is what a byte-for-byte comparison of those two
+# transcripts is worth: it fired on a channel this diff does not own. What this
+# arm means is narrower and is asserted directly: whatever the answer path says,
+# it must not say it DIFFERENTLY because the gate is held, and it must never
+# mention the hold at all. Same exit code above; no reference to the hold here.
+for _m in "$ea" "$eb"; do
+  if printf '%s' "$_m" | grep -qiE 'lead[- ]?hold|with .* until|yours if unanswered'; then
+    bad "(e) 'task answer' mentions the lead hold to the person clearing the gate: $(printf '%s' "$_m" | grep -iE 'lead[- ]?hold|with .* until|yours if unanswered' | head -1)"
+  else
+    ok "(e) 'task answer' says nothing about the hold — it decides reading order, never standing"
+  fi
+done
 # The answer path must not learn the hold exists at all.
 if grep -nE '_task_gate_in_lead_hold|_task_gate_lead_hold' src/task/answer.sh >/dev/null 2>&1; then
   bad "(e) the answer path references the lead hold — the hold must decide reading order, never standing"
@@ -221,6 +251,34 @@ if grep -nE '_GATE_LEAD_REVIEW_HOLD_SECS|-31 minutes|-30 minutes' src/task/inbox
   bad "(g) src/task/inbox.sh restates the hold window instead of calling the predicate"
 else
   ok "(g) no listing surface restates the hold window — they filter on idents the predicate chose"
+fi
+
+# ── (h) THE KEYBOARD-LESS VARIANT CARRIES THE HOLD LINE TOO ─────────────────
+# DIVE-4412 (#927) landed `gate_text_plain` in this same loop while this branch
+# was open: _mirror_post re-sends a gate as PLAIN TEXT when the Bot API rejects
+# the keyboard, and that variant is composed separately. The merge of the two
+# changes is a DECISION, not a mechanical resolution — a hold line appended only
+# to `gate_text` would leave the fallback delivery path saying "needs you" about a
+# gate the lead is still holding, which is precisely the lie this row removes,
+# surviving on the one path #927 exists to fix. This arm pins the resolution so
+# the two changes cannot silently un-integrate on a later rebase.
+# SOURCE arm for arm (g)'s reason and one more: the send is refused outright in a
+# fixture store by DIVE-1506's fail-closed chokepoint, so no assertion here can
+# read a delivered message however the transport is stubbed.
+BODY=$(sed -n "/^_task_inbox_send()/,/^}/p" src/task/inbox.sh)
+if [[ -z "$BODY" ]]; then
+  bad "(h) _task_inbox_send not found in src/task/inbox.sh (renamed?)"
+else
+  printf '%s' "$BODY" | grep -q 'gate_text_plain="\$gate_text"' \
+    && ok "(h) the keyboard-less variant from DIVE-4412 is still composed here" \
+    || bad "(h) gate_text_plain is gone from _task_inbox_send — #927's fallback variant was dropped in a merge"
+  HOLDBLK=$(printf '%s' "$BODY" | sed -n '/_task_gate_lead_hold_line/,/^    fi$/p')
+  printf '%s' "$HOLDBLK" | grep -q 'gate_text+=' \
+    && ok "(h) the hold line is appended to the keyboard variant" \
+    || bad "(h) the hold line never reaches gate_text — the ordinary gate message lost its marking"
+  printf '%s' "$HOLDBLK" | grep -q 'gate_text_plain+=' \
+    && ok "(h) and to the keyboard-less variant — a rejected keyboard cannot strip the marking" \
+    || bad "(h) the hold line is appended to gate_text only: a human whose keyboard was rejected still reads the held gate as 'needs you' (DIVE-4412's fallback path)"
 fi
 
 echo "-----"
