@@ -4243,7 +4243,7 @@ _hb_wake() {
 # coarse (daily/hourly) recurring jobs; minute granularity finer than the tick
 # interval can also be missed. Both documented in the CHANGELOG.
 _hb_materialize_recurring() {
-  local now="$1" minute_start tid sched last_fired policy bound open open_read open_rc stamp_err n_made=0
+  local now="$1" minute_start tid sched last_fired policy bound assignee open open_read open_rc stamp_err n_made=0
   minute_start=$(date -u -d "@${now}" +'%Y-%m-%d %H:%M:00')
   # DIVE-2272: x'1f' + IFS=$'\x1f', NOT '|' + tr + IFS=$'\t'. Tab is an IFS
   # WHITESPACE character, so bash collapses runs of it and an EMPTY field in the
@@ -4255,9 +4255,32 @@ _hb_materialize_recurring() {
   # the materializer silently stopped firing anything. x'1f' is not IFS
   # whitespace, so empty fields survive. Same separator the stall sweeps below
   # already use, for the same reason.
-  while IFS=$'\x1f' read -r tid sched last_fired policy bound; do
+  while IFS=$'\x1f' read -r tid sched last_fired policy bound assignee; do
     [[ -n "$tid" ]] || continue
     _cron_matches "$sched" "$now" || continue
+    # DIVE-4430 — A PACED WEEK GIVES UP THE BEATS FIRST.
+    #
+    # A recurring beat is the cheapest thing to defer and the most expensive
+    # thing to keep: it fires on a clock nobody re-decided, it is never urgent by
+    # construction, and each instance is a full fresh session. So past the soft
+    # floor the slot is not fired at all.
+    #
+    # NOTHING IS STAMPED ON THIS PATH -- not last_fired_at, not last_skipped_at.
+    # DIVE-2273's rule: last_skipped_at means "an open instance suppressed this
+    # slot", the reading table turns that into "a human must close the blocker",
+    # and there is no blocker to close here. An instrument must not report a
+    # cause it did not observe. The slot is simply missed, and the next matching
+    # slot re-asks the meter.
+    if declare -F _pace_band >/dev/null 2>&1 \
+       && { [[ -n "${_HB_PACE_USAGE-}" ]] || [[ "${_PACE_BLIND:-soft}" == "refuse" ]]; }; then
+      local _mz_acct _mz_verdict _mz_rc=0
+      _mz_acct=$(jq -r --arg n "${assignee:-}" '.agents[$n].authProfile // ("@self:" + $n)' <<<"$(registry_read)" 2>/dev/null) || _mz_acct=""
+      _mz_verdict=$(printf '%s' "${_HB_PACE_USAGE-}" | _pace_band "$_mz_acct" "$now") || _mz_rc=$?
+      if (( _mz_rc != 0 )) && ! _pace_admits "$_mz_rc" urgent recurring; then
+        _hb_log "[materializer] $(_hb_ident "$tid") slot at ${minute_start} NOT fired — pacing floor $(_pace_band_name "$_mz_rc") on ${_mz_acct:-<no account>} (assignee ${assignee:-<none>}): ${_mz_verdict}. Nothing stamped; the next matching slot re-asks the meter (DIVE-4430)"
+        continue
+      fi
+    fi
     # Already fired this minute? (string compare on ISO 'YYYY-MM-DD HH:MM:SS';
     # last_fired >= minute_start means a tick already materialized it this minute.)
     if [[ -n "$last_fired" ]] && ! [[ "$last_fired" < "$minute_start" ]]; then
@@ -4358,7 +4381,7 @@ _hb_materialize_recurring() {
     else
       _hb_log "[materializer] $(_hb_ident "$tid") insert failed"
     fi
-  done < <(db "SELECT id||x'1f'||schedule||x'1f'||COALESCE(last_fired_at,'')||x'1f'||COALESCE(on_overlap,'skip')||x'1f'||COALESCE(overlap_bound,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL AND status='todo';" 2>/dev/null)
+  done < <(db "SELECT id||x'1f'||schedule||x'1f'||COALESCE(last_fired_at,'')||x'1f'||COALESCE(on_overlap,'skip')||x'1f'||COALESCE(overlap_bound,'')||x'1f'||COALESCE(assignee,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL AND status='todo';" 2>/dev/null)
   _hb_log "[materializer] pass done — ${n_made} materialized"
   return 0
 }
@@ -6146,6 +6169,149 @@ _hb_loop_ceiling_sweep() {
 # alerts/hard-stops are deduped inside cmd_usage_budget_check, which also
 # refreshes the state cache that `watch` reads. Capture stdout so its summary
 # never leaks into the tick's own output; mirror it into the heartbeat log.
+# ── DIVE-4430 — THE PER-ROW BUDGET, ENFORCED ON A FIGURE THAT IS ACTUALLY THE ROW'S
+#
+# `task set-budget` has existed since DIVE-824 and enforced nothing since
+# DIVE-3343, which removed the guard for a good reason worth restating rather
+# than re-discovering: `_spend_scan_task_ids` keys its window by ASSIGNEE and
+# sums every transcript under that agent's home between started_at and now.
+# Nothing in a transcript says which task a token belonged to, so the charge grew
+# with the row's WALL-CLOCK AGE independent of any work, and two rows open on one
+# agent were each billed that agent's entire spend. A park on that number is a
+# park on the row's age wearing the costume of its work.
+#
+# WHAT CHANGED IS THE SIGNAL, NOT THE APPETITE FOR ENFORCEMENT. DIVE-2058 added
+# a falsifiable cross-check to `usage --json`: every usage-attributed window must
+# intersect at least one /goal DISPATCH of that task, and each row carries
+# `dispatched` — true (a dispatch was found in the window), false (attributed but
+# NO dispatch found: likely misattributed, and rendered as `~N(unverified)`), or
+# null (no pins at all for that agent, so there was nothing to check against).
+#
+# THIS GUARD PARKS ON `dispatched == true` AND ON NOTHING ELSE. false and null are
+# not weaker evidence that the row spent the tokens — they are the absence of
+# evidence, and DIVE-3343 is what parking on the absence looks like. Both are
+# logged, so a row that can never be verified is visible rather than quietly
+# exempt, and neither is ever charged.
+#
+# Three further reads are SKIPS, inherited from the removed guard because each
+# was right:
+#   'none'   -> the explicit per-row carve-out. Spelled, never implied: DIVE-2794
+#               rejected --customer and priority as implicit exemptions, because
+#               an exemption nobody typed is an exemption nobody can audit.
+#   '$...'   -> the cost variant, which belongs to the per-agent cost guard.
+#               Reading it as tokens compares dollars to tokens.
+#   unreadable spend -> NOT-REACHED, never 0 (DIVE-2304). A failed read must not
+#               park a row; that is the same fail-open pointing the other way.
+_HB_TASK_BUDGET_DEFAULT="${FIVE_TASK_BUDGET_DEFAULT:-150000000}"
+
+# Humanise a token count for the ask a human reads. Local and tiny on purpose —
+# the ask must not carry a raw 9-digit integer, and this is not worth a shared
+# helper that a second caller would have to be found for.
+_hb_tok_scale() {
+  local n="${1:-}"
+  [[ "$n" =~ ^[0-9]+$ ]] || { printf '%s' "${n:-?}"; return 0; }
+  if   (( n >= 1000000000 )); then printf '%s.%sB' "$(( n / 1000000000 ))" "$(( (n % 1000000000) / 100000000 ))"
+  elif (( n >= 1000000 ));   then printf '%s.%sM' "$(( n / 1000000 ))"    "$(( (n % 1000000) / 100000 ))"
+  elif (( n >= 1000 ));      then printf '%sk' "$(( n / 1000 ))"
+  else printf '%s' "$n"; fi
+}
+
+# `_hb_task_verified_quota <ident>` — the row's metered tokens, ONLY when the
+# dispatch cross-check verified them. Echoes the integer and returns 0; echoes
+# the reason and returns 1 when there is no verified figure. Reads the tick's
+# single usage snapshot on stdin, so it costs no extra transcript scan.
+_hb_task_verified_quota() {  # <ident>  [<usage-json-on-stdin>]
+  local ident="$1" json out
+  json=$(cat)
+  [[ -n "$json" ]] || { printf 'no usage snapshot this tick'; return 1; }
+  # `(.data // .)` so the same reader works against the CLI envelope and against
+  # a bare fixture. `dispatched == true` is an EXACT test, not a truthiness one:
+  # null must not pass, and in jq `null` is falsy but `select(.dispatched)` would
+  # also admit any non-false value a future field shape introduced.
+  out=$(printf '%s' "$json" | jq -r --arg i "$ident" '
+      (.data // .) | (.tasks // [])
+      | map(select(.ident == $i))
+      | if length == 0 then "none:no attributed turns for this row in the window"
+        else ( map(select(.dispatched == true)) as $v
+               | if ($v | length) == 0
+                 then "none:attributed but UNVERIFIED (no /goal dispatch found in the window) — not chargeable"
+                 else "ok:" + ([$v[].quota | numbers] | add // 0 | floor | tostring) end )
+        end' 2>/dev/null) || { printf 'usage snapshot unparseable'; return 1; }
+  case "$out" in
+    ok:*)   printf '%s' "${out#ok:}"; return 0 ;;
+    none:*) printf '%s' "${out#none:}"; return 1 ;;
+    *)      printf 'usage snapshot unreadable'; return 1 ;;
+  esac
+}
+
+_hb_task_budget_sweep() {  # <usage-json>
+  local usage="${1-}" enforce dflt tier
+  enforce=$(db "SELECT value FROM task_prefs WHERE key='task_budget_enforce';" 2>/dev/null || echo "")
+  [[ "${enforce:-on}" == "off" ]] && return 0
+  # The host pref overrides the built-in default; a MALFORMED pref falls back to
+  # the built-in rather than to "no cap", because an operator who mistyped a cap
+  # meant to have one (DIVE-3341's branch went the other way, when there was no
+  # built-in default to fall back to).
+  dflt=$(db "SELECT value FROM task_prefs WHERE key='task_budget_default';" 2>/dev/null || echo "")
+  [[ "$dflt" =~ ^[1-9][0-9]*$ ]] || dflt="$_HB_TASK_BUDGET_DEFAULT"
+  [[ "$dflt" =~ ^[1-9][0-9]*$ ]] || return 0
+  tier=$(db "SELECT value FROM task_prefs WHERE key='task_budget_gate_tier';" 2>/dev/null || echo "")
+  [[ "$tier" =~ ^[0-2]$ ]] || tier=1
+
+  local row tid tident title prio budget started eff spent age
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\x1f' read -r tid tident title prio budget started <<<"$row"
+    [[ "$tid" =~ ^[0-9]+$ ]] || continue
+    case "$budget" in
+      none|NONE) continue ;;
+      \$*)       continue ;;
+      "")        eff="$dflt" ;;
+      *)         [[ "$budget" =~ ^[1-9][0-9]*$ ]] || continue; eff="$budget" ;;
+    esac
+    if ! spent=$(printf '%s' "$usage" | _hb_task_verified_quota "$tident"); then
+      _hb_log "[task-budget] ${tident} NOT charged — ${spent}. A budget is enforced only on a figure the dispatch cross-check verified (DIVE-2058/DIVE-4430); absence of evidence is not evidence of spend."
+      continue
+    fi
+    [[ "$spent" =~ ^[0-9]+$ ]] || continue
+    (( spent >= eff )) || continue
+
+    age=$(db "SELECT CAST((julianday('now')-julianday($(sqlq "$started")))*24 AS INT);" 2>/dev/null || echo "")
+    local _park_pred="id=${tid} AND status IN ('todo','in_progress') AND parked_at IS NULL"
+    # park_reason states the metric truthfully, and the truth is now different
+    # from DIVE-3341's caveat: this figure IS the row's own, per-turn attributed
+    # and cross-checked against a dispatch of this ident. Say that, and say what
+    # it still excludes, rather than inheriting a warning that no longer applies.
+    local _reason="reached its token budget (${spent}/${eff} metered tok) — parked by the heartbeat (DIVE-4430). The figure is this ROW's own: per-turn attribution, cross-checked against a /goal dispatch of ${tident} inside the reporting window (DIVE-2058). It counts input+output+cache-creation+cache-read, i.e. what the plan meter charges, and it EXCLUDES any Codex turns, whose rollouts are session-cumulative and cannot be assigned to a task window. Raise it with: 5dive task set-budget ${tident} <tokens>, or exempt the row with: 5dive task set-budget ${tident} none."
+    db "BEGIN IMMEDIATE;
+        $(_gate_archive_and_clear_sql task-budget "$_park_pred")
+        UPDATE tasks
+          SET status='blocked', parked_at=datetime('now'),
+              park_reason=$(sqlq "$_reason"),
+              need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL, gate_mode=NULL
+        WHERE ${_park_pred};
+        COMMIT;"
+    db "INSERT INTO task_prefs (key,value) VALUES ('task_budget_trips','1')
+        ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INT)+1 AS TEXT), updated_at=datetime('now');" 2>/dev/null || true
+    # The title rides in the operator LOG, never in the ask: the ask is read by
+    # someone who has never seen our board, and an ident plus a title is two
+    # pieces of our vocabulary in a sentence that has room for neither.
+    _hb_log "[task-budget] ${tident} breached budget (${spent}/${eff} verified metered tok, ${prio}, ~${age:-?}h) — parked + gated: ${title}"
+    ledger_emit "task.budget_enforced" ident="$tident" task_id="$tid" \
+      actor="task-engine" authority="heartbeat" \
+      detail="verified quota ${spent} >= budget ${eff}; row parked and gated at tier ${tier}" 2>/dev/null || true
+    # The gate goes on AFTER the park, because the park clears the gate columns
+    # and would otherwise wipe the gate it just filed.
+    ( cmd_task_need "$tid" --type=decision --tier="$tier" \
+        --options="keep going|stop here" --recommend="stop here" \
+        --ask="A piece of work has now used $(_hb_tok_scale "$spent") of AI capacity against the $(_hb_tok_scale "$eff") we set aside for one job, after about ${age:-?} hours. It has stopped for now. Should it keep going on a bigger allowance, or stop here so someone can look at why it is taking this much?" ) >/dev/null 2>&1 || true
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'')||x'1f'||COALESCE(REPLACE(title,x'1f',' '),'')||x'1f'||COALESCE(priority,'')||x'1f'||COALESCE(task_budget,'')||x'1f'||COALESCE(started_at,'')
+               FROM tasks
+               WHERE status IN ('todo','in_progress') AND kind='standard'
+                 AND parked_at IS NULL AND started_at IS NOT NULL;" 2>/dev/null)
+  return 0
+}
+
 _hb_budget_sweep() {
   local out
   out=$(cmd_usage_budget_check 2>/dev/null) || return 1
@@ -6516,11 +6682,43 @@ cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
-  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0 sk_capped=0 sk_parked=0
+  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0 sk_capped=0 sk_parked=0 sk_pace=0
   local today; today=$(date +%F)   # DIVE-1858 wake-budget day key (YYYY-MM-DD)
   # DIVE-138: materialize due recurring templates FIRST so a freshly-cloned todo
   # is eligible for the wake loop below this same tick. Isolated — a failure here
   # must never abort the wake loop.
+  # DIVE-4430 — THE WEEK'S METER, READ ONCE PER TICK, BEFORE ANYTHING SPENDS IT.
+  #
+  # Read here rather than inside the per-seat loop for the reason the grader pool
+  # reads it once per grader tick: `usage --json` walks every seat's transcripts,
+  # so a per-seat read would be O(seats^2) transcript scans on a 15-seat fleet and
+  # each seat would pace against a different snapshot of the same window.
+  #
+  # A FAILED READ IS EMPTY, and empty is a real state that `_pace_band` treats as
+  # a blind meter — it must never silently become "0% used", which is the exact
+  # fail-open 2026-09-09 measured across 43% of the fleet.
+  #
+  # Deliberately AFTER require_root and BEFORE the materializer: the recurring
+  # beats it fires are the first thing a paced week gives up, so the band has to
+  # exist before they are considered.
+  local _HB_PACE_USAGE="" _HB_PACE_CMD="${_PACE_USAGE_CMD:-sudo -n 5dive usage --json}"
+  # `_pace_band` is bundled with this file (build.sh) and its absence can only
+  # mean a packaging defect or a unit harness that hand-picked its sources. Say
+  # WHICH -- an unnamed missing function is the mystery this codebase keeps
+  # paying for -- and fall through to the read anyway: an empty snapshot is the
+  # already-tested blind path, so the floor degrades to its safe side rather
+  # than to no floor at all.
+  declare -F _pace_band >/dev/null 2>&1 || _hb_log "[pace] PACKAGING DEFECT: _pace_band is not defined in this process — src/task/grader_pool.sh is missing from the bundle manifest (build.sh) or from this harness's source list. The pacing floor cannot grade anything; every account reads BLIND (DIVE-4430)."
+  # Through the TTL cache, not a raw collect: the tick fires every minute and a
+  # `usage --json` is a ~4.4s walk of every seat's transcripts. See the cache
+  # note in src/task/grader_pool.sh for why a five-minute-old reading of a SEVEN-DAY
+  # percentage cannot change a band.
+  if declare -F _pace_usage_snapshot >/dev/null 2>&1; then
+    _HB_PACE_USAGE=$(_pace_usage_snapshot 2>/dev/null || printf '')
+  else
+    _HB_PACE_USAGE=$($_HB_PACE_CMD 2>/dev/null || printf '')
+  fi
+  [[ -n "$_HB_PACE_USAGE" ]] || _hb_log "[pace] the account meter could not be read this tick (${_HB_PACE_CMD}) — every account is treated as BLIND, policy=${_PACE_BLIND:-soft} (a blind meter is never read as 0% used)"
   _hb_materialize_recurring "$now" || _hb_log "[materializer] pass errored (non-fatal)"
   # DIVE-1490: receipt-backed reminder first, so an old gate whose initial send
   # failed gets a button-bearing + group-fallback attempt before the legacy 72h
@@ -6606,6 +6804,9 @@ cmd_heartbeat_tick() {
   # cap and (only if hard-stop is opted in) turn an agent off at the ceiling, and
   # refresh the state cache `watch` reads. Same isolation contract as above.
   _hb_budget_sweep || _hb_log "[budget] pass errored (non-fatal)"
+  # DIVE-4430: the PER-ROW cap, fed the tick's one usage snapshot. Same isolation
+  # contract as every other sweep — it must never abort the wake loop.
+  _hb_task_budget_sweep "$_HB_PACE_USAGE" || _hb_log "[task-budget] pass errored (non-fatal)"
   # DIVE-1434: transport-liveness canary — alarm if any paired claude agent's
   # Telegram poller died (stale beacon => gate-ping taps won't land). Same
   # isolation contract — a failure here must never abort the wake loop.
@@ -6775,6 +6976,39 @@ cmd_heartbeat_tick() {
       # The /goal + every log below must name the task by its DISPLAY ident, not
       # the raw row id — they diverge once a non-default project exists (DIVE-484).
       task_ident=$(_hb_ident "$task_id")
+
+      # --- DIVE-4430 pacing floor ------------------------------------------------
+      # Past the soft floor this seat's account dispatches high|urgent only; past
+      # the hard floor, urgent only. Asked PER CANDIDATE, not per seat, and that
+      # is the whole point: a `continue` here steps to the next candidate in the
+      # same priority order, so an account at 70% still reaches the urgent row
+      # sitting behind two medium ones. Skipping the SEAT would have made the
+      # floor a head-of-line block — DIVE-2716's lesson, paid for once already by
+      # the tier guard (5 held rows blocking 122 runnable ones).
+      #
+      # `_pace_band` is dual-channel like `_grader_window_ok`: verdict on stdout,
+      # DECISION in the exit status. The `|| _pace_rc=$?` is load-bearing — a bare
+      # assignment aborts the whole tick under the bundle's `set -euo pipefail`
+      # the first time an account is anything but open (DIVE-4380).
+      local _pace_acct _pace_verdict _pace_rc=0 _pace_prio
+      _pace_acct=$(jq -r --arg n "$name" '.agents[$n].authProfile // ("@self:" + $n)' <<<"$reg" 2>/dev/null) || _pace_acct=""
+      if declare -F _pace_band >/dev/null 2>&1; then
+        _pace_verdict=$(printf '%s' "$_HB_PACE_USAGE" | _pace_band "$_pace_acct" "$now") || _pace_rc=$?
+      else
+        _pace_verdict="the pacing floor is not loaded in this process (see the PACKAGING DEFECT line above)"; _pace_rc=0
+      fi
+      if (( _pace_rc != 0 )); then
+        # An unreadable priority is NOT a free pass: `_pace_admits` folds an
+        # empty priority into the lowest band, so a row we could not grade is
+        # held rather than waved through.
+        _pace_prio=$(db "SELECT COALESCE(NULLIF(priority,''),'medium') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
+        if ! _pace_admits "$_pace_rc" "$_pace_prio" standard; then
+          sk_pace=$((sk_pace + 1))
+          _hb_log "[$name] ${task_ident} (${_pace_prio:-<priority unreadable>}) HELD by the pacing floor — $(_pace_band_name "$_pace_rc") band: ${_pace_verdict}. Considering the next candidate; exits: 5dive task escalate ${task_id} to push this row through, or raise FIVE_PACE_7D_SOFT/FIVE_PACE_7D_HARD for the week (DIVE-4430)"
+          continue
+        fi
+      fi
+      # --- end DIVE-4430 pacing floor --------------------------------------------
 
     # --- DIVE-1065 tier guard --------------------------------------------------
     # Refuse to AUTO-DRIVE a higher-tier agent from a lower-tier creator's task.
@@ -7236,8 +7470,8 @@ cmd_heartbeat_tick() {
                   | sort_by(.value.heartbeat.lastRunAt // 0)
                   | .[].key' <<<"$reg")
 
-  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / tier-held ${sk_held} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / spend-capped ${sk_capped} / parked-skipped ${sk_parked} / checked ${checked}" \
+  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / tier-held ${sk_held} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / spend-capped ${sk_capped} / parked-skipped ${sk_parked} / pace-held ${sk_pace} / checked ${checked}" \
      '{checked:($c|tonumber), woke:($w|tonumber), slept:($sl|tonumber), sleepArmed:($sa|tonumber), reclaimed:($rc|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
-       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber), tierHeld:($th|tonumber), spendCapped:($sc|tonumber), parked:($pk|tonumber)}}' \
-     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail" --arg th "$sk_held" --arg sc "$sk_capped" --arg pk "$sk_parked"
+       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber), tierHeld:($th|tonumber), spendCapped:($sc|tonumber), parked:($pk|tonumber), paceHeld:($pc|tonumber)}}' \
+     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail" --arg th "$sk_held" --arg sc "$sk_capped" --arg pk "$sk_parked" --arg pc "$sk_pace"
 }
