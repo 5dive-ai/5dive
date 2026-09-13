@@ -41,7 +41,19 @@ INFLIGHT=0
 SEATLOADS=""   # "<seat><US><n>" lines, one per busy pool seat
 LASTPICK=""    # the seat the previous spawn landed on
 US=$'\x1f'
-db(){ case "$*" in
+# DIVE-4418: the staleness bound lives in SQL, so no canned stub can grade it —
+# a stub that returns a number returns the same number whether the bound is there
+# or not. REALDB=1 (set only by that section, at the bottom) routes every read of
+# the SPAWN table at alias `s` — the account cap, the per-seat loads, the cursor
+# and the stale list — into a real sqlite store seeded with real timestamps, so
+# the shipped `datetime('now','-Nh')` clause is the thing under test. Reads of
+# `tasks`, and the pending query (alias `e`), stay canned: routing those would
+# make every arm above depend on a fixture schema they were not written against.
+REALDB=0; STALEDB=""
+db(){ if (( REALDB )) && [[ "$*" == *"lifecycle_events s"* ]]; then
+        sqlite3 "$STALEDB" "$1"; return $?
+      fi
+      case "$*" in
         *grade.requested*)              printf '%s\n' "$PENDING" ;;
         *"GROUP BY seat"*)              printf '%s\n' "$SEATLOADS" ;;
         *"ORDER BY s.id DESC LIMIT 1"*) printf '%s\n' "$LASTPICK" ;;
@@ -592,6 +604,137 @@ PENDING="DIVE-1
 DIVE-2
 DIVE-3"
 _GRADER_POOL="g1"
+
+# ══ DIVE-4418: A SPAWN THAT NEVER REACHES A VERDICT STOPS COUNTING ══════════
+#
+# Every exit in the in-flight predicate is an event that has to HAPPEN, so a
+# killed session emitted nothing and held its slot forever. These arms grade the
+# bound that ends that, and they are the only arms in this file that run against
+# a REAL sqlite store: the bound is `s.ts >= datetime('now','-Nh')`, and against
+# the canned stub above that clause could be deleted without a single assertion
+# moving. Real rows with real timestamps are the only fixture that can tell.
+#
+# THE DISCRIMINATOR IS THE KNOB, NOT THE COUNT. Each arm is run twice over the
+# SAME seeded store — once at the shipped 6h bound and once at 24h, which is
+# longer than the fixture's stale spawn is old. If some other clause were doing
+# the work the two runs would agree; they must not.
+if command -v sqlite3 >/dev/null 2>&1; then
+  STALEDB="$TMPD/stale.db"
+  sqlite3 "$STALEDB" "
+    CREATE TABLE lifecycle_events(id INTEGER PRIMARY KEY, ts TEXT, kind TEXT, ident TEXT, detail TEXT);
+    CREATE TABLE tasks(id INTEGER PRIMARY KEY, ident TEXT, status TEXT,
+                       graded_verdict_at TEXT, graded_verdict TEXT, merge_owner TEXT);
+    -- STALE: spawned 7h ago on g1, no verdict of any kind, row still open.
+    INSERT INTO lifecycle_events VALUES
+      (1, datetime('now','-7 hours'), 'task.grade.spawned', 'DIVE-STALE', 'grader session on g1');
+    -- FRESH: spawned 1h ago on g2, likewise no verdict. Must keep counting.
+    INSERT INTO lifecycle_events VALUES
+      (2, datetime('now','-1 hours'), 'task.grade.spawned', 'DIVE-FRESH', 'grader session on g2');
+    -- GRADED: the ordinary exit, kept as a control so 'stale' cannot be the only
+    -- thing removing rows — if the verdict exit broke, this row would show up in
+    -- the stale list and the arms below would read as passing for the wrong reason.
+    INSERT INTO lifecycle_events VALUES
+      (3, datetime('now','-1 hours'), 'task.grade.spawned', 'DIVE-GRADED', 'grader session on g1'),
+      (4, datetime('now','-30 minutes'), 'task.graded', 'DIVE-GRADED', 'PASS');
+    INSERT INTO tasks(ident,status) VALUES ('DIVE-STALE','todo'),('DIVE-FRESH','todo'),('DIVE-GRADED','todo');"
+  REALDB=1
+  inflight_count(){ db "SELECT COUNT(DISTINCT s.ident) FROM lifecycle_events s
+                          WHERE s.kind='task.grade.spawned'
+$(_grader_inflight_exits_sql)
+                        ;"; }
+
+  _GRADER_STALE_HOURS=6
+  [[ "$(inflight_count)" == 1 ]] \
+    && ok_ 'STALE: at the shipped 6h bound only the fresh spawn counts in flight' \
+    || bad_ 'stale spawn drops out of the account cap' "got: $(inflight_count)"
+  _GRADER_STALE_HOURS=24
+  [[ "$(inflight_count)" == 2 ]] \
+    && ok_ 'STALE: lift the bound past its age and the same spawn counts again — the bound is what dropped it' \
+    || bad_ 'the bound is the discriminator' "got: $(inflight_count)"
+
+  # The GRADED control: it is out at BOTH bounds, so the verdict exit is still
+  # the thing removing it and the age clause did not quietly replace it.
+  _GRADER_STALE_HOURS=24
+  [[ "$(inflight_count)" == 2 ]] \
+    && ok_ 'STALE: a graded spawn stays out even with the age bound lifted (verdict exit intact)' \
+    || bad_ 'verdict exit intact' "got: $(inflight_count)"
+
+  # ── the PER-SEAT reading drops it too, from the SAME fragment ──────────────
+  # This is the half DIVE-4418 was filed to protect: since DIVE-4410 the cap and
+  # the spread are two queries, and a bound in one and not the other would let a
+  # dead grade keep a SEAT busy while the account cap said the lane was free.
+  _GRADER_STALE_HOURS=6
+  loads=$(_grader_seat_loads | tr $'\x1f' '=' | sort | tr '\n' ' ')
+  [[ "$loads" == "g2=1 " ]] \
+    && ok_ 'STALE: the per-seat load also drops the stale spawn — g1 reads idle, g2 busy' \
+    || bad_ 'per-seat load drops the stale spawn' "got: [$loads]"
+  _GRADER_STALE_HOURS=24
+  loads=$(_grader_seat_loads | tr $'\x1f' '=' | sort | tr '\n' ' ')
+  [[ "$loads" == "g1=1 g2=1 " ]] \
+    && ok_ 'STALE: with the bound lifted g1 is busy again — same fragment, both readers' \
+    || bad_ 'per-seat load moves with the bound' "got: [$loads]"
+
+  # ── the drop is NAMED, and only the stale one ─────────────────────────────
+  _GRADER_STALE_HOURS=6
+  stale_idents=$(_grader_stale_spawns | cut -d$'\x1f' -f1 | sort | tr '\n' ' ')
+  [[ "$stale_idents" == "DIVE-STALE " ]] \
+    && ok_ 'STALE: the dropped spawn is named, and the fresh and graded ones are not' \
+    || bad_ 'stale list names exactly the dropped spawn' "got: [$stale_idents]"
+  _GRADER_STALE_HOURS=24
+  [[ -z "$(_grader_stale_spawns)" ]] \
+    && ok_ 'STALE: nothing is reported dropped when the bound has not been crossed' \
+    || bad_ 'no false drops' "got: $(_grader_stale_spawns)"
+
+  # ── the PLAN SAYS SO: a silent expiry is the same failure with a new clock ──
+  _GRADER_STALE_HOURS=6
+  _GRADER_POOL="g1 g2"; PENDING="DIVE-1"
+  out=$(run --cap=9)
+  grep -q '^stale   DIVE-STALE ' <<<"$out" \
+    && ok_ 'STALE: the plan line names the dropped spawn' || bad_ 'plan names the drop' "$out"
+  grep -q 'past the 6h bound' <<<"$out" \
+    && ok_ 'STALE: the plan line says which bound dropped it' || bad_ 'plan names the bound' "$out"
+  grep -q ' stale=1 ' <<<"$out" \
+    && ok_ 'STALE: the summary counts the drop' || bad_ 'summary counts the drop' "$out"
+  outj=$(run --cap=9 --json)
+  [[ "$(printf '%s' "$outj" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["stale"],d["staleHours"])')" == "1 6" ]] \
+    && ok_ 'STALE: --json carries the drop count and the bound it used' || bad_ 'json carries the drop' "$outj"
+
+  # ── THE RECLAIMED SLOT IS REAL CAPACITY, end to end ───────────────────────
+  # cap=2 with two spawns on the books: at 6h one of them is stale, the lane has
+  # a free slot and DIVE-1 spawns. At 24h both count, the cap is full and the
+  # same row queues instead. Nothing else differs between the two runs.
+  _GRADER_STALE_HOURS=6
+  out=$(run --cap=2 --commit)
+  [[ "$(cat "$SPAWNF")" == *":DIVE-1" ]] \
+    && ok_ 'STALE: the reclaimed slot lets a queued delivery spawn' || bad_ 'reclaimed slot spawns' "$(spawns) / $out"
+  _GRADER_STALE_HOURS=24
+  out=$(run --cap=2 --commit)
+  [[ ! -s "$SPAWNF" ]] && grep -q 'queue   DIVE-1' <<<"$out" \
+    && ok_ 'STALE: without the bound that same delivery queues behind the dead grade' \
+    || bad_ 'without the bound it queues' "$(spawns) / $out"
+
+  REALDB=0; _GRADER_STALE_HOURS=6
+  _GRADER_POOL="g1"; PENDING="DIVE-1
+DIVE-2
+DIVE-3"
+else
+  bad_ 'STALE: sqlite3 unavailable — the staleness arms could not run' 'no sqlite3'
+fi
+
+# ── ONE PLACE, and the arm that keeps it one ─────────────────────────────────
+# The bound is only as good as its reach: DIVE-4418's whole risk is a second,
+# unbounded copy of the exit set. So this greys nothing — it reads the SHIPPED
+# function bodies and asserts (a) both readers interpolate the shared fragment,
+# and (b) neither still carries the inline exit test it was cut from. (b) is the
+# load-bearing half: without it, a copy pasted back in beside the call would pass.
+both=$(declare -f _grader_seat_loads; declare -f cmd_task_grader_tick)
+[[ "$(grep -c '_grader_inflight_exits_sql' <<<"$both")" == 2 ]] \
+  && ok_ 'ONE PLACE: the seat-load reader and the account cap both call the shared fragment' \
+  || bad_ 'both readers call the shared fragment' "$(grep -n '_grader_inflight_exits_sql' <<<"$both")"
+grep -q "task.done.,.task.rejected.,.task.graded" <<<"$both" \
+  && bad_ 'ONE PLACE: a reader still carries its own copy of the exit set' \
+       "$(grep -n 'task.rejected' <<<"$both")" \
+  || ok_ 'ONE PLACE: neither reader carries an inline copy of the exit set'
 
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
