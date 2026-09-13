@@ -241,8 +241,40 @@ declare -A RESTART_PATHS=(
   [src/cmd_account.sh]=RESIDUAL
   [src/cmd_auth.sh]=RESIDUAL
 )
+# The candidate set is the TRACKED files, enumerated from git — not a filesystem
+# walk. This is NOT the path filter this arm exists to warn about, and the
+# difference matters: `git ls-files` enumerates the WHOLE repo with no path
+# argument, so a new source file anywhere still arrives here (mutant 9 plants one
+# and this arm still reds). What it excludes is the set that CANNOT carry the
+# defect — untracked and gitignored files, which nothing ships.
+#
+# It is here because a filesystem walk read one in as a finding: `/5dive` is the
+# gitignored 6.2MB CONCATENATED BUILD of everything in src/, so a tree where
+# somebody had built the bundle reported an untriaged restart path that was
+# really the already-triaged sources pasted together, while a fresh CI clone
+# reported nothing. An arm whose verdict depends on whether a build artifact
+# happens to be lying in the tree is not measuring the repo.
+#
+# An instrument failure must NOT read as "nothing to triage" (the `|| true`
+# class): if git cannot answer, the arm fails loudly instead of sweeping an
+# empty candidate set and passing.
+_a1_candidates(){
+  local tracked
+  tracked="$(git -C "$ROOT" ls-files -- . 2>/dev/null)" || { echo "__A1_GIT_FAILED__"; return 0; }
+  [[ -n "$tracked" ]] || { echo "__A1_GIT_FAILED__"; return 0; }
+  printf '%s\n' "$tracked" \
+    | grep -vE '^(tests/|changelog.d/|docs/|CHANGELOG\.md$|node_modules/)' \
+    | while IFS= read -r f; do
+        [[ -f "$ROOT/$f" ]] || continue
+        grep -lE 'systemctl (start|restart) ' "$ROOT/$f" 2>/dev/null
+      done \
+    | sed "s|^${ROOT//|/\\|}/||" | sort -u
+}
+
 found=""
+a1_instrument_ok=1
 while IFS= read -r f; do
+  if [[ "$f" == "__A1_GIT_FAILED__" ]]; then a1_instrument_ok=0; continue; fi
   [[ -n "$f" ]] || continue
   grep -q '5dive-agent@' "$f" || continue
   # The unit on the line must BE an agent unit: spelled out, or built into a
@@ -254,15 +286,15 @@ while IFS= read -r f; do
     | grep -vE '^[[:space:]]*#' \
     | grep -qvE '(warn|echo|printf|doctor_add|fail|_hc_issues)' || continue
   found="${found:+$found }$f"
-done < <(grep -rlE 'systemctl (start|restart) ' \
-           --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=tests \
-           --exclude-dir=changelog.d --exclude-dir=docs --exclude=CHANGELOG.md . 2>/dev/null \
-         | sed 's|^\./||' | sort)
+done < <(_a1_candidates)
 missing=""; extra=""
 for f in $found; do [[ -n "${RESTART_PATHS[$f]:-}" ]] || extra="${extra:+$extra }$f"; done
 for f in "${!RESTART_PATHS[@]}"; do [[ " $found " == *" $f "* ]] || missing="${missing:+$missing }$f"; done
-if [[ -z "$extra" && -z "$missing" ]]; then
-  ok_t "A1 the UNFILTERED sweep: all ${#RESTART_PATHS[@]} agent-unit start/restart paths in the repo are ones this row triaged"
+if [[ "$a1_instrument_ok" != 1 ]]; then
+  bad_t "A1 the sweep could not run — NOT a clean inventory" \
+        "git ls-files returned nothing from $ROOT; the candidate set would have been empty, which must never read as 'no untriaged paths'"
+elif [[ -z "$extra" && -z "$missing" ]]; then
+  ok_t "A1 the UNFILTERED sweep: all ${#RESTART_PATHS[@]} agent-unit start/restart paths tracked in the repo are ones this row triaged"
 else
   bad_t "A1 the restart-path inventory no longer matches the tree" \
         "UNTRIAGED (a new path that can raise an agent — decide whether it must honour a park): ${extra:-none} | GONE (drop it from the inventory): ${missing:-none}"
