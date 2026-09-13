@@ -504,6 +504,82 @@ _plugin_register_registry() {
   return 0
 }
 
+# A box that updated ACROSS DIVE-4202 keeps the marketplace that release stopped
+# writing, and nothing has ever taken it away.
+#
+# DIVE-4202 deleted `_plugin_register_bundled`, so a NEW box has exactly one
+# source for `voice` and `browser`. A box that already carried the `5dive` entry
+# (`kind:local`, `bundled:true`, rooted at `/usr/local/lib/5dive/plugins`) keeps
+# it forever: removing a function stops it WRITING, it does not unwrite what it
+# already wrote. The resolver below then does the right thing with the wrong
+# world — `_plugin_split_ref` finds the name in TWO marketplaces and refuses,
+# exit 5 — so the documented `sudo 5dive plugin add voice` and the install
+# contract's own T1b line are red on every updated box while a fresh docker
+# install stays green, which is why no test saw it (DIVE-4347, then DIVE-4454
+# measured it again on poke-two and exact-swallow at 0.36.0).
+#
+# RETIRING the entry is the honest fix rather than tie-breaking the registry
+# over it. The second source is the residue of code that no longer exists, and
+# its copies are the STALE ones — `browser@5dive` is 1.0.0 with no `serve` —
+# so a tie-break would leave the trap armed for anyone who follows the error's
+# own `name one: browser@5dive` hint, which is the worse bug DIVE-4347 measured.
+#
+# THREE GUARDS, and each is a case this must not fire on:
+#   1. Only an entry the DELETED code wrote: `bundled:true` AND `kind:"local"`.
+#      Nothing else in this tree writes that flag — `marketplace add` does not —
+#      so a local marketplace a user added by hand, even at the same path, is
+#      theirs and stays.
+#   2. Only once the REGISTRY is registered. The clone is best-effort and never
+#      lands on an offline box; pruning there would take away the only source a
+#      name has instead of an ambiguity. One marketplace is not this bug.
+#   3. Never while a plugin is still INSTALLED from it — the refusal
+#      `_plugin_mkt_remove` already makes for a user asking, made here for us
+#      asking. It warns rather than staying silent, because the box then still
+#      has the ambiguity and the operator is the one who can end it.
+#
+# Only our own copy under the store is deleted. The orphan payload at
+# /usr/local/lib/5dive/plugins is inert the moment it is unregistered (nothing
+# resolves it — `_plugin_bundled_dir` went with DIVE-4202), and a root `rm -rf`
+# of a path OUTSIDE `STATE_DIR`, read out of a JSON file, on a code path every
+# plugin verb runs, is not a trade this fix needs to make. It is install.sh's
+# to sweep.
+_plugin_retire_stale_bundled() {
+  local mkts inst; mkts="$(_plugin_mkt_json)"; inst="$(_plugin_installed_json)"
+  jq -e --arg n "$(_plugin_registry_name)" 'has($n)' "$mkts" >/dev/null 2>&1 || return 0
+  local stale; stale=$(jq -r 'to_entries[]
+      | select((.value.bundled == true) and (.value.kind == "local")) | .key' \
+    "$mkts" 2>/dev/null) || return 0
+  [[ -n "$stale" ]] || return 0
+
+  local name still tmp
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    # The name keys a directory we are about to rm -rf. It was validated when it
+    # was written; validate it again where it becomes a path, because the file
+    # it came from is on the box rather than in this repo.
+    _plugin_valid_mkt_name "$name" || continue
+    still=$(jq -r --arg m "$name" '[to_entries[]
+        | select(.value.marketplace == $m) | .key] | join(", ")' "$inst" 2>/dev/null) || still=""
+    if [[ -n "$still" ]]; then
+      warn "marketplace '$name' is the retired bundled one and something still comes from it: $still — leaving it registered, so a bare plugin name stays ambiguous here. Reinstall those from $(_plugin_registry_name) (5dive plugin remove <name>, then 5dive plugin add <name>) and it retires itself."
+      continue
+    fi
+    rm -rf "$(_plugin_mkt_dir)/${name:?}"
+    tmp=$(mktemp)
+    if jq --arg n "$name" 'del(.[$n])' "$mkts" > "$tmp"; then
+      _plugin_publish_json "$tmp" "$mkts" || rm -f "$tmp"
+    else
+      rm -f "$tmp"
+    fi
+  done <<<"$stale"
+  # Explicit for the same reason `_plugin_register_registry`'s is: the last
+  # command above is a conditional inside a loop, every caller is
+  # `_plugin_ensure_store`, and that runs under errexit. Retiring is
+  # best-effort — a box that keeps the stale entry has the bug it had before,
+  # which is strictly better than a plugin verb that dies with no message.
+  return 0
+}
+
 _plugin_ensure_store() {
   require_root
   mkdir -p "$(_plugin_mkt_dir)" "$(_plugin_cache_dir)" "$(_plugin_enabled_dir)"
@@ -514,6 +590,10 @@ _plugin_ensure_store() {
   [[ -f "$(_plugin_installed_json)" ]] || echo '{}' > "$(_plugin_installed_json)"
   chmod 644 "$(_plugin_mkt_json)" "$(_plugin_installed_json)" 2>/dev/null || true
   _plugin_register_registry
+  # AFTER the registry, never before: the retirement below is guarded on the
+  # registry being present, and on a box seeing this release first it is this
+  # call that makes it present.
+  _plugin_retire_stale_bundled
 }
 
 # A marketplace name keys a directory and a config stanza, so it is constrained
