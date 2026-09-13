@@ -1532,8 +1532,16 @@ cmd_task_merge() {
   fi
   [[ -n "$out" ]] && printf '%s\n' "$out" >&2
   (( rc == 0 )) || { mark_reported; return "$rc"; }
+  # An enqueue is not a landing. The primitive says which one happened; saying
+  # "merged" over an enqueue is how a seat closes a row on a merge that has not
+  # happened, and the queue can still eject it.
+  if grep -q '_merge_do: disposition=enqueued' <<<"$out"; then
+    ok "$ident ENQUEUED — the pull request this seat graded PASS is in the target branch's merge queue and NOT yet on it; no second seat was asked. The queue lands it or ejects it — confirm with mergedAt before calling it shipped" \
+       '{ident:$id, merged:false, enqueued:true, actor:$ac}' --arg id "$ident" --arg ac "$actor"
+    return 0
+  fi
   ok "$ident merged — the pull request this seat graded PASS is on the target branch; no second seat was asked" \
-     '{ident:$id, merged:true, actor:$ac}' --arg id "$ident" --arg ac "$actor"
+     '{ident:$id, merged:true, enqueued:false, actor:$ac}' --arg id "$ident" --arg ac "$actor"
 }
 
 # _task_merge_preflight <ident> <actor> — the caller-side refusal texts. Split out
@@ -1607,17 +1615,84 @@ cmd_task_merge_do() {
   tok=$(set -a; . "$_GH_BOT_ENV"; set +a; printf '%s' "${GH_BOT_TOKEN:-}")
   [[ -n "$tok" ]] || fail "$E_GENERIC" "$_GH_BOT_ENV exists but carries no ${_GH_BOT_KEY}."
 
-  local rc=0
-  GH_TOKEN="$tok" GITHUB_TOKEN="" GH_CONFIG_DIR="$(gh_config_dir)" gh pr merge "$pr" --squash || rc=$?
+  local _ghcfg; _ghcfg="$(gh_config_dir)"
+
+  # STEP 1 — ask GitHub how this base branch is governed, in ONE round trip that
+  # also yields the two values an enqueue needs. `mergeQueue` non-null IS the
+  # governance test: this repo protects `main` with a RULESET, which populates no
+  # `branchProtectionRule`, so `requiresMergeQueue` is the wrong field to reach
+  # for. A read that fails leaves every value empty and falls through to the
+  # plain merge below — a governance probe must never be the thing that refuses.
+  local _mq_query _meta _rc_meta=0
+  _mq_query='query($url:URI!){resource(url:$url){... on PullRequest{id headRefOid isInMergeQueue mergeQueue{id}}}}'
+  _meta=$(GH_TOKEN="$tok" GITHUB_TOKEN="" GH_CONFIG_DIR="$_ghcfg" \
+            gh api graphql -f query="$_mq_query" -f url="$pr" 2>/dev/null) || _rc_meta=$?
+  local _pr_id="" _head_oid="" _has_queue="" _already=""
+  if (( _rc_meta == 0 )) && [[ -n "$_meta" ]]; then
+    _pr_id=$(jq -r '.data.resource.id // empty' <<<"$_meta" 2>/dev/null || printf '')
+    _head_oid=$(jq -r '.data.resource.headRefOid // empty' <<<"$_meta" 2>/dev/null || printf '')
+    _has_queue=$(jq -r 'if (.data.resource.mergeQueue|type) == "object" then "1" else "" end' <<<"$_meta" 2>/dev/null || printf '')
+    _already=$(jq -r 'if (.data.resource.isInMergeQueue) == true then "1" else "" end' <<<"$_meta" 2>/dev/null || printf '')
+  fi
+
+  local rc=0 out=""
+
+  # STEP 2 — a queue-governed branch is ENQUEUED, never merged with an explicit
+  # strategy. `gh pr merge --squash` names a strategy the queue owns; GitHub
+  # answers that combination with `The merge strategy for main is set by the
+  # merge queue` and then a GraphQL 500, which reads as an outage and invites a
+  # retry that cannot work (DIVE-4428: four attempts, two pull requests, two
+  # credentials, one failure mode — and two verified-good fixes left for a human
+  # to press by hand). `enqueuePullRequest` returns the entry synchronously, so
+  # the call that enqueues is the call that proves it, and `expectedHeadOid`
+  # pins the graded sha server-side.
+  if [[ -n "$_has_queue" ]]; then
+    if [[ -n "$_already" ]]; then
+      _task_store_audit_log "task merge" "ok" 0 -- "task=$ident" "pr=$pr" "grader=$actor" "actor=$actor" "disposition=already-queued" 2>/dev/null || true
+      printf '%s was ALREADY IN THE MERGE QUEUE before this call — nothing re-enqueued (a second enqueue is a no-op at best). It is NOT on the target branch yet; the queue lands it or ejects it.\n_merge_do: disposition=enqueued\n' "$pr" >&2
+      return 0
+    fi
+    if [[ -z "$_pr_id" || -z "$_head_oid" ]]; then
+      mark_reported
+      printf '_merge_do: %s sits on a MERGE-QUEUE-governed branch, but the pull request node id / head sha could not be read (gh api graphql exited %s), so there is nothing to pin an enqueue to. %s DOES hold merge standing on %s — this is a read failure at GitHub, not a standing refusal. Re-run; if it persists the queue can be read by hand with `gh api graphql -f query=%s -f url=%s`.\n' \
+        "$pr" "$_rc_meta" "$actor" "$ident" "'$_mq_query'" "$pr" >&2
+      return 1
+    fi
+    local _enq_mutation _enq_state=""
+    _enq_mutation='mutation($pr:ID!,$oid:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$pr,expectedHeadOid:$oid}){mergeQueueEntry{state position}}}'
+    out=$(GH_TOKEN="$tok" GITHUB_TOKEN="" GH_CONFIG_DIR="$_ghcfg" \
+            gh api graphql -f query="$_enq_mutation" -f pr="$_pr_id" -f oid="$_head_oid" 2>&1) || rc=$?
+    (( rc == 0 )) && _enq_state=$(jq -r '.data.enqueuePullRequest.mergeQueueEntry.state // empty' <<<"$out" 2>/dev/null || printf '')
+    if (( rc != 0 )) || [[ -z "$_enq_state" ]]; then
+      mark_reported
+      # GitHub's OWN words, verbatim and first. The defect this replaced buried
+      # them under a 500 and a retry suggestion.
+      [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+      printf '_merge_do: ENQUEUE REFUSED for %s (`enqueuePullRequest` exited %s, no queue entry returned) as the machine account. That is GitHub'"'"'s answer above, not a standing refusal — %s DOES hold merge standing on %s here. A required check red or still running, a head that moved since the grade (the enqueue pins %s), and a machine account the queue will not admit all land on this line.\n' \
+        "$pr" "$rc" "$actor" "$ident" "$_head_oid" >&2
+      return "$(( rc != 0 ? rc : 1 ))"
+    fi
+    # Audited as the GRADER's act, not root's: the whole point of the rail is that
+    # the seat that graded is the seat that merged.
+    _task_store_audit_log "task merge" "ok" 0 -- "task=$ident" "pr=$pr" "grader=$actor" "actor=$actor" "disposition=enqueued" 2>/dev/null || true
+    printf '%s ENQUEUED (state=%s, head pinned at %s) by %s (the seat that graded it) as the machine account. This is NOT a landed merge: the queue runs the required checks against a branch that does not exist yet and then lands it OR EJECTS it. Read `mergeQueueEntry` / `mergedAt` before calling it shipped.\n_merge_do: disposition=enqueued\n' \
+      "$pr" "$_enq_state" "$_head_oid" "$actor" >&2
+    return 0
+  fi
+
+  # STEP 3 — no queue on the base branch: the ordinary squash merge, unchanged
+  # except that gh's own message is CAPTURED and reprinted, so a refusal arrives
+  # with its reason instead of a pointer to output that a caller capturing our
+  # stderr may never have shown.
+  out=$(GH_TOKEN="$tok" GITHUB_TOKEN="" GH_CONFIG_DIR="$_ghcfg" gh pr merge "$pr" --squash 2>&1) || rc=$?
+  [[ -n "$out" ]] && printf '%s\n' "$out" >&2
   if (( rc != 0 )); then
     mark_reported
-    printf '_merge_do: `gh pr merge %s --squash` exited %s as the machine account. That is GitHub'"'"'s answer, not a standing refusal — %s DOES hold merge standing on %s here. A required check that is red or still running, a protected branch the machine account cannot merge, and a conflict all land on this line; read gh'"'"'s message above.\n' \
+    printf '_merge_do: `gh pr merge %s --squash` exited %s as the machine account. That is GitHub'"'"'s answer above, not a standing refusal — %s DOES hold merge standing on %s here. A required check that is red or still running, a protected branch the machine account cannot merge, and a conflict all land on this line.\n' \
       "$pr" "$rc" "$actor" "$ident" >&2
     return "$rc"
   fi
-  # Audited as the GRADER's act, not root's: the whole point of the rail is that
-  # the seat that graded is the seat that merged.
-  _task_store_audit_log "task merge" "ok" 0 -- "task=$ident" "pr=$pr" "grader=$actor" "actor=$actor" 2>/dev/null || true
+  _task_store_audit_log "task merge" "ok" 0 -- "task=$ident" "pr=$pr" "grader=$actor" "actor=$actor" "disposition=merged" 2>/dev/null || true
   printf '%s merged by %s (the seat that graded it) as the machine account.\n' "$pr" "$actor" >&2
   return 0
 }

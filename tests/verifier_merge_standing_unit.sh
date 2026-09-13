@@ -214,5 +214,40 @@ grep -q '_merge_do' <<<"$_UNCOND" \
   && ok_t "the grant is UNCONDITIONAL — not gated behind can-push, which a grader must not hold" \
   || bad_t "grant unconditional" "the _merge_do line is inside the can_push block"
 
+# --- 5. DIVE-4428: a queue-governed branch is ENQUEUED, not squash-merged -----
+# MEASURED 2026-09-13 (quinn, PRs #927/#928): `gh pr merge <url> --squash` names a
+# merge strategy that the merge queue owns, and GitHub answers that combination
+# with a GraphQL 500 — which reads as an outage and invites a retry that cannot
+# work. Two verified-good fixes were left for a human to press by hand.
+MERGE_CALLER=$(declare -f cmd_task_merge)
+grep -q 'enqueuePullRequest' <<<"$DO" \
+  && ok_t "the executor ENQUEUES on a queue-governed branch instead of naming a strategy the queue owns" \
+  || bad_t "enqueuePullRequest reached" "$DO"
+grep -q 'expectedHeadOid' <<<"$DO" \
+  && ok_t "...pinning the graded head server-side, so a head that moved errors instead of queueing an ungraded tree" \
+  || bad_t "expectedHeadOid pin" ""
+grep -q 'mergeQueue{id}' <<<"$DO" \
+  && ok_t "...and the governance test is a non-null mergeQueue, not branchProtectionRule (a ruleset populates no rule)" \
+  || bad_t "mergeQueue governance probe" ""
+grep -q 'isInMergeQueue' <<<"$DO" \
+  && ok_t "an already-queued pull request is not re-enqueued (a second enqueue is a no-op at best)" \
+  || bad_t "already-queued short circuit" ""
+# The enqueue is reported as an enqueue. Saying "merged" over one is how a seat
+# closes a row on a merge that has not happened, and the queue can still eject it.
+grep -q 'disposition=enqueued' <<<"$DO" \
+  && ok_t "the executor names the disposition it actually achieved" \
+  || bad_t "executor emits disposition" ""
+grep -q 'disposition=enqueued' <<<"$MERGE_CALLER" \
+  && ok_t "...and the caller reads it rather than printing 'merged' in the past tense over an enqueue" \
+  || bad_t "caller branches on disposition" "$MERGE_CALLER"
+grep -q 'enqueued:true' <<<"$MERGE_CALLER" \
+  && ok_t "...including in --json, where merged:false and enqueued:true are different facts" \
+  || bad_t "json carries enqueued" ""
+# gh's own words are the error. The defect this replaced pointed at output the
+# caller captures and may never have shown.
+grep -q "read gh'" <<<"$DO" \
+  && bad_t "gh output captured, not pointed at" "the executor still says 'read gh's message above'" \
+  || ok_t "GitHub's own message is CAPTURED and reprinted, not referred to as output above"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
