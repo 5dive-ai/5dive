@@ -100,9 +100,41 @@ in_list() { local n="$1"; shift; local x; for x in "$@"; do [[ "$x" == "$n" ]] &
 # `5dive <verb> --help` with a bounded timeout, stdin closed (an interactive
 # wizard that ignored --help would otherwise park the job until the workflow
 # timeout, which reads as a hang rather than a red).
+#
+# DIVE-4430: stderr used to go to /dev/null, so in fourteen months this check
+# has never once printed WHY a verb exits non-zero — only that it did. Two
+# people then failed to reproduce it at a desk (rc 0 for both, as this user and
+# as the container's root) and had nothing to go on but the number. The stderr
+# is now captured to $HELP_ERR and its first lines are quoted back in the
+# failure message.
+#
+# THIS IS ADDITIVE DIAGNOSTICS, NOT A RELAXED CHECK, and the distinction is the
+# whole reason it is allowed to land in the PR it diagnoses: the assertion is
+# byte-for-byte the same (rc 0 or the verb is red), the DENY list is unchanged,
+# and WAIVED is still the frozen 2026-09-09 baseline with T5 still retiring it.
+# Nothing that passed before passes now, and nothing that failed before passes.
+HELP_ERR="${TMPDIR:-/tmp}/install-contract-help-err.$$"
 verb_help_rc() {
-  timeout 30 "$FIVE" "$1" --help </dev/null >/dev/null 2>&1
+  : >"$HELP_ERR" 2>/dev/null || HELP_ERR=/dev/null
+  timeout 30 "$FIVE" "$1" --help </dev/null >/dev/null 2>"$HELP_ERR"
   printf '%s' "$?"
+}
+
+# The first $1 (default 6) lines of stderr from the LAST verb_help_rc call,
+# flattened onto one line so it survives the summary formatting. Call it
+# immediately after verb_help_rc — the next call truncates the file.
+help_err_tail() {
+  local n="${1:-6}"
+  [[ -s "$HELP_ERR" ]] || { printf 'stderr: (empty — the verb exited quietly)'; return 0; }
+  printf 'stderr: '
+  head -n "$n" "$HELP_ERR" \
+    | tr -d '\r' \
+    | sed -e 's/[[:cntrl:]]/ /g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    | cut -c1-400 \
+    | awk 'NF{ printf "%s%s", (c++ ? " | " : ""), $0 } END{ if(!c) printf "(whitespace only)" }'
+  local lines; lines=$(wc -l <"$HELP_ERR" 2>/dev/null || printf 0)
+  (( lines > n )) && printf ' | …+%s more line(s)' "$(( lines - n ))"
+  return 0
 }
 
 echo "=== install contract: $($FIVE --version 2>&1 | head -1) ==="
@@ -209,7 +241,7 @@ else
       if [[ "$vrc" == "0" ]]; then
         ok_t "T2 $p: 5dive $v --help dispatches (rc 0)"
       else
-        bad_t "T2 $p: 5dive $v --help dispatches" "rc=$vrc — the plugin installed but its declared verb does not run"
+        bad_t "T2 $p: 5dive $v --help dispatches" "rc=$vrc — the plugin installed but its declared verb does not run. $(help_err_tail)"
       fi
     done
   done
@@ -286,9 +318,9 @@ else
     if [[ "$vrc" == "0" ]]; then
       ok_t "T4 5dive $v --help (rc 0)"
     elif [[ "$vrc" == "124" ]]; then
-      bad_t "T4 5dive $v --help" "timed out after 30s — the verb ignores --help and blocks (an interactive prompt or a poll)"
+      bad_t "T4 5dive $v --help" "timed out after 30s — the verb ignores --help and blocks (an interactive prompt or a poll). $(help_err_tail)"
     else
-      bad_t "T4 5dive $v --help" "rc=$vrc — a shipped verb with no reachable usage text. If this verb never had one, add it; do not extend WAIVED, which is a frozen 2026-09-09 baseline."
+      bad_t "T4 5dive $v --help" "rc=$vrc — a shipped verb with no reachable usage text. If this verb never had one, add it; do not extend WAIVED, which is a frozen 2026-09-09 baseline. $(help_err_tail)"
     fi
   done
 fi
