@@ -40,10 +40,23 @@ require_root() {
 # Refuses empty rather than recording it: every caller of this treats empty as
 # "flag not given", so a silently-empty file would land the exact same
 # indistinguishable-from-correct write the argv form does.
+#
+# DIVE-4421: `-` means STDIN, so a caller with a heredoc needs no temp file:
+#   5dive agent send dev --message-file=- <<'EOF'
+# The read is the SAME `read -r -d ''` as the file path below, so the two forms
+# cannot drift into eating different bytes. There is no ambiguity to protect
+# against: a file literally named `-` is addressable as `./-`, and every other
+# flag in this CLI that takes `-` (--telegram-token) already spells it this way.
 _read_prose_file() {
   local flag="$1" path="$2"
   _PROSE_FILE_VALUE=""
   [[ -n "$path" ]] || fail "$E_USAGE" "$flag needs a path: ${flag}=<file>"
+  if [[ "$path" == "-" ]]; then
+    IFS= read -r -d '' _PROSE_FILE_VALUE || true
+    [[ -n "$_PROSE_FILE_VALUE" ]] \
+      || fail "$E_VALIDATION" "$flag: stdin was empty — refusing to record an empty value (an empty stdin is indistinguishable from the flag never being passed, which is the failure mode this flag exists to remove)"
+    return 0
+  fi
   [[ -e "$path" ]] || fail "$E_USAGE" "$flag: no such file '$path'"
   [[ -f "$path" || -p "$path" || -c "$path" ]] \
     || fail "$E_USAGE" "$flag: '$path' is not a readable file (regular file, fifo or character device)"

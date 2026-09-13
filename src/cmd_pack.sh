@@ -2196,6 +2196,74 @@ cmd_export() {
   fi
 }
 
+# ---- DIVE-4416: ONE flag table, two readers --------------------------------
+# `hire <role> --from-market --dry-run` used to print the disclosure and exit 0
+# on flags the real run rejects: hire collects everything it does not own into
+# import_args and only ever hands them to cmd_import on the REAL run, so a
+# preview graded nothing. The tables below are the single source of truth for
+# what an import argv may contain; _import_parse_args walks an argv against
+# them WITHOUT touching the box (the dry-run reader) and cmd_import's own loop
+# defers to them for anything its explicit arms did not claim.
+#
+# Value flags are `=`-only, exactly as cmd_import's `--flag=*)` arms are: the
+# space form (`--as nova`) falls through to "unknown flag" on the real run, so
+# the validator must reject it too or the preview lies in the other direction.
+_IMPORT_OWN_VALUE_FLAGS=(--as --channels --telegram-token --discord-token
+                         --auth-profile --workdir --from-persona --type
+                         --isolation --model --effort --provider --api-key)
+_IMPORT_OWN_BOOL_FLAGS=(--report-import --allow-hooks)
+
+# Create-only flags import FORWARDS verbatim into the cmd_create argv it already
+# builds. hire's usage advertises "+ any 'agent import' flag" and an operator
+# reasonably reads a hire as a create — the customer report that opened
+# DIVE-4416 passed --heartbeat-every / --inherit-memory and got "unknown flag"
+# from the real run only. These are the create flags that do not collide with
+# something import computes itself (type/channels/isolation/model/auth-profile/
+# workdir/tokens/--no-skills/--defer-auth/BYO), so forwarding them is additive.
+_IMPORT_CREATE_PASSTHRU_VALUE_FLAGS=(--heartbeat-every --inherit-memory --base-url
+                                     --telegram-home-channel --telegram-allowed-users
+                                     --telegram-cos --telegram-cos-avatar)
+_IMPORT_CREATE_PASSTHRU_BOOL_FLAGS=(--no-heartbeat --no-team-bot --can-push --can-deploy)
+
+# rc 0 if <arg> matches one of the <flag> names in value form (--flag=<v>).
+_import_flag_is_value() {
+  local a="$1"; shift; local f
+  for f in "$@"; do [[ "$a" == "$f="* ]] && return 0; done
+  return 1
+}
+# rc 0 if <arg> is exactly one of the <flag> names (boolean form).
+_import_flag_is_bool() {
+  local a="$1"; shift; local f
+  for f in "$@"; do [[ "$a" == "$f" ]] && return 0; done
+  return 1
+}
+
+# rc 0 if <arg> is a create-only flag import forwards into its cmd_create argv.
+_import_create_passthru_ok() {
+  _import_flag_is_value "$1" "${_IMPORT_CREATE_PASSTHRU_VALUE_FLAGS[@]}" && return 0
+  _import_flag_is_bool  "$1" "${_IMPORT_CREATE_PASSTHRU_BOOL_FLAGS[@]}"  && return 0
+  return 1
+}
+
+# DIVE-4416 validate-only entry point. Walks an `agent import` argv and fails
+# with the SAME message cmd_import's parser would, creating nothing and
+# requiring no root. `hire --from-market` calls this before it resolves the
+# market so a --dry-run preview and the real run agree on which flags are legal.
+_import_parse_args() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      -*)
+        _import_flag_is_value "$a" "${_IMPORT_OWN_VALUE_FLAGS[@]}" && continue
+        _import_flag_is_bool  "$a" "${_IMPORT_OWN_BOOL_FLAGS[@]}"  && continue
+        _import_create_passthru_ok "$a"                            && continue
+        fail "$E_USAGE" "unknown flag: $a"
+        ;;
+      *) : ;;   # positional (the pack/slug) — the caller owns that check
+    esac
+  done
+}
+
 cmd_import() {
   require_root
   local pack="" as="" channels="" tg_token="" dc_token="" profile="" workdir=""
@@ -2211,6 +2279,8 @@ cmd_import() {
   # DIVE-2676: BYO credentials on the import path. Without these an import onto
   # an API-key-only seat provisions an agent that cannot reach a model at all.
   local p_provider="" p_api_key=""
+  # DIVE-4416: create-only flags forwarded verbatim into the cmd_create argv.
+  local -a create_passthru=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --as=*)              as="${1#--as=}" ;;
@@ -2233,7 +2303,13 @@ cmd_import() {
       # events (the agentjacking surface of third-party packs). Deny-by-default:
       # a pack's hooks are STRIPPED on import unless the importer opts in here.
       --allow-hooks)       allow_hooks=1 ;;
-      -*)                  fail "$E_USAGE" "unknown flag: $1" ;;
+      # DIVE-4416: not one of ours — forward it to cmd_create if it is a create
+      # flag we can pass through untouched, otherwise fail exactly as before.
+      -*)                  if _import_create_passthru_ok "$1"; then
+                             create_passthru+=("$1")
+                           else
+                             fail "$E_USAGE" "unknown flag: $1"
+                           fi ;;
       *)                   [[ -z "$pack" ]] && pack="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
@@ -2475,6 +2551,10 @@ cmd_import() {
   fi
   [[ -n "$tg_token" ]] && cargs+=("--telegram-token=$tg_token")
   [[ -n "$dc_token" ]] && cargs+=("--discord-token=$dc_token")
+  # DIVE-4416: create-only flags the caller forwarded (--heartbeat-every,
+  # --inherit-memory, --can-push, …). Appended last so they cannot be silently
+  # overwritten by something import computed above.
+  (( ${#create_passthru[@]} )) && cargs+=("${create_passthru[@]}")
 
   # DIVE-995: MANDATORY install-time disclosure — surface the pack's executable
   # surface (hooks/skills/plugins/prompt/signing-key) BEFORE we recreate anything,

@@ -101,7 +101,16 @@ _task_usage() {
   rm <id>                                       delete (cascades subtasks + edges)
 
   need <id> --type=decision|secret|approval|manual|access --ask="..."|--ask-file=<path>
-      [--options=A|B] [--recommend=<A>|--recommend-file=<path>] [--tier=0|1|2]
+      [--options="<first choice spelled out>|<second choice spelled out>"]
+      [--recommend="<one of the option texts>"|--recommend-file=<path>]
+      [--tier=0|1|2]
+                   Spell each option out. A bare letter records nothing once
+                   the ask is forwarded, quoted or screenshotted — "recommend:
+                   A" is a token with no dictionary. Mistyping is not a reason
+                   to shorten them: on --type=decision a --recommend that does
+                   not match an --options entry exactly fails here, at your
+                   keyboard, before the gate exists; a letter never fails and
+                   just means the wrong thing.
       [--needs=<capability>] [--discusses=<why>] [--rubber-stamp-ok="<why>"]
       [--ask-ok="<why>"]   DIVE-4176: a gate that reaches the PAIRED HUMAN is refused
                    when its --ask runs over 25 words or names an ident/sha/branch/

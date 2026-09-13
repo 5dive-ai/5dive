@@ -50,17 +50,33 @@
 # Measured 2026-08-28 on this host: 4 of 17 registered agents carry no heartbeat
 # key at all, and one of them held an open row.
 #
-# `heartbeat.enabled == true` IS THE WHOLE GATE — because it is the whole gate the
-# tick uses. `_hb_wake` (cmd_heartbeat.sh) never reads `desiredState`: on an
-# iterated seat it runs `systemctl is-active` and STARTS a unit that is down. So a
-# seat is woken by the tick if and only if it is in that population, and that
-# population is `heartbeat.enabled == true` alone (DIVE-4071).
+# `heartbeat.enabled == true` IS THE WHOLE GATE this predicate applies, and until
+# DIVE-4409 it was the whole gate the tick applied too: `_hb_wake` read no
+# `desiredState` and STARTED a unit that was down.
 #
-# WHY `desiredState=stopped` IS NOT FOLDED IN HERE (it used to be, and it was
-# wrong). The old comment claimed an operator-stopped seat "IS iterated by the
-# wake loop and the wake then FAILS". It does not fail: the tick still iterates it
-# (`cmd_stop` sets `desiredState=stopped` but leaves `heartbeat.enabled` untouched)
-# and `_hb_wake` STARTS the stopped unit — so the row dispatches. Reporting that as
+# DIVE-4409 CHANGED THAT, and this comment is corrected rather than left standing:
+# `_hb_wake` now declines to start a unit whose agent carries
+# `desiredState=stopped`. So the tick's population is no longer exactly this
+# predicate's — a seat that is enrolled, parked by its operator, AND whose unit is
+# down holds its row forever, and `orphans` still calls that lane healthy.
+#
+# WHY THE FIELD IS STILL NOT FOLDED IN HERE. The discriminator is not the field,
+# it is the field TOGETHER WITH the unit state: DIVE-4409's guard is scoped to the
+# START, so a parked-but-RUNNING seat (any seat raised outside `5dive agent start`
+# — a manual `systemctl start`, a crash-loop recovery — carries
+# `desiredState=stopped` with a live unit) is still woken normally, and reporting
+# it dead-lane would re-manufacture exactly the false finding described below.
+# Telling the two apart needs a systemd probe, and this predicate is read-only,
+# registry-only, and also feeds ROUTING (src/task/routing.sh:799, :1622) — adding
+# an `is-active` call to it is a behaviour change with its own blast radius, not a
+# comment fix. Filed as its own row; see DIVE-4409's body.
+#
+# THE HISTORY, kept because the false finding it produced is the trap (it used to
+# be folded in, and it was wrong THEN). The old comment claimed an operator-stopped
+# seat "IS iterated by the wake loop and the wake then FAILS". It did not fail: the
+# tick iterated it (`cmd_stop` sets `desiredState=stopped` but leaves
+# `heartbeat.enabled` untouched) and `_hb_wake` STARTED the stopped unit — so the
+# row dispatched. Reporting that as
 # `dead-lane` was a FALSE finding whose printed remedy (`task assign`) re-points a
 # row off a seat that is actively working it. Any seat started outside
 # `5dive agent start` — a manual `systemctl start`, a crash-loop recovery — carries
