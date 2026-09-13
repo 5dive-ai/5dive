@@ -5085,6 +5085,50 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
     notified=0
     unnotified_note=" [UNNOTIFIED — nobody was pinged; answer on the dashboard or: 5dive task answer ${ident}]"
   fi
+  # DIVE-4413: SAY WHERE IT WENT, AND — with no human accounts on the box — SAY
+  # THAT IT WAS A BROADCAST.
+  #
+  # The customer report this row was filed from is one sentence: a founder filed a
+  # gate, read `OK — <id> needs a human (decision, tier 2) — <ask>`, and could not
+  # learn from it that the ping had gone to a forum's General topic rather than to
+  # them. Every fact needed was already computed one frame down — _task_post_owner_target
+  # records the reached chat in the delivery log — it just never came back up.
+  #
+  # Two separate statements, because they answer two different questions and only
+  # one of them is about this gate:
+  #   destination  WHERE this ping landed. A receipt, printed whenever there is one.
+  #   broadcast    WHO could read it. With `humans` empty, _task_send_gate_owner
+  #                delegates to _task_send_owner and delivery fans out over the
+  #                allowlist — correct on a one-human box and a disclosure on any
+  #                other, and NOTHING said which box you were on.
+  # Warned, not failed: every first-run box starts with an empty registry, so this
+  # is the onboarding signal (DIVE-1955 wallpaper test — it fires where something
+  # IS unresolved, namely the identity of the person being paged, and stops firing
+  # the moment `human add` resolves it).
+  local dest_note="" _dest="" _plan="" _legacy=0
+  _human_registry_active || _legacy=1
+  # A RECEIPT and a PLAN are different claims, and the OK line must never print
+  # one in the other's words. The immediate path (tier 0/1, or a window of 0)
+  # has already sent by the time we get here and TASK_SEND_TARGETS holds where
+  # it landed. A tier-2 gate — the only tier whose ping rings a phone, so the
+  # one this row is about — is HELD by the DIVE-4154/4365 window and delivered
+  # from a detached child, so there is no receipt yet and inventing one would be
+  # worse than the silence being fixed. Preview it instead, off the same
+  # access.json the send will walk, resolved through the deliverer's own channel
+  # resolver so the two cannot disagree.
+  _dest=$(_task_send_targets_note) || _dest=""
+  if [[ -n "$_dest" ]]; then
+    dest_note=" [delivered to ${_dest}]"
+  elif (( _legacy )) && [[ "$notified" == "1" ]] && _task_gate_preview_channel "$actor" 2>/dev/null; then
+    # NOT in a command substitution: _task_gate_preview_channel resolves TASK_CH_*
+    # into globals and a subshell would drop them (its own contract note says so).
+    _plan=$(_task_legacy_owner_destinations "${TASK_CH_ACCESS:-}") || _plan=""
+    [[ -n "$_plan" ]] && dest_note=" [ping not sent yet (held by the undo window) — it goes to ${_plan}]"
+  fi
+  if (( _legacy )) && _task_deployment_has_channels; then
+    local _bcast="${_dest:-$_plan}"
+    warn "no human accounts on this box (\`5dive human ls\` is empty), so this gate takes the legacy BROADCAST path${_bcast:+ — it goes to ${_bcast}}. Everyone on that chat or topic can read the ask and tap its buttons. Name the person instead: sudo 5dive human add <id> --telegram=<chat id>"
+  fi
   # DIVE-3266: SAY THAT IT DID NOT ROUTE, AND NAME THE AXIS THAT DECIDED.
   #
   # Reaching here means routed_reviewer is NULL, and an empty routed_reviewer is the
@@ -5126,7 +5170,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
     fi
   fi
   local _nr_note=" [NOT ROUTED — no lead was named, so this gate sits on the PAIRED HUMAN: ${_nr_reason}]"
-  ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note}${unnotified_note}${_nr_note} — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
+  ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note}${unnotified_note}${dest_note}${_nr_note} — $ask" \
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), delivered_to:(($dt|select(length>0)) // null), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg dt "${TASK_SEND_TARGETS:-}" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }

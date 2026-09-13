@@ -130,9 +130,13 @@ Agents:
                                                      # passing =- without piping anything blocks on stdin until
                                                      # the caller's timeout — always send the token on stdin.
   5dive agent config <name> set discord.token=<token>
-  5dive agent config <name> set telegram.home-channel=<chat-id>
-                                                     # hermes only — chat id the gateway posts unsolicited
-                                                     # messages to; ignored by claude/openclaw.
+  5dive agent config <name> set telegram.home-channel=<chat-id>[:<topic-id>]
+                                                     # chat the agent's unsolicited messages and gate pings go
+                                                     # to. hermes/openclaw: the gateway's home chat. claude/
+                                                     # codex/grok/pi/antigravity: binds access.json
+                                                     # groups.<chat>.message_thread_id + last-human-chat.json,
+                                                     # so a gate lands in the named forum TOPIC rather than in
+                                                     # the supergroup's General. :<topic-id> is those types only.
   5dive agent config <name> set telegram.allowed-users=<id1,id2,...>
                                                      # comma-separated numeric user ids; seeds
                                                      # access.json/openclaw.allowFrom/hermes env so the bot

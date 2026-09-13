@@ -1196,6 +1196,16 @@ _task_store_audit_log() { # <cmd> <result> <code> -- <args...>
 TASK_SEND_DELIVERED=0
 TASK_SEND_MESSAGE_IDS=""
 TASK_SEND_FAILED=0
+# DIVE-4413: WHERE the send actually landed, as "<chat>" or "<chat>:<thread>",
+# comma-joined when a fan-out hits several targets. The delivery LOG has carried
+# this since DIVE-1490 (_task_gate_delivery_log records MIRROR_POST_CHAT), but a
+# log the filer never opens is not an answer to "who did you just page?" — the
+# customer report that opened this row is a founder who filed a gate, read
+# `OK — DIVE-501 needs a human (decision, tier 2)`, and had no way to learn the
+# ping went to a forum's General topic. Same value, surfaced on the terminal.
+# A GLOBAL for the same reason TASK_CH_* is one: the send path must never be
+# called in a command substitution, and a subshell would drop this with it.
+TASK_SEND_TARGETS=""
 
 _task_post_owner_target() { # <token> <chat> <thread> <text> <access> <markup> <task_ids> [text_plain]
   local token="$1" chat="$2" thread="$3" text="$4" access_file="$5" reply_markup="$6" task_ids="$7" text_plain="${8:-}"
@@ -1204,6 +1214,10 @@ _task_post_owner_target() { # <token> <chat> <thread> <text> <access> <markup> <
     TASK_SEND_DELIVERED=1
     [[ -n "${MIRROR_POST_MESSAGE_ID:-}" ]] \
       && TASK_SEND_MESSAGE_IDS+="${TASK_SEND_MESSAGE_IDS:+,}${MIRROR_POST_MESSAGE_ID}"
+    # DIVE-4413: MIRROR_POST_CHAT, not "$chat" — _mirror_post follows a
+    # supergroup migration, so the chat the message reached is not always the
+    # chat we aimed at, and reporting the aim would be reporting a guess.
+    TASK_SEND_TARGETS+="${TASK_SEND_TARGETS:+,}${MIRROR_POST_CHAT:-$chat}${thread:+:${thread}}"
     if [[ -n "$task_ids" ]]; then
       _task_gate_delivery_log ok "$task_ids" "${MIRROR_POST_CHAT:-$chat}" "${MIRROR_POST_MESSAGE_ID:-}" "confirmed Bot API send"
     fi
@@ -1236,6 +1250,68 @@ _task_stamp_confirmed_delivery() { # <comma-separated numeric task ids>
       WHERE id IN (${task_ids}) AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || true
 }
 
+# DIVE-4413: describe, in the filer's words, where a LEGACY (registry-empty)
+# gate send will fan out to. Read off the same access.json the send path walks,
+# in the same order, so the preview and the delivery cannot drift into
+# disagreement — the one failure mode a second copy of the routing rules would
+# introduce. Pointer first (the branch that actually decides on a live box),
+# then the DM allowlist, then the bound groups. Prints nothing when there is
+# nothing to describe; never fails (a caller uses it to WARN, and a warning that
+# can kill `task need` under set -e is worse than no warning).
+_task_legacy_owner_destinations() { # <access_file>
+  local access_file="${1:-}" out="" ptr_file p_chat p_thread dms chat groups n i g_chat g_thread
+  [[ -r "$access_file" ]] || return 0
+  ptr_file="${access_file%/*}/last-human-chat.json"
+  if [[ -r "$ptr_file" ]]; then
+    p_chat=$(jq -r '.chatId // empty' "$ptr_file" 2>/dev/null) || p_chat=""
+    p_thread=$(jq -r '.messageThreadId // empty' "$ptr_file" 2>/dev/null) || p_thread=""
+    if [[ -n "$p_chat" ]] && jq -e --arg c "$p_chat" \
+         '((.allowFrom // []) | index($c) != null) or ((.groups // {}) | has($c))' "$access_file" >/dev/null 2>&1; then
+      if [[ -z "$p_thread" ]]; then
+        p_thread=$(jq -r --arg c "$p_chat" '(.groups[$c].message_thread_id // "") | tostring' "$access_file" 2>/dev/null) || p_thread=""
+        [[ "$p_thread" == "null" ]] && p_thread=""
+      fi
+      printf 'chat %s%s (last chat this bot was talked to in)' "$p_chat" "${p_thread:+, topic ${p_thread}}"
+      return 0
+    fi
+  fi
+  dms=$(jq -r '(.allowFrom // [])[]' "$access_file" 2>/dev/null) || dms=""
+  while IFS= read -r chat; do
+    [[ -n "$chat" ]] || continue
+    out+="${out:+, }DM ${chat}"
+  done <<<"$dms"
+  groups=$(jq -c '(.groups // {}) | to_entries' "$access_file" 2>/dev/null) || groups="[]"
+  n=$(jq 'length' <<<"$groups" 2>/dev/null) || n=0
+  for (( i=0; i<${n:-0}; i++ )); do
+    g_chat=$(jq -r ".[$i].key" <<<"$groups" 2>/dev/null) || continue
+    g_thread=$(jq -r ".[$i].value.message_thread_id // \"\"" <<<"$groups" 2>/dev/null) || g_thread=""
+    [[ -n "$g_chat" ]] || continue
+    # Naming the ABSENCE of a topic is the payload, not a detail: "group X" and
+    # "group X, topic 200" are the two outcomes the customer could not tell
+    # apart, and the untopiced one is the wrong room.
+    out+="${out:+, }group ${g_chat}${g_thread:+, topic ${g_thread}}"
+    [[ -n "$g_thread" ]] || out+=" (no topic bound — lands in General)"
+  done
+  printf '%s' "$out"
+  return 0
+}
+
+# DIVE-4413: render TASK_SEND_TARGETS (what a send ACTUALLY reached) as prose.
+# Kept apart from the preview above because they answer different questions and
+# a caller must not be able to confuse a plan with a receipt.
+_task_send_targets_note() {
+  local t out="" IFS=','
+  [[ -n "${TASK_SEND_TARGETS:-}" ]] || return 0
+  for t in $TASK_SEND_TARGETS; do
+    [[ -n "$t" ]] || continue
+    if [[ "$t" == *:* ]]; then out+="${out:+, }chat ${t%%:*}, topic ${t#*:}"
+    else out+="${out:+, }chat ${t} (no topic)"; fi
+  done
+  unset IFS
+  printf '%s' "$out"
+  return 0
+}
+
 # _task_send_owner — send ONE message ($1, optional reply_markup $2, optional
 # comma-separated task row ids $3) to the
 # paired human, using the channel resolved by _task_owner_channel. Routing
@@ -1254,7 +1330,7 @@ _task_send_owner() {
   # through untouched so the Bot-API-rejected-keyboard retry is the one that uses it.
   local text="$1" reply_markup="${2:-}" task_ids="${3:-}" text_plain="${4:-}"
   local token="$TASK_CH_TOKEN" access_file="$TASK_CH_ACCESS"
-  TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0
+  TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0 TASK_SEND_TARGETS=""
   # DIVE-1506: fail-closed chokepoint. EVERY real human-facing task send (gate-notify + /inbox
   # digest) funnels here. Refuse unless the active task DB is the prod DB — an isolated e2e/fixture
   # DB (council_gate_e2e's `task need`, a replayed fixture digest) must never reach a paired human.
@@ -1279,6 +1355,23 @@ _task_send_owner() {
         return 0
       fi
       if jq -e --arg c "$p_chat" '(.groups // {}) | has($c)' "$access_file" >/dev/null 2>&1; then
+        # DIVE-4413: a NULL messageThreadId in the pointer is not a vote for
+        # "General". The pointer is written by the telegram plugin from inbound
+        # traffic and predates forum topics, so a three-month-old pointer names
+        # the group with no topic while access.json binds that same group to a
+        # topic. Measured on teal-fox 2026-09-13: claude-swan's pointer
+        # {chatId:-1003797470983, messageThreadId:null} (written 2026-06-22) beat
+        # groups["-1003797470983"].message_thread_id=200, so DIVE-501's gate
+        # (message 4308) landed in the supergroup's General topic — the "wrong
+        # room" in the customer report. access.json is operator-declared state and
+        # the pointer is observed state; where they disagree about the TOPIC of a
+        # chat both already name, the declaration wins. This narrows the audience
+        # (a topic is a subset of the group), so it cannot widen delivery — the
+        # invariant the pointer arm above is written around.
+        if [[ -z "$p_thread" ]]; then
+          p_thread=$(jq -r --arg c "$p_chat" '(.groups[$c].message_thread_id // "") | tostring' "$access_file" 2>/dev/null) || p_thread=""
+          [[ "$p_thread" == "null" ]] && p_thread=""
+        fi
         _task_post_owner_target "$token" "$p_chat" "$p_thread" "$text" "$access_file" "$reply_markup" "$task_ids" "$text_plain"
         [[ "$TASK_SEND_DELIVERED" == "1" ]] || _task_send_owner_groups "$token" "$access_file" "$text" "$reply_markup" "$task_ids" "$p_chat" "$text_plain"
         _task_stamp_confirmed_delivery "$task_ids"
@@ -1346,7 +1439,7 @@ _task_send_gate_owner() {
     _task_send_owner "$text" "$reply_markup" "$task_ids" "$text_plain"
     return 0
   fi
-  TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0
+  TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0 TASK_SEND_TARGETS=""
   local token="$TASK_CH_TOKEN" access_file="$TASK_CH_ACCESS"
   # DIVE-1506 fail-closed chokepoint, same as _task_send_owner: a fixture/e2e DB
   # must never reach a paired human. Checked here too because this function is a
@@ -1857,6 +1950,14 @@ _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <cha
 # nothing for it. One wrapper, two deliverers: a parallel assertion would be a
 # second thing to go inert, which is the failure mode of the thing being fixed.
 task_need_notify() {
+  # DIVE-4413: one gate, one delivery attempt, one receipt. TASK_SEND_TARGETS is
+  # read by `task need` AFTER this returns, so it has to be scoped to THIS gate.
+  # In the one-shot CLI it starts empty and a reset looks redundant; in the
+  # heartbeat re-nag and the /inbox batch — both of which drive this function in
+  # a loop inside a single process — a held gate that sends nothing would
+  # otherwise inherit the previous gate's destination and the filer would be told
+  # a confident wrong chat. Reset where the attempt begins, not where it lands.
+  TASK_SEND_TARGETS=""
   TASK_GATE_DELIVERY_ROWS=0
   TASK_SEND_DELIVERED=0
   local _rc=0
@@ -2383,6 +2484,38 @@ _task_need_notify_deliver() {
   return 0
 }
 
+# DIVE-4413: WHICH BOT SENDS THIS GATE — lifted verbatim out of
+# _task_need_notify_deliver_now so a second caller cannot drift from it.
+#
+# The second caller is `task need` itself, which wants to TELL THE FILER where
+# the ping is going. It cannot read that off a receipt: a tier-2 gate — the only
+# tier whose ping rings a phone, and therefore the only one this row is about —
+# is HELD by the DIVE-4154/4365 window and delivered from a detached child, so
+# at the moment `task need` prints its OK line no send has happened yet and
+# TASK_SEND_TARGETS is legitimately empty. Re-deriving the channel at the filing
+# site was the alternative, and a re-derivation of a routing rule is the defect
+# this repo keeps paying for (community/wiki/a-duplication-predicate-must-ask-
+# what-the-other-surface-actually-says.md). One function, two readers.
+#
+# Sets TASK_CH_* on success. MUST NOT be called in a command substitution — the
+# globals it resolves would die with the subshell (same contract as
+# _task_chain_channel). Preference order, unchanged:
+#   1. the explicitly tagged gate notifier — one phone surface, one chat to answer in
+#   2. the filer's own channel — the alert belongs to THEIR paired human
+#   3. the ambient owner channel
+# Returns 1 when none of the three resolves; the caller decides whether that is
+# an escalation (the deliverer) or simply nothing to preview (`task need`).
+_task_gate_preview_channel() { # <filer>
+  local _self="${1:-}" _gnotif=""
+  _gnotif=$(_task_gate_notifier_explicit 2>/dev/null) || _gnotif=""
+  if [[ -n "$_gnotif" ]] && _task_agent_channel "$_gnotif"; then
+    return 0
+  elif [[ -n "$_self" ]] && _task_agent_channel "$_self"; then
+    return 0
+  fi
+  _task_owner_channel
+}
+
 _task_need_notify_deliver_now() {
   local ident="$1" need_type="$2" ask="$3" options="$4" recommend="${5:-}"
   local secret_key="${6:-}" connector="${7:-}" human_nonce="${8:-}"
@@ -2443,12 +2576,7 @@ _task_need_notify_deliver_now() {
   # byte-identical to today's. An unpaired or unresolvable notifier falls straight
   # through to the filer-first chain — the notifier is a PREFERENCE about which
   # paired bot sends, never a new way for a gate to reach nobody.
-  local _gnotif=""; _gnotif=$(_task_gate_notifier_explicit 2>/dev/null) || _gnotif=""
-  if [[ -n "$_gnotif" ]] && _task_agent_channel "$_gnotif"; then
-    : # the tagged gate notifier — one phone surface, one chat to answer in
-  elif [[ -n "$_self" ]] && _task_agent_channel "$_self"; then
-    : # the filer's own channel — the alert belongs to THEIR paired human
-  elif ! _task_owner_channel; then
+  if ! _task_gate_preview_channel "$_self"; then
     warn "$ident: filing agent (${_self:-?}) has no paired channel — escalating up the org chart for the gate alert"
     local _fb=""
     _task_chain_channel "$_self" && _fb="$TASK_CH_AGENT"
