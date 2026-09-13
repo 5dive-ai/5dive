@@ -18,8 +18,17 @@
 #       does NOT happen. What was true is that the refusal rested on a field in
 #       somebody else's manifest: add `"review":"official"` to telegram and the
 #       guard evaporates. DIVE-4466 moves it to where it cannot — before
-#       resolution, before the trust gate, keyed on our own constant. T1a-T1e
-#       pass on origin/main too, and they are here so that stays true.
+#       resolution, before the trust gate, keyed on our own constant.
+#
+#       T1a-T1e DO pass on origin/main, and that is exactly their limit: with
+#       the later trust gate live, a refusal is a refusal and no arm can say
+#       WHICH of the two produced it. Reverting only the new pre-resolution
+#       guard to main's bare-only form leaves them all green (measured). T1f is
+#       the arm that can tell: it stubs the trust gate out — the same way this
+#       harness already stubs require_root — so the guard under test is the only
+#       thing left that can refuse. Under that isolation the mutant does not
+#       merely fail to refuse, it INSTALLS telegram box-wide, which is the dead
+#       install this row was filed about.
 #   T2  `market --kind=plugin --json` carried no field saying which unit a row
 #       installs into, so no consumer could have got it right. THIS is the live
 #       defect behind lodar's sentence, and T2a plus the derivation arms are the
@@ -104,8 +113,11 @@ t  "T1a bare ref refused (rc)"            "$E_USAGE" "$RC"
 tc "T1a names the per-agent path"         "installed per AGENT"                 "$ERR"
 tc "T1a names the verb that works"        "5dive agent create <name> --channels=telegram" "$ERR"
 
-# THE REGRESSION. Before DIVE-4466 this reached resolution, passed the trust
-# gate as `official`, and installed.
+# The qualified ref the dashboard actually sends. This arm pins the refusal and
+# its wording; it does NOT pin which guard produced them — today the trust gate
+# would refuse it too, because telegram carries no `fivedive.trust.review` (see
+# the MEASURED CORRECTION above; the row's premise that it passed the gate as
+# `official` was wrong). T1f is where that ambiguity is removed.
 run cmd_plugin_add telegram@5dive-plugins --yes
 t  "T1b qualified ref refused (rc)"       "$E_USAGE" "$RC"
 tc "T1b names the per-agent path"         "installed per AGENT"                 "$ERR"
@@ -130,6 +142,23 @@ tn "T1d browser not refused as a channel" "installed per AGENT"                 
 # else's plugin. A guard that matched on the name alone fails this arm.
 run cmd_plugin_add telegram@acme --yes
 tn "T1e foreign telegram@acme not ours"   "installed per AGENT"                 "$ERR"
+
+# T1f — THE DISCRIMINATING ARM. Everything above is blind to which of two
+# refusals fired. Neutralise the later catcher and only the pre-resolution guard
+# is left standing. Measured on this fixture, ref `telegram@5dive-plugins`:
+#   branch code      -> rc=2, refused, "installed per AGENT"
+#   bare-only mutant -> rc=0, "OK — telegram@5dive-plugins 0.5.52 installed"
+#                       plus "installed and inert" — the dead box-wide install.
+# Saved and restored rather than left stubbed, so T2 below still runs against
+# the shipping gate.
+_tg_orig="$(declare -f _plugin_trust_gate)"
+_plugin_trust_gate() { :; }
+run cmd_plugin_add telegram@5dive-plugins --yes
+t  "T1f guard refuses ALONE, trust gate stubbed (rc)"  "$E_USAGE" "$RC"
+tc "T1f and the refusal is the guard's own"            "installed per AGENT" "$ERR"
+tn "T1f nothing was installed"                         "installed and inert" "$ERR"
+tn "T1f no success line"                               "installed"           "$OUT"
+eval "$_tg_orig"
 
 echo "== T2: market --kind=plugin --json says which unit each row installs into =="
 
@@ -156,6 +185,31 @@ _plugin_is_builtin_channel_ref telegram acme; t "T2c' derivation: telegram@acme 
 _plugin_is_builtin_channel_ref telegram 5dive-plugins; t "T2c' derivation: telegram@5dive-plugins is" "0" "$?"
 _plugin_is_builtin_channel_ref voice 5dive-plugins; t "T2c' derivation: voice@5dive-plugins is not" "1" "$?"
 _plugin_is_builtin_channel_ref telegram ""; t "T2c' derivation: bare telegram still is" "0" "$?"
+
+# T2d — the OTHER row builder. This listing assembles rows in two places: the
+# registered clone read above, and the published manifest it FETCHES when a box
+# has no clone yet — which is every fresh box, and the path T2a cannot reach.
+# The field shipped as two copies of one jq expression; this arm drives the copy
+# nobody was testing (it is now one shared expression, and this is what keeps it
+# one). A fresh STATE_DIR means no local marketplace, so the fetch branch runs.
+_st_save="$STATE_DIR"
+export STATE_DIR="$TMP/state-remote"
+curl() {
+  cat <<'JSON'
+{"name":"5dive-plugins","plugins":[
+  {"name":"telegram","category":"productivity","description":"Telegram channel."},
+  {"name":"voice","category":"channel","description":"Voice notes."}]}
+JSON
+}
+JSON_MODE=1
+run cmd_market_plugins --kind=plugin
+JSON_MODE=0
+unset -f curl
+export STATE_DIR="$_st_save"
+t "T2d remote-index listing succeeded (rc)" "0" "$RC"
+remote_got=$(jq -r '[.data.plugins[] | "\(.name)=\(.installs)/\(.ready)"] | sort | join(" ")' <<<"$OUT" 2>/dev/null)
+t "T2d fetched rows carry installs too (and are not ready)" \
+  "telegram=agent/false voice=box/false" "$remote_got"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

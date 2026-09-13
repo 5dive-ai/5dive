@@ -2906,6 +2906,15 @@ _plugin_market_base() { echo "https://raw.githubusercontent.com/$(gh_org)/5dive-
 # The value is DERIVED from FIVEDIVE_CHANNEL_PLUGINS_JSON, the same constant the
 # refusal in `plugin add` reads, so the catalogue and the installer cannot
 # disagree about which is which.
+#
+# ONE expression, both row builders. This listing assembles rows in two places —
+# the registered clone on disk and the published manifest it fetches when a box
+# has no clone — and the field shipped as two copies of the same jq. Two copies
+# is how the catalogue starts disagreeing with ITSELF: the fetch path is the one
+# a fresh box reads and the one no arm had been driving. Callers must pass
+# --arg m (the marketplace) and --argjson c (the channel constant).
+_PLUGIN_INSTALLS_JQ='installs:(if (.name as $n | any($c[]; .plugin==$n and .marketplace==$m)) then "agent" else "box" end)'
+
 cmd_market_plugins() {
   local kw="" a
   for a in "$@"; do
@@ -2937,7 +2946,7 @@ cmd_market_plugins() {
     local lname; lname=$(jq -r '.name // "5dive-plugins"' "$local_mkt")
     rows=$(jq -c --arg m "$lname" --argjson r "$rows" --argjson c "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
       '$r + [.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:true,
-             installs:(if (.name as $n | any($c[]; .plugin==$n and .marketplace==$m)) then "agent" else "box" end)}]' \
+             '"$_PLUGIN_INSTALLS_JQ"'}]' \
       "$local_mkt")
   fi
 
@@ -2950,7 +2959,7 @@ cmd_market_plugins() {
     local rname; rname=$(jq -r '.name // "5dive-plugins"' <<<"$idx")
     rows=$(jq -c --arg m "$rname" --argjson r "$rows" --argjson c "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
       '$r + [.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:false,
-             installs:(if (.name as $n | any($c[]; .plugin==$n and .marketplace==$m)) then "agent" else "box" end)}]' \
+             '"$_PLUGIN_INSTALLS_JQ"'}]' \
       <<<"$idx")
   fi
 
