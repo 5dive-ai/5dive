@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — the recurring-template materializer runs on a cron, not on a PR. 9.1s of fixture setup for a rail whose regression surfaces on the next scheduled materialisation and in the nightly sweep (DIVE-4465).
 # DIVE-2055 isolated unit harness for the recurring-template materializer's
 # fire predicate.
 #

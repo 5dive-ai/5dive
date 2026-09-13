@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — two a2a DELIVERY defects graded together, 15.4s. Same call as the busy-queue arm beside it: delivery timing is a live rail the fleet exercises hourly and the nightly sweep still grades, and it is not machinery the merge queue itself runs on (DIVE-4465).
 # DIVE-4296 — two delivery defects in one subsystem, graded together.
 #
 # DEFECT 1: `heartbeat wake-task` hard-coded fresh=false, so a FORCED wake onto a

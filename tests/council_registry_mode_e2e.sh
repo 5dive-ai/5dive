@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — council e2e family trim (DIVE-4465) — tests/council_ballot_e2e.sh stays in core as the family's PR smoke; registry mode is graded nightly.
 # DIVE-3729 — the bench registry must stay READABLE, and an unreadable one must SAY SO.
 #
 # What broke: the motion path persists the new roster with `mktemp` + `mv`. `mv` replaces the

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — an e2e over the BUILT binary's read-only single-host UI — 8.0s, and the cost is the build-and-serve fixture, not the assertions. Read-only, off the merge path, and the full sweep still runs it nightly (DIVE-4465).
 # DIVE-2655/DIVE-3931 e2e — the free single-host read-only UI on the BUILT binary.
 #
 # WHAT THIS GRADES, and why each arm exists. The subject is local read-only views

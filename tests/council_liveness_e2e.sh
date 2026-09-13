@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — council e2e family trim (DIVE-4465) — tests/council_ballot_e2e.sh stays in core as the family's PR smoke; liveness is graded nightly.
 # DIVE-1739 liveness E2E — proves the FULL-QUORUM (constitutional) liveness pre-check is REACHABLE
 # through the real bash dispatcher (src/cmd_council.sh -> cli.mjs) on the BUILT ./5dive binary, the
 # surface an amend/convene actually invokes. Gate answer A: a constitutional motion with any

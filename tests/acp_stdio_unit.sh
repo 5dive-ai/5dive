@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — the ACP stdio transport, 4.5s and a guarded sleep budget of 24s — a transport harness's cost is waiting, not asserting. Off the merge path and graded nightly (DIVE-4465).
 # DIVE-3017 — drive `5dive acp` end to end over stdio: the REAL verb, the REAL
 # embedded ACP server, a stubbed `5dive` underneath it.
 #

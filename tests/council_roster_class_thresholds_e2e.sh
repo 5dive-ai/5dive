@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — council e2e family trim (DIVE-4465): six council e2e harnesses cost 24.8s of the 300s PR core for a product surface no merge or ship path runs. tests/council_ballot_e2e.sh stays in core as the family's PR-facing smoke; the enumerations move to the nightly sweep, which runs every one of them.
 # DIVE-2890 roster PER-CLASS THRESHOLD e2e — proves `5dive council roster` reports the bar for the
 # decision class a seat is actually voting in, not the default (`ordinary`) spec alone.
 #
