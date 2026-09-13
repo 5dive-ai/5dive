@@ -1493,13 +1493,41 @@ _merge_disp_probe() {
     "$repo"
 }
 
+# _merge_disp_read <rc> <out> — THE ONE READER of the rail's disposition marker.
+# `_merge_do` achieves one of two different things on a success, and they are not
+# interchangeable: an ENQUEUE is a request the queue may still eject, a MERGE is
+# on the target branch. Both of the rail's callers need to tell them apart, and
+# DIVE-4428 iteration 1 shipped a fix that taught only ONE of them (`task merge`)
+# to grep for the marker — `src/task/status.sh` went on auditing
+# `task.merged-at-close` and telling the operator the seat "merged it (squash)"
+# over a request GitHub had merely accepted. A second grep is how the two answers
+# drift apart again, so there is exactly one, here.
+#
+# Prints `enqueued`, `merged`, or NOTHING AT ALL on a refusal — a rail that
+# refused achieved no disposition, and naming one would be the same defect in the
+# other direction.
+_merge_disp_read() {
+  local rc="${1:-1}" out="${2:-}"
+  (( rc == 0 )) || return 0
+  if [[ "$out" == *'_merge_do: disposition=enqueued'* ]]; then
+    printf 'enqueued\n'
+  else
+    printf 'merged\n'
+  fi
+}
+
 # _merge_disp_do <ident> — call the DIVE-3474 rail. Returns non-zero on any
 # refusal and prints the primitive's own words to stderr, so a hold can name them.
 # Deliberately the SAME primitive `task merge` uses: no second door into a merge.
+# On a success it prints the DISPOSITION on stdout (`enqueued` / `merged`) so the
+# close-time caller can tell a landing from a queued request; before DIVE-4428
+# iteration 2 it captured the executor's stderr into `$out` and DISCARDED it, so
+# the close had only an exit status and asserted a merge over an enqueue.
 _merge_disp_do() {
   local ident="$1" rc=0 out=""
   out=$(printf '%s\0' "$ident" | sudo -n /usr/local/bin/5dive _merge_do 2>&1) || rc=$?
   [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+  _merge_disp_read "$rc" "$out"
   return "$rc"
 }
 
@@ -1535,7 +1563,7 @@ cmd_task_merge() {
   # An enqueue is not a landing. The primitive says which one happened; saying
   # "merged" over an enqueue is how a seat closes a row on a merge that has not
   # happened, and the queue can still eject it.
-  if grep -q '_merge_do: disposition=enqueued' <<<"$out"; then
+  if [[ "$(_merge_disp_read "$rc" "$out")" == "enqueued" ]]; then
     ok "$ident ENQUEUED — the pull request this seat graded PASS is in the target branch's merge queue and NOT yet on it; no second seat was asked. The queue lands it or ejects it — confirm with mergedAt before calling it shipped" \
        '{ident:$id, merged:false, enqueued:true, actor:$ac}' --arg id "$ident" --arg ac "$actor"
     return 0
@@ -1616,6 +1644,26 @@ cmd_task_merge_do() {
   [[ -n "$tok" ]] || fail "$E_GENERIC" "$_GH_BOT_ENV exists but carries no ${_GH_BOT_KEY}."
 
   local _ghcfg; _ghcfg="$(gh_config_dir)"
+
+  # Everything above this line is AUTHORITY — root, SUDO_UID, the standing
+  # predicate, the pull request read from the row. Everything below it is GitHub,
+  # and lives in its own function so the five outcomes at GitHub can be EXECUTED
+  # by the harness over a stubbed `gh` (DIVE-4428 iteration 2: iteration 1 graded
+  # them with eight greps over `declare -f`, and two mutants with every one of
+  # those strings intact survived the whole suite). The split moves no check and
+  # widens nothing: the authority half is still re-derived here, as root, and
+  # `_merge_do_at_github` is unreachable except through it.
+  _merge_do_at_github "$ident" "$pr" "$actor" "$tok" "$_ghcfg"
+}
+
+# _merge_do_at_github <ident> <pr> <actor> <token> <gh-config-dir> — the GitHub
+# half of `_merge_do`, called ONLY from it and only after standing has been
+# re-derived as root. It decides nothing about who may merge; it decides how the
+# base branch's governance says a merge is performed, performs it, and names the
+# disposition it actually achieved.
+_merge_do_at_github() {
+  local ident="$1" pr="$2" actor="$3" tok="$4" _ghcfg="$5"
+
 
   # STEP 1 — ask GitHub how this base branch is governed, in ONE round trip that
   # also yields the two values an enqueue needs. `mergeQueue` non-null IS the

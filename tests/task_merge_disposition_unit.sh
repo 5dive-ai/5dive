@@ -455,7 +455,14 @@ eq "D2  the close reads the graded sha from the ROW, not from its own argv" \
 _hook=$(sed -n '/DIVE-4137: THE MERGE IS THE STEP WHERE GRADED WORK SITS/,/if \[\[ "\$_state" != "MERGED"/p' "$SRC/task/status.sh")
 if [[ -n "$_hook" ]]; then ok_t "D3a the merge hook precedes the DIVE-1830 not-merged branch"
 else bad_t "D3a the merge hook precedes the DIVE-1830 not-merged branch" "not found in that order"; fi
-if grep -q '_gate_pr_state "\$_dref"' <<<"$_hook"; then
+# DIVE-4428 iteration 2 moved the run-record-reread body out of the close and into
+# `_merge_at_close_do`, so the harness could EXECUTE its branches instead of
+# grepping them (a mutant that disabled the enqueue arm passed every source-level
+# arm). The property here is unchanged and still worth pinning at source: the
+# close must DELEGATE, and the thing it delegates to must RE-READ.
+_hookfn=$(sed -n '/^_merge_at_close_do() {/,/^}/p' "$SRC/task/status.sh")
+if grep -q '_merge_at_close_do "\$ident"' <<<"$_hook" \
+   && grep -q '_gate_pr_state "\$_dref"' <<<"$_hookfn"; then
   ok_t "D3b ...and RE-READS the merge state instead of assuming rc=0 means merged"
 else
   bad_t "D3b ...and RE-READS the merge state instead of assuming rc=0 means merged" "no re-read found"
