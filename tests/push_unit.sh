@@ -1434,6 +1434,123 @@ else
       && ! grep -q 'UNREACHABLE-PASS' <<<"$bare_out"; } \
     && ok_t "4423: a BARE call under set -euo pipefail fails by RETURNING, not inside its own grep" \
     || bad_t "4423: a BARE call under set -euo pipefail fails by RETURNING, not inside its own grep" "rc=$bare_rc :: $bare_out"
+
+  # 9. DIVE-4423 iteration 3 (quinn). THE MAJORITY CASE: a MULTI-COMMIT range.
+  #    Measured on this repo 2026-09-13, 7 of 8 recent PRs carried 2-4 commits and
+  #    nothing on the rail requires one commit — yet every fixture branch above has
+  #    exactly one, so "oldest" and "newest" were the same string and the ordering
+  #    the code argued for was graded by nothing. Subject reuse is justified ONLY on
+  #    a one-commit range (that is the sole case where GitHub offers the string AND
+  #    pre-push-rail graded it), so a multi-commit range must take the
+  #    by-construction form with the type derived from the WHOLE range.
+  ( cd "$T4423"
+    git checkout -q -b chore-then-feat main
+    git commit -q --allow-empty -m "chore: first wip commit"
+    git commit -q --allow-empty -m "feat(push): the real work landed in commit two"
+    git checkout -q -b feat-then-chore main
+    git commit -q --allow-empty -m "feat(push): the real work landed in commit one"
+    git commit -q --allow-empty -m "chore: tidy up after it"
+    git checkout -q -b chore-then-fix main
+    git commit -q --allow-empty -m "chore: first wip commit"
+    git commit -q --allow-empty -m "fix(push): the actual fix"
+    git checkout -q -b fix-then-feat main
+    git commit -q --allow-empty -m "fix(push): a fix in commit one"
+    git commit -q --allow-empty -m "feat(push): a feature in commit two"
+    git checkout -q -b feat-then-fix main
+    git commit -q --allow-empty -m "feat(push): a feature in commit one"
+    git commit -q --allow-empty -m "fix(push): a fix in commit two"
+    git checkout -q -b prose-range main
+    git commit -q --allow-empty -m "made the thing work"
+    git commit -q --allow-empty -m "made it work again"
+    git checkout -q -b long-subject main
+    git commit -q --allow-empty -m "feat(push): $(printf 'x%.0s' $(seq 1 300))"
+    git checkout -q main
+  ) >/dev/null 2>&1
+
+  # 9a. a chore FIRST, a feat SECOND: the mint must be feat, and must NOT be the
+  #     oldest subject. Reading one member would mint `chore: first wip commit`,
+  #     main squashes that, release-cut reads chore and cuts a PATCH for a feature
+  #     (DIVE-4086) — and the green title means nothing stops it.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main chore-then-feat "a board title")
+  { [[ "$got" == "feat(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a multi-commit range takes the type of its strongest member (chore,feat -> feat)" \
+    || bad_t "4423: a multi-commit range takes the type of its strongest member (chore,feat -> feat)" "got: $got"
+
+  # 9b. THE SAME RANGE IN THE OTHER ORDER. This is what kills a head-1/tail-1
+  #     mutant in EITHER direction: no single-member read can satisfy 9a and 9b
+  #     at once, because the feat is the oldest in one and the newest in the other.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main feat-then-chore "a board title")
+  { [[ "$got" == "feat(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: the range type does not depend on commit ORDER (feat,chore -> feat)" \
+    || bad_t "4423: the range type does not depend on commit ORDER (feat,chore -> feat)" "got: $got"
+
+  # 9c. no feat in the range, one fix -> fix. The floor may not demote it to chore.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main chore-then-fix "a board title")
+  { [[ "$got" == "fix(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a range with a fix and no feat mints fix, not chore" \
+    || bad_t "4423: a range with a fix and no feat mints fix, not chore" "got: $got"
+
+  # 9c-bis. feat OUTRANKS fix, in BOTH orders. Without this pair the precedence is
+  #     ungraded: no fixture above carries a feat and a fix in the same range, so a
+  #     mutant inverting the two survives every other arm (measured).
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main fix-then-feat "a board title")
+  [[ "$got" == "feat(DIVE-4423): a board title" ]] \
+    && ok_t "4423: feat outranks fix in a mixed range (fix,feat -> feat)" \
+    || bad_t "4423: feat outranks fix in a mixed range (fix,feat -> feat)" "got: $got"
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main feat-then-fix "a board title")
+  [[ "$got" == "feat(DIVE-4423): a board title" ]] \
+    && ok_t "4423: feat outranks fix whichever comes first (feat,fix -> feat)" \
+    || bad_t "4423: feat outranks fix whichever comes first (feat,fix -> feat)" "got: $got"
+
+  # 9d. nothing in the range is gradeable -> chore. A title we minted ourselves is
+  #     not evidence that this change is a feature.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main prose-range "a board title")
+  { [[ "$got" == "chore(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a multi-commit range with no conventional member floors at chore" \
+    || bad_t "4423: a multi-commit range with no conventional member floors at chore" "got: $got"
+
+  # 9e. a multi-commit range NEVER reuses a member subject verbatim, even when that
+  #     member passes the lint on its own.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main chore-then-feat "a board title")
+  { [[ "$got" != *"the real work landed in commit two"* && "$got" != *"first wip commit"* ]]; } \
+    && ok_t "4423: a multi-commit range does not reuse any one commit subject" \
+    || bad_t "4423: a multi-commit range does not reuse any one commit subject" "got: $got"
+
+  # 9f. GitHub caps a PR title at 256 characters and the `gh pr create` call is
+  #     warn-only, so an over-long mint opens NO PR at all — silently. The reuse
+  #     path truncates BEFORE appending the ident, so the ident (which the merge
+  #     gate's evidence binds on) survives the cut.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main long-subject "a board title")
+  { (( ${#got} <= 256 )) && [[ "$got" == *"(DIVE-4423)" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a 300-character commit subject mints a title <=256 that still carries the ident" \
+    || bad_t "4423: a 300-character commit subject mints a title <=256 that still carries the ident" "len=${#got} got: ${got:0:80}..."
+
+  # 9g. the by-construction path is capped too — a board title can be any length.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main prose-range "$(printf 'y%.0s' $(seq 1 400))")
+  { (( ${#got} <= 256 )) && [[ "$got" == "chore(DIVE-4423): "* ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: the by-construction path is capped at 256 as well" \
+    || bad_t "4423: the by-construction path is capped at 256 as well" "len=${#got}"
+
+  # 9h. _push_subject_type is certified by the RULE, not by a second regex: a
+  #     subject the rule reds contributes NO type, whatever it looks like.
+  got=$(_push_subject_type "$T4423" "feat(push): a real one") || got="<none>"
+  [[ "$got" == "feat" ]] \
+    && ok_t "4423: _push_subject_type reads the declared type of a passing subject" \
+    || bad_t "4423: _push_subject_type reads the declared type of a passing subject" "got: $got"
+  got=$(_push_subject_type "$T4423" "feat something without the colon") || got="<none>"
+  [[ "$got" == "<none>" ]] \
+    && ok_t "4423: _push_subject_type yields no type for a subject the rule reds" \
+    || bad_t "4423: _push_subject_type yields no type for a subject the rule reds" "got: $got"
+  got=$(_push_subject_type "$T4423" "feat(push)!: a breaking one") || got="<none>"
+  [[ "$got" == "feat" ]] \
+    && ok_t "4423: _push_subject_type strips the scope and the breaking marker" \
+    || bad_t "4423: _push_subject_type strips the scope and the breaking marker" "got: $got"
 fi
 
 echo "-----"

@@ -852,6 +852,23 @@ _push_title_passes_lint() {
   PR_TITLE="$title" eval "$line true; else false; fi"
 }
 
+# _push_subject_type <repopath> <subject>
+# DIVE-4423 iteration 3. Prints the conventional-commit TYPE a subject declares,
+# and prints NOTHING (non-zero) for a subject the extracted rule does not accept.
+# The rule stays the single authority on what a valid subject is — this only reads
+# the leading token that a certified subject is guaranteed to carry (everything up
+# to the first `(`, `!` or `:`), so there is still exactly one author for the
+# contract and an ungradeable subject contributes no type at all.
+_push_subject_type() {
+  local repopath="$1" subj="$2" head=""
+  _push_title_passes_lint "$repopath" "$subj" || return 1
+  head="${subj%%:*}"     # feat(push)!: x  ->  feat(push)!
+  head="${head%%\(*}"    # feat(push)!     ->  feat
+  head="${head%%!*}"     # feat!           ->  feat
+  [[ -n "$head" ]] || return 1
+  printf '%s' "$head"
+}
+
 # _push_mint_pr_title <ident> <repopath> <base> <branch> <task-title>
 # DIVE-4423. The old default was "${ident}: ${task_title}", and `DIVE-4409: ...`
 # can NEVER match pr-title-lint.yml's `^(feat|fix|...)(\(...\))?!?: ` — so every PR
@@ -860,36 +877,75 @@ _push_title_passes_lint() {
 # were nothing but that retitling, one PR at a time. Structural, not per-author.
 #
 # Two sources, in this order:
-#   1. THE BRANCH'S OWN FIRST COMMIT SUBJECT, when it passes the lint. This is the
-#      author's own conventional type, which is the one thing this function must not
-#      invent: the type decides whether release-cut cuts a minor or a patch
-#      (DIVE-4086), and defaulting everything to `chore` would silently demote every
-#      feature. It is also what GitHub itself offers, and what pre-push-rail.sh has
-#      already graded against this same rule before the branch could be pushed — so
-#      on a rail-cleared branch this arm is the normal case, not the lucky one.
-#      The FIRST (oldest) commit of the range is taken, matching resolve_title.
-#   2. `chore(<ident>): <task title>` otherwise — no commit to read, no rule to read,
-#      or a subject that genuinely fails. It satisfies the rule by construction and
-#      keeps the ident, and `chore` is the honest floor: a title we minted ourselves
-#      is not evidence that this change is a feature.
+#   1. THE BRANCH'S OWN COMMIT SUBJECT, when the range holds EXACTLY ONE COMMIT and
+#      that subject passes the lint. One commit is the sole condition under which
+#      both halves of this arm's justification hold: it is the string GitHub itself
+#      offers as the new PR's title, and it is the string pre-push-rail.sh graded
+#      against this same rule before the branch could be pushed (its resolve_title
+#      says so). Reusing it preserves the AUTHOR's conventional type, which is the
+#      one thing this function must not invent — the type decides whether
+#      release-cut cuts a minor or a patch (DIVE-4086).
+#   2. `<type>(<ident>): <task title>` otherwise, with the type derived from the
+#      WHOLE RANGE: feat if any commit in it declares feat, else fix if any declares
+#      fix, else chore. Measured 2026-09-13, 7 of 8 recent PRs in this repo carry
+#      2-4 commits, so this is the MAJORITY path, not the exception. Reading one
+#      member of a multi-commit range (the oldest, as the old code did) describes
+#      the PR by whichever commit happened to be first — a `chore: wip` first commit
+#      would mint a chore title for a branch whose real work is a feat, main squashes
+#      it, release-cut reads the type and cuts a PATCH for a feature (DIVE-4086's
+#      defect in the other direction, which this row's own ALTERNATIVES block cites
+#      to disqualify `always chore`). Taking the maximum over the range passes the
+#      lint by construction AND cannot demote the cut below what the range earned.
 #
 # The ident is APPENDED to a passing subject that lacks it rather than prefixed: the
 # rule anchors at ^ only, so nothing added at the end can turn a passing title red.
+# GitHub refuses a PR title over 256 characters and `gh pr create` is warn-only at
+# this call site, so an over-long mint opens NO PR at all — both paths are capped,
+# and the reuse path truncates the subject BEFORE appending the ident so the ident
+# (which the merge gate's evidence binds on) always survives.
+_PUSH_PR_TITLE_MAX=256
 _push_mint_pr_title() {
   local ident="$1" repopath="$2" base="$3" branch="$4" t="$5"
-  local subj="" range_base=""
+  local range_base="" subj="" type="" ty="" s="" room=0 max=$_PUSH_PR_TITLE_MAX
+  local -a subjects=()
   if [[ -n "$repopath" && -n "$branch" ]]; then
     range_base="$base"
     git -C "$repopath" rev-parse --verify --quiet "refs/remotes/origin/${base}" >/dev/null 2>&1 \
       && range_base="refs/remotes/origin/${base}"
-    subj=$(git -C "$repopath" log --format='%s' "${range_base}..refs/heads/${branch}" 2>/dev/null | tail -1) || subj=""
+    mapfile -t subjects < <(git -C "$repopath" log --format='%s' "${range_base}..refs/heads/${branch}" 2>/dev/null)
   fi
-  if [[ -n "$subj" ]] && _push_title_passes_lint "$repopath" "$subj"; then
-    [[ "$subj" == *"$ident"* ]] || subj="${subj} (${ident})"
+
+  # 1. single-commit range only.
+  if [[ ${#subjects[@]} -eq 1 && -n "${subjects[0]}" ]] \
+     && _push_title_passes_lint "$repopath" "${subjects[0]}"; then
+    subj="${subjects[0]}"
+    if [[ "$subj" == *"$ident"* ]]; then
+      (( ${#subj} > max )) && subj="${subj:0:$((max - 3))}..."
+    else
+      room=$(( max - ${#ident} - 3 ))            # the " (<ident>)" it is about to gain
+      (( ${#subj} > room )) && subj="${subj:0:$((room - 3))}..."
+      subj="${subj} (${ident})"
+    fi
     printf '%s' "$subj"
     return 0
   fi
-  printf 'chore(%s): %s' "$ident" "${t:-delegated push}"
+
+  # 2. by-construction form, typed by the whole range. An ungradeable subject (and
+  #    so an unreadable or unmatched rule) yields no type, which floors at `chore`:
+  #    a title we minted ourselves is not evidence that this change is a feature.
+  for s in "${subjects[@]}"; do
+    ty="$(_push_subject_type "$repopath" "$s")" || ty=""
+    case "$ty" in
+      feat) type="feat"; break ;;
+      fix)  [[ -n "$type" ]] || type="fix" ;;
+    esac
+  done
+  t="${t:-delegated push}"
+  [[ -n "$type" ]] || type="chore"
+  room=$(( max - ${#ident} - ${#type} - 4 ))   # "<type>(<ident>): "
+  (( room < 4 )) && room=4
+  (( ${#t} > room )) && t="${t:0:$((room - 3))}..."
+  printf '%s(%s): %s' "$type" "$ident" "$t"
 }
 
 # _push_open_pr <ident> <slug> <branch> <base> <title> <body-file> <draft> [repopath]
