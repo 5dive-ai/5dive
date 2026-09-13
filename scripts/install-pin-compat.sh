@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# DIVE-4350 — install.sh COMES FROM main, ITS DOWNLOADS COME FROM THE PIN.
+#
+# THE CLASS THIS GRADES (DIVE-4349, 2026-09-12). install.sh is fetched live from
+# `main` — install.5dive.com serves it, and every box re-fetches it on each
+# self-update — but every `$REPO/<path>` inside it resolves against the tree of
+# the tag the fleet is PINNED to. Those two refs are not the same ref, and with
+# the pin promoted deliberately and rarely (DIVE-4140) main is normally AHEAD.
+#
+# So a maker adding a fail-closed `curl -fsSL "$REPO/<new file>"` to install.sh
+# ships a 404 to the fleet: #890 added hooks/stop-browser-teardown.sh (first in
+# v0.34.0) while the pin was v0.32.3, and under `set -e` that 404 aborted the
+# WHOLE install. Every fresh customer box and every pinned box's 04:00Z
+# self-update failed at "Installing software" from 18:24Z until the hotfix.
+# Nothing in CI could see it: the file exists on main, so every test passed.
+#
+# WHAT THIS ASSERTS: for each fail-closed `$REPO/<path>` in install.sh,
+# `<pin>:<path>` is an object in this repo. That is the exact condition the
+# fleet evaluates at 04:00Z, evaluated at PR time instead.
+#
+# AND WHEN IT CANNOT TELL: a download site that matches neither the tolerant set
+# nor the fail-closed set is `unclassified`, and unclassified FAILS this job. An
+# unasserted complement is not a classification — iteration 1 of this guard made
+# fail-closed the complement of four tolerance rules, and three ordinary bash
+# idioms (a captured `$(curl …)`, `if ! curl …; then die`, `|| { …; exit 1; }`)
+# fell straight through it, including how install.sh fetches its own
+# 5dive.sha256. See the CLASSIFIER block below.
+#
+# WHAT IT DOES NOT ASSERT, named rather than left to be discovered:
+#   * downloads whose path is a runtime variable this script cannot resolve —
+#     they are LISTED in the report by line, not silently dropped;
+#   * the six branch-tarball merge-deploy sites of OTHER repos (DIVE-2288) —
+#     a different rail, and no check in this repo can see them;
+#   * whether a file that EXISTS at the pin is the right version of itself.
+#
+# THE FIX when this fails is one of two, and never "retry":
+#   1. the file is genuinely newer than the pin -> move the download into
+#      `fetch_optional_at_pin` (install.sh), which skips on 404 only; or
+#   2. the pin has caught up -> promote it, and update .github/fleet-pin.
+#
+# Hermetic apart from ONE optional network call (the live pin route). Grades a
+# working tree; `--install-sh=` and `--pin=` make it drivable from a harness.
+set -uo pipefail
+
+INSTALL_SH="install.sh"
+PIN=""
+PIN_SOURCE=""
+ROUTE="${FLEET_PIN_ROUTE:-https://api.5dive.com/cli-version}"
+RECORDED=".github/fleet-pin"
+NO_NETWORK="${INSTALL_PIN_COMPAT_NO_NETWORK:-0}"
+SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+for arg in "$@"; do
+  case "$arg" in
+    --install-sh=*) INSTALL_SH="${arg#*=}" ;;
+    --pin=*)        PIN="${arg#*=}"; PIN_SOURCE="--pin= override" ;;
+    --recorded=*)   RECORDED="${arg#*=}" ;;
+    --no-network)   NO_NETWORK=1 ;;
+    *) printf 'install-pin-compat: unknown argument %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
+
+[[ -r "$INSTALL_SH" ]] || { printf 'install-pin-compat: cannot read %s\n' "$INSTALL_SH" >&2; exit 2; }
+
+# ---------------------------------------------------------------- resolve the pin
+# Ladder: explicit override > live route > recorded file. A recorded value that
+# lags the real pin makes this guard stricter, never looser (see .github/fleet-pin).
+if [[ -z "$PIN" && "$NO_NETWORK" != 1 ]]; then
+  _route_answer="$(curl -fsSL --max-time 10 "$ROUTE" 2>/dev/null | tr -d '[:space:]')" || _route_answer=""
+  if [[ "$_route_answer" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    PIN="$_route_answer"; PIN_SOURCE="live fleet route $ROUTE"
+  fi
+fi
+if [[ -z "$PIN" && -r "$RECORDED" ]]; then
+  _rec="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$RECORDED" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)" || _rec=""
+  if [[ -n "$_rec" ]]; then
+    PIN="$_rec"; PIN_SOURCE="recorded pin $RECORDED (the live route did not answer)"
+  fi
+fi
+if [[ -z "$PIN" ]]; then
+  # NOT a silent pass. Both rungs failing means the guard graded nothing, and a
+  # green tick for "I could not look" is the fails-open half of every guard this
+  # repo has had to fix twice (DIVE-4237).
+  printf '::error::install-pin-compat resolved NO fleet pin — the live route (%s) did not answer and %s carries no vN.N.N line. It therefore graded nothing, and is refusing rather than reporting a pass it did not earn. Set the pin in %s.\n' \
+    "$ROUTE" "$RECORDED" "$RECORDED" >&2
+  exit 1
+fi
+
+# The pin must be an OBJECT here, or the assertion below is vacuous.
+PIN_COMMIT="$(git rev-parse -q --verify "refs/tags/${PIN}^{commit}" 2>/dev/null)" || PIN_COMMIT=""
+if [[ -z "$PIN_COMMIT" ]]; then
+  git fetch --tags --quiet origin "refs/tags/${PIN}:refs/tags/${PIN}" >/dev/null 2>&1 || true
+  PIN_COMMIT="$(git rev-parse -q --verify "refs/tags/${PIN}^{commit}" 2>/dev/null)" || PIN_COMMIT=""
+fi
+if [[ -z "$PIN_COMMIT" ]]; then
+  printf '::error::install-pin-compat resolved the fleet pin as %s (%s) but that tag is not an object in this clone and could not be fetched, so every path assertion below would be vacuously true. Refusing to report a pass it did not earn.\n' \
+    "$PIN" "$PIN_SOURCE" >&2
+  exit 1
+fi
+
+# ------------------------------------------------------- extract download sites
+# Join backslash continuations first: the pii-guard block is one logical `if`
+# spread over five physical lines, and classifying those lines separately reads
+# four bare `curl`s that are not bare.
+# The helper's OWN body is excluded: `curl "$REPO/$_path"` inside
+# fetch_optional_at_pin is the tolerant mechanism, not a download site, and
+# grading it would report the mechanism as an ungradeable blind spot forever.
+LOGICAL="$(sed -e '/>>> DIVE-4350 optional-at-pin download contract/,/<<< DIVE-4350 optional-at-pin download contract/d' "$INSTALL_SH" \
+           | sed -e :a -e '/\\$/N; s/\\\n//; ta')"
+
+# ---------------------------------------------------------------- THE CLASSIFIER
+# Iteration 1 of this guard treated fail-closed as the UNASSERTED COMPLEMENT of
+# four tolerance rules, and quinn measured the consequence: three ordinary
+# fail-closed idioms fell through the complement and were never graded, so the
+# guard greened the exact DIVE-4349 shape it exists to catch. One of the three
+# was not synthetic — `_want="$(curl "$REPO/5dive.sha256" …)" || _want=""` is how
+# install.sh fetches its own checksum, and it was reported as *tolerated* while
+# its `else` arm dies. A complement is not an assertion.
+#
+# So BOTH sets are now enumerated, and matching NEITHER is a THIRD outcome that
+# FAILS this job. The guard refuses to have an opinion it cannot ground.
+#
+#   TOLERANT — only two shapes, each STRUCTURALLY proven unable to abort:
+#     T1  the line routes through `fetch_optional_at_pin`, whose contract is
+#         tested arm-by-arm in tests/install_pin_compat_unit.sh;
+#     T2  the curl is the CONDITION of an `if`/`elif` whose FAILURE BRANCH is
+#         positively shown to ABSORB the failure: the branch taken when the
+#         download fails (the `then` block when the condition is negated with
+#         `if !`, the `else` block otherwise, and NO `else` block at all means
+#         nothing absorbs it) consists SOLELY of log-only statements —
+#         echo/printf/warn/note/log/`:`/true. Absence of an abort token is NOT
+#         evidence of absorption: `if ! curl …; then _failed=1; fi` followed by
+#         `[[ -n "$_failed" ]] && die` has no abort token inside the construct
+#         and takes the box down two lines later (quinn, iteration 2).
+#
+#   FAIL-CLOSED — graded against the pin:
+#     F1  the result is CAPTURED in a command substitution. The failure is
+#         deferred to code this line cannot show, so this line cannot claim it
+#         is handled. (5dive.sha256: the deferred handler dies.)
+#     F2  condition of an `if`/`elif` whose construct DOES contain die/exit/return.
+#     F3  has a `||` fallback and the logical line contains die/exit/return.
+#     F4  bare: no `||`, not a condition, not captured — `set -e` takes the box
+#         down on a 404.
+#
+#   UNCLASSIFIED — matches neither set. NOT a pass. The maker either routes it
+#   through the helper or writes it in a shape named above.
+#
+# Bias is unchanged and now actually holds: every residual ambiguity resolves
+# toward *grading* the path. A false positive costs one PR comment; a false
+# negative cost the fleet on 2026-09-12.
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+printf '%s\n' "$LOGICAL" | awk '
+  function ind(s,   x){ match(s, /^[ \t]*/); return RLENGTH }
+  # end of the if/elif construct opened at line i: the next line at the SAME
+  # indentation whose first token is `fi`. Returns 0 if the structure does not
+  # resolve, which callers treat as fail-closed.
+  function construct_end(i,   myind, k, ki) {
+    myind = ind(L[i])
+    for (k = i + 1; k <= N; k++) {
+      if (L[k] ~ /^[[:space:]]*$/ || L[k] ~ /^[[:space:]]*#/) continue
+      ki = ind(L[k])
+      if (ki < myind) return 0
+      if (ki == myind && L[k] ~ /^[[:space:]]*fi([[:space:];&|)]|$)/) return k
+    }
+    return 0
+  }
+  function body_aborts(i, e,   k, body) {
+    body = ""
+    for (k = i; k <= e; k++) body = body "\n" L[k]
+    return (body ~ /(^|[^A-Za-z0-9_])(die|exit|return)([^A-Za-z0-9_]|$)/) ? 1 : 0
+  }
+  # the first `else`/`elif` belonging to THIS construct (same indentation),
+  # i.e. not one of a nested construct. 0 when the construct has none.
+  function top_level_else(i, e,   myind, k) {
+    myind = ind(L[i])
+    for (k = i + 1; k < e; k++) {
+      if (L[k] ~ /^[[:space:]]*$/ || L[k] ~ /^[[:space:]]*#/) continue
+      if (ind(L[k]) != myind) continue
+      if (L[k] ~ /^[[:space:]]*(else|elif)([[:space:];&|)]|$)/) return k
+    }
+    return 0
+  }
+  # every non-blank, non-comment line in [s,e] is a log-only statement.
+  # An EMPTY range is not positive evidence, so it is not absorption.
+  function log_only(s, e,   k, t, seen) {
+    seen = 0
+    for (k = s; k <= e; k++) {
+      t = L[k]
+      if (t ~ /^[[:space:]]*$/ || t ~ /^[[:space:]]*#/) continue
+      if (t ~ /^[[:space:]]*(echo|printf|warn|note|log|:|true)([[:space:]]|$)/) { seen = 1; continue }
+      return 0
+    }
+    return seen
+  }
+  # POSITIVE evidence that an if-construct absorbs the failure of the download.
+  #   1  absorbed  -> T2
+  #   0  failure branch exists but is not log-only (it may escape)
+  #  -1  no else branch: nothing absorbs the failure
+  #  -2  the failure runs into an `elif`: another test, not an absorption
+  function branch_absorbs(i, e,   negated, br, bs, be) {
+    negated = (L[i] ~ /^[[:space:]]*(el)?if[[:space:]]+!/)
+    br = top_level_else(i, e)
+    if (negated) {
+      # failure takes the `then` block: from just after the condition line to
+      # the first else/elif of this construct, or to the `fi`.
+      bs = i + 1
+      be = (br > 0) ? br - 1 : e - 1
+      return log_only(bs, be) ? 1 : 0
+    }
+    if (br == 0) return -1
+    if (L[br] ~ /^[[:space:]]*elif([[:space:];&|)]|$)/) return -2
+    return log_only(br + 1, e - 1) ? 1 : 0
+  }
+  function captured(l,   p, c) {   # is the curl inside a command substitution?
+    p = index(l, "$("); c = index(l, "curl")
+    return (p > 0 && c > p)
+  }
+  function has_abort(l) { return (l ~ /(^|[^A-Za-z0-9_])(die|exit|return)([^A-Za-z0-9_]|$)/) }
+  function classify(i,   l, a, e) {
+    l = L[i]
+    if (l ~ /fetch_optional_at_pin/)                 return "tolerant\tT1 helper"
+    if (captured(l))                                 return "closed\tF1 captured in $(…); failure deferred"
+    if (l ~ /^[[:space:]]*(el)?if[[:space:]]/) {
+      e = construct_end(i)
+      if (e == 0)                                    return "closed\tF2 if-construct end not resolvable"
+      if (body_aborts(i, e))                         return "closed\tF2 if-construct dies"
+      a = branch_absorbs(i, e)
+      if (a == 1)                                    return "tolerant\tT2 failure branch is log-only"
+      if (a == -1)                                   return "unclassified\tif-construct has no else branch, so nothing absorbs the download failure"
+      if (a == -2)                                   return "unclassified\tthe failure of this if-construct runs into an elif, which tests again rather than absorbing it"
+      return "unclassified\tthe failure branch of this if-construct is not log-only, so the failure may escape to code this construct cannot show"
+    }
+    if (l ~ /\|\|/) {
+      if (has_abort(l))                              return "closed\tF3 || then die/exit/return"
+      return "unclassified\t|| fallback that neither aborts nor is the named helper"
+    }
+    if (l ~ /&&/ && l !~ /;[[:space:]]*then/)        return "closed\tF4 bare (&&-list under set -e)"
+    if (l !~ /\|\|/)                                 return "closed\tF4 bare under set -e"
+    return "unclassified\tshape matches neither the tolerant nor the fail-closed set"
+  }
+  { L[NR] = $0; N = NR }
+  END {
+    for (i = 1; i <= N; i++) {
+      line = L[i]
+      # remember the most recent `for <var> in <words>; do` list
+      if (match(line, /^[[:space:]]*for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]]/)) {
+        hdr = line
+        sub(/^[[:space:]]*for[[:space:]]+/, "", hdr)
+        var = hdr; sub(/[[:space:]].*$/, "", var)
+        items = hdr; sub(/^[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]]+/, "", items)
+        sub(/;[[:space:]]*do.*$/, "", items)
+        forvar[var] = items
+      }
+      if (line ~ /^[[:space:]]*#/) continue
+      if (line !~ /\$\{?REPO\}?\//) continue
+      if (line !~ /curl/) continue
+      # `echo "Fallback: curl -fsSL $REPO/install.sh | sudo bash"` at the foot of
+      # install.sh prints an instruction; it downloads nothing.
+      if (line ~ /^[[:space:]]*(echo|printf)[[:space:]]/) continue
+      split(classify(i), cc, "\t"); cls = cc[1]; why = cc[2]
+      snip = line; sub(/^[[:space:]]+/, "", snip); snip = substr(snip, 1, 90)
+      if (cls == "unclassified") { print "unclassified\t" snip "\t" why; continue }
+      rest = line
+      while (match(rest, /\$\{?REPO\}?\/[^"'"'"' ]+/)) {
+        site = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RSTART + RLENGTH)
+        path = site
+        sub(/^\$\{?REPO\}?\//, "", path)
+        if (path ~ /\$/) {
+          # one resolvable shape: a for-loop variable whose list we just recorded
+          resolved = 0
+          for (v in forvar) {
+            pat = "\\$\\{?" v "\\}?$"
+            if (path ~ pat) {
+              prefix = path; sub(pat, "", prefix)
+              n = split(forvar[v], w, /[[:space:]]+/)
+              for (j = 1; j <= n; j++) if (w[j] != "") print cls "\t" prefix w[j] "\tfor-list $" v " / " why
+              resolved = 1
+            }
+          }
+          if (!resolved) print "unresolved\t" path "\truntime variable"
+        } else {
+          print cls "\t" path "\t" why
+        }
+      }
+    }
+  }
+' > "$TMP/sites"
+
+# URL-decode the one encoding install.sh uses (systemd/5dive-agent%40.service).
+sed -i 's/%40/@/g' "$TMP/sites"
+
+CLOSED="$(awk -F'\t' '$1=="closed"{print $2"\t"$3}' "$TMP/sites" | sort -u)"
+TOLERANT="$(awk -F'\t' '$1=="tolerant"{print $2}' "$TMP/sites" | sort -u)"
+UNRESOLVED="$(awk -F'\t' '$1=="unresolved"{print $2}' "$TMP/sites" | sort -u)"
+UNCLASSIFIED="$(awk -F'\t' '$1=="unclassified"{print $2"\t"$3}' "$TMP/sites" | sort -u)"
+
+if [[ -z "$CLOSED" ]]; then
+  printf '::error::install-pin-compat found ZERO fail-closed $REPO downloads in %s. install.sh has always had several, so this is the extractor breaking, not the file getting safer — and a guard that greens when it stops being able to read its input is worse than no guard (DIVE-4237).\n' "$INSTALL_SH" >&2
+  exit 1
+fi
+
+# ------------------------------------------------------------------- the assertion
+MISSING=0; CHECKED=0
+{
+  printf '## install.sh vs the fleet pin\n\n'
+  printf 'Fleet pin: **%s** (`%s`) — resolved from %s.\n\n' "$PIN" "${PIN_COMMIT:0:12}" "$PIN_SOURCE"
+  printf '`install.sh` is served from **main**; every `$REPO/…` inside it is fetched from **%s**.\n\n' "$PIN"
+} >> "$SUMMARY"
+
+while IFS=$'\t' read -r path how; do
+  [[ -n "$path" ]] || continue
+  CHECKED=$((CHECKED+1))
+  if git cat-file -e "${PIN_COMMIT}:${path}" 2>/dev/null; then
+    printf 'ok   - %s exists at %s [%s]\n' "$path" "$PIN" "$how"
+  else
+    MISSING=$((MISSING+1))
+    printf 'FAIL - %s is fetched FAIL-CLOSED but does not exist at %s (%s)\n' "$path" "$PIN" "$how"
+    printf '::error file=%s::install.sh downloads `%s` fail-closed, but the fleet pin %s does not carry that path. Every fresh install and every box'"'"'s 04:00Z self-update would 404 there and abort the whole install under `set -e` (DIVE-4349). Fix: move it into `fetch_optional_at_pin` (skips on 404 only), or promote the fleet pin past the tag that ships it and update .github/fleet-pin.\n' \
+      "$INSTALL_SH" "$path" "$PIN" >&2
+    printf -- '- **MISSING at %s**: `%s` (%s)\n' "$PIN" "$path" "$how" >> "$SUMMARY"
+  fi
+done <<< "$CLOSED"
+
+# ------------------------------------------------- neither set: refuse, never pass
+UNCLASSIFIED_N=0
+if [[ -n "$UNCLASSIFIED" ]]; then
+  {
+    printf '\n### UNCLASSIFIED download shapes — this job fails on these\n\n'
+    printf 'A `$REPO/…` download that matches neither the tolerant set (the helper, or an `if` construct whose failure branch is log-only) nor the fail-closed set has no grounded disposition, and iteration 1 of this guard proved what happens when the ungrounded half is assumed safe: three fail-closed idioms were reported as tolerated and never graded.\n\n'
+  } >> "$SUMMARY"
+  while IFS=$'\t' read -r snip why; do
+    [[ -n "$snip" ]] || continue
+    UNCLASSIFIED_N=$((UNCLASSIFIED_N+1))
+    printf 'UNCLASSIFIED - %s\n           (%s)\n' "$snip" "$why"
+    printf '::error file=%s::install-pin-compat cannot classify this `$REPO` download as fail-closed or tolerant: `%s` (%s). It is therefore NOT graded against the fleet pin, and this guard will not report a pass it did not earn. Route it through `fetch_optional_at_pin`, or write the failure handling in a shape the guard recognises (a `||` that dies, or an `if` construct whose failure branch does nothing but log).\n' \
+      "$INSTALL_SH" "$snip" "$why" >&2
+    printf -- '- `%s` — %s\n' "$snip" "$why" >> "$SUMMARY"
+  done <<< "$UNCLASSIFIED"
+fi
+
+{
+  printf '\n%d fail-closed path(s) checked, %d missing at the pin, %d unclassified.\n\n' "$CHECKED" "$MISSING" "$UNCLASSIFIED_N"
+  if [[ -n "$TOLERANT" ]]; then
+    printf '### Tolerated at this pin (404 -> named skip, anything else still fatal)\n\n'
+    while IFS= read -r t; do [[ -n "$t" ]] && printf -- '- `%s`\n' "$t"; done <<< "$TOLERANT"
+    printf '\n'
+  fi
+  printf '### What this check CANNOT see\n\n'
+  if [[ -n "$UNRESOLVED" ]]; then
+    printf 'Downloads whose path is a runtime variable — listed, not silently dropped:\n\n'
+    while IFS= read -r u; do [[ -n "$u" ]] && printf -- '- `$REPO/%s`\n' "$u"; done <<< "$UNRESOLVED"
+    printf '\n'
+  fi
+  printf 'Also invisible here: the six branch-tarball merge-deploy sites of **other** repos (DIVE-2288) — a different rail, and no path filter in this repo can reach them.\n'
+} >> "$SUMMARY"
+
+if [[ -n "$UNRESOLVED" ]]; then
+  while IFS= read -r u; do
+    [[ -n "$u" ]] || continue
+    printf 'note - $REPO/%s is a runtime variable; NOT graded against the pin\n' "$u"
+  done <<< "$UNRESOLVED"
+fi
+
+printf 'install-pin-compat: pin=%s (%s) source=%s checked=%d missing=%d tolerated=%d unclassified=%d unresolved=%d\n' \
+  "$PIN" "${PIN_COMMIT:0:12}" "$PIN_SOURCE" "$CHECKED" "$MISSING" \
+  "$(printf '%s' "$TOLERANT" | grep -c . || true)" "$UNCLASSIFIED_N" "$(printf '%s' "$UNRESOLVED" | grep -c . || true)"
+
+[[ $MISSING -eq 0 && $UNCLASSIFIED_N -eq 0 ]] || exit 1

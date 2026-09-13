@@ -1,0 +1,34 @@
+# 5dive-release-hold v1
+#
+# THE FLEET BRAKE (DIVE-4223). Every box's `5dive self-update` re-fetches
+# install.sh from `main` on every run, so this file — read from `main`, never
+# from the tag being installed — is a live fleet control plane.
+#
+# TO ARM A HOLD: add ONE line naming the release tag to hold back, then commit
+# and push to main. It takes effect on each box at its next self-update (the
+# fleet's is 04:00Z); the raw CDN adds a few minutes.
+#
+#     v0.15.34   red nightly smoke 2026-09-10, onboarding wizard dead — <who>
+#
+# TO REVERT: delete the line and push. One commit each way.
+#
+# LINE SHAPE, exactly: a bare vMAJOR.MINOR.PATCH tag at column 1, optionally
+# followed by whitespace and a human reason. Anything else — a leading space, a
+# `#`, a `v0.15` — is NOT a hold and will be ignored in silence. Under incident
+# pressure, copy the line above.
+#
+# WHAT A HOLD DOES: install.sh's resolve_gh_tag() walks the version-sorted tag
+# list DOWN from the newest and skips every tag listed here, so boxes land on the
+# newest release that is NOT held. `5dive update --check` reads the same file, so
+# it reports the same version the installer would actually deliver.
+#
+# WHAT A HOLD DOES NOT DO: it holds boxes BACK, it does not pull them back. A box
+# that already installed the held tag stays on it — DIVE-2243's monotonicity
+# guard refuses the downgrade. This bounds how many boxes reach a bad release; it
+# does not undo the ones that did.
+#
+# DO NOT DELETE THIS FILE, and do not empty it. Its absence is not "no hold" —
+# both readers treat an unfetchable or bannerless body as UNKNOWN and fail
+# CLOSED, which stops every upgrade on the fleet until it is restored.
+#
+# Held tags below this line. None currently.

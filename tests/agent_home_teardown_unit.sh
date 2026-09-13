@@ -242,5 +242,126 @@ else
         "check=$ln_chk user=$ln_usr registry=$ln_reg (did a call site get renamed?)"
 fi
 
+# ---------------------------------------------------------------------------
+# DIVE-4340: the user half of the teardown, when it does NOT succeed.
+#
+# `deluser` used to run as `deluser ... 2>/dev/null || true`, so a teardown that
+# could not delete the account was indistinguishable from one that did — and the
+# caller dropped the registry row either way, which is how 8 accounts on
+# exact-swallow ended up on a box with no command able to reach them. The
+# verdict must be "is the account still there afterwards", not deluser's rc.
+# ---------------------------------------------------------------------------
+DELUSER_RC=0
+id()      { if [[ "${1:-}" == "-u" ]]; then [[ "${2:-}" == "agent-zombie" ]] && { echo 4242; return 0; }; return 1; fi; command id "$@"; }
+getent()  { [[ "${1:-}" == passwd ]] && { printf 'agent-zombie:x:4242:4242::%s/agent-zombie:/bin/bash\n' "$AGENT_HOME_ROOT"; return 0; }; return 1; }
+deluser() { printf 'deluser: /usr/sbin/deluser must be run as root\n' >&2; return "$DELUSER_RC"; }
+setfacl() { return 0; }
+capability_forget_agent() { return 0; }
+AUDITED=""
+audit_log() { AUDITED="$*"; return 0; }
+
+# A deluser that fails and leaves the account behind.
+DELUSER_RC=1
+mkdir -p "$AGENT_HOME_ROOT/agent-zombie"
+_RM_USER_DISPOSITION=""
+# Run it in THIS shell: a command substitution would take the disposition and
+# the audit row into a subshell, and the assertions below would read neither.
+delete_agent_user zombie >/dev/null 2>"$TMP/zombie.err"
+err=$(cat "$TMP/zombie.err")
+[[ "$_RM_USER_DISPOSITION" == "present" ]] \
+  && ok_t "a surviving account is reported as user disposition 'present'" \
+  || bad_t "a surviving account is reported as 'present'" "disposition='$_RM_USER_DISPOSITION'"
+grep -qi "SURVIVED" <<<"$err" \
+  && ok_t "the survivor is loud on stderr, not swallowed" \
+  || bad_t "the survivor is loud on stderr" "$err"
+grep -qi "group" <<<"$err" \
+  && ok_t "the warning names the credential group the account still belongs to" \
+  || bad_t "the warning names the credential group" "$err"
+grep -q "doctor" <<<"$err" \
+  && ok_t "the warning names the command that can still reap it" \
+  || bad_t "the warning names the reap path" "$err"
+[[ "$AUDITED" == *os-teardown-incomplete* && "$AUDITED" == *agent-zombie* ]] \
+  && ok_t "the reason the teardown could not finish is written to the audit log" \
+  || bad_t "the reason is written to the audit log" "audited='$AUDITED'"
+
+# The same code path when the account really is gone: no warning, no audit row.
+id() { if [[ "${1:-}" == "-u" ]]; then return 1; fi; command id "$@"; }
+AUDITED=""; _RM_USER_DISPOSITION=""
+delete_agent_user zombie >/dev/null 2>"$TMP/zombie2.err"
+[[ "$_RM_USER_DISPOSITION" == "absent" && -z "$AUDITED" ]] \
+  && ok_t "an account that is already gone is 'absent' and writes no audit row" \
+  || bad_t "an already-gone account is 'absent'" "disposition='$_RM_USER_DISPOSITION' audited='$AUDITED'"
+
+# ---------------------------------------------------------------------------
+# DIVE-4340 iteration 2 — NO PASSWD ENTRY IS NOT NOTHING LEFT TO DO.
+#
+# `deluser` drops a user from every group, so the account and its membership in
+# the shared credential group normally die together. They come apart in exactly
+# the cases this row exists for: a half-run teardown, a hand-edited group file,
+# a removal that was not `agent rm`. Iteration 1 returned at the `id -u` guard
+# for such a name, left the membership standing, and let doctor --fix report the
+# seat reaped. The membership is the more dangerous half — that group is what
+# this box scopes its shared credentials to.
+# ---------------------------------------------------------------------------
+export AGENT_SHARED_GROUP="fivedive-test"
+# The membership list lives in a FILE, not a variable: the code under test runs
+# gpasswd inside a command substitution (it keeps the tool's own words for the
+# audit row), so a stub that mutated a shell variable would lose the mutation to
+# the subshell and the harness would grade its own seam instead of the product.
+GROUP_FILE="$TMP/group.members"
+GPASSWD_WORKS=1
+set_members() { printf '%s' "$1" >"$GROUP_FILE"; }
+get_members() { cat "$GROUP_FILE" 2>/dev/null; }
+getent() {
+  if [[ "${1:-}" == "group" ]]; then
+    printf '%s:x:9999:%s\n' "$2" "$(get_members)"; return 0
+  fi
+  return 2   # no passwd entry for anyone in this block
+}
+gpasswd() {   # gpasswd -d <user> <group>
+  (( GPASSWD_WORKS )) || { printf 'gpasswd: Permission denied.\n' >&2; return 1; }
+  local u="$2" out="" m; local -a _m=()
+  IFS=',' read -ra _m <<<"$(get_members)"
+  for m in "${_m[@]}"; do [[ "$m" == "$u" ]] && continue; out+="${out:+,}$m"; done
+  set_members "$out"; return 0
+}
+
+set_members "agent-ghost,agent-ceo"
+AUDITED=""; _RM_GROUP_DISPOSITION=""
+delete_agent_user ghost >/dev/null 2>"$TMP/ghost.err"
+[[ "$_RM_GROUP_DISPOSITION" == "dropped" && ",$(get_members)," != *,agent-ghost,* ]] \
+  && ok_t "a name with NO passwd entry still has its credential-group membership dropped" \
+  || bad_t "group membership dropped for a passwd-less name" "disp='$_RM_GROUP_DISPOSITION' members='$(get_members)'"
+[[ -z "$AUDITED" ]] \
+  && ok_t "a successful group drop writes no teardown-failure audit row" \
+  || bad_t "a successful group drop is silent" "audited='$AUDITED'"
+
+# A refused drop (the non-root box) must be LOUD and audited, never silent.
+set_members "agent-ghost,agent-ceo"; GPASSWD_WORKS=0
+AUDITED=""; _RM_GROUP_DISPOSITION=""
+delete_agent_user ghost >/dev/null 2>"$TMP/ghost2.err"
+err=$(cat "$TMP/ghost2.err")
+[[ "$_RM_GROUP_DISPOSITION" == "present" ]] \
+  && ok_t "a membership that survives the drop is reported as 'present'" \
+  || bad_t "a surviving membership is 'present'" "disp='$_RM_GROUP_DISPOSITION'"
+grep -qi "STILL a member" <<<"$err" && grep -q "fivedive-test" <<<"$err" \
+  && ok_t "the surviving membership is loud on stderr and names the group" \
+  || bad_t "the surviving membership is loud and names the group" "$err"
+[[ "$AUDITED" == *os-teardown-incomplete* && "$AUDITED" == *agent-ghost* ]] \
+  && ok_t "a membership that could not be dropped is written to the audit log" \
+  || bad_t "the surviving membership is audited" "audited='$AUDITED'"
+
+# Negative control: a name that was never in the group does nothing at all —
+# this check must not fire on every clean removal.
+set_members "agent-ceo"; GPASSWD_WORKS=1
+AUDITED=""; _RM_GROUP_DISPOSITION=""
+delete_agent_user nosuch >/dev/null 2>"$TMP/ghost3.err"
+[[ "$_RM_GROUP_DISPOSITION" == "absent" && -z "$AUDITED" && ! -s "$TMP/ghost3.err" ]] \
+  && ok_t "a name that was never a group member is 'absent', silent, unaudited" \
+  || bad_t "a non-member is silent" "disp='$_RM_GROUP_DISPOSITION' audited='$AUDITED' err='$(cat "$TMP/ghost3.err")'"
+
+unset -f gpasswd
+unset -f id getent deluser setfacl capability_forget_agent audit_log
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

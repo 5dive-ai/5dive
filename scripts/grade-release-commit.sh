@@ -168,6 +168,7 @@ tests/release_cut_assign_unit.sh tests/release_cut_bundle_unit.sh tests/release_
 tests/version_bump_guard_unit.sh tests/version_freeze_observer_unit.sh \
 tests/update_check_propagation_unit.sh tests/install_monotonicity_unit.sh \
 tests/install_pin_sha_unit.sh tests/install_update_hint_unit.sh tests/install_checksum_unit.sh \
+ tests/release_hold_unit.sh \
 tests/self_bundle_evidence_unit.sh tests/gitattributes_generated_merge_unit.sh \
 tests/release_notes_unit.sh tests/selfcheck_unit.sh tests/selfcheck_union_unit.sh \
 tests/grade_release_commit_unit.sh}"

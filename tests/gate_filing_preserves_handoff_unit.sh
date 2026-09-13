@@ -52,7 +52,7 @@ show_handoff() { ( JSON_MODE=0; as_agent "$1" cmd_task_show "$2" 2>/dev/null ) |
 tasks_db_init
 
 # ---------------------------------------------------------------- fixture -----
-out=$(as_agent maker cmd_task_add --assignee=maker --verifier=reviewer \
+out=$(as_agent maker cmd_task_add --assignee=maker --verifier=reviewer --verify \
       --body="implement it" -- "gate handoff fixture" 2>"$TMP/err")
 tid=$(printf '%s' "$out" | jf '.data.id')
 tident=$(printf '%s' "$out" | jf '.data.ident')
@@ -118,7 +118,7 @@ pstate=$(db "SELECT assignee FROM tasks WHERE id=$pid;")
 # T5 — the DIVE-2196 converse, unchanged: when the VERIFIER files the gate it is
 # an act of review, so the ACK is stamped. The preserve-CASE is a no-op here by
 # construction (assignee=verifier=filer) and must stay one.
-q=$(as_agent maker cmd_task_add --assignee=maker --verifier=reviewer -- "verifier escalates" 2>"$TMP/err")
+q=$(as_agent maker cmd_task_add --assignee=maker --verifier=reviewer --verify -- "verifier escalates" 2>"$TMP/err")
 qid=$(printf '%s' "$q" | jf '.data.id')
 as_agent maker cmd_task_start "$qid" >/dev/null 2>&1
 as_agent maker cmd_task_done "$qid" --result="ready" >/dev/null 2>&1
@@ -133,7 +133,7 @@ hq=$(show_handoff maker "$qid")
 # ------------------------------------------------- iteration accounting (b) ---
 # The counter is read as "times the verifier sent it back". A re-delivery that
 # restores a handoff is not rework and must not inflate it.
-r=$(as_agent maker cmd_task_add --assignee=maker --verifier=reviewer -- "iteration accounting" 2>"$TMP/err")
+r=$(as_agent maker cmd_task_add --assignee=maker --verifier=reviewer --verify -- "iteration accounting" 2>"$TMP/err")
 rid=$(printf '%s' "$r" | jf '.data.id')
 as_agent maker cmd_task_start "$rid" >/dev/null 2>&1
 as_agent maker cmd_task_done "$rid" --result="pass 1" >/dev/null 2>&1

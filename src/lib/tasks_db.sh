@@ -1947,7 +1947,31 @@ _TASKS_TFV_SQL="graded_at IS NOT NULL
        -- clock LATER than the grade clock is, by construction, a delivery the grade
        -- did not grade. Narrowing, and only in that direction: the rows it removes
        -- are exactly the ones awaiting a first grade of the current iteration.
-       AND (handoff_delivered_at IS NULL OR handoff_delivered_at <= graded_at)
+       --
+       -- DIVE-4357 - AND THE GRADE CLOCK IT COMPARES AGAINST IS THE CURRENT ONE.
+       -- graded_at is COALESCE'd at write time (first grade wins, DIVE-2477's rule)
+       -- and NOTHING can advance it, so on a reject -> re-deliver -> pass cycle the
+       -- delivery clock moves past a grade clock that is frozen at iteration 1 and
+       -- this clause was permanently false -- for the life of the row. The verifier
+       -- merge rail (delivery.sh, _TASKS_TFV_SQL AND graded_by = seat) then refused
+       -- forever, and the row went back to needing a second seat to press merge:
+       -- exactly the hand-move DIVE-4137 removed. Measured 2026-09-12 -- DIVE-4346
+       -- (verify at iteration 1, then reject) was permanently unmergeable by its own
+       -- verifier while DIVE-4344 (reject with no verify, so graded_at was still NULL
+       -- and COALESCE stamped it AFTER the re-delivery) merged the same night. Which
+       -- one you get is decided by whether the verifier happened to run a verify
+       -- before bouncing, which is not a property of the work.
+       --
+       -- graded_verdict_at is the CURRENT verdict's own clock (DIVE-3430, bare SET on
+       -- every grade), so it is the field this comparison always meant. The invariant
+       -- above is UNCHANGED and still enforced: a grade recorded before the current
+       -- delivery still confers nothing, because its verdict clock is still older
+       -- than handoff_delivered_at. COALESCE falls back for a row graded before that
+       -- column existed, the same legacy rule as the NULL-is-a-pass arm above and
+       -- character-for-character the expression cmd_agent_runtime.sh already uses to
+       -- decide the very same question on the nag rail.
+       AND (handoff_delivered_at IS NULL
+            OR handoff_delivered_at <= COALESCE(graded_verdict_at, graded_at))
        AND status NOT IN ('done','cancelled')"
 
 # DIVE-4327 — THE MERGE OWNER IS ONE FUNCTION, NOT NINE COPIES.

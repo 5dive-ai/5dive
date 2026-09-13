@@ -84,6 +84,7 @@ CORE_FILES=(
   src/lib/agent_setup.sh
   src/lib/state.sh
   src/lib/env_overrides.sh
+  src/lib/gh_config.sh
   src/lib/capability.sh
   src/lib/broker.sh
   src/lib/durable.sh
@@ -91,6 +92,7 @@ CORE_FILES=(
   src/lib/audit.sh
   src/lib/reap.sh
   src/lib/registry.sh
+  src/lib/quota_wall.sh
   src/lib/agent_env.sh
   src/lib/verify_policy.sh
   src/lib/tasks_db.sh

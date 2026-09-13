@@ -10,9 +10,27 @@ PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad(){ FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
-block="$(sed -n '/^# >>> DIVE-4140 stable CLI target/,/^# <<< DIVE-4140 stable CLI target/p' install.sh)"
-if [[ -n "$block" ]] && grep -q 'resolve_cli_target()' <<<"$block"; then ok "stable resolver is extractable from install.sh"
+# DIVE-4366: the resolver's HOLD DEPENDENCY travels with it. resolve_cli_target
+# consults load_release_hold (the fleet brake must reach the rung customer boxes
+# actually take, not only the canary's tag list), and that loader lives in its
+# own marked section further up install.sh. Extracting the DIVE-4140 block alone
+# produced `load_release_hold: command not found` in every arm — a harness that
+# stubs the dependency away instead would be grading a resolver the repo does not
+# ship. Both blocks, verbatim, in the order install.sh defines them.
+hold_block="$(sed -n '/^# >>> DIVE-4223 release hold/,/^# <<< DIVE-4223 release hold/p' install.sh)"
+target_block="$(sed -n '/^# >>> DIVE-4140 stable CLI target/,/^# <<< DIVE-4140 stable CLI target/p' install.sh)"
+block="$hold_block
+$target_block"
+if [[ -n "$target_block" ]] && grep -q 'resolve_cli_target()' <<<"$block"; then ok "stable resolver is extractable from install.sh"
 else bad "stable resolver is missing"; echo "$PASS passed, $FAIL failed"; exit 1; fi
+if [[ -n "$hold_block" ]] && grep -q 'load_release_hold()' <<<"$hold_block" \
+   && grep -q 'load_release_hold' <<<"$target_block"; then
+  ok "the resolver's release-hold dependency is extractable and the resolver calls it"
+else
+  bad "resolve_cli_target no longer consults the release hold" \
+    "the fleet rung would take a held release while the canary rung refused it"
+  echo "$PASS passed, $FAIL failed"; exit 1
+fi
 
 handoff="$(sed -n '/^[[:space:]]*# >>> DIVE-4140 stable installer handoff/,/^[[:space:]]*# <<< DIVE-4140 stable installer handoff/p' src/cmd_selfupdate.sh)"
 # DIVE-4256 iteration 2: anchor on the ROUTE, not the presence of the var — a presence
@@ -28,8 +46,43 @@ else
 fi
 
 mkdir -p "$TD/bin" "$TD/etc" "$TD/state"
+touch "$TD/.runstart"
+
+# --- DIVE-4294 iteration 4: WATCH the containment, never trust it -----------
+# Three `env -i` launches below (inherited from DIVE-4140/DIVE-4274) did not
+# carry CLI_TARGET_RECEIPT_FILE, so once this row added the writer they fell
+# through to its default and a ROOT run of this suite wrote a FIXTURE receipt to
+# the real host path — tag v1.4.0 from control.invalid, a string that exists
+# nowhere but in this file (quinn, iteration 4). They carry it now. The arms at
+# the bottom of this file fail if the default path is written anyway: a
+# containment you cannot watch fail is the same shape as the silence arm that
+# was bounced at iteration 2.
+#
+# The path is READ OUT OF install.sh, not spelled here, so a changed default
+# cannot leave this watcher guarding a dead path.
+DEFAULT_RECEIPT="$(sed -n 's/.*CLI_TARGET_RECEIPT_FILE:-\([^}]*\)}.*/\1/p' install.sh | head -1)"
+if [[ "$DEFAULT_RECEIPT" == /* ]]; then
+  ok "the guarded default receipt path is read from install.sh ($DEFAULT_RECEIPT)"
+else
+  bad "could not read the default receipt path out of install.sh" "got '$DEFAULT_RECEIPT'"
+fi
+rstamp(){ stat -c '%Y.%s.%i' "$1" 2>/dev/null || printf 'absent\n'; }
+DEFAULT_BEFORE="$(rstamp "$DEFAULT_RECEIPT")"
+# FAKE_HOLD: `open` (the default — hold readable, nothing held), `dead` (both
+# fetch rungs fail, so the hold is UNKNOWN), or a tag name to hold. Served off
+# the URL, because the resolver now makes two different fetches through curl and
+# an arg-blind stub would answer the hold with the route's tag.
 cat > "$TD/bin/curl" <<'CURL'
 #!/usr/bin/env bash
+case "$*" in
+  *release-hold*)
+    case "${FAKE_HOLD:-open}" in
+      dead) exit 22 ;;
+      open) printf '# 5dive-release-hold v1\n' ;;
+      *)    printf '# 5dive-release-hold v1\n%s\n' "$FAKE_HOLD" ;;
+    esac
+    exit 0 ;;
+esac
 case "${FAKE_ROUTE:-fail}" in
   fail) exit 22 ;;
   *) printf '%s\n' "$FAKE_ROUTE" ;;
@@ -48,9 +101,14 @@ chmod +x "$TD/bin/curl" "$TD/bin/installed"
 # an arm could not tell "returned v1.2.3" from "printed something that contains
 # v1.2.3", so a human-facing line accidentally emitted on stdout would have been
 # installed as a version string with every arm still green.
+# GH_ORG is install.sh's own top-level default, set outside both extracted
+# blocks: the hold fetch reads it, and under `set -u` an unset one kills the
+# resolver before it decides anything. A fixture value, never the real org —
+# nothing here may reach github.com.
 LOGF="$TD/stderr"
 run_target(){ # route [installed] [allow]   -> stdout only; stderr in $LOGF
-  env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE="$1" FAKE_INSTALLED="${2:-0.0.0}" \
+  env -i PATH="$TD/bin:/usr/bin:/bin" GH_ORG=testorg FAKE_ROUTE="$1" FAKE_INSTALLED="${2:-0.0.0}" \
+    FAKE_HOLD="${FAKE_HOLD:-open}" \
     FIVE_ALLOW_DOWNGRADE="${3:-0}" CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" \
     CLI_CANARY_FILE="$TD/etc/canary" CLI_VERSION_KNOWN_FILE="$TD/state/known" \
     CLI_VERSION_URL=https://control.invalid/cli-version CLI_INSTALLED_BIN="$TD/bin/installed" \
@@ -115,9 +173,10 @@ resolve_cli_target
 EOF
 chmod +x "$TD/bin/fetched-installer"
 printf 'v1.4.0\n' > "$TD/etc/override"
-out="$(env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE=v9.9.9 FAKE_INSTALLED=1.4.0 \
+out="$(env -i PATH="$TD/bin:/usr/bin:/bin" GH_ORG=testorg FAKE_ROUTE=v9.9.9 FAKE_INSTALLED=1.4.0 FAKE_HOLD=open \
   CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" CLI_CANARY_FILE="$TD/etc/canary" \
   CLI_VERSION_KNOWN_FILE="$TD/state/known" CLI_INSTALLED_BIN="$TD/bin/installed" \
+  CLI_TARGET_RECEIPT_FILE="$TD/state/cli-target.json" \
   bash -c "set -euo pipefail
 installer=\"\$1\"
 $handoff
@@ -151,7 +210,7 @@ if [[ "$mutant" == "$block" ]]; then
 else
   rm -f "$TD/state/known"
   set +e
-  out="$(env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE=fail CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" CLI_CANARY_FILE="$TD/etc/canary" CLI_VERSION_KNOWN_FILE="$TD/state/known" CLI_INSTALLED_BIN="$TD/bin/installed" bash -c "set -euo pipefail
+  out="$(env -i PATH="$TD/bin:/usr/bin:/bin" GH_ORG=testorg FAKE_ROUTE=fail CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" CLI_CANARY_FILE="$TD/etc/canary" CLI_VERSION_KNOWN_FILE="$TD/state/known" CLI_INSTALLED_BIN="$TD/bin/installed" CLI_TARGET_RECEIPT_FILE="$TD/state/cli-target.json" bash -c "set -euo pipefail
 resolve_gh_tag(){ echo v9.9.9; }
 $mutant
 resolve_cli_target" 2>/dev/null)"; rc=$?
@@ -202,10 +261,11 @@ leak="${block//>&2/}"
 if [[ "$leak" == "$block" ]]; then
   bad "stdout-leak mutation applied" "no >&2 redirect found to remove"
 else
-  out="$(env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE=v1.4.0 FAKE_INSTALLED=0.0.0 \
+  out="$(env -i PATH="$TD/bin:/usr/bin:/bin" GH_ORG=testorg FAKE_ROUTE=v1.4.0 FAKE_INSTALLED=0.0.0 \
     FIVE_ALLOW_DOWNGRADE=0 CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" \
     CLI_CANARY_FILE="$TD/etc/canary" CLI_VERSION_KNOWN_FILE="$TD/state/known" \
     CLI_VERSION_URL=https://control.invalid/cli-version CLI_INSTALLED_BIN="$TD/bin/installed" \
+    CLI_TARGET_RECEIPT_FILE="$TD/state/cli-target.json" \
     bash -c "set -euo pipefail
 resolve_gh_tag(){ printf 'v9.9.9\\n'; }
 $leak
@@ -327,7 +387,7 @@ mut_redir="$(sed 's|2>/dev/null > "$tmp"|> "$tmp" 2>/dev/null|' <<<"$block")"
 if [[ "$mut_redir" == "$block" ]]; then
   bad "redirection-order mutation applied" "mutation did not change extracted source"
 else
-  env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE=fail FAKE_INSTALLED=0.0.0 \
+  env -i PATH="$TD/bin:/usr/bin:/bin" GH_ORG=testorg FAKE_ROUTE=fail FAKE_INSTALLED=0.0.0 \
     CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" CLI_CANARY_FILE="$TD/etc/canary" \
     CLI_VERSION_KNOWN_FILE="$TD/state/known" CLI_INSTALLED_BIN="$TD/bin/installed" \
     CLI_TARGET_RECEIPT_FILE=/proc/self/cli-target.json \
@@ -359,7 +419,7 @@ if [[ "$mutant4294" == "$block" ]]; then
   bad "rung mutation applied" "mutation did not change extracted source"
 else
   rm -f "$RECEIPT" "$TD/etc/override"; : > "$TD/etc/canary"
-  env -i PATH="$TD/bin:/usr/bin:/bin" FAKE_ROUTE=fail CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" \
+  env -i PATH="$TD/bin:/usr/bin:/bin" GH_ORG=testorg FAKE_ROUTE=fail CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" \
     CLI_CANARY_FILE="$TD/etc/canary" CLI_VERSION_KNOWN_FILE="$TD/state/known" \
     CLI_INSTALLED_BIN="$TD/bin/installed" CLI_TARGET_RECEIPT_FILE="$RECEIPT" \
     bash -c "set -euo pipefail
@@ -404,6 +464,127 @@ got="$(read_receipt "$TD/state/trunc.json")"
 printf '{"tag":"main","rung":"override"}\n' > "$TD/state/bad.json"
 got="$(read_receipt "$TD/state/bad.json")"
 [[ "$got" == 'null|null|null' ]] && ok "readback: a non-tag value is refused (a ref is not a version)" || bad "non-tag value leaked" "$got"
+
+# --- DIVE-4294 iteration 4: STATIC containment arm --------------------------
+# This is the arm that goes red at ANY uid the moment a launch loses its
+# containment — the dynamic arm below can only go red where /var/lib/5dive is
+# writable, i.e. as root, which is precisely the run nobody does on purpose.
+# Every `env -i` launch in this file that evaluates the resolver must name
+# CLI_TARGET_RECEIPT_FILE. The single exemption is probe_run, whose whole job is
+# to run one launch both ways; it is marked in-line.
+uncontained="$(awk '
+  /containment-exempt/ { pend=1 }
+  /env -i/ && !inl { inl=1; start=NR; got=pend; pend=0 }
+  inl { if ($0 ~ /CLI_TARGET_RECEIPT_FILE/) got=1
+        if ($0 ~ /bash -c/) { if (!got) print start; inl=0; got=0 } }
+' "$0")"
+if [[ -z "$uncontained" ]]; then
+  ok "containment (static): every resolver launch in this harness names CLI_TARGET_RECEIPT_FILE"
+else
+  bad "containment (static): resolver launch(es) fall through to the default receipt path" \
+      "uncontained at line(s): $(tr '\n' ' ' <<<"$uncontained")"
+fi
+
+# --- DIVE-4294 iteration 4: the containment is GRADED, in two arms ----------
+# ARM 1, the real one: nothing in this suite may write the host's receipt path.
+# Compared two ways, because either alone is weak — an identical fingerprint
+# would pass on a file rewritten with the same size in the same second, and an
+# mtime test alone cannot tell "absent throughout" from "absent then removed".
+DEFAULT_AFTER="$(rstamp "$DEFAULT_RECEIPT")"
+if [[ "$DEFAULT_AFTER" == "$DEFAULT_BEFORE" && ! "$DEFAULT_RECEIPT" -nt "$TD/.runstart" ]]; then
+  ok "containment: this suite wrote nothing to the real receipt path ($DEFAULT_RECEIPT)"
+else
+  bad "containment BREACHED: the real receipt path was written during this run" \
+      "$DEFAULT_RECEIPT before=$DEFAULT_BEFORE after=$DEFAULT_AFTER $(cat "$DEFAULT_RECEIPT" 2>/dev/null)"
+fi
+
+# ARM 2: prove ARM 1 CAN fail, at any uid. ARM 1 only goes red where the suite
+# can write /var/lib/5dive, i.e. as root — so as a normal user it would be green
+# on a harness with the containment torn back out, which is exactly the
+# trust-without-sight defect being fixed. This arm redirects the resolver's
+# DEFAULT literal to a sentinel inside $TD and replays the leak arm's env both
+# ways: uncontained must hit the sentinel and be SEEN by the same comparison
+# ARM 1 uses, contained must leave it absent.
+sentinel="$TD/sentinel/cli-target.json"
+mkdir -p "$TD/sentinel"
+probe="${block//"$DEFAULT_RECEIPT"/$sentinel}"
+if [[ "$probe" == "$block" ]]; then
+  bad "containment falsifiability: the default receipt path is not a literal in the resolver" "$DEFAULT_RECEIPT"
+else
+  rm -f "$TD/etc/override" "$TD/etc/canary" "$TD/state/known"
+  probe_run(){ # extra env assignments as "$@"  # containment-exempt: this launch is run BOTH ways on purpose, against a sentinel inside $TD
+    rm -f "$sentinel"
+    env -i PATH="$TD/bin:/usr/bin:/bin" GH_ORG=testorg FAKE_ROUTE=v1.4.0 FAKE_INSTALLED=0.0.0 \
+      FIVE_ALLOW_DOWNGRADE=0 CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" \
+      CLI_CANARY_FILE="$TD/etc/canary" CLI_VERSION_KNOWN_FILE="$TD/state/known" \
+      CLI_VERSION_URL=https://control.invalid/cli-version CLI_INSTALLED_BIN="$TD/bin/installed" \
+      "$@" bash -c "set -euo pipefail
+resolve_gh_tag(){ printf 'v9.9.9\\n'; }
+$probe
+resolve_cli_target" >/dev/null 2>&1
+  }
+  probe_run
+  if [[ -f "$sentinel" && "$sentinel" -nt "$TD/.runstart" ]]; then
+    ok "containment is falsifiable: an UNCONTAINED launch writes the default path and this watcher sees it"
+  else
+    bad "containment watcher is blind: an uncontained launch did not register" "$(rstamp "$sentinel")"
+  fi
+  probe_run CLI_TARGET_RECEIPT_FILE="$TD/state/cli-target.json"
+  if [[ ! -e "$sentinel" ]]; then
+    ok "containment: CLI_TARGET_RECEIPT_FILE set on a launch leaves the default path untouched"
+  else
+    bad "CLI_TARGET_RECEIPT_FILE did not contain the write" "$(cat "$sentinel" 2>/dev/null)"
+  fi
+  rm -f "$sentinel" "$TD/state/cli-target.json"
+fi
+
+# --- DIVE-4366: the brake, on the rung customer boxes take ------------------
+# The hold shipped wired into the TAG-LIST resolver, which since DIVE-4140
+# answers the CANARY opt-in and nothing else. A fleet box takes the route rung,
+# so a hold the route rung does not read is a brake on a handful of boxes and on
+# none of the ones it was armed for. Held => REFUSE (a single tag has no
+# next-best candidate, and falling back to last-known would make a hold a silent
+# downgrade); unreadable => refuse too, because "we could not read the brake" and
+# "no brake is armed" are the same observation only in the direction that ships.
+rm -f "$TD/etc/override" "$TD/etc/canary"
+printf 'v1.4.0\n' > "$TD/state/known"
+out="$(FAKE_HOLD=v1.4.0 run_target v1.4.0)"; rc=$?
+[[ $rc -eq 3 && -z "$out" && "$(tlog)" == *"is HELD on main"* ]] \
+  && ok "a held target on the FLEET route rung refuses (rc 3) and returns no tag" \
+  || bad "the fleet route rung installed a held tag" "rc=$rc out='$out' log='$(tlog)'"
+
+out="$(FAKE_HOLD=v9.9.9 run_target v1.4.0)"; rc=$?
+[[ $rc -eq 0 && "$out" == v1.4.0 ]] \
+  && ok "a hold naming some OTHER tag leaves the route rung alone (the brake at rest is a no-op)" \
+  || bad "an unrelated hold blocked the fleet" "rc=$rc out='$out' log='$(tlog)'"
+
+out="$(FAKE_HOLD=dead run_target v1.4.0)"; rc=$?
+[[ $rc -eq 2 && -z "$out" && "$(tlog)" == *"UNREADABLE"* ]] \
+  && ok "an unreadable hold fails CLOSED on the route rung, with its own return code" \
+  || bad "an unreadable hold was read as open" "rc=$rc out='$out' log='$(tlog)'"
+
+# Non-vacuity: delete the resolver's hold check and the first arm must go red.
+# Every other arm in this file stays green under it — which is exactly why the
+# defect shipped as a merged, tested brake that braked nothing.
+mut_hold="$(sed 's/if \[\[ -n "\$RELEASE_HOLD_LIST" \]\] && printf/if false \&\& printf/' <<<"$block")"
+if [[ "$mut_hold" == "$block" ]]; then
+  bad "hold-check mutation did not apply" "the arm above is vacuous, not passing"
+else
+  mut_out="$(env -i PATH="$TD/bin:/usr/bin:/bin" GH_ORG=testorg FAKE_ROUTE=v1.4.0 FAKE_INSTALLED=0.0.0 \
+    FAKE_HOLD=v1.4.0 CLI_VERSION_OVERRIDE_FILE="$TD/etc/override" CLI_CANARY_FILE="$TD/etc/canary" \
+    CLI_VERSION_KNOWN_FILE="$TD/state/known" CLI_VERSION_URL=https://control.invalid/cli-version \
+    CLI_INSTALLED_BIN="$TD/bin/installed" CLI_TARGET_RECEIPT_FILE="$TD/state/cli-target.json" \
+    bash -c "set -euo pipefail
+resolve_gh_tag(){ printf 'v9.9.9\\n'; }
+$mut_hold
+resolve_cli_target" 2>/dev/null)"
+  if [[ "$mut_out" == v1.4.0 ]]; then
+    ok "mutation 'resolver ignores the hold list' is caught by the held-target arm"
+  else
+    bad "mutation 'resolver ignores the hold list' still refuses" "the held-target arm cannot detect this bug (got '$mut_out')"
+  fi
+fi
+rm -f "$TD/state/cli-target.json"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

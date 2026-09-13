@@ -94,9 +94,22 @@ as() { local who="$1"; shift; ( actor_seam_as "${who}"; "$@" ) 2>"$TMP/err"; }
 col()  { db "SELECT COALESCE($2,'') FROM tasks WHERE ident=$(sqlq "$1");"; }
 # A fresh maker(maker)→verifier(reviewer) task, DELIVERED: status=todo, held by
 # the verifier, handoff_delivered_at stamped, no ACK yet.
+#
+# DIVE-4360: `--verify` is LOAD-BEARING, not decoration. Every arm below grades
+# behaviour on a DELIVERED handoff, and whether `task done` produces one depends
+# on the box verification policy (src/lib/verify_policy.sh). This harness's
+# STATE_DIR is a throwaway tempdir with no box.json, so `box_verify_policy` reads
+# UNSET and answers with its default — and DIVE-4344 flipped that default from
+# `always` to `delivered-only`. Under `delivered-only` a no-PR `task done` skips
+# the grader round and closes the row outright (DIVE-4251), so no handoff is ever
+# stamped: the fixture assertion below went red and the other 16 arms that
+# consume it cascaded (27/0 → 10/17 with no change to this file). The row
+# override pins the fixture to the behaviour it is grading, so neither the
+# default nor a box's chosen policy can move these arms again; the resting-state
+# arm at the bottom of this file grades that pin.
 deliver() {
   local out ident
-  out=$(as maker cmd_task_add "$1" --assignee=maker --verifier=reviewer --accept="does the thing")
+  out=$(as maker cmd_task_add "$1" --assignee=maker --verifier=reviewer --accept="does the thing" --verify)
   ident=$(printf '%s' "$out" | jq -r '.data.ident // empty' 2>/dev/null)
   as maker cmd_task_done "$ident" --result="built it" >/dev/null
   printf '%s' "$ident"
@@ -116,7 +129,7 @@ A=$(deliver "gate filed by the verifier")
   && ok_t "fixture is DELIVERED and unacked (todo, held by reviewer)" \
   || bad_t "fixture not delivered" "status=$(col "$A" status) assignee=$(col "$A" assignee) ack=$(col "$A" handoff_ack_at)"
 
-as reviewer cmd_task_need "$A" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
+as reviewer cmd_task_need "$A" --type=decision --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave this open and parked, or close it as delivered?" >/dev/null
 [[ "$(col "$A" need_type)" == "decision" && -z "$(col "$A" need_answered_at)" \
    && "$(col "$A" status)" == "blocked" ]] \
@@ -145,7 +158,7 @@ as intruder cmd_task_need "$F" --type=manual --ask="unrelated question" >/dev/nu
 # left the suite green, because `handoff_ack_at IS NULL` was doing the skipping.
 # Two fixes for one symptom, one silently standing in for the other.
 G=$(deliver "delivered, live gate, no ACK on the row")
-as reviewer cmd_task_need "$G" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
+as reviewer cmd_task_need "$G" --type=decision --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave this open and parked, or close it as delivered?" >/dev/null
 db "UPDATE tasks SET handoff_ack_at=NULL WHERE ident=$(sqlq "$G");"
 [[ "$(col "$G" assignee)" == "reviewer" && -z "$(col "$G" handoff_ack_at)" \
@@ -215,7 +228,7 @@ as reviewer cmd_task_reject "$D" --feedback="needs another pass FIX: name the co
 #     is the party the gate is waiting on, so their reject proceeds. Graded
 #     explicitly rather than inherited from whoever runs the suite.
 E=$(deliver "tier-2 gate, human rejects")
-as reviewer cmd_task_need "$E" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
+as reviewer cmd_task_need "$E" --type=decision --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave open and parked, or close as delivered?" >/dev/null
 GATE_ACTOR="human"
 as reviewer cmd_task_reject "$E" --feedback="human call: bounce it FIX: name the concrete change" >/dev/null
@@ -240,7 +253,7 @@ as reviewer cmd_task_reject "$H" --feedback="needs another pass FIX: name the co
 #     themselves, the refusal points at withdraw-then-reject — so run it and prove
 #     it completes. The withdrawal is recorded; nothing is put in the human's mouth.
 I=$(deliver "verifier's own gate, withdraw then reject")
-as reviewer cmd_task_need "$I" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
+as reviewer cmd_task_need "$I" --type=decision --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave open and parked, or close as delivered?" >/dev/null
 msg=$(as reviewer cmd_task_reject "$I" --feedback="it fails FIX: name the concrete change" 2>&1; cat "$TMP/err")
 [[ "$msg" == *"--withdraw"* && "$msg" == *"you can retire it yourself"* ]] \
@@ -257,7 +270,7 @@ as reviewer cmd_task_reject "$I" --feedback="it fails FIX: name the concrete cha
 #     refusal must name the exit that does not need them: record the verdict now,
 #     reject when the gate clears. Proven by running it, not by reading the string.
 J=$(deliver "third party's gate, verdict recorded meanwhile")
-as lead cmd_task_need "$J" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
+as lead cmd_task_need "$J" --type=decision --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="policy call only a human can make" >/dev/null
 db "UPDATE tasks SET assignee='reviewer' WHERE ident=$(sqlq "$J");"   # row still held by the verifier
 msg=$(as reviewer cmd_task_reject "$J" --feedback="it fails FIX: name the concrete change" 2>&1; cat "$TMP/err")
@@ -274,7 +287,7 @@ as reviewer cmd_task_set_body "$J" "VERDICT: FAIL — reasons here" --append >/d
 #     never saw DIVE-555. Unguarded, every rail above is advisory: one `task
 #     verify --cmd=true` closes the row and the human's question disappears.
 K=$(deliver "verify --cmd must not close over a gate")
-as reviewer cmd_task_need "$K" --type=decision --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
+as reviewer cmd_task_need "$K" --type=decision --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --options="A|B" --recommend="A" \
    --ask="Leave open and parked, or close as delivered?" >/dev/null
 out=$(as reviewer cmd_task_verify "$K" --cmd=true); rc=$?
 (( rc != 0 )) && ok_t "ARM3c verify auto-close over an open gate exits non-zero (rc=$rc)" \
@@ -296,6 +309,51 @@ as maker cmd_task_verify "$L" --cmd=true >/dev/null
 [[ "$(col "$L" status)" == "done" ]] \
   && ok_t "CONTROL verify still closes an ungated task (guard is not a blanket)" \
   || bad_t "verify broken for ungated tasks" "status=$(col "$L" status)"
+
+# =============================================================================
+# RESTING STATE — DIVE-4360: the fixture's handoff must not depend on the box
+# =============================================================================
+# The 17-arm cascade above was caused by a change NOWHERE IN THIS FILE: DIVE-4344
+# flipped the unset-policy default, and `deliver()` silently stopped delivering.
+# Three arms so that can never be silent again. They grade the PIN, not the
+# default — a later flip of either direction leaves all three green, while
+# dropping `--verify` from `deliver()` reds the first two.
+#
+# The policy is read from $STATE_DIR/box.json, which this harness owns, so each
+# arm writes a real policy there and restores the unset state afterwards.
+BOXCFG="$STATE_DIR/box.json"
+pol_as() {  # pol_as <policy|unset> ; runs in THIS shell so deliver() sees it
+  if [[ "$1" == "unset" ]]; then rm -f "$BOXCFG"; else
+    printf '{"verify":"%s"}\n' "$1" >"$BOXCFG"; fi
+}
+delivered_p() {  # delivered_p <ident> -> 0 when the row is a live, unacked handoff
+  [[ "$(col "$1" status)" == "todo" && "$(col "$1" assignee)" == "reviewer" \
+     && -n "$(col "$1" handoff_delivered_at)" ]]
+}
+
+[[ "$(box_verify_policy)" == "delivered-only" ]] \
+  && ok_t "RESTING the unset box policy reads 'delivered-only' (DIVE-4344's default)" \
+  || bad_t "unset policy is not the documented default" "box_verify_policy=$(box_verify_policy) — if this moved, the two arms below are what keep the 17 arms above from moving with it"
+
+# The point of the pin: the two policies that would otherwise SKIP the grader
+# round must still produce the delivered handoff every arm above consumes.
+for _pol in never delivered-only; do
+  pol_as "$_pol"
+  _r=$(deliver "resting-state fixture under verify=$_pol")
+  delivered_p "$_r" \
+    && ok_t "RESTING deliver() still stamps a handoff under box verify=$_pol (row --verify outranks the box)" \
+    || bad_t "deliver() stopped delivering under verify=$_pol" "status=$(col "$_r" status) assignee=$(col "$_r" assignee) delivered=$(col "$_r" handoff_delivered_at) — every arm above reads this fixture, so this is the 17-arm cascade, not one failure"
+done
+pol_as unset
+
+# The converse, so the arms above are not vacuous: WITHOUT the row override, the
+# current default does close the row outright. This is the arm that documents the
+# blast radius rather than leaving it to be rediscovered.
+N=$(printf '%s' "$(as maker cmd_task_add "no row override" --assignee=maker --verifier=reviewer --accept="x")" | jq -r '.data.ident')
+as maker cmd_task_done "$N" --result="built it" >/dev/null
+delivered_p "$N" \
+  && bad_t "CONVERSE unset default still handed off" "the pin above is vacuous: box_verify_policy=$(box_verify_policy) produced a handoff with no --verify, so these arms would survive a regression" \
+  || ok_t "CONVERSE without --verify the unset default closes outright — the pin is load-bearing"
 
 echo "-----"
 echo "verifier_gate_ack_unit: $PASS passed, $FAIL failed"

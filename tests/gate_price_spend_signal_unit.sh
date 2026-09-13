@@ -129,9 +129,11 @@ _t4=$(_gate_tier2_floor_term "Qwen3.8 Max renders with no price on /models" 2>/d
   && ok_t "T4 floor_term reports nothing for a redacted bare price" \
   || bad_t "T4 floor_term/floor_hit drift" "hit=no but term='$_t4'"
 _t4b=$(_gate_tier2_floor_term "should we raise prices on the pro plan" 2>/dev/null)
-[[ "$_t4b" == "price" ]] \
-  && ok_t "T4 floor_term still reports 'price' when a spend signal arms it" \
-  || bad_t "T4 floor_term on an armed price" "expected 'price', got '$_t4b'"
+# DIVE-4346: the floor is bounded on the TAIL as well now, so the inflection is a
+# term of its own and the reported word is the one the text actually contains.
+[[ "$_t4b" == "prices" ]] \
+  && ok_t "T4 floor_term still reports the price term when a spend signal arms it" \
+  || bad_t "T4 floor_term on an armed price" "expected the whole matched word, got '$_t4b'"
 
 # --- T5: THE APPEAL PATH. `price|pricing` moved to the APPEALABLE half, so a
 #     floored DESIGN decision can be appealed exactly as a `token` one can. The

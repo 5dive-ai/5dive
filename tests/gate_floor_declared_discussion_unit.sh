@@ -131,13 +131,35 @@ actor_seam_as dev; cmd_task_need DIVE-401 --type=decision --from=dev \
 
 # 2: THE REPRO, TITLE axis (DIVE-1957) — the ask is byte-neutral and the floor
 #    keyword lives ONLY in the task title, which the filer cannot reword.
-route_reset; seed DIVE-402 "design the token exchange between the runtime and the broker"
+#    DIVE-4346: the title term was a bare 'token' ("design the token exchange"),
+#    and iteration 3 deliberately stopped flooring that — a bare `token` with no
+#    credential signal now reads as the AI-usage noun (DIVE-4001's bare-noun rule,
+#    extended after DIVE-4028's "tokenmaxxing board" floored). That left this arm
+#    and the two below grading a floor that no longer fires — the exact vacuity
+#    requirement 2 of this header warns about. Re-pointed at 'credentials', which
+#    still floors from the title AND is inflected, so the axis this suite owns is
+#    graded against the term shape iteration 3 actually changed. Arm 2b pins the
+#    bare-'token' behaviour directly, so the re-point is measured, not assumed.
+route_reset; seed DIVE-402 "design the credentials handoff between the runtime and the broker"
 actor_seam_as dev; cmd_task_need DIVE-402 --type=decision --from=dev \
-  --ask="Should the exchange be modelled as a synchronous call or an async queue?" \
+  --ask="Should the handoff be modelled as a synchronous call or an async queue?" \
   --options="sync|async" --recommend="async" \
   --discusses="a transport-shape design question; the title names the subsystem, nothing is being minted or handled" >/dev/null 2>&1
 [[ "$(tierof DIVE-402)" == "1" ]] && ok_t "repro/TITLE: floor keyword in the TITLE is appealable too" || bad_t "repro/TITLE tier 1" "got '$(tierof DIVE-402)'"
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "repro/TITLE: paired human NOT pinged" || bad_t "repro/TITLE no human ping" "HUMAN_PINGED=$HUMAN_PINGED"
+
+# 2b: DIVE-4346 — the reason arm 2 no longer uses 'token'. A bare `token` in the
+#     TITLE, with no credential signal anywhere, trips NO floor term at all, so
+#     there is nothing to appeal. Graded here rather than assumed, because arm 2's
+#     choice of term now depends on it: if the bare-noun rule is ever reverted,
+#     this arm reds and points at arm 2.
+route_reset; seed DIVE-4021 "design the token exchange between the runtime and the broker"
+res4021=$( JSON_MODE=0; cmd_task_need DIVE-4021 --type=decision --from=dev \
+  --ask="Should the handoff be modelled as a synchronous call or an async queue?" \
+  --options="sync|async" --recommend="async" 2>/dev/null )
+{ [[ "$(tierof DIVE-4021)" == "1" ]] && ! grep -qi "category floor" <<<"$res4021"; } \
+  && ok_t "2b/TITLE: a bare 'token' in the title trips no floor term (DIVE-4001 bare-noun rule)" \
+  || bad_t "2b bare token floors" "tier='$(tierof DIVE-4021)' stdout: $res4021"
 
 # 3: MUTATION GUARD — the SAME two gates WITHOUT the flag still floor to the human.
 #    If these ever pass at tier 1 the suite above is grading a floor that stopped
@@ -152,9 +174,9 @@ actor_seam_as dev; cmd_task_need DIVE-403 --type=decision --from=dev \
 # routes to the lead stamped floored_by=title. The guard still has to prove the title
 # is READ AT ALL, so it now grades that stamp: if the title axis went dead the gate
 # would be tier 1 with NO stamp, and this arm reds exactly as it did before.
-route_reset; seed DIVE-404 "design the token exchange between the runtime and the broker"
+route_reset; seed DIVE-404 "design the credentials handoff between the runtime and the broker"
 res404=$( JSON_MODE=0; cmd_task_need DIVE-404 --type=decision --from=dev \
-  --ask="Should the exchange be modelled as a synchronous call or an async queue?" \
+  --ask="Should the handoff be modelled as a synchronous call or an async queue?" \
   --options="sync|async" --recommend="async" 2>/dev/null )
 { [[ "$(tierof DIVE-404)" == "1" ]] && grep -qi "floored_by=title" <<<"$res404"; } \
   && ok_t "mutation/TITLE: the title axis is still LIVE — lead-routed and STAMPED floored_by=title (answer A)" \
@@ -282,7 +304,10 @@ ann2=$(cmd_task_need DIVE-413 --type=approval --from=dev \
 grep -qi "no longer promotes an APPROVAL gate" <<<"$ann2" \
   && ok_t "announce/approval: the demotion is stated at file time, and names --needs= as the route that does reach a person" \
   || bad_t "announce approval states the demotion" "stderr: $ann2"
-grep -qi "credential" <<<"$ann2" \
+# DIVE-4346: the ask names TWO reserved terms and the floor reports the LEFTMOST
+# in the text; 'deleting' is now in the policy data verbatim (it was not before, and
+# 'delete' does not match inside it), so the reported term moved credential -> deleting.
+grep -qi "deleting" <<<"$ann2" \
   && ok_t "announce/approval: still names the MATCHED TERM, so the filer can see what fired" \
   || bad_t "announce/approval names term" "stderr: $ann2"
 grep -q -- "--discusses" <<<"$ann2" && bad_t "announce/approval must NOT advertise --discusses" "stderr: $ann2" || ok_t "announce/approval: does NOT advertise an appeal that would be refused"
@@ -349,16 +374,18 @@ res=$( JSON_MODE=0; cmd_task_need DIVE-420 --type=decision --from=dev \
 grep -qi "T2 category floor" <<<"$res" \
   && ok_t "result/ask: the RESULT LINE states the floor fired (not only the stderr warn)" \
   || bad_t "result/ask states floor" "stdout: $res"
-grep -qi "matched 'credential'" <<<"$res" \
+# DIVE-4346: the floor is bounded on the tail now, so it reports the WHOLE word the
+# text contains — 'credentials', not the 'credential' stem it used to truncate to.
+grep -qi "matched 'credentials'" <<<"$res" \
   && ok_t "result/ask: the RESULT LINE names the MATCHED TERM" \
   || bad_t "result/ask names term" "stdout: $res"
 
 # 17: same assertion on the TITLE axis (DIVE-1957) — the term the filer cannot
 #     reword away must be named on the durable surface too. The ask here is
-#     byte-neutral; 'token' can only have come from the seeded title.
-route_reset; seed DIVE-421 "design the token exchange between the runtime and the broker"
+#     byte-neutral; 'credentials' can only have come from the seeded title.
+route_reset; seed DIVE-421 "design the credentials handoff between the runtime and the broker"
 res2=$( JSON_MODE=0; cmd_task_need DIVE-421 --type=decision --from=dev \
-  --ask="Should the exchange be modelled as a synchronous call or an async queue?" \
+  --ask="Should the handoff be modelled as a synchronous call or an async queue?" \
   --options="sync|async" --recommend="async" 2>/dev/null )
 # DIVE-2224 answer A: the durable surface must still NAME the title term -- that was
 # always this arm's point ("the term the filer cannot reword away is named on the
@@ -367,7 +394,9 @@ res2=$( JSON_MODE=0; cmd_task_need DIVE-421 --type=decision --from=dev \
 grep -qi "floored_by=title" <<<"$res2" \
   && ok_t "result/TITLE: the RESULT LINE states the gate was NOT floored and why (floored_by=title)" \
   || bad_t "result/TITLE states floored_by" "stdout: $res2"
-grep -qi "matched 'token'" <<<"$res2" \
+# DIVE-4346: term re-pointed with the fixture above (bare 'token' no longer floors),
+# and reported whole rather than stem-truncated.
+grep -qi "matched 'credentials'" <<<"$res2" \
   && ok_t "result/TITLE: names the term that matched from the TITLE, the axis the filer cannot reword" \
   || bad_t "result/TITLE names term" "stdout: $res2"
 
@@ -394,7 +423,8 @@ jres=$(cmd_task_need DIVE-423 --type=decision --from=dev \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" 2>/dev/null)
 [[ "$(jq -r '.data.tier_floored' <<<"$jres" 2>/dev/null)" == "true" ]] \
   && ok_t "json: tier_floored is reported" || bad_t "json tier_floored" "$jres"
-[[ "$(jq -r '.data.floor_term' <<<"$jres" 2>/dev/null)" == "credential" ]] \
+# DIVE-4346: whole word, not the stem — same move as the prose arms above.
+[[ "$(jq -r '.data.floor_term' <<<"$jres" 2>/dev/null)" == "credentials" ]] \
   && ok_t "json: the matched term rides the JSON payload" || bad_t "json floor_term" "$jres"
 route_reset; seed DIVE-424
 jres2=$(cmd_task_need DIVE-424 --type=decision --from=dev \

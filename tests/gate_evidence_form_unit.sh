@@ -67,7 +67,14 @@ cleanup() {
     rm -rf "$TMP"
   fi
 }
-trap 'rc=$?; cleanup "$rc"; echo "HARNESS-RC=$rc"' EXIT
+# DIVE-4346: dup the real stderr and carry an ABORT marker. A fixture gate that is
+# REFUSED under `set -e`-ish flow kills the harness before its summary, and a harness
+# that prints no verdict is indistinguishable from one that was never reached -- which
+# is exactly how this file produced NO red on CI run 34665157720, only silence.
+# (tests/truncation_marker_guard_unit.sh discovers this trap by grep and grades it.)
+exec 8>&2
+SUMMARY_PRINTED=0
+trap 'rc=$?; cleanup "$rc"; [[ "${SUMMARY_PRINTED:-0}" == 1 ]] || printf "ABORTED - gate_evidence_form_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8; echo "HARNESS-RC=$rc"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -152,7 +159,7 @@ argval() { sed -n "s/.*[[:space:]]${2}=\([^[:space:]]*\).*/\1/p" <<<"$1" | head 
 reset
 t1=$(addt --assignee=dev -- "fixture t2 nonce gate")
 cmd_task_need "$t1" --type=decision --options="A|B" --recommend="A" \
-  --ask="pick one" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+  --ask="pick one" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 cmd_task_answer "$t1" --value="A" --human --human-proof="$KNOWN_NONCE" \
   >"$TMP/ev1.out" 2>"$TMP/ev1.err"
 WROW=$(grep 'task answer gate' "$AUDIT_CALLS" | grep 'answered_by=' | head -1)
@@ -274,7 +281,7 @@ fi
 reset
 t8=$(addt --assignee=dev -- "fixture t2 decision gate, human on the box")
 cmd_task_need "$t8" --type=decision --options="A|B" --recommend="A" \
-  --ask="pick one" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+  --ask="pick one" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 _PIN_SUDO_HUMAN=0
 cmd_task_answer "$t8" --value="A" --human >"$TMP/ev8.out" 2>"$TMP/ev8.err"
 _PIN_SUDO_HUMAN=1
@@ -294,7 +301,7 @@ fi
 reset
 t9=$(addt --assignee=dev -- "fixture t2 decision gate, agent caller")
 cmd_task_need "$t9" --type=decision --options="A|B" --recommend="A" \
-  --ask="pick one" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+  --ask="pick one" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 out9=$(cmd_task_answer "$t9" --value="A" --human 2>&1); rc9=$?
 COL9=$(hev "$t9")
 ANS9=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${t9};")
@@ -332,4 +339,5 @@ else
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+SUMMARY_PRINTED=1
 [[ "$FAIL" -eq 0 ]]

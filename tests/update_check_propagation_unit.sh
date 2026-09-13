@@ -68,6 +68,12 @@ done
 
 mk_curl() { # $1=file served as /5dive  $2=file served as /5dive.sha256 ('' both = fail every fetch)
             # $3=tags to serve on the atom feed ('' = the feed 404s too)
+            # DIVE-4223: .release-hold on main is served OPEN in every branch here,
+            # including the "every fetch fails" one. These arms grade whether the
+            # BUNDLE resolved; letting the hold go unreadable would make all of
+            # them return the hold's refusal instead, and they would still be
+            # 'unavailable with a reason' — green for the wrong reason. The hold's
+            # own open/held/unreadable behaviour is graded in release_hold_unit.sh.
   local atom="${3:-}"
   if [[ -z "${1:-}" ]]; then
     # Fetches fail, but the atom rung may still resolve a tag — otherwise the
@@ -76,6 +82,7 @@ mk_curl() { # $1=file served as /5dive  $2=file served as /5dive.sha256 ('' both
 url=""
 for a in "\$@"; do case "\$a" in http*) url="\$a";; esac; done
 case "\$url" in
+  *.release-hold*) printf "# 5dive-release-hold v1\n" ;;
   *tags.atom) $( [[ -n "$atom" ]] && printf 'printf "%s"' "$(printf '<id>tag:github.com,2008:Repository/1/%s</id>\\n' $atom)" || printf 'exit 22' ) ;;
   *) exit 22 ;;
 esac
@@ -94,6 +101,7 @@ while [[ \$# -gt 0 ]]; do
   esac
 done
 case "\$url" in
+  *.release-hold*) printf "# 5dive-release-hold v1\n" ;;
   *tags.atom) $( [[ -n "$atom" ]] && printf 'printf "%s"' "$(printf '<id>tag:github.com,2008:Repository/1/%s</id>\\n' $atom)" || printf 'exit 22' ) ;;
   */5dive.sha256) cp "$2" "\$out" ;;
   */5dive)        cp "$1" "\$out" ;;
@@ -173,6 +181,11 @@ while [[ \$# -gt 0 ]]; do
   case "\$1" in -o) out="\$2"; shift 2;; --max-time) shift 2;; -*) shift;; *) url="\$1"; shift;; esac
 done
 case "\$url" in
+  # DIVE-4223: the release hold is READ FROM main BY DESIGN — that is the whole
+  # brake, and it is a different object from the bundle. What this arm still
+  # asserts is that the BUNDLE comes from raw/<tag>/ and that no read of main
+  # can resolve one, so main serves the hold here and nothing else.
+  *"/main/.release-hold") printf "# 5dive-release-hold v1\n" ;;
   */$TAG_NEW/5dive.sha256) cp "$FIX/sum-new" "\$out" ;;
   */$TAG_NEW/5dive)        cp "$FIX/bundle-new" "\$out" ;;
   *) exit 22 ;;

@@ -73,13 +73,16 @@ _liv_usage() {
   5dive liveness --window=<minutes>      # freshness window (default ${_LIV_WINDOW_MIN_DEFAULT}m)
   5dive liveness --json                  # machine-readable records
 
-Verdicts — three, and the third never collapses into the other two:
-  alive         a timestamped artifact this seat wrote, inside the window. Named in the output.
-  no-effect     every probe RAN and found nothing this seat wrote inside the window.
-  not-reached   at least one probe could not run and nothing positive was found. UNKNOWN,
-                not healthy: this is the state a process-presence check silently calls green.
+Verdicts — four, and none of them collapses into another:
+  alive             a timestamped artifact this seat wrote, inside the window. Named in the output.
+  quota-exhausted   the seat's auth account is at 100% of a rate-limit window: it cannot execute a
+                    single token until the reset, whatever it wrote before the wall. Outranks alive.
+  no-effect         every probe RAN and found nothing this seat wrote inside the window.
+  not-reached       at least one probe could not run and nothing positive was found. UNKNOWN,
+                    not healthy: this is the state a process-presence check silently calls green.
 
-Exit: 0 every seat alive - 4 some seat has no effect - 3 some seat not-reached - 2 usage.
+Exit: 0 every seat alive - 4 some seat has no effect or is quota-exhausted - 3 some seat
+not-reached - 2 usage.
 
 Read-only. No process table, no tmux, no pane scrape — a present process that wrote
 nothing for three days is the incident this command exists to catch, not evidence.
@@ -114,13 +117,26 @@ _liv_is_fresh() {
   (( now - e <= w ))
 }
 
-# _liv_verdict <fresh-source-count> <unreadable-source-count> -> verdict
+# _liv_verdict <fresh-source-count> <unreadable-source-count> [quota-state] -> verdict
 #
-# The whole theme is these five lines, in this order. Positive evidence first
-# (a real artifact outranks a broken probe); then the third state; only a
-# COMPLETE, SUCCESSFUL, EMPTY read is allowed to say a seat produced nothing.
+# The whole theme is these lines, in this order. The quota wall comes FIRST and
+# it is the one thing allowed to outrank positive evidence, because it is not a
+# claim about the seat made by someone else — it is the account's own measured
+# usage (DIVE-4342), and an artifact written twenty minutes before the wall went
+# up is not evidence the seat can write another one. `alive` here would be the
+# exact false green this command exists to remove: dev3 held four rows for three
+# days on an expired quota while every liveness signal read healthy.
+#
+# Only `exhausted` gates. `unmeasured` deliberately does NOT downgrade anything:
+# a missing snapshot is not evidence about the seat, and making it suppress a
+# real artifact would let one unreadable file accuse the whole fleet.
+#
+# Then positive evidence (a real artifact outranks a broken probe); then the
+# third state; only a COMPLETE, SUCCESSFUL, EMPTY read is allowed to say a seat
+# produced nothing.
 _liv_verdict() {
-  local fresh="${1:-0}" unreadable="${2:-0}"
+  local fresh="${1:-0}" unreadable="${2:-0}" quota="${3:-unmeasured}"
+  if [[ "$quota" == "exhausted" ]]; then printf 'quota-exhausted\n'; return 0; fi
   if (( fresh > 0 ));      then printf 'alive\n';       return 0; fi
   if (( unreadable > 0 )); then printf 'not-reached\n'; return 0; fi
   printf 'no-effect\n'
@@ -221,20 +237,42 @@ _liv_seat_record() {
              epoch:$ep, ageSec:(if $ag < 0 then null else $ag end)}]' <<<"$probes")
   done
 
-  local verdict; verdict=$(_liv_verdict "$fresh" "$unreadable")
+  # The quota wall — seat -> auth profile -> account usage, read unprivileged
+  # from the snapshot the root `account usage` read publishes. Not a process
+  # probe and not a pane scrape: it is the number the provider itself reported.
+  local qstate qwin qpct qreset qage qnote
+  IFS=$'\037' read -r qstate qwin qpct qreset qage qnote <<<"$(quota_wall_seat "$seat")"
+  [[ -n "$qstate" ]] || qstate="unmeasured"
+
+  local verdict; verdict=$(_liv_verdict "$fresh" "$unreadable" "$qstate")
   local reason=""
   case "$verdict" in
     alive)       reason="wrote ${best_src}: ${best_art}" ;;
     no-effect)   reason="all 3 probes ran; nothing written by this seat in the last $(( w / 60 ))m" ;;
     not-reached) reason="${unreadable} of 3 probes did not run and no fresh artifact was found — UNKNOWN, not healthy" ;;
+    quota-exhausted)
+      reason="CANNOT EXECUTE — $(quota_wall_phrase "$qwin" "$qpct" "$qreset")"
+      # Say what it DID write, if anything: "walled" and "walled and idle for a
+      # day" are different operator problems and the evidence line is the only
+      # place that difference survives.
+      [[ -n "$best_art" ]] && reason="${reason} (last wrote ${best_src}: ${best_art})"
+      ;;
   esac
 
   jq -cn --arg seat "$seat" --arg unix "$unix" --arg v "$verdict" --arg r "$reason" \
          --arg es "$best_src" --arg ea "$best_art" --arg dg "$degraded" \
+         --arg qs "$qstate" --arg qw "$qwin" --arg qp "$qpct" --arg qr "$qreset" \
+         --arg qa "$qage" --arg qn "$qnote" \
          --argjson probes "$probes" --argjson fresh "$fresh" --argjson unread "$unreadable" \
          --argjson w "$w" --argjson age "$best_age" \
     '{seat:$seat, unixUser:$unix, windowSec:$w, verdict:$v, reason:$r,
       evidence:(if $es == "" then null else {source:$es, artifact:$ea, ageSec:$age} end),
+      quota:{state:$qs,
+             window:(if $qw == "" then null else $qw end),
+             pct:(if $qp == "" then null else ($qp|tonumber? // null) end),
+             resetsAt:(if $qr == "" then null else $qr end),
+             snapshotAgeSec:(if $qa == "" then null else ($qa|tonumber? // null) end),
+             note:$qn},
       probes:$probes, freshSources:$fresh, unreadableSources:$unread,
       degraded:(if $dg == "" then [] else ($dg|split("; ")) end)}'
 }
@@ -300,38 +338,43 @@ cmd_liveness() {
     records=$(jq -c --argjson r "$rec" '. + [$r]' <<<"$records")
   done
 
-  local n_alive n_none n_nr
+  local n_alive n_none n_nr n_quota
   n_alive=$(jq '[.[]|select(.verdict=="alive")]|length'       <<<"$records")
   n_none=$(jq  '[.[]|select(.verdict=="no-effect")]|length'   <<<"$records")
   n_nr=$(jq    '[.[]|select(.verdict=="not-reached")]|length' <<<"$records")
+  n_quota=$(jq '[.[]|select(.verdict=="quota-exhausted")]|length' <<<"$records")
 
   # A roster we could not read is counted as a not-reached in its own right, so
   # it can never be the difference between rc 0 and a silent all-green.
   local rc=0
-  if   (( n_none > 0 ));                          then rc=4
+  if   (( n_none > 0 || n_quota > 0 ));           then rc=4
   elif (( n_nr > 0 )) || [[ -n "$roster_note" ]]; then rc=3
   fi
 
   if (( JSON_MODE )); then
     jq -cn --argjson seats "$records" --argjson w "$w" --argjson na "$n_alive" \
-           --argjson nn "$n_none" --argjson nr "$n_nr" --arg roster "$roster_note" \
+           --argjson nn "$n_none" --argjson nr "$n_nr" --argjson nq "$n_quota" \
+           --arg roster "$roster_note" \
       '{ok:true, data:{windowSec:$w, seats:$seats,
-        summary:{alive:$na, noEffect:$nn, notReached:$nr},
+        summary:{alive:$na, noEffect:$nn, notReached:$nr, quotaExhausted:$nq},
         roster:(if $roster == "" then "read" else "not-reached" end),
         rosterNote:(if $roster == "" then null else $roster end)}}'
   else
     printf 'effect-derived liveness — window %dm, evidence is an artifact the seat WROTE\n\n' "$window_min"
-    printf '%-14s %-12s %s\n' SEAT VERDICT EVIDENCE
+    printf '%-14s %-16s %s\n' SEAT VERDICT EVIDENCE
     jq -r '.[] | [.seat, .verdict,
                   (if .evidence then "\(.evidence.source): \(.evidence.artifact) (\(.evidence.ageSec)s ago)" else .reason end)]
                  | @tsv' <<<"$records" \
-      | while IFS=$'\t' read -r s v e; do printf '%-14s %-12s %s\n' "$s" "$v" "$e"; done
+      | while IFS=$'\t' read -r s v e; do printf '%-14s %-16s %s\n' "$s" "$v" "$e"; done
     jq -r '.[] | select((.degraded|length) > 0) | "  degraded probes on \(.seat): \(.degraded|join("; "))"' <<<"$records"
     [[ -n "$roster_note" ]] && printf '\nroster: NOT-REACHED — %s\n' "$roster_note"
-    printf '\n%d alive, %d no-effect, %d NOT-REACHED (of %d seat(s))\n' \
-      "$n_alive" "$n_none" "$n_nr" "${#seats[@]}"
+    printf '\n%d alive, %d quota-exhausted, %d no-effect, %d NOT-REACHED (of %d seat(s))\n' \
+      "$n_alive" "$n_quota" "$n_none" "$n_nr" "${#seats[@]}"
     if (( n_nr > 0 )) || [[ -n "$roster_note" ]]; then
       printf 'NOT-REACHED is not a pass: those seats were not measured.\n'
+    fi
+    if (( n_quota > 0 )); then
+      printf 'quota-exhausted is not a pass either: those seats cannot execute a token until the reset.\n'
     fi
   fi
   # DIVE-2598: a deliberate non-zero exit must claim its reason, or the EXIT-trap

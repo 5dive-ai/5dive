@@ -135,7 +135,10 @@ cmd_task_answer DIVE-203 --value=approved --channel-proof=555 >/dev/null 2>&1
 seed_task DIVE-301; cmd_task_need DIVE-301 --type=decision --ask=q --options="A|B" --recommend="A" --tier=1 >/dev/null 2>&1
 seed_task DIVE-302; cmd_task_need DIVE-302 --type=approval --ask=q --recommend=approved --tier=1 >/dev/null 2>&1
 seed_task DIVE-303; cmd_task_need DIVE-303 --type=decision --ask=q --options="A|B" --tier=1 >/dev/null 2>&1   # no recommend -> skip
-seed_task DIVE-304; cmd_task_need DIVE-304 --type=approval --ask=q --recommend=approved --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1  # explicit tier2 hard gate -> skip
+# DIVE-4346 adds a second hand-typed-tier-2 cap (a gate reaching the human must name
+# the capability it consumes); this fixture needs the UNDECLARED shape, so it takes
+# the audited exception alongside the DIVE-2848 one.
+seed_task DIVE-304; cmd_task_need DIVE-304 --type=approval --ask=q --recommend=approved --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --ask-ok="fixture: this case needs an UNDECLARED hard-human tier-2 gate to grade (DIVE-4346)" >/dev/null 2>&1  # explicit tier2 hard gate -> skip
 seed_task DIVE-305; cmd_task_need DIVE-305 --type=approval --ask=q --recommend=approved --tier=1 >/dev/null 2>&1
 db "UPDATE tasks SET routed_reviewer='marcus' WHERE ident='DIVE-305';"                                        # lead-routed -> skip
 

@@ -157,7 +157,7 @@ else
 fi
 
 # ---- P3: `task add` on that org labels the row verifyUnavailable -------------
-add_out=$( ( cmd_task_add --assignee=maker2 --priority=high -- "a high row filed into an unwakeable org" ) 2>/dev/null | tail -n1 )
+add_out=$( ( cmd_task_add --assignee=maker2 --priority=high --verify -- "a high row filed into an unwakeable org" ) 2>/dev/null | tail -n1 )
 vu=$(printf '%s' "$add_out" | jq -r '.data.verifyUnavailable')
 vraw=$(printf '%s' "$add_out" | jq -r '.data.verifier // ""')
 { [[ "$vu" == "true" && -z "$vraw" ]]; } \

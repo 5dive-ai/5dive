@@ -101,10 +101,27 @@ api_stub='case "$*" in
   *) exit 22 ;;
 esac'
 
+# DIVE-4223: resolve_gh_tag() now also reads the release hold on `main`, so every
+# arm that expects a tag to resolve has to serve one. `hold_curl <body> <rest>`
+# prepends a .release-hold clause to a curl stub; HOLD_NONE is the shipped file
+# with no tags held. The hold's OWN behaviour is graded in
+# tests/release_hold_unit.sh — here it is only a precondition, and it is spelled
+# out rather than hidden in the runner so an arm cannot pass because the harness
+# quietly answered a question the box would have had to ask the network.
+HOLD_NONE='# 5dive-release-hold v1'
+hold_curl() { # $1=hold body ("" => the hold fetch fails)  $2=rest of the curl stub
+  if [[ -n "$1" ]]; then
+    printf 'case "$*" in *release-hold*) cat <<%s\n%s\n%s\nexit 0 ;; esac\n%s\n' \
+      "'HOLDEOF'" "$1" "HOLDEOF" "$2"
+  else
+    printf 'case "$*" in *release-hold*) exit 22 ;; esac\n%s\n' "$2"
+  fi
+}
+
 # The tag-rail property, factored out so the mutants below are graded by the
 # SAME assertion the real block is graded by.
 pins_newest_tag() { # $1=block ; 0 = REPO pinned to the newest tag's commit sha
-  local out; out="$(run_block_with "$1" "$git_stub" "exit 22")"
+  local out; out="$(run_block_with "$1" "$git_stub" "$(hold_curl "$HOLD_NONE" 'exit 22')")"
   [[ "$out" == *"REPO=https://raw.githubusercontent.com/testorg/5dive/$SHA_NEW"* && "$out" == *"PIN=$SHA_NEW"* ]]
 }
 
@@ -113,11 +130,11 @@ pins_newest_tag() { # $1=block ; 0 = REPO pinned to the newest tag's commit sha
 if pins_newest_tag "$block"; then
   ok_t "git ls-remote pins REPO to the newest release tag's commit ($TAG_NEW, not $TAG_OLD, not main)"
 else
-  bad_t "newest release tag did not pin REPO" "got: $(run_block "$git_stub" "exit 22" | tr '\n' '|')"
+  bad_t "newest release tag did not pin REPO" "got: $(run_block "$git_stub" "$(hold_curl "$HOLD_NONE" 'exit 22')" | tr '\n' '|')"
 fi
 
 # 2. git absent/broken → tags.atom + commits/<tag>.atom fallback pins the same tag.
-out="$(run_block "exit 1" "$atom_stub")"
+out="$(run_block "exit 1" "$(hold_curl "$HOLD_NONE" "$atom_stub")")"
 if [[ "$out" == *"PIN=$SHA_NEW"* ]]; then
   ok_t "atom-feed fallback resolves the same newest tag (fresh box, git not installed yet)"
 else
@@ -125,7 +142,7 @@ else
 fi
 
 # 3. git + atom both fail → api.github.com last resort pins the same tag.
-out="$(run_block "exit 1" "$api_stub")"
+out="$(run_block "exit 1" "$(hold_curl "$HOLD_NONE" "$api_stub")")"
 if [[ "$out" == *"PIN=$SHA_NEW"* ]]; then
   ok_t "api.github.com is the last-resort tag resolver"
 else
@@ -136,11 +153,15 @@ fi
 #    This is a no-op, not a brick: an installed box keeps the CLI it has, which
 #    is where it already was. The error must name both explicit valves out
 #    (GH_SHA, REPO) so an operator leaves the guarantee by choosing to.
+#    DIVE-4223: the hold fetch is dead here too, and the message must still be
+#    the TAG one. An unreachable release rail reported as a hold problem sends
+#    the operator to the wrong incident.
 out="$(run_block "exit 1" "exit 22")"
 if [[ "$out" != *"REPO=https"* ]] && [[ "$out" == *"RC=1"* ]] \
    && [[ "$out" == *"NO STABLE RELEASE TAG RESOLVED"* ]] \
+   && [[ "$out" != *"RELEASE HOLD UNREADABLE"* ]] \
    && [[ "$out" == *"GH_SHA"* && "$out" == *"REPO=<base url>"* ]]; then
-  ok_t "no tag resolvable fails CLOSED, naming GH_SHA and REPO — never falls back to /main"
+  ok_t "no tag resolvable fails CLOSED as a TAG failure, not a hold failure, naming GH_SHA and REPO"
 else
   bad_t "unresolvable tag did not fail closed" "got: ${out//$'\n'/ | }"
 fi
@@ -150,7 +171,7 @@ half_stub='case "$*" in
   *--refs*) printf "bbbbbbb\trefs/tags/'"$TAG_NEW"'\n" ;;
   *) exit 1 ;;
 esac'
-out="$(run_block "$half_stub" "exit 22")"
+out="$(run_block "$half_stub" "$(hold_curl "$HOLD_NONE" 'exit 22')")"
 if [[ "$out" != *"REPO=https"* ]] && [[ "$out" == *"RC=1"* ]] && [[ "$out" == *"$TAG_NEW RESOLVED BUT ITS COMMIT DID NOT"* ]]; then
   ok_t "tag-without-commit fails closed and names the tag"
 else
@@ -163,7 +184,7 @@ light_stub='case "$*" in
   *"refs/tags/'"$TAG_OLD"'"*) printf "'"$SHA_OLD"'\trefs/tags/'"$TAG_OLD"'\n" ;;
   *) exit 1 ;;
 esac'
-out="$(run_block "$light_stub" "exit 22")"
+out="$(run_block "$light_stub" "$(hold_curl "$HOLD_NONE" 'exit 22')")"
 if [[ "$out" == *"PIN=$SHA_OLD"* ]]; then
   ok_t "lightweight tag pins its own sha (no ^{} peel to prefer)"
 else

@@ -1274,7 +1274,7 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           # main) DECLINES the acceptance and falls through to the refusal below
           # exactly as if this arm did not exist. It can only ever ADD an acceptance on
           # measured evidence, never manufacture a refusal.
-          local _cu_slug _cu_shas _cu_head="" _cu_anc="" _cu_attr="" _cu_diag=""
+          local _cu_slug _cu_shas _cu_head="" _cu_anc="" _cu_attr="" _cu_diag="" _cu_q=""
           _cu_slug=$(_gate_slug_from_url "$_dref")
           if [[ -n "$_cu_slug" ]]; then
             _cu_attr=$(_gate_branch_ident_on_main "$_cu_slug" "" "$_ghtok" "$ident")
@@ -1288,6 +1288,17 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           # sentences below is a parse error, not a formatting preference.
           [[ -n "$_cu_head" ]] \
             && _cu_diag=" PR head ${_cu_head:0:12} ancestry=${_cu_anc:-unread} — DIAGNOSTIC ONLY, it neither accepts nor blocks (DIVE-3534)."
+          # DIVE-4337: WHICH OF THE THREE OPEN STATES THIS IS. An OPEN pull request
+          # on a queue-protected branch is queued, ejected-unmerged, or never
+          # pressed, and until this read the refusal below said the same sentence
+          # for all three — so the merge owner could not tell "wait" from "press
+          # it" from "it was rejected and nothing said so". Diagnostic only: it
+          # never accepts and never manufactures a refusal, exactly like ancestry
+          # above. Read only on OPEN, so a CLOSED row and every accepting path
+          # pay nothing for it.
+          if [[ "$_state" == "OPEN" && -n "$_cu_slug" ]] && declare -F _gate_pr_queue_state >/dev/null 2>&1; then
+            _cu_q=" $(_gate_mq_note "$(_gate_pr_queue_state "$_dref" "$_ghtok" "$_cu_slug")")"
+          fi
           if [[ "$_cu_attr" == "1" ]]; then
             _task_store_audit_log "task.landed-without-merge" ok 0 -- "$ident" "ref=$_dref state=$_state head=${_cu_head:-unread} ancestry=${_cu_anc:-unread} slug=$_cu_slug"
             # Say what was MEASURED and claim no more. A subject scan cannot tell a
@@ -1311,7 +1322,7 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
               && _cu_why="$_cu_why Its head ${_cu_head:0:12} IS on main, which on its own is what an EMPTY branch looks like — ancestry alone would accept a row that delivered nothing (DIVE-2101), so it cannot close this."
             [[ "$_state" == "CLOSED" ]] \
               && _cu_fix="it is CLOSED, so it cannot be merged — if the work landed another way, land or cite a commit on main whose SUBJECT names $ident and re-run; if it landed in a different PR, re-point the binding (\`task deliver $ident --pr=<url>\`); if it never landed, this row is not done"
-            policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: $_dref is not merged to main (state=$_state, measured).$_cu_why — $_cu_fix"
+            policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: $_dref is not merged to main (state=$_state, measured).$_cu_why$_cu_q — $_cu_fix"
           fi
         fi
         # DIVE-2656: MERGED is not the same as MERGED-WHAT-THE-VERIFIER-GRADED.
@@ -2252,9 +2263,20 @@ _task_start_preflight() {
             _pf "origin is an SSH remote but no SSH key found under ~/.ssh — a push will fail; stage the key before you plan to push."
           fi ;;
         https://*)
-          if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
-            _pf "origin is an HTTPS remote but 'gh auth' isn't logged in — a push will prompt/fail; authenticate before you plan to push."
-          fi ;;
+          # DIVE-4341: this asked `gh auth status` and nothing else, so it fired on
+          # EVERY agent seat of every provisioned box — twice wrong. (a) the shared
+          # GH_CONFIG_DIR that profile.d exports is claude's 0600 one, so gh exits on
+          # a config read and "no login" is what an unreadable config looks like from
+          # here; (b) an agent seat is not SUPPOSED to hold its own login — it pushes
+          # through the delegated rail, which the check never asked about. Name the
+          # rail that WILL carry the push, and warn only when there is genuinely none.
+          local _rail; _rail=$(gh_credential_rail)
+          case "$_rail" in
+            none)
+              _pf "origin is an HTTPS remote and NO push credential is reachable from this seat — not your own gh login, not the delegated claude rail, not the machine account. A push will prompt/fail; authenticate (gh auth login) or land it with '5dive push' from a seat that can." ;;
+            claude|bot)
+              : ;;  # the delegated rail carries it; warning here is the cry-wolf
+          esac ;;
       esac
     fi
   fi

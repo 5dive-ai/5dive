@@ -199,8 +199,9 @@ while read -r local_ref local_oid remote_ref remote_oid; do
   fi
 
   # DIVE-4208: THE PRE-PUSH RAIL — the merge-gating checks that are cheap enough
-  # to run here: the title lint (3s in CI), shellcheck over the changed shell
-  # files, and the harnesses this diff touches. Measured cause: 3 of the 4 open
+  # to run here: the title lint (3s in CI), the changelog-fragment lint that is
+  # the second half of that same required context (DIVE-4336), shellcheck over
+  # the changed shell files, and the harnesses this diff touches. Measured cause: 3 of the 4 open
   # PRs were red on a REQUIRED check on 2026-09-10, and a red required check is
   # not fifteen minutes of CI, it is a verifier bounce plus a fresh maker wake
   # (~20-45 min, DIVE-4206) charged again on every round.
@@ -214,7 +215,7 @@ while read -r local_ref local_oid remote_ref remote_oid; do
   if [[ -f "$PUSH_RAIL" ]]; then
     bash "$PUSH_RAIL" "$base" "$local_oid" || rc=1
   else
-    echo "pre-push-rail: script not found ($PUSH_RAIL); skipping (CI's title, shellcheck and changed-harnesses jobs are the net)." >&2
+    echo "pre-push-rail: script not found ($PUSH_RAIL); skipping (CI's title job — its type arm and its changelog-fragment arm — plus the shellcheck and changed-harnesses jobs are the net)." >&2
   fi
 
   # DIVE-2065: only fires on a push to main with an EXISTING remote main

@@ -15,5 +15,28 @@
 # CODEOWNERS only REQUESTS review on its own. It becomes a REQUIRED approval when
 # "Require review from Code Owners" is enabled in main's branch protection — a
 # repo-admin setting this file cannot set and does not claim to have set.
-/install.sh            @lodar
-/src/cmd_selfupdate.sh @lodar
+#
+# DIVE-4334, 2026-09-12 — THE CONTROL IS UNCHANGED; THE ATTESTER MOVED.
+# Everything above still holds: a required, attributable human-class review on the
+# one mutable-main-to-root path. What changed is WHO signs it. Routing every
+# installer PR to @lodar made a graded-PASS, green, CTO-cleared ship wait on a
+# person (measured: PR #880 held ~1h on this line, #885 behind it), and he does not
+# want the ping. So the owner is now a dedicated login that the ship rail can sign
+# as, and the taps stop.
+#
+# WHY THIS LOGIN AND NOT AN EXISTING ONE — the owner needs four properties and the
+# other two accounts each fail one: CODEOWNERS resolves USERS and TEAMS only (so
+# the GitHub App identity can never be named here, whatever its repo permissions),
+# and GitHub 422s a self-approval (so it cannot be @5dive-bot, which authors every
+# installer PR). @5dive-reviewer is a user, holds write, is not the author, and its
+# credential is reachable only through `5dive gh --as=reviewer`, a root-side rail
+# allowlisted to `pr review` — it signs, it does not work.
+#
+# WHAT THE REVIEW ATTESTS, and this is the part a reader should hold us to: the
+# automated rail at the head being approved — docker-install, test-installed-host
+# (+confirm), supply-chain-guard, shellcheck, scan — plus the verifier's PASS and
+# the CTO clearance named in the review body. A human eye on the diff is NOT what
+# it attests any more. That is the residual this change signs for; it is recorded
+# on DIVE-4334 rather than implied here.
+/install.sh            @5dive-reviewer
+/src/cmd_selfupdate.sh @5dive-reviewer

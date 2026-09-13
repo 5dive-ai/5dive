@@ -24,7 +24,13 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
+# DIVE-4346: ABORT backstop. A refused FIXTURE kills the harness before its
+# summary, and a harness with no verdict is indistinguishable from one that was
+# never reached -- how three of these produced silence instead of a red.
+# tests/truncation_marker_guard_unit.sh discovers this trap by grep and grades it.
+exec 8>&2
+SUMMARY_PRINTED=0
+trap 'rc=$?; rm -rf "${TMP:-}"; [[ "${SUMMARY_PRINTED:-0}" == 1 ]] || printf "ABORTED - gate_tier2_floor_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-tier2-unit.XXXXXX)"
@@ -121,7 +127,7 @@ touch "$GATE_PROOF_ENFORCE"   # enforcement ON for the floor tests
 #     gate also MINTS a nonce, but this floor is provenance-based and does not read
 #     it — that independence is what gate_tier2_decision_nonce_unit T6/T7 pin.) ---
 seed_task DIVE-101
-cmd_task_need DIVE-101 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-101 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 [[ "$(tierof DIVE-101)" == "2" ]] && ok_t "T1 decision --tier=2 stored as tier 2" \
   || bad_t "T1 decision tier 2 stored" "got tier '$(tierof DIVE-101)'"
 out=$(cmd_task_answer DIVE-101 --value=A 2>&1); rc=$?
@@ -135,7 +141,7 @@ out=$(cmd_task_answer DIVE-101 --value=A 2>&1); rc=$?
 # --- T2: SAME gate, a trusted human path passes --human (recorded human:*): ACCEPTED
 #     (DIVE-525 — a real tap/dashboard answer must never be blocked). --------------
 seed_task DIVE-102
-cmd_task_need DIVE-102 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-102 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 # SUBSHELLED (DIVE-2233). The one bare `cmd_task_answer` in this file whose expected
 # outcome is SUCCESS: T1/T4 capture into `out=$(…)`, already a subshell, so a refusal
 # there returns a code. Here a refusal calls production's `fail`, which `exit`s — in a
@@ -183,7 +189,7 @@ fi
 #     answer bare would end the harness at status 6 instead of reddening one arm.
 rm -f "$GATE_PROOF_ENFORCE"
 seed_task DIVE-105
-cmd_task_need DIVE-105 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-105 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 out=$(cmd_task_answer DIVE-105 --value=A 2>&1); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-105)" == "open" ]] \
   && ok_t "T5 enforce OFF does NOT lower the tier-2 floor — bare-agent answer still REFUSED (DIVE-2588)" \
@@ -199,7 +205,7 @@ grep -qi 'tier-2' <<<"$out" \
 #     enforcement envelope off. It must now say NOTHING — the floor stands, and
 #     the sentinel that is present (none here) is the only thing that can speak.
 seed_task DIVE-106
-cmd_task_need DIVE-106 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-106 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 out=$(GATE_PROOF_ENFORCE=/nonexistent/nope cmd_task_answer DIVE-106 --value=A 2>&1); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-106)" == "open" ]] \
   && ok_t "T5b GATE_PROOF_ENFORCE=/nonexistent does not clear a tier-2 gate (DIVE-2588 bypass)" \
@@ -207,5 +213,6 @@ out=$(GATE_PROOF_ENFORCE=/nonexistent/nope cmd_task_answer DIVE-106 --value=A 2>
 touch "$GATE_PROOF_ENFORCE"
 
 echo "-----"
+SUMMARY_PRINTED=1
 printf 'gate_tier2_floor_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

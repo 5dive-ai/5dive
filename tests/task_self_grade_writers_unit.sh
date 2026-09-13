@@ -83,7 +83,7 @@ db "INSERT INTO agents_org (name, reports_to) VALUES ('boss',NULL),('alice','bos
 # =============================================================================
 # ARM 1 — `task add --assignee=X --verifier=X` (the literal DIVE-2899 shape)
 # =============================================================================
-out1=$(run add --assignee=alice --verifier=alice -- "self-graded chore"); rc1=$?
+out1=$(run add --assignee=alice --verifier=alice --verify -- "self-graded chore"); rc1=$?
 (( rc1 != 0 )) && has "$(cat "$TMP"/err)$out1" "can't grade itself" \
   && ok_t "ARM1 'task add --assignee=X --verifier=X' refuses (same message as 'task verifier')" \
   || bad_t "ARM1 'task add --assignee=X --verifier=X' refuses" "rc=$rc1 $out1 $(cat "$TMP"/err)"
@@ -93,7 +93,7 @@ out1=$(run add --assignee=alice --verifier=alice -- "self-graded chore"); rc1=$?
 
 # Non-vacuity sibling: same call, DISTINCT names, must succeed. Proves ARM1 is
 # grading the COLLISION and not just refusing every `task add --verifier=`.
-out1b=$(run add --assignee=alice --verifier=carol -- "properly graded chore"); rc1b=$?
+out1b=$(run add --assignee=alice --verifier=carol --verify -- "properly graded chore"); rc1b=$?
 (( rc1b == 0 )) \
   && ok_t "ARM1-sibling distinct assignee/verifier still succeeds (guard is not over-broad)" \
   || bad_t "ARM1-sibling distinct assignee/verifier still succeeds" "rc=$rc1b $out1b $(cat "$TMP"/err)"
@@ -103,7 +103,7 @@ out1b=$(run add --assignee=alice --verifier=carol -- "properly graded chore"); r
 # DIVE-333 auto-coordinate default would pick anyway (the IMPLIED collision).
 # boss is the lone org root, so it is exactly that default.
 # =============================================================================
-out2=$(run add --verifier=boss -- "implied collision via auto-coordinate"); rc2=$?
+out2=$(run add --verifier=boss --verify -- "implied collision via auto-coordinate"); rc2=$?
 (( rc2 != 0 )) && has "$(cat "$TMP"/err)$out2" "can't grade itself" \
   && ok_t "ARM2 '--verifier=<the auto-coordinate default>' refuses even with no explicit --assignee" \
   || bad_t "ARM2 implied collision via auto-coordinate refuses" "rc=$rc2 $out2 $(cat "$TMP"/err)"
@@ -121,7 +121,7 @@ out2b=$(run add -- "ordinary auto-coordinated chore"); rc2b=$?
 # ASSIGNEE onto the row's EXISTING verifier, the direction `task verifier`'s
 # own attach-time check structurally cannot see.
 # =============================================================================
-a3=$(run add --assignee=alice --verifier=carol -- "assign onto own verifier"); a3_id=$(printf '%s' "$a3" | jf '.data.id')
+a3=$(run add --assignee=alice --verifier=carol --verify -- "assign onto own verifier"); a3_id=$(printf '%s' "$a3" | jf '.data.id')
 out3=$(run assign "$a3_id" carol); rc3=$?
 (( rc3 != 0 )) && has "$(cat "$TMP"/err)$out3" "can't grade itself" \
   && ok_t "ARM3 'task assign <id> <its-own-verifier>' refuses" \
@@ -143,7 +143,7 @@ out3b=$(run assign "$a3_id" boss); rc3b=$?
 # via `task done` -> `_task_route_to_verifier`) must be left alone — ARM3
 # refuses a raw `task assign` onto the verifier, never the legitimate,
 # system-driven handoff write.
-a3c=$(run add --assignee=alice --verifier=carol -- "legitimate handoff"); a3c_id=$(printf '%s' "$a3c" | jf '.data.id')
+a3c=$(run add --assignee=alice --verifier=carol --verify -- "legitimate handoff"); a3c_id=$(printf '%s' "$a3c" | jf '.data.id')
 run_as alice start "$a3c_id" >/dev/null
 run_as alice done  "$a3c_id" --result="ready" >/dev/null
 [[ "$(db "SELECT assignee FROM tasks WHERE id=${a3c_id};")" == "carol" ]] \
@@ -162,7 +162,7 @@ out3d=$(run assign "$a3c_id" carol); rc3d=$?
 # If the filer is the row's own verifier and nothing has been delivered yet,
 # that side effect must not self-appoint them onto the row.
 # =============================================================================
-a4=$(run add --assignee=alice --verifier=carol -- "gate filed by own verifier pre-delivery"); a4_id=$(printf '%s' "$a4" | jf '.data.id')
+a4=$(run add --assignee=alice --verifier=carol --verify -- "gate filed by own verifier pre-delivery"); a4_id=$(printf '%s' "$a4" | jf '.data.id')
 out4=$(run_as carol need "$a4_id" --type=decision --tier=1 --ask="which path" --options="a|b" --recommend="a"); rc4=$?
 (( rc4 == 0 )) \
   && ok_t "ARM4 the gate itself still files (this is a preserve, not a refusal)" \
@@ -175,7 +175,7 @@ out4=$(run_as carol need "$a4_id" --type=decision --tier=1 --ask="which path" --
 # same kind of gate on an undelivered row still takes the assignee exactly as
 # DIVE-891 always intended — ARM4 must not have broken ordinary gate-filing
 # ownership for everyone.
-a4b=$(run add --assignee=alice --verifier=carol -- "gate filed by a stranger pre-delivery"); a4b_id=$(printf '%s' "$a4b" | jf '.data.id')
+a4b=$(run add --assignee=alice --verifier=carol --verify -- "gate filed by a stranger pre-delivery"); a4b_id=$(printf '%s' "$a4b" | jf '.data.id')
 run_as boss need "$a4b_id" --type=decision --tier=1 --ask="which path" --options="a|b" --recommend="a" >/dev/null
 [[ "$(db "SELECT assignee FROM tasks WHERE id=${a4b_id};")" == "boss" ]] \
   && ok_t "ARM4-sibling a stranger filing the same gate still becomes assignee-of-record (DIVE-891, unchanged)" \
@@ -185,7 +185,7 @@ run_as boss need "$a4b_id" --type=decision --tier=1 --ask="which path" --options
 # verifier filing a gate on a row ALREADY delivered to them (assignee is
 # ALREADY carol) is a no-op by construction and must still stamp the review
 # ACK exactly as before.
-a4c=$(run add --assignee=alice --verifier=carol -- "verifier escalates a live review"); a4c_id=$(printf '%s' "$a4c" | jf '.data.id')
+a4c=$(run add --assignee=alice --verifier=carol --verify -- "verifier escalates a live review"); a4c_id=$(printf '%s' "$a4c" | jf '.data.id')
 run_as alice start "$a4c_id" >/dev/null
 run_as alice done  "$a4c_id" --result="ready" >/dev/null
 run_as carol need "$a4c_id" --type=decision --tier=1 --ask="in scope?" --options="yes|no" --recommend="yes" >/dev/null

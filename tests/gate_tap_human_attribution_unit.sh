@@ -41,7 +41,11 @@ set -uo pipefail
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
+# DIVE-4346: ABORT marker -- see the note in gate_evidence_form_unit.sh. A refused
+# fixture gate must produce a RED verdict, never a silent run with no summary.
+exec 8>&2
+SUMMARY_PRINTED=0
+trap 'rc=$?; rm -rf "${TMP:-}"; [[ "${SUMMARY_PRINTED:-0}" == 1 ]] || printf "ABORTED - gate_tap_human_attribution_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-3128-unit.XXXXXX)"
@@ -140,6 +144,7 @@ _board="$(task_actor "")"
 seed()    { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','relaybot');"; }
 t2gate()  {
   cmd_task_need "$1" --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 \
+    --needs=human_tap \
     --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 }
 answered(){ db "SELECT CASE WHEN need_answered_at IS NULL THEN 'open' ELSE 'closed' END FROM tasks WHERE ident='$1';"; }
@@ -268,5 +273,6 @@ actor_name_is_registered_agent tapper;   _rc_human=$?
   || bad_t "T7c unmeasurable roster" "rc=$_rc_blind (expected 2)"
 
 echo "-----"
+SUMMARY_PRINTED=1
 printf 'gate_tap_human_attribution_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

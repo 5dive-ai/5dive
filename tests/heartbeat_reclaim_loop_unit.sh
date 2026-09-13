@@ -143,7 +143,7 @@ bind_branch() {
 # assignee -> verifier, status -> todo, handoff_delivered_at stamped, ack NULL.
 mk_delivered_unacked() {
   local maker="${1:-dev}" vfier="${2:-quinn}" id
-  id=$(addt --assignee="$maker" --verifier="$vfier" -- "ship the widget")
+  id=$(addt --assignee="$maker" --verifier="$vfier" --verify -- "ship the widget")
   ( cmd_task_done "$id" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
   _hb_claim_task "$vfier" "$id" >/dev/null 2>&1
   printf '%s' "$id"

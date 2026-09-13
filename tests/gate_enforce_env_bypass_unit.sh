@@ -48,7 +48,11 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
+# DIVE-4346: the ABORT backstop. Subshelling above should make this unreachable;
+# it is here because "should be unreachable" is what silence looks like.
+exec 8>&2
+SUMMARY_PRINTED=0
+trap 'rc=$?; rm -rf "${TMP:-}"; [[ "${SUMMARY_PRINTED:-0}" == 1 ]] || printf "ABORTED - gate_enforce_env_bypass_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-enforce-bypass.XXXXXX)"
@@ -183,7 +187,11 @@ fi
 file_gate() { # file_gate <ident> <type> [extra args...]
   local ident="$1" type="$2"; shift 2
   seed_task "$ident"
-  cmd_task_need "$ident" --type="$type" "$@" >/dev/null 2>&1
+  # DIVE-4346: SUBSHELLED, for exactly the reason the `answer` helper below already
+  # is. `fail` exits, so an unsubshelled filing call turns a refused FIXTURE into a
+  # dead harness — no summary, no verdict, indistinguishable from a harness that was
+  # never reached. A refused fixture must red one arm, never end the run.
+  ( cmd_task_need "$ident" --type="$type" "$@" ) >/dev/null 2>&1
 }
 
 # `fail` exits. Every answer below runs in a command substitution ON PURPOSE so a
@@ -223,7 +231,7 @@ rm -f "$ALT_SENTINEL"
 : > "$DEFAULT_SENTINEL"   # the live posture: enforcement armed by the root-owned file
 
 file_gate DIVE-401 decision --ask="approve the spend for the volume resize" \
-  --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+  --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 [[ "$(tierof DIVE-401)" == "2" ]] \
   && ok_t "E0 precondition: the gate really is tier 2" \
   || bad_t "E0 tier-2 precondition" "tier=$(tierof DIVE-401)"
@@ -253,7 +261,7 @@ grep -qi 'unproven\|tier-2' <<<"$out" \
 # Half 2 of the fix, isolated: even with NO sentinel anywhere — the state the override
 # used to fake — the tier-2 floor stands on its own.
 rm -f "$DEFAULT_SENTINEL"
-file_gate DIVE-402 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+file_gate DIVE-402 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 out=$(answer DIVE-402 --value=A); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-402)" == "open" ]] \
   && ok_t "E5 with enforcement genuinely OFF the tier-2 floor STILL refuses a non-human answer" \
@@ -265,7 +273,7 @@ out=$(answer DIVE-402 --value=A); rc=$?
 # nonce-bearing tier-2 gate is the DIVE-2356 evidence block. Enforcement is still
 # genuinely off here, so this arm reds if that block's flag conjunct comes back and
 # stays green if only the floor's does. Without it, half the fix is untested.
-file_gate DIVE-406 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+file_gate DIVE-406 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 [[ "$(hashof DIVE-406)" =~ ^[0-9a-f]{64}$ ]] || bad_t "E6 precondition: gate minted a nonce" "hash='$(hashof DIVE-406)'"
 out=$(answer DIVE-406 --value=A --human); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-406)" == "open" ]] \
@@ -275,7 +283,7 @@ out=$(answer DIVE-406 --value=A --human); rc=$?
 
 # ── L2: liveness. A harness whose every arm expects a refusal proves nothing. ─────
 as_human_on_box
-file_gate DIVE-403 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+file_gate DIVE-403 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 out=$(answer DIVE-403 --value=A --human); rc=$?
 [[ $rc -eq 0 && "$(answered DIVE-403)" == "closed" ]] \
   && ok_t "L2 liveness: a REAL human path (non-agent SUDO_UID at EUID 0) still clears the same gate" \
@@ -307,7 +315,10 @@ for ty in approval manual access; do
     # deploy" trips no tier-2 keyword and files as tier 1 — which would silently
     # grade the tier-1 path under a tier-2 name. The precondition below catches it,
     # and this is why it is asserted rather than assumed.
-    *)      file_gate "$idt" approval --ask="approve the deploy" --tier=2 ;;
+    # DIVE-4346: --needs=human_tap is the honest declaration here, not an escape —
+    # the arm needs a REAL tier-2 approval on the human's desk to grade that the
+    # type guard refuses it in both arms, and that is a gate on a person's own call.
+    *)      file_gate "$idt" approval --ask="approve the deploy" --tier=2 --needs=human_tap ;;
   esac
   [[ "$(tierof "$idt")" == "2" ]] || { bad_t "S precondition $ty is tier 2" "tier=$(tierof "$idt")"; continue; }
   b_out=$(answer "$idt" --value=approved --human); b_rc=$?
@@ -320,5 +331,6 @@ for ty in approval manual access; do
 done
 
 echo "-----"
+SUMMARY_PRINTED=1
 printf 'gate_enforce_env_bypass_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

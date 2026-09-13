@@ -15,18 +15,29 @@
 # CI: the 5-minute core shards, docker-install and install-contract STAY in CI. The
 # rail's ceiling is the first minute of CI plus the harnesses the diff touched.
 #
-# THE THREE STAGES, in order, first red refuses the push:
+# THE FOUR STAGES, in order, first red refuses the push:
 #
 #   title       the PR-title lint, ~0s. The regex is EXTRACTED from
 #               .github/workflows/pr-title-lint.yml at run time, never copied —
 #               see title_stage(). Two lists is how a type the lint admits and the
 #               cut rejects gets shipped (DIVE-4086's own defect, one level out).
+#   fragment    the changelog-fragment lint, ~0s — the SECOND step of that same
+#               required `title` context, and the one with no local arm until
+#               DIVE-4336. It runs scripts/lint-changelog-fragments.sh, the exact
+#               script CI runs, against this push's own range. See fragment_stage().
 #   lint        the changed files from the CI lint job's OWN file sets, with
 #               the job's OWN flags including the DIVE-4067 SC2318 pass. Seconds,
 #               because it is scoped to the diff rather than to src/*.sh entire —
 #               that whole-tree pass is ~82s and stays in CI.
 #   harnesses   scripts/changed-harnesses.sh (the same selector the CI job now
 #               calls) run locally, wall-clock capped.
+#
+# THE TWO DOOR CHECKS BOTH RUN before either timed stage, and that is the one
+# place "first red refuses" is relaxed. Both are ~0s and both report on the same
+# required context, so refusing on the title alone would hand back a title fix,
+# take the re-push, and only THEN mention the missing fragment — two rounds to
+# report two facts that cost nothing to learn together. The timed stages still
+# stop at the first red.
 #
 # EVERY STAGE FAILS OPEN, LOUDLY, WHEN ITS INSTRUMENT IS MISSING — no shellcheck
 # binary, no workflow file to read the regex out of, no selector script. That is
@@ -61,7 +72,7 @@
 # agent controls. See override_taken().
 #
 # CONTRACT
-#   usage: scripts/pre-push-rail.sh <base> <head> [--only=title|shellcheck|harnesses]
+#   usage: scripts/pre-push-rail.sh <base> <head> [--only=title|fragment|shellcheck|harnesses]
 #   exit 0  every stage green (or failed open with a printed warning)
 #   exit 1  a stage found something; the push must be refused
 #   exit 2  usage error
@@ -114,14 +125,34 @@ stage_done() { # <name> <t0_ms> <verdict>
 
 wants() { [[ -z "$ONLY" || "$ONLY" == "$1" ]]; }
 
-# ── stage 1: title ────────────────────────────────────────────────────────────
+# ── WHICH STRING THE DOOR CHECKS GRADE ────────────────────────────────────────
 #
-# WHICH STRING IS GRADED. CI grades the PULL REQUEST title, which does not exist
-# yet at push time. What it BECOMES is the squash subject, and GitHub seeds a new
-# PR's title from the sole commit's subject when the branch has one commit. So the
-# rail grades $PR_TITLE if the author states it, else the subject of the FIRST
-# commit in the pushed range — the string GitHub will offer — and says which one it
-# used, because a lint whose subject is ambiguous teaches nothing.
+# CI grades the PULL REQUEST title, which does not exist yet at push time. What it
+# BECOMES is the squash subject, and GitHub seeds a new PR's title from the sole
+# commit's subject when the branch has one commit. So the rail grades $PR_TITLE if
+# the author states it, else the subject of the FIRST commit in the pushed range —
+# the string GitHub will offer — and says which one it used, because a lint whose
+# subject is ambiguous teaches nothing.
+#
+# RESOLVED ONCE, for both stages. The title stage grades the string itself; the
+# fragment stage reads the TYPE out of it, because a feat/fix owes a fragment and a
+# chore does not. Two resolutions would let the two halves of one required context
+# disagree about which change this even is.
+TITLE=""; TITLE_SRC=""; TITLE_RESOLVED=""
+resolve_title() {
+  [[ -n "$TITLE_RESOLVED" ]] && return 0
+  TITLE_RESOLVED=1
+  if [[ -n "${PR_TITLE:-}" ]]; then
+    TITLE="$PR_TITLE"; TITLE_SRC="\$PR_TITLE"
+  else
+    # The FIRST commit of the range (oldest), which is the whole range on a
+    # single-commit branch and is what GitHub offers as the title.
+    TITLE="$(git log --format='%s' "$BASE..$HEAD_REV" 2>/dev/null | tail -1)"
+    TITLE_SRC="the first commit subject in $BASE..$HEAD_REV"
+  fi
+}
+
+# ── stage 1: title ────────────────────────────────────────────────────────────
 title_stage() {
   local t0 wf line title src
   t0="$(now_ms)"
@@ -140,14 +171,8 @@ title_stage() {
     stage_done title "$t0" "SKIPPED — could not extract the rule from pr-title-lint.yml; CI's title job is the net"
     return 0
   fi
-  if [[ -n "${PR_TITLE:-}" ]]; then
-    title="$PR_TITLE"; src="\$PR_TITLE"
-  else
-    # The FIRST commit of the range (oldest), which is the whole range on a
-    # single-commit branch and is what GitHub offers as the title.
-    title="$(git log --format='%s' "$BASE..$HEAD_REV" 2>/dev/null | tail -1)"
-    src="the first commit subject in $BASE..$HEAD_REV"
-  fi
+  resolve_title
+  title="$TITLE"; src="$TITLE_SRC"
   if [[ -z "$title" ]]; then
     stage_done title "$t0" "SKIPPED — no commit in the range and no \$PR_TITLE to grade"
     return 0
@@ -168,7 +193,91 @@ title_stage() {
   return 1
 }
 
-# ── stage 2: shellcheck ───────────────────────────────────────────────────────
+# ── stage 2: the changelog fragment ───────────────────────────────────────────
+#
+# DIVE-4336 — THE ONE REQUIRED CHECK WITH NO LOCAL ARM. Measured 2026-09-11 while
+# grading the day's queue: six PRs (#882 #894 #895 #897 #898 #899) red on the
+# required `title` context, every one of them on DIVE-4177's fragment step and
+# NONE on the conventional-type arm above. Six makers in one day is not six
+# mistakes — nothing on the box knew the rule, so the first thing that ever said
+# so was a required context, minutes later, after the maker had correctly
+# delivered and moved on. Each firing then spent a verifier round to report one
+# missing file, and the grader lane is the fleet's measured bottleneck
+# (DIVE-4322). The fix is not a wider gate: the check is right every single time
+# and a release-notes reader genuinely has nothing to read without the fragment.
+# Only the PLACE it is discovered is wrong, and this stage moves that place.
+#
+# IT RUNS THE SCRIPT CI RUNS. Not a reimplementation: the rule has an
+# exact-string requirement — the precise heading the release fold demands, which
+# this file deliberately does not restate, because a second copy of it here would
+# BE the drift; tests/pre_push_rail_unit.sh A22 asserts the string appears in the
+# lint script and nowhere in this one. Two copies of an exact-string rule diverge
+# silently in the worst direction: the rail greens what the merge gate reds, or
+# the reverse. Same argument, and the same shape, as the title stage extracting
+# its regex instead of forking it. A18-A25 pin this stage, A23 by MUTATING the
+# lint script in a sandbox and requiring this stage's verdict to move with it.
+#
+# WHICH TREE THE HEADING RULE READS. The lint opens each changed changelog.d/*.md
+# from the WORKING TREE, as the CI step reads them from its checkout of the head
+# sha. In a pre-push hook those are the same tree in every normal case; where they
+# are not, CI is still the hard gate. Same standing caveat as shellcheck below.
+fragment_stage() {
+  local t0 lint changed out lrc summary
+  t0="$(now_ms)"
+  lint="$TOP/scripts/lint-changelog-fragments.sh"
+  if [[ ! -f "$lint" ]]; then
+    stage_done fragment "$t0" "SKIPPED — $lint not found; CI's fragment step is the net"
+    return 0
+  fi
+  resolve_title
+  if [[ -z "$TITLE" ]]; then
+    stage_done fragment "$t0" "SKIPPED — no commit in the range and no \$PR_TITLE, so there is no type to grade the fragment rule against"
+    return 0
+  fi
+  changed="$(mktemp)"
+  # --diff-filter=d, the CI step's own filter: a fragment DELETED by this PR is
+  # not graded, because deleting it is how an entry gets withdrawn.
+  if ! git diff --name-only --diff-filter=d "$BASE" "$HEAD_REV" >"$changed" 2>/dev/null; then
+    rm -f "$changed"
+    # NOT a skip. The CI step refuses here for the same reason: "I could not read
+    # the change" must not print as "the change is clean" (tests/lib/grading_tree.sh).
+    stage_done fragment "$t0" "BLOCKED — could not diff $BASE..$HEAD_REV; refusing to report a fragment lint that graded nothing"
+    return 1
+  fi
+  out="$( cd "$TOP" && bash "$lint" --title="$TITLE" --changed-from="$changed" 2>&1 )"; lrc=$?
+  rm -f "$changed"
+  case "$lrc" in
+    0)
+      summary="$(grep -v '^::' <<<"$out" | tail -1)"
+      stage_done fragment "$t0" "${summary:-ok} (title graded: $TITLE_SRC)"
+      # The lint WARNS and exits 0 for a test|ci|chore|docs|refactor|perf PR with
+      # no fragment. Print it: that warning is the whole of what the check has to
+      # say about this push, and a rail quieter than the CI step it stands in for
+      # teaches the maker that local green means CI green when it does not.
+      grep '^::warning' <<<"$out" >&2 || true
+      return 0
+      ;;
+    1)
+      stage_done fragment "$t0" "RED"
+      printf '%s\n' "$out" >&2
+      {
+        echo "pre-push-rail/fragment: this is the same step of the required \`title\` context that red six PRs on 2026-09-11 (DIVE-4336), and it is the cheapest red in the repo to clear — the fix is one file, here, now."
+        echo "  The \`::error\`/\`::warning\` prefixes above are GitHub's annotation syntax: that text is verbatim what CI would print on this push."
+        echo "  graded: the title \"$TITLE\" ($TITLE_SRC), against the changelog.d/ paths in $BASE..$HEAD_REV"
+      } >&2
+      return 1
+      ;;
+    *)
+      # A usage error is a broken INSTRUMENT, not a finding, and the rail's settled
+      # shape is to fail open loudly on those and let the CI step be the gate.
+      stage_done fragment "$t0" "SKIPPED — the fragment lint could not run (exit $lrc); CI's fragment step is the net"
+      printf '%s\n' "$out" >&2
+      return 0
+      ;;
+  esac
+}
+
+# ── stage 3: shellcheck ───────────────────────────────────────────────────────
 #
 # The file SETS and the FLAGS are the `shellcheck` job's, in install-smoke.yml —
 # two invocations per file, because --include=SC2318 restricts to the codes named
@@ -235,7 +344,7 @@ GIT_ENV_SCRUB=(env
   -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_QUARANTINE_PATH
   -u GIT_INDEX_VERSION -u GIT_REFLOG_ACTION)
 
-# ── stage 3: the harnesses this diff touched ──────────────────────────────────
+# ── stage 4: the harnesses this diff touched ──────────────────────────────────
 harness_stage() {
   local t0 sel_rc files=() ran=0 local_rc=0 elapsed remaining=() h_rc
   t0="$(now_ms)"
@@ -390,7 +499,12 @@ override_taken() {
 
 if override_taken; then exit 0; fi
 
+# BOTH DOOR CHECKS RUN, then the timed stages stop at the first red. See "THE TWO
+# DOOR CHECKS BOTH RUN" at the top of this file: they are both ~0s and both report
+# on the same required context, and refusing on the title alone would cost a whole
+# extra push round to report a fact that was free to learn at the same moment.
 wants title      && { title_stage      || rc=1; }
+wants fragment   && { fragment_stage   || rc=1; }
 (( rc == 0 )) && wants shellcheck && { shellcheck_stage || rc=1; }
 (( rc == 0 )) && wants harnesses  && { harness_stage    || rc=1; }
 

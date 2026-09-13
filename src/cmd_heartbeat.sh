@@ -2714,7 +2714,10 @@ _hb_reclaim_to_todo() {
   if [[ "$mode" == "keep-handoff" ]]; then
     vfier=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};" 2>/dev/null) || vfier=""
     _set_extra=", assignee=verifier"
-    _where_extra=" AND verifier IS NOT NULL AND verifier<>'' AND maker_agent IS NOT NULL AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL"
+    # DIVE-4385 -- "live and ungraded" has to EXCLUDE a bounced delivery, or the
+    # guard's own claim above ("it can never invent a handoff") is false: a
+    # rejected row keeps handoff_delivered_at set and this guard could not tell.
+    _where_extra=" AND verifier IS NOT NULL AND verifier<>'' AND maker_agent IS NOT NULL AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL AND (handoff_rejected_at IS NULL OR handoff_rejected_at < handoff_delivered_at)"
   fi
   db "UPDATE tasks SET status='todo'${_set_extra}, started_at=NULL, updated_at=datetime('now')
       WHERE id=${id} AND status='in_progress'${_where_extra};" 2>/dev/null || true
@@ -3229,8 +3232,16 @@ _hb_reclaim() {
   local _rows_sql="SELECT id || '|' ||
                  strftime('%s', COALESCE(started_at, created_at)) || '|' ||
                  CAST((julianday('now') - julianday(COALESCE(started_at, created_at))) * 1440 AS INTEGER) || '|' ||
+                 -- DIVE-4385: the same not-bounced clause. Rule (b)'s skip was 0 on a
+                 -- rejected row only because a reject moves the assignee off the
+                 -- verifier -- correct by accident, and an accident is what turns into
+                 -- a hold with no exit the moment any other writer parks a bounced row
+                 -- back on its verifier (which is exactly what the delivered_live bug
+                 -- below was doing). Stated as a predicate it cannot be undone by hand.
                  CASE WHEN verifier IS NOT NULL AND verifier = assignee
                            AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
+                           AND (handoff_rejected_at IS NULL
+                                OR handoff_rejected_at < handoff_delivered_at)
                       THEN 1 ELSE 0 END || '|' ||
                  -- DIVE-4104: a LIVE DELIVERY, which is a different question from
                  -- the awaiting_verifier flag above and deliberately does not ask who
@@ -3243,8 +3254,18 @@ _hb_reclaim() {
                  -- A COMMAND before sqlite ever sees the SQL. The first cut of this
                  -- comment quoted two column names that way and every reclaim tick
                  -- printed 'assignee: command not found' to stderr.
+                 -- DIVE-4385: AND NOT BOUNCED. task reject stamps handoff_rejected_at
+                 -- and deliberately LEAVES handoff_delivered_at set -- that stamp is a
+                 -- token the next delivery spends, not a clock the reject clears -- so
+                 -- without this clause a rejected row reads delivered-and-ungraded
+                 -- forever and rule (a) hands the maker's rework to the verifier who
+                 -- just bounced it. Same predicate task/routing.sh already counts
+                 -- actionable rework with; a re-delivery makes handoff_delivered_at the
+                 -- newer stamp again and the row is live once more.
                  CASE WHEN verifier IS NOT NULL AND maker_agent IS NOT NULL
                            AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
+                           AND (handoff_rejected_at IS NULL
+                                OR handoff_rejected_at < handoff_delivered_at)
                       THEN 1 ELSE 0 END || '|' ||
                  -- DIVE-4206: graded, bound, and the merge is owed by a seat that
                  -- is not this one. Same predicate the board paints graded-to-merge
@@ -4228,6 +4249,38 @@ _hb_materialize_recurring() {
 #       the batch to weekly. Never auto-applies, never expires.
 # Isolated by the caller (|| log) — a sweep failure must never abort the wake
 # loop (the heartbeat-never-woke bug class).
+# DIVE-4381 iteration 3: the FOURTH human-facing gate composer is pass (3) of
+# _hb_gate_ttl_sweep — the 72h stale-gate BACKLOG batch. Its two bullet lists were
+# built entirely inside SQL, so there was nowhere to call the bash-side link
+# predicate and the backlog reminder shipped bare while the other three carried
+# the link. The complete sweep is `grep -rn '_task_send_gate_owner ' src/`: DIVE-3342
+# made that the single door a gate message leaves by, so enumerating its callers is
+# complete BY CONSTRUCTION, where the previous two sweeps (on _task_gate_ask_line,
+# then on the rendered /task_ token) were each complete only by luck.
+#
+# PER ROW, NOT PER BATCH: this composer renders MANY rows in ONE message, so a link
+# appended at batch level would be present-but-unattached — the R4/R5 mixed-batch
+# defect already armed for on the re-nag. The loop is restructured (rather than the
+# predicate re-expressed as a SQL join) so that `_task_gate_delivery_link_line`
+# stays the ONE place the http(s):// rule lives; a SQL copy of it would be a second
+# predicate free to drift from the first.
+_hb_gate_backlog_bullets() { # <sql: SELECT id||x'1f'||bullet ...> -> bullets, each with its own link line
+  local _row _rid _rline _dl _out=""
+  while IFS= read -r _row; do
+    [[ -n "$_row" ]] || continue
+    _rid="${_row%%$'\x1f'*}"; _rline="${_row#*$'\x1f'}"
+    [[ -n "$_rid" && "$_rline" != "$_row" ]] || continue
+    [[ -n "$_out" ]] && _out+=$'\n'
+    _out+="$_rline"
+    # Two-space continuation indent, the same shape the re-nag uses, so the URL
+    # reads as belonging to ITS bullet rather than to the batch. Appends nothing
+    # at all when the row carries no URL — no label, no orphan indent.
+    _dl=$(_task_gate_delivery_link_line "$_rid")
+    [[ -n "$_dl" ]] && _out+=$'\n'"  ${_dl}"
+  done < <(db "$1")
+  printf '%s' "$_out"
+}
+
 _hb_gate_ttl_sweep() {
   local tid
   # (1) wake parked
@@ -4297,10 +4350,10 @@ _hb_gate_ttl_sweep() {
     local lines_main lines_manual reminder_ids
     reminder_ids=$(db "SELECT id FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname")
                        ORDER BY COALESCE(need_asked_at,updated_at),id;" | paste -sd, -)
-    lines_main=$(db "SELECT '• /task_'||id||' ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
+    lines_main=$(_hb_gate_backlog_bullets "SELECT id||x'1f'||'• /task_'||id||' ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
                      FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type != 'manual'
                      ORDER BY COALESCE(need_asked_at,updated_at);")
-    lines_manual=$(db "SELECT '• /task_'||id||' ['||ident||'] '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
+    lines_manual=$(_hb_gate_backlog_bullets "SELECT id||x'1f'||'• /task_'||id||' ['||ident||'] '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
                        FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type = 'manual'
                        ORDER BY COALESCE(need_asked_at,updated_at);")
     [[ -n "$lines_main" || -n "$lines_manual" ]] || continue
@@ -4319,6 +4372,16 @@ _hb_gate_ttl_sweep() {
     # of stalling on one recipient. Rides this same weekly gate_pinged_at
     # throttle (computed before the UPDATE below). One level (immediate manager);
     # never auto-answers — a human still clears the gate.
+    # DIVE-4381 iteration 3 — DECIDED OUT, and deliberately so. This block is not a
+    # gate message: it goes over the AGENT rail (cmd_send to an org-chart parent),
+    # not through _task_send_gate_owner, which DIVE-3342 made the one door a message
+    # that asks a human to CLEAR a gate leaves by. Its bullets carry no /task_ link
+    # either — the recipient is an agent at a terminal with `5dive task show`, and the
+    # ask is "help chase the answer or re-scope", not "go look at this diff". Putting a
+    # review URL here would be the only affordance in a message that has none, i.e. a
+    # fix to a different and unfiled gap, on a surface outside this row's axis (the
+    # human gate notification). Arm E1 in tests/gate_delivery_link_unit.sh pins the
+    # decision so that changing it is deliberate rather than drift.
     local _mgr _esc_lines
     _mgr=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$aname");")
     if [[ -n "$_mgr" && "$_mgr" != "$aname" ]] && _task_agent_channel "$_mgr"; then
@@ -4433,6 +4496,23 @@ _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
   AND (COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-1 hour')
        OR (gate_pinged_at IS NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-15 minutes')))
+  -- DIVE-4365 part 2: THE RE-NAG MUST NOT OUTRUN THE LEAD-REVIEW HOLD. A tier-2
+  -- gate's phone ping is now held up to 30 minutes so the lead can catch a false
+  -- one (src/task/notify.sh, the lead-review hold). The clause above makes a
+  -- never-pinged gate re-nag-eligible at 15, which is INSIDE that hold — so
+  -- without this the recovery path becomes the first contact and the hold is a
+  -- no-op on exactly the gates it was built for. Same ordering argument, and the
+  -- same 60s margin, as the 840-not-900 sizing one layer down: the re-nag is the
+  -- net under a ping lost to a dead box, never the normal first ring.
+  --
+  -- SCOPED TO never-pinged TIER-2 ROWS ONLY, and scoped by AGE, not by a flag:
+  -- an hour-old gate, an urgent one (the hold skips those outright, so they are
+  -- pinged already and gate_pinged_at is set), and every tier-1 row are
+  -- unaffected. A gate whose hold child died with its box still re-nags — one
+  -- window later instead of at 15 minutes, which is a delay, never a swallow.
+  AND NOT (COALESCE(tier,2)=2 AND gate_pinged_at IS NULL
+           AND COALESCE(gate_urgent,0)=0
+           AND COALESCE(need_asked_at,updated_at,created_at) > datetime('now','-31 minutes'))
   AND NOT (tier=1 AND recommend IS NOT NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-48 hours'))
   AND (gate_pinged_at IS NULL
@@ -4493,13 +4573,26 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
   local text="🔁 Gate reminder — unanswered gates (${route_label}):"
   [[ -n "$_escalated_from" ]] \
     && text+=$'\n'"↑ filed by ${_escalated_from} (no channel of its own) — escalated to you"
-  local rows='[]' row id ident ntype options recommend gtier ask nonce="" markup="" _mint_n=0
+  local rows='[]' row id ident ntype options recommend gtier ask nonce="" markup="" _mint_n=0 _dlink=""
   local -a nonce_ids=() nonce_hashes=()
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     IFS=$'\x1f' read -r id ident ntype options recommend gtier ask <<<"$row"
     [[ -n "$id" && -n "$ident" ]] || continue
     text+=$'\n\n'"• [${ident}] ${ntype} — ${ask} /task_${id}"
+    # DIVE-4381 iteration 2: the THIRD human-facing gate composer, and the one
+    # that best matches this row's motivation — the re-nag is the message a
+    # founder reads when a gate has SAT for an hour or a day, which is exactly
+    # when "which PR was this again?" is the question. It was missed because it
+    # inlines substr(ask,1,240) instead of calling _task_gate_ask_line, so a grep
+    # on that helper finds the other two sites and hides this one (DIVE-1490's
+    # own rule — one affordance must not drift between the first ping and the
+    # reminders — is what made the /inbox site mandatory, and it applies here
+    # unchanged). Indented to the bullet's continuation shape because this loop
+    # renders MANY rows in one message: the link has to read as belonging to ITS
+    # bullet, not to the batch. Appends nothing when the row carries no URL.
+    _dlink=$(_task_gate_delivery_link_line "$id")
+    [[ -n "$_dlink" ]] && text+=$'\n'"  ${_dlink}"
     [[ -n "$recommend" ]] && text+=$'\n'"  ✅ Recommended: ${recommend}"
     [[ -n "$options" ]] && text+=$'\n'"  Options: ${options}"
 
@@ -4649,20 +4742,27 @@ _hb_gate_renag_sweep() {
   # lose than a pin. So an empty or unpaired coordinator falls straight back to the
   # historical per-filer fan-out: the human gets duplicates again, which is the old
   # behaviour and is loud, rather than silence, which is not.
+  # DIVE-4365 part 3: the SENDER is now the resolved gate notifier, not the org
+  # coordinator. `_task_resolve_gate_notifier` falls back to the coordinator when
+  # no role carries the ` gate notifier` marker, so an untagged chart re-nags from
+  # exactly the bot it re-nags from today and DIVE-3742's one-sender property is
+  # untouched — what changes is that an operator can now move the phone ping to
+  # the lead WITHOUT moving default assignment, default planning and the loop
+  # owner with it (see the split at src/task/routing.sh).
   local _renag_coord=""
-  _renag_coord=$(_task_resolve_coordinator 2>/dev/null || true)
+  _renag_coord=$(_task_resolve_gate_notifier 2>/dev/null || true)
   if [[ -n "$_renag_coord" ]] && _task_agent_channel "$_renag_coord"; then
     ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}
               AND COALESCE(tier,2)=2
               ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;" | paste -sd, -)
     if [[ -n "$ids" ]]; then
-      _hb_log "[gate-renag] T2 collapsed onto coordinator ${_renag_coord}; rows=${ids} (DIVE-3742)"
+      _hb_log "[gate-renag] T2 collapsed onto gate notifier ${_renag_coord}; rows=${ids} (DIVE-3742/4365)"
       _hb_gate_renag_batch "$_renag_coord" "$ids" "paired human"
     fi
   else
     [[ -n "$_renag_coord" ]] \
-      && _hb_log "[gate-renag] coordinator ${_renag_coord} has no paired channel; T2 falls back to per-filer fan-out (DIVE-3742)" \
-      || _hb_log "[gate-renag] no coordinator resolved; T2 falls back to per-filer fan-out (DIVE-3742/2031)"
+      && _hb_log "[gate-renag] gate notifier ${_renag_coord} has no paired channel; T2 falls back to per-filer fan-out (DIVE-3742/4365)" \
+      || _hb_log "[gate-renag] no gate notifier resolved; T2 falls back to per-filer fan-out (DIVE-3742/2031)"
     while IFS= read -r owner; do
       [[ -n "$owner" ]] || continue
       ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}

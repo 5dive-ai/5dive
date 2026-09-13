@@ -124,6 +124,9 @@ export FIVEDIVE_HARNESS=1
 . tests/lib/tier.sh
 
 TIER=""; BUDGET=""; LABEL=""; REPORT=""; TOP=10; CORPUS_DIR="tests"; SHARD=""
+# DIVE-4391: the time-sharding weights. Empty means "resolve the default beside the
+# tier definition"; an explicit path is the seam the grading harness drives.
+SHARD_WEIGHTS=""; SHARD_ENV=""; SHARD_MODE=""; SHARD_COVER=0; SHARD_PLAN_MS=0
 # DIVE-2592: how many of the slowest harnesses a BUDGET RED is allowed to re-time
 # before it claims the corpus is over its cap. See the block below the run loop.
 CONFIRM_TOP=3
@@ -172,10 +175,14 @@ for a in "$@"; do case "$a" in
   # DIVE-2525 (main, reviewing #376): the cap is PER JOB, so splitting the sweep
   # across N jobs cuts each job's wall-clock WITHOUT relaxing the constraint. Raising
   # the ceiling buys three days and re-installs the ratchet; sharding buys headroom
-  # that scales with the corpus. Round-robin, not contiguous blocks: the cost
-  # distribution has a long tail (one harness is 300s, the median is under a second),
-  # and contiguous blocks would put a whole alphabetical neighbourhood of expensive
-  # e2e files in one shard.
+  # that scales with the corpus.
+  #
+  # DIVE-4391: the CUT is by measured time, not by file count. Round-robin was already
+  # chosen over contiguous blocks because the cost distribution has a long tail — but
+  # every-Nth only randomises where that tail lands, it does not balance it, and a
+  # count-cut shifts by one when ANY file is added, so the file that moves into the
+  # heavy shard is a pre-existing harness the diff never touched. See tier_shard_assign
+  # in tests/lib/tier.sh for the two same-base measurements and the fall back.
   #
   # WHAT SHARDING DOES NOT DO, said here because it is the thing to watch: it does not
   # reduce the corpus's TOTAL cost, only the wall-clock of any one job. Aggregate
@@ -185,6 +192,14 @@ for a in "$@"; do case "$a" in
   # total, because that total is the number this whole row exists to make legible and
   # sharding is the obvious way to lose it.
   --shard=*)  SHARD="${a#--shard=}" ;;   # i/N, 1-based
+  # DIVE-4391 seams. The TABLE is data in the checkout (tests/lib/harness-weights.tsv),
+  # not a flag the workflow passes, for the reason spelled out beside tier_shard_assign:
+  # every matrix leg computes the whole plan and keeps its slice, so the plan must be a
+  # pure function of the tree or two legs disagree and a harness runs twice or never.
+  # These two exist for the harness that grades the assignment and for a human
+  # measuring a candidate table; neither can move a cap, a verdict or an exit code.
+  --shard-weights=*) SHARD_WEIGHTS="${a#--shard-weights=}" ;;
+  --shard-env=*) SHARD_ENV="${a#--shard-env=}" ;;
   # DIVE-2592. Unlike --budget, this is NOT a hatch: the confirmation pass can only
   # ever REMOVE a red, so lowering it (0 disables it entirely) can only make this gate
   # STRICTER, which is the one direction an override is allowed to move a control in.
@@ -235,7 +250,7 @@ esac; done
 
 case "$TIER" in
   core|full) ;;
-  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--no-cal-post] [--cal-post-us=<us/iter>] [--cross-runner=off|required] [--runner-id=<id>] [--prior-over-runner=<id>] [--drift-fatal=off|required] [--baseline-report=<file>]...\n' >&2; exit 2 ;;
+  *) printf 'usage: run-harnesses.sh --tier=core|full [--budget=<seconds>] [--label=<env>] [--report=<file>] [--corpus-dir=<dir>] [--confirm-top=<n>] [--no-calibrate] [--cal-us=<us/iter>] [--cal-baseline-us=<us/iter>] [--no-cal-post] [--cal-post-us=<us/iter>] [--shard-weights=<file>] [--shard-env=pristine|installed] [--cross-runner=off|required] [--runner-id=<id>] [--prior-over-runner=<id>] [--drift-fatal=off|required] [--baseline-report=<file>]...\n' >&2; exit 2 ;;
 esac
 [[ "$CONFIRM_TOP" =~ ^[0-9]+$ ]] || { printf 'run-harnesses: --confirm-top must be a non-negative integer, got %s\n' "$CONFIRM_TOP" >&2; exit 2; }
 # DIVE-2829: an unrecognised MODE is usage, never a silent fall back to `off`. A typo
@@ -280,8 +295,30 @@ if [[ -n "$SHARD" ]]; then
   if (( si < 1 || sn < 1 || si > sn )); then
     printf 'run-harnesses: --shard=%s is out of range\n' "$SHARD" >&2; exit 2
   fi
-  picked=()
-  for i in "${!CORPUS[@]}"; do (( i % sn == si - 1 )) && picked+=("${CORPUS[$i]}"); done
+  # DIVE-4391: MEASURED TIME, not file count. The old cut was `i % sn == si - 1`;
+  # see tier_shard_assign in tests/lib/tier.sh for the two same-base measurements
+  # that retired it. The fall back to that exact round-robin is inside the function
+  # and is reported, not silent, as shard_mode=count.
+  if [[ -z "$SHARD_ENV" ]]; then
+    case "$LABEL" in installed*) SHARD_ENV=installed ;; *) SHARD_ENV=pristine ;; esac
+  fi
+  case "$SHARD_ENV" in
+    pristine|installed) ;;
+    *) printf 'run-harnesses: --shard-env must be pristine or installed, got %s\n' "$SHARD_ENV" >&2; exit 2 ;;
+  esac
+  if [[ -z "$SHARD_WEIGHTS" ]]; then
+    if [[ "$CORPUS_DIR" == "tests" ]]; then SHARD_WEIGHTS="tests/lib/harness-weights.tsv"
+    else SHARD_WEIGHTS="$CORPUS_DIR/harness-weights.tsv"; fi
+  fi
+  SHARD_PLAN="$(printf '%s\n' "${CORPUS[@]}" | tier_shard_assign "$sn" "$SHARD_ENV" "$SHARD_WEIGHTS")" || {
+    printf 'run-harnesses: could not compute a shard plan\n' >&2; exit 2; }
+  SHARD_MODE="$(sed -n '1s/.*shard_mode=\([a-z]*\).*/\1/p' <<<"$SHARD_PLAN")"
+  SHARD_COVER="$(sed -n '1s/.*cover_pct=\([0-9]*\).*/\1/p' <<<"$SHARD_PLAN")"
+  picked=(); SHARD_PLAN_MS=0
+  while IFS=$'\t' read -r _s _ms _p; do
+    [[ "$_s" == "$si" ]] || continue
+    picked+=("$_p"); SHARD_PLAN_MS=$(( SHARD_PLAN_MS + _ms ))
+  done < <(grep -v '^#' <<<"$SHARD_PLAN")
   CORPUS=("${picked[@]}")
   LABEL="$LABEL-s$si"
   # A shard that selected nothing is UNDETERMINED for the same reason an empty tier
@@ -726,6 +763,14 @@ if [[ -n "$REPORT" ]]; then
     printf '# run-harnesses report\n# tier=%s\n# label=%s\n# shard=%s\n# harnesses=%d\n# wall_clock_s=%d\n# budget_s=%d\n# pct_of_budget=%d\n# header_drift=%d\n# first_pass_wall_clock_s=%d\n# budget_confirmed=%d\n# confirm_reclaimed_s=%d\n' \
       "$TIER" "$LABEL" "${SHARD:-1/1}" "${#CORPUS[@]}" "$total_s" "$BUDGET" "$pct" "${#drift[@]}" \
       "$first_total_s" "$confirmed" "$(( first_total_s - total_s ))"
+    # DIVE-4391: APPENDED, never substituted (the DIVE-2592 rule). shard_mode is the
+    # field that makes "was this plan balanced on measurements, or did it fall back to
+    # the old every-Nth cut?" answerable from the ARTIFACT rather than from the YAML at
+    # the time, and shard_plan_s beside wall_clock_s is what makes the table's staleness
+    # legible: a plan that predicted 240s on a shard that spent 300 is a table to
+    # refresh, and neither number moves a verdict.
+    printf '# shard_mode=%s\n# shard_weights_cover_pct=%d\n# shard_weights_source=%s\n# shard_plan_s=%d\n' \
+      "${SHARD_MODE:-none}" "${SHARD_COVER:-0}" "${SHARD_WEIGHTS:--}" "$(( SHARD_PLAN_MS / 1000 ))"
     # DIVE-2728. APPENDED, never substituted: wall_clock_s / budget_s / pct_of_budget
     # keep their names and their meaning because budget-report and the trend readers
     # parse by field name (the same rule DIVE-2592 followed). The calibration is a new

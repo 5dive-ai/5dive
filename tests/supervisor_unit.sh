@@ -432,22 +432,22 @@ _snap() {  # <class>:<n> ... -> a snapshot array of that shape
 # 1. clean fleet — every bucket zero, nothing degraded, line does not grow
 CLEAN=$(_snap healthy:17)
 t "rollup: clean fleet counts 17 healthy, 0 unclassified" \
-  "17	0	0	0	0	0	0	0	0	0" "$(_sup_rollup_counts "$CLEAN")"
-read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$CLEAN")"
+  "17	0	0	0	0	0	0	0	0	0	0" "$(_sup_rollup_counts "$CLEAN")"
+read -r H SL ST DR VC SA NO UP QE UN OT <<<"$(_sup_rollup_counts "$CLEAN")"
 t "rollup: clean fleet is healthy" \
-  "healthy" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+  "healthy" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $UN $OT)"
 t "rollup: clean fleet adds no suffix (line must not grow)" \
   "" "$(_sup_rollup_extra 0 0 0 0 0)"
 
 # 2/3. THE MEASURED SHAPE — 17 seats, one stalled. Before this fix the line read
 # "17 agents — 16 healthy / 0 slow / 0 drift / 0 stuck" and the seat was unnamed.
 STRANDED=$(_snap healthy:16 stalled:1)
-read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$STRANDED")"
+read -r H SL ST DR VC SA NO UP QE UN OT <<<"$(_sup_rollup_counts "$STRANDED")"
 t "rollup: the stalled seat is COUNTED" "1" "$SA"
 t "rollup: the stalled seat is NAMED in the line" \
   " / 1 stalled" "$(_sup_rollup_extra "$SA" "$NO" "$UP" "$QE" "$OT")"
 t "rollup: a stranded fleet is degraded, not healthy" \
-  "degraded" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+  "degraded" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $UN $OT)"
 # The invariant. Its violation ("16 of 17") was the ONLY visible symptom, so it
 # is the assertion that would have failed before the fix.
 t "rollup: printed buckets sum to the agent count" \
@@ -455,41 +455,41 @@ t "rollup: printed buckets sum to the agent count" \
 
 # 4. a class added AFTER this commit must not vanish the same way
 NEWCLS=$(_snap healthy:2 wedged-in-2027:1)
-read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$NEWCLS")"
+read -r H SL ST DR VC SA NO UP QE UN OT <<<"$(_sup_rollup_counts "$NEWCLS")"
 t "rollup: an unknown class lands in unclassified, not nowhere" "1" "$OT"
 t "rollup: an unknown class still degrades the fleet" \
-  "degraded" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+  "degraded" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $UN $OT)"
 t "rollup: an unknown class is flagged in the line" \
   " / ⚠ 1 unclassified" "$(_sup_rollup_extra "$SA" "$NO" "$UP" "$QE" "$OT")"
 
-# 5. The DELIBERATE exclusions. _sup_fleet_class takes all ten counts precisely
+# 5. The DELIBERATE exclusions. _sup_fleet_class takes all eleven counts precisely
 # so these are a testable choice and not an argument someone forgot to pass.
 # Mutant caught: folding update-pending into the degraded sum paints every box
 # degraded the night of a publish; folding in drift does the same on a /goal
 # that nothing ever acts on.
 UPD=$(_snap healthy:9 update-pending:8)
-read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$UPD")"
+read -r H SL ST DR VC SA NO UP QE UN OT <<<"$(_sup_rollup_counts "$UPD")"
 t "rollup: update-pending is counted" "8" "$UP"
 t "rollup: a fleet that is only update-pending stays HEALTHY" \
-  "healthy" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+  "healthy" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $UN $OT)"
 t "rollup: update-pending is still named in the line" \
   " / 8 update-pending" "$(_sup_rollup_extra $SA $NO $UP $QE $OT)"
 DRF=$(_snap healthy:4 drift:2)
-read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$DRF")"
+read -r H SL ST DR VC SA NO UP QE UN OT <<<"$(_sup_rollup_counts "$DRF")"
 t "rollup: a fleet that is only drift stays HEALTHY" \
-  "healthy" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+  "healthy" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $UN $OT)"
 
 # 6. the other work-is-not-moving classes DO degrade (mutant: dropping any one
 # from the sum leaves an alerting class reported as a healthy fleet)
 for cls in slow stuck verify-challenge no-output quota-exhausted stalled; do
-  read -r H SL ST DR VC SA NO UP QE OT <<<"$(_sup_rollup_counts "$(_snap healthy:3 "${cls}:1")")"
+  read -r H SL ST DR VC SA NO UP QE UN OT <<<"$(_sup_rollup_counts "$(_snap healthy:3 "${cls}:1")")"
   t "rollup: ${cls} alone degrades the fleet" \
-    "degraded" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $OT)"
+    "degraded" "$(_sup_fleet_class $H $SL $ST $DR $VC $SA $NO $UP $QE $UN $OT)"
 done
 
 # 7. empty fleet must not crash or report a negative unclassified
 t "rollup: empty snapshot is all zeros" \
-  "0	0	0	0	0	0	0	0	0	0" "$(_sup_rollup_counts '[]')"
+  "0	0	0	0	0	0	0	0	0	0	0" "$(_sup_rollup_counts '[]')"
 
 # 8. multiple non-zero buckets keep a stable, readable order
 t "rollup: suffix order is stalled, no-output, update-pending, quota, unclassified" \
@@ -543,7 +543,7 @@ SETE_OUT=$(bash -c '
            lib/state.sh lib/audit.sh lib/registry.sh lib/tasks_db.sh cmd_supervisor.sh; do
     . "src/$f"
   done
-  fc=$(_sup_fleet_class 17 0 0 0 0 0 0 0 0 0)
+  fc=$(_sup_fleet_class 17 0 0 0 0 0 0 0 0 0 0)
   ex=$(_sup_rollup_extra 0 0 0 0 0)
   read -r h _ <<<"$(_sup_rollup_counts "[{\"classification\":\"healthy\"},{\"classification\":\"healthy\"}]")"
   printf "%s|%s|%s" "$fc" "$ex" "$h"

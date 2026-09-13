@@ -364,7 +364,7 @@ _hb_seat_advanced rung2seat "$idz" "$since" rung2seat
 #     behaviour on the new site, so the count bump is an extension of the
 #     invariant and not a retirement of it.
 # ---------------------------------------------------------------------------
-idv=$(addt "verifier-queue-reclaim" --assignee=mk4104 --verifier=vf4104)
+idv=$(addt "verifier-queue-reclaim" --assignee=mk4104 --verifier=vf4104 --verify)
 ( cmd_task_done "$idv" --result="delivered in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 _hb_claim_task vf4104 "$idv" >/dev/null 2>&1
 fv_before=$(fld "$idv" first_started_at)

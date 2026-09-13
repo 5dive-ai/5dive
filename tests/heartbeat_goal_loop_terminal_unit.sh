@@ -64,8 +64,8 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 mk() {  # mk <assignee> <verifier|""> [status] [created_by]
   local asg="$1" vf="$2" st="${3:-todo}" cb="${4-main}"
-  db "INSERT INTO tasks (title,status,priority,assignee,created_by,kind,verifier)
-        VALUES ('t','${st}','high',$(sqlq "$asg"),$(sqlq_or_null "$cb"),'standard',$(sqlq_or_null "$vf"));
+  db "INSERT INTO tasks (title,status,priority,assignee,created_by,kind,verifier,verify_forced)
+        VALUES ('t','${st}','high',$(sqlq "$asg"),$(sqlq_or_null "$cb"),'standard',$(sqlq_or_null "$vf"),$(if [[ -n "$vf" ]]; then printf 1; else printf 0; fi));
       UPDATE tasks SET ident='DIVE-'||id WHERE id=last_insert_rowid();
       SELECT last_insert_rowid();"
 }

@@ -24,8 +24,8 @@ cmd_box_config() {
         "       5dive config verify=<always|delivered-only|never>" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
-        "             always          every standard row is graded (default)" \
-        "             delivered-only  only rows bound to a delivery (task deliver --pr=)" \
+        "             always          every standard row is graded" \
+        "             delivered-only  only rows bound to a delivery (default when unset)" \
         "             never           no row is graded by default" \
         "           A row always wins over the box: 'task add --verify' demands a" \
         "           grade on a 'never' box, 'task add --no-verify' skips one on 'always'."
@@ -39,8 +39,10 @@ cmd_box_config() {
 
   if (( ${#sets[@]} == 0 )); then
     local policy; policy=$(box_verify_policy)
-    local src="box default"
-    [[ -r "$(_box_config_path)" ]] || src="unset — defaulting to 'always'"
+    local src="box default" configured="" cfg
+    cfg=$(_box_config_path)
+    [[ -r "$cfg" ]] && configured=$(jq -r '.verify // empty' "$cfg" 2>/dev/null || printf '')
+    [[ -n "$configured" ]] || src="unset — defaulting to 'delivered-only'"
     [[ "${FIVE_VERIFY_DEFAULT:-1}" == "0" ]] && src="FIVE_VERIFY_DEFAULT=0 in this environment"
     ok "verify = ${policy} (${src})" \
        '{verify:$v, source:$s, path:$p}' \

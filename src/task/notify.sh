@@ -1670,6 +1670,46 @@ _task_gate_ask_line() { # <ask>
   fi
 }
 
+# DIVE-4381: THE BOUND PR LINK, ON THE GATE THE HUMAN IS BEING ASKED TO ANSWER.
+#
+# lodar, Telegram 2026-09-12, on DIVE-4366's "needs you" ping: "shouldnt this link
+# be in human gate notification for convenience?" — he had to ask an agent for the
+# URL of the PR the gate was about. The row already HELD it (tasks.delivery_ref,
+# bound by `task deliver --pr=…`); the ping simply never read the column, so the
+# human's next step was a second tap into /task_<id> or a message to a bot.
+#
+# ONE LINE, and it is prose rather than a button on purpose: a bare https URL is
+# auto-linkified by Telegram (the same property DIVE-390 relies on for /task_<n>),
+# a plain-text host renders it inert but still copy-pasteable, and no tap handler
+# has to learn a new callback. It is a FUNCTION for the DIVE-2411 reason — the
+# copy is half the fix, so the copy is what a test can grade.
+#
+# TYPE-BLIND, DELIVERY-REF-KEYED. Every gate on a row with a bound PR gets the
+# line, not just approval/manual: a decision or access gate about a change is
+# answered by looking at the same diff, and suppressing it there would make the
+# human ask for the URL on exactly the gates where the ask is least mechanical.
+# A secret gate mints its own drop link, but that link is a DIFFERENT thing (where
+# the credential goes, not what to review), so the two coexist rather than
+# compete — and a secret gate on a row with no delivery_ref still shows one link.
+#
+# ONLY WHEN IT IS A URL, and the direction is chosen: `delivery_ref` is a free
+# TEXT column and rows carry bare branch names and PR numbers in it. Rendering
+# one as a link would produce a dead tap, so the predicate is a literal
+# http(s):// prefix and anything else emits NOTHING — the caller then appends no
+# line at all, not an empty one.
+_task_gate_delivery_link_line() { # <row_id> -> "🔗 Review: <url>" or nothing
+  local numid="${1:-}" _ref=""
+  [[ "$numid" =~ ^[0-9]+$ ]] || return 0
+  _ref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${numid};" 2>/dev/null) || _ref=""
+  # Trim: a ref stored with surrounding whitespace is still a URL, and an
+  # all-whitespace ref is still nothing.
+  _ref="${_ref#"${_ref%%[![:space:]]*}"}"; _ref="${_ref%"${_ref##*[![:space:]]}"}"
+  case "$_ref" in
+    https://*|http://*) printf '%s' "🔗 Review: ${_ref}" ;;
+    *) return 0 ;;
+  esac
+}
+
 _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <channel_type> [label]
   local numid="$1" need_type="$2" options="$3" recommend="$4" human_nonce="$5" channel_type="$6" label="${7:-}"
   [[ -n "$label" ]] && label="[${label}] "
@@ -2065,6 +2105,44 @@ _GATE_UNDO_WINDOW_SECS=120
 # reds there.
 _GATE_UNDO_WINDOW_SECS_HUMAN_ONLY=840
 
+# ── DIVE-4365 part 2 — EVERY HUMAN-BOUND GATE LANDS ON THE LEAD FIRST ────────
+#
+# DIVE-4154's window asks "will the FILER take this back?". That catches the 138
+# self-withdrawals it was priced on and cannot catch the shape that produced this
+# row: a gate the filer still believes in, that a LEAD can see is false. On
+# DIVE-4359 (2026-09-12) dev3 filed a tier-2 `secret` gate for a value we INVENT
+# and place with credentials the box already holds. The filer never withdrew it —
+# it was correct by every check the filer could run — the phone rang, and the lead
+# then did the step itself in one command. A window that only the filer can close
+# was open the whole time and bought nothing.
+#
+# So the hold gets a SECOND closer. The ping is held until the lead has acted —
+# cleared the gate, withdrawn it, or forwarded it (`task need <id> --escalate`,
+# which skips the hold outright) — or 30 minutes elapse, whichever is first. The
+# lead is queued at file time exactly like today's lead-routed gates, so this
+# costs no wake (DIVE-3474: the cost is the wake, not the message).
+#
+# WHAT IS HELD IS STILL THE PUSH NOTIFICATION AND NOTHING ELSE — every property
+# DIVE-4154's page above asserts holds unchanged here: the row is written,
+# blocked and pending BEFORE the hold, so it is already on the dashboard, in
+# `task inbox`, in `task queue` and answerable by `task answer`. The gate does not
+# wait for the lead; only the buzz does.
+#
+# 30 MINUTES, AND THE CEILING IS WHY IT IS NOT LONGER. The two skips are the
+# filer's explicit urgency, unchanged. A spend/human_tap/brand gate still reaches
+# the person — after the lead has had the window to catch a false one, which is
+# the whole re-ordering: today the human is rung FIRST and the lead reads about it
+# afterwards. Nothing here can stop a gate; it can only decide who reads it first.
+#
+# ORDERING AGAINST THE RE-NAG IS ENFORCED IN THE SWEEP, NOT HERE. At 1800s this
+# window outruns the heartbeat's 15-minute never-pinged re-nag, so the sweep's
+# WHERE clause excludes a tier-2 row inside its hold (cmd_heartbeat.sh, the
+# DIVE-4365 clause) with the same 60s margin the 840-not-900 sizing takes above.
+# Cited by FILE and clause, never by identifier — a comment naming another
+# module's global creates a real lazy-dispatch load edge (see the note on the
+# clamp below).
+_GATE_LEAD_REVIEW_HOLD_SECS=1800
+
 # Seconds to hold this gate's phone ping. 0 = ping now.
 # Reads the row's priority, so it must be called AFTER the gate UPDATE commits —
 # which is the case: task_need_notify runs after cmd_task_need's write.
@@ -2076,6 +2154,16 @@ _task_gate_undo_window_secs() {
   local _ntype _ceil="$_GATE_UNDO_WINDOW_SECS"
   _ntype=$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
   case "$_ntype" in manual|secret) _ceil="$_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY" ;; esac
+  # DIVE-4365 part 2: a HUMAN-BOUND gate (tier 2 — the only tier whose ping is a
+  # phone ping) gets the lead-review ceiling instead, which is longer than either
+  # type window above and therefore replaces them rather than competing with them.
+  # Read from the ROW, like `gate_urgent` below and for the same reason: the tier
+  # is committed before the deliverer runs on both paths, and a column cannot be
+  # lost by a call site forgetting to re-export it. Tier 1 and tier 0 keep the
+  # DIVE-4154 windows untouched — a lead-routed gate never rings a phone, so
+  # holding it would delay a seat that is polling anyway for no saving at all.
+  local _gtier; _gtier=$(db "SELECT COALESCE(tier,2) FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  [[ "$_gtier" == "2" ]] && _ceil="$_GATE_LEAD_REVIEW_HOLD_SECS"
   local secs="${_5DIVE_GATE_UNDO_WINDOW_SECS:-$_ceil}"
   # An explicit numeric override (harnesses, and the operator escape hatch) wins,
   # but a non-numeric one is a typo, not a policy — fall back rather than defer
@@ -2240,8 +2328,31 @@ _task_need_notify_deliver() {
   # assertion quiet: without a row it would synthesise an `error` verdict for a
   # gate that is deliberately, auditably, not yet delivered. No explicit
   # TASK_GATE_DELIVERY_ROWS bump — _task_gate_delivery_log credits itself.
-  _task_gate_delivery_log ok "$ident" "hold:${_secs}s" "" \
-    "phone ping HELD ${_secs}s (DIVE-4154 undo window) — the gate is live NOW on the dashboard, in task inbox and in task queue; a withdrawal inside the window pages nobody. gate_pinged_at stays NULL so the re-nag still escalates if the ping is lost"
+  # DIVE-4365 part 2: a tier-2 hold is a LEAD REVIEW, and it says so. The chat=
+  # value is the distinct one the row's acceptance names, so the two holds can be
+  # counted apart in gate_delivery_log — `hold:<n>s` is the DIVE-4154 filer window
+  # (tier 0/1, nobody's phone), `hold:lead-review` is a human-bound ping waiting on
+  # a lead. Conflating them would make the measurement that prices the next change
+  # to either one impossible, which is the defect floor_provenance was written to
+  # close one layer up.
+  local _hold_tier _hold_chat="hold:${_secs}s" _hold_lead=""
+  _hold_tier=$(db "SELECT COALESCE(tier,2) FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  if [[ "$_hold_tier" == "2" ]]; then
+    _hold_chat="hold:lead-review"
+    # QUEUED, never woken. The lead picks it up from `5dive task queue` on their
+    # next natural turn — the same contract DIVE-3474 gives a lead-routed gate, and
+    # for the same measured reason (an inbound to a non-fresh seat re-sends that
+    # seat's whole window). Best effort by construction: a gate whose lead cannot
+    # be resolved is held and pinged on the clock exactly as if the lead had
+    # declined to act, which is the fail-open direction this whole mechanism keeps.
+    local _hf; _hf=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+    _hold_lead=$(_gate_route_reviewer "$_hf" 2>/dev/null) || _hold_lead=""
+    [[ -n "$_hold_lead" ]] || _hold_lead=$(_task_resolve_gate_notifier 2>/dev/null) || _hold_lead=""
+  fi
+  local _hold_why="DIVE-4154 undo window"
+  [[ "$_hold_chat" == "hold:lead-review" ]] && _hold_why="DIVE-4365 lead review"
+  _task_gate_delivery_log ok "$ident" "$_hold_chat" "" \
+    "phone ping HELD ${_secs}s (${_hold_why}) — the gate is live NOW on the dashboard, in task inbox and in task queue; a withdrawal or a lead clear inside the window pages nobody${_hold_lead:+; queued for ${_hold_lead} to review, who can clear it or forward it with: 5dive task need ${ident} --escalate}. gate_pinged_at stays NULL so the re-nag still escalates if the ping is lost"
   ( {
       # `exec`, not a redirection on the group: a group redirection is RESTORABLE,
       # so bash saves the very descriptors this child must not keep. exec replaces
@@ -2307,7 +2418,22 @@ _task_need_notify_deliver_now() {
   # This is the answer to "why did _task_owner_channel not fire for olivia": it
   # never could. Prepending the filer is not papering over a second bug; the
   # second bug WAS that the own-channel probe is caller-scoped.
-  if [[ -n "$_self" ]] && _task_agent_channel "$_self"; then
+  # DIVE-4365 part 3: THE TAGGED GATE NOTIFIER'S BOT SENDS, ahead of the filer's.
+  # The ping and the conversation it starts must land in ONE chat, with the seat
+  # that holds the context — on DIVE-4359 they landed in two. TASK_CH_AGENT is
+  # recorded by _task_agent_channel exactly as today (DIVE-2073), so the delivery
+  # row still names which bot rang.
+  #
+  # EXPLICIT-ONLY, and that is the whole safety property: `_task_gate_notifier_explicit`
+  # prints nothing unless exactly one org role carries the ` gate notifier` marker,
+  # so on an untagged chart this branch is not taken and the resolution below is
+  # byte-identical to today's. An unpaired or unresolvable notifier falls straight
+  # through to the filer-first chain — the notifier is a PREFERENCE about which
+  # paired bot sends, never a new way for a gate to reach nobody.
+  local _gnotif=""; _gnotif=$(_task_gate_notifier_explicit 2>/dev/null) || _gnotif=""
+  if [[ -n "$_gnotif" ]] && _task_agent_channel "$_gnotif"; then
+    : # the tagged gate notifier — one phone surface, one chat to answer in
+  elif [[ -n "$_self" ]] && _task_agent_channel "$_self"; then
     : # the filer's own channel — the alert belongs to THEIR paired human
   elif ! _task_owner_channel; then
     warn "$ident: filing agent (${_self:-?}) has no paired channel — escalating up the org chart for the gate alert"
@@ -2448,6 +2574,14 @@ _task_need_notify_deliver_now() {
   # (quinn's iteration-1 grade caught this path still emitting the full ask).
   # The full ask stays one tap away behind /task_<id>.
   text+=$'\n\n'"$(_task_gate_ask_line "$ask") /task_${numid}"
+
+  # DIVE-4381: the bound PR, right under the ask and above the type CTA — the
+  # human reads "what am I deciding", then "here is the thing to look at", then
+  # "here is how to clear it". Emitted only when the row actually carries a URL
+  # (the helper returns nothing otherwise), so a row with no delivery_ref and a
+  # row holding a bare branch name both render byte-identically to before.
+  local _dlink; _dlink=$(_task_gate_delivery_link_line "$numid")
+  [[ -n "$_dlink" ]] && text+=$'\n'"$_dlink"
 
   # DIVE-356: secret/manual gates used to carry NO instruction on how to clear
   # them — the core of Mark's "a needs-you that needs no obvious action is

@@ -49,6 +49,11 @@ command -v sqlite3 >/dev/null 2>&1 || { echo "skip - sqlite3 not available"; exi
 
 TMP="$(mktemp -d /tmp/ledger-unit.XXXXXX)"
 
+# The delegated push rail itself may run under sudo. This harness owns its
+# authority fixtures: start from an explicitly unelevated environment, then
+# set the root and sudo identities inside their dedicated arms below.
+unset SUDO_USER SUDO_UID
+
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
@@ -133,6 +138,9 @@ emit_env() {
   . src/lib/audit.sh    >/dev/null 2>&1
   # shellcheck disable=SC1091
   . src/lib/tasks_db.sh >/dev/null 2>&1
+  # A delegated pre-push rail may itself be root. Default this fixture to the
+  # self branch; the dedicated root and sudo arms override the seam below.
+  _audit_is_root() { return 1; }
 }
 
 SECRET='sk-live-DO-NOT-STORE-THIS'
@@ -350,7 +358,7 @@ else
     set +e
     export STATE_DIR="$E2E" TASKS_DIR="$E2E/tasks" TASKS_DB="$E2E/tasks/tasks.db"
     mkdir -p "$TASKS_DIR"
-    "$BUNDLE" task add "funnel case" --project=DIVE --assignee=dev --verifier=main
+    "$BUNDLE" task add "funnel case" --project=DIVE --assignee=dev --verifier=main --verify
     "$BUNDLE" task start DIVE-1 --no-preflight
     "$BUNDLE" task done DIVE-1 --result="delivered, not closed"
   ) >/dev/null 2>&1
