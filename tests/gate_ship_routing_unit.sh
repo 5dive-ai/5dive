@@ -109,10 +109,30 @@ answered(){ db "SELECT CASE WHEN need_answered_at IS NULL THEN 'open' ELSE 'clos
 [[ "$(_gate_route_reviewer dev)"  == "main" ]] && ok_t "reviewer(dev)=main (manager)" || bad_t "reviewer(dev)=main" "got '$(_gate_route_reviewer dev)'"
 [[ -z "$(_gate_route_reviewer main)" ]]       && ok_t "reviewer(main)=empty (lead files → human)" || bad_t "reviewer(main) empty" "got '$(_gate_route_reviewer main)'"
 
-# --- pref OFF: decision gate still pings the human (unchanged behavior) ------
-seed DIVE-1; HUMAN_PINGED=0
+# --- pref OFF: a builder's decision now routes ANYWAY, by kind (DIVE-4415) ----
+# THIS ARM IS INVERTED, DELIBERATELY, AND IT IS THE POINT OF DIVE-4415. It read
+# "pref off: decision pings human (unchanged behavior)" — DIVE-1145's own statement
+# that the rollout had not started. Measured on a customer box (teal-fox 0.35.1,
+# 2026-09-13): that is the defect. A seat with a `reports_to` lead filed an in-org
+# scope fork as a tier-1 decision and the principal got it, replying "the agent must
+# decide by himself, this is just confusing noise for a human". A plain tier<2
+# `decision` is now routable BY KIND and bypasses the pref, like the nine kinds
+# added before it. The pref itself is untouched, and the DIVE-3266 population
+# (an unbound ship-shaped APPROVAL) still reaches the human — that is what keeps
+# this an inversion of one class and not of the pref.
+seed DIVE-1; HUMAN_PINGED=0; route_reset
 actor_seam_as dev; cmd_task_need DIVE-1 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
-[[ "$HUMAN_PINGED" == "1" ]] && ok_t "pref off: decision pings human" || bad_t "pref off pings human" "HUMAN_PINGED=$HUMAN_PINGED"
+[[ "$HUMAN_PINGED" == "0" && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-1';")" == "main" ]] \
+  && ok_t "pref off: a builder's decision routes to the lead by kind and does NOT ping the human (DIVE-4415)" \
+  || bad_t "pref off routes by kind" "HUMAN_PINGED=$HUMAN_PINGED routed='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-1';")'"
+
+# The human-bound control at pref OFF, so this section still has one: an APPROVAL
+# with nothing bound to it is DIVE-3266's population and is unchanged by DIVE-4415.
+seed DIVE-11; HUMAN_PINGED=0; route_reset
+actor_seam_as dev; cmd_task_need DIVE-11 --type=approval --tier=1 --ask="ship A or B?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" && -z "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-11';")" ]] \
+  && ok_t "pref off: an unbound APPROVAL still reaches the human — the kind is scoped to decision (DIVE-3266 held)" \
+  || bad_t "pref off approval control" "HUMAN_PINGED=$HUMAN_PINGED routed='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-11';")'"
 
 _task_pref_set gate_builder_routing on
 
