@@ -1289,6 +1289,270 @@ out=$(run_push DIVE-992 --dry-run 2>&1); rc=$?
   && ok_t "branch refusal names the body requirement, not --branch alone (DIVE-2801)" \
   || bad_t "branch refusal names the body requirement, not --branch alone (DIVE-2801)" "rc=$rc :: $out"
 
+# ---------------------------------------------------------------------------
+# DIVE-4423: the PR TITLE `--open-pr` mints by default must be one pr-title-lint
+# can pass. The old default was "${ident}: ${task_title}" — `DIVE-4409: ...` can
+# never match `^(feat|fix|test|chore|docs|refactor|ci|perf)(\(...\))?!?: `, so
+# every delegated-push PR arrived title-red and froze the merge queue.
+#
+# Graded against THE REPO'S OWN .github/workflows/pr-title-lint.yml — copied into
+# the fixture, not paraphrased — so these arms move with the rule. If the rule
+# file is not readable the arms SKIP loudly rather than passing vacuously.
+TITLE_WF=".github/workflows/pr-title-lint.yml"
+if [[ ! -f "$TITLE_WF" ]]; then
+  bad_t "4423 precondition: $TITLE_WF is readable" "not found — every 4423 arm below would grade nothing"
+else
+  T4423="$TMP/t4423"; mkdir -p "$T4423/.github/workflows"
+  cp "$TITLE_WF" "$T4423/.github/workflows/pr-title-lint.yml"
+  ( cd "$T4423"
+    git init -q -b main
+    git config user.name test; git config user.email test@example.test
+    git add -A && git commit -q -m "chore: fixture base"
+    git update-ref refs/remotes/origin/main HEAD
+    git checkout -q -b feat-conventional
+    git commit -q --allow-empty -m "feat(push): mint a lint-passing default title (DIVE-4423)"
+    git checkout -q -b feat-noident main
+    git commit -q --allow-empty -m "fix(push): a conventional subject that names no task"
+    git checkout -q -b prose main
+    git commit -q --allow-empty -m "made the thing work again"
+    git checkout -q main
+  ) >/dev/null 2>&1
+
+  # The extracted rule must actually REJECT something, or every arm below is
+  # vacuous. This is the exact string the old code minted.
+  _push_title_passes_lint "$T4423" "DIVE-4409: the delegated push opens a PR" \
+    && bad_t "4423 CONTROL: the extracted rule reds the OLD minted form" "it accepted 'DIVE-4409: ...' — the rule is not grading" \
+    || ok_t "4423 CONTROL: the extracted rule reds the OLD minted form"
+  _push_title_passes_lint "$T4423" "chore(DIVE-4409): the delegated push opens a PR" \
+    && ok_t "4423 CONTROL: the extracted rule accepts the chore(<ident>) form" \
+    || bad_t "4423 CONTROL: the extracted rule accepts the chore(<ident>) form" "it rejected the form the fallback mints"
+
+  # 1. a conventional single-commit subject is REUSED verbatim — the author's own
+  #    type is what release-cut reads, so minting our own would demote a feature.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main feat-conventional "a board title")
+  { [[ "$got" == "feat(push): mint a lint-passing default title (DIVE-4423)" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a conventional branch subject is reused verbatim and passes the lint" \
+    || bad_t "4423: a conventional branch subject is reused verbatim and passes the lint" "got: $got"
+
+  # 2. a conventional subject that does not name the task gets the ident APPENDED
+  #    (the rule anchors at ^, so appending cannot redden a passing title).
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main feat-noident "a board title")
+  { [[ "$got" == *"(DIVE-4423)" && "$got" == "fix(push): "* ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a passing subject missing the ident keeps its type AND gains the ident" \
+    || bad_t "4423: a passing subject missing the ident keeps its type AND gains the ident" "got: $got"
+
+  # 3. a prose subject cannot be reused -> the chore(<ident>) fallback, which
+  #    carries the ident and passes by construction.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main prose "a board title")
+  { [[ "$got" == "chore(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a non-conventional branch subject falls back to chore(<ident>) and passes" \
+    || bad_t "4423: a non-conventional branch subject falls back to chore(<ident>) and passes" "got: $got"
+
+  # 4. NO repopath at all (the seven-argument call shape, and any caller with no
+  #    tree) still mints a passing title rather than the old red one.
+  got=$(_push_mint_pr_title DIVE-4423 "" main feat-conventional "a board title")
+  { [[ "$got" == "chore(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: with no repo path the minted default is still lint-passing" \
+    || bad_t "4423: with no repo path the minted default is still lint-passing" "got: $got"
+
+  # 5. empty task title -> the placeholder, still conventional.
+  got=$(_push_mint_pr_title DIVE-4423 "" main "" "")
+  { [[ "$got" == "chore(DIVE-4423): delegated push" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: an empty task title still mints a lint-passing placeholder" \
+    || bad_t "4423: an empty task title still mints a lint-passing placeholder" "got: $got"
+
+  # 6. FAIL TOWARDS THE SAFE FORM: a tree with no rule to read cannot certify a
+  #    subject, so the subject is NOT reused — it is not that we trust it blind.
+  NORULE="$TMP/t4423-norule"; mkdir -p "$NORULE"
+  ( cd "$NORULE"
+    git init -q -b main
+    git config user.name test; git config user.email test@example.test
+    git commit -q --allow-empty -m base
+    git checkout -q -b feat-x
+    git commit -q --allow-empty -m "feat(push): a subject nobody here can grade"
+    git checkout -q main ) >/dev/null 2>&1
+  _push_title_passes_lint "$NORULE" "feat(push): a subject nobody here can grade" \
+    && bad_t "4423: an unreadable rule is not a pass" "it certified a title with no rule present" \
+    || ok_t "4423: an unreadable rule is not a pass"
+  got=$(_push_mint_pr_title DIVE-4423 "$NORULE" main feat-x "a board title")
+  [[ "$got" == "chore(DIVE-4423): a board title" ]] \
+    && ok_t "4423: with no rule to read the mint takes the by-construction form, not the subject" \
+    || bad_t "4423: with no rule to read the mint takes the by-construction form, not the subject" "got: $got"
+
+  # 7. THE GREP'S OWN NO-MATCH PATH. Arm 6 returns at the `-f` test and never
+  #    reaches the grep at all, so until this arm the line that actually probes
+  #    the workflow was graded only on trees where it matched. Here the file IS
+  #    present and the rule literal is NOT in it.
+  NOPAT="$TMP/t4423-nopattern"; mkdir -p "$NOPAT/.github/workflows"
+  printf 'name: pr-title-lint\non:\n  pull_request:\njobs:\n  lint:\n    steps:\n      - run: echo "this file carries no rule line"\n' \
+    > "$NOPAT/.github/workflows/pr-title-lint.yml"
+  _push_title_passes_lint "$NOPAT" "feat(push): a subject with no rule to grade it" \
+    && bad_t "4423: a workflow file with no rule line is not a pass" "it certified a title the rule never graded" \
+    || ok_t "4423: a workflow file with no rule line is not a pass"
+  got=$(_push_mint_pr_title DIVE-4423 "$NOPAT" main feat-conventional "a board title")
+  [[ "$got" == "chore(DIVE-4423): a board title" ]] \
+    && ok_t "4423: an ungradeable rule file takes the by-construction form, not the subject" \
+    || bad_t "4423: an ungradeable rule file takes the by-construction form, not the subject" "got: $got"
+
+  # 8. DIVE-4423 iteration 2 (quinn). The helper must FAIL BY RETURNING, not by
+  #    dying inside its own probe. Today's only production call site (the `if` in
+  #    _push_mint_pr_title) suppresses errexit dynamically THROUGH the call, so a
+  #    bare `line=$(grep …)` on the no-match path was invisible there — the guard
+  #    was being supplied by the caller's context, and any future direct call,
+  #    `&&` chain, or assignment of the result would have resurrected the abort.
+  #
+  #    Graded in a CHILD SHELL, and this is not ceremony: the harness itself runs
+  #    without errexit, and `( set -e … ) || x` cannot grade it either because the
+  #    exemption propagates INTO the subshell. The call is a bare standalone
+  #    statement under `set -euo pipefail`, so the shell exits either way and rc
+  #    alone cannot tell the two apart (measured). What DOES tell them apart is
+  #    WHICH command failed: with the guard the ERR trap fires on the guard's own
+  #    `return 1`; without it, it fires on the grep assignment two lines above,
+  #    which the guard never gets to read. The payload is read from STDOUT.
+  bare_out=$(FIVE_SRC="$PWD/$SRC" bash -c '
+      set -uo pipefail
+      for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
+               lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
+               lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_push.sh; do
+        # shellcheck source=/dev/null
+        source "$FIVE_SRC/$f" || exit 97
+      done
+      trap '"'"'printf "FAILED-ON=%s\n" "$BASH_COMMAND"'"'"' ERR
+      set -eE
+      _push_title_passes_lint "$1" "feat(push): a subject with no rule to grade it"
+      printf "UNREACHABLE-PASS\n"
+    ' _ "$NOPAT" 2>/dev/null)
+  bare_rc=$?
+  { [[ $bare_rc -ne 0 && $bare_rc -ne 97 ]] \
+      && grep -q '^FAILED-ON=return 1$' <<<"$bare_out" \
+      && ! grep -q 'FAILED-ON=.*grep -m1' <<<"$bare_out" \
+      && ! grep -q 'UNREACHABLE-PASS' <<<"$bare_out"; } \
+    && ok_t "4423: a BARE call under set -euo pipefail fails by RETURNING, not inside its own grep" \
+    || bad_t "4423: a BARE call under set -euo pipefail fails by RETURNING, not inside its own grep" "rc=$bare_rc :: $bare_out"
+
+  # 9. DIVE-4423 iteration 3 (quinn). THE MAJORITY CASE: a MULTI-COMMIT range.
+  #    Measured on this repo 2026-09-13, 7 of 8 recent PRs carried 2-4 commits and
+  #    nothing on the rail requires one commit — yet every fixture branch above has
+  #    exactly one, so "oldest" and "newest" were the same string and the ordering
+  #    the code argued for was graded by nothing. Subject reuse is justified ONLY on
+  #    a one-commit range (that is the sole case where GitHub offers the string AND
+  #    pre-push-rail graded it), so a multi-commit range must take the
+  #    by-construction form with the type derived from the WHOLE range.
+  ( cd "$T4423"
+    git checkout -q -b chore-then-feat main
+    git commit -q --allow-empty -m "chore: first wip commit"
+    git commit -q --allow-empty -m "feat(push): the real work landed in commit two"
+    git checkout -q -b feat-then-chore main
+    git commit -q --allow-empty -m "feat(push): the real work landed in commit one"
+    git commit -q --allow-empty -m "chore: tidy up after it"
+    git checkout -q -b chore-then-fix main
+    git commit -q --allow-empty -m "chore: first wip commit"
+    git commit -q --allow-empty -m "fix(push): the actual fix"
+    git checkout -q -b fix-then-feat main
+    git commit -q --allow-empty -m "fix(push): a fix in commit one"
+    git commit -q --allow-empty -m "feat(push): a feature in commit two"
+    git checkout -q -b feat-then-fix main
+    git commit -q --allow-empty -m "feat(push): a feature in commit one"
+    git commit -q --allow-empty -m "fix(push): a fix in commit two"
+    git checkout -q -b prose-range main
+    git commit -q --allow-empty -m "made the thing work"
+    git commit -q --allow-empty -m "made it work again"
+    git checkout -q -b long-subject main
+    git commit -q --allow-empty -m "feat(push): $(printf 'x%.0s' $(seq 1 300))"
+    git checkout -q main
+  ) >/dev/null 2>&1
+
+  # 9a. a chore FIRST, a feat SECOND: the mint must be feat, and must NOT be the
+  #     oldest subject. Reading one member would mint `chore: first wip commit`,
+  #     main squashes that, release-cut reads chore and cuts a PATCH for a feature
+  #     (DIVE-4086) — and the green title means nothing stops it.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main chore-then-feat "a board title")
+  { [[ "$got" == "feat(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a multi-commit range takes the type of its strongest member (chore,feat -> feat)" \
+    || bad_t "4423: a multi-commit range takes the type of its strongest member (chore,feat -> feat)" "got: $got"
+
+  # 9b. THE SAME RANGE IN THE OTHER ORDER. This is what kills a head-1/tail-1
+  #     mutant in EITHER direction: no single-member read can satisfy 9a and 9b
+  #     at once, because the feat is the oldest in one and the newest in the other.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main feat-then-chore "a board title")
+  { [[ "$got" == "feat(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: the range type does not depend on commit ORDER (feat,chore -> feat)" \
+    || bad_t "4423: the range type does not depend on commit ORDER (feat,chore -> feat)" "got: $got"
+
+  # 9c. no feat in the range, one fix -> fix. The floor may not demote it to chore.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main chore-then-fix "a board title")
+  { [[ "$got" == "fix(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a range with a fix and no feat mints fix, not chore" \
+    || bad_t "4423: a range with a fix and no feat mints fix, not chore" "got: $got"
+
+  # 9c-bis. feat OUTRANKS fix, in BOTH orders. Without this pair the precedence is
+  #     ungraded: no fixture above carries a feat and a fix in the same range, so a
+  #     mutant inverting the two survives every other arm (measured).
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main fix-then-feat "a board title")
+  [[ "$got" == "feat(DIVE-4423): a board title" ]] \
+    && ok_t "4423: feat outranks fix in a mixed range (fix,feat -> feat)" \
+    || bad_t "4423: feat outranks fix in a mixed range (fix,feat -> feat)" "got: $got"
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main feat-then-fix "a board title")
+  [[ "$got" == "feat(DIVE-4423): a board title" ]] \
+    && ok_t "4423: feat outranks fix whichever comes first (feat,fix -> feat)" \
+    || bad_t "4423: feat outranks fix whichever comes first (feat,fix -> feat)" "got: $got"
+
+  # 9d. nothing in the range is gradeable -> chore. A title we minted ourselves is
+  #     not evidence that this change is a feature.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main prose-range "a board title")
+  { [[ "$got" == "chore(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a multi-commit range with no conventional member floors at chore" \
+    || bad_t "4423: a multi-commit range with no conventional member floors at chore" "got: $got"
+
+  # 9e. a multi-commit range NEVER reuses a member subject verbatim, even when that
+  #     member passes the lint on its own.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main chore-then-feat "a board title")
+  { [[ "$got" != *"the real work landed in commit two"* && "$got" != *"first wip commit"* ]]; } \
+    && ok_t "4423: a multi-commit range does not reuse any one commit subject" \
+    || bad_t "4423: a multi-commit range does not reuse any one commit subject" "got: $got"
+
+  # 9f. GitHub caps a PR title at 256 characters and the `gh pr create` call is
+  #     warn-only, so an over-long mint opens NO PR at all — silently. The reuse
+  #     path truncates BEFORE appending the ident, so the ident (which the merge
+  #     gate's evidence binds on) survives the cut.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main long-subject "a board title")
+  { (( ${#got} <= 256 )) && [[ "$got" == *"(DIVE-4423)" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a 300-character commit subject mints a title <=256 that still carries the ident" \
+    || bad_t "4423: a 300-character commit subject mints a title <=256 that still carries the ident" "len=${#got} got: ${got:0:80}..."
+
+  # 9g. the by-construction path is capped too — a board title can be any length.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main prose-range "$(printf 'y%.0s' $(seq 1 400))")
+  { (( ${#got} <= 256 )) && [[ "$got" == "chore(DIVE-4423): "* ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: the by-construction path is capped at 256 as well" \
+    || bad_t "4423: the by-construction path is capped at 256 as well" "len=${#got}"
+
+  # 9h. _push_subject_type is certified by the RULE, not by a second regex: a
+  #     subject the rule reds contributes NO type, whatever it looks like.
+  got=$(_push_subject_type "$T4423" "feat(push): a real one") || got="<none>"
+  [[ "$got" == "feat" ]] \
+    && ok_t "4423: _push_subject_type reads the declared type of a passing subject" \
+    || bad_t "4423: _push_subject_type reads the declared type of a passing subject" "got: $got"
+  got=$(_push_subject_type "$T4423" "feat something without the colon") || got="<none>"
+  [[ "$got" == "<none>" ]] \
+    && ok_t "4423: _push_subject_type yields no type for a subject the rule reds" \
+    || bad_t "4423: _push_subject_type yields no type for a subject the rule reds" "got: $got"
+  got=$(_push_subject_type "$T4423" "feat(push)!: a breaking one") || got="<none>"
+  [[ "$got" == "feat" ]] \
+    && ok_t "4423: _push_subject_type strips the scope and the breaking marker" \
+    || bad_t "4423: _push_subject_type strips the scope and the breaking marker" "got: $got"
+fi
+
 echo "-----"
 printf 'push_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

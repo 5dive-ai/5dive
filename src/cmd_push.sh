@@ -817,12 +817,138 @@ cmd_push() {
   # while making it fatal would turn a successful push into a red exit and invite a
   # re-push. The push is the irreversible half; the PR is the recoverable one.
   if [[ $open_pr -eq 1 ]]; then
-    _push_open_pr "$ident" "$slug" "$branch" "$pr_base" "$pr_title" "$pr_body_file" "$pr_draft" \
+    _push_open_pr "$ident" "$slug" "$branch" "$pr_base" "$pr_title" "$pr_body_file" "$pr_draft" "$repopath" \
       || warn "the branch pushed but the pull request was not opened (see above) — re-run just the PR with: 5dive gh pr create --repo ${slug} --head ${branch}"
   fi
 }
 
-# _push_open_pr <ident> <slug> <branch> <base> <title> <body-file> <draft>
+# _push_title_passes_lint <repopath> <title>
+# DIVE-4423. EXTRACTED, NOT COPIED — scripts/pre-push-rail.sh's title_stage makes
+# exactly this choice for exactly this reason: pr-title-lint.yml's condition is the
+# one authority on what a mergeable title is, and a second regex living here would
+# be a second author for the same contract whose disagreement is SILENT (we mint a
+# title the merge gate reds, or refuse one it would have taken).
+#
+# Returns non-zero when the rule cannot be read at all — a repo with no title lint,
+# or a staged tree with no .github/. That is deliberately the same answer as "this
+# title fails": with no rule to satisfy we cannot certify a commit subject, so the
+# caller falls back to the form that satisfies the rule by construction.
+#
+# The candidate travels through the environment and is never interpolated into the
+# eval, for the same reason pr-title-lint.yml passes it through `env:`.
+_push_title_passes_lint() {
+  local repopath="$1" title="$2" wf line
+  [[ -n "$repopath" && -n "$title" ]] || return 1
+  wf="${repopath}/.github/workflows/pr-title-lint.yml"
+  [[ -f "$wf" ]] || return 1
+  # `|| line=""` and NOT `|| true`: under the bundle's `set -euo pipefail` a bare
+  # assignment from a no-match grep kills the caller with nothing on stdout or
+  # stderr (DIVE-2566/2603/2604), and today only the `if` at the single call site
+  # below hides that — errexit suppression is the CALLER's, not this line's, so a
+  # direct call, an `&&` chain or an assignment of the result resurrects the abort.
+  # The empty value is the post-condition the very next line already reads.
+  line="$(grep -m1 -F 'if [[ "$PR_TITLE" =~ ' "$wf" | sed 's/^[[:space:]]*//')" || line=""
+  [[ -n "$line" ]] || return 1
+  PR_TITLE="$title" eval "$line true; else false; fi"
+}
+
+# _push_subject_type <repopath> <subject>
+# DIVE-4423 iteration 3. Prints the conventional-commit TYPE a subject declares,
+# and prints NOTHING (non-zero) for a subject the extracted rule does not accept.
+# The rule stays the single authority on what a valid subject is — this only reads
+# the leading token that a certified subject is guaranteed to carry (everything up
+# to the first `(`, `!` or `:`), so there is still exactly one author for the
+# contract and an ungradeable subject contributes no type at all.
+_push_subject_type() {
+  local repopath="$1" subj="$2" head=""
+  _push_title_passes_lint "$repopath" "$subj" || return 1
+  head="${subj%%:*}"     # feat(push)!: x  ->  feat(push)!
+  head="${head%%\(*}"    # feat(push)!     ->  feat
+  head="${head%%!*}"     # feat!           ->  feat
+  [[ -n "$head" ]] || return 1
+  printf '%s' "$head"
+}
+
+# _push_mint_pr_title <ident> <repopath> <base> <branch> <task-title>
+# DIVE-4423. The old default was "${ident}: ${task_title}", and `DIVE-4409: ...`
+# can NEVER match pr-title-lint.yml's `^(feat|fix|...)(\(...\))?!?: ` — so every PR
+# the delegated push opened arrived title-red and froze the merge queue until a
+# second seat hand-retitled it. ~18 auto-filed rows (DIVE-4165..DIVE-4320, DIVE-4422)
+# were nothing but that retitling, one PR at a time. Structural, not per-author.
+#
+# Two sources, in this order:
+#   1. THE BRANCH'S OWN COMMIT SUBJECT, when the range holds EXACTLY ONE COMMIT and
+#      that subject passes the lint. One commit is the sole condition under which
+#      both halves of this arm's justification hold: it is the string GitHub itself
+#      offers as the new PR's title, and it is the string pre-push-rail.sh graded
+#      against this same rule before the branch could be pushed (its resolve_title
+#      says so). Reusing it preserves the AUTHOR's conventional type, which is the
+#      one thing this function must not invent — the type decides whether
+#      release-cut cuts a minor or a patch (DIVE-4086).
+#   2. `<type>(<ident>): <task title>` otherwise, with the type derived from the
+#      WHOLE RANGE: feat if any commit in it declares feat, else fix if any declares
+#      fix, else chore. Measured 2026-09-13, 7 of 8 recent PRs in this repo carry
+#      2-4 commits, so this is the MAJORITY path, not the exception. Reading one
+#      member of a multi-commit range (the oldest, as the old code did) describes
+#      the PR by whichever commit happened to be first — a `chore: wip` first commit
+#      would mint a chore title for a branch whose real work is a feat, main squashes
+#      it, release-cut reads the type and cuts a PATCH for a feature (DIVE-4086's
+#      defect in the other direction, which this row's own ALTERNATIVES block cites
+#      to disqualify `always chore`). Taking the maximum over the range passes the
+#      lint by construction AND cannot demote the cut below what the range earned.
+#
+# The ident is APPENDED to a passing subject that lacks it rather than prefixed: the
+# rule anchors at ^ only, so nothing added at the end can turn a passing title red.
+# GitHub refuses a PR title over 256 characters and `gh pr create` is warn-only at
+# this call site, so an over-long mint opens NO PR at all — both paths are capped,
+# and the reuse path truncates the subject BEFORE appending the ident so the ident
+# (which the merge gate's evidence binds on) always survives.
+_PUSH_PR_TITLE_MAX=256
+_push_mint_pr_title() {
+  local ident="$1" repopath="$2" base="$3" branch="$4" t="$5"
+  local range_base="" subj="" type="" ty="" s="" room=0 max=$_PUSH_PR_TITLE_MAX
+  local -a subjects=()
+  if [[ -n "$repopath" && -n "$branch" ]]; then
+    range_base="$base"
+    git -C "$repopath" rev-parse --verify --quiet "refs/remotes/origin/${base}" >/dev/null 2>&1 \
+      && range_base="refs/remotes/origin/${base}"
+    mapfile -t subjects < <(git -C "$repopath" log --format='%s' "${range_base}..refs/heads/${branch}" 2>/dev/null)
+  fi
+
+  # 1. single-commit range only.
+  if [[ ${#subjects[@]} -eq 1 && -n "${subjects[0]}" ]] \
+     && _push_title_passes_lint "$repopath" "${subjects[0]}"; then
+    subj="${subjects[0]}"
+    if [[ "$subj" == *"$ident"* ]]; then
+      (( ${#subj} > max )) && subj="${subj:0:$((max - 3))}..."
+    else
+      room=$(( max - ${#ident} - 3 ))            # the " (<ident>)" it is about to gain
+      (( ${#subj} > room )) && subj="${subj:0:$((room - 3))}..."
+      subj="${subj} (${ident})"
+    fi
+    printf '%s' "$subj"
+    return 0
+  fi
+
+  # 2. by-construction form, typed by the whole range. An ungradeable subject (and
+  #    so an unreadable or unmatched rule) yields no type, which floors at `chore`:
+  #    a title we minted ourselves is not evidence that this change is a feature.
+  for s in "${subjects[@]}"; do
+    ty="$(_push_subject_type "$repopath" "$s")" || ty=""
+    case "$ty" in
+      feat) type="feat"; break ;;
+      fix)  [[ -n "$type" ]] || type="fix" ;;
+    esac
+  done
+  t="${t:-delegated push}"
+  [[ -n "$type" ]] || type="chore"
+  room=$(( max - ${#ident} - ${#type} - 4 ))   # "<type>(<ident>): "
+  (( room < 4 )) && room=4
+  (( ${#t} > room )) && t="${t:0:$((room - 3))}..."
+  printf '%s(%s): %s' "$type" "$ident" "$t"
+}
+
+# _push_open_pr <ident> <slug> <branch> <base> <title> <body-file> <draft> [repopath]
 # DIVE-2605, blockage #1. A builder holds no gh credential of any kind, so after
 # `5dive push` puts the branch up they have historically messaged main with a
 # prepared PR body for main to paste — two round-trips of agent-to-agent messaging
@@ -842,6 +968,9 @@ cmd_push() {
 # than the `gh pr create --body "$(cat f)"` a human would type.
 _push_open_pr() {
   local ident="$1" slug="$2" branch="$3" base="$4" title="$5" body_file="$6" draft="$7"
+  # DIVE-4423: repopath is APPENDED, not inserted, and is optional — the older
+  # seven-argument call shape still works and falls back to the ident form below.
+  local repopath="${8:-}"
   local body="" url
 
   [[ -n "$base" ]] || base="${FIVE_GATE_MAIN_BRANCH:-main}"
@@ -851,7 +980,7 @@ _push_open_pr() {
     # can run long; a PR title is a subject line. Truncate rather than refuse, and
     # keep the ident so the merge gate's own ident-match evidence still binds.
     [[ ${#t} -gt 80 ]] && t="${t:0:77}..."
-    title="${ident}: ${t:-delegated push}"
+    title=$(_push_mint_pr_title "$ident" "$repopath" "$base" "$branch" "$t")
   fi
   if [[ -n "$body_file" ]]; then
     body=$(cat "$body_file")
