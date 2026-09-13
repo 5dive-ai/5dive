@@ -1197,9 +1197,9 @@ TASK_SEND_DELIVERED=0
 TASK_SEND_MESSAGE_IDS=""
 TASK_SEND_FAILED=0
 
-_task_post_owner_target() { # <token> <chat> <thread> <text> <access> <markup> <task_ids>
-  local token="$1" chat="$2" thread="$3" text="$4" access_file="$5" reply_markup="$6" task_ids="$7"
-  _mirror_post "$token" "$chat" "$thread" "$text" "$access_file" "$reply_markup"
+_task_post_owner_target() { # <token> <chat> <thread> <text> <access> <markup> <task_ids> [text_plain]
+  local token="$1" chat="$2" thread="$3" text="$4" access_file="$5" reply_markup="$6" task_ids="$7" text_plain="${8:-}"
+  _mirror_post "$token" "$chat" "$thread" "$text" "$access_file" "$reply_markup" "$text_plain"
   if [[ "${MIRROR_POST_DELIVERED:-0}" == "1" ]]; then
     TASK_SEND_DELIVERED=1
     [[ -n "${MIRROR_POST_MESSAGE_ID:-}" ]] \
@@ -1215,8 +1215,8 @@ _task_post_owner_target() { # <token> <chat> <thread> <text> <access> <markup> <
   fi
 }
 
-_task_send_owner_groups() { # <token> <access> <text> <markup> <task_ids> [exclude_chat]
-  local token="$1" access_file="$2" text="$3" reply_markup="$4" task_ids="$5" exclude_chat="${6:-}"
+_task_send_owner_groups() { # <token> <access> <text> <markup> <task_ids> [exclude_chat] [text_plain]
+  local token="$1" access_file="$2" text="$3" reply_markup="$4" task_ids="$5" exclude_chat="${6:-}" text_plain="${7:-}"
   local groups n i g_chat g_thread
   groups=$(jq -c '(.groups // {}) | to_entries' "$access_file" 2>/dev/null) || groups="[]"
   n=$(jq 'length' <<<"$groups" 2>/dev/null) || n=0
@@ -1225,7 +1225,7 @@ _task_send_owner_groups() { # <token> <access> <text> <markup> <task_ids> [exclu
     g_chat=$(jq -r ".[$i].key" <<<"$groups" 2>/dev/null) || continue
     g_thread=$(jq -r ".[$i].value.message_thread_id // \"\"" <<<"$groups" 2>/dev/null) || g_thread=""
     [[ -n "$g_chat" && "$g_chat" != "$exclude_chat" ]] || continue
-    _task_post_owner_target "$token" "$g_chat" "$g_thread" "$text" "$access_file" "$reply_markup" "$task_ids"
+    _task_post_owner_target "$token" "$g_chat" "$g_thread" "$text" "$access_file" "$reply_markup" "$task_ids" "$text_plain"
   done
 }
 
@@ -1250,7 +1250,9 @@ _task_stamp_confirmed_delivery() { # <comma-separated numeric task ids>
 # failures are logged loudly and retry against an allowed group topic. Always
 # returns 0 (best-effort); TASK_SEND_DELIVERED exposes the receipt to callers.
 _task_send_owner() {
-  local text="$1" reply_markup="${2:-}" task_ids="${3:-}"
+  # DIVE-4412: $4 is the keyboard-less variant of $1 (see _mirror_post) — carried
+  # through untouched so the Bot-API-rejected-keyboard retry is the one that uses it.
+  local text="$1" reply_markup="${2:-}" task_ids="${3:-}" text_plain="${4:-}"
   local token="$TASK_CH_TOKEN" access_file="$TASK_CH_ACCESS"
   TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0
   # DIVE-1506: fail-closed chokepoint. EVERY real human-facing task send (gate-notify + /inbox
@@ -1271,14 +1273,14 @@ _task_send_owner() {
     p_thread=$(jq -r '.messageThreadId // empty' "$ptr_file" 2>/dev/null) || p_thread=""
     if [[ -n "$p_chat" ]]; then
       if jq -e --arg c "$p_chat" '(.allowFrom // []) | index($c) != null' "$access_file" >/dev/null 2>&1; then
-        _task_post_owner_target "$token" "$p_chat" "" "$text" "$access_file" "$reply_markup" "$task_ids"
-        [[ "$TASK_SEND_DELIVERED" == "1" ]] || _task_send_owner_groups "$token" "$access_file" "$text" "$reply_markup" "$task_ids"
+        _task_post_owner_target "$token" "$p_chat" "" "$text" "$access_file" "$reply_markup" "$task_ids" "$text_plain"
+        [[ "$TASK_SEND_DELIVERED" == "1" ]] || _task_send_owner_groups "$token" "$access_file" "$text" "$reply_markup" "$task_ids" "" "$text_plain"
         _task_stamp_confirmed_delivery "$task_ids"
         return 0
       fi
       if jq -e --arg c "$p_chat" '(.groups // {}) | has($c)' "$access_file" >/dev/null 2>&1; then
-        _task_post_owner_target "$token" "$p_chat" "$p_thread" "$text" "$access_file" "$reply_markup" "$task_ids"
-        [[ "$TASK_SEND_DELIVERED" == "1" ]] || _task_send_owner_groups "$token" "$access_file" "$text" "$reply_markup" "$task_ids" "$p_chat"
+        _task_post_owner_target "$token" "$p_chat" "$p_thread" "$text" "$access_file" "$reply_markup" "$task_ids" "$text_plain"
+        [[ "$TASK_SEND_DELIVERED" == "1" ]] || _task_send_owner_groups "$token" "$access_file" "$text" "$reply_markup" "$task_ids" "$p_chat" "$text_plain"
         _task_stamp_confirmed_delivery "$task_ids"
         return 0
       fi
@@ -1291,7 +1293,7 @@ _task_send_owner() {
   if [[ -n "$dms" ]]; then
     while IFS= read -r chat; do
       [[ -n "$chat" ]] || continue
-      _task_post_owner_target "$token" "$chat" "" "$text" "$access_file" "$reply_markup" "$task_ids"
+      _task_post_owner_target "$token" "$chat" "" "$text" "$access_file" "$reply_markup" "$task_ids" "$text_plain"
       attempted=1
     done <<<"$dms"
   fi
@@ -1299,7 +1301,7 @@ _task_send_owner() {
   # the alert lands somewhere visible. A partial DM failure still falls back —
   # every allowlisted owner should have a recovery surface.
   if (( ! attempted )) || [[ "$TASK_SEND_FAILED" == "1" ]]; then
-    _task_send_owner_groups "$token" "$access_file" "$text" "$reply_markup" "$task_ids"
+    _task_send_owner_groups "$token" "$access_file" "$text" "$reply_markup" "$task_ids" "" "$text_plain"
   fi
   if (( ! attempted )) && [[ "$TASK_SEND_DELIVERED" != "1" && -n "$task_ids" ]]; then
     TASK_SEND_FAILED=1
@@ -1338,9 +1340,10 @@ _task_send_owner() {
 # by a human editing state rather than by the person proving they can be reached.
 # Always returns 0; TASK_SEND_DELIVERED / TASK_SEND_FAILED carry the outcome.
 _task_send_gate_owner() {
-  local text="$1" reply_markup="${2:-}" task_ids="${3:-}" owner_override="${4:-}"
+  # DIVE-4412: $5 is the keyboard-less variant of $1 (see _mirror_post).
+  local text="$1" reply_markup="${2:-}" task_ids="${3:-}" owner_override="${4:-}" text_plain="${5:-}"
   if ! _human_registry_active; then
-    _task_send_owner "$text" "$reply_markup" "$task_ids"
+    _task_send_owner "$text" "$reply_markup" "$task_ids" "$text_plain"
     return 0
   fi
   TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0
@@ -1405,7 +1408,7 @@ _task_send_gate_owner() {
       "have ${hid} /start this agent's bot, or route the gate to an agent ${hid} owns"
     return 0
   fi
-  _task_post_owner_target "$token" "$chat" "" "$text" "$access_file" "$reply_markup" "$task_ids"
+  _task_post_owner_target "$token" "$chat" "" "$text" "$access_file" "$reply_markup" "$task_ids" "$text_plain"
   # Remembered so a follow-on courtesy line ("…and 3 more gates") goes to the SAME
   # person instead of resolving from nothing and fanning out.
   [[ "$TASK_SEND_DELIVERED" == "1" ]] && TASK_GATE_LAST_OWNER="$hid"
@@ -1708,6 +1711,16 @@ _task_gate_delivery_link_line() { # <row_id> -> "🔗 Review: <url>" or nothing
     https://*|http://*) printf '%s' "🔗 Review: ${_ref}" ;;
     *) return 0 ;;
   esac
+}
+
+# DIVE-4412: append to BOTH variants of the gate message — the one that rides the
+# keyboard and the one _mirror_post falls back to when Telegram rejects it. Reads
+# the caller's `text` / `text_plain` by dynamic scope ON PURPOSE: the alternative
+# is two `+=` lines per append, and the defect being fixed here is precisely that
+# a line added to one variant and not the other is invisible in the diff. Only the
+# markup-DEPENDENT appends touch a single variable, and each says why.
+_task_gate_text_both() { # <chunk>
+  text+="$1"; text_plain+="$1"
 }
 
 _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <channel_type> [label]
@@ -2538,16 +2551,21 @@ _task_need_notify_deliver_now() {
 
   local _gmode
   _gmode=$(db "SELECT COALESCE(gate_mode,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
-  local text="🙋 [${ident}] needs you"
+  # DIVE-4412: `text_plain` is composed alongside `text` and is what the human
+  # actually receives when the Bot API rejects the keyboard — same prose, plus
+  # every line the renderer suppresses BECAUSE a keyboard was computed. The two
+  # are byte-identical whenever no keyboard was computed in the first place.
+  local text="" text_plain=""
+  _task_gate_text_both "🙋 [${ident}] needs you"
   if [[ "$_gmode" == "confirm-after-send" ]]; then
-    text="↩︎ [${ident}] needs you to CONFIRM AN ACTION ALREADY TAKEN"
-    text+=$'\n'"This is a RATIFICATION, not a prior approval — the action has already happened. Confirming records that you signed it off after the fact; denying records that you did not."
+    text="↩︎ [${ident}] needs you to CONFIRM AN ACTION ALREADY TAKEN"; text_plain="$text"
+    _task_gate_text_both $'\n'"This is a RATIFICATION, not a prior approval — the action has already happened. Confirming records that you signed it off after the fact; denying records that you did not."
   fi
   # DIVE-1927: when the ask was escalated off an unpaired filer, NAME the filer.
   # The recipient's bot is not the asker's bot, so without this the alert reads as
   # the manager's own gate and there is no way to tell whose ask it is.
   [[ -n "${TASK_NOTIFY_ESCALATED_FROM:-}" ]] \
-    && text+=$'\n'"↑ filed by ${TASK_NOTIFY_ESCALATED_FROM} (no channel of its own) — escalated to you"
+    && _task_gate_text_both $'\n'"↑ filed by ${TASK_NOTIFY_ESCALATED_FROM} (no channel of its own) — escalated to you"
   # DIVE-3661 iteration 3: print the line ONLY when the recommendation is not
   # already readable off a button. A DECISION gate's ⭐ first button carries the
   # recommended value verbatim (the line was the same words twice, one apart);
@@ -2555,14 +2573,19 @@ _task_need_notify_deliver_now() {
   # recommendation's ONLY copy. Predicate = the markup string itself. A recommend
   # whose text JSON-escapes differently (embedded quotes) misses the substring
   # and prints anyway — that direction fails safe (duplicate, never lost).
-  if [[ -n "$recommend" && "$reply_markup" != *"$recommend"* ]]; then
-    text+=$'\n\n'"✅ Recommended: ${recommend}"
+  # DIVE-4412: the suppression is keyed on the markup this call COMPUTED, which
+  # is not the same fact as the markup the human RECEIVED. The plain variant
+  # therefore always carries the line — on that path no button says it.
+  if [[ -n "$recommend" ]]; then
+    local _rec_block=$'\n\n'"✅ Recommended: ${recommend}"
     # OSS-11 (DIVE-976): cite the precedent that sourced the recommendation so the
     # human sees WHY this choice is advised and can catch a wrong recall. Rides
     # the Recommended line: a ⭐ button carries the choice, but a citation line
     # floating with no visible recommendation above it reads unanchored; the full
     # precedent stays one tap away in /task detail.
-    [[ -n "$precedent_cite" ]] && text+=$'\n'"↩︎ ${precedent_cite}"
+    [[ -n "$precedent_cite" ]] && _rec_block+=$'\n'"↩︎ ${precedent_cite}"
+    text_plain+="$_rec_block"
+    [[ "$reply_markup" != *"$recommend"* ]] && text+="$_rec_block"
   fi
   # DIVE-390: append a bare, tappable /task_<id> link inline at the end of the
   # description sentence, before the options (Mark 2026-06-15). Telegram
@@ -2573,7 +2596,7 @@ _task_need_notify_deliver_now() {
   # /inbox batch is only the re-send — so the one-line ask applies here too
   # (quinn's iteration-1 grade caught this path still emitting the full ask).
   # The full ask stays one tap away behind /task_<id>.
-  text+=$'\n\n'"$(_task_gate_ask_line "$ask") /task_${numid}"
+  _task_gate_text_both $'\n\n'"$(_task_gate_ask_line "$ask") /task_${numid}"
 
   # DIVE-4381: the bound PR, right under the ask and above the type CTA — the
   # human reads "what am I deciding", then "here is the thing to look at", then
@@ -2581,7 +2604,7 @@ _task_need_notify_deliver_now() {
   # (the helper returns nothing otherwise), so a row with no delivery_ref and a
   # row holding a bare branch name both render byte-identically to before.
   local _dlink; _dlink=$(_task_gate_delivery_link_line "$numid")
-  [[ -n "$_dlink" ]] && text+=$'\n'"$_dlink"
+  [[ -n "$_dlink" ]] && _task_gate_text_both $'\n'"$_dlink"
 
   # DIVE-356: secret/manual gates used to carry NO instruction on how to clear
   # them — the core of Mark's "a needs-you that needs no obvious action is
@@ -2609,15 +2632,15 @@ _task_need_notify_deliver_now() {
       # "put the key where I expect it, then tap ✅ Provided", which is an
       # instruction to do the impossible followed by the button that files the
       # false record. See tests/secret_gate_delivery_path_unit.sh arms T8/T8b.
-      text+=$'\n\n'"$(_task_secret_gate_cta "$ident" "$numid" "$secret_key" "$connector" "$_drop")"
+      _task_gate_text_both $'\n\n'"$(_task_secret_gate_cta "$ident" "$numid" "$secret_key" "$connector" "$_drop")"
       ;;
-    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it is handled, which closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
+    manual) _task_gate_text_both $'\n\n'"✋ Tap ✅ Done below once it is handled, which closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
     # DIVE-1243: an `access` gate normally clears via the org lead; it only reaches
     # a human when it's genuinely human-territory (money/secrets/destructive) or no
     # lead was available. No tap button (the plugin `tna:` handler has no access
     # resolution — see the DIVE-118 no-dead-taps allowlist below); give the on-box
     # CLI line instead.
-    access) text+=$'\n\n'"🔓 This is a grant request that reached you directly (human-territory, or no lead available). Clear it on the box: sudo 5dive task answer ${ident} --value=\"granted\" (or denied)" ;;
+    access) _task_gate_text_both $'\n\n'"🔓 This is a grant request that reached you directly (human-territory, or no lead available). Clear it on the box: sudo 5dive task answer ${ident} --value=\"granted\" (or denied)" ;;
   esac
 
   # DIVE-117/118 tap-to-answer buttons. GATED to the plugin types whose `tna:`
@@ -2650,13 +2673,20 @@ _task_need_notify_deliver_now() {
   # on the dashboard. Moved below the markup computation so the predicate is the
   # markup this call actually produced, not a re-derivation that could drift
   # (the DIVE-2824 rule).
-  if [[ -z "$reply_markup" && "$need_type" == "decision" && -n "$options" ]]; then
+  # DIVE-4412: computed for EVERY decision gate with options, not only the
+  # keyboard-less ones — `text` keeps the old predicate, `text_plain` always
+  # carries the list, because on the fallback there are no buttons to duplicate.
+  if [[ "$need_type" == "decision" && -n "$options" ]]; then
     local opts_list
     opts_list=$(printf '%s' "$options" | jq -Rr --arg r "$recommend" '
       ($r | gsub("^\\s+|\\s+$"; "")) as $rr
       | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
       | to_entries | map("  \(.key + 1). \(.value)\(if .value == $rr and ($rr|length)>0 then " ⭐" else "" end)") | join("\n")' 2>/dev/null) || opts_list=""
-    [[ -n "$opts_list" ]] && text+=$'\n\n'"Options:"$'\n'"${opts_list}"
+    if [[ -n "$opts_list" ]]; then
+      local _opts_block=$'\n\n'"Options:"$'\n'"${opts_list}"
+      text_plain+="$_opts_block"
+      [[ -z "$reply_markup" ]] && text+="$_opts_block"
+    fi
   fi
 
   # DIVE-2818: the reply-to-clear prompt, on HIGH-STAKES gates only.
@@ -2683,20 +2713,25 @@ _task_need_notify_deliver_now() {
   # the same change that lands each fork's handler, never before.
   if [[ "$TASK_CH_TYPE" == "claude" ]] && _task_gate_high_stakes "$numid"; then
     local _reply_cta; _reply_cta=$(_task_gate_reply_cta "$ident" "$need_type" "$options" "$recommend" "$reply_markup")
-    [[ -n "$_reply_cta" ]] && text+=$'\n\n'"$_reply_cta"
+    [[ -n "$_reply_cta" ]] && _task_gate_text_both $'\n\n'"$_reply_cta"
   fi
 
   # DIVE-894: no tap buttons landed (non-tna channel type, or no valid options)
   # — a decision/approval gate would otherwise render with no way to act on a
   # dashboard-less box. Append the copy-pasteable on-box answer line.
-  if [[ -z "$reply_markup" ]]; then
-    case "$need_type" in
-      decision) text+=$'\n\n'"Answer on the box: sudo 5dive task answer ${ident} --value=\"<option>\"" ;;
-      approval) text+=$'\n\n'"Answer on the box: sudo 5dive task answer ${ident} --value=approved (or denied)" ;;
-    esac
+  # DIVE-4412: the plain variant is by definition a delivery with no tap, so it
+  # always carries the on-box line — that is the whole point of the fallback.
+  local _onbox=""
+  case "$need_type" in
+    decision) _onbox=$'\n\n'"Answer on the box: sudo 5dive task answer ${ident} --value=\"<option>\"" ;;
+    approval) _onbox=$'\n\n'"Answer on the box: sudo 5dive task answer ${ident} --value=approved (or denied)" ;;
+  esac
+  if [[ -n "$_onbox" ]]; then
+    text_plain+="$_onbox"
+    [[ -z "$reply_markup" ]] && text+="$_onbox"
   fi
 
-  _task_send_gate_owner "$text" "$reply_markup" "$numid"
+  _task_send_gate_owner "$text" "$reply_markup" "$numid" "" "$text_plain"
   return 0
 }
 
