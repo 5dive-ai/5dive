@@ -2446,6 +2446,31 @@ _agent_send_row_hint() {
   return 0
 }
 
+# _agent_body_shell_hint <message> <msg_src> — DIVE-4421. One line, stderr, always 0.
+#
+# A REMINDER, NOT A DETECTOR, and the difference is the whole design. By the time
+# argv reaches this process the caller's shell has ALREADY run `cmd`, expanded
+# $VAR and eaten $4 — the CORRUPTED bodies arrive with the hazard removed
+# ("US$4,500" is already "US,500"), so nothing on this side can see them. What
+# survives to argv is a backtick or $ the caller successfully QUOTED, i.e. the
+# calls that worked. So this fires on the safe ones and is silent on the broken
+# ones, on purpose: it has no false positives on a body that is fine to send, and
+# it fires at the one moment we know the caller is hand-assembling a body with
+# shell metacharacters in it — which is the moment to name the form that cannot
+# be corrupted. It is not, and must not be read as, a corruption check.
+#
+# The receive-side "empty expansion artifact" warn (the reporter's request 2) was
+# DECLINED for the mirror-image reason, recorded on DIVE-4421: it is a by-name
+# list of artifacts — the same incomplete-list trap the report itself names for
+# "just escape it" — and "US,500" is a legal string a sender may have meant.
+_agent_body_shell_hint() {
+  local msg="${1:-}" src="${2:-}"
+  [[ "$src" != "--message-file" ]] || return 0
+  [[ "$msg" == *'`'* || "$msg" == *'$'* ]] || return 0
+  warn "this body still carries a backtick or \$ — your shell expanded any UNQUOTED \$VAR, \`cmd\` or \$(cmd) BEFORE 5dive saw it, with no error on either side. For code, currency, paths or quotes send the body verbatim instead: --message-file=<path>, or --message-file=- fed by a QUOTED heredoc. See: 5dive agent send --help"
+  return 0
+}
+
 cmd_send() {
   local name="" message="" from="" from_set=0 raw=0 wake=0
   local reply_to_chat="" reply_to_msg=""
@@ -2467,6 +2492,13 @@ cmd_send() {
       --wake)             wake=1 ;;
       --reply-to-chat=*)  reply_to_chat="${1#--reply-to-chat=}" ;;
       --reply-to-msg=*)   reply_to_msg="${1#--reply-to-msg=}" ;;
+      # DIVE-4421: `5dive agent send --help` used to die on `unknown flag: --help`,
+      # so the one place a caller asks the tool how to pass a body answered with an
+      # error. It renders the SHARED usage() rather than a second copy of the send
+      # block: a duplicated help text is a text that drifts, and the whole defect
+      # this row fixes is a warning that was reachable in one place and absent in
+      # the place people type.
+      -h|--help)          usage; exit 0 ;;
       --)                 shift; positional+=("$@"); break ;;
       -*)                 fail "$E_USAGE" "unknown flag: $1" ;;
       *)                  positional+=("$1") ;;
@@ -2477,7 +2509,7 @@ cmd_send() {
     name="${positional[0]}"
     positional=("${positional[@]:1}")
   fi
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent send <name> <text...> | --message=<text> | --message-file=<path> [--from=<sender>] [--raw] [--wake] [--reply-to-chat=<id> [--reply-to-msg=<id>]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent send <name> --message-file=<path>|--message-file=- (VERBATIM — your shell cannot corrupt it) | --message=<text> | <text...> [--from=<sender>] [--raw] [--wake] [--reply-to-chat=<id> [--reply-to-msg=<id>]]"
   # DIVE-2627: positional text is the third way to supply the body. With
   # --message-file set, the `-z "$message"` guard below would DROP trailing
   # positional words without a word about it, so refuse instead. Deliberately
@@ -2490,6 +2522,10 @@ cmd_send() {
     message="${positional[*]}"
   fi
   [[ -n "$message" ]] || fail "$E_USAGE" "message is empty"
+  # DIVE-4421. Positional text went through the caller's shell exactly as
+  # --message= did, so msg_src being empty (the positional form) is hinted too —
+  # only --message-file is exempt.
+  _agent_body_shell_hint "$message" "$msg_src"
 
   # DIVE-1065: a standard-isolation agent has no broad sudo, so it cannot run the
   # direct `sudo -u agent-X tmux` inject this function uses below. Route a
@@ -2769,6 +2805,11 @@ cmd_send() {
 # will keep us awake until --timeout — that's correct behaviour.
 cmd_ask() {
   local name="" message="" from="" from_set=0
+  # DIVE-4421: same body-source bookkeeping as cmd_send. `ask` shared `--message=`
+  # with `send` and had NO file form at all, so the safe form the usage now teaches
+  # first would have been a lie on this verb — the corruption is identical here,
+  # and an ask body is typically LONGER (a question with code in it) than a send.
+  local msg_src=""
   local reply_to_chat="" reply_to_msg=""
   local timeout=120 idle=5 poll=2 buf_lines=2000 allow_unfenced=0
   # DIVE-3388 arm 2: how long to give the injected question to ECHO into the pane
@@ -2779,7 +2820,11 @@ cmd_ask() {
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --message=*)        message="${1#--message=}" ;;
+      --message=*)        _prose_flag_dupe --message "$msg_src"; message="${1#--message=}"; msg_src="--message" ;;
+      --message-file=*)   _prose_flag_dupe --message-file "$msg_src"
+                          _read_prose_file --message-file "${1#--message-file=}"
+                          message="$_PROSE_FILE_VALUE"; msg_src="--message-file" ;;
+      -h|--help)          usage; exit 0 ;;
       --from=*)           from="${1#--from=}"; from_set=1 ;;
       --reply-to-chat=*)  reply_to_chat="${1#--reply-to-chat=}" ;;
       --reply-to-msg=*)   reply_to_msg="${1#--reply-to-msg=}" ;;
@@ -2799,7 +2844,7 @@ cmd_ask() {
     name="${positional[0]}"
     positional=("${positional[@]:1}")
   fi
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent ask <name> <text...> [--from=<sender>] [--reply-to-chat=<id> [--reply-to-msg=<id>]] [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--deliver-secs=30] [--allow-unfenced]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent ask <name> --message-file=<path>|--message-file=- (VERBATIM — your shell cannot corrupt it) | --message=<text> | <text...> [--from=<sender>] [--reply-to-chat=<id> [--reply-to-msg=<id>]] [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--deliver-secs=30] [--allow-unfenced]"
   # DIVE-1901: --allow-unfenced re-enables pane scraping, which is the path that
   # has fabricated every bad reply this ticket has caught. It exists for a seat
   # that genuinely cannot follow the reply-format instruction — never for a
@@ -2812,10 +2857,15 @@ cmd_ask() {
   if (( allow_unfenced )) && [[ "$from" == council* ]]; then
     fail "$E_VALIDATION" "--allow-unfenced is refused on a council ask — a seat that cannot fence records as a CAPTURE FAILURE, not an abstain"
   fi
+  # DIVE-4421: identical to cmd_send's guard — with --message-file set, the
+  # `-z "$message"` test below would DROP trailing positional words silently.
+  [[ "$msg_src" != "--message-file" || ${#positional[@]} -eq 0 ]] \
+    || fail "$E_USAGE" "--message-file conflicts with the positional text — pass the body exactly once, either inline or from a file."
   if [[ -z "$message" && ${#positional[@]} -gt 0 ]]; then
     message="${positional[*]}"
   fi
   [[ -n "$message" ]] || fail "$E_USAGE" "message is empty"
+  _agent_body_shell_hint "$message" "$msg_src"
   for n in "$timeout" "$idle" "$poll" "$buf_lines" "$deliver_grace"; do
     [[ "$n" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "timeout/idle/poll/buffer-lines/deliver-secs must be non-negative integers"
   done
