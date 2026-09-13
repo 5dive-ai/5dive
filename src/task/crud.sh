@@ -666,6 +666,12 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   # positive record that the uid was measured and corroborated the claim, which is
   # not something a NULL can ever say.
   local derived_actor="$ACTOR_BOARD"
+  # DIVE-4419: a row can be born oversized too — `task add --body-file=` reads a
+  # file verbatim — so the cap belongs on the creation path as well as on the
+  # append path, or the guard is one `--body-file` away from irrelevant. No
+  # ident exists yet (the AFTER INSERT trigger stamps it), so the refusal names
+  # the title instead.
+  _task_body_size_guard "$body" "the new row (${title:0:60})" "task set-body"
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable,
@@ -1028,15 +1034,25 @@ cmd_task_show() {
     previous_gates=$(_gate_history_summary_json "$id")
     [[ -n "$subs" ]] || subs="[]"
     [[ -n "$deps" ]] || deps="[]"
-    if (( no_body )); then
-      jq -cn --argjson t "$task" --argjson s "$subs" --argjson b "$deps" \
-        --argjson g "$previous_gates" \
-        '{ok:true, data:{task:($t[0] | del(.body, .result)), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
-    else
-      jq -cn --argjson t "$task" --argjson s "$subs" --argjson b "$deps" \
-        --argjson g "$previous_gates" \
-        '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
-    fi
+    [[ -n "$task" ]] || task="[]"
+    [[ -n "$previous_gates" ]] || previous_gates="[]"
+    # DIVE-4419: the four JSON values go to jq on STDIN, never through argv.
+    # `--argjson t "$task"` handed the whole row — body + result + ask — to
+    # execve as ONE argument, and Linux caps a single argv entry at
+    # MAX_ARG_STRLEN (131072 bytes; not tunable, and not the ARG_MAX total).
+    # Past that, exec fails E2BIG, bash reports rc=126, jq prints "Argument list
+    # too long" on stderr and NO JSON envelope is emitted — so every machine
+    # consumer of this surface (the Telegram gate tap, /inbox, the dashboard row
+    # fetch, the `task answer` re-render) died on a row whose only sin was that
+    # agents had written a lot on it. Measured on row 4542: body 116,368 +
+    # result 24,432 -> rc=126 for every reader, including lodar's tap on a live
+    # tier-2 gate, until the body was archived to a file by hand.
+    # A pipe has no such cap. `jq -s` slurps the stream into one array; the
+    # printf order IS the contract — row, subtasks, blocked_by, previous_gates.
+    local _show_filter='{ok:true, data:{task:(.[0][0]), subtasks:.[1], blocked_by:.[2], previous_gates:.[3]}}'
+    (( no_body )) && _show_filter='{ok:true, data:{task:(.[0][0] | del(.body, .result)), subtasks:.[1], blocked_by:.[2], previous_gates:.[3]}}'
+    printf '%s\n%s\n%s\n%s\n' "$task" "$subs" "$deps" "$previous_gates" \
+      | jq -cs "$_show_filter"
   else
     # DIVE-3785: gate state sits IMMEDIATELY AFTER `status`, because `status`
     # alone cannot answer the question the board is most often asked — "what is

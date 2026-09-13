@@ -2950,6 +2950,50 @@ _task_pref_set() {
       ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
 }
 
+# DIVE-4419 — a bound on the one place a row body actually grows.
+#
+# `task set-body --append` is the only unbounded writer on the board: every
+# addendum tacks on and nothing ever trimmed. Row 4542 reached 116,368 bytes of
+# body plus 24,432 of result that way, and at that size `task show --json` blew
+# past MAX_ARG_STRLEN and exited 126 for EVERY reader — including lodar's tap on
+# a live tier-2 gate, which reported only "exited 126 without reporting a
+# reason". cmd_task_show no longer passes the row through argv, so that 126 is
+# gone; this guard exists for the OTHER cost, which that fix does not touch: a
+# row body is re-sent into the assignee's context window on every dispatch of
+# the row, and a non-fresh seat re-reads it every 15 minutes. 100KB of prose on
+# a row is a per-tick burn, not a one-time write. It also keeps the supported
+# write verbs clear of the SAME argv cap on the write side — db() hands its SQL
+# to sqlite3 as one argv entry, so a body past ~131KB cannot be stored at all.
+#
+# Deliberately a WARN then a REFUSE rather than a truncation: silently dropping
+# text someone wrote is worse than refusing the write, and the refusal names the
+# fix (archive the long form to a file, keep the pointer on the row) — the same
+# move main made by hand at 07:53Z on 2026-09-13 to unblock the tap.
+#
+# Overridable by env so a one-off migration or repair is not blocked by it, and
+# so a harness can grade both thresholds without writing 96KB of prose.
+TASK_BODY_WARN_BYTES="${TASK_BODY_WARN_BYTES:-49152}"    # 48KB
+TASK_BODY_MAX_BYTES="${TASK_BODY_MAX_BYTES:-98304}"      # 96KB
+
+# _task_body_size_guard <new-body> <ident> <verb>
+# Refuses (E_VALIDATION) past the cap, warns to stderr past the warn line, and
+# is a no-op below it. SHRINKING is always allowed — the check is on the size of
+# the RESULT, so a `set-body` replace with a short body over an oversized row is
+# the documented way out and must never be refused; a guard reading the prior
+# size would permanently trap the very rows it exists to prevent.
+_task_body_size_guard() {
+  local newbody="$1" ident="$2" verb="${3:-task set-body}"
+  local n; n=$(printf '%s' "$newbody" | wc -c | tr -d ' ')
+  [[ "$n" =~ ^[0-9]+$ ]] || return 0
+  if (( n > TASK_BODY_MAX_BYTES )); then
+    fail "$E_VALIDATION" "refusing: that would leave ${ident} with a ${n}-byte body (cap ${TASK_BODY_MAX_BYTES}). A body this size is re-sent into the assignee's context on EVERY dispatch of the row, and it is what broke reading row 4542 at all (DIVE-4419). Keep the pointer on the row and put the long form in a file: write it under /home/claude/projects/5dive/evidence/ and then '${verb} ${ident} --append \"<one-line summary> — full text: <that path>\"'."
+  fi
+  if (( n > TASK_BODY_WARN_BYTES )); then
+    warn "${ident} body is now ${n} bytes (warn at ${TASK_BODY_WARN_BYTES}, refused past ${TASK_BODY_MAX_BYTES}) — every dispatch of this row re-sends all of it. Move the long form to a file under /home/claude/projects/5dive/evidence/ and leave a pointer."
+  fi
+  return 0
+}
+
 # Formatted read: dbfmt <sqlite-flag> "<sql>"  (e.g. -box, -json, -line).
 dbfmt() {
   umask 0002
