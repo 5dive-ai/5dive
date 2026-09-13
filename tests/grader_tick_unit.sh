@@ -34,7 +34,20 @@ PENDING="DIVE-1
 DIVE-2
 DIVE-3"
 INFLIGHT=0
-db(){ case "$*" in *grade.requested*) printf '%s\n' "$PENDING" ;; *COUNT*) printf '%s\n' "$INFLIGHT" ;; *) printf '' ;; esac; }
+# DIVE-4410: the per-seat reading and the round-robin cursor are two more reads
+# off the same table. They are matched BEFORE `*COUNT*` because the seat-load
+# query is itself a COUNT — matched after, it would be served the account-wide
+# number and every seat would read as equally loaded, which is the defect.
+SEATLOADS=""   # "<seat><US><n>" lines, one per busy pool seat
+LASTPICK=""    # the seat the previous spawn landed on
+US=$'\x1f'
+db(){ case "$*" in
+        *grade.requested*)              printf '%s\n' "$PENDING" ;;
+        *"GROUP BY seat"*)              printf '%s\n' "$SEATLOADS" ;;
+        *"ORDER BY s.id DESC LIMIT 1"*) printf '%s\n' "$LASTPICK" ;;
+        *COUNT*)                        printf '%s\n' "$INFLIGHT" ;;
+        *)                              printf '' ;;
+      esac; }
 fail(){ shift; printf 'FAILCALL %s\n' "$*" >&2; return 1; }
 warn(){ :; }
 task_actor(){ printf 'sys'; }
@@ -70,6 +83,16 @@ probe_ok(){ return 0; }
 probe_no(){ return 1; }
 probe_only_g1(){ [[ "$1" == g1 ]]; }
 _GRADER_READ_PROBE=probe_ok
+# ══ THE PRE-DIVE-4410 ARMS RUN WITH THE PER-SEAT CAP LIFTED, DELIBERATELY ══
+# Everything above the DIVE-4410 section grades the FLOOR, the credential probe
+# and errexit survival, and every one of those arms does it with a ONE-SEAT pool
+# and three pending rows — i.e. by asserting all 3 land. Under the shipped
+# per-seat cap of 1 they would instead be measuring the cap, and would report a
+# spread regression as a floor regression. Lifting it here keeps each arm
+# measuring the property it was written for; the cap gets its own section, and
+# its SHIPPED default gets an arm that assigns nothing (see LOCK 2 THE SETTING
+# for why an arm that assigns the flag cannot grade the default).
+_GRADER_MAX_PER_SEAT=9
 # Replace the ONLY fleet-touching function with a recorder.
 SPAWNS=""
 _grader_spawn_session(){ printf '%s\n' "$1:$2" >> "$SPAWNF"; return 0; }
@@ -424,6 +447,150 @@ out=$(run --cap=5 --only=DIVE-2)
 _GRADER_POOL=""
 out=$(run --cap=5 --commit --only=DIVE-2)
 [[ ! -s "$SPAWNF" ]] && ok_ 'ONLY: still honours LOCK 2 (empty pool, no spawn)' || bad_ 'only + empty pool' "$(spawns)"
+_GRADER_POOL="g1"
+
+# ══ DIVE-4410: THE POOL IS A SET OF SEATS, NOT A PREFERENCE LIST ═════════════
+#
+# The lane was first-fit over `$_GRADER_POOL`, gated only by ACCOUNT headroom and
+# repo readability — neither of which is per-SEAT. MEASURED on main 2026-09-13:
+# 126 consecutive spawns, every one `-> quinn`, and one tick putting DIVE-4404,
+# 4397, 4401 and 4405 onto quinn together while main2 idled. A spawn is
+# assign+wake and a seat runs ONE session, so that tick's `spawn=4` was a 4-deep
+# serial queue, not four graders.
+#
+# WHY EVERY ARM HERE USES A TWO-SEAT POOL ON ONE ACCOUNT (g1 and g2 both read
+# account `mark`): a two-ACCOUNT pool would spread for the wrong reason — the
+# floor is already per-account, so the old first-fit lane passes such a fixture.
+# One account is the shape the defect lives in and the shape the fleet runs.
+_GRADER_POOL="g1 g2"; _GRADER_READ_PROBE=probe_ok
+_GRADER_MAX_PER_SEAT=1
+SEATLOADS=""; LASTPICK=""; INFLIGHT=0
+
+# ── the ordering primitive, graded on its own ────────────────────────────────
+# Load DOMINATES the cursor: a seat at 0 is never passed over for one at 1, and
+# the cursor only breaks the tie. Asserted separately because the two rules are
+# independently wrong-able and the tick can only show one of them at a time.
+ord(){ printf '%s' "$2" | _grader_pool_order "$1" | tr '\n' ' '; }
+[[ "$(ord '' '')" == 'g1 g2 ' ]] \
+  && ok_ 'ORDER: an idle pool with no cursor keeps pool order' || bad_ 'order idle' "$(ord '' '')"
+[[ "$(ord g1 '')" == 'g2 g1 ' ]] \
+  && ok_ 'ORDER: the cursor rotates past the last-picked seat' || bad_ 'order rotates' "$(ord g1 '')"
+[[ "$(ord g2 '')" == 'g1 g2 ' ]] \
+  && ok_ 'ORDER: the rotation wraps' || bad_ 'order wraps' "$(ord g2 '')"
+[[ "$(ord g1 'g2=1
+g1=0
+')" == 'g1 g2 ' ]] \
+  && ok_ 'ORDER: LOAD BEATS THE CURSOR — a busy g2 loses to an idle g1 it points at' \
+  || bad_ 'order load beats cursor' "$(ord g1 'g2=1
+g1=0
+')"
+[[ "$(ord gGONE '')" == 'g1 g2 ' ]] \
+  && ok_ 'ORDER: a cursor naming a seat no longer in the pool degrades to pool order' \
+  || bad_ 'order unknown cursor' "$(ord gGONE '')"
+
+# ── two idle seats, two pending rows: ONE EACH ───────────────────────────────
+PENDING="DIVE-1
+DIVE-2"
+out=$(run --cap=5 --commit)
+[[ "$(grep -c . "$SPAWNF")" == 2 ]] && ok_ 'SPREAD: both rows spawn' || bad_ 'spread spawns 2' "$(spawns)"
+{ grep -q '^g1:' "$SPAWNF" && grep -q '^g2:' "$SPAWNF"; } \
+  && ok_ 'SPREAD: one spawn per seat — g1 AND g2, not two onto g1' \
+  || bad_ 'SPREAD one per seat' "spawned: $(spawns)"
+# THE NEGATIVE HALF. Two spawns landing on two seats is also what a lane that
+# alternates blindly would produce; what must be true is that NEITHER seat took
+# both, i.e. the second row read the first row's spawn.
+[[ "$(cut -d: -f1 "$SPAWNF" | sort -u | wc -l)" == 2 ]] \
+  && ok_ 'SPREAD: no seat took both rows (the in-tick reading is maintained)' \
+  || bad_ 'no seat takes both' "$(spawns)"
+grep -q 'spawn   DIVE-1  -> g1' <<<"$out" && grep -q 'spawn   DIVE-2  -> g2' <<<"$out" \
+  && ok_ 'SPREAD: the PLAN NAMES BOTH seats' || bad_ 'plan names both seats' "$out"
+
+# ── the pick reason rides on the spawn line ──────────────────────────────────
+grep -q 'spawn   DIVE-2  -> g2  (in-flight g1=1 g2=0; g1 busy:1;' <<<"$out" \
+  && ok_ 'REASON: the spawn line says which seats were busy and what the loads were' \
+  || bad_ 'spawn line carries the pick reason' "$out"
+
+# ── a third row with BOTH seats busy QUEUES; it does not stack ───────────────
+PENDING="DIVE-1
+DIVE-2
+DIVE-3"
+SEATLOADS="g1${US}1
+g2${US}1"
+out=$(run --cap=9 --commit)
+[[ ! -s "$SPAWNF" ]] && ok_ 'BUSY: every pool seat at its per-seat cap spawns nothing' \
+  || bad_ 'busy pool spawns nothing' "spawned: $(spawns)"
+grep -q 'queue   DIVE-1  (no free seat — g1 busy:1; g2 busy:1;' <<<"$out" \
+  && ok_ 'BUSY: queues and NAMES the busy seats' || bad_ 'busy queue line' "$out"
+outj=$(run --cap=9 --commit --json)
+[[ "$(printf '%s' "$outj" | python3 -c 'import json,sys;print(json.load(sys.stdin)["queued"])')" == 3 ]] \
+  && ok_ 'BUSY: all 3 counted QUEUED (not spawned, not dark)' || bad_ 'busy queues 3' "$outj"
+
+# ── never a seat at 1 while another is at 0 ──────────────────────────────────
+PENDING="DIVE-1"
+SEATLOADS="g1${US}1"
+LASTPICK="g1"
+out=$(run --cap=9 --commit)
+[[ "$(cat "$SPAWNF")" == 'g2:DIVE-1' ]] \
+  && ok_ 'LEAST-LOADED: a busy g1 is skipped for an idle g2' || bad_ 'least loaded' "$(spawns)"
+# and the mirror image, so the arm is not just "g2 always wins"
+SEATLOADS="g2${US}1"
+LASTPICK="g2"
+out=$(run --cap=9 --commit)
+[[ "$(cat "$SPAWNF")" == 'g1:DIVE-1' ]] \
+  && ok_ 'LEAST-LOADED: mirrored — a busy g2 is skipped for an idle g1' || bad_ 'least loaded mirror' "$(spawns)"
+
+# ── the cursor breaks the all-idle tie, so a drained pool does not re-first-fit ─
+SEATLOADS=""; LASTPICK="g1"
+out=$(run --cap=9 --commit)
+[[ "$(cat "$SPAWNF")" == 'g2:DIVE-1' ]] \
+  && ok_ 'ROUND-ROBIN: with both seats idle the pick follows the cursor, not pool order' \
+  || bad_ 'round robin tie' "$(spawns)"
+LASTPICK="g2"
+out=$(run --cap=9 --commit)
+[[ "$(cat "$SPAWNF")" == 'g1:DIVE-1' ]] \
+  && ok_ 'ROUND-ROBIN: the cursor wraps back to the head of the pool' || bad_ 'round robin wrap' "$(spawns)"
+
+# ── the floor still wins over the load: an idle seat on a spent account loses ─
+# The account floor is UNCHANGED by this row and must stay the harder gate —
+# spreading onto an exhausted account is a worse failure than a serial queue.
+_GRADER_POOL="g9 g1"; SEATLOADS="g1${US}0"; LASTPICK="g9"
+out=$(run --cap=9 --commit)
+[[ "$(cat "$SPAWNF")" == 'g1:DIVE-1' ]] \
+  && ok_ 'FLOOR: an idle seat whose ACCOUNT is spent is still refused' || bad_ 'floor beats load' "$(spawns)"
+_GRADER_POOL="g1 g2"; LASTPICK=""; SEATLOADS=""
+
+# ── the SHIPPED per-seat cap, assigned by nobody ─────────────────────────────
+# Same reasoning as LOCK 2 THE SETTING: every arm above assigns
+# `_GRADER_MAX_PER_SEAT`, so none of them can see a lane that ships with it at 4.
+# This one unsets it, re-sources the lane so the default expansion runs, reads
+# what the lane says, and re-applies the stubs in the header's own order so the
+# real fleet primitive is never reachable from here.
+( unset _GRADER_MAX_PER_SEAT
+  # shellcheck source=/dev/null
+  source src/task/grader_pool.sh
+  [[ "$_GRADER_MAX_PER_SEAT" == 1 ]] ) \
+  && ok_ 'DEFAULT: the shipped per-seat cap is 1 — one grading session per seat' \
+  || bad_ 'shipped per-seat cap is 1' "got: ${_GRADER_MAX_PER_SEAT}"
+# shellcheck source=/dev/null
+source src/task/grader_pool.sh
+_GRADER_USAGE_CMD=usage_cmd
+_GRADER_READ_PROBE=probe_ok
+_grader_spawn_session(){ printf '%s\n' "$1:$2" >> "$SPAWNF"; return 0; }
+_GRADER_MAX_PER_SEAT=1
+
+# ── the account-wide cap is untouched and still binds ────────────────────────
+# Two idle seats must NOT become a way past `--cap`: the per-seat rule narrows
+# the lane, it never widens it.
+PENDING="DIVE-1
+DIVE-2"
+SEATLOADS=""; INFLIGHT=5
+out=$(run --cap=2 --commit)
+[[ ! -s "$SPAWNF" ]] && ok_ 'CAP: a full account cap still blocks both idle seats' \
+  || bad_ 'account cap still binds' "$(spawns)"
+INFLIGHT=0
+PENDING="DIVE-1
+DIVE-2
+DIVE-3"
 _GRADER_POOL="g1"
 
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
