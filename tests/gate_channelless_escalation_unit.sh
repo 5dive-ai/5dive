@@ -182,7 +182,14 @@ db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,status)
     VALUES ('DIVE-9004','unnotified','high','dev3','dev3','standard','todo');"
 did=$(db "SELECT id FROM tasks WHERE ident='DIVE-9004';")
 FILER_SELF=dev3 READABLE="" PAIRED=""
-out=$( (actor_seam_as dev3; cmd_task_need DIVE-9004 --type=decision --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 ); rc=$?
+# DIVE-4415: this arm's subject is "a gate filed when NOBODY CAN BE PINGED still
+# files, stands and says so". It used a plain `--type=decision`, which was
+# human-bound only because a plain tier-1 decision never engaged the lead rail —
+# the defect DIVE-4415 fixes. dev3 has a lead in this fixture, so that filing now
+# routes and correctly needs no channel at all. Re-based on the human-bound class
+# so the channelless claim is still being graded; the moved population gets its
+# own arm immediately below rather than being quietly dropped.
+out=$( (actor_seam_as dev3; cmd_task_need DIVE-9004 --type=decision --tier=2 --needs=human_tap --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 ); rc=$?
 [[ "$rc" == "0" ]] && ok_t "cmd_task_need still FILES the gate when nobody can be pinged" \
   || bad_t "unnotified gate still files" "rc=$rc out=${out:0:200}"
 row=$(db "SELECT status||'|'||COALESCE(need_type,'-')||'|'||COALESCE(gate_pinged_at,'NULL') FROM tasks WHERE id=${did};")
@@ -191,6 +198,17 @@ row=$(db "SELECT status||'|'||COALESCE(need_type,'-')||'|'||COALESCE(gate_pinged
 [[ "$out" == *"UNNOTIFIED"* ]] \
   && ok_t "the result SAYS nobody was pinged (never reads like a notified gate)" \
   || bad_t "unnotified is marked" "${out:0:240}"
+
+# DIVE-4415: and the population that MOVED. A plain tier-1 decision from a seat
+# with a lead is no longer channelless at all — it routes, so "no human channel"
+# stops being a fact about it. Asserted here so the re-basing above is a recorded
+# behaviour change rather than a test that quietly stopped covering a case.
+db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,status)
+    VALUES ('DIVE-9014','unnotified decision','high','dev3','dev3','standard','todo');"
+out=$( (actor_seam_as dev3; cmd_task_need DIVE-9014 --type=decision --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 )
+[[ -n "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-9014';")" && "$out" != *"UNNOTIFIED"* ]] \
+  && ok_t "DIVE-4415: a plain tier-1 decision routes to the lead, so no channel is needed for it" \
+  || bad_t "DIVE-4415 decision routes" "reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-9014';")' out=${out:0:240}"
 
 # ---- 6. absent vs FORBIDDEN in the pairing probe (main's PR #160 review) -----
 # The probe must be three-valued. A boolean would put the very conflation this
