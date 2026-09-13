@@ -91,6 +91,16 @@ eq_t "shape: quoted name => <name>"      "$(_gate_ask_shape 'rename to "Prod Eas
 eq_t "shape: decimal => <num>"           "$(_gate_ask_shape 'bump to 3.5x budget')" \
                                          "bump to <num>x budget"
 
+# DIVE-4431: this harness seeds no org chart, so every filer is chart-unroutable
+# — the org root's condition — and a tier-1 gate nobody but the human reads is now
+# graded by the human-ask readability rule. The asks below name idents ON PURPOSE:
+# precedent matches on the SHAPE of an ask, and `DIVE-100` is what the shape
+# normaliser turns into a token. Re-wording them would delete the input under
+# test, so each filing carries the audited escape instead. (The ordering is
+# deliberate in the fix too: precedent cannot be resolved before the ask is
+# validated, so a precedent-matching gate from an unrouted filer is refused first.)
+ASKOK="--ask-ok=the ident in this ask is the shape input precedent matches on"
+
 # ==================== precedent prefill + invariants =====================
 # P0: matching precedent prefills a BLANK recommend + sets precedent_ref + cites.
 SHAPE_PROD="$(_gate_ask_shape 'deploy DIVE-100 to prod')"
@@ -98,7 +108,7 @@ seed_precedent DIVE-1000 decision 1 "$SHAPE_PROD" yes
 PREC_ID="$(db "SELECT id FROM tasks WHERE ident='DIVE-1000';")"
 seed_task DIVE-1001
 NOTIFY_CITE=""
-cmd_task_need DIVE-1001 --type=decision --ask="deploy DIVE-100 to prod" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1001 --type=decision --ask="deploy DIVE-100 to prod" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "prefill: blank recommend filled from precedent" "$(field DIVE-1001 recommend)" "yes"
 eq_t "prefill: precedent_ref recorded"                "$(field DIVE-1001 precedent_ref)" "$PREC_ID"
 if [[ -n "$NOTIFY_CITE" ]]; then ok_t "prefill: citation handed to notifier"; else bad_t "prefill: citation handed to notifier" "empty"; fi
@@ -108,12 +118,12 @@ eq_t "invariant: tier not mutated by prefill" "$(field DIVE-1001 tier)" "1"
 
 # INV2: fill-blank-ONLY — an explicit filer recommend is never overridden.
 seed_task DIVE-1002
-cmd_task_need DIVE-1002 --type=decision --ask="deploy DIVE-200 to prod" --options="yes|no" --recommend="no" >/dev/null 2>&1
+cmd_task_need DIVE-1002 --type=decision --ask="deploy DIVE-200 to prod" --options="yes|no" --recommend="no" "$ASKOK" >/dev/null 2>&1
 eq_t "invariant: filer recommend not overridden" "$(field DIVE-1002 recommend)" "no"
 
 # INV3: different need_type NEVER matches (approval gate, same shape, no prefill).
 seed_task DIVE-1003
-cmd_task_need DIVE-1003 --type=approval --ask="deploy DIVE-300 to prod" >/dev/null 2>&1
+cmd_task_need DIVE-1003 --type=approval --ask="deploy DIVE-300 to prod" "$ASKOK" >/dev/null 2>&1
 eq_t "invariant: cross-type never matches (recommend blank)" "$(field DIVE-1003 recommend)" "∅"
 eq_t "invariant: cross-type never matches (precedent_ref null)" "$(field DIVE-1003 precedent_ref)" "∅"
 
@@ -121,7 +131,7 @@ eq_t "invariant: cross-type never matches (precedent_ref null)" "$(field DIVE-10
 SHAPE_LOW="$(_gate_ask_shape 'rotate the DIVE-1 worker pool')"
 seed_precedent DIVE-1010 decision 0 "$SHAPE_LOW" yes
 seed_task DIVE-1011
-cmd_task_need DIVE-1011 --type=decision --ask="rotate the DIVE-2 worker pool" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1011 --type=decision --ask="rotate the DIVE-2 worker pool" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "invariant: lower-tier precedent rejected (blank)" "$(field DIVE-1011 recommend)" "∅"
 
 # INV5: precedent NEVER auto-answers — an approval gate stays blocked/unanswered
@@ -129,7 +139,7 @@ eq_t "invariant: lower-tier precedent rejected (blank)" "$(field DIVE-1011 recom
 SHAPE_APP="$(_gate_ask_shape 'grant DIVE-50 admin access')"
 seed_precedent DIVE-1020 approval 2 "$SHAPE_APP" approved
 seed_task DIVE-1021
-cmd_task_need DIVE-1021 --type=approval --ask="grant DIVE-60 admin access" >/dev/null 2>&1
+cmd_task_need DIVE-1021 --type=approval --ask="grant DIVE-60 admin access" "$ASKOK" >/dev/null 2>&1
 eq_t "invariant: precedent prefills approval rec"      "$(field DIVE-1021 recommend)" "approved"
 eq_t "invariant: precedent does NOT auto-answer"       "$(field DIVE-1021 need_answered_at)" "∅"
 eq_t "invariant: gate still blocked (needs human)"     "$(field DIVE-1021 status)" "blocked"
@@ -139,7 +149,7 @@ eq_t "invariant: gate still blocked (needs human)"     "$(field DIVE-1021 status
 SHAPE_PICK="$(_gate_ask_shape 'pick a region for DIVE-70')"
 seed_precedent DIVE-1030 decision 1 "$SHAPE_PICK" yes
 seed_task DIVE-1031
-cmd_task_need DIVE-1031 --type=decision --ask="pick a region for DIVE-80" --options="approve|reject" >/dev/null 2>&1
+cmd_task_need DIVE-1031 --type=decision --ask="pick a region for DIVE-80" --options="approve|reject" "$ASKOK" >/dev/null 2>&1
 eq_t "invariant: option-mismatch skips prefill" "$(field DIVE-1031 recommend)" "∅"
 eq_t "invariant: option-mismatch still cites"   "$(field DIVE-1031 precedent_ref)" "$(db "SELECT id FROM tasks WHERE ident='DIVE-1030';")"
 
@@ -161,7 +171,7 @@ seed_precedent DIVE-1040 decision 1 "$SHAPE_ARCH" yes
 FZ_ID="$(db "SELECT id FROM tasks WHERE ident='DIVE-1040';")"
 seed_task DIVE-1041
 NOTIFY_CITE=""
-cmd_task_need DIVE-1041 --type=decision --ask="archive the stale sandbox namespaces please" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1041 --type=decision --ask="archive the stale sandbox namespaces please" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 # Guard: the paraphrase really is an EXACT miss (shapes differ) so this exercises fuzzy.
 if [[ "$(field DIVE-1041 ask_shape)" != "$SHAPE_ARCH" ]]; then ok_t "fuzzy: paraphrase is an exact-shape miss"; else bad_t "fuzzy: paraphrase is an exact-shape miss" "shapes collided"; fi
 eq_t "fuzzy: blank recommend filled from paraphrase" "$(field DIVE-1041 recommend)" "yes"
@@ -177,7 +187,7 @@ eq_t "fuzzy: tier not mutated"      "$(field DIVE-1041 tier)"             "1"
 
 # F3: below-threshold paraphrase (Jaccard<0.8) does NOT match — no prefill/ref/kind.
 seed_task DIVE-1042
-cmd_task_need DIVE-1042 --type=decision --ask="archive the stale sandbox namespaces now please immediately today" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1042 --type=decision --ask="archive the stale sandbox namespaces now please immediately today" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "fuzzy: sub-threshold no prefill"       "$(field DIVE-1042 recommend)"      "∅"
 eq_t "fuzzy: sub-threshold no precedent_ref" "$(field DIVE-1042 precedent_ref)" "∅"
 eq_t "fuzzy: sub-threshold no kind"          "$(field DIVE-1042 precedent_kind)" "∅"
@@ -186,14 +196,14 @@ eq_t "fuzzy: sub-threshold no kind"          "$(field DIVE-1042 precedent_kind)"
 SHAPE_PURGE="$(_gate_ask_shape 'purge the orphaned build artifacts')"
 seed_precedent DIVE-1050 decision 0 "$SHAPE_PURGE" yes
 seed_task DIVE-1051
-cmd_task_need DIVE-1051 --type=decision --ask="purge the orphaned build artifacts please" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1051 --type=decision --ask="purge the orphaned build artifacts please" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "fuzzy: lower-tier precedent rejected" "$(field DIVE-1051 recommend)"      "∅"
 eq_t "fuzzy: lower-tier no kind"            "$(field DIVE-1051 precedent_kind)" "∅"
 
 # F5: fuzzy honours the decision option-check — cites but does NOT prefill a rec
 # that isn't one of THIS gate's options.
 seed_task DIVE-1052
-cmd_task_need DIVE-1052 --type=decision --ask="archive the stale sandbox namespaces asap" --options="approve|reject" >/dev/null 2>&1
+cmd_task_need DIVE-1052 --type=decision --ask="archive the stale sandbox namespaces asap" --options="approve|reject" "$ASKOK" >/dev/null 2>&1
 eq_t "fuzzy: option-mismatch skips prefill" "$(field DIVE-1052 recommend)"      "∅"
 eq_t "fuzzy: option-mismatch still cites"   "$(field DIVE-1052 precedent_ref)" "$FZ_ID"
 eq_t "fuzzy: option-mismatch kind=fuzzy"    "$(field DIVE-1052 precedent_kind)" "fuzzy"
@@ -236,7 +246,7 @@ SHAPE_AC="$(_gate_ask_shape "$ASK_AC")"
 seed_human_prec_age DIVE-1200 decision 1 "$SHAPE_AC" yes 10
 seed_human_prec_age DIVE-1201 decision 1 "$SHAPE_AC" yes 5
 seed_task DIVE-1202
-cmd_task_need DIVE-1202 --type=decision --ask="$ASK_AC" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1202 --type=decision --ask="$ASK_AC" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear OFF: gate stays blocked"  "$(field DIVE-1202 status)"           "blocked"
 eq_t "autoclear OFF: not auto-answered"   "$(field DIVE-1202 need_answered_at)" "∅"
 
@@ -248,7 +258,7 @@ eq_t "pref: precedent on persists" "$(_task_pref_get precedent_autoclear)" "on"
 # via auto:precedent, precedent_ref = most-recent (DIVE-1201).
 ID_1201="$(db "SELECT id FROM tasks WHERE ident='DIVE-1201';")"
 seed_task DIVE-1203
-cmd_task_need DIVE-1203 --type=decision --ask="$ASK_AC" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1203 --type=decision --ask="$ASK_AC" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A1: status flipped to todo"   "$(field DIVE-1203 status)"          "todo"
 eq_t "autoclear A1: answer applied"           "$(field DIVE-1203 need_answer)"     "yes"
 eq_t "autoclear A1: provenance auto:precedent" "$(field DIVE-1203 need_answered_by)" "auto:precedent"
@@ -260,7 +270,7 @@ ASK_CON="compact the analytics table nightly"; SHAPE_CON="$(_gate_ask_shape "$AS
 seed_human_prec_age DIVE-1210 decision 1 "$SHAPE_CON" yes 10
 seed_human_prec_age DIVE-1211 decision 1 "$SHAPE_CON" no  5
 seed_task DIVE-1212
-cmd_task_need DIVE-1212 --type=decision --ask="$ASK_CON" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1212 --type=decision --ask="$ASK_CON" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A2: contradiction blocks"     "$(field DIVE-1212 status)"           "blocked"
 eq_t "autoclear A2: contradiction unanswered" "$(field DIVE-1212 need_answered_at)" "∅"
 
@@ -269,7 +279,7 @@ ASK_AG="rebuild the search index"; SHAPE_AG="$(_gate_ask_shape "$ASK_AG")"
 seed_prec_by DIVE-1220 decision 1 "$SHAPE_AG" yes "agent:dev"
 seed_prec_by DIVE-1221 decision 1 "$SHAPE_AG" yes "agent:dev"
 seed_task DIVE-1222
-cmd_task_need DIVE-1222 --type=decision --ask="$ASK_AG" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1222 --type=decision --ask="$ASK_AG" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A3: agent seed blocks"        "$(field DIVE-1222 status)"           "blocked"
 eq_t "autoclear A3: agent seed unanswered"    "$(field DIVE-1222 need_answered_at)" "∅"
 
@@ -278,7 +288,7 @@ ASK_AU="prune expired cache entries"; SHAPE_AU="$(_gate_ask_shape "$ASK_AU")"
 seed_prec_by DIVE-1230 decision 1 "$SHAPE_AU" yes "auto:ttl"
 seed_prec_by DIVE-1231 decision 1 "$SHAPE_AU" yes "auto:precedent"
 seed_task DIVE-1232
-cmd_task_need DIVE-1232 --type=decision --ask="$ASK_AU" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1232 --type=decision --ask="$ASK_AU" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A4: auto seed blocks"         "$(field DIVE-1232 status)"           "blocked"
 eq_t "autoclear A4: auto seed unanswered"     "$(field DIVE-1232 need_answered_at)" "∅"
 
@@ -293,7 +303,7 @@ seed_task DIVE-1242
 # approval sitting on a person's desk to grade that auto-clear never touches one, and
 # signing off a migration runbook is a person's own call. Auto-clear eligibility is
 # decided on type and tier, so the declaration does not move what A5 measures.
-cmd_task_need DIVE-1242 --type=approval --ask="$ASK_T2" --tier=2 --needs=human_tap >/dev/null 2>&1
+cmd_task_need DIVE-1242 --type=approval --ask="$ASK_T2" --tier=2 --needs=human_tap "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A5: T2 tier unchanged"        "$(field DIVE-1242 tier)"             "2"
 eq_t "autoclear A5: T2 stays blocked"         "$(field DIVE-1242 status)"           "blocked"
 eq_t "autoclear A5: T2 unanswered"            "$(field DIVE-1242 need_answered_at)" "∅"
@@ -303,7 +313,7 @@ ASK_SEC="load the staging deploy key"; SHAPE_SEC="$(_gate_ask_shape "$ASK_SEC")"
 seed_prec_by DIVE-1250 secret 1 "$SHAPE_SEC" done "human:mark"
 seed_prec_by DIVE-1251 secret 1 "$SHAPE_SEC" done "human:mark"
 seed_task DIVE-1252
-cmd_task_need DIVE-1252 --type=secret --ask="$ASK_SEC" --secret-key=FIXTURE_TOKEN --connector=fixture >/dev/null 2>&1
+cmd_task_need DIVE-1252 --type=secret --ask="$ASK_SEC" --secret-key=FIXTURE_TOKEN --connector=fixture "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A6: secret stays blocked"     "$(field DIVE-1252 status)"           "blocked"
 eq_t "autoclear A6: secret unanswered"        "$(field DIVE-1252 need_answered_at)" "∅"
 
@@ -312,7 +322,7 @@ ASK_OPT="cordon the flaky node"; SHAPE_OPT="$(_gate_ask_shape "$ASK_OPT")"
 seed_human_prec_age DIVE-1260 decision 1 "$SHAPE_OPT" yes 10
 seed_human_prec_age DIVE-1261 decision 1 "$SHAPE_OPT" yes 5
 seed_task DIVE-1262
-cmd_task_need DIVE-1262 --type=decision --ask="$ASK_OPT" --options="approve|reject" >/dev/null 2>&1
+cmd_task_need DIVE-1262 --type=decision --ask="$ASK_OPT" --options="approve|reject" "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A7: off-menu answer blocks"   "$(field DIVE-1262 status)"           "blocked"
 eq_t "autoclear A7: off-menu unanswered"      "$(field DIVE-1262 need_answered_at)" "∅"
 
@@ -330,7 +340,7 @@ ASK_FZ="drain the standby replica"; SHAPE_FZ="$(_gate_ask_shape "$ASK_FZ")"
 seed_fuzzy_human DIVE-1270 decision 1 "$SHAPE_FZ" yes 10
 seed_fuzzy_human DIVE-1271 decision 1 "$SHAPE_FZ" yes 5
 seed_task DIVE-1272
-cmd_task_need DIVE-1272 --type=decision --ask="$ASK_FZ" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1272 --type=decision --ask="$ASK_FZ" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A9: fuzzy seed blocks"       "$(field DIVE-1272 status)"           "blocked"
 eq_t "autoclear A9: fuzzy seed unanswered"   "$(field DIVE-1272 need_answered_at)" "∅"
 
@@ -338,7 +348,7 @@ eq_t "autoclear A9: fuzzy seed unanswered"   "$(field DIVE-1272 need_answered_at
 cmd_task_precedent off >/dev/null 2>&1
 eq_t "pref: precedent off persists" "$(_task_pref_get precedent_autoclear)" "off"
 seed_task DIVE-1263
-cmd_task_need DIVE-1263 --type=decision --ask="$ASK_AC" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1263 --type=decision --ask="$ASK_AC" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A8: OFF re-blocks qualifier"  "$(field DIVE-1263 status)"           "blocked"
 eq_t "autoclear A8: OFF unanswered"           "$(field DIVE-1263 need_answered_at)" "∅"
 
@@ -353,7 +363,7 @@ ASK_NN="restart the metrics collector on box delta"; SHAPE_NN="$(_gate_ask_shape
 seed_human_noNonce DIVE-1280 decision 1 "$SHAPE_NN" yes 10
 seed_human_noNonce DIVE-1281 decision 1 "$SHAPE_NN" yes 5
 seed_task DIVE-1282
-cmd_task_need DIVE-1282 --type=decision --ask="$ASK_NN" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1282 --type=decision --ask="$ASK_NN" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A10: nonce-less human seed blocks"     "$(field DIVE-1282 status)"           "blocked"
 eq_t "autoclear A10: nonce-less human seed unanswered" "$(field DIVE-1282 need_answered_at)" "∅"
 # Liveness for A10: prove the seeds were otherwise QUALIFYING, i.e. the block is
@@ -361,7 +371,7 @@ eq_t "autoclear A10: nonce-less human seed unanswered" "$(field DIVE-1282 need_a
 # Adding the nonce to the same two rows must flip the identical gate to cleared.
 db "UPDATE tasks SET human_nonce_hash='deadbeefcafe' WHERE ident IN ('DIVE-1280','DIVE-1281');"
 seed_task DIVE-1283
-cmd_task_need DIVE-1283 --type=decision --ask="$ASK_NN" --options="yes|no" >/dev/null 2>&1
+cmd_task_need DIVE-1283 --type=decision --ask="$ASK_NN" --options="yes|no" "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A10 liveness: +nonce clears"  "$(field DIVE-1283 need_answered_by)" "auto:precedent"
 
 # A11 (DIVE-2235): class over tier. A tier-1 APPROVAL is human-class, so it must
@@ -371,7 +381,7 @@ ASK_AP="tidy the archived build logs"; SHAPE_AP="$(_gate_ask_shape "$ASK_AP")"
 seed_human_prec_age DIVE-1290 approval 1 "$SHAPE_AP" yes 10
 seed_human_prec_age DIVE-1291 approval 1 "$SHAPE_AP" yes 5
 seed_task DIVE-1292
-cmd_task_need DIVE-1292 --type=approval --ask="$ASK_AP" --tier=1 >/dev/null 2>&1
+cmd_task_need DIVE-1292 --type=approval --ask="$ASK_AP" --tier=1 "$ASKOK" >/dev/null 2>&1
 eq_t "autoclear A11: approval never precedent-cleared" "$(field DIVE-1292 need_answered_at)" "∅"
 eq_t "autoclear A11: approval stays blocked"           "$(field DIVE-1292 status)"           "blocked"
 

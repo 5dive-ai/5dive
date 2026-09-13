@@ -492,7 +492,12 @@ actor_seam_as dev; cmd_task_need DIVE-54 --type=approval --needs=spend_authority
 w2004_of() { grep -c "will REFUSE it" "$1" 2>/dev/null | head -1; }
 # filed by the lead: `_gate_route_reviewer` finds nobody above them -> unrouted.
 seed DIVE-55; HUMAN_PINGED=0; route_reset
-actor_seam_as main; cmd_task_need DIVE-55 --type=decision --ask="cherry-pick, or re-file the delegated push for review after #16?" --from=main >/dev/null 2>"$TMP/n55"
+# DIVE-4431: `main` is this chart's ROOT, so its tier-1 decision is unrouted and
+# now meets the human-ask readability rule — and the ask names a PR number on
+# purpose, because the SAME ask from a builder (DIVE-56, below) is the control
+# that makes this case mean anything. Re-wording one half would break the pair,
+# so the audited escape keeps both inputs identical.
+actor_seam_as main; cmd_task_need DIVE-55 --type=decision --ask="cherry-pick, or re-file the delegated push for review after #16?" --from=main --ask-ok="this ask is one half of a matched pair; its twin is filed by a builder and must be byte-identical" >/dev/null 2>"$TMP/n55"
 [[ "$(w2004_of "$TMP/n55")" -ge 1 ]] \
   && ok_t "DIVE-2004: unrouted eng-ship decision warns at FILE time that push will refuse it" \
   || bad_t "DIVE-2004 file-time warning" "warn=$(w2004_of "$TMP/n55") rr='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-55';")'"
