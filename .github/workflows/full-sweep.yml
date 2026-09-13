@@ -257,7 +257,7 @@ jobs:
       # would leave a second git tree inside the one harness-tree-guard.sh grades.
       - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
         run: |
-          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          git clone --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins" && git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet e0cb2a31e4a32e0d473f9b2dbf0b2b2fdafbc046  # DIVE-4444: pin to last-green plugins (pre-#69, DIVE-3965); bump forward when DIVE-4449 reconciles the recovery-overwrite behaviour
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
@@ -330,7 +330,7 @@ jobs:
       # would leave a second git tree inside the one harness-tree-guard.sh grades.
       - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
         run: |
-          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          git clone --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins" && git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet e0cb2a31e4a32e0d473f9b2dbf0b2b2fdafbc046  # DIVE-4444: pin to last-green plugins (pre-#69, DIVE-3965); bump forward when DIVE-4449 reconciles the recovery-overwrite behaviour
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -488,7 +488,7 @@ jobs:
       # would leave a second git tree inside the one harness-tree-guard.sh grades.
       - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
         run: |
-          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          git clone --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins" && git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet e0cb2a31e4a32e0d473f9b2dbf0b2b2fdafbc046  # DIVE-4444: pin to last-green plugins (pre-#69, DIVE-3965); bump forward when DIVE-4449 reconciles the recovery-overwrite behaviour
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -575,7 +575,7 @@ jobs:
       # would leave a second git tree inside the one harness-tree-guard.sh grades.
       - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
         run: |
-          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          git clone --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins" && git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet e0cb2a31e4a32e0d473f9b2dbf0b2b2fdafbc046  # DIVE-4444: pin to last-green plugins (pre-#69, DIVE-3965); bump forward when DIVE-4449 reconciles the recovery-overwrite behaviour
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -707,7 +707,7 @@ jobs:
       # would leave a second git tree inside the one harness-tree-guard.sh grades.
       - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
         run: |
-          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          git clone --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins" && git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet e0cb2a31e4a32e0d473f9b2dbf0b2b2fdafbc046  # DIVE-4444: pin to last-green plugins (pre-#69, DIVE-3965); bump forward when DIVE-4449 reconciles the recovery-overwrite behaviour
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
