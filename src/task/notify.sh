@@ -1652,19 +1652,32 @@ _task_gate_reply_cta() { # <ident> <need_type> <options> <recommend> <has_tap>
 # couple of words past the target is kept whole (SOFT_MAX) — "…gets its one
 # as-shipped run?" at 16 words reads better finished than chopped at 15.
 _task_gate_ask_line() { # <ask>
-  local a="${1:-}" WORD_MAX=15 SOFT_MAX=18 n=0 w end=0
+  local a="${1:-}" WORD_MAX=15 SOFT_MAX=18 n=0 w end=0 qend=0
   # shellcheck disable=SC2086
   set -- $a
   (( $# <= SOFT_MAX )) && { printf '%s' "$a"; return 0; }
   # Pass 1: the earliest sentence end within SOFT_MAX (so a sentence finishing a
   # couple of words past WORD_MAX is kept whole rather than chopped mid-question).
+  #
+  # DIVE-4431 — A QUESTION MARK INSIDE THE BUDGET BEATS AN EARLIER FULL STOP.
+  # lodar's phone, 2026-09-13: "KAWAMi's casing is fixed and shipped." was the
+  # WHOLE ping. The ask opened with a six-word status sentence and asked its
+  # question second, so "stop at the earliest sentence end" rendered the status
+  # and dropped the decision — a statement with two buttons under it. A
+  # status-first ask is the common shape (the filer sets the scene, then asks),
+  # so this is not a rare input. The budget is NOT widened for it: DIVE-3661's
+  # corpus measurement stands, and both sentences still have to fit inside
+  # SOFT_MAX or the ellipsis cut applies exactly as before. What changes is only
+  # WHICH end inside the budget wins — the one that carries the question.
   for w in "$@"; do
     n=$((n+1)); (( n > SOFT_MAX )) && break
     case "$w" in
       e.g.|i.e.|etc.|vs.|cf.) : ;;                    # abbreviation, not a sentence end
-      *\?|*\!|*.) end=$n; break ;;
+      *\?) (( qend == 0 )) && qend=$n; (( end == 0 )) && end=$n ;;
+      *\!|*.) (( end == 0 )) && end=$n ;;
     esac
   done
+  (( qend > 0 )) && end=$qend
   # Pass 2: emit — a found sentence whole, else WORD_MAX words + ellipsis.
   if (( end > 0 )); then
     printf '%s' "${*:1:end}"

@@ -285,7 +285,11 @@ seed_gate() { # <title> -> ident on stdout; files a real gate through the real n
   ident=$(db "SELECT ident FROM tasks WHERE id=${id};" 2>/dev/null)
   [[ -n "$ident" ]] || { printf ''; return 1; }
   : >"$LOG"
-  ( cmd_task_need "$ident" --type=decision --ask="proceed?" --options="A|B" --recommend=A ) >/dev/null 2>&1
+  # DIVE-4431: bare-letter options are refused on a gate a person reads (the
+  # buttons must name outcomes), so this fixture asks its question with real
+  # ones. The VALUE the answer path uses moves with them, below.
+  ( cmd_task_need "$ident" --type=decision --ask="proceed?" \
+      --options="ship it now|hold it" --recommend="ship it now" ) >/dev/null 2>&1
   printf '%s' "$ident"
 }
 
@@ -303,7 +307,7 @@ for arm in answer withdraw; do
       "$(_task_gate_deliveries "$ident" | grep -c '15491')"
   reset_edits; reset_deletes
   case "$arm" in
-    answer)   ( cmd_task_answer   "$ident" --value=A ) >/dev/null 2>&1 ;;
+    answer)   ( cmd_task_answer   "$ident" --value="ship it now" ) >/dev/null 2>&1 ;;
     withdraw) ( cmd_task_need     "$ident" --withdraw ) >/dev/null 2>&1 ;;
   esac
   chk "wiring/$arm: the close path DELETED the delivered card (DIVE-3228)" \
@@ -358,7 +362,7 @@ fi
 # answer's edit leaking forward.
 ident=$(seed_gate "DIVE-2410 wiring arm: park")
 if [[ -z "$ident" ]]; then chk "wiring/park: seeded a gate" "yes" "no"; else
-  ( cmd_task_answer "$ident" --value=A ) >/dev/null 2>&1
+  ( cmd_task_answer "$ident" --value="ship it now" ) >/dev/null 2>&1
   reset_edits; reset_deletes
   # DIVE-3228: under the card model the ANSWER above already deleted this gate's
   # card, so by the time park runs there is nothing live left and park's retire is
@@ -464,7 +468,7 @@ _pshape=""
 for _i in 1 2; do
   _pid=$(seed_gate "DIVE-2410 precedent seed $_i")
   [[ -n "$_pid" ]] || continue
-  db "UPDATE tasks SET need_answer='A', need_answered_at=datetime('now','-1 day'),
+  db "UPDATE tasks SET need_answer='ship it now', need_answered_at=datetime('now','-1 day'),
         need_answered_by='human:1234567890', human_nonce_hash='deadbeef',
         precedent_kind=NULL, tier=1 WHERE ident=$(sqlq "$_pid");"
   _pshape=$(db "SELECT COALESCE(ask_shape,'') FROM tasks WHERE ident=$(sqlq "$_pid");")
@@ -476,8 +480,11 @@ if [[ -z "$_pshape" || -z "$_tident" ]]; then
 else
   : >"$LOG"          # fresh target, never gated before: ANY delivery here is its own
   reset_edits; reset_deletes
+  # DIVE-4431: outcome-shaped options for the same reason as the fixture above —
+  # this gate is unrouted at tier 1, so it is graded on the text a person would
+  # read before the precedent match decides nobody will read it at all.
   ( cmd_task_need "$_tident" --type=decision --ask="proceed?" \
-      --options="A|B" --recommend=A --tier=1 ) >/dev/null 2>&1
+      --options="ship it now|hold it" --recommend="ship it now" --tier=1 ) >/dev/null 2>&1
   chk "file-time/precedent: it really did auto-clear (the arm graded a settle, not a refusal)" \
       "auto:precedent" \
       "$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident=$(sqlq "$_tident");")"

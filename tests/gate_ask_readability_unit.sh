@@ -173,7 +173,16 @@ file_gate EX-2 --type=approval --ask="$LONG" --tier=2 --ask-ok="urgent"
 # D1 — THE CONTROL THIS WHOLE HARNESS RESTS ON. The same unreadable ask, routed
 # to a lead instead of the human, must file untouched: 264 of the 319 tier-1 asks
 # in the 30-day corpus carry this vocabulary, and they are read by an agent.
+#
+# DIVE-4431: this control needs a LEAD. It used to run under the harness's global
+# no-lead stub, which made it assert "tier 1 is not human-facing" — the exact
+# false premise that let a 90-word org-root ask reach lodar's phone. The corpus
+# it protects is the LEAD-ROUTED population, so the lead is granted for the
+# length of the case (same shape as D1d) and the unrouted twin is graded in G.
 seed KEEP-1
+_gate_route_reviewer() { printf 'main'; }
+eq_t "D1-pre: the lead stub is live (or this case proves nothing)" \
+     "$(_gate_route_reviewer dev)" "main"
 file_gate KEEP-1 --type=decision --ask="Merge DIVE-3164 at head e39ad3a from origin/main?" \
           --options="merge|hold" --tier=1
 eq_t "D1: the SAME jargon ask files at tier 1 (rc 0) — agents read those" "$RC" "0"
@@ -182,6 +191,8 @@ eq_t "D1b: ... and it is really a tier-1 gate, not a downgraded one" "$(field KE
 # task, so a bare grep for the ident would pass on the wrong evidence.
 eq_t "D1c: ... and no readability refusal was audited for it" \
      "$(grep -c 'ask-readability.*task=KEEP-1' "$AUDIT_ROWS")" "0"
+_gate_route_reviewer() { printf ''; }
+eq_t "D1e: the no-lead stub is restored for the cases below" "$(_gate_route_reviewer dev)" ""
 
 # D2..D6 — the lodar-readable corpus, verbatim from the 30-day replay's survivor
 # list. If the refusal reds any of these it is a redesign, not a tightening,
@@ -267,6 +278,78 @@ seed ESC-1
 file_gate ESC-1 --type=manual --ask="$ESC_ASK" --tier=2
 eq_t "F1: the iteration-cap escalation gate the product files is READABLE (rc 0)" "$RC" "0"
 eq_t "F2: ... and it really was filed, not swallowed" "$(field ESC-1 need_type)" "manual"
+
+
+# ============ G. DIVE-4431 — THE TIER-1 GATE NOBODY BUT THE HUMAN READS =====
+# lodar, 2026-09-13, forwarding his phone: a 90-word tier-1 `decision` filed by
+# the org root rendered as one status sentence over two buttons labelled A and B.
+# The ROUTE was right (the root has no lead, so the gate falls through to the
+# human); the rule that exists to stop that text simply never ran, because it
+# keyed on the DECLARED tier. Every case here runs under the harness's global
+# no-lead stub — that IS the org root's condition — and each is paired with the
+# D1 control above, which is the same ask with a lead in the chart.
+seed ROOT-1
+file_gate ROOT-1 --type=decision --tier=1 --recommend=A --options="A|B" \
+  --ask="KAWAMi's casing is fixed and shipped. Its 4-6 SKUs still have nowhere to render — do we leave it as a retail-block entry, or build it a real catalogue destination for a Thai retail-only brand?"
+[[ "$RC" != "0" ]] && ok_t "G1: a tier-1 gate the chart cannot route is REFUSED on the same rule" \
+  || bad_t "G1: a tier-1 gate the chart cannot route is REFUSED on the same rule" "rc=$RC out=$OUT"
+has_t "G1b: ... and the refusal says how long it ran" "$OUT" "the cap is 25"
+eq_t  "G1c: NO gate was written by the refused filing" "$(field ROOT-1 need_type)" "∅"
+eq_t  "G1d: ... and the task was not moved to blocked" "$(field ROOT-1 status)" "todo"
+has_t "G1e: the refusal is audited at the tier it actually ran on" \
+      "$(grep 'task=ROOT-1' "$AUDIT_ROWS")" "tier=1"
+
+# G2 — THE CONTROL THAT MAKES G1 MEAN SOMETHING. Same filer, same missing lead,
+# a plain one-sentence ask: it must FILE, at tier 1, and reach the human path.
+seed ROOT-2
+file_gate ROOT-2 --type=decision --tier=1 --recommend="leave it as one line" \
+  --options="leave it as one line|build it a catalogue page" \
+  --ask="Should this brand keep its one-line listing, or get a page of its own?"
+eq_t "G2: a plain-English unrouted tier-1 gate still files (rc 0)" "$RC" "0"
+eq_t "G2b: ... and it is a real tier-1 decision gate" \
+     "$(field ROOT-2 need_type)|$(field ROOT-2 tier)" "decision|1"
+
+# G3 — OPTIONS THAT ARE BARE LABELS. The buttons are the second half of what
+# lodar saw: `A` and `B` name no outcome, and the ask cannot carry the meaning
+# because the render only shows one sentence of it.
+seed OPTB-1
+file_gate OPTB-1 --type=decision --tier=2 --options="A|B" \
+  --ask="Should this brand keep its one-line listing, or get a page of its own?"
+[[ "$RC" != "0" ]] && ok_t "G3: --options=A|B is REFUSED — a button must name an outcome" \
+  || bad_t "G3: --options=A|B is REFUSED — a button must name an outcome" "rc=$RC out=$OUT"
+has_t "G3b: ... and the refusal says it was the options" "$OUT" "bare labels"
+eq_t  "G3c: NO gate was written by the refused filing" "$(field OPTB-1 need_type)" "∅"
+
+seed OPTB-2
+file_gate OPTB-2 --type=decision --tier=2 --needs=human_tap \
+  --options="keep it as one line|build a catalogue page" \
+  --ask="Should this brand keep its one-line listing, or get a page of its own?"
+eq_t "G3d: outcome-shaped options file (rc 0)" "$RC" "0"
+
+# A MIXED menu is the filer's judgement, not this rule's: only an ALL-bare set is
+# refused, so a real two-word answer beside a short one is untouched.
+seed OPTB-3
+file_gate OPTB-3 --type=decision --tier=2 --needs=human_tap --options="no|switch it on today" \
+  --ask="Should this brand keep its one-line listing, or get a page of its own?"
+eq_t "G3e: a menu with one short entry is NOT refused (rc 0)" "$RC" "0"
+
+# G4 — the escape works here too: a gate must never become unfileable.
+seed ROOT-3
+file_gate ROOT-3 --type=decision --tier=1 --options="A|B" --ask="$LONG" \
+  --ask-ok="the release string is itself the subject of the question"
+eq_t "G4: --ask-ok still files the unrouted tier-1 gate (rc 0)" "$RC" "0"
+has_t "G4b: ... and the escape is recorded" "$(cat "$AUDIT_ROWS")" "ask-readability escaped"
+
+# G5 — THE RENDER. The ping shows one line of the ask, and a status-first ask
+# used to spend it on the status. Graded on the shipped function.
+_g5=$(_task_gate_ask_line "KAWAMi's casing is fixed and shipped. Do we leave it as one line, or build a page?")
+has_t "G5: the rendered ask carries the QUESTION, not just the status" "$_g5" "or build a page?"
+_g5b=$(_task_gate_ask_line "One two three four five six seven. Eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty.")
+eq_t "G5b: an ask with no question mark renders the first sentence as before" \
+     "$_g5b" "One two three four five six seven."
+_g5c=$(_task_gate_ask_line "One two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty?")
+eq_t "G5c: a question BEYOND the budget still gets the ellipsis cut" \
+     "$_g5c" "One two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen…"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]

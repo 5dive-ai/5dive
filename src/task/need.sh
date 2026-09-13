@@ -3511,7 +3511,7 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
   # LEAD. The route itself is resolved after the write, so the routability
   # question is asked here with the routing block's own helper rather than read
   # off the row — the same shape the eng-ship guard above uses.
-  local _ar_human=0
+  local _ar_human=0 _ar_t1_only=0
   if [[ "$tier" == "2" ]]; then
     # DIVE-4329: `manual` joins `secret` here, and it has to — the routing
     # backstop below now refuses every agent for a tier-2 manual gate, so it
@@ -3528,6 +3528,73 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     # down raises it back, so it is human-facing here whatever the running tier
     # says. Without this arm the check is skipped by --tier=1 --needs=human_tap.
     _ar_human=1
+  elif [[ "$tier" == "1" && -z "$(_gate_route_reviewer "$(task_actor "")")" ]]; then
+    # DIVE-4431 — TIER 1 IS NOT "AN AGENT READS IT", AND THE ORG ROOT IS WHERE
+    # THAT ASSUMPTION BREAKS.
+    #
+    # lodar's phone, 2026-09-13: a 90-word tier-1 `decision` filed by the org
+    # root rendered as a 6-word status line and two buttons reading `A` and `B`.
+    # The route was correct — the root has no lead, so the standing-route
+    # fallback below hands the gate to the human — but this check never ran,
+    # because it read the DECLARED tier and every arm above it says "tier 2".
+    # The 83%/319 tier-1 corpus the D1 control protects is lead-ROUTED; a gate
+    # the chart cannot route is not in it, and grading the two the same way is
+    # the whole defect.
+    #
+    # THE PREDICATE IS "NOBODY ELSE READS THIS", ASKED WITH THE ROUTER'S OWN
+    # HELPERS. It cannot be read off the row: the route resolves after the write
+    # and this refusal must stay BEFORE the write (see the note above). So the
+    # three routes that can still take a chart-unroutable tier-1 gate off the
+    # human are re-asked here, and EVERY ambiguity resolves toward NOT refusing —
+    # a false refusal bounces a gate that was fine, which is the direction that
+    # costs a filer a round. The kind-routes not listed (eng-ship, curation,
+    # internal-ops, row-ship, access, --discusses, title-floor, the pref) all
+    # resolve their reviewer with `_gate_route_reviewer` off the same chart that
+    # just answered nobody, so for this filer they land on the human too.
+    local _ar_t1=1 _ar_vf="" _ar_title=""
+    # 1. the DIVE-1495 verifier-route: a distinct fleet-agent verifier reads it.
+    _ar_vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
+    if [[ ( "$type" == "decision" || "$type" == "approval" ) && -n "$_ar_vf" && "$_ar_vf" != "$actor" \
+          && "$(db "SELECT CASE WHEN (SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id}) <> ''
+                      OR EXISTS(SELECT 1 FROM agents_org WHERE name=$(sqlq "$_ar_vf")) THEN 1 ELSE 0 END;")" == "1" ]] \
+       && ! _gate_push_for_review_hit "$ask"; then
+      _ar_t1=0
+    fi
+    # 2. the DIVE-3171 standing-lead fallback: `approval` only, and only when the
+    #    seal names somebody who is not the filer. Same conjunction as the router.
+    if (( _ar_t1 )) && declare -F _gate_standing_lead >/dev/null 2>&1; then
+      _ar_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+      if _gate_lead_standing_eligible "$type" "$tier" "$ask" "$_ar_title"; then
+        local _ar_sl; _ar_sl=$(_gate_standing_lead 2>/dev/null || printf '')
+        [[ -n "$_ar_sl" && "$_ar_sl" != "$(task_actor "")" ]] && _ar_t1=0
+      fi
+    fi
+    # 3. the DIVE-3694 track-record auto-apply: it clears the gate and pings
+    #    NOBODY, so its asks are never read by a person. Approximated on the
+    #    cheap half of the predicate (promoted filer + a recommendation) because
+    #    over-matching here only declines to refuse.
+    #    The DIVE-2410 PRECEDENT auto-clear is deliberately NOT excluded with it,
+    #    and the asymmetry is the ordering: precedent matches on the SHAPE OF THE
+    #    ASK, so it cannot be resolved before the ask has been validated, and a
+    #    filer whose precedent does not match is one whose gate does ping. The
+    #    track-record path keys on the FILER, which is known here.
+    if (( _ar_t1 )) && [[ "$type" == "decision" && -n "$recommend_arg" \
+          && "$tier_floored" == "0" && "$tier_arg" != "2" ]] \
+       && [[ "$(_task_pref_get track_record 2>/dev/null || printf '')" != "off" ]] \
+       && _gate_record_promoted "$actor" 2>/dev/null; then
+      _ar_t1=0
+    fi
+    # GRADED ON ITS TEXT, NOT RE-CLASSIFIED. `_ar_t1_only` marks this gate as
+    # human-facing for the READABILITY and OPTIONS rules only. The two DIVE-4346
+    # refusals below stay on `_ar_human` proper, deliberately: their exits are
+    # "--tier=0 / --tier=1 / name a capability", and a tier-1 gate from a filer
+    # the chart cannot route is ALREADY at tier 1 — offering it that exit would
+    # refuse a fileable gate and point it at a no-op. Making every unrouted
+    # tier-1 gate declare a capability is a real question and a different row;
+    # widening a second control inside this fix is how a control gets widened
+    # mid-ship. This row is about the TEXT a person was sent, and that is all it
+    # changes.
+    if (( _ar_t1 )); then _ar_human=1; _ar_t1_only=1; fi
   fi
   if (( _ar_human )); then
     local _ar_words _ar_term="" _ar_why="" _ar_scan="$ask" _ar_opt_scan="$options" _ar_url=0
@@ -3548,6 +3615,22 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     if [[ -n "$options" ]]; then
       _ar_opt_term=$(_gate_ask_jargon_term "$_ar_opt_scan" 2>/dev/null) || _ar_opt_term=""
     fi
+    # DIVE-4431 — AN OPTION IS A BUTTON, AND A BUTTON LABELLED `A` CARRIES NO
+    # OUTCOME. lodar's phone showed `⭐ A` / `B` under a rendered ask that had
+    # already lost the sentences explaining what A and B meant: the outcomes were
+    # written inside the ask, where the render cannot reach them, and the two
+    # defects compose into a statement with two unlabelled buttons. CLAUDE.md's
+    # rule is the standard here — "`--options=` are read too: make each one a
+    # plain outcome". Refused only when EVERY entry is a bare label (<= 2 chars),
+    # so a real menu with one short entry ("no", "1h") is untouched, and a mixed
+    # set is left to the filer's judgement rather than to a threshold.
+    local _ar_opt_bare=0
+    if [[ -n "$options" ]]; then
+      _ar_opt_bare=$(printf '%s' "$options" | jq -Rr '
+        [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
+        | if length > 0 and all(.[]; length <= 2) then "1" else "0" end' 2>/dev/null) || _ar_opt_bare=0
+      [[ "$_ar_opt_bare" == "1" ]] || _ar_opt_bare=0
+    fi
     (( _ar_words > _GATE_ASK_MAX_WORDS )) \
       && _ar_why="it runs ${_ar_words} words (the cap is ${_GATE_ASK_MAX_WORDS})"
     if [[ -n "$_ar_term" ]]; then
@@ -3556,11 +3639,15 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     if [[ -n "$_ar_opt_term" ]]; then
       _ar_why="${_ar_why:+${_ar_why}, and }--options contains '${_ar_opt_term#*:}' (a ${_ar_opt_term%%:*} — an internal name)"
     fi
+    if [[ "$_ar_opt_bare" == "1" ]]; then
+      _ar_why="${_ar_why:+${_ar_why}, and }its --options are bare labels ('${options}'), so the buttons name no outcome"
+    fi
     if [[ -n "$_ar_why" ]]; then
       if [[ -z "$ask_ok" ]]; then
         _task_store_audit_log "task need ask-readability" "refused" 0 -- \
-          "task=$ident" "filer=${actor:-}" "type=$type" "words=${_ar_words}" \
-          "term=${_ar_term:-none}" "options_term=${_ar_opt_term:-none}" || true
+          "task=$ident" "filer=${actor:-}" "type=$type" "tier=${tier}" "words=${_ar_words}" \
+          "term=${_ar_term:-none}" "options_term=${_ar_opt_term:-none}" \
+          "options_bare=${_ar_opt_bare}" || true
         fail "$E_VALIDATION" "$ident: refusing this gate because its --ask is the ONE piece of text the paired human sees, and ${_ar_why}. He has never read our code: an ident, a sha, a branch, a check name, a file path or a flag is noise to the person deciding — put them in the task BODY, which is where mechanism belongs.
 Rewrite the ask as a CHOICE BETWEEN OUTCOMES, consequence first: what changes if he says yes, what changes if he says no. Not what component is involved.
   bad   \"grant agent-ops NOPASSWD sudo, or run the pass as root — blocks both DIVE-3208 preconditions.\"
@@ -3588,7 +3675,9 @@ THE ONE EXIT THIS REFUSAL DOES NOT OFFER IS A DIFFERENT DESTINATION. --tier=1 wo
     # Each carries its own `--ask-ok` escape, because a gate must never become
     # unfileable (DIVE-2216) and an exception that leaves a row is countable.
     local _un_why=""
-    if _gate_ask_unsatisfiable_preview "$ask"; then
+    if [[ "$_ar_t1_only" == "1" ]]; then                       # DIVE-4431: text rules only (see above)
+      :
+    elif _gate_ask_unsatisfiable_preview "$ask"; then
       _un_why="it asks the reader to open or look at a preview deployment"
     elif _gate_ask_codehost_rule "$ask"; then
       _un_why="its stated reason is a code-hosting rule (a repository setting), not an outcome the reader chooses"
@@ -3688,7 +3777,8 @@ As with the readability refusal, NO EXIT HERE CHANGES THE DESTINATION: nothing a
     # The declared value always wins: `--needs=` is never overwritten by this.
     local _cu_title=""
     _cu_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
-    if [[ -z "${needs//[[:space:]]/}" && "$type" != "secret" && "$type" != "access" ]] \
+    if [[ -z "${needs//[[:space:]]/}" && "$type" != "secret" && "$type" != "access" \
+          && "$_ar_t1_only" != "1" ]] \
        && ! _gate_is_human_tap "$type" "$tier" "$needs"; then
      if [[ "$tier_floored" == "1" ]] \
         || _gate_hit_either _gate_tier2_floor_hit "$ask" "$_cu_title"; then
