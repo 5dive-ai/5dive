@@ -334,6 +334,108 @@ _grader_can_read() {  # <seat> <ident>
   [[ -n "$state" ]]
 }
 
+# ══ DIVE-4410: PER-SEAT LOAD — the pool is a set of seats, not a preference list ══
+#
+# The pick loop below was first-fit over `$_GRADER_POOL`, gated only by ACCOUNT
+# headroom and repo readability. Neither of those is per-SEAT, so with two seats
+# on one account the first name in the pool won every time. MEASURED (main,
+# 2026-09-13): /var/log/5dive-grader.log carried 126 spawns since 2026-09-10 and
+# every one of them read `-> quinn`; the 06:1xZ tick spawned DIVE-4404, 4397,
+# 4401 and 4405 onto quinn in a single pass while main2 sat idle.
+#
+# A SPAWN IS assign+wake ON A SEAT, and a seat runs ONE session at a time
+# (`_grader_spawn_session` below — it is not a new process). So N spawns onto one
+# seat is not N graders, it is an N-deep serial queue wearing the lane's name.
+# That is the whole defect: the counters said `spawn=4`, the fleet ran 1.
+#
+# So the seat is chosen by LOAD, and the cap that matters here is per seat:
+# one in-flight grade per pool seat. When every seat is at it the row QUEUES —
+# it does not stack a second grade behind the first, because stacking is exactly
+# what looked like capacity and was not.
+_GRADER_MAX_PER_SEAT="${_GRADER_MAX_PER_SEAT:-1}"
+
+# The seat rides in the spawn row's DETAIL (`grader session on <seat>`), which is
+# the only place it is recorded — `task.grade.spawned` has no seat column and
+# lifecycle_events is append-only, so adding one would leave every historical row
+# NULL. `substr(...,19)` skips that fixed 18-character prefix; anything else is
+# bucketed as unattributable and counted against no seat, which is the reading
+# that fails toward SPAWNING rather than toward a phantom busy seat.
+# Kept as one string so the load query and the round-robin cursor cannot drift
+# apart in how they read a seat name.
+_GRADER_SEAT_EXPR="CASE WHEN s.detail LIKE 'grader session on %'
+        THEN CASE WHEN instr(substr(s.detail,19),' ')>0
+                  THEN substr(s.detail,19,instr(substr(s.detail,19),' ')-1)
+                  ELSE substr(s.detail,19) END
+        ELSE '' END"
+
+# The in-flight predicate, shared verbatim with the account-wide cap below.
+# DELIBERATELY THE SAME EXPRESSION, not a second opinion: if the two disagreed,
+# the lane would refuse on one count and spread on the other, and no reader could
+# say which number the plan line meant. See the long DIVE-4322 note on the cap
+# for why the exit set is the VERDICT (task.graded / a verdict clock strictly
+# later than this spawn) and not the row's close.
+#
+# One row per ident (`s.id = MAX(id) for that ident`) rather than DISTINCT,
+# because here the rows must be GROUPED by seat: a re-spawn that moved an ident
+# to another seat must count against the seat that holds it NOW, and a DISTINCT
+# over both rows would count it against the seat that no longer does. Summed over
+# seats this yields the same set of idents the cap counts.
+_grader_seat_loads() {  # → "<seat><US><n>" per busy pool seat
+  db "SELECT seat||x'1f'||COUNT(*) FROM (
+        SELECT ${_GRADER_SEAT_EXPR} AS seat
+          FROM lifecycle_events s
+         WHERE s.kind='task.grade.spawned'
+           AND s.id = (SELECT MAX(x.id) FROM lifecycle_events x
+                        WHERE x.ident = s.ident AND x.kind='task.grade.spawned')
+           AND NOT EXISTS (SELECT 1 FROM lifecycle_events d
+                            WHERE d.ident=s.ident
+                              AND d.kind IN ('task.done','task.rejected','task.graded')
+                              AND d.id > s.id)
+           AND NOT EXISTS (SELECT 1 FROM tasks t
+                            WHERE t.ident = s.ident
+                              AND (t.status IN ('done','cancelled')
+                                   OR (COALESCE(t.graded_verdict_at,'') > s.ts
+                                       AND (COALESCE(t.graded_verdict,'') <> ''
+                                            OR COALESCE(t.merge_owner,'') <> ''))))
+      ) WHERE seat<>'' GROUP BY seat;" 2>/dev/null || printf ''
+}
+
+# The round-robin cursor. THE LEDGER IS THE POOL STATE — there is no second file
+# to keep in sync, no state to lose on a restart, and the cursor is readable by
+# anyone reading the spawn log. Ties are the common case once every seat is idle
+# (all zero), and without a cursor a load-only sort is stable on pool order,
+# i.e. first-fit again the moment the pool drains.
+_grader_last_picked_seat() {
+  db "SELECT ${_GRADER_SEAT_EXPR} FROM lifecycle_events s
+       WHERE s.kind='task.grade.spawned' ORDER BY s.id DESC LIMIT 1;" 2>/dev/null || printf ''
+}
+
+# `_grader_pool_order <last-picked>` — the pool, least-loaded first.
+#
+# Reads `<seat>=<n>` lines on stdin (absent seat = 0) and prints the pool ordered
+# by (in-flight ASC, distance after <last-picked> ASC). Load dominates so a seat
+# at 0 is never passed over for one at 1; the cursor only breaks ties.
+# A `<last-picked>` that is not in the pool (the seat was removed) rotates by
+# nothing and the order is plain pool order — the safe degradation, not an error.
+_grader_pool_order() {  # <last-picked-seat>   ["<seat>=<n>" lines on stdin]
+  local last="${1:-}" s n i=0 rot=-1 total
+  local -a seats=()
+  local -A load=()
+  while IFS='=' read -r s n; do
+    [[ -n "$s" && "$n" =~ ^[0-9]+$ ]] && load["$s"]="$n"
+  done
+  for s in $_GRADER_POOL; do
+    seats+=("$s"); [[ "$s" == "$last" ]] && rot=$i; i=$((i+1))
+  done
+  total=${#seats[@]}
+  (( total )) || return 0
+  local idx
+  for ((i=0; i<total; i++)); do
+    idx=$(( (rot + 1 + i) % total ))
+    printf '%s %s %s\n' "${load[${seats[$idx]}]:-0}" "$i" "${seats[$idx]}"
+  done | sort -k1,1n -k2,2n | awk '{print $3}'
+}
+
 # `5dive task grader-tick [--commit] [--cap=N] [--json]` — DIVE-4164, the lane.
 #
 # Consumes `task.grade.requested` and decides, per pending delivery, whether a
@@ -508,6 +610,17 @@ cmd_task_grader_tick() {
                                                                      OR COALESCE(t.merge_owner,'') <> ''))));" 2>/dev/null || printf 0)
   [[ "$inflight" =~ ^[0-9]+$ ]] || inflight=0
 
+  # DIVE-4410: the same reading, split by seat, plus the round-robin cursor.
+  # Read ONCE per tick and then maintained in memory as this pass spawns, so two
+  # rows in one tick cannot both be told the same seat is free.
+  local -A _gp_load=()
+  local _gp_seat _gp_n
+  while IFS=$'\x1f' read -r _gp_seat _gp_n; do
+    [[ -n "$_gp_seat" && "$_gp_n" =~ ^[0-9]+$ ]] || continue
+    _gp_load["$_gp_seat"]="$_gp_n"
+  done < <(_grader_seat_loads)
+  local _gp_last; _gp_last=$(_grader_last_picked_seat)
+
   local ident
   while IFS= read -r ident; do
     [[ -n "$ident" ]] || continue
@@ -581,9 +694,26 @@ cmd_task_grader_tick() {
       n_refuse=$((n_refuse+1))
       plan+="dark    $ident  (no pool configured — set _GRADER_POOL to enable)"$'\n'; continue
     fi
-    # First pool seat whose ACCOUNT has headroom.
-    local seat="" chosen="" why=""
+    # DIVE-4410: LEAST-LOADED pool seat whose ACCOUNT has headroom — not the
+    # first one. The three gates are independent and are applied in cost order:
+    # per-seat load (free, already read), then the account floor, then the
+    # credential probe (a sudo + a GitHub read).
+    local seat="" chosen="" why="" busy="" pairs="" loadstr=""
+    # The busy note is built over the WHOLE pool, not accumulated as the pick
+    # loop walks it: the loop stops at the first admitted seat, so a seat that
+    # was skipped for being busy is often never visited at all and the line
+    # would silently omit the very seat that explains the choice.
     for seat in $_GRADER_POOL; do
+      pairs+="${seat}=${_gp_load[$seat]:-0}"$'\n'
+      loadstr+="${loadstr:+ }${seat}=${_gp_load[$seat]:-0}"
+      (( ${_gp_load[$seat]:-0} >= _GRADER_MAX_PER_SEAT )) && busy+="${seat} busy:${_gp_load[$seat]:-0}; "
+    done
+    local order; order=$(printf '%s' "$pairs" | _grader_pool_order "$_gp_last")
+    for seat in $order; do
+      # A seat already grading is not capacity. `_grader_spawn_session` is
+      # assign+wake on a live seat and a seat runs one session at a time, so a
+      # second grade here is a queue, not a parallel grader.
+      (( ${_gp_load[$seat]:-0} < _GRADER_MAX_PER_SEAT )) || continue
       local acct; acct=$(printf '%s' "$usage" | _grader_account_of "$seat")
       # `|| rc=$?`, NOT `; rc=$?`, and the difference is the whole refusal half
       # of this lane. `_grader_window_ok` is dual-channel BY DESIGN — verdict on
@@ -612,10 +742,23 @@ cmd_task_grader_tick() {
       why="${why}${seat}: ${verdict}; "
     done
     if [[ -z "$chosen" ]]; then
-      n_queue=$((n_queue+1)); plan+="queue   $ident  (no seat with headroom — $why)"$'\n'; continue
+      n_queue=$((n_queue+1))
+      # The busy seats are named in the SAME line as the headroom refusals, so
+      # "queued because the pool is working" and "queued because the meter said
+      # no" are one read apart rather than two log files apart.
+      # The headline names the binding constraint rather than one fixed phrase:
+      # "no seat with headroom" is the floor/credential refusal (and is the exact
+      # park line the errexit arm grades); a pool seat sitting at its per-seat cap
+      # is a different fact and must not be reported as a meter refusal.
+      plan+="queue   $ident  ($( [[ -n "$busy" ]] && printf 'no free seat' || printf 'no seat with headroom' ) — ${busy}${why})"$'\n'; continue
     fi
     n_spawn=$((n_spawn+1)); inflight=$((inflight+1))
-    plan+="spawn   $ident  -> $chosen  ($why)"$'\n'
+    # DIVE-4410: maintain the reading in memory. Without this the second row in
+    # the same tick reads the seat it just filled as idle — which is precisely
+    # the 4-onto-quinn tick this row was filed on.
+    _gp_load["$chosen"]=$(( ${_gp_load[$chosen]:-0} + 1 ))
+    _gp_last="$chosen"
+    plan+="spawn   $ident  -> $chosen  (in-flight ${loadstr}; ${busy}${why})"$'\n'
     if (( commit )); then
       # THE ONLY LINE THAT STARTS ANYTHING, and it records the intent to the
       # ledger BEFORE acting so a crash between the two leaves a spawn we can
