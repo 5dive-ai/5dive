@@ -38,7 +38,21 @@ fails=0
 ok()  { printf 'ok   - %s\n' "$1"; }
 bad() { printf 'FAIL - %s\n' "$1"; fails=$((fails+1)); }
 has() { case "$2" in *"$1"*) return 0;; *) return 1;; esac; }
-sq()  { sqlite3 "$TASKS_DB" "$1"; }
+# EVERY STORE READ AND WRITE IN THIS FILE WAITS ON A BUSY LOCK, exactly as the
+# product's own `db()` does (src/lib/tasks_db.sh: `sqlite3 -cmd ".timeout 5000"`).
+# DIVE-4461, and it is this harness's own fixture that creates the contention:
+# `mkgate` shortens the gate hold to 1 SECOND, and the deliverer forks a DETACHED
+# child per gate that sleeps that window and then WRITES (notify.sh — the still-
+# live check, then a `gate_delivery_log` row; the send itself is refused in a
+# fixture store, the write is not). Three gates, three children, all waking about
+# a second in — which is the middle of the fixture block below. Every `$CLI` call
+# here survives that because it goes through `db()`; a BARE `sqlite3` does not.
+# It fails INSTANTLY with rc 5 and, under `set -e`, kills the run in `prepare`
+# before a single arm is graded — twice on 2026-09-13, once from inside a merge
+# group, where it ejected a graded-PASS PR that no author can re-run (DIVE-4461).
+# A re-run cleared the symptom both times, which is what a missing busy_timeout
+# looks like from the outside: green on an idle box, red under a loaded runner.
+sq()  { sqlite3 -cmd ".timeout 5000" "$TASKS_DB" "$1"; }
 
 # Fixture seats. Reserved fakes only — never a real identifier.
 FILER="holdprobe-maker"
@@ -79,6 +93,26 @@ sq "INSERT OR REPLACE INTO agents_org (name, reports_to) VALUES ('$FILER','$LEAD
 [[ "$(sq "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name='$FILER';")" == "$LEAD" ]] \
   && ok "fixture: the org edge resolves a lead for the filer (the naming arms are not vacuous)" \
   || bad "fixture: no org edge — the lead will not resolve and the naming arms are vacuous"
+# THE WAIT IS GRADED, not assumed. A later edit that drops the `.timeout` on `sq`
+# would restore the DIVE-4461 flake, and a flake is invisible on an idle box — so
+# the contention is MADE here, in the same block that used to die of it. A second
+# connection holds the store's write lock for 0.6s (`BEGIN IMMEDIATE` on stdin,
+# which sqlite3 keeps open while it waits for the next line — no sleeper process
+# and no second language); `sq` must still land its write. The `if` is what makes
+# this a graded FAIL rather than a second copy of the crash: a bare `sq` inside a
+# condition is exempt from `set -e`, so removing the timeout reds this one arm and
+# still runs the other thirty. Measured as the control — `sq` reverted to bare,
+# nothing else touched: FAILED: 1, this arm, every other arm green.
+{ printf 'BEGIN IMMEDIATE;\n'; sleep 0.6; printf 'ROLLBACK;\n'; } | sqlite3 "$TASKS_DB" >/dev/null 2>&1 &
+_busyholder=$!
+sleep 0.15
+if sq "UPDATE tasks SET ident=ident WHERE ident='$HELD';" 2>/dev/null; then
+  ok "fixture: a write lands while another connection holds the store — sq waits on BUSY (DIVE-4461)"
+else
+  bad "fixture: sq lost a write to a busy lock — the busy_timeout is gone and this file will abort under a loaded runner again"
+fi
+wait "$_busyholder" 2>/dev/null || true
+
 asked_ago "$HELD" 60      # (a) one minute old — deep inside the 30-minute hold
 asked_ago "$PAST" 7200    # (b) two hours old — long past it
 asked_ago "$URG"  60      # (c) one minute old, but the filer said it cannot wait
