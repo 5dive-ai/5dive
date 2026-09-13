@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — a READ-ONLY JSON view over the a2a round store, 8.0s. A read surface cannot corrupt state, cannot strand a PR, and is graded every night by the full sweep (DIVE-4465).
 # DIVE-3903: `5dive a2a rounds` — the read-only JSON view over the a2a round
 # ledger that the floor projects.
 #

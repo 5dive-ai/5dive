@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — constitution e2e pair (with tests/constitution_init_e2e.sh) — see that file for the call. Graded nightly (DIVE-4465).
 # DIVE-1742 e2e — `5dive constitution show --json` READ verb on the BUILT binary. Proves the
 # top-level constitution namespace routes through main.sh -> cmd_constitution -> cli.mjs
 # constitution-show, and that the composed envelope is correct: source/defaults, per-class

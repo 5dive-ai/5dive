@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — council e2e family trim (DIVE-4465) — tests/council_ballot_e2e.sh stays in core as the family's PR smoke; capture is graded nightly.
 # DIVE-1869 e2e — a convene that could not REACH its seats must fail LOUD, not seal a receipt.
 #
 # Two failures found on the 2026-07-24 flagship demo, both proved here on the BUILT binary (not by

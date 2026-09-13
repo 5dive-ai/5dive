@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — browser-plugin teardown, 5.3s. The plugin corpus itself moved out of this repo (DIVE-4202); what is left here is a teardown path off the merge/ship rails, and the nightly full sweep still runs it (DIVE-4465).
 # DIVE-4306 unit harness for the turn-end agent-browser teardown.
 #
 # The defect: agent-browser launches a headless Chrome tree and leaves it

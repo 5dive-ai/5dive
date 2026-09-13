@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — the reclaim LOOP is a background rail, not the merge path. 17.6s — the corpus's single most expensive harness, and the cost is fixture fan-out over three reclaim rules, not assertion density. A break here strands a claim for one heartbeat tick and the nightly full sweep names it within a day; it cannot drop a PR from the merge queue, which is what the 5-minute PR core exists to protect (DIVE-4465).
 # DIVE-4104 — isolated unit harness for the three reclaim rules this ticket
 # changes, plus the fixture replay of the four rows that actually bounced.
 #

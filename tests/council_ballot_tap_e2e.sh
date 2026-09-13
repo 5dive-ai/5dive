@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — council e2e family trim (DIVE-4465) — tests/council_ballot_e2e.sh stays in core as the family's PR smoke; this tap enumeration is graded nightly.
 # DIVE-1565 ballot-tap E2E — proves the human ballot TAP->task-close BRIDGE is REACHABLE through the
 # real BASH dispatcher (src/cmd_council.sh -> cli.mjs), driving the BUILT ./5dive binary (not `node
 # cli.mjs` directly), the surface the DIVE-1566 telegram plugin actually shells (CNCL-26 bash-route

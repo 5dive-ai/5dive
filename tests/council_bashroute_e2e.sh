@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — council e2e family trim (DIVE-4465) — see tests/council_ballot_e2e.sh, which stays in core as this family's PR smoke. Nightly runs this arm in full.
 # CNCL-26 bash-route E2E — proves `5dive council sign-vote` / `verify-votes` are REACHABLE
 # through the real BASH dispatcher (src/cmd_council.sh), not just via `node cli.mjs` directly.
 #

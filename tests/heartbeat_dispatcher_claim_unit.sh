@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — the dispatcher's CLAIM is a background scheduling rail. 10.5s in the PR core to grade behaviour whose failure mode is a slow or duplicated wake, caught by the nightly sweep and visible on the live fleet long before it blocks a merge (DIVE-4465).
 # DIVE-2244 — the DISPATCHER CLAIMS. Isolated unit harness for the claim that
 # the heartbeat tick stamps at the moment it nudges an agent.
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — agent-to-agent send timing, graded by simulating a busy seat's turn. 16.4s of the core budget for a rail that no PR diff can break silently — a2a delivery is exercised by the fleet continuously and the nightly full sweep grades it every night. Not on the merge/ship path (DIVE-4465).
 # DIVE-4214 — a send to a BUSY seat must QUEUE, not land mid-turn.
 #
 # Delivery is `tmux send-keys -l` into the live pane, so a send that arrives

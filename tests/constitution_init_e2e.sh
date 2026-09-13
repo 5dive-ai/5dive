@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — constitution e2e pair (with tests/constitution_show_e2e.sh), 8.7s of the 300s PR core for a product surface no merge or ship path runs. Both are graded by the nightly full sweep (DIVE-4465).
 # DIVE-1701 e2e — `5dive constitution init` SEED verb on the BUILT binary. Proves the top-level
 # constitution namespace routes through main.sh -> cmd_constitution -> _constitution_init and that:
 #   · init writes the full default constitution.yaml with GUARDRAILS FIRST (hard_gates/ship/comms)

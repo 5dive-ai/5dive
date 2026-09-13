@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 11.7s spent preseeding a DM thread per buzz-enabled agent — the cost is per-agent fixture fan-out, not arms. Buzz is a product surface, not the merge/ship path; a regression here is a nightly finding, not a stranded PR (DIVE-4465).
 # DIVE-3665 unit harness: preseed a DM thread per buzz-enabled agent.
 #
 # lodar, mid-walk: "we need to preseed dms for all agents that are in buzz. so
