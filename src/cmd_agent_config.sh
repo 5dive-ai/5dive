@@ -11,8 +11,11 @@ cmd_config() {
   #     workdir                   (absolute path; tmux cwd on next launch;
   #                                value "default" or "" clears the override)
   #     telegram.token            (bot token for this agent's telegram plugin)
-  #     telegram.home-channel     (hermes only — chat id the gateway posts to;
-  #                                ignored by claude/openclaw)
+  #     telegram.home-channel     (chat the agent's unsolicited messages and gate
+  #                                pings go to. hermes/openclaw: the gateway's home
+  #                                chat. claude/codex/grok/pi/antigravity: binds
+  #                                access.json groups.<chat> + last-human-chat.json.
+  #                                Accepts <chat> or <chat>:<topic> for a forum topic)
   #     telegram.allowed-users    (csv of numeric ids allowed to DM the bot;
   #                                seeds access.json/openclaw.allowFrom/hermes env)
   #     discord.token             (bot/app token for this agent's discord plugin)
@@ -60,6 +63,7 @@ cmd_config() {
   local new_telegram_token=""
   local new_discord_token=""
   local new_home_channel=""
+  local new_home_thread=""
   local new_allowed_users=""
   local new_model=""
   local new_effort=""
@@ -136,9 +140,23 @@ cmd_config() {
       telegram.home-channel)
         [[ "${TYPE_CHANNELS[$type]:-0}" == "1" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support telegram channels"
-        valid_telegram_chat_id "$v" \
-          || fail "$E_VALIDATION" "telegram.home-channel must be a numeric chat id"
-        new_home_channel="$v"
+        # DIVE-4413: `<chat>:<topic>` names a forum topic inside the chat. A
+        # supergroup chat id is negative and never contains a colon, so the split
+        # is unambiguous. The thread is only meaningful on the access.json types
+        # — hermes/openclaw's gateways take a bare chat — so it is REFUSED rather
+        # than dropped for the others, which is the defect this row is about.
+        local _hc_chat="$v" _hc_thread=""
+        if [[ "$v" == *:* ]]; then
+          _hc_chat="${v%%:*}"; _hc_thread="${v#*:}"
+          [[ "$_hc_thread" =~ ^[0-9]+$ ]] \
+            || fail "$E_VALIDATION" "telegram.home-channel topic must be a positive integer (got '${_hc_thread}' in '$v')"
+          _tg_access_state_dir "agent-${name}" "$type" >/dev/null 2>&1 \
+            || fail "$E_VALIDATION" "telegram.home-channel=<chat>:<topic> is not supported for type '$type' — its gateway takes a bare chat id"
+        fi
+        valid_telegram_chat_id "$_hc_chat" \
+          || fail "$E_VALIDATION" "telegram.home-channel must be a numeric chat id (optionally <chat>:<topic>)"
+        new_home_channel="$_hc_chat"
+        new_home_thread="$_hc_thread"
         applied_keys+=("telegram.home-channel")
         ;;
       telegram.allowed-users)
@@ -277,7 +295,11 @@ cmd_config() {
   # token falls back to the stored connector secret below, so no token is
   # required in the call. (Seeding is additive — it appends new ids; removing
   # an id still goes through `telegram-access set`.)
-  if [[ -n "$new_telegram_token" || -n "$new_allowed_users" ]] \
+  # DIVE-4413: `-n "$new_home_channel"` for the same reason `-n "$new_allowed_users"`
+  # is here — a bare `telegram.home-channel=` set touched neither of the other two
+  # conditions, so it skipped the dispatch entirely, validated, landed in
+  # applied_keys and wrote nothing anywhere. That was half of the accept-and-drop.
+  if [[ -n "$new_telegram_token" || -n "$new_allowed_users" || -n "$new_home_channel" ]] \
       || { [[ -n "$channels_changed_to" ]] && channel_in_list telegram "$channels_changed_to"; }; then
     channel_in_list telegram "$effective_channels" \
       || fail "$E_VALIDATION" "telegram.* keys require channels=telegram (current: $effective_channels)"
@@ -298,6 +320,20 @@ cmd_config() {
     step "Installing telegram channel for agent '$name' (type=$type)"
     install_channel_for_agent "$type" telegram "$name" \
       "$token_for_install" "$new_home_channel" "$new_allowed_users"
+    # DIVE-4413: install_channel_for_agent hands home_channel to the hermes and
+    # openclaw installers ONLY (agent_setup.sh) — every other type took the value
+    # and discarded it. The access.json types have a real lever for the same
+    # intent, so write it here rather than threading a second meaning through a
+    # dispatch whose other arms would keep ignoring it. Never accept-and-drop:
+    # a type with no lever at all cannot reach this branch, because
+    # _tg_access_state_dir refuses it and the else-arm names the reason.
+    if [[ -n "$new_home_channel" ]] && [[ "$type" != "hermes" && "$type" != "openclaw" ]]; then
+      if _tg_access_state_dir "agent-${name}" "$type" >/dev/null 2>&1; then
+        seed_telegram_home_channel "$name" "$type" "$new_home_channel" "$new_home_thread"
+      else
+        fail "$E_VALIDATION" "type '$type' has no telegram home-channel binding — set the destination in the agent's own channel state instead of here"
+      fi
+    fi
     # Hermes' messaging gateway is a separate user systemd unit from the
     # tmux loop. cmd_create wires it up only when channels=telegram|discord
     # at create time; attaching a channel post-create (channels was "none")
