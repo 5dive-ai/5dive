@@ -70,6 +70,21 @@ pol_has "no human at the keyboard"      "Never open a chooser"
 pol_has "the knowledge/compile clause"  "compile it to \`community/wiki/\`"
 pol_has "the result field is read"      "one or two self-contained"
 
+# DIVE-4416 (#926) deleted the `--options=A|B` usage placeholder from all three
+# surfaces that teach gate filing, on the finding that the placeholder was the
+# only thing steering filers to bare letters. This policy block is a FOURTH copy
+# of that text, created after #926 landed — nothing else pins it, so without
+# these two arms the placeholder can be reinstated here on the most-read surface
+# there is and no harness reds. Cause:
+# community/wiki/compacting-a-prompt-into-a-new-surface-can-resurrect-what-another-row-just-deleted.md
+pol_has "options are spelled out, not lettered" "<first choice spelled out>|<second choice spelled out>"
+pol_has "WHY a bare letter is wrong"            "forwarded, quoted or screenshotted"
+if grep -qF -- '--options=A|B' "$POLICY" || grep -qF -- '--options="A|B"' "$POLICY"; then
+  bad_t "policy must NOT teach the A|B placeholder" "$POLICY still carries --options=A|B (DIVE-4416 deleted it everywhere else)"
+else
+  ok_t "policy does not teach the A|B placeholder"
+fi
+
 # =============================================================================
 # PART 2 — the dispatch still carries the row-specific half
 # =============================================================================

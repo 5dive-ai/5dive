@@ -84,8 +84,10 @@ below is invariant, so it lives here instead of in every nudge (DIVE-4406).
 - **A human gate is not a cancellation.** Needs a decision, an approval, a secret, or a manual
   step only a person can do →
   `5dive task need <ident> --type=decision|approval|secret|manual --ask="<ONE crisp question + ~1
-  line of context>" --recommend="<the advised answer>"` (`--options=A|B` on a decision). Heavy
-  detail goes in the task BODY; the ask is the only text the owner reads.
+  line of context>" --recommend="<one of the option texts>"`, and on a decision
+  `--options="<first choice spelled out>|<second choice spelled out>"` — spell the choices out, a
+  bare letter records nothing once the ask is forwarded, quoted or screenshotted. Heavy detail goes
+  in the task BODY; the ask is the only text the owner reads.
 - **Nothing in a goal is a question for a human at your keyboard — you have none.** Decide, and
   write the alternatives you did not take onto the row body. Never open a chooser.
 - **Maker and verifier are separate seats.** A maker never self-verifies, drops the verifier, or
