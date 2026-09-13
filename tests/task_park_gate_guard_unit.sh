@@ -33,6 +33,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 # DIVE-1919: BIND the gate-proof paths to the isolated STATE_DIR too. tasks_db.sh
 # derives them at SOURCE time (line ~1240), i.e. from the DEFAULT /var/lib/5dive,

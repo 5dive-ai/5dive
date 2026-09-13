@@ -49,6 +49,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
 GATE_PROOF_ENFORCE="$STATE_DIR/gate-proof.enforce"

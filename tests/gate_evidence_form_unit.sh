@@ -82,6 +82,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 
 # Suite guard: remember the REAL log's length up front (EV7).
 REALLOG=/var/log/5dive/agent-audit.log

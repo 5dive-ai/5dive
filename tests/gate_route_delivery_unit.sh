@@ -53,6 +53,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 # DIVE-2054: "task need lead-route" is now routed through _task_store_audit_log
 # (STORE IDENTITY fence, DIVE-2010) — declare this fixture store as prod so the

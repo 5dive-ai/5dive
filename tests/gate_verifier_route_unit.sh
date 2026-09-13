@@ -38,6 +38,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 # DIVE-2190: the harness isolates STATE_DIR but the CALLER IDENTITY is ambient — task_actor
 # reads SUDO_USER/USER — while the fixtures hard-code real agent names (maker='dev'). Run this
 # suite as the agent literally named `dev` and the DIVE-2112 self-grading guard fires on step 5's

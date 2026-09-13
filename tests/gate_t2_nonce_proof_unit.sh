@@ -48,6 +48,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 # cmd_council.sh LAST, matching the production bundle order (CNCL-14). Sourcing it is not
 # convenience: the anchor lives in those council helpers, and a harness that stubbed them
 # would be grading its own stubs.

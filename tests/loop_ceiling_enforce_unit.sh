@@ -25,6 +25,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh cmd_loop.sh cmd_usage.sh cmd_heartbeat.sh; do
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=1; mkdir -p "$TASKS_DIR"; set +e
 tasks_db_init; _tasks_db_migrate   # migrate adds parked_at/park_reason (prod stores are always migrated)
