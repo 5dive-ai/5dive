@@ -962,6 +962,34 @@ JOURNALD
   chmod 755 "$BIN_DIR/5dive-agent-start"
   ok "5dive-agent-start → $BIN_DIR/5dive-agent-start"
 
+  # DIVE-3965: the unit's ExecStopPost notifier. Installed next to the launcher
+  # because it shares the launcher's constraint — it has to work when the
+  # bundle itself is the thing that is broken.
+  #
+  # OPTIONAL AT THE PIN, and that is the whole reason this is not the bare
+  # `curl -fsSL` the launcher above uses. This file is ADDITIVE and the fleet
+  # pin predates the tag that ships it, so a fail-closed fetch here 404s on
+  # every fresh install and on every box's 04:00Z self-update and aborts the
+  # WHOLE install under `set -e` (DIVE-4349; caught by
+  # scripts/install-pin-compat.sh before it reached a box). A box that does not
+  # get the notifier simply has no ExecStopPost target — which the unit's `-`
+  # prefix already tolerates: the notification is missing, the unit still stops.
+  #
+  # MOVE IT UP into the fail-closed set only once the fleet pin is at or past
+  # the tag that ships it; install-pin-compat grades that on every PR touching
+  # this file, so "the pin has caught up" stays a check result, not a memory.
+  if fetch_optional_at_pin "5dive-agent-stop-notify" "$BIN_DIR/5dive-agent-stop-notify"; then
+    chmod 755 "$BIN_DIR/5dive-agent-stop-notify"
+    ok "5dive-agent-stop-notify → $BIN_DIR/5dive-agent-stop-notify"
+  else
+    # Symmetric with the optional-hook loop below: the bundle at this pin does
+    # not wire it, so a copy left from a newer install would be a file nothing
+    # invokes (the unit template comes from the same pin and carries no
+    # ExecStopPost line there).
+    rm -f "$BIN_DIR/5dive-agent-stop-notify"
+    say "5dive-agent-stop-notify is not shipped at this pin — agent crash notifications stay off on this box until the fleet pin passes the tag that carries it"
+  fi
+
   # >>> DIVE-4194 box-side scripts
   # The helper scripts below used to be three hand-written curl/chmod/ok blocks
   # right here, and this file was their ONLY writer. The control plane's nightly
@@ -1623,7 +1651,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   systemctl daemon-reload || true
 
   # 3. Binaries + shared libs
-  rm -f "$BIN_DIR/5dive" "$BIN_DIR/5dive-agent-start"
+  rm -f "$BIN_DIR/5dive" "$BIN_DIR/5dive-agent-start" "$BIN_DIR/5dive-agent-stop-notify"
   ok "removed CLI binaries"
   if [[ -d "$LIB_DIR" ]]; then
     rm -rf "$LIB_DIR"

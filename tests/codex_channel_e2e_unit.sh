@@ -346,10 +346,23 @@ const fromCli = JSON.parse(readFileSync('${TMP}/drained.json', 'utf8')) as Dispa
   await h.d.initialize()
   say('c3_notice_source', h.published[0]?.route?.source)
   say('c3_notice_kind', h.published[0]?.meta?.kind)
-  say('c3_notice_says_restart', /restarted/.test(h.published[0]?.text ?? ''))
+  // DIVE-3965 split the notice in two: a CLEAN restart says "restarted", an
+  // unclean stop says "stopped unexpectedly", and this fixture carries no
+  // clean-shutdown marker so it is the unclean branch. Grading on the word
+  // `restarted` graded ONE of the two branches and silently reds on the other.
+  // The invariant both branches owe is that the notice names the LOST TURN.
+  say('c3_notice_says_lost_turn', /before the previous turn completed/.test(h.published[0]?.text ?? ''))
   const started = h.requests.filter(r => r.method === 'turn/start')
   say('c3_recovered_trigger', started[0]?.params?.turnTrigger)
-  say('c3_recovered_text', started[0]?.params?.input?.[0]?.text)
+  // DIVE-3965 also made the recovery context RIDE the next turn as its own
+  // leading input element instead of being a separate apology. So the recovered
+  // message is no longer input[0]; reading input[0] read the rider and called
+  // the message text corrupted. Grade the rider and the message SEPARATELY --
+  // that is stricter than the single arm it replaces, not looser.
+  const c3in = started[0]?.params?.input ?? []
+  const c3texts = c3in.filter(i => i?.type === 'text').map(i => i?.text ?? '')
+  say('c3_recovery_rider', c3texts.some(t => t.startsWith('[5dive recovery]')))
+  say('c3_recovered_text', c3texts.filter(t => !t.startsWith('[5dive recovery]'))[0])
   say('c3_pending_left', h.snapshot()?.pending?.length)
 }
 
@@ -379,8 +392,9 @@ DRIVER_EOF
 
     eq_t "stage C3: a restart tells the route whose turn it lost" '"telegram"' "$(_v c3_notice_source)"
     eq_t "stage C3: and tells it as an error, not as a model reply" '"error"' "$(_v c3_notice_kind)"
-    eq_t "stage C3: the notice actually says it restarted" 'true' "$(_v c3_notice_says_restart)"
+    eq_t "stage C3: the notice actually names the turn it lost" 'true' "$(_v c3_notice_says_lost_turn)"
     eq_t "stage C3: work queued while it was down is recovered" '"5dive:dashboard"' "$(_v c3_recovered_trigger)"
+    eq_t "stage C3: the recovery context rides the recovered turn" 'true' "$(_v c3_recovery_rider)"
     eq_t "stage C3: recovered with its text intact" '"queued while it was down"' "$(_v c3_recovered_text)"
     eq_t "stage C3: and the queue is empty afterwards" '0' "$(_v c3_pending_left)"
   else
