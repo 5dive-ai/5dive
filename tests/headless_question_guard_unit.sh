@@ -136,6 +136,17 @@ PANE_MENTION=$(printf 'The pane sat at "Enter to select" from 05:40Z until 07:12
 t  "arm3: a transcript MENTION scrolls out of the tail window and does not trip" \
    "" "$(printf '%s\n' "$PANE_MENTION" | tail -n "$_SUP_PROMPT_PANE_LINES" | _sup_prompt_match)"
 
+# DIVE-4405: a message we delivered into the pane is our output, not a picker.
+# The shared pre-filter drops it before this regex, so an alert or an a2a note
+# quoting a picker footer cannot make a working seat read as blocked.
+t  "DIVE-4405: an echoed [5dive-msg] quoting the footer does not read as a picker" \
+   "" "$(printf '%s\n' '[5dive-msg from main] your pane showed "Enter to select" at 05:40Z' | _sup_prompt_match)"
+t  "DIVE-4405: ...nor does a [TRIPWIRE] alert quoting it" \
+   "" "$(printf '%s\n' "[TRIPWIRE id-verification] agent-dev STALLED. Pane signature: ↑/↓ to navigate · Enter to select" | _sup_prompt_match)"
+# POSITIVE CONTROL: the same footer text without the marker still matches.
+tc "DIVE-4405 control: the unmarked footer still matches" "Enter to select" \
+   "$(printf '%s\n' '  ↑/↓ to navigate · Enter to select' | _sup_prompt_match)"
+
 # Enter takes the HIGHLIGHTED option, so the cursor is the only thing that may
 # authorise an auto-answer.
 printf '%s\n' "$PANE_BLOCKED"  | _sup_prompt_recommended \

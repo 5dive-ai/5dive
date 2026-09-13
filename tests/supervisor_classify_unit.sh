@@ -162,6 +162,21 @@ t "DIVE-3272 regex: a bare 4290 does NOT match" "MISS" \
 t "DIVE-3272 regex: an empty pane does NOT match" "MISS" \
   "$( [[ -n "$(q '')" ]] && echo MATCH || echo MISS )"
 
+# --- DIVE-4405: our own machine lines are dropped before ANY classifier ------
+# The tripwire alert quotes the pane line it fired on, so once it is rendered
+# into a pane it is input again on the next tick (that is how lodar got paged
+# twice on 2026-09-13). The drop is in the shared pre-filter, so it holds for
+# the quota classifier too — graded here, where the quota regex is graded.
+QUOTA_ECHO="[TRIPWIRE id-verification] claude account 'agent-dev' looks STALLED. Pane signature: ● API Error: Request rejected (429) · Your token-plan 1-week quota has been exhausted."
+t "DIVE-4405 regex: an echoed [TRIPWIRE] alert does NOT reach the quota matcher" "MISS" \
+  "$( [[ -n "$(q "$QUOTA_ECHO")" ]] && echo MATCH || echo MISS )"
+t "DIVE-4405 regex: an echoed [5dive-msg] quota quote does NOT match" "MISS" \
+  "$( [[ -n "$(q '[5dive-msg from ops] your seat printed insufficient_quota at 04:10Z')" ]] && echo MATCH || echo MISS )"
+# POSITIVE CONTROL: the same payload without the machine marker still matches,
+# so the two arms above grade the drop and not an inert string.
+t "DIVE-4405 control: the same 429 payload without the marker still matches" "MATCH" \
+  "$( [[ -n "$(q '● API Error: Request rejected (429) · Your token-plan 1-week quota has been exhausted.')" ]] && echo MATCH || echo MISS )"
+
 # --- DIVE-4206: the banner the harnesses actually print in 2026-09 -----------
 # The whole quota-park apparatus (DIVE-4104) reads THIS classification, and it
 # never fired on either live banner: `session limit` was absent from the header
