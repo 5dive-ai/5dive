@@ -820,6 +820,128 @@ tier_budget() {
   esac
 }
 
+# =================================================================================
+# DIVE-4391: SHARD THE CORPUS ON MEASURED TIME, NOT ON FILE COUNT.
+#
+# THE DEFECT THIS REPLACES. The corpus matrix used to take every Nth file
+# (`i % shards == index`). File count is not cost: the corpus has a long tail (the
+# median harness is under a second, the top one is tens), so an every-Nth cut lands
+# wherever the tail happens to fall. Measured on the SAME base 0f9bc089, 2026-09-12:
+#
+#   PR #918 (no new test file):  shard1 152 files 292s  shard2 152 274s  shard3 152 288s
+#   PR #916 (one new test file): shard1 153 files 308s  shard2 152 235s  shard3 152 219s
+#
+# #916 went RED at 102% of a 300s cap with ~90s of headroom sitting unused on shards
+# 2 and 3, and its attribution line read `new_files=0 new_s=0` — literally true and
+# maximally confusing. Adding a file does not put THAT file in shard 1; it shifts the
+# cut by one, shard 1 gains a slot, and the harness that lands in it is a
+# PRE-EXISTING one the diff never touched. So the author of the next test file pays a
+# red no part of their diff can pay, and the only exit is a human bypass. That is a
+# shared liability billed to whoever is standing closest
+# ([[a-budget-cap-is-a-shared-liability-the-author-cannot-pay]]).
+#
+# WHAT THIS DOES NOT DO, said here because it is the thing to watch: it does not buy
+# capacity. Aggregate cost is unchanged, the per-shard cap is unchanged, and a corpus
+# that genuinely outgrows 3 x 300s still reds — correctly, and on every shard at once
+# rather than on whichever one the alphabet loaded. Balancing spends the headroom the
+# split already bought; it does not create any. The un-sharded total that
+# `core-budget-report` prints is still the number the growth trend is read from.
+#
+# WHY THE WEIGHTS ARE COMMITTED AND NOT FETCHED. Every leg of the matrix computes the
+# WHOLE plan independently and then keeps its own slice, so the plan must be a pure
+# function of the checkout. A per-job fetch that succeeded on shard 1 and hiccuped on
+# shard 2 would hand the two legs DIFFERENT plans, and a harness would then run twice
+# or not at all — a hole in the corpus that reports green, which is strictly worse
+# than the imbalance being fixed. tests/lib/harness-weights.tsv is refreshed by
+# scripts/refresh-harness-weights.sh and reviewed like any other file.
+#
+# STALE OR MISSING IS SAFE BY CONSTRUCTION. Weights decide only WHICH shard a harness
+# lands in. They never move a cap, a verdict, an exit code or a report total. A table
+# too thin to be worth using falls back to the old round-robin and says so
+# (`shard_mode=count`), and an unpriced file is charged the MEDIAN rather than zero —
+# a new harness that plans as free is exactly how the next author inherits the red.
+TIER_SHARD_MIN_COVER_PCT=60
+
+# tier_shard_assign <shards> <pristine|installed> <weights_file|""> ; corpus on stdin
+#
+# Prints, for the corpus read from stdin (one path per line, in tier_list order):
+#   # shard_mode=<time|count> cover_pct=N median_ms=N weighted=N
+#   <shard_index>\t<planned_ms>\t<path>          (one per input line, input order)
+#
+# Deterministic: longest-processing-time-first (sort by weight desc, then path asc,
+# both total orders), each harness to the currently lightest shard, ties to the
+# lowest index. LPT is the classic 4/3-approximation for this exact problem and it
+# needs no search — two runs of this function on the same two files agree, which is
+# the property the matrix depends on.
+tier_shard_assign() {
+  local shards="${1:?tier_shard_assign <shards> <env> <weights_file>}"
+  local env="${2:?tier_shard_assign <shards> <env> <weights_file>}"
+  local wf="${3-}"
+  [[ "$shards" =~ ^[0-9]+$ ]] && (( shards >= 1 )) || {
+    printf 'tier_shard_assign: shards must be a positive integer, got %s\n' "$shards" >&2; return 2; }
+  case "$env" in pristine|installed) ;; *)
+    printf 'tier_shard_assign: env must be pristine or installed, got %s\n' "$env" >&2; return 2 ;; esac
+  [[ -n "$wf" && -r "$wf" ]] || wf=""
+  awk -v shards="$shards" -v envcol="$env" -v wf="$wf" -v mincover="$TIER_SHARD_MIN_COVER_PCT" '
+    function isort(arr, n,   a, b, k) {   # insertion sort, ascending, strings
+      for (a = 1; a < n; a++) { k = arr[a]; b = a - 1
+        while (b >= 0 && arr[b] > k) { arr[b+1] = arr[b]; b-- }
+        arr[b+1] = k }
+    }
+    BEGIN {
+      # ---- weights (optional) -------------------------------------------------
+      if (wf != "") {
+        while ((getline line < wf) > 0) {
+          if (line ~ /^#/ || line == "") continue
+          n = split(line, f, "\t")
+          if (n < 3) continue
+          ms = (envcol == "pristine") ? f[2] + 0 : f[3] + 0
+          if (ms >= 0) w[f[1]] = ms
+        }
+        close(wf)
+      }
+      # ---- corpus, in tier_list order -----------------------------------------
+      m = 0
+      while ((getline p < "/dev/stdin") > 0) { if (p != "") corpus[m++] = p }
+      if (m == 0) { printf "# shard_mode=count cover_pct=0 median_ms=0 weighted=0\n"; exit 0 }
+      known = 0
+      for (a = 0; a < m; a++) if (corpus[a] in w) kn[known++] = w[corpus[a]] ""
+      cover = known * 100 / m
+      # Median of the known weights, for the files that carry none. isort is on
+      # strings, so widths are padded to sort numerically.
+      med = 0
+      if (known > 0) {
+        for (a = 0; a < known; a++) skn[a] = sprintf("%012d", kn[a] + 0)
+        isort(skn, known)
+        med = skn[int(known / 2)] + 0
+      }
+      if (wf == "" || cover < mincover || shards == 1) {
+        printf "# shard_mode=count cover_pct=%d median_ms=%d weighted=0\n", cover, med
+        for (a = 0; a < m; a++) printf "%d\t%d\t%s\n", (a % shards) + 1, 0, corpus[a]
+        exit 0
+      }
+      # ---- LPT: heaviest first, onto the lightest shard -----------------------
+      # Key is "<width-padded weight desc><TAB><path>" so one string sort gives the
+      # whole total order and the tie-break is the path, never the input order.
+      for (a = 0; a < m; a++) {
+        ms = (corpus[a] in w) ? w[corpus[a]] : med
+        cost[corpus[a]] = ms
+        key[a] = sprintf("%012d\t%s", 999999999999 - ms, corpus[a])
+      }
+      isort(key, m)
+      for (s = 1; s <= shards; s++) load[s] = 0
+      for (a = 0; a < m; a++) {
+        split(key[a], kf, "\t"); pth = kf[2]
+        best = 1
+        for (s = 2; s <= shards; s++) if (load[s] < load[best]) best = s
+        assign[pth] = best; load[best] += cost[pth]
+      }
+      printf "# shard_mode=time cover_pct=%d median_ms=%d weighted=1\n", cover, med
+      for (a = 0; a < m; a++) printf "%d\t%d\t%s\n", assign[corpus[a]], cost[corpus[a]], corpus[a]
+    }
+  '
+}
+
 # Usable as a CLI so a workflow step, a git hook or a human can ask without writing
 # bash: tests/lib/tier.sh list core | of <file> | reason <file> | budget core
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -834,7 +956,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     clamp)  tier_cal_clamp_pct "${2:?clamp <raw_pct>}" ;;
     diverge) tier_cal_diverge_pct "${2:?diverge <pre_us> <post_us>}" "${3:?diverge <pre_us> <post_us>}" ;;
     refadmit) shift; tier_cal_ref_admissible "${1:?refadmit <candidate_us> <current_us> <concordant_sample>...}" "${2:?refadmit <candidate_us> <current_us> <concordant_sample>...}" "${@:3}" ;;
+    shard) shift; tier_shard_assign "${1:?shard <shards> <pristine|installed> [weights_file]}" "${2:?shard <shards> <pristine|installed> [weights_file]}" "${3:-tests/lib/harness-weights.tsv}" ;;
     attribute) shift; tier_budget_attribution "${1:?attribute <effective_cap_ms> <red_report> <baseline_report>...}" "${2:?attribute <effective_cap_ms> <red_report> <baseline_report>...}" "${@:3}" ;;
-    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full | scale <us> [baseline] | clamp <pct> | diverge <pre_us> <post_us> | refadmit <candidate_us> <current_us> <concordant_sample>... | attribute <effective_cap_ms> <red_report> <baseline_report>...}\n' >&2; exit 2 ;;
+    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full | scale <us> [baseline] | clamp <pct> | diverge <pre_us> <post_us> | refadmit <candidate_us> <current_us> <concordant_sample>... | attribute <effective_cap_ms> <red_report> <baseline_report>... | shard <shards> <pristine|installed> [weights_file] (corpus on stdin)}\n' >&2; exit 2 ;;
   esac
 fi
