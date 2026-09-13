@@ -273,7 +273,7 @@ after=$(db "SELECT id||'|'||status||'|'||COALESCE(outcome,'')||'|'||COALESCE(end
 id7=$(addt "eta" --assignee="$FIX_MAKER")
 ( cmd_task_start "$id7" --no-preflight ) >/dev/null 2>&1
 r7=$(open_of "$id7")
-( cmd_task_need "$id7" --type=decision --ask="pick" --options="ship it now|hold it" --recommend="ship it now" \
+( cmd_task_need "$id7" --type=decision --ask="pick" --options="A|B" --recommend="A" \
     --tier=2 --needs=human_tap ) >/dev/null 2>&1
 [[ "$(rfld "$r7" human_touch)" == "1" ]] \
   && ok_t "a tier-2 gate marks the run human-touched" \
@@ -281,7 +281,7 @@ r7=$(open_of "$id7")
 id8=$(addt "theta" --assignee="$FIX_MAKER")
 ( cmd_task_start "$id8" --no-preflight ) >/dev/null 2>&1
 r8=$(open_of "$id8")
-( cmd_task_need "$id8" --type=decision --ask="pick" --options="ship it now|hold it" --recommend="ship it now" --tier=0 ) >/dev/null 2>&1
+( cmd_task_need "$id8" --type=decision --ask="pick" --options="A|B" --recommend="A" --tier=0 ) >/dev/null 2>&1
 [[ "$(rfld "$r8" human_touch)" == "0" ]] \
   && ok_t "a TIER-0 gate does NOT mark human_touch (it pings nobody)" \
   || bad_t "tier-0 gate falsely counted a human" "got=[$(rfld "$r8" human_touch)]"

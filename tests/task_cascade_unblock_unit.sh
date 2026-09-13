@@ -101,7 +101,7 @@ a=$(addt -- "A cancel"); b=$(addt --assignee=bob -- "B via cancel")
 # --- T4 GUARDRAIL: an unanswered human need-gate is NOT auto-unblocked
 a=$(addt -- "A gate"); b=$(addt --assignee=bob -- "B gated")
 ( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
-( cmd_task_need "$b" --type=decision --options="ship it now|hold it" --ask="pick one" ) >/dev/null 2>&1
+( cmd_task_need "$b" --type=decision --options="X|Y" --ask="pick one" ) >/dev/null 2>&1
 ( cmd_task_done "$a" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "blocked" && "$(edges "$b")" == "0" ]] \
   && ok_t "need-gated dependent stays blocked (edge dropped, not flipped)" \
@@ -186,7 +186,7 @@ a=$(addt --assignee=dev -- "A verify-closed"); b=$(addt --assignee=bob -- "B beh
 # --- T9b: `task verify` respects the same guardrail (gated dependent stays blocked)
 a=$(addt --assignee=dev -- "A verify gate"); b=$(addt --assignee=bob -- "B gated behind verify")
 ( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
-( cmd_task_need "$b" --type=decision --options="ship it now|hold it" --ask="pick" ) >/dev/null 2>&1
+( cmd_task_need "$b" --type=decision --options="X|Y" --ask="pick" ) >/dev/null 2>&1
 ( cmd_task_verify "$a" --cmd="true" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "blocked" && "$(edges "$b")" == "0" ]] \
   && ok_t "verify-close honors guardrail: gated dependent stays blocked (edge dropped)" \

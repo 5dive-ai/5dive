@@ -252,13 +252,7 @@ OUT=$(file_gate DIVE-130 dev --type=approval --tier=1 --ask="$ASK_MISS")
   || bad_t "E1 must offer the binding remedy" "out=$OUT"
 
 seed DIVE-131 'gate routing bug report'
-# DIVE-4431: the org root's unrouted tier-1 gate now MEETS the human-ask
-# readability rule (it reaches lodar, whatever its declared tier says), and
-# ASK_MISS names a branch on purpose — the prose-only branch mention IS the input
-# this case grades. The audited escape keeps that input verbatim; re-wording the
-# fixture would delete the thing under test.
-OUT=$(file_gate DIVE-131 main --type=approval --ask="$ASK_MISS" \
-        --ask-ok="the branch named in prose is the input this routing case grades")
+OUT=$(file_gate DIVE-131 main --type=approval --ask="$ASK_MISS")
 [[ "$OUT" == *"NOT ROUTED"* && "$OUT" == *"resolves no lead above main"* ]] \
   && ok_t "E2 the no-lead cause is reported distinctly (opposite remedy)" \
   || bad_t "E2 no-lead cause must be distinct" "out=$OUT"

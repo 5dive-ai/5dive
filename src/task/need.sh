@@ -2649,11 +2649,6 @@ cmd_task_need() {
   # a token with no dictionary and the mapping survives only in the clause order of
   # the free-text ask. WARN, never fail — DIVE-2249's fixtures and scripted callers
   # legitimately pass letters, and this is a lesson about writing, not a constraint.
-  # DIVE-4431 ESCALATES THIS WARNING, AND ONLY WHERE THE READER IS A PERSON: an
-  # all-bare option set on a gate that reaches the paired human is refused at the
-  # readability check below (the buttons ARE the answer there — lodar's phone got
-  # `⭐ A` / `B` under an ask whose remaining sentences were cut by the render).
-  # Everywhere else this stays exactly what DIVE-4416 made it: advice.
   if [[ -n "$options" ]]; then
     local _all_single
     _all_single=$(printf '%s' "$options" | jq -Rr '
@@ -3620,22 +3615,6 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     if [[ -n "$options" ]]; then
       _ar_opt_term=$(_gate_ask_jargon_term "$_ar_opt_scan" 2>/dev/null) || _ar_opt_term=""
     fi
-    # DIVE-4431 — AN OPTION IS A BUTTON, AND A BUTTON LABELLED `A` CARRIES NO
-    # OUTCOME. lodar's phone showed `⭐ A` / `B` under a rendered ask that had
-    # already lost the sentences explaining what A and B meant: the outcomes were
-    # written inside the ask, where the render cannot reach them, and the two
-    # defects compose into a statement with two unlabelled buttons. CLAUDE.md's
-    # rule is the standard here — "`--options=` are read too: make each one a
-    # plain outcome". Refused only when EVERY entry is a bare label (<= 2 chars),
-    # so a real menu with one short entry ("no", "1h") is untouched, and a mixed
-    # set is left to the filer's judgement rather than to a threshold.
-    local _ar_opt_bare=0
-    if [[ -n "$options" ]]; then
-      _ar_opt_bare=$(printf '%s' "$options" | jq -Rr '
-        [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
-        | if length > 0 and all(.[]; length <= 2) then "1" else "0" end' 2>/dev/null) || _ar_opt_bare=0
-      [[ "$_ar_opt_bare" == "1" ]] || _ar_opt_bare=0
-    fi
     (( _ar_words > _GATE_ASK_MAX_WORDS )) \
       && _ar_why="it runs ${_ar_words} words (the cap is ${_GATE_ASK_MAX_WORDS})"
     if [[ -n "$_ar_term" ]]; then
@@ -3644,15 +3623,11 @@ If you cannot name the capability, this is a decision you find uncomfortable, no
     if [[ -n "$_ar_opt_term" ]]; then
       _ar_why="${_ar_why:+${_ar_why}, and }--options contains '${_ar_opt_term#*:}' (a ${_ar_opt_term%%:*} — an internal name)"
     fi
-    if [[ "$_ar_opt_bare" == "1" ]]; then
-      _ar_why="${_ar_why:+${_ar_why}, and }its --options are bare labels ('${options}'), so the buttons name no outcome"
-    fi
     if [[ -n "$_ar_why" ]]; then
       if [[ -z "$ask_ok" ]]; then
         _task_store_audit_log "task need ask-readability" "refused" 0 -- \
           "task=$ident" "filer=${actor:-}" "type=$type" "tier=${tier}" "words=${_ar_words}" \
-          "term=${_ar_term:-none}" "options_term=${_ar_opt_term:-none}" \
-          "options_bare=${_ar_opt_bare}" || true
+          "term=${_ar_term:-none}" "options_term=${_ar_opt_term:-none}" || true
         fail "$E_VALIDATION" "$ident: refusing this gate because its --ask is the ONE piece of text the paired human sees, and ${_ar_why}. He has never read our code: an ident, a sha, a branch, a check name, a file path or a flag is noise to the person deciding — put them in the task BODY, which is where mechanism belongs.
 Rewrite the ask as a CHOICE BETWEEN OUTCOMES, consequence first: what changes if he says yes, what changes if he says no. Not what component is involved.
   bad   \"grant agent-ops NOPASSWD sudo, or run the pass as root — blocks both DIVE-3208 preconditions.\"

@@ -309,33 +309,10 @@ eq_t "G2: a plain-English unrouted tier-1 gate still files (rc 0)" "$RC" "0"
 eq_t "G2b: ... and it is a real tier-1 decision gate" \
      "$(field ROOT-2 need_type)|$(field ROOT-2 tier)" "decision|1"
 
-# G3 — OPTIONS THAT ARE BARE LABELS. The buttons are the second half of what
-# lodar saw: `A` and `B` name no outcome, and the ask cannot carry the meaning
-# because the render only shows one sentence of it.
-seed OPTB-1
-file_gate OPTB-1 --type=decision --tier=2 --options="A|B" \
-  --ask="Should this brand keep its one-line listing, or get a page of its own?"
-[[ "$RC" != "0" ]] && ok_t "G3: --options=A|B is REFUSED — a button must name an outcome" \
-  || bad_t "G3: --options=A|B is REFUSED — a button must name an outcome" "rc=$RC out=$OUT"
-has_t "G3b: ... and the refusal says it was the options" "$OUT" "bare labels"
-eq_t  "G3c: NO gate was written by the refused filing" "$(field OPTB-1 need_type)" "∅"
-
-seed OPTB-2
-file_gate OPTB-2 --type=decision --tier=2 --needs=human_tap \
-  --options="keep it as one line|build a catalogue page" \
-  --ask="Should this brand keep its one-line listing, or get a page of its own?"
-eq_t "G3d: outcome-shaped options file (rc 0)" "$RC" "0"
-
-# A MIXED menu is the filer's judgement, not this rule's: only an ALL-bare set is
-# refused, so a real two-word answer beside a short one is untouched.
-seed OPTB-3
-file_gate OPTB-3 --type=decision --tier=2 --needs=human_tap --options="no|switch it on today" \
-  --ask="Should this brand keep its one-line listing, or get a page of its own?"
-eq_t "G3e: a menu with one short entry is NOT refused (rc 0)" "$RC" "0"
-
 # G4 — the escape works here too: a gate must never become unfileable.
 seed ROOT-3
-file_gate ROOT-3 --type=decision --tier=1 --options="A|B" --ask="$LONG" \
+file_gate ROOT-3 --type=decision --tier=1 \
+  --options="leave it as one line|build it a catalogue page" --ask="$LONG" \
   --ask-ok="the release string is itself the subject of the question"
 eq_t "G4: --ask-ok still files the unrouted tier-1 gate (rc 0)" "$RC" "0"
 has_t "G4b: ... and the escape is recorded" "$(cat "$AUDIT_ROWS")" "ask-readability escaped"

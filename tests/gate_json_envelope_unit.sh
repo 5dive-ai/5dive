@@ -60,8 +60,8 @@ mk() { db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,stat
 
 # ---- 1. the live bug: no precedent is the COMMON case, not an edge case -------
 mk DIVE-8001
-out=$( (JSON_MODE=1 cmd_task_need DIVE-8001 --type=decision --options="ship it now|hold it" \
-          --recommend="ship it now" --ask="pick one" --from=dev) 2>/dev/null )
+out=$( (JSON_MODE=1 cmd_task_need DIVE-8001 --type=decision --options="A|B" \
+          --recommend="A" --ask="pick one" --from=dev) 2>/dev/null )
 [[ -n "$out" ]] && ok_t "task need --json emits SOMETHING with no precedent" \
   || bad_t "envelope is non-empty" "got 0 bytes — the whole object was killed by one field"
 printf '%s' "$out" | jq -e . >/dev/null 2>&1 \
@@ -71,7 +71,7 @@ printf '%s' "$out" | jq -e . >/dev/null 2>&1 \
   || bad_t "precedent_ref is null" "got: $(printf '%s' "$out" | jq -c '.data.precedent_ref' 2>/dev/null)"
 # The sibling fields prove the object was built, not merely non-empty.
 [[ "$(printf '%s' "$out" | jq -r '.data.ident' 2>/dev/null)" == "DIVE-8001" \
-   && "$(printf '%s' "$out" | jq -r '.data.recommend' 2>/dev/null)" == "ship it now" ]] \
+   && "$(printf '%s' "$out" | jq -r '.data.recommend' 2>/dev/null)" == "A" ]] \
   && ok_t "sibling fields survive intact (ident + recommend)" \
   || bad_t "sibling fields" "$(printf '%s' "$out" | jq -c '.data' 2>/dev/null)"
 
@@ -81,8 +81,8 @@ printf '%s' "$out" | jq -e . >/dev/null 2>&1 \
 db "UPDATE tasks SET need_answer='A', need_answered_at=datetime('now'),
        need_answered_by='human:test' WHERE ident='DIVE-8001';"
 mk DIVE-8002
-out2=$( (JSON_MODE=1 cmd_task_need DIVE-8002 --type=decision --options="ship it now|hold it" \
-           --recommend="ship it now" --ask="pick one" --from=dev) 2>/dev/null )
+out2=$( (JSON_MODE=1 cmd_task_need DIVE-8002 --type=decision --options="A|B" \
+           --recommend="A" --ask="pick one" --from=dev) 2>/dev/null )
 pref=$(printf '%s' "$out2" | jq -r '.data.precedent_ref' 2>/dev/null)
 [[ "$pref" =~ ^[0-9]+$ ]] \
   && ok_t "a real precedent still renders as a number ($pref), so the field is not merely deleted" \

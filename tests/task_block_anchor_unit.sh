@@ -97,7 +97,7 @@ runq cmd_task_block "$r" --reason="held for launch window" --wake=+3d
 
 # --- T7: a human need-gate anchors a block -----------------------------------
 n=$(addt --assignee=nate -- "N gated")
-runq cmd_task_need "$n" --type=decision --options="ship it now|hold it" --ask="pick"
+runq cmd_task_need "$n" --type=decision --options="X|Y" --ask="pick"
 { [[ "$(st "$n")" == "blocked" ]] && _task_has_block_anchor "$n"; } \
   && ok_t "task need blocks + satisfies the gate anchor" || bad_t "need anchor" "status=$(st "$n")"
 
