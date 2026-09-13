@@ -1422,6 +1422,44 @@ MANAGED
     fi
   fi
 
+# DIVE-4406 — reconcile one marker-delimited block from a published source file
+# into a live file, leaving every byte outside the markers alone.
+#   sync_managed_block <live-file> <source-url-or-path> <marker-id>
+# Markers are HTML comments: `<!-- <id>:begin …-->` … `<!-- <id>:end -->`.
+# Returns 1 (and writes nothing) if the source cannot be read or carries no
+# block — a fetch failure must never truncate a host's file.
+sync_managed_block() {
+  local live="$1" src="$2" id="$3" tmp block
+  tmp="$(mktemp)" || return 1
+  if [[ "$src" == http*://* ]]; then curl -fsSL "$src" -o "$tmp" || { rm -f "$tmp"; return 1; }
+  else cp "$src" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }; fi
+  block="$(awk -v id="$id" '
+    index($0, "<!-- " id ":begin") { inb = 1 }
+    inb { print }
+    index($0, "<!-- " id ":end")   { inb = 0 }' "$tmp")"
+  rm -f "$tmp"
+  [[ -n "$block" ]] || return 1
+  [[ -f "$live" ]] || { printf '%s\n' "$block" > "$live"; return 0; }
+  local out; out="$(mktemp)" || return 1
+  if grep -qF "<!-- ${id}:begin" "$live"; then
+    # Replace in place: everything outside the markers is copied byte for byte;
+    # the old block is dropped and the new one printed where it stood.
+    local bf; bf="$(mktemp)" || { rm -f "$out"; return 1; }
+    printf '%s\n' "$block" > "$bf"
+    awk -v id="$id" -v bf="$bf" '
+      BEGIN { while ((getline l < bf) > 0) nb = nb l "\n" }
+      index($0, "<!-- " id ":begin") { printf "%s", nb; skip = 1; next }
+      skip { if (index($0, "<!-- " id ":end")) skip = 0; next }
+      { print }
+    ' "$live" > "$out" 2>/dev/null || { rm -f "$out" "$bf"; return 1; }
+    rm -f "$bf"
+  else
+    { cat "$live"; printf '\n%s\n' "$block"; } > "$out"
+  fi
+  [[ -s "$out" ]] || { rm -f "$out"; return 1; }
+  cat "$out" > "$live"; rm -f "$out"
+}
+
   # Drop a slim projects-level CLAUDE.md so every agent spawned on this host
   # picks up baseline self-management guidance (project layout, sudo, where
   # the agent's own settings live, the host CLI). Only on first install —
@@ -1436,6 +1474,17 @@ MANAGED
   else
     ok "projects/CLAUDE.md (kept existing)"
   fi
+  # DIVE-4406 — THE LIFECYCLE CONTRACT IS A MANAGED BLOCK, NOT A FIRST-INSTALL FILE.
+  # The heartbeat dispatch stopped repeating the contract in every /goal and now
+  # points at this file. "Only on first install" would mean every existing host
+  # keeps a CLAUDE.md without it — the nudge would cite a section that is not
+  # there, which is worse than the repetition it replaced. So the block between
+  # the two markers is reconciled on EVERY install: replaced if present, appended
+  # if absent, and everything outside the markers (a host's customisation) is
+  # left exactly as it was.
+  sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:task-lifecycle \
+    && ok "projects/CLAUDE.md (task-lifecycle block synced)" \
+    || echo "warn: could not sync the task-lifecycle block into projects/CLAUDE.md — the heartbeat dispatch cites it" >&2
   if [[ ! -e /home/claude/projects/AGENTS.md ]]; then
     ln -sfn CLAUDE.md /home/claude/projects/AGENTS.md
     chown -h claude:claude /home/claude/projects/AGENTS.md

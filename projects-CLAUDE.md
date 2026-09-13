@@ -65,3 +65,38 @@ six and a half hours.
   Spell it `FIVEDIVE_`, not `5DIVE_`: a name may not begin with a digit, so
   `5DIVE_KEEP_ALIVE=1 ./x` is not an assignment at all — bash reads it as a
   command, exits 127, and your job never starts.
+
+<!-- 5dive:task-lifecycle:begin (managed by `5dive` install — edits inside are overwritten; DIVE-4406) -->
+## Task lifecycle — read ONCE per session (the heartbeat dispatch no longer repeats it)
+
+A `/goal DIVE-xxxx` wake names four things and nothing else: the row, its terminal condition, the
+live delta (a rejection, a loop role, a resume, a gate queue), and the next action. Everything
+below is invariant, so it lives here instead of in every nudge (DIVE-4406).
+
+- **One row per turn.** Work only the row the goal names. Single exception: a gate-cleared ping
+  about another row *you* own with finished work — push and deliver that row, then come back.
+- **Read the row's state only from `5dive task show <ident>`**, never from memory or a pane.
+- **The terminal states are four.** `done` — with a `--result` of one or two self-contained
+  sentences, because the creator and the dashboard read that field and nothing else;
+  **delivered** — on a row that carries a verifier, `task done` hands it over and status stays
+  `todo`: that IS the maker's terminal state, so report the delivery and stop; **gated**;
+  **cancelled** — only when the row is genuinely irrelevant or impossible.
+- **A human gate is not a cancellation.** Needs a decision, an approval, a secret, or a manual
+  step only a person can do →
+  `5dive task need <ident> --type=decision|approval|secret|manual --ask="<ONE crisp question + ~1
+  line of context>" --recommend="<the advised answer>"` (`--options=A|B` on a decision). Heavy
+  detail goes in the task BODY; the ask is the only text the owner reads.
+- **Nothing in a goal is a question for a human at your keyboard — you have none.** Decide, and
+  write the alternatives you did not take onto the row body. Never open a chooser.
+- **Maker and verifier are separate seats.** A maker never self-verifies, drops the verifier, or
+  re-runs `done` to force a close. A verifier grades: accept, or
+  `task reject --feedback="FINDING: … FIX: … VERIFY: …"` — a FAIL verdict is a complete, terminal
+  outcome, and a byte-identical re-delivery after one is refused.
+- **Self-audit before you close:** (a) what are you least confident about, (b) what did you not
+  check or leave missing? A real gap is fixed or gated — never closed over silently.
+- **Knowledge-shaped work:** the async `5dive memory consolidate` pass distils FACTS out of your
+  finished transcript for you. JUDGEMENT — a wiki page, a decision record, a cause, a gap
+  analysis — is a claim only you can make: compile it to `community/wiki/` (plus its index line)
+  before you close.
+- **A turn cap in a goal is soft**, model-judged. The hard cap is the heartbeat's stale-row reaper.
+<!-- 5dive:task-lifecycle:end -->
