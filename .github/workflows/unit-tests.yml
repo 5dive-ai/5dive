@@ -305,6 +305,11 @@ jobs:
           # Pattern built at runtime so this guard does not match its own source.
           pat='git clone .*5dive-'"plugins"
           bare="$(grep -rnE "$pat" .github/workflows/ || true)"
+          # Same reason, second needle (DIVE-4452 iteration 2): spelt whole, the
+          # fetch-site needle matched THIS grep line, so the arm below could never
+          # fire on unit-tests.yml -- the one file that carries half the sites.
+          # shellcheck disable=SC2016  # deliberate: the halves are joined, not expanded
+          fetch_needle='"$PLUGINS_'"REF\""
           if [ -n "$bare" ]; then
             echo "FAIL: unpinned 5dive-plugins clone(s):"; echo "$bare"; fail=1
           fi
@@ -317,8 +322,7 @@ jobs:
               echo "FAIL: $f grades the plugins tree with no workflow-level 40-hex PLUGINS_REF"
               fail=1; continue
             fi
-            # shellcheck disable=SC2016  # literal needle, expansion would defeat the check
-          grep -q '"$PLUGINS_REF"' "$f" || { echo "FAIL: $f declares PLUGINS_REF but never fetches it"; fail=1; }
+            grep -qF "$fetch_needle" "$f" || { echo "FAIL: $f declares PLUGINS_REF but never fetches it"; fail=1; }
             echo "  $f -> $v"
             refs="$refs$v"$'\n'
           done
