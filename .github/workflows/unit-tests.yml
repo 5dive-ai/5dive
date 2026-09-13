@@ -43,6 +43,15 @@ on:
   push:
     branches: [main]
 
+env:
+  # DIVE-4452: the 5dive-plugins tree these harnesses grade against, pinned.
+  # The DIVE-3963 seam has one writer in each repo; grading it against whatever
+  # plugins@main happens to be at runner start makes a merge THERE a red HERE,
+  # on a tree that did not change. Pinned, that arrives as a bump PR that can be
+  # graded and reverted. Every clone site in this file MUST use this ref --
+  # the pinned-plugins-clone guard in unit-tests.yml fails the build otherwise.
+  PLUGINS_REF: 69f455755811fb4749448c401cfe16a893b93e22
+
 jobs:
   # DIVE-3315: INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s
   # stands; the core corpus does not fit under it any more. (Two when this was written;
@@ -121,7 +130,16 @@ jobs:
       # would leave a second git tree inside the one harness-tree-guard.sh grades.
       - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
         run: |
-          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          # DIVE-4452: PINNED, and the pin is the point. An unpinned clone made a merge
+          # in ANOTHER repo turn 5dive@main red with zero commits here (main head e2d95b3e
+          # graded SUCCESS at 11:58:57Z and FAILURE at 12:12:38Z on the same tree), which a
+          # re-run cannot clear and which re-prices against every merge-queue candidate.
+          # Fetch-by-sha keeps the clone depth-1. Bump PLUGINS_REF deliberately; the
+          # plugins-pin-drift workflow files the bump as an issue when plugins@main moves.
+          git init --quiet "$RUNNER_TEMP/5dive-plugins"
+          git -C "$RUNNER_TEMP/5dive-plugins" remote add origin https://github.com/5dive-ai/5dive-plugins
+          git -C "$RUNNER_TEMP/5dive-plugins" fetch --quiet --depth 1 origin "$PLUGINS_REF"
+          git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: fetch-depth is load-bearing, not hygiene. actions/checkout@v4
       # defaults to depth 1, and the harnesses below anchor "what this code did
@@ -271,6 +289,50 @@ jobs:
       - uses: actions/checkout@v4
       - name: Grade this workflow's own structure (DIVE-3315 arms, DIVE-3479 arm 99)
         run: bash tests/corpus_tier_budget_unit.sh
+      # DIVE-4452: the pin must not silently regress. This grades the WORKFLOWS,
+      # not the product, so it lives here rather than in the corpus: a reviewer who
+      # re-adds a bare `git clone` of 5dive-plugins re-opens the cross-repo red.
+      #
+      # SELECTOR: a file is in scope when it fetches the plugins TREE for grading,
+      # marked by RUNNER_TEMP/5dive-plugins. That deliberately excludes
+      # install-guard.yml (documents the install.sh tarball sites, clones nothing)
+      # and install-smoke.yml (reads the LIVE registry marketplace.json on purpose,
+      # DIVE-4202 -- a pinned manifest would grade a file no customer reads).
+      - name: No workflow may clone 5dive-plugins unpinned (DIVE-4452)
+        run: |
+          set -euo pipefail
+          fail=0
+          # Pattern built at runtime so this guard does not match its own source.
+          pat='git clone .*5dive-'"plugins"
+          bare="$(grep -rnE "$pat" .github/workflows/ || true)"
+          if [ -n "$bare" ]; then
+            echo "FAIL: unpinned 5dive-plugins clone(s):"; echo "$bare"; fail=1
+          fi
+          refs=""; seen=0
+          for f in .github/workflows/*.yml; do
+            grep -q 'RUNNER_TEMP/5dive-plugins' "$f" || continue
+            seen=$((seen + 1))
+            v="$(sed -n 's/^  PLUGINS_REF: \([0-9a-f]\{40\}\)$/\1/p' "$f")"
+            if [ -z "$v" ]; then
+              echo "FAIL: $f grades the plugins tree with no workflow-level 40-hex PLUGINS_REF"
+              fail=1; continue
+            fi
+            # shellcheck disable=SC2016  # literal needle, expansion would defeat the check
+          grep -q '"$PLUGINS_REF"' "$f" || { echo "FAIL: $f declares PLUGINS_REF but never fetches it"; fail=1; }
+            echo "  $f -> $v"
+            refs="$refs$v"$'\n'
+          done
+          if [ "$seen" -lt 2 ]; then
+            echo "FAIL: expected >=2 workflows grading the plugins tree, found $seen"; fail=1
+          fi
+          n="$(printf '%s' "$refs" | sort -u | grep -c . || true)"
+          if [ "$n" != "1" ]; then
+            echo "FAIL: pins disagree across workflows ($n distinct)"; fail=1
+          fi
+          if [ "$fail" = "0" ]; then
+            echo "OK: 5dive-plugins is pinned, consistently, everywhere it is graded."
+          fi
+          exit "$fail"
 
   changed-harnesses:
     runs-on: ubuntu-latest
@@ -295,7 +357,16 @@ jobs:
       # would leave a second git tree inside the one harness-tree-guard.sh grades.
       - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
         run: |
-          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          # DIVE-4452: PINNED, and the pin is the point. An unpinned clone made a merge
+          # in ANOTHER repo turn 5dive@main red with zero commits here (main head e2d95b3e
+          # graded SUCCESS at 11:58:57Z and FAILURE at 12:12:38Z on the same tree), which a
+          # re-run cannot clear and which re-prices against every merge-queue candidate.
+          # Fetch-by-sha keeps the clone depth-1. Bump PLUGINS_REF deliberately; the
+          # plugins-pin-drift workflow files the bump as an issue when plugins@main moves.
+          git init --quiet "$RUNNER_TEMP/5dive-plugins"
+          git -C "$RUNNER_TEMP/5dive-plugins" remote add origin https://github.com/5dive-ai/5dive-plugins
+          git -C "$RUNNER_TEMP/5dive-plugins" fetch --quiet --depth 1 origin "$PLUGINS_REF"
+          git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: full history — pinned baselines must resolve here too, and the
       # diff below needs the base commit to exist at all.
@@ -508,7 +579,16 @@ jobs:
       # would leave a second git tree inside the one harness-tree-guard.sh grades.
       - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
         run: |
-          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          # DIVE-4452: PINNED, and the pin is the point. An unpinned clone made a merge
+          # in ANOTHER repo turn 5dive@main red with zero commits here (main head e2d95b3e
+          # graded SUCCESS at 11:58:57Z and FAILURE at 12:12:38Z on the same tree), which a
+          # re-run cannot clear and which re-prices against every merge-queue candidate.
+          # Fetch-by-sha keeps the clone depth-1. Bump PLUGINS_REF deliberately; the
+          # plugins-pin-drift workflow files the bump as an issue when plugins@main moves.
+          git init --quiet "$RUNNER_TEMP/5dive-plugins"
+          git -C "$RUNNER_TEMP/5dive-plugins" remote add origin https://github.com/5dive-ai/5dive-plugins
+          git -C "$RUNNER_TEMP/5dive-plugins" fetch --quiet --depth 1 origin "$PLUGINS_REF"
+          git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
@@ -689,7 +769,16 @@ jobs:
       # would leave a second git tree inside the one harness-tree-guard.sh grades.
       - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
         run: |
-          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          # DIVE-4452: PINNED, and the pin is the point. An unpinned clone made a merge
+          # in ANOTHER repo turn 5dive@main red with zero commits here (main head e2d95b3e
+          # graded SUCCESS at 11:58:57Z and FAILURE at 12:12:38Z on the same tree), which a
+          # re-run cannot clear and which re-prices against every merge-queue candidate.
+          # Fetch-by-sha keeps the clone depth-1. Bump PLUGINS_REF deliberately; the
+          # plugins-pin-drift workflow files the bump as an issue when plugins@main moves.
+          git init --quiet "$RUNNER_TEMP/5dive-plugins"
+          git -C "$RUNNER_TEMP/5dive-plugins" remote add origin https://github.com/5dive-ai/5dive-plugins
+          git -C "$RUNNER_TEMP/5dive-plugins" fetch --quiet --depth 1 origin "$PLUGINS_REF"
+          git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
@@ -782,7 +871,16 @@ jobs:
       # would leave a second git tree inside the one harness-tree-guard.sh grades.
       - name: Fetch 5dive-plugins (the dispatcher half of the DIVE-3963 seam)
         run: |
-          git clone --depth 1 --quiet https://github.com/5dive-ai/5dive-plugins "$RUNNER_TEMP/5dive-plugins"
+          # DIVE-4452: PINNED, and the pin is the point. An unpinned clone made a merge
+          # in ANOTHER repo turn 5dive@main red with zero commits here (main head e2d95b3e
+          # graded SUCCESS at 11:58:57Z and FAILURE at 12:12:38Z on the same tree), which a
+          # re-run cannot clear and which re-prices against every merge-queue candidate.
+          # Fetch-by-sha keeps the clone depth-1. Bump PLUGINS_REF deliberately; the
+          # plugins-pin-drift workflow files the bump as an issue when plugins@main moves.
+          git init --quiet "$RUNNER_TEMP/5dive-plugins"
+          git -C "$RUNNER_TEMP/5dive-plugins" remote add origin https://github.com/5dive-ai/5dive-plugins
+          git -C "$RUNNER_TEMP/5dive-plugins" fetch --quiet --depth 1 origin "$PLUGINS_REF"
+          git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4

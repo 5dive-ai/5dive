@@ -1,0 +1,81 @@
+# DIVE-4452 — THE PIN'S ANTIDOTE TO ROT.
+#
+# Pinning the 5dive-plugins clone removed a real failure (a merge in another repo
+# turning 5dive@main red on an unchanged tree, and ejecting merge-queue candidates)
+# at the cost of a real risk: a pinned seam stops grading the LIVE contract and
+# silently ages. That trade is only correct if the bump is routine and cheap.
+#
+# This is the cheap half. Once a day it compares the pin against 5dive-plugins@main
+# and, when they differ, opens (or updates) ONE issue naming the exact two-line edit.
+# It does not open a PR and holds no push credential: the bump stays a deliberate,
+# gradeable act, which is the whole point of pinning.
+name: plugins-pin-drift
+
+on:
+  schedule:
+    # Off the hour, and off 04:47 where header-drift-window already sits.
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the pin against 5dive-plugins@main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE='5dive-plugins pin is behind main (DIVE-4452)'
+          pinned="$(sed -n 's/^  PLUGINS_REF: \([0-9a-f]\{40\}\)$/\1/p' .github/workflows/unit-tests.yml | head -1)"
+          [ -n "$pinned" ] || { echo "no PLUGINS_REF found in unit-tests.yml"; exit 1; }
+          live="$(git ls-remote https://github.com/5dive-ai/5dive-plugins refs/heads/main | cut -f1)"
+          echo "pinned=$pinned live=$live"
+
+          num="$(gh issue list --state open --limit 50 --json number,title \
+                 --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
+
+          if [ "$pinned" = "$live" ]; then
+            echo "Pin is current."
+            if [ -n "$num" ]; then
+              gh issue close "$num" --comment "Pin is current again ($pinned). Closed by plugins-pin-drift."
+            fi
+            exit 0
+          fi
+
+          behind="$(gh api "repos/5dive-ai/5dive-plugins/compare/$pinned...$live" --jq '.ahead_by' 2>/dev/null || echo '?')"
+          {
+            echo "The 5dive-plugins tree our harnesses grade against is **$behind commit(s) behind** that repo's main."
+            echo
+            echo "| | sha |"
+            echo "|---|---|"
+            echo "| pinned here | \`$pinned\` |"
+            echo "| 5dive-plugins@main | \`$live\` |"
+            echo
+            echo "**The bump is two lines.** In \`.github/workflows/unit-tests.yml\` and"
+            echo "\`.github/workflows/full-sweep.yml\`, set:"
+            echo
+            echo '```yaml'
+            echo "  PLUGINS_REF: $live"
+            echo '```'
+            echo
+            echo "Open it as a normal PR. If the DIVE-3963 Codex-channel seam has drifted, that PR"
+            echo "goes red — which is the seam being graded, on a branch, where it can be fixed or"
+            echo "reverted. That is the trade DIVE-4452 chose: a cross-repo break arrives as a"
+            echo "gradeable bump PR instead of a surprise red on main that no re-run can clear."
+            echo
+            echo "<sub>Filed automatically by \`.github/workflows/plugins-pin-drift.yml\`.</sub>"
+          } > issue-body.md
+
+          if [ -n "$num" ]; then
+            gh issue edit "$num" --body-file issue-body.md
+            echo "updated issue #$num"
+          else
+            gh issue create --title "$TITLE" --body-file issue-body.md
+          fi
