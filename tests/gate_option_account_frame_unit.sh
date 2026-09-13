@@ -35,6 +35,15 @@ JSON_MODE=0
 task_need_notify() { :; }
 cmd_send() { return 1; }
 
+# DIVE-4431: this harness seeds no org chart, so every filer here is chart-
+# unroutable — the org root's condition — and since DIVE-4431 a tier-1 gate the
+# chart cannot route is graded by the human-ask readability rule, which refuses
+# `dev3-closes-it` as an internal name. That option string IS the input under
+# test (DIVE-2212 is about a pronoun's referent between two named accounts), so
+# re-wording it would delete the thing being graded. Name a lead instead: these
+# gates are read by an agent, which is the population DIVE-2212 wrote them for.
+_gate_route_reviewer() { printf 'main'; }
+
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
