@@ -292,7 +292,8 @@ agent_rows = []
 turns_by_agent = {}
 # goal_pins[name] = {"DIVE-N", ...} — task idents named in a USER turn, inside
 # the reporting window, by the heartbeat's /goal nudge (cmd_heartbeat.sh's
-# fixed template: "/goal Task DIVE-N shows status ..."). Cross-check for the
+# templates: the legacy "/goal Task DIVE-N shows status …" and, since DIVE-4406,
+# "/goal DIVE-N — your only row this turn …"; both are matched). Cross-check for the
 # attribution below (DIVE-2058): it comes from message CONTENT inside THIS
 # window, not from the tasks table's started_at/done_at (which is what built
 # the window in the first place) and not from heartbeat.log (the subsystem
@@ -413,7 +414,15 @@ for name, meta in agents.items():
                 # e.g. a `5dive task show` paste, can contain arbitrary DIVE-N
                 # mentions with zero relation to a dispatch; a genuine nudge is
                 # always a plain string content).
-                if "shows status done or cancelled" in line and '"user"' in line:
+                # DIVE-4406 compacted the dispatch, so there are TWO phrasings
+                # in the wild and a usage window routinely spans both: the legacy
+                # "/goal Task DIVE-N shows status done or cancelled…" and the
+                # current "/goal DIVE-N — your only row this turn…". Matching only
+                # one silently zeroes per-task attribution for every transcript on
+                # the other side of the change — a detector keyed on prose must be
+                # widened WITH the prose, never swapped.
+                if '"user"' in line and ("shows status done or cancelled" in line
+                                         or "your only row this turn" in line):
                     try:
                         po = json.loads(line)
                     except Exception:
@@ -425,6 +434,7 @@ for name, meta in agents.items():
                             pcontent = pmsg.get("content")
                             if isinstance(pcontent, str):
                                 pins.update(re.findall(r"Task (DIVE-\d+) shows status done or cancelled", pcontent))
+                                pins.update(re.findall(r"/goal (DIVE-\d+)\s*\S?\s*your only row this turn", pcontent))
                 if '"usage"' not in line or '"assistant"' not in line:
                     continue
                 try:
