@@ -81,7 +81,16 @@ _SUP_T_NO_OUTPUT_DAYS="${SUPERVISOR_T_NO_OUTPUT_DAYS:-3}"
 _SUP_QUOTA_PANE_LINES="${SUPERVISOR_QUOTA_PANE_LINES:-40}"
 [[ "$_SUP_QUOTA_PANE_LINES" =~ ^[0-9]+$ ]] || _SUP_QUOTA_PANE_LINES=40
 _SUP_QUOTA_PAT="${SUPERVISOR_QUOTA_PAT:-}"
-[[ -n "$_SUP_QUOTA_PAT" ]] || _SUP_QUOTA_PAT='(api[[:space:]]+error|request[[:space:]]+rejected)[^|]{0,60}429|quota[[:space:]]+(has[[:space:]]+been[[:space:]]+)?exhausted|exhausted[[:space:]]+your[[:space:]]+(token|weekly|monthly)|hit[[:space:]]+your[[:space:]]+((monthly|weekly|daily)[[:space:]]+spend|session|usage|5[[:space:]-]?hour)[[:space:]]+limit|usage[[:space:]]+limit[[:space:]]+reached|insufficient_quota|credit[[:space:]]+balance[[:space:]]+is[[:space:]]+too[[:space:]]+low'
+[[ -n "$_SUP_QUOTA_PAT" ]] || _SUP_QUOTA_PAT='(api[[:space:]]+error|request[[:space:]]+rejected)[^|]{0,60}429|quota[[:space:]]+(has[[:space:]]+been[[:space:]]+)?exhausted|exhausted[[:space:]]+your[[:space:]]+(token|weekly|monthly)|hit[[:space:]]+your[[:space:]]+([^[:space:]]+[[:space:]]+)?((monthly|weekly|daily)[[:space:]]+spend|session|usage|5[[:space:]-]?hour)[[:space:]]+limit|usage[[:space:]]+limit[[:space:]]+reached|insufficient_quota|credit[[:space:]]+balance[[:space:]]+is[[:space:]]+too[[:space:]]+low'
+# DIVE-4401 widened the SAME arm again with one optional qualifier word between
+# `your` and the window noun. A Claude Team seat prints the possessive form
+#   `You've hit your org's monthly spend limit · ... · your session limit resets 9am (UTC)`
+# and `org's` sits exactly where the alternation expected `monthly`, so the ONE
+# line in the Team banner that carries the reset clock matched no arm at all
+# (measured 2026-09-13 04:31Z on main + olivia). The optional group is a single
+# non-space token, so it cannot bridge a clause; the arm still requires the
+# window noun followed by the literal word `limit`.
+#
 # DIVE-4206 widened the `hit your ... limit` arm from the spend-only alternation
 # to `session|usage|5-hour`. It was written when the walls in evidence all said
 # "spend", and the banner both harnesses actually print today matches NONE of the
@@ -565,22 +574,80 @@ _sup_prompt_pane() {  # <type> <user> <sess> <svc_running>
 #
 # `now` is an ARGUMENT (never read internally) so every arm is assertable at a
 # fixed clock, same contract as _sup_quota_deadline, which this calls.
+# DIVE-4401 — the banner is a SENTENCE and the pane is a fixed width, so the
+# signature and the reset clock are routinely on DIFFERENT physical lines. The
+# Claude Team wall is the case that forced this:
+#
+#   You've hit your org's monthly spend limit · ask your admin to raise it at
+#   claude.ai/admin-settings/usage · your session limit resets 9am (UTC)
+#
+# Line 1 carries the signature and no clock; line 2 carries the clock. Reading
+# the deadline off the SELECTED line alone therefore returned `unknown` for a
+# banner whose reset time was plainly on screen — measured 2026-09-13 04:31Z:
+# `agent info main` said quotaDeadline=live and `agent info olivia` said
+# `unknown` off byte-equivalent reset text, purely because the two panes wrapped
+# the same sentence differently.
+#
+# So when a selected match carries no parseable deadline of its own, look at its
+# IMMEDIATE neighbours (±_SUP_QUOTA_JOIN_LINES) for a line that _sup_quota_deadline
+# itself can read, and emit the two joined as one excerpt. Three properties keep
+# this from re-opening DIVE-3880's stale-scrollback false positive:
+#   • only a match with an UNKNOWN deadline is ever extended — a line that
+#     already names its own clock is never overridden by a neighbour's;
+#   • the neighbour must satisfy _sup_quota_deadline, which requires either
+#     `continuing automatically at <clock>` or `limit … resets <clock>` — a bare
+#     `resets 9am` elsewhere on screen cannot join;
+#   • adjacency is the wrap relationship. A refusal two screens up cannot lend
+#     its clock to a newer one.
+# The emitted excerpt is still ONE logical banner, so _sup_quota_deadline's
+# one-line invariant and the `info` side that re-parses the stored excerpt both
+# hold — and both now read the same state the tick did.
+_SUP_QUOTA_JOIN_LINES="${SUPERVISOR_QUOTA_JOIN_LINES:-2}"
+[[ "$_SUP_QUOTA_JOIN_LINES" =~ ^[0-9]+$ ]] || _SUP_QUOTA_JOIN_LINES=2
+
 _sup_quota_match() {  # <pane-text-on-stdin> [now_epoch]
   local now="${1:-}"
   [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
-  local matches
-  matches=$(grep -iE "${_SUP_QUOTA_PAT}|${_SUP_WEEKLY_QUOTA_PAT}" 2>/dev/null \
-    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160) || matches=""
-  [[ -n "$matches" ]] || return 0
-  local line st ep last="" live="" live_ep=-1
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    last="$line"
-    IFS=$'\x1f' read -r st ep <<<"$(_sup_quota_deadline "$line" "$now")"
-    if [[ "$st" == "live" && "$ep" =~ ^[0-9]+$ ]] && (( ep > live_ep )); then
-      live_ep="$ep"; live="$line"
+  # Keep the WHOLE pane, not just the matching lines: the clock we may need to
+  # borrow sits on a line that carries no signature of its own.
+  local -a pane=() ; local raw
+  while IFS= read -r raw; do
+    raw="${raw#"${raw%%[![:space:]]*}"}"; raw="${raw%"${raw##*[![:space:]]}"}"
+    pane+=("${raw:0:160}")
+  done
+  (( ${#pane[@]} )) || return 0
+
+  local i j d st ep jst jep cand last="" live="" live_ep=-1 found=0
+  for (( i = 0; i < ${#pane[@]}; i++ )); do
+    [[ -n "${pane[i]}" ]] || continue
+    grep -qiE "${_SUP_QUOTA_PAT}|${_SUP_WEEKLY_QUOTA_PAT}" <<<"${pane[i]}" 2>/dev/null || continue
+    found=1
+    cand="${pane[i]}"
+    IFS=$'\x1f' read -r st ep <<<"$(_sup_quota_deadline "$cand" "$now")"
+    if [[ "$st" == "unknown" ]]; then
+      # NEAREST first, and FORWARD before backward at equal distance: a wrapped
+      # sentence continues on the line BELOW its signature, so with two banners
+      # stacked in one window a backward-first scan hands the newer one the
+      # older one's clock. Skip a neighbour that is itself a signature — that is
+      # a separate banner, not this one's continuation.
+      for (( d = 1; d <= _SUP_QUOTA_JOIN_LINES; d++ )); do
+        for j in $(( i + d )) $(( i - d )); do
+          (( j >= 0 && j < ${#pane[@]} )) || continue
+          [[ -n "${pane[j]}" ]] || continue
+          grep -qiE "${_SUP_QUOTA_PAT}|${_SUP_WEEKLY_QUOTA_PAT}" <<<"${pane[j]}" 2>/dev/null && continue
+          IFS=$'\x1f' read -r jst jep <<<"$(_sup_quota_deadline "${pane[j]}" "$now")"
+          [[ "$jst" == "unknown" ]] && continue
+          cand="${pane[i]} · ${pane[j]}"; st="$jst"; ep="$jep"
+          break 2
+        done
+      done
     fi
-  done <<<"$matches"
+    last="$cand"
+    if [[ "$st" == "live" && "$ep" =~ ^[0-9]+$ ]] && (( ep > live_ep )); then
+      live_ep="$ep"; live="$cand"
+    fi
+  done
+  (( found )) || return 0
   printf '%s\n' "${live:-$last}"
 }
 
