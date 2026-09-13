@@ -223,6 +223,45 @@ bounced katya && ok_t "U7 an explicit null desiredState restarts" \
 #                     included, whose stopped units a restart WILL start. Not
 #                     measured on a box, so it is recorded on DIVE-4399's body and
 #                     in the changelog rather than filed as a new row.
+#   AUTOMATIC-        the same defect with NO OPERATOR IN THE LOOP AT ALL. Not a
+#   RESIDUAL          softer case than RESIDUAL, a harder one: the fan-out at
+#                     least starts from a command a person typed, and this does
+#                     not. Filed as its own row (DIVE-4409), not fixed here.
+#
+# THIS BUCKET EXISTS BECAUSE ONE VERDICT ABOVE WAS FALSE — in the direction that
+# says a path is safe, which is the worst direction. `src/cmd_heartbeat.sh` was
+# cleared CANNOT-RESURRECT on the two sites that fit that wording (spend-cap probe
+# :6425, usage-limit heal :6726). It has a THIRD, `_hb_wake` at :3802-3807:
+#
+#     if ! systemctl is-active --quiet "5dive-agent@${name}.service"; then
+#       _sc_err=$(systemctl start "5dive-agent@${name}.service" 2>&1 >/dev/null) ...
+#
+# which starts the unit PRECISELY BECAUSE it is not active — the exact inverse of
+# the clearance. The dispatch loop that reaches it (:6310 over `.agents | keys[]`,
+# calling `_hb_wake` at :6868) reads no desiredState; `grep -n desiredState
+# src/cmd_heartbeat.sh` returns three hits, :5859/:5912 in the poller-liveness
+# sweep and :6244 a log string, none in the dispatch path. And desiredState is
+# still operator intent here: auto-sleep at :386 calls a bare `systemctl stop` and
+# writes no field, only `5dive agent stop` writes it (cmd_agent_runtime.sh:51).
+# So a parked agent holding a due todo is started by the TICK — every 15 minutes,
+# not nightly. See DIVE-4409.
+#
+# A FALSE CLEAR IS WORSE THAN THE MISSED FILE THIS ROW WAS FILED OVER, and worse
+# once it is pinned: a filter leaves a file unseen and the tell is a suspiciously
+# short list, but a wrong verdict leaves it seen, named and written down as
+# harmless, so the next reader greps the inventory, finds it triaged, and stops —
+# and A1 then re-asserts that in core CI on every PR, where it reads as coverage.
+# The generalisable defect: A PER-FILE VERDICT IS A PER-CALL-SITE FACT WEARING A
+# PER-FILE LABEL. Cheap discriminator whenever the claim is "cannot raise a
+# stopped unit": grep the file for `is-active` and read EVERY hit.
+#
+# `src/cmd_doctor.sh` KEEPS CANNOT-RESURRECT, re-derived that way rather than
+# re-trusted: its only agent-unit restart is :1588, gated on a non-empty `cpid`
+# from `doctor_seat_claude_pid` (:1017-1028), which reads the unit's own
+# cgroup.procs via `systemctl show -p ControlGroup` and returns empty when there
+# is no cgroup — a stopped unit has none, so the restart is unreachable. Its other
+# `systemctl restart` lines are `$svc` (telegram poller) and `shelld`, not agent
+# units.
 #
 # A1 asserts the inventory is EXACT in both directions. A new restart path
 # anywhere in the repo turns it red — because what DIVE-4033 shipped was not a
@@ -231,7 +270,7 @@ declare -A RESTART_PATHS=(
   [5dive-refresh-plugins.sh]=GUARDED
   [src/cmd_selfupdate.sh]=GUARDED
   [src/cmd_agent_runtime.sh]=GUARDED
-  [src/cmd_heartbeat.sh]=CANNOT-RESURRECT
+  [src/cmd_heartbeat.sh]=AUTOMATIC-RESIDUAL
   [src/cmd_doctor.sh]=CANNOT-RESURRECT
   [src/cmd_agent_lifecycle.sh]=OPERATOR-VERB
   [src/cmd_agent_config.sh]=OPERATOR-VERB
