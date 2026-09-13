@@ -193,6 +193,72 @@ _task_agent_gate_pred() { # <agent>
     AND CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) < 2"
 }
 
+# ── DIVE-4424 — THE HOLD, RENDERED WHERE THE PERSON IS LOOKING ───────────────
+#
+# `task inbox`, the /inbox digest and the dashboard all answer "what needs YOU".
+# A tier-2 gate inside its lead-review hold is not that yet: the lead has it, and
+# the ping the human would normally get is deliberately not sent. Until this row
+# all three listed it identically to a live one, so the phone showed a "needs
+# you" for a gate nobody had rung about — see the block in src/task/notify.sh
+# that owns the hold for the full argument and the rejected alternative (hiding).
+#
+# THE RULE IS NOT RESTATED HERE. It is bash — it reads a sealed constant, a kill
+# switch, a clamped override and two urgency skips — and restating it in SQL is
+# the two-copies problem the predicates at the top of this file exist to refuse.
+# So SQL does the only thing it can do honestly: FILTER ON A SET OF IDENTS that
+# bash has already decided. The SQL prefilter below is a deliberate SUPERSET
+# (open, human-held, never pinged) whose only job is to bound how many idents the
+# bash predicate is asked about; every row it lets through is still decided by
+# the predicate, so widening or narrowing it cannot change a verdict.
+#
+# NOT MEMOISED ACROSS CALLS ON PURPOSE. The hold is a function of `now`; a cached
+# verdict is a gate that reads as the lead's after it became the human's.
+
+# Open human gates currently inside their lead-review hold, one per line:
+#   <ident><US><lead><US><hh:mm><US><iso>
+# $1 = the WHERE that already restricts to the human-held open gates.
+_task_gate_lead_hold_rows() {
+  local where="$1" cand line ident held
+  cand=$(db "SELECT ident FROM tasks
+              WHERE ${where}
+                AND gate_pinged_at IS NULL
+                AND CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) >= 2;" 2>/dev/null || printf '')
+  while IFS= read -r ident; do
+    [[ -n "$ident" ]] || continue
+    held=$(_task_gate_in_lead_hold "$ident") || held=""
+    [[ -n "$held" ]] || continue
+    printf '%s\x1f%s\n' "$ident" "$held"
+  done <<<"$cand"
+}
+
+# The idents of $1's rows as a SQL IN-list ("'A','B'"), empty when there are none.
+# Quoted through sqlq like every other literal that reaches a query here.
+_task_gate_hold_inlist() {
+  local rows="$1" line ident out=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    ident="${line%%$'\x1f'*}"
+    out="${out}${out:+,}$(sqlq "$ident")"
+  done <<<"$rows"
+  printf '%s' "$out"
+}
+
+# The hold fields for one ident out of a `_task_gate_lead_hold_rows` block.
+# $1 = rows, $2 = ident, $3 = which field (lead|hhmm|iso). Empty when not held.
+_task_gate_hold_field() {
+  local rows="$1" want="$2" field="$3" line id lead hm iso rest
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    id="${line%%$'\x1f'*}";   rest="${line#*$'\x1f'}"
+    lead="${rest%%$'\x1f'*}"; rest="${rest#*$'\x1f'}"
+    hm="${rest%%$'\x1f'*}";   iso="${rest#*$'\x1f'}"
+    [[ "$id" == "$want" ]] || continue
+    case "$field" in lead) printf '%s' "$lead" ;; hhmm) printf '%s' "$hm" ;; iso) printf '%s' "$iso" ;; esac
+    return 0
+  done <<<"$rows"
+  return 0
+}
+
 cmd_task_queue() {
   tasks_db_init
   local who="" json=0
@@ -210,6 +276,23 @@ cmd_task_queue() {
   done
   if [[ -z "$who" ]]; then task_actor_claim ""; who="$ACTOR_BOARD"; fi
   local pred; pred=$(_task_agent_gate_pred "$who")
+  # DIVE-4424: a tier-2 gate inside its lead-review hold IS queued to a lead —
+  # that is the whole mechanism — but `_task_agent_gate_pred` stops at tier < 2,
+  # so the seat the hold was handed to could not see it. It was told about the
+  # review in no listing at all: the human's inbox showed it (wrongly, as theirs)
+  # and the lead's showed nothing. Added as a DISJUNCT on an ident set rather
+  # than by relaxing the tier clause — the tier bound is what keeps a hard gate
+  # out of an agent queue once its ping has fired, and only the hold suspends it.
+  local _hold_rows _hold_mine=""
+  _hold_rows=$(_task_gate_lead_hold_rows "$(_task_gate_open_pred) AND ( $(_task_human_gate_pred) )")
+  local _hl _hi
+  while IFS= read -r _hl; do
+    [[ -n "$_hl" ]] || continue
+    _hi="${_hl%%$'\x1f'*}"
+    [[ "$(_task_gate_hold_field "$_hl" "$_hi" lead)" == "$who" ]] || continue
+    _hold_mine="${_hold_mine}${_hold_mine:+,}$(sqlq "$_hi")"
+  done <<<"$_hold_rows"
+  [[ -z "$_hold_mine" ]] || pred="( ${pred} ) OR ( $(_task_gate_open_pred) AND ident IN (${_hold_mine}) )"
 
   if (( json )); then
     local rows
@@ -337,8 +420,18 @@ cmd_task_inbox() {
   local human_where="${open_where} AND ${human_pred}"
   local where="$human_where"
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
+  # DIVE-4424: the same rows, split by who is holding them RIGHT NOW. `where`
+  # stays the unchanged human predicate so nothing is dropped from this view;
+  # what changes is that the held ones are counted, ordered and labelled apart.
+  local hold_rows hold_in live_where="$where" held_where=""
+  hold_rows=$(_task_gate_lead_hold_rows "$where")
+  hold_in=$(_task_gate_hold_inlist "$hold_rows")
+  if [[ -n "$hold_in" ]]; then
+    live_where="${where} AND ident NOT IN (${hold_in})"
+    held_where="${where} AND ident IN (${hold_in})"
+  fi
   if (( send )); then
-    _task_inbox_send "$channel_proof" "$where" "$order"
+    _task_inbox_send "$channel_proof" "$where" "$order" "$hold_in" "$hold_rows"
     return
   fi
   [[ -z "$channel_proof" ]] || fail "$E_USAGE" "--channel-proof only applies with --send"
@@ -348,6 +441,9 @@ cmd_task_inbox() {
   # been burned by before. It is a count and a pointer, never the asks themselves.
   local routed_n; routed_n=$(db "SELECT COUNT(*) FROM tasks WHERE ${open_where} AND NOT ( ${human_pred} );")
   routed_n="${routed_n:-0}"
+  local held_n=0
+  [[ -z "$held_where" ]] || held_n=$(db "SELECT COUNT(*) FROM tasks WHERE ${held_where};")
+  held_n="${held_n:-0}"
   if (( JSON_MODE )); then
     local rows
     # DIVE-3224: `tier` is exported so a CONSUMER never has to re-derive the
@@ -364,16 +460,79 @@ cmd_task_inbox() {
     # exact defect this line closes.
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, tier, precedent_ref, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
+    # DIVE-4424 — MARKED IN PLACE, AND `data.inbox` STILL MEANS WHAT IT MEANT.
+    #
+    # The tempting shape is to lift the held rows OUT of `inbox` into their own
+    # array: every badge that counts `data.inbox|length` would then be fixed with
+    # no consumer touched. It was built that way first and it is wrong, for the
+    # reason this row rejects hiding one layer up — `inbox` is the answer to "what
+    # human gates are open", three harnesses in this repo assert that a tier-2
+    # gate appears there the moment it is filed, and silently re-scoping an
+    # exported array is how a consumer starts under-reporting without ever seeing
+    # an error. A gate that vanished for 30 minutes and came back is the phone
+    # complaint again, aimed at a dashboard.
+    #
+    # So the row keeps its place and GAINS the verdict: `lead_hold:{lead,until}`,
+    # absent on a live gate. `needs_you` is the count a badge should read — the
+    # live subset, computed here rather than by a consumer re-deriving the rule
+    # (the forbidden second copy the predicates at the top of this file exist to
+    # prevent). `lead_hold` at the top level is the held subset for a renderer
+    # that wants only those.
+    local _hl _hi _hlead _hiso _hjson="[]"
+    while IFS= read -r _hl; do
+      [[ -n "$_hl" ]] || continue
+      _hi="${_hl%%$'\x1f'*}"
+      _hlead=$(_task_gate_hold_field "$_hl" "$_hi" lead)
+      _hiso=$(_task_gate_hold_field "$_hl" "$_hi" iso)
+      _hjson=$(jq -cn --argjson a "$_hjson" --arg i "$_hi" --arg l "$_hlead" --arg u "$_hiso" \
+        '$a + [{ident:$i, lead:(($l|select(length>0)) // null), until:$u}]' 2>/dev/null) || _hjson="$_hjson"
+    done <<<"$hold_rows"
+    # Left-join the verdict onto each row by ident. `INDEX` keys the hold side
+    # once rather than rescanning it per row, and a row with no match keeps its
+    # fields untouched — an unmatched row is a live gate, never a dropped one.
+    rows=$(printf '%s' "$rows" | jq -c --argjson h "$_hjson" \
+      '(INDEX($h[]; .ident)) as $m
+       | map(. as $r | if $m[$r.ident] then $r + {lead_hold: ($m[$r.ident] | del(.ident))} else $r end)' 2>/dev/null) \
+      || rows=$(printf '%s' "$rows")
+    [[ -n "$rows" ]] || rows="[]"
     # stdin, not --argjson — same ARG_MAX guard as `task ls`. (DIVE-222)
     # `routed_elsewhere` is additive under data{}; every existing consumer reads
     # data.inbox and is unaffected.
-    printf '%s' "$rows" | jq -c --argjson r "$routed_n" '{ok:true, data:{inbox:., routed_elsewhere:$r}}'
+    printf '%s' "$rows" | jq -c --argjson r "$routed_n" \
+      '{ok:true, data:{inbox:., routed_elsewhere:$r,
+                       needs_you:(map(select(has("lead_hold")|not))|length),
+                       lead_hold:(map(select(has("lead_hold"))))}}'
   else
-    local cnt; cnt=$(db "SELECT COUNT(*) FROM tasks WHERE ${where};")
+    local cnt; cnt=$(db "SELECT COUNT(*) FROM tasks WHERE ${live_where};")
     if [[ "$cnt" == "0" ]]; then
-      echo "inbox empty — nothing waiting on a human."
+      if (( held_n > 0 )); then
+        echo "nothing needs you right now."
+      else
+        echo "inbox empty — nothing waiting on a human."
+      fi
     else
-      dbfmt -box "SELECT ident, priority, need_type, COALESCE(assignee,'-') AS owner, COALESCE(recommend,'-') AS recommend, COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'-') AS precedent, ask FROM tasks WHERE ${where} ${order};"
+      dbfmt -box "SELECT ident, priority, need_type, COALESCE(assignee,'-') AS owner, COALESCE(recommend,'-') AS recommend, COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'-') AS precedent, ask FROM tasks WHERE ${live_where} ${order};"
+    fi
+    # AFTER the live ones, and never inside that box — the ordering IS half the
+    # message. `task answer` on one of these still works and is unchanged: the
+    # hold decides who reads it first, never who may clear it.
+    if (( held_n > 0 )); then
+      printf '\n%s gate(s) with a lead for review — not yours yet:\n' "$held_n"
+      local _hl _hi _hlead _hhm
+      while IFS= read -r _hl; do
+        [[ -n "$_hl" ]] || continue
+        _hi="${_hl%%$'\x1f'*}"
+        _hlead=$(_task_gate_hold_field "$_hl" "$_hi" lead)
+        _hhm=$(_task_gate_hold_field "$_hl" "$_hi" hhmm)
+        # The same columns the box above carries for a live gate — owner included.
+        # A held gate rendered with less than a live one is a second, thinner view
+        # of the same row, and the thin one is where a reader stops trusting it.
+        printf '  [%s] %s (%s) — %s — %s\n' "$_hi" \
+          "$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident=$(sqlq "$_hi");" 2>/dev/null)" \
+          "$(db "SELECT COALESCE(assignee,'-') FROM tasks WHERE ident=$(sqlq "$_hi");" 2>/dev/null)" \
+          "$(db "SELECT replace(COALESCE(ask,''),x'0a',' ') FROM tasks WHERE ident=$(sqlq "$_hi");" 2>/dev/null)" \
+          "$(_task_gate_lead_hold_line "$_hlead" "$_hhm")"
+      done <<<"$hold_rows"
     fi
     if (( routed_n > 0 )); then
       echo "(${routed_n} more open gate(s) routed to an agent seat — not yours to answer: 5dive task ls --gated=agent)"
@@ -393,7 +552,16 @@ cmd_task_inbox() {
 # verb (passing the requesting chat as --channel-proof) instead of composing
 # tier-2 buttons itself.
 _task_inbox_send() {
-  local channel_proof="$1" where="$2" order="$3"
+  local channel_proof="$1" where="$2" order="$3" hold_in="${4:-}" hold_rows="${5:-}"
+  # DIVE-4424: the digest is the surface lodar actually reported — /inbox on the
+  # phone listed a held gate exactly like a live one. It keeps listing it (the
+  # human asked for the list, and marking beats hiding), but it says whose it is,
+  # and it goes to the BOTTOM so the stack still opens with what needs him. The
+  # buttons stay live on a held gate: `task answer` by the human was never what
+  # the hold suspends.
+  if [[ -n "$hold_in" ]]; then
+    order="ORDER BY CASE WHEN ident IN (${hold_in}) THEN 1 ELSE 0 END, ${order#ORDER BY }"
+  fi
   require_root "task inbox --send"
   # DIVE-1506: fail closed — an /inbox digest may reach the paired human ONLY from the prod DB.
   # A fixture/e2e DB (isolated TASKS_DB) must never DM real gates; refuse loudly, don't send.
@@ -466,6 +634,21 @@ _task_inbox_send() {
     # rather than on what was DELIVERED — so without this the digest re-send of a
     # decision gate reaches the human with neither its options nor its ⭐.
     gate_text_plain="$gate_text"
+    # The SAME line the box and the JSON carry, appended rather than re-worded —
+    # three wordings for one state is how a reader learns to distrust all three.
+    # It goes on BOTH variants, and that is the whole point of resolving DIVE-4412
+    # and this row together: the keyboard-rejection fallback must not be the one
+    # delivery path where a held gate still reaches the human reading "needs you".
+    if [[ -n "$hold_rows" ]]; then
+      local _hlead _hhm _hline
+      _hlead=$(_task_gate_hold_field "$hold_rows" "$ident" lead)
+      _hhm=$(_task_gate_hold_field "$hold_rows" "$ident" hhmm)
+      if [[ -n "$_hhm" ]]; then
+        _hline=$(_task_gate_lead_hold_line "$_hlead" "$_hhm")
+        gate_text+=$'\n'"$_hline"
+        gate_text_plain+=$'\n'"$_hline"
+      fi
+    fi
     # DIVE-3661 iteration 3: only when the recommendation is not already readable
     # off a button (decision's ⭐ first button carries it verbatim; approval/secret
     # buttons are generic verbs, so there this line is the only copy). Predicate =

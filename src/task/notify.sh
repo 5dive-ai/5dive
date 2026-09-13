@@ -2257,6 +2257,106 @@ _GATE_UNDO_WINDOW_SECS_HUMAN_ONLY=840
 # clamp below).
 _GATE_LEAD_REVIEW_HOLD_SECS=1800
 
+# ── DIVE-4424 — THE HOLD IS A STATE OF THE ROW, AND EVERY SURFACE MUST SAY SO ──
+#
+# lodar, Telegram 2026-09-13, running 0.36.0 on exact-swallow: "you hold a human
+# gate for 30 minutes for review before pinging a human but it still activates
+# human inbox in telegram. is it a bug or feature". Shipped as designed, and the
+# design is wrong for the phone. The block above is explicit that ONLY the push is
+# held — the row is live in `task inbox`, in the /inbox digest and on the
+# dashboard from the instant it is filed. On a phone a "needs you" line is
+# indistinguishable from a ping, so the human is invited to answer a gate the lead
+# is about to clear: the false-gate cost the hold exists to remove, re-entering
+# through the listing instead of the buzz.
+#
+# FIXED BY MARKING, NOT BY HIDING. The alternative — drop the gate from the
+# human's surfaces until the hold ends — was rejected: a human who opens the inbox,
+# sees nothing, and is then pinged for a gate filed ten minutes earlier has been
+# lied to about the queue. Marking costs one line and is honest.
+#
+# THE HOLD HAS NO COLUMN. It is DERIVED — tier 2, never pinged, still unanswered,
+# younger than the window, and none of the skips. Until this row only the
+# deliverer knew how to compute it, so a renderer that wanted to say "with the
+# lead" would have had to restate the rule: the two-copies-that-disagree shape
+# DIVE-3171 names, and the one the inbox predicates one file over are built to
+# avoid. So the three functions below are THE copy, and both the deliverer and
+# every renderer call them.
+#
+# NOTE THE DIRECTION OF EVERY FALLBACK. An unreadable age, a missing lead, an
+# unresolvable window: all read as NOT HELD, i.e. the row renders as the human's,
+# which is what it becomes anyway when the hold expires. Unreadable state may only
+# ever move a gate TOWARD the person — the same invariant the deliverer keeps, for
+# the same reason.
+
+# The lead a tier-2 gate's ping is queued for while it is held. Empty when none
+# resolves, which the deliverer treats as "the lead declined to act" and the
+# renderers as "your lead" — both fail toward the human.
+_task_gate_lead_reviewer() {
+  local ident="$1" _hf _lead=""
+  _hf=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  _lead=$(_gate_route_reviewer "$_hf" 2>/dev/null) || _lead=""
+  [[ -n "$_lead" ]] || { _lead=$(_task_resolve_gate_notifier 2>/dev/null) || _lead=""; }
+  printf '%s' "$_lead"
+}
+
+# Seconds this gate's phone ping is held for LEAD REVIEW; 0 when it is not a lead
+# hold at all. Delegates to the window resolver above rather than re-deriving:
+# for a tier-2 row that function IS the lead hold (it swaps the ceiling for
+# _GATE_LEAD_REVIEW_HOLD_SECS and then applies the kill switch, the clamped env
+# override and both urgency skips), so a change to any of those reaches the
+# renderers in the same commit. Tier 0/1 return 0 — their DIVE-4154 window is a
+# filer's undo window, not a lead review, and nobody's phone is waiting on it.
+_task_gate_lead_hold_secs() {
+  local ident="$1" _gtier
+  _gtier=$(db "SELECT COALESCE(NULLIF(tier,''),'2') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  [[ "$_gtier" == "2" ]] || { printf '0'; return 0; }
+  _task_gate_undo_window_secs "$ident"
+}
+
+# THE PREDICATE. Prints "<lead>\x1f<hh:mm>\x1f<iso>" — the holder, the local
+# wall-clock time the hold ends, and the same instant in UTC for a machine — when
+# this gate is inside its lead-review hold. Prints NOTHING otherwise, so a caller
+# can branch on emptiness alone.
+#
+# `gate_pinged_at IS NULL` is the receipt, not a flag: the deliverer stamps it
+# when the ping actually goes out, so a hold whose child died with its box reads
+# as still-held here and expires on the clock, exactly as the heartbeat's re-nag
+# clause assumes one layer up.
+_task_gate_in_lead_hold() {
+  local ident="$1"
+  [[ -n "$ident" ]] || return 0
+  local secs; secs=$(_task_gate_lead_hold_secs "$ident")
+  [[ "$secs" =~ ^[0-9]+$ ]] && (( secs > 0 )) || return 0
+  # One query for the whole row-shaped half of the rule. An age we cannot read
+  # comes back empty and falls out below — not held.
+  local row
+  row=$(db "SELECT CAST((julianday('now')-julianday(need_asked_at))*86400 AS INT)
+                 ||x'1f'||strftime('%H:%M', need_asked_at, '+${secs} seconds', 'localtime')
+                 ||x'1f'||strftime('%Y-%m-%dT%H:%M:%SZ', need_asked_at, '+${secs} seconds')
+              FROM tasks
+             WHERE ident=$(sqlq "$ident")
+               AND need_type IS NOT NULL
+               AND need_answered_at IS NULL
+               AND status NOT IN ('done','cancelled')
+               AND need_asked_at IS NOT NULL
+               AND gate_pinged_at IS NULL;" 2>/dev/null || printf '')
+  [[ -n "$row" ]] || return 0
+  local age until_hm until_iso rest
+  age="${row%%$'\x1f'*}"; rest="${row#*$'\x1f'}"
+  until_hm="${rest%%$'\x1f'*}"; until_iso="${rest#*$'\x1f'}"
+  [[ "$age" =~ ^[0-9]+$ ]] || return 0
+  (( age < secs )) || return 0
+  [[ -n "$until_hm" && -n "$until_iso" ]] || return 0
+  printf '%s\x1f%s\x1f%s' "$(_task_gate_lead_reviewer "$ident")" "$until_hm" "$until_iso"
+}
+
+# The one line every human-facing renderer prints for a held gate, so the box,
+# the JSON note and the Telegram digest cannot drift into three wordings.
+# $1 = lead (may be empty), $2 = hh:mm.
+_task_gate_lead_hold_line() {
+  printf '⏳ with %s until %s — yours if unanswered' "${1:-your lead}" "$2"
+}
+
 # Seconds to hold this gate's phone ping. 0 = ping now.
 # Reads the row's priority, so it must be called AFTER the gate UPDATE commits —
 # which is the case: task_need_notify runs after cmd_task_need's write.
@@ -2459,9 +2559,9 @@ _task_need_notify_deliver() {
     # seat's whole window). Best effort by construction: a gate whose lead cannot
     # be resolved is held and pinged on the clock exactly as if the lead had
     # declined to act, which is the fail-open direction this whole mechanism keeps.
-    local _hf; _hf=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
-    _hold_lead=$(_gate_route_reviewer "$_hf" 2>/dev/null) || _hold_lead=""
-    [[ -n "$_hold_lead" ]] || _hold_lead=$(_task_resolve_gate_notifier 2>/dev/null) || _hold_lead=""
+    # DIVE-4424: ONE resolution, called — the renderers name the same lead this
+    # queues the review to, and cannot drift from it.
+    _hold_lead=$(_task_gate_lead_reviewer "$ident")
   fi
   local _hold_why="DIVE-4154 undo window"
   [[ "$_hold_chat" == "hold:lead-review" ]] && _hold_why="DIVE-4365 lead review"
