@@ -56,6 +56,17 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   source "$SRC/$f"
 done
 
+# DIVE-4430: `cmd_heartbeat_tick` now consults the pacing floor before it
+# dispatches, so the floor is part of this harness's world whether or not the
+# harness is about it. It is loaded and pinned OPEN (0% of the week used) rather
+# than left out: unloaded, the tick logs a packaging defect and grades nothing,
+# and this file would then be testing a tick with a disabled guard. Pinned open,
+# every arm below asks exactly the question it asked before.
+# shellcheck source=/dev/null
+source "$SRC/task/grader_pool.sh"
+_pace_open_meter(){ printf '{"agents":[{"account":"acct-dev","sevenDayPct":0,"sevenDayResetsAt":99999999999}]}'; }
+_PACE_USAGE_CMD=_pace_open_meter
+
 STATE_DIR="$TMP"
 TASKS_DIR="$STATE_DIR/tasks"
 TASKS_DB="$TASKS_DIR/tasks.db"

@@ -879,6 +879,83 @@ PY
   fi
 }
 
+# DIVE-4413: bind an access.json-schema seat (claude/codex/grok/pi/antigravity)
+# to a home chat — and, optionally, to a forum TOPIC inside it.
+#
+# `telegram.home-channel` was accepted for every channel-capable type and passed
+# only to the hermes/openclaw installers, so on the 19 paired seats a customer
+# measured it every set reported success and changed nothing. Accept-and-drop is
+# the worst of the three possible behaviours: an operator who sets it believes
+# the gate destination is now bound and stops looking.
+#
+# There is no `homeChannel` field in this schema to write, and inventing one
+# would be a second source of truth the notify path does not read. The lever
+# that exists is the one _task_send_owner already walks, so that is what gets
+# written:
+#   groups[<chat>].message_thread_id   read by _task_send_owner_groups (notify.sh)
+#   last-human-chat.json               the pointer branch, consulted FIRST
+# Both, because either alone leaves the two disagreeing — and a stale pointer
+# beating a fresh group binding is the exact misroute measured on teal-fox.
+#
+# Existing keys on the group entry are preserved (an operator's requireMention /
+# per-group allowFrom must survive a home-channel set), and a group that was not
+# there before is created with the plugin's own defaults. This WIDENS the
+# audience by design — it is an operator declaring a destination, not a gate
+# rail resolving one — which is why it lives behind an explicit `agent config`
+# call and never behind an automatic path.
+seed_telegram_home_channel() {
+  local name="$1" type="$2" chat="$3" thread="${4:-}"
+  local user="agent-${name}"
+  local state_dir
+  state_dir=$(_tg_access_state_dir "$user" "$type") || return 1
+
+  step "Binding telegram home channel for $user (chat ${chat}${thread:+, topic ${thread}})"
+  if ! sudo -u "$user" env CHAT="$chat" THREAD="$thread" STATE="$state_dir" python3 - <<'HOMECH' >&2; then
+import json, os, tempfile
+
+state = os.environ['STATE']
+chat = os.environ['CHAT']
+thread = os.environ['THREAD'] or None
+
+os.makedirs(state, mode=0o700, exist_ok=True)
+access_path = os.path.join(state, 'access.json')
+
+try:
+    with open(access_path) as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {"dmPolicy": "pairing", "allowFrom": [], "groups": {}, "pending": {}}
+
+groups = data.get('groups')
+if not isinstance(groups, dict):
+    groups = {}
+entry = groups.get(chat)
+if not isinstance(entry, dict):
+    entry = {"allowFrom": [], "requireMention": False}
+entry['message_thread_id'] = thread
+groups[chat] = entry
+data['groups'] = groups
+
+
+def _atomic(path, payload):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.tg.', suffix='.tmp')
+    with os.fdopen(fd, 'w') as f:
+        json.dump(payload, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+_atomic(access_path, data)
+# The pointer is consulted BEFORE the groups fan-out, so leaving it on an older
+# chat would make this binding inert on exactly the path it is meant to fix.
+_atomic(os.path.join(state, 'last-human-chat.json'),
+        {"chatId": chat, "messageThreadId": thread})
+print(f"Bound home channel chat={chat} thread={thread} in {access_path} (+ last-human-chat.json)")
+HOMECH
+    fail "$E_GENERIC" "telegram home-channel bind failed for agent '$name'"
+  fi
+}
+
 # Back-compat shim so callers that still reference the telegram-specific name
 # keep working. New code should call install_channel_plugin_for_agent directly.
 install_telegram_plugin_for_agent() {

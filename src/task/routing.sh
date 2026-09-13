@@ -964,6 +964,30 @@ _task_default_verifier() {
 # Excluding the filer is what makes re-escalation free: when the LEAD files (or
 # re-files) the same gate, they resolve to no distinct reviewer, so it goes to
 # the human — exactly "only escalate to the human when the lead re-escalates".
+# DIVE-4415: THE ONE PLACE THE BUILDER-GATE ROUTING DEFAULT LIVES.
+#
+# The default was spelled `"${v:-off}"` at two independent call sites — the
+# `task routing` status printer and the routing block in cmd_task_need — so "what
+# does an unset pref do" had two answers that agreed only by coincidence. It is
+# read here instead.
+#
+# THE DEFAULT IS STILL `off`, AND THAT IS A DECISION, not an omission. Flipping it
+# was the first cut of this fix and it reds six arms of
+# tests/gate_row_state_routing_unit.sh: DIVE-3266 deliberately keeps a ship-shaped
+# APPROVAL with no structured binding (no branch, no delivery_ref) on the human
+# path, and a global flip reverses that row's decision as a side effect of fixing
+# a different class. The customer's class — a plain tier-1 `decision` — is fixed
+# one layer up instead, as a routable KIND (`_decision_route` in need.sh), which is
+# the same shape every other pref bypass added since DIVE-1243 has taken.
+#
+# Prints `on` or `off`. An unrecognised stored value reads as the default rather
+# than as `off`: a typo'd pref must not silently move who gets woken.
+_gate_routing_pref() {
+  local v=""
+  v=$(_task_pref_get gate_builder_routing 2>/dev/null) || v=""
+  case "$v" in on|off) printf '%s' "$v" ;; *) printf 'off' ;; esac
+}
+
 _gate_route_reviewer() {
   local _filer="$1" c=""
   [[ -n "$_filer" ]] || return
@@ -972,7 +996,19 @@ _gate_route_reviewer() {
     "$(_task_resolve_coordinator)"
   )
   for c in "${cands[@]}"; do
-    if [[ -n "$c" && "$c" != "$_filer" ]]; then
+    [[ -n "$c" && "$c" != "$_filer" ]] || continue
+    # DIVE-4415: skip a candidate the fleet cannot wake, the same filter
+    # `_task_verify_reviewer` has applied at every rung since DIVE-3939. This
+    # matters BECAUSE `_decision_route` now routes a plain tier-1 decision by
+    # kind: before it, a box with a dead lead simply never routed one and the
+    # human was rung at file time; after it, an unfiltered chain would park the
+    # gate on a seat that cannot answer and leave it there for the full
+    # FIVEDIVE_GATE_RENAG_AGENT_RAIL_HOURS (24h) before the re-nag escalated it.
+    # Falling through to EMPTY here restores the immediate human ping for exactly
+    # that population and changes nothing for a chart whose lead is alive.
+    # Empty is a legitimate answer: every caller already handles it as
+    # "no distinct lead, this is the human's".
+    if ! _task_verify_excluded "$c" && ! _task_verify_unwakeable "$c"; then
       printf '%s' "$c"; return
     fi
   done

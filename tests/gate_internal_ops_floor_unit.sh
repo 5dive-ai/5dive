@@ -131,7 +131,14 @@ actor_seam_as dev; cmd_task_need DIVE-306 --type=decision --from=dev \
   --ask="Which task board column order should we show, priority-first or age-first?" \
   --options="priority|age" --recommend="priority" >/dev/null 2>&1
 [[ "$(tierof DIVE-306)" == "1" ]] && ok_t "no-op: non-floored internal decision stays tier 1 (unchanged)" || bad_t "no-op tier 1" "got '$(tierof DIVE-306)'"
-[[ "$HUMAN_PINGED" == "1" ]] && ok_t "no-op: non-floored decision still pings human (pref off, unchanged)" || bad_t "no-op pings human" "HUMAN_PINGED=$HUMAN_PINGED"
+# DIVE-4415 re-base. This arm's SUBJECT is that the internal-ops FLOOR did not fire
+# on a non-floored decision; "it still pings the human" was the observable, and it
+# held only because a plain tier-1 decision was pref-gated — the customer defect
+# DIVE-4415 fixes. A floored gate would be tier 2 AND human-bound; a non-floored one
+# is now tier 1 AND lead-routed, which distinguishes the two at least as sharply.
+[[ "$HUMAN_PINGED" == "0" && -n "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-306';")" ]] \
+  && ok_t "no-op: the floor did not fire — the decision is lead-routed, not floored to the human (DIVE-4415)" \
+  || bad_t "no-op routes to the lead" "HUMAN_PINGED=$HUMAN_PINGED reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-306';")'"
 
 # --- 7: SAFETY — a plain destructive decision with NO internal-ops vocab still floors
 route_reset; seed DIVE-307

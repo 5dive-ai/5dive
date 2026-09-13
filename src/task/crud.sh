@@ -196,7 +196,7 @@ cmd_task_add() {
   # implied on purpose — see _hb_task_budget_sweep's header for why --customer
   # and priority were both rejected as implicit carve-outs.
   [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ || "$task_budget" == "none" ]] \
-    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none'. NOTE: advisory only since DIVE-3343 — nothing enforces it"
+    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none'. A bare token count is ENFORCED again since DIVE-4430 — the heartbeat parks the row past it, on the row's own dispatch-verified figure; 'none' exempts it, and the \$cost form is still advisory (it belongs to the per-agent cost guard)"
   # DIVE-1697: --branch seeds the delegated-push 'Branch: <name>' binding into the
   # body up front (same line set-branch writes/upserts later).
   if [[ -n "$branch" ]]; then
@@ -213,6 +213,37 @@ cmd_task_add() {
     valid_cron_expr "$recurring" || fail "$E_VALIDATION" "bad --recurring '$recurring' (need a 5-field cron expr, e.g. \"0 2 * * *\")"
     [[ -z "$parent" ]] || fail "$E_VALIDATION" "--recurring can't be combined with --parent (a template has no parent)"
     kind="recurring"; schedule_sql=$(sqlq "$recurring")
+  fi
+  # ── DIVE-4430: the maker<->verifier loop is BOUNDED BY DEFAULT ──────────────
+  #
+  # `max_iterations` has existed since DIVE-476 and defaulted to NULL, i.e.
+  # unbounded. The escalation it feeds already exists and is already right
+  # (src/task/delivery.sh: at the cap, stop bouncing and park the row on a
+  # human) -- it was simply unreachable on a row nobody thought to pass the flag
+  # to, which is nearly every row. Two rows in the week of 2026-09-13 ran three
+  # iterations at ~100-300M metered each.
+  #
+  # WHY 2, AND WHY THE THIRD ROUND IS THE ONE TO SPEND ON A HUMAN. An iteration
+  # is not a cheap retry: every maker<->verifier round is a COLD RELOAD of a PR
+  # the maker had closed out, so it is the most expensive shape the loop has.
+  # DIVE-4144 measured the failure it produces -- on DIVE-4113 iteration 2
+  # changed nothing, and what closed the row in iteration 3 was already sitting
+  # in the ITERATION-1 reject. A loop that has bounced twice is not converging;
+  # it is re-deriving, and a person reading the two rejects is cheaper than a
+  # third cold reload.
+  #
+  # TEMPLATES ARE UNCHANGED, deliberately. A recurring template is not a row
+  # that runs, it is a row that clones; capping the template caps nothing and
+  # would only put a number on a record that never enters a verify loop. Its
+  # INSTANCES are `kind='standard'` and inherit the default here like anything
+  # else. A row filed WITH --max-iters keeps exactly what was typed, including a
+  # value larger than the default -- this is a default, not a ceiling.
+  if [[ -z "$max_iters" && "$kind" == "standard" ]]; then
+    max_iters="${FIVE_TASK_MAX_ITERS_DEFAULT:-2}"
+    # An operator can disable the default fleet-wide, but not by MISTYPING it:
+    # a malformed override falls back to 2 rather than to unbounded, because the
+    # unbounded reading is the state this exists to end.
+    [[ "$max_iters" =~ ^[1-9][0-9]*$ ]] || max_iters=2
   fi
   # DIVE-2272: the overlap policy is a property of a TEMPLATE. Refuse it on a
   # standard row rather than storing a column nothing will ever read — a flag
@@ -666,6 +697,12 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   # positive record that the uid was measured and corroborated the claim, which is
   # not something a NULL can ever say.
   local derived_actor="$ACTOR_BOARD"
+  # DIVE-4419: a row can be born oversized too — `task add --body-file=` reads a
+  # file verbatim — so the cap belongs on the creation path as well as on the
+  # append path, or the guard is one `--body-file` away from irrelevant. No
+  # ident exists yet (the AFTER INSERT trigger stamps it), so the refusal names
+  # the title instead.
+  _task_body_size_guard "$body" "the new row (${title:0:60})" "task set-body"
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable,
@@ -1028,15 +1065,25 @@ cmd_task_show() {
     previous_gates=$(_gate_history_summary_json "$id")
     [[ -n "$subs" ]] || subs="[]"
     [[ -n "$deps" ]] || deps="[]"
-    if (( no_body )); then
-      jq -cn --argjson t "$task" --argjson s "$subs" --argjson b "$deps" \
-        --argjson g "$previous_gates" \
-        '{ok:true, data:{task:($t[0] | del(.body, .result)), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
-    else
-      jq -cn --argjson t "$task" --argjson s "$subs" --argjson b "$deps" \
-        --argjson g "$previous_gates" \
-        '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
-    fi
+    [[ -n "$task" ]] || task="[]"
+    [[ -n "$previous_gates" ]] || previous_gates="[]"
+    # DIVE-4419: the four JSON values go to jq on STDIN, never through argv.
+    # `--argjson t "$task"` handed the whole row — body + result + ask — to
+    # execve as ONE argument, and Linux caps a single argv entry at
+    # MAX_ARG_STRLEN (131072 bytes; not tunable, and not the ARG_MAX total).
+    # Past that, exec fails E2BIG, bash reports rc=126, jq prints "Argument list
+    # too long" on stderr and NO JSON envelope is emitted — so every machine
+    # consumer of this surface (the Telegram gate tap, /inbox, the dashboard row
+    # fetch, the `task answer` re-render) died on a row whose only sin was that
+    # agents had written a lot on it. Measured on row 4542: body 116,368 +
+    # result 24,432 -> rc=126 for every reader, including lodar's tap on a live
+    # tier-2 gate, until the body was archived to a file by hand.
+    # A pipe has no such cap. `jq -s` slurps the stream into one array; the
+    # printf order IS the contract — row, subtasks, blocked_by, previous_gates.
+    local _show_filter='{ok:true, data:{task:(.[0][0]), subtasks:.[1], blocked_by:.[2], previous_gates:.[3]}}'
+    (( no_body )) && _show_filter='{ok:true, data:{task:(.[0][0] | del(.body, .result)), subtasks:.[1], blocked_by:.[2], previous_gates:.[3]}}'
+    printf '%s\n%s\n%s\n%s\n' "$task" "$subs" "$deps" "$previous_gates" \
+      | jq -cs "$_show_filter"
   else
     # DIVE-3785: gate state sits IMMEDIATELY AFTER `status`, because `status`
     # alone cannot answer the question the board is most often asked — "what is

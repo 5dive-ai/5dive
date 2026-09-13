@@ -67,10 +67,15 @@ _task_usage() {
                                                 (DIVE-3826)
   wip-cap-install [--relane=<lane>]             snapshot each lane's actionable count as its
                                                 frozen WIP ceiling (deliberate, once)
-  set-budget <id> <tokens|\$cost|none>           record an ADVISORY per-row token budget. Nothing enforces it
-                                                (DIVE-3343: a row's own token spend is not measurable, so the
-                                                guard that parked on it was removed). Use the per-agent cost
-                                                budget for a control that actually halts
+  set-budget <id> <tokens|\$cost|none>           set this row's token ceiling. A bare token count is ENFORCED
+                                                (DIVE-4430): past it the heartbeat parks the row and files a
+                                                gate. The figure is the row's OWN — per-turn attribution
+                                                cross-checked against a /goal dispatch of this ident
+                                                (DIVE-2058) — so an unverified one never parks anything, which
+                                                is what DIVE-3343 removed the old guard for. Default
+                                                FIVE_TASK_BUDGET_DEFAULT (150M metered); 'none' exempts the
+                                                row; the \$cost form is still advisory and belongs to the
+                                                per-agent cost budget
   set-overlap <tmpl> <skip|spawn> [bound]       recurring template: does an open instance suppress the next slot?
 
   start <id>                                    -> in_progress
@@ -453,6 +458,11 @@ cmd_task_set_body() {
   else
     newbody="$text"
   fi
+  # DIVE-4419: the check is on the RESULT of the edit, so an append that would
+  # cross the cap is refused while a REPLACE that shrinks an oversized row still
+  # lands — that replace is the documented way out, and a guard that blocked it
+  # would trap exactly the rows it exists to prevent.
+  _task_body_size_guard "$newbody" "$ident" "task set-body"
   db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
   local new_len=${#newbody} new_lines=0
   if [[ -n "$newbody" ]]; then

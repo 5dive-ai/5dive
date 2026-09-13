@@ -176,11 +176,19 @@ n_disj=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c "^  printf '%s' \"( C
 # from the two --json projections, so the surfaces an actual person reads could not
 # state it — which is how main reported "zero pending human gates" to the founder
 # when there were ten.
+#
+# DIVE-4424 took it from five to SIX, and this arm went red exactly as designed —
+# updated deliberately, third time. The new caller is `cmd_task_queue`, which
+# needs the set of open HUMAN gates in order to ask which of them are inside a
+# lead-review hold and therefore belong, for the length of that hold, in the
+# LEAD's queue rather than only the human's. It is the same class as every site
+# above: the alternative was to restate "is a human holding this" inline in the
+# queue predicate, which is the second copy this whole file exists to forbid.
 n_call=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c '\$(_task_human_gate_pred)')
 n_def=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -c '^_task_human_gate_pred() {')
-[[ "$n_call" == "5" && "$n_def" == "1" ]] \
-  && ok_t "S2 one definition, exactly five call sites (inbox view, ls + show projections, ls gate column, show gate header)" \
-  || bad_t "S2 call sites" "definitions=$n_def calls=$n_call — expected 1 and 5"
+[[ "$n_call" == "6" && "$n_def" == "1" ]] \
+  && ok_t "S2 one definition, exactly six call sites (inbox view, ls + show projections, ls gate column, show gate header, queue lead-hold scope)" \
+  || bad_t "S2 call sites" "definitions=$n_def calls=$n_call — expected 1 and 6"
 # S3 covers BOTH projections. Counting call sites proves the helper is CALLED; only
 # this proves its value is what the SQL actually reads. The show arm is not optional
 # decoration: a third caller that resolved the helpers and then restated the rule

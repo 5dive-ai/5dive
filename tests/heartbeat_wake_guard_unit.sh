@@ -69,14 +69,14 @@ mk() {  # mk <title> <status> -> row id
       SELECT last_insert_rowid();"
 }
 
-injected_count() { grep -c '/goal Task' "$INJECTED" 2>/dev/null || true; }  # grep -c prints 0 + exits 1 on no match; || true swallows the exit without a second line
+injected_count() { grep -c '/goal DIVE-' "$INJECTED" 2>/dev/null || true; }  # grep -c prints 0 + exits 1 on no match; || true swallows the exit without a second line
 
 # --- Case 1: a real todo still injects its /goal (guard must not regress) ------
 T=$(mk "live todo" todo)
 before=$(injected_count)
 _hb_wake main false "$T" "DIVE-$T" >/dev/null 2>&1
 after=$(injected_count)
-if (( after == before + 1 )) && grep -q "/goal Task DIVE-$T " "$INJECTED"; then
+if (( after == before + 1 )) && grep -q "/goal DIVE-$T " "$INJECTED"; then
   ok_t "todo id=$T injects its /goal (guard lets actionable work through)"
 else
   bad_t "todo must still inject /goal" "before=$before after=$after id=$T"

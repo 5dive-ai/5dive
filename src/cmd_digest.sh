@@ -515,6 +515,64 @@ usage_l = [{"name": a.get("name"), "output": a.get("output", 0),
            for a in agents_sorted]
 hot = [a for a in usage_l if (a.get("fiveHourPct") or 0) >= 80]
 
+# DIVE-4430 — the PACING FLOOR's standing, per account, off the same read.
+#
+# The heartbeat holds low/medium rows and recurring beats once an account is
+# past FIVE_PACE_7D_SOFT of its week with more than FIVE_PACE_RESET_DAYS to the
+# reset. That hold is invisible on the board (the rows read `todo`) and its only
+# trace is a heartbeat log line, which is exactly the shape DIVE-3501 had to
+# surface for the tier guard. So it is surfaced here, and for the same reasons:
+# the digest is the one surface that comes TO a lead on a cadence.
+#
+# STATELESS AND BREACH-ONLY, like the held block. Nothing here counts ticks or
+# remembers yesterday: the line renders while an account is held and is absent
+# while it is not, so the engage reads as its appearance and the release as its
+# disappearance. A transition log would need state the digest deliberately does
+# not keep — the standing event trail is the heartbeat's `pace.floor` ledger row.
+#
+# Recomputed here from usage_data rather than asked of the heartbeat: same
+# numbers, same file, one read. A blind account is NEVER folded in with a
+# measured one — it is named as blind, because "no meter" and "60% used" want
+# different reactions from the reader.
+_pace_soft = int(os.environ.get("FIVE_PACE_7D_SOFT") or 60)
+_pace_hard = int(os.environ.get("FIVE_PACE_7D_HARD") or 90)
+_pace_reset_days = int(os.environ.get("FIVE_PACE_RESET_DAYS") or 3)
+_pace_now = int(time.time())
+_pace_by_acct = {}
+for a in agents:
+    acct = a.get("account") or ("@self:" + str(a.get("name")))
+    e = _pace_by_acct.setdefault(acct, {"account": acct, "seats": 0,
+                                        "sevenDayPct": None, "sevenDayResetsAt": None})
+    e["seats"] += 1
+    # max across the account's seats, the grader pool's rule: one auth window,
+    # so any seat with a reading answers for the account.
+    for k in ("sevenDayPct", "sevenDayResetsAt"):
+        v = a.get(k)
+        if isinstance(v, (int, float)):
+            e[k] = v if e[k] is None else max(e[k], v)
+pace_l = []
+for e in sorted(_pace_by_acct.values(), key=lambda x: x["account"]):
+    pct, resets = e["sevenDayPct"], e["sevenDayResetsAt"]
+    days_left = int((resets - _pace_now) // 86400) if isinstance(resets, (int, float)) and resets > _pace_now else None
+    if pct is None:
+        band, why = "blind", "no weekly reading — held at the soft floor, never read as 0%"
+    elif pct >= _pace_hard:
+        band, why = "hard", f"{int(pct)}% of the week used (hard floor {_pace_hard}%) — urgent only"
+    elif pct < _pace_soft:
+        band, why = "open", f"{int(pct)}% of the week used"
+    elif days_left is not None and days_left <= _pace_reset_days:
+        band, why = "open", (f"{int(pct)}% used but {days_left}d to the reset — the remainder "
+                             f"expires anyway, so the soft floor is off")
+    else:
+        band, why = "soft", (f"{int(pct)}% of the week used (soft floor {_pace_soft}%)"
+                             + (f", {days_left}d to the reset" if days_left is not None else
+                                ", reset time unreadable so the floor stays armed")
+                             + " — high/urgent only, recurring beats skipped")
+    pace_l.append({"account": e["account"], "seats": e["seats"], "band": band,
+                   "sevenDayPct": pct, "sevenDayResetsAt": resets,
+                   "daysToReset": days_left, "detail": why})
+paced = [p for p in pace_l if p["band"] != "open"]
+
 # Heartbeat health from the `heartbeat ls` table: flag agents that aren't fresh.
 stale = []
 try:
@@ -748,7 +806,7 @@ if as_json:
         "precedentPrefill": {"count": len(prefilled), "accepted": len(accepted),
                              "acceptanceRate": prefill_rate,
                              "byKind": {"exact": prefill_exact, "fuzzy": prefill_fuzzy}},
-        "usage": usage_l, "usageCoverage": usage_cov,
+        "usage": usage_l, "usageCoverage": usage_cov, "pace": pace_l,
         "cli": cli_block,
         "health": {"stale": stale, "hot": [h["name"] for h in hot],
                    # DIVE-1937: `hot` is only a claim about what was READ. A
@@ -956,6 +1014,16 @@ else:
                    f"runnable row(s) held by the tier guard, idle {hs.get('stalledHours')}h: {ids}. "
                    f"Exit: 5dive task assign <id> <equal-or-higher-tier agent>, or "
                    f"5dive heartbeat wake-task {hs.get('agent')} <task_id>.")
+    # DIVE-4430: beside the held block, and before "Fleet healthy" for the same
+    # reason — a paced account is not unhealthy, but a lead reading "healthy"
+    # while two thirds of the queue is deliberately not dispatching is reading
+    # the wrong sentence.
+    for pa in paced:
+        icon = "\U0001F534" if pa["band"] == "hard" else "\U0001F7E1"
+        out.append(f"{icon} Pacing floor {pa['band'].upper()} on account "
+                   f"{pa['account']} ({pa['seats']} seat(s)): {pa['detail']}. "
+                   f"Raise it for the week with FIVE_PACE_7D_SOFT / FIVE_PACE_7D_HARD, "
+                   f"or push one row through with 5dive task escalate <id>.")
     if not hot and not stale:
         # "no rate-limit pressure" is a claim about every agent. It may only be
         # made when every agent was actually read (DIVE-1937).

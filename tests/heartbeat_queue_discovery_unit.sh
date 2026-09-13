@@ -229,7 +229,7 @@ T=$(mk_task "live todo for main")
 mk_gate DIVE-Q7 main 1 '-5 minutes' 0 0 >/dev/null
 _hb_wake main false "$T" "DIVE-$T" >/dev/null 2>&1
 n="$(last_nudge)"
-[[ "$n" == *"/goal Task DIVE-$T"* && "$n" == *"ROUTED TO YOU"* ]] \
+[[ "$n" == *"/goal DIVE-$T"* && "$n" == *"ROUTED TO YOU"* ]] \
   && ok_t "nudge: the queue block is appended to the goal, not substituted for it" \
   || bad_t "nudge: goal text lost when the queue block fired" "got: [${n:0:200}]"
 

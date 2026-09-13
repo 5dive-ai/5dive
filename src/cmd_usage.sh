@@ -292,7 +292,8 @@ agent_rows = []
 turns_by_agent = {}
 # goal_pins[name] = {"DIVE-N", ...} — task idents named in a USER turn, inside
 # the reporting window, by the heartbeat's /goal nudge (cmd_heartbeat.sh's
-# fixed template: "/goal Task DIVE-N shows status ..."). Cross-check for the
+# templates: the legacy "/goal Task DIVE-N shows status …" and, since DIVE-4406,
+# "/goal DIVE-N — your only row this turn …"; both are matched). Cross-check for the
 # attribution below (DIVE-2058): it comes from message CONTENT inside THIS
 # window, not from the tasks table's started_at/done_at (which is what built
 # the window in the first place) and not from heartbeat.log (the subsystem
@@ -323,6 +324,9 @@ for name, meta in agents.items():
         unreadable.append({"name": name, "reason": why})
         continue
     five = seven = None
+    # DIVE-4430: initialised alongside the percentages so an agent whose
+    # branch sets neither still emits the field as null rather than NameError.
+    five_r = seven_r = None
     newest_codex_rate_limit_ts = -1
     for path in sessions:
         try:
@@ -399,6 +403,17 @@ for name, meta in agents.items():
                 primary = (last_rate_limits.get("primary") or {}).get("used_percent")
                 secondary = (last_rate_limits.get("secondary") or {}).get("used_percent")
                 five, seven = primary, secondary
+                # DIVE-4430: Codex rollouts carry resets_in_seconds, not an
+                # epoch. Converted here, against the snapshot's own timestamp,
+                # so both providers hand the pacing floor the same field.
+                def _cx_reset(d):
+                    r = (d or {}).get("resets_in_seconds")
+                    try:
+                        return int(last_ts) + int(r)
+                    except Exception:
+                        return None
+                five_r  = _cx_reset(last_rate_limits.get("primary"))
+                seven_r = _cx_reset(last_rate_limits.get("secondary"))
             # Session-cumulative totals cannot be truthfully assigned to one
             # task window. Keep them in the agent row rather than manufacturing
             # a task attribution at the rollout's final timestamp.
@@ -413,7 +428,15 @@ for name, meta in agents.items():
                 # e.g. a `5dive task show` paste, can contain arbitrary DIVE-N
                 # mentions with zero relation to a dispatch; a genuine nudge is
                 # always a plain string content).
-                if "shows status done or cancelled" in line and '"user"' in line:
+                # DIVE-4406 compacted the dispatch, so there are TWO phrasings
+                # in the wild and a usage window routinely spans both: the legacy
+                # "/goal Task DIVE-N shows status done or cancelled…" and the
+                # current "/goal DIVE-N — your only row this turn…". Matching only
+                # one silently zeroes per-task attribution for every transcript on
+                # the other side of the change — a detector keyed on prose must be
+                # widened WITH the prose, never swapped.
+                if '"user"' in line and ("shows status done or cancelled" in line
+                                         or "your only row this turn" in line):
                     try:
                         po = json.loads(line)
                     except Exception:
@@ -425,6 +448,7 @@ for name, meta in agents.items():
                             pcontent = pmsg.get("content")
                             if isinstance(pcontent, str):
                                 pins.update(re.findall(r"Task (DIVE-\d+) shows status done or cancelled", pcontent))
+                                pins.update(re.findall(r"/goal (DIVE-\d+)\s*\S?\s*your only row this turn", pcontent))
                 if '"usage"' not in line or '"assistant"' not in line:
                     continue
                 try:
@@ -490,6 +514,13 @@ for name, meta in agents.items():
             rl = sc.get("rate_limits") or {}
             five  = (rl.get("five_hour") or {}).get("used_percentage")
             seven = (rl.get("seven_day") or {}).get("used_percentage")
+            # DIVE-4430: the RESET epoch travels with the percentage, from the
+            # same cache read, because the pacing floor needs "how much of the
+            # week is left" and a second reader for it would be a second thing
+            # to drift. Absent/unparseable stays None — the floor treats an
+            # unreadable reset as "stay armed", never as headroom.
+            five_r  = (rl.get("five_hour") or {}).get("resets_at")
+            seven_r = (rl.get("seven_day") or {}).get("resets_at")
         except Exception:
             pass
     agent_rows.append({
@@ -497,6 +528,8 @@ for name, meta in agents.items():
         "models": models, "total": total, "quota": quota,
         "output": output, "cacheRead": cread,
         "fiveHourPct": five, "sevenDayPct": seven,
+        # DIVE-4430: epoch seconds, or null when the source had none.
+        "fiveHourResetsAt": five_r, "sevenDayResetsAt": seven_r,
     })
     turns_by_agent[name] = sorted(turns)
 

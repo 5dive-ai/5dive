@@ -112,6 +112,17 @@ run_tick() {  # run_tick <path-to-cmd_heartbeat.sh> <logfile> [scan-cap-override
   (
     # shellcheck source=/dev/null
     source "$hb"
+    # DIVE-4430: the pacing floor now sits in front of the tier guard in the same
+    # candidate loop, so it is loaded and pinned OPEN (0% of the week) for every
+    # arm. Unloaded, the tick logs a packaging defect and the floor grades
+    # nothing — this file would then be measuring a tick with a disabled guard.
+    # Pinned open, arms 1-4 ask exactly what they asked before, and the ANCHOR
+    # arm (a PINNED pre-fix cmd_heartbeat.sh, which has no floor at all) is
+    # unaffected either way.
+    # shellcheck source=/dev/null
+    source "$SRC/task/grader_pool.sh" 2>/dev/null || true
+    _pace_open_meter(){ printf '{"agents":[{"account":"acct","sevenDayPct":0,"sevenDayResetsAt":99999999999}]}'; }
+    _PACE_USAGE_CMD=_pace_open_meter
     [[ -n "$cap" ]] && _HB_PICK_SCAN="$cap"
     require_root()          { :; }
     registry_read()         { cat "$REGISTRY"; }

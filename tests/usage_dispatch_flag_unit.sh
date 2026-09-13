@@ -138,7 +138,7 @@ touch -d "@$T_DISPATCH_OLD" "$PROJDIR/old.jsonl"
 # assertions whose green came from outside the fixture set. The pin below is what
 # makes them mean something in an isolated tree.
 write_fixture "$PROJDIR/recent.jsonl" \
-  "{\"type\":\"user\",\"timestamp\":\"$(iso "$T_STOLEN")\",\"message\":{\"role\":\"user\",\"content\":\"/goal Task DIVE-90005 shows status done or cancelled...\"}}
+  "{\"type\":\"user\",\"timestamp\":\"$(iso "$T_STOLEN")\",\"message\":{\"role\":\"user\",\"content\":\"/goal DIVE-90005 — your only row this turn; read it with 5dive task show DIVE-90005.\"}}
 {\"type\":\"assistant\",\"timestamp\":\"$(iso "$T_STOLEN")\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":100000,\"output_tokens\":5000000,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}"
 
 # Re-verify immediately before the read too — a fixture that vanished between
