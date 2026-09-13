@@ -3734,25 +3734,25 @@ _hb_loop_terminal_clause() {
     # an owed clause in their own PASS verdict — so the wake DISPATCHES the seat
     # that can read the verdict, and the close stays a judgement someone makes.
     if [[ -n "$_tfv_owner" && "$_tfv_owner" == "$name" ]]; then
-      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS: a verifier grade is recorded, a delivery ref is bound, and %s names YOU (%s) as the seat that owes the merge. This wake IS that move — nothing here is owed by anyone else, so do not route it onward, do not re-grade it and do not re-deliver it. START BY READING THE PULL REQUEST STATE, because which of three things you should do is decided there and not in this note. (1) ALREADY MERGED: close the row with %s — but read the PASS verdict first, since a merged pull request is NOT automatically a finished row (a verdict routinely carries an owed clause, or the branch was one item of several), and if something is still owed, say so on the row and leave it open. (2) MERGEABLE AND GREEN: land it (%s, or %s if you hold the merge), then close. (3) A REQUIRED CHECK IS RED, or the branch conflicts: that is the MAKER%s move, not yours — bounce it with %s naming the check, and stop. Whatever you do, say which of the three it was.' \
-        "$task_ident" "'5dive task ls'" "$name" \
+      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS (%s): graded, delivery ref bound, and you own the merge. Read the pull request FIRST, then do exactly one of three and say which: (1) ALREADY MERGED -> %s, but honour any owed clause in the PASS verdict (a merged PR is not automatically a finished row) and leave it open if something is still owed; (2) mergeable and green -> %s, then close; (3) a required check is red or it conflicts -> that is the MAKER%s move: %s naming the check, and stop. Do not re-grade, re-deliver or route it onward.' \
+        "$task_ident" "$name" \
         "'5dive task done ${task_ident}'" \
-        "'5dive task merge ${task_ident}'" "'5dive task done ${task_ident}'" \
+        "'5dive task merge ${task_ident}'" \
         "$([[ -n "$maker" ]] && printf "'s (%s)" "$maker" || printf "'s")" \
         "'5dive task reject ${task_ident} --feedback=...'"
       return 0
     fi
-    printf ' NOTE — %s is GRADED AND WAITING ON A MERGE: a verifier grade is recorded and a delivery ref is bound, so the verifier has discharged their role and this is TERMINAL FOR THIS GOAL. Treat the goal as MET and stop — %s renders it as %s. The row stays OPEN on purpose and closes only when the work MERGES, because %s keeps meaning merged-to-main; the outstanding act is a MERGE owed by %s, not another pass by you. Do NOT re-grade it, re-deliver it, or close it to make the loop stop.' \
-      "$task_ident" "'5dive task ls'" "'graded->merge:${_tfv_owner}'" "'done'" "${_tfv_owner:-the maker}"
+    printf ' NOTE — %s is GRADED AND WAITING ON A MERGE owed by %s, not by you: the verifier has discharged the role, so this is TERMINAL FOR THIS GOAL. Treat the goal as MET and stop. The row stays open on purpose and closes on the merge (%s renders it as %s). Do not re-grade it, re-deliver it, or close it to make the loop stop.' \
+      "$task_ident" "${_tfv_owner:-the maker}" "'5dive task ls'" "'graded->merge:${_tfv_owner}'"
     return 0
   fi
 
   if [[ "$vfier" != "$name" ]]; then
     # MAKER variant — delivery is the second terminal state.
-    printf ' NOTE — %s carries a maker→verifier loop (verifier: %s), so your %s does NOT close it: it DELIVERS it (status stays todo and the task moves to %s to be graded). That delivery is a SECOND terminal state for THIS goal: treat the goal as MET, and stop, once %s prints a %s line under %s naming %s. Report that you delivered. Do NOT re-run %s, remove the verifier, or self-verify to force a status of done — the terminal close is %s'"'"'s, in their own session, and forcing it past them is a bypass, not progress.' \
+    printf ' NOTE — %s carries a maker->verifier loop (verifier: %s), so your %s DELIVERS rather than closes: status stays todo and the row moves to %s to be graded. Delivery is YOUR terminal state — report it and stop once %s prints %s under %s naming %s. Do NOT re-run it, drop the verifier, or self-verify to force a done; that close is %s'"'"'s to make.' \
       "$task_ident" "$vfier" "'5dive task done ${task_ident}'" "$vfier" \
       "'5dive task show ${task_ident}'" "'handoff: delivered (awaiting verifier ACK)'" \
-      "'loop spec:'" "'maker: ${name}'" "'task done'" "$vfier"
+      "'loop spec:'" "'maker: ${name}'" "$vfier"
     return 0
   fi
 
@@ -3760,13 +3760,12 @@ _hb_loop_terminal_clause() {
   # Mutually exclusive with the verifier variant below by the maker_agent test.
   if [[ -z "$maker" ]]; then
     [[ -n "$creator" && "$creator" != "$name" ]] || return 0
-    printf ' NOTE — on %s you are the verifier-of-record and NOTHING HAS BEEN HANDED TO YOU: %s is empty, so nothing has been delivered, there is no handoff to grade, and %s would refuse. That is the whole of what the loop spec settles. It does NOT settle whether this row was ROUTED to you for a decision or is simply YOURS TO DO — those two states are identical in the spec — so both terminals are listed below and you pick from the body, not from this note. IF IT WAS ROUTED TO YOU FOR A DECISION: make the call, write it and its reason onto the row (%s), then run %s and treat the goal as MET, and stop, once %s prints an %s line naming someone other than you; %s filed this row and is the default destination, pick a different agent only if the body says so. IF THE WORK IS YOURS TO DO: do it and close it with %s — that is the honest terminal for this state and nothing here is steering you off it. Not available either way: grading an empty handoff, recording a done for work nobody did, or cancelling a live row to clear your board. AND RE-READ %s AT THE MOMENT YOU ACT, because this note was written when the row had no maker and that is a live column: if the work is built and delivered BACK to you inside this same session, %s will then print %s under %s and a %s line, and your terminal action becomes the VERIFIER'"'"'s — accept with %s, or return a FAIL verdict with %s.' \
-      "$task_ident" "'maker_agent'" "'task reject'" \
-      "'5dive task set-body ${task_ident}' or a gate answer" \
+    printf ' NOTE — on %s you are verifier-of-record and NOTHING HAS BEEN DELIVERED (maker_agent is empty), so there is no handoff to grade and %s would refuse. That is all the loop spec settles; it does NOT settle whether this row was routed to you or is yours to do. IF IT WAS ROUTED TO YOU FOR A DECISION: make the call, write it and its reason onto the row, then %s and treat the goal as MET, and stop, once %s prints an %s line naming someone else (%s filed it and is the default destination). IF THE WORK IS YOURS TO DO: do it and close with %s. Not available either way: grading an empty handoff, a done for work nobody did, or cancelling a live row to clear your board. AND RE-READ %s AT THE MOMENT YOU ACT, because maker_agent is a live column: if the work is delivered back to you in this same session, it will print %s under %s and a %s line, and your terminal move becomes accept (%s) or a FAIL verdict (%s).' \
+      "$task_ident" "'task reject'" \
       "'5dive task assign ${task_ident} ${creator}'" \
       "'5dive task show ${task_ident}'" "'assignee ='" "$creator" \
       "'5dive task done ${task_ident}'" \
-      "'5dive task show ${task_ident}'" "'5dive task show ${task_ident}'" \
+      "'5dive task show ${task_ident}'" \
       "'maker: ${creator}'" "'loop spec:'" \
       "'handoff: delivered (awaiting verifier ACK)'" \
       "'5dive task done ${task_ident}'" \
@@ -3776,10 +3775,112 @@ _hb_loop_terminal_clause() {
 
   # VERIFIER variant — only once the maker has actually handed off.
   [[ "$maker" != "$name" ]] || return 0
-  printf ' NOTE — you are the VERIFIER on %s (maker: %s) and the handoff is already delivered, so you are here to GRADE the work, not to build or rescue it. A FAIL verdict is a complete, terminal outcome: if it does not pass, run %s and treat the goal as MET, and stop — the reject is a SECOND terminal state for THIS goal even though it leaves status todo, because it bounces the task back to %s (%s will show %s and a %s result line). Report that you rejected and why. Do NOT record a done you do not believe, cancel work that is verified-good, or file a human gate for something %s can fix in another pass — a correct reject IS the terminal action, and forcing a done/cancel past it writes a false record to the board.' \
+  printf ' NOTE — you are the VERIFIER on %s (maker: %s) and the handoff is delivered: GRADE it, do not build or rescue it. A FAIL verdict is complete and terminal — run %s and treat the goal as MET, and stop; it bounces the row back to %s (%s then shows %s and a %s result line). Report that you rejected and why. Do not record a done you do not believe, cancel verified-good work, or gate what %s can fix in another pass.' \
     "$task_ident" "$maker" "'5dive task reject ${task_ident} --feedback=\"FINDING: <what is wrong> FIX: <the concrete change that closes it> VERIFY: <what you will re-run>\"'" \
     "$maker" "'5dive task show ${task_ident}'" "'assignee = ${maker}'" \
     "'❌ ${name} rejected'" "$maker"
+}
+
+# DIVE-4406 — assemble the dispatch text for one wake. Pure: reads the DB and the
+# seat's transcript, writes nothing, injects nothing, so a harness can grade the
+# exact bytes a seat would receive (tests/heartbeat_dispatch_compaction_unit.sh).
+# Order is deliberate and load-bearing — see the comments on each enrichment.
+_hb_nudge_text() { # <agent> <task_id> <task_ident>
+  local name="$1" task_id="$2" task_ident="$3"
+  # Issue a /goal scoped to the one task: Claude Code loops turns until the goal
+  # evaluator sees the condition met, then auto-clears. "stop after N turns" is a
+  # soft, model-judged guard — it does NOT reliably halt a runaway loop, so the
+  # real hard cap is the deterministic stale-in_progress reaper in the tick.
+  # DIVE-4406 — THE DISPATCH CARRIES THE DELTA, NOT THE CONTRACT.
+  # Measured 2026-09-13 on origin/main: this one line was 2,120 bytes of prose
+  # that is byte-identical on every wake, re-sent ~1,100×/day fleet-wide. The
+  # invariants it used to repeat (gate vs cancel, the ask's shape, single-row
+  # scope, the self-audit, maker/verifier separation, the knowledge clause) now
+  # live in ONE surface loaded once per session — `projects-CLAUDE.md`, installed
+  # at /home/claude/projects/CLAUDE.md, section "Task lifecycle". What stays here
+  # is the row, its terminal condition, and the next action.
+  #
+  # DIVE-4406 (evidence on the row): "delivered" is named as a MAKER terminal in
+  # the BASE line, not only in the loop clause. A maker whose row is already
+  # delivered otherwise reads a terminal condition it cannot reach by its own
+  # hand and stays in-turn polling CI — measured on codex/DIVE-4404, 2026-09-13.
+  #
+  # If you are about to add a sentence here, ask whether it is true on EVERY
+  # wake. If it is, it belongs in the policy file; this line is for the delta.
+  local nudge="/goal ${task_ident} — your only row this turn; read it with '5dive task show ${task_ident}'. TERMINAL, then stop: DONE — '5dive task done ${task_ident} --result=\"<1-2 self-contained sentences; the creator and the dashboard read this field>\"' (on a row that carries a verifier the same verb DELIVERS instead, and delivered is terminal for you); GATED — '5dive task need ${task_ident} --type=decision|approval|secret|manual --ask=\"<one crisp question>\" --recommend=\"<the advised answer>\"' if it needs a human; CANCELLED — '5dive task cancel ${task_ident} --result=\"<why>\"' only if the row is genuinely impossible. Self-audit before you close. The rest of the contract (gate vs cancel, the ask's shape, single-row scope, maker/verifier separation, the knowledge clause) is in /home/claude/projects/CLAUDE.md under \"Task lifecycle\" — read it ONCE per session, it is not repeated here. Stop after 6 turns."
+
+  # DIVE-2063: a task carrying a maker→verifier loop can NEVER reach any of the
+  # three terminal states above by the MAKER's own hand. A correct 'task done'
+  # DELIVERS it (status stays todo, assignee moves to the verifier) — the rail
+  # working as designed, and the one outcome the condition refuses. So the goal
+  # re-fires every turn while the maker has nothing left to do but wait on a
+  # peer's independent session, and the only actions that WOULD satisfy it are
+  # the fail-open ones (a second 'task done', dropping the verifier). Teach the
+  # nudge a second terminal state for loop tasks specifically. See the helper for
+  # why this can't be satisfied by writing a result and walking away.
+  #
+  # DIVE-2111: and the same is true on the OTHER side of the rail. A verifier has
+  # TWO terminal actions, not one — accept ('task done', which does close) and
+  # REJECT (a FAIL verdict, which returns the task to the maker at status todo).
+  # DIVE-2063 declined the verifier half on the premise that its close is always
+  # terminal; measured false on DIVE-2090, where a correct reject left the grader
+  # with no honest exit and the goal re-fired five times. The helper now emits the
+  # role-appropriate variant, keyed on the loop spec either way.
+  local loop_clause=""
+  loop_clause=$(_hb_loop_terminal_clause "$name" "$task_id" "$task_ident") || loop_clause=""
+  [[ -n "$loop_clause" ]] && nudge="${nudge}${loop_clause}"
+
+  # DIVE-4144 (arm 2): FIRST of the enrichments, so a bounced maker reads the fix
+  # ahead of the memory citations and the gate queue. It is not literally above the
+  # /goal verb because that token must lead the line to be a slash command at all —
+  # this is as near the top as the transport allows.
+  local reject_clause=""
+  reject_clause=$(_hb_reject_fix_clause "$task_id" 2>/dev/null) || reject_clause=""
+  [[ -n "$reject_clause" ]] && nudge="${nudge}${reject_clause}"
+
+  # DIVE-4213 — the resume carryover, immediately after the reject fix and ahead
+  # of the memory citations: a seat that already has 25 minutes of work sitting
+  # in a checkout should read WHERE IT IS before it reads anything general. It is
+  # emitted regardless of `fresh`, and especially when fresh is true — a /clear
+  # is exactly the blank context this exists to fill. Best-effort like every
+  # other enrichment: a failure here must never block the nudge.
+  local carry_clause=""
+  carry_clause=$(_hb_carryover_clause "$name" "$task_id" "$task_ident" 2>/dev/null) || carry_clause=""
+  if [[ -n "$carry_clause" ]]; then
+    nudge="${nudge}${carry_clause}"
+    _hb_log "[$name] ${task_ident} is a RESUME — carryover attached (workspace + row + last message, DIVE-4213)"
+  fi
+
+  # DIVE-992: enrich the tick prompt from the shared seam. Pull the task's
+  # title+body once, then (a) cite the most relevant memory hits so the agent
+  # starts warm, and (b) if it looks knowledge-shaped, remind it to compile
+  # before closing. Both are best-effort — a failure here must never block the
+  # nudge, so each is guarded and flattened to keep the nudge a single line.
+  local task_text="" recall="" compile_hint=""
+  task_text=$(db "SELECT COALESCE(title,'') || ' ' || COALESCE(body,'') FROM tasks WHERE id=${task_id};" 2>/dev/null | tr '\n' ' ') || task_text=""
+  if [[ -n "$task_text" ]]; then
+    recall=$(_hb_recall_cite "$name" "$task_text" 3) || recall=""
+    if _hb_is_knowledge_task "$task_text"; then
+      compile_hint=" Knowledge-shaped row: the async '5dive memory consolidate' pass already distils FACTS out of your finished transcript, so do not hand-copy them. JUDGEMENT — a wiki page, a decision record, a cause, a gap analysis — is a claim only you can make: COMPILE it to the team wiki (compile-knowledge skill, or '5dive memory add --store=wiki' + an index line) before you close. The pipeline never publishes to the shared wiki."
+    fi
+  fi
+  [[ -n "$recall" ]] && nudge="${nudge} Relevant memory to check first (verify before relying; re-search with '5dive memory search'): ${recall}."
+  [[ -n "$compile_hint" ]] && nudge="${nudge}${compile_hint}"
+
+  # DIVE-3474 arm 2 — THE QUEUE IS DISCOVERED HERE. Removing the file-time a2a
+  # ping is only safe if the reviewer meets the gate on its next natural wake, so
+  # the wake itself carries the count. Without this line the change trades an
+  # interrupt for a lost decision, which is the one outcome the ticket forbids.
+  # Count-only and appended to a nudge that is already being sent: it costs no
+  # extra wake, and it names the verb rather than the rows, so a seat with a long
+  # queue does not get a wall of asks pasted into an unrelated goal.
+  local _gq=0
+  _gq=$(db "SELECT COUNT(*) FROM tasks WHERE $(_task_agent_gate_pred "$name");" 2>/dev/null) || _gq=0
+  if [[ "${_gq:-0}" =~ ^[0-9]+$ ]] && (( _gq > 0 )); then
+    nudge="${nudge} Separately: ${_gq} gate(s) are ROUTED TO YOU and waiting — filed WITHOUT interrupting you (DIVE-3474). Read them with '5dive task queue' and answer each with '5dive task answer <ident> --value=\"<choice>\"' before you finish this turn; the filer's recommendation is shown but is NOT the answer."
+  fi
+
+  printf '%s' "$nudge"
 }
 
 # Wake one agent: ensure it's running, optionally clear context, send the nudge.
@@ -3813,7 +3914,7 @@ _hb_reject_fix_clause() {
   local res; res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${task_id};" 2>/dev/null) || return 0
   local fix; fix=$(_reject_fix_block "$res") || return 0
   [[ -n "$fix" ]] || return 0
-  printf ' YOUR PREVIOUS DELIVERY WAS REJECTED AND THE VERIFIER NAMED THE FIX — read this before you touch anything else: %s. Do THAT, then deliver with a result that says what you changed; a byte-identical re-delivery is refused (DIVE-4144), because it costs the verifier a full re-read of the PR to discover nothing moved.' "$fix"
+  printf ' REJECTED — the verifier named the fix; do this before you touch anything else: %s. Then deliver with a result saying what changed: a byte-identical re-delivery is refused (DIVE-4144).' "$fix"
 }
 
 # DIVE-4213 — RESUME ATTEMPT N+1 FROM ATTEMPT N.
@@ -4108,82 +4209,10 @@ _hb_wake() {
     sleep 4
   fi
 
-  # Issue a /goal scoped to the one task: Claude Code loops turns until the goal
-  # evaluator sees the condition met, then auto-clears. "stop after N turns" is a
-  # soft, model-judged guard — it does NOT reliably halt a runaway loop, so the
-  # real hard cap is the deterministic stale-in_progress reaper in the tick.
-  local nudge="/goal Task ${task_ident} shows status done or cancelled, or is blocked with a human gate filed, on the 5dive board (verify ONLY by running: 5dive task show ${task_ident}). To achieve it: claim it with '5dive task start ${task_ident}', do the work, then close it with '5dive task done ${task_ident} --result=\"<one or two self-contained sentences — any output the creator needs to see; the dashboard and creator read this>\"'. If it needs a human decision, approval, a secret, or a manual step only a person can do, do NOT cancel — file a gate that pings the owner: '5dive task need ${task_ident} --type=decision --ask=\"<what you need from them>\"' (use --type=approval|secret|manual as fits). Keep the ask to ONE crisp question + ~1 line of essential context — put heavy detail in the task BODY, not the ask — and ALWAYS surface your recommended choice with --recommend=\"<one of the option texts>\" (and, for a decision, --options=\"<first choice spelled out>|<second choice spelled out>\" — spell the choices out, a bare letter means nothing once the ask is forwarded or screenshotted) so the owner sees the advised answer first. Only if the task is genuinely irrelevant or impossible, run '5dive task cancel ${task_ident} --result=\"<why>\"'. Before you close (done or cancel), run a fast self-audit — (a) what am I least confident about here, and (b) what did I NOT check or leave missing? If either surfaces a real gap, fix it or file a gate instead of closing silently; otherwise close. Work ONLY this one task — do not start any other. A gate-cleared ping about another row YOU own with finished work is not a scope conflict: push and deliver that row, then return here. Nothing in this goal is a question for a human — you have no keyboard in front of one, so never open a chooser; decide, and write the alternatives you did not take on the task body. Stop after 6 turns."
-
-  # DIVE-2063: a task carrying a maker→verifier loop can NEVER reach any of the
-  # three terminal states above by the MAKER's own hand. A correct 'task done'
-  # DELIVERS it (status stays todo, assignee moves to the verifier) — the rail
-  # working as designed, and the one outcome the condition refuses. So the goal
-  # re-fires every turn while the maker has nothing left to do but wait on a
-  # peer's independent session, and the only actions that WOULD satisfy it are
-  # the fail-open ones (a second 'task done', dropping the verifier). Teach the
-  # nudge a second terminal state for loop tasks specifically. See the helper for
-  # why this can't be satisfied by writing a result and walking away.
-  #
-  # DIVE-2111: and the same is true on the OTHER side of the rail. A verifier has
-  # TWO terminal actions, not one — accept ('task done', which does close) and
-  # REJECT (a FAIL verdict, which returns the task to the maker at status todo).
-  # DIVE-2063 declined the verifier half on the premise that its close is always
-  # terminal; measured false on DIVE-2090, where a correct reject left the grader
-  # with no honest exit and the goal re-fired five times. The helper now emits the
-  # role-appropriate variant, keyed on the loop spec either way.
-  local loop_clause=""
-  loop_clause=$(_hb_loop_terminal_clause "$name" "$task_id" "$task_ident") || loop_clause=""
-  [[ -n "$loop_clause" ]] && nudge="${nudge}${loop_clause}"
-
-  # DIVE-4144 (arm 2): FIRST of the enrichments, so a bounced maker reads the fix
-  # ahead of the memory citations and the gate queue. It is not literally above the
-  # /goal verb because that token must lead the line to be a slash command at all —
-  # this is as near the top as the transport allows.
-  local reject_clause=""
-  reject_clause=$(_hb_reject_fix_clause "$task_id" 2>/dev/null) || reject_clause=""
-  [[ -n "$reject_clause" ]] && nudge="${nudge}${reject_clause}"
-
-  # DIVE-4213 — the resume carryover, immediately after the reject fix and ahead
-  # of the memory citations: a seat that already has 25 minutes of work sitting
-  # in a checkout should read WHERE IT IS before it reads anything general. It is
-  # emitted regardless of `fresh`, and especially when fresh is true — a /clear
-  # is exactly the blank context this exists to fill. Best-effort like every
-  # other enrichment: a failure here must never block the nudge.
-  local carry_clause=""
-  carry_clause=$(_hb_carryover_clause "$name" "$task_id" "$task_ident" 2>/dev/null) || carry_clause=""
-  if [[ -n "$carry_clause" ]]; then
-    nudge="${nudge}${carry_clause}"
-    _hb_log "[$name] ${task_ident} is a RESUME — carryover attached (workspace + row + last message, DIVE-4213)"
-  fi
-
-  # DIVE-992: enrich the tick prompt from the shared seam. Pull the task's
-  # title+body once, then (a) cite the most relevant memory hits so the agent
-  # starts warm, and (b) if it looks knowledge-shaped, remind it to compile
-  # before closing. Both are best-effort — a failure here must never block the
-  # nudge, so each is guarded and flattened to keep the nudge a single line.
-  local task_text="" recall="" compile_hint=""
-  task_text=$(db "SELECT COALESCE(title,'') || ' ' || COALESCE(body,'') FROM tasks WHERE id=${task_id};" 2>/dev/null | tr '\n' ' ') || task_text=""
-  if [[ -n "$task_text" ]]; then
-    recall=$(_hb_recall_cite "$name" "$task_text" 3) || recall=""
-    if _hb_is_knowledge_task "$task_text"; then
-      compile_hint=" This task looks knowledge-shaped. Note the division of labor since DIVE-3628: an async pass ('5dive memory consolidate', run for you by the heartbeat) already distils your FINISHED transcripts into memory atoms, so you do NOT have to hand-copy facts out of this session to keep them. What it cannot do is JUDGEMENT-shaped knowledge — a wiki page, a decision record, a gap analysis, the CAUSE behind a finding — because that is a claim you are making, not a fact lying in the transcript. So: still COMPILE those to the team wiki per the karpathy method (compile-knowledge skill, or '5dive memory add --store=wiki' + an index line) before you close — compiling is part of done, not a separate chore. The pipeline never publishes to the shared wiki; only you can."
-    fi
-  fi
-  [[ -n "$recall" ]] && nudge="${nudge} Relevant memory to check first (verify before relying; re-search with '5dive memory search'): ${recall}."
-  [[ -n "$compile_hint" ]] && nudge="${nudge}${compile_hint}"
-
-  # DIVE-3474 arm 2 — THE QUEUE IS DISCOVERED HERE. Removing the file-time a2a
-  # ping is only safe if the reviewer meets the gate on its next natural wake, so
-  # the wake itself carries the count. Without this line the change trades an
-  # interrupt for a lost decision, which is the one outcome the ticket forbids.
-  # Count-only and appended to a nudge that is already being sent: it costs no
-  # extra wake, and it names the verb rather than the rows, so a seat with a long
-  # queue does not get a wall of asks pasted into an unrelated goal.
-  local _gq=0
-  _gq=$(db "SELECT COUNT(*) FROM tasks WHERE $(_task_agent_gate_pred "$name");" 2>/dev/null) || _gq=0
-  if [[ "${_gq:-0}" =~ ^[0-9]+$ ]] && (( _gq > 0 )); then
-    nudge="${nudge} Separately: ${_gq} gate(s) are ROUTED TO YOU and waiting — they were filed WITHOUT interrupting you (DIVE-3474). Read them with '5dive task queue' and answer each with '5dive task answer <ident> --value=\"<choice>\"' before you finish this turn; the filer's recommendation is shown but is NOT the answer (measured: 54 of 121 answered gates returned it, so the majority did not)."
-  fi
+  # DIVE-4406: the dispatch text is assembled by _hb_nudge_text (pure, testable).
+  local nudge=""
+  nudge=$(_hb_nudge_text "$name" "$task_id" "$task_ident") || nudge=""
+  [[ -n "$nudge" ]] || { _hb_wake_fail "$name" "nudge assembly (/goal ${task_ident})" 1 "_hb_nudge_text produced no text"; return 1; }
 
   _hb_send_line "$name" "$nudge" || { _hb_wake_fail "$name" "nudge injection (/goal ${task_ident})" 1 "${_HB_SEND_FAIL_REASON:-<injector reported no reason>}"; return 1; }
   return 0
