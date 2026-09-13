@@ -105,6 +105,14 @@ db "INSERT INTO tasks (ident,title,status,priority,created_by,project_key,kind)
     VALUES ('DIVE-9001','placeholder-options row','in_progress','medium','main','dive','standard'),
            ('DIVE-9002','descriptive-options row','in_progress','medium','main','dive','standard');"
 
+# DIVE-4462: seed the org chart. This harness grades DIVE-4416's "warn, never fail"
+# for the AGENT reader, and since DIVE-4431 (#947) a tier-1 gate the chart cannot
+# route is human-facing for the READABILITY and OPTIONS rules — with no chart at all
+# there is no agent route left to grade, so the arms below would assert the agent
+# path while exercising the human one.
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('main',NULL,'coordinator');"
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('dev','main','builder');"
+
 run_need() {
   local tag="$1"; shift
   ( cmd_task_need "$@" ) >"$TMP/$tag.out" 2>"$TMP/$tag.err"

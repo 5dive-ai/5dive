@@ -66,6 +66,14 @@ db "INSERT INTO tasks (ident,title,status,priority,created_by,project_key,kind)
            ('DIVE-9103','human-route spelled options','in_progress','medium','main','dive','standard'),
            ('DIVE-9104','agent-route bare options','in_progress','medium','main','dive','standard');"
 
+# Org chart: `main` is the lone root (coordinator), `dev` reports to it. Without this
+# the chart cannot route ANY filer, and DIVE-4431 (#947) marks an unroutable tier-1
+# gate human-facing "for the READABILITY and OPTIONS rules only" — so arm 5 below
+# would grade the human path while claiming to grade the agent one. The chart is what
+# makes "the resolved route is an agent" true rather than merely asserted.
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('main',NULL,'coordinator');"
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('dev','main','builder');"
+
 PLAIN_ASK="Ship the smaller change now, or hold for the full one?"
 
 # ---- 1. THE SEAM: a refusal returns to the caller, it does not end the run ---
