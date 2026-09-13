@@ -109,4 +109,10 @@ fi
 # its payload, exactly as this file's is.
 . "$(dirname -- "${BASH_SOURCE[0]}")/env_isolation.sh" \
   || printf 'env isolation: UNRESOLVED (tests/lib/env_isolation.sh not reachable; caller FIVE_* knobs NOT cleared)\n' >&2
+
+# DIVE-4402: harnesses that grade an always-on verifier box opt in explicitly
+# after creating their disposable STATE_DIR. Default-policy harnesses omit the
+# call, so a production default change cannot silently move their fixture.
+. "$(dirname -- "${BASH_SOURCE[0]}")/verify_policy_fixture.sh" \
+  || printf 'verify-policy fixture: UNRESOLVED (tests/lib/verify_policy_fixture.sh not reachable)\n' >&2
 :

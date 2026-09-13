@@ -41,6 +41,7 @@ fi
 
 TMP="$(mktemp -d)"
 export STATE_DIR="$TMP" TASKS_DB="$TMP/tasks.db" COUNCIL_MOCK=1 COUNCIL_5DIVE_BIN="$FIVE"
+fixture_box_verify_policy always || exit 1
 DB="$TASKS_DB"
 pass=0; fail=0
 ok(){ echo "  ok:   $1"; pass=$((pass+1)); }
@@ -52,7 +53,12 @@ mkgate() { # <title> <type> <tier> <ask> [recommend] [options]
   local ident
   ident="$("$FIVE" task add "$1" --json 2>/dev/null | jq -r '.data.ident // .data.id // empty')"
   [[ -n "$ident" ]] || ident="$(q "SELECT ident FROM tasks ORDER BY id DESC LIMIT 1;")"
-  local -a nargs=(--type="$2" --tier="$3" --ask="$4")
+  # These synthetic asks grade council clear/escalate behavior, not the
+  # capability-declaration classifier.  On an empty fixture org they resolve to
+  # the paired-human route, so DIVE-4346 correctly refuses the deliberately
+  # capability-free text unless the harness records its audited escape.
+  local -a nargs=(--type="$2" --tier="$3" --ask="$4"
+                  --ask-ok="fixture grades council routing, not capability classification")
   [[ -n "${5:-}" ]] && nargs+=(--recommend="$5")
   [[ -n "${6:-}" ]] && nargs+=(--options="$6")
   "$FIVE" task need "$ident" "${nargs[@]}" >/dev/null 2>&1 || true
