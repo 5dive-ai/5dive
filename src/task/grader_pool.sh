@@ -678,7 +678,7 @@ cmd_task_grader_tick() {
                  ORDER BY e.id;" 2>/dev/null || printf '')
 
   local usage="" ; usage=$($_GRADER_USAGE_CMD 2>/dev/null || printf '')
-  local n_pending=0 n_spawn=0 n_queue=0 n_refuse=0 plan=""
+  local n_pending=0 n_spawn=0 n_queue=0 n_refuse=0 n_fail=0 plan=""
   # ══ DIVE-4322: IN FLIGHT MEANS GRADING, NOT "NOT YET CLOSED" ══
   #
   # This count was `spawned with no later task.done/task.rejected`, i.e. a grade
@@ -941,29 +941,60 @@ $(_grader_inflight_exits_sql)
       # verbatim in both modes — `_GRADER_SEAT_EXPR` reads the seat out of this
       # string at a fixed offset, so the suffix may grow and the prefix may not.
       local _gp_sid=""
-      if _grader_process_mode; then _gp_sid=$(_grader_process_session_id "$chosen"); fi
-      ledger_emit task.grade.spawned ident="$ident" actor="$(task_actor "")" \
-        detail="grader session on ${chosen}${_gp_sid:+ (process ${_gp_sid})}" || true
       if _grader_process_mode; then
-        _grader_process_spawn "$chosen" "$ident" "$_gp_sid" \
-          || warn "$ident: grader process on $chosen failed"
+        # ══ DIVE-4417 iteration 2: IN PROCESS MODE THE LEDGER ROW COMES AFTER ══
+        #
+        # "Record the intent before acting" is right in SESSION mode and wrong
+        # here, and the asymmetry is the whole point. There, a wake that fails
+        # leaves a visibly idle seat with a unit, a pane and a liveness rail
+        # watching it, so a spawn row with nothing behind it is noticed. A
+        # one-shot has none of those (see grader_process.sh's header), so the
+        # same row written ahead of a failed launch is permanent: the pending
+        # query at :674 excludes any ident carrying a later
+        # `task.grade.spawned`, and the delivery would never be re-picked by
+        # any tick. quinn measured exactly that on iteration 1.
+        #
+        # So in this mode the row is the RECEIPT of a started process, not the
+        # intent to start one. The window it opens instead — a crash between
+        # the launch and this emit — is the safe one: the row stays pending and
+        # the next tick re-picks it, which is a duplicate grade at worst rather
+        # than a delivery nobody grades. `_grader_process_spawn` owns the other
+        # half: it probes the runas before it assigns, confirms the process is
+        # alive before it returns 0, and unwinds the assign if it is not.
+        _gp_sid=$(_grader_process_session_id "$chosen")
+        if _grader_process_spawn "$chosen" "$ident" "$_gp_sid"; then
+          ledger_emit task.grade.spawned ident="$ident" actor="$(task_actor "")" \
+            detail="grader session on ${chosen}${_gp_sid:+ (process ${_gp_sid})}" || true
+        else
+          warn "$ident: grader process on $chosen failed"
+          # The tick's own arithmetic is corrected too. A summary reading
+          # spawn=1 for a launch that never started is the same untruth as the
+          # ledger row, one line further down, and the slot it reserved must go
+          # back or the rest of this tick plans against capacity it never spent.
+          n_spawn=$((n_spawn-1)); n_fail=$((n_fail+1))
+          inflight=$((inflight-1)); n_procs=$((n_procs-1))
+          _gp_load["$chosen"]=$(( ${_gp_load[$chosen]:-1} - 1 ))
+          plan+="failed  $ident  -> $chosen  (launch did not start; assign reverted, row stays pending)"$'\n'
+        fi
       else
+        ledger_emit task.grade.spawned ident="$ident" actor="$(task_actor "")" \
+          detail="grader session on ${chosen}" || true
         _grader_spawn_session "$chosen" "$ident" || warn "$ident: spawn on $chosen failed"
       fi
     fi
   done <<<"$pending"
 
   if (( json )); then
-    printf '{"pending":%d,"spawned":%d,"queued":%d,"dark":%d,"stale":%d,"staleHours":%d,"cap":%d,"commit":%s,"pool":"%s","mode":"%s","procs":%d,"seatCap":%d}\n' \
+    printf '{"pending":%d,"spawned":%d,"queued":%d,"dark":%d,"stale":%d,"staleHours":%d,"cap":%d,"commit":%s,"pool":"%s","mode":"%s","procs":%d,"seatCap":%d,"failed":%d}\n' \
       "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_stale" "$stale_h" "$cap" \
       "$( ((commit)) && printf true || printf false )" "$_GRADER_POOL" \
-      "$(_grader_spawn_mode)" "$n_procs" "$_gp_seatcap"
+      "$(_grader_spawn_mode)" "$n_procs" "$_gp_seatcap" "$n_fail"
     return 0
   fi
   printf '%s' "$plan"
-  printf 'pending=%d spawn=%d queue=%d dark=%d stale=%d cap=%d mode=%s procs=%d seatcap=%d %s\n' \
+  printf 'pending=%d spawn=%d queue=%d dark=%d stale=%d cap=%d mode=%s procs=%d seatcap=%d failed=%d %s\n' \
     "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_stale" "$cap" \
-    "$(_grader_spawn_mode)" "$n_procs" "$_gp_seatcap" \
+    "$(_grader_spawn_mode)" "$n_procs" "$_gp_seatcap" "$n_fail" \
     "$( ((commit)) && printf '(COMMITTED)' || printf '(dry-run — pass --commit to act)' )"
 }
 

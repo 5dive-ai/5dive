@@ -46,7 +46,15 @@ US=$'\x1f'
 db(){ case "$*" in
         *"FROM runs"*)                  printf '%s\n' "$NEXTRUNN" ;;
         *"INSERT INTO runs"*)           printf '' ;;
-        *grade.requested*)              printf '%s\n' "$PENDING" ;;
+        *"UPDATE runs SET status"*)     printf '%s\n' "$*" >> "$DBWF" ;;
+        *"UPDATE tasks SET assignee"*)  printf '%s\n' "$*" >> "$DBWF" ;;
+        # THE PENDING SET IS MODELLED, NOT CONSTANT, and that is what makes the
+        # F arms below able to regress-catch. The shipped query excludes any
+        # ident carrying a later `task.grade.spawned` (grader_pool.sh, the
+        # NOT EXISTS clause), so a fixture that returns the same three rows
+        # forever cannot tell "the row is still pending" from "the row left
+        # pending permanently" — which is exactly the defect quinn found.
+        *grade.requested*)              pending_now_ ;;
         *"GROUP BY seat"*)              printf '%s\n' "$SEATLOADS" ;;
         *"ORDER BY s.id DESC LIMIT 1"*) printf '%s\n' "$LASTPICK" ;;
         *COUNT*)                        printf '%s\n' "$INFLIGHT" ;;
@@ -54,7 +62,9 @@ db(){ case "$*" in
       esac; }
 sqlq(){ printf "'%s'" "${1//\'/\'\'}"; }
 fail(){ shift; printf 'FAILCALL %s\n' "$*" >&2; return 1; }
-warn(){ :; }
+# warn is a RECORDER now, not a sink: "the caller warns" is half of the contract
+# the failed-launch arms grade, and a sink cannot be asserted against.
+warn(){ printf '%s\n' "$*" >> "$WARNF"; }
 task_actor(){ printf 'sys'; }
 
 USAGE='{"agents":[{"account":"mark","name":"g1","fiveHourPct":10,"sevenDayPct":20},
@@ -67,8 +77,34 @@ usage_cmd(){ printf '%s' "$USAGE"; }
 TMPD="$(mktemp -d "${TMPDIR:-/tmp}/grader-process.XXXXXX")"
 trap 'rc=$?; rm -rf "$TMPD"; echo "HARNESS-RC=$rc"' EXIT
 PROCF="$TMPD/procs"; SESSF="$TMPD/sessions"; EMITF="$TMPD/emits"; PSF="$TMPD/ps"
-: > "$PSF"
-ledger_emit(){ printf '%s\n' "$*" >> "$EMITF"; }
+WARNF="$TMPD/warns"; SPAWNF="$TMPD/spawned"; DBWF="$TMPD/dbwrites"
+export ASSIGNF="$TMPD/assigns"
+: > "$PSF"; : > "$WARNF"; : > "$SPAWNF"; : > "$DBWF"; : > "$ASSIGNF"
+# EMITF is this tick's emits; SPAWNF outlives the tick, because the property the
+# F arms grade is what the NEXT tick sees.
+ledger_emit(){
+  printf '%s\n' "$*" >> "$EMITF"
+  [[ "${1:-}" == task.grade.spawned ]] && printf '%s\n' "${2#ident=}" >> "$SPAWNF"
+  return 0
+}
+pending_now_(){
+  local i
+  for i in $PENDING; do
+    grep -qxF "$i" "$SPAWNF" 2>/dev/null && continue
+    printf '%s\n' "$i"
+  done
+}
+# The assign seam. `_grader_process_spawn` shells out to the CLI, so the arms
+# that run the REAL function need somewhere for that call to land that is not
+# the live board.
+FAKECLI="$TMPD/fake5dive"
+cat > "$FAKECLI" <<'CLI'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$ASSIGNF"
+CLI
+chmod +x "$FAKECLI"
+launch_fail(){ return 7; }
+launch_ok(){   return 0; }
 
 # shellcheck source=/dev/null
 source src/task/grader_pool.sh
@@ -85,8 +121,15 @@ _GRADER_PROCESS_PS_CMD='cat "$PSF"'
 _grader_spawn_session(){ printf '%s\n' "$1:$2" >> "$SESSF"; return 0; }
 _grader_process_spawn(){ printf '%s\n' "$1:$2:$3" >> "$PROCF"; return 0; }
 
-run(){ : > "$PROCF"; : > "$SESSF"; : > "$EMITF"; cmd_task_grader_tick "$@" 2>/dev/null; }
+run_keep(){ : > "$PROCF"; : > "$SESSF"; : > "$EMITF"; : > "$WARNF"; : > "$ASSIGNF"; : > "$DBWF"
+             cmd_task_grader_tick "$@" 2>/dev/null; }
+# `run` forgets what the previous tick spawned; `run_keep` does not. Every arm
+# above wants a clean slate per tick; the F arms want two consecutive ticks.
+run(){ : > "$SPAWNF"; run_keep "$@"; }
 procs_(){ cat "$PROCF" 2>/dev/null; }
+warns_(){ cat "$WARNF" 2>/dev/null; }
+dbw_(){ cat "$DBWF" 2>/dev/null; }
+assigns_(){ cat "$ASSIGNF" 2>/dev/null; }
 sess_(){ cat "$SESSF" 2>/dev/null; }
 emits_(){ cat "$EMITF" 2>/dev/null; }
 jget(){ printf '%s' "$1" | python3 -c "import json,sys;print(json.load(sys.stdin)[sys.argv[1]])" "$2"; }
@@ -279,6 +322,145 @@ outj=$(run --cap=4 --commit --json)
   && ok_ 'LOCK2 holds in process mode: an empty pool launches nothing and reads dark' \
   || bad_ 'LOCK2 in process mode' "$outj"
 _GRADER_POOL="g1 g2"
+
+# ── F. A LAUNCH THAT CANNOT START (DIVE-4417 iteration 2, quinn's finding) ───
+#
+# Iteration 1's 26 arms all stubbed `_grader_process_spawn`, so every one of them
+# graded the tick's DECISIONS and none could reach the launch. quinn ran the real
+# function against a seat whose unix account does not exist: sudo refused, the
+# function returned 0, the caller's warn never fired, and because the ledger row
+# was already written the delivery left `pending` forever.
+#
+# These arms run the REAL `_grader_process_spawn` — re-sourced over the recorder
+# stub inside a subshell, with the CLI, the runas probe and the launcher on their
+# seams — and grade the three halves of the fix together: the launch reports
+# failure, the tick warns and does not claim a spawn, and the NEXT tick still
+# sees the row. Asserting them separately would let a lane that warns and still
+# strands the row pass.
+: > "$PSF"; INFLIGHT=0; SEATLOADS=""; NEXTRUNN=1
+real_spawn_env_() {           # the seams, applied in one place for all F arms
+  # shellcheck source=/dev/null
+  source src/task/grader_process.sh          # the REAL spawn, over the stub
+  _GRADER_PROCESS_PS_CMD='cat "$PSF"'
+  _GRADER_TASK_CLI="$FAKECLI"
+  _GRADER_PROCESS_START_GRACE=0
+}
+
+# F1: the runas refusal — quinn's exact measurement, at function level.
+f1rc=0
+( real_spawn_env_
+  _GRADER_PROCESS_RUNAS_CMD='return 1'
+  _grader_process_spawn g1 DIVE-1 'g1#1' ) || f1rc=$?
+(( f1rc != 0 )) \
+  && ok_ 'F1: a seat this caller cannot become => _grader_process_spawn returns non-zero' \
+  || bad_ 'F1 runas refusal returns non-zero' "rc=$f1rc"
+[[ ! -s "$ASSIGNF" ]] \
+  && ok_ 'F1: the runas probe runs BEFORE the assign, so there is nothing to unwind' \
+  || bad_ 'F1 probe precedes assign' "$(assigns_)"
+
+# F2: the launch itself fails after the assign — the compensation path.
+f2rc=0
+( real_spawn_env_
+  _GRADER_PROCESS_RUNAS_CMD='return 0'
+  _GRADER_PROCESS_LAUNCH=launch_fail
+  _grader_process_spawn g1 DIVE-1 'g1#1' ) || f2rc=$?
+(( f2rc != 0 )) \
+  && ok_ 'F2: a launch that cannot start => _grader_process_spawn returns non-zero' \
+  || bad_ 'F2 failed launch returns non-zero' "rc=$f2rc"
+grep -q 'did not start' <<<"$(warns_)" \
+  && ok_ 'F2: the failure is warned, not swallowed' || bad_ 'F2 warns' "$(warns_)"
+grep -q 'UPDATE tasks SET assignee' <<<"$(dbw_)" \
+  && ok_ 'F2: the assign is unwound, so the row is not left on a seat that is not grading it' \
+  || bad_ 'F2 unwinds the assign' "$(dbw_)"
+grep -q 'UPDATE runs SET status' <<<"$(dbw_)" \
+  && ok_ 'F2: the run row is closed failed rather than left reading running' \
+  || bad_ 'F2 closes the run row' "$(dbw_)"
+grep -q 'task.grade.spawn.failed' <<<"$(cat "$EMITF")" \
+  && ok_ 'F2: a compensating ledger row records the attempt that did not start' \
+  || bad_ 'F2 compensating event' "$(cat "$EMITF")"
+
+# F3: THE PROPERTY THAT WAS BROKEN — two consecutive ticks, failing launch.
+PENDING="DIVE-1"; : > "$SPAWNF"
+f3a=$( real_spawn_env_
+       _GRADER_PROCESS_RUNAS_CMD='return 0'; _GRADER_PROCESS_LAUNCH=launch_fail
+       run_keep --cap=4 --commit )
+grep -q 'DIVE-1' <<<"$(warns_)" \
+  && ok_ 'F3: the tick warns on a launch that never started' || bad_ 'F3 tick warns' "$(warns_)"
+grep -qE '^failed  DIVE-1' <<<"$f3a" \
+  && ok_ 'F3: the plan names the failed launch instead of printing spawn and moving on' \
+  || bad_ 'F3 plan line' "$f3a"
+grep -q 'spawn=0 ' <<<"$f3a" \
+  && ok_ 'F3: the summary does not count a spawn that did not happen' || bad_ 'F3 spawn=0' "$f3a"
+grep -q 'failed=1' <<<"$f3a" \
+  && ok_ 'F3: the summary reports the failure as its own number' || bad_ 'F3 failed=1' "$f3a"
+grep -q 'task.grade.spawned' <<<"$(cat "$EMITF")" \
+  && bad_ 'F3 no spawned row on a failed launch' "$(cat "$EMITF")" \
+  || ok_ 'F3: NO task.grade.spawned row is written for a launch that did not start'
+f3b=$( real_spawn_env_
+       _GRADER_PROCESS_RUNAS_CMD='return 0'; _GRADER_PROCESS_LAUNCH=launch_fail
+       run_keep --cap=4 --commit --json )
+[[ "$(jget "$f3b" pending)" == 1 ]] \
+  && ok_ 'F3: the delivery is STILL PENDING on the next tick (it is re-picked, not stranded)' \
+  || bad_ 'F3 row survives to the next tick' "$f3b"
+
+# F4: the positive control. Without it, a lane that returned non-zero from every
+# launch — or never emitted the ledger row at all — would pass every arm above,
+# and the row would be re-graded on every tick forever.
+: > "$SPAWNF"
+f4a=$( real_spawn_env_
+       _GRADER_PROCESS_RUNAS_CMD='return 0'; _GRADER_PROCESS_LAUNCH=launch_ok
+       run_keep --cap=4 --commit --json )
+[[ "$(jget "$f4a" spawned)" == 1 && "$(jget "$f4a" failed)" == 0 ]] \
+  && ok_ 'F4: a launch that DOES start is still counted as a spawn' || bad_ 'F4 spawn counted' "$f4a"
+grep -q 'task.grade.spawned' <<<"$(cat "$EMITF")" \
+  && ok_ 'F4: the ledger row is written once the launch is known started' \
+  || bad_ 'F4 spawned row written' "$(cat "$EMITF")"
+f4b=$( real_spawn_env_
+       _GRADER_PROCESS_RUNAS_CMD='return 0'; _GRADER_PROCESS_LAUNCH=launch_ok
+       run_keep --cap=4 --commit --json )
+[[ "$(jget "$f4b" pending)" == 0 ]] \
+  && ok_ 'F4: a started grade LEAVES pending, so the receipt still de-duplicates' \
+  || bad_ 'F4 started grade leaves pending' "$f4b"
+
+# F5: the liveness check the DEFAULT launch path depends on, graded directly.
+# The F1-F4 arms reach the launcher through the `_GRADER_PROCESS_LAUNCH` seam, so
+# `_grader_process_started` — the half that catches a launch which starts and
+# then dies — would otherwise ship ungraded, which is the shape of the original
+# defect all over again.
+( real_spawn_env_; : > "$PSF"
+  false & fp=$!
+  _grader_process_started "$fp" DIVE-1 ) \
+  && bad_ 'F5 a wrapper that exited non-zero is not started' '' \
+  || ok_ 'F5: a launch whose wrapper exited non-zero reads as NOT started'
+( real_spawn_env_; : > "$PSF"
+  true & tp=$!
+  _grader_process_started "$tp" DIVE-1 ) \
+  && bad_ 'F5 exit 0 with no marker in argv is not proof of life' '' \
+  || ok_ 'F5: wrapper gone with status 0 and NO marker in argv reads as NOT started'
+( real_spawn_env_
+  printf '4242 sudo -n -u agent-g1 bash -lc : 5dive-grader-oneshot seat=g1 ident=DIVE-1 session=g1#1\n' > "$PSF"
+  true & tp=$!
+  _grader_process_started "$tp" DIVE-1 ) \
+  && ok_ 'F5: wrapper gone with status 0 but the one-shot IS in argv reads as started (setsid forked)' \
+  || bad_ 'F5 marker resolves the setsid fork' "$(cat "$PSF")"
+# THE ZOMBIE BRANCH, graded through the state seam and not through a real
+# zombie: bash reaps its own background children from its SIGCHLD handler, so an
+# arm that backgrounds `false` and looks for a zombie grades the scheduler. The
+# mutant that removes the check survived exactly that arm.
+( real_spawn_env_; : > "$PSF"
+  sleep 5 & zp=$!
+  _GRADER_PID_STATE_CMD='printf Z'
+  _grader_process_started "$zp" DIVE-1; rc=$?
+  kill "$zp" 2>/dev/null; exit $rc ) \
+  && bad_ 'F5 an exited-but-unreaped wrapper is not alive' '' \
+  || ok_ 'F5: a wrapper in state Z (exited, not yet reaped) reads as NOT started, though kill -0 succeeds'
+
+( real_spawn_env_
+  printf '4242 sudo -n -u agent-g1 bash -lc : 5dive-grader-oneshot seat=g1 ident=DIVE-10 session=g1#1\n' > "$PSF"
+  _grader_process_live DIVE-1 ) \
+  && bad_ 'F5 DIVE-10 is not DIVE-1' "$(cat "$PSF")" \
+  || ok_ 'F5: ident=DIVE-10 is not read as proof of life for DIVE-1 (no prefix match)'
+: > "$PSF"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

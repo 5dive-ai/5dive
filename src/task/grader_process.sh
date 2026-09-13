@@ -186,6 +186,143 @@ _grader_process_goal() {  # <ident> <session_id> <dir>
 # `: <mark> seat=… ident=… session=…` is a no-op command whose ARGUMENTS are the
 # record; every layer of the launch carries the string, which is why the counter
 # de-duplicates by ident.
+
+# ══ DIVE-4417 iteration 2: A LAUNCH THAT NEVER STARTS MUST NOT READ AS A SPAWN ══
+#
+# quinn, grading iteration 1, called this file's spawn with a seat whose unix
+# account does not exist. `sudo -n -u` was denied, the per-grade log said so —
+# and the function returned 0, because `setsid … &` is backgrounded and its exit
+# status was never read by anything. Two consequences, and the second is the one
+# that matters: the caller's `|| warn` could not fire, and because the ledger row
+# was written BEFORE the launch, the row left `pending` PERMANENTLY — the pending
+# query excludes any ident carrying a later `task.grade.spawned` — so nothing
+# graded it and no tick ever re-picked it. A denied runas is the EXPECTED first
+# failure here, not an exotic one: this row's SEAT REQUIREMENT section is about
+# how few seats hold that grant.
+#
+# Three things now make the outcome knowable, ordered so the likeliest failure is
+# also the cheapest:
+#   1. `_grader_process_runas_probe` runs BEFORE the row is touched, so a seat
+#      that cannot be launched as costs no compensation at all;
+#   2. the background pid is kept and checked after a short grace, so a launch
+#      that dies on its own (no CLI on PATH, an unwritable directory) is caught
+#      as well as one that was refused;
+#   3. anything that fails AFTER the assign unwinds it and writes a
+#      `task.grade.spawn.failed` row, so the next tick re-picks the delivery.
+# The caller's half — emitting `task.grade.spawned` only once this returns 0 —
+# is in grader_pool.sh, and neither half is sufficient alone.
+
+# The runas probe. Overridable so the unit harness can make it refuse without
+# needing a seat that does not exist. `true` and not the real launch: this asks
+# the one question the launch cannot answer for us in time — may this caller
+# become that account at all — and it asks it for the price of a fork.
+_GRADER_PROCESS_RUNAS_CMD="${_GRADER_PROCESS_RUNAS_CMD:-}"
+_grader_process_runas_probe() {  # <seat>
+  if [[ -n "$_GRADER_PROCESS_RUNAS_CMD" ]]; then eval "$_GRADER_PROCESS_RUNAS_CMD"; return $?; fi
+  sudo -n -u "agent-${1}" true >/dev/null 2>&1
+}
+
+# How long to wait before believing the launch. A one-shot that is going to fail
+# to start has already failed by the time `sudo` or `bash -lc` returns; nothing
+# here waits for the CLI to produce anything.
+_GRADER_PROCESS_START_GRACE="${_GRADER_PROCESS_START_GRACE:-2}"
+
+# The CLI the assign goes through, as a variable for exactly one reason: it is
+# the seam that lets the harness grade this function for real. Every arm on the
+# launch path was previously unreachable because the only way to run the real
+# spawn was to let it mutate the live board.
+_GRADER_TASK_CLI="${_GRADER_TASK_CLI:-5dive}"
+
+# `_grader_process_live <ident>` — is a one-shot for THIS delivery in the process
+# table right now? The trailing space is load-bearing: `ident=DIVE-1` is a prefix
+# of `ident=DIVE-10`, and a prefix match would report another grade's process as
+# this one's proof of life.
+_grader_process_live() {  # <ident>
+  local line
+  while IFS= read -r line; do
+    [[ "$line" == *"$_GRADER_PROCESS_MARK"* && "$line" == *"ident=${1} "* ]] && return 0
+  done < <(_grader_process_ps)
+  return 1
+}
+
+# `_grader_pid_alive <pid>` — alive, and NOT a zombie.
+#
+# `kill -0` ALONE IS THE WRONG TEST HERE and it was wrong in the dangerous
+# direction: a child that has exited and has not been reaped is a zombie, and
+# `kill -0` succeeds on a zombie, so a refused launch read as a running one. That
+# is the very defect this iteration exists to remove, reintroduced one layer
+# down; it was caught by the arm, not by reading the code.
+#
+# THE STATE READ IS A SEAM, for the reason that made this guard nearly ship
+# ungraded: a zombie produced by `cmd &` in a harness is a RACE, because bash
+# reaps its own background children from its SIGCHLD handler, so an arm built on
+# one passes whether the guard is present or not. Feeding the state directly is
+# the only way to grade the branch rather than the timing.
+_GRADER_PID_STATE_CMD="${_GRADER_PID_STATE_CMD:-}"
+_grader_pid_state() {  # <pid>
+  if [[ -n "$_GRADER_PID_STATE_CMD" ]]; then eval "$_GRADER_PID_STATE_CMD"; return 0; fi
+  [[ -r "/proc/$1/status" ]] || return 0
+  sed -n 's/^State:[[:space:]]*\([A-Z]\).*/\1/p' "/proc/$1/status" 2>/dev/null
+}
+_grader_pid_alive() {  # <pid>
+  kill -0 "$1" 2>/dev/null || return 1
+  [[ "$(_grader_pid_state "$1")" == Z ]] && return 1
+  return 0
+}
+
+# `_grader_process_started <pid> <ident>` — did the launch actually start?
+#
+# THE ARGV MARKER IS THE AUTHORITY, not the wrapper's pid, and the reason is that
+# the pid is not always the one-shot's: `setsid` execs in place when its caller is
+# not a process-group leader (the tick, a cron child, is that case) but FORKS and
+# exits 0 immediately under job control. Every layer of the launch — setsid, sudo,
+# bash, and the CLI after it execs — carries the marker in its argv, so a present
+# marker is proof of life whatever the pid is doing.
+#
+# NOTHING HERE MAY BLOCK. A bare `wait` on a pid that is still running would hold
+# the tick for the entire duration of the grade, so the liveness test is the
+# non-blocking one and `wait` is only ever reached for a pid already known dead,
+# where it exists to reap rather than to be read.
+_grader_process_started() {  # <pid> <ident>
+  local pid="$1" ident="$2"
+  _grader_process_live "$ident" && return 0
+  # No marker in the process table. A wrapper that is gone or zombified is a
+  # launch that did not start — the sudo refusal quinn measured lands here.
+  if ! _grader_pid_alive "$pid"; then wait "$pid" 2>/dev/null || true; return 1; fi
+  # Alive, holding the marker in its own argv, yet not visible to the probe: the
+  # probe itself is broken (no pgrep, no permission). Believing the launch is the
+  # only non-blocking answer, and it is the one that does not invent a failure
+  # out of a missing instrument.
+  return 0
+}
+
+# `_grader_process_unwind <seat> <ident> <sid> <rid> <prev_assignee>` — put the
+# row back where the failed launch found it.
+#
+# THE ASSIGN IS REVERTED WITH A DIRECT WRITE, not with `5dive task assign`, and
+# that is deliberate: the shape being restored is the delivered one, where the
+# assignee IS the row's verifier, and `cmd_task_assign` refuses that move from
+# any other assignee (crud.sh, DIVE-3097) — the verb cannot express the undo of
+# its own effect here. The previous value is read before the assign and written
+# back verbatim, so a row that arrived unassigned goes back to NULL rather than
+# to a guessed seat.
+#
+# The run row is marked `failed` in the same breath: a row reading `running` for
+# a process that never existed is the same lie as the ledger's, one table over.
+_grader_process_unwind() {  # <seat> <ident> <sid> <rid> <prev_assignee>
+  local seat="$1" ident="$2" sid="$3" rid="$4" prev="$5"
+  db "UPDATE tasks SET assignee=NULLIF($(sqlq "$prev"),'') WHERE ident=$(sqlq "$ident");" >/dev/null 2>&1 || true
+  if [[ -n "$rid" ]]; then
+    db "UPDATE runs SET status='failed' WHERE id=$(sqlq "$rid");" >/dev/null 2>&1 || true
+  fi
+  # A compensating row, not a silent revert. The tick's warn is a log line nobody
+  # queries; this is the durable record that a grade was attempted and did not
+  # start, and it is why the next tick re-picking the row is a retry rather than
+  # a mystery.
+  ledger_emit task.grade.spawn.failed ident="$ident" actor="$(task_actor "")" \
+    detail="grader process ${sid} on ${seat} did not start; assign reverted, row stays pending" || true
+}
+
 _GRADER_PROCESS_LAUNCH="${_GRADER_PROCESS_LAUNCH:-}"
 _grader_process_spawn() {  # <seat> <ident> <session_id>
   local seat="$1" ident="$2" sid="$3"
@@ -196,14 +333,28 @@ _grader_process_spawn() {  # <seat> <ident> <session_id>
     warn "$ident: skip — owner is $working_owner, not a pool seat"
     return 2
   fi
-  5dive task assign "$ident" "$seat" >/dev/null 2>&1 || return 1
-  _grader_process_run_open "$seat" "$ident" "$sid" >/dev/null
+  # BEFORE the row is touched: the failure that needs no compensation.
+  if ! _grader_process_runas_probe "$seat"; then
+    warn "$ident: grader process on $seat cannot start — no runas for agent-${seat}"
+    return 3
+  fi
+  local prev_assignee=""
+  prev_assignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')
+  "$_GRADER_TASK_CLI" task assign "$ident" "$seat" >/dev/null 2>&1 || return 1
+  local rid=""
+  rid=$(_grader_process_run_open "$seat" "$ident" "$sid")
 
   local root="${_GRADER_PROCESS_ROOT:-/home/agent-${seat}/graders}"
   local dir="${root}/${ident}-${sid#*#}"
   local logf="${_GRADER_PROCESS_LOG_DIR}/${ident}-${sid#*#}.log"
   if [[ -n "$_GRADER_PROCESS_LAUNCH" ]]; then
-    "$_GRADER_PROCESS_LAUNCH" "$seat" "$ident" "$sid" "$dir" "$logf"; return $?
+    local lrc=0
+    "$_GRADER_PROCESS_LAUNCH" "$seat" "$ident" "$sid" "$dir" "$logf" || lrc=$?
+    if (( lrc != 0 )); then
+      warn "$ident: grader process ${sid} on $seat did not start (launch rc=${lrc})"
+      _grader_process_unwind "$seat" "$ident" "$sid" "$rid" "$prev_assignee"
+    fi
+    return "$lrc"
   fi
 
   mkdir -p "$_GRADER_PROCESS_LOG_DIR" 2>/dev/null || true
@@ -215,13 +366,27 @@ _grader_process_spawn() {  # <seat> <ident> <session_id>
 
   local goal; goal=$(_grader_process_goal "$ident" "$sid" "$dir")
   local script
-  printf -v script ': %s seat=%s ident=%s session=%s; cd %q || exit 1; exec %s --print %q' \
+  # %q throughout, including the marker fields. Idents are DB-sourced `DIVE-<n>`
+  # and seats are roster names, so nothing here is reachable today — quinn
+  # recorded it as defense-in-depth rather than a finding — but a quoted field
+  # costs nothing and removes the question from the next reader.
+  printf -v script ': %q seat=%q ident=%q session=%q; cd %q || exit 1; exec %q --print %q' \
     "$_GRADER_PROCESS_MARK" "$seat" "$ident" "$sid" "$dir" "$_GRADER_PROCESS_CLI" "$goal"
 
   # setsid so the grader outlives the tick that started it — the tick is a cron
   # child and its process group is torn down when it returns. Detached from the
   # tick's stdin so a grader can never consume the caller's input.
   setsid sudo -n -u "agent-${seat}" bash -lc "$script" >>"$logf" 2>&1 </dev/null &
+  local pid=$!
+  # The grace is the whole difference between "started" and "was launched". It is
+  # spent once per spawn, in a tick that already spends a sudo and a DB write per
+  # spawn, and it buys the only window in which a refusal is still attributable.
+  sleep "$_GRADER_PROCESS_START_GRACE" 2>/dev/null || true
+  if ! _grader_process_started "$pid" "$ident"; then
+    warn "$ident: grader process ${sid} on $seat did not start — see ${logf}"
+    _grader_process_unwind "$seat" "$ident" "$sid" "$rid" "$prev_assignee"
+    return 4
+  fi
   disown 2>/dev/null || true
   return 0
 }
