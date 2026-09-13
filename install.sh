@@ -962,6 +962,13 @@ JOURNALD
   chmod 755 "$BIN_DIR/5dive-agent-start"
   ok "5dive-agent-start → $BIN_DIR/5dive-agent-start"
 
+  # DIVE-3965: the unit's ExecStopPost notifier. Fetched next to the launcher
+  # because it shares the launcher's constraint — it has to work when the
+  # bundle itself is the thing that is broken.
+  curl -fsSL "$REPO/5dive-agent-stop-notify" -o "$BIN_DIR/5dive-agent-stop-notify"
+  chmod 755 "$BIN_DIR/5dive-agent-stop-notify"
+  ok "5dive-agent-stop-notify → $BIN_DIR/5dive-agent-stop-notify"
+
   # >>> DIVE-4194 box-side scripts
   # The helper scripts below used to be three hand-written curl/chmod/ok blocks
   # right here, and this file was their ONLY writer. The control plane's nightly
@@ -1574,7 +1581,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   systemctl daemon-reload || true
 
   # 3. Binaries + shared libs
-  rm -f "$BIN_DIR/5dive" "$BIN_DIR/5dive-agent-start"
+  rm -f "$BIN_DIR/5dive" "$BIN_DIR/5dive-agent-start" "$BIN_DIR/5dive-agent-stop-notify"
   ok "removed CLI binaries"
   if [[ -d "$LIB_DIR" ]]; then
     rm -rf "$LIB_DIR"
