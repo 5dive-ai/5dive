@@ -6182,8 +6182,8 @@ _hb_tok_scale() {
   local n="${1:-}"
   [[ "$n" =~ ^[0-9]+$ ]] || { printf '%s' "${n:-?}"; return 0; }
   if   (( n >= 1000000000 )); then printf '%s.%sB' "$(( n / 1000000000 ))" "$(( (n % 1000000000) / 100000000 ))"
-  elif (( n >= 1000000 ))    then printf '%s.%sM' "$(( n / 1000000 ))"    "$(( (n % 1000000) / 100000 ))"
-  elif (( n >= 1000 ))       then printf '%sk' "$(( n / 1000 ))"
+  elif (( n >= 1000000 ));   then printf '%s.%sM' "$(( n / 1000000 ))"    "$(( (n % 1000000) / 100000 ))"
+  elif (( n >= 1000 ));      then printf '%sk' "$(( n / 1000 ))"
   else printf '%s' "$n"; fi
 }
 
