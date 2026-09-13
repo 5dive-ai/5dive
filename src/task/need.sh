@@ -167,20 +167,39 @@ cmd_task_track_record() {
 }
 
 # DIVE-1145: ship-gating routing policy switch. `5dive task routing [on|off]`
-# (bare / `status` reports state). When ON, a NON-lead agent's decision gate
-# (tier < 2) routes to the org lead first (see cmd_task_need) instead of pinging
-# the human. Default is OFF fleet-wide until the org lead (main) flips it after
-# reviewing the diff. True-human categories (tier-2-floored decisions, and every
-# approval/manual/secret gate) are never routed. Read-only `status` needs no
-# privilege; on/off is a policy write. Mirrors `task precedent` (OSS-21).
+# (bare / `status` reports state). When ON, an unbound tier<2 approval/manual
+# gate from a NON-lead agent routes to the org lead first (see cmd_task_need)
+# instead of pinging the human. Default is OFF fleet-wide until the org lead
+# (main) flips it after reviewing the diff.
+# DIVE-4415: `decision` LEFT THIS PREF'S POPULATION and the default did NOT move.
+# A tier<2 `decision` now routes to the lead by KIND (`_decision_route`), the same
+# bypass access / eng-ship / row-ship / verifier-route already had, so it reaches
+# the lead whatever this pref says. What the pref still governs is the classes that
+# have no kind of their own: an unbound tier<2 approval or manual gate. Every
+# statement this command prints has to be true of THAT population only — the
+# `off` line used to claim it kept decision gates on the human path, which was the
+# one class it had stopped describing. True-human categories (a tier-2-floored
+# decision, a pinned --tier=2, a declared human capability, and every secret gate)
+# are never routed by any of this. Read-only `status` needs no privilege; on/off is
+# a policy write. Mirrors `task precedent` (OSS-21).
 cmd_task_routing() {
   tasks_db_init
   local sub="${1:-status}"
   case "$sub" in
     status|"")
-      local v; v=$(_task_pref_get gate_builder_routing); v="${v:-off}"
-      ok "builder-gate routing: ${v}" \
-         '{pref:"gate_builder_routing", value:$v}' --arg v "$v"
+      # DIVE-4415: read the default through the one helper that owns it. This
+      # printer and the routing block below each carried their own `:-off`, so
+      # "what does an unset pref do" had two answers that only agreed by
+      # coincidence.
+      local v; v=$(_gate_routing_pref)
+      # DIVE-4415: say what this value does NOT govern. The printer had the same
+      # defect as the `off` line in quieter form — it reports a pref an operator
+      # reads as "who gets woken", and since `decision` routes by kind it is no
+      # longer the whole answer for the class most gates are filed under. Naming
+      # the exception here costs one clause and stops the number being read as a
+      # promise about decisions.
+      ok "builder-gate routing: ${v}$([[ -n "$(_task_pref_get gate_builder_routing 2>/dev/null)" ]] || printf ' (default)') — governs an unbound tier<2 approval or manual gate only; a tier<2 decision gate routes to the org lead BY KIND whatever this says (DIVE-4415)" \
+         '{pref:"gate_builder_routing", value:$v, governs:"approval/manual", decision_routes_by_kind:true}' --arg v "$v"
       ;;
     on|enable)
       _task_pref_set gate_builder_routing on
@@ -193,8 +212,8 @@ cmd_task_routing() {
       _task_pref_set gate_builder_routing off
       # DIVE-2054: same reasoning as "task routing on" above — fenced.
       _task_store_audit_log "task routing" "off" 0 -- "pref=gate_builder_routing" || true
-      ok "builder-gate routing: OFF — decision gates ping the human directly" \
-         '{pref:"gate_builder_routing", value:"off"}'
+      ok "builder-gate routing: OFF — this is the shipped default, not an opt-out from one. A tier<2 decision gate routes to the org lead BY KIND (DIVE-4415) and does not read this pref at all; off governs the classes that still do — an unbound tier<2 approval or manual gate, which reaches the paired human." \
+         '{pref:"gate_builder_routing", value:"off", governs:"approval/manual", decision_routes_by_kind:true}'
       ;;
     *)
       fail "$E_USAGE" "usage: 5dive task routing [on|off|status]"
@@ -4554,6 +4573,46 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
   [[ "$_discusses_applied" == "1" ]] && _routable=1
   # DIVE-1495: a verifier-route gate is routable by kind (to the verifier agent).
   [[ "$_verifier_route" == "1" ]] && _routable=1
+  # ── DIVE-4415 — A PLAIN TIER-1 DECISION IS LEAD-ROUTED BY KIND ──────────────
+  #
+  # Measured on a customer box (teal-fox, 0.35.1, 2026-09-13): `--type=decision
+  # --tier=1` filed by a seat whose org row names a `reports_to` lead went STRAIGHT
+  # to the paired human, with `routed_reviewer` and `route_provenance` both NULL and
+  # no "lead-route gate QUEUED" line anywhere in the delivery log. The principal
+  # replied "the agent must decide by himself, this is just confusing noise for a
+  # human"; the lead answered it in one line once it reached him.
+  #
+  # WHY IT HAPPENED, and it is not the epoch machinery the incident first blamed:
+  # `_routable` is already 1 for `decision` at tier<2 (the `case` above), but the
+  # routing block's own condition is a DISJUNCTION OF KINDS, and a plain decision
+  # matches none of them — so the only clause that could fire for it was
+  # `gate_builder_routing == on`, DIVE-1243's rollout pref, which defaults OFF and
+  # which nothing in provisioning ever turns on. Our fleet ran `task routing on`
+  # long ago, which is exactly why this was invisible here: every customer box
+  # inherits the un-rolled-out default and no in-org decision has ever reached a
+  # lead on one.
+  #
+  # SCOPED TO `decision`, DELIBERATELY. approval/manual/access/ship-shaped gates
+  # keep the routing DIVE-3266 gave them — an unbound ship approval still lands on
+  # the human, and reversing that inside a bug fix for a different class is the
+  # widening this codebase keeps a rule against. A `decision` is the one type that
+  # is already agent-clearable BY TYPE (cmd_task_answer needs no designated-reviewer
+  # exception for it), so routing one to the lead grants no authority that did not
+  # already exist — it only decides whose queue the question lands in.
+  #
+  # Every disqualifier still applies BELOW this line: `--tier=2`, the category
+  # floor, and a declared human capability each set `_routable=0` further down, and
+  # an org that resolves no distinct wakeable lead falls through to the human with
+  # `route_provenance='human:no-lead'`.
+  local _decision_route=0
+  [[ "$type" == "decision" && "$tier" != "2" ]] && _decision_route=1
+  # DIVE-4415: did the routing block below actually RESOLVE a reviewer? Read by the
+  # human-path provenance stamp, which must distinguish "a kind routed this and the
+  # chart named nobody" (`no-lead`) from "no kind applied and the pref is off"
+  # (`routing-pref-off`). Inferring it from the pref alone reported every
+  # unwakeable-chain fall-through as a pref decision — caught by arm E3.
+  local _route_attempted=0
+  [[ "$_decision_route" == "1" ]] && _routable=1
   # DIVE-3171: the standing-lead fallback is routable BY KIND, for the same reason
   # eng-ship is — `gate_builder_routing` defaults to OFF, so routable-but-pref-gated
   # would move the ROUTING byte and still ping the human, which is the entire thing the
@@ -4627,6 +4686,18 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
   # PRINT the routing decision at file time; until it lands this row is the only
   # place a mis-declared gate is visible without diffing where it ended up.
   # DIVE-2054: task-store state for $ident, no channel proof — fenced.
+  # DIVE-4415: ONE ROW PER FILING, carrying the args the filing was made with.
+  # The customer incident could not be diagnosed from the box: `task need --withdraw`
+  # NULLs need_type/tier/options/recommend off the row, `gate_history` records the
+  # epoch but not the route, and `agent-audit.log` held ZERO `task need` rows — only
+  # "task need withdraw" and "gate delivery". So after a withdraw there was no record
+  # anywhere of HOW the gate had been filed, and the tier/needs/urgent triple that
+  # decides the whole routing question had to be inferred from its outcome.
+  # DIVE-2054: task-store state for $ident, no channel proof — fenced.
+  _task_store_audit_log "task need filed" ok 0 -- \
+    "task=$ident" "type=$type" "tier=$tier" "tier_arg=${tier_arg:-<unset>}" \
+    "tier_floored=${tier_floored:-0}" "needs=${needs:-<none>}" "urgent=${urgent:-0}" \
+    "filer=$actor" || true
   if [[ -n "$needs" ]]; then
     _task_store_audit_log "task need declared-capability" \
       "$( ((_needs_human)) && echo human-class || echo unrecognised )" 0 -- \
@@ -4674,7 +4745,13 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
     # routing rollout). The other types still honour the pref.
     # DIVE-1359: eng-ship routing is likewise intrinsic to the KIND — it bypasses
     # the pref too, so the fix is live under the default (pref OFF) posture.
-    local _route; _route=$(_task_pref_get gate_builder_routing); _route="${_route:-off}"
+    # DIVE-4415: the default this reads is STILL `off` — see _gate_routing_pref.
+    # The fix did not move it. `decision` left this pref's population instead:
+    # `_decision_route` is the last disjunct below, so a tier<2 decision routes
+    # whatever this prints. Anything that reads or reports this value has to say
+    # so — `cmd_task_routing`'s off/status lines are asserted for it in
+    # tests/gate_decision_lead_rail_unit.sh (arms T1-T5).
+    local _route; _route=$(_gate_routing_pref)
     # DIVE-2224: a title-only floor is intrinsic to the KIND too, and must bypass the
     # pref for the same reason eng-ship does. Routable-but-pref-gated would have left
     # answer A moving the TIER while the human still got the ping -- two layers, and
@@ -4684,7 +4761,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
     # DIVE-3228/3525: a bound `delivery_ref` is a second row-state binding under the
     # SAME `_row_ship` kind — see the block at the `_rowship_delivery` read above for
     # why the input is the binding and not the type.
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_row_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" ]]; then
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_row_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" || "$_standing_route" == "1" || "$_decision_route" == "1" ]]; then
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
       local _reviewer
@@ -4701,6 +4778,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
       if [[ "$_verifier_route" == "1" ]]; then _reviewer="$_route_target"
       elif [[ "$_standing_route" == "1" ]]; then _reviewer="$_standing_target"
       else _reviewer=$(_gate_route_reviewer "$(task_actor "")"); fi
+      _route_attempted=1
       if [[ -n "$_reviewer" ]]; then
         # Persist the designated reviewer on the row. For approval/manual this is
         # what authorizes agent-<_reviewer> to clear the gate later; for decision
@@ -4761,6 +4839,12 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
         # value can carry the axis it actually came from.
         elif [[ "$_floored_by_title" == "1" ]]; then _rtrigger="floored-by-${_floor_axis}"
         elif [[ "$_standing_route"   == "1" ]]; then _rtrigger="standing-lead"
+        # DIVE-4415: the WEAKEST kind, so it sits at the bottom — directly above the
+        # pref, for the reason DIVE-2093 iteration 3 put the standing arm there. Any
+        # more specific kind still wins; when none applies, "this is a plain tier-1
+        # decision and those route to the lead" is why it routed, and the pref is NOT
+        # (it reports `on` on our fleet and `off` on every box this fix is for).
+        elif [[ "$_decision_route"   == "1" ]]; then _rtrigger="decision-tier1"
         else _rtrigger="gate_builder_routing=on"
         fi
         # DIVE-2093 iteration 3 (main2's blocker 1): the basis is `$_route_prov` ITSELF,
@@ -4887,6 +4971,37 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
       fi
     fi
   fi
+
+  # ── DIVE-4415 — THE HUMAN PATH RECORDS ITS ROUTE TOO ────────────────────────
+  #
+  # Reaching here means no agent was routed. Until now that produced a row with
+  # `routed_reviewer` NULL and `route_provenance` NULL — indistinguishable from a
+  # build that has no routing code, from a routing attempt that failed, and from a
+  # chart that resolved nobody. That indistinguishability is what cost the customer
+  # incident its diagnosis: both epochs of the gate showed EMPTY provenance, so the
+  # first hypothesis was a re-file bug in the epoch machinery, when in fact neither
+  # epoch had ever been a candidate for routing at all.
+  #
+  # `human:<why>` is written on EVERY epoch (this runs on the file path, so a
+  # re-file overwrites it with its own answer rather than inheriting the last one).
+  # It is deliberately a NAMESPACED value: `answer.sh` scopes its one read to the
+  # exact string `seal:standing-lead`, and `_gate_route_why` is only called on the
+  # routed path, so nothing downstream can mistake this for a route.
+  local _hp_why=""
+  if   [[ "$type" == "secret" ]];                      then _hp_why="type-secret"
+  elif [[ "$type" == "manual" && "$tier" == "2" ]];    then _hp_why="type-manual-tier2"
+  elif [[ "$_needs_human" == "1" ]];                   then _hp_why="needs-capability:${needs:-<derived>}"
+  elif [[ "$tier_arg" == "2" ]];                       then _hp_why="tier2-pinned"
+  elif [[ "$tier_floored" == "1" ]];                   then _hp_why="category-floor"
+  elif [[ "$_route_attempted" == "1" ]];                then _hp_why="no-lead"
+  elif [[ "$_routable" != "1" ]];                      then _hp_why="not-routable:${type}/tier${tier}"
+  elif [[ "$(_gate_routing_pref)" != "on" ]];          then _hp_why="routing-pref-off"
+  else                                                      _hp_why="unresolved"
+  fi
+  db "UPDATE tasks SET route_provenance=$(sqlq "human:${_hp_why}") WHERE id=${id};"
+  # DIVE-2054: task-store state for $ident, no channel proof — fenced.
+  _task_store_audit_log "task need human-route" ok 0 -- \
+    "task=$ident" "type=$type" "tier=$tier" "filer=$actor" "route=human:${_hp_why}" || true
 
   # DIVE-2004: LOUD AT FILE TIME. Reaching here means the gate was NOT lead-routed,
   # so it has no routed_reviewer. A `decision` in that state can be answered by any

@@ -153,8 +153,21 @@ _A8=$(audit_route)
 grep -q 'delivery=failed' <<<"$_A8" && ok_t "audit row carries delivery=failed" || bad_t "audit delivery=failed" "audit: $_A8"
 grep -qE 'lead-route error' <<<"$_A8" && ok_t "audit result is error, NOT the old hardcoded green (olivia's 1968 finding)" \
   || bad_t "audit result not a false green" "audit: $_A8"
-[[ "$(grep -c 'task need' "$AUDIT_LOG_FILE")" == "1" ]] && ok_t "ONE audit row per routed gate (no second row for the same send)" \
+# DIVE-4415: the predicate NAMES THE EVENT IT MEANS. Its own comment is "no second
+# row for the same send", i.e. one DELIVERY row per routed gate — but it counted
+# every line containing "task need", so it also silently forbade any other
+# task-need telemetry ever being added. DIVE-4415 adds exactly one such row (the
+# filing's own args, which the customer incident had to be diagnosed without), and
+# that made a control about double-counted SENDS red for a reason unrelated to
+# sends. Narrowed to the delivery event, and the new row gets its own count arm
+# below so the total is still asserted, not merely allowed to drift.
+[[ "$(grep -c 'task need lead-route' "$AUDIT_LOG_FILE")" == "1" ]] && ok_t "ONE lead-route audit row per routed gate (no second row for the same send)" \
   || bad_t "one audit row" "audit: $(cat "$AUDIT_LOG_FILE")"
+[[ "$(grep -c 'task need filed' "$AUDIT_LOG_FILE")" == "1" ]] && ok_t "DIVE-4415: exactly one filing row, carrying the args the gate was filed with" \
+  || bad_t "one filing row" "audit: $(cat "$AUDIT_LOG_FILE")"
+grep -q 'task need filed .*type=decision tier=1 tier_arg=<unset> tier_floored=0 needs=<none> urgent=1' "$AUDIT_LOG_FILE" \
+  && ok_t "DIVE-4415: the filing row names tier, the PINNED tier, the floor, the declared capability and urgency" \
+  || bad_t "filing row args" "audit: $(grep 'task need filed' "$AUDIT_LOG_FILE")"
 # The gate itself must still stand: a failed PING is not a failed FILING. Losing a
 # gate is worse than delaying one (DIVE-1927).
 [[ "$(db "SELECT status FROM tasks WHERE ident='DIVE-8';")" == "blocked" \

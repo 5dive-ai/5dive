@@ -225,15 +225,30 @@ assert_not_routed() { # <ident> <label>
     && ok_t "$lbl" || bad_t "$lbl" "tier='$t' routed='$r' human=$HUMAN_PINGED"
 }
 
+# DIVE-4415: the PHANTOM arms below can no longer use "no reviewer" as their
+# observable. A plain tier-1 `decision` now routes to the lead BY KIND
+# (`decision-tier1`), so "did a phantom eng-ship/curation hit fire?" and "was this
+# gate routed?" have stopped being the same question — for these arms specifically,
+# because they file decisions. The claim they exist to grade is unchanged and is now
+# read where it actually lives: the receipt's TRIGGER. A phantom hit says `eng-ship`
+# or `curation`; a clean gate says `decision-tier1`. That is a STRICTER grade than
+# the old one, which could not distinguish "no phantom" from "the pref happened to
+# be off".
+assert_no_phantom_kind() { # <ident> <label> <forbidden-trigger> <receipt>
+  local id="$1" lbl="$2" bad="$3" out="$4" t; t=$(tierof "$id")
+  [[ "$t" == "1" && "$out" == *"decision-tier1"* && "$out" != *"$bad"* ]] \
+    && ok_t "$lbl" || bad_t "$lbl" "tier='$t' routed='$(routedof "$id")' human=$HUMAN_PINGED receipt=$out"
+}
+
 # (7a) ENG-SHIP PHANTOM. `push[^.]*github` is a bounded-distance pattern: 'push' ends
 #      the ask, 'github' opens the title, and the window closes over the join. Neither
 #      field is about shipping anything. A phantom hit here routes the gate to the lead
 #      BY KIND, bypassing the pref -- it removes the human from a gate nobody
 #      classified as engineering.
 route_reset; seed DIVE-861 'github outage postmortem, customer impact'
-actor_seam_as dev; cmd_task_need DIVE-861 --type=decision --from=dev \
-  --ask="approve the push" --options="A|B" --recommend="A" >/dev/null 2>&1
-assert_not_routed DIVE-861 "seam: 'push' in ask + 'github' in title does NOT fabricate an ENG-SHIP downgrade"
+actor_seam_as dev; OUT7A=$(cmd_task_need DIVE-861 --type=decision --from=dev \
+  --ask="approve the push" --options="A|B" --recommend="A" 2>&1)
+assert_no_phantom_kind DIVE-861 "seam: 'push' in ask + 'github' in title does NOT fabricate an ENG-SHIP downgrade" eng-ship "$OUT7A"
 
 # (7b) NON-VACUITY for (7a): a REAL eng-ship ask must still route to the lead. Without
 #      this, (7a) passes by breaking the DIVE-1359 eng-ship class outright.
@@ -245,9 +260,9 @@ assert_lead_routed DIVE-862 "non-vacuity: a REAL eng-ship ask (one field) still 
 # (7c) CURATION PHANTOM. `ready for the (queue|drip)` spans the seam: 'ready for the'
 #      ends the ask, 'queue' opens the title. Neither field is about content curation.
 route_reset; seed DIVE-863 'queue of open support tickets'
-actor_seam_as dev; cmd_task_need DIVE-863 --type=decision --from=dev \
-  --ask="is this ready for the" --options="A|B" --recommend="A" >/dev/null 2>&1
-assert_not_routed DIVE-863 "seam: 'ready for the' in ask + 'queue' in title does NOT fabricate a CURATION downgrade"
+actor_seam_as dev; OUT7C=$(cmd_task_need DIVE-863 --type=decision --from=dev \
+  --ask="is this ready for the" --options="A|B" --recommend="A" 2>&1)
+assert_no_phantom_kind DIVE-863 "seam: 'ready for the' in ask + 'queue' in title does NOT fabricate a CURATION downgrade" curation "$OUT7C"
 
 # (7d) NON-VACUITY for (7c): a REAL curation ask must still route to the reviewer.
 route_reset; seed DIVE-864 'onboarding rewrite'
