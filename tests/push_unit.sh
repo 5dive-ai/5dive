@@ -1383,6 +1383,57 @@ else
   [[ "$got" == "chore(DIVE-4423): a board title" ]] \
     && ok_t "4423: with no rule to read the mint takes the by-construction form, not the subject" \
     || bad_t "4423: with no rule to read the mint takes the by-construction form, not the subject" "got: $got"
+
+  # 7. THE GREP'S OWN NO-MATCH PATH. Arm 6 returns at the `-f` test and never
+  #    reaches the grep at all, so until this arm the line that actually probes
+  #    the workflow was graded only on trees where it matched. Here the file IS
+  #    present and the rule literal is NOT in it.
+  NOPAT="$TMP/t4423-nopattern"; mkdir -p "$NOPAT/.github/workflows"
+  printf 'name: pr-title-lint\non:\n  pull_request:\njobs:\n  lint:\n    steps:\n      - run: echo "this file carries no rule line"\n' \
+    > "$NOPAT/.github/workflows/pr-title-lint.yml"
+  _push_title_passes_lint "$NOPAT" "feat(push): a subject with no rule to grade it" \
+    && bad_t "4423: a workflow file with no rule line is not a pass" "it certified a title the rule never graded" \
+    || ok_t "4423: a workflow file with no rule line is not a pass"
+  got=$(_push_mint_pr_title DIVE-4423 "$NOPAT" main feat-conventional "a board title")
+  [[ "$got" == "chore(DIVE-4423): a board title" ]] \
+    && ok_t "4423: an ungradeable rule file takes the by-construction form, not the subject" \
+    || bad_t "4423: an ungradeable rule file takes the by-construction form, not the subject" "got: $got"
+
+  # 8. DIVE-4423 iteration 2 (quinn). The helper must FAIL BY RETURNING, not by
+  #    dying inside its own probe. Today's only production call site (the `if` in
+  #    _push_mint_pr_title) suppresses errexit dynamically THROUGH the call, so a
+  #    bare `line=$(grep …)` on the no-match path was invisible there — the guard
+  #    was being supplied by the caller's context, and any future direct call,
+  #    `&&` chain, or assignment of the result would have resurrected the abort.
+  #
+  #    Graded in a CHILD SHELL, and this is not ceremony: the harness itself runs
+  #    without errexit, and `( set -e … ) || x` cannot grade it either because the
+  #    exemption propagates INTO the subshell. The call is a bare standalone
+  #    statement under `set -euo pipefail`, so the shell exits either way and rc
+  #    alone cannot tell the two apart (measured). What DOES tell them apart is
+  #    WHICH command failed: with the guard the ERR trap fires on the guard's own
+  #    `return 1`; without it, it fires on the grep assignment two lines above,
+  #    which the guard never gets to read. The payload is read from STDOUT.
+  bare_out=$(FIVE_SRC="$PWD/$SRC" bash -c '
+      set -uo pipefail
+      for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
+               lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
+               lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_push.sh; do
+        # shellcheck source=/dev/null
+        source "$FIVE_SRC/$f" || exit 97
+      done
+      trap '"'"'printf "FAILED-ON=%s\n" "$BASH_COMMAND"'"'"' ERR
+      set -eE
+      _push_title_passes_lint "$1" "feat(push): a subject with no rule to grade it"
+      printf "UNREACHABLE-PASS\n"
+    ' _ "$NOPAT" 2>/dev/null)
+  bare_rc=$?
+  { [[ $bare_rc -ne 0 && $bare_rc -ne 97 ]] \
+      && grep -q '^FAILED-ON=return 1$' <<<"$bare_out" \
+      && ! grep -q 'FAILED-ON=.*grep -m1' <<<"$bare_out" \
+      && ! grep -q 'UNREACHABLE-PASS' <<<"$bare_out"; } \
+    && ok_t "4423: a BARE call under set -euo pipefail fails by RETURNING, not inside its own grep" \
+    || bad_t "4423: a BARE call under set -euo pipefail fails by RETURNING, not inside its own grep" "rc=$bare_rc :: $bare_out"
 fi
 
 echo "-----"

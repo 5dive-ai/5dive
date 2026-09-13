@@ -841,7 +841,13 @@ _push_title_passes_lint() {
   [[ -n "$repopath" && -n "$title" ]] || return 1
   wf="${repopath}/.github/workflows/pr-title-lint.yml"
   [[ -f "$wf" ]] || return 1
-  line="$(grep -m1 -F 'if [[ "$PR_TITLE" =~ ' "$wf" | sed 's/^[[:space:]]*//')"
+  # `|| line=""` and NOT `|| true`: under the bundle's `set -euo pipefail` a bare
+  # assignment from a no-match grep kills the caller with nothing on stdout or
+  # stderr (DIVE-2566/2603/2604), and today only the `if` at the single call site
+  # below hides that — errexit suppression is the CALLER's, not this line's, so a
+  # direct call, an `&&` chain or an assignment of the result resurrects the abort.
+  # The empty value is the post-condition the very next line already reads.
+  line="$(grep -m1 -F 'if [[ "$PR_TITLE" =~ ' "$wf" | sed 's/^[[:space:]]*//')" || line=""
   [[ -n "$line" ]] || return 1
   PR_TITLE="$title" eval "$line true; else false; fi"
 }
