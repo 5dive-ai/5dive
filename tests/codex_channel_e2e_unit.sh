@@ -346,10 +346,24 @@ const fromCli = JSON.parse(readFileSync('${TMP}/drained.json', 'utf8')) as Dispa
   await h.d.initialize()
   say('c3_notice_source', h.published[0]?.route?.source)
   say('c3_notice_kind', h.published[0]?.meta?.kind)
-  say('c3_notice_says_restart', /restarted/.test(h.published[0]?.text ?? ''))
+  // Assert the FACT, not the sentence. DIVE-3965 made the notice cause-aware
+  // ("restarted" for a clean stop, "stopped unexpectedly" for a crash) and this
+  // harness grades a repo we do not own, fetched unpinned at CI run time — an
+  // exact-string arm here reds 5dive's main on a 5dive-plugins merge (DIVE-4435).
+  say('c3_notice_says_went_down', /restarted|stopped unexpectedly/.test(h.published[0]?.text ?? ''))
+  // The negative half: the notice must not be the interrupted message echoed back.
+  say('c3_notice_is_not_the_lost_message', !/^interrupted$/.test(h.published[0]?.text ?? ''))
   const started = h.requests.filter(r => r.method === 'turn/start')
   say('c3_recovered_trigger', started[0]?.params?.turnTrigger)
-  say('c3_recovered_text', started[0]?.params?.input?.[0]?.text)
+  // DIVE-3965 also PREPENDS a recovery-context element to the next turn's input
+  // rather than replacing the queued message. Index 0 is therefore no longer the
+  // message; what must hold is that the queued text survives the restart VERBATIM
+  // as its own element, so a dropped or mangled message still reds.
+  const c3in = (started[0]?.params?.input ?? []) as Array<{ type?: string; text?: string }>
+  say('c3_recovered_text_verbatim', c3in.some(e => e?.text === 'queued while it was down'))
+  // ...and that it was carried, not merely mentioned inside some larger blob.
+  say('c3_recovered_text_is_own_element',
+      c3in.filter(e => e?.text === 'queued while it was down').length)
   say('c3_pending_left', h.snapshot()?.pending?.length)
 }
 
@@ -379,9 +393,11 @@ DRIVER_EOF
 
     eq_t "stage C3: a restart tells the route whose turn it lost" '"telegram"' "$(_v c3_notice_source)"
     eq_t "stage C3: and tells it as an error, not as a model reply" '"error"' "$(_v c3_notice_kind)"
-    eq_t "stage C3: the notice actually says it restarted" 'true' "$(_v c3_notice_says_restart)"
+    eq_t "stage C3: the notice actually says the dispatcher went down" 'true' "$(_v c3_notice_says_went_down)"
+    eq_t "stage C3: and is not the lost message echoed back" 'true' "$(_v c3_notice_is_not_the_lost_message)"
     eq_t "stage C3: work queued while it was down is recovered" '"5dive:dashboard"' "$(_v c3_recovered_trigger)"
-    eq_t "stage C3: recovered with its text intact" '"queued while it was down"' "$(_v c3_recovered_text)"
+    eq_t "stage C3: recovered with its text intact" 'true' "$(_v c3_recovered_text_verbatim)"
+    eq_t "stage C3: as its own input element, exactly once" '1' "$(_v c3_recovered_text_is_own_element)"
     eq_t "stage C3: and the queue is empty afterwards" '0' "$(_v c3_pending_left)"
   else
     bad_t "stage C: the dispatcher driver did not run" "$(tail -5 "$TMP/driver.err")"

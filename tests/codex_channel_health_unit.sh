@@ -70,6 +70,22 @@ rec() { # rec [jq-filter-to-apply]
       bound:true, threadId:"thread-1", lastInboundAt:$in, lastOutboundAt:$out,
       queueDepth:0}' <<<'{}' | jq -c "${1:-.}"
 }
+# §5 goes through `agent_channel_handshake`, which takes no `now` and reads the
+# REAL clock — so a record stamped off the frozen NOW above is fresh for exactly
+# 60s of wall-clock and `stale` forever after. That is what reds main at
+# 12:01Z on 2026-09-13 and every instant since (DIVE-4435). Arms that call the
+# un-pinned path must stamp off the same clock that path reads.
+rec_wall() { # rec_wall [jq-filter-to-apply] — same record, real-clock timestamps
+  local _n; _n=$(date +%s)
+  jq -c --arg u "$(date -u -d "@$(( _n - 5 ))" +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg in "$(date -u -d "@$(( _n - 30 ))" +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg out "$(date -u -d "@$(( _n - 20 ))" +%Y-%m-%dT%H:%M:%SZ)" \
+    '{schema:1, bridge:"codex-dispatcher", bridgeVersion:"0.5.18", pid:4242,
+      startedAt:"2026-09-13T11:50:00Z", updatedAt:$u, heartbeatMs:15000,
+      declared:["telegram","dashboard"], listening:["telegram","dashboard"],
+      bound:true, threadId:"thread-1", lastInboundAt:$in, lastOutboundAt:$out,
+      queueDepth:0}' <<<'{}' | jq -c "${1:-.}"
+}
 cl() { # cl <record> [attempts] [max] [active] [declared]
   _channel_health_classify "$1" "${5:-telegram,dashboard}" "${4:-yes}" "${2:-0}" "${3:-2}" "$NOW"
 }
@@ -208,9 +224,16 @@ t "5.1 no record, no bridge expected -> the reader declines to answer" "" \
   "$(agent_channel_handshake a telegram,dashboard claude yes)"
 t "5.2 no record, a bridge WAS expected -> absent" "absent" \
   "$(st "$(agent_channel_handshake a telegram,dashboard codex yes)")"
-FAKE_RECORD=$(rec)
+FAKE_RECORD=$(rec_wall)
 t "5.3 a record is believed whatever the registry calls the seat" "bound" \
   "$(st "$(agent_channel_handshake a telegram,dashboard claude yes)")"
+# The negative half, and the reason 5.3 must stamp off the wall clock: the same
+# record aged past its window is NOT believed. Rejoin these two to the frozen
+# NOW and 5.3 reds on the calendar instead of on the code.
+FAKE_RECORD=$(rec_wall '.updatedAt="2026-09-13T11:50:00Z"')
+t "5.3b and an out-of-window record is not" "stale" \
+  "$(st "$(agent_channel_handshake a telegram,dashboard claude yes)")"
+FAKE_RECORD=$(rec_wall)
 t "5.4 nothing declared is never probed at all" "" \
   "$(agent_channel_handshake a none codex yes)"
 
@@ -222,7 +245,7 @@ FAKE_RECORD=""
 out=$(agent_channels_binding a telegram,dashboard claude yes)
 t  "5.5 with no handshake a refusal still reports refused" "refused" "$(st "$out")"
 t  "5.6 and keeps the three-field contract"                "3"       "$(awk -F'|' '{print NF}' <<<"$out")"
-FAKE_RECORD=$(rec '.listening=["telegram"]')
+FAKE_RECORD=$(rec_wall '.listening=["telegram"]')
 out=$(agent_channels_binding a telegram,dashboard codex yes)
 t  "5.7 the handshake outranks the pane when it exists" "mismatched" "$(st "$out")"
 t  "5.8 and still emits three fields, not four"         "3"          "$(awk -F'|' '{print NF}' <<<"$out")"
