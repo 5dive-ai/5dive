@@ -8,7 +8,7 @@ trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d /tmp/verify-policy-fixture.XXXXXX)"
-P=0 F=0
+P=0; F=0
 ok_t() { P=$((P+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { F=$((F+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
