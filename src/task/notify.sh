@@ -1670,6 +1670,46 @@ _task_gate_ask_line() { # <ask>
   fi
 }
 
+# DIVE-4381: THE BOUND PR LINK, ON THE GATE THE HUMAN IS BEING ASKED TO ANSWER.
+#
+# lodar, Telegram 2026-09-12, on DIVE-4366's "needs you" ping: "shouldnt this link
+# be in human gate notification for convenience?" — he had to ask an agent for the
+# URL of the PR the gate was about. The row already HELD it (tasks.delivery_ref,
+# bound by `task deliver --pr=…`); the ping simply never read the column, so the
+# human's next step was a second tap into /task_<id> or a message to a bot.
+#
+# ONE LINE, and it is prose rather than a button on purpose: a bare https URL is
+# auto-linkified by Telegram (the same property DIVE-390 relies on for /task_<n>),
+# a plain-text host renders it inert but still copy-pasteable, and no tap handler
+# has to learn a new callback. It is a FUNCTION for the DIVE-2411 reason — the
+# copy is half the fix, so the copy is what a test can grade.
+#
+# TYPE-BLIND, DELIVERY-REF-KEYED. Every gate on a row with a bound PR gets the
+# line, not just approval/manual: a decision or access gate about a change is
+# answered by looking at the same diff, and suppressing it there would make the
+# human ask for the URL on exactly the gates where the ask is least mechanical.
+# A secret gate mints its own drop link, but that link is a DIFFERENT thing (where
+# the credential goes, not what to review), so the two coexist rather than
+# compete — and a secret gate on a row with no delivery_ref still shows one link.
+#
+# ONLY WHEN IT IS A URL, and the direction is chosen: `delivery_ref` is a free
+# TEXT column and rows carry bare branch names and PR numbers in it. Rendering
+# one as a link would produce a dead tap, so the predicate is a literal
+# http(s):// prefix and anything else emits NOTHING — the caller then appends no
+# line at all, not an empty one.
+_task_gate_delivery_link_line() { # <row_id> -> "🔗 Review: <url>" or nothing
+  local numid="${1:-}" _ref=""
+  [[ "$numid" =~ ^[0-9]+$ ]] || return 0
+  _ref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${numid};" 2>/dev/null) || _ref=""
+  # Trim: a ref stored with surrounding whitespace is still a URL, and an
+  # all-whitespace ref is still nothing.
+  _ref="${_ref#"${_ref%%[![:space:]]*}"}"; _ref="${_ref%"${_ref##*[![:space:]]}"}"
+  case "$_ref" in
+    https://*|http://*) printf '%s' "🔗 Review: ${_ref}" ;;
+    *) return 0 ;;
+  esac
+}
+
 _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <channel_type> [label]
   local numid="$1" need_type="$2" options="$3" recommend="$4" human_nonce="$5" channel_type="$6" label="${7:-}"
   [[ -n "$label" ]] && label="[${label}] "
@@ -2534,6 +2574,14 @@ _task_need_notify_deliver_now() {
   # (quinn's iteration-1 grade caught this path still emitting the full ask).
   # The full ask stays one tap away behind /task_<id>.
   text+=$'\n\n'"$(_task_gate_ask_line "$ask") /task_${numid}"
+
+  # DIVE-4381: the bound PR, right under the ask and above the type CTA — the
+  # human reads "what am I deciding", then "here is the thing to look at", then
+  # "here is how to clear it". Emitted only when the row actually carries a URL
+  # (the helper returns nothing otherwise), so a row with no delivery_ref and a
+  # row holding a bare branch name both render byte-identically to before.
+  local _dlink; _dlink=$(_task_gate_delivery_link_line "$numid")
+  [[ -n "$_dlink" ]] && text+=$'\n'"$_dlink"
 
   # DIVE-356: secret/manual gates used to carry NO instruction on how to clear
   # them — the core of Mark's "a needs-you that needs no obvious action is

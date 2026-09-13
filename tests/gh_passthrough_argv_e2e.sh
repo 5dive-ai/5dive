@@ -138,7 +138,7 @@ chk "E JSON class is 'passthrough'" "passthrough" "$cls"
 # that is not a passthrough, so a green here means the two cases remain
 # distinguishable rather than that the backstop was disabled wholesale.
 int=$(GH_STUB_RC=0 "$FIVE" gh --as=nonsense pr view 51 2>&1 >/dev/null)
-case "$int" in *"--as must be auto, bot or caller"*) ok "F an internal refusal still reports itself" ;;
+case "$int" in *"--as must be auto, bot, caller or reviewer"*) ok "F an internal refusal still reports itself" ;;
   *) bad "F an internal refusal still reports itself" "got: $int" ;; esac
 case "$int" in *"class=read"*|*"actor="*)
     bad "F an internal refusal runs nothing" "banner printed before validation: $int" ;;

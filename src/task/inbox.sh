@@ -464,6 +464,12 @@ _task_inbox_send() {
     # off a button (decision's ⭐ first button carries it verbatim; approval/secret
     # buttons are generic verbs, so there this line is the only copy). Predicate =
     # the markup actually produced, same rule as the single-gate site.
+    # DIVE-4381: the same bound-PR line the first delivery carries. The batch
+    # re-send is the message a founder reads when a gate has SAT, which is when
+    # "which PR was this again?" is most likely — a link on the first ping only
+    # would drift exactly the way DIVE-1490 forbids.
+    local _dl; _dl=$(_task_gate_delivery_link_line "$id")
+    [[ -n "$_dl" ]] && gate_text+=$'\n'"$_dl"
     [[ -n "$recommend" && "$markup" != *"$recommend"* ]] && gate_text+=$'\n'"✅ Recommended: ${recommend}"
     [[ -n "$options" && -z "$markup" ]] && gate_text+=$'\n'"Options: ${options}"
     # DIVE-2818: the high-stakes reply-to-clear prompt reaches the BATCH re-send
