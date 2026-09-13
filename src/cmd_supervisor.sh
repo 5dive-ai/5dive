@@ -341,8 +341,46 @@ _SUP_ALERT_WINDOW_H="${SUPERVISOR_ALERT_WINDOW_H:-24}"
 # Anthropic ID/age-verification challenge, so the phrasing is inferred. We ship
 # alert-only and tune this (or override via SUPERVISOR_VERIFY_PAT) on the first
 # real signature (DIVE-1127 verify-time last-mile).
+#
+# DIVE-4405: the third alternative used to end in the bare STEM `verif`, which
+# admits `verified`/`unverified` — so the ordinary idle line
+#   "Nothing left to continue - DIVE-4394 is closed and verified"
+# ("to continue" + "verif" 30 chars later) paged lodar as an ID challenge on
+# 2026-09-13. That clause now requires the imperative directed at the reader
+# (`verify your` / `verify you`) — the bare stem appears in no alternative. No
+# trailing space is required after it: a TUI wraps, and "…please verify your"
+# can legitimately be the last thing on a line.
 _SUP_VERIFY_PAT="${SUPERVISOR_VERIFY_PAT:-}"
-[[ -n "$_SUP_VERIFY_PAT" ]] || _SUP_VERIFY_PAT='(verify|confirm)[[:space:]]+(your[[:space:]]+)?(identity|age)|please[[:space:]]+verify[[:space:]]+your|(to[[:space:]]+continue|you[[:space:]]+must)[^.]{0,30}verif|government[- ]?issued[[:space:]]+(photo[[:space:]]+)?id|verify[[:space:]]+that[[:space:]]+you[[:space:]]+are[[:space:]]+(over|at[[:space:]]+least)|age[[:space:]-]*restricted'
+[[ -n "$_SUP_VERIFY_PAT" ]] || _SUP_VERIFY_PAT='(verify|confirm)[[:space:]]+(your[[:space:]]+)?(identity|age)|please[[:space:]]+verify[[:space:]]+your|(to[[:space:]]+continue|you[[:space:]]+must)[^.]{0,30}verify[[:space:]]+(your|you)|government[- ]?issued[[:space:]]+(photo[[:space:]]+)?id|verify[[:space:]]+that[[:space:]]+you[[:space:]]+are[[:space:]]+(over|at[[:space:]]+least)|age[[:space:]-]*restricted'
+
+# ── DIVE-4405: OUR OWN ALERT, RENDERED INTO A PANE, IS NOT PANE EVIDENCE ─────
+#
+# The second page on 2026-09-13 (agent-main, 05:51Z) was the FIRST page: main's
+# pane was displaying the alert a2a-send, whose text carries the tripped line
+# verbatim ("Pane signature: <excerpt>"). Every pane classifier here reads the
+# screen, and the screen is where we deliver alerts and messages — so any
+# signature we emit is guaranteed to come back as input on the next tick.
+#
+# Dropped BEFORE the match, for every classifier, not just the one that fired:
+# a line carrying `[TRIPWIRE`, `[5dive-msg` or our alert's own `Pane signature:`
+# label is machine output of ours, never a harness interstitial. Matched
+# ANYWHERE in the line, not anchored: the TUI renders a received message inside
+# a box with its own gutter, and an anchor would be defeated by one border glyph.
+#
+# RESIDUAL, signed and not closed here: tmux returns WRAPPED rows, so a long
+# alert can put the excerpt on a continuation row carrying none of these
+# markers, and that row is still matchable. `Pane signature:` catches the common
+# wrap point (the excerpt starts right after it); the other two controls on that
+# path are the tightened pattern above — the line that actually paged no longer
+# matches at all — and the 24h per-account alert dedupe.
+_SUP_PANE_ECHO_PAT='\[(TRIPWIRE|5dive-msg)|Pane signature:'
+
+# Pure, no I/O: pane text in, the same text minus our own echoed machine lines.
+# `|| true` because grep -v exits 1 when it drops everything, and an all-echo
+# pane is a legitimately clean pane, not a failure.
+_sup_pane_drop_echoes() {  # <pane-text-on-stdin>
+  grep -vE "$_SUP_PANE_ECHO_PAT" 2>/dev/null || true
+}
 
 # DIVE-971: per-type telegram-bridge pgrep pattern (matched against the agent
 # user's process argv, -f). claude's forked plugin argv carries the cache path
@@ -436,7 +474,7 @@ _sup_probe_state() {
 # _sup_verify_challenge so the false-positive-critical regex is unit-testable
 # without a live tmux (mirrors how _sup_act_plan is the pure, tested core).
 _sup_verify_match() {  # <pane-text-on-stdin>
-  grep -iE "$_SUP_VERIFY_PAT" 2>/dev/null | head -1 \
+  _sup_pane_drop_echoes | grep -iE "$_SUP_VERIFY_PAT" 2>/dev/null | head -1 \
     | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
 }
 
@@ -487,7 +525,7 @@ _SUP_PROMPT_PAT="${SUPERVISOR_PROMPT_PAT:-}"
 # for the same reason _sup_verify_match and _sup_quota_match are: the
 # false-positive-critical regex has to be gradeable without a live tmux.
 _sup_prompt_match() {  # <pane-text-on-stdin>
-  grep -E "$_SUP_PROMPT_PAT" 2>/dev/null | tail -1 \
+  _sup_pane_drop_echoes | grep -E "$_SUP_PROMPT_PAT" 2>/dev/null | tail -1 \
     | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
 }
 
@@ -500,9 +538,14 @@ _sup_prompt_match() {  # <pane-text-on-stdin>
 # Claude marks the selected row with ❯ (or a bare '>' on a terminal without it).
 # No cursor visible => rc 1 => we do not answer, we page. Fail-closed, because
 # the failure mode of guessing is an irreversible choice made by a watchdog.
+# DIVE-4405 (iteration 2): the pre-filter runs HERE TOO, and this is the reader
+# that most needed it. A TUI renders an inbound a2a/alert inside a box whose
+# gutter is a bare '>', so an echoed alert quoting "…(Recommended)" reads as a
+# cursor row and authorises Enter on whatever the model was actually sitting on.
+# The four other pane-text-on-stdin readers only page; this one ACTS.
 _sup_prompt_recommended() {  # <pane-text-on-stdin>
   local line
-  line=$(grep -E '^[[:space:]]*(❯|>)[[:space:]]' 2>/dev/null | tail -1) || return 1
+  line=$(_sup_pane_drop_echoes | grep -E '^[[:space:]]*(❯|>)[[:space:]]' 2>/dev/null | tail -1) || return 1
   [[ -n "$line" ]] || return 1
   [[ "$line" == *"(Recommended)"* ]]
 }
@@ -569,7 +612,7 @@ _sup_quota_match() {  # <pane-text-on-stdin> [now_epoch]
   local now="${1:-}"
   [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
   local matches
-  matches=$(grep -iE "${_SUP_QUOTA_PAT}|${_SUP_WEEKLY_QUOTA_PAT}" 2>/dev/null \
+  matches=$(_sup_pane_drop_echoes | grep -iE "${_SUP_QUOTA_PAT}|${_SUP_WEEKLY_QUOTA_PAT}" 2>/dev/null \
     | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160) || matches=""
   [[ -n "$matches" ]] || return 0
   local line st ep last="" live="" live_ep=-1
