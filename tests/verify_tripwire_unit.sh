@@ -72,6 +72,62 @@ t "verification tests"                         "clean" "$(hit '39/39 verificatio
 t "identity of the caller (code talk)"         "clean" "$(hit 'we assert the identity of the caller matches')"
 t "empty pane"                                 "clean" "$(hit '')"
 
+# --- DIVE-4405: the stem `verif` is not a challenge -------------------------
+# On 2026-09-13 lodar was paged twice for idle accounts. The clause
+# `(to continue|you must)[^.]{0,30}verif` matched an ordinary closure line
+# ("to continue" + "verified" 30 chars later). The clause now demands the
+# imperative, so the two lines below are the discriminator.
+CLOSURE_LINE='Nothing left to continue — DIVE-4394 is closed and verified'
+t "DIVE-4405: an idle 'closed and verified' closure line is clean" "clean" "$(hit "$CLOSURE_LINE")"
+t "DIVE-4405: 'nothing to continue, work is unverified' is clean" "clean" \
+  "$(hit 'nothing to continue here, the residual is still unverified')"
+t "DIVE-4405: the to-continue imperative still trips (clause kept, not deleted)" "tripped" \
+  "$(hit 'To continue you must verify your details before the next run')"
+t "DIVE-4405: the real challenge phrasing trips" "tripped" \
+  "$(hit 'To continue, please verify your identity with a government-issued ID')"
+
+# POSITIVE CONTROL for the two negatives above: with the OLD stem clause
+# restored via the env escape hatch, the closure line DOES trip. Without this
+# the negatives would pass on a pattern that never matched that line at all.
+( export SUPERVISOR_VERIFY_PAT='(to[[:space:]]+continue|you[[:space:]]+must)[^.]{0,30}verif'
+  source "$SRC/cmd_supervisor.sh"
+  [[ -n "$(printf '%s\n' 'Nothing left to continue — DIVE-4394 is closed and verified' | _sup_verify_match)" ]] \
+    && echo tripped || echo clean
+) > "$TMP/oldpat"
+t "DIVE-4405 control: the OLD stem clause did trip on that same line" "tripped" "$(cat "$TMP/oldpat")"
+
+# --- DIVE-4405: our own alert, echoed into a pane, is not pane evidence ------
+# Page 2 was page 1: main's pane was displaying the alert a2a-send, which quotes
+# the tripped line verbatim. Every pane classifier now drops our machine lines.
+ALERT_ECHO="[TRIPWIRE id-verification] claude account 'agent-dev' looks STALLED on an ID/age-verification challenge (anthropic-tos-hedge D4 trigger 1). Response: flip this account to the OpenRouter-Claude profile same-day (A1 runbook). Pane signature: To continue, please verify your identity with a government-issued ID"
+t "DIVE-4405: an echoed [TRIPWIRE] alert cannot re-trigger the tripwire" "clean" "$(hit "$ALERT_ECHO")"
+t "DIVE-4405: ...even with the TUI message-box gutter in front of it" "clean" \
+  "$(hit "  │ ${ALERT_ECHO}")"
+t "DIVE-4405: an echoed [5dive-msg] line is dropped too" "clean" \
+  "$(hit '[5dive-msg from main] please verify your identity was the pane signature')"
+# EACH BRANCH OF _SUP_PANE_ECHO_PAT GETS ITS OWN ARM. The alert-echo arms above
+# carry BOTH a '[TRIPWIRE' marker and a 'Pane signature:' excerpt, so either
+# branch alone keeps them green — an alternation is one guard per branch, and a
+# branch no arm can red is a deletable branch. This line carries ONLY the
+# '[TRIPWIRE' marker (a truncated alert, no signature excerpt); deleting
+# TRIPWIRE from the alternation must red it.
+t "DIVE-4405: a [TRIPWIRE line with no signature excerpt is dropped on that marker alone" "clean" \
+  "$(hit '[TRIPWIRE id-verification] agent-dev: To continue, please verify your identity')"
+# THE WRAP SHAPE, and the only arm that grades the `Pane signature:` branch of
+# _SUP_PANE_ECHO_PAT on its own. tmux capture-pane returns WRAPPED rows: a long
+# alert line puts its pane-signature excerpt on a continuation row that carries
+# NO '[TRIPWIRE'/'[5dive-msg' marker — which is precisely how page 2 happened.
+# Deleting `|Pane signature:` from the alternation must red THIS arm.
+t "DIVE-4405: a wrapped continuation row (Pane signature: only, no marker) is dropped" "clean" \
+  "$(hit 'Pane signature: To continue, please verify your identity with a government-issued ID')"
+t "DIVE-4405: ...and with the message-box gutter tmux leaves on the wrapped row" "clean" \
+  "$(hit '>   Pane signature: You must verify your identity before continuing')"
+# POSITIVE CONTROL: the same payload WITHOUT the machine marker still trips, so
+# the arms above prove the drop, not an inert payload.
+t "DIVE-4405 control: the same signature without the marker still trips" "tripped" \
+  "$(hit 'To continue, please verify your identity with a government-issued ID')"
+t "DIVE-4405: an all-echo pane is clean, not an error" "clean" "$(hit "$ALERT_ECHO"$'\n'"$ALERT_ECHO")"
+
 # --- env override: SUPERVISOR_VERIFY_PAT retunes without a release ----------
 ( export SUPERVISOR_VERIFY_PAT='banana-challenge'
   # re-source so the constant picks up the override
