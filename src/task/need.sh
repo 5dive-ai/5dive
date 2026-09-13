@@ -167,12 +167,21 @@ cmd_task_track_record() {
 }
 
 # DIVE-1145: ship-gating routing policy switch. `5dive task routing [on|off]`
-# (bare / `status` reports state). When ON, a NON-lead agent's decision gate
-# (tier < 2) routes to the org lead first (see cmd_task_need) instead of pinging
-# the human. Default is OFF fleet-wide until the org lead (main) flips it after
-# reviewing the diff. True-human categories (tier-2-floored decisions, and every
-# approval/manual/secret gate) are never routed. Read-only `status` needs no
-# privilege; on/off is a policy write. Mirrors `task precedent` (OSS-21).
+# (bare / `status` reports state). When ON, an unbound tier<2 approval/manual
+# gate from a NON-lead agent routes to the org lead first (see cmd_task_need)
+# instead of pinging the human. Default is OFF fleet-wide until the org lead
+# (main) flips it after reviewing the diff.
+# DIVE-4415: `decision` LEFT THIS PREF'S POPULATION and the default did NOT move.
+# A tier<2 `decision` now routes to the lead by KIND (`_decision_route`), the same
+# bypass access / eng-ship / row-ship / verifier-route already had, so it reaches
+# the lead whatever this pref says. What the pref still governs is the classes that
+# have no kind of their own: an unbound tier<2 approval or manual gate. Every
+# statement this command prints has to be true of THAT population only — the
+# `off` line used to claim it kept decision gates on the human path, which was the
+# one class it had stopped describing. True-human categories (a tier-2-floored
+# decision, a pinned --tier=2, a declared human capability, and every secret gate)
+# are never routed by any of this. Read-only `status` needs no privilege; on/off is
+# a policy write. Mirrors `task precedent` (OSS-21).
 cmd_task_routing() {
   tasks_db_init
   local sub="${1:-status}"
@@ -183,8 +192,14 @@ cmd_task_routing() {
       # "what does an unset pref do" had two answers that only agreed by
       # coincidence.
       local v; v=$(_gate_routing_pref)
-      ok "builder-gate routing: ${v}$([[ -n "$(_task_pref_get gate_builder_routing 2>/dev/null)" ]] || printf ' (default)')" \
-         '{pref:"gate_builder_routing", value:$v}' --arg v "$v"
+      # DIVE-4415: say what this value does NOT govern. The printer had the same
+      # defect as the `off` line in quieter form — it reports a pref an operator
+      # reads as "who gets woken", and since `decision` routes by kind it is no
+      # longer the whole answer for the class most gates are filed under. Naming
+      # the exception here costs one clause and stops the number being read as a
+      # promise about decisions.
+      ok "builder-gate routing: ${v}$([[ -n "$(_task_pref_get gate_builder_routing 2>/dev/null)" ]] || printf ' (default)') — governs an unbound tier<2 approval or manual gate only; a tier<2 decision gate routes to the org lead BY KIND whatever this says (DIVE-4415)" \
+         '{pref:"gate_builder_routing", value:$v, governs:"approval/manual", decision_routes_by_kind:true}' --arg v "$v"
       ;;
     on|enable)
       _task_pref_set gate_builder_routing on
@@ -197,8 +212,8 @@ cmd_task_routing() {
       _task_pref_set gate_builder_routing off
       # DIVE-2054: same reasoning as "task routing on" above — fenced.
       _task_store_audit_log "task routing" "off" 0 -- "pref=gate_builder_routing" || true
-      ok "builder-gate routing: OFF — decision gates ping the human directly. This is now an explicit opt-out FROM the default (DIVE-4415): a tier<2 decision/approval gate from a seat with a lead will reach the paired human instead of that lead." \
-         '{pref:"gate_builder_routing", value:"off"}'
+      ok "builder-gate routing: OFF — this is the shipped default, not an opt-out from one. A tier<2 decision gate routes to the org lead BY KIND (DIVE-4415) and does not read this pref at all; off governs the classes that still do — an unbound tier<2 approval or manual gate, which reaches the paired human." \
+         '{pref:"gate_builder_routing", value:"off", governs:"approval/manual", decision_routes_by_kind:true}'
       ;;
     *)
       fail "$E_USAGE" "usage: 5dive task routing [on|off|status]"
@@ -4712,7 +4727,12 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
     # routing rollout). The other types still honour the pref.
     # DIVE-1359: eng-ship routing is likewise intrinsic to the KIND — it bypasses
     # the pref too, so the fix is live under the default (pref OFF) posture.
-    # DIVE-4415: the default this reads is now ON — see _gate_routing_pref.
+    # DIVE-4415: the default this reads is STILL `off` — see _gate_routing_pref.
+    # The fix did not move it. `decision` left this pref's population instead:
+    # `_decision_route` is the last disjunct below, so a tier<2 decision routes
+    # whatever this prints. Anything that reads or reports this value has to say
+    # so — `cmd_task_routing`'s off/status lines are asserted for it in
+    # tests/gate_decision_lead_rail_unit.sh (arms T1-T5).
     local _route; _route=$(_gate_routing_pref)
     # DIVE-2224: a title-only floor is intrinsic to the KIND too, and must bypass the
     # pref for the same reason eng-ship does. Routable-but-pref-gated would have left

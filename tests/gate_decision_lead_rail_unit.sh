@@ -203,6 +203,69 @@ OUT=$(file_gate DIVE-505 swan --type=decision --tier=1 --ask="$ASK")
 human_pinged && ok_t "E3 …and the human really was pinged for it" || bad_t "E3 unwakeable must ping" "out=$OUT"
 unset -f _task_doctor_lane_wakeable
 
+# ── C. THE T2 CATEGORY FLOOR IS THE ONE THING THE TIER HALF OF THE KIND GUARDS ─
+# `_decision_route` is `[[ $type == decision && $tier != 2 ]]`, and quinn's mutant
+# (iteration 1) dropped the tier half: the harness stayed 20/0 while a money
+# decision moved onto the lead's queue. Nothing here saw it because E1 covers the
+# PINNED `--tier=2` case, and that one is independently blocked one layer down by
+# `[[ "$tier_arg" == "2" ]] && _routable=0` (need.sh) — so E1 passes with or
+# without the guard. There is no `tier_floored -> _routable=0` line anywhere: the
+# floor works by setting `tier=2`, and `[[ "$_decision_route" == "1" ]] &&
+# _routable=1` sits BELOW the `case` that read `$tier`, so it OVERRIDES the floor's
+# routability the moment its own tier test is gone. The FLOORED population is what
+# the tier half uniquely protects, and the floor exists precisely to force
+# money/secret/irreversible asks to a person.
+FLOOR_ASK="Refund the customer and charge the invoice to our card, or hold the charge?"
+# The predicate first, the mirror of arm P: assert the ask really DOES trip the
+# floor, so a regex change cannot quietly turn the arms below into a test of an
+# ordinary unfloored decision that routes for the ordinary reason.
+[[ "$(_gate_floor_axis "$FLOOR_ASK" "decision lead rail fixture")" == "ask" ]] \
+  && ok_t "C0 premise: the floor classifier really does hit this ask on the ASK axis" \
+  || bad_t "C0 premise: the floor must hit the ask" "_gate_floor_axis printed '$(_gate_floor_axis "$FLOOR_ASK" "decision lead rail fixture")' — re-base C on an ask that still trips the floor"
+seed DIVE-506
+OUT=$(file_gate DIVE-506 swan --type=decision --tier=1 --options="refund now|hold the charge" --recommend="hold the charge" --ask="$FLOOR_ASK")
+[[ "$(tierof DIVE-506)" == "2" ]] \
+  && ok_t "C1 a tier-1 decision whose ask names money is FLOORED to tier 2 — the filer does not get to lower it" \
+  || bad_t "C1 category floor must elevate the tier" "tier='$(tierof DIVE-506)'; out=$OUT"
+[[ -z "$(reviewerof DIVE-506)" ]] \
+  && ok_t "C2 …and it is NOT on the lead rail: a floored decision has no routed_reviewer" \
+  || bad_t "C2 a floored decision must not reach a lead" "routed_reviewer='$(reviewerof DIVE-506)' — the tier half of _decision_route is gone; out=$OUT"
+[[ "$(provof DIVE-506)" == "human:category-floor" ]] \
+  && ok_t "C3 …and the row records WHY it stayed human: the category floor, not a missing lead" \
+  || bad_t "C3 floored provenance" "got '$(provof DIVE-506)', want human:category-floor; out=$OUT"
+human_pinged \
+  && ok_t "C4 …and the paired human really WAS pinged — the floored gate reached a person" \
+  || bad_t "C4 a floored decision must ping the human" "ping file empty; out=$OUT"
+
+# ── T. THE OPERATOR-FACING TEXT SAYS WHAT THE CODE DOES ──────────────────────
+# `task routing off|status` is the only place an operator learns who a gate reaches.
+# After this ticket `decision` routes by KIND and never reads the pref, so the old
+# off line ("decision gates ping the human directly … an explicit opt-out FROM the
+# default") was false in both halves: the default did not move, and the one class it
+# named as human-bound is the class that now goes to the lead. Nothing asserted
+# either string before — grep across tests/ for "explicit opt-out" returned only
+# unrelated verify_optout matches — which is why an operator could run the command,
+# be told it worked, and be wrong. These arms are the reason the next edit cannot
+# re-break it silently.
+OUT=$(cmd_task_routing off 2>&1)
+grep -qi 'explicit opt-out' <<<"$OUT" \
+  && bad_t "T1 'routing off' must not call itself an opt-out from a default that never moved" "out=$OUT" \
+  || ok_t "T1 'routing off' no longer claims to be an opt-out FROM the default — the default is still off (arm D1)"
+grep -qi 'decision gates ping the human directly' <<<"$OUT" \
+  && bad_t "T2 'routing off' must not claim decision gates reach the human" "the class it names is the class this ticket routed; out=$OUT" \
+  || ok_t "T2 'routing off' no longer promises the human a class that now goes to the lead"
+grep -q 'routes to the org lead BY KIND' <<<"$OUT" \
+  && ok_t "T3 'routing off' names the bypass explicitly: a tier<2 decision routes by KIND" \
+  || bad_t "T3 'routing off' must name the kind bypass" "out=$OUT"
+grep -q 'approval or manual' <<<"$OUT" \
+  && ok_t "T4 …and it still names what the pref DOES govern, so off is not read as a no-op" \
+  || bad_t "T4 'routing off' must name the population it still governs" "out=$OUT"
+OUT=$(cmd_task_routing status 2>&1)
+grep -q 'routes to the org lead BY KIND' <<<"$OUT" \
+  && ok_t "T5 'routing status' carries the same exception — the printed value is not the whole answer" \
+  || bad_t "T5 'routing status' must say decision no longer honours the value it prints" "out=$OUT"
+_task_pref_set gate_builder_routing off
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0" .sh)" "$PASS" "$FAIL"
 SUMMARY_PRINTED=1
 [[ "$FAIL" == 0 ]]
