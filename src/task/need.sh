@@ -2643,6 +2643,24 @@ cmd_task_need() {
     [[ "$connector" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
       || fail "$E_VALIDATION" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]{0,63}\$)"
   fi
+  # DIVE-4416: --options=A|B was the shape the usage string taught for years, and
+  # filers copied the placeholder rather than writing the choice. A letter records
+  # nothing: once the ask is forwarded, quoted or screenshotted, "recommend: A" is
+  # a token with no dictionary and the mapping survives only in the clause order of
+  # the free-text ask. WARN, never fail — DIVE-2249's fixtures and scripted callers
+  # legitimately pass letters, and this is a lesson about writing, not a constraint.
+  if [[ -n "$options" ]]; then
+    local _all_single
+    _all_single=$(printf '%s' "$options" | jq -Rr '
+      [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
+      | (length > 0 and all(.[]; length == 1)) | tostring' 2>/dev/null) || _all_single="false"
+    if [[ "$_all_single" == "true" ]]; then
+      warn "--options=\"$options\": every option is a single character — that is the usage placeholder copied, not a choice."
+      warn "  Spell each option out (--options=\"widen the cap now|fix the 176 rows and split it\"). The owner reads the buttons on a phone,"
+      warn "  and a forwarded or screenshotted \"recommend: A\" carries no record of what A was. Filing anyway."
+    fi
+  fi
+
   # DIVE-148: --recommend surfaces the agent's advised choice first in the human
   # alert (and ⭐-marks its button). Only meaningful for the two finite-choice
   # gate types; reject it elsewhere so the gate shape stays honest. For a

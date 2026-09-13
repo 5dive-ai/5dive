@@ -33,7 +33,7 @@ case "$tool" in
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "deny",
-        permissionDecisionReason: ("No human sits at this keyboard. Take the option you marked Recommended (or the first) and continue; write the alternatives on the task body.\n\nThis seat has no paired channel, so \($t) renders a picker into a tmux pane nobody is reading and the session blocks until someone walks past it. If the choice genuinely needs a person, it is a gate, not a picker: file one with `5dive task need <IDENT> --type=decision --ask=\"...\" --recommend=\"...\" --options=A|B`, which pings the owner and leaves a record. Otherwise proceed on your own recommendation and record the alternatives you did not take in the task body.")
+        permissionDecisionReason: ("No human sits at this keyboard. Take the option you marked Recommended (or the first) and continue; write the alternatives on the task body.\n\nThis seat has no paired channel, so \($t) renders a picker into a tmux pane nobody is reading and the session blocks until someone walks past it. If the choice genuinely needs a person, it is a gate, not a picker: file one with `5dive task need <IDENT> --type=decision --ask=\"...\" --options=\"<first choice spelled out>|<second choice spelled out>\" --recommend=\"<one of those option texts>\"`, which pings the owner and leaves a record. Otherwise proceed on your own recommendation and record the alternatives you did not take in the task body.")
       }
     }'
     ;;
