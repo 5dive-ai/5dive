@@ -35,6 +35,40 @@ SRC=src
 TMP=$(mktemp -d /tmp/gate-destination.XXXXXX)
 trap 'rc=$?; rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
 
+# ---------------------------------------------------------------- the SWITCH is a fixture
+# OWN THE PRECONDITION, DO NOT INHERIT IT (quinn, iteration 1).
+#
+# PART 1(a)'s warning is gated on `_task_deployment_has_channels`, which globs
+# ${CONNECTORS_DIR}/telegram-*.env — defaulted in src/header.sh to
+# /etc/5dive/connectors, i.e. state written by whoever installed the MACHINE and
+# by nothing in this file. On a paired dev seat that glob finds eight connector
+# files and A8/A9 pass; on a GitHub runner it finds none and they go red. The
+# red was the visible half. The WORSE half is A10, the DIVE-1955 no-wallpaper
+# control ("the warning stops once a human is named"): with the switch off it
+# passes VACUOUSLY, because the warning it claims to have silenced never fired.
+# A host-read predicate moves a positive arm and its negative control in
+# OPPOSITE directions and only one of those directions is visible, so the arm
+# that still reads green is the one that stopped grading anything.
+#
+# So the switch is a fixture: one connector file in a tempdir this harness
+# wrote, exported BEFORE header.sh resolves CONNECTORS_DIR, and asserted ON at
+# A7c ahead of every arm that depends on it — the same shape A6 already uses for
+# the empty humans registry. The value of the ambient FIVEDIVE_CONNECTOR_DIR is
+# irrelevant after this line, which is the property: both `bash tests/…` on a
+# paired box and the same command with the var pointed anywhere else are 14/0.
+export FIVEDIVE_CONNECTOR_DIR="$TMP/connectors"
+mkdir -p "$FIVEDIVE_CONNECTOR_DIR"
+printf 'TELEGRAM_BOT_TOKEN=fixture-not-a-real-token\n' >"$FIVEDIVE_CONNECTOR_DIR/telegram-fixture.env"
+
+# THE SWEEP (same shape, rest of the harness): every other switch these arms ride
+# on is already written here — the humans registry and the gate-notifier tag are
+# rows in this harness's own DB (asserted at A6), the access.json and the pointer
+# are files it writes per arm, and the channel resolver is stubbed. The one
+# remaining inheritable input is the hold window: A11/A12 need a tier-2 gate to
+# be HELD and A7a/A7b need one SENT, and this harness sets that per arm, so an
+# ambient export of it would decide both. Drop it rather than read it.
+unset _5DIVE_GATE_UNDO_WINDOW_SECS
+
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
@@ -141,6 +175,9 @@ grep -q '^-1003797470983|200$' "$SEND_LOG" \
 grep -q 'delivered to chat -1003797470983, topic 200' <<<"$out" \
   && ok_t "A7b the ok line names WHERE the ping landed (RED on main: no destination at all)" \
   || bad_t "A7b filer was not told the destination" "out=$out"
+_task_deployment_has_channels \
+  && ok_t "A7c precondition: this deployment HAS a channel, so the broadcast warning's switch is provably ON (fixture, not the box)" \
+  || bad_t "A7c precondition broken — no telegram-*.env in the fixture connector dir" "CONNECTORS_DIR=$CONNECTORS_DIR contents=$(ls -A "$CONNECTORS_DIR" 2>&1 | tr '\n' ' ')"
 grep -q 'no human accounts on this box' <<<"$err" && grep -q 'BROADCAST' <<<"$err" \
   && ok_t "A8 an empty humans registry warns that the ask is readable by everyone on that chat" \
   || bad_t "A8 no broadcast warning" "err=$err"
