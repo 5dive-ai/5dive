@@ -94,7 +94,7 @@ scan() {
 # possible ordering). A guard whose own corpus contains its own negative fixtures
 # has to build them, so the reserved word is substituted in at write time and the
 # shape never exists as a line in this file.
-TH=then; DO=do
+TH='then'; DO='do'   # quoted: bare words here are SC1010, in the guard that is about them
 { printf '#!/usr/bin/env bash\n_hb_tok_scale() {\n  local n="${1:-}"\n'
   printf '  if   (( n >= 1000000000 )); %s printf \x27%%sB\x27 "$(( n / 1000000000 ))"\n' "$TH"
   printf '  elif (( n >= 1000000 ))    %s printf \x27%%sM\x27 "$(( n / 1000000 ))"\n' "$TH"

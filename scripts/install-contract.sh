@@ -120,6 +120,7 @@ verb_help_rc() {
   printf '%s' "$?"
 }
 
+# shellcheck disable=SC2120 # the default IS the call; the arg is for a future caller
 # The first $1 (default 6) lines of stderr from the LAST verb_help_rc call,
 # flattened onto one line so it survives the summary formatting. Call it
 # immediately after verb_help_rc — the next call truncates the file.
