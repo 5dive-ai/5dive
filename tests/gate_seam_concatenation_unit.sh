@@ -137,7 +137,7 @@ assert_lead_routed() { # <ident> <label>
 #     the join.
 route_reset; seed DIVE-801 'table stakes: the onboarding rewrite'
 actor_seam_as dev; cmd_task_need DIVE-801 --type=decision --from=dev \
-  --ask="confirm we can drop" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="confirm we can drop" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 # Graded on the AXIS, not the tier: under arm C every gate here is tier 1, so the
 # tier can no longer tell a fabricated hit from a real one (DIVE-4175).
 assert_axis DIVE-801 "axis=none" "seam: 'drop' in ask + 'table' in title does NOT fabricate a floor hit"
@@ -145,7 +145,7 @@ assert_axis DIVE-801 "axis=none" "seam: 'drop' in ask + 'table' in title does NO
 # (2) NON-VACUITY, ask axis: a real floor term in the ASK still forces hard-human.
 route_reset; seed DIVE-802 'onboarding rewrite'
 actor_seam_as dev; cmd_task_need DIVE-802 --type=decision --from=dev \
-  --ask="approve the refund to the customer" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="approve the refund to the customer" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_axis DIVE-802 "axis=ask" "non-vacuity: a real floor term in the ASK is still FOUND in the ask (arm C: found, no longer promoted)"
 
 # (3) PART 2 / ANSWER A: a floor term in the TITLE, with a SUBSTANTIVE ask that names
@@ -154,13 +154,13 @@ assert_axis DIVE-802 "axis=ask" "non-vacuity: a real floor term in the ASK is st
 #     axis change is loud rather than silent.
 route_reset; seed DIVE-803 'the stale credential rotation write-up'
 actor_seam_as dev; cmd_task_need DIVE-803 --type=decision --from=dev \
-  --ask="which of these two wordings should we use?" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="which of these two wordings should we use?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_lead_routed DIVE-803 "answer A: a floor term in the TITLE + a substantive ask routes to the LEAD, not the human"
 
 # (4) CONTROL: neither field, no seam — an ordinary gate is untouched.
 route_reset; seed DIVE-804 'onboarding rewrite'
 actor_seam_as dev; cmd_task_need DIVE-804 --type=decision --from=dev \
-  --ask="which of these two wordings should we use?" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="which of these two wordings should we use?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_not_floored DIVE-804 "control: a gate with no floor term in either field stays tier 1"
 
 # =============================================================================
@@ -175,7 +175,7 @@ assert_not_floored DIVE-804 "control: a gate with no floor term in either field 
 #     object at all — it is the case where a human matters most.
 route_reset; seed DIVE-805 'task board tidy-up for DIVE-2224'
 actor_seam_as dev; cmd_task_need DIVE-805 --type=decision --from=dev \
-  --ask="approve the purge" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="approve the purge" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 # DIVE-4175 arm C: the down direction used to be observable as "stays human". The
 # internal-ops carve-out that the phantom co-reference attacked (DIVE-1481) fires
 # only on `tier_floored == 1`, which arm C no longer produces, so the carve-out
@@ -191,13 +191,13 @@ assert_axis DIVE-805 "axis=ask" "seam: a co-reference manufactured ACROSS the jo
 #     DIVE-1480 carve-out outright.
 route_reset; seed DIVE-806 'onboarding rewrite'
 actor_seam_as dev; cmd_task_need DIVE-806 --type=decision --from=dev \
-  --ask="approve the purge of the task board backlog rows" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="approve the purge of the task board backlog rows" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_lead_routed DIVE-806 "non-vacuity: a REAL internal-ops ask (verb+object in one field) still downgrades to the lead"
 
 # (7) NON-VACUITY, title axis for the carve-out: verb and object both in the TITLE.
 route_reset; seed DIVE-807 'purge the task board backlog rows left by the wipe'
 actor_seam_as dev; cmd_task_need DIVE-807 --type=decision --from=dev \
-  --ask="please confirm" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="please confirm" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_lead_routed DIVE-807 "non-vacuity: a REAL internal-ops TITLE (verb+object in one field) still downgrades"
 
 # =============================================================================
@@ -249,27 +249,27 @@ assert_no_phantom_kind() { # <ident> <label> <forbidden-trigger> <receipt>
 #      classified as engineering.
 route_reset; seed DIVE-861 'github outage postmortem, customer impact'
 actor_seam_as dev; OUT7A=$(cmd_task_need DIVE-861 --type=decision --from=dev \
-  --ask="approve the push" --options="A|B" --recommend="A" 2>&1)
+  --ask="approve the push" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" 2>&1)
 assert_no_phantom_kind DIVE-861 "seam: 'push' in ask + 'github' in title does NOT fabricate an ENG-SHIP downgrade" eng-ship "$OUT7A"
 
 # (7b) NON-VACUITY for (7a): a REAL eng-ship ask must still route to the lead. Without
 #      this, (7a) passes by breaking the DIVE-1359 eng-ship class outright.
 route_reset; seed DIVE-862 'onboarding rewrite'
 actor_seam_as dev; cmd_task_need DIVE-862 --type=decision --from=dev \
-  --ask="approve the merge of the release branch" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="approve the merge of the release branch" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_lead_routed DIVE-862 "non-vacuity: a REAL eng-ship ask (one field) still routes to the lead"
 
 # (7c) CURATION PHANTOM. `ready for the (queue|drip)` spans the seam: 'ready for the'
 #      ends the ask, 'queue' opens the title. Neither field is about content curation.
 route_reset; seed DIVE-863 'queue of open support tickets'
 actor_seam_as dev; OUT7C=$(cmd_task_need DIVE-863 --type=decision --from=dev \
-  --ask="is this ready for the" --options="A|B" --recommend="A" 2>&1)
+  --ask="is this ready for the" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" 2>&1)
 assert_no_phantom_kind DIVE-863 "seam: 'ready for the' in ask + 'queue' in title does NOT fabricate a CURATION downgrade" curation "$OUT7C"
 
 # (7d) NON-VACUITY for (7c): a REAL curation ask must still route to the reviewer.
 route_reset; seed DIVE-864 'onboarding rewrite'
 actor_seam_as dev; cmd_task_need DIVE-864 --type=decision --from=dev \
-  --ask="approve the persona card for the drip queue" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="approve the persona card for the drip queue" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_lead_routed DIVE-864 "non-vacuity: a REAL curation ask (one field) still routes to the reviewer"
 
 # =============================================================================
@@ -299,7 +299,7 @@ _gate_ask_substantive "approve this" \
 #     graded by mutation, not by reading.
 route_reset; seed DIVE-808 'delete all customer data'
 actor_seam_as dev; cmd_task_need DIVE-808 --type=decision --from=dev \
-  --ask="approve this" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="approve this" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 # arm C: the fallback still CLASSIFIES (axis=title-fallback) and no longer floors.
 # Arm E (DIVE-4176) refuses an ask this thin at filing time, which is what replaces
 # the fail-closed cover — the named, accepted residual until it is in the cut.
@@ -308,7 +308,7 @@ assert_axis DIVE-808 "axis=title-fallback" "FALLBACK: ask 'approve this' + destr
 # (10) the same fallback with an ask that is pure politeness.
 route_reset; seed DIVE-809 'wipe the production database and start over'
 actor_seam_as dev; cmd_task_need DIVE-809 --type=decision --from=dev \
-  --ask="please confirm" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="please confirm" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_axis DIVE-809 "axis=title-fallback" "FALLBACK: a politeness-only ask + destructive TITLE still classifies title-fallback"
 
 # (11) THE NAMED VICTIM. DIVE-2216's real title contains 'deleted', so before answer A
@@ -317,7 +317,7 @@ assert_axis DIVE-809 "axis=title-fallback" "FALLBACK: a politeness-only ask + de
 route_reset; seed DIVE-810 'agent ask harvests NOTHING from a grok seat: the reply fence requires each marker alone on a line, grok puts them inline, and the fallback was deleted - the seat reads as a silent abstain'
 actor_seam_as dev; cmd_task_need DIVE-810 --type=decision --from=dev \
   --ask="push the reviewed branch for this ticket to origin so CI can grade it" \
-  --options="A|B" --recommend="A" >/dev/null 2>&1
+  --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_lead_routed DIVE-810 "answer A: a routine push ask on DIVE-2216's own title now routes to the LEAD"
 
 # (12) an APPROVAL gate takes the same axis as a decision gate -- the filing floor and
@@ -342,13 +342,13 @@ assert_lead_routed DIVE-811 "answer A applies to an APPROVAL gate too (filing fl
 # the-baseline-differs rule applied to a mutation arm.
 route_reset; seed DIVE-812 'delete all customer data'
 actor_seam_as dev; cmd_task_need DIVE-812 --type=decision --from=dev \
-  --ask="approve this" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="approve this" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 _REAL_AXIS=$(provof DIVE-812)
 _SUBSTANTIVE_REAL=$(declare -f _gate_ask_substantive)
 _gate_ask_substantive() { return 0; }   # MUTANT: every ask counts as substantive
 route_reset; seed DIVE-814 'delete all customer data'
 actor_seam_as dev; cmd_task_need DIVE-814 --type=decision --from=dev \
-  --ask="approve this" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="approve this" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 _MUTANT_AXIS=$(provof DIVE-814)
 eval "$_SUBSTANTIVE_REAL"               # restore BEFORE asserting, so a failed
                                         # assertion can never leave the mutant live
@@ -366,7 +366,7 @@ eval "$_SUBSTANTIVE_REAL"               # restore BEFORE asserting, so a failed
 #      the mutant and this suite would report on code that is not shipped.
 route_reset; seed DIVE-813 'delete all customer data'
 actor_seam_as dev; cmd_task_need DIVE-813 --type=decision --from=dev \
-  --ask="approve this" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="approve this" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_axis DIVE-813 "axis=title-fallback" "MUTATION: the real predicate is RESTORED (the mutant did not leak into the suite)"
 
 printf '\nDIVE-2224 gate seam: %d passed, %d failed\n' "$PASS" "$FAIL"

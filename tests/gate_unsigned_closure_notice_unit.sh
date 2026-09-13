@@ -121,7 +121,7 @@ signable_box() {
 
 mkgate() {   # mkgate <label> -> task id with an open tier-1 decision gate
   local t; t=$(addt --assignee=dev -- "$1")
-  cmd_task_need "$t" --type=decision --options="A|B" --recommend="A" \
+  cmd_task_need "$t" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
     --ask="pick one" --tier=1 >/dev/null 2>&1
   printf '%s' "$t"
 }

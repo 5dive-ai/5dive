@@ -145,7 +145,7 @@ _board="$(task_actor "")"
 
 seed()    { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','relaybot');"; }
 t2gate()  {
-  cmd_task_need "$1" --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 \
+  cmd_task_need "$1" --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 \
     --needs=human_tap \
     --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 }

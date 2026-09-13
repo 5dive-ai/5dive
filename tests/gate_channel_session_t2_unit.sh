@@ -309,7 +309,7 @@ out=$(cmd_task_answer DIVE-2412010 --value=approved --channel-proof=999 --channe
 # Without this, "records which form" would pass on a column that says the same
 # thing for a tap, a dashboard clear and a channel citation.
 seed_task DIVE-2412011
-cmd_task_need DIVE-2412011 --type=decision --ask="pick" --options="A|B" --recommend="A" --tier=1 >/dev/null 2>&1
+cmd_task_need DIVE-2412011 --type=decision --ask="pick" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=1 >/dev/null 2>&1
 cmd_task_answer DIVE-2412011 --value=A --channel-proof=$HUMAN_CHAT >/dev/null 2>&1
 [[ "$(answered DIVE-2412011)" == "closed" && "$(evform DIVE-2412011)" == "channel-chat" ]] \
   && ok_t "CS10 the tier<2 chat-only form (DIVE-1305) still clears and records channel-chat" \

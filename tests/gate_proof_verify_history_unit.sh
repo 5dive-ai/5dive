@@ -104,7 +104,7 @@ task_need_notify() { return 0; }
 _task_store_audit_log() { :; }
 sigof()  { db "SELECT COALESCE(need_answer_sig,'') FROM tasks WHERE id=${1};"; }
 histn()  { db "SELECT COUNT(*) FROM gate_history WHERE task_id=${1};"; }
-mkgate() { ( cmd_task_need "$1" --type=decision --options="A|B" --recommend="A" \
+mkgate() { ( cmd_task_need "$1" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
                --ask="${2:-pick one}" --tier=1 ) >/dev/null 2>&1; }
 # `task answer` has no --by flag; the answerer is derived from the actor, and the
 # fixture's is deterministic. Arm 2d asserts the PRINTED answerer equals the

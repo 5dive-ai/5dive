@@ -287,7 +287,7 @@ seed_gate() { # <title> -> ident on stdout; files a real gate through the real n
   ident=$(db "SELECT ident FROM tasks WHERE id=${id};" 2>/dev/null)
   [[ -n "$ident" ]] || { printf ''; return 1; }
   : >"$LOG"
-  ( cmd_task_need "$ident" --type=decision --ask="proceed?" --options="A|B" --recommend=A ) >/dev/null 2>&1
+  ( cmd_task_need "$ident" --type=decision --ask="proceed?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=A ) >/dev/null 2>&1
   printf '%s' "$ident"
 }
 
@@ -427,7 +427,7 @@ ident=$(seed_gate "DIVE-2410 file-time arm: tier0")
 if [[ -z "$ident" ]]; then chk "file-time/tier-0: seeded a gate" "yes" "no"; else
   reset_edits; reset_deletes
   ( cmd_task_need "$ident" --type=decision --ask="t0 proceed?" \
-      --options="A|B" --recommend=A --tier=0 ) >/dev/null 2>&1
+      --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=A --tier=0 ) >/dev/null 2>&1
   chk "file-time/tier-0: the OUTGOING gate's card was DELETED by the re-file retire" \
       "tok-marketing|1234567890|15491" "$(deletes)"
   chk "file-time/tier-0: and the auto-cleared gate delivered NO button of its own" "1" \
@@ -479,7 +479,7 @@ else
   : >"$LOG"          # fresh target, never gated before: ANY delivery here is its own
   reset_edits; reset_deletes
   ( cmd_task_need "$_tident" --type=decision --ask="proceed?" \
-      --options="A|B" --recommend=A --tier=1 ) >/dev/null 2>&1
+      --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=A --tier=1 ) >/dev/null 2>&1
   chk "file-time/precedent: it really did auto-clear (the arm graded a settle, not a refusal)" \
       "auto:precedent" \
       "$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident=$(sqlq "$_tident");")"

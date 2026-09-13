@@ -127,7 +127,7 @@ assert_downgraded() { # <ident> <label>
 route_reset; seed DIVE-901 'DIVE-1690 council page'
 actor_seam_as dev; cmd_task_need DIVE-901 --type=decision --tier=2 --ask-ok="fixture: this file grades the explicit --tier=2 PIN itself; --needs= would make the capability the source of the tier and the arm would stop measuring the pin" --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="Ship it to prod: which council page copy goes live?" \
-  --options="A|B" --recommend="A" >/dev/null 2>&1
+  --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-901 "eng-ship in ASK: explicit --tier=2 survives (stays hard-human)"
 
 # 2: THE TITLE AXIS — byte-neutral ask, eng-ship keywords ONLY in the task title.
@@ -137,7 +137,7 @@ assert_pin_held DIVE-901 "eng-ship in ASK: explicit --tier=2 survives (stays har
 route_reset; seed DIVE-902 'LAND the DIVE-1672 council-rules branch: rebase package.json + settle MERGE order vs dive-1690'
 actor_seam_as dev; cmd_task_need DIVE-902 --type=decision --tier=2 --ask-ok="fixture: this file grades the explicit --tier=2 PIN itself; --needs= would make the capability the source of the tier and the arm would stop measuring the pin" --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="Which of these two wordings should the public page use?" \
-  --options="A|B" --recommend="A" >/dev/null 2>&1
+  --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-902 "eng-ship in TITLE: explicit --tier=2 survives (the axis the filer cannot reword)"
 
 # 3: floor term + eng-ship term together (repro 2 — 'BRAND call' + 'ship'). The
@@ -147,7 +147,7 @@ route_reset; seed DIVE-903 'Council page polish'
 actor_seam_as dev; cmd_task_need DIVE-903 --type=decision --tier=2 --ask-ok="fixture: this file grades the explicit --tier=2 PIN itself; --needs= would make the capability the source of the tier and the arm would stop measuring the pin" --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask-ok="fixture: the ask names a PUBLIC page path (/council), which the DIVE-4176 readability rule cannot tell from a filesystem path — the declared escape is the designed exit for exactly this, and rewording it would drop the 'brand'+'ship' pair this arm grades" \
   --ask="BRAND call on the public 5dive.ai /council page before we ship it" \
-  --options="A|B" --recommend="A" >/dev/null 2>&1
+  --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-903 "eng-ship + floor term ('brand'+'ship') with --tier=2 stays hard-human"
 
 # 4: approval flavour, keyword in TITLE only.
@@ -186,7 +186,7 @@ assert_pin_held DIVE-910 "curation in ASK: explicit --tier=2 survives"
 route_reset; seed DIVE-911 'Approve the persona pack for the 5dive-marketplace publish queue'
 actor_seam_as dev; cmd_task_need DIVE-911 --type=decision --tier=2 --ask-ok="fixture: this file grades the explicit --tier=2 PIN itself; --needs= would make the capability the source of the tier and the arm would stop measuring the pin" --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
   --ask="Which of the two brand palettes should we commit to?" \
-  --options="A|B" --recommend="A" >/dev/null 2>&1
+  --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-911 "curation in TITLE: explicit --tier=2 survives"
 
 # 9: UNCHANGED — no pin ⇒ the curation carve-out still beats the 'publish' floor.
@@ -245,7 +245,7 @@ actor_seam_as dev; cmd_task_need DIVE-931 --type=access --from=dev \
 #     the recorded tier back, so assert the recorded value, not just the routing.
 route_reset; seed DIVE-940 'LAND the dive-1957 branch'
 OUT=$(cmd_task_need DIVE-940 --type=decision --tier=2 --ask-ok="fixture: this file grades the explicit --tier=2 PIN itself; --needs= would make the capability the source of the tier and the arm would stop measuring the pin" --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
-  --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" 2>/dev/null)
+  --ask="Which wording ships on the public page?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" 2>/dev/null)
 [[ "$(printf '%s' "$OUT" | jq -r '.data.tier')" == "2" ]] \
   && ok_t "recorded JSON envelope reports tier 2 for a pinned eng-ship-TITLE gate" \
   || bad_t "envelope tier 2" "got '$(printf '%s' "$OUT" | jq -r '.data.tier // "?"')'"
@@ -264,7 +264,7 @@ audit_reset() { : >"$AUDIT_FILE"; }
 # 16: a pinned eng-ship gate that escalates past the lead records the row.
 route_reset; audit_reset; seed DIVE-950 'LAND the dive-1957 branch: settle MERGE order'
 actor_seam_as dev; cmd_task_need DIVE-950 --type=decision --tier=2 --ask-ok="fixture: this file grades the explicit --tier=2 PIN itself; --needs= would make the capability the source of the tier and the arm would stop measuring the pin" --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
-  --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="Which wording ships on the public page?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 grep -q '^task.gate-tier2-pin-escalated$' "$AUDIT_FILE" \
   && ok_t "pinned eng-ship escalation records an audit row (measurable, not just a warn)" \
   || bad_t "audit row on pinned escalation" "rows='$(tr '\n' ',' <"$AUDIT_FILE")'"
@@ -273,7 +273,7 @@ grep -q '^task.gate-tier2-pin-escalated$' "$AUDIT_FILE" \
 #     past a lead", so it must not fire on the normal lead-routed path.
 route_reset; audit_reset; seed DIVE-951 'LAND the dive-1957 branch: settle MERGE order'
 actor_seam_as dev; cmd_task_need DIVE-951 --type=decision --from=dev \
-  --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" >/dev/null 2>&1
+  --ask="Which wording ships on the public page?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 grep -q '^task.gate-tier2-pin-escalated$' "$AUDIT_FILE" \
   && bad_t "no audit row on the un-pinned downgrade" "rows='$(tr '\n' ',' <"$AUDIT_FILE")'" \
   || ok_t "un-pinned eng-ship downgrade records NO pin-escalation row"
@@ -287,7 +287,7 @@ route_reset; audit_reset; unset _TASK_STORE_AUDIT_FENCED
 seed DIVE-952 'LAND the dive-1957 branch: settle MERGE order'
 FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db" cmd_task_need DIVE-952 \
   --type=decision --tier=2 --ask-ok="fixture: this file grades the explicit --tier=2 PIN itself; --needs= would make the capability the source of the tier and the arm would stop measuring the pin" --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" --from=dev \
-  --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" \
+  --ask="Which wording ships on the public page?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   >/dev/null 2>"$TMP/offstore.err"
 [[ ! -s "$AUDIT_FILE" ]] \
   && ok_t "off the prod store, the pin-escalation writes NO audit row" \

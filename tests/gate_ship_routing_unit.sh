@@ -123,7 +123,7 @@ answered(){ db "SELECT CASE WHEN need_answered_at IS NULL THEN 'open' ELSE 'clos
 # (an unbound ship-shaped APPROVAL) still reaches the human — that is what keeps
 # this an inversion of one class and not of the pref.
 seed DIVE-1; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-1 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-1 --type=decision --ask="ship A or B?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-1';")" == "main" ]] \
   && ok_t "pref off: a builder's decision routes to the lead by kind and does NOT ping the human (DIVE-4415)" \
   || bad_t "pref off routes by kind" "HUMAN_PINGED=$HUMAN_PINGED routed='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-1';")'"
@@ -140,14 +140,14 @@ _task_pref_set gate_builder_routing on
 
 # --- pref ON: builder decision routes to lead, NO human ping ----------------
 seed DIVE-2; HUMAN_PINGED=0; route_reset
-actor_seam_as dev; cmd_task_need DIVE-2 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-2 --type=decision --ask="ship A or B?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "route on: builder decision does NOT ping human" || bad_t "route suppresses human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ "$(statusof DIVE-2)" == "blocked" && "$(answered DIVE-2)" == "open" ]] && ok_t "routed gate stays blocked+open for lead" || bad_t "routed gate blocked+open" "status=$(statusof DIVE-2) ans=$(answered DIVE-2)"
 [[ "$(reached DIVE-2 main)" == "1" ]] && ok_t "routed decision reached lead (main) — sent, or queued for its next wake" || bad_t "routed decision → main" "sent=$(route_sent) last='$(route_last)' queued=$(queued_for DIVE-2 main)"
 
 # --- pref ON: gate filed BY the lead escalates to human ----------------------
 seed DIVE-3; HUMAN_PINGED=0
-actor_seam_as main; cmd_task_need DIVE-3 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=main >/dev/null 2>&1
+actor_seam_as main; cmd_task_need DIVE-3 --type=decision --ask="ship A or B?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=main >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: lead's own decision goes to human" || bad_t "lead decision → human" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # --- DIVE-1182: pref ON — builder APPROVAL (ship-gate) routes to lead ---------

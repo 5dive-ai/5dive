@@ -163,7 +163,7 @@ out3d=$(run assign "$a3c_id" carol); rc3d=$?
 # that side effect must not self-appoint them onto the row.
 # =============================================================================
 a4=$(run add --assignee=alice --verifier=carol --verify -- "gate filed by own verifier pre-delivery"); a4_id=$(printf '%s' "$a4" | jf '.data.id')
-out4=$(run_as carol need "$a4_id" --type=decision --tier=1 --ask="which path" --options="a|b" --recommend="a"); rc4=$?
+out4=$(run_as carol need "$a4_id" --type=decision --tier=1 --ask="which path" --options="a|b" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="a"); rc4=$?
 (( rc4 == 0 )) \
   && ok_t "ARM4 the gate itself still files (this is a preserve, not a refusal)" \
   || bad_t "ARM4 the gate still files" "rc=$rc4 $out4 $(cat "$TMP"/err)"
@@ -176,7 +176,7 @@ out4=$(run_as carol need "$a4_id" --type=decision --tier=1 --ask="which path" --
 # DIVE-891 always intended — ARM4 must not have broken ordinary gate-filing
 # ownership for everyone.
 a4b=$(run add --assignee=alice --verifier=carol --verify -- "gate filed by a stranger pre-delivery"); a4b_id=$(printf '%s' "$a4b" | jf '.data.id')
-run_as boss need "$a4b_id" --type=decision --tier=1 --ask="which path" --options="a|b" --recommend="a" >/dev/null
+run_as boss need "$a4b_id" --type=decision --tier=1 --ask="which path" --options="a|b" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="a" >/dev/null
 [[ "$(db "SELECT assignee FROM tasks WHERE id=${a4b_id};")" == "boss" ]] \
   && ok_t "ARM4-sibling a stranger filing the same gate still becomes assignee-of-record (DIVE-891, unchanged)" \
   || bad_t "ARM4-sibling stranger-filed gate still takes the assignee" "assignee=$(db "SELECT assignee FROM tasks WHERE id=${a4b_id};")"

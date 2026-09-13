@@ -175,7 +175,7 @@ depu=$(db "SELECT COUNT(*) FROM task_deps WHERE task_id=$idb;")
 
 # --- T7: decision need blocks the task and records the gate shape
 idn=$(run add -- "needs a call" | jf '.data.id')
-run need "$idn" --type=decision --ask="A or B?" --options="A|B" --recommend="A" >/dev/null
+run need "$idn" --type=decision --ask="A or B?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null
 [[ "$(db "SELECT status FROM tasks WHERE id=$idn;")" == "blocked" && \
    "$(db "SELECT need_type FROM tasks WHERE id=$idn;")" == "decision" && \
    "$(db "SELECT need_options FROM tasks WHERE id=$idn;")" == "A|B" ]] \
@@ -189,7 +189,7 @@ run answer "$idn" --value="A" >/dev/null
 
 # --- T9: need rejects --options on non-decision types
 ida=$(run add -- "approval shaped" | jf '.data.id')
-run need "$ida" --type=approval --ask="ok?" --options="A|B" >/dev/null 2>&1
+run need "$ida" --type=approval --ask="ok?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" >/dev/null 2>&1
 [[ $? -ne 0 ]] && ok_t "--options rejected on approval gate" || bad_t "options guard" "exit 0"
 
 # --- T10: park stores wake_at + park_reason; unpark clears them

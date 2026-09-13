@@ -191,7 +191,7 @@ FILER_SELF=dev3 READABLE="" PAIRED=""
 # routes and correctly needs no channel at all. Re-based on the human-bound class
 # so the channelless claim is still being graded; the moved population gets its
 # own arm immediately below rather than being quietly dropped.
-out=$( (actor_seam_as dev3; cmd_task_need DIVE-9004 --type=decision --tier=2 --needs=human_tap --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 ); rc=$?
+out=$( (actor_seam_as dev3; cmd_task_need DIVE-9004 --type=decision --tier=2 --needs=human_tap --ask="which way?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev3) 2>&1 ); rc=$?
 [[ "$rc" == "0" ]] && ok_t "cmd_task_need still FILES the gate when nobody can be pinged" \
   || bad_t "unnotified gate still files" "rc=$rc out=${out:0:200}"
 row=$(db "SELECT status||'|'||COALESCE(need_type,'-')||'|'||COALESCE(gate_pinged_at,'NULL') FROM tasks WHERE id=${did};")
@@ -207,7 +207,7 @@ row=$(db "SELECT status||'|'||COALESCE(need_type,'-')||'|'||COALESCE(gate_pinged
 # behaviour change rather than a test that quietly stopped covering a case.
 db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,status)
     VALUES ('DIVE-9014','unnotified decision','high','dev3','dev3','standard','todo');"
-out=$( (actor_seam_as dev3; cmd_task_need DIVE-9014 --type=decision --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 )
+out=$( (actor_seam_as dev3; cmd_task_need DIVE-9014 --type=decision --ask="which way?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev3) 2>&1 )
 [[ -n "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-9014';")" && "$out" != *"UNNOTIFIED"* ]] \
   && ok_t "DIVE-4415: a plain tier-1 decision routes to the lead, so no channel is needed for it" \
   || bad_t "DIVE-4415 decision routes" "reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-9014';")' out=${out:0:240}"

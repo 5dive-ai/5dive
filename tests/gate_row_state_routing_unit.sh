@@ -168,7 +168,7 @@ human_pinged \
 
 # decision type takes the same route (the three routable types, not just approval).
 seed DIVE-103 'gate routing bug report' dive-3224-inbox
-OUT=$(file_gate DIVE-103 dev --type=decision --ask="$ASK_MISS" --options="A|B" --recommend="A")
+OUT=$(file_gate DIVE-103 dev --type=decision --ask="$ASK_MISS" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A")
 [[ "$(reviewerof DIVE-103)" == "main" ]] \
   && ok_t "B3 --type=decision on a bound row routes too" \
   || bad_t "B3 decision must route" "routed_reviewer='$(reviewerof DIVE-103)'; out=$OUT"

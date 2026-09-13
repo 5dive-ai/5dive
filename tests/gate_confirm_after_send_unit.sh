@@ -201,7 +201,7 @@ seed DIVE-9003
 ( cmd_task_need DIVE-9003 --type=approval --from=marketing --mode=sometime --ask=x ) >/dev/null 2>&1
 (( $? != 0 )) && ok_t "6a: an unknown --mode is refused" \
               || bad_t "6a: unknown --mode refused" "a free-text order is prose, which is what this ticket replaces"
-( cmd_task_need DIVE-9003 --type=decision --options="a|b" --recommend=a --from=marketing \
+( cmd_task_need DIVE-9003 --type=decision --options="a|b" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=a --from=marketing \
     --mode=confirm-after-send --ask=x ) >/dev/null 2>&1
 (( $? != 0 )) && ok_t "6b: --mode on a non-approval type is refused" \
               || bad_t "6b: --mode refused off --type=approval" "a decision is lead-clearable, so a ratification filed as one need never reach a person"

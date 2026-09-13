@@ -85,7 +85,7 @@ t=$(addt --assignee=dev -- "fixture gate task")
 # fork a subshell and the one-shot _TASK_STORE_AUDIT_FENCED flag set inside it
 # would never survive back to this process (mirrors the same caveat in
 # tests/gate_telemetry_fence_unit.sh). In production this is never called in one.
-cmd_task_need "$t" --type=decision --options="X|Y" --ask="pick" 2>"$TMP/first.err" >/dev/null
+cmd_task_need "$t" --type=decision --options="X|Y" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --ask="pick" 2>"$TMP/first.err" >/dev/null
 if [[ ! -s "$AUDIT_CALLS" ]]; then
   ok_t "off the prod store, an unnotified gate writes NO audit row"
 else
@@ -98,7 +98,7 @@ ERR1=$(cat "$TMP/first.err")
 
 # ...and only once per process, or every fixture gate in a suite reprints it.
 t2=$(addt --assignee=dev -- "second fixture gate task")
-cmd_task_need "$t2" --type=decision --options="X|Y" --ask="pick" 2>"$TMP/second.err" >/dev/null
+cmd_task_need "$t2" --type=decision --options="X|Y" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --ask="pick" 2>"$TMP/second.err" >/dev/null
 ERR2=$(cat "$TMP/second.err")
 [[ "$ERR2" != *"telemetry withheld"* ]] \
   && ok_t "the notice is one-shot per process, not once per row" \
@@ -109,7 +109,7 @@ reset
 export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"   # active store IS declared prod
 t3=$(addt --assignee=dev -- "on-store fixture gate task")
 t3_ident=$(db "SELECT ident FROM tasks WHERE id=$t3;")
-cmd_task_need "$t3" --type=decision --options="X|Y" --ask="pick" >/dev/null 2>&1
+cmd_task_need "$t3" --type=decision --options="X|Y" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --ask="pick" >/dev/null 2>&1
 # DIVE-2010 review (main): assert the SHAPE of the row, not the identity of
 # whoever runs the suite. `filer=` comes from task_actor(), which resolves to
 # the CALLER's own identity (dev2 -> dev here, but "main" on main's box, and

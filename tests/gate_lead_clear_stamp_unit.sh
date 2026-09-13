@@ -210,7 +210,7 @@ reset
 SUDO_NONAGENT=1
 AUTH="nobody"
 t4=$(addt --assignee=dev -- "fixture unrouted decision $FIXTURE_MARK")
-cmd_task_need "$t4" --type=decision --options="A|B" --recommend="A" \
+cmd_task_need "$t4" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   --ask="pick one" --tier=1 >/dev/null 2>&1
 ( actor_seam_as lodar; cmd_task_answer "$t4" --value="A" --human --from=lodar >/dev/null 2>&1 )
 BY4=$(nby "$t4")

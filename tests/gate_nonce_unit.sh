@@ -40,6 +40,9 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+# DIVE-4462: this harness declines the gate seam — arms read the raw nonce a stubbed task_need_notify records into a shell variable (T1/T2 'notify hashes to stored'); a subshell discards it and the arm
+# would grade a different program (green, and wrong). Its gates carry the audited --ask-ok instead, so no refusal aborts it.
+GATE_SEAM_INPROCESS=1
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
   || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
@@ -147,7 +150,7 @@ done
 #     quietly invert from "the boundary holds" to "the mint is broken".
 seed_task DIVE-200
 NOTIFY_NONCE="sentinel"
-cmd_task_need DIVE-200 --type=decision --ask="pick" --options="A|B" --recommend="A" >/dev/null 2>&1
+cmd_task_need DIVE-200 --type=decision --ask="pick" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 t=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-200';")
 [[ "$t" == "1" ]] && ok_t "T2 precondition: gate landed at tier 1" \
   || bad_t "T2 precondition: gate landed at tier 1" "got tier '$t' — the no-nonce assertion below is no longer about tier 1"

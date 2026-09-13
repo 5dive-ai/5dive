@@ -68,7 +68,7 @@ cmd_task_need DIVE-201 --type=approval --ask="approve the mechanical README sync
 
 # --- A2: regression — a non-floored `decision` gate still defaults to tier 1. -------
 seed_task DIVE-202
-cmd_task_need DIVE-202 --type=decision --ask="pick lane" --options="A|B" --recommend="A" >/dev/null 2>&1
+cmd_task_need DIVE-202 --type=decision --ask="pick lane" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 [[ "$(tierof DIVE-202)" == "1" ]] \
   && ok_t "A2 non-floored decision still defaults to tier 1 (unchanged)" \
   || bad_t "A2 decision defaults tier 1" "got tier '$(tierof DIVE-202)'"

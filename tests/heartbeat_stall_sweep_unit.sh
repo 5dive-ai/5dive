@@ -319,7 +319,7 @@ _hb_stall_sweep >/dev/null 2>&1
 #     stranded work, same as an unclaimed todo
 reset_all
 gate_task=$(addt --assignee=bob -- "needs a call")
-( cmd_task_need "$gate_task" --type=decision --options="X|Y" --ask="pick" ) >/dev/null 2>&1
+( cmd_task_need "$gate_task" --type=decision --options="X|Y" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --ask="pick" ) >/dev/null 2>&1
 _hb_stall_sweep >/dev/null 2>&1
 [[ -n "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")" ]] \
   && ok_t "an open tier<=1 (fleet-actionable) gate alone starts the stall clock" \

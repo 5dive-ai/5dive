@@ -176,7 +176,7 @@ GRANT=""
 
 # --- 1. VERIFIER ROUTE: the ok line names the deciding property ---------------
 reset_log; seed_loop DIVE-8001
-need DIVE-8001 --type=decision --ask="pick option A or B for the retry backoff" --options="A|B" --recommend="A" --from=dev; OUT_V="$OUT"; ERR_V="$ERR"
+need DIVE-8001 --type=decision --ask="pick option A or B for the retry backoff" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev; OUT_V="$OUT"; ERR_V="$ERR"
 [[ "$(reviewer_of DIVE-8001)" == "olivia" ]] \
   && ok_t "verifier route is live here (routed_reviewer=olivia)" \
   || bad_t "verifier route live" "routed_reviewer='$(reviewer_of DIVE-8001)' out=$OUT_V err=$ERR_V"
@@ -226,7 +226,7 @@ grep -q 'LOOP MEMBERSHIP' <<<"$OUT_L" \
 (
   _gate_route_why() { printf ''; }
   reset_log; seed_loop DIVE-8003
-  need DIVE-8003 --type=decision --ask="pick option A or B for the retry backoff" --options="A|B" --recommend="A" --from=dev
+  need DIVE-8003 --type=decision --ask="pick option A or B for the retry backoff" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev
   printf 'REVIEWER=%s\n%s\n' "$(reviewer_of DIVE-8003)" "$OUT" >"$TMP/mut"
 )
 MUT=$(cat "$TMP/mut")
@@ -295,7 +295,7 @@ grep -q 'CANNOT' <<<"$OUT_U$ERR_U" \
 # Same non-signing seat as case 4. The ONLY difference is the ask's shape. If this
 # arm also printed the clause, the notice would be on every gate and read by nobody.
 reset_log; seed_loop DIVE-8007; GRANT='cli-scoped|root|0'
-need DIVE-8007 --type=decision --ask="pick option A or B for the retry backoff" --options="A|B" --recommend="A" --from=dev; OUT_O="$OUT"; ERR_O="$ERR"
+need DIVE-8007 --type=decision --ask="pick option A or B for the retry backoff" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev; OUT_O="$OUT"; ERR_O="$ERR"
 grep -q 'require_sig' <<<"$OUT_O$ERR_O" \
   && bad_t "a non-push ask must print NO require_sig clause" "out: $OUT_O err: $ERR_O" \
   || ok_t "NARROWNESS: a non-push ask to the same non-signing seat prints no require_sig clause and no warn (DIVE-1955)"
@@ -323,7 +323,7 @@ JSON_MODE=0
   && ok_t "JSON: require_sig_seat=no" || bad_t "json require_sig_seat" "out: $OUT_J"
 reset_log; seed_loop DIVE-8009
 JSON_MODE=1
-need DIVE-8009 --type=decision --ask="pick option A or B for the retry backoff" --options="A|B" --recommend="A" --from=dev; OUT_J2="$OUT"
+need DIVE-8009 --type=decision --ask="pick option A or B for the retry backoff" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev; OUT_J2="$OUT"
 JSON_MODE=0
 [[ "$(jq -r '.data.require_sig_seat' <<<"$OUT_J2" 2>/dev/null)" == "null" ]] \
   && ok_t "JSON: require_sig_seat is NULL when the check did not apply — not-checked and can-sign stay distinguishable" \

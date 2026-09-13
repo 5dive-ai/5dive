@@ -63,6 +63,9 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+# DIVE-4462: this harness declines the gate seam — arms read HUMAN_PINGED, a counter a stubbed task_need_notify increments in this shell; a subshell discards it and the arm
+# would grade a different program (green, and wrong). Its gates carry the audited --ask-ok instead, so no refusal aborts it.
+GATE_SEAM_INPROCESS=1
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
   || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
@@ -188,7 +191,7 @@ res404=$( JSON_MODE=0; cmd_task_need DIVE-404 --type=decision --from=dev \
 route_reset; seed DIVE-405
 actor_seam_as dev; cmd_task_need DIVE-405 --type=decision --from=dev \
   --ask="How should we model the credential store, and do we refund the affected customers \$500 each?" \
-  --options="A|B" --recommend="A" --discusses="mostly a data-model question" >/dev/null 2>&1
+  --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --discusses="mostly a data-model question" >/dev/null 2>&1
 [[ "$(tierof DIVE-405)" == "2" ]] && ok_t "safety: money residual refuses the appeal, stays tier 2" || bad_t "safety money tier 2" "got '$(tierof DIVE-405)'"
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "safety: money residual still pings the human" || bad_t "safety money pings human" "HUMAN_PINGED=$HUMAN_PINGED"
 
@@ -196,7 +199,7 @@ actor_seam_as dev; cmd_task_need DIVE-405 --type=decision --from=dev \
 route_reset; seed DIVE-406
 actor_seam_as dev; cmd_task_need DIVE-406 --type=decision --from=dev \
   --ask="Model the credential lifecycle — and revoke the leaked key + move the dns record while we are here?" \
-  --options="A|B" --recommend="A" --discusses="framing it as a lifecycle design question" >/dev/null 2>&1
+  --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --discusses="framing it as a lifecycle design question" >/dev/null 2>&1
 [[ "$(tierof DIVE-406)" == "2" ]] && ok_t "safety: revoke/dns residual refuses the appeal, stays tier 2" || bad_t "safety infra tier 2" "got '$(tierof DIVE-406)'"
 
 # 6: DIVE-2146 REGRESSION GUARD — an APPROVAL gate declares an ACTION, so the
@@ -317,7 +320,7 @@ grep -q -- "--discusses" <<<"$ann2" && bad_t "announce/approval must NOT adverti
 # the type a lead can auto-apply — is still FORCED to tier 2 and is still offered
 # the recorded appeal. One ask, two types, two outcomes.
 route_reset; seed DIVE-4131
-ann3=$(cmd_task_need DIVE-4131 --type=decision --from=dev --options="A|B" --recommend="A" \
+ann3=$(cmd_task_need DIVE-4131 --type=decision --from=dev --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   --ask="Approve deleting the leaked credential from the store." 2>&1 >/dev/null)
 grep -qi "FORCED to tier 2" <<<"$ann3" \
   && ok_t "differential: the same credential ask on a DECISION is still forced to tier 2 (the floor is kept where nothing stands behind it)" \
@@ -333,7 +336,7 @@ grep -q "floor-appeal applied" "$AUDIT_FILE" && ok_t "audit: an APPLIED appeal i
 grep -q "declared=" "$AUDIT_FILE" && ok_t "audit: the declared reason is recorded verbatim" || bad_t "audit declared" "$(cat "$AUDIT_FILE")"
 route_reset; seed DIVE-415
 actor_seam_as dev; cmd_task_need DIVE-415 --type=decision --from=dev \
-  --ask="Model the store, and refund the customer \$500?" --options="A|B" --recommend="A" \
+  --ask="Model the store, and refund the customer \$500?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   --discusses="claiming this is only design" >/dev/null 2>&1
 grep -q "floor-appeal refused" "$AUDIT_FILE" && ok_t "audit: a REFUSED appeal is recorded too (an attempt is evidence)" || bad_t "audit refused" "$(cat "$AUDIT_FILE")"
 

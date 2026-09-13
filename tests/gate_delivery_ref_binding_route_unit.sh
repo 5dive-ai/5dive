@@ -164,7 +164,7 @@ OUT0=$(cmd_task_need DIVE-9000 --type=approval --ask="$PLAIN_ASK" --recommend="g
 # Arm 0 above (an unbound APPROVAL) is untouched and remains the binding control.
 seed DIVE-9020
 actor_seam_as dev
-OUT0B=$(cmd_task_need DIVE-9020 --type=decision --ask="$PLAIN_ASK" --options="A|B" --recommend="A" --from=dev 2>&1)
+OUT0B=$(cmd_task_need DIVE-9020 --type=decision --ask="$PLAIN_ASK" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev 2>&1)
 [[ -n "$(reviewer_of DIVE-9020)" ]] \
   && ok_t "DIVE-4415: an unbound decision now routes to the lead (the moved population, asserted not dropped)" \
   || bad_t "an unbound decision did not route" "$OUT0B"
