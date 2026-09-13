@@ -142,6 +142,44 @@ DOCUMENTED=$(grep -oE '^  5dive agent rotation [a-z-]+' "$MAIN" \
   && ok_t "documented rotation verbs == dispatched rotation verbs" \
   || bad_t "help/dispatch drift" "dispatched=[$(echo "$DISPATCHED" | tr '\n' ' ')] documented=[$(echo "$DOCUMENTED" | tr '\n' ' ')]"
 
+# ---- 8. WIRING: the real `hire --from-market --dry-run` argv, end to end -----
+# quinn's iteration-1 finding, and the reason this arm exists: every arm above
+# calls _import_parse_args DIRECTLY, so they grade the COMPONENT and not the
+# WIRING. Neutering the single line that connects the new parser to the dry-run
+# branch (src/cmd_hire.sh, the `_import_parse_args "${import_args[@]}"` call)
+# left this harness at full green while the customer's exact command went back to
+# rc=0 with the disclosure printed — the acceptance harness could not fail for
+# the reason the row exists. An arm that proves a part is correct is not an arm
+# that proves the part is connected (same shape as the DIVE-4328 finding).
+#
+# So: build a throwaway bundle and run the REAL argv through it. It dies in the
+# flag parser before the market is resolved — no root, no network, creates
+# nothing — and we assert BOTH halves: non-zero, and the offending flag NAMED.
+# Naming the flag is what makes the arm precise rather than merely non-zero: with
+# the wiring cut, a box with no registry reachable would also exit non-zero, but
+# its message would be about the registry, not about --bogus-flag=1.
+_bin_tmp="$(mktemp -d /tmp/dive4416-hire-e2e.XXXXXX)"
+if BUILD_OUT="$_bin_tmp/5dive" bash ./build.sh >"$_bin_tmp/build.log" 2>&1 && [[ -x "$_bin_tmp/5dive" ]]; then
+  E2E_OUT=$("$_bin_tmp/5dive" hire engineer --from-market --as=marcus --dry-run --bogus-flag=1 2>&1)
+  E2E_RC=$?
+  [[ "$E2E_RC" != "0" ]] \
+    && ok_t "E2E: 'hire --from-market --dry-run --bogus-flag=1' exits non-zero (was a constant 0)" \
+    || bad_t "E2E: the dry-run still exits 0 on a flag the real run rejects" "rc=$E2E_RC out=$(printf '%s' "$E2E_OUT" | head -3)"
+  [[ "$E2E_OUT" == *"--bogus-flag=1"* ]] \
+    && ok_t "E2E: the rejection names the offending flag (not a registry error standing in)" \
+    || bad_t "E2E: non-zero but the flag is not named" "out=$(printf '%s' "$E2E_OUT" | head -5)"
+  # A dry run that dies in the parser must still create NOTHING and must not have
+  # reached the disclosure — the operator should see the error, not a green preview.
+  [[ "$E2E_OUT" != *"DRY RUN — nothing created"* && "$E2E_OUT" != *"install-time disclosure"* ]] \
+    && ok_t "E2E: no disclosure and no DRY-RUN banner printed on a rejected argv" \
+    || bad_t "E2E: the disclosure/banner printed despite the bad flag" "out=$(printf '%s' "$E2E_OUT" | head -8)"
+else
+  # Do NOT skip green: this is the only arm that binds the wiring, and a silent
+  # skip is exactly how the gap above survived a full-green run.
+  bad_t "E2E: could not build a throwaway bundle to grade the wiring" "$(tail -3 "$_bin_tmp/build.log" 2>/dev/null)"
+fi
+rm -rf "$_bin_tmp"
+
 echo
 printf 'DIVE-4416 hire dry-run flag validation + rotation help: %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1
