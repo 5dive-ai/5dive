@@ -2894,6 +2894,18 @@ cmd_import() {
 # surface. `5dive plugin list` is the authority on what is installed.
 _plugin_market_base() { echo "https://raw.githubusercontent.com/$(gh_org)/5dive-plugins/main"; }
 
+# DIVE-4466: every row carries `installs` — "agent" or "box".
+#
+# The listing's consumers could not tell the two install UNITS apart: a name, a
+# category and a marketplace say nothing about whether `plugin add` is even the
+# right verb. /dashboard/plugins offered all five rows with an Install button,
+# and pressing it on telegram produced a dead box-wide install. `category` is not
+# the missing field and cannot be made into it — telegram, dashboard and buzz are
+# `productivity`, voice and browser are `channel`, which splits the wrong way.
+#
+# The value is DERIVED from FIVEDIVE_CHANNEL_PLUGINS_JSON, the same constant the
+# refusal in `plugin add` reads, so the catalogue and the installer cannot
+# disagree about which is which.
 cmd_market_plugins() {
   local kw="" a
   for a in "$@"; do
@@ -2923,8 +2935,9 @@ cmd_market_plugins() {
   if [[ -r "$local_mkt" ]] && jq -e '.plugins' >/dev/null 2>&1 <"$local_mkt"; then
     remote_ok=1
     local lname; lname=$(jq -r '.name // "5dive-plugins"' "$local_mkt")
-    rows=$(jq -c --arg m "$lname" --argjson r "$rows" \
-      '$r + [.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:true}]' \
+    rows=$(jq -c --arg m "$lname" --argjson r "$rows" --argjson c "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
+      '$r + [.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:true,
+             installs:(if (.name as $n | any($c[]; .plugin==$n and .marketplace==$m)) then "agent" else "box" end)}]' \
       "$local_mkt")
   fi
 
@@ -2935,8 +2948,9 @@ cmd_market_plugins() {
      && jq -e '.plugins' >/dev/null 2>&1 <<<"$idx"; then
     remote_ok=1
     local rname; rname=$(jq -r '.name // "5dive-plugins"' <<<"$idx")
-    rows=$(jq -c --arg m "$rname" --argjson r "$rows" \
-      '$r + [.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:false}]' \
+    rows=$(jq -c --arg m "$rname" --argjson r "$rows" --argjson c "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
+      '$r + [.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:false,
+             installs:(if (.name as $n | any($c[]; .plugin==$n and .marketplace==$m)) then "agent" else "box" end)}]' \
       <<<"$idx")
   fi
 
