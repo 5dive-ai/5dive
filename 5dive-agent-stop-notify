@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# 5dive-agent-stop-notify <name> — ExecStopPost notifier for 5dive-agent@.service.
+#
+# DIVE-3965 (P06). The channel plugins can tell you a turn was interrupted, but
+# only from INSIDE a process that is still alive. The three states that matter
+# most — SIGKILL, OOM, and a permanent config failure that trips
+# RestartPreventExitStatus — kill the notifier along with everything else, so
+# the chat's last word is whatever the agent happened to be saying. systemd is
+# the only observer that outlives the unit, and ExecStopPost is where it speaks.
+#
+# WHY IT IS A SEPARATE SCRIPT AND NOT `5dive ...`:
+# ExecStopPost runs as User=agent-%i with no sudo, and it must survive a
+# half-installed bundle (a `5dive` that is mid-self-update is exactly when an
+# agent is most likely to be dying). This file therefore depends on bash, curl
+# and coreutils only, reads no state it cannot read as the agent, and ALWAYS
+# exits 0 — a notifier must never be the reason a stop is recorded as failed.
+# The unit also prefixes it with `-` for the same reason, belt and braces.
+#
+# WHAT systemd HANDS US (see systemd.service(5), "Environment variables in
+# spawned processes"):
+#   SERVICE_RESULT  success | protocol | timeout | exit-code | signal |
+#                   core-dump | watchdog | start-limit-hit | resources | oom-kill
+#   EXIT_CODE       exited | killed | dumped
+#   EXIT_STATUS     numeric exit status, or the signal name for killed/dumped
+set -uo pipefail
+
+NAME="${1:-}"
+[[ -n "$NAME" ]] || exit 0
+
+HOME_DIR="${STOP_NOTIFY_HOME:-/home/agent-${NAME}}"
+REGISTRY="${STOP_NOTIFY_REGISTRY:-/var/lib/5dive/agents.json}"
+STATE_DIR="${STOP_NOTIFY_STATE_DIR:-${HOME_DIR}/.5dive/stop-notify}"
+DEDUP_SECS="${STOP_NOTIFY_DEDUP_SECS:-900}"
+NOW="${STOP_NOTIFY_NOW:-$(date +%s)}"
+SEND_CMD="${STOP_NOTIFY_SEND_CMD:-}"
+
+RESULT="${SERVICE_RESULT:-unknown}"
+EXIT_KIND="${EXIT_CODE:-}"
+EXIT_VAL="${EXIT_STATUS:-}"
+
+# ── the decision, kept as one function so the harness can grade it directly ──
+#
+# Prints "<cause key>|<sentence>" or nothing at all when the stop is not worth a
+# message. The cause key is what dedup counts, so two different causes inside
+# one window BOTH get through: an OOM followed by a config failure is two
+# findings, not a repeat.
+classify_stop() {   # <result> <exit-kind> <exit-val> <desired-state>
+  local result="$1" kind="$2" val="$3" desired="$4"
+
+  # A deliberate stop is not an incident. Two independent readings say so, and
+  # either is enough: systemd's own verdict, and the operator intent DIVE-857
+  # records in the registry at `5dive agent stop`. The second is load-bearing
+  # because a launcher that dies on SIGTERM reports `signal/SIGTERM`, which is
+  # byte-identical to a kill — without the intent flag every clean `agent stop`
+  # would page the chat.
+  [[ "$desired" == "stopped" ]] && return 0
+  [[ "$result" == "success" ]] && return 0
+  if [[ "$kind" == "killed" && ( "$val" == "TERM" || "$val" == "SIGTERM" || "$val" == "15" ) ]]; then
+    return 0
+  fi
+
+  case "$result" in
+    oom-kill)
+      printf 'oom|ran out of memory and was killed by the kernel. It will not come back on its own if the box is still under pressure.\n' ;;
+    watchdog)
+      printf 'watchdog|stopped responding to its own watchdog and was killed.\n' ;;
+    start-limit-hit)
+      printf 'crash-loop|failed to start too many times in a row, so systemd gave up. It stays down until someone clears it.\n' ;;
+    timeout)
+      printf 'timeout|did not shut down in time and was killed.\n' ;;
+    resources)
+      printf 'resources|could not be started — the box could not give it the resources it asked for.\n' ;;
+    core-dump)
+      printf 'core-dump|crashed hard (signal %s) and dumped core.\n' "${val:-unknown}" ;;
+    signal)
+      printf 'signal-%s|was killed by signal %s.\n' "${val:-unknown}" "${val:-unknown}" ;;
+    exit-code)
+      # 2 and 3 are 5dive-agent-start's permanent conditions and the unit's
+      # RestartPreventExitStatus: no retry is coming, which is the part a
+      # person needs to be told.
+      case "$val" in
+        2) printf 'permanent-2|could not start: its agent type is not one this box knows how to run. It will NOT be retried.\n' ;;
+        3) printf 'permanent-3|could not start: its CLI or plugin is not installed. It will NOT be retried.\n' ;;
+        *) printf 'exit-%s|exited with error status %s.\n' "${val:-unknown}" "${val:-unknown}" ;;
+      esac ;;
+    protocol|*)
+      printf 'other-%s|stopped unexpectedly (systemd: %s).\n' "$result" "$result" ;;
+  esac
+}
+
+desired_state() {
+  [[ -r "$REGISTRY" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -r --arg n "$NAME" '.agents[$n].desiredState // ""' "$REGISTRY" 2>/dev/null
+}
+
+verdict="$(classify_stop "$RESULT" "$EXIT_KIND" "$EXIT_VAL" "$(desired_state)")"
+[[ -n "$verdict" ]] || exit 0
+cause="${verdict%%|*}"
+sentence="${verdict#*|}"
+
+# ── dedup: a crash-loop is one finding, not forty ───────────────────────────
+#
+# Keyed on the CAUSE, so a different failure inside the window still gets
+# through. The suppressed repeats are counted rather than dropped: the next
+# message that does go out says how many there were, which is the difference
+# between "it crashed" and "it has crashed 38 times".
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+mark="${STATE_DIR}/${NAME}.last"
+prev_cause="" prev_at=0 prev_count=0
+if [[ -r "$mark" ]]; then read -r prev_cause prev_at prev_count < "$mark" 2>/dev/null || true; fi
+[[ "$prev_at" =~ ^[0-9]+$ ]] || prev_at=0
+[[ "$prev_count" =~ ^[0-9]+$ ]] || prev_count=0
+
+repeats=0
+if [[ "$prev_cause" == "$cause" ]] && (( NOW - prev_at < DEDUP_SECS )); then
+  # Inside the window: count it and say nothing.
+  printf '%s %s %s\n' "$cause" "$prev_at" "$(( prev_count + 1 ))" > "$mark" 2>/dev/null || true
+  exit 0
+fi
+[[ "$prev_cause" == "$cause" ]] && repeats="$prev_count"
+printf '%s %s 0\n' "$cause" "$NOW" > "$mark" 2>/dev/null || true
+
+text="⚠️ Agent ${NAME} ${sentence}"
+if (( repeats > 0 )); then
+  text+=$'\n'"(${repeats} further occurrence(s) were suppressed in the last $(( DEDUP_SECS / 60 )) minutes.)"
+fi
+
+# ── delivery ────────────────────────────────────────────────────────────────
+#
+# The unit's own EnvironmentFile already put TELEGRAM_BOT_TOKEN in our
+# environment, and ExecStopPost inherits it. The paired chats are the
+# allowFrom list of whichever runtime's channel state this seat has.
+token="${TELEGRAM_BOT_TOKEN:-}"
+[[ -n "$token" ]] || exit 0
+
+access=""
+for d in .codex .claude .grok .gemini; do
+  cand="${HOME_DIR}/${d}/channels/telegram/access.json"
+  [[ -r "$cand" ]] && { access="$cand"; break; }
+done
+[[ -n "$access" ]] || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+
+mapfile -t chats < <(jq -r '.allowFrom // [] | .[]' "$access" 2>/dev/null | head -5)
+for chat in "${chats[@]:-}"; do
+  [[ -n "$chat" ]] || continue
+  if [[ -n "$SEND_CMD" ]]; then
+    "$SEND_CMD" "$chat" "$text" || true
+  else
+    curl -fsS -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+      --data-urlencode "chat_id=${chat}" \
+      --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+  fi
+done
+exit 0

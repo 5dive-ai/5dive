@@ -74,6 +74,12 @@ cmd_hire() {
         cat <<'EOF'
 usage: 5dive hire <name> [--type=claude] [--role=<text>] [--title=<text>] [+ any 'agent create' flag]
        5dive hire <role> --from-market [--as=<name>] [--dry-run] [--yes] [--role=<text>] [--title=<text>] [+ any 'agent import' flag]
+                                                     # DIVE-4416: also forwards the create-only flags
+                                                     # --heartbeat-every= --inherit-memory= --no-heartbeat
+                                                     # --no-team-bot --can-push --can-deploy --base-url=
+                                                     # --telegram-home-channel= --telegram-allowed-users=
+                                                     # --telegram-cos= --telegram-cos-avatar=
+                                                     # --dry-run rejects an unknown flag just like the real run
 
 FRESH  — sugar for `agent create` (+ `org set` when --role/--title given):
   5dive hire cto --role="CTO" --title="Chief Technology Officer"
@@ -136,6 +142,16 @@ cmd_hire_market() {
     shift
   done
   [[ -n "$role_query" ]] || fail "$E_USAGE" "usage: 5dive hire <role> --from-market [--as=<name>] [--dry-run] [--yes]  (e.g. 5dive hire ceo --from-market)"
+
+  # DIVE-4416: grade the forwarded flags HERE, before we resolve the market and
+  # before the dry-run branch returns. They used to be parsed only by cmd_import
+  # on the real run, so `--dry-run` printed the disclosure and exited 0 on an
+  # argv the identical command without --dry-run rejects — a preview that told
+  # the operator the run was safe when it could not even start. Validate-only:
+  # creates nothing, needs no root, and fails with cmd_import's own message.
+  if (( ${#import_args[@]} )); then
+    _import_parse_args "${import_args[@]}"
+  fi
 
   # 1) Resolve the role against the open market (rarity/completeness-tiered pick).
   step "Scanning the character-pack registry for a '$role_query'"

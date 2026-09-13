@@ -67,14 +67,46 @@ t "no measured destination does not pretend a switch happened" "1" \
   "$([[ "$_HB_BOUNDARY_ROTATION_REASON" == no\ eligible\ account* ]] && printf 1 || printf 0)"
 t "no measured destination falls through to the existing wall/alert path" "2" "$(wc -l <"$WAKE_CALLS" | tr -d ' ')"
 
-# Placement fence: the real heartbeat call must precede `_hb_wake`; a helper
-# that works but is called after submission would still rotate mid-task.
-ROT_LINE=$(grep -n '_hb_rotate_at_dispatch_boundary "\$name" "\$reg"' src/cmd_heartbeat.sh | tail -1 | cut -d: -f1)
-WAKE_LINE=$(grep -n 'if _hb_wake "\$name"' src/cmd_heartbeat.sh | tail -1 | cut -d: -f1)
-if [[ "$ROT_LINE" =~ ^[0-9]+$ && "$WAKE_LINE" =~ ^[0-9]+$ ]] && (( ROT_LINE < WAKE_LINE )); then
-  PASS=$((PASS+1)); printf 'ok   - production boundary check is before _hb_wake\n'
-else
-  FAIL=$((FAIL+1)); printf 'FAIL - production boundary check must precede _hb_wake (rotate=%s wake=%s)\n' "$ROT_LINE" "$WAKE_LINE"
+# Placement fence: the real heartbeat call must precede the DISPATCH `_hb_wake`;
+# a helper that works but is called after submission would still rotate mid-task.
+#
+# DIVE-4409: both anchors are matched by their distinctive ARGUMENTS, not by the
+# statement shape around them, and each must resolve to EXACTLY ONE line.  The
+# previous fence matched the dispatch wake as `if _hb_wake "$name"` and took
+# `tail -1`; when the dispatch site had to become `_hb_wake … || _wake_rc=$?` to
+# read the parked exit code, the match silently slid to the `heartbeat wake-task`
+# call site — a call nobody needs fenced — and the arm graded the wrong thing.
+# It reddened only by the accident of which line number came out larger.  A fence
+# that cannot find its anchor must FAIL, never fall back to the nearest match.
+# A subshell cannot report a failure: `$( )` swallows both the printf and the
+# FAIL increment, which is how a broken fence goes quiet.  So the resolver sets a
+# global and returns a status; the caller does the counting in THIS shell.
+FENCE_LINE=
+fence_line() { # <label> <fixed-pattern> -> sets FENCE_LINE, or fails loudly
+  local label=$1 pat=$2 hits n
+  FENCE_LINE=
+  hits=$(grep -nF -- "$pat" src/cmd_heartbeat.sh | cut -d: -f1)
+  n=0
+  [[ -n "$hits" ]] && n=$(printf '%s\n' "$hits" | grep -c .)
+  if (( n != 1 )); then
+    printf 'FAIL - placement fence anchor %s must match exactly one call site (matched %s: %s)\n' \
+      "$label" "$n" "$(printf '%s' "$hits" | tr '\n' ' ')"
+    return 1
+  fi
+  FENCE_LINE=$hits
+}
+
+ROT_LINE=; WAKE_LINE=
+fence_line rotate '_hb_rotate_at_dispatch_boundary "$name" "$reg"' && ROT_LINE=$FENCE_LINE || FAIL=$((FAIL+1))
+fence_line dispatch-wake '_hb_wake "$name" "$eff_fresh"' && WAKE_LINE=$FENCE_LINE || FAIL=$((FAIL+1))
+if [[ "$ROT_LINE" =~ ^[0-9]+$ && "$WAKE_LINE" =~ ^[0-9]+$ ]]; then
+  if (( ROT_LINE < WAKE_LINE )); then
+    PASS=$((PASS+1)); printf 'ok   - production boundary check is before the dispatch _hb_wake\n'
+  else
+    FAIL=$((FAIL+1))
+    printf 'FAIL - production boundary check must precede the dispatch _hb_wake (rotate=%s wake=%s)\n' \
+      "$ROT_LINE" "$WAKE_LINE"
+  fi
 fi
 
 printf '\nquota_rotation_dispatch_boundary_unit: %d passed, %d failed\n' "$PASS" "$FAIL"

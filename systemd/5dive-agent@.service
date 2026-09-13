@@ -43,6 +43,11 @@ ExecStart=/usr/local/bin/5dive-agent-start %i
 # when agy exits and then also gets the graceful cgroup SIGTERM, so its poll is
 # still aborted cleanly. Stop drops from 15s to ~0.05s for agy.
 ExecStop=/bin/bash -c '/usr/bin/tmux kill-session -t agent-%i 2>/dev/null; /usr/bin/pkill -HUP -u agent-%i -x agy 2>/dev/null; true'
+# DIVE-3965: the only observer that outlives a SIGKILL, an OOM, or a permanent
+# start failure. `-` so a notifier fault can never turn a clean stop into a
+# failed one; the script exits 0 unconditionally for the same reason, and stays
+# silent for a deliberate `5dive agent stop` and for a clean exit.
+ExecStopPost=-/usr/local/bin/5dive-agent-stop-notify %i
 Restart=on-failure
 RestartSec=3
 # A missing binary or an unknown agent type is a PERMANENT condition — no amount
