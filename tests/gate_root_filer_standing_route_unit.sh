@@ -63,6 +63,10 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+# DIVE-4462: this harness declines the gate seam — the arms read HUMAN_PINGED, a flag the stubbed _task_need_notify_deliver sets in THIS shell.
+# A subshell discards it, so wrapping would not red an arm, it would make the arm grade a
+# different program (green, and wrong). Its gates carry the audited --ask-ok, so no refusal aborts it.
+GATE_SEAM_INPROCESS=1
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
   || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 COUNCIL_DIR="$STATE_DIR/council"; COUNCIL_LINEAGE="$COUNCIL_DIR/lineage.jsonl"
@@ -289,7 +293,7 @@ cmd_task_need DIVE-3908 --type=approval --ask="$ENG_ASK" --from=dev >/dev/null 2
 # the standing authority's scope and must not acquire a route here. This is the ticket's
 # negative arm — do NOT widen this to route ALL unrouteable gates to the lead.
 route_reset; seed DIVE-3909; fixture_actor olivia
-cmd_task_need DIVE-3909 --type=decision --options='A|B' --recommend='A' --ask="$ENG_ASK" --from=olivia >/dev/null 2>&1
+cmd_task_need DIVE-3909 --type=decision --options='A|B' --ask-ok='fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)' --recommend='A' --ask="$ENG_ASK" --from=olivia >/dev/null 2>&1
 [[ "$(route_sent)" == "0" && -z "$(rr_of DIVE-3909)" ]] \
   && ok_t "A6 a root-filed DECISION is not standing-routed (type is not in scope)" \
   || bad_t "A6 decision not standing-routed" "sent=$(route_sent) routed_reviewer=$(rr_of DIVE-3909) spy=$(spy_last)"
