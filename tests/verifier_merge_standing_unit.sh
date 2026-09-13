@@ -503,5 +503,80 @@ eq_t    "C4 an unreadable re-read still returns 0 (the merge happened)"  "$CRC" 
 eq_t    "C4 ...but hands the caller no state, so the gate refuses below" "$CRE" ""
 export DISP=merged PR_STATE='MERGED|x|PASS'
 
+# --- 9. THE CALL SITE, GRADED IN THE PRODUCT'S OWN ENVELOPE ------------------
+# DIVE-4428 iteration 2 shipped a REGRESSION that section 8 could not see, and
+# the reason is one layer out from section 8's own lesson: this harness runs
+# under `set -uo pipefail` (line 22) — no `-e` — while the product runs under
+# `set -euo pipefail` (src/header.sh). Extracting the close-time body into
+# `_merge_at_close_do` moved it out of an `if` CONDITION, where set -e is
+# suppressed, into a bare `_am_re=$(...)`, whose rc IS the command
+# substitution's. So on a REFUSAL the whole close died at the assignment and the
+# refusal at :1264 was never reached — while C3 above, in the laxer envelope,
+# happily asserted the fall-through that the product could not perform.
+#
+# Section 8 fixed grading the STRING instead of the branch. This section fixes
+# grading the branch IN A DIFFERENT SHELL. It therefore does two things the
+# arms above deliberately do not: it takes the call site from the SHIPPED
+# SOURCE (a guard deleted there must red here) and it runs it under the
+# product's own `set -euo pipefail`, asserting execution continues PAST it.
+CS_FRAG="$TMP/callsite.frag"
+awk '/local _am_re; _am_re=\$\(_merge_at_close_do/,/^ +fi$/' "$SRC/task/status.sh" >"$CS_FRAG"
+CS_FRAG_T=$(cat "$CS_FRAG")
+# The anchor. Without it a sed/awk range that stopped matching would make every
+# arm below pass over an EMPTY script — the vacuous-green shape this whole fix
+# is about.
+has_t "C5 anchor: the call site was extracted from the shipped source" "$CS_FRAG_T" '_merge_at_close_do "$ident"'
+has_t "C5 anchor: ...through the test that reads its post-condition"   "$CS_FRAG_T" '[[ -n "$_am_re" ]]'
+
+# `local` is only legal in a function, and the close IS one, so the fragment
+# runs inside one here too — that also reproduces set -e's function semantics
+# (a plain call, not a condition), which is the whole point.
+CS_PROBE="$TMP/callsite-probe.sh"
+{
+  printf '%s\n' 'set -euo pipefail'
+  printf '%s\n' 'warn() { printf "%s\n" "$*" >&2; }'
+  # The rail REFUSES — the path this row's own residual 2 predicts
+  # (enqueuePullRequest 403ing for the machine account).
+  printf '%s\n' '_merge_at_close_do() { warn "the merge rail refused"; return 1; }'
+  printf '%s\n' 'ident=DIVE-100; _dref=https://github.com/x/y/pull/1; _am_actor=quinn'
+  printf '%s\n' '_am_graded=abcdef1234567890; _ghtok=tok; id=7; _state=OPEN; _merged=""'
+  printf '%s\n' 'close_body() {'
+  cat "$CS_FRAG"
+  printf '%s\n' '}'
+  printf '%s\n' 'close_body'
+  printf '%s\n' 'printf "REACHED-THE-CODE-AFTER-THE-CALL\n"'
+  # :1264's gate is the next thing the real close does, and it is what the
+  # refusal text promises ("this close is refused below exactly as it would
+  # have been"). Assert the shell is still alive to run it.
+  printf '%s\n' 'if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then'
+  printf '%s\n' '  printf "CLOSE-CONTINUED-TO-ITS-OWN-GATE\n"'
+  printf '%s\n' 'fi'
+} >"$CS_PROBE"
+CS_OUT=$(bash "$CS_PROBE" 2>/dev/null); CS_RC=$?
+
+has_t "C5 a refused rail does NOT kill the close under set -euo pipefail" "$CS_OUT" "REACHED-THE-CODE-AFTER-THE-CALL"
+has_t "C5 ...and the close reaches the refusal gate the rail promised"    "$CS_OUT" "CLOSE-CONTINUED-TO-ITS-OWN-GATE"
+eq_t  "C5 ...and the close does not exit non-zero without a reason"       "$CS_RC" "0"
+
+# C6 — the positive case must still read through the SAME construct: a guard
+# that swallowed the rail's answer as well as its rc would pass C5 and break
+# every merge-at-close.
+CS_PROBE2="$TMP/callsite-probe2.sh"
+{
+  printf '%s\n' 'set -euo pipefail'
+  printf '%s\n' 'warn() { printf "%s\n" "$*" >&2; }'
+  printf '%s\n' '_merge_at_close_do() { printf "MERGED|2026-09-13T09:18:48Z\n"; }'
+  printf '%s\n' 'ident=DIVE-100; _dref=https://github.com/x/y/pull/1; _am_actor=quinn'
+  printf '%s\n' '_am_graded=abcdef1234567890; _ghtok=tok; id=7; _state=OPEN; _merged=""'
+  printf '%s\n' 'close_body() {'
+  cat "$CS_FRAG"
+  printf '%s\n' '}'
+  printf '%s\n' 'close_body'
+  printf '%s\n' 'printf "STATE=%s MERGED=%s\n" "$_state" "$_merged"'
+} >"$CS_PROBE2"
+CS_OUT2=$(bash "$CS_PROBE2" 2>/dev/null); CS_RC2=$?
+has_t "C6 a rail that ACTED still hands its state through the guard" "$CS_OUT2" "STATE=MERGED MERGED=2026-09-13T09:18:48Z"
+eq_t  "C6 ...and the close continues"                                "$CS_RC2" "0"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

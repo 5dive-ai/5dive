@@ -1252,7 +1252,17 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
               # EXECUTE it: graded at source only, a branch that no longer fires is
               # indistinguishable from one that does (measured — a mutant replacing
               # the disposition test with `false` passed every source-level arm).
-              local _am_re; _am_re=$(_merge_at_close_do "$ident" "$_dref" "$_am_actor" "$_am_graded" "$_ghtok" "$id")
+              # `|| _am_re=""` IS LOAD-BEARING (DIVE-4428 iteration 3). The product
+              # runs under `set -euo pipefail` (src/header.sh); an assignment's rc
+              # IS its command substitution's rc, so an unguarded `_am_re=$(...)`
+              # kills the whole close the moment the rail REFUSES — the operator
+              # gets "exited 1 without reporting a reason" instead of the refusal
+              # that line 1264 below is written to print. Before the iteration-2
+              # extraction the same body sat inside an `if`, where set -e is
+              # suppressed. This is the same `|| x=""` remedy as the DIVE-2603 note
+              # at :1983 and the DIVE-3340 note at :793, and it restores the exact
+              # post-condition the `[[ -n "$_am_re" ]]` test below already reads.
+              local _am_re; _am_re=$(_merge_at_close_do "$ident" "$_dref" "$_am_actor" "$_am_graded" "$_ghtok" "$id") || _am_re=""
               if [[ -n "$_am_re" ]]; then
                 _state="${_am_re%%|*}"
                 local _am_rest="${_am_re#*|}"; _merged="${_am_rest%%|*}"
