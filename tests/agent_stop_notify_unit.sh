@@ -17,7 +17,10 @@ set -uo pipefail
 TMP=""
 trap 'rc=$?; [[ -n "$TMP" ]] && rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
 
-. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" 2>/dev/null || true
+# DIVE-2211: name the tree this harness grades. No `2>/dev/null` — the helper's
+# stderr line IS the payload.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUT="${ROOT}/5dive-agent-stop-notify"
 [[ -x "$SUT" ]] || { echo "FAIL: $SUT is missing or not executable"; exit 1; }
