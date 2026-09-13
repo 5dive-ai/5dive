@@ -129,7 +129,7 @@ t_stopped=$(addt --assignee=stopped -- "assigned to a seat the operator turned o
 
 # negatives
 t_gate=$(addt --assignee=live -- "waiting on a human")
-( cmd_task_need "$t_gate" --type=decision --ask="pick one" --options="A|B" --recommend="A" ) >/dev/null 2>&1
+( cmd_task_need "$t_gate" --type=decision --ask="pick one" --options="ship it now|hold it" --recommend="ship it now" ) >/dev/null 2>&1
 # `task need` REASSIGNS the row to the routed reviewer, and that name is derived
 # from the running actor — so it varies by whoever runs this harness and would not
 # be in the fixture registry. Put it back on `live`: the gate, not the routing, is
@@ -143,7 +143,7 @@ db "UPDATE tasks SET assignee='live' WHERE id=${t_gate};"
 # (quinn, iteration 1.) An answered gate leaves the row dispatchable again, with
 # need_type still recorded, so this is also a negative: it is not a finding.
 t_gatedone=$(addt --assignee=live -- "a gate that was already answered")
-( cmd_task_need "$t_gatedone" --type=decision --ask="pick one" --options="A|B" --recommend="A" ) >/dev/null 2>&1
+( cmd_task_need "$t_gatedone" --type=decision --ask="pick one" --options="ship it now|hold it" --recommend="ship it now" ) >/dev/null 2>&1
 db "UPDATE tasks SET need_answered_at=datetime('now'), status='todo', assignee='live' WHERE id=${t_gatedone};"
 
 t_livedep=$(addt --assignee=live -- "behind a blocker that is still open")

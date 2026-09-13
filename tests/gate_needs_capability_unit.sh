@@ -201,7 +201,7 @@ OUT_N=$(cmd_task_need DIVE-9020 --type=approval --ask="approve the merge of the 
 n=9010
 for cap in spend_authority secret_provision; do
   reset_log; seed_loop "DIVE-$n"
-  OUT_X=$(cmd_task_need "DIVE-$n" --type=decision --ask="pick option A or B" --options="A|B" --recommend="A" --needs="$cap" --from=dev 2>"$TMP/e_$n")
+  OUT_X=$(cmd_task_need "DIVE-$n" --type=decision --ask="pick option A or B" --options="ship it now|hold it" --recommend="ship it now" --needs="$cap" --from=dev 2>"$TMP/e_$n")
   if [[ "$(reviewer_of "DIVE-$n")" == "" && "$(tier_of "DIVE-$n")" == "2" ]] && grep -q 'needs a human' <<<"$OUT_X" \
      && ! grep -q '^olivia$' "$ROUTE_FILE"; then
     ok_t "--needs=$cap resolves to the human on a verifier-loop task (tier 2, unrouted, verifier not sent)"
@@ -212,7 +212,7 @@ for cap in spend_authority secret_provision; do
   # is what makes it not. Prove the control for THIS type too, so the pass is not
   # inherited from case 1's approval arm.
   n=$((n+1)); reset_log; seed_loop "DIVE-$n"
-  actor_seam_as dev; cmd_task_need "DIVE-$n" --type=decision --ask="pick option A or B" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
+  actor_seam_as dev; cmd_task_need "DIVE-$n" --type=decision --ask="pick option A or B" --options="ship it now|hold it" --recommend="ship it now" --from=dev >/dev/null 2>&1
   [[ "$(reviewer_of "DIVE-$n")" == "olivia" ]] \
     && ok_t "CONTROL for $cap's arm: the same decision without --needs still routes to the verifier" \
     || bad_t "decision control routes to verifier" "reviewer='$(reviewer_of "DIVE-$n")'"

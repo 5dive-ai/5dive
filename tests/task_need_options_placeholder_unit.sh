@@ -109,6 +109,13 @@ run_need() {
   printf '%s' "$?" >"$TMP/$tag.rc"
 }
 
+# DIVE-4431: arms 7-8 grade DIVE-4416's "warn, never fail" on the population it
+# was written for — a gate an AGENT reads. This harness has no org chart, so the
+# chart resolves nobody and (since DIVE-4431) an unrouted tier-1 gate is graded as
+# human-facing, where the same letters are REFUSED. Give the filer a lead so these
+# arms keep asking their own question; the human-facing escalation is arm 8b.
+_gate_route_reviewer() { printf 'main'; }
+
 run_need letters DIVE-9001 --type=decision \
   --ask="Ship the smaller change now, or hold for the full one?" \
   --options='A|B' --recommend='A'
@@ -136,6 +143,28 @@ RC=$(cat "$TMP/spelled.rc" 2>/dev/null)
 [[ "$RC" == "0" ]] \
   && ok_t "descriptive options file cleanly" \
   || bad_t "descriptive options failed to file" "rc=$RC err: $(printf '%s' "$ERR2" | head -3)"
+
+# ---- 8b. DIVE-4431: the same letters on a HUMAN-facing gate are REFUSED -----
+# The warning above is advice to a filer whose reader is an agent. When the reader
+# is the paired human the options are the BUTTONS, and `A` / `B` name no outcome —
+# so there the same input is a refusal, with the same --ask-ok escape as the rest
+# of the human-ask readability rule.
+db "INSERT INTO tasks (ident,title,status,priority,created_by,project_key,kind)
+    VALUES ('DIVE-9003','human-facing placeholder-options row','in_progress','medium','main','dive','standard');"
+run_need humanletters DIVE-9003 --type=decision --tier=2 --needs=human_tap \
+  --ask="Ship the smaller change now, or hold for the full one?" \
+  --options='A|B' --recommend='A'
+RC=$(cat "$TMP/humanletters.rc" 2>/dev/null)
+[[ "$RC" != "0" ]] \
+  && ok_t "DIVE-4431: bare letters on a gate a PERSON reads are refused, not warned" \
+  || bad_t "DIVE-4431: bare letters on a human-facing gate must be refused" "rc=$RC"
+case "$(cat "$TMP/humanletters.err" 2>/dev/null)" in
+  *'bare labels'*) ok_t "DIVE-4431: ... and the refusal says the buttons name no outcome" ;;
+  *) bad_t "DIVE-4431: refusal must name the options" "stderr: $(head -3 "$TMP/humanletters.err" 2>/dev/null)" ;;
+esac
+[[ "$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident='DIVE-9003';")" == "" ]] \
+  && ok_t "DIVE-4431: ... and NO gate was written by the refused filing" \
+  || bad_t "DIVE-4431: refused filing must not leave a gate" "need_type=$(db "SELECT need_type FROM tasks WHERE ident='DIVE-9003';")"
 
 # ---- 9. a one-character option next to a real one is NOT the placeholder ----
 # Only an ALL-single-character list is the copied placeholder. "y|proceed with a

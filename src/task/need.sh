@@ -2649,6 +2649,11 @@ cmd_task_need() {
   # a token with no dictionary and the mapping survives only in the clause order of
   # the free-text ask. WARN, never fail — DIVE-2249's fixtures and scripted callers
   # legitimately pass letters, and this is a lesson about writing, not a constraint.
+  # DIVE-4431 ESCALATES THIS WARNING, AND ONLY WHERE THE READER IS A PERSON: an
+  # all-bare option set on a gate that reaches the paired human is refused at the
+  # readability check below (the buttons ARE the answer there — lodar's phone got
+  # `⭐ A` / `B` under an ask whose remaining sentences were cut by the render).
+  # Everywhere else this stays exactly what DIVE-4416 made it: advice.
   if [[ -n "$options" ]]; then
     local _all_single
     _all_single=$(printf '%s' "$options" | jq -Rr '

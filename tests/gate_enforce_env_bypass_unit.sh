@@ -21,7 +21,7 @@
 # THE HOLE, measured by main on the released v0.18.2 artifact and reproduced here on
 # the installed 0.18.0+dive2563 as agent-dev uid 1007, no sudo:
 #
-#   GATE_PROOF_ENFORCE=/nonexistent/nope  5dive task answer <T2-decision> --value=A --human
+#   GATE_PROOF_ENFORCE=/nonexistent/nope  5dive task answer <T2-decision> --value="ship it now" --human
 #
 # SUCCEEDED where the identical command without the variable was REFUSED, and landed
 # need_answer=A, need_answered_by=human:dev, need_answered_uid=1007 — the same row a
@@ -231,7 +231,7 @@ rm -f "$ALT_SENTINEL"
 : > "$DEFAULT_SENTINEL"   # the live posture: enforcement armed by the root-owned file
 
 file_gate DIVE-401 decision --ask="approve the spend for the volume resize" \
-  --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+  --options="ship it now|hold it" --recommend="ship it now" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 [[ "$(tierof DIVE-401)" == "2" ]] \
   && ok_t "E0 precondition: the gate really is tier 2" \
   || bad_t "E0 tier-2 precondition" "tier=$(tierof DIVE-401)"
@@ -241,12 +241,12 @@ file_gate DIVE-401 decision --ask="approve the spend for the volume resize" \
 
 # THE LOAD-BEARING BASELINE. Without it the bypass arm proves nothing: a command that
 # refuses everywhere is not evidence that the variable was neutralised.
-out=$(answer DIVE-401 --value=A --human); rc=$?
+out=$(answer DIVE-401 --value="ship it now" --human); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-401)" == "open" ]] \
   && ok_t "E1 baseline: a forged --human from an agent is REFUSED and the row is untouched" \
   || bad_t "E1 baseline refusal" "rc=$rc state=$(answered DIVE-401) out=$out"
 
-out=$(GATE_PROOF_ENFORCE=/nonexistent/nope answer DIVE-401 --value=A --human); rc=$?
+out=$(GATE_PROOF_ENFORCE=/nonexistent/nope answer DIVE-401 --value="ship it now" --human); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-401)" == "open" ]] \
   && ok_t "E2 THE BYPASS IS CLOSED: same command + GATE_PROOF_ENFORCE=/nonexistent still REFUSED" \
   || bad_t "E2 env bypass closed" "rc=$rc state=$(answered DIVE-401) prov=$(provby DIVE-401) out=$out"
@@ -261,8 +261,8 @@ grep -qi 'unproven\|tier-2' <<<"$out" \
 # Half 2 of the fix, isolated: even with NO sentinel anywhere — the state the override
 # used to fake — the tier-2 floor stands on its own.
 rm -f "$DEFAULT_SENTINEL"
-file_gate DIVE-402 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
-out=$(answer DIVE-402 --value=A); rc=$?
+file_gate DIVE-402 decision --ask="pick a lane" --options="ship it now|hold it" --recommend="ship it now" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+out=$(answer DIVE-402 --value="ship it now"); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-402)" == "open" ]] \
   && ok_t "E5 with enforcement genuinely OFF the tier-2 floor STILL refuses a non-human answer" \
   || bad_t "E5 floor is unconditional" "rc=$rc state=$(answered DIVE-402) out=$out"
@@ -273,9 +273,9 @@ out=$(answer DIVE-402 --value=A); rc=$?
 # nonce-bearing tier-2 gate is the DIVE-2356 evidence block. Enforcement is still
 # genuinely off here, so this arm reds if that block's flag conjunct comes back and
 # stays green if only the floor's does. Without it, half the fix is untested.
-file_gate DIVE-406 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+file_gate DIVE-406 decision --ask="pick a lane" --options="ship it now|hold it" --recommend="ship it now" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 [[ "$(hashof DIVE-406)" =~ ^[0-9a-f]{64}$ ]] || bad_t "E6 precondition: gate minted a nonce" "hash='$(hashof DIVE-406)'"
-out=$(answer DIVE-406 --value=A --human); rc=$?
+out=$(answer DIVE-406 --value="ship it now" --human); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-406)" == "open" ]] \
   && ok_t "E6 enforcement OFF: a forged --human on a nonce-bearing tier-2 gate is refused by the EVIDENCE block" \
   || bad_t "E6 evidence block is unconditional" "rc=$rc state=$(answered DIVE-406) out=$out"
@@ -283,8 +283,8 @@ out=$(answer DIVE-406 --value=A --human); rc=$?
 
 # ── L2: liveness. A harness whose every arm expects a refusal proves nothing. ─────
 as_human_on_box
-file_gate DIVE-403 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
-out=$(answer DIVE-403 --value=A --human); rc=$?
+file_gate DIVE-403 decision --ask="pick a lane" --options="ship it now|hold it" --recommend="ship it now" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+out=$(answer DIVE-403 --value="ship it now" --human); rc=$?
 [[ $rc -eq 0 && "$(answered DIVE-403)" == "closed" ]] \
   && ok_t "L2 liveness: a REAL human path (non-agent SUDO_UID at EUID 0) still clears the same gate" \
   || bad_t "L2 real human path still clears" "rc=$rc state=$(answered DIVE-403) out=$out"
@@ -294,9 +294,9 @@ out=$(answer DIVE-403 --value=A --human); rc=$?
 as_agent
 
 # ── B: the boundary. The fix must not have widened into tier 1. ──────────────────
-file_gate DIVE-404 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=1
+file_gate DIVE-404 decision --ask="pick a lane" --options="ship it now|hold it" --recommend="ship it now" --tier=1
 [[ "$(tierof DIVE-404)" == "1" ]] || bad_t "B0 tier-1 precondition" "tier=$(tierof DIVE-404)"
-out=$(answer DIVE-404 --value=A); rc=$?
+out=$(answer DIVE-404 --value="ship it now"); rc=$?
 [[ $rc -eq 0 && "$(answered DIVE-404)" == "closed" ]] \
   && ok_t "B1 boundary: a bare-agent answer on a TIER-1 decision still clears (not over-widened)" \
   || bad_t "B1 tier-1 unaffected" "rc=$rc state=$(answered DIVE-404) out=$out"

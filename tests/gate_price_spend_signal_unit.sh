@@ -218,7 +218,7 @@ db "INSERT INTO tasks (ident, title, status, created_by) VALUES
 # can no longer show is whether the signal REACHED a person, so the two halves are
 # now asserted separately — the signal off the stamp, the reach off the declaration.
 ( cmd_task_need DIVE-4091 --type=decision --ask="should we raise prices on the pro plan" \
-  --options="A|B" --recommend="A" ) >/dev/null 2>&1
+  --options="ship it now|hold it" --recommend="ship it now" ) >/dev/null 2>&1
 _prov=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-4091';")
 [[ "$_prov" == axis=ask* ]] \
   && ok_t "T7 e2e: a real repricing decision is still DETECTED as a price call ($_prov)" \
@@ -226,7 +226,7 @@ _prov=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-40
 db "INSERT INTO tasks (ident, title, status, created_by) VALUES
      ('DIVE-4095','pro plan repricing','todo','main');"
 ( cmd_task_need DIVE-4095 --type=decision --needs=spend_authority --ask="should we raise prices on the pro plan" \
-  --options="A|B" --recommend="A" ) >/dev/null 2>&1
+  --options="ship it now|hold it" --recommend="ship it now" ) >/dev/null 2>&1
 [[ "$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-4095';")" == "2" ]] \
   && ok_t "T7 e2e: a DECLARED repricing decision reaches a person (tier 2)" \
   || bad_t "T7 e2e repricing declared" "got tier $(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-4095';")"
@@ -234,7 +234,7 @@ db "INSERT INTO tasks (ident, title, status, created_by) VALUES
 db "INSERT INTO tasks (ident, title, status, created_by) VALUES
      ('DIVE-4092','ads budget','todo','main');"
 ( cmd_task_need DIVE-4092 --type=decision --ask='approve $500 for the ads campaign' \
-  --options="A|B" --recommend="A" ) >/dev/null 2>&1
+  --options="ship it now|hold it" --recommend="ship it now" ) >/dev/null 2>&1
 _prov=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-4092';")
 [[ "$_prov" == axis=ask* ]] \
   && ok_t "T7 e2e: a real spend is still DETECTED (negative control, $_prov)" \
