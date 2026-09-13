@@ -57,7 +57,14 @@ CODEX_HEALTH_SCHEMA=$(sed -n 's/^CODEX_HEALTH_SCHEMA=\([0-9]*\)$/\1/p' "$SRC/cmd
 CODEX_HEALTH_REL=$(sed -n 's/^CODEX_HEALTH_REL="\(.*\)"$/\1/p' "$SRC/cmd_agent.sh")
 [[ -n "$CODEX_HEALTH_SCHEMA" && -n "$CODEX_HEALTH_REL" ]] || { echo "FAIL: could not read the handshake constants"; exit 1; }
 
-NOW=$(date -d '2026-09-13T12:00:00Z' +%s 2>/dev/null) || NOW=$(date +%s)
+# The clock is REAL, not a frozen date. Arms below reach the classifier two ways:
+# `cl` injects $NOW as its 6th arg, but §5 calls agent_channel_handshake /
+# agent_channels_binding, which have no clock seam and read wall-clock `now`.
+# A pinned NOW therefore built records that were fresh to `cl` and, from the
+# moment real time passed the pin + the 60s window, STALE to §5 — the harness
+# reds on the calendar rather than on the tree (DIVE-4438; it froze main and 2
+# PRs at 2026-09-13T12:01Z). Every timestamp here is now relative to real now.
+NOW=$(date -u +%s)
 at() { date -u -d "@$(( NOW - $1 ))" +%Y-%m-%dT%H:%M:%SZ; }   # <secs-ago> -> iso
 
 # One record, every arm varies a field off it. The shape is the one
@@ -142,7 +149,7 @@ t "2.10 59s is not stale"                  "bound" "$(st "$(cl "$(rec '.updatedA
 t "2.11 a 10ms cadence still gets 60s"     "bound" "$(st "$(cl "$(rec '.heartbeatMs=10 | .updatedAt="'"$(at 59)"'"')")")"
 t "2.12 a slow cadence widens the window"  "bound" "$(st "$(cl "$(rec '.heartbeatMs=120000 | .updatedAt="'"$(at 300)"'"')")")"
 t "2.13 but not without limit"             "stale" "$(st "$(cl "$(rec '.heartbeatMs=120000 | .updatedAt="'"$(at 400)"'"')")")"
-t "2.14 fractional-second timestamps parse" "bound" "$(st "$(cl "$(rec '.updatedAt="2026-09-13T11:59:55.123Z"')")")"
+t "2.14 fractional-second timestamps parse" "bound" "$(st "$(cl "$(rec '.updatedAt="'"$(at 5 | sed 's/Z$/.123Z/')"'"')")")"
 
 # ---- §3 the repair is bounded, and matched to the cause ------------------
 # Claim 2. The ceiling lives in the classifier so the CLI and the bridge cannot

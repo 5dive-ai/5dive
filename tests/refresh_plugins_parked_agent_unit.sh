@@ -246,6 +246,17 @@ bounced katya && ok_t "U7 an explicit null desiredState restarts" \
 # So a parked agent holding a due todo is started by the TICK — every 15 minutes,
 # not nightly. See DIVE-4409.
 #
+# DIVE-4409 HAS LANDED, so the bucket above is now empty and this file reads
+# GUARDED — but A2's grep does NOT prove that, and the reason is worth keeping:
+# `desiredState` was ALREADY in src/cmd_heartbeat.sh (those three hits) while it
+# was resurrecting katya every fifteen minutes. A presence grep over a 7000-line
+# file is a necessary condition, not a sufficient one, and here it would have
+# passed on the pre-fix bytes. The behavioural proof — the shipped guard run
+# against a temp registry with systemctl stubbed, nine negative controls for the
+# freeze direction, and the ordering assertion that the check precedes the start
+# — is tests/heartbeat_wake_parked_agent_unit.sh, which in turn asserts that THIS
+# inventory carries the corrected verdict. Neither file can be relaxed alone.
+#
 # A FALSE CLEAR IS WORSE THAN THE MISSED FILE THIS ROW WAS FILED OVER, and worse
 # once it is pinned: a filter leaves a file unseen and the tell is a suspiciously
 # short list, but a wrong verdict leaves it seen, named and written down as
@@ -270,7 +281,7 @@ declare -A RESTART_PATHS=(
   [5dive-refresh-plugins.sh]=GUARDED
   [src/cmd_selfupdate.sh]=GUARDED
   [src/cmd_agent_runtime.sh]=GUARDED
-  [src/cmd_heartbeat.sh]=AUTOMATIC-RESIDUAL
+  [src/cmd_heartbeat.sh]=GUARDED
   [src/cmd_doctor.sh]=CANNOT-RESURRECT
   [src/cmd_agent_lifecycle.sh]=OPERATOR-VERB
   [src/cmd_agent_config.sh]=OPERATOR-VERB

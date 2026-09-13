@@ -116,6 +116,19 @@ Agents:
                                                      # refuses any policy this CLI did not write.
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
+  5dive agent rotation get <agent>                   # DIVE-4416: the seat's login pool — which accounts it
+                                                     # may rotate through, which one is current, and any
+                                                     # cooldowns. Read-only, no lock.
+  5dive agent rotation set <agent> [--enabled=true|false] [--accounts=a,b,c]
+                                                     # enable/disable rotation for the seat and set the pool
+  5dive agent rotation rotate <agent> [--cooldown-current=<epoch>] [--require-live-headroom]
+                                     [--if-current-near-wall]
+                                                     # move the seat onto the next account in its pool;
+                                                     # --cooldown-current parks the one it left until <epoch>
+  5dive agent rotation cooldown <agent> <account> --until=<epoch>
+                                                     # park one account for this seat until <epoch>
+  5dive agent rotation clear-cooldown <agent> [<account>]
+                                                     # lift the cooldown on one account (or all of them)
   5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity)
   5dive agent config <name> set effort=<low|medium|high|xhigh|max>
                                                      # claude only — reasoning effort (effortLevel);
