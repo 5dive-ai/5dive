@@ -1399,6 +1399,53 @@ cmd_doctor() {
       fi
     fi
 
+    # --- DIVE-3964: per-seat channel BINDING, from the bridge handshake ---
+    #
+    # The two checks around this one grade CONFIGURATION — is the allowlist
+    # right, does the banner have an owner. Neither can tell you whether a
+    # particular seat is actually carrying messages right now, and until the
+    # bridge wrote a handshake nothing could: the only runtime signal was a
+    # refusal banner that prints once and rolls off the scrollback. So a seat
+    # could be perfectly configured, perfectly alive and completely deaf, and
+    # every line of this report would read [ok] (DIVE-4036, 2.2 days).
+    #
+    # One row per seat that declares channels, so the fix is addressed to a
+    # name. `absent` on a seat whose runtime has no bridge is not reported at
+    # all — agent_channel_handshake returns nothing there, because absence is
+    # only evidence when the thing was expected.
+    local _dc_reg _dc_name _dc_type _dc_chan _dc_active _dc_hs _dc_state _dc_detail _dc_ev
+    _dc_reg=$(registry_read 2>/dev/null || echo '{}')
+    while IFS=$'\t' read -r _dc_name _dc_type _dc_chan; do
+      [[ -n "$_dc_name" ]] || continue
+      case "$_dc_chan" in ""|none|null) continue ;; esac
+      _dc_active=no
+      systemctl is-active --quiet "5dive-agent@${_dc_name}" 2>/dev/null && _dc_active=yes
+      _dc_hs=$(agent_channel_handshake "$_dc_name" "$_dc_chan" "$_dc_type" "$_dc_active" 2>/dev/null || true)
+      [[ -n "$_dc_hs" ]] || continue
+      _dc_state="${_dc_hs%%|*}"
+      _dc_detail="${_dc_hs#*|}"; _dc_detail="${_dc_detail%%|*}"
+      _dc_ev="${_dc_hs##*|}"
+      case "$_dc_state" in
+        bound)
+          doctor_add channels "binding-${_dc_name}" ok \
+            "${_dc_name}: channels BOUND — ${_dc_detail}${_dc_ev:+ (${_dc_ev})}" ;;
+        n/a) : ;;
+        absent)
+          # The bridge was expected and wrote nothing. Not an error on its own —
+          # a seat that has never been started since the bridge shipped reads
+          # this way too — but it is the state that used to print as [ok].
+          doctor_add channels "binding-${_dc_name}" warn \
+            "${_dc_name}: no channel handshake — ${_dc_detail}" false false ;;
+        *)
+          # stale / unbound / failed / mismatched: the seat declares channels it
+          # is not carrying. That is an outage of a reachability surface, so it
+          # is an error and rides summary.errors, exactly like a suppressed
+          # needs-you banner above.
+          doctor_add channels "binding-${_dc_name}" error \
+            "${_dc_name}: channels DECLARED (${_dc_chan}) but ${_dc_state} — ${_dc_detail}${_dc_ev:+ · last seen ${_dc_ev}} · fix: 5dive agent restart ${_dc_name}, and if it survives that, the cause named here is not one a restart can fix" false false ;;
+      esac
+    done < <(jq -r '.agents // {} | to_entries[] | [.key, (.value.type // ""), (.value.channels // "none")] | @tsv' <<<"$_dc_reg" 2>/dev/null || true)
+
     local ms=/etc/claude-code/managed-settings.json
     # DIVE-3537: human-readable rendering of the ONE canonical set, so the [ok]
     # line names what it actually asserted instead of a hand-typed pair that can

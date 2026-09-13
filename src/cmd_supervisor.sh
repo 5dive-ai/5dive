@@ -1637,6 +1637,25 @@ _sup_agent_record() {
   local verify_excerpt verify_rc
   verify_excerpt=$(_sup_verify_challenge "$type" "$user" "$sess" "$svc_running"); verify_rc=$?
 
+  # --- signal: channel BINDING, from the bridge handshake (DIVE-3964) ---
+  # Every other signal in this function measures LIVENESS. This one measures
+  # whether the channels the registry declares are actually carrying messages,
+  # and it is the only signal here the seat asserts about ITSELF: the record is
+  # written by the Codex bridge, so a healthy unit, a live tmux session and a
+  # running poller are not evidence against it. Empty for a runtime with no
+  # bridge and nothing declared — absence is only evidence when the thing was
+  # expected (see agent_channel_handshake).
+  local chan_health chan_state="" chan_detail="" chan_repair="" chan_evidence=""
+  chan_health=$(agent_channel_handshake "$name" "$channels" "$type" \
+                  "$([[ "${active:-}" == "active" ]] && echo yes || echo no)" \
+                  "$(_sup_channel_repair_history "$name")" 2>/dev/null || true)
+  if [[ -n "$chan_health" ]]; then
+    chan_state="${chan_health%%|*}"
+    chan_detail="${chan_health#*|}"; chan_detail="${chan_detail%%|*}"
+    chan_repair="${chan_health%|*}"; chan_repair="${chan_repair##*|}"
+    chan_evidence="${chan_health##*|}"
+  fi
+
   # --- signal: model-capacity refusal in the live pane (DIVE-3272) ---
   local quota_excerpt quota_rc
   quota_excerpt=$(_sup_quota_pane "$user" "$sess" "$svc_running" "$now"); quota_rc=$?
@@ -1735,6 +1754,8 @@ _sup_agent_record() {
     --arg quotaExcerpt "$quota_excerpt" \
     --arg quotaDeadline "$quota_deadline" \
     --arg quotaDeadlineEpoch "$quota_deadline_epoch" \
+    --arg chanState "$chan_state" --arg chanDetail "$chan_detail" \
+    --arg chanRepair "$chan_repair" --arg chanEvidence "$chan_evidence" \
     --arg promptExcerpt "$prompt_excerpt" \
     --arg promptMark "$prompt_mark" \
     --arg paneProbe "$pane_probe" \
@@ -1758,6 +1779,14 @@ _sup_agent_record() {
                # unknown state above). This is what a park keys to; the string
                # above says only which of three states the parse landed in.
                quotaDeadlineEpoch:(if $quotaDeadlineEpoch == "" then null else ($quotaDeadlineEpoch|tonumber) end),
+               # DIVE-3964. `state` is the bridge handshake verdict
+               # (bound|stale|mismatched|unbound|failed|absent|n/a) and `repair`
+               # is what a supervisor may SAFELY do about it — never inferred
+               # from the state here, because the classifier is the only place
+               # that knows whether the restart budget is already spent.
+               channelBinding:(if $chanState == "" then null else
+                 {state:$chanState, detail:$chanDetail, repair:$chanRepair,
+                  evidence:(if $chanEvidence == "" then null else $chanEvidence end)} end),
                # DIVE-4293: the picker footer the pane tail is sitting on, and
                # whether the HIGHLIGHTED option carries (Recommended). The mark
                # is null when there is no picker to qualify.
@@ -1964,6 +1993,21 @@ _sup_act_history() {
 # (event='action'), never 'planned': a dormant tick must not spend the seat's
 # restart budget on a restart it did not perform, or turning actions on would
 # find every seat already rate-limited. Echoes a bare integer.
+# DIVE-3964: how many CHANNEL repairs this seat has already been given in the
+# window, read off the same audit trail as every other limiter — no extra state
+# file. The count is fed back INTO the classifier rather than compared here, so
+# the ceiling lives in exactly one place (and in the same place for the CLI and
+# for the bridge's own TypeScript).
+_sup_channel_repair_history() { # <name> -> integer
+  local name="$1" n
+  n=$(db "SELECT COUNT(*) FROM supervisor_events
+          WHERE agent=$(sqlq "$name") AND event='action'
+            AND signals LIKE '%\"rung\":\"channel-restart\"%'
+            AND ts >= datetime('now', '-${_SUP_ACT_WINDOW_H} hours');" 2>/dev/null || echo 0)
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s' "$n"
+}
+
 _sup_restart_history() {
   local name="$1" n
   n=$(db "SELECT COUNT(*) FROM supervisor_events
@@ -2668,6 +2712,55 @@ cmd_supervisor_tick() {
       && { alerted=$((alerted + 1)); events=$((events + 1)); } \
       || warn "supervisor: $cls alert insert failed for $name"
     warn "supervisor: ALERT $name — $cls: $excerpt"
+  done < <(jq -c '.[]' <<<"$snap")
+
+  # ── DIVE-3964: CHANNEL BINDING — repair what a restart can fix, report the rest.
+  #
+  # This is its own loop and not a rung on the P2 ladder for the same reason the
+  # DIVE-1127 tripwire is: the ladder is a response to WEDGED COMPUTE, escalating
+  # nudge -> resume -> rotate -> restart against a seat that is not progressing.
+  # A seat whose channels are deaf is progressing perfectly — it simply cannot be
+  # reached — so it never classifies `stuck` and the ladder never looks at it.
+  # That was the DIVE-4036 shape exactly: every liveness signal green, the seat
+  # working, nobody able to talk to it for 2.2 days.
+  #
+  # The verdict decides, not this loop: `repair` is `restart` only for a cause a
+  # restart can plausibly fix, and the classifier withdraws it once the attempts
+  # in the window are spent (fed in above as the attempt count). So a dead token,
+  # a refused account or a record this build cannot parse is REPORTED and never
+  # retried, and no condition can be restart-looped.
+  local chan_repaired=0 chan_reported=0
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    local cb_state cb_detail cb_repair cb_name cb_prior
+    cb_state=$(jq -r '.signals.channelBinding.state  // ""' <<<"$row" 2>/dev/null) || continue
+    [[ -n "$cb_state" && "$cb_state" != "bound" && "$cb_state" != "n/a" ]] || continue
+    cb_name=$(jq -r '.name' <<<"$row")
+    cb_detail=$(jq -r '.signals.channelBinding.detail // ""' <<<"$row")
+    cb_repair=$(jq -r '.signals.channelBinding.repair // "report"' <<<"$row")
+    if [[ "$cb_repair" == "restart" && "$actions_on" == "true" ]]; then
+      local cb_rc=0 cb_res="ok"
+      _sup_act_exec "$cb_name" "restart" "channel-$cb_state" || { cb_rc=$?; cb_res="failed"; }
+      db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+          VALUES ($(sqlq "$cb_name"), 'action', 'channels', $(sqlq "channel-$cb_state"),
+                  $(sqlq "{\"rung\":\"channel-restart\",\"result\":\"${cb_res}\",\"detail\":$(jq -Rc . <<<"$cb_detail")}"));" 2>/dev/null \
+        && { chan_repaired=$((chan_repaired + 1)); acted=$((acted + 1)); events=$((events + 1)); } \
+        || warn "supervisor: channel action insert failed for $cb_name"
+      warn "supervisor: CHANNEL REPAIR $cb_name — $cb_state: $cb_detail — restarted ($cb_res)"
+      continue
+    fi
+    # REPORT. Deduped per agent per window like the other always-live alerts, so
+    # a condition a restart cannot fix pages once and then stays on the board.
+    cb_prior=$(db "SELECT COUNT(*) FROM supervisor_events
+                   WHERE agent=$(sqlq "$cb_name") AND event='alert' AND classification='channels'
+                     AND ts >= datetime('now', '-${_SUP_ALERT_WINDOW_H} hours');" 2>/dev/null || echo 0)
+    [[ "$cb_prior" =~ ^[0-9]+$ ]] || cb_prior=0
+    (( cb_prior > 0 )) && continue
+    db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+        VALUES ($(sqlq "$cb_name"), 'alert', 'channels', $(sqlq "channel-$cb_state"), $(sqlq "$row"));" 2>/dev/null \
+      && { chan_reported=$((chan_reported + 1)); alerted=$((alerted + 1)); events=$((events + 1)); } \
+      || warn "supervisor: channel alert insert failed for $cb_name"
+    warn "supervisor: CHANNEL ALERT $cb_name — $cb_state: $cb_detail$(if [[ "$actions_on" != "true" && "$cb_repair" == "restart" ]]; then printf ' (a restart would be attempted, but actions are dormant)'; fi)"
   done < <(jq -c '.[]' <<<"$snap")
 
   # ── P2 (DIVE-857): ACT + ESCALATE — pre-cleared by lodar 2026-07-02, gated on

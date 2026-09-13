@@ -1457,11 +1457,156 @@ PY
 # Emits `<state>|<detail>|<evidence>` on stdout and always exits 0: like every
 # other probe on this command it degrades to a reported unknown, never a failed
 # `info`.
-agent_channels_binding() { # agent_channels_binding <name> <declared-channels>
-  local name="$1" declared="$2" pane="" line=""
+# DIVE-3964 — the BRIDGE HANDSHAKE, and why it sits above the banner probe.
+#
+# `agent_channels_binding` below can prove `refused` and can never prove `bound`
+# (its own header says why). That leaves `unknown` covering both "bound and
+# working" and "silently deaf for two days" — DIVE-4036 was found by a human,
+# not by this surface. A banner is a side effect of a session; a handshake is a
+# fact the bridge asserts about ITSELF, on an interval, into a file. The
+# load-bearing difference is AGE: an assertion that stopped being refreshed is
+# positive evidence of a dead bridge, where a missing banner is evidence of
+# nothing.
+#
+# The record is written by 5dive-plugins:plugins/telegram-codex/health.ts and
+# `_channel_health_classify` is the shell PARITY of its `classifyHealth`. Two
+# implementations of one decision is a cost paid deliberately: the CLI cannot
+# import TypeScript, and the alternative — shelling out to bun on every `agent
+# info` — makes a read-only survey depend on the runtime it is surveying. The
+# format is versioned for exactly this reason: a schema this build does not know
+# is REPORTED, never guessed at, so the two can ship on their own rails.
+CODEX_HEALTH_SCHEMA=1
+CODEX_HEALTH_REL=".codex/channels/dispatcher/health.json"
+
+# _channel_health_read <name> -> the raw record on stdout, empty when there is
+# none. Three reads because the caller may be the agent itself, root, or a seat
+# that can only reach the file through the agent's own uid; every failure is one
+# answer (empty = absent), which the classifier then renders.
+_channel_health_read() { # <name>
+  local name="$1"
+  # Two `local`s on purpose (SC2318): the words of a single `local` are expanded
+  # BEFORE any of its assignments take effect, so `${name}` in the same
+  # statement reads the CALLER's `name` under bash's dynamic scoping — right by
+  # accident today, silently wrong the moment a caller renames its variable.
+  local path="/home/agent-${name}/${CODEX_HEALTH_REL}" raw=""
+  raw=$(cat "$path" 2>/dev/null) || raw=""
+  [[ -n "$raw" ]] || raw=$(sudo -n -u "agent-${name}" cat "$path" 2>/dev/null) || raw=""
+  [[ -n "$raw" ]] || raw=$(sudo -n cat "$path" 2>/dev/null) || raw=""
+  printf '%s' "$raw"
+}
+
+# _channel_health_classify <raw-json|""> <declared-csv> <yes|no service-active>
+#                          [repair-attempts] [max-repairs] [now-epoch]
+#
+# Emits `<state>|<detail>|<repair>|<evidence>` and always exits 0 — a probe that
+# fails an `info` is worse than one that reports what it could not read.
+#
+# States: bound (the TS `healthy`; named for the line it prints), absent, stale,
+# mismatched, unbound, failed, n/a. Repairs: none | restart | report.
+#
+# ORDER IS THE SAFETY PROPERTY. Absent / wrong-schema / stale are settled BEFORE
+# any field inside the record is believed, because a stale record's
+# `"bound": true` is exactly the lie this ticket exists to stop reporting. And a
+# restart is only ever offered for a cause a restart can plausibly fix: a named
+# failure cause survives every restart, so it is reported instead.
+_channel_health_classify() {
+  local raw="${1:-}" declared="${2:-}" active="${3:-yes}"
+  local attempts="${4:-0}" max="${5:-2}" now="${6:-}"
+  [[ -n "$now" ]] || now=$(date +%s)
+  case "$declared" in
+    ""|none|null) printf 'n/a|||\n'; return 0 ;;
+  esac
+  local json="null"
+  if [[ -n "$raw" ]]; then json=$(jq -c '.' <<<"$raw" 2>/dev/null) || json="null"; fi
+  jq -rn \
+    --argjson h "$json" --arg declared "$declared" --arg active "$active" \
+    --argjson attempts "$attempts" --argjson max "$max" --argjson now "$now" \
+    --argjson schema "$CODEX_HEALTH_SCHEMA" '
+    def clean: gsub("[|\r\n\t]+"; " ");
+    ($declared | split(",") | map(select(length > 0)) | unique) as $dec |
+    ($attempts >= $max) as $spent |
+    (if $spent then "report" else "restart" end) as $retry |
+    def exhausted($d):
+      if $spent then "\($d); \($attempts) restart(s) did not heal it — this needs a person, not another restart"
+      else $d end;
+    # The one line an operator acts on, carried beside every state so a `↳`
+    # render never has to go back to the file.
+    (if $h == null then "" else
+      "bridge \($h.bridgeVersion // "?") · pid \($h.pid // "?") · queue \($h.queueDepth // 0) · in \($h.lastInboundAt // "never") · out \($h.lastOutboundAt // "never") · thread \($h.threadId // "none")\(if $h.active then " · turn \($h.active.turnId) from \($h.active.source)" else "" end)"
+     end) as $ev |
+    (if $h == null then null else
+      (($h.updatedAt // "") | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null)
+     end) as $upd |
+    (if $h == null then 0 else
+      ([60, (((($h.heartbeatMs // 15000) | tonumber) / 1000) * 3)] | max | floor)
+     end) as $win |
+    (if $h == null then
+       (if $active != "yes" then
+          ["absent", "no handshake and the agent service is not running — start the agent first", "none"]
+        else
+          ["absent", exhausted("the agent is running but its Codex channel bridge has never written a handshake — the bridge did not start"), $retry]
+        end)
+     elif (($h.schema // 0) != $schema) then
+       ["absent", "handshake schema \($h.schema // "missing") is not readable by this build (expected \($schema)) — upgrade the CLI or the plugin", "report"]
+     elif ($upd == null) then
+       ["stale", "handshake has an unreadable updatedAt (\($h.updatedAt // "missing"))", "report"]
+     elif (($now - $upd) > $win) then
+       ["stale", exhausted("handshake last refreshed \($now - $upd)s ago, past its \($win)s window — the bridge is wedged or gone (pid \($h.pid // "?"))"), $retry]
+     elif (($h.failure != null) and ($h.bound != true)) then
+       ["failed", "\($h.failure.channel // "bridge"): \($h.failure.cause // "unnamed failure") (at \($h.failure.at // "unknown time"))", "report"]
+     elif ($h.bound != true) then
+       ["unbound", exhausted("the bridge is running but has no live Codex thread — the app-server handshake has not completed"), $retry]
+     elif ((($h.listening // []) | unique) != $dec) then
+       (($dec - (($h.listening // []) | unique)) as $missing |
+        ((($h.listening // []) | unique) - $dec) as $extra |
+        ([ (if ($missing | length) > 0 then "declared but not listening: \($missing | join(","))" else empty end),
+           (if ($extra   | length) > 0 then "listening but not declared: \($extra   | join(","))" else empty end) ] | join("; ")) as $parts |
+        (if $h.failure then " (last failure — \($h.failure.channel // "bridge"): \($h.failure.cause // "unnamed"))" else "" end) as $cause |
+        ["mismatched", exhausted("\($parts)\($cause)"),
+         (if $h.failure then "report" else $retry end)])
+     else
+       ["bound", "listening on \((($h.listening // []) | join(",")))\(if $h.active then ", turn \($h.active.turnId) from \($h.active.source)" else "" end)\(if (($h.queueDepth // 0) > 0) then ", \($h.queueDepth) queued" else "" end)", "none"]
+     end) as $v |
+    [($v[0] | clean), ($v[1] | clean), ($v[2] | clean), ($ev | clean)] | join("|")
+  ' 2>/dev/null || printf 'unknown|the channel handshake could not be classified (jq failed)|report|'
+}
+
+# agent_channel_handshake <name> <declared-csv> <type> [active] [attempts] [max]
+#
+# The reader the other surfaces call. ABSENCE IS ONLY EVIDENCE WHEN THE THING
+# WAS EXPECTED: a claude seat runs no Codex bridge, so a missing record there is
+# not a defect and this returns empty, leaving the banner probe to answer. A
+# record that EXISTS is believed whatever the registry calls the seat — positive
+# evidence outranks a label.
+agent_channel_handshake() {
+  local name="$1" declared="${2:-}" type="${3:-}" active="${4:-yes}"
+  local attempts="${5:-0}" max="${6:-2}" raw=""
+  case "$declared" in
+    ""|none|null) return 0 ;;
+  esac
+  raw=$(_channel_health_read "$name")
+  if [[ -z "$raw" && "$type" != "codex" ]]; then return 0; fi
+  _channel_health_classify "$raw" "$declared" "$active" "$attempts" "$max"
+}
+
+agent_channels_binding() { # agent_channels_binding <name> <declared> [type] [active]
+  local name="$1" declared="$2" type="${3:-}" active="${4:-yes}" pane="" line="" hs=""
   case "$declared" in
     ""|none|null) printf 'n/a||\n'; return 0 ;;
   esac
+  # DIVE-3964: the handshake first, because it is the only reading that can say
+  # BOUND. It answers only when there is a record (or when one was expected and
+  # is missing); everything else still falls through to the banner below, which
+  # remains the only probe that works for a runtime with no bridge.
+  hs=$(agent_channel_handshake "$name" "$declared" "$type" "$active" || true)
+  if [[ -n "$hs" ]]; then
+    # <state>|<detail>|<repair>|<evidence> -> <state>|<detail>|<evidence>:
+    # `repair` is for the supervisor, not for a printed line.
+    local _s _d _e
+    _s="${hs%%|*}"; _d="${hs#*|}"; _d="${_d%%|*}"; _e="${hs##*|}"
+    printf '%s|%s|%s\n' "$_s" "$_d" "$_e"
+    return 0
+  fi
   # Same instrument the runtime commands use (cmd_agent_runtime.sh). A missing
   # session, a denied sudo and an absent tmux are one answer here — unknown —
   # and the detail says which, because "cannot probe" and "probed clean" have
@@ -1585,7 +1730,9 @@ cmd_info() {
   # BOUND, and why a clean capture is `unknown` rather than a green.
   local _chan_declared _cb _cb_state _cb_detail _cb_evidence
   _chan_declared=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
-  _cb=$(agent_channels_binding "$name" "$_chan_declared" || true)
+  _cb=$(agent_channels_binding "$name" "$_chan_declared" \
+        "$(jq -r --arg n "$name" '.agents[$n].type // ""' <<<"$reg")" \
+        "$([[ "$active" == "active" ]] && echo yes || echo no)" || true)
   [[ -n "$_cb" ]] || _cb='unknown|channel binding probe did not run|'
   _cb_state="${_cb%%|*}"
   _cb_detail="${_cb#*|}"; _cb_detail="${_cb_detail%%|*}"
@@ -1661,7 +1808,12 @@ cmd_info() {
         # (there was nothing to measure) and `unknown` measured nothing either;
         # collapsing those into a true would hand a consumer the same false
         # confidence in JSON that the printed line used to hand a human.
-        measured: ($cbState == "refused"),
+        # DIVE-3964: `measured` is true for any POSITIVE reading — the refusal
+        # banner, or a handshake the bridge actually wrote. It stays false for
+        # `n/a`, `unknown` and `absent`, which measured nothing; collapsing
+        # those into a true would hand a consumer the same false confidence in
+        # JSON that the printed line used to hand a human.
+        measured: ($cbState == "refused" or ($cbState | IN("bound","stale","mismatched","unbound","failed"))),
         detail: (if $cbDetail == "" then null else $cbDetail end),
         evidence: (if $cbEvidence == "" then null else $cbEvidence end)
       },
@@ -1739,7 +1891,14 @@ cmd_info() {
       # reader was actually after.
       "channels:    \(.channels)\(if .botUsername then " (@\(.botUsername))" else "" end)\(if .channelsBinding.state == "n/a" then "" else " — DECLARED (registry)" end)",
       (if .channelsBinding.state == "n/a" then empty else
-        "bound:       \(if .channelsBinding.state == "refused" then "NO — REFUSED at runtime" else "unknown — \(.channelsBinding.detail // "not probeable from here")" end)\(if .channelsBinding.evidence then "\n             ↳ \(.channelsBinding.evidence)" else "" end)"
+        "bound:       \(if .channelsBinding.state == "refused" then "NO — REFUSED at runtime"
+                          elif .channelsBinding.state == "bound" then "YES — \(.channelsBinding.detail) (bridge handshake, fresh)"
+                          elif .channelsBinding.state == "stale" then "NO — \(.channelsBinding.detail)"
+                          elif .channelsBinding.state == "mismatched" then "PARTIAL — \(.channelsBinding.detail)"
+                          elif .channelsBinding.state == "unbound" then "NO — \(.channelsBinding.detail)"
+                          elif .channelsBinding.state == "failed" then "NO — \(.channelsBinding.detail)"
+                          elif .channelsBinding.state == "absent" then "unknown — \(.channelsBinding.detail)"
+                          else "unknown — \(.channelsBinding.detail // "not probeable from here")" end)\(if .channelsBinding.evidence then "\n             ↳ \(.channelsBinding.evidence)" else "" end)"
        end),
       "profile:     \(.authProfile // "-")",
       "auth:        \($authLine)",
@@ -1763,6 +1922,9 @@ cmd_info() {
        else empty end),
       (if (.health.auth.state == "needs_login" or .health.auth.state == "expired" or .health.startup.state == "degraded") then
          "\nWARNING: this seat is DEGRADED: the process is \(.active), but its provider credential is not usable. Repair with `5dive agent auth status --agent=\(.name)` followed by the appropriate `5dive agent auth start ...`, then restart the seat."
+       else empty end),
+      (if (.channelsBinding.state | IN("stale","unbound","failed","mismatched")) then
+         "\nWARNING: this agent DECLARES channels (\(.channelsDeclared)) and its own channel bridge says they are NOT all carrying messages: \(.channelsBinding.detail). Unlike every liveness line above, this is an assertion the bridge makes about itself, so a healthy unit and a live tmux session are not evidence against it (DIVE-3964). \(if .channelsBinding.evidence then "Last seen: \(.channelsBinding.evidence). " else "" end)Repair: 5dive agent restart \(.name) — and if this line survives a restart, the cause named above is not one a restart can fix."
        else empty end),
       (if .channelsBinding.state == "refused" then
          "\nWARNING: this agent DECLARES channels (\(.channelsDeclared)) and its session REFUSED them. It cannot receive or reply on any of them, however healthy every other line above looks — the registry, the unit and the bot username are all still correct, which is exactly why this reads as paired. The gate is inside the coding-CLI binary, not our plugin staging, so re-running `agent create` or re-installing the plugins will not move it (DIVE-2765). Do not attribute an unanswered message or a red round-trip on this agent to credential routing until this line is clear."

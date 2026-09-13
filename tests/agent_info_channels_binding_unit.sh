@@ -63,9 +63,18 @@ tnc() { # <desc> <needle> <haystack> — does NOT contain
 # The probe under test, lifted out of cmd_agent.sh so no state/registry/systemd
 # machinery has to boot. Extracted by name rather than pasted: a copy would grade
 # the copy, which is the failure mode this comment exists to prevent.
-fnsrc=$(sed -n '/^agent_channels_binding() {/,/^}/p' "$SRC/cmd_agent.sh")
-[[ -n "$fnsrc" ]] || { echo "FAIL: could not extract agent_channels_binding from $SRC/cmd_agent.sh"; exit 1; }
-eval "$fnsrc"
+# DIVE-3964: the probe now consults the bridge HANDSHAKE first and falls back to
+# the banner, so its two collaborators come with it. Extracting them (rather than
+# stubbing them away) is what keeps these arms grading the real fall-through: a
+# stub that always returns empty would grade a probe that can no longer exist.
+for _fn in agent_channels_binding _channel_health_read _channel_health_classify agent_channel_handshake; do
+  fnsrc=$(sed -n "/^${_fn}() {/,/^}/p" "$SRC/cmd_agent.sh")
+  [[ -n "$fnsrc" ]] || { echo "FAIL: could not extract ${_fn} from $SRC/cmd_agent.sh"; exit 1; }
+  eval "$fnsrc"
+done
+CODEX_HEALTH_SCHEMA=$(sed -n 's/^CODEX_HEALTH_SCHEMA=\([0-9]*\)$/\1/p' "$SRC/cmd_agent.sh")
+CODEX_HEALTH_REL=$(sed -n 's/^CODEX_HEALTH_REL="\(.*\)"$/\1/p' "$SRC/cmd_agent.sh")
+[[ -n "$CODEX_HEALTH_SCHEMA" && -n "$CODEX_HEALTH_REL" ]] || { echo "FAIL: could not read the handshake constants"; exit 1; }
 
 # Stubbed privilege + tmux. SESSION says whether has-session succeeds; PANE is
 # what capture-pane emits. Every real caller of this function reaches tmux only
@@ -167,7 +176,7 @@ rec() { # rec <state> <evidence>
   jq -nc --arg s "$1" --arg e "$2" '{
     name:"a", type:"claude", cliName:"claude", cliVersion:"1", model:null, effort:null,
     modelUnpinnedWithCreds:false, channels:"telegram,dashboard", channelsDeclared:"telegram,dashboard",
-    channelsBinding:{state:$s, measured:($s=="refused"), detail:"d", evidence:(if $e=="" then null else $e end)},
+    channelsBinding:{state:$s, measured:($s=="refused" or ($s|IN("bound","stale","mismatched","unbound","failed"))), detail:"d", evidence:(if $e=="" then null else $e end)},
     botUsername:"b", authProfile:null, workdir:"/w", isolation:"admin", isolationLabelled:true,
     sudo:{measured:true,grant:"g",scope:"s",runas:"r",extraEntries:false,diverges:false},
     supervisor:{stateNote:"n",note:"o",line:"l",verdict:null}, createdAt:"t"}'
