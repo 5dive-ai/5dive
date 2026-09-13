@@ -82,6 +82,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 
 # Suite guard: remember the REAL log's length up front (EV7).
 REALLOG=/var/log/5dive/agent-audit.log
@@ -158,7 +160,7 @@ argval() { sed -n "s/.*[[:space:]]${2}=\([^[:space:]]*\).*/\1/p" <<<"$1" | head 
 # The tap shape: --human --human-proof=<nonce>, SUDO_UID still the agent's.
 reset
 t1=$(addt --assignee=dev -- "fixture t2 nonce gate")
-cmd_task_need "$t1" --type=decision --options="A|B" --recommend="A" \
+cmd_task_need "$t1" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   --ask="pick one" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 cmd_task_answer "$t1" --value="A" --human --human-proof="$KNOWN_NONCE" \
   >"$TMP/ev1.out" 2>"$TMP/ev1.err"
@@ -234,7 +236,7 @@ fi
 # an absent key is what makes a sweep return a confident zero.
 reset
 t2=$(addt --assignee=dev -- "fixture tier-1 decision gate")
-cmd_task_need "$t2" --type=decision --options="A|B" --recommend="A" \
+cmd_task_need "$t2" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   --ask="pick one" --tier=1 >/dev/null 2>&1
 cmd_task_answer "$t2" --value="B" --human >"$TMP/ev4.out" 2>"$TMP/ev4.err"
 WROW2=$(grep 'task answer gate' "$AUDIT_CALLS" | grep 'answered_by=' | head -1)
@@ -280,7 +282,7 @@ fi
 # is the false negative this ticket was filed on.
 reset
 t8=$(addt --assignee=dev -- "fixture t2 decision gate, human on the box")
-cmd_task_need "$t8" --type=decision --options="A|B" --recommend="A" \
+cmd_task_need "$t8" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   --ask="pick one" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 _PIN_SUDO_HUMAN=0
 cmd_task_answer "$t8" --value="A" --human >"$TMP/ev8.out" 2>"$TMP/ev8.err"
@@ -300,7 +302,7 @@ fi
 # arm stays green when the guarded write happens anyway).
 reset
 t9=$(addt --assignee=dev -- "fixture t2 decision gate, agent caller")
-cmd_task_need "$t9" --type=decision --options="A|B" --recommend="A" \
+cmd_task_need "$t9" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   --ask="pick one" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 out9=$(cmd_task_answer "$t9" --value="A" --human 2>&1); rc9=$?
 COL9=$(hev "$t9")

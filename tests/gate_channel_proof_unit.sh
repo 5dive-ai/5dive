@@ -35,6 +35,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
 GATE_PROOF_ENFORCE="$STATE_DIR/gate-proof.enforce"
@@ -109,7 +111,7 @@ touch "$GATE_PROOF_ENFORCE"   # enforcement ON for every clear below
 
 # ── CP2: channel-proof clears a tier-1 decision gate, provenance human:* ──────
 seed_task DIVE-201
-cmd_task_need DIVE-201 --type=decision --ask="pick" --options="A|B" --recommend="A" --tier=1 >/dev/null 2>&1
+cmd_task_need DIVE-201 --type=decision --ask="pick" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=1 >/dev/null 2>&1
 cmd_task_answer DIVE-201 --value=A --channel-proof=555 >/dev/null 2>&1
 [[ "$(answered DIVE-201)" == "closed" ]] && ok_t "CP2 tier-1 decision clears via channel-proof" \
   || bad_t "CP2 tier-1 decision clears" "state=$(answered DIVE-201)"
@@ -118,7 +120,7 @@ cmd_task_answer DIVE-201 --value=A --channel-proof=555 >/dev/null 2>&1
 
 # ── CP3: channel-proof does NOT clear a tier-2 hard gate (kept a per-gate tap) ─
 seed_task DIVE-202
-cmd_task_need DIVE-202 --type=decision --ask="pick" --options="A|B" --recommend="A" --tier=1 >/dev/null 2>&1
+cmd_task_need DIVE-202 --type=decision --ask="pick" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=1 >/dev/null 2>&1
 db "UPDATE tasks SET tier='2' WHERE ident='DIVE-202';"   # simulate a T2-floored gate
 out=$(cmd_task_answer DIVE-202 --value=A --channel-proof=555 2>&1); rc=$?
 [[ "$(answered DIVE-202)" == "open" && $rc -ne 0 ]] && ok_t "CP3 tier-2 gate REJECTS channel-proof (keeps per-gate tap)" \
@@ -132,9 +134,9 @@ cmd_task_answer DIVE-203 --value=approved --channel-proof=555 >/dev/null 2>&1
   || bad_t "CP4 tier-1 approval clears" "state=$(answered DIVE-203)"
 
 # ── CP5: clear-recs bulk — applies recs to tier<2, skips tier-2/no-rec/routed ──
-seed_task DIVE-301; cmd_task_need DIVE-301 --type=decision --ask=q --options="A|B" --recommend="A" --tier=1 >/dev/null 2>&1
+seed_task DIVE-301; cmd_task_need DIVE-301 --type=decision --ask=q --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=1 >/dev/null 2>&1
 seed_task DIVE-302; cmd_task_need DIVE-302 --type=approval --ask=q --recommend=approved --tier=1 >/dev/null 2>&1
-seed_task DIVE-303; cmd_task_need DIVE-303 --type=decision --ask=q --options="A|B" --tier=1 >/dev/null 2>&1   # no recommend -> skip
+seed_task DIVE-303; cmd_task_need DIVE-303 --type=decision --ask=q --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --tier=1 >/dev/null 2>&1   # no recommend -> skip
 # DIVE-4346 adds a second hand-typed-tier-2 cap (a gate reaching the human must name
 # the capability it consumes); this fixture needs the UNDECLARED shape, so it takes
 # the audited exception alongside the DIVE-2848 one.
@@ -150,14 +152,14 @@ cmd_task_clear_recs --channel-proof=555 >/dev/null 2>&1
 [[ "$(answered DIVE-305)" == "open"   ]] && ok_t "CP5 SKIPS lead-routed gate"  || bad_t "CP5 skip routed" "$(answered DIVE-305)"
 
 # ── CP6: clear-recs --only targets exactly one gate ──────────────────────────
-seed_task DIVE-401; cmd_task_need DIVE-401 --type=decision --ask=q --options="A|B" --recommend="A" --tier=1 >/dev/null 2>&1
-seed_task DIVE-402; cmd_task_need DIVE-402 --type=decision --ask=q --options="A|B" --recommend="A" --tier=1 >/dev/null 2>&1
+seed_task DIVE-401; cmd_task_need DIVE-401 --type=decision --ask=q --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=1 >/dev/null 2>&1
+seed_task DIVE-402; cmd_task_need DIVE-402 --type=decision --ask=q --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=1 >/dev/null 2>&1
 cmd_task_clear_recs --channel-proof=555 --only=DIVE-401 >/dev/null 2>&1
 [[ "$(answered DIVE-401)" == "closed" && "$(answered DIVE-402)" == "open" ]] \
   && ok_t "CP6 --only clears just the named gate" || bad_t "CP6 --only scope" "401=$(answered DIVE-401) 402=$(answered DIVE-402)"
 
 # ── CP7: clear-recs rejects an unverified channel-proof ──────────────────────
-seed_task DIVE-501; cmd_task_need DIVE-501 --type=decision --ask=q --options="A|B" --recommend="A" --tier=1 >/dev/null 2>&1
+seed_task DIVE-501; cmd_task_need DIVE-501 --type=decision --ask=q --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=1 >/dev/null 2>&1
 out=$(cmd_task_clear_recs --channel-proof=999 2>&1); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-501)" == "open" ]] && ok_t "CP7 bad channel-proof rejected, nothing cleared" \
   || bad_t "CP7 bad channel-proof rejected" "rc=$rc state=$(answered DIVE-501)"

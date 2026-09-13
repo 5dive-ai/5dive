@@ -55,6 +55,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
 mkdir -p "$TASKS_DIR"; set +e
@@ -201,7 +203,7 @@ OUT_N=$(cmd_task_need DIVE-9020 --type=approval --ask="approve the merge of the 
 n=9010
 for cap in spend_authority secret_provision; do
   reset_log; seed_loop "DIVE-$n"
-  OUT_X=$(cmd_task_need "DIVE-$n" --type=decision --ask="pick option A or B" --options="A|B" --recommend="A" --needs="$cap" --from=dev 2>"$TMP/e_$n")
+  OUT_X=$(cmd_task_need "DIVE-$n" --type=decision --ask="pick option A or B" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --needs="$cap" --from=dev 2>"$TMP/e_$n")
   if [[ "$(reviewer_of "DIVE-$n")" == "" && "$(tier_of "DIVE-$n")" == "2" ]] && grep -q 'needs a human' <<<"$OUT_X" \
      && ! grep -q '^olivia$' "$ROUTE_FILE"; then
     ok_t "--needs=$cap resolves to the human on a verifier-loop task (tier 2, unrouted, verifier not sent)"
@@ -212,7 +214,7 @@ for cap in spend_authority secret_provision; do
   # is what makes it not. Prove the control for THIS type too, so the pass is not
   # inherited from case 1's approval arm.
   n=$((n+1)); reset_log; seed_loop "DIVE-$n"
-  actor_seam_as dev; cmd_task_need "DIVE-$n" --type=decision --ask="pick option A or B" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
+  actor_seam_as dev; cmd_task_need "DIVE-$n" --type=decision --ask="pick option A or B" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev >/dev/null 2>&1
   [[ "$(reviewer_of "DIVE-$n")" == "olivia" ]] \
     && ok_t "CONTROL for $cap's arm: the same decision without --needs still routes to the verifier" \
     || bad_t "decision control routes to verifier" "reviewer='$(reviewer_of "DIVE-$n")'"

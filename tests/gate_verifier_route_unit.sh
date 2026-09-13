@@ -38,6 +38,12 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+# DIVE-4462: this harness declines the gate seam — the arms read HUMAN_PINGED, a flag the stubbed _task_need_notify_deliver sets in THIS shell.
+# A subshell discards it, so wrapping would not red an arm, it would make the arm grade a
+# different program (green, and wrong). Its gates carry the audited --ask-ok, so no refusal aborts it.
+GATE_SEAM_INPROCESS=1
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 # DIVE-2190: the harness isolates STATE_DIR but the CALLER IDENTITY is ambient — task_actor
 # reads SUDO_USER/USER — while the fixtures hard-code real agent names (maker='dev'). Run this
 # suite as the agent literally named `dev` and the DIVE-2112 self-grading guard fires on step 5's
@@ -128,7 +134,7 @@ seed_loop() {
 
 # ---- 1. maker's decision gate routes to the verifier agent, not the human ----
 route_reset; seed_loop DIVE-501; fixture_actor dev
-cmd_task_need DIVE-501 --type=decision --options='A|B' --recommend='A' \
+cmd_task_need DIVE-501 --type=decision --options='A|B' --ask-ok='fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)' --recommend='A' \
   --ask='Which schema for the field?' --from=dev >/dev/null 2>&1
 [[ "$(route_last)" == "main" ]] \
   && ok_t "maker decision gate routes to verifier 'main'" \
@@ -146,7 +152,7 @@ actor_seam_as dev; cmd_task_need DIVE-502 --type=approval --ask='OK to merge the
 
 # ---- 3. filer IS the verifier -> no self-route (max-iters escalation stays human) ----
 route_reset; seed_loop DIVE-503; fixture_actor main
-cmd_task_need DIVE-503 --type=decision --options='A|B' --recommend='A' \
+cmd_task_need DIVE-503 --type=decision --options='A|B' --ask-ok='fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)' --recommend='A' \
   --ask='pick one' --from=main >/dev/null 2>&1
 [[ "$(route_last)" != "main" ]] \
   && ok_t "verifier's own gate does not self-route to itself" \
@@ -157,7 +163,7 @@ cmd_task_need DIVE-503 --type=decision --options='A|B' --recommend='A' \
 # land on the VERIFIER, who has no spend authority — but the route to true-human is
 # the DECLARATION now, not the ask's wording. Control below records the loosening.
 route_reset; seed_loop DIVE-504; fixture_actor dev
-cmd_task_need DIVE-504 --type=decision --options='A|B' --recommend='A' --needs=spend_authority \
+cmd_task_need DIVE-504 --type=decision --options='A|B' --ask-ok='fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)' --recommend='A' --needs=spend_authority \
   --ask='Approve the $5000 refund to the customer?' --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(route_sent)" == "0" ]] \
   && ok_t "a DECLARED money decision stays human, not verifier-routed" \
@@ -169,7 +175,7 @@ cmd_task_need DIVE-504 --type=decision --options='A|B' --recommend='A' --needs=s
 # is load-bearing and STAYS: 9 decision-type gates in the 30-day window were
 # answered by the paired human and a blanket demotion deleted all 9.
 route_reset; seed_loop DIVE-554; fixture_actor dev
-cmd_task_need DIVE-554 --type=decision --options='A|B' --recommend='A' \
+cmd_task_need DIVE-554 --type=decision --options='A|B' --ask-ok='fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)' --recommend='A' \
   --ask='Approve the $5000 refund to the customer?' --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] \
   && ok_t "arm C narrowing: the SAME spend ask undeclared on a DECISION still pages — a lead could auto-apply it, so the floor is kept" \
@@ -276,7 +282,7 @@ rr_nl=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-311
 # disabled. A non-push question on the same loop shape still reaches the verifier —
 # without this arm, deleting the DIVE-1495 route entirely would pass 7 and 7b.
 route_reset; suppress_reset; seed_loop_g DIVE-3119; fixture_actor dev
-cmd_task_need DIVE-3119 --type=decision --options='A|B' --recommend='A' \
+cmd_task_need DIVE-3119 --type=decision --options='A|B' --ask-ok='fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)' --recommend='A' \
   --ask='Which schema for the field?' --from=dev >/dev/null 2>&1
 [[ "$(suppress_n)" == "0" ]] \
   && ok_t "NEGATIVE: no suppression row when the verifier route actually fires" \
@@ -290,7 +296,7 @@ cmd_task_need DIVE-3119 --type=decision --options='A|B' --recommend='A' \
 # would strip the verifier off every genuine question filed on it.
 route_reset; fixture_actor dev
 seed_loop_g DIVE-3120 'push-for-review gate routes to the loop VERIFIER'
-cmd_task_need DIVE-3120 --type=decision --options='A|B' --recommend='A' \
+cmd_task_need DIVE-3120 --type=decision --options='A|B' --ask-ok='fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)' --recommend='A' \
   --ask='Which schema for the field?' --from=dev >/dev/null 2>&1
 [[ "$(route_last)" == "grader" ]] \
   && ok_t "a push-for-review TITLE does not lead-route a non-push ask" \

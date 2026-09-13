@@ -33,6 +33,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 
 STATE_DIR="$TMP"
 TASKS_DIR="$STATE_DIR/tasks"
@@ -97,7 +99,7 @@ runq cmd_task_block "$r" --reason="held for launch window" --wake=+3d
 
 # --- T7: a human need-gate anchors a block -----------------------------------
 n=$(addt --assignee=nate -- "N gated")
-runq cmd_task_need "$n" --type=decision --options="X|Y" --ask="pick"
+runq cmd_task_need "$n" --type=decision --options="X|Y" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --ask="pick"
 { [[ "$(st "$n")" == "blocked" ]] && _task_has_block_anchor "$n"; } \
   && ok_t "task need blocks + satisfies the gate anchor" || bad_t "need anchor" "status=$(st "$n")"
 

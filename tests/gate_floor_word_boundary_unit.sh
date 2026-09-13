@@ -49,6 +49,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
 GATE_PROOF_ENFORCE="$STATE_DIR/gate-proof.enforce"
@@ -190,7 +192,7 @@ unset -f _council_constitution_path _council_hard_gate_rx
 #     T1..T7 grade the helpers; this grades the decision. --------------------
 db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('DIVE-901','t','todo','main');"
 cmd_task_need DIVE-901 --type=decision --ask="stop forging a suppression that never happened" \
-  --options="A|B" --recommend="A" >/dev/null 2>&1
+  --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 _tier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-901';")
 [[ "$_tier" != "2" ]] \
   && ok_t "T8 e2e: a decision gate whose ASK says 'suppression' is NOT floored to tier 2 (tier $_tier)" \
@@ -198,7 +200,7 @@ _tier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-901';")
 
 db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('DIVE-902','t','todo','main');"
 cmd_task_need DIVE-902 --type=decision --ask="approve the press release copy" \
-  --options="A|B" --recommend="A" >/dev/null 2>&1
+  --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 # DIVE-4175 arm C: the tier is no longer the observable — the promoter is gone. What
 # T8 is protecting is that the per-term word boundary did not FAIL OPEN, and that is
 # now read off floor_provenance, which still records the axis and the term.
@@ -209,7 +211,7 @@ _prov=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-90
 
 db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('DIVE-903','t','todo','main');"
 cmd_task_need DIVE-903 --type=decision --ask="approve \$500 for ads" \
-  --options="A|B" --recommend="A" >/dev/null 2>&1
+  --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 _prov=$(db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='DIVE-903';")
 [[ "$_prov" == axis=ask* ]] \
   && ok_t "T8 e2e: a money ask STILL matches the floor (the fail-open a per-term \\b would open)" \

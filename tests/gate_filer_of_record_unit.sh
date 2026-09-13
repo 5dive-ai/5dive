@@ -46,6 +46,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 set +e
 
 # DIVE-4154: this harness grades the DELIVERER — the escalation chain, the
@@ -121,7 +123,7 @@ run_esc() { : >"$TMP/out"; cmd_task_gate_escalate "$1" >"$TMP/out" 2>&1; local r
 db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,status)
     VALUES ('DIVE-9101','creators task','high','main','main','standard','todo');"
 FILER_SELF=""; READABLE=""; PAIRED=""
-out=$( (actor_seam_as dev3; cmd_task_need DIVE-9101 --type=decision --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 )
+out=$( (actor_seam_as dev3; cmd_task_need DIVE-9101 --type=decision --ask="which way?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev3) 2>&1 )
 row=$(db "SELECT COALESCE(gate_filed_by,'NULL')||'|'||COALESCE(created_by,'NULL')||'|'||COALESCE(assignee,'NULL')
           FROM tasks WHERE ident='DIVE-9101';")
 [[ "$row" == "dev3|main|dev3" ]] \

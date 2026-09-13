@@ -42,6 +42,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 set +e
 
 STATE_DIR="$TMP"; TASKS_DIR="$TMP/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
@@ -60,7 +62,7 @@ mk() { db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,stat
 
 # ---- 1. the live bug: no precedent is the COMMON case, not an edge case -------
 mk DIVE-8001
-out=$( (JSON_MODE=1 cmd_task_need DIVE-8001 --type=decision --options="A|B" \
+out=$( (JSON_MODE=1 cmd_task_need DIVE-8001 --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" \
           --recommend="A" --ask="pick one" --from=dev) 2>/dev/null )
 [[ -n "$out" ]] && ok_t "task need --json emits SOMETHING with no precedent" \
   || bad_t "envelope is non-empty" "got 0 bytes — the whole object was killed by one field"
@@ -81,7 +83,7 @@ printf '%s' "$out" | jq -e . >/dev/null 2>&1 \
 db "UPDATE tasks SET need_answer='A', need_answered_at=datetime('now'),
        need_answered_by='human:test' WHERE ident='DIVE-8001';"
 mk DIVE-8002
-out2=$( (JSON_MODE=1 cmd_task_need DIVE-8002 --type=decision --options="A|B" \
+out2=$( (JSON_MODE=1 cmd_task_need DIVE-8002 --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" \
            --recommend="A" --ask="pick one" --from=dev) 2>/dev/null )
 pref=$(printf '%s' "$out2" | jq -r '.data.precedent_ref' 2>/dev/null)
 [[ "$pref" =~ ^[0-9]+$ ]] \

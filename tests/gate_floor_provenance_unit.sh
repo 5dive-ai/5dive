@@ -87,6 +87,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
 JSON_MODE=1
@@ -140,7 +142,7 @@ seed DIVE-9002 'ordinary title'
 
 # --- 3. axis=ask + term — the floor fired on the ask ----------------------------
 seed DIVE-9003 'ordinary title'
-( cmd_task_need DIVE-9003 --type=decision --ask="approve the spend on a bigger volume" --options="A|B" --recommend=A >/dev/null 2>&1 )
+( cmd_task_need DIVE-9003 --type=decision --ask="approve the spend on a bigger volume" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=A >/dev/null 2>&1 )
 # DIVE-4346: the provenance field now carries a SECOND clause on a gate whose
 # capability was derived from the floor term (`;needs=derived:<class>`), so these
 # arms assert the CAUSE clause as a prefix rather than the whole field. The
@@ -154,7 +156,7 @@ seed DIVE-9003 'ordinary title'
 # The row must still say so — "not floored, and here is the term I saw" is exactly
 # the fact a reviewer needs, and it is the bucket 4 of tonight's 48 fell into.
 seed DIVE-9004 'delete the old customer records table'
-( cmd_task_need DIVE-9004 --type=decision --ask="which of the two rendering libraries should the panel use, A or B" --options="A|B" --recommend=A >/dev/null 2>&1 )
+( cmd_task_need DIVE-9004 --type=decision --ask="which of the two rendering libraries should the panel use, A or B" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=A >/dev/null 2>&1 )
 [[ "$(prov DIVE-9004)" == "axis=title;term=delete" ]] \
   && ok_t 'a title-only category term records axis=title with its term' \
   || bad_t 'axis=title must be recorded' "got [$(prov DIVE-9004)]"
@@ -164,14 +166,14 @@ seed DIVE-9004 'delete the old customer records table'
 
 # --- 5. axis=title-fallback — the ask states nothing of its own -----------------
 seed DIVE-9005 'delete the old customer records table'
-( cmd_task_need DIVE-9005 --type=decision --ask="?" --options="A|B" --recommend=A >/dev/null 2>&1 )
+( cmd_task_need DIVE-9005 --type=decision --ask="?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=A >/dev/null 2>&1 )
 [[ "$(prov DIVE-9005)" == "axis=title-fallback;term=delete"* && "$(tier_of DIVE-9005)" == "2" ]] \
   && ok_t 'an insubstantial ask floors on the title and records title-fallback' \
   || bad_t 'title-fallback must be recorded and must floor' "got [$(prov DIVE-9005)] tier=$(tier_of DIVE-9005)"
 
 # --- 6. axis=none — the floor RAN and did not fire ------------------------------
 seed DIVE-9006 'panel rendering library choice'
-( cmd_task_need DIVE-9006 --type=decision --ask="which of the two rendering libraries should the panel use, A or B" --options="A|B" --recommend=A >/dev/null 2>&1 )
+( cmd_task_need DIVE-9006 --type=decision --ask="which of the two rendering libraries should the panel use, A or B" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=A >/dev/null 2>&1 )
 [[ "$(prov DIVE-9006)" == "axis=none" ]] \
   && ok_t 'a clean gate records axis=none — "ran, no hit", not an empty cell' \
   || bad_t 'a non-floored gate must still record that the floor ran' "got [$(prov DIVE-9006)] — NULL here reproduces the defect this ticket exists to fix"
@@ -205,8 +207,8 @@ seed DIVE-9012 'ordinary title'
 # The archive is the only durable record once a row is re-filed or withdrawn, and
 # the reconstruction that motivated this ticket read gate_history, not tasks.
 seed DIVE-9008 'ordinary title'
-( cmd_task_need DIVE-9008 --type=decision --ask="approve the spend on a bigger volume" --options="A|B" --recommend=A >/dev/null 2>&1 )
-( cmd_task_need DIVE-9008 --type=decision --ask="which rendering library, A or B" --options="A|B" --recommend=A >/dev/null 2>&1 )
+( cmd_task_need DIVE-9008 --type=decision --ask="approve the spend on a bigger volume" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=A >/dev/null 2>&1 )
+( cmd_task_need DIVE-9008 --type=decision --ask="which rendering library, A or B" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=A >/dev/null 2>&1 )
 hist=$(db "SELECT COALESCE(floor_provenance,'<NULL>') FROM gate_history WHERE ident='DIVE-9008' ORDER BY id LIMIT 1;")
 [[ "$hist" == "axis=ask;term=spend"* ]] \
   && ok_t 'the archived gate keeps its provenance in gate_history' \
@@ -219,7 +221,7 @@ hist=$(db "SELECT COALESCE(floor_provenance,'<NULL>') FROM gate_history WHERE id
 # A row with no gate must not keep reporting why it had a tier. The value is not
 # lost — arm 8 is why: the archive took a copy on the way out.
 seed DIVE-9009 'ordinary title'
-( cmd_task_need DIVE-9009 --type=decision --ask="approve the spend on a bigger volume" --options="A|B" --recommend=A >/dev/null 2>&1 )
+( cmd_task_need DIVE-9009 --type=decision --ask="approve the spend on a bigger volume" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=A >/dev/null 2>&1 )
 ( cmd_task_need DIVE-9009 --withdraw >/dev/null 2>&1 )
 [[ "$(prov DIVE-9009)" == "<NULL>" ]] \
   && ok_t 'withdraw clears the provenance off the task row' \

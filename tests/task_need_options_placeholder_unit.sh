@@ -76,6 +76,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh lib/actor.sh lib/runs.sh lib/broker.sh cmd_push.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP/state"
 TASKS_DIR="$STATE_DIR/tasks"
 # shellcheck disable=SC2034
@@ -102,6 +104,14 @@ tasks_db_init
 db "INSERT INTO tasks (ident,title,status,priority,created_by,project_key,kind)
     VALUES ('DIVE-9001','placeholder-options row','in_progress','medium','main','dive','standard'),
            ('DIVE-9002','descriptive-options row','in_progress','medium','main','dive','standard');"
+
+# DIVE-4462: seed the org chart. This harness grades DIVE-4416's "warn, never fail"
+# for the AGENT reader, and since DIVE-4431 (#947) a tier-1 gate the chart cannot
+# route is human-facing for the READABILITY and OPTIONS rules — with no chart at all
+# there is no agent route left to grade, so the arms below would assert the agent
+# path while exercising the human one.
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('main',NULL,'coordinator');"
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('dev','main','builder');"
 
 run_need() {
   local tag="$1"; shift

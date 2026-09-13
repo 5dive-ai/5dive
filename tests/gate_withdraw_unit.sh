@@ -46,6 +46,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
 GATE_PROOF_ENFORCE="$STATE_DIR/gate-proof.enforce"
@@ -216,7 +218,7 @@ out=$(wd DIVE-231 ROOT SU=agent-creative ID=agent-grok); rc=$?
 # ── Shape / lifecycle guards (identity-independent; run as an authorized caller) ──
 # T4: an already-ANSWERED gate cannot be withdrawn.
 seed_task DIVE-204
-IS_ROOT=1 IDUN=root cmd_task_need DIVE-204 --type=decision --ask="pick lane" --options="A|B" --recommend="A" --tier=1 --from=creative >/dev/null 2>&1
+IS_ROOT=1 IDUN=root cmd_task_need DIVE-204 --type=decision --ask="pick lane" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=1 --from=creative >/dev/null 2>&1
 IS_ROOT=1 IDUN=root cmd_task_answer DIVE-204 --value=A --human >/dev/null 2>&1
 [[ "$(gate_open DIVE-204)" == "answered" ]] || bad_t "T4 precond answered" "open=$(gate_open DIVE-204)"
 out=$(wd DIVE-204 ROOT SU=agent-creative); rc=$?

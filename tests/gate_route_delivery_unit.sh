@@ -53,6 +53,12 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+# DIVE-4462: this harness declines the gate seam — the arms read HUMAN_PINGED, a flag the stubbed _task_need_notify_deliver sets in THIS shell.
+# A subshell discards it, so wrapping would not red an arm, it would make the arm grade a
+# different program (green, and wrong). Its gates carry the audited --ask-ok, so no refusal aborts it.
+GATE_SEAM_INPROCESS=1
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 # DIVE-2054: "task need lead-route" is now routed through _task_store_audit_log
 # (STORE IDENTITY fence, DIVE-2010) — declare this fixture store as prod so the
@@ -118,7 +124,7 @@ reset_log() { : >"$NOTIFY_LOG"; : >"$ROUTE_FILE"; : >"$AUDIT_LOG_FILE"; }
 # --- 1. a routed gate now records a delivery verdict at all -------------------
 # The headline defect: zero rows for the entire routed population.
 reset_log; seed DIVE-7; HUMAN_PINGED=0; SEND_RC=0; JSON_MODE=0
-OUT7=$(cmd_task_need DIVE-7 --urgent --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev 2>"$TMP/e7")
+OUT7=$(cmd_task_need DIVE-7 --urgent --type=decision --ask="ship A or B?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev 2>"$TMP/e7")
 R7=$(rows_for DIVE-7)
 [[ -n "$R7" ]] && ok_t "routed gate writes a gate-delivery row (was ZERO rows for the whole rail)" \
   || bad_t "routed gate writes a delivery row" "log: $(cat "$NOTIFY_LOG")"
@@ -140,7 +146,7 @@ grep -q 'delivery=delivered' <<<"$(audit_route)" && ok_t "audit row carries deli
 # This is the case that could not previously exist: the stub returns non-zero and
 # the old code printed "routed to main" regardless.
 reset_log; seed DIVE-8; HUMAN_PINGED=0; SEND_RC=7; JSON_MODE=0
-OUT8=$(cmd_task_need DIVE-8 --urgent --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev 2>"$TMP/e8")
+OUT8=$(cmd_task_need DIVE-8 --urgent --type=decision --ask="ship A or B?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev 2>"$TMP/e8")
 R8=$(rows_for DIVE-8)
 grep -q 'result=error' <<<"$R8" && ok_t "failed routed send records result=error" || bad_t "failed send error row" "row: $R8"
 grep -q 'rc=7' <<<"$R8" && ok_t "error row carries the send's ACTUAL exit status (rc=7)" || bad_t "error row names rc" "row: $R8"
@@ -264,7 +270,7 @@ _H13=$(grep 'tasks=DIVE-13 ' "$NOTIFY_LOG")
 # assumed from the fact that the first half passed.
 reset_log; seed DIVE-14; HUMAN_PINGED=0; SEND_RC=0; JSON_MODE=0
 actor_seam_as dev   # file as the BUILDER, so the gate routes up to the lead
-OUT14=$(cmd_task_need DIVE-14 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev 2>"$TMP/e14")
+OUT14=$(cmd_task_need DIVE-14 --type=decision --ask="ship A or B?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --from=dev 2>"$TMP/e14")
 # THE HEADLINE: nothing was sent. $ROUTE_FILE is written by the `5dive agent send`
 # stub, so a non-empty file is a wake this ticket exists to remove.
 [[ ! -s "$ROUTE_FILE" ]] && ok_t "arm 2: a routed gate fires ZERO agent send — the lead's window is not woken" \

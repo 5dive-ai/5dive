@@ -46,6 +46,10 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
+# DIVE-4462: this harness declines the gate seam — arm "the notice is one-shot per PROCESS" grades _TASK_STORE_AUDIT_FENCED, a shell flag cmd_task_need sets; a subshell discards it and the arm would grade a different program.
+GATE_SEAM_INPROCESS=1
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 
 # Suite guard: remember the REAL log's length up front, so the check at the
 # bottom fails if THIS run grew it — a regression here would otherwise sail
@@ -81,7 +85,7 @@ t=$(addt --assignee=dev -- "fixture gate task")
 # fork a subshell and the one-shot _TASK_STORE_AUDIT_FENCED flag set inside it
 # would never survive back to this process (mirrors the same caveat in
 # tests/gate_telemetry_fence_unit.sh). In production this is never called in one.
-cmd_task_need "$t" --type=decision --options="X|Y" --ask="pick" 2>"$TMP/first.err" >/dev/null
+cmd_task_need "$t" --type=decision --options="X|Y" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --ask="pick" 2>"$TMP/first.err" >/dev/null
 if [[ ! -s "$AUDIT_CALLS" ]]; then
   ok_t "off the prod store, an unnotified gate writes NO audit row"
 else
@@ -94,7 +98,7 @@ ERR1=$(cat "$TMP/first.err")
 
 # ...and only once per process, or every fixture gate in a suite reprints it.
 t2=$(addt --assignee=dev -- "second fixture gate task")
-cmd_task_need "$t2" --type=decision --options="X|Y" --ask="pick" 2>"$TMP/second.err" >/dev/null
+cmd_task_need "$t2" --type=decision --options="X|Y" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --ask="pick" 2>"$TMP/second.err" >/dev/null
 ERR2=$(cat "$TMP/second.err")
 [[ "$ERR2" != *"telemetry withheld"* ]] \
   && ok_t "the notice is one-shot per process, not once per row" \
@@ -105,7 +109,7 @@ reset
 export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"   # active store IS declared prod
 t3=$(addt --assignee=dev -- "on-store fixture gate task")
 t3_ident=$(db "SELECT ident FROM tasks WHERE id=$t3;")
-cmd_task_need "$t3" --type=decision --options="X|Y" --ask="pick" >/dev/null 2>&1
+cmd_task_need "$t3" --type=decision --options="X|Y" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --ask="pick" >/dev/null 2>&1
 # DIVE-2010 review (main): assert the SHAPE of the row, not the identity of
 # whoever runs the suite. `filer=` comes from task_actor(), which resolves to
 # the CALLER's own identity (dev2 -> dev here, but "main" on main's box, and

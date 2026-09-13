@@ -59,6 +59,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh cmd_proof.sh; do
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=1
@@ -97,7 +99,7 @@ hist_n() { db "SELECT COUNT(*) FROM gate_history WHERE task_id=${1};"; }
 # does not depend on the answer path's own policy checks.
 plant() {
   local id="$1"
-  ( cmd_task_need "$id" --type=decision --options="A|B" --recommend="A" \
+  ( cmd_task_need "$id" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
     --ask="fixture gate on $id" --tier=1 ) >/dev/null 2>&1
   db "UPDATE tasks SET need_answer='B', need_answered_at=datetime('now'),
         need_answered_by='human:lodar', need_answered_uid=1000,
@@ -238,7 +240,7 @@ fi
 
 # --- 5. NON-VACUITY: a FIRST gate archives nothing ---------------------------
 t5=$(addt --assignee=dev -- "fixture: virgin task, first gate ever")
-( cmd_task_need "$t5" --type=decision --options="A|B" --ask="first gate" --tier=1 ) >/dev/null 2>&1
+( cmd_task_need "$t5" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --ask="first gate" --tier=1 ) >/dev/null 2>&1
 if [[ "$(hist_n "$t5")" == "0" ]]; then
   ok_t "filing a FIRST gate archives nothing (a row means a gate was DISPLACED)"
 else

@@ -61,6 +61,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
 mkdir -p "$TASKS_DIR"; set +e
@@ -199,7 +201,7 @@ seed DIVE-9003
 ( cmd_task_need DIVE-9003 --type=approval --from=marketing --mode=sometime --ask=x ) >/dev/null 2>&1
 (( $? != 0 )) && ok_t "6a: an unknown --mode is refused" \
               || bad_t "6a: unknown --mode refused" "a free-text order is prose, which is what this ticket replaces"
-( cmd_task_need DIVE-9003 --type=decision --options="a|b" --recommend=a --from=marketing \
+( cmd_task_need DIVE-9003 --type=decision --options="a|b" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=a --from=marketing \
     --mode=confirm-after-send --ask=x ) >/dev/null 2>&1
 (( $? != 0 )) && ok_t "6b: --mode on a non-approval type is refused" \
               || bad_t "6b: --mode refused off --type=approval" "a decision is lead-clearable, so a ratification filed as one need never reach a person"

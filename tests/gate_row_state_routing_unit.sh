@@ -62,6 +62,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=0
 mkdir -p "$TASKS_DIR"; set +e
@@ -166,7 +168,7 @@ human_pinged \
 
 # decision type takes the same route (the three routable types, not just approval).
 seed DIVE-103 'gate routing bug report' dive-3224-inbox
-OUT=$(file_gate DIVE-103 dev --type=decision --ask="$ASK_MISS" --options="A|B" --recommend="A")
+OUT=$(file_gate DIVE-103 dev --type=decision --ask="$ASK_MISS" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A")
 [[ "$(reviewerof DIVE-103)" == "main" ]] \
   && ok_t "B3 --type=decision on a bound row routes too" \
   || bad_t "B3 decision must route" "routed_reviewer='$(reviewerof DIVE-103)'; out=$OUT"

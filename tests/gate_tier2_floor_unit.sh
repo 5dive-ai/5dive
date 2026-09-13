@@ -42,6 +42,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
 GATE_PROOF_ENFORCE="$STATE_DIR/gate-proof.enforce"
@@ -127,7 +129,7 @@ touch "$GATE_PROOF_ENFORCE"   # enforcement ON for the floor tests
 #     gate also MINTS a nonce, but this floor is provenance-based and does not read
 #     it — that independence is what gate_tier2_decision_nonce_unit T6/T7 pin.) ---
 seed_task DIVE-101
-cmd_task_need DIVE-101 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-101 --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 [[ "$(tierof DIVE-101)" == "2" ]] && ok_t "T1 decision --tier=2 stored as tier 2" \
   || bad_t "T1 decision tier 2 stored" "got tier '$(tierof DIVE-101)'"
 out=$(cmd_task_answer DIVE-101 --value=A 2>&1); rc=$?
@@ -141,7 +143,7 @@ out=$(cmd_task_answer DIVE-101 --value=A 2>&1); rc=$?
 # --- T2: SAME gate, a trusted human path passes --human (recorded human:*): ACCEPTED
 #     (DIVE-525 — a real tap/dashboard answer must never be blocked). --------------
 seed_task DIVE-102
-cmd_task_need DIVE-102 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-102 --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 # SUBSHELLED (DIVE-2233). The one bare `cmd_task_answer` in this file whose expected
 # outcome is SUCCESS: T1/T4 capture into `out=$(…)`, already a subshell, so a refusal
 # there returns a code. Here a refusal calls production's `fail`, which `exit`s — in a
@@ -156,7 +158,7 @@ case "$(provby DIVE-102)" in human:*) ok_t "T2 provenance recorded human:*" ;; *
 
 # --- T3: a tier-1 decision gate is UNCHANGED — agents legitimately clear these. ---
 seed_task DIVE-103
-cmd_task_need DIVE-103 --type=decision --ask="pick lane" --options="A|B" --recommend="A" --tier=1 >/dev/null 2>&1
+cmd_task_need DIVE-103 --type=decision --ask="pick lane" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=1 >/dev/null 2>&1
 [[ "$(tierof DIVE-103)" == "1" ]] || bad_t "T3 precond tier 1" "got '$(tierof DIVE-103)'"
 cmd_task_answer DIVE-103 --value=A >/dev/null 2>&1
 [[ "$(answered DIVE-103)" == "closed" ]] \
@@ -189,7 +191,7 @@ fi
 #     answer bare would end the harness at status 6 instead of reddening one arm.
 rm -f "$GATE_PROOF_ENFORCE"
 seed_task DIVE-105
-cmd_task_need DIVE-105 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-105 --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 out=$(cmd_task_answer DIVE-105 --value=A 2>&1); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-105)" == "open" ]] \
   && ok_t "T5 enforce OFF does NOT lower the tier-2 floor — bare-agent answer still REFUSED (DIVE-2588)" \
@@ -205,7 +207,7 @@ grep -qi 'tier-2' <<<"$out" \
 #     enforcement envelope off. It must now say NOTHING — the floor stands, and
 #     the sentinel that is present (none here) is the only thing that can speak.
 seed_task DIVE-106
-cmd_task_need DIVE-106 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-106 --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 out=$(GATE_PROOF_ENFORCE=/nonexistent/nope cmd_task_answer DIVE-106 --value=A 2>&1); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-106)" == "open" ]] \
   && ok_t "T5b GATE_PROOF_ENFORCE=/nonexistent does not clear a tier-2 gate (DIVE-2588 bypass)" \

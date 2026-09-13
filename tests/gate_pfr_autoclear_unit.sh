@@ -31,6 +31,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 # cmd_push.sh carries _push_branch_from_body, which the auto-clear reads the row's
 # binding through. Sourced for the REAL function rather than a local re-implementation:
 # the whole point of DIVE-3266's row-state rule is that the gate and `5dive push` derive

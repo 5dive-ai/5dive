@@ -58,6 +58,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 
 # Suite guard: remember the REAL log's length up front, so the check at the bottom
 # fails if THIS run grew it.
@@ -208,7 +210,7 @@ reset
 SUDO_NONAGENT=1
 AUTH="nobody"
 t4=$(addt --assignee=dev -- "fixture unrouted decision $FIXTURE_MARK")
-cmd_task_need "$t4" --type=decision --options="A|B" --recommend="A" \
+cmd_task_need "$t4" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   --ask="pick one" --tier=1 >/dev/null 2>&1
 ( actor_seam_as lodar; cmd_task_answer "$t4" --value="A" --human --from=lodar >/dev/null 2>&1 )
 BY4=$(nby "$t4")

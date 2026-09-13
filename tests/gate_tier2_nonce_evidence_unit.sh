@@ -37,6 +37,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
 GATE_PROOF_ENFORCE="$STATE_DIR/gate-proof.enforce"
@@ -122,7 +124,7 @@ nhash()   { db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE ident='$1'
 
 # --- T1: a tier-2 decision gate now MINTS a per-gate nonce (it did not before). ---
 seed DIVE-201
-cmd_task_need DIVE-201 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-201 --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 [[ -n "$(nhash DIVE-201)" ]] \
   && ok_t "T1 tier-2 decision gate mints a per-gate human nonce" \
   || bad_t "T1 nonce minted on tier-2 decision" "human_nonce_hash empty"
@@ -156,7 +158,7 @@ case "$(provby DIVE-201)" in human:*) ok_t "T3 provenance recorded human:*" ;; *
 
 # --- T4: a WRONG nonce (agent guessing) is refused. --------------------------------
 seed DIVE-202
-cmd_task_need DIVE-202 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-202 --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 FAKE_NONAGENT=0
 out=$(cmd_task_answer DIVE-202 --value=A --human --human-proof="00000000000000000000000000000000" 2>&1); rc=$?
 [[ "$(answered DIVE-202)" == "open" && $rc -ne 0 ]] \
@@ -165,7 +167,7 @@ out=$(cmd_task_answer DIVE-202 --value=A --human --human-proof="0000000000000000
 
 # --- T5: the dashboard/human-on-box path (non-agent SUDO_UID, no nonce) CLEARS. ----
 seed DIVE-203
-cmd_task_need DIVE-203 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-203 --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 FAKE_NONAGENT=1
 cmd_task_answer DIVE-203 --value=A --human >/dev/null 2>&1
 [[ "$(answered DIVE-203)" == "closed" ]] \
@@ -180,7 +182,7 @@ cmd_task_answer DIVE-203 --value=A --human >/dev/null 2>&1
 #     is the arm that reds if someone reverts _gate_human_principal to the uid test.
 #     Subshelled via $( ) because the refusal is a `fail 6` exit BY DESIGN.
 seed DIVE-290
-cmd_task_need DIVE-290 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-290 --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 FAKE_NONAGENT=1
 _cg_saved=$(declare -f _gate_caller_cgroup)
 _gate_caller_cgroup() { printf '%s' '/system.slice/system-5dive.slice/5dive-agent@dev.service'; }
@@ -194,7 +196,7 @@ eval "$_cg_saved"
 #     to the DIVE-1117 provenance floor: a real human --human tap still clears even
 #     though its original message carried no nonce (an in-flight pre-fix gate). -----
 seed DIVE-204
-cmd_task_need DIVE-204 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-204 --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 db "UPDATE tasks SET human_nonce_hash=NULL WHERE ident='DIVE-204';"   # simulate a pre-DIVE-1448 row
 FAKE_NONAGENT=0   # plugin tap = agent SUDO_UID, no nonce available on the old message
 cmd_task_answer DIVE-204 --value=A --human >/dev/null 2>&1
@@ -204,7 +206,7 @@ cmd_task_answer DIVE-204 --value=A --human >/dev/null 2>&1
 
 # --- T7: legacy fallback still rejects a NON-human (no --human) agent answer. -------
 seed DIVE-205
-cmd_task_need DIVE-205 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
+cmd_task_need DIVE-205 --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape" >/dev/null 2>&1
 db "UPDATE tasks SET human_nonce_hash=NULL WHERE ident='DIVE-205';"
 FAKE_NONAGENT=0
 out=$(cmd_task_answer DIVE-205 --value=A 2>&1); rc=$?
@@ -216,7 +218,7 @@ out=$(cmd_task_answer DIVE-205 --value=A 2>&1); rc=$?
 #     (b) gap: decision answers previously left NO audit row at all. ---------------
 : > "$AUDIT_LOG_FILE"
 seed DIVE-206
-cmd_task_need DIVE-206 --type=decision --ask="pick lane" --options="A|B" --recommend="A" --tier=1 >/dev/null 2>&1
+cmd_task_need DIVE-206 --type=decision --ask="pick lane" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=1 >/dev/null 2>&1
 FAKE_NONAGENT=0
 cmd_task_answer DIVE-206 --value=A >/dev/null 2>&1
 [[ "$(answered DIVE-206)" == "closed" ]] \

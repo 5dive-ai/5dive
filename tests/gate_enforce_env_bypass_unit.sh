@@ -64,6 +64,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
 DEFAULT_SENTINEL="$STATE_DIR/gate-proof.enforce"
@@ -231,7 +233,7 @@ rm -f "$ALT_SENTINEL"
 : > "$DEFAULT_SENTINEL"   # the live posture: enforcement armed by the root-owned file
 
 file_gate DIVE-401 decision --ask="approve the spend for the volume resize" \
-  --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+  --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 [[ "$(tierof DIVE-401)" == "2" ]] \
   && ok_t "E0 precondition: the gate really is tier 2" \
   || bad_t "E0 tier-2 precondition" "tier=$(tierof DIVE-401)"
@@ -261,7 +263,7 @@ grep -qi 'unproven\|tier-2' <<<"$out" \
 # Half 2 of the fix, isolated: even with NO sentinel anywhere — the state the override
 # used to fake — the tier-2 floor stands on its own.
 rm -f "$DEFAULT_SENTINEL"
-file_gate DIVE-402 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+file_gate DIVE-402 decision --ask="pick a lane" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 out=$(answer DIVE-402 --value=A); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-402)" == "open" ]] \
   && ok_t "E5 with enforcement genuinely OFF the tier-2 floor STILL refuses a non-human answer" \
@@ -273,7 +275,7 @@ out=$(answer DIVE-402 --value=A); rc=$?
 # nonce-bearing tier-2 gate is the DIVE-2356 evidence block. Enforcement is still
 # genuinely off here, so this arm reds if that block's flag conjunct comes back and
 # stays green if only the floor's does. Without it, half the fix is untested.
-file_gate DIVE-406 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+file_gate DIVE-406 decision --ask="pick a lane" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 [[ "$(hashof DIVE-406)" =~ ^[0-9a-f]{64}$ ]] || bad_t "E6 precondition: gate minted a nonce" "hash='$(hashof DIVE-406)'"
 out=$(answer DIVE-406 --value=A --human); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-406)" == "open" ]] \
@@ -283,7 +285,7 @@ out=$(answer DIVE-406 --value=A --human); rc=$?
 
 # ── L2: liveness. A harness whose every arm expects a refusal proves nothing. ─────
 as_human_on_box
-file_gate DIVE-403 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
+file_gate DIVE-403 decision --ask="pick a lane" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=2 --needs=human_tap --rubber-stamp-ok="fixture: this case needs a real hard-human tier-2 gate to grade; DIVE-2848 caps the hand-typed shape"
 out=$(answer DIVE-403 --value=A --human); rc=$?
 [[ $rc -eq 0 && "$(answered DIVE-403)" == "closed" ]] \
   && ok_t "L2 liveness: a REAL human path (non-agent SUDO_UID at EUID 0) still clears the same gate" \
@@ -294,7 +296,7 @@ out=$(answer DIVE-403 --value=A --human); rc=$?
 as_agent
 
 # ── B: the boundary. The fix must not have widened into tier 1. ──────────────────
-file_gate DIVE-404 decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=1
+file_gate DIVE-404 decision --ask="pick a lane" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" --tier=1
 [[ "$(tierof DIVE-404)" == "1" ]] || bad_t "B0 tier-1 precondition" "tier=$(tierof DIVE-404)"
 out=$(answer DIVE-404 --value=A); rc=$?
 [[ $rc -eq 0 && "$(answered DIVE-404)" == "closed" ]] \

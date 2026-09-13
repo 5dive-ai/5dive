@@ -38,6 +38,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=1
 mkdir -p "$TASKS_DIR"; set +e
@@ -66,7 +68,7 @@ cmd_task_need DIVE-201 --type=approval --ask="approve the mechanical README sync
 
 # --- A2: regression — a non-floored `decision` gate still defaults to tier 1. -------
 seed_task DIVE-202
-cmd_task_need DIVE-202 --type=decision --ask="pick lane" --options="A|B" --recommend="A" >/dev/null 2>&1
+cmd_task_need DIVE-202 --type=decision --ask="pick lane" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" >/dev/null 2>&1
 [[ "$(tierof DIVE-202)" == "1" ]] \
   && ok_t "A2 non-floored decision still defaults to tier 1 (unchanged)" \
   || bad_t "A2 decision defaults tier 1" "got tier '$(tierof DIVE-202)'"

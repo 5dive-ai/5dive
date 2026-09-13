@@ -29,6 +29,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh lib/actor.sh lib/runs.sh cmd_agent_runtime.sh cmd_task.sh; do
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 set +e
 
 STATE_DIR="$TMP"; TASKS_DIR="$TMP/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
@@ -185,7 +187,7 @@ tier=$(db "SELECT COALESCE(tier,2) FROM tasks WHERE id=${sp_id};")
 # --self-minted is refused, not ignored, where there is no secret to describe.
 d_id=$(mkrow DIVE-9406)
 out=$(cmd_task_need DIVE-9406 --type=decision --self-minted --from=dev3 \
-        --options="A|B" --ask="Shall we ship the tile dark, or hold it for the relay?" 2>&1); rc=$?
+        --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --ask="Shall we ship the tile dark, or hold it for the relay?" 2>&1); rc=$?
 [[ $rc -ne 0 && "$out" == *"--self-minted only applies to a secret gate"* ]] \
   && ok_t "--self-minted on a non-secret gate is REFUSED, never silently ignored" \
   || fail_t "--self-minted on a decision gate returned rc=${rc}: ${out}"

@@ -80,6 +80,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
+. "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
+  || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 
 # Suite guard: remember where the REAL log ended before this run, so the check at
 # the bottom can read ONLY the bytes appended during it.
@@ -133,7 +135,7 @@ writerows() { grep -c 'task answer gate.*answered_by=' "$AUDIT_CALLS"; }
 reset
 export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"        # active store IS prod -> allowed
 t1=$(addt --assignee=dev -- "fixture decision gate")
-cmd_task_need "$t1" --type=decision --options="A|B" --recommend="A" \
+cmd_task_need "$t1" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   --ask="pick one" --tier=1 >/dev/null 2>&1
 cmd_task_answer "$t1" --value="B" --human >/dev/null 2>&1
 STORED_AT=$(nat "$t1"); STORED_BY=$(nby "$t1")
@@ -172,7 +174,7 @@ t2=$(addt --assignee=dev -- "fixture hard gate")
 # DIVE-4346: a gate reaching the human must name the capability it consumes. This
 # ask genuinely spends money, so the declaration is the honest fixture here — and it
 # keeps the gate a real hard-human tier-2, which is what the case needs to grade.
-cmd_task_need "$t2" --type=decision --options="A|B" --recommend="A" \
+cmd_task_need "$t2" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   --ask="spend money on ads" --tier=2 --needs=spend_authority >/dev/null 2>&1
 ( cmd_task_answer "$t2" --value="A" ) >/dev/null 2>&1
 RC=$?
@@ -196,7 +198,7 @@ fi
 reset
 export FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db"
 t3=$(addt --assignee=dev -- "fixture off-store gate")
-cmd_task_need "$t3" --type=decision --options="A|B" --recommend="A" \
+cmd_task_need "$t3" --type=decision --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
   --ask="pick one" --tier=1 >/dev/null 2>&1
 reset
 cmd_task_answer "$t3" --value="B" --human >"$TMP/off.out" 2>"$TMP/off.err"

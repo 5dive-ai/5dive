@@ -2668,11 +2668,16 @@ cmd_task_need() {
   # a token with no dictionary and the mapping survives only in the clause order of
   # the free-text ask. WARN, never fail — DIVE-2249's fixtures and scripted callers
   # legitimately pass letters, and this is a lesson about writing, not a constraint.
+  # DIVE-4462 hoists the verdict into a function-scoped flag: the WARN below is
+  # for every reader, the REFUSAL further down (inside `_ar_human`) is only for a
+  # gate whose resolved ROUTE is the paired human. One computation, two readers.
+  local _opts_all_single="false"
   if [[ -n "$options" ]]; then
     local _all_single
     _all_single=$(printf '%s' "$options" | jq -Rr '
       [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
       | (length > 0 and all(.[]; length == 1)) | tostring' 2>/dev/null) || _all_single="false"
+    _opts_all_single="$_all_single"
     if [[ "$_all_single" == "true" ]]; then
       warn "--options=\"$options\": every option is a single character — that is the usage placeholder copied, not a choice."
       warn "  Spell each option out (--options=\"widen the cap now|fix the 176 rows and split it\"). The owner reads the buttons on a phone,"
@@ -3667,6 +3672,35 @@ THE ONE EXIT THIS REFUSAL DOES NOT OFFER IS A DIFFERENT DESTINATION. --tier=1 wo
     elif [[ -n "$ask_ok" ]]; then
       warn "--ask-ok changed nothing on this gate — the readability check passed on its own (${_ar_words} words, no internal names)."
     fi
+    # DIVE-4462 — THE BUTTONS MUST NAME OUTCOMES. `--options=A|B` passed every
+    # check for years because the usage string taught it; DIVE-4416 made it WARN.
+    # A warning is the right shape for an agent reader and the wrong one here: on
+    # 2026-09-13 lodar's phone showed a gate whose two buttons read `A` and `B`,
+    # and the outcomes they stood for lived inside the ask, where the one-line
+    # render cannot reach them. Keyed on the RESOLVED ROUTE, not the declared tier
+    # (DIVE-4431): a gate is only graded on its buttons when a person taps them.
+    # The DIVE-4416 warn above is unchanged and still fires for the agent reader —
+    # scripted callers and fixtures legitimately pass letters.
+    if [[ "$_opts_all_single" == "true" ]]; then
+      if [[ -z "$ask_ok" ]]; then
+        _task_store_audit_log "task need ask-options" "refused" 0 -- \
+          "task=$ident" "filer=${actor:-}" "type=$type" "options=${options}" || true
+        fail "$E_VALIDATION" "$ident: refusing this gate because every one of its --options is a single character, and those options ARE the buttons the person taps. A button reading \"A\" names no outcome: once the ask is forwarded, quoted or screenshotted, \"recommend: A\" is a token with no dictionary, and the mapping survives only in the clause order of a sentence he read on a phone.
+Spell each option out as the OUTCOME it produces, so the two buttons are readable without the ask:
+  bad   --options=\"A|B\"
+  good  --options=\"widen the cap now|fix the rows first and split it\"
+Your exits:
+  spell the options out   two plain outcomes, no labels only we understand. This is the exit that is wanted.
+  --ask-ok=\"<why these options cannot be spelled out>\"    the audited exception. Re-run this same command with that flag appended and the gate files, unchanged, to the same person. Recorded on the gate and countable afterwards.
+NO EXIT HERE CHANGES THE DESTINATION: --tier=1 would send this somewhere else, and nothing about the wording of a button says the person who has to act on it is the wrong person."
+      fi
+      [[ ${#ask_ok} -ge 12 ]] \
+        || fail "$E_VALIDATION" "--ask-ok must state WHY these options cannot be spelled out (it is recorded on the gate and read by whoever counts these exceptions later)"
+      _task_store_audit_log "task need ask-options" "escaped" 0 -- \
+        "task=$ident" "filer=${actor:-}" "type=$type" "options=${options}" "declared=$ask_ok" || true
+      warn "bare-option escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". Every option on this gate is a single character, and the human is still being sent it."
+    fi
+
     # DIVE-4346 — THE ANSWERABILITY REFUSALS. Placed inside `_ar_human` for the
     # same reason the readability refusal is: only a gate that actually reaches
     # the paired human is graded on whether a person can act on it. A tier-1 ask
