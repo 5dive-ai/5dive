@@ -2245,6 +2245,25 @@ _import_create_passthru_ok() {
   return 1
 }
 
+# DIVE-4414: an accepted --isolation value must either be applied or refused.
+# Keep this validation shared with hire's validate-only path so --dry-run and a
+# real import cannot disagree about whether a tier is valid.
+_import_validate_isolation() {
+  valid_isolation "$1" \
+    || fail "$E_VALIDATION" "invalid --isolation (admin|standard|sandboxed)"
+}
+
+# Resolve the pack's tier without letting import's persona-only default replace
+# a manifest value. The caller's value wins only when the flag was explicit.
+_import_resolve_isolation() {
+  local manifest_value="$1" requested_value="$2" requested_set="$3"
+  if (( requested_set )); then
+    printf '%s' "$requested_value"
+  else
+    printf '%s' "$manifest_value"
+  fi
+}
+
 # DIVE-4416 validate-only entry point. Walks an `agent import` argv and fails
 # with the SAME message cmd_import's parser would, creating nothing and
 # requiring no root. `hire --from-market` calls this before it resolves the
@@ -2253,6 +2272,9 @@ _import_parse_args() {
   local a
   for a in "$@"; do
     case "$a" in
+      --isolation=*)
+        _import_validate_isolation "${a#--isolation=}"
+        ;;
       -*)
         _import_flag_is_value "$a" "${_IMPORT_OWN_VALUE_FLAGS[@]}" && continue
         _import_flag_is_bool  "$a" "${_IMPORT_OWN_BOOL_FLAGS[@]}"  && continue
@@ -2275,7 +2297,7 @@ cmd_import() {
   # import too, not only --from-persona. Default p_type EMPTY so we can tell
   # "explicitly asked for <type>" apart from "took the pack's baked-in type";
   # the from-persona synth defaults it to claude locally below.
-  local from_persona="" p_type="" p_iso="standard" p_model="" p_effort=""
+  local from_persona="" p_type="" p_iso="standard" p_iso_set=0 p_model="" p_effort=""
   # DIVE-2676: BYO credentials on the import path. Without these an import onto
   # an API-key-only seat provisions an agent that cannot reach a model at all.
   local p_provider="" p_api_key=""
@@ -2291,7 +2313,8 @@ cmd_import() {
       --workdir=*)         workdir="${1#--workdir=}" ;;
       --from-persona=*)    from_persona="${1#--from-persona=}" ;;
       --type=*)            p_type="${1#--type=}" ;;
-      --isolation=*)       p_iso="${1#--isolation=}" ;;
+      --isolation=*)       p_iso="${1#--isolation=}"; p_iso_set=1
+                            _import_validate_isolation "$p_iso" ;;
       --model=*)           p_model="${1#--model=}" ;;
       --effort=*)          p_effort="${1#--effort=}" ;;
       --provider=*)        p_provider="${1#--provider=}" ;;
@@ -2328,7 +2351,7 @@ cmd_import() {
       || fail "$E_VALIDATION" "could not build a pack from persona '$from_persona' (is it a valid OpenAgent persona?)"
     pack="$persona_tmp"
   fi
-  [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent import <pack>|--from-persona=<file.persona.yaml> --as=<name> [--type=claude] [--channels=...] [--telegram-token=...] [--discord-token=...] [--auth-profile=...] [--workdir=...]"
+  [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent import <pack>|--from-persona=<file.persona.yaml> --as=<name> [--type=claude] [--isolation=admin|standard|sandboxed] [--channels=...] [--telegram-token=...] [--discord-token=...] [--auth-profile=...] [--workdir=...]"
 
   # DIVE-2565: a single-file AGENTS.md export is a pack too. Explode it back into
   # a v1 stage and re-tar, so EVERYTHING below — safe-extract, manifest
@@ -2454,6 +2477,7 @@ cmd_import() {
   # (from-persona already baked p_type into the manifest above, so p_type is
   # empty there and the manifest value stands.)
   [[ -n "$p_type" ]]   && type="$p_type"
+  isolation=$(_import_resolve_isolation "$isolation" "$p_iso" "$p_iso_set")
   [[ -n "$p_model" ]]  && model="$p_model"
   [[ -n "$p_effort" ]] && effort="$p_effort"
   # DIVE-2303: resolve a family ALIAS to the full current id before it reaches
