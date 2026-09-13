@@ -4656,22 +4656,33 @@ _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
        OR (gate_pinged_at IS NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-15 minutes')))
   -- DIVE-4365 part 2: THE RE-NAG MUST NOT OUTRUN THE LEAD-REVIEW HOLD. A tier-2
-  -- gate's phone ping is now held up to 30 minutes so the lead can catch a false
-  -- one (src/task/notify.sh, the lead-review hold). The clause above makes a
-  -- never-pinged gate re-nag-eligible at 15, which is INSIDE that hold — so
-  -- without this the recovery path becomes the first contact and the hold is a
-  -- no-op on exactly the gates it was built for. Same ordering argument, and the
-  -- same 60s margin, as the 840-not-900 sizing one layer down: the re-nag is the
-  -- net under a ping lost to a dead box, never the normal first ring.
+  -- gate's phone ping is held so the lead can catch a false one
+  -- (src/task/notify.sh, the lead-review hold). The clause above makes a
+  -- never-pinged gate re-nag-eligible at 15 minutes; if the hold ever reaches
+  -- that, the recovery path becomes the first contact and the hold is a no-op on
+  -- exactly the gates it was built for. Same ordering argument, and the same 60s
+  -- margin, as the 840-not-900 sizing one layer down: the re-nag is the net under
+  -- a ping lost to a dead box, never the normal first ring.
+  --
+  -- SIZED TO THE HOLD PLUS THAT MARGIN, AND IT IS SLACK TODAY (DIVE-4420). The
+  -- hold is 10 minutes, so 11 here; the sweep's own 15-minute never-pinged clock
+  -- already sits past that and this clause excludes nothing at the current size.
+  -- It is kept, and kept in step, because it is the only thing that re-orders
+  -- them if the hold is raised back — and it is graded structurally (the routing
+  -- harness greps this literal and compares it against the hold), so a raise on
+  -- one side reds rather than silently inverting the two contacts. Tightening it
+  -- from 31 is what makes a gate whose hold child died with its box re-nag at the
+  -- normal 15 minutes instead of 31: a delay of one sweep, not of three windows.
   --
   -- SCOPED TO never-pinged TIER-2 ROWS ONLY, and scoped by AGE, not by a flag:
   -- an hour-old gate, an urgent one (the hold skips those outright, so they are
   -- pinged already and gate_pinged_at is set), and every tier-1 row are
-  -- unaffected. A gate whose hold child died with its box still re-nags — one
-  -- window later instead of at 15 minutes, which is a delay, never a swallow.
+  -- unaffected. A gate whose hold child died with its box still re-nags — later
+  -- rather than at 15 minutes if this clause bites, which is a delay, never a
+  -- swallow.
   AND NOT (COALESCE(tier,2)=2 AND gate_pinged_at IS NULL
            AND COALESCE(gate_urgent,0)=0
-           AND COALESCE(need_asked_at,updated_at,created_at) > datetime('now','-31 minutes'))
+           AND COALESCE(need_asked_at,updated_at,created_at) > datetime('now','-11 minutes'))
   AND NOT (tier=1 AND recommend IS NOT NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-48 hours'))
   AND (gate_pinged_at IS NULL

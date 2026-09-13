@@ -2242,20 +2242,40 @@ _GATE_UNDO_WINDOW_SECS_HUMAN_ONLY=840
 # `task inbox`, in `task queue` and answerable by `task answer`. The gate does not
 # wait for the lead; only the buzz does.
 #
-# 30 MINUTES, AND THE CEILING IS WHY IT IS NOT LONGER. The two skips are the
-# filer's explicit urgency, unchanged. A spend/human_tap/brand gate still reaches
-# the person — after the lead has had the window to catch a false one, which is
-# the whole re-ordering: today the human is rung FIRST and the lead reads about it
-# afterwards. Nothing here can stop a gate; it can only decide who reads it first.
+# 10 MINUTES, AND THE FLOOR IS THE LEAD'S DISPATCH, NOT THE CEILING (lodar,
+# 2026-09-13: "30 minutes seems way to long tho" — DIVE-4420). The hold buys the
+# lead ONE dispatch to look at the row; the lead is queued at file time and a
+# non-fresh seat is re-dispatched every 15 minutes, a fresh one sooner, so a
+# second and a third window buy re-reads of a row already read, paid for by the
+# person waiting. Ten minutes is what the catch actually costs; the rest was the
+# ceiling's slack, and the ceiling is not the thing being priced. The two skips
+# are the filer's explicit urgency, unchanged. A spend/human_tap/brand gate still
+# reaches the person — after the lead has had the window to catch a false one,
+# which is the whole re-ordering: today the human is rung FIRST and the lead
+# reads about it afterwards. Nothing here can stop a gate; it can only decide who
+# reads it first.
 #
-# ORDERING AGAINST THE RE-NAG IS ENFORCED IN THE SWEEP, NOT HERE. At 1800s this
-# window outruns the heartbeat's 15-minute never-pinged re-nag, so the sweep's
-# WHERE clause excludes a tier-2 row inside its hold (cmd_heartbeat.sh, the
-# DIVE-4365 clause) with the same 60s margin the 840-not-900 sizing takes above.
+# IT IS NOW SHORTER THAN EITHER TYPE WINDOW, WHICH IS THE ASK. At 1800s this
+# ceiling was the LONGEST of the three and replaced them; at 600s it is the
+# shortest, so a manual/secret tier-2 gate's withdraw-before-ping window is 600s
+# and no longer 840s. That is a real narrowing of the DIVE-4154 window on exactly
+# the human-bound gates it was widened for, and it is taken deliberately: the ask
+# was a shorter wait before the phone rings, and the withdrawal window cannot be
+# longer than the wait it sits inside. The filer keeps every other closer — the
+# row is blocked and answerable the instant it is written.
+#
+# ORDERING AGAINST THE RE-NAG. At 600s the hold clears the heartbeat's own
+# 15-minute never-pinged re-nag by 300s on its own, so the ordering the
+# 840-not-900 sizing protects one layer down holds here without help. The sweep's
+# DIVE-4365 exclusion (cmd_heartbeat.sh, that clause) is tightened in step to sit
+# 60s past this hold rather than three windows past it — a gate whose hold child
+# died with its box is then re-nagged at the sweep's normal 15 minutes instead of
+# 31. The exclusion is slack at this size and load-bearing again the moment
+# anyone raises the hold back; it is graded structurally, not by literal.
 # Cited by FILE and clause, never by identifier — a comment naming another
 # module's global creates a real lazy-dispatch load edge (see the note on the
 # clamp below).
-_GATE_LEAD_REVIEW_HOLD_SECS=1800
+_GATE_LEAD_REVIEW_HOLD_SECS=600
 
 # ── DIVE-4424 — THE HOLD IS A STATE OF THE ROW, AND EVERY SURFACE MUST SAY SO ──
 #
@@ -2369,8 +2389,10 @@ _task_gate_undo_window_secs() {
   _ntype=$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
   case "$_ntype" in manual|secret) _ceil="$_GATE_UNDO_WINDOW_SECS_HUMAN_ONLY" ;; esac
   # DIVE-4365 part 2: a HUMAN-BOUND gate (tier 2 — the only tier whose ping is a
-  # phone ping) gets the lead-review ceiling instead, which is longer than either
-  # type window above and therefore replaces them rather than competing with them.
+  # phone ping) gets the lead-review ceiling instead. It REPLACES the type window
+  # above rather than competing with it, in both directions — since DIVE-4420 it
+  # is SHORTER than both, so on a manual/secret tier-2 gate this line narrows the
+  # withdraw-before-ping window from 840s to 600s. Deliberate; see the constant.
   # Read from the ROW, like `gate_urgent` below and for the same reason: the tier
   # is committed before the deliverer runs on both paths, and a column cannot be
   # lost by a call site forgetting to re-export it. Tier 1 and tier 0 keep the
