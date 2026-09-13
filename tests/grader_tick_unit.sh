@@ -636,7 +636,21 @@ if command -v sqlite3 >/dev/null 2>&1; then
     INSERT INTO lifecycle_events VALUES
       (3, datetime('now','-1 hours'), 'task.grade.spawned', 'DIVE-GRADED', 'grader session on g1'),
       (4, datetime('now','-30 minutes'), 'task.graded', 'DIVE-GRADED', 'PASS');
-    INSERT INTO tasks(ident,status) VALUES ('DIVE-STALE','todo'),('DIVE-FRESH','todo'),('DIVE-GRADED','todo');"
+    -- OLD-GRADED: spawned 8h ago and graded 7h ago. It is past the age bound AND
+    -- finished, and it is the arm that stops 'stale' from meaning merely 'old'.
+    -- On the live store the overwhelming majority of spawns are exactly this
+    -- shape (52 of 53 resolved, most of them days old), so a stale list that
+    -- dropped the verdict exit would not be a subtle bug — it would print a
+    -- reclaimed-slot line for every grade the lane has ever completed.
+    INSERT INTO lifecycle_events VALUES
+      (5, datetime('now','-8 hours'), 'task.grade.spawned', 'DIVE-OLD-GRADED', 'grader session on g1'),
+      (6, datetime('now','-7 hours'), 'task.graded', 'DIVE-OLD-GRADED', 'PASS');
+    -- OLD-CLOSED: same age, no task.graded row at all — it exits on the tasks-table
+    -- belt (DIVE-4322 (b)) instead, which the stale list must honour too.
+    INSERT INTO lifecycle_events VALUES
+      (7, datetime('now','-8 hours'), 'task.grade.spawned', 'DIVE-OLD-CLOSED', 'grader session on g2');
+    INSERT INTO tasks(ident,status) VALUES ('DIVE-STALE','todo'),('DIVE-FRESH','todo'),('DIVE-GRADED','todo'),
+                                           ('DIVE-OLD-GRADED','todo'),('DIVE-OLD-CLOSED','done');"
   REALDB=1
   inflight_count(){ db "SELECT COUNT(DISTINCT s.ident) FROM lifecycle_events s
                           WHERE s.kind='task.grade.spawned'
@@ -680,6 +694,17 @@ $(_grader_inflight_exits_sql)
   [[ "$stale_idents" == "DIVE-STALE " ]] \
     && ok_ 'STALE: the dropped spawn is named, and the fresh and graded ones are not' \
     || bad_ 'stale list names exactly the dropped spawn' "got: [$stale_idents]"
+  # STALE IS NOT A SYNONYM FOR OLD, and this is the arm that says so. Both rows
+  # below are older than the bound and both are finished — one through the ledger
+  # verdict, one through the row's own closed status. Reporting either as a
+  # reclaimed slot would be a lie about capacity on every tick, and on the real
+  # store it would be a lie repeated once per grade the lane has ever run.
+  grep -q 'DIVE-OLD-GRADED' <<<"$(_grader_stale_spawns)" \
+    && bad_ 'STALE: an old but GRADED spawn was reported as dropped' "$(_grader_stale_spawns)" \
+    || ok_ 'STALE: an old spawn that reached a verdict is finished, not dropped'
+  grep -q 'DIVE-OLD-CLOSED' <<<"$(_grader_stale_spawns)" \
+    && bad_ 'STALE: an old spawn on a CLOSED row was reported as dropped' "$(_grader_stale_spawns)" \
+    || ok_ 'STALE: an old spawn whose row closed is finished, not dropped'
   _GRADER_STALE_HOURS=24
   [[ -z "$(_grader_stale_spawns)" ]] \
     && ok_ 'STALE: nothing is reported dropped when the bound has not been crossed' \
