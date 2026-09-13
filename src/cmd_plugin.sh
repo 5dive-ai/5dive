@@ -369,13 +369,41 @@ _plugin_is_builtin_channel() {
   jq -e --arg p "$1" 'any(.[]; .plugin==$p)' <<<"$FIVEDIVE_CHANNEL_PLUGINS_JSON" >/dev/null 2>&1
 }
 
+# DIVE-4466 — the same question, asked of a QUALIFIED ref.
+#
+# The bare-name check above was the whole guard, and the one caller that matters
+# never asks it a bare name: /dashboard/plugins' Add tab installs by the
+# qualified key on purpose (a bare name goes ambiguous the day a box knows two
+# marketplaces offering it, DIVE-4347), so `telegram@5dive-plugins` walked past
+# the guard, passed the trust gate as `official`, and produced a box-wide install
+# of a plugin that is wired per AGENT — dead code the page then showed as
+# "installed" (lodar, 2026-09-13).
+#
+# The marketplace half of the match is not decoration. FIVEDIVE_CHANNEL_PLUGINS_JSON
+# pins each channel to `5dive-plugins`; a third-party marketplace that happens to
+# publish a plugin called `telegram` is not our channel and must not inherit this
+# refusal. An EMPTY marketplace means the ref was bare, which is the old question.
+_plugin_is_builtin_channel_ref() {
+  local p="$1" m="${2:-}"
+  [[ -n "$m" ]] || { _plugin_is_builtin_channel "$p"; return; }
+  jq -e --arg p "$p" --arg m "$m" 'any(.[]; .plugin==$p and .marketplace==$m)' \
+    <<<"$FIVEDIVE_CHANNEL_PLUGINS_JSON" >/dev/null 2>&1
+}
+
+# One wording, two callers (the pre-resolution guard in `plugin add` and the
+# trust gate), so the two cannot drift apart the way they were about to.
+_plugin_builtin_channel_refusal() {
+  local p="$1"
+  fail "$E_USAGE" "'$p' is one of 5dive's built-in channel plugins — it is installed per AGENT, not per box, so 'plugin add' is not the path. Use: 5dive agent create <name> --channels=$p  (or, for an existing agent, 5dive agent config <name> --channels=$p). It predates the plugin contract and carries no 5dive manifest block, which is why it would otherwise read as unreviewed."
+}
+
 _plugin_trust_gate() {
   local name="$1" review="$2"
   case "$review" in
     official) return 0 ;;
     community|unreviewed|"")
       if _plugin_is_builtin_channel "$name"; then
-        fail "$E_USAGE" "'$name' is one of 5dive's built-in channel plugins — it is installed per AGENT, not per box, so 'plugin add' is not the path. Use: 5dive agent create <name> --channels=$name  (or, for an existing agent, 5dive agent config <name> --channels=$name). It predates the plugin contract and carries no 5dive manifest block, which is why it reads as unreviewed here."
+        _plugin_builtin_channel_refusal "$name"
       fi
       fail "$E_PERMISSION" "$(cat <<MSG
 '$name' is a ${review:-unreviewed} plugin, and 5dive installs only 'official' plugins today.
@@ -972,9 +1000,14 @@ cmd_plugin_add() {
   # which sits behind manifest resolution, which needs the marketplace the user
   # has not added. The whole value of the hint is for the person who has NOT set
   # anything up, so it has to run before anything that needs setup.
-  local _bare="${ref%@*}"
-  if [[ "$ref" != *@* ]] && _plugin_is_builtin_channel "$_bare"; then
-    fail "$E_USAGE" "'$_bare' is one of 5dive's built-in channel plugins — it is installed per AGENT, not per box, so 'plugin add' is not the path. Use: 5dive agent create <name> --channels=$_bare  (or, for an existing agent, 5dive agent config <name> --channels=$_bare). It predates the plugin contract and carries no 5dive manifest block, which is why it would otherwise read as unreviewed."
+  #
+  # DIVE-4466: and it asks the QUALIFIED ref too. The dashboard only ever sends
+  # the qualified form, so the bare-only version of this guard never fired for
+  # the one caller that could reach it from a browser.
+  local _bare="${ref%@*}" _refmkt=""
+  [[ "$ref" == *@* ]] && _refmkt="${ref#*@}"
+  if _plugin_is_builtin_channel_ref "$_bare" "$_refmkt"; then
+    _plugin_builtin_channel_refusal "$_bare"
   fi
 
   local plugin mkt
