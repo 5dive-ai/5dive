@@ -214,5 +214,369 @@ grep -q '_merge_do' <<<"$_UNCOND" \
   && ok_t "the grant is UNCONDITIONAL — not gated behind can-push, which a grader must not hold" \
   || bad_t "grant unconditional" "the _merge_do line is inside the can_push block"
 
+# --- 5. DIVE-4428: a queue-governed branch is ENQUEUED, not squash-merged -----
+# MEASURED 2026-09-13 (quinn, PRs #927/#928): `gh pr merge <url> --squash` names a
+# merge strategy that the merge queue owns, and GitHub answers that combination
+# with a GraphQL 500 — which reads as an outage and invites a retry that cannot
+# work. Two verified-good fixes were left for a human to press by hand.
+MERGE_CALLER=$(declare -f cmd_task_merge)
+# The GitHub half lives in its own function since iteration 2 (see section 6):
+# the authority half above is still graded against `cmd_task_merge_do`.
+DO_GH=$(declare -f _merge_do_at_github)
+grep -q 'enqueuePullRequest' <<<"$DO_GH" \
+  && ok_t "the executor ENQUEUES on a queue-governed branch instead of naming a strategy the queue owns" \
+  || bad_t "enqueuePullRequest reached" "$DO_GH"
+grep -q 'expectedHeadOid' <<<"$DO_GH" \
+  && ok_t "...pinning the graded head server-side, so a head that moved errors instead of queueing an ungraded tree" \
+  || bad_t "expectedHeadOid pin" ""
+grep -q 'mergeQueue{id}' <<<"$DO_GH" \
+  && ok_t "...and the governance test is a non-null mergeQueue, not branchProtectionRule (a ruleset populates no rule)" \
+  || bad_t "mergeQueue governance probe" ""
+grep -q 'isInMergeQueue' <<<"$DO_GH" \
+  && ok_t "an already-queued pull request is not re-enqueued (a second enqueue is a no-op at best)" \
+  || bad_t "already-queued short circuit" ""
+# The enqueue is reported as an enqueue. Saying "merged" over one is how a seat
+# closes a row on a merge that has not happened, and the queue can still eject it.
+grep -q 'disposition=enqueued' <<<"$DO_GH" \
+  && ok_t "the executor names the disposition it actually achieved" \
+  || bad_t "executor emits disposition" ""
+grep -q '_merge_disp_read' <<<"$MERGE_CALLER" \
+  && ok_t "...and the caller reads it rather than printing 'merged' in the past tense over an enqueue" \
+  || bad_t "caller branches on disposition" "$MERGE_CALLER"
+grep -q '_merge_disp_read' <<<"$(declare -f _merge_disp_do)" \
+  && ok_t "...through the SAME reader the close-time rail uses — one reader of the marker, not two greps" \
+  || bad_t "one reader of the marker" "$(declare -f _merge_disp_do)"
+grep -q 'enqueued:true' <<<"$MERGE_CALLER" \
+  && ok_t "...including in --json, where merged:false and enqueued:true are different facts" \
+  || bad_t "json carries enqueued" ""
+# gh's own words are the error. The defect this replaced pointed at output the
+# caller captures and may never have shown.
+grep -q "read gh'" <<<"$DO_GH" \
+  && bad_t "gh output captured, not pointed at" "the executor still says 'read gh's message above'" \
+  || ok_t "GitHub's own message is CAPTURED and reprinted, not referred to as output above"
+
+# --- 6. DIVE-4428 iteration 2: THE ARMS THAT EXECUTE THE ENVELOPE -------------
+#
+# WHY THIS SECTION EXISTS. Iteration 1 graded this fix with eight `grep`s over
+# `declare -f`. quinn re-applied two mutants with every one of those strings
+# still intact and the harness stayed at 38 passed / 0 failed:
+#   (a) `[[ -n "$_has_queue" ]]` -> `-z`   — inverts governance completely: it
+#       would enqueue on branches with NO queue and squash-merge the queue-
+#       governed ones, i.e. restore the exact 500 this row is about.
+#   (b) `-f oid="$_head_oid"`   -> `-f oid=""` — removes the head pin an arm
+#       above claims to hold.
+# A string is not a behaviour. Every arm below RUNS `_merge_do_at_github` over a
+# stubbed `gh`, and each of the five outcomes is asserted on what the rail
+# actually invoked, what it returned, and what it audited.
+#
+# `_merge_do_at_github` is the GitHub half of `_merge_do`, split out for exactly
+# this reason; the authority half (root, SUDO_UID, standing, the row's own
+# delivery_ref) is unchanged and is still graded at source in section 4.
+mkdir -p "$TMP/bin" "$TMP/ghcfg"
+cat >"$TMP/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf 'GH %s\n' "$*" >>"$GH_ARGS_LOG"
+_all="$*"
+if [[ "$_all" == *"pr merge"* ]]; then
+  case "${SQUASH_MODE:-ok}" in
+    ok)   printf 'Squashed and merged pull request #658\n'; exit 0 ;;
+    fail) printf '! The merge strategy for main is set by the merge queue\nGraphQL: Something went wrong while executing your query\n' >&2; exit 1 ;;
+  esac
+fi
+if [[ "$_all" == *enqueuePullRequest* ]]; then
+  case "${ENQ_MODE:-ok}" in
+    ok)      printf '{"data":{"enqueuePullRequest":{"mergeQueueEntry":{"state":"QUEUED","position":1}}}}\n'; exit 0 ;;
+    noentry) printf '{"data":{"enqueuePullRequest":{"mergeQueueEntry":null}}}\n'; exit 0 ;;
+    err)     printf 'GraphQL: enqueuePullRequest is not admitted for this installation\n' >&2; exit 1 ;;
+  esac
+fi
+# otherwise: the governance probe
+case "${PROBE_MODE:-queue}" in
+  queue)      printf '{"data":{"resource":{"id":"PR_node1","headRefOid":"%s","isInMergeQueue":false,"mergeQueue":{"id":"MQ_1"}}}}\n' "${HEAD_OID}"; exit 0 ;;
+  noqueue)    printf '{"data":{"resource":{"id":"PR_node1","headRefOid":"%s","isInMergeQueue":false,"mergeQueue":null}}}\n' "${HEAD_OID}"; exit 0 ;;
+  already)    printf '{"data":{"resource":{"id":"PR_node1","headRefOid":"%s","isInMergeQueue":true,"mergeQueue":{"id":"MQ_1"}}}}\n' "${HEAD_OID}"; exit 0 ;;
+  nopin)      printf '{"data":{"resource":{"isInMergeQueue":false,"mergeQueue":{"id":"MQ_1"}}}}\n'; exit 0 ;;
+  unreadable) printf 'GraphQL: Something went wrong while executing your query\n' >&2; exit 1 ;;
+esac
+exit 1
+STUB
+chmod +x "$TMP/bin/gh"
+export PATH="$TMP/bin:$PATH"
+export GH_ARGS_LOG="$TMP/gh.args"; : >"$GH_ARGS_LOG"
+export HEAD_OID=eb6528c1eb6528c1eb6528c1eb6528c1eb6528c1
+AUDIT_LOG="$TMP/audit.log"; : >"$AUDIT_LOG"
+# The audit line is half of what this fix changes (an enqueue must not be recorded
+# as a merge), so it is captured rather than written to a real store.
+_task_store_audit_log() { printf '%s\n' "$*" >>"$AUDIT_LOG"; }
+XPR=https://github.com/5dive-ai/5dive/pull/658
+
+# Runs the rail and captures rc, stderr, the gh argv log and the audit line.
+# In a SUBSHELL: the stubs are the surface under test, not this shell's state.
+run_rail() {
+  : >"$GH_ARGS_LOG"; : >"$AUDIT_LOG"
+  RERR=$( ( _merge_do_at_github DIVE-100 "$XPR" quinn faketoken "$TMP/ghcfg" >"$TMP/rail.out" 2>"$TMP/rail.err"; printf '%s' "$?" >"$TMP/rail.rc" ) ; cat "$TMP/rail.err" )
+  RRC=$(cat "$TMP/rail.rc"); RLOG=$(cat "$GH_ARGS_LOG"); RAUD=$(cat "$AUDIT_LOG")
+}
+eq_t()   { if [[ "$2" == "$3" ]]; then ok_t "$1"; else bad_t "$1" "want '$3', got '$2'"; fi; }
+has_t()  { if [[ "$2" == *"$3"* ]]; then ok_t "$1"; else bad_t "$1" "missing '$3' in: $2"; fi; }
+hasnt_t(){ if [[ "$2" != *"$3"* ]]; then ok_t "$1"; else bad_t "$1" "unwanted '$3' in: $2"; fi; }
+
+# E1 — THE FIX, EXECUTED. A queue-governed branch is enqueued, with the pull
+# request's node id and the head sha on the wire. Kills mutant (a) and (b).
+export PROBE_MODE=queue ENQ_MODE=ok SQUASH_MODE=ok
+run_rail
+eq_t   "E1 queue-governed: the rail returns 0"                       "$RRC" "0"
+has_t  "E1 ...by CALLING enqueuePullRequest (not by printing it)"    "$RLOG" "enqueuePullRequest"
+has_t  "E1 ...carrying the pull request's node id"                   "$RLOG" "-f pr=PR_node1"
+has_t  "E1 ...and the graded head pinned server-side"                "$RLOG" "-f oid=$HEAD_OID"
+hasnt_t "E1 ...and NO strategy-naming squash merge is attempted"     "$RLOG" "pr merge"
+has_t  "E1 ...reported to the caller as an enqueue"                  "$RERR" "_merge_do: disposition=enqueued"
+has_t  "E1 ...in words that refuse to call it a landing"             "$RERR" "This is NOT a landed merge"
+has_t  "E1 ...and AUDITED as an enqueue, not as a merge"             "$RAUD" "disposition=enqueued"
+hasnt_t "E1 ...(the audit does not also claim a merge)"              "$RAUD" "disposition=merged"
+
+# E2 — THE CONTROL, and the other half of mutant (a)'s kill. No queue on the base
+# branch: the ordinary squash merge, untouched.
+export PROBE_MODE=noqueue ENQ_MODE=ok
+run_rail
+eq_t    "E2 unqueued branch: the rail returns 0"                     "$RRC" "0"
+has_t   "E2 ...by shelling the ordinary squash merge"                "$RLOG" "pr merge $XPR --squash"
+hasnt_t "E2 ...and the enqueue mutation does NOT fire"               "$RLOG" "enqueuePullRequest"
+has_t   "E2 ...reported as a merge"                                  "$RERR" "merged by quinn"
+has_t   "E2 ...and audited as one"                                   "$RAUD" "disposition=merged"
+
+# E3 — an already-queued pull request is not re-enqueued, and is still reported
+# as an enqueue rather than as a landing.
+export PROBE_MODE=already
+run_rail
+eq_t    "E3 already in the queue: returns 0"                         "$RRC" "0"
+hasnt_t "E3 ...without re-enqueueing"                                "$RLOG" "enqueuePullRequest"
+hasnt_t "E3 ...and without falling back to a squash merge"           "$RLOG" "pr merge"
+eq_t    "E3 ...exactly one round trip was spent"                     "$(grep -c '^GH ' <<<"$RLOG")" "1"
+has_t   "E3 ...still reported as an enqueue"                         "$RERR" "_merge_do: disposition=enqueued"
+has_t   "E3 ...and audited as already-queued"                        "$RAUD" "disposition=already-queued"
+
+# E4 — THE FALL-THROUGH the code deliberately builds and no iteration-1 arm held:
+# a governance probe must never be the thing that refuses.
+export PROBE_MODE=unreadable
+run_rail
+eq_t    "E4 an unreadable governance probe does NOT refuse"          "$RRC" "0"
+has_t   "E4 ...it falls THROUGH to the ordinary squash merge"        "$RLOG" "--squash"
+hasnt_t "E4 ...and never enqueues blind"                             "$RLOG" "enqueuePullRequest"
+
+# E5 — the enqueue is refused at GitHub. Non-zero, and GitHub's own bytes on
+# stderr rather than a pointer to output the caller may never have shown.
+export PROBE_MODE=queue ENQ_MODE=err
+run_rail
+eq_t   "E5 a refused enqueue returns non-zero"                       "$((RRC != 0))" "1"
+has_t  "E5 ...with GitHub's OWN words reprinted verbatim"            "$RERR" "not admitted for this installation"
+has_t  "E5 ...named as GitHub's answer, not as a standing refusal"   "$RERR" "ENQUEUE REFUSED"
+hasnt_t "E5 ...and nothing is audited as merged or enqueued"         "$RAUD" "disposition="
+
+# E5b — the mutation "succeeds" but returns no queue entry. rc=0 from gh is not
+# evidence of a queued request; the entry is.
+export PROBE_MODE=queue ENQ_MODE=noentry
+run_rail
+eq_t   "E5b an empty queue entry is a refusal, not a success"        "$((RRC != 0))" "1"
+has_t  "E5b ...named as such"                                        "$RERR" "no queue entry returned"
+
+# E6 — queue-governed, but the node id / head sha could not be read: there is
+# nothing to pin an enqueue to, so it refuses rather than queueing unpinned.
+export PROBE_MODE=nopin ENQ_MODE=ok
+run_rail
+eq_t    "E6 a queue-governed PR with no readable head refuses"       "$((RRC != 0))" "1"
+has_t   "E6 ...naming what is missing"                               "$RERR" "nothing to pin an enqueue to"
+hasnt_t "E6 ...and does not enqueue unpinned"                        "$RLOG" "enqueuePullRequest"
+
+# E7 — the unqueued path's own refusal still carries gh's message.
+export PROBE_MODE=noqueue SQUASH_MODE=fail
+run_rail
+eq_t   "E7 a refused squash merge returns non-zero"                  "$((RRC != 0))" "1"
+has_t  "E7 ...with gh's own line reprinted"                          "$RERR" "The merge strategy for main is set by the merge queue"
+export SQUASH_MODE=ok
+
+# --- 7. THE DISPOSITION CONTRACT THE CLOSE-TIME RAIL DEPENDS ON --------------
+# DIVE-4428 iteration 1's product defect: `src/task/status.sh` calls the SAME
+# primitive and could not tell an enqueue from a merge, so it audited
+# `task.merged-at-close` and told the operator the seat "merged it (squash)"
+# over a request GitHub had only accepted. The marker is now read in ONE place.
+eq_t "R1 the reader names an enqueue"  "$(_merge_disp_read 0 "$XPR ENQUEUED ...
+_merge_do: disposition=enqueued")" "enqueued"
+eq_t "R2 ...a plain merge"             "$(_merge_disp_read 0 "$XPR merged by quinn (the seat that graded it).")" "merged"
+eq_t "R3 ...and says NOTHING on a refusal (no disposition was achieved)" \
+     "$(_merge_disp_read 1 "_merge_do: ENQUEUE REFUSED for $XPR")" ""
+
+# `_merge_disp_do` over a stubbed `sudo`: the stdout contract status.sh branches
+# on, executed. Without this the branch below is graded only by reading it.
+# `sudo` is a FUNCTION here, not a binary: tests/lib/env_isolation.sh installs one
+# that REFUSES with rc=125 whenever host PAM would restore FIVE_* knobs across the
+# sudo boundary (DIVE-3096), so a stub dropped on PATH is never reached — measured
+# while writing this arm, which read as a refused rail. Overriding the function is
+# the only stub that fires, and nothing here ever wants the real one.
+sudo() {
+  cat >/dev/null
+  [[ "${RAIL_RC:-0}" == "0" ]] || { printf '_merge_do: ENQUEUE REFUSED\n' >&2; return "${RAIL_RC}"; }
+  printf '%s\n' "${RAIL_OUT:-the pull request merged by quinn}" >&2
+  return 0
+}
+export RAIL_RC=0 RAIL_OUT='ENQUEUED (state=QUEUED, head pinned at deadbeef)
+_merge_do: disposition=enqueued'
+eq_t "R4 _merge_disp_do hands the close an 'enqueued' disposition on stdout" \
+     "$(_merge_disp_do DIVE-100 2>/dev/null)" "enqueued"
+export RAIL_OUT='the pull request merged by quinn (the seat that graded it).'
+eq_t "R5 ...and 'merged' when the rail landed it" \
+     "$(_merge_disp_do DIVE-100 2>/dev/null)" "merged"
+export RAIL_RC=1
+eq_t "R6 ...and nothing at all on a refusal" "$( ( _merge_disp_do DIVE-100 2>/dev/null ) )" ""
+export RAIL_RC=0
+
+# --- 8. THE CLOSE-TIME RAIL, EXECUTED ----------------------------------------
+# DIVE-4428 iteration 1's PRODUCT defect: `src/task/status.sh` calls the same
+# primitive and could not tell an enqueue from a merge, so it audited
+# `task.merged-at-close` and told the operator the seat "merged it (squash)" over
+# a request GitHub had only ACCEPTED.
+#
+# WHY THESE ARE EXECUTABLE AND NOT GREPS. The first iteration-2 draft graded this
+# branch by sed-ing the close's source and grepping it. Measured while writing
+# this section: replacing the disposition test with `if false; then` — collapsing
+# the enqueue arm back into the merge arm, i.e. RE-INTRODUCING THE EXACT DEFECT
+# under grade — left every one of those greps passing at 83/0, because a dead
+# branch still contains its strings. That is the same lesson as section 6, found
+# a second time in the same fix. Every arm below RUNS `_merge_at_close_do`.
+CAUD="$TMP/close-audit.log"; CWARN="$TMP/close-warn.log"; CDB="$TMP/close-db.log"
+_task_store_audit_log() { printf '%s\n' "$*" >>"$CAUD"; }
+warn() { printf '%s\n' "$*" >>"$CWARN"; }
+_gate_slug_from_url() { printf '5dive-ai/5dive\n'; }
+# `db` is defined through eval on purpose: a plain definition down here trips
+# SC2218 (in shellcheck) against the REAL db calls in sections 1-5 above, which
+# run before this point and must reach the fixture database, not this log.
+eval 'db() { printf "%s\n" "$*" >>"$CDB"; }'
+_gate_pr_state() { printf '%s\n' "${PR_STATE:-}"; }
+# The rail itself is stubbed HERE (it is executed for real in section 7): what is
+# under test is what the close DOES with each of the three answers it can get.
+_merge_disp_do() { [[ -n "${DISP:-}" ]] || return 1; printf '%s\n' "$DISP"; }
+
+run_close() {
+  : >"$CAUD"; : >"$CWARN"; : >"$CDB"
+  CRE=$(_merge_at_close_do DIVE-100 "$XPR" quinn abcdef1234567890 tok 7); CRC=$?
+  CAUDT=$(cat "$CAUD"); CWARNT=$(cat "$CWARN"); CDBT=$(cat "$CDB")
+}
+
+# C1 — AN ENQUEUE IS NOT A LANDING. The defect, asserted on behaviour.
+export DISP=enqueued PR_STATE='OPEN|null|PASS'
+run_close
+eq_t    "C1 an enqueue at close: the rail acted, so it returns 0"    "$CRC" "0"
+has_t   "C1 ...and is AUDITED under its own event"                   "$CAUDT" "task.enqueued-at-close"
+hasnt_t "C1 ...never as a merge that has not happened"               "$CAUDT" "task.merged-at-close"
+hasnt_t "C1 ...and the operator is NOT told the seat merged it"      "$CWARNT" "merged it (squash)"
+has_t   "C1 ...but that it is in the MERGE QUEUE"                    "$CWARNT" "MERGE QUEUE"
+has_t   "C1 ...in words that refuse to call it a landing"            "$CWARNT" "NOT a landed merge"
+hasnt_t "C1 ...and the merge owner is NOT retired: one is still owed" "$CDBT" "merge_owner=NULL"
+has_t   "C1 ...the caller still gets the re-read state, not a claim" "$CRE" "OPEN|null"
+
+# C2 — A REAL MERGE still behaves exactly as it did before this fix.
+export DISP=merged PR_STATE='MERGED|2026-09-13T09:18:48Z|PASS'
+run_close
+eq_t    "C2 a landed merge at close: returns 0"                      "$CRC" "0"
+has_t   "C2 ...audited as task.merged-at-close"                      "$CAUDT" "task.merged-at-close"
+hasnt_t "C2 ...and not as an enqueue"                                "$CAUDT" "task.enqueued-at-close"
+has_t   "C2 ...operator told the seat merged it"                     "$CWARNT" "merged it (squash)"
+has_t   "C2 ...and the merge owner IS retired"                       "$CDBT" "merge_owner=NULL"
+has_t   "C2 ...the caller gets MERGED from the RE-READ"              "$CRE" "MERGED|2026-09-13"
+
+# C3 — the rail refused: nothing recorded, nothing claimed, the close falls
+# through to the refusal it would have printed anyway.
+export DISP="" PR_STATE='OPEN|null|PASS'
+run_close
+eq_t    "C3 a refused rail returns non-zero"                         "$((CRC != 0))" "1"
+eq_t    "C3 ...and audits NOTHING"                                   "$CAUDT" ""
+eq_t    "C3 ...and writes NOTHING to the row"                        "$CDBT" ""
+has_t   "C3 ...and says the rail refused"                            "$CWARNT" "the merge rail refused"
+eq_t    "C3 ...handing the caller no state to act on"                "$CRE" ""
+
+# C4 — GitHub could not be re-read after the merge. The rail still acted, but the
+# caller is handed NOTHING rather than an assumed MERGED: the one place a close
+# could accept on a claim instead of a measurement.
+export DISP=merged PR_STATE=''
+run_close
+eq_t    "C4 an unreadable re-read still returns 0 (the merge happened)"  "$CRC" "0"
+eq_t    "C4 ...but hands the caller no state, so the gate refuses below" "$CRE" ""
+export DISP=merged PR_STATE='MERGED|x|PASS'
+
+# --- 9. THE CALL SITE, GRADED IN THE PRODUCT'S OWN ENVELOPE ------------------
+# DIVE-4428 iteration 2 shipped a REGRESSION that section 8 could not see, and
+# the reason is one layer out from section 8's own lesson: this harness runs
+# under `set -uo pipefail` (line 22) — no `-e` — while the product runs under
+# `set -euo pipefail` (src/header.sh). Extracting the close-time body into
+# `_merge_at_close_do` moved it out of an `if` CONDITION, where set -e is
+# suppressed, into a bare `_am_re=$(...)`, whose rc IS the command
+# substitution's. So on a REFUSAL the whole close died at the assignment and the
+# refusal at :1264 was never reached — while C3 above, in the laxer envelope,
+# happily asserted the fall-through that the product could not perform.
+#
+# Section 8 fixed grading the STRING instead of the branch. This section fixes
+# grading the branch IN A DIFFERENT SHELL. It therefore does two things the
+# arms above deliberately do not: it takes the call site from the SHIPPED
+# SOURCE (a guard deleted there must red here) and it runs it under the
+# product's own `set -euo pipefail`, asserting execution continues PAST it.
+CS_FRAG="$TMP/callsite.frag"
+awk '/local _am_re; _am_re=\$\(_merge_at_close_do/,/^ +fi$/' "$SRC/task/status.sh" >"$CS_FRAG"
+CS_FRAG_T=$(cat "$CS_FRAG")
+# The anchor. Without it a sed/awk range that stopped matching would make every
+# arm below pass over an EMPTY script — the vacuous-green shape this whole fix
+# is about.
+has_t "C5 anchor: the call site was extracted from the shipped source" "$CS_FRAG_T" '_merge_at_close_do "$ident"'
+has_t "C5 anchor: ...through the test that reads its post-condition"   "$CS_FRAG_T" '[[ -n "$_am_re" ]]'
+
+# `local` is only legal in a function, and the close IS one, so the fragment
+# runs inside one here too — that also reproduces set -e's function semantics
+# (a plain call, not a condition), which is the whole point.
+CS_PROBE="$TMP/callsite-probe.sh"
+{
+  printf '%s\n' 'set -euo pipefail'
+  printf '%s\n' 'warn() { printf "%s\n" "$*" >&2; }'
+  # The rail REFUSES — the path this row's own residual 2 predicts
+  # (enqueuePullRequest 403ing for the machine account).
+  printf '%s\n' '_merge_at_close_do() { warn "the merge rail refused"; return 1; }'
+  printf '%s\n' 'ident=DIVE-100; _dref=https://github.com/x/y/pull/1; _am_actor=quinn'
+  printf '%s\n' '_am_graded=abcdef1234567890; _ghtok=tok; id=7; _state=OPEN; _merged=""'
+  printf '%s\n' 'close_body() {'
+  cat "$CS_FRAG"
+  printf '%s\n' '}'
+  printf '%s\n' 'close_body'
+  printf '%s\n' 'printf "REACHED-THE-CODE-AFTER-THE-CALL\n"'
+  # :1264's gate is the next thing the real close does, and it is what the
+  # refusal text promises ("this close is refused below exactly as it would
+  # have been"). Assert the shell is still alive to run it.
+  printf '%s\n' 'if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then'
+  printf '%s\n' '  printf "CLOSE-CONTINUED-TO-ITS-OWN-GATE\n"'
+  printf '%s\n' 'fi'
+} >"$CS_PROBE"
+CS_OUT=$(bash "$CS_PROBE" 2>/dev/null); CS_RC=$?
+
+has_t "C5 a refused rail does NOT kill the close under set -euo pipefail" "$CS_OUT" "REACHED-THE-CODE-AFTER-THE-CALL"
+has_t "C5 ...and the close reaches the refusal gate the rail promised"    "$CS_OUT" "CLOSE-CONTINUED-TO-ITS-OWN-GATE"
+eq_t  "C5 ...and the close does not exit non-zero without a reason"       "$CS_RC" "0"
+
+# C6 — the positive case must still read through the SAME construct: a guard
+# that swallowed the rail's answer as well as its rc would pass C5 and break
+# every merge-at-close.
+CS_PROBE2="$TMP/callsite-probe2.sh"
+{
+  printf '%s\n' 'set -euo pipefail'
+  printf '%s\n' 'warn() { printf "%s\n" "$*" >&2; }'
+  printf '%s\n' '_merge_at_close_do() { printf "MERGED|2026-09-13T09:18:48Z\n"; }'
+  printf '%s\n' 'ident=DIVE-100; _dref=https://github.com/x/y/pull/1; _am_actor=quinn'
+  printf '%s\n' '_am_graded=abcdef1234567890; _ghtok=tok; id=7; _state=OPEN; _merged=""'
+  printf '%s\n' 'close_body() {'
+  cat "$CS_FRAG"
+  printf '%s\n' '}'
+  printf '%s\n' 'close_body'
+  printf '%s\n' 'printf "STATE=%s MERGED=%s\n" "$_state" "$_merged"'
+} >"$CS_PROBE2"
+CS_OUT2=$(bash "$CS_PROBE2" 2>/dev/null); CS_RC2=$?
+has_t "C6 a rail that ACTED still hands its state through the guard" "$CS_OUT2" "STATE=MERGED MERGED=2026-09-13T09:18:48Z"
+eq_t  "C6 ...and the close continues"                                "$CS_RC2" "0"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

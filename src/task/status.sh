@@ -135,6 +135,50 @@ _task_guard_result_over_closed() {
   _TASK_GUARDED_RESULT="$result"
 }
 
+# _merge_at_close_do <ident> <pr-ref> <grader> <graded-sha> <gh-token> <row-id>
+# THE CLOSE-TIME HALF of the DIVE-4137 rail: run the merge primitive, record and
+# say WHAT IT ACHIEVED, and hand the caller the re-read pull request state (on
+# stdout, `STATE|merged|...`, empty when GitHub could not be re-read) so the gate
+# below decides on a measurement rather than on this call's claim.
+#
+# It is a function, and not the inline block it was until DIVE-4428 iteration 2,
+# for one measured reason: the block's correctness is a BRANCH, and a branch
+# graded by grepping the source is not graded at all. A mutant that replaced the
+# disposition test with `false` — collapsing the enqueue arm into the merge arm,
+# which is exactly the defect iteration 1 shipped — passed every source-level arm
+# with the strings still intact. The arms over this function execute it.
+#
+# WHY THE BRANCH EXISTS AT ALL: `_merge_do` achieves one of two different things.
+# On a queue-governed base branch it ENQUEUES, and an enqueue is a request the
+# queue can still eject; only a merge is on the target branch. Iteration 1 taught
+# `task merge` to tell them apart and left THIS caller asserting a landing over a
+# queued request — a false operator line and a false audit record. Both callers
+# now read the same marker through `_merge_disp_read`.
+_merge_at_close_do() {
+  local ident="$1" _dref="$2" _am_actor="$3" _am_graded="$4" _ghtok="$5" id="$6"
+  local _am_did=""
+  if ! _am_did=$(_merge_disp_do "$ident"); then
+    warn "$ident: $_dref reads auto-mergeable at the graded sha, but the merge rail refused (DIVE-4137) — see its message above. Nothing changed; this close is refused below exactly as it would have been."
+    return 1
+  fi
+  if [[ "$_am_did" == "enqueued" ]]; then
+    _task_store_audit_log "task.enqueued-at-close" ok 0 -- "$ident" "ref=$_dref grader=$_am_actor graded_sha=${_am_graded:-none}"
+    warn "$ident: $_dref was CLEAN at the graded sha ${_am_graded:0:12} with every required check green, so the seat that graded it handed it to the target branch's MERGE QUEUE as the machine account rather than routing the button back to the maker (DIVE-4137). This is NOT a landed merge — the queue lands it or ejects it — so the close still asks the gate's own probe and will refuse until it reads MERGED."
+  else
+    _task_store_audit_log "task.merged-at-close" ok 0 -- "$ident" "ref=$_dref grader=$_am_actor graded_sha=${_am_graded:-none}"
+    warn "$ident: $_dref was CLEAN at the graded sha ${_am_graded:0:12} with every required check green, so the seat that graded it merged it (squash) as the machine account rather than routing the button back to the maker (DIVE-4137). Re-reading the merge state now — every gate below still runs on it."
+  fi
+  # RE-READ, do not assume. The rail returning 0 is GitHub's answer that it acted;
+  # the gate's answer must still come from the gate's own probe, or this would be
+  # the one place in the close that accepts on a claim instead of a measurement.
+  local _am_re; _am_re=$(_gate_pr_state "$_dref" "$_ghtok" "$(_gate_slug_from_url "$_dref")")
+  [[ -n "$_am_re" ]] && printf '%s\n' "$_am_re"
+  # The merge owner is retired by a LANDING, never by an enqueue: a row whose
+  # pull request is still in the queue is still owed one.
+  [[ "$_am_did" == "enqueued" ]] \
+    || db "UPDATE tasks SET merge_owner=NULL, merge_hold_reason=NULL WHERE id=${id};" || true
+  return 0
+}
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
@@ -1204,21 +1248,24 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
             _am_graded=$(_gate_graded_sha "$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")")
             _am_disp=$(_merge_disp_probe "$_dref" "$_am_graded" 2>/dev/null) || _am_disp=""
             if [[ "$_am_disp" == "merge" ]]; then
-              if _merge_disp_do "$ident"; then
-                _task_store_audit_log "task.merged-at-close" ok 0 -- "$ident" "ref=$_dref grader=$_am_actor graded_sha=${_am_graded:-none}"
-                warn "$ident: $_dref was CLEAN at the graded sha ${_am_graded:0:12} with every required check green, so the seat that graded it merged it (squash) as the machine account rather than routing the button back to the maker (DIVE-4137). Re-reading the merge state now — every gate below still runs on it."
-                # RE-READ, do not assume. `gh pr merge` returning 0 is GitHub's
-                # answer that it merged; the gate's answer must still come from
-                # the gate's own probe, or this line would be the one place in the
-                # close that accepts on a claim instead of on a measurement.
-                local _am_re; _am_re=$(_gate_pr_state "$_dref" "$_ghtok" "$(_gate_slug_from_url "$_dref")")
-                if [[ -n "$_am_re" ]]; then
-                  _state="${_am_re%%|*}"
-                  local _am_rest="${_am_re#*|}"; _merged="${_am_rest%%|*}"
-                fi
-                db "UPDATE tasks SET merge_owner=NULL, merge_hold_reason=NULL WHERE id=${id};" || true
-              else
-                warn "$ident: $_dref reads auto-mergeable at the graded sha, but the merge rail refused (DIVE-4137) — see its message above. Nothing changed; this close is refused below exactly as it would have been."
+              # In its own function since DIVE-4428 iteration 2 so the harness can
+              # EXECUTE it: graded at source only, a branch that no longer fires is
+              # indistinguishable from one that does (measured — a mutant replacing
+              # the disposition test with `false` passed every source-level arm).
+              # `|| _am_re=""` IS LOAD-BEARING (DIVE-4428 iteration 3). The product
+              # runs under `set -euo pipefail` (src/header.sh); an assignment's rc
+              # IS its command substitution's rc, so an unguarded `_am_re=$(...)`
+              # kills the whole close the moment the rail REFUSES — the operator
+              # gets "exited 1 without reporting a reason" instead of the refusal
+              # that line 1264 below is written to print. Before the iteration-2
+              # extraction the same body sat inside an `if`, where set -e is
+              # suppressed. This is the same `|| x=""` remedy as the DIVE-2603 note
+              # at :1983 and the DIVE-3340 note at :793, and it restores the exact
+              # post-condition the `[[ -n "$_am_re" ]]` test below already reads.
+              local _am_re; _am_re=$(_merge_at_close_do "$ident" "$_dref" "$_am_actor" "$_am_graded" "$_ghtok" "$id") || _am_re=""
+              if [[ -n "$_am_re" ]]; then
+                _state="${_am_re%%|*}"
+                local _am_rest="${_am_re#*|}"; _merged="${_am_rest%%|*}"
               fi
             fi
           fi
