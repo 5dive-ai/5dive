@@ -135,6 +135,7 @@ LAZY_FILES=(
   src/task/gate_evidence.sh
   src/task/status.sh
   src/task/grader_pool.sh
+  src/task/pace.sh
   src/task/delivery.sh
   src/task/loops.sh
   src/task/need.sh

@@ -196,7 +196,7 @@ cmd_task_add() {
   # implied on purpose — see _hb_task_budget_sweep's header for why --customer
   # and priority were both rejected as implicit carve-outs.
   [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ || "$task_budget" == "none" ]] \
-    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none'. NOTE: advisory only since DIVE-3343 — nothing enforces it"
+    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none'. A bare token count is ENFORCED again since DIVE-4430 — the heartbeat parks the row past it, on the row's own dispatch-verified figure; 'none' exempts it, and the \$cost form is still advisory (it belongs to the per-agent cost guard)"
   # DIVE-1697: --branch seeds the delegated-push 'Branch: <name>' binding into the
   # body up front (same line set-branch writes/upserts later).
   if [[ -n "$branch" ]]; then
@@ -213,6 +213,37 @@ cmd_task_add() {
     valid_cron_expr "$recurring" || fail "$E_VALIDATION" "bad --recurring '$recurring' (need a 5-field cron expr, e.g. \"0 2 * * *\")"
     [[ -z "$parent" ]] || fail "$E_VALIDATION" "--recurring can't be combined with --parent (a template has no parent)"
     kind="recurring"; schedule_sql=$(sqlq "$recurring")
+  fi
+  # ── DIVE-4430: the maker<->verifier loop is BOUNDED BY DEFAULT ──────────────
+  #
+  # `max_iterations` has existed since DIVE-476 and defaulted to NULL, i.e.
+  # unbounded. The escalation it feeds already exists and is already right
+  # (src/task/delivery.sh: at the cap, stop bouncing and park the row on a
+  # human) -- it was simply unreachable on a row nobody thought to pass the flag
+  # to, which is nearly every row. Two rows in the week of 2026-09-13 ran three
+  # iterations at ~100-300M metered each.
+  #
+  # WHY 2, AND WHY THE THIRD ROUND IS THE ONE TO SPEND ON A HUMAN. An iteration
+  # is not a cheap retry: every maker<->verifier round is a COLD RELOAD of a PR
+  # the maker had closed out, so it is the most expensive shape the loop has.
+  # DIVE-4144 measured the failure it produces -- on DIVE-4113 iteration 2
+  # changed nothing, and what closed the row in iteration 3 was already sitting
+  # in the ITERATION-1 reject. A loop that has bounced twice is not converging;
+  # it is re-deriving, and a person reading the two rejects is cheaper than a
+  # third cold reload.
+  #
+  # TEMPLATES ARE UNCHANGED, deliberately. A recurring template is not a row
+  # that runs, it is a row that clones; capping the template caps nothing and
+  # would only put a number on a record that never enters a verify loop. Its
+  # INSTANCES are `kind='standard'` and inherit the default here like anything
+  # else. A row filed WITH --max-iters keeps exactly what was typed, including a
+  # value larger than the default -- this is a default, not a ceiling.
+  if [[ -z "$max_iters" && "$kind" == "standard" ]]; then
+    max_iters="${FIVE_TASK_MAX_ITERS_DEFAULT:-2}"
+    # An operator can disable the default fleet-wide, but not by MISTYPING it:
+    # a malformed override falls back to 2 rather than to unbounded, because the
+    # unbounded reading is the state this exists to end.
+    [[ "$max_iters" =~ ^[1-9][0-9]*$ ]] || max_iters=2
   fi
   # DIVE-2272: the overlap policy is a property of a TEMPLATE. Refuse it on a
   # standard row rather than storing a column nothing will ever read — a flag

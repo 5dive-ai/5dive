@@ -323,6 +323,9 @@ for name, meta in agents.items():
         unreadable.append({"name": name, "reason": why})
         continue
     five = seven = None
+    # DIVE-4430: initialised alongside the percentages so an agent whose
+    # branch sets neither still emits the field as null rather than NameError.
+    five_r = seven_r = None
     newest_codex_rate_limit_ts = -1
     for path in sessions:
         try:
@@ -399,6 +402,17 @@ for name, meta in agents.items():
                 primary = (last_rate_limits.get("primary") or {}).get("used_percent")
                 secondary = (last_rate_limits.get("secondary") or {}).get("used_percent")
                 five, seven = primary, secondary
+                # DIVE-4430: Codex rollouts carry resets_in_seconds, not an
+                # epoch. Converted here, against the snapshot's own timestamp,
+                # so both providers hand the pacing floor the same field.
+                def _cx_reset(d):
+                    r = (d or {}).get("resets_in_seconds")
+                    try:
+                        return int(last_ts) + int(r)
+                    except Exception:
+                        return None
+                five_r  = _cx_reset(last_rate_limits.get("primary"))
+                seven_r = _cx_reset(last_rate_limits.get("secondary"))
             # Session-cumulative totals cannot be truthfully assigned to one
             # task window. Keep them in the agent row rather than manufacturing
             # a task attribution at the rollout's final timestamp.
@@ -490,6 +504,13 @@ for name, meta in agents.items():
             rl = sc.get("rate_limits") or {}
             five  = (rl.get("five_hour") or {}).get("used_percentage")
             seven = (rl.get("seven_day") or {}).get("used_percentage")
+            # DIVE-4430: the RESET epoch travels with the percentage, from the
+            # same cache read, because the pacing floor needs "how much of the
+            # week is left" and a second reader for it would be a second thing
+            # to drift. Absent/unparseable stays None — the floor treats an
+            # unreadable reset as "stay armed", never as headroom.
+            five_r  = (rl.get("five_hour") or {}).get("resets_at")
+            seven_r = (rl.get("seven_day") or {}).get("resets_at")
         except Exception:
             pass
     agent_rows.append({
@@ -497,6 +518,8 @@ for name, meta in agents.items():
         "models": models, "total": total, "quota": quota,
         "output": output, "cacheRead": cread,
         "fiveHourPct": five, "sevenDayPct": seven,
+        # DIVE-4430: epoch seconds, or null when the source had none.
+        "fiveHourResetsAt": five_r, "sevenDayResetsAt": seven_r,
     })
     turns_by_agent[name] = sorted(turns)
 
