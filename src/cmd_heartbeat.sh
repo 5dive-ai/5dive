@@ -674,8 +674,18 @@ cmd_heartbeat_wake_task() {
   _hb_log "[$name] forced wake onto ${task_ident} (fresh=${fresh}${fresh_override:+, caller override})"
   _hb_wake_task_record_defect "$name" "$task_id" "$task_ident"
   # DIVE-4310: a forced wake fails with the same named cause as a tick wake.
-  _hb_wake "$name" "$fresh" "$task_id" "$task_ident" \
-    || _hb_log "[$name] forced wake FAILED at ${_HB_WAKE_FAIL_REASON:-<step not recorded — a wake exit is missing its _hb_wake_fail>}"
+  local _fw_rc=0
+  _hb_wake "$name" "$fresh" "$task_id" "$task_ident" || _fw_rc=$?
+  if (( _fw_rc == _HB_WAKE_RC_PARKED )); then
+    # DIVE-4409: the forced verb honours the park too, exactly as
+    # `agent send --wake` refuses on it — a debugging verb is not a consent
+    # override, and the operator who parked the seat is the one who clears it.
+    # The note is already in the heartbeat log; this is the line on the terminal
+    # that ran the verb.
+    warn "$(_hb_parked_skip_note "$name" "$task_ident")"
+  elif (( _fw_rc != 0 )); then
+    _hb_log "[$name] forced wake FAILED at ${_HB_WAKE_FAIL_REASON:-<step not recorded — a wake exit is missing its _hb_wake_fail>}"
+  fi
 }
 
 # DIVE-4327 — EVERY FORCED WAKE IS A LOOP DEFECT, AND IT IS RECORDED AS ONE.
@@ -3776,6 +3786,115 @@ _hb_wake_fail() {
   return 1
 }
 
+# The post-start settle: a unit is active well before its tmux session exists,
+# and every injector below needs the session. Deliberately OUTSIDE the DIVE-4409
+# fence — it is a collaborator of the start, not part of the consent property,
+# and tests/heartbeat_wake_parked_agent_unit.sh supplies its own so the arms do
+# not sit through a 60s wait per start.
+_hb_wake_settle_tmux() {
+  local name="$1" i
+  for ((i = 0; i < 30; i++)); do
+    sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null && break
+    sleep 2
+  done
+}
+
+# >>> DIVE-4409 an operator-parked agent stays parked (the heartbeat wake)
+# `desiredState: stopped` is the operator's recorded intent — only the operator
+# verb `5dive agent stop` writes it (src/cmd_agent_runtime.sh:51); auto-sleep
+# calls a bare `systemctl stop` and writes no registry field, so the field still
+# means a PERSON parked this seat. The supervisor, `agent send --wake`, the
+# objective preflight, the self-update sweep (DIVE-4033) and the plugin-refresh
+# bounce (DIVE-4399) all read it. THIS path never did.
+#
+# The wake is the third instance of the same consent failure and the only one
+# measurable on this host: `_hb_wake` starts the unit PRECISELY BECAUSE it is
+# not active, so a parked seat holding a due todo is restarted every 15 minutes
+# with no operator in the loop. DIVE-4399's inventory cleared this file as
+# CANNOT-RESURRECT after reading its two other restart sites (the spend-cap
+# probe and the usage-limit heal), which are reached only for an agent already
+# observed running — a per-file verdict standing in for a per-call-site fact.
+# See community/wiki/an-audit-grep-with-a-path-filter-cannot-find-the-file-outside-the-filter.md
+#
+# IT SKIPS, IT DOES NOT ENFORCE (DIVE-4033's shape, for the third time). We
+# decline to raise a parked unit; we do not stop a parked-but-RUNNING one, and
+# we do not touch the row. Reconciling registry against systemd is the
+# supervisor's job, and a nudge into an already-running seat is not a
+# resurrection — so the guard is scoped to the start, which is the defect.
+#
+# WHAT HAPPENS TO THE TODO, AND WHY IT IS NOT DIVE-4399's "owed to nobody".
+# A skipped bounce cost nothing: the plugins were already on disk. A skipped
+# WAKE LEAVES WORK OWED — the row stays todo, unclaimed, and the tick re-reaches
+# it every 15 minutes for as long as the park stands. That is deliberate: the
+# row must NOT be claimed (a claim would strand it in_progress on a seat that
+# never got the goal, until the reaper), and it must NOT be cancelled (only a
+# person knows whether the park or the assignment is the stale one). So the
+# state is left exactly as it is and made VISIBLE instead:
+#   * the per-agent explanation is throttled to one line per hour (the flag-mtime
+#     throttle `_hb_poller_liveness_sweep` already uses in this file) — every
+#     tick would be 96 lines a day per parked agent, which is how a real signal
+#     becomes noise;
+#   * the tick's own summary counts `parked-skipped` on EVERY pass, 0 included,
+#     so the state is never invisible between throttled lines.
+#
+# ABSENT IS NOT STOPPED, AND UNREADABLE IS NOT STOPPED. The two directions are
+# not symmetric and the wrong skip is the silent one: a parked-looking agent
+# that never wakes for its due work looks exactly like an idle fleet. So ONLY an
+# explicit, parseable `stopped` skips — no registry, no jq, a corrupt body, an
+# unknown agent and an absent field ALL start, as everywhere else in the tree.
+_hb_agent_is_parked() {
+  local name="${1:-}" desired=""
+  [[ -n "$name" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  local reg; reg=$(registry_read 2>/dev/null) || return 1
+  [[ -n "$reg" ]] || return 1
+  desired=$(jq -r --arg n "$name" '.agents[$n].desiredState // "running"' <<<"$reg" 2>/dev/null) || return 1
+  [[ "$desired" == "stopped" ]]
+}
+
+# The line the operator reads. It names BOTH exits because either can be the
+# right one and a bare "skipped" reads as a decision already taken for them.
+_hb_parked_skip_note() {
+  local n="${1:-}" ident="${2:-the due task}"
+  printf "[%s] wake SKIPPED — %s is due but the registry says desiredState=stopped (an operator parked this agent). NOT starting the unit; the row stays todo and unclaimed, and this tick will re-reach it. Reconcile: '5dive agent start %s' if the park is stale, or '5dive task park %s' / reassign it if the row should not be waiting on a parked seat." \
+    "$n" "$ident" "$n" "$ident"
+}
+
+# Distinct from both existing exits. Returning 0 would let the caller claim the
+# row in_progress for a seat that never received the goal; returning 1 would
+# count a deliberate, operator-authored skip as a wake FAILURE to retry.
+_HB_WAKE_RC_PARKED=4
+
+# The start half of _hb_wake, as its own function so the guard and the start it
+# guards are one testable unit — a fix that ships dormant is DIVE-1095's shape,
+# and ordering (check BEFORE the start, not after it is scheduled) is the whole
+# property. Returns 0 when the unit is already active or was started, 1 on a
+# real start failure, $_HB_WAKE_RC_PARKED when the agent is parked.
+_hb_wake_start_unit_if_needed() {
+  local name="$1" task_ident="${2:-the due task}"
+  systemctl is-active --quiet "5dive-agent@${name}.service" && return 0
+  if _hb_agent_is_parked "$name"; then
+    _HB_WAKE_FAIL_STEP="parked"
+    _HB_WAKE_FAIL_REASON="agent '${name}' is parked by operator intent (desiredState=stopped) — the unit was NOT started and ${task_ident} stays todo"
+    local flag="${STATE_DIR:-/var/lib/5dive}/wake-parked.${name}.skipped"
+    local _now; _now=$(date +%s)
+    if [[ ! -f "$flag" ]] || (( _now - $(stat -c %Y "$flag" 2>/dev/null || echo 0) >= 3600 )); then
+      : > "$flag" 2>/dev/null || true
+      _hb_log "$(_hb_parked_skip_note "$name" "$task_ident")"
+    fi
+    return "$_HB_WAKE_RC_PARKED"
+  fi
+  # DIVE-4310: keep systemd's stderr. `2>/dev/null` here discarded the one
+  # string that distinguishes "unit not found" from "job failed" from a
+  # masked unit — and then the caller printed neither.
+  local _sc_err _sc_rc=0
+  _sc_err=$(systemctl start "5dive-agent@${name}.service" 2>&1 >/dev/null) || _sc_rc=$?
+  (( _sc_rc == 0 )) || { _hb_wake_fail "$name" "systemctl start (5dive-agent@${name}.service)" "$_sc_rc" "$_sc_err"; return 1; }
+  _hb_wake_settle_tmux "$name"
+  return 0
+}
+# <<< DIVE-4409 an operator-parked agent stays parked (the heartbeat wake)
+
 _hb_wake() {
   local name="$1" fresh="$2" task_id="$3" task_ident="${4:-DIVE-$3}"
   _HB_WAKE_FAIL_STEP=""; _HB_WAKE_FAIL_REASON=""   # DIVE-4310: never stale
@@ -3799,19 +3918,7 @@ _hb_wake() {
     _hb_log "[$name] wake skipped — ${task_ident} is ${_wt_status:-nonexistent}, not actionable; no /goal injected"
     return 0
   fi
-  if ! systemctl is-active --quiet "5dive-agent@${name}.service"; then
-    # DIVE-4310: keep systemd's stderr. `2>/dev/null` here discarded the one
-    # string that distinguishes "unit not found" from "job failed" from a
-    # masked unit — and then the caller printed neither.
-    local _sc_err _sc_rc=0
-    _sc_err=$(systemctl start "5dive-agent@${name}.service" 2>&1 >/dev/null) || _sc_rc=$?
-    (( _sc_rc == 0 )) || { _hb_wake_fail "$name" "systemctl start (5dive-agent@${name}.service)" "$_sc_rc" "$_sc_err"; return 1; }
-    local i
-    for ((i = 0; i < 30; i++)); do
-      sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null && break
-      sleep 2
-    done
-  fi
+  _hb_wake_start_unit_if_needed "$name" "$task_ident" || return $?
   local _ts_err _ts_rc=0
   _ts_err=$(sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>&1 >/dev/null) || _ts_rc=$?
   (( _ts_rc == 0 )) || { _hb_wake_fail "$name" "tmux session probe (agent-${name} has no session after start)" "$_ts_rc" "$_ts_err"; return 1; }
@@ -6200,7 +6307,7 @@ cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
-  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0 sk_capped=0
+  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0 sk_capped=0 sk_parked=0
   local today; today=$(date +%F)   # DIVE-1858 wake-budget day key (YYYY-MM-DD)
   # DIVE-138: materialize due recurring templates FIRST so a freshly-cloned todo
   # is eligible for the wake loop below this same tick. Isolated — a failure here
@@ -6865,7 +6972,19 @@ cmd_heartbeat_tick() {
     fi
 
     _hb_log "[$name] due + todo ${task_ident} — waking (fresh=${eff_fresh})"
-    if _hb_wake "$name" "$eff_fresh" "$task_id" "$task_ident"; then
+    # DIVE-4409: rc is initialised, never assumed — under `set -u` an unset rc on
+    # the healthy path kills the tick (DIVE-4380's shape, same file family).
+    local _wake_rc=0
+    _hb_wake "$name" "$eff_fresh" "$task_id" "$task_ident" || _wake_rc=$?
+    if (( _wake_rc == _HB_WAKE_RC_PARKED )); then
+      # NOT a wake and NOT a failure: the operator parked this seat. The row is
+      # left todo and UNCLAIMED on purpose (see the fenced note above _hb_wake),
+      # the budget is not spent, and the per-agent explanation is throttled —
+      # this counter is what keeps the state visible on every tick.
+      sk_parked=$((sk_parked + 1))
+      continue
+    fi
+    if (( _wake_rc == 0 )); then
       with_registry_lock _hb_wake_budget_inc "$name" "$today" >/dev/null 2>&1 || true  # DIVE-1858: count this wake
       with_registry_lock _hb_clear_active_defer "$name" >/dev/null 2>&1 || true  # DIVE-1486: episode over
       local nudge_n
@@ -6908,8 +7027,8 @@ cmd_heartbeat_tick() {
                   | sort_by(.value.heartbeat.lastRunAt // 0)
                   | .[].key' <<<"$reg")
 
-  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / tier-held ${sk_held} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / spend-capped ${sk_capped} / checked ${checked}" \
+  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / tier-held ${sk_held} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / spend-capped ${sk_capped} / parked-skipped ${sk_parked} / checked ${checked}" \
      '{checked:($c|tonumber), woke:($w|tonumber), slept:($sl|tonumber), sleepArmed:($sa|tonumber), reclaimed:($rc|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
-       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber), tierHeld:($th|tonumber), spendCapped:($sc|tonumber)}}' \
-     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail" --arg th "$sk_held" --arg sc "$sk_capped"
+       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber), tierHeld:($th|tonumber), spendCapped:($sc|tonumber), parked:($pk|tonumber)}}' \
+     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail" --arg th "$sk_held" --arg sc "$sk_capped" --arg pk "$sk_parked"
 }
