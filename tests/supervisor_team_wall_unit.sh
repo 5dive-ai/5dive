@@ -124,5 +124,41 @@ t "a clean pane yields no excerpt" "" "$(qm "$CLEAN")"
 ( set -e; printf '%s\n' "$CLEAN" | _sup_quota_match "$NOW" >/dev/null; echo ALIVE ) | grep -q ALIVE \
   && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL: clean pane killed an errexit caller"; }
 
+# --- 9. DIVE-4405 x DIVE-4401: OUR OWN ECHO IS NOT PANE EVIDENCE, AND IT IS
+#        NOT A JOINABLE NEIGHBOUR EITHER --------------------------------------
+# DIVE-4405 dropped `[TRIPWIRE` / `[5dive-msg` / `Pane signature:` lines in
+# front of the grep, because the TUI renders our own alerts into the pane we
+# then read back. The join added here borrows a clock from a NON-signature
+# neighbour, which is a SECOND way the same echo gets in: the marker line is not
+# the match, it is the line lending the time. Both doors are closed by filtering
+# the pane BEFORE it is read into the array.
+ECHO_ONLY="assorted scrollback above the wall
+[TRIPWIRE quota] agent-olivia — Pane signature: You've hit your org's monthly spend limit"
+t "our own echoed alert is not itself a wall" "" "$(qm "$ECHO_ONLY")"
+
+# An untimed REAL signature with an ECHOED clock-bearing neighbour: the clock
+# must not be borrowed, so the match stays unknown and is emitted unextended.
+ECHO_NEIGHBOUR="You've hit your org's monthly spend limit · ask your admin to raise it at
+[5dive-msg from ops] claude.ai/admin-settings/usage · your session limit resets 9am (UTC)"
+t "an echoed neighbour cannot lend its clock" "unknown" "$(qst "$(qm "$ECHO_NEIGHBOUR")")"
+t "the untimed signature is emitted unjoined" \
+  "You've hit your org's monthly spend limit · ask your admin to raise it at" \
+  "$(qm "$ECHO_NEIGHBOUR")"
+
+# POSITIVE CONTROL for the pair above — the identical pane with the echo marker
+# removed DOES join. Without this the two arms would pass on a function that
+# never joins at all.
+REAL_NEIGHBOUR="You've hit your org's monthly spend limit · ask your admin to raise it at
+claude.ai/admin-settings/usage · your session limit resets 9am (UTC)"
+t "control: the same neighbour unmarked does join" "live" "$(qst "$(qm "$REAL_NEIGHBOUR")")"
+t "control: and it carries the banner's 9am (UTC)" "$WANT" "$(qep "$(qm "$REAL_NEIGHBOUR")")"
+
+# A pane that is ENTIRELY our own echo is a legitimately clean pane, not a
+# failure: _sup_pane_drop_echoes carries `|| true` for exactly this, and an
+# errexit caller must survive it (the DIVE-3778 contract, re-asserted on the
+# path where grep -v now drops every line).
+( set -e; printf '%s\n' "$ECHO_ONLY" | _sup_quota_match "$NOW" >/dev/null; echo ALIVE ) | grep -q ALIVE \
+  && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL: an all-echo pane killed an errexit caller"; }
+
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -293,6 +293,103 @@ if (( RC == 1 )) && [[ "$OUT" == *"selected 0 harnesses"* ]]; then
 else bad "a shard that selects nothing FAILS rather than reporting green over nothing" "rc=$RC out=$OUT"; fi
 
 
+# ------------------------------------ DIVE-4391 the split is balanced on MEASURED TIME
+# A partition is necessary and not sufficient. File count is not cost, and an every-Nth
+# cut over a long-tailed corpus lands the tail wherever the alphabet puts it: measured
+# on the same base 0f9bc089 (2026-09-12), PR #918 planned 292/274/288s and PR #916 —
+# one new test file, none of it in shard 1 — planned 308/235/219 and was EJECTED from
+# the merge queue at 102% of cap with ~90s of headroom idle on the other two shards.
+# The author could not pay that red with any part of their own diff.
+#
+# So the assignment is weighted by tests/lib/harness-weights.tsv. These arms grade the
+# three properties that make that safe: it still PARTITIONS, it is DETERMINISTIC (every
+# matrix leg computes the whole plan and keeps its slice — two legs that disagree run a
+# harness twice or never), and it FALLS BACK to the old round-robin, loudly, rather than
+# planning off a table too thin to mean anything.
+SHARDER="tests/lib/tier.sh"
+plan() { printf '%s\n' "$@" | bash "$SHARDER" shard "$PLAN_N" "$PLAN_ENV" "$PLAN_W"; }
+PLAN_N=3; PLAN_ENV=installed; PLAN_W="$TMP/harness-weights.tsv"
+SEVEN=(s1.sh s2.sh s3.sh s4.sh s5.sh s6.sh s7.sh)
+
+# Weights chosen so the OLD cut is maximally wrong: every-third takes s1/s4/s7, which
+# are exactly the three expensive files. Count-sharding plans 300ms/2ms/2ms here.
+{ printf '# generated=2026-09-13\n'
+  for f in s1 s4 s7; do printf '%s.sh\t100000\t100000\n' "$f"; done
+  for f in s2 s3 s5 s6; do printf '%s.sh\t1000\t1000\n' "$f"; done
+} > "$PLAN_W"
+
+P="$(plan "${SEVEN[@]}")"
+want "a weighted plan says so in its mode line" \
+  "time" "$(sed -n '1s/.*shard_mode=\([a-z]*\).*/\1/p' <<<"$P")"
+heavy_per_shard="$(grep -v '^#' <<<"$P" | awk -F'\t' '$2 == 100000 { print $1 }' | sort | tr '\n' ' ' | sed 's/ $//')"
+want "each shard carries exactly one of the three expensive harnesses" \
+  "1 2 3" "$heavy_per_shard"
+want "the weighted plan still covers every harness exactly once" \
+  "7" "$(grep -cv '^#' <<<"$P")"
+want "the weighted plan assigns each harness to exactly one shard" \
+  "7" "$(grep -v '^#' <<<"$P" | awk -F'\t' '{print $3}' | sort -u | wc -l)"
+want "the weighted plan is deterministic across runs" \
+  "$(plan "${SEVEN[@]}")" "$P"
+# Input ORDER must not move the plan either: tier_list is sorted today, and a plan
+# that depended on that would break silently the day it is not.
+want "the weighted plan does not depend on the input order" \
+  "$(grep -v '^#' <<<"$P" | sort)" "$(plan s7.sh s6.sh s5.sh s4.sh s3.sh s2.sh s1.sh | grep -v '^#' | sort)"
+
+# An UNPRICED file is charged the median, never zero. A new harness that plans as free
+# is precisely how the next author inherits somebody else's red.
+P8="$(plan "${SEVEN[@]}" s8.sh)"
+want "a harness with no measured weight is priced at the median, not at zero" \
+  "1000" "$(grep -v '^#' <<<"$P8" | awk -F'\t' '$3 == "s8.sh" { print $2 }')"
+
+# Thin table -> the OLD cut, and it is reported, not silent.
+{ printf '# generated=2026-09-13\n'; printf 's1.sh\t100000\t100000\n'; } > "$PLAN_W"
+P="$(plan "${SEVEN[@]}")"
+want "a table too thin to plan from falls back to round-robin" \
+  "count" "$(sed -n '1s/.*shard_mode=\([a-z]*\).*/\1/p' <<<"$P")"
+want "the fall back is the round-robin the shards had before, unchanged" \
+  "s1.sh s4.sh s7.sh" "$(grep -v '^#' <<<"$P" | awk -F'\t' '$1 == 1 { print $3 }' | tr '\n' ' ' | sed 's/ $//')"
+PLAN_W="$TMP/absent-weights.tsv"
+want "a MISSING table falls back to round-robin rather than refusing" \
+  "count" "$(plan "${SEVEN[@]}" | sed -n '1s/.*shard_mode=\([a-z]*\).*/\1/p')"
+
+# THE STALENESS TRIPWIRE, and it is the arm that matters most here. Everything above
+# grades the mechanism against a fixture; this one grades the COMMITTED table against
+# the REAL core corpus. A table that stops covering the corpus does not fail — it
+# quietly reverts CI to file-count sharding and the ejections come back.
+for _env in pristine installed; do
+  _cov="$(bash "$SHARDER" list core tests | bash "$SHARDER" shard 3 "$_env" tests/lib/harness-weights.tsv \
+            | sed -n '1s/.*cover_pct=\([0-9]*\).*/\1/p')"
+  if [[ "${_cov:-0}" -ge 90 ]]; then
+    ok "the committed weights table still prices the core corpus ($_env, ${_cov}%)"
+  else
+    bad "the committed weights table still prices the core corpus ($_env)" \
+        "cover_pct=${_cov:-0} — run scripts/refresh-harness-weights.sh and commit the result"
+  fi
+done
+
+# And the report must SAY which plan produced it, or a reader cannot tell a balanced
+# run from a silently-reverted one by looking at the artifact.
+rm -f "$TMP"/*.sh
+for i in 1 2 3 4 5 6 7; do mk "s$i.sh" '#!/usr/bin/env bash
+exit 0'; done
+# The table is keyed by the path the corpus reports, which for this seam is the
+# throwaway dir's own — a table keyed on bare basenames would cover NOTHING and this
+# arm would silently grade the round-robin it is here to prove was replaced.
+{ printf '# generated=2026-09-13\n'
+  for i in 1 2 3 4 5 6 7; do printf '%s/s%s.sh\t1000\t1000\n' "$TMP" "$i"; done
+} > "$TMP/harness-weights.tsv"
+bash "$RUNNER" --no-calibrate --corpus-dir="$TMP" --tier=full --budget=600 \
+  --shard=1/3 --report="$TMP/plan-report.txt" >/dev/null 2>&1
+want "the report names the plan that produced the shard" \
+  "time" "$(sed -n 's/^# shard_mode=//p' "$TMP/plan-report.txt")"
+if grep -q '^# shard_plan_s=' "$TMP/plan-report.txt" && grep -q '^# shard_weights_cover_pct=' "$TMP/plan-report.txt"; then
+  ok "the report carries the planned cost and the table's coverage beside the clock"
+else
+  bad "the report carries the planned cost and the table's coverage beside the clock" \
+      "$(grep '^# shard' "$TMP/plan-report.txt")"
+fi
+rm -f "$TMP"/harness-weights.tsv
+
 # ------------------------------------------- 17-22 DIVE-2555: the CLOCK vs the CLAIM
 # MERGED HERE, NOT GIVEN A NEW FILE. This row's own rule is that past the cap a new
 # guard replaces or merges an existing one, and the subject is the same subject: what

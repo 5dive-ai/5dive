@@ -308,7 +308,13 @@ MIRROR_POST_ERROR=""
 # and retry once against the new supergroup id, so the mirror self-heals instead
 # of silently dying. Best-effort throughout — a mirror post is never load-bearing.
 _mirror_post() {
-  local token="$1" chat="$2" thread="$3" text="$4" access_file="$5" reply_markup="${6:-}"
+  # DIVE-4412: <text_plain> is the SAME message rendered as if no keyboard had
+  # been computed — it carries the numbered option list, the "✅ Recommended"
+  # line and the on-box answer line that the renderer suppresses whenever the
+  # buttons would have said the same words. It is used ONLY on the keyboard-less
+  # retry below. Callers that pass nothing keep today's behaviour exactly (the
+  # retry re-sends `text`), so the a2a/mirror call sites are untouched.
+  local token="$1" chat="$2" thread="$3" text="$4" access_file="$5" reply_markup="${6:-}" text_plain="${7:-}"
   MIRROR_POST_DELIVERED=0
   MIRROR_POST_MESSAGE_ID=""
   MIRROR_POST_CHAT="$chat"
@@ -362,7 +368,13 @@ _mirror_post() {
   # a different (delivery) problem, not a button one.
   if [[ -n "$reply_markup" ]]; then
     _mirror_log_button_reject "$chat" "$thread" "$reply_markup" "$resp"
-    resp=$(_mirror_send "$token" "$chat" "$thread" "$text" "") || resp="${resp:-}"
+    # DIVE-4412: the retry that drops the keyboard must NOT re-send text that was
+    # written on the assumption the keyboard would land. A decision gate rendered
+    # its options and its recommendation into the buttons alone (DIVE-3661's
+    # no-duplicate rule keys on the COMPUTED markup, not the DELIVERED one), so
+    # the old retry handed the human an open question with nothing to choose
+    # from. Send the keyboard-less variant when the caller supplied one.
+    resp=$(_mirror_send "$token" "$chat" "$thread" "${text_plain:-$text}" "") || resp="${resp:-}"
     ok=$(jq -r '.ok // false' <<<"$resp" 2>/dev/null) || ok=false
     if [[ "$ok" == "true" ]]; then
       mid=$(jq -r '.result.message_id // empty' <<<"$resp" 2>/dev/null) || mid=""

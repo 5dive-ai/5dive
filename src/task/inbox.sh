@@ -439,7 +439,7 @@ _task_inbox_send() {
   # (FIVEDIVE_NOTIFY_SILENT -> disable_notification), so the human gets one ping
   # and a readable stack.
   local id ident prio ntype options recommend gtier ask nonce="" markup="" _hs=""
-  local gate_text sent=0 failed=0 first_sent=0 all_ids="" all_mids="" _mint_n=0
+  local gate_text gate_text_plain sent=0 failed=0 first_sent=0 all_ids="" all_mids="" _mint_n=0
   local _prev_silent="${FIVEDIVE_NOTIFY_SILENT:-}"
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
@@ -460,6 +460,12 @@ _task_inbox_send() {
     # was a verbatim duplicate of what the human can already see and tap.
     _hs=""; _task_gate_high_stakes "$id" && _hs=1
     gate_text="$([[ -n "$_hs" ]] && printf '🔐' || printf '🗂') [${ident}] ${ntype} — $(_task_gate_ask_line "$ask") /task_${id}"
+    # DIVE-4412: the keyboard-less variant, composed alongside. _mirror_post
+    # falls back to a text-only re-send when the Bot API rejects the keyboard,
+    # and the two suppressions below are keyed on the markup this loop COMPUTED
+    # rather than on what was DELIVERED — so without this the digest re-send of a
+    # decision gate reaches the human with neither its options nor its ⭐.
+    gate_text_plain="$gate_text"
     # DIVE-3661 iteration 3: only when the recommendation is not already readable
     # off a button (decision's ⭐ first button carries it verbatim; approval/secret
     # buttons are generic verbs, so there this line is the only copy). Predicate =
@@ -469,9 +475,15 @@ _task_inbox_send() {
     # "which PR was this again?" is most likely — a link on the first ping only
     # would drift exactly the way DIVE-1490 forbids.
     local _dl; _dl=$(_task_gate_delivery_link_line "$id")
-    [[ -n "$_dl" ]] && gate_text+=$'\n'"$_dl"
-    [[ -n "$recommend" && "$markup" != *"$recommend"* ]] && gate_text+=$'\n'"✅ Recommended: ${recommend}"
-    [[ -n "$options" && -z "$markup" ]] && gate_text+=$'\n'"Options: ${options}"
+    [[ -n "$_dl" ]] && { gate_text+=$'\n'"$_dl"; gate_text_plain+=$'\n'"$_dl"; }
+    if [[ -n "$recommend" ]]; then
+      gate_text_plain+=$'\n'"✅ Recommended: ${recommend}"
+      [[ "$markup" != *"$recommend"* ]] && gate_text+=$'\n'"✅ Recommended: ${recommend}"
+    fi
+    if [[ -n "$options" ]]; then
+      gate_text_plain+=$'\n'"Options: ${options}"
+      [[ -z "$markup" ]] && gate_text+=$'\n'"Options: ${options}"
+    fi
     # DIVE-2818: the high-stakes reply-to-clear prompt reaches the BATCH re-send
     # too. DIVE-1490's rule applies unchanged — the initial alert and every re-nag
     # share one renderer so the affordance cannot drift between first delivery and
@@ -484,13 +496,13 @@ _task_inbox_send() {
     # site, and for the same reason — independent statements, one renderer.
     if [[ "$TASK_CH_TYPE" == "claude" && -n "$_hs" ]]; then
       local _batch_cta; _batch_cta=$(_task_gate_reply_cta "$ident" "$ntype" "$options" "$recommend" "$markup")
-      [[ -n "$_batch_cta" ]] && gate_text+=$'\n\n'"$_batch_cta"
+      [[ -n "$_batch_cta" ]] && { gate_text+=$'\n\n'"$_batch_cta"; gate_text_plain+=$'\n\n'"$_batch_cta"; }
     fi
     # First message pings; the rest arrive silently.
     if (( first_sent )); then export FIVEDIVE_NOTIFY_SILENT=1; fi
     # DIVE-3342: per-gate, so each gate reaches ITS owner (or nobody) — the
     # per-gate loop this site already had is what makes that free.
-    _task_send_gate_owner "$gate_text" "$markup" "$id"
+    _task_send_gate_owner "$gate_text" "$markup" "$id" "" "$gate_text_plain"
     if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
       sent=$(( sent + 1 )); first_sent=1
       all_ids+="${all_ids:+,}${id}"

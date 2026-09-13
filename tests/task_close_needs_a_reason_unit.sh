@@ -64,6 +64,7 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+fixture_box_verify_policy always || exit 1
 JSON_MODE=1; mkdir -p "$TASKS_DIR"
 set +e
 
@@ -72,7 +73,13 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n       %s\n' "$1" "${2:-}"; }
 
 tasks_db_init
-as() { local who="$1"; shift; ( actor_seam_as "${who}"; "$@" ) 2>"$TMP"/err; }
+# The full-sweep runner is root, while this harness models named agent callers.
+# Seal both halves of that identity: actor_seam_as supplies the uid/passwd pair,
+# and forcing the resolver's root predicate false keeps _gate_withdraw_actor on
+# the same non-root agent path in every runner environment.  Without the latter,
+# a root runner ignores the sealed uid seam, resolves no SUDO_* actor, and grades
+# the withdraw refusal as a successful anonymous-human withdrawal instead.
+as() { local who="$1"; shift; ( actor_seam_as "${who}"; _gate_is_root() { return 1; }; "$@" ) 2>"$TMP"/err; }
 
 status_of()   { db "SELECT status                        FROM tasks WHERE ident=$(sqlq "$1");"; }
 res_of()      { db "SELECT COALESCE(result,'')           FROM tasks WHERE ident=$(sqlq "$1");"; }
@@ -86,6 +93,10 @@ actor_is() { ( actor_seam_as "$1"; task_actor ); }
 [[ "$(actor_is dev2)" == "dev2" ]] \
   && ok_t "INSTRUMENT: harness impersonates an actor (task_actor -> dev2)" \
   || bad_t "INSTRUMENT: actor impersonation broken" "got '$(actor_is dev2)' — arms are vacuous"
+withdraw_actor_is() { ( actor_seam_as "$1"; _gate_is_root() { return 1; }; _gate_withdraw_actor ); }
+[[ "$(withdraw_actor_is dev2)" == "agent dev2" ]] \
+  && ok_t "INSTRUMENT: withdraw authorization sees the sealed agent on root and non-root runners" \
+  || bad_t "INSTRUMENT: withdraw authorization bypassed the sealed actor" "got '$(withdraw_actor_is dev2)' — P is vacuous"
 
 # ── A: `task cancel --result=""` on a first close is REFUSED ──────────────────
 # The shape measured seven times in three days.

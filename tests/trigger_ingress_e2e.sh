@@ -23,6 +23,7 @@ TMP="$(mktemp -d /tmp/trigger-ingress.XXXXXX)"
 FIVE="$TMP/5dive"
 BUILD_OUT="$FIVE" bash build.sh >/dev/null 2>&1 || bail "could not build 5dive"
 export STATE_DIR="$TMP/state"
+fixture_box_verify_policy always || exit 1
 mkdir -p "$STATE_DIR/tasks"
 "$FIVE" ui --data >/dev/null 2>&1 || bail "could not initialize isolated task store"
 DB="$STATE_DIR/tasks/tasks.db"

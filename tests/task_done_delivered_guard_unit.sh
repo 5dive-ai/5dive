@@ -44,6 +44,7 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 
 STATE_DIR="$TMP"
+fixture_box_verify_policy always || exit 1
 TASKS_DIR="$STATE_DIR/tasks"
 TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=1

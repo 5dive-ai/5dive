@@ -52,6 +52,7 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+fixture_box_verify_policy always || exit 1
 JSON_MODE=1; mkdir -p "$TASKS_DIR"
 set +e
 

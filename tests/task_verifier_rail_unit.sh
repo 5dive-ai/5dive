@@ -46,6 +46,7 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 
 STATE_DIR="$TMP"
+fixture_box_verify_policy always || exit 1
 TASKS_DIR="$STATE_DIR/tasks"
 TASKS_DB="$TASKS_DIR/tasks.db"
 mkdir -p "$TASKS_DIR"
@@ -251,6 +252,11 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 # T11a: the classifier is a candidate set — assert it on a title, not a vibe.
+# DIVE-3245's independent per-filer volume cap was added after these ratio-cap
+# arms. Keep it out of this fixture so T11h/T11i continue grading the declared
+# ratio-cap escapes instead of tripping a second policy at the same row count.
+_t11_daily_cap="$_TASK_FILING_DAILY_CAP"
+_TASK_FILING_DAILY_CAP=999
 [[ -n "$(_task_internal_subject_reason 'the smoke-gate harness dies on pipefail')" \
    && -z "$(_task_internal_subject_reason 'web push on the dashboard PWA')" ]] \
   && ok_t "T11a classifier hits our own machinery and leaves a product title alone" \
@@ -434,6 +440,7 @@ nb2_out=$(run add --assignee=alice --priority=medium -- "w review gate harness s
 (( nb2_rc != 0 )) && has "$(cat "$TMP"/err)$nb2_out" "filing cap" \
   && ok_t "T11n restoring the prod declaration restores the refusal (T11m was the store, not a broken cap)" \
   || bad_t "T11n restoring the prod declaration restores the refusal (T11m was the store, not a broken cap)" "rc=$nb2_rc $nb2_out $(cat "$TMP"/err)"
+_TASK_FILING_DAILY_CAP="$_t11_daily_cap"
 
 # --- T12: THE CAP PATH SURVIVES `set -e`, which is how it ships -------------
 # This harness runs under `set +e` (line ~52) so that arms can assert non-zero

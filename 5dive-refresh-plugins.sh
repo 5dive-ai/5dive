@@ -47,6 +47,12 @@ CLAUDE_BIN="${CLAUDE_BIN:-/home/claude/.local/bin/claude}"
 # only the active version (old behavior); 0 disables pruning.
 KEEP_PLUGIN_VERSIONS="${KEEP_PLUGIN_VERSIONS:-2}"
 
+# The agent registry. One name for the path every reader in this script uses —
+# the agent enumeration, the fork-lineage bounce list, and (DIVE-4399) the
+# parked check below. Overridable so the unit test can point all three at a
+# temp file instead of the box's real registry.
+AGENTS_REGISTRY="${AGENTS_REGISTRY:-/var/lib/5dive/agents.json}"
+
 # GitHub org migration (5dive-com -> 5dive-ai, 2026-06): existing agents
 # persist the marketplace source in known_marketplaces.json AND in the
 # marketplace clone's origin remote. Both break once the old org name is
@@ -102,8 +108,8 @@ if [[ ! -x "$CLAUDE_BIN" ]]; then
 fi
 
 if [[ -z "$agents" ]]; then
-  if [[ -r /var/lib/5dive/agents.json ]] && command -v jq >/dev/null 2>&1; then
-    agents=$(jq -r '.agents | keys[]?' /var/lib/5dive/agents.json 2>/dev/null || true)
+  if [[ -r "$AGENTS_REGISTRY" ]] && command -v jq >/dev/null 2>&1; then
+    agents=$(jq -r '.agents | keys[]?' "$AGENTS_REGISTRY" 2>/dev/null || true)
   fi
   if [[ -z "$agents" ]]; then
     agents=$(for d in /home/agent-*; do [[ -d "$d" ]] && basename "$d" | sed 's/^agent-//'; done)
@@ -278,36 +284,113 @@ fi
 
 # `type` in the registry IS the runtime, and the fork dir is telegram-<type>; a
 # claude-lineage agent is served by the marketplace path above and never matches.
-if [[ -n "$FORK_CHANGED" && -r /var/lib/5dive/agents.json ]] && command -v jq >/dev/null 2>&1; then
+if [[ -n "$FORK_CHANGED" && -r "$AGENTS_REGISTRY" ]] && command -v jq >/dev/null 2>&1; then
   _fork_restart=""
   while IFS=$'\t' read -r _name _type; do
     [[ -n "$_type" && "$_type" != claude && "$_type" != null ]] || continue
     case " $FORK_CHANGED " in *" telegram-$_type "*) _fork_restart="${_fork_restart:+$_fork_restart }$_name" ;; esac
-  done < <(jq -r '.agents | to_entries[] | "\(.key)\t\(.value.type // "")"' /var/lib/5dive/agents.json 2>/dev/null)
+  done < <(jq -r '.agents | to_entries[] | "\(.key)\t\(.value.type // "")"' "$AGENTS_REGISTRY" 2>/dev/null)
   if [[ -n "$_fork_restart" ]]; then
     CHANGED_AGENTS="${CHANGED_AGENTS:+$CHANGED_AGENTS }$_fork_restart"
     echo "--- fork agents needing a bounce: $_fork_restart ---"
   fi
 fi
 
+# >>> DIVE-4399 an operator-parked agent stays parked (the plugin-refresh bounce)
+# `desiredState: stopped` is the operator's recorded intent (`5dive agent stop`
+# writes it). The supervisor, the heartbeat, `agent send --wake`, the objective
+# preflight and — since DIVE-4033 — the self-update restart sweep all read it.
+# THIS path never did: `git grep -n desiredState` over this file returned zero
+# hits, and `systemctl restart` on a stopped unit STARTS it. Measured on
+# `5dive-teal-fox-cx43`: `katya` carries `desiredState: stopped`, had been
+# resurrected nightly for roughly a month, and masking the unit by hand was the
+# only defence the operator found. `systemctl disable` is not one — it stops
+# boot-time activation, not an explicit restart.
+#
+# WHY THIS FILE AND NOT src/. DIVE-4033 fixed the same defect on the same agent
+# and looked for siblings with `git grep -l desiredState -- src scripts`. This
+# script sits at the REPO ROOT, outside that filter, so the sweep that was meant
+# to make the fix complete structurally could not see the one path still broken.
+# See community/wiki/an-audit-grep-with-a-path-filter-cannot-find-the-file-outside-the-filter.md
+#
+# IT SKIPS, IT DOES NOT ENFORCE (DIVE-4033's shape, deliberately not a second
+# one). Stopping a running-but-parked agent from a plugin-refresh cron is
+# destructive and is the supervisor's job; reconciling registry against systemd
+# is not this script's. So the bounce declines to perpetuate the contradiction
+# by its own action, says so once per parked agent, and names BOTH exits —
+# only a person knows which is the right one.
+#
+# THE SKIPPED BOUNCE IS OWED TO NOBODY. The plugin refresh itself already ran
+# for this agent: its on-disk plugin cache is current, and Claude reads plugins
+# at launch. A parked-and-stopped agent therefore loads the new payload on its
+# next start by construction, and a parked-but-running one loads it whenever the
+# operator takes either exit. Nothing is deferred and nothing is lost.
+#
+# ABSENT IS NOT STOPPED, AND UNREADABLE IS NOT STOPPED (DIVE-2318, and the
+# `// "running"` default every other reader uses). The two failure directions are
+# not symmetric: a wrong skip silently freezes agents on the old plugin build —
+# the exact silent-dormancy class DIVE-3269 measured on this very script, where
+# five staged plugins sat an hour behind two merged rows and nobody could tell
+# — while a wrong restart is loud and recoverable. So ONLY an explicit,
+# parseable `stopped` skips. A missing registry, absent jq, a corrupt body, an
+# agent with no such field and an agent absent from the file ALL restart.
+_agent_is_parked() {
+  local name="${1:-}" desired=""
+  [[ -n "$name" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -n "${AGENTS_REGISTRY:-}" && -r "$AGENTS_REGISTRY" ]] || return 1
+  desired=$(jq -r --arg n "$name" '.agents[$n].desiredState // "running"' "$AGENTS_REGISTRY" 2>/dev/null) || return 1
+  [[ "$desired" == "stopped" ]]
+}
+
+# The line the operator reads in the nightly log. It names both exits because
+# either can be correct and a bare "skipped" would read as a decision already
+# taken on their behalf.
+_parked_skip_note() {
+  local n="${1:-}"
+  printf "  parked: agent-%s has new plugins on disk but the registry says desiredState=stopped — NOT restarting it, and not stopping it either. Nothing is owed: the refreshed plugins load on its next start. Reconcile: '5dive agent stop %s' if the park is real, '5dive agent start %s' if the intent is stale.\n" "$n" "$n" "$n"
+}
+
 # --restart: bounce only the agents whose plugin set changed, so the new code
-# actually loads. Deferred via systemd-run (--on-active=1 --collect) so the
-# restart fires ~1s after we exit — this both lets this script finish cleanly
-# and makes it safe for an agent to restart ITSELF (the transient unit outlives
-# our teardown). No-op when nothing changed.
-if (( RESTART_CHANGED )); then
-  if [[ -n "$CHANGED_AGENTS" ]]; then
-    echo "--- restarting changed agents: $CHANGED_AGENTS ---"
-    for ag in $CHANGED_AGENTS; do
-      if systemd-run --on-active=1 --collect \
-           /bin/systemctl restart "5dive-agent@${ag}.service" >/dev/null 2>&1; then
-        echo "  scheduled restart: agent-$ag (~1s)"
-      else
-        echo "  WARN: failed to schedule restart for agent-$ag" >&2
-      fi
-    done
-  else
+# actually loads — minus the ones the operator parked. Deferred via systemd-run
+# (--on-active=1 --collect) so the restart fires ~1s after we exit: this both
+# lets this script finish cleanly and makes it safe for an agent to restart
+# ITSELF (the transient unit outlives our teardown).
+#
+# `parked` / `parked_count` are emitted as their own machine-readable lines, in
+# the pair DIVE-4033 put on the self-update JSON, so "which agents did the cron
+# decline to bounce last night" is greppable and not only prose. parked_count is
+# printed on EVERY --restart pass, including 0 — an absent line would be
+# indistinguishable from a pass that never reached the check.
+_restart_changed_agents() {
+  local list="${1:-}" ag parked_count=0 restarted=0
+  if [[ -z "$list" ]]; then
     echo "--- --restart: no agents changed, nothing to bounce ---"
+    echo "  parked_count: 0"
+    return 0
   fi
+  echo "--- restarting changed agents: $list ---"
+  for ag in $list; do
+    if _agent_is_parked "$ag"; then
+      parked_count=$((parked_count + 1))
+      _parked_skip_note "$ag"
+      continue
+    fi
+    if systemd-run --on-active=1 --collect \
+         /bin/systemctl restart "5dive-agent@${ag}.service" >/dev/null 2>&1; then
+      restarted=$((restarted + 1))
+      echo "  scheduled restart: agent-$ag (~1s)"
+    else
+      echo "  WARN: failed to schedule restart for agent-$ag" >&2
+    fi
+  done
+  echo "  parked_count: $parked_count"
+  return 0
+}
+# <<< DIVE-4399 an operator-parked agent stays parked (the plugin-refresh bounce)
+
+if (( RESTART_CHANGED )); then
+  _restart_changed_agents "$CHANGED_AGENTS"
 fi
+
 echo "=== $(date -Iseconds) plugin refresh done ==="
