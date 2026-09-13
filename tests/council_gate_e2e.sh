@@ -41,6 +41,7 @@ fi
 
 TMP="$(mktemp -d)"
 export STATE_DIR="$TMP" TASKS_DB="$TMP/tasks.db" COUNCIL_MOCK=1 COUNCIL_5DIVE_BIN="$FIVE"
+fixture_box_verify_policy always || exit 1
 DB="$TASKS_DB"
 pass=0; fail=0
 ok(){ echo "  ok:   $1"; pass=$((pass+1)); }
