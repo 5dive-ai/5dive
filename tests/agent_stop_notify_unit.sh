@@ -41,7 +41,7 @@ chmod 755 "${TMP}/send-stub"
 
 fails=0
 pass() { echo "ok   — $1"; }
-fail() { echo "FAIL — $1"; fails=$(( fails + 1 )); }
+fail() { echo "FAIL — $1"; fails=$((fails+1)); }
 
 # run <label> <result> <exit-kind> <exit-val> [extra env assignments...]
 run() {
