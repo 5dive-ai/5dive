@@ -108,10 +108,33 @@ secs=$(_task_gate_undo_window_secs DIVE-9401)
 # recovery path becomes the first contact — the 840-not-900 ordering argument,
 # re-asserted one layer up. Graded STRUCTURALLY against the sweep's clause so a
 # later raise of either constant reds here rather than silently re-ordering them.
-grep -q "datetime('now','-31 minutes')" src/cmd_heartbeat.sh \
-  && (( _GATE_LEAD_REVIEW_HOLD_SECS < 31*60 )) \
-  && ok_t "the re-nag sweep excludes a never-pinged tier-2 row inside its hold, with margin over the hold" \
-  || fail_t "the lead-review hold (${_GATE_LEAD_REVIEW_HOLD_SECS}s) is not strictly inside the re-nag's exclusion window"
+grep -q "datetime('now','-11 minutes')" src/cmd_heartbeat.sh \
+  && (( _GATE_LEAD_REVIEW_HOLD_SECS + 60 <= 11*60 )) \
+  && ok_t "the re-nag sweep excludes a never-pinged tier-2 row inside its hold, with the 60s margin over the hold" \
+  || fail_t "the lead-review hold (${_GATE_LEAD_REVIEW_HOLD_SECS}s) is not a full 60s inside the re-nag's exclusion window"
+
+# DIVE-4420 — AND THE ORDERING MUST SURVIVE THE EXCLUSION BEING SLACK. At a
+# 10-minute hold the clause above excludes nothing: the sweep's own never-pinged
+# clock (15 minutes) is already past it, so THAT is what keeps the buttoned ping
+# ahead of the re-nag, and it is what this arm grades. Read out of the heartbeat
+# source rather than copied, for the same reason gate_undo_window arm 11b does:
+# a literal pasted here goes on passing after someone moves the sweep.
+_renag_min=$(sed -n "s/.*need_asked_at,updated_at,created_at) <= datetime('now','-\([0-9]\+\) minutes').*/\1/p" \
+               src/cmd_heartbeat.sh | head -1)
+if [[ "$_renag_min" =~ ^[0-9]+$ ]] && (( _GATE_LEAD_REVIEW_HOLD_SECS + 60 <= _renag_min * 60 )); then
+  ok_t "the hold (${_GATE_LEAD_REVIEW_HOLD_SECS}s) clears the sweep's never-pinged re-nag (${_renag_min} minutes, read from source) by at least the 60s margin"
+else
+  fail_t "the hold (${_GATE_LEAD_REVIEW_HOLD_SECS}s) does not clear the sweep's never-pinged re-nag ('${_renag_min}' minutes read from cmd_heartbeat.sh) with 60s to spare"
+fi
+
+# DIVE-4420 — THE SIZE ITSELF IS PINNED, so a later "raise it back" reds here
+# rather than sliding. lodar asked for 10 minutes on 2026-09-13 ("30 minutes
+# seems way to long tho"); every arm above is a RELATION and all of them stay
+# green at 1800 as long as the sweep moves with it, which is exactly how the
+# number would drift back. This arm has no relation in it on purpose.
+(( _GATE_LEAD_REVIEW_HOLD_SECS == 600 )) \
+  && ok_t "the lead-review hold is 600s — the number lodar asked for, pinned so a raise is a decision and not a slide" \
+  || fail_t "the lead-review hold is ${_GATE_LEAD_REVIEW_HOLD_SECS}s, not the 600s DIVE-4420 set; if this is intended, move the pin and say who asked"
 
 l_id=$(mkrow DIVE-9402)
 db "UPDATE tasks SET need_type='decision', tier=1, need_asked_at=datetime('now'), status='blocked' WHERE id=${l_id};"
