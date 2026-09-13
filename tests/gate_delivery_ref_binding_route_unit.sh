@@ -150,15 +150,25 @@ OUT0=$(cmd_task_need DIVE-9000 --type=approval --ask="$PLAIN_ASK" --recommend="g
   && ok_t "and the unrouted receipt is still EXPLICIT (DIVE-3266's E1 contract holds)" \
   || bad_t "the unrouted receipt is not explicit" "$OUT0"
 
-# 0b. An ordinary `decision` on an unbound row is likewise untouched — still
-# pref-gated. A decision is already agent-clearable by TYPE, so it was never the
-# population that reached lodar, and widening past it would be a second change.
+# 0b. An ordinary `decision` on an unbound row. THIS ARM'S SUBJECT is DIVE-3228's
+# scope — that the delivery-ref BINDING is what routed a gate here, not the type —
+# and it used "an unbound decision stays unrouted" as the observable, which was
+# true only because a plain tier-1 decision was pref-gated. DIVE-4415 moved that
+# population deliberately (it is the customer defect: an in-org decision that never
+# reached the lead who owned it), so the observable is re-based rather than the
+# claim. The claim is still graded, and more directly than before: the decision
+# routes, and it routes as `decision-tier1` — NOT as a row-ship binding, which is
+# what "the fix widened past the binding" would actually look like now.
+# Arm 0 above (an unbound APPROVAL) is untouched and remains the binding control.
 seed DIVE-9020
 actor_seam_as dev
-cmd_task_need DIVE-9020 --type=decision --ask="$PLAIN_ASK" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
-[[ -z "$(reviewer_of DIVE-9020)" ]] \
-  && ok_t "an unbound decision is UNCHANGED — still pref-gated, still unrouted" \
-  || bad_t "an unbound decision routed to '$(reviewer_of DIVE-9020)'" "the fix widened past the binding"
+OUT0B=$(cmd_task_need DIVE-9020 --type=decision --ask="$PLAIN_ASK" --options="A|B" --recommend="A" --from=dev 2>&1)
+[[ -n "$(reviewer_of DIVE-9020)" ]] \
+  && ok_t "DIVE-4415: an unbound decision now routes to the lead (the moved population, asserted not dropped)" \
+  || bad_t "an unbound decision did not route" "$OUT0B"
+[[ "$OUT0B" == *"decision-tier1"* && "$OUT0B" != *"row-ship"* && "$OUT0B" != *"delivery-ref"* ]] \
+  && ok_t "…and it routed as the DECISION kind, not as a row-ship binding — DIVE-3228 did not widen past the binding" \
+  || bad_t "an unbound decision routed via a binding trigger" "the fix widened past the binding: $OUT0B"
 
 # --- 1. THE FIX: the SAME ask on a DELIVERY-BOUND row routes to the chart lead ---
 # One variable against case 0: this row carries a `delivery_ref`. No `Branch:` line is
