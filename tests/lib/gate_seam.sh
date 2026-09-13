@@ -24,10 +24,25 @@
 # real effects are sqlite writes and audit-log lines, which are separate
 # processes and persist. Nothing under tests/ reads a variable back out of it.
 #
+# THE OPT-OUT, and why it is declared rather than inferred. A subshell discards
+# shell state, so a harness whose SUBJECT is in-process state that cmd_task_need
+# sets — `_TASK_STORE_AUDIT_FENCED` (audit_task_store_fence_unit: "the notice is
+# one-shot per PROCESS"), or a stubbed `task_need_notify` recording into a
+# variable the arms read back (gate_precedent_unit, DIVE-4346) — must not be
+# wrapped: wrapping it does not red the arm, it makes the arm grade a different
+# program. Set `GATE_SEAM_INPROCESS=1` before sourcing, WITH A WRITTEN REASON.
+# Those harnesses keep the ABORT marker instead: a refused fixture still ends
+# them, but it ends with a verdict rather than with silence, and silence is the
+# half that misleads a reader.
+#
 # Source AFTER src/cmd_task.sh, and only from a test harness — this file is not
 # shipped behaviour and production must keep `exit` on a refusal.
 
 _gate_seam_install() {
+  if [[ "${GATE_SEAM_INPROCESS:-0}" == "1" ]]; then
+    printf 'gate seam: DECLINED by GATE_SEAM_INPROCESS=1 — this harness grades in-process state, so a refusal inside cmd_task_need still ends it (the ABORT marker is what names that)\n' >&2
+    return 0
+  fi
   if ! declare -F cmd_task_need >/dev/null 2>&1; then
     printf 'gate seam: cmd_task_need not defined — source src/cmd_task.sh FIRST; refusals will still abort this harness\n' >&2
     return 1

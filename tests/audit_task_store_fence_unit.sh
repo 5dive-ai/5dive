@@ -46,6 +46,8 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
+# DIVE-4462: this harness declines the gate seam — arm "the notice is one-shot per PROCESS" grades _TASK_STORE_AUDIT_FENCED, a shell flag cmd_task_need sets; a subshell discards it and the arm would grade a different program.
+GATE_SEAM_INPROCESS=1
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
   || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 
