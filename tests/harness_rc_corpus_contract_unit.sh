@@ -96,6 +96,114 @@ else
   printf '       this file is modeled on, and DIVE-2692 for the full writeup.\n'
 fi
 
+# DIVE-4440: A SECOND `trap ... EXIT` SILENTLY UNARMS THE FIRST, AND THE REGEX
+# ABOVE CANNOT SEE IT.
+#
+# The FIX text this file prints already SAYS the rule -- "bash keeps only the LAST
+# trap registered per signal ... never left as a second trap alongside it" -- and
+# until now nothing checked it. A file could carry a perfect marker trap on line 29,
+# register a bare cleanup trap on line 196, and pass this contract forever while
+# emitting no HARNESS-RC at all. That is not a weaker check than none; it is worse,
+# because the green here is read as coverage.
+#
+# MEASURED, not reasoned: at c7462480 tests/codex_channel_health_unit.sh matched
+# RC_RE (line 29) and printed ZERO HARNESS-RC lines on a PASSING run, while its
+# neighbour codex_bin_resolution_unit.sh printed HARNESS-RC=0. One offender in a
+# 300+ corpus -- so the blast radius is small and the detector has to be PRECISE,
+# not merely loud.
+#
+# WHY "IS IT AT TOP LEVEL" AND NOT "IS THERE A SECOND TRAP LINE". Five other files
+# carry a second EXIT trap that is entirely correct, and a line-grep reds all five:
+# broker_surface_unit.sh registers one inside a `( ... )` subshell (whose trap dies
+# with the subshell), and audit_exit_trap_row / gh_actor_routing / pre_push_rail /
+# silent_nonzero_exit_backstop each write one into a quoted heredoc or an awk-built
+# FIXTURE -- text that is never executed by this shell at all. All five were
+# confirmed by RUNNING them: 1 HARNESS-RC line each. A detector that reds a correct
+# file teaches authors to route around it, which is how this contract dies twice.
+#
+# THE DISCRIMINATOR IS A REAL PARSE BY BASH ITSELF, in DIVE-3679's shape: if
+# everything BEFORE the trap line parses as COMPLETE bash, the line runs in this
+# shell's top level; an unterminated `(` or an open heredoc leaves the prefix
+# incomplete and the line is not ours to judge.
+#
+# WHY THIS IS NOT `verdict_injection_point_top_level` CALLED VERBATIM, measured
+# rather than assumed -- the first cut of this arm DID call it and produced a FALSE
+# POSITIVE on tests/pre_push_rail_unit.sh:304, a trap inside a `<<'EOF'` fixture:
+#
+#   $ head -n 303 tests/pre_push_rail_unit.sh | bash -n
+#   warning: here-document at line 300 delimited by end-of-file (wanted `EOF')
+#   exit 0
+#
+# An unterminated heredoc is a WARNING, not an error, so bash -n exits 0 and a
+# rc-only reading calls the prefix complete. That is the same class this whole file
+# is about: a check that succeeds against the wrong target. Completeness therefore
+# requires BOTH rc 0 AND an empty stderr. Recorded here and not fixed in the shared
+# library because DIVE-3679's caller asks the question about a TERMINAL verdict line,
+# where an open heredoc cannot be in play -- widening that instrument mid-ship to suit
+# a new caller is how a working control acquires a behaviour nobody graded.
+#
+# THREE OUTCOMES. The parse can also FAIL TO RUN (mktemp). That is neither "top
+# level" nor "nested" and it is reported as UNKNOWN rather than silently picking a
+# side -- a check that cannot run must not answer.
+_rc_prefix_is_complete() {   # <file> <lineno> -> 0 top-level, 1 nested/open, 2 could-not-run
+  local f="$1" n="$2" pfx err rc
+  (( n <= 1 )) && return 0
+  pfx=$(mktemp) || return 2
+  err=$(mktemp) || { rm -f "$pfx"; return 2; }
+  head -n $(( n - 1 )) "$f" > "$pfx" || { rm -f "$pfx" "$err"; return 2; }
+  bash -n "$pfx" 2>"$err"; rc=$?
+  # Empty stderr is load-bearing, not belt-and-braces: see the heredoc note above.
+  if [[ $rc -eq 0 && ! -s "$err" ]]; then rc=0; else rc=1; fi
+  rm -f "$pfx" "$err"
+  return $rc
+}
+
+TRAP_STMT_RE='(^|[;&|do][[:space:]]*|^[[:space:]]*)trap[[:space:]]'
+
+# ONE detector, called by the corpus loop AND by the mutation arms below. A second
+# copy for the mutants would grade the copy -- the same argument tests/lib/
+# harness-verdict-detect.sh carries for its own extraction.
+_rc_silenced_lines() {   # <file> -> "<lineno>:<line>" per silencing trap; "?<lineno>" per unclassifiable
+  local f="$1" ln line
+  grep -qE "$RC_RE" "$f" || return 0   # no marker to silence; that is the MISSING arm's job
+  while IFS=: read -r ln line; do
+    [[ -n "$ln" ]] || continue
+    _rc_prefix_is_complete "$f" "$ln"
+    case $? in
+      0) printf '%s:%s\n' "$ln" "$line" ;;
+      2) printf '?%s\n' "$ln" ;;
+    esac
+  done < <(grep -nE "$TRAP_STMT_RE" "$f" \
+             | grep -E '\bEXIT\b' \
+             | grep -v 'HARNESS-RC' \
+             | grep -vE '^[0-9]+:[[:space:]]*#')
+}
+
+SILENCED=(); UNKNOWN_TL=()
+for t in "${CORPUS[@]}"; do
+  while read -r hit; do
+    [[ -n "$hit" ]] || continue
+    if [[ "$hit" == \?* ]]; then UNKNOWN_TL+=("$t:${hit#?}"); else SILENCED+=("$t:$hit"); fi
+  done < <(_rc_silenced_lines "$t")
+done
+
+if (( ${#SILENCED[@]} == 0 )); then
+  ok "no harness re-registers a top-level EXIT trap that would unarm its HARNESS-RC trap"
+else
+  nok "${#SILENCED[@]} top-level EXIT trap(s) replace the HARNESS-RC trap and silence it:"
+  for m in "${SILENCED[@]}"; do printf '       %s\n' "$m"; done
+  printf '\n       FIX -- FOLD the cleanup into the marker trap instead of registering a\n'
+  printf '       second one. bash keeps only the LAST trap per signal, so the file above\n'
+  printf '       currently emits NO HARNESS-RC line at all, pass or fail:\n\n'
+  printf '           trap '"'"'rc=$?; <your cleanup here>; echo "HARNESS-RC=$rc"'"'"' EXIT\n\n'
+  printf '       rc=$? must stay FIRST so cleanup cannot overwrite the exit code.\n'
+fi
+
+if (( ${#UNKNOWN_TL[@]} > 0 )); then
+  nok "${#UNKNOWN_TL[@]} trap line(s) could not be classified (parser could not run); asserting nothing about them:"
+  for m in "${UNKNOWN_TL[@]}"; do printf '       %s\n' "$m"; done
+fi
+
 # MUTATION, not just reading the regex: a check that cannot fail proves
 # nothing (this file's own sibling on DIVE-2211 exists partly to name that
 # risk). Stage a throwaway harness missing the trap and confirm THIS FILE's
@@ -145,6 +253,82 @@ if [[ "$HAZ_OUT" == *"HARNESS-RC=0"* ]]; then
   ok "mutation: the hazardous form is a LIVE bug, not just a disliked shape -- exit 7 misreports as HARNESS-RC=0 at runtime"
 else
   nok "mutation: expected the hazardous form to misreport rc at runtime (got: $HAZ_OUT) -- the arm above is not grading a real hazard"
+fi
+
+# DIVE-4440 MUTANTS for the SILENCED arm. Three files, and the two NEGATIVE ones
+# are the point: a detector that only proves it can fire is a detector nobody has
+# shown to be quiet, and the first cut of this arm DID red a correct file.
+#
+# Every mutant carries an ANCHOR: the positive one is RUN and shown to actually lose
+# its HARNESS-RC line, so the arm is grading a live hazard and not a disliked shape.
+
+# (a) POSITIVE -- a second EXIT trap at top level.
+cat > "$MUTTMP/silenced_unit.sh" <<'MUT'
+#!/usr/bin/env bash
+set -uo pipefail
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
+d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+echo body
+MUT
+if [[ -n "$(_rc_silenced_lines "$MUTTMP/silenced_unit.sh")" ]]; then
+  ok "mutation: a second TOP-LEVEL EXIT trap is correctly reported SILENCED"
+else
+  nok "mutation: a second top-level EXIT trap is (wrongly) reported clean -- the arm has no teeth"
+fi
+# ANCHOR: prove the mutation is a real silencing, not a shape this file dislikes.
+SIL_OUT="$(bash "$MUTTMP/silenced_unit.sh" 2>&1)"
+if [[ "$SIL_OUT" != *HARNESS-RC* ]]; then
+  ok "mutation: the silenced form is a LIVE bug -- the mutant emits NO HARNESS-RC line at runtime"
+else
+  nok "mutation: expected the mutant to emit no HARNESS-RC (got: $SIL_OUT) -- the arm above grades nothing"
+fi
+
+# (b) NEGATIVE -- inside a ( ... ) subshell. The trap dies with the subshell and the
+# parent's marker trap is untouched (tests/broker_surface_unit.sh does exactly this).
+cat > "$MUTTMP/subshell_unit.sh" <<'MUT'
+#!/usr/bin/env bash
+set -uo pipefail
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
+(
+  trap 'echo inner' EXIT
+  echo body
+)
+MUT
+if [[ -z "$(_rc_silenced_lines "$MUTTMP/subshell_unit.sh")" ]]; then
+  ok "mutation NEGATIVE: an EXIT trap inside a subshell is correctly NOT reported"
+else
+  nok "mutation NEGATIVE: a subshell EXIT trap is (wrongly) reported silenced -- false positive"
+fi
+SUB_OUT="$(bash "$MUTTMP/subshell_unit.sh" 2>&1)"
+if [[ "$SUB_OUT" == *HARNESS-RC* ]]; then
+  ok "mutation NEGATIVE anchor: the subshell mutant really does still print HARNESS-RC"
+else
+  nok "mutation NEGATIVE anchor: the subshell mutant lost HARNESS-RC -- the negative control is wrong"
+fi
+
+# (c) NEGATIVE -- inside a QUOTED HEREDOC, i.e. text written to a fixture and never
+# executed by this shell. This is the exact false positive the first cut produced on
+# tests/pre_push_rail_unit.sh:304, pinned so it cannot come back: bash -n only WARNS
+# on an unterminated heredoc, so an rc-only completeness test calls this top level.
+cat > "$MUTTMP/heredoc_unit.sh" <<'MUT'
+#!/usr/bin/env bash
+set -uo pipefail
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
+cat > /dev/null <<'FIXTURE'
+d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+FIXTURE
+echo body
+MUT
+if [[ -z "$(_rc_silenced_lines "$MUTTMP/heredoc_unit.sh")" ]]; then
+  ok "mutation NEGATIVE: an EXIT trap inside a quoted heredoc is correctly NOT reported"
+else
+  nok "mutation NEGATIVE: a heredoc EXIT trap is (wrongly) reported silenced -- the heredoc-warning gap is back"
+fi
+HD_OUT="$(bash "$MUTTMP/heredoc_unit.sh" 2>&1)"
+if [[ "$HD_OUT" == *HARNESS-RC* ]]; then
+  ok "mutation NEGATIVE anchor: the heredoc mutant really does still print HARNESS-RC"
+else
+  nok "mutation NEGATIVE anchor: the heredoc mutant lost HARNESS-RC -- the negative control is wrong"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
