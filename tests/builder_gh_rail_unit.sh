@@ -254,13 +254,27 @@ if [[ $RAIL_TESTABLE -eq 1 ]]; then
   grep -qF 'line two with' "$SUDO_LOG" \
     && bad_t "T7 PR body leaked into sudo's argv" "sudo=$(cat "$SUDO_LOG")" \
     || ok_t "T7 the PR body never appears in sudo's argv (no process-table leak)"
-  # Default title binds the ident, which is the evidence the merge gate matches on.
+  # Default title binds the ident, which is the evidence the merge gate matches on
+  # — and since DIVE-4423 it must ALSO be a title pr-title-lint can pass. The old
+  # `DIVE-2605: ...` form carried the ident and could never match the lint, so the
+  # PR froze the merge queue until a second seat retitled it by hand. This call
+  # passes no repo path, so the mint takes its by-construction `chore(<ident>)`
+  # form; the subject-reuse path is graded in tests/push_unit.sh.
   : >"$GHDO_ARGS_LOG"
   SUDO_MODE=grant GHDO_OUT='https://github.com/o/r/pull/100' \
     _push_open_pr DIVE-2605 o/r feat/x "" "" "" 0 >/dev/null 2>&1
-  grep -qF 'DIVE-2605: a title that is the PR subject line' "$GHDO_ARGS_LOG" \
+  grep -qF 'chore(DIVE-2605): a title that is the PR subject line' "$GHDO_ARGS_LOG" \
     && ok_t "T7 the default PR title carries the ident (the gate's ident-match evidence)" \
     || bad_t "T7 default title" "args=$(cat "$GHDO_ARGS_LOG")"
+  # ...and the ident alone is not enough: the same minted title must clear the
+  # repo's own title rule. Extracted from the workflow, never a copy of it.
+  if [[ -f .github/workflows/pr-title-lint.yml ]]; then
+    _push_title_passes_lint . "$(_push_mint_pr_title DIVE-2605 "" main feat/x 'a title that is the PR subject line')" \
+      && ok_t "T7 the default PR title also PASSES pr-title-lint (DIVE-4423)" \
+      || bad_t "T7 default title lint" "the minted default is still title-red"
+  else
+    skip_t "T7 default title lint" ".github/workflows/pr-title-lint.yml not readable here"
+  fi
 else
   skip_t "T7 push --open-pr routing" "/usr/local/bin/5dive is not executable here"
 fi

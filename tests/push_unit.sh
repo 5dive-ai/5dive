@@ -1289,6 +1289,102 @@ out=$(run_push DIVE-992 --dry-run 2>&1); rc=$?
   && ok_t "branch refusal names the body requirement, not --branch alone (DIVE-2801)" \
   || bad_t "branch refusal names the body requirement, not --branch alone (DIVE-2801)" "rc=$rc :: $out"
 
+# ---------------------------------------------------------------------------
+# DIVE-4423: the PR TITLE `--open-pr` mints by default must be one pr-title-lint
+# can pass. The old default was "${ident}: ${task_title}" — `DIVE-4409: ...` can
+# never match `^(feat|fix|test|chore|docs|refactor|ci|perf)(\(...\))?!?: `, so
+# every delegated-push PR arrived title-red and froze the merge queue.
+#
+# Graded against THE REPO'S OWN .github/workflows/pr-title-lint.yml — copied into
+# the fixture, not paraphrased — so these arms move with the rule. If the rule
+# file is not readable the arms SKIP loudly rather than passing vacuously.
+TITLE_WF=".github/workflows/pr-title-lint.yml"
+if [[ ! -f "$TITLE_WF" ]]; then
+  bad_t "4423 precondition: $TITLE_WF is readable" "not found — every 4423 arm below would grade nothing"
+else
+  T4423="$TMP/t4423"; mkdir -p "$T4423/.github/workflows"
+  cp "$TITLE_WF" "$T4423/.github/workflows/pr-title-lint.yml"
+  ( cd "$T4423"
+    git init -q -b main
+    git config user.name test; git config user.email test@example.test
+    git add -A && git commit -q -m "chore: fixture base"
+    git update-ref refs/remotes/origin/main HEAD
+    git checkout -q -b feat-conventional
+    git commit -q --allow-empty -m "feat(push): mint a lint-passing default title (DIVE-4423)"
+    git checkout -q -b feat-noident main
+    git commit -q --allow-empty -m "fix(push): a conventional subject that names no task"
+    git checkout -q -b prose main
+    git commit -q --allow-empty -m "made the thing work again"
+    git checkout -q main
+  ) >/dev/null 2>&1
+
+  # The extracted rule must actually REJECT something, or every arm below is
+  # vacuous. This is the exact string the old code minted.
+  _push_title_passes_lint "$T4423" "DIVE-4409: the delegated push opens a PR" \
+    && bad_t "4423 CONTROL: the extracted rule reds the OLD minted form" "it accepted 'DIVE-4409: ...' — the rule is not grading" \
+    || ok_t "4423 CONTROL: the extracted rule reds the OLD minted form"
+  _push_title_passes_lint "$T4423" "chore(DIVE-4409): the delegated push opens a PR" \
+    && ok_t "4423 CONTROL: the extracted rule accepts the chore(<ident>) form" \
+    || bad_t "4423 CONTROL: the extracted rule accepts the chore(<ident>) form" "it rejected the form the fallback mints"
+
+  # 1. a conventional single-commit subject is REUSED verbatim — the author's own
+  #    type is what release-cut reads, so minting our own would demote a feature.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main feat-conventional "a board title")
+  { [[ "$got" == "feat(push): mint a lint-passing default title (DIVE-4423)" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a conventional branch subject is reused verbatim and passes the lint" \
+    || bad_t "4423: a conventional branch subject is reused verbatim and passes the lint" "got: $got"
+
+  # 2. a conventional subject that does not name the task gets the ident APPENDED
+  #    (the rule anchors at ^, so appending cannot redden a passing title).
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main feat-noident "a board title")
+  { [[ "$got" == *"(DIVE-4423)" && "$got" == "fix(push): "* ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a passing subject missing the ident keeps its type AND gains the ident" \
+    || bad_t "4423: a passing subject missing the ident keeps its type AND gains the ident" "got: $got"
+
+  # 3. a prose subject cannot be reused -> the chore(<ident>) fallback, which
+  #    carries the ident and passes by construction.
+  got=$(_push_mint_pr_title DIVE-4423 "$T4423" main prose "a board title")
+  { [[ "$got" == "chore(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: a non-conventional branch subject falls back to chore(<ident>) and passes" \
+    || bad_t "4423: a non-conventional branch subject falls back to chore(<ident>) and passes" "got: $got"
+
+  # 4. NO repopath at all (the seven-argument call shape, and any caller with no
+  #    tree) still mints a passing title rather than the old red one.
+  got=$(_push_mint_pr_title DIVE-4423 "" main feat-conventional "a board title")
+  { [[ "$got" == "chore(DIVE-4423): a board title" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: with no repo path the minted default is still lint-passing" \
+    || bad_t "4423: with no repo path the minted default is still lint-passing" "got: $got"
+
+  # 5. empty task title -> the placeholder, still conventional.
+  got=$(_push_mint_pr_title DIVE-4423 "" main "" "")
+  { [[ "$got" == "chore(DIVE-4423): delegated push" ]] \
+      && _push_title_passes_lint "$T4423" "$got"; } \
+    && ok_t "4423: an empty task title still mints a lint-passing placeholder" \
+    || bad_t "4423: an empty task title still mints a lint-passing placeholder" "got: $got"
+
+  # 6. FAIL TOWARDS THE SAFE FORM: a tree with no rule to read cannot certify a
+  #    subject, so the subject is NOT reused — it is not that we trust it blind.
+  NORULE="$TMP/t4423-norule"; mkdir -p "$NORULE"
+  ( cd "$NORULE"
+    git init -q -b main
+    git config user.name test; git config user.email test@example.test
+    git commit -q --allow-empty -m base
+    git checkout -q -b feat-x
+    git commit -q --allow-empty -m "feat(push): a subject nobody here can grade"
+    git checkout -q main ) >/dev/null 2>&1
+  _push_title_passes_lint "$NORULE" "feat(push): a subject nobody here can grade" \
+    && bad_t "4423: an unreadable rule is not a pass" "it certified a title with no rule present" \
+    || ok_t "4423: an unreadable rule is not a pass"
+  got=$(_push_mint_pr_title DIVE-4423 "$NORULE" main feat-x "a board title")
+  [[ "$got" == "chore(DIVE-4423): a board title" ]] \
+    && ok_t "4423: with no rule to read the mint takes the by-construction form, not the subject" \
+    || bad_t "4423: with no rule to read the mint takes the by-construction form, not the subject" "got: $got"
+fi
+
 echo "-----"
 printf 'push_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
