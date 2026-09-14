@@ -2272,10 +2272,17 @@ cmd_export() {
         local ck cx
         ck=$(_pack_codex_to_atoms "$memdir" "$draft" knowledge)
         _pack_atoms_index "$draft" "Memory Index (distilled from a codex store)"
-        # `grep -c` prints 0 AND exits 1 when a present file has no matches, so
-        # a `|| echo 0` appends a SECOND zero and the arithmetic below dies with
-        # "syntax error in expression" under set -e. Take the first line only.
-        local cxall; cxall=$(grep -c '^# Task Group:' "$memdir/MEMORY.md" 2>/dev/null | head -1)
+        # `grep -c` prints 0 AND exits 1 when a present file has no matches.
+        # Two wrong guards, both measured: `|| echo 0` appends a SECOND zero and
+        # the arithmetic below dies with "syntax error in expression"; piping
+        # through `head -1` fixes the VALUE but not the STATUS — `head` exits 0,
+        # pipefail still hands the pipeline rc 1, and the bare assignment dies
+        # under the bundle's own `set -euo pipefail` with nothing on stdout or
+        # stderr. Guard the ASSIGNMENT with the post-condition the arithmetic
+        # below reads. (`|| true` suppresses the status without stating a value;
+        # `local cxall=$(…)` masks the failure instead of handling it.)
+        local cxall
+        cxall=$(grep -c '^# Task Group:' "$memdir/MEMORY.md" 2>/dev/null) || cxall=0
         cx=$(( ${cxall:-0} - ck ))
         (( cx < 0 )) && cx=0
         counts="$ck $cx"

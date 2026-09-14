@@ -449,10 +449,35 @@ else
 fi
 
 # ============ 10. a present-but-empty MEMORY.md does not kill the export =====
-# `grep -c` prints 0 AND exits 1 on a file with no matches, so the old
-# `$(grep -c … || echo 0)` yielded TWO zeros and the arithmetic around it died
-# with "syntax error in expression". The seat this bites is a real one: a codex
-# store whose MEMORY.md has not accumulated a task group yet.
+# `grep -c` prints 0 AND exits 1 on a file with no matches. TWO wrong guards
+# have now been measured at this one site, and the second was introduced by the
+# arm that closed the first:
+#   `|| echo 0`        -> a SECOND zero, arithmetic dies "syntax error in expression"
+#   `| head -1`        -> value fixed, STATUS not: head exits 0, pipefail still
+#                         hands the pipeline rc 1, and the bare assignment dies
+#                         under the product's own `set -euo pipefail`, silently.
+# The seat this bites is a real one: a codex store whose MEMORY.md has not
+# accumulated a task group yet.
+#
+# THIS ARM IS DRIVEN UNDER `set -e` ON PURPOSE. The harness does `set +e` at the
+# top of the file, which switches OFF the very errexit the failure needs — under
+# `set +e` the unguarded assignment is measured to behave IDENTICALLY to the
+# guarded one, so an arm run in the harness's own shell cannot see this bug no
+# matter what it asserts. The subshell restores the product's shell.
+#
+# AND rc IS NOT THE DISCRIMINATOR. E_GENERIC is 1 and bash's errexit abort is
+# also 1, so both the silent death and the honest refusal exit 1. Measured at
+# this fixture, unguarded vs guarded, under `set -e`:
+#   unguarded: rc=1, output EMPTY,               half-written draft LEFT BEHIND
+#   guarded:   rc=1, output NAMES the refusal,   draft cleaned up
+# So the arms below grade the output and the draft dir. An arm that read rc, or
+# that matched the text of the OLD failure, passes on both.
+#
+# Why this fixture cannot assert rc==0: in knowledge mode atoms come only from
+# MEMORY.md's task groups, so `grep -c` returns 0 exactly when the conversion
+# produced 0 atoms — which is always the "nothing shareable" refusal. The
+# guard's no-match branch is UNREACHABLE on a successful export. The rc==0
+# post-condition is therefore graded by arm 10b below, on a store that has one.
 EMPTYTG="$TMP/empty-tg"; mkdir -p "$EMPTYTG"
 printf '## Reusable knowledge\n\n- a fact with no task-group heading\n' > "$EMPTYTG/MEMORY.md"
 _pack_memory_kind() { printf 'codex\n'; }
@@ -461,11 +486,62 @@ _pack_memory_dir()  { printf '%s\n' "$EMPTYTG"; }
 # harness is run as root by the pre-push rail, and the un-stubbed path would
 # create /home/agent-cx on a real host.
 _pack_draft_dir()   { printf '%s\n' "$TMP/draft-phase"; }
-out=$(cmd_export cx --memory=distilled --audience=self 2>&1); rc=$?
+rm -rf "$TMP/draft-phase"
+out=$( set -e; cmd_export cx --memory=distilled --audience=self 2>&1 ); rc=$?
+# (1) the refusal is REACHED and NAMED. Empty output IS the bug: the product
+# died mid-function with nothing on stdout or stderr.
 case "$out" in
-  *"syntax error in expression"*) bad_t "a zero-task-group codex MEMORY.md does not crash the draft" "$out" ;;
-  *)                              ok_t  "a zero-task-group codex MEMORY.md does not crash the draft" ;;
+  "")  bad_t "a zero-task-group codex MEMORY.md refuses OUT LOUD, not silently" \
+             "rc=$rc with NOTHING on stdout or stderr — the assignment aborted under set -e" ;;
+  *"nothing shareable"*)
+       ok_t  "a zero-task-group codex MEMORY.md refuses OUT LOUD, not silently" ;;
+  *)   bad_t "a zero-task-group codex MEMORY.md refuses OUT LOUD, not silently" \
+             "rc=$rc, unexpected: $out" ;;
 esac
+# (2) the refusal ran its own cleanup. `fail` is preceded by `rm -rf "$draft"`;
+# an abort at the assignment skips it and orphans a half-written draft dir that
+# _pack_atoms_index had already populated.
+if [[ -e "$TMP/draft-phase" ]]; then
+  bad_t "the refusal leaves no half-written draft behind" \
+        "orphaned: $(ls "$TMP/draft-phase" 2>/dev/null | tr '\n' ' ')"
+else
+  ok_t "the refusal leaves no half-written draft behind"
+fi
+
+# ---- 10b. THE POST-CONDITION IN THE SUCCESS DIRECTION, under `set -e` -------
+# Arm 10a grades a refusal; on its own it would pass on a product that refuses
+# everything. This is the same driver over a store that DOES carry a task group:
+# the export must exit 0, write a draft with real atoms, and report a count that
+# matches what it wrote. Nothing else in the suite drives cmd_export with
+# errexit on, so an abort anywhere in the draft phase is invisible without it.
+ONETG="$TMP/one-tg"; mkdir -p "$ONETG"
+cat > "$ONETG/MEMORY.md" <<'ONE'
+# Task Group: reconciling a codex export
+
+## Reusable knowledge
+
+- ONETGMARK a store with one task group still drafts.
+ONE
+ONEDRAFT="$TMP/one-draft"; rm -rf "$ONEDRAFT"
+_pack_memory_dir() { printf '%s\n' "$ONETG"; }
+_pack_draft_dir()  { printf '%s\n' "$ONEDRAFT"; }
+out=$( set -e; cmd_export cx --memory=distilled --audience=self 2>&1 ); rc=$?
+eq_t "a codex store WITH a task group drafts cleanly under the product's own set -e" "$rc" "0"
+onen=$(ls "$ONEDRAFT"/codex-tg-*.md 2>/dev/null | wc -l)
+[[ "$onen" -ge 1 ]] \
+  && ok_t "that draft carries atoms ($onen)" \
+  || bad_t "that draft carries atoms" "no codex-tg-*.md in $ONEDRAFT (rc=$rc): $out"
+[[ -f "$ONEDRAFT/MEMORY.md" ]] \
+  && ok_t "that draft carries its regenerated index" \
+  || bad_t "that draft carries its regenerated index" "no MEMORY.md (rc=$rc)"
+# The count the operator is shown must be the count on disk. `kept` is `ck`, the
+# conversion's own return, and `excluded` is the grep-derived remainder — the
+# value the guarded assignment feeds. A guard that swallowed a real count into 0
+# would still exit 0 and still write atoms; only this reads it back.
+onekept=$(printf '%s' "$out" | sed -n 's/.*kept \([0-9]*\) knowledge fact.*/\1/p' | head -1)
+eq_t "the kept count it reports is the atoms it wrote" "$onekept" "$onen"
+oneexc=$(printf '%s' "$out" | sed -n 's/.*excluded \([0-9]*\) private.*/\1/p' | head -1)
+eq_t "the excluded remainder is 0 when every task group converted" "$oneexc" "0"
 
 # ====== 11. THE EXCLUSION MUST COVER THE METADATA, NOT JUST THE BODY ========
 # The shipped fixture above opens every task group with a `scope:` line, and
