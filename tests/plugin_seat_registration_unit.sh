@@ -393,6 +393,101 @@ t  "T15g no gradeable seat reads UNKNOWN, not ok" "warn" "$(cut -d'|' -f1 "$TMP/
 tc "T15h ...and says nothing was measured" "nothing was measured" "$(cat "$TMP/doc-empty")"
 
 # ---------------------------------------------------------------------------
+# T16 — DIVE-4530: the REPAIR path, driven through the real verbs
+# ---------------------------------------------------------------------------
+# T13a/T13c prove `add` and `upgrade` mention the walker. They cannot see WHERE:
+# on 2026-09-14 both calls sat BEHIND a same-version early return, so on every
+# box that already carried the plugin at the marketplace version — which was
+# every box with browser — neither verb reached the walk. doctor named
+# `plugin upgrade` as the fix and that fix did nothing; the only sequence that
+# re-registered a seat was `plugin remove` + `plugin add`, and `remove` deletes
+# $STATE_DIR/plugins/enabled/<key>/ with the operator's hand-written adapters in
+# it (measured twice on the canary). So these arms run the real functions on the
+# real early-return branch and grade what reaches the seats.
+#
+# The marketplace source and the version-keyed cache dir the box already has.
+# Capabilities are ["skill"] only: `verb` would take _plugin_verb_install_check,
+# a different row's machinery, and seat-facing is what is under test.
+MKTSRC="$(_plugin_mkt_dir)/5dive-plugins/plugins/browser"
+mkdir -p "$MKTSRC/.claude-plugin" "$MKTSRC/skills/connect-site"
+jq -n '{name:"browser",version:"1.3.0",author:{name:"5dive-ai"},
+        fivedive:{trust:{publisher:"5dive-ai",review:"official"},capabilities:["skill"]}}' \
+  > "$MKTSRC/.claude-plugin/plugin.json"
+cp "$PDIR/AGENTS.md" "$MKTSRC/AGENTS.md"
+DEST="$(_plugin_cache_dir)/5dive-plugins/browser/1.3.0"
+mkdir -p "$DEST"; cp "$PDIR/AGENTS.md" "$DEST/AGENTS.md"
+# The operator's hand-written file inside the ENABLED directory. This is the
+# thing `plugin remove` + `plugin add` destroyed, and the reason the repair verb
+# has to be one that fetches nothing.
+mkdir -p "$PDIR/adapters"; echo '{"host":"example.com"}' > "$PDIR/adapters/example.json"
+
+wipe_seats() {
+  rm -rf "$PERSONA_HOME_ROOT/agent-ceo/.claude" "$PERSONA_HOME_ROOT/agent-devops/.claude"
+  rm -f "$CODEX_MD"
+  : > "$SEAT_SCRIPTS"
+}
+
+wipe_seats
+ij_before=$(md5sum "$(_plugin_installed_json)" | cut -d' ' -f1)
+link_before=$(readlink "$(_plugin_enabled_dir)/browser@5dive-plugins")
+addout=$(cmd_plugin_add browser@5dive-plugins --yes 2>&1); addrc=$?
+
+t  "T16a same-version add still succeeds" "0" "$addrc"
+tc "T16b ...and still says nothing was fetched (the §4 sentence is not what was wrong)" \
+   "is already installed at version 1.3.0 — nothing was fetched" "$addout"
+t  "T16c THE FIX: a claude seat that missed the walk carries the plugin after a same-version add" "yes" \
+   "$(plugin_seat_registered ceo browser 5dive-plugins && echo yes || echo no)"
+t  "T16d ...the second claude seat too" "yes" \
+   "$(plugin_seat_registered devops browser 5dive-plugins && echo yes || echo no)"
+t  "T16e ...and the codex seat gets its instructions section" "1" "$(nblk "$CODEX_MD")"
+tc "T16f ...and the walk reports per seat rather than repairing silently" \
+   "ceo (claude): browser@5dive-plugins registered" "$addout"
+t  "T16g the walker ran ONCE per claude seat, not twice" "2" "$(grep -c '^=== ' "$SEAT_SCRIPTS")"
+tc "T16h ...in the REGISTER direction" 'plugin install "${PLUGIN}@${MARKETPLACE}"' "$(cat "$SEAT_SCRIPTS")"
+tnc "T16i ...and never the unregister direction" 'plugin uninstall' "$(cat "$SEAT_SCRIPTS")"
+# The box side: this verb is the repair precisely because it changes nothing here.
+t  "T16j the operator's hand-written file in the enabled directory survives" "yes" \
+   "$([[ -f "$PDIR/adapters/example.json" ]] && echo yes || echo no)"
+t  "T16k the enabled pointer is untouched" "$link_before" \
+   "$(readlink "$(_plugin_enabled_dir)/browser@5dive-plugins")"
+t  "T16l installed.json is untouched" "$ij_before" \
+   "$(md5sum "$(_plugin_installed_json)" | cut -d' ' -f1)"
+
+# A DISABLED plugin is not a repair target. doctor grades select(.value.enabled)
+# only, so pushing a disabled plugin onto seats here would undo `plugin disable`
+# at the layer disable does not reach — and it says so rather than passing mute.
+OFFSRC="$(_plugin_mkt_dir)/5dive-plugins/plugins/off"
+mkdir -p "$OFFSRC/.claude-plugin"
+jq -n '{name:"off",version:"1.0.0",author:{name:"5dive-ai"},
+        fivedive:{trust:{publisher:"5dive-ai",review:"official"},capabilities:["skill"]}}' \
+  > "$OFFSRC/.claude-plugin/plugin.json"
+mkdir -p "$(_plugin_cache_dir)/5dive-plugins/off/1.0.0"
+: > "$SEAT_SCRIPTS"
+offout=$(cmd_plugin_add off@5dive-plugins --yes 2>&1)
+t  "T16m a DISABLED plugin is not pushed onto the seats by a same-version add" "yes" \
+   "$([[ ! -s "$SEAT_SCRIPTS" ]] && echo yes || echo no)"
+tc "T16n ...and the operator is told why, not left with silence" "is disabled on this box" "$offout"
+
+# The same early return on `upgrade`, whose own comment claimed to be the repair
+# path for a box "upgraded past the version that first shipped the walk" — true
+# only for a box that was BEHIND until this row.
+wipe_seats
+upout=$(cmd_plugin_upgrade browser@5dive-plugins 2>&1); uprc=$?
+t  "T16o same-version upgrade still succeeds" "0" "$uprc"
+tc "T16p ...and still names the §4 trap" "the marketplace still offers 1.3.0" "$upout"
+t  "T16q THE FIX, other verb: the seat carries the plugin after a same-version upgrade" "yes" \
+   "$(plugin_seat_registered ceo browser 5dive-plugins && echo yes || echo no)"
+t  "T16r ...and the codex seat has its section" "1" "$(nblk "$CODEX_MD")"
+
+# doctor must name a command that WORKS. The old text named `plugin upgrade`
+# without --yes and `re-run 'plugin add'`; both returned before the walk.
+DOCTOR_OUT=""; rm -rf "$PERSONA_HOME_ROOT/agent-ceo/.claude"; doctor_check_plugin_seat_registration
+tc "T16s doctor's remedy names the verb that now runs the walk" \
+   "sudo 5dive plugin add <plugin>@<marketplace> --yes" "$DOCTOR_OUT"
+tc "T16t ...and warns off the sequence that destroys the enabled directory" \
+   "Do NOT use 'plugin remove'" "$DOCTOR_OUT"
+
+# ---------------------------------------------------------------------------
 # NEGATIVE CONTROLS — cut a named term out of the SHIPPING function's own text
 # and prove the cut landed and the arm it protects goes red.
 # ---------------------------------------------------------------------------
@@ -456,5 +551,45 @@ if (( ${m5n:-0} >= 2 )); then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); printf 'FAIL: M5b returning the whole AGENTS.md did NOT accrete (%s copies) — T7c is vacuous\n' "${m5n:-0}"
 fi
 
+# M6: cut the repair call out of cmd_plugin_add's same-version branch. Without it
+# the branch is what it was on 2026-09-14: it returns before the walk and the
+# seat stays blind, which is what T16c must then see.
+m6=$(declare -f cmd_plugin_add | sed 's/_plugin_seat_reregister "$key" "$plugin" "$mkt" "$caps" "$dest"/: NOTCALLED/')
+t "M6a the mutation landed (the repair call is gone from the mutant's text)" "1" \
+  "$(grep -c 'NOTCALLED' <<<"$m6")"
+m6reg=$( eval "$m6"
+         wipe_seats
+         cmd_plugin_add browser@5dive-plugins --yes >/dev/null 2>&1
+         plugin_seat_registered ceo browser 5dive-plugins && echo yes || echo no )
+if [[ "$m6reg" == no ]]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); printf 'FAIL: M6b cutting the repair call out of cmd_plugin_add still registered the seat — T16c is vacuous\n'
+fi
+
+# M7: the same cut on cmd_plugin_upgrade's same-version branch, against T16q.
+m7=$(declare -f cmd_plugin_upgrade | sed 's/_plugin_seat_reregister "$key" "$plugin" "$mkt" "$_same_caps"/: NOTCALLED/')
+t "M7a the mutation landed" "1" "$(grep -c 'NOTCALLED' <<<"$m7")"
+m7reg=$( eval "$m7"
+         wipe_seats
+         cmd_plugin_upgrade browser@5dive-plugins >/dev/null 2>&1
+         plugin_seat_registered ceo browser 5dive-plugins && echo yes || echo no )
+if [[ "$m7reg" == no ]]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); printf 'FAIL: M7b cutting the repair call out of cmd_plugin_upgrade still registered the seat — T16q is vacuous\n'
+fi
+
+# M8: cut the ENABLED guard out of the repair helper. A disabled plugin would
+# then be pushed onto every seat by `plugin add`, undoing `plugin disable` at the
+# layer disable does not reach — which is what T16m forbids.
+m8=$(declare -f _plugin_seat_reregister | sed 's/if \[\[ "$enabled" != true \]\]; then/if false; then/')
+t "M8a the mutation landed (the enabled guard is gone)" "0" \
+  "$(grep -c '"\$enabled" != true' <<<"$m8")"
+m8ran=$( eval "$m8"
+         : > "$SEAT_SCRIPTS"
+         cmd_plugin_add off@5dive-plugins --yes >/dev/null 2>&1
+         [[ -s "$SEAT_SCRIPTS" ]] && echo yes || echo no )
+if [[ "$m8ran" == yes ]]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); printf 'FAIL: M8b cutting the enabled guard did NOT push the disabled plugin onto the seats — T16m is vacuous\n'
+fi
+: > "$SEAT_SCRIPTS"
+
 printf 'plugin_seat_registration_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
-[[ "$FAIL" -eq 0 && "$PASS" -ge 40 ]]
+[[ "$FAIL" -eq 0 && "$PASS" -ge 60 ]]

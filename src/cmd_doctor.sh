@@ -410,10 +410,12 @@ doctor_check_marketplace_clones() {
 # about the box and false about every agent on it.
 #
 # So this check asks the question the old report could not: for each ENABLED
-# seat-facing plugin, which claude seats do NOT carry it? Fixable — `plugin
-# upgrade <key>` re-runs the walk — but deliberately NOT auto-repaired: a seat
-# registration drops privilege and clones a marketplace, which is not something
-# `doctor` should do without being asked.
+# seat-facing plugin, which claude seats do NOT carry it? Fixable — `plugin add
+# <key> --yes` re-runs the walk (DIVE-4530; before it, both `add` and `upgrade`
+# returned at their same-version branch BEFORE the walk, so the remedy this line
+# printed was a no-op on every box that already carried the plugin) — but
+# deliberately NOT auto-repaired: a seat registration drops privilege and clones
+# a marketplace, which is not something `doctor` should do without being asked.
 doctor_check_plugin_seat_registration() {
   local rows name type key
   rows=$(plugin_seat_unregistered_rows 2>/dev/null || true)
@@ -443,7 +445,7 @@ doctor_check_plugin_seat_registration() {
     missing+=("$name:$key")
   done <<<"$rows"
   doctor_add plugins seat-registration warn \
-    "${#missing[@]} seat/plugin pair(s) NOT registered: ${missing[*]} — those agents cannot load the plugin's skills (a non-claude seat is missing the plugin's instructions section). Fix: sudo 5dive plugin upgrade <plugin>@<marketplace> (re-runs the per-seat registration), or re-run 'plugin add'. By hand it must be a NON-LOGIN shell — /etc/profile.d/5dive-shared-configs.sh exports CLAUDE_CONFIG_DIR for every login shell, so a -lc form reads another user's config and fails with a misleading 'not found in marketplace'" \
+    "${#missing[@]} seat/plugin pair(s) NOT registered: ${missing[*]} — those agents cannot load the plugin's skills (a non-claude seat is missing the plugin's instructions section). Fix: sudo 5dive plugin add <plugin>@<marketplace> --yes — at the version the box already has, that fetches nothing, leaves the enabled/ directory untouched, and re-runs the per-seat registration only (so does 'plugin upgrade' at the same version). Do NOT use 'plugin remove' + 'plugin add' to repair this: 'remove' deletes the plugin's enabled directory and any hand-written files in it. By hand it must be a NON-LOGIN shell — /etc/profile.d/5dive-shared-configs.sh exports CLAUDE_CONFIG_DIR for every login shell, so a -lc form reads another user's config and fails with a misleading 'not found in marketplace'" \
     false false
 }
 

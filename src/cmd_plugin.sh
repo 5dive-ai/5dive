@@ -1067,6 +1067,10 @@ cmd_plugin_add() {
     echo "  $key is already installed at version $version — nothing was fetched." >&2
     echo "  The install path is keyed on the version, so a change that did not bump" >&2
     echo "  'version' in plugin.json cannot arrive. Bump it and run 'plugin upgrade $key'." >&2
+    # DIVE-4530: ...and the per-seat half runs anyway. Nothing was fetched, but a
+    # seat that missed the original walk is still missing it, and this is the
+    # only verb that can put it back without deleting the enabled directory.
+    _plugin_seat_reregister "$key" "$plugin" "$mkt" "$caps" "$dest"
     ok "$key already at $version" '{plugin:$p, marketplace:$m, version:$v, changed:false}' \
        --arg p "$plugin" --arg m "$mkt" --arg v "$version"
     return 0
@@ -1160,6 +1164,48 @@ cmd_plugin_add() {
      --argjson c "$(jq -c '(.fivedive.capabilities // [])' <<<"$j")"
 }
 
+# DIVE-4530 — the repair verb, and why it is `add`.
+#
+# DIVE-4522 shipped the seat walk on the paths that CHANGE the box: a fresh
+# `plugin add`, an `upgrade` that moves the version. Every box that already
+# carried the plugin at the marketplace version — which on 2026-09-14 was every
+# box with browser — reached neither: both verbs return at their "nothing to
+# fetch" branch BEFORE the walk, so `doctor`'s finding named a remedy that was a
+# no-op, and the only sequence that actually re-registered a seat was
+# `plugin remove` + `plugin add`. That sequence deletes
+# $STATE_DIR/plugins/enabled/<key>/ with the operator's hand-written adapters in
+# it (measured twice on the canary, restored from a backup both times). A
+# warning whose stated fix either does nothing or destroys data is not a fix.
+#
+# So this is the same walk, on the two paths that change NOTHING on the box: no
+# fetch, no copy, no pointer flip, no installed.json write. Registration is
+# idempotent (plugin_seat_register_claude ends in a read, plugin_seat_doc_install
+# replaces its own marker region), which is what makes running it on an
+# unchanged box safe rather than merely harmless.
+#
+# ENABLED is the guard, and it is doctor's predicate rather than a new one:
+# plugin_seat_unregistered_rows grades `select(.value.enabled)` only, so a
+# disabled plugin is never a finding and must not be a repair either — pushing it
+# onto seats here would undo a `plugin disable` at the layer `disable` does not
+# reach. It says so instead of passing silently, because "add printed nothing
+# about seats" is the shape of the defect this row is closing.
+_plugin_seat_reregister() { # <key> <plugin> <marketplace> <caps> <dir>
+  local key="${1:-}" plugin="${2:-}" mkt="${3:-}" caps="${4:-}" dir="${5:-}"
+  plugin_seat_is_seat_facing "$caps" || return 0
+  local enabled; enabled=$(jq -r --arg k "$key" '.[$k].enabled // false' \
+    "$(_plugin_installed_json)" 2>/dev/null) || enabled=false
+  if [[ "$enabled" != true ]]; then
+    echo "  $key is disabled on this box, so no seat registration was run." >&2
+    echo "  Enable it first:  sudo 5dive plugin enable $key" >&2
+    return 0
+  fi
+  echo >&2
+  echo "  Re-registering $key with existing agents (nothing was fetched, and the" >&2
+  echo "  box's enabled/$key directory is untouched):" >&2
+  plugin_seat_apply "$plugin" "$mkt" "$caps" register "$dir" || true
+  return 0
+}
+
 cmd_plugin_list() {
   _plugin_ensure_store
   local j; j=$(cat "$(_plugin_installed_json)")
@@ -1243,6 +1289,14 @@ cmd_plugin_upgrade() {
     echo "  $key is at $cur and the marketplace still offers $cur." >&2
     echo "  If a fix was published without bumping 'version' in plugin.json, it cannot" >&2
     echo "  arrive: the install path is keyed on the version (contract §4)." >&2
+    # DIVE-4530: the same-version return used to sit in front of the seat walk
+    # below, which made the "registration is idempotent, so this is also the
+    # repair path" claim in that walk's comment true only for a box that was
+    # BEHIND. The repair path now runs from here too, against the version this
+    # box actually has on disk.
+    local _same_caps; _same_caps=$(jq -r '((.fivedive.capabilities // []) | join(" "))' <<<"$nj")
+    _plugin_seat_reregister "$key" "$plugin" "$mkt" "$_same_caps" \
+      "$(_plugin_cache_dir)/$mkt/$plugin/$cur"
     ok "$key already at $cur" '{plugin:$k, version:$v, changed:false}' --arg k "$key" --arg v "$cur"
     return 0
   fi
