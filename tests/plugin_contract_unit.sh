@@ -442,6 +442,19 @@ fi
 # after `setup`, so the two arms cannot both pass on a broken read of the
 # manifest.
 
+# THE CALLER'S UID IS A FIXTURE FROM HERE DOWN. Every arm below runs the
+# publisher's command, and since DIVE-4475 the verb picks its path from
+# `$(id -u)`: at root it drops to the calling seat, anywhere else it runs as
+# itself. A suite whose verdict depends on the uid of whoever invoked it is not
+# a grader — run under `sudo` this section dropped `touch $SENTINEL` into a seat
+# that cannot reach the harness's own 0700 temp tree, reddening four arms that
+# have nothing to do with uid. The call site reads `$(id -u)` in THIS shell, so
+# a function reaches it and nothing is ever actually elevated: unprivileged by
+# default here, and set to 0 explicitly by the arms that exist to grade the root
+# branch (T9r-T9u).
+HARNESS_UID=1000
+id() { if [[ "${1:-}" == "-u" ]]; then echo "$HARNESS_UID"; else command id "$@"; fi; }
+
 # Consent first. Without --yes and with stdin not a terminal the verb must
 # REFUSE, and — the half that matters — must not have run anything.
 run cmd_plugin_setup setupy@fixture
@@ -569,9 +582,8 @@ tn "T9q4 ...so the old unconditional 'as root' claim is gone"      "it runs, as 
 # own defect class.
 #
 # Executing it needs no root, only two shims:
-#   · `id` as a shell FUNCTION answering 0 to `-u`. The call site reads
-#     `$(id -u)` in THIS shell, so a function reaches it and nothing is actually
-#     elevated.
+#   · `HARNESS_UID=0`, read through the `id` function installed above — the call
+#     site reads `$(id -u)` in THIS shell, so nothing is actually elevated.
 #   · a recording `runuser` first on PATH, which appends its argv to a log and
 #     execs the rest. So we observe the exact wrapper the verb chose AND the
 #     publisher's command still runs — a shim that only recorded would prove the
@@ -587,15 +599,13 @@ exec "$@"
 SHIMEOF
 chmod +x "$SHIM/runuser"
 
-id() { if [[ "${1:-}" == "-u" ]]; then echo 0; else command id "$@"; fi; }
-
 shimmed_setup() {  # shimmed_setup <caller-seat> <verb args...>
   local seat="$1"; shift
   local saved="$PATH"
   : > "$RUNLOG"
-  PATH="$SHIM:$PATH"; export SUDO_USER="$seat"
+  PATH="$SHIM:$PATH"; export SUDO_USER="$seat"; HARNESS_UID=0
   run cmd_plugin_setup "$@"
-  PATH="$saved"; unset SUDO_USER
+  PATH="$saved"; unset SUDO_USER; HARNESS_UID=1000
 }
 
 SEATWIRED="$TMP/seat-wired"
@@ -640,7 +650,7 @@ rm -f "$SEATWIRED"; : > "$RUNLOG"
   PATH="$SHIM:$PATH"
   # shellcheck source=/dev/null
   source "$MUTSRC"
-  id() { if [[ "${1:-}" == "-u" ]]; then echo 0; else command id "$@"; fi; }
+  HARNESS_UID=0
   SUDO_USER=alice cmd_plugin_setup setupwired@fixture --yes
 ) >/dev/null 2>&1
 t "T9t with the wrapper deleted from the call site, NOTHING is wrapped" "" \
@@ -665,7 +675,7 @@ t  "T9u3 ...and it is recorded as not-ok, so the button is re-offered"  "false" 
 t  "T9u4 ...and the drop itself still happened (it is the command that failed)" \
    "-u alice -- bash -c exit 77" "$(cat "$RUNLOG")"
 
-unset -f id shimmed_setup
+unset -f shimmed_setup
 
 # `plugin setup` is reachable through the real dispatcher, not only as a function
 # this harness calls directly.
