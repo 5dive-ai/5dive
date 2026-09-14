@@ -1426,10 +1426,24 @@ cmd_task_assign() {
   # (assignee != verifier today) reassigned straight onto its own verifier,
   # which would make that agent both the worker and the grader with no handoff
   # ever recorded (DIVE-2899: assignee=verifier, delivered_at NULL).
-  local _asg_cur_vfier _asg_cur_assignee
+  #
+  # DIVE-4520 NARROWS IT TO WHAT THAT PARAGRAPH DESCRIBES. The condition above
+  # was written as `assignee != verifier`, which is a PROXY for "no handoff ever
+  # recorded" and only holds while the row has never been delivered. A row that
+  # WAS delivered and then bounced, re-assigned, or graded sits at
+  # `assignee != verifier` with a handoff clock stamped — DIVE-2899's shape is
+  # not that row, but the proxy cannot tell them apart, so the guard fired on it.
+  # It fires on exactly the population `_task_done_merge_pending_guard` prints
+  # its hand-over advice to (both its call sites are inside a
+  # `verifier != assignee` branch), which made that advice unrunnable on every
+  # row that ever saw it. Read the column the comment means:
+  # `handoff_delivered_at IS NULL` is "no handoff ever recorded", and a row that
+  # HAS one cannot be the fresh shape DIVE-2899 named.
+  local _asg_cur_vfier _asg_cur_assignee _asg_undelivered
   _asg_cur_vfier=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
   _asg_cur_assignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
-  if [[ -n "$_asg_cur_vfier" && "$who" == "$_asg_cur_vfier" && "$_asg_cur_assignee" != "$_asg_cur_vfier" ]]; then
+  _asg_undelivered=$(db "SELECT COUNT(*) FROM tasks WHERE id=${id} AND handoff_delivered_at IS NULL;")
+  if [[ -n "$_asg_cur_vfier" && "$who" == "$_asg_cur_vfier" && "$_asg_cur_assignee" != "$_asg_cur_vfier" && "$_asg_undelivered" == "1" ]]; then
     fail "$E_VALIDATION" "'$who' is $ident's own verifier — a maker can't grade itself (pick a different assignee, or re-point the verifier first with '5dive task verifier $ident <agent>')"
   fi
   # Handing a task to a NEW owner resets its in_progress clock: SQLite evaluates

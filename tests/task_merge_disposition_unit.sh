@@ -602,21 +602,68 @@ if [[ "$_c11_out" == *"already spent"* ]]; then
 else
   bad_t "C9s ...and says WHY the audited escape applies there (the standing is already spent)" "$_c11_out"
 fi
-# C9t: AND THE ESCAPE IS NOT DECORATION. The refusal is only followable if the
-# verb it names actually moves the row off the guarded fork. `task assign` onto
-# the verifier makes verifier == assignee, which is the shape the guard is not on
-# (the ordinary close), and it stamps no delivery clock — so the grading seat
-# still holds standing when that seat closes. Asserted behaviourally, against the
-# shipped standing predicate, not by reading the sentence again.
+# C9t-C9w: AND THE ESCAPE IS NOT DECORATION — GRADED BY RUNNING IT.
+#
+# Iteration 2 asserted this branch by WRITING the end state by hand
+# (`UPDATE tasks SET assignee='quinn'`) and checking the consequences. quinn
+# bounced that at iteration 2 and was right: `grep -c cmd_task_assign` over this
+# suite returned 0, so the arms certified what the refusal SAYS and never once
+# ran the verb it names. `cmd_task_assign` refused it — DIVE-3097's guard fired
+# on `assignee != verifier`, which is the precondition of the fork the refusal is
+# printed on, so the advice could not be followed on any row that ever saw it.
+# DIVE-4520 narrows that guard to the column its own comment means
+# (`handoff_delivered_at IS NULL`). These arms drive the SHIPPED verb.
+#
+# `_task_require_lane` is stubbed for these calls and nothing else: it reads the
+# agent registry, this board is a temp fixture with a two-agent roster, and lane
+# registration is not what is under test here. The guard under test sits below
+# it.
+assign_run() { # assign_run <ident> <seat> -> runs the shipped verb, lane check stubbed
+  ( set +e; _task_require_lane() { return 0; }; cmd_task_assign "$1" "$2" 2>&1 )
+}
 _c11_assign_before=$(col "$c11" handoff_delivered_at)
-db "UPDATE tasks SET assignee='quinn' WHERE id=${c11};"   # what `task assign <ident> quinn` does
-eq "C9t the escape moves the row off the guarded fork (verifier == assignee)" \
+_c11_assign_out=$(assign_run "$_c11ident" quinn); _c11_assign_rc=$?
+if (( _c11_assign_rc == 0 )); then
+  ok_t "C9t the escape the refusal prints RUNS on the row it is printed on"
+else
+  bad_t "C9t the escape the refusal prints RUNS on the row it is printed on" \
+        "rc=$_c11_assign_rc; output: $_c11_assign_out"
+fi
+eq "C9u ...moving the row off the guarded fork (verifier == assignee)" \
    "quinn|quinn" "$(col "$c11" verifier)|$(col "$c11" assignee)"
-eq "C9u ...without stamping a delivery clock" \
+eq "C9v ...without stamping a delivery clock" \
    "$_c11_assign_before" "$(col "$c11" handoff_delivered_at)"
-eq "C9v ...so the grading seat still holds standing for the merge" \
+eq "C9w ...so the grading seat still holds standing for the merge" \
    "1" "$(_stands_on "$c11" main2)"
 db "UPDATE tasks SET assignee='dev' WHERE id=${c11};"     # restore, the row is not reused but say so
+
+# C9x: THE IN-POPULATION POSITIVE CONTROL for C9t. The same verb, same row, a
+# seat that is NOT the verifier — the shape DIVE-3097 never refused. If C9t went
+# green because the verb became a no-op rather than because the guard stopped
+# firing, this arm is unchanged and C9t's move is the difference.
+_c11_pc_out=$(assign_run "$_c11ident" ops); _c11_pc_rc=$?
+eq "C9x POSITIVE CONTROL: the same verb to a NON-verifier seat runs too (rc 0, moved)" \
+   "0|ops" "${_c11_pc_rc}|$(col "$c11" assignee)"
+db "UPDATE tasks SET assignee='dev' WHERE id=${c11};"
+
+# C9y: THE NEGATIVE CONTROL THE NARROWING MUST NOT EAT. DIVE-2899's shape is a
+# row that has NEVER been delivered (handoff_delivered_at NULL) being reassigned
+# straight onto its own verifier — that manufactures a maker who is also the
+# grader with no handoff ever recorded, and it must still be refused. Identical
+# to the C9 fixture in every column the guard reads EXCEPT the delivery clock.
+# A mutant that drops the narrowing conjunct reds C9t/C9u/C9w/C9x; a mutant that
+# deletes the guard outright reds this one.
+c11f=$(mkrow "never delivered, being pointed at its own verifier")
+db "UPDATE tasks SET assignee='dev', handoff_delivered_at=NULL WHERE id=${c11f};"
+_c11f_ident=$(db "SELECT ident FROM tasks WHERE id=${c11f};")
+_c11f_out=$(assign_run "$_c11f_ident" quinn); _c11f_rc=$?
+eq "C9y NEGATIVE CONTROL: the never-delivered row is STILL refused onto its own verifier" \
+   "3|dev" "${_c11f_rc}|$(col "$c11f" assignee)"
+if [[ "$_c11f_out" == *"a maker can't grade itself"* ]]; then
+  ok_t "C9z ...by DIVE-3097's own refusal, not by an unrelated failure"
+else
+  bad_t "C9z ...by DIVE-3097's own refusal, not by an unrelated failure" "$_c11f_out"
+fi
 
 # --- C9j: THE IN-POPULATION NEGATIVE CONTROL. A row carrying a LIVE reject is
 # NOT merge-pending — the maker owes a fix and `task done` is exactly the verb
