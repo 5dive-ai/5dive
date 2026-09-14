@@ -403,9 +403,19 @@ run _plugin_mkt_upgrade fixture
 run cmd_plugin_add setupy@fixture --yes
 t  "T9a a plugin declaring a setup step installs"            "0" "$RC"
 tc "T9b ...and its hint is shown to the user"                "needs a host engine" "$OUT$ERR"
-tc "T9b2 ...along with the command, marked as theirs to run" "5dive does not run this for you" "$OUT$ERR"
+tc "T9b2 ...along with the command, marked as not-run-on-its-own" "5dive does not run this on its own" "$OUT$ERR"
+tc "T9b3 ...and the no-terminal route to the same step is named"  "5dive plugin setup setupy@fixture" "$OUT$ERR"
 t  "T9c ...and the command was PRINTED, NOT EXECUTED (the whole design in one arm)" "no" \
    "$([[ -e "$SENTINEL" ]] && echo yes || echo no)"
+# DIVE-4467: the DECLARATION is recorded at install, with no run on it. This is
+# what lets a page that has never seen the manifest know a box step is owed —
+# without it the dashboard cannot tell "no setup needed" from "setup not done".
+t "T9c2 ...but the declaration is recorded, so a page can know a step is owed" "touch $SENTINEL" \
+  "$(jq -r '."setupy@fixture".setup.command' "$STATE_DIR/plugins/installed.json")"
+t "T9c3 ...carrying no run receipt yet"                                        "null" \
+  "$(jq -r '."setupy@fixture".setup.ran_at // "null"' "$STATE_DIR/plugins/installed.json")"
+t "T9c4 ...and a plugin with no setup block records none (absence is a signal)" "null" \
+  "$(jq -r '."good@fixture".setup // "null"' "$STATE_DIR/plugins/installed.json")"
 
 # The bundled voice plugin is the live instance of that, so grade the real file
 # rather than only the fixture: if someone later drops the setup block from
@@ -419,6 +429,95 @@ else
   t "T9e voice asks for audio, which is what makes its consent screen honest" "true" \
     "$(jq -r '[.fivedive.grants[]] | index("audio-io") != null' "$VOICE")"
 fi
+
+# =============================================================================
+# T9f-T9n — `plugin setup`: the SAME command, run because the user asked
+# (DIVE-4467)
+# =============================================================================
+# The pair T9c/T9g is the whole design, and neither arm means anything alone.
+# T9c is the negative control (install must NOT execute the manifest's command);
+# T9g is its positive control (the verb MUST execute exactly that command, or
+# the dashboard button is decoration). The sentinel from T9c is reused on
+# purpose: the file that must not exist after `add` is the file that must exist
+# after `setup`, so the two arms cannot both pass on a broken read of the
+# manifest.
+
+# Consent first. Without --yes and with stdin not a terminal the verb must
+# REFUSE, and — the half that matters — must not have run anything.
+run cmd_plugin_setup setupy@fixture
+t  "T9f no --yes and no terminal is refused, not assumed"      "10" "$RC"
+t  "T9f2 ...and nothing ran (the sentinel is still absent)"    "no" \
+   "$([[ -e "$SENTINEL" ]] && echo yes || echo no)"
+tc "T9f3 ...and the refusal names the flag that would consent" "--yes" "$OUT$ERR"
+
+# The consent text is the publisher's, shown again at the moment of running —
+# a dashboard click changes the input device, not the disclosure.
+run cmd_plugin_setup setupy@fixture --yes
+t  "T9g the verb RUNS the manifest's command (positive control for T9c)" "yes" \
+   "$([[ -e "$SENTINEL" ]] && echo yes || echo no)"
+t  "T9g2 ...and reports success"                                "0" "$RC"
+tc "T9g3 ...after showing the publisher's hint again"           "needs a host engine" "$OUT$ERR"
+tc "T9g4 ...and the exact command it is about to run"           "touch $SENTINEL" "$OUT$ERR"
+
+# The run is RECORDED, which is what lets the dashboard stop offering a button
+# for work already done.
+INST="$STATE_DIR/plugins/installed.json"
+t "T9h the run is recorded on the installed entry"       "true" \
+  "$(jq -r '."setupy@fixture".setup.ok' "$INST")"
+t "T9h2 ...with the command that actually ran"           "touch $SENTINEL" \
+  "$(jq -r '."setupy@fixture".setup.command' "$INST")"
+t "T9h1b ...merged onto the declaration, not replacing it" "needs a host engine" \
+  "$(jq -r '."setupy@fixture".setup.hint' "$INST")"
+t "T9h3 ...and its exit code"                            "0" \
+  "$(jq -r '."setupy@fixture".setup.rc' "$INST")"
+
+# A plugin with no setup block has nothing to run, and saying so is not the same
+# as running nothing quietly.
+mkplugin nosetup "$(manifest nosetup 1.0.0 official '["channel"]')"
+mkindex
+run _plugin_mkt_upgrade fixture
+run cmd_plugin_add nosetup@fixture --yes
+t  "T9i0 (precondition) the no-setup fixture installed"   "0" "$RC"
+run cmd_plugin_setup nosetup@fixture --yes
+t  "T9i a plugin with no setup block is refused"          "4" "$RC"
+tc "T9i2 ...naming what is missing"                       "fivedive.setup.command" "$OUT$ERR"
+
+run cmd_plugin_setup nosuchplugin --yes
+t  "T9j an uninstalled plugin is refused"                 "4" "$RC"
+
+# THE ALLOWLIST ARM. The verb takes a plugin REFERENCE and nothing else; there is
+# no shape in which a caller hands it a command. A second word is a usage error,
+# not a second command — this is what lets the API route forward a validated key
+# and never a string.
+run cmd_plugin_setup setupy@fixture "touch $TMP/SMUGGLED" --yes
+t  "T9k a second argument is refused, never treated as a command" "2" "$RC"
+t  "T9k2 ...and nothing was smuggled through it"          "no" \
+   "$([[ -e "$TMP/SMUGGLED" ]] && echo yes || echo no)"
+run cmd_plugin_setup --command="touch $TMP/SMUGGLED2" --yes
+t  "T9k3 an invented flag is refused rather than parsed" "2" "$RC"
+t  "T9k4 ...and nothing was smuggled through it"          "no" \
+   "$([[ -e "$TMP/SMUGGLED2" ]] && echo yes || echo no)"
+
+# A failing setup is a recorded failure, not a silent one: the entry keeps rc so
+# the page can show it, and the verb exits non-zero so a script can see it.
+mkplugin setupbad "$(manifest setupbad 1.0.0 official '["channel"]' '[]' \
+  "$(jq -cn '{setup:{hint:"will not work", command:"exit 7"}}')")"
+mkindex
+run _plugin_mkt_upgrade fixture
+run cmd_plugin_add setupbad@fixture --yes
+run cmd_plugin_setup setupbad@fixture --yes
+t  "T9m a failing setup command fails the verb"           "1" "$RC"
+tc "T9m2 ...naming the exit code it saw"                  "exited 7" "$OUT$ERR"
+t  "T9m3 ...and the failure is recorded, not swallowed"   "7" \
+  "$(jq -r '."setupbad@fixture".setup.rc' "$INST")"
+t  "T9m4 ...as not-ok, so the page re-offers the button"  "false" \
+  "$(jq -r '."setupbad@fixture".setup.ok' "$INST")"
+
+# `plugin setup` is reachable through the real dispatcher, not only as a function
+# this harness calls directly.
+run cmd_plugin setup
+t  "T9n 'plugin setup' is a dispatched subverb, not an unknown one" "2" "$RC"
+tc "T9n2 ...and its usage is the plugin-reference shape" "5dive plugin setup <plugin>" "$OUT$ERR"
 
 # =============================================================================
 # T10 — RETIRED by DIVE-4202: install.sh stages no plugins

@@ -189,6 +189,7 @@ _plugin_usage() {
   5dive plugin upgrade <plugin>[@<marketplace>]
   5dive plugin enable|disable <plugin>[@<marketplace>]    # a flag flip; the code stays on disk
   5dive plugin rollback <plugin>[@<marketplace>] [<version>]
+  5dive plugin setup <plugin>[@<marketplace>] [--yes]     # run the publisher's one-time host setup
 
   5dive plugin marketplace add <source> [--as=<name>]
   5dive plugin marketplace list [--json]
@@ -1082,9 +1083,11 @@ cmd_plugin_add() {
      --argjson caps "$(jq -c '(.fivedive.capabilities // [])' <<<"$j")" \
      --argjson grants "$(jq -c '(.fivedive.grants // [])' <<<"$j")" \
      --argjson verbs "$(jq -c '(.fivedive.verbs // [])' <<<"$j")" \
+     --argjson setup "$(jq -c '(.fivedive.setup // null)' <<<"$j")" \
      '.[$k] = {plugin:$p, marketplace:$m, version:$v, enabled:true, review:$r,
                publisher:$pub, capabilities:$caps, grants:$grants, verbs:$verbs,
-               installed_at:$t}' \
+               installed_at:$t}
+      | (if $setup == null then . else .[$k].setup = $setup end)' \
      "$(_plugin_installed_json)" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
 
   if [[ -z "$caps" ]]; then
@@ -1122,7 +1125,11 @@ cmd_plugin_add() {
     echo >&2
     [[ -n "$setup_hint" ]] && echo "  $setup_hint" >&2
     [[ -n "$setup_cmd"  ]] && echo "  Run it yourself when you are ready:  $setup_cmd" >&2
-    echo "  (5dive does not run this for you — read it first; it is the publisher's text.)" >&2
+    # DIVE-4467: the same step, initiated by the user, without a terminal. The
+    # command still comes from the manifest and is still shown first — what
+    # changes is that a dashboard user can now reach it at all.
+    [[ -n "$setup_cmd"  ]] && echo "  Or have 5dive run exactly that line for you:  sudo 5dive plugin setup $key" >&2
+    echo "  (5dive does not run this on its own — read it first; it is the publisher's text.)" >&2
   fi
   ok "$key $version installed${caps:+ — registers: $caps}" \
      '{plugin:$p, marketplace:$m, version:$v, review:$r, capabilities:$c, changed:true}' \
@@ -1501,6 +1508,113 @@ _plugin_dispatch_verb() {
   exec "$entry" "$@"
 }
 
+
+# ---- `plugin setup`: the box-level half, run on purpose (DIVE-4467) --------
+#
+# `plugin add` PRINTS `fivedive.setup.command` and deliberately does not run it
+# (the long note above cmd_plugin_add's setup block says why, and it still
+# stands: a string from a manifest must never execute because the publisher
+# said so, at install, before the user has seen what they installed).
+#
+# That left a dead end for the half of our users who never open a terminal.
+# lodar, 2026-09-13, reading the browser plugin's consent on /dashboard/plugins:
+# "thats difficult for users on dashboard who dont go to terminal ever". The box
+# half — Chrome plus a root-created profile store; ffmpeg plus a whisper venv —
+# never got installed, so the plugin read "installed" and its verb reported
+# MISSING forever.
+#
+# The distinction that makes this safe is the same one `_plugin_dispatch_verb`
+# leans on: a verb runs because the USER TYPED IT, after consent, on a path we
+# chose. Here the user presses a button that is this verb, and:
+#
+#   · the command is read from the INSTALLED manifest on this box, never from
+#     the caller. THIS VERB IS THE ALLOWLIST — no free-form command string
+#     crosses the box boundary, so the dashboard route (api lib/plugins-verbs.ts)
+#     can pass only a plugin key it already validates for the other four verbs.
+#   · the publisher's own hint and command are printed before it runs, the same
+#     text `plugin add` showed. One click instead of a terminal is a change of
+#     INPUT DEVICE, not a removal of consent.
+#   · it refuses a plugin that is not installed, and one whose manifest has no
+#     setup block. Nothing is inferred.
+#
+# The run is recorded on the installed.json entry (command, when, who, rc) so
+# the dashboard can stop offering a button for work already done, and so a
+# failed run is visible rather than silently retried forever.
+cmd_plugin_setup() {
+  local ref="" assume_yes=0 a
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y) assume_yes=1 ;;
+      -*)       fail "$E_USAGE" "unknown flag '$a' (usage: 5dive plugin setup <plugin>[@<marketplace>] [--yes])" ;;
+      *)        [[ -z "$ref" ]] && ref="$a" || fail "$E_USAGE" "one plugin at a time" ;;
+    esac
+  done
+  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive plugin setup <plugin>[@<marketplace>] [--yes]"
+
+  _plugin_ensure_store
+  local j; j=$(cat "$(_plugin_installed_json)")
+  local key; _plugin_resolve_installed_key "$ref" "$j"; key="$_PL_KEY"
+
+  # The manifest is read through the ENABLED pointer, which is the version that
+  # is actually live on this box — not the marketplace source, which may already
+  # be a version ahead of what is installed. Setting up code you are not running
+  # is the failure this verb exists to remove, not one to introduce.
+  local dir="$(_plugin_enabled_dir)/$key"
+  [[ -d "$dir" ]] \
+    || fail "$E_NOT_FOUND" "'$key' is installed but disabled (no enabled version on disk) — enable it first: 5dive plugin enable $key"
+  local mf; mf=$(_plugin_manifest_path "$dir") \
+    || fail "$E_VALIDATION" "'$key' has no plugin.json on this box — reinstall it: 5dive plugin upgrade $key"
+  local mj; mj=$(jq -c . "$mf" 2>/dev/null) \
+    || fail "$E_VALIDATION" "'$key' has an unparseable plugin.json on this box"
+
+  local setup_hint setup_cmd
+  setup_hint=$(jq -r '.fivedive.setup.hint // ""' <<<"$mj")
+  setup_cmd=$(jq -r '.fivedive.setup.command // ""' <<<"$mj")
+  [[ -n "$setup_cmd" ]] \
+    || fail "$E_NOT_FOUND" "'$key' declares no host setup step (its manifest has no fivedive.setup.command) — there is nothing to run"
+
+  local plugin review
+  plugin=$(jq -r --arg k "$key" '.[$k].plugin' <<<"$j")
+  review=$(jq -r --arg k "$key" '.[$k].review // "unreviewed"' <<<"$j")
+
+  echo "  One-time host setup for $key, as published by $plugin:" >&2
+  [[ -n "$setup_hint" ]] && echo "    $setup_hint" >&2
+  echo "    it runs, as root:  $setup_cmd" >&2
+  echo "    review tier:       $review" >&2
+  echo "  (this is the publisher's own text and the publisher's own command — 5dive runs" >&2
+  echo "   exactly the line above and nothing else.)" >&2
+  echo >&2
+
+  if (( ! assume_yes )); then
+    [[ -t 0 ]] \
+      || fail "$E_PERMISSION" "plugin setup needs your confirmation and stdin is not a terminal — re-run with --yes if you have read the above"
+    local reply
+    read -r -p "  Run it now? [y/N] " reply
+    [[ "$reply" == [yY] || "$reply" == [yY][eE][sS] ]] \
+      || fail "$E_GENERIC" "cancelled — nothing was run"
+  fi
+
+  local started rc=0
+  started=$(date -u +%FT%TZ)
+  # `bash -c` because `setup.command` is a COMMAND LINE, not an argv — it is the
+  # same string a human was told to paste. `|| rc=$?` (never a bare call) so a
+  # non-zero exit is RECORDED and reported instead of killing the verb under
+  # header.sh's errexit with nothing written down.
+  bash -c "$setup_cmd" >&2 || rc=$?
+
+  local tmp; tmp=$(mktemp)
+  jq --arg k "$key" --arg c "$setup_cmd" --arg t "$(date -u +%FT%TZ)" \
+     --arg s "$started" --arg by "${SUDO_USER:-${USER:-root}}" --argjson rc "$rc" \
+     '.[$k].setup = ((.[$k].setup // {})
+                     + {command:$c, started_at:$s, ran_at:$t, by:$by, rc:$rc, ok:($rc==0)})' \
+     "$(_plugin_installed_json)" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
+
+  (( rc == 0 )) \
+    || fail "$E_GENERIC" "$key setup exited $rc — the command above is the publisher's; read its output, fix what it named, then run 'sudo 5dive plugin setup $key --yes' again"
+  ok "$key host setup done" \
+     '{plugin:$k, command:$c, rc:0, changed:true}' --arg k "$key" --arg c "$setup_cmd"
+}
+
 cmd_plugin() {
   local sub="${1:-list}"; [[ $# -gt 0 ]] && shift
   case "$sub" in
@@ -1513,6 +1627,7 @@ cmd_plugin() {
     enable)          cmd_plugin_enable "$@" ;;
     disable)         cmd_plugin_disable "$@" ;;
     rollback)        cmd_plugin_rollback "$@" ;;
+    setup)           cmd_plugin_setup "$@" ;;
     *) fail "$E_USAGE" "unknown: 5dive plugin $sub (see: 5dive plugin --help)" ;;
   esac
 }
