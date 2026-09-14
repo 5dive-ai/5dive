@@ -17,8 +17,17 @@
 # It sources `grader_pool.sh` ALONE, which was exactly right while the shipped
 # mode was `session`: the tick reached none of `grader_process.sh` and a
 # standalone source graded the shape the bundle actually ran. DIVE-4521 flips the
-# default to `process`, so an unpinned source here would make every arm below
-# call into a file that is not loaded — 33 of them did, on the first run.
+# default to `process` and unpinned this suite reds 33 of its 90 arms.
+#
+# TWO CAUSES, AND THE UNLOADED FILE IS THE SMALLER ONE. Measured at this head,
+# unpinned: 57/33 with `grader_process.sh` unsourced, 63/27 with it sourced. So at
+# most 6 of the 33 are "a function that is not defined"; the other 27 red for the
+# SEMANTIC reason, which no amount of sourcing fixes — `_grader_load_source`
+# dispatches on the mode, and the two readers do not read the same thing. Session
+# counts in-flight from `task.grade.spawned` LEDGER rows; process counts LIVE
+# CLONE SEATS. Every fixture here models a busy lane in the ledger vocabulary and
+# creates no clone, so under the new default the lane reads EMPTY
+# (`mode=process clones=0` on the tick line) and the load-shaped arms go with it.
 #
 # The pin is `_GRADER_SPAWN_MODE=session` at each of the four source sites, and
 # it is a SCOPE statement, not a workaround: the locks, the cap arithmetic, the

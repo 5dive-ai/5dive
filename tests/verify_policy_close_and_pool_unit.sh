@@ -26,17 +26,33 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   source "$SRC/$f"
 done
 source "$SRC/task/grader_pool.sh"
-# DIVE-4521: PINNED TO THE SESSION SHAPE, and it has to be said here because the
-# line above is why. This suite sources `grader_pool.sh` WITHOUT
-# `grader_process.sh`, which was exact while the shipped mode was `session` (the
-# tick reached none of that file). The flip makes `process` the default, so an
-# unpinned source would have the 4322 cap arms below calling `_grader_load_source`
-# into a file that is not loaded. The cap and in-flight SQL those arms grade are
-# mode-independent; the process/clone shape is graded by
-# `tests/grader_process_unit.sh`, which sources both files in bundle order.
-# The default MODE is deliberately not asserted here — asserting it in a file
-# that cannot load the machinery it selects is how a flip reads green while the
-# lane is broken.
+# DIVE-4521: PINNED TO THE SESSION SHAPE, and the reason is SEMANTIC, not a
+# missing source file. (Iteration 1 of DIVE-4521 said the arms redded because this
+# suite sources `grader_pool.sh` without `grader_process.sh`, so the 4322 cap arms
+# called `_grader_load_source` into a file that is not loaded. That account is
+# DISPROVED — main2 disproved it while grading, and it reproduces: source
+# `grader_process.sh` too, so `_grader_process_seat_loads` IS defined, remove this
+# pin, and the SAME three arms red with identical json,
+# `spawned=1 queued=0 clones=1 mode=process`, 18/3.)
+#
+# The real mechanism: `_grader_load_source` (grader_pool.sh) dispatches on the mode
+# and the two readers do not read the same thing. In `session` it is
+# `_grader_seat_loads`, which counts in-flight from `task.grade.spawned` LEDGER
+# rows. In `process` it is `_grader_process_seat_loads`, which counts LIVE CLONE
+# SEATS. The 4322 arms below seed two ledger occupiers and create no clone, so
+# under the new default the lane correctly reads EMPTY and the cap does not bite.
+# The fixture models in-flight in the session vocabulary; pinning keeps it honest
+# instead of rewriting it.
+#
+# Nothing is left ungraded by the pin: the cap in PROCESS mode is covered in
+# `tests/grader_process_unit.sh` (cap=4 -> 3 spawned/0 queued; cap=2 -> 2 spawned/
+# 1 queued; the ledger-vs-clone contrast at its lines 284-306), which sources both
+# files in bundle order.
+#
+# The default MODE is deliberately not asserted here — asserting it in a file that
+# cannot load the machinery it selects is how a flip reads green while the lane is
+# broken.
+# community/wiki/two-reasons-a-harness-reds-on-a-default-flip-and-only-one-is-a-missing-source-file.md
 # community/wiki/flipping-a-dark-ship-default-inverts-the-lock-arm-it-does-not-delete-it.md
 _GRADER_SPAWN_MODE=session
 
