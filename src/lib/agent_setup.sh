@@ -372,22 +372,55 @@ preseed_antigravity_agent() {
   preseed_default_skills_for_type "$name" antigravity
 }
 
-# DIVE-1535: seed the a2a return-channel convention into a new codex agent's
-# standing instructions (~/.codex/AGENTS.md — codex's global personal guidance).
+# DIVE-3966: the managed operating baseline for every codex agent. The markers
+# are the ownership boundary: 5dive may replace this block on an upgrade, but
+# every byte outside it belongs to the user and must survive untouched.
+CODEX_BASELINE_MARKER="5dive:codex-operating-baseline"
+
+# Seed the a2a return-channel convention and the maintained operating baseline
+# into a codex agent's standing instructions (~/.codex/AGENTS.md — codex's
+# global personal guidance).
 # A headless codex worker prints its output only to its own tmux pane; `agent
 # send` is one-way and `agent ask` can't reliably capture a codex TUI (DIVE-1410),
 # so codex agents must PUSH results back to whoever briefed them. DIVE-1410 proved
 # this convention end-to-end but only ever wrote it into andy's file by hand — so
 # every OTHER codex worker booted with no return channel. This makes it the
-# default. Idempotent + non-destructive: if an AGENTS.md already exists (a curated
-# andy-style file), we leave it untouched so a human edit is never clobbered.
+# default. Idempotent + non-destructive: an existing AGENTS.md keeps all content
+# outside the managed markers, while an older managed block is upgraded in place.
 # Pure: emit the standing-instructions AGENTS.md body for a codex agent to stdout.
 # Kept separate from the filesystem/ownership plumbing so the content (and the
 # agent-name interpolation) is unit-testable without touching sudo or a real user.
-_codex_return_channel_doc() {
+_codex_operating_baseline_doc() {
   local name="$1"
   cat <<AGENTS_MD
-# ${name} — standing instructions
+<!-- ${CODEX_BASELINE_MARKER}:begin v1 -->
+# 5dive managed operating baseline
+
+This block is maintained by 5dive. Put personal instructions outside its markers.
+
+## Channels and operational communication
+
+- Lead with the result. Keep routine progress concise and do not leave a user
+  waiting silently during long work.
+- On a Telegram-paired seat, use the \`notify-user\` skill for progress,
+  completion, and choices. Do not open a TUI-only picker the Telegram user
+  cannot see.
+- Use the \`5dive-cli\` skill for task-board and inter-agent coordination.
+- Use the \`compile-knowledge\` skill when work produces a durable decision,
+  cause, or gap analysis; routine task facts are consolidated automatically.
+
+## Model tiering
+
+Keep planning, judgment, verification, and user communication in the main
+thread. When delegation is explicitly authorized, use a fast lower-cost model
+for bounded mechanical work, a general coding model for routine implementation,
+and the strongest reasoning model only for genuinely judgment-heavy work.
+
+## Resuming work
+
+After a restart or compaction, inspect the active task and its latest receipts,
+then continue from the existing worktree and evidence. Do not restart completed
+work or repeat a delivery merely to make a verifier-owned row close.
 
 ## Reporting results back to whoever asked (a2a return channel)
 
@@ -415,23 +448,83 @@ does not return a reply) and \`5dive agent ask\` cannot reliably capture a codex
 TUI's output, so codex agents PUSH their results back rather than being polled.
 This makes the return channel automatic and independent of what any single brief
 happens to remember to append.
+<!-- ${CODEX_BASELINE_MARKER}:end -->
 AGENTS_MD
+}
+
+# Backward-compatible pure renderer name used by the original DIVE-1535 unit.
+_codex_return_channel_doc() { _codex_operating_baseline_doc "$@"; }
+
+# Reconcile the current block into one ordinary file. The caller owns directory
+# creation and final ownership/mode so this pure file operation is unit-testable.
+_codex_sync_operating_baseline_file() { # <file> <agent-name>
+  local file="$1" name="$2" block out bf begins ends begin_line end_line
+  block="$(_codex_operating_baseline_doc "$name")" || return 1
+  [[ -n "$block" ]] || return 1
+  # Never follow a user-controlled link with root's write authority.
+  [[ ! -L "$file" ]] || return 1
+  out="$(mktemp "$(dirname "$file")/.AGENTS.md.XXXXXX")" || return 1
+  if [[ ! -f "$file" ]]; then
+    printf '%s\n' "$block" >"$out" || { rm -f "$out"; return 1; }
+    mv -f "$out" "$file"
+    return $?
+  fi
+  if grep -qF "<!-- ${CODEX_BASELINE_MARKER}:begin" "$file"; then
+    begins=$(grep -cF "<!-- ${CODEX_BASELINE_MARKER}:begin" "$file" || true)
+    ends=$(grep -cF "<!-- ${CODEX_BASELINE_MARKER}:end -->" "$file" || true)
+    [[ "$begins" == 1 && "$ends" == 1 ]] || { rm -f "$out"; return 1; }
+    begin_line=$(grep -nF "<!-- ${CODEX_BASELINE_MARKER}:begin" "$file" | cut -d: -f1)
+    end_line=$(grep -nF "<!-- ${CODEX_BASELINE_MARKER}:end -->" "$file" | cut -d: -f1)
+    (( begin_line < end_line )) || { rm -f "$out"; return 1; }
+    bf="$(mktemp)" || { rm -f "$out"; return 1; }
+    printf '%s\n' "$block" >"$bf"
+    awk -v id="$CODEX_BASELINE_MARKER" -v bf="$bf" '
+      BEGIN { while ((getline l < bf) > 0) replacement = replacement l "\n" }
+      index($0, "<!-- " id ":begin") { printf "%s", replacement; skip = 1; next }
+      skip { if (index($0, "<!-- " id ":end")) skip = 0; next }
+      { print }
+    ' "$file" >"$out" || { rm -f "$out" "$bf"; return 1; }
+    rm -f "$bf"
+  else
+    { cat "$file"; [[ ! -s "$file" ]] || printf '\n'; printf '%s\n' "$block"; } >"$out"
+  fi
+  if ! cmp -s "$out" "$file"; then
+    mv -f "$out" "$file" || { rm -f "$out"; return 1; }
+  else
+    rm -f "$out"
+  fi
 }
 
 preseed_codex_return_channel() {
   local name="$1"
-  local user="agent-${name}" home="/home/agent-${name}"
+  local user="agent-${name}" root="${CODEX_AGENT_HOME_ROOT:-/home}"
+  local home="${root}/agent-${name}"
   [[ -d "$home" ]] || return 0
   id -u "$user" &>/dev/null || return 0
   local dir="$home/.codex" file="$home/.codex/AGENTS.md"
-  # Don't overwrite an existing standing-instructions file (a curated andy-style
-  # AGENTS.md must survive) — DIVE-1535 seeds a default, it never clobbers.
-  if sudo -u "$user" test -e "$file"; then
-    return 0
-  fi
   install -d -m 700 -o "$user" -g "$user" "$dir" 2>/dev/null || return 0
-  install -m 600 -o "$user" -g "$user" /dev/null "$file" 2>/dev/null || return 0
-  _codex_return_channel_doc "$name" | sudo -u "$user" tee "$file" >/dev/null
+  _codex_sync_operating_baseline_file "$file" "$name" || return 1
+  chown "$user:$user" "$file" 2>/dev/null || return 1
+  chmod 600 "$file" 2>/dev/null || return 1
+}
+
+# Hidden installer migration: creation calls the function above for one new
+# agent; every upgrade calls this fleet pass after swapping in the new bundle.
+cmd_agent_sync_codex_baseline() {
+  require_root "agent _sync_codex_baseline"
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _sync_codex_baseline takes no arguments"
+  local reg name synced=0 failed=0
+  reg=$(registry_read)
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if preseed_codex_return_channel "$name"; then
+      synced=$((synced + 1))
+    else
+      failed=$((failed + 1))
+    fi
+  done < <(jq -r '(.agents // {}) | to_entries[] | select(.value.type == "codex") | .key' <<<"$reg")
+  (( failed == 0 )) || return 1
+  ok "codex operating baseline reconciled: synced=${synced}, failed=${failed}"
 }
 
 # ---------------------------------------------------------------------------

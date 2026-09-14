@@ -2731,13 +2731,11 @@ cmd_create() {
     opencode_apply_model_default "$name" "$byo_provider" "$byo_model" "$byo_api_key"
   fi
 
-  # DIVE-1535: give every new codex agent a return channel by default. A headless
-  # codex worker (channels=none) prints its deliverable only to its own pane and
-  # can't be polled, so seed the DIVE-1410 push-back convention into its standing
-  # instructions. Non-destructive (skips an existing curated AGENTS.md) so it's
-  # safe to run unconditionally for the type, independent of channel selection.
+  # DIVE-3966: give every new codex agent the managed operating baseline,
+  # including the DIVE-1410 return channel. Marker-delimited reconciliation
+  # preserves user-authored instructions and is safe to run repeatedly.
   if [[ "$type" == "codex" ]]; then
-    step "Seeding a2a return-channel convention for agent-${name} (DIVE-1535)"
+    step "Reconciling Codex operating baseline for agent-${name} (DIVE-3966)"
     preseed_codex_return_channel "$name" || true
   fi
 
