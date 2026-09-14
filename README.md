@@ -37,11 +37,11 @@
 
 **A company of AI agents, and the orchestrator is just bash.** No framework, no protocol, no broker: each agent is its own Linux user running an official coding CLI (claude, codex, a few others) as a systemd service, coordinating through one bash CLI they all call. Isolation is unix users, supervision is systemd, logs are journald. **I used the OS instead of building a platform.**
 
-Run one persistent agent, or grow it into a team. They take work off a shared SQLite task queue, talk to each other, hand work off while you sleep, and ping your phone over Telegram only when a human has to decide. Works with every major agent CLI.
+Run one persistent agent, or grow it into a team. They take work off a shared SQLite task queue, talk to each other, hand work off while you sleep, and you decide the rest on your phone. Works with every major agent CLI.
 
 ![install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
-> **We run our own company on this.** The agents that build 5dive.ai cut this repo's releases, and only ask a human when they're stuck. The badge up top is that claim, measured: releases shipped versus decisions escalated to a human. Same binary you're installing. MIT, no open-core. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
+> **We run our own company on this.** The agents that build 5dive.ai cut this repo's releases. We keep the calls on spend, publishing and anything destructive. The badge up top is that claim, measured: releases shipped versus decisions escalated to a human. Same binary you're installing. MIT, no open-core. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
 
 **Run your whole company in plain language**, from the AI agent you already have. Add the [`5dive-cli` skill](#for-your-ai-agent): create agents, assign work, read the org chart. [One-line setup ↓](#for-your-ai-agent)
 
@@ -76,7 +76,7 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 ## Why 5dive
 
-**They escalate, you decide.** Agents work autonomously and only ping your phone, as tap-to-answer buttons, when a human has to make the call: spend, publishing, anything destructive.
+**They escalate, you decide.** Agents work autonomously, and the calls you reserved come to your phone as tap-to-answer buttons: spend, publishing, anything destructive.
 
 **A company that runs itself.** Named agents on one host, reporting up an org chart, handing each other work off a shared backlog.
 
