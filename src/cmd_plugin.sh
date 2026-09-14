@@ -1529,15 +1529,28 @@ _plugin_dispatch_verb() {
 # Only the real uid crosses an arbitrary inner `sudo`, so we drop to the caller
 # and let their sudo re-derive the seat honestly.
 #
-# Pure on purpose: it decides from (caller, euid) and prints argv, so the arms
-# can grade the decision at any uid instead of needing root to observe it.
-# Empty output means "run it exactly as before" — a root caller (no seat to
-# restore) and an unprivileged caller (already the right seat, and `sudo -u`
-# would only prompt them for their own password) both take that path.
+# `runuser`, not `sudo -u`, and the difference bites on exactly the boxes we
+# care about: `sudo -u` asks the sudoers POLICY for permission to become the
+# caller, and this fleet narrows runas on purpose (DIVE-3263) — so a drop that a
+# policy can deny is a drop that stops working first on the hardened boxes.
+# `runuser` is root-only by construction and consults no policy, so where we are
+# already root it cannot be refused. Both set the real uid, which is the whole
+# requirement. `sudo -u` stays as the fallback for a box with no util-linux.
+#
+# Pure on purpose apart from that one probe: it decides from (caller, euid) and
+# prints argv, so the arms can grade the decision at any uid instead of needing
+# root to observe it. Empty output means "run it exactly as before" — a root
+# caller (no seat to restore) and an unprivileged caller (already the right seat,
+# and dropping would only re-ask them for their own password) both take that
+# path.
 _plugin_setup_runner() {
   local caller="$1" euid="$2"
   [[ "$euid" == "0" && -n "$caller" && "$caller" != "root" ]] || return 0
-  printf '%s\n' sudo -u "$caller" --
+  if command -v runuser >/dev/null 2>&1; then
+    printf '%s\n' runuser -u "$caller" --
+  else
+    printf '%s\n' sudo -u "$caller" --
+  fi
 }
 
 # ---- `plugin setup`: the box-level half, run on purpose (DIVE-4467) --------
