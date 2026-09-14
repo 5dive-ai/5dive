@@ -669,5 +669,149 @@ else
 fi
 eq_t "the full landed store re-exports as knowledge only (2 of $atoms atoms)" "${seedcounts%% *}" "2"
 
+# ============ 12. DIVE-4545: THE LAST-RESORT RUNG IS WEIGHED, NOT ESTIMATED ==
+# The defect this section exists for: the sampled rung ESTIMATED its output
+# (`shown * 80`) while the two rungs above it measured theirs, and the estimate
+# breached the always-loaded budget from ~120 atoms up — 16,811 B at 120,
+# 26,692 B at 400 (1.67x). Nothing reded, because the suite graded WHICH form
+# was chosen and WHAT IT SAID; nothing weighed the artefact.
+#
+# The fixture slugs are the length the REAL store's are (~135 B per slim line,
+# measured off agent-dev's own memory dir). That is the whole discriminator:
+# the pre-existing 400-atom arm used ~73 B lines, under the hardcoded 80, so
+# the estimate happened to hold and the arm was green over the defect.
+_mk_atoms() {   # _mk_atoms <dir> <n>
+  local d="$1" n="$2" i=0 slug
+  rm -rf "$d"; mkdir -p "$d"
+  while (( i < n )); do
+    i=$((i+1))
+    slug=$(printf 'atom-%03d-a-slug-of-the-length-the-real-store-carries-in-practice' "$i")
+    printf -- '---\nname: %s\ndescription: %s\nmetadata:\n  type: reference\n---\n\nbody\n' \
+      "$slug" "a description of roughly the length the converter emits for a real codex task group section, which is what makes the full form overflow" \
+      > "$d/$slug.md"
+  done
+}
+
+for n in 80 110 120 140 400; do
+  BUD="$TMP/bud-$n"
+  _mk_atoms "$BUD" "$n"
+  _pack_atoms_index "$BUD" "Memory Index (imported from a codex store)"
+  b=$(wc -c < "$BUD/MEMORY.md")
+  [[ "$b" -le "$_PACK_INDEX_BUDGET" ]] \
+    && ok_t "$n atoms: the written index is inside the always-loaded budget ($b <= $_PACK_INDEX_BUDGET B)" \
+    || bad_t "$n atoms: the written index is inside the always-loaded budget" "$b B > $_PACK_INDEX_BUDGET B"
+  # A file that fits by naming nothing is not a pass. Every rung must still
+  # index atoms, and a cut one must still SAY what it left out.
+  nl=$(grep -c '^- \[' "$BUD/MEMORY.md")
+  [[ "$nl" -ge 1 ]] \
+    && ok_t "$n atoms: the index still names atoms ($nl of $n)" \
+    || bad_t "$n atoms: the index still names atoms" "named none"
+  if (( nl < n )); then
+    grep -q "$(( n - nl )) of $n atoms are not named above" "$BUD/MEMORY.md" \
+      && ok_t "$n atoms: the cut index counts what it did not name ($(( n - nl )))" \
+      || bad_t "$n atoms: the cut index counts what it did not name" "$(grep 'not named above' "$BUD/MEMORY.md" || echo 'no disclosure line')"
+  fi
+done
+
+# The fixture's own line length is asserted, so a later edit cannot quietly
+# shrink the slugs back under the 80-byte constant the broken estimate assumed
+# and re-green the table above by making it vacuous. Read off the 400-atom
+# index, which is the degraded form (the 1-atom case renders full descriptions).
+probe_line_b=$(grep '^- \[' "$TMP/bud-400/MEMORY.md" | head -1 | wc -c)
+[[ "$probe_line_b" -ge 120 ]] \
+  && ok_t "the budget fixtures carry real-length slug lines ($probe_line_b B, like the live store)" \
+  || bad_t "the budget fixtures carry real-length slug lines" "$probe_line_b B — at or under the 80 B the broken estimate assumed, so the table above is vacuous"
+
+# THE NON-MONOTONICITY, which is the half a byte cap alone does not catch: at
+# ~120 atoms the old cap never bound, so the "sample" was the entire list the
+# slim rung had just REJECTED plus a preamble and a footer — the degraded form
+# came out strictly LARGER than the form it degraded from (16,811 B where slim
+# had been 16,3xx). Grade that relation directly: whatever the sampled rung
+# writes must be smaller than the slim form it refused.
+for n in 120 140 400; do
+  # The slim form is deterministic: one `- [slug](file)` line per atom plus the
+  # header and the omission note. Rebuild it the way the rung would and weigh it.
+  slim_txt=""; slim_b=0
+  for f in "$TMP/bud-$n"/*.md; do
+    base=$(basename "$f"); [[ "$base" == "MEMORY.md" ]] && continue
+    slim_txt+="- [${base%.md}]($base)"$'\n'
+  done
+  slim_b=$(printf '%s' "$slim_txt" | wc -c)
+  got_b=$(wc -c < "$TMP/bud-$n/MEMORY.md")
+  [[ "$got_b" -lt "$slim_b" ]] \
+    && ok_t "$n atoms: the degraded index is SMALLER than the slim form it refused ($got_b < $slim_b B)" \
+    || bad_t "$n atoms: the degraded index is SMALLER than the slim form it refused" "wrote $got_b B where slim would have been $slim_b B"
+done
+
+# The budget is in BYTES and this index is full of em dashes. Under a UTF-8
+# locale a character count under-reads a multi-byte description by 2 B each, so
+# a store can measure "inside" and be written over. Fixture: descriptions that
+# are mostly em dashes, sized to land near the budget.
+UTF="$TMP/utf8"; rm -rf "$UTF"; mkdir -p "$UTF"
+i=0
+while (( i < 60 )); do
+  i=$((i+1))
+  printf -- '---\nname: utf-atom-%03d-a-slug-of-the-length-the-real-store-carries\ndescription: %s\nmetadata:\n  type: reference\n---\n\nbody\n' \
+    "$i" "$(printf '—%.0s' $(seq 1 80))" > "$UTF/utf-atom-$(printf '%03d' $i).md"
+done
+_pack_atoms_index "$UTF" "Memory Index (utf-8)"
+u=$(wc -c < "$UTF/MEMORY.md")
+[[ "$u" -le "$_PACK_INDEX_BUDGET" ]] \
+  && ok_t "a multi-byte index is measured in BYTES, like the loader measures it ($u B)" \
+  || bad_t "a multi-byte index is measured in BYTES, like the loader measures it" "$u B > $_PACK_INDEX_BUDGET B — a character count under-read it"
+
+# The NAMED failure at the floor: a budget that cannot hold the header plus one
+# slug must say so and return non-zero, never write a file that will be cut.
+FLOOR="$TMP/floor"; _mk_atoms "$FLOOR" 5
+( _PACK_INDEX_BUDGET=300; _pack_atoms_index "$FLOOR" "Memory Index (floor)" ) >/dev/null 2>"$TMP/floor.err"
+floor_rc=$?
+floor_b=$(wc -c < "$FLOOR/MEMORY.md")
+[[ "$floor_rc" -ne 0 ]] \
+  && ok_t "a budget too small for even one entry FAILS by status, not silently (rc=$floor_rc)" \
+  || bad_t "a budget too small for even one entry FAILS by status, not silently" "rc=0 over a $floor_b B file"
+grep -q 'does not fit the always-loaded budget' "$TMP/floor.err" \
+  && ok_t "that failure is NAMED on stderr" \
+  || bad_t "that failure is NAMED on stderr" "$(cat "$TMP/floor.err")"
+
+# ============ 13. DIVE-4545: the agents-md memory header is ROUTED ===========
+# `--format=agents-md` over a raw codex store renders whole documents, one
+# section per FILE — 45,994 B in one file, measured — under a header claiming
+# "one fact per section" and "distilled". Distilled is the one thing raw mode
+# is not, and the header is the only thing a reader of that file has.
+_amd_stage() {   # _amd_stage <dir> <shape>
+  local d="$1" shape="$2"
+  rm -rf "$d"; mkdir -p "$d/memory"
+  printf '{"includes":{"memory":"raw","memoryShape":"%s"}}\n' "$shape" > "$d/manifest.json"
+  printf -- '---\nname: a-fact\ndescription: d\n---\n\nbody\n' > "$d/memory/a-fact.md"
+}
+_amd_stage "$TMP/amd-codex" codex-docs
+_amd_stage "$TMP/amd-atoms" atoms
+codex_hdr=$(_agents_md_render_memory "$TMP/amd-codex")
+atoms_hdr=$(_agents_md_render_memory "$TMP/amd-atoms")
+case "$codex_hdr" in
+  *"one fact per section"*) bad_t "a raw codex store is NOT rendered as 'one fact per section'" \
+                                  "$(printf '%s' "$codex_hdr" | sed -n '3,5p')" ;;
+  *"not one per fact"*)     ok_t  "a raw codex store is NOT rendered as 'one fact per section'" ;;
+  *)                        bad_t "a raw codex store is NOT rendered as 'one fact per section'" \
+                                  "unexpected header: $(printf '%s' "$codex_hdr" | sed -n '3,5p')" ;;
+esac
+case "$codex_hdr" in
+  *Distilled*) bad_t "a raw codex store is not called 'distilled'" "the header still says Distilled" ;;
+  *)           ok_t  "a raw codex store is not called 'distilled'" ;;
+esac
+# The other side of the branch, so the fix cannot be "delete the claim": an
+# atoms store keeps the header it earned.
+case "$atoms_hdr" in
+  *"Distilled persona memory, one fact per section"*) ok_t "an atoms store keeps the distilled header" ;;
+  *) bad_t "an atoms store keeps the distilled header" "$(printf '%s' "$atoms_hdr" | sed -n '3,5p')" ;;
+esac
+# A pack written before memoryShape existed carries atoms — the manifest
+# default, and the shape every writer before DIVE-4541 produced.
+rm -f "$TMP/amd-atoms/manifest.json"
+case "$(_agents_md_render_memory "$TMP/amd-atoms")" in
+  *"Distilled persona memory, one fact per section"*) ok_t "a manifest with no shape field renders as atoms" ;;
+  *) bad_t "a manifest with no shape field renders as atoms" "the default moved" ;;
+esac
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1

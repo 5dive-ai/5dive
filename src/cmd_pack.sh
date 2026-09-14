@@ -1646,6 +1646,26 @@ _pack_codex_to_atoms() {   # _pack_codex_to_atoms <srcdir> <outdir> [all|knowled
 # the file SAYS how many atoms it did not name and how to reach them. An empty
 # search is evidence of absence; a short router is not.
 _PACK_INDEX_BUDGET="${_PACK_INDEX_BUDGET:-16000}"
+# DIVE-4545: BYTE length, not character length. The budget the loader enforces
+# is in bytes, and this file is full of em dashes — under a UTF-8 locale `${#s}`
+# counts one per three bytes, so a character count silently under-reads exactly
+# the text that overflows. Sets a global instead of echoing so the callers below
+# can measure inside a loop without a subshell per line.
+_PACK_BLEN=0
+_pack_blen() {   # _pack_blen <string>  -> $_PACK_BLEN
+  local LC_ALL=C
+  _PACK_BLEN=${#1}
+}
+
+# The sampled rung's footer, rendered in one place because it is both WRITTEN
+# and RESERVED (measured before the count it prints is known) — two renderings
+# that drift is how a budget gets breached by exactly one line.
+printf -v _PACK_INDEX_SLIM_NOTE 'Descriptions are omitted here to stay inside the always-loaded size limit — `5dive memory get <slug>` reads any of them.\n\n'
+_PACK_INDEX_FOOTER=""
+_pack_index_footer() {   # _pack_index_footer <unnamed> <listed> -> $_PACK_INDEX_FOOTER
+  printf -v _PACK_INDEX_FOOTER '\n_%s of %s atoms are not named above. They are on disk in this directory and reachable with `5dive memory search --index "<topic>"`._\n' "$1" "$2"
+}
+
 _pack_atoms_index() {   # _pack_atoms_index <dir> [<title>]
   local dir="$1" title="${2:-Memory Index}" f nm desc
   local head_txt lines_full lines_slim total listed=0 shown=0 budget="$_PACK_INDEX_BUDGET"
@@ -1661,15 +1681,18 @@ _pack_atoms_index() {   # _pack_atoms_index <dir> [<title>]
     lines_full+="$(printf -- '- [%s](%s) — %s' "$nm" "$(basename "$f")" "$desc")"$'\n'
     lines_slim+="$(printf -- '- [%s](%s)' "$nm" "$(basename "$f")")"$'\n'
   done
-  total=$(( ${#head_txt} + ${#lines_full} ))
+  _pack_blen "$head_txt$lines_full"; total=$_PACK_BLEN
   if (( total <= budget )); then
     printf '%s%s' "$head_txt" "$lines_full" > "$dir/MEMORY.md"
     return 0
   fi
-  total=$(( ${#head_txt} + ${#lines_slim} ))
+  # The slim rung reserves its own preamble too: it is ~130 B of text that the
+  # comparison used to leave out, so a store landing within 130 B of the budget
+  # chose slim and wrote a file over it.
+  _pack_blen "$head_txt$_PACK_INDEX_SLIM_NOTE$lines_slim"; total=$_PACK_BLEN
   if (( total <= budget )); then
     { printf '%s' "$head_txt"
-      printf 'Descriptions are omitted here to stay inside the always-loaded size limit — `5dive memory get <slug>` reads any of them.\n\n'
+      printf '%s' "$_PACK_INDEX_SLIM_NOTE"
       printf '%s' "$lines_slim"
     } > "$dir/MEMORY.md"
     return 0
@@ -1677,16 +1700,75 @@ _pack_atoms_index() {   # _pack_atoms_index <dir> [<title>]
   # Still over: name what fits, then say plainly what is not named. The atoms
   # are all on disk and all searchable; the one unacceptable outcome is a file
   # that looks complete and is not.
-  { printf '%s' "$head_txt"
-    printf 'This store holds %s atoms — too many to name in an always-loaded file. The ones below are a sample; find the rest by searching, never by reading this list.\n\n' "$listed"
-    while IFS= read -r ln; do
-      [[ -z "$ln" ]] && continue
-      (( ${#head_txt} + shown * 80 > budget - 400 )) && break
-      printf '%s\n' "$ln"
-      shown=$((shown+1))
-    done <<< "$lines_slim"
-    printf '\n_%s of %s atoms are not named above. They are on disk in this directory and reachable with `5dive memory search --index "<topic>"`._\n' "$(( listed - shown ))" "$listed"
-  } > "$dir/MEMORY.md"
+  #
+  # DIVE-4545 — THIS RUNG MEASURES, LIKE THE TWO ABOVE IT. It used to ESTIMATE
+  # (`${#head_txt} + shown * 80 > budget - 400`) and the estimate was wrong in
+  # both directions at once. Real slug lines are ~135 B, not 80, so at 400
+  # atoms the cap bound far too late and the file plateaued at ~26.7 kB — 1.67x
+  # the budget. And below ~190 atoms the cap never bound AT ALL, so the
+  # "sample" was the entire list the slim rung had just rejected plus a
+  # preamble and a footer: strictly LARGER than the form it replaced (16.8 kB
+  # at 120 atoms). Both reinstate the silent tail-cut this writer exists to
+  # prevent, and neither showed up in grading, because the arms graded which
+  # form was chosen and what it said — nothing weighed the artefact.
+  #
+  # So the rung renders its fixed parts, measures them, and admits a line only
+  # while the ACTUAL byte total still fits. Two shrink levers in order: fewer
+  # lines, then shorter lines. If not even one truncated slug fits, it says so
+  # and returns non-zero rather than writing a file that will be cut.
+  local pre_txt foot_txt body_txt ln fixed body_b out_txt
+  printf -v pre_txt 'This store holds %s atoms — too many to name in an always-loaded file. The ones below are a sample; find the rest by searching, never by reading this list.\n\n' "$listed"
+  # The footer's own length depends on the number it prints, so it is reserved
+  # at its WORST case (`listed`, never shorter than `listed - shown`). The
+  # assembled file can then only come in under what was reserved.
+  _pack_index_footer "$listed" "$listed"; foot_txt="$_PACK_INDEX_FOOTER"
+  _pack_blen "$head_txt$pre_txt$foot_txt"; fixed=$_PACK_BLEN
+  body_txt=""; body_b=0
+  while IFS= read -r ln; do
+    [[ -z "$ln" ]] && continue
+    _pack_blen "$ln"
+    if (( fixed + body_b + _PACK_BLEN + 1 > budget )); then
+      # Lever 1: fewer lines.
+      (( shown > 0 )) && break
+      # Lever 2: shorter lines — nothing fits at full width, so the floor is a
+      # truncated slug rather than an index with no entries at all. Dropped one
+      # CHARACTER at a time so a multi-byte slug is never split mid-character.
+      ln="$ln…"
+      while [[ -n "$ln" ]]; do
+        ln="${ln%?}"
+        _pack_blen "$ln"
+        (( fixed + _PACK_BLEN + 1 <= budget )) && break
+      done
+      [[ -n "$ln" ]] || break
+    fi
+    body_txt+="$ln"$'\n'
+    body_b=$(( body_b + _PACK_BLEN + 1 ))
+    shown=$((shown+1))
+  done <<< "$lines_slim"
+  if (( shown == 0 )); then
+    # A NAMED failure. The budget cannot hold the header, the disclosure and a
+    # single slug, so there is no honest sample to write: say that in the file
+    # and on stderr, and let the caller know by exit status.
+    { printf '%s' "$head_txt"
+      printf 'This store holds %s atoms and not one of them can be named inside the always-loaded size limit (%s B). Reach them by searching: `5dive memory search --index "<topic>"`.\n' "$listed" "$budget"
+    } > "$dir/MEMORY.md"
+    warn "memory index for $dir does not fit the always-loaded budget ($budget B) even with one entry — wrote a search-only index naming none of its $listed atom(s)"
+    return 1
+  fi
+  # MEASURE THE ARTEFACT, not the plan for it. The accounting above is exact,
+  # so this loop is expected never to fire — which is precisely why it is here:
+  # it makes "the file fits" a property of the bytes written rather than of the
+  # arithmetic that preceded them, the way the two rungs above already are.
+  while :; do
+    _pack_index_footer "$(( listed - shown ))" "$listed"; foot_txt="$_PACK_INDEX_FOOTER"
+    out_txt="$head_txt$pre_txt$body_txt$foot_txt"
+    _pack_blen "$out_txt"
+    (( _PACK_BLEN <= budget )) && break
+    (( shown > 1 )) || break
+    body_txt="${body_txt%$'\n'}"; body_txt="${body_txt%$'\n'*}"$'\n'
+    shown=$((shown-1))
+  done
+  printf '%s' "$out_txt" > "$dir/MEMORY.md"
 }
 
 # Locate an agent's persona-memory dir. Memory is keyed by project slug
@@ -1968,13 +2050,26 @@ _agents_md_render() {
 # the check that this extraction changed no output — mutation-confirmed: breaking
 # the delegation below reds 3 of its arms.
 _agents_md_render_memory() {
-  local stage="$1"
+  local stage="$1" shape
   [[ -d "$stage/memory" ]] || return 0
   grep -q . < <(find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null) || return 0
+  # DIVE-4545: the header is ROUTED on the shape of the staged bytes, because
+  # it makes a claim about them. Over a raw codex store the sections are three
+  # whole documents (45 kB in one file, measured), not one fact each, and
+  # "distilled" is the opposite of what --memory=raw stages — a reader told the
+  # file is distilled has been told the tripwire scoped it, which is exactly the
+  # thing raw mode warns it did not do.
+  shape=$(_pack_manifest_memory_shape "$stage")
   printf '%s\n' "$AGENTS_MD_S_MEMORY"
   printf '# Memory\n\n'
-  printf 'Distilled persona memory, one fact per section. `5dive agent import`\n'
-  printf 'writes each back to `memory/<file>`; any other harness just reads them.\n\n'
+  if [[ "$shape" == "codex-docs" ]]; then
+    printf 'Persona memory as this agent keeps it: whole codex memory documents,\n'
+    printf 'one section per FILE and not one per fact. `5dive agent import` writes\n'
+    printf 'each back to `memory/<file>`; any other harness just reads them.\n\n'
+  else
+    printf 'Distilled persona memory, one fact per section. `5dive agent import`\n'
+    printf 'writes each back to `memory/<file>`; any other harness just reads them.\n\n'
+  fi
   local f base fence
   while IFS= read -r f; do
     base=$(basename "$f")
