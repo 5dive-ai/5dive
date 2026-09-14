@@ -17,11 +17,14 @@
 # script it was handed, so the CLAUDE_CONFIG_DIR trap (the one that cost ten
 # minutes on the canary) is graded as text rather than assumed.
 #
-# NEGATIVE CONTROLS, three, because a green here must not be reachable by
+# NEGATIVE CONTROLS, five, because a green here must not be reachable by
 # widening anything: M1 cuts the seat-facing test out of the shipping walker and
 # proves the walk stops happening; M2 cuts `unset CLAUDE_CONFIG_DIR` out of the
 # shipping registration and proves the trap arm reds; M3 cuts the walker call out
-# of `cmd_plugin_add` and proves the call-site arm reds.
+# of `cmd_plugin_add` and proves the call-site arm reds; M4 cuts the trailing
+# registration READ — the sole detector of "the install did not take", since
+# every line of the seat heredoc ends in `|| true` — and proves T14 reds; M5 puts
+# back the whole-file AGENTS.md emit and proves T7c sees it accrete.
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -73,7 +76,9 @@ jq -n '{"browser@5dive-plugins":{plugin:"browser",marketplace:"5dive-plugins",ve
         "telegram@5dive-plugins":{plugin:"telegram",marketplace:"5dive-plugins",version:"1.0.0",
           enabled:true,capabilities:["channel"]},
         "off@5dive-plugins":{plugin:"off",marketplace:"5dive-plugins",version:"1.0.0",
-          enabled:false,capabilities:["skill"]}}' \
+          enabled:false,capabilities:["skill"]},
+        "mcponly@5dive-plugins":{plugin:"mcponly",marketplace:"5dive-plugins",version:"1.0.0",
+          enabled:true,capabilities:["mcp"]}}' \
   > "$(_plugin_installed_json)"
 
 # the enabled plugin dir, with the AGENTS.md section browser really ships
@@ -107,6 +112,11 @@ plugin_seat_run_as() {
     case "$var" in PLUGIN=*) plugin="${var#PLUGIN=}" ;; MARKETPLACE=*) mkt="${var#MARKETPLACE=}" ;; esac
   done
   { printf '=== %s %s@%s\n' "$user" "$plugin" "$mkt"; cat; } >> "$SEAT_SCRIPTS"
+  # STUB_MODE=noop: the drop RAN and wrote nothing. That is not a contrived
+  # state — every line of the shipping heredoc ends in `|| true` (the clone, the
+  # PREREG python, the marketplace update/add, the install itself), so a real
+  # `claude plugin install` that fails leaves exactly this. T14 grades it.
+  [[ "$STUB_MODE" == noop ]] && return 0
   local home="$PERSONA_HOME_ROOT/${user}" f
   f="$home/.claude/plugins/installed_plugins.json"
   mkdir -p "$(dirname "$f")"
@@ -189,7 +199,31 @@ tc "T6d ...and carries the publisher's text" "The viewer link belongs to the hum
 # ---------------------------------------------------------------------------
 plugin_seat_doc_install researcher codex browser "$PDIR" >/dev/null 2>&1
 plugin_seat_doc_install researcher codex browser "$PDIR" >/dev/null 2>&1
-t "T7 three installs leave exactly ONE block" "1" "$(grep -c -- '5dive:browser:begin' "$CODEX_MD")"
+t "T7a three installs leave exactly ONE block" "1" "$(grep -c -- '5dive:browser:begin' "$CODEX_MD")"
+
+# T7b-e — ACCRETION, the shape the browser fixture above CANNOT see. browser's
+# real AGENTS.md carries its markers on the first and last line, so "the
+# delimited region" and "the whole file" are the same string and the two cases
+# collapse into one. The moment a publisher adds a heading, a licence footer, or
+# delimits only PART of the file, they stop being the same: doc_install replaces
+# the begin..end region with whatever doc_block returns, so returning the whole
+# file re-inserts every out-of-marker byte INSIDE the markers on every run, and
+# `plugin add` / `plugin upgrade` / the agent-create backfill each add a copy to
+# the file the agent reads every turn. Measured 1/2/3 copies over three installs.
+PDIR2="$TMP/plugins/wrapped"; mkdir -p "$PDIR2"
+{ echo '# Browser plugin — notes for maintainers'
+  echo '<!-- 5dive:browser:begin -->'
+  echo 'The viewer link belongs to the human.'
+  echo '<!-- 5dive:browser:end -->'
+  echo 'Published by 5dive-ai. Licence: MIT.'; } > "$PDIR2/AGENTS.md"
+rm -f "$CODEX_MD"
+for _i in 1 2 3; do plugin_seat_doc_install researcher codex browser "$PDIR2" >/dev/null 2>&1; done
+t "T7b three installs of a PARTIALLY delimited AGENTS.md leave ONE block" "1" "$(nblk "$CODEX_MD")"
+t "T7c ...and the publisher's text ABOVE its markers is not copied in at all" "0" \
+  "$(grep -c 'notes for maintainers' "$CODEX_MD")"
+t "T7d ...nor the footer BELOW them" "0" "$(grep -c 'Licence: MIT' "$CODEX_MD")"
+tc "T7e ...while the delimited text itself did land" "The viewer link belongs to the human." "$(cat "$CODEX_MD")"
+rm -f "$CODEX_MD"; plugin_seat_doc_install researcher codex browser "$PDIR" >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------
 # T8 — removal is exact: the block goes, operator text around it stays
@@ -228,7 +262,20 @@ tc "T10a the seat with no registration is named"       "ceo	claude	browser@5dive
 tnc "T10b a seat that IS registered is not named"      "devops	claude	browser" "$miss"
 tnc "T10c a channel-only plugin is never reported missing" "telegram@5dive-plugins" "$miss"
 tnc "T10d a DISABLED skill plugin is never reported missing" "off@5dive-plugins" "$miss"
-tnc "T10e a codex seat is not graded against a claude plugin registry" "researcher" "$miss"
+tnc "T10e a codex seat CARRYING the section is not reported (it is graded by its markers, not by installed_plugins.json)" "researcher	codex" "$miss"
+tnc "T10f a registry row whose home is gone is NOT reported — the walker skips it, so a finding here would name a seat whose stated fix (re-run the walk) skips it again" \
+    "ghost" "$miss"
+tnc "T10g a seat-facing plugin shipping no AGENTS.md is not a finding against a codex seat (there is nothing to give that harness)" \
+    "researcher	codex	mcponly@5dive-plugins" "$miss"
+tc  "T10h ...but it IS a finding against a claude seat, which registers it as a plugin" \
+    "ceo	claude	mcponly@5dive-plugins" "$miss"
+mv "$CODEX_MD" "$CODEX_MD.bak"
+miss_codex=$(plugin_seat_unregistered_rows)
+tc "T10i a codex seat MISSING the plugin's instructions section IS reported — the half of this fix that serves non-claude harnesses has a surface too" \
+   "researcher	codex	browser@5dive-plugins" "$miss_codex"
+mv "$CODEX_MD.bak" "$CODEX_MD"
+t  "T10j the seats doctor COUNTS are the seats it GRADED (ghost has no home, so 3 not 4)" "3" \
+   "$(plugin_seat_graded_rows | grep -c .)"
 
 # ---------------------------------------------------------------------------
 # T11 — the other direction: a seat created AFTER the box installed the plugin
@@ -274,6 +321,78 @@ tc "T13f the lib is in the bundle"            "src/lib/plugin_seats.sh" \
    "$(grep -h 'plugin_seats.sh' build.sh || echo NONE)"
 
 # ---------------------------------------------------------------------------
+# T14 — THE HONEST FAILURE, and the one line that produces it
+# ---------------------------------------------------------------------------
+# Every line of the seat heredoc ends in `|| true` BY DESIGN — the clone, the
+# PREREG python, the marketplace update/add, the install itself — so the exit
+# status of the privilege drop carries no information whatsoever. The trailing
+# `plugin_seat_registered` read is therefore the SOLE detector of "the install
+# did not take", and it is what turns a silent failure into
+# "NOT registered — run 'sudo 5dive doctor'". Until STUB_MODE=noop existed, no
+# arm ever reached the drop and failed: the stub always wrote the seat's file,
+# and T5a/T5b grade the _plugin_seat_mkt_repo early return, a different branch
+# BEFORE the drop. In a delivery whose only on-box arm is signed as owed, this
+# suite is the entire evidence base, and this was the line inside it that could
+# be deleted green.
+STUB_MODE=noop
+rm -rf "$PERSONA_HOME_ROOT/agent-ceo/.claude"
+plugin_seat_register_claude ceo browser 5dive-plugins >/dev/null 2>&1; noop_rc=$?
+t "T14a a registration whose drop ran and wrote nothing returns NON-ZERO" "1" "$noop_rc"
+noopwalk=$( registry_read() { jq -n '{agents:{ceo:{type:"claude"}}}'; }
+            plugin_seat_apply browser 5dive-plugins "channel verb skill" register "$PDIR" 2>&1 )
+tc "T14b ...and the walk says so rather than claiming a success it did not get" \
+   "ceo (claude): browser@5dive-plugins NOT registered" "$noopwalk"
+tc "T14c ...and the tally agrees"        "0 ok, 1 failed" "$noopwalk"
+t  "T14d ...and the walk returns non-zero" "1" \
+   "$( registry_read() { jq -n '{agents:{ceo:{type:"claude"}}}'; }
+       plugin_seat_apply browser 5dive-plugins "channel verb skill" register "$PDIR" >/dev/null 2>&1; echo $? )"
+STUB_MODE=install
+
+# ---------------------------------------------------------------------------
+# T15 — DOCTOR'S OWN LINE, run rather than grepped
+# ---------------------------------------------------------------------------
+# T13e only proves doctor MENTIONS the walker. The sentence doctor prints is its
+# own claim, and a green one that counts seats it never graded is this row's
+# defect one layer out: `plugin add` said "registers: skill" about a box while it
+# was false about every agent on it, and "registered with all 3 seat(s)" while
+# two were measured is the same sentence. So the function is extracted and RUN,
+# against a stub doctor_add that records the verdict it was handed.
+eval "$(sed -n '/^doctor_check_plugin_seat_registration()/,/^}/p' src/cmd_doctor.sh)"
+DOCTOR_OUT=""
+doctor_add() { DOCTOR_OUT="$3|$4"; }
+
+# Make every GRADED seat carry every enabled seat-facing plugin, so the report is
+# silent and doctor takes its ok path. mcponly ships no AGENTS.md, so it is
+# nothing to give the codex seat and is not owed there.
+for s in ceo devops; do
+  mkdir -p "$PERSONA_HOME_ROOT/agent-$s/.claude/plugins"
+  jq -n '{plugins:{"browser@5dive-plugins":[{installPath:"/x"}],
+                   "mcponly@5dive-plugins":[{installPath:"/x"}]}}' \
+    > "$PERSONA_HOME_ROOT/agent-$s/.claude/plugins/installed_plugins.json"
+done
+rm -f "$CODEX_MD"; plugin_seat_doc_install researcher codex browser "$PDIR" >/dev/null 2>&1
+DOCTOR_OUT=""; doctor_check_plugin_seat_registration
+t  "T15a with nothing missing doctor is green"  "ok" "${DOCTOR_OUT%%|*}"
+tc "T15b ...and counts the seats it GRADED, not the registry rows (ghost has no home: 3, not 4)" \
+   "all 3 graded seat(s)" "$DOCTOR_OUT"
+tnc "T15c ...so it never claims coverage of a seat it skipped" "all 4" "$DOCTOR_OUT"
+
+# And the warn path, whose remedy must be reachable: the seat it names is one the
+# walk will actually act on.
+rm -f "$PERSONA_HOME_ROOT/agent-ceo/.claude/plugins/installed_plugins.json"
+DOCTOR_OUT=""; doctor_check_plugin_seat_registration
+t  "T15d a seat missing a plugin is a warn"     "warn" "${DOCTOR_OUT%%|*}"
+tc "T15e ...naming the seat and the plugin"     "ceo:browser@5dive-plugins" "$DOCTOR_OUT"
+tnc "T15f ...and never naming the homeless row the fix cannot reach" "ghost:" "$DOCTOR_OUT"
+
+# No seats at all is UNKNOWN, not green: absent is not clean.
+DOCTOR_OUT=""; ( registry_read() { jq -n '{agents:{}}'; }
+                 doctor_check_plugin_seat_registration
+                 printf '%s' "$DOCTOR_OUT" ) > "$TMP/doc-empty"
+t  "T15g no gradeable seat reads UNKNOWN, not ok" "warn" "$(cut -d'|' -f1 "$TMP/doc-empty")"
+tc "T15h ...and says nothing was measured" "nothing was measured" "$(cat "$TMP/doc-empty")"
+
+# ---------------------------------------------------------------------------
 # NEGATIVE CONTROLS — cut a named term out of the SHIPPING function's own text
 # and prove the cut landed and the arm it protects goes red.
 # ---------------------------------------------------------------------------
@@ -305,6 +424,36 @@ if [[ "$m3" == *"plugin_seat_apply"* ]]; then
   FAIL=$((FAIL+1)); printf 'FAIL: M3b the call-site arm cannot distinguish a walker call from its absence\n'
 else
   PASS=$((PASS+1))
+fi
+
+# M4: replace the SOLE honest-failure detector — the trailing
+# `plugin_seat_registered` in plugin_seat_register_claude — with a bare success.
+# The shipping behaviour is correct; before T14 existed it was protected by
+# nothing, and this mutant survived the suite at full green.
+m4=$(declare -f plugin_seat_register_claude | sed 's|plugin_seat_registered "$name" "$plugin" "$mkt"|return 0|')
+t "M4a the mutation landed (the detector is gone from the mutant's text)" "0" \
+  "$(grep -c 'plugin_seat_registered' <<<"$m4")"
+STUB_MODE=noop
+( eval "$m4"
+  rm -rf "$PERSONA_HOME_ROOT/agent-ceo/.claude"
+  plugin_seat_register_claude ceo browser 5dive-plugins >/dev/null 2>&1 ); m4rc=$?
+STUB_MODE=install
+if (( m4rc == 0 )); then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); printf 'FAIL: M4b cutting the final plugin_seat_registered did NOT make a drop that wrote nothing report success — T14a is vacuous\n'
+fi
+
+# M5: put back the whole-file emit doc_block used to return for an
+# already-delimited AGENTS.md, and prove T7c sees the accretion it was written
+# for. The mutant must leave >= 2 copies of the publisher's out-of-marker text.
+m5=$(declare -f plugin_seat_doc_block | sed 's|_plugin_seat_doc_region "$body" "$b" "$e"|printf "%s" "$body"|')
+t "M5a the mutation landed (the region extraction is gone)" "0" \
+  "$(grep -c '_plugin_seat_doc_region' <<<"$m5")"
+m5n=$( eval "$m5"
+       rm -f "$CODEX_MD"
+       for _i in 1 2 3; do plugin_seat_doc_install researcher codex browser "$PDIR2" >/dev/null 2>&1; done
+       grep -c 'notes for maintainers' "$CODEX_MD" 2>/dev/null; true )
+if (( ${m5n:-0} >= 2 )); then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); printf 'FAIL: M5b returning the whole AGENTS.md did NOT accrete (%s copies) — T7c is vacuous\n' "${m5n:-0}"
 fi
 
 printf 'plugin_seat_registration_unit: %d passed, %d failed\n' "$PASS" "$FAIL"

@@ -52,6 +52,13 @@ plugin_seat_is_seat_facing() {
 _plugin_seat_home() { printf '%s/agent-%s\n' "${PERSONA_HOME_ROOT:-/home}" "${1:-}"; }
 _plugin_seat_installed_json() { printf '%s/.claude/plugins/installed_plugins.json\n' "$(_plugin_seat_home "${1:-}")"; }
 
+# A registry row whose home directory is gone is NOT a seat anything can be
+# installed into. One predicate, used by the walker and by the report, because
+# when they disagreed the report named a seat the walk had skipped and the fix it
+# printed — re-run the walk — skipped it again. A warning whose stated remedy is
+# a no-op is a hold nobody can lift, so the two must read the same seat set.
+plugin_seat_home_exists() { [[ -d "$(_plugin_seat_home "${1:-}")" ]]; }
+
 # plugin_seat_rows -> "<name>\t<type>" for every registered agent.
 # Reads the registry and nothing else; stubbed in tests by stubbing registry_read.
 plugin_seat_rows() {
@@ -187,17 +194,38 @@ plugin_seat_doc_begin() { printf '<!-- 5dive:%s:begin -->' "${1:-}"; }
 plugin_seat_doc_end()   { printf '<!-- 5dive:%s:end -->' "${1:-}"; }
 
 # The section to install, read from the plugin's own directory. A plugin that
-# already delimits its AGENTS.md (browser does) is used verbatim so what lands on
-# the seat is byte-identical to what the publisher wrote; one that does not is
-# wrapped, because the markers are what makes removal exact.
+# already delimits its AGENTS.md (browser does) has the DELIMITED REGION taken
+# verbatim, so what lands on the seat is byte-identical to what the publisher
+# wrote between its own markers; one that does not is wrapped, because the
+# markers are what makes removal exact.
+#
+# ONLY the region, never the whole file, and the reason is plugin_seat_doc_install
+# below: it replaces the begin..end region of the seat's file with whatever this
+# returns. Return the whole file and every byte OUTSIDE the markers — a heading, a
+# licence footer, a maintainer note — is re-inserted INSIDE them on every run, so
+# `plugin add`, `plugin upgrade` and the agent-create backfill each append another
+# copy to the file the agent reads every turn. Measured 1/2/3 copies over three
+# installs before this returned the region. browser's AGENTS.md puts its markers
+# on the first and last line, which is exactly why the whole-file form looked
+# correct: for that one file the two are the same string.
+#
+# The extraction is the same first-match, non-greedy span doc_install's regex
+# takes: shortest prefix up to the first begin marker, shortest suffix from the
+# first end marker after it.
+_plugin_seat_doc_region() { # <body> <begin-marker> <end-marker>
+  local body="${1:-}" b="${2:-}" e="${3:-}" rest
+  rest="${body#*"$b"}"
+  printf '%s%s%s\n' "$b" "${rest%%"$e"*}" "$e"
+}
+
 plugin_seat_doc_block() { # <plugin> <plugin-dir>
   local plugin="${1:-}" dir="${2:-}" f="${2:-}/AGENTS.md" body b e
   [[ -f "$f" ]] || return 1
   body=$(cat "$f") || return 1
   [[ -n "$body" ]] || return 1
   b=$(plugin_seat_doc_begin "$plugin"); e=$(plugin_seat_doc_end "$plugin")
-  if [[ "$body" == *"$b"* && "$body" == *"$e"* ]]; then
-    printf '%s\n' "$body"
+  if [[ "$body" == *"$b"*"$e"* ]]; then
+    _plugin_seat_doc_region "$body" "$b" "$e"
   else
     printf '%s\n%s\n%s\n' "$b" "$body" "$e"
   fi
@@ -253,6 +281,16 @@ DOCPY
   ! grep -qF "$(plugin_seat_doc_begin "$plugin")" "$md" 2>/dev/null
 }
 
+# plugin_seat_doc_installed <name> <type> <plugin> -> 0 when that seat's
+# instructions file already carries the plugin's section. The non-claude
+# counterpart of plugin_seat_registered, and what lets the report grade a codex
+# seat at all instead of counting it and looking away.
+plugin_seat_doc_installed() { # <name> <type> <plugin>
+  local md; md=$(persona_target "${1:-}" "${2:-}") || return 1
+  [[ -f "$md" ]] || return 1
+  grep -qF "$(plugin_seat_doc_begin "${3:-}")" "$md" 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # The walkers
 # ---------------------------------------------------------------------------
@@ -269,7 +307,7 @@ plugin_seat_apply() {
 
   while IFS=$'\t' read -r name type; do
     [[ -n "$name" ]] || continue
-    [[ -d "$(_plugin_seat_home "$name")" ]] || { n_skip=$((n_skip+1)); continue; }
+    plugin_seat_home_exists "$name" || { n_skip=$((n_skip+1)); continue; }
     case "$type" in
       claude)
         if [[ "$action" == register ]]; then
@@ -340,29 +378,59 @@ plugin_seat_backfill() { # <name> <type>
                      ((.value.capabilities // []) | join(" "))] | @tsv' "$ij" 2>/dev/null || true)
 }
 
+# plugin_seat_graded_rows -> "<name>\t<type>" for the seats this report and the
+# walker BOTH act on: every registry row whose home still exists. Exported as its
+# own verb so `doctor` counts exactly the seats it graded — a green line reading
+# "registered with all 3 seat(s)" while two were measured is this row's own defect
+# one layer out, and this row exists because a surface said "registers: skill"
+# about a box while it was false about every agent on it.
+plugin_seat_graded_rows() {
+  local name type
+  while IFS=$'\t' read -r name type; do
+    [[ -n "$name" ]] || continue
+    plugin_seat_home_exists "$name" || continue
+    printf '%s\t%s\n' "$name" "$type"
+  done < <(plugin_seat_rows)
+}
+
 # plugin_seat_unregistered_rows -> "<seat>\t<type>\t<key>" for every ENABLED
 # seat-facing plugin a seat does not carry. This is the report `doctor` prints,
 # and it is the exact state that was invisible on 2026-09-14: four seats, one
 # enabled skill plugin, nothing anywhere that would have said so.
+#
+# EVERY harness is graded, each by what "carried" means for it: a claude seat by
+# its own installed_plugins.json, any other by the plugin's section in the file
+# that harness reads. Grading claude only would have left the half of the fix that
+# serves codex/pi/opencode seats with no surface at all — a section hand-deleted
+# from a codex seat's AGENTS.md would have read green, by name-count, as covered.
 plugin_seat_unregistered_rows() {
   local ij; ij="$(_plugin_installed_json)"
   [[ -f "$ij" ]] || return 0
-  local -a keys=() plugins=() mkts=()
+  local -a keys=() plugins=() mkts=() dirs=()
   local key plugin mkt caps name type i
   while IFS=$'\t' read -r key plugin mkt caps; do
     [[ -n "$key" ]] || continue
     plugin_seat_is_seat_facing "$caps" || continue
     keys+=("$key"); plugins+=("$plugin"); mkts+=("$mkt")
+    dirs+=("$(_plugin_enabled_dir)/$key")
   done < <(jq -r 'to_entries[] | select(.value.enabled)
                   | [.key, .value.plugin, .value.marketplace,
                      ((.value.capabilities // []) | join(" "))] | @tsv' "$ij" 2>/dev/null || true)
   (( ${#keys[@]} )) || return 0
   while IFS=$'\t' read -r name type; do
     [[ -n "$name" ]] || continue
-    [[ "$type" == claude ]] || continue
     for i in "${!keys[@]}"; do
-      plugin_seat_registered "$name" "${plugins[$i]}" "${mkts[$i]}" \
-        || printf '%s\t%s\t%s\n' "$name" "$type" "${keys[$i]}"
+      if [[ "$type" == claude ]]; then
+        plugin_seat_registered "$name" "${plugins[$i]}" "${mkts[$i]}" \
+          || printf '%s\t%s\t%s\n' "$name" "$type" "${keys[$i]}"
+      else
+        # A plugin shipping no AGENTS.md has nothing to give this harness, and
+        # the walker skips it rather than failing — so it is not a finding here
+        # either. Same predicate, same seat set, in both directions.
+        plugin_seat_doc_block "${plugins[$i]}" "${dirs[$i]}" >/dev/null 2>&1 || continue
+        plugin_seat_doc_installed "$name" "$type" "${plugins[$i]}" \
+          || printf '%s\t%s\t%s\n' "$name" "$type" "${keys[$i]}"
+      fi
     done
-  done < <(plugin_seat_rows)
+  done < <(plugin_seat_graded_rows)
 }

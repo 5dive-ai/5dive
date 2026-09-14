@@ -417,17 +417,23 @@ doctor_check_marketplace_clones() {
 doctor_check_plugin_seat_registration() {
   local rows name type key
   rows=$(plugin_seat_unregistered_rows 2>/dev/null || true)
+  # GRADED seats, not registry rows. plugin_seat_graded_rows applies the same
+  # filter the walker does (a row whose home is gone is skipped there), so the
+  # count in the green line below is the number of seats this check actually
+  # measured. Counting every registry row instead made the ok-line claim
+  # coverage of seats nothing had looked at — the same sentence this row was
+  # filed to delete, one layer out.
   local seats_seen=0
-  seats_seen=$(plugin_seat_rows 2>/dev/null | grep -c . || true)
+  seats_seen=$(plugin_seat_graded_rows 2>/dev/null | grep -c . || true)
   if [[ -z "$rows" ]]; then
     # Silence here has two very different causes and they must not both read
     # green: no seats at all measures nothing.
     if (( seats_seen == 0 )); then
       doctor_add plugins seat-registration warn \
-        "UNKNOWN: no agent seats are registered, so no seat could be graded — nothing was measured"
+        "UNKNOWN: no agent seat could be graded (none registered, or none with a home on this box) — nothing was measured"
     else
       doctor_add plugins seat-registration ok \
-        "every enabled skill/mcp plugin is registered with all $seats_seen seat(s)"
+        "every enabled skill/mcp plugin is carried by all $seats_seen graded seat(s)"
     fi
     return 0
   fi
@@ -437,7 +443,7 @@ doctor_check_plugin_seat_registration() {
     missing+=("$name:$key")
   done <<<"$rows"
   doctor_add plugins seat-registration warn \
-    "${#missing[@]} seat/plugin pair(s) NOT registered: ${missing[*]} — those agents cannot load the plugin's skills. Fix: sudo 5dive plugin upgrade <plugin>@<marketplace> (re-runs the per-seat registration), or re-run 'plugin add'. By hand it must be a NON-LOGIN shell — /etc/profile.d/5dive-shared-configs.sh exports CLAUDE_CONFIG_DIR for every login shell, so a -lc form reads another user's config and fails with a misleading 'not found in marketplace'" \
+    "${#missing[@]} seat/plugin pair(s) NOT registered: ${missing[*]} — those agents cannot load the plugin's skills (a non-claude seat is missing the plugin's instructions section). Fix: sudo 5dive plugin upgrade <plugin>@<marketplace> (re-runs the per-seat registration), or re-run 'plugin add'. By hand it must be a NON-LOGIN shell — /etc/profile.d/5dive-shared-configs.sh exports CLAUDE_CONFIG_DIR for every login shell, so a -lc form reads another user's config and fails with a misleading 'not found in marketplace'" \
     false false
 }
 

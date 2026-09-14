@@ -1205,8 +1205,9 @@ cmd_plugin_remove() {
   # DIVE-4522, the reverse of the walk in `add`. §3 says uninstall is TOTAL, and
   # a seat still carrying the plugin in its own ~/.claude (or still carrying its
   # instructions section) is code the user believes they removed — the exact
-  # clause the rm -rf above exists to honour, one layer out. Runs BEFORE the
-  # record is deleted because the capabilities it reads live in that record.
+  # clause the rm -rf above exists to honour, one layer out. The capabilities it
+  # reads are captured into $_rm_caps from the in-memory record ABOVE, before the
+  # `jq del`, which is why this walk can stand after the record is gone.
   if plugin_seat_is_seat_facing "$_rm_caps"; then
     echo "  Unregistering $key from existing agents:" >&2
     plugin_seat_apply "$plugin" "$mkt" "$_rm_caps" unregister || true
