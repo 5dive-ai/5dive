@@ -2736,7 +2736,7 @@ cmd_create() {
   # preserves user-authored instructions and is safe to run repeatedly.
   if [[ "$type" == "codex" ]]; then
     step "Reconciling Codex operating baseline for agent-${name} (DIVE-3966)"
-    preseed_codex_return_channel "$name" || true
+    preseed_codex_return_channel "$name" >/dev/null || true
   fi
 
   # DIVE-990: memory-as-onboarding. Seed the new agent's recall store from

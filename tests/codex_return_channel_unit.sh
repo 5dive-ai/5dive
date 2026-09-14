@@ -5,7 +5,7 @@
 # ~/.codex/AGENTS.md, so every other codex worker booted with no return channel.
 #
 # Pure test — no root, network, users, or runtime state. Exercises the content
-# generator (_codex_return_channel_doc) plus the non-destructive guard logic of
+# generator (_codex_operating_baseline_doc) plus the non-destructive guard logic of
 # preseed_codex_return_channel with the filesystem primitives stubbed to a temp
 # HOME. The real ownership/perms plumbing is covered by the create-path smoke test.
 set -euo pipefail
@@ -67,11 +67,12 @@ install() {                                          # honor -d (mkdir) and file
   if (( mkdir )); then mkdir -p "$dest"; else : >"$dest"; fi
 }
 sudo() {                                             # drop `-u <user>`, run the rest here
+  printf '%s\n' "$*" >>"$SUDO_LOG"
   shift 2
   "$@"
 }
-chown() { :; }
 chmod() { :; }
+SUDO_LOG="$tmp/sudo.log"
 
 seed_one() {
   mkdir -p "$HOME_BASE/agent-$1"
@@ -83,6 +84,7 @@ seed_one fresh
 f="$HOME_BASE/agent-fresh/.codex/AGENTS.md"
 check "fresh seed creates AGENTS.md"   '[[ -f "$f" ]]'
 check "fresh seed has convention"      'grep -q "5dive agent send <from>" "$f"'
+check "content write runs as seat"      'grep -q "tee .*\.codex/\.AGENTS\.md" "$SUDO_LOG" && grep -q "mv -f .*\.codex/\.AGENTS\.md" "$SUDO_LOG"'
 
 # curated file already present → preserved outside an appended managed block
 mkdir -p "$HOME_BASE/agent-curated/.codex"
@@ -128,11 +130,14 @@ check "malformed block is untouched"    '[[ "$broken_before" == "$broken_after" 
 # The upgrade primitive filters the registry to Codex seats only.
 mkdir -p "$HOME_BASE/agent-fleet-codex" "$HOME_BASE/agent-fleet-claude"
 require_root() { :; }
-registry_read() { printf '%s\n' '{"agents":{"fleet-codex":{"type":"codex"},"fleet-claude":{"type":"claude"}}}'; }
-ok() { :; }
-CODEX_AGENT_HOME_ROOT="$HOME_BASE" cmd_agent_sync_codex_baseline
+registry_read() { printf '%s\n' '{"agents":{"fleet-codex":{"type":"codex"},"missing-codex":{"type":"codex"},"fleet-claude":{"type":"claude"}}}'; }
+SYNC_SUMMARY=""
+ok() { SYNC_SUMMARY="$1"; }
+export CODEX_AGENT_HOME_ROOT="$HOME_BASE"
+cmd_agent_sync_codex_baseline
 check "upgrade syncs existing codex"    '[[ -f "$HOME_BASE/agent-fleet-codex/.codex/AGENTS.md" ]]'
 check "upgrade skips non-codex"         '[[ ! -e "$HOME_BASE/agent-fleet-claude/.codex/AGENTS.md" ]]'
+check "upgrade counts real outcomes"    '[[ "$SYNC_SUMMARY" == *"updated=1, current=0, skipped=1, failed=0"* ]]'
 
 # The installed-upgrade path actually invokes the primitive after bundle swap.
 check "installer wires upgrade sync"    'grep -q "agent _sync_codex_baseline" install.sh'

@@ -452,9 +452,6 @@ happens to remember to append.
 AGENTS_MD
 }
 
-# Backward-compatible pure renderer name used by the original DIVE-1535 unit.
-_codex_return_channel_doc() { _codex_operating_baseline_doc "$@"; }
-
 # Reconcile the current block into one ordinary file. The caller owns directory
 # creation and final ownership/mode so this pure file operation is unit-testable.
 _codex_sync_operating_baseline_file() { # <file> <agent-name>
@@ -499,13 +496,40 @@ preseed_codex_return_channel() {
   local name="$1"
   local user="agent-${name}" root="${CODEX_AGENT_HOME_ROOT:-/home}"
   local home="${root}/agent-${name}"
-  [[ -d "$home" ]] || return 0
-  id -u "$user" &>/dev/null || return 0
+  [[ -d "$home" ]] || { printf 'skipped\n'; return 0; }
+  id -u "$user" &>/dev/null || { printf 'skipped\n'; return 0; }
   local dir="$home/.codex" file="$home/.codex/AGENTS.md"
-  install -d -m 700 -o "$user" -g "$user" "$dir" 2>/dev/null || return 0
-  _codex_sync_operating_baseline_file "$file" "$name" || return 1
-  chown "$user:$user" "$file" 2>/dev/null || return 1
-  chmod 600 "$file" 2>/dev/null || return 1
+  # The seat owns its home. Refuse indirection, then keep every content write
+  # under the seat's uid; the installer must not turn a user-controlled path
+  # into a root write primitive.
+  [[ ! -L "$dir" ]] || return 1
+  [[ ! -e "$dir" || -d "$dir" ]] || return 1
+  install -d -m 700 -o "$user" -g "$user" "$dir" 2>/dev/null || return 1
+  [[ ! -L "$file" ]] || return 1
+
+  local staged seat_tmp
+  staged="$(mktemp)" || return 1
+  if [[ -f "$file" ]]; then
+    cat "$file" >"$staged" || { rm -f "$staged"; return 1; }
+  fi
+  _codex_sync_operating_baseline_file "$staged" "$name" \
+    || { rm -f "$staged"; return 1; }
+  if [[ -f "$file" ]] && cmp -s "$staged" "$file"; then
+    rm -f "$staged"
+    printf 'current\n'
+    return 0
+  fi
+  seat_tmp=$(sudo -u "$user" mktemp "$dir/.AGENTS.md.XXXXXX") \
+    || { rm -f "$staged"; return 1; }
+  if ! sudo -u "$user" tee "$seat_tmp" <"$staged" >/dev/null \
+      || ! sudo -u "$user" chmod 600 "$seat_tmp" \
+      || ! sudo -u "$user" mv -f "$seat_tmp" "$file"; then
+    sudo -u "$user" rm -f "$seat_tmp" 2>/dev/null || true
+    rm -f "$staged"
+    return 1
+  fi
+  rm -f "$staged"
+  printf 'updated\n'
 }
 
 # Hidden installer migration: creation calls the function above for one new
@@ -513,18 +537,27 @@ preseed_codex_return_channel() {
 cmd_agent_sync_codex_baseline() {
   require_root "agent _sync_codex_baseline"
   [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _sync_codex_baseline takes no arguments"
-  local reg name synced=0 failed=0
+  local reg name state updated=0 current=0 skipped=0 failed=0
   reg=$(registry_read)
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    if preseed_codex_return_channel "$name"; then
-      synced=$((synced + 1))
-    else
+    if ! state=$(preseed_codex_return_channel "$name"); then
       failed=$((failed + 1))
+      continue
     fi
+    case "$state" in
+      updated) updated=$((updated + 1)) ;;
+      current) current=$((current + 1)) ;;
+      skipped) skipped=$((skipped + 1)) ;;
+      *)       failed=$((failed + 1)) ;;
+    esac
   done < <(jq -r '(.agents // {}) | to_entries[] | select(.value.type == "codex") | .key' <<<"$reg")
-  (( failed == 0 )) || return 1
-  ok "codex operating baseline reconciled: synced=${synced}, failed=${failed}"
+  if (( failed > 0 )); then
+    warn "codex operating baseline reconcile incomplete: updated=${updated}, current=${current}, skipped=${skipped}, failed=${failed}"
+    return 1
+  else
+    ok "codex operating baseline reconciled: updated=${updated}, current=${current}, skipped=${skipped}, failed=0"
+  fi
 }
 
 # ---------------------------------------------------------------------------
