@@ -837,7 +837,21 @@ cmd_task_verify() {
           # before the column existed, re-graded here). Never a bare set.
           _md_owner=$(db "SELECT COALESCE(NULLIF(graded_by,''),'') FROM tasks WHERE id=${id};")
           [[ -n "$_md_owner" ]] || _md_owner=$(task_actor "")
-          _md_why="auto-mergeable at the graded sha — run \`5dive task done ${ident}\`"
+          # DIVE-4520: THE VERB THIS PRINTS MUST NOT BE THE ONE THAT REVOKES THE
+          # STANDING IT JUST STAMPED. `task done` on a loop row does not merge and
+          # does not close: it takes the maker->verifier routing fork and
+          # re-delivers an UNCHANGED pass at exit 0, which moves
+          # handoff_delivered_at past every recorded verdict clock — and
+          # `_TASKS_TFV_SQL`'s DIVE-4357 conjunct then reads the row as a delivery
+          # the grade did not grade, stripping merge standing from the one seat
+          # named on the line above. Measured on DIVE-4491 / 5dive-ai/5dive#963:
+          # the board's own instruction is what stalled the row.
+          # `5dive task merge <ident>` is the verb the DIVE-3474 rail accepts from
+          # exactly this seat. The re-delivery is separately REFUSED at the close
+          # (src/task/status.sh, same ticket) so that a hint we do not compose —
+          # an older board line, a quoted screenshot, a human — cannot spend it
+          # either; this half removes the trigger, that half makes the verb safe.
+          _md_why="auto-mergeable at the graded sha — run \`5dive task merge ${ident}\`"
         else
           _md_owner="${_md_disp#hold:}"; _md_why="${_md_owner#*:}"; _md_owner="${_md_owner%%:*}"
           # `maker` is a ROLE in the disposition's vocabulary, resolved to a seat
