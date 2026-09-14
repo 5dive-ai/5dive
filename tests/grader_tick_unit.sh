@@ -12,6 +12,23 @@
 # A single test that passes --commit with an empty pool would be satisfied by
 # either lock alone and could not tell which one was doing the work.
 #
+# ── DIVE-4521: THIS SUITE GRADES THE POOL LANE IN *SESSION* SHAPE, PINNED ──
+#
+# It sources `grader_pool.sh` ALONE, which was exactly right while the shipped
+# mode was `session`: the tick reached none of `grader_process.sh` and a
+# standalone source graded the shape the bundle actually ran. DIVE-4521 flips the
+# default to `process`, so an unpinned source here would make every arm below
+# call into a file that is not loaded — 33 of them did, on the first run.
+#
+# The pin is `_GRADER_SPAWN_MODE=session` at each of the four source sites, and
+# it is a SCOPE statement, not a workaround: the locks, the cap arithmetic, the
+# plan lines and the round-robin cursor graded here are mode-independent, and the
+# process/clone shape — including the shipped default and its per-seat cap — is
+# graded by `tests/grader_process_unit.sh`, which sources BOTH files in bundle
+# order. What is deliberately NOT graded here is the default mode; asserting it
+# in a file that cannot load the machinery it selects is how the flip would read
+# green while the lane was broken.
+#
 # No DB, no fleet: db/ledger_emit/the spawn primitive are stubs.
 # Run: bash tests/grader_tick_unit.sh
 set -uo pipefail
@@ -88,6 +105,7 @@ USAGE='{"agents":[{"account":"mark","name":"g1","fiveHourPct":10,"sevenDayPct":2
 usage_cmd(){ printf '%s' "$USAGE"; }
 # shellcheck source=/dev/null
 source src/task/grader_pool.sh
+_GRADER_SPAWN_MODE=session   # DIVE-4521: see the header — this suite is pinned to the session shape
 _GRADER_USAGE_CMD=usage_cmd
 # The credential probe is stubbed permissive by default so the arms above keep
 # measuring what they were written to measure; the arms below flip it.
@@ -172,6 +190,7 @@ defj=$(
   unset _GRADER_POOL
   # shellcheck source=/dev/null
   source src/task/grader_pool.sh
+  _GRADER_SPAWN_MODE=session   # DIVE-4521: see the header — this suite is pinned to the session shape
   _GRADER_USAGE_CMD=usage_cmd
   _GRADER_READ_PROBE=probe_ok
   _grader_spawn_session(){ printf '%s\n' "$1:$2" >> "$SPAWNF"; return 0; }
@@ -580,11 +599,13 @@ _GRADER_POOL="g1 g2"; LASTPICK=""; SEATLOADS=""
 ( unset _GRADER_MAX_PER_SEAT
   # shellcheck source=/dev/null
   source src/task/grader_pool.sh
+  _GRADER_SPAWN_MODE=session   # DIVE-4521: see the header — this suite is pinned to the session shape
   [[ "$_GRADER_MAX_PER_SEAT" == 1 ]] ) \
   && ok_ 'DEFAULT: the shipped per-seat cap is 1 — one grading session per seat' \
   || bad_ 'shipped per-seat cap is 1' "got: ${_GRADER_MAX_PER_SEAT}"
 # shellcheck source=/dev/null
 source src/task/grader_pool.sh
+_GRADER_SPAWN_MODE=session   # DIVE-4521: see the header — this suite is pinned to the session shape
 _GRADER_USAGE_CMD=usage_cmd
 _GRADER_READ_PROBE=probe_ok
 _grader_spawn_session(){ printf '%s\n' "$1:$2" >> "$SPAWNF"; return 0; }

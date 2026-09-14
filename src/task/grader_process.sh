@@ -429,7 +429,39 @@ _grader_clone_create() {  # <clone> <pool_seat>
   # would fail after spending a seat.
   [[ -n "$profile" ]] || { warn "grader clone ${clone}: pool seat ${pool} has no auth profile to clone"; return 5; }
   "$_GRADER_TASK_CLI" agent create "$clone" --type=claude --auth-profile="$profile" \
-    --channels=none --no-skills --no-team-bot --no-heartbeat >/dev/null 2>&1
+    --channels=none --no-skills --no-team-bot --no-heartbeat >/dev/null 2>&1 || return $?
+  _grader_clone_record_origin "$clone" "$pool"
+}
+
+# ══ DIVE-4521 (precondition 4): WRITE THE LINEAGE THE REGISTRY CANNOT INFER ══
+#
+# `5dive agent info` returns type, profile, workdir, created — and nothing
+# recording parent or origin, so the `writer != grader` guard compares names and
+# a clone of the maker passes it (DIVE-4514). The dispatcher's gate
+# (`_grader_seat_origin`, grader_pool.sh) can read a clone's origin out of the
+# name THIS lane mints, but every other reader of the registry — a future guard,
+# `agent info`, a human — cannot. So the one moment that knows the answer records
+# it, as the `origin` field that page asks for.
+#
+# NON-FATAL BY DESIGN. The seat exists and can grade; the field is for readers,
+# and the dispatcher's own gate does not depend on it (the name carries the same
+# fact). Failing the create over a registry write would trade a working grade for
+# a missing annotation — and the tick may run where `registry_write`'s root-owned
+# atomic replace is not permitted.
+_GRADER_CLONE_ORIGIN_CMD="${_GRADER_CLONE_ORIGIN_CMD:-}"
+_grader_clone_record_origin() {  # <clone> <pool_seat>
+  local clone="${1:-}" pool="${2:-}"
+  [[ -n "$clone" && -n "$pool" ]] || return 0
+  if [[ -n "$_GRADER_CLONE_ORIGIN_CMD" ]]; then eval "$_GRADER_CLONE_ORIGIN_CMD"; return 0; fi
+  [[ -w "${REGISTRY:-}" ]] || { warn "grader clone ${clone}: registry not writable — lineage origin=${pool} NOT recorded"; return 0; }
+  local updated
+  updated=$(jq --arg c "$clone" --arg o "$pool" \
+    'if (.agents|has($c)) then .agents[$c].origin = $o else . end' "$REGISTRY" 2>/dev/null) || {
+      warn "grader clone ${clone}: could not compute lineage origin=${pool}"; return 0; }
+  [[ -n "$updated" ]] || { warn "grader clone ${clone}: empty registry read; lineage origin=${pool} NOT recorded"; return 0; }
+  printf '%s\n' "$updated" | registry_write 2>/dev/null \
+    || warn "grader clone ${clone}: registry write failed; lineage origin=${pool} NOT recorded"
+  return 0
 }
 
 # `_grader_clone_creds <clone> <pool_seat>` — the READ credential, copied.
@@ -467,8 +499,18 @@ _grader_clone_creds() {  # <clone> <pool_seat>
     # the spot, not left to grade blind" — asked one step earlier, where it costs
     # nothing.
     [[ -r "$src" ]] || { warn "grader clone ${clone}: ${pool} has no ${rel} to copy"; return 3; }
-    if grep -qE 'gh[op]_[A-Za-z0-9_]{8}' "$src" 2>/dev/null; then
-      warn "grader clone ${clone}: REFUSED to copy ${rel} — it carries a write-capable token (gho_/ghp_); read-only ghs_ installation tokens only"
+    # ══ DIVE-4521 (precondition 3): THE ALPHABET IS EVERY WRITE-CAPABLE SHAPE ══
+    # It read `gh[op]_` — gho_/ghp_, and deliberately NOT ghs_, the read-only
+    # installation token that is supposed to travel. `ghu_` (a user-to-server
+    # token) and a fine-grained `github_pat_` are both write-capable and neither
+    # can appear in these two files TODAY, which is exactly why this widened
+    # before the flip: "cannot appear today" is a standing fact about a dark
+    # lane, and this row is the moment it stops being one. A content test costs
+    # the same over four shapes as over two.
+    # `ghs_` stays out of the class on purpose; adding it would refuse the very
+    # credential the clone is created to carry.
+    if grep -qE 'gh[opu]_[A-Za-z0-9_]{8}|github_pat_[A-Za-z0-9_]{8}' "$src" 2>/dev/null; then
+      warn "grader clone ${clone}: REFUSED to copy ${rel} — it carries a write-capable token (gho_/ghp_/ghu_/github_pat_); read-only ghs_ installation tokens only"
       return 4
     fi
     # ══ THE DIRECTORY IS CREATED OWNED BY THE CLONE, NOT BY ROOT ══
