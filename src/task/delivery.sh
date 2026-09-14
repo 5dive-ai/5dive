@@ -914,6 +914,168 @@ _task_reject_emit_event() {
   _run_close_for_task "$id" completed verifier_rejected || true
 }
 
+# ============================================================================
+# DIVE-4476 — THE ESCALATION ASK IS WRITTEN BY THE PRODUCT, SO THE PRODUCT
+# COMPOSES IT FROM THE ROW.
+#
+# lodar, 2026-09-14 02:36Z, reading the DIVE-4471 escalation on his phone:
+# "confusing phrasing.. do i [open the PR] and submit approve?" and 02:37Z "our
+# human gate is still unfriendly and not fixed then?". What he was sent was
+# "A piece of work has failed review 2 times and stopped. Decide whether to keep
+# going or drop it." — DIVE-4176's rewrite, which fixed the READABILITY (no ident,
+# no pasted feedback) and left three things broken that readability does not grade:
+#
+#   1. it names NO WORK. "A piece of work" is every row on the board. He cannot
+#      tell what he is deciding about without opening a link.
+#   2. its BUTTON was not either outcome. `--type=manual` renders one "✋ Tap ✅
+#      Done" (src/task/notify.sh) while the sentence offers "keep going or drop
+#      it" — so the only tap available answers neither half of the question.
+#   3. it went to HIM FIRST. `manual` is tier-2 by type, and a two-strike stop is
+#      a lead's call (DIVE-4346/4365: the orchestrator clears first).
+#
+# The fix for all three is the same one: file the DECISION that is actually being
+# taken — `--type=decision`, which defaults to tier 1 and therefore ROUTES to the
+# filing verifier's lead, with two spelled-out options and the lead's default as
+# `--recommend`. The human sees it only when the chart resolves nobody above the
+# verifier, and by then it is a readable sentence with two real buttons.
+#
+# WHY THE COMPOSITION IS DEFENSIVE, AND THIS IS THE LOAD-BEARING PART. Naming the
+# row means interpolating the TITLE, and titles on this board are written by
+# agents for agents: "DIVE-4462 --options seam", "cli-3754 launcher entry point".
+# Every one of those shapes is refused by the readability rule in `task need`,
+# `cmd_task_need` exits rather than returns, and the refusal would make `task
+# reject` ITSELF FAIL at the iteration cap — the exact failure DIVE-4176 hit and
+# recorded (community/wiki/the-readability-rule-is-about-the-reader-not-the-tier.md,
+# section 6: "the one bounce that ends a loop stops producing the gate that ends
+# it"). A product-written ask must therefore be UNCONDITIONALLY fileable.
+#
+# So the subject is built by the SAME classifier that would refuse it
+# (`_gate_ask_jargon_term`), taking words until the first token a person outside
+# our codebase cannot read, and the composed ask is measured against the SAME word
+# cap (`_GATE_ASK_MAX_WORDS`) before it is returned. If either the subject or the
+# finding clause cannot be made readable, it is DROPPED and the sentence degrades
+# to the subject-free form, which is lint-clean by construction. Degrading loses a
+# hint; refusing loses the gate.
+_ESCALATION_OPTIONS='keep going — the lead takes it over|drop it'
+_ESCALATION_RECOMMEND='keep going — the lead takes it over'
+
+# Print a leading run of <max-words> readable words of <text>, stopping at the
+# first token the gate-ask classifier calls an internal name. Stopping rather
+# than DELETING is deliberate: a title reads as a phrase, and a hole punched in
+# the middle of one ("the seam is unswept") is harder to read than a short one.
+_task_escalation_phrase() { # <text> <max-words> -> phrase (possibly empty)
+  local _ep_raw="${1:-}" _ep_max="${2:-10}" _ep_out="" _ep_w _ep_n=0
+  # A title's tail clause is where the filer puts the mechanism and the
+  # attribution — "… — name the work + two outcomes (lodar 2026-09-14)". Cut it
+  # before word-counting so the budget is spent on the subject, not the aside.
+  _ep_raw="${_ep_raw%%(*}"
+  _ep_raw="${_ep_raw%%—*}"
+  _ep_raw="${_ep_raw%%$'\n'*}"
+  for _ep_w in $_ep_raw; do
+    if declare -F _gate_ask_jargon_term >/dev/null 2>&1; then
+      _gate_ask_jargon_term "$_ep_w" >/dev/null 2>&1 && break
+    fi
+    _ep_out="${_ep_out:+${_ep_out} }${_ep_w}"
+    _ep_n=$(( _ep_n + 1 ))
+    (( _ep_n >= _ep_max )) && break
+  done
+  # Trailing punctuation left behind by the cut reads as a typo on a phone, and
+  # a phrase cut mid-clause ends on a dangling function word ("… writes a machine
+  # ask a"). Strip both, repeatedly, because one exposes the other.
+  local _ep_last
+  while [[ -n "$_ep_out" ]]; do
+    if [[ "$_ep_out" == *[,\;:.-] ]]; then _ep_out="${_ep_out%?}"; continue; fi
+    _ep_last="${_ep_out##* }"
+    case "${_ep_last,,}" in
+      a|an|the|and|but|or|of|to|in|on|for|with|that|is|was|its|it|by|as|at|from|not|no)
+        [[ "$_ep_out" == *" "* ]] || { _ep_out=""; break; }
+        _ep_out="${_ep_out% *}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$_ep_out"
+}
+
+# The one clause of the verifier's last finding that a person can read. Taken
+# from the FINDING half of the reject template (`_REJECT_TEMPLATE_HINT`) when it
+# is present, because the FIX half is addressed to the maker and is machine
+# prose by design. Empty whenever it cannot be made readable, which is the
+# common case and is fine — the full text is on the row's `result`.
+_task_escalation_finding() { # <feedback text> -> clause (possibly empty)
+  local _ef_txt="${1:-}" _ef_cl
+  _ef_txt=$(printf '%s' "$_ef_txt" | tr '\n\t' '  ')
+  # the last FINDING, for the same reason _reject_fix_block takes the last FIX:
+  # a re-reject carries the superseded text first.
+  case "$_ef_txt" in
+    *FINDING:*) _ef_cl="${_ef_txt##*FINDING:}" ;;
+    # DIVE-4476 iteration 3: NO fallback. The call site hands this function
+    # `fb_txt` AFTER `_task_guard_result_over_closed` merged the MAKER's prior
+    # result into it (src/task/status.sh:122), so a "first colon wins" fallback
+    # lands inside the maker's own delivered text and shows the maker's
+    # self-report to the human AS the verifier's finding — on a gate whose two
+    # buttons are keep-going / drop-it, which is to say it argues for the wrong
+    # button in the maker's words. Unlabelled feedback is the COMMON case (the
+    # refusal upstream requires a FIX label only, and `--no-fix=` is a second
+    # legal exit with neither label): 196 of 285 recorded rejects on this board,
+    # 69%. No FINDING label therefore means no clause, which is what the
+    # docstring above already promises and what the composer degrades cleanly for.
+    *) _ef_cl="" ;;
+  esac
+  # one clause only — the first sentence or separator wins. `FIX:` is a separator
+  # too: the template writes "FINDING: … / FIX: …", but that " / " is a convention
+  # and is not enforced, so a finding written "FINDING: the relay never lands FIX:
+  # do X" would otherwise leak the very label the docstring means to exclude.
+  _ef_cl="${_ef_cl%%FIX:*}"
+  _ef_cl="${_ef_cl%%.*}"; _ef_cl="${_ef_cl%%;*}"; _ef_cl="${_ef_cl%% / *}"
+  _ef_cl="${_ef_cl#"${_ef_cl%%[![:space:]]*}"}"
+  _ef_cl=$(_task_escalation_phrase "$_ef_cl" 5)
+  # A one- or two-word fragment is noise, not a hint.
+  local -a _ef_w=(); read -r -a _ef_w <<<"$_ef_cl"
+  (( ${#_ef_w[@]} >= 3 )) || _ef_cl=""
+  printf '%s' "$_ef_cl"
+}
+
+# The ask itself. Contract: the return value ALWAYS passes the `task need`
+# readability rule, whatever is on the row.
+_task_escalation_ask() { # <row id> <iterations> [feedback text]
+  local _ea_id="${1:-}" _ea_iter="${2:-2}" _ea_fb="${3:-}"
+  local _ea_title="" _ea_subj="" _ea_find="" _ea_count _ea_ask _ea_max="${_GATE_ASK_MAX_WORDS:-25}"
+  case "$_ea_iter" in
+    # `max_iterations=1` is legal (tests/task_reject_trace_unit.sh's own fixture
+    # uses it) and rendered "sent back 1 times" to the person deciding.
+    1) _ea_count="once" ;;
+    2) _ea_count="twice" ;;
+    *) _ea_count="${_ea_iter} times" ;;
+  esac
+  # The subject-free sentence is the FLOOR: 14 words, no internal names, and it
+  # is what every degradation below falls back to.
+  local _ea_base="The work was sent back ${_ea_count} and has stopped. Keep going, or drop it?"
+  [[ "$_ea_id" =~ ^[0-9]+$ ]] || { printf '%s' "$_ea_base"; return 0; }
+  _ea_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${_ea_id};" 2>/dev/null) || _ea_title=""
+  _ea_subj=$(_task_escalation_phrase "$_ea_title" 9)
+  # Under three words the subject names nothing ("Loop two-strike" is not a
+  # subject), so it buys a cut title at no readability gain.
+  local -a _ea_sw=(); read -r -a _ea_sw <<<"$_ea_subj"
+  (( ${#_ea_sw[@]} >= 3 )) || _ea_subj=""
+  [[ -z "$_ea_subj" ]] && { printf '%s' "$_ea_base"; return 0; }
+  _ea_find=$(_task_escalation_finding "$_ea_fb")
+  _ea_ask="${_ea_subj}: sent back ${_ea_count} (${_ea_find}) and stopped. Keep going, or drop it?"
+  [[ -n "$_ea_find" ]] || _ea_ask="${_ea_subj}: sent back ${_ea_count} and stopped. Keep going, or drop it?"
+  # MEASURE THE COMPOSED STRING, do not trust the arithmetic of the budget. Drop
+  # the finding first (it is the hint), then the subject (it is the name), then
+  # the floor — each step strictly shorter and strictly more readable.
+  if declare -F _gate_ask_word_count >/dev/null 2>&1; then
+    if (( $(_gate_ask_word_count "$_ea_ask") > _ea_max )); then
+      _ea_ask="${_ea_subj}: sent back ${_ea_count} and stopped. Keep going, or drop it?"
+      (( $(_gate_ask_word_count "$_ea_ask") > _ea_max )) && _ea_ask="$_ea_base"
+    fi
+  fi
+  if declare -F _gate_ask_jargon_term >/dev/null 2>&1; then
+    _gate_ask_jargon_term "$_ea_ask" >/dev/null 2>&1 && _ea_ask="$_ea_base"
+  fi
+  printf '%s' "$_ea_ask"
+}
+
 cmd_task_reject() {
   tasks_db_init
   local task="" feedback="" no_fix=""
@@ -1123,15 +1285,25 @@ cmd_task_reject() {
     _task_reject_emit_event "$ident" "$id" "$_rj_actor" "$_rj_prev" "$iter" "$maxi" \
       "escalated to human review at the iteration cap (loop stuck, not bounced back)"
     warn "$ident hit max_iterations ($maxi) — escalating to human review"
-    # DIVE-4176: this ask lands on the PAIRED HUMAN, so it is written for one —
-    # no ident, no branch, no interpolated verifier feedback (that text is already
-    # on the row's `result`, written six lines up, and the row is what the gate
-    # points at). The readability refusal in `task need` grades this string like
-    # any other; a control arm in tests/gate_ask_readability_unit.sh keeps it from
-    # drifting back into machine vocabulary, where the refusal would make `reject`
-    # itself fail at the iteration cap.
-    cmd_task_need "$id" --type=manual --from="${vfier:-verifier}" \
-      --ask="A piece of work has failed review ${iter} times and stopped. Decide whether to keep going or drop it."
+    # DIVE-4176: this ask is written for a person — no ident, no branch, no
+    # interpolated verifier feedback (that text is already on the row's `result`,
+    # written six lines up, and the row is what the gate points at). The
+    # readability refusal in `task need` grades this string like any other, so a
+    # regression here would make `reject` itself fail at the iteration cap; the
+    # composer above is written to be unconditionally fileable for that reason and
+    # tests/escalation_ask_unit.sh grades the string it actually produces.
+    #
+    # DIVE-4476: `decision`, not `manual`. The type is not cosmetic — it is the
+    # ROUTE and it is the BUTTONS. `manual` is tier-2 by type, so it went straight
+    # to the paired human and rendered one "Tap ✅ Done" that answered neither half
+    # of its own question. `decision` defaults to tier 1, which routes to the
+    # filing verifier's lead (a two-strike stop is the orchestrator's call —
+    # DIVE-4346/4365) and renders the two options below as the two taps. The human
+    # is reached only when the chart resolves nobody above the verifier, which is
+    # the fallback, not the destination.
+    cmd_task_need "$id" --type=decision --from="${vfier:-verifier}" \
+      --options="$_ESCALATION_OPTIONS" --recommend="$_ESCALATION_RECOMMEND" \
+      --ask="$(_task_escalation_ask "$id" "$iter" "$fb_txt")"
     return
   fi
   # Otherwise bounce back to the maker for another pass.
