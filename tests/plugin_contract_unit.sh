@@ -513,6 +513,50 @@ t  "T9m3 ...and the failure is recorded, not swallowed"   "7" \
 t  "T9m4 ...as not-ok, so the page re-offers the button"  "false" \
   "$(jq -r '."setupbad@fixture".setup.ok' "$INST")"
 
+# =============================================================================
+# T9p-T9u — WHOSE box-half is it? (DIVE-4475)
+# =============================================================================
+# The defect these arms exist for: `plugin setup` ran the publisher's command as
+# root, and every shipped setup command begins with `sudo`. An inner `sudo` from
+# a root caller sets SUDO_USER=root, so `5dive browser setup` — which refuses to
+# make root a browser seat, correctly — was UNRUNNABLE through this verb on
+# every box. The existing T9f-T9n fixtures could not see it: their command is
+# `touch $SENTINEL`, which has no opinion about who runs it.
+#
+# So: one fixture command that READS the seat, plus the decision seam graded
+# directly. The seam is graded directly because the interesting case is euid 0
+# and this harness is not root — a pure (caller, euid) -> argv function is
+# observable at any uid, a `sudo` buried in the verb is not.
+
+t "T9p as root, a real seat is restored by dropping to it" "sudo -u alice --" \
+  "$(_plugin_setup_runner alice 0 | tr '\n' ' ' | sed 's/ $//')"
+t "T9p2 ...and a root CALLER gets no wrapper (there is no seat to restore)" "" \
+  "$(_plugin_setup_runner root 0)"
+t "T9p3 ...and an unprivileged caller is already the right seat, so no sudo" "" \
+  "$(_plugin_setup_runner alice 1000)"
+t "T9p4 ...and an empty caller is never turned into 'sudo -u ' " "" \
+  "$(_plugin_setup_runner "" 0)"
+
+# THE FIXTURE WITH AN OPINION. Its command reads SUDO_USER — the one thing the
+# browser plugin uses to pick the profile owner — and writes what it saw. An arm
+# that asserts on this cannot pass while the verb launders the seat.
+SEATSEEN="$TMP/seat-seen"
+mkplugin setupseat "$(manifest setupseat 1.0.0 official '["channel"]' '[]' \
+  "$(jq -cn --arg f "$SEATSEEN" '{setup:{hint:"needs to know whose box-half this is",
+                                          command:("printf %s \"$SUDO_USER\" > " + $f)}}')")"
+mkindex
+run _plugin_mkt_upgrade fixture
+run cmd_plugin_add setupseat@fixture --yes
+t "T9q0 (precondition) the seat-reading fixture installed" "0" "$RC"
+
+SUDO_USER=alice run cmd_plugin_setup setupseat@fixture --yes
+t  "T9q the publisher's command SEES the calling seat, not root"  "alice" \
+   "$(cat "$SEATSEEN" 2>/dev/null)"
+t  "T9q2 ...and the same seat is what got recorded on the entry"  "alice" \
+   "$(jq -r '."setupseat@fixture".setup.by' "$INST")"
+tc "T9q3 ...and the consent screen names that seat, not 'as root'" "it runs, as alice:" "$OUT$ERR"
+tn "T9q4 ...so the old unconditional 'as root' claim is gone"      "it runs, as root:" "$OUT$ERR"
+
 # `plugin setup` is reachable through the real dispatcher, not only as a function
 # this harness calls directly.
 run cmd_plugin setup
