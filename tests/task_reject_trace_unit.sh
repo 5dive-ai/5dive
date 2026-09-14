@@ -172,9 +172,18 @@ c_row2=$(JSON_MODE=1 cmd_task_ls --all 2>/dev/null | jq -c --arg i "$C" '.data.t
 F=$(seed "F reject at the iteration cap escalates")
 db "UPDATE tasks SET max_iterations=1, iteration=1 WHERE ident=$(sqlq "$F");"
 out=$(as main cmd_task_reject "$F" --feedback="still wrong at the cap FIX: name the concrete change"); rc=$?
-[[ "$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident=$(sqlq "$F");")" == "manual" ]] \
-  && ok_t "F fixture took the ESCALATION branch (a manual gate was filed), not the bounce-back" \
-  || bad_t "F wrong branch" "need_type='$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident=$(sqlq "$F");")' — arm F below would grade the ordinary path twice"
+# DIVE-4476: the discriminator is the escalation's gate CONTRACT, not merely a type
+# string. It used to read need_type='manual'; that branch now files a `decision`
+# carrying two named outcomes, because `manual` is tier-2 BY TYPE — it went straight
+# to the paired human and rendered a single "Tap ✅ Done" that answered neither half
+# of its own question. Assert the type AND both outcomes together: a later type or
+# button change then fails HERE loudly, instead of silently sending the three arms
+# below to grade the ordinary bounce-back a second time.
+f_type=$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident=$(sqlq "$F");")
+f_opts=$(db "SELECT COALESCE(need_options,'') FROM tasks WHERE ident=$(sqlq "$F");")
+[[ "$f_type" == "decision" && "$f_opts" == *"keep going"* && "$f_opts" == *"drop it"* ]] \
+  && ok_t "F fixture took the ESCALATION branch (a decision gate offering both outcomes: '$f_opts'), not the bounce-back" \
+  || bad_t "F wrong branch" "need_type='$f_type' need_options='$f_opts' — expected a decision gate with both outcomes; arm F below would grade the ordinary path twice"
 [[ "$(events_of "$F" task.rejected)" == "1" ]] \
   && ok_t "F the escalating reject ALSO emits task.rejected (both write sites, one emitter)" \
   || bad_t "F escalation emits nothing" "count=$(events_of "$F" task.rejected) — the terminal reject leaves no trace"
