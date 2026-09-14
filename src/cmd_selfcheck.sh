@@ -246,7 +246,7 @@ _sc_probe_t2_forge() {
     : > "$d/gate-proof.enforce"     # the live fleet posture since 2026-07-30
 
     seed() { db "INSERT INTO tasks (ident,title,status,created_by) VALUES ('$1','selfcheck','todo','main');" >/dev/null 2>&1
-             cmd_task_need "$1" --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 \
+             cmd_task_need "$1" --type=decision --ask="pick a lane" --options="take the left lane|take the right lane" --recommend="take the left lane" --tier=2 \
                --needs=human_tap >/dev/null 2>&1; }   # DIVE-2848: this prover NEEDS a hard-human gate to forge against, so it declares one instead of hand-pinning a tier the cap now refuses
     by() { db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='$1';"; }
 
@@ -285,7 +285,7 @@ _sc_probe_t2_forge() {
     printf 'pinned=%s\n' "$(_gate_authenticated_actor)"
     seed DIVE-990001
     printf 'tier=%s\n' "$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-990001';")"
-    ( GATE_PROOF_ENFORCE=/nonexistent/nope cmd_task_answer DIVE-990001 --value=A --human ) >/dev/null 2>&1
+    ( GATE_PROOF_ENFORCE=/nonexistent/nope cmd_task_answer DIVE-990001 --value="take the left lane" --human ) >/dev/null 2>&1
     printf 'forged=%s\n' "$(by DIVE-990001)"
 
     # (b) LIVENESS: a real human path on an identical gate must still clear. The pin
@@ -306,7 +306,7 @@ _sc_probe_t2_forge() {
     # ran, not about the floor.
     _gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }
     export SUDO_UID=0
-    ( cmd_task_answer DIVE-990002 --value=A --human ) >/dev/null 2>&1
+    ( cmd_task_answer DIVE-990002 --value="take the left lane" --human ) >/dev/null 2>&1
     printf 'human=%s\n' "$(by DIVE-990002)"
   )
   rm -rf "$d"
