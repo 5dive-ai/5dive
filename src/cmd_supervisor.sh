@@ -585,27 +585,70 @@ _SUP_PROMPT_PAT="${SUPERVISOR_PROMPT_PAT:-}"
 #
 # DIVE-4293 above reads the footer the harness renders under AskUserQuestion and
 # ExitPlanMode ("Enter to select"). There is a second modal that freezes a seat
-# exactly as hard and renders a DIFFERENT footer:
+# exactly as hard and renders a DIFFERENT footer. It is claude's own
+# tool-permission confirm: a line naming the flagged command, a question asking
+# whether to go ahead, a numbered option list whose first entry is the
+# affirmative one, and a one-line footer offering the escape key. The three
+# parts this reader keys on are the defaults of the three _PAT variables below;
+# the modal is NOT transcribed here, for the reason the next paragraph gives.
 #
-#     Dangerous rm operation on possibly-empty variable path: "$out/$f"
-#     Do you want to proceed?
-#     ❯ 1. Yes
-#       2. No
-#     Esc to cancel · Tab to amend
+# It fires even under bypassPermissions — bypass is not a no-questions mode —
+# and it is not an AskUserQuestion, so DIVE-4293's PreToolUse hook never sees it
+# either. Nothing in this fleet could read it. dev3 sat on one for ~10h on a
+# live row on 2026-09-14 and every surface said the seat was fine.
 #
-# It is claude's own tool-permission confirm. It fires even under
-# bypassPermissions — bypass is not a no-questions mode — and it is not an
-# AskUserQuestion, so DIVE-4293's PreToolUse hook never sees it either. Nothing
-# in this fleet could read it. dev3 sat on one for ~10h on a live row on
-# 2026-09-14 and every surface said the seat was fine.
+# THE SIGNATURE IS A POSITION, NOT A CONJUNCTION (DIVE-4536 it.2).
 #
-# THE SIGNATURE IS A CONJUNCTION, NOT A SENTENCE, and that is the whole
-# false-positive control. "Do you want to proceed?" is a string agents WRITE —
-# the row that ordered this fix contains it twice — so matching the question
-# alone would classify any seat discussing the confirm as sitting on one. All
-# three parts must be on the 12-line tail together: the question, a numbered
-# Yes option, and the Esc footer. A quoted mention in prose carries the sentence
-# and neither of the other two.
+# Iteration 1 keyed on the three parts co-occurring in the pane tail and claimed
+# that "a quoted mention in prose carries the sentence and neither of the other
+# two". THAT CLAIM WAS FALSE, and it was falsified by two artifacts iteration 1
+# itself shipped: the task row documenting the incident, and the wiki page
+# written to explain it, both quote main's capture VERBATIM — all three parts,
+# adjacent. Prose about a pane signature is not a paraphrase of it, it is a
+# transcript of it, and faithfulness is the whole point of the document. Any
+# claude seat idle >=10m with either artifact in its capture window would have
+# been read as sitting on a confirm, taken an Escape into a LIVE pane, and had a
+# fabricated decline appended to its row — this row's own defect shape, one
+# layer up: the documentation of the stall becomes the trigger that hides the
+# next one.
+#
+# What actually separates an instance from a transcript is WHERE it sits, per
+# community/wiki/documenting-machinery-inside-its-own-data-store-manufactures-
+# false-positives.md ("anchor on position, not presence"):
+#
+#   * A LIVE modal is drawn at the BOTTOM of the pane, in place of the input
+#     box. Below its footer there is only chrome — the box rule, the usage/model
+#     line, the mode line. MEASURED 2026-09-14 on a live claude pane
+#     (`tmux capture-pane -p -S -40` on agent-ops' own session): exactly TWO
+#     non-empty lines below the input box's bottom rule; tests/ask_capture_unit.sh's
+#     independently-written claude frame models THREE. _SUP_CONFIRM_TAIL_LINES
+#     is 8 — better than 2x the measured chrome, so an extra hint, queue or
+#     border line cannot produce a false negative, and still 5 clear of the
+#     nearest REAL quotation measured in the population (the incident row's own
+#     `task show` output carries the footer 13 non-empty lines from the end; the
+#     wiki page, 24).
+#   * A transcript has DOCUMENT after it — the next line of the row body is the
+#     sentence explaining what the modal is; the next line of the wiki page is a
+#     closing fence.
+#
+# The conjunction is kept and tightened rather than replaced, because position
+# alone would accept a pane whose last lines happen to be a quoted question:
+# ordering is now STRICT (question strictly above the affirmative option,
+# affirmative option strictly above the footer — the modal's actual geometry, and
+# a one-line prose mention carrying all three parts at once therefore fails), and
+# the parts must be ADJACENT (_SUP_CONFIRM_SPAN_LINES / _SUP_CONFIRM_ADJ_LINES,
+# measured from the capture: question→option 1 line, question→footer 3, so 2 and
+# 4 carry a border line of slack).
+#
+# RESIDUAL, SIGNED: a capture whose BOTTOM-MOST content is a verbatim, correctly
+# ordered transcript of the modal is not distinguishable from the modal by any
+# rule in this function — the bytes are the same and there is nothing after
+# either. That is why fix (3) of this iteration is the other half: the documents
+# this change ships have their literals BROKEN, so our own writing cannot be a
+# member of the population we scan. The bias of every constant here is
+# false-negative: an unmatched confirm degrades to exactly the pre-DIVE-4536
+# behaviour, which is the incident, whereas a false positive interrupts a
+# working seat.
 _SUP_CONFIRM_PAT="${SUPERVISOR_CONFIRM_PAT:-}"
 [[ -n "$_SUP_CONFIRM_PAT" ]] || _SUP_CONFIRM_PAT='Do you want to (proceed|continue)'
 _SUP_CONFIRM_YES_PAT="${SUPERVISOR_CONFIRM_YES_PAT:-}"
@@ -613,6 +656,18 @@ _SUP_CONFIRM_YES_PAT="${SUPERVISOR_CONFIRM_YES_PAT:-}"
 _SUP_CONFIRM_FOOTER_PAT="${SUPERVISOR_CONFIRM_FOOTER_PAT:-}"
 [[ -n "$_SUP_CONFIRM_FOOTER_PAT" ]] || _SUP_CONFIRM_FOOTER_PAT='Esc to cancel'
 
+# The position anchors. All three count NON-EMPTY lines, because a capture is
+# padded to the pane height with blanks and a modal is not the last ROW of the
+# pane, it is the last CONTENT of it.
+#   TAIL — how far from the end of the capture the footer may sit.
+#   SPAN — greatest distance from the question line to the footer line.
+#   ADJ  — greatest distance from the question line to the affirmative option.
+_SUP_CONFIRM_TAIL_LINES="${SUPERVISOR_CONFIRM_TAIL_LINES:-8}"
+[[ "$_SUP_CONFIRM_TAIL_LINES" =~ ^[0-9]+$ ]] || _SUP_CONFIRM_TAIL_LINES=8
+_SUP_CONFIRM_SPAN_LINES="${SUPERVISOR_CONFIRM_SPAN_LINES:-4}"
+[[ "$_SUP_CONFIRM_SPAN_LINES" =~ ^[0-9]+$ ]] || _SUP_CONFIRM_SPAN_LINES=4
+_SUP_CONFIRM_ADJ_LINES="${SUPERVISOR_CONFIRM_ADJ_LINES:-2}"
+[[ "$_SUP_CONFIRM_ADJ_LINES" =~ ^[0-9]+$ ]] || _SUP_CONFIRM_ADJ_LINES=2
 # HOW LONG a confirm must stand before this watchdog presses a key on the seat's
 # behalf. The ALERT is immediate (a frozen seat is a frozen seat); only the
 # keystroke waits. Ten minutes is one tick: long enough that we are never racing
@@ -622,20 +677,44 @@ _SUP_T_CONFIRM_DWELL_MIN="${SUPERVISOR_T_CONFIRM_DWELL_MIN:-10}"
 [[ "$_SUP_T_CONFIRM_DWELL_MIN" =~ ^[0-9]+$ ]] || _SUP_T_CONFIRM_DWELL_MIN=10
 
 # _sup_confirm_match — pure, no I/O. Echoes the confirm's question line (trimmed)
-# when the pane tail carries the whole three-part signature, empty otherwise.
+# when the pane tail carries the whole signature AT THE BOTTOM, empty otherwise.
 # Split from the capture for the same reason every other matcher here is: the
-# false-positive-critical regex has to be gradeable without a live tmux.
+# false-positive-critical rule has to be gradeable without a live tmux. See the
+# block above for why this is a position test and not a co-occurrence test.
 _sup_confirm_match() {  # <pane-text-on-stdin>
-  local tail q
+  local tail ln n lo f w q y i
   tail=$(_sup_pane_drop_echoes) || return 0
   [[ -n "$tail" ]] || return 0
-  grep -qE "$_SUP_CONFIRM_YES_PAT"    <<<"$tail" 2>/dev/null || return 0
-  grep -qE "$_SUP_CONFIRM_FOOTER_PAT" <<<"$tail" 2>/dev/null || return 0
-  q=$(grep -E "$_SUP_CONFIRM_PAT" <<<"$tail" 2>/dev/null | tail -1) || return 0
-  [[ -n "$q" ]] || return 0
-  printf '%s\n' "$q" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
+  local -a L=()
+  while IFS= read -r ln; do
+    [[ "$ln" =~ ^[[:space:]]*$ ]] && continue
+    L+=("$ln")
+  done <<<"$tail"
+  n=${#L[@]}
+  (( n > 0 )) || return 0
+  # Anchor: the footer must sit inside the last _SUP_CONFIRM_TAIL_LINES non-empty
+  # lines. Scan from the bottom up so the LOWEST qualifying footer wins — on a
+  # pane that carries both a transcript and a live modal, the modal is the lower.
+  lo=$(( n - _SUP_CONFIRM_TAIL_LINES )); (( lo < 0 )) && lo=0
+  for (( f = n - 1; f >= lo; f-- )); do
+    grep -qE "$_SUP_CONFIRM_FOOTER_PAT" <<<"${L[f]}" 2>/dev/null || continue
+    w=$(( f - _SUP_CONFIRM_SPAN_LINES )); (( w < 0 )) && w=0
+    q=-1; y=-1
+    # Strict geometry: question, then the affirmative option, then the footer —
+    # each on its OWN line and in that order. A prose mention that carries all
+    # three parts on one line (this row's `result` field does exactly that) has
+    # no ordering and is rejected here, not by the anchor.
+    for (( i = w; i < f; i++ )); do
+      if (( q < 0 )) && grep -qE "$_SUP_CONFIRM_PAT" <<<"${L[i]}" 2>/dev/null; then q=$i; continue; fi
+      if (( q >= 0 && y < 0 && i > q )) && grep -qE "$_SUP_CONFIRM_YES_PAT" <<<"${L[i]}" 2>/dev/null; then y=$i; fi
+    done
+    (( q >= 0 && y > q && y < f )) || continue
+    (( y - q <= _SUP_CONFIRM_ADJ_LINES )) || continue
+    printf '%s\n' "${L[q]}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
+    return 0
+  done
+  return 0
 }
-
 # _sup_prompt_match — pure, no I/O. Echoes the footer line (trimmed) when the
 # pane tail is sitting on a picker, empty otherwise. Split out from the capture
 # for the same reason _sup_verify_match and _sup_quota_match are: the

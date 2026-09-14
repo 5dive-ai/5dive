@@ -49,10 +49,37 @@ WEEKLY_ONLY_PANE=$'  weekly limit 7d: 100% — no further requests this window'
 
 # The incident pane, verbatim from main's capture at 2026-09-14 13:49Z.
 CONFIRM_PANE=$'Add cmd_read and cmd_links to bin/browser\nDangerous rm operation on possibly-empty variable path: "$out/$f"\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend'
-# FALSE-POSITIVE CONTROL: a seat DISCUSSING the confirm. This row's own body
-# contains the question twice; it carries the sentence and neither of the other
-# two parts of the signature.
-PROSE_PANE=$'> the pane showed "Do you want to proceed?" and nobody answered it\n  for ten hours, per the supervisor log — writing that up now.'
+# FALSE-POSITIVE CONTROLS, DRAWN FROM THE POPULATION, NOT COMPOSED (it.2).
+#
+# Iteration 1 shipped a two-line paraphrase written by the author against the
+# author's own pattern — a specimen of the false positive already known to be
+# avoided, which is not a control. The verifier fed the real population instead
+# and found TWO hits, both on disk in the same commit as the detector. They are
+# checked in VERBATIM here, exactly as they were when they tripped it:
+#
+#   row-body-task-show.txt — the output of `5dive task show DIVE-4536`, which
+#     quotes main's 13:49Z capture in full (all three parts, adjacent) and
+#     carries them a SECOND time, all on ONE line, in the delivered `result`.
+#   wiki-bypass-mode.md — the page written in THIS delivery to document the
+#     defect, fenced block, all three parts. Snapshotted BEFORE its literals
+#     were broken, on purpose: a control has to be the thing that failed. The
+#     live page no longer carries them either, which is the other half of the
+#     fix, not a substitute for this arm.
+#
+# Do not "tidy" these files. Their value is that nobody wrote them for this test.
+FIX_ROW_BODY=tests/fixtures/dive4536/row-body-task-show.txt
+FIX_WIKI_PAGE=tests/fixtures/dive4536/wiki-bypass-mode.md
+
+# The incident capture with the chrome a REAL claude pane draws under a modal —
+# measured 2026-09-14 from a live pane (`tmux capture-pane -p -S -40`): the box
+# rule, the usage/model line, the mode line. The positive control has to carry
+# this, or the tail anchor is being graded against a fixture that ends at the
+# footer and the constant is never exercised.
+CONFIRM_PANE_CHROME=$'Add cmd_read and cmd_links to bin/browser\nDangerous rm operation on possibly-empty variable path: "$out/$f"\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend\n────────────────────────────────────────\n  Opus 5 5h: 9% 7d: 80%\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent'
+
+# A prose mention that carries ALL THREE parts on ONE line — the shape of this
+# row's own `result` field. Killed by the strict ordering, not by the anchor.
+ONELINE_MENTION=$'the built-in confirm (Do you want to proceed? / ❯ 1. Yes / Esc to cancel) is\n  invisible to the DIVE-4293 hook, so nothing read it for ten hours.'
 # The DIVE-4293 picker, unchanged. Must still read as blocked-on-prompt and must
 # NOT be downgraded to a decline (Enter on it is the model'"'"'s own answer).
 PICKER_PANE=$'Which approach?\n❯ 1. Rebuild the index (Recommended)\n  2. Patch in place\n↑/↓ to navigate · Enter to select'
@@ -88,8 +115,41 @@ ok "mutant reverted — the meter is clean again" \
 # ── defect 2: the built-in confirm is a recognised state ─────────────────────
 ok "the confirm's question line is matched" \
   "Do you want to proceed?" "$(printf '%s\n' "$CONFIRM_PANE" | _sup_confirm_match)"
-ok "FALSE-POSITIVE CONTROL: prose quoting the question is NOT a confirm" \
-  "" "$(printf '%s\n' "$PROSE_PANE" | _sup_confirm_match)"
+ok "POSITIVE CONTROL: the incident capture WITH real pane chrome still matches" \
+  "Do you want to proceed?" "$(printf '%s\n' "$CONFIRM_PANE_CHROME" | _sup_confirm_match)"
+ok "FALSE-POSITIVE (population): \`task show DIVE-4536\` is NOT a confirm" \
+  "" "$(_sup_confirm_match < "$FIX_ROW_BODY")"
+ok "FALSE-POSITIVE (population): the bypass-mode wiki page is NOT a confirm" \
+  "" "$(_sup_confirm_match < "$FIX_WIKI_PAGE")"
+ok "FALSE-POSITIVE: all three parts on ONE line (the result field) is NOT a confirm" \
+  "" "$(printf '%s\n' "$ONELINE_MENTION" | _sup_confirm_match)"
+# The fixtures must still CONTAIN the signature, or the two arms above pass for
+# the wrong reason (a control that no longer carries the thing controls nothing).
+if grep -q 'Do you want to proceed' "$FIX_ROW_BODY" && grep -qE '^[[:space:]]*❯?[[:space:]]*1\. Yes' "$FIX_ROW_BODY" \
+   && grep -q 'Esc to cancel' "$FIX_ROW_BODY"; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); echo "FAIL: row-body fixture no longer carries all three parts — it is not a control"; fi
+if grep -q 'Do you want to proceed' "$FIX_WIKI_PAGE" && grep -qE '^[[:space:]]*❯?[[:space:]]*1\. Yes' "$FIX_WIKI_PAGE" \
+   && grep -q 'Esc to cancel' "$FIX_WIKI_PAGE"; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); echo "FAIL: wiki fixture no longer carries all three parts — it is not a control"; fi
+
+# ANCHORED MUTANT: widen the tail anchor past the footer's real offset in the
+# row body (13 non-empty lines from the end) and the population arm MUST go red.
+# This is what proves the POSITION is load-bearing rather than some other
+# accident of the fixture.
+_real_tail=$_SUP_CONFIRM_TAIL_LINES
+_SUP_CONFIRM_TAIL_LINES=999
+_mut_row=$(_sup_confirm_match < "$FIX_ROW_BODY")
+_mut_wiki=$(_sup_confirm_match < "$FIX_WIKI_PAGE")
+_SUP_CONFIRM_TAIL_LINES=$_real_tail
+if [[ -n "$_mut_row" && -n "$_mut_wiki" ]]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); echo "FAIL: ANCHORED MUTANT — unanchoring did NOT re-admit the population hits (row='$_mut_row' wiki='$_mut_wiki'), so the anchor is not what kills them"; fi
+ok "mutant reverted — the row body is clean again" "" "$(_sup_confirm_match < "$FIX_ROW_BODY")"
+
+# The SPAN and ADJ anchors are load-bearing too: push the option away from the
+# question by more than ADJ and the real capture must stop matching.
+SPACED_PANE=$'Do you want to proceed?\n  (some intervening render)\n  (another line)\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend'
+ok "question and option more than ADJ apart -> no match" \
+  "" "$(printf '%s\n' "$SPACED_PANE" | _sup_confirm_match)"
 ok "the DIVE-4293 picker is not read as a confirm" \
   "" "$(printf '%s\n' "$PICKER_PANE" | _sup_confirm_match)"
 ok "the DIVE-4293 picker still matches its own footer" \
