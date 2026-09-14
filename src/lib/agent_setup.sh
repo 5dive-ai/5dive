@@ -483,7 +483,9 @@ _codex_sync_operating_baseline_file() { # <file> <agent-name>
     ' "$file" >"$out" || { rm -f "$out" "$bf"; return 1; }
     rm -f "$bf"
   else
-    { cat "$file"; [[ ! -s "$file" ]] || printf '\n'; printf '%s\n' "$block"; } >"$out"
+    cat "$file" >"$out" || { rm -f "$out"; return 1; }
+    { [[ ! -s "$file" ]] || printf '\n'; printf '%s\n' "$block"; } >>"$out" \
+      || { rm -f "$out"; return 1; }
   fi
   if ! cmp -s "$out" "$file"; then
     mv -f "$out" "$file" || { rm -f "$out"; return 1; }

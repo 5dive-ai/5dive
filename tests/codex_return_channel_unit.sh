@@ -66,6 +66,7 @@ install() {                                          # honor -d (mkdir) and file
     esac
     shift
   done
+  [[ "$dest" != "$HOME_BASE/agent-broken-codex/.codex" ]] || return 1
   if (( mkdir )); then mkdir -p "$dest"; else : >"$dest"; fi
 }
 sudo() {                                             # drop `-u <user>`, run the rest here
@@ -129,22 +130,58 @@ fi
 broken_after=$(sha256sum "$broken" | awk '{print $1}')
 check "malformed block is untouched"    '[[ "$broken_before" == "$broken_after" ]]'
 
+# A failed read in the unmarked append path must fail without replacing the
+# original. This is the short-write/no-space shape from the verifier receipt.
+append_fail="$HOME_BASE/append-fail.md"
+printf 'ORIGINAL USER TEXT\n' >"$append_fail"
+cat() {
+  if [[ "${1:-}" == "$append_fail" ]]; then printf 'IRR'; return 1; fi
+  command cat "$@"
+}
+if _codex_sync_operating_baseline_file "$append_fail" append-fail; then
+  echo "FAIL: failed append read must be refused"
+  exit 1
+fi
+unset -f cat
+check "failed append leaves original"   'grep -qx "ORIGINAL USER TEXT" "$append_fail"'
+
 # The upgrade primitive filters the registry to Codex seats only and reports all
-# four outcomes. One fixture starts current so changing current -> updated is red.
-mkdir -p "$HOME_BASE/agent-fleet-codex" "$HOME_BASE/agent-current-codex/.codex" "$HOME_BASE/agent-fleet-claude"
+# four outcomes. One fixture starts current and one hits a real install failure,
+# so the install-error, accounting, non-zero, and warning branches are live.
+mkdir -p "$HOME_BASE/agent-fleet-codex" "$HOME_BASE/agent-current-codex/.codex" "$HOME_BASE/agent-broken-codex" "$HOME_BASE/agent-fleet-claude"
 _codex_operating_baseline_doc current-codex >"$HOME_BASE/agent-current-codex/.codex/AGENTS.md"
 require_root() { :; }
 SYNC_SUMMARY=""
 ok() { SYNC_SUMMARY="$1"; }
 WARN_LOG="$tmp/warn.log"
-warn() { printf '%s\n' "$*" >>"$WARN_LOG"; }
+WARN_SUMMARY=""
+warn() { WARN_SUMMARY="$1"; printf '%s\n' "$*" >>"$WARN_LOG"; }
 export CODEX_AGENT_HOME_ROOT="$HOME_BASE"
 REGISTRY="$tmp/agents.json"
-printf '%s\n' '{"agents":{"fleet-codex":{"type":"codex"},"current-codex":{"type":"codex"},"missing-codex":{"type":"codex"},"fleet-claude":{"type":"claude"}}}' >"$REGISTRY"
-cmd_agent_sync_codex_baseline
+printf '%s\n' '{"agents":{"fleet-codex":{"type":"codex"},"current-codex":{"type":"codex"},"missing-codex":{"type":"codex"},"broken-codex":{"type":"codex"},"fleet-claude":{"type":"claude"}}}' >"$REGISTRY"
+fleet_rc=0
+cmd_agent_sync_codex_baseline || fleet_rc=$?
 check "upgrade syncs existing codex"    '[[ -f "$HOME_BASE/agent-fleet-codex/.codex/AGENTS.md" ]]'
 check "upgrade skips non-codex"         '[[ ! -e "$HOME_BASE/agent-fleet-claude/.codex/AGENTS.md" ]]'
-check "upgrade counts real outcomes"    '[[ "$SYNC_SUMMARY" == *"updated=1, current=1, skipped=1, failed=0"* ]]'
+check "failure summary counts all arms" '[[ "$WARN_SUMMARY" == *"updated=1, current=1, skipped=1, failed=1"* ]]'
+check "fleet failure returns nonzero"   '[[ "$fleet_rc" -ne 0 ]]'
+check "fleet failure warns incomplete" 'grep -q "reconcile incomplete" "$WARN_LOG"'
+
+# The wildcard state is also fail-closed. Route exactly one fixture through an
+# impossible success token so mutating the *) arm to current is observable.
+real_preseed=$(declare -f preseed_codex_return_channel | sed '1s/preseed_codex_return_channel/_real_preseed_codex_return_channel/')
+eval "$real_preseed"
+preseed_codex_return_channel() {
+  [[ "$1" != "unexpected-codex" ]] || { printf 'impossible-state\n'; return 0; }
+  _real_preseed_codex_return_channel "$@"
+}
+printf '%s\n' '{"agents":{"unexpected-codex":{"type":"codex"}}}' >"$REGISTRY"
+: >"$WARN_LOG"; WARN_SUMMARY=""; unexpected_rc=0
+cmd_agent_sync_codex_baseline || unexpected_rc=$?
+check "unknown state returns nonzero"   '[[ "$unexpected_rc" -ne 0 ]]'
+check "unknown state counts failure"    '[[ "$WARN_SUMMARY" == *"updated=0, current=0, skipped=0, failed=1"* ]]'
+unset -f preseed_codex_return_channel
+eval "$(declare -f _real_preseed_codex_return_channel | sed '1s/_real_preseed_codex_return_channel/preseed_codex_return_channel/')"
 
 # Missing, unreadable, and malformed registries fail loud instead of collapsing
 # to a vacuous green fleet pass.
