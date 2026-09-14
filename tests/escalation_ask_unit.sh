@@ -189,6 +189,28 @@ ESC_FLOOR=$(_task_escalation_ask "$(rowid ESC-C-FLOOR)" 2 "$FB")
 eq_t "C-floor: a title that is only an ident degrades to the subject-free sentence" \
      "$ESC_FLOOR" "The work was sent back twice and has stopped. Keep going, or drop it?"
 
+# C-backstop — THE GUARD OF LAST RESORT, GRADED DIRECTLY.
+# The composer checks the FINISHED string against the classifier after building
+# it word by word. No title can reach that check today (the per-word walk has
+# already dropped everything it would catch), so a mutant that deletes it
+# SURVIVES the cases above — which means the guard is untested code, and untested
+# code in the position "this is what stops `task reject` failing at the cap" is
+# the wrong kind of comfort. It is graded here by disabling the per-word walk,
+# which is exactly the future in which the guard becomes load-bearing: a
+# classifier that gains a rule the word walk cannot express.
+_esc_phrase_real=$(declare -f _task_escalation_phrase)
+_task_escalation_phrase() { printf '%s' "${1:-}"; }   # let everything through
+seed ESC-BACKSTOP "DIVE-4476 regressed the ask at head e131860"
+ESC_BACKSTOP=$(_task_escalation_ask "$(rowid ESC-BACKSTOP)" 2 "$FB")
+_j=$(_gate_ask_jargon_term "$ESC_BACKSTOP" 2>/dev/null) || _j="CLEAN"
+eq_t "C-backstop: with the word walk disabled the FINISHED string is still clean" "$_j" "CLEAN"
+eq_t "C-backstop2: ... because it fell all the way to the subject-free floor" \
+     "$ESC_BACKSTOP" "The work was sent back twice and has stopped. Keep going, or drop it?"
+eval "$_esc_phrase_real"
+# The control: the walk really is back, or every case after this grades a stub.
+eq_t "C-backstop3: CONTROL — the real phrase builder was restored" \
+     "$(_task_escalation_phrase "keep this part DIVE-1 drop that" 9)" "keep this part"
+
 # ============ D. THE ROUTE — a two-strike stop is the lead's call first ======
 # DIVE-4346/4365: the orchestrator clears first. The old gate was `manual`, which
 # is tier 2 BY TYPE and therefore reached lodar whatever the chart said. This is
