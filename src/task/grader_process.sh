@@ -113,6 +113,26 @@ _GRADER_PROCESS_CLI="${_GRADER_PROCESS_CLI:-claude}"
 # so the mapping is total in both directions.
 _GRADER_CLONE_PREFIX="${_GRADER_CLONE_PREFIX:-gr-}"
 
+# THE HOME ROOT AND THE QUARANTINE DIRECTORY ARE NAMED PRIVATELY HERE, AND THAT
+# IS A BUILD CONSTRAINT, NOT A STYLE CHOICE (DIVE-4496 iteration 2).
+#
+# The CLI-wide overrides for these two live as TOP-LEVEL assignments in
+# src/cmd_agent_create.sh (the "STATE_DIR-style override ... what lets the
+# rootless unit harness drive these paths" clause). `lazy_tokens` matches a bare
+# word anywhere in a file — comments included, deliberately — so merely NAMING
+# either of those two globals here would have made this module depend on that
+# one. This module is in the universal `__MODDEPS` set, so that single edge
+# closes over every module and every verb in the CLI then loads the agent-create
+# module: measured on the bundle, `whoami` 8 -> 9 modules, `task ls` 13 -> 14,
+# `heartbeat ls` 11 -> 12. A fleet-wide startup cost.
+#
+# And it bought nothing. Those globals are themselves only `${NAME:-/home}` over
+# the environment, so a `:-` fallback read here supplied exactly what loading the
+# provider would have. The private names below keep the test seam (the harness
+# sets them) and carry the same defaults, with no edge.
+_GRADER_HOME_ROOT="${_GRADER_HOME_ROOT:-/home}"
+_GRADER_QUARANTINE_DIR="${_GRADER_QUARANTINE_DIR:-${_GRADER_HOME_ROOT}/.5dive-reaped}"
+
 # `_grader_clone_name <session-id>` — `quinn#3` -> `gr-quinn-3`, or non-zero.
 #
 # REFUSES rather than truncates. A truncated seat name would still create, and it
@@ -438,7 +458,7 @@ _grader_clone_creds() {  # <clone> <pool_seat>
   local clone="$1" pool="$2" rel src dst
   [[ -n "$clone" && -n "$pool" ]] || return 1
   if [[ -n "$_GRADER_CLONE_CREDS_CMD" ]]; then eval "$_GRADER_CLONE_CREDS_CMD"; return $?; fi
-  local home_root="${AGENT_HOME_ROOT:-/home}"
+  local home_root="$_GRADER_HOME_ROOT"
   for rel in $_GRADER_CLONE_CRED_FILES; do
     src="${home_root}/agent-${pool}/${rel}"
     dst="${home_root}/agent-${clone}/${rel}"
@@ -520,14 +540,15 @@ _grader_clone_remove() {  # <clone>
 
 # `_grader_clone_reaped_prune` — cap the age of the quarantine.
 #
-# ONLY `<prefix>*` ENTRIES, never the whole of REAPED_DIR: that directory also
-# holds the homes of seats an operator removed by hand, and a grader lane has no
-# business deciding when those expire.
+# ONLY `<prefix>*` ENTRIES, never the whole of the quarantine directory that
+# src/cmd_agent_create.sh moves a removed home into (its DIVE-2138 "quarantine,
+# not delete" clause): that directory also holds the homes of seats an operator
+# removed by hand, and a grader lane has no business deciding when those expire.
 _GRADER_REAPED_MAX_DAYS="${_GRADER_REAPED_MAX_DAYS:-7}"
 _GRADER_CLONE_PRUNE_CMD="${_GRADER_CLONE_PRUNE_CMD:-}"
 _grader_clone_reaped_prune() {
   if [[ -n "$_GRADER_CLONE_PRUNE_CMD" ]]; then eval "$_GRADER_CLONE_PRUNE_CMD"; return 0; fi
-  local dir="${REAPED_DIR:-${AGENT_HOME_ROOT:-/home}/.5dive-reaped}" d
+  local dir="$_GRADER_QUARANTINE_DIR" d
   [[ -d "$dir" ]] || return 0
   d="${_GRADER_REAPED_MAX_DAYS}"; [[ "$d" =~ ^[0-9]+$ ]] || d=7
   find "$dir" -maxdepth 1 -mindepth 1 -type d -name "${_GRADER_CLONE_PREFIX}*" \

@@ -510,7 +510,7 @@ printf 'GH_TOKEN=ghp_averyrealclassicpersonalaccesstoken\n' >> "$credhome/agent-
 # included — so `!= 0` would pass for a lane that removed the token test entirely
 # and simply failed to copy. 4 is the refusal; 3 is "could not read/install".
 credrc=0
-( AGENT_HOME_ROOT="$credhome"
+( _GRADER_HOME_ROOT="$credhome"
   _GRADER_CLONE_CREDS_CMD=''
   _GRADER_CLONE_CRED_FILES='.config/5dive/gh-read-tokens.env'
   install(){ command install -D -m 0600 "${@: -2:1}" "${@: -1}"; }
@@ -524,7 +524,7 @@ grep -q 'REFUSED to copy' <<<"$(warns_)" \
 # the arm above and the lane never copies a credential at all.
 sed -i '/ghp_/d' "$credhome/agent-g1/.config/5dive/gh-read-tokens.env"
 : > "$WARNF"
-( AGENT_HOME_ROOT="$credhome"; _GRADER_CLONE_CREDS_CMD=''
+( _GRADER_HOME_ROOT="$credhome"; _GRADER_CLONE_CREDS_CMD=''
   _GRADER_CLONE_CRED_FILES='.config/5dive/gh-read-tokens.env'
   # -D is KEPT and only the chown is dropped: the clone's account does not exist
   # in this harness, but the parent directories still have to be made or the arm
@@ -541,7 +541,7 @@ sed -i '/ghp_/d' "$credhome/agent-g1/.config/5dive/gh-read-tokens.env"
 # applies an owner to every component it creates; `install -D` chowns the file and
 # leaves the parents to root.
 : > "$WARNF"; instlog="$TMPD/instargs"; : > "$instlog"
-( AGENT_HOME_ROOT="$credhome"; _GRADER_CLONE_CREDS_CMD=''
+( _GRADER_HOME_ROOT="$credhome"; _GRADER_CLONE_CREDS_CMD=''
   _GRADER_CLONE_CRED_FILES='.config/5dive/gh-read-tokens.env'
   install(){ printf '%s\n' "$*" >> "$instlog"; if [[ "$1" == -d ]]; then command mkdir -p "${@: -1}"; else command install -D -m 0600 "${@: -2:1}" "${@: -1}"; fi; }
   _grader_clone_creds gr-g1-1 g1 ) >/dev/null 2>&1
@@ -550,7 +550,7 @@ grep -qE '^-d -o agent-gr-g1-1 -g agent-gr-g1-1 -m 0700 .*/agent-gr-g1-1/\.confi
   || bad_ 'CREDS creates the dir owned by the clone' "$(cat "$instlog")"
 # A MISSING SOURCE IS A REFUSAL, not an empty copy: a clone with an absent
 # hosts.yml grades blind, which is the state the row says must be unwound.
-( AGENT_HOME_ROOT="$credhome"; _GRADER_CLONE_CREDS_CMD=''
+( _GRADER_HOME_ROOT="$credhome"; _GRADER_CLONE_CREDS_CMD=''
   _GRADER_CLONE_CRED_FILES='.config/gh/nonexistent.yml'
   _grader_clone_creds gr-g1-1 g1 ) >/dev/null 2>&1 \
   && bad_ 'CREDS a missing source is refused' '' \
@@ -648,6 +648,23 @@ sweep_(){ : > "$RMF"; : > "$EMITF"; : > "$DBWF"
 n=$(sweep_ 'SW_RUN="gr-1-1'$US'DIVE-7'$US'2026-09-14 08:00:00"; SW_VERDICT=0')
 [[ "$n" == 0 && ! "$(rms_)" =~ gr-g1-1 ]] \
   && ok_ 'S1: a clone whose grade is running is NOT swept' || bad_ 'S1 live clone survives' "swept=$n rm=$(rms_)"
+
+# S1b LIVE PAST THE GRACE — the regime EVERY REAL GRADE OCCUPIES, and until this
+# arm existed nothing graded it. S1 above poses a live clone but leaves the run
+# row YOUNG, so `past the start grace AND not live` short-circuits on the FIRST
+# conjunct and the liveness test is never reached: S1 passes because of the
+# grace, not because of liveness. S4 poses the second conjunct only in the
+# reap-it direction. So `_grader_clone_live` was graded in one direction only,
+# and deleting it left all 83 arms green (main2's surviving mutant M3b,
+# `&& ! _grader_clone_live "$clone"` -> `&& true`).
+#
+# THE GRACE IS 300s AND A GRADE RUNS 4-9 MINUTES, so a running grade spends most
+# of its life here. Reaping a dead clone costs one re-queued delivery; reaping a
+# LIVE one destroys a grade in flight, which is the expensive direction.
+n=$(sweep_ 'SW_RUN="gr-1-1'$US'DIVE-7'$US'2026-09-14 08:00:00"; SW_PASTGRACE=1; _GRADER_CLONE_LIVE_CMD="return 0"')
+[[ "$n" == 0 ]] && [[ ! "$(rms_)" =~ gr-g1-1 ]] && ! grep -q 'SET assignee=verifier' <<<"$(dbw_)" \
+  && ok_ 'S1b: a clone PAST its start grace with a grading CLI still running is NOT swept' \
+  || bad_ 'S1b live clone past the grace survives' "swept=$n rm=$(rms_) dbw=$(dbw_)"
 
 # S2 RESOLVED: a verdict landed. Removed, and the run row is CLOSED — which is
 # this row's live specimen: gr-20260914T054510Z-1554431-1 still read
