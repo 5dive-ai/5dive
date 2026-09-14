@@ -192,8 +192,16 @@ jobs:
           # extracting and RUNNING these exact bytes rather than grading a copy.
           # Unset (the nightly schedule, which declares no input) means patch, so the
           # scheduled path is behaviourally identical to before this change.
-          # DO NOT ADD `set -e` TO THIS STEP. It runs under `set -uo pipefail` on purpose,
-          # which is why every refusal below is an EXPLICIT `exit 1` rather than a bare
+          # DO NOT ADD `set -e` TO THIS STEP'S OWN `set` LINE. Read that literally: this
+          # step DOES run under -e — it declares no `shell:`, so the runner invokes it as
+          # `bash -e {0}` and always has (DIVE-4153, and see the note ~25 lines down). What
+          # the step SETS is `set -uo pipefail`, and that is what must not gain an `e`,
+          # because tests/release_cut_assign_unit.sh evals these exact bytes OUTSIDE the
+          # runner, where -e would then be on and would change the mutation grade below.
+          # The earlier wording read as "-e is off here", which is false in the runner and
+          # is how DIVE-4474 shipped: a broken pipe that would have been a harmless empty
+          # capture under a genuinely -e-less shell instead killed the cut.
+          # It is also why every refusal below is an EXPLICIT `exit 1` rather than a bare
           # failing command. tests/release_cut_assign_unit.sh evals these same bytes, and
           # its mutation grade depends on it: removing the explicit exit on an unknown
           # level turns a refusal into a silent patch derivation and reddens exactly ONE
@@ -220,8 +228,9 @@ jobs:
           # `bash -e {0}`, so the assignment aborts the whole step with NO message at all.
           # That is exactly what run 34345097999 did on 2026-09-09: it printed the incumbent
           # line and exited 1 silently, with no ::error:: annotation to read (DIVE-4153).
-          # The comment further down claiming this step does not run under `set -e` is about
-          # what this block SETS, not what the runner INVOKES; -e has always been on.
+          # The `set -e` comment ~25 lines UP is about what this block SETS, not what the
+          # runner INVOKES; -e has always been on. (It said "further down" — the blocks have
+          # since moved; corrected with DIVE-4474.)
           # So every one of these must swallow the no-match exit explicitly.
           _forced_by=$(grep -E '^[0-9a-f]+ [a-z]+(\([^)]*\))?!:' <<<"$_subjects" | head -3) || _forced_by=""
           if [[ -n "$_forced_by" ]]; then
@@ -511,7 +520,17 @@ jobs:
           # release notes. A hotfix that publishes without saying what it did not wait for is
           # the same unattributable green this file spends 200 lines refusing elsewhere.
           _filter_dropped() {
-            if [[ "$REQUIRED_ONLY" != "true" ]]; then return 0; fi
+            # DIVE-4474: `cat >/dev/null`, NOT a bare `return`. This function is the right
+            # side of a pipe whose left side is `printf '%s\n' "$runs"`. Returning without
+            # reading closes the pipe while the writer is still writing; once "$runs" exceeds
+            # the 64KB pipe buffer, printf blocks, takes EPIPE, `set -o pipefail` promotes it
+            # and the runner's `bash -e {0}` kills the whole cut. It is SIZE-dependent, so it
+            # was latent for as long as main's check-run board fit in the buffer and then
+            # became permanent: run 34794905130 derived v0.37.0 -> v0.38.0 and died before
+            # tagging. The drain is `>/dev/null` and not `cat` (which is what _filter_required
+            # nine lines up correctly does) because on this path the function must emit
+            # NOTHING — its stdout is the hotfix lane's skipped-checks list.
+            if [[ "$REQUIRED_ONLY" != "true" ]]; then cat >/dev/null; return 0; fi
             awk -F'\t' -v req="$_REQ_LIST" '
               BEGIN { n = split(req, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") R[a[i]] = 1 }
               !($1 in R) && $3 != "success" && $3 != "skipped" && $3 != "neutral"'

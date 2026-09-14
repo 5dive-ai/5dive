@@ -1012,6 +1012,78 @@ ok "lane ON, our own row on the board: a REQUIRED red is REFUSED, not waited out
 ok "lane ON, our own row on the board: an all-green board still cuts" \
    "$(lane_run "$BOARD_SELF" "$REQ_NINE" "$SELFRUN")" "GREEN"
 
+echo '== DIVE-4474: the runner shell is `bash -e {0}`, and the board can exceed the pipe buffer =='
+# WHY THIS SECTION EXISTS AND WHY 106 ARMS ABOVE MISSED THE DEFECT THAT KILLED THE CUT.
+# Every helper above drives the block with `bash -c "set -uo pipefail; $GUARD"`. The real step
+# declares no `shell:`, so the runner invokes it as `bash -e {0}` — errexit is ON in production
+# and OFF in this harness. `_filter_dropped` returned WITHOUT reading stdin on the lane-OFF path;
+# the writer `printf '%s\n' "$runs"` then took EPIPE once the board exceeded the 64KB pipe buffer,
+# pipefail promoted it, and -e killed the step. Both conditions are needed to see it, so the arms
+# below pin BOTH: errexit, and a board past the buffer. Run 34794905130 (2026-09-14) derived
+# v0.37.0 -> v0.38.0 and died here without tagging.
+# The board goes in through a FILE, not the environment. `runs=... bash -c` is how every helper
+# above passes it, and at 200KB that is E2BIG ("Argument list too long", rc 126) before the block
+# runs at all — a harness limit that would masquerade as the very death these arms grade. On the
+# real runner `runs` is a shell variable inside the step, never an exported one.
+# raw_e() is always called inside $( ), i.e. a SUBSHELL, so it cannot hand its exit code back
+# in a variable — the assignment dies with the subshell. The rc goes through a FILE for that
+# reason; raw_e_rc() reads the one the last call wrote.
+RAW_E_RCFILE=$(mktemp)
+raw_e_rc(){ cat "$RAW_E_RCFILE"; }
+raw_e(){ # $1 = check-runs TSV ; echoes the block's combined output, records rc for raw_e_rc
+  local f out rc
+  f=$(mktemp); printf '%s' "$1" >"$f"
+  out=$(sha=deadbeefcafe tag=v9.9.9 RELEASE_CUT_POLL_SECONDS=0 _BOARD_FILE="$f" bash -e -c "
+    set -uo pipefail
+    runs=\$(cat \"\$_BOARD_FILE\")
+    $GUARD
+  " 2>&1); rc=$?
+  rm -f "$f"; printf '%s' "$rc" >"$RAW_E_RCFILE"; printf '%s' "$out"
+}
+verdict_e(){ # $1 = check-runs TSV ; like verdict(), but under the RUNNER's shell (-e)
+  local out rc
+  out=$(raw_e "$1"); rc=$(raw_e_rc)
+  if (( rc != 0 )); then
+    grep -q 'CI NOT REACHED'    <<<"$out" && { echo NOT-REACHED; return; }
+    grep -q 'CI still IN FLIGHT' <<<"$out" && { echo IN-FLIGHT;   return; }
+    grep -q 'CI is RED'          <<<"$out" && { echo RED;         return; }
+    echo "DIED-rc${rc}"; return
+  fi
+  grep -q 'CI green on' <<<"$out" && echo GREEN || echo "OTHER-OK:$out"
+}
+# An all-green board, sized either side of the 64KB pipe buffer. Size is the trigger, so it is
+# the thing the fixture must control; the rows are otherwise identical and uninteresting.
+board_of(){ awk -v n="$1" 'BEGIN{for(i=1;i<=n;i++) printf "chk%05d\tcompleted\tsuccess\thttps://github.com/o/r/actions/runs/99999999999/job/%d\n", i, i}'; }
+SMALL_BOARD=$(board_of 20)      # ~1.3KB — fits the buffer
+BIG_BOARD=$(board_of 3000)      # ~200KB — does not
+ok "the big fixture is actually past the 64KB pipe buffer (else these arms grade nothing)" \
+   "$([[ ${#BIG_BOARD} -gt 65536 ]] && echo past-buffer || echo TOO-SMALL:${#BIG_BOARD})" "past-buffer"
+ok "small green board under -e -> GREEN" "$(verdict_e "$SMALL_BOARD")" "GREEN"
+ok "BIG green board under -e -> GREEN (the drain in _filter_dropped)" "$(verdict_e "$BIG_BOARD")" "GREEN"
+
+# MUTANT — put the pre-fix shape back: the lane-OFF early return reads nothing.
+if m=$(mutate 's|if \[\[ "$REQUIRED_ONLY" != "true" \]\]; then cat >/dev/null; return 0; fi|if [[ "$REQUIRED_ONLY" != "true" ]]; then return 0; fi|' GUARD); then
+  GUARD_SAVE="$GUARD"; GUARD="$m"
+  # Assert the CAUSE, not merely "not green": a non-GREEN verdict could be any refusal, and an
+  # E2BIG or a missing `gh` would read identically. Two spellings of the same cause are accepted
+  # because they depend on the writer's SIGPIPE disposition, which is the runner's to set: a
+  # shell that dies on the signal exits 141 (128+13) and says nothing, while one running with
+  # SIGPIPE ignored gets EPIPE back and printf reports `write error: Broken pipe` — which is the
+  # spelling run 34794905130 logged. Either is this defect; anything else is a different failure.
+  _mo=$(raw_e "$BIG_BOARD"); _mrc=$(raw_e_rc)
+  ok "PRE-FIX SHAPE + big board + -e: the cut DIES, and it dies on a BROKEN PIPE (the defect)" \
+     "$( { [[ "$_mrc" == "141" ]] || grep -qi 'broken pipe' <<<"$_mo"; } && echo sigpipe || echo "other:rc=$_mrc" )" "sigpipe"
+  # ...and the same mutant on a SMALL board still cuts. That is the whole reason this shipped:
+  # the defect is invisible until the board outgrows the buffer, so an arm that does not pin
+  # the SIZE grades a passing mutant and reports green.
+  ok "PRE-FIX SHAPE + small board + -e: still GREEN, which is why this stayed latent" \
+     "$(verdict_e "$SMALL_BOARD")" "GREEN"
+  GUARD="$GUARD_SAVE"
+else
+  vacuous "pre-fix shape: _filter_dropped returns without draining"
+fi
+rm -f "$RAW_E_RCFILE"
+
 echo
 echo "$pass passed, $fail failed"
 exit $(( fail > 0 ))
