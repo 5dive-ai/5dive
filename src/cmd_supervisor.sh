@@ -107,6 +107,58 @@ _SUP_QUOTA_PAT="${SUPERVISOR_QUOTA_PAT:-}"
 # alternation, and _hb_pane_is_usage_limit still demands an action line too.
 _SUP_WEEKLY_QUOTA_PAT="${SUPERVISOR_WEEKLY_QUOTA_PAT:-}"
 [[ -n "$_SUP_WEEKLY_QUOTA_PAT" ]] || _SUP_WEEKLY_QUOTA_PAT='(^|[[:space:]])(7d|1w):[[:space:]]*100%([^0-9]|$)'
+#
+# DIVE-4536: THE WEEKLY ARM MUST NOT MATCH THE STATUS BAR. Claude Code renders a
+# two-window usage METER on the bottom line of every pane, at all times:
+#
+#     Opus 5 · 5h: 17%  7d: 100%
+#
+# `7d: 100%` sits inside it, so from the moment an account's weekly window
+# filled, EVERY tick read that seat's idle pane as "a model-capacity refusal" —
+# and DIVE-4097 door 2 then HELD the no-progress ladder behind it. Measured
+# 2026-09-14: dev3 sat on a one-keystroke confirm for ~10h producing 60 HELD
+# lines and zero nudges, while the meter it was held on had already fallen back
+# to `7d: 71%` (the hold reads an UNKNOWN deadline as still-in-force, so nothing
+# could expire it either). A hold that cannot expire is a stall with a green
+# label.
+#
+# THE METER IS A GAUGE, NOT A REFUSAL. It is present whether or not the account
+# can spend; it says what has been used, never that a request was denied. Only a
+# refusal SENTENCE (_SUP_QUOTA_PAT: "usage limit reached", "You've hit your …
+# limit", "credit balance is too low", a 429) is evidence that the seat tried and
+# was told no.
+#
+# WHY THE WEEKLY ARM IS NOT SIMPLY DELETED: a weekly wall genuinely can be
+# refusal-free in OTHER renderings, and this arm is the only pane reading of one.
+# So the arm survives and the METER SHAPE is excluded from it — a line carrying
+# BOTH windows (`5h: N%` and `7d: M%`) is the status bar and nothing else.
+#
+# AND THE COVER THIS GIVES UP IS ALREADY HELD BY A BETTER SIGNAL: DIVE-4342's
+# account-usage snapshot reads the provider's own measured percentage and is
+# ranked ABOVE this pane branch in _sup_classify. A real weekly wall is measured
+# there, from the number, without scraping a gauge off a TUI. What falls through
+# here is exactly the row's "at cap, unconfirmed" — no hold, no green word, the
+# no-progress path free to do its job.
+_SUP_USAGE_METER_PAT="${SUPERVISOR_USAGE_METER_PAT:-}"
+[[ -n "$_SUP_USAGE_METER_PAT" ]] || _SUP_USAGE_METER_PAT='(^|[[:space:]])5h:[[:space:]]*[0-9]+%'
+
+# _sup_line_is_usage_meter — rc 0 when this ONE line is Claude Code's two-window
+# status meter. Both windows must be on it: the 5h reading is what separates the
+# gauge from a weekly-wall sentence, which never carries a session percentage.
+_sup_line_is_usage_meter() {  # <line>
+  grep -qiE "$_SUP_USAGE_METER_PAT" <<<"$1" 2>/dev/null || return 1
+  grep -qiE '(^|[[:space:]])(7d|1w):[[:space:]]*[0-9]+%' <<<"$1" 2>/dev/null
+}
+
+# _sup_line_is_refusal — the ONE predicate both the match and its neighbour-skip
+# use, so the two can never disagree about what a refusal line is. A refusal
+# sentence always counts; the weekly arm counts only when the line is not the
+# status meter.
+_sup_line_is_refusal() {  # <line>
+  grep -qiE "${_SUP_QUOTA_PAT}" <<<"$1" 2>/dev/null && return 0
+  _sup_line_is_usage_meter "$1" && return 1
+  grep -qiE "${_SUP_WEEKLY_QUOTA_PAT}" <<<"$1" 2>/dev/null
+}
 # Ignore a missing poller right after a service start — the plugin's bun server
 # takes a moment to boot, and a false poller-dead there would flag every
 # freshly-restarted agent.
@@ -529,6 +581,61 @@ _SUP_PROMPT_PANE_LINES="${SUPERVISOR_PROMPT_PANE_LINES:-12}"
 _SUP_PROMPT_PAT="${SUPERVISOR_PROMPT_PAT:-}"
 [[ -n "$_SUP_PROMPT_PAT" ]] || _SUP_PROMPT_PAT='[Ee]nter to (select|confirm|choose)'
 
+# ── DIVE-4536: the OTHER picker — claude's BUILT-IN dangerous-command confirm ──
+#
+# DIVE-4293 above reads the footer the harness renders under AskUserQuestion and
+# ExitPlanMode ("Enter to select"). There is a second modal that freezes a seat
+# exactly as hard and renders a DIFFERENT footer:
+#
+#     Dangerous rm operation on possibly-empty variable path: "$out/$f"
+#     Do you want to proceed?
+#     ❯ 1. Yes
+#       2. No
+#     Esc to cancel · Tab to amend
+#
+# It is claude's own tool-permission confirm. It fires even under
+# bypassPermissions — bypass is not a no-questions mode — and it is not an
+# AskUserQuestion, so DIVE-4293's PreToolUse hook never sees it either. Nothing
+# in this fleet could read it. dev3 sat on one for ~10h on a live row on
+# 2026-09-14 and every surface said the seat was fine.
+#
+# THE SIGNATURE IS A CONJUNCTION, NOT A SENTENCE, and that is the whole
+# false-positive control. "Do you want to proceed?" is a string agents WRITE —
+# the row that ordered this fix contains it twice — so matching the question
+# alone would classify any seat discussing the confirm as sitting on one. All
+# three parts must be on the 12-line tail together: the question, a numbered
+# Yes option, and the Esc footer. A quoted mention in prose carries the sentence
+# and neither of the other two.
+_SUP_CONFIRM_PAT="${SUPERVISOR_CONFIRM_PAT:-}"
+[[ -n "$_SUP_CONFIRM_PAT" ]] || _SUP_CONFIRM_PAT='Do you want to (proceed|continue)'
+_SUP_CONFIRM_YES_PAT="${SUPERVISOR_CONFIRM_YES_PAT:-}"
+[[ -n "$_SUP_CONFIRM_YES_PAT" ]] || _SUP_CONFIRM_YES_PAT='^[[:space:]]*(❯|>)?[[:space:]]*1\.[[:space:]]*Yes'
+_SUP_CONFIRM_FOOTER_PAT="${SUPERVISOR_CONFIRM_FOOTER_PAT:-}"
+[[ -n "$_SUP_CONFIRM_FOOTER_PAT" ]] || _SUP_CONFIRM_FOOTER_PAT='Esc to cancel'
+
+# HOW LONG a confirm must stand before this watchdog presses a key on the seat's
+# behalf. The ALERT is immediate (a frozen seat is a frozen seat); only the
+# keystroke waits. Ten minutes is one tick: long enough that we are never racing
+# a seat that is about to be answered by a person attached to the pane, short
+# enough that the measured failure (10 HOURS) cannot recur.
+_SUP_T_CONFIRM_DWELL_MIN="${SUPERVISOR_T_CONFIRM_DWELL_MIN:-10}"
+[[ "$_SUP_T_CONFIRM_DWELL_MIN" =~ ^[0-9]+$ ]] || _SUP_T_CONFIRM_DWELL_MIN=10
+
+# _sup_confirm_match — pure, no I/O. Echoes the confirm's question line (trimmed)
+# when the pane tail carries the whole three-part signature, empty otherwise.
+# Split from the capture for the same reason every other matcher here is: the
+# false-positive-critical regex has to be gradeable without a live tmux.
+_sup_confirm_match() {  # <pane-text-on-stdin>
+  local tail q
+  tail=$(_sup_pane_drop_echoes) || return 0
+  [[ -n "$tail" ]] || return 0
+  grep -qE "$_SUP_CONFIRM_YES_PAT"    <<<"$tail" 2>/dev/null || return 0
+  grep -qE "$_SUP_CONFIRM_FOOTER_PAT" <<<"$tail" 2>/dev/null || return 0
+  q=$(grep -E "$_SUP_CONFIRM_PAT" <<<"$tail" 2>/dev/null | tail -1) || return 0
+  [[ -n "$q" ]] || return 0
+  printf '%s\n' "$q" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
+}
+
 # _sup_prompt_match — pure, no I/O. Echoes the footer line (trimmed) when the
 # pane tail is sitting on a picker, empty otherwise. Split out from the capture
 # for the same reason _sup_verify_match and _sup_quota_match are: the
@@ -576,12 +683,22 @@ _sup_prompt_pane() {  # <type> <user> <sess> <svc_running>
   (( rc == 0 )) || return "$rc"
   [[ -n "$pane" ]] || return "$_SUP_PROBE_BLIND"
   excerpt=$(printf '%s\n' "$pane" | _sup_prompt_match)
-  [[ -n "$excerpt" ]] || return 0
-  if printf '%s\n' "$pane" | _sup_prompt_recommended; then
-    printf '%s\037recommended\n' "$excerpt"
-  else
-    printf '%s\037unmarked\n' "$excerpt"
+  if [[ -n "$excerpt" ]]; then
+    if printf '%s\n' "$pane" | _sup_prompt_recommended; then
+      printf '%s\037recommended\n' "$excerpt"
+    else
+      printf '%s\037unmarked\n' "$excerpt"
+    fi
+    return 0
   fi
+  # DIVE-4536: the built-in confirm, checked only after the DIVE-4293 footer has
+  # not matched. Ranked second because the two are mutually exclusive in
+  # practice and the AskUserQuestion reading is the older, wider-graded one; a
+  # pane that somehow carried both is the model's own picker, which is the
+  # answerable case and must not be downgraded to a decline.
+  excerpt=$(printf '%s\n' "$pane" | _sup_confirm_match)
+  [[ -n "$excerpt" ]] || return 0
+  printf '%s\037confirm\n' "$excerpt"
 }
 
 # DIVE-3272: pure signature match, no I/O — echoes ONE pane line that looks like
@@ -674,7 +791,7 @@ _sup_quota_match() {  # <pane-text-on-stdin> [now_epoch]
   local i j d st ep jst jep cand last="" live="" live_ep=-1 found=0
   for (( i = 0; i < ${#pane[@]}; i++ )); do
     [[ -n "${pane[i]}" ]] || continue
-    grep -qiE "${_SUP_QUOTA_PAT}|${_SUP_WEEKLY_QUOTA_PAT}" <<<"${pane[i]}" 2>/dev/null || continue
+    _sup_line_is_refusal "${pane[i]}" || continue
     found=1
     cand="${pane[i]}"
     IFS=$'\x1f' read -r st ep <<<"$(_sup_quota_deadline "$cand" "$now")"
@@ -688,7 +805,7 @@ _sup_quota_match() {  # <pane-text-on-stdin> [now_epoch]
         for j in $(( i + d )) $(( i - d )); do
           (( j >= 0 && j < ${#pane[@]} )) || continue
           [[ -n "${pane[j]}" ]] || continue
-          grep -qiE "${_SUP_QUOTA_PAT}|${_SUP_WEEKLY_QUOTA_PAT}" <<<"${pane[j]}" 2>/dev/null && continue
+          _sup_line_is_refusal "${pane[j]}" && continue
           IFS=$'\x1f' read -r jst jep <<<"$(_sup_quota_deadline "${pane[j]}" "$now")"
           [[ "$jst" == "unknown" ]] && continue
           cand="${pane[i]} · ${pane[j]}"; st="$jst"; ep="$jep"
@@ -1267,9 +1384,17 @@ _sup_capacity_notify_machine() {  # <class> [quota_alerts_on] -> true|false
 # an alert that sends you to the wrong place is worse than a quieter one. Both
 # legs best-effort, like every alert in this file — a wedged channel must never
 # abort the tick for the rest of the fleet.
-_sup_prompt_alert() {  # <name> <detail>
-  local name="$1" detail="$2"
-  local msg="[FLEET-HEALTH blocked-on-prompt] agent '${name}' is UP and REACHABLE and is WAITING ON A KEYPRESS: ${detail}. It called AskUserQuestion or ExitPlanMode and the picker is rendering into a tmux pane nobody is reading; the seat will sit there until someone answers it. The highlighted option is NOT marked (Recommended), so this watchdog will not choose for it. Read the pane (tmux attach -t agent-${name}), pick the option, and if the choice genuinely needed a person it belongs on a task gate, not a picker."
+# DIVE-4536: <cause> selects the body. The two causes under this class are
+# waiting on the same keypress for opposite reasons, and the old single text
+# named AskUserQuestion — which would have told a reader to go pick an option on
+# a confirm the watchdog had already refused, on a seat that had already moved on.
+_sup_prompt_alert() {  # <name> <detail> [cause]
+  local name="$1" detail="$2" cause="${3:-blocked-on-prompt}" msg
+  if [[ "$cause" == "dangerous-confirm" ]]; then
+    msg="[FLEET-HEALTH blocked-on-prompt] agent '${name}' is UP and REACHABLE and is WAITING ON A KEYPRESS: ${detail}. This is claude's built-in tool-permission confirm (it fires even under bypassPermissions and is not an AskUserQuestion, so no hook sees it). The watchdog answers this one itself by pressing Escape — the safe option — so you are reading this because the keypress could not be sent, automatic actions are off, or the seat has stood on a confirm repeatedly inside one hour, which means the model keeps re-issuing a flagged command and a keypress is not the fix. Read the pane (tmux attach -t agent-${name})."
+  else
+    msg="[FLEET-HEALTH blocked-on-prompt] agent '${name}' is UP and REACHABLE and is WAITING ON A KEYPRESS: ${detail}. It called AskUserQuestion or ExitPlanMode and the picker is rendering into a tmux pane nobody is reading; the seat will sit there until someone answers it. The highlighted option is NOT marked (Recommended), so this watchdog will not choose for it. Read the pane (tmux attach -t agent-${name}), pick the option, and if the choice genuinely needed a person it belongs on a task gate, not a picker."
+  fi
   # DIVE-3318: a one-way machine notice nobody replies to is not a round.
   _5DIVE_A2A_NOTIFY=1 5dive agent send main "$msg" >/dev/null 2>&1 \
     || warn "prompt-alert: 'agent send main' failed for $name (alert still audited)"
@@ -1368,10 +1493,17 @@ Classification (conservative — see docs/fleet-supervisor-design.md §4):
                   (cause: no-output) — the seat is claiming work and completing
                   none, which every liveness signal reads as "active"; alerts
   blocked-on-prompt
-                  pane is sitting on an AskUserQuestion/ExitPlanMode picker —
-                  the seat is waiting on a keypress, not on a model (DIVE-4293).
-                  Auto-answered with Enter when the highlighted option is marked
-                  (Recommended); paged otherwise.
+                  pane is sitting on a picker — the seat is waiting on a
+                  keypress, not on a model. Two causes:
+                  blocked-on-prompt = an AskUserQuestion/ExitPlanMode picker
+                  (DIVE-4293), auto-answered with Enter ONLY when the
+                  highlighted option is marked (Recommended), paged otherwise;
+                  dangerous-confirm = claude's built-in tool-permission confirm
+                  (DIVE-4536), which fires even under bypassPermissions and no
+                  hook can see — auto-DECLINED with Escape (never Yes) once it
+                  has stood ${_SUP_T_CONFIRM_DWELL_MIN}m+ with no transcript
+                  progress, noted on the seat's in-progress row, and paged only
+                  when the keypress fails or the seat keeps coming back.
   quota-exhausted pane shows a model-capacity/quota refusal (cause:
                   quota-exhausted) — a fleet event, not the seat's own; alerts
   unprobed        this run could not READ the seat's pane (it is not root), so
@@ -1500,7 +1632,8 @@ _sup_cli_check() {
 #       has_work(0/1) act_age cli_stale(true/false/unknown) goal_drift_task
 #       verify_excerpt stranded open_rows no_output_days quota_excerpt
 #       quota_deadline(live/lapsed/unknown, DIVE-3880)
-#       prompt_excerpt prompt_mark(recommended/unmarked, DIVE-4293)
+#       prompt_excerpt prompt_mark(recommended/unmarked, DIVE-4293;
+#                                 confirm/confirm-fresh, DIVE-4536)
 _sup_classify() {
   local desired="$1" svc_running="$2" active="$3" sess="$4" tmux_state="$5" poller="$6" \
         loop_stuck="$7" has_work="$8" act_age="$9" cli_stale="${10}" goal_drift_task="${11}" \
@@ -1532,11 +1665,29 @@ _sup_classify() {
     # types a line into a pane that is waiting for a KEY, and `resume` presses
     # Escape, which throws the question away along with whatever the model was
     # about to do with the answer.
-    class="blocked-on-prompt"; cause="blocked-on-prompt"
-    detail="pane is sitting on a choice picker: ${prompt_excerpt}"
+    class="blocked-on-prompt"
     case "$prompt_mark" in
-      recommended) detail="${detail} [highlighted option is marked (Recommended) — answerable]" ;;
-      *)           detail="${detail} [no highlighted (Recommended) option — a person must choose]" ;;
+      # DIVE-4536: claude's own tool-permission confirm gets its OWN cause, not
+      # its own CLASS. The state is identical (a seat frozen on a keypress), and
+      # every surface that counts blocked-on-prompt — the board, the digest,
+      # `agent info`, the alert dedup — must count this too. A second class for
+      # the same state would have had to be added to each of them, and the one
+      # that got missed is where the next 10-hour stall hides. What differs is
+      # only the REMEDY, and a remedy is what a cause selects.
+      confirm|confirm-fresh)
+        cause="dangerous-confirm"
+        detail="pane is sitting on a tool-permission confirm: ${prompt_excerpt}"
+        if [[ "$prompt_mark" == "confirm" ]]; then
+          detail="${detail} [standing ${_SUP_T_CONFIRM_DWELL_MIN}m+ with no transcript progress — declinable (Esc)]"
+        else
+          detail="${detail} [seen this tick — the decline waits ${_SUP_T_CONFIRM_DWELL_MIN}m]"
+        fi ;;
+      recommended)
+        cause="blocked-on-prompt"
+        detail="pane is sitting on a choice picker: ${prompt_excerpt} [highlighted option is marked (Recommended) — answerable]" ;;
+      *)
+        cause="blocked-on-prompt"
+        detail="pane is sitting on a choice picker: ${prompt_excerpt} [no highlighted (Recommended) option — a person must choose]" ;;
     esac
   # desiredState (P2, DIVE-857 prereq b): an operator's explicit stop/start
   # beats inference. Recorded by `5dive agent stop|start`; absent on legacy
@@ -1794,7 +1945,20 @@ _sup_agent_record() {
   prow=$(_sup_prompt_pane "$type" "$user" "$sess" "$svc_running"); prompt_rc=$?
   if [[ -n "$prow" ]]; then
     prompt_excerpt="${prow%%$'\x1f'*}"; prompt_mark="${prow##*$'\x1f'}"
-    [[ "$prompt_mark" == "recommended" ]] || prompt_mark="unmarked"
+    case "$prompt_mark" in
+      recommended) ;;
+      # DIVE-4536: the DWELL is applied HERE, where the transcript clock lives,
+      # and it gates the KEYSTROKE only — the class, the alert and the audited
+      # event all fire on the first tick that sees the confirm. act_age is
+      # computed a few lines above; -1 means the transcript mtime was
+      # unreadable, and an unknown age never presses a key (the same
+      # false-negative bias every threshold in this file carries).
+      confirm)
+        if (( act_age < 0 || act_age < _SUP_T_CONFIRM_DWELL_MIN * 60 )); then
+          prompt_mark="confirm-fresh"
+        fi ;;
+      *) prompt_mark="unmarked" ;;
+    esac
   fi
 
   # --- CLASSIFY (design §4) — see _sup_classify for the decision chain itself.
@@ -1870,6 +2034,7 @@ _sup_agent_record() {
                # is null when there is no picker to qualify.
                blockedOnPrompt:(if $promptExcerpt == "" then null else $promptExcerpt end),
                promptRecommended:(if $promptExcerpt == "" then null else ($promptMark == "recommended") end),
+               promptMark:(if $promptExcerpt == "" then null else $promptMark end),
                # DIVE-4342 it.2: "ok" = the pane probes ran (or had nothing to
                # look at); "unprobed" = at least one could not look, so the
                # three branches above it did not run and a clean reading here
@@ -2459,6 +2624,27 @@ _sup_act_exec() {  # <name> <verb> <cause>
       # question, which is what `resume` does and why that rung is the wrong
       # remedy here (the model has already decided; it wants its own answer).
       sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1 ;;
+    decline-prompt)
+      # DIVE-4536. The confirm's sibling of answer-prompt, and the difference is
+      # the whole safety argument: answer-prompt presses ENTER, which takes the
+      # highlighted option, and is therefore only ever reached after
+      # _sup_prompt_recommended proved the model marked that option itself.
+      # Nothing is marked on a tool-permission confirm — the harness raised it
+      # precisely because the command was flagged — so there is no option this
+      # watchdog is entitled to TAKE. It is entitled to REFUSE one.
+      #
+      # ESCAPE AND NOT "2", Enter. Both land on the same outcome (the tool call
+      # is denied and the model re-plans, which is what a human did by hand on
+      # 2026-09-14 at 13:49Z — the seat resumed within seconds). Escape is the
+      # footer's own documented cancel, it is one key, and it does not depend on
+      # the cursor sitting where we think it is; pressing a DIGIT assumes the
+      # numbering, and a confirm that ever renders its options in another order
+      # turns that assumption into an approval. Fail-closed means the failure
+      # mode of a mis-press must be "the command did not run", never "the
+      # flagged command ran".
+      #
+      # Never Ctrl-C: that kills the turn, not the modal.
+      sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Escape 2>/dev/null || return 1 ;;
     rotate)
       ( with_registry_lock cmd_agent_rotation_rotate "$name" ) >/dev/null 2>&1 ;;
     # DIVE-3753 rung 4. SUBSHELL, for the same reason rotate is one: cmd_restart
@@ -2520,6 +2706,40 @@ _sup_quota_checkpoint_live_tasks() { # <name>
   (( changed > 0 )) || return 2
   _SUP_QUOTA_CHECKPOINTED="$changed"
   return 0
+}
+
+# ── DIVE-4536: the declined confirm goes ON THE ROW, not only in the log ─────
+#
+# A supervisor_events row records that the FLEET did something. The seat that
+# wakes next needs to know that one of its tool calls was refused by a watchdog
+# while it was not looking, or it re-plans blind and the most likely re-plan is
+# to run the same flagged command again. `task show` and the digest read the
+# body; nothing reads /var/log/5dive/supervisor-tick.log on the way into a turn.
+#
+# Body-append only: status, assignee and started_at are untouched. Declining a
+# tool call does not un-start a row — the seat is still holding it and is about
+# to keep working it. (Contrast _sup_quota_checkpoint_live_tasks, which requeues,
+# because a walled seat cannot continue at all.)
+#
+# Best-effort by construction: no live row, or a write that fails, returns
+# nonzero and the caller neither retries nor alerts on it. The keystroke has
+# already landed; a missing note must not turn a successful decline into a
+# failed one.
+_sup_confirm_note_row() {  # <name> <excerpt> <result>
+  local name="$1" excerpt="$2" result="$3" n stamp note changed
+  n=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null) || return 1
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  (( n > 0 )) || return 1
+  stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || stamp="unknown-time"
+  note="[${stamp}] supervisor DECLINED a tool-permission confirm on this seat (DIVE-4536). The pane had been standing on \"${excerpt}\" with no transcript progress for ${_SUP_T_CONFIRM_DWELL_MIN}m+, so the watchdog pressed Escape (result: ${result}) — the SAFE option, never Yes. The flagged command did NOT run. If that command was genuinely needed, re-plan it in a form that does not trip the guard (name the path, avoid an unset variable in an rm), or put the decision on a task gate; do not simply re-issue it and wait for someone to press Yes."
+  changed=$(db "UPDATE tasks
+      SET body = COALESCE(body,'')
+                 || CASE WHEN COALESCE(body,'') = '' THEN '' ELSE char(10)||char(10) END
+                 || $(sqlq "$note"),
+          updated_at=datetime('now')
+      WHERE assignee=$(sqlq "$name") AND status='in_progress';
+      SELECT changes();" 2>/dev/null) || return 1
+  [[ "$changed" =~ ^[0-9]+$ ]] && (( changed > 0 ))
 }
 
 # ── DIVE-3667: fleet rollup — count EVERY class, not a hand-picked five ──────
@@ -2683,6 +2903,48 @@ cmd_supervisor_tick() {
     # Unmarked pickers are never answered — they fall straight through to the
     # page below, which is the whole point of the row: a person chooses.
     if [[ "$cls" == "blocked-on-prompt" ]]; then
+      local prompt_mark_s; prompt_mark_s=$(jq -r '.signals.promptMark // ""' <<<"$row")
+      # DIVE-4536: the declinable confirm, handled before the answerable picker
+      # because the two marks are disjoint and this one must never reach a
+      # branch whose remedy is Enter. Not deduped, for the same reason
+      # answer-prompt is not: an act that worked removes its own trigger, and a
+      # seat that comes back on a confirm is standing at a NEW one.
+      if [[ "$prompt_mark_s" == "confirm" && "$actions_on" == "true" ]]; then
+        local dec_result="ok"
+        _sup_act_exec "$name" decline-prompt "dangerous-confirm" || dec_result="failed"
+        db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+            VALUES ($(sqlq "$name"), 'action', 'blocked-on-prompt', 'dangerous-confirm',
+                    $(sqlq "{\"rung\":\"decline-prompt\",\"result\":\"${dec_result}\",\"key\":\"Escape\"}"));" 2>/dev/null \
+          && { acted=$((acted + 1)); events=$((events + 1)); } \
+          || warn "supervisor: decline-prompt audit insert failed for $name"
+        # The row the seat was frozen ON is where this belongs — the digest and
+        # `task show` are read by whoever picks the row up next, and a declined
+        # tool call the model has to re-plan around is a fact about the WORK.
+        _sup_confirm_note_row "$name" "$excerpt" "$dec_result"
+        if [[ "$dec_result" == "ok" ]]; then
+          warn "supervisor: DECLINED $name — tool-permission confirm, pressed Escape (the safe option)"
+          # RECURRENCE IS THE ESCALATION, and it is the reason this act is safe
+          # to leave unattended. One decline is a watchdog unsticking a seat. A
+          # seat that stands on a confirm again within the hour is a seat whose
+          # model keeps re-issuing a flagged command, and pressing Escape at it
+          # forever is the same silent loop this row exists to end — so the
+          # THIRD one inside the window stops being quiet and falls through to
+          # the page below. The audited row for THIS decline is already
+          # inserted, so the count includes it.
+          local recent_dec
+          recent_dec=$(db "SELECT COUNT(*) FROM supervisor_events
+                           WHERE agent=$(sqlq "$name") AND event='action'
+                             AND cause='dangerous-confirm'
+                             AND ts >= datetime('now', '-1 hours');" 2>/dev/null || echo 0)
+          [[ "$recent_dec" =~ ^[0-9]+$ ]] || recent_dec=0
+          if (( recent_dec < 3 )); then continue; fi
+          excerpt="${excerpt}; DECLINED ${recent_dec}x in the last hour — this seat keeps re-issuing a flagged command and a keypress is not the fix"
+        else
+          excerpt="${excerpt}; auto-decline failed to reach the pane"
+        fi
+      elif [[ "$prompt_mark_s" == "confirm" ]]; then
+        excerpt="${excerpt}; automatic actions are disabled"
+      fi
       local prompt_rec; prompt_rec=$(jq -r '.signals.promptRecommended // false' <<<"$row")
       if [[ "$prompt_rec" == "true" && "$actions_on" == "true" ]]; then
         local ans_result="ok"
@@ -2781,7 +3043,7 @@ cmd_supervisor_tick() {
     if [[ "$cls" == "verify-challenge" ]]; then
       _sup_verify_alert "$name" "$excerpt"
     elif [[ "$cls" == "blocked-on-prompt" ]]; then
-      _sup_prompt_alert "$name" "$excerpt"
+      _sup_prompt_alert "$name" "$excerpt" "$(jq -r '.cause // "blocked-on-prompt"' <<<"$row")"
     else
       _sup_capacity_alert "$name" "$cls" "$excerpt" "$notify_human" "$notify_machine"
     fi

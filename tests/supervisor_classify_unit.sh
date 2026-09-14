@@ -141,12 +141,35 @@ t "DIVE-3272 regex: dev3's real 429 line matches" "MATCH" \
   "$( [[ -n "$(q '● API Error: Request rejected (429) · Your token-plan 1-week quota has been exhausted.')" ]] && echo MATCH || echo MISS )"
 t "DIVE-3272 regex: the spend-limit phrasing matches" "MATCH" \
   "$( [[ -n "$(q "You've hit your monthly spend limit. Opus 5 5h: 0% 1w: 100%")" ]] && echo MATCH || echo MISS )"
-t "DIVE-3822 regex: 5h=0 with 7d=100 is weekly-exhausted" "MATCH" \
+# DIVE-4536 REVERSES TWO OF THESE ARMS, and they are the two that carry BOTH
+# windows on one line. That shape is not a wall reading — it is claude's
+# status-bar usage METER, which is rendered on every pane at all times, so from
+# the moment an account's weekly window filled, every tick read every idle pane
+# as a refusal and DIVE-4097 door 2 held the no-progress ladder behind it.
+# Measured 2026-09-14: dev3 stood on a one-keystroke confirm for ~10h, 60 HELD
+# lines, zero nudges. A gauge says what has been SPENT; only a refusal sentence
+# says a request was DENIED, and door 2's hold needs the latter.
+#
+# WHAT DIVE-3822 STILL HAS: the weekly arm itself is intact (the `missing 5h`
+# arm below is unchanged and still matches), and a wall that prints a refusal
+# sentence beside a full meter still matches through _SUP_QUOTA_PAT — the arm
+# immediately above this block is exactly that case and is untouched.
+#
+# THE RESIDUAL, SIGNED: an account genuinely at its weekly wall whose pane shows
+# only the two-window meter and no refusal sentence is no longer classified from
+# the PANE. It is still classified from DIVE-4342's account-usage snapshot,
+# which reads the provider's own measured percentage and is ranked ABOVE this
+# branch in _sup_classify; what is lost is the case where that snapshot is also
+# stale or absent, and the cost there is a nudge sent to a throttled seat
+# (harmless, it resumes on its own) instead of ten hours of silence.
+t "DIVE-4536: 5h=0 with 7d=100 on one line is the status METER, not a refusal" "MISS" \
   "$( [[ -n "$(q 'Opus 5 5h: 0% 7d: 100%')" ]] && echo MATCH || echo MISS )"
 t "DIVE-3822 regex: missing 5h with 7d=100 is still weekly-exhausted" "MATCH" \
   "$( [[ -n "$(q 'Opus 5 7d: 100%')" ]] && echo MATCH || echo MISS )"
-t "DIVE-3822 regex: 1w spelling at 100 is weekly-exhausted" "MATCH" \
+t "DIVE-4536: the 1w spelling of the meter is the meter too" "MISS" \
   "$( [[ -n "$(q 'Opus 5 5h: 0% 1w: 100%')" ]] && echo MATCH || echo MISS )"
+t "DIVE-4536 POSITIVE CONTROL: a refusal sentence beside a full meter still matches" "MATCH" \
+  "$( [[ -n "$(q 'Usage limit reached · Opus 5 5h: 100% 7d: 100%')" ]] && echo MATCH || echo MISS )"
 t "DIVE-3822 regex: a healthy 7d counter does NOT exhaust the seat" "MISS" \
   "$( [[ -n "$(q 'Opus 5 7d: 28%')" ]] && echo MATCH || echo MISS )"
 t "DIVE-3822 regex: a healthy 1w counter does NOT exhaust the seat" "MISS" \
