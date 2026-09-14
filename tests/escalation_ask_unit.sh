@@ -243,5 +243,68 @@ has_t "E4: ... and the ask comes from the composer, not a literal" "$CALL" '_tas
 no_t  "E5: no --type=manual survives on the escalation path" \
       "$(grep -c 'cmd_task_need "\$id" --type=manual' "$SRC/task/delivery.sh")" "1"
 
+# ============ F. THE INPUT THE PRODUCT ACTUALLY GIVES THE COMPOSER ===========
+# Sections A-C feed the composer a BARE rejection string. The call site does not.
+# `cmd_task_reject` passes `fb_txt` AFTER `_task_guard_result_over_closed`
+# (src/task/status.sh:122) has merged the MAKER'S OWN PRIOR RESULT in front of the
+# verifier's feedback under the DIVE-2483 seam. So every arm above graded the
+# composer on input the product never hands it, and a "first colon wins" fallback
+# was reading the maker's self-report and showing it to the human AS the verifier's
+# finding — on a gate whose two buttons are keep-going / drop-it, which is to say
+# it argued for the wrong button with the maker's words.
+#
+# This is the COMMON path, not the edge: unlabelled feedback is legal (the refusal
+# in `cmd_task_reject` requires a FIX label only, and `--no-fix=` is a second legal
+# exit carrying neither label), and 196 of 285 rejects recorded on the live board —
+# 69% — have no FINDING label. Feed the real shape here, or F grades nothing.
+MAKER_RESULT='STATUS: shipped it and went home'
+SEAM=$'\n\n--- appended 2026-09-14 04:19:02Z by a later write (DIVE-2483); the text above was already on the row ---\n'
+# No FINDING label. Legal, and the majority shape.
+FB_NOLABEL='❌ quinn rejected (iteration 2): the acceptance arm never reds without the patch / FIX: re-run it on the merged tree'
+PROD_FB="${MAKER_RESULT}${SEAM}${FB_NOLABEL}"
+
+seed ESC-F "Wizard tile ships broken on every box because the relay never landed"
+file_escalation ESC-F 2 "$PROD_FB"
+eq_t "F1: the production-shaped feedback still files (rc 0)" "$RC" "0"
+no_t "F2: THE DEFECT — the MAKER's own result is not quoted to the human as the finding" \
+     "$ESC_ASK" "shipped it and went home"
+no_t "F3: ... not even a fragment of it" "$ESC_ASK" "shipped"
+no_t "F4: ... and the DIVE-2483 merge seam does not leak into the ask either" \
+     "$ESC_ASK" "appended"
+eq_t "F5: no FINDING label means NO clause — the sentence degrades, it does not invent one" \
+     "$ESC_ASK" "Wizard tile ships broken on every box because: sent back twice and stopped. Keep going, or drop it?"
+
+# The control that stops F2-F5 passing vacuously: with a FINDING label present,
+# on the SAME merged shape, the clause is still produced. Without this arm a
+# composer that returned the floor for everything would grade green above.
+FB_LABELLED="${MAKER_RESULT}${SEAM}"'❌ quinn rejected (iteration 2): FINDING: the acceptance arm never reds / FIX: re-run it on the merged tree'
+seed ESC-F2 "Wizard tile ships broken on every box because the relay never landed"
+file_escalation ESC-F2 2 "$FB_LABELLED"
+has_t "F6: CONTROL — a LABELLED finding on the same merged shape still yields its clause" \
+      "$ESC_ASK" "(the acceptance arm never reds)"
+no_t  "F7: CONTROL — ... and still not the maker's words" "$ESC_ASK" "shipped"
+
+# `--no-fix=<reason>` (DIVE-4144) is the second legal exit: neither label.
+seed ESC-F3 "Wizard tile ships broken on every box because the relay never landed"
+file_escalation ESC-F3 2 "${MAKER_RESULT}${SEAM}"'❌ quinn rejected (iteration 2): I cannot name the fix: the failure is not reproducible from here'
+no_t "F8: a --no-fix bounce carries neither label, and still quotes nobody" "$ESC_ASK" "shipped"
+
+# ============ G. the clause builder's own edges =============================
+# All three found by quinn on the same builder; all three reach a person.
+seed ESC-G1 "Wizard tile ships broken on every box because the relay never landed"
+file_escalation ESC-G1 1 "$FB"
+no_t "G1: a one-strike loop (max_iterations=1, legal) does not say '1 times'" "$ESC_ASK" "1 times"
+has_t "G2: ... it says 'once'" "$ESC_ASK" "sent back once"
+
+# The reject template's " / " between FINDING and FIX is a convention, not a rule.
+seed ESC-G2 "Wizard tile ships broken on every box because the relay never landed"
+file_escalation ESC-G2 2 '❌ quinn rejected (iteration 2): FINDING: the relay never lands FIX: re-run the installer'
+no_t "G3: the FIX label does not leak into the clause when the ' / ' is absent" "$ESC_ASK" "FIX"
+has_t "G4: ... the finding half still survives the cut" "$ESC_ASK" "(the relay never lands)"
+
+# A phrase cut mid-clause must not end on a dangling function word.
+eq_t "G5: 'but' dangles like every other function word and is trimmed" \
+     "$(_task_escalation_phrase 'the tile renders but the relay never lands' 4)" "the tile renders"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]] || exit 1

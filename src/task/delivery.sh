@@ -987,7 +987,7 @@ _task_escalation_phrase() { # <text> <max-words> -> phrase (possibly empty)
     if [[ "$_ep_out" == *[,\;:.-] ]]; then _ep_out="${_ep_out%?}"; continue; fi
     _ep_last="${_ep_out##* }"
     case "${_ep_last,,}" in
-      a|an|the|and|or|of|to|in|on|for|with|that|is|was|its|it|by|as|at|from|not|no)
+      a|an|the|and|but|or|of|to|in|on|for|with|that|is|was|its|it|by|as|at|from|not|no)
         [[ "$_ep_out" == *" "* ]] || { _ep_out=""; break; }
         _ep_out="${_ep_out% *}" ;;
       *) break ;;
@@ -1008,9 +1008,24 @@ _task_escalation_finding() { # <feedback text> -> clause (possibly empty)
   # a re-reject carries the superseded text first.
   case "$_ef_txt" in
     *FINDING:*) _ef_cl="${_ef_txt##*FINDING:}" ;;
-    *) _ef_cl="${_ef_txt#*: }" ;;
+    # DIVE-4476 iteration 3: NO fallback. The call site hands this function
+    # `fb_txt` AFTER `_task_guard_result_over_closed` merged the MAKER's prior
+    # result into it (src/task/status.sh:122), so a "first colon wins" fallback
+    # lands inside the maker's own delivered text and shows the maker's
+    # self-report to the human AS the verifier's finding — on a gate whose two
+    # buttons are keep-going / drop-it, which is to say it argues for the wrong
+    # button in the maker's words. Unlabelled feedback is the COMMON case (the
+    # refusal upstream requires a FIX label only, and `--no-fix=` is a second
+    # legal exit with neither label): 196 of 285 recorded rejects on this board,
+    # 69%. No FINDING label therefore means no clause, which is what the
+    # docstring above already promises and what the composer degrades cleanly for.
+    *) _ef_cl="" ;;
   esac
-  # one clause only — the first sentence or separator wins.
+  # one clause only — the first sentence or separator wins. `FIX:` is a separator
+  # too: the template writes "FINDING: … / FIX: …", but that " / " is a convention
+  # and is not enforced, so a finding written "FINDING: the relay never lands FIX:
+  # do X" would otherwise leak the very label the docstring means to exclude.
+  _ef_cl="${_ef_cl%%FIX:*}"
   _ef_cl="${_ef_cl%%.*}"; _ef_cl="${_ef_cl%%;*}"; _ef_cl="${_ef_cl%% / *}"
   _ef_cl="${_ef_cl#"${_ef_cl%%[![:space:]]*}"}"
   _ef_cl=$(_task_escalation_phrase "$_ef_cl" 5)
@@ -1026,6 +1041,9 @@ _task_escalation_ask() { # <row id> <iterations> [feedback text]
   local _ea_id="${1:-}" _ea_iter="${2:-2}" _ea_fb="${3:-}"
   local _ea_title="" _ea_subj="" _ea_find="" _ea_count _ea_ask _ea_max="${_GATE_ASK_MAX_WORDS:-25}"
   case "$_ea_iter" in
+    # `max_iterations=1` is legal (tests/task_reject_trace_unit.sh's own fixture
+    # uses it) and rendered "sent back 1 times" to the person deciding.
+    1) _ea_count="once" ;;
     2) _ea_count="twice" ;;
     *) _ea_count="${_ea_iter} times" ;;
   esac
