@@ -381,6 +381,28 @@ _grader_process_mode() { [[ "$_GRADER_SPAWN_MODE" == "process" ]]; }
 # say which behaviour it degraded to rather than printing the typo back.
 _grader_spawn_mode() { _grader_process_mode && printf 'process' || printf 'session'; }
 
+# ══ DIVE-4496: HOW MANY CLONES ONE TICK MAY CREATE ══
+#
+# A clone is created SYNCHRONOUSLY (see grader_process.sh: the create's exit
+# status is the only honest answer to "did this launch start"), so every create is
+# wall time the tick spends inline. The live cron is `*/5` with NO flock, so a
+# tick that outran its own period would overlap the next one and two ticks could
+# spawn the same delivery twice. One create per tick keeps the tick an order of
+# magnitude inside its period; the lane still reaches its seat cap, over
+# consecutive ticks instead of inside one, and a grade runs 4-9 minutes so the
+# cap is full long before the first verdict.
+#
+# It bounds CREATES, never the cap: clones already running are untouched by it,
+# and a tick that spends its budget QUEUES the rest with that reason named.
+_GRADER_CLONE_MAX_CREATES_PER_TICK="${_GRADER_CLONE_MAX_CREATES_PER_TICK:-1}"
+_grader_clone_create_budget() {
+  # `:-1` and not a bare expansion: this is read inside subshells the harness
+  # and the tick both create, and an UNSET variable under the bundle's `set -u`
+  # would abort the tick rather than fall back to the default.
+  local n="${_GRADER_CLONE_MAX_CREATES_PER_TICK:-1}"
+  [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n" || printf '1'
+}
+
 # The per-seat bound in force, by mode. Read through a function so the two
 # comparison sites in the tick cannot disagree about which bound applies. ONE is
 # correct for a serial seat and must stay 1 there (DIVE-4410: a second wake on a
@@ -678,7 +700,7 @@ cmd_task_grader_tick() {
                  ORDER BY e.id;" 2>/dev/null || printf '')
 
   local usage="" ; usage=$($_GRADER_USAGE_CMD 2>/dev/null || printf '')
-  local n_pending=0 n_spawn=0 n_queue=0 n_refuse=0 n_fail=0 plan=""
+  local n_pending=0 n_spawn=0 n_queue=0 n_refuse=0 n_fail=0 n_created=0 plan=""
   # ══ DIVE-4322: IN FLIGHT MEANS GRADING, NOT "NOT YET CLOSED" ══
   #
   # This count was `spawned with no later task.done/task.rejected`, i.e. a grade
@@ -746,10 +768,39 @@ $(_grader_inflight_exits_sql)
   # GUARDED, not read unconditionally: in session mode there are no one-shots to
   # find, and calling into grader_process.sh from the default path would make
   # this file's own harness depend on a file it does not source.
+  # ══ DIVE-4496: THE TICK THAT CREATES A CLONE ALSO SWEEPS CLONES ══
+  #
+  # Same tick, not a second cron line, because the two readings must not be able
+  # to disagree: the cap below counts LIVE CLONE SEATS, and a clone whose grade is
+  # over is not a live grade — if the sweep ran on its own schedule, the cap would
+  # spend part of every tick counting seats that were already finished.
+  #
+  # BEFORE the count, never after. A tick that removed three finished clones and
+  # then planned against the number it read BEFORE removing them would refuse
+  # three deliveries it had just made room for. The sweep REMOVES and
+  # `_grader_process_count` READS; keeping those as two functions is what lets the
+  # count be the one source of truth for the cap in both modes.
+  #
+  # It runs in DRY-RUN TOO and reports without acting, for the same reason the
+  # stale bound is announced rather than silent: the plan must say which seats this
+  # tick would take away.
+  local n_swept=0
+  if _grader_process_mode; then
+    n_swept=$(_grader_clone_sweep $( ((commit)) && printf '%s' --commit ) 2>/dev/null || printf 0)
+    [[ "$n_swept" =~ ^[0-9]+$ ]] || n_swept=0
+  fi
   local n_procs=0
   if _grader_process_mode; then
     n_procs=$(_grader_process_count)
     [[ "$n_procs" =~ ^[0-9]+$ ]] || n_procs=0
+    # The trailing count means two different things by mode and must SAY which.
+    # Committed, the sweep has already removed and `n_procs` is what is left
+    # grading. In dry-run nothing was removed, so the same number is everything
+    # still PRESENT — reporting that as "still grading" would double-count the
+    # clones the line just said it would take away.
+    (( n_swept )) && plan+="sweep   ${n_swept} grader clone(s) $( ((commit)) \
+      && printf 'removed; %d still grading' "$n_procs" \
+      || printf 'would be removed (dry-run); %d clone seat(s) present' "$n_procs" )"$'\n'
   fi
   # `if`, NEVER `pred && assign`: under the bundle's `set -euo pipefail` a false
   # predicate at statement position is a non-zero simple command and errexit kills
@@ -855,6 +906,15 @@ $(_grader_inflight_exits_sql)
     if (( inflight >= cap )); then
       n_queue=$((n_queue+1)); plan+="queue   $ident  (cap $cap reached; $inflight in flight)"$'\n'; continue
     fi
+    # DIVE-4496: the per-tick CREATE budget, checked beside the cap and reported
+    # as its own reason. A clone create is synchronous wall time inside a tick
+    # whose cron carries no flock, so this is the bound that keeps a tick from
+    # outrunning its own period — it is not the cap, and a reader must be able to
+    # tell "the lane is full" from "this tick has spent its creates".
+    if _grader_process_mode && (( n_created >= $(_grader_clone_create_budget) )); then
+      n_queue=$((n_queue+1))
+      plan+="queue   $ident  (this tick's clone-create budget of $(_grader_clone_create_budget) is spent; the next tick creates the next one)"$'\n'; continue
+    fi
     if [[ -z "$_GRADER_POOL" ]]; then
       n_refuse=$((n_refuse+1))
       plan+="dark    $ident  (no pool configured — set _GRADER_POOL to enable)"$'\n'; continue
@@ -926,7 +986,7 @@ $(_grader_inflight_exits_sql)
     # DIVE-4417 (6): the live process count per tick, on the spawn line, beside
     # the mode that produced it — the one number that says whether the lane is
     # actually running graders in parallel or is a queue reporting spawn=N.
-    plan+="spawn   $ident  -> $chosen  (in-flight ${loadstr}; ${busy}${why}mode=$(_grader_spawn_mode) procs=${n_procs})"$'\n'
+    plan+="spawn   $ident  -> $chosen  (in-flight ${loadstr}; ${busy}${why}mode=$(_grader_spawn_mode) clones=${n_procs})"$'\n'
     if _grader_process_mode; then n_procs=$((n_procs+1)); fi
     if (( commit )); then
       # THE ONLY LINE THAT STARTS ANYTHING, and it records the intent to the
@@ -963,6 +1023,7 @@ $(_grader_inflight_exits_sql)
         # alive before it returns 0, and unwinds the assign if it is not.
         _gp_sid=$(_grader_process_session_id "$chosen")
         if _grader_process_spawn "$chosen" "$ident" "$_gp_sid"; then
+          n_created=$((n_created+1))
           ledger_emit task.grade.spawned ident="$ident" actor="$(task_actor "")" \
             detail="grader session on ${chosen}${_gp_sid:+ (process ${_gp_sid})}" || true
         else
@@ -985,16 +1046,22 @@ $(_grader_inflight_exits_sql)
   done <<<"$pending"
 
   if (( json )); then
-    printf '{"pending":%d,"spawned":%d,"queued":%d,"dark":%d,"stale":%d,"staleHours":%d,"cap":%d,"commit":%s,"pool":"%s","mode":"%s","procs":%d,"seatCap":%d,"failed":%d}\n' \
+    printf '{"pending":%d,"spawned":%d,"queued":%d,"dark":%d,"stale":%d,"staleHours":%d,"cap":%d,"commit":%s,"pool":"%s","mode":"%s","clones":%d,"seatCap":%d,"failed":%d,"swept":%d}\n' \
       "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_stale" "$stale_h" "$cap" \
       "$( ((commit)) && printf true || printf false )" "$_GRADER_POOL" \
-      "$(_grader_spawn_mode)" "$n_procs" "$_gp_seatcap" "$n_fail"
+      "$(_grader_spawn_mode)" "$n_procs" "$_gp_seatcap" "$n_fail" "$n_swept"
     return 0
   fi
   printf '%s' "$plan"
-  printf 'pending=%d spawn=%d queue=%d dark=%d stale=%d cap=%d mode=%s procs=%d seatcap=%d failed=%d %s\n' \
+  # DIVE-4496: `clones=` and `swept=` are on the tick line because the row asks
+  # for them there — a clone lane whose seat churn is only visible in the journal
+  # is a lane nobody can audit from the log the cron already writes. `clones=`
+  # REPLACES DIVE-4417's `procs=` rather than joining it: they are one reading
+  # under two names now that a "process" is a seat, and two names for one number
+  # in a log line is how a reader concludes they measure different things.
+  printf 'pending=%d spawn=%d queue=%d dark=%d stale=%d cap=%d mode=%s clones=%d swept=%d seatcap=%d failed=%d %s\n' \
     "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_stale" "$cap" \
-    "$(_grader_spawn_mode)" "$n_procs" "$_gp_seatcap" "$n_fail" \
+    "$(_grader_spawn_mode)" "$n_procs" "$n_swept" "$_gp_seatcap" "$n_fail" \
     "$( ((commit)) && printf '(COMMITTED)' || printf '(dry-run — pass --commit to act)' )"
 }
 

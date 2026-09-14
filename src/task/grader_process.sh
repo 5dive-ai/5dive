@@ -9,11 +9,34 @@
 # concurrent grade to 2. It did not make it N, and no amount of spreading will:
 # the ceiling is the number of seats you are willing to provision.
 #
-# This file is the other spawn shape. One headless one-shot PROCESS per delivery,
-# launched by the tick under the pool seat's own unix account, with its own
-# working directory, exiting when it has delivered the verdict. N of them run
-# under one account, and the cap is read from the LIVE PROCESSES rather than from
-# lifecycle rows.
+# This file is the other spawn shape. One EPHEMERAL CLONED SEAT per delivery,
+# created by the tick, woken onto the row once, and removed by the next tick that
+# sees its grade resolved. N of them run under one auth profile, and the cap is
+# read from the LIVE CLONE SEATS rather than from lifecycle rows.
+#
+# ══ DIVE-4496: WHY IT IS A SEAT AND NOT A HEADLESS ONE-SHOT ══
+# It was a one-shot (`claude --print` under `sudo -n -u agent-<seat>`) until the
+# live arm ran. MEASURED 2026-09-14 05:45Z, process mode ON: the one-shot spawned
+# to grade DIVE-4482 died in 2 seconds with "Not logged in" and left a run record
+# reading `running` that only DIVE-4418's six-hour bound would ever close. The
+# cause is structural, not a tuning problem: the seat's auth profile is injected
+# by `5dive-agent-start`, and a one-shot never runs it, so a one-shot has no
+# credential and can never have one without re-implementing that injection here.
+#
+# A CLONE INHERITS THE WHOLE RAIL INSTEAD OF RE-BUILDING IT. `agent create` runs
+# the start script, so the auth profile IS injected — the exact thing the one-shot
+# lacked. It also arrives with the things the one-shot header below says process
+# mode does not have: a systemd unit, a tmux pane, `agent logs`, the supervisor
+# pane classifiers and the liveness rails. So `journal_unit` on the run row is now
+# a REAL unit name rather than the deliberate blank the one-shot had to write, and
+# the "runtime-rail extensions are owed" caveat is withdrawn rather than deferred.
+#
+# lodar, 2026-09-14 06:05Z: "if Parallel grading is so complex maybe we should
+# just clone it and rm after it done?" and 06:06Z "keep it simple" — ONE create,
+# ONE wake, ONE remove. There is no new daemon and no second log format here; the
+# remove is the same sweep that handles a clone dying mid-turn, because those are
+# the same question asked one tick apart (06:07Z: "the only downside i see it mid
+# turn death and then we forget to delete clone").
 #
 # ══ WHY THE CAP MOVES OFF THE LEDGER, WHICH IS THE WHOLE POINT OF (2) ══
 # In session mode a spawn row is the only evidence a grade exists, so DIVE-4322
@@ -32,21 +55,28 @@
 # queue in front of it — the cap is the only thing between the lane and the
 # account's window.
 #
-# ══ WHAT THIS MODE DOES NOT YET DO, STATED RATHER THAN LEFT TO BE FOUND ══
-# A second concurrent process under one account has NO systemd unit and NO tmux
-# pane. `agent logs`, the supervisor pane classifiers and the liveness rails all
-# address the single fixed names above (src/cmd_agent_runtime.sh:35, 109, 682,
-# 789), so a one-shot is invisible to every one of them: you cannot `agent logs`
-# it, the supervisor cannot read a rate-limit refusal off it, and no rail will
-# notice it wedged. That is why `journal_unit` is written EMPTY on its run row
-# rather than guessed — an empty column is a readable gap; a plausible-looking
-# unit name that resolves to nothing is a lie the next reader has to disprove.
-# Extending those rails is ops-owned and is not in this file. Until it lands,
-# process mode's containment is the per-process log plus the cap, and that is
-# the reason the mode is dark by default rather than the new default.
-# The argv marker. It is the ONLY thing that makes a one-shot findable, because
-# the process has no unit and no pane to be found by, so it is deliberately a
-# string that appears nowhere else in the fleet's argv.
+# ══ WHAT THIS MODE COSTS, STATED RATHER THAN LEFT TO BE FOUND ══
+# A clone is not free the way a wake is. `agent create` is a unix account plus a
+# runtime provision plus a sudoers render — measured in this repo's own comment
+# on `_grader_spawn_session` at ~50s, and re-measured under DIVE-4496 on this box
+# (the number is in the PR body, not here, because a constant in a comment rots).
+# Against a grade that runs 4-9 minutes that is single-digit percent overhead, and
+# it buys the credential the one-shot could not have at any price.
+#
+# THE ACCOUNT FLOOR IS STILL PER AUTH PROFILE, NOT PER SEAT. A clone borrows the
+# pool seat's `--auth-profile`, so N clones off one pool seat share ONE window and
+# the pool's existing `mark at 5h=…%` check is the real gate. Cloning multiplies
+# seats, never budgets.
+#
+# ══ WHAT A CLONE MUST NOT BE ══
+# It is created `--channels=none --no-skills --no-team-bot --no-heartbeat`. The
+# last of those is load-bearing and is not a performance choice: a clone with a
+# heartbeat is a seat that PICKS ITS OWN NEXT ROW off the shared queue, so an
+# ephemeral grader would start doing arbitrary fleet work and then be removed
+# mid-turn by its own sweep. One wake, one row, one verdict.
+#
+# The argv marker, kept because the clone's grading CLI still carries it and it is
+# what makes a clone's own work attributable in `ps` beside the fleet's.
 _GRADER_PROCESS_MARK="${_GRADER_PROCESS_MARK:-5dive-grader-oneshot}"
 
 # Per-ACCOUNT parallelism once the per-seat serial queue is gone. In session mode
@@ -57,68 +87,112 @@ _GRADER_PROCESS_MARK="${_GRADER_PROCESS_MARK:-5dive-grader-oneshot}"
 # before the floor is ever consulted.
 _GRADER_MAX_PER_SEAT_PROCESS="${_GRADER_MAX_PER_SEAT_PROCESS:-4}"
 
-# Where a one-shot runs and where its output lands. Both are per-GRADE, never
-# shared: two graders in one directory would fight over the same index.lock, and
-# two graders in one log file produce a transcript nobody can attribute.
-_GRADER_PROCESS_ROOT="${_GRADER_PROCESS_ROOT:-}"      # default: the seat's ~/graders
-_GRADER_PROCESS_LOG_DIR="${_GRADER_PROCESS_LOG_DIR:-/var/log/5dive-graders}"
+# A clone needs neither of the one-shot's two per-grade knobs: its HOME is its
+# private working directory (nothing else has an account there, so two graders can
+# never fight over one index.lock) and its unit's JOURNAL is its log. What is left
+# is the name of the grading CLI, which is read for one thing only — the liveness
+# test the sweep runs against the clone's own account.
 _GRADER_PROCESS_CLI="${_GRADER_PROCESS_CLI:-claude}"
 
-# `_grader_process_ps` — one line per live one-shot argv, overridable so the unit
-# harness can feed a fixture instead of needing live graders on the box.
+# ══ DIVE-4496: THE UNIT OF A GRADE IS A CLONE SEAT, SO THAT IS WHAT IS COUNTED ══
 #
-# `pgrep -a -f` and not `ps | grep`: pgrep excludes its own pid, which is the
-# classic off-by-one in a self-counting probe.
-_GRADER_PROCESS_PS_CMD="${_GRADER_PROCESS_PS_CMD:-}"
-_grader_process_ps() {
-  if [[ -n "$_GRADER_PROCESS_PS_CMD" ]]; then eval "$_GRADER_PROCESS_PS_CMD"; return 0; fi
-  pgrep -a -f "$_GRADER_PROCESS_MARK" 2>/dev/null || printf ''
+# In the one-shot shape this was an argv scan: the process had no unit and no
+# registry row, so its own command line was the only record it existed. A clone
+# has a REGISTRY ROW, which is both cheaper to read and the same thing `agent rm`
+# keys on — so the sweep and the cap cannot disagree about which clones exist.
+#
+# THE CLONE NAME IS THE SESSION ID, and that is what makes ownership unambiguous
+# without a second table: session `quinn#3` is seat `gr-quinn-3`. The row asked
+# for the clone to be named by the RUN ID and it cannot be — `valid_name`
+# (cmd_agent_create.sh) caps a seat at 16 lowercase chars and a run id is
+# `gr-<utc-timestamp>-<pid>-<n>`, 29 characters with two uppercase letters in it.
+# So the clone is named by the run's IDENTITY instead of its id: the same
+# `<pool seat>` and `<n>` the run row carries in `session_id`, which is the pair
+# that actually answers "whose grade is this, and which of that seat's grades".
+# The full run id stays on the run row and the run row names the clone in `agent`,
+# so the mapping is total in both directions.
+_GRADER_CLONE_PREFIX="${_GRADER_CLONE_PREFIX:-gr-}"
+
+# `_grader_clone_name <session-id>` — `quinn#3` -> `gr-quinn-3`, or non-zero.
+#
+# REFUSES rather than truncates. A truncated seat name would still create, and it
+# would create a seat whose name no longer maps back to any session — the sweep
+# would then read it as an orphan and reap a live grade every tick. A pool seat
+# whose name is too long to clone is a configuration fact the operator must see,
+# not one this function may paper over.
+_grader_clone_name() {  # <session-id>
+  local sid="$1" seat="${1%%#*}" n="${1##*#}" name
+  [[ -n "$sid" && "$sid" == *#* && -n "$seat" && "$n" =~ ^[0-9]+$ ]] || return 1
+  name="${_GRADER_CLONE_PREFIX}${seat}-${n}"
+  # The same shape `valid_name` enforces, re-asserted here so the refusal is
+  # attributable to the clone lane rather than surfacing as an `agent create`
+  # usage error several layers down.
+  [[ "$name" =~ ^[a-z][a-z0-9-]*$ && ${#name} -le 16 ]] || return 1
+  printf '%s' "$name"
 }
 
-# `_grader_process_count [<seat>]` — live one-shots, all seats or one seat.
+# `_grader_clone_pool_seat <clone>` — `gr-quinn-3` -> `quinn`. The inverse, and
+# it is a pure string operation on purpose: the per-seat load reading runs once
+# per tick over every clone, and a DB round trip per clone to recover a name the
+# name already contains is a cost with no answer attached.
+_grader_clone_pool_seat() {  # <clone>
+  local c="${1#${_GRADER_CLONE_PREFIX}}"
+  [[ "$1" == "${_GRADER_CLONE_PREFIX}"* && "$c" == *-* ]] || return 1
+  printf '%s' "${c%-*}"
+}
+
+# `_grader_clone_ls` — one live clone seat name per line.
 #
-# COUNTED BY DISTINCT `ident=`, NEVER BY LINE, and that is the load-bearing
-# detail. One launch is three processes that all carry the marker in their argv —
-# the `sudo`, the `bash -lc`, and after exec the CLI itself — plus `setsid` while
-# it lives. Counting lines would read one grade as three or four and the cap
-# would bind at a quarter of its number; counting idents reads one grade as one
-# however many argv layers happen to be alive at the instant of the read.
+# The REGISTRY is the source, not `getent passwd`, because the registry is what
+# `agent rm` reads and refuses on: a clone this returns must be one the sweep can
+# actually remove. A half-created seat with an account and no registry row is a
+# real state and it is NOT this lane's to clean — `5dive doctor
+# --category=registry --fix` (doctor_check_orphan_seats) already owns that class
+# and has since DIVE-4340.
+_GRADER_CLONE_LS_CMD="${_GRADER_CLONE_LS_CMD:-}"
+_grader_clone_ls() {
+  if [[ -n "$_GRADER_CLONE_LS_CMD" ]]; then eval "$_GRADER_CLONE_LS_CMD"; return 0; fi
+  [[ -r "${REGISTRY:-}" ]] || { printf ''; return 0; }
+  jq -r --arg p "$_GRADER_CLONE_PREFIX" \
+    '.agents | keys[] | select(startswith($p))' "$REGISTRY" 2>/dev/null || printf ''
+}
+
+# `_grader_process_count` — live clone seats, all pool seats or one.
+#
+# Kept under its old name because it is the tick's cap reading and the tick is
+# unchanged by this row (the row's instruction is "re-point the LAUNCH; keep the
+# tick"). What changed is only what a "process" IS.
 _grader_process_count() {  # [<seat>]
-  local want="${1:-}" line ident seat
-  local -A seen=()
-  while IFS= read -r line; do
-    [[ "$line" == *"$_GRADER_PROCESS_MARK"* ]] || continue
-    [[ "$line" == *ident=* ]] || continue
-    ident="${line#*ident=}"; ident="${ident%% *}"
-    [[ -n "$ident" ]] || continue
+  local want="${1:-}" clone n=0 pool
+  while IFS= read -r clone; do
+    [[ -n "$clone" ]] || continue
     if [[ -n "$want" ]]; then
-      [[ "$line" == *seat=* ]] || continue
-      seat="${line#*seat=}"; seat="${seat%% *}"
-      [[ "$seat" == "$want" ]] || continue
+      pool=$(_grader_clone_pool_seat "$clone" 2>/dev/null || printf '')
+      [[ "$pool" == "$want" ]] || continue
     fi
-    seen["$ident"]=1
-  done < <(_grader_process_ps)
-  printf '%s' "${#seen[@]}"
+    n=$((n+1))
+  done < <(_grader_clone_ls)
+  printf '%s' "$n"
 }
 
-# `_grader_process_seat_loads` — the per-seat reading in process mode, in the
-# same `<seat><US><n>` shape `_grader_seat_loads` emits, so the tick's pick loop
-# is identical in both modes and only its SOURCE of truth changes.
+# `_grader_process_seat_loads` — the per-POOL-SEAT reading, in the same
+# `<seat><US><n>` shape `_grader_seat_loads` emits, so the tick's pick loop is
+# identical in both modes and only its SOURCE of truth changes.
+#
+# Per POOL seat and never per clone: a clone is one grade by construction, so a
+# per-clone load is always 1 and would make the cap meaningless. The number the
+# lane must bound is how many clones one AUTH PROFILE is carrying, and the pool
+# seat is the name that profile is reached through.
 _grader_process_seat_loads() {
-  local line ident seat key
-  local -A seen=() load=()
-  while IFS= read -r line; do
-    [[ "$line" == *"$_GRADER_PROCESS_MARK"* ]] || continue
-    [[ "$line" == *ident=* && "$line" == *seat=* ]] || continue
-    ident="${line#*ident=}"; ident="${ident%% *}"
-    seat="${line#*seat=}";  seat="${seat%% *}"
-    [[ -n "$ident" && -n "$seat" ]] || continue
-    key="${seat}/${ident}"
-    [[ -n "${seen[$key]:-}" ]] && continue
-    seen["$key"]=1
-    load["$seat"]=$(( ${load[$seat]:-0} + 1 ))
-  done < <(_grader_process_ps)
-  for seat in "${!load[@]}"; do printf '%s\x1f%s\n' "$seat" "${load[$seat]}"; done
+  local clone pool
+  local -A load=()
+  while IFS= read -r clone; do
+    [[ -n "$clone" ]] || continue
+    pool=$(_grader_clone_pool_seat "$clone" 2>/dev/null || printf '')
+    [[ -n "$pool" ]] || continue
+    load["$pool"]=$(( ${load[$pool]:-0} + 1 ))
+  done < <(_grader_clone_ls)
+  for pool in "${!load[@]}"; do printf '%s\x1f%s\n' "$pool" "${load[$pool]}"; done
 }
 
 # `_grader_process_session_id <seat>` — `<seat>#<n>`, the attribution DO (3) asks
@@ -131,9 +205,15 @@ _grader_process_seat_loads() {
 _grader_process_session_id() {  # <seat>
   local seat="$1" n
   [[ -n "$seat" ]] || return 1
+  # DIVE-4496: keyed on `session_id` ALONE, no longer on `agent`. In clone mode
+  # `runs.agent` holds the CLONE (`gr-quinn-3`), not the pool seat, so the old
+  # `agent=<seat>` clause would find zero prior rows and hand out `quinn#1`
+  # forever — every clone colliding on one name, and every one of them reusing a
+  # session id already spent. The `session_id LIKE '<seat>#%'` clause is the one
+  # that was always doing the selecting.
   n=$(db "SELECT COALESCE(MAX(CAST(substr(session_id, instr(session_id,'#')+1) AS INTEGER)),0)+1
             FROM runs
-           WHERE agent=$(sqlq "$seat") AND role='grader'
+           WHERE role='grader'
              AND session_id LIKE $(sqlq "${seat}#")||'%';" 2>/dev/null || printf '')
   [[ "$n" =~ ^[0-9]+$ ]] || n=1
   printf '%s#%s' "$seat" "$n"
@@ -144,27 +224,38 @@ _grader_process_session_id() {  # <seat>
 # (src/lib/tasks_db.sh), so the shape needed no migration; nothing wrote two live
 # rows for one seat before this.
 #
-# journal_unit IS WRITTEN EMPTY ON PURPOSE — see the header. A one-shot has no
-# unit; writing `5dive-agent@quinn.service` would name the seat's MAIN session,
-# whose journal contains everything except this grade.
-_grader_process_run_open() {  # <seat> <ident> <session_id>
-  local seat="$1" ident="$2" sid="$3" rid tid
+# DIVE-4496: journal_unit IS NOW A REAL UNIT, and the change is the whole point
+# of the clone shape. A one-shot had none, so this column was written EMPTY on
+# purpose — an empty column being a readable gap where a plausible unit name that
+# resolves to nothing is a lie. A clone is a seat: `5dive-agent@gr-quinn-3.service`
+# exists, `agent logs gr-quinn-3` works, and the supervisor's pane classifiers can
+# read a rate-limit refusal off it. The gap is closed rather than documented.
+#
+# `agent` HOLDS THE CLONE, NOT THE POOL SEAT, and that is the ownership record the
+# sweep runs on: given a clone seat there is exactly one query for its grade
+# (`runs WHERE agent=<clone>`), and given a run row the pool seat whose budget it
+# spends is in `session_id`. Writing the pool seat here instead would leave the
+# sweep with no way to tell which of quinn's three clones a row belonged to.
+_grader_process_run_open() {  # <seat> <ident> <session_id> [<clone>]
+  local seat="$1" ident="$2" sid="$3" clone="${4:-}" rid tid unit=""
   rid="gr-$(date -u +%Y%m%dT%H%M%SZ)-$$-${sid#*#}"
   tid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')
   [[ "$tid" =~ ^[0-9]+$ ]] || tid=NULL
+  [[ -n "$clone" ]] && unit="5dive-agent@${clone}.service"
   db "INSERT INTO runs (id, task_id, ident, agent, role, runtime_type, session_id,
                         journal_unit, wake_reason, status)
-      VALUES ($(sqlq "$rid"), ${tid}, $(sqlq "$ident"), $(sqlq "$seat"), 'grader',
-              'oneshot', $(sqlq "$sid"), '', 'task.grade.spawned', 'running');" >/dev/null 2>&1 || true
+      VALUES ($(sqlq "$rid"), ${tid}, $(sqlq "$ident"), $(sqlq "${clone:-$seat}"), 'grader',
+              'clone', $(sqlq "$sid"), $(sqlq "$unit"), 'task.grade.spawned', 'running');" >/dev/null 2>&1 || true
   printf '%s' "$rid"
 }
 
-# The goal the one-shot is launched with. Deliberately the SAME instruction the
-# session-mode wake sends, plus the two facts only a one-shot needs: it is alone
-# (no seat session will pick this up if it exits early) and its cwd is its own.
-_grader_process_goal() {  # <ident> <session_id> <dir>
-  printf 'You are a one-shot grader session (%s) with no inbox and no follow-up turn: this process exits when you stop. Grade delivered task %s. Your working directory %s is yours alone — make any checkout or worktree you need inside it, never in a shared checkout. Read the row, grade the delivery, checkpoint each verified arm to the row as you go, then run 5dive task done or 5dive task reject. Do not wait for CI; grade what is at the delivered head.' \
-    "$2" "$1" "$3"
+# The instruction the clone is woken with. Deliberately the SAME instruction the
+# session-mode wake sends, plus the two facts only an ephemeral seat needs: it is
+# alone (nothing will pick this row up if it stops early, because the clone has no
+# heartbeat) and its home is its own to check out into.
+_grader_process_goal() {  # <ident> <session_id> <clone>
+  printf 'You are an ephemeral grader seat (%s, session %s) created for this one delivery: you have no inbox, no heartbeat and no next row, and this seat is removed once your verdict lands. Grade delivered task %s. Your home directory is yours alone — make any checkout or worktree you need inside it, never in a shared checkout. Read the row, grade the delivery, checkpoint each verified arm to the row as you go, then run 5dive task done or 5dive task reject. Do not wait for CI; grade what is at the delivered head.' \
+    "$3" "$2" "$1"
 }
 
 # `_grader_process_spawn <seat> <ident> <session_id>` — start ONE grader process.
@@ -233,66 +324,214 @@ _GRADER_PROCESS_START_GRACE="${_GRADER_PROCESS_START_GRACE:-2}"
 # spawn was to let it mutate the live board.
 _GRADER_TASK_CLI="${_GRADER_TASK_CLI:-5dive}"
 
-# `_grader_process_live <ident>` — is a one-shot for THIS delivery in the process
-# table right now? The trailing space is load-bearing: `ident=DIVE-1` is a prefix
-# of `ident=DIVE-10`, and a prefix match would report another grade's process as
-# this one's proof of life.
-_grader_process_live() {  # <ident>
-  local line
-  while IFS= read -r line; do
-    [[ "$line" == *"$_GRADER_PROCESS_MARK"* && "$line" == *"ident=${1} "* ]] && return 0
-  done < <(_grader_process_ps)
-  return 1
+# `_grader_clone_live <clone>` — is this clone actually WORKING right now?
+#
+# ══ THE PID IN THE RUN ID IS NOT THE GRADE'S PID, AND IT NEVER WAS ══
+#
+# This row's live specimen (`gr-20260914T054510Z-1554431-1`, measured by quinn
+# 2026-09-14 06:22Z) came with the suggestion that the cheapest correct liveness
+# test is `kill -0` on the pid the run id embeds. It is not, and the specimen is
+# itself the proof: `_grader_process_run_open` builds that id from `$$`, and `$$`
+# in the tick is the TICK's shell — a cron child that returns in seconds. pid
+# 1554431 was dead 37 minutes later because the tick was dead, not because the
+# grade was. Keyed on that pid, the sweep would reap every clone it had just
+# created, on the very next tick, while the grade was running. So the embedded pid
+# is useful for exactly one thing (telling two run ids apart) and is never read as
+# liveness here.
+#
+# WHAT IS READ INSTEAD is the clone's own account: a grading CLI running as
+# `agent-<clone>`. That is the thing the mutant kills (`SIGKILL a clone's claude
+# mid-grade`) and the thing a wedged-but-alive grade still has, which is the pair
+# the sweep has to tell apart. The unit is deliberately NOT the test: the template
+# restarts, and a restarted clone comes back with an empty session and no goal —
+# it will never resume the grade, so `is-active` would report a seat that is up
+# and idle as a grade in progress.
+#
+# IT FAILS TOWARD REAPING, and that direction is chosen. A clone wrongly reaped
+# costs one re-queued delivery (the next tick grades it again); a dead clone
+# wrongly believed alive costs the delivery its grade until the six-hour bound —
+# which is the failure this row exists to remove.
+_GRADER_CLONE_LIVE_CMD="${_GRADER_CLONE_LIVE_CMD:-}"
+_grader_clone_live() {  # <clone>
+  local clone="$1"
+  [[ -n "$clone" ]] || return 1
+  if [[ -n "$_GRADER_CLONE_LIVE_CMD" ]]; then eval "$_GRADER_CLONE_LIVE_CMD"; return $?; fi
+  pgrep -u "agent-${clone}" -f "$_GRADER_PROCESS_CLI" >/dev/null 2>&1
 }
 
-# `_grader_pid_alive <pid>` — alive, and NOT a zombie.
+# How long after its run row opens a clone is believed alive without being asked.
+# `agent create` provisions a runtime and the CLI is not up the instant the row is
+# written, so a liveness test inside this window would reap every clone during its
+# own startup. It is a floor on the AGE OF THE RUN ROW, not a sleep: nothing waits.
+_GRADER_CLONE_START_GRACE_S="${_GRADER_CLONE_START_GRACE_S:-300}"
+
+# ══ DIVE-4496: THE PID MACHINERY IS GONE, NOT MOVED ══
 #
-# `kill -0` ALONE IS THE WRONG TEST HERE and it was wrong in the dangerous
-# direction: a child that has exited and has not been reaped is a zombie, and
-# `kill -0` succeeds on a zombie, so a refused launch read as a running one. That
-# is the very defect this iteration exists to remove, reintroduced one layer
-# down; it was caught by the arm, not by reading the code.
+# Iteration 2 of DIVE-4417 kept a background pid and probed it for zombie-vs-live
+# (`_grader_pid_state`, `_grader_pid_alive`, `_grader_process_started`), because
+# the launch was `setsid sudo … &` and a backgrounded launch's exit status is
+# never read by anything. There is no background pid here: `agent create` is
+# called SYNCHRONOUSLY and its exit status IS the answer to "did the launch
+# start", so the entire question those three functions reconstructed is now
+# answered directly. Their arms went with them; the arms that replaced them grade
+# the create's rc, the credential refusal and the sweep.
 #
-# THE STATE READ IS A SEAM, for the reason that made this guard nearly ship
-# ungraded: a zombie produced by `cmd &` in a harness is a RACE, because bash
-# reaps its own background children from its SIGCHLD handler, so an arm built on
-# one passes whether the guard is present or not. Feeding the state directly is
-# the only way to grade the branch rather than the timing.
-_GRADER_PID_STATE_CMD="${_GRADER_PID_STATE_CMD:-}"
-_grader_pid_state() {  # <pid>
-  if [[ -n "$_GRADER_PID_STATE_CMD" ]]; then eval "$_GRADER_PID_STATE_CMD"; return 0; fi
-  [[ -r "/proc/$1/status" ]] || return 0
-  sed -n 's/^State:[[:space:]]*\([A-Z]\).*/\1/p' "/proc/$1/status" 2>/dev/null
+# THE COST OF SYNCHRONOUS IS A SLOW TICK, and it is bounded rather than ignored.
+# A create is a unix account plus a runtime provision plus a sudoers render, so
+# the tick pays that wall time inline. `_GRADER_CLONE_MAX_CREATES_PER_TICK`
+# (read by the tick) is 1: the lane reaches its seat cap over consecutive ticks
+# instead of inside one. Measured against the live cron — `*/5` with NO flock —
+# one create keeps a tick an order of magnitude clear of its own period, where
+# four would risk overlapping ticks double-spawning a delivery. The cron line
+# should also carry `flock -n` and that is an ops change, not this file's.
+
+# `_grader_clone_create <clone> <pool_seat>` — the seat, and nothing else.
+#
+# `--channels=none --no-skills --no-team-bot`: a grader has no inbox, no plugin
+# surface and no team bot to bind. `--no-heartbeat` is the load-bearing one — see
+# the header: a clone with a heartbeat picks its own next row off the shared queue.
+#
+# The auth profile is the POOL SEAT's, which is the whole reason a pool seat is
+# still chosen before a clone is created: the floor check the tick already ran was
+# a reading of that profile's window, and a clone created on any other profile
+# would be a grade spent against a budget nobody measured.
+_GRADER_CLONE_CREATE_CMD="${_GRADER_CLONE_CREATE_CMD:-}"
+_grader_clone_create() {  # <clone> <pool_seat>
+  local clone="$1" pool="$2" profile=""
+  [[ -n "$clone" && -n "$pool" ]] || return 1
+  if [[ -n "$_GRADER_CLONE_CREATE_CMD" ]]; then eval "$_GRADER_CLONE_CREATE_CMD"; return $?; fi
+  if [[ -r "${REGISTRY:-}" ]]; then
+    profile=$(jq -r --arg n "$pool" '.agents[$n].authProfile // empty' "$REGISTRY" 2>/dev/null || printf '')
+  fi
+  # NO PROFILE IS A REFUSAL, not a create with the default. An unpinned clone
+  # resolves whatever credential the box's default names, which is exactly the
+  # "authenticated by accident" shape the one-shot failed in — and this time it
+  # would fail after spending a seat.
+  [[ -n "$profile" ]] || { warn "grader clone ${clone}: pool seat ${pool} has no auth profile to clone"; return 5; }
+  "$_GRADER_TASK_CLI" agent create "$clone" --type=claude --auth-profile="$profile" \
+    --channels=none --no-skills --no-team-bot --no-heartbeat >/dev/null 2>&1
 }
-_grader_pid_alive() {  # <pid>
-  kill -0 "$1" 2>/dev/null || return 1
-  [[ "$(_grader_pid_state "$1")" == Z ]] && return 1
+
+# `_grader_clone_creds <clone> <pool_seat>` — the READ credential, copied.
+#
+# ══ WHAT IS COPIED, AND WHY THESE TWO FILES AND NOT A GRANT ══
+# `/usr/local/sbin/verifier-gh-read-token.sh` mints for `SEATS=(quinn main2)` only
+# (measured: its own default argv), so a clone is born with no GitHub credential
+# at all and would grade blind. The two files are the whole of that credential:
+# `~/.config/gh/hosts.yml` and `~/.config/5dive/gh-read-tokens.env`. They hold
+# `ghs_` GitHub App INSTALLATION tokens scoped contents:read + metadata:read +
+# pull_requests:read, with a ~1 hour TTL — so the copy expires with or before the
+# grade and there is nothing to revoke. That short life is the security property,
+# not a limitation of the copy.
+#
+# ══ WHAT MUST NEVER BE COPIED, ENFORCED AND NOT JUST DOCUMENTED ══
+# The 5dive-bot classic PAT (`/etc/5dive/connectors/github-bot.env`, scopes
+# `repo, workflow`) is full WRITE on everything, and handing it to a throwaway
+# seat would also route around the delegated-push review gate. That is the mint
+# script's own rule. So the copy REFUSES on any `gho_`/`ghp_`-shaped token in the
+# source, which is a content test rather than a path test: a write token that
+# reaches these files by some future accident is caught by the thing that copies
+# them, not by the naming of the file it arrived in.
+_GRADER_CLONE_CREDS_CMD="${_GRADER_CLONE_CREDS_CMD:-}"
+_GRADER_CLONE_CRED_FILES="${_GRADER_CLONE_CRED_FILES:-.config/gh/hosts.yml .config/5dive/gh-read-tokens.env}"
+_grader_clone_creds() {  # <clone> <pool_seat>
+  local clone="$1" pool="$2" rel src dst
+  [[ -n "$clone" && -n "$pool" ]] || return 1
+  if [[ -n "$_GRADER_CLONE_CREDS_CMD" ]]; then eval "$_GRADER_CLONE_CREDS_CMD"; return $?; fi
+  local home_root="${AGENT_HOME_ROOT:-/home}"
+  for rel in $_GRADER_CLONE_CRED_FILES; do
+    src="${home_root}/agent-${pool}/${rel}"
+    dst="${home_root}/agent-${clone}/${rel}"
+    # A MISSING SOURCE IS A REFUSAL. The caller unwinds on it, which is the row's
+    # "a clone that cannot run the read probe against its delivery is unwound on
+    # the spot, not left to grade blind" — asked one step earlier, where it costs
+    # nothing.
+    [[ -r "$src" ]] || { warn "grader clone ${clone}: ${pool} has no ${rel} to copy"; return 3; }
+    if grep -qE 'gh[op]_[A-Za-z0-9_]{8}' "$src" 2>/dev/null; then
+      warn "grader clone ${clone}: REFUSED to copy ${rel} — it carries a write-capable token (gho_/ghp_); read-only ghs_ installation tokens only"
+      return 4
+    fi
+    # ══ THE DIRECTORY IS CREATED OWNED BY THE CLONE, NOT BY ROOT ══
+    # MEASURED on the first live arm, 2026-09-14: `install -D` creates the missing
+    # parents ROOT-OWNED and only chowns the FILE, and `gh` does not merely read
+    # its config dir — on first use it MIGRATES and writes `config.yml` into it.
+    # So the clone got a perfectly readable hosts.yml inside a directory it could
+    # not write, `gh auth token` died with "failed to write config after
+    # migration: permission denied", `5dive gh` read that as "you hold NO gh
+    # credential on this seat" and routed the read to the bot — which needs a
+    # NOPASSWD grant the clone lacks. One root-owned directory presented as a
+    # missing credential three layers away. `install -d` applies the owner to
+    # EVERY component it creates, which is the difference that matters here.
+    install -d -o "agent-${clone}" -g "agent-${clone}" -m 0700 "${dst%/*}" 2>/dev/null \
+      || { warn "grader clone ${clone}: could not create ${rel%/*} owned by the clone"; return 3; }
+    install -o "agent-${clone}" -g "agent-${clone}" -m 0600 "$src" "$dst" 2>/dev/null \
+      || { warn "grader clone ${clone}: could not install ${rel}"; return 3; }
+  done
   return 0
 }
 
-# `_grader_process_started <pid> <ident>` — did the launch actually start?
+# `_grader_clone_wake <clone> <ident> <session_id>` — ONE wake, onto ONE row.
 #
-# THE ARGV MARKER IS THE AUTHORITY, not the wrapper's pid, and the reason is that
-# the pid is not always the one-shot's: `setsid` execs in place when its caller is
-# not a process-group leader (the tick, a cron child, is that case) but FORKS and
-# exits 0 immediately under job control. Every layer of the launch — setsid, sudo,
-# bash, and the CLI after it execs — carries the marker in its argv, so a present
-# marker is proof of life whatever the pid is doing.
+# ══ NOT `heartbeat wake-task`, AND THE REASON IS MEASURABLE IN THE DISPATCH ══
+# The row's direction says "heartbeat-wake it onto the row as verifier", and that
+# verb is the wrong instrument for a clone. `_hb_task_loop_note`
+# (cmd_heartbeat.sh) picks which of its variants to send by comparing the woken
+# seat's name against the row's `verifier` COLUMN. A clone is never that column's
+# value — the row's verifier is the routed seat (quinn), and the clone is a
+# throwaway grading on its behalf — so `vfier != name` selects the MAKER variant,
+# which tells the clone that its `task done` "DELIVERS rather than closes" and
+# that the work is its to do. A wake that hands the grader the maker's contract is
+# worse than no wake: it produces a confident turn doing the wrong job.
 #
-# NOTHING HERE MAY BLOCK. A bare `wait` on a pid that is still running would hold
-# the tick for the entire duration of the grade, so the liveness test is the
-# non-blocking one and `wait` is only ever reached for a pid already known dead,
-# where it exists to reap rather than to be read.
-_grader_process_started() {  # <pid> <ident>
-  local pid="$1" ident="$2"
-  _grader_process_live "$ident" && return 0
-  # No marker in the process table. A wrapper that is gone or zombified is a
-  # launch that did not start — the sudo refusal quinn measured lands here.
-  if ! _grader_pid_alive "$pid"; then wait "$pid" 2>/dev/null || true; return 1; fi
-  # Alive, holding the marker in its own argv, yet not visible to the probe: the
-  # probe itself is broken (no pgrep, no permission). Believing the launch is the
-  # only non-blocking answer, and it is the one that does not invent a failure
-  # out of a missing instrument.
+# `agent send` carries its OWN instruction, so the framing comes from this file
+# rather than from a column the clone does not appear in. It is also exactly what
+# `_grader_spawn_session` does today, which means the clone lane and the session
+# lane wake with the same words and a verdict from one is comparable to a verdict
+# from the other.
+#
+# The `_A2A_GUARD` is DIVE-4295's: if the row closes or moves to another seat
+# while this copy is spooled, the copy is dropped rather than typed.
+# `assignee_owns` and not a verifier clause — the clone IS the assignee here (the
+# assign above is what makes that true) and is NOT the verifier.
+_GRADER_CLONE_WAKE_CMD="${_GRADER_CLONE_WAKE_CMD:-}"
+_grader_clone_wake() {  # <clone> <ident> <session_id>
+  local clone="$1" ident="$2" sid="${3:-}"
+  [[ -n "$clone" && -n "$ident" ]] || return 1
+  if [[ -n "$_GRADER_CLONE_WAKE_CMD" ]]; then eval "$_GRADER_CLONE_WAKE_CMD"; return $?; fi
+  local msg; msg=$(_grader_process_goal "$ident" "$sid" "$clone")
+  _A2A_GUARD="task:${ident}:${clone}:assignee_owns" \
+  "$_GRADER_TASK_CLI" agent send "$clone" "$msg" >/dev/null 2>&1
+}
+
+# `_grader_clone_remove <clone>` — the seat goes away, its home is quarantined.
+#
+# NOT `--purge-home`. `agent rm` already moves the home to
+# `/home/.5dive-reaped/<clone>-<ts>` root-owned 0700 (DIVE-2138), which is the
+# reap backup the row asks for, and a grade's working tree is occasionally the
+# only record of what it looked at. `_grader_clone_reaped_prune` caps its age so
+# the quarantine does not become the disk leak.
+_GRADER_CLONE_REMOVE_CMD="${_GRADER_CLONE_REMOVE_CMD:-}"
+_grader_clone_remove() {  # <clone>
+  local clone="$1"
+  [[ -n "$clone" ]] || return 1
+  if [[ -n "$_GRADER_CLONE_REMOVE_CMD" ]]; then eval "$_GRADER_CLONE_REMOVE_CMD"; return $?; fi
+  "$_GRADER_TASK_CLI" agent rm "$clone" >/dev/null 2>&1
+}
+
+# `_grader_clone_reaped_prune` — cap the age of the quarantine.
+#
+# ONLY `<prefix>*` ENTRIES, never the whole of REAPED_DIR: that directory also
+# holds the homes of seats an operator removed by hand, and a grader lane has no
+# business deciding when those expire.
+_GRADER_REAPED_MAX_DAYS="${_GRADER_REAPED_MAX_DAYS:-7}"
+_GRADER_CLONE_PRUNE_CMD="${_GRADER_CLONE_PRUNE_CMD:-}"
+_grader_clone_reaped_prune() {
+  if [[ -n "$_GRADER_CLONE_PRUNE_CMD" ]]; then eval "$_GRADER_CLONE_PRUNE_CMD"; return 0; fi
+  local dir="${REAPED_DIR:-${AGENT_HOME_ROOT:-/home}/.5dive-reaped}" d
+  [[ -d "$dir" ]] || return 0
+  d="${_GRADER_REAPED_MAX_DAYS}"; [[ "$d" =~ ^[0-9]+$ ]] || d=7
+  find "$dir" -maxdepth 1 -mindepth 1 -type d -name "${_GRADER_CLONE_PREFIX}*" \
+    -mtime "+${d}" -exec rm -rf -- {} + 2>/dev/null || true
   return 0
 }
 
@@ -323,7 +562,40 @@ _grader_process_unwind() {  # <seat> <ident> <sid> <rid> <prev_assignee>
     detail="grader process ${sid} on ${seat} did not start; assign reverted, row stays pending" || true
 }
 
-_GRADER_PROCESS_LAUNCH="${_GRADER_PROCESS_LAUNCH:-}"
+# `_grader_process_spawn <seat> <ident> <session_id>` — create ONE clone, wake it.
+#
+# ORDER IS THE WHOLE CORRECTNESS ARGUMENT here, and it is the order that makes
+# every failure cheap in proportion to how likely it is:
+#
+#   1. non-pool owner, then runas — neither touches the row or the fleet;
+#   2. NAME — refused before any spend, because a pool seat whose name cannot be
+#      cloned fails identically on every tick and must say so;
+#   3. CREATE the clone. Nothing on the row yet: a failed create leaves a board
+#      byte-identical to before and the next tick retries;
+#   4. CREDS. A refusal here removes the clone again — the "unwound on the spot"
+#      the row asks for — and still nothing has touched the row;
+#   5. only NOW assign the row and open the run record, i.e. once the thing being
+#      recorded actually exists;
+#   6. WAKE. A failed wake unwinds both (assign reverted, run marked failed,
+#      compensating ledger row) AND removes the clone, so the delivery goes back
+#      to pending with no seat left behind.
+#
+# The caller's half — emitting `task.grade.spawned` only once this returns 0 —
+# is in grader_pool.sh, and neither half is sufficient alone. That is DIVE-4417
+# iteration 2's finding and it is unchanged: a spawn row written ahead of a
+# launch that never started is PERMANENT, because the pending query excludes any
+# ident carrying a later `task.grade.spawned`.
+#
+# ══ THERE IS NO WHOLE-LAUNCH SEAM ANY MORE, AND THAT IS DELIBERATE ══
+# DIVE-4417 had `_GRADER_PROCESS_LAUNCH`, one seam standing in for the entire
+# launch, because the launch was one `setsid sudo` line. It cannot stand in for
+# this one: the assign and the run record sit BETWEEN the create and the wake
+# (nothing may be written to the row until the clone exists, and nothing may be
+# woken until the row is written), so a seam that swallowed the whole sequence
+# would take the ordering — the only thing worth grading here — out of reach of
+# every arm. The four per-step seams above replace it, and the harness drives the
+# caller's contract through the WAKE seam, which is the step that fails after the
+# row has been touched.
 _grader_process_spawn() {  # <seat> <ident> <session_id>
   local seat="$1" ident="$2" sid="$3"
   [[ -n "$seat" && -n "$ident" && -n "$sid" ]] || return 1
@@ -333,60 +605,237 @@ _grader_process_spawn() {  # <seat> <ident> <session_id>
     warn "$ident: skip — owner is $working_owner, not a pool seat"
     return 2
   fi
-  # BEFORE the row is touched: the failure that needs no compensation.
+  # BEFORE the row is touched: the failure that needs no compensation. The clone
+  # is created by this caller, but the creds are copied OUT of the pool seat's
+  # home, which still needs the runas the one-shot needed.
   if ! _grader_process_runas_probe "$seat"; then
-    warn "$ident: grader process on $seat cannot start — no runas for agent-${seat}"
+    warn "$ident: grader clone for $seat cannot start — no runas for agent-${seat}"
     return 3
   fi
+  local clone=""
+  clone=$(_grader_clone_name "$sid" 2>/dev/null || printf '')
+  if [[ -z "$clone" ]]; then
+    warn "$ident: cannot derive a clone seat name from session '${sid}' — a seat name is at most 16 lowercase chars (valid_name); rename the pool seat or shorten it"
+    return 5
+  fi
+
+  if ! _grader_clone_create "$clone" "$seat"; then
+    warn "$ident: could not create grader clone ${clone} off ${seat} — row untouched, next tick retries"
+    return 6
+  fi
+  if ! _grader_clone_creds "$clone" "$seat"; then
+    warn "$ident: grader clone ${clone} has no read credential — removing it rather than grading blind"
+    _grader_clone_remove "$clone" || warn "$ident: grader clone ${clone} could not be removed; the sweep will take it"
+    return 7
+  fi
+  # THE PROBE, RUN AS THE CLONE, and it is a different question from the one the
+  # tick already answered. The tick's `_grader_can_read` ran against the POOL
+  # SEAT, because that is the name it was choosing between; whether the COPY
+  # landed and works is a property of the clone, and the two come apart exactly
+  # where it matters — an expired token (they live ~1h), a copy that silently
+  # failed, a clone whose account cannot reach the credential it now owns. A
+  # clone that cannot read its own delivery would grade blind and return a
+  # confident FAIL about a diff it never saw, so it is unwound on the spot.
+  if declare -F _grader_can_read >/dev/null 2>&1 && ! _grader_can_read "$clone" "$ident"; then
+    warn "$ident: grader clone ${clone} holds a credential that cannot read the delivery — removing it rather than grading blind"
+    _grader_clone_remove "$clone" || warn "$ident: grader clone ${clone} could not be removed; the sweep will take it"
+    return 9
+  fi
+
   local prev_assignee=""
   prev_assignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')
-  "$_GRADER_TASK_CLI" task assign "$ident" "$seat" >/dev/null 2>&1 || return 1
-  local rid=""
-  rid=$(_grader_process_run_open "$seat" "$ident" "$sid")
-
-  local root="${_GRADER_PROCESS_ROOT:-/home/agent-${seat}/graders}"
-  local dir="${root}/${ident}-${sid#*#}"
-  local logf="${_GRADER_PROCESS_LOG_DIR}/${ident}-${sid#*#}.log"
-  if [[ -n "$_GRADER_PROCESS_LAUNCH" ]]; then
-    local lrc=0
-    "$_GRADER_PROCESS_LAUNCH" "$seat" "$ident" "$sid" "$dir" "$logf" || lrc=$?
-    if (( lrc != 0 )); then
-      warn "$ident: grader process ${sid} on $seat did not start (launch rc=${lrc})"
-      _grader_process_unwind "$seat" "$ident" "$sid" "$rid" "$prev_assignee"
-    fi
-    return "$lrc"
+  # ASSIGNED TO THE CLONE, not to the pool seat. The verdict path, the
+  # double-spawn guard and the reclaim rails all read `assignee`, and the seat
+  # that is about to be woken is the clone — a row owned by the pool seat while
+  # a clone grades it is a grade no rail can attribute to the thing doing it.
+  if ! "$_GRADER_TASK_CLI" task assign "$ident" "$clone" >/dev/null 2>&1; then
+    warn "$ident: could not assign to grader clone ${clone}"
+    _grader_clone_remove "$clone" || true
+    return 8
   fi
+  local rid=""
+  rid=$(_grader_process_run_open "$seat" "$ident" "$sid" "$clone")
 
-  mkdir -p "$_GRADER_PROCESS_LOG_DIR" 2>/dev/null || true
-  # The seat's account owns its own tree; the log is opened by the ROOT tick and
-  # inherited across the sudo as an already-open fd, so the child never needs
-  # write access to /var/log and the log cannot be tampered with by the grade.
-  install -d -o "agent-${seat}" -g "agent-${seat}" -m 0755 "$dir" 2>/dev/null \
-    || mkdir -p "$dir" 2>/dev/null || true
-
-  local goal; goal=$(_grader_process_goal "$ident" "$sid" "$dir")
-  local script
-  # %q throughout, including the marker fields. Idents are DB-sourced `DIVE-<n>`
-  # and seats are roster names, so nothing here is reachable today — quinn
-  # recorded it as defense-in-depth rather than a finding — but a quoted field
-  # costs nothing and removes the question from the next reader.
-  printf -v script ': %q seat=%q ident=%q session=%q; cd %q || exit 1; exec %q --print %q' \
-    "$_GRADER_PROCESS_MARK" "$seat" "$ident" "$sid" "$dir" "$_GRADER_PROCESS_CLI" "$goal"
-
-  # setsid so the grader outlives the tick that started it — the tick is a cron
-  # child and its process group is torn down when it returns. Detached from the
-  # tick's stdin so a grader can never consume the caller's input.
-  setsid sudo -n -u "agent-${seat}" bash -lc "$script" >>"$logf" 2>&1 </dev/null &
-  local pid=$!
-  # The grace is the whole difference between "started" and "was launched". It is
-  # spent once per spawn, in a tick that already spends a sudo and a DB write per
-  # spawn, and it buys the only window in which a refusal is still attributable.
-  sleep "$_GRADER_PROCESS_START_GRACE" 2>/dev/null || true
-  if ! _grader_process_started "$pid" "$ident"; then
-    warn "$ident: grader process ${sid} on $seat did not start — see ${logf}"
+  if ! _grader_clone_wake "$clone" "$ident" "$sid"; then
+    warn "$ident: grader clone ${clone} was created but did not start grading (the wake was not delivered) — unwinding"
     _grader_process_unwind "$seat" "$ident" "$sid" "$rid" "$prev_assignee"
+    _grader_clone_remove "$clone" || warn "$ident: grader clone ${clone} could not be removed; the sweep will take it"
     return 4
   fi
-  disown 2>/dev/null || true
   return 0
+}
+
+# ══ DIVE-4496: THE SWEEP IS THE REMOVE, AND THAT IS WHY THERE IS ONLY ONE ══
+#
+# lodar asked for "ONE create, ONE wake, ONE remove" and for the tick that creates
+# a clone to also sweep clones. Those are the same mechanism, not two: "the grade
+# finished, take the seat away" and "the grade died mid-turn, take the seat away
+# and re-queue" differ only in whether a verdict landed, which is one column. A
+# separate happy-path remove would be a second code path doing the same thing, and
+# the one that ran less often would be the one that was wrong.
+#
+# WHY THE CLONE DOES NOT REMOVE ITSELF, since that is the obvious other design:
+# `agent rm` stops the systemd unit the clone's own turn is running inside, so a
+# self-remove is a process deleting the account it is executing as, mid-verdict.
+# lodar's 06:07Z worry ("mid turn death and then we forget to delete clone") is
+# exactly the failure a self-remove cannot cover, and the sweep covers both.
+#
+# FOUR STATES PER CLONE, and the order is from cheapest to most expensive:
+#   resolved  — its run row has a verdict after it. Remove, close the run `ok`.
+#   orphan    — no open run row at all (a create that outlived its tick, a run
+#               row already closed). Remove. Nothing to re-queue.
+#   stale     — run row open past `_GRADER_STALE_HOURS`. Remove + re-queue.
+#   dead      — run row open, inside the bound, past the start grace, and no
+#               grading CLI running as the clone. Remove + re-queue. THIS is the
+#               state the one-shot had no answer for at all: DIVE-4417 graded a
+#               launch that never STARTS, and a launch that starts and then dies
+#               was contained only by the six-hour bound.
+# Anything else is live and is left alone.
+#
+# ══ WHERE A SWEPT DELIVERY GOES BACK TO, AND WHY IT IS NOT THIS LANE ══
+#
+# The obvious re-queue is a fresh `task.grade.requested`: the pending query keys
+# on the LATEST request and excludes any ident carrying a later
+# `task.grade.spawned`, so a new request row is the only thing that puts a reaped
+# delivery back in THIS lane's pending set.
+#
+# IT IS NOT DONE, AND THE REASON IS A GUARDRAIL THIS ROW MUST NOT WIDEN.
+# `tests/grader_spawn_trigger_unit.sh` arm1b asserts STRUCTURALLY that
+# `_grader_spawn_request` has exactly one call site — inside
+# `_task_route_to_verifier`, the single funnel every delivery passes through — so
+# that no code path anywhere can name, time or prime a judge outside the act of
+# the system recording a delivery. A second emitter here would have turned that
+# arm red, and widening a safety control to unblock the change it would block is
+# the one move this repo's rules name outright.
+#
+# SO THE SWEEP RESTORES THE ROW TO ITS ROUTED VERIFIER instead, which is the same
+# recovery `_hb_reclaim_to_todo … keep-handoff` performs for every other seat that
+# dies holding a delivery: assignee back to `verifier`, status back to `todo`, the
+# delivery stamps untouched, the run closed `abandoned`. The delivery is graded on
+# the next pass — by the verifier's own session rather than by a new clone. That
+# is a degrade to the SESSION lane, which is the posture every other guard in this
+# file already takes, and it is a complete recovery rather than a deferral: the
+# grade happens, the row is never stranded, and no delivery waits on the six-hour
+# bound. Re-entering the CLONE lane after a sweep needs the funnel taught to
+# re-request, which is a change in `delivery.sh` and belongs to whoever owns that
+# guardrail — it is written on the row rather than smuggled in here.
+_grader_clone_sweep() {  # [--commit]  -> <number of clones swept>
+  local commit=0
+  [[ "${1:-}" == "--commit" ]] && commit=1
+  local clone swept=0 row rid ridnt rts reason
+  local grace="${_GRADER_CLONE_START_GRACE_S}"
+  [[ "$grace" =~ ^[0-9]+$ ]] || grace=300
+  local hours; hours=$(_grader_stale_hours)
+  while IFS= read -r clone; do
+    [[ -n "$clone" ]] || continue
+    # The clone's own open run row — ONE query per clone, keyed on the column
+    # that holds the clone name, which is the ownership record run_open writes.
+    row=$(db "SELECT id||x'1f'||COALESCE(ident,'')||x'1f'||COALESCE(started_at,'')
+                FROM runs
+               WHERE agent=$(sqlq "$clone") AND role='grader' AND status='running'
+               ORDER BY id DESC LIMIT 1;" 2>/dev/null || printf '')
+    rid="${row%%$'\x1f'*}"; ridnt=""; rts=""
+    if [[ "$row" == *$'\x1f'* ]]; then
+      ridnt="${row#*$'\x1f'}"; rts="${ridnt#*$'\x1f'}"; ridnt="${ridnt%%$'\x1f'*}"
+    fi
+    reason=""
+    if [[ -z "$rid" ]]; then
+      reason="orphan: no open run record"
+    elif [[ -n "$ridnt" ]] && _grader_clone_verdict_landed "$ridnt" "$rts"; then
+      reason="resolved: verdict landed"
+    elif [[ -n "$rts" ]] && _grader_clone_run_older_than "$rts" "$(( hours * 3600 ))"; then
+      reason="stale: run open past the ${hours}h bound"
+    elif [[ -n "$rts" ]] && _grader_clone_run_older_than "$rts" "$grace" \
+         && ! _grader_clone_live "$clone"; then
+      reason="dead: no ${_GRADER_PROCESS_CLI} running as agent-${clone}"
+    fi
+    # LIVE IS NOT COUNTED HERE. `_grader_process_count` is the tick's one
+    # reading of how many clones exist, and it is called immediately after this;
+    # a second count returned from the remover is a second source of truth for
+    # the cap, which is the DIVE-4418 failure in a new place.
+    [[ -n "$reason" ]] || continue
+    swept=$((swept+1))
+    (( commit )) || continue
+    _grader_clone_remove "$clone" \
+      || warn "grader clone ${clone} (${reason}) could not be removed — it will be retried next tick"
+    case "$reason" in
+      resolved:*)
+        # The run row is closed here and NOWHERE ELSE, which is the live specimen
+        # this row was filed with: `gr-20260914T054510Z-1554431-1` still read
+        # `running (open)` in `run ls` 37 minutes after its process was gone,
+        # because the record's liveness was asserted at INSERT and never checked
+        # again. The sweep is the check.
+        [[ -n "$rid" ]] && db "UPDATE runs SET status='ok', outcome='graded' WHERE id=$(sqlq "$rid");" >/dev/null 2>&1 || true
+        ;;
+      orphan:*) : ;;
+      *) _grader_clone_requeue "$clone" "$ridnt" "$rid" ;;
+    esac
+  done < <(_grader_clone_ls)
+  (( commit )) && _grader_clone_reaped_prune
+  printf '%s' "$swept"
+  return 0
+}
+
+# `_grader_clone_requeue <clone> <ident> <run id>` — the row goes back to its
+# verifier, the run is closed, and the attempt is on the record.
+#
+# `abandoned` AND NOT `failed`, which is DIVE-3932's distinction and it is load
+# bearing: we know the attempt stopped, we do NOT know that it errored. A sweep
+# that writes `failed` for a clone somebody SIGKILLed is asserting a fault it did
+# not witness.
+#
+# THE RESTORE IS GUARDED on the delivery being live and ungraded, copied clause
+# for clause from `_hb_reclaim_to_todo`'s keep-handoff mode, so this can never
+# invent a handoff on a row whose delivery was already bounced or graded.
+_grader_clone_requeue() {  # <clone> <ident> <run id>
+  local clone="$1" ident="$2" rid="$3"
+  [[ -n "$ident" ]] || return 0
+  db "UPDATE tasks
+         SET assignee=verifier, status='todo', started_at=NULL, updated_at=datetime('now')
+       WHERE ident=$(sqlq "$ident")
+         AND verifier IS NOT NULL AND verifier<>''
+         AND maker_agent IS NOT NULL
+         AND handoff_delivered_at IS NOT NULL
+         AND handoff_ack_at IS NULL
+         AND (handoff_rejected_at IS NULL OR handoff_rejected_at < handoff_delivered_at);" >/dev/null 2>&1 || true
+  [[ -n "$rid" ]] && db "UPDATE runs SET status='abandoned', outcome='grader_clone_swept'
+                          WHERE id=$(sqlq "$rid");" >/dev/null 2>&1 || true
+  # A compensating row, not a silent revert — the same reason
+  # `_grader_process_unwind` writes one. Without it a delivery that was graded
+  # twice looks like a duplicate the lane cannot account for.
+  ledger_emit task.grade.spawn.failed ident="$ident" actor="$(task_actor "")" \
+    detail="grader clone ${clone} swept before a verdict; row restored to its verifier" || true
+  return 0
+}
+
+# `_grader_clone_verdict_landed <ident> <run ts>` — did a verdict land on this row
+# after its clone's run opened?
+#
+# THE SAME EXIT SET the in-flight predicate uses (`task.graded` / `task.done` /
+# `task.rejected` strictly later than the spawn), asked about one run rather than
+# all of them. Not `tasks.status='done'`: a PASS is deliberately held open as
+# `graded->merge` for hours (DIVE-3330), and a clone kept alive for the length of
+# somebody's merge queue is the DIVE-4322 leak with a seat attached instead of a
+# slot.
+_grader_clone_verdict_landed() {  # <ident> <run ts>
+  local ident="$1" ts="$2" n
+  [[ -n "$ident" ]] || return 1
+  n=$(db "SELECT COUNT(*) FROM lifecycle_events
+           WHERE ident=$(sqlq "$ident")
+             AND kind IN ('task.done','task.rejected','task.graded')
+             AND ($(sqlq "$ts")='' OR ts >= $(sqlq "$ts"));" 2>/dev/null || printf '0')
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 ))
+}
+
+# `_grader_clone_run_older_than <ts> <seconds>` — age, computed BY SQLITE.
+#
+# By the store and not by `date -d`, because the run row's timestamp is written by
+# sqlite's own `datetime('now')` in UTC and comparing it against a shell `date`
+# reading is how a sweep acquires a timezone bug that only fires half the year.
+_grader_clone_run_older_than() {  # <ts> <seconds>
+  local ts="$1" secs="$2" v
+  [[ -n "$ts" && "$secs" =~ ^[0-9]+$ ]] || return 1
+  v=$(db "SELECT CASE WHEN (julianday('now')-julianday($(sqlq "$ts")))*86400 > ${secs}
+                      THEN 1 ELSE 0 END;" 2>/dev/null || printf '0')
+  [[ "$v" == "1" ]]
 }
