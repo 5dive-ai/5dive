@@ -194,9 +194,12 @@ eq_t "seal-time scoping excludes none of them"      "${counts##* }" "0"
 # ======================== 4. conversion, all mode ============================
 FULL="$TMP/full"
 n2=$(_pack_codex_to_atoms "$STORE" "$FULL" all)
-# 2 task groups + 2 summary sections + 2 threads. The leading `# Raw Memories`
-# banner is not a section and must not become an atom.
-eq_t "all mode converts every section of all three documents" "$n2" "6"
+# 2 task groups x (knowledge atom + private atom) + 2 summary sections + 2
+# threads. The leading `# Raw Memories` banner is not a section and must not
+# become an atom. The task groups count TWICE because one codex task group
+# carries both classes and they must not land in one file: see the typing arms
+# below.
+eq_t "all mode converts every section of all three documents" "$n2" "8"
 full_all="$(cat "$FULL"/*.md)"
 for mark in SECRETPREF PROFILEMARK TIPMARK RAWMARK; do
   case "$full_all" in
@@ -219,19 +222,74 @@ tf=$(grep -l 'TIPMARK' "$FULL"/*.md | head -1)
 grep -q '^  type: feedback$' "$tf" && ok_t "imported general tips are typed 'feedback'" \
   || bad_t "imported general tips are typed 'feedback'" "got: $(grep '^  type:' "$tf")"
 
+# THE SAME PROPERTY, INSIDE A TASK GROUP — and this is the half that was wrong.
+# memory_summary.md is a whole private document, so typing it was easy. A codex
+# TASK GROUP mixes the classes in one section: `## Reusable knowledge` beside
+# `## User preferences` and the per-task rollout ids. Folding all of it into the
+# `reference` atom types private text public, and the next distilled export of
+# the seat it landed on publishes it — the allowlist reads the atom's type, and
+# the atom said reference.
+sp=$(grep -l 'SECRETPREF' "$FULL"/*.md | head -1)
+if [[ -n "$sp" ]] && grep -q '^  type: user$' "$sp"; then
+  ok_t "a task group's '## User preferences' lands typed 'user', not 'reference'"
+else
+  bad_t "a task group's '## User preferences' lands typed 'user', not 'reference'" "got: ${sp:-none} $(grep '^  type:' "${sp:-/dev/null}" 2>/dev/null)"
+fi
+# The knowledge atom must be CLEAN, not merely accompanied by a private one.
+kn=$(grep -l 'cumulative per rollout' "$FULL"/*.md | head -1)
+if [[ -n "$kn" ]] && ! grep -q 'SECRETPREF' "$kn"; then
+  ok_t "the knowledge atom of that task group carries no private text"
+else
+  bad_t "the knowledge atom of that task group carries no private text" "SECRETPREF is inside ${kn:-none}"
+fi
+# The per-task rollout/thread ids are the other private class in a task group.
+rid=$(grep -l 'rollout_summaries/2026-09-07T05-50-12' "$FULL"/*.md | head -1)
+if [[ -n "$rid" ]] && grep -q '^  type: user$' "$rid"; then
+  ok_t "the per-task rollout ids land typed 'user'"
+else
+  bad_t "the per-task rollout ids land typed 'user'" "got: ${rid:-none} $(grep '^  type:' "${rid:-/dev/null}" 2>/dev/null)"
+fi
+# THE WHOLE POINT, stated as the round trip it protects: a distilled export of
+# the seat this store landed on must publish exactly the knowledge and nothing
+# else. This is _pack_scope_memory over the IMPORTED atoms, which is what a
+# later `agent export <new-seat> --memory=distilled` runs.
+REEXPORT="$TMP/reexport"
+recounts=$(_pack_scope_memory "$FULL" "$REEXPORT")
+re_all="$(cat "$REEXPORT"/*.md 2>/dev/null)"
+leaked=""
+for mark in SECRETPREF PROFILEMARK TIPMARK; do
+  case "$re_all" in *"$mark"*) leaked="$leaked $mark" ;; esac
+done
+[[ -z "$leaked" ]] \
+  && ok_t "a later distilled re-export of the landed seat publishes no private text (kept/excluded: $recounts)" \
+  || bad_t "a later distilled re-export of the landed seat publishes no private text" "published:$leaked"
+case "$re_all" in
+  *"cumulative per rollout"*) ok_t "that re-export still publishes the knowledge" ;;
+  *)                          bad_t "that re-export still publishes the knowledge" "the knowledge atom was excluded too" ;;
+esac
+
 # ============================ 5. the index ==================================
 _pack_atoms_index "$FULL" "Memory Index (imported from a codex store)"
 [[ -f "$FULL/MEMORY.md" ]] && ok_t "conversion regenerates MEMORY.md" || bad_t "conversion regenerates MEMORY.md" "absent"
 idx_lines=$(grep -c '^- \[' "$FULL/MEMORY.md")
-eq_t "the index names every atom" "$idx_lines" "6"
+eq_t "the index names every atom" "$idx_lines" "8"
 # The reason the index exists at all: the source MEMORY.md is 143 KB on a real
-# seat and a claude loader drops the TAIL past its limit with no error. A router
-# over the same store has to be an order of magnitude smaller than the store.
+# seat and a claude loader drops the TAIL past its limit with no error. The
+# property that buys is SCALE INVARIANCE — the index grows with how many atoms
+# there are, never with how big they are. Graded by growing the bodies and
+# requiring the index not to move. (This replaces an `index < store` byte
+# comparison: over a 1.3 KB fixture store that arm graded the fixture's size,
+# not the writer, and it flipped the moment the atom count changed.)
 idx_bytes=$(wc -c < "$FULL/MEMORY.md")
-store_bytes=$(cat "$STORE/MEMORY.md" "$STORE/memory_summary.md" "$STORE/raw_memories.md" | wc -c)
-[[ "$idx_bytes" -lt "$store_bytes" ]] \
-  && ok_t "the regenerated index is smaller than the store it indexes ($idx_bytes < $store_bytes B)" \
-  || bad_t "the regenerated index is smaller than the store it indexes" "index $idx_bytes B vs store $store_bytes B"
+BLOAT="$TMP/bloat"; rm -rf "$BLOAT"; mkdir -p "$BLOAT"
+for f in "$FULL"/*.md; do
+  [[ "$(basename "$f")" == "MEMORY.md" ]] && continue
+  cp "$f" "$BLOAT/"
+  head -c 5000 /dev/zero | tr '\0' 'x' >> "$BLOAT/$(basename "$f")"
+done
+_pack_atoms_index "$BLOAT" "Memory Index (imported from a codex store)"
+bloat_bytes=$(wc -c < "$BLOAT/MEMORY.md")
+eq_t "the index does not grow when the atoms do (${idx_bytes} B either way)" "$bloat_bytes" "$idx_bytes"
 # The index carries one capped DESCRIPTION per atom and no body structure. A
 # router that grows bodies is the failure this whole conversion exists to avoid,
 # and it shows up as long lines and as copied `##` headings, not as a byte total.
@@ -408,6 +466,69 @@ case "$out" in
   *"syntax error in expression"*) bad_t "a zero-task-group codex MEMORY.md does not crash the draft" "$out" ;;
   *)                              ok_t  "a zero-task-group codex MEMORY.md does not crash the draft" ;;
 esac
+
+# ====== 11. THE EXCLUSION MUST COVER THE METADATA, NOT JUST THE BODY ========
+# The shipped fixture above opens every task group with a `scope:` line, and
+# that is what made the "drops '## User preferences'" arm green: the desc
+# capture ran BEFORE the keep test, so it happened to land on the scope line.
+# Vary the fixture and the same code publishes the private line as the atom's
+# `description:` and as its MEMORY.md index line while the body stays clean.
+# So: a task group whose FIRST content is the excluded subsection.
+LEADSTORE="$TMP/lead-store"; mkdir -p "$LEADSTORE"
+cat > "$LEADSTORE/MEMORY.md" <<'LEAD'
+# Task Group: billing reconciliation
+
+## User preferences
+
+- LEAKMARK4541 never page the user before breakfast.
+
+## Reusable knowledge
+
+- Reconcile by invoice id, not by amount.
+LEAD
+LEADDRAFT="$TMP/lead-draft"
+_pack_memory_dir() { printf '%s\n' "$LEADSTORE"; }
+_pack_draft_dir()  { printf '%s\n' "$LEADDRAFT"; }
+# The REAL path, not the helper: cmd_export's own draft phase, the bytes a
+# reviewer would be shown and then seal.
+out=$(cmd_export cx --memory=distilled --audience=publish 2>&1); rc=$?
+if grep -rq 'LEAKMARK4541' "$LEADDRAFT" 2>/dev/null; then
+  bad_t "no private line reaches a distilled draft, INCLUDING its frontmatter and index" \
+        "$(grep -rn 'LEAKMARK4541' "$LEADDRAFT" | head -3)"
+else
+  ok_t "no private line reaches a distilled draft, INCLUDING its frontmatter and index"
+fi
+# ...and the atom is still described, not blanked: an empty description is how
+# this arm would be passed without fixing anything.
+d=$(awk -F': ' '/^description: /{print $2; exit}' "$LEADDRAFT"/codex-tg-*.md 2>/dev/null)
+[[ -n "${d//\"/}" ]] \
+  && ok_t "the atom still carries a description drawn from what it DOES carry ($d)" \
+  || bad_t "the atom still carries a description drawn from what it DOES carry" "empty description (rc=$rc): $out"
+if grep -rq 'Reconcile by invoice id' "$LEADDRAFT" 2>/dev/null; then
+  ok_t "the knowledge subsection is still exported from that task group"
+else
+  bad_t "the knowledge subsection is still exported from that task group" "rc=$rc: $out"
+fi
+
+# THE IMPORT SIDE of the same property. Raw DOES carry the private line — it is
+# the operator's own backup — so the claim is not "it disappears", it is "it
+# lands TYPED private", and the grade is what the next distilled export of the
+# destination seat would publish.
+LEAD_IN="$TMP/lead-in"; mkdir -p "$LEAD_IN"; cp "$LEADSTORE/MEMORY.md" "$LEAD_IN/"
+LEAD_MEM="$TMP/lead-mem"
+_pack_seed_claude_memory "$LEAD_IN" "$LEAD_MEM" codex-docs >/dev/null
+grep -rq 'LEAKMARK4541' "$LEAD_MEM" \
+  && ok_t "an import carries the private line onto the seat (it is a move, not a filter)" \
+  || bad_t "an import carries the private line onto the seat (it is a move, not a filter)" "the line was dropped instead of typed"
+LEAD_PUB="$TMP/lead-pub"
+leadcounts=$(_pack_scope_memory "$LEAD_MEM" "$LEAD_PUB")
+if grep -rq 'LEAKMARK4541' "$LEAD_PUB"; then
+  bad_t "a distilled export of the seat it landed on withholds it (kept/excluded: $leadcounts)" \
+        "$(grep -rn 'LEAKMARK4541' "$LEAD_PUB" | head -3)"
+else
+  ok_t "a distilled export of the seat it landed on withholds it (kept/excluded: $leadcounts)"
+fi
+eq_t "that export still publishes the task group's knowledge" "${leadcounts%% *}" "1"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1

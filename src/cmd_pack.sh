@@ -1522,35 +1522,69 @@ _pack_codex_split() {   # _pack_codex_split <file> <outdir> <kind> <mode>
       if (length(t) > 180) t = substr(t, 1, 180)
       return t
     }
-    function flush(   f, nm, ty, d) {
-      if (title == "") return
-      if (body ~ /^[[:space:]]*$/) return
+    # A description is read off the BODY THIS ATOM CARRIES, never off the
+    # section it was cut from. The old capture ran before the keep test, so a
+    # task group whose first prose line sat inside `## User preferences` put
+    # that line into the atoms `description:` AND into the MEMORY.md index —
+    # while the body itself was correctly clean. An exclusion that filters the
+    # body and not the metadata derived from it excludes nothing.
+    function firstprose(b,   i, a, m, l) {
+      m = split(b, a, "\n")
+      for (i = 1; i <= m; i++) {
+        l = a[i]
+        if (l ~ /^#/) continue
+        if (l !~ /[^[:space:]]/) continue
+        sub(/^scope:[[:space:]]*/, "", l)
+        sub(/^[-*][[:space:]]+/, "", l)
+        return l
+      }
+      return ""
+    }
+    function emit(ttl, bdy, ty, sfx, dsc,   f, nm, d) {
+      if (ttl == "") return
+      if (bdy ~ /^[[:space:]]*$/) return
       n++
-      nm = sprintf("%s-%03d-%s", PREFIX, n, slug(title))
+      nm = sprintf("%s-%03d-%s%s", PREFIX, n, slug(ttl), sfx)
+      d = (dsc != "" ? dsc : firstprose(bdy))
+      if (d == "") d = ttl
+      f = OUT "/" nm ".md"
+      # QUOTED, like `5dive memory add` writes it (cmd_memory.sh): a codex
+      # task-group title is `Task Group: <x>`, and an unquoted colon in a YAML
+      # scalar is a parse error for any reader stricter than our own regex.
+      printf("---\nname: %s\ndescription: \"%s\"\nmetadata:\n  type: %s\n  source: codex/%s\n---\n\n%s%s", nm, esc(d), ty, SRC, head, bdy) > f
+      close(f)
+    }
+    function flush(   ty) {
+      if (title == "") return
       ty = TYPE
       # memory_summary.md mixes the two private classes: the profile and the
       # stated preferences are `user`, everything else there is `feedback`
       # (how to work with them). Both are excluded by a distilled export, which
       # is why this file never reaches knowledge mode at all.
       if (KIND == "profile") ty = (title ~ /^User /) ? "user" : "feedback"
-      d = (desc == "" ? esc(title) : esc(desc))
-      f = OUT "/" nm ".md"
-      printf("---\nname: %s\ndescription: %s\nmetadata:\n  type: %s\n  source: codex/%s\n---\n\n%s%s", nm, d, ty, SRC, head, body) > f
-      close(f)
+      emit(title, body, ty, "", "")
+      # ONE codex task group carries BOTH classes. The private half — the
+      # stated preferences and the per-task rollout/thread ids — lands as its
+      # OWN atom typed `user`, never folded into the `reference` atom: the
+      # export allowlist keys on the atom type, so private text inside a
+      # reference atom is private text the NEXT distilled export publishes.
+      # Its description is the task-group title and not its first line: the
+      # index is always loaded, and a private atom is reached by search.
+      emit(title, priv, "user", "-private", title)
     }
     $0 ~ SPLITRE {
       flush()
       title = $0; sub(/^#+[[:space:]]*/, "", title)
-      head = $0 "\n"; body = ""; desc = ""
+      head = $0 "\n"; body = ""; priv = ""
       keep = (MODE == "knowledge" && KIND == "taskgroups") ? 0 : 1
       next
     }
     {
       if (title == "") next
-      if (MODE == "knowledge" && KIND == "taskgroups" && $0 ~ /^## /)
+      if (KIND == "taskgroups" && $0 ~ /^## /)
         keep = ($0 ~ /^## (Reusable knowledge|Failures and how to do differently)/) ? 1 : 0
-      if (desc == "" && $0 ~ /[^[:space:]]/ && $0 !~ /^#/) { d = $0; sub(/^scope:[[:space:]]*/, "", d); desc = d }
       if (keep) body = body $0 "\n"
+      else if (MODE != "knowledge") priv = priv $0 "\n"
     }
     END { flush(); printf("%d\n", n) }
   ' "$file"
