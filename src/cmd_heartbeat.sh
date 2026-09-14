@@ -3733,10 +3733,25 @@ _hb_loop_terminal_clause() {
     # request is not a finished row — two of seven rows triaged that morning had
     # an owed clause in their own PASS verdict — so the wake DISPATCHES the seat
     # that can read the verdict, and the close stays a judgement someone makes.
+    #
+    # DIVE-4520 iteration 2 — THE CLOSE VERB IS NOT THIS SEAT'S, AND BRANCH (1)
+    # USED TO SAY IT WAS. This dispatch is the FIRST text a merge owner reads,
+    # ahead of any board cell, so it is the second composer of the same
+    # instruction `src/task/loops.sh` carried (ops measured being woken by it on
+    # DIVE-4485 with both pull requests already merged, running the verb it named,
+    # and watching the row re-deliver). On a graded-and-waiting row the assignee is
+    # still the MAKER, so `task done` from here takes the maker->verifier routing
+    # fork and re-delivers — which strips the merge standing of the very seat this
+    # note is waking — and since this row's guard it is refused outright. The verb
+    # that terminates the row without stamping a delivery clock is `task assign`
+    # onto the row's VERIFIER (frequently this same seat), whose own close is
+    # ungated by the guard. So branch (1) names that, and branch (2) hands off the
+    # same way after the merge instead of saying "then close".
     if [[ -n "$_tfv_owner" && "$_tfv_owner" == "$name" ]]; then
-      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS (%s): graded, delivery ref bound, and you own the merge. Read the pull request FIRST, then do exactly one of three and say which: (1) ALREADY MERGED -> %s, but honour any owed clause in the PASS verdict (a merged PR is not automatically a finished row) and leave it open if something is still owed; (2) mergeable and green -> %s, then close; (3) a required check is red or it conflicts -> that is the MAKER%s move: %s naming the check, and stop. Do not re-grade, re-deliver or route it onward.' \
+      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS (%s): graded, delivery ref bound, and you own the merge. Read the pull request FIRST, then do exactly one of three and say which: (1) ALREADY MERGED -> the close is NOT yours to run from here (the row is still assigned to the maker, so a close from this seat re-delivers the row and is refused, DIVE-4520): hand it to the seat that closes a loop row — its verifier %s, which may be you — with %s, and that seat closes it; honour any owed clause in the PASS verdict first (a merged PR is not automatically a finished row) and leave it open if something is still owed; (2) mergeable and green -> %s, then hand it on exactly as in (1); (3) a required check is red or it conflicts -> that is the MAKER%s move: %s naming the check, and stop. Do not re-grade, re-deliver or route it onward.' \
         "$task_ident" "$name" \
-        "'5dive task done ${task_ident}'" \
+        "'$vfier'" \
+        "'5dive task assign ${task_ident} ${vfier}'" \
         "'5dive task merge ${task_ident}'" \
         "$([[ -n "$maker" ]] && printf "'s (%s)" "$maker" || printf "'s")" \
         "'5dive task reject ${task_ident} --feedback=...'"

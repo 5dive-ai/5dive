@@ -566,6 +566,58 @@ else
   bad_t "C9i ...and the seat that can run it, read from graded_by" "$_c11_out"
 fi
 
+# --- C9q-C9t (DIVE-4520 iteration 2): THE ALREADY-MERGED BRANCH, which is the
+# one the fleet's own instructions send people to.
+#
+# `_TASKS_TFV_SQL` HAS NO NOTION OF MERGE STATE and this guard adds no probe —
+# DIVE-4137 wants the close path probe-free, and a GitHub read that failed open
+# would make the refusal non-deterministic. The consequence, measured by main2 on
+# iteration 1: the fixture below is BYTE-IDENTICAL in the store to a row whose
+# pull request landed ten minutes ago, so the guard fires on both and cannot tell
+# them apart. That is a decision, not an oversight — and it is exactly why the
+# TEXT has to carry the case the predicate cannot see. On a landed pull request
+# the hand-off to the verifier IS the unchanged re-delivery `--force-redeliver`
+# exists for (the standing it spends is already spent), and `task assign` reaches
+# the same end with no delivery clock at all. Naming neither is what made the
+# refusal un-followable where `cmd_heartbeat.sh`'s wake dispatch sends the merge
+# owner.
+#
+# The mutant these exist for is deleting the already-merged clause from the
+# refusal; it reds C9q, C9r and C9s and nothing else.
+if [[ "$_c11_out" == *"ALREADY MERGED"* ]]; then
+  ok_t "C9q ...and the refusal ADDRESSES the case the predicate cannot see (already merged)"
+else
+  bad_t "C9q ...and the refusal ADDRESSES the case the predicate cannot see (already merged)" "$_c11_out"
+fi
+if [[ "$_c11_out" == *"task assign ${_c11ident} quinn"* ]]; then
+  ok_t "C9r ...naming the escape that applies there, on THIS row and its own verifier"
+else
+  bad_t "C9r ...naming the escape that applies there, on THIS row and its own verifier" "$_c11_out"
+fi
+# C9s is keyed on the REASON the audited escape applies there, not on the flag's
+# name — the flag is named a sentence earlier for the unmerged case, so a grep for
+# it alone survives the clause-deletion mutant and would be decoration.
+if [[ "$_c11_out" == *"already spent"* ]]; then
+  ok_t "C9s ...and says WHY the audited escape applies there (the standing is already spent)"
+else
+  bad_t "C9s ...and says WHY the audited escape applies there (the standing is already spent)" "$_c11_out"
+fi
+# C9t: AND THE ESCAPE IS NOT DECORATION. The refusal is only followable if the
+# verb it names actually moves the row off the guarded fork. `task assign` onto
+# the verifier makes verifier == assignee, which is the shape the guard is not on
+# (the ordinary close), and it stamps no delivery clock — so the grading seat
+# still holds standing when that seat closes. Asserted behaviourally, against the
+# shipped standing predicate, not by reading the sentence again.
+_c11_assign_before=$(col "$c11" handoff_delivered_at)
+db "UPDATE tasks SET assignee='quinn' WHERE id=${c11};"   # what `task assign <ident> quinn` does
+eq "C9t the escape moves the row off the guarded fork (verifier == assignee)" \
+   "quinn|quinn" "$(col "$c11" verifier)|$(col "$c11" assignee)"
+eq "C9u ...without stamping a delivery clock" \
+   "$_c11_assign_before" "$(col "$c11" handoff_delivered_at)"
+eq "C9v ...so the grading seat still holds standing for the merge" \
+   "1" "$(_stands_on "$c11" main2)"
+db "UPDATE tasks SET assignee='dev' WHERE id=${c11};"     # restore, the row is not reused but say so
+
 # --- C9j: THE IN-POPULATION NEGATIVE CONTROL. A row carrying a LIVE reject is
 # NOT merge-pending — the maker owes a fix and `task done` is exactly the verb
 # that delivers it. Identical fixture, one column different.
@@ -617,6 +669,16 @@ _c13_seen=0
 [[ "$_c13_out" == *"--force-redeliver"* && "$_c13_out" == *"merge standing"* && "$_c13_out" == *main2* ]] && _c13_seen=1
 eq "C9n ...and the cost is stated rather than silent (the warning names the seat that loses standing)" \
    "1" "$_c13_seen"
+# C9n2 (DIVE-4520 iteration 2): AND IT IS STATED AS A CONDITION, not as a fact.
+# The escape's whole point is that an unchanged re-delivery is sometimes right —
+# and the case where it is MOST right is a pull request that has already merged,
+# where there is no merge left to hold standing for. A warn that asserts the loss
+# flatly argues against the escape exactly there, which is what iteration 1
+# shipped. The mutant is the revert to the flat sentence; it reds here only.
+_c13_cond=0
+[[ "$_c13_out" == *"has NOT merged yet"* && "$_c13_out" == *"already merged"* ]] && _c13_cond=1
+eq "C9n2 ...and the cost is CONDITIONAL on the pull request not having landed" \
+   "1" "$_c13_cond"
 eq "C9o ...and the forced re-delivery really did happen (the row is back with the verifier)" \
    "quinn" "$(col "$c13" assignee)"
 # ...and the warning was not decoration: with the verdict clock 30 minutes back,

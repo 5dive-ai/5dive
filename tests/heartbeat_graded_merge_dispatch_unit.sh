@@ -126,7 +126,15 @@ grep -q "TERMINAL FOR THIS GOAL" <<<"$note" \
 # All three dispositions are named, so the seat does not have to re-derive which
 # turn it is in — and the already-merged one is a CLOSE the seat decides, never
 # an auto-close (main2: a merged pull request is not a finished row).
-for want in "ALREADY MERGED" "task done DIVE-9001" "task merge DIVE-9001" "task reject DIVE-9001"; do
+#
+# DIVE-4520 iteration 2: `task done DIVE-9001` LEFT THIS LIST ON PURPOSE, and its
+# absence is now asserted below. This dispatch is the second composer of the
+# instruction the row was filed about: on a graded-and-waiting row the assignee is
+# still the maker, so a close from the woken seat takes the routing fork,
+# re-delivers, and strips the merge standing of the seat being woken — and since
+# the guard shipped it is refused outright. Naming the verb that is REFUSED, on
+# the branch a merge owner reads first, is the defect, not the wording of it.
+for want in "ALREADY MERGED" "task assign DIVE-9001 quinn" "task merge DIVE-9001" "task reject DIVE-9001"; do
   grep -qF "$want" <<<"$note" \
     && ok_t "arm 5c: the note names '$want'" \
     || bad_t "arm 5c: the note must name '$want'" "got: $note"
@@ -134,6 +142,19 @@ done
 grep -qF "(dev)" <<<"$note" \
   && ok_t "arm 5d: the red-check bounce names the maker by seat (dev)" \
   || bad_t "arm 5d: the bounce must name the maker" "got: $note"
+# --- Arm 5e (DIVE-4520 iteration 2): THE REFUSED VERB IS NOT NAMED AT ALL ------
+# The mutant this exists for is the one-word revert: putting
+# `'5dive task done ${task_ident}'` back into branch (1). It reds here and
+# nowhere else in this suite.
+grep -qF "task done" <<<"$note" \
+  && bad_t "arm 5e: branch (1) must not name the verb the DIVE-4520 guard refuses" "got: $note" \
+  || ok_t "arm 5e: the note names no 'task done' anywhere — the close is the verifier's, after the assign"
+# --- Arm 5f: and the hand-off is named for the branch that needs it -----------
+# Branch (2) used to end in a bare "then close", which is the same instruction
+# one verb later. It must route through the same hand-off as (1).
+grep -qF "hand it on exactly as in (1)" <<<"$note" \
+  && ok_t "arm 5f: the merge branch hands off the same way instead of saying 'then close'" \
+  || bad_t "arm 5f: branch (2) must route its termination through branch (1)" "got: $note"
 
 # --- Arm 6: the MAKER's note on the same row is unchanged -------------------
 # The stand-down clause is still correct for everyone who does not own the merge.
@@ -163,6 +184,28 @@ got=$(_hb_pick_task dev)
 got=$(_hb_pick_task quinn)
 [[ -z "$got" ]] && ok_t "arm 8b: and quinn, who owns nothing here, is not woken" \
                 || bad_t "arm 8b: the fallback must not dispatch to the grader" "got '$got', row=$F"
+
+# --- Arm 9 (DIVE-4520 iteration 2): THE NON-DEGENERATE FIXTURE ---------------
+# Every fixture above ties verifier == grader == merge owner, so a composer that
+# printed `$name` (the woken seat) instead of the row's VERIFIER would pass arm
+# 5c unchanged. The DIVE-4491 shape does not tie them: a TEMP grader (main2)
+# holds the merge, the loop's own verifier (quinn) is still on the row, and the
+# row is assigned to the maker. The hand-off must name quinn — the seat whose
+# close the guard does not refuse — and not main2, who cannot close it.
+db "DELETE FROM tasks;"
+T=$(mk "T graded by a temp session, loop verifier is quinn" dev)
+grade "$T" dev quinn main2
+db "UPDATE tasks SET verifier='quinn', graded_by='main2' WHERE id=${T};"
+note_t=$(_hb_loop_terminal_clause main2 "$T" "DIVE-9002")
+grep -q "MERGE IS YOURS" <<<"$note_t" \
+  && ok_t "arm 9: the temp grader that owns the merge still gets the owner's note" \
+  || bad_t "arm 9: the merge owner must be woken with the owner note" "got: ${note_t:-<empty>}"
+grep -qF "task assign DIVE-9002 quinn" <<<"$note_t" \
+  && ok_t "arm 9b: ...and the hand-off names the row's VERIFIER (quinn), not the woken seat" \
+  || bad_t "arm 9b: the hand-off must name the verifier column, not the grader" "got: $note_t"
+grep -qF "task assign DIVE-9002 main2" <<<"$note_t" \
+  && bad_t "arm 9c: the hand-off named the grading seat, which cannot close the row" "got: $note_t" \
+  || ok_t "arm 9c: ...and never the grading seat, whose own close would re-deliver"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
