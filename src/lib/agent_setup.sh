@@ -470,8 +470,8 @@ _codex_sync_operating_baseline_file() { # <file> <agent-name>
     begins=$(grep -cF "<!-- ${CODEX_BASELINE_MARKER}:begin" "$file" || true)
     ends=$(grep -cF "<!-- ${CODEX_BASELINE_MARKER}:end -->" "$file" || true)
     [[ "$begins" == 1 && "$ends" == 1 ]] || { rm -f "$out"; return 1; }
-    begin_line=$(grep -nF "<!-- ${CODEX_BASELINE_MARKER}:begin" "$file" | cut -d: -f1)
-    end_line=$(grep -nF "<!-- ${CODEX_BASELINE_MARKER}:end -->" "$file" | cut -d: -f1)
+    begin_line=$(grep -nF "<!-- ${CODEX_BASELINE_MARKER}:begin" "$file" | cut -d: -f1) || begin_line=""
+    end_line=$(grep -nF "<!-- ${CODEX_BASELINE_MARKER}:end -->" "$file" | cut -d: -f1) || end_line=""
     (( begin_line < end_line )) || { rm -f "$out"; return 1; }
     bf="$(mktemp)" || { rm -f "$out"; return 1; }
     printf '%s\n' "$block" >"$bf"
@@ -537,8 +537,19 @@ preseed_codex_return_channel() {
 cmd_agent_sync_codex_baseline() {
   require_root "agent _sync_codex_baseline"
   [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _sync_codex_baseline takes no arguments"
-  local reg name state updated=0 current=0 skipped=0 failed=0
-  reg=$(registry_read)
+  local reg rc=0 names name state updated=0 current=0 skipped=0 failed=0
+  reg=$(registry_read_checked) || rc=$?
+  if (( rc != 0 )); then
+    case "$rc" in
+      3) warn "codex operating baseline reconcile refused: agent registry is missing" ;;
+      4) warn "codex operating baseline reconcile refused: agent registry is unreadable" ;;
+      5) warn "codex operating baseline reconcile refused: agent registry is not valid JSON" ;;
+      *) warn "codex operating baseline reconcile refused: agent registry read failed (rc=${rc})" ;;
+    esac
+    return 1
+  fi
+  names=$(jq -r '(.agents // {}) | to_entries[] | select(.value.type == "codex") | .key' <<<"$reg") \
+    || { warn "codex operating baseline reconcile refused: could not enumerate Codex agents"; return 1; }
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     if ! state=$(preseed_codex_return_channel "$name"); then
@@ -551,7 +562,7 @@ cmd_agent_sync_codex_baseline() {
       skipped) skipped=$((skipped + 1)) ;;
       *)       failed=$((failed + 1)) ;;
     esac
-  done < <(jq -r '(.agents // {}) | to_entries[] | select(.value.type == "codex") | .key' <<<"$reg")
+  done <<<"$names"
   if (( failed > 0 )); then
     warn "codex operating baseline reconcile incomplete: updated=${updated}, current=${current}, skipped=${skipped}, failed=${failed}"
     return 1

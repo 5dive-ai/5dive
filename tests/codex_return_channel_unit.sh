@@ -26,6 +26,8 @@ cd "$(dirname "$0")/.."
 # shellcheck disable=SC1091
 source src/header.sh
 # shellcheck disable=SC1091
+source src/lib/registry.sh
+# shellcheck disable=SC1091
 source src/lib/agent_setup.sh
 
 pass=0
@@ -127,17 +129,47 @@ fi
 broken_after=$(sha256sum "$broken" | awk '{print $1}')
 check "malformed block is untouched"    '[[ "$broken_before" == "$broken_after" ]]'
 
-# The upgrade primitive filters the registry to Codex seats only.
-mkdir -p "$HOME_BASE/agent-fleet-codex" "$HOME_BASE/agent-fleet-claude"
+# The upgrade primitive filters the registry to Codex seats only and reports all
+# four outcomes. One fixture starts current so changing current -> updated is red.
+mkdir -p "$HOME_BASE/agent-fleet-codex" "$HOME_BASE/agent-current-codex/.codex" "$HOME_BASE/agent-fleet-claude"
+_codex_operating_baseline_doc current-codex >"$HOME_BASE/agent-current-codex/.codex/AGENTS.md"
 require_root() { :; }
-registry_read() { printf '%s\n' '{"agents":{"fleet-codex":{"type":"codex"},"missing-codex":{"type":"codex"},"fleet-claude":{"type":"claude"}}}'; }
 SYNC_SUMMARY=""
 ok() { SYNC_SUMMARY="$1"; }
+WARN_LOG="$tmp/warn.log"
+warn() { printf '%s\n' "$*" >>"$WARN_LOG"; }
 export CODEX_AGENT_HOME_ROOT="$HOME_BASE"
+REGISTRY="$tmp/agents.json"
+printf '%s\n' '{"agents":{"fleet-codex":{"type":"codex"},"current-codex":{"type":"codex"},"missing-codex":{"type":"codex"},"fleet-claude":{"type":"claude"}}}' >"$REGISTRY"
 cmd_agent_sync_codex_baseline
 check "upgrade syncs existing codex"    '[[ -f "$HOME_BASE/agent-fleet-codex/.codex/AGENTS.md" ]]'
 check "upgrade skips non-codex"         '[[ ! -e "$HOME_BASE/agent-fleet-claude/.codex/AGENTS.md" ]]'
-check "upgrade counts real outcomes"    '[[ "$SYNC_SUMMARY" == *"updated=1, current=0, skipped=1, failed=0"* ]]'
+check "upgrade counts real outcomes"    '[[ "$SYNC_SUMMARY" == *"updated=1, current=1, skipped=1, failed=0"* ]]'
+
+# Missing, unreadable, and malformed registries fail loud instead of collapsing
+# to a vacuous green fleet pass.
+assert_bad_registry() {
+  local label="$1"
+  : >"$WARN_LOG"
+  if cmd_agent_sync_codex_baseline >/dev/null; then
+    echo "FAIL: $label registry must refuse"
+    exit 1
+  fi
+  grep -q "reconcile refused" "$WARN_LOG" || { echo "FAIL: $label registry did not warn"; exit 1; }
+  pass=$((pass+1))
+}
+rm -f "$REGISTRY"
+assert_bad_registry "missing"
+printf '%s' '{"agents":{"broken"' >"$REGISTRY"
+assert_bad_registry "malformed"
+printf '%s\n' '{"agents":{}}' >"$REGISTRY"
+/usr/bin/chmod 000 "$REGISTRY"
+if [[ ! -r "$REGISTRY" ]]; then
+  assert_bad_registry "unreadable"
+else
+  echo "SKIP: unreadable registry arm (test user can still read mode 000)"
+fi
+/usr/bin/chmod 600 "$REGISTRY"
 
 # The installed-upgrade path actually invokes the primitive after bundle swap.
 check "installer wires upgrade sync"    'grep -q "agent _sync_codex_baseline" install.sh'
