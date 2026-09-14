@@ -58,6 +58,22 @@ got=$(find "$RAWOUT" -maxdepth 1 -name '*.md' | wc -l)
 [[ "$kept" -eq "$TOTAL_MD" && "$excl" -eq 0 ]] \
   && ok_t "raw reports kept=$kept excluded=0" \
   || bad_t "raw counts" "kept=$kept excluded=$excl"
+# ... and only the store ITSELF: a nested dir of facts is not part of it.
+# `raw` means the store, not the tree beneath it — a codex store keeps 65
+# per-session rollout summaries in rollout_summaries/, carrying rollout paths
+# and thread ids (DIVE-4541). The exclusion is carried by a `-maxdepth 1`, which
+# is invisible: without this arm, widening the walk ships them and every other
+# arm in this file stays green. Graded on its own fixture so the byte-identical
+# arm below keeps comparing whole directories.
+NEST="$TMP/nested-src"; mkdir -p "$NEST/subdir"
+printf -- '---\nname: top\nmetadata:\n  type: reference\n---\n\nTOPMARK\n'       > "$NEST/top.md"
+printf -- '---\nname: nested\nmetadata:\n  type: reference\n---\n\nNESTEDMARK\n' > "$NEST/subdir/nested.md"
+ncounts=$(_pack_raw_memory "$NEST" "$TMP/nested-out")
+if [[ "${ncounts%% *}" == "1" ]] && grep -rqs TOPMARK "$TMP/nested-out" && ! grep -rqs NESTEDMARK "$TMP/nested-out"; then
+  ok_t "raw copies the store, NOT its subdirectories"
+else
+  bad_t "raw copies the store, NOT its subdirectories" "kept=${ncounts%% *}; staged: $(find "$TMP/nested-out" -type f -printf '%P ' 2>/dev/null)"
+fi
 
 for f in private-user private-fb opted-out no-type MEMORY; do
   [[ -f "$RAWOUT/$f.md" ]] \

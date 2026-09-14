@@ -1440,14 +1440,278 @@ _pack_memory_publish_gate() {
   _pack_memory_leakscan "$dir" "$self"
 }
 
+# --- DIVE-4541: cross-harness memory ---------------------------------------
+#
+# Codex keeps its memory as THREE WHOLE DOCUMENTS, not one file per fact:
+#   MEMORY.md         `# Task Group:` sections, each carrying `## Reusable
+#                     knowledge` / `## Failures and how to do differently`
+#                     (knowledge) alongside `## User preferences` and the
+#                     per-task rollout ids (private/operational). 143 KB on the
+#                     seat this was measured on.
+#   memory_summary.md the user profile + preferences digest.
+#   raw_memories.md   `## Thread <uuid>` stage-1 notes.
+# A claude seat's store is the opposite shape: ONE atom per fact, frontmatter
+# carrying name/description/metadata.type, and a MEMORY.md that is an INDEX.
+#
+# So moving memory across the two is a CONVERSION, never a copy. Two reasons,
+# and the second is the one that bites silently: the deny-by-default export
+# scoping keys on per-fact `metadata.type`, which a codex document does not
+# have; and a verbatim 143 KB MEMORY.md dropped into a claude memory dir is
+# past the loader's limit, where the loader drops the TAIL with NO error
+# (DIVE-3821) — so the facts would be "landed" and not loaded.
+_pack_agent_type() {
+  local n="$1" t
+  t=$(jq -r --arg n "$n" '.agents[$n].type // "claude"' <<<"$(registry_read 2>/dev/null || echo '{"agents":{}}')" 2>/dev/null) || t=""
+  [[ -n "$t" && "$t" != "null" ]] || t="claude"
+  printf '%s\n' "$t"
+}
+
+# The SHAPE of a seat's memory store, by harness type. `none` is a real answer
+# and is returned rather than falling back to the claude path: a seat of some
+# other type that happens to have a stray ~/.claude/projects does not keep its
+# memory there, and reporting one is how a pack ships a directory nobody meant
+# to export. Callers turn `none` into a refusal that names the type.
+_pack_memory_kind() {
+  case "$(_pack_agent_type "$1")" in
+    claude) printf 'claude\n' ;;
+    codex)  printf 'codex\n' ;;
+    *)      printf 'none\n' ;;
+  esac
+}
+
+# The store PATH for a seat, by harness type — deliberately WITHOUT a
+# filesystem probe, so "which store does this harness use" is a question that
+# can be asked, answered and graded on its own. _pack_memory_dir below is the
+# probe. Exit 1 with no output when the harness has no store 5dive knows: a
+# caller must not be able to read a claude path out of a non-claude seat.
+_pack_memory_path() {
+  local name="$1" kind
+  kind=$(_pack_memory_kind "$name")
+  case "$kind" in
+    claude) printf '/home/agent-%s/.claude/projects\n' "$name" ;;
+    codex)  printf '/home/agent-%s/.codex/memories\n'  "$name" ;;
+    *)      return 1 ;;
+  esac
+}
+
+# Split ONE codex document into atoms. <kind> selects the section boundary and
+# the default type; <mode> is `all` (every section) or `knowledge` (inside a
+# task group, keep only the two knowledge subsections — the codex-shaped
+# equivalent of _pack_scope_memory's {reference,project} allowlist, since the
+# per-fact type that allowlist reads does not exist here). Echoes the count.
+_pack_codex_split() {   # _pack_codex_split <file> <outdir> <kind> <mode>
+  local file="$1" out="$2" kind="$3" mode="${4:-all}" splitre type prefix
+  case "$kind" in
+    taskgroups) splitre='^# Task Group:' ; type=reference ; prefix=codex-tg ;;
+    profile)    splitre='^## '           ; type=user      ; prefix=codex-profile ;;
+    # raw_memories.md is the merged stage-1 text codex has NOT reviewed into
+    # knowledge. It travels (raw is the operator's own backup) but it must not
+    # travel typed `reference`: the export allowlist is {reference,project}, so
+    # a thread atom landing inside it is text the NEXT distilled export of the
+    # destination seat publishes. Same repair as a task group's private half —
+    # `user` is the honest read of an unreviewed per-session trail, and raw
+    # still carries everything, correctly typed.
+    threads)    splitre='^## Thread '    ; type=user      ; prefix=codex-thread ;;
+    *) return 1 ;;
+  esac
+  mkdir -p "$out"
+  awk -v OUT="$out" -v KIND="$kind" -v MODE="$mode" -v SPLITRE="$splitre" \
+      -v TYPE="$type" -v PREFIX="$prefix" -v SRC="$(basename "$file")" '
+    function slug(s,   t) {
+      t = tolower(s); gsub(/[^a-z0-9]+/, "-", t); gsub(/^-+/, "", t); gsub(/-+$/, "", t)
+      if (length(t) > 60) t = substr(t, 1, 60)
+      gsub(/-+$/, "", t); if (t == "") t = "section"
+      return t
+    }
+    function esc(s,   t) {
+      t = s; gsub(/["\\]/, "", t); gsub(/[[:space:]]+/, " ", t)
+      sub(/^ /, "", t); sub(/ $/, "", t)
+      if (length(t) > 180) t = substr(t, 1, 180)
+      return t
+    }
+    # A description is read off the BODY THIS ATOM CARRIES, never off the
+    # section it was cut from. The old capture ran before the keep test, so a
+    # task group whose first prose line sat inside `## User preferences` put
+    # that line into the atoms `description:` AND into the MEMORY.md index —
+    # while the body itself was correctly clean. An exclusion that filters the
+    # body and not the metadata derived from it excludes nothing.
+    function firstprose(b,   i, a, m, l) {
+      m = split(b, a, "\n")
+      for (i = 1; i <= m; i++) {
+        l = a[i]
+        if (l ~ /^#/) continue
+        if (l !~ /[^[:space:]]/) continue
+        sub(/^scope:[[:space:]]*/, "", l)
+        sub(/^[-*][[:space:]]+/, "", l)
+        return l
+      }
+      return ""
+    }
+    function emit(ttl, bdy, ty, sfx, dsc,   f, nm, d) {
+      if (ttl == "") return
+      if (bdy ~ /^[[:space:]]*$/) return
+      n++
+      nm = sprintf("%s-%03d-%s%s", PREFIX, n, slug(ttl), sfx)
+      d = (dsc != "" ? dsc : firstprose(bdy))
+      if (d == "") d = ttl
+      f = OUT "/" nm ".md"
+      # QUOTED, like `5dive memory add` writes it (cmd_memory.sh): a codex
+      # task-group title is `Task Group: <x>`, and an unquoted colon in a YAML
+      # scalar is a parse error for any reader stricter than our own regex.
+      printf("---\nname: %s\ndescription: \"%s\"\nmetadata:\n  type: %s\n  source: codex/%s\n---\n\n%s%s", nm, esc(d), ty, SRC, head, bdy) > f
+      close(f)
+    }
+    function flush(   ty, dsc) {
+      if (title == "") return
+      ty = TYPE
+      dsc = ""
+      # memory_summary.md mixes the two private classes: the profile and the
+      # stated preferences are `user`, everything else there is `feedback`
+      # (how to work with them). Both are excluded by a distilled export, which
+      # is why this file never reaches knowledge mode at all.
+      if (KIND == "profile") ty = (title ~ /^User /) ? "user" : "feedback"
+      # A thread atom is described by its section TITLE, never by its first
+      # line. `description:` is copied into MEMORY.md, and MEMORY.md is ALWAYS
+      # loaded — so firstprose over unreviewed text puts that text in the one
+      # file no reader opts into. The title (`Thread <id>`) says nothing the
+      # atom filename does not already say. NOTE: no apostrophes in here, the
+      # awk program is a single-quoted bash string.
+      if (KIND == "threads") dsc = title
+      emit(title, body, ty, "", dsc)
+      # ONE codex task group carries BOTH classes. The private half — the
+      # stated preferences and the per-task rollout/thread ids — lands as its
+      # OWN atom typed `user`, never folded into the `reference` atom: the
+      # export allowlist keys on the atom type, so private text inside a
+      # reference atom is private text the NEXT distilled export publishes.
+      # Its description is the task-group title and not its first line: the
+      # index is always loaded, and a private atom is reached by search.
+      emit(title, priv, "user", "-private", title)
+    }
+    $0 ~ SPLITRE {
+      flush()
+      title = $0; sub(/^#+[[:space:]]*/, "", title)
+      head = $0 "\n"; body = ""; priv = ""
+      keep = (MODE == "knowledge" && KIND == "taskgroups") ? 0 : 1
+      next
+    }
+    {
+      if (title == "") next
+      if (KIND == "taskgroups" && $0 ~ /^## /)
+        keep = ($0 ~ /^## (Reusable knowledge|Failures and how to do differently)/) ? 1 : 0
+      if (keep) body = body $0 "\n"
+      else if (MODE != "knowledge") priv = priv $0 "\n"
+    }
+    END { flush(); printf("%d\n", n) }
+  ' "$file"
+}
+
+# Convert a codex memory store (a dir holding those three documents) into
+# frontmattered atoms under <outdir>. Echoes how many atoms were written.
+_pack_codex_to_atoms() {   # _pack_codex_to_atoms <srcdir> <outdir> [all|knowledge]
+  local src="$1" out="$2" mode="${3:-all}" total=0 c
+  mkdir -p "$out"
+  if [[ -f "$src/MEMORY.md" ]]; then
+    c=$(_pack_codex_split "$src/MEMORY.md" "$out" taskgroups "$mode" 2>/dev/null) || c=0
+    total=$((total + ${c:-0}))
+  fi
+  # knowledge mode stops here ON PURPOSE. memory_summary.md IS the user profile
+  # and raw_memories.md is unreviewed stage-1 text; neither is knowledge, and a
+  # distilled pack is the publishable kind. Raw is where they travel.
+  if [[ "$mode" != "knowledge" ]]; then
+    if [[ -f "$src/memory_summary.md" ]]; then
+      c=$(_pack_codex_split "$src/memory_summary.md" "$out" profile "$mode" 2>/dev/null) || c=0
+      total=$((total + ${c:-0}))
+    fi
+    if [[ -f "$src/raw_memories.md" ]]; then
+      c=$(_pack_codex_split "$src/raw_memories.md" "$out" threads "$mode" 2>/dev/null) || c=0
+      total=$((total + ${c:-0}))
+    fi
+  fi
+  printf '%s\n' "$total"
+}
+
+# Write a ROUTER-shaped MEMORY.md over a dir of atoms: one line per atom, no
+# bodies. `5dive memory router` renders the richer form and is the thing to
+# re-run later; this stays inside cmd_pack.sh so neither export nor import
+# grows a dependency on node (require_node) on a path where a missing
+# interpreter would mean memory silently not landing.
+#
+# THE BUDGET IS THE POINT, not a nicety. MEMORY.md is ALWAYS loaded, the loader
+# has a size limit, and past it it drops the TAIL with no error (DIVE-3821) — so
+# an index that overflows does not fail, it silently stops indexing its oldest
+# half. Measured on the codex seat this was built against: 104 atoms indexed
+# with full descriptions came to 23 KB, over the limit. So the writer degrades
+# in two declared steps rather than emitting something that reads fine and is
+# truncated: descriptions are dropped first, then the listing itself is cut and
+# the file SAYS how many atoms it did not name and how to reach them. An empty
+# search is evidence of absence; a short router is not.
+_PACK_INDEX_BUDGET="${_PACK_INDEX_BUDGET:-16000}"
+_pack_atoms_index() {   # _pack_atoms_index <dir> [<title>]
+  local dir="$1" title="${2:-Memory Index}" f nm desc
+  local head_txt lines_full lines_slim total listed=0 shown=0 budget="$_PACK_INDEX_BUDGET"
+  printf -v head_txt '# %s\n\nOrientation only. Each atom carries its own description; read the file.\nSearch before concluding a fact is absent:\n\n    5dive memory search --index "<topic>"\n    5dive memory get <slug>\n\n' "$title"
+  lines_full=""; lines_slim=""
+  for f in "$dir"/*.md; do
+    [[ -e "$f" ]] || continue
+    [[ "$(basename "$f")" == "MEMORY.md" ]] && continue
+    nm=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^name:[[:space:]]*/{sub(/^name:[[:space:]]*/,""); print; exit}' "$f")
+    desc=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^description:[[:space:]]*/{sub(/^description:[[:space:]]*/,""); gsub(/^"|"$/,""); print; exit}' "$f")
+    [[ -n "$nm" ]] || continue
+    listed=$((listed+1))
+    lines_full+="$(printf -- '- [%s](%s) — %s' "$nm" "$(basename "$f")" "$desc")"$'\n'
+    lines_slim+="$(printf -- '- [%s](%s)' "$nm" "$(basename "$f")")"$'\n'
+  done
+  total=$(( ${#head_txt} + ${#lines_full} ))
+  if (( total <= budget )); then
+    printf '%s%s' "$head_txt" "$lines_full" > "$dir/MEMORY.md"
+    return 0
+  fi
+  total=$(( ${#head_txt} + ${#lines_slim} ))
+  if (( total <= budget )); then
+    { printf '%s' "$head_txt"
+      printf 'Descriptions are omitted here to stay inside the always-loaded size limit — `5dive memory get <slug>` reads any of them.\n\n'
+      printf '%s' "$lines_slim"
+    } > "$dir/MEMORY.md"
+    return 0
+  fi
+  # Still over: name what fits, then say plainly what is not named. The atoms
+  # are all on disk and all searchable; the one unacceptable outcome is a file
+  # that looks complete and is not.
+  { printf '%s' "$head_txt"
+    printf 'This store holds %s atoms — too many to name in an always-loaded file. The ones below are a sample; find the rest by searching, never by reading this list.\n\n' "$listed"
+    while IFS= read -r ln; do
+      [[ -z "$ln" ]] && continue
+      (( ${#head_txt} + shown * 80 > budget - 400 )) && break
+      printf '%s\n' "$ln"
+      shown=$((shown+1))
+    done <<< "$lines_slim"
+    printf '\n_%s of %s atoms are not named above. They are on disk in this directory and reachable with `5dive memory search --index "<topic>"`._\n' "$(( listed - shown ))" "$listed"
+  } > "$dir/MEMORY.md"
+}
+
 # Locate an agent's persona-memory dir. Memory is keyed by project slug
 # (~/.claude/projects/<slug>/memory/); a customer agent normally has one. If
 # several exist we take the largest (the agent's primary working project).
 _pack_memory_dir() {
-  local name="$1"
-  local base="/home/agent-${name}/.claude/projects"   # separate stmt: ${name} aborts under set -u if same line
-  [[ -d "$base" ]] || return 1
-  find "$base" -maxdepth 2 -type d -name memory 2>/dev/null \
+  local name="$1" kind store
+  # DIVE-4541: resolve per HARNESS. The claude path is not a universal default —
+  # it is one harness's answer, and handing it to a seat that keeps its memory
+  # elsewhere is what made `export codex --memory=raw` read as "has no persona
+  # memory to export" while 1.8 MB of it sat in ~/.codex/memories.
+  kind=$(_pack_memory_kind "$name")
+  store=$(_pack_memory_path "$name") || return 1
+  if [[ "$kind" == "codex" ]]; then
+    [[ -d "$store" ]] || return 1
+    # rollout_summaries/ is EXCLUDED, and by decision rather than by accident:
+    # they are per-session transcript summaries whose content is already
+    # distilled into the three top-level documents, and they carry rollout
+    # paths and thread ids — operational detail a pack has no reason to move.
+    # `find -maxdepth 1` in every consumer is what enforces it.
+    printf '%s\n' "$store"
+    return 0
+  fi
+  [[ -d "$store" ]] || return 1
+  find "$store" -maxdepth 2 -type d -name memory 2>/dev/null \
     | while read -r d; do printf '%s\t%s\n' "$(find "$d" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)" "$d"; done \
     | sort -rn | head -1 | cut -f2-
 }
@@ -1479,6 +1743,54 @@ _pack_memory_dir() {
 #
 # Returns "<kept> <0>" to match _pack_scope_memory's contract; nothing is ever
 # excluded here, and the second field exists so callers stay uniform.
+# DIVE-4541: the DISCRIMINATOR the whole cross-harness landing turns on. It is
+# read off the pack rather than guessed from the target, because the question is
+# "what shape are these bytes", not "what does this seat want" — and a pack
+# written before the field existed carries atoms, which is what every writer
+# before now produced.
+# Where the DRAFT phase writes the reviewable memory dir. A resolver rather than
+# an inline path for the same reason as _pack_memory_path: it is the one write
+# the draft phase makes outside the pack, so a harness that drives cmd_export
+# has to be able to point it somewhere that is not a real seat's home.
+_pack_draft_dir() {   # _pack_draft_dir <agent-name>
+  printf '/home/agent-%s/.claude/pack-staging/memory-draft\n' "$1"
+}
+
+_pack_manifest_memory_shape() {   # _pack_manifest_memory_shape <stage>
+  local stage="$1" sh
+  sh=$(jq -r '.includes.memoryShape // "atoms"' "$stage/manifest.json" 2>/dev/null || echo atoms)
+  [[ -n "$sh" && "$sh" != "null" ]] || sh="atoms"
+  printf '%s\n' "$sh"
+}
+
+# DIVE-4541: seed a CLAUDE seat's memory dir from a pack's staged memory, routed
+# on the shape of the staged bytes. Extracted from cmd_import so the routing is
+# executable without a seat: it is the branch that decides CONVERT vs verbatim
+# copy, and a mutant that collapses it reinstates exactly the failure this change
+# exists to prevent (a 143 KB codex MEMORY.md dropped into a claude memory dir,
+# tail silently cut past the loader limit — DIVE-3821). Echoes the number of
+# facts it intended to land.
+_pack_seed_claude_memory() {   # _pack_seed_claude_memory <stage-memory-dir> <memdir> <shape>
+  local smem="$1" mdir="$2" shape="$3" packed conv
+  mkdir -p "$mdir"
+  if [[ "$shape" == "codex-docs" ]]; then
+    # CONVERT, never copy. The codex store is three whole documents; this seat's
+    # store is one atom per fact plus an INDEX. A verbatim copy would put a
+    # 143 KB MEMORY.md where the loader has a limit it exceeds silently, so the
+    # facts would be present and not loaded — the worst of the two failures,
+    # because it reads as success.
+    conv=$(_pack_codex_to_atoms "$smem" "$mdir" all)
+    _pack_atoms_index "$mdir" "Memory Index (imported from a codex store)"
+    # +1 is the regenerated index, which the caller's `landed` counts as a file
+    # too; the ratio it prints is a landing check, not an arithmetic claim.
+    printf '%s\n' "$(( conv + 1 ))"
+    return 0
+  fi
+  packed=$(find "$smem" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
+  cp "$smem"/*.md "$mdir/" 2>/dev/null || true
+  printf '%s\n' "$packed"
+}
+
 _pack_raw_memory() {
   local memdir="$1" outdir="$2" kept=0 f base
   mkdir -p "$outdir"
@@ -1925,6 +2237,8 @@ cmd_export() {
   # redaction judgement. Phase 1 (no --approve-memory) writes a scoped draft and
   # stops; phase 2 (--approve-memory=<reviewed dir>) seals the reviewed dir in.
   local mem_src="" mem_tmp=""   # SEAL phase: scoped temp dir of approved memory to pack
+  local mem_shape="atoms"       # DIVE-4541: shape of the staged memory bytes
+  local mem_kind_staged; mem_kind_staged=$(_pack_memory_kind "$name")
   if (( with_memory )); then
     if [[ -z "$approve_memory" ]]; then
       # --- DRAFT phase: scope (L1) + tripwire (L3), write a review draft, STOP.
@@ -1932,13 +2246,46 @@ cmd_export() {
       # no ~/.claude/projects dir at all — true of every non-claude-type seat
       # (opencode, codex never create it). Unguarded under set -e that assignment
       # killed the script before the very next line's fail() could print anything.
+      local mem_kind; mem_kind=$(_pack_memory_kind "$name")
       local memdir; memdir=$(_pack_memory_dir "$name") || memdir=""
-      [[ -n "$memdir" ]] || fail "$E_NOT_FOUND" "agent '$name' has no persona memory to export"
-      local draft="/home/agent-${name}/.claude/pack-staging/memory-draft"
+      if [[ -z "$memdir" ]]; then
+        # DIVE-4541: say WHICH store was looked for. "has no persona memory" was
+        # true of the lookup and false of the seat.
+        if [[ "$mem_kind" == "none" ]]; then
+          fail "$E_NOT_FOUND" "agent '$name' is a '$(_pack_agent_type "$name")' seat and 5dive knows no memory store for that harness (claude: ~/.claude/projects/<slug>/memory, codex: ~/.codex/memories). Export the config without --with-memory, or move the store by hand."
+        fi
+        fail "$E_NOT_FOUND" "agent '$name' has no persona memory to export (looked in the $mem_kind store)"
+      fi
+      local draft; draft=$(_pack_draft_dir "$name")
       rm -rf "$draft"; mkdir -p "$draft"
       local counts kept excluded
       if [[ "$memory_mode" == "raw" ]]; then
         counts=$(_pack_raw_memory "$memdir" "$draft")
+      elif [[ "$mem_kind" == "codex" ]]; then
+        # DIVE-4541: a codex store has no per-fact metadata.type, so
+        # _pack_scope_memory's allowlist cannot decide anything about it and
+        # would exclude all of it. Convert FIRST — one atom per task group,
+        # knowledge subsections only, typed `reference` — and the ordinary
+        # allowlist then holds over the result, including on the seal below,
+        # unchanged. The private halves (the user profile, the stated
+        # preferences, the raw thread notes) do not enter the draft at all.
+        local ck cx
+        ck=$(_pack_codex_to_atoms "$memdir" "$draft" knowledge)
+        _pack_atoms_index "$draft" "Memory Index (distilled from a codex store)"
+        # `grep -c` prints 0 AND exits 1 when a present file has no matches.
+        # Two wrong guards, both measured: `|| echo 0` appends a SECOND zero and
+        # the arithmetic below dies with "syntax error in expression"; piping
+        # through `head -1` fixes the VALUE but not the STATUS — `head` exits 0,
+        # pipefail still hands the pipeline rc 1, and the bare assignment dies
+        # under the bundle's own `set -euo pipefail` with nothing on stdout or
+        # stderr. Guard the ASSIGNMENT with the post-condition the arithmetic
+        # below reads. (`|| true` suppresses the status without stating a value;
+        # `local cxall=$(…)` masks the failure instead of handling it.)
+        local cxall
+        cxall=$(grep -c '^# Task Group:' "$memdir/MEMORY.md" 2>/dev/null) || cxall=0
+        cx=$(( ${cxall:-0} - ck ))
+        (( cx < 0 )) && cx=0
+        counts="$ck $cx"
       else
         counts=$(_pack_scope_memory "$memdir" "$draft")
       fi
@@ -2067,6 +2414,15 @@ cmd_export() {
     # shareable pack. The refusal is a property of the bytes; the label has to
     # be one too, because the label is all a later reader has.
     mem_inc="$memory_mode"
+    # DIVE-4541: the SHAPE of what is staged, which is not the same question as
+    # the mode. A distilled codex export is already atoms (the draft converted
+    # it); a RAW codex export is the three codex documents verbatim, and an
+    # importer that does not know that will land a 143 KB MEMORY.md in a claude
+    # memory dir and silently lose its tail. Old packs carry no field; `atoms`
+    # is the right default for every pack written before this one.
+    if [[ "$memory_mode" == "raw" && "$mem_kind_staged" == "codex" ]]; then
+      mem_shape="codex-docs"
+    fi
   fi
 
   # Emit a conforming OpenAgent persona.yaml (DIVE-656) so the pack is spec-valid
@@ -2086,12 +2442,13 @@ cmd_export() {
     --arg model "$model" --arg effort "$effort" \
     --argjson plugins "$plugins" --argjson skills "$skills" --argjson hooks "$hooks" \
     --arg mem "$mem_inc" \
+    --arg memshape "$mem_shape" \
     --argjson persona "$has_persona" \
     '{
       packFormat: $fmt,
       agentName: $name,
       createdWith: $ver,
-      includes: { memory: (if $mem=="false" then false else $mem end), persona: $persona },
+      includes: { memory: (if $mem=="false" then false else $mem end), memoryShape: (if $mem=="false" then null else $memshape end), persona: $persona },
       config: ($cfg + {
         model: (if $model=="" then null else $model end),
         effort: (if $effort=="" then null else $effort end)
@@ -2769,14 +3126,40 @@ cmd_import() {
   # workdir at all — see the DIVE-3881 resolution above for why the manifest's own
   # value is not one on the common path.
   local mem_seeded="none"
-  if [[ "$mem_inc" != "false" && -d "$stage/memory" ]]; then
+  # DIVE-4541: what shape are the staged bytes, and what shape does this seat
+  # want? A pack written before this field exists carries atoms — that is what
+  # every writer before now produced.
+  local mem_shape_in; mem_shape_in=$(_pack_manifest_memory_shape "$stage")
+  # A codex TARGET keeps memory in ~/.codex/memories, not under .claude/projects
+  # — seeding it there would report a landing nothing on that seat can read.
+  if [[ "$mem_inc" != "false" && -d "$stage/memory" && "$type" == "codex" ]]; then
+    local codexdir="/home/agent-${as}/.codex/memories" cpacked clanded
+    cpacked=$(find "$stage/memory" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
+    install -d -o "agent-${as}" -g "agent-${as}" "$codexdir" 2>/dev/null || true
+    cp "$stage"/memory/*.md "$codexdir/" 2>/dev/null || true
+    chown -R "agent-${as}:agent-${as}" "/home/agent-${as}/.codex" 2>/dev/null || true
+    clanded=$(find "$codexdir" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
+    if (( clanded > 0 )); then
+      mem_seeded="$codexdir ($cpacked file(s) copied, $clanded present)"
+      [[ "$mem_effect" == "none" ]] && mem_effect="codex reads $codexdir"
+      # Atoms landing on a codex seat stay one-file-per-fact: codex loads
+      # MEMORY.md, so say plainly that the atoms are readable-but-not-loaded
+      # rather than implying the store was merged.
+      [[ "$mem_shape_in" == "atoms" && ! -f "$codexdir/MEMORY.md" ]] \
+        && warn "the pack's memory is claude-shaped atoms and landed in $codexdir as separate files; codex loads MEMORY.md, so these are readable but not auto-loaded (the persona doc carries the same facts inline)"
+    else
+      mem_seeded="FAILED (0 of $cpacked files reached $codexdir)"
+    fi
+  elif [[ "$mem_inc" != "false" && -d "$stage/memory" ]]; then
     if [[ -n "$eff_workdir" ]]; then
       local slug mdir packed landed
       slug=$(printf '%s' "$eff_workdir" | sed 's#/#-#g')
       mdir="$cdir/projects/${slug}/memory"
-      packed=$(find "$stage/memory" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
       install -d -o "agent-${as}" -g "agent-${as}" "$mdir" 2>/dev/null || true
-      cp "$stage"/memory/*.md "$mdir/" 2>/dev/null || true
+      # DIVE-4541: the shape of the staged bytes decides convert-vs-copy, and
+      # that routing lives in _pack_seed_claude_memory so it is gradeable
+      # without a seat.
+      packed=$(_pack_seed_claude_memory "$stage/memory" "$mdir" "$mem_shape_in")
       chown -R "agent-${as}:agent-${as}" "$cdir/projects" 2>/dev/null || true
       landed=$(find "$mdir" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
       # DIVE-3881 (fix B): COUNT what landed instead of assuming the cp worked.
