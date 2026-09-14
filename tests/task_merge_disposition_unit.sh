@@ -367,10 +367,22 @@ grade_prose "$c1"
 eq "C1a an auto-mergeable graded row names the GRADER, not the maker 'dev'" \
    "quinn" "$(col "$c1" merge_owner)"
 eq "C1b ...and the board renders that owner" "graded->merge:quinn" "$(board "$c1")"
-if [[ "$(col "$c1" merge_hold_reason)" == *"task done"* ]]; then
-  ok_t "C1c ...and the reason cell says what to run"
+# DIVE-4520: WHICH VERB. Before this ticket the cell read `run `5dive task done``
+# — and on a loop row that verb re-delivers an unchanged pass, moves the delivery
+# clock past the verdict clock, and strips merge standing from the seat named one
+# field to the left. The board's own instruction was what stalled DIVE-4491. Both
+# halves are asserted, because "contains task merge" alone would still pass a cell
+# that offered both verbs.
+_c1c=$(col "$c1" merge_hold_reason)
+if [[ "$_c1c" == *"task merge"* && "$_c1c" != *"task done"* ]]; then
+  ok_t "C1c ...and the reason cell says to run \`task merge\`, never \`task done\` (DIVE-4520)"
 else
-  bad_t "C1c ...and the reason cell says what to run" "$(col "$c1" merge_hold_reason)"
+  bad_t "C1c ...and the reason cell says to run \`task merge\`, never \`task done\` (DIVE-4520)" "$_c1c"
+fi
+if [[ "$_c1c" == *"task merge ${_c1ident:=$(db "SELECT ident FROM tasks WHERE id=$c1;")}"* ]]; then
+  ok_t "C1d ...naming THIS row, so the line is runnable as printed"
+else
+  bad_t "C1d ...naming THIS row, so the line is runnable as printed" "$_c1c"
 fi
 
 # --- C2: a diverged PR owes a LOOK from ops (DIVE-4326; `main` before). THIS IS
@@ -469,6 +481,259 @@ db "UPDATE tasks SET graded_by='' WHERE id=${c10};"
 grade_prose "$c10"
 eq "C8h an EMPTY graded_by falls back to the grading seat, never to 'main'" \
    "quinn" "$(col "$c10" merge_owner)"
+
+# ===================================================================
+# C9. DIVE-4520 — `task done` ON A MERGE-PENDING ROW REFUSES INSTEAD OF
+#     RE-DELIVERING.
+#
+# The other half of the same defect. Section C1c above stops the BOARD printing
+# the destructive verb; these arms make the verb itself safe, because a hint we
+# do not compose (an older board line, a quoted screenshot, a person) can still
+# point at it — and text-only enforcement is a proven repeat-defect class here
+# (DIVE-4440). The rule was already written down on the wiki before this row
+# existed and it did not stop the tap that measured it.
+#
+# THE HARM, measured on DIVE-4491 / 5dive-ai/5dive#963: on a loop row `task done`
+# is not a close. It takes the maker->verifier routing fork and re-delivers, which
+# stamps handoff_delivered_at=now. `_TASKS_TFV_SQL`'s DIVE-4357 conjunct then
+# reads a delivery clock later than every verdict clock as "a delivery the grade
+# did not grade", and `_task_merge_preflight` refuses the seat `graded_by` names —
+# the ONE seat the rail accepts. Exit 0, nothing red, strictly worse than before.
+#
+# THE ASSERTION IS BEHAVIOURAL AND IT IS THE SAME QUESTION SECTION C8 ASKS: not
+# "did a refusal print" but "does the seat the board named still hold standing
+# under the SHIPPED predicate afterwards". A refusal that printed while the row
+# was written anyway would pass a message-only arm.
+#
+# THE NEGATIVE CONTROL IS IN-POPULATION AND THERE ARE TWO of them, because this
+# guard can fail in both directions:
+#   * C9g — the ACKing seat (quinn) holds no standing before OR after. A guard
+#     that "preserved standing" by widening the rail would pass every other arm.
+#   * C9h/C9i — a row with a LIVE reject is NOT merge-pending, and its `task done`
+#     MUST still re-deliver. A guard that refused every `task done` on a bound row
+#     would strand exactly the rework this rail exists to carry.
+# ===================================================================
+DISP_ANSWER="merge"
+_stands_on() { # <row id> <seat> -> 1 when the SHIPPED rail would accept that seat
+  db "SELECT COUNT(*) FROM tasks WHERE id=$1 AND $(_task_merge_standing_sql "$2");"
+}
+
+# The DIVE-4491 shape exactly: graded by a temp session (main2), the loop's own
+# verifier (quinn) still on the row, and the row assigned to a THIRD state — the
+# maker's seat — so `verifier != assignee` and the close takes the routing fork.
+c11=$(mkrow "graded, bound, and waiting on a merge")
+db "UPDATE tasks SET assignee='dev' WHERE id=${c11};"
+HARNESS_ACTOR=main2 grade_prose "$c11"
+# The delivery clock is stamped BEHIND the verdict clock, which is what makes the
+# row merge-pending rather than delivered-and-ungraded.
+#
+# AND THE VERDICT CLOCK IS PUSHED BACK TOO, deliberately, because without it the
+# arms below cannot fail. Both clocks are datetime('now') at ONE-SECOND resolution
+# (the tie DIVE-2624 measured on this very column pair): a re-delivery landing in
+# the same second as the grade leaves the standing conjunct tied and TRUE, so an
+# unguarded `task done` would still read as standing-intact and C9f would pass
+# against the defect. Thirty minutes of separation is what makes "the delivery
+# clock overtook the verdict clock" observable at all.
+db "UPDATE tasks SET handoff_delivered_at=datetime('now','-1 hour'),
+       graded_verdict_at=datetime('now','-30 minutes'), assignee='dev' WHERE id=${c11};"
+_c11ident=$(db "SELECT ident FROM tasks WHERE id=${c11};")
+eq "C9a the fixture IS merge-pending (the state the board paints graded->merge)" \
+   "1" "$(db "SELECT COUNT(*) FROM tasks WHERE id=${c11} AND ${_TASKS_TFV_SQL};")"
+eq "C9b ...and the grading seat holds standing BEFORE the tap" "1" "$(_stands_on "$c11" main2)"
+_c11_before=$(col "$c11" handoff_delivered_at)
+_c11_iter_before=$(col "$c11" iteration)
+_c11_out=$( set +e; cmd_task_done "$_c11ident" --result="re-asserting the pass" 2>&1 ); _c11_rc=$?
+if (( _c11_rc != 0 )); then
+  ok_t "C9c \`task done\` on a merge-pending row REFUSES (rc=$_c11_rc, not the exit-0 no-op)"
+else
+  bad_t "C9c \`task done\` on a merge-pending row REFUSES" "rc=0; output: $_c11_out"
+fi
+eq "C9d ...and handoff_delivered_at did NOT move (nothing was written)" \
+   "$_c11_before" "$(col "$c11" handoff_delivered_at)"
+eq "C9e ...nor did the iteration counter" "$_c11_iter_before" "$(col "$c11" iteration)"
+eq "C9f ...so the grading seat STILL holds standing under the shipped predicate" \
+   "1" "$(_stands_on "$c11" main2)"
+eq "C9g NEGATIVE CONTROL: the ACKing seat holds none before or after (the rail was not widened)" \
+   "0" "$(_stands_on "$c11" quinn)"
+if [[ "$_c11_out" == *"task merge ${_c11ident}"* ]]; then
+  ok_t "C9h ...and the refusal names the verb that works, on this row"
+else
+  bad_t "C9h ...and the refusal names the verb that works, on this row" "$_c11_out"
+fi
+if [[ "$_c11_out" == *main2* ]]; then
+  ok_t "C9i ...and the seat that can run it, read from graded_by"
+else
+  bad_t "C9i ...and the seat that can run it, read from graded_by" "$_c11_out"
+fi
+
+# --- C9q-C9t (DIVE-4520 iteration 2): THE ALREADY-MERGED BRANCH, which is the
+# one the fleet's own instructions send people to.
+#
+# `_TASKS_TFV_SQL` HAS NO NOTION OF MERGE STATE and this guard adds no probe —
+# DIVE-4137 wants the close path probe-free, and a GitHub read that failed open
+# would make the refusal non-deterministic. The consequence, measured by main2 on
+# iteration 1: the fixture below is BYTE-IDENTICAL in the store to a row whose
+# pull request landed ten minutes ago, so the guard fires on both and cannot tell
+# them apart. That is a decision, not an oversight — and it is exactly why the
+# TEXT has to carry the case the predicate cannot see. On a landed pull request
+# the hand-off to the verifier IS the unchanged re-delivery `--force-redeliver`
+# exists for (the standing it spends is already spent), and `task assign` reaches
+# the same end with no delivery clock at all. Naming neither is what made the
+# refusal un-followable where `cmd_heartbeat.sh`'s wake dispatch sends the merge
+# owner.
+#
+# The mutant these exist for is deleting the already-merged clause from the
+# refusal; it reds C9q, C9r and C9s and nothing else.
+if [[ "$_c11_out" == *"ALREADY MERGED"* ]]; then
+  ok_t "C9q ...and the refusal ADDRESSES the case the predicate cannot see (already merged)"
+else
+  bad_t "C9q ...and the refusal ADDRESSES the case the predicate cannot see (already merged)" "$_c11_out"
+fi
+if [[ "$_c11_out" == *"task assign ${_c11ident} quinn"* ]]; then
+  ok_t "C9r ...naming the escape that applies there, on THIS row and its own verifier"
+else
+  bad_t "C9r ...naming the escape that applies there, on THIS row and its own verifier" "$_c11_out"
+fi
+# C9s is keyed on the REASON the audited escape applies there, not on the flag's
+# name — the flag is named a sentence earlier for the unmerged case, so a grep for
+# it alone survives the clause-deletion mutant and would be decoration.
+if [[ "$_c11_out" == *"already spent"* ]]; then
+  ok_t "C9s ...and says WHY the audited escape applies there (the standing is already spent)"
+else
+  bad_t "C9s ...and says WHY the audited escape applies there (the standing is already spent)" "$_c11_out"
+fi
+# C9t-C9w: AND THE ESCAPE IS NOT DECORATION — GRADED BY RUNNING IT.
+#
+# Iteration 2 asserted this branch by WRITING the end state by hand
+# (`UPDATE tasks SET assignee='quinn'`) and checking the consequences. quinn
+# bounced that at iteration 2 and was right: `grep -c cmd_task_assign` over this
+# suite returned 0, so the arms certified what the refusal SAYS and never once
+# ran the verb it names. `cmd_task_assign` refused it — DIVE-3097's guard fired
+# on `assignee != verifier`, which is the precondition of the fork the refusal is
+# printed on, so the advice could not be followed on any row that ever saw it.
+# DIVE-4520 narrows that guard to the column its own comment means
+# (`handoff_delivered_at IS NULL`). These arms drive the SHIPPED verb.
+#
+# `_task_require_lane` is stubbed for these calls and nothing else: it reads the
+# agent registry, this board is a temp fixture with a two-agent roster, and lane
+# registration is not what is under test here. The guard under test sits below
+# it.
+assign_run() { # assign_run <ident> <seat> -> runs the shipped verb, lane check stubbed
+  ( set +e; _task_require_lane() { return 0; }; cmd_task_assign "$1" "$2" 2>&1 )
+}
+_c11_assign_before=$(col "$c11" handoff_delivered_at)
+_c11_assign_out=$(assign_run "$_c11ident" quinn); _c11_assign_rc=$?
+if (( _c11_assign_rc == 0 )); then
+  ok_t "C9t the escape the refusal prints RUNS on the row it is printed on"
+else
+  bad_t "C9t the escape the refusal prints RUNS on the row it is printed on" \
+        "rc=$_c11_assign_rc; output: $_c11_assign_out"
+fi
+eq "C9u ...moving the row off the guarded fork (verifier == assignee)" \
+   "quinn|quinn" "$(col "$c11" verifier)|$(col "$c11" assignee)"
+eq "C9v ...without stamping a delivery clock" \
+   "$_c11_assign_before" "$(col "$c11" handoff_delivered_at)"
+eq "C9w ...so the grading seat still holds standing for the merge" \
+   "1" "$(_stands_on "$c11" main2)"
+db "UPDATE tasks SET assignee='dev' WHERE id=${c11};"     # restore, the row is not reused but say so
+
+# C9x: THE IN-POPULATION POSITIVE CONTROL for C9t. The same verb, same row, a
+# seat that is NOT the verifier — the shape DIVE-3097 never refused. If C9t went
+# green because the verb became a no-op rather than because the guard stopped
+# firing, this arm is unchanged and C9t's move is the difference.
+_c11_pc_out=$(assign_run "$_c11ident" ops); _c11_pc_rc=$?
+eq "C9x POSITIVE CONTROL: the same verb to a NON-verifier seat runs too (rc 0, moved)" \
+   "0|ops" "${_c11_pc_rc}|$(col "$c11" assignee)"
+db "UPDATE tasks SET assignee='dev' WHERE id=${c11};"
+
+# C9y: THE NEGATIVE CONTROL THE NARROWING MUST NOT EAT. DIVE-2899's shape is a
+# row that has NEVER been delivered (handoff_delivered_at NULL) being reassigned
+# straight onto its own verifier — that manufactures a maker who is also the
+# grader with no handoff ever recorded, and it must still be refused. Identical
+# to the C9 fixture in every column the guard reads EXCEPT the delivery clock.
+# A mutant that drops the narrowing conjunct reds C9t/C9u/C9w/C9x; a mutant that
+# deletes the guard outright reds this one.
+c11f=$(mkrow "never delivered, being pointed at its own verifier")
+db "UPDATE tasks SET assignee='dev', handoff_delivered_at=NULL WHERE id=${c11f};"
+_c11f_ident=$(db "SELECT ident FROM tasks WHERE id=${c11f};")
+_c11f_out=$(assign_run "$_c11f_ident" quinn); _c11f_rc=$?
+eq "C9y NEGATIVE CONTROL: the never-delivered row is STILL refused onto its own verifier" \
+   "3|dev" "${_c11f_rc}|$(col "$c11f" assignee)"
+if [[ "$_c11f_out" == *"a maker can't grade itself"* ]]; then
+  ok_t "C9z ...by DIVE-3097's own refusal, not by an unrelated failure"
+else
+  bad_t "C9z ...by DIVE-3097's own refusal, not by an unrelated failure" "$_c11f_out"
+fi
+
+# --- C9j: THE IN-POPULATION NEGATIVE CONTROL. A row carrying a LIVE reject is
+# NOT merge-pending — the maker owes a fix and `task done` is exactly the verb
+# that delivers it. Identical fixture, one column different.
+c12=$(mkrow "bounced back, maker re-delivering")
+db "UPDATE tasks SET assignee='dev' WHERE id=${c12};"
+HARNESS_ACTOR=main2 grade_prose "$c12"
+db "UPDATE tasks SET handoff_delivered_at=datetime('now','-1 hour'),
+       handoff_rejected_at=datetime('now'), assignee='dev' WHERE id=${c12};"
+_c12ident=$(db "SELECT ident FROM tasks WHERE id=${c12};")
+eq "C9j the reject makes the row NOT merge-pending" \
+   "0" "$(db "SELECT COUNT(*) FROM tasks WHERE id=${c12} AND ${_TASKS_TFV_SQL};")"
+_c12_before=$(col "$c12" handoff_delivered_at)
+_c12_out=$( set +e; cmd_task_done "$_c12ident" --result="FIX: addressed the finding" 2>&1 ); _c12_rc=$?
+if (( _c12_rc == 0 )); then
+  ok_t "C9k ...so its \`task done\` still DELIVERS (rc=0) — the guard did not widen"
+else
+  bad_t "C9k ...so its \`task done\` still DELIVERS (rc=0) — the guard did not widen" "rc=$_c12_rc; $_c12_out"
+fi
+if [[ "$(col "$c12" handoff_delivered_at)" != "$_c12_before" ]]; then
+  ok_t "C9l ...and the delivery clock DID move, which is what a real delivery does"
+else
+  bad_t "C9l ...and the delivery clock DID move" "still $_c12_before"
+fi
+
+# --- C9m: the audited escape. `--force-redeliver=<why>` (DIVE-4144) already means
+# "this unchanged re-delivery is correct"; reusing it keeps ONE sentence for one
+# meaning. A refusal with no escape is a stall wearing a different hat.
+c13=$(mkrow "escape hatch")
+db "UPDATE tasks SET assignee='dev' WHERE id=${c13};"
+HARNESS_ACTOR=main2 grade_prose "$c13"
+db "UPDATE tasks SET handoff_delivered_at=datetime('now','-1 hour'),
+       graded_verdict_at=datetime('now','-30 minutes'), assignee='dev' WHERE id=${c13};"
+_c13ident=$(db "SELECT ident FROM tasks WHERE id=${c13};")
+_c13_out=$( set +e; cmd_task_done "$_c13ident" --result="restoring a lost handoff" \
+              --force-redeliver="the handoff record was lost; the pass is unchanged" 2>&1 ); _c13_rc=$?
+if (( _c13_rc == 0 )); then
+  ok_t "C9m --force-redeliver proceeds (rc=0), so the refusal is recoverable"
+else
+  bad_t "C9m --force-redeliver proceeds (rc=0)" "rc=$_c13_rc; $_c13_out"
+fi
+# The cost is asserted as the WARNING, not as a standing flip. Both clocks are
+# datetime('now') at ONE-SECOND resolution, so a forced re-delivery inside the same
+# second as the grade leaves the standing conjunct tied and true — the tie
+# DIVE-2624 measured on this very column pair. An arm that asserted standing was
+# lost would pass only on a slow box and is exactly the shape that reds in CI and
+# not on a desk. What is deterministic, and what the escape owes its caller, is
+# that it SAYS what it is spending.
+_c13_seen=0
+[[ "$_c13_out" == *"--force-redeliver"* && "$_c13_out" == *"merge standing"* && "$_c13_out" == *main2* ]] && _c13_seen=1
+eq "C9n ...and the cost is stated rather than silent (the warning names the seat that loses standing)" \
+   "1" "$_c13_seen"
+# C9n2 (DIVE-4520 iteration 2): AND IT IS STATED AS A CONDITION, not as a fact.
+# The escape's whole point is that an unchanged re-delivery is sometimes right —
+# and the case where it is MOST right is a pull request that has already merged,
+# where there is no merge left to hold standing for. A warn that asserts the loss
+# flatly argues against the escape exactly there, which is what iteration 1
+# shipped. The mutant is the revert to the flat sentence; it reds here only.
+_c13_cond=0
+[[ "$_c13_out" == *"has NOT merged yet"* && "$_c13_out" == *"already merged"* ]] && _c13_cond=1
+eq "C9n2 ...and the cost is CONDITIONAL on the pull request not having landed" \
+   "1" "$_c13_cond"
+eq "C9o ...and the forced re-delivery really did happen (the row is back with the verifier)" \
+   "quinn" "$(col "$c13" assignee)"
+# ...and the warning was not decoration: with the verdict clock 30 minutes back,
+# the new delivery clock really does overtake it, so the standing the escape spent
+# is measurably gone. This is the harm the refusal above prevents, exercised once
+# on purpose so the suite holds a witness of it rather than only a description.
+eq "C9p ...and the spent cost is REAL: the grading seat no longer holds standing" \
+   "0" "$(_stands_on "$c13" main2)"
 
 # ===================================================================
 # D. THE MERGE ITSELF, at `task done`.

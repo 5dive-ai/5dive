@@ -179,6 +179,82 @@ _merge_at_close_do() {
     || db "UPDATE tasks SET merge_owner=NULL, merge_hold_reason=NULL WHERE id=${id};" || true
   return 0
 }
+# DIVE-4520 — THE HINT'S VERB REVOKED THE STANDING OF THE ONLY SEAT THAT COULD
+# HAVE MERGED THE ROW, and this is the half that makes the verb safe whatever
+# points at it.
+#
+# On a loop row `task done` is not a close: it takes the maker->verifier routing
+# fork below and RE-DELIVERS. On a row that is graded PASS and merely awaiting a
+# merge that re-delivery carries no new work — and it still stamps
+# handoff_delivered_at=now, which moves the delivery clock past every recorded
+# verdict clock. `_TASKS_TFV_SQL`'s DIVE-4357 conjunct then reads the row as a
+# delivery the grade did not grade, and `_task_merge_preflight` refuses the seat
+# `graded_by` names: the ONE seat the rail would have accepted. Exit 0, no
+# warning, and a state strictly worse than before the tap. Measured on
+# DIVE-4491 / 5dive-ai/5dive#963, 2026-09-14, by a seat doing exactly what the
+# board told it to do.
+#
+# THE PREDICATE IS THE SHARED ONE. `_TASKS_TFV_SQL` is graded-and-waiting-on-a-
+# merge — it already means "graded PASS, bound to a pull request, no live
+# reject", and it is what the board renders as `graded->merge:<seat>`. Re-typing
+# those conjuncts here would be a second answer to a question the store already
+# answers, and the two would drift the first time either moved (DIVE-4357 moved
+# one of them once already). So this refusal fires on exactly the rows the board
+# paints as merge-pending, by construction.
+#
+# WHY A REFUSAL AND NOT A SILENT SKIP. A refusal is recoverable: nothing is
+# written, the row keeps its standing, and the reader is told the verb that
+# works. The exit-0 re-delivery is not recoverable by the seat that ran it — the
+# repair needs `graded_by` to re-record its verdict, which is a different seat on
+# every row that was graded twice. One trusting tap per seat is the cost.
+#
+# NOT PLACED INSIDE `_task_route_to_verifier`: that helper is also `task
+# deliver`'s funnel, and a maker re-pointing a binding at a NEW pull request is
+# delivering something the grade never saw. That is a real delivery and must
+# still go through. This guard is about the CLOSE verb re-asserting an unchanged
+# pass, so it sits on the close path's forks.
+#
+# THE ESCAPE IS THE EXISTING ONE. `--force-redeliver=<why>` (DIVE-4144) already
+# means "this unchanged re-delivery is correct and here is why"; a second flag
+# for the same sentence would only make the audit unable to say which was meant.
+#
+# ITERATION 2 (main2's reject, DIVE-4520): THE PREDICATE HAS NO NOTION OF MERGE
+# STATE, AND THAT IS DELIBERATE — SO THE TEXT HAS TO CARRY IT. `_TASKS_TFV_SQL`
+# reads clocks and columns; a row whose pull request merged ten minutes ago still
+# satisfies every conjunct, so this fires there too. Probing GitHub from the close
+# path to tell the two apart is the one thing DIVE-4137 asks us not to add here,
+# and a probe that fails open would make the refusal non-deterministic. So the
+# refusal ADDRESSES the already-merged case in words instead: on a landed pull
+# request the hand-off to the verifier IS the unchanged re-delivery the escape
+# exists for, and there is a second route that stamps no delivery clock at all —
+# `task assign <ident> <verifier>`, after which that seat's own close finishes the
+# row (the close path is unguarded when verifier == assignee, measured). Naming
+# neither is what made the refusal un-followable on the branch the fleet's own
+# wake dispatch sends people to.
+_task_done_merge_pending_guard() {
+  local id="$1" ident="$2"
+  local _mp_pending
+  _mp_pending=$(db "SELECT COUNT(*) FROM tasks WHERE id=${id} AND ${_TASKS_TFV_SQL};" 2>/dev/null || printf 0)
+  [[ "$_mp_pending" == "1" ]] || return 0
+  local _mp_owner _mp_dref _mp_vfier
+  _mp_owner=$(db "SELECT COALESCE(NULLIF(graded_by,''),'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  _mp_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  # The hand-over target, read from the row's own verifier column — never from the
+  # caller, and never `graded_by`: on the DIVE-4491 shape a TEMP grader holds the
+  # merge while the loop's verifier is a different seat, and it is the loop's
+  # verifier that can close the row.
+  _mp_vfier=$(db "SELECT COALESCE(NULLIF(verifier,''),'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  if [[ -n "${_TASK_REDELIVER_FORCE_REASON:-}" ]]; then
+    # DIVE-4520 iteration 2: the cost is stated CONDITIONALLY, because it is
+    # conditional. On a pull request that has already landed there is no merge
+    # left to hold standing for, and a warn that asserts a loss anyway argues
+    # against the escape exactly where the escape is the right answer.
+    warn "$ident: re-delivering a row that is graded and awaiting a merge (--force-redeliver, DIVE-4520) — '${_TASK_REDELIVER_FORCE_REASON}'. This stamps a new delivery clock. If ${_mp_dref:-the bound pull request} has NOT merged yet, that costs ${_mp_owner:-the grading seat} its merge standing on it until it re-records its verdict; if it has already merged, the standing is already spent and the new clock is the only effect."
+    return 0
+  fi
+  policy_refuse "$E_CONFLICT" done-redelivers-a-graded-merge DIVE-4520 "$ident" \
+    "$ident is already graded PASS and is waiting on a MERGE, not on another delivery — REFUSED, and nothing was written. On a loop row \`task done\` re-delivers, and a re-delivery stamps a new delivery clock that strips merge standing from '${_mp_owner:-the grading seat}' — the only seat the merge rail accepts on this row (DIVE-4520, measured on DIVE-4491). The verb for this row is \`5dive task merge $ident\`, run by '${_mp_owner:-the seat named in graded_by}'; ${_mp_dref:-the bound pull request} is what it merges. If the work actually CHANGED since that grade, re-point the binding first — \`task deliver $ident --pr=<url>\` — which is a delivery the grade has not seen and is allowed. If you are re-asserting an unchanged pass on purpose, say why and it proceeds (audited): '--force-redeliver=\"<why>\"'. If ${_mp_dref:-that pull request} has ALREADY MERGED, this hand-off is that unchanged re-delivery and the standing it would spend is already spent — so either take the audited escape above, or hand the row over without stamping a delivery clock at all: \`5dive task assign $ident ${_mp_vfier:-the seat in the verifier column}\`, after which that seat's own close finishes the row."
+}
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
@@ -606,6 +682,7 @@ _task_status_cmd() {
         # WOULD have graded, and `5dive trace` can still answer why nobody did.
         warn "$ident: verifier round skipped (DIVE-2719) — the delivered diff touches only tests/docs/changelog, where CI is the gate and a grading round-trip adds latency and no signal. Grader on the row was '$_vfier'; force the review with '5dive task verifier $ident $_vfier' after re-opening if you disagree."
       else
+        _task_done_merge_pending_guard "$id" "$ident"
         _task_route_to_verifier "$id" "$_vfier" "$_asignee" "$result" "$want_result"
         return
       fi
@@ -648,6 +725,12 @@ _task_status_cmd() {
         else
           warn "$ident: graded after all (DIVE-2719) — filed without a verifier, but the delivered diff touches the blast radius (scheduler/task store/credentials/deploy), so it routes to '$_up' instead of closing outright."
         fi
+        # Both forks, not just the measured one: this one upgrades a row that was
+        # filed WITHOUT a verifier, and a row can acquire a grade and a binding
+        # before it acquires one (a hand-run `task verify`, a re-filed row). The
+        # guard is a read and a COUNT(*) — cheap enough that covering the fork
+        # nobody has hit yet is better than arguing it is unreachable.
+        _task_done_merge_pending_guard "$id" "$ident"
         _task_route_to_verifier "$id" "$_up" "$_asignee" "$result" "$want_result"
         return
       fi
