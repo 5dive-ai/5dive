@@ -738,9 +738,21 @@ n=$(sweep_ 'SW_RUN="gr-1-1'$US'DIVE-7'$US'2026-09-14 08:00:00"; SW_PASTGRACE=1; 
 n=$(sweep_ 'SW_RUN="gr-1-1'$US'DIVE-7'$US'2026-09-14 08:00:00"; SW_VERDICT=1')
 [[ "$n" == 1 ]] && grep -qx 'gr-g1-1' <<<"$(rms_)" \
   && ok_ 'S2: a clone whose verdict landed is removed on the next tick' || bad_ 'S2 resolved swept' "swept=$n rm=$(rms_)"
-grep -q "UPDATE runs SET status='ok'" <<<"$(dbw_)" \
+# DIVE-4532: the TOKEN is asserted, not just "an UPDATE happened". `status='ok'`
+# closed the row into a bucket `cmd_run_metrics` does not count, so the sweep
+# settled the record and made it invisible to the fleet's own grading metric at
+# the same time. `completed` is what the four consumers already read.
+#
+# THIS ARM CANNOT BE THE WHOLE GUARD and should not be read as one: it is a
+# string assertion over a db STUB, so it only ever checks the token its author
+# had in mind. tests/grader_clone_run_close_unit.sh runs the same sweep against a
+# real store and asks `run metrics` what it counted.
+grep -q "UPDATE runs SET status='completed', outcome='graded'" <<<"$(dbw_)" \
   && ok_ 'S2: the run record is CLOSED by the sweep, not left asserting running forever' \
   || bad_ 'S2 closes the run record' "$(dbw_)"
+grep -q "ended_at=datetime('now')" <<<"$(dbw_)" \
+  && ok_ 'S2: the close stamps ended_at, so a reaped seat stops printing an open run' \
+  || bad_ 'S2 stamps ended_at' "$(dbw_)"
 grep -q 'SET assignee=verifier' <<<"$(dbw_)" \
   && bad_ 'S2 a graded delivery is not restored to its verifier' "$(dbw_)" \
   || ok_ 'S2: a delivery that WAS graded is not handed back to its verifier'

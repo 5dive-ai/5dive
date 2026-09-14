@@ -744,7 +744,8 @@ _grader_process_spawn() {  # <seat> <ident> <session_id>
 # exactly the failure a self-remove cannot cover, and the sweep covers both.
 #
 # FOUR STATES PER CLONE, and the order is from cheapest to most expensive:
-#   resolved  — its run row has a verdict after it. Remove, close the run `ok`.
+#   resolved  — its run row has a verdict after it. Remove, close the run
+#               `completed` (the token `run metrics` counts — DIVE-4532).
 #   orphan    — no open run row at all (a create that outlived its tick, a run
 #               row already closed). Remove. Nothing to re-queue.
 #   stale     — run row open past `_GRADER_STALE_HOURS`. Remove + re-queue.
@@ -828,7 +829,23 @@ _grader_clone_sweep() {  # [--commit]  -> <number of clones swept>
         # `running (open)` in `run ls` 37 minutes after its process was gone,
         # because the record's liveness was asserted at INSERT and never checked
         # again. The sweep is the check.
-        [[ -n "$rid" ]] && db "UPDATE runs SET status='ok', outcome='graded' WHERE id=$(sqlq "$rid");" >/dev/null 2>&1 || true
+        #
+        # DIVE-4532: `completed`, NOT `ok`. `src/cmd_run.sh`'s bucket list is a
+        # CLOSED vocabulary — settled/completed/abandoned/parked/first_attempt_ok
+        # — and `ok` is in none of it, so a swept clone grade was settled but
+        # counted by nothing: once every grade runs as a clone, `completed` and
+        # `first_attempt_ok` stop counting grades at all. The token is chosen to
+        # match the reader that already exists, rather than widening that reader's
+        # vocabulary to accommodate this one writer. `outcome='graded'` stays: it
+        # is a boundary LABEL like `task_done`, and nothing compares `outcome`
+        # against it.
+        #
+        # `ended_at` is stamped here for the same reason `run_close` stamps it —
+        # without it `run show` prints an open-ended run for a seat that no longer
+        # exists, and the mean-duration metric skips the row entirely.
+        [[ -n "$rid" ]] && db "UPDATE runs SET status='completed', outcome='graded',
+                                      ended_at=datetime('now')
+                                WHERE id=$(sqlq "$rid");" >/dev/null 2>&1 || true
         ;;
       orphan:*) : ;;
       *) _grader_clone_requeue "$clone" "$ridnt" "$rid" ;;
@@ -861,7 +878,12 @@ _grader_clone_requeue() {  # <clone> <ident> <run id>
          AND handoff_delivered_at IS NOT NULL
          AND handoff_ack_at IS NULL
          AND (handoff_rejected_at IS NULL OR handoff_rejected_at < handoff_delivered_at);" >/dev/null 2>&1 || true
-  [[ -n "$rid" ]] && db "UPDATE runs SET status='abandoned', outcome='grader_clone_swept'
+  # DIVE-4532: `ended_at` here for the same reason the resolved branch stamps it
+  # — `abandoned` IS a counted bucket, but a settled run with no end time still
+  # prints open-ended in `run show` and is skipped by the mean-duration metric.
+  # The STATUS is untouched: `abandoned` is DIVE-3932's deliberate distinction.
+  [[ -n "$rid" ]] && db "UPDATE runs SET status='abandoned', outcome='grader_clone_swept',
+                                ended_at=datetime('now')
                           WHERE id=$(sqlq "$rid");" >/dev/null 2>&1 || true
   # A compensating row, not a silent revert — the same reason
   # `_grader_process_unwind` writes one. Without it a delivery that was graded
