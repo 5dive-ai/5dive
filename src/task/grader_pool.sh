@@ -364,12 +364,34 @@ _GRADER_MAX_PER_SEAT="${_GRADER_MAX_PER_SEAT:-1}"
 # lane whose default path depended on a second file would have that harness
 # grading a shape the bundle never runs.
 #
-# The mode ships as `session`, i.e. byte-for-byte today's behaviour. Naming
-# `process` is a THIRD lock, deliberate and separate from naming the pool,
-# because that mode starts a paid one-shot per delivery with no per-seat serial
-# queue in front of it. See grader_process.sh for what it does and what it does
-# not yet do.
-_GRADER_SPAWN_MODE="${_GRADER_SPAWN_MODE:-session}"
+# ── DIVE-4521: THE DEFAULT IS NOW `process`. WHAT THAT COST TO SAY ──
+#
+# It shipped as `session` — byte-for-byte the old behaviour — because naming
+# `process` is a THIRD lock, deliberate and separate from naming the pool: that
+# mode starts a paid ephemeral CLONE SEAT per delivery with no per-seat serial
+# queue in front of it. DIVE-4496 merged the whole create/creds/wake/sweep path
+# to main (17ad9baa) behind this one expansion, so until it flipped the lane was
+# code nothing could reach.
+#
+# The flip is this line and the four preconditions DIVE-4496's PASS signed, all
+# of which are in this diff or beside it:
+#   1. `flock -n` on the `*/5` grader-tick cron line (a create is synchronous
+#      wall time inside the tick; the code bound
+#      `_GRADER_CLONE_MAX_CREATES_PER_TICK` keeps a tick well inside its period,
+#      but the lock is the real control).
+#   2. a NATURALLY-QUEUED delivery graded end-to-end by a clone that is then
+#      reaped — the state this flip newly exposes, and the arm the row is
+#      accepted on.
+#   3. `ghu_` / fine-grained `github_pat_` in the clone-creds refusal alphabet
+#      (grader_process.sh): "cannot appear in those two files today" stops being
+#      a standing fact the moment the lane is live.
+#   4. the lineage guard below — `writer != grader` compares NAMES, and a clone
+#      of the maker passes that check while carrying the maker's inherited blind
+#      spots.
+#
+# Anything unrecognised still reads as `session`, so a typo'd mode degrades to
+# the OLD behaviour rather than to the new default.
+_GRADER_SPAWN_MODE="${_GRADER_SPAWN_MODE:-process}"
 
 # A PREDICATE, not a bare `[[ ]]` at each of the five sites that ask: a mode
 # spelled differently in one of them is a lane that counts processes and then
@@ -380,6 +402,59 @@ _grader_process_mode() { [[ "$_GRADER_SPAWN_MODE" == "process" ]]; }
 # `session` — a typo'd mode must degrade to today's behaviour, and the plan must
 # say which behaviour it degraded to rather than printing the typo back.
 _grader_spawn_mode() { _grader_process_mode && printf 'process' || printf 'session'; }
+
+# ══ DIVE-4521 (precondition 4, live case DIVE-4514): SAME-ORIGIN IS NOT A GRADE ══
+#
+# `writer != grader` (DIVE-474/477) compares agent NAMES. Contamination comes
+# from where a seat STARTED, not from what its directives say today, and the
+# registry has no lineage field — so `main` -> `main2`, a clone seeded from
+# main's own directives, is invisible to that guard BY CONSTRUCTION. The board
+# cannot refuse what it cannot represent.
+# community/wiki/the-writer-not-grader-guard-is-lineage-blind-a-clone-can-grade-its-origins-maker.md
+#
+# Two changes made that STANDING rather than incidental: DIVE-4410 spreads
+# spawns across pool seats on purpose, and this row's flip makes every grader a
+# clone. So the refusal has to be representable here, in the dispatcher, instead
+# of relying on a clone recognising itself and declining by hand — which is what
+# actually happened on DIVE-4514 and is not a control.
+#
+# THREE SOURCES, CHEAPEST FIRST, and the order is the whole design:
+#   1. `_GRADER_SEAT_ORIGINS` — an operator map (`"main2=main"`), because the
+#      pre-existing pool clones were minted before anything recorded lineage and
+#      no amount of reading can recover it. It sits on the cron line beside
+#      `_GRADER_POOL` for the same reason that does: it is fleet shape, not code.
+#   2. the clone's own NAME, which THIS lane mints (`gr-quinn-1` -> `quinn`).
+#      Derived with pure string ops and the prefix defaulted locally, never by
+#      calling into grader_process.sh: `tests/grader_tick_unit.sh` sources this
+#      file ALONE and a cross-file call here would grade a half-built lane.
+#   3. the registry's `origin` field, which `_grader_clone_create` now writes for
+#      every clone it mints (grader_process.sh) — the lineage field the wiki page
+#      asks for, populated where this lane is the one that knows the answer.
+# An agent none of the three can place is its OWN origin, which fails toward
+# spawning rather than toward a lane that refuses every seat it cannot explain.
+_GRADER_SEAT_ORIGINS="${_GRADER_SEAT_ORIGINS:-}"
+_grader_seat_origin() {  # <agent> -> the agent this one descends from
+  local a="${1:-}" pair pfx="${_GRADER_CLONE_PREFIX:-gr-}" o=""
+  [[ -n "$a" ]] || return 1
+  for pair in $_GRADER_SEAT_ORIGINS; do
+    [[ "$pair" == "${a}="* && -n "${pair#*=}" ]] && { printf '%s' "${pair#*=}"; return 0; }
+  done
+  if [[ "$a" == "${pfx}"* ]]; then
+    o="${a#"$pfx"}"
+    [[ "$o" == *-* ]] && { printf '%s' "${o%-*}"; return 0; }
+  fi
+  if [[ -r "${REGISTRY:-}" ]]; then
+    o=$(jq -r --arg n "$a" '.agents[$n].origin // empty' "$REGISTRY" 2>/dev/null || printf '')
+  fi
+  printf '%s' "${o:-$a}"
+}
+
+# Same-origin, not same-name. Two unnamed seats are not a collision (an unknown
+# maker must not refuse the whole pool), which is why both names are required.
+_grader_same_origin() {  # <seat> <maker>
+  [[ -n "${1:-}" && -n "${2:-}" ]] || return 1
+  [[ "$(_grader_seat_origin "$1")" == "$(_grader_seat_origin "$2")" ]]
+}
 
 # ══ DIVE-4496: HOW MANY CLONES ONE TICK MAY CREATE ══
 #
@@ -890,8 +965,13 @@ $(_grader_inflight_exits_sql)
     # fresh session IS how that seat grades. Skipping those would strand every
     # pinned row on this box. So the skip fires only where the two genuinely
     # disagree — a pin naming somebody the pool cannot spawn.
-    local _gp_rm=""
+    local _gp_rm="" _gp_maker=""
     [[ -n "$_gp_id" ]] && _gp_rm=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${_gp_id};" 2>/dev/null || printf '')
+    # DIVE-4521: the maker, for the lineage gate in the seat pick below. Read
+    # HERE with the other per-row columns rather than inside the pool loop — the
+    # loop runs once per pool seat and a DB round trip per seat to re-read one
+    # unchanging column is a cost with no answer attached.
+    [[ -n "$_gp_id" ]] && _gp_maker=$(db "SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${_gp_id};" 2>/dev/null || printf '')
     if [[ "$_gp_rm" == seat:* ]]; then
       local _gp_pin="${_gp_rm#seat:}" _gp_in_pool=0 _gp_s
       for _gp_s in $_GRADER_POOL; do [[ "$_gp_s" == "$_gp_pin" ]] && { _gp_in_pool=1; break; }; done
@@ -923,7 +1003,7 @@ $(_grader_inflight_exits_sql)
     # first one. The three gates are independent and are applied in cost order:
     # per-seat load (free, already read), then the account floor, then the
     # credential probe (a sudo + a GitHub read).
-    local seat="" chosen="" why="" busy="" pairs="" loadstr=""
+    local seat="" chosen="" why="" busy="" pairs="" loadstr="" samelin=""
     # The busy note is built over the WHOLE pool, not accumulated as the pick
     # loop walks it: the loop stops at the first admitted seat, so a seat that
     # was skipped for being busy is often never visited at all and the line
@@ -932,6 +1012,14 @@ $(_grader_inflight_exits_sql)
       pairs+="${seat}=${_gp_load[$seat]:-0}"$'\n'
       loadstr+="${loadstr:+ }${seat}=${_gp_load[$seat]:-0}"
       (( ${_gp_load[$seat]:-0} >= _gp_seatcap )) && busy+="${seat} busy:${_gp_load[$seat]:-0}; "
+      # DIVE-4521: same-origin refusals are collected over the WHOLE pool here
+      # for the reason the busy note is — `why` is REPLACED by the admitted
+      # seat's verdict on the pick, so a lineage refusal recorded inside that
+      # loop vanishes from the very line that reports the spawn it caused. A
+      # grade routed away from the maker's own lineage must SAY so on the spawn
+      # line; otherwise the only trace of the guard working is the absence of a
+      # seat name nobody was looking for.
+      _grader_same_origin "$seat" "$_gp_maker" && samelin+="${seat} same-origin:${_gp_maker}; "
     done
     local order; order=$(printf '%s' "$pairs" | _grader_pool_order "$_gp_last")
     for seat in $order; do
@@ -939,6 +1027,16 @@ $(_grader_inflight_exits_sql)
       # assign+wake on a live seat and a seat runs one session at a time, so a
       # second grade here is a queue, not a parallel grader.
       (( ${_gp_load[$seat]:-0} < _gp_seatcap )) || continue
+      # DIVE-4521 / DIVE-4514: LINEAGE BEFORE THE METER. A same-origin seat is
+      # refused whatever its headroom, and it is checked first because it is a
+      # string comparison — spending a usage read and a GitHub probe on a seat
+      # that can never be admitted is the cost this ordering exists to avoid.
+      # The CLONE inherits the pool seat's origin (it is minted from it), so
+      # guarding the seat guards the clone the spawn below would create.
+      if _grader_same_origin "$seat" "$_gp_maker"; then
+        why="${why}${seat}: same origin as maker ${_gp_maker} ($(_grader_seat_origin "$seat")) — a clone cannot grade its origin's work; "
+        continue
+      fi
       local acct; acct=$(printf '%s' "$usage" | _grader_account_of "$seat")
       # `|| rc=$?`, NOT `; rc=$?`, and the difference is the whole refusal half
       # of this lane. `_grader_window_ok` is dual-channel BY DESIGN — verdict on
@@ -986,7 +1084,7 @@ $(_grader_inflight_exits_sql)
     # DIVE-4417 (6): the live process count per tick, on the spawn line, beside
     # the mode that produced it — the one number that says whether the lane is
     # actually running graders in parallel or is a queue reporting spawn=N.
-    plan+="spawn   $ident  -> $chosen  (in-flight ${loadstr}; ${busy}${why}mode=$(_grader_spawn_mode) clones=${n_procs})"$'\n'
+    plan+="spawn   $ident  -> $chosen  (in-flight ${loadstr}; ${busy}${samelin}${why}mode=$(_grader_spawn_mode) clones=${n_procs})"$'\n'
     if _grader_process_mode; then n_procs=$((n_procs+1)); fi
     if (( commit )); then
       # THE ONLY LINE THAT STARTS ANYTHING, and it records the intent to the

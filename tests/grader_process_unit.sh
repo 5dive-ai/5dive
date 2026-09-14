@@ -55,6 +55,13 @@ db(){ case "$*" in
         # forever cannot tell "the row is still pending" from "the row left
         # pending permanently" — which is exactly the defect quinn found.
         *grade.requested*)              pending_now_ ;;
+        # DIVE-4521: the row's id and its MAKER, both modelled so the lineage
+        # gate below can be graded. Empty by default, which is what every arm
+        # above was already reading out of the `*)` catch-all — so a default-off
+        # fixture keeps those arms byte-identical and the gate cannot silently
+        # start refusing seats in tests that never mention lineage.
+        *"SELECT id FROM tasks WHERE ident"*) printf '%s\n' "$TASKID" ;;
+        *maker_agent*)                  printf '%s\n' "$MAKER" ;;
         *"GROUP BY seat"*)              printf '%s\n' "$SEATLOADS" ;;
         *"ORDER BY s.id DESC LIMIT 1"*) printf '%s\n' "$LASTPICK" ;;
         *COUNT*)                        printf '%s\n' "$INFLIGHT" ;;
@@ -67,6 +74,8 @@ fail(){ shift; printf 'FAILCALL %s\n' "$*" >&2; return 1; }
 warn(){ printf '%s\n' "$*" >> "$WARNF"; }
 task_actor(){ printf 'sys'; }
 
+TASKID=""
+MAKER=""
 USAGE='{"agents":[{"account":"mark","name":"g1","fiveHourPct":10,"sevenDayPct":20},
                   {"account":"mark","name":"g2","fiveHourPct":10,"sevenDayPct":20}]}'
 usage_cmd(){ printf '%s' "$USAGE"; }
@@ -145,7 +154,14 @@ _GRADER_POOL="g1 g2"
 # in the BUDGET arms at the end.
 _GRADER_CLONE_MAX_CREATES_PER_TICK=99
 
-# ── A. THE MODE IS DARK BY DEFAULT, graded on the SHIPPED default ────────────
+# ── A. THE MODE IS LIVE BY DEFAULT (DIVE-4521), graded on the SHIPPED default ─
+#
+# INVERTED, and deliberately in place rather than deleted: this arm was the
+# dark-ship lock ("the shipped mode is session, --commit launches no process"),
+# and the flip's only real risk is that the default is not what the bundle
+# actually ships. So the SAME arm now asserts the opposite three facts, and the
+# explicit-session control below keeps the old path covered — a flip that
+# deleted its own guard would leave the default graded by nothing.
 #
 # Assigns NOTHING. It unsets the variable, re-sources the file so the default
 # expansion actually runs, re-applies every stub in the same order the header
@@ -178,20 +194,55 @@ _GRADER_CLONE_PRUNE_CMD='return 0'
   : > "$PROCF"; : > "$SESSF"
   cmd_task_grader_tick --cap=5 --commit --json 2>/dev/null
 )
-[[ "$(jget "$defout" mode)" == session ]] \
-  && ok_ 'A: the shipped _GRADER_SPAWN_MODE is session (nothing assigned it)' \
-  || bad_ 'shipped mode is session' "$defout"
-[[ ! -s "$PROCF" ]] \
-  && ok_ 'A: --commit on the shipped default launches no grader PROCESS' \
-  || bad_ 'shipped default launches no process' "$(procs_)"
-[[ -s "$SESSF" ]] \
-  && ok_ 'A: --commit on the shipped default still wakes a SESSION (unchanged)' \
-  || bad_ 'shipped default still wakes a session' "$(sess_)"
-# The per-seat bound must not move with the mode flag alone: 1 is correct for a
-# serial seat and a lane that raised it in session mode would be stacking wakes,
-# which is precisely the DIVE-4410 defect wearing this row's name.
-[[ "$(jget "$defout" seatCap)" == 1 ]] \
-  && ok_ 'A: session mode keeps the per-seat cap at 1' || bad_ 'session seatcap 1' "$defout"
+[[ "$(jget "$defout" mode)" == process ]] \
+  && ok_ 'A: the shipped _GRADER_SPAWN_MODE is process (nothing assigned it)' \
+  || bad_ 'shipped mode is process' "$defout"
+[[ -s "$PROCF" ]] \
+  && ok_ 'A: --commit on the shipped default LAUNCHES a grader clone process' \
+  || bad_ 'shipped default launches a process' "$(procs_)"
+[[ ! -s "$SESSF" ]] \
+  && ok_ 'A: --commit on the shipped default wakes NO session (the old path is off)' \
+  || bad_ 'shipped default wakes no session' "$(sess_)"
+# The per-seat bound moves WITH the mode and only with it: a serial seat must
+# stay at 1 (DIVE-4410 — a second wake on a live seat is a queue, not a grader),
+# and a lane of separate clone seats is the only thing that may exceed it.
+[[ "$(jget "$defout" seatCap)" == 4 ]] \
+  && ok_ 'A: the shipped default carries the PROCESS per-seat cap' || bad_ 'shipped seatcap 4' "$defout"
+
+# ── A2. THE EXPLICIT SESSION CONTROL, in its own subshell ────────────────────
+#
+# The arm the flip would otherwise have deleted. `_GRADER_SPAWN_MODE=session`
+# must still reach the session primitive and NOTHING in the clone machinery, and
+# it must still report the serial per-seat cap — a flip is only reversible if the
+# behaviour it flipped away from is still graded.
+sessout=$(
+  # shellcheck source=/dev/null
+  source src/task/grader_pool.sh
+  # shellcheck source=/dev/null
+  source src/task/grader_process.sh
+  _GRADER_SPAWN_MODE=session
+  _GRADER_POOL="g1 g2"
+  _GRADER_USAGE_CMD=usage_cmd
+  _GRADER_READ_PROBE=probe_ok
+  _GRADER_CLONE_LS_CMD='cat "$PSF"'
+  _GRADER_CLONE_PRUNE_CMD='return 0'
+  _grader_spawn_session(){ printf '%s\n' "$1:$2" >> "$SESSF"; return 0; }
+  _grader_process_spawn(){ printf '%s\n' "$1:$2:$3" >> "$PROCF"; return 0; }
+  : > "$PROCF"; : > "$SESSF"
+  # SPAWNF outlives a tick on purpose (it models the pending query's
+  # "excludes any ident with a later task.grade.spawned"), and arm A above just
+  # spawned into it — so without this reset the pending set A2 reads is EMPTY and
+  # a session lane that woke nothing would pass for the right reason.
+  : > "$SPAWNF"
+  cmd_task_grader_tick --cap=5 --commit --json 2>/dev/null
+)
+[[ "$(jget "$sessout" mode)" == session ]] \
+  && ok_ 'A2: an explicit session mode still reads as session' || bad_ 'A2 explicit session mode' "$sessout"
+[[ -s "$SESSF" && ! -s "$PROCF" ]] \
+  && ok_ 'A2: explicit session mode wakes a SESSION and launches no clone' \
+  || bad_ 'A2 session path intact' "$(sess_)/$(procs_)"
+[[ "$(jget "$sessout" seatCap)" == 1 ]] \
+  && ok_ 'A2: explicit session mode keeps the per-seat cap at 1' || bad_ 'A2 session seatcap 1' "$sessout"
 
 _GRADER_SPAWN_MODE=process
 
@@ -522,7 +573,21 @@ grep -q 'REFUSED to copy' <<<"$(warns_)" \
   && ok_ 'CREDS: the refusal says why, naming the token class' || bad_ 'CREDS refusal is explained' "$(warns_)"
 # THE POSITIVE CONTROL. Without it, a `return 1` at the top of the function passes
 # the arm above and the lane never copies a credential at all.
+# DIVE-4521 (precondition 3): the two shapes the alphabet did NOT cover. Each is
+# graded on its own so a half-widened pattern cannot pass on the other's arm.
 sed -i '/ghp_/d' "$credhome/agent-g1/.config/5dive/gh-read-tokens.env"
+for _tok in 'GH_TOKEN=ghu_averyrealusertoservertoken' 'GH_TOKEN=github_pat_11ABCDEFG0aVeryFineGrained'; do
+  printf '%s\n' "$_tok" >> "$credhome/agent-g1/.config/5dive/gh-read-tokens.env"
+  credrc=0
+  ( _GRADER_HOME_ROOT="$credhome"
+    _GRADER_CLONE_CREDS_CMD=''
+    _GRADER_CLONE_CRED_FILES='.config/5dive/gh-read-tokens.env'
+    _grader_clone_creds gr-g1-1 g1 ) >/dev/null 2>&1 || credrc=$?
+  [[ "$credrc" == 4 ]] \
+    && ok_ "CREDS: a write-capable ${_tok%%=*}=${_tok#*=} token REFUSES the copy (rc=4)" \
+    || bad_ "CREDS ${_tok#*=} is refused" "rc=$credrc"
+  sed -i "\|${_tok#*=}|d" "$credhome/agent-g1/.config/5dive/gh-read-tokens.env"
+done
 : > "$WARNF"
 ( _GRADER_HOME_ROOT="$credhome"; _GRADER_CLONE_CREDS_CMD=''
   _GRADER_CLONE_CRED_FILES='.config/5dive/gh-read-tokens.env'
@@ -790,6 +855,86 @@ grep -q "clone-create budget of 1 is spent" <<<"$bout" \
 ( _GRADER_CLONE_MAX_CREATES_PER_TICK=abc; [[ "$(_grader_clone_create_budget)" == 1 ]] ) \
   && ok_ 'BUDGET: a garbage budget degrades to 1, never to 0' || bad_ 'BUDGET garbage' ''
 _GRADER_CLONE_MAX_CREATES_PER_TICK=99
+
+# ── LINEAGE: A SAME-ORIGIN SEAT IS REFUSED (DIVE-4521, live case DIVE-4514) ──
+#
+# `writer != grader` compares NAMES, so `main2` grading `main`'s delivery passes
+# it while carrying main's inherited blind spots. The gate is graded on the
+# DISPATCHER because that is where it has to hold: the manual seat-level
+# self-refusal that saved DIVE-4514 is a person noticing, not a control.
+_GRADER_CLONE_MAX_CREATES_PER_TICK=99
+PENDING="DIVE-1"
+# The row id has to be REAL for these arms (the maker column is read behind it),
+# which brings the verification-policy check at the top of the loop into play —
+# that one reads the box's config and declines a row on a `verify=never` box. It
+# is not what these arms grade, so it is stubbed to the granting answer.
+_task_verify_grants(){ return 0; }
+TASKID=42
+
+# The three origin sources, each on its own arm.
+[[ "$(_grader_seat_origin gr-quinn-3)" == quinn ]] \
+  && ok_ 'LINEAGE: a clone this lane minted carries its origin in its NAME' \
+  || bad_ 'LINEAGE clone name origin' "$(_grader_seat_origin gr-quinn-3)"
+( _GRADER_SEAT_ORIGINS="main2=main"; [[ "$(_grader_seat_origin main2)" == main ]] ) \
+  && ok_ 'LINEAGE: the operator map places a pool clone minted before lineage existed' \
+  || bad_ 'LINEAGE operator map' ''
+[[ "$(_grader_seat_origin quinn)" == quinn ]] \
+  && ok_ 'LINEAGE: an agent nothing can place is its own origin (fails toward spawning)' \
+  || bad_ 'LINEAGE unplaceable is itself' "$(_grader_seat_origin quinn)"
+( _GRADER_SEAT_ORIGINS="main2=main"; _grader_same_origin main2 main ) \
+  && ok_ 'LINEAGE: a clone and its origin are same-origin under two different names' \
+  || bad_ 'LINEAGE same-origin across names' ''
+_grader_same_origin "" main \
+  && bad_ 'LINEAGE an unnamed maker is not a collision' '' \
+  || ok_ 'LINEAGE: an unnamed maker collides with nothing (an unknown maker must not refuse the pool)'
+
+# THE DISPATCHER ARM. g1 is the maker's own origin, g2 is independent: the pick
+# must land on g2 whatever the round-robin cursor would otherwise have said.
+: > "$PSF"; INFLIGHT=0; SEATLOADS=""; LASTPICK=g2
+MAKER=g1
+lout=$( _GRADER_SEAT_ORIGINS="g1=g1 g2=g2" run --cap=4 --commit )
+grep -qE 'spawn   DIVE-1  -> g2' <<<"$lout" \
+  && ok_ 'LINEAGE: the tick routes past the same-origin seat to the independent one' \
+  || bad_ 'LINEAGE routes to independent seat' "$lout"
+grep -q "g1 same-origin:g1" <<<"$lout" \
+  && ok_ 'LINEAGE: the SPAWN line names the seat the lineage guard refused' \
+  || bad_ 'LINEAGE refusal named on the spawn line' "$lout"
+grep -q "same origin as maker main2" <<<"$loutq_seen" 2>/dev/null || true
+
+# AND THE WHOLE POOL SAME-ORIGIN IS A QUEUE, NOT A GRADE. The failure this
+# guards is a lane that, having refused every seat, grades anyway on the last one.
+: > "$PSF"; INFLIGHT=0; SEATLOADS=""
+MAKER=main2
+loutq=$( _GRADER_SEAT_ORIGINS="g1=main g2=main main2=main" run --cap=4 --commit )
+[[ ! -s "$PROCF" ]] \
+  && ok_ 'LINEAGE: an all-same-origin pool launches NOTHING (it queues)' \
+  || bad_ 'LINEAGE all same-origin queues' "$(procs_)"
+grep -qE 'queue   DIVE-1' <<<"$loutq" \
+  && ok_ 'LINEAGE: and says so as a queue line' || bad_ 'LINEAGE queue line' "$loutq"
+# CONTROL: same fixture, lineage map removed => it spawns. Without this the two
+# arms above would pass on any lane that simply refused to spawn at all.
+: > "$PSF"; INFLIGHT=0; SEATLOADS=""
+loutc=$( run --cap=4 --commit )
+[[ -s "$PROCF" ]] \
+  && ok_ 'LINEAGE control: with no lineage to read, the same delivery DOES spawn' \
+  || bad_ 'LINEAGE control spawns' "$loutc"
+MAKER=""; TASKID=""; LASTPICK=""
+
+# ── THE LINEAGE FIELD IS WRITTEN AT CREATE (what the registry cannot infer) ──
+REGF="$TMPD/agents.json"
+printf '{"agents":{"gr-g1-1":{"type":"claude"}}}\n' > "$REGF"
+registry_write(){ cat > "$REGF.new"; mv "$REGF.new" "$REGF"; }
+( REGISTRY="$REGF"; _GRADER_CLONE_ORIGIN_CMD=''; _grader_clone_record_origin gr-g1-1 g1 ) >/dev/null 2>&1
+[[ "$(jq -r '.agents["gr-g1-1"].origin' "$REGF")" == g1 ]] \
+  && ok_ 'ORIGIN: a created clone records origin=<pool seat> in the registry' \
+  || bad_ 'ORIGIN recorded' "$(cat "$REGF")"
+# A NON-FATAL FAILURE, because the seat can grade without the annotation and the
+# dispatcher reads the same fact out of the name.
+orc=0
+( REGISTRY="$TMPD/nope/agents.json"; _GRADER_CLONE_ORIGIN_CMD=''
+  _grader_clone_record_origin gr-g1-1 g1 ) >/dev/null 2>&1 || orc=$?
+[[ "$orc" == 0 ]] \
+  && ok_ 'ORIGIN: an unwritable registry warns and does NOT fail the create' || bad_ 'ORIGIN non-fatal' "rc=$orc"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
