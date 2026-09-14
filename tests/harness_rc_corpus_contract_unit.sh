@@ -623,11 +623,17 @@ d=\$(mktemp -d); trap 'rm -rf \"\$d\"' EXIT
 echo 'note: this harness explains the HARNESS-RC contract to the reader'
 echo body")"
 
-# The same spoof text with NO second trap: the marker really is emitted, so the
-# anchor must not red it. Without this, anchoring could be satisfied by a detector
-# that simply reds anything mentioning the marker.
-_mut_negative "a COMPLIANT harness that also prints the word HARNESS-RC in its output" \
+# The control the anchor actually needs, and the shape matters: it must be a
+# CANDIDATE that reaches the oracle. A file with no second `trap ... EXIT` never
+# gets that far -- _rc_verdict returns 4 (not a candidate) and the oracle is never
+# consulted -- so a spoof-text fixture WITHOUT a trap proves nothing about
+# anchoring. This one carries a CORRECT (subshell) second trap, so it is graded by
+# the oracle, AND it prints the marker's name in its own output. Anchoring must
+# leave it clean: the risk anchoring introduces is redding a file whose real marker
+# the anchor fails to match, not redding one that merely says the word.
+_mut_negative "a COMPLIANT candidate that also prints the word HARNESS-RC in its output" \
   "$(_mut_write clean_spoof_unit.sh "$MUT_HEAD
+( d=\$(mktemp -d); trap 'rm -rf \"\$d\"' EXIT; echo inner )
 echo 'note: this harness explains the HARNESS-RC contract to the reader'
 echo body")"
 
