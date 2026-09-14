@@ -269,5 +269,145 @@ grep -q '^- \[atom-001' "$BIG/MEMORY.md" \
   && ok_t "the cut index's first entry starts its own line" \
   || bad_t "the cut index's first entry starts its own line" "$(sed -n '8,10p' "$BIG/MEMORY.md")"
 
+# ================= 7. RAW STAGING TAKES THE STORE, NOT ITS SUBDIRS ===========
+# The rollout_summaries/ exclusion is a DECISION (per-session transcript
+# summaries carrying rollout paths and thread ids), and until now it was carried
+# by a `-maxdepth 1` and a comment. A comment is not a grade: widening the walk
+# to -maxdepth 2 ships 65 of those files inside a raw codex export and every
+# other arm stays green.
+RAWSTAGE="$TMP/rawstage"
+rawcounts=$(_pack_raw_memory "$STORE" "$RAWSTAGE")
+eq_t "raw staging takes the three top-level codex documents" "${rawcounts%% *}" "3"
+if [[ -e "$RAWSTAGE/2026-09-07.md" ]] || grep -rqs 'a per-session transcript summary' "$RAWSTAGE"; then
+  bad_t "raw staging EXCLUDES rollout_summaries/" "a rollout summary was staged into the pack"
+else
+  ok_t "raw staging EXCLUDES rollout_summaries/"
+fi
+
+# ============ 8. THE MANIFEST WRITER: the field the landing turns on =========
+# cmd_import routes CONVERT-vs-copy off includes.memoryShape. Nothing graded it,
+# so a mutant flipping the writer's "codex-docs" to "atoms" reinstated the exact
+# failure this change exists to prevent — a 143 KB MEMORY.md cp'd into a claude
+# memory dir, tail dropped with no error — and left every arm green.
+#
+# Graded through the REAL seal path (--approve-memory skips the draft phase's
+# writes under /home/agent-*), so what is read back is the manifest cmd_export
+# actually wrote, not a string in the source.
+require_root()        { :; }
+require_agent()       { :; }
+_pack_agent_config()  { printf '{"type":"codex"}\n'; }
+_pack_skill_refs()    { printf '[]\n'; }
+_agent_to_persona()   { return 1; }
+
+# A clean approve dir shaped like a codex store (the seal copies it verbatim
+# under --memory=raw); kept free of the fixture's credential-shaped marks so the
+# arm grades the manifest and not the tripwire.
+APPROVE_DOCS="$TMP/approve-docs"; mkdir -p "$APPROVE_DOCS"
+printf '# Task Group: a\n\n## Reusable knowledge\n\n- a fact\n' > "$APPROVE_DOCS/MEMORY.md"
+printf '## User Profile\n\nworks in one repo\n'                 > "$APPROVE_DOCS/memory_summary.md"
+
+seal_shape() { # <agent> <mode> <approve-dir> -> echoes manifest includes.memoryShape
+  local ag="$1" mode="$2" dir="$3"
+  local out="$TMP/shape-$ag-$mode.tar.gz" x="$TMP/xs-$ag-$mode"
+  cmd_export "$ag" --memory="$mode" --audience=self --approve-memory="$dir" -o "$out" \
+    >"$TMP/shape-$ag-$mode.out" 2>&1
+  mkdir -p "$x"
+  tar -xzf "$out" -C "$x" 2>/dev/null || return 1
+  jq -r '.includes.memoryShape' "$x/manifest.json" 2>/dev/null
+}
+
+got=$(seal_shape cx raw "$APPROVE_DOCS")
+eq_t "a RAW export from a codex seat declares memoryShape=codex-docs" "$got" "codex-docs"
+# THE CONTROL, and it is the half that stops "label everything codex-docs" from
+# passing: the same flags on a claude seat must still say atoms, or every legacy
+# pack would be routed through a conversion it does not need.
+got=$(seal_shape cl raw "$APPROVE_DOCS")
+eq_t "control: a RAW export from a claude seat still declares memoryShape=atoms" "$got" "atoms"
+# Distilled from a codex seat is ALREADY atoms — the draft converted it — so the
+# shape is a property of the staged bytes, not of the source harness.
+got=$(seal_shape cx distilled "$DRAFT")
+eq_t "a DISTILLED codex export declares memoryShape=atoms (the bytes are atoms)" "$got" "atoms"
+# An old pack carries no field at all; the importer must read that as atoms
+# rather than as "unknown", or every pack written before this change stops
+# landing.
+NOFIELD="$TMP/nofield"; mkdir -p "$NOFIELD"
+echo '{"packFormat":1,"includes":{"memory":"distilled","persona":false}}' > "$NOFIELD/manifest.json"
+eq_t "a pack with no memoryShape field reads as atoms" "$(_pack_manifest_memory_shape "$NOFIELD")" "atoms"
+NULLF="$TMP/nullf"; mkdir -p "$NULLF"
+echo '{"includes":{"memory":false,"memoryShape":null}}' > "$NULLF/manifest.json"
+eq_t "an explicit null memoryShape reads as atoms" "$(_pack_manifest_memory_shape "$NULLF")" "atoms"
+
+# =============== 9. THE IMPORT SIDE ROUTES ON THAT FIELD =====================
+# This is the consumer of arm 8. It grades the branch, not the converter: the
+# converter was already graded above by direct call, and a direct call is
+# exactly what a mutant in the ROUTING leaves untouched.
+SEED_IN="$TMP/seed-in"; mkdir -p "$SEED_IN"
+cp "$STORE/MEMORY.md" "$STORE/memory_summary.md" "$STORE/raw_memories.md" "$SEED_IN/"
+SEED_OUT="$TMP/seed-out"
+packed=$(_pack_seed_claude_memory "$SEED_IN" "$SEED_OUT" codex-docs)
+atoms=$(find "$SEED_OUT" -maxdepth 1 -type f -name '*.md' ! -name MEMORY.md | wc -l)
+# NOT `>1` alone — three staged documents copied verbatim also leave two files
+# beside the index, so a count-only arm passes on the exact regression this
+# grades. What separates convert from copy is that every landed file is an ATOM:
+# frontmatter with a name and a type. A codex document has neither.
+notatoms=0
+for f in "$SEED_OUT"/*.md; do
+  [[ "$(basename "$f")" == "MEMORY.md" ]] && continue
+  head -1 "$f" | grep -qx -- '---' && grep -q '^name: ' "$f" && grep -q '^  type: ' "$f" || notatoms=$((notatoms+1))
+done
+[[ "$atoms" -gt 3 && "$notatoms" -eq 0 ]] \
+  && ok_t "a codex-docs pack lands as MANY frontmattered atoms on a claude seat ($atoms)" \
+  || bad_t "a codex-docs pack lands as MANY frontmattered atoms on a claude seat" \
+           "got $atoms file(s) beside the index, $notatoms of them not atoms (3 documents were staged)"
+[[ -f "$SEED_OUT/MEMORY.md" ]] \
+  && ok_t "a codex-docs landing regenerates an index" \
+  || bad_t "a codex-docs landing regenerates an index" "no MEMORY.md written"
+seed_idx=$(wc -c < "$SEED_OUT/MEMORY.md")
+[[ "$seed_idx" -le "$_PACK_INDEX_BUDGET" ]] \
+  && ok_t "the landed index is inside the always-loaded budget ($seed_idx <= $_PACK_INDEX_BUDGET B)" \
+  || bad_t "the landed index is inside the always-loaded budget" "$seed_idx B"
+# The failure mode in one assertion: the source MEMORY.md must NOT be sitting in
+# the seat's memory dir verbatim. On the real store that file is 143 KB and the
+# loader drops its tail with no error, so "present" reads as success and is not.
+if grep -qs '^# Task Group: usage accounting for codex seats' "$SEED_OUT/MEMORY.md"; then
+  bad_t "the codex MEMORY.md is NOT copied through verbatim" "the store's own index landed as the seat's index"
+else
+  ok_t "the codex MEMORY.md is NOT copied through verbatim"
+fi
+eq_t "the landing reports the atoms it wrote, plus its index" "$packed" "$(( atoms + 1 ))"
+
+# THE CONTROL for arm 9: atoms in, atoms out, byte-for-byte — a claude-sourced
+# pack must not be dragged through the codex conversion.
+ATOM_IN="$TMP/atom-in"; mkdir -p "$ATOM_IN"
+printf -- '---\nname: a-fact\ndescription: d\nmetadata:\n  type: reference\n---\n\nUNTOUCHED body\n' > "$ATOM_IN/a-fact.md"
+printf '# Memory Index\n- [a-fact](a-fact.md) — d\n' > "$ATOM_IN/MEMORY.md"
+ATOM_OUT="$TMP/atom-out"
+packed2=$(_pack_seed_claude_memory "$ATOM_IN" "$ATOM_OUT" atoms)
+eq_t "control: an atoms pack copies verbatim, count unchanged" "$packed2" "2"
+if cmp -s "$ATOM_IN/a-fact.md" "$ATOM_OUT/a-fact.md" && cmp -s "$ATOM_IN/MEMORY.md" "$ATOM_OUT/MEMORY.md"; then
+  ok_t "control: an atoms pack's files are byte-identical after landing"
+else
+  bad_t "control: an atoms pack's files are byte-identical after landing" "the conversion branch ran on claude-shaped memory"
+fi
+
+# ============ 10. a present-but-empty MEMORY.md does not kill the export =====
+# `grep -c` prints 0 AND exits 1 on a file with no matches, so the old
+# `$(grep -c … || echo 0)` yielded TWO zeros and the arithmetic around it died
+# with "syntax error in expression". The seat this bites is a real one: a codex
+# store whose MEMORY.md has not accumulated a task group yet.
+EMPTYTG="$TMP/empty-tg"; mkdir -p "$EMPTYTG"
+printf '## Reusable knowledge\n\n- a fact with no task-group heading\n' > "$EMPTYTG/MEMORY.md"
+_pack_memory_kind() { printf 'codex\n'; }
+_pack_memory_dir()  { printf '%s\n' "$EMPTYTG"; }
+# The draft phase's ONE write outside the pack. Point it at the fixture: this
+# harness is run as root by the pre-push rail, and the un-stubbed path would
+# create /home/agent-cx on a real host.
+_pack_draft_dir()   { printf '%s\n' "$TMP/draft-phase"; }
+out=$(cmd_export cx --memory=distilled --audience=self 2>&1); rc=$?
+case "$out" in
+  *"syntax error in expression"*) bad_t "a zero-task-group codex MEMORY.md does not crash the draft" "$out" ;;
+  *)                              ok_t  "a zero-task-group codex MEMORY.md does not crash the draft" ;;
+esac
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1

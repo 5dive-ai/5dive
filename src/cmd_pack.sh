@@ -1694,6 +1694,54 @@ _pack_memory_dir() {
 #
 # Returns "<kept> <0>" to match _pack_scope_memory's contract; nothing is ever
 # excluded here, and the second field exists so callers stay uniform.
+# DIVE-4541: the DISCRIMINATOR the whole cross-harness landing turns on. It is
+# read off the pack rather than guessed from the target, because the question is
+# "what shape are these bytes", not "what does this seat want" — and a pack
+# written before the field existed carries atoms, which is what every writer
+# before now produced.
+# Where the DRAFT phase writes the reviewable memory dir. A resolver rather than
+# an inline path for the same reason as _pack_memory_path: it is the one write
+# the draft phase makes outside the pack, so a harness that drives cmd_export
+# has to be able to point it somewhere that is not a real seat's home.
+_pack_draft_dir() {   # _pack_draft_dir <agent-name>
+  printf '/home/agent-%s/.claude/pack-staging/memory-draft\n' "$1"
+}
+
+_pack_manifest_memory_shape() {   # _pack_manifest_memory_shape <stage>
+  local stage="$1" sh
+  sh=$(jq -r '.includes.memoryShape // "atoms"' "$stage/manifest.json" 2>/dev/null || echo atoms)
+  [[ -n "$sh" && "$sh" != "null" ]] || sh="atoms"
+  printf '%s\n' "$sh"
+}
+
+# DIVE-4541: seed a CLAUDE seat's memory dir from a pack's staged memory, routed
+# on the shape of the staged bytes. Extracted from cmd_import so the routing is
+# executable without a seat: it is the branch that decides CONVERT vs verbatim
+# copy, and a mutant that collapses it reinstates exactly the failure this change
+# exists to prevent (a 143 KB codex MEMORY.md dropped into a claude memory dir,
+# tail silently cut past the loader limit — DIVE-3821). Echoes the number of
+# facts it intended to land.
+_pack_seed_claude_memory() {   # _pack_seed_claude_memory <stage-memory-dir> <memdir> <shape>
+  local smem="$1" mdir="$2" shape="$3" packed conv
+  mkdir -p "$mdir"
+  if [[ "$shape" == "codex-docs" ]]; then
+    # CONVERT, never copy. The codex store is three whole documents; this seat's
+    # store is one atom per fact plus an INDEX. A verbatim copy would put a
+    # 143 KB MEMORY.md where the loader has a limit it exceeds silently, so the
+    # facts would be present and not loaded — the worst of the two failures,
+    # because it reads as success.
+    conv=$(_pack_codex_to_atoms "$smem" "$mdir" all)
+    _pack_atoms_index "$mdir" "Memory Index (imported from a codex store)"
+    # +1 is the regenerated index, which the caller's `landed` counts as a file
+    # too; the ratio it prints is a landing check, not an arithmetic claim.
+    printf '%s\n' "$(( conv + 1 ))"
+    return 0
+  fi
+  packed=$(find "$smem" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
+  cp "$smem"/*.md "$mdir/" 2>/dev/null || true
+  printf '%s\n' "$packed"
+}
+
 _pack_raw_memory() {
   local memdir="$1" outdir="$2" kept=0 f base
   mkdir -p "$outdir"
@@ -2159,7 +2207,7 @@ cmd_export() {
         fi
         fail "$E_NOT_FOUND" "agent '$name' has no persona memory to export (looked in the $mem_kind store)"
       fi
-      local draft="/home/agent-${name}/.claude/pack-staging/memory-draft"
+      local draft; draft=$(_pack_draft_dir "$name")
       rm -rf "$draft"; mkdir -p "$draft"
       local counts kept excluded
       if [[ "$memory_mode" == "raw" ]]; then
@@ -2175,7 +2223,11 @@ cmd_export() {
         local ck cx
         ck=$(_pack_codex_to_atoms "$memdir" "$draft" knowledge)
         _pack_atoms_index "$draft" "Memory Index (distilled from a codex store)"
-        cx=$(( $(grep -c '^# Task Group:' "$memdir/MEMORY.md" 2>/dev/null || echo 0) - ck ))
+        # `grep -c` prints 0 AND exits 1 when a present file has no matches, so
+        # a `|| echo 0` appends a SECOND zero and the arithmetic below dies with
+        # "syntax error in expression" under set -e. Take the first line only.
+        local cxall; cxall=$(grep -c '^# Task Group:' "$memdir/MEMORY.md" 2>/dev/null | head -1)
+        cx=$(( ${cxall:-0} - ck ))
         (( cx < 0 )) && cx=0
         counts="$ck $cx"
       else
@@ -3021,8 +3073,7 @@ cmd_import() {
   # DIVE-4541: what shape are the staged bytes, and what shape does this seat
   # want? A pack written before this field exists carries atoms — that is what
   # every writer before now produced.
-  local mem_shape_in; mem_shape_in=$(jq -r '.includes.memoryShape // "atoms"' "$stage/manifest.json" 2>/dev/null || echo atoms)
-  [[ -n "$mem_shape_in" && "$mem_shape_in" != "null" ]] || mem_shape_in="atoms"
+  local mem_shape_in; mem_shape_in=$(_pack_manifest_memory_shape "$stage")
   # A codex TARGET keeps memory in ~/.codex/memories, not under .claude/projects
   # — seeding it there would report a landing nothing on that seat can read.
   if [[ "$mem_inc" != "false" && -d "$stage/memory" && "$type" == "codex" ]]; then
@@ -3048,23 +3099,11 @@ cmd_import() {
       local slug mdir packed landed
       slug=$(printf '%s' "$eff_workdir" | sed 's#/#-#g')
       mdir="$cdir/projects/${slug}/memory"
-      packed=$(find "$stage/memory" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
       install -d -o "agent-${as}" -g "agent-${as}" "$mdir" 2>/dev/null || true
-      if [[ "$mem_shape_in" == "codex-docs" ]]; then
-        # DIVE-4541: CONVERT, never copy. The codex store is three whole
-        # documents; this seat's store is one atom per fact plus an INDEX. A
-        # verbatim copy would put a 143 KB MEMORY.md where the loader has a
-        # limit it exceeds silently (DIVE-3821), so the facts would be present
-        # and not loaded — the worst of the two failures, because it reads as
-        # success.
-        local conv; conv=$(_pack_codex_to_atoms "$stage/memory" "$mdir" all)
-        _pack_atoms_index "$mdir" "Memory Index (imported from a codex store)"
-        # +1 is the regenerated index, which `landed` counts as a file too; the
-        # ratio below is a landing check, not an arithmetic claim about facts.
-        packed=$(( conv + 1 ))
-      else
-        cp "$stage"/memory/*.md "$mdir/" 2>/dev/null || true
-      fi
+      # DIVE-4541: the shape of the staged bytes decides convert-vs-copy, and
+      # that routing lives in _pack_seed_claude_memory so it is gradeable
+      # without a seat.
+      packed=$(_pack_seed_claude_memory "$stage/memory" "$mdir" "$mem_shape_in")
       chown -R "agent-${as}:agent-${as}" "$cdir/projects" 2>/dev/null || true
       landed=$(find "$mdir" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
       # DIVE-3881 (fix B): COUNT what landed instead of assuming the cp worked.
