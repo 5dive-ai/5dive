@@ -251,35 +251,41 @@ eq_t  "E1: an imperative ask still FILES (rc 0)" "$RC" "0"
 has_t "E1b: ... and is warned about the missing question" "$OUT" "states an instruction rather than asking a question"
 
 # ============ F. the gate the PRODUCT files must pass its own rule ==========
-# `task reject` at the iteration cap files a --type=manual gate that parks the
-# stuck loop on the paired human. That ask is written by delivery.sh, not by a
-# filer, and nothing else grades it — so when it carried the row's ident and the
-# verifier's raw feedback it was refused by this very rule, which made `reject`
-# itself fail at the cap (caught in CI on this branch, not in review). The arm
-# reads the SHIPPED string out of the source rather than restating it, so a later
-# edit that reintroduces machine vocabulary reds here instead of in production.
-ESC_ASK=$(grep -A1 'cmd_task_need "\$id" --type=manual --from=' "$SRC/task/delivery.sh" \
-          | sed -n 's/.*--ask="\(.*\)"$/\1/p')
+# `task reject` at the iteration cap files the gate that parks a stopped
+# maker->verifier loop. That ask is written by delivery.sh, not by a filer, and
+# nothing else grades it — so when it carried the row's ident and the verifier's
+# raw feedback it was refused by this very rule, which made `reject` itself fail
+# at the cap (caught in CI on that branch, not in review).
+#
+# DIVE-4476 replaced the literal with a COMPOSER that builds the ask from the
+# row's own title, so the arm can no longer read the shipped string out of the
+# source: it calls the composer and grades what it returns. That is strictly
+# stronger — the old arm graded a constant, this one grades every title the
+# board can produce. The composer's own degradation contract (a title that
+# cannot be made readable is dropped rather than passed through, so the gate is
+# unconditionally fileable) is graded in tests/escalation_ask_unit.sh; here it
+# stays as the control that the RULE and the PRODUCT still agree.
+declare -F _task_escalation_ask >/dev/null 2>&1 \
+  && ok_t "F0: the escalation ask composer was located (or arm F proves nothing)" \
+  || bad_t "F0: _task_escalation_ask not reachable" "the call shape moved; arm F is vacuous"
+# A hostile title on purpose — an ident, a path and a sha are exactly the shapes
+# this rule refuses, and they arrive through the title slot, not the prose.
+seed ESC-1 "DIVE-4176 src/task/need.sh regressed the ask at head e131860"
+ESC_ASK=$(_task_escalation_ask "$(db "SELECT id FROM tasks WHERE ident='ESC-1';")" 2 \
+          "❌ quinn rejected (iteration 2): FINDING: CI is red on core-pristine at head 777e23a9 / FIX: re-run tests/gate_ask_readability_unit.sh")
 [[ -n "$ESC_ASK" ]] \
-  && ok_t "F0: the escalation ask was located in delivery.sh (or arm F proves nothing)" \
-  || bad_t "F0: escalation ask not found in delivery.sh" "grep found nothing — the call shape moved"
-# Substitute the call site's live variables with REALISTIC values — an ident, a
-# count, a cap, a verifier's raw feedback — because the jargon this rule refuses
-# arrives through exactly those slots, not through the prose around them. Any $
-# left after this means a new slot appeared that the arm is not filling, and the
-# arm must red rather than grade a half-expanded string.
-ESC_ASK="${ESC_ASK//\$\{iter\}/3}"
-ESC_ASK="${ESC_ASK//\$\{maxi\}/3}"
-ESC_ASK="${ESC_ASK//\$ident/DIVE-4176}"
-ESC_ASK="${ESC_ASK//\$\{ident\}/DIVE-4176}"
-ESC_ASK="${ESC_ASK//\$\{feedback:-none\}/CI is red on core-pristine at head 777e23a9, see tests/gate_ask_readability_unit.sh}"
-[[ "$ESC_ASK" != *'$'* ]] \
-  && ok_t "F0b: every shell expansion in it was substituted (no \$… left half-graded)" \
-  || bad_t "F0b: unsubstituted expansion left in the escalation ask" "ask='$ESC_ASK'"
-seed ESC-1
-file_gate ESC-1 --type=manual --ask="$ESC_ASK" --tier=2
+  && ok_t "F0b: the composer returned an ask (an empty one would file and grade nothing)" \
+  || bad_t "F0b: the composer returned nothing" "ask=''"
+# Filed at the type's own default tier (1) with the harness's no-lead stub in
+# force: that is the DIVE-4431 path, and it is precisely the condition in which
+# the escalation reaches the paired human. Pinning --tier=2 would grade a
+# different gate than the one the product files.
+file_gate ESC-1 --type=decision --ask="$ESC_ASK" \
+  --options="$_ESCALATION_OPTIONS"
 eq_t "F1: the iteration-cap escalation gate the product files is READABLE (rc 0)" "$RC" "0"
-eq_t "F2: ... and it really was filed, not swallowed" "$(field ESC-1 need_type)" "manual"
+eq_t "F2: ... and it really was filed, not swallowed" "$(field ESC-1 need_type)" "decision"
+eq_t "F3: ... and its BUTTONS pass the same rule (they are read by the same person)" \
+     "$(field ESC-1 need_options)" "keep going — the lead takes it over|drop it"
 
 
 # ============ G. DIVE-4431 — THE TIER-1 GATE NOBODY BUT THE HUMAN READS =====
