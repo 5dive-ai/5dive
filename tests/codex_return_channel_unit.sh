@@ -162,14 +162,12 @@ rm -f "$REGISTRY"
 assert_bad_registry "missing"
 printf '%s' '{"agents":{"broken"' >"$REGISTRY"
 assert_bad_registry "malformed"
-printf '%s\n' '{"agents":{}}' >"$REGISTRY"
-/usr/bin/chmod 000 "$REGISTRY"
-if [[ ! -r "$REGISTRY" ]]; then
-  assert_bad_registry "unreadable"
-else
-  echo "SKIP: unreadable registry arm (test user can still read mode 000)"
-fi
-/usr/bin/chmod 600 "$REGISTRY"
+# Exercise registry_read_checked's documented unreadable outcome directly so
+# this arm remains live even when the harness itself runs as root.
+real_registry_read_checked=$(declare -f registry_read_checked)
+registry_read_checked() { return 4; }
+assert_bad_registry "unreadable"
+eval "$real_registry_read_checked"
 
 # The installed-upgrade path actually invokes the primitive after bundle swap.
 check "installer wires upgrade sync"    'grep -q "agent _sync_codex_baseline" install.sh'
