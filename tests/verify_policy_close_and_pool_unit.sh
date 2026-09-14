@@ -26,6 +26,19 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   source "$SRC/$f"
 done
 source "$SRC/task/grader_pool.sh"
+# DIVE-4521: PINNED TO THE SESSION SHAPE, and it has to be said here because the
+# line above is why. This suite sources `grader_pool.sh` WITHOUT
+# `grader_process.sh`, which was exact while the shipped mode was `session` (the
+# tick reached none of that file). The flip makes `process` the default, so an
+# unpinned source would have the 4322 cap arms below calling `_grader_load_source`
+# into a file that is not loaded. The cap and in-flight SQL those arms grade are
+# mode-independent; the process/clone shape is graded by
+# `tests/grader_process_unit.sh`, which sources both files in bundle order.
+# The default MODE is deliberately not asserted here — asserting it in a file
+# that cannot load the machinery it selects is how a flip reads green while the
+# lane is broken.
+# community/wiki/flipping-a-dark-ship-default-inverts-the-lock-arm-it-does-not-delete-it.md
+_GRADER_SPAWN_MODE=session
 
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 BOX_CONFIG="$TMP/box.json"; JSON_MODE=0
