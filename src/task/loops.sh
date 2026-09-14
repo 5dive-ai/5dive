@@ -811,9 +811,33 @@ cmd_task_verify() {
           # Auto-mergeable at the graded sha. The MERGE itself is not done here —
           # it belongs to `task done`, where the DIVE-1830 gate can re-derive that
           # it landed and DIVE-2656 can compare what landed against what was
-          # graded. Recording it as this seat's own name is what turns the board
-          # line into an instruction the grader can act on immediately.
-          _md_owner=$(task_actor ""); _md_why="auto-mergeable at the graded sha — run \`5dive task done ${ident}\`"
+          # graded. Recording the GRADER's name is what turns the board line into
+          # an instruction that seat can act on immediately.
+          # THE SEAT NAMED HERE MUST BE THE SEAT THE RAIL ACCEPTS, AND IT IS NOT
+          # ALWAYS THIS ONE (DIVE-4512). `_task_merge_preflight` keys on
+          # `graded_by == actor`, and `graded_by` is COALESCE-frozen at the FIRST
+          # grade by the write directly above. Stamping the CURRENT actor agrees
+          # with that only while a row is graded ONCE. Graded twice — the default
+          # shape of a maker->verifier loop, where a temp grader session records
+          # the PASS and the loop's verifier then ACKs it — the two fields cannot
+          # agree, and the board prints `run \`5dive task done\`` at a seat the rail
+          # refuses BY NAME. `task done` is no escape either: _merge_at_close_do
+          # routes the close through the same disposition and reprints the same
+          # refusal, so the row has no self-service exit at all. Measured on
+          # DIVE-4491 / 5dive-ai/5dive#963: green, clean, 21/21 checks, graded PASS
+          # twice, refused to both graded seats.
+          #
+          # READ THE FROZEN COLUMN, do not widen the rail. The alternative fix —
+          # letting any seat that recorded a PASS use the rail — moves DIVE-3474's
+          # standing invariant, and that is a separate decision. This one only
+          # makes the board name the seat the invariant already blesses.
+          #
+          # The fallback is the old expression and covers exactly one shape: a
+          # tree where the write above did not land a graded_by (a row graded
+          # before the column existed, re-graded here). Never a bare set.
+          _md_owner=$(db "SELECT COALESCE(NULLIF(graded_by,''),'') FROM tasks WHERE id=${id};")
+          [[ -n "$_md_owner" ]] || _md_owner=$(task_actor "")
+          _md_why="auto-mergeable at the graded sha — run \`5dive task done ${ident}\`"
         else
           _md_owner="${_md_disp#hold:}"; _md_why="${_md_owner#*:}"; _md_owner="${_md_owner%%:*}"
           # `maker` is a ROLE in the disposition's vocabulary, resolved to a seat
