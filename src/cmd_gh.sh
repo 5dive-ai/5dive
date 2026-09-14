@@ -241,6 +241,111 @@ _gh_reviewer_allowed() {
 # config read and this predicate renders it as "you hold no credential".
 _gh_caller_credential() { GH_CONFIG_DIR="$(gh_config_dir)" gh auth token >/dev/null 2>&1; }
 
+# ---------------------------------------------------------------------------
+# DIVE-4494 — THE READ RAIL IS OWNER-AWARE ON ONE SIDE OF THE HOUSE ONLY.
+#
+# `gh` holds ONE token per host, and on this fleet `hosts.yml` carries the
+# 5dive-ai installation's. Against a PERSONAL-account repo (`lodar/5dive-api`,
+# `lodar/5dive-frontend` — most of what we ship) that token is LIVE AND BLIND:
+# it authenticates, and answers `GraphQL: Could not resolve to a Repository`.
+#
+# The answer is already on the seat. `/usr/local/sbin/verifier-gh-read-token.sh`
+# mints one read-only App installation token PER INSTALLATION into
+# `~/.config/5dive/gh-read-tokens.env` as `GH_READ_TOKEN_<OWNER>`, and DIVE-3888
+# taught the MERGE GATE to open that file (`_gate_gh`'s escalation). `cmd_gh`
+# never learned: two rails, one blind. Measured 2026-09-14 in
+# /var/log/5dive-grader.log — the DIVE-4417 parallel grader lane probes a seat
+# with `5dive gh pr view <ref> --json state`, so every lodar/* delivery queued as
+# "has headroom but cannot read the delivery ref" while a 5dive-ai/* delivery on
+# the same tick spawned. The lane worked; the READ did not.
+#
+# So this reuses DIVE-3888's helpers verbatim (`_gate_owner_from_args`,
+# `_gate_owner_read_token`, `_gate_gh_blind_err`) rather than growing a second
+# token lookup — one file, one transform, one place to be wrong.
+#
+# THE CONTRACT, and it is DIVE-3888's, because the safety argument is the same:
+#  * READ CLASS ONLY. The token is scoped `contents:read metadata:read
+#    pull_requests:read` (DIVE-3888 recorded the 403-on-PATCH positive control),
+#    so it cannot carry a write or an admin call, and offering it one would only
+#    convert a clear refusal into a 403.
+#  * ONLY AFTER A CALL THAT FAILED BLIND. No query that answers today changes
+#    path, and no successful call spends an extra request.
+#  * CHOSEN BY OWNER, from the repo the query itself names. It can never be
+#    pointed at a repo it was not minted for, and an argv that names no owner
+#    yields nothing and the old behaviour stands.
+#  * FAILS CLOSED. If the file, the variable or the retry is missing, the
+#    caller gets the ORIGINAL status and the ORIGINAL stderr, byte for byte.
+# It can only convert an unanswered read into an answered one.
+# ---------------------------------------------------------------------------
+
+# _gh_owner_read_token <class> <gh args...> — 0 when this seat holds a read-only
+# token for the owner this call names, publishing it in `_GH_OWNER_READ_TOK`.
+#
+# IT RETURNS THE TOKEN IN A VARIABLE, NOT ON STDOUT, and that is deliberate: the
+# credential posture in this file is that a token is never printed and never
+# reaches argv (DIVE-1460/2448), and `tests/gh_actor_routing_unit.sh` pins it by
+# grepping this source for a print of a token. A helper that answered on stdout
+# would have made that guard report a leak on a line that was fine — and widening
+# a guard to admit your own change is how the next real leak gets through.
+_GH_OWNER_READ_TOK=""
+_gh_owner_read_token() {
+  local class="${1:-}"; shift
+  _GH_OWNER_READ_TOK=""
+  [[ "$class" == "read" ]] || return 1
+  local own cur
+  own="$(_gate_owner_from_args "$@" 2>/dev/null || printf '')"
+  [[ -n "$own" ]] || return 1
+  _GH_OWNER_READ_TOK="$(_gate_owner_read_token "$own" 2>/dev/null)" || { _GH_OWNER_READ_TOK=""; return 1; }
+  [[ -n "$_GH_OWNER_READ_TOK" ]] || return 1
+  # Retrying with the credential that just said "cannot see" buys nothing and
+  # would make the retry note a lie about which rail answered.
+  cur="$(GH_CONFIG_DIR="$(gh_config_dir)" gh auth token 2>/dev/null || printf '')"
+  if [[ -n "$cur" && "$_GH_OWNER_READ_TOK" == "$cur" ]]; then _GH_OWNER_READ_TOK=""; return 1; fi
+  return 0
+}
+
+# _gh_run_as_caller <class> <gh args...> — run gh on the caller's own credential,
+# with the DIVE-4494 owner-scoped read retry behind it. Returns gh's status.
+#
+# STDERR IS CAPTURED ONLY ON THE CANDIDATE PATH. Deciding "is this stderr the
+# blind one" means reading it, and reading it means not streaming it — which
+# would reorder the output of every ordinary `5dive gh` call for a retry that
+# almost never applies. So the token is resolved first, and a call with nothing
+# to retry with runs exactly as it always has: streamed, untouched.
+_gh_run_as_caller() {
+  local class="${1:-}"; shift
+  local rc=0
+  if ! _gh_owner_read_token "$class" "$@"; then
+    gh "$@" || rc=$?
+    return "$rc"
+  fi
+
+  local errf; errf="${TMPDIR:-/tmp}/.5dive-gh-caller-err.$$"
+  : >"$errf" 2>/dev/null || true
+  gh "$@" 2>"$errf" || rc=$?
+  if (( rc != 0 )) && _gate_gh_blind_err "$errf"; then
+    local own; own="$(_gate_owner_from_args "$@" 2>/dev/null || printf '')"
+    # The SAME transform the minting script uses (`5dive-ai` -> 5DIVE_AI), so the
+    # variable this message names is the variable that was actually read.
+    local ovar; ovar="GH_READ_TOKEN_$(printf '%s' "$own" | tr 'a-z-' 'A-Z_')"
+    local blind; blind="$(head -n1 "$errf" 2>/dev/null || printf '')"
+    local rrc=0
+    # The primary call failed, so it printed nothing on stdout (gh emits a --json
+    # payload only after a successful request) and the retry's output cannot be
+    # appended to a partial one — the same reason _gate_gh streams its primary.
+    GH_TOKEN="$_GH_OWNER_READ_TOK" GH_CONFIG_DIR="$(gh_config_dir)" gh "$@" || rrc=$?
+    if (( rrc == 0 )); then
+      echo "[5dive gh] your own credential cannot see this repository (${blind}) — answered instead with this seat's read-only token for '${own}' (${ovar}, minted by root, read-only: DIVE-3888/DIVE-4494)." >&2
+      rm -f "$errf" 2>/dev/null || true
+      return 0
+    fi
+    echo "[5dive gh] your own credential cannot see this repository, and this seat's read-only token for '${own}' could not answer either (gh exit ${rrc})." >&2
+  fi
+  cat "$errf" >&2 2>/dev/null || true
+  rm -f "$errf" 2>/dev/null || true
+  return "$rc"
+}
+
 # _gh_child_exit <rc> — a non-zero from the WRAPPED gh is gh's failure, not ours.
 #
 # DIVE-3135: without this the silent-exit backstop (lib/output.sh) fires and
@@ -363,7 +468,7 @@ cmd_gh() {
 
   local rc=0
   if [[ "$actor" == "caller" ]]; then
-    gh "$@" || rc=$?
+    _gh_run_as_caller "$class" "$@" || rc=$?
     _gh_child_exit "$rc" "$@"
     return "$rc"
   fi
