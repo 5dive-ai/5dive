@@ -60,6 +60,17 @@
 # picks up E6 now, so the sha comparison is graded through the read as well as
 # from a fixture.
 #
+# DIVE-4512 adds section C's arm C8 — the shape none of the above could see,
+# because every earlier arm grades a row ONCE. Its mutants, driven by hand the
+# same way:
+#   M9   loops.sh `_md_owner=$(db "SELECT ...graded_by...")` restored to the bare
+#        `_md_owner=$(task_actor "")`              killed 3 arms (C8d, C8e, C8f)
+#   M10  the empty-graded_by fallback line deleted killed 1 arm  (C8h)
+#   M11  the read points at `maker_agent` instead
+#        of `graded_by`                            killed 7 arms (C1a, C1b, C8b,
+#                                                  C8d, C8e, C8f, C8h)
+# M9 is the defect DIVE-4512 exists to fix, stated as a mutant.
+#
 # Run: bash tests/task_merge_disposition_unit.sh   (no root, no network).
 set -uo pipefail
 
@@ -414,6 +425,50 @@ db "UPDATE tasks SET graded_at=datetime('now'), graded_by='quinn', graded_verdic
        merge_owner=NULL, merge_hold_reason=NULL WHERE id=${c8};"
 eq "C7  a NULL merge_owner still renders the pre-DIVE-4137 maker" \
    "graded->merge:dev" "$(board "$c8")"
+
+# --- C8: A ROW GRADED TWICE (DIVE-4512). THE ARM THIS SECTION WAS MISSING.
+#
+# Every arm above grades once, so `graded_by` and the current actor are the same
+# seat and the skew cannot show. The default shape on this board grades TWICE: a
+# temp grader session records the first PASS, the loop's own verifier then ACKs
+# it. `graded_by` is COALESCE-frozen at the FIRST grader; `_task_merge_preflight`
+# keys the rail on `graded_by == actor`. So if this stamp names the CURRENT actor,
+# the board hands a "run `5dive task done`" instruction to a seat the rail refuses
+# BY NAME — and `_merge_at_close_do` reprints that same refusal, leaving the row
+# with no self-service exit. Measured on DIVE-4491 / 5dive-ai/5dive#963.
+#
+# THE ASSERTION IS BEHAVIOURAL, not a field comparison: the arm asks the SHIPPED
+# standing predicate whether the seat the board just named can actually run the
+# rail. A stamp that names the wrong seat cannot pass it.
+DISP_ANSWER="merge"
+c9=$(mkrow "graded by a temp session, then ACKed by the loop verifier")
+HARNESS_ACTOR=main2 grade_prose "$c9"      # first grade — a DIFFERENT seat
+eq "C8a the first grader is frozen into graded_by" "main2" "$(col "$c9" graded_by)"
+eq "C8b ...and owns the merge after one grade"     "main2" "$(col "$c9" merge_owner)"
+grade_prose "$c9"                          # second grade — quinn, the loop's ACK
+eq "C8c a re-grade does NOT repaint graded_by (provenance is frozen)"    "main2" "$(col "$c9" graded_by)"
+eq "C8d ...so the merge owner must STAY the seat the rail accepts, not the ACKer"    "main2" "$(col "$c9" merge_owner)"
+eq "C8e ...and the board renders it" "graded->merge:main2" "$(board "$c9")"
+# The behavioural half: the seat the board named holds standing over the SHIPPED
+# predicate, and the seat a bare `task_actor ""` would have named does not.
+_c9id=$(db "SELECT ident FROM tasks WHERE id=${c9};")
+_stands() { db "SELECT COUNT(*) FROM tasks WHERE ident=$(sqlq "$_c9id") AND $(_task_merge_standing_sql "$1");"; }
+eq "C8f the seat the board names can actually run the rail" "1" "$(_stands "$(col "$c9" merge_owner)")"
+eq "C8g negative control: the ACKing seat holds no standing (the refusal DIVE-4512 measured)" \
+   "0" "$(_stands quinn)"
+
+# --- C8h: THE FALLBACK IS NOT DEAD CODE, so it gets a fixture rather than a
+# comment. A row whose `graded_by` is present but EMPTY has no frozen grader to
+# read; without the fallback that empty read falls through to the UPDATE's own
+# `${_md_owner:-main}` default and silently routes the row to `main` — a seat that
+# never graded it and that the rail refuses just as firmly. It must degrade to the
+# pre-DIVE-4512 behaviour (the grading seat) instead.
+DISP_ANSWER="merge"
+c10=$(mkrow "no frozen grader to read")
+db "UPDATE tasks SET graded_by='' WHERE id=${c10};"
+grade_prose "$c10"
+eq "C8h an EMPTY graded_by falls back to the grading seat, never to 'main'" \
+   "quinn" "$(col "$c10" merge_owner)"
 
 # ===================================================================
 # D. THE MERGE ITSELF, at `task done`.
