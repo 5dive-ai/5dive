@@ -1553,6 +1553,64 @@ _plugin_setup_runner() {
   fi
 }
 
+
+# DIVE-4491: a setup step whose program is not on this box must be REFUSED here,
+# not relayed as a shell's `command not found`.
+#
+# `voice` ships `fivedive.setup.command = "sudo 5dive-setup-voice"` and nothing
+# on the box installs `5dive-setup-voice` — not the plugin's own cache (it holds
+# only bin/ and .claude-plugin/), not install.sh. Pressing "Run setup" on the
+# dashboard therefore reached a shell, and the panel rendered what the shell
+# said: `sudo: 5dive-setup-voice: command not found`, exit 1. Legible to someone
+# who can open a terminal, and the population this button exists for is the one
+# that cannot ("users on dashboard who dont go to terminal ever", lodar,
+# 2026-09-13). A missing host prerequisite is OUR refusal to make, in our words,
+# before anything runs.
+#
+# The predicate is "which program would this line actually exec", and the first
+# WORD is not it: both shipped setup commands begin with `sudo`, which is always
+# present, so a naive first-word check passes exactly the case that broke. So:
+# drop leading `VAR=val` assignments and a leading `sudo` with its flags, and
+# report the word after them.
+#
+# Conservative by construction — it prints NOTHING (meaning "run it, do not
+# refuse") whenever it cannot be sure: a metacharacter in the program word, a
+# line that starts with a subshell, an empty line. Under-refusing costs the old
+# behaviour for that plugin; over-refusing would block a setup step that works.
+# Pure and argv-only so the arms can grade the decision without a box.
+_plugin_setup_program() {
+  local line="$1" tok; local -a words=()
+  read -r -a words <<<"$line" || true
+  while (( ${#words[@]} )); do
+    tok="${words[0]}"; words=("${words[@]:1}")
+    case "$tok" in
+      # `FOO=bar cmd` — an assignment prefix is not the program.
+      [A-Za-z_]*=*) continue ;;
+      sudo|/usr/bin/sudo|/bin/sudo)
+        # sudo's own flags, and the values of those that take one. Anything we
+        # do not recognise as a flag is the program.
+        while (( ${#words[@]} )); do
+          case "${words[0]}" in
+            -[ugpCTR])    words=("${words[@]:2}") ;;
+            --user=*|--group=*|--prompt=*) words=("${words[@]:1}") ;;
+            --user|--group|--prompt) words=("${words[@]:2}") ;;
+            --)           words=("${words[@]:1}"); break ;;
+            -*)           words=("${words[@]:1}") ;;
+            *)            break ;;
+          esac
+        done
+        continue ;;
+      *) ;;
+    esac
+    # A word carrying shell syntax is not a program name we can look up.
+    case "$tok" in
+      ''|*[\|\&\;\<\>\(\)\$\`\"\'\*\?\[\]\{\}\~\!\#]*|*=*) return 0 ;;
+    esac
+    printf '%s\n' "$tok"
+    return 0
+  done
+}
+
 # ---- `plugin setup`: the box-level half, run on purpose (DIVE-4467) --------
 #
 # `plugin add` PRINTS `fivedive.setup.command` and deliberately does not run it
@@ -1620,6 +1678,18 @@ cmd_plugin_setup() {
   local plugin review
   plugin=$(jq -r --arg k "$key" '.[$k].plugin' <<<"$j")
   review=$(jq -r --arg k "$key" '.[$k].review // "unreviewed"' <<<"$j")
+
+  # DIVE-4491: refuse a setup step whose program this box does not have, BEFORE
+  # the consent block and before anything is run, so the dashboard panel reads a
+  # 5dive sentence instead of a shell's `command not found`. Looked up in our own
+  # (root) environment, whose PATH is a superset of the caller's — so "not here"
+  # is a fact about the box, not about the seat.
+  local setup_prog setup_pub
+  setup_pub=$(jq -r '.fivedive.trust.publisher // ""' <<<"$mj"); [[ -n "$setup_pub" ]] || setup_pub="$plugin"
+  setup_prog=$(_plugin_setup_program "$setup_cmd")
+  if [[ -n "$setup_prog" ]] && ! command -v "$setup_prog" >/dev/null 2>&1; then
+    fail "$E_NOT_FOUND" "'$key' needs '$setup_prog' to set itself up and this box does not have it — the publisher's setup step ($setup_cmd) is not installed here, so nothing was run. This is the plugin's gap, not yours: ask its publisher ($setup_pub) for a version that ships its own installer."
+  fi
 
   # The seat this box-half belongs to. Resolved HERE, in the process sudo has
   # not yet rewritten (see _plugin_setup_runner) — one process later it is gone.
