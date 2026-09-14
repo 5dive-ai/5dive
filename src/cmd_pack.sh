@@ -1504,7 +1504,14 @@ _pack_codex_split() {   # _pack_codex_split <file> <outdir> <kind> <mode>
   case "$kind" in
     taskgroups) splitre='^# Task Group:' ; type=reference ; prefix=codex-tg ;;
     profile)    splitre='^## '           ; type=user      ; prefix=codex-profile ;;
-    threads)    splitre='^## Thread '    ; type=reference ; prefix=codex-thread ;;
+    # raw_memories.md is the merged stage-1 text codex has NOT reviewed into
+    # knowledge. It travels (raw is the operator's own backup) but it must not
+    # travel typed `reference`: the export allowlist is {reference,project}, so
+    # a thread atom landing inside it is text the NEXT distilled export of the
+    # destination seat publishes. Same repair as a task group's private half —
+    # `user` is the honest read of an unreviewed per-session trail, and raw
+    # still carries everything, correctly typed.
+    threads)    splitre='^## Thread '    ; type=user      ; prefix=codex-thread ;;
     *) return 1 ;;
   esac
   mkdir -p "$out"
@@ -1554,15 +1561,23 @@ _pack_codex_split() {   # _pack_codex_split <file> <outdir> <kind> <mode>
       printf("---\nname: %s\ndescription: \"%s\"\nmetadata:\n  type: %s\n  source: codex/%s\n---\n\n%s%s", nm, esc(d), ty, SRC, head, bdy) > f
       close(f)
     }
-    function flush(   ty) {
+    function flush(   ty, dsc) {
       if (title == "") return
       ty = TYPE
+      dsc = ""
       # memory_summary.md mixes the two private classes: the profile and the
       # stated preferences are `user`, everything else there is `feedback`
       # (how to work with them). Both are excluded by a distilled export, which
       # is why this file never reaches knowledge mode at all.
       if (KIND == "profile") ty = (title ~ /^User /) ? "user" : "feedback"
-      emit(title, body, ty, "", "")
+      # A thread atom is described by its section TITLE, never by its first
+      # line. `description:` is copied into MEMORY.md, and MEMORY.md is ALWAYS
+      # loaded — so firstprose over unreviewed text puts that text in the one
+      # file no reader opts into. The title (`Thread <id>`) says nothing the
+      # atom filename does not already say. NOTE: no apostrophes in here, the
+      # awk program is a single-quoted bash string.
+      if (KIND == "threads") dsc = title
+      emit(title, body, ty, "", dsc)
       # ONE codex task group carries BOTH classes. The private half — the
       # stated preferences and the per-task rollout/thread ids — lands as its
       # OWN atom typed `user`, never folded into the `reference` atom: the

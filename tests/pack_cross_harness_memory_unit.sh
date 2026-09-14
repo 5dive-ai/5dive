@@ -257,7 +257,7 @@ REEXPORT="$TMP/reexport"
 recounts=$(_pack_scope_memory "$FULL" "$REEXPORT")
 re_all="$(cat "$REEXPORT"/*.md 2>/dev/null)"
 leaked=""
-for mark in SECRETPREF PROFILEMARK TIPMARK; do
+for mark in SECRETPREF PROFILEMARK TIPMARK RAWMARK; do
   case "$re_all" in *"$mark"*) leaked="$leaked $mark" ;; esac
 done
 [[ -z "$leaked" ]] \
@@ -529,6 +529,69 @@ else
   ok_t "a distilled export of the seat it landed on withholds it (kept/excluded: $leadcounts)"
 fi
 eq_t "that export still publishes the task group's knowledge" "${leadcounts%% *}" "1"
+
+# ====== 12. THE THIRD PRODUCER: raw_memories.md is not `reference` either ====
+# The same property as section 11, at the producer nobody enumerated. A codex
+# store has THREE documents and the repair covered two: memory_summary.md is
+# typed private as a whole, a task group's private half is split out — and
+# raw_memories.md, 234 KB of unreviewed stage-1 text on the real seat, still
+# went in as `reference`. knowledge mode never reads it, which is why the
+# export path looked clean; mode=all on the IMPORT path converts it, and then
+# the allowlist reads `reference` and publishes it.
+#
+# Graded on the ALREADY-LANDED seat from arm 9 (SEED_OUT), because that is the
+# product path: a codex-docs pack seeded onto a claude seat.
+th=$(grep -l 'RAWMARK' "$SEED_OUT"/codex-thread-*.md 2>/dev/null | head -1)
+if [[ -z "$th" ]]; then
+  bad_t "raw_memories.md lands as codex-thread atoms" "no codex-thread atom carries RAWMARK"
+else
+  ok_t "raw_memories.md lands as codex-thread atoms"
+  # NOT `== user` alone: what the arm must protect is membership of the
+  # allowlist, so assert the property the allowlist actually tests.
+  thty=$(awk '/^  type: /{print $2; exit}' "$th")
+  case "$thty" in
+    reference|project) bad_t "an unreviewed thread atom is typed OUTSIDE the {reference,project} allowlist" "typed $thty" ;;
+    "")                bad_t "an unreviewed thread atom is typed OUTSIDE the {reference,project} allowlist" "no metadata.type at all" ;;
+    *)                 ok_t  "an unreviewed thread atom is typed OUTSIDE the {reference,project} allowlist (typed $thty)" ;;
+  esac
+  # The description invariant, at this producer. firstprose over unreviewed
+  # text is how the raw line reaches `description:` — and description: is
+  # copied into MEMORY.md, which is loaded whether or not anyone searches.
+  thd=$(awk -F'description: ' '/^description: /{print $2; exit}' "$th")
+  case "$thd" in
+    *RAWMARK*) bad_t "a thread atom's description is its section title, not its first raw line" "description: $thd" ;;
+    *Thread*)  ok_t  "a thread atom's description is its section title, not its first raw line ($thd)" ;;
+    *)         bad_t "a thread atom's description is its section title, not its first raw line" "description: ${thd:-<empty>}" ;;
+  esac
+fi
+if grep -q 'RAWMARK' "$SEED_OUT/MEMORY.md" 2>/dev/null; then
+  bad_t "no raw line reaches the landed seat's always-loaded index" "$(grep -n 'RAWMARK' "$SEED_OUT/MEMORY.md" | head -2)"
+else
+  ok_t "no raw line reaches the landed seat's always-loaded index"
+fi
+
+# TWO-SIDED, exactly as for the task-group case: raw IS a move, not a filter —
+# the line must BE on the seat, and must NOT be in what a later distilled
+# export of that seat publishes.
+grep -rq 'RAWMARK' "$SEED_OUT" \
+  && ok_t "the import carries the unreviewed thread text onto the seat (it is a move, not a filter)" \
+  || bad_t "the import carries the unreviewed thread text onto the seat (it is a move, not a filter)" "raw_memories.md was dropped instead of typed"
+SEED_PUB="$TMP/seed-pub"
+seedcounts=$(_pack_scope_memory "$SEED_OUT" "$SEED_PUB")
+if grep -rq 'RAWMARK' "$SEED_PUB" 2>/dev/null; then
+  bad_t "a distilled re-export of the landed seat withholds the unreviewed threads (kept/excluded: $seedcounts)" \
+        "$(grep -rn 'RAWMARK' "$SEED_PUB" | head -3)"
+else
+  ok_t "a distilled re-export of the landed seat withholds the unreviewed threads (kept/excluded: $seedcounts)"
+fi
+# ...and it is still a useful export: the knowledge from the same store survives
+# the round trip. An arm that only checks withholding passes on "publish nothing".
+if grep -rq 'cumulative per rollout' "$SEED_PUB" 2>/dev/null; then
+  ok_t "that re-export still publishes the store's knowledge"
+else
+  bad_t "that re-export still publishes the store's knowledge" "kept/excluded: $seedcounts"
+fi
+eq_t "the full landed store re-exports as knowledge only (2 of $atoms atoms)" "${seedcounts%% *}" "2"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1
