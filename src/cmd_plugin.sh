@@ -1509,6 +1509,50 @@ _plugin_dispatch_verb() {
 }
 
 
+# DIVE-4475: WHO the publisher's setup command runs as, and why it cannot be an
+# env var.
+#
+# `setup.command` is, by the comment below, "the same string a human was told to
+# paste". A human pastes it in their OWN shell, and both shipped commands begin
+# with `sudo` (browser: `sudo 5dive browser setup`; voice: `sudo 5dive-setup-voice`)
+# — they self-elevate, so they are written for a NON-root caller. We ran them as
+# root, and that broke the one thing they use to identify their owner:
+#
+#   sudo bash -c 'echo $SUDO_USER; sudo bash -c "echo \$SUDO_USER"'
+#     agent-dev        <- the real seat, in our process
+#     root             <- one process later, in the publisher's
+#
+# `sudo` sets SUDO_USER to ITS OWN invoking user, so from a root caller every
+# inner sudo rewrites the seat to `root`; and with `Defaults env_reset` no
+# hand-exported variable (of any name) survives either. Exporting the seat is
+# therefore not a smaller version of this fix — it is a fix that cannot work.
+# Only the real uid crosses an arbitrary inner `sudo`, so we drop to the caller
+# and let their sudo re-derive the seat honestly.
+#
+# `runuser`, not `sudo -u`, and the difference bites on exactly the boxes we
+# care about: `sudo -u` asks the sudoers POLICY for permission to become the
+# caller, and this fleet narrows runas on purpose (DIVE-3263) — so a drop that a
+# policy can deny is a drop that stops working first on the hardened boxes.
+# `runuser` is root-only by construction and consults no policy, so where we are
+# already root it cannot be refused. Both set the real uid, which is the whole
+# requirement. `sudo -u` stays as the fallback for a box with no util-linux.
+#
+# Pure on purpose apart from that one probe: it decides from (caller, euid) and
+# prints argv, so the arms can grade the decision at any uid instead of needing
+# root to observe it. Empty output means "run it exactly as before" — a root
+# caller (no seat to restore) and an unprivileged caller (already the right seat,
+# and dropping would only re-ask them for their own password) both take that
+# path.
+_plugin_setup_runner() {
+  local caller="$1" euid="$2"
+  [[ "$euid" == "0" && -n "$caller" && "$caller" != "root" ]] || return 0
+  if command -v runuser >/dev/null 2>&1; then
+    printf '%s\n' runuser -u "$caller" --
+  else
+    printf '%s\n' sudo -u "$caller" --
+  fi
+}
+
 # ---- `plugin setup`: the box-level half, run on purpose (DIVE-4467) --------
 #
 # `plugin add` PRINTS `fivedive.setup.command` and deliberately does not run it
@@ -1577,9 +1621,14 @@ cmd_plugin_setup() {
   plugin=$(jq -r --arg k "$key" '.[$k].plugin' <<<"$j")
   review=$(jq -r --arg k "$key" '.[$k].review // "unreviewed"' <<<"$j")
 
+  # The seat this box-half belongs to. Resolved HERE, in the process sudo has
+  # not yet rewritten (see _plugin_setup_runner) — one process later it is gone.
+  local caller="${SUDO_USER:-${USER:-$(id -un)}}"
+  local -a runner=(); mapfile -t runner < <(_plugin_setup_runner "$caller" "$(id -u)")
+
   echo "  One-time host setup for $key, as published by $plugin:" >&2
   [[ -n "$setup_hint" ]] && echo "    $setup_hint" >&2
-  echo "    it runs, as root:  $setup_cmd" >&2
+  echo "    it runs, as $caller:  $setup_cmd" >&2
   echo "    review tier:       $review" >&2
   echo "  (this is the publisher's own text and the publisher's own command — 5dive runs" >&2
   echo "   exactly the line above and nothing else.)" >&2
@@ -1600,11 +1649,13 @@ cmd_plugin_setup() {
   # same string a human was told to paste. `|| rc=$?` (never a bare call) so a
   # non-zero exit is RECORDED and reported instead of killing the verb under
   # header.sh's errexit with nothing written down.
-  bash -c "$setup_cmd" >&2 || rc=$?
+  # DIVE-4475: run it AS THE CALLER when we are root and the caller is not, so
+  # the publisher's own `sudo` re-derives the seat instead of inheriting `root`.
+  ${runner[@]+"${runner[@]}"} bash -c "$setup_cmd" >&2 || rc=$?
 
   local tmp; tmp=$(mktemp)
   jq --arg k "$key" --arg c "$setup_cmd" --arg t "$(date -u +%FT%TZ)" \
-     --arg s "$started" --arg by "${SUDO_USER:-${USER:-root}}" --argjson rc "$rc" \
+     --arg s "$started" --arg by "$caller" --argjson rc "$rc" \
      '.[$k].setup = ((.[$k].setup // {})
                      + {command:$c, started_at:$s, ran_at:$t, by:$by, rc:$rc, ok:($rc==0)})' \
      "$(_plugin_installed_json)" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"

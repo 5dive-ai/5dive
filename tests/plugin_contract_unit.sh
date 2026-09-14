@@ -442,6 +442,19 @@ fi
 # after `setup`, so the two arms cannot both pass on a broken read of the
 # manifest.
 
+# THE CALLER'S UID IS A FIXTURE FROM HERE DOWN. Every arm below runs the
+# publisher's command, and since DIVE-4475 the verb picks its path from
+# `$(id -u)`: at root it drops to the calling seat, anywhere else it runs as
+# itself. A suite whose verdict depends on the uid of whoever invoked it is not
+# a grader — run under `sudo` this section dropped `touch $SENTINEL` into a seat
+# that cannot reach the harness's own 0700 temp tree, reddening four arms that
+# have nothing to do with uid. The call site reads `$(id -u)` in THIS shell, so
+# a function reaches it and nothing is ever actually elevated: unprivileged by
+# default here, and set to 0 explicitly by the arms that exist to grade the root
+# branch (T9r-T9u).
+HARNESS_UID=1000
+id() { if [[ "${1:-}" == "-u" ]]; then echo "$HARNESS_UID"; else command id "$@"; fi; }
+
 # Consent first. Without --yes and with stdin not a terminal the verb must
 # REFUSE, and — the half that matters — must not have run anything.
 run cmd_plugin_setup setupy@fixture
@@ -512,6 +525,157 @@ t  "T9m3 ...and the failure is recorded, not swallowed"   "7" \
   "$(jq -r '."setupbad@fixture".setup.rc' "$INST")"
 t  "T9m4 ...as not-ok, so the page re-offers the button"  "false" \
   "$(jq -r '."setupbad@fixture".setup.ok' "$INST")"
+
+# =============================================================================
+# T9p-T9u — WHOSE box-half is it? (DIVE-4475)
+# =============================================================================
+# The defect these arms exist for: `plugin setup` ran the publisher's command as
+# root, and every shipped setup command begins with `sudo`. An inner `sudo` from
+# a root caller sets SUDO_USER=root, so `5dive browser setup` — which refuses to
+# make root a browser seat, correctly — was UNRUNNABLE through this verb on
+# every box. The existing T9f-T9n fixtures could not see it: their command is
+# `touch $SENTINEL`, which has no opinion about who runs it.
+#
+# So: one fixture command that READS the seat, plus the decision seam graded
+# directly. The seam is graded directly because the interesting case is euid 0
+# and this harness is not root — a pure (caller, euid) -> argv function is
+# observable at any uid, a `sudo` buried in the verb is not.
+
+t "T9p as root, a real seat is restored by dropping to it" "runuser -u alice --" \
+  "$(_plugin_setup_runner alice 0 | tr '\n' ' ' | sed 's/ $//')"
+t "T9p1 ...via runuser, which asks no sudoers policy; sudo -u only where util-linux is absent" \
+  "sudo -u alice --" \
+  "$(PATH=/nonexistent-for-this-arm _plugin_setup_runner alice 0 | tr '\n' ' ' | sed 's/ $//')"
+t "T9p2 ...and a root CALLER gets no wrapper (there is no seat to restore)" "" \
+  "$(_plugin_setup_runner root 0)"
+t "T9p3 ...and an unprivileged caller is already the right seat, so no sudo" "" \
+  "$(_plugin_setup_runner alice 1000)"
+t "T9p4 ...and an empty caller is never turned into 'sudo -u ' " "" \
+  "$(_plugin_setup_runner "" 0)"
+
+# THE FIXTURE WITH AN OPINION. Its command reads SUDO_USER — the one thing the
+# browser plugin uses to pick the profile owner — and writes what it saw. An arm
+# that asserts on this cannot pass while the verb launders the seat.
+SEATSEEN="$TMP/seat-seen"
+mkplugin setupseat "$(manifest setupseat 1.0.0 official '["channel"]' '[]' \
+  "$(jq -cn --arg f "$SEATSEEN" '{setup:{hint:"needs to know whose box-half this is",
+                                          command:("printf %s \"$SUDO_USER\" > " + $f)}}')")"
+mkindex
+run _plugin_mkt_upgrade fixture
+run cmd_plugin_add setupseat@fixture --yes
+t "T9q0 (precondition) the seat-reading fixture installed" "0" "$RC"
+
+SUDO_USER=alice run cmd_plugin_setup setupseat@fixture --yes
+t  "T9q the publisher's command SEES the calling seat, not root"  "alice" \
+   "$(cat "$SEATSEEN" 2>/dev/null)"
+t  "T9q2 ...and the same seat is what got recorded on the entry"  "alice" \
+   "$(jq -r '."setupseat@fixture".setup.by' "$INST")"
+tc "T9q3 ...and the consent screen names that seat, not 'as root'" "it runs, as alice:" "$OUT$ERR"
+tn "T9q4 ...so the old unconditional 'as root' claim is gone"      "it runs, as root:" "$OUT$ERR"
+
+# --- T9r-T9u: the WIRING, executed end to end --------------------------------
+# T9p grades the DECISION and T9q grades the seat the publisher's command sees,
+# and neither one EXECUTES the line the fix changed: the wrapper is emitted only
+# at euid 0, this harness is not root, so `${runner[@]+"${runner[@]}"}` at the
+# call site was graded by nothing — delete it outright and the suite stayed
+# green (quinn, DIVE-4475 iteration 1). A decision nothing consumes is the row's
+# own defect class.
+#
+# Executing it needs no root, only two shims:
+#   · `HARNESS_UID=0`, read through the `id` function installed above — the call
+#     site reads `$(id -u)` in THIS shell, so nothing is actually elevated.
+#   · a recording `runuser` first on PATH, which appends its argv to a log and
+#     execs the rest. So we observe the exact wrapper the verb chose AND the
+#     publisher's command still runs — a shim that only recorded would prove the
+#     command was replaced, not run.
+SHIM="$TMP/shim"; mkdir -p "$SHIM"
+RUNLOG="$TMP/runner.log"; export RUNLOG
+cat > "$SHIM/runuser" <<'SHIMEOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$RUNLOG"
+[[ "${1:-}" == "-u" ]] && shift 2
+[[ "${1:-}" == "--" ]] && shift
+exec "$@"
+SHIMEOF
+chmod +x "$SHIM/runuser"
+
+shimmed_setup() {  # shimmed_setup <caller-seat> <verb args...>
+  local seat="$1"; shift
+  local saved="$PATH"
+  : > "$RUNLOG"
+  PATH="$SHIM:$PATH"; export SUDO_USER="$seat"; HARNESS_UID=0
+  run cmd_plugin_setup "$@"
+  PATH="$saved"; unset SUDO_USER; HARNESS_UID=1000
+}
+
+SEATWIRED="$TMP/seat-wired"
+mkplugin setupwired "$(manifest setupwired 1.0.0 official '["channel"]' '[]' \
+  "$(jq -cn --arg f "$SEATWIRED" '{setup:{hint:"box half, owned by a seat",
+                                          command:("printf %s \"$SUDO_USER\" > " + $f)}}')")"
+mkindex
+run _plugin_mkt_upgrade fixture
+run cmd_plugin_add setupwired@fixture --yes
+t "T9r0 (precondition) the wiring fixture installed" "0" "$RC"
+
+WIREDCMD=$(jq -r '.fivedive.setup.command' "$MKT/setupwired/.claude-plugin/plugin.json")
+rm -f "$SEATWIRED"
+shimmed_setup alice setupwired@fixture --yes
+t "T9r at euid 0 the verb WRAPS the publisher's command, with the real seat" \
+  "-u alice -- bash -c $WIREDCMD" "$(cat "$RUNLOG")"
+t "T9r2 ...and the publisher's command still RAN (the wrapper execs, not swallows)" \
+  "alice" "$(cat "$SEATWIRED" 2>/dev/null)"
+t "T9r3 ...and the verb succeeded"  "0" "$RC"
+t "T9r4 ...and the run is recorded against that seat" "alice" \
+  "$(jq -r '."setupwired@fixture".setup.by' "$INST")"
+
+# Non-vacuity, half one: the log is written by the WRAPPER, not by the arm. A
+# root caller has no seat to restore, so at the same euid 0 nothing is wrapped.
+rm -f "$SEATWIRED"
+shimmed_setup root setupwired@fixture --yes
+t "T9s a root CALLER is not wrapped even at euid 0 — the log stays empty" "" \
+  "$(cat "$RUNLOG")"
+t "T9s2 ...and the publisher's command ran anyway, unwrapped"  "root" \
+  "$(cat "$SEATWIRED" 2>/dev/null)"
+
+# Non-vacuity, half two: MUTATE THE CALL SITE. Strip the wrapper from the one
+# line the fix changed — mutant 1 of the rejection — and the log must be EMPTY
+# while everything else about the verb is unchanged. This is what makes T9r an
+# arm on the wiring rather than an arm on the pure function a second time.
+MUTSRC="$TMP/cmd_plugin.callsite-mutant.sh"
+sed 's/${runner\[@\]+"${runner\[@\]}"} bash -c/bash -c/' src/cmd_plugin.sh > "$MUTSRC"
+if cmp -s src/cmd_plugin.sh "$MUTSRC"; then MUTATED=no; else MUTATED=yes; fi
+t "T9t0 (precondition) the call-site mutant really differs from the source" "yes" "$MUTATED"
+rm -f "$SEATWIRED"; : > "$RUNLOG"
+(
+  PATH="$SHIM:$PATH"
+  # shellcheck source=/dev/null
+  source "$MUTSRC"
+  HARNESS_UID=0
+  SUDO_USER=alice cmd_plugin_setup setupwired@fixture --yes
+) >/dev/null 2>&1
+t "T9t with the wrapper deleted from the call site, NOTHING is wrapped" "" \
+  "$(cat "$RUNLOG")"
+t "T9t2 ...and that mutant is otherwise alive — it ran the command, just bare" \
+  "alice" "$(cat "$SEATWIRED" 2>/dev/null)"
+
+# ops's note 3 on the gate: before this change the publisher's inner `sudo` was
+# a no-op under root; now it authenticates as the SEAT, so a box where that seat
+# has no NOPASSWD turns "root ran it" into "the seat could not". That must be a
+# recorded, reported failure — never a silent success.
+mkplugin setupdenied "$(manifest setupdenied 1.0.0 official '["channel"]' '[]' \
+  '{"setup":{"hint":"needs rights the seat has not got","command":"exit 77"}}')"
+mkindex
+run _plugin_mkt_upgrade fixture
+run cmd_plugin_add setupdenied@fixture --yes
+shimmed_setup alice setupdenied@fixture --yes
+t  "T9u a command that fails UNDER THE DROP fails the verb" "1" "$RC"
+tc "T9u2 ...and the exit code reaches the operator"  "setup exited 77" "$OUT$ERR"
+t  "T9u3 ...and it is recorded as not-ok, so the button is re-offered"  "false" \
+   "$(jq -r '."setupdenied@fixture".setup.ok' "$INST")"
+t  "T9u4 ...and the drop itself still happened (it is the command that failed)" \
+   "-u alice -- bash -c exit 77" "$(cat "$RUNLOG")"
+
+unset -f shimmed_setup
 
 # `plugin setup` is reachable through the real dispatcher, not only as a function
 # this harness calls directly.
