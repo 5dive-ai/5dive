@@ -1,0 +1,368 @@
+# ---------------------------------------------------------------------------
+# DIVE-4522: a box-level plugin install is not a seat-level one
+# ---------------------------------------------------------------------------
+# `5dive plugin add browser@5dive-plugins` enables a plugin for the BOX:
+# $STATE_DIR/plugins/enabled/<key> points at the version-keyed cache dir and
+# installed.json records what was declared. Nothing in that sequence touches an
+# agent seat, and a `skill` plugin is only real when the seat's harness LOADS it.
+#
+# Measured 2026-09-14 on lodar's canary (exact-swallow, 4 seats): browser had
+# been enabled at the box level since the Sep 11 provision, shipped
+# skills/connect-site, and every seat's ~/.claude/plugins/installed_plugins.json
+# listed telegram + dashboard ONLY. Four agents, one browser they could not see.
+# Per-seat registration ran exactly once, at agent create, and only for the
+# seat's CHANNEL plugins — so a plugin added after a seat exists reached nobody,
+# and `plugin add` printed "registers: channel,verb,skill" while registering the
+# skill half with no one.
+#
+# This file is the walker that closes that: at `plugin add`, at `plugin
+# upgrade`, at agent create, and in reverse at `plugin remove`.
+#
+# THE TRAP, and it is why every call here is a NON-LOGIN shell with
+# CLAUDE_CONFIG_DIR unset. /etc/profile.d/5dive-shared-configs.sh exports
+# CLAUDE_CONFIG_DIR=/home/claude/.claude for every login shell on the box, so
+# `sudo -u agent-x bash -lc 'claude plugin install browser@5dive-plugins'` reads
+# CLAUDE's config, finds no 5dive-plugins marketplace there, and fails with
+# "Plugin 'browser' not found in marketplace '5dive-plugins'" — a message that
+# names the wrong cause and cost 10 minutes on the canary. install_channel_
+# plugin_for_agent already avoids it the same way; this is the second caller,
+# not a new discovery.
+
+# The capabilities that make a plugin SEAT-FACING. A plugin declaring neither
+# registers with nobody — that is the line-339 warning in cmd_plugin.sh staying
+# true, and it is what the mutant arm in the unit suite grades. `channel` is
+# deliberately NOT here: channel plugins are installed per seat by
+# install_channel_for_agent, which also npm-installs deps and patches the start
+# script, and running this walker over them would half-install a service.
+PLUGIN_SEAT_CAPS="${PLUGIN_SEAT_CAPS:-skill mcp}"
+
+# plugin_seat_is_seat_facing <space-separated-caps> -> 0 when a seat must learn
+# about this plugin.
+plugin_seat_is_seat_facing() {
+  local caps=" ${1:-} " c
+  for c in $PLUGIN_SEAT_CAPS; do
+    [[ "$caps" == *" $c "* ]] && return 0
+  done
+  return 1
+}
+
+# The seat's HOME. PERSONA_HOME_ROOT is the seam persona_target() already uses,
+# so the unit suite exercises the real writers against a temp tree rather than
+# asserting on greps — same seam, same reason.
+_plugin_seat_home() { printf '%s/agent-%s\n' "${PERSONA_HOME_ROOT:-/home}" "${1:-}"; }
+_plugin_seat_installed_json() { printf '%s/.claude/plugins/installed_plugins.json\n' "$(_plugin_seat_home "${1:-}")"; }
+
+# plugin_seat_rows -> "<name>\t<type>" for every registered agent.
+# Reads the registry and nothing else; stubbed in tests by stubbing registry_read.
+plugin_seat_rows() {
+  local reg; reg=$(registry_read 2>/dev/null || echo '{}')
+  jq -r '(.agents // {}) | to_entries[] | [.key, (.value.type // "claude")] | @tsv' <<<"$reg" 2>/dev/null || true
+}
+
+# plugin_seat_registered <name> <plugin> <marketplace> -> 0 when that seat's
+# claude already carries the plugin. This is the state that was invisible: it
+# reads the SEAT's file, never the box's installed.json.
+plugin_seat_registered() {
+  local f; f=$(_plugin_seat_installed_json "${1:-}")
+  [[ -f "$f" ]] || return 1
+  jq -e --arg k "${2:-}@${3:-}" '((.plugins // {})[$k] // []) | length > 0' "$f" >/dev/null 2>&1
+}
+
+# The clone URL a SEAT can use for a marketplace this box has registered.
+# A `local` marketplace deliberately returns non-zero: the seat cannot clone a
+# path that only root can read, and pretending otherwise would produce a seat
+# whose marketplace entry points at a directory it gets EACCES on.
+_plugin_seat_mkt_repo() {
+  local mkt="${1:-}" src kind mj; mj="$(_plugin_mkt_json)"
+  [[ -f "$mj" ]] || return 1
+  src=$(jq -r --arg n "$mkt" '.[$n].source // ""' "$mj" 2>/dev/null)
+  kind=$(jq -r --arg n "$mkt" '.[$n].kind // ""' "$mj" 2>/dev/null)
+  [[ "$kind" == "git" && -n "$src" ]] || return 1
+  case "$src" in
+    *://*|*@*:*) printf '%s\n' "$src" ;;
+    */*)         printf 'https://github.com/%s.git\n' "${src%@*}" ;;
+    *)           return 1 ;;
+  esac
+}
+
+# The one place that drops privilege to a seat. A function rather than an inline
+# `sudo` so the unit suite can replace it: everything above it is then graded for
+# real, and only the privilege drop is stubbed.
+plugin_seat_run_as() { # plugin_seat_run_as <user> [VAR=VAL ...]  (script on stdin)
+  local user="$1"; shift
+  sudo -u "$user" -H env "$@" bash -s
+}
+
+# Register one plugin with one CLAUDE seat. Idempotent; 0 = registered (now or
+# already), non-zero = it is not registered and the caller must say so.
+plugin_seat_register_claude() { # <name> <plugin> <marketplace>
+  local name="${1:-}" plugin="${2:-}" mkt="${3:-}" user="agent-${1:-}" repo
+  if ! repo=$(_plugin_seat_mkt_repo "$mkt"); then
+    warn "[$name] marketplace '$mkt' has no URL a seat can clone (local source?) — $plugin NOT registered for this seat"
+    return 2
+  fi
+  plugin_seat_run_as "$user" PLUGIN="$plugin" MARKETPLACE="$mkt" MKT_REPO="$repo" \
+    >&2 <<'SEAT_PLUGIN_REGISTER' || true
+set -uo pipefail
+# NOT a login shell, and this unset is the whole reason (see the header).
+unset CLAUDE_CONFIG_DIR
+export NVM_DIR="/home/claude/.nvm"
+# shellcheck disable=SC1091
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+export PATH="/home/claude/.local/bin:$PATH"
+CLAUDE="${CLAUDE_BIN:-/home/claude/.local/bin/claude}"
+[ -x "$CLAUDE" ] || CLAUDE="$(command -v claude 2>/dev/null || echo "$CLAUDE")"
+
+# Same pre-registration as install_channel_plugin_for_agent, same cause:
+# `claude plugin marketplace add` crashes headless for a user that has never run
+# a session (DIVE-248), while `marketplace update` works headless once the
+# marketplace is on disk. So clone + record, then let `update` take it.
+MKT_DIR="$HOME/.claude/plugins/marketplaces/$MARKETPLACE"
+if [ ! -d "$MKT_DIR/.git" ]; then
+  mkdir -p "$HOME/.claude/plugins/marketplaces"
+  rm -rf "$MKT_DIR"
+  git clone -q --depth 1 "$MKT_REPO" "$MKT_DIR" || true
+fi
+MKT_SLUG=$(printf '%s' "$MKT_REPO" | sed -e 's#^https://github.com/##' -e 's#\.git$##')
+KM_FILE="$HOME/.claude/plugins/known_marketplaces.json" \
+  MKT_NAME="$MARKETPLACE" MKT_SLUG="$MKT_SLUG" MKT_DIR="$MKT_DIR" python3 <<'PREREG' || true
+import json, os, datetime
+km = os.environ["KM_FILE"]
+d = {}
+if os.path.exists(km):
+    try:
+        d = json.load(open(km))
+    except Exception:
+        d = {}
+d.setdefault(os.environ["MKT_NAME"], {
+    "source": {"source": "github", "repo": os.environ["MKT_SLUG"]},
+    "installLocation": os.environ["MKT_DIR"],
+    "lastUpdated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+})
+json.dump(d, open(km, "w"), indent=2)
+PREREG
+
+"$CLAUDE" plugin marketplace update "$MARKETPLACE" >/dev/null 2>&1 \
+  || "$CLAUDE" plugin marketplace add "$MKT_REPO" >/dev/null 2>&1 || true
+yes | "$CLAUDE" plugin install "${PLUGIN}@${MARKETPLACE}" >/dev/null 2>&1 || true
+SEAT_PLUGIN_REGISTER
+  plugin_seat_registered "$name" "$plugin" "$mkt"
+}
+
+# Reverse. `claude plugin uninstall` is the verb; the seat's own cache dir goes
+# with it, which is the point — `plugin remove` promises the code is gone.
+plugin_seat_unregister_claude() { # <name> <plugin> <marketplace>
+  local name="${1:-}" plugin="${2:-}" mkt="${3:-}" user="agent-${1:-}"
+  plugin_seat_registered "$name" "$plugin" "$mkt" || return 0
+  plugin_seat_run_as "$user" PLUGIN="$plugin" MARKETPLACE="$mkt" \
+    >&2 <<'SEAT_PLUGIN_UNREGISTER' || true
+set -uo pipefail
+unset CLAUDE_CONFIG_DIR
+export NVM_DIR="/home/claude/.nvm"
+# shellcheck disable=SC1091
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+export PATH="/home/claude/.local/bin:$PATH"
+CLAUDE="${CLAUDE_BIN:-/home/claude/.local/bin/claude}"
+[ -x "$CLAUDE" ] || CLAUDE="$(command -v claude 2>/dev/null || echo "$CLAUDE")"
+yes | "$CLAUDE" plugin uninstall "${PLUGIN}@${MARKETPLACE}" >/dev/null 2>&1 || true
+SEAT_PLUGIN_UNREGISTER
+  ! plugin_seat_registered "$name" "$plugin" "$mkt"
+}
+
+# ---------------------------------------------------------------------------
+# Non-claude harnesses
+# ---------------------------------------------------------------------------
+# A codex/pi/opencode/grok seat has no plugin system to register with, and that
+# is not the same as having nothing to give it. A plugin that ships an AGENTS.md
+# section is shipping the SAME workflow its Claude skill carries, written for any
+# harness (browser's own file says so in its first paragraph). So the section is
+# installed into the seat's instructions file.
+#
+# THROUGH persona_target(), never a hardcoded `.claude/…`: TYPE_PERSONA_FILE is
+# the map that knows a codex seat reads ~/.codex/AGENTS.md and a pi seat reads
+# ~/.pi/agent/AGENTS.md, and cmd_selfupdate.sh's header records what happens when
+# a payload path is re-literaled instead of derived — five of thirteen seats,
+# 27 skill dirs, invisible and silently skipped every night.
+plugin_seat_doc_begin() { printf '<!-- 5dive:%s:begin -->' "${1:-}"; }
+plugin_seat_doc_end()   { printf '<!-- 5dive:%s:end -->' "${1:-}"; }
+
+# The section to install, read from the plugin's own directory. A plugin that
+# already delimits its AGENTS.md (browser does) is used verbatim so what lands on
+# the seat is byte-identical to what the publisher wrote; one that does not is
+# wrapped, because the markers are what makes removal exact.
+plugin_seat_doc_block() { # <plugin> <plugin-dir>
+  local plugin="${1:-}" dir="${2:-}" f="${2:-}/AGENTS.md" body b e
+  [[ -f "$f" ]] || return 1
+  body=$(cat "$f") || return 1
+  [[ -n "$body" ]] || return 1
+  b=$(plugin_seat_doc_begin "$plugin"); e=$(plugin_seat_doc_end "$plugin")
+  if [[ "$body" == *"$b"* && "$body" == *"$e"* ]]; then
+    printf '%s\n' "$body"
+  else
+    printf '%s\n%s\n%s\n' "$b" "$body" "$e"
+  fi
+}
+
+# Install (or refresh) the marker-delimited section in one seat's instructions
+# file. Replaces an existing block rather than appending a second copy, so the
+# nightly and a re-run of `plugin add` converge instead of accreting.
+plugin_seat_doc_install() { # <name> <type> <plugin> <plugin-dir>
+  local name="${1:-}" type="${2:-}" plugin="${3:-}" dir="${4:-}" md block user="agent-${1:-}"
+  block=$(plugin_seat_doc_block "$plugin" "$dir") || return 1
+  md=$(persona_target "$name" "$type") || return 1
+  _persona_ensure_dir "$user" "$md"
+  MD="$md" BLOCK="$block" BEGIN="$(plugin_seat_doc_begin "$plugin")" \
+    END="$(plugin_seat_doc_end "$plugin")" python3 <<'DOCPY' || return 1
+import os, re
+md, block = os.environ["MD"], os.environ["BLOCK"].rstrip("\n")
+b, e = os.environ["BEGIN"], os.environ["END"]
+cur = ""
+if os.path.exists(md):
+    with open(md) as f:
+        cur = f.read()
+pat = re.compile(re.escape(b) + r".*?" + re.escape(e), re.S)
+if pat.search(cur):
+    new = pat.sub(lambda _m: block, cur, count=1)
+else:
+    new = (cur.rstrip("\n") + "\n\n" if cur.strip() else "") + block + "\n"
+if new != cur:
+    os.makedirs(os.path.dirname(md), exist_ok=True)
+    with open(md, "w") as f:
+        f.write(new)
+DOCPY
+  chown "$user":"$user" "$md" 2>/dev/null || true
+  grep -qF "$(plugin_seat_doc_begin "$plugin")" "$md" 2>/dev/null
+}
+
+plugin_seat_doc_remove() { # <name> <type> <plugin>
+  local name="${1:-}" type="${2:-}" plugin="${3:-}" md
+  md=$(persona_target "$name" "$type") || return 1
+  [[ -f "$md" ]] || return 0
+  MD="$md" BEGIN="$(plugin_seat_doc_begin "$plugin")" END="$(plugin_seat_doc_end "$plugin")" \
+    python3 <<'DOCPY' || return 1
+import os, re
+md = os.environ["MD"]
+b, e = os.environ["BEGIN"], os.environ["END"]
+with open(md) as f:
+    cur = f.read()
+new = re.sub(re.escape(b) + r".*?" + re.escape(e) + r"\n?", "", cur, count=1, flags=re.S)
+if new != cur:
+    with open(md, "w") as f:
+        f.write(new.rstrip("\n") + ("\n" if new.strip() else ""))
+DOCPY
+  ! grep -qF "$(plugin_seat_doc_begin "$plugin")" "$md" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# The walkers
+# ---------------------------------------------------------------------------
+# plugin_seat_apply <plugin> <marketplace> <caps> <register|unregister> [dir]
+#
+# One line of report per seat, on stderr, because a silent walk is the state this
+# row was filed to remove: `plugin add` used to print "registers: skill" and the
+# operator had no way to learn that it registered with nobody.
+plugin_seat_apply() {
+  local plugin="${1:-}" mkt="${2:-}" caps="${3:-}" action="${4:-register}" dir="${5:-}"
+  plugin_seat_is_seat_facing "$caps" || return 0
+  local key="${plugin}@${mkt}" name type n_ok=0 n_skip=0 n_fail=0
+  [[ -n "$dir" ]] || dir="$(_plugin_enabled_dir)/$key"
+
+  while IFS=$'\t' read -r name type; do
+    [[ -n "$name" ]] || continue
+    [[ -d "$(_plugin_seat_home "$name")" ]] || { n_skip=$((n_skip+1)); continue; }
+    case "$type" in
+      claude)
+        if [[ "$action" == register ]]; then
+          if plugin_seat_register_claude "$name" "$plugin" "$mkt"; then
+            echo "  $name (claude): $key registered" >&2; n_ok=$((n_ok+1))
+          else
+            echo "  $name (claude): $key NOT registered — run 'sudo 5dive doctor' " >&2; n_fail=$((n_fail+1))
+          fi
+        else
+          if plugin_seat_unregister_claude "$name" "$plugin" "$mkt"; then
+            echo "  $name (claude): $key unregistered" >&2; n_ok=$((n_ok+1))
+          else
+            echo "  $name (claude): $key could NOT be unregistered" >&2; n_fail=$((n_fail+1))
+          fi
+        fi ;;
+      *)
+        # No plugin system on this harness — the AGENTS.md section is the whole
+        # of what we can give it, and a plugin that ships none gets skipped
+        # rather than warned about: not every plugin has a non-claude story.
+        if [[ "$action" == register ]]; then
+          if plugin_seat_doc_block "$plugin" "$dir" >/dev/null 2>&1; then
+            if plugin_seat_doc_install "$name" "$type" "$plugin" "$dir"; then
+              echo "  $name ($type): $plugin instructions installed" >&2; n_ok=$((n_ok+1))
+            else
+              echo "  $name ($type): $plugin instructions NOT installed" >&2; n_fail=$((n_fail+1))
+            fi
+          else
+            n_skip=$((n_skip+1))
+          fi
+        else
+          plugin_seat_doc_remove "$name" "$type" "$plugin" >/dev/null 2>&1 \
+            && { echo "  $name ($type): $plugin instructions removed" >&2; n_ok=$((n_ok+1)); } \
+            || n_skip=$((n_skip+1))
+        fi ;;
+    esac
+  done < <(plugin_seat_rows)
+
+  if (( n_ok || n_fail )); then
+    echo "  seats: $n_ok ok, $n_fail failed, $n_skip skipped" >&2
+  fi
+  (( n_fail == 0 ))
+}
+
+# The other direction, for agent create: give a BRAND-NEW seat every seat-facing
+# plugin the box already has enabled. Without this, a seat created after
+# `plugin add` is as blind as the four on the canary were — the same defect from
+# the other end, and the reason this is a separate verb rather than a flag.
+plugin_seat_backfill() { # <name> <type>
+  local name="${1:-}" type="${2:-}" key plugin mkt caps ij
+  ij="$(_plugin_installed_json)"
+  [[ -f "$ij" ]] || return 0
+  while IFS=$'\t' read -r key plugin mkt caps; do
+    [[ -n "$key" ]] || continue
+    plugin_seat_is_seat_facing "$caps" || continue
+    if [[ "$type" == claude ]]; then
+      plugin_seat_register_claude "$name" "$plugin" "$mkt" \
+        && echo "  $name: $key registered" >&2 \
+        || echo "  $name: $key NOT registered" >&2
+    else
+      local dir; dir="$(_plugin_enabled_dir)/$key"
+      plugin_seat_doc_block "$plugin" "$dir" >/dev/null 2>&1 || continue
+      plugin_seat_doc_install "$name" "$type" "$plugin" "$dir" \
+        && echo "  $name: $plugin instructions installed" >&2 \
+        || echo "  $name: $plugin instructions NOT installed" >&2
+    fi
+  done < <(jq -r 'to_entries[] | select(.value.enabled)
+                  | [.key, .value.plugin, .value.marketplace,
+                     ((.value.capabilities // []) | join(" "))] | @tsv' "$ij" 2>/dev/null || true)
+}
+
+# plugin_seat_unregistered_rows -> "<seat>\t<type>\t<key>" for every ENABLED
+# seat-facing plugin a seat does not carry. This is the report `doctor` prints,
+# and it is the exact state that was invisible on 2026-09-14: four seats, one
+# enabled skill plugin, nothing anywhere that would have said so.
+plugin_seat_unregistered_rows() {
+  local ij; ij="$(_plugin_installed_json)"
+  [[ -f "$ij" ]] || return 0
+  local -a keys=() plugins=() mkts=()
+  local key plugin mkt caps name type i
+  while IFS=$'\t' read -r key plugin mkt caps; do
+    [[ -n "$key" ]] || continue
+    plugin_seat_is_seat_facing "$caps" || continue
+    keys+=("$key"); plugins+=("$plugin"); mkts+=("$mkt")
+  done < <(jq -r 'to_entries[] | select(.value.enabled)
+                  | [.key, .value.plugin, .value.marketplace,
+                     ((.value.capabilities // []) | join(" "))] | @tsv' "$ij" 2>/dev/null || true)
+  (( ${#keys[@]} )) || return 0
+  while IFS=$'\t' read -r name type; do
+    [[ -n "$name" ]] || continue
+    [[ "$type" == claude ]] || continue
+    for i in "${!keys[@]}"; do
+      plugin_seat_registered "$name" "${plugins[$i]}" "${mkts[$i]}" \
+        || printf '%s\t%s\t%s\n' "$name" "$type" "${keys[$i]}"
+    done
+  done < <(plugin_seat_rows)
+}
