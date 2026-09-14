@@ -1,0 +1,198 @@
+           ident = DIVE-4536
+           title = Supervisor held dev3 10h on a 'Do you want to proceed?' confirm: the quota matcher reads the status-bar meter as a capacity wall, and no verdict recognises a waiting prompt
+          status = in_progress
+            gate = none
+        priority = high
+        assignee = ops
+      created_by = main
+       parent_id = 
+      created_at = 2026-09-14 13:49:33
+first_started_at = 2026-09-14 16:50:59
+      started_at = 2026-09-14 17:34:20
+         done_at = 
+    delivery_ref = https://github.com/5dive-ai/5dive/pull/974
+     merge_owner = -
+            body = AXIS: the org layer's observable behaviour — a seat sat on a one-keystroke prompt for ~10 hours on a live row and nothing woke anyone. lodar, 2026-09-14 13:46Z: "dev3 stuck on claude code option picker: Do you want to proceed: Yes / No — our supervisor didnt catch that for 10 hours".
+
+FILING-CAP EXCEPTION (already blocked shipped work): dev3's browser-read row (lodar's 2026-09-14 direction) made no progress for ~10h; `5dive liveness --agent=dev3` at 13:50Z: no-effect, nothing written in 60m.
+
+WHAT THE PANE SHOWED (main, 13:49Z, `tmux capture-pane -t agent-dev3`):
+    Add cmd_read and cmd_links to bin/browser
+    Dangerous rm operation on possibly-empty variable path: "$out/$f"
+    Do you want to proceed?
+    ❯ 1. Yes
+      2. No
+    Esc to cancel · Tab to amend
+This is Claude Code's BUILT-IN dangerous-command confirm. It fires even under bypassPermissions, and it is NOT AskUserQuestion — so the DIVE-4293 PreToolUse hook (pretool-headless-question.sh) does not see it, and nothing else does either. main pressed "2. No" (the flagged rm was unseen; No is reversible) and the session resumed within seconds ("Zigzagging… 17s").
+
+WHAT THE SUPERVISOR DID FOR 10 HOURS (/var/log/5dive/supervisor-tick.log, every 10 min):
+    ALERT dev3 — quota-exhausted: pane shows a model-capacity refusal: Opus 5 5h: 17% 7d: 100% [the refusal names no resume deadline this can parse — UNKNOWN whether it is still in force, NOT confirmed …]
+    HELD dev3 — behind a capacity wall (no-progress); would have: nudge
+    … OK — supervisor tick: 16 agents — 14 healthy / 0 slow / 0 drift / 0 stuck / 1 stalled / 1 quota-exhausted · actions ON: 0 acted / 0 escalated
+Two defects, one outcome:
+1. The quota-refusal matcher accepts Claude Code's STATUS-BAR usage meter ("Opus 5 5h: N% 7d: M%") as "a model-capacity refusal". That line is on every pane at all times; at 7d: 100% it reads as a wall, and the HELD branch suppresses the nudge the no-progress verdict would have fired. By 13:49Z the meter read 7d: 71% and the hold was still in force ("UNKNOWN whether it is still in force" is treated as still in force). A hold that cannot expire is a stall with a green label.
+2. No verdict recognises an interactive chooser. "Do you want to proceed?" + "❯ 1. Yes" is a one-line pane signature; the supervisor has `stuck` causes service-dead|tmux-dead|poller-dead|loop-stuck|no-progress and none is "waiting on a keypress".
+
+FIX (smallest first)
+(a) The quota matcher must not match the status-bar meter: require the refusal sentence ("Usage limit reached", "continuing automatically at", "resets at") and IGNORE the `Opus … 5h: N% 7d: M%` meter line; a meter at 100% without a refusal sentence is "at cap, unconfirmed" → falls through to the no-progress path, never HELD.
+(b) A `stuck` cause `prompt-waiting`: pane matches `Do you want to proceed\?` / `❯ 1\. Yes` / `Enter to select` with no transcript progress for 10m+ → action: press the SAFE option (No / Esc) and file the event on the seat's row (the model then re-plans); escalate only if it recurs within the hour. The headless hook (DIVE-4293) stays for AskUserQuestion; this is its sibling for the built-in confirms.
+(c) `5dive liveness` and the heartbeat's stale-row reaper read the same signature so a fresh wake is not queued behind a picker.
+
+ACCEPT
+- A fixture pane carrying only the status-bar meter at "7d: 100%" and no refusal sentence is NOT classified quota-exhausted and is NOT held (unit arm on the classifier; positive control: the real "Usage limit reached · continuing automatically at 8am" line still classifies and still holds).
+- A fixture pane on "Do you want to proceed? ❯ 1. Yes / 2. No" with no progress for 10m classifies `stuck/prompt-waiting`, the tick presses No once, logs it on the row, and the next tick reads the seat as progressing.
+- Run on this host: dev3's ~10h window re-read from the log would have produced a nudge within 20 min, not 60 HELD lines.
+
+ALTERNATIVES NOT TAKEN
+- Auto-pressing "Yes": never — the confirm exists because the command was flagged; only the safe option is pressable by a rail.
+- Disabling the dangerous-rm confirm via settings: it is a real guard on a seat with cli-root sudo; keep it.
+
+Evidence: supervisor-tick.log lines quoted above (13:4xZ), pane capture, liveness output, main's send-keys at 13:49Z. Related: DIVE-4293 (AskUserQuestion hook), DIVE-4278 (liveness), the memory atom "codex /stop = Ctrl-C into the pane" (never Ctrl-C a pane to unstick it).
+
+
+FILING-CAP EXCEPTION (already blocked shipped work): dev3's browser-read row made no progress for ~10h (2026-09-14) while the supervisor HELD it as quota-exhausted
+
+
+---
+
+## OPS, 2026-09-14 — delivered as PR #974 (branch `dive-4536-supervisor-confirm`)
+
+Both defects fixed. Deliverable (c) NOT built — see below.
+
+### Root cause of defect 1, more precisely than the row states it
+
+The matcher's weekly arm is `(7d|1w): 100%`, and that substring lives inside the
+status-bar meter (`src/cmd_supervisor.sh:109`). Fixed by excluding the METER
+SHAPE — a line carrying BOTH `5h: N%` and `7d: M%` is the status bar and nothing
+else — rather than by deleting the arm, which is still the only pane reading of a
+refusal-free weekly wall (`Opus 5 7d: 100%` with no session percentage beside it
+still matches).
+
+**Why the hold could not expire, which the row inferred and is now confirmed:**
+DIVE-4097 door 2's oracle is the `quota-exhausted` supervisor_events row that
+door 1 files *for as long as the classification holds*. The classifier fed the
+evidence that justified the classifier. Cutting the classification at the root
+drains the loop; door 2 itself needed no change.
+
+### ALTERNATIVES NOT TAKEN
+
+**1. A new `stuck` cause `prompt-waiting`, as the row specified.** Not taken. The
+supervisor already has `blocked-on-prompt` (DIVE-4293), ranked directly under the
+verification challenge and ABOVE every inference, for exactly this state — the
+row only knew about DIVE-4293's PreToolUse hook. The confirm is now a second
+CAUSE under that class (`dangerous-confirm`), not a second class, because the
+state is identical and the board, the digest, `agent info` and the alert dedup all
+count the class; a parallel class would have had to be added to each by hand, and
+the one that got missed is where the next ten-hour stall hides. Putting it under
+`stuck` would also have been actively wrong: the `stuck` ladder's first two rungs
+are `nudge` (types a line into a pane waiting for a KEY) and `resume` (presses
+Escape *and then* asks the seat to continue, discarding the model's own plan).
+
+**2. Pressing `2` then Enter, as the row specified ("press No").** Not taken —
+Escape instead, same outcome (the call is denied and the model re-plans; the seat
+resumed in seconds when main did it by hand at 13:49Z). Escape is the footer's
+own documented cancel, it is one key, and it does not assume the cursor is where
+we think it is. Pressing a DIGIT assumes the numbering, and a confirm that ever
+renders its options in another order turns that assumption into an approval.
+Fail-closed means a mis-press yields "the command did not run", never "the flagged
+command ran".
+
+**3. Firing the class only after the 10m dwell.** Not taken. The ALERT, the class
+and the audited event fire on the first tick that sees the confirm; only the
+KEYSTROKE waits the dwell. A frozen seat should be visible immediately; pressing
+a key on a seat's behalf is what deserves a wait.
+
+**4. Widening `promptRecommended` to cover the confirm.** Not taken — that boolean
+selects the ENTER path. Widening it would have made every reader of it start
+answering tool-permission confirms with "Yes". A new `promptMark` signal carries
+the raw mark instead; `promptRecommended` keeps its exact DIVE-4293 meaning.
+
+### THE TEST REVERSAL, SIGNED
+
+`tests/supervisor_classify_unit.sh` carried two DIVE-3822 arms asserting that
+`Opus 5 5h: 0% 7d: 100%` and its `1w` spelling DO classify as weekly-exhausted.
+Those are the meter shape; both are now inverted, with the measurement written at
+the arms and a new positive-control arm beside them. Blast radius checked:
+`_sup_quota_match` has exactly one consumer (`_sup_quota_pane` → `_sup_classify`);
+DIVE-3822's rotation selector reads headroom via
+`cmd_agent_rotation_rotate --require-live-headroom` and is untouched.
+
+**Residual signed:** an account genuinely at its weekly wall whose pane shows only
+the two-window meter and NO refusal sentence is no longer classified from the
+pane. DIVE-4342's account-usage snapshot still classifies it from the provider's
+own measured percentage and ranks above this branch; what is lost is the case
+where that snapshot is ALSO stale or absent. Cost there is a nudge to a throttled
+seat (harmless, self-healing) instead of ten hours of silence — the asymmetry the
+row ordered.
+
+### DELIVERABLE (c) NOT BUILT — stated, not silently dropped
+
+The row asked that `5dive liveness` and the heartbeat's stale-row reaper read the
+same signature.
+
+- **`liveness`: refused by its own charter**, not by effort. It does not scrape
+  panes at all, deliberately — a present pane is not evidence of life
+  (`src/cmd_supervisor.sh:513-515` records the reasoning). Teaching it this
+  signature means changing that charter, which is a decision, not a patch, and it
+  is not mine to take inside this row.
+- **The reaper: the hold it was stuck behind is gone with defect 1.** Its stall
+  was not a missing signature; it was door 2 suppressing the ladder. Adding a
+  second reader of the pane there now would be speculative.
+
+If the fleet still wants (c) after this ships, it is a row with a decision in it.
+
+### VERIFIED
+
+- `tests/supervisor_confirm_unit.sh` — NEW, 25 arms, all pure (no tmux/root/db):
+  both false positives killed, POSITIVE CONTROLS for both true positives, each of
+  the three conjunction parts proven load-bearing, the DIVE-4293 picker proven
+  un-downgraded, the meter proven to lend no deadline to the neighbour join, and
+  the incident replayed end to end (10h no-progress + no confirm →
+  `stuck/no-progress`, the nudge suppressed for ten hours).
+- **MUTANT-KILL arm**: restores the pre-fix predicate and asserts the meter DOES
+  classify under it, so the negative arms are proven to test the fix, not the
+  fixture.
+- `tests/supervisor_classify_unit.sh` 106/106.
+- 94 supervisor/heartbeat-touching harnesses green.
+
+### KNOWLEDGE COMPILED
+
+- NEW `community/wiki/a-gauge-rendered-on-every-pane-is-not-a-refusal-and-a-hold-whose-oracle-is-its-own-alarm-cannot-expire.md`
+  — the transferable half: a gauge reports a level and an event reports that
+  something happened, and a hold whose oracle is its own alarm is a latch, not an
+  expiry.
+- CORRECTED `community/wiki/bypass-mode-is-not-a-no-questions-mode-and-the-question-guard-lived-only-in-the-telegram-plugin.md`
+  — that page said bypass mode "skips PERMISSION prompts" and drew the line at
+  `AskUserQuestion`. It does not: the built-in dangerous-command confirm IS a
+  permission prompt and fires under bypass. Both index lines updated.
+
+### SELF-AUDIT
+
+- **Least confident:** the confirm's exact rendering. All three signature parts
+  come from ONE capture (main's, 13:49Z) of ONE modal; other flagged-tool confirms
+  may word the question differently, and the strings belong to a TUI we do not
+  ship. Mitigated the way the file's siblings are — all three parts are
+  env-overridable (`SUPERVISOR_CONFIRM_PAT`, `_YES_PAT`, `_FOOTER_PAT`) so a
+  rewording is tunable without a release — and the bias is false-negative: an
+  unmatched confirm degrades to exactly today's behaviour.
+- **Not checked:** no on-box arm. Every arm here is pure; the sudo `tmux
+  send-keys Escape` path is graded only by reading (it is byte-identical to the
+  `resume` rung's existing Escape, which ships today). A live confirm was not
+  reproduced on a real seat.
+
+          result = Fixed both defects behind dev3's ~10h silent stall: the supervisor's capacity matcher no longer reads claude's always-present status-bar usage meter (Opus 5 · 5h: N% 7d: M%) as a refusal — only a refusal sentence classifies, which drains the DIVE-4097 door-2 hold whose oracle was the audit row its own classification files — and claude's built-in tool-permission confirm (Do you want to proceed? / ❯ 1. Yes / Esc to cancel), invisible to DIVE-4293's hook and its supervisor branch alike, is now the cause 'dangerous-confirm' under blocked-on-prompt, auto-DECLINED with Escape (never Yes) after 10m of no progress, noted on the seat's in-progress row, escalating only on a failed keypress or a third confirm inside an hour. PR #974, 25 new pure arms incl. a mutant-kill and positive controls for both true positives, 106/106 on supervisor_classify_unit and 94 supervisor/heartbeat harnesses green; deliverable (c) deliberately NOT built and the reason is on the row body, alongside the signed residual for the two DIVE-3822 test arms this reverses.
+
+--- appended 2026-09-14 17:19:09Z by a later write (DIVE-2483); the text above was already on the row ---
+❌ quinn rejected (iteration 1): FINDING: the confirm matcher's stated false-positive control is falsified by two artifacts this same delivery shipped. The comment on _SUP_CONFIRM_PAT claims 'a quoted mention in prose carries the sentence and neither of the other two' parts. It does not. Fed straight to _sup_confirm_match on the merged tree (2cad2ad6, branch is on top of current origin/main): (a) the output of '5dive task show DIVE-4536' — the row body quotes main's verbatim 13:49Z capture, all three parts — MATCHES, echoing 'Do you want to proceed?'; (b) community/wiki/bypass-mode-is-not-a-no-questions-mode-and-the-question-guard-lived-only-in-the-telegram-plugin.md — the page written in THIS delivery to document the defect, fenced block, all three parts — MATCHES. Prose about a pane signature is not a paraphrase of it, it is a transcript of it; faithfulness is the whole point of the doc and it is exactly what makes it indistinguishable from an instance. Consequence is not a miscount: on any claude seat idle >=10m (the normal state between turns) with that text in the capture window, the tick classifies blocked-on-prompt/dangerous-confirm, _sup_act_exec sends Escape into a live pane, _sup_confirm_note_row appends a FABRICATED sentence to that seat's in-progress row ('supervisor DECLINED a tool-permission confirm on this seat … the flagged command did NOT run'), and — because the class outranks the whole stuck ladder and the branch 'continue's — a genuinely stalled seat reads as handled. That is this row's own defect shape reproduced one layer up: the documentation of the stall becomes the trigger that hides the next one. The shipped negative control PROSE_PANE is a two-line paraphrase composed by the author against the pattern; it is a specimen of the false positive you already knew to avoid, not a control. Both real hits were on disk in the same commit. FIX: (1) discriminate on POSITION, not more conjunction — a live modal renders at the BOTTOM of the pane with nothing substantive after the footer, and its three parts are ADJACENT; a quotation always has prose after it (the row body's next line is 'This is Claude Code's BUILT-IN…', the wiki page's is a closing fence). Require the footer within the last few non-empty lines of the capture and the Yes option/footer within ~2 lines of the question. Measure the real modal's offset from a capture rather than guessing the constant. (2) Replace PROSE_PANE with controls drawn from the population, not composed: paste the DIVE-4536 row body and the bypass-mode wiki page in verbatim as fixtures and assert neither classifies, with the incident capture still asserting it does. (3) Break the literals in the doc you ship, per the mitigation in community/wiki/documenting-machinery-inside-its-own-data-store-manufactures-false-positives.md, so a page about the signature cannot be an instance of it. NOT AT ISSUE — do not rework: defect 1 is correct and I re-derived it independently. Meter at '5h: 17% 7d: 100%' and at 7d:71% both fall through, and both positive controls survive ('Claude usage limit reached · continuing automatically at 8am' matches; 'weekly limit 7d: 100%' with no session percentage matches). 25/25 supervisor_confirm_unit and 106/106 supervisor_classify_unit re-run green on my worktree, as claimed. One residual worth a line in the body, not a rework: a WRAPPED meter (5h and 7d on separate rows, which tmux capture-pane does return) still classifies — same wrap residual already signed at cmd_supervisor.sh:431, degrades to today's behaviour. VERIFY: on the next delivery I will re-run _sup_confirm_match over (i) live 'task show DIVE-4536' output, (ii) the bypass-mode wiki page, (iii) this row's own new feedback text — all three must return empty — and over the verbatim 13:49Z incident capture, which must still return the question line; plus the new population-drawn fixtures in supervisor_confirm_unit.sh, an anchored mutant proving the position anchor is load-bearing (remove the anchor, the row-body arm must go red), and both suites at head.
+created_by_tier = admin
+previous gates = 0
+
+verify: delivered-only (box default) — a grader grades this delivery
+review: temp — one grader session per delivery, then gone
+
+loop spec:
+  acceptance_criteria: Deliverable meets the intent of: Supervisor held dev3 10h on a 'Do you want to proceed?' confirm: the quota matcher reads the status-bar meter as a capacity wall, and no verdict recognises a waiting prompt. Maker records in the done result WHAT was built and HOW it was checked; quinn confirms against this before the task closes.
+  max_iterations: 2
+  verifier: quinn
+  maker: ops
+  iteration: 1
