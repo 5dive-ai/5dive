@@ -156,6 +156,15 @@ fi
 # The oracle is exact where the parse was approximate, and it is exact for
 # spellings nobody has thought of yet, which is the whole point.
 #
+# THE COST THE STATIC VERSION DID NOT HAVE, named because it is real and it is not
+# free: running a candidate gives this contract that candidate's SIDE EFFECTS. TMPDIR
+# is isolated per run and removed by the trap on line 28, but a harness that writes
+# relative to the repo writes into the tree being graded -- ops found an untracked
+# package.json in a grading worktree after a contract run. Disposable in CI, which
+# starts from a clean checkout; NOT disposable in a developer worktree, where it
+# shows up as unexplained `git status` noise. The trade was taken knowingly: the
+# static verdict cost three spellings of blindness, and this costs one stray file.
+#
 # THE DEAD END, named so it is not re-walked: "append `)` to the prefix and
 # re-parse" looks like the cheap way to keep the static route and tell a subshell
 # from an open compound. ops measured it misclassifying BOTH real files --
@@ -197,11 +206,30 @@ ORACLE_TIMEOUT="${HARNESS_RC_ORACLE_TIMEOUT:-180}"
 SELF_ABS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 ORACLE_TMP="$(mktemp -d /tmp/harness-rc-oracle.XXXXXX)"
 
-_rc_candidate_lines() {   # <file> -> "<lineno>:<line>" for every trap/EXIT line that is not the marker
+_rc_candidate_lines() {   # <file> -> "<lineno>:<line>" for every trap/EXIT line that is not a COMPLIANT marker trap
   grep -nE '\btrap\b' "$1" \
     | grep -E '\bEXIT\b' \
-    | grep -v 'HARNESS-RC' \
-    | grep -vE '^[0-9]+:[[:space:]]*#'
+    | grep -vE '^[0-9]+:[[:space:]]*#' \
+    | grep -vE "$RC_RE"
+}
+
+# ITERATION 3 (DIVE-4440, ops's second grade): the line above used to drop every
+# line containing the substring HARNESS-RC, which exempted the one shape that is
+# WORSE than silence -- a second top-level trap that DOES print the marker and
+# prints the WRONG VALUE. LIVE AT HEAD when ops measured it:
+# tests/headless_question_guard_unit.sh:245 registered
+# `trap 'rm -f "$mut"; rc=$?; echo "HARNESS-RC=$rc"' EXIT`, so `rm -f` ran before
+# `rc=$?` and the harness forced to exit 7 printed HARNESS-RC=0 (control, with the
+# head trap alone: HARNESS-RC=7). The behavioural oracle cannot see that -- the file
+# emits a marker, so it "survives" -- which is why the corruption gets its OWN arm
+# below rather than a wider oracle. Filtering on RC_RE instead of the substring is
+# what lets that arm have a candidate set at all.
+_rc_noncompliant_marker_lines() {   # <file> -> "<lineno>:<line>" for every trap/EXIT line that MENTIONS the marker but is not a compliant marker trap
+  grep -nE '\btrap\b' "$1" \
+    | grep -E '\bEXIT\b' \
+    | grep 'HARNESS-RC' \
+    | grep -vE '^[0-9]+:[[:space:]]*#' \
+    | grep -vE "$RC_RE"
 }
 
 # ONE detector, called by the corpus loop AND by the mutation arms below. A second
@@ -217,7 +245,17 @@ _rc_marker_survives() {   # <file> -> 0 marker present, 1 SILENCED, 2 could-not-
   out=$(_HARNESS_RC_ORACLE=1 TMPDIR="$ORACLE_TMP" timeout "$ORACLE_TIMEOUT" bash "$f" 2>&1)
   rc=$?
   (( rc == 124 || rc == 125 || rc == 126 || rc == 127 )) && return 2
-  grep -q 'HARNESS-RC' <<<"$out" && return 0
+  # ANCHORED, and counted -- not `grep -q HARNESS-RC`. An unanchored substring test
+  # over merged stdout+stderr hands a clean verdict to any harness that prints the
+  # marker's NAME anywhere in its own output, and the candidate set is exactly the
+  # population where that is likeliest: files carrying a second `trap ... EXIT` are
+  # disproportionately files ABOUT exit traps and markers (audit_exit_trap_row,
+  # silent_nonzero_exit_backstop and truncation_marker_guard are 3 of today's 13).
+  # Measured by ops: a probe registering a second top-level trap AND echoing one
+  # sentence containing the word HARNESS-RC ran with ZERO emitted markers and this
+  # contract called it clean. Measured here: all 13 non-self candidates emit exactly
+  # ONE anchored line, so the anchor costs no false positive.
+  (( $(grep -cE '^HARNESS-RC=[0-9]+$' <<<"$out") >= 1 )) && return 0
   return 1
 }
 
@@ -267,6 +305,67 @@ else
     nok "${#UNKNOWN_TL[@]} candidate harness(es) could not be RUN (timeout ${ORACLE_TIMEOUT}s / not executable); asserting nothing about them:"
     for m in "${UNKNOWN_TL[@]}"; do printf '       %s\n' "$m"; done
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# ITERATION 3 ARM: A MARKER WITH THE WRONG VALUE IS WORSE THAN NO MARKER.
+# ---------------------------------------------------------------------------
+# Everything above grades the marker's EXISTENCE. Nothing graded its VALUE, and a
+# job that fails while printing `HARNESS-RC=0` is the same silent failure with a
+# receipt attached -- strictly worse than silence, because it survives a human
+# reading the log and it survives the run-harnesses.sh summary.
+#
+# The shape: a second top-level EXIT trap that DOES carry the marker but runs its
+# cleanup BEFORE `rc=$?`, so the captured code is the cleanup's, not the harness's.
+# RC_RE (line 76) was written for exactly this hazard -- it requires `rc=$?;` to be
+# the FIRST statement in the trap body -- and the MISSING arm satisfies it with ANY
+# ONE matching line in the file, so a file can open with a compliant trap and
+# replace it 226 lines later with a non-compliant one and be green twice over.
+#
+# MEASURED, at head, not hypothesised: tests/headless_question_guard_unit.sh:245
+# carried `trap 'rm -f "$mut"; rc=$?; echo "HARNESS-RC=$rc"' EXIT`. Forced to exit 7
+# it printed HARNESS-RC=0; with only the compliant head trap it printed HARNESS-RC=7.
+# It is fixed in the same commit as this arm.
+#
+# SCOPE, measured across the corpus: exactly one file outside this one carried such
+# a line. So this arm reds the file that lies and nothing else.
+#
+# WHY THIS IS STATIC WHILE THE ARM ABOVE IS BEHAVIOURAL, and it is not a relapse:
+# the behavioural oracle answers "was a marker emitted", and a corrupting trap emits
+# one -- it is clean by that oracle's definition and always will be. Grading the
+# VALUE behaviourally would mean forcing each candidate to a known non-zero exit,
+# which means editing it. The property here is a property of the TRAP BODY's
+# statement order, which is what RC_RE already reads; the iteration-1 failure was
+# enumerating where a trap may APPEAR, and that is not what this reads.
+#
+# SELF IS EXEMPT, and this is a real hole, stated rather than hidden: this file
+# prints the FIX text (`trap 'rc=$?; <your cleanup here>; ...' EXIT`) through printf
+# and writes deliberately non-compliant fixtures for the mutants below, so its own
+# text carries such lines by design. Distinguishing fixture text from live code is
+# the static-scope problem the oracle above exists to avoid re-walking. What covers
+# this file instead: its own trap is line 28, graded by the MISSING arm, by
+# run-harnesses.sh in the log of this very run, and by the corrupting-form mutants
+# below, which are the same measurement applied to text this file controls.
+NONCOMPLIANT=()
+for t in "${CORPUS[@]}"; do
+  abs="$(cd "$(dirname "$t")" && pwd)/$(basename "$t")"
+  [[ "$abs" == "$SELF_ABS" ]] && continue
+  [[ -n "$(_rc_noncompliant_marker_lines "$t")" ]] && NONCOMPLIANT+=("$t")
+done
+
+if (( ${#NONCOMPLIANT[@]} == 0 )); then
+  ok "every EXIT trap that prints HARNESS-RC captures rc FIRST -- no harness reports a code that is its cleanup's, not its own"
+else
+  nok "${#NONCOMPLIANT[@]} harness(es) register an EXIT trap that prints HARNESS-RC with the WRONG value:"
+  for m in "${NONCOMPLIANT[@]}"; do
+    printf '       %s\n' "$m"
+    while IFS= read -r cl; do [[ -n "$cl" ]] && printf '         suspect %s\n' "$cl"; done < <(_rc_noncompliant_marker_lines "$m")
+  done
+  printf '\n       FIX -- rc=$? must be the FIRST statement in the trap body, before any\n'
+  printf '       cleanup, or the marker reports the cleanup command'"'"'s exit code:\n\n'
+  printf '           trap '"'"'rc=$?; <your cleanup here>; echo "HARNESS-RC=$rc"'"'"' EXIT\n\n'
+  printf '       A harness that fails while printing HARNESS-RC=0 is worse than one that\n'
+  printf '       prints nothing: the receipt makes the failure look graded.\n'
 fi
 # MUTATION, not just reading the regex: a check that cannot fail proves
 # nothing (this file's own sibling on DIVE-2211 exists partly to name that
@@ -358,7 +457,10 @@ _mut_positive() {   # <label> <file>
   else
     nok "mutation: $label is (wrongly) reported clean (verdict $rc) -- the arm has no teeth against this spelling"
   fi
-  n=$(bash "$f" 2>&1 | grep -c 'HARNESS-RC')
+  # ANCHORED like the oracle: the spoof mutant below prints the marker's NAME and no
+  # marker, and an unanchored count would call it a non-silencing and quietly void
+  # the arm it exists to prove.
+  n=$(bash "$f" 2>&1 | grep -cE '^HARNESS-RC=[0-9]+$')
   if (( n == 0 )); then
     ok "mutation ANCHOR: $label really does emit 0 HARNESS-RC lines when run"
   else
@@ -374,7 +476,7 @@ _mut_negative() {   # <label> <file>
   else
     nok "mutation NEGATIVE: $label is (wrongly) reported silenced (verdict $rc) -- a false positive teaches authors to route around this guard"
   fi
-  n=$(bash "$f" 2>&1 | grep -c 'HARNESS-RC')
+  n=$(bash "$f" 2>&1 | grep -cE '^HARNESS-RC=[0-9]+$')
   if (( n >= 1 )); then
     ok "mutation NEGATIVE ANCHOR: $label really does still print HARNESS-RC"
   else
@@ -510,5 +612,83 @@ _mut_negative "a '( trap - EXIT; ... )' reset inside a subshell" \
   "$(_mut_write clean_subshell_reset_unit.sh "$MUT_HEAD
 ( trap - EXIT; echo inner )
 echo body")"
+
+# --- ITERATION 3: THE SPOOF -------------------------------------------------
+# The arm that would have caught iteration 2's oracle. A silenced harness that
+# merely MENTIONS the marker in its own output bought a clean verdict from
+# `grep -q HARNESS-RC`. Ground truth is the ANCHORED count, which is zero.
+_mut_positive "a silenced harness that PRINTS the word HARNESS-RC in its own output" \
+  "$(_mut_write silenced_spoof_unit.sh "$MUT_HEAD
+d=\$(mktemp -d); trap 'rm -rf \"\$d\"' EXIT
+echo 'note: this harness explains the HARNESS-RC contract to the reader'
+echo body")"
+
+# The same spoof text with NO second trap: the marker really is emitted, so the
+# anchor must not red it. Without this, anchoring could be satisfied by a detector
+# that simply reds anything mentioning the marker.
+_mut_negative "a COMPLIANT harness that also prints the word HARNESS-RC in its output" \
+  "$(_mut_write clean_spoof_unit.sh "$MUT_HEAD
+echo 'note: this harness explains the HARNESS-RC contract to the reader'
+echo body")"
+
+# --- ITERATION 3: THE CORRUPTING FORM ---------------------------------------
+# A marker with the WRONG VALUE. Three arms, mirroring _mut_positive, because the
+# same two ways of grading nothing apply: the line must be SEEN by the
+# non-compliant grep, it must be REPORTED by the arm, and the mutant RUN must
+# really misreport its exit code -- otherwise the arm grades a disliked shape
+# rather than a live defect.
+_mut_corrupting() {   # <label> <file> <expected-wrong-rc> <expected-true-rc>
+  local label="$1" f="$2" want="$3" truth="$4" got
+  if [[ -n "$(_rc_noncompliant_marker_lines "$f")" ]]; then
+    ok "mutation CANDIDATE: $label is seen by the non-compliant-marker grep"
+  else
+    nok "mutation CANDIDATE: $label is INVISIBLE to the non-compliant-marker grep -- the arm would never see it"
+  fi
+  got=$(bash "$f" 2>&1 | grep -oE '^HARNESS-RC=[0-9]+$' | tail -1)
+  if [[ "$got" == "HARNESS-RC=$want" ]]; then
+    ok "mutation ANCHOR: $label really misreports -- exits $truth and prints $got"
+  else
+    nok "mutation ANCHOR: $label printed '$got', expected HARNESS-RC=$want -- it is not a live corruption, so the arm above grades nothing"
+  fi
+}
+
+_mut_corrupting_negative() {   # <label> <file> <expected-rc>
+  local label="$1" f="$2" want="$3" got
+  if [[ -z "$(_rc_noncompliant_marker_lines "$f")" ]]; then
+    ok "mutation NEGATIVE: $label is correctly NOT reported as a corrupting trap"
+  else
+    nok "mutation NEGATIVE: $label is (wrongly) reported -- a false positive on a correct fold teaches authors to route around this guard"
+  fi
+  got=$(bash "$f" 2>&1 | grep -oE '^HARNESS-RC=[0-9]+$' | tail -1)
+  if [[ "$got" == "HARNESS-RC=$want" ]]; then
+    ok "mutation NEGATIVE ANCHOR: $label really does report its own code ($got)"
+  else
+    nok "mutation NEGATIVE ANCHOR: $label printed '$got', expected HARNESS-RC=$want -- the negative control is wrong, not the detector"
+  fi
+}
+
+# (1) The live shape, as it stood at tests/headless_question_guard_unit.sh:245.
+_mut_corrupting "cleanup BEFORE rc=\$? in a second top-level trap" \
+  "$(_mut_write corrupt_order_unit.sh "$MUT_HEAD
+f=\$(mktemp)
+trap 'rm -f \"\$f\"; rc=\$?; echo \"HARNESS-RC=\$rc\"' EXIT
+exit 7")" 0 7
+
+# (2) The same hazard written with a function call instead of an inline command --
+# the value is whatever the cleanup returned, which need not be 0.
+_mut_corrupting "a cleanup FUNCTION called before rc=\$?" \
+  "$(_mut_write corrupt_func_unit.sh "$MUT_HEAD
+cleanup() { return 3; }
+trap 'cleanup; rc=\$?; echo \"HARNESS-RC=\$rc\"' EXIT
+exit 7")" 3 7
+
+# NEGATIVE: the CORRECT fold. rc is captured first, cleanup runs after, and the
+# marker carries the harness's own code. This must never be reported.
+_mut_corrupting_negative "a correctly folded second trap (rc=\$? first, cleanup after)" \
+  "$(_mut_write corrupt_clean_unit.sh "$MUT_HEAD
+f=\$(mktemp)
+trap 'rc=\$?; rm -f \"\$f\"; echo \"HARNESS-RC=\$rc\"' EXIT
+exit 7")" 7
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

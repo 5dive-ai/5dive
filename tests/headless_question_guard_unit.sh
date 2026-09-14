@@ -16,7 +16,7 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
+trap 'rc=$?; rm -f "${mut:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-4440: the arm-4 mutant tempfile is cleaned HERE, folded in. A second `trap ... EXIT` at the mutation site would replace this one, and the one that stood there ran `rm -f` BEFORE `rc=$?`, so this harness forced to exit 7 printed HARNESS-RC=0. `${mut:-}` because the trap is armed ~225 lines before the variable exists.
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0
@@ -242,7 +242,6 @@ t  "arm3: verify-challenge still wins over blocked-on-prompt" \
 # Without this the suite would pass against a tree where the guard is written
 # but never wired — which is the shape of the original defect.
 mut=$(mktemp) || { echo "FAIL: arm4: mktemp"; exit 1; }
-trap 'rm -f "$mut"; rc=$?; echo "HARNESS-RC=$rc"' EXIT
 grep -v "pretool-headless-question.sh" src/lib/agent_setup.sh > "$mut"
 if grep -q "pretool-headless-question.sh" "$mut"; then
   FAIL=$((FAIL+1)); echo "FAIL: arm4: mutation did not remove the install"
