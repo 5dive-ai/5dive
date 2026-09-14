@@ -910,6 +910,11 @@ refresh_managed_files() {
   if ! "$BIN_DIR/5dive" agent _reconcile_sudoers; then
     echo "warn: existing standard-seat sudoers were not reconciled; routed reviewers may be unable to use newly shipped narrow primitives" >&2
   fi
+  # DIVE-3966: new Codex seats get the managed AGENTS.md baseline at create
+  # time; this pass backfills and updates existing seats on every upgrade.
+  if ! "$BIN_DIR/5dive" agent _sync_codex_baseline; then
+    echo "warn: existing Codex AGENTS.md baselines were not fully reconciled; user-authored text was left untouched" >&2
+  fi
 
   # DIVE-3554: the relay binaries the shipped Connect Buzz panel shells out to.
   # Fail-soft on purpose (see stage_buzz_binaries) — a buzz release outage must

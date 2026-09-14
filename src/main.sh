@@ -768,6 +768,8 @@ main() {
         # the bundle with no way to source src/, reads the same list the provisioner
         # seeds instead of carrying a second copy that drifts. No root, no state.
         _default_skills) cmd_agent_default_skills "$@" ;;
+        # DIVE-3966: hidden installer migration for existing Codex seats.
+        _sync_codex_baseline) cmd_agent_sync_codex_baseline "$@" ;;
         # DIVE-4081: hidden installer migration. Refresh managed standard-seat
         # sudoers after a bundle upgrade so existing routed reviewers gain the
         # narrow _task_answer path already rendered for newly-created seats.
