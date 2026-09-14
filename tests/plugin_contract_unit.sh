@@ -527,6 +527,70 @@ t  "T9m4 ...as not-ok, so the page re-offers the button"  "false" \
   "$(jq -r '."setupbad@fixture".setup.ok' "$INST")"
 
 # =============================================================================
+# T9o — a setup step this box cannot run is REFUSED, not relayed (DIVE-4491)
+# =============================================================================
+# The defect: `voice` declares `sudo 5dive-setup-voice` and NOTHING installs that
+# binary — not the plugin's cache, not install.sh. The verb handed the string to
+# a shell, so the dashboard panel rendered the shell's own sentence,
+# `sudo: 5dive-setup-voice: command not found`, exit 1. That is legible to
+# someone who can open a terminal, which is precisely the population this button
+# was built to not need. A missing host prerequisite is ours to refuse, in our
+# words, before anything runs.
+#
+# The trap the first-word reading walks into: BOTH shipped setup commands begin
+# with `sudo`, which is always present. So T9o1-T9o6 grade the resolver directly
+# — pure, argv-only, and the only way to see that it looks PAST `sudo` — and
+# T9o7+ grade the verb that consumes it.
+
+t "T9o1 the program is the word after sudo, not sudo itself" "5dive-setup-voice" \
+  "$(_plugin_setup_program 'sudo 5dive-setup-voice')"
+t "T9o2 ...past sudo's flags and their values"               "/opt/s.sh" \
+  "$(_plugin_setup_program 'sudo -u bob -n /opt/s.sh')"
+t "T9o3 ...and past an assignment prefix"                    "setup-thing" \
+  "$(_plugin_setup_program 'FOO=bar setup-thing --now')"
+t "T9o4 a line whose program is browser's resolves to the CLI, which exists" "5dive" \
+  "$(_plugin_setup_program 'sudo 5dive browser setup')"
+# Conservative where it cannot be sure: an empty answer means "run it", so an
+# unparseable line keeps the old behaviour instead of blocking a working step.
+t "T9o5 a line it cannot read yields no program (refuse nothing)" "" \
+  "$(_plugin_setup_program '(cd /x; ./y)')"
+t "T9o6 ...and so does an empty command"                     "" \
+  "$(_plugin_setup_program '')"
+
+# The verb. The fixture's command is `<missing> ; touch <sentinel>` with a `;`
+# and not `&&` on purpose: if the preflight is removed the shell runs the line,
+# the missing program fails, and the `;` still reaches the touch — so the
+# sentinel arm reds when the fix is reverted instead of passing on the failure.
+PFS="$TMP/PREFLIGHT_RAN"
+mkplugin setupgone "$(manifest setupgone 1.0.0 official '["channel"]' '[]' \
+  "$(jq -cn --arg s "$PFS" '{setup:{hint:"needs a host engine", command:("5dive-setup-nope-4491 ; touch " + $s)}}')")"
+mkindex
+run _plugin_mkt_upgrade fixture
+run cmd_plugin_add setupgone@fixture --yes
+t  "T9o7 (precondition) the missing-program fixture installed" "0" "$RC"
+run cmd_plugin_setup setupgone@fixture --yes
+t  "T9o8 a setup step whose program is absent is refused"      "4" "$RC"
+t  "T9o9 ...and NOTHING ran (the line never reached a shell)"  "no" \
+   "$([[ -e "$PFS" ]] && echo yes || echo no)"
+tc "T9o10 ...naming the program the box does not have"         "5dive-setup-nope-4491" "$OUT$ERR"
+tn "T9o11 ...in our sentence, not a shell's"                   "command not found" "$OUT$ERR"
+t  "T9o12 ...and no run is recorded, so the page can still offer the button" "null" \
+   "$(jq -r '."setupgone@fixture".setup.rc // "null"' "$INST")"
+
+# The voice shape end to end: `sudo <missing>`. Same refusal, and it is this arm
+# that would pass on a first-word reading (sudo always exists) — so it is the one
+# that grades the skip. `sudo -n` so a reverted fix fails fast instead of sitting
+# on a password prompt.
+mkplugin setupgonesudo "$(manifest setupgonesudo 1.0.0 official '["channel"]' '[]' \
+  "$(jq -cn '{setup:{hint:"needs a host engine", command:"sudo -n 5dive-setup-nope-4491"}}')")"
+mkindex
+run _plugin_mkt_upgrade fixture
+run cmd_plugin_add setupgonesudo@fixture --yes
+run cmd_plugin_setup setupgonesudo@fixture --yes
+t  "T9o13 the voice shape (sudo + a missing program) is refused too" "4" "$RC"
+tc "T9o14 ...naming the program, never 'sudo'"                 "'5dive-setup-nope-4491'" "$OUT$ERR"
+
+# =============================================================================
 # T9p-T9u — WHOSE box-half is it? (DIVE-4475)
 # =============================================================================
 # The defect these arms exist for: `plugin setup` ran the publisher's command as
