@@ -82,6 +82,7 @@ CORE_FILES=(
   src/lib/validation.sh
   src/lib/models.sh
   src/lib/agent_setup.sh
+  src/lib/plugin_seats.sh
   src/lib/state.sh
   src/lib/env_overrides.sh
   src/lib/gh_config.sh

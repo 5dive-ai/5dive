@@ -208,6 +208,16 @@ _plugin_usage() {
   <plugin>/bin/<verb> and nothing else: the manifest names the verb, it never
   supplies a command line.
 
+  A plugin that declares `skill` or `mcp` is registered with EVERY existing
+  agent on the box at `add` time, and with every agent created afterwards —
+  claude seats through their own `claude plugin install`, other harnesses
+  through the plugin's AGENTS.md section in the file that harness actually
+  reads. `remove` reverses both. `5dive doctor` lists any seat that is missing
+  one. If you register a seat by hand, do it in a NON-LOGIN shell:
+  /etc/profile.d/5dive-shared-configs.sh exports CLAUDE_CONFIG_DIR for every
+  login shell, so `sudo -u agent-x bash -lc 'claude plugin install ...'` reads
+  a different user's config and fails with "not found in marketplace".
+
   Installing a plugin is installing CODE that runs with your agent's access.
   `add` prints who published it and exactly what it will be handed, and waits
   for you to agree. Pass --yes only when you have already read that.
@@ -1131,6 +1141,19 @@ cmd_plugin_add() {
     [[ -n "$setup_cmd"  ]] && echo "  Or have 5dive run exactly that line for you:  sudo 5dive plugin setup $key" >&2
     echo "  (5dive does not run this on its own — read it first; it is the publisher's text.)" >&2
   fi
+  # DIVE-4522. Enabling the plugin for the BOX is half of "installed": a `skill`
+  # or `mcp` plugin is only real once the seat's harness loads it, and until this
+  # line existed nothing here ever touched a seat. Measured on lodar's canary:
+  # browser enabled box-wide since Sep 11, four agents, zero of them able to see
+  # skills/connect-site. The walk is per seat and reports per seat, because the
+  # failure it replaces was a silent one — the old `plugin add` printed
+  # "registers: skill" while registering the skill with nobody.
+  if plugin_seat_is_seat_facing "$caps"; then
+    echo >&2
+    echo "  Registering $key with existing agents:" >&2
+    plugin_seat_apply "$plugin" "$mkt" "$caps" register "$dest" || true
+  fi
+
   ok "$key $version installed${caps:+ — registers: $caps}" \
      '{plugin:$p, marketplace:$m, version:$v, review:$r, capabilities:$c, changed:true}' \
      --arg p "$plugin" --arg m "$mkt" --arg v "$version" --arg r "$review" \
@@ -1163,6 +1186,7 @@ cmd_plugin_remove() {
   local key; _plugin_resolve_installed_key "$ref" "$j"; key="$_PL_KEY"
 
   local plugin mkt; plugin=$(jq -r --arg k "$key" '.[$k].plugin' <<<"$j"); mkt=$(jq -r --arg k "$key" '.[$k].marketplace' <<<"$j")
+  local _rm_caps; _rm_caps=$(jq -r --arg k "$key" '((.[$k].capabilities // []) | join(" "))' <<<"$j")
 
   # §3: "uninstall is TOTAL". Not just the enabled version — every version dir
   # this plugin ever installed, the pointer, and the config stanza. A plugin that
@@ -1178,6 +1202,17 @@ cmd_plugin_remove() {
   rm -rf "$(_plugin_cache_dir)/$mkt/$plugin"
   local tmp; tmp=$(mktemp)
   jq --arg k "$key" 'del(.[$k])' <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
+  # DIVE-4522, the reverse of the walk in `add`. §3 says uninstall is TOTAL, and
+  # a seat still carrying the plugin in its own ~/.claude (or still carrying its
+  # instructions section) is code the user believes they removed — the exact
+  # clause the rm -rf above exists to honour, one layer out. The capabilities it
+  # reads are captured into $_rm_caps from the in-memory record ABOVE, before the
+  # `jq del`, which is why this walk can stand after the record is gone.
+  if plugin_seat_is_seat_facing "$_rm_caps"; then
+    echo "  Unregistering $key from existing agents:" >&2
+    plugin_seat_apply "$plugin" "$mkt" "$_rm_caps" unregister || true
+  fi
+
   ok "$key removed — every version, its pointer and its grants are gone" '{plugin:$k}' --arg k "$key"
 }
 
@@ -1230,6 +1265,17 @@ cmd_plugin_upgrade() {
      --argjson grants "$(jq -c '(.fivedive.grants // [])' <<<"$nj")" \
      '.[$k].version = $v | .[$k].capabilities = $caps | .[$k].grants = $grants | .[$k].upgraded_at = $t' \
      <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
+
+  # DIVE-4522: re-pin the seats at the new version. `5dive-refresh-plugins.sh`
+  # re-pins nightly, but only plugins ALREADY in a seat's installed_plugins.json —
+  # it adds nothing — so a seat that missed the original `add` would stay missing
+  # forever without this. Registration is idempotent, so this is also the repair
+  # path for a box upgraded past the version that first shipped the walk.
+  local _up_caps; _up_caps=$(jq -r '((.fivedive.capabilities // []) | join(" "))' <<<"$nj")
+  if plugin_seat_is_seat_facing "$_up_caps"; then
+    echo "  Re-registering $key with existing agents:" >&2
+    plugin_seat_apply "$plugin" "$mkt" "$_up_caps" register "$dest" || true
+  fi
 
   ok "$key upgraded $cur -> $new (roll back: 5dive plugin rollback $key)" \
      '{plugin:$k, from:$f, to:$t, changed:true}' --arg k "$key" --arg f "$cur" --arg t "$new"

@@ -2782,6 +2782,17 @@ cmd_create() {
     esac
   done
 
+  # DIVE-4522: a new seat gets every seat-facing plugin the BOX already has
+  # enabled, not only its own channel plugins. Per-seat registration used to run
+  # here for channels alone, which is why `plugin add` before a create and
+  # `agent create` after a `plugin add` were BOTH blind — the same gap from two
+  # ends. Best-effort: a marketplace hiccup must not fail an otherwise good
+  # create, and `doctor` reports whatever did not land.
+  if declare -F plugin_seat_backfill >/dev/null 2>&1; then
+    step "Registering enabled 5dive plugins with agent-${name}"
+    plugin_seat_backfill "$name" "$type" || true
+  fi
+
   # Hermes BYO Kimi/Moonshot: KIMI_API_KEY lives in the agent user's
   # ~/.hermes/.env (hermes' Kimi provider reads it directly; there is no
   # `hermes auth add moonshot`). apply_byo_provider stamped it into the

@@ -400,6 +400,53 @@ doctor_check_marketplace_clones() {
   doctor_add plugins marketplace-freshness "$sev" "$msg"
 }
 
+# DIVE-4522 — the seat-registration gap, made visible.
+#
+# `plugin add` enables a plugin for the BOX. A `skill` or `mcp` plugin is only
+# real once the SEAT's harness loads it, and until DIVE-4522 nothing registered
+# it with a seat that already existed. On lodar's canary that state persisted for
+# three days across four agents with no surface anywhere that could report it —
+# `plugin ls` showed the plugin enabled and "registers: skill", and it was true
+# about the box and false about every agent on it.
+#
+# So this check asks the question the old report could not: for each ENABLED
+# seat-facing plugin, which claude seats do NOT carry it? Fixable — `plugin
+# upgrade <key>` re-runs the walk — but deliberately NOT auto-repaired: a seat
+# registration drops privilege and clones a marketplace, which is not something
+# `doctor` should do without being asked.
+doctor_check_plugin_seat_registration() {
+  local rows name type key
+  rows=$(plugin_seat_unregistered_rows 2>/dev/null || true)
+  # GRADED seats, not registry rows. plugin_seat_graded_rows applies the same
+  # filter the walker does (a row whose home is gone is skipped there), so the
+  # count in the green line below is the number of seats this check actually
+  # measured. Counting every registry row instead made the ok-line claim
+  # coverage of seats nothing had looked at — the same sentence this row was
+  # filed to delete, one layer out.
+  local seats_seen=0
+  seats_seen=$(plugin_seat_graded_rows 2>/dev/null | grep -c . || true)
+  if [[ -z "$rows" ]]; then
+    # Silence here has two very different causes and they must not both read
+    # green: no seats at all measures nothing.
+    if (( seats_seen == 0 )); then
+      doctor_add plugins seat-registration warn \
+        "UNKNOWN: no agent seat could be graded (none registered, or none with a home on this box) — nothing was measured"
+    else
+      doctor_add plugins seat-registration ok \
+        "every enabled skill/mcp plugin is carried by all $seats_seen graded seat(s)"
+    fi
+    return 0
+  fi
+  local -a missing=()
+  while IFS=$'\t' read -r name type key; do
+    [[ -n "$name" ]] || continue
+    missing+=("$name:$key")
+  done <<<"$rows"
+  doctor_add plugins seat-registration warn \
+    "${#missing[@]} seat/plugin pair(s) NOT registered: ${missing[*]} — those agents cannot load the plugin's skills (a non-claude seat is missing the plugin's instructions section). Fix: sudo 5dive plugin upgrade <plugin>@<marketplace> (re-runs the per-seat registration), or re-run 'plugin add'. By hand it must be a NON-LOGIN shell — /etc/profile.d/5dive-shared-configs.sh exports CLAUDE_CONFIG_DIR for every login shell, so a -lc form reads another user's config and fails with a misleading 'not found in marketplace'" \
+    false false
+}
+
 # doctor_mp_list <label> [item...]  — " label a, b", or "" when there are none.
 doctor_mp_list() {
   local label="$1"; shift
@@ -1800,6 +1847,9 @@ cmd_doctor() {
     # DIVE-4340: pass the registry seat list so orphan homes are not graded as
     # stale agent clones (they are reported by registry/orphan-seats instead).
     doctor_check_marketplace_clones /home "$_mp_ref" "" "$(doctor_registry_seat_names)"
+    # DIVE-4522: and the other plugin question a box can get wrong — a plugin
+    # enabled here that no seat can see.
+    doctor_check_plugin_seat_registration
   fi
 
   if (( run_memory )); then
