@@ -354,6 +354,51 @@ _grader_can_read() {  # <seat> <ident>
 # what looked like capacity and was not.
 _GRADER_MAX_PER_SEAT="${_GRADER_MAX_PER_SEAT:-1}"
 
+# ══ DIVE-4417: THE MODE SWITCH LIVES HERE, WITH THE TICK THAT READS IT ══
+#
+# `src/task/grader_process.sh` holds the process machinery; these four
+# predicates hold the QUESTION the tick asks, and they are in this file on
+# purpose. Every call into that file below is behind `_grader_process_mode`, so
+# in the shipped default — session mode — the tick reaches none of it and this
+# file is still standalone: `tests/grader_tick_unit.sh` sources it alone, and a
+# lane whose default path depended on a second file would have that harness
+# grading a shape the bundle never runs.
+#
+# The mode ships as `session`, i.e. byte-for-byte today's behaviour. Naming
+# `process` is a THIRD lock, deliberate and separate from naming the pool,
+# because that mode starts a paid one-shot per delivery with no per-seat serial
+# queue in front of it. See grader_process.sh for what it does and what it does
+# not yet do.
+_GRADER_SPAWN_MODE="${_GRADER_SPAWN_MODE:-session}"
+
+# A PREDICATE, not a bare `[[ ]]` at each of the five sites that ask: a mode
+# spelled differently in one of them is a lane that counts processes and then
+# wakes a session.
+_grader_process_mode() { [[ "$_GRADER_SPAWN_MODE" == "process" ]]; }
+
+# The mode name for the plan and the JSON. Anything unrecognised reads as
+# `session` — a typo'd mode must degrade to today's behaviour, and the plan must
+# say which behaviour it degraded to rather than printing the typo back.
+_grader_spawn_mode() { _grader_process_mode && printf 'process' || printf 'session'; }
+
+# The per-seat bound in force, by mode. Read through a function so the two
+# comparison sites in the tick cannot disagree about which bound applies. ONE is
+# correct for a serial seat and must stay 1 there (DIVE-4410: a second wake on a
+# seat is a queue, not a grader); it is only once the grades are separate
+# processes that this constant is the thing to raise.
+_grader_max_per_seat() {
+  if _grader_process_mode; then printf '%s' "${_GRADER_MAX_PER_SEAT_PROCESS:-4}"
+  else printf '%s' "$_GRADER_MAX_PER_SEAT"; fi
+}
+
+# The per-seat reading, from whichever source the mode names — ledger rows for a
+# session lane, the live process table for a process lane. One function so a
+# future mode cannot be taught to the cap and forgotten in the spread; the two
+# disagreeing about which grades exist is the DIVE-4418 failure in a new place.
+_grader_load_source() {
+  if _grader_process_mode; then _grader_process_seat_loads; else _grader_seat_loads; fi
+}
+
 # The seat rides in the spawn row's DETAIL (`grader session on <seat>`), which is
 # the only place it is recorded — `task.grade.spawned` has no seat column and
 # lifecycle_events is append-only, so adding one would leave every historical row
@@ -633,7 +678,7 @@ cmd_task_grader_tick() {
                  ORDER BY e.id;" 2>/dev/null || printf '')
 
   local usage="" ; usage=$($_GRADER_USAGE_CMD 2>/dev/null || printf '')
-  local n_pending=0 n_spawn=0 n_queue=0 n_refuse=0 plan=""
+  local n_pending=0 n_spawn=0 n_queue=0 n_refuse=0 n_fail=0 plan=""
   # ══ DIVE-4322: IN FLIGHT MEANS GRADING, NOT "NOT YET CLOSED" ══
   #
   # This count was `spawned with no later task.done/task.rejected`, i.e. a grade
@@ -691,6 +736,31 @@ $(_grader_inflight_exits_sql)
                                 ;" 2>/dev/null || printf 0)
   [[ "$inflight" =~ ^[0-9]+$ ]] || inflight=0
 
+  # ══ DIVE-4417: IN PROCESS MODE THE LEDGER IS NOT THE TRUTH ABOUT CAPACITY ══
+  # Everything above reconstructs "is this grade still running?" from rows the
+  # grade may never write, which is why it needed DIVE-4322's exit set and
+  # DIVE-4418's six-hour bound on top. A process answers directly: it is in the
+  # process table or it is not. Read here, once per tick, and used for both the
+  # cap and the log line DO (6) asks for — in session mode it is reported and
+  # binds nothing, because there are no one-shots to find.
+  # GUARDED, not read unconditionally: in session mode there are no one-shots to
+  # find, and calling into grader_process.sh from the default path would make
+  # this file's own harness depend on a file it does not source.
+  local n_procs=0
+  if _grader_process_mode; then
+    n_procs=$(_grader_process_count)
+    [[ "$n_procs" =~ ^[0-9]+$ ]] || n_procs=0
+  fi
+  # `if`, NEVER `pred && assign`: under the bundle's `set -euo pipefail` a false
+  # predicate at statement position is a non-zero simple command and errexit kills
+  # the tick — i.e. the SESSION-mode path, the one that must not change at all.
+  if _grader_process_mode; then inflight="$n_procs"; fi
+  # The per-seat bound differs by mode (1 is correct for a serial seat, wrong for
+  # parallel processes), so it is resolved ONCE and both comparison sites read
+  # this local — two sites reading the raw constant is how a mode half-applies.
+  local _gp_seatcap; _gp_seatcap=$(_grader_max_per_seat)
+  [[ "$_gp_seatcap" =~ ^[0-9]+$ ]] || _gp_seatcap=1
+
   # ══ THE DROP IS ANNOUNCED, NEVER SILENT ══
   # Read BEFORE the pending loop and printed at the TOP of the plan, so a reader
   # who is trying to explain why the lane had capacity (or why a grade never came
@@ -713,7 +783,7 @@ $(_grader_inflight_exits_sql)
   while IFS=$'\x1f' read -r _gp_seat _gp_n; do
     [[ -n "$_gp_seat" && "$_gp_n" =~ ^[0-9]+$ ]] || continue
     _gp_load["$_gp_seat"]="$_gp_n"
-  done < <(_grader_seat_loads)
+  done < <(_grader_load_source)
   local _gp_last; _gp_last=$(_grader_last_picked_seat)
 
   local ident
@@ -801,14 +871,14 @@ $(_grader_inflight_exits_sql)
     for seat in $_GRADER_POOL; do
       pairs+="${seat}=${_gp_load[$seat]:-0}"$'\n'
       loadstr+="${loadstr:+ }${seat}=${_gp_load[$seat]:-0}"
-      (( ${_gp_load[$seat]:-0} >= _GRADER_MAX_PER_SEAT )) && busy+="${seat} busy:${_gp_load[$seat]:-0}; "
+      (( ${_gp_load[$seat]:-0} >= _gp_seatcap )) && busy+="${seat} busy:${_gp_load[$seat]:-0}; "
     done
     local order; order=$(printf '%s' "$pairs" | _grader_pool_order "$_gp_last")
     for seat in $order; do
       # A seat already grading is not capacity. `_grader_spawn_session` is
       # assign+wake on a live seat and a seat runs one session at a time, so a
       # second grade here is a queue, not a parallel grader.
-      (( ${_gp_load[$seat]:-0} < _GRADER_MAX_PER_SEAT )) || continue
+      (( ${_gp_load[$seat]:-0} < _gp_seatcap )) || continue
       local acct; acct=$(printf '%s' "$usage" | _grader_account_of "$seat")
       # `|| rc=$?`, NOT `; rc=$?`, and the difference is the whole refusal half
       # of this lane. `_grader_window_ok` is dual-channel BY DESIGN — verdict on
@@ -853,26 +923,78 @@ $(_grader_inflight_exits_sql)
     # the 4-onto-quinn tick this row was filed on.
     _gp_load["$chosen"]=$(( ${_gp_load[$chosen]:-0} + 1 ))
     _gp_last="$chosen"
-    plan+="spawn   $ident  -> $chosen  (in-flight ${loadstr}; ${busy}${why})"$'\n'
+    # DIVE-4417 (6): the live process count per tick, on the spawn line, beside
+    # the mode that produced it — the one number that says whether the lane is
+    # actually running graders in parallel or is a queue reporting spawn=N.
+    plan+="spawn   $ident  -> $chosen  (in-flight ${loadstr}; ${busy}${why}mode=$(_grader_spawn_mode) procs=${n_procs})"$'\n'
+    if _grader_process_mode; then n_procs=$((n_procs+1)); fi
     if (( commit )); then
       # THE ONLY LINE THAT STARTS ANYTHING, and it records the intent to the
       # ledger BEFORE acting so a crash between the two leaves a spawn we can
       # see rather than one we cannot account for.
-      ledger_emit task.grade.spawned ident="$ident" actor="$(task_actor "")" \
-        detail="grader session on ${chosen}" || true
-      _grader_spawn_session "$chosen" "$ident" || warn "$ident: spawn on $chosen failed"
+      # The session id is minted BEFORE the ledger row so the row can name it:
+      # `run ls` and the spawn log must agree on which of quinn's concurrent
+      # grades this is, and a detail written without it is unattributable
+      # forever (lifecycle_events is append-only).
+      #
+      # The `grader session on <seat>` prefix is LOAD-BEARING and is kept
+      # verbatim in both modes — `_GRADER_SEAT_EXPR` reads the seat out of this
+      # string at a fixed offset, so the suffix may grow and the prefix may not.
+      local _gp_sid=""
+      if _grader_process_mode; then
+        # ══ DIVE-4417 iteration 2: IN PROCESS MODE THE LEDGER ROW COMES AFTER ══
+        #
+        # "Record the intent before acting" is right in SESSION mode and wrong
+        # here, and the asymmetry is the whole point. There, a wake that fails
+        # leaves a visibly idle seat with a unit, a pane and a liveness rail
+        # watching it, so a spawn row with nothing behind it is noticed. A
+        # one-shot has none of those (see grader_process.sh's header), so the
+        # same row written ahead of a failed launch is permanent: the pending
+        # query at :674 excludes any ident carrying a later
+        # `task.grade.spawned`, and the delivery would never be re-picked by
+        # any tick. quinn measured exactly that on iteration 1.
+        #
+        # So in this mode the row is the RECEIPT of a started process, not the
+        # intent to start one. The window it opens instead — a crash between
+        # the launch and this emit — is the safe one: the row stays pending and
+        # the next tick re-picks it, which is a duplicate grade at worst rather
+        # than a delivery nobody grades. `_grader_process_spawn` owns the other
+        # half: it probes the runas before it assigns, confirms the process is
+        # alive before it returns 0, and unwinds the assign if it is not.
+        _gp_sid=$(_grader_process_session_id "$chosen")
+        if _grader_process_spawn "$chosen" "$ident" "$_gp_sid"; then
+          ledger_emit task.grade.spawned ident="$ident" actor="$(task_actor "")" \
+            detail="grader session on ${chosen}${_gp_sid:+ (process ${_gp_sid})}" || true
+        else
+          warn "$ident: grader process on $chosen failed"
+          # The tick's own arithmetic is corrected too. A summary reading
+          # spawn=1 for a launch that never started is the same untruth as the
+          # ledger row, one line further down, and the slot it reserved must go
+          # back or the rest of this tick plans against capacity it never spent.
+          n_spawn=$((n_spawn-1)); n_fail=$((n_fail+1))
+          inflight=$((inflight-1)); n_procs=$((n_procs-1))
+          _gp_load["$chosen"]=$(( ${_gp_load[$chosen]:-1} - 1 ))
+          plan+="failed  $ident  -> $chosen  (launch did not start; assign reverted, row stays pending)"$'\n'
+        fi
+      else
+        ledger_emit task.grade.spawned ident="$ident" actor="$(task_actor "")" \
+          detail="grader session on ${chosen}" || true
+        _grader_spawn_session "$chosen" "$ident" || warn "$ident: spawn on $chosen failed"
+      fi
     fi
   done <<<"$pending"
 
   if (( json )); then
-    printf '{"pending":%d,"spawned":%d,"queued":%d,"dark":%d,"stale":%d,"staleHours":%d,"cap":%d,"commit":%s,"pool":"%s"}\n' \
+    printf '{"pending":%d,"spawned":%d,"queued":%d,"dark":%d,"stale":%d,"staleHours":%d,"cap":%d,"commit":%s,"pool":"%s","mode":"%s","procs":%d,"seatCap":%d,"failed":%d}\n' \
       "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_stale" "$stale_h" "$cap" \
-      "$( ((commit)) && printf true || printf false )" "$_GRADER_POOL"
+      "$( ((commit)) && printf true || printf false )" "$_GRADER_POOL" \
+      "$(_grader_spawn_mode)" "$n_procs" "$_gp_seatcap" "$n_fail"
     return 0
   fi
   printf '%s' "$plan"
-  printf 'pending=%d spawn=%d queue=%d dark=%d stale=%d cap=%d %s\n' \
+  printf 'pending=%d spawn=%d queue=%d dark=%d stale=%d cap=%d mode=%s procs=%d seatcap=%d failed=%d %s\n' \
     "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_stale" "$cap" \
+    "$(_grader_spawn_mode)" "$n_procs" "$_gp_seatcap" "$n_fail" \
     "$( ((commit)) && printf '(COMMITTED)' || printf '(dry-run — pass --commit to act)' )"
 }
 
