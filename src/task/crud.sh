@@ -360,6 +360,60 @@ cmd_task_add() {
     [[ -z "$assignee" ]] && assignee=$(_task_resolve_coordinator)
     [[ -n "$assignee" ]] && auto_coordinated=1
   fi
+  # DIVE-4555: A ROW NOBODY WILL EVER DISPATCH IS ACCEPTED SILENTLY — the two
+  # halves of that, both of which live on THIS path and not the explicit one.
+  #
+  # `_task_require_lane` above runs the asleep check on what the CALLER TYPED.
+  # The default resolved two lines up is the parallel path, and it carried no
+  # check at all: a board whose project lead or coordinator has its heartbeat off
+  # auto-coordinates every unassigned row onto a seat the tick never iterates,
+  # and `task doctor` calls each one dead-lane afterwards. Same predicate, same
+  # wording, said at the only moment the filer can pick a different seat.
+  #
+  # And when the default resolves to NOTHING (no project lead, and
+  # `_task_resolve_coordinator` finds no tagged role and no LONE org root — nine
+  # roots on teal-fox, so all three tiers miss), the row is created unassigned and
+  # the filer reads a plain "created DIVE-N". Fourteen rows landed that way there
+  # over eight weeks from eight different seats, every one of them `task add` with
+  # no --assignee. Nothing wakes an unassigned row, so each was autonomy zero from
+  # the moment it was accepted.
+  #
+  # ROUTE, THEN REFUSE — never accept. The creator's own manager is a real owner
+  # and is what the gate router already falls back to, so prefer it and SAY so on
+  # the created line. Refuse only when there is nowhere at all to route, and
+  # refuse with the same fix line `5dive doctor` prints, because the filer is the
+  # person standing in front of the problem.
+  #
+  # DEGRADE, DO NOT GUESS (the rule `_task_require_lane` and
+  # `_task_doctor_lane_wakeable` both keep): an EMPTY org chart is a fresh box or
+  # a unit fixture, not a misconfigured fleet, and an unreadable roster is a
+  # measurement failure. Neither may become a refusal — only a chart that someone
+  # has actually built, and still has no dispatchable owner, is a finding.
+  local coord_routed=""
+  if [[ "$kind" == "standard" ]]; then
+    if (( auto_coordinated )); then
+      _task_lane_asleep_note "$assignee" "the row's default owner"
+    elif [[ -z "$assignee" ]]; then
+      local _filer="${from:-$ACTOR_BOARD}" _mgr="" _org_n=0
+      _org_n=$(db "SELECT COUNT(*) FROM agents_org;" 2>/dev/null) || _org_n=0
+      [[ "$_org_n" =~ ^[0-9]+$ ]] || _org_n=0
+      if [[ -n "$_filer" ]]; then
+        _mgr=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$_filer");" 2>/dev/null) || _mgr=""
+      fi
+      _task_roster
+      # A manager edge pointing at a name that is not a registered agent routes
+      # nowhere — that is `task orphans`' whole subject. Only a roster we could
+      # actually read can veto it.
+      if [[ -n "$_mgr" && "$_TASK_ROSTER_STATE" == "ok" ]] && ! _task_roster_has "$_mgr"; then _mgr=""; fi
+      if [[ -n "$_mgr" ]]; then
+        assignee="$_mgr"; auto_coordinated=1; coord_routed="manager of ${_filer}"
+        warn "no project lead and no org coordinator resolves on this board, so ${_filer}'s manager '${_mgr}' owns this row. Nothing wakes an unassigned row, so leaving it unowned would have made it undispatchable from the moment it was created. Tag a coordinator so the next one routes on its own: 5dive org set <agent> --role='<existing role text> coordinator'   (board-wide view: 5dive task doctor)"
+        _task_lane_asleep_note "$assignee" "the row's default owner"
+      elif (( _org_n > 0 )) && [[ "${FIVE_ALLOW_UNOWNED:-0}" != "1" ]]; then
+        fail "$E_VALIDATION" "this row would be created with NO OWNER, and nothing wakes an unassigned row — the heartbeat tick only iterates assignees, so it would sit on the board forever reading as backlog. No project lead on '${project}', no agent tagged coordinator, no lone org root, and '${_filer:-the filer}' has no manager to route to. Fix it once, for every future row: 5dive org set <agent> --role='<existing role text> coordinator'   (or name an owner on this one: --assignee=<agent>; roster: 5dive agent list; board-wide view: 5dive task doctor)"
+      fi
+    fi
+  fi
   # DIVE-3097: an explicit --verifier naming this row's own (now-fully-resolved)
   # assignee reaches the IDENTICAL end state `task verifier` already refuses —
   # "'X' is <ident>'s own assignee — a maker can't grade itself" — but `task add`
@@ -737,7 +791,10 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
       warn "$ident: title cites existing ${followup_warn_ident} ${followup_warn_kind} #${followup_warn_number} without --parent, so no child link was created.${_followup_match_note} If this is a child, file it with --parent=${followup_warn_ident}."
     fi
     local coord_note=""
-    (( auto_coordinated )) && coord_note=" → coordinator: $assignee"
+    # DIVE-4555: name WHY it landed there when it was not the coordinator, so the
+    # filer can tell "the board routed this deliberately" from "the board had to
+    # find someone".
+    (( auto_coordinated )) && coord_note=" → ${coord_routed:-coordinator}: $assignee"
     local verify_note=""
     (( verify_defaulted )) && verify_note=" · verifier-graded by default → $verifier ('task done' hands off to grade; refine with --accept/--verify, or opt out with --no-verify)"
     # INST-2 (DIVE-1673): a quiet, lowercase tag — honest but not a nag for solo
