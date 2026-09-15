@@ -1529,6 +1529,44 @@ cmd_doctor() {
       fi
     fi
 
+    # --- DIVE-4551: can a fleet-health ALERT reach anybody? ---
+    #
+    # The check above grades whether the needs-you banner has an owner. This one
+    # grades the other consumer of the same resolution, and it is the one that
+    # went silent on a customer box: every supervisor alert named `main` on both
+    # legs, a seat that exists on exactly one box in the world. On teal-fox
+    # (0.40.0, three org roots, none tagged) a seat with an open row and nothing
+    # closed in 32 days alerted correctly, audited correctly and reached nobody.
+    #
+    # Severity is keyed to CONSEQUENCE like its neighbour, and the evidence is
+    # the audit trail rather than the config: an 'alert-undeliverable' row means
+    # a leg was ACTUALLY lost in the last 7 days, not that one could be. So this
+    # cannot read [ok] while the watcher is dark, which is the exact failure the
+    # row was filed on.
+    if [[ -f "${TASKS_DB:-}" ]]; then
+      local undeliv undeliv_seats alert_to
+      undeliv=$(db "SELECT COUNT(*) FROM supervisor_events
+                    WHERE event='alert-undeliverable'
+                      AND ts >= datetime('now', '-7 days');" 2>/dev/null || echo 0)
+      [[ "$undeliv" =~ ^[0-9]+$ ]] || undeliv=0
+      if (( undeliv > 0 )); then
+        undeliv_seats=$(db "SELECT COUNT(DISTINCT agent) FROM supervisor_events
+                            WHERE event='alert-undeliverable'
+                              AND ts >= datetime('now', '-7 days');" 2>/dev/null || echo 0)
+        doctor_add channels supervisor-alert-delivery error \
+          "${undeliv} fleet-health alert leg(s) for ${undeliv_seats:-?} seat(s) were UNDELIVERABLE in the last 7d — a supervisor alert or a heartbeat escalation fired and reached nobody (DIVE-4551/4554); fix: give the chart ONE root (5dive org set <agent> --manager=<mgr>), or tag the seat that should be paged (5dive org set <agent> --role='<their prose> gate notifier')" false false
+      else
+        alert_to=$(_sup_alert_recipient 2>/dev/null || true)
+        if [[ -n "$alert_to" ]]; then
+          doctor_add channels supervisor-alert-delivery ok \
+            "fleet-health alerts (supervisor + heartbeat escalations) resolve to '$alert_to' — 0 undeliverable in the last 7d"
+        else
+          doctor_add channels supervisor-alert-delivery warn \
+            "NO recipient resolves for fleet-health alerts — every supervisor alert AND every heartbeat escalation (spend-cap wall, usage-limit freeze, stranded seat) will be audited and delivered to nobody (DIVE-4551/4554); harmless only while the fleet is clean; fix: 5dive org set <agent> --role='<their prose> gate notifier'" false false
+        fi
+      fi
+    fi
+
     # --- DIVE-3964: per-seat channel BINDING, from the bridge handshake ---
     #
     # The two checks around this one grade CONFIGURATION — is the allowlist

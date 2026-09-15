@@ -1388,6 +1388,110 @@ sup_info_for_agent() {  # <name>
   _sup_info_status "$armed" "$tick" "$row" "$now" "$rc" "$rcause" "$rdetail" "$open" "$days" "$store" "$wall"
 }
 
+# ── DIVE-4551: WHO RECEIVES A FLEET-HEALTH ALERT ────────────────────────────
+#
+# Every alert below used to name `main` literally, on BOTH legs, in all three
+# rails. `main` is a seat that exists on exactly one box in the world — ours.
+# Reported from a customer box (teal-fox, 5dive 0.40.0, 2026-09-15) whose org
+# roots are claude-aleks / claude-alena / claude-jane: `agent send main` failed
+# with "no agent named 'main'" and `_task_agent_channel main` was false, so both
+# legs dropped and the ONLY trace of a seat sitting on an open row with nothing
+# closed in 32 days was a warn line in a cron log nobody reads. That is the
+# DIVE-3272 blind spot reproduced one level up: the cover for it existed and was
+# addressed to a name that does not resolve.
+#
+# WHY THE NOTIFIER AND NOT THE COORDINATOR. The row proposed
+# `_task_resolve_coordinator` for both legs. Measured on this box before writing
+# it: that resolver returns **olivia** (the lone org root, the advisory CEO), not
+# main — main is tagged `gate notifier` (DIVE-4365). So the literal proposal
+# would have re-routed every fleet-health alert HERE from the CTO who co-owns the
+# D4 runbook these messages cite onto a seat that does not run it, which is a
+# regression dressed as a fix. `_task_resolve_gate_notifier` is the resolver
+# whose JOB is "which seat pages a person about fleet state", and it FALLS BACK
+# to `_task_resolve_coordinator`, so on an untagged customer chart with one root
+# it resolves exactly what the row asked for (claude-aleks) and on this box it
+# resolves `main` — byte-identical here, fixed there. It also gives the customer
+# the narrow override the row wanted without inventing a config key: tagging
+# a seat `gate notifier` moves the alerts alone, where tagging one `coordinator`
+# would also dump every unassigned row and every default plan on them (the six
+# call sites named in the DIVE-4365 note above _task_resolve_gate_notifier).
+#
+# ONE resolver for BOTH legs, deliberately: the a2a and the DM must land on the
+# same seat or the reply arrives in a chat that holds none of the context —
+# measured on DIVE-4359 and the reason the notifier knob exists at all.
+_sup_alert_recipient() {  # -> seat name, or empty when nothing resolves
+  declare -F _task_resolve_gate_notifier >/dev/null 2>&1 || return 0
+  _task_resolve_gate_notifier 2>/dev/null || true
+}
+
+# An undeliverable alert must not be a `warn` that scrolls away — that IS the
+# incident. The tick still never aborts (DIVE-1127 design), so the escape is an
+# audited row of its own: queryable after the fact, counted in the tick summary,
+# and read by `5dive doctor` (supervisor-alert-delivery) so the box says out loud
+# that its fleet watcher cannot reach anyone. Deliberately a SECOND row rather
+# than a field on the 'alert' row: the alert fired and is real either way, and a
+# reader filtering `event='alert'` must keep seeing it.
+#
+# <reason> is one of: no-coordinator (nothing resolves), send-failed (the a2a
+# rail refused), no-channel (the resolved seat has no paired Telegram channel —
+# the leg that was a silent `if` with no else before this row).
+_SUP_ALERTS_UNDELIVERABLE=0
+_sup_alert_undeliverable() {  # <name> <class> <leg> <reason> [recipient]
+  local name="$1" class="$2" leg="$3" reason="$4" to="${5:-}" sig
+  _SUP_ALERTS_UNDELIVERABLE=$(( _SUP_ALERTS_UNDELIVERABLE + 1 ))
+  sig=$(jq -nc --arg l "$leg" --arg r "$reason" --arg to "$to" \
+          '{leg:$l, reason:$r, recipient:(if $to == "" then null else $to end)}' 2>/dev/null \
+        || printf '{"leg":"%s","reason":"%s"}' "$leg" "$reason")
+  # The SUBSHELL is load-bearing, not style: `db` fences the store and a fenced
+  # or missing store makes it `fail`, which EXITS. An alert-delivery failure
+  # taking the whole tick down with it would be the DIVE-1127 rule inverted by
+  # the very code written to honour it. The count above is bumped first and in
+  # THIS shell, so the summary line still reports a leg the audit row lost.
+  ( db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+        VALUES ($(sqlq "$name"), 'alert-undeliverable', $(sqlq "$class"),
+                $(sqlq "$reason"), $(sqlq "$sig"));" ) >/dev/null 2>&1 || true
+}
+
+# Both legs of every alert rail, in one place. Best-effort by construction: a
+# wedged channel, a missing seat or an empty org chart must never abort the tick
+# for the rest of the fleet (DIVE-1127) — it must only be IMPOSSIBLE to lose
+# silently. A muted leg (DIVE-3982 / DIVE-4052) is not undeliverable and is not
+# counted: nobody asked for it to be delivered.
+_sup_alert_deliver() {  # <rail> <name> <class> <msg> [notify_human=true] [notify_machine=true]
+  local rail="$1" name="$2" class="$3" msg="$4" \
+        notify_human="${5:-true}" notify_machine="${6:-true}" to
+  to=$(_sup_alert_recipient)
+  if [[ -z "$to" ]]; then
+    warn "${rail}: UNDELIVERABLE for $name — no alert recipient resolves on this box (alert still audited); fix: give the org chart ONE root (5dive org set <agent> --manager=<mgr>), or tag a seat (5dive org set <agent> --role='<their prose> gate notifier')"
+    if [[ "$notify_machine" == "true" ]]; then
+      _sup_alert_undeliverable "$name" "$class" machine no-coordinator ""
+    fi
+    if [[ "$notify_human" == "true" ]]; then
+      _sup_alert_undeliverable "$name" "$class" human no-coordinator ""
+    fi
+    return 0
+  fi
+  # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
+  # a2a_round_guard. NOT a sender exemption; never set this by hand.
+  if [[ "$notify_machine" == "true" ]]; then
+    if ! _5DIVE_A2A_NOTIFY=1 5dive agent send "$to" "$msg" >/dev/null 2>&1; then
+      warn "${rail}: 'agent send ${to}' failed for $name (alert still audited)"
+      _sup_alert_undeliverable "$name" "$class" machine send-failed "$to"
+    fi
+  fi
+  # lodar is a human, not an agent — reached through the notifier seat's paired
+  # channel. A seat that resolves but carries no channel used to be a silent
+  # skip; it is now audited like any other lost leg.
+  if [[ "$notify_human" == "true" ]]; then
+    if _task_agent_channel "$to"; then
+      _task_send_owner "$msg" >/dev/null 2>&1 || true
+    else
+      warn "${rail}: no paired channel on '${to}' for $name (alert still audited)"
+      _sup_alert_undeliverable "$name" "$class" human no-channel "$to"
+    fi
+  fi
+}
+
 # DIVE-3272: a seat that cannot transact is a FLEET-health event. The entire cost
 # of the incident was the 20 rows queued behind a seat nobody knew was dark, so
 # the alert leads with that and not with the seat's own symptom. Same delivery
@@ -1409,15 +1513,9 @@ _sup_capacity_alert() {  # <name> <class> <detail> [notify_human=true] [notify_m
   #
   # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
   # a2a_round_guard. NOT a sender exemption; never set this by hand.
-  if [[ "$notify_machine" == "true" ]]; then
-    _5DIVE_A2A_NOTIFY=1 5dive agent send main "$msg" >/dev/null 2>&1 \
-      || warn "capacity-alert: 'agent send main' failed for $name (alert still audited)"
-  fi
-  # lodar is a human — reached through main's paired channel, same route the
-  # verify tripwire uses. Best-effort: a miss still leaves the audited alert row.
-  if [[ "$notify_human" == "true" ]] && _task_agent_channel main; then
-    _task_send_owner "$msg" >/dev/null 2>&1 || true
-  fi
+  # DIVE-4551: both legs go to the RESOLVED recipient, and a leg that cannot be
+  # delivered is audited rather than warned into a log nobody reads.
+  _sup_alert_deliver capacity-alert "$name" "$class" "$msg" "$notify_human" "$notify_machine"
 }
 
 # DIVE-4052: which LEGS does a capacity alert get? Two pure decisions, no I/O,
@@ -1474,12 +1572,7 @@ _sup_prompt_alert() {  # <name> <detail> [cause]
   else
     msg="[FLEET-HEALTH blocked-on-prompt] agent '${name}' is UP and REACHABLE and is WAITING ON A KEYPRESS: ${detail}. It called AskUserQuestion or ExitPlanMode and the picker is rendering into a tmux pane nobody is reading; the seat will sit there until someone answers it. The highlighted option is NOT marked (Recommended), so this watchdog will not choose for it. Read the pane (tmux attach -t agent-${name}), pick the option, and if the choice genuinely needed a person it belongs on a task gate, not a picker."
   fi
-  # DIVE-3318: a one-way machine notice nobody replies to is not a round.
-  _5DIVE_A2A_NOTIFY=1 5dive agent send main "$msg" >/dev/null 2>&1 \
-    || warn "prompt-alert: 'agent send main' failed for $name (alert still audited)"
-  if _task_agent_channel main; then
-    _task_send_owner "$msg" >/dev/null 2>&1 || true
-  fi
+  _sup_alert_deliver prompt-alert "$name" blocked-on-prompt "$msg"
 }
 
 # DIVE-1127: fire the same-day alert for a tripped account. Both legs are
@@ -1490,18 +1583,7 @@ _sup_prompt_alert() {  # <name> <detail> [cause]
 _sup_verify_alert() {  # <name> <excerpt>
   local name="$1" excerpt="$2"
   local msg="[TRIPWIRE id-verification] claude account 'agent-${name}' looks STALLED on an ID/age-verification challenge (anthropic-tos-hedge D4 trigger 1). Response: flip this account to the OpenRouter-Claude profile same-day (A1 runbook). Pane signature: ${excerpt}"
-  # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
-  # a2a_round_guard. NOT a sender exemption; never set this by hand.
-  _5DIVE_A2A_NOTIFY=1 5dive agent send main "$msg" >/dev/null 2>&1 \
-    || warn "verify-tripwire: 'agent send main' failed for $name (alert still audited)"
-  # lodar is a human, not an agent — reach them through main's paired Telegram
-  # channel (main is the human-facing bot). Resolve main's channel, then DM the
-  # owner on it. Best-effort: a miss is fine — main's agent-send leg above and
-  # the audited alert row still carry the signal. (DIVE-1127 last-mile, routing
-  # decided by main.)
-  if _task_agent_channel main; then
-    _task_send_owner "$msg" >/dev/null 2>&1 || true
-  fi
+  _sup_alert_deliver verify-tripwire "$name" verify-challenge "$msg"
 }
 
 # Goal-drift (DIVE-971): claude-only, transcript-scoped, STRUCTURAL — no
@@ -2953,6 +3035,10 @@ cmd_supervisor_tick() {
   # gets its own alert path, always live when the tick is enabled (no actions flag),
   # deduped one alert per account per _SUP_ALERT_WINDOW_H, and audited as event='alert'.
   local alerted=0
+  # DIVE-4551: per-tick, because the alert helpers below bump it as a global
+  # (the loop runs in this shell — process substitution, not a pipe — so the
+  # count survives to the summary line and the heartbeat row).
+  _SUP_ALERTS_UNDELIVERABLE=0
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     # DIVE-3272: the same always-live, deduped alert path carries the capacity
@@ -3378,9 +3464,11 @@ cmd_supervisor_tick() {
           --argjson vc "$vchal" --argjson no "$nooutput" --argjson up "$updpend" \
           --argjson qe "$quota" --argjson un "$unprobed" \
           --argjson ot "$other" --argjson ev "$events" \
+          --argjson ua "${_SUP_ALERTS_UNDELIVERABLE:-0}" \
           '{total:$t, healthy:$h, slow:$sl, drift:$dr, stuck:$st, stalled:$sa,
             verifyChallenge:$vc, noOutput:$no, updatePending:$up,
-            quotaExhausted:$qe, unprobed:$un, unclassified:$ot, anomalyRows:$ev}')
+            quotaExhausted:$qe, unprobed:$un, unclassified:$ot, anomalyRows:$ev,
+            alertsUndeliverable:$ua}')
   db "INSERT INTO supervisor_events (agent, event, classification, signals)
       VALUES ('(fleet)', 'heartbeat', $(sqlq "$fleet_class"), $(sqlq "$sig"));" \
     2>/dev/null && events=$((events + 1)) || warn "supervisor: heartbeat insert failed"
@@ -3391,17 +3479,24 @@ cmd_supervisor_tick() {
   fi
   local vchal_note=""
   (( vchal > 0 )) && vchal_note=" · ⚠ ${vchal} verify-challenge (${alerted} alerted)"
+  # DIVE-4551: an alert that reached nobody is the loudest thing this line can
+  # carry — it says the watcher itself is dark. Appears only when non-zero, like
+  # every other conditional note here.
+  local undeliv_note=""
+  (( ${_SUP_ALERTS_UNDELIVERABLE:-0} > 0 )) \
+    && undeliv_note=" · ⚠ ${_SUP_ALERTS_UNDELIVERABLE} alert leg(s) UNDELIVERABLE (no recipient resolves — see 5dive doctor)"
   # DIVE-3667: the four original buckets keep their exact position so anything
   # already parsing this line still parses; the rest appear only when non-zero,
   # so a clean fleet's line does not grow.
   local extra
   extra=$(_sup_rollup_extra "$stalled" "$nooutput" "$updpend" "$quota" "$other")
-  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${drift} drift / ${stuck} stuck${extra} · ${events} audit row(s)${act_note}${vchal_note}" \
-     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), drift:($dr|tonumber), stuck:($st|tonumber), stalled:($sa|tonumber), noOutput:($no|tonumber), updatePending:($up|tonumber), quotaExhausted:($qe|tonumber), unclassified:($ot|tonumber), verifyChallenge:($vc|tonumber), alerted:($al|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber)}' \
+  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${drift} drift / ${stuck} stuck${extra} · ${events} audit row(s)${act_note}${vchal_note}${undeliv_note}" \
+     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), drift:($dr|tonumber), stuck:($st|tonumber), stalled:($sa|tonumber), noOutput:($no|tonumber), updatePending:($up|tonumber), quotaExhausted:($qe|tonumber), unclassified:($ot|tonumber), verifyChallenge:($vc|tonumber), alerted:($al|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber), alertsUndeliverable:($ua|tonumber)}' \
      --arg t "$total" --arg h "$healthy" --arg sl "$slow" --arg dr "$drift" --arg st "$stuck" --arg e "$events" \
      --arg sa "$stalled" --arg no "$nooutput" --arg up "$updpend" --arg qe "$quota" --arg ot "$other" \
      --arg vc "$vchal" --arg al "$alerted" \
-     --arg ae "$actions_on" --arg ac "$acted" --arg pl "$planned" --arg es "$escalated"
+     --arg ae "$actions_on" --arg ac "$acted" --arg pl "$planned" --arg es "$escalated" \
+     --arg ua "${_SUP_ALERTS_UNDELIVERABLE:-0}"
 }
 
 cmd_supervisor() {

@@ -55,6 +55,14 @@ audit_log() { return 0; }
 
 tasks_db_init
 
+# DIVE-4554: the housekeeping notices below no longer address a seat by name —
+# they ask `_hb_ops_recipient` who holds that job on THIS chart. An empty
+# `agents_org` therefore resolves nobody, and the notice is audited instead of
+# sent, which is the correct product behaviour and makes every "the coordinator
+# is told" arm below vacuous. So the fixture now states the chart it always
+# assumed: one ops seat, the one these notices went to unconditionally before.
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('ops','DevOps / SRE',NULL);"
+
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
