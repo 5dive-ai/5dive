@@ -4085,9 +4085,18 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+    # DIVE-4537 (iteration 2): AN AUTO-APPLIED ANSWER OWES THE SAME WORK A TYPED
+    # ONE DOES. The iteration-cap stop is the one gate whose answer IS a verb, and
+    # every auto-clear here writes need_answer directly and returns — so without
+    # this line the stop is recorded as answered and the loop stays stopped, which
+    # is worse than the gate it replaced (no human and no lead is in the path to
+    # notice). No-op on every other gate: the executor is self-guarding.
+    local _t0_esc=""
+    declare -F _task_escalation_auto_apply >/dev/null 2>&1 \
+      && _t0_esc=$(_task_escalation_auto_apply "$id" "$ident" "$recommend" "auto:t0" || true)
     # DIVE-2054: auto-clear applied from task-store data — fenced.
     _task_store_audit_log "task need t0-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$recommend" || true
-    ok "$ident tier-0 gate auto-cleared — applied: $recommend" \
+    ok "$ident tier-0 gate auto-cleared — applied: $recommend${_t0_esc}" \
        '{id:($i|tonumber), ident:$id, tier:0, auto_applied:$rc, need_type:$ty}' \
        --arg i "$id" --arg id "$ident" --arg rc "$recommend" --arg ty "$type"
     return
@@ -4336,9 +4345,13 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
                 UPDATE tasks SET status='todo'
                   WHERE id=${id} AND status='blocked'
                     AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+            # DIVE-4537 (iteration 2) — see the same line at the tier-0 clear above.
+            local _pr_esc=""
+            declare -F _task_escalation_auto_apply >/dev/null 2>&1 \
+              && _pr_esc=$(_task_escalation_auto_apply "$id" "$ident" "$_qans" "auto:precedent" || true)
             # DIVE-2054: same reasoning as "task need t0-auto" above — fenced.
             _task_store_audit_log "task need precedent-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$_qans" "precedent=$_qid" || true
-            ok "$ident tier-1 gate auto-cleared from human precedent — applied: $_qans (precedent #$_qid)" \
+            ok "$ident tier-1 gate auto-cleared from human precedent — applied: $_qans (precedent #$_qid)${_pr_esc}" \
                '{id:($i|tonumber), ident:$id, tier:1, need_type:$ty, auto_applied:$rc, need_answered_by:"auto:precedent", precedent_ref:($pr|tonumber)}' \
                --arg i "$id" --arg id "$ident" --arg ty "$type" --arg rc "$_qans" --arg pr "$_qid"
             return
@@ -4414,6 +4427,17 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
           UPDATE tasks SET status='todo'
             WHERE id=${id} AND status='blocked'
               AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+      # DIVE-4537 (iteration 2) — THE PATH THIS DEFECT WAS MEASURED ON. Every seat
+      # that files an iteration-cap stop is promoted on this host (quinn 93%, dev
+      # 94%, ops 100%), the escalation carries a --recommend, and `track_record`
+      # defaults ON in code — so this clear, not a lead's tap, is the likeliest
+      # answer the stop will ever get. Before this line it recorded "keep going"
+      # and left the loop stopped: the row held by the verifier at iteration ==
+      # max_iterations, unstamped, nobody pinged, and no human or lead in the path
+      # to notice. See the same line at the tier-0 clear above.
+      local _tr_esc=""
+      declare -F _task_escalation_auto_apply >/dev/null 2>&1 \
+        && _tr_esc=$(_task_escalation_auto_apply "$id" "$ident" "$recommend_arg" "auto:record" || true)
       # DIVE-2054: an auto-clear applied from task-store data — fenced on store
       # identity, same primitive as the tier-0, TTL and pfr auto-clears.
       _task_store_audit_log "task need record-auto" "ok" 0 -- \
@@ -4422,7 +4446,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
       ledger_emit gate.autocleared ident="$ident" task_id="$id" actor="$actor" \
         policy="record:${type}" \
         detail="tier-1 decision auto-applied on ${actor}'s track record (${_tr_c}/${_tr_t} = ${_tr_pct}%, last ${_GATE_RECORD_STREAK} clean) — applied: ${recommend_arg}" || true
-      ok "$ident tier-1 decision auto-cleared on your track record — applied: $recommend_arg (record: ${_tr_c}/${_tr_t} = ${_tr_pct}% of your last ${_tr_t} answered tier-1 decision gates returned your recommendation, last ${_GATE_RECORD_STREAK} clean; nobody was pinged, provenance auto:record). ONE answer against your recommendation revokes this. 5dive task track-record off restores the ping." \
+      ok "$ident tier-1 decision auto-cleared on your track record — applied: ${recommend_arg}${_tr_esc} (record: ${_tr_c}/${_tr_t} = ${_tr_pct}% of your last ${_tr_t} answered tier-1 decision gates returned your recommendation, last ${_GATE_RECORD_STREAK} clean; nobody was pinged, provenance auto:record). ONE answer against your recommendation revokes this. 5dive task track-record off restores the ping." \
          '{id:($i|tonumber), ident:$id, tier:1, need_type:$ty, auto_applied:$rc, need_answered_by:"auto:record", record_concordant:($c|tonumber), record_total:($t|tonumber), record_rate:($p|tonumber)}' \
          --arg i "$id" --arg id "$ident" --arg ty "$type" --arg rc "$recommend_arg" \
          --arg c "$_tr_c" --arg t "$_tr_t" --arg p "$_tr_pct"

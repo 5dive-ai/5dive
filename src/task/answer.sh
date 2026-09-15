@@ -123,14 +123,27 @@ _loop_answer_is_bounce() {
 # ambiguous, and of the two mistakes, resuming work a lead meant to stop spends a
 # maker's whole pass, while stopping work a lead meant to continue is visible on
 # the board the same hour and costs one `task reject` to undo.
+#
+# A NEGATED SEGMENT IS NOT A VERB (DIVE-4537 iteration 2). "do not keep going"
+# carries no drop stem, so stem-matching alone read it as a RESUME — the
+# expensive direction, and the exact inversion of what was answered. Flipping on
+# a negation instead ("it means the other one") only moves the guess: "don't drop
+# it" would then resume, which is the expensive direction again, decided off free
+# prose. So a negation particle in the decision segment makes the answer
+# AMBIGUOUS and the row does not move — the branch that already exists, that
+# already names the two words that work, and that costs one more tap instead of a
+# maker's whole pass. Neither shipped option can be negated (they are the two
+# literal buttons, graded in section D), so this can only fire on free text.
 _ESC_RESUME_STEMS='keep|keeps|continue|continues|carry|resume|resumes|another|again|proceed|go'
 _ESC_DROP_STEMS='drop|drops|dropped|cancel|cancels|abandon|abandons|stop|stops|kill|scrap|shelve|bin'
+_ESC_NEGATION_RX="\b(not|never|cannot|no|nope|dont|doesnt|wont)\b|n't"
 _task_escalation_answer_verb() {   # <answer value> -> "resume" | "drop" | ""
   local _v="${1:-}" _first="" _seg=""
   _first=$(printf '%s' "$_v" | grep -m1 -v '^[[:space:]]*$' || true)
   _first="${_first#"${_first%%[![:space:]]*}"}"
   _seg="${_first%%[—:;,.]*}"
   _seg=$(printf '%s' "$_seg" | tr '[:upper:]' '[:lower:]')
+  if grep -qE "$_ESC_NEGATION_RX" <<<"$_seg"; then printf ''; return 0; fi
   if grep -qE "\b(${_ESC_DROP_STEMS})\b" <<<"$_seg"; then printf 'drop'; return 0; fi
   if grep -qE "\b(${_ESC_RESUME_STEMS})\b" <<<"$_seg"; then printf 'resume'; return 0; fi
   printf ''
@@ -152,6 +165,136 @@ _task_escalation_gate_open() {   # <row id> -> 0 when the open gate is the cap e
                    THEN 1 ELSE 0 END FROM tasks WHERE id=${_eg_id};" 2>/dev/null) || return 1
   [[ "$_eg" == "1" ]]
 }
+
+# ── DIVE-4537 iteration 2 — THE EXECUTOR, BECAUSE A TYPED ANSWER IS NOT THE ────
+#    ONLY WAY THIS GATE GETS ANSWERED
+#
+# Iteration 1 put the resume inside `cmd_task_answer`, and that is one of FIVE
+# writers of `need_answer` on this gate. The other four are the auto-clears —
+# `auto:t0`, `auto:precedent`, `auto:record` (src/task/need.sh) and `auto:ttl`
+# (src/cmd_heartbeat.sh) — and every one of them applies the answer with a DIRECT
+# `UPDATE tasks SET need_answer=…` and returns, deliberately (their comments say
+# "never cmd_task_answer": going through it would mint a human nonce no human
+# produced). So the most likely way this gate is answered at all skipped the verb
+# entirely: measured at 388a2610 with the code default `track_record on` and a
+# promoted filer, a reject at the cap came back `answered_by=auto:record,
+# answer=keep going` on a row still at `iteration == max_iterations`, still held
+# by the VERIFIER, with no bounce stamp — DIVE-4520's stall, now with no human
+# and no lead anywhere in the path to notice it. All three seats that file these
+# (quinn 93%, dev 94%, ops 100%) are promoted on this host today.
+#
+# THE DISPOSITION IS THEREFORE A FUNCTION, CALLED ONCE PER WRITER, never a second
+# copy at each site: a stop that is not also a start is a stall with a receipt,
+# and the receipt is what makes it invisible.
+#
+# It is SELF-GUARDING — it returns 1 on any row whose open gate is not the cap
+# escalation — so a caller needs no copy of the predicate either, and adding the
+# call to a fifth writer is one line.
+#
+# IT DOES NOT NOTIFY. The ping policy belongs to the caller and the two callers
+# differ: a typed answer redirects the gate-cleared ping it was already sending
+# to the maker, while an auto-clear's whole contract is that nobody is pinged —
+# it uses `routing_receipt`, the same hand-over receipt the ordinary reject bounce
+# sends, which is a routing fact rather than a question. See
+# `_task_escalation_auto_apply` below.
+#
+# Outputs land in _ESC_EXEC_VERB / _ESC_EXEC_MAKER / _ESC_EXEC_MAXI because bash
+# returns one integer and the caller needs three strings.
+_task_escalation_execute() {   # <row id> <ident> <answer value> <answered by> -> 0 when this gate is the cap escalation
+  _ESC_EXEC_VERB=""; _ESC_EXEC_MAKER=""; _ESC_EXEC_MAXI=""
+  local _x_id="${1:-}" _x_ident="${2:-}" _x_value="${3:-}" _x_by="${4:-}" _esc_iter=""
+  _task_escalation_gate_open "$_x_id" || return 1
+  _ESC_EXEC_VERB=$(_task_escalation_answer_verb "$_x_value")
+  _ESC_EXEC_MAKER=$(db "SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${_x_id};")
+  _esc_iter=$(db  "SELECT COALESCE(iteration,0)    FROM tasks WHERE id=${_x_id};")
+  case "$_ESC_EXEC_VERB" in
+    resume)
+      # THE CAP IS RAISED FIRST, and that ordering is not cosmetic: with
+      # iteration still == max_iterations the maker's next bounce would re-fire
+      # this very escalation on the pass meant to close the row — the gate you
+      # just retired, re-sent. `+1` and not `+2`: one more pass is what was
+      # decided, and the next stop is a decision worth taking again.
+      #
+      # `handoff_ack_at=NULL, handoff_rejected_at=now` is the reject rail's own
+      # bounce stamp (src/task/delivery.sh), copied so a resumed row is
+      # indistinguishable from an ordinary bounce to every reader downstream —
+      # the reclaimer, `task show`, and the "was there a reject since the last
+      # delivery" question DIVE-2624 added that column to answer. `result` is
+      # untouched: it holds the verifier's last FINDING/FIX, which is the entire
+      # instruction for the pass being authorised here.
+      db "UPDATE tasks SET
+            max_iterations=CASE WHEN COALESCE(max_iterations,0) <= COALESCE(iteration,0)
+                                THEN COALESCE(iteration,0)+1 ELSE max_iterations END,
+            status='todo', assignee=$(sqlq "$_ESC_EXEC_MAKER"), started_at=NULL,
+            handoff_ack_at=NULL, handoff_rejected_at=datetime('now'), done_at=NULL
+          WHERE id=${_x_id} AND status NOT IN ('done','cancelled');"
+      _ESC_EXEC_MAXI=$(db "SELECT COALESCE(max_iterations,0) FROM tasks WHERE id=${_x_id};")
+      _task_store_audit_log "task answer loop-resume" ok 0 -- \
+        "task=$_x_ident" "verb=resume" "maker=${_ESC_EXEC_MAKER}" \
+        "iteration=${_esc_iter}" "max_iterations=${_ESC_EXEC_MAXI}" "answered_by=${_x_by}" || true
+      ;;
+    drop)
+      # Through the shared close funnel, never a hand-rolled UPDATE: cancelling
+      # is a session close, a run close, a dependent cascade and a worktree
+      # reclaim as well as a status write, and a second copy of that list is a
+      # copy that stops matching. Subshell + suppressed output because the funnel
+      # prints its own receipt and this command owes exactly one. The row's
+      # `result` already carries the verifier's findings, so --result only fills
+      # a genuinely empty field.
+      local _esc_prev_result
+      _esc_prev_result=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${_x_id};")
+      local -a _esc_cancel=(cmd_task_cancel "$_x_id")
+      [[ -n "$_esc_prev_result" ]] || _esc_cancel+=("--result=Dropped at the two-strike stop — ${_x_by} chose to stop the work rather than take another pass.")
+      if ( "${_esc_cancel[@]}" ) >/dev/null 2>&1; then
+        _task_store_audit_log "task answer loop-drop" ok 0 -- \
+          "task=$_x_ident" "verb=drop" "iteration=${_esc_iter}" "answered_by=${_x_by}" || true
+      else
+        # The answer is already durable; say the second half did not land rather
+        # than fail a gate that is answered, or lie about the row's state.
+        warn "${_x_ident}: the stop was answered 'drop it' but the cancel did not apply — the row is still open. Close it with '5dive task cancel ${_x_ident} --result=\"…\"'."
+        _task_store_audit_log "task answer loop-drop" "failed" 0 -- \
+          "task=$_x_ident" "verb=drop" "answered_by=${_x_by}" || true
+      fi
+      ;;
+    *)
+      # Neither vocabulary in the decision segment. Do NOT guess: the two
+      # outcomes are opposite and the answer is on the row for a person to read.
+      warn "${_x_ident}: this is the stop a review loop hit at its iteration cap, and the answer does not open with either outcome, so the loop was NOT restarted or dropped. Answer again with 'keep going' or 'drop it' in the first words: '5dive task answer ${_x_ident} --value=\"keep going\"'."
+      _task_store_audit_log "task answer loop-ambiguous" ok 0 -- \
+        "task=$_x_ident" "answered_by=${_x_by}" || true
+      ;;
+  esac
+  return 0
+}
+
+# The auto-clear callers' one line. Fires the SAME hand-over receipt the ordinary
+# reject bounce fires (src/task/delivery.sh) — a routing fact, not a question, so
+# the auto-clear's "nobody was pinged" contract is intact — and prints the clause
+# each site appends to its own success message, because a receipt saying only
+# "applied: keep going" is the receipt that made this invisible the first time.
+#
+# `declare -F` and the trailing `|| true` at every call site are the additive-only
+# contract, not belt-and-braces: a tree that sources a SUBSET of src/ (which is
+# what most harnesses do, and what src/cmd_heartbeat.sh's own harnesses do) has no
+# answer.sh, and bash turns a missing function into rc=127 on a clear that had
+# already succeeded.
+_task_escalation_auto_apply() {   # <row id> <ident> <answer> <provenance> -> prints a receipt clause
+  declare -F _task_escalation_execute >/dev/null 2>&1 || return 1
+  _task_escalation_execute "$@" || return 1
+  case "$_ESC_EXEC_VERB" in
+    resume)
+      routing_receipt "$2" "$_ESC_EXEC_MAKER" "now owns it (the two-strike stop was lifted)" 2>/dev/null || true
+      printf ' The stop it answers is EXECUTED: the row is back with maker %s for one more pass (cap now %s).' \
+        "$_ESC_EXEC_MAKER" "$_ESC_EXEC_MAXI"
+      ;;
+    drop)
+      printf ' The stop it answers is EXECUTED: the row is cancelled and the review findings kept.'
+      ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
 
 # ── DIVE-3128: a button tap, attributed and recorded ─────────────────────────
 #
@@ -1620,75 +1763,19 @@ cmd_task_answer() {
 
   # DIVE-4537: the cap escalation was just answered — EXECUTE the disposition.
   # Deliberately after the block above: that one recomputes `blocked` -> `todo`
-  # for the generic case, and both branches here overwrite the status it leaves.
-  local _esc_verb="" _esc_maker="" _esc_iter="" _esc_maxi="" _esc_pingmsg=""
-  if [[ "$nt" == "decision" && "$_lk" != gate:* ]] && _task_escalation_gate_open "$id"; then
-    _esc_verb=$(_task_escalation_answer_verb "$value")
-    _esc_maker=$(db "SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id};")
-    _esc_iter=$(db  "SELECT COALESCE(iteration,0)    FROM tasks WHERE id=${id};")
-    case "$_esc_verb" in
-      resume)
-        # THE CAP IS RAISED FIRST, and that ordering is not cosmetic: with
-        # iteration still == max_iterations the maker's next bounce would re-fire
-        # this very escalation on the pass meant to close the row — the gate you
-        # just retired, re-sent. `+1` and not `+2`: one more pass is what was
-        # decided, and the next stop is a decision worth taking again.
-        #
-        # `handoff_ack_at=NULL, handoff_rejected_at=now` is the reject rail's own
-        # bounce stamp (src/task/delivery.sh), copied so a resumed row is
-        # indistinguishable from an ordinary bounce to every reader downstream —
-        # the reclaimer, `task show`, and the "was there a reject since the last
-        # delivery" question DIVE-2624 added that column to answer. `result` is
-        # untouched: it holds the verifier's last FINDING/FIX, which is the entire
-        # instruction for the pass being authorised here.
-        db "UPDATE tasks SET
-              max_iterations=CASE WHEN COALESCE(max_iterations,0) <= COALESCE(iteration,0)
-                                  THEN COALESCE(iteration,0)+1 ELSE max_iterations END,
-              status='todo', assignee=$(sqlq "$_esc_maker"), started_at=NULL,
-              handoff_ack_at=NULL, handoff_rejected_at=datetime('now'), done_at=NULL
-            WHERE id=${id} AND status NOT IN ('done','cancelled');"
-        _esc_maxi=$(db "SELECT COALESCE(max_iterations,0) FROM tasks WHERE id=${id};")
-        _task_store_audit_log "task answer loop-resume" ok 0 -- \
-          "task=$ident" "verb=resume" "maker=${_esc_maker}" \
-          "iteration=${_esc_iter}" "max_iterations=${_esc_maxi}" "answered_by=${answered_by}" || true
-        # The ping follows the WORK, not the gate. `owner` was resolved before any
-        # write (gate_filed_by first), which on this gate is the verifier who
-        # rejected — pinging them to "resume the task" is the hand-back that left
-        # DIVE-4520 with no owner.
-        owner="$_esc_maker"
-        _esc_pingmsg="${ident} — the stop was lifted and it is back with you for another pass. The last review feedback is on the row (\`5dive task show ${ident}\`); fix it and \`5dive task deliver ${ident}\`."
-        ;;
-      drop)
-        # Through the shared close funnel, never a hand-rolled UPDATE: cancelling
-        # is a session close, a run close, a dependent cascade and a worktree
-        # reclaim as well as a status write, and a second copy of that list is a
-        # copy that stops matching. Subshell + suppressed output because the funnel
-        # prints its own receipt and this command owes exactly one. The row's
-        # `result` already carries the verifier's findings, so --result only fills
-        # a genuinely empty field.
-        local _esc_prev_result
-        _esc_prev_result=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
-        local -a _esc_cancel=(cmd_task_cancel "$id")
-        [[ -n "$_esc_prev_result" ]] || _esc_cancel+=("--result=Dropped at the two-strike stop — ${answered_by} chose to stop the work rather than take another pass.")
-        if ( "${_esc_cancel[@]}" ) >/dev/null 2>&1; then
-          _task_store_audit_log "task answer loop-drop" ok 0 -- \
-            "task=$ident" "verb=drop" "iteration=${_esc_iter}" "answered_by=${answered_by}" || true
-        else
-          # The answer is already durable; say the second half did not land rather
-          # than fail a gate that is answered, or lie about the row's state.
-          warn "${ident}: the stop was answered 'drop it' but the cancel did not apply — the row is still open. Close it with '5dive task cancel ${ident} --result=\"…\"'."
-          _task_store_audit_log "task answer loop-drop" "failed" 0 -- \
-            "task=$ident" "verb=drop" "answered_by=${answered_by}" || true
-        fi
-        ;;
-      *)
-        # Neither vocabulary in the decision segment. Do NOT guess: the two
-        # outcomes are opposite and the answer is on the row for a person to read.
-        warn "${ident}: this is the stop a review loop hit at its iteration cap, and the answer does not open with either outcome, so the loop was NOT restarted or dropped. Answer again with 'keep going' or 'drop it' in the first words: '5dive task answer ${ident} --value=\"keep going\"'."
-        _task_store_audit_log "task answer loop-ambiguous" ok 0 -- \
-          "task=$ident" "answered_by=${answered_by}" || true
-        ;;
-    esac
+  # for the generic case, and the executor's branches overwrite the status it
+  # leaves. The work lives in `_task_escalation_execute` because a typed answer is
+  # only one of five writers of this gate's answer — see that function's header.
+  local _esc_pingmsg=""
+  if [[ "$nt" == "decision" && "$_lk" != gate:* ]] \
+     && _task_escalation_execute "$id" "$ident" "$value" "$answered_by" \
+     && [[ "$_ESC_EXEC_VERB" == "resume" ]]; then
+    # The ping follows the WORK, not the gate. `owner` was resolved before any
+    # write (gate_filed_by first), which on this gate is the verifier who
+    # rejected — pinging them to "resume the task" is the hand-back that left
+    # DIVE-4520 with no owner.
+    owner="$_ESC_EXEC_MAKER"
+    _esc_pingmsg="${ident} — the stop was lifted and it is back with you for another pass. The last review feedback is on the row (\`5dive task show ${ident}\`); fix it and \`5dive task deliver ${ident}\`."
   fi
 
   local newstatus; newstatus=$(db "SELECT status FROM tasks WHERE id=${id};")

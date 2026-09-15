@@ -144,7 +144,7 @@ eq_t "A10b: the verifier can grade the authorised pass" "$R_RC" "0"
 eq_t "A11: a second failure files a FRESH stop rather than looping unbounded" \
   "$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN 'open' ELSE 'none' END FROM tasks WHERE ident='ESC-KEEP';")" "open"
 eq_t "A12: ... and it is a DECISION, the type that routes to the lead" "$(field ESC-KEEP need_type)" "decision"
-eq_t "A13: ... at tier 1, not the tier-2 floor `manual` carries by type"  "$(field ESC-KEEP tier)" "1"
+eq_t "A13: ... at tier 1, not the tier-2 floor 'manual' carries by type"  "$(field ESC-KEEP tier)" "1"
 eq_t "A14: ... and answering THAT one resumes the loop too" \
   "$( ( cmd_task_answer "$(rowid ESC-KEEP)" --value="$_ESCALATION_RECOMMEND" --from=main ) >/dev/null 2>&1; field ESC-KEEP assignee)" "dev"
 eq_t "A15: ... buying exactly one more pass" "$(field ESC-KEEP max_iterations)" "4"
@@ -194,6 +194,16 @@ eq_t "D4: a keep whose REASONING says 'drop' still resumes" \
 eq_t "D5: neither vocabulary is neither verb"  "$(_task_escalation_answer_verb "see my note on the row")" ""
 eq_t "D6: an ambiguous opening segment prefers the cheaper mistake" \
   "$(_task_escalation_answer_verb "stop and keep")" "drop"
+# A NEGATED SEGMENT IS NOT A VERB. "do not keep going" carries no drop stem, so
+# stem-matching alone read it as a RESUME — the expensive direction, and the exact
+# inversion of the answer. It is now the ambiguous branch: the row does not move
+# and the answerer is told the two words that work.
+eq_t "D7: a negated resume is NOT a resume" \
+  "$(_task_escalation_answer_verb "do not keep going")" ""
+eq_t "D8: ... and a negated drop is not a drop either — neither is guessed at" \
+  "$(_task_escalation_answer_verb "don't drop it")" ""
+eq_t "D9: CONTROL — the two shipped buttons carry no negation and still classify" \
+  "$(_task_escalation_answer_verb "$_ESCALATION_RECOMMEND")$(_task_escalation_answer_verb "drop it — stop the work, keep the findings")" "resumedrop"
 
 echo
 echo "== E. A MERGE ON OUR OWN REPO IS REFUSED, AND NAMES THE ROUTING VERB =="
@@ -237,6 +247,90 @@ eq_t "F4: the classifier itself needs BOTH halves — a repo with no write verb 
   "$(_gate_ask_our_repo_write "Is https://github.com/5dive-ai/5dive/pull/1 the right shape?" && echo caught || echo clean)" "clean"
 eq_t "F5: ... and a write verb with no repo of ours is clean" \
   "$(_gate_ask_our_repo_write "Please merge the two paragraphs in the launch email." && echo caught || echo clean)" "clean"
+# THE THIRD CONJUNCT, which had no arm of its own in iteration 1 although the
+# delivery note claimed one. The refusal reads the FILER from the uid-resolved
+# actor, not from --from, and a person filing this for another person is not the
+# population: nobody is being asked to do work a seat here could do instead.
+_real_withdraw_actor=$(declare -f _gate_withdraw_actor || true)
+_gate_withdraw_actor() { printf 'human'; }
+ctl "F6: CONTROL — the same ask from a HUMAN filer is not the population, and files" files \
+    manual "Press Merge on https://github.com/5dive-ai/5dive-chat/pull/11 — plain merge, never Squash."
+if [[ -n "$_real_withdraw_actor" ]]; then eval "$_real_withdraw_actor"; else unset -f _gate_withdraw_actor; fi
+ctl "F7: ... and with the filer back to an agent seat the very same ask is refused again" refused \
+    manual "Press Merge on https://github.com/5dive-ai/5dive-chat/pull/11 — plain merge, never Squash."
+
+echo
+echo "== G. AN AUTO-APPLIED ANSWER DOES THE SAME WORK A TYPED ONE DOES =="
+# THE DEFECT ITERATION 1 SHIPPED. `cmd_task_answer` is one of five writers of this
+# gate's answer; the other four are the auto-clears, which apply it with a DIRECT
+# UPDATE and return — never through `task answer`, deliberately. So the resume
+# lived on the path a lead's typed tap takes, and not on the path this gate is
+# most likely to take at all: every seat that files one of these stops is promoted
+# on this host (quinn 93%, dev 94%, ops 100%), the stop carries a --recommend, and
+# `track_record` defaults ON in code. The result was `answered_by=auto:record,
+# answer=keep going` on a row still held by the VERIFIER at iteration ==
+# max_iterations, unstamped, with no human and no lead in the path to notice.
+#
+# Pin the record seams the same way this harness already pins the route, send and
+# actor seams — the point is the EXECUTION, not the promotion arithmetic.
+_real_pref_get=$(declare -f _task_pref_get || true)
+_real_promoted=$(declare -f _gate_record_promoted || true)
+_real_stats=$(declare -f _gate_record_stats || true)
+_TR_PREF=on
+_task_pref_get()        { [[ "${1:-}" == "track_record" ]] && printf '%s' "$_TR_PREF"; return 0; }
+_gate_record_promoted() { return 0; }
+_gate_record_stats()    { printf '17 18 5'; }
+
+seed_capped ESC-AUTO
+db "UPDATE tasks SET result=$(sqlq "$FB") WHERE ident='ESC-AUTO';"
+_real_task_actor=$(declare -f task_actor)
+task_actor() { printf 'quinn'; }
+G_OUT=$( (cmd_task_reject "$(rowid ESC-AUTO)" --feedback="$FB") 2>&1 ); G_RC=$?
+eval "$_real_task_actor"
+eq_t "G1: the reject at the cap succeeds"        "$G_RC" "0"
+eq_t "G2: ... and the stop is auto-answered on the filer's track record" \
+  "$(field ESC-AUTO need_answered_by)" "auto:record"
+eq_t "G3: ... and THAT answer hands the row to the MAKER"  "$(field ESC-AUTO assignee)" "dev"
+eq_t "G4: ... raises the cap to N+1"                       "$(field ESC-AUTO max_iterations)" "3"
+eq_t "G5: ... and leaves it open for work"                 "$(field ESC-AUTO status)" "todo"
+[[ "$(field ESC-AUTO handoff_rejected_at)" != "∅" ]] \
+  && ok_t "G6: ... with the bounce stamped, as an ordinary reject stamps it" \
+  || bad_t "G6: handoff_rejected_at not stamped" "an auto-cleared stop that reads as never bounced"
+has_t "G7: ... and the receipt says the row moved, not just that an answer was recorded" \
+  "$G_OUT" "back with maker dev"
+has_t "G8: ... the verifier's findings survive as the instruction for the pass" "$(field ESC-AUTO result)" "FINDING:"
+
+# THE CONTROL: with the pref off there is no auto-clear, so nothing here may move
+# the row — the resume must ride the ANSWER, never the reject.
+_TR_PREF=off
+seed_capped ESC-AUTO-OFF
+db "UPDATE tasks SET result=$(sqlq "$FB") WHERE ident='ESC-AUTO-OFF';"
+_real_task_actor=$(declare -f task_actor)
+task_actor() { printf 'quinn'; }
+( cmd_task_reject "$(rowid ESC-AUTO-OFF)" --feedback="$FB" ) >/dev/null 2>&1
+eval "$_real_task_actor"
+eq_t "G9: CONTROL — pref off, the stop is left open for a lead" \
+  "$(field ESC-AUTO-OFF need_answered_by)" "∅"
+eq_t "G10: CONTROL — ... and the row is NOT handed to the maker" "$(field ESC-AUTO-OFF assignee)" "quinn"
+eq_t "G11: CONTROL — ... and its cap is NOT raised"              "$(field ESC-AUTO-OFF max_iterations)" "2"
+
+# THE OTHER AUTO WRITER REACHABLE FROM THIS GATE: a tier-0 filing applies the
+# recommendation at once on the same direct-write path. Same one line, same
+# executor — the cost of covering a writer is a line, which is the whole point of
+# lifting the disposition out of `task answer`.
+_TR_PREF=off
+seed_capped ESC-AUTO-T0
+db "UPDATE tasks SET result=$(sqlq "$FB") WHERE ident='ESC-AUTO-T0';"
+T0_OUT=$( (cmd_task_need "$(rowid ESC-AUTO-T0)" --type=decision --from=quinn --tier=0 \
+    --options="$_ESCALATION_OPTIONS" --recommend="$_ESCALATION_RECOMMEND" \
+    --ask="$(_task_escalation_ask "$(rowid ESC-AUTO-T0)" 2 "$FB")") 2>&1 ); T0_RC=$?
+eq_t "G12: a tier-0 filing of the same stop applies at once" "$T0_RC" "0"
+eq_t "G13: ... and it too hands the row to the maker"        "$(field ESC-AUTO-T0 assignee)" "dev"
+eq_t "G14: ... with the cap at N+1"                          "$(field ESC-AUTO-T0 max_iterations)" "3"
+
+if [[ -n "$_real_pref_get" ]]; then eval "$_real_pref_get"; else unset -f _task_pref_get; fi
+if [[ -n "$_real_promoted" ]]; then eval "$_real_promoted"; else unset -f _gate_record_promoted; fi
+if [[ -n "$_real_stats" ]];    then eval "$_real_stats";    else unset -f _gate_record_stats; fi
 
 echo
 printf 'TOTAL: %d passed, %d failed\n' "$PASS" "$FAIL"
