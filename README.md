@@ -243,17 +243,40 @@ Install 5dive on this Linux host so I can use you to manage 5dive agents.
 
 ## Security &amp; isolation
 
-Each agent is one Linux user under one of three isolation tiers:
+Each agent is one Linux user. Three tiers are available at create time, and a fourth is conferred afterwards:
 
-| Tier | Access |
+| Tier | What the seat can actually run as root |
 |------|--------|
-| `standard` (default) | shared read, limited write |
-| `admin` | full host; auto-granted to the first agent on a fresh box |
-| `sandboxed` | own home only, no sudo, systemd resource limits |
+| `sandboxed` | nothing — no sudo at all. Own home, systemd resource limits |
+| `standard` (default) | a handful of named `5dive` subcommands, nothing else |
+| `admin` | **the whole `5dive` CLI as root — not root on the box.** Auto-granted to the first agent on a fresh box |
+| `beyond-admin` | any command, as any user. Conferred by an operator with `agent grant`, never at create time |
 
 ```sh
 sudo 5dive agent create my-agent --type=claude --isolation=sandboxed
 ```
+
+**`admin` is not root, and the difference bites.** An `admin` seat holds
+`ALL=(root) NOPASSWD: /usr/local/bin/5dive, /usr/local/bin/5dive *` — every 5dive
+subcommand, and nothing else. It cannot `systemctl restart`, edit a Caddyfile,
+write a unit file or `sudo -u someone-else`. That is deliberate: `journalctl`,
+`systemctl status` and a writable `/etc/systemd/system` are each a one-line root
+escape, so granting them would make `admin` mean root while still reading as a
+middle tier. Host remediation is reached through hardened verbs instead —
+`5dive host unit|journal|cron` — which need no sudoers change at all.
+
+When a seat genuinely needs the whole box, say so rather than hand-editing a
+sudoers drop-in:
+
+```sh
+sudo 5dive agent grant my-agent root      # writes a managed, visudo-checked
+                                          # ALL=(ALL) NOPASSWD: ALL, stamps the
+                                          # label beyond-admin, records an audit row
+```
+
+`5dive agent info <name>` then reports the **measured** grant beside the stored
+label and warns when the two disagree — so a seat's privilege is something you
+read, not something you infer from a tier name.
 
 **No middlemen.** 5dive runs on your server. Auth tokens go to model providers directly, never to us. No telemetry, no error reporting, no usage data leaves the box. Long form: [your auth tokens don't touch us →](https://blog.5dive.ai/blog/your-auth-tokens-dont-touch-us/?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
 
