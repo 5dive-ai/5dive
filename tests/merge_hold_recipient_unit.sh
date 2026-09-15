@@ -56,8 +56,8 @@
 # NON-VACUITY, PER FILE — the union receipt in this row's iteration 1 said
 # "revert both files -> 7 reds" and those seven all came from delivery.sh,
 # which is exactly the misattribution it hid:
-#   src/task/delivery.sh reverted alone -> A4-A8, B4, D2, E1-E3 red     (10)
-#   src/task/loops.sh    reverted alone -> E1, E2, E3, E6, E7a red       (5)
+#   src/task/delivery.sh reverted alone -> A4-A8, B4, D2, E1-E3, E11-E13 (13)
+#   src/task/loops.sh    reverted alone -> E1-E3, E6, E7a, E11-E13        (8)
 # The second line is the one that did not exist at iteration 1: reverting
 # loops.sh alone left SEVENTEEN harnesses green, this one included.
 #
@@ -294,9 +294,10 @@ t "D8 ...and the named exemption still holds at end of line: \`agent send to\` i
 # one that reaches the merger branch without inventing an input.
 cat > "$TMP/drive_write.sh" <<'DRIVER'
 #!/usr/bin/env bash
-# <src dir> <roster file> <this-box|teal-fox>  ->  "<merge_owner>|<reason>|<rendered owner>"
+# <src dir> <roster file> <this-box|teal-fox> [normal|orphan]
+#   -> "<merge_owner>|<reason>|<rendered owner>"
 set -uo pipefail
-SRCD="$1"; export FIVE_MERGE_HOLD_ROSTER="$2"; CHART="$3"
+SRCD="$1"; export FIVE_MERGE_HOLD_ROSTER="$2"; CHART="$3"; ROW="${4:-normal}"
 TMP="$(mktemp -d /tmp/mhr-write.XXXXXX)"; STATE_DIR="$TMP"
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
@@ -326,6 +327,10 @@ id=$(db "INSERT INTO tasks (title, assignee, created_by, kind, status, maker_age
                  'in_progress','claude-ivan','quinn',
                  'https://github.com/5dive-ai/5dive/pull/809',1);
          SELECT last_insert_rowid();")
+# The one shape the degrade cannot rescue, declared on the row at iteration 1 and
+# armed here rather than left as prose: BOTH maker_agent and assignee are
+# nullable, so a row can have no seat to fall back to either.
+[[ "$ROW" == "orphan" ]] && db "UPDATE tasks SET maker_agent=NULL, assignee=NULL WHERE id=$id;"
 ident=$(db "SELECT ident FROM tasks WHERE id=$id;")
 ( set +e; cmd_task_verify "$ident" --no-done \
     --result="PASS — re-derived from a fresh clone. graded-sha: aabbccdd11223344556677889900aabbccddeeff" \
@@ -339,7 +344,7 @@ DRIVER
 
 E_CUST="$TMP/e-roster-customer.json"; printf '%s\n' '{"agents":{"claude-aleks":{},"claude-ivan":{}}}' > "$E_CUST"
 E_BOX="$TMP/e-roster-thisbox.json";  printf '%s\n' '{"agents":{"main":{},"ops":{},"dev":{},"quinn":{}}}' > "$E_BOX"
-drive() { bash "$TMP/drive_write.sh" "$1" "$2" "$3"; }
+drive() { bash "$TMP/drive_write.sh" "$1" "$2" "$3" "${4:-normal}"; }
 
 E_TEAL=$(drive "$PWD/src" "$E_CUST" teal-fox)
 t "E1 teal-fox, driven through \`task verify\`: the WRITTEN merge_owner is the maker, never 'main'" \
@@ -391,6 +396,21 @@ t "E9 ...and the reason loses the suffix, so the board cannot even say why" \
 E_MUTBOX=$(drive "$LOOPMUT" "$E_BOX" this-box)
 t "E10 ...while this box reads identically under the mutant, which is why nothing here ever caught it" \
   "ops" "${E_MUTBOX%%|*}"
+
+# THE RESIDUAL, armed rather than declared. `maker_agent` and `assignee` are both
+# nullable, so the degrade has a floor: a row with neither has nothing to fall
+# back TO. The column is then left empty and the render degrades to '?', which is
+# the honest answer and NOT the same event as stamping a seat that does not
+# exist — but it is a shape the DIVE-4143 grader_pool fences read as "no hold
+# recorded" (`COALESCE(merge_owner,'') <> ''`), so it is asserted here so that a
+# later change to it has to be deliberate.
+E_ORPH=$(drive "$PWD/src" "$E_CUST" teal-fox orphan)
+t "E11 a row with no maker and no assignee: the column is left EMPTY, never backfilled" \
+  "" "${E_ORPH%%|*}"
+t "E12 ...the reason still says why, so the board can be asked" \
+  "disposition-probe-failed-no-merge-seat" "$(cut -d'|' -f2 <<<"$E_ORPH")"
+t "E13 ...and the render says '?' — unknown, rather than a name nothing can dispatch" \
+  "?" "${E_ORPH##*|}"
 
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
