@@ -6,7 +6,9 @@
 # (created_at/started_at/handoff_delivered_at/handoff_ack_at/need_answered_at/
 # shipped_flag_at/done_at) plus the surrounding append-only context — the
 # project goal it descends from, its parent chain, the objective/loop that
-# originated it, the human gate that cleared it, and the tamper-evident audit
+# originated it, the human gate(s) that cleared it — every epoch, read from the
+# durable gate_history archive and not just the one the live row still carries
+# (DIVE-4552) — and the tamper-evident audit
 # log lines that reference its ident.
 #
 # This IS the zero-human proof story compiled into one command: who was
@@ -21,6 +23,44 @@
 #
 # Usage:
 #   5dive trace <id|DIVE-N> [--json] [--no-audit]
+
+# DIVE-4552 — the gate epochs of ONE task, from the DURABLE record.
+#
+# THE DEFECT THIS CLOSES. Both gate readers in `trace` — the timeline's `gate`
+# event and the human-touchpoint COUNT the verdict is computed from — read
+# need_answered_at/need_answered_by off the LIVE tasks row, which holds at most
+# ONE gate epoch. `_gate_archive_and_clear_sql` (lib/tasks_db.sh) moves the
+# answered epoch into gate_history and nulls those columns on every re-file,
+# withdraw, park and loop-ceiling park. So the moment a SECOND gate is filed on
+# a row, the human who cleared the first one disappears from the count, and the
+# verdict flips to `zero-human` — on a row a human demonstrably touched. Luca
+# measured it on teal-fox box-1: `trace` printed the audit-log line "gate cleared
+# by human:… (human touchpoint)" and, three lines later, "0 human touchpoint(s)
+# so far", inside one invocation. The audit log is append-only and was right; the
+# derived count was wrong. `zero-human` is the product's headline claim, so a
+# false zero is the claim itself being false.
+#
+# ONE fragment feeds BOTH readers, and that is the point, not a tidiness: the
+# contradiction luca saw was two readers of the same fact disagreeing. Sharing
+# the source makes them unable to disagree again.
+#
+# NO DOUBLE COUNT, structurally: the archive INSERT and the UPDATE that nulls the
+# live answer columns are one statement pair inside one transaction, so an epoch
+# is in gate_history XOR on the live row, never both. An UNANSWERED gate (live or
+# withdrawn-before-answer) drops out of both branches on need_answered_at.
+#
+# Emits a SELECT with columns: ts, who, ntype, ans, src.
+_trace_gate_epochs_sql() {
+  local id="$1"
+  printf '%s\n' \
+    "SELECT need_answered_at AS ts, COALESCE(need_answered_by,'-') AS who," \
+    "       COALESCE(need_type,'gate') AS ntype, need_answer AS ans, 'archived' AS src" \
+    "  FROM gate_history WHERE task_id=${id} AND need_answered_at IS NOT NULL" \
+    "UNION ALL" \
+    "SELECT need_answered_at, COALESCE(need_answered_by,'-')," \
+    "       COALESCE(need_type,'gate'), need_answer, 'live'" \
+    "  FROM tasks WHERE id=${id} AND need_answered_at IS NOT NULL"
+}
 
 cmd_trace() {
   tasks_db_init
@@ -62,11 +102,11 @@ cmd_trace() {
       SELECT handoff_ack_at, 'review', COALESCE(verifier,'-'), 'verifier began review'
         FROM tasks WHERE id=${id} AND handoff_ack_at IS NOT NULL
       UNION ALL
-      SELECT need_answered_at, 'gate', COALESCE(need_answered_by,'-'),
-             COALESCE(need_type,'gate')||' cleared: '||
-               CASE WHEN need_type='secret' THEN '(secret provided out-of-band)'
-                    ELSE COALESCE(need_answer,'(answered)') END
-        FROM tasks WHERE id=${id} AND need_answered_at IS NOT NULL
+      SELECT ts, 'gate', who,
+             ntype||' cleared: '||
+               CASE WHEN ntype='secret' THEN '(secret provided out-of-band)'
+                    ELSE COALESCE(ans,'(answered)') END
+        FROM ( $(_trace_gate_epochs_sql "$id") )
       UNION ALL
       SELECT shipped_flag_at, 'ship-detected', '-',
              'commit referencing '||ident||' seen on origin/main'
@@ -87,26 +127,47 @@ cmd_trace() {
   assignee=$(db "SELECT COALESCE(assignee,'-') FROM tasks WHERE id=${id};")
   title=$(db "SELECT title FROM tasks WHERE id=${id};")
   # human touchpoints = answered gates whose clearer is a verified human
-  # (need_answered_by is prefixed 'human:' on the verified-human path, DIVE-394).
-  human_gates=$(db "SELECT COUNT(*) FROM tasks
-                    WHERE id=${id} AND need_answered_at IS NOT NULL
-                      AND need_answered_by LIKE 'human:%';")
+  # (need_answered_by is prefixed 'human:' on the verified-human path, DIVE-394),
+  # over EVERY epoch the row ever carried — archived and live (DIVE-4552).
+  human_gates=$(db "SELECT COUNT(*) FROM ( $(_trace_gate_epochs_sql "$id") )
+                    WHERE who LIKE 'human:%';")
   pending_gate=$(db "SELECT COALESCE(need_type,'') FROM tasks
                      WHERE id=${id} AND need_type IS NOT NULL AND need_answered_at IS NULL;")
   human_gates=${human_gates:-0}
+
+  # DIVE-4552, second half: gate_history only reaches back to the archive's own
+  # coverage boundary (DIVE-2133). On a task older than that boundary, epochs
+  # displaced in the blind era were destroyed outright, so the count above is
+  # "recorded", not "all there ever were" — and the ONE reading that must not be
+  # stated unqualified from a partial record is the zero. `_gate_history_facts`
+  # already computes that boundary for `task show`; reuse it rather than
+  # re-deriving a second, drifting copy. Guarded on the function existing so a
+  # partial source set (a harness that loads cmd_trace.sh without task/crud.sh)
+  # degrades to the unqualified wording instead of dying.
+  local gh_state="unknown" gh_coverage=""
+  if declare -F _gate_history_facts >/dev/null 2>&1; then
+    local _gh_n
+    IFS='|' read -r _gh_n gh_coverage gh_state _ < <(_gate_history_facts "$id") || gh_state="unknown"
+  fi
+  local zero_caveat=""
+  [[ "$gh_state" != "complete" ]] && zero_caveat=" (recorded; earlier gate history is not covered by the archive)"
 
   local verdict
   case "$status" in
     done)
       if [[ "$human_gates" -eq 0 ]]; then
-        verdict="zero-human — goal to done with 0 human touchpoints"
+        verdict="zero-human — goal to done with 0 human touchpoints${zero_caveat}"
       else
         verdict="human-in-the-loop — ${human_gates} human gate(s) required"
       fi ;;
     cancelled) verdict="cancelled" ;;
     *)
+      # A pending gate does not erase the ones already cleared. Naming only the
+      # pending one was the second way a human touchpoint went missing from the
+      # verdict: arm 1 of DIVE-4552 (answer a gate as human, file another) hits
+      # exactly this branch.
       if [[ -n "$pending_gate" ]]; then
-        verdict="in progress — blocked on a pending ${pending_gate} gate"
+        verdict="in progress — blocked on a pending ${pending_gate} gate, ${human_gates} human touchpoint(s) so far"
       else
         verdict="in progress — ${human_gates} human touchpoint(s) so far"
       fi ;;
@@ -141,8 +202,11 @@ cmd_trace() {
   # `trace` is the ledger's forcing function and its first consumer. The timeline
   # above is DERIVED — it reconstructs the story from transition columns on the
   # tasks row, which means it can only ever show what the current state implies:
-  # one gate (the latest), no authority, no elevation, no idempotency, and
-  # nothing at all about an event that left no column behind. The ledger section
+  # no authority, no elevation, no idempotency, and nothing at all about an
+  # event that left no column behind. GATES are the one exception since
+  # DIVE-4552: those read the durable gate_history archive, because the live
+  # row's single epoch made the derived count actively FALSE (a human-cleared
+  # row verdicted zero-human) rather than merely thin. The ledger section
   # is the RECORDED story, with the full envelope per row.
   #
   # The two are shown side by side rather than merged. They are different kinds
@@ -221,6 +285,7 @@ cmd_trace() {
       --arg ident "$ident" --arg title "$title" --arg status "$status" \
       --arg assignee "$assignee" --arg verdict "$verdict" \
       --argjson human_gates "$human_gates" --arg pending "$pending_gate" \
+      --arg gh_state "$gh_state" --arg gh_coverage "$gh_coverage" \
       --arg proj "$proj" --arg proj_goal "$proj_goal" --arg objective "$objective" \
       --arg loop "$loop" \
       --argjson events "$events" --argjson audit "$audit_json" \
@@ -233,6 +298,11 @@ cmd_trace() {
          ident:$ident, title:$title, status:$status, assignee:$assignee,
          verdict:$verdict, human_touchpoints:$human_gates,
          pending_gate:(if $pending=="" then null else $pending end),
+         human_touchpoints_coverage:{
+           state:$gh_state,
+           complete:($gh_state=="complete"),
+           started_at:(if $gh_coverage=="" then null else $gh_coverage end)
+         },
          origin:{
            project:(if $proj=="" then null else $proj end),
            project_goal:(if $proj_goal=="" then null else $proj_goal end),
