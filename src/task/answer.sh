@@ -285,7 +285,11 @@ _task_escalation_execute() {   # <row id> <ident> <answer value> <answered by> -
 # this function in `$(…)` would swallow the receipt into its own success message
 # instead of emitting it. The receipt has to be printed from the caller's own
 # stdout, which means this function cannot be a command substitution.
-_ESC_AUTO_NOTE=""
+#
+# `_ESC_AUTO_NOTE` is DECLARED IN src/header.sh (core), not here. A cross-module
+# read of a top-level variable is what __MODDEPS is for, and cmd_heartbeat reads
+# this one — declaring it at column 0 in this module made every `heartbeat ls`
+# drag six lazy modules in. See the comment on the declaration for the numbers.
 _task_escalation_auto_apply() {   # <row id> <ident> <answer> <provenance> -> sets _ESC_AUTO_NOTE
   _ESC_AUTO_NOTE=""
   declare -F _task_escalation_execute >/dev/null 2>&1 || return 1

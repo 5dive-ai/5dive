@@ -3742,14 +3742,34 @@ NO EXIT HERE CHANGES THE DESTINATION: --tier=1 would send this somewhere else, a
     # for the reader, it is addressed to the wrong KIND of holder. Scoped to
     # `manual` (the type that skips the lead-first rail by being tier-2 by type)
     # filed by an AGENT seat, which is the population DIVE-4365 left uncovered.
+    #
+    # THE POPULATION IS "NOT A PERSON", AND IT HAS THREE OUTCOMES, NOT TWO
+    # (iteration 3). `_gate_withdraw_actor` prints `agent <name>` | `human` |
+    # `none`, and iteration 2 refused only the first — so BOTH other outcomes
+    # failed OPEN, in the direction this row exists to close. `none` is not an
+    # exotic branch: it is what an unattributable caller resolves to — root cron,
+    # a systemd timer, a harness running as root with no SUDO_* (DIVE-4341) — and
+    # a gate filed by one of those is by construction not a person handing work to
+    # another person. It is refused, with the same audited `--ask-ok` escape, so
+    # nothing becomes unfileable (DIVE-2216).
+    #
+    # `human` still FILES, deliberately. A person filing this for a person is not
+    # the population: nobody is being asked to do work a seat here could do
+    # instead, and refusing it would tell the one caller who is already the
+    # capability holder to hand the row to themselves. The caveat, written down
+    # because it is a real fail-open: a uid that merely APPEARS in /etc/passwd
+    # resolves `human`, which is what a GitHub Actions runner does — so this guard
+    # does not bind in CI. That is acceptable here (CI files no gates on this
+    # host's store) and it is why the harness below pins the actor seam for every
+    # arm instead of inheriting whatever identity the runner happens to have.
     if [[ "$type" == "manual" ]] && _gate_ask_our_repo_write "$ask"; then
       local _cap_actor _cap_kind
       _cap_actor=$(_gate_withdraw_actor)      # "agent <name>" | "human" | "none"
       _cap_kind="${_cap_actor%% *}"
-      if [[ "$_cap_kind" == "agent" ]]; then
+      if [[ "$_cap_kind" == "agent" || "$_cap_kind" == "none" ]]; then
         if [[ -z "$ask_ok" ]]; then
           _task_store_audit_log "task need ask-capability" "refused" 0 -- \
-            "task=$ident" "filer=${actor:-}" "type=$type" "why=repo-write-on-our-own-repo" || true
+            "task=$ident" "filer=${actor:-}" "type=$type" "why=repo-write-on-our-own-repo" "caller=${_cap_kind}" || true
           fail "$E_VALIDATION" "$ident: refusing this gate because it asks a person to make a change in one of OUR OWN code repositories — that is a permission some of our own seats already hold, so it is a job to hand over, not a question to ask.
 The person tapping decides nothing here: whoever holds the write access does the same thing whichever way they answer, and the only thing the tap buys is the delay until they read it. Measured 2026-09-14: one of these sat on the paired human's phone for three hours and was then done by another seat in five minutes.
   hand the row over          '5dive task assign ${ident} main' (or another seat that holds the access) — this is the exit that is wanted.
@@ -3759,7 +3779,7 @@ The person tapping decides nothing here: whoever holds the write access does the
         [[ ${#ask_ok} -ge 12 ]] \
           || fail "$E_VALIDATION" "--ask-ok must state WHY no seat here can make this repository change (it is recorded on the gate and read by whoever counts these exceptions later)"
         _task_store_audit_log "task need ask-capability" "escaped" 0 -- \
-          "task=$ident" "filer=${actor:-}" "type=$type" "why=repo-write-on-our-own-repo" "declared=$ask_ok" || true
+          "task=$ident" "filer=${actor:-}" "type=$type" "why=repo-write-on-our-own-repo" "caller=${_cap_kind}" "declared=$ask_ok" || true
         warn "capability escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". This ask wants a change in a repository we own, and the human is still being sent it."
       fi
     fi

@@ -213,6 +213,18 @@ eq_t "D9: CONTROL — the two shipped buttons carry no negation and still classi
 
 echo
 echo "== E. A MERGE ON OUR OWN REPO IS REFUSED, AND NAMES THE ROUTING VERB =="
+# PIN THE IDENTITY SEAM FOR THE POPULATION UNDER TEST, not just for the control
+# (iteration 3). The refusal's third conjunct reads `_gate_withdraw_actor`, and
+# iteration 2 pinned it only around F6. Everywhere else the arm inherited the
+# HOST's identity — on an agent seat that resolves `agent <seat>` and the
+# precondition arrived free, so E1-E6 and F7 were green here and RED in CI, where
+# the runner's uid is in /etc/passwd and resolves `human`. An arm that needs a
+# precondition must state it: `agent quinn` is asserted, never inherited.
+# (_real_withdraw_actor is restored at the end of section F.)
+_real_withdraw_actor=$(declare -f _gate_withdraw_actor || true)
+actor_is() { eval "_gate_withdraw_actor() { printf '%s' \"$1\"; }"; }
+actor_restore() { if [[ -n "$_real_withdraw_actor" ]]; then eval "$_real_withdraw_actor"; else unset -f _gate_withdraw_actor; fi; }
+actor_is 'agent quinn'
 db "INSERT INTO tasks (ident, title, priority, assignee, created_by, kind, status)
     VALUES ('ESC-MERGE', 'a plain piece of work', 'medium', 'quinn', 'main', 'standard', 'todo');"
 E_OUT=$( (cmd_task_need "$(rowid ESC-MERGE)" --type=manual --from=quinn \
@@ -257,13 +269,31 @@ eq_t "F5: ... and a write verb with no repo of ours is clean" \
 # delivery note claimed one. The refusal reads the FILER from the uid-resolved
 # actor, not from --from, and a person filing this for another person is not the
 # population: nobody is being asked to do work a seat here could do instead.
-_real_withdraw_actor=$(declare -f _gate_withdraw_actor || true)
-_gate_withdraw_actor() { printf 'human'; }
+MERGE_ASK="Press Merge on https://github.com/5dive-ai/5dive-chat/pull/11 — plain merge, never Squash."
+actor_is 'human'
 ctl "F6: CONTROL — the same ask from a HUMAN filer is not the population, and files" files \
-    manual "Press Merge on https://github.com/5dive-ai/5dive-chat/pull/11 — plain merge, never Squash."
-if [[ -n "$_real_withdraw_actor" ]]; then eval "$_real_withdraw_actor"; else unset -f _gate_withdraw_actor; fi
-ctl "F7: ... and with the filer back to an agent seat the very same ask is refused again" refused \
-    manual "Press Merge on https://github.com/5dive-ai/5dive-chat/pull/11 — plain merge, never Squash."
+    manual "$MERGE_ASK"
+actor_is 'agent quinn'
+ctl "F7: ... and with the filer an agent seat the very same ask is refused again" refused \
+    manual "$MERGE_ASK"
+# THE THIRD OUTCOME OF THE RESOLVER, which had no arm at all in iteration 2 and is
+# the one the CI runner and root cron take. `_gate_withdraw_actor` prints
+# `agent <name>` | `human` | `none`; refusing only the first fails OPEN for the
+# other two, in the direction this row exists to close. An unattributable caller
+# is by construction not a person handing work to another person, so it is
+# refused — and it keeps the audited escape, so nothing becomes unfileable.
+actor_is 'none'
+ctl "F8: an UNATTRIBUTABLE caller (root cron, a timer) is refused too, not filed" refused \
+    manual "$MERGE_ASK"
+F8_OUT=$( (cmd_task_need "$(rowid ESC-CTL)" --type=manual --from=quinn --ask="$MERGE_ASK") 2>&1 )
+has_t "F8b: ... naming the same hand-over exit a named seat gets" "$F8_OUT" "task assign"
+ctl "F8c: CONTROL — an unattributable caller's ORDINARY manual ask still files" files \
+    manual "Plug the spare power cable back into the machine under the desk?"
+# The refusal must be countable BY CALLER KIND: "how many of these came from
+# automation" is the question this row's axis is measured on.
+has_t "F9: the audit row records which kind of caller was refused" \
+  "$(grep 'ask-capability' "$AUDIT_ROWS" | tail -1)" "caller=none"
+actor_restore
 
 echo
 echo "== G. AN AUTO-APPLIED ANSWER DOES THE SAME WORK A TYPED ONE DOES =="
@@ -338,6 +368,121 @@ T0_OUT=$( (cmd_task_need "$(rowid ESC-AUTO-T0)" --type=decision --from=quinn --t
 eq_t "G12: a tier-0 filing of the same stop applies at once" "$T0_RC" "0"
 eq_t "G13: ... and it too hands the row to the maker"        "$(field ESC-AUTO-T0 assignee)" "dev"
 eq_t "G14: ... with the cap at N+1"                          "$(field ESC-AUTO-T0 max_iterations)" "3"
+
+echo
+echo "== H. THE PRECEDENT AUTO-CLEAR EXECUTES TOO (the third of four writers) =="
+# UNGRADED IN ITERATION 2, and found by cutting the line with a 0-count anchor:
+# the 69-arm suite stayed 69/69, so the auto:precedent call site was carried by
+# the maker's word alone. It is a DIFFERENT writer from auto:record — a different
+# predicate, a different answer source (a prior HUMAN tap on the same ask shape,
+# not the filer's track record) — and "the same one line is there" is a claim
+# about the source, which is what the arm is supposed to stop me asserting.
+_TR_PREF=off
+_PC_PREF=on
+_task_pref_get() {
+  case "${1:-}" in
+    track_record)        printf '%s' "$_TR_PREF" ;;
+    precedent_autoclear) printf '%s' "$_PC_PREF" ;;
+  esac
+  return 0
+}
+seed_capped ESC-AUTO-PR
+PR_ID=$(rowid ESC-AUTO-PR)
+PR_ASK=$(_task_escalation_ask "$PR_ID" 2 "$FB")
+db "UPDATE tasks SET result=$(sqlq "$FB") WHERE id=${PR_ID};"
+# Pass 1 with the pref OFF records the shape this exact ask hashes to; the seeds
+# are then given THAT shape, so the precedent set matches by construction rather
+# than by my guess at the normaliser.
+_PC_PREF=off
+( cmd_task_need "$PR_ID" --type=decision --from=quinn \
+    --options="$_ESCALATION_OPTIONS" --recommend="$_ESCALATION_RECOMMEND" --ask="$PR_ASK" ) >/dev/null 2>&1
+PR_SHAPE=$(field ESC-AUTO-PR ask_shape)
+[[ -n "$PR_SHAPE" && "$PR_SHAPE" != "∅" ]] \
+  && ok_t "H0: the cap gate carries an ask shape, so precedent can key on it" \
+  || bad_t "H0: no ask_shape on the escalation gate" "section H grades nothing"
+# Two nonce-verified HUMAN answers on that shape, agreeing — the qualifying set.
+for _n in 1 2; do
+  db "INSERT INTO tasks (ident, title, priority, assignee, created_by, kind, status,
+                         need_type, tier, ask_shape, need_answer, need_answered_by,
+                         human_nonce_hash, need_answered_at)
+      VALUES ('ESC-SEED${_n}', 'an earlier stop a person answered', 'medium', 'dev', 'main', 'standard', 'done',
+              'decision', 1, $(sqlq "$PR_SHAPE"), $(sqlq "$_ESCALATION_RECOMMEND"), 'human:lodar',
+              'nonce${_n}', datetime('now','-1 day'));"
+done
+# Back to the capped, ungated state and file it again for real.
+db "UPDATE tasks SET need_type=NULL, ask=NULL, need_answer=NULL, need_answered_at=NULL,
+      need_answered_by=NULL, ask_shape=NULL, recommend=NULL, need_asked_at=NULL, tier=NULL,
+      status='todo', assignee='quinn', iteration=2, max_iterations=2, handoff_rejected_at=NULL
+    WHERE id=${PR_ID};"
+_PC_PREF=on
+H_OUT=$( (cmd_task_need "$PR_ID" --type=decision --from=quinn \
+    --options="$_ESCALATION_OPTIONS" --recommend="$_ESCALATION_RECOMMEND" --ask="$PR_ASK") 2>&1 )
+eq_t "H1: the stop is auto-answered on the human precedent" \
+  "$(field ESC-AUTO-PR need_answered_by)" "auto:precedent"
+eq_t "H2: ... and THAT answer hands the row to the MAKER" "$(field ESC-AUTO-PR assignee)" "dev"
+eq_t "H3: ... raises the cap to N+1"                      "$(field ESC-AUTO-PR max_iterations)" "3"
+[[ "$(field ESC-AUTO-PR handoff_rejected_at)" != "∅" ]] \
+  && ok_t "H4: ... and stamps the bounce" \
+  || bad_t "H4: handoff_rejected_at not stamped" "a precedent-cleared stop that reads as never bounced"
+has_t "H5: ... and says the row moved, not just that an answer was recorded" "$H_OUT" "back with maker dev"
+# CONTROL: the precedent path with the pref off leaves the stop for a lead.
+_PC_PREF=off
+seed_capped ESC-AUTO-PR-OFF
+PRO_ID=$(rowid ESC-AUTO-PR-OFF)
+db "UPDATE tasks SET result=$(sqlq "$FB") WHERE id=${PRO_ID};"
+( cmd_task_need "$PRO_ID" --type=decision --from=quinn --options="$_ESCALATION_OPTIONS" \
+    --recommend="$_ESCALATION_RECOMMEND" --ask="$(_task_escalation_ask "$PRO_ID" 2 "$FB")" ) >/dev/null 2>&1
+eq_t "H6: CONTROL — pref off, no precedent clear"  "$(field ESC-AUTO-PR-OFF need_answered_by)" "∅"
+eq_t "H7: CONTROL — ... and the row is not handed to the maker" "$(field ESC-AUTO-PR-OFF assignee)" "quinn"
+
+echo
+echo "== I. THE 48h TTL SWEEP EXECUTES TOO — AND ITS PING IS THE NOVEL PART =="
+# The fourth writer, and the one iteration 2's self-audit wrongly called "graded
+# by arms". It is also the only call site with logic of its own: the sweep's
+# "Resume the task" ping goes to the row's ASSIGNEE, which on a stopped loop is
+# the VERIFIER — the hand-back that left DIVE-4520 with no owner. Suppressing it
+# is a claim, and a claim needs an arm.
+if source "$SRC/cmd_heartbeat.sh" 2>/dev/null && declare -F _hb_gate_ttl_sweep >/dev/null 2>&1; then
+  ok_t "I0: the real TTL sweep is reachable (not a copy of it)"
+  _hb_log() { return 0; }
+  seed_capped ESC-TTL
+  TTL_ID=$(rowid ESC-TTL)
+  db "UPDATE tasks SET result=$(sqlq "$FB") WHERE id=${TTL_ID};"
+  ( cmd_task_need "$TTL_ID" --type=decision --from=quinn --options="$_ESCALATION_OPTIONS" \
+      --recommend="$_ESCALATION_RECOMMEND" --ask="$(_task_escalation_ask "$TTL_ID" 2 "$FB")" ) >/dev/null 2>&1
+  # Age the gate past the 48h TTL; everything else is the shape the cap files.
+  db "UPDATE tasks SET need_asked_at=datetime('now','-72 hours') WHERE id=${TTL_ID};"
+  : >"$SENT"
+  _hb_gate_ttl_sweep >/dev/null 2>&1
+  eq_t "I1: the sweep applies the recommendation" "$(field ESC-TTL need_answered_by)" "auto:ttl"
+  eq_t "I2: ... and THAT answer hands the row to the MAKER" "$(field ESC-TTL assignee)" "dev"
+  eq_t "I3: ... raises the cap to N+1"                      "$(field ESC-TTL max_iterations)" "3"
+  [[ "$(field ESC-TTL handoff_rejected_at)" != "∅" ]] \
+    && ok_t "I4: ... and stamps the bounce" \
+    || bad_t "I4: handoff_rejected_at not stamped" "a TTL-cleared stop that reads as never bounced"
+  if grep -q 'Resume the task' "$SENT"; then
+    bad_t "I5: the verifier must NOT also be told to resume" "$(cat "$SENT")"
+  else
+    ok_t "I5: the sweep's own 'Resume the task' ping is suppressed on a resumed loop"
+  fi
+  has_t "I6: ... and the MAKER got the hand-over receipt instead" "$(cat "$RECEIPTS")" "dev"
+  # CONTROL: an ORDINARY tier-1 gate on the same sweep still gets the ping, so
+  # the suppression is scoped to the stop and did not silence the sweep.
+  db "INSERT INTO tasks (ident, title, priority, assignee, created_by, kind, status,
+                         need_type, tier, recommend, ask, need_asked_at)
+      VALUES ('TTL-PLAIN', 'an ordinary tier-1 gate', 'medium', 'dev', 'main', 'standard', 'todo',
+              'decision', 1, 'widen the cap now', 'Widen the cap now, or fix the rows first?',
+              datetime('now','-72 hours'));"
+  : >"$SENT"
+  _hb_gate_ttl_sweep >/dev/null 2>&1
+  eq_t "I7: CONTROL — an ordinary gate is still auto-applied" "$(field TTL-PLAIN need_answered_by)" "auto:ttl"
+  grep -q 'Resume the task' "$SENT" \
+    && ok_t "I8: CONTROL — ... and its owner still gets the sweep's ping" \
+    || bad_t "I8: the suppression silenced the whole sweep" "$(cat "$SENT")"
+else
+  bad_t "I0: the real TTL sweep is NOT reachable from this harness" \
+    "src/cmd_heartbeat.sh did not source; the auto:ttl writer would ship ungraded"
+fi
 
 if [[ -n "$_real_pref_get" ]]; then eval "$_real_pref_get"; else unset -f _task_pref_get; fi
 if [[ -n "$_real_promoted" ]]; then eval "$_real_promoted"; else unset -f _gate_record_promoted; fi
