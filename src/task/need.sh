@@ -4092,8 +4092,10 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
     # is worse than the gate it replaced (no human and no lead is in the path to
     # notice). No-op on every other gate: the executor is self-guarding.
     local _t0_esc=""
-    declare -F _task_escalation_auto_apply >/dev/null 2>&1 \
-      && _t0_esc=$(_task_escalation_auto_apply "$id" "$ident" "$recommend" "auto:t0" || true)
+    if declare -F _task_escalation_auto_apply >/dev/null 2>&1; then
+      _task_escalation_auto_apply "$id" "$ident" "$recommend" "auto:t0" || true
+      _t0_esc="${_ESC_AUTO_NOTE:-}"
+    fi
     # DIVE-2054: auto-clear applied from task-store data — fenced.
     _task_store_audit_log "task need t0-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$recommend" || true
     ok "$ident tier-0 gate auto-cleared — applied: $recommend${_t0_esc}" \
@@ -4347,8 +4349,10 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
                     AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
             # DIVE-4537 (iteration 2) — see the same line at the tier-0 clear above.
             local _pr_esc=""
-            declare -F _task_escalation_auto_apply >/dev/null 2>&1 \
-              && _pr_esc=$(_task_escalation_auto_apply "$id" "$ident" "$_qans" "auto:precedent" || true)
+            if declare -F _task_escalation_auto_apply >/dev/null 2>&1; then
+              _task_escalation_auto_apply "$id" "$ident" "$_qans" "auto:precedent" || true
+              _pr_esc="${_ESC_AUTO_NOTE:-}"
+            fi
             # DIVE-2054: same reasoning as "task need t0-auto" above — fenced.
             _task_store_audit_log "task need precedent-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$_qans" "precedent=$_qid" || true
             ok "$ident tier-1 gate auto-cleared from human precedent — applied: $_qans (precedent #$_qid)${_pr_esc}" \
@@ -4436,8 +4440,10 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
       # max_iterations, unstamped, nobody pinged, and no human or lead in the path
       # to notice. See the same line at the tier-0 clear above.
       local _tr_esc=""
-      declare -F _task_escalation_auto_apply >/dev/null 2>&1 \
-        && _tr_esc=$(_task_escalation_auto_apply "$id" "$ident" "$recommend_arg" "auto:record" || true)
+      if declare -F _task_escalation_auto_apply >/dev/null 2>&1; then
+        _task_escalation_auto_apply "$id" "$ident" "$recommend_arg" "auto:record" || true
+        _tr_esc="${_ESC_AUTO_NOTE:-}"
+      fi
       # DIVE-2054: an auto-clear applied from task-store data — fenced on store
       # identity, same primitive as the tier-0, TTL and pfr auto-clears.
       _task_store_audit_log "task need record-auto" "ok" 0 -- \

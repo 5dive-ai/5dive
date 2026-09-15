@@ -269,26 +269,35 @@ _task_escalation_execute() {   # <row id> <ident> <answer value> <answered by> -
 
 # The auto-clear callers' one line. Fires the SAME hand-over receipt the ordinary
 # reject bounce fires (src/task/delivery.sh) — a routing fact, not a question, so
-# the auto-clear's "nobody was pinged" contract is intact — and prints the clause
-# each site appends to its own success message, because a receipt saying only
-# "applied: keep going" is the receipt that made this invisible the first time.
+# the auto-clear's "nobody was pinged" contract is intact — and hands back the
+# clause each site appends to its own success message, because a receipt saying
+# only "applied: keep going" is the receipt that made this invisible the first
+# time.
 #
 # `declare -F` and the trailing `|| true` at every call site are the additive-only
 # contract, not belt-and-braces: a tree that sources a SUBSET of src/ (which is
 # what most harnesses do, and what src/cmd_heartbeat.sh's own harnesses do) has no
 # answer.sh, and bash turns a missing function into rc=127 on a clear that had
 # already succeeded.
-_task_escalation_auto_apply() {   # <row id> <ident> <answer> <provenance> -> prints a receipt clause
+#
+# THE CLAUSE COMES BACK IN A VARIABLE, NOT ON STDOUT, and that is not a style
+# choice: `routing_receipt` prints its own line to stdout, so a caller capturing
+# this function in `$(…)` would swallow the receipt into its own success message
+# instead of emitting it. The receipt has to be printed from the caller's own
+# stdout, which means this function cannot be a command substitution.
+_ESC_AUTO_NOTE=""
+_task_escalation_auto_apply() {   # <row id> <ident> <answer> <provenance> -> sets _ESC_AUTO_NOTE
+  _ESC_AUTO_NOTE=""
   declare -F _task_escalation_execute >/dev/null 2>&1 || return 1
   _task_escalation_execute "$@" || return 1
   case "$_ESC_EXEC_VERB" in
     resume)
+      _ESC_AUTO_NOTE=$(printf ' The stop it answers is EXECUTED: the row is back with maker %s for one more pass (cap now %s).' \
+        "$_ESC_EXEC_MAKER" "$_ESC_EXEC_MAXI")
       routing_receipt "$2" "$_ESC_EXEC_MAKER" "now owns it (the two-strike stop was lifted)" 2>/dev/null || true
-      printf ' The stop it answers is EXECUTED: the row is back with maker %s for one more pass (cap now %s).' \
-        "$_ESC_EXEC_MAKER" "$_ESC_EXEC_MAXI"
       ;;
     drop)
-      printf ' The stop it answers is EXECUTED: the row is cancelled and the review findings kept.'
+      _ESC_AUTO_NOTE=' The stop it answers is EXECUTED: the row is cancelled and the review findings kept.'
       ;;
     *) return 1 ;;
   esac

@@ -4496,8 +4496,10 @@ _hb_gate_ttl_sweep() {
     # answer.sh; bash turns a missing function into rc=127 on a clear that already
     # succeeded.
     local _ttl_esc=""
-    declare -F _task_escalation_auto_apply >/dev/null 2>&1 \
-      && _ttl_esc=$(_task_escalation_auto_apply "$gid" "$gident" "$grec" "auto:ttl" || true)
+    if declare -F _task_escalation_auto_apply >/dev/null 2>&1; then
+      _task_escalation_auto_apply "$gid" "$gident" "$grec" "auto:ttl" || true
+      _ttl_esc="${_ESC_AUTO_NOTE:-}"
+    fi
     # DIVE-2054: task-store auto-clear (TTL) — fenced on STORE IDENTITY, same
     # primitive as cmd_task.sh's _task_store_audit_log (DIVE-2010).
     _task_store_audit_log "gate ttl-auto" "ok" 0 -- "task=$gident" "type=$gtype" "applied=$grec" || true

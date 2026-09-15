@@ -61,6 +61,12 @@ audit_log()              { return 0; }
 AUDIT_ROWS="$TMP/audit_rows"; : >"$AUDIT_ROWS"
 _task_store_audit_log()  { printf '%s\n' "$*" >>"$AUDIT_ROWS"; return 0; }
 _task_reclaim_on_close() { return 0; }
+# The hand-over receipt the ordinary reject bounce sends (src/lib/routing_receipt.sh,
+# not sourced here). It prints to the CALLER's stdout, which is why the auto-clear
+# helper hands its clause back in a variable instead of on stdout — capturing the
+# helper in `$(…)` would swallow this line into the success message.
+RECEIPTS="$TMP/receipts"; : >"$RECEIPTS"
+routing_receipt() { printf '%s\n' "$*" >>"$RECEIPTS"; printf 'handoff: %s %s\n' "${2:-}" "${3:-}"; return 0; }
 # NO LEAD ABOVE THE FILER — the human-fallback route, the only one in which the
 # ask rules run at all (DIVE-4431). Section B's refusal is one of those rules.
 _gate_route_reviewer()   { printf ''; }
@@ -298,6 +304,11 @@ eq_t "G5: ... and leaves it open for work"                 "$(field ESC-AUTO sta
   || bad_t "G6: handoff_rejected_at not stamped" "an auto-cleared stop that reads as never bounced"
 has_t "G7: ... and the receipt says the row moved, not just that an answer was recorded" \
   "$G_OUT" "back with maker dev"
+has_t "G7b: ... the maker gets the same hand-over receipt an ordinary bounce sends" \
+  "$(cat "$RECEIPTS")" "dev"
+grep -q '^handoff: dev' <<<"$G_OUT" \
+  && ok_t "G7c: ... and that receipt reaches the caller's own output, not the success message" \
+  || bad_t "G7c: the receipt was swallowed" "capturing the helper in \$(…) folds routing_receipt's line into 'applied: …'"
 has_t "G8: ... the verifier's findings survive as the instruction for the pass" "$(field ESC-AUTO result)" "FINDING:"
 
 # THE CONTROL: with the pref off there is no auto-clear, so nothing here may move
