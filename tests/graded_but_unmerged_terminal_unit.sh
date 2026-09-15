@@ -139,7 +139,7 @@ D=$(mkrow ref_no_grade)
 # DIVE-4576: a delivery's result must name its evidence or the delivery is
 # refused — the five labels here keep this arm's subject (that a MAKER cannot
 # stamp graded_at by writing grade-shaped prose) reachable.
-( cmd_task_deliver "$D" --pr=https://github.com/5dive-ai/5dive/pull/2 --result="the maker typing a grade-shaped sentence. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass GRADED-SHA: as stated here CI: green CRITERIA: (1) -> the run above" ) >/dev/null 2>&1
+( cmd_task_deliver "$D" --pr=https://github.com/5dive-ai/5dive/pull/2 --result="the maker typing a grade-shaped sentence. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass DELIVERED-SHA: 1f2e3d4c5b6a79880123456789abcdef01234567 CI: green CRITERIA: (1) -> the run above" ) >/dev/null 2>&1
 # The absence below is only meaningful if the row EXISTS and deliver actually wrote
 # to it — otherwise this arm passes on a missing fixture, which is the same defect
 # the positive control in (b) exists to prevent.

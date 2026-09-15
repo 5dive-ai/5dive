@@ -64,7 +64,7 @@ spawn_count() { wc -l < "$SPAWNS" | tr -d ' '; }
 PR=https://github.com/5dive-ai/5dive/pull/999
 GOOD="CHANGED: src/task/delivery.sh, tests/x.sh
 CHECKED: bash tests/x.sh — 14 arms, 14 pass; 3 mutation arms red on the pre-fix tree
-GRADED-SHA: deadbeef
+DELIVERED-SHA: 1f2e3d4c5b6a79880123456789abcdef01234567
 CI: green at delivery (lint+unit)
 CRITERIA: (1) refusal is non-mutating -> arm 4; (2) no session booked -> arm 9"
 
@@ -82,7 +82,7 @@ miss() { _delivery_evidence_missing "$1"; }
 [[ "$(miss "${GOOD/CI: green at delivery (lint+unit)/}")" == "CI" ]] \
   && ok_t "a missing field is named, and only it" \
   || bad_t "a missing field is named, and only it" "missing='$(miss "${GOOD/CI: green at delivery (lint+unit)/}")'"
-[[ "$(miss "nothing was checked here at all")" == "CHANGED CHECKED GRADED-SHA CI CRITERIA" ]] \
+[[ "$(miss "nothing was checked here at all")" == "CHANGED CHECKED DELIVERED-SHA CI CRITERIA" ]] \
   && ok_t "prose with no labels is missing all five" \
   || bad_t "prose with no labels is missing all five" "missing='$(miss "nothing was checked here at all")'"
 # The boundary: a word ENDING in a label must not satisfy that label, and a
@@ -94,7 +94,7 @@ miss() { _delivery_evidence_missing "$1"; }
   || bad_t "an empty label does not satisfy its field" "missing='$(miss "CHECKED:")'"
 ALIAS="FILES: a.sh
 RAN: bash a.sh (3/3)
-SHA: c0ffee
+DELIVERY-SHA: c0ffee
 CHECKS: red on lint
 ACCEPTANCE: (1) -> ran"
 [[ -z "$(miss "$ALIAS")" ]] && ok_t "the documented aliases satisfy all five fields" \
@@ -111,6 +111,38 @@ _t=$(_delivery_evidence_template); [[ -z "$(miss "$_t")" ]] \
   && ok_t "the template ITSELF satisfies the check it documents" \
   || bad_t "the template ITSELF satisfies the check it documents" "missing='$(miss "$_t")'"
 
+# --- THE LABEL MUST NOT COLLIDE WITH THE VERIFIER'S FENCE (DIVE-4576 iter 1).
+# `_gate_graded_sha` reads `graded-sha|graded_sha|graded sha` out of the ROW
+# RESULT and its subject is the VERIFIER's attestation: DIVE-2940 refuses a close
+# that states none, DIVE-2656 compares it to what the PR merged. Mandating that
+# same label on every bound DELIVERY would hand the maker authorship of the
+# verifier's operand. The fence is label-only, so the fix is a label that does
+# not overlap — which is only true while `SHA`, `HEAD-SHA` and `GRADED-SHA` stay
+# OUT of the alias list. These arms are what hold that, here at the contract
+# rather than only at the gate (tests/task_deliver_merge_gate_unit.sh Te7d).
+if declare -F _gate_graded_sha >/dev/null 2>&1; then
+  [[ -z "$(_gate_graded_sha "$GOOD")" ]] \
+    && ok_t "a filled evidence block makes NO graded-sha claim" \
+    || bad_t "a filled evidence block makes NO graded-sha claim" "got='$(_gate_graded_sha "$GOOD")'"
+  [[ -z "$(_gate_graded_sha "$(_delivery_evidence_template)")" ]] \
+    && ok_t "the template itself makes NO graded-sha claim" \
+    || bad_t "the template itself makes NO graded-sha claim" "got='$(_gate_graded_sha "$(_delivery_evidence_template)")'"
+  [[ -z "$(_gate_graded_sha "$ALIAS")" ]] \
+    && ok_t "no accepted ALIAS smuggles a graded-sha claim" \
+    || bad_t "no accepted ALIAS smuggles a graded-sha claim" "got='$(_gate_graded_sha "$ALIAS")'"
+fi
+# The complement, stated as a property rather than trusted: the maker's own label
+# must be one the fence cannot read even when it carries a real hex sha.
+_SHA40=aa11bb22cc33dd44ee55ff6600112233445566aa
+[[ -z "$(miss "CHANGED: a.sh
+CHECKED: bash a.sh 1/1
+GRADED-SHA: $_SHA40
+CI: green
+CRITERIA: (1) -> ran")" ]] \
+  && bad_t "the verifier's label does NOT satisfy the maker's field" \
+          "GRADED-SHA still satisfies DELIVERED-SHA — the alias list re-admits the collision" \
+  || ok_t "the verifier's label does NOT satisfy the maker's field"
+
 echo "── PART 2 — the refusal is non-mutating, and scoped to a binding ──"
 ID1=$(add_row "unevidenced delivery" --review=temp)
 OUT1=$(cmd_task_deliver "$ID1" --pr="$PR" --result="did the thing, it works" 2>&1); RC1=$?
@@ -121,7 +153,7 @@ OUT1=$(cmd_task_deliver "$ID1" --pr="$PR" --result="did the thing, it works" 2>&
   || bad_t "the refused delivery wrote NO result" "result='$(col "$ID1" result)'"
 [[ "$(col "$ID1" handoff_delivered_at)" == "" ]] && ok_t "the refused delivery started NO handoff clock" \
   || bad_t "the refused delivery started NO handoff clock" "stamp='$(col "$ID1" handoff_delivered_at)'"
-[[ "$OUT1" == *CHANGED* && "$OUT1" == *GRADED-SHA* ]] && ok_t "the refusal names the missing fields" \
+[[ "$OUT1" == *CHANGED* && "$OUT1" == *DELIVERED-SHA* ]] && ok_t "the refusal names the missing fields" \
   || bad_t "the refusal names the missing fields" "$OUT1"
 OUT2=$(cmd_task_deliver "$ID1" --pr="$PR" --result="$GOOD" 2>&1); RC2=$?
 (( RC2 == 0 )) && ok_t "an evidenced delivery is ACCEPTED" || bad_t "an evidenced delivery is ACCEPTED" "rc=$RC2 $OUT2"
@@ -244,7 +276,7 @@ else
 fi
 # (b) the FIELD LIST. Drop CI from it and a text missing only CI must pass.
 ORIG_FIELDS="$_DELIVERY_EVIDENCE_FIELDS"
-_DELIVERY_EVIDENCE_FIELDS='CHANGED CHECKED GRADED-SHA CRITERIA'
+_DELIVERY_EVIDENCE_FIELDS='CHANGED CHECKED DELIVERED-SHA CRITERIA'
 [[ -z "$(miss "${GOOD/CI: green at delivery (lint+unit)/}")" ]] \
   && ok_t "dropping CI from the field list changes the answer (the list is read)" \
   || bad_t "dropping CI from the field list changes the answer (the list is read)" "still missing '$(miss "${GOOD/CI: green at delivery (lint+unit)/}")'"

@@ -203,7 +203,7 @@ review_mode_cost_note() {  # <mode>
 #
 #   CHANGED    which files moved              → what the diff spot-check reads
 #   CHECKED    the commands run + pass/fail    → what the grader RE-RUNS
-#   GRADED-SHA the sha those numbers came from → what it re-runs them AGAINST
+#   DELIVERED-SHA the sha those numbers came from → what it re-runs them AGAINST
 #   CI         the CI state at delivery        → already required to be LOOKED at
 #   CRITERIA   each acceptance criterion → its evidence  → the grade's own rubric
 #
@@ -218,7 +218,22 @@ review_mode_cost_note() {  # <mode>
 # _REJECT_FIX_MARKER_RE: without the non-alphanumeric boundary "unchecked:" and
 # "prefixed-sha:" satisfy their own fields, and without demanding an alphanumeric
 # AFTER the separator an empty label passes.
-_DELIVERY_EVIDENCE_FIELDS='CHANGED CHECKED GRADED-SHA CI CRITERIA'
+#
+# THE SHA FIELD IS `DELIVERED-SHA`, NOT `GRADED-SHA`, AND THE DIFFERENCE IS A
+# CONTROL, NOT A WORD (DIVE-4576 iteration 1, rejected for exactly this).
+# `_gate_graded_sha` is a LABEL-ONLY fence whose subject is the VERIFIER's
+# attestation — DIVE-2940 refuses a close whose result states no `graded-sha`,
+# and DIVE-2656 then compares that sha to what the PR actually merged, precisely
+# because "the maker can push after the verdict". Mandating the byte-identical
+# label on every bound DELIVERY would make the MAKER the author of that operand
+# on every row: DIVE-2940 would be pre-satisfied before anyone graded anything,
+# and DIVE-2656 would compare a maker-authored, delivery-time sha against the
+# head — the "every other check on this gate would still pass" case it exists to
+# catch. The fence is label-only, so a label that does not overlap is the whole
+# fix; `SHA` and `HEAD-SHA` are dropped from the alias list below for the same
+# reason (`graded sha` / `graded_sha` / `graded-sha` are the tokens that overlap,
+# and a bare `SHA` alias re-admits every one of them).
+_DELIVERY_EVIDENCE_FIELDS='CHANGED CHECKED DELIVERED-SHA CI CRITERIA'
 
 # `_delivery_evidence_field_re <field>` — the marker regex for one field.
 # Aliases live HERE and nowhere else, so the refusal, the template and the tests
@@ -228,7 +243,7 @@ _delivery_evidence_field_re() {  # <field>
   case "${1:-}" in
     CHANGED)    alts='CHANGED|FILES' ;;
     CHECKED)    alts='CHECKED|HOW|EVIDENCE|RAN' ;;
-    GRADED-SHA) alts='GRADED-SHA|GRADED_SHA|GRADEDSHA|HEAD-SHA|SHA' ;;
+    DELIVERED-SHA) alts='DELIVERED-SHA|DELIVERED_SHA|DELIVEREDSHA|DELIVERY-SHA|DELIVERY_SHA' ;;
     CI)         alts='CI|CI-STATE|CHECKS' ;;
     CRITERIA)   alts='CRITERIA|ACCEPTANCE|CRITERION' ;;
     *)          return 1 ;;
@@ -261,7 +276,7 @@ _delivery_evidence_template() {
   cat <<'TPL'
 CHANGED: <the files that moved, and in one clause what each change does>
 CHECKED: <every command you ran, each with its pass/fail counts — "17 arms, 17 pass; 3 mutation arms red on the pre-fix tree">
-GRADED-SHA: <the sha those numbers were produced at — the head the grader re-runs them against>
+DELIVERED-SHA: <the sha those numbers were produced at — the head the grader re-runs them against. NOT `graded-sha`: that label is the verifier's, and writing it here would pre-satisfy the gate that checks the verdict>
 CI: <what CI said at delivery, or "not finished at delivery" (you must LOOK, you must not WAIT)>
 CRITERIA: <each acceptance criterion, and the line of evidence above that closes it>
 TPL

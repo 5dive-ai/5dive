@@ -542,7 +542,7 @@ eq "C9a the fixture IS merge-pending (the state the board paints graded->merge)"
 eq "C9b ...and the grading seat holds standing BEFORE the tap" "1" "$(_stands_on "$c11" main2)"
 _c11_before=$(col "$c11" handoff_delivered_at)
 _c11_iter_before=$(col "$c11" iteration)
-_c11_out=$( set +e; cmd_task_done "$_c11ident" --result="re-asserting the pass. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass GRADED-SHA: as stated here CI: green CRITERIA: (1) -> the run above" 2>&1 ); _c11_rc=$?
+_c11_out=$( set +e; cmd_task_done "$_c11ident" --result="re-asserting the pass. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass DELIVERED-SHA: 1f2e3d4c5b6a79880123456789abcdef01234567 CI: green CRITERIA: (1) -> the run above" 2>&1 ); _c11_rc=$?
 if (( _c11_rc != 0 )); then
   ok_t "C9c \`task done\` on a merge-pending row REFUSES (rc=$_c11_rc, not the exit-0 no-op)"
 else
@@ -677,7 +677,7 @@ _c12ident=$(db "SELECT ident FROM tasks WHERE id=${c12};")
 eq "C9j the reject makes the row NOT merge-pending" \
    "0" "$(db "SELECT COUNT(*) FROM tasks WHERE id=${c12} AND ${_TASKS_TFV_SQL};")"
 _c12_before=$(col "$c12" handoff_delivered_at)
-_c12_out=$( set +e; cmd_task_done "$_c12ident" --result="FIX: addressed the finding. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass GRADED-SHA: as stated here CI: green CRITERIA: (1) -> the run above" 2>&1 ); _c12_rc=$?
+_c12_out=$( set +e; cmd_task_done "$_c12ident" --result="FIX: addressed the finding. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass DELIVERED-SHA: 1f2e3d4c5b6a79880123456789abcdef01234567 CI: green CRITERIA: (1) -> the run above" 2>&1 ); _c12_rc=$?
 if (( _c12_rc == 0 )); then
   ok_t "C9k ...so its \`task done\` still DELIVERS (rc=0) — the guard did not widen"
 else
@@ -698,7 +698,7 @@ HARNESS_ACTOR=main2 grade_prose "$c13"
 db "UPDATE tasks SET handoff_delivered_at=datetime('now','-1 hour'),
        graded_verdict_at=datetime('now','-30 minutes'), assignee='dev' WHERE id=${c13};"
 _c13ident=$(db "SELECT ident FROM tasks WHERE id=${c13};")
-_c13_out=$( set +e; cmd_task_done "$_c13ident" --result="restoring a lost handoff. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass GRADED-SHA: as stated here CI: green CRITERIA: (1) -> the run above" \
+_c13_out=$( set +e; cmd_task_done "$_c13ident" --result="restoring a lost handoff. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass DELIVERED-SHA: 1f2e3d4c5b6a79880123456789abcdef01234567 CI: green CRITERIA: (1) -> the run above" \
               --force-redeliver="the handoff record was lost; the pass is unchanged" 2>&1 ); _c13_rc=$?
 if (( _c13_rc == 0 )); then
   ok_t "C9m --force-redeliver proceeds (rc=0), so the refusal is recoverable"

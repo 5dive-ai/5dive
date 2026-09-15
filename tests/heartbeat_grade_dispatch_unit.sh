@@ -57,7 +57,7 @@ M=$(_grader_grade_method_clause)
 has "$M" "VERIFY THE CLAIMS" && ok_t "the clause names the method"       || bad_t "the clause names the method" "$M"
 has "$M" "DO NOT RE-INVESTIGATE" && ok_t "the clause forbids re-derivation" || bad_t "the clause forbids re-derivation" "$M"
 has "$M" "RE-RUN"            && ok_t "the clause says re-run what is named" || bad_t "the clause says re-run what is named" "$M"
-has "$M" "GRADED-SHA"        && ok_t "the clause names the sha field"    || bad_t "the clause names the sha field" "$M"
+has "$M" "DELIVERED-SHA"     && ok_t "the clause names the sha field"    || bad_t "the clause names the sha field" "$M"
 has "$M" "unevidenced"       && ok_t "an unevidenced claim is named a FAIL" || bad_t "an unevidenced claim is named a FAIL" "$M"
 has "$M" "Budget 25 turns"   && ok_t "the budget is STATED, with its number" || bad_t "the budget is STATED, with its number" "$M"
 # The budget is a knob, and a knob nothing reads is a comment.

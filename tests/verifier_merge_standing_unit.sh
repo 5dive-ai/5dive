@@ -131,7 +131,7 @@ db "UPDATE tasks SET graded_at=datetime('now','-2 hours'), graded_verdict_at=dat
 IT_FROZEN=$(db "SELECT graded_at FROM tasks WHERE id=${IT};")
 ( cmd_task_reject "$IT" --feedback="bounced: fix the predicate" ) >/dev/null 2>&1
 # DIVE-4576: the five evidence labels are required of a delivery's result.
-( cmd_task_deliver "$IT" --pr="$ITER_PR" --result="iteration 2. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass GRADED-SHA: as stated here CI: green CRITERIA: (1) -> the run above" ) >/dev/null 2>&1   # re-delivery: advances the delivery clock, spends the reject token
+( cmd_task_deliver "$IT" --pr="$ITER_PR" --result="iteration 2. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass DELIVERED-SHA: 1f2e3d4c5b6a79880123456789abcdef01234567 CI: green CRITERIA: (1) -> the run above" ) >/dev/null 2>&1   # re-delivery: advances the delivery clock, spends the reject token
 db "UPDATE tasks SET handoff_delivered_at=datetime('now','-1 hour') WHERE id=${IT};"
 db "UPDATE tasks SET graded_by='${ME_V}', maker_agent='${MAKER_V}' WHERE id=${IT};"
 

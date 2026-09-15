@@ -295,7 +295,7 @@ _grader_process_run_open() {  # <seat> <ident> <session_id> [<clone>]
 # re-derivation this row exists to end.
 _GRADER_TURN_BUDGET="${_GRADER_TURN_BUDGET:-25}"
 _grader_grade_method_clause() {
-  printf 'VERIFY THE CLAIMS, DO NOT RE-INVESTIGATE: read the result'"'"'s CHANGED / CHECKED / GRADED-SHA / CI / CRITERIA fields, RE-RUN the commands it names against the graded sha, and spot-check the diff against each acceptance criterion — that is the grade. A claim carrying NO evidence is a FAIL, not something for you to go and derive: reject it with FINDING: unevidenced — <the claim>. Budget %s turns for the whole grade; on reaching it, deliver the verdict you have and say which claims you verified and which you did not reach, rather than spending a second session.' \
+  printf 'VERIFY THE CLAIMS, DO NOT RE-INVESTIGATE: read the result'"'"'s CHANGED / CHECKED / DELIVERED-SHA / CI / CRITERIA fields, RE-RUN the commands it names against the sha it delivered at (the maker writes DELIVERED-SHA; `graded-sha` in the result stays YOURS to write), and spot-check the diff against each acceptance criterion — that is the grade. A claim carrying NO evidence is a FAIL, not something for you to go and derive: reject it with FINDING: unevidenced — <the claim>. Budget %s turns for the whole grade; on reaching it, deliver the verdict you have and say which claims you verified and which you did not reach, rather than spending a second session.' \
     "${_GRADER_TURN_BUDGET:-25}"
 }
 

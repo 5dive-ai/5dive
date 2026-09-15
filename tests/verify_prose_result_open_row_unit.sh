@@ -124,7 +124,7 @@ grep -qi "graded by READING" <<<"$out" \
 # permanently wrong record, not an error. These arms assert the FILE form on both
 # verbs plus the two refusals that make it safe to reach for.
 F=$(mk "prose F")
-printf 'graded by reading the diff.\n\nSecond paragraph with a `backtick`, an apostrophe'"'"'s worth of trouble, and $NOT_A_VAR.\n\nCHANGED: src/x.sh\nCHECKED: bash tests/x.sh — 3 arms, 3 pass\nGRADED-SHA: as stated here\nCI: green\nCRITERIA: (1) -> the run above (DIVE-4576: a delivery names its evidence)\n' > "$TMP/verdict.txt"
+printf 'graded by reading the diff.\n\nSecond paragraph with a `backtick`, an apostrophe'"'"'s worth of trouble, and $NOT_A_VAR.\n\nCHANGED: src/x.sh\nCHECKED: bash tests/x.sh — 3 arms, 3 pass\nDELIVERED-SHA: 1f2e3d4c5b6a79880123456789abcdef01234567\nCI: green\nCRITERIA: (1) -> the run above (DIVE-4576: a delivery names its evidence)\n' > "$TMP/verdict.txt"
 "$CLI" task verify "$F" --no-done --result-file="$TMP/verdict.txt" >/dev/null 2>&1
 f_rc=$?
 [[ "$f_rc" -eq 0 ]] \
