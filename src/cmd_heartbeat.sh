@@ -320,6 +320,15 @@ _HB_CONSOLIDATE_EVERY_MIN="${MEMORY_CONSOLIDATE_EVERY_MIN:-360}"
 # A distiller call measured ~35s; 300s is generous headroom without letting a
 # wedged model call sit on the tick.
 _HB_CONSOLIDATE_TIMEOUT_S="${MEMORY_CONSOLIDATE_TIMEOUT_S:-300}"
+# DIVE-4562 — how many CONSECUTIVE API-error refusals before the seat is called
+# not-transacting out loud (and by `5dive doctor`). 4 at the 6h cadence is one
+# full day: long enough that a single expired token refreshed by the next sweep
+# never raises it, short enough that nobody loses sixteen days of consolidation
+# the way five teal-fox seats did. The counter is CONSECUTIVE, so one successful
+# pass clears it — a seat that is transacting can never accumulate toward the
+# threshold no matter how long it runs.
+_HB_CONSOLIDATE_NOTX_AFTER="${MEMORY_CONSOLIDATE_NOTX_AFTER:-4}"
+[[ "$_HB_CONSOLIDATE_NOTX_AFTER" =~ ^[0-9]+$ ]] || _HB_CONSOLIDATE_NOTX_AFTER=4
 [[ "$_HB_SLEEP_AFTER_MIN" =~ ^[0-9]+$ ]] || _HB_SLEEP_AFTER_MIN=15
 
 # Per-agent idle-before-sleep threshold (minutes); falls back to the global default.
@@ -544,6 +553,98 @@ _hb_a2a_queue_sweep() {
 }
 
 _hb_log() { printf '%s [heartbeat] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
+
+# --- DIVE-4554: WHO a heartbeat escalation reaches, and what happens when the
+# answer is "nobody" -----------------------------------------------------------
+#
+# Every escalation in this file used to be `( cmd_send "main" … ) >/dev/null 2>&1
+# || true`, or the same shape addressed to "ops". Both names exist on exactly one
+# box in the world: ours. DIVE-4551 was filed from a customer box (teal-fox)
+# whose org roots are claude-aleks / claude-alena / claude-jane — there the send
+# fails and the redirection eats the failure, so there is no warn in the cron
+# log, no `supervisor_events` row and nothing for `doctor` to read. The
+# supervisor rails DIVE-4551 fixed at least printed a warn, which is how the
+# customer found that bug at all; these were quieter, and two of the three `main`
+# sites are the billing walls written specifically to reach a person.
+#
+# A NAME IS A RESOLVER YOU HAVE NOT WRITTEN (community/wiki/
+# a-hardcoded-recipient-is-a-single-box-assumption.md). So the names move into
+# these two resolvers, which can answer "there is no such seat here", and every
+# call site below asks a question instead of addressing a constant.
+
+# The escalation recipient: the seat whose JOB is paging a person about fleet
+# state. `_task_resolve_gate_notifier` (src/task/routing.sh) falls back to
+# `_task_resolve_coordinator`, so an untagged lone-root chart resolves the root —
+# what the customer box needs — and this box resolves `main`, which is exactly
+# what these lines already said. NOT `_task_resolve_coordinator` directly:
+# measured here it returns `olivia` (the advisory CEO), so the literal proposal
+# would have moved the billing walls off the CTO who co-owns the runbook they
+# cite — a regression dressed as a fix (DIVE-4551, DIVE-4365).
+_hb_escalation_recipient() {  # -> seat name, or empty when nothing resolves
+  declare -F _task_resolve_gate_notifier >/dev/null 2>&1 || return 0
+  _task_resolve_gate_notifier 2>/dev/null || true
+}
+
+# The QUEUE-HOUSEKEEPING notices (stale-blocked, recurring stalls, stranded rows,
+# the fleet-stall and pinger canaries) are a different audience from the billing
+# walls, and routing them onto the notifier would be the same wrong-premise
+# regression pointing the other way: on this box they go to `ops` (DevOps/SRE)
+# while the notifier is `main` (the CTO). So this resolver PREFERS an ops seat
+# when the chart actually has one and otherwise falls back to the escalation
+# recipient — on a chart with no such seat the notice reaches whoever pages the
+# human rather than nobody at all. The string survives only INSIDE the resolver,
+# where its absence is answerable; no call site addresses it.
+_hb_ops_recipient() {  # -> seat name, or empty when nothing resolves
+  local _n=""
+  _n=$(db "SELECT name FROM agents_org WHERE lower(name)='ops' LIMIT 1;" 2>/dev/null) || _n=""
+  if [[ -n "$_n" ]]; then printf '%s' "$_n"; return 0; fi
+  _hb_escalation_recipient
+}
+
+# An escalation that reached nobody must not be distinguishable from one that
+# reached someone only by the absence of output. The tick still never aborts on a
+# wedged channel or an empty org chart (DIVE-1127), so the escape is an AUDITED
+# row instead of a bare `|| true`: `_sup_alert_undeliverable` writes
+# event='alert-undeliverable' into supervisor_events, and DIVE-4551's
+# `supervisor-alert-delivery` doctor check already reads that table over 7d — so
+# a lost heartbeat leg lights an existing error-level check with no new arm.
+_hb_alert_undeliverable() {  # <subject> <class> <reason> [recipient]
+  if declare -F _sup_alert_undeliverable >/dev/null 2>&1; then
+    # leg=machine: every heartbeat escalation is an a2a send. The human leg on
+    # these rails is the recipient seat's own paired channel, not ours to file.
+    _sup_alert_undeliverable "$1" "$2" machine "$3" "${4:-}"
+  else
+    # Never silent — a tree missing the audit writer is a split-tree test
+    # harness, not the shipped bundle, and saying so is the whole point of the
+    # row. Deliberately not a duplicated INSERT: one writer, one schema.
+    _hb_log "[$1] AUDIT WRITER MISSING (_sup_alert_undeliverable) — could not record a '${3}' escalation loss for class '${2}' (DIVE-4554)"
+  fi
+}
+
+# The one send used by every escalation below. Pass the recipient explicitly when
+# the rail has its own audience (the ops notices do); omit it for the escalation
+# recipient. An EXPLICIT empty recipient is honoured as "nothing resolved" rather
+# than silently re-resolved, which is what makes the ops rails auditable too.
+# _HB_ESCALATE_TO holds the seat the LAST escalation resolved to (empty = none),
+# so a log line can name the seat that was actually reached instead of repeating
+# a constant. The stall-sweep line below said "sent to main" while the code had
+# been sending to ops for eight months — a stale name in a log is the same defect
+# class, one layer out, and it is what a reader greps when the page never arrives.
+_HB_ESCALATE_TO=""
+_hb_escalate() {  # <rail> <subject> <class> <message> [recipient]
+  local rail="$1" subject="$2" class="$3" msg="$4" to=""
+  if (( $# >= 5 )); then to="$5"; else to=$(_hb_escalation_recipient); fi
+  _HB_ESCALATE_TO="$to"
+  if [[ -z "$to" ]]; then
+    _hb_log "[${subject}] ${rail}: UNDELIVERABLE — no recipient resolves on this box; the escalation is audited, not delivered. Fix: give the org chart ONE root (5dive org set <agent> --manager=<mgr>), or tag a seat (5dive org set <agent> --role='<their prose> gate notifier') (DIVE-4554)"
+    _hb_alert_undeliverable "$subject" "$class" no-recipient ""
+    return 0
+  fi
+  if ! ( cmd_send "$to" --from="task-engine" --message="$msg" ) >/dev/null 2>&1; then
+    _hb_log "[${subject}] ${rail}: 'cmd_send ${to}' FAILED — escalation lost (audited, not delivered) (DIVE-4554)"
+    _hb_alert_undeliverable "$subject" "$class" send-failed "$to"
+  fi
+}
 
 _hb_usage() {
   cat <<USAGE
@@ -5152,8 +5253,9 @@ _hb_blocked_sweep() {
           --message="▶️ Unblocked: ${dident} — all blockers done, now on your queue." ) >/dev/null 2>&1 || true
     done
     _hb_log "[blocked-sweep] auto-recovered: ${idlist}"
-    ( cmd_send "ops" --from="task-engine" \
-        --message="🔧 Auto-recovered ${#rec[@]} stale-blocked task(s) whose blockers were all done: ${idlist}" ) >/dev/null 2>&1 || true
+    _hb_escalate "blocked-sweep" "task-engine" "blocked-autorecovered" \
+        "🔧 Auto-recovered ${#rec[@]} stale-blocked task(s) whose blockers were all done: ${idlist}" \
+        "$(_hb_ops_recipient)"
   fi
 
   # (b) surface no-live-reason blocks (never auto-unblock). Throttle to once/24h.
@@ -5167,8 +5269,9 @@ _hb_blocked_sweep() {
     last=$(db "SELECT value FROM task_prefs WHERE key='blocked_sweep_pinged_at';" 2>/dev/null)
     cutoff=$(date -u -d '24 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
     if [[ -z "$last" || ( -n "$cutoff" && "$last" < "$cutoff" ) ]]; then
-      ( cmd_send "ops" --from="task-engine" \
-          --message="⚠️ Blocked with no live reason (no open dependency, no human gate, no park) — likely manually blocked + forgotten. Unblock (5dive task unblock <id>) or cancel if dead: ${orphan}" ) >/dev/null 2>&1 || true
+      _hb_escalate "blocked-sweep" "task-engine" "blocked-no-reason" \
+          "⚠️ Blocked with no live reason (no open dependency, no human gate, no park) — likely manually blocked + forgotten. Unblock (5dive task unblock <id>) or cancel if dead: ${orphan}" \
+        "$(_hb_ops_recipient)"
       db "INSERT INTO task_prefs (key,value) VALUES ('blocked_sweep_pinged_at', datetime('now'))
           ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
       _hb_log "[blocked-sweep] surfaced no-reason blocked: ${orphan}"
@@ -5608,8 +5711,9 @@ _hb_stall_sweep() {
     rbusy=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks
                 WHERE kind='standard' AND status='in_progress'
                   AND assignee=$(sqlq "${rasg:-}") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
-    ( cmd_send "ops" --from="task-engine" \
-        --message="⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}'${rbusy:+ — who is OCCUPIED on ${rbusy}, so this notice may be undeliverable-in-effect (a goal-fenced assignee cannot take a second row)} — ${rsupp_main}. If it is still unstarted in ${_HB_RECURRING_ESCALATE_HOURS}h the ladder reassigns or cancels it (DIVE-2853)." ) >/dev/null 2>&1 || true
+    _hb_escalate "recurring-stall" "${rident}" "recurring-stall" \
+        "⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}'${rbusy:+ — who is OCCUPIED on ${rbusy}, so this notice may be undeliverable-in-effect (a goal-fenced assignee cannot take a second row)} — ${rsupp_main}. If it is still unstarted in ${_HB_RECURRING_ESCALATE_HOURS}h the ladder reassigns or cancels it (DIVE-2853)." \
+        "$(_hb_ops_recipient)"
     db "UPDATE tasks SET recurring_stall_pinged_at=datetime('now') WHERE id=${rid};"
     _hb_log "[recurring-stall] ${rident} never-started ${rhours}h (template ${rtmpl}) -> surfaced"
   done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||t.created_at||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)||x'1f'||COALESCE(p.on_overlap,'skip')
@@ -5709,8 +5813,9 @@ _hb_stall_sweep() {
         ( cmd_send "$easg" --from="task-engine" \
             --message="🔁 ${eident} has been moved OFF you to '${etarget}' — it was never started ${ehours}h after being flagged, and ${esupp}. Nothing for you to do; if you were about to start it, say so to ${etarget} rather than both starting it." ) >/dev/null 2>&1 || true
       fi
-      ( cmd_send "ops" --from="task-engine" \
-          --message="🔁 Recurring-stall ESCALATED: ${eident} (template ${etmpl}) reassigned '${easg:-unassigned}' -> '${etarget}' after ${ehours}h unstarted past its flag — a re-ping to the original assignee cannot clear a goal-fenced one, so the ladder changes hands (DIVE-2853)." ) >/dev/null 2>&1 || true
+      _hb_escalate "recurring-escalate" "${eident}" "recurring-escalate" \
+          "🔁 Recurring-stall ESCALATED: ${eident} (template ${etmpl}) reassigned '${easg:-unassigned}' -> '${etarget}' after ${ehours}h unstarted past its flag — a re-ping to the original assignee cannot clear a goal-fenced one, so the ladder changes hands (DIVE-2853)." \
+        "$(_hb_ops_recipient)"
       ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
         actor="task-engine" authority="heartbeat" \
         detail="reassigned ${easg:-unassigned}->${etarget} after ${ehours}h never-started (template ${etmpl})" || true
@@ -5724,7 +5829,8 @@ _hb_stall_sweep() {
       if [[ -n "$easg" ]]; then
         ( cmd_send "$easg" --from="task-engine" --message="$emsg If you still want this instance, the next materialization is yours to start on time — or reply to say the row should not be assigned to you." ) >/dev/null 2>&1 || true
       fi
-      ( cmd_send "ops" --from="task-engine" --message="$emsg No free agent existed at escalation time, so reassignment had nowhere to go (DIVE-2853)." ) >/dev/null 2>&1 || true
+      _hb_escalate "recurring-escalate" "${eident}" "recurring-escalate" "$emsg No free agent existed at escalation time, so reassignment had nowhere to go (DIVE-2853)." \
+        "$(_hb_ops_recipient)"
       ledger_emit "task.recurring_stall_escalated" ident="$eident" task_id="$eid" \
         actor="task-engine" authority="heartbeat" \
         detail="auto-cancelled after ${ehours}h never-started, no free agent (template ${etmpl})" || true
@@ -5927,8 +6033,9 @@ _hb_stall_sweep() {
     else
       slane="that seat holds nothing else and is not visibly busy, so READ THE ROW before treating this as a lane problem"
     fi
-    ( cmd_send "ops" --from="task-engine" \
-        --message="🧊 Stranded ${sdays}d: ${sident} ${sphase} on '${sasg}'${sbusy:+, while that seat is ACTIVE on ${sbusy}}${sload:+ and holds ${sload} other todo row(s)} — ${slane} (reassign; cancel it if it is dead; or, if it is waiting on a date or an event, give that wait its verb — \`5dive task park --wake=\` — because a wait written only in the body leaves the row in the rotation and lands here). Surfaced once per row and never again (DIVE-3483)." ) >/dev/null 2>&1 || true
+    _hb_escalate "stranded" "${sident}" "stranded-row" \
+        "🧊 Stranded ${sdays}d: ${sident} ${sphase} on '${sasg}'${sbusy:+, while that seat is ACTIVE on ${sbusy}}${sload:+ and holds ${sload} other todo row(s)} — ${slane} (reassign; cancel it if it is dead; or, if it is waiting on a date or an event, give that wait its verb — \`5dive task park --wake=\` — because a wait written only in the body leaves the row in the rotation and lands here). Surfaced once per row and never again (DIVE-3483)." \
+        "$(_hb_ops_recipient)"
     db "UPDATE tasks SET stranded_pinged_at=datetime('now') WHERE id=${sid};"
     _hb_log "[stranded] ${sident} todo ${sdays}d on ${sasg}${sbusy:+ (active on ${sbusy})} -> surfaced"
   done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(first_started_at,created_at)||x'1f'||COALESCE(first_started_at,'')
@@ -6078,11 +6185,12 @@ _hb_stall_sweep() {
             _hdr="❓ possible fleet-stall (UNPROVEN)"
             _tail="The session probe could not measure every agent, so this is a QUESTION, not a finding — is the fleet actually stalled? Check \`5dive task ls\` / \`5dive task inbox\`"
           fi
-          ( cmd_send "ops" --from="task-engine" \
-              --message="${_hdr}: ${total_stranded} stranded actionable item(s) (${stranded_todo} assigned-but-unstarted, ${open_gates} fleet-actionable gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops, ${parked_gates} parked on the human (context, not counted) — and ${_act_detail}. ${_tail} (DIVE-1416 gap#3, session probe DIVE-2122, claim/probe honesty DIVE-2244, labels DIVE-2207)." ) >/dev/null 2>&1 || true
+          _hb_escalate "stall-sweep" "task-engine" "fleet-stall" \
+              "${_hdr}: ${total_stranded} stranded actionable item(s) (${stranded_todo} assigned-but-unstarted, ${open_gates} fleet-actionable gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops, ${parked_gates} parked on the human (context, not counted) — and ${_act_detail}. ${_tail} (DIVE-1416 gap#3, session probe DIVE-2122, claim/probe honesty DIVE-2244, labels DIVE-2207)." \
+        "$(_hb_ops_recipient)"
           db "INSERT INTO task_prefs (key,value) VALUES ('stall_alerted_at', datetime('now'))
               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
-          _hb_log "[stall-sweep] fleet-idle $((since_secs / 60))m with ${total_stranded} stranded item(s), ${_act_detail} -> sent '${_hdr}' to main"
+          _hb_log "[stall-sweep] fleet-idle $((since_secs / 60))m with ${total_stranded} stranded item(s), ${_act_detail} -> sent '${_hdr}' to '${_HB_ESCALATE_TO:-nobody (undeliverable)}'"
         fi
       fi
     fi
@@ -6117,8 +6225,9 @@ _hb_stall_sweep() {
       last_alert=$(db "SELECT value FROM task_prefs WHERE key='pinger_canary_alerted_at';" 2>/dev/null)
       cutoff=$(date -u -d '6 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
       if [[ -z "$last_alert" || ( -n "$cutoff" && "$last_alert" < "$cutoff" ) ]]; then
-        ( cmd_send "ops" --from="task-engine" \
-            --message="🚨 pinger-liveness canary tripped: ${eligible} human gate(s) are past their reminder window (72h+ unanswered, unpinged 7d+) but gate_pinged_at hasn't advanced fleet-wide in over an hour — the gate-ping batch looks dead (DIVE-1434 regression class). Check /var/log/5dive-heartbeat.log for batch errors." ) >/dev/null 2>&1 || true
+        _hb_escalate "pinger-canary" "task-engine" "pinger-canary" \
+            "🚨 pinger-liveness canary tripped: ${eligible} human gate(s) are past their reminder window (72h+ unanswered, unpinged 7d+) but gate_pinged_at hasn't advanced fleet-wide in over an hour — the gate-ping batch looks dead (DIVE-1434 regression class). Check /var/log/5dive-heartbeat.log for batch errors." \
+        "$(_hb_ops_recipient)"
         db "INSERT INTO task_prefs (key,value) VALUES ('pinger_canary_alerted_at', datetime('now'))
             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
         _hb_log "[pinger-canary] TRIPPED — ${eligible} eligible gate(s), last gate_pinged_at ${last_ping:-never}"
@@ -6653,6 +6762,18 @@ _hb_capability_reverify_sweep() {
   return 0
 }
 
+# DIVE-4562 iteration 2 — resolve a seat's unix user, or fail if it has none.
+# Its OWN function because two places need the same answer: the sweep's loop
+# (which seats does it visit?) and the reap below (which counters can never be
+# cleared again?). Two copies of this rule that drift apart re-create the wedge
+# the reap exists to close, so there is exactly one.
+_hb_consolidate_seat_user() {
+  local _n="$1"
+  if id -u "agent-${_n}" >/dev/null 2>&1; then printf 'agent-%s' "$_n"; return 0; fi
+  if id -u "$_n"         >/dev/null 2>&1; then printf '%s' "$_n";       return 0; fi
+  return 1
+}
+
 # DIVE-3628 — THE SCHEDULER for `5dive memory consolidate`. A verb nobody runs is
 # not an async pipeline: the acceptance is "a fresh box user's agent loses a
 # session and a later session knows what it learned, with NO manual step", and
@@ -6696,6 +6817,13 @@ _hb_memory_consolidate_sweep() {
   # i.e. still being loaded with their TAIL dropped. OVER is the one that matters:
   # it is the 24-hours-later number DIVE-4222's saving evaporated against.
   _HB_CONS_ROUTED=0; _HB_CONS_OVER=0
+  # DIVE-4562 — the not-transacting counters. UNAUTH is the seats whose distiller
+  # answered with an API-error refusal THIS pass; NOTX is the subset that has now
+  # done so for _HB_CONSOLIDATE_NOTX_AFTER consecutive passes, i.e. the ones a
+  # human has to clear. They are separate because the first is noise on any given
+  # tick (a token rotating, a limit resetting at the top of the hour) and the
+  # second is the standing condition that went unseen for sixteen days.
+  _HB_CONS_UNAUTH=0; _HB_CONS_NOTX=0
   [[ "${MEMORY_CONSOLIDATE:-on}" == "off" ]] && return 0
   local every="${MEMORY_CONSOLIDATE_EVERY_MIN:-${_HB_CONSOLIDATE_EVERY_MIN}}"
   [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) || every="$_HB_CONSOLIDATE_EVERY_MIN"
@@ -6703,11 +6831,35 @@ _hb_memory_consolidate_sweep() {
   mkdir -p "$stampdir" 2>/dev/null || return 0
   local reg name user stamp last
   reg=$(registry_read) || return 0
+  # DIVE-4562 iteration 2 (quinn) — REAP the counters of seats this sweep will
+  # never visit again. The counter is deleted by the pass that gets through, so
+  # a seat removed WHILE it was refusing leaves a file nothing can ever clear,
+  # and doctor's new check would then name a seat nobody can restore, forever.
+  # That is the cry-wolf alarm alternative (c) was rejected for, reached through
+  # a different door — and it is likeliest exactly when the incident is a
+  # fleet-wide auth lapse (five seats refusing at once; remove any one of them).
+  # `agent rm` now deletes both files itself; this reap is what heals a box
+  # where the seat went away some other way, or under a pre-4562 binary.
+  #
+  # The seat list is derived ONCE, and the reap runs only if that derivation
+  # SUCCEEDED. A registry that cannot be read has already returned above, and one
+  # that reads but does not parse is UNKNOWN — not empty. Reaping on unknown
+  # would delete the fleet's counters, i.e. erase the standing condition this row
+  # exists to make visible, on a transient read error.
+  local _known_seats _rf _rn
+  if _known_seats=$(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); then
+    for _rf in "$stampdir"/*.notx; do
+      [[ -e "$_rf" ]] || continue
+      _rn=$(basename "$_rf" .notx)
+      grep -qxF -- "$_rn" <<<"$_known_seats" \
+        && _hb_consolidate_seat_user "$_rn" >/dev/null && continue
+      rm -f "$_rf" "$stampdir/${_rn}.stamp" 2>/dev/null || true
+      _hb_log "[memory-consolidate] reaped a stale not-transacting counter for '${_rn}' (no such seat on this box any more) — it could never have been cleared by a passing run."
+    done
+  fi
   for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
     # Resolve the seat's unix user the same way the memory store does.
-    user="agent-$name"
-    id -u "$user" >/dev/null 2>&1 || user="$name"
-    id -u "$user" >/dev/null 2>&1 || continue
+    user=$(_hb_consolidate_seat_user "$name") || continue
     stamp="$stampdir/${name}.stamp"
     last=$(cat "$stamp" 2>/dev/null) || last=0
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
@@ -6770,6 +6922,34 @@ _hb_memory_consolidate_sweep() {
     [[ "$n_routed" == "true" ]] && _HB_CONS_ROUTED=$((_HB_CONS_ROUTED + 1)) || :
     [[ "$n_over"   == "true" ]] && _HB_CONS_OVER=$((_HB_CONS_OVER + 1)) || :
     _HB_CONS_ATOMS=$((_HB_CONS_ATOMS + n_atoms))
+    # DIVE-4562 — READ THE RESULT OF THE TURN, not just the fact that a turn
+    # happened. The verb now says whether its distiller REFUSED (not logged in,
+    # spend/usage/session limit) rather than merely failed, and that is the one
+    # outcome where the next pass is guaranteed to fail the same way. An absent
+    # field (a seat still on a pre-4562 binary) is 0, never an alarm.
+    local n_unauth
+    n_unauth=$(jq -s -r "$jf pick(\"distiller_unauthed\")" <<<"$out" 2>/dev/null) || n_unauth=""
+    [[ "$n_unauth" =~ ^[0-9]+$ ]] || n_unauth=0
+    # The consecutive counter lives next to the cadence stamp, for the same
+    # reason the stamp does: it has to survive the tick that wrote it. Reset on
+    # ANY pass that was not a refusal — including a plain distiller failure, which
+    # proves the seat reached the model and got an answer back.
+    local notxf="$stampdir/${name}.notx" notx=0
+    if (( n_unauth > 0 )); then
+      notx=$(cat "$notxf" 2>/dev/null) || notx=0
+      [[ "$notx" =~ ^[0-9]+$ ]] || notx=0
+      notx=$((notx + 1))
+      printf '%s\n' "$notx" > "$notxf" 2>/dev/null || true
+      _HB_CONS_UNAUTH=$((_HB_CONS_UNAUTH + 1))
+      if (( notx >= _HB_CONSOLIDATE_NOTX_AFTER )); then
+        _HB_CONS_NOTX=$((_HB_CONS_NOTX + 1))
+        # Named, per seat, every pass it stays broken. The fleet summary line
+        # below is a count; a count nobody can act on is what this row is about.
+        _hb_log "[memory-consolidate] SEAT NOT TRANSACTING: ${name} — ${notx} consecutive passes refused by the API (not logged in / spend or usage limit). Its memory has not consolidated since the streak began. Retrying will not clear this: restore the seat's auth or raise the limit (5dive doctor --category=memory)."
+      fi
+    else
+      rm -f "$notxf" 2>/dev/null || true
+    fi
     if (( n_dfail > 0 )); then
       _HB_CONS_DFAIL=$((_HB_CONS_DFAIL + 1))
     elif (( n_proc > 0 )); then
@@ -6899,7 +7079,7 @@ cmd_heartbeat_tick() {
   # DIVE-4284: ROUTED/OVER join the guard so an index event alone still logs —
   # a seat with nothing to distil can still be the seat whose index is truncated.
   (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} || ${_HB_CONS_DFAIL:-0} || ${_HB_CONS_IDLE:-0} || ${_HB_CONS_ROUTED:-0} || ${_HB_CONS_OVER:-0} )) \
-    && _hb_log "[memory-consolidate] ${_HB_CONS_ATOMS:-0} atom(s) from ${_HB_CONS_RAN:-0} seat(s), ${_HB_CONS_DFAIL:-0} distiller-failed, ${_HB_CONS_FAILED:-0} could not run, ${_HB_CONS_IDLE:-0} nothing to distil, ${_HB_CONS_SKIPPED:-0} not due; index: ${_HB_CONS_ROUTED:-0} re-routed under limit, ${_HB_CONS_OVER:-0} STILL OVER" || true
+    && _hb_log "[memory-consolidate] ${_HB_CONS_ATOMS:-0} atom(s) from ${_HB_CONS_RAN:-0} seat(s), ${_HB_CONS_DFAIL:-0} distiller-failed (${_HB_CONS_UNAUTH:-0} API-refused, ${_HB_CONS_NOTX:-0} NOT TRANSACTING), ${_HB_CONS_FAILED:-0} could not run, ${_HB_CONS_IDLE:-0} nothing to distil, ${_HB_CONS_SKIPPED:-0} not due; index: ${_HB_CONS_ROUTED:-0} re-routed under limit, ${_HB_CONS_OVER:-0} STILL OVER" || true
   # DIVE-3343: there is NO per-TASK budget sweep here any more, and its absence
   # is deliberate — see the block above _hb_loop_ceiling_sweep's neighbours in
   # this file for why the figure it enforced could not be attributed to a row.
@@ -7331,8 +7511,8 @@ cmd_heartbeat_tick() {
           sc_last=$(db "SELECT value FROM task_prefs WHERE key='${sc_key}';" 2>/dev/null)
           sc_cut=$(date -u -d '6 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
           if [[ -z "$sc_last" || ( -n "$sc_cut" && "$sc_last" < "$sc_cut" ) ]]; then
-            ( cmd_send "main" --from="task-engine" \
-                --message="🔴 Spend cap, not a rate limit: agent '${name}' (account '${acct}') is refusing every request with a SPEND-limit wall, which does not reset on its own the way the 5-hour window does. The task engine has STOPPED handing rows to that seat and will re-check by measurement — nothing is queued behind a retry loop. Raising or resetting the ceiling is a billing call for lodar. (DIVE-3465)" ) >/dev/null 2>&1 || true
+            _hb_escalate "spend-cap" "${name}" "spend-cap" \
+                "🔴 Spend cap, not a rate limit: agent '${name}' (account '${acct}') is refusing every request with a SPEND-limit wall, which does not reset on its own the way the 5-hour window does. The task engine has STOPPED handing rows to that seat and will re-check by measurement — nothing is queued behind a retry loop. Raising or resetting the ceiling is a billing call for lodar. (DIVE-3465)"
             db "INSERT INTO task_prefs (key,value) VALUES ('${sc_key}', datetime('now'))
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');" 2>/dev/null || true
           fi
@@ -7397,11 +7577,11 @@ cmd_heartbeat_tick() {
           ua_last=$(db "SELECT value FROM task_prefs WHERE key='${ua_key}';" 2>/dev/null)
           ua_cut=$(date -u -d '60 minutes ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
           if [[ -z "$ua_last" || ( -n "$ua_cut" && "$ua_last" < "$ua_cut" ) ]]; then
-            ( cmd_send "main" --from="task-engine" \
-                --message="🟠 Capacity/billing check: agent '${name}' is frozen on the Claude Code usage-limit dialog and STILL frozen ${heal_gap}m after a self-heal restart, with no healthy peer on account '${acct}' to prove headroom — account '${acct}' appears genuinely rate/spend-limited right now (not a stuck dialog). If this is a plan/spend ceiling it's a human call for lodar. (DIVE-1666)" ) >/dev/null 2>&1 || true
+            _hb_escalate "usage-limit" "${name}" "usage-limit" \
+                "🟠 Capacity/billing check: agent '${name}' is frozen on the Claude Code usage-limit dialog and STILL frozen ${heal_gap}m after a self-heal restart, with no healthy peer on account '${acct}' to prove headroom — account '${acct}' appears genuinely rate/spend-limited right now (not a stuck dialog). If this is a plan/spend ceiling it's a human call for lodar. (DIVE-1666)"
             db "INSERT INTO task_prefs (key,value) VALUES ('${ua_key}', datetime('now'))
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');" 2>/dev/null || true
-            _hb_log "[$name] usage-limit dialog frozen ${heal_gap}m post-restart, no headroom on '$acct' → surfaced capacity/billing to main (DIVE-1666)"
+            _hb_log "[$name] usage-limit dialog frozen ${heal_gap}m post-restart, no headroom on '$acct' → surfaced capacity/billing to '${_HB_ESCALATE_TO:-nobody (undeliverable)}' (DIVE-1666/4554)"
           fi
         fi
         sk_active=$((sk_active + 1))
@@ -7451,8 +7631,8 @@ cmd_heartbeat_tick() {
           if [[ "${reaped:-0}" =~ ^[0-9]+$ ]] && (( reaped == 0 )); then
             # Nothing reapable and still not advancing: this is past what the
             # heartbeat can fix by itself. Surface it rather than resetting.
-            ( cmd_send "main" --from="task-engine" \
-                --message="🟠 Seat '${name}' has been stranded across ${defer_n} deferred heartbeat ticks with an UNCHANGED pane, through a repeat force-nudge, and has no reapable stale shell — the nudge is proven not to land and the seat cannot take ${task_ident}. Needs a look (DIVE-3503/DIVE-1486)." ) >/dev/null 2>&1 || true
+            _hb_escalate "active-defer" "${name}" "active-defer-stranded" \
+                "🟠 Seat '${name}' has been stranded across ${defer_n} deferred heartbeat ticks with an UNCHANGED pane, through a repeat force-nudge, and has no reapable stale shell — the nudge is proven not to land and the seat cannot take ${task_ident}. Needs a look (DIVE-3503/DIVE-1486)."
           fi
         fi
         _hb_log "[$name] active-defer escalation — pane unchanged ${defer_n} ticks (>=${_HB_ACTIVE_DEFER_ESCALATE}) with ${task_ident} todo waiting → idle-stranded, force-nudging (DIVE-1486)"

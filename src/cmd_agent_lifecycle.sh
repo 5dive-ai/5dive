@@ -125,6 +125,15 @@ cmd_rm() {
   systemctl reset-failed "5dive-agent@${name}.service" 2>/dev/null || true
   step "Removing systemd env + channel secrets"
   rm -f "${ENV_DIR}/${name}.env" "${ENV_DIR}/${name}-auth.env"
+  # DIVE-4562: and the memory-consolidation scheduler's per-seat files. The
+  # not-transacting counter is only ever deleted by a pass that GETS THROUGH, so
+  # a seat removed while its distiller was being refused left behind a counter
+  # that nothing could ever clear — `5dive doctor --category=memory` would name
+  # a seat nobody can restore, forever. The cadence stamp goes with it so a
+  # re-created seat of the same name starts on a clean cadence rather than
+  # inheriting a stranger's clock.
+  rm -f "${STATE_DIR}/memory-consolidate/${name}.notx" \
+        "${STATE_DIR}/memory-consolidate/${name}.stamp"
   remove_channel_secret telegram "$name"
   remove_channel_secret discord  "$name"
   step "Deleting user agent-${name}"

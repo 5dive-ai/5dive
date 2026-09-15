@@ -38,6 +38,14 @@ STATE_DIR="$TMP"; TASKS_DIR="$TMP/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 mkdir -p "$TASKS_DIR"
 tasks_db_init; _tasks_db_migrate
 
+# DIVE-4554: the housekeeping notices below no longer address a seat by name —
+# they ask `_hb_ops_recipient` who holds that job on THIS chart. An empty
+# `agents_org` therefore resolves nobody, and the notice is audited instead of
+# sent, which is the correct product behaviour and makes every "the coordinator
+# is told" arm below vacuous. So the fixture now states the chart it always
+# assumed: one ops seat, the one these notices went to unconditionally before.
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('ops','DevOps / SRE',NULL);"
+
 # The rail is REAL in this harness (cmd_agent.sh is sourced), so stub it or a unit
 # test injects into live tmux panes. Same posture as heartbeat_gate_renag_unit.sh.
 AGENT_SEND_LOG="$TMP/agent_sends"; : >"$AGENT_SEND_LOG"

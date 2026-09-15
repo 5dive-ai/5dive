@@ -504,17 +504,33 @@ t "4052: a 1-arg call defaults loud on both legs" \
 # below cannot reach, because they stub this function to observe its arguments.
 # Here the arguments are honoured or not at the two actual sends. `5dive` is a
 # leading-digit function name, which bash allows.
-MACHINE_FIRED=0; HUMAN_FIRED=0
-5dive() { MACHINE_FIRED=1; return 0; }
-_task_agent_channel() { return 0; }
+MACHINE_FIRED=0; HUMAN_FIRED=0; SENT_TO=""; CHAN_FOR=""
+5dive() { MACHINE_FIRED=1; SENT_TO="$3"; return 0; }
+_task_agent_channel() { CHAN_FOR="$1"; return 0; }
 _task_send_owner() { HUMAN_FIRED=1; return 0; }
+# DIVE-4551: the recipient is RESOLVED now, not the literal string `main`. The
+# resolver lives in src/task/routing.sh (this harness sources cmd_supervisor.sh
+# alone), so it is stubbed here exactly like the two rails above — what these
+# arms grade is that the alert honours whatever it resolves, and the resolution
+# ORDER itself is graded against a real org chart in
+# tests/supervisor_alert_recipient_unit.sh.
+_task_resolve_gate_notifier() { printf 'claude-aleks'; }
 
 MACHINE_FIRED=0; HUMAN_FIRED=0; _sup_capacity_alert ops quota-exhausted "d" true true
 t "capacity_alert: both legs fire when both are asked for" "1:1" "$HUMAN_FIRED:$MACHINE_FIRED"
 
+t "capacity_alert: ...addressed to the RESOLVED seat, not the literal 'main'" \
+  "claude-aleks:claude-aleks" "$SENT_TO:$CHAN_FOR"
+
 MACHINE_FIRED=0; HUMAN_FIRED=0; _sup_capacity_alert ops quota-exhausted "d" false false
 t "capacity_alert: the human leg is silent when muted"   "0" "$HUMAN_FIRED"
-t "capacity_alert: and NO 'agent send main' is issued"   "0" "$MACHINE_FIRED"
+t "capacity_alert: and NO agent-send is issued"          "0" "$MACHINE_FIRED"
+# DIVE-4551: a MUTED leg is not an undeliverable one — nobody asked for it to be
+# delivered. Without this arm the counter could be bumped by the DIVE-4052 mute
+# and `doctor` would report an outage on a box whose alerts are working.
+_SUP_ALERTS_UNDELIVERABLE=0; _sup_capacity_alert ops quota-exhausted "d" false false
+t "capacity_alert: a muted leg is NOT counted undeliverable" \
+  "0" "$_SUP_ALERTS_UNDELIVERABLE"
 
 # The two legs are independent, not one boolean under two names: muting either
 # alone must leave the other firing, which an implementation that collapsed them
@@ -531,6 +547,50 @@ t "capacity_alert: no 4th/5th arg preserves the old loud behavior on both legs" 
 MACHINE_FIRED=0; HUMAN_FIRED=0; _sup_verify_alert ops "identity challenge"
 t "4052 verify-challenge: its own alert path is untouched, both legs live" \
   "1:1" "$HUMAN_FIRED:$MACHINE_FIRED"
+
+# ── DIVE-4551: the three ways a leg is LOST, and none of them may be silent ──
+# The customer shape: three org roots, none tagged, so nothing resolves. Before
+# this row both legs dropped and left a warn line in a cron log; the tick must
+# still complete, and the loss must be COUNTED.
+_task_resolve_gate_notifier() { printf ''; }
+MACHINE_FIRED=0; HUMAN_FIRED=0; _SUP_ALERTS_UNDELIVERABLE=0
+_sup_capacity_alert ops no-output "1 open row(s), nothing closed in 32d" true true
+t "4551 no recipient: neither leg is attempted" "0:0" "$HUMAN_FIRED:$MACHINE_FIRED"
+t "4551 no recipient: both legs are counted undeliverable" \
+  "2" "$_SUP_ALERTS_UNDELIVERABLE"
+# ...and only the legs that were ASKED for. The teal-fox alert is no-output,
+# whose human leg is muted by DIVE-3982: counting it would over-report.
+_SUP_ALERTS_UNDELIVERABLE=0
+_sup_capacity_alert ops no-output "d" false true
+t "4551 no recipient: a muted leg is not counted as lost" \
+  "1" "$_SUP_ALERTS_UNDELIVERABLE"
+
+# A recipient that resolves but whose a2a rail refuses — the `no agent named`
+# half of the customer report, now audited instead of warned away.
+_task_resolve_gate_notifier() { printf 'claude-aleks'; }
+5dive() { return 1; }
+_task_agent_channel() { return 0; }
+MACHINE_FIRED=0; HUMAN_FIRED=0; _SUP_ALERTS_UNDELIVERABLE=0
+_sup_capacity_alert ops no-output "d" false true
+t "4551 send-failed: the lost machine leg is counted" "1" "$_SUP_ALERTS_UNDELIVERABLE"
+
+# A recipient that resolves and carries NO paired channel — the leg that was a
+# bare `if` with no else before this row, and the quietest of the three.
+5dive() { MACHINE_FIRED=1; return 0; }
+_task_agent_channel() { return 1; }
+MACHINE_FIRED=0; HUMAN_FIRED=0; _SUP_ALERTS_UNDELIVERABLE=0
+_sup_capacity_alert ops verify-challenge "d" true true
+t "4551 no-channel: the machine leg still fires" "1" "$MACHINE_FIRED"
+t "4551 no-channel: the human leg is counted lost, not skipped in silence" \
+  "1" "$_SUP_ALERTS_UNDELIVERABLE"
+# The negative control for all six arms above: a fully deliverable alert counts
+# ZERO. Without it every arm here is satisfied by a counter that only increments.
+5dive() { MACHINE_FIRED=1; return 0; }
+_task_agent_channel() { return 0; }
+MACHINE_FIRED=0; HUMAN_FIRED=0; _SUP_ALERTS_UNDELIVERABLE=0
+_sup_capacity_alert ops verify-challenge "d" true true
+t "4551 control: a delivered alert counts zero undeliverable legs" \
+  "1:1:0" "$HUMAN_FIRED:$MACHINE_FIRED:$_SUP_ALERTS_UNDELIVERABLE"
 unset -f 5dive
 
 # (c) end to end through the REAL cmd_supervisor_tick. Unarmed, so a quota wall
