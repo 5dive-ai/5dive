@@ -787,8 +787,16 @@ main() {
         # an operator reaches for when ONE seat is missing ONE capability the
         # template already emits, and it prints what it did for that seat.
         grant)
+          # DIVE-4557: `grant root` stamps the registry isolation label, so this
+          # arm became a registry WRITER and takes the lock like every other
+          # mutating arm. The lock is cooperative: an unlocked writer does not
+          # merely risk losing its own write, it defeats the ones that honour it —
+          # a heartbeat tick reading just before the stamp writes its stale
+          # snapshot back, leaving root-all on disk and `admin` in the registry,
+          # which is exactly the DIVE-2079 label/grant disagreement this verb
+          # exists to abolish. `IN_REGISTRY_LOCK` makes it re-entrant.
           AUDIT_CMD="agent grant"; AUDIT_ARGS=("$@")
-          cmd_agent_grant "$@" ;;
+          with_registry_lock cmd_agent_grant "$@" ;;
         stats)   cmd_stats "$@" ;;
         create)
           AUDIT_CMD="agent create"; AUDIT_ARGS=("$@")

@@ -254,6 +254,179 @@ else
   bad "_hb_tier_rank not extractable from cmd_heartbeat.sh" "the function" "nothing"
 fi
 
+# ---------------------------------------------------------------------------
+# 10. DIVE-4557 iteration 2: `agent grant` is a REGISTRY WRITER, so it must hold
+#     the registry lock like every other mutating arm in main.sh.
+#
+#     What changed at 1a1e69c2: before it, `grant` touched sudoers only. The root
+#     path stamps the isolation label, and `_agent_stamp_isolation` is an unlocked
+#     read-modify-write (`registry_read | jq | registry_write`). registry_write is
+#     atomic PER WRITE but takes no lock — the lock is the caller's job, and
+#     src/main.sh says so in a comment above the switch.
+#
+#     The lock is COOPERATIVE, so an unlocked writer does not merely risk losing
+#     its own write; it defeats the writers that honour it. Both directions are
+#     forced here deterministically — a locked concurrent writer is made to land
+#     inside the stamp's read/write window, rather than raced for:
+#
+#       (a) the grant clobbers the other writer  -> wake.idleSince LOST
+#       (b) the other writer reverts the grant   -> sudoers root-all on disk,
+#           registry label `admin`, i.e. the DIVE-2079 disagreement this verb
+#           exists to abolish, on a seat holding unrestricted root.
+#
+#     Graded through the REAL dispatch arm, lifted out of src/main.sh, so the
+#     grade tracks what ships rather than a re-typed copy of it. Section 11 is
+#     its mutant: strip `with_registry_lock` from that lifted text and both
+#     assertions must fail.
+#
+#     Root-free: only require_root and chown are stubbed (the harness is not
+#     root); visudo, write_root_sudoers, registry_read/registry_write and the
+#     stamp are the shipped ones, against a fixture STATE_DIR and SUDOERS_D.
+# ---------------------------------------------------------------------------
+echo "10. the registry lock — a concurrent locked writer forced into the window"
+
+IL_DIR="$TMP/lock"
+IL_STAMP="2026-09-15T12:00:00Z"
+IL_WAIT_TICKS=40           # 40 x 0.05s = 2s; a BLOCKED writer never appears in it
+
+# Keep an unhooked handle on the shipped writer before the instrument shadows it.
+eval "registry_write_real() $(declare -f registry_write | tail -n +2)"
+
+require_root() { :; }      # the harness is not root
+chown()        { :; }      # ... so ensure_state/registry_write/write_root_sudoers chowns are no-ops
+
+il_wait_for() {            # bounded wait; 0 = marker appeared, 1 = timed out
+  local f="$1" i=0
+  while (( i < IL_WAIT_TICKS )); do
+    [[ -e "$f" ]] && return 0
+    sleep 0.05; i=$((i+1))
+  done
+  return 1
+}
+
+# Models cmd_heartbeat.sh's `_hb_autosleep_arm`: a read-modify-write of a
+# DIFFERENT field on the SAME seat, taken under the lock, as all 45 heartbeat
+# call sites take it.
+il_hb_arm() {
+  registry_read \
+    | jq --arg t "$IL_STAMP" '.agents.sysop.wake.idleSince = $t' \
+    | registry_write_real
+}
+
+# Direction (b): read under the lock BEFORE the grant's write, write back after
+# it — the shape of any heartbeat tick that straddles an unlocked stamp.
+il_hb_read_then_write() {
+  local snap; snap="$(registry_read)"
+  : > "$IL_DIR/hb.read"
+  il_wait_for "$IL_DIR/grant.write.done" || true
+  printf '%s' "$snap" \
+    | jq --arg t "$IL_STAMP" '.agents.sysop.wake.idleSince = $t' \
+    | registry_write_real
+}
+
+# `exec 200>&-` models a SEPARATE process: a background subshell inherits the
+# grant's open lock fd, and an inherited copy keeps the lock alive after the
+# grant's subshell exits — the writer would then block on a lock nobody holds.
+il_spawn_other() {
+  ( exec 200>&-
+    IN_REGISTRY_LOCK=0
+    with_registry_lock "$1" >/dev/null 2>&1
+    : > "$IL_DIR/other.done" ) &
+}
+
+# The instrument: the grant's own registry_write, delayed until the concurrent
+# writer has landed. $body is the snapshot the stamp ALREADY read, so letting the
+# other writer run here is precisely "between the read and the write".
+registry_write() {
+  local body; body="$(cat)"
+  if [[ -n "${IL_MODE:-}" && ! -e "$IL_DIR/hook.fired" ]]; then
+    : > "$IL_DIR/hook.fired"
+    [[ "$IL_MODE" == "a" ]] && { il_spawn_other il_hb_arm; il_wait_for "$IL_DIR/other.done" || true; }
+  fi
+  printf '%s' "$body" | registry_write_real
+  [[ -n "${IL_MODE:-}" ]] && : > "$IL_DIR/grant.write.done"
+  return 0
+}
+
+il_fixture() {
+  rm -rf "$IL_DIR"; mkdir -p "$IL_DIR/agents.d"
+  STATE_DIR="$IL_DIR"; REGISTRY="$IL_DIR/agents.json"
+  ENV_DIR="$IL_DIR/agents.d"; REGISTRY_LOCK="$IL_DIR/registry.lock"
+  # ensure_state (which with_registry_lock calls) also provisions the task store;
+  # TASKS_DIR is derived in lib/tasks_db.sh, which this harness does not source,
+  # so point it at the fixture the way cmd_selfcheck's own fixtures do.
+  TASKS_DIR="$IL_DIR/tasks"
+  : > "$REGISTRY_LOCK"
+  jq -n '{schemaVersion:1, agents:{sysop:{isolation:"admin", wake:{}}}}' > "$REGISTRY"
+  printf 'AGENT_ISOLATION=admin\n' > "$ENV_DIR/sysop.env"
+  rm -f "$SUDOERS_D/agent-sysop"
+}
+
+# -> "<registry label>|<the other writer's field>|<enforced sudo class>"
+il_run() {
+  local disp="$1" mode="$2"
+  il_fixture
+  IL_MODE="$mode"
+  if [[ "$mode" == "b" ]]; then
+    il_spawn_other il_hb_read_then_write
+    il_wait_for "$IL_DIR/hb.read" || true
+  fi
+  "$disp" sysop root >/dev/null 2>&1
+  il_wait_for "$IL_DIR/other.done" || true
+  IL_MODE=""
+  printf '%s|%s|%s' \
+    "$(jq -r '.agents.sysop.isolation // "MISSING"' "$REGISTRY")" \
+    "$(jq -r '.agents.sysop.wake.idleSince // "LOST"' "$REGISTRY")" \
+    "$(classify_sudo_grant < "$SUDOERS_D/agent-sysop" 2>/dev/null | cut -d'|' -f1)"
+}
+
+# The arm as it ships, lifted out of src/main.sh rather than re-typed.
+il_arm_src=$(sed -n '/^        grant)$/,/;;$/p' "$SRC/main.sh")
+il_build() {   # $1 = fn name, $2 = arm text
+  printf '%s() {\n  case "grant" in\n%s\n  esac\n}\n' "$1" "$2" > "$TMP/$1.sh"
+  # shellcheck source=/dev/null
+  source "$TMP/$1.sh"
+}
+
+if [[ -z "$il_arm_src" ]] || ! grep -q 'cmd_agent_grant' <<<"$il_arm_src"; then
+  bad "the grant arm is extractable from src/main.sh" "the dispatch arm" "nothing usable"
+else
+  il_build il_dispatch_shipped "$il_arm_src"
+
+  il_a=$(il_run il_dispatch_shipped a)
+  is "(a) other writer lands mid-window: its field SURVIVES" "$(cut -d'|' -f2 <<<"$il_a")" "$IL_STAMP"
+  is "(a)   ... and the grant's own label survives too"      "$(cut -d'|' -f1 <<<"$il_a")" "beyond-admin"
+
+  il_b=$(il_run il_dispatch_shipped b)
+  is "(b) heartbeat reads before / writes after: label SURVIVES" "$(cut -d'|' -f1 <<<"$il_b")" "beyond-admin"
+  is "(b)   ... and its own field is not lost either"           "$(cut -d'|' -f2 <<<"$il_b")" "$IL_STAMP"
+  is "(b)   ... so the enforced grant and the label AGREE" \
+     "$(cls=$(cut -d'|' -f3 <<<"$il_b"); lbl=$(cut -d'|' -f1 <<<"$il_b")
+        [[ "$cls" == "root-all" && "$(isolation_implied_by_grant "$cls")" == "$lbl" ]] && echo agree || echo "DISAGREE($cls vs $lbl)")" \
+     "agree"
+
+  # -------------------------------------------------------------------------
+  # 11. Non-vacuity: strip `with_registry_lock` from the SAME lifted text and
+  #     both directions must break — otherwise section 10 is grading nothing.
+  # -------------------------------------------------------------------------
+  echo "11. mutation — the lock is what section 10 grades"
+  il_mut_src=${il_arm_src/with_registry_lock cmd_agent_grant/cmd_agent_grant}
+  if [[ "$il_mut_src" == "$il_arm_src" ]] || grep -q 'with_registry_lock' <<<"$il_mut_src"; then
+    bad "(mutant) mutation did not apply — section 10's grade is vacuous" "lock removed" "unchanged"
+  else
+    il_build il_dispatch_unlocked "$il_mut_src"
+    il_ma=$(il_run il_dispatch_unlocked a)
+    is "(mutant a) unlocked grant CLOBBERS the concurrent writer" \
+       "$(cut -d'|' -f2 <<<"$il_ma")" "LOST"
+    il_mb=$(il_run il_dispatch_unlocked b)
+    is "(mutant b) the heartbeat REVERTS the grant's label" \
+       "$(cut -d'|' -f1 <<<"$il_mb")" "admin"
+    is "(mutant b)   ... leaving root on disk and \`admin\` in the registry" \
+       "$(cut -d'|' -f3 <<<"$il_mb")" "root-all"
+  fi
+fi
+unset -f registry_write registry_read 2>/dev/null; true
+
 echo
 printf 'agent_grant_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1
