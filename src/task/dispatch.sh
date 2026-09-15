@@ -84,6 +84,11 @@ _task_usage() {
                                                 verifiers: put \`graded-sha: <sha>\` in the result;
                                                 --no-graded-sha is the audited escape
   deliver <id> --pr=<url> [--result=|--result-file=<path>]   record the delivery PR, hand to the verifier
+                               the result must name its EVIDENCE — CHANGED / CHECKED (commands + pass/fail
+                               counts) / GRADED-SHA / CI / CRITERIA — so the grader RE-RUNS it instead of
+                               re-deriving it ('task show' prints the template). --force-unevidenced=<why>
+                               is the audited exit. (DIVE-4576)
+           [--verify=<cmd>]    grade this row with a COMMAND at delivery — no grader session is booked
   verify <id> [--cmd=] [--result=|--result-file=<path>] [--no-done] [--merge-proof] [--timeout=]
                                                 run the check; exit 0 = pass
   reject <id> --feedback="FINDING/FIX/VERIFY"    verifier FAIL: bounce back to the maker

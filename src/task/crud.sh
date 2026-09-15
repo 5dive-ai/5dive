@@ -1318,6 +1318,20 @@ cmd_task_show() {
       else
         echo "review: unrecorded (row predates the filing-time review mode, DIVE-4324)"
       fi
+      # DIVE-4576: the maker FILLS the result template, it does not guess it.
+      # Printed while the row is IN PROGRESS — i.e. at the one moment the maker
+      # is running the very commands the fields ask for — because a template a
+      # maker first meets inside a refusal costs a round to satisfy, and the
+      # measurement it asks for (pass/fail counts, the sha they ran at) is
+      # already gone by then. Only on an in-progress standard row, and worded
+      # conditionally: the rail itself fires only on a delivery that binds a pull
+      # request, so a knowledge row that reads this is told it does not apply.
+      local _sh_st; _sh_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+      if [[ "$_sh_st" == "in_progress" ]] && declare -F _delivery_evidence_template >/dev/null 2>&1; then
+        echo
+        echo "result template (DIVE-4576 — required when this row delivers a pull request; the grader re-runs what you name here instead of re-deriving it):"
+        _delivery_evidence_template | indent2
+      fi
     fi
     # DIVE-476: loop spec (only when any field is set) — the declarative verify
     # loop the (c) runner executes. Mirrors the conditional human-gate block.

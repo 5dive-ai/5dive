@@ -68,9 +68,195 @@ _task_deliver_reach_probe() {
   return 0
 }
 
+# ── DIVE-4576 deliverable 3 — A COMMAND-GRADED ROW NEVER BOOKS A SESSION ────
+#
+# `--review=check` has meant "a COMMAND grades it, no grader session" since
+# DIVE-4324 — but only at FILING time, where it chose the mode and then nothing
+# ran it. The delivery still emitted a spawn request, a clone still woke, cold-
+# loaded the pull request, and ran the command the row had been carrying all
+# along. The mode named the cheap path and the rail took the expensive one.
+#
+# So the delivery honours it: run the row's command HERE, record its exit status
+# as the grade through the one verb that already knows how to record a grade
+# (`task verify --no-done`, which stamps graded_at, preserves the maker's result
+# rather than overwriting it, and renders the row as graded->merge), and return
+# without attaching a grader or routing. No clone is created, so the grade costs
+# a command instead of a session.
+#
+# WHY IT DELEGATES TO cmd_task_verify INSTEAD OF RUNNING bash ITSELF. A second
+# executor would be a second answer to "what does a passing command mean": the
+# timeout handling, the 25-line output tail, the DIVE-2483 result preservation,
+# the DIVE-3330 merge-binding hold and the ledger receipt all live there, and a
+# copy of them here would drift the first time one of them was fixed.
+#
+# A FAILING COMMAND BOUNCES WITHOUT A SESSION TOO, and that is the half worth
+# having: today a red delivery costs a whole grader session to discover the red.
+# The FAIL verdict is recorded on the row and the row stays with the maker — no
+# handoff clock is started, so no reject is needed to undo one.
+#
+# rc: 0 = graded here (caller must not route) · 1 = not command-graded.
+_task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result> <want_result>
+  local id="$1" ident="$2" given="${3:-}" result="${4:-}" want_result="${5:-0}"
+  local mode stored
+  mode=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  stored=$(db "SELECT COALESCE(verify_command,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  if [[ -n "$given" ]]; then
+    # A command supplied at delivery is PERSISTED, so a later re-grade, a
+    # `task loops` replay and `task show` all read the same command — a grade
+    # whose command lives only in one process's argv is not reproducible, and
+    # reproducibility is the entire reason a command may stand in for a grader.
+    db "UPDATE tasks SET verify_command=$(sqlq "$given") WHERE id=${id};"
+    stored="$given"
+    case "$(review_mode_kind "$mode" 2>/dev/null || printf invalid)" in
+      check) : ;;
+      seat)
+        # The row PINNED a NAMED grader at filing. A command given at delivery
+        # does not overrule that choice — it is stored as evidence for the seat
+        # that was chosen. Silently downgrading a named grade to a command is
+        # the "a mode is not the authority on spend" confusion verify_policy.sh
+        # warns about, one direction over: somebody asked for that seat's
+        # judgement, and an exit status is not it.
+        warn "$ident: --verify=<cmd> stored, but this row pins ${mode} as its grader — the command is recorded for that seat to run, not run in its place. File with --review=check to be graded by a command (DIVE-4576)."
+        return 1 ;;
+      temp)
+        # `temp` is the anonymous ephemeral clone, and it is also what a row gets
+        # when the filer chose NOTHING (DIVE-4324's default) — the two are
+        # indistinguishable in the column, so this cannot be read as a pin. A
+        # maker naming the command that grades their own diff at delivery is the
+        # cheaper of the two and is honoured, loudly: the clone it replaces is
+        # the entire cost this row exists to remove. A filer who wants a session
+        # regardless says so with a named grader (--review=<seat>), which the arm
+        # above refuses to downgrade.
+        db "UPDATE tasks SET review_mode='check' WHERE id=${id};"
+        warn "$ident: filed --review=temp (a grader session) and delivered with --verify=<cmd> — graded by the command instead, and NO grader session is booked (DIVE-4576). Pin a session grader with --review=<seat> if a seat's judgement, not an exit status, is what this row needs."
+        mode=check ;;
+      *)
+        db "UPDATE tasks SET review_mode='check' WHERE id=${id};"
+        mode=check ;;
+    esac
+  fi
+  [[ "$mode" == "check" ]] || return 1
+  if [[ -z "$stored" ]]; then
+    warn "$ident: filed --review=check (graded by a command) but the row carries NO command, so there is nothing to grade with. Add one at delivery: 'task deliver $ident --pr=… --verify=\"<cmd>\"' (DIVE-4576)."
+    return 1
+  fi
+  # The maker's result is written BEFORE the grade runs, and only on this path —
+  # every other arm of `task deliver` still writes it at its own point, because a
+  # refusal further down (the byte-identical re-delivery guard) states that
+  # nothing was written and an early write here would make that false. On THIS
+  # path there is no later refusal that says so, and the order matters: the grade
+  # receipt is appended to the maker's text by DIVE-2483's preservation rail, so
+  # a result written after the grade would sit under its own evidence.
+  if (( want_result )); then
+    db "UPDATE tasks SET result=$(sqlq_or_null "$result") WHERE id=${id};"
+  fi
+  local out rc=0
+  out=$(cmd_task_verify "$ident" --no-done --cmd="$stored" 2>&1) || rc=$?
+  printf '%s\n' "$out" >&2
+  if (( rc == 0 )); then
+    ok "$ident delivered — GRADED BY COMMAND at delivery, no grader session spawned (review=check, DIVE-4576): '$stored' exited 0. The grade is recorded on the row; the merge owner closes it through 'task done' once the binding is merged." \
+       '{id:($i|tonumber), ident:$id, delivered:true, gradedBy:"command", command:$c, verdict:"pass", graderSession:false, routedTo:null}' \
+       --arg i "$id" --arg id "$ident" --arg c "$stored"
+    return 0
+  fi
+  policy_refuse "$E_CONFLICT" deliver-command-grade-failed DIVE-4576 "$ident" \
+    "$ident: the command that grades this row FAILED at delivery (exit ${rc}) — '$stored'. The delivery ref is recorded and the FAIL verdict is on the row, but it was NOT handed off: no grader session was spawned to discover a red that a command had already found, and no handoff clock is running, so there is no reject to undo. The output tail is in the row's result ('5dive task show $ident'). Fix it and deliver again."
+}
+
+# ── DIVE-4576 — A DELIVERY THAT CARRIES NO EVIDENCE IS REFUSED ──────────────
+#
+# AXIS: tokens per closed row. The grader is an EPHEMERAL CLONE that cold-loads
+# this row and the pull request from nothing (DIVE-4164/4496), so every claim it
+# cannot CHECK it has to RE-DERIVE — it re-runs the maker's investigation to find
+# out whether the maker's investigation was right. Measured on dev 2026-09-15:
+# 97% of every grader turn is cache re-read, and a reject pays for the whole
+# thing twice, on both seats.
+#
+# The fix is not a longer result. It is a result whose claims are ADDRESSED TO A
+# RE-RUN: the five labelled fields in `_delivery_evidence_template` are exactly
+# the inputs a grade needs (which files to spot-check, which commands to re-run,
+# at which sha, what CI already said, and which criterion each answers). With
+# them the grade is a comparison; without them it is a second investigation.
+#
+# SCOPE — ONLY A DELIVERY THAT BINDS A PULL REQUEST. Knowledge, ops and
+# coordination rows close through `task done` with no binding and are untouched:
+# there is no diff to name files in and no sha to grade at, and a rail that
+# demanded one would teach makers to type "CHANGED: n/a" five times, which is
+# the shape of every control that stopped meaning anything. `verify=delivered-
+# only` (DIVE-4251) draws the same line for the same reason — bound means code
+# that ships.
+#
+# NOTHING IS WRITTEN WHEN IT REFUSES, which is why every caller invokes it
+# BEFORE its own UPDATE. It is the same contract as DIVE-4113/4144's byte-
+# identical re-delivery refusal, and deliberately the same shape: the row is
+# untouched, the refusal names the missing field, and there is one audited exit.
+#
+# THE AUDITED EXIT IS NOT A STYLE ESCAPE. `--force-unevidenced="<why>"` exists
+# because a real delivery can genuinely have no sha (a revert of a revert, a
+# binding re-pointed with no new work) and a rail with no exit is a rail people
+# route around by pasting the labels with nothing under them. It WARNS, loudly,
+# and the reason is recorded on the delivery — a grader reading it knows it is
+# about to pay for a full re-derivation and can price the grade accordingly.
+_task_guard_delivery_evidence() {  # <id> <ident> <verb> <result-text> <want_result> [<binding-being-bound>]
+  local id="$1" ident="$2" verb="$3" text="$4" want="${5:-0}" binding="${6:-}"
+  # A delivery is only graded against a diff when one is bound. The binding is
+  # read from the ROW, because `task done`'s routing fork reaches here on a row
+  # whose ref was stamped by an EARLIER `task deliver` — and passed IN by
+  # `task deliver` itself, because the whole point of running before the UPDATE
+  # is that the ref is not on the row yet. Without that argument the guard would
+  # be silent on exactly the first delivery of every row, which is the one the
+  # grader pays most for.
+  local _ev_ref="$binding"
+  [[ -n "$_ev_ref" ]] || _ev_ref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  [[ -n "$_ev_ref" ]] || return 0
+  # THE RAIL GRADES THE CLAIM AT THE MOMENT THE CLAIM IS WRITTEN. When the maker
+  # typed a result, that text is the claim and it is what is checked. When they
+  # typed none, this verb is a BINDING operation — re-pointing the ref at a new
+  # pull request is the legitimate act DIVE-2682 exists to keep cheap, and the
+  # claim standing on the row was already checked when it was written. So a bare
+  # delivery over an existing result passes.
+  #
+  # A bare delivery over an EMPTY result hands the grader a pull request and
+  # NOTHING ELSE. It WARNS rather than refusing, and the reasoning is worth
+  # recording because the other two answers were both defensible:
+  #
+  #   refuse it — it is the worst case, strictly worse than an unevidenced
+  #     sentence. Rejected because a bare `task deliver --pr=` is also the
+  #     legitimate RE-POINT of a binding (DIVE-2682) and the "bind now, write the
+  #     result at close" shape that four existing harnesses and an unknown number
+  #     of live rows use; refusing it turns one row's rail into a migration.
+  #   say nothing — rejected: it is exactly the bypass a maker who resents the
+  #     rail would find first.
+  #
+  # So it warns HERE and is FAILED THERE: deliverable 2 tells the grader that a
+  # claim with no evidence is a FAIL, and "no claim at all" is that case at its
+  # limit. The teeth are in the grade, which is where they cost the maker a round
+  # rather than costing the fleet a migration.
+  #
+  # FORWARD-ONLY on the other branch, the posture DIVE-4144's hash took: a result
+  # written before this rail existed was never checked by it, and a bare re-point
+  # of such a row proceeds rather than refusing rows nobody can fix.
+  local _ev_text="$text"
+  if (( ! want )); then
+    _ev_text=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    if [[ -z "${_ev_text//[[:space:]]/}" ]]; then
+      warn "$ident: delivered with NO result at all (DIVE-4576) — the grader gets a pull request and nothing to check, so it will re-derive your work to grade it, and a claim it cannot check is a FAIL ('FINDING: unevidenced'). Write the delivery's evidence before it is graded: '5dive task show $ident' prints the template while the row is in progress."
+    fi
+    return 0
+  fi
+  local _ev_missing; _ev_missing=$(_delivery_evidence_missing "$_ev_text") && return 0
+  if [[ -n "${_TASK_EVIDENCE_WAIVER:-}" ]]; then
+    warn "$ident: delivered WITHOUT $(printf '%s' "$_ev_missing" | tr ' ' ',') (--force-unevidenced, DIVE-4576) — '${_TASK_EVIDENCE_WAIVER}'. The grader cannot re-run what this result does not name, so this grade is a full re-derivation of your investigation and is priced accordingly."
+    return 0
+  fi
+  policy_refuse "$E_VALIDATION" deliver-result-without-evidence DIVE-4576 "$ident" \
+    "$ident: this ${verb} names a pull request but its result does not state: ${_ev_missing}. NOTHING WAS WRITTEN — the row is unchanged and still yours. WHY THIS IS REFUSED RATHER THAN WARNED: the grader is a fresh clone with no memory of your session, so a claim it cannot re-run it has to re-derive, which costs a second full investigation of a diff you have already investigated — and a reject pays it twice. Fill these in (the same template '5dive task show $ident' prints while the row is in progress):"$'\n'"$(_delivery_evidence_template)"$'\n'"Then re-run your ${verb}. If this delivery genuinely has no such evidence to give (a revert, a re-pointed binding with no new work), say so and it proceeds, audited and recorded for the grader to read: --force-unevidenced=\"<why>\"."
+}
+
 cmd_task_deliver() {
   tasks_db_init
   local task="" pr="" result="" want_result=0 result_src=""
+  local deliver_cmd=""                   # DIVE-4576: --verify=<cmd> given at delivery
   local append_result=0 force_result=0   # DIVE-2476: the two sanctioned answers to the
                                          # already-closed-row refusal, spelled exactly
                                          # as `task done|cancel` spells them.
@@ -96,12 +282,23 @@ cmd_task_deliver() {
       # nobody passes is how a guard silently stops applying.
       --force-redeliver=*) _TASK_REDELIVER_FORCE_REASON="${1#*=}" ;;
       --force-redeliver)   fail "$E_USAGE" "--force-redeliver needs a reason: --force-redeliver=\"<why the unchanged re-delivery is correct>\" (DIVE-4144)" ;;
+      # DIVE-4576: the audited exit from the evidence refusal. A bare flag is a
+      # usage error for DIVE-4144's reason — a waiver with no reason recorded is
+      # a waiver nobody can price, and the grader is the party that pays.
+      --force-unevidenced=*) _TASK_EVIDENCE_WAIVER="${1#*=}" ;;
+      --force-unevidenced)   fail "$E_USAGE" "--force-unevidenced needs a reason: --force-unevidenced=\"<why this delivery has no such evidence to give>\" (DIVE-4576)" ;;
+      # DIVE-4576 deliverable 3: a maker may ADD the grading command AT DELIVERY.
+      # `task add --verify=<cmd>` already picks `--review=check` at filing, but a
+      # row is frequently only gradeable by a command once the work exists — and
+      # the alternative to accepting it here is a grader session spent running
+      # the command the maker could have named.
+      --verify=*)          deliver_cmd="${1#*=}" ;;
       -*)              fail "$E_USAGE" "unknown flag: $1" ;;
       *)               [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>|--result-file=<path>] [--append-result|--force-result]"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>|--result-file=<path>] [--append-result|--force-result] [--verify=<cmd>] [--force-unevidenced=<why>]"
   [[ -n "$pr" ]]   || fail "$E_USAGE" "task deliver requires --pr=<url> (the PR that delivers this task; done stays blocked until it is MERGED — DIVE-1830)"
   # Basic sanity: a delivery ref must look like a PR URL, not a bare word.
   if [[ "$pr" != http*://* && "$pr" != *github.com* ]]; then
@@ -131,6 +328,10 @@ cmd_task_deliver() {
       "$append_result" "$force_result" deliver-over-closed-result
     result="$_TASK_GUARDED_RESULT"
   fi
+  # DIVE-4576: the evidence rail, BEFORE the delivery stamp, so a refused
+  # delivery is wholly non-mutating exactly like DIVE-2476's guard above. The PR
+  # is passed in because it is not on the row yet — see the guard's header.
+  _task_guard_delivery_evidence "$id" "$ident" delivery "$result" "$want_result" "$pr"
   # Record the delivery ref + timestamp before the handoff, so the merge-gate can
   # see it regardless of where the task lands next.
   # DIVE-2682 (dev's reject, iteration 1): stamp the binding's iteration HERE, beside
@@ -151,6 +352,14 @@ cmd_task_deliver() {
   # can SEE it, here, rather than leaving the verifier to discover it at close.
   # Runs AFTER the write on purpose: the delivery is not conditional on it.
   _task_deliver_reach_probe "$ident" "$pr"
+  # DIVE-4576 deliverable 3: a command-graded row is graded HERE and never
+  # reaches the grader attach below — placed after the ref is bound so the grade
+  # is recorded against the binding it is a grade OF (DIVE-3330 reads it), and
+  # before the attach so no spawn request is ever emitted for a row whose grade
+  # has already happened.
+  if _task_deliver_command_grade "$id" "$ident" "$deliver_cmd" "$result" "$want_result"; then
+    return 0
+  fi
   local _vfier _asignee
   _vfier=$(db "SELECT COALESCE(verifier,'')  FROM tasks WHERE id=${id};")
   _asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
@@ -736,6 +945,12 @@ _task_route_to_verifier() {
   # --result is a re-assertion, and DIVE-2624 already labels it "re-delivery of the
   # same pass, not rework" in the receipt below.
   local _rd_ident; _rd_ident=$(ident_of "$id")
+  # DIVE-4576: the evidence rail on the OTHER delivery verb. This helper is the
+  # one funnel every delivery passes through, so `task done`'s two routing forks
+  # meet the same refusal `task deliver` met above; a row with no binding is not
+  # in scope and returns immediately. Ordered with the byte-identical guard and
+  # BEFORE the UPDATE for the same reason: both refusals promise an untouched row.
+  _task_guard_delivery_evidence "$id" "$_rd_ident" "hand-off" "${_TASK_RAW_RESULT-${result:-}}" "$want_result"
   local _rd_rejected _rd_prev_hash _rd_new_hash
   _rd_rejected=$(db "SELECT COALESCE(handoff_rejected_at,'') FROM tasks WHERE id=${id};")
   if (( want_result )) && [[ -n "$_rd_rejected" ]] && declare -F ledger_hash >/dev/null 2>&1; then

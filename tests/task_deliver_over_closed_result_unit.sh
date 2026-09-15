@@ -77,8 +77,12 @@ res()  { db "SELECT COALESCE(result,'')       FROM tasks WHERE id=$1;"; }
 st()   { db "SELECT COALESCE(status,'')       FROM tasks WHERE id=$1;"; }
 
 PR=https://github.com/5dive-ai/5dive/pull/999
-THEIRS="main2: verifier ACK — release cut 0.9.14 confirmed green, two caveats recorded."
-MINE="olivia: delivering the follow-up."
+# DIVE-4576: every result a DELIVERY writes now has to name its evidence
+# (CHANGED / CHECKED / GRADED-SHA / CI / CRITERIA) or the delivery is refused.
+# The fixture text carries the five labels so these arms keep grading what they
+# are about — this harness's subject is unchanged by that rail.
+THEIRS="main2: verifier ACK — release cut 0.9.14 confirmed green, two caveats recorded. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass GRADED-SHA: deadbeef CI: green CRITERIA: (1) -> the run above"
+MINE="olivia: delivering the follow-up. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass GRADED-SHA: deadbeef CI: green CRITERIA: (1) -> the run above"
 
 # --- D1. the defect, unrouted rail (main's probe P4) --------------------------
 id=$(seed done "$THEIRS")
