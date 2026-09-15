@@ -2010,10 +2010,19 @@ _hb_pick_tasks() {
 # one id, and because it keeps DIVE-979's ordering rules stated in ONE query.
 _hb_pick_task() { _hb_pick_tasks "$1" 1; }
 
-# DIVE-1065: privilege ordering for the auto-wake tier guard. admin > standard >
-# sandboxed; 0 for unknown/human — an unknown creator never blocks a wake.
+# DIVE-1065: privilege ordering for the auto-wake tier guard. beyond-admin >
+# admin > standard > sandboxed; 0 for unknown/human — an unknown creator never
+# blocks a wake.
+#
+# DIVE-4557 added the `beyond-admin` arm, and it is not cosmetic. The fallback is
+# 0, the bucket that NEVER blocks a wake — so the moment `agent grant <n> root`
+# started stamping a fourth label, the most privileged seat on the box would have
+# ranked below a sandboxed one and the guard would have read as passing. A new
+# tier that is not added here fails OPEN, silently, which is why the label set is
+# named in exactly one place and this is it.
 _hb_tier_rank() {
   case "$1" in
+    beyond-admin) echo 4 ;;
     admin)     echo 3 ;;
     standard)  echo 2 ;;
     sandboxed) echo 1 ;;

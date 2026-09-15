@@ -168,6 +168,92 @@ else
   bad "(mutant) mutation did not apply — section 4's grade is vacuous" "guard reverted" "unchanged"
 fi
 
+# ---------------------------------------------------------------------------
+# 7. DIVE-4557: `agent grant <name> root` — the CONFERRAL path.
+#
+#    Different contract from sections 1-6, and the differences are the point:
+#    this one MINTS where the standard re-render refuses to, it WIDENS on
+#    purpose, and it must not silently overwrite a policy this CLI did not write
+#    unless doing so changes nothing about what the seat can do.
+# ---------------------------------------------------------------------------
+echo "7. grant root — conferral, not re-render"
+root_state() { local p; p=$(_agent_grant_root_plan "$1"); printf '%s' "${p%%|*}"; }
+
+rm -f "$SUDOERS_D/agent-newbie"
+is "no policy at all -> update (root MINTS; the standard verb refuses here)" \
+   "$(root_state agent-newbie)" "update"
+is "  and the standard verb still refuses the same input" \
+   "$(plan_state agent-newbie merge)" "refuse"
+
+seat "$(render_standard_sudoers agent-quinn 0 0)" agent-quinn
+is "a managed cli-scoped seat -> update (widening is what the verb is for)" \
+   "$(root_state agent-quinn)" "update"
+seat "$(printf '%s\n%s\n' '# Managed by 5dive (DIVE-1002/1088). Fleet-management scope for admin agent agent-adm.' 'agent-adm ALL=(root) NOPASSWD: /usr/local/bin/5dive, /usr/local/bin/5dive *')" agent-adm
+is "a managed cli-root (admin) seat -> update" "$(root_state agent-adm)" "update"
+
+seat "$(render_root_sudoers agent-rooty)" agent-rooty
+is "the managed root policy, byte for byte -> current (idempotent)" \
+   "$(root_state agent-rooty)" "current"
+
+# The pre-DIVE-1002 hand-written drop-in every legacy seat on this host carries.
+# It is ALREADY root-all, so replacing it widens nothing — but it must not read
+# as `current`, because `current` means "no write" and would leave the file
+# unmanaged and the label still disagreeing.
+seat 'agent-old ALL=(ALL) NOPASSWD: ALL' agent-old
+is "hand-written root-all -> adopt, NOT current" "$(root_state agent-old)" "adopt"
+
+# A foreign policy that is NARROWER than root is the one input we refuse: taking
+# it would DELETE an operator's file rather than widen it.
+seat "$(legacy_policy agent-hand2 | sed '1s/^# Managed by 5dive.*/# hand-written by an operator/')" agent-hand2
+is "hand-written NARROWER policy -> refuse" "$(root_state agent-hand2)" "refuse"
+seat "$(printf '%s\n' '# operator policy' 'agent-cust ALL=(root) NOPASSWD: /bin/systemctl restart caddy')" agent-cust
+is "hand-written custom policy -> refuse" "$(root_state agent-cust)" "refuse"
+
+# The rendered text IS root, classifies as root-all, and implies beyond-admin —
+# the three facts the label stamp depends on. Grading the renderer rather than
+# the writer keeps this harness root-free.
+is "the rendered policy grants ALL=(ALL) NOPASSWD: ALL" \
+   "$(render_root_sudoers agent-rooty | grep -cE '^agent-rooty ALL=\(ALL\) NOPASSWD: ALL$')" "1"
+is "  carries the managed header (so a later run recognises its own file)" \
+   "$(render_root_sudoers agent-rooty | head -1 | grep -c '^# Managed by 5dive ')" "1"
+is "  classifies as root-all" \
+   "$(render_root_sudoers agent-rooty | classify_sudo_grant | cut -d'|' -f1)" "root-all"
+is "  whose implied label is exactly what the verb stamps" \
+   "$(isolation_implied_by_grant "$(render_root_sudoers agent-rooty | classify_sudo_grant | cut -d'|' -f1)")" "beyond-admin"
+
+# ---------------------------------------------------------------------------
+# 8. Non-vacuity for section 7: revert the adopt/refuse split and the two
+#    hand-written inputs stop being told apart.
+# ---------------------------------------------------------------------------
+echo "8. mutation — the adopt/refuse split is what section 7 grades"
+sed 's/^    if \[\[ "\$cls" == "root-all" \]\]; then$/    if [[ "$cls" == "NEVERMATCH2" ]]; then/' \
+  "$SRC/cmd_agent_create.sh" > "$MUT/cmd_agent_create_root.sh"
+if grep -q 'NEVERMATCH2' "$MUT/cmd_agent_create_root.sh"; then
+  mut_old=$( set +u; source "$MUT/cmd_agent_create_root.sh" >/dev/null 2>&1; p=$(_agent_grant_root_plan agent-old); printf '%s' "${p%%|*}" )
+  is "(mutant) root-all arm reverted -> the legacy drop-in is no longer adopted" \
+     "$([[ "$mut_old" != "adopt" ]] && echo "not-adopted" || echo "adopt")" "not-adopted"
+else
+  bad "(mutant) mutation did not apply — section 7's adopt grade is vacuous" "arm reverted" "unchanged"
+fi
+
+# ---------------------------------------------------------------------------
+# 9. The fourth label must be RANKED, not defaulted. _hb_tier_rank's fallback is
+#    0 — the bucket that never blocks an auto-wake — so an unranked new tier
+#    fails OPEN and the guard reads as passing.
+# ---------------------------------------------------------------------------
+echo "9. beyond-admin is ranked above admin, not defaulted to 0"
+rank_src=$(sed -n '/^_hb_tier_rank() {/,/^}/p' "$SRC/cmd_heartbeat.sh")
+if [[ -n "$rank_src" ]]; then
+  ( eval "$rank_src"
+    is "beyond-admin outranks admin" \
+       "$([[ "$(_hb_tier_rank beyond-admin)" -gt "$(_hb_tier_rank admin)" ]] && echo yes || echo no)" "yes"
+    is "  and is not the unknown bucket" "$(_hb_tier_rank beyond-admin)" "4"
+    printf '%d %d\n' "$PASS" "$FAIL" > "$TMP/rank.counts" )
+  read -r PASS FAIL < "$TMP/rank.counts"
+else
+  bad "_hb_tier_rank not extractable from cmd_heartbeat.sh" "the function" "nothing"
+fi
+
 echo
 printf 'agent_grant_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1

@@ -114,6 +114,12 @@ Agents:
                                                      # sudoers from the current template so it gains a
                                                      # capability added after it was created. Idempotent;
                                                      # refuses any policy this CLI did not write.
+  5dive agent grant <name> root                      # root: CONFER unrestricted root (any command, any user)
+                                                     # on a seat of any tier. Writes a managed, visudo-checked
+                                                     # drop-in, stamps the label beyond-admin so agent info
+                                                     # stops disagreeing with the grant, and audits it. Wider
+                                                     # than admin, which is the 5dive CLI as root only. No
+                                                     # revoke verb yet.
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
   5dive agent rotation get <agent>                   # DIVE-4416: the seat's login pool — which accounts it
