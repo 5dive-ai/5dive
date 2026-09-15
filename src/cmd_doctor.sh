@@ -1473,15 +1473,15 @@ cmd_doctor() {
                             WHERE event='alert-undeliverable'
                               AND ts >= datetime('now', '-7 days');" 2>/dev/null || echo 0)
         doctor_add channels supervisor-alert-delivery error \
-          "${undeliv} supervisor alert leg(s) for ${undeliv_seats:-?} seat(s) were UNDELIVERABLE in the last 7d — the fleet watcher fired and reached nobody (DIVE-4551); fix: give the chart ONE root (5dive org set <agent> --manager=<mgr>), or tag the seat that should be paged (5dive org set <agent> --role='<their prose> gate notifier')" false false
+          "${undeliv} fleet-health alert leg(s) for ${undeliv_seats:-?} seat(s) were UNDELIVERABLE in the last 7d — a supervisor alert or a heartbeat escalation fired and reached nobody (DIVE-4551/4554); fix: give the chart ONE root (5dive org set <agent> --manager=<mgr>), or tag the seat that should be paged (5dive org set <agent> --role='<their prose> gate notifier')" false false
       else
         alert_to=$(_sup_alert_recipient 2>/dev/null || true)
         if [[ -n "$alert_to" ]]; then
           doctor_add channels supervisor-alert-delivery ok \
-            "supervisor alerts resolve to '$alert_to' — 0 undeliverable in the last 7d"
+            "fleet-health alerts (supervisor + heartbeat escalations) resolve to '$alert_to' — 0 undeliverable in the last 7d"
         else
           doctor_add channels supervisor-alert-delivery warn \
-            "NO recipient resolves for supervisor alerts — every fleet-health alert will be audited and delivered to nobody (DIVE-4551); harmless only while the fleet is clean; fix: 5dive org set <agent> --role='<their prose> gate notifier'" false false
+            "NO recipient resolves for fleet-health alerts — every supervisor alert AND every heartbeat escalation (spend-cap wall, usage-limit freeze, stranded seat) will be audited and delivered to nobody (DIVE-4551/4554); harmless only while the fleet is clean; fix: 5dive org set <agent> --role='<their prose> gate notifier'" false false
         fi
       fi
     fi
