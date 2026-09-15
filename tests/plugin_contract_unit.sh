@@ -506,10 +506,25 @@ run cmd_plugin_setup setupy@fixture "touch $TMP/SMUGGLED" --yes
 t  "T9k a second argument is refused, never treated as a command" "2" "$RC"
 t  "T9k2 ...and nothing was smuggled through it"          "no" \
    "$([[ -e "$TMP/SMUGGLED" ]] && echo yes || echo no)"
-run cmd_plugin_setup --command="touch $TMP/SMUGGLED2" --yes
+# DIVE-4471: this arm PASSES A REAL REF, and the sentinel is cleared first.
+# Both are load-bearing. The original fixture passed no reference at all, so
+# deleting the `-*)` guard changed nothing observable: the flag was ignored, `ref`
+# stayed empty, and the `[[ -n "$ref" ]]` check three lines down returned the very
+# same 2. T9k3 and T9k4 both passed against a verb with no flag guard — quinn's
+# mutant survived 109/0 for exactly that reason. With a ref present the two paths
+# diverge: guarded it is a usage error, unguarded the verb resolves, `--yes`
+# assumes consent, and the manifest's own command RUNS. Clearing the sentinel
+# (T9g created it) is what makes that difference visible, because the smuggled
+# path is never the observable one — an ignored flag executes nothing, so
+# `SMUGGLED2` stays absent either way and cannot grade the guard by itself.
+rm -f "$SENTINEL"
+run cmd_plugin_setup setupy@fixture --command="touch $TMP/SMUGGLED2" --yes
 t  "T9k3 an invented flag is refused rather than parsed" "2" "$RC"
 t  "T9k4 ...and nothing was smuggled through it"          "no" \
    "$([[ -e "$TMP/SMUGGLED2" ]] && echo yes || echo no)"
+t  "T9k5 ...and the refusal ran NOTHING, not even the manifest's own command" "no" \
+   "$([[ -e "$SENTINEL" ]] && echo yes || echo no)"
+tc "T9k6 ...naming the flag it did not understand"        "unknown flag" "$OUT$ERR"
 
 # A failing setup is a recorded failure, not a silent one: the entry keeps rc so
 # the page can show it, and the verb exits non-zero so a script can see it.
@@ -746,6 +761,24 @@ unset -f shimmed_setup
 run cmd_plugin setup
 t  "T9n 'plugin setup' is a dispatched subverb, not an unknown one" "2" "$RC"
 tc "T9n2 ...and its usage is the plugin-reference shape" "5dive plugin setup <plugin>" "$OUT$ERR"
+
+# DIVE-4471. THE ENABLED-POINTER GUARD, which had no arm at all: quinn's mutant
+# replacing `[[ -d "$dir" ]] || fail ...` with `:` survived 109/0. The guard is
+# the reason the manifest is read through the enabled pointer rather than the
+# marketplace source — setting up a version that is not the one running is the
+# failure this verb exists to remove. Without the guard `$dir` does not exist,
+# `_plugin_manifest_path` misses, and the refusal that reaches the user names a
+# missing plugin.json and tells them to REINSTALL a plugin that is merely
+# switched off. `setupy@fixture` still has its setup block and is still
+# installed, so the only thing under test here is enabled-ness.
+run cmd_plugin_disable setupy@fixture
+t  "T9p0 (precondition) the fixture disabled cleanly"     "0" "$RC"
+run cmd_plugin_setup setupy@fixture --yes
+t  "T9p an installed but DISABLED plugin is refused"      "4" "$RC"
+tc "T9p2 ...saying it is disabled rather than missing"     "installed but disabled" "$OUT$ERR"
+tc "T9p3 ...and pointing at the verb that fixes it"        "plugin enable" "$OUT$ERR"
+t  "T9p4 ...and nothing ran (the sentinel is still absent)" "no" \
+   "$([[ -e "$SENTINEL" ]] && echo yes || echo no)"
 
 # =============================================================================
 # T10 — RETIRED by DIVE-4202: install.sh stages no plugins
