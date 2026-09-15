@@ -68,6 +68,18 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
+# DIVE-4562: the memory-consolidation scheduler's per-seat files. The
+# not-transacting counter is cleared ONLY by a pass that gets through, and only
+# an enrolled seat ever gets a pass — so a seat removed while its distiller was
+# being refused used to leave behind a counter nothing could clear, and
+# `5dive doctor --category=memory` would name a seat nobody can restore, forever.
+# `creative` is the control: it is not the seat being removed and its files must
+# survive, or the cleanup is a wipe rather than a cleanup.
+mkdir -p "$STATE_DIR/memory-consolidate"
+printf '63\n' > "$STATE_DIR/memory-consolidate/agy.notx"
+printf '1\n'  > "$STATE_DIR/memory-consolidate/agy.stamp"
+printf '63\n' > "$STATE_DIR/memory-consolidate/creative.notx"
+
 # --- exercise ----------------------------------------------------------------
 cmd_rm agy >"$TMP/out" 2>"$TMP/err"
 
@@ -109,6 +121,22 @@ else
   bad_t "agent rm receipt is not valid JSON" \
         "stdout=[$(cat "$TMP/out")] stderr=[$(tail -2 "$TMP/err")]"
 fi
+
+# 6. DIVE-4562: the removed seat's consolidation counter and cadence stamp go
+#    with it. Without this, the alarm added for DIVE-4562 wedges permanently on
+#    a name nobody can restore — and that is likeliest during a fleet-wide auth
+#    lapse, when several seats are refusing at once and one gets removed.
+[[ -e "$STATE_DIR/memory-consolidate/agy.notx" ]] \
+  && bad_t "agent rm left the not-transacting counter behind (DIVE-4562)" \
+  || ok_t "agent rm removes the seat's not-transacting counter (DIVE-4562)"
+[[ -e "$STATE_DIR/memory-consolidate/agy.stamp" ]] \
+  && bad_t "agent rm left the consolidation cadence stamp behind" \
+  || ok_t "and its consolidation cadence stamp"
+# CONTROL — it removes THIS seat's files and nobody else's. A cleanup that wiped
+# the directory would pass both arms above while deleting the fleet's signal.
+[[ -e "$STATE_DIR/memory-consolidate/creative.notx" ]] \
+  && ok_t "CONTROL: another seat's counter is untouched" \
+  || bad_t "CONTROL: agent rm wiped a seat it was not removing"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

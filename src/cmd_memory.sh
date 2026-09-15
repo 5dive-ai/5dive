@@ -1557,6 +1557,22 @@ PYEOF
 # trap: an unauthed `claude --print` prints "Not logged in" and EXITS 0, so a
 # fleet-wide auth lapse would read as "the sessions were quiet" forever. Measured
 # on this box 2026-08-20.
+#
+# EXIT 4 = DIVE-4562. Exit 3 is still too coarse in the direction that costs
+# most. A distiller that answered in prose is a MODEL miss — the next pass over
+# the same transcript may well succeed, and nobody needs to be told. A distiller
+# that came back "Not logged in · Please run /login" or "You've hit your org's
+# monthly spend limit" did not answer at all: the seat cannot transact, the next
+# pass will fail identically, and it will keep failing until a HUMAN restores
+# auth or raises a limit. Measured on this box 2026-09-15: 428 such assistant
+# turns across 12 seats between 2026-08-20 and 2026-09-13 — four passes a day
+# each, every one of them landing in the same bucket as a model that rambled,
+# and so never louder than a retry. luca measured the same shape on teal-fox:
+# five seats, exactly 63 lost passes each, 16 days, no signal anywhere.
+#
+# The refusal is only ever classified when NO JSON object was found, i.e. this is
+# strictly a refinement of the exit-3 branch: a real atoms[] payload that happens
+# to quote the phrase "not logged in" still parses and still writes.
 _memory_consolidate_parse() {
   # The payload arrives as a FILE, not on stdin: `python3 - <<PY` already spends
   # stdin on the program text, so a parser that read sys.stdin would silently
@@ -1566,8 +1582,29 @@ _memory_consolidate_parse() {
 import base64, json, re, sys
 raw = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
 # Tolerate a fenced block or leading prose — cheaper than failing a whole pass.
+# DIVE-4562 — the API-error refusal class. Matched against the refusal TEXT
+# rather than the exit code on purpose: `claude --print` prints these and EXITS
+# ZERO, which is why sixteen days of them read as ordinary quiet.
+REFUSAL = re.compile(
+    r"not logged in"
+    r"|please run /login"
+    r"|hit your (?:org|usage|session|weekly|monthly)"
+    r"|(?:spend|usage|session|rate) limit"
+    r"|credit balance is too low"
+    r"|invalid api key"
+    r"|authentication[ _]error"
+    r"|oauth token (?:has )?expired",
+    re.I)
 m = re.search(r'\{.*\}', raw, re.S)
 if not m:
+    hit = REFUSAL.search(raw)
+    if hit:
+        sys.stderr.write(
+            "consolidate: the distiller could not transact — it answered %r. "
+            "This is not a session with nothing to distil and not a model miss: "
+            "it will fail identically every pass until a human restores auth or "
+            "raises the limit.\n" % raw.strip()[:200])
+        sys.exit(4)
     sys.stderr.write("consolidate: distiller returned no JSON object\n")
     sys.exit(3)
 try:
@@ -1659,6 +1696,12 @@ _memory_consolidate() {
 
   local considered=0 processed=0 written=0 refused=0 dupes=0 skipped_live=0 skipped_done=0
   local distill_failed=0
+  # DIVE-4562: the subset of distill_failed that is an API-error refusal, i.e. a
+  # seat that is NOT TRANSACTING. Counted separately because the two want
+  # opposite responses: a model miss wants a silent retry, a refusal wants a
+  # human. Folding them together is what made sixteen days of dead passes look
+  # like ordinary retry noise.
+  local distill_unauthed=0
   local -a written_files=()
   local now; now=$(date +%s)
   local t
@@ -1693,6 +1736,16 @@ _memory_consolidate() {
     local rows prc=0
     rows=$(_memory_consolidate_parse "$rawf") || prc=$?
     rm -f "$rawf"
+    if [ "$prc" -eq 4 ]; then
+      # DIVE-4562 — an API-error refusal. Same ledger contract as exit 3 (no
+      # row, so the transcript is retried), but counted into its OWN bucket so
+      # the scheduler above can tell "this seat is not transacting" from "the
+      # model rambled once". Both are distiller failures; only this one is a
+      # standing condition a human has to clear.
+      distill_failed=$((distill_failed+1))
+      distill_unauthed=$((distill_unauthed+1))
+      continue
+    fi
     if [ "$prc" -eq 3 ]; then
       # No ledger row on a distiller failure. Stamping one would retire the
       # transcript permanently on a transient auth blip — the backlog would be
@@ -1813,6 +1866,7 @@ _memory_consolidate() {
        --argjson written "$written" --argjson refused "$refused" --argjson dupes "$dupes" \
        --argjson live "$skipped_live" --argjson done "$skipped_done" \
        --argjson dfail "$distill_failed" \
+       --argjson dunauth "$distill_unauthed" \
        --argjson ok "$([ "$pass_rc" -eq 0 ] && echo true || echo false)" \
        --argjson ibefore "$idx_before" --argjson iafter "$idx_after" \
        --argjson ilimit "$idx_limit" --argjson ibudget "$idx_budget" \
@@ -1822,7 +1876,7 @@ _memory_consolidate() {
       '{ok:$ok, data:{store:$store, ledger:$ledger, dry_run:$dry, considered:$considered,
         processed:$processed, atoms_written:$written, atoms_refused:$refused,
         atoms_duplicate:$dupes, skipped_live:$live, skipped_consolidated:$done,
-        distiller_failed:$dfail,
+        distiller_failed:$dfail, distiller_unauthed:$dunauth,
         index_bytes_before:$ibefore, index_bytes_after:$iafter,
         index_limit:$ilimit, index_router_budget:$ibudget,
         index_over_limit:$iover, index_rerouted:$irouted,
@@ -1836,6 +1890,10 @@ _memory_consolidate() {
     # Loud, and never folded into "0 atoms": a distiller that cannot answer is a
     # different event from a session with nothing worth keeping.
     [ "$distill_failed" -gt 0 ] && echo "  DISTILLER FAILED on $distill_failed session(s) — not ledgered, will retry next pass (is the CLI logged in?)" >&2 || :
+    # DIVE-4562: louder than the line above, and deliberately so. A retry is the
+    # right answer to a model miss and the WRONG answer here — this one repeats
+    # every pass until a person acts, and the retry is what hid it.
+    [ "$distill_unauthed" -gt 0 ] && echo "  NOT TRANSACTING: $distill_unauthed of those were an API-error refusal (not logged in / spend or usage limit). Retrying will not clear it — this seat needs a human to restore auth or raise the limit." >&2 || :
     [ "$dry" -eq 1 ] && echo "  (dry run — nothing written, ledger untouched)" || :
   fi
   # An INTENTIONAL non-zero exit has to claim the reason, or the EXIT-trap
