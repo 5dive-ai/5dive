@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# TIER: nightly — 94.8s measured in CI (installed-host shard 1, PR #950 head 56636fe9, 2026-09-15; 86.8s on pristine shard 2). The verdict is BEHAVIOURAL: it RUNS the candidate harnesses to count anchored markers, so the wall-clock IS the property and no fold or trim reclaims it. At ~30% of the 300s core cap one file reds the budget gate for every PR. The argument, the routes not taken and the coverage this costs are under "WHY THIS IS NIGHTLY AND NOT CORE" below.
+#
 # DIVE-2692 corpus contract: every harness in tests/*.sh carries the
 # HARNESS-RC EXIT trap (DIVE-2573 landed the mechanism; DIVE-2692 extended it
 # from 13 to the full corpus).
@@ -149,7 +151,9 @@ fi
 #   VERDICT    = run the candidate and count HARNESS-RC lines in its output.
 #                Zero lines IS the defect, by definition rather than by proxy.
 #
-# WHY THIS IS AFFORDABLE AND THE FILE HEADER'S OBJECTION DOES NOT REACH IT. That
+# WHY THE FILE HEADER'S OBJECTION DOES NOT REACH IT -- AND WHY THE COST STILL HAD
+# TO MOVE TIERS (the heading here used to read "why this is affordable"; it was
+# affordable in candidates and not in the budget that was paying, see below). That
 # header rejects executing the corpus ("300+ harnesses ... costs minutes and would
 # grade the corpus, not the property"), and that objection is about the 585-file
 # corpus. The candidate set is 28 files of 592 today (13 before iteration 4 dropped
@@ -159,6 +163,92 @@ fi
 # precision work landed. The honest cost: this harness runs ~2.5min, not ~38s.
 # The oracle is exact where the parse was approximate, and it is exact for
 # spellings nobody has thought of yet, which is the whole point.
+#
+# WHY THIS IS NIGHTLY AND NOT CORE (DIVE-4440 iteration 5, after ops's cost
+# rejection). The paragraph above priced this change in CANDIDATES -- 28 of 592, a
+# 45x smaller set than the objection was written about -- and never in the budget
+# that actually pays. Measured, in the merge queue, with nothing failing: queue
+# branch e66c57a6 was EJECTED on 2026-09-15T03:20:03Z (failed_checks) because
+# core-pristine (shard 2) spent 301s against the 300s cap with 156/156 harnesses
+# GREEN, and core-installed-host (shard 1) spent 325s with 157/157 green. Both
+# attributions named one file and only this one: verdict=corpus
+# reason=concentrated-excess top_excess_share_pct=100 new_files=0 --
+# 86.8s pristine / 94.8s installed-host, this harness, up from ~38s. One guard
+# holding 29-32% of a tier that every pull request has to fit inside.
+#
+# tests/lib/tier.sh gives a harness over the cap three routes and no fourth:
+# MERGE it into a harness of the same subject, RETIRE it, or DEMOTE it to the
+# nightly sweep with the reason written in the file. This is the third.
+#
+#   MERGE is arithmetic that does not work here. The only cost a merge reclaims is
+#   setup -- one bash start, one grading-tree source, one corpus enumeration, which
+#   together are under 2s of the 90. The remaining ~88s is 27 candidate harnesses
+#   being RUN, and they cost the same whichever file's process runs them.
+#
+#   RETIRE is not on the table: this is the guard DIVE-4440 exists to build, and
+#   the class it catches has now arrived three times (DIVE-2573, DIVE-3592,
+#   DIVE-4440). Retiring it is the row cancelling itself.
+#
+#   DEMOTE prices the cost where there is room for it. The nightly sweep's cap is
+#   1320s per job over three shards; full-sweep.yml's own measured shards ran
+#   459/505/723s pristine and 498/506/701s installed-host, so the slowest shard
+#   carries ~600s of headroom and ~95s lands inside it with the sweep's budget
+#   report printing what it cost. Nothing is hidden by moving: it is reported by a
+#   budgeted runner either way, just by one that priced it.
+#
+# THE FOURTH ROUTE, NOT TAKEN AND NOT A TIE. ops offered it: keep the file in core
+# and cut oracle runs by skipping candidates whose trap line already looks
+# compliant. That re-installs a STATIC pre-filter in front of the behavioural
+# verdict -- the same proxy that reported clean through three iterations of this
+# row, and its misses would be silent by construction, which is the property this
+# file exists to deny. It is a design change with its own false-negative risk and
+# it does not belong in the same diff as a budget repair. If the nightly budget
+# ever tightens, that is the route to measure, with an arm per skipped shape.
+#
+# RAISING THE 300s CAP WAS NEVER A ROUTE. It is widening a safety control mid-ship
+# to unblock the change the control is refusing, and the cap is lodar's number.
+#
+# WHAT THE DEMOTION COSTS, stated rather than discovered. In core, a harness that
+# lands with a silencing trap reds ITS OWN pull request. In nightly, it reds the
+# sweep that runs after it merges, so a silenced marker can sit on main for up to a
+# day. Three things bound that, and the first is the one that matters:
+#
+#   1. scripts/changed-harnesses.sh DISCOVERS corpus-wide contracts (any harness
+#      whose source enumerates the corpus glob) and adds them to the pre-push rail
+#      whenever a diff ADDS or DELETES a tests/*.sh. So the event this contract was
+#      built for -- a NEW harness arriving with the defect -- is still graded before
+#      the branch is pushed, ahead of CI rather than behind it. The rail's own seam
+#      is honest about itself: all changed harnesses share a 360s cap and a harness
+#      that runs out of it is reported UN-RUN, not green (this file now eats ~135s
+#      of that 360s locally, which is the other place this cost shows up).
+#   2. What escapes to the nightly window is therefore the corpus-wide re-check on
+#      pull requests that touch no harness -- and what it protects is a DIAGNOSTIC
+#      LINE, not a product behaviour: the failure mode of a day's delay is a CI log
+#      that does not name its own exit code, exactly the symptom this row was filed
+#      for and exactly as recoverable a day later.
+#   3. It is still a standing check that names the file, which is the thing
+#      DIVE-2692's header demanded -- "not a future ticket someone has to notice is
+#      needed". Nightly moves when it fires, not whether.
+#
+#   Against that: leaving it in core reds the budget gate on EVERY pull request in
+#   the repo, including every one that has nothing to do with exit traps. A guard
+#   that stops all shipping to protect a diagnostic line has inverted its own
+#   ledger -- which is the argument tests/lib/tier.sh was written to make.
+#
+# THE SPLIT, CONSIDERED AND REFUSED: keep the cheap static arms in core and move
+# only the oracle to nightly. Two files grading one property is the "one contract
+# with two authors" shape tier.sh's header names, and the half that would stay in
+# core is precisely the version that reported clean through iterations 1-3. A green
+# static arm on a pull request would read as a clearance it has already been proven
+# not to be worth. One file, one verdict, one tier.
+#
+# STALE WEIGHT, NAMED: tests/lib/harness-weights.tsv still carries 610ms/785ms for
+# this file (generated 2026-09-13, before the behavioural arm). The shard PLANNER
+# reads that table, so until scripts/refresh-harness-weights.sh regenerates it from
+# a green sweep, the nightly planner under-weights this file by ~100x. That
+# perturbs shard BALANCE, never the cap -- the cap is enforced on measured
+# wall-clock -- but a planner working from a two-orders-of-magnitude-wrong number is
+# worth knowing about before someone reads an unbalanced shard as corpus growth.
 #
 # THE COST THE STATIC VERSION DID NOT HAVE, named because it is real and it is not
 # free: running a candidate gives this contract that candidate's SIDE EFFECTS. TMPDIR
