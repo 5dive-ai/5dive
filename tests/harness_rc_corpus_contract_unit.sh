@@ -141,18 +141,22 @@ fi
 # same shapes. So the enumeration is now used ONLY to pick CANDIDATES, where being
 # over-broad is free, and the VERDICT is rendered by RUNNING the file:
 #
-#   CANDIDATE  = any line naming both `trap` and `EXIT`, minus the marker line
+#   CANDIDATE  = any line naming `trap` that is not the compliant marker line
 #                itself, minus whole-line comments. Deliberately a superset: a
-#                false candidate costs one harness run and nothing else.
+#                false candidate costs one harness run and nothing else. (The
+#                `and EXIT` half of this was iteration 3's last enumeration and is
+#                gone -- see ITERATION 4 at _rc_candidate_lines.)
 #   VERDICT    = run the candidate and count HARNESS-RC lines in its output.
 #                Zero lines IS the defect, by definition rather than by proxy.
 #
 # WHY THIS IS AFFORDABLE AND THE FILE HEADER'S OBJECTION DOES NOT REACH IT. That
 # header rejects executing the corpus ("300+ harnesses ... costs minutes and would
 # grade the corpus, not the property"), and that objection is about the 585-file
-# corpus. The candidate set is 13 files / 41 lines today -- measured, 34s serial,
-# every one of the 12 non-self candidates emitting exactly one marker line, so
-# ZERO false positives where the static classifier's own precision work landed.
+# corpus. The candidate set is 28 files of 592 today (13 before iteration 4 dropped
+# the signal filter) -- measured on the merged tree, 136s serial including this
+# file's own excluded run, every one of the 27 non-self candidates emitting exactly
+# ONE anchored marker, so ZERO false positives where the static classifier's own
+# precision work landed. The honest cost: this harness runs ~2.5min, not ~38s.
 # The oracle is exact where the parse was approximate, and it is exact for
 # spellings nobody has thought of yet, which is the whole point.
 #
@@ -190,9 +194,33 @@ fi
 #     spelling that DOES leave text behind (`printf 'trap ... EXIT' > f; . "$f"`) is
 #     caught, because the printf line is a candidate.
 #
-# What is closed is the whole class of "a shape the classifier's author did not
-# enumerate" for any trap written in the harness itself -- which is what let this
-# class arrive three times, and what iteration 1's negative mutants could not see.
+# CLOSURE CLAIM, CORRECTED IN ITERATION 4 -- the old wording ("the whole class of
+# a shape the classifier's author did not enumerate, for any trap written in the
+# harness itself") was FALSE when written, and ops proved it with two spellings:
+# the classifier still enumerated the SIGNAL NAME, so `trap 'cleanup' 0` and
+# `trap 'cleanup' exit` were not candidates. A file that prints a completeness
+# claim it does not enforce is the exact defect this row exists to kill, so the
+# claim is now scoped to what the code actually does:
+#
+#   CLOSED: where the trap APPEARS (any prefix, any compound statement, any
+#           function that runs) -- the oracle runs the file and counts markers, so
+#           it is exact for spellings nobody has written yet; and how the SIGNAL is
+#           SPELLED -- the candidate greps no longer read the signal position at
+#           all, so `EXIT`, `exit`, `Exit`, `0`, a multi-signal list and `trap - 0`
+#           are all candidates and all graded by the same oracle.
+#   NOT CLOSED, and these are the residuals below: a trap on a branch this run does
+#           not take; a trap registered wholly from a sourced file with no `trap`
+#           text of its own; and the candidate grep's one remaining literal -- the
+#           word `trap` itself. A harness that assembles the keyword out of
+#           fragments (`t=tr; ${t}ap ...`) is not a candidate. That is a deliberate
+#           floor, not an oversight: the word `trap` is what the FIX text tells
+#           authors to write, and no accidental cleanup is spelled around it.
+#
+# Note what pins the FIRST trap: RC_RE still requires the literal `EXIT`, so a
+# compliant marker trap must be spelled `EXIT` -- enforced LOUDLY by the MISSING
+# arm above, which reds any other spelling by name. That is why the candidate and
+# non-compliant greps below can afford to know nothing about signals: the marker
+# trap's own spelling is already pinned, and everything else is a candidate.
 #
 # THREE OUTCOMES, unchanged in spirit: a candidate that cannot be RUN (timeout,
 # unexecutable) is neither clean nor silenced. It is reported UNKNOWN and fails --
@@ -206,9 +234,27 @@ ORACLE_TIMEOUT="${HARNESS_RC_ORACLE_TIMEOUT:-180}"
 SELF_ABS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 ORACLE_TMP="$(mktemp -d /tmp/harness-rc-oracle.XXXXXX)"
 
-_rc_candidate_lines() {   # <file> -> "<lineno>:<line>" for every trap/EXIT line that is not a COMPLIANT marker trap
+# ITERATION 4 (DIVE-4440, ops's third grade): THE LAST ENUMERATION WAS THE SIGNAL
+# NAME, and it is gone. Iteration 3 still required `\bEXIT\b` on the line. In bash
+# `EXIT`, lowercase `exit`, any mixed case, and the number `0` are the SAME signal
+# (measured: all four register; only `SIGEXIT` is rejected), and `trap 'cleanup' 0`
+# is the classic POSIX idiom. ops measured both spellings really losing the marker
+# and this contract staying silent on them, because the line never became a
+# candidate and the exact behavioural oracle was never consulted -- iteration 1's
+# failure mode moved one field to the right.
+#
+# So the signal filter is DROPPED rather than widened to `EXIT|exit|0`. Widening
+# adds zero candidates today and keeps a list that the next spelling walks past;
+# dropping it means the candidate set is "any line naming `trap` that is not the
+# compliant marker trap", with no knowledge of signals at all. MEASURED on the tree
+# merged into origin/main e0cb028d: 13 -> 28 candidate files of 592, and all 28 emit
+# EXACTLY ONE anchored marker, so the widening costs ZERO false positives. It costs
+# TIME: 27 non-self runs, 136s serial measured (was 34s for 13), so this harness
+# goes from ~38s to ~2.5min. That is the trade iteration 2 already argued for --
+# over-inclusion costs one harness run and nothing else -- and it is named here
+# rather than discovered in a CI shard.
+_rc_candidate_lines() {   # <file> -> "<lineno>:<line>" for every `trap` line that is not a COMPLIANT marker trap
   grep -nE '\btrap\b' "$1" \
-    | grep -E '\bEXIT\b' \
     | grep -vE '^[0-9]+:[[:space:]]*#' \
     | grep -vE "$RC_RE"
 }
@@ -224,10 +270,20 @@ _rc_candidate_lines() {   # <file> -> "<lineno>:<line>" for every trap/EXIT line
 # emits a marker, so it "survives" -- which is why the corruption gets its OWN arm
 # below rather than a wider oracle. Filtering on RC_RE instead of the substring is
 # what lets that arm have a candidate set at all.
-_rc_noncompliant_marker_lines() {   # <file> -> "<lineno>:<line>" for every trap/EXIT line that MENTIONS the marker but is not a compliant marker trap
-  grep -nE '\btrap\b' "$1" \
-    | grep -E '\bEXIT\b' \
-    | grep 'HARNESS-RC' \
+#
+# ITERATION 4: this arm loses the signal filter too, for the same reason -- a trap
+# that captures rc AFTER its cleanup misreports just as badly spelled `0` or
+# `exit`. It is STATIC (it reports on the grep alone), so over-inclusion is NOT
+# free here and the naive drop introduces a real false positive: measured, the only
+# corpus line that gains is codex_channel_health_unit.sh:204, a plain assignment
+# whose TRAILING COMMENT happens to read "... the HARNESS-RC trap at the head".
+# The fix is a fact about the builtin's syntax rather than another spelling list:
+# a trap whose BODY prints the marker always has the word `trap` BEFORE it on the
+# line, because the body follows the keyword. Requiring that order drops the
+# comment and keeps every real shape. Measured across 592 harnesses: ZERO lines
+# outside this file match, so this arm reds the file that lies and nothing else.
+_rc_noncompliant_marker_lines() {   # <file> -> "<lineno>:<line>" for every `trap` line whose body MENTIONS the marker but is not a compliant marker trap
+  grep -nE '\btrap\b.*HARNESS-RC' "$1" \
     | grep -vE '^[0-9]+:[[:space:]]*#' \
     | grep -vE "$RC_RE"
 }
@@ -250,10 +306,10 @@ _rc_marker_survives() {   # <file> -> 0 marker present, 1 SILENCED, 2 could-not-
   # marker's NAME anywhere in its own output, and the candidate set is exactly the
   # population where that is likeliest: files carrying a second `trap ... EXIT` are
   # disproportionately files ABOUT exit traps and markers (audit_exit_trap_row,
-  # silent_nonzero_exit_backstop and truncation_marker_guard are 3 of today's 13).
+  # silent_nonzero_exit_backstop and truncation_marker_guard are 3 of today's 28).
   # Measured by ops: a probe registering a second top-level trap AND echoing one
   # sentence containing the word HARNESS-RC ran with ZERO emitted markers and this
-  # contract called it clean. Measured here: all 13 non-self candidates emit exactly
+  # contract called it clean. Measured here: all 27 non-self candidates emit exactly
   # ONE anchored line, so the anchor costs no false positive.
   (( $(grep -cE '^HARNESS-RC=[0-9]+$' <<<"$out") >= 1 )) && return 0
   return 1
@@ -284,9 +340,9 @@ else
   done
 
   if (( ${#SILENCED[@]} == 0 )); then
-    ok "no harness loses its HARNESS-RC line at runtime (${CANDIDATES} of ${#CORPUS[@]} carry a second trap/EXIT line; each was RUN and printed its marker)"
+    ok "no harness loses its HARNESS-RC line at runtime (${CANDIDATES} of ${#CORPUS[@]} carry a non-compliant \`trap\` line, any signal spelling; each was RUN and printed its marker)"
   else
-    nok "${#SILENCED[@]} harness(es) emit NO HARNESS-RC line when run -- a later EXIT trap replaced the marker trap:"
+    nok "${#SILENCED[@]} harness(es) emit NO HARNESS-RC line when run -- a later EXIT trap replaced the marker trap (EXIT, exit, Exit and 0 are all the same signal):"
     for m in "${SILENCED[@]}"; do
       printf '       %s\n' "$m"
       while IFS= read -r cl; do [[ -n "$cl" ]] && printf '         suspect %s\n' "$cl"; done < <(_rc_candidate_lines "$m")
@@ -574,6 +630,40 @@ _mut_positive "a bare 'trap - EXIT' reset at top level" \
 trap - EXIT
 echo body")"
 
+# (12)-(15) ITERATION 4: THE SIGNAL SPELLINGS. In bash EXIT, lowercase exit, any
+# mixed case, and the number 0 are the SAME signal -- `trap 'cleanup' 0` is the
+# classic POSIX idiom, not an exotic shape -- and iteration 3's candidate greps
+# required the literal `\bEXIT\b`, so these registered a silencing trap that this
+# contract could not see. Each carries the same three arms as every positive above,
+# and the CANDIDATE arm is the one that matters here: iteration 3 failed at that
+# stage, not at the verdict.
+_mut_positive "a second top-level trap on signal 0 (the POSIX spelling)" \
+  "$(_mut_write silenced_sig0_unit.sh "$MUT_HEAD
+d=\$(mktemp -d); trap 'rm -rf \"\$d\"' 0
+echo body")"
+
+_mut_positive "a second top-level trap on lowercase 'exit'" \
+  "$(_mut_write silenced_siglower_unit.sh "$MUT_HEAD
+d=\$(mktemp -d); trap 'rm -rf \"\$d\"' exit
+echo body")"
+
+_mut_positive "a second top-level trap on mixed-case 'Exit'" \
+  "$(_mut_write silenced_sigmixed_unit.sh "$MUT_HEAD
+d=\$(mktemp -d); trap 'rm -rf \"\$d\"' Exit
+echo body")"
+
+_mut_positive "a second top-level trap on a MULTI-signal list ending in 0" \
+  "$(_mut_write silenced_siglist_unit.sh "$MUT_HEAD
+d=\$(mktemp -d); trap 'rm -rf \"\$d\"' INT TERM 0
+echo body")"
+
+# (16) The disarm, spelled numerically -- mutant (11) covered `trap - EXIT`, and the
+# numeric spelling is the one iteration 3's grep could not see.
+_mut_positive "a bare 'trap - 0' reset at top level" \
+  "$(_mut_write silenced_reset0_unit.sh "$MUT_HEAD
+trap - 0
+echo body")"
+
 # --- NEGATIVE: the shapes that are CORRECT and must never be redded -----------
 # A detector that reds a correct file teaches authors to route around it, which is
 # how this contract dies a fourth time. All five shapes below exist in the real
@@ -606,6 +696,23 @@ echo body")"
 _mut_negative "a trap in a function body that is never called" \
   "$(_mut_write clean_uncalled_func_unit.sh "$MUT_HEAD
 arm() { trap 'echo cleanup' EXIT; }
+echo body")"
+
+# ITERATION 4: the signal-agnostic candidate grep must not red a CORRECT trap just
+# because it is spelled `0`. A subshell trap on signal 0 is a candidate now (it was
+# invisible before) and the oracle must still leave it clean.
+_mut_negative "a trap on signal 0 inside a ( ... ) subshell" \
+  "$(_mut_write clean_subshell_sig0_unit.sh "$MUT_HEAD
+(
+  trap 'echo inner' 0
+  echo body
+)")"
+
+# ITERATION 4: a trap on a DIFFERENT signal entirely is a candidate now (no signal
+# filter) and silences nothing. It must be run and found clean, not reported.
+_mut_negative "a top-level trap on ERR, which is not the EXIT slot at all" \
+  "$(_mut_write clean_errtrap_unit.sh "$MUT_HEAD
+trap 'echo errhandler' ERR
 echo body")"
 
 _mut_negative "a '( trap - EXIT; ... )' reset inside a subshell" \
@@ -687,6 +794,25 @@ _mut_corrupting "a cleanup FUNCTION called before rc=\$?" \
 cleanup() { return 3; }
 trap 'cleanup; rc=\$?; echo \"HARNESS-RC=\$rc\"' EXIT
 exit 7")" 3 7
+
+# (3) ITERATION 4: the same corruption spelled on signal 0. The value arm dropped
+# its `\bEXIT\b` filter too, so this must be SEEN by the non-compliant grep; it was
+# invisible to iteration 3.
+_mut_corrupting "cleanup before rc=\$? in a trap spelled on signal 0" \
+  "$(_mut_write corrupt_sig0_unit.sh "$MUT_HEAD
+f=\$(mktemp)
+trap 'rm -f \"\$f\"; rc=\$?; echo \"HARNESS-RC=\$rc\"' 0
+exit 7")" 0 7
+
+# NEGATIVE, ITERATION 4: the false positive the naive signal-filter drop introduced
+# in the VALUE arm -- a plain line whose TRAILING COMMENT names both `trap` and the
+# marker. Live shape: codex_channel_health_unit.sh:204. It must never be reported.
+# (This mutant has no corrupting trap at all, so it is graded only by the
+# non-compliant grep -- which is the stage it exists to defend.)
+_mut_corrupting_negative "an ordinary line whose trailing comment names the HARNESS-RC trap" \
+  "$(_mut_write corrupt_comment_tail_unit.sh "$MUT_HEAD
+d=\$(mktemp -d)   # cleanup folded into the HARNESS-RC trap at the head
+exit 7")" 7
 
 # NEGATIVE: the CORRECT fold. rc is captured first, cleanup runs after, and the
 # marker carries the harness's own code. This must never be reported.
