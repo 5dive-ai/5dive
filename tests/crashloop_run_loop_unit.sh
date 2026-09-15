@@ -69,10 +69,23 @@ LOOP_PID=$!
 # poll for the flag rather than assuming one second is enough for the loop to
 # trip detection — on a loaded CI runner it is not, and the kill below then
 # lands BEFORE the flag/alert ever drop (flaky red, no bug). Bounded ~10s.
-for _i in $(seq 1 100); do [[ -f "$FLAG" ]] && break; sleep 0.1; done
-# never fail SILENTLY into a missing flag: say so out loud, or the assertions
-# below red as if the product misbehaved when the CHECK simply ran out of time.
-[[ -f "$FLAG" ]] || echo "crashloop: TIMED OUT after ~10s waiting for $FLAG — assertions below fail on a missing flag, not on a product bug" >&2
+# DIVE-4572: poll for the LAST observable the assertions read, not the first.
+# run-loop.sh writes the flag (`: > "$flag"`) and only THEN forks for
+# _cl_pane_tail and calls _cl_notify. Breaking on the flag put the kill inside
+# that window: the flag assertion passed, the alert never landed, and the arm
+# red as "got 0 crash-loop alerts, want 1" with an EMPTY notify log — a harness
+# race, not a product bug. Measured on 5dive@main c856a3f0, 2026-09-15: green in
+# the merge_group run, red in the push run at the identical sha, on a shard the
+# budget arm independently measured as over its cap (a loaded runner widens the
+# fork window). The alert is written strictly after the flag, so waiting on the
+# alert also waits on the flag; a genuine never-alerts bug still burns the full
+# window and still reds below, which is the outcome we want.
+for _i in $(seq 1 100); do grep -q 'crash-looping' "$NOTIFY_LOG" 2>/dev/null && break; sleep 0.1; done
+# never fail SILENTLY into a missing flag/alert: say so out loud, or the
+# assertions below red as if the product misbehaved when the CHECK simply ran
+# out of time.
+grep -q 'crash-looping' "$NOTIFY_LOG" 2>/dev/null \
+  || echo "crashloop: TIMED OUT after ~10s waiting for a crash-loop alert in $NOTIFY_LOG (flag present: $([[ -f "$FLAG" ]] && echo yes || echo no)) — assertions below fail on a missing alert, not necessarily on a product bug" >&2
 kill "$LOOP_PID" 2>/dev/null || true
 wait "$LOOP_PID" 2>/dev/null || true
 
