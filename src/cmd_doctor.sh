@@ -1076,6 +1076,57 @@ doctor_seat_claude_pid() {
   printf '%s' "$procs"
 }
 
+# DIVE-4562 — IS EACH SEAT'S CONSOLIDATION ACTUALLY TRANSACTING?
+#
+# Every other check in the `memory` category grades the CONTENT of a memory
+# store. None of them could see the failure that mattered: a seat whose
+# six-hourly consolidation pass has been refused by the API ("Not logged in",
+# "you've hit your org's monthly spend limit") on every run for weeks. Its store
+# stays perfectly clean — it is simply frozen, and a clean frozen store is
+# indistinguishable from a healthy one by hygiene alone. luca measured five
+# teal-fox seats losing 63 passes each over 16 days with no signal anywhere; the
+# same shape ran on this box across 12 seats between 2026-08-20 and 2026-09-13.
+#
+# The scheduler writes one counter file per seat that is refusing and DELETES it
+# the moment a pass gets through, so the presence of the file IS the condition —
+# nothing here re-derives it, re-runs a distiller, or spends a token.
+#
+# Args: <stamp dir> <consecutive-pass threshold>. Both injected rather than read
+# from the environment so this is gradeable without a box.
+doctor_check_consolidate_transacting() {
+  local _cons_stampdir="${1:-${STATE_DIR:-/var/lib/5dive}/memory-consolidate}"
+  local _notx_after="${2:-4}"
+  [[ "$_notx_after" =~ ^[0-9]+$ ]] || _notx_after=4
+  if [[ "${MEMORY_CONSOLIDATE:-on}" == "off" ]]; then
+    doctor_add memory consolidate ok "memory consolidation is switched off (MEMORY_CONSOLIDATE=off) — no seat is expected to transact"
+  elif [[ ! -d "$_cons_stampdir" ]]; then
+    # No stamp dir at all means the sweep has never run here. That is a real
+    # state and a WARN, not an ok: "no seat is failing" and "nothing has ever
+    # tried" are the two readings this row exists to stop conflating.
+    doctor_add memory consolidate warn "the memory-consolidation scheduler has never run on this box (no $_cons_stampdir) — no seat's memory is being distilled"
+  else
+    local _notxf _notx_name _notx_n _notx_bad="" _notx_watch=0
+    for _notxf in "$_cons_stampdir"/*.notx; do
+      [[ -e "$_notxf" ]] || continue
+      _notx_name=$(basename "$_notxf" .notx)
+      _notx_n=$(cat "$_notxf" 2>/dev/null) || _notx_n=0
+      [[ "$_notx_n" =~ ^[0-9]+$ ]] || _notx_n=0
+      if (( _notx_n >= _notx_after )); then
+        _notx_bad+="${_notx_bad:+, }${_notx_name} (${_notx_n} passes)"
+      else
+        _notx_watch=$((_notx_watch + 1))
+      fi
+    done
+    if [[ -n "$_notx_bad" ]]; then
+      doctor_add memory consolidate error "NOT TRANSACTING — the distiller has been refused by the API on every consecutive pass for: ${_notx_bad}. Their memory has not consolidated since. Retrying will not clear it: restore the seat's auth or raise the account limit."
+    elif (( _notx_watch > 0 )); then
+      doctor_add memory consolidate warn "${_notx_watch} seat(s) had a distiller refused by the API on their last pass but are under the ${_notx_after}-pass threshold — transient limit or a rotating token; re-check if it persists"
+    else
+      doctor_add memory consolidate ok "every enrolled seat's last consolidation pass reached the model"
+    fi
+  fi
+}
+
 cmd_doctor() {
   require_root
   local filter="" want_fix=0 dry=0
@@ -1855,6 +1906,12 @@ cmd_doctor() {
   fi
 
   if (( run_memory )); then
+    # DIVE-4562 — is each seat's consolidation actually transacting? Factored
+    # out so it is gradeable without a root shell and a whole box (see
+    # tests/doctor_consolidate_transacting_unit.sh).
+    doctor_check_consolidate_transacting \
+      "${STATE_DIR:-/var/lib/5dive}/memory-consolidate" "${MEMORY_CONSOLIDATE_NOTX_AFTER:-4}"
+
     local mem_roots=() code_root=""
     for d in /home/claude/projects/5dive /home/claude/projects; do
       [[ -d "$d" ]] && { code_root="$d"; break; }

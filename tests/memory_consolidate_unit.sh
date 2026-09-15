@@ -345,6 +345,71 @@ check "a duplicate-slug refusal survives errexit" "$?" "0"
 errexit_run --distiller="$EMPTY" --max-sessions=1 --dry-run >/dev/null 2>&1
 check "dry run survives errexit" "$?" "0"
 
+echo "── DIVE-4562: an API-error refusal is not a model miss ──"
+# THE row's discriminator. Before this, "Not logged in · Please run /login" and
+# "I could not do that, sorry." landed in the SAME bucket (distiller_failed), so
+# a seat that had been unable to transact for sixteen days was indistinguishable
+# from a distiller that rambled once. The arms below assert the SPLIT, not the
+# count — a change that merely made every failure "unauthed" would pass an
+# arm that only looked at the refusal case.
+SPEND=$(stub spend "You've hit your org's monthly spend limit · ask your admin to raise it at claude.ai/settings")
+SESSLIM=$(stub sesslim "You've hit your session limit · resets 9am (UTC)")
+mk_transcript "$PROJ/nnnn-4562.jsonl" "a session dispatched to a seat that cannot transact" "Ok."
+touch -d '3 hours ago' "$PROJ/nnnn-4562.jsonl"
+
+JOUT=$(JSON_MODE=1 run --distiller="$NOAUTH" --max-sessions=1 --force 2>/dev/null)
+check "a 'Not logged in' refusal is counted as a distiller failure (unchanged)" \
+  "$(jq -r '.data.distiller_failed' <<<"$JOUT" 2>/dev/null)" "1"
+check "AND is machine-readable as a seat that could not transact" \
+  "$(jq -r '.data.distiller_unauthed' <<<"$JOUT" 2>/dev/null)" "1"
+JOUT=$(JSON_MODE=1 run --distiller="$SPEND" --max-sessions=1 --force 2>/dev/null)
+check "a monthly spend-limit refusal lands in the same class" \
+  "$(jq -r '.data.distiller_unauthed' <<<"$JOUT" 2>/dev/null)" "1"
+JOUT=$(JSON_MODE=1 run --distiller="$SESSLIM" --max-sessions=1 --force 2>/dev/null)
+check "so does a session-limit refusal (the third shape measured on this box)" \
+  "$(jq -r '.data.distiller_unauthed' <<<"$JOUT" 2>/dev/null)" "1"
+
+# CONTROL 1 — the discriminator, and the arm that fails if the classifier is
+# widened to "any failure". A distiller that answered in prose DID transact:
+# the model was reached, the next pass may well succeed, and nobody should be
+# paged. It must stay a plain distiller failure.
+JOUT=$(JSON_MODE=1 run --distiller="$GARBAGE" --max-sessions=1 --force 2>/dev/null)
+check "CONTROL: a prose answer is still a distiller failure" \
+  "$(jq -r '.data.distiller_failed' <<<"$JOUT" 2>/dev/null)" "1"
+check "CONTROL: but NOT a could-not-transact — it reached the model" \
+  "$(jq -r '.data.distiller_unauthed' <<<"$JOUT" 2>/dev/null)" "0"
+# CONTROL 2 — a pass that worked must report zero, or the doctor surface reads
+# every healthy box as broken.
+JOUT=$(JSON_MODE=1 run --distiller="$EMPTY" --max-sessions=1 --force 2>/dev/null)
+check "CONTROL: a pass that reached the model reports zero refusals" \
+  "$(jq -r '.data.distiller_unauthed' <<<"$JOUT" 2>/dev/null)" "0"
+# CONTROL 3 — the classifier keys on a refusal INSTEAD OF a result, never on a
+# result that mentions one. An atom whose body quotes the phrase must still be
+# written, or the fix silently eats a class of real memory.
+QUOTING=$(stub quoting '{"atoms":[{"type":"reference","name":"quotes-a-refusal","description":"an atom whose body quotes the refusal text","body":"When the CLI is unauthenticated it prints Not logged in and exits zero, which is why the parse layer matches on text."}]}')
+JOUT=$(JSON_MODE=1 run --distiller="$QUOTING" --max-sessions=1 --force 2>/dev/null)
+check "CONTROL: an atom that QUOTES the refusal text is still written" \
+  "$(jq -r '.data.atoms_written' <<<"$JOUT" 2>/dev/null)" "1"
+check "CONTROL: and is not misread as a refusal" \
+  "$(jq -r '.data.distiller_unauthed' <<<"$JOUT" 2>/dev/null)" "0"
+# The ledger contract is the half that stops silent LOSS: a refused pass must
+# leave the transcript retriable. Asserted on a session no other arm touches.
+mk_transcript "$PROJ/oooo-4562.jsonl" "a session refused by the API" "Ok."
+touch -d '3 hours ago' "$PROJ/oooo-4562.jsonl"
+LB=$(wc -l < "$LEDGER")
+run --distiller="$NOAUTH" --max-sessions=1 --force >/dev/null 2>&1
+check "a refused pass writes NO ledger row, so the transcript is retried" \
+  "$(wc -l < "$LEDGER")" "$LB"
+# And the human-readable path says it out loud, in the words an operator acts on.
+ERR=$(run --distiller="$NOAUTH" --max-sessions=1 --force 2>&1 >/dev/null)
+grep -qi 'NOT TRANSACTING' <<<"$ERR" \
+  && ok "the non-JSON pass names the condition as NOT TRANSACTING" \
+  || bad "the non-JSON pass does not name the condition (got: $(head -c 120 <<<"$ERR"))"
+ERR=$(run --distiller="$GARBAGE" --max-sessions=1 --force 2>&1 >/dev/null)
+grep -qi 'NOT TRANSACTING' <<<"$ERR" \
+  && bad "CONTROL: a prose answer wrongly claims NOT TRANSACTING" \
+  || ok "CONTROL: a prose answer does not claim NOT TRANSACTING"
+
 echo "── validation ──"
 run --distiller="$EMPTY" --max-sessions=x >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--max-sessions must be numeric" || bad "--max-sessions must be numeric"
 run --distiller="$EMPTY" --idle-min=-1 >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--idle-min must be numeric" || bad "--idle-min must be numeric"
