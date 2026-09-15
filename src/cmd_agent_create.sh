@@ -190,6 +190,69 @@ SUDOERS
   fi
 }
 
+# DIVE-4557: render the UNRESTRICTED root policy — the `root-all` class that
+# classify_sudo_grant has reported since DIVE-2079 and that nothing could write.
+#
+# WHY THIS EXISTS AND WHY IT IS NOT THE TIER DIVE-3213 REFUSED.
+# DIVE-3213 proposed a fourth isolation tier scoped to systemctl/journalctl/
+# crontab/unit writes. lodar answered B on 2026-08-11: no tier, build the verbs —
+# because each of those four is an independent one-line root escape, so the tier
+# would have READ `host-admin` in `agent info` and MEANT `root-all`. The refusal
+# was of a MISLABELLED grant, not of root itself.
+#
+# This function is the opposite shape. It writes root, says root, and classifies
+# root: `agent info` reports grant `root-all`, the registry label becomes
+# `beyond-admin`, and `diverges` is false because the two agree. Nobody can
+# reason from the label and be wrong, which was the whole DIVE-2079 complaint.
+#
+# WHAT IT CLOSES. The legacy seats (`dev`, `main`, `olivia` on this host) hold
+# `ALL=(ALL) NOPASSWD: ALL` from before DIVE-1002, and no flag re-emits it — so
+# an operator who approves "give that seat host root" names a grant the tooling
+# cannot produce (community/wiki/the-top-isolation-tier-no-longer-reproduces-the-
+# oldest-agents-grant.md). The only route left was a hand-written drop-in: not
+# visudo-checked by us, not audited, not visible to `agent info` except as a
+# DISAGREE warning, and invisible to the digest.
+#
+# WHAT IT IS NOT. It is not a way to get host work done inside the admin
+# boundary — `5dive host` (DIVE-3221) is that, and it needs no sudoers change.
+# Reach for this only when a seat genuinely needs the whole box, and know that it
+# also confers a RUNAS target: `(ALL)` lets the seat become `claude`, whose gh
+# credential is the human's GitHub identity. That runas breadth, not the command
+# scoping, is the real step up from `admin` (see the DIVE-2079 note below).
+# The exact text write_root_sudoers installs, without installing it — so the
+# plan half can compare byte-for-byte and the unit harness can grade the shape
+# without root or a real /etc/sudoers.d.
+render_root_sudoers() {
+  local user="$1"
+  cat <<SUDOERS
+# Managed by 5dive (DIVE-4557). UNRESTRICTED root for beyond-admin agent ${user}.
+# This seat can run any command as any user, including \`claude\`. Do not edit by
+# hand; \`5dive agent grant ${user#agent-} root\` re-renders it.
+${user} ALL=(ALL) NOPASSWD: ALL
+SUDOERS
+}
+
+write_root_sudoers() {
+  local user="$1"
+  local d="${SUDOERS_D:-/etc/sudoers.d}"
+  local f="${d}/${user}"
+  local tmp
+  tmp=$(mktemp)
+  # One renderer, one text: the plan half compares against render_root_sudoers,
+  # so a second copy here is exactly the drift the DIVE-4183 harness exists to
+  # catch one level up.
+  render_root_sudoers "$user" > "$tmp"
+  chmod 440 "$tmp"
+  if visudo -cf "$tmp" >/dev/null 2>&1; then
+    chown root:root "$tmp"
+    mv "$tmp" "$f"
+    chmod 440 "$f"
+  else
+    rm -f "$tmp"
+    fail "$E_GENERIC" "generated sudoers for ${user} failed visudo validation; aborting (no partial install)"
+  fi
+}
+
 # DIVE-2079: read back a user's ENFORCED sudo grant and classify it — the inverse
 # of the two writers above, so `agent info` can report what an agent can actually
 # do rather than only the label the registry happens to store.
@@ -487,9 +550,16 @@ classify_sudo_grant() {
   printf '%s|%s|%s\n' "$class" "$runas" "$extra"
 }
 
-# The isolation label each class WOULD justify. `root-all` maps to no label at
-# all: nothing this CLI can provision is that wide, so it is named for what it
-# is rather than rounded down to the nearest label an operator would misread.
+# The isolation label each class WOULD justify. `root-all` maps to `beyond-admin`
+# rather than being rounded down to the nearest label an operator would misread.
+#
+# DIVE-4557 UPDATE: this used to read "nothing this CLI can provision is that
+# wide". That is no longer true — `agent grant <name> root` provisions it and
+# STAMPS this label, which is what makes `diverges` false for such a seat. The
+# mapping is unchanged; only the reason it exists is. It was the read-back of an
+# unreachable state, and it is now also the writer's contract: if these two ever
+# drift apart, every root seat starts reporting a DISAGREE warning against its
+# own managed policy.
 isolation_implied_by_grant() {
   case "$1" in
     root-all) printf 'beyond-admin\n' ;;
@@ -798,22 +868,157 @@ _agent_grant_plan() {
     "$can_push" "$can_deploy" "$f" "$can_push" "$can_deploy"
 }
 
+# DIVE-4557: the decision half of `agent grant <name> root`. Pure — reads the
+# seat's ENFORCED policy through the documented SUDOERS_D seam, writes nothing,
+# so every refusal is unit-gradeable without root or a real /etc/sudoers.d.
+#
+# Prints `<state>|<detail>`, where state is one of:
+#   update  the seat is narrower than root (or holds no policy at all) — this is
+#           the WIDENING case, and the only one that changes what the seat can do.
+#   adopt   the seat ALREADY enforces root-all through a file this CLI did not
+#           write (the pre-DIVE-1002 hand-written drop-in every legacy seat
+#           carries). Capability does not change; management and the honest
+#           label do. This is the case that must not read as `current`, because
+#           `current` would mean "nothing to do" and leave the file unmanaged.
+#   current the managed root policy is already installed, byte for byte.
+#   refuse  a file this CLI did not write whose grant is NARROWER than root.
+#           Re-rendering would DELETE an operator's policy rather than widen it;
+#           they move it aside first, so the destruction is their act, not ours.
+#
+# Note the asymmetry with _agent_grant_plan: that verb refuses to MINT (it
+# re-renders an existing standard policy), this one mints deliberately. Root is
+# conferred, not reconciled — a sandboxed seat with no drop-in is a legitimate
+# target for it, and the missing file is not evidence of anything.
+_agent_grant_root_plan() {
+  local user="$1" d="${SUDOERS_D:-/etc/sudoers.d}" f current grant cls wanted
+  f="${d}/${user}"
+  wanted=$(render_root_sudoers "$user")
+  if [[ ! -r "$f" ]]; then
+    printf 'update|%s holds no sudoers policy — minting the managed root policy at %s\n' "$user" "$f"
+    return 0
+  fi
+  current=$(cat "$f")
+  if [[ "$current" == "$wanted" ]]; then
+    printf 'current|%s already enforces the managed root policy — nothing to do\n' "$user"
+    return 0
+  fi
+  grant=$(printf '%s\n' "$current" | classify_sudo_grant)
+  cls="${grant%%|*}"
+  if [[ "$current" != '# Managed by 5dive '* ]]; then
+    if [[ "$cls" == "root-all" ]]; then
+      printf 'adopt|%s already enforces root-all through a policy this CLI did not write — replacing it with the managed equivalent (no change to what the seat can do)\n' "$user"
+    else
+      printf 'refuse|%s is not a 5dive-managed policy (no managed header) and enforces a %s grant, narrower than root — refusing to DELETE a policy this CLI did not write. Move %s aside first, then re-run\n' "$f" "$cls" "$f"
+    fi
+    return 0
+  fi
+  printf 'update|%s enforces a %s grant — widening it to unrestricted root\n' "$user" "$cls"
+}
+
+# DIVE-4557: stamp the isolation LABEL on both sources of truth at once.
+#
+# There are two, they are independent, and nothing reconciles them (DIVE-2218):
+# the registry, and `${ENV_DIR}/<name>.env`. agent_isolation_2src lets the ENV
+# FILE win a disagreement, because that is what the call sites act on — so
+# writing only the registry would leave every env-reading site still calling this
+# seat `admin` while `agent info` called it `beyond-admin`. Both, or neither.
+#
+# Best-effort on the env file: a seat can legitimately have no env file, and a
+# label that could not be stamped is WARNED, never silently dropped — the sudoers
+# write has already happened by then and the operator needs to know the label
+# lags the grant.
+_agent_stamp_isolation() {
+  local name="$1" label="$2"
+  # Two `local`s on purpose: within ONE `local`, later initialisers do not see
+  # the names declared beside them (SC2318), so a single line here would have
+  # expanded the CALLER's $name into the env path.
+  local ef="${ENV_DIR}/${name}.env"
+  registry_read \
+    | jq --arg n "$name" --arg i "$label" '.agents[$n].isolation = $i' \
+    | registry_write
+  if [[ -f "$ef" ]]; then
+    if grep -q '^AGENT_ISOLATION=' "$ef"; then
+      sed -i "s/^AGENT_ISOLATION=.*/AGENT_ISOLATION=${label}/" "$ef" \
+        || warn "could not rewrite AGENT_ISOLATION in ${ef} — the registry says ${label} and the env file does not; every env-reading call site will keep using the old tier until you fix it by hand"
+    else
+      printf 'AGENT_ISOLATION=%s\n' "$label" >> "$ef" \
+        || warn "could not append AGENT_ISOLATION to ${ef} — see above"
+    fi
+  else
+    warn "no env file at ${ef} — the registry label is ${label} and nothing else records it"
+  fi
+}
+
+# DIVE-4557: the write half of `agent grant <name> root`.
+#
+# Root-only to RUN (require_root, in the caller) and loud in the receipt, because
+# root is a capability an operator confers rather than a default a seat drifts
+# into. `main.sh` already routes this verb through the generic AUDIT_CMD path, so
+# the audit row — who ran it, when, with what arguments — is written for free and
+# is not re-implemented here.
+#
+# The label is stamped AFTER the sudoers write, never before: a stamped label
+# over a failed write is the DIVE-2079 defect (a seat that reads more privileged
+# than it is) manufactured by the tool that exists to prevent it. write_root_
+# sudoers visudo-validates and fails loudly without a partial install, so the
+# only reachable orderings are (no write, no stamp) and (write, stamp).
+_cmd_agent_grant_root() {
+  local name="$1" user="$2" iso="$3"
+  local plan state detail
+  plan=$(_agent_grant_root_plan "$user")
+  state="${plan%%|*}"; detail="${plan#*|}"
+  case "$state" in
+    refuse) fail "$E_USAGE" "$detail" ;;
+    current)
+      # The policy is ours and correct; the LABEL may still lag it (a seat
+      # granted root by an older build, or a registry restored from a backup).
+      if [[ "$iso" != "beyond-admin" ]]; then
+        _agent_stamp_isolation "$name" "beyond-admin"
+        ok "${name}: already enforces the managed root policy — isolation label corrected to beyond-admin (was ${iso})" \
+           '{agent:$a, capability:"root", changed:false, labelChanged:true, isolation:"beyond-admin", previousIsolation:$i}' \
+           --arg a "$name" --arg i "$iso"
+        return 0
+      fi
+      ok "${name}: already root (managed policy and beyond-admin label both in place)" \
+         '{agent:$a, capability:"root", changed:false, labelChanged:false, isolation:"beyond-admin"}' \
+         --arg a "$name"
+      return 0 ;;
+  esac
+  write_root_sudoers "$user"
+  _agent_stamp_isolation "$name" "beyond-admin"
+  if [[ "$state" == "adopt" ]]; then
+    warn "${name} ALREADY held unrestricted root through a hand-written drop-in — this did not widen the seat, it put an existing grant under management and made the label honest. ${detail}"
+  else
+    warn "${name} NOW HAS UNRESTRICTED ROOT on this box: any command, as any user, no password. That includes becoming \`claude\`, whose GitHub credential is the human operator's identity. This is wider than \`admin\`, which is the 5dive CLI as root and nothing else. If what this seat actually needed was host remediation, \`5dive host\` (units, journals, crontabs) already reaches it from inside the admin boundary with no sudoers change. THERE IS NO REVOKE VERB YET (DIVE-4557 ships the conferral only): narrowing this seat again means removing /etc/sudoers.d/${user} by hand and re-running \`agent create\`, or waiting for \`agent grant <name> admin\`."
+  fi
+  ok "${name}: $(if [[ "$state" == "adopt" ]]; then printf 'existing root policy brought under management'; else printf 'unrestricted root granted'; fi) — isolation label is now beyond-admin (was ${iso})" \
+     '{agent:$a, capability:"root", changed:true, labelChanged:true, isolation:"beyond-admin", previousIsolation:$i, adopted:($s=="adopt")}' \
+     --arg a "$name" --arg i "$iso" --arg s "$state"
+}
+
 cmd_agent_grant() {
   require_root "agent grant"
   local name="${1:-}" cap="${2:-}"
   [[ $# -eq 2 && -n "$name" && -n "$cap" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent grant <name> <merge|push|deploy>"
+    || fail "$E_USAGE" "usage: 5dive agent grant <name> <merge|push|deploy|root>"
   case "$cap" in
-    merge|push|deploy) ;;
-    *) fail "$E_USAGE" "unknown capability '${cap}' — one of: merge, push, deploy" ;;
+    merge|push|deploy|root) ;;
+    *) fail "$E_USAGE" "unknown capability '${cap}' — one of: merge, push, deploy, root" ;;
   esac
   local user="agent-${name}" reg iso
   reg=$(registry_read)
   jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null 2>&1 \
     || fail "$E_USAGE" "no agent named '${name}' in the registry"
   iso=$(jq -r --arg n "$name" '.agents[$n].isolation // "unknown"' <<<"$reg")
+  # DIVE-4557: `root` is a CONFERRAL, not a re-render, so it takes its own path
+  # and accepts any starting tier. Everything below this block is the DIVE-4183
+  # standard-template re-render and is unchanged.
+  if [[ "$cap" == "root" ]]; then
+    _cmd_agent_grant_root "$name" "$user" "$iso"
+    return $?
+  fi
   [[ "$iso" == "standard" ]] \
-    || fail "$E_USAGE" "agent '${name}' is labelled isolation='${iso}', not standard — \`agent grant\` re-renders the standard template only (an admin seat already reaches the whole CLI as root; a sandboxed seat holds no policy by design)"
+    || fail "$E_USAGE" "agent '${name}' is labelled isolation='${iso}', not standard — \`agent grant\` re-renders the standard template only (an admin seat already reaches the whole CLI as root; a sandboxed seat holds no policy by design). To give this seat the whole box instead: \`5dive agent grant ${name} root\`"
   local plan state push deploy detail
   plan=$(_agent_grant_plan "$user" "$cap")
   state="${plan%%|*}"; plan="${plan#*|}"

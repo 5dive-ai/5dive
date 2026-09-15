@@ -320,6 +320,15 @@ _HB_CONSOLIDATE_EVERY_MIN="${MEMORY_CONSOLIDATE_EVERY_MIN:-360}"
 # A distiller call measured ~35s; 300s is generous headroom without letting a
 # wedged model call sit on the tick.
 _HB_CONSOLIDATE_TIMEOUT_S="${MEMORY_CONSOLIDATE_TIMEOUT_S:-300}"
+# DIVE-4562 — how many CONSECUTIVE API-error refusals before the seat is called
+# not-transacting out loud (and by `5dive doctor`). 4 at the 6h cadence is one
+# full day: long enough that a single expired token refreshed by the next sweep
+# never raises it, short enough that nobody loses sixteen days of consolidation
+# the way five teal-fox seats did. The counter is CONSECUTIVE, so one successful
+# pass clears it — a seat that is transacting can never accumulate toward the
+# threshold no matter how long it runs.
+_HB_CONSOLIDATE_NOTX_AFTER="${MEMORY_CONSOLIDATE_NOTX_AFTER:-4}"
+[[ "$_HB_CONSOLIDATE_NOTX_AFTER" =~ ^[0-9]+$ ]] || _HB_CONSOLIDATE_NOTX_AFTER=4
 [[ "$_HB_SLEEP_AFTER_MIN" =~ ^[0-9]+$ ]] || _HB_SLEEP_AFTER_MIN=15
 
 # Per-agent idle-before-sleep threshold (minutes); falls back to the global default.
@@ -2010,10 +2019,19 @@ _hb_pick_tasks() {
 # one id, and because it keeps DIVE-979's ordering rules stated in ONE query.
 _hb_pick_task() { _hb_pick_tasks "$1" 1; }
 
-# DIVE-1065: privilege ordering for the auto-wake tier guard. admin > standard >
-# sandboxed; 0 for unknown/human — an unknown creator never blocks a wake.
+# DIVE-1065: privilege ordering for the auto-wake tier guard. beyond-admin >
+# admin > standard > sandboxed; 0 for unknown/human — an unknown creator never
+# blocks a wake.
+#
+# DIVE-4557 added the `beyond-admin` arm, and it is not cosmetic. The fallback is
+# 0, the bucket that NEVER blocks a wake — so the moment `agent grant <n> root`
+# started stamping a fourth label, the most privileged seat on the box would have
+# ranked below a sandboxed one and the guard would have read as passing. A new
+# tier that is not added here fails OPEN, silently, which is why the label set is
+# named in exactly one place and this is it.
 _hb_tier_rank() {
   case "$1" in
+    beyond-admin) echo 4 ;;
     admin)     echo 3 ;;
     standard)  echo 2 ;;
     sandboxed) echo 1 ;;
@@ -6596,6 +6614,18 @@ _hb_capability_reverify_sweep() {
   return 0
 }
 
+# DIVE-4562 iteration 2 — resolve a seat's unix user, or fail if it has none.
+# Its OWN function because two places need the same answer: the sweep's loop
+# (which seats does it visit?) and the reap below (which counters can never be
+# cleared again?). Two copies of this rule that drift apart re-create the wedge
+# the reap exists to close, so there is exactly one.
+_hb_consolidate_seat_user() {
+  local _n="$1"
+  if id -u "agent-${_n}" >/dev/null 2>&1; then printf 'agent-%s' "$_n"; return 0; fi
+  if id -u "$_n"         >/dev/null 2>&1; then printf '%s' "$_n";       return 0; fi
+  return 1
+}
+
 # DIVE-3628 — THE SCHEDULER for `5dive memory consolidate`. A verb nobody runs is
 # not an async pipeline: the acceptance is "a fresh box user's agent loses a
 # session and a later session knows what it learned, with NO manual step", and
@@ -6639,6 +6669,13 @@ _hb_memory_consolidate_sweep() {
   # i.e. still being loaded with their TAIL dropped. OVER is the one that matters:
   # it is the 24-hours-later number DIVE-4222's saving evaporated against.
   _HB_CONS_ROUTED=0; _HB_CONS_OVER=0
+  # DIVE-4562 — the not-transacting counters. UNAUTH is the seats whose distiller
+  # answered with an API-error refusal THIS pass; NOTX is the subset that has now
+  # done so for _HB_CONSOLIDATE_NOTX_AFTER consecutive passes, i.e. the ones a
+  # human has to clear. They are separate because the first is noise on any given
+  # tick (a token rotating, a limit resetting at the top of the hour) and the
+  # second is the standing condition that went unseen for sixteen days.
+  _HB_CONS_UNAUTH=0; _HB_CONS_NOTX=0
   [[ "${MEMORY_CONSOLIDATE:-on}" == "off" ]] && return 0
   local every="${MEMORY_CONSOLIDATE_EVERY_MIN:-${_HB_CONSOLIDATE_EVERY_MIN}}"
   [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) || every="$_HB_CONSOLIDATE_EVERY_MIN"
@@ -6646,11 +6683,35 @@ _hb_memory_consolidate_sweep() {
   mkdir -p "$stampdir" 2>/dev/null || return 0
   local reg name user stamp last
   reg=$(registry_read) || return 0
+  # DIVE-4562 iteration 2 (quinn) — REAP the counters of seats this sweep will
+  # never visit again. The counter is deleted by the pass that gets through, so
+  # a seat removed WHILE it was refusing leaves a file nothing can ever clear,
+  # and doctor's new check would then name a seat nobody can restore, forever.
+  # That is the cry-wolf alarm alternative (c) was rejected for, reached through
+  # a different door — and it is likeliest exactly when the incident is a
+  # fleet-wide auth lapse (five seats refusing at once; remove any one of them).
+  # `agent rm` now deletes both files itself; this reap is what heals a box
+  # where the seat went away some other way, or under a pre-4562 binary.
+  #
+  # The seat list is derived ONCE, and the reap runs only if that derivation
+  # SUCCEEDED. A registry that cannot be read has already returned above, and one
+  # that reads but does not parse is UNKNOWN — not empty. Reaping on unknown
+  # would delete the fleet's counters, i.e. erase the standing condition this row
+  # exists to make visible, on a transient read error.
+  local _known_seats _rf _rn
+  if _known_seats=$(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); then
+    for _rf in "$stampdir"/*.notx; do
+      [[ -e "$_rf" ]] || continue
+      _rn=$(basename "$_rf" .notx)
+      grep -qxF -- "$_rn" <<<"$_known_seats" \
+        && _hb_consolidate_seat_user "$_rn" >/dev/null && continue
+      rm -f "$_rf" "$stampdir/${_rn}.stamp" 2>/dev/null || true
+      _hb_log "[memory-consolidate] reaped a stale not-transacting counter for '${_rn}' (no such seat on this box any more) — it could never have been cleared by a passing run."
+    done
+  fi
   for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
     # Resolve the seat's unix user the same way the memory store does.
-    user="agent-$name"
-    id -u "$user" >/dev/null 2>&1 || user="$name"
-    id -u "$user" >/dev/null 2>&1 || continue
+    user=$(_hb_consolidate_seat_user "$name") || continue
     stamp="$stampdir/${name}.stamp"
     last=$(cat "$stamp" 2>/dev/null) || last=0
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
@@ -6713,6 +6774,34 @@ _hb_memory_consolidate_sweep() {
     [[ "$n_routed" == "true" ]] && _HB_CONS_ROUTED=$((_HB_CONS_ROUTED + 1)) || :
     [[ "$n_over"   == "true" ]] && _HB_CONS_OVER=$((_HB_CONS_OVER + 1)) || :
     _HB_CONS_ATOMS=$((_HB_CONS_ATOMS + n_atoms))
+    # DIVE-4562 — READ THE RESULT OF THE TURN, not just the fact that a turn
+    # happened. The verb now says whether its distiller REFUSED (not logged in,
+    # spend/usage/session limit) rather than merely failed, and that is the one
+    # outcome where the next pass is guaranteed to fail the same way. An absent
+    # field (a seat still on a pre-4562 binary) is 0, never an alarm.
+    local n_unauth
+    n_unauth=$(jq -s -r "$jf pick(\"distiller_unauthed\")" <<<"$out" 2>/dev/null) || n_unauth=""
+    [[ "$n_unauth" =~ ^[0-9]+$ ]] || n_unauth=0
+    # The consecutive counter lives next to the cadence stamp, for the same
+    # reason the stamp does: it has to survive the tick that wrote it. Reset on
+    # ANY pass that was not a refusal — including a plain distiller failure, which
+    # proves the seat reached the model and got an answer back.
+    local notxf="$stampdir/${name}.notx" notx=0
+    if (( n_unauth > 0 )); then
+      notx=$(cat "$notxf" 2>/dev/null) || notx=0
+      [[ "$notx" =~ ^[0-9]+$ ]] || notx=0
+      notx=$((notx + 1))
+      printf '%s\n' "$notx" > "$notxf" 2>/dev/null || true
+      _HB_CONS_UNAUTH=$((_HB_CONS_UNAUTH + 1))
+      if (( notx >= _HB_CONSOLIDATE_NOTX_AFTER )); then
+        _HB_CONS_NOTX=$((_HB_CONS_NOTX + 1))
+        # Named, per seat, every pass it stays broken. The fleet summary line
+        # below is a count; a count nobody can act on is what this row is about.
+        _hb_log "[memory-consolidate] SEAT NOT TRANSACTING: ${name} — ${notx} consecutive passes refused by the API (not logged in / spend or usage limit). Its memory has not consolidated since the streak began. Retrying will not clear this: restore the seat's auth or raise the limit (5dive doctor --category=memory)."
+      fi
+    else
+      rm -f "$notxf" 2>/dev/null || true
+    fi
     if (( n_dfail > 0 )); then
       _HB_CONS_DFAIL=$((_HB_CONS_DFAIL + 1))
     elif (( n_proc > 0 )); then
@@ -6842,7 +6931,7 @@ cmd_heartbeat_tick() {
   # DIVE-4284: ROUTED/OVER join the guard so an index event alone still logs —
   # a seat with nothing to distil can still be the seat whose index is truncated.
   (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} || ${_HB_CONS_DFAIL:-0} || ${_HB_CONS_IDLE:-0} || ${_HB_CONS_ROUTED:-0} || ${_HB_CONS_OVER:-0} )) \
-    && _hb_log "[memory-consolidate] ${_HB_CONS_ATOMS:-0} atom(s) from ${_HB_CONS_RAN:-0} seat(s), ${_HB_CONS_DFAIL:-0} distiller-failed, ${_HB_CONS_FAILED:-0} could not run, ${_HB_CONS_IDLE:-0} nothing to distil, ${_HB_CONS_SKIPPED:-0} not due; index: ${_HB_CONS_ROUTED:-0} re-routed under limit, ${_HB_CONS_OVER:-0} STILL OVER" || true
+    && _hb_log "[memory-consolidate] ${_HB_CONS_ATOMS:-0} atom(s) from ${_HB_CONS_RAN:-0} seat(s), ${_HB_CONS_DFAIL:-0} distiller-failed (${_HB_CONS_UNAUTH:-0} API-refused, ${_HB_CONS_NOTX:-0} NOT TRANSACTING), ${_HB_CONS_FAILED:-0} could not run, ${_HB_CONS_IDLE:-0} nothing to distil, ${_HB_CONS_SKIPPED:-0} not due; index: ${_HB_CONS_ROUTED:-0} re-routed under limit, ${_HB_CONS_OVER:-0} STILL OVER" || true
   # DIVE-3343: there is NO per-TASK budget sweep here any more, and its absence
   # is deliberate — see the block above _hb_loop_ceiling_sweep's neighbours in
   # this file for why the figure it enforced could not be attributed to a row.
