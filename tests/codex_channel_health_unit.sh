@@ -26,7 +26,15 @@ set -uo pipefail
 # shellcheck source=/dev/null
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
+# DIVE-4440: the tempdir cleanup for section 4b is FOLDED IN HERE rather than
+# registered as its own `trap ... EXIT` further down. bash keeps only the LAST trap
+# per signal, so the second registration this replaces had silently unarmed this
+# line since DIVE-3964 landed: at c7462480 this harness printed ZERO HARNESS-RC
+# lines on a PASSING run while every neighbour printed one, and the corpus contract
+# that is supposed to guarantee it stayed green throughout (it matched this line and
+# never looked further down the file). ${_h4b:-} because the trap is armed ~165
+# lines before the variable exists, and an early exit must still print the marker.
+trap 'rc=$?; [[ -n "${_h4b:-}" ]] && rm -rf "$_h4b"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 SRC=src
 
@@ -193,7 +201,7 @@ t  "4.11 a newline cannot add a line"            "1" "$(wc -l <<<"$v")"
 # CALLER's variable under dynamic scoping and was right only by accident. These
 # arms call the real reader from a scope where no outer `name` exists, which is
 # the condition the whole-file stub can never reproduce.
-_h4b=$(mktemp -d); trap 'rm -rf "$_h4b"' EXIT
+_h4b=$(mktemp -d)   # DIVE-4440: cleanup folded into the HARNESS-RC trap at the head.
 mkdir -p "$_h4b/home/agent-zed/$(dirname "$CODEX_HEALTH_REL")"
 printf '{"bound":true}' > "$_h4b/home/agent-zed/$CODEX_HEALTH_REL"
 # Read through a `cat` shim so the arm needs no real /home seat and no sudo.
