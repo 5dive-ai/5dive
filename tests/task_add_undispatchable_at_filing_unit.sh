@@ -122,6 +122,64 @@ if has "$t2_out" "manager of filer: boss"; then
 else bad_t "T2c created line does not name the route" "$t2_out"; fi
 
 # ---------------------------------------------------------------------------
+# T7 — THE MATERIALIZED EXEMPTION (ops review finding on the delivery).
+#
+# `--materialized` does NOT change $kind (it stays `standard` unless --recurring),
+# so the T1 refusal reached every internal writer that files an anchor row. Three
+# in tree do it with no resolvable assignee — cmd_objective's re-plan anchor,
+# cmd_goal's anchor when $planner is empty, and cmd_proof (--from=proof, a name
+# that is not in agents_org, so the manager route misses too). On the T1 chart
+# that is `objective` and `goal` losing their anchor and `proof publish`
+# refusing, i.e. this row's fix breaking three unrelated verbs on exactly the
+# board it ships for.
+#
+# Both sibling filing guards in the same function already carry `-z
+# "$materialized"` for the reason written above each of them: a refusal mid-batch
+# leaves a HALF-MATERIALIZED plan, some children filed and some not, with a loop
+# driver already waiting on a short child list.
+#
+# Deliberately NOT exempted: the route and the heartbeat-off warning. A warning
+# cannot abort a batch, and an anchor owned by the filer's manager beats an
+# unowned one — graded by T8 below, so "exempt" cannot quietly become "skip the
+# whole block".
+chart_reset
+db "INSERT INTO agents_org (name,role) VALUES ('boss','AI CEO'),('sleeper','QA / testing');"
+run_add t7 --materialized -- 'an internal writers anchor row'
+t7_rc=$?
+t7_err=$(<"$TMP/t7.err")
+t7_n=$(db "SELECT COUNT(*) FROM tasks WHERE title='an internal writers anchor row';")
+if (( t7_rc == 0 )) && [[ "$t7_n" == "1" ]]; then
+  ok_t "T7a a --materialized anchor is filed, not refused, on an unroutable chart"
+else bad_t "T7a a --materialized anchor was refused (aborts a whole materialization)" "rc=$t7_rc n=$t7_n err=$t7_err"; fi
+if ! has "$t7_err" "NO OWNER"; then
+  ok_t "T7b and the refusal text is not printed on that path either"
+else bad_t "T7b the refusal fired on the materialized path" "$t7_err"; fi
+
+# CONTROL for T7. The SAME fixture without --materialized must still refuse, or
+# T7 is graded against a guard that no longer fires for anyone.
+run_add t7c -- 'the same row without the materialized flag'
+t7c_rc=$?
+t7c_n=$(db "SELECT COUNT(*) FROM tasks WHERE title='the same row without the materialized flag';")
+if (( t7c_rc != 0 )) && [[ "$t7c_n" == "0" ]]; then
+  ok_t "T7c CONTROL: the same add WITHOUT --materialized is still refused"
+else bad_t "T7c the exemption disabled the guard for everyone" "rc=$t7c_rc n=$t7c_n"; fi
+
+# ---------------------------------------------------------------------------
+# T8 — the exemption is scoped to the `fail`, not to the block. On a chart where
+# the filer HAS a manager (the T2 shape), a materialized anchor must still ROUTE
+# and still be announced: an owned anchor is strictly better than an unowned one,
+# and nothing about routing can abort a batch.
+chart_reset
+db "INSERT INTO agents_org (name,role) VALUES ('boss','AI CEO'),('sleeper','QA / testing');
+    INSERT INTO agents_org (name,reports_to) VALUES ('filer','boss');"
+run_add t8 --materialized -- 'a materialized anchor with a manager to route to'
+t8_rc=$?
+t8_asg=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE title='a materialized anchor with a manager to route to';")
+if (( t8_rc == 0 )) && [[ "$t8_asg" == "boss" ]]; then
+  ok_t "T8 a materialized anchor still ROUTES to the manager (exemption covers the fail only)"
+else bad_t "T8 materialized anchor was not routed" "rc=$t8_rc assignee='$t8_asg'"; fi
+
+# ---------------------------------------------------------------------------
 # T3 — DEGRADE ARM. An EMPTY chart is a fresh box or a fixture, not a broken
 # fleet: still accepted, unassigned, no refusal. A guard that cannot distinguish
 # the two would refuse every add on a box that has not been set up yet.

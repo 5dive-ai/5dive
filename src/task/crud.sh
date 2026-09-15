@@ -409,7 +409,31 @@ cmd_task_add() {
         assignee="$_mgr"; auto_coordinated=1; coord_routed="manager of ${_filer}"
         warn "no project lead and no org coordinator resolves on this board, so ${_filer}'s manager '${_mgr}' owns this row. Nothing wakes an unassigned row, so leaving it unowned would have made it undispatchable from the moment it was created. Tag a coordinator so the next one routes on its own: 5dive org set <agent> --role='<existing role text> coordinator'   (board-wide view: 5dive task doctor)"
         _task_lane_asleep_note "$assignee" "the row's default owner"
-      elif (( _org_n > 0 )) && [[ "${FIVE_ALLOW_UNOWNED:-0}" != "1" ]]; then
+      elif (( _org_n > 0 )) && [[ -z "$materialized" ]]; then
+        # `-z "$materialized"` matches the two sibling filing guards in this same
+        # function (the filing cap at ~514 and the WIP cap at ~569), and for the
+        # reason each of them already writes down: a refusal mid-batch aborts a
+        # whole materialization and leaves a HALF-MATERIALIZED plan — some
+        # children exist, some do not, and a loop driver is already waiting on a
+        # child list that is short. Note `--materialized` does not change $kind
+        # (it is `standard` unless --recurring), so the `kind` test above does
+        # NOT cover this and every internal writer reached the fail.
+        #
+        # Three in-tree callers file a --materialized standard row with no
+        # resolvable assignee: cmd_objective.sh (re-plan anchor, no --assignee,
+        # `|| return $?`), cmd_goal.sh (goal anchor; `${planner:+--assignee=…}`
+        # is CONDITIONAL) and cmd_proof.sh (--from=proof, which is not a row in
+        # agents_org, so the manager route cannot save it either). On the exact
+        # board this row ships for — several org roots, none tagged, filer is
+        # itself a root so reports_to is NULL — that is `5dive objective` and
+        # `5dive goal` losing their anchor and `proof publish` refusing to
+        # publish. This host could not surface it: its chart has ONE root, so the
+        # lone-root coordinator tier resolves and the refusal is unreachable here.
+        #
+        # The ROUTE and the heartbeat-off WARNING above stay on the materialized
+        # path deliberately. A warning cannot abort a batch, and routing an anchor
+        # to the filer's manager is strictly better than leaving it unowned. It is
+        # only the `fail` that must not fire here.
         fail "$E_VALIDATION" "this row would be created with NO OWNER, and nothing wakes an unassigned row — the heartbeat tick only iterates assignees, so it would sit on the board forever reading as backlog. No project lead on '${project}', no agent tagged coordinator, no lone org root, and '${_filer:-the filer}' has no manager to route to. Fix it once, for every future row: 5dive org set <agent> --role='<existing role text> coordinator'   (or name an owner on this one: --assignee=<agent>; roster: 5dive agent list; board-wide view: 5dive task doctor)"
       fi
     fi
