@@ -134,6 +134,28 @@ cmd_org_set() {
   if (( mgr_set )); then (( mgr_clear )) && _aud_mgr="(cleared)" || _aud_mgr="$mgr_name"; fi
   audit_log "org set" ok 0 -- "agent=$name" "reports_to=$_aud_mgr" "by_claimed=${SUDO_USER:-root}"
 
+  # DIVE-4555 — THE CHART IS BUILT HERE, so this is where "and it still routes
+  # nowhere" has to be said. There is no onboarding wizard that writes
+  # `agents_org` (checked: neither `5dive init` nor `5dive company` touches the
+  # table — `org set` is its only writer), so the state the filing refusal now
+  # catches is reachable only through this verb, and reaching it silently is what
+  # let teal-fox grow NINE org roots with none of them tagged. With more than one
+  # root every tier of `_task_resolve_coordinator` misses, so every unassigned row
+  # filed on that board landed nowhere and said nothing.
+  #
+  # A WARNING, NOT A REFUSAL, and the asymmetry is deliberate: a chart is built
+  # one edge at a time and is legitimately incomplete in between, so refusing an
+  # edit would fight the operator mid-build. `task add` refuses at the moment work
+  # is actually accepted; this line is the same fact said one step earlier, to the
+  # person who can fix it for good.
+  if declare -F _task_resolve_coordinator >/dev/null 2>&1; then
+    local _coord=""; _coord=$(_task_resolve_coordinator 2>/dev/null) || _coord=""
+    if [[ -z "$_coord" ]]; then
+      local _roots; _roots=$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);")
+      warn "this chart still resolves NO coordinator (${_roots} top-level agent(s), none tagged) — an unassigned row has no default owner, and nothing wakes a row with no owner. 'task add' with no --assignee now refuses on this board rather than accepting work nothing will dispatch. Tag one: 5dive org set <agent> --role='<existing role text> coordinator'   (the marker lives inside the role prose, so it costs the chart no display text)"
+    fi
+  fi
+
   if (( JSON_MODE )); then
     local row; row=$(dbfmt -json "SELECT name, reports_to, role, title FROM agents_org WHERE name=$(sqlq "$name");")
     jq -cn --argjson r "$row" '{ok:true, data:($r[0])}'
