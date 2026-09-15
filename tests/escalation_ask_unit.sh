@@ -104,7 +104,7 @@ declare -F _task_escalation_ask >/dev/null 2>&1 \
   && ok_t "PRECONDITION: the product's ask composer is reachable in this harness" \
   || bad_t "PRECONDITION: _task_escalation_ask not sourced" "the call site is graded by nothing"
 eq_t "PRECONDITION: the two options the call site passes are the two buttons" \
-     "$_ESCALATION_OPTIONS" "keep going — the lead takes it over|drop it"
+     "$_ESCALATION_OPTIONS" "keep going — send it back for another pass|drop it — stop the work, keep the findings"
 has_t "PRECONDITION: the recommendation is one of them, or task need refuses the pair" \
       "$_ESCALATION_OPTIONS" "$_ESCALATION_RECOMMEND"
 
@@ -119,9 +119,9 @@ no_t  "A4: ... and no longer says 'a piece of work'" "$ESC_ASK" "A piece of work
 has_t "A5: the ask offers the two outcomes as a question" "$ESC_ASK" "Keep going, or drop it?"
 no_t  "A6: it does not tell him to tap Done — that button belongs to type=manual" "$ESC_ASK" "Tap"
 eq_t  "A7: the two buttons are on the row, so the taps ARE the outcomes" \
-      "$(field ESC-A need_options)" "keep going — the lead takes it over|drop it"
+      "$(field ESC-A need_options)" "keep going — send it back for another pass|drop it — stop the work, keep the findings"
 eq_t  "A8: ... with the lead's default recommended" \
-      "$(field ESC-A recommend)" "keep going — the lead takes it over"
+      "$(field ESC-A recommend)" "keep going — send it back for another pass"
 eq_t  "A9: a decision gate is tier 1 by type — the human is the FALLBACK, not the destination" \
       "$(field ESC-A tier)" "1"
 

@@ -1876,6 +1876,42 @@ _gate_ask_codehost_rule() {   # <ask> -> 0 when a per-change tap is asked for BE
   return 0
 }
 
+# ── DIVE-4537 — ARM 3: A MERGE ON A REPOSITORY WE OWN IS A CAPABILITY GATE ───
+#
+# lodar, 2026-09-14 13:43Z: "why i still get false human gates? i thought we
+# fixed this". Two reached his phone that morning; this is the second of them.
+# DIVE-4514 (quinn, 10:39:56Z) was a `manual` gate — tier 2 BY TYPE, so it skips
+# the lead-first rail entirely — asking him to "Press Merge (plain merge, never
+# Squash)" on two pull requests in an org WE OWN. quinn's token cannot merge.
+# main's can, and did: 5dive-chat#11 landed at 13:43Z as a two-parent merge
+# commit, five minutes after he forwarded it.
+#
+# So the ask was answerable, but not by him and not only by him — the capability
+# it consumes is a WRITE TOKEN ON OUR OWN REPO, which several seats hold. That is
+# the definition of a capability gate, and DIVE-4365's own rule for one is to
+# hand the ROW to a holder (`task assign`), not to file a question. The rule was
+# already written; `manual` was the type it did not cover, because `manual` is
+# floored at tier 2 by type and never meets the lead-first routing that would
+# have caught this.
+#
+# NARROW ON PURPOSE, three conjuncts, and each one is load-bearing:
+#   * the ask names a github.com URL under an org we own (5dive-ai, lodar). A
+#     third-party repo is genuinely someone else's button and is NOT caught.
+#   * the ask asks for a repo WRITE (merge/squash/land/push/revert). "Is the
+#     approach in <our PR> right?" is a judgement and stays fileable.
+#   * the filer is an AGENT seat. A person filing this for another person is not
+#     the population, and reading the caller keeps it that way.
+# The `--ask-ok` escape is the fourth exit, for the real case where every holder
+# is genuinely out of tokens.
+_GATE_ASK_OURREPO_RX='github\.com/(5dive-ai|lodar)/'
+_GATE_ASK_REPO_WRITE_RX='\b(merge|merges|merged|merging|squash|land|landed|push|pushed|revert)\b'
+_gate_ask_our_repo_write() {   # <ask> -> 0 when it asks for a write on a repo we own
+  local s="${1:-}"
+  LC_ALL=C grep -Eiq "$_GATE_ASK_OURREPO_RX" <<<"$s" || return 1
+  LC_ALL=C grep -Eiq "$_GATE_ASK_REPO_WRITE_RX" <<<"$s" || return 1
+  return 0
+}
+
 # Word count on whitespace. Deliberately the same unit the human experiences —
 # words on a phone screen — not characters or bytes.
 _gate_ask_word_count() {
@@ -3699,6 +3735,33 @@ NO EXIT HERE CHANGES THE DESTINATION: --tier=1 would send this somewhere else, a
       _task_store_audit_log "task need ask-options" "escaped" 0 -- \
         "task=$ident" "filer=${actor:-}" "type=$type" "options=${options}" "declared=$ask_ok" || true
       warn "bare-option escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". Every option on this gate is a single character, and the human is still being sent it."
+    fi
+
+    # DIVE-4537 — THE CAPABILITY REFUSAL, ahead of the answerability arms because
+    # it is a stronger statement about the same gate: this ask is not merely hard
+    # for the reader, it is addressed to the wrong KIND of holder. Scoped to
+    # `manual` (the type that skips the lead-first rail by being tier-2 by type)
+    # filed by an AGENT seat, which is the population DIVE-4365 left uncovered.
+    if [[ "$type" == "manual" ]] && _gate_ask_our_repo_write "$ask"; then
+      local _cap_actor _cap_kind
+      _cap_actor=$(_gate_withdraw_actor)      # "agent <name>" | "human" | "none"
+      _cap_kind="${_cap_actor%% *}"
+      if [[ "$_cap_kind" == "agent" ]]; then
+        if [[ -z "$ask_ok" ]]; then
+          _task_store_audit_log "task need ask-capability" "refused" 0 -- \
+            "task=$ident" "filer=${actor:-}" "type=$type" "why=repo-write-on-our-own-repo" || true
+          fail "$E_VALIDATION" "$ident: refusing this gate because it asks a person to make a change in one of OUR OWN code repositories — that is a permission some of our own seats already hold, so it is a job to hand over, not a question to ask.
+The person tapping decides nothing here: whoever holds the write access does the same thing whichever way they answer, and the only thing the tap buys is the delay until they read it. Measured 2026-09-14: one of these sat on the paired human's phone for three hours and was then done by another seat in five minutes.
+  hand the row over          '5dive task assign ${ident} main' (or another seat that holds the access) — this is the exit that is wanted.
+  ask for the access         if nobody here holds it, the missing credential is its own gate: --type=secret, which IS a human capability.
+  --ask-ok=\"<why no seat here can do this>\"    the audited exception, for the real case where every holder is out of tokens. Recorded on the gate and countable afterwards."
+        fi
+        [[ ${#ask_ok} -ge 12 ]] \
+          || fail "$E_VALIDATION" "--ask-ok must state WHY no seat here can make this repository change (it is recorded on the gate and read by whoever counts these exceptions later)"
+        _task_store_audit_log "task need ask-capability" "escaped" 0 -- \
+          "task=$ident" "filer=${actor:-}" "type=$type" "why=repo-write-on-our-own-repo" "declared=$ask_ok" || true
+        warn "capability escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". This ask wants a change in a repository we own, and the human is still being sent it."
+      fi
     fi
 
     # DIVE-4346 — THE ANSWERABILITY REFUSALS. Placed inside `_ar_human` for the

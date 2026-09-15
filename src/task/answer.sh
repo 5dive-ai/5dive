@@ -100,6 +100,59 @@ _loop_answer_is_bounce() {
   return 1
 }
 
+# ── DIVE-4537 — THE ITERATION-CAP ANSWER IS THE LOOP'S RESUME VERB ───────────
+#
+# The two-strike escalation (`task reject` at max_iterations, src/task/delivery.sh)
+# is not an inbox item: it is the ONLY artifact that can restart the loop it
+# stopped. Answering it used to clear the question and change nothing else — the
+# row kept `iteration == max_iterations`, kept no maker, and the reclaimer handed
+# it back to the verifier, the one seat forbidden to build it. Executing the
+# disposition by hand is three verbs in a forced order (`task verifier
+# --max-iters=<n+1>`, then `need --withdraw`, then `task reject`) and the lead who
+# answers holds none of them, so on DIVE-4520 the decision "keep going" sat
+# written on the row from 12:25Z to 13:48Z. Measured and written up in
+# community/wiki/a-withdrawn-iteration-cap-gate-leaves-the-loop-with-no-owner-and-no-resume-verb.md.
+#
+# So the answer performs the resume. Which way it resumes is read from the
+# DECISION SEGMENT — the first non-blank line up to its first dash/colon/comma/
+# stop — for the same reason _loop_answer_is_bounce reads it there: the reasoning
+# that follows is where the false positives live ("keep going" appears in the
+# prose of a drop as often as in a keep).
+#
+# DROP WINS A TIE. An answer whose opening segment carries both vocabularies is
+# ambiguous, and of the two mistakes, resuming work a lead meant to stop spends a
+# maker's whole pass, while stopping work a lead meant to continue is visible on
+# the board the same hour and costs one `task reject` to undo.
+_ESC_RESUME_STEMS='keep|keeps|continue|continues|carry|resume|resumes|another|again|proceed|go'
+_ESC_DROP_STEMS='drop|drops|dropped|cancel|cancels|abandon|abandons|stop|stops|kill|scrap|shelve|bin'
+_task_escalation_answer_verb() {   # <answer value> -> "resume" | "drop" | ""
+  local _v="${1:-}" _first="" _seg=""
+  _first=$(printf '%s' "$_v" | grep -m1 -v '^[[:space:]]*$' || true)
+  _first="${_first#"${_first%%[![:space:]]*}"}"
+  _seg="${_first%%[—:;,.]*}"
+  _seg=$(printf '%s' "$_seg" | tr '[:upper:]' '[:lower:]')
+  if grep -qE "\b(${_ESC_DROP_STEMS})\b" <<<"$_seg"; then printf 'drop'; return 0; fi
+  if grep -qE "\b(${_ESC_RESUME_STEMS})\b" <<<"$_seg"; then printf 'resume'; return 0; fi
+  printf ''
+}
+
+# Is THIS row's open gate the one the iteration cap filed? Structural, and both
+# conjuncts are needed. The shared stuck-loop predicate alone would make every
+# decision gate on a capped row a resume token — a filer legitimately asking
+# "which of these two approaches" on a stalled loop must not bounce the row by
+# being answered. The options string alone would fire on a row that is not at its
+# cap, where there is nothing to resume.
+_task_escalation_gate_open() {   # <row id> -> 0 when the open gate is the cap escalation
+  local _eg_id="${1:-}" _eg
+  [[ "$_eg_id" =~ ^[0-9]+$ ]] || return 1
+  declare -F _task_stuck_loop_pred >/dev/null 2>&1 || return 1
+  _eg=$(db "SELECT CASE WHEN $(_task_stuck_loop_pred)
+                     AND COALESCE(maker_agent,'') <> ''
+                     AND COALESCE(need_options,'') = $(sqlq "${_ESCALATION_OPTIONS:-}")
+                   THEN 1 ELSE 0 END FROM tasks WHERE id=${_eg_id};" 2>/dev/null) || return 1
+  [[ "$_eg" == "1" ]]
+}
+
 # ── DIVE-3128: a button tap, attributed and recorded ─────────────────────────
 #
 # WHO the tapping Telegram uid IS. Resolution order, widest evidence first:
@@ -1564,6 +1617,80 @@ cmd_task_answer() {
         WHERE id=${id} AND status='blocked'
           AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
   fi
+
+  # DIVE-4537: the cap escalation was just answered — EXECUTE the disposition.
+  # Deliberately after the block above: that one recomputes `blocked` -> `todo`
+  # for the generic case, and both branches here overwrite the status it leaves.
+  local _esc_verb="" _esc_maker="" _esc_iter="" _esc_maxi="" _esc_pingmsg=""
+  if [[ "$nt" == "decision" && "$_lk" != gate:* ]] && _task_escalation_gate_open "$id"; then
+    _esc_verb=$(_task_escalation_answer_verb "$value")
+    _esc_maker=$(db "SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id};")
+    _esc_iter=$(db  "SELECT COALESCE(iteration,0)    FROM tasks WHERE id=${id};")
+    case "$_esc_verb" in
+      resume)
+        # THE CAP IS RAISED FIRST, and that ordering is not cosmetic: with
+        # iteration still == max_iterations the maker's next bounce would re-fire
+        # this very escalation on the pass meant to close the row — the gate you
+        # just retired, re-sent. `+1` and not `+2`: one more pass is what was
+        # decided, and the next stop is a decision worth taking again.
+        #
+        # `handoff_ack_at=NULL, handoff_rejected_at=now` is the reject rail's own
+        # bounce stamp (src/task/delivery.sh), copied so a resumed row is
+        # indistinguishable from an ordinary bounce to every reader downstream —
+        # the reclaimer, `task show`, and the "was there a reject since the last
+        # delivery" question DIVE-2624 added that column to answer. `result` is
+        # untouched: it holds the verifier's last FINDING/FIX, which is the entire
+        # instruction for the pass being authorised here.
+        db "UPDATE tasks SET
+              max_iterations=CASE WHEN COALESCE(max_iterations,0) <= COALESCE(iteration,0)
+                                  THEN COALESCE(iteration,0)+1 ELSE max_iterations END,
+              status='todo', assignee=$(sqlq "$_esc_maker"), started_at=NULL,
+              handoff_ack_at=NULL, handoff_rejected_at=datetime('now'), done_at=NULL
+            WHERE id=${id} AND status NOT IN ('done','cancelled');"
+        _esc_maxi=$(db "SELECT COALESCE(max_iterations,0) FROM tasks WHERE id=${id};")
+        _task_store_audit_log "task answer loop-resume" ok 0 -- \
+          "task=$ident" "verb=resume" "maker=${_esc_maker}" \
+          "iteration=${_esc_iter}" "max_iterations=${_esc_maxi}" "answered_by=${answered_by}" || true
+        # The ping follows the WORK, not the gate. `owner` was resolved before any
+        # write (gate_filed_by first), which on this gate is the verifier who
+        # rejected — pinging them to "resume the task" is the hand-back that left
+        # DIVE-4520 with no owner.
+        owner="$_esc_maker"
+        _esc_pingmsg="${ident} — the stop was lifted and it is back with you for another pass. The last review feedback is on the row (\`5dive task show ${ident}\`); fix it and \`5dive task deliver ${ident}\`."
+        ;;
+      drop)
+        # Through the shared close funnel, never a hand-rolled UPDATE: cancelling
+        # is a session close, a run close, a dependent cascade and a worktree
+        # reclaim as well as a status write, and a second copy of that list is a
+        # copy that stops matching. Subshell + suppressed output because the funnel
+        # prints its own receipt and this command owes exactly one. The row's
+        # `result` already carries the verifier's findings, so --result only fills
+        # a genuinely empty field.
+        local _esc_prev_result
+        _esc_prev_result=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+        local -a _esc_cancel=(cmd_task_cancel "$id")
+        [[ -n "$_esc_prev_result" ]] || _esc_cancel+=("--result=Dropped at the two-strike stop — ${answered_by} chose to stop the work rather than take another pass.")
+        if ( "${_esc_cancel[@]}" ) >/dev/null 2>&1; then
+          _task_store_audit_log "task answer loop-drop" ok 0 -- \
+            "task=$ident" "verb=drop" "iteration=${_esc_iter}" "answered_by=${answered_by}" || true
+        else
+          # The answer is already durable; say the second half did not land rather
+          # than fail a gate that is answered, or lie about the row's state.
+          warn "${ident}: the stop was answered 'drop it' but the cancel did not apply — the row is still open. Close it with '5dive task cancel ${ident} --result=\"…\"'."
+          _task_store_audit_log "task answer loop-drop" "failed" 0 -- \
+            "task=$ident" "verb=drop" "answered_by=${answered_by}" || true
+        fi
+        ;;
+      *)
+        # Neither vocabulary in the decision segment. Do NOT guess: the two
+        # outcomes are opposite and the answer is on the row for a person to read.
+        warn "${ident}: this is the stop a review loop hit at its iteration cap, and the answer does not open with either outcome, so the loop was NOT restarted or dropped. Answer again with 'keep going' or 'drop it' in the first words: '5dive task answer ${ident} --value=\"keep going\"'."
+        _task_store_audit_log "task answer loop-ambiguous" ok 0 -- \
+          "task=$ident" "answered_by=${answered_by}" || true
+        ;;
+    esac
+  fi
+
   local newstatus; newstatus=$(db "SELECT status FROM tasks WHERE id=${id};")
 
   # DIVE-552: a loop GATE step was just answered → advance the relay. Approve
@@ -1649,7 +1776,9 @@ cmd_task_answer() {
   # the signal); pinging the owner to resume a closed task is just confusing.
   if [[ -n "$owner" ]] && (( ! _close_done )); then
     local pingmsg
-    if [[ "$nt" == "secret" ]]; then
+    if [[ -n "${_esc_pingmsg:-}" ]]; then
+      pingmsg="$_esc_pingmsg"
+    elif [[ "$nt" == "secret" ]]; then
       pingmsg="${ident} secret gate marked provided — resume the task and load the key from where it was placed (its .env / your own channel), NOT from the task."
     else
       pingmsg="${ident} gate cleared — your '${nt}' ask was answered. Resume the task; run \`5dive task show ${ident}\` for the value."
