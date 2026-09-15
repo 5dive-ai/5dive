@@ -195,5 +195,61 @@ _r=$(cmd_box_config unknown=1 2>&1)
 printf '{"verify":"always"}\n' > "$BOX_CONFIG"
 [[ "$(FIVE_VERIFY_DEFAULT=0 box_verify_policy)" == "never" ]]   && ok_t "FIVE_VERIFY_DEFAULT=0 still wins over a box file saying 'always'"   || bad_t "FIVE_VERIFY_DEFAULT=0 wins over the box file" "got $(FIVE_VERIFY_DEFAULT=0 box_verify_policy)"
 
+echo "── DIVE-4559: the verify-small knob, and the key the setter writes ──────"
+# THE KNOB IS A SECOND QUESTION, not a fourth policy value, so it is graded
+# beside the 9-arm matrix rather than inside it: `verify` says WHICH rows get a
+# grader, `verify-small` says how big a delivery has to be to be worth one.
+rm -f "$BOX_CONFIG"
+[[ "$(box_verify_small)" == "off" ]] \
+  && ok_t "verify-small defaults to off with no box file (an upgraded box changes nothing)" \
+  || bad_t "small default" "got '$(box_verify_small)'"
+printf '{"verify":"always"}\n' > "$BOX_CONFIG"
+[[ "$(box_verify_small)" == "off" ]] \
+  && ok_t "verify-small defaults to off when the box file has every OTHER key" \
+  || bad_t "small default with file" "got '$(box_verify_small)'"
+
+# UNPARSEABLE READS AS OFF, in the direction that keeps grading. A hand-edited
+# box.json must never be able to make garbage mean "a very large threshold".
+for _bad in 0 -5 abc 12.5 " "; do
+  printf '{"verify_small":"%s"}\n' "$_bad" > "$BOX_CONFIG"
+  [[ "$(box_verify_small)" == "off" ]] \
+    && ok_t "verify-small: '$_bad' reads as off (garbage never widens the downgrade)" \
+    || bad_t "small garbage '$_bad'" "got '$(box_verify_small)'"
+done
+printf '{"verify_small":"30"}\n' > "$BOX_CONFIG"
+[[ "$(box_verify_small)" == "30" ]] \
+  && ok_t "verify-small: a positive threshold is read back verbatim" || bad_t "small read" "got '$(box_verify_small)'"
+
+# The SETTER. `verify-small=30` on the command line, `.verify_small` in the file.
+rm -f "$BOX_CONFIG"
+_r=$(cmd_box_config verify-small=bogus 2>&1)
+[[ "$_r" == *"positive number of changed lines"* ]] \
+  && ok_t "config: an out-of-range verify-small is refused and the shape is named" || bad_t "small validate" "got: ${_r:0:200}"
+cmd_box_config verify-small=25 >/dev/null 2>&1
+[[ "$(box_verify_small)" == "25" ]] \
+  && ok_t "config verify-small=25 round-trips through the file" || bad_t "small round-trip" "got '$(box_verify_small)'"
+
+# THE ARM THE SECOND KEY WAS ALWAYS GOING TO BREAK, and it is why it is here:
+# the setter's loop iterated over every key while writing `.verify = $v`
+# unconditionally. With one key that is invisible; with two, `verify-small=25`
+# stored "25" as the POLICY, which box_verify_policy then discards as invalid —
+# the setting vanishes and the command still reports success.
+[[ "$(box_verify_policy)" == "delivered-only" ]] \
+  && ok_t "config: setting verify-small did NOT overwrite the verification policy" \
+  || bad_t "key clobber" "policy reads '$(box_verify_policy)' after 'verify-small=25' — the setter wrote the wrong key"
+
+# Both keys, one file, neither erasing the other.
+cmd_box_config verify=always >/dev/null 2>&1
+[[ "$(box_verify_policy)" == "always" && "$(box_verify_small)" == "25" ]] \
+  && ok_t "config: the two keys coexist — setting one preserves the other" \
+  || bad_t "keys coexist" "verify=$(box_verify_policy) verify_small=$(box_verify_small)"
+cmd_box_config verify-small=off >/dev/null 2>&1
+[[ "$(box_verify_small)" == "off" && "$(box_verify_policy)" == "always" ]] \
+  && ok_t "config verify-small=off turns the downgrade back off without touching the policy" \
+  || bad_t "small off" "verify=$(box_verify_policy) verify_small=$(box_verify_small)"
+_r=$(cmd_box_config 2>&1)
+[[ "$_r" == *"verify-small = off"* ]] \
+  && ok_t "config with no args prints the size knob beside the policy" || bad_t "small shown" "got: ${_r:0:300}"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAILN"
 [[ "$FAILN" -eq 0 ]]

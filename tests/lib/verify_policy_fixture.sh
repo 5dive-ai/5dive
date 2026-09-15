@@ -25,3 +25,26 @@ fixture_box_verify_policy() { # <always|delivered-only|never>
   printf '{"verify":"%s"}\n' "$policy" > "$BOX_CONFIG" || return
   export BOX_CONFIG
 }
+
+# DIVE-4559: the SIZE knob, set beside the policy rather than instead of it.
+# Merges into whatever box.json the policy fixture already wrote (or starts one)
+# so a harness can ask for `always` + a threshold without the second call
+# silently dropping the first.
+fixture_box_verify_small() { # <lines|off>
+  local small="${1:-}" dir="${STATE_DIR:-}" cur='{}'
+
+  if [[ "$small" != "off" && ! "$small" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'verify-small fixture: invalid threshold %q\n' "$small" >&2; return 2
+  fi
+  case "$dir" in
+    ""|/|/var/lib/5dive)
+      printf 'verify-small fixture: REFUSED non-disposable STATE_DIR %q\n' "$dir" >&2
+      return 2 ;;
+  esac
+
+  mkdir -p "$dir" || return
+  BOX_CONFIG="${BOX_CONFIG:-$dir/box.json}"
+  [[ -r "$BOX_CONFIG" ]] && cur=$(cat "$BOX_CONFIG")
+  printf '%s\n' "$(jq --arg s "$small" '.verify_small = $s' <<<"$cur")" > "$BOX_CONFIG" || return
+  export BOX_CONFIG
+}

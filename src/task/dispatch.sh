@@ -36,6 +36,12 @@ _task_usage() {
                                to none (both book a session; the box just said not to spend one) and
                                says so on the created line. 'check' is exempt — a command spends no
                                session. Bare --verify is the one way to buy a row back.
+                               A box running '5dive config verify-small=<lines>' also DOWNGRADES at
+                               delivery: a PR under that many changed lines, touching nothing in the
+                               blast radius (scheduler, task store, credentials, deploy, shared libs,
+                               sudo policy, systemd, schema, provisioning), closes without booking a
+                               grader session and says so. --verify beats it; --no-verify never beats
+                               the opposite, delivery-time UPGRADE (DIVE-2730).
       [--customer] [--already-blocked=<what it blocked>]   escapes for the internal-filing cap
   ls [--status=] [--assignee=] [--mine] [--all] [--recurring]   open rows, priority-ordered
   ls --gated[=human|agent]                      only rows holding a live gate. The 'gate' column is
