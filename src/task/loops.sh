@@ -862,10 +862,25 @@ cmd_task_verify() {
           # seat itself, because it is the half that knows the repo; this is the
           # net for the one disposition the probe cannot produce — its own
           # failure, above — and for any tree that called the pure decider directly.
-          [[ "$_md_owner" == "merger" ]] \
-            && _md_owner=$(_merge_hold_seat '' 2>/dev/null || printf 'main')
+          # DIVE-4571: and it can resolve to NOBODY — `ops` and the `main`
+          # fallback are both names that exist on one box. The old `|| printf
+          # 'main'` (and the `${_md_owner:-main}` below it) stamped that name
+          # anyway, so a customer box recorded a merge_owner the roster has
+          # never heard of: a row assigned on its face and dispatchable to no
+          # one. Degrade to the seat the row GUARANTEES instead.
+          if [[ "$_md_owner" == "merger" ]]; then
+            _md_owner=$(_merge_hold_seat '' 2>/dev/null) || _md_owner=""
+            if [[ -z "$_md_owner" ]]; then
+              _md_owner=$(db "SELECT COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'')) FROM tasks WHERE id=${id};")
+              _md_why="${_md_why}-no-merge-seat"
+            fi
+          fi
         fi
-        db "UPDATE tasks SET merge_owner=$(sqlq "${_md_owner:-main}"),
+        # An EMPTY owner is left empty, never backfilled with a seat name:
+        # `_tasks_merge_owner_sql` COALESCEs '' to maker_agent and then to the
+        # assignee, so the render degrades to a seat that exists rather than to
+        # a constant that may not (DIVE-4571).
+        db "UPDATE tasks SET merge_owner=$(sqlq "${_md_owner:-}"),
                merge_hold_reason=$(sqlq "$_md_why")
             WHERE id=${id};" || true
       fi

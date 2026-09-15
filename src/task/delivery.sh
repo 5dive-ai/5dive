@@ -1525,12 +1525,54 @@ _merge_hold_seat_live() {
 # ops cannot read it, and treating it as such would route the whole transient-read
 # family (`pr-state-unreadable`, `repo-unresolved`) back onto main — i.e. the
 # common case would be the constant again.
+# _merge_hold_fallback_seat -> the seat that owes a merge ops cannot take, or
+# empty when this box has nobody for it.
+#
+# DIVE-4571. The fallback above was PRINTED UNCHECKED: `_merge_hold_seat` asked
+# the roster whether `ops` was live and then, on a no, named `main` without
+# asking the same question about it. Both names exist on exactly one box in the
+# world — ours — so on the customer chart DIVE-4551 was filed from (teal-fox:
+# claude-aleks / claude-alena / claude-jane) every held merge was stamped
+# `merge_owner=main`, a seat that is not in the roster at all. That is the row
+# shape luca measured as the OTHER half of the same report: assigned on its face,
+# dispatchable to nobody, and `task doctor` calls the board clean. A name is a
+# resolver you have not written (community/wiki/
+# a-hardcoded-recipient-is-a-single-box-assumption.md).
+#
+# So the fallback is now three rungs, and every rung is CHECKED:
+#   (1) the configured fallback seat, if the heartbeat will wake it;
+#   (2) `_task_resolve_gate_notifier` — the resolver whose job is "which seat
+#       pages a person about fleet state", falling back to the coordinator, i.e.
+#       the same resolver DIVE-4551/4554 put behind the alert rails. On an
+#       untagged lone-root chart that is the root; here it is `main`, which is
+#       what rung (1) already answers, so this box never reaches it;
+#   (3) nothing — and an empty answer is an ANSWER, handled by both callers,
+#       rather than a constant that merely looks like one.
+_merge_hold_fallback_seat() {
+  local _n=""
+  if _merge_hold_seat_live "$_MERGE_HOLD_SEAT_FALLBACK"; then
+    printf '%s' "$_MERGE_HOLD_SEAT_FALLBACK"; return 0
+  fi
+  if declare -F _task_resolve_gate_notifier >/dev/null 2>&1; then
+    _n=$(_task_resolve_gate_notifier 2>/dev/null) || _n=""
+  fi
+  if [[ -n "$_n" ]] && _merge_hold_seat_live "$_n"; then
+    printf '%s' "$_n"; return 0
+  fi
+  return 1
+}
+
+# rc 1 + empty output = this box has no seat that owes a held merge. Callers
+# degrade to the MAKER role rather than stamping a seat that does not exist:
+# DIVE-4326 moved the hold off the maker because they have nothing left to do on
+# a clean branch, which is a COST argument, and it is strictly outranked by a row
+# nothing can dispatch.
 _merge_hold_seat() {
   local repo="${1:-}"
   if [[ -n "$repo" ]] && ! grep -qE "$_MERGE_HOLD_SEAT_OWNERS_RX" <<<"$repo"; then
-    printf '%s' "$_MERGE_HOLD_SEAT_FALLBACK"; return 0
+    _merge_hold_fallback_seat; return $?
   fi
-  _merge_hold_seat_live "$_MERGE_HOLD_SEAT" || { printf '%s' "$_MERGE_HOLD_SEAT_FALLBACK"; return 0; }
+  _merge_hold_seat_live "$_MERGE_HOLD_SEAT" || { _merge_hold_fallback_seat; return $?; }
   printf '%s' "$_MERGE_HOLD_SEAT"
 }
 
@@ -1540,7 +1582,19 @@ _merge_hold_seat() {
 _merge_hold_resolve() {
   local disp="${1:-}" repo="${2:-}"
   case "$disp" in
-    hold:merger:*) printf 'hold:%s:%s' "$(_merge_hold_seat "$repo")" "${disp#hold:merger:}" ;;
+    hold:merger:*)
+      # DIVE-4571: a ROLE that resolves to nobody stays a role. `maker` is the
+      # one seat a row always has, the probe and the verifier close both already
+      # resolve it, and the reason token carries WHY it landed there so a box
+      # with no merge seat says so on the board instead of naming a phantom.
+      local _mhs=""
+      _mhs=$(_merge_hold_seat "$repo") || _mhs=""
+      if [[ -n "$_mhs" ]]; then
+        printf 'hold:%s:%s' "$_mhs" "${disp#hold:merger:}"
+      else
+        printf 'hold:maker:%s-no-merge-seat' "${disp#hold:merger:}"
+      fi
+      ;;
     *) printf '%s' "$disp" ;;
   esac
 }
