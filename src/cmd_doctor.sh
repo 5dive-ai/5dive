@@ -1076,6 +1076,21 @@ doctor_seat_claude_pid() {
   printf '%s' "$procs"
 }
 
+# DIVE-4562 iteration 2 — the seats the registry knows, one per line.
+#
+# Its own function so the check below is gradeable without a registry, and so
+# that "the registry says this seat is gone" stays distinguishable from "the
+# registry could not be read". A non-zero return means UNKNOWN, and unknown must
+# never filter: suppressing a real standing alarm because a registry read
+# hiccuped is much worse than naming one stale seat for five more minutes.
+doctor_consolidate_known_seats() {
+  declare -F registry_read >/dev/null 2>&1 || return 1
+  local _reg
+  _reg=$(registry_read 2>/dev/null) || return 1
+  [[ -n "$_reg" ]] || return 1
+  jq -r '.agents | keys[]' <<<"$_reg" 2>/dev/null || return 1
+}
+
 # DIVE-4562 — IS EACH SEAT'S CONSOLIDATION ACTUALLY TRANSACTING?
 #
 # Every other check in the `memory` category grades the CONTENT of a memory
@@ -1105,10 +1120,23 @@ doctor_check_consolidate_transacting() {
     # tried" are the two readings this row exists to stop conflating.
     doctor_add memory consolidate warn "the memory-consolidation scheduler has never run on this box (no $_cons_stampdir) — no seat's memory is being distilled"
   else
-    local _notxf _notx_name _notx_n _notx_bad="" _notx_watch=0
+    local _notxf _notx_name _notx_n _notx_bad="" _notx_watch=0 _notx_ghost=0
+    # Iteration 2 (quinn): intersect with the registry. A counter is cleared only
+    # by a pass that gets through, so a seat removed while it was refusing left
+    # one behind that NOTHING could ever clear — this check would have named a
+    # seat nobody can restore, forever, with no --fix and no verb to clear it.
+    # An alarm that cannot be turned off is the alarm that gets ignored, which is
+    # the exact failure alternative (c) was rejected for. The scheduler reaps
+    # these on its next sweep (and `agent rm` deletes them outright); here they
+    # are simply not this check's business.
+    local _known="" _known_ok=1
+    _known=$(doctor_consolidate_known_seats) || _known_ok=0
     for _notxf in "$_cons_stampdir"/*.notx; do
       [[ -e "$_notxf" ]] || continue
       _notx_name=$(basename "$_notxf" .notx)
+      if (( _known_ok )) && ! grep -qxF -- "$_notx_name" <<<"$_known"; then
+        _notx_ghost=$((_notx_ghost + 1)); continue
+      fi
       _notx_n=$(cat "$_notxf" 2>/dev/null) || _notx_n=0
       [[ "$_notx_n" =~ ^[0-9]+$ ]] || _notx_n=0
       if (( _notx_n >= _notx_after )); then
@@ -1117,12 +1145,14 @@ doctor_check_consolidate_transacting() {
         _notx_watch=$((_notx_watch + 1))
       fi
     done
+    local _notx_gh=""
+    (( _notx_ghost > 0 )) && _notx_gh=" (${_notx_ghost} stale counter(s) for seat(s) the registry no longer knows were ignored; the scheduler reaps them on its next sweep)"
     if [[ -n "$_notx_bad" ]]; then
-      doctor_add memory consolidate error "NOT TRANSACTING — the distiller has been refused by the API on every consecutive pass for: ${_notx_bad}. Their memory has not consolidated since. Retrying will not clear it: restore the seat's auth or raise the account limit."
+      doctor_add memory consolidate error "NOT TRANSACTING — the distiller has been refused by the API on every consecutive pass for: ${_notx_bad}. Their memory has not consolidated since. Retrying will not clear it: restore the seat's auth or raise the account limit.${_notx_gh}"
     elif (( _notx_watch > 0 )); then
-      doctor_add memory consolidate warn "${_notx_watch} seat(s) had a distiller refused by the API on their last pass but are under the ${_notx_after}-pass threshold — transient limit or a rotating token; re-check if it persists"
+      doctor_add memory consolidate warn "${_notx_watch} seat(s) had a distiller refused by the API on their last pass but are under the ${_notx_after}-pass threshold — transient limit or a rotating token; re-check if it persists${_notx_gh}"
     else
-      doctor_add memory consolidate ok "every enrolled seat's last consolidation pass reached the model"
+      doctor_add memory consolidate ok "every enrolled seat's last consolidation pass reached the model${_notx_gh}"
     fi
   fi
 }

@@ -6594,6 +6594,18 @@ _hb_capability_reverify_sweep() {
   return 0
 }
 
+# DIVE-4562 iteration 2 — resolve a seat's unix user, or fail if it has none.
+# Its OWN function because two places need the same answer: the sweep's loop
+# (which seats does it visit?) and the reap below (which counters can never be
+# cleared again?). Two copies of this rule that drift apart re-create the wedge
+# the reap exists to close, so there is exactly one.
+_hb_consolidate_seat_user() {
+  local _n="$1"
+  if id -u "agent-${_n}" >/dev/null 2>&1; then printf 'agent-%s' "$_n"; return 0; fi
+  if id -u "$_n"         >/dev/null 2>&1; then printf '%s' "$_n";       return 0; fi
+  return 1
+}
+
 # DIVE-3628 — THE SCHEDULER for `5dive memory consolidate`. A verb nobody runs is
 # not an async pipeline: the acceptance is "a fresh box user's agent loses a
 # session and a later session knows what it learned, with NO manual step", and
@@ -6651,11 +6663,35 @@ _hb_memory_consolidate_sweep() {
   mkdir -p "$stampdir" 2>/dev/null || return 0
   local reg name user stamp last
   reg=$(registry_read) || return 0
+  # DIVE-4562 iteration 2 (quinn) — REAP the counters of seats this sweep will
+  # never visit again. The counter is deleted by the pass that gets through, so
+  # a seat removed WHILE it was refusing leaves a file nothing can ever clear,
+  # and doctor's new check would then name a seat nobody can restore, forever.
+  # That is the cry-wolf alarm alternative (c) was rejected for, reached through
+  # a different door — and it is likeliest exactly when the incident is a
+  # fleet-wide auth lapse (five seats refusing at once; remove any one of them).
+  # `agent rm` now deletes both files itself; this reap is what heals a box
+  # where the seat went away some other way, or under a pre-4562 binary.
+  #
+  # The seat list is derived ONCE, and the reap runs only if that derivation
+  # SUCCEEDED. A registry that cannot be read has already returned above, and one
+  # that reads but does not parse is UNKNOWN — not empty. Reaping on unknown
+  # would delete the fleet's counters, i.e. erase the standing condition this row
+  # exists to make visible, on a transient read error.
+  local _known_seats _rf _rn
+  if _known_seats=$(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); then
+    for _rf in "$stampdir"/*.notx; do
+      [[ -e "$_rf" ]] || continue
+      _rn=$(basename "$_rf" .notx)
+      grep -qxF -- "$_rn" <<<"$_known_seats" \
+        && _hb_consolidate_seat_user "$_rn" >/dev/null && continue
+      rm -f "$_rf" "$stampdir/${_rn}.stamp" 2>/dev/null || true
+      _hb_log "[memory-consolidate] reaped a stale not-transacting counter for '${_rn}' (no such seat on this box any more) — it could never have been cleared by a passing run."
+    done
+  fi
   for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
     # Resolve the seat's unix user the same way the memory store does.
-    user="agent-$name"
-    id -u "$user" >/dev/null 2>&1 || user="$name"
-    id -u "$user" >/dev/null 2>&1 || continue
+    user=$(_hb_consolidate_seat_user "$name") || continue
     stamp="$stampdir/${name}.stamp"
     last=$(cat "$stamp" 2>/dev/null) || last=0
     [[ "$last" =~ ^[0-9]+$ ]] || last=0

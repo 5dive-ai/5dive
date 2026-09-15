@@ -410,6 +410,30 @@ grep -qi 'NOT TRANSACTING' <<<"$ERR" \
   && bad "CONTROL: a prose answer wrongly claims NOT TRANSACTING" \
   || ok "CONTROL: a prose answer does not claim NOT TRANSACTING"
 
+# THE KNOWN FALSE ALARM, pinned rather than described (quinn, iteration 1). The
+# classifier only ever runs when NO JSON came back, but within that branch it is
+# a text match, so prose that merely QUOTES a limit phrase is classified as a
+# refusal. Iteration 1's residual claimed "a miss, never a false alarm"; that was
+# wrong in the direction that matters, because the residual is what the next
+# reader trusts. It is asserted here so the bound is a fact and not a sentence:
+# the seat must still have FOUR consecutive such passes before anything is said,
+# and a distiller that emits prose about limits four passes running is a broken
+# distiller either way.
+FALSEPOS=$(stub falsepos 'The session discussed how the rate limit was hit during the deploy.')
+JOUT=$(JSON_MODE=1 run --distiller="$FALSEPOS" --max-sessions=1 --force 2>/dev/null)
+check "KNOWN: no-JSON prose quoting a limit phrase IS classified as a refusal" \
+  "$(jq -r '.data.distiller_unauthed' <<<"$JOUT" 2>/dev/null)" "1"
+check "and it is still only ONE pass — the 4-pass streak is what bounds it" \
+  "$(jq -r '.data.distiller_failed' <<<"$JOUT" 2>/dev/null)" "1"
+# The bound is real only because the same words cannot be reached through a
+# SUCCESSFUL pass: a distiller that returns JSON is never classified at all.
+FALSEPOSJSON=$(stub falseposjson '{"atoms":[{"type":"reference","name":"rate-limit-note","description":"an atom about a rate limit","body":"The session discussed how the rate limit was hit during the deploy."}]}')
+JOUT=$(JSON_MODE=1 run --distiller="$FALSEPOSJSON" --max-sessions=1 --force 2>/dev/null)
+check "CONTROL: the same sentence inside a valid payload is written, not classified" \
+  "$(jq -r '.data.atoms_written' <<<"$JOUT" 2>/dev/null)" "1"
+check "CONTROL: and raises no refusal" \
+  "$(jq -r '.data.distiller_unauthed' <<<"$JOUT" 2>/dev/null)" "0"
+
 echo "── validation ──"
 run --distiller="$EMPTY" --max-sessions=x >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--max-sessions must be numeric" || bad "--max-sessions must be numeric"
 run --distiller="$EMPTY" --idle-min=-1 >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--idle-min must be numeric" || bad "--idle-min must be numeric"

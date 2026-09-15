@@ -79,6 +79,17 @@ assert_check "a seat past the threshold is an ERROR"       error "NOT TRANSACTIN
 assert_check "and the seat is named, with its streak"      error "alice \(63 passes\)"
 assert_check "and the message says retrying will not fix it" error "Retrying will not clear it"
 
+# 4b. EXACTLY at the threshold. Iteration 1 shipped fixtures of 2, 63, 10 and a
+#     non-number — never 4 — so the comparison could be relaxed from `>=` to `>`
+#     (moving the alarm from one day to 30 hours) with the harness still 12/12
+#     green. The boundary is the only value that grades the operator, so it is
+#     pinned here: at the threshold is an ERROR, one short of it is not.
+printf '4\n' > "$DIR/alice.notx"
+assert_check "EXACTLY at the threshold is already an ERROR (pins >=, not >)" error "alice \(4 passes\)"
+printf '3\n' > "$DIR/alice.notx"
+assert_check "and one pass short of it is still only a WARN"                 warn  "under the 4-pass threshold"
+printf '63\n' > "$DIR/alice.notx"
+
 # 5. The threshold is the argument, not a constant baked into the branch.
 assert_check "the same file is ok-side of a higher threshold" warn "under the 99-pass threshold" 99
 
@@ -108,6 +119,55 @@ rm -f "$DIR"/*.notx
 #    and must not be reported as a frozen fleet.
 printf '63\n' > "$DIR/alice.notx"
 MEMORY_CONSOLIDATE=off assert_check "MEMORY_CONSOLIDATE=off reports ok, not a false alarm" ok "switched off"
+rm -f "$DIR"/*.notx
+
+# 11. THE GHOST SEAT (quinn, iteration 1 — blocking). A counter is cleared only
+#     by a pass that gets through, so a seat removed WHILE it was refusing left
+#     one behind that nothing could ever clear. This check would then have named
+#     a seat nobody can restore, forever, with no --fix and no verb to clear it —
+#     the cry-wolf alarm alternative (c) was rejected for, through another door.
+#     It is likeliest exactly during a fleet-wide auth lapse: several seats
+#     refusing at once, remove any one of them.
+doctor_consolidate_known_seats() { printf 'alice\nbob\n'; }
+printf '63\n' > "$DIR/ghost-seat.notx"
+assert_check "a counter for a seat the registry does not know raises NOTHING" ok "reached the model"
+row=$(run_check 4)
+if jq -e '.message | test("ghost-seat") | not' <<<"$row" >/dev/null; then
+  ok_t "and the removed seat is never named"
+else
+  bad_t "and the removed seat is never named" "$row"
+fi
+assert_check "it is reported as ignored, not silently dropped" ok "stale counter\(s\) for seat\(s\) the registry no longer knows"
+
+# 12. NEGATIVE CONTROL for that filter — it must remove the ghost and NOTHING
+#     else. A filter that swallowed every counter would pass arm 11 and quietly
+#     disable the whole check, which is the defect this row exists to fix.
+printf '63\n' > "$DIR/alice.notx"
+assert_check "CONTROL: a REAL seat past the threshold still errors beside a ghost" error "alice \(63 passes\)"
+row=$(run_check 4)
+if jq -e '.message | test("ghost-seat") | not' <<<"$row" >/dev/null; then
+  ok_t "CONTROL: and the ghost is still not named in the error"
+else
+  bad_t "CONTROL: and the ghost is still not named in the error" "$row"
+fi
+
+# 13. CONTROL — an UNREADABLE registry must not filter. Unknown is not "gone":
+#     suppressing a real standing alarm because a registry read hiccuped is the
+#     worse of the two errors, so the check fails LOUD, not quiet.
+rm -f "$DIR/alice.notx"
+doctor_consolidate_known_seats() { return 1; }
+assert_check "CONTROL: an unreadable registry still reports the ghost rather than hiding it" error "ghost-seat \(63 passes\)"
+# Restore the SHIPPED definition rather than unsetting it, so the next arm
+# grades the real default and not an absence production never has.
+# shellcheck disable=SC1091
+source src/cmd_doctor.sh
+rm -f "$DIR"/*.notx
+
+# 14. The shipped default with no registry reachable (no `registry_read` in
+#     scope) must also read as UNKNOWN and therefore not filter — the fail-open
+#     direction has to hold for the real function, not only for a stub.
+printf '63\n' > "$DIR/carol.notx"
+assert_check "with no registry function defined, a failing seat is still named" error "carol \(63 passes\)"
 rm -f "$DIR"/*.notx
 
 # 10. The check is WIRED, not merely defined — a function nothing calls is the

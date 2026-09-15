@@ -44,6 +44,15 @@ if [ -z "$SWEEP_SRC" ]; then
   echo "  FAIL — could not extract _hb_memory_consolidate_sweep from $SRC/cmd_heartbeat.sh"
   echo "PASS=0 FAIL=1"; exit 1
 fi
+# DIVE-4562 iteration 2: the sweep now shares its seat-user resolution with the
+# reap, so the helper comes across too. Asserted, not assumed — the sweep calls
+# it, so a silently-empty extraction would take every seat out of the loop and
+# still report "0 failures".
+SEATUSER_SRC=$(awk '/^_hb_consolidate_seat_user\(\) \{/,/^\}/' "$SRC/cmd_heartbeat.sh")
+if [ -z "$SEATUSER_SRC" ]; then
+  echo "  FAIL — could not extract _hb_consolidate_seat_user from $SRC/cmd_heartbeat.sh"
+  echo "PASS=0 FAIL=1"; exit 1
+fi
 grep -q '^_HB_CONSOLIDATE_EVERY_MIN=' "$SRC/cmd_heartbeat.sh" \
   && ok "the cadence constant _HB_CONSOLIDATE_EVERY_MIN is defined in the module" \
   || bad "_HB_CONSOLIDATE_EVERY_MIN is not defined in the module"
@@ -55,6 +64,7 @@ grep -q '^_HB_CONSOLIDATE_NOTX_AFTER=' "$SRC/cmd_heartbeat.sh" \
   || bad "_HB_CONSOLIDATE_NOTX_AFTER is not defined in the module"
 
 eval "$SWEEP_SRC"
+eval "$SEATUSER_SRC"
 _HB_CONSOLIDATE_EVERY_MIN=360
 _HB_CONSOLIDATE_TIMEOUT_S=300
 _HB_CONSOLIDATE_NOTX_AFTER=4
@@ -74,7 +84,13 @@ BINEOF
 chmod +x "$SELF_BIN"
 
 _hb_log() { :; }
-registry_read() { printf '%s' "${REG:-{\"agents\":{}\}}"; }
+# The default-value expansion here used to leave a stray `\}}` glued onto the
+# JSON, so EVERY arm ran against a registry that does not parse. Nothing noticed:
+# the sweep only ever read it with `jq -r ... 2>/dev/null` inside `$( )`, which
+# prints the keys and then throws away the parse error. `jq -e` does not, so
+# DIVE-4562's reap tripped over it. Keep the default in a variable.
+_REG_DEFAULT='{"agents":{}}'
+registry_read() { printf '%s' "${REG:-$_REG_DEFAULT}"; }
 # Stub the whole invocation chain. `timeout` and `sudo` are the two commands the
 # sweep shells out through, so both are replaced by recorders — otherwise a
 # "green" arm could be green because sudo refused.
@@ -294,6 +310,72 @@ STUB_OUT='{"ok":true,"data":{"atoms_written":1,"processed":1,"distiller_failed":
 run_streak 5
 check "CONTROL: a pre-4562 envelope raises nothing" "$((_HB_CONS_UNAUTH + _HB_CONS_NOTX))" "0"
 check "CONTROL: and still grades as distilled"      "$_HB_CONS_RAN" "2"
+
+echo "== DIVE-4562 iteration 2: a counter for a seat that is GONE must be reaped =="
+# quinn, iteration 1 (blocking): the counter is deleted only by a pass that gets
+# through, and this loop only ever visits seats the registry still lists. So a
+# seat removed WHILE it was refusing left a counter nothing could ever clear, and
+# doctor would have named a seat nobody can restore, forever. Likeliest exactly
+# when the incident is fleet-wide auth: five seats refusing at once, remove one.
+reset; : > "$LOG"
+mkdir -p "$(notxdir)"
+printf '63\n' > "$(notxdir)/ghost-seat.notx"
+printf '%s\n' "$NOW"  > "$(notxdir)/ghost-seat.stamp"
+printf '2\n'  > "$(notxdir)/alice.notx"
+_hb_memory_consolidate_sweep "$NOW"
+[ -e "$(notxdir)/ghost-seat.notx" ] \
+  && bad "a counter for a seat absent from the registry survived the sweep" \
+  || ok "a counter for a seat absent from the registry is reaped"
+[ -e "$(notxdir)/ghost-seat.stamp" ] \
+  && bad "its cadence stamp survived too" \
+  || ok "and its cadence stamp goes with it"
+grep -q "reaped a stale not-transacting counter for 'ghost-seat'" "$LOG" \
+  && ok "the reap is logged, not silent (a file vanishing unexplained is its own defect)" \
+  || bad "the reap is silent"
+
+# CONTROL — the reap must remove the ghost and NOTHING else. A reap that cleared
+# every counter would pass the arm above while quietly deleting the whole signal:
+# alice is enrolled, was at 2, and this pass got through, so her counter is gone
+# for the RIGHT reason — assert on a seat that is still refusing instead.
+reset; : > "$LOG"
+mkdir -p "$(notxdir)"
+printf '63\n' > "$(notxdir)/ghost-seat.notx"
+printf '3\n'  > "$(notxdir)/alice.notx"
+STUB_OUT='{"ok":false,"data":{"atoms_written":0,"processed":1,"distiller_failed":1,"distiller_unauthed":1}}'
+STUB_RC=6
+_hb_memory_consolidate_sweep "$NOW"
+check "CONTROL: an ENROLLED seat's streak is untouched by the reap and still counts up" \
+  "$(cat "$(notxdir)/alice.notx" 2>/dev/null)" "4"
+check "CONTROL: and it still crosses the threshold" "$_HB_CONS_NOTX" "1"
+[ -e "$(notxdir)/ghost-seat.notx" ] \
+  && bad "CONTROL: the ghost survived a refusing pass" \
+  || ok "CONTROL: the ghost is reaped on a refusing pass too"
+
+# CONTROL — a registry that cannot be read reaps NOTHING. Unknown is not "gone":
+# deleting a fleet's counters on a transient registry error would erase the
+# standing condition this row exists to make visible.
+reset; : > "$LOG"
+mkdir -p "$(notxdir)"
+printf '63\n' > "$(notxdir)/ghost-seat.notx"
+_saved_rr=$(declare -f registry_read)
+registry_read() { return 1; }
+_hb_memory_consolidate_sweep "$NOW"
+[ -e "$(notxdir)/ghost-seat.notx" ] \
+  && ok "CONTROL: an unreadable registry reaps nothing" \
+  || bad "CONTROL: an unreadable registry wiped the counters"
+eval "$_saved_rr"
+# And the nastier half: a registry that READS but does not PARSE. The sweep
+# survives that by design (the seat loop swallows jq's error inside `$( )` and
+# simply visits nobody), so the reap must not read the resulting empty answer as
+# "the registry knows no seats" and delete every counter on the box.
+REG='not json'
+_hb_memory_consolidate_sweep "$((NOW + 361*60))"
+[ -e "$(notxdir)/ghost-seat.notx" ] \
+  && ok "CONTROL: an UNPARSEABLE registry reaps nothing either (unknown is not empty)" \
+  || bad "CONTROL: an unparseable registry wiped the counters"
+REG='{"agents":{"alice":{},"bob":{}}}'
+rm -rf "$(notxdir)"
+
 _hb_log() { :; }
 
 echo "== TWO envelopes on the stream still grade as one result =="
@@ -372,6 +454,17 @@ _hb_memory_consolidate_sweep "$NOW"
 check "only the resolvable seat runs"                           "$(ncalls)" "1"
 grep -q 'ghost' "$CALLS" && bad "the unresolvable seat was invoked anyway" \
   || ok "the unresolvable seat was skipped"
+# DIVE-4562: and because it is skipped, its not-transacting counter can never be
+# cleared by a passing run either — being IN the registry is not enough. The
+# registry row and the unix account can outlive each other, so the reap uses the
+# same two-part rule the loop does: if this sweep will not visit the seat, its
+# counter is reaped rather than left to wedge doctor's alarm forever.
+mkdir -p "$(dirname "$STATE_DIR/memory-consolidate")/memory-consolidate"
+printf '63\n' > "$STATE_DIR/memory-consolidate/ghost.notx"
+_hb_memory_consolidate_sweep "$((NOW + 361*60))"
+[ -e "$STATE_DIR/memory-consolidate/ghost.notx" ] \
+  && bad "a registry seat with no unix account keeps an unclearable counter" \
+  || ok "a registry seat with no unix account has its counter reaped too"
 REG='{"agents":{"alice":{},"bob":{}}}'
 
 echo "== a broken registry is survivable =="
