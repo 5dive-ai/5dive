@@ -32,11 +32,34 @@
 #   C. The REPO-WIDE enumeration. DIVE-4554's arm E ran this grep over
 #      src/cmd_heartbeat.sh alone, which is exactly how the class survived the
 #      first fix: DIVE-4551 cleaned three sites in one file and eleven lived on
-#      in the file next to it. This arm reads every shell file under src/.
-#   D. MUTATION. Restore either literal and an arm above must go red.
+#      in the file next to it. This arm reads every shell file under src/, and
+#      it matches the three SHAPES a seat name is written in — double-quoted,
+#      single-quoted, and bare — because a guard that only sees the shape the
+#      defect happened to use is the file-scoped grep again, one level down
+#      (iteration 1, quinn: `cmd_send ops` and a trailing `5dive agent send
+#      main` at end of line both scored 0).
+#   D. MUTATION of A and C.
+#   E. THE WRITE ITSELF, driven through the shipped `cmd_task_verify` — the
+#      half of this diff that lives in src/task/loops.sh, and the half that
+#      produced the customer symptom. Sections A-D grade delivery.sh; B5-B7
+#      seed the column BY HAND and assert the render, so they cannot see
+#      whether the verify path stopped writing `main` (iteration 1, quinn).
+#      Here a graded row is driven end to end on a box whose roster and chart
+#      contain neither `ops` nor `main`, and the arm reads the column the
+#      product wrote. Its mutant reverts src/task/loops.sh alone.
 #
-# NOT MEASURED, declared: no live grade, no gh, no heartbeat tick. This grades
-# who a hold names and what is written for it.
+# NOT MEASURED, declared: no live grade, no gh, no heartbeat tick. The one gh
+# read is failed rather than stubbed to a string, which is a SHIPPED
+# disposition (`hold:merger:disposition-probe-failed`, loops.sh) and the one
+# that reaches the merger branch without inventing an input.
+#
+# NON-VACUITY, PER FILE — the union receipt in this row's iteration 1 said
+# "revert both files -> 7 reds" and those seven all came from delivery.sh,
+# which is exactly the misattribution it hid:
+#   src/task/delivery.sh reverted alone -> A4-A8, B4, D2, E1-E3 red     (10)
+#   src/task/loops.sh    reverted alone -> E1, E2, E3, E6, E7a red       (5)
+# The second line is the one that did not exist at iteration 1: reverting
+# loops.sh alone left SEVENTEEN harnesses green, this one included.
 #
 # Run: bash tests/merge_hold_recipient_unit.sh (no root, no network).
 set -uo pipefail
@@ -53,10 +76,15 @@ STATE_DIR="$TMP"
 # and its CONTENT is what each arm rewrites.
 export FIVE_MERGE_HOLD_ROSTER="$TMP/agents.json"
 
+# The whole of `task`, not the two modules sections A-D need: section E drives
+# the shipped `cmd_task_verify`, which lives in src/task/loops.sh and is only
+# reachable through this file (it resolves its own module dir from BASH_SOURCE,
+# so a MUTANT COPY of src/ sources its own loops.sh — which is what makes E7
+# possible).
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/state.sh lib/audit.sh lib/registry.sh lib/tasks_db.sh \
-         task/routing.sh task/delivery.sh; do
+         lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
+         lib/tasks_db.sh lib/actor.sh lib/broker.sh cmd_push.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -155,14 +183,37 @@ t "B7 ...while the REASON still records why nobody owns it" \
 # heredoc'd example would be caught, which is the safe direction.
 # `grep -c` PRINTS 0 and EXITS 1 on no matches, so a `|| echo 0` tail emits TWO
 # zeros and every arm below would compare against '0\n0'. Count with awk.
+#
+# THE SHAPE, not one shape (iteration 1, quinn). A seat name is written three
+# ways in shell — "ops", 'ops' and bare ops — and a guard that only sees the
+# double-quoted one repeats the mistake this row exists to close: it grades the
+# form the defect happened to take instead of the class. Both shipped literals
+# were double-quoted, so the narrow guard was green for the wrong reason.
+# Verified against a mutant tree below, one mutant per shape.
+_SEAT='[a-z][a-z0-9_-]*'
 literal_sends() {
-  grep -rnE '^[^#]*(cmd_send|_task_send_agent)[[:space:]]+"[a-z][a-z0-9_-]*"' "${1:-src}" --include='*.sh' \
+  grep -rnE "^[^#]*(cmd_send|_task_send_agent)[[:space:]]+(\"${_SEAT}\"|'${_SEAT}'|${_SEAT}([[:space:]]|\$))" \
+    "${1:-src}" --include='*.sh' \
     | awk 'END {print NR}'
 }
 # `send to ${reviewer}` is English inside a failure message, not a recipient —
 # the one exemption, named rather than regexed around, because a filter nobody
-# can read is how the next literal gets in.
+# can read is how the next literal gets in. END-OF-LINE counts: `5dive agent
+# send main` with nothing after it is the commonest shape of all and the old
+# trailing-[[:space:]] requirement scored it 0.
 literal_a2a() {
+  grep -rnE "^[^#]*5dive agent send ${_SEAT}([[:space:]]|\$)" "${1:-src}" --include='*.sh' \
+    | grep -vE '5dive agent send to([[:space:]]|$)' \
+    | awk 'END {print NR}'
+}
+# The iteration-1 guards, kept ONLY as the control the shape mutants are read
+# against: each shape mutant asserts the widened guard sees it AND that this one
+# does not, so "the guard got wider" is measured, not claimed.
+literal_sends_narrow() {
+  grep -rnE '^[^#]*(cmd_send|_task_send_agent)[[:space:]]+"[a-z][a-z0-9_-]*"' "${1:-src}" --include='*.sh' \
+    | awk 'END {print NR}'
+}
+literal_a2a_narrow() {
   grep -rnE '^[^#]*5dive agent send [a-z][a-z0-9_-]*[[:space:]]' "${1:-src}" --include='*.sh' \
     | grep -v '5dive agent send to ' \
     | awk 'END {print NR}'
@@ -201,6 +252,145 @@ t "D3 MUTANT: one literal send added to an unrelated module — the repo-wide ar
   "1" "$(literal_sends "$MUTDIR")"
 t "D4 ...and the arm DIVE-4554 shipped, which reads cmd_heartbeat.sh alone, stays green on it" \
   "0" "$(grep -c '^[^#]*cmd_send "[a-z][a-z0-9_-]*"' "$MUTDIR/cmd_heartbeat.sh")"
+
+# THE OTHER TWO SHAPES (iteration 1, quinn). One mutant per shape, each read
+# twice: the widened guard must SEE it and the iteration-1 guard must MISS it.
+# The second half is what makes the widening a measurement rather than a claim —
+# a regex that got longer and caught nothing new is the file-scoped grep again.
+shape_mutant() {  # <line to append> -> "<widened> <narrow>"
+  local d="$TMP/shape-$RANDOM"; cp -r src "$d"
+  printf '%s\n' "$1" >> "$d/cmd_liveness.sh"
+  case "$2" in
+    a2a) printf '%s %s' "$(literal_a2a "$d")" "$(literal_a2a_narrow "$d")" ;;
+    *)   printf '%s %s' "$(literal_sends "$d")" "$(literal_sends_narrow "$d")" ;;
+  esac
+  rm -rf "$d"
+}
+t "D5 MUTANT (UNQUOTED seat): \`cmd_send ops --message=x\` — seen now, invisible to the iteration-1 guard" \
+  "1 0" "$(shape_mutant 'cmd_send ops --message="regression"' send)"
+t "D6 MUTANT (SINGLE-QUOTED seat): \`cmd_send 'ops'\` — same" \
+  "1 0" "$(shape_mutant "cmd_send 'ops' --message=\"regression\"" send)"
+t "D7 MUTANT (a2a at END OF LINE): \`5dive agent send main\` with nothing after it" \
+  "1 0" "$(shape_mutant '  sudo 5dive agent send main' a2a)"
+t "D8 ...and the named exemption still holds at end of line: \`agent send to\` is English" \
+  "0 0" "$(shape_mutant '  die "could not 5dive agent send to"' a2a)"
+
+# ── E. THE WRITE: cmd_task_verify, driven end to end ─────────────────────────
+# Iteration 1 graded this diff's delivery.sh half behaviourally and its loops.sh
+# half not at all: B5-B7 seed merge_owner BY HAND and assert the RENDER, so
+# reverting loops.sh alone — restoring the very literal this row exists to
+# delete — left 17 harnesses green (quinn, reproduced). These arms drive the
+# shipped `cmd_task_verify` on a graded, PR-bound row and read the column the
+# PRODUCT wrote.
+#
+# In a CHILD PROCESS, deliberately: the mutant must be a mutant of the SOURCE
+# TREE, not a function redefined in this shell, and `cmd_task.sh` resolves its
+# own module dir from BASH_SOURCE — so a copy of src/ with one line changed
+# sources its own loops.sh and nothing else has to be faked.
+#
+# The one impure leaf (`_merge_disp_probe`, the single gh read) is made to FAIL
+# rather than stubbed to a string: loops.sh turns that into
+# `hold:merger:disposition-probe-failed`, which is a shipped disposition and the
+# one that reaches the merger branch without inventing an input.
+cat > "$TMP/drive_write.sh" <<'DRIVER'
+#!/usr/bin/env bash
+# <src dir> <roster file> <this-box|teal-fox>  ->  "<merge_owner>|<reason>|<rendered owner>"
+set -uo pipefail
+SRCD="$1"; export FIVE_MERGE_HOLD_ROSTER="$2"; CHART="$3"
+TMP="$(mktemp -d /tmp/mhr-write.XXXXXX)"; STATE_DIR="$TMP"
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
+         lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
+         lib/tasks_db.sh lib/actor.sh lib/broker.sh cmd_push.sh cmd_task.sh; do
+  # shellcheck source=/dev/null
+  source "$SRCD/$f"
+done
+TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+mkdir -p "$TASKS_DIR"; set +e
+tasks_db_init
+if [[ "$CHART" == "this-box" ]]; then
+  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('olivia','AI CEO',NULL);"
+  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('main','engineering — gate notifier','olivia');"
+  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('ops','DevOps / SRE','main');"
+else
+  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-aleks','founder',NULL);"
+  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-alena','ops',NULL);"
+  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-jane','eng',NULL);"
+fi
+# grader != maker is a standing predicate (DIVE-477); pin the actor so the arm
+# does not depend on which seat runs the suite.
+task_actor() { local f="${1:-}"; [[ -n "$f" ]] && printf '%s' "$f" || printf '%s' quinn; }
+_merge_disp_probe() { return 1; }
+id=$(db "INSERT INTO tasks (title, assignee, created_by, kind, status, maker_agent, verifier,
+                            delivery_ref, iteration)
+         VALUES ('a held merge on a box with no merge seat','quinn','claude-aleks','standard',
+                 'in_progress','claude-ivan','quinn',
+                 'https://github.com/5dive-ai/5dive/pull/809',1);
+         SELECT last_insert_rowid();")
+ident=$(db "SELECT ident FROM tasks WHERE id=$id;")
+( set +e; cmd_task_verify "$ident" --no-done \
+    --result="PASS — re-derived from a fresh clone. graded-sha: aabbccdd11223344556677889900aabbccddeeff" \
+    >/dev/null 2>&1 )
+printf '%s|%s|%s\n' \
+  "$(db "SELECT COALESCE(merge_owner,'') FROM tasks WHERE id=$id;")" \
+  "$(db "SELECT COALESCE(merge_hold_reason,'') FROM tasks WHERE id=$id;")" \
+  "$(db "SELECT $(_tasks_merge_owner_sql) FROM tasks WHERE id=$id;")"
+rm -rf "$TMP"
+DRIVER
+
+E_CUST="$TMP/e-roster-customer.json"; printf '%s\n' '{"agents":{"claude-aleks":{},"claude-ivan":{}}}' > "$E_CUST"
+E_BOX="$TMP/e-roster-thisbox.json";  printf '%s\n' '{"agents":{"main":{},"ops":{},"dev":{},"quinn":{}}}' > "$E_BOX"
+drive() { bash "$TMP/drive_write.sh" "$1" "$2" "$3"; }
+
+E_TEAL=$(drive "$PWD/src" "$E_CUST" teal-fox)
+t "E1 teal-fox, driven through \`task verify\`: the WRITTEN merge_owner is the maker, never 'main'" \
+  "claude-ivan" "${E_TEAL%%|*}"
+t "E2 ...and the reason records WHY it landed there" \
+  "disposition-probe-failed-no-merge-seat" "$(cut -d'|' -f2 <<<"$E_TEAL")"
+t "E3 ...so the board renders a seat that is on that box's roster" \
+  "claude-ivan" "${E_TEAL##*|}"
+
+# POSITIVE CONTROL. Without it E1-E3 would also pass on a tree where the write
+# never happened at all.
+E_BOXA=$(drive "$PWD/src" "$E_BOX" this-box)
+t "E4 this box, same path: the column still says ops — byte-identical to the shipped behaviour" \
+  "ops" "${E_BOXA%%|*}"
+t "E5 ...with no -no-merge-seat suffix, because a merge seat WAS resolved" \
+  "disposition-probe-failed" "$(cut -d'|' -f2 <<<"$E_BOXA")"
+
+# THE MUTANT: src/task/loops.sh alone, reverted to what shipped before this row.
+# Both literals come back (`|| printf 'main'` and `${_md_owner:-main}`); nothing
+# in delivery.sh moves, so `_merge_hold_seat` still answers "" with rc 1 and the
+# mutant has to CHOOSE to stamp the constant anyway. That is the customer defect.
+cat > "$TMP/mutate_loops.py" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+blk = re.compile(r'          if \[\[ "\$_md_owner" == "merger" \]\]; then\n.*?\n          fi\n', re.S)
+pre = ('          [[ "$_md_owner" == "merger" ]] \\\n'
+       "            && _md_owner=$(_merge_hold_seat '' 2>/dev/null || printf 'main')\n")
+s, n1 = blk.subn(pre, s, count=1)
+s, n2 = re.subn(re.escape('sqlq "${_md_owner:-}"'), 'sqlq "${_md_owner:-main}"', s, count=1)
+open(p, 'w').write(s)
+print(f"{n1}{n2}")
+PY
+LOOPMUT="$TMP/src-loops-pre4571"; cp -r src "$LOOPMUT"
+t "E6 the mutant applies, both halves, exactly once each" \
+  "11" "$(python3 "$TMP/mutate_loops.py" "$LOOPMUT/task/loops.sh")"
+# ANCHOR the cut, on the CODE and not on the prose: the comment above the block
+# quotes `${_md_owner:-main}` to explain the defect, so a bare grep for that
+# string reds on its own explanation in BOTH trees. Match the call it sits in.
+t "E7a anchor: the shipped tree writes no constant" \
+  "0" "$(grep -c 'sqlq "${_md_owner:-main}"' src/task/loops.sh)"
+t "E7b anchor: the mutant tree does, once" \
+  "1" "$(grep -c 'sqlq "${_md_owner:-main}"' "$LOOPMUT/task/loops.sh")"
+E_MUT=$(drive "$LOOPMUT" "$E_CUST" teal-fox)
+t "E8 MUTANT: teal-fox is stamped 'main' — a seat absent from its roster AND its chart. E1 is not vacuous" \
+  "main" "${E_MUT%%|*}"
+t "E9 ...and the reason loses the suffix, so the board cannot even say why" \
+  "disposition-probe-failed" "$(cut -d'|' -f2 <<<"$E_MUT")"
+E_MUTBOX=$(drive "$LOOPMUT" "$E_BOX" this-box)
+t "E10 ...while this box reads identically under the mutant, which is why nothing here ever caught it" \
+  "ops" "${E_MUTBOX%%|*}"
 
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
