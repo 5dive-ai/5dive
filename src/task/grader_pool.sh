@@ -141,13 +141,25 @@ _grader_reading_pair() {  # <now>   [<reading-json-on-stdin>]
 # `_grader_reading_pair` (the pool) and `_pace_account_seven` (the floor), so
 # there is still exactly one place that decides what "too old" means.
 _grader_account_reading_json() {  # <account> -> reading JSON or EMPTY
-  local acct="${1:-}" rl=""
+  local acct="${1:-}" rl="" snap="" live_at=-1 snap_at=-1
   [[ -n "$acct" ]] || return 0
   if declare -F account_best_ratelimits >/dev/null 2>&1; then
     rl=$(account_best_ratelimits "$acct" 2>/dev/null || printf '')
   fi
-  if [[ -z "$rl" || "$rl" == "null" ]] && declare -F quota_snapshot_read >/dev/null 2>&1; then
-    rl=$(quota_snapshot_read 2>/dev/null | jq -c --arg a "$acct" '
+  # DIVE-4578 iteration 2: THE FRESHER CARRIER WINS, not simply the first
+  # non-empty one. "Live first" as a plain fallback chain means a live cache
+  # that merely EXISTS shadows the snapshot, and a seat that rendered its
+  # statusline two hours ago still hands back a reading — which the caller's
+  # asOf fence then throws away, leaving the account blind while a snapshot
+  # published minutes ago sat unread behind it. Measured on this host
+  # 2026-09-16: mp-team's bound seats carried caches older than the 600s fence
+  # while the snapshot's row for it was 431s old, so the floor read the ACTIVITY
+  # document for an account whose own reading was available. Neither carrier is
+  # trusted more for being fresher — both fences still run, one level up — this
+  # only stops the staler of two real readings from hiding the other. Live wins
+  # a tie, which is the old order in the case where both are equally fresh.
+  if declare -F quota_snapshot_read >/dev/null 2>&1; then
+    snap=$(quota_snapshot_read 2>/dev/null | jq -c --arg a "$acct" '
            (((.accounts // []) | map(select(.name == $a)) | first | .usage) // null)
            | if . == null then empty
              else {asOf: .asOf,
@@ -156,6 +168,13 @@ _grader_account_reading_json() {  # <account> -> reading JSON or EMPTY
                    sevenDayPct:   (.sevenDay.pct      // null),
                    sevenResetsAt: (.sevenDay.resetsAt // null)} end' 2>/dev/null || printf '')
   fi
+  [[ -n "$rl" && "$rl" != "null" ]] || rl=""
+  [[ -n "$snap" && "$snap" != "null" ]] || snap=""
+  if [[ -n "$rl" ]]; then live_at=$(jq -r '.asOf // -1' <<<"$rl" 2>/dev/null || printf -- -1); fi
+  if [[ -n "$snap" ]]; then snap_at=$(jq -r '.asOf // -1' <<<"$snap" 2>/dev/null || printf -- -1); fi
+  [[ "$live_at" =~ ^-?[0-9]+$ ]] || live_at=-1
+  [[ "$snap_at" =~ ^-?[0-9]+$ ]] || snap_at=-1
+  if [[ -z "$rl" ]] || { [[ -n "$snap" ]] && (( snap_at > live_at )); }; then rl="$snap"; fi
   [[ -n "$rl" && "$rl" != "null" ]] || return 0
   printf '%s' "$rl"
 }

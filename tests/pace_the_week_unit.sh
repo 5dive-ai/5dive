@@ -498,6 +498,42 @@ print((row or {}).get("band", "<no row>"), (row or {}).get("source"))
 PY2EOF
   dres=$(ACCTF="$ACCTF" SEATDOC="$SEATDOC" timeout 120 python3 "$DPROBE2" 2>&1 | tail -1)
   dband=${dres%% *}; dsrc=${dres#* }
+  # 2b. A STALE LIVE CACHE MUST NOT SHADOW A FRESH SNAPSHOT. "Live first" read
+  #     as a plain fallback chain means a cache that merely EXISTS wins, and a
+  #     seat that rendered its statusline two hours ago hands back a reading the
+  #     fence then throws away — leaving the account blind while a snapshot
+  #     published minutes ago sat unread behind it. Measured on this host
+  #     2026-09-16: mp-team's bound caches were past the 600s fence while its
+  #     snapshot row was 431s old, and the floor read the ACTIVITY document.
+  SHADOW="$TMPD/acct-shadow.json"
+  ( set -uo pipefail
+    source src/task/grader_pool.sh
+    account_best_ratelimits() {   # exists, and is OLDER than the fence
+      printf '{"asOf":%s,"fiveHourPct":9,"fiveResetsAt":%s,"sevenDayPct":95,"sevenResetsAt":%s}' \
+             "$(( NOWR - 7200 ))" "$(( NOWR + 3600 ))" "$RFAR"
+    }
+    quota_snapshot_read() {       # published minutes ago, inside the fence
+      printf '{"accounts":[{"name":"m","usage":{"asOf":%s,"fiveHour":null,"sevenDay":{"pct":20,"resetsAt":%s}}}]}' \
+             "$(( NOWR - 120 ))" "$RFAR"
+    }
+    account_each() { printf 'm\n'; }
+    # shellcheck source=/dev/null
+    source "$DIGF"
+    _digest_account_reading > "$SHADOW"
+  ) 2>/dev/null
+  shres=$(ACCTF="$SHADOW" SEATDOC="$SEATDOC" timeout 120 python3 "$DPROBE2" 2>&1 | tail -1)
+  shrc=0
+  ( set -uo pipefail
+    source src/task/grader_pool.sh
+    account_best_ratelimits() { printf '{"asOf":%s,"fiveHourPct":9,"fiveResetsAt":%s,"sevenDayPct":95,"sevenResetsAt":%s}' "$(( NOWR - 7200 ))" "$(( NOWR + 3600 ))" "$RFAR"; }
+    quota_snapshot_read() { printf '{"accounts":[{"name":"m","usage":{"asOf":%s,"sevenDay":{"pct":20,"resetsAt":%s}}}]}' "$(( NOWR - 120 ))" "$RFAR"; }
+    printf '%s' "$SEATDOC" | _pace_band m "$NOWR" >/dev/null
+  ) || shrc=$?
+  shband=$(source src/task/grader_pool.sh; _pace_band_name "$shrc")
+  [[ "$shres" == "open account" && "$shband" == "open" ]] \
+    && ok_ "H2: a STALE live cache does not shadow a FRESH snapshot — both readers take the fresher carrier and land on open [account reading]" \
+    || bad_ "H2: shadowing" "digest='${shres}', floor='${shband}' — expected 'open account'/'open'; a two-hour-old cache is hiding a two-minute-old snapshot and the account reads blind"
+
   # 3b. THE DIFFERENTIAL, so the agreement above cannot pass vacuously: the
   #     SNAPSHOT-ALONE source iteration 1 shipped, on this same fixture, lands
   #     on a DIFFERENT band. If these two ever agree, the arm has stopped
