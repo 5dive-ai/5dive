@@ -130,8 +130,18 @@ has_t "A8: the verifier's findings survive as the instruction for the pass" "$(f
 has_t "A9: the resume ping goes to the maker, not the gate's filer" "$(cat "$SENT")" "dev"
 # THE POINT OF RAISING THE CAP: the next bounce must bounce, not re-escalate.
 db "UPDATE tasks SET status='todo' WHERE ident='ESC-KEEP';"
+# The result carries the five evidence fields DIVE-4576 requires of any delivery
+# that BINDS a pull request — this arm is about the cap, so the delivery must not
+# fail for an unrelated reason. `DELIVERED-SHA` and never `graded-sha`: that
+# label is the VERIFIER's, and a fixture writing it hands the DIVE-2656 fence a
+# maker-authored operand (DIVE-4576 iteration 1).
 D_OUT=$( (cmd_task_deliver "$(rowid ESC-KEEP)" --pr=https://github.com/5dive-ai/5dive/pull/1 \
-        --result="took the pass: re-ran the arm against origin/main, it greens") 2>&1 ); D_RC=$?
+        --result="took the pass: re-ran the arm against origin/main, it greens
+CHANGED: tests/escalation_resume_unit.sh
+CHECKED: bash tests/escalation_resume_unit.sh — 1 arm, 1 pass
+DELIVERED-SHA: 4c5b6a79880123456789abcdef01234567891f2e
+CI: green at delivery
+CRITERIA: the authorised pass delivers -> this arm") 2>&1 ); D_RC=$?
 eq_t "A9b: the maker can deliver the authorised pass" "$D_RC" "0"
 eq_t "A10: the maker's next delivery is iteration N+1" "$(field ESC-KEEP iteration)" "3"
 # The grade is the VERIFIER's, and a reject reads the caller from the seat the
