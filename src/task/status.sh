@@ -322,6 +322,12 @@ _task_status_cmd() {
       # because `task done` is the verb a maker actually re-delivers with.
       --force-redeliver=*) _TASK_REDELIVER_FORCE_REASON="${1#*=}" ;;
       --force-redeliver)   fail "$E_USAGE" "--force-redeliver needs a reason: --force-redeliver=\"<why the unchanged re-delivery is correct>\" (DIVE-4144)" ;;
+      # DIVE-4576: `task done` on a bound row IS a delivery, so it meets the same
+      # evidence rail and carries the same audited exit. Parsed here rather than
+      # rejected as an unknown flag, which is what a maker who just read the
+      # refusal would otherwise hit.
+      --force-unevidenced=*) _TASK_EVIDENCE_WAIVER="${1#*=}" ;;
+      --force-unevidenced)   fail "$E_USAGE" "--force-unevidenced needs a reason: --force-unevidenced=\"<why this delivery has no such evidence to give>\" (DIVE-4576)" ;;
       --)         shift; positional+=("$@"); break ;;
       -*)         fail "$E_USAGE" "unknown flag: $1" ;;
       *)          positional+=("$1") ;;

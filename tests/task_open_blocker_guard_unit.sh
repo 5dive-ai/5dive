@@ -119,7 +119,10 @@ out=$(cmd_task_deliver DIVE-910 --pr=https://github.com/5dive-ai/5dive/pull/999 
 seed DIVE-912 blocked verifier
 seed DIVE-913 'done'
 edge DIVE-912 DIVE-913
-out=$(cmd_task_deliver DIVE-912 --pr=https://github.com/5dive-ai/5dive/pull/998 --result=work 2>&1); rc=$?
+# DIVE-4576: a delivery whose result names no evidence is refused, so the fixture
+# result carries the five labels; this harness's subject (the blocker guard) is
+# unchanged by that rail.
+out=$(cmd_task_deliver DIVE-912 --pr=https://github.com/5dive-ai/5dive/pull/998 --result="work. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass DELIVERED-SHA: 1f2e3d4c5b6a79880123456789abcdef01234567 CI: green CRITERIA: (1) -> the run above" 2>&1); rc=$?
 [[ "$rc" == 0 && "$(st DIVE-912)" == todo && "$(field DIVE-912 delivery_ref)" == https://github.com/5dive-ai/5dive/pull/998 ]] \
   && ok_t "T6 stale blocked delivery remains allowed and routes normally" \
   || bad_t "T6 terminal blocker does not refuse delivery" "rc=$rc status=$(st DIVE-912) ref=$(field DIVE-912 delivery_ref)"

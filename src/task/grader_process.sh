@@ -273,9 +273,35 @@ _grader_process_run_open() {  # <seat> <ident> <session_id> [<clone>]
 # session-mode wake sends, plus the two facts only an ephemeral seat needs: it is
 # alone (nothing will pick this row up if it stops early, because the clone has no
 # heartbeat) and its home is its own to check out into.
+# DIVE-4576 — THE METHOD, and it is the same sentence in both grader lanes.
+#
+# A clone starts from nothing, so whatever this message does not say, it invents;
+# and the method a cold seat invents is re-derivation — redo the maker's work and
+# see whether it agrees. That is a second full session per close, and a reject
+# buys it twice (DIVE-4440: five iterations, 34h). The maker's result now NAMES
+# what changed, what was run with its pass/fail counts, the sha, CI, and the
+# criterion each answers (src/lib/verify_policy.sh), so the cheap method exists:
+# re-run what is named, at the sha that is named, compare, and spot-check the
+# diff against each criterion.
+#
+# ONE STRING, TWO LANES. The session lane and the clone lane wake with the same
+# words on purpose (see the header of `_grader_clone_wake`) — a verdict from one
+# is comparable to a verdict from the other only while that stays true, and two
+# hand-maintained copies of a method is how it stops being true.
+#
+# `_GRADER_TURN_BUDGET` is stated rather than implied: an unstated budget is not
+# a budget, and over-budget is an OUTCOME here, not a failure — a verdict that
+# names what it did not reach is gradeable and cheap; a silent overrun is the
+# re-derivation this row exists to end.
+_GRADER_TURN_BUDGET="${_GRADER_TURN_BUDGET:-25}"
+_grader_grade_method_clause() {
+  printf 'VERIFY THE CLAIMS, DO NOT RE-INVESTIGATE: read the result'"'"'s CHANGED / CHECKED / DELIVERED-SHA / CI / CRITERIA fields, RE-RUN the commands it names against the sha it delivered at (the maker writes DELIVERED-SHA; `graded-sha` in the result stays YOURS to write), and spot-check the diff against each acceptance criterion — that is the grade. A claim carrying NO evidence is a FAIL, not something for you to go and derive: reject it with FINDING: unevidenced — <the claim>. Budget %s turns for the whole grade; on reaching it, deliver the verdict you have and say which claims you verified and which you did not reach, rather than spending a second session.' \
+    "${_GRADER_TURN_BUDGET:-25}"
+}
+
 _grader_process_goal() {  # <ident> <session_id> <clone>
-  printf 'You are an ephemeral grader seat (%s, session %s) created for this one delivery: you have no inbox, no heartbeat and no next row, and this seat is removed once your verdict lands. Grade delivered task %s. Your home directory is yours alone — make any checkout or worktree you need inside it, never in a shared checkout. Read the row, grade the delivery, checkpoint each verified arm to the row as you go, then run 5dive task done or 5dive task reject. Do not wait for CI; grade what is at the delivered head.' \
-    "$3" "$2" "$1"
+  printf 'You are an ephemeral grader seat (%s, session %s) created for this one delivery: you have no inbox, no heartbeat and no next row, and this seat is removed once your verdict lands. Grade delivered task %s. Your home directory is yours alone — make any checkout or worktree you need inside it, never in a shared checkout. Read the row, grade the delivery, checkpoint each verified arm to the row as you go, then run 5dive task done or 5dive task reject. Do not wait for CI; grade what is at the delivered head. %s' \
+    "$3" "$2" "$1" "$(_grader_grade_method_clause)"
 }
 
 # `_grader_process_spawn <seat> <ident> <session_id>` — start ONE grader process.
