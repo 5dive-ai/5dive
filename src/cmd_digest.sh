@@ -220,6 +220,82 @@ cmd_digest() {
     printf '%s\n' '{"data":{"agents":[],"tasks":[],"coverage":{"agentsExpected":null,"agentsRead":0,"unreadable":[],"complete":false,"unavailable":true,"reason":"the usage collector could not be run by this caller (5dive usage needs root)"}}}'
   }
 
+  # The published account snapshot, read the unprivileged way (DIVE-4578).
+  # `quota_snapshot_read` is bundled ahead of this file and is preferred; the
+  # direct file read is the fallback for a digest sourced without
+  # src/lib/quota_wall.sh. An unreadable or absent snapshot yields `{}`.
+  _digest_account_snapshot() {
+    if declare -F quota_snapshot_read >/dev/null 2>&1; then
+      local snap; snap="$(quota_snapshot_read 2>/dev/null || printf '')"
+      if [ -n "$snap" ]; then printf '%s\n' "$snap"; return 0; fi
+    fi
+    local f="${QUOTA_SNAPSHOT_FILE:-${STATE_DIR:-/var/lib/5dive}/account-usage.json}"
+    if [ -r "$f" ] && [ -s "$f" ]; then jq -ce '.' "$f" 2>/dev/null && return 0; fi
+    printf '%s\n' '{}'
+  }
+
+  # ── DIVE-4578 iteration 2: A SOURCE WITH NO SCHEDULED PUBLISHER IS NOT A SOURCE
+  #
+  # The account rows this digest's pacing block reads now come from
+  # `_grader_account_reading_json` — the SAME two-source reader the floor uses
+  # (src/task/grader_pool.sh): each registry-bound seat's LIVE statusline cache
+  # first (`account_best_ratelimits`, root — and the digest cron IS root), the
+  # published snapshot second.
+  #
+  # Iteration 1 fed this block the snapshot ALONE, and NOTHING publishes that
+  # snapshot on a schedule: its only writer is `cmd_account_usage`, i.e. a human
+  # typing `5dive account usage`. There is no cron.d entry, no timer and no
+  # in-product caller, so on an hourly digest tick every account was already
+  # past the 600s `asOf` fence and the block fell straight back to the activity
+  # document this row exists to stop trusting. Measured on this host at
+  # 2026-09-16 01:05Z: per-account asOf ages 5716s / 6082s / 20382s, the rest
+  # null — every one of them outside the fence. Worse, `_pace_band` was reading
+  # the LIVE caches at that same moment, so the two predicates that must agree
+  # could disagree on one tick: the floor clearing an account the digest still
+  # rendered as "blind — held at the soft floor".
+  #
+  # THE FENCES ARE UNCHANGED and still live in the python block (the reading's
+  # own `asOf` within QUOTA_SNAPSHOT_MAX_AGE; a window whose `resetsAt` has
+  # turned over dropped). This function changes WHERE the rows come from, never
+  # whether they are believed — an account with neither source contributes no
+  # row, exactly as an absent snapshot did, and the block is still blind and
+  # still held.
+  #
+  # The account list is the UNION of the snapshot's names and the profiles on
+  # disk (`account_each`), because the quiet account this row is about may have
+  # no snapshot row at all. Without `_grader_account_reading_json` in the
+  # process (a digest sourced without src/task/grader_pool.sh) this degrades to
+  # the plain snapshot read above rather than to nothing.
+  _digest_account_reading() {
+    local snap rows='[]' n rl next
+    snap="$(_digest_account_snapshot 2>/dev/null || printf '{}')"
+    if ! declare -F _grader_account_reading_json >/dev/null 2>&1; then
+      [ -n "$snap" ] || snap='{}'
+      printf '%s\n' "$snap"; return 0
+    fi
+    local -a names=()
+    while IFS= read -r n; do
+      if [ -n "$n" ]; then names+=("$n"); fi
+    done < <(
+      { printf '%s\n' "$snap" | jq -r '(.accounts // [])[]? | .name // empty' 2>/dev/null || true
+        if declare -F account_each >/dev/null 2>&1; then account_each 2>/dev/null || true; fi
+      } | awk 'NF && !seen[$0]++' 2>/dev/null || true
+    )
+    for n in ${names[@]+"${names[@]}"}; do
+      rl="$(_grader_account_reading_json "$n" 2>/dev/null || printf '')"
+      [ -n "$rl" ] && [ "$rl" != "null" ] || continue
+      next="$(jq -c --arg n "$n" --argjson r "$rl" '. + [{name: $n, usage: {
+                asOf: ($r.asOf // null),
+                fiveHour: (if ($r.fiveHourPct // null) == null then null
+                           else {pct: $r.fiveHourPct, resetsAt: ($r.fiveResetsAt // null)} end),
+                sevenDay: (if ($r.sevenDayPct // null) == null then null
+                           else {pct: $r.sevenDayPct, resetsAt: ($r.sevenResetsAt // null)} end)}}]' \
+              <<<"$rows" 2>/dev/null || printf '')"
+      if [ -n "$next" ]; then rows="$next"; fi
+    done
+    jq -cn --argjson a "$rows" '{accounts: $a}' 2>/dev/null || printf '%s\n' '{}'
+  }
+
   # Stage each source in a temp file (a large task queue blows past the env-var
   # size limit if passed inline). Paths — not payloads — go to python.
   local tmpd
@@ -236,6 +312,17 @@ cmd_digest() {
   # so the standup can say UNKNOWN instead of implying zero.
   _digest_run usage --json >"$tmpd/usage.json" 2>/dev/null || _digest_usage_unavailable >"$tmpd/usage.json"
   [ -s "$tmpd/usage.json" ] || _digest_usage_unavailable >"$tmpd/usage.json"
+  # DIVE-4578: the ACCOUNT's own reading, which the activity document above
+  # cannot carry. `usage --json` is built by walking what each seat DID in the
+  # window, so a QUIET account contributes no row (or a row of nulls) and the
+  # pacing block below read that silence as "blind" — held at the soft floor —
+  # while the account snapshot had the live weekly number all along. The
+  # The rows come from `_grader_account_reading_json` per account — the live
+  # per-seat statusline caches the registry binds to the account first, the
+  # published snapshot second — because the snapshot alone has no scheduled
+  # publisher and is stale on almost every tick (see _digest_account_reading).
+  _digest_account_reading >"$tmpd/acct.json" 2>/dev/null || echo '{}' >"$tmpd/acct.json"
+  [ -s "$tmpd/acct.json" ] || echo '{}' >"$tmpd/acct.json"
   _digest_run heartbeat ls >"$tmpd/hb.txt" 2>/dev/null || : >"$tmpd/hb.txt"
   # DIVE-3501: seats whose ENTIRE runnable queue is tier-guard held. This is the
   # ONLY surface for that state — the rows read `todo`, the unit reads `active`,
@@ -339,6 +426,8 @@ cmd_digest() {
   DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" DIGEST_OBJ_F="$tmpd/obj.json" \
   DIGEST_UPDATE_F="$tmpd/update.json" DIGEST_HELD_F="$tmpd/held.json" \
   DIGEST_BUZZ_F="$tmpd/buzz.json" DIGEST_CAP_F="$tmpd/cap.json" \
+  DIGEST_ACCT_F="$tmpd/acct.json" \
+  QUOTA_SNAPSHOT_MAX_AGE="${QUOTA_SNAPSHOT_MAX_AGE:-600}" \
   DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
 
@@ -362,6 +451,10 @@ buzz_partial = bool(buzz_data.get("partial")) if isinstance(buzz_data, dict) els
 
 tasks_data = load("DIGEST_TASKS_F", {"tasks": []})
 usage_data = load("DIGEST_USAGE_F", {"agents": [], "tasks": []})
+# DIVE-4578: the account-usage snapshot, the source the pacing block below reads
+# FIRST. `{}` when it is absent or unreadable, which leaves the pacing block on
+# the per-seat activity document exactly as it was.
+acct_snap = load("DIGEST_ACCT_F", {})
 tasks = tasks_data.get("tasks", tasks_data if isinstance(tasks_data, list) else [])
 
 def to_epoch(s):
@@ -538,6 +631,58 @@ _pace_soft = int(os.environ.get("FIVE_PACE_7D_SOFT") or 60)
 _pace_hard = int(os.environ.get("FIVE_PACE_7D_HARD") or 90)
 _pace_reset_days = int(os.environ.get("FIVE_PACE_RESET_DAYS") or 3)
 _pace_now = int(time.time())
+# DIVE-4578 — THE ACCOUNT'S READING FIRST, the activity document second.
+#
+# `agents` is built by walking what each seat DID in the window, so a QUIET
+# account contributes no row at all, or a row of nulls. This block read that
+# silence as "blind" and rendered a hold ("held at the soft floor") on an
+# account whose own reading said it was at 30% of its week — the same
+# misreading that stalled the grader pool for nine hours on 2026-09-15
+# (DIVE-4575), inverted by this consumer's fail-safe pointing the other way.
+#
+# The account snapshot reaches its numbers through the REGISTRY BINDING, which
+# idleness cannot erase, so it answers for an account no seat has touched. It is
+# fenced HARDER than the document it overrides, the same two fences the grader
+# pool uses (src/task/grader_pool.sh): the READING's own `asOf` within
+# QUOTA_SNAPSHOT_MAX_AGE — not the age of the file that quotes it — and a window
+# whose `resetsAt` has already passed is dropped, because a percentage from a
+# window that has since turned over is not a statement about the week we are
+# pacing. Either fence sends the account back to the per-seat document, and with
+# NEITHER source it is still blind and still held: no path here invents a number.
+_acct_max_age = int(os.environ.get("QUOTA_SNAPSHOT_MAX_AGE") or 600)
+_acct_rows = acct_snap.get("accounts") if isinstance(acct_snap, dict) else None
+if not isinstance(_acct_rows, list):
+    _acct_rows = []
+
+def _acct_epoch(v):
+    # Epoch seconds (the statusline cache) or a vendor date string (a snapshot).
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str):
+        return to_epoch(v)
+    return None
+
+def _acct_weekly(name):
+    """(pct, resetsAt) from the ACCOUNT's own reading, fenced, or (None, None)."""
+    for r in _acct_rows:
+        if not isinstance(r, dict) or r.get("name") != name:
+            continue
+        u = r.get("usage") if isinstance(r.get("usage"), dict) else {}
+        asof = _acct_epoch(u.get("asOf"))
+        if asof is None or not (0 <= _pace_now - asof <= _acct_max_age):
+            return (None, None)
+        sd = u.get("sevenDay") if isinstance(u.get("sevenDay"), dict) else {}
+        pct = sd.get("pct")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            return (None, None)
+        resets = _acct_epoch(sd.get("resetsAt"))
+        if resets is not None and resets < _pace_now:
+            return (None, None)
+        return (pct, resets)
+    return (None, None)
+
 _pace_by_acct = {}
 for a in agents:
     acct = a.get("account") or ("@self:" + str(a.get("name")))
@@ -550,12 +695,28 @@ for a in agents:
         v = a.get(k)
         if isinstance(v, (int, float)):
             e[k] = v if e[k] is None else max(e[k], v)
+# An account the snapshot knows and the activity document does not is exactly
+# the quiet account this block was blind to, so it gets a row of its own rather
+# than being absent from the surface altogether.
+for r in _acct_rows:
+    n = r.get("name") if isinstance(r, dict) else None
+    if isinstance(n, str) and n and n not in _pace_by_acct:
+        _pace_by_acct[n] = {"account": n, "seats": 0,
+                            "sevenDayPct": None, "sevenDayResetsAt": None}
 pace_l = []
 for e in sorted(_pace_by_acct.values(), key=lambda x: x["account"]):
-    pct, resets = e["sevenDayPct"], e["sevenDayResetsAt"]
+    # The pct and its reset always come from ONE source: a reset time from the
+    # activity document does not describe the window the account reading measured.
+    pct, resets = _acct_weekly(e["account"])
+    src = "account"
+    if pct is None:
+        pct, resets, src = e["sevenDayPct"], e["sevenDayResetsAt"], "seat"
+    if pct is None:
+        src = None
     days_left = int((resets - _pace_now) // 86400) if isinstance(resets, (int, float)) and resets > _pace_now else None
     if pct is None:
-        band, why = "blind", "no weekly reading — held at the soft floor, never read as 0%"
+        band, why = "blind", ("no weekly reading from the account and none from any of its seats "
+                              "— held at the soft floor, never read as 0%")
     elif pct >= _pace_hard:
         band, why = "hard", f"{int(pct)}% of the week used (hard floor {_pace_hard}%) — urgent only"
     elif pct < _pace_soft:
@@ -568,9 +729,11 @@ for e in sorted(_pace_by_acct.values(), key=lambda x: x["account"]):
                              + (f", {days_left}d to the reset" if days_left is not None else
                                 ", reset time unreadable so the floor stays armed")
                              + " — high/urgent only, recurring beats skipped")
+    if src:
+        why += f" [{src} reading]"
     pace_l.append({"account": e["account"], "seats": e["seats"], "band": band,
                    "sevenDayPct": pct, "sevenDayResetsAt": resets,
-                   "daysToReset": days_left, "detail": why})
+                   "daysToReset": days_left, "source": src, "detail": why})
 paced = [p for p in pace_l if p["band"] != "open"]
 
 # Heartbeat health from the `heartbeat ls` table: flag agents that aren't fresh.

@@ -133,15 +133,33 @@ _grader_reading_pair() {  # <now>   [<reading-json-on-stdin>]
 # Both are `declare -F`-guarded so this file stays sourceable on its own: the
 # unit harnesses source it alone, and there the account reading is simply absent
 # and every existing arm keeps grading the per-seat fallback it was written for.
-_grader_account_reading() {  # <account> -> "<5h><US><7d>" or EMPTY
-  local acct="${1:-}" rl="" now
+# `_grader_account_reading_json <account>` — the account's reading in the
+# `usage_read_ratelimits` shape ({asOf, fiveHourPct, fiveResetsAt, sevenDayPct,
+# sevenResetsAt}), UNFENCED, or EMPTY. Split out for DIVE-4578: the pacing floor
+# needs the weekly pct AND its reset time out of the same reading, which the
+# fenced `<5h><US><7d>` pair cannot carry. The fences live one level up, in
+# `_grader_reading_pair` (the pool) and `_pace_account_seven` (the floor), so
+# there is still exactly one place that decides what "too old" means.
+_grader_account_reading_json() {  # <account> -> reading JSON or EMPTY
+  local acct="${1:-}" rl="" snap="" live_at=-1 snap_at=-1
   [[ -n "$acct" ]] || return 0
-  now=$(date +%s)
   if declare -F account_best_ratelimits >/dev/null 2>&1; then
     rl=$(account_best_ratelimits "$acct" 2>/dev/null || printf '')
   fi
-  if [[ -z "$rl" || "$rl" == "null" ]] && declare -F quota_snapshot_read >/dev/null 2>&1; then
-    rl=$(quota_snapshot_read 2>/dev/null | jq -c --arg a "$acct" '
+  # DIVE-4578 iteration 2: THE FRESHER CARRIER WINS, not simply the first
+  # non-empty one. "Live first" as a plain fallback chain means a live cache
+  # that merely EXISTS shadows the snapshot, and a seat that rendered its
+  # statusline two hours ago still hands back a reading — which the caller's
+  # asOf fence then throws away, leaving the account blind while a snapshot
+  # published minutes ago sat unread behind it. Measured on this host
+  # 2026-09-16: mp-team's bound seats carried caches older than the 600s fence
+  # while the snapshot's row for it was 431s old, so the floor read the ACTIVITY
+  # document for an account whose own reading was available. Neither carrier is
+  # trusted more for being fresher — both fences still run, one level up — this
+  # only stops the staler of two real readings from hiding the other. Live wins
+  # a tie, which is the old order in the case where both are equally fresh.
+  if declare -F quota_snapshot_read >/dev/null 2>&1; then
+    snap=$(quota_snapshot_read 2>/dev/null | jq -c --arg a "$acct" '
            (((.accounts // []) | map(select(.name == $a)) | first | .usage) // null)
            | if . == null then empty
              else {asOf: .asOf,
@@ -150,7 +168,23 @@ _grader_account_reading() {  # <account> -> "<5h><US><7d>" or EMPTY
                    sevenDayPct:   (.sevenDay.pct      // null),
                    sevenResetsAt: (.sevenDay.resetsAt // null)} end' 2>/dev/null || printf '')
   fi
+  [[ -n "$rl" && "$rl" != "null" ]] || rl=""
+  [[ -n "$snap" && "$snap" != "null" ]] || snap=""
+  if [[ -n "$rl" ]]; then live_at=$(jq -r '.asOf // -1' <<<"$rl" 2>/dev/null || printf -- -1); fi
+  if [[ -n "$snap" ]]; then snap_at=$(jq -r '.asOf // -1' <<<"$snap" 2>/dev/null || printf -- -1); fi
+  [[ "$live_at" =~ ^-?[0-9]+$ ]] || live_at=-1
+  [[ "$snap_at" =~ ^-?[0-9]+$ ]] || snap_at=-1
+  if [[ -z "$rl" ]] || { [[ -n "$snap" ]] && (( snap_at > live_at )); }; then rl="$snap"; fi
   [[ -n "$rl" && "$rl" != "null" ]] || return 0
+  printf '%s' "$rl"
+}
+
+_grader_account_reading() {  # <account> -> "<5h><US><7d>" or EMPTY
+  local acct="${1:-}" rl now
+  [[ -n "$acct" ]] || return 0
+  now=$(date +%s)
+  rl=$(_grader_account_reading_json "$acct") || return 0
+  [[ -n "$rl" ]] || return 0
   printf '%s' "$rl" | _grader_reading_pair "$now"
 }
 # Overridable so a unit harness can feed a fixture instead of needing root, a
@@ -1461,6 +1495,67 @@ _PACE_BLIND="${FIVE_PACE_BLIND:-soft}"
 # live meter. Same posture as _GRADER_USAGE_CMD / _SUP_QUOTA_PAT.
 _PACE_USAGE_CMD="${_PACE_USAGE_CMD:-sudo -n 5dive usage --json}"
 
+# ── DIVE-4578: THE ACCOUNT'S READING FIRST, HERE TOO ────────────────────────
+#
+# `5dive usage --json` is built by walking what each seat DID in the window, so
+# its silence about a seat means "this seat was quiet", not "this account is
+# unmeasured". The grader pool read that silence as unmeasured and refused a
+# seat for nine hours (DIVE-4575). This floor reads the same document and makes
+# the INVERTED mistake: `FIVE_PACE_BLIND=soft` holds a blind account at the soft
+# floor, so a QUIET account is paced down to high/urgent-only while its account
+# reading — reached through the registry binding, which idleness cannot erase —
+# says it is at 30% of its week. Same document, same ambiguity, opposite
+# direction, because each consumer's fail-safe points its own way.
+#
+# So the population of the defect is the document's READERS, and the fix is the
+# same re-ordering DIVE-4575 proved on the pool: account reading first, the
+# per-seat activity document as the fallback, and the account reading fenced
+# HARDER than the source it overrides (a fresher source that is allowed to be
+# stale is not an improvement). The blind branch is untouched — with NEITHER
+# source we still hold at the soft floor and never read the emptiness as 0%
+# (DIVE-4342).
+
+# `_pace_account_seven <account> [<now>]` — the account's own WEEKLY reading as
+# `<pct><US><resetsAt-epoch>`, or EMPTY.
+#
+# Both fences of `_grader_reading_pair`, applied to the weekly window only:
+#   * the READING's own measurement time (`asOf`) within `_GRADER_READING_MAX_AGE`
+#     — not the age of the file that quotes it;
+#   * a window whose `sevenResetsAt` has already passed is DROPPED entirely,
+#     because a percentage from a window that has since turned over is not a
+#     statement about the week we are pacing.
+# Either fence, or an absent number, yields EMPTY — which sends the caller to
+# the per-seat document, and if that is blind too, to the blind branch. There is
+# no path here that invents a number.
+#
+# The reset is normalised to EPOCH before it is printed, because the caller does
+# days-to-reset arithmetic on it and the two sources spell it differently (the
+# statusline cache carries epoch seconds, a snapshot may carry a vendor date
+# string). An unparseable reset prints EMPTY and leaves the floor armed, which
+# is the direction the unmeasured case must always point.
+_pace_account_seven() {  # <account> [<now-epoch>] -> "<pct><US><resets>" or EMPTY
+  local acct="${1:-}" now="${2:-}" rl asof seven sr
+  [[ -n "$acct" ]] || return 0
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  declare -F _grader_account_reading_json >/dev/null 2>&1 || return 0
+  rl=$(_grader_account_reading_json "$acct" 2>/dev/null || printf '')
+  [[ -n "$rl" && "$rl" != "null" ]] || return 0
+  asof=$(jq -r '.asOf // empty' <<<"$rl" 2>/dev/null || printf '')
+  [[ "$asof" =~ ^[0-9]+$ ]] || return 0
+  (( now >= asof && now - asof <= _GRADER_READING_MAX_AGE )) || return 0
+  seven=$(jq -r '.sevenDayPct // empty'   <<<"$rl" 2>/dev/null || printf '')
+  sr=$(jq -r    '.sevenResetsAt // empty' <<<"$rl" 2>/dev/null || printf '')
+  [[ -n "$seven" ]] || return 0
+  _grader_reading_expired "$sr" "$now" && return 0
+  if [[ -n "$sr" && ! "$sr" =~ ^[0-9]+$ ]]; then sr=$(date -d "$sr" +%s 2>/dev/null) || sr=""; fi
+  [[ "$sr" =~ ^[0-9]+$ ]] || sr=""
+  printf '%s%s%s' "$seven" "$_GRADER_READING_US" "$sr"
+}
+# Overridable so a unit harness can feed a fixture instead of needing root, a
+# registry and a live meter. A FUNCTION NAME, not a command string, because it
+# is expanded unquoted — same posture as `_GRADER_ACCOUNT_READING_CMD`.
+_PACE_ACCOUNT_CMD="${_PACE_ACCOUNT_CMD:-_pace_account_seven}"
+
 # `_pace_field <account> <field>` — one numeric field for an account, or EMPTY
 # when the meter has no number for it.
 #
@@ -1492,7 +1587,7 @@ _pace_field() {  # <account> <field>  [<usage-json-on-stdin>]
 #   3  hard   — urgent only, no recurring template firing
 #   1  refuse — no dispatch at all (only reachable under FIVE_PACE_BLIND=refuse)
 _pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
-  local acct="$1" now="${2:-$(date +%s)}" json seven resets days_left
+  local acct="$1" now="${2:-$(date +%s)}" json seven="" resets="" days_left src="" pair=""
   if [[ -z "$acct" ]]; then
     # No account named is not a measurement, and it must not read as headroom.
     printf 'pace: no account named — holding at the soft floor rather than reading it as 0%%\n'
@@ -1500,17 +1595,38 @@ _pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
     return 2
   fi
   json=$(cat)
-  if [[ -z "$json" ]]; then
-    printf 'pace: %s returned nothing — no meter, holding at the soft floor (never 0%%)\n' "$_PACE_USAGE_CMD"
-    [[ "$_PACE_BLIND" == "refuse" ]] && return 1
-    return 2
+  # DIVE-4578: the ACCOUNT's reading first, the per-seat document second. The
+  # pct and its reset are taken from ONE source and never mixed: a reset from
+  # the activity document does not describe the window the account reading
+  # measured.
+  pair=$($_PACE_ACCOUNT_CMD "$acct" "$now" 2>/dev/null || printf '')
+  if [[ -n "$pair" ]]; then
+    seven="${pair%%$_GRADER_READING_US*}"; resets="${pair#*$_GRADER_READING_US}"
+    [[ -n "$seven" ]] && src="account"
   fi
-  seven=$(printf '%s' "$json" | _pace_field "$acct" sevenDayPct)
+  if [[ -z "$seven" && -n "$json" ]]; then
+    seven=$(printf '%s' "$json" | _pace_field "$acct" sevenDayPct)
+    if [[ -n "$seven" ]]; then
+      src="seat"
+      resets=$(printf '%s' "$json" | _pace_field "$acct" sevenDayResetsAt)
+    fi
+  fi
   # Emptiness FIRST, always, and before any arithmetic — `(( < 60 ))` on an
   # empty operand is 0 in bash, which is the exact fail-open this guard family
   # exists to prevent (2026-09-09: 43% of the fleet read as 0% used).
+  #
+  # The reason names BOTH sources, because "has no weekly reading" used to read
+  # as "this account is at its limit" when it actually meant "this account has
+  # been quiet" — the misreading that kept DIVE-4575 open all day, and the one a
+  # log line is the only trace of here.
   if [[ -z "$seven" ]]; then
-    printf 'pace: %s has no weekly reading (null) — blind meter, policy=%s\n' "$acct" "$_PACE_BLIND"
+    if [[ -z "$json" ]]; then
+      printf 'pace: %s has no weekly reading — no account reading measured within %ss and %s returned nothing; blind meter, policy=%s (never 0%%)\n' \
+             "$acct" "$_GRADER_READING_MAX_AGE" "$_PACE_USAGE_CMD" "$_PACE_BLIND"
+    else
+      printf 'pace: %s has no weekly reading (null) — no account reading measured within %ss and no seat of the account carries one; blind meter, policy=%s\n' \
+             "$acct" "$_GRADER_READING_MAX_AGE" "$_PACE_BLIND"
+    fi
     [[ "$_PACE_BLIND" == "refuse" ]] && return 1
     return 2
   fi
@@ -1524,15 +1640,16 @@ _pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
     return 2
   fi
   if (( seven >= _PACE_FLOOR_7D_HARD )); then
-    printf 'pace: %s is at %s%% of its week (hard floor %s%%) — urgent only\n' \
-           "$acct" "$seven" "$_PACE_FLOOR_7D_HARD"; return 3
+    printf 'pace: %s is at %s%% of its week (hard floor %s%%, from the %s reading) — urgent only\n' \
+           "$acct" "$seven" "$_PACE_FLOOR_7D_HARD" "$src"; return 3
   fi
   if (( seven < _PACE_FLOOR_7D_SOFT )); then
-    printf 'pace: %s at 7d=%s%% (soft floor %s%%) — no hold\n' \
-           "$acct" "$seven" "$_PACE_FLOOR_7D_SOFT"; return 0
+    printf 'pace: %s at 7d=%s%% (soft floor %s%%, from the %s reading) — no hold\n' \
+           "$acct" "$seven" "$_PACE_FLOOR_7D_SOFT" "$src"; return 0
   fi
-  # Over the soft floor. It binds only while there is still a week to pace.
-  resets=$(printf '%s' "$json" | _pace_field "$acct" sevenDayResetsAt)
+  # Over the soft floor. It binds only while there is still a week to pace. The
+  # reset comes from whichever source gave us the pct (set above) — never from
+  # the other one.
   resets="${resets%%.*}"
   if [[ "$resets" =~ ^[0-9]+$ ]] && [[ "$now" =~ ^[0-9]+$ ]] && (( resets > now )); then
     days_left=$(( (resets - now) / 86400 ))
@@ -1540,14 +1657,14 @@ _pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
       printf 'pace: %s at %s%% (soft floor %s%%) but only %sd to the reset (<=%sd) — unspent headroom expires, no hold\n' \
              "$acct" "$seven" "$_PACE_FLOOR_7D_SOFT" "$days_left" "$_PACE_RESET_DAYS"; return 0
     fi
-    printf 'pace: %s is at %s%% of its week (soft floor %s%%) with %sd to the reset — high/urgent only\n' \
-           "$acct" "$seven" "$_PACE_FLOOR_7D_SOFT" "$days_left"; return 2
+    printf 'pace: %s is at %s%% of its week (soft floor %s%%, from the %s reading) with %sd to the reset — high/urgent only\n' \
+           "$acct" "$seven" "$_PACE_FLOOR_7D_SOFT" "$src" "$days_left"; return 2
   fi
   # Over the soft floor with NO readable reset. The distance-to-reset test is
   # the only thing that could RELAX the floor, so an unreadable one leaves the
   # floor armed — the unmeasured case never buys headroom.
-  printf 'pace: %s is at %s%% of its week (soft floor %s%%), reset time unreadable so the floor stays armed — high/urgent only\n' \
-         "$acct" "$seven" "$_PACE_FLOOR_7D_SOFT"; return 2
+  printf 'pace: %s is at %s%% of its week (soft floor %s%%, from the %s reading), reset time unreadable so the floor stays armed — high/urgent only\n' \
+         "$acct" "$seven" "$_PACE_FLOOR_7D_SOFT" "$src"; return 2
 }
 
 # `_pace_admits <band-rc> <priority> <kind>` — does this band dispatch this row?
