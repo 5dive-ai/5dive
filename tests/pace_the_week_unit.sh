@@ -343,6 +343,13 @@ acct_cases = [
      snap(20, now-3600), "soft", "seat"),
     # NEGATIVE CONTROL — with NEITHER source we are still blind and still held.
     ("neither-source-still-blind", NULLSEAT, {"accounts": []}, "blind", None),
+    # SOURCE MIXING, the case every other fixture hides: the account reading has
+    # a pct but NO readable reset, and the document has a NEAR one. Taking that
+    # reset would RELAX the floor (2d left -> open) on a window the document
+    # measured and the account reading did not. The floor must stay armed.
+    ("account-pct-without-a-reset-never-borrows-the-documents",
+     [{"name":"a","account":"m","sevenDayPct":70,"sevenDayResetsAt":now+2*86400}],
+     snap(70, None), "soft", "account"),
     ("a-snapshot-for-another-account-is-not-this-one",
      NULLSEAT, snap(20, now+6*86400, name="other"), "blind", None),
 ]
@@ -399,6 +406,15 @@ fi
 # So this arm drives the digest's REAL row builder (`_digest_account_reading`,
 # extracted verbatim from src/cmd_digest.sh) over stubs of BOTH carriers, and
 # asserts the band it produces equals `_pace_band`'s on the same fixture.
+# The builder is extracted below, which means nothing here would notice the
+# staging line being pointed back at the snapshot alone — the exact edit that
+# IS iteration 1's defect. So assert the wiring structurally, against the live
+# source, before grading the function it names.
+if grep -qE '^\s+_digest_account_reading >"\$tmpd/acct\.json"' src/cmd_digest.sh; then
+  ok_ "H2: the digest STAGES its account rows from _digest_account_reading (not from the snapshot alone)"
+else
+  bad_ "H2: wiring" "the pace block's account rows are no longer staged from _digest_account_reading — the two-source reader is extracted but unreachable, which is iteration 1's defect exactly"
+fi
 DIGF="$TMPD/digfn.sh"
 awk '/^  _digest_account_snapshot\(\) \{/{f=1} f{print} f&&/^  \}$/{exit}' src/cmd_digest.sh  > "$DIGF"
 awk '/^  _digest_account_reading\(\) \{/{f=1}  f{print} f&&/^  \}$/{exit}' src/cmd_digest.sh >> "$DIGF"
