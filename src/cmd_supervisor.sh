@@ -724,6 +724,131 @@ _sup_prompt_match() {  # <pane-text-on-stdin>
     | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
 }
 
+# ── DIVE-4581: the THIRD picker — claude's own USAGE-LIMIT hold ──────────────
+#
+# Two pickers above; this is the one that PAGED A HUMAN THREE TIMES IN ONE
+# EVENING (quinn ~16:05Z, ops ~16:20Z, community ~01:00Z on 2026-09-15/16, all
+# on the same exhausted account) for a non-event. When claude is refused by a
+# plan/org wall mid-turn it prints the refusal and renders its OWN choice
+# picker asking what to do about it: hold and wait for the reset, wait here and
+# resume automatically at the printed time, or upgrade the plan. It carries the
+# DIVE-4293 footer, so _sup_prompt_match matches it; nothing on it is marked
+# "(Recommended)", so _sup_prompt_recommended refuses it; and the pane
+# therefore classified `blocked-on-prompt` with "a person must choose".
+#
+# A PERSON DOES NOT HAVE TO CHOOSE. This is a QUOTA HOLD whose own pane prints
+# the time it ends, the class this file already has for exactly that state is
+# `quota-exhausted`, and its remedy is a keypress this watchdog is entitled to
+# make: take the option that waits here and resumes automatically. main made
+# that keypress by hand for two of the three seats; the third had dismissed
+# itself before anyone read it. Nothing about the state needed a human.
+#
+# THE SIGNATURE IS A POSITION, NOT A CONJUNCTION — the DIVE-4536 lesson, and it
+# binds harder here because the act is worse. The confirm's mis-press DECLINES
+# (fail-closed); this one presses Enter on an option a false positive picked,
+# and it also SILENCES the page a real AskUserQuestion owes. So the reading is
+# only ever attempted on a pane the DIVE-4293 footer has ALREADY matched, and
+# on top of that it demands the wall's own two option lines, each a NUMBERED
+# option on its OWN line, in order, immediately above that footer:
+#
+#   * the HOLD option (wait for the limit to reset) strictly above
+#   * the AUTO-RESUME option (continue automatically …) strictly above
+#   * the footer, itself inside the last _SUP_LIMIT_TAIL_LINES non-empty lines.
+#
+# A quotation fails all three anchors at once: prose about this picker carries
+# the two option texts on ONE line (this row's own body does exactly that), or
+# with document after it. Both failure directions were measured against the
+# population, not composed — tests/supervisor_limit_picker_unit.sh feeds in the
+# verbatim `task show DIVE-4581` output and the wiki page written for it.
+#
+# THE KEYSTROKE IS CURSOR-RELATIVE, NOT "Down, Enter". The pane above renders
+# the hold option first and the cursor sits on it, so one Down reaches the
+# auto-resume option — but a fixed keystroke count is the assumption DIVE-4536
+# refused for the same reason ("pressing a DIGIT assumes the numbering"). This
+# computes the SIGNED distance from the cursor row to the auto-resume row and
+# sends that many Down (or Up) presses. No cursor on a numbered option, or a
+# distance beyond _SUP_LIMIT_STEP_MAX, yields `unknown`: the class still flips
+# to quota-exhausted (which is true, and which does not page), and NO key is
+# pressed. Bias, as everywhere in this file: false-negative.
+_SUP_LIMIT_HOLD_PAT="${SUPERVISOR_LIMIT_HOLD_PAT:-}"
+[[ -n "$_SUP_LIMIT_HOLD_PAT" ]] \
+  || _SUP_LIMIT_HOLD_PAT='^[[:space:]]*(❯|>)?[[:space:]]*[0-9]+\.[[:space:]]+.*wait[[:space:]]+for[[:space:]]+(the[[:space:]]+)?limit[[:space:]]+to[[:space:]]+reset'
+_SUP_LIMIT_AUTO_PAT="${SUPERVISOR_LIMIT_AUTO_PAT:-}"
+[[ -n "$_SUP_LIMIT_AUTO_PAT" ]] \
+  || _SUP_LIMIT_AUTO_PAT='^[[:space:]]*(❯|>)?[[:space:]]*[0-9]+\.[[:space:]]+.*continue[[:space:]]+automatically'
+# The cursor row, restricted to a NUMBERED OPTION. The bare-gutter reading that
+# DIVE-4405 found (a TUI draws an inbound message inside a box whose gutter is
+# '>') cannot become a cursor position here, because an echoed alert line is not
+# a numbered option.
+_SUP_LIMIT_CURSOR_PAT="${SUPERVISOR_LIMIT_CURSOR_PAT:-}"
+[[ -n "$_SUP_LIMIT_CURSOR_PAT" ]] || _SUP_LIMIT_CURSOR_PAT='^[[:space:]]*(❯|>)[[:space:]]*[0-9]+\.[[:space:]]'
+# Anchors, all counting NON-EMPTY lines (a capture is blank-padded to the pane
+# height). Measured on the live 2026-09-16 05:5xZ capture kept as
+# tests/fixtures/dive4581/limit-picker-pane.txt: the footer is the LAST
+# non-empty line of the capture — this picker REPLACES the input box, so unlike
+# the DIVE-4536 confirm there is no chrome under it at all — and hold→footer
+# spans 3 lines (SPAN 6 carries a fourth option and a border line of slack).
+# TAIL 3 is therefore 2 clear of the measurement, which is the slack a future
+# release's status line would need, and no more: every additional line of tail
+# is a line of QUOTATION the matcher would accept.
+#
+# RESIDUAL, SIGNED: a capture whose bottom-most content is a verbatim, correctly
+# ordered transcript of this picker with fewer than three non-empty lines after
+# it is not distinguishable from the picker — the bytes are the same. That is
+# DIVE-4536's signed residual inheriting one class down, and it is why the page
+# and the row shipped with this change have their literals broken up, and why
+# both are graded as fixtures. The exposure is bounded by the footer match this
+# reading sits behind: it never sees a pane DIVE-4293 would not already have
+# acted on.
+_SUP_LIMIT_TAIL_LINES="${SUPERVISOR_LIMIT_TAIL_LINES:-3}"
+[[ "$_SUP_LIMIT_TAIL_LINES" =~ ^[0-9]+$ ]] || _SUP_LIMIT_TAIL_LINES=3
+_SUP_LIMIT_SPAN_LINES="${SUPERVISOR_LIMIT_SPAN_LINES:-6}"
+[[ "$_SUP_LIMIT_SPAN_LINES" =~ ^[0-9]+$ ]] || _SUP_LIMIT_SPAN_LINES=6
+_SUP_LIMIT_STEP_MAX="${SUPERVISOR_LIMIT_STEP_MAX:-4}"
+[[ "$_SUP_LIMIT_STEP_MAX" =~ ^[0-9]+$ ]] || _SUP_LIMIT_STEP_MAX=4
+
+# _sup_limit_picker_match — pure, no I/O. Echoes
+# "<auto-resume-option-line>\x1f<steps|unknown>" when the pane tail is sitting
+# on the usage-limit hold picker, empty otherwise. The excerpt is the
+# auto-resume line on purpose: it is the one that carries the RESUME TIME, so
+# every downstream surface quotes a wall that names when it ends.
+_sup_limit_picker_match() {  # <pane-text-on-stdin>
+  local tail ln n lo f h a c i w d steps
+  tail=$(_sup_pane_drop_echoes) || return 0
+  [[ -n "$tail" ]] || return 0
+  local -a L=()
+  while IFS= read -r ln; do
+    [[ "$ln" =~ ^[[:space:]]*$ ]] && continue
+    L+=("$ln")
+  done <<<"$tail"
+  n=${#L[@]}
+  (( n > 0 )) || return 0
+  lo=$(( n - _SUP_LIMIT_TAIL_LINES )); (( lo < 0 )) && lo=0
+  # Bottom-up, so on a pane carrying both a transcript and the live picker the
+  # LOWER (live) one wins — same reason _sup_confirm_match scans this way.
+  for (( f = n - 1; f >= lo; f-- )); do
+    grep -qE "$_SUP_PROMPT_PAT" <<<"${L[f]}" 2>/dev/null || continue
+    w=$(( f - _SUP_LIMIT_SPAN_LINES )); (( w < 0 )) && w=0
+    h=-1; a=-1; c=-1
+    for (( i = w; i < f; i++ )); do
+      if (( h < 0 )) && grep -qE "$_SUP_LIMIT_HOLD_PAT" <<<"${L[i]}" 2>/dev/null; then h=$i; fi
+      if (( a < 0 && h >= 0 && i > h )) && grep -qE "$_SUP_LIMIT_AUTO_PAT" <<<"${L[i]}" 2>/dev/null; then a=$i; fi
+      if grep -qE "$_SUP_LIMIT_CURSOR_PAT" <<<"${L[i]}" 2>/dev/null; then c=$i; fi
+    done
+    (( h >= 0 && a > h && a < f )) || continue
+    steps="unknown"
+    if (( c >= w )); then
+      d=$(( a - c )); (( d < 0 )) && d=$(( -d ))
+      (( d <= _SUP_LIMIT_STEP_MAX )) && steps=$(( a - c ))
+    fi
+    printf '%s\x1f%s\n' \
+      "$(printf '%s\n' "${L[a]}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160)" \
+      "$steps"
+    return 0
+  done
+  return 0
+}
+
 # _sup_prompt_recommended — pure, no I/O. rc 0 when the option the cursor is ON
 # is marked "(Recommended)", rc 1 otherwise.
 #
@@ -756,13 +881,23 @@ _sup_prompt_pane_capture() {  # <user> <sess> <svc_running>
 }
 
 _sup_prompt_pane() {  # <type> <user> <sess> <svc_running>
-  local type="$1" pane excerpt rc
+  local type="$1" pane excerpt rc lrow
   [[ "$type" == "claude" ]] || return 1
   pane=$(_sup_prompt_pane_capture "$2" "$3" "$4"); rc=$?
   (( rc == 0 )) || return "$rc"
   [[ -n "$pane" ]] || return "$_SUP_PROBE_BLIND"
   excerpt=$(printf '%s\n' "$pane" | _sup_prompt_match)
   if [[ -n "$excerpt" ]]; then
+    # DIVE-4581: the usage-limit hold is read FIRST among the footer's readings,
+    # and only ever on a pane this footer already matched. It is the narrower
+    # claim (a picker whose two options are the wall's own), so a pane that
+    # satisfies it is never also an AskUserQuestion; the marks are disjoint and
+    # this one carries its own keystroke plan in the mark.
+    lrow=$(printf '%s\n' "$pane" | _sup_limit_picker_match)
+    if [[ -n "$lrow" ]]; then
+      printf '%s\037limit-picker:%s\n' "${lrow%%$'\x1f'*}" "${lrow##*$'\x1f'}"
+      return 0
+    fi
     if printf '%s\n' "$pane" | _sup_prompt_recommended; then
       printf '%s\037recommended\n' "$excerpt"
     else
@@ -1843,6 +1978,23 @@ _sup_classify() {
         else
           detail="${detail} [seen this tick — the decline waits ${_SUP_T_CONFIRM_DWELL_MIN}m]"
         fi ;;
+      # DIVE-4581: claude's own usage-limit hold. It is the one picker that is
+      # NOT a question — it is the capacity wall this classifier already has a
+      # class for, wearing a picker's footer, and `blocked-on-prompt` paged a
+      # human three times in one evening for it. Reclassified rather than given
+      # a cause under blocked-on-prompt (the DIVE-4536 shape), because here the
+      # STATE differs and not just the remedy: the seat is walled, the wall
+      # prints its own end time, and every surface that counts quota walls —
+      # the board, `agent info`, the rotation branch, the DIVE-4052 sentinel —
+      # should count this too.
+      limit-picker*)
+        class="quota-exhausted"; cause="limit-picker"
+        detail="pane is sitting on claude's own usage-limit hold picker — a capacity wall that prints its own resume time, not a question for a person: ${prompt_excerpt}"
+        if [[ "${prompt_mark#limit-picker:}" == "unknown" ]]; then
+          detail="${detail} [no cursor on a numbered option — the auto-resume option will NOT be pressed; the seat waits for its own reset]"
+        else
+          detail="${detail} [auto-resume option is ${prompt_mark#limit-picker:} step(s) from the cursor — answerable]"
+        fi ;;
       recommended)
         cause="blocked-on-prompt"
         detail="pane is sitting on a choice picker: ${prompt_excerpt} [highlighted option is marked (Recommended) — answerable]" ;;
@@ -2108,6 +2260,11 @@ _sup_agent_record() {
     prompt_excerpt="${prow%%$'\x1f'*}"; prompt_mark="${prow##*$'\x1f'}"
     case "$prompt_mark" in
       recommended) ;;
+      # DIVE-4581: passed through verbatim — the mark carries the cursor-relative
+      # keystroke count the act rung needs, and the dwell below is deliberately
+      # NOT applied: a quota hold has no person about to answer it, and every
+      # tick it stands is a tick the seat is parked for nothing.
+      limit-picker:*) ;;
       # DIVE-4536: the DWELL is applied HERE, where the transcript clock lives,
       # and it gates the KEYSTROKE only — the class, the alert and the audited
       # event all fire on the first tick that sees the confirm. act_age is
@@ -2806,6 +2963,22 @@ _sup_act_exec() {  # <name> <verb> <cause>
       #
       # Never Ctrl-C: that kills the turn, not the modal.
       sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Escape 2>/dev/null || return 1 ;;
+    park-on-limit)
+      # DIVE-4581. <cause> carries the SIGNED distance from the picker's cursor
+      # row to its auto-resume option, computed by _sup_limit_picker_match from
+      # the same capture that classified the seat. Cursor-relative and not a
+      # fixed "Down, Enter" for the reason decline-prompt refuses to press a
+      # digit: a fixed count assumes an option ORDER, and an order that ever
+      # changes turns the assumption into "upgrade the plan" — a spend decision
+      # made by a watchdog. A non-numeric distance never reaches here (the
+      # caller skips on `unknown`); if one did, this refuses rather than guesses.
+      local steps="$cause" key=Down i
+      [[ "$steps" =~ ^-?[0-9]+$ ]] || return 1
+      if (( steps < 0 )); then key=Up; steps=$(( -steps )); fi
+      for (( i = 0; i < steps; i++ )); do
+        sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" "$key" 2>/dev/null || return 1
+      done
+      sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1 ;;
     rotate)
       ( with_registry_lock cmd_agent_rotation_rotate "$name" ) >/dev/null 2>&1 ;;
     # DIVE-3753 rung 4. SUBSHELL, for the same reason rotate is one: cmd_restart
@@ -3126,6 +3299,49 @@ cmd_supervisor_tick() {
         excerpt="${excerpt}; auto-answer failed to reach the pane"
       elif [[ "$prompt_rec" == "true" ]]; then
         excerpt="${excerpt}; automatic actions are disabled"
+      fi
+    fi
+
+    # DIVE-4581: the usage-limit HOLD PICKER, handled before the rotation branch
+    # and ending the row here — no page, whatever happens. Three FLEET-HEALTH
+    # pages reached a phone in one evening for this state; the wall prints when
+    # it ends, so the only thing owed is the keypress that parks the seat on it.
+    # Ahead of rotation on purpose: flipping the profile under an OPEN picker
+    # leaves the picker open and the seat still frozen, so the keypress is the
+    # more specific remedy and it removes its own trigger.
+    if [[ "$cls" == "quota-exhausted" ]]; then
+      local lp_mark; lp_mark=$(jq -r '.signals.promptMark // ""' <<<"$row")
+      if [[ "$lp_mark" == limit-picker:* ]]; then
+        local lp_steps="${lp_mark#limit-picker:}" lp_result="ok" recent_lp
+        if [[ "$actions_on" != "true" ]]; then
+          lp_result="skipped-actions-off"
+        elif [[ "$lp_steps" == "unknown" ]]; then
+          lp_result="skipped-no-cursor"
+        else
+          _sup_act_exec "$name" park-on-limit "$lp_steps" || lp_result="failed"
+        fi
+        # The KEYSTROKE is attempted every tick the picker still stands (an act
+        # that worked removes its own trigger), but the audited row is filed at
+        # most once per alert window per seat — that row is what the digest and
+        # `agent info` read, and a parked seat must not write a line every ten
+        # minutes for the hours a weekly wall lasts.
+        recent_lp=$(db "SELECT COUNT(*) FROM supervisor_events
+                        WHERE agent=$(sqlq "$name") AND event='action' AND cause='limit-picker'
+                          AND ts >= datetime('now', '-${_SUP_ALERT_WINDOW_H} hours');" 2>/dev/null || echo 0)
+        [[ "$recent_lp" =~ ^[0-9]+$ ]] || recent_lp=0
+        if (( recent_lp == 0 )); then
+          db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+              VALUES ($(sqlq "$name"), 'action', 'quota-exhausted', 'limit-picker',
+                      $(sqlq "{\"rung\":\"park-on-limit\",\"result\":\"${lp_result}\",\"steps\":\"${lp_steps}\"}"));" 2>/dev/null \
+            && { acted=$((acted + 1)); events=$((events + 1)); } \
+            || warn "supervisor: park-on-limit audit insert failed for $name"
+        fi
+        if [[ "$lp_result" == "ok" ]]; then
+          warn "supervisor: PARKED $name — usage-limit hold, took the wait-and-resume option (no page: the wall names its own reset)"
+        else
+          warn "supervisor: usage-limit hold on $name — ${lp_result}; the seat waits for its own reset (no page)"
+        fi
+        continue
       fi
     fi
 

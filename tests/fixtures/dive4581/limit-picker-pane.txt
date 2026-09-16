@@ -1,0 +1,24 @@
+
+ ▐▛███▛█   Claude Code v2.1.273
+▝▜██████▀  Sonnet 5 · Claude API
+  ▝▝ ▝▝    /var/lib/5dive-warm/mark
+
+
+❯ [cc-inject-probe] no-op: this line only proves your composer still submits
+  after tonight Claude Code upgrade. Do nothing and do not claim a task.
+  ⎿  You've hit your org's monthly spend limit · ask your admin to raise it at
+     claude.ai/admin-settings/usage · your weekly limit resets Sep 19, 12pm
+     (UTC)
+
+✻ Sautéed for 0s · done 4:36 AM
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Wait here, then continue automatically at Sep 19, 12pm
+     3. Upgrade your plan
+
+   Enter to confirm · Esc to cancel
