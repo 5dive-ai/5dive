@@ -791,5 +791,88 @@ grep -q "task.done.,.task.rejected.,.task.graded" <<<"$both" \
        "$(grep -n 'task.rejected' <<<"$both")" \
   || ok_ 'ONE PLACE: neither reader carries an inline copy of the exit set'
 
+# ══ DIVE-4575: AN IDLE TEMPLATE SEAT MUST NOT BLIND ITS OWN ACCOUNT ═════════
+#
+# Measured on this host 2026-09-15: the pool's second template seat main2 sat
+# idle from 09-14, its statusline cache carried no `rate_limits` key, and the
+# lane refused it on EVERY tick for nine hours — `main2: refuse: mark has no 5h
+# reading (null)` — while `main`, on the SAME auth account and therefore in the
+# same window, held a live reading the whole time. Seven graded deliveries sat
+# in the queue. The pool could not use a seat precisely because it had not been
+# using it, and nothing about waiting fixes that: an unwritten cache does not
+# appear at a window reset.
+#
+# The three arms below are the whole loop at the TICK level — the floor harness
+# grades the decision function, this grades whether the lane spawns.
+IDLE_USAGE='{"agents":[{"account":"mark","name":"g1","fiveHourPct":null,"sevenDayPct":null}]}'
+idle_usage_cmd(){ printf '%s' "$IDLE_USAGE"; }
+SNAP=''
+quota_snapshot_read(){ [[ -n "$SNAP" ]] && printf '%s' "$SNAP"; return 0; }
+NOW4575=$(date +%s)
+snap4575(){  # <5h pct> <7d pct>
+  printf '{"writtenAt":%d,"accounts":[{"name":"mark","usage":{"asOf":%d,"source":"main","remembered":false,"fiveHour":{"pct":%s,"resetsAt":%d},"sevenDay":{"pct":%s,"resetsAt":%d}}}]}' \
+    "$NOW4575" "$((NOW4575 - 30))" "$1" "$((NOW4575 + 3600))" "$2" "$((NOW4575 + 86400))"
+}
+_GRADER_POOL="g1"; _GRADER_READ_PROBE=probe_ok; _GRADER_USAGE_CMD=idle_usage_cmd
+_GRADER_MAX_PER_SEAT=9
+
+# A — THE ROW. The pool seat's own row reads null on both windows; the ACCOUNT
+#     has a fresh reading under the floor. The lane must spawn.
+SNAP="$(snap4575 7 40)"
+out=$(run --cap=5 --commit)
+[[ "$(grep -c . "$SPAWNF")" == 3 ]] \
+  && ok_ '4575: an idle seat with a fresh ACCOUNT reading spawns (was 9h of refusals)' \
+  || bad_ '4575 idle seat spawns on the account reading' "plan: $out"
+grep -q 'from the account reading' <<<"$out" \
+  && ok_ '4575: the spawn line names WHICH source answered' \
+  || bad_ '4575 spawn line names the source' "$out"
+
+# B — THE NEGATIVE CONTROL, and the half that keeps the fail-closed rule intact
+#     (DIVE-4342): with NO account reading either, the lane still refuses. It
+#     must also SAY that it is dark rather than throttled — nine hours of
+#     `no seat with headroom` were read as a busy account, which is why the
+#     defect survived a whole day of a log nobody could act on.
+SNAP=''
+out=$(run --cap=5 --commit)
+[[ ! -s "$SPAWNF" ]] \
+  && ok_ '4575: both sources blind still fails CLOSED (never assumes 0%)' \
+  || bad_ '4575 blind account spawns nothing' "spawned: $(spawns)"
+grep -q 'POOL DARK' <<<"$out" \
+  && ok_ '4575: the queue line says the lane is DARK, not throttled' \
+  || bad_ '4575 queue line says POOL DARK' "$out"
+grep -q 'queue   DIVE-1  (no seat with headroom — ' <<<"$out" \
+  && ok_ '4575: the park headline is unchanged (the errexit arm grades it)' \
+  || bad_ '4575 park headline unchanged' "$out"
+outj=$(run --cap=5 --commit --json)
+[[ "$(printf '%s' "$outj" | python3 -c 'import json,sys;print(json.load(sys.stdin)["blindAccount"])')" == 3 ]] \
+  && ok_ '4575: blindAccount counts the unmeasured refusals, separate from dark' \
+  || bad_ '4575 blindAccount count' "$outj"
+[[ "$(printf '%s' "$outj" | python3 -c 'import json,sys;print(json.load(sys.stdin)["dark"])')" == 0 ]] \
+  && ok_ '4575: a NAMED pool refusing is not counted as an unconfigured lane' \
+  || bad_ '4575 dark stays 0 with a named pool' "$outj"
+
+# C — ONE DOOR FURTHER BACK. A seat idle long enough has NO ROW AT ALL in the
+#     usage document (cmd_usage.sh `continue`s past a seat that moved no tokens
+#     in the window), so `_grader_account_of` resolved it to no account and the
+#     floor refused it for "no account named" — a different, even less
+#     actionable message for the same cause. The binding is REGISTRY state and
+#     outlives any amount of idleness, so it is read from there first.
+EMPTY_USAGE='{"agents":[]}'
+empty_usage_cmd(){ printf '%s' "$EMPTY_USAGE"; }
+quota_seat_account(){ [[ "$1" == g1 ]] && printf 'mark'; return 0; }
+_GRADER_USAGE_CMD=empty_usage_cmd
+SNAP="$(snap4575 7 40)"
+out=$(run --cap=5 --commit)
+[[ "$(grep -c . "$SPAWNF")" == 3 ]] \
+  && ok_ '4575: a seat ABSENT from the usage doc still resolves its account (registry)' \
+  || bad_ '4575 absent seat resolves via the registry' "plan: $out"
+unset -f quota_seat_account
+out=$(run --cap=5 --commit)
+[[ ! -s "$SPAWNF" ]] \
+  && ok_ '4575: with no binding anywhere the seat is still refused, not guessed' \
+  || bad_ '4575 unbound seat refuses' "spawned: $(spawns)"
+unset -f quota_snapshot_read
+SNAP=''; _GRADER_USAGE_CMD=usage_cmd; _GRADER_POOL="g1"
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

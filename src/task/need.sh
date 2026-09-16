@@ -1876,6 +1876,42 @@ _gate_ask_codehost_rule() {   # <ask> -> 0 when a per-change tap is asked for BE
   return 0
 }
 
+# ── DIVE-4537 — ARM 3: A MERGE ON A REPOSITORY WE OWN IS A CAPABILITY GATE ───
+#
+# lodar, 2026-09-14 13:43Z: "why i still get false human gates? i thought we
+# fixed this". Two reached his phone that morning; this is the second of them.
+# DIVE-4514 (quinn, 10:39:56Z) was a `manual` gate — tier 2 BY TYPE, so it skips
+# the lead-first rail entirely — asking him to "Press Merge (plain merge, never
+# Squash)" on two pull requests in an org WE OWN. quinn's token cannot merge.
+# main's can, and did: 5dive-chat#11 landed at 13:43Z as a two-parent merge
+# commit, five minutes after he forwarded it.
+#
+# So the ask was answerable, but not by him and not only by him — the capability
+# it consumes is a WRITE TOKEN ON OUR OWN REPO, which several seats hold. That is
+# the definition of a capability gate, and DIVE-4365's own rule for one is to
+# hand the ROW to a holder (`task assign`), not to file a question. The rule was
+# already written; `manual` was the type it did not cover, because `manual` is
+# floored at tier 2 by type and never meets the lead-first routing that would
+# have caught this.
+#
+# NARROW ON PURPOSE, three conjuncts, and each one is load-bearing:
+#   * the ask names a github.com URL under an org we own (5dive-ai, lodar). A
+#     third-party repo is genuinely someone else's button and is NOT caught.
+#   * the ask asks for a repo WRITE (merge/squash/land/push/revert). "Is the
+#     approach in <our PR> right?" is a judgement and stays fileable.
+#   * the filer is an AGENT seat. A person filing this for another person is not
+#     the population, and reading the caller keeps it that way.
+# The `--ask-ok` escape is the fourth exit, for the real case where every holder
+# is genuinely out of tokens.
+_GATE_ASK_OURREPO_RX='github\.com/(5dive-ai|lodar)/'
+_GATE_ASK_REPO_WRITE_RX='\b(merge|merges|merged|merging|squash|land|landed|push|pushed|revert)\b'
+_gate_ask_our_repo_write() {   # <ask> -> 0 when it asks for a write on a repo we own
+  local s="${1:-}"
+  LC_ALL=C grep -Eiq "$_GATE_ASK_OURREPO_RX" <<<"$s" || return 1
+  LC_ALL=C grep -Eiq "$_GATE_ASK_REPO_WRITE_RX" <<<"$s" || return 1
+  return 0
+}
+
 # Word count on whitespace. Deliberately the same unit the human experiences —
 # words on a phone screen — not characters or bytes.
 _gate_ask_word_count() {
@@ -3701,6 +3737,53 @@ NO EXIT HERE CHANGES THE DESTINATION: --tier=1 would send this somewhere else, a
       warn "bare-option escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". Every option on this gate is a single character, and the human is still being sent it."
     fi
 
+    # DIVE-4537 — THE CAPABILITY REFUSAL, ahead of the answerability arms because
+    # it is a stronger statement about the same gate: this ask is not merely hard
+    # for the reader, it is addressed to the wrong KIND of holder. Scoped to
+    # `manual` (the type that skips the lead-first rail by being tier-2 by type)
+    # filed by an AGENT seat, which is the population DIVE-4365 left uncovered.
+    #
+    # THE POPULATION IS "NOT A PERSON", AND IT HAS THREE OUTCOMES, NOT TWO
+    # (iteration 3). `_gate_withdraw_actor` prints `agent <name>` | `human` |
+    # `none`, and iteration 2 refused only the first — so BOTH other outcomes
+    # failed OPEN, in the direction this row exists to close. `none` is not an
+    # exotic branch: it is what an unattributable caller resolves to — root cron,
+    # a systemd timer, a harness running as root with no SUDO_* (DIVE-4341) — and
+    # a gate filed by one of those is by construction not a person handing work to
+    # another person. It is refused, with the same audited `--ask-ok` escape, so
+    # nothing becomes unfileable (DIVE-2216).
+    #
+    # `human` still FILES, deliberately. A person filing this for a person is not
+    # the population: nobody is being asked to do work a seat here could do
+    # instead, and refusing it would tell the one caller who is already the
+    # capability holder to hand the row to themselves. The caveat, written down
+    # because it is a real fail-open: a uid that merely APPEARS in /etc/passwd
+    # resolves `human`, which is what a GitHub Actions runner does — so this guard
+    # does not bind in CI. That is acceptable here (CI files no gates on this
+    # host's store) and it is why the harness below pins the actor seam for every
+    # arm instead of inheriting whatever identity the runner happens to have.
+    if [[ "$type" == "manual" ]] && _gate_ask_our_repo_write "$ask"; then
+      local _cap_actor _cap_kind
+      _cap_actor=$(_gate_withdraw_actor)      # "agent <name>" | "human" | "none"
+      _cap_kind="${_cap_actor%% *}"
+      if [[ "$_cap_kind" == "agent" || "$_cap_kind" == "none" ]]; then
+        if [[ -z "$ask_ok" ]]; then
+          _task_store_audit_log "task need ask-capability" "refused" 0 -- \
+            "task=$ident" "filer=${actor:-}" "type=$type" "why=repo-write-on-our-own-repo" "caller=${_cap_kind}" || true
+          fail "$E_VALIDATION" "$ident: refusing this gate because it asks a person to make a change in one of OUR OWN code repositories — that is a permission some of our own seats already hold, so it is a job to hand over, not a question to ask.
+The person tapping decides nothing here: whoever holds the write access does the same thing whichever way they answer, and the only thing the tap buys is the delay until they read it. Measured 2026-09-14: one of these sat on the paired human's phone for three hours and was then done by another seat in five minutes.
+  hand the row over          '5dive task assign ${ident} main' (or another seat that holds the access) — this is the exit that is wanted.
+  ask for the access         if nobody here holds it, the missing credential is its own gate: --type=secret, which IS a human capability.
+  --ask-ok=\"<why no seat here can do this>\"    the audited exception, for the real case where every holder is out of tokens. Recorded on the gate and countable afterwards."
+        fi
+        [[ ${#ask_ok} -ge 12 ]] \
+          || fail "$E_VALIDATION" "--ask-ok must state WHY no seat here can make this repository change (it is recorded on the gate and read by whoever counts these exceptions later)"
+        _task_store_audit_log "task need ask-capability" "escaped" 0 -- \
+          "task=$ident" "filer=${actor:-}" "type=$type" "why=repo-write-on-our-own-repo" "caller=${_cap_kind}" "declared=$ask_ok" || true
+        warn "capability escape ACCEPTED and RECORDED: --ask-ok=\"${ask_ok}\". This ask wants a change in a repository we own, and the human is still being sent it."
+      fi
+    fi
+
     # DIVE-4346 — THE ANSWERABILITY REFUSALS. Placed inside `_ar_human` for the
     # same reason the readability refusal is: only a gate that actually reaches
     # the paired human is graded on whether a person can act on it. A tier-1 ask
@@ -4022,9 +4105,20 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+    # DIVE-4537 (iteration 2): AN AUTO-APPLIED ANSWER OWES THE SAME WORK A TYPED
+    # ONE DOES. The iteration-cap stop is the one gate whose answer IS a verb, and
+    # every auto-clear here writes need_answer directly and returns — so without
+    # this line the stop is recorded as answered and the loop stays stopped, which
+    # is worse than the gate it replaced (no human and no lead is in the path to
+    # notice). No-op on every other gate: the executor is self-guarding.
+    local _t0_esc=""
+    if declare -F _task_escalation_auto_apply >/dev/null 2>&1; then
+      _task_escalation_auto_apply "$id" "$ident" "$recommend" "auto:t0" || true
+      _t0_esc="${_ESC_AUTO_NOTE:-}"
+    fi
     # DIVE-2054: auto-clear applied from task-store data — fenced.
     _task_store_audit_log "task need t0-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$recommend" || true
-    ok "$ident tier-0 gate auto-cleared — applied: $recommend" \
+    ok "$ident tier-0 gate auto-cleared — applied: $recommend${_t0_esc}" \
        '{id:($i|tonumber), ident:$id, tier:0, auto_applied:$rc, need_type:$ty}' \
        --arg i "$id" --arg id "$ident" --arg rc "$recommend" --arg ty "$type"
     return
@@ -4273,9 +4367,15 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
                 UPDATE tasks SET status='todo'
                   WHERE id=${id} AND status='blocked'
                     AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+            # DIVE-4537 (iteration 2) — see the same line at the tier-0 clear above.
+            local _pr_esc=""
+            if declare -F _task_escalation_auto_apply >/dev/null 2>&1; then
+              _task_escalation_auto_apply "$id" "$ident" "$_qans" "auto:precedent" || true
+              _pr_esc="${_ESC_AUTO_NOTE:-}"
+            fi
             # DIVE-2054: same reasoning as "task need t0-auto" above — fenced.
             _task_store_audit_log "task need precedent-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$_qans" "precedent=$_qid" || true
-            ok "$ident tier-1 gate auto-cleared from human precedent — applied: $_qans (precedent #$_qid)" \
+            ok "$ident tier-1 gate auto-cleared from human precedent — applied: $_qans (precedent #$_qid)${_pr_esc}" \
                '{id:($i|tonumber), ident:$id, tier:1, need_type:$ty, auto_applied:$rc, need_answered_by:"auto:precedent", precedent_ref:($pr|tonumber)}' \
                --arg i "$id" --arg id "$ident" --arg ty "$type" --arg rc "$_qans" --arg pr "$_qid"
             return
@@ -4351,6 +4451,19 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
           UPDATE tasks SET status='todo'
             WHERE id=${id} AND status='blocked'
               AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+      # DIVE-4537 (iteration 2) — THE PATH THIS DEFECT WAS MEASURED ON. Every seat
+      # that files an iteration-cap stop is promoted on this host (quinn 93%, dev
+      # 94%, ops 100%), the escalation carries a --recommend, and `track_record`
+      # defaults ON in code — so this clear, not a lead's tap, is the likeliest
+      # answer the stop will ever get. Before this line it recorded "keep going"
+      # and left the loop stopped: the row held by the verifier at iteration ==
+      # max_iterations, unstamped, nobody pinged, and no human or lead in the path
+      # to notice. See the same line at the tier-0 clear above.
+      local _tr_esc=""
+      if declare -F _task_escalation_auto_apply >/dev/null 2>&1; then
+        _task_escalation_auto_apply "$id" "$ident" "$recommend_arg" "auto:record" || true
+        _tr_esc="${_ESC_AUTO_NOTE:-}"
+      fi
       # DIVE-2054: an auto-clear applied from task-store data — fenced on store
       # identity, same primitive as the tier-0, TTL and pfr auto-clears.
       _task_store_audit_log "task need record-auto" "ok" 0 -- \
@@ -4359,7 +4472,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
       ledger_emit gate.autocleared ident="$ident" task_id="$id" actor="$actor" \
         policy="record:${type}" \
         detail="tier-1 decision auto-applied on ${actor}'s track record (${_tr_c}/${_tr_t} = ${_tr_pct}%, last ${_GATE_RECORD_STREAK} clean) — applied: ${recommend_arg}" || true
-      ok "$ident tier-1 decision auto-cleared on your track record — applied: $recommend_arg (record: ${_tr_c}/${_tr_t} = ${_tr_pct}% of your last ${_tr_t} answered tier-1 decision gates returned your recommendation, last ${_GATE_RECORD_STREAK} clean; nobody was pinged, provenance auto:record). ONE answer against your recommendation revokes this. 5dive task track-record off restores the ping." \
+      ok "$ident tier-1 decision auto-cleared on your track record — applied: ${recommend_arg}${_tr_esc} (record: ${_tr_c}/${_tr_t} = ${_tr_pct}% of your last ${_tr_t} answered tier-1 decision gates returned your recommendation, last ${_GATE_RECORD_STREAK} clean; nobody was pinged, provenance auto:record). ONE answer against your recommendation revokes this. 5dive task track-record off restores the ping." \
          '{id:($i|tonumber), ident:$id, tier:1, need_type:$ty, auto_applied:$rc, need_answered_by:"auto:record", record_concordant:($c|tonumber), record_total:($t|tonumber), record_rate:($p|tonumber)}' \
          --arg i "$id" --arg id "$ident" --arg ty "$type" --arg rc "$recommend_arg" \
          --arg c "$_tr_c" --arg t "$_tr_t" --arg p "$_tr_pct"

@@ -298,5 +298,86 @@ else
   eval "$ORIG_DELIV"
 fi
 
+echo "── PART 6 — composition with DIVE-4559's small-delivery downgrade ─"
+# WHICH RAIL FIRES FIRST ON A SMALL BOUND ROW, AND WHY THAT ORDER IS THE RIGHT
+# ONE. #985 (DIVE-4559) and this row both rewrote the delivery/close routing
+# fork and share four files; only `src/lib/verify_policy.sh` conflicted at the
+# merge, and a clean textual merge in the other three is evidence that the LINES
+# do not overlap and NO evidence that the two POLICIES compose. So the order is
+# asserted here rather than left to be discovered on a live close.
+#
+# MEASURED, and it is the size rule that wins: the DIVE-4559 skip is evaluated
+# in `task done`'s routing fork (src/task/status.sh) BEFORE it calls
+# `_task_route_to_verifier`, and this row's evidence guard lives INSIDE that
+# function — so a small delivery is never asked for evidence.
+#
+# THAT IS THE INTENDED SHAPE, not a hole. The five fields exist for exactly one
+# reader: a grader who would otherwise re-derive the work. A row the box has
+# already decided not to grade has no such reader, and refusing it would tax a
+# maker for a session nobody books. The other direction would be the defect —
+# demanding evidence and then closing without a grade is the "CHANGED: n/a"
+# shape this rail's own scope decision exists to avoid. The guards that DO
+# apply to a small close are unchanged and still ahead of it: CI, and the
+# DIVE-1830 merge gate (which is what stops the small close in this harness,
+# where no gh credential can resolve the PR — a fixture limit, not a policy).
+#
+# The two arms that make this evidence rather than assertion: the SAME row at
+# 400 lines meets the evidence refusal, and the same 12-line row on a box with
+# the knob at its shipped `off` meets it too.
+_task_delivery_paths()      { printf 'src/cmd_agent.sh\n'; }   # ordinary code: not deep, not denylisted
+_task_delivery_file_lines() { printf 'src/cmd_agent.sh\t%s\n' "${SM_LINES:-12}"; }
+bound_row() {  # <title> [add-flags...] -> ident of a BOUND, in-progress maker row
+  local _t="$1"; shift
+  local _i; _i=$(add_row "$_t" --review=temp "$@")
+  cmd_task_deliver "$_i" --pr="$PR" --result="$GOOD" >/dev/null 2>&1
+  db "UPDATE tasks SET assignee='dev', status='in_progress', verifier='grader'
+        WHERE ident=$(sqlq "$_i");"
+  printf '%s' "$_i"
+}
+UNEV="fixed it, looks right now"
+
+printf '{"verify":"always","verify_small":30}\n' > "$BOX_CONFIG"
+IDS1=$(bound_row "small bound row, unevidenced")
+: > "$SPAWNS"
+OUTS1=$(SM_LINES=12 cmd_task_done "$IDS1" --result="$UNEV" 2>&1)
+[[ "$OUTS1" == *"DIVE-4559"* && "$OUTS1" != *"does not state"* ]] \
+  && ok_t "small bound row: the SIZE downgrade fires first and the evidence rail never runs" \
+  || bad_t "small bound row: the SIZE downgrade fires first and the evidence rail never runs" "$(printf '%s' "$OUTS1" | tr '\n' ' ' | head -c 400)"
+# Not "the row closed" — the DIVE-1830 merge gate stops that in this harness —
+# but "it was never handed to the grader", which is the property the ordering
+# turns on. The handoff clock is NOT the witness here: the fixture's own
+# `task deliver` stamped it before this arm ran.
+[[ "$(col "$IDS1" assignee)" == "dev" && "$(col "$IDS1" status)" != "todo" && "$(spawn_count)" == "0" ]] \
+  && ok_t "small bound row: no grader round was booked, so there is no reader the evidence was owed to" \
+  || bad_t "small bound row: no grader round was booked" "assignee='$(col "$IDS1" assignee)' status='$(col "$IDS1" status)' spawns=$(spawn_count)"
+
+# CONTROL 1 — same row, same box, same stubs: only the line count changes.
+IDS2=$(bound_row "large bound row, unevidenced")
+OUTS2=$(SM_LINES=400 cmd_task_done "$IDS2" --result="$UNEV" 2>&1); RCS2=$?
+(( RCS2 != 0 )) && [[ "$OUTS2" == *"does not state"* && "$OUTS2" != *"DIVE-4559"* ]] \
+  && ok_t "over the threshold the evidence refusal fires instead (the skip above came from the SIZE)" \
+  || bad_t "over the threshold the evidence refusal fires instead" "rc=$RCS2 $(printf '%s' "$OUTS2" | tr '\n' ' ' | head -c 300)"
+
+# CONTROL 2 — an explicit `--verify` beats small (DIVE-4251's row-over-box
+# ruling, which #985 preserved), so the row is graded and the evidence is owed.
+IDS3=$(bound_row "small bound row that demanded a grade" --verify)
+OUTS3=$(SM_LINES=12 cmd_task_done "$IDS3" --result="$UNEV" 2>&1); RCS3=$?
+(( RCS3 != 0 )) && [[ "$OUTS3" == *"does not state"* ]] \
+  && ok_t "a --verify row is small-exempt, so its delivery still owes evidence" \
+  || bad_t "a --verify row is small-exempt, so its delivery still owes evidence" "rc=$RCS3 $(printf '%s' "$OUTS3" | tr '\n' ' ' | head -c 300)"
+
+# CONTROL 3 — THE SHIPPED DEFAULT. With the knob off (every box until its owner
+# sets it), the identical 12-line delivery meets the evidence rail: the ordering
+# above exists only where someone bought it.
+printf '{"verify":"always"}\n' > "$BOX_CONFIG"
+IDS4=$(bound_row "small bound row, knob off")
+OUTS4=$(SM_LINES=12 cmd_task_done "$IDS4" --result="$UNEV" 2>&1); RCS4=$?
+(( RCS4 != 0 )) && [[ "$OUTS4" == *"does not state"* ]] \
+  && ok_t "with verify-small=off (the shipped default) the same 12-line delivery owes evidence" \
+  || bad_t "with verify-small=off the same 12-line delivery owes evidence" "rc=$RCS4 $(printf '%s' "$OUTS4" | tr '\n' ' ' | head -c 300)"
+unset -f _task_delivery_paths _task_delivery_file_lines bound_row
+unset SM_LINES
+. "$SRC/task/routing.sh"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAILN"
 (( FAILN == 0 ))

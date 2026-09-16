@@ -481,6 +481,129 @@ run verifier "$idnv2" nvgrader >/dev/null 2>&1
   && ok_t "no-verify: 'task verifier' clears the opt-out it overrides" \
   || bad_t "optout supersede" "still $(db "SELECT verify_optout FROM tasks WHERE id=${idnv2};") after an explicit attach"
 
+# --- T-4559: the SMALL-delivery downgrade, the inverse of the T-2730 upgrade.
+#
+# THE PURE HALF FIRST (a `path<TAB>changed-lines` list on stdin -> a reason or
+# nothing), for the same reason T-2719 grades `_task_delivery_depth` directly:
+# the gh-backed half prints nothing on every failure path, and "prints nothing"
+# is already an input this function is graded on.
+sm=$(printf 'src/cmd_agent.sh\t9\nREADME.md\t5\n' | _task_delivery_small 30)
+[[ "$sm" == "small delivery: 2 files / 14 changed lines, under verify-small=30" ]] \
+  && ok_t "small: a 14-line two-file delivery is small under a 30-line threshold, and says the count" \
+  || bad_t "small class" "got '$sm'"
+
+# NON-VACUITY, and the arm that keeps this from being a permanent yes: one line
+# over the threshold is not small. Without it every arm below is satisfied by a
+# function that returns a reason unconditionally.
+sm=$(printf 'src/cmd_agent.sh\t31\n' | _task_delivery_small 30)
+[[ -z "$sm" ]] \
+  && ok_t "small: 31 changed lines is NOT small under a 30-line threshold" || bad_t "over threshold" "got '$sm'"
+
+# THE EXCLUSIONS MATTER MORE THAN THE NUMBER (the ticket's own words). A
+# two-line shared-lib or sudoers edit is not small at any count.
+for _p in src/lib/verify_policy.sh scripts/inc/5dive-cli.sh etc/sudoers.d/5dive systemd/5dive.service src/lib/schema.ts; do
+  sm=$(printf '%s\t2\n' "$_p" | _task_delivery_small 30)
+  [[ -z "$sm" ]] \
+    && ok_t "small: a 2-line change under $_p is never small (denylist beats the count)" \
+    || bad_t "denylist $_p" "got '$sm' — a denylisted path was downgraded"
+done
+
+# The blast radius is ONE list, shared with T-2719's depth: a scheduler path is
+# refused here without this function owning a second copy of the globs.
+sm=$(printf 'src/cmd_heartbeat.sh\t1\n' | _task_delivery_small 30)
+[[ -z "$sm" ]] \
+  && ok_t "small: a 1-line scheduler change is never small (deep globs are shared with the depth rail)" \
+  || bad_t "deep in small" "got '$sm'"
+
+# UNKNOWN STAYS UNKNOWN, both shapes. An empty list is vacuously "all files
+# under any threshold" — the same trap T-2719d names — and a non-numeric count
+# is a gh output shape nobody has seen yet, not a zero.
+sm=$(printf '' | _task_delivery_small 30)
+[[ -z "$sm" ]] && ok_t "small: no files -> unknown, never small" || bad_t "empty is small" "got '$sm'"
+sm=$(printf 'README.md\t\n' | _task_delivery_small 30)
+[[ -z "$sm" ]] && ok_t "small: an unparseable line count -> unknown, never small" || bad_t "junk count" "got '$sm'"
+
+# OFF IS OFF, whatever the diff — the shipped default on every box.
+sm=$(printf 'README.md\t1\n' | _task_delivery_small off)
+[[ -z "$sm" ]] && ok_t "small: the knob at 'off' downgrades nothing" || bad_t "off ignored" "got '$sm'"
+
+# --- and the END-TO-END half, through `task done`'s routing fork. Four rows,
+# identical but for the one input under test, so each arm's control is the arm
+# beside it rather than an assertion about what the code "would" do.
+fixture_box_verify_small 30 || bad_t "fixture" "could not set verify-small"
+_task_delivery_paths()      { printf 'src/cmd_agent.sh\n'; }   # ordinary code: neither deep nor shallow
+_task_delivery_file_lines() { printf 'src/cmd_agent.sh\t%s\n' "${SM_LINES:-12}"; }
+
+# The verifier is attached AT FILING (`--verifier=`), never afterwards with the
+# `task verifier` verb: DIVE-4251 made that verb set `verify_forced=1` (naming a
+# grader by hand IS a demand for a grade), which would have exempted every
+# fixture row from the size rule and left four of the six arms below vacuously
+# green. Found by this harness — the first draft used the verb.
+sm_row() {  # <flag...> -> id of a started row carrying a distinct verifier
+  local _id; _id=$(run add --assignee=smmaker --verifier=smgrader --body="w" "$@" -- "small-delivery fixture $RANDOM" | jf '.data.id')
+  run start "$_id" >/dev/null 2>&1
+  printf '%s' "$_id"
+}
+
+# ...and the fixture PROVES it is not force-flagged, because that is the exact
+# way this test can stop testing anything without going red.
+_smchk=$(sm_row)
+[[ "$(db "SELECT COALESCE(verify_forced,0) FROM tasks WHERE id=${_smchk};")" == "0" \
+   && "$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${_smchk};")" == "smgrader" ]] \
+  && ok_t "small fixture: the row carries a verifier and NO --verify flag (the arms below are not vacuous)" \
+  || bad_t "fixture not clean" "verify_forced=$(db "SELECT verify_forced FROM tasks WHERE id=${_smchk};") verifier=$(db "SELECT verifier FROM tasks WHERE id=${_smchk};")"
+
+id_sm=$(sm_row); SM_LINES=12 run done "$id_sm" --result="two-liner" >/dev/null
+[[ "$(db "SELECT status FROM tasks WHERE id=${id_sm};")" == "done" \
+   && "$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id_sm};")" == "smgrader" ]] \
+  && ok_t "small: a 12-line delivery CLOSES instead of booking its grader (the verifier column is kept as the record of who would have)" \
+  || bad_t "small close" "status=$(db "SELECT status FROM tasks WHERE id=${id_sm};") assignee=$(db "SELECT assignee FROM tasks WHERE id=${id_sm};") — the row routed instead of closing"
+grep -q 'DIVE-4559' "$TMP"/err \
+  && ok_t "small: the skip NAMES itself and its count on stderr" \
+  || bad_t "silent skip" "warn does not mention DIVE-4559: $(tr '\n' ' ' <"$TMP"/err)"
+
+# THE CONTROL, and it is what makes the arm above evidence: same row, same
+# stubs, same box — only the line count changes, and the round comes back.
+id_big=$(sm_row); SM_LINES=400 run done "$id_big" --result="big" >/dev/null
+[[ "$(db "SELECT status FROM tasks WHERE id=${id_big};")" == "todo" \
+   && "$(db "SELECT assignee FROM tasks WHERE id=${id_big};")" == "smgrader" ]] \
+  && ok_t "small: a 400-line delivery still routes to its verifier (the close above came from the SIZE, not from the fixture)" \
+  || bad_t "large control" "status=$(db "SELECT status FROM tasks WHERE id=${id_big};") assignee=$(db "SELECT assignee FROM tasks WHERE id=${id_big};")"
+
+# A denylisted path at the SAME small size still books the grader — the arm the
+# ticket asks for by name, driven through the real fork rather than the class.
+_task_delivery_paths()      { printf 'src/lib/verify_policy.sh\n'; }
+_task_delivery_file_lines() { printf 'src/lib/verify_policy.sh\t5\n'; }
+id_deny=$(sm_row); run done "$id_deny" --result="five lines, shared lib" >/dev/null
+[[ "$(db "SELECT status FROM tasks WHERE id=${id_deny};")" == "todo" \
+   && "$(db "SELECT assignee FROM tasks WHERE id=${id_deny};")" == "smgrader" ]] \
+  && ok_t "small: a 5-line change to a shared lib still routes (path beats size end to end)" \
+  || bad_t "denylist e2e" "status=$(db "SELECT status FROM tasks WHERE id=${id_deny};") — a denylisted path closed ungraded"
+
+# `--verify` BEATS SMALL, exactly as it beats the box policy: a row that
+# demanded a grade made a claim about the diff's importance, not its size.
+_task_delivery_paths()      { printf 'src/cmd_agent.sh\n'; }
+_task_delivery_file_lines() { printf 'src/cmd_agent.sh\t3\n'; }
+id_force=$(sm_row --verify); run done "$id_force" --result="tiny but demanded" >/dev/null
+[[ "$(db "SELECT status FROM tasks WHERE id=${id_force};")" == "todo" \
+   && "$(db "SELECT assignee FROM tasks WHERE id=${id_force};")" == "smgrader" ]] \
+  && ok_t "small: an explicit --verify row is graded however small the delivery is" \
+  || bad_t "forced beats small" "status=$(db "SELECT status FROM tasks WHERE id=${id_force};") — --verify was overruled by the size rule"
+
+# AND THE SHIPPED DEFAULT: with the knob off, the identical 3-line delivery
+# routes. This is the arm that says an upgraded box changes nothing until its
+# owner sets a threshold.
+fixture_box_verify_small off || bad_t "fixture" "could not clear verify-small"
+id_off=$(sm_row); run done "$id_off" --result="tiny, knob off" >/dev/null
+[[ "$(db "SELECT status FROM tasks WHERE id=${id_off};")" == "todo" \
+   && "$(db "SELECT assignee FROM tasks WHERE id=${id_off};")" == "smgrader" ]] \
+  && ok_t "small: with verify-small=off (the shipped default) a 3-line delivery still routes" \
+  || bad_t "off e2e" "status=$(db "SELECT status FROM tasks WHERE id=${id_off};") — the downgrade fired on a box that never asked for it"
+
+unset -f _task_delivery_paths _task_delivery_file_lines sm_row
+unset SM_LINES
+. "$SRC/task/routing.sh"
+
 # The named exclusion list: data, not a code change.
 FIVE_VERIFY_EXCLUDE="main, dev2" _task_verify_excluded main \
   && ok_t "verify exclusion: a listed name is excluded" || bad_t "exclusion hit" "main not excluded"

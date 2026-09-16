@@ -688,9 +688,32 @@ _task_status_cmd() {
         # WOULD have graded, and `5dive trace` can still answer why nobody did.
         warn "$ident: verifier round skipped (DIVE-2719) — the delivered diff touches only tests/docs/changelog, where CI is the gate and a grading round-trip adds latency and no signal. Grader on the row was '$_vfier'; force the review with '5dive task verifier $ident $_vfier' after re-opening if you disagree."
       else
-        _task_done_merge_pending_guard "$id" "$ident"
-        _task_route_to_verifier "$id" "$_vfier" "$_asignee" "$result" "$want_result"
-        return
+        # DIVE-4559: the SIZE downgrade, and it is the mirror image of the
+        # DIVE-2730 upgrade below — that one measures the diff at delivery and
+        # BUYS a grader the filing never asked for; this one measures the same
+        # diff and DECLINES one the filing did ask for. Both are the same
+        # ruling: the delivery-time measurement beats the file-time guess, in
+        # whichever direction the measurement points. (lodar, 2026-09-15: "can
+        # we set verification off for small tasks? we can be flexible", said in
+        # the same breath as "maybe we shouldn't turn off grader?" — so the
+        # answer had to be a size rule, not an off switch.)
+        #
+        # ORDER MATTERS AND IT IS NOT DECORATIVE. A `deep` depth never reaches
+        # this branch's condition, and the small classifier re-checks the blast
+        # radius itself (_task_path_small_denied), so a scheduler or credentials
+        # path cannot be downgraded by either rail alone or by the two of them
+        # disagreeing. Off by default — `box_verify_small` reads `off` until a
+        # box sets it, so every existing box keeps today's behaviour and pays
+        # not even the extra gh call.
+        local _small=""
+        [[ "$_depth" != "deep" ]] && _small=$(_task_delivery_small_reason "$id")
+        if [[ -n "$_small" ]]; then
+          warn "$ident: verifier round skipped (DIVE-4559) — ${_small}. A cold grader session costs more than this diff is worth; CI and the DIVE-1830 merge gate still apply. Grader on the row was '$_vfier'; file with '--verify' to buy the round back, or lower the threshold with '5dive config verify-small=<lines>|off'."
+        else
+          _task_done_merge_pending_guard "$id" "$ident"
+          _task_route_to_verifier "$id" "$_vfier" "$_asignee" "$result" "$want_result"
+          return
+        fi
       fi
     elif [[ -z "$_vfier" && "$_depth" == "deep" && -n "$_asignee" \
             && "$_route_st" != "done" && "$_route_st" != "cancelled" \

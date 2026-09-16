@@ -48,6 +48,116 @@ _grader_pct() {  # <account> <fiveHourPct|sevenDayPct> [<json-on-stdin>]
   ' 2>/dev/null || printf ''
 }
 
+# ── DIVE-4575: THE ACCOUNT'S READING, NOT AN IDLE SEAT'S ────────────────────
+#
+# `_grader_pct` above reads `5dive usage --json`, and that document is built
+# from TRANSCRIPT ACTIVITY: cmd_usage.sh walks each seat's session files for the
+# window and `continue`s past a seat that moved no tokens in it, so an IDLE seat
+# contributes no row at all — and a seat whose statusline cache was never
+# written contributes a row with null percentages. Either way the ACCOUNT can
+# read blind while its window is perfectly well known, because the numbers live
+# in the seats' statusline caches and `account usage` reads those caches through
+# the REGISTRY binding, which no amount of idleness erases.
+#
+# MEASURED 2026-09-15 (DIVE-4575): the pool's second template seat main2 sat
+# idle from 09-14, its `~/.claude/statusline-last.json` carried no `rate_limits`
+# key at all, and the lane refused it on EVERY tick for nine hours with
+# `main2: refuse: mark has no 5h reading (null)` — while `main`, on the same
+# account and therefore in the same auth window, held a live 5h/7d reading the
+# whole time (`/var/lib/5dive/account-usage.json`, `source: main`). Seven graded
+# deliveries queued behind a seat the pool could not use precisely because it
+# had not been using it. The fail-closed rule is right (DIVE-4342: never launder
+# an absent reading into clear); the SOURCE was wrong.
+#
+# So the account reading is read FIRST and the per-seat usage document is the
+# FALLBACK, never the other way round. It is fenced HARDER than the document it
+# overrides, because a fresher source that is allowed to be stale is not an
+# improvement:
+#   * the reading must carry its own measurement time (`asOf`) and be no older
+#     than `_GRADER_READING_MAX_AGE` — the age of the READING, not of the file
+#     that quotes it (src/lib/quota_wall.sh's fence, same seconds);
+#   * a window whose `resetsAt` has already passed is DROPPED, because a
+#     percentage from a window that has since turned over is not a statement
+#     about the window we are about to spend in (`quota_wall_reset_guard`);
+#   * when nothing fresh is found it emits NOTHING and the caller keeps failing
+#     closed. There is no path here that invents a number.
+_GRADER_READING_MAX_AGE="${_GRADER_READING_MAX_AGE:-600}"
+_GRADER_READING_US=$'\037'
+
+# `_grader_reading_expired <resetsAt> <now>` — exit 0 when this window has
+# already turned over. An ABSENT or UNREADABLE reset is NOT expired: the reading
+# itself already passed the age fence, and we do not discard a measured window
+# over a timestamp format. Epoch seconds (what the statusline cache carries) and
+# vendor date strings (what a snapshot may carry) are both accepted.
+_grader_reading_expired() {  # <resetsAt> <now>
+  local r="${1:-}" now="${2:-0}" e
+  [[ -n "$r" && "$r" != "null" ]] || return 1
+  if [[ "$r" =~ ^[0-9]+$ ]]; then e="$r"; else e=$(date -d "$r" +%s 2>/dev/null) || return 1; fi
+  [[ "$e" =~ ^[0-9]+$ ]] || return 1
+  (( e < now ))
+}
+
+# `_grader_reading_pair <now>` — apply the age and reset fences to ONE reading in
+# the `usage_read_ratelimits` shape, and print `<5h><US><7d>`. Either field may
+# be empty (that window was null, or its reset had passed); NOTHING is printed
+# when the reading has no usable measurement time at all, which is the caller's
+# signal to fall back.
+_grader_reading_pair() {  # <now>   [<reading-json-on-stdin>]
+  local now="${1:-0}" json asof five seven fr sr
+  json=$(cat)
+  [[ -n "$json" && "$json" != "null" ]] || return 0
+  asof=$(jq -r '.asOf // empty'         <<<"$json" 2>/dev/null || printf '')
+  [[ "$asof" =~ ^[0-9]+$ ]] || return 0
+  (( now >= asof && now - asof <= _GRADER_READING_MAX_AGE )) || return 0
+  five=$(jq -r  '.fiveHourPct // empty'   <<<"$json" 2>/dev/null || printf '')
+  seven=$(jq -r '.sevenDayPct // empty'   <<<"$json" 2>/dev/null || printf '')
+  fr=$(jq -r    '.fiveResetsAt // empty'  <<<"$json" 2>/dev/null || printf '')
+  sr=$(jq -r    '.sevenResetsAt // empty' <<<"$json" 2>/dev/null || printf '')
+  if _grader_reading_expired "$fr" "$now"; then five=""; fi
+  if _grader_reading_expired "$sr" "$now"; then seven=""; fi
+  printf '%s%s%s' "$five" "$_GRADER_READING_US" "$seven"
+}
+
+# `_grader_account_reading <account>` — the account's own 5h/7d pair, or EMPTY.
+#
+# TWO SOURCES, in the order of how little they depend on the seat having run:
+#   (a) LIVE, across the seats the REGISTRY binds to this account
+#       (`account_best_ratelimits`, cmd_account.sh) — it opens each bound seat's
+#       statusline cache directly and keeps the freshest, so an idle seat is
+#       simply outvoted by a busy sibling instead of blinding the account. Root
+#       only (sibling homes are 0750); the grader cron is root, and an
+#       unprivileged caller gets nothing and falls through rather than erroring.
+#   (b) the published account-usage snapshot (`quota_snapshot_read`), normalised
+#       into the same shape — the unprivileged reader's copy of the same numbers.
+#
+# Both are `declare -F`-guarded so this file stays sourceable on its own: the
+# unit harnesses source it alone, and there the account reading is simply absent
+# and every existing arm keeps grading the per-seat fallback it was written for.
+_grader_account_reading() {  # <account> -> "<5h><US><7d>" or EMPTY
+  local acct="${1:-}" rl="" now
+  [[ -n "$acct" ]] || return 0
+  now=$(date +%s)
+  if declare -F account_best_ratelimits >/dev/null 2>&1; then
+    rl=$(account_best_ratelimits "$acct" 2>/dev/null || printf '')
+  fi
+  if [[ -z "$rl" || "$rl" == "null" ]] && declare -F quota_snapshot_read >/dev/null 2>&1; then
+    rl=$(quota_snapshot_read 2>/dev/null | jq -c --arg a "$acct" '
+           (((.accounts // []) | map(select(.name == $a)) | first | .usage) // null)
+           | if . == null then empty
+             else {asOf: .asOf,
+                   fiveHourPct:   (.fiveHour.pct      // null),
+                   fiveResetsAt:  (.fiveHour.resetsAt // null),
+                   sevenDayPct:   (.sevenDay.pct      // null),
+                   sevenResetsAt: (.sevenDay.resetsAt // null)} end' 2>/dev/null || printf '')
+  fi
+  [[ -n "$rl" && "$rl" != "null" ]] || return 0
+  printf '%s' "$rl" | _grader_reading_pair "$now"
+}
+# Overridable so a unit harness can feed a fixture instead of needing root, a
+# registry and a live meter. Same posture as `_GRADER_USAGE_CMD` — a FUNCTION
+# NAME, not a command string, because it is expanded unquoted.
+_GRADER_ACCOUNT_READING_CMD="${_GRADER_ACCOUNT_READING_CMD:-_grader_account_reading}"
+
 # `_grader_window_ok <account>` — may we spawn a grader on this account?
 # Exit 0 = yes. Non-zero = no, with the reason on stdout for the row's record.
 #
@@ -60,24 +170,44 @@ _grader_pct() {  # <account> <fiveHourPct|sevenDayPct> [<json-on-stdin>]
 # 2026-09-09 that was 43% of the fleet. Every refusal below is therefore written
 # as an explicit emptiness test BEFORE any numeric comparison.
 _grader_window_ok() {  # <account>  [<usage-json-on-stdin>]
-  local acct="$1" json five seven
+  local acct="$1" json five="" seven=""
   if [[ -z "$acct" ]]; then
     printf 'refuse: no account named — a floor with no account is not a measurement\n'; return 1
   fi
   json=$(cat)
-  if [[ -z "$json" ]]; then
-    printf 'refuse: %s returned nothing — no meter, no spawn\n' "$_GRADER_USAGE_CMD"; return 1
+  # NOT a refusal on its own any more (DIVE-4575): an empty per-seat document is
+  # the normal state of a quiet fleet, and the account reading below may still
+  # carry the window. It becomes a refusal only if that source is blind too, and
+  # the message below says so.
+  # DIVE-4575: THE ACCOUNT'S READING FIRST. Per window, not per document, so one
+  # blind window on the better source does not throw away its good one.
+  local pair five_src="" seven_src=""
+  pair=$($_GRADER_ACCOUNT_READING_CMD "$acct" 2>/dev/null || printf '')
+  if [[ -n "$pair" ]]; then
+    five="${pair%%$_GRADER_READING_US*}"; seven="${pair#*$_GRADER_READING_US}"
+    if [[ -n "$five" ]];  then five_src="account";  fi
+    if [[ -n "$seven" ]]; then seven_src="account"; fi
   fi
-  five=$(printf '%s' "$json"  | _grader_pct "$acct" fiveHourPct)
-  seven=$(printf '%s' "$json" | _grader_pct "$acct" sevenDayPct)
-
-  # Emptiness first, always, and each side separately so the reason names which
-  # meter was blind rather than blaming "the meter".
   if [[ -z "$five" ]]; then
-    printf 'refuse: %s has no 5h reading (null) — failing closed, not assuming 0%%\n' "$acct"; return 1
+    five=$(printf '%s' "$json" | _grader_pct "$acct" fiveHourPct)
+    if [[ -n "$five" ]]; then five_src="seat"; fi
   fi
   if [[ -z "$seven" ]]; then
-    printf 'refuse: %s has no weekly reading (null) — failing closed, not assuming 0%%\n' "$acct"; return 1
+    seven=$(printf '%s' "$json" | _grader_pct "$acct" sevenDayPct)
+    if [[ -n "$seven" ]]; then seven_src="seat"; fi
+  fi
+
+  # Emptiness first, always, and each side separately so the reason names which
+  # meter was blind rather than blaming "the meter". The reason now also names
+  # that BOTH sources were asked: "no 5h reading" used to read as "this seat is
+  # quiet", which is exactly the misreading that left DIVE-4575 open all day.
+  if [[ -z "$five" ]]; then
+    printf 'refuse: %s has no 5h reading (null) — no account reading measured within %ss and no seat of the account carries one; failing closed, not assuming 0%%\n' \
+           "$acct" "$_GRADER_READING_MAX_AGE"; return 1
+  fi
+  if [[ -z "$seven" ]]; then
+    printf 'refuse: %s has no weekly reading (null) — no account reading measured within %ss and no seat of the account carries one; failing closed, not assuming 0%%\n' \
+           "$acct" "$_GRADER_READING_MAX_AGE"; return 1
   fi
   # Percentages arrive as floats (56.99999999999999); strip to integer for the
   # comparison rather than trusting bash arithmetic with a decimal point, which
@@ -94,7 +224,8 @@ _grader_window_ok() {  # <account>  [<usage-json-on-stdin>]
     printf 'queue: %s is at %s%% of its weekly window (floor %s%%) — spawn waits for the reset\n' \
            "$acct" "$seven" "$_GRADER_FLOOR_7D"; return 2
   fi
-  printf 'ok: %s at 5h=%s%% 7d=%s%%\n' "$acct" "$five" "$seven"; return 0
+  printf 'ok: %s at 5h=%s%% 7d=%s%% (5h from the %s reading, 7d from the %s reading)\n' \
+         "$acct" "$five" "$seven" "${five_src:-seat}" "${seven_src:-seat}"; return 0
 }
 
 # `_grader_spawn_request <ident> <task_id> <verifier> <iteration>` — record that
@@ -270,11 +401,25 @@ print("      so the spawn FLOOR is not replayable and is not modelled here.")
 # the mapping and the meter must agree, and two sources could disagree about
 # which window a seat draws on — which is the one thing the cap cannot survive.
 _grader_account_of() {  # <agent>  [<usage-json-on-stdin>]
-  local agent="$1"
+  local agent="$1" json acct=""
+  json=$(cat)
   [[ -n "$agent" ]] || { printf ''; return 0; }
-  jq -r --arg n "$agent" '
-    [ .. | objects | select(.name? == $n) | .account? | strings ] | (.[0] // "")
-  ' 2>/dev/null || printf ''
+  # DIVE-4575: THE REGISTRY BINDING FIRST, one door further back than the floor.
+  # The usage document only carries a seat that moved tokens in the window, so a
+  # seat idle for long enough has no row in it at all and resolved to NO ACCOUNT
+  # — and `_grader_window_ok` then refused it for "no account named", which is
+  # not what is wrong with it. The binding is registry state and outlives any
+  # amount of idleness. `declare -F`-guarded for the same reason as the reading:
+  # the unit harnesses source this file alone.
+  if declare -F quota_seat_account >/dev/null 2>&1; then
+    acct=$(quota_seat_account "$agent" 2>/dev/null || printf '')
+  fi
+  if [[ -z "$acct" ]]; then
+    acct=$(printf '%s' "$json" | jq -r --arg n "$agent" '
+      [ .. | objects | select(.name? == $n) | .account? | strings ] | (.[0] // "")
+    ' 2>/dev/null || printf '')
+  fi
+  printf '%s' "$acct"
 }
 
 # `_grader_can_read <seat> <ident>` — can this seat get a true answer out of
@@ -775,7 +920,7 @@ cmd_task_grader_tick() {
                  ORDER BY e.id;" 2>/dev/null || printf '')
 
   local usage="" ; usage=$($_GRADER_USAGE_CMD 2>/dev/null || printf '')
-  local n_pending=0 n_spawn=0 n_queue=0 n_refuse=0 n_fail=0 n_created=0 plan=""
+  local n_pending=0 n_spawn=0 n_queue=0 n_refuse=0 n_fail=0 n_created=0 n_dark=0 plan=""
   # ══ DIVE-4322: IN FLIGHT MEANS GRADING, NOT "NOT YET CLOSED" ══
   #
   # This count was `spawned with no later task.done/task.rejected`, i.e. a grade
@@ -1073,7 +1218,20 @@ $(_grader_inflight_exits_sql)
       # "no seat with headroom" is the floor/credential refusal (and is the exact
       # park line the errexit arm grades); a pool seat sitting at its per-seat cap
       # is a different fact and must not be reported as a meter refusal.
-      plan+="queue   $ident  ($( [[ -n "$busy" ]] && printf 'no free seat' || printf 'no seat with headroom' ) — ${busy}${why})"$'\n'; continue
+      # DIVE-4575: A LANE RUNNING DARK IS NOT A LANE THROTTLING, and in a log
+      # line that only names the refusals they read the same. The difference is
+      # the whole of that row: a floor refusal clears by itself at the window's
+      # reset, a blind one never does — nothing about waiting makes an unwritten
+      # statusline cache appear. Nine hours of `no seat with headroom` were read
+      # as a busy account. The headline is deliberately NOT changed (the errexit
+      # park arm grades it verbatim); the dark verdict is appended, counted, and
+      # carries the operator's next move.
+      local dark_note=""
+      if [[ "$why" == *"failing closed"* ]]; then
+        n_dark=$((n_dark+1))
+        dark_note=" [POOL DARK: an account with no measured reading — this refusal does not clear at any window reset; run 'sudo -n 5dive account usage' or start the seat once]"
+      fi
+      plan+="queue   $ident  ($( [[ -n "$busy" ]] && printf 'no free seat' || printf 'no seat with headroom' ) — ${busy}${why})${dark_note}"$'\n'; continue
     fi
     n_spawn=$((n_spawn+1)); inflight=$((inflight+1))
     # DIVE-4410: maintain the reading in memory. Without this the second row in
@@ -1144,8 +1302,12 @@ $(_grader_inflight_exits_sql)
   done <<<"$pending"
 
   if (( json )); then
-    printf '{"pending":%d,"spawned":%d,"queued":%d,"dark":%d,"stale":%d,"staleHours":%d,"cap":%d,"commit":%s,"pool":"%s","mode":"%s","clones":%d,"seatCap":%d,"failed":%d,"swept":%d}\n' \
-      "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_stale" "$stale_h" "$cap" \
+    # `dark` is the POOL-IS-UNCONFIGURED count and keeps its meaning. DIVE-4575's
+    # `blindAccount` is a different fact with a different fix — the pool IS named
+    # and is refusing because nothing measured its account — so it gets its own
+    # field rather than being folded into a count readers already interpret.
+    printf '{"pending":%d,"spawned":%d,"queued":%d,"dark":%d,"blindAccount":%d,"stale":%d,"staleHours":%d,"cap":%d,"commit":%s,"pool":"%s","mode":"%s","clones":%d,"seatCap":%d,"failed":%d,"swept":%d}\n' \
+      "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_dark" "$n_stale" "$stale_h" "$cap" \
       "$( ((commit)) && printf true || printf false )" "$_GRADER_POOL" \
       "$(_grader_spawn_mode)" "$n_procs" "$_gp_seatcap" "$n_fail" "$n_swept"
     return 0
@@ -1157,8 +1319,8 @@ $(_grader_inflight_exits_sql)
   # REPLACES DIVE-4417's `procs=` rather than joining it: they are one reading
   # under two names now that a "process" is a seat, and two names for one number
   # in a log line is how a reader concludes they measure different things.
-  printf 'pending=%d spawn=%d queue=%d dark=%d stale=%d cap=%d mode=%s clones=%d swept=%d seatcap=%d failed=%d %s\n' \
-    "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_stale" "$cap" \
+  printf 'pending=%d spawn=%d queue=%d dark=%d blindacct=%d stale=%d cap=%d mode=%s clones=%d swept=%d seatcap=%d failed=%d %s\n' \
+    "$n_pending" "$n_spawn" "$n_queue" "$n_refuse" "$n_dark" "$n_stale" "$cap" \
     "$(_grader_spawn_mode)" "$n_procs" "$n_swept" "$_gp_seatcap" "$n_fail" \
     "$( ((commit)) && printf '(COMMITTED)' || printf '(dry-run — pass --commit to act)' )"
 }

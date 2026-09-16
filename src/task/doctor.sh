@@ -148,10 +148,103 @@ _task_doctor_fleet_note() {
 #
 # The lane class (assignee undispatchable) is scanned separately: it needs the
 # roster, which the three above do not.
-_task_doctor_board_sql() {
-  cat <<'SQL'
-SELECT ident, status, COALESCE(assignee,'') AS assignee,
-       CASE
+# _task_doctor_lane_sets - the DEAD-LANE and DEAD-GRADER seat sets, as SQL
+# IN-lists of already-quoted names. Writes three globals and echoes nothing (a
+# command substitution is a subshell, so a second return value assigned inside
+# one never reaches the caller - the same trap _task_doctor_row_reason documents):
+#
+#   _TASK_DOCTOR_BAD_LANES     seats holding open rows that nothing wakes, "" if none
+#   _TASK_DOCTOR_BAD_GRADERS   ditto for the verifier column
+#   _TASK_DOCTOR_LANE_NOTE     set when the check could not be DECIDED
+#
+# COST IS PER SEAT, NOT PER ROW, and that is the whole reason this is a function
+# rather than a per-row predicate call (DIVE-4558). `_task_doctor_lane_wakeable`
+# spawns one `jq` per name; over the DISTINCT names on the board that is 16 jq
+# calls on this host (223ms measured 2026-09-15), and over the ROWS it would be
+# ~180. `task ls --json` now calls this on every invocation, so the set-based
+# shape is what makes carrying the classification affordable there: 223ms against
+# an 8.7s `task ls --all --json` baseline on the same board, 2.6%.
+#
+# DEGRADE, NEVER REFUSE: with no roster every lane would read as dead, so the
+# sets stay EMPTY and the note says why. An empty set OMITS the lane arms of
+# _task_doctor_reason_case_sql entirely rather than classifying anything.
+_TASK_DOCTOR_BAD_LANES=""
+_TASK_DOCTOR_BAD_GRADERS=""
+_TASK_DOCTOR_LANE_NOTE=""
+_task_doctor_lane_sets() {
+  _TASK_DOCTOR_BAD_LANES=""; _TASK_DOCTOR_BAD_GRADERS=""; _TASK_DOCTOR_LANE_NOTE=""
+  local lanes; lanes=$(_task_roster_sql_notin)
+  if [[ -z "$lanes" ]]; then
+    _TASK_DOCTOR_LANE_NOTE="lane check SKIPPED - the agent roster is ${_TASK_ROSTER_STATE:-unknown}; with no roster every lane would read as dead. Fix the registry first: 5dive doctor"
+    return 0
+  fi
+  # DIVE-3939: the scan runs over BOTH columns of the dispatch rail. It used to
+  # read `assignee` only, and said so in its own clean line - while the same
+  # predicate was never applied to `verifier`, which delivery WRITES INTO
+  # assignee at `task done`. So a row with a dead grader passed this check for
+  # its whole life and stranded at handoff, with the maker's work already spent.
+  # Same predicate, same sub-cases, one loop, two columns: a second copy of the
+  # rule is how the picker and the report came to disagree in the first place.
+  _task_doctor_scan_column "SELECT DISTINCT assignee FROM tasks
+                  WHERE kind='standard' AND status IN ('todo','in_progress','blocked')
+                    AND assignee IS NOT NULL AND assignee!='';" _TASK_DOCTOR_BAD_LANES
+  _task_doctor_scan_column "SELECT DISTINCT verifier FROM tasks
+                  WHERE kind='standard' AND status IN ('todo','in_progress','blocked')
+                    AND verifier IS NOT NULL AND verifier!='';" _TASK_DOCTOR_BAD_GRADERS
+}
+
+_task_doctor_scan_column() {  # <sql for DISTINCT names> <out-var name>
+  local _sql="$1" _out="$2" name seen="" bad="" rc
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    case " $seen " in *" $name "*) continue ;; esac
+    seen+=" $name"
+    # `&& rc=0 || rc=$?`, never `; rc=$?`: under the bundle's `set -euo
+    # pipefail` an assignment taking a non-zero substitution kills the verb
+    # before the next line, which is how `orphans` once died mid-listing.
+    _task_doctor_lane_wakeable "$name" && rc=0 || rc=$?
+    if [[ "$rc" == "2" ]]; then
+      [[ -n "$_TASK_DOCTOR_LANE_NOTE" ]] || _TASK_DOCTOR_LANE_NOTE="heartbeat check SKIPPED for some lanes - ${STATE_DIR:-/var/lib/5dive}/agents.json could not be read"
+      continue
+    fi
+    [[ "$rc" == "0" ]] && continue
+    bad+="${bad:+,}$(sqlq "$name")"
+  done < <(db "$_sql" 2>/dev/null || true)
+  printf -v "$_out" '%s' "$bad"
+}
+
+# The classification ladder, as ONE SQL CASE over `tasks`, shared by this
+# report and by `task ls --json`'s dispatch_reason projection (DIVE-4558).
+#
+# WHY A SHARED EXPRESSION AND NOT A SECOND COPY. Two copies of a dispatch rule
+# is exactly how the picker and the report came to disagree in DIVE-3939 --
+# doctor printed "wakeable assignee" OK over a row the board digest called
+# undispatchable. The board and the report now read the same ladder, so an
+# ident cannot be labelled two ways on two surfaces.
+#
+# THE TWO SET ARGUMENTS ARE SQL IN-LISTS of already-quoted seat names, produced
+# by _task_doctor_lane_sets. EMPTY MEANS THE ARM IS OMITTED -- not written as
+# `assignee IN ()` (a syntax error) and not written as a false arm. A row whose
+# lane could not be CHECKED reads as unclassified, never as healthy and never as
+# dead; that is the same failure direction _task_doctor_lane_wakeable's rc=2
+# exists for.
+#
+# PRECEDENCE IS LOAD-BEARING and matches _merge_rows, which keeps a row's FIRST
+# classification: the four roster-free board classes, then unassigned, then
+# dead-lane, then dead-verifier. dead-lane before dead-verifier because a row
+# that is both is stranded NOW and the grader problem is one step later.
+#
+# THE THIRD ARGUMENT, and why unassigned-no-coordinator is not on by default.
+# The heartbeat tick iterates SEATS and hands each one its own rows; a row with
+# no assignee is on no seat, so no tick ever reaches it -- undispatchable by the
+# same mechanism as a dead lane, one step earlier. `task ls` carries that class
+# (DIVE-4558: it is what lodar's board was full of). `task doctor` does NOT: its
+# finding set and its census are DIVE-3784/4269's contract, and widening a report
+# is a decision, not a side effect of sharing an expression. Hence an explicit
+# opt-in rather than a difference the two callers could drift into.
+_task_doctor_reason_case_sql() {  # <bad-lanes-inlist> <bad-graders-inlist> [with-unassigned]
+  local lanes="${1:-}" graders="${2:-}" unassigned="${3:-0}" out
+  out="CASE
          WHEN status='blocked'
               AND parked_at IS NULL
               AND (need_type IS NULL OR need_answered_at IS NOT NULL)
@@ -165,8 +258,22 @@ SELECT ident, status, COALESCE(assignee,'') AS assignee,
                               WHERE d.task_id=tasks.id AND b.status NOT IN ('done','cancelled'))
            THEN 'stale-edge'
          WHEN parked_at IS NOT NULL AND wake_at IS NULL           THEN 'park-no-wake'
-         WHEN parked_at IS NOT NULL AND wake_at <= datetime('now') THEN 'wake-passed'
-       END AS reason,
+         WHEN parked_at IS NOT NULL AND wake_at <= datetime('now') THEN 'wake-passed'"
+  [[ "$unassigned" == "1" ]] && out+="
+         WHEN assignee IS NULL OR assignee='' THEN 'unassigned-no-coordinator'"
+  [[ -z "$lanes"   ]] || out+="
+         WHEN assignee IN (${lanes}) THEN 'dead-lane'"
+  [[ -z "$graders" ]] || out+="
+         WHEN verifier IN (${graders}) THEN 'dead-verifier'"
+  out+="
+       END"
+  printf '%s' "$out"
+}
+
+_task_doctor_board_sql() {
+  printf 'SELECT ident, status, COALESCE(assignee,%s) AS assignee,\n' "''"
+  printf '       %s AS reason,\n' "$(_task_doctor_reason_case_sql '' '' 0)"
+  cat <<'SQL'
        COALESCE(wake_at,'') AS wake_at,
        (SELECT GROUP_CONCAT(b.ident || '/' || b.status, ' ') FROM task_deps d JOIN tasks b ON b.id=d.blocked_by
         WHERE d.task_id=tasks.id) AS blockers,
@@ -188,6 +295,7 @@ _task_doctor_explain() {
     stale-edge)   printf '%s' "blocked by rows that are ALL closed — a stale edge the cascade missed. -> 5dive task unblock <id>" ;;
     wake-passed)  printf '%s' "parked, and its wake time has already passed — the heartbeat TTL pass should have unparked it. -> 5dive task unpark <id>  (NOT unblock: unblock only drops edges, and a park has none, so it reports success and changes nothing)" ;;
     park-no-wake) printf '%s' "parked with NO wake time — it will never revisit itself. -> 5dive task unpark <id>, or re-park with a --wake" ;;
+    unassigned-no-coordinator) printf '%s' "no assignee, so no tick ever reaches it - the heartbeat iterates SEATS and hands each one its own rows, and this row is on no seat. -> 5dive task assign <id> <agent>   (roster: 5dive agent list). If the board keeps producing these, the chart resolves no coordinator for filing to default to: 5dive org set <agent> --role='<their prose> coordinator'" ;;
     dead-lane)    printf '%s' "assigned to a seat the heartbeat tick never wakes (heartbeat disabled or absent) — nothing will pick it up. -> 5dive task assign <id> <agent>   (roster: 5dive agent list)" ;;
     dead-verifier) printf '%s' "GRADER nothing wakes: this row dispatches fine and STRANDS AT HANDOFF, not now — \`task done\` writes assignee=<verifier>, so the maker spends the whole task first and the delivery goes to a seat no tick will ever iterate. -> 5dive task verifier <id> <agent>   (roster: 5dive agent list)" ;;
     *)            printf '%s' "undispatchable" ;;
@@ -445,31 +553,11 @@ cmd_task_doctor() {
     # spent. Same predicate, same sub-cases, one loop, two columns: a second copy
     # of the rule is how the picker and the report came to disagree in the first
     # place.
-    _scan_column() {  # <sql for DISTINCT names> <out-var name>
-      local _sql="$1" _out="$2" name seen="" bad="" rc
-      while IFS= read -r name; do
-        [[ -n "$name" ]] || continue
-        case " $seen " in *" $name "*) continue ;; esac
-        seen+=" $name"
-        # `&& rc=0 || rc=$?`, never `; rc=$?`: under the bundle's `set -euo
-        # pipefail` an assignment taking a non-zero substitution kills the verb
-        # before the next line, which is how `orphans` once died mid-listing.
-        _task_doctor_lane_wakeable "$name" && rc=0 || rc=$?
-        if [[ "$rc" == "2" ]]; then
-          [[ -n "$lane_note" ]] || lane_note="heartbeat check SKIPPED for some lanes — ${STATE_DIR:-/var/lib/5dive}/agents.json could not be read"
-          continue
-        fi
-        [[ "$rc" == "0" ]] && continue
-        bad+="${bad:+,}$(sqlq "$name")"
-      done < <(db "$_sql" 2>/dev/null || true)
-      printf -v "$_out" '%s' "$bad"
-    }
-    _scan_column "SELECT DISTINCT assignee FROM tasks
-                    WHERE kind='standard' AND status IN ('todo','in_progress','blocked')
-                      AND assignee IS NOT NULL AND assignee!='';" bad_lanes
-    _scan_column "SELECT DISTINCT verifier FROM tasks
-                    WHERE kind='standard' AND status IN ('todo','in_progress','blocked')
-                      AND verifier IS NOT NULL AND verifier!='';" bad_graders
+    # DIVE-4558: ONE implementation of this scan, hoisted to file scope so
+    # `task ls --json` classifies rows off the same seat sets this report does.
+    _task_doctor_lane_sets
+    bad_lanes="$_TASK_DOCTOR_BAD_LANES"; bad_graders="$_TASK_DOCTOR_BAD_GRADERS"
+    [[ -z "$_TASK_DOCTOR_LANE_NOTE" || -n "$lane_note" ]] || lane_note="$_TASK_DOCTOR_LANE_NOTE"
     _merge_rows() {  # <sql> — append rows not already classified
       local _rows; _rows=$(dbfmt -json "$1")
       [[ -n "$_rows" ]] || _rows='[]'

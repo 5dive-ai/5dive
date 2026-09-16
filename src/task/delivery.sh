@@ -1171,8 +1171,20 @@ _task_reject_emit_event() {
 # finding clause cannot be made readable, it is DROPPED and the sentence degrades
 # to the subject-free form, which is lint-clean by construction. Degrading loses a
 # hint; refusing loses the gate.
-_ESCALATION_OPTIONS='keep going — the lead takes it over|drop it'
-_ESCALATION_RECOMMEND='keep going — the lead takes it over'
+#
+# DIVE-4537 — THE OPTIONS NAME WHAT THE ANSWER DOES, BECAUSE NOW IT DOES IT.
+# "the lead takes it over" described who was left holding the row, not an
+# outcome, and it was not even true: answering this gate cleared the question and
+# left the loop exactly as stopped as it was (iteration == max_iterations, no
+# maker, no resume verb — measured on DIVE-4520, where the disposition "keep
+# going" sat written on the row for 83 minutes because the three verbs that
+# execute it are `task verifier --max-iters`, `need --withdraw` and `task reject`,
+# in that order, and the answering lead holds none of them:
+# community/wiki/a-withdrawn-iteration-cap-gate-leaves-the-loop-with-no-owner-and-no-resume-verb.md).
+# `cmd_task_answer` now performs the resume itself, so each option can say what
+# its tap produces. Keep both readable: these two strings ARE the two buttons.
+_ESCALATION_OPTIONS='keep going — send it back for another pass|drop it — stop the work, keep the findings'
+_ESCALATION_RECOMMEND='keep going — send it back for another pass'
 
 # Print a leading run of <max-words> readable words of <text>, stopping at the
 # first token the gate-ask classifier calls an internal name. Stopping rather

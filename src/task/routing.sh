@@ -247,7 +247,32 @@ _task_effective_review_mode() {  # <no_verify> <verify_cmd> <verifier> <grants> 
 # and unknown must stay unknown: every caller below treats it as "change
 # nothing", so a missing credential can never widen OR narrow the rail.
 _task_delivery_paths() {
-  local _id="$1" _dref _body _branch="" _slug _tok _pr="" _n
+  local _pr; _pr=$(_task_delivery_pr_url "$1")
+  [[ -n "$_pr" ]] || return 0
+  GH_TOKEN="$(_gate_gh_token)" GH_CONFIG_DIR="$(gh_config_dir)" \
+    gh pr view "$_pr" --json files -q '.files[].path' 2>/dev/null || return 0
+}
+
+# DIVE-4559: the same fetch, one field wider — `path<TAB>changed-lines` per
+# file, where changed = additions + deletions. A SEPARATE function rather than a
+# widening of `_task_delivery_paths` on purpose: that one has four callers and a
+# stub in tests/task_core_unit.sh, and the small-delivery arm is the only caller
+# that needs a size. It costs one extra `gh pr view` on exactly the deliveries
+# that were about to book a whole grader session, which is the trade this ticket
+# is about.
+_task_delivery_file_lines() {  # <task-id>
+  local _pr; _pr=$(_task_delivery_pr_url "$1")
+  [[ -n "$_pr" ]] || return 0
+  GH_TOKEN="$(_gate_gh_token)" GH_CONFIG_DIR="$(gh_config_dir)" \
+    gh pr view "$_pr" --json files -q '.files[] | "\(.path)\t\(.additions + .deletions)"' 2>/dev/null || return 0
+}
+
+# Resolve the PR URL of the delivery bound to task <id>, or print nothing.
+# Extracted from _task_delivery_paths so the size fetch above cannot drift from
+# the path fetch: two copies of this resolution would be two answers to "which
+# PR is this row" the first time one of them learned about a new binding shape.
+_task_delivery_pr_url() {
+  local _id="$1" _dref _body _branch="" _slug _tok _n
   _dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${_id};")
   _body=$(db "SELECT COALESCE(body,'')         FROM tasks WHERE id=${_id};")
   [[ -n "$_dref" ]] || _branch=$(_push_branch_from_body "$_body")
@@ -258,17 +283,15 @@ _task_delivery_paths() {
   _tok=$(_gate_gh_token); [[ -n "$_tok" ]] || return 0
   _slug=$(_gate_task_repo_slug "$_dref" "$_body")
   if [[ "$_dref" =~ ^https?:// ]]; then
-    _pr="$_dref"
-  else
-    # A bare `#N` delivery_ref is left to the merge gate's own DIVE-1955 refusal;
-    # here it simply reads as unknown rather than being resolved against a guess.
-    [[ -n "$_branch" && -n "$_slug" ]] || return 0
-    _n=$(GH_TOKEN="$_tok" GH_CONFIG_DIR="$(gh_config_dir)" gh pr list --repo "$_slug" --head "$_branch" --state all \
-           --json number -q '.[0].number' 2>/dev/null || echo "")
-    [[ -n "$_n" ]] || return 0
-    _pr="https://github.com/${_slug}/pull/${_n}"
+    printf '%s' "$_dref"; return 0
   fi
-  GH_TOKEN="$_tok" GH_CONFIG_DIR="$(gh_config_dir)" gh pr view "$_pr" --json files -q '.files[].path' 2>/dev/null || return 0
+  # A bare `#N` delivery_ref is left to the merge gate's own DIVE-1955 refusal;
+  # here it simply reads as unknown rather than being resolved against a guess.
+  [[ -n "$_branch" && -n "$_slug" ]] || return 0
+  _n=$(GH_TOKEN="$_tok" GH_CONFIG_DIR="$(gh_config_dir)" gh pr list --repo "$_slug" --head "$_branch" --state all \
+         --json number -q '.[0].number' 2>/dev/null || echo "")
+  [[ -n "$_n" ]] || return 0
+  printf 'https://github.com/%s/pull/%s' "$_slug" "$_n"
 }
 
 # Classify a path list (on stdin) as 'deep' | 'shallow' | '' (unknown/ordinary).
@@ -285,11 +308,7 @@ _task_delivery_depth() {
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
     have=1
-    case "$p" in
-      src/cmd_heartbeat.sh|src/cmd_task.sh|src/cmd_auth*|lib/db.sh|scripts/deploy*|\
-      .github/workflows/*|install.sh|*credential*|*secret*|*token*)
-        printf 'deep'; return 0 ;;
-    esac
+    _task_path_is_deep "$p" && { printf 'deep'; return 0; }
     case "$p" in
       tests/*|docs/*|changelog.d/*|*.md) ;;
       *) all_shallow=0 ;;
@@ -297,6 +316,84 @@ _task_delivery_depth() {
   done
   (( have )) || return 0
   (( all_shallow )) && printf 'shallow'
+  return 0
+}
+
+# The blast-radius globs, extracted from the loop above so DIVE-4559's small
+# delivery cannot disagree with DIVE-2719's deep one about what a scheduler
+# path is. Exit 0 = in the blast radius.
+_task_path_is_deep() {  # <path>
+  case "${1:-}" in
+    src/cmd_heartbeat.sh|src/cmd_task.sh|src/cmd_auth*|lib/db.sh|scripts/deploy*|\
+    .github/workflows/*|install.sh|*credential*|*secret*|*token*) return 0 ;;
+  esac
+  return 1
+}
+
+# DIVE-4559: THE EXCLUSIONS MATTER MORE THAN THE NUMBER. A five-line sudoers
+# edit, a five-line change to the provisioning path or to a shared lib every
+# seat sources is not "small" in any sense a grader cares about — size is a
+# proxy for risk and these are where the proxy breaks. So the denylist is the
+# blast radius PLUS the paths whose line count lies: shared libraries, the
+# installer's include tree, sudo policy, systemd units and the provisioning
+# scripts. Exit 0 = this path can never make a delivery small.
+_task_path_small_denied() {  # <path>
+  _task_path_is_deep "$1" && return 0
+  case "${1:-}" in
+    src/lib/*|lib/*|scripts/inc/*|scripts/*provision*|systemd/*|*.service|\
+    *sudoers*|*.sql|*schema*|docker/*|Dockerfile*) return 0 ;;
+  esac
+  return 1
+}
+
+# Classify a delivery as SMALL, from `path<TAB>changed-lines` on stdin and a
+# threshold in $1. Prints the human reason when it is small, nothing otherwise;
+# always returns 0, so a caller under `set -e` reads the empty string the same
+# way `_task_delivery_depth` is read.
+#
+# THREE WAYS TO NOT BE SMALL, and only the first is about the number:
+#   * more changed lines than the threshold;
+#   * any denylisted path, whatever the count;
+#   * anything UNKNOWN — no files, or a count that is not a number. An empty
+#     list is the arm that keeps a missing gh credential from waiving the rail
+#     (DIVE-2719's T-2719d, and the same vacuous-truth trap: every one of zero
+#     files is under any threshold).
+_task_delivery_small() {  # <threshold>  [stdin: path<TAB>lines]
+  local thr="${1:-off}" p n files=0 lines=0 fp lp
+  [[ "$thr" != "off" ]] || return 0
+  [[ "$thr" =~ ^[1-9][0-9]*$ ]] || return 0
+  while IFS=$'\t' read -r p n; do
+    [[ -n "$p" ]] || continue
+    _task_path_small_denied "$p" && return 0
+    [[ "$n" =~ ^[0-9]+$ ]] || return 0
+    files=$((files+1)); lines=$((lines+n))
+  done
+  (( files )) || return 0
+  (( lines <= thr )) || return 0
+  fp=s; (( files == 1 )) && fp=""
+  lp=s; (( lines == 1 )) && lp=""
+  printf 'small delivery: %d file%s / %d changed line%s, under verify-small=%s' \
+    "$files" "$fp" "$lines" "$lp" "$thr"
+  return 0
+}
+
+# The row-level wrapper the `task done` fork calls: knob off, an explicit
+# `--verify` on the row, or an unresolvable delivery all read as "not small".
+#
+# `--verify` (verify_forced) BEATS SMALL, exactly as it beats the box policy —
+# a row that demanded a grade asked about this diff's importance, not its size,
+# and DIVE-4251 already settled that the row wins over the box in both
+# directions. `--no-verify` is not consulted here: a row that opted out never
+# reaches this fork.
+_task_delivery_small_reason() {  # <task-id>
+  local id="$1" thr forced tsv
+  thr=$(box_verify_small)
+  [[ "$thr" != "off" ]] || return 0
+  forced=$(db "SELECT COALESCE(verify_forced,0) FROM tasks WHERE id=${id};" 2>/dev/null || printf 0)
+  [[ "$forced" == "1" ]] && return 0
+  tsv=$(_task_delivery_file_lines "$id")
+  [[ -n "$tsv" ]] || return 0
+  _task_delivery_small "$thr" <<<"$tsv"
   return 0
 }
 

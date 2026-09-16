@@ -32,6 +32,15 @@ grep -q 'RestartPreventExitStatus=2 3' "$ROOT/systemd/5dive-agent@.service" \
 grep -q 'StartLimitBurst=' "$ROOT/systemd/5dive-agent@.service" \
   || fail "unit needs a start limit so a crash-loop cannot run unbounded"
 
+# DIVE-4561: a seat's process umask is the only thing that decides the mode of a
+# file git creates with a plain fopen() (FETCH_HEAD, packed-refs.new, pack tmps).
+# Without UMask= systemd starts the unit at 0022, those land 644, and every other
+# seat's `git fetch` in that shared tree dies on a ref it cannot write -- which
+# leaves the origin/* refs FROZEN, and a frozen ref AGREES with whoever reads it.
+# Anchored to the value, not the key: `UMask=0022` would pass a bare key grep.
+grep -qE '^UMask=0002$' "$ROOT/systemd/5dive-agent@.service" \
+  || fail "unit must set UMask=0002 so files a seat writes stay group-writable for claude"
+
 # --- behavioural: resolve_codex against a fake nvm tree ----------------------
 
 # Source only the resolver block; the rest of agent-start needs a real agent.

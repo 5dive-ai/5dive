@@ -4664,11 +4664,31 @@ _hb_gate_ttl_sweep() {
         UPDATE tasks SET status='todo'
           WHERE id=${gid} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${gid});"
+    # DIVE-4537 (iteration 2): AN AUTO-APPLIED ANSWER OWES THE SAME WORK A TYPED
+    # ONE DOES. The iteration-cap stop is a tier-1 decision carrying a recommend,
+    # so it is squarely inside this sweep's own population — and applying "keep
+    # going" here without executing it records the loop as resumed while leaving
+    # it stopped, held by the verifier at iteration == max_iterations. The
+    # executor is self-guarding, so this is a no-op on every other gate. `declare
+    # -F` because a heartbeat harness sources a SUBSET of src/ and has no
+    # answer.sh; bash turns a missing function into rc=127 on a clear that already
+    # succeeded.
+    local _ttl_esc=""
+    if declare -F _task_escalation_auto_apply >/dev/null 2>&1; then
+      _task_escalation_auto_apply "$gid" "$gident" "$grec" "auto:ttl" || true
+      _ttl_esc="${_ESC_AUTO_NOTE:-}"
+    fi
     # DIVE-2054: task-store auto-clear (TTL) — fenced on STORE IDENTITY, same
     # primitive as cmd_task.sh's _task_store_audit_log (DIVE-2010).
     _task_store_audit_log "gate ttl-auto" "ok" 0 -- "task=$gident" "type=$gtype" "applied=$grec" || true
-    [[ -n "$gowner" ]] && ( cmd_send "$gowner" --message="⏱ ${gident} tier-1 gate hit its 48h TTL — recommendation applied: ${grec}. Resume the task; run \`5dive task show ${gident}\`." ) >/dev/null 2>&1 || true
-    _hb_log "[gate-ttl] ${gident} T1 48h TTL -> applied rec"
+    # A RESUMED LOOP MUST NOT ALSO GET THIS PING. `gowner` is the row's assignee,
+    # which on a stopped loop is the VERIFIER — telling them to "resume the task"
+    # is the hand-back that left DIVE-4520 with no owner, and the executor has
+    # already sent the maker the hand-over receipt.
+    if [[ -z "$_ttl_esc" && -n "$gowner" ]]; then
+      ( cmd_send "$gowner" --message="⏱ ${gident} tier-1 gate hit its 48h TTL — recommendation applied: ${grec}. Resume the task; run \`5dive task show ${gident}\`." ) >/dev/null 2>&1 || true
+    fi
+    _hb_log "[gate-ttl] ${gident} T1 48h TTL -> applied rec${_ttl_esc}"
   done < <(db "SELECT id||x'1f'||need_type||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(assignee,'')
                FROM tasks
                WHERE need_type IS NOT NULL AND need_answered_at IS NULL

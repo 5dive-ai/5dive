@@ -977,6 +977,45 @@ cmd_task_ls() {
     [[ "$status" == "done" || "$status" == "cancelled" ]] && \
       fail "$E_USAGE" "--gated and --status=$status are mutually exclusive: closing a row retires its gate, so no closed row has a live one (try '5dive task gate-history <id>')"
   fi
+  # DIVE-4558: the per-row DISPATCH REASON, carried in the JSON projection.
+  #
+  # THE DEFECT THIS CLOSES. lodar read a board of 53 rows, saw "hold" and
+  # "(unassigned)" on 41 of them, and could not tell a row nobody will ever pick
+  # up from a row waiting its turn. `task doctor` knew the difference and this
+  # projection did not, so every consumer of it - the dashboard board included,
+  # whose /tasks/snapshot route is a pass-through of this very command - rendered
+  # the two identically. The fix is to carry doctor's OWN classification here,
+  # not to re-derive a second rule in the consumer.
+  #
+  # ALWAYS PRESENT, NEVER CONDITIONAL. `dispatch_reason`/`dispatch_fix` are
+  # normalised to an explicit null on a healthy row rather than left absent: a
+  # projection whose SHAPE changes with its data cannot tell a reader "no
+  # undispatchable rows" from "this view does not report dispatch", which is the
+  # DIVE-3785 rule for the human board and the DIVE-2777 trap for this one
+  # (dbfmt -json drops null-valued keys, and a reader cannot distinguish that
+  # from a field that was never added).
+  #
+  # COST, MEASURED BEFORE IT WAS MADE UNCONDITIONAL (2026-09-15, this host, 180
+  # rows / 16 seats): the lane scan is SET-BASED - one `jq` per DISTINCT seat on
+  # the board, 223ms - against an 8.7s `task ls --all --json` baseline, i.e.
+  # 2.6%. A per-ROW `_task_doctor_lane_wakeable` would have been ~180 jq calls
+  # and is the shape this deliberately does not use. That measurement is why
+  # there is no opt-in flag here: a flag the dashboard route forgets to pass
+  # reproduces the filed defect silently.
+  #
+  # DEGRADES: with doctor.sh unloaded or the roster unreadable the lane arms are
+  # omitted and the four roster-free classes still classify. Never refuses.
+  local _dispatch_case="NULL"
+  if (( ! recurring )); then
+    if declare -F _task_doctor_lane_sets >/dev/null 2>&1; then
+      _task_doctor_lane_sets
+      _dispatch_case=$(_task_doctor_reason_case_sql "$_TASK_DOCTOR_BAD_LANES" "$_TASK_DOCTOR_BAD_GRADERS" 1)
+    elif declare -F _task_doctor_reason_case_sql >/dev/null 2>&1; then
+      _dispatch_case=$(_task_doctor_reason_case_sql "" "" 1)
+    fi
+    [[ "$_dispatch_case" == "NULL" ]] || _dispatch_case="CASE WHEN kind='standard' AND status IN ('todo','in_progress','blocked') THEN (${_dispatch_case}) END"
+  fi
+
   if (( JSON_MODE )); then
     local rows
     # DIVE-3267: `needs_human` is the CLI's own verdict — "this gate is waiting on a
@@ -1021,6 +1060,7 @@ cmd_task_ls() {
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
              handoff_ack_at, handoff_delivered_at, handoff_rejected_at,
+             ${_dispatch_case} AS dispatch_reason,
              CASE WHEN ${_gate_open} THEN 1 ELSE 0 END AS gate_live,
              CASE WHEN ${_gate_open} AND ( ${_gate_human} ) THEN 1 ELSE 0 END AS needs_human,
              CASE WHEN verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS verify_unavailable,
@@ -1030,10 +1070,30 @@ cmd_task_ls() {
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
     # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
     # ("Argument list too long"). stdin has no such cap. (DIVE-222)
+    # The remedy text comes from `_task_doctor_explain` - the SAME table the
+    # report prints - built once into a jq lookup, never restated in SQL. A
+    # second copy of this prose is how a surface comes to promise a verb the
+    # report does not (DIVE-3784's filed symptom, one layer up).
+    local _fixmap='{}'
+    if declare -F _task_doctor_explain >/dev/null 2>&1; then
+      _fixmap=$(jq -cn \
+        --arg na "$(_task_doctor_explain no-anchor)" \
+        --arg se "$(_task_doctor_explain stale-edge)" \
+        --arg wp "$(_task_doctor_explain wake-passed)" \
+        --arg pn "$(_task_doctor_explain park-no-wake)" \
+        --arg dl "$(_task_doctor_explain dead-lane)" \
+        --arg dv "$(_task_doctor_explain dead-verifier)" \
+        --arg un "$(_task_doctor_explain unassigned-no-coordinator)" \
+        '{"no-anchor":$na,"stale-edge":$se,"wake-passed":$wp,"park-no-wake":$pn,
+          "dead-lane":$dl,"dead-verifier":$dv,"unassigned-no-coordinator":$un}')
+    fi
+    local _dispatch_jq='map(.dispatch_reason = (.dispatch_reason // null)
+                            | .dispatch_fix = (if .dispatch_reason == null then null
+                                               else ($fix[.dispatch_reason] // "undispatchable") end))'
     if (( no_body )); then
-      printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:(map(del(.body, .result)))}}'
+      printf '%s' "$rows" | jq -c --argjson fix "$_fixmap" "{ok:true, data:{tasks:(map(del(.body, .result)) | ${_dispatch_jq})}}"
     else
-      printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:.}}'
+      printf '%s' "$rows" | jq -c --argjson fix "$_fixmap" "{ok:true, data:{tasks:(. | ${_dispatch_jq})}}"
     fi
   elif (( recurring )); then
     # DIVE-2237: last_fired alone cannot distinguish SUPPRESSED from BROKEN.
@@ -1308,6 +1368,15 @@ cmd_task_show() {
         _sh_eff="no grader yet — one is attached when a delivery is bound (task deliver --pr=…)"
       else _sh_eff="no grader; 'task done' closes it outright"; fi
       echo; echo "verify: ${_sh_pol} (${_sh_src}) — ${_sh_eff}"
+      # DIVE-4559: the size rule is part of the answer to "will this be graded",
+      # so it is printed with it — but only when the box has turned it on, and
+      # WITHOUT measuring this row's delivery. The measurement needs a gh round
+      # trip against the bound PR, and `task show` is read far more often than
+      # `task done` runs; a reader who wants the verdict runs the close. The
+      # line states the rule in force, which is the fact `task show` can know.
+      local _sh_small; _sh_small=$(box_verify_small)
+      [[ "$_sh_small" != "off" ]] \
+        && echo "verify-small: ${_sh_small} lines (box) — a delivery under that, outside the blast radius, closes without a grader"
       # DIVE-4324 deliverable 3: the mode the row was FILED with, beside the
       # policy that caps it. NULL is printed as `unrecorded`, never as `none`:
       # every row filed before this column existed has one, and reading those as
