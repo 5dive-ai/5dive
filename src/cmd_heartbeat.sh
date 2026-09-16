@@ -3900,10 +3900,71 @@ _hb_loop_terminal_clause() {
 
   # VERIFIER variant — only once the maker has actually handed off.
   [[ "$maker" != "$name" ]] || return 0
-  printf ' NOTE — you are the VERIFIER on %s (maker: %s) and the handoff is delivered: GRADE it, do not build or rescue it. A FAIL verdict is complete and terminal — run %s and treat the goal as MET, and stop; it bounces the row back to %s (%s then shows %s and a %s result line). Report that you rejected and why. Do not record a done you do not believe, cancel verified-good work, or gate what %s can fix in another pass.' \
-    "$task_ident" "$maker" "'5dive task reject ${task_ident} --feedback=\"FINDING: <what is wrong> FIX: <the concrete change that closes it> VERIFY: <what you will re-run>\"'" \
+  # DIVE-4576 — THE GRADE IS A VERIFICATION OF CLAIMS, NOT A SECOND INVESTIGATION.
+  #
+  # This clause is the FIRST and often the only instruction a grader clone reads,
+  # and until now it said "GRADE it" and left the method open — so the method a
+  # cold clone reaches for is the only one that needs no input: re-derive the
+  # maker's work and see whether it agrees. That is a second full session per
+  # close (dev, 2026-09-15: 97% of every grader turn is cache re-read), and a
+  # reject buys it twice. Since this row the maker's result must NAME what it
+  # changed, what it ran with counts, the sha, CI, and the criterion each answers
+  # (src/lib/verify_policy.sh), so the cheap method is now available: re-run what
+  # is named, at the sha that is named, and compare.
+  #
+  # THE UNEVIDENCED CLAIM IS A FAIL, NOT A RESEARCH TASK. That is the load-
+  # bearing half. A grader that investigates an unevidenced claim pays the full
+  # re-derivation anyway and teaches the maker that omitting evidence is free; a
+  # grader that FAILS it returns the cheapest possible round — one labelled
+  # finding the maker can close with the command they already ran.
+  #
+  # THE BUDGET IS STATED because an unstated one is not a budget: a grade that
+  # runs long silently becomes the re-derivation this row exists to end. Over
+  # budget is an OUTCOME, not a failure — report what was verified and what was
+  # not, which is a gradeable answer; the maker can close the named gap.
+  printf ' NOTE — you are the VERIFIER on %s (maker: %s) and the handoff is delivered: GRADE it, do not build or rescue it, and do not RE-INVESTIGATE it. VERIFY THE CLAIMS (DIVE-4576): read the result'"'"'s CHANGED / CHECKED / DELIVERED-SHA / CI / CRITERIA, RE-RUN the commands it names at the sha it names, and spot-check the diff against each acceptance criterion — that is the grade. A claim with NO evidence behind it is a FAIL, not something to go and derive yourself: %s. Budget %s turns for the whole grade; if you reach it, deliver the verdict you have — say which claims you verified and which you did not reach — rather than spending another session. A FAIL verdict is complete and terminal — run %s and treat the goal as MET, and stop; it bounces the row back to %s (%s then shows %s and a %s result line). Report that you rejected and why. Do not record a done you do not believe, cancel verified-good work, or gate what %s can fix in another pass.' \
+    "$task_ident" "$maker" \
+    "'5dive task reject ${task_ident} --feedback=\"FINDING: unevidenced — <the claim> FIX: <the command or diff line that would evidence it> VERIFY: <what you will re-run>\"'" \
+    "$(_hb_grade_turn_budget)" \
+    "'5dive task reject ${task_ident} --feedback=\"FINDING: <what is wrong> FIX: <the concrete change that closes it> VERIFY: <what you will re-run>\"'" \
     "$maker" "'5dive task show ${task_ident}'" "'assignee = ${maker}'" \
     "'❌ ${name} rejected'" "$maker"
+}
+
+# DIVE-4576 — the turn budget a GRADE gets, and the predicate that says a wake is
+# one. Two separate things, deliberately in one place.
+#
+# `_hb_grade_turn_budget` is the number, overridable for a box that grades bigger
+# diffs. 25 is the figure on the row: a grade that re-runs named commands and
+# spot-checks a diff is a handful of tool calls, and the cases that ran to 60+
+# turns were re-investigations, which is the shape this budget exists to stop
+# being silently affordable.
+_HB_GRADE_TURN_BUDGET="${_HB_GRADE_TURN_BUDGET:-25}"
+_hb_grade_turn_budget() { printf '%s' "${_HB_GRADE_TURN_BUDGET:-25}"; }
+
+# `_hb_is_grade_wake` answers the SAME question the VERIFIER variant above asks —
+# is this seat being woken to grade a delivered handoff — for the base dispatch
+# line, which is assembled before the clause and cannot read a variable the
+# clause sets (it runs in a command substitution). It is the variant's predicate
+# restated, and a restated predicate drifts, so tests/heartbeat_grade_dispatch_unit.sh
+# pins the two together: every row shape is run through BOTH, and a shape where
+# the clause emits the verifier variant while this returns non-zero (or the
+# reverse) FAILS the harness. Do not "fix" a disagreement by editing one side.
+_hb_is_grade_wake() {  # <agent> <task_id>
+  local name="$1" task_id="$2"
+  [[ "$task_id" =~ ^[0-9]+$ ]] || return 1
+  # Graded-and-waiting is checked first and excluded for the clause's own reason:
+  # on that row the verifier has already discharged the role, so the wake is
+  # about a merge and a grading budget would be describing work nobody owes.
+  [[ "$(db "SELECT 1 FROM tasks WHERE id=${task_id} AND ${_TASKS_TFV_SQL};" 2>/dev/null)" == "1" ]] && return 1
+  local row vfier maker
+  row=$(db "SELECT COALESCE(verifier,'')||'|'||COALESCE(maker_agent,'')
+              FROM tasks
+             WHERE id=${task_id}
+               AND assignee=$(sqlq "$name")
+               AND status NOT IN ('done','cancelled');" 2>/dev/null) || return 1
+  vfier="${row%%|*}"; maker="${row#*|}"
+  [[ -n "$vfier" && "$vfier" == "$name" && -n "$maker" && "$maker" != "$name" ]]
 }
 
 # DIVE-4406 — assemble the dispatch text for one wake. Pure: reads the DB and the
@@ -3932,7 +3993,14 @@ _hb_nudge_text() { # <agent> <task_id> <task_ident>
   #
   # If you are about to add a sentence here, ask whether it is true on EVERY
   # wake. If it is, it belongs in the policy file; this line is for the delta.
-  local nudge="/goal ${task_ident} — your only row this turn; read it with '5dive task show ${task_ident}'. TERMINAL, then stop: DONE — '5dive task done ${task_ident} --result=\"<1-2 self-contained sentences; the creator and the dashboard read this field>\"' (on a row that carries a verifier the same verb DELIVERS instead, and delivered is terminal for you); GATED — '5dive task need ${task_ident} --type=decision|approval|secret|manual --ask=\"<one crisp question>\" --recommend=\"<the advised answer>\"' if it needs a human; CANCELLED — '5dive task cancel ${task_ident} --result=\"<why>\"' only if the row is genuinely impossible. Self-audit before you close. The rest of the contract (gate vs cancel, the ask's shape, single-row scope, maker/verifier separation, the knowledge clause) is in /home/claude/projects/CLAUDE.md under \"Task lifecycle\" — read it ONCE per session, it is not repeated here. Stop after 6 turns."
+  # DIVE-4576: the cap the dispatch states depends on the ROLE being woken — a
+  # grade gets the stated grading budget, every other wake keeps the historical
+  # soft 6. Two numbers in one sentence is what a hardcoded 6 plus a budget in
+  # the grader clause would have produced, and a dispatch that contradicts itself
+  # is read as neither.
+  local _hb_turns=6
+  _hb_is_grade_wake "$name" "$task_id" 2>/dev/null && _hb_turns=$(_hb_grade_turn_budget)
+  local nudge="/goal ${task_ident} — your only row this turn; read it with '5dive task show ${task_ident}'. TERMINAL, then stop: DONE — '5dive task done ${task_ident} --result=\"<1-2 self-contained sentences; the creator and the dashboard read this field>\"' (on a row that carries a verifier the same verb DELIVERS instead, and delivered is terminal for you); GATED — '5dive task need ${task_ident} --type=decision|approval|secret|manual --ask=\"<one crisp question>\" --recommend=\"<the advised answer>\"' if it needs a human; CANCELLED — '5dive task cancel ${task_ident} --result=\"<why>\"' only if the row is genuinely impossible. Self-audit before you close. The rest of the contract (gate vs cancel, the ask's shape, single-row scope, maker/verifier separation, the knowledge clause) is in /home/claude/projects/CLAUDE.md under \"Task lifecycle\" — read it ONCE per session, it is not repeated here. Stop after ${_hb_turns} turns."
 
   # DIVE-2063: a task carrying a maker→verifier loop can NEVER reach any of the
   # three terminal states above by the MAKER's own hand. A correct 'task done'

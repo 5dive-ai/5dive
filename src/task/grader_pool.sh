@@ -1394,7 +1394,12 @@ _grader_spawn_session() {  # <seat> <ident>
   # Closing it properly needs an env_keep entry or a new `_deliver` argument, and
   # a sudoers wildcard is not something to widen inside this change.
   _A2A_GUARD="task:${ident}:${seat}:assignee_owns" \
-  5dive agent send "$seat" "Grade delivered task ${ident}. Read the row, grade the delivery, then run 5dive task done or 5dive task reject. Checkpoint each verified arm to the row as you go." >/dev/null 2>&1
+  # DIVE-4576: the same method clause the clone lane sends — one definition, in
+  # src/task/grader_process.sh. Guarded with `declare -F` because this file is
+  # sourced before that one and a harness may load either alone; a missing clause
+  # degrades to the pre-DIVE-4576 wording rather than failing a spawn.
+  local _gm=""; declare -F _grader_grade_method_clause >/dev/null 2>&1 && _gm=" $(_grader_grade_method_clause)"
+  5dive agent send "$seat" "Grade delivered task ${ident}. Read the row, grade the delivery, then run 5dive task done or 5dive task reject. Checkpoint each verified arm to the row as you go.${_gm}" >/dev/null 2>&1
 }
 
 # ══ DIVE-4430 — THE DISPATCHER'S FLOOR LIVES IN THIS FILE, NOT IN ITS OWN ════

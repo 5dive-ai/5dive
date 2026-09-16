@@ -185,6 +185,103 @@ review_mode_cost_note() {  # <mode>
   esac
 }
 
+# ── DIVE-4576: THE DELIVERY CARRIES ITS EVIDENCE ─────────────────────────────
+#
+# lodar, 2026-09-15: "yes. thats important for our tight tokens subscriptions"
+#
+# Grading is RE-DERIVATION today. A grader clone cold-reloads the pull request
+# and re-runs the maker's investigation, because the result field it is handed
+# says what the maker BELIEVES and not what the maker RAN — so the only way to
+# grade a claim is to go and make it yourself. That is a second full session per
+# close, and a reject repeats it on both seats (DIVE-4440: five iterations, 34h,
+# for a diff that ended as comments plus a changelog line).
+#
+# A claim with evidence attached is CHEAP to grade: the grader re-runs the named
+# command against the named sha and compares. A claim with none is not gradeable
+# at all without redoing the work. So the fields below are not a report format —
+# each one is the input to a check the grader would otherwise have to invent:
+#
+#   CHANGED    which files moved              → what the diff spot-check reads
+#   CHECKED    the commands run + pass/fail    → what the grader RE-RUNS
+#   DELIVERED-SHA the sha those numbers came from → what it re-runs them AGAINST
+#   CI         the CI state at delivery        → already required to be LOOKED at
+#   CRITERIA   each acceptance criterion → its evidence  → the grade's own rubric
+#
+# ONE MARKER PER FIELD, NOT A PROSE CLASSIFIER, for the reason DIVE-4144's FIX
+# marker is one: the property being asserted is that the field is LABELLED and
+# greppable, never that its contents are good — no regex holds that, and a check
+# that pretended to would be a worse lie than the one it replaced. Aliases are
+# accepted because makers already write these five things under several names,
+# and refusing a delivery over a synonym teaches makers to fight the rail.
+#
+# THE SEPARATOR AND THE LEADING BOUNDARY ARE LOAD-BEARING, exactly as in
+# _REJECT_FIX_MARKER_RE: without the non-alphanumeric boundary "unchecked:" and
+# "prefixed-sha:" satisfy their own fields, and without demanding an alphanumeric
+# AFTER the separator an empty label passes.
+#
+# THE SHA FIELD IS `DELIVERED-SHA`, NOT `GRADED-SHA`, AND THE DIFFERENCE IS A
+# CONTROL, NOT A WORD (DIVE-4576 iteration 1, rejected for exactly this).
+# `_gate_graded_sha` is a LABEL-ONLY fence whose subject is the VERIFIER's
+# attestation — DIVE-2940 refuses a close whose result states no `graded-sha`,
+# and DIVE-2656 then compares that sha to what the PR actually merged, precisely
+# because "the maker can push after the verdict". Mandating the byte-identical
+# label on every bound DELIVERY would make the MAKER the author of that operand
+# on every row: DIVE-2940 would be pre-satisfied before anyone graded anything,
+# and DIVE-2656 would compare a maker-authored, delivery-time sha against the
+# head — the "every other check on this gate would still pass" case it exists to
+# catch. The fence is label-only, so a label that does not overlap is the whole
+# fix; `SHA` and `HEAD-SHA` are dropped from the alias list below for the same
+# reason (`graded sha` / `graded_sha` / `graded-sha` are the tokens that overlap,
+# and a bare `SHA` alias re-admits every one of them).
+_DELIVERY_EVIDENCE_FIELDS='CHANGED CHECKED DELIVERED-SHA CI CRITERIA'
+
+# `_delivery_evidence_field_re <field>` — the marker regex for one field.
+# Aliases live HERE and nowhere else, so the refusal, the template and the tests
+# cannot drift into describing three different contracts.
+_delivery_evidence_field_re() {  # <field>
+  local alts
+  case "${1:-}" in
+    CHANGED)    alts='CHANGED|FILES' ;;
+    CHECKED)    alts='CHECKED|HOW|EVIDENCE|RAN' ;;
+    DELIVERED-SHA) alts='DELIVERED-SHA|DELIVERED_SHA|DELIVEREDSHA|DELIVERY-SHA|DELIVERY_SHA' ;;
+    CI)         alts='CI|CI-STATE|CHECKS' ;;
+    CRITERIA)   alts='CRITERIA|ACCEPTANCE|CRITERION' ;;
+    *)          return 1 ;;
+  esac
+  printf '(^|[^[:alnum:]_])(%s)[[:space:]]*([(:=-]|—)[^[:alnum:]]*[[:alnum:]]' "$alts"
+}
+
+# `_delivery_evidence_missing <result-text>` — prints the MISSING field labels,
+# space separated. rc=0 when nothing is missing.
+#
+# Case-insensitive on the label (`shopt -s nocasematch` is process state a
+# caller may rely on, so it is saved and restored rather than set globally).
+_delivery_evidence_missing() {  # <result text>
+  local text="${1:-}" f re missing="" _nc
+  _nc=$(shopt -p nocasematch); shopt -s nocasematch
+  for f in $_DELIVERY_EVIDENCE_FIELDS; do
+    re=$(_delivery_evidence_field_re "$f") || continue
+    [[ "$text" =~ $re ]] || missing="${missing}${missing:+ }${f}"
+  done
+  eval "$_nc"
+  printf '%s' "$missing"
+  [[ -z "$missing" ]]
+}
+
+# `_delivery_evidence_template` — the five labelled lines a maker fills in. ONE
+# string: `task show` prints it on an in-progress row so the maker FILLS it, the
+# refusal prints it so a maker who hit the rail is not left guessing, and the
+# help text quotes it. DIVE-4144's `_REJECT_TEMPLATE_HINT` is the precedent.
+_delivery_evidence_template() {
+  cat <<'TPL'
+CHANGED: <the files that moved, and in one clause what each change does>
+CHECKED: <every command you ran, each with its pass/fail counts — "17 arms, 17 pass; 3 mutation arms red on the pre-fix tree">
+DELIVERED-SHA: <the sha those numbers were produced at — the head the grader re-runs them against. NOT `graded-sha`: that label is the verifier's, and writing it here would pre-satisfy the gate that checks the verdict>
+CI: <what CI said at delivery, or "not finished at delivery" (you must LOOK, you must not WAIT)>
+CRITERIA: <each acceptance criterion, and the line of evidence above that closes it>
+TPL
+}
+
 # ── DIVE-4559: the SMALL-delivery downgrade — the inverse of DIVE-2730 ───────
 #
 # lodar, Telegram 2026-09-15: "can we set verification off for small tasks? we
