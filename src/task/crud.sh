@@ -1368,6 +1368,15 @@ cmd_task_show() {
         _sh_eff="no grader yet — one is attached when a delivery is bound (task deliver --pr=…)"
       else _sh_eff="no grader; 'task done' closes it outright"; fi
       echo; echo "verify: ${_sh_pol} (${_sh_src}) — ${_sh_eff}"
+      # DIVE-4559: the size rule is part of the answer to "will this be graded",
+      # so it is printed with it — but only when the box has turned it on, and
+      # WITHOUT measuring this row's delivery. The measurement needs a gh round
+      # trip against the bound PR, and `task show` is read far more often than
+      # `task done` runs; a reader who wants the verdict runs the close. The
+      # line states the rule in force, which is the fact `task show` can know.
+      local _sh_small; _sh_small=$(box_verify_small)
+      [[ "$_sh_small" != "off" ]] \
+        && echo "verify-small: ${_sh_small} lines (box) — a delivery under that, outside the blast radius, closes without a grader"
       # DIVE-4324 deliverable 3: the mode the row was FILED with, beside the
       # policy that caps it. NULL is printed as `unrecorded`, never as `none`:
       # every row filed before this column existed has one, and reading those as

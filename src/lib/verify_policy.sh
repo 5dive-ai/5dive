@@ -184,3 +184,44 @@ review_mode_cost_note() {  # <mode>
     *)     printf 'unknown' ;;
   esac
 }
+
+# ── DIVE-4559: the SMALL-delivery downgrade — the inverse of DIVE-2730 ───────
+#
+# lodar, Telegram 2026-09-15: "can we set verification off for small tasks? we
+# can be flexible" — asked immediately after "maybe we shouldn't turn off
+# grader?". Both sentences are the spec: keep grading what ships, stop spending
+# a whole cold grader session (a fresh seat reloading a PR from nothing) on a
+# two-line fix.
+#
+# THE BOX KNOB IS A SECOND QUESTION, NOT A FOURTH POLICY VALUE. `verify` asks
+# *which rows* get a grader and is answered at filing; this asks *how big a
+# delivery has to be* to be worth one, and can only be answered at delivery.
+# Folding it into `_VERIFY_POLICIES` would have made the 9-arm matrix a 12-arm
+# one in which three arms mean "it depends on a number stored somewhere else".
+#
+# DEFAULT `off`, INCLUDING ON THIS BOX until it is set explicitly. A downgrade
+# that arrives switched on would retroactively ungrade every small delivery on
+# every box that upgrades the CLI, which is a spend decision made for the
+# customer — the exact thing DIVE-4251 exists to stop.
+_verify_small_valid() {  # <value>
+  local v="${1:-}"
+  [[ "$v" == "off" ]] && return 0
+  [[ "$v" =~ ^[1-9][0-9]*$ ]]
+}
+
+# `box_verify_small` — the changed-line threshold under which a delivery closes
+# without booking a grader. Prints a positive integer, or `off`.
+#
+# Read at call time and validated on the way out, for the same two reasons
+# `box_verify_policy` is: STATE_DIR is reassigned by ~60 harnesses after the
+# libs load, and a hand-edited box.json must never be able to make an unreadable
+# value mean "a very large number". Anything unparseable reads as `off` — the
+# direction that keeps grading.
+box_verify_small() {
+  local v="" f; f=$(_box_config_path)
+  if [[ -r "$f" ]]; then
+    v=$(jq -r '.verify_small // empty' "$f" 2>/dev/null || printf '')
+  fi
+  _verify_small_valid "$v" || v="off"
+  printf '%s' "$v"
+}
