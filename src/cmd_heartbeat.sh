@@ -6981,12 +6981,107 @@ _hb_memory_consolidate_sweep() {
   return 0
 }
 
+# DIVE-4585 — THE SCHEDULER for the account-usage snapshot.
+#
+# `/var/lib/5dive/account-usage.json` is the one carrier of an account's rate-
+# limit reading that IDLENESS CANNOT ERASE: it reaches the number through the
+# registry binding rather than through anything a seat did lately. Three
+# consumers fence it at QUOTA_SNAPSHOT_MAX_AGE (600s) — the pacing floor
+# (`_pace_account_seven`), the digest's account block, and `agent list`'s quota
+# join — and until this sweep existed its ONLY writer was `cmd_account_usage`,
+# i.e. a human typing `sudo 5dive account usage`. Measured 2026-09-16, 1134s
+# after the last hand-run: all 23 accounts outside the fence, so every consumer
+# fell back to the ACTIVITY document that cannot measure the idle, and a quiet
+# account was paced down to high/urgent-only on nearly every tick (DIVE-4575
+# measured the same lost dispatch at nine hours on the grader pool).
+#
+# A source with no scheduled publisher is not a source. The repair is a cadence,
+# NOT a wider fence: a fresher source that is allowed to be stale is not an
+# improvement (DIVE-4578, DIVE-4342).
+#
+# Why here and not a new cron.d entry or a systemd timer — the same answer
+# DIVE-3628 gave for the consolidate pass: the tick is the ONE recurring root
+# job every 5dive box already has (`5dive init` wires it, it fires every
+# minute), so hanging the publisher off it means a customer box gets a fresh
+# snapshot with zero extra install. A timer would be a second thing to install
+# and a second thing to be missing — which is the defect class this row IS.
+#
+# And it runs as ROOT here, which is the other half of why the tick is the right
+# host: the rows can only be built by a reader that can open sibling seats'
+# 0750 homes. An unprivileged timer would publish an empty snapshot and look
+# like it was working.
+#
+# CADENCE: 120s, a fifth of the 600s fence. Not 600 and not "every tick" — at
+# the fence a single missed pass expires the source, and the pass is not free:
+# MEASURED on this box 2026-09-16, `account usage` over 22 accounts takes
+# 1.40s / 1.77s / 1.43s wall (it opens every bound seat's statusline cache), for
+# a seven-day percentage that cannot move meaningfully in sixty seconds. 120s
+# survives four consecutive missed ticks and still lands inside the fence, at
+# ~1.5s of work per two minutes.
+#
+# WHAT A CADENCE CANNOT DO: it makes the snapshot FRESH, never COMPLETE. On this
+# box 3 of 22 accounts carry a reading at all; the other 19 have no bound seat
+# that has ever rendered a statusline and no remembered record, so they publish
+# `usage: null` and their consumers still fall back to the activity document.
+# Republishing faster cannot invent a number nobody has measured — that is a
+# different row, and it must not be papered over by widening the fence.
+_HB_QUOTA_SNAPSHOT_EVERY_SEC="${_HB_QUOTA_SNAPSHOT_EVERY_SEC:-120}"
+
+# _hb_quota_snapshot_sweep <now> — republish the snapshot when it is due.
+# Same isolation contract as every other sweep: it must never abort the wake
+# loop, and it must never report a publish it did not do.
+_hb_quota_snapshot_sweep() {
+  local now="$1"
+  _HB_QSNAP_RAN=0; _HB_QSNAP_SKIPPED=0; _HB_QSNAP_FAILED=0
+  [[ "${QUOTA_SNAPSHOT_PUBLISH:-on}" == "off" ]] && return 0
+  local every="${QUOTA_SNAPSHOT_EVERY_SEC:-${_HB_QUOTA_SNAPSHOT_EVERY_SEC}}"
+  [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) || every="$_HB_QUOTA_SNAPSHOT_EVERY_SEC"
+  # A PACKAGING DEFECT IS NAMED, NEVER SWALLOWED. `account_usage_publish` is
+  # bundled ahead of this file (build.sh); its absence means the manifest lost
+  # src/cmd_account.sh or a harness hand-picked its sources. Silence here would
+  # read exactly like "nothing was due" — which is the shape of the defect this
+  # sweep exists to end.
+  if ! declare -F account_usage_publish >/dev/null 2>&1; then
+    _HB_QSNAP_FAILED=1
+    _hb_log "[quota-snapshot] PACKAGING DEFECT: account_usage_publish is not defined in this process — src/cmd_account.sh is missing from the bundle manifest (build.sh). The account-usage snapshot has no publisher again; every consumer of it is fenced out within ${QUOTA_SNAPSHOT_MAX_AGE:-600}s (DIVE-4585)."
+    return 0
+  fi
+  local stamp="${STATE_DIR:-/var/lib/5dive}/quota-snapshot.stamp" last
+  last=$(cat "$stamp" 2>/dev/null) || last=0
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  # A stamp from the FUTURE (clock step, restored backup) would otherwise wedge
+  # the publisher until real time caught up — the one failure mode that looks
+  # identical to "it is working".
+  (( last > now )) && last=0
+  if (( now - last < every )); then
+    _HB_QSNAP_SKIPPED=1; return 0
+  fi
+  # Stamp BEFORE the pass, like the consolidate sweep: the tick fires every
+  # minute, and a pass wedged on a slow filesystem read would otherwise be
+  # re-entered by every subsequent tick. A crashed pass just waits one cadence.
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+  if account_usage_publish; then
+    _HB_QSNAP_RAN=1
+  else
+    _HB_QSNAP_FAILED=1
+  fi
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
   local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0 sk_capped=0 sk_parked=0 sk_pace=0
   local today; today=$(date +%F)   # DIVE-1858 wake-budget day key (YYYY-MM-DD)
+  # DIVE-4585: republish the account-usage snapshot FIRST, before anything in
+  # this tick reads an account's headroom. The pacing floor below consults it
+  # (through `_grader_account_reading_json`) for exactly the accounts whose seats
+  # are all idle, so a snapshot refreshed after the wake loop would be a snapshot
+  # this tick paced without. Same isolation contract as every other sweep.
+  _hb_quota_snapshot_sweep "$now" || _hb_log "[quota-snapshot] pass errored (non-fatal)"
+  (( ${_HB_QSNAP_RAN:-0} || ${_HB_QSNAP_FAILED:-0} )) \
+    && _hb_log "[quota-snapshot] account-usage snapshot ${_HB_QSNAP_RAN:-0} published, ${_HB_QSNAP_FAILED:-0} failed (cadence ${_HB_QUOTA_SNAPSHOT_EVERY_SEC:-120}s, consumer fence ${QUOTA_SNAPSHOT_MAX_AGE:-600}s)" || true
   # DIVE-138: materialize due recurring templates FIRST so a freshly-cloned todo
   # is eligible for the wake loop below this same tick. Isolated — a failure here
   # must never abort the wake loop.

@@ -510,10 +510,21 @@ account_usage_recall() {
   jq -c '. + {source: null, remembered: true}' "$path" 2>/dev/null || printf 'null'
 }
 
-cmd_account_usage() {
-  ensure_state
-  [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account usage"
-  require_root
+# account_usage_rows — the per-account table as rows JSON, and NOTHING else.
+#
+# DIVE-4585. This loop used to live inside `cmd_account_usage`, which is why the
+# only way to refresh the published snapshot was for a human to type
+# `sudo 5dive account usage` and read a table nobody asked for. A source whose
+# refresh is welded to a print statement has no scheduler and therefore no
+# cadence — see community/wiki/a-source-with-no-scheduled-publisher-is-not-a-source.md.
+# Split out so the scheduled publisher (`_hb_quota_snapshot_sweep`) drives the
+# SAME rows the table prints; a second row-builder would be a second thing to
+# drift.
+#
+# Root in practice: it reads sibling seats' 0750 homes for their statusline
+# caches. Callers enforce that; this function does not, so a harness can drive
+# it with fixture accounts.
+account_usage_rows() {
   local rows="[]" name agents agent rl at best best_at src usage
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
@@ -544,8 +555,40 @@ cmd_account_usage() {
     rows=$(jq -c --arg n "$name" --argjson a "$agents" --argjson u "$usage" \
       '. + [{name:$n, agents:$a, usage:$u}]' <<<"$rows")
   done < <(account_each)
+  printf '%s' "$rows"
+}
+
+# account_usage_publish — build the rows and publish the snapshot. NO table, no
+# JSON envelope, no exit code that can kill a caller.
+#
+# DIVE-4585: this is the entry point a SCHEDULER calls. The snapshot is the one
+# carrier of an account's reading that idleness cannot erase (it reaches the
+# number through the registry binding), and every consumer fences it at
+# QUOTA_SNAPSHOT_MAX_AGE — so a snapshot refreshed only by a human typing a
+# command is, for all of those consumers, permanently expired. Measured
+# 2026-09-16: every one of 23 accounts outside the 600s fence, 1134s after the
+# last hand-run (DIVE-4585 body).
+#
+# Always returns 0. It is called from the heartbeat tick, where the standing
+# contract is that no sweep may ever abort the wake loop.
+account_usage_publish() {
+  local rows
+  rows=$(account_usage_rows 2>/dev/null) || return 0
+  [[ -n "$rows" && "$rows" != "[]" ]] || return 0
+  quota_snapshot_publish "$rows" || true
+  return 0
+}
+
+cmd_account_usage() {
+  ensure_state
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account usage"
+  require_root
+  local rows; rows=$(account_usage_rows)
   # Publish for the unprivileged health surfaces (liveness, supervisor,
   # agent list). See src/lib/quota_wall.sh — measurements, not verdicts.
+  # This hand-run is no longer the ONLY publisher (DIVE-4585) — it stays
+  # because the freshest possible snapshot at the moment a human looks is
+  # strictly better than one up to a cadence old.
   quota_snapshot_publish "$rows"
   if (( JSON_MODE )); then
     echo "$rows" | jq -c '{ok:true, data: .}'

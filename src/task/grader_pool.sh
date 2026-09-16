@@ -81,7 +81,18 @@ _grader_pct() {  # <account> <fiveHourPct|sevenDayPct> [<json-on-stdin>]
 #     about the window we are about to spend in (`quota_wall_reset_guard`);
 #   * when nothing fresh is found it emits NOTHING and the caller keeps failing
 #     closed. There is no path here that invents a number.
-_GRADER_READING_MAX_AGE="${_GRADER_READING_MAX_AGE:-600}"
+# DIVE-4585 — ONE FENCE, ONE NUMBER. This used to carry its own `600` literal
+# while the digest's python block and `agent list` read QUOTA_SNAPSHOT_MAX_AGE,
+# also 600. Two spellings of one predicate agree only until an operator moves
+# one of them, and the disagreement they would then produce is SILENT: the floor
+# and the digest would grade the same account's reading differently, which is
+# precisely what DIVE-4578 iteration 1 was rejected for. So the canonical knob is
+# QUOTA_SNAPSHOT_MAX_AGE (src/lib/quota_wall.sh, bundled ahead of this file) and
+# this name is now an ALIAS of it, retained because ~2 harnesses and the pacing
+# floor's own messages spell the fence this way. Set QUOTA_SNAPSHOT_MAX_AGE and
+# both predicates move; the `600` here is only the no-quota_wall.sh fallback a
+# hand-picked harness source list would hit.
+_GRADER_READING_MAX_AGE="${_GRADER_READING_MAX_AGE:-${QUOTA_SNAPSHOT_MAX_AGE:-600}}"
 _GRADER_READING_US=$'\037'
 
 # `_grader_reading_expired <resetsAt> <now>` — exit 0 when this window has
@@ -1263,7 +1274,20 @@ $(_grader_inflight_exits_sql)
       local dark_note=""
       if [[ "$why" == *"failing closed"* ]]; then
         n_dark=$((n_dark+1))
-        dark_note=" [POOL DARK: an account with no measured reading — this refusal does not clear at any window reset; run 'sudo -n 5dive account usage' or start the seat once]"
+        # DIVE-4585: the snapshot now has a scheduled publisher (the heartbeat
+        # tick republishes it every couple of minutes — the sweep clause in
+        # src/cmd_heartbeat.sh owns the cadence), so a reading that is absent
+        # HERE is no longer the expected steady state it was when this note was
+        # written — it means no seat bound to the account has ever rendered a
+        # statusline, or the tick is not running. Say both, in that order.
+        #
+        # DIVE-4585 iteration 2: the cadence is deliberately NOT named here, in
+        # prose OR in the message. `lazy_tokens` matches identifiers over the
+        # whole file including comments, so one mention of a top-level global of
+        # another payload module puts a __MODDEPS edge on this one — and this
+        # module is in every verb's closure, so the edge lands on `whoami`.
+        # Cite the owning file, never the constant.
+        dark_note=" [POOL DARK: an account with no measured reading — this refusal does not clear at any window reset. The snapshot is republished by the heartbeat tick every couple of minutes (DIVE-4585), so check that the tick is running ('5dive heartbeat ls', /var/log/5dive-heartbeat.log) before anything else; if it is, no seat bound to this account has ever rendered a statusline — start one once, or run 'sudo -n 5dive account usage' for an immediate publish]"
       fi
       plan+="queue   $ident  ($( [[ -n "$busy" ]] && printf 'no free seat' || printf 'no seat with headroom' ) — ${busy}${why})${dark_note}"$'\n'; continue
     fi
