@@ -275,8 +275,15 @@ grep -q "OR ( (\${_TASKS_TFV_SQL})" <<<"$PICK" \
 # answer for a blind sibling on the same account.
 DPROBE="$TMPD/dpace.py"
 cat > "$DPROBE" <<'PYEOF'
-import os, time, sys
+import os, time, sys, datetime as dt
 src = open('src/cmd_digest.sh').read()
+# The block calls the digest's own timestamp parser; extract it rather than
+# re-typing one, so a drift there is graded here too.
+_ts_a = src.index('def to_epoch(s):')
+_ts_b = src.index('\n\n', _ts_a)
+_ts_ns = {"dt": dt}
+exec(src[_ts_a:_ts_b], _ts_ns)
+to_epoch = _ts_ns["to_epoch"]
 try:
     a = src.index('# DIVE-4430 — the PACING FLOOR')
     tail = 'paced = [p for p in pace_l if p["band"] != "open"]'
@@ -295,18 +302,74 @@ cases = [
               [{"name":"a","account":"m","sevenDayPct":None,"sevenDayResetsAt":None},
                {"name":"b","account":"m","sevenDayPct":70,"sevenDayResetsAt":now+6*86400}], "soft"),
 ]
+# DIVE-4578 — the same six situations answered by the ACCOUNT's reading instead
+# of the per-seat document, plus the two fences and the negative control. The
+# QUIET-ACCOUNT case is the row: no seat row at all (or a null one) and a fresh
+# account reading at 20% must read OPEN, where it used to read blind -> soft.
+def snap(pct, resets, asof=None, name="m"):
+    return {"writtenAt": now,
+            "accounts": [{"name": name,
+                          "usage": {"asOf": now - 60 if asof is None else asof,
+                                    "fiveHour": {"pct": 5, "resetsAt": now + 3600},
+                                    "sevenDay": {"pct": pct, "resetsAt": resets}}}]}
+NOSEAT = []
+NULLSEAT = [{"name":"a","account":"m","sevenDayPct":None,"sevenDayResetsAt":None}]
+acct_cases = [
+    # label, agents, snapshot, want-band, want-source
+    ("quiet-account-no-seat-row",   NOSEAT,   snap(20, now+6*86400), "open",  "account"),
+    ("quiet-account-null-seat-row", NULLSEAT, snap(20, now+6*86400), "open",  "account"),
+    ("account-soft",                NULLSEAT, snap(70, now+6*86400), "soft",  "account"),
+    ("account-hard",                NULLSEAT, snap(95, now+6*86400), "hard",  "account"),
+    ("account-near-reset",          NULLSEAT, snap(70, now+2*86400), "open",  "account"),
+    # The account reading OVERRIDES a live seat row, and the two are never mixed:
+    # the seat says 20% with 6d left, the account says 95%.
+    ("account-overrides-a-live-seat",
+     [{"name":"a","account":"m","sevenDayPct":20,"sevenDayResetsAt":now+6*86400}],
+     snap(95, now+6*86400), "hard", "account"),
+    # FENCE 1 — the reading's own asOf. Past the age it is not a reading, and the
+    # seat document answers instead.
+    ("stale-reading-falls-back-to-the-seat",
+     [{"name":"a","account":"m","sevenDayPct":70,"sevenDayResetsAt":now+6*86400}],
+     snap(20, now+6*86400, asof=now-4000), "soft", "seat"),
+    # FENCE 2 — a window that has already turned over is not a statement about
+    # the week we are pacing.
+    ("reset-passed-falls-back-to-the-seat",
+     [{"name":"a","account":"m","sevenDayPct":70,"sevenDayResetsAt":now+6*86400}],
+     snap(20, now-3600), "soft", "seat"),
+    # NEGATIVE CONTROL — with NEITHER source we are still blind and still held.
+    ("neither-source-still-blind", NULLSEAT, {"accounts": []}, "blind", None),
+    ("a-snapshot-for-another-account-is-not-this-one",
+     NULLSEAT, snap(20, now+6*86400, name="other"), "blind", None),
+]
 bad = 0
 for label, agents, want in cases:
-    ns = {"os": os, "time": time, "agents": agents}
+    ns = {"os": os, "time": time, "to_epoch": to_epoch, "agents": agents, "acct_snap": {}}
     exec(block, ns)
     got = ns["pace_l"][0]["band"]
     print(("ok" if got == want else "no"), label, got, want)
     if got != want: bad += 1
+for label, agents, sn, want, want_src in acct_cases:
+    ns = {"os": os, "time": time, "to_epoch": to_epoch, "agents": agents, "acct_snap": sn}
+    exec(block, ns)
+    rows = ns["pace_l"]
+    row = next((r for r in rows if r["account"] == "m"), None)
+    got = row["band"] if row else "<no row>"
+    gsrc = row.get("source") if row else None
+    okrow = (got == want and gsrc == want_src)
+    print(("ok" if okrow else "no"), label, got, want, gsrc, want_src)
+    if not okrow: bad += 1
 # breach-only: an open account must produce NO digest line.
-ns = {"os": os, "time": time,
+ns = {"os": os, "time": time, "to_epoch": to_epoch, "acct_snap": {},
       "agents": [{"name":"a","account":"m","sevenDayPct":20,"sevenDayResetsAt":now+6*86400}]}
 exec(block, ns)
 print(("ok" if not ns["paced"] else "no"), "breach-only", len(ns["paced"]), 0)
+if ns["paced"]: bad += 1
+# ...and a quiet account the ACCOUNT reading clears must not render either: the
+# whole point of the row is that it stops being reported as held.
+ns = {"os": os, "time": time, "to_epoch": to_epoch, "agents": [],
+      "acct_snap": snap(20, now+6*86400)}
+exec(block, ns)
+print(("ok" if not ns["paced"] else "no"), "quiet-account-breach-only", len(ns["paced"]), 0)
 if ns["paced"]: bad += 1
 sys.exit(1 if bad else 0)
 PYEOF
@@ -314,7 +377,7 @@ dout=$(timeout 120 python3 "$DPROBE" 2>&1); drc=$?
 if [[ "$dout" == *EXTRACT-FAILED* ]]; then
   bad_ "H: extraction" "the digest's pacing block could not be located — its sentinel comment moved"
 elif (( drc == 0 )); then
-  ok_ "H: the digest's band agrees with _pace_band on all six situations, and stays silent on an open account"
+  ok_ "H: the digest's band agrees with _pace_band on all six situations, reads the ACCOUNT first (DIVE-4578) with both fences and the blind control, and stays silent on an open account"
 else
   bad_ "H: digest band" "the digest's copy disagrees with the floor: ${dout//$'\n'/ | }"
 fi
@@ -359,6 +422,72 @@ CF="$TMPD/pace-cache.json"
   [[ "$rcb" == "2" ]] || { echo "I4 empty snapshot did not read as blind/soft (got $rcb)"; exit 1; }
   exit 0 ) && ok_ "I: the snapshot cache serves fresh, bypasses stale, and fails to BLIND rather than to 0% or to a stale number" \
     || bad_ "I: snapshot cache" "see the message above"
+
+# ── J: DIVE-4578 — the floor reads the ACCOUNT first ───────────────────────
+# The document `_pace_band` grades is built by walking what each seat DID in the
+# window, so its silence about an account means "quiet", not "unmeasured" — and
+# FIVE_PACE_BLIND=soft then paces a quiet account down to high/urgent-only while
+# its account reading says it has room. Same document, same ambiguity as the
+# grader pool's nine-hour stall (DIVE-4575), inverted by this consumer's
+# fail-safe pointing the other way.
+#
+# THESE ARMS DRIVE THE REAL `_pace_account_seven`, NOT A STUB OF `_PACE_ACCOUNT_CMD`.
+# `quota_snapshot_read` is what the shipped bundle reaches for when no bound seat
+# carries a live cache, so defining THAT is how the normaliser, the age fence and
+# the reset fence all execute and only the file read is replaced. Stubbing the
+# command seam instead would grade the caller and nothing else.
+jarm(){ # <snapshot-json> <usage-doc-or-empty> -> "<rc> <verdict>"
+  ( source src/task/grader_pool.sh
+    quota_snapshot_read(){ printf '%s' "$1"; }
+    # shellcheck disable=SC2317
+    quota_snapshot_read(){ printf '%s' "$SNAP"; }
+    SNAP="$1"
+    local rc=0 out
+    out=$(printf '%s' "$2" | _pace_band acct "$NOW") || rc=$?
+    printf '%s %s' "$rc" "$out" )
+}
+snap_(){ # <7d-pct> <7d-resets> [<asOf>]
+  printf '{"writtenAt":%s,"accounts":[{"name":"acct","usage":{"asOf":%s,"fiveHour":{"pct":5,"resetsAt":%s},"sevenDay":{"pct":%s,"resetsAt":%s}}}]}' \
+    "$NOW" "${3:-$(( NOW - 60 ))}" "$(( NOW + 3600 ))" "$1" "$2"
+}
+jcase(){ # <label> <want-rc> <snapshot> <usage-doc> [<must-contain>]
+  local got rc
+  got=$(jarm "$3" "$4"); rc="${got%% *}"
+  if [[ "$rc" == "$2" ]] && { [[ -z "${5:-}" ]] || [[ "$got" == *"$5"* ]]; }; then
+    ok_ "J: $1"
+  else
+    bad_ "J: $1" "rc=$rc want=$2 verdict=${got#* }"
+  fi
+}
+# The row itself: a QUIET account — no row in the document at all — with a fresh
+# account reading at 20% is OPEN, where it used to be held at the soft floor.
+jcase "a quiet account with a fresh 20% account reading is OPEN, not held at the soft floor" \
+      0 "$(snap_ 20 "$FAR")" "" "from the account reading"
+jcase "a document that names the account but carries no weekly number does not override it either" \
+      0 "$(snap_ 20 "$FAR")" "$(mkjson null null)" "from the account reading"
+# The account reading is the SOURCE, not a tie-breaker: it overrides a live seat
+# row in the tightening direction too.
+jcase "the account reading overrides a live seat row (seat 20%, account 95% -> hard)" \
+      3 "$(snap_ 95 "$FAR")" "$(mkjson 20 "$FAR")" "hard floor"
+jcase "the account reading at 70% with 6d to the reset holds at the soft floor" \
+      2 "$(snap_ 70 "$FAR")" "" "from the account reading"
+# The reset that relaxes the soft floor comes from the SAME source as the pct —
+# the document says 6 days out, the account says 2, and the account wins.
+jcase "the days-to-reset relaxation uses the ACCOUNT's reset, never the document's" \
+      0 "$(snap_ 70 "$NEAR")" "$(mkjson 70 "$FAR")" "to the reset"
+# FENCE 1: the age of the READING, not of the file that quotes it.
+jcase "a reading past _GRADER_READING_MAX_AGE is not a reading — the document answers instead" \
+      2 "$(snap_ 20 "$FAR" "$(( NOW - 4000 ))")" "$(mkjson 70 "$FAR")" "from the seat reading"
+# FENCE 2: a window that has already turned over says nothing about this week.
+jcase "a weekly window whose reset has passed is dropped — the document answers instead" \
+      2 "$(snap_ 20 "$(( NOW - 3600 ))")" "$(mkjson 70 "$FAR")" "from the seat reading"
+# NEGATIVE CONTROLS — the fail-closed rule is not relaxed for the seat we want.
+jcase "with NEITHER source the floor is still blind and still holds (never 0%)" \
+      2 '{"accounts":[]}' "" "no account reading measured within"
+jcase "a snapshot for a DIFFERENT account is not this account's reading" \
+      2 '{"writtenAt":0,"accounts":[{"name":"other","usage":{"asOf":0,"sevenDay":{"pct":5}}}]}' "" \
+      "no account reading measured within"
+jcase "a malformed snapshot is not a measurement" 2 'not json at all' "" "no weekly reading"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
