@@ -220,11 +220,10 @@ cmd_digest() {
     printf '%s\n' '{"data":{"agents":[],"tasks":[],"coverage":{"agentsExpected":null,"agentsRead":0,"unreadable":[],"complete":false,"unavailable":true,"reason":"the usage collector could not be run by this caller (5dive usage needs root)"}}}'
   }
 
-  # The account snapshot, read the unprivileged way (DIVE-4578). `quota_snapshot_read`
-  # is bundled ahead of this file and is preferred; the direct file read is the
-  # fallback for a digest sourced without src/lib/quota_wall.sh. An unreadable or
-  # absent snapshot yields `{}` — which leaves every account on the per-seat
-  # document exactly as before, never on an invented number.
+  # The published account snapshot, read the unprivileged way (DIVE-4578).
+  # `quota_snapshot_read` is bundled ahead of this file and is preferred; the
+  # direct file read is the fallback for a digest sourced without
+  # src/lib/quota_wall.sh. An unreadable or absent snapshot yields `{}`.
   _digest_account_snapshot() {
     if declare -F quota_snapshot_read >/dev/null 2>&1; then
       local snap; snap="$(quota_snapshot_read 2>/dev/null || printf '')"
@@ -233,6 +232,68 @@ cmd_digest() {
     local f="${QUOTA_SNAPSHOT_FILE:-${STATE_DIR:-/var/lib/5dive}/account-usage.json}"
     if [ -r "$f" ] && [ -s "$f" ]; then jq -ce '.' "$f" 2>/dev/null && return 0; fi
     printf '%s\n' '{}'
+  }
+
+  # ── DIVE-4578 iteration 2: A SOURCE WITH NO SCHEDULED PUBLISHER IS NOT A SOURCE
+  #
+  # The account rows this digest's pacing block reads now come from
+  # `_grader_account_reading_json` — the SAME two-source reader the floor uses
+  # (src/task/grader_pool.sh): each registry-bound seat's LIVE statusline cache
+  # first (`account_best_ratelimits`, root — and the digest cron IS root), the
+  # published snapshot second.
+  #
+  # Iteration 1 fed this block the snapshot ALONE, and NOTHING publishes that
+  # snapshot on a schedule: its only writer is `cmd_account_usage`, i.e. a human
+  # typing `5dive account usage`. There is no cron.d entry, no timer and no
+  # in-product caller, so on an hourly digest tick every account was already
+  # past the 600s `asOf` fence and the block fell straight back to the activity
+  # document this row exists to stop trusting. Measured on this host at
+  # 2026-09-16 01:05Z: per-account asOf ages 5716s / 6082s / 20382s, the rest
+  # null — every one of them outside the fence. Worse, `_pace_band` was reading
+  # the LIVE caches at that same moment, so the two predicates that must agree
+  # could disagree on one tick: the floor clearing an account the digest still
+  # rendered as "blind — held at the soft floor".
+  #
+  # THE FENCES ARE UNCHANGED and still live in the python block (the reading's
+  # own `asOf` within QUOTA_SNAPSHOT_MAX_AGE; a window whose `resetsAt` has
+  # turned over dropped). This function changes WHERE the rows come from, never
+  # whether they are believed — an account with neither source contributes no
+  # row, exactly as an absent snapshot did, and the block is still blind and
+  # still held.
+  #
+  # The account list is the UNION of the snapshot's names and the profiles on
+  # disk (`account_each`), because the quiet account this row is about may have
+  # no snapshot row at all. Without `_grader_account_reading_json` in the
+  # process (a digest sourced without src/task/grader_pool.sh) this degrades to
+  # the plain snapshot read above rather than to nothing.
+  _digest_account_reading() {
+    local snap rows='[]' n rl next
+    snap="$(_digest_account_snapshot 2>/dev/null || printf '{}')"
+    if ! declare -F _grader_account_reading_json >/dev/null 2>&1; then
+      [ -n "$snap" ] || snap='{}'
+      printf '%s\n' "$snap"; return 0
+    fi
+    local -a names=()
+    while IFS= read -r n; do
+      if [ -n "$n" ]; then names+=("$n"); fi
+    done < <(
+      { printf '%s\n' "$snap" | jq -r '(.accounts // [])[]? | .name // empty' 2>/dev/null || true
+        if declare -F account_each >/dev/null 2>&1; then account_each 2>/dev/null || true; fi
+      } | awk 'NF && !seen[$0]++' 2>/dev/null || true
+    )
+    for n in ${names[@]+"${names[@]}"}; do
+      rl="$(_grader_account_reading_json "$n" 2>/dev/null || printf '')"
+      [ -n "$rl" ] && [ "$rl" != "null" ] || continue
+      next="$(jq -c --arg n "$n" --argjson r "$rl" '. + [{name: $n, usage: {
+                asOf: ($r.asOf // null),
+                fiveHour: (if ($r.fiveHourPct // null) == null then null
+                           else {pct: $r.fiveHourPct, resetsAt: ($r.fiveResetsAt // null)} end),
+                sevenDay: (if ($r.sevenDayPct // null) == null then null
+                           else {pct: $r.sevenDayPct, resetsAt: ($r.sevenResetsAt // null)} end)}}]' \
+              <<<"$rows" 2>/dev/null || printf '')"
+      if [ -n "$next" ]; then rows="$next"; fi
+    done
+    jq -cn --argjson a "$rows" '{accounts: $a}' 2>/dev/null || printf '%s\n' '{}'
   }
 
   # Stage each source in a temp file (a large task queue blows past the env-var
@@ -256,10 +317,11 @@ cmd_digest() {
   # window, so a QUIET account contributes no row (or a row of nulls) and the
   # pacing block below read that silence as "blind" — held at the soft floor —
   # while the account snapshot had the live weekly number all along. The
-  # snapshot is the unprivileged reader's copy of the same measurement
-  # (src/lib/quota_wall.sh publishes it world-readable), so this costs one
-  # small file read and no extra collect.
-  _digest_account_snapshot >"$tmpd/acct.json" 2>/dev/null || echo '{}' >"$tmpd/acct.json"
+  # The rows come from `_grader_account_reading_json` per account — the live
+  # per-seat statusline caches the registry binds to the account first, the
+  # published snapshot second — because the snapshot alone has no scheduled
+  # publisher and is stale on almost every tick (see _digest_account_reading).
+  _digest_account_reading >"$tmpd/acct.json" 2>/dev/null || echo '{}' >"$tmpd/acct.json"
   [ -s "$tmpd/acct.json" ] || echo '{}' >"$tmpd/acct.json"
   _digest_run heartbeat ls >"$tmpd/hb.txt" 2>/dev/null || : >"$tmpd/hb.txt"
   # DIVE-3501: seats whose ENTIRE runnable queue is tier-guard held. This is the

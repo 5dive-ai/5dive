@@ -24,6 +24,11 @@
 #      not rot.
 #   F. `--max-iters` defaults to 2 on a standard row, is untouched on a template,
 #      and never overrides an explicit value.
+#   H2. The digest's account rows come from the SAME two-source reader the floor
+#      uses (live per-seat caches first, published snapshot second) — not from
+#      the snapshot alone, which has no scheduled publisher and is stale on
+#      every hourly tick. Graded on the state that proves it: stale snapshot,
+#      fresh live cache, and the two predicates must land on the same band.
 #   G. The picker already excludes `blocked` rows and rows whose merge another
 #      seat owns — asserted against the LIVE query text, because arm 4 of the
 #      filing is satisfied by code that is already on main and a regression here
@@ -380,6 +385,126 @@ elif (( drc == 0 )); then
   ok_ "H: the digest's band agrees with _pace_band on all six situations, reads the ACCOUNT first (DIVE-4578) with both fences and the blind control, and stays silent on an open account"
 else
   bad_ "H: digest band" "the digest's copy disagrees with the floor: ${dout//$'\n'/ | }"
+fi
+
+# ── H2: THE DIGEST'S ROWS COME FROM THE SAME READER THE FLOOR USES ─────────
+# Arm H stubs the SNAPSHOT and nothing else, so it cannot see the state that
+# rejected iteration 1: the snapshot is STALE (nothing publishes it on a
+# schedule — its only writer is a human typing `5dive account usage`) while a
+# registry-bound seat's LIVE statusline cache is FRESH. In that state the floor
+# read the live cache and cleared the account while the digest, on the same
+# tick, still rendered it held — a NEW disagreement between the two predicates
+# that must agree.
+#
+# So this arm drives the digest's REAL row builder (`_digest_account_reading`,
+# extracted verbatim from src/cmd_digest.sh) over stubs of BOTH carriers, and
+# asserts the band it produces equals `_pace_band`'s on the same fixture.
+DIGF="$TMPD/digfn.sh"
+awk '/^  _digest_account_snapshot\(\) \{/{f=1} f{print} f&&/^  \}$/{exit}' src/cmd_digest.sh  > "$DIGF"
+awk '/^  _digest_account_reading\(\) \{/{f=1}  f{print} f&&/^  \}$/{exit}' src/cmd_digest.sh >> "$DIGF"
+if ! grep -q '_grader_account_reading_json' "$DIGF"; then
+  bad_ "H2: extraction" "the digest's account-row builder could not be located, or it no longer calls _grader_account_reading_json — which is the whole finding"
+else
+  ok_ "H2: the digest's account-row builder was extracted from the shipping source and calls the floor's reader"
+  NOWR=$(date +%s); RFAR=$(( NOWR + 6*86400 ))
+  # The document the digest and the floor BOTH fall back to: the account's one
+  # busy seat moved tokens and reported 70% — enough to hold at the soft floor.
+  SEATDOC=$(printf '{"agents":[{"name":"s1","account":"m","sevenDayPct":70,"sevenDayResetsAt":%s}]}' "$RFAR")
+  ACCTF="$TMPD/acct-built.json"
+  ( set -uo pipefail
+    source src/task/grader_pool.sh
+    # LIVE, per registry-bound seat — fresh, and it says the account has room.
+    # `q` is the quiet account the snapshot has never heard of: it exists only
+    # as a profile on disk, which is exactly the account this row is about.
+    account_best_ratelimits() {
+      case "$1" in
+        m) printf '{"asOf":%s,"fiveHourPct":5,"fiveResetsAt":%s,"sevenDayPct":20,"sevenResetsAt":%s}' "$(( NOWR - 60 ))" "$(( NOWR + 3600 ))" "$RFAR" ;;
+        q) printf '{"asOf":%s,"fiveHourPct":4,"fiveResetsAt":%s,"sevenDayPct":95,"sevenResetsAt":%s}' "$(( NOWR - 60 ))" "$(( NOWR + 3600 ))" "$RFAR" ;;
+        *) printf '' ;;
+      esac
+    }
+    # The PUBLISHED SNAPSHOT — stale by 4000s, i.e. the state it is in on every
+    # hourly digest tick, and disagreeing with the live cache so a silent
+    # fall-through to it is visible as a different band, not as the same one.
+    quota_snapshot_read() {
+      printf '{"writtenAt":%s,"accounts":[{"name":"m","usage":{"asOf":%s,"fiveHour":null,"sevenDay":{"pct":95,"resetsAt":%s}}}]}' \
+             "$(( NOWR - 4000 ))" "$(( NOWR - 4000 ))" "$RFAR"
+    }
+    account_each() { printf 'q\n'; }
+    # shellcheck source=/dev/null
+    source "$DIGF"
+    _digest_account_reading > "$ACCTF"
+  ) 2>/dev/null
+  # 1. The builder reached the LIVE cache, not the stale snapshot: `m` carries
+  #    20% (live) and not 95% (snapshot), and its asOf is inside the fence.
+  gpct=$(jq -r '[(.accounts//[])[]|select(.name=="m")|.sevenDay//.usage.sevenDay|.pct]|first // "none"' "$ACCTF" 2>/dev/null)
+  [[ "$gpct" == "20" ]] \
+    && ok_ "H2: the digest's row for a seat-bound account carries the LIVE cache's 20%, not the stale snapshot's 95%" \
+    || bad_ "H2: live first" "expected 20 from the live cache, got '${gpct}' — a stale snapshot was preferred, which is the reject"
+  gage=$(jq -r --argjson n "$NOWR" '[(.accounts//[])[]|select(.name=="m")|.usage.asOf]|first // -1 | $n - .' "$ACCTF" 2>/dev/null)
+  [[ "$gage" =~ ^[0-9]+$ ]] && (( gage <= 600 )) \
+    && ok_ "H2: ...and that row's asOf is INSIDE the 600s fence, so the digest's fence can admit it at all" \
+    || bad_ "H2: asOf age" "row asOf is ${gage}s old — outside the fence, so the digest still falls back to the activity document"
+  # 2. The account the snapshot never heard of is still reached, through the
+  #    profiles on disk. This is the quiet account the row exists for.
+  qpct=$(jq -r '[(.accounts//[])[]|select(.name=="q")|.usage.sevenDay.pct]|first // "none"' "$ACCTF" 2>/dev/null)
+  [[ "$qpct" == "95" ]] \
+    && ok_ "H2: an account with NO snapshot row is still reached through its profile on disk" \
+    || bad_ "H2: union" "account 'q' is absent from the built rows (got '${qpct}')"
+  # 3. THE AGREEMENT. Same fixture, both predicates.
+  frc=0
+  ( set -uo pipefail
+    source src/task/grader_pool.sh
+    account_best_ratelimits() {
+      case "$1" in m) printf '{"asOf":%s,"fiveHourPct":5,"fiveResetsAt":%s,"sevenDayPct":20,"sevenResetsAt":%s}' "$(( NOWR - 60 ))" "$(( NOWR + 3600 ))" "$RFAR" ;; *) printf '' ;; esac
+    }
+    quota_snapshot_read() {
+      printf '{"accounts":[{"name":"m","usage":{"asOf":%s,"sevenDay":{"pct":95,"resetsAt":%s}}}]}' "$(( NOWR - 4000 ))" "$RFAR"
+    }
+    printf '%s' "$SEATDOC" | _pace_band m "$NOWR" >/dev/null
+  ) || frc=$?
+  fband=$(source src/task/grader_pool.sh; _pace_band_name "$frc")
+  DPROBE2="$TMPD/dpace2.py"
+  cat > "$DPROBE2" <<'PY2EOF'
+import os, time, sys, json, datetime as dt
+src = open('src/cmd_digest.sh').read()
+_a = src.index('def to_epoch(s):'); _b = src.index('\n\n', _a)
+_ns = {"dt": dt}; exec(src[_a:_b], _ns); to_epoch = _ns["to_epoch"]
+a = src.index('# DIVE-4430 — the PACING FLOOR')
+tail = 'paced = [p for p in pace_l if p["band"] != "open"]'
+block = src[a:src.index(tail) + len(tail)]
+acct = json.load(open(os.environ["ACCTF"]))
+agents = json.loads(os.environ["SEATDOC"])["agents"]
+ns = {"os": os, "time": time, "to_epoch": to_epoch, "agents": agents, "acct_snap": acct}
+exec(block, ns)
+row = next((r for r in ns["pace_l"] if r["account"] == "m"), None)
+print((row or {}).get("band", "<no row>"), (row or {}).get("source"))
+PY2EOF
+  dres=$(ACCTF="$ACCTF" SEATDOC="$SEATDOC" timeout 120 python3 "$DPROBE2" 2>&1 | tail -1)
+  dband=${dres%% *}; dsrc=${dres#* }
+  # 3b. THE DIFFERENTIAL, so the agreement above cannot pass vacuously: the
+  #     SNAPSHOT-ALONE source iteration 1 shipped, on this same fixture, lands
+  #     on a DIFFERENT band. If these two ever agree, the arm has stopped
+  #     discriminating and the ok above means nothing.
+  SNAPONLY="$TMPD/acct-snaponly.json"
+  ( set -uo pipefail
+    source src/task/grader_pool.sh
+    quota_snapshot_read() {
+      printf '{"writtenAt":%s,"accounts":[{"name":"m","usage":{"asOf":%s,"fiveHour":null,"sevenDay":{"pct":95,"resetsAt":%s}}}]}' \
+             "$(( NOWR - 4000 ))" "$(( NOWR - 4000 ))" "$RFAR"
+    }
+    # shellcheck source=/dev/null
+    source "$DIGF"
+    _digest_account_snapshot > "$SNAPONLY"
+  ) 2>/dev/null
+  sres=$(ACCTF="$SNAPONLY" SEATDOC="$SEATDOC" timeout 120 python3 "$DPROBE2" 2>&1 | tail -1)
+  sband=${sres%% *}
+  [[ "$sband" == "soft" && "$sband" != "$fband" ]] \
+    && ok_ "H2: ...and the snapshot-ALONE source iteration 1 shipped lands on 'soft' on the same fixture — the fixture discriminates, so the agreement above is not vacuous" \
+    || bad_ "H2: differential" "snapshot-alone gave '${sband}' (floor said '${fband}') — expected 'soft'; if they match, this arm can no longer see the defect"
+  [[ "$dband" == "$fband" && "$dband" == "open" && "$dsrc" == "account" ]] \
+    && ok_ "H2: STALE SNAPSHOT + FRESH LIVE CACHE — the digest reads 'open [account reading]' and _pace_band agrees; iteration 1 rendered 'soft' here while the floor cleared it" \
+    || bad_ "H2: the two predicates disagree" "digest='${dband}' (source=${dsrc}), _pace_band='${fband}' — they must be the same band on the same fixture"
 fi
 
 # ── I: the snapshot cache ──────────────────────────────────────────────────
