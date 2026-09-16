@@ -197,6 +197,18 @@ EMPTY=$( ( set +u
            [ -e "$QUOTA_SNAPSHOT_FILE" ] && echo "wrote" || echo "kept" ) )
 check "a box with NO accounts keeps the previous snapshot rather than blanking it" "$EMPTY" "$(printf 'rc=0\nkept')"
 
+# --- DIVE-4585 iteration 2: the cadence constant must not leak into another
+# payload module ---------------------------------------------------------------
+# `lazy_tokens` matches identifiers over the WHOLE file, comments included, so a
+# single mention of _HB_QUOTA_SNAPSHOT_EVERY_SEC (a top-level global of
+# cmd_heartbeat.sh) from any other payload module creates a __MODDEPS edge to
+# cmd_heartbeat. grader_pool.sh is in every verb's closure, so that edge lands on
+# `whoami` and reds the lazy-dispatch budget. Iteration 1 shipped exactly that.
+echo "== the cadence constant does not leak into another payload module =="
+LEAKS=$(grep -rl '_HB_QUOTA_SNAPSHOT_EVERY_SEC' "$SRC" 2>/dev/null \
+        | grep -v '/cmd_heartbeat\.sh$' | sort | tr '\n' ' ')
+check "no payload module other than cmd_heartbeat.sh names the cadence constant" "$LEAKS" ""
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

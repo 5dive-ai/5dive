@@ -1275,11 +1275,19 @@ $(_grader_inflight_exits_sql)
       if [[ "$why" == *"failing closed"* ]]; then
         n_dark=$((n_dark+1))
         # DIVE-4585: the snapshot now has a scheduled publisher (the heartbeat
-        # tick, every _HB_QUOTA_SNAPSHOT_EVERY_SEC), so a reading that is absent
+        # tick republishes it every couple of minutes — the sweep clause in
+        # src/cmd_heartbeat.sh owns the cadence), so a reading that is absent
         # HERE is no longer the expected steady state it was when this note was
         # written — it means no seat bound to the account has ever rendered a
         # statusline, or the tick is not running. Say both, in that order.
-        dark_note=" [POOL DARK: an account with no measured reading — this refusal does not clear at any window reset. The snapshot is republished by the heartbeat tick every ${_HB_QUOTA_SNAPSHOT_EVERY_SEC:-120}s (DIVE-4585), so check that the tick is running ('5dive heartbeat ls', /var/log/5dive-heartbeat.log) before anything else; if it is, no seat bound to this account has ever rendered a statusline — start one once, or run 'sudo -n 5dive account usage' for an immediate publish]"
+        #
+        # DIVE-4585 iteration 2: the cadence is deliberately NOT named here, in
+        # prose OR in the message. `lazy_tokens` matches identifiers over the
+        # whole file including comments, so one mention of a top-level global of
+        # another payload module puts a __MODDEPS edge on this one — and this
+        # module is in every verb's closure, so the edge lands on `whoami`.
+        # Cite the owning file, never the constant.
+        dark_note=" [POOL DARK: an account with no measured reading — this refusal does not clear at any window reset. The snapshot is republished by the heartbeat tick every couple of minutes (DIVE-4585), so check that the tick is running ('5dive heartbeat ls', /var/log/5dive-heartbeat.log) before anything else; if it is, no seat bound to this account has ever rendered a statusline — start one once, or run 'sudo -n 5dive account usage' for an immediate publish]"
       fi
       plan+="queue   $ident  ($( [[ -n "$busy" ]] && printf 'no free seat' || printf 'no seat with headroom' ) — ${busy}${why})${dark_note}"$'\n'; continue
     fi
