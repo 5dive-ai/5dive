@@ -285,7 +285,7 @@ file_gate ESC-1 --type=decision --ask="$ESC_ASK" \
 eq_t "F1: the iteration-cap escalation gate the product files is READABLE (rc 0)" "$RC" "0"
 eq_t "F2: ... and it really was filed, not swallowed" "$(field ESC-1 need_type)" "decision"
 eq_t "F3: ... and its BUTTONS pass the same rule (they are read by the same person)" \
-     "$(field ESC-1 need_options)" "keep going — the lead takes it over|drop it"
+     "$(field ESC-1 need_options)" "keep going — send it back for another pass|drop it — stop the work, keep the findings"
 
 
 # ============ G. DIVE-4431 — THE TIER-1 GATE NOBODY BUT THE HUMAN READS =====

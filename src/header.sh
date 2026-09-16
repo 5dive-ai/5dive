@@ -951,6 +951,29 @@ valid_byo_provider() {
 # with no endpoint behind it (DIVE-2757).
 CLAUDE_CUSTOM_PROVIDER_ID="custom"
 
+# DIVE-4537 (iteration 3): THE CAP-ESCALATION AUTO-CLEAR'S RECEIPT CLAUSE, and it
+# lives HERE rather than beside the function that sets it, for a load-path reason
+# that is invisible from src/task/answer.sh.
+#
+# `_task_escalation_auto_apply` (src/task/answer.sh) hands its caller a sentence
+# to append to the clear's log line. It cannot print it: routing_receipt writes
+# the caller's OWN stdout, so a `$(…)` capture would swallow the receipt. So the
+# clause comes back in this global — and one of the four callers is
+# `_hb_gate_ttl_sweep`, in cmd_heartbeat.sh.
+#
+# The lazy-dispatch index (scripts/lib/lazy-dispatch.sh) closes __MODDEPS over
+# CROSS-MODULE READS OF A TOP-LEVEL VARIABLE, because `set -u` kills the CLI when
+# one is read before its provider loads. A FUNCTION reference needs no edge (it
+# has an autoload stub in core); a VARIABLE reference does. With the assignment
+# at column 0 in task/answer.sh, cmd_heartbeat became a dependant of task__answer
+# and, transitively, of task__delivery, task__need, task__gate_evidence, cmd_gh
+# and cmd_push — measured 2026-09-15: `heartbeat ls` went from 11 modules/~1.05s
+# to 17 modules/~1.6s, tripping tests/lazy_dispatch_unit.sh's 110% budget. The
+# variable is three bytes of state; the edge it created was six modules on every
+# heartbeat tick. Declaring it in core makes the provider core, so no edge exists
+# and the function is still loaded lazily, on the one call that needs it.
+_ESC_AUTO_NOTE=""
+
 # Validate an operator-supplied Anthropic-compatible endpoint for claude BYO.
 #
 # This value is written into an auth profile's combined.env and loaded by
