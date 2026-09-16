@@ -15,6 +15,17 @@ StartLimitBurst=10
 Type=simple
 User=agent-%i
 Group=claude
+# DIVE-4561: every file a seat writes must be group-writable for `claude`, because
+# the shared checkouts under /home/claude/projects/5dive are read AND written by
+# all 19 seats. systemd starts a unit with umask 0022 unless told otherwise, and a
+# process umask is the ONLY thing that decides a new file's mode: setgid governs
+# group OWNERSHIP, `core.sharedRepository=group` governs .git INTERNALS, and
+# neither touches a file git creates with a plain fopen(). That is why the
+# 2026-09-14 prevention still let `.git/FETCH_HEAD` land 644 under agent-quinn on
+# 09-15 and froze every origin/* ref in that tree for every other seat. 0002
+# clears only the group-write bit, so files come out 664 and directories 775 —
+# world perms are unchanged. Interactive seat shells already assume 0002.
+UMask=0002
 EnvironmentFile=-/etc/5dive/connectors/anthropic.env
 EnvironmentFile=-/etc/5dive/connectors/openai.env
 EnvironmentFile=-/etc/5dive/connectors/gemini.env
