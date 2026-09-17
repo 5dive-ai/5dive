@@ -145,12 +145,20 @@ has "$(cat "$(envf or-alpha)")" "ANTHROPIC_AUTH_TOKEN=${KEY2}" \
 (
   unset -f audit_log; . "$SRC/lib/audit.sh"
   mkdir -p "$TMP/real-audit"
+  # AUDIT_LOG IS SET HERE ON PURPOSE. `audit_log` returns early unless the log's
+  # DIRECTORY exists, and header.sh's default is /var/log/5dive — present on a
+  # 5dive host, absent on a CI runner. Left at the default this arm grades the
+  # host's directory layout: green on a box that has one, and green-by-early-
+  # return on a box that does not, which is the same as not running.
+  AUDIT_LOG="$TMP/real-audit/agent-audit.log"
   _emit_audit_line() { printf '%s\n' "$1" >>"$TMP/real-audit/line.json"; }
   audit_log "account set" "ok" 0 -- or-alpha --type=claude "--api-key=$KEY1"
 ) >/dev/null 2>&1
 REAL="$(cat "$TMP/real-audit/line.json" 2>/dev/null)"
-{ [[ -n "$REAL" ]] && ! has "$REAL" "$KEY1" && has "$REAL" "<redacted>"; } \
-  && ok_t "C5: a literal --api-key in argv is redacted before it reaches the audit log" \
+# `or-alpha` is the anchor: it proves the row RENDERED and that redaction is
+# selective. Without it an empty file would satisfy "the key is absent".
+{ [[ -n "$REAL" ]] && has "$REAL" "or-alpha" && ! has "$REAL" "$KEY1" && has "$REAL" "<redacted>"; } \
+  && ok_t "C5: a literal --api-key in argv is redacted before it reaches the audit log, and the rest of the row survives" \
   || bad_t "C5: argv redaction covers --api-key" "row: ${REAL:0:200}"
 
 # --- D) Both key forms, and which one is documented -------------------------
