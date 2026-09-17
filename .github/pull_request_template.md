@@ -41,10 +41,12 @@ tests to run before merging. -->
 
 ## Checks run locally
 
-- [ ] `./build.sh` rebuilt the bundle (committed in this PR)
+- [ ] `./build.sh` rebuilt the bundle (do NOT commit it — it is gitignored)
 - [ ] `bash -n 5dive` passes
 - [ ] `cd ui && bun run build` passes (if `ui/` touched)
 - [ ] Tried it on a real install (one-liner, docker, or `5dive init` wizard)
+- [ ] `bash scripts/pre-push-rail.sh "$(git merge-base origin/main HEAD)" HEAD`
+      passes (or `core.hooksPath` is wired and the push ran it)
 
 ## Notes for the reviewer
 

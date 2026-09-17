@@ -65,34 +65,57 @@ single-file bundle and `./build.sh`.
 
 ## The bundle rule (please read)
 
-`./build.sh` concatenates `src/` into the committed `5dive` bundle. **Both
-files are tracked** — CI's `bundle-drift` job runs `./build.sh && git diff
---exit-code 5dive` and fails any PR where they disagree. Two rules:
+`./build.sh` concatenates `src/` into the single-file `5dive` bundle. **The
+bundle is not tracked** — `5dive` and `5dive.sha256` are in `.gitignore` and
+are generated at tag time by `release-cut` (DIVE-2091). Two rules:
 
 - Edit `src/`, never the bundle. The bundle is generated.
-- After editing `src/`, run `./build.sh` and commit the regenerated `5dive`
-  in the same PR.
+- After editing `src/`, run `./build.sh` and `bash -n 5dive` locally to prove
+  the tree still assembles — then commit **neither** file. `bundle-drift` has a
+  step named *"The bundle must NOT be tracked"* that fails any PR re-adding
+  them.
 
-If `bundle-drift` fails, you forgot the rebuild. Run `./build.sh`, commit,
-push again.
+`bundle-drift` checks that `build.sh` is reproducible from `src/`, not that a
+committed bundle matches. If it fails, the rebuild is not deterministic — a
+timestamp, a `ls` ordering, or a file the concatenation picks up conditionally.
 
 ## Testing
 
-Lightweight checks (always run before opening a PR):
+**Wire the pre-push rail once per clone, and let it do this for you:**
 
 ```bash
-./build.sh        # rebuilds the bundle
-bash -n 5dive     # bundle syntax check
-for t in tests/*.sh; do bash "$t" || echo "FAILED: $t"; done   # unit harnesses
+git config core.hooksPath scripts/git-hooks
 ```
+
+That installs `scripts/git-hooks/pre-push`, which runs `scripts/pre-push-rail.sh`
+(DIVE-4208) on every push: the PR-title lint, the changelog-fragment lint,
+`shellcheck` over the files your diff touched, and only the harnesses your diff
+touched — under a wall-clock cap. It is deliberately scoped to what CI reds on in
+its first minute, because a red required check does not cost you CI's wall clock,
+it costs a review round trip. To run it by hand without pushing:
+
+```bash
+bash scripts/pre-push-rail.sh "$(git merge-base origin/main HEAD)" HEAD
+```
+
+Plus, if you touched `src/`:
+
+```bash
+./build.sh        # rebuilds the bundle — NOT committed, see "The bundle rule"
+bash -n 5dive     # bundle syntax check
+```
+
+**Do not run the whole corpus before pushing.** `tests/` is 600+ harnesses and
+takes ~25 minutes on a laptop; that is CI's job, not yours. CI runs a core tier
+plus `changed-harnesses` on every PR under a 300s budget (`unit-tests.yml`), and
+the full corpus on a schedule (`full-sweep.yml`).
 
 The `tests/` harnesses need no root and no network: each one sources
 `src/` directly into a throwaway state dir, so the live agent registry and
-task DB are never touched. CI (`unit-tests`) runs all of them on every PR —
-if you add or change behavior in a covered area (task gates, loops,
-secret drop, supervisor), extend the matching harness in the same PR. New
-harnesses that follow the same pattern are very welcome; the biggest
-uncovered surfaces are the task core verbs and the agent lifecycle.
+task DB are never touched. If you add or change behavior in a covered area
+(task gates, loops, secret drop, supervisor), extend the matching harness in
+the same PR. New harnesses that follow the same pattern are very welcome; the
+biggest uncovered surfaces are the task core verbs and the agent lifecycle.
 
 **If you add a harness, it must name the tree it grades.** Every harness reads
 `src/` from the working tree by relative path, so a green log is a claim about
