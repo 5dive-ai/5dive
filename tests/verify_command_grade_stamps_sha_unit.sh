@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# A COMMAND grade states the sha it graded, so the merge gate can clear.
+# A COMMAND grade states the sha it graded — but only when it can PROVE it.
 #
 # THE DEFECT. A row graded by a command (`--review=check`) recorded
 # `✅ verify PASS (exit 0): <cmd>` and nothing else. `_gate_graded_sha` reads only
 # a LABELLED `graded-sha:` declaration, so it read empty; `_merge_disp_decide`
-# answered `hold:merger:no-graded-sha-stated` (DIVE-2656: a grade is bound to a
-# sha, not to a pull request); and `task done` refuses a close whose result states
-# no graded sha. A row that had just passed its own acceptance command could
-# therefore be closed by nobody — only by an operator typing the sha in by hand or
-# spending the audited `--no-graded-sha`. Measured on DIVE-544 / #994.
+# answered `hold:merger:no-graded-sha-stated`; and `task done` refuses a close
+# whose result states no graded sha. A row that had just passed its own acceptance
+# command could therefore be closed by nobody.
 #
-# The sha was never unknown: the command ran against the delivered head and the
-# delivery record names it. Every arm below therefore grades WHERE THE SHA CAME
-# FROM as well as that one arrived — a stamp from the wrong source is the failure
-# this would otherwise trade for the first one.
+# AND THE OBVIOUS FIX IS A WORSE DEFECT. `graded-sha` answers WHICH TREE THIS
+# GRADE EXERCISED. "What was the pull request head while the command ran" is a
+# different question: a grade of `git show origin/main:<file>` — run because the
+# work landed by another route — reads a tree the head never was. Stamping from
+# the head would make the gate CLEAR ON AN INFERENCE, inverting the failure
+# direction of a control built to refuse (lodar, review on #1001). So the stamp is
+# issued only when the tree the command ran in IS the head, and every other case
+# gets `graded-head-at:` — legible, and a label the fence does not parse.
+#
+# Every arm below therefore drives a REAL `git rev-parse HEAD` in a REAL cwd: the
+# harness makes its own throwaway checkout and runs the verb inside it, because a
+# stubbed tree would grade the fixture rather than the probe.
 #
 #   bash tests/verify_command_grade_stamps_sha_unit.sh   (no root, no network)
 set -uo pipefail
@@ -49,14 +55,22 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 has()   { [[ "$1" == *"$2"* ]]; }
 
-HEAD_SHA="a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"   # what gh reports as the PR head
-DELV_SHA="0fedcba987654321fedcba9876543210fedcba98"   # what the maker stated at delivery
+# --- The two cwds every arm chooses between ----------------------------------
+# TREE is a real git checkout whose HEAD this harness knows; NOTGIT is a plain
+# directory, which is what "the grade did not run in a git tree" looks like.
+TREE="$TMP/tree"; NOTGIT="$TMP/notgit"
+mkdir -p "$TREE" "$NOTGIT"
+git -C "$TREE" init -q >/dev/null 2>&1
+git -C "$TREE" -c user.email=harness@example.invalid -c user.name=harness \
+    commit -q --allow-empty -m 'seed' >/dev/null 2>&1
+TREE_SHA="$(git -C "$TREE" rev-parse HEAD 2>/dev/null)"
+OTHER_SHA="00112233445566778899aabbccddeeff00112233"   # a head the command never read
 PR_URL="https://github.com/acme/widget/pull/994"
 
-# --- The gh seam, stubbed: this harness grades the STAMP, not the transport ----
+# --- The gh seam, stubbed: this harness grades the STAMP, not the transport ---
 # GH_HEAD empty models "gh cannot read the pull request" (no credential, no
-# network, a repo the token is blind to) — the case the fallback exists for.
-GH_HEAD="$HEAD_SHA"
+# network, a repo the token is blind to).
+GH_HEAD="$TREE_SHA"
 _gate_gh_token() { printf 'stub-token'; }
 _gate_gh() {
   shift 2
@@ -77,120 +91,155 @@ seed() {
 }
 result_of() { db "SELECT COALESCE(result,'') FROM tasks WHERE ident='$1';"; }
 status_of() { db "SELECT COALESCE(status,'') FROM tasks WHERE ident='$1';"; }
-# `fail` exits, so every run is a subshell.
-run_verify() { ( cmd_task_verify "$@" ) >"$TMP/out" 2>"$TMP/err"; printf '%s' "$?"; }
+# `fail` exits, so every run is a subshell — and the cwd is the point of the arm.
+run_in() { local d="$1"; shift; ( cd "$d" && cmd_task_verify "$@" ) >"$TMP/out" 2>"$TMP/err"; printf '%s' "$?"; }
+disp_at() { _merge_disp_decide MERGEABLE CLEAN "$1" "$2" low; }
 
-DELIVERY_RECORD="delivered by the maker
-CHANGED: src/thing.sh — the fix
-DELIVERED-SHA: ${DELV_SHA}
-CI: green"
+record_with() { printf 'delivered by the maker\nCHANGED: src/thing.sh — the fix\nDELIVERED-SHA: %s\nCI: green' "$1"; }
+RECORD_TREE="$(record_with "$TREE_SHA")"
+RECORD_OTHER="$(record_with "$OTHER_SHA")"
 
 # --- 0) PRECONDITIONS: the arms below are not vacuous ------------------------
-seed 601 DIVE-601 "$PR_URL" "$DELIVERY_RECORD"
-[[ -z "$(_gate_graded_sha "$DELIVERY_RECORD")" ]] \
-  && ok_t "precondition: the delivery record states NO graded-sha (DELIVERED-SHA is a different claim)" \
-  || bad_t "precondition: the seeded record states no graded-sha" "it already does; every arm below would pass vacuously"
-[[ "$(_merge_disp_decide MERGEABLE CLEAN "$HEAD_SHA" "" low)" == "hold:merger:no-graded-sha-stated" ]] \
+[[ "$TREE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+  && ok_t "precondition: the harness made a real checkout and knows its HEAD (${TREE_SHA:0:12})" \
+  || bad_t "precondition: a throwaway git checkout exists" "git rev-parse gave '$TREE_SHA' — every arm below would grade nothing"
+[[ -z "$(_gate_graded_sha "$RECORD_TREE")" ]] \
+  && ok_t "precondition: a delivery record states NO graded-sha (DELIVERED-SHA is a different claim)" \
+  || bad_t "precondition: the seeded record states no graded-sha" "it already does; the arms below would pass vacuously"
+[[ "$(disp_at "$TREE_SHA" "")" == "hold:merger:no-graded-sha-stated" ]] \
   && ok_t "precondition: with no graded sha the disposition really is hold:merger:no-graded-sha-stated" \
-  || bad_t "precondition: the gate holds without a graded sha" "got: $(_merge_disp_decide MERGEABLE CLEAN "$HEAD_SHA" "" low)"
+  || bad_t "precondition: the gate holds without a graded sha" "got: $(disp_at "$TREE_SHA" "")"
 
-# --- A) gh answers: the sha is the PR HEAD AT GRADE TIME ---------------------
-GH_HEAD="$HEAD_SHA"
-RC="$(run_verify DIVE-601)"
+# --- A) THE TREE IS THE HEAD: stamped, and the gate clears -------------------
+seed 601 DIVE-601 "$PR_URL" "$RECORD_TREE"
+GH_HEAD="$TREE_SHA"
+RC="$(run_in "$TREE" DIVE-601)"
 A_RES="$(result_of DIVE-601)"
 [[ "$RC" == "0" ]] \
   && ok_t "A0: a passing command grade still exits 0" \
   || bad_t "A0: the grade exits 0" "rc=$RC err: $(head -2 "$TMP/err")"
-has "$A_RES" "graded-sha: ${HEAD_SHA}" \
-  && ok_t "A1: the recorded result states graded-sha: <the PR head>" \
-  || bad_t "A1: the result states the graded sha" "result: ${A_RES:0:400}"
-[[ "$(_gate_graded_sha "$A_RES")" == "$HEAD_SHA" ]] \
-  && ok_t "A2: ... and the FENCE the gates read returns exactly that sha" \
-  || bad_t "A2: _gate_graded_sha reads the stamp" "got '$(_gate_graded_sha "$A_RES")'"
-has "$A_RES" "read with gh" \
-  && ok_t "A3: ... and the line names where the sha came from" \
-  || bad_t "A3: the stamp names its source" "result: ${A_RES:0:400}"
-[[ "$(_merge_disp_decide MERGEABLE CLEAN "$HEAD_SHA" "$(_gate_graded_sha "$A_RES")" low)" == "merge" ]] \
-  && ok_t "A4: the merge gate no longer holds at no-graded-sha-stated — it says merge" \
-  || bad_t "A4: the gate clears" "got: $(_merge_disp_decide MERGEABLE CLEAN "$HEAD_SHA" "$(_gate_graded_sha "$A_RES")" low)"
+[[ "$(_gate_graded_sha "$A_RES")" == "$TREE_SHA" ]] \
+  && ok_t "A1: the tree the command ran in IS the head -> graded-sha: <that tree>" \
+  || bad_t "A1: a proven grade is stamped" "got '$(_gate_graded_sha "$A_RES")' from: ${A_RES:0:400}"
+has "$A_RES" "the tree this grade ran in" \
+  && ok_t "A2: ... and the line says that is what the sha IS, not what the head was" \
+  || bad_t "A2: the stamp states what it proves" "result: ${A_RES:0:400}"
+[[ "$(disp_at "$TREE_SHA" "$(_gate_graded_sha "$A_RES")")" == "merge" ]] \
+  && ok_t "A3: ... so the merge gate clears instead of holding at no-graded-sha-stated" \
+  || bad_t "A3: the gate clears on a proven stamp" "got: $(disp_at "$TREE_SHA" "$(_gate_graded_sha "$A_RES")")"
 [[ "$(status_of DIVE-601)" != "done" ]] \
-  && ok_t "A5: the bound row still does NOT close itself (DIVE-3330 hold is unchanged)" \
-  || bad_t "A5: the bound row stays open" "status=$(status_of DIVE-601)"
+  && ok_t "A4: the bound row still does NOT close itself (DIVE-3330 hold is unchanged)" \
+  || bad_t "A4: the bound row stays open" "status=$(status_of DIVE-601)"
 
-# --- B) gh cannot read it: fall back to the maker's DELIVERED-SHA ------------
-seed 602 DIVE-602 "$PR_URL" "$DELIVERY_RECORD"
-GH_HEAD=""
-RC="$(run_verify DIVE-602)"
+# --- B) lodar's case: the command graded a tree that is not the head ---------
+# `git show origin/main:<file>` in a checkout sitting at some other commit. The
+# head is readable and fine; it is simply not what was graded.
+seed 602 DIVE-602 "$PR_URL" "$RECORD_TREE"
+GH_HEAD="$OTHER_SHA"
+RC="$(run_in "$TREE" DIVE-602)"
 B_RES="$(result_of DIVE-602)"
-[[ "$(_gate_graded_sha "$B_RES")" == "$DELV_SHA" ]] \
-  && ok_t "B1: with gh unreadable the stamp is the DELIVERED-SHA the delivery stated" \
-  || bad_t "B1: the DELIVERED-SHA fallback" "rc=$RC got '$(_gate_graded_sha "$B_RES")' from: ${B_RES:0:400}"
-has "$B_RES" "DELIVERED-SHA stated in the delivery record" \
-  && ok_t "B2: ... and says so, rather than passing it off as a gh read" \
-  || bad_t "B2: the fallback names its source" "result: ${B_RES:0:400}"
-[[ "$(_merge_disp_decide MERGEABLE CLEAN "$DELV_SHA" "$(_gate_graded_sha "$B_RES")" low)" == "merge" ]] \
-  && ok_t "B3: ... and the gate clears at that sha too" \
-  || bad_t "B3: the gate clears on the fallback" "got: $(_merge_disp_decide MERGEABLE CLEAN "$DELV_SHA" "$(_gate_graded_sha "$B_RES")" low)"
+[[ "$RC" == "0" ]] \
+  && ok_t "B0: the grade still PASSES — this is about what is stamped, not about the verdict" \
+  || bad_t "B0: the grade passes" "rc=$RC err: $(head -2 "$TMP/err")"
+[[ -z "$(_gate_graded_sha "$B_RES")" ]] \
+  && ok_t "B1: head != the tree graded -> NOTHING is stamped (the inference is refused)" \
+  || bad_t "B1: a head the grade never read is not stamped" "got '$(_gate_graded_sha "$B_RES")'"
+{ has "$B_RES" "graded-head-at: ${OTHER_SHA}" && has "$B_RES" "tree graded: ${TREE_SHA}"; } \
+  && ok_t "B2: ... and both shas are on the row under graded-head-at, so the hold is legible" \
+  || bad_t "B2: the provenance is written down" "result: ${B_RES:0:500}"
+[[ "$(disp_at "$OTHER_SHA" "$(_gate_graded_sha "$B_RES")")" == "hold:merger:no-graded-sha-stated" ]] \
+  && ok_t "B3: ... and the merge gate KEEPS HOLDING — a person still looks at this one" \
+  || bad_t "B3: the gate holds on an unproven grade" "got: $(disp_at "$OTHER_SHA" "$(_gate_graded_sha "$B_RES")")"
 
-# --- C) Neither source: the hold STAYS, and becomes legible ------------------
-seed 603 DIVE-603 "$PR_URL" "delivered with no sha field at all"
-GH_HEAD=""
-RC="$(run_verify DIVE-603)"
+# --- C) The command did not run in a git tree at all ------------------------
+seed 603 DIVE-603 "$PR_URL" "$RECORD_TREE"
+GH_HEAD="$TREE_SHA"
+RC="$(run_in "$NOTGIT" DIVE-603)"
 C_RES="$(result_of DIVE-603)"
-has "$C_RES" "graded-sha: unreadable" \
-  && ok_t "C1: with no source at all the result SAYS the sha is unreadable" \
-  || bad_t "C1: the unreadable case is written down" "result: ${C_RES:0:400}"
-[[ -z "$(_gate_graded_sha "$C_RES")" ]] \
-  && ok_t "C2: ... and that line carries no hex, so the fence still reads EMPTY" \
-  || bad_t "C2: the unreadable line must not satisfy the fence" "got '$(_gate_graded_sha "$C_RES")'"
-[[ "$(_merge_disp_decide MERGEABLE CLEAN "$HEAD_SHA" "$(_gate_graded_sha "$C_RES")" low)" == "hold:merger:no-graded-sha-stated" ]] \
-  && ok_t "C3: ... so the gate still HOLDS — this fix makes the hold legible, never lifts it" \
-  || bad_t "C3: the hold survives an unreadable sha" "got: $(_merge_disp_decide MERGEABLE CLEAN "$HEAD_SHA" "$(_gate_graded_sha "$C_RES")" low)"
+{ [[ -z "$(_gate_graded_sha "$C_RES")" ]] && has "$C_RES" "tree graded: unreadable"; } \
+  && ok_t "C1: no readable tree -> nothing proven, nothing stamped, and the row says which half was missing" \
+  || bad_t "C1: an unreadable tree holds" "got '$(_gate_graded_sha "$C_RES")' from: ${C_RES:0:500}"
 
-# --- D) A verifier who stated their own sha is not overwritten ---------------
-seed 604 DIVE-604 "$PR_URL" "$DELIVERY_RECORD"
-GH_HEAD="$HEAD_SHA"
-RC="$(run_verify DIVE-604 --cmd=true --no-done --result="I read the diff. graded-sha: deadbee1234567")"
+# --- D) gh unreadable: DELIVERED-SHA may CORROBORATE the tree ----------------
+seed 604 DIVE-604 "$PR_URL" "$RECORD_TREE"
+GH_HEAD=""
+RC="$(run_in "$TREE" DIVE-604)"
 D_RES="$(result_of DIVE-604)"
-[[ "$(_gate_graded_sha "$D_RES")" == "deadbee1234567" ]] \
-  && ok_t "D1: a graded-sha the VERIFIER stated in prose wins — the stamp does not overwrite a claim" \
-  || bad_t "D1: a stated claim is left alone" "rc=$RC got '$(_gate_graded_sha "$D_RES")'"
-! has "$D_RES" "read with gh" \
-  && ok_t "D2: ... and no second, machine-written line is added beside it" \
-  || bad_t "D2: no stamp is added over a stated claim" "result: ${D_RES:0:400}"
+{ [[ "$(_gate_graded_sha "$D_RES")" == "$TREE_SHA" ]] && has "$D_RES" "DELIVERED-SHA stated in the delivery record"; } \
+  && ok_t "D1: gh silent but DELIVERED-SHA == the tree graded -> stamped, and it names the corroborating source" \
+  || bad_t "D1: the corroborated fallback stamps" "got '$(_gate_graded_sha "$D_RES")' from: ${D_RES:0:400}"
 
-# --- E) An UNBOUND row is untouched -----------------------------------------
-db "DELETE FROM tasks WHERE id=605;" >/dev/null 2>&1
-db "INSERT INTO tasks(id, ident, title, status, priority, assignee, created_by, created_at, project_key, verify_command)
-    VALUES(605, 'DIVE-605', 'unbound row', 'in_progress', 'high', 'maker', 'harness', datetime('now'), 'dive', 'true');" \
-  >/dev/null 2>&1
-GH_HEAD="$HEAD_SHA"
-RC="$(run_verify DIVE-605)"
+# --- E) ... and never STANDS IN for the tree ---------------------------------
+seed 605 DIVE-605 "$PR_URL" "$RECORD_OTHER"
+GH_HEAD=""
+RC="$(run_in "$TREE" DIVE-605)"
 E_RES="$(result_of DIVE-605)"
-! has "$E_RES" "graded-sha" \
-  && ok_t "E1: a row binding no delivery gets no stamp — there is no merge gate to answer" \
-  || bad_t "E1: unbound rows are not stamped" "result: ${E_RES:0:300}"
-[[ "$(status_of DIVE-605)" == "done" ]] \
-  && ok_t "E2: ... and it still auto-closes, so a mutation that disabled every close cannot green this file" \
-  || bad_t "E2: the unbound row still closes" "status=$(status_of DIVE-605) rc=$RC err: $(head -2 "$TMP/err")"
+[[ -z "$(_gate_graded_sha "$E_RES")" ]] \
+  && ok_t "E1: DELIVERED-SHA disagreeing with the tree graded stamps NOTHING — it corroborates, it does not substitute" \
+  || bad_t "E1: an uncorroborated DELIVERED-SHA is not a stamp" "got '$(_gate_graded_sha "$E_RES")'"
+has "$E_RES" "graded-head-at: unreadable" \
+  && ok_t "E2: ... and with gh silent too the line says the head itself was unreadable" \
+  || bad_t "E2: the unreadable head is named" "result: ${E_RES:0:500}"
 
-# --- F) A FAIL owes nobody a merge answer -----------------------------------
-seed 606 DIVE-606 "$PR_URL" "$DELIVERY_RECORD"
-GH_HEAD="$HEAD_SHA"
-RC="$(run_verify DIVE-606 --cmd=false)"
-F_RES="$(result_of DIVE-606)"
-{ [[ "$RC" != "0" ]] && ! has "${F_RES#*"$DELIVERY_RECORD"}" "graded-sha"; } \
-  && ok_t "F1: a FAILING grade stamps nothing — a fail owes the maker a fix, not anyone a merge" \
-  || bad_t "F1: the FAIL branch is untouched" "rc=$RC result: ${F_RES:0:400}"
+# --- F) THE LABEL MUST NOT PARSE. This is the whole safety property ---------
+# Asserted on the rendered text directly as well as through the rows above: if
+# `graded-head-at:` ever satisfied the fence, every held case in this file would
+# silently become a clear, which is the exact failure the review objected to.
+for probe in \
+  "graded-head-at: ${OTHER_SHA} (tree graded: ${TREE_SHA})" \
+  "graded-head-at: unreadable (tree graded: unreadable)" \
+  "graded-head-at: ${OTHER_SHA} (tree graded: unreadable)"; do
+  [[ -n "$(_gate_graded_sha "$probe")" ]] && { bad_t "F1: 'graded-head-at' must not satisfy _gate_graded_sha" "it parsed '$probe' as '$(_gate_graded_sha "$probe")'"; F_BAD=1; }
+done
+[[ -z "${F_BAD:-}" ]] \
+  && ok_t "F1: none of the three graded-head-at shapes parses as a graded sha" \
+  || true
+[[ -n "$(_gate_graded_sha "graded-sha: ${TREE_SHA}")" ]] \
+  && ok_t "F2: ... while the real label still does — F1 is a discrimination, not a broken fence" \
+  || bad_t "F2: the fence still parses a real graded-sha" "it no longer matches anything"
+
+# --- G) A verifier who stated their own sha is not overwritten ---------------
+seed 606 DIVE-606 "$PR_URL" "$RECORD_TREE"
+GH_HEAD="$TREE_SHA"
+RC="$(run_in "$TREE" DIVE-606 --cmd=true --no-done --result="I read the diff. graded-sha: deadbee1234567")"
+G_RES="$(result_of DIVE-606)"
+{ [[ "$(_gate_graded_sha "$G_RES")" == "deadbee1234567" ]] && ! has "$G_RES" "the tree this grade ran in"; } \
+  && ok_t "G1: a graded-sha the VERIFIER stated wins — the stamp fills a silence, it does not overrule a claim" \
+  || bad_t "G1: a stated claim is left alone" "rc=$RC got '$(_gate_graded_sha "$G_RES")'"
+
+# --- H) An UNBOUND row is untouched -----------------------------------------
+db "DELETE FROM tasks WHERE id=607;" >/dev/null 2>&1
+db "INSERT INTO tasks(id, ident, title, status, priority, assignee, created_by, created_at, project_key, verify_command)
+    VALUES(607, 'DIVE-607', 'unbound row', 'in_progress', 'high', 'maker', 'harness', datetime('now'), 'dive', 'true');" \
+  >/dev/null 2>&1
+GH_HEAD="$TREE_SHA"
+RC="$(run_in "$TREE" DIVE-607)"
+H_RES="$(result_of DIVE-607)"
+{ ! has "$H_RES" "graded-sha" && ! has "$H_RES" "graded-head-at"; } \
+  && ok_t "H1: a row binding no delivery gets no line at all — there is no merge gate to answer" \
+  || bad_t "H1: unbound rows are untouched" "result: ${H_RES:0:300}"
+[[ "$(status_of DIVE-607)" == "done" ]] \
+  && ok_t "H2: ... and it still auto-closes, so a mutation that disabled every close cannot green this file" \
+  || bad_t "H2: the unbound row still closes" "status=$(status_of DIVE-607) rc=$RC err: $(head -2 "$TMP/err")"
+
+# --- I) A FAIL owes nobody a merge answer -----------------------------------
+seed 608 DIVE-608 "$PR_URL" "$RECORD_TREE"
+GH_HEAD="$TREE_SHA"
+RC="$(run_in "$TREE" DIVE-608 --cmd=false)"
+I_RES="$(result_of DIVE-608)"
+{ [[ "$RC" != "0" ]] && ! has "${I_RES#*"$RECORD_TREE"}" "graded-sha" \
+  && ! has "${I_RES#*"$RECORD_TREE"}" "graded-head-at"; } \
+  && ok_t "I1: a FAILING grade writes neither line — a fail owes the maker a fix, not anyone a merge" \
+  || bad_t "I1: the FAIL branch is untouched" "rc=$RC result: ${I_RES:0:400}"
 
 # =============================================================================
-# MUTANT — take the stamp back out and the gate must hold again.
+# MUTANT — take the stamp back out and the gate must hold on the PROVEN case.
 # =============================================================================
 # BEFORE/AFTER on purpose: "the stamp is gone" is also true of a sed that matched
 # nothing, which would make every arm below vacuous.
 ORIG="$(declare -f cmd_task_verify)"
 MUT="$(printf '%s\n' "$ORIG" | sed 's/^\([[:space:]]*\)if \[\[ -n "\$_vg_dref" \]\].*/\1if false; then/')"
-has "$ORIG" '_verify_grade_sha_line' \
+has "$ORIG" '_verify_grade_line' \
   && ok_t "M0a: BEFORE — the shipped verify really does reach the stamp" \
   || bad_t "M0a: the shipped verify stamps" "no stamp found; every mutant arm below is vacuous"
 { has "$MUT" 'if false; then' && ! has "$MUT" 'if [[ -n "$_vg_dref" ]]'; } \
@@ -198,23 +247,45 @@ has "$ORIG" '_verify_grade_sha_line' \
   || bad_t "M0b: the mutation took" "the sed did not match; the mutant is not mutated"
 
 eval "$MUT"
-seed 607 DIVE-607 "$PR_URL" "$DELIVERY_RECORD"
-GH_HEAD="$HEAD_SHA"
-RC="$(run_verify DIVE-607)"
-M_RES="$(result_of DIVE-607)"
+seed 609 DIVE-609 "$PR_URL" "$RECORD_TREE"
+GH_HEAD="$TREE_SHA"
+RC="$(run_in "$TREE" DIVE-609)"
+M_RES="$(result_of DIVE-609)"
 [[ "$RC" == "0" && -z "$(_gate_graded_sha "$M_RES")" ]] \
-  && ok_t "M1: MUTANT — the grade still PASSES and still states no sha (A1/A2 would be red on it)" \
+  && ok_t "M1: MUTANT — the grade still PASSES and states no sha (A1 would be red on it)" \
   || bad_t "M1: mutant records no sha" "rc=$RC got '$(_gate_graded_sha "$M_RES")'"
-[[ "$(_merge_disp_decide MERGEABLE CLEAN "$HEAD_SHA" "$(_gate_graded_sha "$M_RES")" low)" == "hold:merger:no-graded-sha-stated" ]] \
-  && ok_t "M2: MUTANT — and the merge gate is back to no-graded-sha-stated (A4 would be red on it)" \
-  || bad_t "M2: mutant holds the gate" "got: $(_merge_disp_decide MERGEABLE CLEAN "$HEAD_SHA" "$(_gate_graded_sha "$M_RES")" low)"
+[[ "$(disp_at "$TREE_SHA" "$(_gate_graded_sha "$M_RES")")" == "hold:merger:no-graded-sha-stated" ]] \
+  && ok_t "M2: MUTANT — and the merge gate is back to no-graded-sha-stated (A3 would be red on it)" \
+  || bad_t "M2: mutant holds the gate" "got: $(disp_at "$TREE_SHA" "$(_gate_graded_sha "$M_RES")")"
 
+# A second mutation, aimed at the REVIEW's defect rather than the original one:
+# stamp from the head without proving the tree, and arm B goes green when it must
+# not. This is the arm that would have caught the shape lodar rejected.
+#
+# The dispatcher is restored FIRST — with cmd_task_verify still mutated the helper
+# is never reached, and both arms below would "pass" on an empty result, which is
+# the vacuous shape M0a/M0b exist to rule out one level up.
 eval "$ORIG"
-seed 608 DIVE-608 "$PR_URL" "$DELIVERY_RECORD"
-RC="$(run_verify DIVE-608)"
-[[ "$(_gate_graded_sha "$(result_of DIVE-608)")" == "$HEAD_SHA" ]] \
-  && ok_t "M3: RESTORE took — the fixed verify is back and stamps again" \
-  || bad_t "M3: restore took" "got '$(_gate_graded_sha "$(result_of DIVE-608)")' (later arms would grade the mutant)"
+ORIG_LINE="$(declare -f _verify_grade_line)"
+_verify_grade_line() { printf 'graded-sha: %s (the pull request head at grade time, read with gh)' "$GH_HEAD"; }
+seed 610 DIVE-610 "$PR_URL" "$RECORD_TREE"
+GH_HEAD="$OTHER_SHA"
+RC="$(run_in "$TREE" DIVE-610)"
+M3_RES="$(result_of DIVE-610)"
+[[ "$(_gate_graded_sha "$M3_RES")" == "$OTHER_SHA" ]] \
+  && ok_t "M3: INFERRING MUTANT — stamping from the head alone puts a tree the grade never read on the row (B1 would be red on it)" \
+  || bad_t "M3: the inferring mutant stamps the head" "got '$(_gate_graded_sha "$M3_RES")'"
+[[ "$(disp_at "$OTHER_SHA" "$(_gate_graded_sha "$M3_RES")")" == "merge" ]] \
+  && ok_t "M4: ... and the gate CLEARS on it — the exact inversion this shape exists to prevent (B3 would be red on it)" \
+  || bad_t "M4: the inferring mutant clears the gate" "got: $(disp_at "$OTHER_SHA" "$(_gate_graded_sha "$M3_RES")")"
+
+eval "$ORIG_LINE"
+seed 611 DIVE-611 "$PR_URL" "$RECORD_TREE"
+GH_HEAD="$TREE_SHA"
+RC="$(run_in "$TREE" DIVE-611)"
+[[ "$(_gate_graded_sha "$(result_of DIVE-611)")" == "$TREE_SHA" ]] \
+  && ok_t "M5: RESTORE took — the fixed verify and helper are back and stamp the proven case again" \
+  || bad_t "M5: restore took" "got '$(_gate_graded_sha "$(result_of DIVE-611)")' (later arms would grade the mutant)"
 
 echo "-----"
 printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"

@@ -463,53 +463,73 @@ _task_verify_merge_binding() {
   return 0
 }
 
-# _verify_grade_sha_line <delivery_ref> <row_result> — the one line a COMMAND
-# grade owes the merge gate, or a legible reason there is none.
+# _verify_grade_line <delivery_ref> <row_result> <tree_head> — the one line a
+# COMMAND grade owes the merge gate, and it is only a STAMP when it is a proof.
 #
 # WHAT WAS MISSING. A command-graded row (`--review=check`) recorded
 # `✅ verify PASS (exit 0): <cmd>` and nothing else, so `_gate_graded_sha` read
-# EMPTY off it. DIVE-2656's rule — a grade is bound to a SHA, not to a pull
-# request — is read forwards by `_merge_disp_decide`, which therefore answered
-# `hold:merger:no-graded-sha-stated`; and `task done` refuses a close whose result
+# EMPTY off it. `_merge_disp_decide` therefore answered
+# `hold:merger:no-graded-sha-stated`, and `task done` refuses a close whose result
 # states no `graded-sha` either. So a row that had just PASSED its own acceptance
 # command could be closed by nobody: not the grader, not the merge owner, only an
 # operator typing the sha in by hand or spending the audited `--no-graded-sha`.
-# Measured on DIVE-544 / #994 — verify PASS at 04:40Z, held at
-# no-graded-sha-stated until a human appended the sha after the merge.
 #
-# THE SHA WAS NEVER UNKNOWN. The command ran against the delivered head, and the
-# delivery record names that head in its `DELIVERED-SHA:` field. So ask GitHub
-# what the head is at grade time — that is the sha the command actually graded and
-# the one the gate compares against — and fall back to the maker's stated
-# DELIVERED-SHA when gh cannot answer.
+# WHAT `graded-sha` MEANS, and why the obvious fix is the wrong one. Its contract
+# is stated in `_merge_disp_decide`: a grade is bound to a SHA, not to a pull
+# request. So it answers WHICH TREE THIS GRADE EXERCISED. "What was the pull
+# request head while the command ran" is a DIFFERENT question, and the two diverge
+# the moment a command does not read that head — a grade of `git show
+# origin/main:<file>`, run because the work landed by another route, reads a tree
+# the pull request head never was. Stamping it from the head would make the gate
+# CLEAR on an inference, which inverts the failure direction of a control that
+# exists to refuse: today an unstampable grade holds and a person looks, which is
+# expensive but safe. (lodar, review on #1001.)
 #
-# NAME THE SOURCE, and when there is neither say THAT. An unstamped PASS is
-# indistinguishable from a rail that never ran, which is why this cost a person's
-# attention on every delivery instead of once. The no-source line deliberately
-# carries no hex, so `_gate_graded_sha` still reads empty and the gate still
-# holds — the hold is made LEGIBLE here, never lifted.
-_verify_grade_sha_line() {
-  local dref="$1" prior="${2:-}" sha="" tok line stated=""
+# SO THE STAMP IS ISSUED ONLY AGAINST A MATCH. `<tree_head>` is `git rev-parse
+# HEAD` in the cwd the verify command ran in. When that tree IS the pull request
+# head — prefix comparison, the same rule `_merge_disp_decide` uses — the grade
+# demonstrably ran against the thing that would merge, and the sha stamped is the
+# TREE's, because the tree is the fact and the head is the corroboration.
+#
+# EVERY OTHER CASE GETS `graded-head-at:`, a label `_gate_graded_sha` does NOT
+# parse. The operator reading the row still gets both shas and can see exactly why
+# nothing was stamped; the gate keeps holding. That is the same instinct as the
+# no-source line this replaces — an unstamped PASS is indistinguishable from a rail
+# that never ran, and the cure for that is legibility, never a looser gate.
+#
+# THE LABEL MUST NOT PARSE, and that is load-bearing rather than cosmetic: the
+# phrase `graded-sha:` never appears in that line, and `(tree graded: <sha>)`
+# cannot match either, because the fence wants `graded` + `[-_ ]` + `sha`. The
+# harness asserts `_gate_graded_sha` reads EMPTY off both shapes.
+_verify_grade_line() {
+  local dref="$1" prior="${2:-}" tree="${3:-}" head="" tok line stated="" src=""
   if declare -F _gate_gh >/dev/null 2>&1 && declare -F _gate_gh_token >/dev/null 2>&1; then
     tok=$(_gate_gh_token 2>/dev/null) || tok=""
-    sha=$(_gate_gh "$tok" 20 pr view "$dref" --json headRefOid -q '.headRefOid' 2>/dev/null) || sha=""
+    head=$(_gate_gh "$tok" 20 pr view "$dref" --json headRefOid -q '.headRefOid' 2>/dev/null) || head=""
   fi
-  if [[ "$sha" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
-    printf 'graded-sha: %s (the pull request head at grade time, read with gh)' "${sha,,}"
-    return 0
-  fi
-  # LAST occurrence wins, the same rule `_gate_graded_sha` uses on its own label:
-  # a re-delivery prepends the earlier record, so the later statement is current.
+  [[ "$head" =~ ^[0-9a-fA-F]{7,40}$ ]] || head=""
+  [[ "$tree" =~ ^[0-9a-fA-F]{7,40}$ ]] || tree=""
+  # The maker's stated sha CORROBORATES the tree when gh cannot answer; it never
+  # stands in for it. LAST occurrence wins, the same rule `_gate_graded_sha` uses
+  # on its own label: a re-delivery prepends the earlier record.
   while IFS= read -r line; do
     if [[ "$line" =~ [Dd][Ee][Ll][Ii][Vv][Ee][Rr][Ee][Dd][-_\ ][Ss][Hh][Aa][[:space:]]*[:=][[:space:]]*([0-9a-fA-F]{7,40}) ]]; then
       stated="${BASH_REMATCH[1]}"
     fi
   done <<<"$prior"
-  if [[ -n "$stated" ]]; then
-    printf 'graded-sha: %s (DELIVERED-SHA stated in the delivery record; gh could not read %s)' "${stated,,}" "$dref"
+  if [[ -n "$tree" ]]; then
+    if [[ -n "$head" && ( "$tree" == "$head"* || "$head" == "$tree"* ) ]]; then
+      src="the pull request head, read with gh"
+    elif [[ -z "$head" && -n "$stated" && ( "$tree" == "$stated"* || "$stated" == "$tree"* ) ]]; then
+      src="the DELIVERED-SHA stated in the delivery record (gh could not read ${dref})"
+    fi
+  fi
+  if [[ -n "$src" ]]; then
+    printf 'graded-sha: %s (the tree this grade ran in, and it matches %s)' "${tree,,}" "$src"
     return 0
   fi
-  printf 'graded-sha: unreadable — gh could not read %s and the delivery record states no DELIVERED-SHA, so the merge gate holds this row until the sha this grade ran against is stated' "$dref"
+  printf 'graded-head-at: %s (tree graded: %s) — this grade did not demonstrably run against that head, so it is NOT a merge-gate stamp and the row keeps holding' \
+    "${head:-unreadable}" "${tree:-unreadable}"
 }
 
 # DIVE-475: deterministic verify-runner — proven-done, not claimed-done. Run a
@@ -627,17 +647,22 @@ cmd_task_verify() {
     # Both given: the command's evidence AND the grader's words, prose first, because
     # the prose is the part a human wrote and the tail is the part they were reading.
     (( have_prose )) && result_txt="${prose}"$'\n'"--- evidence ---"$'\n'"${result_txt}"
-    # A COMMAND GRADE STATES THE SHA IT GRADED — see _verify_grade_sha_line above.
+    # A COMMAND GRADE STATES THE SHA IT GRADED — see _verify_grade_line above.
     # Only on a BOUND row: an unbound one has no merge gate to answer and auto-closes
     # here anyway. And never over a claim that is already stated — a verifier who put
     # `graded-sha:` in their own prose has said which sha they graded, and that is
     # theirs to say, not ours to overwrite.
-    local _vg_dref _vg_prior
+    local _vg_dref _vg_prior _vg_tree
     _vg_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
     if [[ -n "$_vg_dref" ]] && declare -F _gate_graded_sha >/dev/null 2>&1 \
        && [[ -z "$(_gate_graded_sha "$result_txt")" ]]; then
+      # THE TREE THIS GRADE RAN IN — the cwd `bash -c "$cmd"` inherited, read here
+      # rather than beside the run only because nothing between the two can move a
+      # checkout. Unreadable (not a git tree) is an ANSWER, not an error: it means
+      # nothing can be proven, which `_verify_grade_line` renders as a hold.
+      _vg_tree=$(git rev-parse HEAD 2>/dev/null) || _vg_tree=""
       _vg_prior=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
-      result_txt="${result_txt}"$'\n'"$(_verify_grade_sha_line "$_vg_dref" "$_vg_prior")"
+      result_txt="${result_txt}"$'\n'"$(_verify_grade_line "$_vg_dref" "$_vg_prior" "$_vg_tree")"
     fi
   else
     verdict="fail"
