@@ -1053,9 +1053,17 @@ cmd_task_ls() {
     # row whose value is null, and every row anyone reached for first was null
     # here. Only a row with a NON-NULL clock discriminates — which is what the
     # regression test asserts against (tests/task_reject_trace_unit.sh, arm C).
+    # gate_pinged_at: the gate's last CONFIRMED delivery receipt (and the re-nag
+    # throttle), ABSENT from this projection and from `task inbox --json` while
+    # `task show --json` carried it — the DIVE-2777 shape again, on the column
+    # that answers "was this human ever pinged". A reader filtering `ls`/`inbox`
+    # got null on every gated row, and null is indistinguishable from "never
+    # pinged"; one such read produced a board-wide false "no gate was ever
+    # delivered" that two seats acted on. Same column, same query, so the three
+    # surfaces cannot disagree. Still absent on a NULL row, like every column here.
     # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier, review_mode,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, gate_pinged_at, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier, review_mode,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
