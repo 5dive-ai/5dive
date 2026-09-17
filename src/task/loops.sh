@@ -463,6 +463,55 @@ _task_verify_merge_binding() {
   return 0
 }
 
+# _verify_grade_sha_line <delivery_ref> <row_result> — the one line a COMMAND
+# grade owes the merge gate, or a legible reason there is none.
+#
+# WHAT WAS MISSING. A command-graded row (`--review=check`) recorded
+# `✅ verify PASS (exit 0): <cmd>` and nothing else, so `_gate_graded_sha` read
+# EMPTY off it. DIVE-2656's rule — a grade is bound to a SHA, not to a pull
+# request — is read forwards by `_merge_disp_decide`, which therefore answered
+# `hold:merger:no-graded-sha-stated`; and `task done` refuses a close whose result
+# states no `graded-sha` either. So a row that had just PASSED its own acceptance
+# command could be closed by nobody: not the grader, not the merge owner, only an
+# operator typing the sha in by hand or spending the audited `--no-graded-sha`.
+# Measured on DIVE-544 / #994 — verify PASS at 04:40Z, held at
+# no-graded-sha-stated until a human appended the sha after the merge.
+#
+# THE SHA WAS NEVER UNKNOWN. The command ran against the delivered head, and the
+# delivery record names that head in its `DELIVERED-SHA:` field. So ask GitHub
+# what the head is at grade time — that is the sha the command actually graded and
+# the one the gate compares against — and fall back to the maker's stated
+# DELIVERED-SHA when gh cannot answer.
+#
+# NAME THE SOURCE, and when there is neither say THAT. An unstamped PASS is
+# indistinguishable from a rail that never ran, which is why this cost a person's
+# attention on every delivery instead of once. The no-source line deliberately
+# carries no hex, so `_gate_graded_sha` still reads empty and the gate still
+# holds — the hold is made LEGIBLE here, never lifted.
+_verify_grade_sha_line() {
+  local dref="$1" prior="${2:-}" sha="" tok line stated=""
+  if declare -F _gate_gh >/dev/null 2>&1 && declare -F _gate_gh_token >/dev/null 2>&1; then
+    tok=$(_gate_gh_token 2>/dev/null) || tok=""
+    sha=$(_gate_gh "$tok" 20 pr view "$dref" --json headRefOid -q '.headRefOid' 2>/dev/null) || sha=""
+  fi
+  if [[ "$sha" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+    printf 'graded-sha: %s (the pull request head at grade time, read with gh)' "${sha,,}"
+    return 0
+  fi
+  # LAST occurrence wins, the same rule `_gate_graded_sha` uses on its own label:
+  # a re-delivery prepends the earlier record, so the later statement is current.
+  while IFS= read -r line; do
+    if [[ "$line" =~ [Dd][Ee][Ll][Ii][Vv][Ee][Rr][Ee][Dd][-_\ ][Ss][Hh][Aa][[:space:]]*[:=][[:space:]]*([0-9a-fA-F]{7,40}) ]]; then
+      stated="${BASH_REMATCH[1]}"
+    fi
+  done <<<"$prior"
+  if [[ -n "$stated" ]]; then
+    printf 'graded-sha: %s (DELIVERED-SHA stated in the delivery record; gh could not read %s)' "${stated,,}" "$dref"
+    return 0
+  fi
+  printf 'graded-sha: unreadable — gh could not read %s and the delivery record states no DELIVERED-SHA, so the merge gate holds this row until the sha this grade ran against is stated' "$dref"
+}
+
 # DIVE-475: deterministic verify-runner — proven-done, not claimed-done. Run a
 # command; its EXIT CODE is the real stop condition. On pass (exit 0), an unbound
 # task flips to done; a task carrying a merge binding records a structural grade
@@ -578,6 +627,18 @@ cmd_task_verify() {
     # Both given: the command's evidence AND the grader's words, prose first, because
     # the prose is the part a human wrote and the tail is the part they were reading.
     (( have_prose )) && result_txt="${prose}"$'\n'"--- evidence ---"$'\n'"${result_txt}"
+    # A COMMAND GRADE STATES THE SHA IT GRADED — see _verify_grade_sha_line above.
+    # Only on a BOUND row: an unbound one has no merge gate to answer and auto-closes
+    # here anyway. And never over a claim that is already stated — a verifier who put
+    # `graded-sha:` in their own prose has said which sha they graded, and that is
+    # theirs to say, not ours to overwrite.
+    local _vg_dref _vg_prior
+    _vg_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_vg_dref" ]] && declare -F _gate_graded_sha >/dev/null 2>&1 \
+       && [[ -z "$(_gate_graded_sha "$result_txt")" ]]; then
+      _vg_prior=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+      result_txt="${result_txt}"$'\n'"$(_verify_grade_sha_line "$_vg_dref" "$_vg_prior")"
+    fi
   else
     verdict="fail"
     result_txt="❌ verify FAIL (exit ${rc}): ${cmd}"$'\n'"--- output tail ---"$'\n'"${tail_out}"
