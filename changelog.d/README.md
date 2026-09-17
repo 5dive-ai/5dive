@@ -14,6 +14,16 @@ never collide, because there is no shared line range for git to conflict on.
 changelog.d/<ident>.md      # e.g. changelog.d/DIVE-2582.md
 ```
 
+**No ticket ident? Use the PR number: `changelog.d/PR-<n>.md`.** Outside
+contributors hold no `DIVE-` ident, and the filename only has to be *unique per
+change* — that is the whole no-collision property this directory exists for. The
+PR number is the one identifier both sides know, so `changelog.d/PR-994.md` with
+`(#994)` in the heading is correct and `scripts/lint-changelog-fragments.sh`
+accepts it. The lint grades the **heading**, never the filename.
+
+Add it in the same commit if you can; otherwise a second commit naming the PR
+once it exists is fine and costs nothing.
+
 containing exactly what you would otherwise have typed at the top of
 `CHANGELOG.md` — the file's first non-blank line must be a heading of the form:
 
