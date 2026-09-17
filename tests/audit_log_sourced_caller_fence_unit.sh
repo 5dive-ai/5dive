@@ -176,31 +176,66 @@ fi
   || bad_t "4b: live log untouched by the isolated write" "rows=$(rows)"
 
 # ---------------------- arm 5: the HARDCODED live path, with nothing designated
-# A harness that forgets AUDIT_LOG starts on header.sh's own value. Nothing here
-# exports the decoy knob or AUDIT_LOG; the fence must fire on the literal path
-# alone. Only the caller's stderr is read. Skipped, as a SKIP, when this process
-# could append to the real log: a regressed tree would then make the arm itself
-# the leak it grades.
+# A harness that forgets AUDIT_LOG starts on header.sh's own value. Nothing below
+# exports the decoy knob or AUDIT_LOG, so the fence must fire on the literal path
+# alone.
+#
+# 5b/5c drive the PREDICATE rather than a writer, and that is the whole point of
+# the arm. `audit_log` opens with `[[ -d "${AUDIT_LOG%/*}" ]] || return 0` (the
+# DIVE-1307 guard against a noisy redirect before audit_init has run), so on a box
+# with no /var/log/5dive — CI, every container — it returns BEFORE the fence is
+# ever consulted. An arm that drove audit_log here would therefore demand a
+# withheld line from a box that cannot produce one, and would credit the dir guard
+# on a box that can. The predicate is what this fix added, it decides the
+# withholding, and calling it opens no file, so these two arms need no skip and
+# read the same everywhere. Against a src/ without the fence both functions are
+# undefined, rc is 127, and both arms go red.
 REAL_LOG=/var/log/5dive/agent-audit.log
+rm -f "$SUDO_MARK"
+out5=$(env -u FIVEDIVE_FENCE_EXTRA_AUDIT_LOG bash -c "
+  set -uo pipefail; cd '$PWD'
+  for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/actor.sh lib/audit.sh; do source '$SRC'/\$f; done
+  sudo() { printf '%s\n' \"\$*\" >> '$SUDO_MARK'; return 1; }
+  printf 'AUDIT_LOG=%s\n' \"\$AUDIT_LOG\" >&2
+  set +e
+  _audit_sink_is_live;            printf 'SINK-IS-LIVE=%s\n' \$?
+  _audit_sourced_caller_fence;    printf 'FENCE=%s\n' \$?
+  " 2>&1)
+if grep -q "AUDIT_LOG=$REAL_LOG" <<<"$out5"; then
+  ok_t "5: precondition — header.sh still aims a sourced caller at $REAL_LOG (the arm grades the real default)"
+else
+  bad_t "5: precondition" "header.sh no longer sets AUDIT_LOG to $REAL_LOG; re-derive this arm: $(head -c 200 <<<"$out5")"
+fi
+[[ "$out5" == *"SINK-IS-LIVE=0"* ]] \
+  && ok_t "5b: with nothing designated, the hardcoded path is still recognised as the live sink" \
+  || bad_t "5b: the hardcoded live path is recognised without a designation" "expected SINK-IS-LIVE=0; got: $(head -c 300 <<<"$out5")"
+if [[ "$out5" == *"FENCE=0"* ]] && grep -q 'audit row withheld' <<<"$out5" && ! sudo_reached; then
+  ok_t "5c: ... so a sourced caller there is WITHHELD, says so once, and never reaches for sudo"
+else
+  bad_t "5c: the hardcoded live path is fenced without a designation" "expected FENCE=0 + the withheld line, sudo unreached; withheld=$(grep -c 'audit row withheld' <<<"$out5") sudo_reached=$(sudo_reached && echo yes || echo no): $(head -c 300 <<<"$out5")"
+fi
+
+# ---- arm 5d: the same thing through the real writer, where that is safe to run
+# The end-to-end counterpart to 5b/5c. Skipped — as a SKIP, not a pass — whenever
+# this process could actually append to the real log or its notify/, because a
+# regressed src/ would then make this arm itself the leak it grades. Where it does
+# run it is also satisfied by the dir guard above, which is why it supplements
+# 5b/5c rather than replacing them.
 if [[ $EUID -eq 0 || -w "$REAL_LOG" || -w "${REAL_LOG%/*}/notify" ]]; then
-  printf 'SKIP - 5: this process can write %s or its notify/, so a regressed src/ would leak a real row or drop note from this arm (precondition unavailable, NOT a pass)\n' "$REAL_LOG"
+  printf 'SKIP - 5d: this process can write %s or its notify/, so a regressed src/ would leak a real row or drop note from this arm (precondition unavailable, NOT a pass)\n' "$REAL_LOG"
 else
   rm -f "$SUDO_MARK"
-  out5=$(env -u FIVEDIVE_FENCE_EXTRA_AUDIT_LOG bash -c "
+  before5=$(cat "$REAL_LOG" 2>/dev/null | wc -l | tr -d ' ')
+  out5d=$(env -u _TASKS_STORE_ENTRY env -u FIVEDIVE_FENCE_EXTRA_AUDIT_LOG bash -c "
     set -uo pipefail; cd '$PWD'
     for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/actor.sh lib/audit.sh; do source '$SRC'/\$f; done
     sudo() { printf '%s\n' \"\$*\" >> '$SUDO_MARK'; return 1; }
-    printf 'AUDIT_LOG=%s\n' \"\$AUDIT_LOG\" >&2
-    $PROBE" 2>&1)
-  if grep -q "AUDIT_LOG=$REAL_LOG" <<<"$out5"; then
-    ok_t "5: precondition — header.sh still aims a sourced caller at $REAL_LOG (the arm grades the real default)"
+    $PROBE; printf 'EXECUTION-CONTINUED rc=%s\n' \$?" 2>&1)
+  after5=$(cat "$REAL_LOG" 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$after5" == "$before5" ]] && ! sudo_reached && grep -q 'EXECUTION-CONTINUED rc=0' <<<"$out5d"; then
+    ok_t "5d: a real audit_log on the hardcoded path adds no row, never reaches for sudo, and still returns 0"
   else
-    bad_t "5: precondition" "header.sh no longer sets AUDIT_LOG to $REAL_LOG; re-derive this arm: $(head -c 200 <<<"$out5")"
-  fi
-  if grep -q 'audit row withheld' <<<"$out5" && ! sudo_reached; then
-    ok_t "5b: with nothing designated, the sourced caller is withheld on the hardcoded path and never reaches for sudo"
-  else
-    bad_t "5b: the hardcoded live path is fenced without a designation" "withheld=$(grep -c 'audit row withheld' <<<"$out5") sudo_reached=$(sudo_reached && echo yes || echo no): $(head -c 300 <<<"$out5")"
+    bad_t "5d: the real writer is inert on the hardcoded path" "rows $before5 -> $after5 sudo_reached=$(sudo_reached && echo yes || echo no): $(head -c 300 <<<"$out5d")"
   fi
 fi
 
