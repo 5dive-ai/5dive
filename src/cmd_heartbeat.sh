@@ -763,9 +763,35 @@ cmd_heartbeat_wake_task() {
     esac
   done
   local name="${_pos[0]:-}" task_id="${_pos[1]:-}"
-  local task_ident="${_pos[2]:-DIVE-${_pos[1]:-}}"
   [[ -n "$name" && "$task_id" =~ ^[0-9]+$ ]] \
     || fail "$E_USAGE" "usage: 5dive heartbeat wake-task [--fresh|--no-fresh] <agent> <task_id> [<task_ident>]"
+  # THE IDENT IS RESOLVED FROM THE ROW, NEVER FABRICATED FROM THE ID.
+  #
+  # `<task_ident>` is optional and the exit hints deliberately omit it, so the
+  # default is the common path, not the corner. That default used to be
+  # "DIVE-${task_id}" — which is only right while a row's id and its ident
+  # number happen to coincide. They are independent columns: id 553 is
+  # DIVE-546. `wake-task claude-qa 553` logged the forced wake onto DIVE-553,
+  # filed the loop defect against DIVE-553, and typed `/goal DIVE-553 … 5dive
+  # task show DIVE-553` into the seat. The seat looked, found no such row,
+  # started nothing — and the verb had already reported success, so the tick
+  # that was supposed to be un-stuck stayed stuck with a green log line over it
+  # (measured on claude-qa, 2026-09-17 09:48:49Z).
+  #
+  # A wrong ident here is worse than no ident: every downstream consumer takes
+  # it on trust. So resolve it, and REFUSE when it cannot be resolved rather
+  # than inventing one — an id with no row is an operator typo, and the old
+  # code turned that typo into a confident wake onto a row that never existed.
+  local row_ident
+  row_ident=$(db "SELECT COALESCE(ident,'') FROM tasks WHERE id=${task_id};" 2>/dev/null) || row_ident=""
+  [[ -n "$row_ident" ]] \
+    || fail "$E_USAGE" "wake-task: no task row has id ${task_id} (<task_id> is the row id, not the ident number)"
+  # The third argument stays an override, but only one that AGREES with the row.
+  # Its job is to let a caller state the ident it believes it is waking; a
+  # disagreement is the bug it exists to catch, not a value to prefer.
+  local task_ident="${_pos[2]:-$row_ident}"
+  [[ "$task_ident" == "$row_ident" ]] \
+    || fail "$E_USAGE" "wake-task: <task_ident> ${task_ident} is not the ident of row id ${task_id} (that row is ${row_ident})"
   local fresh
   if [[ -n "$fresh_override" ]]; then
     fresh="$fresh_override"
