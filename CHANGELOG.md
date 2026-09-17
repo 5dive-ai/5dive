@@ -1,6 +1,177 @@
 # Changelog
 
-## Unreleased — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
+## v0.43.0 — feat(pace): give the account-usage snapshot a scheduled publisher (DIVE-4585)
+
+`/var/lib/5dive/account-usage.json` is the one carrier of an account's rate-limit reading that
+idleness cannot erase — it reaches the number through the registry binding rather than through
+anything a seat did lately. Three consumers fence it at 600s (the weekly pacing floor, the digest's
+account block, `agent list`'s quota join), and its only writer was a human typing
+`sudo 5dive account usage`. Measured 2026-09-16, 1134s after the last hand-run: **all 23 accounts
+outside the fence**, so the all-idle account DIVE-4578 was named for still fell back to the activity
+document that cannot measure the idle, and was paced down to high/urgent-only on nearly every tick.
+
+The snapshot now has a cadence. `account_usage_publish` (the row builder split out of
+`cmd_account_usage`, so the table and the publisher can never drift) is driven by
+`_hb_quota_snapshot_sweep` on the heartbeat tick, **before** anything in that tick reads an account's
+headroom. Off switch `QUOTA_SNAPSHOT_PUBLISH=off`; cadence knob `QUOTA_SNAPSHOT_EVERY_SEC`.
+
+**Not a new cron.d entry or timer, deliberately.** The defect being fixed is "a thing that was
+supposed to run does not exist on this box", so fixing it with a new thing that has to be installed
+reproduces the defect's own precondition on every box the install misses — with silence, not an
+error, as the symptom. The tick is the one recurring root job every install already wires
+(DIVE-3628's precedent) and the only host that runs as root, which building the rows requires (it
+opens sibling seats' 0750 homes); an unprivileged timer would publish an empty snapshot and look
+like it was working.
+
+**120s, not 600s.** At the fence a single missed pass expires the source, and the sweep lives inside
+a `flock -n` tick designed to skip, so missed passes are normal operation. 120s survives four
+consecutive missed ticks and still lands inside the fence. Cost measured over 22 accounts:
+1.40s / 1.77s / 1.43s per pass.
+
+Second item, same surface: the one fence stops having two spellings. `_GRADER_READING_MAX_AGE` is
+now derived from `QUOTA_SNAPSHOT_MAX_AGE`, so an operator who moves one cannot silently re-open the
+floor/digest disagreement DIVE-4578 iteration 1 was rejected for. The grader pool's dark-note now
+tells the reader to check the tick first — an absent reading is no longer the expected steady state.
+
+Residual, signed: a cadence makes the snapshot fresh, never complete. 3 of 22 accounts on this host
+carry a reading at all; the rest publish `usage: null` and their consumers still fall back to the
+activity document. That is successor work and must not be closed by widening the fence.
+
+## v0.43.0 — fix(pace): the weekly pacing floor and the digest read the ACCOUNT's headroom, so a QUIET account stops being paced down (DIVE-4578)
+
+DIVE-4575 fixed one consumer of `5dive usage --json`; the document had two others, and there the
+same blindness INVERTS. That document is built from TRANSCRIPT ACTIVITY (`cmd_usage.sh` `continue`s
+past a seat that moved no tokens), so its silence about an account means *this account has been
+quiet* — and the pacing floor's `FIVE_PACE_BLIND=soft` posture reads that silence as "no meter" and
+holds the account at the soft floor: low/medium rows held, recurring beats skipped, while the
+account's own reading sits there saying it has room. The grader pool's failure refused a seat that
+had headroom; this one throttles an account that has headroom, from the same ambiguity, because each
+consumer's fail-safe points its own way.
+
+**The fix is the re-ordering DIVE-4575 proved, applied to the readers it named.** `_pace_band` and
+the digest's pace block now read the ACCOUNT's reading first — reached through the registry binding,
+which idleness cannot erase — and fall back to the per-seat activity document. The account reading
+is fenced HARDER than the source it overrides: its own `asOf` within 600s (the age of the READING,
+not of the file that quotes it), and a weekly window whose `resetsAt` has already passed is dropped
+entirely. With NEITHER source the floor is still blind and still holds at the soft floor:
+DIVE-4342's fail-closed rule is untouched and no path here invents a number.
+
+**A percentage and its reset are one reading.** The floor does not act on the pct alone — over the
+soft floor it asks how long until the window resets and RELAXES the floor inside the last 3 days,
+because unspent headroom expires anyway. So `_pace_account_seven` returns `<pct><US><resetsAt>` as
+one record and the fallback swaps both at once: a reset taken from the other source would describe a
+different week, and both fields would still be well-formed. `_grader_account_reading` is split into
+an unfenced JSON reader plus its existing fenced pair, so one place still decides what "too old"
+means.
+
+**The digest moved with the floor, not after it.** It recomputes the same bands from the same
+document ("one read, same numbers"), which makes it a SECOND PREDICATE of the same rule — fixing one
+of two agreeing predicates leaves the surface a lead reads still wrong. It now reads the same
+account snapshot (`quota_snapshot_read`, the unprivileged reader's copy — one small file read, no
+extra collect), an account the snapshot knows and the activity document does not gets a row at all
+rather than being absent, and every verdict names which reading answered.
+
+Evidence, on-host, with the activity document EMPTY and the real `/var/lib/5dive/account-usage.json`
+rows re-stamped fresh — the state a quiet fleet is actually in:
+
+```
+pre-fix   mark  chemmonitor  vesper   all rc=2 soft: "usage --json returned nothing — no meter"
+post-fix  mark         rc=3 hard   at 98% of its week (hard floor 90%, from the account reading)
+          chemmonitor  rc=0 open   84% but only 3d to the reset — unspent headroom expires
+          vesper       rc=2 soft   no account reading and no seat reading — the negative control
+```
+
+Arms: 20 new in `tests/pace_the_week_unit.sh` (64 passed), driving the REAL `_pace_account_seven`
+through a defined `quota_snapshot_read` — the seam the shipped bundle reaches — rather than a stub of
+the command, so the normaliser and both fences execute. Copied onto `origin/main`, 11 of them go red.
+
+## v0.43.0 — feat(task): a delivery carries its evidence, the grade verifies claims under a stated budget, and a command-graded row books no session (DIVE-4576)
+
+Grading was RE-DERIVATION. A grader is an ephemeral clone (DIVE-4164/4496) that cold-loads the row
+and the pull request from nothing, so every claim it could not CHECK it had to REDO — it re-ran the
+maker's investigation to find out whether the maker's investigation was right. Measured on this
+host over the 18 grades the pool has run (`scripts/grade-burn.sh`, the `5dive-burn-log.sh` method,
+assistant records deduped by `message.id`): **mean 58 turns and 5.6M metered tokens per grade
+(median 5.42M, ~$4.60 at Opus 5 list), of which 97.5% is cache re-read.** Ten of the eighteen ran
+past 60 turns and averaged 7.9M; the cheapest ran 7 turns for 0.32M. Cost tracks TURNS, not diff
+size — and it tracks them superlinearly (46k tokens/turn at 7 turns, 137k/turn at 119), because
+every turn re-reads a context that grew on the last one. A reject pays the whole thing twice, on
+both seats (DIVE-4440: five iterations, 34h, for a diff that ended as comments plus a changelog
+line).
+
+- **`task deliver` / `task done` refuse a result that carries no evidence**, on a delivery that
+  binds a pull request. The five fields are the INPUTS TO A CHECK, not a report format: `CHANGED`
+  (what the diff spot-check reads), `CHECKED` (the commands the grader RE-RUNS, with pass/fail
+  counts), `GRADED-SHA` (what it re-runs them against), `CI` (already required to be looked at),
+  `CRITERIA` (each acceptance criterion mapped to the evidence that closes it). Aliases are
+  accepted (`FILES`/`RAN`/`SHA`/`CHECKS`/`ACCEPTANCE`); one marker per field, never a prose
+  classifier — the property asserted is that the field is labelled and greppable, exactly as
+  DIVE-4144's `FIX` marker is. Same contract as the byte-identical re-delivery refusal it sits
+  beside: **nothing is written**, the refusal names the missing fields and prints the template, and
+  there is one audited exit, `--force-unevidenced="<why>"`, whose reason is printed for the grader
+  that will now have to pay for a re-derivation.
+- **`task show` prints the template while the row is IN PROGRESS** — the one moment the maker is
+  running the very commands it asks about. A template first met inside a refusal costs a round to
+  satisfy, and the pass/fail counts and the sha it asks for are already gone by then.
+- **The grader dispatch states the METHOD and the BUDGET**, in both grader lanes (the ephemeral
+  clone's goal and the session lane's wake) and in the heartbeat's verifier clause, from one
+  string: read the result's fields, RE-RUN what they name at the sha they name, spot-check the diff
+  against each criterion — that is the grade. **A claim with no evidence is a FAIL**
+  (`FINDING: unevidenced — <claim>`), not a research task: a grader that investigates it pays the
+  full re-derivation anyway and teaches the maker that omitting evidence is free. The budget is 25
+  turns (`_GRADER_TURN_BUDGET`, `_HB_GRADE_TURN_BUDGET`), and the heartbeat's own turn cap becomes
+  that number on a grade wake rather than contradicting it with the historical 6.
+- **A command-graded row never books a session.** `--review=check` has meant "graded by a command,
+  no grader session" since DIVE-4324 — but only at FILING time: the delivery still emitted a spawn
+  request and a clone still woke to run the command the row had been carrying all along. The
+  delivery now runs it, through `task verify --no-done` (one executor, so the timeout, the output
+  tail, DIVE-2483's result preservation and DIVE-3330's merge-binding hold are not re-derived
+  here), records the verdict as the grade, and returns without attaching a grader or routing.
+  **A RED command bounces without a session too** — today a red delivery costs a whole grader
+  session to discover the red — and starts no handoff clock, so there is no reject to undo.
+  `task deliver --verify="<cmd>"` lets a maker add the command at delivery; a row that pins a
+  NAMED grader (`--review=<seat>`) is never silently downgraded to an exit status, while the
+  anonymous `temp` (which is also what a filer who chose nothing gets) is, loudly.
+
+`tests/task_delivery_evidence_unit.sh` (41 arms) grades the PERSISTED state, not the printed line —
+that a refused delivery left no `delivery_ref`, no result and no handoff clock, and that a
+command-graded delivery emitted no spawn request and attached no grader — with three mutation arms
+that cut named terms out of the shipping functions and require the behaviour to change.
+`tests/heartbeat_grade_dispatch_unit.sh` (26 arms) reads the exact dispatch bytes, and pins
+`_hb_is_grade_wake` against the verifier clause across seven row shapes, because it is that
+clause's predicate restated for a line assembled before the clause runs. Both harnesses were run on
+`origin/main` before the fix: **50 arms red there** (27 of 39 reached in the first, 23 of 26 in the
+second).
+
+The fixture population this rail moves was enumerated by the RAIL rather than by the ticket's words —
+every harness that binds a `delivery_ref` or drives the deliver/done verbs, 42 of them. Seven carried
+unevidenced delivery results and were updated; the rest were green untouched. Worth keeping: the
+DIVE-2656 graded-sha gate parses sha-shaped tokens out of the result, so a fixture evidence block
+that says `GRADED-SHA: deadbeef` re-points the sha the gate grades and reds ten arms of an unrelated
+harness.
+
+What is NOT closed: the after-measurement. Deliverable 4's "before" is above and reproducible with
+`scripts/grade-burn.sh`; the "after" can only be taken once graders have woken with this dispatch.
+Projection from the turn curve: a 25-turn grade lands near 1.7M (≈31% of today's median) and a
+command-graded row costs zero sessions — the row's "under a fifth" target is reachable only with
+the command path carrying a real share of closes, which is a rollout question, not a code one.
+
+**Composition with DIVE-4559's small-delivery downgrade (#985), measured rather than assumed.** The
+two changes rewrote the same delivery/close routing fork and share four files; only
+`src/lib/verify_policy.sh` conflicted at the merge, and a clean textual merge in the other three is
+evidence that the LINES do not overlap and none at all that the POLICIES compose. On a small bound
+row **the size downgrade fires first**: `task done`'s routing fork evaluates it in
+`src/task/status.sh` before calling `_task_route_to_verifier`, and the evidence guard lives inside
+that function, so a delivery the box has already decided not to grade is never asked for evidence.
+That is the intended order — the five fields exist for one reader, a grader who would otherwise
+re-derive the work, and a row with no grader has no such reader; demanding evidence and then closing
+ungraded is the "CHANGED: n/a" shape this rail's own scope decision exists to avoid. CI and the
+DIVE-1830 merge gate still apply to that close. Four arms in `tests/task_delivery_evidence_unit.sh`
+(PART 6) pin it: the ordering, plus three controls that invert it — the same row at 400 lines, a row
+carrying `--verify` (which beats small), and the same 12-line delivery on a box at the shipped
+`verify-small=off`, all of which owe evidence.
+
+## v0.43.0 — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
 
 0.26.1 shipped a launcher that could not start any agent (DIVE-4067). The nightly installs the
 release and then restarts every agent, so every box that took it **emptied itself, unattended**,
@@ -38,7 +209,7 @@ first agent it restarts:
 
 `self-update`'s JSON gains a `health_gate` object; every existing field keeps its meaning.
 
-## Unreleased — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
+## v0.43.0 — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
 
 `5dive team import <slug>` provisioned a **roster**, not a working company. Agents, roles and
 reporting lines came up with nothing recurring on the board, so an imported team sat idle
@@ -95,7 +266,7 @@ functional against a real sqlite task store with a stub CLI, not source greps; e
 (kill the reconcile, drop the title arm, fold loop errors into `errors`, move the pass above
 the creates, strip the template's loops, …) were each run alone and each went red.
 
-## Unreleased — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
+## v0.43.0 — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
 
 All four bundled team templates hard-set `defaults.type: claude`, so `5dive team import
 content-studio` could only ever produce Claude Code seats — even though `agent create` has
@@ -134,7 +305,7 @@ long accepted every harness in `TYPE_BIN` and per-agent `type:` was already read
 and `cmd_team` themselves, each with a no-flag negative control. The wiring arms are not decoration: a
 mutation that parses `--type` and never applies it survived every transform-level arm.
 
-## Unreleased — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
+## v0.43.0 — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
 
 DIVE-3885 shipped the right rule — *a checker that could not RUN is `unknown`, never `stale`,
 because a broken instrument must not accuse a true fact* — and encoded it as a list of EXIT CODES
@@ -165,7 +336,7 @@ cases that must be classified oppositely share an exit code. **Parseability is t
 - 3 new harness sections (74/74 green), including the **negative control that decides the design**:
   an rc=2 check that PARSES must stay `stale`.
 
-## Unreleased — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
+## v0.43.0 — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
 
 Item 3 of the memory-janitor plan is a `check:` whose exit code re-derives a fact, plus a pass that
 flips it stale. It looked buildable on the existing `--evidence=<kind>:<ref>`: `cmd:` *is* a check,
@@ -203,7 +374,7 @@ arm through the built binary — that arm is what caught the stale exit code bei
 "this is a bug in the CLI" by the `lib/output.sh` backstop, which would have buried the digest a
 nightly pass exists to produce.
 
-## Unreleased — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
+## v0.43.0 — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
 
 `agent info` printed **⚠ NOT TRANSACTING (quota-exhausted)** about a seat that was executing the very
 command that read the flag. Measured 2026-09-01 14:17Z on `ops`: the pane refusal it quoted said
@@ -232,7 +403,7 @@ Undated pane lines resolve to the NEAREST of yesterday/today/tomorrow at that ti
 at 23:55 is tomorrow and `11pm` read at 00:05 is yesterday. Residual, stated rather than hidden: a refusal
 still on screen more than ~12h later reads as the same time-of-day today.
 
-## Unreleased — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
+## v0.43.0 — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
 
 Two rails, each correct, that intersect on a seat which can satisfy neither:
 
@@ -266,7 +437,7 @@ STATUS proves the merge". Nothing read it.
 
 Not touched: only-the-verifier-closes stays exactly as it is.
 
-## Unreleased — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
+## v0.43.0 — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
 
 `task show` printed a row's gate at the TAIL of the record, below the body; `task ls` printed nothing at
 all. So the board could not answer the one question a fleet with a paired human is most often asked —
@@ -304,7 +475,7 @@ all. So the board could not answer the one question a fleet with a paired human 
   fleet-wide by DEFAULT since DIVE-3224, so the flag OSS-36 specified was never built and anyone reaching
   for it got `unknown flag: --fleet` — a hard error where the view they wanted was already on screen.
 
-## Unreleased — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
+## v0.43.0 — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
 
 On 2026-08-28 05:00Z the board read **31 open rows** and `5dive-ai/5dive` main had not moved in **~42h**
 (`5816e7a` / `v0.23.0`, since 2026-08-26 10:23Z). Of the 31: 30 `blocked`, exactly **1 `todo`**. A reader
@@ -345,7 +516,7 @@ Complements the heartbeat's `_hb_blocked_sweep` (DIVE-1355) rather than replacin
 a2a at most once per 24h and covers two of these four classes. A throttled push to one seat's inbox is a
 different job from an operator looking at a stalled board now.
 
-## Unreleased — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
+## v0.43.0 — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
 
 The **v0.23 headline capability**. The theme was ratified 2026-08-26 as "Liveness you cannot fake"
 (DIVE-3738); v0.23.0 shipped its substrate — courier-routed alarms (DIVE-3727) and the rung-4
@@ -390,7 +561,7 @@ both directions — the third state folded UP into `alive`, folded DOWN into `no
 freshness window removed — each asserted to have applied and to turn a *named* arm red while leaving
 the others green, so no arm's green is the fixture's doing.
 
-## Unreleased — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
+## v0.43.0 — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
 
 On 2026-08-26 the supervisor printed `ESCALATE <seat> (poller-dead: rung-4-needed)` for `marketing`,
 `main`, `dev` and `olivia`. The detection was correct, it fired on time — and **nothing served rung 4**,
@@ -446,7 +617,7 @@ out of sqlite), `poller_liveness_unit` (41), `supervisor_classify_unit` (37),
 case, the tick dispatch entry, the counter exclusion, the limiter and the retired remedy text each red
 exactly the arms that claim them.
 
-## Unreleased — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
+## v0.43.0 — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
 
 INST-4 made the *record* of an action idempotent (`lifecycle_events` has a UNIQUE index on
 `idem_key`). INST-5 bounded *who* may act and *what* they may act on. Neither could answer the
@@ -493,7 +664,7 @@ next (email / pay / publish) would have been double-send, double-pay, double-pub
   the double-claim refusal must go red), the inversion arm with its live control, and a realistic
   pre-INST-8 store fixture for the migration.
 
-## Unreleased — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
+## v0.43.0 — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
 
 `5dive memory consolidate` had produced atoms **once across the entire fleet** while
 `/var/log/5dive-heartbeat.log` reported `13 seat(s) distilled, 4 failed, 0 not due` every six hours
@@ -533,7 +704,7 @@ it is a liveness check wearing a productivity label; and **hand-written artifact
 are not evidence the pipeline ran** — a populated output directory reads exactly like a working
 extractor, and only the ledger tells them apart.
 
-## Unreleased — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
+## v0.43.0 — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
 
 A session window dies and everything it learned dies with it, because "compile before you close" is
 a HABIT and a habit is not a mechanism. The motivating case is on the record: the very
@@ -601,7 +772,7 @@ Tests: `tests/memory_consolidate_unit.sh`, 53 assertions, offline by constructio
 an injected seam). Four mutants — the live-session skip, the dry-run ledger guard, the ledger skip,
 and the errexit fix — each red exactly the arm meant to catch it.
 
-## Unreleased — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
+## v0.43.0 — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
 
 DIVE-3172 made the nightly restart conditional on the agent payload actually moving, which takes a
 CLI-only night to zero restarts. This is the belt for the nights the payload genuinely moves: those
@@ -640,7 +811,7 @@ concern - our nightly updates kills some active agents mid tasks"*).
   three sweeps of one marker — parked mid-task is NOT restarted and keeps its marker; the row closes
   and the SAME marker fires the bounce; the next sweep does not bounce it again.
 
-## Unreleased — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
+## v0.43.0 — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
 
 Since DIVE-1935 the mandatory auto-detect merge gate has said so when its repo scan cannot
 complete: it warns, writes a `task.merge-gate-unverified` row to the audit log, and lets the close
@@ -672,7 +843,7 @@ never read is a receipt, not a control.
 - **Exit status is the consumable signal** (1 when any stamped close still has an open PR), because
   a stamp with no consumer is the whole defect.
 
-## Unreleased — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
+## v0.43.0 — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
 
 `--apply` was already safe: it deletes only on a closed PR whose head SHA equals the branch's
 current SHA, and age never entered that path. **The digest above it was the problem.** Its
@@ -736,7 +907,7 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
   the invariant `branch-hygiene-report.sh` greps for when it runs this same script against
   `lodar/5dive-api` and `lodar/5dive-frontend`.
 
-## Unreleased — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
+## v0.43.0 — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
 
 The constitution validator and the authority reader accepted **disjoint** subsets of YAML, so the
 key was unsettable through any path: `council amend` threw `use inline arrays in constitution v0`
@@ -762,7 +933,7 @@ worked example — so the template failed the validator shipping beside it.
   *"no motion could have succeeded"*, not *"nobody convened one"* — an instrument that measured its
   own writer.
 
-## Unreleased — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
+## v0.43.0 — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
 
 lodar, 2026-08-16, on a routine branch-push approval waking the org lead: *"why dev2 cannot do
 delegated push himself and burns your token for approval?"* An approval gate whose ask is an
@@ -796,7 +967,7 @@ permanent gate record and digest line intact, and **no ping to anyone**.
 - **`5dive task pfr-autoclear [on|off|status]`**, default **on**, restores the lead ping with no
   release.
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.43.0 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -826,7 +997,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.43.0 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -850,7 +1021,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.43.0 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -883,7 +1054,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.43.0 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -917,7 +1088,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.43.0 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -959,7 +1130,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.43.0 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -1023,7 +1194,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.43.0 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
