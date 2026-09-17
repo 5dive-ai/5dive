@@ -123,6 +123,74 @@ if ! ( _SUP_LIMIT_TAIL_LINES=200; _SUP_LIMIT_SPAN_LINES=200
 ok "arm10: MUTANT — with the position anchors removed, the quoted transcript DOES match" \
    "0" "$mut_rc"
 
+# ── 17. ITERATION 2 (grader gr-quinn-19): a QUOTED picker emits no keystroke ─
+# The cursor glyph used to accept a bare '>' as an alternative to the pointer.
+# Every gutter-quoting shape — a markdown blockquote, a chat forward, an
+# inbound message rendered with a '>' gutter (the DIVE-4405 shape) — prefixes
+# each option row with it, so the reading was not merely a match: it was the
+# most CONFIDENT possible cursor position, and it pressed a key into a live
+# pane. These arms assert on the STEPS FIELD, not on the match: the class is
+# ALLOWED to flip (a quoted wall still is not a question), what must never
+# happen is a keystroke. Option literals are assembled here rather than written
+# out, for the same reason the row body and the wiki page break them up.
+O1='1. Stop and wait for limit to reset'
+O2='2. Wait here, then continue automatically at Sep 19, 12pm'
+O3='3. Upgrade your plan'
+FOOT='Enter to confirm · Esc to cancel'
+BLOCKQUOTE=$(printf '> What do you want to do?\n>\n> %s\n> %s\n> %s\n>\n> %s\n' "$O1" "$O2" "$O3" "$FOOT")
+FORWARD=$(printf 'main forwarded a pane:\n\n> %s\n> %s\n> %s\n> %s\n' "$O1" "$O2" "$O3" "$FOOT")
+INBOUND=$(printf '[5dive-msg from main] the seat is sitting on this:\n> What do you want to do?\n> %s\n> %s\n> %s\n> %s\n' "$O1" "$O2" "$O3" "$FOOT")
+steps_of() { cut -d$'\x1f' -f2 <<<"$(printf '%s\n' "$1" | _sup_limit_picker_match)"; }
+ok "arm17: a gutter-quoted BLOCKQUOTE of the picker presses NO key" \
+   "unknown" "$(steps_of "$BLOCKQUOTE")"
+ok "arm17b: a gutter-quoted chat FORWARD presses NO key" \
+   "unknown" "$(steps_of "$FORWARD")"
+ok "arm17c: a gutter-quoted inbound a2a message presses NO key" \
+   "unknown" "$(steps_of "$INBOUND")"
+
+# MUTANT: put the bare gutter back into BOTH glyph classes — the pre-fix
+# reading — and the blockquote must produce a NUMERIC step count again, i.e.
+# the restriction is what is holding arm17 and not some other anchor. Measured
+# on the pre-fix tree, all three shapes gave exactly this: -1, one Up then
+# Enter, into the seat's live pane.
+mut_glyph=$( _SUP_LIMIT_CURSOR_PAT='^[[:space:]]*(❯|>)[[:space:]]*[0-9]+\.[[:space:]]'
+             _SUP_LIMIT_OPTION_PAT='^[[:space:]]*((❯|>)[[:space:]]*)?[0-9]+\.[[:space:]]'
+             steps_of "$BLOCKQUOTE" )
+# The claim under test is "a keystroke is emitted", not one particular count:
+# on the pre-fix tree the cursor scan had no break, so it ran to the LAST
+# gutter-prefixed row (the upgrade option) and read -1, one Up then Enter; with
+# the break in place the same widening reads +1 off the first quoted row. Both
+# are keys pressed into a live pane on a quotation, which is the defect.
+ok "arm18: MUTANT — with the bare gutter back in both glyph classes, the quote answers" \
+   "yes" "$( [[ "$mut_glyph" =~ ^-?[0-9]+$ ]] && echo yes || echo no )"
+# ...and the two restrictions are INDEPENDENT stops: relax only the cursor and
+# the quoted pane still presses nothing, because a gutter-quoted row is not an
+# option row either, so neither end of the distance can be located.
+mut_cursor_only=$( _SUP_LIMIT_CURSOR_PAT='^[[:space:]]*(❯|>)[[:space:]]*[0-9]+\.[[:space:]]'
+                   steps_of "$BLOCKQUOTE" )
+ok "arm18b: the option-row class stops the quote on its own" \
+   "unknown" "$mut_cursor_only"
+
+# ── 19. the distance is counted in OPTION ROWS, not rendered lines ──────────
+# A render with a description sub-line under each option: the true distance
+# from the cursor to the auto-resume option is ONE. Counting non-empty lines
+# gives TWO, which walks the cursor onto the third option — upgrade the plan,
+# a purchase, the exact decision the cursor-relative design exists to avoid.
+SUBLINE=$(printf '   What do you want to do?\n\n   ❯ %s\n     resets at Sep 19, 12pm (UTC)\n     %s\n     the seat parks and wakes itself\n     %s\n     costs money\n\n   %s\n' \
+                 "$O1" "$O2" "$O3" "$FOOT")
+ok "arm19: description sub-lines do not inflate the distance" "1" "$(steps_of "$SUBLINE")"
+# MUTANT: widen the option class to every line and the same pane over-shoots
+# to 2 — the pre-fix reading, and the arm that proves arm19 is load-bearing.
+mut_opt=$( _SUP_LIMIT_OPTION_PAT='.'; steps_of "$SUBLINE" )
+ok "arm20: MUTANT — counting rendered lines instead of option rows over-shoots" \
+   "2" "$mut_opt"
+
+# ── 21. this harness is itself population ──────────────────────────────────
+# It now carries assembled option literals, so it joins the row body and the
+# wiki page as a file a seat could cat into its own pane. It must not classify.
+ok "arm21: this harness file does not classify (population)" \
+   "" "$(_sup_limit_picker_match < "$0")"
+
 # ── 11. the classifier ──────────────────────────────────────────────────────
 c=$(cls_prompt "2. Wait here, then continue automatically at Sep 19, 12pm" "limit-picker:1")
 ok  "arm11: the hold picker classifies quota-exhausted, not blocked-on-prompt" \

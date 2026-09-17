@@ -93,3 +93,44 @@ instance of it. `tests/supervisor_limit_picker_unit.sh` feeds this page and the 
 - A watchdog that may press a key owes a cursor-relative plan, not a keystroke count.
 - When a false positive is cheap in one class and expensive in another, the bug to fix is
   the routing, not the volume.
+
+## Postscript (iteration 2, 2026-09-17): the anchors were sound, the GLYPH was the hole
+
+The grader accepted every position anchor above and rejected the change on one character
+class. The cursor pattern accepted a bare greater-than sign as an alternative to the
+pointer glyph, defended in a code comment by the DIVE-4405 argument: *an echoed alert line
+is not a numbered option.* That argument is true and it does not apply. The shapes that
+carry a greater-than gutter — a markdown blockquote, a chat forward, an inbound message
+drawn inside a gutter box — prefix **every line they quote**, including the numbered
+option rows. A quoted numbered option IS a numbered option behind that gutter.
+
+So the widening did not merely let a quotation match. It handed the reader the most
+CONFIDENT cursor position available, and this is the one reader in the path that ACTS: on
+three separately-shaped quoted panes the reading came back answerable and a key went into
+the seat's live pane. The bias the whole file claims — false-negative — was inverted at
+exactly the rung where inversion costs the most.
+
+**The lesson is not "check your regex".** It is that a glyph class is a POPULATION
+question, the same question the position anchors were already asked. The anchors were
+graded against the row body and this page because those are files a seat can render; the
+glyph class was never graded against anything, because it looked like a rendering detail
+rather than a reading. Two controls answer the same question and only one of them was
+measured, so the rule composed exactly the way the original three rules did: each correct
+about its own widget, none of them asked whether the thing behind the gutter was live.
+
+Two changes close it, and they are independent stops rather than one fix twice: the cursor
+glyph is now the pointer the live capture actually renders and nothing else, and the step
+distance is counted in **option ROWS** rather than rendered lines, so neither end of the
+distance can be located on a quoted pane. The second also fixes a defect that was never
+about quoting: a release that draws a description sub-line under each option makes rendered
+lines and options disagree, and the line count over-shoots onto the third option — the one
+that buys something. The unit a keystroke moves in is the unit the distance must be
+measured in.
+
+Both directions stay safe: the class still flips to the quota wall (which is true of a
+quoted wall too, and which pages nobody), and the keystroke is simply withheld.
+
+- A reading that may ACT is graded against the population; a reading that only pages is
+  graded against the truth. Those are different bars, and the acting one is not optional.
+- When two independent controls could stop the same false positive, build both. The one
+  you argue for in a comment is the one that is about to be wrong.

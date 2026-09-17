@@ -776,12 +776,32 @@ _SUP_LIMIT_HOLD_PAT="${SUPERVISOR_LIMIT_HOLD_PAT:-}"
 _SUP_LIMIT_AUTO_PAT="${SUPERVISOR_LIMIT_AUTO_PAT:-}"
 [[ -n "$_SUP_LIMIT_AUTO_PAT" ]] \
   || _SUP_LIMIT_AUTO_PAT='^[[:space:]]*(❯|>)?[[:space:]]*[0-9]+\.[[:space:]]+.*continue[[:space:]]+automatically'
-# The cursor row, restricted to a NUMBERED OPTION. The bare-gutter reading that
-# DIVE-4405 found (a TUI draws an inbound message inside a box whose gutter is
-# '>') cannot become a cursor position here, because an echoed alert line is not
-# a numbered option.
+# The cursor row: the POINTER GLYPH ONLY, on a numbered option.
+#
+# ITERATION 2 (grader gr-quinn-19) — this pattern used to accept a bare '>' as
+# an alternative to the pointer, on the argument that "an echoed alert line is
+# not a numbered option". A QUOTED option line IS a numbered option behind that
+# gutter: a markdown blockquote, a chat forward, or a DIVE-4405 inbound drawn
+# with a '>' gutter prefixes EVERY option row with it, so the reading did not
+# merely match, it produced the most CONFIDENT possible cursor position and
+# emitted a keystroke into a live pane. Measured on three such panes before the
+# restriction: all three answered with a step count. This reader is the only
+# one in the limit path that ACTS, so it takes the pointer the live capture
+# actually renders and nothing else; a terminal that cannot draw it reads
+# `unknown`, the class still flips to quota-exhausted, and NO key is pressed.
+# _sup_prompt_recommended keeps its wider glyph class deliberately: it emits no
+# keystroke of its own and its pre-filter is a different control.
 _SUP_LIMIT_CURSOR_PAT="${SUPERVISOR_LIMIT_CURSOR_PAT:-}"
-[[ -n "$_SUP_LIMIT_CURSOR_PAT" ]] || _SUP_LIMIT_CURSOR_PAT='^[[:space:]]*(❯|>)[[:space:]]*[0-9]+\.[[:space:]]'
+[[ -n "$_SUP_LIMIT_CURSOR_PAT" ]] || _SUP_LIMIT_CURSOR_PAT='^[[:space:]]*❯[[:space:]]*[0-9]+\.[[:space:]]'
+# A NUMBERED OPTION ROW of this picker — the unit the distance is counted in.
+# Down/Up move by OPTION, not by rendered line, so a release that draws a
+# description sub-line under each option makes a line count over-shoot: the
+# true distance 1 computes as 2 and walks the cursor onto "upgrade your plan",
+# the purchase this design exists to avoid. Same glyph class as the cursor: a
+# gutter-quoted "> 2. ..." is not an option row, so a quoted pane cannot supply
+# the positions either and falls to `unknown`.
+_SUP_LIMIT_OPTION_PAT="${SUPERVISOR_LIMIT_OPTION_PAT:-}"
+[[ -n "$_SUP_LIMIT_OPTION_PAT" ]] || _SUP_LIMIT_OPTION_PAT='^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.[[:space:]]'
 # Anchors, all counting NON-EMPTY lines (a capture is blank-padded to the pane
 # height). Measured on the live 2026-09-16 05:5xZ capture kept as
 # tests/fixtures/dive4581/limit-picker-pane.txt: the footer is the LAST
@@ -813,7 +833,8 @@ _SUP_LIMIT_STEP_MAX="${SUPERVISOR_LIMIT_STEP_MAX:-4}"
 # auto-resume line on purpose: it is the one that carries the RESUME TIME, so
 # every downstream surface quotes a wall that names when it ends.
 _sup_limit_picker_match() {  # <pane-text-on-stdin>
-  local tail ln n lo f h a c i w d steps
+  local tail ln n lo f h a c i w d steps pc pa k
+  local -a OPT=()
   tail=$(_sup_pane_drop_echoes) || return 0
   [[ -n "$tail" ]] || return 0
   local -a L=()
@@ -829,17 +850,29 @@ _sup_limit_picker_match() {  # <pane-text-on-stdin>
   for (( f = n - 1; f >= lo; f-- )); do
     grep -qE "$_SUP_PROMPT_PAT" <<<"${L[f]}" 2>/dev/null || continue
     w=$(( f - _SUP_LIMIT_SPAN_LINES )); (( w < 0 )) && w=0
-    h=-1; a=-1; c=-1
+    h=-1; a=-1; c=-1; OPT=()
     for (( i = w; i < f; i++ )); do
       if (( h < 0 )) && grep -qE "$_SUP_LIMIT_HOLD_PAT" <<<"${L[i]}" 2>/dev/null; then h=$i; fi
       if (( a < 0 && h >= 0 && i > h )) && grep -qE "$_SUP_LIMIT_AUTO_PAT" <<<"${L[i]}" 2>/dev/null; then a=$i; fi
-      if grep -qE "$_SUP_LIMIT_CURSOR_PAT" <<<"${L[i]}" 2>/dev/null; then c=$i; fi
+      if grep -qE "$_SUP_LIMIT_OPTION_PAT" <<<"${L[i]}" 2>/dev/null; then OPT+=("$i"); fi
+      # FIRST hit only: one pointer is drawn per picker, so a second reading in
+      # the same window is not a later cursor, it is another picker's row.
+      if (( c < 0 )) && grep -qE "$_SUP_LIMIT_CURSOR_PAT" <<<"${L[i]}" 2>/dev/null; then c=$i; fi
     done
     (( h >= 0 && a > h && a < f )) || continue
+    # The distance is counted in OPTION ROWS, and both ends must BE option rows
+    # of this window — otherwise the reading is not confident and no key moves.
     steps="unknown"
     if (( c >= w )); then
-      d=$(( a - c )); (( d < 0 )) && d=$(( -d ))
-      (( d <= _SUP_LIMIT_STEP_MAX )) && steps=$(( a - c ))
+      pc=-1; pa=-1
+      for (( k = 0; k < ${#OPT[@]}; k++ )); do
+        (( OPT[k] == c )) && pc=$k
+        (( OPT[k] == a )) && pa=$k
+      done
+      if (( pc >= 0 && pa >= 0 )); then
+        d=$(( pa - pc )); (( d < 0 )) && d=$(( -d ))
+        (( d <= _SUP_LIMIT_STEP_MAX )) && steps=$(( pa - pc ))
+      fi
     fi
     printf '%s\x1f%s\n' \
       "$(printf '%s\n' "${L[a]}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160)" \
