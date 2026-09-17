@@ -757,6 +757,107 @@ cmd_account_login() {
   cmd_auth_login --auth-profile="$name" "$type"
 }
 
+# `5dive account set <name> --type=<type> --provider=<id> --api-key=- [--model=<slug>]
+#                          [--base-url=<url>] [--replace]`
+#
+# WHY A NEW VERB RATHER THAN A WIDER `account login` (issue #999). `account` is
+# the abstraction for REUSABLE auth profiles, but only the OAuth half went
+# through it: writing a BYO provider key meant `agent auth set`, an AGENT-scoped
+# verb doing account-scoped work — which is also why configuring a credential
+# could look like it needed an agent. The two verbs are kept apart because the
+# words mean different things: `login` implies an interactive sign-in, a device
+# code, a browser, a thing that can be CANCELLED, and `account login --api-key=-`
+# in a runbook makes a reader stop and check what it does. `set` means "write
+# this value". One verb each, both self-describing, and login's flag surface is
+# left exactly as it was.
+#
+# IT IS A WRAPPER, deliberately and completely. The profile this writes is the
+# one `cmd_auth_set` writes, byte for byte — same validation, same stdin
+# handling, same restart of the agents bound to it — because two writers of one
+# credential store drift, and the drift is discovered during an incident. What
+# this adds is the account-scoped name, the replace guard, and the audit row.
+#
+# THE KEY DOES NOT BELONG IN ARGV. `--api-key=-` reads it from stdin and is the
+# documented form; a literal value is accepted and marked discouraged, because an
+# argument is visible in `ps` for the life of the call and lands in shell
+# history. (`audit_log` redacts `--api-key=` either way, which is a backstop, not
+# a reason to pass one.)
+_account_set_usage() {
+  cat <<'ACCTSET'
+usage: 5dive account set <name> --type=<type> --provider=<id> --api-key=- [--model=<slug>] [--base-url=<url>] [--replace]
+
+  Configure a BYO provider credential on a reusable account profile, without
+  creating an agent. `account login` remains the interactive OAuth flow.
+
+  --api-key=-   READ THE KEY FROM STDIN. This is the documented form:
+                  printf '%s' "$KEY" | sudo 5dive account set <name> ...
+                A literal --api-key=<value> still works but is DISCOURAGED — an
+                argument is visible in `ps` while the call runs and is written to
+                shell history.
+  --replace     REQUIRED to overwrite credentials the profile already carries for
+                this type. Without it the write is refused, so `account set`
+                cannot quietly re-point a live profile at another provider. A
+                replace is audited: the row names the profile and the provider,
+                never the key.
+ACCTSET
+}
+
+cmd_account_set() {
+  local name="" type="" provider="" api_key="" model="" base_url="" replace=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type=*)     type="${1#--type=}" ;;
+      --provider=*) provider="${1#--provider=}" ;;
+      --api-key=*)  api_key="${1#--api-key=}" ;;
+      --model=*)    model="${1#--model=}" ;;
+      --base-url=*) base_url="${1#--base-url=}" ;;
+      --replace)    replace=1 ;;
+      -*)           fail "$E_USAGE" "unknown flag: $1"$'\n'"$(_account_set_usage)" ;;
+      *)            [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" && -n "$type" && -n "$api_key" ]] || fail "$E_USAGE" "$(_account_set_usage)"
+  valid_profile_name "$name" \
+    || fail "$E_VALIDATION" "invalid account name (lowercase letters/digits/_-, start letter, <=32 chars)"
+  # Same reservation `account add` makes: 'default' is the value
+  # `agent config set auth-profile=default` uses to CLEAR a binding.
+  [[ "$name" != "default" ]] \
+    || fail "$E_VALIDATION" "'default' is reserved (clears an agent's account binding)"
+  is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type"
+
+  # THE REPLACE GUARD, and it is keyed PER TYPE. A profile signed in to codex is
+  # not what a `--type=claude` write is about to overwrite, so refusing on any
+  # credential at all would make rotation — a stated reason this verb exists —
+  # need the flag every time and train people to pass it by reflex. What must not
+  # happen silently is re-pointing a credential that IS there: every agent bound
+  # to the profile changes behaviour on its next restart, and nothing in the
+  # audit trail would say why.
+  local had=0 t
+  if declare -F account_types_authed_arr >/dev/null 2>&1; then
+    account_types_authed_arr "$name"
+    for t in ${ACCOUNT_TYPES_AUTHED[@]+"${ACCOUNT_TYPES_AUTHED[@]}"}; do
+      [[ "$t" == "$type" ]] && { had=1; break; }
+    done
+  fi
+  if (( had )) && (( ! replace )); then
+    fail "$E_CONFLICT" "account '$name' already carries $type credentials — refusing to replace them silently. Every agent bound to '$name' would change behaviour on its next restart. Re-run with --replace if that is what you mean (the replace is audited: profile and provider, never the key)."
+  fi
+  # Audited BEFORE the write, so an overwrite that dies half way still leaves the
+  # record that it was attempted — the row exists to explain a profile that
+  # changed, and a row written only on success cannot explain a partial one.
+  if (( had )); then
+    audit_log "account set" "replace" 0 -- \
+      "profile=$name" "type=$type" "provider=${provider:-none}"
+  fi
+
+  local -a args=("$type" "--auth-profile=$name" "--api-key=$api_key")
+  [[ -z "$provider" ]] || args+=("--provider=$provider")
+  [[ -z "$model" ]]    || args+=("--model=$model")
+  [[ -z "$base_url" ]] || args+=("--base-url=$base_url")
+  cmd_auth_set "${args[@]}"
+}
+
 cmd_agent_set_account() {
   local agent="${1:-}" account="${2:-}"
   [[ -n "$agent" && -n "$account" ]] \
