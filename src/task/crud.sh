@@ -1745,8 +1745,8 @@ cmd_task_verifier() {
         verify_unavailable=NULL,
         verify_optout=NULL,
         -- DIVE-4251: naming a grader by hand IS the row's demand for a grade, so
-        -- it sets the same flag `task add --verify` does. Without this, the
-        -- retrofit stored a verifier that a `verify=never` box then declined to
+        -- it sets the same flag 'task add --verify' does. Without this, the
+        -- retrofit stored a verifier that a 'verify=never' box then declined to
         -- route to — an attach that appears to work and grades nothing, which is
         -- the worst of the three possible outcomes.
         verify_forced=1${move_sql}
