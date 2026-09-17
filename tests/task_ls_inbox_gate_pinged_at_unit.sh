@@ -106,5 +106,43 @@ eq_t "B3: never pinged -> key absent on show"  "$(show_field DIVE-9002 gate_ping
 eq_t "C1: gate_live is still 1 on the pinged gate in ls (the verdict the column sits beside)" "$(ls_field DIVE-9001 gate_live)" "1"
 eq_t "C2: need_answered_at, never broken, is still absent on an unanswered gate in inbox" "$(inbox_field DIVE-9001 need_answered_at)" "<absent>"
 
+# ---- ARM M: the MUTANT — put the defect back, in this process -----------------
+# Everything above is green on the fixed tree, which is also what a file with no
+# teeth looks like. This arm rebuilds cmd_task_ls and cmd_task_inbox from the
+# WORKING TREE's own definitions with `gate_pinged_at` struck out of the two
+# SELECT lists — the pre-fix text — and requires the A arms to go red. In-file,
+# because "A1/A2 red against main" is a claim about a checkout nobody re-runs.
+ORIG_LS="$(declare -f cmd_task_ls)"
+ORIG_INBOX="$(declare -f cmd_task_inbox)"
+# M0 is a BEFORE/AFTER pair, not one assertion. "The column is gone after the
+# sed" is also true of a sed that matched nothing on a tree that never had the
+# column — which is the one tree where a vacuous mutant matters most, because
+# there the A arms are red and a reader is already looking for why. So state the
+# precondition out loud first, then the strike.
+if declare -f cmd_task_ls | grep -q 'gate_pinged_at' \
+   && declare -f cmd_task_inbox | grep -q 'gate_pinged_at'; then
+  ok_t "M0a: precondition — both projections name gate_pinged_at before the strike (there is something to mutate)"
+else
+  bad_t "M0a: precondition for the mutant arm" "a projection does not name gate_pinged_at to begin with, so M1/M2 below cannot re-introduce anything: ls=$(declare -f cmd_task_ls | grep -c gate_pinged_at) inbox=$(declare -f cmd_task_inbox | grep -c gate_pinged_at)"
+fi
+eval "$(sed 's/need_answered_tap_uid, gate_pinged_at, tier/need_answered_tap_uid, tier/' <<<"$ORIG_LS")"
+eval "$(sed 's/need_answered_at, gate_pinged_at FROM tasks/need_answered_at FROM tasks/' <<<"$ORIG_INBOX")"
+if ! declare -f cmd_task_ls | grep -q 'gate_pinged_at' \
+   && ! declare -f cmd_task_inbox | grep -q 'gate_pinged_at'; then
+  ok_t "M0b: ... and the strike landed — neither projection names it now"
+else
+  bad_t "M0b: the strike landed" "a projection still names gate_pinged_at, so M1/M2 would pass vacuously: ls=$(declare -f cmd_task_ls | grep -c gate_pinged_at) inbox=$(declare -f cmd_task_inbox | grep -c gate_pinged_at)"
+fi
+eq_t "M1: struck from ls, a pinged gate reads as never pinged (so this file CAN fail)" "$(ls_field DIVE-9001 gate_pinged_at)" "<absent>"
+eq_t "M2: ... and the same on inbox — the defect, live"                               "$(inbox_field DIVE-9001 gate_pinged_at)" "<absent>"
+# The disagreement is the defect, not the absence: show selects * and is
+# unaffected, which is exactly how one surface said 2026-09-15 and another said
+# nothing about the same row.
+eq_t "M3: ... while show still carries it — the cross-surface disagreement itself" "$(show_field DIVE-9001 gate_pinged_at)" "$PINGED"
+# Restore and prove it took: a mutant left installed would poison any arm added
+# after this one, and it would look like a fresh regression.
+eval "$ORIG_LS"; eval "$ORIG_INBOX"
+eq_t "M4: the restored projections carry the receipt again (the mutant is not left installed)" "$(ls_field DIVE-9001 gate_pinged_at)" "$PINGED"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
