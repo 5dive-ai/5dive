@@ -458,7 +458,11 @@ cmd_task_inbox() {
     # `routed_reviewer`/`needs_capability` here — that invites a second copy of
     # the rule, which is the DIVE-3171 two-copies-that-disagree shape and is the
     # exact defect this line closes.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, tier, precedent_ref, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
+    # gate_pinged_at is the one stored column added since: the gate's confirmed
+    # delivery receipt, which `task show --json` carried and this surface did not
+    # (see the matching note in cmd_task_ls). A stored column, not a verdict —
+    # it adds no second copy of any rule.
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, tier, precedent_ref, need_answer, need_answered_at, gate_pinged_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # DIVE-4424 — MARKED IN PLACE, AND `data.inbox` STILL MEANS WHAT IT MEANT.
     #
