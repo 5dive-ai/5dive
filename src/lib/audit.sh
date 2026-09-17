@@ -19,6 +19,71 @@ audit_init() {
   chmod 2770 "$notify_dir"
 }
 
+# _audit_sink_is_live — does AUDIT_LOG resolve to the fleet's real audit log?
+#
+# DIVE-2249, one surface over. The tasks-store fence (src/lib/tasks_db.sh) keys
+# on the ENTRYPOINT: every legitimate production write comes from the built
+# bundle, whose `main` sets _TASKS_STORE_ENTRY as its first statement, so a
+# process that sourced src/lib/*.sh directly and then aimed a write at the
+# production path is a mistake BY CONSTRUCTION. The audit log had no such fence:
+# src/header.sh sets AUDIT_LOG=/var/log/5dive/agent-audit.log unconditionally,
+# tests/lib/env_isolation.sh clears only FIVE_*, and a harness that does not stub
+# audit_log itself therefore writes REAL rows. Measured on a box that runs 5dive:
+# `task cancel`, `deploy gate` and `agent ask` fixture rows landed in the live log
+# during one run of the corpus — and, from a non-root caller, they got there
+# through the privileged _audit_append fallback below, i.e. through sudo, which is
+# the last place a test should be.
+#
+# INVISIBLE ON A ROOT-OWNED BOX, which is why it lived. Where the log is 640
+# root:claude and the caller cannot append, `-w` fails, `sudo -n` fails, and the
+# drop note goes to notify/ — or nowhere, when /var/log/5dive is absent, as in
+# CI. A clean grep of the log on such a box does not disprove the leak; it shows
+# only that THIS box could not write.
+#
+# Same shape as the store fence, on purpose: the live path is HARDCODED so no
+# environment can move it, FIVEDIVE_FENCE_EXTRA_AUDIT_LOG only ADDS a path to the
+# fenced set (the harness designates its decoy that way, so the worst a caller
+# can do with it is fence themselves), and readlink's empty result — a parent
+# that does not exist, the CI case — falls back to the literal path rather than
+# comparing "" == "" and fencing every caller.
+_audit_sink_is_live() {
+  local active ra p rp
+  active="${AUDIT_LOG:-/var/log/5dive/agent-audit.log}"
+  ra="$(readlink -f "$active" 2>/dev/null)"; [[ -n "$ra" ]] || ra="$active"
+  for p in /var/log/5dive/agent-audit.log "${FIVEDIVE_FENCE_EXTRA_AUDIT_LOG:-}"; do
+    [[ -n "$p" ]] || continue
+    rp="$(readlink -f "$p" 2>/dev/null)"; [[ -n "$rp" ]] || rp="$p"
+    [[ "$ra" == "$rp" ]] && return 0
+  done
+  return 1
+}
+
+# _audit_sourced_caller_fence — returns 0 when the row must be WITHHELD.
+#
+# WITHHELD, not refused. The store fence exits, because a fixture row on the
+# board is a mutation somebody has to undo. An audit row is best-effort by
+# contract (a full disk must not block a rescue `agent rm`), and audit_log runs
+# from the EXIT trap of every mutating verb, so a fence that exited here would
+# kill a harness in its teardown. DIVE-2010 already withholds task audit
+# telemetry from a non-production store and says so once; this is the same
+# sentence for the same reason, one layer down, covering every caller of
+# audit_log and _audit_note_drop rather than the task verbs alone.
+#
+# The line is the payload (DIVE-2325): withheld in silence, "the harness never
+# audited" and "the fence ate it" become the same empty log. Once per process,
+# so a harness that audits two hundred times reads one line, not two hundred.
+_AUDIT_SOURCED_FENCE_SAID=""
+_audit_sourced_caller_fence() {
+  [[ -n "${_TASKS_STORE_ENTRY:-}" ]] && return 1
+  _audit_sink_is_live || return 1
+  if [[ -z "${_AUDIT_SOURCED_FENCE_SAID:-}" ]]; then
+    _AUDIT_SOURCED_FENCE_SAID=1
+    local msg="audit row withheld: this process sourced src/lib/audit.sh without entering through the 5dive CLI, and AUDIT_LOG is the live fleet log (${AUDIT_LOG:-<unset>}) — a sourced-library caller never writes there (DIVE-2249 class). If this is a test: point AUDIT_LOG under your throwaway STATE_DIR after sourcing src/header.sh, or stub audit_log. If you are genuinely driving prod, invoke the 5dive binary rather than sourcing its libraries."
+    if declare -F warn >/dev/null 2>&1; then warn "$msg"; else printf 'warn: %s\n' "$msg" >&2; fi
+  fi
+  return 0
+}
+
 # _emit_audit_line <ndjson-line> — append one line to the tamper-evident log
 # WITHOUT ever failing the caller or leaking to stderr.
 #
@@ -39,6 +104,9 @@ audit_init() {
 _emit_audit_line() {
   local line="$1"
   [[ -n "$line" ]] || return 0
+  # Fenced BEFORE the writability test: on the non-root path that test is what
+  # hands the row to sudo, and a sourced caller must never get that far.
+  _audit_sourced_caller_fence && return 0
   if [[ $EUID -eq 0 || -w "$AUDIT_LOG" ]]; then
     printf '%s\n' "$line" >> "$AUDIT_LOG" 2>/dev/null \
       || _audit_note_drop "$line" "direct-append-failed"
@@ -69,6 +137,9 @@ _emit_audit_line() {
 # the log, not for the actor.
 _audit_note_drop() {
   local line="$1" reason="$2"
+  # Same fence as the log itself: notify/ is 2770 by construction, so it is the
+  # one live surface a sourced NON-root caller can reach without sudo.
+  _audit_sourced_caller_fence && return 0
   local drops_dir="${AUDIT_LOG%/*}/notify"
   [[ -d "$drops_dir" ]] || return 0
   local drops="$drops_dir/audit-drops.log"
