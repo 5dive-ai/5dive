@@ -290,9 +290,133 @@ cmd_task_reclaim() {
      --arg s "$skipped" --arg f "$total_fail" --argjson rows "$rows"
 }
 
+# -------- `--help` ON A SUBVERB, ANSWERED IN ONE PLACE --------
+#
+# `5dive task --help` printed the surface above, but every SUBVERB refused the
+# flag. Each subverb parses its own flags, and 34 of those loops end in
+# `-*) fail "$E_USAGE" "unknown flag: $1"` — so `5dive task ls --help`, which is
+# what an operator types to ask a verb how it works, answered "unknown flag:
+# --help" and then printed the usage line of whatever the loop thought it was
+# doing, not of `ls`. The nearest thing to a verb-shaped answer anywhere in the
+# tree is `5dive self-update --help`, which at least says "takes no arguments".
+#
+# ANSWERED HERE, before the dispatch, rather than in those 34 flag loops: a
+# per-verb edit is 34 places to forget, and the 35th verb ships without it.
+#
+# THE TEXT IS NOT WRITTEN HERE EITHER. It is READ, at run time, from the two
+# places this project already keeps it:
+#
+#   1. the surface usage above, which documents 41 of the subverbs; failing that,
+#   2. the `usage: 5dive task <verb> …` literal the verb itself prints when you
+#      get its arguments wrong.
+#
+# So there is no third copy of the text to drift, and a verb documented in
+# NEITHER place is refused BY NAME rather than answered with an invented line —
+# which is the failure mode this whole change exists to remove.
+# tests/task_subverb_help_unit.sh walks the case statement below, label by
+# label, and grades every one of them through this path.
+
+# _task_help_wanted <args…> — do these args ASK for help? `--` ends the flags
+# (several subverbs honour it), and only the two exact spellings count: the
+# `--help` inside `--ask="… --help …"` is a VALUE, not a question.
+_task_help_wanted() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --)        return 1 ;;
+      -h|--help) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# _task_verb_arm <verb> — "<canonical spelling> <function>", read out of
+# cmd_task's OWN case statement at run time. Reading it back rather than
+# restating it here is what makes an alias (`list`, `view`, `close`, `gates`,
+# `new`, `delete`) answer with the usage of the verb it actually runs, with no
+# second alias list to rot — the same reason the pre-push rail extracts the
+# title regex from the workflow instead of carrying a copy (DIVE-4208).
+_task_verb_arm() {
+  declare -f cmd_task | awk -v v="$1" '
+    /^[[:space:]]+[^ (].*\)$/ {
+      lab = $0; sub(/\)[[:space:]]*$/, "", lab); gsub(/[[:space:]]/, "", lab)
+      n = split(lab, alt, "|")
+      for (i = 1; i <= n; i++) if (alt[i] == v) {
+        if ((getline body) > 0) { split(body, f, "[[:space:]]+"); fn = (f[1] == "" ? f[2] : f[1]) }
+        print alt[1] " " fn; exit
+      }
+    }'
+}
+
+# _task_verb_own_usage <function> <verb> — the `usage: 5dive task <verb> …` line
+# the verb prints itself when its arguments are wrong.
+_task_verb_own_usage() {
+  local fn="$1" verb="$2" body line
+  body=$(declare -f "$fn" 2>/dev/null) || return 1
+  # In the BUILT BUNDLE a lazy module is unparsed text until something calls into
+  # it (DIVE-4087), so `declare -f` here yields the one-line autoload STUB, which
+  # carries no usage text at all. Load the module the stub names, then read it
+  # again. The split tree has no stubs and never takes this branch — which is why
+  # the harness grades this path through a BUILT BUNDLE and not through src/.
+  if [[ "$body" == *_lazy_autoload* ]] && declare -F _load_module >/dev/null 2>&1; then
+    local mod="${body#*_lazy_autoload }"; mod="${mod%% *}"
+    _load_module "$mod" >/dev/null 2>&1 || return 1
+    body=$(declare -f "$fn" 2>/dev/null) || return 1
+  fi
+  line=$(printf '%s\n' "$body" | grep -o "usage: 5dive task ${verb}[^\"']*" | head -1) || true
+  [[ -n "$line" ]] || return 1
+  # A few of these literals are printf formats carrying a `\n` and a paragraph of
+  # prose after it; take the usage line and leave the escape unrendered.
+  printf '%s\n' "${line%%\\n*}"
+}
+
+# _task_subverb_help <verb> — print that verb's usage.
+#   0  printed it
+#   1  not a verb at all (the case below has better words for that than we do)
+#   2  a verb this tree documents NOWHERE — say so rather than invent a line
+_task_subverb_help() {
+  local verb="$1" arm primary fn out=""
+  arm=$(_task_verb_arm "$verb") || true
+  [[ -n "$arm" ]] || return 1
+  primary="${arm%% *}"; fn="${arm#* }"
+  out=$(_task_usage 2>/dev/null | awk -v v="$primary" '
+    /^  [a-z]/ {
+      blk = 0; n = split($1, alt, "|")
+      for (i = 1; i <= n; i++) if (alt[i] == v) blk = 1
+      if (!blk) next
+      if (seen++) { print; next }
+      line = $0; sub(/^  /, "", line)
+      printf "usage: 5dive task %s\n", line
+      next
+    }
+    /^   / { if (blk) print; next }
+    { blk = 0 }') || true
+  [[ -n "$out" ]] || out=$(_task_verb_own_usage "$fn" "$primary") || true
+  [[ -n "$out" ]] || return 2
+  printf '%s\n' "$out"
+}
+
+# _task_help_intercept <verb> <args…> — 0 when the args asked for help and it has
+# been answered. Kept out of cmd_task's body on purpose: _task_verb_arm reads
+# that body back as text, and a second `case` inside it would look like arms.
+_task_help_intercept() {
+  local verb="$1"; shift
+  _task_help_wanted "$@" || return 1
+  local rc=0
+  _task_subverb_help "$verb" || rc=$?
+  case $rc in
+    0) return 0 ;;
+    2) fail "$E_USAGE" "5dive task $verb: no usage text — the verb is documented neither in '5dive task --help' nor in its own arguments check" ;;
+  esac
+  return 1
+}
+
 cmd_task() {
   [[ $# -gt 0 ]] || { _task_usage; mark_reported; exit "$E_USAGE"; }
   local sub="$1"; shift
+  # `--help` after a subverb is a question about THAT verb, not an unknown
+  # flag. Answered before the dispatch; see the block above.
+  if _task_help_intercept "$sub" "$@"; then return 0; fi
   case "$sub" in
     init)            cmd_task_init "$@" ;;
     add|new)         cmd_task_add "$@" ;;
