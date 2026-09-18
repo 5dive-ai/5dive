@@ -893,6 +893,7 @@ cmd_task_verify() {
     # `|| true` covers a tree that sourced a subset of src/ without delivery.sh.
     if (( rc == 0 )); then
       local _md_dref _md_disp _md_owner _md_why
+      local _md_held=0
       _md_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
       if [[ -n "$_md_dref" ]] && declare -F _merge_disp_probe >/dev/null 2>&1; then
         _md_disp=$(_merge_disp_probe "$_md_dref" "$(_gate_graded_sha "$result_txt")" 2>/dev/null) \
@@ -943,6 +944,7 @@ cmd_task_verify() {
           # either; this half removes the trigger, that half makes the verb safe.
           _md_why="auto-mergeable at the graded sha — run \`5dive task merge ${ident}\`"
         else
+          _md_held=1
           _md_owner="${_md_disp#hold:}"; _md_why="${_md_owner#*:}"; _md_owner="${_md_owner%%:*}"
           # `maker` is a ROLE in the disposition's vocabulary, resolved to a seat
           # only here, where the row is in hand.
@@ -973,6 +975,51 @@ cmd_task_verify() {
         db "UPDATE tasks SET merge_owner=$(sqlq "${_md_owner:-}"),
                merge_hold_reason=$(sqlq "$_md_why")
             WHERE id=${id};" || true
+        # ---- upstream #1009: A HELD ROW MUST LAND SOMEWHERE, NOT JUST BE LABELLED ----
+        #
+        # Writing `merge_owner` names the seat that owes the merge and dispatches
+        # the row to NOBODY. Both pickers miss it: the assignee arm because the
+        # assignee is the grading seat (increasingly an ephemeral pool clone that
+        # is already gone), and the merge-owner arm at `cmd_heartbeat.sh:2097` —
+        # which is correct and exists for exactly this row — because the enclosing
+        # `WHERE t.status='todo'` filtered the row out one line earlier. The
+        # grading session STARTED the row and was torn down without resetting it,
+        # so it sits at `in_progress` forever, looking like an agent is busy on it.
+        # Measured by the maintainer on a live box: six rows graded ACCEPT, five
+        # with their pull requests already merged, ages up to three days.
+        #
+        # TWO COLUMNS, NOT ONE, and that is why this is not a one-line fix. Moving
+        # the assignee alone leaves `status='in_progress'` and BOTH pickers still
+        # filter the row out — it looks repaired and does not move. The maintainer
+        # verified exactly that with `task assign` on all five rows.
+        # `status='todo', started_at=NULL` is the pair `_hb_reclaim` already writes
+        # (`cmd_heartbeat.sh:2868`) and it restores the invariant
+        # `cmd_heartbeat.sh:5541` states in as many words: a delivered
+        # maker->verifier row sits at todo.
+        #
+        # WHY HERE AND NOT IN THE PICKER. The issue offers both and asks for one.
+        # Widening the picker would also need the CLAIM widened
+        # (`cmd_heartbeat.sh:2766` re-asserts `status='todo'`), putting two new
+        # conditions on the hot dispatch path — and it would leave the row reading
+        # `in_progress`, which is the field that made this look like work in flight
+        # for three days. Moving the assignee leaves ONE owner on the row.
+        #
+        # SCOPED TO A HOLD WITH A RESOLVED SEAT, on a row that is still open. An
+        # empty owner is left alone: `_tasks_merge_owner_sql` degrades an empty
+        # `merge_owner` to maker_agent and then to the assignee, and stamping a
+        # name the roster has never heard of is the DIVE-4571 defect this file
+        # already refuses to commit one branch above.
+        if (( ${_md_held:-0} )) && [[ -n "${_md_owner:-}" ]]; then
+          db "UPDATE tasks
+                 SET assignee=$(sqlq "$_md_owner"),
+                     status='todo',
+                     started_at=NULL,
+                     updated_at=datetime('now')
+               WHERE id=${id}
+                 AND status NOT IN ('done','cancelled');" || true
+          _task_store_audit_log "task.merge-hold-dispatched" ok 0 -- \
+            "$ident" "owner=$_md_owner reason=$_md_why"
+        fi
       fi
     fi
   fi

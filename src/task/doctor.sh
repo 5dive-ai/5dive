@@ -258,7 +258,12 @@ _task_doctor_reason_case_sql() {  # <bad-lanes-inlist> <bad-graders-inlist> [wit
                               WHERE d.task_id=tasks.id AND b.status NOT IN ('done','cancelled'))
            THEN 'stale-edge'
          WHEN parked_at IS NOT NULL AND wake_at IS NULL           THEN 'park-no-wake'
-         WHEN parked_at IS NOT NULL AND wake_at <= datetime('now') THEN 'wake-passed'"
+         WHEN parked_at IS NOT NULL AND wake_at <= datetime('now') THEN 'wake-passed'
+         WHEN status='in_progress'
+              AND kind='standard'
+              AND merge_hold_reason IS NOT NULL AND merge_hold_reason<>''
+              AND (${_TASKS_TFV_SQL})
+           THEN 'graded-merge-held'"
   [[ "$unassigned" == "1" ]] && out+="
          WHEN assignee IS NULL OR assignee='' THEN 'unassigned-no-coordinator'"
   [[ -z "$lanes"   ]] || out+="
@@ -273,6 +278,10 @@ _task_doctor_reason_case_sql() {  # <bad-lanes-inlist> <bad-graders-inlist> [wit
 _task_doctor_board_sql() {
   printf 'SELECT ident, status, COALESCE(assignee,%s) AS assignee,\n' "''"
   printf '       %s AS reason,\n' "$(_task_doctor_reason_case_sql '' '' 0)"
+  # upstream #1009 acceptance 3: the report must NAME THE SEAT THAT OWES THE
+  # MERGE, not only the shape. The board's own owner expression, so this line and
+  # the picker's merge-owner arm cannot disagree about who is owed.
+  printf '       %s AS owes_merge,\n' "$(_tasks_merge_owner_sql '')"
   cat <<'SQL'
        COALESCE(wake_at,'') AS wake_at,
        (SELECT GROUP_CONCAT(b.ident || '/' || b.status, ' ') FROM task_deps d JOIN tasks b ON b.id=d.blocked_by
@@ -297,6 +306,7 @@ _task_doctor_explain() {
     park-no-wake) printf '%s' "parked with NO wake time — it will never revisit itself. -> 5dive task unpark <id>, or re-park with a --wake" ;;
     unassigned-no-coordinator) printf '%s' "no assignee, so no tick ever reaches it - the heartbeat iterates SEATS and hands each one its own rows, and this row is on no seat. -> 5dive task assign <id> <agent>   (roster: 5dive agent list). If the board keeps producing these, the chart resolves no coordinator for filing to default to: 5dive org set <agent> --role='<their prose> coordinator'" ;;
     dead-lane)    printf '%s' "assigned to a seat the heartbeat tick never wakes (heartbeat disabled or absent) — nothing will pick it up. -> 5dive task assign <id> <agent>   (roster: 5dive agent list)" ;;
+    graded-merge-held) printf '%s' "graded ACCEPT and HELD for a merge, at status=in_progress - so NO tick reaches it. Both pickers are scoped to status='todo' (cmd_heartbeat.sh:2076/:2085), so the merge-owner arm at :2097 that exists for exactly this row never runs, and the assignee is the grading seat, often an ephemeral clone that is already gone. The work shipped; only the bookkeeping stalled. -> the seat named below runs 5dive task merge <id>. A row that predates this fix is still at in_progress and nothing will dispatch it: re-record the grade (5dive task verify <id> --no-done --cmd=<the acceptance test>), which now hands the row to that seat and puts the status back." ;;
     dead-verifier) printf '%s' "GRADER nothing wakes: this row dispatches fine and STRANDS AT HANDOFF, not now — \`task done\` writes assignee=<verifier>, so the maker spends the whole task first and the delivery goes to a seat no tick will ever iterate. -> 5dive task verifier <id> <agent>   (roster: 5dive agent list)" ;;
     *)            printf '%s' "undispatchable" ;;
   esac
@@ -671,7 +681,7 @@ cmd_task_doctor() {
 
   # Read the JSON back rather than raw `db` output: the default `|` separator
   # would split any title containing one.
-  local out="" line ident st asg reason wake blockers title grader
+  local out="" line ident st asg reason wake blockers title grader owes
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     ident=$(printf '%s' "$line"   | jq -r '.ident')
@@ -682,10 +692,12 @@ cmd_task_doctor() {
     blockers=$(printf '%s' "$line"| jq -r '.blockers // ""')
     title=$(printf '%s' "$line"   | jq -r '.title // ""')
     grader=$(printf '%s' "$line"  | jq -r '.grader // ""')
+    owes=$(printf '%s' "$line"    | jq -r '.owes_merge // ""')
     out+="  ${ident}  [${st}${asg:+ · }${asg}]  ${reason}"$'\n'
     out+="        ${title}"$'\n'
     out+="        $(_task_doctor_explain "$reason")"$'\n'
     [[ "$reason" == "dead-verifier" && -n "$grader" ]] && out+="        verifier: ${grader}  (nothing wakes it; the row itself is dispatchable)"$'\n'
+    [[ "$reason" == "graded-merge-held" && -n "$owes" ]] && out+="        owes the merge: ${owes}  (the seat this row should have been dispatched to)"$'\n'
     [[ -n "$wake"     ]] && out+="        wake_at: ${wake}Z"$'\n'
     [[ -n "$blockers" ]] && out+="        blockers: ${blockers}"$'\n'
   done < <(printf '%s' "$findings" | jq -c '.[]')
