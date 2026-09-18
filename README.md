@@ -339,6 +339,17 @@ sudo 5dive agent create agent-a --type=claude --auth-profile=work
 sudo 5dive agent create agent-b --type=claude --auth-profile=work
 ```
 
+`login` is the interactive OAuth flow. For a bring-your-own provider key, `account set` configures the profile directly — no agent required:
+
+```sh
+sudo 5dive account add or-alpha
+printf '%s' "$OPENROUTER_API_KEY" | sudo 5dive account set or-alpha \
+  --type=claude --provider=openrouter --api-key=- --model=stealth/union-alpha
+sudo 5dive agent set-account coder or-alpha
+```
+
+Pass the key on stdin with `--api-key=-`: a literal `--api-key=<value>` works but is visible in `ps` while the call runs and lands in shell history. Replacing credentials a profile already carries needs `--replace`, and the replace is audited — the row names the profile and the provider, never the key.
+
 Rename or rotate the account, every bound agent rebinds automatically. `5dive account usage` shows each account's rate-limit headroom.
 
 ### One bot for the whole team

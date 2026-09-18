@@ -256,6 +256,9 @@ Accounts (a named auth profile — group sign-ins so multiple agents share one l
   5dive account usage                                  # per-account 5h/7d limit usage (dashboard dots + /usage)
   5dive account add <name>                             # create empty account; sign in next
   5dive account login <name> --type=<type>             # interactive TTY login into an account
+  5dive account set <name> --type=<type> --provider=<id> --api-key=-
+                                                       # BYO provider key on an account, no agent needed;
+                                                       # key on stdin, --replace to overwrite existing creds
   5dive account rename <old> <new>                     # repoints all bound agents + restarts them
   5dive account remove <name>                          # refuses if any agents still bound
 
@@ -1007,7 +1010,7 @@ main() {
       AUDIT_CMD="agent rm"; AUDIT_ARGS=("$@")
       with_registry_lock cmd_rm "$@" ;;
     account)
-      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|usage|add|rename|remove|login|set-active-provider"
+      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|usage|add|rename|remove|login|set|set-active-provider"
       local acctcmd="$1"; shift
       case "$acctcmd" in
         list)   cmd_account_list "$@" ;;
@@ -1027,6 +1030,12 @@ main() {
           # EXIT trap won't fire after exec.
           audit_log "account login" "started" 0 -- "$@"
           cmd_account_login "$@" ;;
+        set)
+          # A BYO credential write: mutating, so it is audited and takes the
+          # registry lock like `add`/`rename`/`remove`. `audit_log` redacts
+          # `--api-key=` before anything reaches the log (src/lib/audit.sh).
+          AUDIT_CMD="account set"; AUDIT_ARGS=("$@")
+          with_registry_lock cmd_account_set "$@" ;;
         set-active-provider)
           AUDIT_CMD="account set-active-provider"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_account_set_active_provider "$@" ;;
