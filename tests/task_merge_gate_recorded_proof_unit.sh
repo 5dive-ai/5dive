@@ -224,6 +224,13 @@ seed()      { db "INSERT INTO tasks (ident, title, body, status, created_by, ass
                     VALUES ('$1','t','','in_progress','main','main');"; }
 bind_pr()   { db "UPDATE tasks SET delivery_ref='$2', delivered_at=datetime('now') WHERE ident='$1';"; }
 statusof()  { db "SELECT status FROM tasks WHERE ident='$1';"; }
+# upstream #1009: the four arms below are named "the row stays open" and used to assert that
+# by testing for the literal `in_progress`. That literal was ENCODING THE STRANDING the issue
+# reports: a graded row held for a merge was left at in_progress, which is exactly what made
+# it invisible to both heartbeat pickers. The hold now puts the status pair back
+# (status='todo', started_at=NULL) so the merge owner's tick can reach it, and these arms
+# assert what their own names say instead of one particular open status.
+openof()    { case "$(statusof "$1")" in done|cancelled) printf 'closed' ;; '') printf 'missing' ;; *) printf 'open' ;; esac; }
 slugof()    { db "SELECT COALESCE(policy,'') FROM policy_refusals WHERE ident='$1' ORDER BY id DESC LIMIT 1;"; }
 proofof()   { db "SELECT COALESCE(merge_proof_at,'')||'|'||COALESCE(merge_proof_ref,'')||'|'||COALESCE(merge_proof_by,'')||'|'||COALESCE(merge_proof_cmd,'') FROM tasks WHERE ident='$1';"; }
 run_done()  { OUT=$(cmd_task_done "$@" 2>&1); RC=$?; }
@@ -314,7 +321,7 @@ run_verify D-1 --no-done --merge-proof --cmd='true'
 bind_pr D-1 "$OTHER_PR"     # re-delivered against a different PR
 run_done D-1 --result='landed'
 chk "T3 a stale proof does not close the row" "$((RC != 0))" "1"
-chk "T3 and the row stays open"               "$(statusof D-1)" "in_progress"
+chk "T3 and the row stays open"               "$(openof D-1)" "open"
 chk "T3 on the no-credential refusal"         "$(slugof D-1)" "done-merge-gate-no-credential"
 
 # ---------------------------------------------------------------------------
@@ -392,7 +399,7 @@ sub "T9 and it is stamped against the public binding" "$(proofof I-1)" "|$PUBLIC
 : >"$CURL_ARGS_LOG"
 run_done I-1 --result='landed'
 chk "T9 an UNMERGED public PR is not closed by a proof" "$((RC != 0))" "1"
-chk "T9 and the row stays open"                        "$(statusof I-1)" "in_progress"
+chk "T9 and the row stays open"                        "$(openof I-1)" "open"
 nsub "T9 the proof did not close it"                   "$OUT" "RECORDED MACHINE EVIDENCE"
 sub "T9 the refusal quotes the MEASURED state"         "$OUT" "state=OPEN"
 sub "T9 and the rail was actually asked"               "$(cat "$CURL_ARGS_LOG")" "pulls/999"
@@ -461,7 +468,7 @@ run_verify K-2 --no-done --merge-proof --cmd='true'
 : >"$CURL_ARGS_LOG"
 run_done K-2 --result='landed'
 chk "T10b an OPEN PR an escalation rail CAN read is not closed by a proof" "$((RC != 0))" "1"
-chk "T10b and the row stays open"               "$(statusof K-2)" "in_progress"
+chk "T10b and the row stays open"               "$(openof K-2)" "open"
 nsub "T10b the proof did not close it"          "$OUT" "RECORDED MACHINE EVIDENCE"
 sub "T10b the refusal quotes the MEASURED state" "$OUT" "state=OPEN"
 sub "T10b and the escalation rail was asked"    "$(cat "$CURL_ARGS_LOG")" "pulls/998"
@@ -477,7 +484,7 @@ seed K-3; bind_pr K-3 "$PRIVATE_PR"
 run_verify K-3 --no-done --merge-proof --cmd='true'
 run_done K-3 --result='landed'
 chk "T10c a working token is not overridden by a proof" "$((RC != 0))" "1"
-chk "T10c and the row stays open"               "$(statusof K-3)" "in_progress"
+chk "T10c and the row stays open"               "$(openof K-3)" "open"
 nsub "T10c the proof was never consulted"       "$OUT" "RECORDED MACHINE EVIDENCE"
 sub "T10c the refusal quotes the token's answer" "$OUT" "state=OPEN"
 unset GH_STUB_BLIND GH_STUB_STATE

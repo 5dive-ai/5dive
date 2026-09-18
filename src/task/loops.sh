@@ -893,6 +893,7 @@ cmd_task_verify() {
     # `|| true` covers a tree that sourced a subset of src/ without delivery.sh.
     if (( rc == 0 )); then
       local _md_dref _md_disp _md_owner _md_why
+      local _md_held=0 _md_asg=''
       _md_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
       if [[ -n "$_md_dref" ]] && declare -F _merge_disp_probe >/dev/null 2>&1; then
         _md_disp=$(_merge_disp_probe "$_md_dref" "$(_gate_graded_sha "$result_txt")" 2>/dev/null) \
@@ -943,6 +944,7 @@ cmd_task_verify() {
           # either; this half removes the trigger, that half makes the verb safe.
           _md_why="auto-mergeable at the graded sha — run \`5dive task merge ${ident}\`"
         else
+          _md_held=1
           _md_owner="${_md_disp#hold:}"; _md_why="${_md_owner#*:}"; _md_owner="${_md_owner%%:*}"
           # `maker` is a ROLE in the disposition's vocabulary, resolved to a seat
           # only here, where the row is in hand.
@@ -973,6 +975,61 @@ cmd_task_verify() {
         db "UPDATE tasks SET merge_owner=$(sqlq "${_md_owner:-}"),
                merge_hold_reason=$(sqlq "$_md_why")
             WHERE id=${id};" || true
+        # ---- upstream #1009: A HELD ROW MUST LAND SOMEWHERE, NOT JUST BE LABELLED ----
+        #
+        # Writing `merge_owner` named the seat that owed the merge and dispatched
+        # the row to NOBODY. Both pickers missed it: the assignee arm because the
+        # assignee is the grading seat (increasingly an ephemeral pool clone that
+        # is already gone), and the merge-owner arm at `cmd_heartbeat.sh:2097` —
+        # which exists for exactly this row and is correct — because the enclosing
+        # `WHERE t.status='todo'` filtered the row out one line earlier. The
+        # grading session STARTED the row and was torn down without resetting it,
+        # so it sat at `in_progress` looking like work in flight. Measured by the
+        # maintainer: six rows graded ACCEPT, five with their pull requests
+        # already merged, ages up to three days.
+        #
+        # (1) THE STATUS PAIR IS THE OPERATIVE HALF, and it is unconditional.
+        # `status='todo', started_at=NULL` is the pair `_hb_reclaim` already
+        # writes (`cmd_heartbeat.sh:2868`) and it restores the invariant
+        # `cmd_heartbeat.sh:5541` states outright: a delivered maker->verifier row
+        # sits at todo. With the row back at todo the merge-owner arm at :2097
+        # reaches it ON ITS OWN — that arm keys on `merge_owner`, not on the
+        # assignee — so acceptance 1 needs no ownership change at all, and the
+        # claim at `:2766` (which re-asserts `status='todo'`) keeps working
+        # unmodified.
+        #
+        # (2) THE ASSIGNEE MOVES ONLY WHEN THE SEAT IS GONE. That is acceptance 2
+        # read literally: "never keeps that clone as assignee ONCE THE CLONE IS
+        # GONE". Moving it unconditionally would be a second, wider change wearing
+        # this one's clothes — it takes a row away from a LIVE maker, which
+        # `tests/task_delivery_evidence_unit.sh` asserts against by name ("the row
+        # was NOT routed away from the maker") for a `--review=check` row whose
+        # maker is the seat that must keep it. A row whose assignee is alive is
+        # not stranded and does not need rescuing.
+        #
+        # DEGRADE, NEVER GUESS: if the roster cannot be read, the assignee is left
+        # alone. An unreadable registry is not evidence that a seat is gone, and
+        # the status half above already restores dispatch either way. Same posture
+        # as `task doctor`'s lane check, which skips rather than calling every
+        # lane dead when the roster is unknown.
+        db "UPDATE tasks
+               SET status='todo',
+                   started_at=NULL,
+                   updated_at=datetime('now')
+             WHERE id=${id}
+               AND status NOT IN ('done','cancelled');" || true
+        _md_asg=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+        if (( ${_md_held:-0} )) && [[ -n "${_md_owner:-}" && "$_md_asg" != "$_md_owner" ]] \
+           && _task_seat_is_gone "$_md_asg"; then
+          db "UPDATE tasks
+                 SET assignee=$(sqlq "$_md_owner"),
+                     updated_at=datetime('now')
+               WHERE id=${id}
+                 AND status NOT IN ('done','cancelled');" || true
+          _task_store_audit_log "task.merge-hold-reassigned" ok 0 -- \
+            "$ident" "from=${_md_asg:-<none>} to=$_md_owner reason=$_md_why"
+          warn "$ident: assignee '${_md_asg:-<none>}' is not on the roster — handed to '${_md_owner}', the seat that owes the merge."
+        fi
       fi
     fi
   fi
