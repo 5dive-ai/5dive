@@ -210,6 +210,43 @@ fail() {
 die()  { fail "$E_GENERIC" "$@"; }
 warn() { echo "warn: $*" >&2; }
 
+# defer_write_note <message> / _five_flush_write_notes — a warn that is composed at
+# the point where its evidence exists and printed at the point where its claim is
+# true. Deferred notes that are never flushed are simply never said.
+#
+# THE DEFECT THIS EXISTS FOR. `_task_guard_result_over_closed` composes the merged
+# result and says "this row already carried a result and it was PRESERVED, not
+# replaced — N bytes kept above your text" AT THE MOMENT IT COMPOSES IT, which is
+# before every close guard that can still refuse: the merge-pending guard
+# (DIVE-4520) and the done-before-pr-merged refusal (DIVE-1830) both fire after
+# it. So on a refused close the operator read a sentence asserting a write, then a
+# refusal, and the row's result was byte-identical to before. Measured twice on
+# 2026-09-18 at 7597 and 9237 bytes, both unchanged; two makers believed their
+# post-delivery notes were on the row.
+#
+# WHY DEFER RATHER THAN MOVE THE LINE. The byte count is only in hand where the
+# guard composes the text — once any caller has written the row, the previous
+# bytes are gone. So the sentence stays where its evidence is and only the CLAIM
+# is postponed, to the write sites, which are the callers that know it came true.
+#
+# WHY NOT FLUSH FROM `ok()`, which was iteration 1 here and reads like the obvious
+# single point: `ok` is a two-letter name that the test suite itself redefines as
+# a PASS counter — `tests/task_result_loss_open_row_unit.sh` shadows it and then
+# calls `cmd_task_done` in-process, so the product's `ok` never runs and the
+# announcement vanished from the very harness that exists to pin it. A flush point
+# a caller can shadow is not a flush point. The EXIT trap has the same shape of
+# problem from the other side: it never fires for an in-process `cmd_*` call at
+# all. The write sites fire in both worlds.
+_FIVE_WRITE_NOTES=()
+
+defer_write_note() { _FIVE_WRITE_NOTES+=("$1"); }
+_five_flush_write_notes() {
+  (( ${#_FIVE_WRITE_NOTES[@]} )) || return 0
+  local _n
+  for _n in "${_FIVE_WRITE_NOTES[@]}"; do warn "$_n"; done
+  _FIVE_WRITE_NOTES=()
+}
+
 # step <message>
 # Progress chatter (what the old script printed as `echo "==> ..."`). Always
 # goes to stderr so JSON stdout stays parseable. In text mode the user still

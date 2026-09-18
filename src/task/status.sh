@@ -28,6 +28,9 @@ _task_guard_result_over_closed() {
   local id="$1" ident="$2" verb="$3" result="$4"
   local append_result="${5:-0}" force_result="${6:-0}" policy="${7:-done-over-closed-result}"
   _TASK_GUARDED_RESULT="$result"
+  # Entry clears any note a previous call in this process deferred: the count it
+  # carries belongs to that call's read of the column, not to this one's.
+  _FIVE_WRITE_NOTES=()
   local _cl_st _cl_prev
   _cl_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
   _cl_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
@@ -129,7 +132,12 @@ _task_guard_result_over_closed() {
       # The byte count is not decoration: it is the cheapest thing that makes the
       # claim falsifiable at a glance — a reader who expected 2.6KB and sees 40
       # knows to look, and one who sees nothing at all never does.
-      warn "$ident: this row already carried a result and it was PRESERVED, not replaced — ${#_cl_prev} bytes kept above your text, under a dated seam (DIVE-2483). Run '5dive task show $ident' to read both, or '5dive trace $ident' for who wrote the earlier one."
+      # DEFERRED, not printed: this sentence asserts a write, and every close
+      # guard that can still refuse runs after this point (DIVE-4520 at :234,
+      # DIVE-1830's done-before-pr-merged). `ok` prints it if the write happens;
+      # a refusal exits through `fail` and it is never said. The claim is the
+      # same, and it is now true when it is made.
+      defer_write_note "$ident: this row already carried a result and it was PRESERVED, not replaced — ${#_cl_prev} bytes kept above your text, under a dated seam (DIVE-2483). Run '5dive task show $ident' to read both, or '5dive trace $ident' for who wrote the earlier one."
     fi
   fi
   _TASK_GUARDED_RESULT="$result"
@@ -2191,6 +2199,7 @@ $_body"
     set_result=", result=$(sqlq_or_null "$result")"
   fi
   db "UPDATE tasks SET status=$(sqlq "$newstatus")${extra}${set_result} WHERE id=${id};"
+  _five_flush_write_notes   # the close is written: any deferred PRESERVED note is now true
   # DIVE-3349: the SESSION SEGMENT, written from the one funnel every status verb
   # crosses and immediately after the status write it describes — the same reason
   # the audit row and the ledger row below sit here rather than in each verb: a
