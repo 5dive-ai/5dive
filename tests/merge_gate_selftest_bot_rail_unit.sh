@@ -82,9 +82,36 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
+# --- THE PERMISSION HALF IS SEAMED, and this is the correction that matters -----
+# `_gate_gh_bot_ok` short-circuits on `[[ -x /usr/local/bin/5dive ]]` — a HOST fact
+# that no stub in this file reaches. On a developer box the installed CLI is there
+# and every cell below runs; on a CI runner it is not, and the first version of this
+# file went green here and RED IN CI with 14 arms failing, because `_gate_gh_bot_ok`
+# answered "no" whatever the stubbed sudo said. A harness whose central arms only run
+# where the product happens to be installed has not graded them.
+#
+# So the permission half is a seam. That is legitimate here because it is not what
+# this file is about: the defect is that permission was READ AS presence, so what has
+# to be graded is the CONJUNCTION and the three strings it produces. The real
+# `_gate_gh_bot_ok` — sudoers, the -x gate, the installed path — is graded by
+# tests/builder_gh_rail_unit.sh, which owns it and names its own skip. P1 below still
+# exercises the real one wherever the host allows, so the seam cannot hide a drift.
+_gate_gh_bot_ok() { [[ "${SUDO_STUB_BOT:-0}" == "1" ]]; }
+
 # Each cell is just the two stub answers. The predicate deliberately holds NO state
 # between calls — see T6, which is the arm that pins that.
 cell() { export SUDO_STUB_BOT="$1" SUDO_STUB_PROBE="$2"; }
+
+# P1: the real predicate, wherever this host can run it. Named, not silent, so a
+# runner that cannot reach it says so instead of reporting a green it did not earn.
+if [[ -x /usr/local/bin/5dive ]]; then
+  ( unset -f _gate_gh_bot_ok; source "$SRC/task/gate_evidence.sh" 2>/dev/null
+    export SUDO_STUB_BOT=1; _gate_gh_bot_ok ) \
+    && ok_t "P1 the REAL _gate_gh_bot_ok answers yes through the stubbed sudo on this host (the seam below is a stand-in for this, not a divergence from it)" \
+    || bad_t "P1 real predicate" "the real _gate_gh_bot_ok said no with the grant stubbed yes"
+else
+  ok_t "P1 SKIPPED-BY-DESIGN: /usr/local/bin/5dive is not executable here, so the real _gate_gh_bot_ok cannot be exercised; tests/builder_gh_rail_unit.sh owns that predicate and names the same limit"
+fi
 
 # --- 1. THE CROSS ------------------------------------------------------------
 cell 1 1
@@ -124,14 +151,21 @@ cell 0 1
 # --- 2. THE PROBE IS ASKED AT ALL, AND ONLY AS A PROBE -----------------------
 cell 1 0
 : >"$SUDO_CALLS"; _gate_gh_bot_present
-grep -q -- '-l ' "$SUDO_CALLS" \
-  && ok_t "T5 the permission question is still asked (sudo -n -l ...)" || bad_t "T5" "$(cat "$SUDO_CALLS")"
 grep -q '_gh_do' "$SUDO_CALLS" \
-  && ok_t "T5a ...AND a second call goes to _gh_do — the presence question, which is the half that did not exist" \
-  || bad_t "T5a probe must be asked" "$(cat "$SUDO_CALLS")"
-[[ "$(grep -c '_gh_do' "$SUDO_CALLS")" == "2" ]] \
-  && ok_t "T5b ...two calls per answer and no more: the permission question and the presence question" \
-  || bad_t "T5b" "calls=[$(cat "$SUDO_CALLS")]"
+  && ok_t "T5 the presence question IS asked — a sudo call to _gh_do, which is the half that did not exist before" \
+  || bad_t "T5 probe must be asked" "$(cat "$SUDO_CALLS")"
+[[ "$(grep -c -- '--probe' "$SUDO_CALLS")" == "0" ]] \
+  && ok_t "T5a ...with the sentinel on STDIN, never in the argv, so it cannot reach gh even by accident" \
+  || bad_t "T5a probe must not be an argv flag" "$(cat "$SUDO_CALLS")"
+[[ "$(grep -c '_gh_do' "$SUDO_CALLS")" == "1" ]] \
+  && ok_t "T5b ...exactly one probe per answer" || bad_t "T5b" "calls=[$(cat "$SUDO_CALLS")]"
+# SHORT-CIRCUIT: a seat that may not route is not asked about a credential it could
+# not use. This is what makes the conjunction an AND rather than two reports.
+cell 0 1
+: >"$SUDO_CALLS"; _gate_gh_bot_present
+[[ "$(grep -c '_gh_do' "$SUDO_CALLS")" == "0" ]] \
+  && ok_t "T5c SHORT-CIRCUIT: with no permission the probe is not asked at all — no wasted sudo, and no question about a rail this seat cannot use" \
+  || bad_t "T5c" "calls=[$(cat "$SUDO_CALLS")]"
 
 # T6 PINS THE ABSENCE OF CACHING, and it is here because the first version of this fix
 # memoised the answer in a process-scoped variable. That looks free — neither half changes
@@ -229,12 +263,15 @@ mdiff=$(diff "$ROOT/src/task/gate_evidence.sh" "$MUT" | grep -c '^[<>]')
   || bad_t "M0 differential" "changed=$mdiff"
 bash -n "$MUT" && ok_t "M0a ...and is still valid bash" || bad_t "M0a" ""
 ( source "$MUT" 2>/dev/null
-  export SUDO_STUB_BOT=1 SUDO_STUB_PROBE=0; _GATE_BOT_PRESENT=""
+  # re-seam: sourcing the mutant reinstated the real, host-dependent predicate
+  _gate_gh_bot_ok() { [[ "${SUDO_STUB_BOT:-0}" == "1" ]]; }
+  export SUDO_STUB_BOT=1 SUDO_STUB_PROBE=0
   [[ "$(_gate_gh_bot_state)" == "available" ]] ) \
   && ok_t "M1 MUTANT — T2a is RED on it: permitted-with-no-credential reads 'available' again. The defect, live." \
   || bad_t "M1 mutant must reproduce the defect" ""
 ( source "$MUT" 2>/dev/null
-  export SUDO_STUB_BOT=1 SUDO_STUB_PROBE=1; _GATE_BOT_PRESENT=""
+  _gate_gh_bot_ok() { [[ "${SUDO_STUB_BOT:-0}" == "1" ]]; }
+  export SUDO_STUB_BOT=1 SUDO_STUB_PROBE=1
   [[ "$(_gate_gh_bot_state)" == "available" ]] ) \
   && ok_t "M2 ...while the credential-present cell reads the same on the mutant, so it differs in exactly the defect's cell (T1a green on it)" \
   || bad_t "M2" ""
