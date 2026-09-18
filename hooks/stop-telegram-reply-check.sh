@@ -11,20 +11,26 @@
 # the safety net.
 #
 # Decision tree (when had_inbound this turn):
-#   reply/edit_message sent this turn        → exit clean (proper channel used;
-#                                              any loose transcript text is just
-#                                              narration — do NOT relay it)
+#   reply/edit_message/react this turn       → exit clean (the channel was
+#                                              reached; any loose transcript
+#                                              text is narration — do NOT
+#                                              relay it)
 #   no send, transcript text present         → curl "(auto-relay) <text>"
 #                                              (genuine "talked to the
 #                                              transcript instead of replying")
-#   no send, no text, react-only             → exit clean (intentional ack)
+#   no send, no text, download_attachment    → exit clean (tool-only turn)
 #   no send, no text, no tool, first time    → JSON {decision:"block"} (retry)
 #   no send, no text, no tool, re-entry      → curl enriched diagnostic
 #
-# A "send" is reply OR edit_message — react/download_attachment don't count,
-# since a 👍 isn't a text answer. Deciding at the turn level (did the agent
-# reach the proper channel at all?) rather than per-text-block is what stops
-# preambles and end-of-turn summaries leaking out after the real reply.
+# A "send" is reply, edit_message OR react. A reaction is a deliberate act on
+# the channel — the house rule is to react to an acknowledgement rather than
+# reply to it — so the turn that placed one has ANSWERED, and its end-of-turn
+# recap is narration like any other. The net exists for the turn that never
+# touched Telegram at all, and that turn still relays. download_attachment is
+# not a send: it reads FROM the channel and says nothing back.
+# Deciding at the turn level (did the agent reach the proper channel at all?)
+# rather than per-text-block is what stops preambles and end-of-turn summaries
+# leaking out after the real reply.
 #
 # Loop safety (three layers — any one is sufficient):
 #   1. payload.stop_hook_active=true set by the harness on Stop re-invocation
@@ -120,10 +126,11 @@ fi
 #     embedded in a tool_result) contains a telegram <channel> block. The
 #     channel plugin injects "A message arrived while you were working"
 #     system-reminders into tool_results, so mid-turn inbounds count.
-#   - had_telegram_tool_call: any assistant tool_use called one of the
-#     mcp__plugin_telegram_telegram__{reply,react,edit_message} tools. Any
-#     of those satisfies the "something reached Telegram" rule — a pure
-#     reaction-only turn (e.g. acking a status ping) is intentional.
+#   - had_telegram_tool_call: any assistant tool_use called ANY
+#     mcp__plugin_telegram_telegram__ tool, download_attachment included.
+#     It is the weaker predicate, and after the react fix below it only
+#     still decides the no-text case — a download-only turn is intentional
+#     and must not be blocked or diagnosed.
 #   - texts: every non-empty assistant text block in the turn, in order.
 #     We auto-relay every block past relayed_count from the state file;
 #     joining all-unrelayed beats picking just the last one, which used
@@ -165,7 +172,8 @@ analysis=$(jq -s --arg tg "$TG_PREFIX" '
           | (.message.content // [])[]?
           | select(.type == "tool_use"
                    and ((.name == ($tg + "reply"))
-                        or (.name == ($tg + "edit_message"))))
+                        or (.name == ($tg + "edit_message"))
+                        or (.name == ($tg + "react"))))
         ] | length > 0
       ),
       texts: (
@@ -212,11 +220,18 @@ message_id=$(printf '%s' "$analysis" | jq -r '.last_message_id // ""')
 [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || exit 0
 
 # Turn-level rule (the fix for narration leaking out after the real reply):
-# if the agent delivered text through the proper channel — reply or
-# edit_message — anywhere in this turn, then every loose assistant transcript
-# block is narration (preamble, progress notes, end-of-turn summary), NOT a
-# missed answer. Suppress all auto-relay. Deciding per-turn instead of
-# per-text-block is what stops summaries arriving after the answer.
+# if the agent reached the proper channel anywhere in this turn — reply,
+# edit_message or react — then every loose assistant transcript block is
+# narration (preamble, progress notes, end-of-turn summary), NOT a missed
+# answer. Suppress all auto-relay. Deciding per-turn instead of per-text-block
+# is what stops summaries arriving after the answer.
+#
+# react is here rather than in the react-only branch further down on purpose:
+# that branch is reached only when the turn produced NO text, and the harness
+# asks for an end-of-turn recap, so a turn that acked with 👍 and then wrote
+# one word of recap fell through to auto-relay and shipped the recap to the
+# chat. Counting the reaction as the answer fixes it where the question is
+# actually asked, instead of leaving had_send describing something it is not.
 if [[ "$had_send" == "true" ]]; then
   exit 0
 fi
