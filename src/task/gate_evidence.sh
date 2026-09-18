@@ -981,9 +981,18 @@ _gate_gh() {
       # rails below it — reached only from a call that failed blind, returns the
       # original status and empty stdout if it also fails, so it can only convert an
       # unanswered query into an answered one.
-      local _own _otok _oout="" _orc=0
+      #
+      # DIVE-4606: `_otxt` carries the WORDING for the reason line below. It exists
+      # because the reason line used to spell its two cases as
+      # `${_otok:+tried}${_otok:-absent}` on the SAME name — and `:-` is not the else
+      # of `:+`: when `_otok` is set and non-empty it expands to THE TOKEN. Every
+      # blind-repo failure on a seat holding an owner-scoped token therefore printed
+      # that token into the warn. Two states, two names; never re-derive a message
+      # from the variable that holds the credential.
+      local _own _otok _oout="" _orc=0 _otxt=""
       _own="$(_gate_owner_from_args "$@")"
       if [[ -n "$_own" ]] && _otok="$(_gate_owner_read_token "$_own")" && [[ "$_otok" != "$tok" ]]; then
+        _otxt="was tried and could not answer"
         local -a _obound=(); [[ "$secs" != "0" ]] && _obound=(timeout "${secs}s")
         _oout=$(GH_TOKEN="$_otok" GH_CONFIG_DIR="$(gh_config_dir)" "${_obound[@]}" gh "$@" 2>/dev/null) || _orc=$?
         if (( _orc == 0 )) && [[ -n "$_oout" ]]; then
@@ -992,6 +1001,14 @@ _gate_gh() {
           rm -f "$_errf" 2>/dev/null || true
           printf '%s' "$_oout"
           return 0
+        fi
+      elif [[ -n "$_own" ]]; then
+        # The two ways the arm is not reached, told apart by which one happened —
+        # not by re-reading `_otok`, which is the credential itself.
+        if [[ -z "$_otok" ]]; then
+          _otxt="is not present on this seat"
+        else
+          _otxt="is the same credential that just failed, so it was not sent again"
         fi
       fi
       local _esc_out="" _esc_rc=0 _esc_err="" _escerrf
@@ -1010,7 +1027,7 @@ _gate_gh() {
         printf '%s' "$_esc_out"
         return 0
       fi
-      _GATE_GH_LAST_ERR="the caller's own credential cannot see this repository (${_blind}); the seat's owner-scoped read token for '${_own:-?}' ${_own:+was ${_otok:+tried and could not answer}${_otok:-not present on this seat}}, and the credential-free rails were tried too and could not answer: ${_esc_err}"
+      _GATE_GH_LAST_ERR="the caller's own credential cannot see this repository (${_blind}); the seat's owner-scoped read token for '${_own:-?}' ${_otxt}, and the credential-free rails were tried too and could not answer: ${_esc_err}"
       _gate_gh_publish_err
       rm -f "$_errf" 2>/dev/null || true
       printf ''

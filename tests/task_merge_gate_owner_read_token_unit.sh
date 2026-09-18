@@ -213,5 +213,71 @@ sub "T6 and names the owner arm it tried"      "$_GATE_GH_LAST_ERR" "owner-scope
 UNEXPECTED="$(grep -vxE 'ghs_blind|ghs_works|tok-lodar|tok-5dive-ai|<none>' "$TOK_ALL" | sort -u | tr '\n' ' ')"
 chk "T7 every token gh saw was written by this harness" "$UNEXPECTED" ""
 
+# ---------------------------------------------------------------------------
+# T8 — DIVE-4606: THE REASON LINE MUST NOT CONTAIN THE CREDENTIAL.
+#
+# The reason line spelled its two cases as `${_otok:+tried}${_otok:-absent}` on the
+# SAME name. `:-` is not the else of `:+` — on a seat that HOLDS the owner token the
+# second expansion is the TOKEN ITSELF, so every blind-repo failure printed a live
+# `ghs_` credential into the warn `task done` shows (observed 2026-09-18 on DIVE-4605,
+# run-together as `...could not answerghs_<token>`, which is the tell).
+#
+# The negative case — no token on the seat — is the one that rendered correctly, which
+# is why this survived; so BOTH wordings are pinned here, and the token-absence arm is
+# the one that actually grades the fix.
+# ---------------------------------------------------------------------------
+unset GH_STUB_GOOD_TOKEN
+: >"$TOK_LOG"
+_gate_gh "ghs_blind" 0 pr view "$PR" --json state,mergedAt -q '.state' >"$TMP/t8a.out" 2>/dev/null
+nsub "T8 the reason does NOT carry the owner read token"      "$_GATE_GH_LAST_ERR" "tok-lodar"
+sub  "T8 it says the owner token was tried and could not answer" "$_GATE_GH_LAST_ERR" "was tried and could not answer"
+chk  "T8 and nothing is run together with the wording"        "$(printf '%s' "$_GATE_GH_LAST_ERR" | grep -c 'could not answertok')" "0"
+# The arm really did send the owner token — otherwise "does not appear in the reason"
+# would be vacuously true because it was never resolved at all.
+sub  "T8 (control) the owner token WAS resolved and sent"     "$(cat "$TOK_LOG")" "tok-lodar"
+
+# The seat holds NO token for the owner this query names: the wording that was already
+# correct must stay correct, and must still not be the value of anything.
+: >"$TOK_LOG"
+NOTOK_PR='https://github.com/nosuchowner/somerepo/pull/9'
+_gate_gh "ghs_blind" 0 pr view "$NOTOK_PR" --json state,mergedAt -q '.state' >"$TMP/t8b.out" 2>/dev/null
+sub  "T8 a seat with no token for that owner says so"         "$_GATE_GH_LAST_ERR" "is not present on this seat"
+nsub "T8 and that path sends no owner token either"           "$(cat "$TOK_LOG")" "tok-"
+
+# The owner token IS the caller's own credential: the arm is skipped, and the old text
+# claimed it "was tried" when it never ran. Distinct states, distinct wordings.
+: >"$TOK_LOG"
+_gate_gh "tok-lodar" 0 pr view "$PR" --json state,mergedAt -q '.state' >"$TMP/t8c.out" 2>/dev/null
+nsub "T8 the reason does not carry the caller's token either" "$_GATE_GH_LAST_ERR" "tok-lodar"
+sub  "T8 and it says the token was not sent a second time"    "$_GATE_GH_LAST_ERR" "was not sent again"
+chk  "T8 exactly one call — the same credential is not retried" "$(wc -l <"$TOK_LOG")" "1"
+
+# ---------------------------------------------------------------------------
+# T9 — THE IDIOM ITSELF, repo-wide. `${X:+a}${X:-b}` reads like a ternary and is not
+# one; wherever X holds a secret it is a disclosure, not a typo. Swept 2026-09-18: one
+# site, the bug above. This arm keeps it at zero.
+#
+# Two things this guard is careful about, both of which made an earlier draft useless:
+#  * it reads CODE ONLY — a whole-line comment is dropped first, or the explanatory
+#    comment written next to the fix reds the guard that the fix installed;
+#  * it does not spell the "same name twice" requirement as an ERE BACKREFERENCE. `\1`
+#    inside `grep -E` is a GNU extension and a non-GNU grep exits 2 on it — which the
+#    pipeline would read as "no matches", i.e. vacuously green on the very grep that
+#    could not run. The two names are compared in bash instead.
+# ---------------------------------------------------------------------------
+IDIOM="$(find src -type f -print0 | xargs -0 awk '
+  /^[[:space:]]*#/ { next }                       # code only: an explanatory comment is not a leak
+  {
+    line = $0
+    while (match(line, /[$][{][A-Za-z_][A-Za-z0-9_]*:[+][^{}]*[}][$][{][A-Za-z_][A-Za-z0-9_]*:-/)) {
+      frag = substr(line, RSTART, RLENGTH)
+      line = substr(line, RSTART + RLENGTH)
+      a = frag; sub(/^[$][{]/, "", a); sub(/:[+].*$/, "", a)
+      b = frag; sub(/^.*[}][$][{]/, "", b); sub(/:-$/, "", b)
+      if (a == b) printf "%s:%d:%s ", FILENAME, FNR, frag
+    }
+  }')"
+chk 'T9 no ${X:+..}${X:-..} fake ternary anywhere in src/' "$IDIOM" ""
+
 printf '\n%s\n' "---- $PASS passed, $FAIL failed ----"
 [[ $FAIL -eq 0 ]]
