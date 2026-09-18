@@ -1793,6 +1793,21 @@ _task_require_principal() {
 # _task_roster_sql_notin — a SQL fragment listing the roster, for the surfacer.
 # Prints nothing when the roster is unestablished, so a caller that interpolates
 # it cannot turn "could not measure" into "everything is an orphan".
+# _task_seat_is_gone <name> — 0 only when the roster is READABLE and does not
+# carry <name>. Upstream #1009 acceptance 2 turns on "once the clone is gone", and
+# the two ways to be wrong here are not symmetric: calling a live seat gone takes
+# a row away from someone working on it, while calling a gone seat live leaves the
+# row exactly where it already was. So an unreadable roster answers NO, and an
+# empty name answers YES — a row assigned to nobody is dispatched to nobody.
+_task_seat_is_gone() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || return 0
+  local roster; _task_roster; roster="$_TASK_ROSTER"
+  [[ "$_TASK_ROSTER_STATE" == "ok" ]] || return 1
+  grep -Fxq -- "$name" <<<"$roster" && return 1
+  return 0
+}
+
 _task_roster_sql_notin() {
   local roster n out=""
   _task_roster; roster="$_TASK_ROSTER"

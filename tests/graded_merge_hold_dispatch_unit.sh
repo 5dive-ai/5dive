@@ -73,6 +73,14 @@ id=$(seed DIVE-900)
 # The real write, driven through the verify path with the disposition probe stubbed to the
 # hold the issue names. `_merge_disp_probe` is the seam: it is the half that talks to GitHub.
 _merge_disp_probe() { printf 'hold:merger:no-graded-sha-stated\n'; }
+# THE ROSTER IS A SEAM, because acceptance 2 turns on "once the clone is gone" and that is a
+# registry fact, not a task-store one. ROSTER_OK=0 answers "unreadable", which is the degrade
+# path, and the dead clone is deliberately absent from the list.
+ROSTER_OK=1
+_task_roster() {
+  _TASK_ROSTER_STATE=$( ((ROSTER_OK)) && printf ok || printf unknown )
+  _TASK_ROSTER=$(printf '%s\n' "$LIVE" dev main)
+}
 _gate_version_vs_installed() { :; }
 task_actor() { printf '%s\n' "$LIVE"; }
 task_actor_claim() { ACTOR_BOARD="$LIVE"; }
@@ -94,7 +102,7 @@ owner=$(col DIVE-901 merge_owner)
 [[ -n "$owner" ]] \
   && ok_t "A2 the hold resolved an owner and recorded it ($owner)" || bad_t "A2 owner must resolve" ""
 [[ "$(col DIVE-901 assignee)" == "$owner" ]] \
-  && ok_t "A2a ACCEPTANCE 2: the assignee moved off the ephemeral clone onto that same seat — ONE owner on the row, not two" \
+  && ok_t "A2a ACCEPTANCE 2: the assignee was on a seat the roster does not carry, so it moved to that same owner — one owner on the row, not two" \
   || bad_t "A2a assignee must equal the owner" "assignee=[$(col DIVE-901 assignee)] owner=[$owner]"
 [[ "$(col DIVE-901 assignee)" != "$DEAD" ]] \
   && ok_t "A2b ...so the row no longer names a seat that does not exist" || bad_t "A2b" ""
@@ -105,6 +113,31 @@ owner=$(col DIVE-901 merge_owner)
   && ok_t "A3a ...and the LIMIT-1 picker the direct-claim path uses returns it too" || bad_t "A3a" ""
 [[ -z "$(_hb_pick_tasks "$DEAD" 5 | grep -x "$id")" ]] \
   && ok_t "A3b ...and the dead clone's tick does not, so the row moved rather than being shared" || bad_t "A3b" ""
+
+# --- 1b. THE ASSIGNEE MOVE IS NARROW, and these two arms are why -------------
+# Moving it unconditionally is a different, wider change wearing this one's clothes: it takes
+# a row away from a LIVE maker. tests/task_delivery_evidence_unit.sh asserts against exactly
+# that by name ("the row was NOT routed away from the maker") for a --review=check row, and
+# an earlier cut of this fix broke it — in CI, not here, because who the owner resolves to is
+# a roster fact. A row whose assignee is alive is not stranded and does not need rescuing.
+id=$(seed DIVE-905 in_progress dev)          # assignee IS on the roster
+cmd_task_verify DIVE-905 --cmd=true --no-done >/dev/null 2>&1
+[[ "$(col DIVE-905 assignee)" == "dev" ]] \
+  && ok_t "A6 a LIVE assignee is left alone — the hold does not take a row away from the seat holding it" \
+  || bad_t "A6 must not steal a live row" "assignee=[$(col DIVE-905 assignee)]"
+[[ "$(col DIVE-905 status)" == "todo" && -z "$(col DIVE-905 started_at)" ]] \
+  && ok_t "A6a ...and it is dispatchable anyway, because the STATUS PAIR is the operative half and the merge-owner arm keys on merge_owner, not on the assignee" \
+  || bad_t "A6a status pair must still reset" "status=[$(col DIVE-905 status)]"
+
+ROSTER_OK=0
+id=$(seed DIVE-906)                           # assignee gone, but the roster cannot be read
+cmd_task_verify DIVE-906 --cmd=true --no-done >/dev/null 2>&1
+[[ "$(col DIVE-906 assignee)" == "$DEAD" ]] \
+  && ok_t "A7 DEGRADE, NEVER GUESS: an unreadable roster is not evidence a seat is gone, so the assignee is left alone" \
+  || bad_t "A7 must not move on an unknown roster" "assignee=[$(col DIVE-906 assignee)]"
+[[ "$(col DIVE-906 status)" == "todo" ]] \
+  && ok_t "A7a ...while the status half still runs, so dispatch is restored either way" || bad_t "A7a" ""
+ROSTER_OK=1
 
 # --- 2. ACCEPTANCE 3: doctor names the shape AND the seat ----------------------
 id=$(seed DIVE-902)
