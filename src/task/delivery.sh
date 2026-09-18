@@ -483,7 +483,10 @@ cmd_task_merge_gate_selftest() {
     tok=""; _gate_tok_note "[0 gh binary] ABSENT — no arm can run"
   fi
   trace=$(awk '{printf "%s%s", (NR>1?"; ":""), $0}' "$_GATE_TOK_TRACEF" 2>/dev/null || printf '')
-  _gate_gh_bot_ok && bot="available" || bot="not permitted on this seat"
+  # The three-state answer, from the shared helper the DIVE-2318 refusal also
+  # prints — see `_gate_gh_bot_state`. "available" now means the credential is
+  # there, not merely that this seat may reach for it.
+  bot="$(_gate_gh_bot_state)"
   _gate_anon_ok   && anon="usable"   || anon="unusable (no curl/jq, or FIVE_GATE_NO_ANON=1)"
   # DIVE-4341: the instrument's blind spot was that a RESOLVED token and a gh that
   # cannot start look identical here — this very line printed `[4 sudo -u claude gh
