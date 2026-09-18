@@ -19,12 +19,27 @@
 #      logs the depth that is left;
 #   E. a busy seat still takes at most one message per round (no second message
 #      typed into the turn the first started);
-#   F. the sender's queued receipt names the depth and the force verb.
+#   F. the sender's queued receipt names the depth and the force verb;
+#   H. wake-task with <task_ident> OMITTED resolves the ident from the seeded
+#      row, and with that row deleted it refuses instead of waking.
+#
+# THE SEEDED ROW (#998, 7583a5cb). Every wake arm below calls the verb with task
+# id 4296. Until #998 wake-task never looked that id up -- `<task_ident>`
+# defaulted to "DIVE-${task_id}" -- so a fabricated id cost nothing and this
+# harness never owned a row. #998 made the verb resolve the ident FROM the row
+# and refuse an id no row carries, which is a contract this harness depends on
+# and predates: it went red in the full sweep on main with
+# `FAILCALL wake-task: no task row has id 4296`, on the first call, before a
+# single arm was graded. The stub DB below therefore owns one row -- id 4296,
+# ident DIVE-4296 -- and section H grades that dependency in both directions.
 #
 # MUTATION (the row's own acceptance): restore the literal
 #   _hb_wake "$name" "false" "$task_id" "$task_ident"
 # in cmd_heartbeat_wake_task and arm A must go red. Restore the single-pass
 # `for name in …; do a2a_queue_flush_one …; done` sweep and arm D must go red.
+# Section H carries its own mutation in-process: delete the seeded row and the
+# wake arms must go red -- which is precisely the failure this harness showed on
+# main, restated as an arm that stays here to catch it next time.
 #
 # Boundaries only are stubbed: tmux/systemd/sudo, the registry, the DB, the idle
 # predicate and _hb_wake's best-effort enrichment clauses. cmd_heartbeat_wake_task,
@@ -87,11 +102,24 @@ registry_read() {
   printf '{"agents":{"ops":{"heartbeat":{"fresh":%s}},"codey":{"heartbeat":{"fresh":false}}}}\n' \
     "${OPS_FRESH:-true}"
 }
+# The seeded row: id and ident are independent columns, and wake-task reads the
+# ident out of the row (#998). ROWS is the whole tasks table this harness owns --
+# one row -- so "delete the seeded row" in section H is an `unset` of one key,
+# and an id that is not a key answers empty, exactly as the SELECT would.
+ROW_ID=4296
+ROW_IDENT="DIVE-${ROW_ID}"
+declare -A ROWS=( [4296]="DIVE-4296" )
 # DB: the row is a live todo; TASK_FRESH drives the per-row override column.
 db() {
   local q="$1"
   case "$q" in
     *"SELECT status FROM tasks"*)          printf 'todo\n' ;;
+    # #998: the ident the wake announces is looked up by row id, never built
+    # from it. Answer for the seeded row only; any other id gets the empty
+    # string the real SELECT returns, which the verb refuses on.
+    *"COALESCE(ident,'')"*)
+      local _id="${q##*id=}"; _id="${_id%%;*}"
+      printf '%s\n' "${ROWS[$_id]:-}" ;;
     *"COALESCE(fresh,'')"*)                printf '%s\n' "${TASK_FRESH:-}" ;;
     *"COALESCE(title,'')"*)                printf '\n' ;;
     *)                                     printf '\n' ;;
@@ -126,6 +154,7 @@ reset_wake() { : >"$SENT"; : >"$LOG"; }
 first_line() { head -1 "$SENT" 2>/dev/null || true; }
 goal_line_no() { { grep -n '^/goal ' "$SENT" | head -1 | cut -d: -f1; } 2>/dev/null || true; }
 clear_line_no() { { grep -n '^/clear$' "$SENT" | head -1 | cut -d: -f1; } 2>/dev/null || true; }
+goal_line() { { grep '^/goal ' "$SENT" | head -1; } 2>/dev/null || true; }
 
 # --- A: a forced wake on a FRESH seat clears first ---------------------------
 # The defect verbatim: the goal must not land under the previous turn's output.
@@ -222,6 +251,59 @@ is "F: cmd_send still reports queued:true" "true" "$(jq -r '.data.queued' <<<"$o
 grep -q '_hb_wake "$name" "false"' src/cmd_heartbeat.sh \
   && bad_t "G: wake-task no longer hard-codes fresh=false" "the literal is back" \
   || ok_t "G: wake-task no longer hard-codes fresh=false"
+
+# --- H: the ident comes from the ROW, and no row means no wake (#998) --------
+# The five calls above pass DIVE-4296 explicitly, so they grade the send order
+# and say nothing about the lookup. This arm omits the argument -- the path #998
+# changed, and the one the verb's own exit hints tell an operator to take.
+#
+# Note what this harness can and cannot see: its row id and its ident NUMBER are
+# the same 4296, so a fabricating verb and a resolving one would type the same
+# string here. H1 therefore proves the lookup SUCCEEDS; H2-H4, with the row
+# deleted, prove it HAPPENS -- a verb that fabricated would wake happily onto a
+# row that does not exist. (The id-vs-ident disagreement itself is graded by
+# tests/heartbeat_wake_task_ident_unit.sh, whose row is id 553 / ident DIVE-546.)
+is "H0: the seeded row answers the ident lookup by id" "$ROW_IDENT" \
+   "$(db "SELECT COALESCE(ident,'') FROM tasks WHERE id=${ROW_ID};")"
+
+reset_wake
+OPS_FRESH=true cmd_heartbeat_wake_task ops "$ROW_ID"
+_h="$(goal_line)"
+case "$_h" in
+  "/goal ${ROW_IDENT}"*) ok_t "H1: <task_ident> omitted -- the /goal carries the row's ${ROW_IDENT}" ;;
+  *)  bad_t "H1: <task_ident> omitted -- the /goal carries the row's ${ROW_IDENT}" "got: ${_h:-no /goal line}" ;;
+esac
+is "H1b: ... and the fresh seat still clears first" "/clear" "$(first_line)"
+
+# MUTANT: delete the seeded row -- the full-sweep failure, verbatim, as an arm.
+# It runs in a subshell so the deletion cannot leak into a later arm, and that
+# subshell restores production's `fail`, which EXITS. The outer stub returns 1
+# instead so the harness survives its own arms; a `return` here would let the
+# verb run on past the refusal with an empty ident and H4 would grade nothing.
+reset_wake
+_m_err="${TMPROOT}/h-mutant.err"; _m_rc=0
+(
+  fail() { printf 'FAILCALL %s\n' "${2:-}" >&2; exit 1; }
+  unset 'ROWS[4296]'
+  OPS_FRESH=true cmd_heartbeat_wake_task ops "$ROW_ID"
+) >/dev/null 2>"$_m_err" || _m_rc=$?
+(( _m_rc != 0 )) \
+  && ok_t "H2: MUTANT -- with the seeded row deleted the wake is refused" \
+  || bad_t "H2: MUTANT -- with the seeded row deleted the wake is refused" "rc=0; it woke anyway"
+grep -q "no task row has id ${ROW_ID}" "$_m_err" \
+  && ok_t "H3: MUTANT -- the refusal names the id (the line main died on)" \
+  || bad_t "H3: MUTANT -- the refusal names the id" "stderr: $(cat "$_m_err" 2>/dev/null)"
+is "H4: MUTANT -- nothing is typed, so arm A goes red on it"  "" "$(clear_line_no)"
+is "H4b: MUTANT -- no goal is delivered, so arm B goes red on it" "" "$(goal_line_no)"
+
+# Grade the restore: without it, anything added after this point would be
+# grading a harness whose row is gone.
+reset_wake
+OPS_FRESH=true cmd_heartbeat_wake_task ops "$ROW_ID"
+case "$(goal_line)" in
+  "/goal ${ROW_IDENT}"*) ok_t "H5: RESTORE -- the row outlived the mutant and still resolves ${ROW_IDENT}" ;;
+  *)  bad_t "H5: RESTORE -- the row outlived the mutant" "got: ${_h:-no /goal line}" ;;
+esac
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
