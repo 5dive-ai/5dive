@@ -1,6 +1,422 @@
 # Changelog
 
-## Unreleased — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
+## v0.44.0 — fix(heartbeat): wake-task resolves the row's ident instead of inventing DIVE-<id> (#998)
+
+`5dive heartbeat wake-task <agent> <task_id> [<task_ident>]` defaulted the optional third
+argument to `DIVE-${task_id}`. A row's `id` and the number in its `ident` are independent
+columns, so that default is right only by coincidence — and the verb's own exit hint tells
+the operator to pass `<task_id>` alone, which is exactly the path that fabricated.
+
+On this fleet id 553 is DIVE-546. `heartbeat wake-task claude-qa 553` logged the forced wake
+onto DIVE-553, filed the loop defect against DIVE-553, and typed `/goal DIVE-553 … 5dive task
+show DIVE-553` into the seat. The seat looked, found no such row and started nothing, while
+the verb had already reported success — so the tick wake-task exists to un-stick stayed stuck
+under a green log line. Passing the ident as `<task_id>` was rejected by the usage check, so
+there was no correct way to say it either.
+
+The ident is now read from the row, and an id no row carries is refused with `E_USAGE` naming
+the id rather than woken as `DIVE-<id>`: every downstream consumer takes that ident on trust,
+so a wrong one is worse than none. The third argument stays an override, but only one that
+agrees with the row — a disagreement is the bug it exists to catch, not a value to prefer.
+
+`tests/heartbeat_wake_task_ident_unit.sh` seeds a throwaway `TASKS_DB` with one row whose id
+and ident number deliberately disagree and stubs the transport, so it grades the ident rather
+than the wake. Six mutant arms restore the `DIVE-${task_id}` default and assert every positive
+arm goes red on it, with a BEFORE/AFTER pair proving the mutation took.
+
+## v0.44.0 — fix(task): task ls and task inbox --json carry gate_pinged_at like task show (#997)
+
+Three surfaces disagreed about the same row. `task show --json` returned
+`gate_pinged_at` because it does `SELECT *`; the JSON branch of `cmd_task_ls` and
+`cmd_task_inbox` are explicit column lists and neither named it, so the key was missing
+from every row on both. Those projections also drop null-valued keys (DIVE-1610), which
+is the part that made it dangerous: a reader could not tell "this projection never had
+the column" from "this gate was never pinged", and `ls`/`inbox` are the surfaces an agent
+queries to find out which gates exist. On 2026-09-15 a reader took that absence as
+evidence and reported that no gate on the box had ever been delivered; two seats acted on
+it before it was caught. DIVE-2777 was the same shape on `handoff_delivered_at`.
+
+The fix is the column, named in both lists. One stored column each, no derived field and
+no second copy of any rule — the receipt is written by `src/task/notify.sh` and read by
+`src/cmd_heartbeat.sh` as the re-nag throttle, and all three surfaces now read it from the
+same place. The key stays absent where the value is NULL, exactly like every other
+nullable column on these projections, so what changes is that the surfaces agree rather
+than that absence acquires a new meaning. Making the key set itself stable is the
+DIVE-3785 treatment, deliberately scoped there to one projection because reversing
+DIVE-1610 on the high-volume list surfaces is a different trade.
+
+`tests/task_ls_inbox_gate_pinged_at_unit.sh` seeds one pinged and one never-pinged live
+human gate and compares the receipt byte-for-byte across all three surfaces, with the
+never-pinged row as the negative control — its key must be absent on all three alike. Arm
+M strikes the column back out of both functions in-process and requires the positive arms
+to go red; its precondition arm asserts the column was there to strike, so a sed that
+matched nothing cannot pass for a reproduced defect. 18 arms green, 5 red against the
+unfixed tree.
+
+## v0.44.0 — fix(audit): a sourced-library caller no longer writes the live audit log (#996)
+
+`src/header.sh` sets `AUDIT_LOG=/var/log/5dive/agent-audit.log` unconditionally and
+`tests/lib/env_isolation.sh` clears only `FIVE_*`, so every harness that sources `src/`
+starts aimed at the real log. 124 harnesses stub `audit_log` and 10 re-point `AUDIT_LOG`;
+the rest audited for real. On a box that runs 5dive, one corpus run put `task cancel`,
+`deploy gate` and `agent ask` fixture rows in the live log — and from a non-root caller
+they arrived through the privileged `sudo -n 5dive _audit_append` fallback, which is the
+last place a test should be. It survived because it is invisible where the log is 640
+root:claude: the `-w` test fails, `sudo -n` fails, the note goes to `notify/` or nowhere,
+and a clean grep proves only that THAT box could not write.
+
+`_emit_audit_line` and `_audit_note_drop` now withhold the row when the process never
+entered through the CLI entrypoint and `AUDIT_LOG` resolves to the hardcoded live path —
+the same keying as the tasks-store fence (DIVE-2249), where `main()` sets
+`_TASKS_STORE_ENTRY` as its first statement. Withheld, not refused: an audit row is
+best-effort by contract and `audit_log` runs from every mutating verb's EXIT trap, so a
+fence that exited would kill a harness in its teardown. `rc` is unchanged and one `warn`
+line per process says so, because silence would make "never audited" and "the fence ate
+it" the same empty log. Not an env override in `header.sh` — a non-root seat could then
+divert its own rows past the privileged append (DIVE-1268).
+
+`tests/audit_log_sourced_caller_fence_unit.sh` designates a decoy under `$TMP` as the live
+log and shadows `sudo`, so the real `/var/log/5dive` is never opened; arms 0, 3b and 4 are
+the liveness pair, proving the same writes still land from the CLI entrypoint and into an
+isolated sink, so the zeros in the fenced arms are not a dead writer. Four arms go red
+against `src/` without the fence.
+
+## v0.44.0 — docs(contributing): the contributor docs now match what CI actually does (#995)
+
+Three claims in `CONTRIBUTING.md`, the PR template and `changelog.d/README.md` were wrong,
+all three found by the author of our first outside PR (#994) by following them literally.
+
+- **The Testing section** sent contributors to `for t in tests/*.sh` — 603 harnesses, ~25
+  minutes — and never mentioned `scripts/pre-push-rail.sh` or `core.hooksPath`, which run
+  what CI reds on first plus only the harnesses the diff touched (measured at 5m04s on
+  #994). It also claimed CI runs the whole corpus on every PR; `unit-tests.yml` runs the
+  core tier under a 300s budget plus `changed-harnesses`, and the full corpus is
+  `full-sweep.yml`'s job.
+- **"The bundle rule"** said `5dive` and `5dive.sha256` are tracked and must be committed.
+  They are gitignored (DIVE-2091) and `bundle-drift` fails a PR that re-adds them. The same
+  file's "Pull requests" section already said so, so it contradicted itself, and the PR
+  template's checkbox took the wrong side.
+- **`changelog.d/README.md`** documented the filename as your ticket ident and gave an
+  outside contributor, who holds none, nothing to use. The lint grades the heading rather
+  than the filename, so `changelog.d/PR-<n>.md` has always been accepted; that is now
+  written down, and this fragment uses it.
+
+Documentation only — no executable path changes.
+
+## v0.44.0 — fix(task): `task verifier` no longer runs its own SQL comment (#994)
+
+Every successful `5dive task verifier <id> <agent>` printed
+`/usr/local/bin/5dive: line N: task: command not found` on stderr. `cmd_task_verifier`
+builds its UPDATE as a **double-quoted bash string**, and two of the SQL `--` comment lines
+inside it quoted a command name in markdown backticks. Backticks in a double-quoted string
+are command substitution, so bash ran `task add --verify` — a binary that does not exist,
+the verb is `5dive task` — before sqlite3 ever saw the statement, and spliced the empty
+result into the comment.
+
+The row was written correctly and the exit status was 0, which is why it lived this long:
+every signal a caller reads said the verb worked, and the only evidence was a line on
+stderr that looked like it came from something else. On a box that greps agent logs for
+`command not found` it is a standing false positive on a healthy verb.
+
+The fix is the two lines: `'single quotes'` instead of backticks. Nothing else changes —
+the comment is inert to sqlite either way. A repo-wide scan for the same shape (a backticked
+`--` comment sitting in a live double-quoted string, rather than in the `<<'SQL'` heredocs
+`src/lib/tasks_db.sh` uses) found no other site.
+
+`tests/task_verifier_sql_comment_backticks_unit.sh` runs the verb and asserts stderr carries
+no bash diagnostic, then rebuilds `cmd_task_verifier` from the working tree **with the
+backticks put back** and asserts the diagnostic reappears — a clean arm alone would stay
+green against an empty stderr it never captured. The mutant arm also pins rc 0 and a correct
+`verifier` column under the defect, which is the property that hid it.
+
+## v0.44.0 — fix(task): a refused close no longer claims the appended result was kept, and a verify FAIL no longer reads as a CLI crash (#1008)
+
+Two message-order defects in the task verbs, both of which made the CLI say something untrue
+about what it had just done.
+
+`_task_guard_result_over_closed` composes `prev + seam + new` and said "this row already
+carried a result and it was PRESERVED, not replaced — N bytes kept above your text" at the
+moment it composed it. Every close guard that can still refuse runs after that point, so on a
+refused close the operator read a sentence asserting a write, then a refusal, over a result
+that was byte-identical to before — measured twice at 7597 and 9237 bytes, both unchanged, and
+two makers believed their post-delivery notes were on the row. The sentence is now deferred and
+flushed by the callers that write the row, so the claim is made where it is true. It is deferred
+rather than moved because the byte count is only in hand where the text is composed; once a
+caller has written the row, the previous bytes are gone.
+
+`task verify` printed a failing grade through `warn`, which does not set the reported flag, so
+the DIVE-2598 backstop reported the exit as "without reporting a reason. This is a bug in the
+CLI, not a refusal … Please file it: 5dive bug." on top of a FAIL verdict that had just been
+recorded correctly on the row. That branch now marks itself reported. The exit status stays 1,
+so a shell caller can still branch on the grade; only the false crash report goes.
+
+`tests/task_message_before_write_unit.sh` grades both against built bundles run as their own
+processes — one defect is an ordering between a warn and a refusal that exits, the other is the
+EXIT-trap backstop, and a sourced fixture would grade neither. Each gets a mutant bundle, the
+shipped one with that single line reverted, which must reproduce its own defect.
+
+## v0.44.0 — fix(task): task merge closes a row whose pull request the maintainer already merged, without the machine-account credential (#1007)
+
+`_merge_do` demanded the machine-account credential unconditionally, after the standing
+check and before anything had read the pull request. The pull request's own state was never
+consulted — so on a box with no bot connector, a row whose pull request the MAINTAINER
+merged was closable by nobody. That is the normal case for an outside contributor, who
+holds no merge right in the target repo at all: `task merge` wanted a credential to perform
+a merge that had already happened, `task done` refused with `done-redelivers-a-graded-merge`
+or `done-before-pr-merged`, `--force-redeliver` wanted delivery fields, and `task assign` is
+refused when the closer is the verifier. What was left was re-pointing the verifier,
+reassigning and closing as the new assignee — three verbs and an audit trail that says the
+GRADER CHANGED, to record a merge that happened without us.
+
+Ask what the pull request IS before demanding the credential to change it. The read goes out
+over `_gate_gh`'s cheapest rail with an empty token — the same read the merge gate and
+`merge-gate-selftest` already make — because asking has never needed a machine account; only
+merging does. `mergedAt` is the operand rather than `state`, since a queue-evicted pull
+request reads OPEN and a closed-unmerged one reads CLOSED and neither carries one. An
+already-landed pull request reports a new `already-merged` disposition, which
+`_merge_disp_read` tests FIRST so that neither caller credits this seat with a landing the
+maintainer made, and the merge hold on the row is retired. Everything that is not a
+confirmed landing — including a GitHub that could not be asked at all — falls through to the
+credential demand exactly as before.
+
+`tests/task_merge_already_merged_unit.sh` executes the read and the decision over a stubbed
+rail rather than grepping for them, asserts the branch's POSITION against the credential
+demand by line number, and keeps the negative the fix turns on: an OPEN pull request with no
+machine account is still refused, with the same text and with nothing written to the row.
+
+## v0.44.0 — fix(ci): weight nightly-tier harnesses from the full sweep so the shard planner stops packing them together (#1006)
+
+The shard planner reads `tests/lib/harness-weights.tsv`, and that table was built
+only from the `core-<env>-<shard>` artifacts of a green `unit-tests` run — a job in
+which no `# TIER: nightly` harness ever runs. All 125 nightly harnesses therefore had
+no row and were priced at the median, about a second each. On full-sweep run
+35313238307 the planner put the three most expensive files in the corpus into one
+shard on the strength of that price: `gate_channel_session_t2_mutation` (350s),
+`selfcheck_mutation_e2e` (152s) and `harness_rc_corpus_contract_unit` (119s). The
+shard exited over budget at 1358s against a 1320s cap with all 204 of its harnesses
+green, while the other two idled at 811s and 644s.
+
+`.github/scripts/fetch-budget-baseline.sh` takes a new `--tiers=core+full`, which also
+fetches the `full-<env>-<shard>` reports of the most recent completed full-sweep run on
+`main` that still has them, into a directory of their own.
+`scripts/refresh-harness-weights.sh` asks for both tiers and merges them, the full-tier
+figure winning every overlap, and now refuses to write a core-only table unless asked
+with `--allow-core-only`. The confirm jobs call the fetcher exactly as before and their
+attribution baseline is unchanged — that is what the separate directory is for. Full
+coverage of the corpus goes 79% -> 100%, and the three shards plan at 936s each instead
+of 352s each.
+
+## v0.44.0 — fix(hooks): a reaction counts as a Telegram reply, so the Stop hook no longer auto-relays the turn's recap (#1005)
+
+A turn answered with an emoji reaction had its end-of-turn recap relayed into
+the chat as `(auto-relay) …`. Three of them landed on "ok"-class messages in a
+single two-minute window before this was tracked down.
+
+The Stop hook's `had_telegram_send` counted only `reply` and `edit_message`, so
+a react-only turn fell through to the "no send, transcript text present" branch
+and relayed the whole transcript. The branch that already handles a react-only
+ack sits below that one and is reached only when the turn produced no text —
+and a recap is text, so it never saw these turns.
+
+`react` now counts as a send. A reaction is a deliberate act on the channel, so
+the turn that placed one has answered; the net still fires for a turn that never
+touched Telegram at all, and `download_attachment` is still not a send.
+`tests/stop_telegram_reply_check_react_unit.sh` runs the real hook against
+synthetic transcripts with only `curl` stubbed, and its mutant strips `react`
+back out and requires the reaction arm red while the real-miss arm stays green.
+
+## v0.44.0 — test(heartbeat): a2a drain-and-wake harness seeds the row wake-task now resolves (#1004)
+
+`tests/a2a_drain_and_wake_fresh_unit.sh` calls `cmd_heartbeat_wake_task ops 4296 DIVE-4296`
+five times against a stubbed DB that never held a row. That cost nothing while `wake-task`
+never looked the id up — until #998 made the verb resolve the ident FROM the row and refuse an
+id no row carries. The harness predates that contract and is not in the PR rail's set, so #998
+merged green and `main` went red on the first call of the first arm, on both full-sweep shards,
+with `FAILCALL wake-task: no task row has id 4296`. The nightly release-cut refused to cut on it.
+
+The harness now owns the row it has always been waking: id 4296, ident DIVE-4296, seeded into
+the stub DB it already uses as a boundary, answering the ident lookup by id and returning empty
+for any other id exactly as the `SELECT` would. Every existing arm and all five call sites are
+unchanged — they still grade DIVE-4296's send-order and drain contracts, now against a row that
+exists. No `src/` change: the behaviour they tripped over is the intended one.
+
+A new section H grades that dependency in both directions. With `<task_ident>` omitted the
+`/goal` carries the ident read from the row; with the seeded row deleted the verb refuses,
+names the id and types nothing, so arms A and B go red on it. Against the pre-#998 fabricating
+verb the section fails 4 of its arms while A through C stay green — the failure that took main
+down for eleven hours, kept as an arm so the next harness to drift off this contract is caught
+here instead of there.
+
+## v0.44.0 — fix(doctor): read seat-owned plugin clones and flag seats launched DEGRADED (#1003)
+
+`doctor`'s `marketplace-freshness` check could not read a single agent's plugin
+marketplace clone. Each clone lives under that agent's own `$HOME` and is owned
+by that agent's uid while `doctor` runs as root, and git refuses a repository
+owned by another user (CVE-2022-24765) — so every clone but the sudo caller's own
+was filed as `unreadable-clone`, and from cron or a root shell all of them were.
+On a box with 35 seats that read as "1 of 35 current, 32 unreadable", with two
+genuinely stale readers buried in the unknown bucket. The three reads are now
+scoped with a per-clone `safe.directory` on the command line, which git honours
+as protected config and which leaves nothing behind box-wide.
+
+`doctor`'s registry lane also printed `[ok]` for a seat the launcher had already
+marked DEGRADED. The per-seat check ended at "entry + user + env file all
+present" — three presence facts — while the launcher's own verdict sat in the
+seat's `.5dive-cred-seed-failed` breadcrumb, which is where `agent info` and
+`agent list` get `startup: degraded` from. `doctor` now reads it: a degraded seat
+is an error carrying the launcher's reason and the commands that clear it. A home
+`doctor` cannot read still reads `ok` — its own permission boundary is not
+evidence about the seat.
+
+Both are covered by harnesses with mutant arms that re-introduce the defect:
+`tests/doctor_marketplace_freshness_unit.sh` models the ownership refusal with a
+`git` stand-in on `PATH`, and `tests/doctor_registry_degraded_seat_unit.sh` is new.
+
+## v0.44.0 — feat(account): account set configures a BYO provider profile without creating an agent (#1002)
+
+`account` is the abstraction for reusable auth profiles, but only the OAuth half went through it.
+Writing a bring-your-own provider key meant `agent auth set` — an AGENT-scoped verb doing
+account-scoped work — so credential setup depended on whether the credential was OAuth or an API
+key, and configuring one could look like it needed an agent.
+
+`5dive account set <name> --type=<type> --provider=<id> --api-key=- [--model=<slug>]
+[--base-url=<url>] [--replace]` closes that. It is a new verb rather than three more flags on
+`account login`: `login` implies an interactive sign-in that can be cancelled, `set` means "write
+this value", and `account login --api-key=-` in a runbook would make a reader stop and check what
+it does. `login`'s flag surface is unchanged.
+
+It is a wrapper over the existing writer, so the profile it produces is byte-identical to one from
+`agent auth set` — two writers of one credential store drift, and the drift is found during an
+incident. What it adds is account-scoped: a profile that already carries credentials FOR THAT TYPE
+is refused unless `--replace` is given, because a silent clobber would re-point a live profile at
+another provider and every bound agent would change behaviour on its next restart with nothing in
+the audit trail saying why. A replace writes an audit row naming the profile and the provider,
+never the key. Both rules are in the usage text.
+
+`--api-key=-` reads the key from stdin and is the documented form in the usage text and the README;
+a literal value still works and is marked discouraged, because an argument is visible in `ps` while
+the call runs and lands in shell history.
+
+`tests/account_set_byo_profile_unit.sh` writes real profiles into a throwaway state dir and asserts
+the byte-identity with `agent auth set`, that a refused write leaves the profile untouched rather
+than merely complaining, that `--replace` is audited without the key, that a literal `--api-key` in
+argv is redacted by the real `audit_log`, that `account login --api-key=` still fails with
+`unknown flag`, and — through a bundle it builds itself — that the CLI routes to the verb at all. A
+mutant arm removes the replace guard and requires the silent clobber back.
+
+## v0.44.0 — fix(task): a command grade stamps the sha it graded so the merge gate can clear (#1001)
+
+`_gate_graded_sha` is a fence by design: it matches a labelled `graded-sha:` declaration and
+nothing else. A row graded by a COMMAND (`--review=check`) recorded `✅ verify PASS (exit 0):
+<cmd>` and no such line, so the fence read empty — and everything downstream reads that fence.
+`_merge_disp_decide` answered `hold:merger:no-graded-sha-stated`, and `task done` refuses a close
+whose result states no graded sha, so a row that had just passed its own acceptance command could
+be closed by nobody.
+
+What `graded-sha` means is WHICH TREE THIS GRADE EXERCISED, not what the pull request head was
+while the command ran, and the two diverge whenever a command does not read that head — a grade of
+`git show origin/main:<file>`, run because the work landed by another route, reads a tree the head
+never was. So the stamp is issued only against a PROOF: `git rev-parse HEAD` in the cwd the verify
+command ran in, compared to the head by the same prefix rule `_merge_disp_decide` uses. On a match
+the row carries `graded-sha: <that tree>` and the gate clears. The maker's `DELIVERED-SHA` can
+corroborate the tree when gh cannot answer; it never stands in for it.
+
+Every other case — head and tree disagree, no readable tree, nothing readable at all — gets
+`graded-head-at: <head> (tree graded: <tree>)`, a label the fence does not parse. The operator gets
+both shas and can see why nothing was stamped, and the gate keeps holding. An unstamped PASS was
+indistinguishable from a rail that never ran, and the cure for that is legibility, never a looser
+gate.
+
+`tests/verify_command_grade_stamps_sha_unit.sh` makes its own throwaway checkout and runs the verb
+inside it, so every arm drives a real `git rev-parse` rather than a stubbed one: the proven case,
+the `origin/main` case, no git tree, the corroborated and uncorroborated fallbacks, a verifier's own
+claim left alone, an unbound row untouched, and a FAIL writing nothing. One mutant disables the
+stamp and requires the gate back at `no-graded-sha-stated`; a second stamps from the head WITHOUT
+proving the tree and is required to clear the gate on a tree the grade never read — the arm that
+catches this fix's own wrong shape.
+
+## v0.44.0 — fix(task): every task subverb answers --help with its own usage (#1000)
+
+`5dive task --help` printed the task surface, but every SUBVERB rejected the flag. Each one
+parses its own flags and 34 of those loops end in `-*) fail "$E_USAGE" "unknown flag: $1"`, so
+`5dive task ls --help` — what an operator types to ask a verb how it works — answered
+`error: unknown flag: --help`, and the usage line it printed alongside belonged to whatever the
+loop thought it was doing rather than to `ls`.
+
+`cmd_task` now answers `--help`/`-h` for the subverb before dispatching to it. One place, not 34:
+a per-verb edit is 34 places to forget and the 35th verb ships without it. The text is not written
+there either — it is read at run time from the surface usage that already documents 41 of the
+subverbs, or failing that from the `usage: 5dive task <verb> …` literal the verb itself prints on
+bad arguments, so there is no third copy to drift. A verb documented in neither place is refused
+by name instead of answered with an invented line. The canonical spelling and the target function
+come out of `cmd_task`'s own `case` at run time, which is what makes `list`, `view`, `close`,
+`gates`, `new` and `delete` answer with the usage of the verb they actually run.
+
+`tests/task_subverb_help_unit.sh` walks that same `case` — a list in the harness would go stale
+exactly when a verb is added with no usage text, which is the case it exists to catch — and asks
+every label for help. Mutant arms remove the intercept and require `task ls --help` to return to
+`unknown flag`, and the last arms build a bundle and drive the help through it, because the
+fallback's module-loading branch (DIVE-4087 autoload stubs) only exists in the built artifact.
+
+## v0.44.0 — fix(supervisor): claude's usage-limit hold is a quota wall, not a question (DIVE-4581)
+
+Three FLEET-HEALTH `blocked-on-prompt` pages reached a phone on the evening of
+2026-09-15 (three seats, one exhausted account) for the same non-event: claude's
+own usage-limit hold picker. When a plan/org wall refuses a turn, the harness
+prints the refusal and renders a choice picker — hold until the reset, wait here
+and resume automatically at the printed time, or upgrade — under the same footer
+it draws beneath `AskUserQuestion`. Three rules each answered correctly (footer
+matched → picker; nothing marked `(Recommended)` → do not press a key; therefore
+escalate "a person must choose") and composed into a false page, because all
+three ask whether a person must ANSWER the picker and none asks whether the
+picker is a question. It is not: it is the capacity wall this classifier already
+has a class for, and it prints the time it ends.
+
+The pane now classifies `quota-exhausted` with the new cause `limit-picker`, the
+excerpt quoting the option that carries the resume time. The supervisor answers
+it itself and does not page: the keystroke is CURSOR-RELATIVE — the signed
+distance from the picker's cursor row to its auto-resume row, sent as that many
+Down/Up presses then Enter — never a fixed "Down, Enter", because a fixed count
+assumes an option ORDER and one of the options on this picker is a purchase. No
+cursor on a numbered option, or a distance over 4, and the class still flips
+(true, and quiet) with no key pressed at all. The keystroke retries every tick
+the picker stands; the audited `supervisor_events` row is filed at most once per
+alert window per seat, which is what the digest and `agent info` read. The
+rotation branch is reached only after this one declines, since flipping a
+profile under an open picker leaves the picker open.
+
+Re-CLASSIFIED rather than given a cause under `blocked-on-prompt` — the opposite
+exit from DIVE-4536's — because here the STATE differs and not just the remedy:
+every surface that counts quota walls wants a walled seat counted as walled. The
+signature is a POSITION, not a conjunction (the DIVE-4536 lesson): the reading is
+attempted only on a pane whose picker footer already matched, and then demands
+the wall's two option lines, each a numbered option on its own line, in order,
+immediately above that footer. Both false-positive directions are graded against
+the POPULATION, not composed specimens — `tests/supervisor_limit_picker_unit.sh`
+(34 arms) feeds back the verbatim `task show DIVE-4581` output and the wiki page
+written for this fix and asserts both stay silent, keeps the incident capture as
+the positive control, keeps an ordinary unmarked picker escalating to a person,
+and carries a mutant arm proving the position anchor is load-bearing plus the
+signed residual arm that measures where the anchor's boundary sits.
+
+Knowledge: `community/wiki/a-picker-is-not-always-a-question-the-usage-limit-hold-paged-a-human-three-times.md`.
+
+**Iteration 2 (grader gr-quinn-19).** The position anchors graded clean; the hole was the
+CURSOR GLYPH. It accepted a bare greater-than sign as an alternative to the pointer, on
+the argument that an echoed alert line is not a numbered option — true, and beside the
+point, because a gutter-quoting render (a blockquote, a chat forward, an inbound message
+drawn in a gutter box) prefixes the numbered option ROWS too. A quoted picker therefore
+read as the most CONFIDENT cursor position available and sent a key into that seat's live
+pane; measured on three separately-shaped quoted panes, all three answered. The glyph is
+now the pointer the live capture actually renders and nothing else, and — an independent
+second stop, and a defect in its own right — the step distance is counted in OPTION ROWS
+rather than rendered lines, so a release that draws a description sub-line under each
+option can no longer over-shoot onto the upgrade option (measured: true distance 1, line
+distance 2). The cursor scan also stops at its first hit. Both directions stay safe: the
+class still flips to the quota wall, the keystroke is withheld. Five new arms; all five
+are red on the pre-fix tree.
+
+## v0.44.0 — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
 
 0.26.1 shipped a launcher that could not start any agent (DIVE-4067). The nightly installs the
 release and then restarts every agent, so every box that took it **emptied itself, unattended**,
@@ -38,7 +454,7 @@ first agent it restarts:
 
 `self-update`'s JSON gains a `health_gate` object; every existing field keeps its meaning.
 
-## Unreleased — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
+## v0.44.0 — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
 
 `5dive team import <slug>` provisioned a **roster**, not a working company. Agents, roles and
 reporting lines came up with nothing recurring on the board, so an imported team sat idle
@@ -95,7 +511,7 @@ functional against a real sqlite task store with a stub CLI, not source greps; e
 (kill the reconcile, drop the title arm, fold loop errors into `errors`, move the pass above
 the creates, strip the template's loops, …) were each run alone and each went red.
 
-## Unreleased — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
+## v0.44.0 — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
 
 All four bundled team templates hard-set `defaults.type: claude`, so `5dive team import
 content-studio` could only ever produce Claude Code seats — even though `agent create` has
@@ -134,7 +550,7 @@ long accepted every harness in `TYPE_BIN` and per-agent `type:` was already read
 and `cmd_team` themselves, each with a no-flag negative control. The wiring arms are not decoration: a
 mutation that parses `--type` and never applies it survived every transform-level arm.
 
-## Unreleased — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
+## v0.44.0 — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
 
 DIVE-3885 shipped the right rule — *a checker that could not RUN is `unknown`, never `stale`,
 because a broken instrument must not accuse a true fact* — and encoded it as a list of EXIT CODES
@@ -165,7 +581,7 @@ cases that must be classified oppositely share an exit code. **Parseability is t
 - 3 new harness sections (74/74 green), including the **negative control that decides the design**:
   an rc=2 check that PARSES must stay `stale`.
 
-## Unreleased — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
+## v0.44.0 — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
 
 Item 3 of the memory-janitor plan is a `check:` whose exit code re-derives a fact, plus a pass that
 flips it stale. It looked buildable on the existing `--evidence=<kind>:<ref>`: `cmd:` *is* a check,
@@ -203,7 +619,7 @@ arm through the built binary — that arm is what caught the stale exit code bei
 "this is a bug in the CLI" by the `lib/output.sh` backstop, which would have buried the digest a
 nightly pass exists to produce.
 
-## Unreleased — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
+## v0.44.0 — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
 
 `agent info` printed **⚠ NOT TRANSACTING (quota-exhausted)** about a seat that was executing the very
 command that read the flag. Measured 2026-09-01 14:17Z on `ops`: the pane refusal it quoted said
@@ -232,7 +648,7 @@ Undated pane lines resolve to the NEAREST of yesterday/today/tomorrow at that ti
 at 23:55 is tomorrow and `11pm` read at 00:05 is yesterday. Residual, stated rather than hidden: a refusal
 still on screen more than ~12h later reads as the same time-of-day today.
 
-## Unreleased — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
+## v0.44.0 — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
 
 Two rails, each correct, that intersect on a seat which can satisfy neither:
 
@@ -266,7 +682,7 @@ STATUS proves the merge". Nothing read it.
 
 Not touched: only-the-verifier-closes stays exactly as it is.
 
-## Unreleased — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
+## v0.44.0 — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
 
 `task show` printed a row's gate at the TAIL of the record, below the body; `task ls` printed nothing at
 all. So the board could not answer the one question a fleet with a paired human is most often asked —
@@ -304,7 +720,7 @@ all. So the board could not answer the one question a fleet with a paired human 
   fleet-wide by DEFAULT since DIVE-3224, so the flag OSS-36 specified was never built and anyone reaching
   for it got `unknown flag: --fleet` — a hard error where the view they wanted was already on screen.
 
-## Unreleased — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
+## v0.44.0 — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
 
 On 2026-08-28 05:00Z the board read **31 open rows** and `5dive-ai/5dive` main had not moved in **~42h**
 (`5816e7a` / `v0.23.0`, since 2026-08-26 10:23Z). Of the 31: 30 `blocked`, exactly **1 `todo`**. A reader
@@ -345,7 +761,7 @@ Complements the heartbeat's `_hb_blocked_sweep` (DIVE-1355) rather than replacin
 a2a at most once per 24h and covers two of these four classes. A throttled push to one seat's inbox is a
 different job from an operator looking at a stalled board now.
 
-## Unreleased — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
+## v0.44.0 — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
 
 The **v0.23 headline capability**. The theme was ratified 2026-08-26 as "Liveness you cannot fake"
 (DIVE-3738); v0.23.0 shipped its substrate — courier-routed alarms (DIVE-3727) and the rung-4
@@ -390,7 +806,7 @@ both directions — the third state folded UP into `alive`, folded DOWN into `no
 freshness window removed — each asserted to have applied and to turn a *named* arm red while leaving
 the others green, so no arm's green is the fixture's doing.
 
-## Unreleased — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
+## v0.44.0 — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
 
 On 2026-08-26 the supervisor printed `ESCALATE <seat> (poller-dead: rung-4-needed)` for `marketing`,
 `main`, `dev` and `olivia`. The detection was correct, it fired on time — and **nothing served rung 4**,
@@ -446,7 +862,7 @@ out of sqlite), `poller_liveness_unit` (41), `supervisor_classify_unit` (37),
 case, the tick dispatch entry, the counter exclusion, the limiter and the retired remedy text each red
 exactly the arms that claim them.
 
-## Unreleased — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
+## v0.44.0 — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
 
 INST-4 made the *record* of an action idempotent (`lifecycle_events` has a UNIQUE index on
 `idem_key`). INST-5 bounded *who* may act and *what* they may act on. Neither could answer the
@@ -493,7 +909,7 @@ next (email / pay / publish) would have been double-send, double-pay, double-pub
   the double-claim refusal must go red), the inversion arm with its live control, and a realistic
   pre-INST-8 store fixture for the migration.
 
-## Unreleased — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
+## v0.44.0 — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
 
 `5dive memory consolidate` had produced atoms **once across the entire fleet** while
 `/var/log/5dive-heartbeat.log` reported `13 seat(s) distilled, 4 failed, 0 not due` every six hours
@@ -533,7 +949,7 @@ it is a liveness check wearing a productivity label; and **hand-written artifact
 are not evidence the pipeline ran** — a populated output directory reads exactly like a working
 extractor, and only the ledger tells them apart.
 
-## Unreleased — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
+## v0.44.0 — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
 
 A session window dies and everything it learned dies with it, because "compile before you close" is
 a HABIT and a habit is not a mechanism. The motivating case is on the record: the very
@@ -601,7 +1017,7 @@ Tests: `tests/memory_consolidate_unit.sh`, 53 assertions, offline by constructio
 an injected seam). Four mutants — the live-session skip, the dry-run ledger guard, the ledger skip,
 and the errexit fix — each red exactly the arm meant to catch it.
 
-## Unreleased — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
+## v0.44.0 — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
 
 DIVE-3172 made the nightly restart conditional on the agent payload actually moving, which takes a
 CLI-only night to zero restarts. This is the belt for the nights the payload genuinely moves: those
@@ -640,7 +1056,7 @@ concern - our nightly updates kills some active agents mid tasks"*).
   three sweeps of one marker — parked mid-task is NOT restarted and keeps its marker; the row closes
   and the SAME marker fires the bounce; the next sweep does not bounce it again.
 
-## Unreleased — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
+## v0.44.0 — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
 
 Since DIVE-1935 the mandatory auto-detect merge gate has said so when its repo scan cannot
 complete: it warns, writes a `task.merge-gate-unverified` row to the audit log, and lets the close
@@ -672,7 +1088,7 @@ never read is a receipt, not a control.
 - **Exit status is the consumable signal** (1 when any stamped close still has an open PR), because
   a stamp with no consumer is the whole defect.
 
-## Unreleased — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
+## v0.44.0 — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
 
 `--apply` was already safe: it deletes only on a closed PR whose head SHA equals the branch's
 current SHA, and age never entered that path. **The digest above it was the problem.** Its
@@ -736,7 +1152,7 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
   the invariant `branch-hygiene-report.sh` greps for when it runs this same script against
   `lodar/5dive-api` and `lodar/5dive-frontend`.
 
-## Unreleased — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
+## v0.44.0 — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
 
 The constitution validator and the authority reader accepted **disjoint** subsets of YAML, so the
 key was unsettable through any path: `council amend` threw `use inline arrays in constitution v0`
@@ -762,7 +1178,7 @@ worked example — so the template failed the validator shipping beside it.
   *"no motion could have succeeded"*, not *"nobody convened one"* — an instrument that measured its
   own writer.
 
-## Unreleased — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
+## v0.44.0 — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
 
 lodar, 2026-08-16, on a routine branch-push approval waking the org lead: *"why dev2 cannot do
 delegated push himself and burns your token for approval?"* An approval gate whose ask is an
@@ -796,7 +1212,7 @@ permanent gate record and digest line intact, and **no ping to anyone**.
 - **`5dive task pfr-autoclear [on|off|status]`**, default **on**, restores the lead ping with no
   release.
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.44.0 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -826,7 +1242,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.44.0 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -850,7 +1266,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.44.0 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -883,7 +1299,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.44.0 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -917,7 +1333,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.44.0 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -959,7 +1375,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.44.0 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -1023,7 +1439,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.44.0 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
