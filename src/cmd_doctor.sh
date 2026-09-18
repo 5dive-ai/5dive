@@ -1478,7 +1478,27 @@ cmd_doctor() {
             doctor_add registry "agent:$name" error "$env_file missing (run with --repair)" true false
           fi
         else
-          doctor_add registry "agent:$name" ok "entry + user + env file all present"
+          # Entry, user and env file are three PRESENCE facts about the box, and
+          # a seat can hold all three and still have been launched without a
+          # usable credential — the launcher says so in the journal and persists
+          # its verdict in the seat's own breadcrumb, which `agent info` already
+          # reads as `startup: degraded`. doctor read none of it and printed
+          # [ok], so the one surface an operator runs to ask "is this box well?"
+          # was the one surface that could not see a seat that cannot transact.
+          # No provider re-probe here: the breadcrumb IS the launcher's verdict,
+          # and the next boot that sees a usable credential clears it.
+          local seat_health seat_reason
+          seat_health=$(_agent_startup_credential_health "$name" 2>/dev/null) || seat_health=""
+          seat_reason="${seat_health#*|}"
+          if [[ "$seat_health" == "degraded|"* ]]; then
+            doctor_add registry "agent:$name" error \
+              "launched DEGRADED — ${seat_reason}; run: sudo 5dive agent auth status --agent=$name, then the 'agent auth start ...' it names, then restart the seat" false false
+          else
+            # `unknown|...` keeps the ok line on purpose. A home we cannot read
+            # is not a seat we know is broken, and doctor must not manufacture
+            # an error out of its own permission boundary.
+            doctor_add registry "agent:$name" ok "entry + user + env file all present"
+          fi
         fi
       done
       # DIVE-4340: and now the CONVERSE. Everything above asks "does this
