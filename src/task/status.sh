@@ -161,7 +161,16 @@ _merge_at_close_do() {
     warn "$ident: $_dref reads auto-mergeable at the graded sha, but the merge rail refused (DIVE-4137) — see its message above. Nothing changed; this close is refused below exactly as it would have been."
     return 1
   fi
-  if [[ "$_am_did" == "enqueued" ]]; then
+  if [[ "$_am_did" == "already-merged" ]]; then
+    # The rail found the pull request ALREADY on the target branch and
+    # performed nothing. Audited and said under its own name, because the two
+    # arms below both assert that THIS SEAT acted — and crediting a seat with a
+    # landing the maintainer made is the same false record DIVE-4428 fixed for
+    # the enqueue, one outcome further out. The hold is still retired below: a
+    # merged pull request is owed a merge by nobody.
+    _task_store_audit_log "task.merge-already-landed" ok 0 -- "$ident" "ref=$_dref grader=$_am_actor graded_sha=${_am_graded:-none}"
+    warn "$ident: $_dref was ALREADY MERGED before this close asked — recorded, NO MERGE PERFORMED and no machine account used. Re-reading the merge state now; every gate below still runs on it."
+  elif [[ "$_am_did" == "enqueued" ]]; then
     _task_store_audit_log "task.enqueued-at-close" ok 0 -- "$ident" "ref=$_dref grader=$_am_actor graded_sha=${_am_graded:-none}"
     warn "$ident: $_dref was CLEAN at the graded sha ${_am_graded:0:12} with every required check green, so the seat that graded it handed it to the target branch's MERGE QUEUE as the machine account rather than routing the button back to the maker (DIVE-4137). This is NOT a landed merge — the queue lands it or ejects it — so the close still asks the gate's own probe and will refuse until it reads MERGED."
   else

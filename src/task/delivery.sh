@@ -1962,7 +1962,14 @@ _merge_disp_probe() {
 _merge_disp_read() {
   local rc="${1:-1}" out="${2:-}"
   (( rc == 0 )) || return 0
-  if [[ "$out" == *'_merge_do: disposition=enqueued'* ]]; then
+  # ORDER IS NOT ALPHABETICAL: `already-merged` is tested first because it is the
+  # outcome that performed NOTHING, and a reader that fell through to `merged`
+  # would credit this seat with a landing the maintainer made. Same class of
+  # false record as the enqueue-read-as-merge that DIVE-4428 fixed, one outcome
+  # further out.
+  if [[ "$out" == *'_merge_do: disposition=already-merged'* ]]; then
+    printf 'already-merged\n'
+  elif [[ "$out" == *'_merge_do: disposition=enqueued'* ]]; then
     printf 'enqueued\n'
   else
     printf 'merged\n'
@@ -2016,7 +2023,20 @@ cmd_task_merge() {
   # An enqueue is not a landing. The primitive says which one happened; saying
   # "merged" over an enqueue is how a seat closes a row on a merge that has not
   # happened, and the queue can still eject it.
-  if [[ "$(_merge_disp_read "$rc" "$out")" == "enqueued" ]]; then
+  local _disp; _disp=$(_merge_disp_read "$rc" "$out")
+  if [[ "$_disp" == "already-merged" ]]; then
+    # RETIRE THE HOLD, because the thing it was held for has happened. This is
+    # the SAME record `_merge_at_close_do` makes on a landing (status.sh) and it
+    # is made here for the same reason: a row whose pull request is on the target
+    # branch is owed no merge by anybody, and leaving `merge_owner` set paints
+    # the board with an action nobody can take.
+    db "UPDATE tasks SET merge_owner=NULL, merge_hold_reason=NULL WHERE ident=$(sqlq "$ident");" || true
+    _task_store_audit_log "task.merge-already-landed" ok 0 -- "$ident" "actor=$actor"
+    ok "$ident: the pull request this seat graded PASS was ALREADY MERGED upstream — recorded, NO MERGE PERFORMED and no machine account used. The merge hold is retired; this seat did not land it and is not credited with it" \
+       '{ident:$id, merged:true, enqueued:false, already_merged:true, performed:false, actor:$ac}' --arg id "$ident" --arg ac "$actor"
+    return 0
+  fi
+  if [[ "$_disp" == "enqueued" ]]; then
     ok "$ident ENQUEUED — the pull request this seat graded PASS is in the target branch's merge queue and NOT yet on it; no second seat was asked. The queue lands it or ejects it — confirm with mergedAt before calling it shipped" \
        '{ident:$id, merged:false, enqueued:true, actor:$ac}' --arg id "$ident" --arg ac "$actor"
     return 0
@@ -2059,6 +2079,59 @@ _task_merge_preflight() {
   esac
 }
 
+# _merge_landed_read <pr-ref> <repo-slug> — HAS THIS PULL REQUEST ALREADY MERGED?
+# Prints `<merge-commit-sha>|<mergedAt>` when it has, and NOTHING otherwise (not
+# merged, or GitHub could not be asked). Never fails the caller: an unanswerable
+# read is indistinguishable from "not merged yet" for the ONE decision it feeds,
+# which is whether there is still a merge left to perform — and that decision
+# fails towards today's behaviour, the credential demand.
+#
+# WHY IT IS ITS OWN FUNCTION, and not three lines inside `cmd_task_merge_do`:
+# that caller is root-only and reached through a sudo hop, so a harness cannot
+# execute it. The same argument DIVE-4428 iteration 2 made when it split
+# `_merge_do_at_github` out — "a branch graded by grepping the source is not
+# graded at all" — applies here, and this branch decides whether a credential is
+# demanded. So it is executed, over a stubbed `gh`, in
+# tests/task_merge_already_merged_unit.sh.
+#
+# THE READ IS CREDENTIAL-FREE BY CONSTRUCTION: `_gate_gh` is handed an EMPTY
+# token, which is the same cheapest rail `_gate_pr_state` uses for the merge gate
+# and `merge-gate-selftest` — a seat's own `gh` auth, the bot rail if one exists,
+# or DIVE-2770's anonymous rail for a public repo. Asking what a pull request IS
+# has never needed a machine account; only merging one does.
+_merge_landed_read() {
+  local ref="$1" slug="${2:-}" out=""
+  local -a repo_arg=()
+  [[ "$ref" =~ ^[0-9]+$ ]] && repo_arg=(--repo "$slug")
+  out=$(_gate_gh "" 10 pr view "$ref" "${repo_arg[@]}" \
+          --json state,mergedAt,mergeCommit \
+          -q '[ (.mergeCommit.oid // "null"), (.mergedAt // "null") ] | join("|")' \
+          2>/dev/null) || out=""
+  # `mergedAt` is the operand, not `state`: it is the field that only a LANDING
+  # sets. A queue-evicted pull request reads state=OPEN and a closed-unmerged one
+  # reads state=CLOSED, and neither of them carries a mergedAt (DIVE-4337).
+  local _at="${out#*|}"
+  [[ -n "$out" && "$out" == *"|"* && -n "$_at" && "$_at" != "null" ]] || return 0
+  printf '%s\n' "$out"
+}
+
+# _merge_do_already_landed <pr-ref> — 0 when the pull request has ALREADY merged
+# and the marker has been written; 1 when there is still a merge to perform.
+#
+# The caller's whole use of it is `_merge_do_already_landed "$pr" && return 0`, so
+# the 1 is load-bearing in the ordinary direction: everything that is not a
+# confirmed landing — not merged, closed unmerged, evicted from the queue, or a
+# GitHub that could not be asked at all — carries on to the credential demand and
+# behaves exactly as it does today.
+_merge_do_already_landed() {
+  local pr="$1" _ml=""
+  _ml=$(_merge_landed_read "$pr" "$(_gate_slug_from_url "$pr")") || _ml=""
+  [[ -n "$_ml" ]] || return 1
+  printf '%s is ALREADY MERGED upstream as %s at %s — NOTHING WAS MERGED by this call and no machine account was used. Recording the landing that already happened.\n_merge_do: disposition=already-merged\n' \
+    "$pr" "${_ml%%|*}" "${_ml#*|}" >&2
+  return 0
+}
+
 # cmd_task_merge_do — ROOT-ONLY (`_merge_do`). Re-derives everything: the caller
 # from SUDO_UID, the standing from the row, and the pull request from the row's
 # own delivery_ref. Accepts an IDENT and nothing else, so there is no argument
@@ -2088,6 +2161,44 @@ cmd_task_merge_do() {
   pr=$(db "SELECT delivery_ref FROM tasks WHERE ident=$(sqlq "$ident") AND $(_task_merge_standing_sql "$actor") LIMIT 1;" 2>/dev/null || printf '')
   [[ -n "$pr" ]] \
     || fail "$E_AUTH_REQUIRED" "_merge_do: ${actor} holds no merge standing on ${ident} — the row must be graded PASS BY ${actor}, still carry the delivery_ref that grade was recorded against, and not have been rejected since. Re-derived here as root from the row; the caller's view of it is not consulted. \`5dive task show ${ident}\` prints the fields this predicate reads."
+
+  # A READ NEEDS NO MACHINE ACCOUNT; ONLY A MERGE DOES — so ask what
+  # the pull request IS before demanding the credential to change it.
+  #
+  # THE DEFECT THIS REMOVES. The demand below was unconditional, and it sat
+  # AFTER standing but BEFORE anything had read the pull request. On a box with
+  # no bot connector that made a row whose pull request THE MAINTAINER ALREADY
+  # MERGED — the normal case for an outside contributor, who cannot merge in the
+  # target repo at all — closable by nobody: this verb demanded a credential to
+  # perform a merge that had already happened; `task done` refused with
+  # done-redelivers-a-graded-merge (DIVE-4520) or done-before-pr-merged
+  # (DIVE-1830); `--force-redeliver` wants delivery fields; and `task assign` is
+  # refused when the closer is the verifier. What was left was re-pointing the
+  # verifier, reassigning, and closing as the new assignee — three verbs and an
+  # audit trail that says the GRADER CHANGED, to record a merge that happened
+  # without us. Measured on DIVE-549 / 5dive-ai/5dive#998, 2026-09-17: merged
+  # upstream 14:21Z, row graded PASS, every close path refused.
+  #
+  # IT WIDENS NO AUTHORITY. Standing is already re-derived above, as root, over
+  # the shared predicate, and the pull request is still the row's own
+  # delivery_ref — this branch reads that same pull request and returns; it
+  # cannot reach a different one, cannot merge anything, and cannot be entered by
+  # a row that failed the standing query. The only thing it changes is WHICH
+  # rows have to hold a credential: the ones with a merge still to perform.
+  #
+  # IT FAILS TOWARDS TODAY'S BEHAVIOUR. `_merge_landed_read` prints nothing when
+  # GitHub cannot be asked, which is the same answer it gives for "not merged" —
+  # so an unreachable GitHub lands on the credential demand exactly as it does
+  # now, rather than on a quiet success. The direction matters: the wrong way
+  # round, an unanswerable read would report a merge that nobody has confirmed.
+  #
+  # IN ITS OWN FUNCTION, for the DIVE-4428 iteration-2 reason: `cmd_task_merge_do`
+  # is root-only behind a sudo hop, so a harness cannot execute this branch here.
+  # `_merge_do_already_landed` can be executed, and is — the arms over it run the
+  # branch rather than grepping for it. What a harness still cannot execute is
+  # this branch's POSITION, so the harness asserts that separately, by line
+  # number, against the credential demand below.
+  _merge_do_already_landed "$pr" && return 0
 
   [[ -r "$_GH_BOT_ENV" ]] \
     || fail "$E_GENERIC" "machine-account credential missing ($_GH_BOT_ENV) — 5dive secret write ${_GH_BOT_KEY} --connector=github-bot"
