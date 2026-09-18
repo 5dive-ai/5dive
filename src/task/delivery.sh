@@ -149,6 +149,7 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
   # a result written after the grade would sit under its own evidence.
   if (( want_result )); then
     db "UPDATE tasks SET result=$(sqlq_or_null "$result") WHERE id=${id};"
+    _five_flush_write_notes
   fi
   local out rc=0
   out=$(cmd_task_verify "$ident" --no-done --cmd="$stored" 2>&1) || rc=$?
@@ -391,6 +392,7 @@ cmd_task_deliver() {
   if [[ -n "$_vfier" && "$_vfier" != "$_asignee" ]] && ! _task_verify_grants "$id"; then
     warn "$ident: delivery recorded, grading handoff DECLINED (verify=$(box_verify_policy), DIVE-4251) — the grader named on the row is '$_vfier', but this box's verification policy grants this row no grader session, so it is not routed and no grader is spawned. It stays with '$_asignee' to close. Change the box with '5dive config verify=always', or file the row with --verify."
     (( want_result )) && db "UPDATE tasks SET result=$(sqlq_or_null "$result") WHERE id=${id};"
+    _five_flush_write_notes
     ok "$ident delivered ($pr) — recorded; not routed for grading (verify=$(box_verify_policy))" \
        '{id:($i|tonumber), ident:$id, deliveryRef:$p, delivered:true, routedTo:null, gradingDeclined:true, verifyPolicy:$vp, status:"in_progress"}' \
        --arg i "$id" --arg id "$ident" --arg p "$pr" --arg vp "$(box_verify_policy)"
@@ -406,6 +408,7 @@ cmd_task_deliver() {
   # No distinct verifier: record the delivery but do NOT close — a verifier must
   # confirm the merge and close it. Leave the task in_progress.
   (( want_result )) && db "UPDATE tasks SET result=$(sqlq_or_null "$result") WHERE id=${id};"
+  _five_flush_write_notes
   # DIVE-2204: the two rows that land here are NOT the same claim. verifier=='' has
   # no verifier at all; verifier==assignee HAS one, just not distinct from the
   # assignee. Saying "no distinct verifier" for the latter reads as "unverified" to
@@ -1499,6 +1502,7 @@ cmd_task_reject() {
   # tests/task_close_preserves_done_at_unit.sh (arm G).
   if (( maxi > 0 && iter >= maxi )); then
     db "UPDATE tasks SET result=$(sqlq "$fb_txt") WHERE id=${id};"
+    _five_flush_write_notes
     # DIVE-2777: THE SECOND WRITE SITE GETS THE EVENT TOO, and this branch is the
     # one that most needs it — it is the terminal reject, the bounce that ends the
     # loop and parks it on a human, and it `return`s before the emit below.

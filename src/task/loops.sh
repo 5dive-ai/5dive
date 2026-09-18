@@ -737,6 +737,7 @@ cmd_task_verify() {
     _vg_a=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
     if [[ -n "$_vg_t" && -z "$_vg_a" ]]; then
       db "UPDATE tasks SET result=$(sqlq "$result_txt") WHERE id=${id};"
+      _five_flush_write_notes   # recorded BEFORE the refusal below, so the note is true
       policy_refuse "$E_CONFLICT" verify-close-over-open-gate DIVE-2196 "$ident" \
         "$ident has a pending '${_vg_t}' gate awaiting a human — the verify verdict is RECORDED, but the auto-close is refused: closing here would drop the human's question out of every open-gate view without anyone answering it, which is DIVE-555's bypass reached by a different verb. Exits: let them answer it ('5dive task answer $ident --value=...'), withdraw it if your result makes it moot ('5dive task need $ident --withdraw'), or re-run with --no-done to record evidence without closing."
     fi
@@ -768,6 +769,7 @@ cmd_task_verify() {
           && "$_svc_status" != "done" && "$_svc_status" != "cancelled" ]]; then
       if [[ -z "$_svc_auth_actor" ]]; then
         db "UPDATE tasks SET result=$(sqlq "$result_txt") WHERE id=${id};"
+        _five_flush_write_notes   # recorded before the refusal below
         fail "$E_PERMISSION" "$ident verify passed and was recorded, but auto-close was refused: the caller identity could not be authenticated"
       fi
       if [[ "$_svc_auth_actor" == "$self_verify_maker" ]]; then
@@ -816,6 +818,7 @@ cmd_task_verify() {
     # refusal deliberately allows) refreshed done_at here, same as the close
     # verbs did. COALESCE for the same reason and by the same rule: first close wins.
     db "UPDATE tasks SET status='done', done_at=COALESCE(done_at, datetime('now')), result=$(sqlq "$result_txt") WHERE id=${id};"
+    _five_flush_write_notes
     flipped=1
     if (( self_verified_close )); then
       _task_store_audit_log "task.verify-self-close" "self-verified-close" 0 -- \
@@ -866,6 +869,7 @@ cmd_task_verify() {
            graded_verdict=$( (( rc == 0 )) && printf "'pass'" || printf "'fail'" ),
            graded_verdict_at=datetime('now')
         WHERE id=${id};"
+        _five_flush_write_notes   # the graded write lands here
 
     # DIVE-4137: RECORD WHO OWES THE MERGE, at the moment the grade is stamped.
     #
@@ -1059,6 +1063,14 @@ cmd_task_verify() {
       fi
     else
       warn "$ident verify FAIL (exit $rc) — status unchanged"
+      # A FAIL VERDICT IS A REPORTED OUTCOME, NOT A SILENT DEATH. `warn` does not
+      # set the reported flag (only `fail` does), so the DIVE-2598 backstop on the
+      # EXIT trap saw a non-zero exit with nothing claimed and printed "5dive task
+      # exited 1 without reporting a reason. This is a bug in the CLI, not a
+      # refusal … Please file it: 5dive bug." over a grade that had just been
+      # recorded correctly on the row. The exit status stays 1 so a shell caller
+      # can still branch on the verdict; only the false crash report goes.
+      mark_reported
     fi
   fi
   return $(( rc == 0 ? 0 : 1 ))
