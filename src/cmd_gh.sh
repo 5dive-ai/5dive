@@ -546,6 +546,34 @@ cmd_gh_do() {
   # flag does not already give them: the allowlist below is re-derived here, so the
   # widest thing this sentinel can unlock is `gh pr review` as 5dive-reviewer,
   # which is the whole purpose of the credential.
+  # THE PRESENCE PROBE. A leading `--probe` sentinel answers one
+  # question — is the machine-account connector actually there — and answers it
+  # WHERE THE ANSWER LIVES, which is as root: `/etc/5dive/connectors` is
+  # root-only, so a non-root caller cannot tell an absent credential from an
+  # unreadable one, and `_gh_bot_available`'s own header says so.
+  #
+  # WHY IT IS NEEDED AT ALL. `_gate_gh_bot_ok` asks `sudo -n -l` — may this seat
+  # ROUTE through this helper — and its own comment says "No network, no token".
+  # Callers were printing that permission answer as AVAILABILITY. Measured
+  # 2026-09-18 on a box with no connector file at all: `task merge-gate-selftest`
+  # printed "machine-account rail: available" while every verb that then took the
+  # rail failed on "machine-account credential missing".
+  #
+  # First position only and stripped before anything else reads the argv, the same
+  # discipline the identity sentinel below uses, so it can never reach `gh`. It
+  # resolves no token, execs nothing and prints nothing: the exit status IS the
+  # answer, which is what makes it safe to expose to any seat holding the grant.
+  if [[ "${args[0]}" == "--probe" ]]; then
+    _gh_bot_available && return 0
+    # A silent non-zero is the DIVE-2598 backstop's trigger, and this one is a
+    # VERDICT rather than a death: without this the probe's own "no" would be
+    # reported to the operator as "5dive exited 1 without reporting a reason.
+    # This is a bug in the CLI". The caller reads the status; nothing is printed
+    # on purpose.
+    mark_reported
+    return 1
+  fi
+
   local identity="bot"
   if [[ "${args[0]}" == "--identity=reviewer" ]]; then
     identity="reviewer"
