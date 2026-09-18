@@ -157,6 +157,109 @@ else
   bad_t "the reference resolver returns the published head sha" "rc=$rc out=$out"
 fi
 
+# --- SEAT-OWNED CLONES ------------------------------------------------------
+# Every clone this check reads lives under ANOTHER uid's $HOME, and doctor runs
+# as root. Since CVE-2022-24765 git refuses a repository owned by another user,
+# so the plain `git -C "$clone"` this function used failed for every clone but
+# the sudo caller's own (git exempts SUDO_UID) — and a 35-seat box read as
+# "1 of 35 current, 32 unreadable-clone" from a terminal and "0 of 35" from
+# cron. That is rule 1 firing on a permission artefact rather than on anything
+# about the clones, and it hid two genuinely stale readers inside the UNKNOWN
+# bucket.
+#
+# The synthetic homes here are owned by the runner, so git never refuses them
+# and the arms above cannot see this at all. So MODEL the refusal: a `git` first
+# on PATH that fails the three read verbs unless the caller scoped a
+# safe.directory to that clone on the command line, and is the real git
+# otherwise.
+STRICT_BIN="$TMP/strict-bin"; mkdir -p "$STRICT_BIN"
+STRICT_REAL_GIT="$(command -v git)"; export STRICT_REAL_GIT
+cat >"$STRICT_BIN/git" <<'STRICTGIT'
+#!/usr/bin/env bash
+# Test double for git >= 2.35.2 meeting a repo owned by another uid. The refusal
+# is lifted ONLY by a safe.directory scoped to that repo in PROTECTED config,
+# which on a command line means `-c safe.directory=<repo>`.
+guard="${STRICT_CLONE:-}"
+targeted=0 scoped=0 verb="" prev=""
+for a in "$@"; do
+  case "$a" in
+    rev-parse|cat-file|rev-list) [[ -z "$verb" ]] && verb="$a" ;;
+  esac
+  [[ "$prev" == "-C" && -n "$guard" && "$a" == "$guard" ]] && targeted=1
+  [[ "$prev" == "-c" && "$a" == "safe.directory=$guard" ]] && scoped=1
+  prev="$a"
+done
+if (( targeted )) && [[ -n "$verb" ]] && (( ! scoped )); then
+  printf "fatal: detected dubious ownership in repository at '%s'\n" "$guard" >&2
+  exit 128
+fi
+exec "$STRICT_REAL_GIT" "$@"
+STRICTGIT
+chmod +x "$STRICT_BIN/git"
+
+SAVED_PATH="$PATH"; SAVED_HOMES="$HOMES"
+HOMES="$TMP/seat-owned"; mkdir -p "$HOMES"
+make_home s-current current
+make_home s-stale   stale
+PATH="$STRICT_BIN:$PATH"
+
+# assert_read <label> — the seat-owned clone was READ: it is inside the counted
+# population and nowhere in the UNKNOWN bucket. Both halves matter — the mutant
+# below moves it from one to the other.
+assert_read() {
+  local row; row=$(run_check "$NEW_SHA")
+  if jq -e '.message | test("^STALE: 1 of 2 ") and (test("unreadable-clone") | not)' <<<"$row" >/dev/null; then
+    ok_t "$1"
+  else
+    bad_t "$1" "$row"
+  fi
+}
+
+# S0. The double really refuses — otherwise every arm below passes on any tree.
+export STRICT_CLONE="$HOMES/s-current/$REL"
+if ! git -C "$STRICT_CLONE" rev-parse HEAD >/dev/null 2>&1 \
+   && [[ "$(git -C "$STRICT_CLONE" -c "safe.directory=$STRICT_CLONE" rev-parse HEAD 2>/dev/null)" == "$NEW_SHA" ]]; then
+  ok_t "S0: the seat-owned double refuses an unscoped read and allows a scoped one"
+else
+  bad_t "S0: the double discriminates" "the refusal is not modelled; S1-S3 would be vacuous"
+fi
+
+# S1. A CURRENT seat-owned clone is counted current, not filed as unreadable.
+assert_read "S1: a seat-owned clone is READ, not filed as unreadable-clone"
+
+# S2. And a STALE seat-owned clone is graded WITH its distance — which only
+#     holds if cat-file and rev-list are scoped too, not just rev-parse.
+export STRICT_CLONE="$HOMES/s-stale/$REL"
+assert_row "S2: a stale seat-owned clone is graded with its distance (cat-file + rev-list are scoped too)" \
+  "$NEW_SHA" warn "behind: s-stale:${OLD_SHA:0:7} \\(behind by 1\\)"
+
+# S3. MUTANT — strip the scoping and the whole fleet goes back to unreadable.
+#     BEFORE/AFTER on purpose: "the scoping is gone" is also true of a sed that
+#     matched nothing, which would make the arm below pass against any tree.
+MP_ORIG="$(declare -f doctor_check_marketplace_clones)"
+MP_MUT="$(printf '%s\n' "$MP_ORIG" | sed 's/ -c "safe\.directory=\$clone"//g')"
+[[ "$(grep -c 'safe\.directory=\$clone' <<<"$MP_ORIG")" == "3" ]] \
+  && ok_t "S3a: BEFORE — all three read verbs carry the scoped safe.directory" \
+  || bad_t "S3a: all three reads are scoped" "found $(grep -c 'safe\.directory=\$clone' <<<"$MP_ORIG") of 3; the mutant below is weaker than it looks"
+{ [[ "$MP_MUT" != "$MP_ORIG" ]] && ! grep -q 'safe\.directory' <<<"$MP_MUT"; } \
+  && ok_t "S3b: AFTER — the mutation really removed it (the sed matched)" \
+  || bad_t "S3b: the mutation took" "the sed did not match; the mutant is not mutated"
+
+eval "$MP_MUT"
+export STRICT_CLONE="$HOMES/s-current/$REL"
+assert_row "S3c: MUTANT — an unscoped read files a readable current clone as unreadable-clone (S1 is red on it)" \
+  "$NEW_SHA" warn "UNKNOWN:.*s-current:unreadable-clone"
+export STRICT_CLONE="$HOMES/s-stale/$REL"
+assert_row "S3d: MUTANT — and the stale clone's distance is unmeasurable too (S2 is red on it)" \
+  "$NEW_SHA" warn "UNKNOWN:.*s-stale:unreadable-clone"
+
+eval "$MP_ORIG"
+export STRICT_CLONE="$HOMES/s-current/$REL"
+assert_read "S3e: RESTORE took — the shipped check reads the seat-owned clone again"
+
+unset STRICT_CLONE
+PATH="$SAVED_PATH"; HOMES="$SAVED_HOMES"
+
 # 10. THE WIRING, EXECUTED — not read. A check nobody dispatches is a check that
 #     never runs, and `--category=plugins` failing usage would make the surface
 #     unreachable exactly the way `--category=policy` was (DIVE-2327). Stub the

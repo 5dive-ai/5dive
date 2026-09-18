@@ -345,7 +345,15 @@ doctor_check_marketplace_clones() {
       fi
       continue
     fi
-    sha=$(git -C "$clone" rev-parse HEAD 2>/dev/null) || sha=""
+    # doctor runs as root, but each clone is owned by ITS OWN seat uid. Since
+    # CVE-2022-24765 git refuses a repository owned by another user, so a plain
+    # `git -C "$clone"` here failed for every clone except the sudo caller's own
+    # (git exempts SUDO_UID) and this check read a whole fleet as
+    # `unreadable-clone` — rule 1 above firing on a permission artefact rather
+    # than on anything about the clones. `-c` is protected config, so git honours
+    # a safe.directory given on the command line; scoping it to THIS clone leaves
+    # nothing box-wide behind, unlike `safe.directory=*` or an /etc/gitconfig edit.
+    sha=$(git -C "$clone" -c "safe.directory=$clone" rev-parse HEAD 2>/dev/null) || sha=""
     if [[ -z "$sha" ]]; then
       unknown+=("$name:unreadable-clone")
     elif [[ -z "$ref_sha" ]]; then
@@ -356,8 +364,8 @@ doctor_check_marketplace_clones() {
       # Distance is only computable when the published commit is in THIS clone's
       # object store; a clone that never fetched it can still be graded stale.
       behind=""
-      if git -C "$clone" cat-file -e "${ref_sha}^{commit}" 2>/dev/null; then
-        behind=$(git -C "$clone" rev-list --count "HEAD..$ref_sha" 2>/dev/null)
+      if git -C "$clone" -c "safe.directory=$clone" cat-file -e "${ref_sha}^{commit}" 2>/dev/null; then
+        behind=$(git -C "$clone" -c "safe.directory=$clone" rev-list --count "HEAD..$ref_sha" 2>/dev/null)
       fi
       if [[ -n "$behind" ]]; then
         stale+=("$name:${sha:0:7} (behind by $behind)")
