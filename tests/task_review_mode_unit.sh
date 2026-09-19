@@ -98,13 +98,14 @@ expect_mode() { # <label> <want> <flags...>
   [[ "$got" == "$want" ]] && ok_t "$label -> $want" || bad_t "$label -> $want" "review_mode='$got'"
 }
 
-echo "── the four modes, explicitly chosen ────────────────────────────"
+echo "── the five modes, explicitly chosen ────────────────────────────"
 expect_mode "review none"  none        --review=none
 # DIVE-4623: `--review=check` now also needs its negative control. The mode
 # resolution these arms grade is unchanged; the control is a filing-time
 # requirement of the same flag, so it rides along rather than earning its own
 # fixture.
 expect_mode "review check" check       --review=check --verify="npm test" --mutant="sed -i s/expect/xx/ test.js"
+expect_mode "review rubric" rubric     --review=rubric
 expect_mode "review temp"  temp        --review=temp
 expect_mode "review seat"  seat:quinn  --review=quinn
 
@@ -176,6 +177,7 @@ _task_verify_skip_reason() { printf ''; }   # isolate the policy from the classi
 set_policy never
 expect_mode "verify=never + no flag"           none  --body="a real code row"
 expect_mode "verify=never + --review=temp"     none  --review=temp --body="a real code row"
+expect_mode "verify=never + --review=rubric"   none  --review=rubric --body="a real code row"
 expect_mode "verify=never + --review=<seat>"   none  --review=quinn --body="a real code row"
 expect_mode "verify=never + --verifier=<seat>" none  --verifier=quinn --body="a real code row"
 expect_mode "verify=never + --review=check"    check --review=check --verify="npm test" --mutant="sed -i s/expect/xx/ test.js" --body="a real code row"

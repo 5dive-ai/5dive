@@ -154,7 +154,7 @@ _task_verify_row_source() {  # <task-id>
 # would cost a session resolves to `none`. A mode is what the filer asked for; a
 # policy is what the box will pay for, and conflating them is how `--tier=1` on
 # an approval became a no-op that looked like a control (see the rules file).
-_REVIEW_MODE_FIXED="none check temp"
+_REVIEW_MODE_FIXED="none check rubric temp"
 
 # `review_mode_kind <mode>` — none|check|temp|seat|invalid. `seat` is any other
 # non-empty token, validated as an agent name by the caller (which has the lane
@@ -179,6 +179,7 @@ review_mode_cost_note() {  # <mode>
   case "$(review_mode_kind "${1:-}")" in
     none)  printf 'no grader — "task done" closes it outright' ;;
     check) printf 'graded by a command, no grader session' ;;
+    rubric) printf 'one fixed six-question cheap pass; flags escalate to a full grade' ;;
     temp)  printf 'one grader session per delivery, then gone' ;;
     seat)  printf 'graded by %s in its own session' "${1#seat:}" ;;
     *)     printf 'unknown' ;;

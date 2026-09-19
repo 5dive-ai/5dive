@@ -804,6 +804,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   delivery_ref           TEXT,
   delivered_at           TEXT,
   delivery_ref_iteration INTEGER,
+  -- DIVE-4634: the immutable grading source. `task deliver` records the maker's
+  -- stable Git common directory and exact HEAD so the grader can create a
+  -- detached worktree from the already-present object store even after the
+  -- maker's task worktree is reclaimed, instead of cloning and installing.
+  -- Both are nullable for deliveries made before this shipped.
+  delivery_repo_path     TEXT,
+  delivered_sha          TEXT,
   -- OSS-27 (OSS-19 re-plan cycle): provenance for a task ORIGINATED by an
   -- objective's planner cycle. originated_by_objective = objectives.id that
   -- filed it; originated_cycle = the objective_cycles.cycle_no it was filed in.
@@ -1825,6 +1832,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   # is "not urgent", which is the truth for every pre-existing row.
   'gate_urgent INTEGER'
   'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER'
+  'delivery_repo_path TEXT' 'delivered_sha TEXT'
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
   # DIVE-2730: the add-time `--no-verify`, persisted. Nullable — NULL is "the

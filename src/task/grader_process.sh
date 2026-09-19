@@ -294,14 +294,20 @@ _grader_process_run_open() {  # <seat> <ident> <session_id> [<clone>]
 # names what it did not reach is gradeable and cheap; a silent overrun is the
 # re-derivation this row exists to end.
 _GRADER_TURN_BUDGET="${_GRADER_TURN_BUDGET:-25}"
-_grader_grade_method_clause() {
-  printf 'VERIFY THE CLAIMS, DO NOT RE-INVESTIGATE: read the result'"'"'s CHANGED / CHECKED / DELIVERED-SHA / CI / CRITERIA fields, RE-RUN the commands it names against the sha it delivered at (the maker writes DELIVERED-SHA; `graded-sha` in the result stays YOURS to write), and spot-check the diff against each acceptance criterion — that is the grade. A claim carrying NO evidence is a FAIL, not something for you to go and derive: reject it with FINDING: unevidenced — <the claim>. Budget %s turns for the whole grade; on reaching it, deliver the verdict you have and say which claims you verified and which you did not reach, rather than spending a second session.' \
-    "${_GRADER_TURN_BUDGET:-25}"
+_grader_grade_method_clause() {  # [ident]
+  local ident="${1:-}" mode="temp"
+  [[ -n "$ident" ]] && mode=$(db "SELECT COALESCE(review_mode,'temp') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf temp)
+  if [[ "$mode" == "rubric" ]]; then
+    printf 'RUBRIC GRADE (cheap fixed pass): Run `5dive task grade-context %s` and use only that bounded packet. Answer all six yes/no, quoting the exact packet line for each: (1) does a test exercise the change; (2) is a mutant arm present and does it go red; (3) is any file outside stated scope; (4) do changelog/result claims match the diff; (5) is any secret or real identifier present; (6) does CHECKED contradict the diff. Any adverse flag is a REJECT/escalation; an all-clean pass is the grade. Re-run the named CHECKED commands in GRADE_TREE, then run the packet'"'"'s grade-context --check command before the verdict.' "$ident"
+  else
+    printf 'VERIFY THE CLAIMS, DO NOT RE-INVESTIGATE: Run `5dive task grade-context %s`; use only its acceptance criteria, DIVE-4576 claim block, delivered-sha diff, and named checks. RE-RUN CHECKED in GRADE_TREE, then run the packet'"'"'s grade-context --check command before verdict. A claim carrying NO evidence is a FAIL: reject with FINDING: unevidenced — <claim>. Budget %s turns; at the bound, deliver the verdict and name anything unreached.' \
+      "$ident" "${_GRADER_TURN_BUDGET:-25}"
+  fi
 }
 
 _grader_process_goal() {  # <ident> <session_id> <clone>
-  printf 'You are an ephemeral grader seat (%s, session %s) created for this one delivery: you have no inbox, no heartbeat and no next row, and this seat is removed once your verdict lands. Grade delivered task %s. Your home directory is yours alone — make any checkout or worktree you need inside it, never in a shared checkout. Read the row, grade the delivery, checkpoint each verified arm to the row as you go, then run 5dive task done or 5dive task reject. Do not wait for CI; grade what is at the delivered head. %s' \
-    "$3" "$2" "$1" "$(_grader_grade_method_clause)"
+  printf 'You are an ephemeral grader seat (%s, session %s) created for one delivery: no inbox, heartbeat, or next row. Grade %s from its bounded packet, checkpoint each verified arm, then run task done or task reject. Do not wait for CI. %s' \
+    "$3" "$2" "$1" "$(_grader_grade_method_clause "$1")"
 }
 
 # `_grader_process_spawn <seat> <ident> <session_id>` — start ONE grader process.
@@ -442,8 +448,8 @@ _GRADER_CLONE_START_GRACE_S="${_GRADER_CLONE_START_GRACE_S:-300}"
 # a reading of that profile's window, and a clone created on any other profile
 # would be a grade spent against a budget nobody measured.
 _GRADER_CLONE_CREATE_CMD="${_GRADER_CLONE_CREATE_CMD:-}"
-_grader_clone_create() {  # <clone> <pool_seat>
-  local clone="$1" pool="$2" profile=""
+_grader_clone_create() {  # <clone> <pool_seat> [task-ident]
+  local clone="$1" pool="$2" ident="${3:-}" profile="" model_arg=()
   [[ -n "$clone" && -n "$pool" ]] || return 1
   if [[ -n "$_GRADER_CLONE_CREATE_CMD" ]]; then eval "$_GRADER_CLONE_CREATE_CMD"; return $?; fi
   if [[ -r "${REGISTRY:-}" ]]; then
@@ -454,8 +460,13 @@ _grader_clone_create() {  # <clone> <pool_seat>
   # "authenticated by accident" shape the one-shot failed in — and this time it
   # would fail after spending a seat.
   [[ -n "$profile" ]] || { warn "grader clone ${clone}: pool seat ${pool} has no auth profile to clone"; return 5; }
+  # Rubric is deliberately a cheap-model lane. The fixed prompt contains the
+  # judgement surface; it does not need the pool seat's strongest default.
+  if [[ -n "$ident" ]] && [[ "$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')" == "rubric" ]]; then
+    model_arg=(--model="${_GRADER_RUBRIC_MODEL:-sonnet}")
+  fi
   "$_GRADER_TASK_CLI" agent create "$clone" --type=claude --auth-profile="$profile" \
-    --channels=none --no-skills --no-team-bot --no-heartbeat >/dev/null 2>&1 || return $?
+    "${model_arg[@]}" --channels=none --no-skills --no-team-bot --no-heartbeat >/dev/null 2>&1 || return $?
   _grader_clone_record_origin "$clone" "$pool"
 }
 
@@ -708,7 +719,7 @@ _grader_process_spawn() {  # <seat> <ident> <session_id>
     return 5
   fi
 
-  if ! _grader_clone_create "$clone" "$seat"; then
+  if ! _grader_clone_create "$clone" "$seat" "$ident"; then
     warn "$ident: could not create grader clone ${clone} off ${seat} — row untouched, next tick retries"
     return 6
   fi

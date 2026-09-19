@@ -20,12 +20,14 @@ _task_usage() {
       [--assignee=<agent|role:<r>|charter:<kw>>]
       [--recurring="<5-field cron>"] [--accept=<criteria>|--accept-file=<path>] [--verify=<cmd>]
       [--verifier=<agent>] [--max-iters=<n>] [--no-verify] [--verify] [--task-budget=<tokens|\$cost>]
-      [--review=none|check|temp|<seat>] [--mutant=<cmd>|--no-mutant=<reason>]
+      [--review=none|check|rubric|temp|<seat>] [--mutant=<cmd>|--no-mutant=<reason>]
                                           WHO GRADES THIS ROW — pick it when you file it:
         none          nobody. 'task done' closes it outright.       cost: no session
         check         a command grades it (needs --verify=<cmd> AND --mutant=<cmd>).
                       THE PREFERRED DEFAULT for any row whose result a command can
                       state: it spends no grader session.           cost: no session
+        rubric        one cheap fixed six-question pass over the bounded claim packet.
+                      Any flag, blast-radius path, or --verify escalates to temp.
         temp          one fresh pool session per delivery, gone after.
         <seat>        a pinned standing reviewer grades it in its own session.
         Default when you pass nothing: none for a low-priority row, a bodyless chore
@@ -68,6 +70,8 @@ _task_usage() {
                                                 answer survives only in gate-history, '-' nothing.
                                                 --gated=human is exactly the inbox set.
   show <id|DIVE-N>                              full detail + subtasks + blockers
+  grade-context <id|DIVE-N> [--check=<path>]    materialize/check the private detached grading
+                                                worktree and print the bounded grading packet
   assign <id> <agent>                           reassign
   verifier <id> <agent> [--accept=] [--max-iters=]   attach or re-point the verifier rail
   set-body <id> <text...>|--file=<path> [--append]   replace the body, or append to it
@@ -440,6 +444,7 @@ cmd_task() {
     add|new)         cmd_task_add "$@" ;;
     ls|list)         cmd_task_ls "$@" ;;
     show|view)       cmd_task_show "$@" ;;
+    grade-context)   cmd_task_grade_context "$@" ;;
     gate-history)    cmd_task_gate_history "$@" ;;
     assign)          cmd_task_assign "$@" ;;
     set-branch)      cmd_task_set_branch "$@" ;;
@@ -1099,4 +1104,3 @@ cmd_task_init() {
   tasks_db_init
   ok "tasks store ready at $TASKS_DB" '{path:$p}' --arg p "$TASKS_DB"
 }
-

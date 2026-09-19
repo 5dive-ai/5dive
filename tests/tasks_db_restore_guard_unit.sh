@@ -308,6 +308,12 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # a same-seat worktree at bare origin/main ce8f463a scored 56/0 on this harness
 # while this branch scored 55/1 with got==want, so the count was the only thing
 # failing and the one column is the whole delta.
+#
+# 103 -> 105 (DIVE-4634, 2026-09-19): `delivery_repo_path` + `delivered_sha` —
+# the checkout and immutable head from which a grader materializes its private
+# detached worktree without cloning. READ from a fresh tasks_db_init on this
+# tree: `SELECT count(*) FROM pragma_table_info('tasks')` returned 105; not
+# derived by adding this branch's two-column delta.
 
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
@@ -317,8 +323,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "103" ]] \
-  && ok "fresh schema: all 103 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "105" ]] \
+  && ok "fresh schema: all 105 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

@@ -233,6 +233,13 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
     stored="$given"
     case "$(review_mode_kind "$mode" 2>/dev/null || printf invalid)" in
       check) : ;;
+      rubric)
+        # An explicit command is evidence the fixed rubric cannot adjudicate by
+        # itself. Keep it for the full grader and escalate; never silently turn a
+        # deliberately independent model grade into the maker's own command.
+        db "UPDATE tasks SET review_mode='temp' WHERE id=${id};"
+        warn "$ident: --review=rubric escalated to a full grade because delivery supplied --verify=<cmd> (DIVE-4634)."
+        return 1 ;;
       seat)
         # The row PINNED a NAMED grader at filing. A command given at delivery
         # does not overrule that choice — it is stored as evidence for the seat
@@ -243,6 +250,10 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
         warn "$ident: --verify=<cmd> stored, but this row pins ${mode} as its grader — the command is recorded for that seat to run, not run in its place. File with --review=check to be graded by a command (DIVE-4576)."
         return 1 ;;
       temp)
+        # `_task_deliver_rubric_escalate` may already have promoted rubric to
+        # temp because the row is explicit/blast-radius. In that case the
+        # command is evidence for the grader, not a reason to downgrade again.
+        [[ "${_TASK_RUBRIC_ESCALATED:-0}" == "1" ]] && return 1
         # `temp` is the anonymous ephemeral clone, and it is also what a row gets
         # when the filer chose NOTHING (DIVE-4324's default) — the two are
         # indistinguishable in the column, so this cannot be read as a pin. A
@@ -339,6 +350,156 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
   fi
   policy_refuse "$E_CONFLICT" deliver-command-grade-failed DIVE-4576 "$ident" \
     "$ident: the command that grades this row FAILED at delivery (exit ${rc}) — '$stored'. The delivery ref is recorded and the FAIL verdict is on the row, but it was NOT handed off: no grader session was spawned to discover a red that a command had already found, and no handoff clock is running, so there is no reject to undo. The output tail is in the row's result ('5dive task show $ident'). Fix it and deliver again."
+}
+
+# DIVE-4634: rubric is the cheap lane, never the unsafe lane. Any explicit
+# verification request or any path excluded from the small-delivery classifier
+# promotes it to the ordinary full grade before routing.
+_TASK_RUBRIC_ESCALATED=0
+_task_rubric_local_paths() {  # <id>
+  local id="$1" repo sha base
+  repo=$(db "SELECT COALESCE(delivery_repo_path,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  sha=$(db "SELECT COALESCE(delivered_sha,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  [[ -d "$repo" && "$sha" =~ ^[0-9a-f]{40}$ ]] || return 0
+  base=$(git --git-dir="$repo" merge-base "$sha" origin/main 2>/dev/null || printf '')
+  [[ -n "$base" ]] || return 0
+  git --git-dir="$repo" diff --name-only "$base" "$sha" -- 2>/dev/null || true
+}
+
+_task_path_is_rubric_blast() {  # <path>
+  _task_path_small_denied "$1" && return 0
+  case "${1:-}" in src/task/*) return 0 ;; esac
+  return 1
+}
+
+_task_deliver_rubric_escalate() {  # <id> <ident> [delivery verify command]
+  local id="$1" ident="$2" given="${3:-}" mode forced stored p reason=""
+  _TASK_RUBRIC_ESCALATED=0
+  mode=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  [[ "$mode" == "rubric" ]] || return 1
+  forced=$(db "SELECT COALESCE(verify_forced,0) FROM tasks WHERE id=${id};" 2>/dev/null || printf 0)
+  stored=$(db "SELECT COALESCE(verify_command,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  if [[ "$forced" == "1" || -n "$stored" || -n "$given" ]]; then
+    reason="explicit --verify"
+  else
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      if _task_path_is_rubric_blast "$p"; then reason="blast-radius path: $p"; break; fi
+    done < <({ _task_rubric_local_paths "$id"; _task_delivery_paths "$id"; } | sort -u)
+  fi
+  [[ -n "$reason" ]] || return 1
+  db "UPDATE tasks SET review_mode='temp' WHERE id=${id};"
+  _TASK_RUBRIC_ESCALATED=1
+  warn "$ident: --review=rubric escalated to a full grade (${reason}, DIVE-4634)."
+  return 0
+}
+
+# Extract only DIVE-4576's labelled claim block. A maker may write arbitrary
+# prose after it; that prose is deliberately not grader context.
+_task_grade_claim_block() {  # [stdin]
+  awk '
+    function allowed(s) { return s ~ /^(CHANGED|FILES|CHECKED|HOW|EVIDENCE|RAN|DELIVERED[-_]?SHA|DELIVERYSHA|CI|CI-STATE|CHECKS|CRITERIA|ACCEPTANCE|CRITERION)[[:space:]]*[:(=-]/ }
+    /^[A-Z][A-Z0-9_-]*[[:space:]]*[:(=-]/ { on = allowed($0) }
+    on { print }
+  ' | head -c "${FIVEDIVE_GRADE_CLAIM_MAX_BYTES:-65536}" || true
+}
+
+_task_grade_tree_digest() {  # <tree>
+  local tree="$1" p
+  (
+    cd "$tree" || exit 1
+    while IFS= read -r -d '' p; do
+      if [[ -L "$p" ]]; then printf 'link  %s  %s\n' "$(readlink "$p")" "$p"
+      else sha256sum -- "$p"; fi
+    done < <(git ls-files -z)
+  ) | sha256sum | awk '{print $1}'
+}
+
+_task_grade_tree_assert() {  # <id> <ident> <tree> [quiet]
+  local id="$1" ident="$2" tree="$3" quiet="${4:-0}" want got dirty base seal now
+  want=$(db "SELECT COALESCE(delivered_sha,'') FROM tasks WHERE id=${id};")
+  [[ "$want" =~ ^[0-9a-f]{40}$ ]] || fail "$E_CONFLICT" "$ident has no recorded delivered sha; re-deliver from the source checkout (DIVE-4634)"
+  [[ -d "$tree" ]] || fail "$E_NOT_FOUND" "$ident grading tree does not exist: $tree"
+  got=$(git -C "$tree" rev-parse HEAD 2>/dev/null || printf '')
+  [[ "$got" == "$want" ]] || fail "$E_CONFLICT" "$ident grading tree HEAD is ${got:-unreadable}, expected delivered sha $want — REJECT (DIVE-4634)"
+  dirty=$(git -C "$tree" status --porcelain --untracked-files=all 2>/dev/null || printf 'unreadable')
+  [[ -z "$dirty" ]] || fail "$E_CONFLICT" "$ident grading tree is dirty — REJECT (DIVE-4634): ${dirty:0:300}"
+  base="${tree%/*}"; seal="${base}/.${ident}-${want}.seal"
+  [[ -r "$seal" ]] || fail "$E_CONFLICT" "$ident grading tree has no content seal — REJECT (DIVE-4634)"
+  now=$(_task_grade_tree_digest "$tree")
+  [[ "$now" == "$(cat "$seal")" ]] || fail "$E_CONFLICT" "$ident grading tree content changed after materialization — REJECT (DIVE-4634)"
+  (( quiet )) || printf 'GRADE-TREE-OK: %s (HEAD=%s, clean, seal=%s)\n' "$tree" "$want" "$now"
+}
+
+# `task grade-context` is the grader's only entry point. It intentionally never
+# selects tasks.body, routing history, or a maker transcript.
+cmd_task_grade_context() {
+  tasks_db_init
+  local task="" check=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --check=*) check="${1#*=}" ;;
+      -h|--help) printf 'usage: 5dive task grade-context <id|DIVE-N> [--check=<grading-tree>]\n'; return 0 ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *) [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "usage: 5dive task grade-context <id|DIVE-N> [--check=<grading-tree>]" ;;
+    esac
+    shift
+  done
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task grade-context <id|DIVE-N> [--check=<grading-tree>]"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  if [[ -n "$check" ]]; then _task_grade_tree_assert "$id" "$ident" "$check"; return 0; fi
+
+  local repo sha criteria result root tree tree_q seal digest base diff claim mode
+  repo=$(db "SELECT COALESCE(delivery_repo_path,'') FROM tasks WHERE id=${id};")
+  sha=$(db "SELECT COALESCE(delivered_sha,'') FROM tasks WHERE id=${id};")
+  criteria=$(db "SELECT COALESCE(acceptance_criteria,'') FROM tasks WHERE id=${id};")
+  result=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+  mode=$(db "SELECT COALESCE(review_mode,'temp') FROM tasks WHERE id=${id};")
+  [[ -d "$repo" && "$sha" =~ ^[0-9a-f]{40}$ ]] \
+    || fail "$E_CONFLICT" "$ident has no usable delivered checkout+sha; re-deliver from the source checkout (DIVE-4634)"
+  git --git-dir="$repo" cat-file -e "${sha}^{commit}" 2>/dev/null \
+    || fail "$E_CONFLICT" "$ident delivered sha $sha is absent from $repo — REJECT (DIVE-4634)"
+
+  root="${XDG_STATE_HOME:-${HOME}/.local/state}/5dive/grades"
+  mkdir -p "$root" || fail "$E_GENERIC" "cannot create private grader state at $root"
+  chmod 700 "$root" 2>/dev/null || true
+  tree="${root}/${ident}-${sha:0:12}"
+  tree_q=$(printf '%q' "$tree")
+  seal="${root}/.${ident}-${sha}.seal"
+  if [[ ! -d "$tree" ]]; then
+    git --git-dir="$repo" worktree prune >/dev/null 2>&1 || true
+    git --git-dir="$repo" worktree add --detach -q "$tree" "$sha" \
+      || fail "$E_GENERIC" "$ident could not create detached grading worktree at $sha"
+    chmod -R go-w "$tree" 2>/dev/null || true
+    digest=$(_task_grade_tree_digest "$tree") || fail "$E_GENERIC" "$ident could not seal grading worktree"
+    printf '%s' "$digest" >"$seal"; chmod 600 "$seal" 2>/dev/null || true
+  fi
+  _task_grade_tree_assert "$id" "$ident" "$tree" 1
+  base=$(git --git-dir="$repo" merge-base "$sha" origin/main 2>/dev/null || git --git-dir="$repo" rev-parse "${sha}^" 2>/dev/null || printf '')
+  [[ -n "$base" ]] || fail "$E_CONFLICT" "$ident cannot resolve a diff base for $sha — REJECT (DIVE-4634)"
+  diff=$(git -C "$tree" diff --no-ext-diff --unified=3 "$base" "$sha" -- | head -c "${FIVEDIVE_GRADE_DIFF_MAX_BYTES:-131072}" || true)
+  claim=$(printf '%s\n' "$result" | _task_grade_claim_block)
+  cat <<PACKET
+BEGIN BOUNDED GRADING PACKET DIVE-4634
+TASK: ${ident}
+MODE: ${mode}
+GRADE_TREE: ${tree}
+DELIVERED_SHA: ${sha}
+BASE_SHA: ${base}
+
+ACCEPTANCE CRITERIA (bounded at 16384 bytes):
+$(printf '%s' "$criteria" | head -c 16384)
+
+DELIVERY CLAIM BLOCK (the CHECKED lines are the commands and reported outputs to re-run):
+${claim}
+
+GIT DIFF AT DELIVERED SHA (bounded at ${FIVEDIVE_GRADE_DIFF_MAX_BYTES:-131072} bytes):
+${diff}
+END BOUNDED GRADING PACKET DIVE-4634
+
+Before recording a verdict, run:
+  5dive task grade-context ${ident} --check=${tree_q}
+PACKET
 }
 
 # ── DIVE-4576 — A DELIVERY THAT CARRIES NO EVIDENCE IS REFUSED ──────────────
@@ -531,11 +692,20 @@ cmd_task_deliver() {
   # CURRENT iteration, never a bump: re-pointing is the legitimate act the gate
   # demands, so recording it cannot weaken the gate — the stamp still only ever
   # equals an iteration at which a PR was actually named.
-  db "UPDATE tasks SET delivery_ref=$(sqlq "$pr"), delivered_at=datetime('now'), delivery_ref_iteration=COALESCE(iteration,0) WHERE id=${id};"
+  local _delivery_repo="" _delivered_sha=""
+  _delivery_repo=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || printf '')
+  _delivered_sha=$(git rev-parse HEAD 2>/dev/null || printf '')
+  [[ "$_delivered_sha" =~ ^[0-9a-f]{40}$ ]] || { _delivery_repo=""; _delivered_sha=""; }
+  db "UPDATE tasks SET delivery_ref=$(sqlq "$pr"), delivered_at=datetime('now'), delivery_ref_iteration=COALESCE(iteration,0),
+                       delivery_repo_path=$(sqlq_or_null "$_delivery_repo"), delivered_sha=$(sqlq_or_null "$_delivered_sha")
+        WHERE id=${id};"
+  [[ -n "$_delivered_sha" ]] \
+    || warn "$ident: delivery was invoked outside a git checkout; the bounded grader cannot materialize the delivered SHA until this row is re-delivered from its source checkout (DIVE-4634)."
   # DIVE-3496 (iteration 2): the ref is now bound — assert the gate's credential
   # can SEE it, here, rather than leaving the verifier to discover it at close.
   # Runs AFTER the write on purpose: the delivery is not conditional on it.
   _task_deliver_reach_probe "$ident" "$pr"
+  _task_deliver_rubric_escalate "$id" "$ident" "$deliver_cmd" || true
   # DIVE-4576 deliverable 3: a command-graded row is graded HERE and never
   # reaches the grader attach below — placed after the ref is bound so the grade
   # is recorded against the binding it is a grade OF (DIVE-3330 reads it), and
