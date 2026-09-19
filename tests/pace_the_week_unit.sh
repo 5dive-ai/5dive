@@ -666,5 +666,79 @@ jcase "a snapshot for a DIFFERENT account is not this account's reading" \
       "no account reading measured within"
 jcase "a malformed snapshot is not a measurement" 2 'not json at all' "" "no weekly reading"
 
+# ── K: DIVE-4586 — a stale weekly reading is still a LOWER BOUND ────────────
+# Measured on this host 2026-09-18: `mark` has eight bound seats, a real weekly
+# reading of 100%, and the freshest statusline cache across all eight is two
+# hours old — because the seats stopped rendering WHEN the account hit its wall.
+# The asOf fence drops it, the floor calls the account blind, and blind is the
+# SOFT floor: eight seats held one band looser than the account they are on.
+#
+# The fix is not a wider fence (DIVE-4578/4342 refuse that, and it would let a
+# stale number buy spend). A weekly percentage never falls before its window
+# resets, so an aged reading inside an unreset window bounds the current one
+# from BELOW — and the floor is a lower-bound test. Admitted in the restrictive
+# direction only; every arm below that could open the floor must stay shut.
+STALE=$(( NOW - 4000 ))              # past _GRADER_READING_MAX_AGE
+kcase(){ jcase "$@"; }
+
+# THE ROW. Stale 100%, window not reset, no document: was blind/soft, now hard.
+kcase "K: a stale 100% reading inside an unreset week hardens the floor (was blind/soft)" \
+      3 "$(snap_ 100 "$FAR" "$STALE")" "" "AT LEAST 100%"
+kcase "K: a stale 70% reading inside an unreset week holds at the soft floor, named as a bound" \
+      2 "$(snap_ 70 "$FAR" "$STALE")" "" "at LEAST 70%"
+
+# THE DIRECTION. A bound can only tighten. The near-reset relaxation is the one
+# branch that BUYS dispatch, so a bound must never reach it — while the same
+# numbers with a FRESH reading still do.
+kcase "K: a bound never buys the near-reset relaxation" \
+      2 "$(snap_ 70 "$NEAR" "$STALE")" "" "cannot buy the near-reset relaxation"
+kcase "K: CONTROL — the same 70%/2d reading FRESH still opens the floor" \
+      0 "$(snap_ 70 "$NEAR")" "" "to the reset"
+kcase "K: a bound under the soft floor says nothing — the account is still blind" \
+      2 "$(snap_ 20 "$FAR" "$STALE")" "" "no account reading measured within"
+
+# THE PRECONDITION. The whole argument is "the window has not turned over", so
+# every way of failing to show that must yield no bound at all.
+kcase "K: a stale 100% whose window has already RESET is not a bound" \
+      2 "$(snap_ 100 "$(( NOW - 3600 ))" "$STALE")" "" "no account reading measured within"
+kcase "K: a stale 100% with no readable reset is not a bound" \
+      2 "$(snap_ 100 null "$STALE")" "" "no account reading measured within"
+# A reading stamped in the FUTURE is the clock-skew case, and it is what keeps
+# `asof <= now < resets` — the chain that places the measurement inside the
+# window it reports on — from being assumed rather than shown.
+kcase "K: a reading stamped in the future is not a bound" \
+      2 "$(snap_ 100 "$FAR" "$(( NOW + 600 ))")" "" "no account reading measured within"
+kcase "K: an undated stale reading is not a bound" \
+      2 "$(snap_ 100 "$FAR" null)" "" "no account reading measured within"
+kcase "K: no snapshot at all is still blind, not a bound" \
+      2 '{"accounts":[]}' "" "no account reading measured within"
+
+# THE POLICY. A bound may only ever tighten what the blind branch would have
+# returned. Under FIVE_PACE_BLIND=refuse the blind answer is already the
+# tightest there is, so the bound must not be consulted — it could only loosen.
+kbarm(){ # <blind-policy> <snapshot> -> "<rc> <verdict>"
+  ( source src/task/grader_pool.sh
+    # shellcheck disable=SC2317
+    quota_snapshot_read(){ printf '%s' "$SNAP"; }
+    SNAP="$2"; _PACE_BLIND="$1"
+    local rc=0 out
+    out=$(printf '' | _pace_band acct "$NOW") || rc=$?
+    printf '%s %s' "$rc" "$out" )
+}
+kb=$(kbarm refuse "$(snap_ 100 "$FAR" "$STALE")"); [[ "${kb%% *}" == 1 ]] \
+  && ok_ "K: under FIVE_PACE_BLIND=refuse a bound does not loosen the refusal" \
+  || bad_ "K: under FIVE_PACE_BLIND=refuse a bound does not loosen the refusal" "rc=${kb%% *} want=1"
+kb=$(kbarm soft "$(snap_ 100 "$FAR" "$STALE")"); [[ "${kb%% *}" == 3 ]] \
+  && ok_ "K: CONTROL — the same fixture under the default policy DOES harden, so the arm above is not vacuous" \
+  || bad_ "K: CONTROL — refuse-policy arm is not vacuous" "rc=${kb%% *} want=3"
+
+# THE ORDERING, pinned deliberately rather than left to fall out: the bound is
+# consulted ONLY after both CURRENT sources have failed. A live seat document
+# still answers ahead of it. The alternative — vendor-reported 100% outranking
+# our own activity log — is argued on the row body; this arm exists so flipping
+# it is a decision and not a regression.
+kcase "K: a live seat document still answers ahead of the bound" \
+      0 "$(snap_ 100 "$FAR" "$STALE")" "$(mkjson 20 "$FAR")" "from the seat reading"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

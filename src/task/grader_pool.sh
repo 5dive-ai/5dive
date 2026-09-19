@@ -1585,6 +1585,81 @@ _pace_account_seven() {  # <account> [<now-epoch>] -> "<pct><US><resets>" or EMP
 # is expanded unquoted — same posture as `_GRADER_ACCOUNT_READING_CMD`.
 _PACE_ACCOUNT_CMD="${_PACE_ACCOUNT_CMD:-_pace_account_seven}"
 
+# ── DIVE-4586: A STALE WEEKLY READING IS STILL A LOWER BOUND ────────────────
+#
+# 19 of 22 accounts published `usage: null` after DIVE-4585 gave the snapshot a
+# scheduled publisher, and the reflex reading of that is "there is no number for
+# these accounts". Measured on this host 2026-09-18, that is not what it says.
+# Only FOUR accounts have a bound seat at all, and of those the one the floor
+# gets wrong is `mark`: eight seats, a real weekly reading of 100%, and the
+# freshest statusline cache across all eight is TWO HOURS old — so
+# `_pace_account_seven`'s asOf fence drops it and the floor reads `mark` as
+# blind and holds it at the SOFT floor, while the account is in fact over the
+# HARD one.
+#
+# The cause is a loop, and it is the same one `src/lib/quota_wall.sh` records
+# for the snapshot: the seats stopped rendering statuslines BECAUSE the account
+# hit its wall, so the wall is exactly the condition under which the evidence of
+# the wall goes stale. Freshness fences are correct and this does not touch
+# them — widening one would be DIVE-4578's and DIVE-4342's refusal, and it would
+# let a stale number through in the direction that BUYS spend.
+#
+# What is true instead: a weekly `used_percentage` is monotonically
+# non-decreasing inside its own window. It only falls when the window turns
+# over, and the window's turn-over time is carried in the reading itself. So
+# while `sevenResetsAt` is still in the FUTURE, an aged reading of 100% is not a
+# current measurement — but it IS a sound lower bound on the current one, and
+# the floor is a lower-bound test: "is this account at or above N%".
+#
+# Therefore this reading is admitted in ONE direction only. It can raise the
+# floor (soft, hard); it can never open it, never satisfy the
+# distance-to-reset relaxation (which is the one branch that BUYS dispatch),
+# and never turn absence into a number — under the soft floor a lower bound
+# says nothing, so the caller falls through to the blind branch exactly as
+# before. The failure this whole family refuses is a green word nobody
+# measured; a bound that can only ever say "at least this red" cannot produce
+# one.
+#
+# NOT fixed here, because it is a different defect with a different fix: the
+# `codex` account's three seats can never produce this reading at all — their
+# CLI is not Claude Code and has no Anthropic 5h/7d window — so they sit at the
+# blind soft floor permanently, waiting on a number that does not exist for
+# their provider. That is provider awareness, not a carrier. See the row body.
+#
+# `_pace_account_seven_bound <account> [<now>]` -> "<pct><US><resets>" or EMPTY.
+# Same source and the same reset fence as `_pace_account_seven`; the asOf fence
+# is replaced by the requirement that the reading HAVE a measurement time (an
+# undated reading is still nothing) and that its window not have turned over.
+_pace_account_seven_bound() {  # <account> [<now-epoch>] -> "<pct><US><resets>" or EMPTY
+  local acct="${1:-}" now="${2:-}" rl asof seven sr
+  [[ -n "$acct" ]] || return 0
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  declare -F _grader_account_reading_json >/dev/null 2>&1 || return 0
+  rl=$(_grader_account_reading_json "$acct" 2>/dev/null || printf '')
+  [[ -n "$rl" && "$rl" != "null" ]] || return 0
+  asof=$(jq -r '.asOf // empty' <<<"$rl" 2>/dev/null || printf '')
+  # An undated reading is not a bound either: with no measurement time we cannot
+  # say the reading was taken inside the window it names.
+  [[ "$asof" =~ ^[0-9]+$ ]] || return 0
+  (( asof <= now )) || return 0
+  seven=$(jq -r '.sevenDayPct // empty'   <<<"$rl" 2>/dev/null || printf '')
+  sr=$(jq -r    '.sevenResetsAt // empty' <<<"$rl" 2>/dev/null || printf '')
+  [[ -n "$seven" ]] || return 0
+  # The whole argument rests on the window not having turned over. No readable
+  # reset means we cannot show that, so there is no bound — not a bound we
+  # assume. This is stricter than `_pace_account_seven`, which may print an
+  # empty reset because a FRESH pct stands on its own.
+  if [[ -n "$sr" && ! "$sr" =~ ^[0-9]+$ ]]; then sr=$(date -d "$sr" +%s 2>/dev/null) || sr=""; fi
+  [[ "$sr" =~ ^[0-9]+$ ]] || return 0
+  (( sr > now )) || return 0
+  # `asof <= now < sr` already places the measurement inside the window it
+  # reports on, so there is no separate asof-vs-reset test to write: the future-
+  # asOf guard above is what makes that chain hold.
+  printf '%s%s%s' "$seven" "$_GRADER_READING_US" "$sr"
+}
+# Overridable by the same contract as _PACE_ACCOUNT_CMD, for the same reason.
+_PACE_ACCOUNT_BOUND_CMD="${_PACE_ACCOUNT_BOUND_CMD:-_pace_account_seven_bound}"
+
 # `_pace_field <account> <field>` — one numeric field for an account, or EMPTY
 # when the meter has no number for it.
 #
@@ -1617,6 +1692,7 @@ _pace_field() {  # <account> <field>  [<usage-json-on-stdin>]
 #   1  refuse — no dispatch at all (only reachable under FIVE_PACE_BLIND=refuse)
 _pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   local acct="$1" now="${2:-$(date +%s)}" json seven="" resets="" days_left src="" pair=""
+  local lb_pair="" lb_seven="" lb_resets=""
   if [[ -z "$acct" ]]; then
     # No account named is not a measurement, and it must not read as headroom.
     printf 'pace: no account named — holding at the soft floor rather than reading it as 0%%\n'
@@ -1648,6 +1724,43 @@ _pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   # as "this account is at its limit" when it actually meant "this account has
   # been quiet" — the misreading that kept DIVE-4575 open all day, and the one a
   # log line is the only trace of here.
+  # DIVE-4586. Neither source carries a CURRENT reading. Before calling the
+  # account blind, ask whether it carries a stale one whose window has not
+  # turned over — a lower bound (see `_pace_account_seven_bound`). It is
+  # consulted ONLY here, after both current sources have failed, and it is only
+  # ever allowed to make the floor harder: over the hard floor it hardens, over
+  # the soft floor it holds without the distance-to-reset relaxation that is
+  # the one branch capable of BUYING dispatch, and under the soft floor it says
+  # nothing at all and we fall into the blind branch below unchanged. A bound
+  # cannot show an account is under a floor, only that it is over one.
+  #
+  # THE BOUND IS ONLY EVER A TIGHTENING DEVICE, under every policy — so it is
+  # measured against what the blind branch below would otherwise return.
+  # `FIVE_PACE_BLIND=soft` (the default) falls to the soft floor, so a bound may
+  # move it to hard (tighter) or leave it at soft (equal). `FIVE_PACE_BLIND=refuse`
+  # already returns the tightest answer there is, so a bound could only ever
+  # LOOSEN it — and that policy's contract is "no current meter, no dispatch",
+  # which a lower bound does not satisfy. Under `refuse` the bound is therefore
+  # not consulted at all.
+  if [[ -z "$seven" && "$_PACE_BLIND" != "refuse" ]]; then
+    lb_pair=$($_PACE_ACCOUNT_BOUND_CMD "$acct" "$now" 2>/dev/null || printf '')
+    if [[ -n "$lb_pair" ]]; then
+      lb_seven="${lb_pair%%$_GRADER_READING_US*}"; lb_resets="${lb_pair#*$_GRADER_READING_US}"
+      lb_seven="${lb_seven%%.*}"
+      if [[ "$lb_seven" =~ ^[0-9]+$ ]]; then
+        if (( lb_seven >= _PACE_FLOOR_7D_HARD )); then
+          printf 'pace: %s has no CURRENT weekly reading, but its last reading (%s%%) is inside a week that has not reset yet — a weekly percentage never falls before its reset, so the account is at AT LEAST %s%% (hard floor %s%%) — urgent only\n' \
+                 "$acct" "$lb_seven" "$lb_seven" "$_PACE_FLOOR_7D_HARD"
+          return 3
+        fi
+        if (( lb_seven >= _PACE_FLOOR_7D_SOFT )); then
+          printf 'pace: %s has no CURRENT weekly reading, but its last reading (%s%%) is inside a week that has not reset yet — at LEAST %s%% (soft floor %s%%); a lower bound cannot buy the near-reset relaxation, so the floor stays armed — high/urgent only\n' \
+                 "$acct" "$lb_seven" "$lb_seven" "$_PACE_FLOOR_7D_SOFT"
+          return 2
+        fi
+      fi
+    fi
+  fi
   if [[ -z "$seven" ]]; then
     if [[ -z "$json" ]]; then
       printf 'pace: %s has no weekly reading — no account reading measured within %ss and %s returned nothing; blind meter, policy=%s (never 0%%)\n' \
