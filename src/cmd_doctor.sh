@@ -142,7 +142,7 @@ doctor_check_gate_repo_visibility() {
   dir="$(_gate_vis_dir 2>/dev/null || printf '')"
   if [[ -z "$dir" || ! -d "$dir" ]]; then
     doctor_add creds merge-gate-repos ok \
-      "merge-gate repo visibility not measured on this box yet (no close has swept the repo set); \`5dive task merge-gate-selftest\` measures it now"
+      "merge-gate repo visibility not measured on this box yet — the reading is taken by a close whose row names no PR and no branch, which sweeps the whole repo set. (\`5dive task merge-gate-selftest\` grades the RAIL against one control PR; it does not measure per-repo coverage.)"
     return 0
   fi
   for f in "$dir"/*.reading; do
@@ -175,7 +175,7 @@ doctor_check_gate_repo_visibility() {
     esac
   done
   (( n > 0 )) || doctor_add creds merge-gate-repos ok \
-    "merge-gate repo visibility not measured on this box yet (no close has swept the repo set); \`5dive task merge-gate-selftest\` measures it now"
+    "merge-gate repo visibility not measured on this box yet — the reading is taken by a close whose row names no PR and no branch, which sweeps the whole repo set. (\`5dive task merge-gate-selftest\` grades the RAIL against one control PR; it does not measure per-repo coverage.)"
   return 0
 }
 
