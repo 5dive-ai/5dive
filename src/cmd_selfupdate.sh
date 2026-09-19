@@ -472,21 +472,39 @@ _pending_restart_sweep() {
     fi
     started="$(_unit_active_enter_epoch "$unit")"
     busy="$(_agent_busy_state "$name")"
+    # THE BOARD IS NOT THE SESSION, and the verdict is what has to know it.
+    # `_agent_busy_state` answers "does this seat hold an in_progress row",
+    # which reads a seat that is mid-turn with NO claimed row — an incident
+    # capture, a conversation, a turn between two rows — as `idle`. The session
+    # reading below is the one every reclaim path already trusts.
+    #
+    # ASKED HERE RATHER THAN IN THE `fire` ARM (where it used to sit) so it
+    # reaches `_pending_restart_decide` as the busy input it always was. Same
+    # deferral, same kept marker, same counter — plus the 24h ceiling now
+    # applies to a session-busy seat, which is the whole point of having one:
+    # held in the `fire` arm, a seat busy for a week took the silent `continue`
+    # and `overdue` was unreachable for the exact population it was written for.
+    #
+    # `_hb_agent_idle`, NOT the raw native word: DIVE-4298 measured `busy`
+    # persisting for 1h20m on a seat whose turn had ENDED but whose background
+    # shell was still alive, and this helper is the one that re-reads the pane
+    # for a finished status line before believing it. Folding the raw reading in
+    # here would hold that seat's restart until the ceiling instead.
+    if [[ "$busy" == "idle" ]] \
+       && declare -F _hb_agent_idle >/dev/null 2>&1 \
+       && ! _hb_agent_idle "$name" 0.4; then
+      busy="busy"
+    fi
     verdict="$(_pending_restart_decide "$marked" "$started" "$busy" "$now" "$_PENDING_RESTART_MAX_DEFER_SECS")"
     case "$verdict" in
       already-bounced)
         _pending_restart_clear "$name"; _PR_CLEARED=$((_PR_CLEARED + 1)) ;;
       fire)
-        # The board says the row is closed; this asks whether the SESSION is
-        # between turns. Leaving the last task is not the same as being done
-        # talking about it, and a bounce one second into the closing turn is the
-        # same lost work in a smaller window. Any non-idle answer (busy, pane
-        # unreadable, blocked on a prompt) defers to the next sweep — the marker
-        # survives, so nothing is lost by waiting.
-        if declare -F _hb_agent_idle >/dev/null 2>&1 && ! _hb_agent_idle "$name" 0.4; then
-          _PR_DEFERRED=$((_PR_DEFERRED + 1))
-          continue
-        fi
+        # Both readings agree the seat is free: no in_progress row, and the
+        # session is between turns (the check that says so now runs above, as an
+        # input to the verdict — "leaving the last task" is not "done talking
+        # about it", and a bounce one second into the closing turn is the same
+        # lost work in a smaller window).
         # Read the reason BEFORE the clear — the log line is the only place the
         # deferral's cause survives, and clearing first would print an empty one.
         why="$(_pending_restart_reason "$name")"

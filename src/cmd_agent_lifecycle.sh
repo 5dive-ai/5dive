@@ -86,6 +86,57 @@ cmd_self_restart() {
     || fail "$E_PERMISSION" "refusing: caller '$caller' is not an agent-* user"
   local name="${BASH_REMATCH[1]}"
   require_agent "$name"
+  # >>> self-restart defers while a turn is in flight
+  #     (tests/agent_self_restart_defers_mid_turn_unit.sh extracts this block
+  #      VERBATIM between these markers and runs the shipped bytes — keep them.)
+  #
+  # THE ~1s DEFERRAL BELOW WAS NEVER A GUARD ON THE AGENT'S WORK. Its own comment
+  # says what it is for: the transient unit outlives THIS CLI CALL's teardown, so
+  # the caller's SIGTERM cannot abort the restart. Nothing here ever asked whether
+  # the seat was mid-turn — and every caller of this primitive reaches it from
+  # inside a live session (the telegram plugin's /model, /effort, /update,
+  # /resume and ho:restart all shell out to `5dive agent _self_restart`).
+  #
+  # Measured 2026-09-15 08:50:02Z: a `/model` one second into a tool call bounced
+  # the unit, the call died with 137, its results were never written, and the
+  # human saw only the restart ack. The turn is gone with no record that it
+  # existed — which is the same failure DIVE-3173 removed from the self-update
+  # restart loop, on the one restart path that never got the treatment.
+  #
+  # THE DEBT IS QUEUED, NOT DROPPED. `_pending_restart_mark` writes the same
+  # durable marker self-update uses, and `_pending_restart_sweep` — which every
+  # heartbeat tick runs (cmd_heartbeat.sh) — takes the restart at the next idle
+  # tick. So `/model` still lands; it lands a tick later instead of on top of a
+  # running turn.
+  #
+  # UNCERTAINTY RESTARTS HERE, AND THAT IS THE OPPOSITE DIRECTION FROM THE SWEEP.
+  # In the sweep the marker already exists, so waiting costs nothing and every
+  # unreadable signal defers. Here a wrong defer means an operator typed /restart
+  # and nothing visibly happened, on every box whose native signal is simply
+  # unavailable — a non-claude runtime, or a `claude` too old for
+  # `agents --json`. So ONLY a definite `busy` / `blocked:*` reading queues;
+  # rc 1, an empty answer and an absent helper all take today's path unchanged.
+  #
+  # A MARKER WE CANNOT WRITE REFUSES rather than restarts. The two failures are
+  # not symmetric: a refusal is loud, immediate and costs one retry, while
+  # restarting anyway is precisely the lost turn this block exists to prevent.
+  local _sr_state=""
+  if declare -F _hb_agent_native_state >/dev/null 2>&1; then
+    _sr_state="$(_hb_agent_native_state "$name" 2>/dev/null)" || _sr_state=""
+  fi
+  case "$_sr_state" in
+    busy|blocked:*)
+      if declare -F _pending_restart_mark >/dev/null 2>&1 \
+         && _pending_restart_mark "$name" "self-restart asked mid-turn"; then
+        ok "agent '$name': a turn is in flight — restart queued for the next idle tick." \
+           '{name:$n, action:"restart", self:true, deferred:true, queued:true, state:$s}' \
+           --arg n "$name" --arg s "$_sr_state"
+        return 0
+      fi
+      fail "$E_GENERIC" "agent '$name': a turn is in flight and the deferred-restart marker could not be written — refusing to bounce the seat mid-turn. Retry once the turn ends, or restart it from the host with: 5dive agent restart $name"
+      ;;
+  esac
+  # <<< self-restart defers while a turn is in flight
   # Fixed, name-only command (no caller injection); the ~1s transient unit
   # survives this caller's teardown so its own SIGTERM can't abort the restart.
   systemd-run --on-active=1 --collect \
