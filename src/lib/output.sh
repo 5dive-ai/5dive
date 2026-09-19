@@ -274,3 +274,175 @@ ok() {
   fi
   return 0
 }
+
+# -------- subverb `--help`, shared across surfaces (DIVE-569) --------
+#
+# `5dive <surface> <verb> --help` must answer with THAT verb's usage. It shipped
+# for `task` alone in PR-1000 (src/task/dispatch.sh); `agent` and `account` still
+# ran straight into their per-verb flag loops, every one of which ends in
+# `-*) fail "$E_USAGE" "unknown flag: $1"`, so the question read as a typo.
+#
+# The generalisation, rather than a third copy: the intercept is parameterised on
+# (a) the function that prints the surface's usage and (b) the dispatch function
+# whose `case` labels ENUMERATE the surface's verbs. Both are read back at run
+# time, so an alias answers with the usage of the verb it actually runs and a new
+# verb costs nothing. The answer text still comes from one of exactly two places
+# that already exist:
+#
+#   1. the surface usage block the verb is documented in, and
+#   2. the `usage: 5dive <surface> <verb> …` literal the verb (or its dispatch
+#      arm) prints when you get its arguments wrong.
+#
+# A verb documented in NEITHER is refused BY NAME rather than answered with an
+# invented line — the failure mode this whole shape exists to remove.
+
+# _verb_help_wanted <args…> — do these args ASK for help? `--` ends the flags
+# (several subverbs honour it), and only the two exact spellings count: the
+# `--help` inside `--ask="… --help …"` is a VALUE, not a question.
+_verb_help_wanted() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --)        return 1 ;;
+      -h|--help) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# _verb_arm <dispatch_fn> <verb> — "<canonical spelling> <function>", read out of
+# <dispatch_fn>'s OWN case statement at run time. Reading it back rather than
+# restating it here is what makes an alias (`list`, `view`, `fire`, `rm`) answer
+# with the usage of the verb it actually runs, with no second alias list to rot —
+# the same reason the pre-push rail extracts the title regex from the workflow
+# instead of carrying a copy (DIVE-4208). The second field is empty when the
+# arm's first statement is not a plain function call (a nested `case` guard, an
+# `AUDIT_CMD=` assignment); callers must treat it as a hint, not a promise.
+_verb_arm() {
+  declare -f "$1" 2>/dev/null | awk -v v="$2" '
+    function tok(line,   f) { split(line, f, "[[:space:]]+"); return (f[1] == "" ? f[2] : f[1]) }
+    /^[[:space:]]+[^ (].*\)$/ {
+      lab = $0; sub(/\)[[:space:]]*$/, "", lab); gsub(/[[:space:]]/, "", lab)
+      n = split(lab, alt, "|")
+      for (i = 1; i <= n; i++) if (alt[i] == v) {
+        # The handler is the first `cmd_*` token anywhere in the arm, not the
+        # first token of its first line: main.sh audits before it dispatches, so
+        # half these arms open with `AUDIT_CMD="agent export"` and the one that
+        # dispatches is `with_registry_lock cmd_agent_add "$@"` two lines down.
+        # Falling back to the first token keeps the surfaces whose arms are
+        # one-liners (`task`) resolving exactly as they did.
+        first = ""; fn = ""
+        while ((getline body) > 0) {
+          if (first == "") first = tok(body)
+          for (j = 1; j <= NF; j++) {}
+          if (match(body, /(^|[[:space:]])cmd_[A-Za-z0-9_]+([[:space:]]|$)/)) {
+            fn = substr(body, RSTART, RLENGTH); gsub(/[[:space:]]/, "", fn); break
+          }
+          if (body ~ /^[[:space:]]*;;[[:space:]]*$/) break
+        }
+        print alt[1] " " (fn == "" ? first : fn); exit
+      }
+    }'
+}
+
+# _verb_surface_help <usage_fn> <path> <lead> <verb> — the block <usage_fn>
+# documents <verb> in, reprinted with a `usage:` header.
+#
+# <lead> is what sits between the two-space indent and the verb on an entry line,
+# because the two surfaces spell their entries differently and neither is going
+# to be rewritten for this: `_task_usage` lists bare verbs (`  ls|list …`, so
+# lead=""), while the top-level `usage()` lists whole command lines
+# (`  5dive agent info <name>`, so lead="5dive agent "). <path> is what the
+# header prints — "5dive task", "5dive agent", "5dive account".
+_verb_surface_help() {
+  local usage_fn="$1" path="$2" lead="$3" verb="$4"
+  "$usage_fn" 2>/dev/null | awk -v v="$verb" -v lead="$lead" -v path="$path" '
+    BEGIN { n = length(lead) }
+    substr($0, 1, 2) == "  " && substr($0, 3, 1) != " " {
+      blk = 0
+      rest = substr($0, 3)
+      if (n == 0 || substr(rest, 1, n) == lead) {
+        tok = substr(rest, n + 1); sub(/[[:space:]].*$/, "", tok)
+        m = split(tok, alt, "|")
+        for (i = 1; i <= m; i++) if (alt[i] == v) blk = 1
+      }
+      if (!blk) next
+      if (seen++) { print; next }
+      printf "usage: %s %s\n", path, substr($0, 3 + n)
+      next
+    }
+    /^   / { if (blk) print; next }
+    { blk = 0 }'
+}
+
+# _verb_own_usage <fn> <path> — the `usage: <path> …` literal <fn> prints itself
+# when its arguments are wrong. The token after <path> must be whitespace or the
+# end of the literal, so asking about `account list` cannot be answered with the
+# surface-wide `usage: 5dive account list|show|usage|add|…` guard.
+_verb_own_usage() {
+  local fn="$1" path="$2" body line
+  body=$(declare -f "$fn" 2>/dev/null) || return 1
+  # In the BUILT BUNDLE a lazy module is unparsed text until something calls into
+  # it (DIVE-4087), so `declare -f` here yields the one-line autoload STUB, which
+  # carries no usage text at all. Load the module the stub names, then read it
+  # again. The split tree has no stubs and never takes this branch — which is why
+  # the harnesses grade this path through a BUILT BUNDLE and not through src/.
+  if [[ "$body" == *_lazy_autoload* ]] && declare -F _load_module >/dev/null 2>&1; then
+    local mod="${body#*_lazy_autoload }"; mod="${mod%% *}"
+    _load_module "$mod" >/dev/null 2>&1 || return 1
+    body=$(declare -f "$fn" 2>/dev/null) || return 1
+  fi
+  line=$(printf '%s\n' "$body" | awk -v p="usage: $path" '
+    {
+      s = $0
+      while ((i = index(s, p)) > 0) {
+        t = substr(s, i + length(p)); c = substr(t, 1, 1)
+        if (c == "" || c == " " || c == "\t") { sub(/["\047].*$/, "", t); print p t; exit }
+        s = substr(s, i + length(p))
+      }
+    }') || true
+  [[ -n "$line" ]] || return 1
+  # A few of these literals are printf formats carrying a `\n` and a paragraph of
+  # prose after it; take the usage line and leave the escape unrendered.
+  printf '%s\n' "${line%%\\n*}"
+}
+
+# _verb_subverb_help <path> <usage_fn> <dispatch_fn> <lead> <verb> — print that
+# verb's usage.
+#   0  printed it
+#   1  not a verb at all (the dispatch case below has better words for that)
+#   2  a verb this tree documents NOWHERE — say so rather than invent a line
+_verb_subverb_help() {
+  local path="$1" usage_fn="$2" dispatch_fn="$3" lead="$4" verb="$5"
+  local arm primary fn out=""
+  arm=$(_verb_arm "$dispatch_fn" "$verb") || true
+  [[ -n "$arm" ]] || return 1
+  primary="${arm%% *}"; fn="${arm#* }"
+  out=$(_verb_surface_help "$usage_fn" "$path" "$lead" "$primary") || true
+  # Then the handler's own literal, then the dispatch arm's — `agent rotation`
+  # and friends guard their nested case in main.sh, not in a cmd_ function.
+  [[ -n "$out" || -z "$fn" ]] || out=$(_verb_own_usage "$fn" "$path $primary") || true
+  [[ -n "$out" ]] || out=$(_verb_own_usage "$dispatch_fn" "$path $primary") || true
+  [[ -n "$out" ]] || return 2
+  printf '%s\n' "$out"
+}
+
+# _verb_help_intercept <path> <usage_fn> <dispatch_fn> <lead> <verb> <args…> — 0
+# when the args asked for help and it has been answered. Kept OUT of the
+# dispatch function's body on purpose: _verb_arm reads that body back as text,
+# and a second `case` inside it would look like arms.
+_verb_help_intercept() {
+  local path="$1" usage_fn="$2" dispatch_fn="$3" lead="$4" verb="$5"; shift 5
+  _verb_help_wanted "$@" || return 1
+  # `5dive <surface> --help --help` asks about the SURFACE, and every dispatch
+  # case already carries an arm for that. Refusing it here as "a verb documented
+  # nowhere" would be the invented answer this whole path exists to avoid.
+  _verb_help_wanted "$verb" && return 1
+  local rc=0
+  _verb_subverb_help "$path" "$usage_fn" "$dispatch_fn" "$lead" "$verb" || rc=$?
+  case $rc in
+    0) return 0 ;;
+    2) fail "$E_USAGE" "$path $verb: no usage text — the verb is documented neither in '$path --help' nor in its own arguments check" ;;
+  esac
+  return 1
+}

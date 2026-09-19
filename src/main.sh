@@ -523,204 +523,28 @@ _five_is_passthrough_verb() {
   esac
 }
 
-main() {
-  # DIVE-2249: mark that this process entered through the real CLI entrypoint.
-  # The tasks-store fence (src/lib/tasks_db.sh) allows writes to the PRODUCTION
-  # board only from here — a harness that sources the libraries directly never
-  # runs main, so its writes are refused instead of appending real-looking fixture
-  # rows to the live board. Keep this the FIRST statement in main: anything above
-  # it that touched the store would be fenced against its own entrypoint.
-  _TASKS_STORE_ENTRY=cli
+# -------- the `agent` and `account` verb dispatchers --------
+#
+# Lifted out of main()'s own `case` (DIVE-569) so `declare -f` can read the
+# labels back: _verb_help_intercept (src/lib/output.sh) answers
+# `5dive agent <verb> --help` by resolving the alias to the verb it actually
+# runs, and it does that by reading the DISPATCHING case statement at run time.
+# An arm inlined in main() is only reachable as part of main()'s whole body,
+# where the other surfaces' arms look like arms of this one.
+#
+# The bodies keep main()'s indentation ON PURPOSE. The move is then pure — it is
+# what `git diff -w` shows — and four harnesses that lift these arms out of the
+# file by column (agent_grant, agent_send_audit, buzz_bridge,
+# hire_dryrun_flag_validation, usage_enumeration_completeness) keep extracting
+# them. Re-indenting is a separate change, and a noisier one than this fix.
 
-  # The argv this process was invoked with, so require_root's hint can name the
-  # command the caller actually typed instead of a bare `sudo 5dive `.
-  FIVE_ARGV=("$@")
-
-  # Global --json: strip every occurrence before dispatch so each subcommand
-  # gets the same arg shape regardless of where the flag was placed.
-  #
-  # EXCEPT after a PASSTHROUGH verb (DIVE-3135). `5dive gh` documents
-  # `<gh args...>` and hands them to another tool, so a flag after it is that
-  # tool's, not ours. Stripping `--json` out of `gh pr view 51 --json state` left
-  # `state` behind as a stray positional and gh's own parser answered "accepts at
-  # most 1 arg(s), received 2" — public issues #526 and #553, and the reason a
-  # credential-less seat could not read a PR at all. A passthrough verb therefore
-  # ENDS global flag parsing, the same way `--` does. `5dive --json gh ...` still
-  # works: the flag is before the verb, which is where a 5dive-level flag belongs.
-  local -a rest=()
-  local a passthrough=0 seen_verb=0
-  for a in "$@"; do
-    if (( passthrough )); then rest+=("$a"); continue; fi
-    if [[ "$a" == "--json" ]]; then
-      JSON_MODE=1
-      continue
-    fi
-    # The first token that is not a global flag IS the verb — test it once, so a
-    # later argument that merely spells `gh` (`5dive task add "fix gh routing"`)
-    # cannot turn global parsing off midway.
-    if (( ! seen_verb )); then
-      seen_verb=1
-      _five_is_passthrough_verb "$a" && passthrough=1
-    fi
-    rest+=("$a")
-  done
-  set -- "${rest[@]+"${rest[@]}"}"
-
-  [[ $# -gt 0 ]] || { usage; mark_reported; exit "$E_USAGE"; }
-  local top="$1"; shift
-  # DIVE-2323: the one place that sees every dispatch, so fail()'s E_GENERIC
-  # hint can name the verb that broke. Set unconditionally, even for a $top
-  # the case below rejects — that path fails E_USAGE, which the hint never
-  # fires on, so an unvalidated verb string never actually reaches it.
-  CURRENT_VERB="$top"
-  # Handle --version / -v / version before the dispatch table so it stays a
-  # zero-dependency one-liner check (reviewers grep for it first).
-  case "$top" in
-    -v|--version|version)
-      if [[ "${JSON_MODE:-0}" == 1 ]]; then
-        printf '{"ok":true,"data":{"version":"%s"}}\n' "$FIVE_VERSION"
-      else
-        echo "5dive $FIVE_VERSION"
-      fi
-      exit 0
-      ;;
-  esac
-  # Mutating commands run under with_registry_lock so adduser/registry_write
-  # can't race across concurrent dashboard clicks. Read-only commands (list,
-  # logs, stats, types, auth status/poll) bypass the lock and the audit log.
-  case "$top" in
-    _task_answer)
-      # DIVE-3160: hidden, privileged, delegated SIGNED gate clear. Reachable ONLY
-      # via NOPASSWD sudo (the scoped render_standard_sudoers line). Reads the
-      # `task answer` arguments NUL-separated on STDIN — never argv, so the grant
-      # stays an exact command path with no wildcard — re-derives the caller from
-      # SUDO_UID and its lead-clear standing FROM THE ROW as root, refuses every
-      # human-evidence form, and only then runs cmd_task_answer at EUID 0, where
-      # the DIVE-756 closure signs in-process instead of shelling out to a
-      # `gate-proof sign` grant a cli-scoped seat does not have.
-      #
-      # Not audited HERE, for the _gh_do reason: the parent `task answer` verb is
-      # audited and reaches this primitive through a PIPE, not `exec`, so the
-      # outer EXIT trap still fires and attribution survives (DIVE-2797 is about
-      # the exec case, which this deliberately is not). Never advertised.
-      cmd_task_answer_delegated
-      exit $? ;;
-    _audit_append)
-      # DIVE-1268: hidden, privileged, APPEND-ONLY audit primitive. Reachable
-      # ONLY via NOPASSWD sudo — the admin whole-CLI grant, or the scoped
-      # write_standard_sudoers line for standard agents. It lets a non-root
-      # agent-* caller land its mutating action in the 640 root:claude
-      # tamper-evident log without loosening perms to a group-writable 660
-      # (which would let any group-claude agent rewrite/truncate past entries).
-      # Reads ONE NDJSON line from stdin, re-stamps `user` from SUDO_USER so the
-      # payload can't spoof the actor, and appends it — nothing else. Never execs
-      # caller input (upholds the write_admin_sudoers invariant), never advertised,
-      # and is not itself audited (AUDIT_CMD stays unset, so no recursion).
-      [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_audit_append is a privileged internal primitive"
-      audit_init 2>/dev/null || true
-      local _al
-      IFS= read -r _al || true
-      [[ -n "$_al" ]] || exit 0
-      printf '%s\n' "$_al" \
-        | jq -c --arg u "${SUDO_USER:-unknown}" \
-            'if type=="object" then .user=$u else empty end' \
-        >> "$AUDIT_LOG" 2>/dev/null || true
-      exit 0
-      ;;
-    gh)
-      # DIVE-2448 (last mile of DIVE-2232): actor-routed `gh`. A WRITE goes out as
-      # the machine account so the actor field means something; admin-class and
-      # read operations stay on the caller's own credential (the bot is
-      # admin=false everywhere, and a read has no actor field to attribute). The
-      # decision is printed on every call. Credential-bearing → audited; the
-      # token is read root-side in _gh_do and never lands in argv.
-      # DIVE-2792: `exit $?`, like every sibling passthrough arm above. Today the
-      # status still reaches the caller without it — this case is main()'s last
-      # statement and `main "$@"` is the script's — so the fix is not a live
-      # bug-fix but the removal of a load-bearing coincidence: the moment anyone
-      # appends a statement after `esac`, gh's exit status (4 = not logged in,
-      # 8 = checks pending, 1 = failing checks) is silently replaced by that
-      # statement's. A wrapper whose exit-code fidelity depends on where it sits
-      # in the file is one refactor away from lying again.
-      AUDIT_CMD="gh"; AUDIT_ARGS=("$@")
-      cmd_gh "$@"; exit $? ;;
-    _merge_do)
-      # DIVE-3474 arm 1: hidden, privileged. Reachable ONLY via NOPASSWD sudo (the
-      # UNCONDITIONAL render_standard_sudoers line — it confers no authority of its
-      # own, exactly like _task_answer). Reads ONE task ident on STDIN and nothing
-      # else, re-derives the caller from SUDO_UID and its merge standing from the
-      # ROW as root (graded_by = this seat, over the shared graded-awaiting-merge
-      # predicate), and merges the pull request the ROW names — never one the
-      # caller does. Not audited here; the parent `task merge` verb is, and the
-      # primitive writes its own store-audit row naming the grader.
-      cmd_task_merge_do
-      exit $? ;;
-    _gh_do)
-      # DIVE-2448: hidden, privileged. Reachable ONLY via NOPASSWD sudo. Reads the
-      # gh argv NUL-separated on STDIN (never argv, so the grant stays exact-path
-      # / sudo-rs safe), re-derives the routing class authoritatively, reads the
-      # machine account's PAT from the root-only connector and execs gh with it as
-      # an environment prefix. The agent process never holds the token. Not
-      # audited itself (the parent `gh` verb is) and never advertised.
-      cmd_gh_do "$@"
-      exit $? ;;
-    _deploy_do)
-      # INST-5: hidden, privileged, ATOMIC delegated deploy — the capability
-      # broker's SECOND surface, same template as _push_do. Reachable ONLY via
-      # NOPASSWD sudo. Reads <ident> <project> <ref> <env> on STDIN (never argv,
-      # so the grant stays exact-path / sudo-rs safe), re-verifies the cleared
-      # gate under signature, re-binds the target to the task's own Deploy line,
-      # reads VERCEL_TOKEN root-only and fires ONE deployment of the repo the
-      # project is ALREADY linked to. The agent process never holds the token.
-      # Not audited itself (the parent `deploy` verb is) and never advertised.
-      cmd_deploy_do "$@"
-      exit $? ;;
-    _push_do)
-      # DIVE-1376/1460: hidden, privileged, ATOMIC delegated push. Reachable ONLY
-      # via NOPASSWD sudo. Reads <ident> <repo-path> <branch> <repo-url> on STDIN
-      # (never argv, so the grant stays exact-path / sudo-rs safe), re-verifies the
-      # human gate + author scan authoritatively, mints a repo-SCOPED installation
-      # token, pushes the one branch, and discards the token — all as root. The
-      # agent process never holds a token. Not audited itself (the parent `push`
-      # verb is) and never advertised.
-      cmd_push_do "$@"
-      exit $? ;;
-    plugin|plugins)
-      # DIVE-4020: the plugin lifecycle verb. Until this existed there was no
-      # `5dive plugin` at all — plugins installed only as side effects of
-      # `agent create` / `agent buzz enable`, so a CLI-only self-hoster had no
-      # path to one. Mutating and root-only (it writes under STATE_DIR and
-      # copies code onto the box), but it does NOT take the registry lock: it
-      # touches no agent, and holding the agent lock while cloning a marketplace
-      # would block every seat on a network fetch.
-      AUDIT_CMD="plugin"; AUDIT_ARGS=("$@")
-      cmd_plugin "$@" ;;
-    market)
-      # DIVE-1020: front door to the agent market — browse/search the
-      # character-pack registry + preview a persona before hiring. Read-only
-      # (curls the public index), so no lock, no root, no audit — same posture
-      # as `agent marketplace`, which it supersedes as the top-level surface.
-      cmd_market "$@" ;;
-    hire)
-      # DIVE-603: ergonomic alias for `agent create` (+ `org set`). Mutating —
-      # take the registry lock like create; cmd_hire's inner create call is a
-      # re-entrant no-op re-lock.
-      # DIVE-1013: `hire <role> --from-market --dry-run` is a read-only preview
-      # (resolve + DIVE-995 disclosure, creates nothing) — run it OUTSIDE the
-      # lock so it needs no root, exactly like `agent inspect`.
-      local _hire_market=0 _hire_dry=0 _ha
-      for _ha in "$@"; do
-        case "$_ha" in --from-market|--market) _hire_market=1 ;; --dry-run) _hire_dry=1 ;; esac
-      done
-      if (( _hire_market && _hire_dry )); then
-        cmd_hire "$@"
-      else
-        AUDIT_CMD="hire"; AUDIT_ARGS=("$@")
-        with_registry_lock cmd_hire "$@"
-      fi ;;
-    agent)
+_agent_verb_dispatch() {
       [[ $# -gt 0 ]] || { usage; mark_reported; exit "$E_USAGE"; }
       local sub="$1"; shift
+      # `--help` after a subverb is a question about THAT verb, not an unknown
+      # flag. Answered before the dispatch, through the same helper `task`
+      # uses (src/lib/output.sh); see the block above it there.
+      if _verb_help_intercept "5dive agent" usage _agent_verb_dispatch "5dive agent " "$sub" "$@"; then return 0; fi
       case "$sub" in
         -h|--help|help) usage ;;
         list)    cmd_list "$@" ;;
@@ -1004,15 +828,18 @@ main() {
           else
             fail "$E_USAGE" "unknown agent command: $sub"
           fi ;;
-      esac ;;
-    fire)
-      # `5dive fire <name>` — top-level synonym for `agent rm` (fire an agent).
-      AUDIT_CMD="agent rm"; AUDIT_ARGS=("$@")
-      with_registry_lock cmd_rm "$@" ;;
-    account)
+      esac
+}
+
+_account_verb_dispatch() {
       [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|usage|add|rename|remove|login|set|set-active-provider"
       local acctcmd="$1"; shift
+      # `--help` after a subverb is a question about THAT verb, not an unknown
+      # flag. Answered before the dispatch, through the same helper `task`
+      # uses (src/lib/output.sh); see the block above it there.
+      if _verb_help_intercept "5dive account" usage _account_verb_dispatch "5dive account " "$acctcmd" "$@"; then return 0; fi
       case "$acctcmd" in
+        -h|--help|help) usage ;;
         list)   cmd_account_list "$@" ;;
         show)   cmd_account_show "$@" ;;
         usage)  cmd_account_usage "$@" ;;
@@ -1040,7 +867,212 @@ main() {
           AUDIT_CMD="account set-active-provider"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_account_set_active_provider "$@" ;;
         *) fail "$E_USAGE" "unknown account command: $acctcmd" ;;
-      esac ;;
+      esac
+}
+
+main() {
+  # DIVE-2249: mark that this process entered through the real CLI entrypoint.
+  # The tasks-store fence (src/lib/tasks_db.sh) allows writes to the PRODUCTION
+  # board only from here — a harness that sources the libraries directly never
+  # runs main, so its writes are refused instead of appending real-looking fixture
+  # rows to the live board. Keep this the FIRST statement in main: anything above
+  # it that touched the store would be fenced against its own entrypoint.
+  _TASKS_STORE_ENTRY=cli
+
+  # The argv this process was invoked with, so require_root's hint can name the
+  # command the caller actually typed instead of a bare `sudo 5dive `.
+  FIVE_ARGV=("$@")
+
+  # Global --json: strip every occurrence before dispatch so each subcommand
+  # gets the same arg shape regardless of where the flag was placed.
+  #
+  # EXCEPT after a PASSTHROUGH verb (DIVE-3135). `5dive gh` documents
+  # `<gh args...>` and hands them to another tool, so a flag after it is that
+  # tool's, not ours. Stripping `--json` out of `gh pr view 51 --json state` left
+  # `state` behind as a stray positional and gh's own parser answered "accepts at
+  # most 1 arg(s), received 2" — public issues #526 and #553, and the reason a
+  # credential-less seat could not read a PR at all. A passthrough verb therefore
+  # ENDS global flag parsing, the same way `--` does. `5dive --json gh ...` still
+  # works: the flag is before the verb, which is where a 5dive-level flag belongs.
+  local -a rest=()
+  local a passthrough=0 seen_verb=0
+  for a in "$@"; do
+    if (( passthrough )); then rest+=("$a"); continue; fi
+    if [[ "$a" == "--json" ]]; then
+      JSON_MODE=1
+      continue
+    fi
+    # The first token that is not a global flag IS the verb — test it once, so a
+    # later argument that merely spells `gh` (`5dive task add "fix gh routing"`)
+    # cannot turn global parsing off midway.
+    if (( ! seen_verb )); then
+      seen_verb=1
+      _five_is_passthrough_verb "$a" && passthrough=1
+    fi
+    rest+=("$a")
+  done
+  set -- "${rest[@]+"${rest[@]}"}"
+
+  [[ $# -gt 0 ]] || { usage; mark_reported; exit "$E_USAGE"; }
+  local top="$1"; shift
+  # DIVE-2323: the one place that sees every dispatch, so fail()'s E_GENERIC
+  # hint can name the verb that broke. Set unconditionally, even for a $top
+  # the case below rejects — that path fails E_USAGE, which the hint never
+  # fires on, so an unvalidated verb string never actually reaches it.
+  CURRENT_VERB="$top"
+  # Handle --version / -v / version before the dispatch table so it stays a
+  # zero-dependency one-liner check (reviewers grep for it first).
+  case "$top" in
+    -v|--version|version)
+      if [[ "${JSON_MODE:-0}" == 1 ]]; then
+        printf '{"ok":true,"data":{"version":"%s"}}\n' "$FIVE_VERSION"
+      else
+        echo "5dive $FIVE_VERSION"
+      fi
+      exit 0
+      ;;
+  esac
+  # Mutating commands run under with_registry_lock so adduser/registry_write
+  # can't race across concurrent dashboard clicks. Read-only commands (list,
+  # logs, stats, types, auth status/poll) bypass the lock and the audit log.
+  case "$top" in
+    _task_answer)
+      # DIVE-3160: hidden, privileged, delegated SIGNED gate clear. Reachable ONLY
+      # via NOPASSWD sudo (the scoped render_standard_sudoers line). Reads the
+      # `task answer` arguments NUL-separated on STDIN — never argv, so the grant
+      # stays an exact command path with no wildcard — re-derives the caller from
+      # SUDO_UID and its lead-clear standing FROM THE ROW as root, refuses every
+      # human-evidence form, and only then runs cmd_task_answer at EUID 0, where
+      # the DIVE-756 closure signs in-process instead of shelling out to a
+      # `gate-proof sign` grant a cli-scoped seat does not have.
+      #
+      # Not audited HERE, for the _gh_do reason: the parent `task answer` verb is
+      # audited and reaches this primitive through a PIPE, not `exec`, so the
+      # outer EXIT trap still fires and attribution survives (DIVE-2797 is about
+      # the exec case, which this deliberately is not). Never advertised.
+      cmd_task_answer_delegated
+      exit $? ;;
+    _audit_append)
+      # DIVE-1268: hidden, privileged, APPEND-ONLY audit primitive. Reachable
+      # ONLY via NOPASSWD sudo — the admin whole-CLI grant, or the scoped
+      # write_standard_sudoers line for standard agents. It lets a non-root
+      # agent-* caller land its mutating action in the 640 root:claude
+      # tamper-evident log without loosening perms to a group-writable 660
+      # (which would let any group-claude agent rewrite/truncate past entries).
+      # Reads ONE NDJSON line from stdin, re-stamps `user` from SUDO_USER so the
+      # payload can't spoof the actor, and appends it — nothing else. Never execs
+      # caller input (upholds the write_admin_sudoers invariant), never advertised,
+      # and is not itself audited (AUDIT_CMD stays unset, so no recursion).
+      [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_audit_append is a privileged internal primitive"
+      audit_init 2>/dev/null || true
+      local _al
+      IFS= read -r _al || true
+      [[ -n "$_al" ]] || exit 0
+      printf '%s\n' "$_al" \
+        | jq -c --arg u "${SUDO_USER:-unknown}" \
+            'if type=="object" then .user=$u else empty end' \
+        >> "$AUDIT_LOG" 2>/dev/null || true
+      exit 0
+      ;;
+    gh)
+      # DIVE-2448 (last mile of DIVE-2232): actor-routed `gh`. A WRITE goes out as
+      # the machine account so the actor field means something; admin-class and
+      # read operations stay on the caller's own credential (the bot is
+      # admin=false everywhere, and a read has no actor field to attribute). The
+      # decision is printed on every call. Credential-bearing → audited; the
+      # token is read root-side in _gh_do and never lands in argv.
+      # DIVE-2792: `exit $?`, like every sibling passthrough arm above. Today the
+      # status still reaches the caller without it — this case is main()'s last
+      # statement and `main "$@"` is the script's — so the fix is not a live
+      # bug-fix but the removal of a load-bearing coincidence: the moment anyone
+      # appends a statement after `esac`, gh's exit status (4 = not logged in,
+      # 8 = checks pending, 1 = failing checks) is silently replaced by that
+      # statement's. A wrapper whose exit-code fidelity depends on where it sits
+      # in the file is one refactor away from lying again.
+      AUDIT_CMD="gh"; AUDIT_ARGS=("$@")
+      cmd_gh "$@"; exit $? ;;
+    _merge_do)
+      # DIVE-3474 arm 1: hidden, privileged. Reachable ONLY via NOPASSWD sudo (the
+      # UNCONDITIONAL render_standard_sudoers line — it confers no authority of its
+      # own, exactly like _task_answer). Reads ONE task ident on STDIN and nothing
+      # else, re-derives the caller from SUDO_UID and its merge standing from the
+      # ROW as root (graded_by = this seat, over the shared graded-awaiting-merge
+      # predicate), and merges the pull request the ROW names — never one the
+      # caller does. Not audited here; the parent `task merge` verb is, and the
+      # primitive writes its own store-audit row naming the grader.
+      cmd_task_merge_do
+      exit $? ;;
+    _gh_do)
+      # DIVE-2448: hidden, privileged. Reachable ONLY via NOPASSWD sudo. Reads the
+      # gh argv NUL-separated on STDIN (never argv, so the grant stays exact-path
+      # / sudo-rs safe), re-derives the routing class authoritatively, reads the
+      # machine account's PAT from the root-only connector and execs gh with it as
+      # an environment prefix. The agent process never holds the token. Not
+      # audited itself (the parent `gh` verb is) and never advertised.
+      cmd_gh_do "$@"
+      exit $? ;;
+    _deploy_do)
+      # INST-5: hidden, privileged, ATOMIC delegated deploy — the capability
+      # broker's SECOND surface, same template as _push_do. Reachable ONLY via
+      # NOPASSWD sudo. Reads <ident> <project> <ref> <env> on STDIN (never argv,
+      # so the grant stays exact-path / sudo-rs safe), re-verifies the cleared
+      # gate under signature, re-binds the target to the task's own Deploy line,
+      # reads VERCEL_TOKEN root-only and fires ONE deployment of the repo the
+      # project is ALREADY linked to. The agent process never holds the token.
+      # Not audited itself (the parent `deploy` verb is) and never advertised.
+      cmd_deploy_do "$@"
+      exit $? ;;
+    _push_do)
+      # DIVE-1376/1460: hidden, privileged, ATOMIC delegated push. Reachable ONLY
+      # via NOPASSWD sudo. Reads <ident> <repo-path> <branch> <repo-url> on STDIN
+      # (never argv, so the grant stays exact-path / sudo-rs safe), re-verifies the
+      # human gate + author scan authoritatively, mints a repo-SCOPED installation
+      # token, pushes the one branch, and discards the token — all as root. The
+      # agent process never holds a token. Not audited itself (the parent `push`
+      # verb is) and never advertised.
+      cmd_push_do "$@"
+      exit $? ;;
+    plugin|plugins)
+      # DIVE-4020: the plugin lifecycle verb. Until this existed there was no
+      # `5dive plugin` at all — plugins installed only as side effects of
+      # `agent create` / `agent buzz enable`, so a CLI-only self-hoster had no
+      # path to one. Mutating and root-only (it writes under STATE_DIR and
+      # copies code onto the box), but it does NOT take the registry lock: it
+      # touches no agent, and holding the agent lock while cloning a marketplace
+      # would block every seat on a network fetch.
+      AUDIT_CMD="plugin"; AUDIT_ARGS=("$@")
+      cmd_plugin "$@" ;;
+    market)
+      # DIVE-1020: front door to the agent market — browse/search the
+      # character-pack registry + preview a persona before hiring. Read-only
+      # (curls the public index), so no lock, no root, no audit — same posture
+      # as `agent marketplace`, which it supersedes as the top-level surface.
+      cmd_market "$@" ;;
+    hire)
+      # DIVE-603: ergonomic alias for `agent create` (+ `org set`). Mutating —
+      # take the registry lock like create; cmd_hire's inner create call is a
+      # re-entrant no-op re-lock.
+      # DIVE-1013: `hire <role> --from-market --dry-run` is a read-only preview
+      # (resolve + DIVE-995 disclosure, creates nothing) — run it OUTSIDE the
+      # lock so it needs no root, exactly like `agent inspect`.
+      local _hire_market=0 _hire_dry=0 _ha
+      for _ha in "$@"; do
+        case "$_ha" in --from-market|--market) _hire_market=1 ;; --dry-run) _hire_dry=1 ;; esac
+      done
+      if (( _hire_market && _hire_dry )); then
+        cmd_hire "$@"
+      else
+        AUDIT_CMD="hire"; AUDIT_ARGS=("$@")
+        with_registry_lock cmd_hire "$@"
+      fi ;;
+    agent)
+      _agent_verb_dispatch "$@" ;;
+    fire)
+      # `5dive fire <name>` — top-level synonym for `agent rm` (fire an agent).
+      AUDIT_CMD="agent rm"; AUDIT_ARGS=("$@")
+      with_registry_lock cmd_rm "$@" ;;
+    account)
+      _account_verb_dispatch "$@" ;;
     config)
       # DIVE-4251: the PER-BOX settings surface (`5dive config verify=<policy>`),
       # distinct from `5dive agent config <name> set …`, which is per-seat. A
