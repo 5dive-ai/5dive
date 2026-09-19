@@ -254,6 +254,7 @@ Accounts (a named auth profile — group sign-ins so multiple agents share one l
   5dive account list                                   # name, types signed in, # agents bound
   5dive account show <name>                            # detail incl. env keys present
   5dive account usage                                  # per-account 5h/7d limit usage (dashboard dots + /usage)
+  5dive account usage --history [--7d] [--account=<n>] # provider 5h/7d readings OVER TIME (appended samples, not the latest)
   5dive account add <name>                             # create empty account; sign in next
   5dive account login <name> --type=<type>             # interactive TTY login into an account
   5dive account set <name> --type=<type> --provider=<id> --api-key=-
@@ -360,6 +361,8 @@ Supervisor (observe-only fleet health — detect + classify, ZERO auto-actions):
 Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage [--7d]                                 # board: top agents + top tasks by tokens (24h default)
   5dive usage <agent> [--7d]                         # one agent: per-model + per-task breakdown
+  5dive usage --by=account [--7d]                    # by AUTH PROFILE, attributed per turn to the binding live then
+  5dive usage --account=<n> [--by=agent|task] [--7d] # one profile: its seats, or the tasks that spent it
   5dive cost [--7d]                                  # budget-focused: per-agent 24h burn vs soft/ceiling + state
   5dive activity <agent> [--7d] [--task=DIVE-N]      # what the agent actually did: files touched, commands run, cost
   5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop] [--basis=quota|cost]
