@@ -2463,6 +2463,23 @@ cmd_task_need() {
     # property it was reaching for). Both are now true: _gate_archive_and_clear_sql
     # resets all six provenance columns, so no answer or answerer survives a
     # withdrawal, and the outgoing gate is preserved in gate_history instead.
+    # DIVE-3932 (this row): did this gate ever reach a person? Read BEFORE the
+    # transaction below, which nulls `gate_pinged_at` itself — afterwards there is
+    # nothing left to read and the question is unanswerable. `gate_pinged_at` is
+    # the last CONFIRMED Bot API delivery for the gate (tasks_db.sh), so it is
+    # evidence the ask landed in someone's chat, not merely that it was routed.
+    #
+    # WITHDRAW IS WHERE THE FILING-TIME FLAG'S ONE GOOD ARGUMENT SURVIVES. The
+    # original comment defended it with "a gate that was filed and withdrawn still
+    # cost a human, and an inference off the surviving rows would lose it" — true,
+    # and it is exactly this path, because the archive nulls every answer column.
+    # So the cost is charged here, on the same evidence the answer path uses: the
+    # gate was DELIVERED and no answer ever came.
+    local _wd_touch=0
+    if [[ "$(db "SELECT CASE WHEN gate_pinged_at IS NOT NULL AND need_answered_at IS NULL
+                  THEN 1 ELSE 0 END FROM tasks WHERE id=${id};" 2>/dev/null)" == "1" ]]; then
+      _wd_touch=1
+    fi
     db "BEGIN IMMEDIATE;
         $(_gate_archive_and_clear_sql withdraw "id=${id}")
         UPDATE tasks
@@ -2488,6 +2505,12 @@ cmd_task_need() {
     # suppress it (fencing here would trade a contamination bug for an
     # evidence-suppression bug, the DIVE-1968 fail-open family). See DIVE-2054 wiki.
     audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=${w_name:-$w_kind}" "asserted_from=${from:-}" || true
+    # A delivered-but-unanswered gate that is now withdrawn: a person was asked
+    # and the asking is what cost them, so the attempt carries the touch even
+    # though no answer row survives to infer it from.
+    if (( _wd_touch )); then
+      run_touch_human "$(run_current "$id")" || true
+    fi
     # DIVE-2410: a withdrawn gate is a settled gate from the human's side — the
     # question is gone, so the button must go with it. A withdrawal is the path
     # most likely to leave a stale button standing, because unlike an answer
@@ -4077,19 +4100,29 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
   ledger_emit gate.filed ident="$ident" task_id="$id" actor="$actor" \
     policy="tier${tier}:${type}" in="$ask" \
     detail="${type} gate filed at tier ${tier}${recommend:+ (recommend: ${recommend})}"
-  # DIVE-3932: the gate on the filer's own run. `human_touch` is set for tier 1
-  # and 2 ONLY — a tier-0 gate is a permanent record that applies the filer's own
-  # recommendation with NO ping, so counting it as a human touch would report a
-  # person was involved in work no person ever saw, and "human touches per
-  # shipped task" is the metric the zero-human thesis is graded on. The run is
-  # NOT closed here: filing a gate does not by itself park the row (a tier-0
-  # applies and continues), and the funnel's `blocked` arm closes the ones that
-  # genuinely park.
+  # DIVE-3932: the gate on the filer's own run. The run is NOT closed here:
+  # filing a gate does not by itself park the row (a tier-0 applies and
+  # continues), and the funnel's `blocked` arm closes the ones that genuinely
+  # park.
+  #
+  # `human_touch` IS NOT SET HERE ANY MORE, and the reason is the one DIVE-3932's
+  # own comment gave for excluding tier 0: counting a gate nobody answered would
+  # "report a person was involved in work no person ever saw". That argument does
+  # not stop at tier 0. A TIER-1 GATE IS ROUTED TO THE LEAD SEAT, WHICH IS AN
+  # AGENT BY CONSTRUCTION — it is queued with no a2a send and no wake (DIVE-3474)
+  # and cleared by that agent — so filing one marked the attempt as having
+  # required a person on every lead-reviewed row. Measured on a live box: a row
+  # whose only gate was filed 05:40:11Z and cleared by a sibling agent 66 seconds
+  # later read `runs.human_touch = 1` while `trace` read `human_touchpoints = 0`
+  # off the same row. Two metrics for one question, disagreeing.
+  #
+  # TIER WAS ALWAYS THE WRONG PREDICATE: it says how big the ask was, not who
+  # answered it, and the same mismatch covers `auto:ttl`, `auto:reject` and
+  # `auto:t0` closures at any tier. The flag is now set where the answerer is
+  # known — by PROVENANCE at answer time (src/task/answer.sh), and by DELIVERY at
+  # withdraw time below — which is the rule `trace` already used.
   _run_event_for_task "$id" gate.opened \
     "{\"type\":$(_run_json_str "$type"),\"tier\":$(_run_json_str "$tier")}" || true
-  if [[ "$tier" != "0" ]]; then
-    run_touch_human "$(run_current "$id")" || true
-  fi
 
   # DIVE-891 tier 0: apply the recommendation right now — the gate exists only
   # as a signed-off record in the log/digest, never as a ping. Provenance is

@@ -1580,6 +1580,31 @@ cmd_task_answer() {
   # needs to show "this attempt waited on a person here".
   _run_event_for_task "$id" gate.closed \
     "{\"type\":$(_run_json_str "$nt"),\"by\":$(_run_json_str "${_lg_prov%%:*}")}" || true
+  # AND THE HUMAN-TOUCH FLAG, HERE, WHERE THE ANSWERER IS KNOWN. It used to be
+  # set at FILING time for any tier above 0 (src/task/need.sh), which is a claim
+  # about the size of the ask rather than about who answered it: a tier-1 gate is
+  # routed to the lead SEAT — an agent — and cleared by that agent, so every
+  # lead-reviewed row reported a person who never saw it.
+  #
+  # THE SAME PREDICATE `trace` ALREADY USES, deliberately. Its verdict counts
+  # gate epochs `WHERE who LIKE 'human:%'` (src/cmd_trace.sh), and on the
+  # measured row the two disagreed — `runs.human_touch = 1` against
+  # `human_touchpoints = 0` — which is worse than either answer alone, because
+  # "human touches per shipped task" is the metric the zero-human thesis is
+  # graded on and there were two of it.
+  #
+  # `_lg_prov` is read back OUT of the row a few lines up rather than taken from
+  # `$answered_by`, so this flag follows the provenance that actually LANDED. That
+  # also lands the auto paths correctly for free: `auto:ttl`, `auto:reject` and
+  # `auto:t0` are not `human:*` and now touch nothing, at any tier.
+  #
+  # An `if`, not `[[ … ]] && …`: src/header.sh runs `set -euo pipefail`, and a
+  # bare AND-list whose test fails returns non-zero from this statement — which
+  # is the common case here (most gates are not human-answered) and would abort
+  # the answer mid-write.
+  if [[ "$_lg_prov" == human:* ]]; then
+    run_touch_human "$(run_current "$id")" || true
+  fi
 
   # DIVE-2412 acceptance: WHICH evidence form cleared this gate must be
   # recoverable FROM THE ROW, not only from a log line that can rotate or diverge

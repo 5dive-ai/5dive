@@ -22,8 +22,11 @@
 #      BYTE-FOR-BYTE UNCHANGED. The whole value of the lineage is that failure
 #      survives recovery.
 #   6  a live run cannot be retried (that would double-count one attempt).
-#   7  human_touch is set by a tier-1/2 gate and NOT by a tier-0 gate — tier 0
-#      pings nobody, and counting it would report a person in work no person saw.
+#   7  human_touch follows WHO ANSWERED, not what tier was filed. Filing charges
+#      nobody at any tier; a human: clear charges one. Tier says how big the ask
+#      is — a tier-1 gate is routed to the lead SEAT, an agent, so charging at
+#      filing reported a person in work no person saw (the tier-0 argument this
+#      arm used to carry, applied to the other two tiers).
 #   8  run_usage enforces PROVENANCE: an unknown source/quality is not stored as
 #      if it were known, and quality='unavailable' stores a NULL value so
 #      "we looked and it isn't exposed" cannot render as a measurement.
@@ -270,16 +273,33 @@ after=$(db "SELECT id||'|'||status||'|'||COALESCE(outcome,'')||'|'||COALESCE(end
   || bad_t "a live run was retried"
 
 # ---------------------------------------------------------------------------
-# 7. human_touch: a tier-1/2 gate sets it; a TIER-0 gate does not.
+# 7. human_touch: set by WHO ANSWERED, not by the tier that was filed.
+#
+# This arm used to assert that a tier-2 filing marked the run. That predicate was
+# wrong in the direction that matters: a tier-1 gate is routed to the lead SEAT —
+# an agent — and cleared by it, so every lead-reviewed row reported a human who
+# never saw it, while `trace` read 0 off the same row. The flag now follows
+# `need_answered_by LIKE 'human:%'`, which is the predicate trace already used.
+# tests/run_human_touch_at_answer_unit.sh owns the full matrix; these three keep
+# the contract pinned where the run primitives themselves are graded.
 # ---------------------------------------------------------------------------
 id7=$(addt "eta" --assignee="$FIX_MAKER")
 ( cmd_task_start "$id7" --no-preflight ) >/dev/null 2>&1
 r7=$(open_of "$id7")
 ( cmd_task_need "$id7" --type=decision --ask="pick" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend="A" \
     --tier=2 --needs=human_tap ) >/dev/null 2>&1
+[[ "$(rfld "$r7" human_touch)" == "0" ]] \
+  && ok_t "FILING a tier-2 gate does not mark the run — nobody has answered it yet" \
+  || bad_t "a filed-but-unanswered tier-2 gate charged a human" "got=[$(rfld "$r7" human_touch)]"
+# Answered by a verified human: the flag fires. Written through the columns the
+# product reads plus the real `run_touch_human`, so this grades the primitive
+# rather than re-implementing the answer verb's policy checks.
+db "UPDATE tasks SET need_answer='A', need_answered_at=datetime('now'),
+      need_answered_by='human:1234567890' WHERE id=${id7};"
+run_touch_human "$r7"
 [[ "$(rfld "$r7" human_touch)" == "1" ]] \
-  && ok_t "a tier-2 gate marks the run human-touched" \
-  || bad_t "tier-2 gate did not mark human_touch" "got=[$(rfld "$r7" human_touch)]"
+  && ok_t "a gate answered by a verified HUMAN marks the run human-touched" \
+  || bad_t "a human-cleared gate did not mark human_touch" "got=[$(rfld "$r7" human_touch)]"
 id8=$(addt "theta" --assignee="$FIX_MAKER")
 ( cmd_task_start "$id8" --no-preflight ) >/dev/null 2>&1
 r8=$(open_of "$id8")
