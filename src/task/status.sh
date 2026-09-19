@@ -1857,6 +1857,14 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
     # alone ("0 of 11") cannot tell a credential problem from a listing/rate-limit/
     # visibility one, and the warning below was written as if it could.
     local _sc_err="" _sc_err_slug="" _sc_errf=""
+    # DIVE-4619: did the first failing repo say ANYTHING? `_sc_err` is filled with
+    # an explanatory placeholder when it did not, so the placeholder cannot be the
+    # signal — a classifier reading it would call "nothing was said" a reason.
+    local _sc_err_silent=0
+    # DIVE-4619: WHICH repos declined, not just how many. "6 of 11" tells an
+    # operator a credential is short and nothing about what to grant it; the
+    # standing finding on `doctor` has to name them.
+    local _sc_bad=""
     command -v gh >/dev/null 2>&1 && _ghtok2=$(_gate_gh_token)
     # DIVE-1935: NO TOKEN means the answer is unverified whatever gh prints — do
     # not run the query and then read its empty result as "repo is clean". That
@@ -1895,10 +1903,15 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
         # Keep the FIRST failure's reason: it is the one an operator should read, and
         # a `timeout`-killed call leaves an empty sink, which is itself the answer
         # (the call never got far enough to be told anything).
-        if [[ -z "$_hit" && $_sc_ok -lt $_sc_total && -z "$_sc_err" ]]; then
-          _sc_err_slug="$_slug2"
-          _sc_err="$(head -c 400 "$_sc_errf" 2>/dev/null | tr '\n' ' ' || printf '')"
-          [[ -n "$_sc_err" ]] || _sc_err="the call produced no error text (killed by the gate's 5s timeout, or gh exited silently)"
+        if [[ -z "$_hit" && $_sc_ok -lt $_sc_total ]]; then
+          # DIVE-4619: every declining repo, in order. The FIRST failure's reason is
+          # still the one reported (DIVE-4282); this is the roster behind the count.
+          _sc_bad="${_sc_bad:+$_sc_bad,}$_slug2"
+          if [[ -z "$_sc_err" ]]; then
+            _sc_err_slug="$_slug2"
+            _sc_err="$(head -c 400 "$_sc_errf" 2>/dev/null | tr '\n' ' ' || printf '')"
+            [[ -n "$_sc_err" ]] || { _sc_err_silent=1; _sc_err="the call produced no error text (killed by the gate's 5s timeout, or gh exited silently)"; }
+          fi
         fi
         if [[ -n "$_hit" ]]; then _auto_hit="$_hit"; _sc_hit_slug="$_slug2"; break; fi
       done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
@@ -1906,6 +1919,13 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       rm -f "$_sc_errf" 2>/dev/null || true
       [[ $_sc_ok -eq $_sc_total && $_sc_total -gt 0 ]] && _scan_ran=1
       [[ -n "$_auto_hit" ]] && _scan_ran=1
+      # DIVE-4619: a CLEAN full sweep is a reading too, and the one that clears the
+      # standing finding. Only a sweep of the whole configured set is a census of
+      # the box: a `_task_slug`-narrowed scan asked about one repo, and a scan that
+      # BROKE on a hit stopped early, so neither says anything about the rest.
+      if [[ -z "$_task_slug" && -z "$_auto_hit" && $_sc_total -gt 0 && $_sc_ok -eq $_sc_total ]]; then
+        _gate_vis_record "$_sc_ok" "$_sc_total" "" ok "" "$(_gate_tok_why)"
+      fi
     fi
     # DIVE-2316: the mandatory gate already resolved a concrete PR in a concrete
     # repo. Persist that identity before refusing the premature close, so the
@@ -1985,13 +2005,51 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       # answered because there was no rail.
       local _uv_head="merge-gate could not query GitHub ($_scan_why)"
       [[ -n "$_sc_err" ]] && _uv_head="merge-gate HELD a rail but the repo scan FAILED ($_scan_why) — first failure, ${_sc_err_slug}: ${_sc_err}"
-      warn "$ident: ${_uv_head} — this close is UNVERIFIED, not verified-clean (DIVE-1935). Instrument: ${_uv_why}. Grade it with \`5dive task merge-gate-selftest\`."
+      # DIVE-4619: classify before reporting. `partial-repo-scan-K-of-N` is three
+      # different situations wearing one label, and two of them are the operator's
+      # while the third is ours — see _gate_scan_class.
+      local _scan_class _class_says _sc_err_real=""
+      (( _sc_err_silent )) || _sc_err_real="$_sc_err"
+      _scan_class="$(_gate_scan_class "$_scan_why" "$_sc_err_real")"
+      _class_says="$(_gate_scan_class_says "$_scan_class")"
+      # Persist the reading so `doctor` can carry this ONCE as a standing finding.
+      # Same census guard as the clean path above.
+      [[ -z "$_task_slug" ]] \
+        && _gate_vis_record "$_sc_ok" "$_sc_total" "$_sc_bad" "$_scan_class" "$_scan_why" "$_uv_why"
+      # THE COLLAPSE, AND EXACTLY WHAT IT DOES NOT TOUCH.
+      #
+      # The audit row below and the UNVERIFIED stamp on the result are written on
+      # EVERY close, unthrottled: they are the durable record, and thinning them
+      # would trade noise for silence — the worse failure, and the one the stamp
+      # exists to prevent.
+      #
+      # NOR DOES THE CLOSE GO QUIET. DIVE-1935's rule is that an unverified close is
+      # audited, "never a silent one", and suppressing the terminal line outright on
+      # closes 2..45 would restore exactly the silence that ticket deleted. So a
+      # repeat still says UNVERIFIED and still names the reason — in ONE line that
+      # points at the standing finding, instead of the four-sentence wall that made
+      # 45 of 57 closes unreadable. What repeats is a pointer; what is said once is
+      # the explanation.
+      #
+      # The key is the CLASS, the reason and the first failing repo — everything the
+      # full sentence is derived from — so a coverage change (6-of-11 -> 5-of-11), a
+      # different failing repo, or a different KIND of failure all re-announce in
+      # full immediately.
+      # A timeout on repo A and a rate limit on repo A both read
+      # `partial-repo-scan-0-of-11` and are not the same report, which is why the
+      # class and the failing repo are in the key and not just the reason.
+      if _gate_notice_due "unverified-scan|$_scan_class|$_scan_why|$_sc_err_slug"; then
+        warn "$ident: ${_uv_head} — this close is UNVERIFIED, not verified-clean (DIVE-1935). Instrument: ${_uv_why}. ${_class_says} Grade it with \`5dive task merge-gate-selftest\`; this is a standing condition of the box, so \`5dive doctor --category=creds\` carries it as one finding and further closes with this same reason collapse to one line (DIVE-4619)."
+      else
+        warn "$ident: close UNVERIFIED (${_scan_why}) — standing condition on this box, unchanged since the notice above; \`5dive doctor --category=creds\` names it (DIVE-4619)."
+      fi
       # The scan's own reason belongs on the AUDIT ROW too — the row is what a later
       # sweep reads, and a reason that lives only in a warning on someone's terminal
       # is gone by the time anyone triages the close. Built as an array: the text is
       # gh's stderr and contains spaces, so an unquoted conditional expansion here
       # would word-split it into a fistful of bogus audit fields.
-      local -a _uv_fields=("$ident" "reason=$_scan_why" "seat=$(id -un 2>/dev/null || printf '?')")
+      local -a _uv_fields=("$ident" "reason=$_scan_why" "class=$_scan_class" "seat=$(id -un 2>/dev/null || printf '?')")
+      [[ -n "$_sc_bad" ]] && _uv_fields+=("invisible=$_sc_bad")
       [[ -n "$_sc_err" ]] && _uv_fields+=("scan_err=${_sc_err_slug}: ${_sc_err}")
       _task_store_audit_log "task.merge-gate-unverified" ok 0 -- "${_uv_fields[@]}"
       _mg_unverified="${_mg_unverified:+$_mg_unverified; }repo scan did not complete ($_scan_why)"
