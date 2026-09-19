@@ -47,15 +47,59 @@ t() {
 
 NOW=$(date +%s)
 
+# THE RESET INSTANT IS DERIVED FROM THE CLOCK, NEVER WRITTEN DOWN (DIVE-4372, a
+# second time). Every fixture below that means "the window has not turned over
+# yet" used one hardcoded literal. The code under test compares resetsAt against
+# `date -u +%s`, so when that instant arrived the literal moved into the past and
+# twelve arms flipped from "walled, resets later" to "wall expired" — on main,
+# with no diff involved, exactly the way `date -d r` did it before. main's last
+# green run was the evening before; every PR opened after midnight UTC failed
+# core-pristine on it.
+#
+# A DATE IN A FIXTURE IS A CLOCK DEPENDENCY WEARING A CONSTANT'S CLOTHES. The
+# repo already learned this once and answered it by making the fixture prove its
+# own premise, so this does the same: derive the instant, then assert it is
+# genuinely ahead of now before any arm relies on it. The PAST fixtures
+# (2020-01-01) and the unparseable one stay literal — their meaning does not
+# expire.
+FUTURE_RESET=$(date -u -d '+1 day' +%Y-%m-%dT00:00:00Z)
+
+# The fixture proves its own premise BEFORE anything leans on it — the shape
+# DIVE-4372 settled on. Both halves are needed: a literal date(1) cannot parse
+# would make every "future reset" arm grade the unparseable path instead, and an
+# instant that is not actually ahead of now is the defect this change removes.
+t "the derived reset instant is parseable by date(1)" "yes" \
+  "$(date -u -d "$FUTURE_RESET" +%s >/dev/null 2>&1 && printf yes || printf no)"
+t "and it is genuinely AHEAD of now, which is what every future-reset arm below assumes" "yes" \
+  "$( [[ "$(date -u -d "$FUTURE_RESET" +%s 2>/dev/null || printf 0)" -gt "$(date -u +%s)" ]] \
+      && printf yes || printf no )"
+
+# AND NO DATED LITERAL MAY CREEP BACK IN WITH A FUTURE MEANING. This is the arm
+# that stops the defect returning by edit rather than by clock: every dated
+# literal still written in this file must be in the PAST, because a past date
+# cannot expire into a different meaning, while a future one becomes a time bomb
+# the moment it is committed. The deliberate 2020-01-01 fixtures pass; a new
+# 2027-… would not.
+SELF="tests/$(basename "${BASH_SOURCE[0]}")"
+_dated_future=""
+while read -r _d; do
+  [[ -n "$_d" ]] || continue
+  _ts=$(date -u -d "$_d" +%s 2>/dev/null) || continue
+  (( _ts < $(date -u +%s) )) || _dated_future="$_dated_future $_d"
+done < <(grep -oE '"20[0-9]{2}-[0-9]{2}-[0-9]{2}(T[0-9:]+Z)?"' "$SELF" | tr -d '"' | sort -u)
+t "every dated literal still in this file is in the PAST, so none can expire into a different meaning" \
+  "" "$_dated_future"
+
 # snap <ageSec> <fiveHourPct|null> <sevenDayPct|null> — write the published
 # snapshot for account `walled`, exactly as `account usage` publishes it.
 snap() {
   local age="$1" five="$2" seven="$3"
   jq -cn --argjson at "$(( NOW - age ))" --argjson f "$five" --argjson s "$seven" \
+         --arg fr "$FUTURE_RESET" \
     '{writtenAt:$at, accounts:[
         {name:"walled", agents:["dev9"],
-         usage:{fiveHour:(if $f == null then null else {pct:$f, resetsAt:"2026-09-19T00:00:00Z"} end),
-                sevenDay:(if $s == null then null else {pct:$s, resetsAt:"2026-09-19T00:00:00Z"} end),
+         usage:{fiveHour:(if $f == null then null else {pct:$f, resetsAt:$fr} end),
+                sevenDay:(if $s == null then null else {pct:$s, resetsAt:$fr} end),
                 asOf:$at, source:"dev9", remembered:false}}]}' >"$QUOTA_SNAPSHOT_FILE"
 }
 field() { local n="$1"; shift; IFS=$'\037' read -r -a f <<<"$*"; printf '%s' "${f[$n]:-}"; }
@@ -147,7 +191,7 @@ fi
 # shellcheck source=/dev/null
 source src/cmd_supervisor.sh 2>/dev/null || true
 if declare -f _sup_info_status >/dev/null; then
-  WALL='account at 101% of its 7d limit — resets 2026-09-19T00:00:00Z'
+  WALL="account at 101% of its 7d limit — resets $FUTURE_RESET"
   # armed=false, no tick, store readable, no open rows — the EXACT shape the
   # customer box was in when `supervisor` printed `healthy … 0 stalled / 0 stuck`
   # over a seat that could not spend a token.
@@ -243,7 +287,7 @@ t "and the note says WHY, naming the reset it predates" "yes" \
 t "and no past date is handed to a surface to print" "" "$(field 3 "$(quota_wall_account walled)")"
 
 # quinn's fixture 2, verbatim: remembered, measured eleven days ago, 101%.
-snap3 "$(( 11 * 86400 ))" "2026-09-19T00:00:00Z" true 101
+snap3 "$(( 11 * 86400 ))" "$FUTURE_RESET" true 101
 t "a REMEMBERED reading 11 days old is unmeasured, however fresh the file" \
   "unmeasured" "$(wstate walled)"
 t "and not clear either" "no" \
@@ -254,10 +298,23 @@ t "and it says the number was recalled, so the operator knows what to refresh" "
   "$(wnote walled | grep -q 'recalled from the account record' && printf yes || printf no)"
 
 # POSITIVE CONTROLS — the fences must not eat the alarm this row was filed for.
-snap3 5 "2026-09-19T00:00:00Z" false 101
+snap3 5 "$FUTURE_RESET" false 101
 t "a FRESH reading with a future reset is still the wall" "exhausted" "$(wstate walled)"
+
+# MUTANT — the defect, reproduced in the one position that carried it. Same
+# fixture shape as the positive control directly above; only the reset instant
+# goes back to a written-down date that has since passed. The wall disappears,
+# which is exactly what twelve arms did on main at 00:00Z with nobody's diff
+# involved. Without this the arm above would still pass against a hardcoded
+# literal on any day before it expired, which is how the bug shipped green.
+snap3 5 "2020-01-01T00:00:00Z" false 101
+t "MUTANT: a written-down reset that has since expired turns the same wall into 'unmeasured'" \
+  "unmeasured" "$(wstate walled)"
+snap3 5 "$FUTURE_RESET" false 101
+t "MUTANT restored: the derived instant reads as the wall again" \
+  "exhausted" "$(wstate walled)"
 t "and still carries the reset for the surfaces to print" \
-  "2026-09-19T00:00:00Z" "$(field 3 "$(quota_wall_account walled)")"
+  "$FUTURE_RESET" "$(field 3 "$(quota_wall_account walled)")"
 # An "obviously invalid" literal is not a fact about date(1) — it is a guess.
 # This arm was written with `r`, and GNU date reads a bare `r` as the RFC-822
 # military time zone R (UTC+5): `date -d r` is midnight UTC+5 = 05:00Z TODAY,
@@ -276,9 +333,9 @@ snap3 5 "" false 101
 t "a reading with NO reset time at all is still the wall" "exhausted" "$(wstate walled)"
 
 # The reading's age uses the same fence as the file's, and it is a real edge.
-snap3 "$(( QUOTA_SNAPSHOT_MAX_AGE - 5 ))" "2026-09-19T00:00:00Z" false 101
+snap3 "$(( QUOTA_SNAPSHOT_MAX_AGE - 5 ))" "$FUTURE_RESET" false 101
 t "a reading just INSIDE the freshness fence is measured" "exhausted" "$(wstate walled)"
-snap3 "$(( QUOTA_SNAPSHOT_MAX_AGE + 5 ))" "2026-09-19T00:00:00Z" false 101
+snap3 "$(( QUOTA_SNAPSHOT_MAX_AGE + 5 ))" "$FUTURE_RESET" false 101
 t "a reading just OUTSIDE it is unmeasured" "unmeasured" "$(wstate walled)"
 t "the age reported is the READING's, not the file's" "yes" \
   "$( [[ "$(field 4 "$(quota_wall_account walled)")" -gt "$QUOTA_SNAPSHOT_MAX_AGE" ]] \
@@ -286,11 +343,11 @@ t "the age reported is the READING's, not the file's" "yes" \
 
 # An undated reading: we cannot age it, so we do not get to call it anything.
 jq -cn --argjson at "$NOW" '{writtenAt:$at, accounts:[{name:"walled",
-  usage:{sevenDay:{pct:101, resetsAt:"2026-09-19T00:00:00Z"}}}]}' >"$QUOTA_SNAPSHOT_FILE"
+  usage:{sevenDay:{pct:101, resetsAt:$fr}}}]}' --arg fr "$FUTURE_RESET" >"$QUOTA_SNAPSHOT_FILE"
 t "a reading with no asOf is unmeasured, in either direction" \
   "unmeasured" "$(wstate walled)"
 jq -cn --argjson at "$NOW" '{writtenAt:$at, accounts:[{name:"walled",
-  usage:{sevenDay:{pct:12, resetsAt:"2026-09-19T00:00:00Z"}}}]}' >"$QUOTA_SNAPSHOT_FILE"
+  usage:{sevenDay:{pct:12, resetsAt:$fr}}}]}' --arg fr "$FUTURE_RESET" >"$QUOTA_SNAPSHOT_FILE"
 t "an undated reading BELOW the wall is also unmeasured, never clear" \
   "unmeasured" "$(wstate walled)"
 
@@ -331,7 +388,7 @@ source src/lib/quota_wall.sh
 t "mutation: restored — the spent window is unmeasured again" \
   "unmeasured" "$(wstate walled)"
 
-snap3 "$(( 11 * 86400 ))" "2026-09-19T00:00:00Z" true 101
+snap3 "$(( 11 * 86400 ))" "$FUTURE_RESET" true 101
 MUTA=$(declare -f quota_wall_account | sed 's/\$readage > \$maxage/$readage > 99999999999/')
 t "mutation: the asOf-fence cut landed in the shipping function text" "yes" \
   "$(grep -q '99999999999' <<<"$MUTA" && printf yes || printf no)"
@@ -434,10 +491,10 @@ t "shaper: the ONLY difference between the walled run and its controls is the sn
 SH_PAST=$(shaper_state 101 5 "2020-01-01" false)
 t "shaper (PRODUCTION path): a reading past its own reset is unmeasured" \
   "unknown|unmeasured" "$SH_PAST"
-SH_OLD=$(shaper_state 101 "$(( 11 * 86400 ))" "2026-09-19T00:00:00Z" true)
+SH_OLD=$(shaper_state 101 "$(( 11 * 86400 ))" "$FUTURE_RESET" true)
 t "shaper (PRODUCTION path): an 11-day-old remembered reading is unmeasured" \
   "unknown|unmeasured" "$SH_OLD"
-SH_FRESH=$(shaper_state 101 5 "2026-09-19T00:00:00Z" false)
+SH_FRESH=$(shaper_state 101 5 "$FUTURE_RESET" false)
 t "shaper: and a fresh reading with a future reset is STILL the wall" \
   "quota-exhausted|exhausted" "$SH_FRESH"
 t "shaper: neither fenced run says ready and neither says clear" "yes" \
@@ -468,7 +525,7 @@ sed 's/if read_age > QUOTA_MAX_AGE:/if read_age > 99999999999:/' "$PYORIG" >"$PY
 t "shaper mutation: the reading-age cut landed in the shipping text" "yes" \
   "$(grep -q 'read_age > 99999999999' "$PYMUT" && printf yes || printf no)"
 PYSRC="$PYMUT"
-SH_MUT2=$(shaper_state 101 "$(( 11 * 86400 ))" "2026-09-19T00:00:00Z" true)
+SH_MUT2=$(shaper_state 101 "$(( 11 * 86400 ))" "$FUTURE_RESET" true)
 PYSRC="$PYORIG"
 t "shaper mutation: without it an 11-day-old number is a wall again" \
   "quota-exhausted|exhausted" "$SH_MUT2"
