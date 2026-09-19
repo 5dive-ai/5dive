@@ -519,6 +519,70 @@ cmd_task_answer_delegated() {
   cmd_task_answer "${args[@]}"
 }
 
+# DIVE-4609: a standard Telegram seat needs to relay the PAIRED HUMAN'S action,
+# not exercise task authority as the agent. Bare `sudo 5dive task ...` is
+# intentionally absent from the standard sudoers bundle, and `_task_answer`
+# intentionally refuses every human-evidence flag. This sibling primitive is
+# narrower than either: exact path/no argv, two operations only, caller derived
+# from SUDO_UID, and the caller's own paired-human DM re-verified root-side.
+cmd_task_channel_delegated() {
+  _gate_is_root || fail "$E_PERMISSION" "_task_channel is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
+
+  local -a wire=() args=(); local a op="" channel_proof="" positional=0
+  while IFS= read -r -d '' a; do wire+=("$a"); done
+  (( ${#wire[@]} >= 2 )) || fail "$E_VALIDATION" "_task_channel requires an operation and arguments on stdin."
+  op="${wire[0]}"; args=("${wire[@]:1}")
+  case "$op" in answer|clear-recs) ;; *) fail "$E_VALIDATION" "_task_channel allows only answer or clear-recs." ;; esac
+
+  local ruid="${SUDO_UID:-}" actor=""
+  [[ "$ruid" =~ ^[0-9]+$ && "$ruid" != 0 ]] \
+    || fail "$E_AUTH_REQUIRED" "_task_channel requires sudo from an agent seat."
+  actor=$(_gate_uid_to_agent "$ruid")
+  [[ -n "$actor" ]] || fail "$E_AUTH_REQUIRED" "_task_channel caller uid ${ruid} is not an agent seat."
+
+  for a in "${args[@]}"; do
+    case "$a" in
+      --channel-proof=*) channel_proof="${a#*=}" ;;
+    esac
+    case "$op:$a" in
+      answer:--value=*|answer:--human|answer:--human-proof=*|answer:--channel-proof=*|answer:--channel-msg=*|answer:--tap-uid=*|answer:--tap-username=*|answer:--tap-msg=*|answer:--relay-agent=*|answer:--from=telegram) ;;
+      answer:--*) fail "$E_VALIDATION" "_task_channel answer refuses ${a%%=*}." ;;
+      answer:*) positional=$((positional + 1)); (( positional == 1 )) || fail "$E_VALIDATION" "_task_channel answer accepts one task ident." ;;
+      clear-recs:--channel-proof=*|clear-recs:--only=*|clear-recs:--from=telegram) ;;
+      clear-recs:*) fail "$E_VALIDATION" "_task_channel clear-recs refuses ${a%%=*}." ;;
+    esac
+  done
+  [[ -n "$channel_proof" ]] || fail "$E_AUTH_REQUIRED" "_task_channel requires paired-human channel proof."
+  _gate_channel_proof_ok "$channel_proof" \
+    || fail "$E_AUTH_REQUIRED" "_task_channel channel proof did not verify for agent ${actor}."
+
+  TASK_CHANNEL_DELEGATED=1
+  case "$op" in
+    answer)     cmd_task_answer "${args[@]}" ;;
+    clear-recs) cmd_task_clear_recs "${args[@]}" ;;
+  esac
+}
+
+# Caller half. _TASK_CHANNEL_ATTEMPTED distinguishes "not this path" from a
+# privileged refusal: once a caller supplied --channel-proof, failure MUST NOT
+# fall through to an unsigned/group-writable write.
+_task_channel_try() {
+  local op="$1"; shift
+  _TASK_CHANNEL_ATTEMPTED=0
+  _gate_is_root && return 1
+  [[ -z "${TASK_CHANNEL_DELEGATED:-}" ]] || return 1
+  local a has_proof=0
+  for a in "$@"; do [[ "$a" == --channel-proof=* ]] && has_proof=1; done
+  (( has_proof )) || return 1
+  _TASK_CHANNEL_ATTEMPTED=1
+  sudo -n -l /usr/local/bin/5dive _task_channel >/dev/null 2>&1 \
+    || fail "$E_PERMISSION" "paired-human task write needs the scoped _task_channel grant; reconcile this standard seat and retry."
+  local out rc=0
+  out=$(printf '%s\0' "$op" "$@" | sudo -n /usr/local/bin/5dive _task_channel 2>&1) || rc=$?
+  printf '%s\n' "$out"
+  return "$rc"
+}
+
 # The caller half: reach for the SIGNED path when, and only when, this seat is one
 # whose closures land unsigned today. A seat that can sign directly keeps today's
 # path byte for byte — routing a root-all seat through the executor would silently
@@ -551,6 +615,9 @@ _task_answer_try_delegated() {
 }
 
 cmd_task_answer() {
+  local _tc_rc=0
+  _task_channel_try answer "$@" || _tc_rc=$?
+  (( _TASK_CHANNEL_ATTEMPTED )) && return "$_tc_rc"
   tasks_db_init
   # DIVE-3160: prefer the delegated SIGNED clear on a seat that cannot sign. Runs
   # before any parsing so the executor sees the caller's arguments verbatim.
