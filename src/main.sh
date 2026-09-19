@@ -22,6 +22,11 @@ Maintenance:
 Live view:
   5dive watch [--interval=N]                         # htop-style live view of every agent;
                                                      # ↑↓ select, ↵ attach, r refresh, q quit.
+  5dive wall [--grid=CxR] [--rebuild] [<seat>...]    # every agent's live TUI tiled on ONE screen,
+                                                     # read-only (C-b w opts one pane in).
+                                                     # Seats come from the registry; the grid
+                                                     # defaults to 3 wide and is remembered per box.
+                                                     # full surface: 5dive wall --help
 
 Compose (declarative agents via 5dive.yaml):
   5dive up   [-f file]                               # bring up agents declared in spec (idempotent)
@@ -281,6 +286,8 @@ Auth (lower-level; the dashboard uses these — prefer 'account' for human-drive
   5dive agent auth cancel <session_id>
   5dive agent auth reap [--ttl=<secs>] [--max-age=<secs>] [--dry-run]
                                                        # kill abandoned login processes + drop old session dirs
+  # Agent TUI access: '5dive watch' then ↵ attaches to ONE seat (writable);
+  # '5dive wall' tiles EVERY seat read-only on one screen (DIVE-4614).
   # NB each session's login TUI lives on a PRIVATE tmux socket, so a plain
   # 'tmux ls' shows nothing. To watch one live:
   #   tmux -S /var/lib/5dive/auth-sessions/<session_id>/tmux.sock attach -t auth-<session_id>
@@ -1105,6 +1112,11 @@ main() {
     watch)
       # Live multi-agent dashboard (htop-style). Read-only — no audit, no lock.
       cmd_watch "$@" ;;
+    wall)
+      # DIVE-4614: every agent's live TUI on one screen, read-only. Holds no
+      # state of its own (it only tiles `tmux attach -r` clients), so like
+      # `watch` it takes no lock and is not audited.
+      cmd_wall "$@" ;;
     selfcheck)
       # DIVE-2039 (v0.16 "Fails loud"): run each critical rail for real in an
       # ISOLATED state dir and assert the EFFECT, not the report. Every write it
