@@ -998,14 +998,28 @@ cmd_task_verify() {
         # claim at `:2766` (which re-asserts `status='todo'`) keeps working
         # unmodified.
         #
-        # (2) THE ASSIGNEE MOVES ONLY WHEN THE SEAT IS GONE. That is acceptance 2
-        # read literally: "never keeps that clone as assignee ONCE THE CLONE IS
-        # GONE". Moving it unconditionally would be a second, wider change wearing
-        # this one's clothes — it takes a row away from a LIVE maker, which
-        # `tests/task_delivery_evidence_unit.sh` asserts against by name ("the row
-        # was NOT routed away from the maker") for a `--review=check` row whose
-        # maker is the seat that must keep it. A row whose assignee is alive is
-        # not stranded and does not need rescuing.
+        # (2) THE HELD ROW ENDS UP WITH ONE OWNER, NOT TWO. DIVE-4604 measured
+        # the narrower rule — move the assignee only when that seat is GONE —
+        # leaving the stranding in place on a live box: 2026-09-19, DIVE-4574
+        # (assignee `main`, live) and DIVE-4632 (assignee `quinn`, live) were both
+        # back at `in_progress` with `merge_owner=ops`, and `task doctor` called
+        # both undispatchable. The status half above is necessary and not
+        # sufficient, because it only holds until something claims the row again:
+        # every OTHER dispatch path keys on the ASSIGNEE, not on `merge_owner` —
+        # the loop-defect forced wake (`forced wake of quinn onto DIVE-4632:
+        # stage_owner=quinn`), a goal wake, a hand `task assign`. The picker's
+        # merge-owner arm is the only reader of `merge_owner` there is, so one
+        # claim by the old assignee puts the row at `in_progress` and hides it
+        # from that arm again, permanently. Leaving two owners on one row is the
+        # confusion the filing named in as many words.
+        #
+        # HAND IT OVER ONLY TO A SEAT THE HEARTBEAT WAKES, ON POSITIVE KNOWLEDGE.
+        # `_task_merge_hold_owner_takes_it` says yes only when the roster READ
+        # and carries that owner with a heartbeat. When it cannot be read the
+        # pre-DIVE-4604 rule stands unchanged — move only a seat that is provably
+        # gone — so an unreadable registry can never route a row onto a name
+        # nothing iterates, the failure DIVE-4571 removed and DIVE-4220 before it,
+        # and the A7 arm holds either way.
         #
         # DEGRADE, NEVER GUESS: if the roster cannot be read, the assignee is left
         # alone. An unreadable registry is not evidence that a seat is gone, and
@@ -1020,7 +1034,7 @@ cmd_task_verify() {
                AND status NOT IN ('done','cancelled');" || true
         _md_asg=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
         if (( ${_md_held:-0} )) && [[ -n "${_md_owner:-}" && "$_md_asg" != "$_md_owner" ]] \
-           && _task_seat_is_gone "$_md_asg"; then
+           && { _task_merge_hold_owner_takes_it "$_md_owner" || _task_seat_is_gone "$_md_asg"; }; then
           db "UPDATE tasks
                  SET assignee=$(sqlq "$_md_owner"),
                      updated_at=datetime('now')
@@ -1028,7 +1042,7 @@ cmd_task_verify() {
                  AND status NOT IN ('done','cancelled');" || true
           _task_store_audit_log "task.merge-hold-reassigned" ok 0 -- \
             "$ident" "from=${_md_asg:-<none>} to=$_md_owner reason=$_md_why"
-          warn "$ident: assignee '${_md_asg:-<none>}' is not on the roster — handed to '${_md_owner}', the seat that owes the merge."
+          warn "$ident: held for merge — handed from '${_md_asg:-<none>}' to '${_md_owner}', the seat that owes the merge."
         fi
       fi
     fi
