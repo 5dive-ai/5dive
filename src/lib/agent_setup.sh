@@ -801,7 +801,7 @@ ensure_bun_for_agent() {
 }
 
 install_channel_plugin_for_agent() {
-  local plugin="$1" name="$2" allowed_users="${3:-}"
+  local plugin="$1" name="$2" allowed_users="${3:-}" token="${4:-}"
   local user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
 
@@ -955,6 +955,28 @@ AGENT_PLUGIN_INSTALL
   then
     fail "$E_GENERIC" \
       "$plugin plugin install failed for agent '$name' (see journalctl / stderr above). Run: sudo 5dive doctor"
+  fi
+
+  # Claude channel MCPs read their credential from their own state directory,
+  # not from the fleet connector copy. Reconcile it on every install/rotation,
+  # and discard Claude's negative MCP-auth cache so a prior tokenless launch
+  # cannot keep the newly credentialed channel disabled.
+  if [[ "$plugin" == "telegram" ]]; then
+    [[ -n "$token" ]] || fail "$E_VALIDATION" "telegram token missing for agent '$name'"
+    sudo -u "$user" -H env TOKEN="$token" bash -s <<'CLAUDE_TELEGRAM_STATE'
+set -euo pipefail
+STATE="$HOME/.claude/channels/telegram"
+ENV_FILE="$STATE/.env"
+TMP="$STATE/.env.tmp.$$"
+mkdir -p "$STATE"
+chmod 700 "$STATE"
+touch "$ENV_FILE"
+grep -v '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" >"$TMP" || true
+printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN" >>"$TMP"
+chmod 600 "$TMP"
+mv "$TMP" "$ENV_FILE"
+rm -f "$HOME/.claude/mcp-needs-auth-cache.json"
+CLAUDE_TELEGRAM_STATE
   fi
 
   # Pre-seed access.json with the operator's user id so the agent is usable on
@@ -2189,7 +2211,7 @@ install_channel_for_agent() {
     fail "$E_VALIDATION" "channels=buzz is claude-only (agent '$name' is type $type)"
   fi
   case "$type" in
-    claude)      install_channel_plugin_for_agent "$plugin" "$name" "$allowed_users" ;;
+    claude)      install_channel_plugin_for_agent "$plugin" "$name" "$allowed_users" "$token" ;;
     codex)       install_channel_for_codex_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     grok)        install_channel_for_grok_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     antigravity) install_channel_for_antigravity_agent "$plugin" "$name" "$token" "$allowed_users" ;;

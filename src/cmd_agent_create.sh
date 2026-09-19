@@ -532,6 +532,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _deploy_do"*|\
         "/usr/local/bin/5dive _gh_do"*|\
         "/usr/local/bin/5dive _task_answer"*|\
+        "/usr/local/bin/5dive _task_channel"*|\
         "/usr/local/bin/5dive _merge_do"*)              has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
@@ -674,6 +675,13 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _self_restart
 # between standing and capability that it exists to close. It cannot stamp a
 # human answer: every human-evidence form is refused inside the primitive.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_answer
+# DIVE-4609: let this seat relay a paired-human Telegram answer without granting
+# the bare root task surface. EXACT path, NO args, NO wildcard. The operation and
+# arguments travel over stdin; _task_channel allows only answer / clear-recs,
+# derives the seat from SUDO_UID, and re-verifies its own access.json before any
+# signed write. This is unconditional because every standard Telegram seat needs
+# working gate taps, while the primitive grants no authority without channel proof.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_channel
 # DIVE-3474: let a VERIFIER merge the pull request on a row IT ITSELF graded PASS.
 # EXACT path, NO args, NO wildcard: one task ident travels over stdin, the caller
 # is derived from SUDO_UID inside _merge_do, and the merge standing is re-derived
