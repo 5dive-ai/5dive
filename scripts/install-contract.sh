@@ -85,7 +85,7 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n       %s\n' "$1" "${2:-}"; }
 DENY='uninstall self-update self_update update paperclip-seed fire hire'
 
 # --- MEASURED BASELINE: verbs with no --help handling today ------------------
-# Measured 2026-09-09 on 278c3879, as root: these 15 spellings answer `--help`
+# Measured 2026-09-09 on 278c3879, as root: these spellings answer `--help`
 # with a usage ERROR (rc 2), not usage text. They are pre-existing defects, not
 # regressions from this change, and fixing 15 argument parsers inside the PR
 # that adds the check would make the check unreviewable. They are waived HERE,
@@ -93,7 +93,12 @@ DENY='uninstall self-update self_update update paperclip-seed fire hire'
 # answering --help correctly turns this harness RED until it is removed from
 # this list, so the baseline can only shrink. A verb added to the CLI after
 # today is asserted by T4 with no waiver available.
-WAIVED='account activity buzz cost deploy doctor gate-proof host objective objectives project projects push trace usage'
+# `account` came off this list on 2026-09-19: `5dive account --help` had no help
+# arm at all and answered "unknown account command: --help", and the change that
+# gave `agent`/`account` subverbs their `--help` gave the surface one too. T5 is
+# what required it to come off here in the same PR — which is the point of a
+# self-retiring waiver.
+WAIVED='activity buzz cost deploy doctor gate-proof host objective objectives project projects push trace usage'
 
 in_list() { local n="$1"; shift; local x; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
 
