@@ -870,6 +870,27 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- ungraded. Written once at `task add`; the run-time authority on whether a
   -- grader actually spends a session stays verify_grants_grader(), never this.
   review_mode             TEXT,
+  -- DIVE-4623: THE NEGATIVE CONTROL FOR `review_mode='check'`. A command grade
+  -- is only evidence if the command can FAIL, and nothing proved that: a row
+  -- filed `--review=check --verify=true` graded itself green at every delivery
+  -- for zero tokens and zero information. This column holds the command that
+  -- BREAKS the delivered tree (typically `git apply -R` of the fix hunk, or a
+  -- `sed` that removes the guard the row added). At delivery both arms run from
+  -- a clean checkout at the delivered sha: the check must PASS on the tree as
+  -- delivered and must FAIL after the mutant runs. A check that survives the
+  -- mutant is vacuous and the delivery is refused.
+  --
+  -- TWO NON-COMMAND VALUES, both deliberate and both distinguishable from NULL:
+  --   'none: <reason>'  the AUDITED ESCAPE (`--no-mutant="<why>"`) — a row whose
+  --                     check genuinely cannot be inverted (an environment
+  --                     probe, a live-box reachability check). The reason is
+  --                     stored because an unexplained escape and a forgotten
+  --                     flag are the same state otherwise, which is the
+  --                     declared-vs-actual collapse review_mode exists to end.
+  --   NULL              never recorded: every row filed before this shipped,
+  --                     and every row that is not command-graded. NOT a synonym
+  --                     for the escape — a NULL row simply predates the rail.
+  mutant_command          TEXT,
   -- DIVE-3251: THE FIRST TIME REAL WORK STARTED ON THIS ROW, and the one clock in
   -- this table that no nudge/reclaim path may touch. `started_at` is the CURRENT
   -- claim's clock and the heartbeat ladder deliberately clears it on reclaim, "so
@@ -1817,6 +1838,10 @@ _TASKS_ADDITIVE_COLUMNS=(
   # Nullable — NULL is "never recorded", which is a real third state and not
   # `none`. See the CREATE TABLE comment.
   'review_mode TEXT'
+  # DIVE-4623: the negative control for a command-graded row. Nullable — NULL is
+  # "never recorded", which is every pre-existing row, so the backfill is a
+  # no-op. See the CREATE TABLE comment for the two non-command values.
+  'mutant_command TEXT'
   # DIVE-3251: the durable first-start clock, split out of `started_at` so the
   # reclaim ladder can keep restarting the age without destroying the evidence
   # that work happened. Nullable — NULL means "this build never recorded it",

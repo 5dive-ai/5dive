@@ -207,9 +207,15 @@ OUT6=$(cmd_task_done "$ID4" --result="fixed it, looks right now" 2>&1); RC6=$?
 (( RC6 != 0 )) && ok_t "'task done' on a BOUND row refuses an unevidenced result" \
   || bad_t "'task done' on a BOUND row refuses an unevidenced result" "rc=$RC6 $OUT6"
 
+# DIVE-4623: `--review=check` now requires a negative control — the command that
+# BREAKS the check — because a check that cannot fail grades every tree green.
+# These rows grade the ROUTING a command grade takes and their command is
+# literally `true`, so they take the audited waiver rather than a mutant that
+# would (correctly) condemn `true` as vacuous. The control arms themselves are
+# graded in tests/task_check_mutant_arm_unit.sh.
 echo "── PART 4 — a command-graded row never books a grader session ─────"
 CMDOK="true"; CMDBAD="false"
-ID5=$(add_row "command graded, green" --review=check --verify="$CMDOK")
+ID5=$(add_row "command graded, green" --review=check --verify="$CMDOK" --no-mutant="fixture: these arms grade the routing a command grade takes, not the command")
 : > "$SPAWNS"
 OUT7=$(cmd_task_deliver "$ID5" --pr="$PR" --result="$GOOD" 2>&1); RC7=$?
 (( RC7 == 0 )) && ok_t "a green command-graded delivery succeeds" || bad_t "a green command-graded delivery succeeds" "rc=$RC7 $OUT7"
@@ -224,7 +230,7 @@ OUT7=$(cmd_task_deliver "$ID5" --pr="$PR" --result="$GOOD" 2>&1); RC7=$?
 [[ "$(col "$ID5" assignee)" == "dev" ]] && ok_t "the row was NOT routed away from the maker" \
   || bad_t "the row was NOT routed away from the maker" "assignee='$(col "$ID5" assignee)'"
 
-ID6=$(add_row "command graded, red" --review=check --verify="$CMDBAD")
+ID6=$(add_row "command graded, red" --review=check --verify="$CMDBAD" --no-mutant="fixture: these arms grade the routing a command grade takes, not the command")
 : > "$SPAWNS"
 OUT8=$(cmd_task_deliver "$ID6" --pr="$PR" --result="$GOOD" 2>&1); RC8=$?
 (( RC8 != 0 )) && ok_t "a RED command-graded delivery is refused" || bad_t "a RED command-graded delivery is refused" "rc=$RC8"
@@ -284,12 +290,16 @@ _DELIVERY_EVIDENCE_FIELDS="$ORIG_FIELDS"
 # (c) the COMMAND-GRADE early return. Cut it and a green check row must fall
 # through to the grader attach — i.e. book the session this row exists to save.
 ORIG_DELIV=$(declare -f cmd_task_deliver)
-MUT2=$(printf '%s\n' "$ORIG_DELIV" | sed '0,/if _task_deliver_command_grade "\$id" "\$ident" "\$deliver_cmd" "\$result" "\$want_result"; then/s//if false; then/')
+# Anchored on the CALL, not on its full argument list: DIVE-4623 added the
+# negative control as a sixth argument, and a sed pinned to the old arity
+# matched nothing and left this arm vacuously green — which is exactly what the
+# `matched nothing` guard below is here to catch.
+MUT2=$(printf '%s\n' "$ORIG_DELIV" | sed '0,/if _task_deliver_command_grade .*; then/s//if false; then/')
 if [[ "$MUT2" == "$ORIG_DELIV" ]]; then
   bad_t "mutation (c) landed" "sed matched nothing — the arm below would be vacuous"
 else
   eval "$MUT2"
-  IDA=$(add_row "check row, grade path cut" --review=check --verify="$CMDOK")
+  IDA=$(add_row "check row, grade path cut" --review=check --verify="$CMDOK" --no-mutant="fixture: these arms grade the routing a command grade takes, not the command")
   : > "$SPAWNS"
   ( cmd_task_deliver "$IDA" --pr="$PR" --result="$GOOD" ) >/dev/null 2>&1
   [[ "$(col "$IDA" verifier)" != "" || "$(spawn_count)" != "0" ]] \

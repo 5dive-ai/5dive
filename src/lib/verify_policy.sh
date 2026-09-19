@@ -185,6 +185,47 @@ review_mode_cost_note() {  # <mode>
   esac
 }
 
+# ── DIVE-4623: A CHECK THAT CANNOT FAIL IS NOT A GRADE ───────────────────────
+#
+# `check` was never trusted as a DEFAULT, and the reason was not that a command
+# grades badly — it is that nothing proved the command could go red. `--verify=true`
+# is a passing grade on every tree that will ever exist, and it is indistinguishable,
+# in the store and on the board, from a real acceptance run. So the mode carries a
+# NEGATIVE CONTROL: the command that breaks the delivered tree. Both arms run at
+# delivery and a check that survives the break is refused as evidence.
+#
+# The measurement that forced it (main, 2026-09-19, summed `message.usage` over
+# seven days of transcripts): the single grader seat out-burned the maker seat it
+# grades, 2318.8M vs 2307.0M quota tokens, 97.8% of it cache-read — a second full
+# session re-loading a diff that had already been made. A command grade with a
+# proven-red control costs a command.
+#
+# `mutant_escape_reason <value>` — prints the reason when the stored value is the
+# audited escape (`none: <why>`), and returns 1 for a real command or an empty
+# cell. One place decides what the prefix means, so the filer's refusal, the
+# delivery arm and `task show` cannot drift apart on it.
+mutant_escape_reason() {  # <stored mutant_command>
+  local v="${1:-}"
+  [[ "$v" == none:* ]] || return 1
+  local r="${v#none:}"
+  printf '%s' "${r# }"
+}
+
+# `mutant_control_note <stored mutant_command>` — what the row's negative control
+# IS, in the words the filer and the board read. Same reason as
+# `review_mode_cost_note` above: the add line, `task show` and the help table
+# must not each invent their own sentence for the same stored state.
+mutant_control_note() {  # <stored mutant_command>
+  local v="${1:-}" r
+  if [[ -z "$v" ]]; then
+    printf 'NO negative control — nothing proves this check can fail'
+  elif r=$(mutant_escape_reason "$v"); then
+    printf 'negative control waived (audited): %s' "$r"
+  else
+    printf 'negative control: %s' "$v"
+  fi
+}
+
 # ── DIVE-4576: THE DELIVERY CARRIES ITS EVIDENCE ─────────────────────────────
 #
 # lodar, 2026-09-15: "yes. thats important for our tight tokens subscriptions"
