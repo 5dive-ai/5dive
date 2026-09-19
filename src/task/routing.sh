@@ -1808,6 +1808,33 @@ _task_seat_is_gone() {
   return 0
 }
 
+# _task_seat_is_known <name> — 0 only when the roster is READABLE and DOES carry
+# <name>. The positive mirror of `_task_seat_is_gone`, and not its negation: both
+# answer NO on an unreadable roster, because neither "gone" nor "live" is a fact
+# you may infer from a registry you could not read (DIVE-4604). Callers use this
+# when they are about to MOVE a row onto a seat, where a wrong yes lands work on
+# a name nothing iterates.
+_task_seat_is_known() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || return 1
+  local roster; _task_roster; roster="$_TASK_ROSTER"
+  [[ "$_TASK_ROSTER_STATE" == "ok" ]] || return 1
+  grep -Fxq -- "$name" <<<"$roster"
+}
+
+# _task_merge_hold_owner_takes_it <seat> — 0 when a held row may be MOVED onto
+# <seat>: positive knowledge only. `_merge_hold_seat_live` answers YES on an
+# unreadable roster on purpose, because there it guards a PRINT and a wrong yes
+# costs one bounce; here it guards a WRITE that moves a row, so it is conjoined
+# with an actual registry read rather than trusted alone (DIVE-4604).
+_task_merge_hold_owner_takes_it() {
+  local seat="${1:-}"
+  [[ -n "$seat" ]] || return 1
+  _task_seat_is_known "$seat" || return 1
+  declare -F _merge_hold_seat_live >/dev/null 2>&1 || return 0
+  _merge_hold_seat_live "$seat"
+}
+
 _task_roster_sql_notin() {
   local roster n out=""
   _task_roster; roster="$_TASK_ROSTER"
