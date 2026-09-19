@@ -1088,14 +1088,26 @@ cmd_task_verify() {
   # row, and the lane would then read the re-spawned grade as still in flight
   # forever. Never fatal: `ledger_emit` swallows its own failure, and a verdict
   # that is already durably stored must not be undone by a bookkeeping write.
+  # HOISTED out of the ledger branch below so the AUDIT row and the LEDGER event
+  # report the same sha. Read once, used twice: a reader comparing the two must
+  # never be able to find them disagreeing about the same verdict.
+  local _g_sha=""
+  declare -F _gate_graded_sha >/dev/null 2>&1 \
+    && _g_sha=$(_gate_graded_sha "$result_txt" 2>/dev/null || printf '')
   if declare -F ledger_emit >/dev/null 2>&1; then
-    local _g_sha=""
-    declare -F _gate_graded_sha >/dev/null 2>&1 \
-      && _g_sha=$(_gate_graded_sha "$result_txt" 2>/dev/null || printf '')
     ledger_emit task.graded ident="$ident" task_id="$id" actor="$(task_actor "")" \
       idem="task.graded:${ident}:$(date +%s%N 2>/dev/null || echo $$)" \
       detail="verdict=${verdict} sha=${_g_sha:-unknown} closed=${flipped} merge-hold=${merge_hold}"
   fi
+  # And the AUDIT row, carrying the same fields. The ledger event and the audit
+  # log are different readers: the ledger is the pool's in-flight lane (it keys on
+  # this event to free a slot), the audit log is the fleet trail a person reads
+  # when asking who graded what. A verdict stored with a lifecycle event but no
+  # audit row is exactly the `deliver` gap one verb over. Not conditional on
+  # ledger_emit being defined — the trail must not go quiet because the ledger is
+  # absent.
+  _task_store_audit_log "task.graded" ok 0 -- "$ident" "verdict=$verdict" \
+    "sha=${_g_sha:-unknown}" "closed=$flipped" "merge-hold=$merge_hold"
 
   if (( JSON_MODE )); then
     printf '%s' "$result_txt" | jq -R -s \
