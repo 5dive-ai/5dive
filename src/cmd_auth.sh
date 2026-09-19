@@ -89,6 +89,34 @@ auth_creds_present() {
   [[ -n "$api_val" ]]
 }
 
+# auth_probe_output <type> [profile] [timeout-secs] [cmd-override] — run the
+# probe and echo WHAT IT PRINTED (stdout+stderr merged), rc 0. Returns 2, with
+# no output, when the type has no probe configured.
+#
+# DIVE-4591 split this out of `auth_probe_one`, which threw the text away and
+# kept only a stale-or-not verdict. The early-quota probe asks a DIFFERENT
+# question of the same invocation — did the provider serve this turn, or refuse
+# it with a usage wall — and the one thing that must not be duplicated is the
+# ENV PRECEDENCE below: shared connector env first, the profile's combined.env
+# LAST so it overrides (the precedence systemd uses). Two copies of that is two
+# things that can drift into probing the wrong account, which for this caller
+# would mean un-parking a fleet on another account's headroom.
+auth_probe_output() {
+  local type="$1" profile="${2:-}" secs="${3:-5}" probe="${4:-${TYPE_PROBE[$1]:-}}"
+  [[ -n "$probe" ]] || return 2
+  [[ "$secs" =~ ^[0-9]+$ ]] && (( secs > 0 )) || secs=5
+  local env_src='' f
+  for f in /etc/5dive/connectors/anthropic.env /etc/5dive/connectors/openai.env; do
+    env_src+="[ -r $f ] && set -a && . $f && set +a; "
+  done
+  if [[ -n "$profile" ]]; then
+    local pf="${AUTH_PROFILES_DIR}/${profile}/combined.env"
+    env_src+="[ -r $pf ] && set -a && . $pf && set +a; "
+  fi
+  sudo -u claude -i timeout "${secs}s" bash -lc "${env_src}${probe}" 2>&1 || true
+  return 0
+}
+
 # auth_probe_one <type> [profile] — run a short CLI invocation to verify the
 # stored creds still work against the provider API. Returns 0 (ok) / 1 (stale)
 # / 2 (no probe configured, caller should fall back to file-presence).
@@ -107,16 +135,8 @@ auth_creds_present() {
 auth_probe_one() {
   local type="$1" profile="${2:-}" probe="${TYPE_PROBE[$1]:-}"
   [[ -n "$probe" ]] || return 2
-  local env_src=''
-  for f in /etc/5dive/connectors/anthropic.env /etc/5dive/connectors/openai.env; do
-    env_src+="[ -r $f ] && set -a && . $f && set +a; "
-  done
-  if [[ -n "$profile" ]]; then
-    local pf="${AUTH_PROFILES_DIR}/${profile}/combined.env"
-    env_src+="[ -r $pf ] && set -a && . $pf && set +a; "
-  fi
   local out
-  out=$(sudo -u claude -i timeout 5s bash -lc "${env_src}${probe}" 2>&1 || true)
+  out=$(auth_probe_output "$type" "$profile" 5) || return 2
   # Known "stale creds" signals from claude's --print output. We match on
   # substrings rather than exit codes because --print flips its exit code
   # based on whether stdout is a TTY. Rate-limit / usage-limit responses
