@@ -117,6 +117,14 @@ cmd_rm() {
     || fail "$E_NOT_FOUND" "no agent named '$name'"
   local rm_profile
   rm_profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$reg")
+  # DIVE-4589: removal ENDS the binding, and "unbound from here on" is a fact
+  # with its own timestamp. Without it, a seat removed from an account leaves its
+  # last binding open forever, and any later reader attributes turns that cannot
+  # exist. The account column is NULL — explicitly unbound, which is a different
+  # answer from "we have no event".
+  if declare -F account_binding_record >/dev/null 2>&1; then
+    account_binding_record "$name" "" "agent-remove" || true
+  fi
   step "Stopping 5dive-agent@${name}.service"
   systemctl disable --now "5dive-agent@${name}.service" 2>/dev/null || true
   # DIVE-1609: a crashed/oneshot unit lingers in `failed` even after disable,

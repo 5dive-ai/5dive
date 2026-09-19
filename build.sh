@@ -97,6 +97,7 @@ CORE_FILES=(
   src/lib/agent_env.sh
   src/lib/verify_policy.sh
   src/lib/tasks_db.sh
+  src/lib/account_history.sh
   src/lib/runs.sh
   src/lib/actor.sh
   src/lib/routing_receipt.sh
