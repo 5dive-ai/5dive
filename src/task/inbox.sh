@@ -956,6 +956,9 @@ cmd_gate_proof() {
 # apply). The tier<2 + channel-proof enforcement lives in cmd_task_answer, so
 # even a hand-crafted --only=<hard gate> can never be cleared here.
 cmd_task_clear_recs() {
+  local _tc_rc=0
+  _task_channel_try clear-recs "$@" || _tc_rc=$?
+  (( _TASK_CHANNEL_ATTEMPTED )) && return "$_tc_rc"
   tasks_db_init
   local channel_proof="" only="" from=""
   while [[ $# -gt 0 ]]; do
@@ -1018,4 +1021,3 @@ cmd_task_clear_recs() {
   ok "applied recommendations to $n gate(s): ${cleared[*]}" \
      '{cleared:($n|tonumber), gates:$g}' --arg n "$n" --argjson g "$gates_json"
 }
-
