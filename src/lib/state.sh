@@ -64,3 +64,63 @@ ensure_state_ro() {
 
 # Initialise the append-only audit log. Readable by group `claude` so the
 # dashboard process (which runs as `claude`) can `tail` it without sudo.
+
+# --- DIVE-4642: the composer-wedge ledger -------------------------------------
+#
+# A seat whose composer holds an unsubmitted payload is simultaneously ALIVE,
+# IDLE and PERMANENTLY STUCK, and nothing anywhere pages: the row it was handed
+# stays `in_progress`, so every later tick reads `busy — 1 in_progress, skip`,
+# which is the very thing that stops it ever being re-woken. Measured on quinn
+# 2026-09-19: DIVE-4628 (urgent, a green approved PR) sat ungraded for 9.5h.
+#
+# The injector ALREADY knows when this happens — it prints `submit unverified`.
+# That line went to a log nobody reads. This ledger is how that knowledge leaves
+# the injector: one file per wedged seat, written by whoever measured the wedge,
+# read by `5dive supervisor` (class `composer-wedged`) so the seat is reported
+# UNHEALTHY BY NAME within one tick instead of being reported busy forever.
+#
+# Deliberately a FILE and not a db row: the writer is the heartbeat injector,
+# which runs inside `_hb_send_line` under a registry lock on some paths, and a
+# sqlite write there would be a new lock-ordering edge on the one path that must
+# never hang. Group-readable (2770 root:claude) so a non-root seat can read its
+# own verdict — the plugin-floor log being root-only is why that is spelled out.
+_wedge_dir() { printf '%s\n' "${STATE_DIR}/composer-wedge"; }
+
+# Record that <seat>'s composer is holding text nobody submitted.
+# args: <seat> <chars> <excerpt> [<cleared|residual>]
+# Best-effort by construction: a ledger write must never fail a wake.
+_wedge_mark() {
+  local seat="$1" chars="${2:-0}" excerpt="${3:-}" disp="${4:-residual}" d
+  d="$(_wedge_dir)"
+  mkdir -p "$d" 2>/dev/null || return 0
+  chown root:claude "$d" 2>/dev/null || true
+  chmod 2770 "$d" 2>/dev/null || true
+  excerpt="${excerpt//$'\n'/ }"
+  printf '%s\x1f%s\x1f%s\x1f%s\n' "$(date -u +%s)" "$chars" "$disp" "${excerpt:0:120}" \
+    > "${d}/${seat}" 2>/dev/null || return 0
+  chmod 660 "${d}/${seat}" 2>/dev/null || true
+  return 0
+}
+
+# Forget the wedge. Called on every VERIFIED submit, so the ledger ages out by
+# the seat working again rather than by a timer — a timer would clear a wedge
+# that is still live, which is the failure this whole row exists to remove.
+_wedge_clear() { rm -f "$(_wedge_dir)/${1}" 2>/dev/null || true; return 0; }
+
+# Human-readable detail for <seat>, or rc 1 when the seat is not wedged.
+_wedge_read() {
+  local seat="$1" line ts chars disp excerpt
+  line=$(cat "$(_wedge_dir)/${seat}" 2>/dev/null) || return 1
+  [[ -n "$line" ]] || return 1
+  IFS=$'\x1f' read -r ts chars disp excerpt <<<"$line"
+  [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+  local age=$(( $(date -u +%s) - ts ))
+  (( age < 0 )) && age=0
+  if [[ "$disp" == "cleared" ]]; then
+    printf 'a dispatched payload could not be submitted %dm ago (%s chars, since cleared from the composer): %s\n' \
+      $(( age / 60 )) "$chars" "${excerpt:0:80}"
+  else
+    printf 'the composer has held %s chars of UNSENT text for %dm — the seat is idle, its row reads in_progress, and nothing is running: %s\n' \
+      "$chars" $(( age / 60 )) "${excerpt:0:80}"
+  fi
+}
