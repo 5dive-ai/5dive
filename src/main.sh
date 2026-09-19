@@ -605,6 +605,14 @@ main() {
       # the exec case, which this deliberately is not). Never advertised.
       cmd_task_answer_delegated
       exit $? ;;
+    _task_channel)
+      # DIVE-4609: hidden, privileged Telegram human-action bridge. Standard
+      # seats may reach only this exact path; operation + arguments travel over
+      # stdin. The executor accepts task answer / clear-recs only, derives the
+      # calling seat from SUDO_UID, and re-verifies that seat's paired-human
+      # channel before the ordinary task functions authorize and sign the write.
+      cmd_task_channel_delegated
+      exit $? ;;
     _audit_append)
       # DIVE-1268: hidden, privileged, APPEND-ONLY audit primitive. Reachable
       # ONLY via NOPASSWD sudo — the admin whole-CLI grant, or the scoped

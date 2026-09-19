@@ -80,6 +80,8 @@ is "grant merge   -> update" "$(plan_state agent-quinn merge)" "update"
 is "  and neither broker axis is invented" "$(plan_axes agent-quinn merge)" "0|0"
 is "the rendered policy DOES carry the merge grant" \
    "$(render_standard_sudoers agent-quinn 0 0 | grep -cE '^agent-quinn ALL=\(root\) NOPASSWD: /usr/local/bin/5dive _merge_do$')" "1"
+is "the rendered policy carries exact-path channel taps" \
+   "$(render_standard_sudoers agent-quinn 0 0 | grep -cE '^agent-quinn ALL=\(root\) NOPASSWD: /usr/local/bin/5dive _task_channel$')" "1"
 
 # ---------------------------------------------------------------------------
 # 2. Idempotence — a second run is a no-op with exit 0, not a second write.
