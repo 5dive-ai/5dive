@@ -20,16 +20,34 @@ _task_usage() {
       [--assignee=<agent|role:<r>|charter:<kw>>]
       [--recurring="<5-field cron>"] [--accept=<criteria>|--accept-file=<path>] [--verify=<cmd>]
       [--verifier=<agent>] [--max-iters=<n>] [--no-verify] [--verify] [--task-budget=<tokens|\$cost>]
-      [--review=none|check|temp|<seat>]   WHO GRADES THIS ROW — pick it when you file it:
+      [--review=none|check|temp|<seat>] [--mutant=<cmd>|--no-mutant=<reason>]
+                                          WHO GRADES THIS ROW — pick it when you file it:
         none          nobody. 'task done' closes it outright.       cost: no session
-        check         a command grades it (needs --verify=<cmd>).   cost: no session
+        check         a command grades it (needs --verify=<cmd> AND --mutant=<cmd>).
+                      THE PREFERRED DEFAULT for any row whose result a command can
+                      state: it spends no grader session.           cost: no session
         temp          one fresh pool session per delivery, gone after.
         <seat>        a pinned standing reviewer grades it in its own session.
         Default when you pass nothing: none for a low-priority row, a bodyless chore
         title, a body tagged mechanical/copy/doc or a body that is one read-back
         command; check when --verify=<cmd> is given; the filing seat when --customer
-        is set; temp otherwise. The mode is printed back with its cost on the
-        'created DIVE-N' line and shown by 'task ls' / 'task show'.
+        is set; temp otherwise — and a row that lands on temp is told, on the created
+        line, what it would take to be command-graded instead. The mode is printed
+        back with its cost on the 'created DIVE-N' line and shown by 'task ls' /
+        'task show'.
+      --mutant=<cmd>   THE NEGATIVE CONTROL, required by --review=check (DIVE-4623).
+                       The command that BREAKS the delivered tree — 'git apply -R
+                       <fix>.patch', 'sed -i s/<new guard>/xx/ src/foo.sh',
+                       'git checkout <base> -- src/'. At delivery both arms run from
+                       a CLEAN CHECKOUT at the delivered sha: the check must PASS as
+                       delivered and must FAIL after the mutant. A check that survives
+                       the mutant is vacuous — it would grade every tree green — and
+                       the delivery is REFUSED with that as the finding, without
+                       booking a grader session. Both arms are recorded on the row.
+      --no-mutant=<reason>  the audited escape, for a check that genuinely cannot be
+                       inverted (an environment probe, a live-box reachability test).
+                       The reason is stored: an unexplained escape and a forgotten
+                       flag are otherwise the same state.
       --no-verify / --verify   skip / demand a grader session for THIS row, whatever the
                                box default is ('5dive config verify=always|delivered-only|never')
                                '5dive config verify=never' CAPS --review=temp and --review=<seat>

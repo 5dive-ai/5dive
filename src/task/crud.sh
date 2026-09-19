@@ -18,6 +18,10 @@ cmd_task_add() {
   # DIVE-4324: the one filing-time review field, and whether a SEAT was pinned
   # by hand (`--verifier=`) rather than derived by the DIVE-969 default.
   local review_flag="" verifier_pinned=0
+  # DIVE-4623: the negative control for a command-graded row, and the audited
+  # escape from it. Two variables rather than one sentinel so "the filer passed
+  # nothing" and "the filer waived it, here is why" are never the same state.
+  local mutant_cmd="" mutant_waiver=""
   # DIVE-4324 iteration 3: the NEW spelling's demand, kept deliberately distinct
   # from `force_verify`. It clears the code's own title/priority auto-skips (so
   # `--review=temp` on a chore row is not a silent no-op) but it does NOT reach
@@ -68,6 +72,17 @@ cmd_task_add() {
       # It is an ALIAS over the four flags that already reached those states,
       # never a fifth mechanism — see the resolution block below the parser.
       --review=*)    review_flag="${1#*=}" ;;
+      # DIVE-4623: THE COMMAND THAT MUST BREAK THE CHECK. A grade command with no
+      # proven failure mode is not evidence — `--verify=true` passes on every
+      # tree there will ever be — so a row graded by a command names the mutant
+      # that takes it red, and the delivery runs both arms from a clean checkout
+      # at the delivered sha.
+      --mutant=*)    mutant_cmd="${1#*=}" ;;
+      # The audited escape, and it takes a REASON rather than being a bare flag:
+      # a check that genuinely cannot be inverted (an environment probe, a
+      # reachability test against a live box) is a real category, and an
+      # unexplained escape is indistinguishable from a forgotten flag.
+      --no-mutant=*) mutant_waiver="${1#*=}" ;;
       # DIVE-969: explicit opt-out of the verifier-by-default posture. A plain
       # `task done` closes the resulting task directly (no maker→grader handoff).
       --no-verify)   no_verify="1" ;;
@@ -156,6 +171,12 @@ cmd_task_add() {
       check)
         [[ -n "$verify_cmd" ]] || fail "$E_USAGE" "--review=check needs the command that grades the row: pass --verify=\"<cmd>\" as well (DIVE-4324)"
         [[ -n "$no_verify" ]]  && fail "$E_VALIDATION" "--review=check and --no-verify contradict each other — pass one (DIVE-4324)"
+        # DIVE-4623: AND IT NEEDS THE COMMAND THAT BREAKS THAT CHECK. This is the
+        # one refusal that makes `check` safe to prefer over a grader session:
+        # without it the mode is an unfalsifiable green, and the whole argument
+        # for spending no session rests on the command being able to go red.
+        [[ -n "$mutant_cmd" || -n "$mutant_waiver" ]] || fail "$E_USAGE" \
+          "--review=check needs a NEGATIVE CONTROL: the command that breaks the check. Pass --mutant=\"<cmd>\" — it runs in a clean checkout at the delivered sha, and the check must then FAIL. Typical shapes: 'git apply -R <fix>.patch', 'sed -i s/new_guard/xx/ src/foo.sh', 'git checkout <base> -- src/'. A check nothing can take red grades every tree green (--verify=true is the limit case) and is not evidence. If this row's check genuinely cannot be inverted, say why: --no-mutant=\"<reason>\" (audited, recorded on the row) (DIVE-4623)"
         _rm_asked="check" ;;
       temp)
         [[ -n "$no_verify" ]] && fail "$E_VALIDATION" "--review=temp and --no-verify contradict each other — pass one (DIVE-4324)"
@@ -184,6 +205,17 @@ cmd_task_add() {
         fail "$E_VALIDATION" "bad --review value '$review_flag' — one of: none (no grader) | check (a command grades it, with --verify=<cmd>) | temp (one fresh pool session per delivery) | <seat> (a pinned standing reviewer) (DIVE-4324)" ;;
     esac
   fi
+  # DIVE-4623: the negative control, validated where the review mode was.
+  [[ -n "$mutant_cmd" && -n "$mutant_waiver" ]] \
+    && fail "$E_VALIDATION" "--mutant=<cmd> and --no-mutant=<reason> contradict each other — one names the command that breaks the check, the other says none can. Pass one (DIVE-4623)"
+  # A control with nothing to control is a flag that reads as a rail and is not
+  # one: it would sit in the column, show on the board, and never run.
+  [[ -n "$mutant_cmd" && -z "$verify_cmd" ]] \
+    && fail "$E_USAGE" "--mutant=<cmd> is the negative control for a COMMAND-GRADED row, and this row names no command to grade it with. Pass --verify=\"<the check>\" too, or drop --mutant (DIVE-4623)"
+  [[ -n "$mutant_waiver" && -z "$verify_cmd" ]] \
+    && fail "$E_USAGE" "--no-mutant=<reason> waives the negative control for a COMMAND-GRADED row, and this row names no command to grade it with. Pass --verify=\"<the check>\" too, or drop --no-mutant (DIVE-4623)"
+  [[ -n "$mutant_waiver" && -z "${mutant_waiver//[[:space:]]/}" ]] \
+    && fail "$E_VALIDATION" "--no-mutant was given an EMPTY reason. An unexplained escape and a forgotten flag are the same state in the column, which is what the reason exists to keep apart (DIVE-4623)"
   valid_task_priority "$priority" || fail "$E_VALIDATION" "bad priority '$priority' (low|medium|high|urgent)"
   # DIVE-476: --max-iters is the maker→verifier loop cap; must be a positive int.
   [[ -z "$max_iters" || "$max_iters" =~ ^[1-9][0-9]*$ ]] \
@@ -756,6 +788,14 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   # the grader is deferred to the delivery, not refused, and recording those two
   # the same way is the collapse this column exists to prevent.
   local review_mode _rv_grants=0
+  # DIVE-4623: ONE cell, two meanings, and the prefix is what keeps them apart —
+  # see mutant_escape_reason(). Empty stays empty (NULL): a row that is not
+  # command-graded has no control to record, and writing 'none' there would make
+  # every ungraded row look like an audited escape.
+  local mutant_stored=""
+  if   [[ -n "$mutant_cmd" ]];    then mutant_stored="$mutant_cmd"
+  elif [[ -n "$mutant_waiver" ]]; then mutant_stored="none: ${mutant_waiver}"
+  fi
   (( _vp_grants == 1 || _vp_deferred == 1 )) && _rv_grants=1
   review_mode=$(_task_effective_review_mode "$no_verify" "$verify_cmd" "$verifier" \
                                             "$_rv_grants" "$verify_skipped" "$verifier_pinned" "$_vp_deferred")
@@ -784,12 +824,12 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable,
-                              verify_optout, verify_forced, review_mode, on_overlap, overlap_bound)
+                              verify_optout, verify_forced, review_mode, mutant_command, on_overlap, overlap_bound)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), $(sqlq_or_null "$derived_actor"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
                    $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL),
-                   $([[ -n "$no_verify" ]] && echo 1 || echo NULL), $([[ -n "$force_verify" ]] && echo 1 || echo NULL), $(sqlq_or_null "$review_mode"), ${on_overlap_sql}, ${overlap_bound_sql});
+                   $([[ -n "$no_verify" ]] && echo 1 || echo NULL), $([[ -n "$force_verify" ]] && echo 1 || echo NULL), $(sqlq_or_null "$review_mode"), $(sqlq_or_null "$mutant_stored"), ${on_overlap_sql}, ${overlap_bound_sql});
            SELECT last_insert_rowid();")
   # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
   # read it back rather than assuming the DIVE- prefix (DIVE-484).
@@ -869,6 +909,14 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
       else                                  _rv_why="no distinct grader available"
       fi
       review_note+=" — ${_rv_why}; choose deliberately with --review=none|check|temp|<seat>"
+      # DIVE-4623: THE DEFAULT IS STEERED, not just printed. A row that lands on
+      # `temp` books a second full session to re-derive work that was already
+      # done — measured at 2318.8M grader tokens against 2307.0M maker tokens
+      # over seven days. The one thing that turns that into a command is naming
+      # the check AND the mutant that breaks it, so the line that reports the
+      # default now says so on exactly the rows that are paying for it.
+      [[ "$review_mode" == "temp" ]] \
+        && review_note+=". A command can grade this instead, for no session at all: --review=check --verify=\"<the check>\" --mutant=\"<the command that breaks it>\" (DIVE-4623)"
     elif [[ -n "$_rm_asked" && "$review_mode" != "$_rm_asked" ]]; then
       # DIVE-4324 iteration 3: THE FILER ASKED AND SOMETHING OUTRANKED THEM, so
       # say it here. Now that the box policy caps `temp` and `<seat>`, a silent
@@ -1418,6 +1466,11 @@ cmd_task_show() {
     loopspec=$(db "SELECT
         CASE WHEN acceptance_criteria IS NOT NULL THEN 'acceptance_criteria: '||acceptance_criteria||x'0a' ELSE '' END||
         CASE WHEN verify_command      IS NOT NULL THEN 'verify_command: '||verify_command||x'0a' ELSE '' END||
+        -- DIVE-4623: the negative control, rendered NEXT TO the command it
+        -- controls. A check shown without it reads as proven when it is not.
+        CASE WHEN verify_command IS NOT NULL AND mutant_command IS NULL
+             THEN 'mutant_command: (none — nothing proves this check can fail; --mutant=<cmd>)'||x'0a' ELSE '' END||
+        CASE WHEN mutant_command      IS NOT NULL THEN 'mutant_command: '||mutant_command||x'0a' ELSE '' END||
         CASE WHEN max_iterations      IS NOT NULL THEN 'max_iterations: '||max_iterations||x'0a' ELSE '' END||
         CASE WHEN task_budget         IS NOT NULL THEN 'task_budget: '||task_budget||x'0a' ELSE '' END||
         CASE WHEN verifier            IS NOT NULL THEN 'verifier: '||verifier||x'0a' ELSE '' END||
@@ -1431,7 +1484,7 @@ cmd_task_show() {
         CASE WHEN verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled')
              THEN 'unverified: no independent verifier available (solo org, no distinct grader)' ELSE '' END
       FROM tasks WHERE id=${id}
-        AND (acceptance_criteria IS NOT NULL OR verify_command IS NOT NULL
+        AND (acceptance_criteria IS NOT NULL OR verify_command IS NOT NULL OR mutant_command IS NOT NULL
              OR max_iterations IS NOT NULL OR verifier IS NOT NULL OR task_budget IS NOT NULL
              OR maker_agent IS NOT NULL OR iteration IS NOT NULL OR handoff_ack_at IS NOT NULL
              OR (verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled')));")

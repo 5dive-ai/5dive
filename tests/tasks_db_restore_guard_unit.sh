@@ -297,6 +297,17 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # the MERGED tree, as the header above instructs (`bad` patched to print its
 # detail, one run, `count=102` with got==want and rc=0, patch reverted); not
 # derived by adding this branch's one-column delta.
+#
+# 102 -> 103 (DIVE-4623, 2026-09-19): `mutant_command` — the persisted negative
+# control for a command-graded row (`--mutant=<cmd>`, or `none: <reason>` for the
+# audited `--no-mutant` escape), so a `--review=check` grade can prove the check it
+# runs is capable of failing. READ off a fresh tasks_db_init on the MERGED tree, as
+# the header above instructs (`bad` patched to print its detail, one run,
+# `count=103` with got==want and rc=0, patch reverted); not derived by adding this
+# branch's one-column delta. Control done first, as the DIVE-3483 entry instructs:
+# a same-seat worktree at bare origin/main ce8f463a scored 56/0 on this harness
+# while this branch scored 55/1 with got==want, so the count was the only thing
+# failing and the one column is the whole delta.
 
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
@@ -306,8 +317,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "102" ]] \
-  && ok "fresh schema: all 102 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "103" ]] \
+  && ok "fresh schema: all 103 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

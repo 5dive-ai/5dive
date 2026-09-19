@@ -68,6 +68,123 @@ _task_deliver_reach_probe() {
   return 0
 }
 
+# ── DIVE-4623 — THE CHECK MUST BE ABLE TO FAIL, AND WE MAKE IT FAIL ────────
+#
+# AXIS: the autonomy number. Measured by main on 2026-09-19 over seven days of
+# per-seat transcripts (`message.usage`, quota basis): the single grader seat
+# burned 2318.8M tokens against the maker seat's 2307.0M — 97.8% of it cache-read,
+# a second full session re-loading a diff that had already been made. Every
+# ordinary row is paid for twice. `--review=check` already removes the second
+# payment for a command-graded row (DIVE-4576 above), and it was still not the
+# default, for one honest reason: NOTHING PROVED THE COMMAND COULD GO RED.
+# `--verify=true` is a passing grade on every tree that will ever exist, and in
+# the column and on the board it is indistinguishable from a real acceptance run.
+#
+# So the mode carries a NEGATIVE CONTROL and the delivery RUNS it. Both arms, from
+# a clean checkout at the delivered sha:
+#
+#   arm A (as delivered)       the check must PASS
+#   arm B (after the mutant)   the check must FAIL
+#
+# Arm B passing means the check is vacuous, and a vacuous check is not weaker
+# evidence than a real one — it is ZERO evidence, the same distinction DIVE-3175
+# drew about testing the instrument instead of the product. So the delivery is
+# refused with that as the finding.
+#
+# WHY A CLEAN CHECKOUT AND NOT THE MAKER'S TREE. The maker's worktree is dirty by
+# construction at delivery time (that is what was just pushed), and it is the one
+# tree where a check can pass for a reason that is not in the commit — an
+# untracked fixture, a stale build output, an export in the shell. Arm A from a
+# detached worktree at the delivered sha is therefore a second finding in its own
+# right when it goes red: it says the pushed tree does not carry what the grade
+# claims. Arm B additionally needs a tree it may DESTROY, so it gets its own.
+#
+# WHY THIS RUNS bash ITSELF INSTEAD OF DELEGATING TO cmd_task_verify, which is the
+# opposite of the choice the DIVE-4576 block above makes, deliberately: arm B's
+# pass/fail is INVERTED. A red arm B is the healthy outcome, and routing it through
+# the verb that records grades would stamp a ❌ FAIL on a row whose control just
+# worked — the verdict and the record would disagree. Nothing else that verb owns
+# (the result-preservation rail, the merge hold, the ledger receipt) applies to a
+# run whose whole purpose is to be thrown away. The PRIMARY grade still goes
+# through it, unchanged.
+#
+# `_task_check_control_arms <ident> <check-cmd> <mutant-cmd>` — prints a receipt
+# to stdout, and returns:
+#   0  control healthy (A pass, B fail)
+#   1  VACUOUS: the check passed on the mutated tree
+#   2  could not run: no git tree, no worktree, or the mutant itself errored
+#   3  arm A red: the check does not pass from a clean checkout at this sha
+_TASK_CONTROL_RECEIPT=""
+_task_check_control_arms() {  # <ident> <check-cmd> <mutant-cmd>
+  local ident="$1" check="$2" mutant="$3"
+  _TASK_CONTROL_RECEIPT=""
+  local repo sha
+  repo=$(git rev-parse --show-toplevel 2>/dev/null) || repo=""
+  sha=$(git rev-parse HEAD 2>/dev/null) || sha=""
+  if [[ -z "$repo" || -z "$sha" ]]; then
+    _TASK_CONTROL_RECEIPT="control: NOT RUN — 'task deliver' was run outside a git checkout, so there is no delivered sha to check out and no tree to mutate. The command grade below is UNCONTROLLED: nothing here proves it can fail."
+    return 2
+  fi
+  # A check that names the maker's own tree by absolute path reaches around the
+  # clean checkout and reads the dirty files anyway, which would make BOTH arms
+  # meaningless while looking green. It is a warning and not a refusal: the path
+  # may legitimately be a fixture outside the repo.
+  [[ "$check$mutant" == *"$repo"* ]] && warn "$ident: the check or mutant command names '$repo' by absolute path — inside the clean checkout that path still resolves to the MAKER's tree, so the control arms may be reading files the delivered sha does not contain. Prefer repo-relative paths (DIVE-4623)."
+
+  local base wtA="" wtB="" rcA=0 rcB=0 rcM=0 outA="" outB="" outM=""
+  base=$(mktemp -d "${TMPDIR:-/tmp}/5dive-control.XXXXXX") || {
+    _TASK_CONTROL_RECEIPT="control: NOT RUN — could not create a scratch directory for the clean checkouts."
+    return 2; }
+  # Every exit from here cleans up both worktrees AND their registrations: a
+  # leaked `git worktree` entry is a defect the maker inherits in their own repo.
+  _tcc_cleanup() {
+    local d
+    for d in "$wtA" "$wtB"; do
+      [[ -n "$d" ]] || continue
+      git -C "$repo" worktree remove --force "$d" >/dev/null 2>&1 || rm -rf "$d"
+    done
+    rm -rf "$base"
+  }
+  local tmo=(); command -v timeout >/dev/null 2>&1 \
+    && tmo=(timeout "${FIVEDIVE_CONTROL_ARM_TIMEOUT:-900}")
+
+  wtA="$base/asdelivered"
+  if ! git -C "$repo" worktree add --detach -q "$wtA" "$sha" >/dev/null 2>&1; then
+    wtA=""; _tcc_cleanup
+    _TASK_CONTROL_RECEIPT="control: NOT RUN — could not create a clean checkout of ${sha:0:12} (git worktree add failed). The command grade below is UNCONTROLLED."
+    return 2
+  fi
+  if outA=$( (cd "$wtA" && "${tmo[@]}" bash -c "$check") 2>&1 ); then rcA=0; else rcA=$?; fi
+
+  wtB="$base/mutated"
+  if ! git -C "$repo" worktree add --detach -q "$wtB" "$sha" >/dev/null 2>&1; then
+    wtB=""; _tcc_cleanup
+    _TASK_CONTROL_RECEIPT="control: NOT RUN — could not create the second clean checkout of ${sha:0:12} to mutate. The command grade below is UNCONTROLLED."
+    return 2
+  fi
+  if outM=$( (cd "$wtB" && "${tmo[@]}" bash -c "$mutant") 2>&1 ); then rcM=0; else rcM=$?; fi
+  if (( rcM != 0 )); then
+    _tcc_cleanup
+    _TASK_CONTROL_RECEIPT="control: NOT RUN — the mutant command ITSELF failed (exit ${rcM}) in a clean checkout at ${sha:0:12}, so no mutated tree was ever produced and the check was never given a chance to fail. This is a broken control, not a passing one.
+    mutant: ${mutant}
+    ${outM:0:400}"
+    return 2
+  fi
+  if outB=$( (cd "$wtB" && "${tmo[@]}" bash -c "$check") 2>&1 ); then rcB=0; else rcB=$?; fi
+  _tcc_cleanup
+
+  _TASK_CONTROL_RECEIPT="control arms (DIVE-4623), clean checkouts at ${sha:0:12}:
+    A as delivered — $( ((rcA==0)) && printf 'PASS (exit 0)' || printf 'FAIL (exit %s)' "$rcA" ) — ${check}
+    B after mutant — $( ((rcB==0)) && printf 'PASS (exit 0) ← VACUOUS' || printf 'FAIL (exit %s) ← control healthy' "$rcB" ) — ${mutant}"
+  if (( rcA != 0 )); then
+    _TASK_CONTROL_RECEIPT+="
+    arm A output tail: $(printf '%s\n' "$outA" | tail -n 10)"
+    return 3
+  fi
+  (( rcB == 0 )) && return 1
+  return 0
+}
+
 # ── DIVE-4576 deliverable 3 — A COMMAND-GRADED ROW NEVER BOOKS A SESSION ────
 #
 # `--review=check` has meant "a COMMAND grades it, no grader session" since
@@ -95,11 +212,18 @@ _task_deliver_reach_probe() {
 # handoff clock is started, so no reject is needed to undo one.
 #
 # rc: 0 = graded here (caller must not route) · 1 = not command-graded.
-_task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result> <want_result>
-  local id="$1" ident="$2" given="${3:-}" result="${4:-}" want_result="${5:-0}"
+_task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result> <want_result> [mutant-given-at-delivery]
+  local id="$1" ident="$2" given="${3:-}" result="${4:-}" want_result="${5:-0}" given_mutant="${6:-}"
   local mode stored
   mode=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
   stored=$(db "SELECT COALESCE(verify_command,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  # DIVE-4623: a control named at delivery is persisted for the same reason the
+  # command is — a grade whose negative control lives only in one process's argv
+  # is not reproducible, and reproducibility is the whole reason a command may
+  # stand in for a grader.
+  if [[ -n "$given_mutant" ]]; then
+    db "UPDATE tasks SET mutant_command=$(sqlq "$given_mutant") WHERE id=${id};"
+  fi
   if [[ -n "$given" ]]; then
     # A command supplied at delivery is PERSISTED, so a later re-grade, a
     # `task loops` replay and `task show` all read the same command — a grade
@@ -140,6 +264,52 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
     warn "$ident: filed --review=check (graded by a command) but the row carries NO command, so there is nothing to grade with. Add one at delivery: 'task deliver $ident --pr=… --verify=\"<cmd>\"' (DIVE-4576)."
     return 1
   fi
+  # ── DIVE-4623: THE NEGATIVE CONTROL, RUN BEFORE THE GRADE IS BELIEVED ─────
+  # Read from the row rather than from argv so a row filed with `--mutant=` is
+  # controlled whether or not this delivery re-passed it.
+  local control ctl_rc=0 ctl_note="" ctl_escape=""
+  control=$(db "SELECT COALESCE(mutant_command,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  if [[ -z "$control" ]]; then
+    # A row filed before this rail existed, or one that reached `check` through
+    # the delivery-time downgrade above. Deliberately NOT a refusal: that would
+    # re-book a grader session for every legacy command-graded row, which is the
+    # burn this whole line of work exists to remove. It is recorded instead, so
+    # "graded by an uncontrolled command" is countable on the board rather than
+    # silently equal to a proven one.
+    ctl_note="control: NONE RECORDED — this row names no mutant, so nothing here proves '$stored' can fail. File the control with --mutant=\"<cmd>\" (or record why it cannot be inverted with --no-mutant=\"<reason>\") (DIVE-4623)."
+    warn "$ident: graded by a command with NO negative control. $ctl_note"
+  elif ctl_escape=$(mutant_escape_reason "$control"); then
+    ctl_note="control: WAIVED at filing (audited, DIVE-4623) — ${ctl_escape}. The check ran once, as delivered; nothing demonstrated it can fail."
+  else
+    _task_check_control_arms "$ident" "$stored" "$control" || ctl_rc=$?
+    ctl_note="$_TASK_CONTROL_RECEIPT"
+  fi
+
+  # A VACUOUS CHECK IS REFUSED, and the refusal is the finding. Written to the
+  # row first: a delivery that is bounced for having no evidence must leave the
+  # reason where the next reader looks, not only in the caller's scrollback.
+  if (( ctl_rc == 1 || ctl_rc == 3 )); then
+    local _cv_txt
+    if (( ctl_rc == 1 )); then
+      _cv_txt="❌ delivery REFUSED — the check that grades this row is VACUOUS (DIVE-4623): it PASSED on a tree the mutant had already broken, so its exit status says nothing about this diff."$'\n'"${ctl_note}"
+    else
+      _cv_txt="❌ delivery REFUSED — the check FAILED from a clean checkout at the delivered sha (DIVE-4623): it may be passing in the maker's tree for a reason that was not pushed."$'\n'"${ctl_note}"
+    fi
+    if declare -F _task_guard_result_over_closed >/dev/null 2>&1; then
+      _task_guard_result_over_closed "$id" "$ident" deliver "$_cv_txt" 0 0 check-control-arm
+      _cv_txt="$_TASK_GUARDED_RESULT"
+    fi
+    db "UPDATE tasks SET result=$(sqlq "$_cv_txt") WHERE id=${id};"
+    _five_flush_write_notes
+    if (( ctl_rc == 1 )); then
+      policy_refuse "$E_CONFLICT" deliver-check-vacuous DIVE-4623 "$ident" \
+        "$ident: the command grading this row PASSED on a tree its own mutant had broken, so it is not evidence about anything — a check that cannot fail grades every tree green. NOT handed off: no grader session was spawned and no handoff clock is running, so there is no reject to undo. Both arms are recorded on the row ('5dive task show $ident'). Exits: make the check actually assert the behaviour, or name a mutant that really breaks it ('task deliver $ident --pr=… --mutant=\"<cmd>\"'), or buy a grader session for this row with '5dive task verifier $ident <seat>'."
+    else
+      policy_refuse "$E_CONFLICT" deliver-check-red-at-sha DIVE-4623 "$ident" \
+        "$ident: the command grading this row FAILED in a clean checkout at the delivered sha, although it may pass where you ran it. That is the delivered tree missing something your worktree has — an untracked fixture, a stale build output, an exported variable. NOT handed off: no grader session was spawned. The arms are on the row ('5dive task show $ident'). Push what is missing and deliver again."
+    fi
+  fi
+
   # The maker's result is written BEFORE the grade runs, and only on this path —
   # every other arm of `task deliver` still writes it at its own point, because a
   # refusal further down (the byte-identical re-delivery guard) states that
@@ -152,10 +322,17 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
     _five_flush_write_notes
   fi
   local out rc=0
-  out=$(cmd_task_verify "$ident" --no-done --cmd="$stored" 2>&1) || rc=$?
+  # The receipt rides in as the grade's prose, so BOTH ARMS ARE RECORDED ON THE
+  # ROW in the one cell the board and the merge owner already read — rather than
+  # in a second column nothing renders.
+  out=$(cmd_task_verify "$ident" --no-done --cmd="$stored" --result="$ctl_note" 2>&1) || rc=$?
   printf '%s\n' "$out" >&2
   if (( rc == 0 )); then
-    ok "$ident delivered — GRADED BY COMMAND at delivery, no grader session spawned (review=check, DIVE-4576): '$stored' exited 0. The grade is recorded on the row; the merge owner closes it through 'task done' once the binding is merged." \
+    local _ok_ctl="with a PROVEN negative control (the check goes red on the mutated tree, DIVE-4623)"
+    (( ctl_rc == 2 )) && _ok_ctl="control NOT RUN — see the row"
+    [[ -z "$control" ]] && _ok_ctl="with NO negative control on the row"
+    [[ -n "$ctl_escape" ]] && _ok_ctl="control waived at filing (audited)"
+    ok "$ident delivered — GRADED BY COMMAND at delivery, no grader session spawned (review=check, DIVE-4576), ${_ok_ctl}: '$stored' exited 0. The grade is recorded on the row; the merge owner closes it through 'task done' once the binding is merged." \
        '{id:($i|tonumber), ident:$id, delivered:true, gradedBy:"command", command:$c, verdict:"pass", graderSession:false, routedTo:null}' \
        --arg i "$id" --arg id "$ident" --arg c "$stored"
     return 0
@@ -258,6 +435,7 @@ cmd_task_deliver() {
   tasks_db_init
   local task="" pr="" result="" want_result=0 result_src=""
   local deliver_cmd=""                   # DIVE-4576: --verify=<cmd> given at delivery
+  local deliver_mutant=""   # DIVE-4623: the negative control, named at delivery
   local append_result=0 force_result=0   # DIVE-2476: the two sanctioned answers to the
                                          # already-closed-row refusal, spelled exactly
                                          # as `task done|cancel` spells them.
@@ -294,6 +472,11 @@ cmd_task_deliver() {
       # the alternative to accepting it here is a grader session spent running
       # the command the maker could have named.
       --verify=*)          deliver_cmd="${1#*=}" ;;
+      # DIVE-4623: and the NEGATIVE CONTROL for it, same argument one step on — a
+      # row is frequently only invertible once the diff exists, and the mutant is
+      # usually written FROM that diff ('git apply -R' of the fix hunk).
+      --mutant=*)          deliver_mutant="${1#*=}" ;;
+      --no-mutant=*)       deliver_mutant="none: ${1#*=}" ;;
       -*)              fail "$E_USAGE" "unknown flag: $1" ;;
       *)               [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
     esac
@@ -358,7 +541,7 @@ cmd_task_deliver() {
   # is recorded against the binding it is a grade OF (DIVE-3330 reads it), and
   # before the attach so no spawn request is ever emitted for a row whose grade
   # has already happened.
-  if _task_deliver_command_grade "$id" "$ident" "$deliver_cmd" "$result" "$want_result"; then
+  if _task_deliver_command_grade "$id" "$ident" "$deliver_cmd" "$result" "$want_result" "$deliver_mutant"; then
     return 0
   fi
   local _vfier _asignee

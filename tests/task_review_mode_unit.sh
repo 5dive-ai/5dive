@@ -100,7 +100,11 @@ expect_mode() { # <label> <want> <flags...>
 
 echo "── the four modes, explicitly chosen ────────────────────────────"
 expect_mode "review none"  none        --review=none
-expect_mode "review check" check       --review=check --verify="npm test"
+# DIVE-4623: `--review=check` now also needs its negative control. The mode
+# resolution these arms grade is unchanged; the control is a filing-time
+# requirement of the same flag, so it rides along rather than earning its own
+# fixture.
+expect_mode "review check" check       --review=check --verify="npm test" --mutant="sed -i s/expect/xx/ test.js"
 expect_mode "review temp"  temp        --review=temp
 expect_mode "review seat"  seat:quinn  --review=quinn
 
@@ -129,6 +133,9 @@ refuses() { # <label> <substring> <flags...>
   [[ "$out" == *"$want"* ]] && ok_t "$label" || bad_t "$label" "got: ${out:0:170}"
 }
 refuses "--review=check without --verify=<cmd> is refused" "needs the command"  --review=check
+# DIVE-4623: and the sibling refusal, at the same rung — a command grade with no
+# proven failure mode is an unfalsifiable green.
+refuses "--review=check without a NEGATIVE CONTROL is refused" "NEGATIVE CONTROL"  --review=check --verify="npm test"
 refuses "--review=none + --verify is refused"              "contradict"         --review=none --verify
 refuses "--review=none + --verifier= is refused"           "contradict"         --review=none --verifier=quinn
 refuses "--review=temp + --verifier= is refused"           "contradict"         --review=temp --verifier=quinn
@@ -171,7 +178,7 @@ expect_mode "verify=never + no flag"           none  --body="a real code row"
 expect_mode "verify=never + --review=temp"     none  --review=temp --body="a real code row"
 expect_mode "verify=never + --review=<seat>"   none  --review=quinn --body="a real code row"
 expect_mode "verify=never + --verifier=<seat>" none  --verifier=quinn --body="a real code row"
-expect_mode "verify=never + --review=check"    check --review=check --verify="npm test" --body="a real code row"
+expect_mode "verify=never + --review=check"    check --review=check --verify="npm test" --mutant="sed -i s/expect/xx/ test.js" --body="a real code row"
 expect_mode "verify=never + bare --verify buys the row back" temp --verify --body="a real code row"
 
 # FINDING 2: the two spellings must land on the SAME ROW, or `--review=` is a
