@@ -69,7 +69,19 @@ printf '%s\n' \
   'CI: not run' \
   'CRITERIA: body omitted; exact-sha clean sealed tree; fixed rubric on cheap model; escalation preserved.' \
   '--- DELIVERED DIFF ---'
-git_ diff "$base_sha..$head_sha"
+# DIVE4634_EXCLUDE_SCAFFOLD=1 drops THIS measurement apparatus (the generator and
+# its narrative fixture) from the diff. It is not the grader's view — the grader
+# sees the whole delivered diff, scaffolding included — it exists so the ratio can
+# be read without the fixture, which lands in the diff and inflates BOTH arms by
+# its own size. Report the unset number as the measurement; the set one only says
+# how much of the packet is the apparatus.
+if [[ "${DIVE4634_EXCLUDE_SCAFFOLD:-0}" == 1 ]]; then
+  git_ diff "$base_sha..$head_sha" -- . \
+    ':(exclude)tests/fixtures/dive4634-legacy-narrative.txt' \
+    ':(exclude)scripts/dive4634-grade-cost-prompt.sh'
+else
+  git_ diff "$base_sha..$head_sha"
+fi
 
 if [[ "$mode" == reject-scope ]]; then
   printf '%s\n' \
