@@ -314,11 +314,30 @@ fi
 #   * `trap 'rm -rf "$TMPDIR"' EXIT` — TWICE (cmd_skill.sh, lib/agent_setup.sh),
 #     both inside heredoc'd `bash -s` installers that are a DIFFERENT PROCESS and
 #     never see ours; identical text, so `sort -u` folds them to one line.
+#   * `trap 'rm -f "$tmp"' EXIT`     — DIVE-4667, inside `render_agent_coauthor_hook`'s
+#     quoted `<<'HOOK'` body in lib/agent_setup.sh. That text is not code this CLI
+#     runs: it is the git `prepare-commit-msg` hook written to a seat's home and
+#     executed by GIT, in its own process, at commit time. It cannot reach
+#     on_exit_audit because on_exit_audit is not installed in that process.
+#
+#     PUSH_EXIT_HANDLER IS THE WRONG FIX FOR THIS ONE, and the census message
+#     offering it first is why this note exists. `push_exit_handler` is a function
+#     of OUR bundle; the hook is a standalone script that sources nothing of ours,
+#     so calling it there would abort the hook on every commit the fleet makes.
+#     The census message's second option — classify it — is the correct one.
+#
+#     A CLASSIFICATION IS A HOLE UNLESS ITS PREMISE IS CHECKED. Arm 11 is exact
+#     string equality, so a DIFFERENT new trap still reds; but nothing in arm 11
+#     notices if this exact line later appears in real CLI code, where it WOULD
+#     clobber the backstop. Arm 11b checks the premise rather than restating it:
+#     every classified bare-`rm` trap must occur ONLY inside a quoted heredoc
+#     body, and `trap on_exit_audit EXIT` must occur OUTSIDE one — the second
+#     half is what stops a broken tracker from passing 11b vacuously.
 census_traps() {  # census_traps <bundle> — distinct EXIT-trap installs, C-collated
   grep -oE "trap[[:space:]]+('[^']*'|\"[^\"]*\"|[A-Za-z_][A-Za-z0-9_]*)[[:space:]]+EXIT([[:space:]]|$)" "$1" \
     | sed 's/[[:space:]]*$//' | LC_ALL=C sort -u
 }
-EXPECTED_TRAPS=$'trap \'rm -rf "$TMPDIR"\' EXIT\ntrap on_exit_audit EXIT'
+EXPECTED_TRAPS=$'trap \'rm -f "$tmp"\' EXIT\ntrap \'rm -rf "$TMPDIR"\' EXIT\ntrap on_exit_audit EXIT'
 FOUND_TRAPS=$(census_traps "$BIN")
 if [[ "$FOUND_TRAPS" == "$EXPECTED_TRAPS" ]]; then
   ok_t 'the built bundle installs no EXIT trap beyond the classified set (nothing can clobber the backstop)'
@@ -329,6 +348,54 @@ expected:
 $EXPECTED_TRAPS
 A new \`trap ... EXIT\` REPLACES on_exit_audit. Use push_exit_handler, or classify it here."
 fi
+# --- 11b. THE CLASSIFICATION'S PREMISE, CHECKED ---------------------------
+# Arm 11 is exact string equality, so it still reds on a DIFFERENT new trap. What
+# it cannot see is a classified line MOVING: `trap 'rm -f "$tmp"' EXIT` is benign
+# because it is heredoc text a separate process runs, and the day someone writes
+# that same line in real CLI code arm 11 stays green while the backstop dies.
+# So the premise is graded, not restated: each classified bare-`rm` trap occurs
+# ONLY inside a quoted heredoc body, and the real one occurs OUTSIDE — that last
+# check is the non-vacuity half, without which a tracker that swallowed every
+# line would pass this arm having verified nothing.
+traps_outside_heredoc() {  # traps_outside_heredoc <bundle> <literal> -> count
+  awk -v needle="$2" '
+    BEGIN { q = sprintf("%c", 39); n = 0 }
+    {
+      if (delim == "") {
+        if (match($0, "<<-?[[:space:]]*" q "[A-Za-z_][A-Za-z0-9_]*" q)) {
+          s = substr($0, RSTART, RLENGTH)
+          sub(/^<<-?[[:space:]]*/, "", s); gsub(q, "", s)
+          delim = s
+          next
+        }
+      } else {
+        stripped = $0
+        sub(/^[[:space:]]+/, "", stripped)
+        if (stripped == delim) delim = ""
+        next
+      }
+      if (index($0, needle)) n++
+    }
+    END { print n+0 }
+  ' "$1"
+}
+_hd_fail=0
+for _lit in 'trap '"'"'rm -f "$tmp"'"'"' EXIT' 'trap '"'"'rm -rf "$TMPDIR"'"'"' EXIT'; do
+  _n=$(traps_outside_heredoc "$BIN" "$_lit")
+  if [[ "$_n" == 0 ]]; then
+    ok_t "classified as heredoc-only, and it is: \`$_lit\` occurs 0 times outside a quoted heredoc"
+  else
+    _hd_fail=1
+    bad_t "a classified trap escaped its heredoc" "\`$_lit\` occurs $_n time(s) in real CLI code, where it REPLACES on_exit_audit — classifying it was only ever sound while it was hook/installer text"
+  fi
+done
+_n=$(traps_outside_heredoc "$BIN" 'trap on_exit_audit EXIT')
+if [[ "$_n" -ge 1 ]]; then
+  ok_t "non-vacuity: the real process-wide trap IS seen outside a heredoc ($_n), so the tracker is not swallowing everything"
+else
+  bad_t 'the heredoc tracker must still see ordinary code' "trap on_exit_audit EXIT was found $_n times outside a heredoc — arm 11b's zeroes above prove nothing"
+fi
+
 # Liveness for the arm above: a clean census is worthless unless the same census
 # reds on a bundle that HAS the extra trap. $CLOB is exactly that bundle.
 [[ "$(census_traps "$CLOB")" != "$EXPECTED_TRAPS" ]] \
