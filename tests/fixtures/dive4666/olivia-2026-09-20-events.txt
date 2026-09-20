@@ -1,0 +1,18 @@
+2026-09-20 04:50:13 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 04:50:13 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 05:00:20 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 05:10:13 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 05:20:12 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 05:30:16 | healthy |  | idle
+2026-09-20 05:40:13 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 05:40:13 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 05:50:13 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 06:00:22 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 06:10:15 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 06:20:14 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 06:30:18 | healthy |  | idle
+2026-09-20 07:00:30 | no-output | no-output | 1 open row(s), nothing closed in 3d
+2026-09-20 07:00:31 | no-output | no-output | 1 open row(s), nothing closed in 3d
+2026-09-20 07:00:33 | no-output | no-output | 1 open row(s), nothing closed in 3d
+2026-09-20 07:10:16 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
+2026-09-20 07:10:16 | quota-exhausted | account-usage | auth account measured at the wall: account at 100% of its 5h limit — resets 1789891800
