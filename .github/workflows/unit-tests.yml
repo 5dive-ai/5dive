@@ -1074,7 +1074,7 @@ jobs:
       - name: The ACP server must have been GRADED (pristine)
         run: |
           bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
-            core-pristine-1.txt core-pristine-2.txt core-pristine-3.txt
+            core-pristine-1.txt core-pristine-2.txt core-pristine-3.txt core-pristine-4.txt
 
   acp-graded-installed:
     # DIVE-4186: queue-time only. Its `needs` would carry the skip anyway; spelled out
@@ -1091,7 +1091,7 @@ jobs:
       - name: The ACP server must have been GRADED (installed host)
         run: |
           bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
-            core-installed-1.txt core-installed-2.txt core-installed-3.txt
+            core-installed-1.txt core-installed-2.txt core-installed-3.txt core-installed-4.txt
 
   # DIVE-3315: THE FOUR REQUIRED CHECKS, kept by NAME. `test`, `test-installed-host`,
   # `test-confirm` and `test-installed-host-confirm` are required status checks on main.

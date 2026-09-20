@@ -2176,6 +2176,61 @@ chk(not shard_problems,
     'the core shard count is PINNED at %d per environment, over CORE JOBS rather than over jobs that happen to carry a shard key, and the pin is parsed rather than asserted in a comment (a third shard, a third capacity job with the key renamed, and a third capacity job with no matrix at all are all the same declared capacity raise: each must arrive as a policy decision that edits this line, not as one character in the workflow)' % CORE_SHARDS,
     ' | '.join(shard_problems))
 
+# 98b — AND N IS WRITTEN TWICE: THE MATRIX, AND THE UNION GRADER'S REPORT LIST.
+# Found by quinn grading DIVE-4658's own first delivery, which moved the matrices 3 -> 4
+# and left both lists at three files. The 3 -> 4 delivery went 190/0 here and red on the
+# REQUIRED check `test`: in run 35508594885 LPT put acp_stdio_unit.sh in shard 4, its
+# report landed in the workspace, the grader was handed only shards 1..3, and
+# acp-graded-pristine failed in 13s with "appears in NONE of the 3 report(s)". Arm 98 could
+# not see it — it parses the two `matrix:` lines and nothing else — and
+# harness_graded_union_unit.sh could not either: it grades the union SCRIPT, not the
+# argument list the workflow hands it.
+#
+# WHY THIS IS AN ARM AND NOT A GLOB. The obvious fix is `core-pristine-*.txt` on the call
+# line, and it is the wrong one: an absent report is exactly what the union grader exists
+# to fail on (see the header above these two jobs — "A shard added without extending this
+# list reds it too... the fail-closed direction"), and a glob that matches three files when
+# four shards ran expands silently to a shorter list and grades the union it was given. The
+# enumeration is the contract; what was missing was a reader that holds the enumeration to
+# the same N as the matrix. This arm is that reader, so the fifth shard — ~9 days out at
+# this corpus's measured ~5.6s/shard/day growth — reds here pre-merge instead of reding
+# `test` post-push.
+UNION = 'harness-graded-union.sh'
+union_jobs = {jn: j for jn, j in jobs.items() if any(UNION in r for r in runs(j))}
+list_problems = []
+# One grading job per environment, same population as the corpus jobs. Zero of them is the
+# vacuous green this arm would otherwise report after a rename.
+if len(union_jobs) != CORE_ENVS:
+    list_problems.append(
+        'expected exactly %d job(s) calling %s (one per environment); found %d (%s) — the '
+        'report lists this arm reads are wherever those calls are, so a rename or a drop '
+        'takes the enumeration out of view rather than failing it'
+        % (CORE_ENVS, UNION, len(union_jobs), ', '.join(sorted(union_jobs)) or 'none'))
+for jn in sorted(union_jobs):
+    text = '\n'.join(r for r in runs(union_jobs[jn]) if UNION in r)
+    found = re.findall(r'\bcore-([a-z][a-z-]*)-(\d+)\.txt\b', text)
+    if not found:
+        list_problems.append(
+            '%s calls %s with no enumerated `core-<env>-N.txt` arguments — a glob or a '
+            'variable puts the report count outside this file, and a glob that matches '
+            'fewer files than there are shards expands to a short list and grades it '
+            'silently, which is the failure this enumeration exists to refuse' % (jn, UNION))
+        continue
+    envs = sorted({e for e, _ in found})
+    idx = [int(n) for _, n in found]
+    if len(envs) != 1:
+        list_problems.append(
+            '%s mixes report families %s in one union call — each environment is graded '
+            'against its own shards' % (jn, ', '.join(envs)))
+    if sorted(idx) != want:
+        list_problems.append(
+            '%s hands %s %d report(s) %r for %d declared shard(s) %r — every harness LPT '
+            'places in a shard whose report is not listed is silently ungraded (measured: '
+            'run 35508594885, acp_stdio_unit.sh in core-pristine-4.txt, list of 3)'
+            % (jn, UNION, len(idx), sorted(idx), CORE_SHARDS, want))
+chk(not list_problems,
+    'the union grader is handed one report per DECLARED shard in each environment, enumerated (N is spelled in the `matrix:` and again in this argument list, and arm 98 reads only the first: the 3 -> 4 reshard that left these lists at three passed arm 98 and red the required check `test`)',
+    ' | '.join(list_problems))
 # 99 — AND THE GUARD MUST RUN ON THE PATH IT GUARDS. DIVE-3479 finding 2.
 #
 # This file is `TIER: nightly`, and the PR path selects harnesses by DIFF: `changed-harnesses`
