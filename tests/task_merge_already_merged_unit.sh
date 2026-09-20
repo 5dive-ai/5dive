@@ -63,7 +63,7 @@ _gate_gh() { printf '[%s]' "$1" >"$TOKF"; shift 2
              return "$_gate_gh_rc"; }
 
 # --- 1. THE READ ------------------------------------------------------------
-_gate_gh_payload="$SHA|$AT"; _gate_gh_rc=0
+_gate_gh_payload="MERGED|$SHA|$AT"; _gate_gh_rc=0
 got=$(_merge_landed_read "$PR" 5dive-ai/5dive)
 [[ "$got" == "$SHA|$AT" ]] \
   && ok_t "T1 a merged pull request reads back its merge sha and its mergedAt" \
@@ -72,14 +72,14 @@ got=$(_merge_landed_read "$PR" 5dive-ai/5dive)
   && ok_t "T1b THE CLAIM OF THIS FIX: the read went out with an EMPTY token — no machine account was resolved to ask what a pull request IS" \
   || bad_t "T1b credential-free read" "token seen: '$(cat "$TOKF" 2>/dev/null)' (expected the empty string, bracketed)"
 
-_gate_gh_payload="null|null"; _gate_gh_rc=0
+_gate_gh_payload="OPEN|null|null"; _gate_gh_rc=0
 [[ -z "$(_merge_landed_read "$PR" 5dive-ai/5dive)" ]] \
   && ok_t "T2 an OPEN pull request reads back nothing — there is still a merge to perform" \
   || bad_t "T2 open reads empty" ""
 
 # A closed-unmerged PR and a queue-evicted one both carry a sha-shaped field or a
 # state, and NEITHER carries a mergedAt. mergedAt is the operand for that reason.
-_gate_gh_payload="null|null"; _gate_gh_rc=0
+_gate_gh_payload="CLOSED|null|null"; _gate_gh_rc=0
 [[ -z "$(_merge_landed_read "$PR" 5dive-ai/5dive)" ]] \
   && ok_t "T2b a CLOSED-unmerged pull request reads back nothing either (DIVE-4337: state cannot answer this, mergedAt can)" \
   || bad_t "T2b closed reads empty" ""
@@ -89,13 +89,51 @@ _gate_gh_payload=""; _gate_gh_rc=1
   && ok_t "T3 FAILS TOWARDS TODAY: a GitHub that cannot be asked reads back nothing, so the caller lands on the credential demand rather than on a quiet success" \
   || bad_t "T3 unreachable reads empty" ""
 
-_gate_gh_payload="$SHA|"; _gate_gh_rc=0
+_gate_gh_payload="OPEN|$SHA|"; _gate_gh_rc=0
 [[ -z "$(_merge_landed_read "$PR" 5dive-ai/5dive)" ]] \
   && ok_t "T3b a sha with an EMPTY mergedAt is not a landing either" \
   || bad_t "T3b empty mergedAt" ""
 
-# --- 2. THE DECISION --------------------------------------------------------
+# --- 1b. THE PROBE'S THREE ANSWERS (DIVE-4701) ------------------------------
+# `_merge_landed_read` above collapses "not landed" and "could not be asked" into
+# one empty string, which is right for the verb and wrong for a POLLER: the tick
+# must report an unreachable rail as a standing condition and must never report
+# an open pull request as one. `_merge_landed_probe` is the single reader both
+# now share, so these arms grade the distinction the sweep depends on. The
+# separator is x1f, so each expectation is written with the literal byte.
+US=$'\x1f'
+_gate_gh_payload="MERGED|$SHA|$AT"; _gate_gh_rc=0
+[[ "$(_merge_landed_probe "$PR" 5dive-ai/5dive)" == "MERGED${US}${SHA}${US}${AT}" ]] \
+  && ok_t "T3c the probe reports MERGED with the sha and the mergedAt" \
+  || bad_t "T3c probe merged" "got '$(_merge_landed_probe "$PR" 5dive-ai/5dive)'"
+
+_gate_gh_payload="OPEN|null|null"; _gate_gh_rc=0
+[[ "$(_merge_landed_probe "$PR" 5dive-ai/5dive)" == "OPEN${US}OPEN" ]] \
+  && ok_t "T3d AN OPEN PULL REQUEST IS A VERDICT, NOT A SILENCE — the probe says OPEN and names the state, so a poller never files it as an unreadable rail" \
+  || bad_t "T3d probe open" "got '$(_merge_landed_probe "$PR" 5dive-ai/5dive)'"
+
+_gate_gh_payload="CLOSED|null|null"; _gate_gh_rc=0
+[[ "$(_merge_landed_probe "$PR" 5dive-ai/5dive)" == "OPEN${US}CLOSED" ]] \
+  && ok_t "T3e a CLOSED-unmerged pull request is OPEN to this probe (the verdict is about the LANDING) and still carries its real state" \
+  || bad_t "T3e probe closed" "got '$(_merge_landed_probe "$PR" 5dive-ai/5dive)'"
+
+_gate_gh_payload=""; _gate_gh_rc=1
+[[ "$(_merge_landed_probe "$PR" 5dive-ai/5dive)" == "UNKNOWN${US}" ]] \
+  && ok_t "T3f a GitHub that cannot be asked is UNKNOWN — distinguishable from OPEN, which is the whole reason this function exists" \
+  || bad_t "T3f probe unknown" "got '$(_merge_landed_probe "$PR" 5dive-ai/5dive)'"
+
+# THE SHORT-RECORD GUARD. A rail that answers with something other than the three
+# fields asked for must be UNKNOWN, not a verdict assembled out of the wrong
+# fields — UNKNOWN and OPEN both change nothing, but MERGED WRITES.
 _gate_gh_payload="$SHA|$AT"; _gate_gh_rc=0
+[[ "$(_merge_landed_probe "$PR" 5dive-ai/5dive)" == "UNKNOWN${US}" ]] \
+  && ok_t "T3g a TWO-field record (rail/format drift) is UNKNOWN, never a landing read out of the wrong field positions" \
+  || bad_t "T3g probe short record" "got '$(_merge_landed_probe "$PR" 5dive-ai/5dive)'"
+[[ -z "$(_merge_landed_read "$PR" 5dive-ai/5dive)" ]] \
+  && ok_t "T3h ...and the verb reads nothing from it either" || bad_t "T3h short record via verb" ""
+
+# --- 2. THE DECISION --------------------------------------------------------
+_gate_gh_payload="MERGED|$SHA|$AT"; _gate_gh_rc=0
 out=$(_merge_do_already_landed "$PR" 2>&1); rc=$?
 (( rc == 0 )) \
   && ok_t "T4 a landed pull request short-circuits the primitive (rc 0 — the caller returns before the credential demand)" \
@@ -108,7 +146,7 @@ out=$(_merge_do_already_landed "$PR" 2>&1); rc=$?
   && ok_t "T4c ...and says plainly that it performed nothing — this seat is not credited with the maintainer's merge" \
   || bad_t "T4c performed-nothing wording" "$out"
 
-_gate_gh_payload="null|null"; _gate_gh_rc=0
+_gate_gh_payload="OPEN|null|null"; _gate_gh_rc=0
 out=$(_merge_do_already_landed "$PR" 2>&1); rc=$?
 (( rc == 1 )) \
   && ok_t "T5 AN OPEN PULL REQUEST CARRIES ON (rc 1) — the credential demand is untouched on every row with a merge left to perform" \
