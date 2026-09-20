@@ -449,7 +449,7 @@ cmd_task_grade_context() {
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   if [[ -n "$check" ]]; then _task_grade_tree_assert "$id" "$ident" "$check"; return 0; fi
 
-  local repo sha criteria result root tree tree_q seal digest base diff claim mode
+  local repo sha criteria result root tree tree_q seal digest base diff claim mode criteria_b
   repo=$(db "SELECT COALESCE(delivery_repo_path,'') FROM tasks WHERE id=${id};")
   sha=$(db "SELECT COALESCE(delivered_sha,'') FROM tasks WHERE id=${id};")
   criteria=$(db "SELECT COALESCE(acceptance_criteria,'') FROM tasks WHERE id=${id};")
@@ -479,6 +479,14 @@ cmd_task_grade_context() {
   [[ -n "$base" ]] || fail "$E_CONFLICT" "$ident cannot resolve a diff base for $sha — REJECT (DIVE-4634)"
   diff=$(git -C "$tree" diff --no-ext-diff --unified=3 "$base" "$sha" -- | head -c "${FIVEDIVE_GRADE_DIFF_MAX_BYTES:-131072}" || true)
   claim=$(printf '%s\n' "$result" | _task_grade_claim_block)
+  # DIVE-4634 iteration 3: the truncation is hoisted OUT of the heredoc rather than
+  # spelled inline. `<<PACKET` is deliberately unquoted — it has to interpolate
+  # ${ident} ${mode} ${tree} ${sha} ${base} ${claim} ${diff} — and an unquoted heredoc
+  # also EXECUTES any $(...) in its body, which is the class
+  # tests/heredoc_substitution_unit.sh bans outside its allowlist. Quoting the
+  # delimiter is NOT the fix here: it would turn every one of those expansions into
+  # literal text and emit a packet naming no task, no tree and no sha.
+  criteria_b=$(printf '%s' "$criteria" | head -c 16384)
   cat <<PACKET
 BEGIN BOUNDED GRADING PACKET DIVE-4634
 TASK: ${ident}
@@ -488,7 +496,7 @@ DELIVERED_SHA: ${sha}
 BASE_SHA: ${base}
 
 ACCEPTANCE CRITERIA (bounded at 16384 bytes):
-$(printf '%s' "$criteria" | head -c 16384)
+${criteria_b}
 
 DELIVERY CLAIM BLOCK (the CHECKED lines are the commands and reported outputs to re-run):
 ${claim}
