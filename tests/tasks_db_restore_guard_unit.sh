@@ -308,6 +308,21 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # a same-seat worktree at bare origin/main ce8f463a scored 56/0 on this harness
 # while this branch scored 55/1 with got==want, so the count was the only thing
 # failing and the one column is the whole delta.
+#
+# 103 -> 107 (DIVE-4654, 2026-09-20): +merge_landed_at/_sha/_by/_ref, the recorded
+# landing of a pull request merged on the FORGE rather than through `task merge` —
+# what lets a row leave stage MERGING when the grading seat holds no merge rail.
+# READ off a fresh tasks_db_init on the MERGED tree (this branch merged with
+# origin/main f21d02d5), as the header above instructs (`bad` patched to print its
+# detail, one run, `count=107` with got==want and rc=0, patch reverted); not derived
+# by adding this branch's four-column delta. Control done first, as the DIVE-3483
+# entry instructs: a same-seat worktree at bare origin/main f21d02d5 scored 56/0 on
+# this harness while the merged tree scored 55/1 with got==want, so the count was
+# the only thing failing and the four columns are the whole delta. COLLISION, of the
+# kind the DIVE-3474 entry above describes: PR #1034 (DIVE-4634) moves this SAME
+# literal for +delivery_repo_path/+delivered_sha and was unmerged at this read.
+# Whichever of the two lands second must RE-READ off the merged tree — git will
+# conflict on this line, and the resolution is a read, not 107 + 2.
 
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
@@ -317,8 +332,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "103" ]] \
-  && ok "fresh schema: all 103 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "107" ]] \
+  && ok "fresh schema: all 107 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------
