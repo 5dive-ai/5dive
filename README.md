@@ -399,6 +399,23 @@ sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 
 `--as` is the agent's name on your box; the pack supplies the persona, model, and skills. Add `--channels=telegram` to wire a bot at import time. Packs live in the [`5dive-ai/5dive-marketplace`](https://github.com/5dive-ai/5dive-marketplace) registry, and a `5dive.yaml` can reference one with `pack: <slug>`.
 
+### Plugins
+
+A plugin adds something to every seat on the box at once: a channel (Telegram, Discord), a verb (a new top-level `5dive <verb>`), or a capability such as a shared browser or voice. It is a directory with a Claude Code plugin manifest (`.claude-plugin/plugin.json`). 5dive installs it box-level and registers it with every existing agent and every agent created later: Claude Code seats through their own plugin install, other harnesses through the plugin's `AGENTS.md` section.
+
+```sh
+sudo 5dive plugin add browser@5dive-plugins        # from the 5dive marketplace
+sudo 5dive plugin add 5dive-ai/5dive-voice         # from any GitHub repo that carries a marketplace.json
+sudo 5dive plugin list                             # version, tier, enabled, what it registers
+sudo 5dive plugin upgrade browser@5dive-plugins
+sudo 5dive plugin disable browser@5dive-plugins    # a flag flip; the code stays on disk
+sudo 5dive plugin rollback browser@5dive-plugins 1.1.0
+```
+
+`add` prints who published the plugin and exactly what it will be handed, then waits for you to agree: a plugin is code that runs with your agents' access. `5dive market --kind=plugin` is the catalog, and the same list is on the dashboard under **Plugins**.
+
+**Develop your own.** Any repo with a `.claude-plugin/marketplace.json` naming its plugins installs with `5dive plugin add <owner>/<repo>`. [5dive-browser](https://github.com/5dive-ai/5dive-browser) and [5dive-voice](https://github.com/5dive-ai/5dive-voice) are the two we ship that way; [5dive-plugins](https://github.com/5dive-ai/5dive-plugins) is the marketplace with the rest (telegram, dashboard, buzz). A plugin declares what it registers (`channel`, `verb`, `skill`, `mcp`). A verb plugin ships `bin/<verb>` and is reached only after every builtin command, so it can never take `5dive task` from you; a manifest naming a builtin, or a verb another plugin already claims, is refused at install. Publish under your own name: `add` shows the publisher before anything runs.
+
 ### See the org layer: `5dive ui`
 
 The CLI serves its own web UI. No install, no build step, no account:
