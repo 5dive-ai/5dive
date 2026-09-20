@@ -589,7 +589,19 @@ _task_channel_try() {
   # EXISTS, so the caller's channel proof was handed to root and ROOT said no.
   # Falling through there would land the write unsigned behind a human proof
   # the primitive had just rejected.
-  sudo -n -l /usr/local/bin/5dive _task_channel >/dev/null 2>&1 || return 1
+  #
+  # AND the same reason keeps a seat that can ALREADY SIGN off this rail
+  # entirely, which is the other half of the same reject: on a root-all seat
+  # `sudo -n -l` says yes to everything, so without this probe every admin seat
+  # -- including the one carrying the box's own paired human -- would be
+  # re-routed from today's in-process write onto a primitive whose flag
+  # allowlist is deliberately narrower than `task answer`'s, and whose caller
+  # check refuses any uid that is not an `agent-*` seat. The narrow rail exists
+  # for the seat that cannot sign; a seat that can keeps today's path byte for
+  # byte, exactly as `_task_answer_try_delegated` below decides the same thing
+  # with the same probe.
+  sudo -n -l /usr/local/bin/5dive gate-proof sign >/dev/null 2>&1 && return 1
+  sudo -n -l /usr/local/bin/5dive _task_channel   >/dev/null 2>&1 || return 1
   _TASK_CHANNEL_ATTEMPTED=1
   local out rc=0
   out=$(printf '%s\0' "$op" "$@" | sudo -n /usr/local/bin/5dive _task_channel 2>&1) || rc=$?

@@ -35,8 +35,12 @@ export CALLS="$TMP/calls" WIRE="$TMP/wire"
 # Keep this seam in-process. The pre-push corpus deliberately sanitises inherited
 # command environments; a PATH shim made this arm order-dependent even though the
 # production call itself is a shell command.
+# A STANDARD seat, which is the population this rail exists for: it cannot sign
+# (`gate-proof sign` denied) and it holds the exact-path grant. Both probes are
+# distinguished by $4, so an arm that models only one of them cannot pass by
+# accident.
 sudo(){
-  if [[ "$2" == "-l" ]]; then return 0; fi
+  if [[ "$2" == "-l" ]]; then [[ "$4" == "_task_channel" ]] && return 0 || return 1; fi
   printf '%s\n' "$*" >>"$CALLS"
   python3 -c 'import sys; b=sys.stdin.buffer.read(); print(b.count(b"\0"))' >"$WIRE"
   printf '{"ok":true,"data":{"signed":true}}\n'
@@ -60,7 +64,7 @@ has "$CALLS" '/usr/local/bin/5dive _task_channel' 'delegation invokes only the h
 # process, so on the pre-fix tree this arm does not print FAIL -- it kills the
 # harness mid-run, which is itself the regression signal.
 sudo(){
-  if [[ "$2" == "-l" ]]; then return 1; fi          # grant absent
+  if [[ "$2" == "-l" ]]; then return 1; fi          # cannot sign, and no grant either
   printf '%s\n' "$*" >>"$CALLS"; cat >/dev/null
   printf '{"ok":true,"data":{"signed":true}}\n'
 }
@@ -77,7 +81,7 @@ _task_channel_try answer DIVE-1 --value=yes --channel-proof=123 >/dev/null 2>&1;
 # would land the write unsigned behind a human proof the primitive rejected, so
 # ATTEMPTED stays 1 and the caller returns the refusal.
 sudo(){
-  if [[ "$2" == "-l" ]]; then return 0; fi          # grant present
+  if [[ "$2" == "-l" ]]; then [[ "$4" == "_task_channel" ]] && return 0 || return 1; fi
   printf '%s\n' "$*" >>"$CALLS"; cat >/dev/null
   printf 'refused\n'; return 4
 }
@@ -87,6 +91,21 @@ _task_channel_try answer DIVE-1 --value=yes --channel-proof=123 >/dev/null 2>&1;
   || bad "granted seat: a root refusal propagates as the caller rc (got $rc)"
 [[ "${_TASK_CHANNEL_ATTEMPTED}" == 1 ]] && ok 'granted seat: ATTEMPTED=1 so there is no unsigned fall-through' \
   || bad "granted seat: ATTEMPTED=1 so there is no unsigned fall-through (got '${_TASK_CHANNEL_ATTEMPTED}')"
+
+# ...and a seat that can already sign never reaches the rail at all: on a root-all
+# seat `sudo -n -l` says yes to every path, so the grant probe alone would re-route
+# every admin seat (the paired human's own included) onto a primitive whose flag
+# allowlist is narrower than `task answer`'s.
+sudo(){
+  if [[ "$2" == "-l" ]]; then return 0; fi                # root-all: every path permitted
+  printf '%s\n' "$*" >>"$CALLS"; cat >/dev/null
+  printf '{"ok":true,"data":{"signed":true}}\n'
+}
+: >"$CALLS"; _TASK_CHANNEL_ATTEMPTED=unset
+_task_channel_try answer DIVE-1 --value=yes --channel-proof=123 >/dev/null 2>&1; rc=$?
+[[ $rc != 0 && "${_TASK_CHANNEL_ATTEMPTED}" == 0 && ! -s "$CALLS" ]] \
+  && ok 'a seat that can sign keeps today in-process path, bridge untouched' \
+  || bad "a seat that can sign keeps today in-process path (rc=$rc attempted='${_TASK_CHANNEL_ATTEMPTED}')"
 
 SETUP="$SRC/lib/agent_setup.sh"
 has "$SETUP" 'TELEGRAM_BOT_TOKEN=%s' 'Claude install writes the channel token'
