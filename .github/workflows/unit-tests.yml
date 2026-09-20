@@ -55,7 +55,8 @@ env:
 jobs:
   # DIVE-3315: INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s
   # stands; the core corpus does not fit under it any more. (Two when this was written;
-  # THREE since DIVE-4147 — the gate and the measurement are the block below.) Measured on main
+  # THREE since DIVE-4147 and FOUR since DIVE-4658 — the gates and the measurements are the
+  # blocks below.) Measured on main
   # 2026-08-11/12: 313s pristine against a 312s effective cap, with ~6% runner spread
   # and the mutation-harness lever exhausted at ~7s available against ~13s needed
   # (olivia's by-construction census, DIVE-3313). A cap breached by 1s on the draw of a
@@ -92,6 +93,48 @@ jobs:
   # launder is `core_us_per_harness` against a fixed reference (DIVE-3477), reading
   # pct_of_ref=160 pristine / 141 installed-host on that run.
   #
+  # DIVE-4658: N = 4, decided by the lead on 2026-09-20 as a tier-0 decision recorded on that
+  # row, the alternative on the ask being to shed ~40s per environment by demoting
+  # escalation_ask_unit.sh, escalation_resume_unit.sh and agent_account_subverb_help_unit.sh to
+  # nightly — lodar-facing guards, for ~3 days of headroom. Measured cause: at THREE shards the
+  # core tier is over its 300s cap at BASELINE prices, before any pull request's own files are
+  # priced at all. Run 35493287641 (DIVE-4614's merge group, head 5fddeb43) re-priced the 163
+  # harnesses COMMON to the merge group and the last green main baseline and got
+  # `repriced_s=307` on core-pristine s1 and `repriced_s=323` on core-installed-host s3, both
+  # `verdict=corpus reason=over-at-baseline-prices`, with `NO TEST FAILED — 165 of 165
+  # harnesses passed`. That is a budget eject with no defect in the diff, and it fired on a 7%
+  # overage — inside runner-to-runner spread, so the same tree was red on one attempt and green
+  # on the next. #1026 was ejected from the merge queue twice on it; #1027, #1018 and #1029
+  # went the same night, none of them for a failing test.
+  #
+  # THE FOURTH SHARD WAS PRICED BEFORE IT WAS TAKEN, against the last green main run
+  # (35487993239, head 3967b60d). The shipped `harness-weights.tsv` under-prices the corpus
+  # and THE PLANNER READS THAT TSV, so a partition priced with measured weights is not the
+  # one CI will run: plan with the SHIPPED TSV, cost at MEASURED prices (that run's six shard
+  # reports joined on column 3). The partition reproduces offline EXACTLY — 497 of 497
+  # harnesses land in the shard index they ran in, in BOTH environments — and costed at that
+  # run's own per-harness times those shards sum to 336/317/275s pristine and 223/304/276s
+  # installed-host against 338/318/275 and 223/305/276 observed. That last sum is a
+  # BOOKKEEPING check and not an independent prediction: the prices come from the run being
+  # summed. What is NOT circular is the comparison to the planner's own estimate for the same
+  # partition — `shard_plan_s` 279/279/280 and 267/267/267, i.e. balanced, and wrong by up to
+  # 22%, at `shard_weights_cover_pct=97`. Cover counts files that HAVE a weight; it does not
+  # say the weights are right.
+  #
+  # At four shards, same method, today's 502-harness corpus: worst shard 246s pristine (82%
+  # of cap) and 212s installed-host (70%), no harness removed, no cap raised, no ruleset
+  # edit. Pricing with measured weights for BOTH steps instead reads 233s and 201s — it
+  # predicts a balance the planner cannot deliver and under-reads the worst shard by 5%.
+  #
+  # WHAT IT DOES NOT DO, and this is the residual: the corpus is still ~930s pristine and still
+  # growing at ~12 core harnesses a day (140 added since 09-08). 54s of headroom on the worst
+  # shard against ~5.6s of growth per shard per day is roughly NINE DAYS, and the ladder gets
+  # shorter every rung — a fifth shard buys 4/5 of what this one bought. This is capacity, not
+  # paydown, and the paydown is still owed. The number that adding capacity cannot launder is
+  # `core_us_per_harness` against its frozen reference (DIVE-3477): it divides by the harness
+  # COUNT, so it reads the same at three shards and at four, which is the entire reason it was
+  # built.
+  #
   # AND THE UN-SHARDED TOTAL IS STILL PRINTED, by `core-budget-report` below: sharding
   # is the obvious way to lose the number this whole scheme exists to surface. Two jobs
   # reporting 157s read as comfortable while the corpus still costs 313s. Per-shard is
@@ -115,7 +158,7 @@ jobs:
       # un-sharded total is re-summed from the shards' reports, and a cancelled shard
       # is a hole in exactly the number this row exists to keep legible.
       fail-fast: false
-      matrix: { shard: [1, 2, 3] }
+      matrix: { shard: [1, 2, 3, 4] }
     steps:
       # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
       # moves a payload the real CLI produced into the real dispatcher that lives in
@@ -568,7 +611,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: { shard: [1, 2, 3] }
+      matrix: { shard: [1, 2, 3, 4] }
     steps:
       # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
       # moves a payload the real CLI produced into the real dispatcher that lives in

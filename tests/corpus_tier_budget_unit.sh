@@ -2002,7 +2002,7 @@ if len(summ) == 1:
 
 # 98 — THE SHARD COUNT IS A PINNED NUMBER, NOT A SENTENCE. Found by codex grading this
 # row's own PR: changing BOTH core matrices from [1, 2] to [1, 2, 3] passes 142/0.
-# (N is 3 as of DIVE-4147 — see the note on CORE_SHARDS below. Read every `[1, 2, 3]`
+# (N is 4 as of DIVE-4658 — see the notes on CORE_SHARDS below. Read every `[1, 2, 3]`
 # in this header as "one more shard than is pinned"; the arm is about N moving in the
 # workflow alone, whatever N is.) Every
 # arm above stays green because every one of them is about the shape of the split and not
@@ -2084,7 +2084,23 @@ if len(summ) == 1:
 # it. Three shards is ~217s per shard, 28% margin, no harness removed, no cap raised.
 # TIER_BUDGET_CORE, TIER_CAL_SCALE_MAX_PCT and TIER_CAL_BASELINE_US are all untouched by
 # that change, as they were by this arm's own commit.
-CORE_SHARDS = 3
+#
+# DIVE-4658 MOVED THIS LINE FROM 3 TO 4, and it came back as a decision exactly as this arm
+# requires: a lead decision on 2026-09-20, recorded on the row, the alternative being to demote
+# ~40s per environment of lodar-facing guards to nightly. The cause was measured, not felt — at
+# three shards the tier is over 300s at BASELINE prices, with the PR's own files excluded from the
+# pricing: merge-group run 35493287641 read repriced_s=307 (core-pristine s1) and 323
+# (core-installed-host s3) over the 163 harnesses common to the group and the last green main
+# baseline, verdict=corpus, over-at-baseline-prices, 165 of 165 harnesses PASSING. Four pull
+# requests were ejected from the merge queue that night with no failing test. The fourth shard was
+# priced before it was taken: planned with the SHIPPED weights TSV (what CI plans with) and costed
+# at the per-harness times in run 35487993239's six shard reports, joined on column 3. That
+# partition reproduces offline exactly — 497 of 497 harnesses in the shard index they ran in, in
+# both environments — while the planner's own shard_plan_s for it read a balanced 279/279/280
+# against a true 336/317/275. Worst shard at four: 246s pristine (82% of cap), 212s installed-host
+# (70%). TIER_BUDGET_CORE, TIER_CAL_SCALE_MAX_PCT and TIER_CAL_BASELINE_US are
+# untouched by that change, as they were by DIVE-4147's and by this arm's own commit.
+CORE_SHARDS = 4
 # One corpus job per environment (pristine, installed-host) and one confirm job per
 # environment. Both are counts of JOBS, and both are capacity: another corpus job is
 # another 300s cap, and another confirm job is another box re-running a shard.
