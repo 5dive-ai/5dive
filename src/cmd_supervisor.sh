@@ -70,6 +70,20 @@ _SUP_T_STRANDED_MIN="${SUPERVISOR_T_STRANDED_MIN:-45}"
 # FALSE-NEGATIVE like every other threshold in this file.
 _SUP_T_NO_OUTPUT_DAYS="${SUPERVISOR_T_NO_OUTPUT_DAYS:-3}"
 [[ "$_SUP_T_NO_OUTPUT_DAYS" =~ ^[0-9]+$ ]] || _SUP_T_NO_OUTPUT_DAYS=3
+# DIVE-4666 it.2: the drought's SECOND term. The days-since-close number above
+# is measured against the seat's CLOSE history and nothing else, so at 07:40Z on
+# 2026-09-20 `codex` — which had been correctly idle with no open rows until
+# 07:31Z, was assigned DIVE-4665 at 07:31Z, STARTED it at 07:34Z and had it at a
+# gate by 07:40Z — was paged as "not transacting: 1 open row(s), nothing closed
+# in 3d". Every word of that was true and the conclusion was wrong: a seat is
+# only dark if its OPEN work is also standing still. This window is how long the
+# newest touch on the open queue has to be stale before a close drought counts
+# as darkness. A day, because the close threshold is three and the two must not
+# be the same number — the row's own arms are "picked up 5 minutes ago -> quiet"
+# and "sat 2 days with no start since -> page", and anything from ~1h to ~2d
+# separates them. Same env escape hatch as its siblings.
+_SUP_T_NO_OUTPUT_IDLE_MIN="${SUPERVISOR_T_NO_OUTPUT_IDLE_MIN:-1440}"
+[[ "$_SUP_T_NO_OUTPUT_IDLE_MIN" =~ ^[0-9]+$ ]] || _SUP_T_NO_OUTPUT_IDLE_MIN=1440
 # DIVE-3272: a model-capacity error in a seat's pane is a FLEET-health event, not
 # that seat's private problem — the cost is borne by every row queued behind it.
 # Nothing scraped for one before this. Pane-scoped for the same reason the
@@ -1232,11 +1246,47 @@ _sup_quota_pane() {  # <user> <sess> <svc_running> [now_epoch]
 
 # DIVE-3272: the OUTPUT signal — the one thing no probe above measures, read from
 # the store that was holding the answer the whole time, unread. Echoes
-# "<open-rows>|<days-since-last-close>"; the second is -1 when this seat has
-# never closed anything (unknown age => never classifies on its own, so a
-# brand-new seat can't be flagged for having produced nothing yet).
+# "<open-rows>|<days-since-last-close>|<minutes-since-the-open-queue-last-moved>".
+#
+# Field 2 is -1 when this seat has never closed anything (unknown age => never
+# classifies on its own, so a brand-new seat can't be flagged for having produced
+# nothing yet).
+#
+# DIVE-4666 it.2 added FIELD 3, and it is the answer to a different question.
+# Fields 1+2 say "this seat is holding work and has closed nothing" — which was
+# TRUE of codex at 07:40Z on 2026-09-20 and yet paged a human about a seat that
+# had picked a row up six minutes earlier and gated it. A close is a LAGGING
+# signal by up to the whole length of a row; the queue's own clock is not.
+#
+# WHAT COUNTS AS MOVEMENT, and why one expression covers all three events the
+# row asked for (start, deliver, gate):
+#   start   COALESCE(first_started_at, started_at, created_at) — the attempt's
+#           own clock. first_started_at FIRST on purpose: `started_at` is
+#           re-stamped by every _hb_claim_task re-dispatch out of `todo`
+#           (src/cmd_heartbeat.sh), so keying on it would let a seat that is
+#           re-woken every 15 minutes and produces nothing look permanently
+#           fresh — it would DISARM DIVE-3272 rather than qualify it. created_at
+#           is the floor: a row that landed 5 minutes ago and was never claimed
+#           is not evidence of darkness either.
+#   deliver `_task_route_to_verifier` sets assignee=<verifier>, so a delivered
+#           row LEAVES this seat's open set (src/task/delivery.sh).
+#   gate    `task need` sets status='blocked', so a gated row leaves it too.
+# So both of those are already handled structurally, by the `status IN` +
+# `assignee=` filter this function has always carried, and neither needs a term.
+#
+# MAX, not MIN — the newest touch, not the oldest row. The claim the page makes
+# is "this seat is not transacting", and the thing that refutes it is the seat
+# having transacted RECENTLY; an ancient row sitting alongside a fresh one is
+# already counted by field 2. (MIN would have paged codex exactly as before on
+# any seat that also happened to hold one old row.)
+#
+# -1 on field 3 means UNKNOWN and leaves the drought decision exactly as
+# DIVE-3272 shipped it. On this path that pairs only with open=0 — with open>0
+# the MAX is over a COALESCE ending in a NOT NULL column, so it always resolves
+# — but _sup_classify is also called by harnesses with the old 21-arg signature,
+# and those must keep their pre-4666 answers.
 _sup_output_stats() {  # <name>
-  local name="$1" open last days=-1
+  local name="$1" open last days=-1 moved move=-1
   open=$(db "SELECT COUNT(*) FROM tasks
              WHERE assignee=$(sqlq "$name") AND status IN ('todo','in_progress')
                AND kind='standard';" 2>/dev/null || echo 0)
@@ -1247,7 +1297,48 @@ _sup_output_stats() {  # <name>
   last=$(db "SELECT CAST((julianday('now') - julianday(MAX(done_at))) AS INTEGER)
              FROM tasks WHERE assignee=$(sqlq "$name") AND done_at IS NOT NULL;" 2>/dev/null || echo "")
   [[ "$last" =~ ^[0-9]+$ ]] && days="$last"
-  printf '%s|%s\n' "$open" "$days"
+  moved=$(db "SELECT CAST((julianday('now')
+                - julianday(MAX(COALESCE(first_started_at, started_at, created_at)))) * 1440 AS INTEGER)
+              FROM tasks WHERE assignee=$(sqlq "$name") AND status IN ('todo','in_progress')
+                AND kind='standard';" 2>/dev/null || echo "")
+  # A clock skew or a row stamped in the future reads negative; clamp to 0 so a
+  # bad stamp cannot masquerade as the -1 that means "unknown".
+  [[ "$moved" =~ ^-?[0-9]+$ ]] && { move="$moved"; (( move < 0 )) && move=0; }
+  printf '%s|%s|%s\n' "$open" "$days" "$move"
+}
+
+# DIVE-4666 it.2: the drought decision itself, lifted OUT of the classifier's
+# chain so it is assertable without composing a whole agent record — and so a
+# mutant can be pointed at exactly the comparison this row added. Echoes
+# true|false, in the same voice as _sup_capacity_notify_{human,machine}.
+#
+# BOTH terms are required: a close drought AND an open queue that has not moved.
+# Either alone is a seat doing its job — a long close drought with fresh starts
+# is a seat grinding hard work, and a stale queue with recent closes is a seat
+# that just finished something.
+_sup_output_drought() {  # <open_rows> <days_since_close> <mins_since_move> -> true|false
+  local open="${1:-0}" days="${2:--1}" move="${3:--1}"
+  [[ "$open" =~ ^[0-9]+$ ]]   || open=0
+  [[ "$days" =~ ^-?[0-9]+$ ]] || days=-1
+  [[ "$move" =~ ^-?[0-9]+$ ]] || move=-1
+  (( open > 0 )) || { printf 'false'; return; }
+  (( days >= 0 && days >= _SUP_T_NO_OUTPUT_DAYS )) || { printf 'false'; return; }
+  # move < 0 is UNKNOWN, not fresh: an unmeasured queue clock must not silence a
+  # measured three-day drought (that would be the absence-reads-as-health shape
+  # this whole file exists to remove). It is unreachable with open>0 on the real
+  # store read above; it is reachable from a 21-arg legacy call.
+  (( move >= 0 && move < _SUP_T_NO_OUTPUT_IDLE_MIN )) && { printf 'false'; return; }
+  printf 'true'
+}
+
+# DIVE-4666 it.2: a duration a person reads, for the detail line the page quotes.
+_sup_ago_phrase() {  # <minutes>
+  local m="${1:--1}"
+  [[ "$m" =~ ^[0-9]+$ ]] || { printf ''; return; }
+  if   (( m < 60 ));   then printf '%dm' "$m"
+  elif (( m < 1440 )); then printf '%dh' $(( m / 60 ))
+  else                      printf '%dd' $(( m / 1440 ))
+  fi
 }
 
 # ── DIVE-3274: the same two facts, on the surface people actually type ────────
@@ -1310,11 +1401,13 @@ _SUP_INFO_TICK_TOL=120   # seconds. Per-agent rows are written BEFORE the fleet
 # args: armed(true/false) tick_epoch row_epoch now
 #       rec_class rec_cause rec_detail open_rows days_since_close(-1 = never)
 #       store_readable(true/false) account_wall(empty unless AT the wall now)
+#       move_mins(minutes since the open queue last moved; -1 = not measured)
 _sup_info_status() {
   local armed="$1" tick="${2:-0}" row="${3:-0}" now="${4:-0}" \
         rc="${5:-}" rcause="${6:-}" rdetail="${7:-}" open="${8:-0}" days="${9:--1}" \
-        store="${10:-true}" wall="${11:-}"
+        store="${10:-true}" wall="${11:-}" move="${12:--1}"
   [[ "$store" == "false" ]] || store="true"
+  [[ "$move" =~ ^-?[0-9]+$ ]] || move=-1
   [[ "$tick" =~ ^[0-9]+$ ]] || tick=0
   [[ "$row"  =~ ^[0-9]+$ ]] || row=0
   [[ "$now"  =~ ^[0-9]+$ ]] || now=0
@@ -1352,9 +1445,20 @@ _sup_info_status() {
   elif (( open == 0 )); then
     output="idle"; transacting="null"
     note="no open rows, last close ${days}d ago — correctly idle, not dry"
+  elif [[ "$(_sup_output_drought "$open" "$days" "$move")" != "true" ]]; then
+    # DIVE-4666 it.2: SURFACE PARITY. `dry / transacting:false` is the same
+    # claim the tick pages on, and this surface is the drill-down a person opens
+    # when the page arrives — so it must not go on saying "not transacting"
+    # about a seat the tick has just stopped paging for. Reached only when the
+    # queue clock was MEASURED and is fresh (an unmeasured one is -1, which
+    # _sup_output_drought reads as unknown and lets fall through to `dry`
+    # exactly as it did pre-4666, so every 11-arg caller is unchanged).
+    output="ok"; transacting="true"
+    note="${open} open row(s), last close ${days}d ago — but the newest was picked up $(_sup_ago_phrase "$move") ago, so this seat is moving"
   else
     output="dry"; transacting="false"
     note="${open} open row(s), nothing closed in ${days}d"
+    (( move >= 0 )) && note="${note}, nothing picked up in $(_sup_ago_phrase "$move")"
   fi
 
   # --- the half it INHERITS from the trail ------------------------------------
@@ -1523,7 +1627,7 @@ _sup_info_ago() {
 # never to a confident all-clear and never to a failed `agent info`.
 sup_info_for_agent() {  # <name>
   local name="$1" armed="false" tick=0 row=0 now rc="" rcause="" rdetail="" open=0 days=-1 \
-        store="false"
+        move=-1 store="false"
   now=$(date +%s)
   [[ -f "$_SUP_ENABLED_FLAG" ]] && armed="true"
   # A store this seat cannot read is NOT zero rows and no closes. Probe it with
@@ -1534,8 +1638,9 @@ sup_info_for_agent() {  # <name>
     && [[ "$(db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks' LIMIT 1;" 2>/dev/null || echo "")" == "1" ]] \
     && store="true"
   if [[ "$store" == "true" ]]; then
-    local ostats; ostats=$(_sup_output_stats "$name" 2>/dev/null || echo "0|-1")
-    open="${ostats%%|*}"; days="${ostats##*|}"
+    # DIVE-4666 it.2: three fields, read positionally — see _sup_agent_record.
+    local ostats; ostats=$(_sup_output_stats "$name" 2>/dev/null || echo "0|-1|-1")
+    IFS='|' read -r open days move <<<"$ostats"
     tick=$(db "SELECT COALESCE(strftime('%s', MAX(ts)), 0) FROM supervisor_events
                WHERE agent='(fleet)' AND event='heartbeat';" 2>/dev/null || echo 0)
     local r
@@ -1553,7 +1658,7 @@ sup_info_for_agent() {  # <name>
     IFS=$'\037' read -r w_state w_win w_pct w_reset w_age w_note <<<"$(quota_wall_seat "$name")"
     [[ "$w_state" == "exhausted" ]] && wall="$(quota_wall_phrase "$w_win" "$w_pct" "$w_reset")"
   fi
-  _sup_info_status "$armed" "$tick" "$row" "$now" "$rc" "$rcause" "$rdetail" "$open" "$days" "$store" "$wall"
+  _sup_info_status "$armed" "$tick" "$row" "$now" "$rc" "$rcause" "$rdetail" "$open" "$days" "$store" "$wall" "$move"
 }
 
 # ── DIVE-4551: WHO RECEIVES A FLEET-HEALTH ALERT ────────────────────────────
@@ -2188,7 +2293,8 @@ _sup_classify() {
         verify_excerpt="${12}" stranded="${13:-0}" \
         open_rows="${14:-0}" no_output_days="${15:--1}" quota_excerpt="${16:-}" \
         quota_deadline="${17:-unknown}" prompt_excerpt="${18:-}" prompt_mark="${19:-unmarked}" \
-        account_wall="${20:-}" pane_probe="${21:-ok}"
+        account_wall="${20:-}" pane_probe="${21:-ok}" \
+        no_output_move="${22:--1}"
   # DIVE-3880: the policy lives HERE, in the pure decision, not at the pane
   # probe — the probe owes a distinguishable signal, the classifier owes the
   # verdict (community/wiki/a-fail-open-underneath-a-fail-closed-path-feeds-it-a-lie-in-the-format-it-trusts.md).
@@ -2297,15 +2403,26 @@ _sup_classify() {
     class="stuck"; cause="loop-stuck"; detail="${loop_stuck} running loop(s) self-flagged stuck"
   elif (( has_work )) && (( act_age >= 0 )) && (( act_age >= _SUP_T_STUCK_MIN * 60 )); then
     class="stuck"; cause="no-progress"; detail="active work, no transcript progress for $((act_age / 60))m"
-  elif (( no_output_days >= 0 )) && (( no_output_days >= _SUP_T_NO_OUTPUT_DAYS )) && (( open_rows > 0 )); then
+  elif [[ "$(_sup_output_drought "$open_rows" "$no_output_days" "$no_output_move")" == "true" ]]; then
     # DIVE-3272: the output drought. Ranked BELOW the hard dead signals — those
     # are more specific and already surface — but ABOVE stale-cli / slow / drift
     # / active, because a multi-day drought outranks a ten-minute progress gap
     # and a box-level update notice, and because the branch it has to beat is
     # the one that hid the incident: `has_work -> detail="active"`. A seat that
     # is claiming rows and closing none must not print as active.
+    #
+    # DIVE-4666 it.2: the predicate, not the inline conjunction, because the
+    # test it owes now takes THREE numbers and the third is the one that was
+    # missing when this branch paged codex six minutes after it picked a row up.
+    # See _sup_output_drought for what movement is and why a delivery and a gate
+    # need no term of their own.
     class="no-output"; cause="no-output"
     detail="${open_rows} open row(s), nothing closed in ${no_output_days}d"
+    # Only when it was MEASURED. An unknown queue clock adds no clause, so every
+    # 21-arg caller's detail string is byte-identical to pre-4666.
+    if (( no_output_move >= 0 )); then
+      detail="${detail}, nothing picked up in $(_sup_ago_phrase "$no_output_move")"
+    fi
   elif [[ "$cli_stale" == "true" ]]; then
     # Box-level: the shared CLI is behind AND the nightly isn't catching up
     # (the /tmp-clobber class) — every agent is executing old code. Requires a
@@ -2487,11 +2604,16 @@ _sup_agent_record() {
   # last closed anything. The pair is the detector: either number alone is
   # meaningless (0 open rows and no closes is a correctly idle seat; 20 open
   # rows and a close this morning is a busy one).
-  local open_rows=0 no_output_days=-1 ostats
+  # DIVE-4666 it.2: THREE fields now — the third is minutes since the open queue
+  # last moved. Read positionally with IFS rather than ${x%%|*}/${x##*|}: the
+  # suffix form silently returned field 3 as `no_output_days` the moment the
+  # third arrived, which is a wrong number in the voice of a right one.
+  local open_rows=0 no_output_days=-1 no_output_move=-1 ostats
   ostats=$(_sup_output_stats "$name")
-  open_rows="${ostats%%|*}"; no_output_days="${ostats##*|}"
-  [[ "$open_rows"      =~ ^[0-9]+$ ]]  || open_rows=0
+  IFS='|' read -r open_rows no_output_days no_output_move <<<"$ostats"
+  [[ "$open_rows"      =~ ^[0-9]+$ ]]   || open_rows=0
   [[ "$no_output_days" =~ ^-?[0-9]+$ ]] || no_output_days=-1
+  [[ "$no_output_move" =~ ^-?[0-9]+$ ]] || no_output_move=-1
 
   # --- signal: stranded todo (DIVE-1416 gap#3) — a todo task assigned to this
   # agent, sitting untouched (never started) past the stranded window. Only
@@ -2551,7 +2673,8 @@ _sup_agent_record() {
                         "$loop_stuck" "$has_work" "$act_age" "$_SUP_CLI_STALE" "$goal_drift_task" \
                         "$verify_excerpt" "$stranded" \
                         "$open_rows" "$no_output_days" "$quota_excerpt" "$quota_deadline" \
-                        "$prompt_excerpt" "$prompt_mark" "$_sup_wall" "$pane_probe")
+                        "$prompt_excerpt" "$prompt_mark" "$_sup_wall" "$pane_probe" \
+                        "$no_output_move")
   IFS=$'\x1f' read -r class cause detail <<<"$crow"
 
   jq -cn \
@@ -2572,6 +2695,7 @@ _sup_agent_record() {
     --arg promptMark "$prompt_mark" \
     --arg paneProbe "$pane_probe" \
     --argjson openRows "$open_rows" --argjson noOutputDays "$no_output_days" \
+    --argjson noOutputMoveMins "$no_output_move" \
     --arg class "$class" --arg cause "$cause" --arg detail "$detail" \
     '{name:$name, type:$type, channels:$channels, unit:$unit,
       signals:{service:$service, sub:$sub, uptimeSec:$uptime, tmux:$tmux, poller:$poller,
@@ -2582,6 +2706,12 @@ _sup_agent_record() {
                verifyChallenge:(if $verifyExcerpt == "" then null else $verifyExcerpt end),
                openRows:$openRows,
                daysSinceLastClose:(if $noOutputDays < 0 then null else $noOutputDays end),
+               # DIVE-4666 it.2: the SECOND term of the drought — minutes since
+               # the newest touch on the open queue of this seat. Recorded, not only
+               # consumed: the 07:40Z page was un-auditable after the fact
+               # precisely because the number that refuted it was never written
+               # down. null == not measured, never 0.
+               minsSinceQueueMoved:(if $noOutputMoveMins < 0 then null else $noOutputMoveMins end),
                quotaSignature:(if $quotaExcerpt == "" then null else $quotaExcerpt end),
                # DIVE-3880: live / lapsed / unknown for the signature above.
                # null only when there is no signature to qualify.

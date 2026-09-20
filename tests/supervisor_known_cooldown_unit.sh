@@ -4,9 +4,19 @@
 # reset time six ticks running; the page dropped both and asked the reader to
 # go check the quota reset.
 #
-# Every arm here is PURE — _sup_wall_verdict, _sup_wall_reset_of,
-# _sup_capacity_notify_{human,machine}, _sup_capacity_tail, quota_wall_when.
-# No tmux, no root, no db, no clock (every arm passes `now` explicitly).
+# ITERATION 2 folds in the row's SECOND requirement (the 07:40Z addendum): the
+# same alert fired at codex six minutes after it picked a row up, because the
+# no-output verdict was measured against the seat's CLOSE history alone. Sections
+# H-J cover the queue-movement term that qualifies it.
+#
+# Sections A-G are PURE — _sup_wall_verdict, _sup_wall_reset_of,
+# _sup_capacity_notify_{human,machine}, _sup_capacity_tail, quota_wall_when,
+# _sup_output_drought, _sup_ago_phrase, _sup_info_status. No tmux, no root, no
+# clock (every arm passes `now` explicitly).
+# Section I drives the REAL `_sup_agent_record` with only the store read stubbed
+# (the technique tests/supervisor_classify_unit.sh:447 already uses), and
+# section J runs `_sup_output_stats`'s REAL SQL against a scratch sqlite file —
+# no root, no network, nothing outside $TMPDIR.
 #
 # THE POPULATION CONTROL is the incident itself: the verbatim
 # `supervisor_events` rows for olivia between 04:50Z and 07:10Z that day, on
@@ -168,29 +178,191 @@ ok "arm41: two hours past the reset, the same rows say LAPSED" \
 ok "arm42: ...and the page comes back" \
    "true" "$(_sup_capacity_notify_machine "no-output" "true" "$(cut -d$'\x1f' -f1 <<<"$R2")")"
 
-# ── G. MUTANTS — each must red the arm above it ─────────────────────────────
-# M1: drop the reset comparison (the row named this mutant).
-_sup_wall_verdict_M1() { printf 'lapsed'; }
-ok "arm43: MUTANT 1 — a verdict that never compares the reset reds arm38" \
-   "lapsed" "$(_sup_wall_verdict_M1 "$RESET" "$ALERT_AT" "$TICK")"
-# M2: gate the human leg only (what a class-keyed reading of the row produces).
-_sup_capacity_notify_machine_M2() {
-  local class="${1:-}" quota_alerts_on="${2:-true}"
-  [[ "$class" == "quota-exhausted" ]] && { printf '%s' "$quota_alerts_on"; return; }
-  printf 'true'
+# ── G. MUTANTS — each one is RE-RUN THROUGH THE ARM IT CLAIMS TO COVER ──────
+# it.2, on quinn's finding: the first cut of this section defined a shadow
+# function and asserted that the shadow gave the wrong answer. That is a
+# tautology — it proves the mutant is a mutant, not that the arm above it is
+# load-bearing. A mutant is evidence only when the REAL arm's expression,
+# evaluated with the mutation substituted, stops producing the real arm's
+# expected value. `reds` is that assertion, and it FAILS when the mutation
+# changes nothing.
+reds() {  # <which arm> <that arm's expected value> <what it computes under the mutation>
+  if [[ "$2" != "$3" ]]; then PASS=$((PASS+1))
+  else FAIL=$((FAIL+1)); echo "FAIL: $1 — the mutation changed NOTHING: the arm still computes '$3'"; fi
 }
-ok "arm44: MUTANT 2 — a human-leg-only gate still sends the page that fired" \
-   "true" "$(_sup_capacity_notify_machine_M2 "no-output" "true" "cooling")"
-# M3: key the gate on the TICK'S CLASS (the row's literal text) instead of the
-# seat's wall — the version that would not have stopped this page.
-_sup_capacity_notify_machine_M3() {
-  local class="${1:-}" quota_alerts_on="${2:-true}" wall_state="${3:-none}"
+
+# M1: a verdict that never compares the reset (the mutant the row named).
+# Substituted under `replay`, which is exactly what arm37-39 evaluate.
+M1=$( _sup_wall_verdict() { printf 'lapsed'; }; replay "$ALERT_AT" )
+reds "arm43: MUTANT 1 reds arm38" "cooling" "$(cut -d$'\x1f' -f1 <<<"$M1")"
+reds "arm44: MUTANT 1 reds arm39 — the page comes back" \
+     "false" "$(_sup_capacity_notify_machine "no-output" "true" "$(cut -d$'\x1f' -f1 <<<"$M1")")"
+
+# M2: gate the HUMAN leg only — what a reading of the row that missed which leg
+# actually fired produces. Re-run through arm20's own expression.
+M2=$( _sup_capacity_notify_machine() {
+        local class="${1:-}" on="${2:-true}"
+        [[ "$class" == "quota-exhausted" ]] && { printf '%s' "$on"; return; }
+        printf 'true'
+      }
+      _sup_capacity_notify_machine "no-output" "true" "cooling" )
+reds "arm45: MUTANT 2 — a human-leg-only gate reds arm20 (the incident)" "false" "$M2"
+
+# M3: key the gate on the TICK'S CLASS (the row's literal text) rather than the
+# seat's wall. Re-run through arm20 and arm39.
+M3f() {
+  local class="${1:-}" on="${2:-true}" wall_state="${3:-none}"
   [[ "$class" == "quota-exhausted" && "$wall_state" == "cooling" ]] && { printf 'false'; return; }
-  [[ "$class" == "quota-exhausted" ]] && { printf '%s' "$quota_alerts_on"; return; }
+  [[ "$class" == "quota-exhausted" ]] && { printf '%s' "$on"; return; }
   printf 'true'
 }
-ok "arm45: MUTANT 3 — keying on the tick's class lets the no-output page through" \
-   "true" "$(_sup_capacity_notify_machine_M3 "no-output" "true" "cooling")"
+reds "arm46: MUTANT 3 — keying on the tick's class reds arm20" \
+     "false" "$(M3f "no-output" "true" "cooling")"
+reds "arm47: ...and reds arm39 with it" \
+     "false" "$(M3f "no-output" "true" "$(cut -d$'\x1f' -f1 <<<"$R")")"
+# The control for `reds` itself: the UNMUTATED function must NOT red arm20, or
+# `reds` would pass on anything at all.
+ok "arm48: CONTROL — the real function still answers arm20's expected value" \
+   "false" "$(_sup_capacity_notify_machine "no-output" "true" "cooling")"
+
+# ── H. THE SECOND REQUIREMENT — the drought needs BOTH terms ────────────────
+# The 07:40Z addendum, as a pure predicate. _SUP_T_NO_OUTPUT_DAYS=3,
+# _SUP_T_NO_OUTPUT_IDLE_MIN=1440 (a day) on stock settings.
+ok "arm49: THE CODEX PAGE — one open row picked up 5 minutes ago is not a drought" \
+   "false" "$(_sup_output_drought 1 3 5)"
+ok "arm50: ...and the same seat's row after 2 days with no start since IS one" \
+   "true" "$(_sup_output_drought 1 3 2880)"
+ok "arm51: an unmeasured queue clock leaves DIVE-3272 exactly as it shipped" \
+   "true" "$(_sup_output_drought 1 3 -1)"
+ok "arm52: no open rows is never a drought, whatever the clocks say" \
+   "false" "$(_sup_output_drought 0 9 9999)"
+ok "arm53: a recent close is never a drought, however stale the queue" \
+   "false" "$(_sup_output_drought 3 0 9999)"
+ok "arm54: a seat that has NEVER closed anything stays unknown, not dry" \
+   "false" "$(_sup_output_drought 3 -1 9999)"
+ok "arm55: the idle window's own edge — one minute short is still quiet" \
+   "false" "$(_sup_output_drought 1 3 1439)"
+ok "arm56: ...and exactly at the window it pages" \
+   "true" "$(_sup_output_drought 1 3 1440)"
+ok "arm57: garbage in the queue clock reads UNKNOWN, never fresh" \
+   "true" "$(_sup_output_drought 1 3 "soon")"
+# M4: the mutant the row asked for — drop the new comparison. Re-run arm49.
+M4f() {  # the pre-4666 conjunction, verbatim
+  local open="${1:-0}" days="${2:--1}"
+  (( open > 0 )) && (( days >= 0 )) && (( days >= _SUP_T_NO_OUTPUT_DAYS )) \
+    && { printf 'true'; return; }
+  printf 'false'
+}
+reds "arm58: MUTANT 4 — dropping the movement comparison reds arm49" \
+     "false" "$(M4f 1 3 5)"
+ok "arm59: ...and MUTANT 4 agrees with the real predicate everywhere else (arm50)" \
+   "true" "$(M4f 1 3 2880)"
+# The phrase the page quotes.
+ok "arm60: minutes stay minutes" "5m"  "$(_sup_ago_phrase 5)"
+ok "arm61: an hour reads as hours"  "2h"  "$(_sup_ago_phrase 120)"
+ok "arm62: two days read as days"   "2d"  "$(_sup_ago_phrase 2880)"
+ok "arm63: an unmeasured age renders nothing at all" "" "$(_sup_ago_phrase -1)"
+
+# ── I. THE CODEX PAGE, END TO END, THROUGH THE REAL RECORD PATH ─────────────
+# Only the store read is stubbed; every other signal is the real function
+# answering on a clean pane. NOW is the second the codex page was sent.
+CODEX_AT=1789890000   # 2026-09-20 07:40:00Z
+rec() {  # <ostats>  -> the agent record JSON
+  local stats="$1"
+  (
+    systemctl() { printf 'ActiveState=active\nSubState=running\nActiveEnterTimestamp=n/a\n'; }
+    db() { echo 0; }
+    _sup_quota_pane_capture() { printf '%s\n' 'nothing interesting on this pane at all'; }
+    _sup_verify_challenge() { :; }
+    _sup_prompt_pane() { :; }
+    sudo() { return 0; }
+    _sup_activity_epoch() { :; }
+    _sup_goal_drift() { :; }
+    _sup_output_stats() { printf '%s\n' "$stats"; }
+    _sup_agent_record codex claude "" agent-codex.service agent-codex codex /home/agent-codex "$CODEX_AT" running
+  )
+}
+C1=$(rec "1|3|5")
+ok "arm64: THE 07:40Z PAGE — a seat whose only open row is 5 minutes old does not classify no-output" \
+   "healthy" "$(jq -r '.classification' <<<"$C1")"
+C2=$(rec "1|3|2880")
+ok "arm65: ...and the same row after 2 days with no start/deliver since still does" \
+   "no-output" "$(jq -r '.classification' <<<"$C2")"
+has "arm66: ...and the page now says WHY, in a duration a person reads" \
+    "nothing picked up in 2d" "$(jq -r '.detail' <<<"$C2")"
+ok  "arm67: the queue clock is recorded on the audited row, not just consumed" \
+    "2880" "$(jq -r '.signals.minsSinceQueueMoved' <<<"$C2")"
+# A 2-field stats string is the pre-4666 shape: unknown movement, unchanged verdict.
+C3=$(rec "1|3")
+ok "arm68: a pre-4666 two-field store read still classifies exactly as it did" \
+   "no-output" "$(jq -r '.classification' <<<"$C3")"
+ok "arm69: ...with a byte-identical detail line" \
+   "1 open row(s), nothing closed in 3d" "$(jq -r '.detail' <<<"$C3")"
+
+# ── I2. SURFACE PARITY — `agent info` must not go on calling it dry ─────────
+INFO_FRESH=$(_sup_info_status true "$CODEX_AT" "$CODEX_AT" "$CODEX_AT" healthy "" "" 1 3 true "" 5)
+ok  "arm70: the drill-down a person opens after a page agrees with the tick" \
+    "true" "$(jq -r '.transacting' <<<"$INFO_FRESH")"
+has "arm71: ...and says which fact refutes the drought" \
+    "picked up 5m ago" "$(jq -r '.note' <<<"$INFO_FRESH")"
+INFO_DRY=$(_sup_info_status true "$CODEX_AT" "$CODEX_AT" "$CODEX_AT" no-output no-output "" 1 3 true "" 2880)
+ok  "arm72: a real drought still reads dry there" \
+    "false" "$(jq -r '.transacting' <<<"$INFO_DRY")"
+INFO_LEGACY=$(_sup_info_status true "$CODEX_AT" "$CODEX_AT" "$CODEX_AT" no-output no-output "" 1 3 true "")
+ok  "arm73: an 11-arg call is byte-identical to pre-4666" \
+    "$(jq -r '.note' <<<"$INFO_LEGACY")" "1 open row(s), nothing closed in 3d"
+
+# ── J. THE STORE READ ITSELF — the real SQL, on a scratch sqlite file ───────
+# quinn's it.1 third finding was that the I/O half of this row had zero arms.
+# This is the half THIS iteration adds, so it gets one: the real
+# `_sup_output_stats` text, run by sqlite3 against a throwaway store.
+SCRATCH=$(mktemp -d); trap 'rm -rf "$SCRATCH"' EXIT
+STORE="$SCRATCH/tasks.db"
+sqlite3 "$STORE" "CREATE TABLE tasks (id INTEGER PRIMARY KEY, assignee TEXT, status TEXT,
+  kind TEXT DEFAULT 'standard', created_at TEXT, started_at TEXT, first_started_at TEXT, done_at TEXT);"
+stats() {  # <seat>
+  ( db() { sqlite3 "$STORE" "$1"; }; _sup_output_stats "$1" )
+}
+ins() {  # <assignee> <status> <created> <started> <first_started> <done>
+  sqlite3 "$STORE" "INSERT INTO tasks(assignee,status,kind,created_at,started_at,first_started_at,done_at)
+    VALUES ('$1','$2','standard',datetime('now','$3'),
+            $([[ "$4" == "-" ]] && echo NULL || echo "datetime('now','$4')"),
+            $([[ "$5" == "-" ]] && echo NULL || echo "datetime('now','$5')"),
+            $([[ "$6" == "-" ]] && echo NULL || echo "datetime('now','$6')"));"
+}
+# codex at 07:40Z: one open row created 9 minutes ago, first started 6 ago; the
+# last close was 3 days back.
+ins codex in_progress '-9 minutes' '-6 minutes' '-6 minutes' -
+ins codex done '-40 days' '-40 days' '-40 days' '-3 days'
+CX=$(stats codex)
+ok "arm74: THE REAL READ — three fields, not two" "3" "$(awk -F'|' '{print NF}' <<<"$CX")"
+ok "arm75: ...one open row"        "1" "$(cut -d'|' -f1 <<<"$CX")"
+ok "arm76: ...a 3-day close drought" "3" "$(cut -d'|' -f2 <<<"$CX")"
+ok "arm77: ...and a queue that moved 6 minutes ago" "6" "$(cut -d'|' -f3 <<<"$CX")"
+ok "arm78: ...so the real store read, fed to the real predicate, withholds the page" \
+   "false" "$(_sup_output_drought $(tr '|' ' ' <<<"$CX"))"
+# A RE-DISPATCH must not launder a dark seat: started_at is re-stamped by every
+# _hb_claim_task out of todo, first_started_at is not. This is why the COALESCE
+# reads first_started_at FIRST, and the arm is the proof.
+ins dark todo '-4 days' '-2 minutes' '-4 days' -
+ins dark done '-40 days' '-40 days' '-40 days' '-5 days'
+DK=$(stats dark)
+ok "arm79: a row re-claimed 2 minutes ago still reads its FIRST start, 4 days back" \
+   "5760" "$(cut -d'|' -f3 <<<"$DK")"
+ok "arm80: ...so DIVE-3272's dark seat still pages through a re-dispatch storm" \
+   "true" "$(_sup_output_drought $(tr '|' ' ' <<<"$DK"))"
+# A row that landed and was never claimed falls back to created_at, not to -1.
+ins fresh todo '-5 minutes' - - -
+ins fresh done '-40 days' '-40 days' '-40 days' '-3 days'
+FR=$(stats fresh)
+ok "arm81: an unclaimed row 5 minutes old measures 5 minutes, not 'unknown'" \
+   "5" "$(cut -d'|' -f3 <<<"$FR")"
+ok "arm82: ...and a row that just landed is not evidence of darkness" \
+   "false" "$(_sup_output_drought $(tr '|' ' ' <<<"$FR"))"
+# A seat with nothing open: the queue clock is genuinely unknown, and says so.
+NB=$(stats nobody)
+ok "arm83: a seat with no open rows reports an unknown queue clock, never 0" \
+   "0|-1|-1" "$NB"
 
 echo "known-cooldown unit: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))
