@@ -7114,19 +7114,31 @@ _hb_memory_consolidate_sweep() {
     # DIVE-3711 defect itself: a success counter must be able to produce the
     # negative for the thing it names, and this one could not.
     #
-    # The child sources the seat's OWN auth env first. `sudo -H` resets the
-    # environment, so CLAUDE_CODE_OAUTH_TOKEN — which is how these seats are
+    # The child re-creates the unit's OWN credential environment. `sudo -H` resets
+    # the environment, so CLAUDE_CODE_OAUTH_TOKEN — which is how these seats are
     # authenticated; they hold no on-disk credential under their own HOME — never
     # reached the distiller, and every call came back "Not logged in · Please run
-    # /login". Sourced INSIDE the child (the file is group-readable by the seat)
-    # rather than passed as an argument, which would put the token in `ps`.
+    # /login". Sourced INSIDE the child (both files are group-readable by the
+    # seat) rather than passed as arguments, which would put the token in `ps`.
+    #
+    # DIVE-4648: it must replay the unit's EnvironmentFile ORDER, not just the
+    # profile overlay. A seat with NO auth profile bound has no
+    # `<name>-auth.env` at all — it is authed by the SHARED connector, exactly as
+    # `systemd/5dive-agent@.service` loads it (shared anthropic.env first, then
+    # the `%i`-auth overlay last) and as `5dive-agent-start` replays it before
+    # first launch. Sourcing only the overlay meant `[ -r ]` silently skipped a
+    # file that was never going to exist, and every unbound seat's distiller ran
+    # with no credential at all — memory consolidation lost with no signal, and
+    # doctor pointing the operator at a credential `auth status --probe` reports
+    # healthy. Shared FIRST, profile LAST so a profiled seat still wins.
+    local sharedenv="${CONNECTORS_DIR:-/etc/5dive/connectors}/anthropic.env"
     local authenv="${ENV_DIR:-${STATE_DIR:-/var/lib/5dive}/agents.d}/${name}-auth.env"
     local out=""
     # One line, deliberately: a multi-line -c payload carries newlines into every
     # log, `ps` line and test recorder that echoes the argv back.
     out=$(timeout "${_HB_CONSOLIDATE_TIMEOUT_S}" sudo -n -u "$user" -H bash -c \
-         'set -a; [ -r "$1" ] && . "$1"; set +a; exec "$2" memory consolidate --max-sessions=1 --json' \
-         _ "$authenv" "${SELF_BIN:-/usr/local/bin/5dive}" 2>/dev/null) || out="${out:-}"
+         'set -a; [ -r "$1" ] && . "$1"; [ -r "$2" ] && . "$2"; set +a; exec "$3" memory consolidate --max-sessions=1 --json' \
+         _ "$sharedenv" "$authenv" "${SELF_BIN:-/usr/local/bin/5dive}" 2>/dev/null) || out="${out:-}"
     local n_atoms n_proc n_dfail
     # `--slurp` and take the FIRST object that carries the field, because the
     # stream can hold TWO envelopes: on a non-zero exit the CLI's EXIT-trap
