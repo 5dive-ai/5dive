@@ -2074,6 +2074,49 @@ cmd_doctor() {
     # DIVE-4522: and the other plugin question a box can get wrong — a plugin
     # enabled here that no seat can see.
     doctor_check_plugin_seat_registration
+
+    # DIVE-4697: the plugin path that arrives from OUTSIDE the box. Claude Code
+    # 2.1.275 syncs the skills and plugins enabled on the claude.ai ACCOUNT into
+    # every session signed in with it, and our auth profiles are shared across
+    # seats and boxes — so a toggle in one web UI lands code in every seat on
+    # the profile. This check asks the only question that has a proven answer:
+    # is the opt-out written where Claude reads it?
+    #
+    # It sits in `plugins` and NOT in `channels` on purpose. The file is the
+    # same, but allowedChannelPlugins gates a synced plugin's CHANNEL only
+    # (measured in the 2.1.278 binary) — its skills, commands, hooks, agents and
+    # MCP servers load regardless. So the channels category cannot answer this,
+    # and an operator asking "what plugin code can reach this box?" runs
+    # --category=plugins. WARN, not error: a box missing the keys is exposed to
+    # a toggle nobody has flipped, which is a gap to close, not an outage.
+    local _sync_ms=/etc/claude-code/managed-settings.json
+    if [[ ! -f "$_sync_ms" ]]; then
+      doctor_add plugins claudeai-sync warn \
+        "$_sync_ms missing — claude.ai account sync of skills/plugins is NOT opted out (DIVE-4697); rerun install.sh" false false
+    elif managed_settings_sync_off_ok "$_sync_ms"; then
+      doctor_add plugins claudeai-sync ok \
+        "claude.ai account sync opted out in $_sync_ms (syncClaudeAiSkills + syncClaudeAiPlugins = false)"
+    else
+      local _sync_gap=""
+      _sync_gap=$(managed_settings_sync_missing "$_sync_ms") || _sync_gap=""
+      [[ -n "$_sync_gap" ]] || _sync_gap="syncClaudeAiSkills, syncClaudeAiPlugins"
+      if (( DOCTOR_REPAIR )); then
+        # Same fixer as the channels check — reconcile_managed_settings sets
+        # both keys from FIVEDIVE_MANAGED_SYNC_OFF_JSON. 0=changed, 3=already
+        # current (unreachable from this branch, but it is the helper's
+        # contract), 1=cannot reconcile.
+        reconcile_managed_settings "$_sync_ms"
+        case $? in
+          0|3) doctor_add plugins claudeai-sync warn \
+                 "claude.ai account sync was not opted out ($_sync_gap) — written to $_sync_ms in place (DIVE-4697)" true true ;;
+          *)   doctor_add plugins claudeai-sync error \
+                 "claude.ai account sync not opted out ($_sync_gap) and $_sync_ms could not be reconciled (no jq, or the file is not valid JSON) — fix it by hand: skills and plugins enabled on the shared claude.ai account load in every seat here (DIVE-4697)" false false ;;
+        esac
+      else
+        doctor_add plugins claudeai-sync warn \
+          "claude.ai account sync NOT opted out in $_sync_ms ($_sync_gap) — skills/plugins enabled on the shared claude.ai account load in every seat on this box; fix: sudo 5dive doctor --category=plugins --fix (DIVE-4697)" false false
+      fi
+    fi
   fi
 
   if (( run_memory )); then
