@@ -854,6 +854,23 @@ got=$(printf '%s' "$(mk5 20 "$FAR" 10 "$F5")" | { _pace_band "" "$NOW" >/dev/nul
 [[ "$got" == "2" ]] && ok_ "L11: the no-account path through a PIPE returns the band (2), not a pipe status" \
   || bad_ "L11: pipe safety" "expected 2, got ${got}"
 
+# L12 — THE DIFFERENTIAL, through the block that actually ships. Section D
+# graded the dispatch block on the weekly alone; these two arms drive the SAME
+# verbatim-extracted block with a document that carries a 5h field, so the
+# combiner is graded where it is really called and not only at the function.
+if declare -F probe_board >/dev/null 2>&1; then
+  got_5h=$(probe_board "$(mk5 20 "$FAR" 101 "$F5")")
+  [[ "$got_5h" == "DIVE-1 " ]] \
+    && ok_ "L12: the shipping dispatch block holds everything but the urgent row on a 101% session window" \
+    || bad_ "L12: dispatch block, 5h hard" "expected 'DIVE-1 ', got '${got_5h}'"
+  got_5o=$(probe_board "$(mk5 20 "$FAR" 10 "$F5")")
+  [[ "$got_5o" == "DIVE-1 DIVE-2 DIVE-3 DIVE-4 " ]] \
+    && ok_ "L12: CONTROL — the same block with a healthy session window dispatches all four (the arm above is not vacuous)" \
+    || bad_ "L12: dispatch block, 5h open" "expected all four rows, got '${got_5o}'"
+else
+  bad_ "L12: the dispatch-block differential" "probe_board is not defined — section D's extraction failed, so this arm cannot run"
+fi
+
 # ── M: the mutants ─────────────────────────────────────────────────────────
 # Every L arm above is paired here with a mutation that reverts the fix, so a
 # green L section cannot be green vacuously.
