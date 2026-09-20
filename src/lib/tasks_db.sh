@@ -71,14 +71,38 @@ _TASKS_STORE_ENTRY="${_TASKS_STORE_ENTRY:-}"
 # readlink -f prints nothing when a path's PARENT does not exist, so an empty
 # result falls back to the literal path rather than comparing "" == "" and
 # fencing every caller (readlink's three unresolvable states — only one is empty).
+#
+# DIVE-4669 — MEMOISED ON ITS INPUTS, because this is a HARNESS-ONLY cost and it
+# was the corpus's largest single one. The fence short-circuits on the entrypoint
+# marker (line above), which `src/main.sh` sets as its first statement, so NO
+# production call ever reaches this function: everything it spends is spent by
+# sourced-library callers, i.e. by tests/*.sh, on every db() call they make.
+# Unmemoised it spawns `readlink -f` TWICE per statement (three times when
+# FIVEDIVE_FENCE_EXTRA_STORE is set) — measured on the control plane at 7.3ms of
+# the 9.5ms a db() call costs, against 2.2ms for the sqlite3 spawn the call
+# exists to make. The corpus is ~70k db() calls, so the resolution the fence
+# repeats is most of what the core tier's budget is spent on.
+#
+# THE MEMO DOES NOT WIDEN THE FENCE, and that is the property to hold: the key is
+# the full set of INPUTS the answer is a function of — the active store path and
+# the extra-store knob — so re-pointing TASKS_DB (the thing a harness actually
+# does between arms) re-resolves from scratch. What it does not see is a path
+# whose SYMLINK TARGET is re-pointed underneath an unchanged path string inside
+# one process; that is the residual, it has no caller in this repo, and
+# tests/tasks_store_fence_unit.sh (arms 6a/6b/6c) grades both halves.
 _tasks_store_is_prod() {
-  local active ra p rp
+  local active ra p rp key
   active="${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}"
+  key="$active|${FIVEDIVE_FENCE_EXTRA_STORE:-}"
+  if [[ "${_TASKS_FENCE_MEMO_KEY-}" == "$key" ]]; then
+    return "${_TASKS_FENCE_MEMO_RC:-1}"
+  fi
+  _TASKS_FENCE_MEMO_KEY="$key"; _TASKS_FENCE_MEMO_RC=1
   ra="$(readlink -f "$active" 2>/dev/null)"; [[ -n "$ra" ]] || ra="$active"
   for p in /var/lib/5dive/tasks/tasks.db "${FIVEDIVE_FENCE_EXTRA_STORE:-}"; do
     [[ -n "$p" ]] || continue
     rp="$(readlink -f "$p" 2>/dev/null)"; [[ -n "$rp" ]] || rp="$p"
-    [[ "$ra" == "$rp" ]] && return 0
+    [[ "$ra" == "$rp" ]] && { _TASKS_FENCE_MEMO_RC=0; return 0; }
   done
   return 1
 }
