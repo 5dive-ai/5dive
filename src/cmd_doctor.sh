@@ -529,6 +529,101 @@ doctor_check_plugin_seat_registration() {
     false false
 }
 
+# DIVE-4709 — a box-level plugin enable is not a seat-level READ.
+#
+# doctor already asks "is this plugin registered with every seat?"
+# (doctor_check_plugin_seat_registration, DIVE-4522). It does not ask the
+# question that killed two customer seats: can that seat READ the box's plugin
+# record at all? A seat that cannot has no working plugin VERB — not one — and
+# the CLI used to tell it so with "unknown command", which names the wrong
+# cause. Measured: `5dive-browser-probe@agent-mp` (box 10) failed 5/5 fires in
+# 24h and `@agent-claude-lab` (box 11) 2/2, while the plugin was enabled
+# box-wide and every other seat on those boxes probed fine. Nothing anywhere
+# surfaced it; the customer-visible connected-sites tile simply never updated,
+# and an empty tile reads as "nothing is connected".
+#
+# The check asserts the OUTCOME (this seat can read the record), not the
+# liveness of any unit — a probe unit that exits 0 having probed nothing is the
+# same lie one layer up.
+#
+# doctor_record_probe_as <user> <path> -> READ | BLOCKED | UNMEASURED
+#
+# Its own seam, so the unit suite grades the verdict logic without two real
+# accounts. UNMEASURED exists because of the projects-level rule this check
+# would otherwise walk straight into: a privilege drop that the sudoers policy
+# DENIES exits non-zero exactly like a real negative, so "BLOCKED" inferred
+# from a drop that never ran would report every seat on a hardened box as dead.
+# The positive control runs first and its failure is terminal for the arm.
+#
+# `runuser` before `sudo -u` for the reason _plugin_setup_runner gives: this
+# fleet narrows runas on purpose (DIVE-3263), and runuser consults no policy.
+doctor_record_probe_as() {
+  local user="$1" path="$2"; local -a drop
+  if command -v runuser >/dev/null 2>&1; then drop=(runuser -u "$user" --)
+  else drop=(sudo -n -u "$user" --); fi
+  "${drop[@]}" test -r /etc/passwd >/dev/null 2>&1 || { printf 'UNMEASURED\n'; return 0; }
+  if "${drop[@]}" test -r "$path" >/dev/null 2>&1; then printf 'READ\n'; else printf 'BLOCKED\n'; fi
+}
+
+# doctor_verb_claiming_plugins <record> — keys of enabled plugins that declare a
+# verb. The check is only interesting when something is actually reachable by
+# verb; with none, a blinded seat loses nothing yet and the row would be noise.
+doctor_verb_claiming_plugins() {
+  local rec="$1"
+  [[ -r "$rec" ]] || return 0
+  jq -r 'to_entries[]
+         | select(.value.enabled == true)
+         | select((.value.capabilities // []) | index("verb"))
+         | .key' "$rec" 2>/dev/null | tr '\n' ' ' | sed 's/ $//'
+}
+
+doctor_check_plugin_record_visibility() {
+  local rec; rec="$(_plugin_installed_json)"
+  if [[ ! -e "$rec" ]]; then
+    doctor_add plugins record-visibility ok \
+      "no box plugin record on this host — no seat can be blinded by one"
+    return 0
+  fi
+  local verbs; verbs=$(doctor_verb_claiming_plugins "$rec")
+  if [[ -z "$verbs" ]]; then
+    doctor_add plugins record-visibility ok \
+      "no enabled plugin declares a verb, so no seat depends on reading $rec yet"
+    return 0
+  fi
+
+  local name type seats=0
+  local -a blind=() unmeasured=()
+  while IFS=$'\t' read -r name type; do
+    [[ -n "$name" ]] || continue
+    seats=$((seats+1))
+    case "$(doctor_record_probe_as "agent-$name" "$rec")" in
+      READ)     ;;
+      BLOCKED)  blind+=("$name") ;;
+      *)        unmeasured+=("$name") ;;
+    esac
+  done < <(plugin_seat_graded_rows 2>/dev/null)
+
+  if (( seats == 0 )); then
+    doctor_add plugins record-visibility warn \
+      "UNKNOWN: no agent seat could be graded (none registered, or none with a home on this box) — nothing was measured, which is not the same as clean"
+    return 0
+  fi
+  if (( ${#blind[@]} )); then
+    doctor_add plugins record-visibility error \
+      "${#blind[@]} of $seats seat(s) cannot read $rec: ${blind[*]} — for those seats EVERY enabled plugin verb ($verbs) is unreachable, so any unit running one fails on every fire and whatever it feeds (a connected-sites tile, a status probe) silently never updates. Fix, as root, per seat: gpasswd -a agent-<seat> ${AGENT_SHARED_GROUP:-claude}; chmod 644 $rec; and make every directory above $rec traversable by that group. Reinstalling the plugin does NOT fix this — the plugin is already enabled box-wide" \
+      false false
+    return 0
+  fi
+  if (( ${#unmeasured[@]} )); then
+    doctor_add plugins record-visibility warn \
+      "UNKNOWN for ${#unmeasured[@]} of $seats seat(s) (${unmeasured[*]}): the privilege drop used to read $rec as that seat did not pass its own positive control, so those seats were not measured — a denied drop and a blinded seat look identical from here. Re-run as root on the box" \
+      false false
+    return 0
+  fi
+  doctor_add plugins record-visibility ok \
+    "all $seats graded seat(s) can read $rec, so every enabled plugin verb ($verbs) is reachable from each of them"
+}
+
 # doctor_mp_list <label> [item...]  — " label a, b", or "" when there are none.
 doctor_mp_list() {
   local label="$1"; shift
@@ -2074,6 +2169,9 @@ cmd_doctor() {
     # DIVE-4522: and the other plugin question a box can get wrong — a plugin
     # enabled here that no seat can see.
     doctor_check_plugin_seat_registration
+    # DIVE-4709: and the layer under it — a seat that cannot READ the record at
+    # all, whose every plugin verb therefore dies as "unknown command".
+    doctor_check_plugin_record_visibility
   fi
 
   if (( run_memory )); then
