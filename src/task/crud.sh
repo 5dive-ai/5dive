@@ -178,6 +178,10 @@ cmd_task_add() {
         [[ -n "$mutant_cmd" || -n "$mutant_waiver" ]] || fail "$E_USAGE" \
           "--review=check needs a NEGATIVE CONTROL: the command that breaks the check. Pass --mutant=\"<cmd>\" — it runs in a clean checkout at the delivered sha, and the check must then FAIL. Typical shapes: 'git apply -R <fix>.patch', 'sed -i s/new_guard/xx/ src/foo.sh', 'git checkout <base> -- src/'. A check nothing can take red grades every tree green (--verify=true is the limit case) and is not evidence. If this row's check genuinely cannot be inverted, say why: --no-mutant=\"<reason>\" (audited, recorded on the row) (DIVE-4623)"
         _rm_asked="check" ;;
+      rubric)
+        [[ -n "$no_verify" ]] && fail "$E_VALIDATION" "--review=rubric and --no-verify contradict each other — pass one (DIVE-4634)"
+        [[ -n "$verifier" ]]  && fail "$E_VALIDATION" "--review=rubric and --verifier=$verifier contradict each other — rubric uses the pool's fixed-question lane; pin a seat instead if you need that reviewer (DIVE-4634)"
+        review_demand="1"; _rm_asked="rubric" ;;
       temp)
         [[ -n "$no_verify" ]] && fail "$E_VALIDATION" "--review=temp and --no-verify contradict each other — pass one (DIVE-4324)"
         [[ -n "$verifier" ]]  && fail "$E_VALIDATION" "--review=temp and --verifier=$verifier contradict each other — 'temp' is the pool's fresh session, '$verifier' is a pinned seat (--review=$verifier) (DIVE-4324)"
@@ -202,7 +206,7 @@ cmd_task_add() {
         # A standing reviewer costs a session too, so the cap applies to it.
         verifier="$_rm_seat"; verifier_pinned=1; _rm_asked="seat:${_rm_seat}" ;;
       *)
-        fail "$E_VALIDATION" "bad --review value '$review_flag' — one of: none (no grader) | check (a command grades it, with --verify=<cmd>) | temp (one fresh pool session per delivery) | <seat> (a pinned standing reviewer) (DIVE-4324)" ;;
+        fail "$E_VALIDATION" "bad --review value '$review_flag' — one of: none | check | rubric | temp | <seat> (DIVE-4324/DIVE-4634)" ;;
     esac
   fi
   # DIVE-4623: the negative control, validated where the review mode was.
@@ -799,6 +803,10 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   (( _vp_grants == 1 || _vp_deferred == 1 )) && _rv_grants=1
   review_mode=$(_task_effective_review_mode "$no_verify" "$verify_cmd" "$verifier" \
                                             "$_rv_grants" "$verify_skipped" "$verifier_pinned" "$_vp_deferred")
+  # rubric spends a pool session like temp, so the existing resolver and box cap
+  # decide whether a session is affordable first. Only an actually granted temp
+  # lane is then labelled rubric; a verify=never cap remains `none`.
+  [[ "$_rm_asked" == "rubric" && "$review_mode" == "temp" ]] && review_mode="rubric"
   task_actor_claim "$from"
   local creator="${from:-$ACTOR_BOARD}"
   # RECORD BOTH, with the columns the right way round. `created_by` keeps its
@@ -1880,4 +1888,3 @@ cmd_task_verifier() {
      --arg pac "$cur_accept" --arg ch "$([[ "$new_accept" != "$cur_accept" ]] && echo 1 || echo 0)" \
      --arg m "$mid_handoff" --arg r "$repoint"
 }
-

@@ -159,7 +159,7 @@ _operator_ids() {
 preseed_claude_agent() {
   # DIVE-1883: the default pin resolves from src/lib/models.sh — the one place a
   # model release is recorded. An explicit $3 (DIVE-1103 BYO) still wins.
-  local name="$1" channels="$2" selected_model="${3:-$(resolve_model_alias opus)}"
+  local name="$1" channels="$2" selected_model="${3:-$(resolve_model_alias opus)}" selected_effort="${4:-high}"
   local user="agent-${name}" home="/home/agent-${name}"
   [[ -d "$home" ]] || fail "$E_GENERIC" "agent home missing: $home"
 
@@ -221,9 +221,9 @@ JSON
   # DIVE-1883: which id "opus" resolves to lives in src/lib/models.sh — never
   # re-inline a literal here.
   local settings
-  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" --arg model "$selected_model" '{
+  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" --arg model "$selected_model" --arg effort "$selected_effort" '{
     model: $model,
-    effortLevel: "high",
+    effortLevel: $effort,
     permissions: {
       defaultMode: "bypassPermissions",
       allow: ["Bash(5dive-transcribe:*)"]

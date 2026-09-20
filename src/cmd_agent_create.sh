@@ -2305,7 +2305,7 @@ cmd_create() {
   local name="" type="" channels="none" channels_explicit=0 telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
   local cos_owner_id=""
-  local byo_provider="" byo_api_key="" byo_model="" byo_base_url=""
+  local byo_provider="" byo_api_key="" byo_model="" byo_effort="" byo_base_url=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
   local isolation="" isolation_explicit=0 no_team_bot=0
   # DIVE-4269: a created seat is ENROLLED in the heartbeat by default. See the
@@ -2332,6 +2332,7 @@ cmd_create() {
       --provider=*)                byo_provider="${1#--provider=}" ;;
       --api-key=*)                 byo_api_key="${1#--api-key=}" ;;
       --model=*)                   byo_model="${1#--model=}" ;;
+      --effort=*)                  byo_effort="${1#--effort=}" ;;
       --base-url=*)                byo_base_url="${1#--base-url=}" ;;
       --with-skills=*)             skills_arg="${1#--with-skills=}"; skills_set=1 ;;
       --no-skills)                 no_skills=1 ;;
@@ -2348,10 +2349,14 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
+  if [[ -n "$byo_effort" ]]; then
+    [[ "$type" == "claude" ]] || fail "$E_VALIDATION" "--effort is supported only for claude agents"
+    case "$byo_effort" in low|medium|high|xhigh|max) ;; *) fail "$E_VALIDATION" "invalid --effort '$byo_effort' (allowed: low, medium, high, xhigh, max)" ;; esac
+  fi
   # DIVE-1221/1222: Grok provisioning is FROZEN. Grok Build CLI (xAI) has a
   # disclosed codebase-exfiltration issue with no client-side fix as of its
   # v0.2.98 changelog; xAI shipped only a revocable server-side mitigation. As a
@@ -2888,14 +2893,14 @@ cmd_create() {
   # run prompts are handled by their own CLIs.
   if [[ "$type" == "claude" ]]; then
     step "Preseeding claude config for agent-${name}"
-    # A create-time BYO --model is per-agent intent. The auth profile's
+    # A create-time --model is per-agent intent, whether the credential comes
+    # from --provider/--api-key or from an existing auth profile. The auth profile's
     # ANTHROPIC_DEFAULT_* variables translate Claude's tier aliases, but the
     # preseeded settings.json model is the actual startup selection and used to
     # be hard-pinned to claude-opus-4-8, overriding that intent. Pass the model
     # through so this agent starts on the requested OpenRouter/vendor slug.
-    local _claude_byo_model=""
-    [[ -n "$byo_provider" ]] && _claude_byo_model="$byo_model"
-    preseed_claude_agent "$name" "$channels" "$_claude_byo_model"
+    local _claude_create_model="$byo_model"
+    preseed_claude_agent "$name" "$channels" "$_claude_create_model" "${byo_effort:-high}"
   elif [[ "$type" == "antigravity" ]]; then
     # antigravity needs no claude-style ~/.claude preseed (agy reads its own
     # ~/.gemini state). The default-skill seed every other type gets isn't
