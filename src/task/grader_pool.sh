@@ -1828,6 +1828,51 @@ _pace_band_7d() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
          "$acct" "$seven" "$_PACE_FLOOR_7D_SOFT" "$src"; return 2
 }
 
+
+# `_pace_field_5h <account> <now>` — the SESSION-window percentage for an
+# account: the max over the account's seats, but reduced over READINGS and never
+# over FIELDS. EMPTY when no seat of the account carries a live one.
+#
+# WHY THIS IS NOT `_pace_field` TWICE (DIVE-4631, quinn's iteration-1 finding).
+# Every row of the usage document is built from THAT seat's own
+# `~/.claude/statusline-last.json` (`src/cmd_usage.sh`), which is rewritten only
+# when that seat runs. So a seat idle since it hit the wall carries a stale pct
+# AND the stale reset that belongs to it, while an active sibling carries a
+# current pair. Maxing the pct over all seats and then, separately, maxing the
+# reset over all seats picks the pct from one seat and the clock from ANOTHER:
+# the stale 101% is fenced against the fresh seat's reset, survives, and pins the
+# whole account at `hard` on a window that turned over an hour ago. That hold is
+# self-sustaining — the stale seat refreshes its cache only by RUNNING, which the
+# hold prevents for everything below urgent — which is exactly the freeze this
+# family keeps re-learning (DIVE-4430/4575/4586). A pct and its reset are ONE
+# reading: community/wiki/a-pct-and-its-reset-are-one-reading.md, and this is its
+# cross-seat instance.
+#
+# So: pair each seat's pct with ITS OWN `fiveHourResetsAt`, drop the pairs whose
+# window has already turned over, and take the max of whatever survives. The
+# fence is still `_grader_reading_expired` and nothing else — one place decides
+# what "expired" means, it accepts both epoch seconds and vendor date strings,
+# and an ABSENT or unparseable reset is NOT a passed one, so that reading is KEPT
+# and the floor stays armed (decision 3's edge, unchanged).
+_pace_field_5h() {  # <account> <now>  [<usage-json-on-stdin>]
+  local acct="${1:-}" now="${2:-0}" json best="" pct reset
+  json=$(cat)
+  [[ -n "$acct" && -n "$json" ]] || { printf ''; return 0; }
+  while IFS=$'\t' read -r pct reset; do
+    [[ -n "$pct" ]] || continue
+    pct="${pct%%.*}"
+    [[ "$pct" =~ ^[0-9]+$ ]] || continue
+    # `<seat>` is the reading's own clock, never a sibling's.
+    if _grader_reading_expired "${reset%%.*}" "$now"; then continue; fi
+    if [[ -z "$best" ]] || (( pct > best )); then best="$pct"; fi
+  done < <(printf '%s' "$json" | jq -r --arg a "$acct" '
+    (.data // .)
+    | .. | objects | select(.account? == $a)
+    | select(.fiveHourPct | numbers)
+    | [ (.fiveHourPct | tostring), ((.fiveHourResetsAt // "") | tostring) ] | @tsv
+  ' 2>/dev/null || printf '')
+  printf '%s' "$best"
+}
 # `_pace_band_5h <account> [<now-epoch>]` — how hard is the SESSION-window floor?
 #
 # Same two channels as every band function here: verdict on stdout, decision in
@@ -1855,7 +1900,10 @@ _pace_band_7d() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
 #    here: a 5h window turns over five times a day, so a stale high reading is
 #    the common case rather than the exotic one. An ABSENT or unparseable reset
 #    is not a passed one — `_grader_reading_expired` keeps that reading, and the
-#    floor stays armed, because the unmeasured case never buys dispatch.
+#    floor stays armed, because the unmeasured case never buys dispatch. The
+#    fence is applied PER READING, inside `_pace_field_5h`, against that seat's
+#    own reset — see the long note there for why an account-level fence is
+#    unsound the moment the account has more than one seat.
 #
 # 4. NO NEAR-RESET RELAXATION. The weekly relaxes inside `_PACE_RESET_DAYS`
 #    because unspent headroom expires at the reset. That reasoning does not
@@ -1864,9 +1912,10 @@ _pace_band_7d() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
 #    reset is a reason to WAIT for a whole window, never to spend the stub of
 #    this one.
 #
-# The reading is `max` across the account's seats (`_pace_field`), which is the
-# fail-closed lower bound on a shared pool and the same reasoning DIVE-4586 uses
-# for the weekly. CONFIRMED before it was written, on the live document
+# The reading is `max` across the account's seats (`_pace_field_5h`), which is
+# the fail-closed lower bound on a shared pool and the same reasoning DIVE-4586
+# uses for the weekly — but the max is taken over live READINGS, not over the
+# pct field on its own. CONFIRMED before it was written, on the live document
 # 2026-09-19/20: every seat of `chemmonitor` reported 38/39/38% against ONE
 # `fiveHourResetsAt` (1789891800), and every seat of `mark` reported 0% against
 # one reset of its own — one window per ACCOUNT, sampled at slightly different
@@ -1874,7 +1923,7 @@ _pace_band_7d() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
 # right read is the seat's own, and the seat name is in hand at the dispatch
 # call site (`$name`); this function would then take it as an argument.
 _pace_band_5h() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
-  local acct="${1:-}" now="${2:-}" json five="" resets=""
+  local acct="${1:-}" now="${2:-}" json five="" raw=""
   [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
   # Read stdin FIRST and unconditionally, before any early return, so a caller
   # that pipes cannot be handed an EPIPE in place of a band.
@@ -1884,21 +1933,26 @@ _pace_band_5h() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
            "$( [[ -z "$acct" ]] && printf 'no account named' || printf 'no usage document' )"
     return 0
   fi
-  five=$(printf '%s' "$json" | _pace_field "$acct" fiveHourPct)
+  # ONE reduction, over READINGS: each seat's pct is fenced on that seat's own
+  # clock and the max is taken over the survivors. There is deliberately no
+  # post-hoc `_grader_reading_expired` here any more — a second, account-level
+  # fence could only ever be applied to a reset that had itself been maxed
+  # across seats, which is the unpairing this helper exists to prevent. The
+  # single-seat path is not special-cased either: with one seat the reduction
+  # degenerates to that seat's own pair, which is what the old post-hoc check
+  # was doing by accident rather than by construction.
+  five=$(printf '%s' "$json" | _pace_field_5h "$acct" "$now")
   if [[ -z "$five" ]]; then
-    printf 'pace/5h: %s has no session-window reading (null) — a blind 5h meter contributes NOTHING here; the weekly band is what holds a blind account (DIVE-4631 decision 2)\n' "$acct"
-    return 0
-  fi
-  five="${five%%.*}"
-  if ! [[ "$five" =~ ^[0-9]+$ ]]; then
-    printf 'pace/5h: %s session meter is unparseable (5h=%s) — contributing nothing; the weekly band stands alone\n' "$acct" "$five"
-    return 0
-  fi
-  resets=$(printf '%s' "$json" | _pace_field "$acct" fiveHourResetsAt)
-  resets="${resets%%.*}"
-  if _grader_reading_expired "$resets" "$now"; then
-    printf 'pace/5h: %s reads %s%% of a session window that has ALREADY reset (%s) — a percentage from a window that has since turned over is not a statement about the one we are pacing; dropped\n' \
-           "$acct" "$five" "$resets"
+    # Nothing survived. Say WHICH of the two silences it was, because they have
+    # different operator meanings: no meter at all, or every meter belonging to
+    # a window that has since turned over.
+    raw=$(printf '%s' "$json" | _pace_field "$acct" fiveHourPct)
+    if [[ -n "$raw" ]]; then
+      printf 'pace/5h: %s reads %s%% of a session window that has ALREADY reset — a percentage from a window that has since turned over is not a statement about the one we are pacing; dropped (every seat carrying a reading was fenced on its OWN fiveHourResetsAt)\n' \
+             "$acct" "${raw%%.*}"
+      return 0
+    fi
+    printf 'pace/5h: %s has no session-window reading (null or unparseable) — a blind 5h meter contributes NOTHING here; the weekly band is what holds a blind account (DIVE-4631 decision 2)\n' "$acct"
     return 0
   fi
   if (( five >= _PACE_FLOOR_5H )); then
@@ -1909,7 +1963,6 @@ _pace_band_5h() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   printf 'pace/5h: %s at 5h=%s%% (floor %s%%) — no hold\n' "$acct" "$five" "$_PACE_FLOOR_5H"
   return 0
 }
-
 # `_pace_rank <band-rc>` — how TIGHT is this band, as an orderable number. The
 # exit codes are not ordered (1 is the tightest and sorts lowest), so the
 # combiner cannot compare them directly. An unknown code ranks tightest: a band

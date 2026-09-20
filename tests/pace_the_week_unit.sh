@@ -838,6 +838,38 @@ got=$(printf '{"agents":[{"account":"acct","sevenDayPct":20,"sevenDayResetsAt":%
 [[ "$got" == "3" ]] && ok_ "L9: max across the account's seats — one seat at 101% answers for the pool" \
   || bad_ "L9: max across seats" "expected 3, got ${got}"
 
+# L13 — TWO SEATS OF ONE ACCOUNT THAT DISAGREE ABOUT THE CLOCK (quinn's
+# iteration-1 finding). Every row of the usage document comes from that SEAT's
+# own statusline cache, rewritten only when the seat runs, so a seat idle since
+# it hit the wall carries a stale pct AND the stale reset that belongs to it
+# while a busy sibling carries a current pair. L4 (expired -> dropped) is
+# single-seat and L9 gives both seats the SAME reset, so neither of them can see
+# a per-FIELD max pick the pct from one seat and the clock from the other. This
+# arm is the one that does: the over-floor seat's window turned over an hour
+# ago, the under-floor seat's is live, and the account must NOT be held.
+mk5_two(){ # <5h-a> <5hr-a> <5h-b> <5hr-b>  — one account, two seats, healthy week
+  printf '{"agents":[{"name":"stale","account":"acct","sevenDayPct":20,"sevenDayResetsAt":%s,"fiveHourPct":%s,"fiveHourResetsAt":%s},{"name":"fresh","account":"acct","sevenDayPct":20,"sevenDayResetsAt":%s,"fiveHourPct":%s,"fiveHourResetsAt":%s}]}' \
+         "$FAR" "$1" "$2" "$FAR" "$3" "$4"
+}
+band_two(){ local rc=0; printf '%s' "$(mk5_two "$@")" | _pace_band acct "$NOW" >/dev/null || rc=$?; printf '%s' "$rc"; }
+got=$(band_two 101 "$F5_PAST" 5 "$F5")
+[[ "$got" == "0" ]] \
+  && ok_ "L13: a stale 101% whose OWN window has reset, beside a live 5%, does not hold the account" \
+  || bad_ "L13: cross-seat clock pairing" "expected 0, got ${got} — the pct and the reset were maxed independently"
+# ...and the same document with the stale seat's window still LIVE must hold, or
+# the arm above would pass simply because two seats never hold anything.
+got=$(band_two 101 "$F5" 5 "$F5")
+[[ "$got" == "3" ]] \
+  && ok_ "L13: CONTROL — the same two seats with the 101% window still live DO hold (L13 is not vacuous)" \
+  || bad_ "L13: cross-seat control" "expected 3, got ${got}"
+# The mirror: the OVER-floor seat is the fresh one and the stale sibling is
+# under the floor. The survivor is 101%, so the hold stands — a per-reading
+# fence must not throw away a live reading just because a sibling is stale.
+got=$(band_two 5 "$F5_PAST" 101 "$F5")
+[[ "$got" == "3" ]] \
+  && ok_ "L13: a live 101% beside a stale 5% still holds (the fence drops readings, not accounts)" \
+  || bad_ "L13: mirror" "expected 3, got ${got}"
+
 # L10 — the operator reading a hold needs the exit for the band that caused it.
 v=$(say5 20 "$FAR" 101 "$F5")
 [[ "$v" == *"5-hour session window"* && "$v" == *"weekly:"* ]] \
@@ -901,13 +933,29 @@ if mutant 's|^    printf .pace/5h: %s has no session-window reading.*|    printf
     && ok_ "M2: REVERTED — a null 5h now holds a healthy seat, which is the fleet-wide freeze L3 forbids" \
     || bad_ "M2: the mutant did not flip the arm" "L3 is not grading the blind branch"
 else bad_ "M2: the mutation took" "the sed matched nothing — this mutant is vacuous"; fi
-# M3 — decision 3 reverted: the expired-window fence removed.
-if mutant 's|^  if _grader_reading_expired "$resets" "$now"; then|  if false; then|'; then
+# M3 — decision 3 reverted: the per-reading expired-window fence removed.
+if mutant 's|^    if _grader_reading_expired "${reset%%.\*}" "$now"; then continue; fi|    if false; then continue; fi|'; then
   ok_ "M3: the mutation took (the expired-window fence is gone)"
   [[ "$(mband 20 "$FAR" 101 "$F5_PAST")" == "3" ]] \
     && ok_ "M3: REVERTED — a reading from a window that already reset holds again" \
     || bad_ "M3: the mutant did not flip the arm" "L4 is not grading the reset fence"
 else bad_ "M3: the mutation took" "the sed matched nothing — this mutant is vacuous"; fi
+# M3b — the PRE-FIX reduction restored verbatim: max the pct over the seats, max
+# the reset over the seats separately, then fence the one against the other.
+# This is the shape that shipped at 319f9074 and that quinn rejected. It leaves
+# L4 GREEN — which is the whole point, and is asserted below, because it is what
+# makes L13 and not L4 the arm that catches this.
+if mutant 's#^  five=$(printf .%s. "$json" | _pace_field_5h "$acct" "$now")#  five=$(printf "%s" "$json" | _pace_field "$acct" fiveHourPct); _mr=$(printf "%s" "$json" | _pace_field "$acct" fiveHourResetsAt); if _grader_reading_expired "${_mr%%.*}" "$now"; then five=""; fi#'; then
+  ok_ "M3b: the mutation took (the pct and the reset are maxed independently again)"
+  mband_two(){ ( source "$MUT"
+      rc=0; printf '%s' "$(mk5_two "$@")" | _pace_band acct "$NOW" >/dev/null || rc=$?; printf '%s' "$rc" ); }
+  [[ "$(mband_two 101 "$F5_PAST" 5 "$F5")" == "3" ]] \
+    && ok_ "M3b: REVERTED — the stale 101% is fenced against the SIBLING's live clock and pins the account at hard" \
+    || bad_ "M3b: the mutant did not flip the arm" "L13 is not grading the pct/reset pairing"
+  [[ "$(mband 20 "$FAR" 101 "$F5_PAST")" == "0" ]] \
+    && ok_ "M3b: the single-seat arm L4 stays GREEN against this mutant — L13 is what catches it" \
+    || bad_ "M3b: L4 under the mutant" "expected 0; this mutant is not the pre-fix shape"
+else bad_ "M3b: the mutation took" "the sed matched nothing — this mutant is vacuous"; fi
 # M4 — the ranking reverted: the LOOSER band wins the combine.
 if mutant 's|^  if (( $(_pace_rank "$rc5") > $(_pace_rank "$rc7") )); then|  if false; then|'; then
   ok_ "M4: the mutation took (the 5h band can no longer win the combine)"
