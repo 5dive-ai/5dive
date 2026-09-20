@@ -52,16 +52,16 @@ fi
 
 printf '%s\n' \
   '--- ACCEPTANCE ---' \
-  'Scope: src/task grading and delivery, src/lib task schema/policy, agent-create model configuration, their focused tests, help, and changelog.' \
+  'Scope: src/task grading and delivery, src/lib task schema/policy, agent-create model configuration, their focused tests, help, changelog, and the stage-2 cost-measurement generator with its fixture under scripts/ and tests/fixtures/.' \
   'Bound the grading prompt to acceptance, claim, diff, and named checks; omit narrative/transcript. Grade from an immutable exact-sha clean tree. Add a low-cost six-question rubric; reject or escalate on a flag, blast path, or --verify.' \
   '--- DELIVERY CLAIM ---' \
-  'CHANGED: delivery.sh bounded grade-context and sealed detached worktrees; grader_process.sh six-question rubric plus Sonnet/low-effort pin; crud.sh/dispatch.sh expose rubric; tasks_db.sh records repo+sha; tests cover boundaries/refusals.'
+  'CHANGED: delivery.sh bounded grade-context and sealed detached worktrees; grader_process.sh six-question rubric plus Sonnet/low-effort pin; crud.sh/dispatch.sh expose rubric; tasks_db.sh records repo+sha; tests cover boundaries/refusals; scripts/dive4634-grade-cost-prompt.sh and tests/fixtures/dive4634-legacy-narrative.txt are the stage-2 cost-measurement generator and its legacy-narrative fixture.'
 
 case "$mode" in
   reject-checked)
     printf '%s\n' 'CHECKED: grade-context 15/0; build PASS. RAW CHECK OUTPUT: grade-context FAIL=1 and build exited 2.' ;;
   *)
-    printf '%s\n' 'CHECKED: grade-context 15/0; review-mode 49/0; db-restore 56/0; delivery-evidence 53/0; mutant-arm 37/0; subverb-help 25/0; lazy-dispatch 42/0; build PASS.' ;;
+    printf '%s\n' 'CHECKED: grade-context 15/0 at head and 4 pass / 17 fail with the same harness checked out onto bare origin/main (negative control: the arms go red without this diff); review-mode 49/0; db-restore 56/0; delivery-evidence 53/0; mutant-arm 37/0; subverb-help 25/0; lazy-dispatch 42/0; build PASS.' ;;
 esac
 
 printf '%s\n' \
