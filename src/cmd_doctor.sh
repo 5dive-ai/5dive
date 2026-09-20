@@ -1156,7 +1156,7 @@ doctor_check_consolidate_transacting() {
     local _notx_gh=""
     (( _notx_ghost > 0 )) && _notx_gh=" (${_notx_ghost} stale counter(s) for seat(s) the registry no longer knows were ignored; the scheduler reaps them on its next sweep)"
     if [[ -n "$_notx_bad" ]]; then
-      doctor_add memory consolidate error "NOT TRANSACTING — the distiller has been refused by the API on every consecutive pass for: ${_notx_bad}. Their memory has not consolidated since. Retrying will not clear it: restore the seat's auth or raise the account limit.${_notx_gh}"
+      doctor_add memory consolidate error "NOT TRANSACTING — the distiller has been refused by the API on every consecutive pass for: ${_notx_bad}. Their memory has not consolidated since. Retrying will not clear it. Check the credential first (\`5dive auth status --probe\`): if it reports HEALTHY the refusal is the ACCOUNT's limit, not the credential — raise the limit or move the seat to another auth profile. Only a probe that reports unhealthy means the seat's auth needs restoring.${_notx_gh}"
     elif (( _notx_watch > 0 )); then
       doctor_add memory consolidate warn "${_notx_watch} seat(s) had a distiller refused by the API on their last pass but are under the ${_notx_after}-pass threshold — transient limit or a rotating token; re-check if it persists${_notx_gh}"
     else

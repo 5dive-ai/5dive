@@ -69,6 +69,14 @@ _HB_CONSOLIDATE_EVERY_MIN=360
 _HB_CONSOLIDATE_TIMEOUT_S=300
 _HB_CONSOLIDATE_NOTX_AFTER=4
 STATE_DIR="$TMP/state"
+# DIVE-4648: the sweep now also sources the SHARED connector, so the harness has
+# to own that path. Pinning it into $TMP is not tidiness — left unset the sweep
+# falls back to /etc/5dive/connectors/anthropic.env, which on a real box EXISTS
+# and is group-readable by the user running the tests. Every arm below would
+# then be handed a live production token: the "no auth file" control would go
+# red for the right reason and the wrong one at once, and a real credential
+# would be written into $TOKEN_SEEN under /tmp.
+CONNECTORS_DIR="$TMP/connectors"
 SELF_BIN="$TMP/fake-5dive"
 CALLS="$TMP/calls.log"
 # The far end of the sudo payload. It records whether the seat's token actually
@@ -112,7 +120,7 @@ REG='{"agents":{"alice":{},"bob":{}}}'
 # Default: a healthy pass that actually produced something. Every arm that is
 # not about failure inherits this, so "green" means "the sweep saw atoms".
 _STUB_OK='{"ok":true,"data":{"atoms_written":2,"processed":1,"distiller_failed":0}}'
-reset() { rm -rf "$STATE_DIR" "$CALLS"; : > "$CALLS"; : > "$TOKEN_SEEN"; STUB_RC=0; STUB_OUT="$_STUB_OK"; unset MEMORY_CONSOLIDATE MEMORY_CONSOLIDATE_EVERY_MIN; }
+reset() { rm -rf "$STATE_DIR" "$CONNECTORS_DIR" "$CALLS"; : > "$CALLS"; : > "$TOKEN_SEEN"; STUB_RC=0; STUB_OUT="$_STUB_OK"; unset MEMORY_CONSOLIDATE MEMORY_CONSOLIDATE_EVERY_MIN; }
 STUB_OUT="$_STUB_OK"; STUB_RC=0
 export STUB_OUT STUB_RC   # spoken by $SELF_BIN, which is a real child process now
 ncalls() { wc -l < "$CALLS" | tr -d ' '; }
@@ -430,6 +438,69 @@ case "$(cat "$CALLS")" in
   *CLAUDE_CODE_OAUTH_TOKEN*) bad "the token is passed as an ARGUMENT — visible in ps to every user" ;;
   *) ok "and no secret is placed on the command line" ;;
 esac
+
+echo "== DIVE-4648: an UNBOUND seat is authed by the SHARED connector, not by a profile =="
+# The defect: a seat with no auth profile bound has NO `<name>-auth.env`, ever.
+# The old payload sourced only that file, `[ -r ]` silently skipped it, and the
+# distiller ran with no credential — "Not logged in" on every pass, memory
+# silently lost, and doctor blaming a credential that probes healthy.
+#
+# This is asserted on ARRIVAL for the same reason the arm above is: the argv
+# proves a path was passed, never that anything was read out of it. Neither seat
+# has a profile here, so BOTH have to come out of the payload holding the shared
+# token and NEITHER may report `<absent>`.
+reset
+SHARED_FIXTURE='not-a-real-shared-token-1234567890'
+mkdir -p "$CONNECTORS_DIR"
+printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$SHARED_FIXTURE" > "$CONNECTORS_DIR/anthropic.env"
+_hb_memory_consolidate_sweep "$NOW"
+check "both unbound seats reach the distiller holding the shared token" \
+  "$(grep -c -F -- "$SHARED_FIXTURE" "$TOKEN_SEEN")" "2"
+check "and neither unbound seat runs credential-less" \
+  "$(grep -c -F -- '<absent>' "$TOKEN_SEEN")" "0"
+# The OUTCOME, not just the environment: an unbound seat has to TRANSACT. With
+# the sourcing deleted the stub still answers, so this alone would not catch the
+# bug — it is here because the row's acceptance is about atoms, not about env.
+check "an unbound seat's pass transacts (atoms counted)" "$_HB_CONS_ATOMS" "4"
+check "and no unbound seat is filed as not-transacting"  "$_HB_CONS_UNAUTH" "0"
+grep -q 'anthropic.env' "$CALLS" \
+  && ok "the invocation carries the shared connector path" \
+  || bad "the invocation never references the shared connector — an unbound seat gets no credential"
+case "$(cat "$CALLS")" in
+  *"$SHARED_FIXTURE"*) bad "the shared token is passed as an ARGUMENT — visible in ps to every user" ;;
+  *) ok "and the shared token is not on the command line either" ;;
+esac
+
+echo "== DIVE-4648: the profile overlay still WINS over the shared connector =="
+# Order, not presence. `systemd/5dive-agent@.service` loads the shared
+# anthropic.env first and the `%i`-auth overlay LAST, and `5dive-agent-start`
+# replays that order before first launch; two same-type seats run against
+# different accounts only because the overlay is last. Sourcing the shared file
+# second would silently move every profiled seat back onto the shared account —
+# a billing-visible regression that the arm above cannot see.
+reset
+mkdir -p "$CONNECTORS_DIR" "$STATE_DIR/agents.d"
+printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$SHARED_FIXTURE" > "$CONNECTORS_DIR/anthropic.env"
+printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$AUTH_FIXTURE"   > "$STATE_DIR/agents.d/alice-auth.env"
+_hb_memory_consolidate_sweep "$NOW"
+check "the PROFILED seat keeps its own account (overlay sourced last)" \
+  "$(grep -c -F -- "$AUTH_FIXTURE" "$TOKEN_SEEN")" "1"
+check "CONTROL: the unbound seat on the same box still gets the shared token" \
+  "$(grep -c -F -- "$SHARED_FIXTURE" "$TOKEN_SEEN")" "1"
+
+echo "== DIVE-4648: a genuinely tokenless box still surfaces as FAILED =="
+# The fix must not paper over the real outage it resembles. No connector and no
+# profile is a box with no credential at all: the distiller has to run empty and
+# the refusal has to be COUNTED, or this change would have traded a silent loss
+# for a silent success.
+reset
+STUB_OUT='{"ok":true,"data":{"atoms_written":0,"processed":0,"distiller_failed":1,"distiller_unauthed":1}}'
+_hb_memory_consolidate_sweep "$NOW"
+check "no connector and no profile: both seats run credential-less" \
+  "$(grep -c -F -- '<absent>' "$TOKEN_SEEN")" "2"
+check "and both refusals are counted, not swallowed" "$_HB_CONS_UNAUTH" "2"
+check "the standing not-transacting counter is written for alice" \
+  "$(cat "$STATE_DIR/memory-consolidate/alice.notx" 2>/dev/null)" "1"
 
 echo "== the log line reports the ARTIFACT, not the attempt =="
 LOGLINE=$(grep -n 'memory-consolidate\]' "$SRC/cmd_heartbeat.sh" | grep _hb_log)
