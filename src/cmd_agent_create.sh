@@ -3081,6 +3081,16 @@ cmd_create() {
       + (if $bu == "" then {} else {botUsername: $bu} end)
     )' <<<"$reg" | registry_write
 
+  # DIVE-4589: a seat's FIRST binding is a binding event like any other. Without
+  # it the agent's whole history before its first rebind has no event at or
+  # before it, and every turn it ever ran reads as `current-binding-fallback` —
+  # true but needlessly weak, since creation is the one moment we know exactly.
+  # Emitted here, right after the registry entry exists and before the unit is
+  # enabled, so it still precedes the first token this seat can spend.
+  if [[ -n "$profile" ]] && declare -F account_binding_record >/dev/null 2>&1; then
+    account_binding_record "$name" "$profile" "create" || true
+  fi
+
   # users.sh creates /home/claude/.hermes at 2770, but `hermes auth add
   # openai-codex` (kicked off by `agent auth start hermes` before create)
   # tightens it back to 0700 when writing auth.json. The chmod 0775 in the

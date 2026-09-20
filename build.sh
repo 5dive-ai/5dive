@@ -97,6 +97,7 @@ CORE_FILES=(
   src/lib/agent_env.sh
   src/lib/verify_policy.sh
   src/lib/tasks_db.sh
+  src/lib/account_history.sh
   src/lib/runs.sh
   src/lib/actor.sh
   src/lib/routing_receipt.sh
@@ -127,6 +128,7 @@ LAZY_FILES=(
   src/cmd_doctor.sh
   src/cmd_host.sh
   src/cmd_watch.sh
+  src/cmd_wall.sh
   src/cmd_compose.sh
   src/cmd_whoami.sh
   src/cmd_box_config.sh

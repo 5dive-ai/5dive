@@ -134,7 +134,15 @@ grep -q "TERMINAL FOR THIS GOAL" <<<"$note" \
 # re-delivers, and strips the merge standing of the seat being woken — and since
 # the guard shipped it is refused outright. Naming the verb that is REFUSED, on
 # the branch a merge owner reads first, is the defect, not the wording of it.
-for want in "ALREADY MERGED" "task assign DIVE-9001 quinn" "task merge DIVE-9001" "task reject DIVE-9001"; do
+# DIVE-4654 SUPERSEDED THE HAND-OFF VERB IN BRANCH (1). It used to be
+# `task assign <ident> <verifier>`, which moves the row and leaves it in the
+# MERGING stage: the board goes on painting graded->merge, the picker goes on
+# excluding the seat the row was just handed to, and this same dispatch fires
+# again next tick (ops measured four dispatches on DIVE-4632, three no-ops).
+# `task merge-landed` records the landing, exits the stage AND hands the row to
+# the closing seat in one act, so branch (1) names it instead. The ARM is
+# unchanged in intent: the branch must name a verb that terminates the row.
+for want in "ALREADY MERGED" "task merge-landed DIVE-9001" "task merge DIVE-9001" "task reject DIVE-9001"; do
   grep -qF "$want" <<<"$note" \
     && ok_t "arm 5c: the note names '$want'" \
     || bad_t "arm 5c: the note must name '$want'" "got: $note"
@@ -152,7 +160,10 @@ grep -qF "task done" <<<"$note" \
 # --- Arm 5f: and the hand-off is named for the branch that needs it -----------
 # Branch (2) used to end in a bare "then close", which is the same instruction
 # one verb later. It must route through the same hand-off as (1).
-grep -qF "hand it on exactly as in (1)" <<<"$note" \
+# DIVE-4654: the phrase moved with the verb — branch (2) now says "record the
+# landing exactly as in (1)". Still the same property: (2) does not end in a bare
+# "then close", it routes through (1).
+grep -qF "record the landing exactly as in (1)" <<<"$note" \
   && ok_t "arm 5f: the merge branch hands off the same way instead of saying 'then close'" \
   || bad_t "arm 5f: branch (2) must route its termination through branch (1)" "got: $note"
 
@@ -200,7 +211,10 @@ note_t=$(_hb_loop_terminal_clause main2 "$T" "DIVE-9002")
 grep -q "MERGE IS YOURS" <<<"$note_t" \
   && ok_t "arm 9: the temp grader that owns the merge still gets the owner's note" \
   || bad_t "arm 9: the merge owner must be woken with the owner note" "got: ${note_t:-<empty>}"
-grep -qF "task assign DIVE-9002 quinn" <<<"$note_t" \
+# DIVE-4654: the hand-off is performed BY the verb now, so what the note must
+# still get right is WHICH SEAT it names — the row's verifier column (quinn),
+# never the woken grading seat (main2), whose own close would re-deliver.
+grep -qF "its verifier 'quinn'" <<<"$note_t" \
   && ok_t "arm 9b: ...and the hand-off names the row's VERIFIER (quinn), not the woken seat" \
   || bad_t "arm 9b: the hand-off must name the verifier column, not the grader" "got: $note_t"
 grep -qF "task assign DIVE-9002 main2" <<<"$note_t" \

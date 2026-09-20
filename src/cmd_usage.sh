@@ -34,7 +34,7 @@ usage_collect() {
   local since="$1" db
   db="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}"
   REGISTRY="$REGISTRY" TASK_DB="$db" USAGE_SINCE="$since" python3 - <<'PY'
-import os, sys, json, time, re, sqlite3, errno, datetime as dt   # no glob: DIVE-3419
+import os, sys, json, time, re, sqlite3, errno, bisect, datetime as dt   # no glob: DIVE-3419
 
 since = int(os.environ["USAGE_SINCE"])
 now   = int(time.time())
@@ -474,7 +474,11 @@ for name, meta in agents.items():
                 # classes). They are carried side by side rather than one being
                 # derived later, because the task-attribution below sums turns and
                 # a ratio computed after the fact cannot be re-split per task.
-                turns.append((ts, ot, i+ot+cc, i+ot+cc+cr))
+                # DIVE-4589 adds cache-read as a fifth member: the per-ACCOUNT
+                # board reports it (it is ~97% of a plan's meter), and like the
+                # two bases above it cannot be re-split out of a sum computed
+                # after the fact.
+                turns.append((ts, ot, i+ot+cc, i+ot+cc+cr, cr))
     if pins:
         goal_pins[name] = pins
     # A partial read of ONE agent still makes the company total partial: the row
@@ -565,9 +569,76 @@ for r in rows:
 for a in wins:
     wins[a].sort(key=lambda w: w["start"], reverse=True)
 
+# --- historical auth-profile attribution (DIVE-4589) -----------------------
+# The binding trail, oldest first per agent. A turn is attributed to the binding
+# that was LIVE AT ITS OWN TIMESTAMP — never to the agent's current config,
+# never to the binding at task start or task end. The whole point of the store
+# is that those three answers diverge the moment a seat is rotated, and before
+# this row all of them were the same wrong answer.
+#
+# ATTRIBUTION SOURCES, and they are reported, not blended:
+#   binding-event             — an event at or before this turn. Proven.
+#   current-binding-fallback  — no event that old; the agent's CURRENT registry
+#                               binding is shown, explicitly as a fallback. This
+#                               is what every turn before this row's deploy gets,
+#                               because nothing was backfilled (a backfill would
+#                               be a fabricated proof).
+#   unknown                   — no event and no current binding either.
+binds = {}
+try:
+    _bcon = sqlite3.connect(task_db)
+    for _agent, _ts, _acct in _bcon.execute(
+            "SELECT agent, ts, account FROM account_binding_events ORDER BY ts, id"):
+        try:
+            binds.setdefault(_agent, []).append((int(_ts), _acct))
+        except (TypeError, ValueError):
+            continue
+    _bcon.close()
+except Exception:
+    # No table (a board that predates the migration) or no store at all. Not an
+    # error: it is the honest "no history here", and every turn falls to the
+    # fallback below wearing that label.
+    binds = {}
+
+_bind_keys = {a: [e[0] for e in ev] for a, ev in binds.items()}
+
+def account_at(agent, ts):
+    ev = binds.get(agent)
+    if ev:
+        i = bisect.bisect_right(_bind_keys[agent], ts)
+        if i:
+            acct = ev[i-1][1]
+            # An explicit UNBOUND event (account NULL) is a proven absence of a
+            # binding, not a missing answer — it must not fall through to the
+            # current config, or removing a seat would re-attribute its past.
+            return (acct if acct else None), "binding-event"
+    cur = (agents.get(agent) or {}).get("authProfile")
+    if cur:
+        return cur, "current-binding-fallback"
+    return None, "unknown"
+
+accounts = {}
+
+def _acct_bucket(key):
+    return accounts.setdefault(key, {
+        "account": key if key else None,
+        "total": 0, "quota": 0, "output": 0, "cacheRead": 0, "turns": 0,
+        "attribution": {"binding-event": 0, "current-binding-fallback": 0, "unknown": 0},
+        "agents": {}, "tasks": {},
+        # Per-turn (ts, quota, cacheRead), kept only so the anomaly diagnostics
+        # below can sum the tokens moved BETWEEN two provider snapshots rather
+        # than over the whole reporting window. Dropped before the payload is
+        # emitted — it is working state, not an interface.
+        "_turns": [],
+    })
+
+def _sub(d, key, ts_hint=None):
+    return d.setdefault(key, {"name": key, "total": 0, "quota": 0,
+                              "output": 0, "cacheRead": 0, "turns": 0})
+
 for name, turns in turns_by_agent.items():
     ws = wins.get(name, [])
-    for ts, out, tot, qta in turns:
+    for ts, out, tot, qta, cr in turns:
         hit = None
         for w in ws:
             if w["start"] <= ts <= w["end"]:
@@ -578,6 +649,25 @@ for name, turns in turns_by_agent.items():
         else:
             u = untracked.setdefault(name, {"total":0,"quota":0,"output":0})
             u["total"]+=tot; u["quota"]+=qta; u["output"]+=out
+        # Per-turn account attribution. Same single walk as the task attribution
+        # above, deliberately: a turn is read once, and the account and the task
+        # it lands on are decided from the SAME timestamp. A task that spans a
+        # rebind therefore appears under both accounts, split at the event — that
+        # is acceptance criteria 2 and 3, and it is a feature, not a double count.
+        acct, conf = account_at(name, ts)
+        b = _acct_bucket(acct or "")
+        b["total"]+=tot; b["quota"]+=qta; b["output"]+=out; b["cacheRead"]+=cr
+        b["turns"]+=1; b["attribution"][conf]+=1
+        b["_turns"].append((ts, qta, cr))
+        ab = _sub(b["agents"], name)
+        ab["total"]+=tot; ab["quota"]+=qta; ab["output"]+=out; ab["cacheRead"]+=cr; ab["turns"]+=1
+        if hit:
+            tb = b["tasks"].setdefault(hit["ident"], {"ident": hit["ident"],
+                                                      "title": hit["title"],
+                                                      "total":0,"quota":0,"output":0,
+                                                      "cacheRead":0,"turns":0})
+            tb["total"]+=tot; tb["quota"]+=qta; tb["output"]+=out
+            tb["cacheRead"]+=cr; tb["turns"]+=1
 
 # --- dispatch cross-check (DIVE-2058, FALSIFIABLE INVARIANT) ---------------
 # "Every usage-attributed token window must intersect at least one DISPATCH
@@ -633,6 +723,120 @@ for a in wins:
                           "output":w["output"],"turns":w["turns"],
                           "iteration":w["iteration"],"dispatched":dispatched})
 
+# --- provider quota snapshots + anomaly diagnostics (DIVE-4589 sections 2/4) ---
+# The samples are the history that <profile>/usage.json and account-usage.json
+# used to overwrite. Read here so ONE payload carries both halves of the join the
+# row was filed for: tokens moved, and the provider percentage that moved with
+# them.
+samples_by_account = {}
+try:
+    _scon = sqlite3.connect(task_db)
+    for _a, _as_of, _fp, _fr, _sp, _sr, _src in _scon.execute(
+            "SELECT account, as_of, five_pct, five_reset, seven_pct, seven_reset, source_agent "
+            "FROM account_usage_samples WHERE as_of >= ? AND as_of <= ? ORDER BY account, as_of",
+            (since, now)):
+        samples_by_account.setdefault(_a, []).append({
+            "asOf": int(_as_of), "fivePct": _fp, "fiveResetsAt": _fr,
+            "sevenPct": _sp, "sevenResetsAt": _sr, "sourceAgent": _src})
+    _scon.close()
+except Exception:
+    samples_by_account = {}
+
+def _reset_between(a, b, pct_key, reset_key):
+    """True when the window these two samples sit in is not the same window.
+
+    Two independent tells, and either is enough: the vendor's own reset stamp
+    changed, or the percentage went DOWN (a plan meter only rises inside a
+    window). Both are needed — a vendor that stops reporting resets_at still
+    resets, and a reset immediately followed by fresh burn can land back above
+    where it started."""
+    ra, rb = a.get(reset_key), b.get(reset_key)
+    if ra and rb and ra != rb:
+        return True
+    pa, pb = a.get(pct_key), b.get(pct_key)
+    if pa is not None and pb is not None and pb < pa:
+        return True
+    return False
+
+def _per_m(delta, tokens):
+    if delta is None or not tokens:
+        return None
+    return round(delta / (tokens / 1000000.0), 4)
+
+for key, b in accounts.items():
+    rows = samples_by_account.get(key, []) if key else []
+    first = rows[0] if rows else None
+    last  = rows[-1] if len(rows) > 1 else None
+    b["quotaSnapshots"] = {
+        "samples": len(rows),
+        "firstAsOf": (first or {}).get("asOf"),
+        "lastAsOf": (rows[-1]["asOf"] if rows else None),
+        "sourceAgents": sorted({r["sourceAgent"] for r in rows if r.get("sourceAgent")}),
+        "latest": (rows[-1] if rows else None),
+    }
+    # Section 4, and ONLY as an observational diagnostic: percentage points of
+    # the provider's meter per 1M tokens we moved in the same interval. It is a
+    # ratio between two things we observed, never an inference of the vendor's
+    # accounting from API pricing (which section 4 forbids). Any missing leg
+    # returns `unknown` with the reason named, because a ratio quietly computed
+    # across a reset is worse than no ratio.
+    # `unknown` is about the RATIO, not about the raw percentage-point delta: a
+    # delta the provider itself moved is still a measurement even when we cannot
+    # divide it by tokens we can vouch for. Keeping the two separate is what lets
+    # the board show a real +11 while refusing to say what it was per 1M tokens.
+    diag = {"unknown": None, "fromAsOf": None, "toAsOf": None,
+            "quotaTokens": None, "cacheReadTokens": None,
+            "sevenDayPpDelta": None, "fiveHourPpDelta": None,
+            "sevenDayPpPerMQuota": None, "sevenDayPpPerMCacheRead": None,
+            "fiveHourPpPerMQuota": None,
+            "basis": "observational only — a ratio of two measurements, not a "
+                     "claim about how the provider meters"}
+    if last is None:
+        diag["unknown"] = ("fewer than two provider snapshots inside the window"
+                           if len(rows) < 2 else "no provider snapshots inside the window")
+    elif _reset_between(first, last, "sevenPct", "sevenResetsAt"):
+        diag["unknown"] = "the 7-day window reset between the two snapshots"
+    else:
+        lo, hi = first["asOf"], last["asOf"]
+        qsum = sum(t[1] for t in b["_turns"] if lo <= t[0] <= hi)
+        csum = sum(t[2] for t in b["_turns"] if lo <= t[0] <= hi)
+        diag["fromAsOf"], diag["toAsOf"] = lo, hi
+        diag["quotaTokens"], diag["cacheReadTokens"] = qsum, csum
+        if first.get("sevenPct") is not None and last.get("sevenPct") is not None:
+            diag["sevenDayPpDelta"] = round(last["sevenPct"] - first["sevenPct"], 4)
+        if (first.get("fivePct") is not None and last.get("fivePct") is not None
+                and not _reset_between(first, last, "fivePct", "fiveResetsAt")):
+            diag["fiveHourPpDelta"] = round(last["fivePct"] - first["fivePct"], 4)
+        diag["sevenDayPpPerMQuota"]     = _per_m(diag["sevenDayPpDelta"], qsum)
+        diag["sevenDayPpPerMCacheRead"] = _per_m(diag["sevenDayPpDelta"], csum)
+        diag["fiveHourPpPerMQuota"]     = _per_m(diag["fiveHourPpDelta"], qsum)
+        if not qsum:
+            diag["unknown"] = ("no tokens attributed to this account between the "
+                               "two snapshots")
+        # An attribution that is mostly fallback makes the ratio's denominator
+        # uncertain, and section 4 says an uncertain attribution returns unknown.
+        elif b["attribution"]["binding-event"] == 0:
+            diag["unknown"] = ("no proven binding for any turn in the interval "
+                               "(current-binding fallback only)")
+    b["diagnostics"] = diag
+
+account_rows = []
+for key, b in sorted(accounts.items(), key=lambda kv: -kv[1]["quota"]):
+    b.pop("_turns", None)
+    b["agents"] = sorted(b["agents"].values(), key=lambda a: -a["quota"])
+    b["tasks"]  = sorted(b["tasks"].values(),  key=lambda t: -t["quota"])
+    # The row SAYS how it was attributed rather than leaving a reader to assume.
+    att = b["attribution"]
+    if att["binding-event"] and not (att["current-binding-fallback"] or att["unknown"]):
+        b["attributionSource"] = "binding-event"
+    elif att["binding-event"]:
+        b["attributionSource"] = "mixed"
+    elif att["unknown"] and not att["current-binding-fallback"]:
+        b["attributionSource"] = "unknown"
+    else:
+        b["attributionSource"] = "current-binding-fallback"
+    account_rows.append(b)
+
 print(json.dumps({
     "window": {"since": since, "now": now},
     # DIVE-4037: the payload SAYS what each figure is made of. A consumer that
@@ -676,6 +880,12 @@ print(json.dumps({
                   }},
     },
     "agents": agent_rows, "tasks": tasks, "untracked": untracked,
+    # DIVE-4589: usage by AUTH PROFILE, attributed per turn to the binding that
+    # was live at that turn's timestamp. `agents[].account` above is unchanged
+    # and still the seat's CURRENT binding — it is a config reading and is left
+    # alone; this is the historical one, and the two are deliberately not merged
+    # into a single field that would mean different things over time.
+    "accounts": account_rows,
     # DIVE-1929: what this read COVERED, so a consumer can tell a company-wide
     # total from one agent's slice. Sets READ vs sets that EXIST — the count
     # never travels without it.
@@ -757,29 +967,146 @@ cmd_usage() {
 
   require_root
 
-  local agent="" win_flag="24h"
+  local agent="" win_flag="24h" by="" acct=""
   local args=()
   for a in "$@"; do
     case "$a" in
       --7d|7d|--week)  win_flag="7d" ;;
       --24h|24h|--day) win_flag="24h" ;;
+      # DIVE-4589: the historical-by-auth-profile views. NEW FLAGS ONLY — the
+      # bare `usage`, `usage <agent>` and `--7d` forms are byte-for-byte what
+      # they were, which is acceptance criterion 10.
+      --by=*)          by="${a#--by=}" ;;
+      --account=*)     acct="${a#--account=}" ;;
       --*)             fail "$E_USAGE" "unknown flag: $a" ;;
       *)               args+=("$a") ;;
     esac
   done
   [[ ${#args[@]} -le 1 ]] || fail "$E_USAGE" "usage: 5dive usage [<agent>] [--7d] [--json]"
   [[ ${#args[@]} -eq 1 ]] && agent="${args[0]}"
+  case "$by" in
+    ""|account|agent|task) ;;
+    *) fail "$E_USAGE" "unknown --by=$by (account|agent|task)" ;;
+  esac
+  if [[ -n "$by" && "$by" != "account" && -z "$acct" ]]; then
+    fail "$E_USAGE" "--by=$by needs --account=<profile> (fleet-wide --by=agent is the default board: 5dive usage)"
+  fi
+  [[ -n "$agent" && ( -n "$by" || -n "$acct" ) ]] \
+    && fail "$E_USAGE" "name an agent OR an account view, not both"
 
   local since now data budgets
   since=$(( $(date +%s) - $(usage_window_secs "$win_flag") ))
   data=$(usage_collect "$since") || fail "$E_GENERIC" "failed to collect usage"
   budgets=$(usage_budget_load)
 
-  if [[ -n "$agent" ]]; then
+  if [[ -n "$acct" ]]; then
+    usage_render_account "$data" "$acct" "${by:-summary}" "$win_flag"
+  elif [[ "$by" == "account" ]]; then
+    usage_render_accounts "$data" "$win_flag"
+  elif [[ -n "$agent" ]]; then
     usage_render_agent "$data" "$agent" "$win_flag"
   else
     usage_render_board "$data" "$win_flag" "$budgets"
   fi
+}
+
+# usage_accounts_legend — the one line that stops the table below being read as
+# a proof. Attribution and snapshot coverage are both reported per row; this
+# says what the two words mean, once, instead of a footnote per row.
+usage_accounts_legend() {
+  printf '  ATTRIB: binding-event = the account was PROVEN live at each turn'\''s own timestamp;\n'
+  printf '          current-binding-fallback = no binding event that old, so the seat'\''s CURRENT\n'
+  printf '          account is shown and is NOT proof; mixed = both; unknown = neither.\n'
+  printf '          Nothing was backfilled: turns older than the first recorded rebind can only\n'
+  printf '          ever read as fallback. SNAP = provider quota snapshots inside the window.\n'
+}
+
+# usage_render_accounts <data> <win> — the per-AUTH-PROFILE board. Two seats on
+# one profile aggregate into one row (criterion 1); one seat that moved mid-window
+# contributes to two rows, split at the event (criterion 2).
+usage_render_accounts() {
+  local data="$1" win="$2"
+  if (( JSON_MODE )); then
+    jq -c '{ok:true, data:{window:.window, basis:.basis, accounts:.accounts,
+            coverage:.coverage}}' <<<"$data"
+    return
+  fi
+  local label; [[ "$win" == "7d" ]] && label="last 7d" || label="last 24h"
+  echo "usage by auth profile — $label"
+  usage_coverage_note "$data"
+  jq -r "$USAGE_JQ_HELPERS"'
+    def ppd: if . == null then "?" else ((if . > 0 then "+" else "" end) + (.*10|round|./10|tostring)) end;
+    def pctof($n; $d): if $d == null or $d == 0 then "-" else (($n / $d * 1000 | floor) / 10 | tostring) + "%" end;
+    (["ACCOUNT","QUOTA","CACHE-READ","CACHE%","5H Δ","7D Δ","SNAP","ATTRIB","SEATS"] | @tsv),
+    (.accounts[] |
+      [ (.account // "(unattributed)"),
+        (.quota|htok), (.cacheRead|htok), pctof(.cacheRead; .quota),
+        (.diagnostics.fiveHourPpDelta|ppd), (.diagnostics.sevenDayPpDelta|ppd),
+        (.quotaSnapshots.samples|tostring), .attributionSource,
+        ((.agents|map(.name))|join(",")) ] | @tsv)
+    ' <<<"$data" | column -t -s $'\t' | sed 's/^/  /'
+  # A delta that could not be computed says WHY, per account, instead of leaving
+  # a bare "?" the reader has to guess at. Section 4: a reset, a missing
+  # snapshot or an uncertain attribution all return unknown, named.
+  jq -r '.accounts[] | select(.diagnostics.unknown != null)
+          | "  ? \(.account // "(unattributed)"): no pp-per-1M-tokens ratio — \(.diagnostics.unknown)"' <<<"$data"
+  usage_accounts_legend
+}
+
+# usage_render_account <data> <account> <by> <win> — one profile, optionally
+# broken down. `--by=task` is the view that makes criterion 3 visible: one task
+# legitimately appears under two profiles when it was worked across a rebind.
+usage_render_account() {
+  local data="$1" acct="$2" by="$3" win="$4" row
+  row=$(jq -c --arg a "$acct" '.accounts[] | select(.account == $a)' <<<"$data")
+  if [[ -z "$row" ]]; then
+    if (( JSON_MODE )); then
+      jq -cn --arg a "$acct" '{ok:true, data:{account:$a, quota:0, total:0, output:0,
+        cacheRead:0, turns:0, agents:[], tasks:[], note:"no usage attributed in window"}}'
+      return
+    fi
+    # NOT an error: an account with no attributed turns in the window is a real
+    # answer, and failing here would make "idle" indistinguishable from "typo".
+    echo "no usage attributed to account '$acct' in this window"
+    return
+  fi
+  if (( JSON_MODE )); then
+    jq -c --argjson r "$row" --arg by "$by" \
+      '{ok:true, data:($r + {window:.window, by:$by})}' <<<"$data"
+    return
+  fi
+  local label; [[ "$win" == "7d" ]] && label="last 7d" || label="last 24h"
+  echo "$acct — $label"
+  usage_coverage_note "$data"
+  case "$by" in
+    agent)
+      jq -r "$USAGE_JQ_HELPERS"'
+        (["AGENT","QUOTA","CACHE-READ","COST-BASIS","TURNS"] | @tsv),
+        (.agents[] | [ .name, (.quota|htok), (.cacheRead|htok), (.total|htok),
+                       (.turns|tostring) ] | @tsv)' <<<"$row" \
+        | column -t -s $'\t' | sed 's/^/  /'
+      ;;
+    task)
+      jq -r "$USAGE_JQ_HELPERS"'
+        (["TASK","QUOTA","CACHE-READ","COST-BASIS","TURNS","TITLE"] | @tsv),
+        (.tasks[] | [ .ident, (.quota|htok), (.cacheRead|htok), (.total|htok),
+                      (.turns|tostring), (.title // "" | .[0:44]) ] | @tsv)' <<<"$row" \
+        | column -t -s $'\t' | sed 's/^/  /'
+      ;;
+    *)
+      jq -r "$USAGE_JQ_HELPERS"'
+        "  quota basis:  \(.quota|htok)   (cache-read \(.cacheRead|htok))",
+        "  cost basis:   \(.total|htok)",
+        "  turns:        \(.turns)   seats: \((.agents|map(.name))|join(", "))",
+        "  attribution:  \(.attributionSource)   (proven \(.attribution["binding-event"]), fallback \(.attribution["current-binding-fallback"]), unknown \(.attribution.unknown))",
+        "  snapshots:    \(.quotaSnapshots.samples)\(if .quotaSnapshots.samples > 0 then "  from \(.quotaSnapshots.sourceAgents|join(","))" else "" end)",
+        (if .diagnostics.unknown != null
+         then "  7d Δ:         \(if .diagnostics.sevenDayPpDelta == null then "unknown" else "\(.diagnostics.sevenDayPpDelta) pp" end) — no pp-per-1M ratio: \(.diagnostics.unknown)"
+         else "  7d Δ:         \(.diagnostics.sevenDayPpDelta) pp over \(.diagnostics.quotaTokens) quota tokens  (\(.diagnostics.sevenDayPpPerMQuota) pp/1M quota, \(.diagnostics.sevenDayPpPerMCacheRead) pp/1M cache-read — observational only)" end)
+        ' <<<"$row"
+      ;;
+  esac
+  usage_accounts_legend
 }
 
 # usage_coverage_note <collect_json> — the banner that turns a partial read into

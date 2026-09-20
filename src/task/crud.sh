@@ -1200,6 +1200,16 @@ cmd_task_ls() {
       dbfmt -box "SELECT ident,
              CASE WHEN ${_TASKS_TFV_SQL}
                   THEN 'graded->merge:'||$(_tasks_merge_owner_sql)
+                  -- DIVE-4654: and once the merge has LANDED the row is owed a
+                  -- CLOSE, not a merge. Without this cell a row whose pull
+                  -- request is on the target branch paints plain 'todo' again the
+                  -- moment the landing is recorded, which is the same silence
+                  -- DIVE-3098 removed one stage earlier: the reader cannot tell
+                  -- it from work nobody has started. Names the ASSIGNEE, because
+                  -- the close is the assignee's act and the merge owner has
+                  -- nothing left to do on it.
+                  WHEN (${_TASKS_MERGE_LANDED_SQL}) AND status NOT IN ('done','cancelled')
+                  THEN 'merged->close:'||COALESCE(NULLIF(assignee,''),'?')
                   ELSE status END AS status,
              ${_gate_cell} AS gate,
              priority, COALESCE(assignee,'-') AS assignee, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref,
@@ -1212,6 +1222,16 @@ cmd_task_ls() {
       dbfmt -box "SELECT ident,
              CASE WHEN ${_TASKS_TFV_SQL}
                   THEN 'graded->merge:'||$(_tasks_merge_owner_sql)
+                  -- DIVE-4654: and once the merge has LANDED the row is owed a
+                  -- CLOSE, not a merge. Without this cell a row whose pull
+                  -- request is on the target branch paints plain 'todo' again the
+                  -- moment the landing is recorded, which is the same silence
+                  -- DIVE-3098 removed one stage earlier: the reader cannot tell
+                  -- it from work nobody has started. Names the ASSIGNEE, because
+                  -- the close is the assignee's act and the merge owner has
+                  -- nothing left to do on it.
+                  WHEN (${_TASKS_MERGE_LANDED_SQL}) AND status NOT IN ('done','cancelled')
+                  THEN 'merged->close:'||COALESCE(NULLIF(assignee,''),'?')
                   ELSE status END AS status,
              ${_gate_cell} AS gate,
              priority, COALESCE(assignee,'-') AS assignee,
@@ -1311,9 +1331,9 @@ cmd_task_show() {
     # "never started" FROM THE BOARD ALONE. A fix that records the first start but
     # does not surface it here does not satisfy that.
     if (( no_body )); then
-      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, CASE WHEN COALESCE(merge_owner,'')='' THEN '-' ELSE merge_owner||' ('||COALESCE(NULLIF(merge_hold_reason,''),'no reason recorded')||')' END AS merge_owner FROM tasks WHERE id=${id};"
+      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, CASE WHEN (${_TASKS_MERGE_LANDED_SQL}) THEN 'none — MERGED ON THE FORGE as '||substr(COALESCE(NULLIF(merge_landed_sha,''),'an unrecorded sha'),1,12)||', recorded '||merge_landed_at||' by '||COALESCE(NULLIF(merge_landed_by,''),'?')||'; this row is owed a CLOSE' WHEN COALESCE(merge_owner,'')='' THEN '-' ELSE merge_owner||' ('||COALESCE(NULLIF(merge_hold_reason,''),'no reason recorded')||')' END AS merge_owner FROM tasks WHERE id=${id};"
     else
-      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, CASE WHEN COALESCE(merge_owner,'')='' THEN '-' ELSE merge_owner||' ('||COALESCE(NULLIF(merge_hold_reason,''),'no reason recorded')||')' END AS merge_owner, body, result FROM tasks WHERE id=${id};"
+      dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, CASE WHEN (${_TASKS_MERGE_LANDED_SQL}) THEN 'none — MERGED ON THE FORGE as '||substr(COALESCE(NULLIF(merge_landed_sha,''),'an unrecorded sha'),1,12)||', recorded '||merge_landed_at||' by '||COALESCE(NULLIF(merge_landed_by,''),'?')||'; this row is owed a CLOSE' WHEN COALESCE(merge_owner,'')='' THEN '-' ELSE merge_owner||' ('||COALESCE(NULLIF(merge_hold_reason,''),'no reason recorded')||')' END AS merge_owner, body, result FROM tasks WHERE id=${id};"
     fi
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed

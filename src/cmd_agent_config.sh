@@ -248,6 +248,19 @@ cmd_config() {
     fi
   fi
   echo "$reg" | registry_write
+  # DIVE-4589: the binding event is written after the registry write has SUCCEEDED
+  # (a failed write must not leave a rebind recorded that never happened) and
+  # before the env rewrite + auth-symlink re-point below — which is what actually
+  # makes the new credential reachable. So the event's ts is a lower bound on the
+  # first turn that could have used the new account: acceptance criterion 4.
+  # Every rebind path in the CLI (set-account, rotation, failover, a create that
+  # passes --auth-profile) funnels through this one function, so there is one
+  # emitter rather than one per caller.
+  if (( profile_dirty )) && declare -F account_binding_record >/dev/null 2>&1; then
+    local _bind_to
+    _bind_to=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
+    account_binding_record "$name" "$_bind_to" "${_5D_BINDING_REASON:-config-set}" || true
+  fi
   if (( env_dirty )); then
     step "Rewriting ${ENV_DIR}/${name}.env"
     local new_channels new_workdir new_profile

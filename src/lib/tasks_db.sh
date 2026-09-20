@@ -176,7 +176,7 @@ require_sqlite() {
 # block, and a store stamped '3932-1' has never seen the triggers block, so
 # either literal skips one population's migration entirely. A THIRD value that
 # no store carries is the only resolution that re-migrates both.
-_TASKS_SCHEMA_EPOCH='3932-2'  # DIVE-3932+3931: +runs/run_events/run_usage AND +event trigger ingress tables
+_TASKS_SCHEMA_EPOCH='4589-1'  # DIVE-4589: +account_binding_events/account_usage_samples (on top of 3932-2)
 
 # DIVE-3931: Event -> Task ingress lives in the task store because ingress ends
 # at the queue. One SQL emitter serves fresh stores and migrations so the two
@@ -380,6 +380,36 @@ CREATE TABLE IF NOT EXISTS tasks (
   merge_proof_by TEXT,
   merge_proof_ref TEXT,
   merge_proof_cmd TEXT,
+  -- DIVE-4654: THE MERGE LANDED ON THE FORGE, RECORDED SO THE STAGE CAN EXIT.
+  -- `_TASKS_TFV_SQL` below is the MERGING stage, and until this column the only
+  -- thing that could take a row out of it was `task merge` -- a verb bound to the
+  -- seat that GRADED. When the grading seat holds no merge rail on the repo the
+  -- merge is pressed on the FORGE instead (the documented play: withhold the
+  -- graded-sha token so merge_owner routes to a seat that can push), and then
+  -- nothing ever advanced the stage: the tick dispatched the merge owner, who had
+  -- no verb, forever, while the assignee -- the only seat that may close -- was
+  -- excluded by the picker's own merge-owner clause. Measured on DIVE-4632:
+  -- 5dive-ai/ops#20 merged 2026-09-19T19:08:15Z, four dispatches, the last three
+  -- no-ops (community/wiki/a-merge-pressed-on-the-forge-never-leaves-the-boards-
+  -- merging-stage.md).
+  --   merge_landed_at   when the landing was RECORDED (never backdated; the
+  --                     forge's own mergedAt goes in the audit line, not here)
+  --   merge_landed_sha  the merge commit the forge reported
+  --   merge_landed_by   the seat that recorded it
+  --   merge_landed_ref  the delivery_ref it was recorded AGAINST -- the stage
+  --                     predicate accepts the record only while it still equals
+  --                     the row's CURRENT binding, so a re-pointed delivery
+  --                     re-enters MERGING rather than carrying a stale landing
+  --                     onto a different pull request. Same rule, and the same
+  --                     reason, as merge_proof_ref above.
+  -- BARE SET, not COALESCE, for merge_proof's reason: this is CURRENT STATE about
+  -- a specific binding. NULL = no landing has been recorded, which is every row
+  -- that existed before this column, so the migration is a pure ALTER with no
+  -- backfill and no row changes stage on the way in.
+  merge_landed_at TEXT,
+  merge_landed_sha TEXT,
+  merge_landed_by TEXT,
+  merge_landed_ref TEXT,
   -- DIVE-2615: why this gate has this tier — axis=pinned|type-default|secret-type
   -- |ask|title|title-fallback|none, plus ;term=<t> where a term is what fired.
   -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS: a fresh store takes this
@@ -1331,6 +1361,45 @@ CREATE TABLE IF NOT EXISTS objectives (
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- DIVE-4589: the TIME DIMENSION between a usage event and the auth profile that
+-- paid for it. Append-only by contract: a rebind writes a NEW row and never
+-- rewrites an old one, because a historical turn was paid for by whatever
+-- binding was live when it ran. `ts` is epoch seconds (the instant the binding
+-- became live — written BEFORE the new credential is used), `account` is NULL
+-- for "unbound" (agent removed, or auth-profile cleared to default). `reason`
+-- names the path that moved it: create | config-set | rotation | failover |
+-- account-rename | agent-remove.
+-- Keep byte-identical to the copy in _tasks_db_migrate (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS account_binding_events (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      INTEGER NOT NULL,
+  agent   TEXT NOT NULL,
+  account TEXT,
+  reason  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_account_binding_agent_ts
+  ON account_binding_events(agent, ts);
+-- DIVE-4589: append-only provider quota observations. The JSON files
+-- (<profile>/usage.json, ${STATE_DIR}/account-usage.json) stay as the fast
+-- LATEST-state cache; this is the history they overwrite. `as_of` is the instant
+-- the PROVIDER's number was measured, not when we stored it, so re-reading the
+-- same statusline cache is idempotent through UNIQUE(account, as_of) — that
+-- uniqueness IS the "do not insert a recalled reading as a fresh observation"
+-- rule, together with source_agent NOT NULL (a reading with no seat behind it is
+-- a recall and never reaches this table).
+-- Keep byte-identical to the copy in _tasks_db_migrate (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS account_usage_samples (
+  account      TEXT NOT NULL,
+  as_of        INTEGER NOT NULL,
+  five_pct     REAL,
+  five_reset   TEXT,
+  seven_pct    REAL,
+  seven_reset  TEXT,
+  source_agent TEXT NOT NULL,
+  UNIQUE(account, as_of)
+);
+CREATE INDEX IF NOT EXISTS idx_account_usage_samples_acct
+  ON account_usage_samples(account, as_of);
 -- Append-only reading history — one row per tick (value=NULL + rc!=0 on a metric
 -- failure, so a broken metric-cmd shows as a visible gap, not a silent skip). This
 -- is the audit trail, same honesty pattern as the proof branch's history.jsonl.
@@ -1886,6 +1955,10 @@ _TASKS_ADDITIVE_COLUMNS=(
   # merge_proof_ref must match the CURRENT binding.
   'merge_proof_at TEXT' 'merge_proof_by TEXT'
   'merge_proof_ref TEXT' 'merge_proof_cmd TEXT'
+  # DIVE-4654: the recorded forge landing that lets the MERGING stage exit. See
+  # the CREATE TABLE comment; merge_landed_ref must match the CURRENT binding.
+  'merge_landed_at TEXT' 'merge_landed_sha TEXT'
+  'merge_landed_by TEXT' 'merge_landed_ref TEXT'
   # DIVE-2354: approve-to-send | confirm-after-send. See the CREATE TABLE comment.
   'gate_mode TEXT'
   # DIVE-3342: humans.id of the person who may CLEAR this gate. See the CREATE
@@ -1962,6 +2035,22 @@ _TASKS_ADDITIVE_COLUMNS=(
 # already-graded row off the board the moment this shipped — a silent regression on
 # live data, in the direction this predicate is least able to afford. See the CREATE
 # TABLE comment for why no backfill can do better than that.
+# DIVE-4654 — A LANDING RECORDED AGAINST THE ROW'S CURRENT BINDING, as one
+# string, because three readers need the same answer: the stage predicate below
+# (which subtracts it), the board (which paints it) and task show. The whole
+# point of the row that added it is that a stage and its exit must not be two
+# hand-copied opinions.
+#
+# SCOPED TO THE BINDING, exactly as merge_proof_ref is. A landing recorded
+# against a delivery_ref the row no longer carries is a landing of a DIFFERENT
+# pull request, so a re-pointed delivery re-enters the merging stage rather than
+# inheriting the old record. NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT:
+# the constant is one double-quoted bash string.
+_TASKS_MERGE_LANDED_SQL="merge_landed_at IS NOT NULL
+       AND merge_landed_ref IS NOT NULL
+       AND delivery_ref IS NOT NULL
+       AND merge_landed_ref = delivery_ref"
+
 _TASKS_TFV_SQL="graded_at IS NOT NULL
        AND delivery_ref IS NOT NULL AND TRIM(delivery_ref) <> ''
        AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
@@ -2005,6 +2094,29 @@ _TASKS_TFV_SQL="graded_at IS NOT NULL
        -- decide the very same question on the nag rail.
        AND (handoff_delivered_at IS NULL
             OR handoff_delivered_at <= COALESCE(graded_verdict_at, graded_at))
+       -- DIVE-4654 - AND A MERGE ALREADY ON THE TARGET BRANCH IS NOT A MERGE
+       -- STILL OWED. NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT, for the
+       -- reason the DIVE-4327 block above states: the whole constant is one
+       -- double-quoted bash string.
+       --
+       -- Every other conjunct here reads a CLOCK or a COLUMN, and none of them
+       -- can see the forge. Until this one the only thing that took a row out of
+       -- this predicate was a close or a cancel -- and the verb that leads to
+       -- either, task merge, is bound to the seat named in graded_by. When that
+       -- seat holds no merge rail on the repo the merge is pressed on the FORGE
+       -- by a seat that can push, and then the stage had no exit at all: the tick
+       -- dispatched the merge owner, who has no verb for it, while this same
+       -- predicate excluded the assignee from the picker -- the only seat that
+       -- may close. Measured on DIVE-4632 (5dive-ai/ops#20 merged
+       -- 2026-09-19T19:08:15Z, four dispatches, three of them no-ops).
+       --
+       -- SCOPED TO THE CURRENT BINDING, exactly as merge_proof_ref is: a landing
+       -- recorded against a delivery_ref the row no longer carries is a landing
+       -- of a DIFFERENT pull request, so the row re-enters this stage rather
+       -- than carrying the old record onto the new one. NULL on either column is
+       -- every row that existed before DIVE-4654, which is why the migration
+       -- needs no backfill and no row changes stage on the way in.
+       AND NOT (${_TASKS_MERGE_LANDED_SQL})
        AND status NOT IN ('done','cancelled')"
 
 # DIVE-4327 — THE MERGE OWNER IS ONE FUNCTION, NOT NINE COPIES.
@@ -2636,6 +2748,44 @@ MIG
          SELECT 'gate_history_coverage',
                 'inferred:'||COALESCE((SELECT MIN(retired_at) FROM gate_history), datetime('now'));" \
       >/dev/null 2>&1 || true
+  fi
+
+  # DIVE-4589 account_binding_events + account_usage_samples — additive, gated on
+  # the binding table's absence so it takes no write lock on every command. Both
+  # brand-new and referenced by nothing, so creating them cannot touch the queue.
+  # NOTE: nothing is BACKFILLED here on purpose. A pre-existing board has no
+  # binding history, and inventing a genesis event at migration time would stamp
+  # today's binding onto every turn that ran before it — the exact false
+  # attribution this row exists to remove. Turns older than the first real event
+  # are reported as `current-binding-fallback`, never as a proven binding.
+  # Keep these CREATE TABLE bodies byte-identical to the copies in _tasks_schema.
+  local has_binding_events
+  has_binding_events=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_binding_events' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_binding_events" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG4589' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS account_binding_events (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      INTEGER NOT NULL,
+  agent   TEXT NOT NULL,
+  account TEXT,
+  reason  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_account_binding_agent_ts
+  ON account_binding_events(agent, ts);
+CREATE TABLE IF NOT EXISTS account_usage_samples (
+  account      TEXT NOT NULL,
+  as_of        INTEGER NOT NULL,
+  five_pct     REAL,
+  five_reset   TEXT,
+  seven_pct    REAL,
+  seven_reset  TEXT,
+  source_agent TEXT NOT NULL,
+  UNIQUE(account, as_of)
+);
+CREATE INDEX IF NOT EXISTS idx_account_usage_samples_acct
+  ON account_usage_samples(account, as_of);
+MIG4589
   fi
 
   # OSS-19 (OSS-26) objectives + objective_readings — additive, gated on the

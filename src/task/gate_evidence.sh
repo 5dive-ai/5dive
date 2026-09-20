@@ -2311,3 +2311,152 @@ _gate_branch_ident_on_main() {
   # Stopped counting; did not run out. Report what was WALKED, not what was asked for.
   printf 'bound:%s' "$walked"
 }
+
+# ---------------------------------------------------------------------------
+# DIVE-4619 — A STANDING CONDITION BELONGS ON `doctor`, NOT ON EVERY CLOSE.
+#
+# The DIVE-1935/1955 repo scan is right to stamp a close it could not verify, and
+# right to write an audit row for it. What it also did was print the SAME
+# human-facing warning on every close, and on a box whose credential cannot see
+# part of the repo set that condition does not change between closes: luca's box
+# (teal-fox) measured 45 of 57 closes in three days carrying an identical
+# `partial-repo-scan-6-of-11` warning. 79% of a close log saying one unactionable
+# thing is not a record anyone reads, so the ONE close that genuinely needed a
+# second look was indistinguishable from the 44 that did not.
+#
+# The split this makes:
+#   - the AUDIT ROW and the UNVERIFIED STAMP stay per close, unchanged. They are
+#     the durable record; thinning them would trade noise for silence, which is
+#     the worse failure and the one the stamp exists to prevent.
+#   - the human-facing WARNING is throttled per (seat, reason), because a reason
+#     that has not changed is the same sentence a second time.
+#   - the reading behind it is PERSISTED, so `5dive doctor` can carry it once as a
+#     standing finding naming which repos are invisible and which credential is
+#     short — the place a property of the BOX belongs.
+
+# _gate_vis_dir — where the standing-visibility reading and the notice stamps
+# live. Under TASKS_DIR because that is the one state directory every seat can
+# already write (setgid, group claude); STATE_DIR itself is root-only.
+_gate_vis_dir() {
+  printf '%s' "${TASKS_DIR:-${STATE_DIR:-/var/lib/5dive}/tasks}/gate-visibility"
+}
+
+# _gate_vis_seat — the account this reading is ABOUT. Credentials are per seat,
+# so a box's answer is a set of per-seat answers, never one.
+_gate_vis_seat() { id -un 2>/dev/null || printf 'unknown'; }
+
+_gate_vis_slugify() { printf '%s' "${1:-}" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# _gate_scan_class <reason> <scan-stderr> — WHOSE PROBLEM IS THIS?
+#
+# `partial-repo-scan-K-of-N` is one label over several different situations, and
+# they are not the same person's to fix. gate_evidence.sh's own record of a
+# `0-of-11` on a seat whose token was fine is the proof that the last one exists.
+#
+#   no-rail            no credential and no bot/anon rail — nothing to ask with.
+#   unreachable        the reachability probe said no; the loop never ran.
+#   credential-partial K of N answered, K>0 — the credential is short some repos.
+#   credential-blind   0 of N, and gh said it cannot SEE them — wrong credential
+#                      for this repo set.
+#   scan-failed        0 of N, and gh gave a reason that is NOT invisibility — a
+#                      rate limit, a 403, an outage. Names itself; often transient.
+#   scan-silent        0 of N, a rail in hand, and NOT ONE repo said why. Nothing
+#                      here is evidence about the credential, and reporting it as
+#                      one sends the reader to audit an account that is fine.
+#
+# The invisibility markers are the same ones `_gate_gh_blind_err` matches, and
+# deliberately no wider: "rate limit exceeded" carries HTTP 403 and is not a
+# statement that the repository cannot be seen.
+_gate_scan_class() {
+  local why="${1:-}" err="${2:-}"
+  case "$why" in
+    gh-absent|no-gh-token|no-gh-rail-for-listing) printf 'no-rail'; return 0 ;;
+    query-failed)                                 printf 'unreachable'; return 0 ;;
+  esac
+  if [[ "$why" =~ ^partial-repo-scan-([0-9]+)-of-([0-9]+)$ ]]; then
+    [[ "${BASH_REMATCH[1]}" != "0" ]] && { printf 'credential-partial'; return 0; }
+    [[ -n "$err" ]] || { printf 'scan-silent'; return 0; }
+    if printf '%s' "$err" | grep -qiE 'could not resolve to a repository|not found \(http 404\)|http 404|resource not accessible by integration'; then
+      printf 'credential-blind'; return 0
+    fi
+    printf 'scan-failed'; return 0
+  fi
+  printf 'scan-silent'
+}
+
+# _gate_scan_class_says <class> — the one sentence that says whose problem it is,
+# written for the person reading a close, who caused none of these.
+_gate_scan_class_says() {
+  case "${1:-}" in
+    no-rail)            printf 'This seat holds no GitHub rail at all, so nothing could be asked — the box owner provisions one; the close itself is fine.' ;;
+    unreachable)        printf 'A rail was held but GitHub was not reachable from this box, which is usually transient.' ;;
+    credential-partial) printf "This seat's GitHub credential can see only SOME of the configured repos — a standing property of the BOX, not of any one close." ;;
+    credential-blind)   printf 'A credential resolved but it can see NONE of the configured repos — it is the wrong credential for this repo set, which the box owner fixes.' ;;
+    scan-failed)        printf 'A rail answered with an error that is not about visibility (see the reason above) — often transient; the credential is not implicated.' ;;
+    scan-silent)        printf 'A rail was held, every repo declined, and NOT ONE of them said why — that is not evidence about your credential, and it may be a defect in the gate. Please file it.' ;;
+    *)                  printf '' ;;
+  esac
+}
+
+# _gate_vis_record <ok> <total> <invisible-csv> <class> <reason> <instrument>
+# Persist the last FULL sweep as this seat's standing reading. Best-effort by
+# construction: a bookkeeping write must never fail the close it describes.
+_gate_vis_record() {
+  local ok="${1:-0}" total="${2:-0}" bad="${3:-}" class="${4:-}" why="${5:-}" inst="${6:-}"
+  local dir seat f tmp
+  dir="$(_gate_vis_dir)"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  # Group-writable so the NEXT seat to close a row can write its own reading into
+  # a directory this one created.
+  chmod 2775 "$dir" 2>/dev/null || true
+  seat="$(_gate_vis_seat)"
+  f="$dir/$(_gate_vis_slugify "$seat").reading"
+  tmp="$f.tmp.$$"
+  {
+    printf 'asof=%s\n'       "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '')"
+    printf 'asof_epoch=%s\n' "$(date +%s 2>/dev/null || printf 0)"
+    printf 'seat=%s\n'       "$seat"
+    printf 'ok=%s\n'         "$ok"
+    printf 'total=%s\n'      "$total"
+    printf 'invisible=%s\n'  "$bad"
+    printf 'class=%s\n'      "$class"
+    printf 'reason=%s\n'     "$why"
+    printf 'instrument=%s\n' "$inst"
+  } >"$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# _gate_vis_field <file> <key> — one value out of a reading, or empty.
+_gate_vis_field() {
+  local f="${1:-}" k="${2:-}" line
+  [[ -r "$f" ]] || { printf ''; return 0; }
+  line=$(grep -m1 "^${k}=" "$f" 2>/dev/null || printf '')
+  printf '%s' "${line#*=}"
+}
+
+# _gate_notice_due <key> — 0 when this standing notice should be PRINTED, 1 when
+# an identical one was printed inside the TTL. Stamps the key on a 0.
+#
+# FAILS OPEN on purpose: an unwritable state dir, an unreadable clock or a
+# malformed stamp all print the warning again. A throttle that can silence the
+# gate by breaking is a worse instrument than no throttle at all.
+# `FIVE_GATE_NOTICE_TTL=0` disables suppression entirely (the harness control).
+_gate_notice_due() {
+  local key="${1:-}" ttl dir f now last
+  ttl="${FIVE_GATE_NOTICE_TTL:-86400}"
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=86400
+  (( ttl == 0 )) && return 0
+  dir="$(_gate_vis_dir)/notices"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  chmod 2775 "$dir" 2>/dev/null || true
+  now=$(date +%s 2>/dev/null) || return 0
+  [[ "$now" =~ ^[0-9]+$ ]] || return 0
+  f="$dir/$(_gate_vis_slugify "$(_gate_vis_seat)|$key")"
+  if [[ -f "$f" ]]; then
+    last=$(head -c 32 "$f" 2>/dev/null || printf '')
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last < ttl )) && return 1
+  fi
+  printf '%s' "$now" >"$f" 2>/dev/null || true
+  return 0
+}

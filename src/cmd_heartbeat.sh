@@ -752,19 +752,20 @@ _hb_effective_fresh() {
 # (pick the task up in the running context) and `--fresh` forces the clear.
 cmd_heartbeat_wake_task() {
   require_root
-  local fresh_override=""
+  local fresh_override="" force_busy="false"
   local -a _pos=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --fresh)    fresh_override="true"; shift ;;
       --no-fresh) fresh_override="false"; shift ;;
+      --force)    force_busy="true"; shift ;;
       --)         shift; while [[ $# -gt 0 ]]; do _pos+=("$1"); shift; done ;;
       *)          _pos+=("$1"); shift ;;
     esac
   done
   local name="${_pos[0]:-}" task_id="${_pos[1]:-}"
   [[ -n "$name" && "$task_id" =~ ^[0-9]+$ ]] \
-    || fail "$E_USAGE" "usage: 5dive heartbeat wake-task [--fresh|--no-fresh] <agent> <task_id> [<task_ident>]"
+    || fail "$E_USAGE" "usage: 5dive heartbeat wake-task [--fresh|--no-fresh] [--force] <agent> <task_id> [<task_ident>]"
   # THE IDENT IS RESOLVED FROM THE ROW, NEVER FABRICATED FROM THE ID.
   #
   # `<task_ident>` is optional and the exit hints deliberately omit it, so the
@@ -798,7 +799,45 @@ cmd_heartbeat_wake_task() {
   else
     fresh="$(_hb_effective_fresh "$name" "$task_id")"
   fi
-  _hb_log "[$name] forced wake onto ${task_ident} (fresh=${fresh}${fresh_override:+, caller override})"
+  # DIVE-4642 — THE FORCED PATH READS THE SEAT BEFORE IT TYPES INTO IT.
+  #
+  # The tick has always asked `_hb_agent_idle` first and deferred a mid-turn
+  # seat; `wake-task` skipped that read entirely and went straight to _hb_wake.
+  # So a forced wake onto a seat 21 minutes into a turn typed `/clear` into a
+  # LIVE composer, could not submit it (the composer is busy), and left the
+  # `/clear` queued to fire at that turn's boundary — wiping a working seat's
+  # context. Measured by luca on box-1, 5dive 0.45.0, 2026-09-20; rated S1.
+  #
+  # `_hb_composer_clear` now removes that residual, so the S1 harm is already
+  # dead. This read removes the CAUSE: on a seat that is provably working there
+  # is nothing to force, and the row stays todo for the tick that is already
+  # going to reach it.
+  #
+  # THE SAME PREDICATE AS THE TICK, not a copy of it — a second derivation of
+  # "is this seat busy" is exactly the shape DIVE-4276 cost us. It is also
+  # strictly better than the raw native word: `_hb_agent_idle` carries DIVE-4298's
+  # cross-check, so a seat held at native `busy` only by an orphaned background
+  # shell still reads idle here and is still woken.
+  #
+  # FAILS OPEN, deliberately. rc 2 is "no signal" (a non-claude runtime, claude
+  # not running, tmux unreadable) and must not block a debugging verb on a seat
+  # we cannot measure — the old behaviour is the right default there. Only a
+  # POSITIVE reading of working (1) or blocked (3) holds the wake, and `--force`
+  # takes it anyway for the operator who has looked at the pane and disagrees.
+  if [[ "$force_busy" != "true" ]]; then
+    local _fw_idle_rc=0
+    _hb_agent_idle "$name" || _fw_idle_rc=$?
+    if (( _fw_idle_rc == 1 || _fw_idle_rc == 3 )); then
+      local _fw_state="mid-turn (a turn is in flight)"
+      (( _fw_idle_rc == 3 )) && _fw_state="blocked on ${_HB_IDLE_REASON:-input needed}"
+      local _fw_note
+      _fw_note="[$name] forced wake REFUSED onto ${task_ident} — the seat is ${_fw_state}, and typing a goal into a live composer cannot submit and leaves a draft that fires at the turn's boundary (DIVE-4642). The row stays todo and the next tick reaches it. Override with '--force' if you have looked at the pane, or 'sudo 5dive agent restart ${name}' if the seat is genuinely stuck."
+      _hb_log "$_fw_note"
+      warn "$_fw_note"
+      return 0
+    fi
+  fi
+  _hb_log "[$name] forced wake onto ${task_ident} (fresh=${fresh}${fresh_override:+, caller override}$([[ "$force_busy" == "true" ]] && printf ', busy-guard forced')"
   _hb_wake_task_record_defect "$name" "$task_id" "$task_ident"
   # DIVE-4310: a forced wake fails with the same named cause as a tick wake.
   local _fw_rc=0
@@ -2295,11 +2334,123 @@ _hb_landed_check() {
   return 0
 }
 
+# DIVE-4642 — ONE LINE, OR IT IS NOT A SUBMIT.
+#
+# `send-keys -l` puts the payload in the composer; the Enter that follows is what
+# submits it. On a MULTI-LINE payload that Enter does not submit — Claude Code
+# binds Enter to "insert a newline" the moment the buffer has more than one line,
+# and prints `ctrl+x ctrl+s to send now` under it. Measured on quinn 2026-09-19
+# 23:27Z: an entire multi-line `/goal DIVE-4614` verifier brief sat in the
+# composer as an unsent draft, the seat never started a turn, and every later
+# tick read `busy — 1 in_progress, skip` for 9.5 hours.
+#
+# `ctrl+x ctrl+s` IS NOT AN OPTION: it cannot be delivered through tmux. Measured
+# twice on the live wedge — `send-keys C-x C-s`, and the two-step `send-keys C-x;
+# sleep 1; send-keys C-s`. Neither submits. The hint is written for a human at a
+# terminal, not for an injector.
+#
+# So the transport's real contract is: the payload we type must be ONE line. The
+# nudge itself already is (`_hb_nudge_text` builds a single long string); what
+# breaks it is the ENRICHMENTS, which interpolate free text written by other
+# seats — `_hb_reject_fix_clause` carries a verifier's `FINDING:/FIX:/VERIFY:`
+# feedback verbatim and `_hb_carryover_clause` carries a last message. Both are
+# multi-line whenever their author pressed Return, and neither author can know
+# their prose is about to become a keystroke stream.
+#
+# Flattening is lossless for what rides here: every payload on this path is
+# PROSE, and the newlines are paragraph breaks, not syntax. The alternative
+# transports both cost more than they buy — a file pointer makes the seat read a
+# file before it can read its goal (a turn, and a new failure mode when the file
+# is unreadable), and a real bracketed paste would still leave a multi-line
+# buffer whose Enter inserts a newline.
+_hb_flatten_payload() {
+  local t="$1"
+  t="${t//$'\r'/ }"
+  t="${t//$'\n'/ }"
+  t="${t//$'\t'/ }"
+  # collapse the runs the substitutions just created, and trim.
+  printf '%s' "$t" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+# Count of newlines in a payload — the log line's evidence that flattening did
+# something, so a green log never claims a fix it did not perform.
+_hb_payload_newlines() {
+  local t="$1" nl
+  nl="${t//[!$'\n']/}"
+  printf '%s' "${#nl}"
+}
+
+# DIVE-4642 — NEVER LEAVE TYPED TEXT IN A COMPOSER YOU COULD NOT SUBMIT.
+#
+# What the failed attempt LEAVES BEHIND is the destructive half. `wake-task`
+# injects `/clear` before the goal; when that injection fails today it does not
+# roll back, it sits in the composer and FIRES WHEN THE TARGET'S TURN ENDS —
+# a scheduled wipe of another agent's context. Measured: two wakes on quinn
+# (23:17:36Z, 23:17:41Z) wiped the seat's session.
+#
+# C-u, never Escape: Escape on a seat that is mid-turn ABORTS the turn; C-u only
+# edits the composer (verified on quinn and dev — both turns survived). The Up
+# arm is the second half of the measured recovery: when the payload has already
+# left the composer for the queue, Up recalls it so C-u can drop it. On an
+# already-empty composer Up+C-u recalls one history entry and clears it again,
+# which is a no-op on the seat.
+#
+# Returns 0 when the composer is EMPTY afterwards, 1 when text survived both
+# arms; sets _HB_COMPOSER_UNSENT either way.
+_hb_composer_clear() {
+  local name="$1"
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
+  _hb_verify_submit "$name" && return 0
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Up 2>/dev/null || true
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
+  _hb_verify_submit "$name" && return 0
+  return 1
+}
+
+# DIVE-4642 — the deadlock probe, read at the busy-guard.
+#
+# `busy` is inferred from `in_progress` alone, and that is the deadlock: the row
+# keeps the seat busy, and being busy is what stops the seat ever being re-woken.
+# A wedged seat satisfies THREE things at once, and only a wedged seat does:
+#   1. it is a claude seat (the pane has a composer to read at all),
+#   2. its native run-state is a DEFINITE `idle` — `claude agents --json` says no
+#      turn is in flight, so "busy" is already false on the seat's own word,
+#   3. its composer holds non-ghost text — something was typed and never sent.
+# Conjunction, and every leg must be measured: an unavailable native signal
+# returns rc 1 here (false-negative bias, the house rule), because reporting a
+# working seat as wedged would clear a composer mid-thought.
+#
+# On a positive reading this MARKS the ledger and CLEARS the draft, so the caller
+# is free to dispatch into an empty composer on this same tick.
+_hb_wedge_probe() {
+  local name="$1" st unsent
+  [[ -n "$(_hb_claude_pid "$name")" ]] || return 1
+  st=$(_hb_agent_native_state "$name") || return 1
+  [[ "$st" == "idle" ]] || return 1
+  unsent=$(_hb_composer_unsent "$name")
+  [[ -n "$unsent" ]] || return 1
+  _HB_COMPOSER_UNSENT="$unsent"
+  _wedge_mark "$name" "${#unsent}" "$unsent" "residual"
+  if _hb_composer_clear "$name"; then
+    _wedge_mark "$name" "${#unsent}" "$unsent" "cleared"
+  fi
+  return 0
+}
+
 # Inject one literal line + Enter into an agent's tmux pane. Returns nonzero
 # (never exits) so a single dead pane can't abort the whole tick.
 _hb_send_line() {
   local name="$1" text="$2" tries=0
   _HB_SEND_FAIL_REASON=""   # DIVE-4310: never report a previous attempt's cause
+  # DIVE-4642: FIRST, before the inbox route and before anything is typed — the
+  # payload becomes ONE line or it can never be submitted by an Enter. See
+  # _hb_flatten_payload for why this is the transport's contract and not a
+  # cosmetic tidy-up.
+  local _hb_nl; _hb_nl=$(_hb_payload_newlines "$text")
+  if (( _hb_nl > 0 )); then
+    text=$(_hb_flatten_payload "$text")
+    _hb_log "[$name] payload carried ${_hb_nl} newline(s) — flattened to one line before typing; a multi-line composer binds Enter to newline and the submit could never land (DIVE-4642)" 2>/dev/null || true
+  fi
   # DIVE-2137: the heartbeat is the FOURTH typed-send site (send / ask / _deliver
   # are the three in cmd_agent_runtime.sh) and had the same blind spot — it types
   # a nudge into whatever the pane happens to be showing. An agent that booted
@@ -2378,12 +2529,25 @@ _hb_send_line() {
   # claim on a prompt nobody received.
   if [[ -n "$(_hb_claude_pid "$name")" ]]; then
     _hb_send_keys_step "$name" "submit (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
-    _hb_verify_submit "$name" && return 0
+    _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
     sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
     _hb_send_keys_step "$name" "submit retry (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
-    _hb_verify_submit "$name" && return 0
-    _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}') (DIVE-4242)"
-    _hb_log "[$name] submit UNVERIFIED — the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}'); returning failure so nothing is claimed on it (DIVE-4242)" 2>/dev/null || true
+    _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
+    # DIVE-4642: the submit failed and we KNOW it. Two things follow, and today
+    # neither happened: the seat is marked unhealthy so `5dive supervisor` names
+    # it within one tick instead of reporting it busy forever, and the text we
+    # typed is REMOVED. Leaving it is not neutral — on the wake-task path the
+    # residual is a `/clear` that fires at the target's next turn boundary and
+    # wipes a working seat's context.
+    local _hb_wedged="${_HB_COMPOSER_UNSENT}"
+    _wedge_mark "$name" "${#_hb_wedged}" "$_hb_wedged" "residual"
+    if _hb_composer_clear "$name"; then
+      _wedge_mark "$name" "${#_hb_wedged}" "$_hb_wedged" "cleared"
+      _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still held ${#_hb_wedged} chars of non-ghost text after 2 Enters ('${_hb_wedged:0:60}') — the draft has been CLEARED and the seat marked wedged, so nothing of it fires later (DIVE-4642; was DIVE-4242)"
+    else
+      _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}') AND the clear did not take — the seat is wedged with a residual draft that may fire at its next turn boundary; it needs 'sudo 5dive agent restart ${name}' (DIVE-4642)"
+    fi
+    _hb_log "[$name] submit UNVERIFIED — ${_HB_SEND_FAIL_REASON}; returning failure so nothing is claimed on it" 2>/dev/null || true
     return 1
   fi
   sleep 0.4
@@ -2424,13 +2588,38 @@ _hb_composer_unsent() {
   line="${line//$'\xc2\xa0'/ }"
   line="${line//[$'\t\r\n']/ }"
   line=$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")
+  # DIVE-4642 — EXCLUDE THE HARNESS'S OWN COMPOSER HINTS, BY CONTENT.
+  #
+  # `Press up to edit queued messages` is exactly 32 bytes and it is NOT our
+  # string (`grep -rn` across src finds nothing): it is Claude Code's own hint,
+  # rendered only when at least one message IS queued. So on a mid-turn seat the
+  # guard's failure condition and the success it exists to detect coincide — the
+  # payload was typed, the Enter queued it, the TUI announced that in the only
+  # place this function looks, and the announcement was read as leftover input.
+  # Measured on main 2026-09-14 09:12Z (DIVE-4355), and the addendum to
+  # community/wiki/an-injected-prompt-can-sit-unsent-while-the-seat-reads-busy-verify-the-submit-before-you-claim.md
+  # names the repair: exclude it by CONTENT, not by dim attribute, and treat its
+  # presence as a POSITIVE receipt.
+  #
+  # This is a precondition of the clear that DIVE-4642 added above it, not a
+  # cosmetic tidy-up. Without it, `_hb_composer_clear` would fire on a seat that
+  # had submitted successfully, and its `Up` arm would RECALL the queued message
+  # so the following `C-u` could delete it — destroying the very payload the
+  # wake delivered. A guard that is wrong in this direction is worse than none.
+  case "$line" in
+    'Press up to edit queued messages'|'ctrl+x ctrl+s to send now') line="" ;;
+  esac
   printf '%s' "$line"
 }
 
 # DIVE-4242: did the Enter take? 0 = composer empty of non-ghost text (the
 # payload left it), 1 = text still sitting there (sets _HB_COMPOSER_UNSENT for
 # the caller's log line). Waits a beat first so the TUI has redrawn.
-_HB_COMPOSER_UNSENT=""
+#
+# _HB_COMPOSER_UNSENT is DECLARED IN src/lib/state.sh, not here. cmd_agent_runtime
+# reads it too, and a column-0 assignment in this module would make cmd_heartbeat
+# its lazy-dispatch provider — an edge that closes over every verb in the CLI
+# (DIVE-4642). This module writes it; core declares it.
 _hb_verify_submit() {
   local name="$1"
   sleep "${_HB_SUBMIT_VERIFY_SEC:-0.3}"
@@ -3884,10 +4073,19 @@ _hb_loop_terminal_clause() {
     # ungated by the guard. So branch (1) names that, and branch (2) hands off the
     # same way after the merge instead of saying "then close".
     if [[ -n "$_tfv_owner" && "$_tfv_owner" == "$name" ]]; then
-      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS (%s): graded, delivery ref bound, and you own the merge. Read the pull request FIRST, then do exactly one of three and say which: (1) ALREADY MERGED -> the close is NOT yours to run from here (the row is still assigned to the maker, so a close from this seat re-delivers the row and is refused, DIVE-4520): hand it to the seat that closes a loop row — its verifier %s, which may be you — with %s, and that seat closes it; honour any owed clause in the PASS verdict first (a merged PR is not automatically a finished row) and leave it open if something is still owed; (2) mergeable and green -> %s, then hand it on exactly as in (1); (3) a required check is red or it conflicts -> that is the MAKER%s move: %s naming the check, and stop. Do not re-grade, re-deliver or route it onward.' \
+      # DIVE-4654 — BRANCH (1) NAMES THE VERB THAT EXITS THE STAGE. It used to
+      # name `task assign` onto the verifier, which moves the row and leaves it
+      # in MERGING: the board goes on painting graded->merge, the picker goes on
+      # excluding the assignee it just handed the row to, and this same dispatch
+      # fires again next tick. That is the loop ops measured on DIVE-4632 (four
+      # dispatches, three no-ops). `task merge-landed` records the landing the
+      # forge already reports, retires the hold, exits the stage AND hands the
+      # row to the closing seat in one act — so the seat this note wakes now has
+      # a verb for the state it is woken into.
+      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS (%s): graded, delivery ref bound, and you own the merge. Read the pull request FIRST, then do exactly one of three and say which: (1) ALREADY MERGED -> %s, which records the landing, takes the row out of the merging stage and hands it to the seat that closes a loop row (its verifier %s, which may be you); the close is NOT yours to run from here while the row is assigned to the maker (DIVE-4520), and you must honour any owed clause in the PASS verdict first — a merged PR is not automatically a finished row, so leave it open if something is still owed; (2) mergeable and green -> %s, then record the landing exactly as in (1); (3) a required check is red or it conflicts -> that is the MAKER%s move: %s naming the check, and stop. Do not re-grade, re-deliver or route it onward.' \
         "$task_ident" "$name" \
+        "'5dive task merge-landed ${task_ident}'" \
         "'$vfier'" \
-        "'5dive task assign ${task_ident} ${vfier}'" \
         "'5dive task merge ${task_ident}'" \
         "$([[ -n "$maker" ]] && printf "'s (%s)" "$maker" || printf "'s")" \
         "'5dive task reject ${task_ident} --feedback=...'"
@@ -6925,19 +7123,31 @@ _hb_memory_consolidate_sweep() {
     # DIVE-3711 defect itself: a success counter must be able to produce the
     # negative for the thing it names, and this one could not.
     #
-    # The child sources the seat's OWN auth env first. `sudo -H` resets the
-    # environment, so CLAUDE_CODE_OAUTH_TOKEN — which is how these seats are
+    # The child re-creates the unit's OWN credential environment. `sudo -H` resets
+    # the environment, so CLAUDE_CODE_OAUTH_TOKEN — which is how these seats are
     # authenticated; they hold no on-disk credential under their own HOME — never
     # reached the distiller, and every call came back "Not logged in · Please run
-    # /login". Sourced INSIDE the child (the file is group-readable by the seat)
-    # rather than passed as an argument, which would put the token in `ps`.
+    # /login". Sourced INSIDE the child (both files are group-readable by the
+    # seat) rather than passed as arguments, which would put the token in `ps`.
+    #
+    # DIVE-4648: it must replay the unit's EnvironmentFile ORDER, not just the
+    # profile overlay. A seat with NO auth profile bound has no
+    # `<name>-auth.env` at all — it is authed by the SHARED connector, exactly as
+    # `systemd/5dive-agent@.service` loads it (shared anthropic.env first, then
+    # the `%i`-auth overlay last) and as `5dive-agent-start` replays it before
+    # first launch. Sourcing only the overlay meant `[ -r ]` silently skipped a
+    # file that was never going to exist, and every unbound seat's distiller ran
+    # with no credential at all — memory consolidation lost with no signal, and
+    # doctor pointing the operator at a credential `auth status --probe` reports
+    # healthy. Shared FIRST, profile LAST so a profiled seat still wins.
+    local sharedenv="${CONNECTORS_DIR:-/etc/5dive/connectors}/anthropic.env"
     local authenv="${ENV_DIR:-${STATE_DIR:-/var/lib/5dive}/agents.d}/${name}-auth.env"
     local out=""
     # One line, deliberately: a multi-line -c payload carries newlines into every
     # log, `ps` line and test recorder that echoes the argv back.
     out=$(timeout "${_HB_CONSOLIDATE_TIMEOUT_S}" sudo -n -u "$user" -H bash -c \
-         'set -a; [ -r "$1" ] && . "$1"; set +a; exec "$2" memory consolidate --max-sessions=1 --json' \
-         _ "$authenv" "${SELF_BIN:-/usr/local/bin/5dive}" 2>/dev/null) || out="${out:-}"
+         'set -a; [ -r "$1" ] && . "$1"; [ -r "$2" ] && . "$2"; set +a; exec "$3" memory consolidate --max-sessions=1 --json' \
+         _ "$sharedenv" "$authenv" "${SELF_BIN:-/usr/local/bin/5dive}" 2>/dev/null) || out="${out:-}"
     local n_atoms n_proc n_dfail
     # `--slurp` and take the FIRST object that carries the field, because the
     # stream can hold TWO envelopes: on a non-zero exit the CLI's EXIT-trap
@@ -7094,6 +7304,320 @@ _hb_quota_snapshot_sweep() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# DIVE-4591 — NOTICE AN *EARLY* PROVIDER RESET.
+#
+# lodar, 2026-09-16: "can we set hourly ping or something in case the weekly
+# usage limit will reset because we will never know when it can happen and all
+# agent will not take hb".
+#
+# THE SCHEDULED RESET ALREADY HAS AN OWNER and this sweep must never become a
+# second one. `_hb_quota_unpark` (above) releases a parked seat once the deadline
+# the wall itself printed has passed, re-stamps the budget clock on its held rows
+# and wakes it. What had no owner is the UNSCHEDULED edge: the provider lifting a
+# weekly limit BEFORE the printed time. Nothing on this box can see that happen:
+#
+#   1. Every quota number 5dive holds is a RECALL, not an observation. The
+#      account-usage snapshot is built from each seat's ~/.claude/statusline-last.json,
+#      which Claude Code only rewrites when that seat TAKES A TURN. A parked seat
+#      takes no turns, so its reading is frozen at the moment it hit the wall —
+#      permanently, and it still reads as a current fact to every consumer.
+#   2. Claude Code's own picker parks until the printed time too.
+#
+# So no amount of re-reading local state can discover an early reset, and the
+# ONLY live probe is a real turn. This sweep is the thing that decides to spend
+# one, on a cadence, and says in the log what it cost.
+#
+# WHAT IT IS NOT. It is not the pane. The fleet-health matcher false-fires on any
+# pane that merely RENDERS the picker's wording, and pane text cannot tell a live
+# wall from the leftovers of one (DIVE-3880, DIVE-4581) — so the decision to
+# probe is taken from the account's own MEASURED reading through
+# `quota_wall_account`, which classifies at read time against the caller's clock.
+# It is also not DIVE-3465's spend-cap release probe (that restarts ONE held seat
+# to re-read ITS pane) nor DIVE-1666/1677's frozen-dialog self-heal (that unsticks
+# a seat whose dialog outlived its cause). Both of those act on a seat. This acts
+# on an ACCOUNT, out of band, and touches no seat at all unless the account is
+# proven live again.
+#
+# COST DISCIPLINE, which is the whole reason it is allowed to exist:
+#   * a profile with headroom is never probed — there is nothing to discover;
+#   * a profile past its printed reset is never probed — `_hb_quota_unpark` owns
+#     that transition and two owners for one transition is the defect to avoid;
+#   * a profile whose reading is UNMEASURED is never probed — a blind probe is a
+#     turn spent to learn nothing, and `unmeasured` is a real third state;
+#   * so the only profile probed is one that is walled AND still before its
+#     printed reset, at most once per _HB_QUOTA_PROBE_EVERY_SEC — and on a still
+#     walled account the provider REFUSES the turn, which spends nothing. The one
+#     turn it can actually cost is spent only when the account is live again,
+#     which is exactly the answer being bought.
+#
+# THE PROBE IS HEADLESS, NOT A SEAT. `auth_probe_output` runs the type's own
+# `--print` invocation under the profile's combined.env (the precedence systemd
+# uses) as the `claude` user. Print mode renders no picker, so this probe cannot
+# leave a seat sitting on a chooser — the failure mode the row named. A seat that
+# IS on one is DIVE-4581's subject and is answered by the supervisor tick.
+#
+# AND IT NEVER INFERS "LIVE" FROM SILENCE. An empty probe, a network error, a
+# timeout and an auth failure are all `unknown`, and `unknown` changes nothing.
+# `live` requires the sentinel the probe asked for to come back — positive
+# evidence that the provider served a turn on this account — because the action
+# on `live` is to restart seats and rewrite a recorded deadline, and doing that
+# on a blind probe would be far worse than missing one early reset.
+_HB_QUOTA_PROBE_EVERY_SEC="${_HB_QUOTA_PROBE_EVERY_SEC:-3600}"
+_HB_QUOTA_PROBE_TIMEOUT_SEC="${_HB_QUOTA_PROBE_TIMEOUT_SEC:-60}"
+# THE TICK IS THE FLEET'S DISPATCHER AND THIS SWEEP RUNS INSIDE IT. A walled
+# account refuses in seconds — that is the common case and it is cheap — but a
+# hung provider connection would otherwise hold the tick for one timeout PER
+# walled account. So the pass carries a wall-clock budget: it always fires at
+# least one probe (a budget that can starve every probe is a wedge, not a
+# bound), and stops once it has spent this much, deferring the rest to the next
+# cadence and SAYING so. 180s ~= three timeouts; an hourly pass that cannot
+# finish inside that is a provider problem, not a reason to stall dispatch.
+_HB_QUOTA_PROBE_BUDGET_SEC="${_HB_QUOTA_PROBE_BUDGET_SEC:-180}"
+_HB_QUOTA_PROBE_SENTINEL="${_HB_QUOTA_PROBE_SENTINEL:-FIVEDIVEQUOTAPROBEOK}"
+
+# _hb_quota_probe_decide <state> <resetEpoch|""> <now> — pure. Echoes `probe`
+# or `skip:<reason>`. The reason is not decoration: it is what the log line says
+# and what the harness asserts, so a silent skip cannot pass for a probe.
+_hb_quota_probe_decide() {
+  local state="${1:-}" reset="${2:-}" now="${3:-0}"
+  case "$state" in
+    exhausted) ;;
+    clear)     printf 'skip:headroom\n'; return 0 ;;
+    *)         printf 'skip:unmeasured\n'; return 0 ;;
+  esac
+  # ARMED EXPLICITLY, not left to a happy accident. `quota_wall_reset_guard`
+  # already rewrites an exhausted reading whose window has reset to `unmeasured`,
+  # so this branch is belt to that suspenders — but the property being protected
+  # (the heartbeat's un-park owns a lapsed deadline, alone) is this sweep's, and
+  # a property nothing here tests is a property that drifts away from here.
+  if [[ "$reset" =~ ^[0-9]+$ ]] && (( reset > 0 && now >= reset )); then
+    printf 'skip:deadline-passed\n'; return 0
+  fi
+  printf 'probe\n'
+}
+
+# _hb_quota_probe_classify <sentinel> — pure, reads the probe output on stdin.
+# Echoes live | walled | unknown. ORDER IS LOAD-BEARING: the wall is checked
+# BEFORE the sentinel, so a refusal that happens to quote the prompt back can
+# never be read as a served turn.
+_hb_quota_probe_classify() {
+  local sentinel="${1:-$_HB_QUOTA_PROBE_SENTINEL}" out pat
+  out=$(cat)
+  [[ -n "${out//[[:space:]]/}" ]] || { printf 'unknown\n'; return 0; }
+  pat="${_SUP_QUOTA_PAT:-usage[[:space:]]+limit[[:space:]]+reached|hit[[:space:]]+your[[:space:]]+([^[:space:]]+[[:space:]]+)?((monthly|weekly|daily)[[:space:]]+spend|session|usage|5[[:space:]-]?hour)[[:space:]]+limit|quota[[:space:]]+exhausted|insufficient_quota}"
+  grep -qiE "$pat" <<<"$out" 2>/dev/null && { printf 'walled\n'; return 0; }
+  grep -qF "$sentinel" <<<"$out" 2>/dev/null && { printf 'live\n'; return 0; }
+  printf 'unknown\n'
+}
+
+# _hb_quota_probe_run <profile> — fire ONE turn on that profile and echo what
+# came back. The seam `_HB_QUOTA_PROBE_CMD` lets a harness drive the sweep with
+# no provider, no sudo and no network; it is never set in production.
+_hb_quota_probe_run() {
+  local profile="$1" bin cmd
+  if [[ -n "${_HB_QUOTA_PROBE_CMD:-}" ]]; then
+    "${_HB_QUOTA_PROBE_CMD}" "$profile" 2>&1 || true
+    return 0
+  fi
+  declare -F auth_probe_output >/dev/null 2>&1 || return 0
+  bin="${TYPE_BIN[claude]:-/home/claude/.local/bin/claude}"
+  cmd="${bin} --print $(printf '%q' "Reply with exactly this word and nothing else: ${_HB_QUOTA_PROBE_SENTINEL}")"
+  auth_probe_output claude "$profile" "$_HB_QUOTA_PROBE_TIMEOUT_SEC" "$cmd" || true
+  return 0
+}
+
+# _hb_quota_probe_walled_seats <profile> <registry-json> — the seats bound to
+# this profile whose NEWEST supervisor observation is quota-exhausted. The
+# newest observation, not "a wall ever seen": the same authority
+# `_hb_quota_park_until_seat` uses, so this sweep and the park can never disagree
+# about who is parked.
+_hb_quota_probe_walled_seats() {
+  local profile="$1" reg="$2" walled seat
+  walled=$(db "SELECT agent FROM supervisor_events
+                WHERE id IN (SELECT MAX(id) FROM supervisor_events GROUP BY agent)
+                  AND classification='quota-exhausted';" 2>/dev/null) || return 0
+  [[ -n "$walled" ]] || return 0
+  while IFS= read -r seat; do
+    [[ -n "$seat" ]] || continue
+    [[ "$(jq -r --arg n "$seat" '.agents[$n].authProfile // ""' <<<"$reg" 2>/dev/null)" == "$profile" ]] || continue
+    printf '%s\n' "$seat"
+  done <<<"$walled"
+}
+
+# _hb_quota_probe_correct_deadline <seat> <now> — REWRITE THE STORED DEADLINE to
+# the instant the reset was MEASURED. Echoes the number of rows it moved.
+#
+# This is the half of the row that is easy to leave out and fatal to leave out.
+# Every consumer of the park — `_hb_quota_park_until_seat`, `_hb_quota_parked`,
+# `_hb_quota_unpark` — derives it from `signals.quotaDeadlineEpoch` on the seat's
+# newest observation. Restarting a seat without correcting that number leaves the
+# next tick re-deriving the wall's PRINTED time and re-parking the seat we just
+# freed.
+#
+# It edits the deadline and NOT the classification on purpose. The classification
+# records what the pane said and stays true; the deadline records when the wall
+# lifts, and we have just measured that it lifted early. Leaving the class as
+# `quota-exhausted` with a past deadline is precisely the input `_hb_quota_unpark`
+# is built to act on — so the transition keeps its ONE owner, which re-stamps the
+# budget clocks and wakes the seat. `quotaDeadlineCorrectedAt` is written beside
+# it so a later reader can see the number was measured here, not printed by a
+# wall.
+_hb_quota_probe_correct_deadline() {
+  local seat="$1" now="$2" moved
+  moved=$(db "UPDATE supervisor_events
+                 SET signals = json_set(signals,
+                                        '\$.signals.quotaDeadlineEpoch', ${now},
+                                        '\$.signals.quotaDeadlineCorrectedAt', ${now})
+               WHERE id = (SELECT MAX(id) FROM supervisor_events WHERE agent=$(sqlq "$seat"))
+                 AND classification='quota-exhausted'
+                 AND COALESCE(json_extract(signals, '\$.signals.quotaDeadlineEpoch'), 0) > ${now};
+              SELECT changes();" 2>/dev/null) || moved=0
+  [[ "$moved" =~ ^[0-9]+$ ]] || moved=0
+  printf '%s' "$moved"
+}
+
+# _hb_quota_probe_release <profile> <now> <registry-json> — the account is live
+# again. Put its parked seats back to work. Echoes "<restarted> <corrected>".
+#
+# ORDER IS THE DESIGN. (1) correct the deadline, so nothing can re-park the seat
+# on the printed time. (2) restart the seat — a parked Claude Code session is
+# waiting on ITS OWN clock and will not resume just because the provider changed
+# its mind, so a fresh session is what makes the seat able to work, and it also
+# ends any stale picker without a keystroke. (3) settle the pane, then hand the
+# seat to `_hb_quota_unpark` with a zero grace: it re-stamps the budget clock on
+# the held rows (so nothing is reaped on a claim age that accrued while the seat
+# was TOLD not to work) and wakes it onto its held row. We call the existing
+# owner rather than re-implementing three lines of it.
+#
+# The grace is zero HERE and only here: its purpose upstream is to give a seat
+# one tick to resume on its own before anything is taken off it, and we have just
+# restarted the seat, which is a stronger act than waiting for a self-resume that
+# cannot come.
+#
+# AN OPERATOR PARK OUTRANKS THIS. A seat whose desiredState is stopped was parked
+# by a person; the account being live again is not a reason to start it. Its
+# deadline is still corrected (that record should not stay wrong), and it is
+# neither restarted nor woken.
+_hb_quota_probe_release() {
+  local profile="$1" now="$2" reg="$3" seat restarted=0 corrected=0 moved
+  while IFS= read -r seat; do
+    [[ -n "$seat" ]] || continue
+    moved=$(_hb_quota_probe_correct_deadline "$seat" "$now")
+    (( moved > 0 )) && corrected=$((corrected + 1))
+    if declare -F _hb_agent_is_parked >/dev/null 2>&1 && _hb_agent_is_parked "$seat"; then
+      _hb_log "[$seat] account '${profile}' reset early, but this seat is parked by operator intent — deadline corrected, NOT restarted (DIVE-4591)"
+      continue
+    fi
+    if systemctl restart "5dive-agent@${seat}.service" 2>/dev/null; then
+      restarted=$((restarted + 1))
+      _hb_log "[$seat] account '${profile}' reset EARLY — restarted the seat onto a fresh session (its parked session waits on the wall's printed time and cannot resume itself) (DIVE-4591)"
+      declare -F _hb_wake_settle_tmux >/dev/null 2>&1 && _hb_wake_settle_tmux "$seat"
+    else
+      _hb_log "[$seat] account '${profile}' reset early — restart FAILED (systemctl); the deadline is corrected either way, so the ordinary un-park still frees the claim (DIVE-4591)"
+    fi
+    # The single owner of the transition. Zero grace: see above.
+    _hb_quota_unpark "$seat" 0 || true
+  done < <(_hb_quota_probe_walled_seats "$profile" "$reg")
+  printf '%s %s' "$restarted" "$corrected"
+}
+
+# _hb_quota_probe_accounts <registry-json> — the auth profiles worth probing:
+# named (not `@self:` — those carry no combined.env to probe under), bound to at
+# least one claude-type seat, and holding a readable credential. Anything else
+# would be a turn spent against the wrong account or no account at all.
+_hb_quota_probe_accounts() {
+  local reg="$1" p
+  while IFS= read -r p; do
+    [[ -n "$p" && "$p" != "@self:"* ]] || continue
+    [[ -r "${AUTH_PROFILES_DIR}/${p}/combined.env" ]] || continue
+    printf '%s\n' "$p"
+  done < <(jq -r '[.agents[] | select((.type // "claude") == "claude")
+                            | .authProfile // ""] | unique | .[]' <<<"$reg" 2>/dev/null)
+}
+
+# _hb_quota_probe_sweep <now> <registry-json> — the hourly pass. Same isolation
+# contract as every other sweep: it must never abort the wake loop, and it must
+# never report a probe it did not fire.
+_hb_quota_probe_sweep() {
+  local now="$1" reg="${2:-}"
+  _HB_QPROBE_FIRED=0; _HB_QPROBE_SKIPPED=0; _HB_QPROBE_RESET=0; _HB_QPROBE_UNKNOWN=0; _HB_QPROBE_WALLED=0
+  [[ "${QUOTA_EARLY_PROBE:-on}" == "off" ]] && return 0
+  # The literal is repeated here ON PURPOSE. Every other fallback in this pair
+  # of lines is a VARIABLE, and a cadence that falls back to an unset variable
+  # is a cadence of zero — i.e. a probe on every tick, a turn a minute, the one
+  # failure of this sweep that costs real money. A bad value lands on the hour.
+  local every="${QUOTA_EARLY_PROBE_EVERY_SEC:-${_HB_QUOTA_PROBE_EVERY_SEC:-3600}}"
+  [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) || every=3600
+  # A packaging defect is NAMED, never swallowed — silence here reads exactly
+  # like "no account was walled", which is the shape of the defect this sweep
+  # exists to end (same rule as the snapshot sweep above).
+  if ! declare -F quota_wall_account >/dev/null 2>&1; then
+    _hb_log "[quota-probe] PACKAGING DEFECT: quota_wall_account is not defined in this process — src/lib/quota_wall.sh is missing from the bundle manifest (build.sh). An early provider reset cannot be noticed on this box (DIVE-4591)."
+    return 0
+  fi
+  local stamp="${STATE_DIR:-/var/lib/5dive}/quota-probe.stamp" last
+  last=$(cat "$stamp" 2>/dev/null) || last=0
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  # A stamp from the FUTURE (clock step, restored backup) would otherwise wedge
+  # the probe until real time caught up — the failure that looks like success.
+  (( last > now )) && last=0
+  (( now - last < every )) && return 0
+  # Stamp BEFORE the pass: the tick fires every minute and a pass blocked on a
+  # slow provider must not be re-entered by the next one. A crashed pass just
+  # waits one cadence.
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+  [[ -n "$reg" ]] || reg=$(registry_read 2>/dev/null) || return 0
+  [[ -n "$reg" ]] || return 0
+  local budget="${_HB_QUOTA_PROBE_BUDGET_SEC:-180}"
+  [[ "$budget" =~ ^[0-9]+$ ]] || budget=180
+  local started; started=$(date +%s)
+  local acct rec state window pct resets reset_ep verdict out cls rel
+  local us="${QUOTA_US:-}"; [[ -n "$us" ]] || us=$'\037'
+  while IFS= read -r acct; do
+    [[ -n "$acct" ]] || continue
+    rec=$(quota_wall_account "$acct" 2>/dev/null) || rec=""
+    state=""; window=""; pct=""; resets=""
+    IFS="$us" read -r state window pct resets _ _ <<<"$rec"
+    reset_ep=""
+    [[ -n "$resets" ]] && { reset_ep=$(date -u -d "$resets" +%s 2>/dev/null) || reset_ep=""; }
+    verdict=$(_hb_quota_probe_decide "$state" "$reset_ep" "$now")
+    if [[ "$verdict" != "probe" ]]; then
+      _HB_QPROBE_SKIPPED=$((_HB_QPROBE_SKIPPED + 1))
+      [[ "${verdict#skip:}" == "deadline-passed" ]] && \
+        _hb_log "[quota-probe] '${acct}' is walled but its printed reset has passed — NOT probed; the heartbeat's own un-park owns that transition (DIVE-4591)"
+      continue
+    fi
+    if (( _HB_QPROBE_FIRED > 0 )) && (( $(date +%s) - started >= budget )); then
+      _HB_QPROBE_SKIPPED=$((_HB_QPROBE_SKIPPED + 1))
+      _hb_log "[quota-probe] '${acct}' is due a probe but this pass has spent its ${budget}s wall-clock budget — deferred to the next cadence rather than holding the dispatch tick (DIVE-4591)"
+      continue
+    fi
+    # THE COST LINE, every time a turn is spent. A box owner has to be able to
+    # see what this watcher costs them without reading the source.
+    _hb_log "[quota-probe] '${acct}' reads ${pct:-?}% of its ${window:-?} limit and its printed reset is still ahead — SPENDING ONE SHORT TURN to ask whether the window moved early. Cost: one ~10-token print-mode turn on this account; a still-walled account REFUSES it and spends nothing (DIVE-4591)"
+    _HB_QPROBE_FIRED=$((_HB_QPROBE_FIRED + 1))
+    out=$(_hb_quota_probe_run "$acct")
+    cls=$(printf '%s' "$out" | _hb_quota_probe_classify)
+    case "$cls" in
+      live)
+        _HB_QPROBE_RESET=$((_HB_QPROBE_RESET + 1))
+        rel=$(_hb_quota_probe_release "$acct" "$now" "$reg")
+        _hb_log "[quota-probe] '${acct}' EARLY RESET: the provider served a turn before the reset time its own wall printed — ${rel% *} seat(s) restarted, ${rel#* } stored deadline(s) corrected to the measured instant so nothing re-parks them (DIVE-4591)"
+        ;;
+      walled)
+        _HB_QPROBE_WALLED=$((_HB_QPROBE_WALLED + 1))
+        _hb_log "[quota-probe] '${acct}' still walled — the turn was refused, nothing restarted, no row's clock moved (DIVE-4591)"
+        ;;
+      *)
+        _HB_QPROBE_UNKNOWN=$((_HB_QPROBE_UNKNOWN + 1))
+        _hb_log "[quota-probe] '${acct}' probe returned NEITHER the sentinel nor a wall (empty, timeout, network or auth) — COULD-NOT-DETERMINE, so nothing changes. A blind probe is never read as headroom (DIVE-4591)"
+        ;;
+    esac
+  done < <(_hb_quota_probe_accounts "$reg")
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
@@ -7108,6 +7632,13 @@ cmd_heartbeat_tick() {
   _hb_quota_snapshot_sweep "$now" || _hb_log "[quota-snapshot] pass errored (non-fatal)"
   (( ${_HB_QSNAP_RAN:-0} || ${_HB_QSNAP_FAILED:-0} )) \
     && _hb_log "[quota-snapshot] account-usage snapshot ${_HB_QSNAP_RAN:-0} published, ${_HB_QSNAP_FAILED:-0} failed (cadence ${_HB_QUOTA_SNAPSHOT_EVERY_SEC:-120}s, consumer fence ${QUOTA_SNAPSHOT_MAX_AGE:-600}s)" || true
+  # DIVE-4591: and THEN ask whether a wall lifted EARLY — after the republish
+  # above, so the reading this decides on is this tick's, not the last one's.
+  # Hourly, account-level, and it spends a turn only on an account that is walled
+  # and still before its printed reset. Isolated like every other sweep.
+  _hb_quota_probe_sweep "$now" "$reg" || _hb_log "[quota-probe] pass errored (non-fatal)"
+  (( ${_HB_QPROBE_FIRED:-0} )) \
+    && _hb_log "[quota-probe] ${_HB_QPROBE_FIRED} probe(s) fired: ${_HB_QPROBE_RESET:-0} early reset(s), ${_HB_QPROBE_WALLED:-0} still walled, ${_HB_QPROBE_UNKNOWN:-0} could-not-determine; ${_HB_QPROBE_SKIPPED:-0} account(s) skipped unprobed (cadence ${_HB_QUOTA_PROBE_EVERY_SEC:-3600}s)" || true
   # DIVE-138: materialize due recurring templates FIRST so a freshly-cloned todo
   # is eligible for the wake loop below this same tick. Isolated — a failure here
   # must never abort the wake loop.
@@ -7318,7 +7849,18 @@ cmd_heartbeat_tick() {
                   WHERE assignee=$(sqlq "$name") AND status='in_progress'
                     AND NOT ( (${_TASKS_TFV_SQL})
                               AND $(_tasks_merge_owner_sql) <> $(sqlq "$name") );" 2>/dev/null || echo 0)
-    if [[ "${inprog:-0}" != "0" ]]; then
+    # DIVE-4642 — BUSY MUST NOT BE INFERRED FROM `in_progress` ALONE. That
+    # inference is the deadlock: the row keeps the seat "busy", and being "busy"
+    # is what stops the seat ever being re-woken, so a seat whose goal never
+    # submitted stays skipped forever while the board paints it healthy. Cross-
+    # check the seat before believing the count — _hb_wedge_probe returns 0 only
+    # when the seat's OWN native state says no turn is in flight AND its composer
+    # holds unsent text. On a positive reading it has already marked the ledger
+    # and cleared the draft, so we fall through to dispatch into a clean composer
+    # on this same tick rather than `continue`.
+    if [[ "${inprog:-0}" != "0" ]] && _hb_wedge_probe "$name"; then
+      _hb_log "[$name] ALARM: WEDGED, not busy — ${inprog} in_progress but the seat reports idle with ${#_HB_COMPOSER_UNSENT} chars of unsent text in its composer ('${_HB_COMPOSER_UNSENT:0:60}'); draft cleared, seat marked unhealthy, dispatching this tick (DIVE-4642)"
+    elif [[ "${inprog:-0}" != "0" ]]; then
       sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"
       # DIVE-4278: this tick just PROVED the seat is working. Say so on the
       # record, or `agent list` reports it as the most stalled seat on the box.
@@ -7428,7 +7970,7 @@ cmd_heartbeat_tick() {
         _pace_prio=$(db "SELECT COALESCE(NULLIF(priority,''),'medium') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
         if ! _pace_admits "$_pace_rc" "$_pace_prio" standard; then
           sk_pace=$((sk_pace + 1))
-          _hb_log "[$name] ${task_ident} (${_pace_prio:-<priority unreadable>}) HELD by the pacing floor — $(_pace_band_name "$_pace_rc") band: ${_pace_verdict}. Considering the next candidate; exits: 5dive task escalate ${task_id} to push this row through, or raise FIVE_PACE_7D_SOFT/FIVE_PACE_7D_HARD for the week (DIVE-4430)"
+          _hb_log "[$name] ${task_ident} (${_pace_prio:-<priority unreadable>}) HELD by the pacing floor — $(_pace_band_name "$_pace_rc") band: ${_pace_verdict}. Considering the next candidate; exits: 5dive task escalate ${task_id} to push this row through, or raise the floor that caused this band — FIVE_PACE_7D_SOFT/FIVE_PACE_7D_HARD for the week, FIVE_PACE_5H for the 5-hour session window (DIVE-4430, DIVE-4631)"
           continue
         fi
       fi

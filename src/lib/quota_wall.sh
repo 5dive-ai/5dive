@@ -204,12 +204,40 @@ quota_wall_seat() {
   quota_wall_account "$acct"
 }
 
-# quota_wall_phrase <window> <pct> <resetsAt> — the one human clause all three
-# surfaces print, so `agent list`, `liveness` and `supervisor` cannot drift into
-# describing the same wall three different ways.
+# quota_wall_when <resetsAt> [now_epoch] — DIVE-4666. The reset, rendered for a
+# person. Providers hand this field over in whatever shape they use, and the
+# account snapshot's is epoch SECONDS: the string that reached a phone on
+# 2026-09-20 was `resets 1789891800`, which is not a time to anybody reading it.
+#
+# Same UTC day as `now` -> `08:50Z`; any other day -> `Sep 21 08:50Z`, because a
+# bare clock on a 7d wall that lifts tomorrow reads as "an hour from now".
+# A shape this cannot resolve passes through VERBATIM — an unrendered stamp is
+# still more than a blank, and inventing a time is the one thing it must not do.
+quota_wall_when() {
+  local raw="${1:-}" now="${2:-}" secs="" out
+  [[ -n "$raw" ]] || return 0
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  if   [[ "$raw" =~ ^[0-9]{13}$ ]];    then secs=$(( 10#$raw / 1000 ))
+  elif [[ "$raw" =~ ^[0-9]{9,11}$ ]];  then secs=$(( 10#$raw ))
+  fi
+  if [[ -n "$secs" ]]; then
+    if [[ "$(date -u -d "@${secs}" +%Y-%m-%d 2>/dev/null)" == "$(date -u -d "@${now}" +%Y-%m-%d 2>/dev/null)" ]]; then
+      out=$(date -u -d "@${secs}" '+%H:%MZ' 2>/dev/null) || out=""
+    else
+      out=$(date -u -d "@${secs}" '+%b %-d %H:%MZ' 2>/dev/null) || out=""
+    fi
+    [[ -n "$out" ]] && { printf '%s' "$out"; return 0; }
+  fi
+  printf '%s' "$raw"
+}
+
+# quota_wall_phrase <window> <pct> <resetsAt> [now_epoch] — the one human clause
+# all three surfaces print, so `agent list`, `liveness` and `supervisor` cannot
+# drift into describing the same wall three different ways. DIVE-4666: that is
+# also why the epoch is rendered HERE and not at each of the three call sites.
 quota_wall_phrase() {
-  local win="${1:-}" pct="${2:-}" reset="${3:-}"
+  local win="${1:-}" pct="${2:-}" reset="${3:-}" now="${4:-}"
   printf 'account at %s%% of its %s limit' "${pct:-?}" "${win:-quota}"
-  [[ -n "$reset" ]] && printf ' — resets %s' "$reset"
+  [[ -n "$reset" ]] && printf ' — resets %s' "$(quota_wall_when "$reset" "$now")"
   printf '\n'
 }

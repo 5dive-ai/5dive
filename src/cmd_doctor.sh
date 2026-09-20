@@ -107,6 +107,78 @@ doctor_check_audit_drop_dir() {
     "$dir is a directory with mode 2770 and group $expected_group; lost audit rows can leave a drop marker"
 }
 
+# doctor_check_gate_repo_visibility
+#
+# DIVE-4619 — THE STANDING FINDING THE CLOSE PATH USED TO RE-PRINT 45 TIMES.
+#
+# "this seat's GitHub credential can see 6 of 11 repos" is a property of the BOX
+# and its credentials. It does not change between two closes, so the close path
+# is the wrong surface for it: luca's box carried an identical warning on 45 of
+# 57 closes over three days, which is how the one close that needed a second look
+# became indistinguishable from the 44 that did not. The close still writes its
+# audit row and its UNVERIFIED stamp every time; the sentence a PERSON reads
+# belongs here, once.
+#
+# WHY THIS READS A RECORDED MEASUREMENT AND DOES NOT PROBE. The dashboard polls
+# `doctor --json`, and a live probe is one network call PER CONFIGURED REPO per
+# poll — the same cost that made DIVE-3457 take `models` out of the default run.
+# The merge-gate scan already measures this on every no-binding close and now
+# persists what it saw, so this check is free and says nothing the gate did not
+# actually observe. It reports the reading's AGE rather than presenting it as
+# live, and `5dive task merge-gate-selftest` is the live re-measure.
+#
+# A box with NO reading is reported `ok` with "not measured" — never a clean
+# bill. An absent measurement and a measured pass must not read the same.
+doctor_check_gate_repo_visibility() {
+  local dir f n=0
+  # The gate helpers live in src/task/gate_evidence.sh, later in the bundle. A
+  # partial source (a harness that loads doctor alone) must degrade to "not
+  # measured", never to a crash inside a health check.
+  if ! declare -F _gate_vis_dir >/dev/null 2>&1; then
+    doctor_add creds merge-gate-repos ok \
+      "merge-gate repo visibility not measured (gate helpers not loaded in this context)"
+    return 0
+  fi
+  dir="$(_gate_vis_dir 2>/dev/null || printf '')"
+  if [[ -z "$dir" || ! -d "$dir" ]]; then
+    doctor_add creds merge-gate-repos ok \
+      "merge-gate repo visibility not measured on this box yet — the reading is taken by a close whose row names no PR and no branch, which sweeps the whole repo set. (\`5dive task merge-gate-selftest\` grades the RAIL against one control PR; it does not measure per-repo coverage.)"
+    return 0
+  fi
+  for f in "$dir"/*.reading; do
+    [[ -r "$f" ]] || continue
+    n=$((n+1))
+    local seat ok total bad class reason inst asof asof_epoch age_txt now
+    seat=$(_gate_vis_field "$f" seat);   ok=$(_gate_vis_field "$f" ok)
+    total=$(_gate_vis_field "$f" total); bad=$(_gate_vis_field "$f" invisible)
+    class=$(_gate_vis_field "$f" class); reason=$(_gate_vis_field "$f" reason)
+    inst=$(_gate_vis_field "$f" instrument)
+    asof=$(_gate_vis_field "$f" asof); asof_epoch=$(_gate_vis_field "$f" asof_epoch)
+    age_txt="as of ${asof:-unknown}"
+    now=$(date +%s 2>/dev/null || printf '')
+    if [[ "$now" =~ ^[0-9]+$ && "$asof_epoch" =~ ^[0-9]+$ && $asof_epoch -gt 0 ]]; then
+      age_txt="$age_txt ($(( (now - asof_epoch) / 3600 ))h ago)"
+    fi
+    local who; who=$(_gate_scan_class_says "$class" 2>/dev/null || printf '')
+    case "$class" in
+      ok)
+        doctor_add creds "merge-gate-repos:${seat:-?}" ok \
+          "the merge-gate credential saw all ${total:-?} configured repos — $age_txt" ;;
+      scan-silent)
+        # NOT the operator's. A rail was held and nothing said why; rendering that
+        # as a credential fault sends the reader to audit an account that is fine.
+        doctor_add creds "merge-gate-repos:${seat:-?}" error \
+          "the merge-gate repo scan reported ${reason:-?} with a rail in hand and no reason from any repo — $who Instrument: ${inst:-unknown}. $age_txt" ;;
+      *)
+        doctor_add creds "merge-gate-repos:${seat:-?}" warn \
+          "the merge-gate credential saw ${ok:-0} of ${total:-?} configured repos (${reason:-?}); invisible: ${bad:-unknown}. $who Instrument: ${inst:-unknown}. $age_txt — every close from this seat is stamped UNVERIFIED until it is fixed" ;;
+    esac
+  done
+  (( n > 0 )) || doctor_add creds merge-gate-repos ok \
+    "merge-gate repo visibility not measured on this box yet — the reading is taken by a close whose row names no PR and no branch, which sweeps the whole repo set. (\`5dive task merge-gate-selftest\` grades the RAIL against one control PR; it does not measure per-repo coverage.)"
+  return 0
+}
+
 # doctor_check_cli_freshness [installed-bin] [probe-output]
 #
 # DIVE-2640 (split of DIVE-2621 item a) — NOTHING ON THIS BOARD DISTINGUISHED
@@ -1156,7 +1228,7 @@ doctor_check_consolidate_transacting() {
     local _notx_gh=""
     (( _notx_ghost > 0 )) && _notx_gh=" (${_notx_ghost} stale counter(s) for seat(s) the registry no longer knows were ignored; the scheduler reaps them on its next sweep)"
     if [[ -n "$_notx_bad" ]]; then
-      doctor_add memory consolidate error "NOT TRANSACTING — the distiller has been refused by the API on every consecutive pass for: ${_notx_bad}. Their memory has not consolidated since. Retrying will not clear it: restore the seat's auth or raise the account limit.${_notx_gh}"
+      doctor_add memory consolidate error "NOT TRANSACTING — the distiller has been refused by the API on every consecutive pass for: ${_notx_bad}. Their memory has not consolidated since. Retrying will not clear it. Check the credential first (\`5dive auth status --probe\`): if it reports HEALTHY the refusal is the ACCOUNT's limit, not the credential — raise the limit or move the seat to another auth profile. Only a probe that reports unhealthy means the seat's auth needs restoring.${_notx_gh}"
     elif (( _notx_watch > 0 )); then
       doctor_add memory consolidate warn "${_notx_watch} seat(s) had a distiller refused by the API on their last pass but are under the ${_notx_after}-pass threshold — transient limit or a rotating token; re-check if it persists${_notx_gh}"
     else
@@ -1420,6 +1492,9 @@ cmd_doctor() {
         esac
       done <<<"$heal_out"
     fi
+    # DIVE-4619: the merge-gate's repo visibility is a credential fact about this
+    # box, so it is reported here once rather than on every close.
+    doctor_check_gate_repo_visibility
   fi
 
   # --- registry + per-agent state ---

@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+#
+# TIER: nightly — this harness was added by #1025 and took core shard 1/3 from at-cap to 307s
+# against its 300s budget (102%, 164 harnesses, on a runner calibrated at 94% of baseline, so
+# not runner slowness). It is the newest cost in that shard, so it pays for itself here rather
+# than by demoting a guard somebody else argued for. It is a pure-fixture unit test of a picker
+# WHERE clause with no flaky surface, which is the safest class to move off the PR path.
+# OWED BACK: restore it to core the moment the shard has headroom — it guards DIVE-4604, the
+# row-stranding bug, and a regression there is invisible on the board by construction.
 # upstream #1009 — a graded row held for merge must land on the seat that owes the merge.
 #
 # THE STRANDING, as the maintainer measured it: six rows graded ACCEPT, five with their pull
@@ -79,7 +87,10 @@ _merge_disp_probe() { printf 'hold:merger:no-graded-sha-stated\n'; }
 ROSTER_OK=1
 _task_roster() {
   _TASK_ROSTER_STATE=$( ((ROSTER_OK)) && printf ok || printf unknown )
-  _TASK_ROSTER=$(printf '%s\n' "$LIVE" dev main)
+  # `ops` is on it because that is who `_merge_hold_seat` resolves the `merger`
+  # role to on a real box, and DIVE-4604's move needs POSITIVE knowledge that the
+  # owner is a seat the roster carries. The dead clone stays off it.
+  _TASK_ROSTER=$(printf '%s\n' "$LIVE" dev main ops)
 }
 _gate_version_vs_installed() { :; }
 task_actor() { printf '%s\n' "$LIVE"; }
@@ -114,26 +125,36 @@ owner=$(col DIVE-901 merge_owner)
 [[ -z "$(_hb_pick_tasks "$DEAD" 5 | grep -x "$id")" ]] \
   && ok_t "A3b ...and the dead clone's tick does not, so the row moved rather than being shared" || bad_t "A3b" ""
 
-# --- 1b. THE ASSIGNEE MOVE IS NARROW, and these two arms are why -------------
-# Moving it unconditionally is a different, wider change wearing this one's clothes: it takes
-# a row away from a LIVE maker. tests/task_delivery_evidence_unit.sh asserts against exactly
-# that by name ("the row was NOT routed away from the maker") for a --review=check row, and
-# an earlier cut of this fix broke it — in CI, not here, because who the owner resolves to is
-# a roster fact. A row whose assignee is alive is not stranded and does not need rescuing.
-id=$(seed DIVE-905 in_progress dev)          # assignee IS on the roster
+# --- 1b. DIVE-4604: A LIVE ASSIGNEE IS MOVED TOO — ONE OWNER, NOT TWO --------
+# The narrow rule (move only a seat that is GONE) shipped first and left the stranding in
+# place on a live box. Measured 2026-09-19, after that fix was merged AND installed:
+# DIVE-4574 (assignee `main`, alive) and DIVE-4632 (assignee `quinn`, alive) were both back
+# at status='in_progress' with merge_owner=ops, and `task doctor` called both undispatchable.
+# The status pair is necessary and NOT sufficient: it holds only until something claims the
+# row again, and every other dispatch path keys on the ASSIGNEE, not on merge_owner — the
+# loop-defect forced wake ("forced wake of quinn onto DIVE-4632: stage_owner=quinn"), a goal
+# wake, a hand `task assign`. The picker's merge-owner arm is the only reader merge_owner
+# has, so ONE claim by the old assignee hides the row from it again, permanently.
+id=$(seed DIVE-905 in_progress dev)          # assignee IS on the roster, and alive
 cmd_task_verify DIVE-905 --cmd=true --no-done >/dev/null 2>&1
-[[ "$(col DIVE-905 assignee)" == "dev" ]] \
-  && ok_t "A6 a LIVE assignee is left alone — the hold does not take a row away from the seat holding it" \
-  || bad_t "A6 must not steal a live row" "assignee=[$(col DIVE-905 assignee)]"
+owner905=$(col DIVE-905 merge_owner)
+[[ -n "$owner905" && "$(col DIVE-905 assignee)" == "$owner905" ]] \
+  && ok_t "A6 a LIVE assignee is handed to the merge owner as well — the row ends with ONE owner, so no other dispatch path can re-claim it away from the merge" \
+  || bad_t "A6 a live assignee must move to the owner" "assignee=[$(col DIVE-905 assignee)] owner=[$(col DIVE-905 merge_owner)]"
 [[ "$(col DIVE-905 status)" == "todo" && -z "$(col DIVE-905 started_at)" ]] \
-  && ok_t "A6a ...and it is dispatchable anyway, because the STATUS PAIR is the operative half and the merge-owner arm keys on merge_owner, not on the assignee" \
+  && ok_t "A6a ...and the STATUS PAIR still resets, which is the half that makes either owner's tick reach it" \
   || bad_t "A6a status pair must still reset" "status=[$(col DIVE-905 status)]"
+[[ -n "$(_hb_pick_tasks "$owner905" 5 | grep -x "$id")" ]] \
+  && ok_t "A6b ...and the owing seat's tick returns it" || bad_t "A6b owner must pick it up" "picked=[$(_hb_pick_tasks "$owner905" 5 | tr '\n' ' ')]"
+[[ -z "$(_hb_pick_tasks dev 5 | grep -x "$id")" ]] \
+  && ok_t "A6c ...and the ex-assignee's tick does not, so a claim by that seat can no longer put the row back at in_progress where the merge-owner arm cannot see it" \
+  || bad_t "A6c the ex-assignee must not still pick it" "picked=[$(_hb_pick_tasks dev 5 | tr '\n' ' ')]"
 
 ROSTER_OK=0
 id=$(seed DIVE-906)                           # assignee gone, but the roster cannot be read
 cmd_task_verify DIVE-906 --cmd=true --no-done >/dev/null 2>&1
 [[ "$(col DIVE-906 assignee)" == "$DEAD" ]] \
-  && ok_t "A7 DEGRADE, NEVER GUESS: an unreadable roster is not evidence a seat is gone, so the assignee is left alone" \
+  && ok_t "A7 DEGRADE, NEVER GUESS: an unreadable roster is evidence of neither death nor life, so the assignee is left alone — the move needs POSITIVE knowledge that the owner is a seat the heartbeat wakes" \
   || bad_t "A7 must not move on an unknown roster" "assignee=[$(col DIVE-906 assignee)]"
 [[ "$(col DIVE-906 status)" == "todo" ]] \
   && ok_t "A7a ...while the status half still runs, so dispatch is restored either way" || bad_t "A7a" ""

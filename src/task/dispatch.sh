@@ -338,99 +338,45 @@ cmd_task_reclaim() {
 # tests/task_subverb_help_unit.sh walks the case statement below, label by
 # label, and grades every one of them through this path.
 
+# The four helpers below are THIN WRAPPERS over the shared implementation in
+# src/lib/output.sh (DIVE-569). They were the original, `task`-only shape; when
+# `agent` and `account` needed the same answer the body was parameterised on the
+# surface's usage function and its dispatch function rather than copied a third
+# time. The names stay because cmd_task reads better calling them, and because
+# tests/task_subverb_help_unit.sh grades this surface through them.
+
 # _task_help_wanted <args…> — do these args ASK for help? `--` ends the flags
 # (several subverbs honour it), and only the two exact spellings count: the
 # `--help` inside `--ask="… --help …"` is a VALUE, not a question.
-_task_help_wanted() {
-  local a
-  for a in "$@"; do
-    case "$a" in
-      --)        return 1 ;;
-      -h|--help) return 0 ;;
-    esac
-  done
-  return 1
-}
+_task_help_wanted() { _verb_help_wanted "$@"; }
 
 # _task_verb_arm <verb> — "<canonical spelling> <function>", read out of
 # cmd_task's OWN case statement at run time. Reading it back rather than
 # restating it here is what makes an alias (`list`, `view`, `close`, `gates`,
 # `new`, `delete`) answer with the usage of the verb it actually runs, with no
-# second alias list to rot — the same reason the pre-push rail extracts the
-# title regex from the workflow instead of carrying a copy (DIVE-4208).
-_task_verb_arm() {
-  declare -f cmd_task | awk -v v="$1" '
-    /^[[:space:]]+[^ (].*\)$/ {
-      lab = $0; sub(/\)[[:space:]]*$/, "", lab); gsub(/[[:space:]]/, "", lab)
-      n = split(lab, alt, "|")
-      for (i = 1; i <= n; i++) if (alt[i] == v) {
-        if ((getline body) > 0) { split(body, f, "[[:space:]]+"); fn = (f[1] == "" ? f[2] : f[1]) }
-        print alt[1] " " fn; exit
-      }
-    }'
-}
+# second alias list to rot.
+_task_verb_arm() { _verb_arm cmd_task "$1"; }
 
 # _task_verb_own_usage <function> <verb> — the `usage: 5dive task <verb> …` line
 # the verb prints itself when its arguments are wrong.
-_task_verb_own_usage() {
-  local fn="$1" verb="$2" body line
-  body=$(declare -f "$fn" 2>/dev/null) || return 1
-  # In the BUILT BUNDLE a lazy module is unparsed text until something calls into
-  # it (DIVE-4087), so `declare -f` here yields the one-line autoload STUB, which
-  # carries no usage text at all. Load the module the stub names, then read it
-  # again. The split tree has no stubs and never takes this branch — which is why
-  # the harness grades this path through a BUILT BUNDLE and not through src/.
-  if [[ "$body" == *_lazy_autoload* ]] && declare -F _load_module >/dev/null 2>&1; then
-    local mod="${body#*_lazy_autoload }"; mod="${mod%% *}"
-    _load_module "$mod" >/dev/null 2>&1 || return 1
-    body=$(declare -f "$fn" 2>/dev/null) || return 1
-  fi
-  line=$(printf '%s\n' "$body" | grep -o "usage: 5dive task ${verb}[^\"']*" | head -1) || true
-  [[ -n "$line" ]] || return 1
-  # A few of these literals are printf formats carrying a `\n` and a paragraph of
-  # prose after it; take the usage line and leave the escape unrendered.
-  printf '%s\n' "${line%%\\n*}"
-}
+_task_verb_own_usage() { _verb_own_usage "$1" "5dive task $2"; }
 
 # _task_subverb_help <verb> — print that verb's usage.
 #   0  printed it
 #   1  not a verb at all (the case below has better words for that than we do)
 #   2  a verb this tree documents NOWHERE — say so rather than invent a line
-_task_subverb_help() {
-  local verb="$1" arm primary fn out=""
-  arm=$(_task_verb_arm "$verb") || true
-  [[ -n "$arm" ]] || return 1
-  primary="${arm%% *}"; fn="${arm#* }"
-  out=$(_task_usage 2>/dev/null | awk -v v="$primary" '
-    /^  [a-z]/ {
-      blk = 0; n = split($1, alt, "|")
-      for (i = 1; i <= n; i++) if (alt[i] == v) blk = 1
-      if (!blk) next
-      if (seen++) { print; next }
-      line = $0; sub(/^  /, "", line)
-      printf "usage: 5dive task %s\n", line
-      next
-    }
-    /^   / { if (blk) print; next }
-    { blk = 0 }') || true
-  [[ -n "$out" ]] || out=$(_task_verb_own_usage "$fn" "$primary") || true
-  [[ -n "$out" ]] || return 2
-  printf '%s\n' "$out"
-}
+#
+# `_task_usage` lists bare verbs (`  ls|list …`), so the surface reader is
+# handed an empty <lead>; the top-level `usage()` lists whole command lines and
+# hands it "5dive agent " / "5dive account ".
+_task_subverb_help() { _verb_subverb_help "5dive task" _task_usage cmd_task "" "$1"; }
 
 # _task_help_intercept <verb> <args…> — 0 when the args asked for help and it has
 # been answered. Kept out of cmd_task's body on purpose: _task_verb_arm reads
 # that body back as text, and a second `case` inside it would look like arms.
 _task_help_intercept() {
   local verb="$1"; shift
-  _task_help_wanted "$@" || return 1
-  local rc=0
-  _task_subverb_help "$verb" || rc=$?
-  case $rc in
-    0) return 0 ;;
-    2) fail "$E_USAGE" "5dive task $verb: no usage text — the verb is documented neither in '5dive task --help' nor in its own arguments check" ;;
-  esac
-  return 1
+  _verb_help_intercept "5dive task" _task_usage cmd_task "" "$verb" "$@"
 }
 
 cmd_task() {
@@ -460,6 +406,7 @@ cmd_task() {
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
     merge)           cmd_task_merge "$@" ;;         # DIVE-3474 verifier merges what IT graded
+    merge-landed)    cmd_task_merge_landed "$@" ;; # DIVE-4654 record a forge merge; exit MERGING
     merge-audit)     cmd_task_merge_audit "$@" ;;   # DIVE-1935 retrospective sweep
     grader-replay)   cmd_task_grader_replay "$@" ;;  # DIVE-4164 dry-run capacity replay
     grader-tick)     cmd_task_grader_tick "$@" ;;    # DIVE-4164 pool lane (dark by default)

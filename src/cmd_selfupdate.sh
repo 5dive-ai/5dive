@@ -285,6 +285,38 @@ _PENDING_RESTART_MAX_DEFER_SECS=$((24 * 3600))
 # _agent_busy_state <name> -> busy | idle | unknown
 # `unknown` is a THIRD value on purpose and is never folded into `idle`: a board
 # we could not read must take the same branch as a board that said busy.
+#
+# THE BOARD IS NOT THE SESSION, and this function used to be only the board. It
+# asks "does this seat hold an in_progress row", which is silent about the seat
+# that is mid-turn on chat-driven work and holding no row at all — the normal
+# shape for a Telegram-paired seat. That seat answered `idle` and the nightly
+# `5dive update` restarted it mid-turn; the turn's results were lost with no
+# error surfaced anywhere.
+#
+# So when the board says idle, ask the live signal the heartbeat already trusts
+# before every reclaim: `_hb_agent_native_state` runs `claude agents --json` as
+# the seat and answers busy | idle | blocked:<why>, rc 1 when it cannot tell.
+# Only a DEFINITE busy/blocked answer overrides the board. Three properties this
+# keeps, none of them accidental:
+#
+#   * `unknown` stays `unknown` — an unreadable board is not upgraded to a
+#     session reading, because the two are answers to different questions and
+#     `unknown` already defers.
+#   * rc 1 / no reading changes nothing, so a non-claude runtime, an older
+#     `claude` without `agents --json`, or a split tree where the helper is not
+#     loaded all behave exactly as before.
+#   * a board that says BUSY short-circuits — no reason to shell out to the
+#     seat to confirm a deferral already decided.
+#
+# THIS DEFERS MORE THAN IT USED TO, AND THAT IS THE INTENDED DIRECTION. DIVE-4298
+# measured native `busy` persisting for 1h20m on a seat whose TURN had ended but
+# whose background shell was still alive, so such a seat now holds its restart
+# until those shells exit. That is this module's own stated trade, verbatim from
+# the fence above: the failure that costs work is restarting an agent we cannot
+# see, while the failure that costs a payload update is bounded by the ceiling
+# and is LOUD. `_pending_restart_decide`, the marker format and
+# `_PENDING_RESTART_MAX_DEFER_SECS` are untouched, so the 24h line still fires
+# and "deferred forever" still cannot happen silently.
 _agent_busy_state() {
   local name="${1:-}" n=""
   [[ -n "$name" ]] || { printf 'unknown\n'; return 0; }
@@ -293,7 +325,14 @@ _agent_busy_state() {
   fi
   n=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null) || n=""
   if [[ "$n" =~ ^[0-9]+$ ]]; then
-    if (( n > 0 )); then printf 'busy\n'; else printf 'idle\n'; fi
+    if (( n > 0 )); then printf 'busy\n'; return 0; fi
+    # Board idle. The session may still be mid-turn with nothing claimed.
+    if declare -F _hb_agent_native_state >/dev/null 2>&1; then
+      case "$(_hb_agent_native_state "$name" 2>/dev/null || true)" in
+        busy|blocked:*) printf 'busy\n'; return 0 ;;
+      esac
+    fi
+    printf 'idle\n'
   else
     printf 'unknown\n'
   fi

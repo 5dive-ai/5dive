@@ -309,11 +309,35 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # while this branch scored 55/1 with got==want, so the count was the only thing
 # failing and the one column is the whole delta.
 #
-# 103 -> 105 (DIVE-4634, 2026-09-19): `delivery_repo_path` + `delivered_sha` —
-# the checkout and immutable head from which a grader materializes its private
-# detached worktree without cloning. READ from a fresh tasks_db_init on this
-# tree: `SELECT count(*) FROM pragma_table_info('tasks')` returned 105; not
-# derived by adding this branch's two-column delta.
+# 103 -> 107 (DIVE-4654, 2026-09-20): +merge_landed_at/_sha/_by/_ref, the recorded
+# landing of a pull request merged on the FORGE rather than through `task merge` —
+# what lets a row leave stage MERGING when the grading seat holds no merge rail.
+# READ off a fresh tasks_db_init on the MERGED tree (this branch merged with
+# origin/main f21d02d5), as the header above instructs (`bad` patched to print its
+# detail, one run, `count=107` with got==want and rc=0, patch reverted); not derived
+# by adding this branch's four-column delta. Control done first, as the DIVE-3483
+# entry instructs: a same-seat worktree at bare origin/main f21d02d5 scored 56/0 on
+# this harness while the merged tree scored 55/1 with got==want, so the count was
+# the only thing failing and the four columns are the whole delta. COLLISION, of the
+# kind the DIVE-3474 entry above describes: PR #1034 (DIVE-4634) moves this SAME
+# literal for +delivery_repo_path/+delivered_sha and was unmerged at this read.
+# Whichever of the two lands second must RE-READ off the merged tree — git will
+# conflict on this line, and the resolution is a read, not 107 + 2.
+#
+# 107 -> 109 (DIVE-4634, 2026-09-20, the SECOND of the collision the entry above
+# predicted): `delivery_repo_path` + `delivered_sha` — the checkout and immutable
+# head from which a grader materializes its private detached worktree without
+# cloning. This branch's own earlier entry read 105 off ITS tree, before DIVE-4654
+# landed; that number is dead and is deliberately not carried forward, because a
+# provenance line that names a count nobody can reproduce on the merged tree is
+# worse than no line. RE-READ off a fresh tasks_db_init on the MERGED tree, as both
+# the header and DIVE-4654's entry instruct, and NOT as 107 + 2: `bad` patched to
+# print its detail, one run on the merged tree, `count=109` with rc=0 and got==want,
+# patch reverted. Control done first, as the DIVE-3483 entry instructs: this same
+# seat's worktree at bare origin/main 00da4a22 scored 56/0 on this harness while the
+# merged tree scored 55/1 with got==want, so the count was the only thing failing and
+# the two columns are the whole delta. (109 also equals 107 + 2. That it agrees is a
+# result, not the method — the arithmetic was not consulted.)
 
 fresh_tree
 out=$(tasks_db_init 2>&1); rc=$?
@@ -323,8 +347,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "105" ]] \
-  && ok "fresh schema: all 105 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "109" ]] \
+  && ok "fresh schema: all 109 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------
