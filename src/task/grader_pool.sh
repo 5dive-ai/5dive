@@ -1520,6 +1520,20 @@ _PACE_FLOOR_7D_HARD="${FIVE_PACE_7D_HARD:-90}"
 # (which protects the window itself) stays armed.
 _PACE_RESET_DAYS="${FIVE_PACE_RESET_DAYS:-3}"
 _PACE_BLIND="${FIVE_PACE_BLIND:-soft}"
+
+# ── DIVE-4631: THE WEEK IS NOT THE ONLY WINDOW THE WORK HAS TO FIT IN ───────
+#
+# Measured on this host 2026-09-19: `dev` read fiveHourPct 101 and sevenDayPct
+# 12. The floor read the week alone, returned `open`, and the dispatcher handed
+# the seat a row it could not finish — the seat claimed it, hit the session wall
+# mid-attempt, and the row went to reclaim. The meter that would have predicted
+# that was the NEXT FIELD in the document the floor was already reading.
+#
+# One knob, one threshold, and the band it produces is `hard` (urgent only) and
+# never `refuse`. Freezing is the failure mode this family keeps re-learning
+# (DIVE-4430, DIVE-4575, DIVE-4586): an incident is worth a turn that may be
+# truncated; a medium row is not.
+_PACE_FLOOR_5H="${FIVE_PACE_5H:-85}"
 # Overridable so the unit harness feeds a fixture instead of needing root and a
 # live meter. Same posture as _GRADER_USAGE_CMD / _SUP_QUOTA_PAT.
 _PACE_USAGE_CMD="${_PACE_USAGE_CMD:-sudo -n 5dive usage --json}"
@@ -1678,7 +1692,12 @@ _pace_field() {  # <account> <field>  [<usage-json-on-stdin>]
   ' 2>/dev/null || printf ''
 }
 
-# `_pace_band <account> [<now-epoch>]` — how hard is the floor on this account?
+# `_pace_band_7d <account> [<now-epoch>]` — how hard is the WEEKLY floor on
+# this account? This is the original `_pace_band` body, unchanged; `_pace_band`
+# is now the combiner below, which takes the tighter of this and the session
+# window (DIVE-4631). Call it with a HERE-STRING, never a pipe: it returns
+# before its `json=$(cat)` when no account is named, and a pipe would then hand
+# the caller the writer's EPIPE status instead of this function's band.
 #
 # Dual-channel by the same contract as `_grader_window_ok`, and for the reason
 # recorded there (DIVE-4380): the verdict is on stdout, the DECISION is the exit
@@ -1690,7 +1709,7 @@ _pace_field() {  # <account> <field>  [<usage-json-on-stdin>]
 #   2  soft   — high|urgent only, no recurring template firing
 #   3  hard   — urgent only, no recurring template firing
 #   1  refuse — no dispatch at all (only reachable under FIVE_PACE_BLIND=refuse)
-_pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
+_pace_band_7d() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   local acct="$1" now="${2:-$(date +%s)}" json seven="" resets="" days_left src="" pair=""
   local lb_pair="" lb_seven="" lb_resets=""
   if [[ -z "$acct" ]]; then
@@ -1807,6 +1826,135 @@ _pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   # floor armed — the unmeasured case never buys headroom.
   printf 'pace: %s is at %s%% of its week (soft floor %s%%, from the %s reading), reset time unreadable so the floor stays armed — high/urgent only\n' \
          "$acct" "$seven" "$_PACE_FLOOR_7D_SOFT" "$src"; return 2
+}
+
+# `_pace_band_5h <account> [<now-epoch>]` — how hard is the SESSION-window floor?
+#
+# Same two channels as every band function here: verdict on stdout, decision in
+# the exit status. Only TWO answers are reachable:
+#
+#   0  open — this window says nothing that should hold a row
+#   3  hard — at or over `_PACE_FLOOR_5H`% of the session window; urgent only
+#
+# Four decisions are baked in, and each one is a place this could have been
+# written differently:
+#
+# 1. NEVER `refuse`, and never `soft`. See the knob above.
+#
+# 2. A BLIND 5h READING CONTRIBUTES NOTHING — `open`, not a hold. `fiveHourPct:
+#    null` is ordinary steady state here (`community`, `creative`, `ops`,
+#    `codex` and `warm-mark` all read null on the box this was written on). The
+#    WEEKLY band already holds a blind account at the soft floor, so a second
+#    hold keyed on the same blindness double-counts one silence and paces the
+#    whole fleet down on it. This is NOT the "never read an empty meter as 0%"
+#    rule being broken (DIVE-4342): the weekly is still holding, and this
+#    function is a TIGHTENER on top of it that declines to tighten.
+#
+# 3. A READING WHOSE `fiveHourResetsAt` HAS ALREADY PASSED IS DROPPED. It is the
+#    same fence the weekly applies via `sevenResetsAt`, and it matters more
+#    here: a 5h window turns over five times a day, so a stale high reading is
+#    the common case rather than the exotic one. An ABSENT or unparseable reset
+#    is not a passed one — `_grader_reading_expired` keeps that reading, and the
+#    floor stays armed, because the unmeasured case never buys dispatch.
+#
+# 4. NO NEAR-RESET RELAXATION. The weekly relaxes inside `_PACE_RESET_DAYS`
+#    because unspent headroom expires at the reset. That reasoning does not
+#    transfer: this floor is not a pacing rule at all — it exists so we do not
+#    spend a dispatch on a turn that will be truncated — so being close to the
+#    reset is a reason to WAIT for a whole window, never to spend the stub of
+#    this one.
+#
+# The reading is `max` across the account's seats (`_pace_field`), which is the
+# fail-closed lower bound on a shared pool and the same reasoning DIVE-4586 uses
+# for the weekly. CONFIRMED before it was written, on the live document
+# 2026-09-19/20: every seat of `chemmonitor` reported 38/39/38% against ONE
+# `fiveHourResetsAt` (1789891800), and every seat of `mark` reported 0% against
+# one reset of its own — one window per ACCOUNT, sampled at slightly different
+# moments per seat, not one window per seat. If that ever stops being true the
+# right read is the seat's own, and the seat name is in hand at the dispatch
+# call site (`$name`); this function would then take it as an argument.
+_pace_band_5h() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
+  local acct="${1:-}" now="${2:-}" json five="" resets=""
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  # Read stdin FIRST and unconditionally, before any early return, so a caller
+  # that pipes cannot be handed an EPIPE in place of a band.
+  json=$(cat)
+  if [[ -z "$acct" || -z "$json" ]]; then
+    printf 'pace/5h: no session-window reading (%s) — the session floor contributes nothing; the weekly band stands alone\n' \
+           "$( [[ -z "$acct" ]] && printf 'no account named' || printf 'no usage document' )"
+    return 0
+  fi
+  five=$(printf '%s' "$json" | _pace_field "$acct" fiveHourPct)
+  if [[ -z "$five" ]]; then
+    printf 'pace/5h: %s has no session-window reading (null) — a blind 5h meter contributes NOTHING here; the weekly band is what holds a blind account (DIVE-4631 decision 2)\n' "$acct"
+    return 0
+  fi
+  five="${five%%.*}"
+  if ! [[ "$five" =~ ^[0-9]+$ ]]; then
+    printf 'pace/5h: %s session meter is unparseable (5h=%s) — contributing nothing; the weekly band stands alone\n' "$acct" "$five"
+    return 0
+  fi
+  resets=$(printf '%s' "$json" | _pace_field "$acct" fiveHourResetsAt)
+  resets="${resets%%.*}"
+  if _grader_reading_expired "$resets" "$now"; then
+    printf 'pace/5h: %s reads %s%% of a session window that has ALREADY reset (%s) — a percentage from a window that has since turned over is not a statement about the one we are pacing; dropped\n' \
+           "$acct" "$five" "$resets"
+    return 0
+  fi
+  if (( five >= _PACE_FLOOR_5H )); then
+    printf 'pace/5h: %s is at %s%% of its 5-hour session window (floor %s%%) — a turn started now is truncated at the wall, so urgent only\n' \
+           "$acct" "$five" "$_PACE_FLOOR_5H"
+    return 3
+  fi
+  printf 'pace/5h: %s at 5h=%s%% (floor %s%%) — no hold\n' "$acct" "$five" "$_PACE_FLOOR_5H"
+  return 0
+}
+
+# `_pace_rank <band-rc>` — how TIGHT is this band, as an orderable number. The
+# exit codes are not ordered (1 is the tightest and sorts lowest), so the
+# combiner cannot compare them directly. An unknown code ranks tightest: a band
+# we cannot read must not be the one that wins by being loose.
+_pace_rank() {  # <band-rc>
+  case "${1:-}" in 0) printf 0 ;; 2) printf 1 ;; 3) printf 2 ;; 1) printf 3 ;; *) printf 3 ;; esac
+}
+
+# `_pace_band <account> [<now-epoch>]` — THE TIGHTER of the weekly floor and the
+# session-window floor (DIVE-4631).
+#
+# The combiner lives here rather than at the call sites deliberately: heartbeat
+# dispatch, the materializer and anything added later all get the session window
+# with no change of their own, and there is exactly one place where the two
+# windows are reconciled.
+#
+# Same dual channel as before (DIVE-4380) — verdict on stdout, decision in the
+# exit status — so every existing caller is unchanged:
+#
+#   0  open   — dispatch everything, as today
+#   2  soft   — high|urgent only, no recurring template firing
+#   3  hard   — urgent only, no recurring template firing
+#   1  refuse — no dispatch at all (only reachable under FIVE_PACE_BLIND=refuse)
+#
+# Both halves are fed with a HERE-STRING, never a pipe: `_pace_band_7d` returns
+# before its `json=$(cat)` when no account is named, and under the bundle's
+# `set -euo pipefail` a pipe would hand us printf's EPIPE status in place of the
+# band. Reading stdin once here also means a caller may still pipe into
+# `_pace_band` itself, which both shipping call sites do.
+_pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
+  local acct="${1:-}" now="${2:-}" json v7="" v5="" rc7=0 rc5=0
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  json=$(cat)
+  v7=$(_pace_band_7d "$acct" "$now" <<<"$json") || rc7=$?
+  v5=$(_pace_band_5h "$acct" "$now" <<<"$json") || rc5=$?
+  if (( $(_pace_rank "$rc5") > $(_pace_rank "$rc7") )); then
+    printf '%s · (weekly: %s)\n' "$v5" "$v7"
+    return "$rc5"
+  fi
+  if (( rc5 != 0 )); then
+    printf '%s · (session window: %s)\n' "$v7" "$v5"
+    return "$rc7"
+  fi
+  printf '%s\n' "$v7"
+  return "$rc7"
 }
 
 # `_pace_admits <band-rc> <priority> <kind>` — does this band dispatch this row?
