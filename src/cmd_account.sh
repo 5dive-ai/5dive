@@ -547,6 +547,22 @@ account_usage_rows() {
                    else {pct: .sevenDayPct, resetsAt: .sevenResetsAt} end),
         asOf: .asOf, source: $src, remembered: false}' <<<"$best")
       account_usage_remember "$name" "$usage"
+      # DIVE-4589: the JSON record above is the LATEST-state cache and is
+      # overwritten every pass; this appends the same reading to history so the
+      # previous one survives. Only this branch inserts — it is the one that has
+      # a live seat ($src) behind the number. The recall branch below has no
+      # source agent by construction, which is what stops a remembered reading
+      # from entering the record as a fresh observation.
+      if declare -F account_usage_sample_record >/dev/null 2>&1; then
+        local _s_asof _s_fp _s_fr _s_sp _s_sr
+        _s_asof=$(jq -r '.asOf // empty'               <<<"$usage")
+        _s_fp=$(  jq -r '.fiveHour.pct // empty'       <<<"$usage")
+        _s_fr=$(  jq -r '.fiveHour.resetsAt // empty'  <<<"$usage")
+        _s_sp=$(  jq -r '.sevenDay.pct // empty'       <<<"$usage")
+        _s_sr=$(  jq -r '.sevenDay.resetsAt // empty'  <<<"$usage")
+        account_usage_sample_record "$name" "$_s_asof" "$_s_fp" "$_s_fr" \
+                                    "$_s_sp" "$_s_sr" "$src" || true
+      fi
     else
       # No live mapping carries a cache — fall back to what this ACCOUNT last
       # reported. A profile with zero bound seats still prints its 5H/7D.
@@ -579,9 +595,63 @@ account_usage_publish() {
   return 0
 }
 
+# cmd_account_usage_history <args> — `5dive account usage --history [--7d|--24h]
+# [--account=<name>]`. Section 3 of the spec: the provider'"'"'s numbers OVER TIME,
+# which before DIVE-4589 existed nowhere because every reading overwrote the last.
+cmd_account_usage_history() {
+  local win="24h" acct="" a
+  for a in "$@"; do
+    case "$a" in
+      --history)                  ;;
+      --7d|7d|--week)   win="7d"  ;;
+      --24h|24h|--day)  win="24h" ;;
+      --account=*)      acct="${a#--account=}" ;;
+      *) fail "$E_USAGE" "usage: 5dive account usage --history [--7d] [--account=<name>]" ;;
+    esac
+  done
+  ensure_state_ro
+  local since rows
+  since=$(( $(date +%s) - $( [[ "$win" == "7d" ]] && echo 604800 || echo 86400 ) ))
+  rows=$(account_usage_history_rows "$since" "$acct")
+  if (( JSON_MODE )); then
+    jq -cn --argjson r "$rows" --argjson s "$since" \
+      '{ok:true, data:{since:$s, accounts:$r}}'
+    return
+  fi
+  if [[ "$(jq -r 'length' <<<"$rows")" == "0" ]]; then
+    # Absence with its cause named. A store that has only just started sampling
+    # is the ordinary case for a while after this ships, and it must not read as
+    # "these accounts moved nothing".
+    echo "no provider quota samples in this window — the history starts when the first"
+    echo "live reading is appended (every 5dive account usage / heartbeat snapshot pass)."
+    return
+  fi
+  jq -r '
+    def pct(x): if x == null then "-" else ((x*10|round)/10|tostring) + "%" end;
+    def ppd:    if . == null then "?" else ((if . > 0 then "+" else "" end) + ((.*10|round)/10|tostring)) end;
+    (["ACCOUNT","SAMPLES","5H","7D","5H Δ","7D Δ","RESET","SOURCES"] | @tsv),
+    (.[] | [ .account, (.samples|tostring),
+             pct(.latest.fivePct), pct(.latest.sevenPct),
+             (.fiveHourPpDelta|ppd), (.sevenDayPpDelta|ppd),
+             (if .resetCrossed then "crossed" else "-" end),
+             (.sourceAgents|join(",")) ] | @tsv)' <<<"$rows" \
+    | column -t -s $'\t' | sed 's/^/  /'
+  printf '  Δ is between the FIRST and LAST sample in the window, in provider percentage\n'
+  printf '  points. "crossed" means the window reset between them, so the delta is not a\n'
+  printf '  measurement of anything and is withheld rather than shown wrong.\n'
+}
+
 cmd_account_usage() {
+  # DIVE-4589: the history view reads the appended samples out of the task store
+  # and nothing else, so it is handled BEFORE require_root — an unprivileged seat
+  # can ask what an account has been doing without being able to read anyone'"'"'s
+  # home. The bare `account usage` path below is untouched.
+  if [[ "${1:-}" == "--history" ]] || [[ " $* " == *" --history "* ]]; then
+    cmd_account_usage_history "$@"
+    return
+  fi
   ensure_state
-  [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account usage"
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account usage [--history [--7d] [--account=<name>]]"
   require_root
   local rows; rows=$(account_usage_rows)
   # Publish for the unprivileged health surfaces (liveness, supervisor,
@@ -689,6 +759,17 @@ cmd_account_rename() {
     local agent
     while IFS= read -r agent; do
       [[ -n "$agent" ]] || continue
+      # DIVE-4589: a rename moves the BINDING NAME, so it is a binding event like
+      # any other — recorded before the symlink re-point, for the same reason.
+      # What it deliberately does NOT do is rewrite the events and samples
+      # already stored under the old name: those rows are what was true then,
+      # and rewriting them is exactly the mutation acceptance criterion 5
+      # forbids. The consequence is real and is the documented cost of that
+      # choice — history spanning a rename reads as two accounts, the old name
+      # up to the rename and the new one after it.
+      if declare -F account_binding_record >/dev/null 2>&1; then
+        account_binding_record "$agent" "$new" "account-rename" || true
+      fi
       step "Re-pointing ${ENV_DIR}/${agent}-auth.env"
       link_agent_profile "$agent" "$new"
       step "Restarting 5dive-agent@${agent}.service"
@@ -1197,7 +1278,9 @@ cmd_agent_rotation_rotate() {
   # stdout so we emit a single clean envelope. `tier`/`coolingTarget` are
   # surfaced for observability (3 + coolingTarget=true means we rotated to a
   # still-cooling-but-sooner account; the resume waits on its reset).
-  cmd_config "$name" set "auth-profile=${target}" >/dev/null
+  # DIVE-4589: name the PATH that moved the binding. The event itself is emitted
+  # inside cmd_config (one emitter); only the reason is per-caller.
+  _5D_BINDING_REASON=rotation cmd_config "$name" set "auth-profile=${target}" >/dev/null
 
   # DIVE-3856: STOP OVER-CLAIMING. What this verb knows is that it re-pointed
   # the profile and that `cmd_config` SCHEDULED a bounce — `systemd-run

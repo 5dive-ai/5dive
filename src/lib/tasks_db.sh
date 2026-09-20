@@ -176,7 +176,7 @@ require_sqlite() {
 # block, and a store stamped '3932-1' has never seen the triggers block, so
 # either literal skips one population's migration entirely. A THIRD value that
 # no store carries is the only resolution that re-migrates both.
-_TASKS_SCHEMA_EPOCH='3932-2'  # DIVE-3932+3931: +runs/run_events/run_usage AND +event trigger ingress tables
+_TASKS_SCHEMA_EPOCH='4589-1'  # DIVE-4589: +account_binding_events/account_usage_samples (on top of 3932-2)
 
 # DIVE-3931: Event -> Task ingress lives in the task store because ingress ends
 # at the queue. One SQL emitter serves fresh stores and migrations so the two
@@ -1324,6 +1324,45 @@ CREATE TABLE IF NOT EXISTS objectives (
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- DIVE-4589: the TIME DIMENSION between a usage event and the auth profile that
+-- paid for it. Append-only by contract: a rebind writes a NEW row and never
+-- rewrites an old one, because a historical turn was paid for by whatever
+-- binding was live when it ran. `ts` is epoch seconds (the instant the binding
+-- became live — written BEFORE the new credential is used), `account` is NULL
+-- for "unbound" (agent removed, or auth-profile cleared to default). `reason`
+-- names the path that moved it: create | config-set | rotation | failover |
+-- account-rename | agent-remove.
+-- Keep byte-identical to the copy in _tasks_db_migrate (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS account_binding_events (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      INTEGER NOT NULL,
+  agent   TEXT NOT NULL,
+  account TEXT,
+  reason  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_account_binding_agent_ts
+  ON account_binding_events(agent, ts);
+-- DIVE-4589: append-only provider quota observations. The JSON files
+-- (<profile>/usage.json, ${STATE_DIR}/account-usage.json) stay as the fast
+-- LATEST-state cache; this is the history they overwrite. `as_of` is the instant
+-- the PROVIDER's number was measured, not when we stored it, so re-reading the
+-- same statusline cache is idempotent through UNIQUE(account, as_of) — that
+-- uniqueness IS the "do not insert a recalled reading as a fresh observation"
+-- rule, together with source_agent NOT NULL (a reading with no seat behind it is
+-- a recall and never reaches this table).
+-- Keep byte-identical to the copy in _tasks_db_migrate (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS account_usage_samples (
+  account      TEXT NOT NULL,
+  as_of        INTEGER NOT NULL,
+  five_pct     REAL,
+  five_reset   TEXT,
+  seven_pct    REAL,
+  seven_reset  TEXT,
+  source_agent TEXT NOT NULL,
+  UNIQUE(account, as_of)
+);
+CREATE INDEX IF NOT EXISTS idx_account_usage_samples_acct
+  ON account_usage_samples(account, as_of);
 -- Append-only reading history — one row per tick (value=NULL + rc!=0 on a metric
 -- failure, so a broken metric-cmd shows as a visible gap, not a silent skip). This
 -- is the audit trail, same honesty pattern as the proof branch's history.jsonl.
@@ -2628,6 +2667,44 @@ MIG
          SELECT 'gate_history_coverage',
                 'inferred:'||COALESCE((SELECT MIN(retired_at) FROM gate_history), datetime('now'));" \
       >/dev/null 2>&1 || true
+  fi
+
+  # DIVE-4589 account_binding_events + account_usage_samples — additive, gated on
+  # the binding table's absence so it takes no write lock on every command. Both
+  # brand-new and referenced by nothing, so creating them cannot touch the queue.
+  # NOTE: nothing is BACKFILLED here on purpose. A pre-existing board has no
+  # binding history, and inventing a genesis event at migration time would stamp
+  # today's binding onto every turn that ran before it — the exact false
+  # attribution this row exists to remove. Turns older than the first real event
+  # are reported as `current-binding-fallback`, never as a proven binding.
+  # Keep these CREATE TABLE bodies byte-identical to the copies in _tasks_schema.
+  local has_binding_events
+  has_binding_events=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_binding_events' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_binding_events" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG4589' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS account_binding_events (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      INTEGER NOT NULL,
+  agent   TEXT NOT NULL,
+  account TEXT,
+  reason  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_account_binding_agent_ts
+  ON account_binding_events(agent, ts);
+CREATE TABLE IF NOT EXISTS account_usage_samples (
+  account      TEXT NOT NULL,
+  as_of        INTEGER NOT NULL,
+  five_pct     REAL,
+  five_reset   TEXT,
+  seven_pct    REAL,
+  seven_reset  TEXT,
+  source_agent TEXT NOT NULL,
+  UNIQUE(account, as_of)
+);
+CREATE INDEX IF NOT EXISTS idx_account_usage_samples_acct
+  ON account_usage_samples(account, as_of);
+MIG4589
   fi
 
   # OSS-19 (OSS-26) objectives + objective_readings — additive, gated on the
