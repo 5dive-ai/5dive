@@ -1430,10 +1430,21 @@ inject_and_submit() {
   # Enters is the ceiling, as in `_hb_send_line`: a third Enter into a composer
   # that is not accepting is a stray keystroke, not a fix.
   sudo -u "$user" tmux send-keys -t "agent-${name}" Enter
-  _hb_verify_submit "$name" && return 0
+  _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
   sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
   sudo -u "$user" tmux send-keys -t "agent-${name}" Enter
-  _hb_verify_submit "$name" && return 0
+  _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
+  # DIVE-4642 — THE SECOND TYPED-SEND SITE OWES THE SAME TWO THINGS. A composer
+  # -hygiene claim is graded per SITE (the DIVE-4246 addendum), and the symptom
+  # cannot enumerate them: the pane looks identical either way. This site is left
+  # on its own transport on purpose — an a2a message's newlines are its FIELDS
+  # (RESULT / EVIDENCE / BLOCKER / NEXT), so flattening here would destroy the
+  # thing being delivered, and unlike a dispatched goal these payloads have been
+  # landing. What it does inherit is the part that is pure gain: do not leave
+  # text you could not submit, and do not let the seat go on reading as busy.
+  local _ias_left="${_HB_COMPOSER_UNSENT}"
+  _wedge_mark "$name" "${#_ias_left}" "$_ias_left" "residual"
+  if _hb_composer_clear "$name"; then _wedge_mark "$name" "${#_ias_left}" "$_ias_left" "cleared"; fi
   return 1
 }
 

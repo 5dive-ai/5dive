@@ -2145,6 +2145,11 @@ Classification (conservative — see docs/fleet-supervisor-design.md §4):
   no-output       holds open row(s) and has closed NOTHING for ${_SUP_T_NO_OUTPUT_DAYS}d+
                   (cause: no-output) — the seat is claiming work and completing
                   none, which every liveness signal reads as "active"; alerts
+  composer-wedged a dispatched payload is sitting UNSENT in the seat's composer
+                  (cause: submit-unverified) — the seat is alive, idle and
+                  permanently stuck, and its claimed row reads in_progress, which
+                  is what makes every later tick skip it as busy. Observe-only:
+                  the nudge/resume ladder makes it worse; restart the seat
   blocked-on-prompt
                   pane is sitting on a picker — the seat is waiting on a
                   keypress, not on a model. Two causes:
@@ -2293,8 +2298,8 @@ _sup_classify() {
         verify_excerpt="${12}" stranded="${13:-0}" \
         open_rows="${14:-0}" no_output_days="${15:--1}" quota_excerpt="${16:-}" \
         quota_deadline="${17:-unknown}" prompt_excerpt="${18:-}" prompt_mark="${19:-unmarked}" \
-        account_wall="${20:-}" pane_probe="${21:-ok}" \
-        no_output_move="${22:--1}"
+        account_wall="${20:-}" pane_probe="${21:-ok}" wedged="${22:-}" \
+        no_output_move="${23:--1}"
   # DIVE-3880: the policy lives HERE, in the pure decision, not at the pane
   # probe — the probe owes a distinguishable signal, the classifier owes the
   # verdict (community/wiki/a-fail-open-underneath-a-fail-closed-path-feeds-it-a-lie-in-the-format-it-trusts.md).
@@ -2309,6 +2314,23 @@ _sup_classify() {
   if [[ -n "$verify_excerpt" ]]; then
     class="verify-challenge"; cause="id-verification"
     detail="pane shows an ID/age-verification challenge"
+  elif [[ -n "$wedged" ]]; then
+    # DIVE-4642 — ranked here, above every inference, for the same reason the two
+    # branches around it are: a wedged composer FREEZES the seat, so it explains
+    # any concurrent stall and is the more specific reading of one. It must sit
+    # above `has_work`/`slow`/`stuck` in particular, because a wedged seat is
+    # holding an in_progress row BY DEFINITION — that row is what the injector
+    # claimed on the goal it could not deliver — and `active` is exactly the
+    # healthy-looking word that hid this for 9.5 hours on quinn.
+    #
+    # Not `stuck`: the P2 act ladder's remedies are wrong here. A nudge types
+    # another line into a composer that already cannot submit (each dispatch only
+    # makes the draft longer), and `resume` presses Escape, which aborts the turn.
+    # The only measured exit is `sudo 5dive agent restart <seat>`, so this class
+    # is observe-and-name, and the remedy is in the detail where an operator reads
+    # it rather than in a loop that would make the wedge worse.
+    class="composer-wedged"; cause="submit-unverified"
+    detail="${wedged} — recover with: sudo 5dive agent restart <seat>"
   elif [[ -n "$prompt_excerpt" ]]; then
     # DIVE-4293: ranked immediately under the verification challenge and above
     # every inference, on the same reasoning — a picker FREEZES the session, so
@@ -2419,7 +2441,7 @@ _sup_classify() {
     class="no-output"; cause="no-output"
     detail="${open_rows} open row(s), nothing closed in ${no_output_days}d"
     # Only when it was MEASURED. An unknown queue clock adds no clause, so every
-    # 21-arg caller's detail string is byte-identical to pre-4666.
+    # caller that passes no 23rd argument keeps a byte-identical detail string.
     if (( no_output_move >= 0 )); then
       detail="${detail}, nothing picked up in $(_sup_ago_phrase "$no_output_move")"
     fi
@@ -2669,12 +2691,20 @@ _sup_agent_record() {
   # `unprobed` never invents a fault — it only refuses to let a CLEAN word be
   # printed by a caller that was never allowed to observe (see _sup_classify).
   local pane_probe; pane_probe=$(_sup_probe_state "$verify_rc" "$quota_rc" "$prompt_rc")
+  # DIVE-4642: the injector already KNOWS when a submit failed — it prints
+  # `submit unverified` — and that knowledge went to a log nobody reads while the
+  # board said the seat was busy. `_wedge_read` is how it reaches a surface: a
+  # seat whose composer is holding an undelivered payload is named UNHEALTHY here
+  # within one tick. rc 1 (not wedged) leaves the variable empty, so the branch
+  # below is disarmed by absence and no new false red is possible.
+  local _sup_wedged=""
+  _sup_wedged=$(_wedge_read "$name" 2>/dev/null) || _sup_wedged=""
   crow=$(_sup_classify "$desired" "$svc_running" "$active" "$sess" "$tmux_state" "$poller" \
                         "$loop_stuck" "$has_work" "$act_age" "$_SUP_CLI_STALE" "$goal_drift_task" \
                         "$verify_excerpt" "$stranded" \
                         "$open_rows" "$no_output_days" "$quota_excerpt" "$quota_deadline" \
                         "$prompt_excerpt" "$prompt_mark" "$_sup_wall" "$pane_probe" \
-                        "$no_output_move")
+                        "$_sup_wedged" "$no_output_move")
   IFS=$'\x1f' read -r class cause detail <<<"$crow"
 
   jq -cn \

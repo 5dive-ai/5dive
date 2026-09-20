@@ -532,6 +532,32 @@ cmd_task_deliver() {
   # demands, so recording it cannot weaken the gate — the stamp still only ever
   # equals an iteration at which a PR was actually named.
   db "UPDATE tasks SET delivery_ref=$(sqlq "$pr"), delivered_at=datetime('now'), delivery_ref_iteration=COALESCE(iteration,0) WHERE id=${id};"
+  # A DELIVERY IS A TASK STATE CHANGE, so it leaves an audit row like every other
+  # one. `task start|done|cancel|set-body|merge|answer gate` all call this helper;
+  # `deliver` did not, and the only trace of a delivery was the row's own mutable
+  # columns. Measured on one box over the 24h to 2026-09-19: eight deliveries, and
+  # the same window carried 8 `task start` and 14 `task done` rows — so a reader
+  # asking "when was this bound, and to what" had a gap no other verb has.
+  #
+  # HERE, immediately after the binding UPDATE, because this is the one point
+  # every deliver arm crosses: the command-graded arm returns before the routing
+  # arm is reached, and the routing arm returns before the tail.
+  #
+  # The two fields are read in ONE query into locals rather than as command
+  # substitutions in the argument list. `src/task/status.sh` measured that exact
+  # shape: an argument-position `$(...)` is expanded BEFORE the callee runs, so
+  # every non-production-store call paid a fork for a row the DIVE-2010 fence then
+  # withheld.
+  #
+  # `iteration=` is the value STAMPED HERE. The routing arm below re-stamps it to
+  # iteration+1 inside the same command (see _task_route_to_verifier's trailing
+  # 1), so on that arm the row's final column reads one higher than this record —
+  # which is correct: this row says what the binding was stamped at, not what the
+  # counter ended the command at.
+  local _dl_audit _dl_iter _dl_review
+  _dl_audit=$(db "SELECT COALESCE(delivery_ref_iteration,0)||' '||COALESCE(review_mode,'-') FROM tasks WHERE id=${id};")
+  _dl_iter="${_dl_audit%% *}"; _dl_review="${_dl_audit#* }"
+  _task_store_audit_log "task deliver" ok 0 -- "$ident" "ref=$pr" "iteration=$_dl_iter" "review=$_dl_review"
   # DIVE-3496 (iteration 2): the ref is now bound — assert the gate's credential
   # can SEE it, here, rather than leaving the verifier to discover it at close.
   # Runs AFTER the write on purpose: the delivery is not conditional on it.
