@@ -152,6 +152,14 @@ sudo 5dive agent set-account cheap-coder kimi        # 重新绑定并重启智�
 sudo 5dive agent create glm-coder --type=claude --provider=openrouter --api-key=<key> --auth-profile=openrouter --model=z-ai/glm-5.2
 ```
 
+想把 key 保存一次、按名字分给智能体？`account set` 直接配置账户，不需要先有智能体；之后每个 `agent create --auth-profile=<name>` 或 `agent set-account` 都会复用它（详见下文[账户](#账户共享鉴权配置)）：
+
+```sh
+sudo 5dive account add or-alpha
+printf '%s' "$OPENROUTER_API_KEY" | sudo 5dive account set or-alpha --type=claude --provider=openrouter --api-key=-
+sudo 5dive agent create scout --type=claude --auth-profile=or-alpha
+```
+
 不在上述列表里？`--base-url` 可以把框架指向**任意** Anthropic 兼容接口——自托管的模型，或我们未收录的供应商主机：
 
 ```sh
@@ -204,6 +212,24 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 
 `5dive ui`<br>
 在本地浏览器中查看组织架构、任务队列和人工关卡。
+
+`5dive wall main olivia dev quinn ops --grid=3x2`<br>
+把这五个席位的实时终端平铺在一个屏幕上，只读；直接运行 `5dive wall` 则平铺所有在跑的席位。`C-b w` 让某一个窗格可写，`C-b d` 分离。
+
+`5dive project add mobile --prefix=MOB --lead-agent=dev`<br>
+一支团队同时做多个产品。每个项目有自己的任务编号（MOB-1、MOB-2）和自己的负责人。
+
+`5dive org tree`<br>
+谁向谁汇报。人工关卡沿这张图向上路由；`sudo 5dive human add you --telegram=<chat id>` 指定关卡要找的那个人的手机。
+
+`sudo 5dive plugin add 5dive-ai/5dive-browser`<br>
+直接从 GitHub 仓库安装插件。这个插件给整支团队一个共享的、由人登录过的浏览器。
+
+`5dive fleet status`<br>
+用 `5dive fleet add` 登记过的每台机器的可达性和智能体数量。
+
+`5dive digest --7d`<br>
+最近七天团队工作的一页摘要。`5dive digest on` 会每天发到你的 Telegram。
 
 `5dive memory search "release checklist"`<br>
 搜索团队带来源的长期记忆。
@@ -293,6 +319,17 @@ sudo 5dive agent create agent-a --type=claude --auth-profile=work
 sudo 5dive agent create agent-b --type=claude --auth-profile=work
 ```
 
+`login` 是交互式 OAuth 登录。要用自带的 provider key，`account set` 直接配置账户，不需要智能体：
+
+```sh
+sudo 5dive account add or-alpha
+printf '%s' "$OPENROUTER_API_KEY" | sudo 5dive account set or-alpha \
+  --type=claude --provider=openrouter --api-key=- --model=stealth/union-alpha
+sudo 5dive agent set-account coder or-alpha
+```
+
+用 `--api-key=-` 从标准输入传 key：直接写 `--api-key=<value>` 也能用，但调用期间会出现在 `ps` 里，也会留在 shell 历史中。替换账户已有的凭据需要 `--replace`，替换会记入审计——记录里有账户和 provider，从不包含 key。
+
 重命名或轮换账户时，所有绑定的智能体都会自动重新绑定。`5dive account usage` 显示每个账户的限流余量。
 
 ### 整支团队共用一个 bot
@@ -315,6 +352,23 @@ sudo 5dive agent import olivia --as=ceo    # 从 pack 创建具名智能体
 ```
 
 `--as` 是该智能体在你主机上的名字；pack 会提供人格、模型和技能。导入时加 `--channels=telegram` 可同时配置 bot。Pack 位于 [`5dive-ai/5dive-marketplace`](https://github.com/5dive-ai/5dive-marketplace) 仓库，`5dive.yaml` 也可以通过 `pack: <slug>` 引用。
+
+### 插件
+
+插件一次给机器上的所有席位加上某样东西：一个渠道（Telegram、Discord）、一个动词（新的顶层 `5dive <verb>`），或一项能力，比如共享浏览器或语音。它是一个带 Claude Code 插件清单（`.claude-plugin/plugin.json`）的目录。5dive 在机器层面安装它，并把它注册给现有的每个智能体和之后创建的每个智能体：Claude Code 席位通过各自的插件安装，其他框架通过插件的 `AGENTS.md` 段落。
+
+```sh
+sudo 5dive plugin add browser@5dive-plugins        # 从 5dive 市场安装
+sudo 5dive plugin add 5dive-ai/5dive-voice         # 从任何带 marketplace.json 的 GitHub 仓库安装
+sudo 5dive plugin list                             # 版本、层级、是否启用、注册了什么
+sudo 5dive plugin upgrade browser@5dive-plugins
+sudo 5dive plugin disable browser@5dive-plugins    # 只是翻转开关；代码留在磁盘上
+sudo 5dive plugin rollback browser@5dive-plugins 1.1.0
+```
+
+`add` 会打印插件的发布者以及它将被赋予的确切权限，然后等你确认：插件是以你的智能体的权限运行的代码。`5dive market --kind=plugin` 是目录，仪表盘的 **Plugins** 页面显示同一份列表。
+
+**开发你自己的插件。** 任何带 `.claude-plugin/marketplace.json`（列出其插件）的仓库都可以用 `5dive plugin add <owner>/<repo>` 安装。[5dive-browser](https://github.com/5dive-ai/5dive-browser) 和 [5dive-voice](https://github.com/5dive-ai/5dive-voice) 是我们以这种方式发布的两个；[5dive-plugins](https://github.com/5dive-ai/5dive-plugins) 是放着其余插件（telegram、dashboard、buzz）的市场。插件声明它注册什么（`channel`、`verb`、`skill`、`mcp`）。动词插件提供 `bin/<verb>`，且只在所有内置命令之后才会被匹配，所以它永远抢不走你的 `5dive task`；清单里若声明了内置命令名，或另一个插件已占用的动词，安装时会被拒绝。用你自己的名义发布：`add` 在任何东西运行之前都会先显示发布者。
 
 ### 查看组织层：`5dive ui`
 
@@ -353,6 +407,7 @@ CLI 自带一个 Web 界面。无需安装、无需构建、无需账户：
 5dive task      add / ls / assign / start / done / need / inbox / answer
 5dive heartbeat on / off / ls / tick     # 唤醒有排队任务的智能体
 5dive org       set / tree               # 谁向谁汇报
+5dive wall [--grid=CxR] [<seat>...]      # 所有智能体的实时终端平铺在一个屏幕上，只读
 5dive ui                                 # 浏览器中的三个视图（见下文）
 
 5dive account   add / login / list / show / usage / rename / remove
