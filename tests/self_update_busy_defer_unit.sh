@@ -163,6 +163,91 @@ else
   bad_t "the busy query is not scoped to in_progress" "counting todo defers every agent with a backlog, forever"
 fi
 
+# ------------------------------------------- the SESSION half of busy --------
+# THE BOARD IS NOT THE SESSION. `_agent_busy_state` used to be only the board,
+# so a seat mid-turn on chat-driven work and holding NO row — the normal shape
+# for a Telegram-paired seat — answered `idle` and the nightly update restarted
+# it mid-turn. The live reading is the one the heartbeat already trusts before
+# every reclaim (`_hb_agent_native_state`: claude agents --json as the seat ->
+# busy | idle | blocked:<why>, rc 1 when it cannot tell).
+#
+# `bsn <db-stub> <native-stub>` composes the two readings independently, which is
+# the whole point: the defect lives in the cell where the board says idle and the
+# session says busy, and only an independent cross can construct it.
+BOARD_IDLE='db(){ echo 0; }; sqlq(){ printf "%s" "$1"; }'
+BOARD_BUSY='db(){ echo 3; }; sqlq(){ printf "%s" "$1"; }'
+bsn() { ( eval "$1"; eval "$2"; eval "$block"; _agent_busy_state "${3:-alice}" ); }
+
+if [[ "$(bsn "$BOARD_IDLE" '_hb_agent_native_state(){ printf busy; }')" == busy ]]; then
+  ok_t "THE DEFECT'S CELL: board idle + session BUSY reads busy — a seat mid-turn with nothing claimed is no longer restarted"
+else
+  bad_t "a mid-turn seat with no claimed row still read idle" \
+        "got '$(bsn "$BOARD_IDLE" '_hb_agent_native_state(){ printf busy; }')' — KILLS WORK, and it is the shape every chat-driven seat has"
+fi
+if [[ "$(bsn "$BOARD_IDLE" '_hb_agent_native_state(){ printf "blocked:permission prompt"; }')" == busy ]]; then
+  ok_t "blocked:* is busy too — a seat waiting on a prompt has a live turn behind it"
+else
+  bad_t "a blocked session read idle" "a permission prompt is not a task boundary"
+fi
+if [[ "$(bsn "$BOARD_IDLE" '_hb_agent_native_state(){ printf idle; }')" == idle ]]; then
+  ok_t "board idle + session idle is still idle — NEVER FIRES stays closed, the restart is taken"
+else
+  bad_t "an idle seat was not restartable" "nothing would ever be bounced onto a new payload"
+fi
+# rc 1 is "no reading", and it must change NOTHING: a non-claude runtime, a
+# `claude` too old for `agents --json`, or a split tree where the helper is not
+# loaded all have to behave exactly as before this change.
+if [[ "$(bsn "$BOARD_IDLE" '_hb_agent_native_state(){ return 1; }')" == idle ]]; then
+  ok_t "an UNAVAILABLE session signal (rc 1) leaves the board's answer alone"
+else
+  bad_t "an unavailable signal changed the verdict" "every non-claude seat would stop taking payload updates"
+fi
+if [[ "$(bsn "$BOARD_IDLE" ':')" == idle ]]; then
+  ok_t "the helper ABSENT entirely behaves as before — the guard is declare -F, not a call into the void"
+else
+  bad_t "an absent helper changed behaviour" "a missing function must not be a silent policy change"
+fi
+# An unreadable BOARD is not upgraded by a session reading: the two answer
+# different questions, and `unknown` already defers.
+if [[ "$(bsn 'db(){ return 1; }; sqlq(){ printf "%s" "$1"; }' '_hb_agent_native_state(){ printf idle; }')" == unknown ]]; then
+  ok_t "an unreadable board stays UNKNOWN even when the session says idle — three values stay three"
+else
+  bad_t "unknown was folded into idle by the session reading" "KILLS WORK whenever the board errors"
+fi
+# A board that says busy must not pay for a shell-out to confirm a deferral it
+# already decided. Recorded as a file because "was it called" is not inferable.
+NATIVE_CALLS="$WORK/native.calls"; : >"$NATIVE_CALLS"
+if [[ "$(bsn "$BOARD_BUSY" '_hb_agent_native_state(){ printf 1 >>"$NATIVE_CALLS"; printf idle; }')" == busy ]] \
+   && [[ ! -s "$NATIVE_CALLS" ]]; then
+  ok_t "a BUSY board short-circuits: the session is never asked, so no sudo/exec is spent on a settled answer"
+else
+  bad_t "the busy board still called the native probe" "calls=[$(cat "$NATIVE_CALLS" 2>/dev/null)]"
+fi
+
+# MUTANT: drop the native case and the defect's cell reads idle again.
+mut_block="$(printf '%s\n' "$block" | sed '/busy|blocked:\*) printf .busy/d')"
+if [[ "$mut_block" != "$block" ]]; then
+  ok_t "MUTANT: the native case is removable from the shipped block, so the strike-out below is real"
+else
+  bad_t "the mutation is a no-op" "the arm below would pass vacuously"
+fi
+mut_state="$( eval "$BOARD_IDLE"; _hb_agent_native_state(){ printf busy; }; eval "$mut_block"; _agent_busy_state alice )"
+if [[ "$mut_state" == idle ]]; then
+  ok_t "MUTANT: without the native case, board idle + session busy reads 'idle' again — the restart-mid-turn defect, live"
+else
+  bad_t "mutant must reproduce the defect" "got '$mut_state' — the arms above are vacuous"
+fi
+
+# THE HOST-PRISTINE CONTROL. CI has no /usr/local/bin/5dive, no /etc/5dive, no
+# /var/lib/5dive and no sudo grant, so a predicate short-circuiting on one of
+# those passes at a desk and reds on the runner. Asserted as a property of the
+# shipped block rather than assumed.
+if grep -qE '/usr/local/bin|/etc/5dive|/var/lib/5dive' <<<"$(sed -n '/^_agent_busy_state()/,/^}/p' src/cmd_selfupdate.sh)"; then
+  bad_t "_agent_busy_state names an absolute host path" "it would short-circuit on the runner, where none of them exist"
+else
+  ok_t "_agent_busy_state reads no absolute host path — nothing in it can short-circuit on what CI does not install"
+fi
+
 # ------------------------------- POSITIVE CONTROL (acceptance criterion 3) -----
 # One agent, one marker, three sweeps: parked mid-task -> NOT restarted; row
 # closed -> restarted; then the marker is gone so it is not restarted twice.
@@ -226,6 +311,38 @@ if [[ "$out" == "fired=0 deferred=1 cleared=0" ]] && [[ ! -s "$RESTARTS" ]]; the
   ok_t "an idle BOARD with a non-idle PANE still defers (the boundary is not the end of the turn)"
 else
   bad_t "a mid-turn agent was bounced" "sweep said '$out' — the pane guard is not applied"
+fi
+
+# END TO END, through the real sweep rather than the predicate alone: the board
+# is idle, the SESSION is mid-turn, and the bounce must not happen. This is the
+# arm that grades what `5dive update` actually does on a chat-driven seat — the
+# predicate arms above would all pass against a sweep that never consulted it.
+rm -rf "$PENDING_RESTART_DIR"; mk frank "payload changed" >/dev/null; : > "$RESTARTS"
+out="$(
+  (
+    eval "$block"
+    RESTARTS="$WORK/restarts"
+    systemctl() {
+      case "${1:-}" in
+        is-active) return 0 ;;
+        show)      printf '\n' ;;
+        restart)   printf '%s\n' "${2:-}" >> "$RESTARTS" ;;
+        *)         return 0 ;;
+      esac
+    }
+    db(){ echo 0; }; sqlq(){ printf '%s' "$1"; }   # board: no claimed row
+    _hb_agent_native_state(){ printf busy; }        # session: mid-turn
+    _hb_agent_idle(){ return 0; }                   # pane would have said idle
+    _pending_restart_sweep
+    printf 'fired=%s deferred=%s\n' "$_PR_FIRED" "$_PR_DEFERRED"
+  )
+)"
+if [[ "$out" == "fired=0 deferred=1" ]] && [[ ! -s "$RESTARTS" ]] \
+   && [[ -f "$PENDING_RESTART_DIR/frank" ]]; then
+  ok_t "E2E: the SWEEP defers a seat whose board is idle but whose session is mid-turn, and keeps the marker"
+else
+  bad_t "the sweep bounced a mid-turn seat with no claimed row" \
+        "sweep='$out' restarts: $(tr '\n' ' ' < "$RESTARTS") — this is the nightly update killing a turn"
 fi
 
 # A stopped unit has nothing to bounce: it loads the new payload on its next
