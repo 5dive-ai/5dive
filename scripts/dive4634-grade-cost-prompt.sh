@@ -70,11 +70,11 @@ printf '%s\n' \
   'CRITERIA: body omitted; exact-sha clean sealed tree; fixed rubric on cheap model; escalation preserved.' \
   '--- DELIVERED DIFF ---'
 # DIVE4634_EXCLUDE_SCAFFOLD=1 drops THIS measurement apparatus (the generator and
-# its narrative fixture) from the diff. It is not the grader's view — the grader
-# sees the whole delivered diff, scaffolding included — it exists so the ratio can
-# be read without the fixture, which lands in the diff and inflates BOTH arms by
-# its own size. Report the unset number as the measurement; the set one only says
-# how much of the packet is the apparatus.
+# its narrative fixture) from the diff. Unset is the grader's real view of THIS
+# delivery and is the number to quote for this row. Set is the number that
+# GENERALISES: the 38KB fixture lands in the diff and inflates both arms by its
+# own size, which no ordinary row carries, so the unset ratio understates the
+# effect of bounding on a normal delivery. Quote both, never one alone.
 if [[ "${DIVE4634_EXCLUDE_SCAFFOLD:-0}" == 1 ]]; then
   git_ diff "$base_sha..$head_sha" -- . \
     ':(exclude)tests/fixtures/dive4634-legacy-narrative.txt' \
