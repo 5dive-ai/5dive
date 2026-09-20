@@ -53,6 +53,41 @@ has "$CALLS" '/usr/local/bin/5dive _task_channel' 'delegation invokes only the h
 : >"$CALLS"; _task_channel_try answer DIVE-1 --value=yes >/dev/null 2>&1
 [[ ! -s "$CALLS" ]] && ok 'no channel proof means no privileged call' || bad 'no channel proof means no privileged call'
 
+# DIVE-4609 iteration 2 (quinn reject): a seat that does NOT hold the grant must
+# fall THROUGH to today's unprivileged write, not fail. Every installed seat is
+# in that state until its sudoers is re-rendered, so the first version of this
+# bridge took a working path away from every one of them. `fail` exits the
+# process, so on the pre-fix tree this arm does not print FAIL -- it kills the
+# harness mid-run, which is itself the regression signal.
+sudo(){
+  if [[ "$2" == "-l" ]]; then return 1; fi          # grant absent
+  printf '%s\n' "$*" >>"$CALLS"; cat >/dev/null
+  printf '{"ok":true,"data":{"signed":true}}\n'
+}
+: >"$CALLS"; _TASK_CHANNEL_ATTEMPTED=unset
+_task_channel_try answer DIVE-1 --value=yes --channel-proof=123 >/dev/null 2>&1; rc=$?
+[[ $rc != 0 ]] && ok 'ungranted seat: bridge declines instead of taking the write' \
+  || bad 'ungranted seat: bridge declines instead of taking the write'
+[[ "${_TASK_CHANNEL_ATTEMPTED}" == 0 ]] && ok 'ungranted seat: ATTEMPTED=0 so the caller falls through' \
+  || bad "ungranted seat: ATTEMPTED=0 so the caller falls through (got '${_TASK_CHANNEL_ATTEMPTED}')"
+[[ ! -s "$CALLS" ]] && ok 'ungranted seat: no privileged call is made' || bad 'ungranted seat: no privileged call is made'
+
+# ...and the converse, which is the refusal this bridge exists to make: the grant
+# IS present, so the proof reached root and ROOT refused it. Falling through here
+# would land the write unsigned behind a human proof the primitive rejected, so
+# ATTEMPTED stays 1 and the caller returns the refusal.
+sudo(){
+  if [[ "$2" == "-l" ]]; then return 0; fi          # grant present
+  printf '%s\n' "$*" >>"$CALLS"; cat >/dev/null
+  printf 'refused\n'; return 4
+}
+: >"$CALLS"; _TASK_CHANNEL_ATTEMPTED=unset
+_task_channel_try answer DIVE-1 --value=yes --channel-proof=123 >/dev/null 2>&1; rc=$?
+[[ $rc == 4 ]] && ok 'granted seat: a root refusal propagates as the caller rc' \
+  || bad "granted seat: a root refusal propagates as the caller rc (got $rc)"
+[[ "${_TASK_CHANNEL_ATTEMPTED}" == 1 ]] && ok 'granted seat: ATTEMPTED=1 so there is no unsigned fall-through' \
+  || bad "granted seat: ATTEMPTED=1 so there is no unsigned fall-through (got '${_TASK_CHANNEL_ATTEMPTED}')"
+
 SETUP="$SRC/lib/agent_setup.sh"
 has "$SETUP" 'TELEGRAM_BOT_TOKEN=%s' 'Claude install writes the channel token'
 has "$SETUP" 'mcp-needs-auth-cache.json' 'Claude install clears stale MCP auth refusal cache'

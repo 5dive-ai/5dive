@@ -564,8 +564,10 @@ cmd_task_channel_delegated() {
 }
 
 # Caller half. _TASK_CHANNEL_ATTEMPTED distinguishes "not this path" from a
-# privileged refusal: once a caller supplied --channel-proof, failure MUST NOT
-# fall through to an unsigned/group-writable write.
+# privileged refusal: once the bridge has actually been EXERCISED -- proof
+# supplied AND the grant present -- failure MUST NOT fall through to an
+# unsigned/group-writable write. A seat that holds no grant never exercises it
+# and is left on today's path (see the guard below).
 _task_channel_try() {
   local op="$1"; shift
   _TASK_CHANNEL_ATTEMPTED=0
@@ -574,9 +576,21 @@ _task_channel_try() {
   local a has_proof=0
   for a in "$@"; do [[ "$a" == --channel-proof=* ]] && has_proof=1; done
   (( has_proof )) || return 1
+  # DIVE-4609 iteration 2: NO GRANT IS "THIS PATH DOES NOT EXIST HERE", NOT A
+  # REFUSAL. Every seat whose sudoers predates this change -- i.e. every
+  # installed seat until it is re-rendered, plus every admin/root-all seat that
+  # never needed the bridge -- has no `_task_channel` entry. Failing here did
+  # not ADD a signed path to those seats, it REPLACED their working
+  # unprivileged write with a hard E_PERMISSION. So leave _TASK_CHANNEL_ATTEMPTED
+  # at 0 and fall through to today's path, byte for byte, exactly as the
+  # sibling `_task_answer_try_delegated` does one function below.
+  #
+  # The hard refusal below stays for the case it was written for: the grant
+  # EXISTS, so the caller's channel proof was handed to root and ROOT said no.
+  # Falling through there would land the write unsigned behind a human proof
+  # the primitive had just rejected.
+  sudo -n -l /usr/local/bin/5dive _task_channel >/dev/null 2>&1 || return 1
   _TASK_CHANNEL_ATTEMPTED=1
-  sudo -n -l /usr/local/bin/5dive _task_channel >/dev/null 2>&1 \
-    || fail "$E_PERMISSION" "paired-human task write needs the scoped _task_channel grant; reconcile this standard seat and retry."
   local out rc=0
   out=$(printf '%s\0' "$op" "$@" | sudo -n /usr/local/bin/5dive _task_channel 2>&1) || rc=$?
   printf '%s\n' "$out"
