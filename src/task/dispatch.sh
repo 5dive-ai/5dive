@@ -401,6 +401,7 @@ cmd_task() {
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
     merge)           cmd_task_merge "$@" ;;         # DIVE-3474 verifier merges what IT graded
+    merge-landed)    cmd_task_merge_landed "$@" ;; # DIVE-4654 record a forge merge; exit MERGING
     merge-audit)     cmd_task_merge_audit "$@" ;;   # DIVE-1935 retrospective sweep
     grader-replay)   cmd_task_grader_replay "$@" ;;  # DIVE-4164 dry-run capacity replay
     grader-tick)     cmd_task_grader_tick "$@" ;;    # DIVE-4164 pool lane (dark by default)
