@@ -84,6 +84,17 @@ _GRADER_TASK_CLI=mock_create; _grader_clone_record_origin(){ :; }
 _grader_clone_create gr-pool-1 pool "$IDENT" >/dev/null 2>&1
 grep -q -- '--model=sonnet' "$CREATE_ARGS" \
   && ok_t "rubric clone is pinned to the cheap model" || bad_t "rubric cheap model pin" "$(cat "$CREATE_ARGS" 2>/dev/null)"
+grep -q -- '--effort=low' "$CREATE_ARGS" \
+  && ok_t "rubric clone is pinned to low effort" || bad_t "rubric low-effort pin" "$(cat "$CREATE_ARGS" 2>/dev/null)"
+
+# The clone path passes --model without a BYO provider. Create must preserve
+# that auth-profile-backed model request in the runtime preseed; otherwise the
+# live seat silently starts on Opus while the mock-argument arm above stays green.
+CREATE_SRC=$(<src/cmd_agent_create.sh)
+[[ "$CREATE_SRC" == *'_claude_create_model="$byo_model"'* \
+  && "$CREATE_SRC" == *'preseed_claude_agent "$name" "$channels" "$_claude_create_model" "${byo_effort:-high}"'* ]] \
+  && ok_t "auth-profile clone applies the cheap model at create" \
+  || bad_t "auth-profile clone applies the cheap model at create"
 
 printf '%s\nPASS=%d FAIL=%d\n' '-----' "$PASS" "$FAILN"
 (( FAILN == 0 ))

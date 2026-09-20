@@ -83,14 +83,15 @@ sudo() {
 }
 chmod() { :; }
 install_default_skill_for_agent() { :; }
-preseed_claude_agent "$test_agent" none google/gemini-2.5-pro
+preseed_claude_agent "$test_agent" none google/gemini-2.5-pro low
 jq -e '.model == "google/gemini-2.5-pro"' "$captured_settings" >/dev/null
+jq -e '.effortLevel == "low"' "$captured_settings" >/dev/null
 
 create_src=$(<src/cmd_agent_create.sh)
 setup_src=$(<src/lib/agent_setup.sh)
 [[ "$create_src" == *'_apply_byo_hermes "$native" "$canonical" "$api_key" "$profile" "$model"'* ]]
-[[ "$create_src" == *'_claude_byo_model="$byo_model"'* ]]
-[[ "$create_src" == *'preseed_claude_agent "$name" "$channels" "$_claude_byo_model"'* ]]
+[[ "$create_src" == *'_claude_create_model="$byo_model"'* ]]
+[[ "$create_src" == *'preseed_claude_agent "$name" "$channels" "$_claude_create_model" "${byo_effort:-high}"'* ]]
 # DIVE-1883: the default pin is no longer a baked literal — it resolves from the
 # model catalogue (src/lib/models.sh). Assert the shape, not the id, so a model
 # release doesn't have to touch this test; models.sh owns the id and

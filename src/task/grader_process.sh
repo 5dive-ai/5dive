@@ -463,7 +463,7 @@ _grader_clone_create() {  # <clone> <pool_seat> [task-ident]
   # Rubric is deliberately a cheap-model lane. The fixed prompt contains the
   # judgement surface; it does not need the pool seat's strongest default.
   if [[ -n "$ident" ]] && [[ "$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')" == "rubric" ]]; then
-    model_arg=(--model="${_GRADER_RUBRIC_MODEL:-sonnet}")
+    model_arg=(--model="${_GRADER_RUBRIC_MODEL:-sonnet}" --effort=low)
   fi
   "$_GRADER_TASK_CLI" agent create "$clone" --type=claude --auth-profile="$profile" \
     "${model_arg[@]}" --channels=none --no-skills --no-team-bot --no-heartbeat >/dev/null 2>&1 || return $?
