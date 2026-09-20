@@ -1604,6 +1604,9 @@ _sup_alert_recipient() {  # -> seat name, or empty when nothing resolves
 # rail refused), no-channel (the resolved seat has no paired Telegram channel —
 # the leg that was a silent `if` with no else before this row).
 _SUP_ALERTS_UNDELIVERABLE=0
+# DIVE-4666: capacity pages withheld this tick because the seat is on a known,
+# self-healing wall. Counted, so "quiet" is a number and not an absence.
+_SUP_ALERTS_QUIETED=0
 _sup_alert_undeliverable() {  # <name> <class> <leg> <reason> [recipient]
   local name="$1" class="$2" leg="$3" reason="$4" to="${5:-}" sig
   _SUP_ALERTS_UNDELIVERABLE=$(( _SUP_ALERTS_UNDELIVERABLE + 1 ))
@@ -1666,9 +1669,14 @@ _sup_alert_deliver() {  # <rail> <name> <class> <msg> [notify_human=true] [notif
 # shape as _sup_verify_alert — both legs best-effort, because one wedged channel
 # must never abort the tick for the rest of the fleet — and the caller owns the
 # dedup window.
-_sup_capacity_alert() {  # <name> <class> <detail> [notify_human=true] [notify_machine=true]
-  local name="$1" class="$2" detail="$3" notify_human="${4:-true}" notify_machine="${5:-true}"
-  local msg="[FLEET-HEALTH ${class}] agent '${name}' is UP and REACHABLE but NOT TRANSACTING: ${detail}. Every liveness signal (unit / tmux / poller / registry label) reads healthy — that agreement is the DIVE-3272 defect, not evidence against this alert. Check the seat's model capacity (auth-profile, quota reset) and reassign or park whatever is queued behind it."
+_sup_capacity_alert() {  # <name> <class> <detail> [notify_human=true] [notify_machine=true] [wall_state=none] [reset_epoch] [queue]
+  local name="$1" class="$2" detail="$3" notify_human="${4:-true}" notify_machine="${5:-true}" \
+        wall_state="${6:-none}" reset="${7:-}" queue="${8:-}"
+  # DIVE-4666 item 3: the closing sentence is built, not literal — it names the
+  # reset in human time (never the provider's epoch) and the rows actually
+  # queued behind the seat. Every existing caller that passes neither gets the
+  # old sentence back, minus the epoch, which no reader could use anyway.
+  local msg="[FLEET-HEALTH ${class}] agent '${name}' is UP and REACHABLE but NOT TRANSACTING: ${detail}. Every liveness signal (unit / tmux / poller / registry label) reads healthy — that agreement is the DIVE-3272 defect, not evidence against this alert. $(_sup_capacity_tail "$name" "$wall_state" "$reset" "$queue")"
   # DIVE-4052: the MACHINE leg is suppressible too, and for quota-exhausted that
   # is the bigger of the two costs. This send lands in main's ACCUMULATING
   # session, where each one is a turn that re-sends the whole window — measured
@@ -1686,6 +1694,201 @@ _sup_capacity_alert() {  # <name> <class> <detail> [notify_human=true] [notify_m
   _sup_alert_deliver capacity-alert "$name" "$class" "$msg" "$notify_human" "$notify_machine"
 }
 
+# ── DIVE-4666: A KNOWN COOLDOWN IS NOT AN INCIDENT ──────────────────────────
+#
+# 2026-09-20 07:00:33Z a FLEET-HEALTH page for `olivia` reached a human. The
+# supervisor had measured — four minutes earlier, and on six ticks in the two
+# hours before that — that the seat's auth account was AT its 5h wall and WHEN
+# it came back. The page dropped both facts and asked the reader to "check the
+# seat's model capacity (auth-profile, quota reset)", which is the one thing it
+# had just measured. lodar, on his phone: "olivia is just on 5h usage limit
+# cooldown - not worth the alert".
+#
+# WHY IT ESCAPED THE TWO MUTES THAT ALREADY EXIST. DIVE-4052 mutes
+# `quota-exhausted` on both legs; DIVE-3982 mutes `no-output`'s human leg. On
+# paper this state was covered twice. The alert that fired was class
+# `no-output`, whose MACHINE leg is deliberately live (its remedy genuinely is
+# main's triage) — and it fired because the CLASSIFICATION oscillates tick to
+# tick while one single wall stands. Measured on supervisor_events for olivia,
+# 2026-09-20 (ts | classification | cause):
+#
+#   04:50–06:20  quota-exhausted / account-usage   fresh account reading
+#   05:30, 06:30 healthy                           the reading aged past 600s
+#   07:00        no-output / no-output  -> ALERT   still no fresh reading, so the
+#                                                  3-day drought the wall CAUSED
+#                                                  became the most specific branch
+#   07:10        quota-exhausted / account-usage   a fresh reading again
+#
+# The account-usage branch is gated on a reading measured within 600s and the
+# snapshot publisher's cadence is longer than that, so the wall signal BLINKS.
+# Every mute in this file keys on THIS TICK'S CLASS, so one blink lands the
+# fleet on the single class nobody muted. That is cause 5 of
+# `a-stalled-signal-is-true-and-names-no-cause`: the detector's window is
+# shorter than the lane's cadence.
+#
+# So the gate below keys on the SEAT'S KNOWN WALL, not on the class of the
+# tick. A DELIBERATE DEVIATION from the row's literal text ("a supervisor
+# verdict of quota-exhausted with a reset in the FUTURE"), written because the
+# literal version keys on the class and would NOT have suppressed the page that
+# caused the row.
+#
+# NOT GATED, on purpose: `verify-challenge` (account state only a person can
+# clear) and `blocked-on-prompt` — neither reaches these functions, they have
+# their own senders. And the audited supervisor_events row is filed either way:
+# muting a notification must never cost the record (DIVE-4052).
+
+# The tick cadence, used only as the one-tick grace below. Not a threshold to
+# tune: it answers "could the seat plausibly have resumed yet".
+_SUP_TICK_SEC="${SUPERVISOR_TICK_SEC:-600}"
+[[ "$_SUP_TICK_SEC" =~ ^[0-9]+$ ]] || _SUP_TICK_SEC=600
+
+# PURE. <reset_epoch> <now_epoch> [tick_sec] -> cooling | lapsed | none
+#
+# `none` is the NO-KNOWLEDGE answer and restores the pre-4666 policy exactly: an
+# empty or unparseable reset can never quieten anything. The false-negative bias
+# every threshold in this file carries — an unknown wall pages.
+_sup_wall_verdict() {
+  local reset="${1:-}" now="${2:-}" tick="${3:-${_SUP_TICK_SEC:-600}}"
+  [[ "$reset" =~ ^[0-9]+$ ]] || { printf 'none'; return 0; }
+  [[ "$now"   =~ ^[0-9]+$ ]] || now=$(date +%s)
+  [[ "$tick"  =~ ^[0-9]+$ ]] || tick=600
+  (( now <= reset )) && { printf 'cooling'; return 0; }
+  # ONE TICK OF GRACE, which the row asked for by name. A seat does not resume
+  # on the second its wall lifts — it resumes on the next dispatch. Paging at
+  # reset+1s would page every wall on this box, once, forever.
+  (( now - reset <= tick )) && { printf 'cooling'; return 0; }
+  printf 'lapsed'
+}
+
+# PURE. <text> [now_epoch] -> reset epoch | empty
+#
+# The reset out of a detail string, in the three shapes this file produces:
+#   * `... — resets <epoch>`       the account snapshot's own stamp (s or ms),
+#                                   and every audited row written before 4666
+#   * `... — resets 08:50Z` /
+#     `... — resets Sep 21 08:50Z` what quota_wall_when renders from 4666 on
+#   * the vendor banner's clock     parsed by the ONE parser that already
+#                                   resolves it (_sup_quota_deadline), never a
+#                                   third regex for the same sentence
+#
+# Our own `HH:MMZ` form is read HERE rather than through _sup_quota_deadline,
+# whose regexes correctly refuse a bare meridiem-less clock: on a VENDOR BANNER
+# "at 8:50" is 08:50 or 20:50 and guessing invents the answer, but in a string
+# this file rendered itself the Z is explicit and there is nothing to guess.
+_sup_wall_reset_of() {
+  local text="${1:-}" now="${2:-}" st ep hh mm day base best="" bestd=-1 d
+  [[ -n "$text" ]] || return 0
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  if [[ "$text" =~ resets?[[:space:]]+([0-9]{13})([^0-9]|$) ]]; then
+    printf '%s' $(( 10#${BASH_REMATCH[1]} / 1000 )); return 0
+  fi
+  if [[ "$text" =~ resets?[[:space:]]+([0-9]{9,11})([^0-9]|$) ]]; then
+    printf '%s' $(( 10#${BASH_REMATCH[1]} )); return 0
+  fi
+  # `resets Sep 21 08:50Z` — fully qualified, so resolve it directly. The YEAR
+  # is the current one: a wall never resets more than 7 days out, so the only
+  # input this is wrong on is one straddling New Year, and it is wrong in the
+  # LOUD direction (a stale-looking reset reads `lapsed`, which pages).
+  if [[ "$text" =~ resets?[[:space:]]+([A-Z][a-z]{2})[[:space:]]+([0-9]{1,2})[[:space:]]+([0-9]{2}):([0-9]{2})Z ]]; then
+    d=$(date -u -d "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} $(date -u -d "@${now}" +%Y) ${BASH_REMATCH[3]}:${BASH_REMATCH[4]} UTC" +%s 2>/dev/null) || d=""
+    [[ "$d" =~ ^[0-9]+$ ]] && { printf '%s' "$d"; return 0; }
+    return 0
+  fi
+  # `resets 08:50Z` — a bare clock, resolved to the NEAREST day, the same
+  # yesterday/today/tomorrow arithmetic _sup_clock_state uses on the banner.
+  if [[ "$text" =~ resets?[[:space:]]+([0-9]{2}):([0-9]{2})Z ]]; then
+    hh="${BASH_REMATCH[1]}"; mm="${BASH_REMATCH[2]}"
+    day=$(date -u -d "@${now}" +%Y-%m-%d 2>/dev/null) || return 0
+    base=$(date -u -d "${day} ${hh}:${mm} UTC" +%s 2>/dev/null) || return 0
+    for d in $(( base - 86400 )) "$base" $(( base + 86400 )); do
+      local dist=$(( d > now ? d - now : now - d ))
+      if (( bestd < 0 || dist < bestd )); then bestd="$dist"; best="$d"; fi
+    done
+    printf '%s' "$best"; return 0
+  fi
+  IFS=$'\x1f' read -r st ep <<<"$(_sup_quota_deadline "$text" "$now")"
+  [[ "$st" == "live" || "$st" == "lapsed" ]] && [[ "$ep" =~ ^[0-9]+$ ]] && printf '%s' "$ep"
+  return 0
+}
+
+# I/O. <name> [now_epoch] -> "<verdict>\x1f<reset epoch or empty>"
+#
+# The live snapshot first, then the AUDITED ROWS — and the audited rows are the
+# whole point: they are what survives the blink. A tick that cannot see a fresh
+# reading still sees the six rows the last two hours wrote.
+_sup_wall_state() {
+  local name="${1:-}" now="${2:-}" w_state w_win w_pct w_reset w_age w_note e rows d
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  [[ -n "$name" ]] || { printf 'none\x1f\n'; return 0; }
+  if declare -f quota_wall_seat >/dev/null 2>&1; then
+    IFS=$'\037' read -r w_state w_win w_pct w_reset w_age w_note <<<"$(quota_wall_seat "$name" 2>/dev/null)"
+    if [[ "$w_state" == "exhausted" && -n "$w_reset" ]]; then
+      e=$(_sup_wall_reset_of "resets ${w_reset}" "$now")
+      [[ -n "$e" ]] && { printf '%s\x1f%s\n' "$(_sup_wall_verdict "$e" "$now")" "$e"; return 0; }
+    fi
+  fi
+  # The SUBSHELL is load-bearing for the same reason it is in
+  # _sup_alert_undeliverable: `db` fences the store and a fenced store makes it
+  # `fail`, which EXITS. Deciding whether to quieten an alert must never take
+  # the tick down — and an unreadable store answers `none`, which PAGES.
+  rows=$( db "SELECT COALESCE(json_extract(signals, '\$.detail'), '')
+              FROM supervisor_events
+              WHERE agent=$(sqlq "$name")
+                AND event IN ('observe','transition','alert')
+                AND classification='quota-exhausted'
+                AND ts >= datetime('now', '-${_SUP_ALERT_WINDOW_H} hours')
+              ORDER BY id DESC LIMIT 24;" 2>/dev/null ) || rows=""
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    e=$(_sup_wall_reset_of "$d" "$now")
+    [[ -n "$e" ]] && { printf '%s\x1f%s\n' "$(_sup_wall_verdict "$e" "$now")" "$e"; return 0; }
+  done <<<"$rows"
+  printf 'none\x1f\n'
+}
+
+# I/O. <name> -> "DIVE-1, DIVE-2 (+3 more)" | empty
+#
+# DIVE-4666 item 3: the page names the queue instead of telling the reader to go
+# look it up. The whole cost of the DIVE-3272 incident was the rows stranded
+# behind a dark seat, so the alert that exists for it may as well carry them.
+_sup_queue_behind() {
+  local name="${1:-}" ids n extra
+  [[ -n "$name" ]] || return 0
+  ids=$( db "SELECT GROUP_CONCAT(ident, ', ') FROM (
+               SELECT ident FROM tasks
+               WHERE assignee=$(sqlq "$name") AND status IN ('todo','in_progress')
+               ORDER BY id LIMIT 5);" 2>/dev/null ) || ids=""
+  [[ -n "$ids" ]] || return 0
+  n=$( db "SELECT COUNT(*) FROM tasks
+           WHERE assignee=$(sqlq "$name") AND status IN ('todo','in_progress');" 2>/dev/null ) || n=0
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  extra=""
+  (( n > 5 )) && extra=" (+$(( n - 5 )) more)"
+  printf '%s%s' "$ids" "$extra"
+}
+
+# PURE. <name> <wall_state> <reset_epoch> <queue> [now] -> the closing sentence.
+#
+# DIVE-4666 item 3. The old tail asked the reader to re-measure two things the
+# sender was holding: the quota reset it had just read, and the queue it had
+# just counted. An alert that sends you to go look is a slower version of no
+# alert.
+_sup_capacity_tail() {
+  local name="${1:-}" ws="${2:-none}" reset="${3:-}" queue="${4:-}" now="${5:-}" out
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  if [[ "$ws" == "lapsed" && "$reset" =~ ^[0-9]+$ ]] && declare -f quota_wall_when >/dev/null 2>&1; then
+    out="Its usage wall ENDED at $(quota_wall_when "$reset" "$now") and the seat is still not transacting, so this is not a cooldown — check the auth profile."
+  else
+    out="Check the seat's model capacity (auth-profile, quota reset)."
+  fi
+  if [[ -n "$queue" ]]; then
+    out="${out} Queued behind it: ${queue} — reassign or park those."
+  else
+    out="${out} Nothing is queued behind it right now (5dive task ls --assignee=${name})."
+  fi
+  printf '%s' "$out"
+}
+
 # DIVE-4052: which LEGS does a capacity alert get? Two pure decisions, no I/O,
 # so the wiring from classification to each leg is unit-gradeable on its own.
 # `quota_alerts_on` is read once per tick from _SUP_QUOTA_ALERTS_FLAG and passed
@@ -1693,8 +1896,17 @@ _sup_capacity_alert() {  # <name> <class> <detail> [notify_human=true] [notify_m
 #
 # Both default the sentinel to TRUE so that a legacy 1-arg call is exactly the
 # pre-4052 loud answer; the production tick always passes the flag explicitly.
-_sup_capacity_notify_human() {  # <class> [quota_alerts_on] -> true|false
-  local class="${1:-}" quota_alerts_on="${2:-true}"
+_sup_capacity_notify_human() {  # <class> [quota_alerts_on] [wall_state] -> true|false
+  local class="${1:-}" quota_alerts_on="${2:-true}" wall_state="${3:-none}"
+  # DIVE-4666: a KNOWN cooldown with a measured reset still ahead is not an
+  # incident on either leg, whichever of the two capacity classes this tick
+  # happened to land on. Ahead of every other rule here because it is a fact
+  # about the SEAT and the rules below are facts about the class. Defaults to
+  # `none`, so a legacy 2-arg call is byte-for-byte the pre-4666 answer.
+  if [[ "$wall_state" == "cooling" ]] \
+     && [[ "$class" == "quota-exhausted" || "$class" == "no-output" ]]; then
+    printf 'false'; return
+  fi
   # DIVE-3982: no-output ("N open row(s), nothing closed in Nd") is never a human
   # ping — the other half of the FLEET-HEALTH family. Its remedy is "reassign or
   # park", which is main/ops triage, NOT lodar's, and it is the byte-identical
@@ -1717,8 +1929,15 @@ _sup_capacity_notify_human() {  # <class> [quota_alerts_on] -> true|false
 # function at all (_sup_verify_alert, loud on both legs by construction: an
 # ID-verification challenge is account state only a person can clear, and it is
 # not a quota wall).
-_sup_capacity_notify_machine() {  # <class> [quota_alerts_on] -> true|false
-  local class="${1:-}" quota_alerts_on="${2:-true}"
+_sup_capacity_notify_machine() {  # <class> [quota_alerts_on] [wall_state] -> true|false
+  local class="${1:-}" quota_alerts_on="${2:-true}" wall_state="${3:-none}"
+  # DIVE-4666. THIS is the leg that fired on 2026-09-20 — `no-output`'s machine
+  # leg, the one DIVE-3982 deliberately left live — so a gate that covered only
+  # the human leg would have changed nothing about the page it was written for.
+  if [[ "$wall_state" == "cooling" ]] \
+     && [[ "$class" == "quota-exhausted" || "$class" == "no-output" ]]; then
+    printf 'false'; return
+  fi
   [[ "$class" == "quota-exhausted" ]] && { printf '%s' "$quota_alerts_on"; return; }
   printf 'true'
 }
@@ -3245,6 +3464,8 @@ cmd_supervisor_tick() {
   # (the loop runs in this shell — process substitution, not a pipe — so the
   # count survives to the summary line and the heartbeat row).
   _SUP_ALERTS_UNDELIVERABLE=0
+  # DIVE-4666: same per-tick reset, same reason.
+  _SUP_ALERTS_QUIETED=0
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     # DIVE-3272: the same always-live, deduped alert path carries the capacity
@@ -3452,14 +3673,31 @@ cmd_supervisor_tick() {
     # the digest both read it. What changed is only that nobody is PINGED.
     if (( prev_alert > 0 )); then continue; fi
     local notify_human notify_machine
-    notify_human=$(_sup_capacity_notify_human "$cls" "$quota_alerts_on")
-    notify_machine=$(_sup_capacity_notify_machine "$cls" "$quota_alerts_on")
+    # DIVE-4666: the seat's KNOWN wall, resolved once per alerting seat. Read
+    # even for the classes it cannot quieten, because the `lapsed` reading is
+    # what lets the page say when the wall ended instead of asking the reader.
+    local wall_state wall_reset queue_behind
+    IFS=$'\x1f' read -r wall_state wall_reset <<<"$(_sup_wall_state "$name")"
+    notify_human=$(_sup_capacity_notify_human "$cls" "$quota_alerts_on" "$wall_state")
+    notify_machine=$(_sup_capacity_notify_machine "$cls" "$quota_alerts_on" "$wall_state")
+    queue_behind=$(_sup_queue_behind "$name")
     if [[ "$cls" == "verify-challenge" ]]; then
       _sup_verify_alert "$name" "$excerpt"
     elif [[ "$cls" == "blocked-on-prompt" ]]; then
       _sup_prompt_alert "$name" "$excerpt" "$(jq -r '.cause // "blocked-on-prompt"' <<<"$row")"
     else
-      _sup_capacity_alert "$name" "$cls" "$excerpt" "$notify_human" "$notify_machine"
+      # A GUARD THAT SUPPRESSES AN ACTION LOGS THE ACTION'S NAME (the wiki page
+      # of that title). One line per quietened seat per window — the row's
+      # "at most one digest line" — and it names the class it withheld, the
+      # wall, and when the seat is due back, so a reader of supervisor-tick.log
+      # can tell "quiet because known" from "quiet because broken". The
+      # audited supervisor_events row below is filed either way.
+      if [[ "$notify_human" != "true" && "$notify_machine" != "true" && "$wall_state" == "cooling" ]]; then
+        _SUP_ALERTS_QUIETED=$(( _SUP_ALERTS_QUIETED + 1 ))
+        warn "supervisor: QUIET ${name} — withheld the ${cls} page: known usage wall, back at $(if declare -f quota_wall_when >/dev/null 2>&1; then quota_wall_when "$wall_reset"; else printf '%s' "$wall_reset"; fi)$(if [[ -n "$queue_behind" ]]; then printf ' (queued behind it: %s)' "$queue_behind"; fi)"
+      fi
+      _sup_capacity_alert "$name" "$cls" "$excerpt" "$notify_human" "$notify_machine" \
+                          "$wall_state" "$wall_reset" "$queue_behind"
     fi
     db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
         VALUES ($(sqlq "$name"), 'alert', $(sqlq "$cls"), $(sqlq "$cause_s"), $(sqlq "$row"));" 2>/dev/null \
@@ -3714,10 +3952,11 @@ cmd_supervisor_tick() {
           --argjson qe "$quota" --argjson un "$unprobed" \
           --argjson ot "$other" --argjson ev "$events" \
           --argjson ua "${_SUP_ALERTS_UNDELIVERABLE:-0}" \
+          --argjson qw "${_SUP_ALERTS_QUIETED:-0}" \
           '{total:$t, healthy:$h, slow:$sl, drift:$dr, stuck:$st, stalled:$sa,
             verifyChallenge:$vc, noOutput:$no, updatePending:$up,
             quotaExhausted:$qe, unprobed:$un, unclassified:$ot, anomalyRows:$ev,
-            alertsUndeliverable:$ua}')
+            alertsUndeliverable:$ua, capacityPagesWithheld:$qw}')
   db "INSERT INTO supervisor_events (agent, event, classification, signals)
       VALUES ('(fleet)', 'heartbeat', $(sqlq "$fleet_class"), $(sqlq "$sig"));" \
     2>/dev/null && events=$((events + 1)) || warn "supervisor: heartbeat insert failed"
@@ -3734,18 +3973,25 @@ cmd_supervisor_tick() {
   local undeliv_note=""
   (( ${_SUP_ALERTS_UNDELIVERABLE:-0} > 0 )) \
     && undeliv_note=" · ⚠ ${_SUP_ALERTS_UNDELIVERABLE} alert leg(s) UNDELIVERABLE (no recipient resolves — see 5dive doctor)"
+  # DIVE-4666: quiet is a NUMBER, not an absence. Without this, "the supervisor
+  # stopped paging about walls" and "the supervisor stopped noticing walls" read
+  # identically on the one line anybody watches. Not a ⚠ — withholding a page
+  # for a wall that names its own reset is the correct outcome, not a fault.
+  local quiet_note=""
+  (( ${_SUP_ALERTS_QUIETED:-0} > 0 )) \
+    && quiet_note=" · ${_SUP_ALERTS_QUIETED} capacity page(s) withheld (seat on a known wall, reset still ahead)"
   # DIVE-3667: the four original buckets keep their exact position so anything
   # already parsing this line still parses; the rest appear only when non-zero,
   # so a clean fleet's line does not grow.
   local extra
   extra=$(_sup_rollup_extra "$stalled" "$nooutput" "$updpend" "$quota" "$other")
-  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${drift} drift / ${stuck} stuck${extra} · ${events} audit row(s)${act_note}${vchal_note}${undeliv_note}" \
-     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), drift:($dr|tonumber), stuck:($st|tonumber), stalled:($sa|tonumber), noOutput:($no|tonumber), updatePending:($up|tonumber), quotaExhausted:($qe|tonumber), unclassified:($ot|tonumber), verifyChallenge:($vc|tonumber), alerted:($al|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber), alertsUndeliverable:($ua|tonumber)}' \
+  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${drift} drift / ${stuck} stuck${extra} · ${events} audit row(s)${act_note}${vchal_note}${undeliv_note}${quiet_note}" \
+     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), drift:($dr|tonumber), stuck:($st|tonumber), stalled:($sa|tonumber), noOutput:($no|tonumber), updatePending:($up|tonumber), quotaExhausted:($qe|tonumber), unclassified:($ot|tonumber), verifyChallenge:($vc|tonumber), alerted:($al|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber), alertsUndeliverable:($ua|tonumber), capacityPagesWithheld:($qw|tonumber)}' \
      --arg t "$total" --arg h "$healthy" --arg sl "$slow" --arg dr "$drift" --arg st "$stuck" --arg e "$events" \
      --arg sa "$stalled" --arg no "$nooutput" --arg up "$updpend" --arg qe "$quota" --arg ot "$other" \
      --arg vc "$vchal" --arg al "$alerted" \
      --arg ae "$actions_on" --arg ac "$acted" --arg pl "$planned" --arg es "$escalated" \
-     --arg ua "${_SUP_ALERTS_UNDELIVERABLE:-0}"
+     --arg ua "${_SUP_ALERTS_UNDELIVERABLE:-0}" --arg qw "${_SUP_ALERTS_QUIETED:-0}"
 }
 
 cmd_supervisor() {
