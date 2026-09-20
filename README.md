@@ -210,6 +210,24 @@ Watch the whole team in real time.
 `5dive ui`<br>
 Open local browser views for the org chart, task queue, human gates, and signed trigger deliveries.
 
+`5dive wall`<br>
+Every agent's live terminal tiled on one screen, read-only. `C-b w` makes one pane writable, `C-b d` detaches.
+
+`5dive project add mobile --prefix=MOB --lead-agent=dev`<br>
+Run several products off one team. Each project numbers its own tasks (MOB-1, MOB-2) and has its own lead.
+
+`5dive org tree`<br>
+Who reports to whom. Gates route up this chart, and `sudo 5dive human add you --telegram=<chat id>` names the person whose phone they reach.
+
+`sudo 5dive plugin add 5dive-ai/5dive-browser`<br>
+Install a plugin straight from a GitHub repo. This one gives the whole team a shared, human-authenticated browser.
+
+`5dive fleet status`<br>
+Reachability and agent counts across every box you registered with `5dive fleet add`.
+
+`5dive digest --7d`<br>
+The last seven days of the team's work on one page. `5dive digest on` delivers it to your Telegram every day.
+
 `5dive trigger`<br>
 Turn signed GitHub or generic webhook events into ordinary tasks.
 
@@ -414,6 +432,7 @@ sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<princip
 5dive trigger   add / ls / show / deliveries / replay / serve
 5dive heartbeat on / off / ls / tick     # wake agents that have queued work
 5dive org       set / tree               # who reports to whom
+5dive wall [--grid=CxR] [<seat>...]      # every agent's live TUI on one screen, read-only
 5dive ui                                 # local org/queue/gates/triggers views
 
 5dive account   add / login / list / show / usage / rename / remove
