@@ -752,19 +752,20 @@ _hb_effective_fresh() {
 # (pick the task up in the running context) and `--fresh` forces the clear.
 cmd_heartbeat_wake_task() {
   require_root
-  local fresh_override=""
+  local fresh_override="" force_busy="false"
   local -a _pos=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --fresh)    fresh_override="true"; shift ;;
       --no-fresh) fresh_override="false"; shift ;;
+      --force)    force_busy="true"; shift ;;
       --)         shift; while [[ $# -gt 0 ]]; do _pos+=("$1"); shift; done ;;
       *)          _pos+=("$1"); shift ;;
     esac
   done
   local name="${_pos[0]:-}" task_id="${_pos[1]:-}"
   [[ -n "$name" && "$task_id" =~ ^[0-9]+$ ]] \
-    || fail "$E_USAGE" "usage: 5dive heartbeat wake-task [--fresh|--no-fresh] <agent> <task_id> [<task_ident>]"
+    || fail "$E_USAGE" "usage: 5dive heartbeat wake-task [--fresh|--no-fresh] [--force] <agent> <task_id> [<task_ident>]"
   # THE IDENT IS RESOLVED FROM THE ROW, NEVER FABRICATED FROM THE ID.
   #
   # `<task_ident>` is optional and the exit hints deliberately omit it, so the
@@ -798,7 +799,45 @@ cmd_heartbeat_wake_task() {
   else
     fresh="$(_hb_effective_fresh "$name" "$task_id")"
   fi
-  _hb_log "[$name] forced wake onto ${task_ident} (fresh=${fresh}${fresh_override:+, caller override})"
+  # DIVE-4642 — THE FORCED PATH READS THE SEAT BEFORE IT TYPES INTO IT.
+  #
+  # The tick has always asked `_hb_agent_idle` first and deferred a mid-turn
+  # seat; `wake-task` skipped that read entirely and went straight to _hb_wake.
+  # So a forced wake onto a seat 21 minutes into a turn typed `/clear` into a
+  # LIVE composer, could not submit it (the composer is busy), and left the
+  # `/clear` queued to fire at that turn's boundary — wiping a working seat's
+  # context. Measured by luca on box-1, 5dive 0.45.0, 2026-09-20; rated S1.
+  #
+  # `_hb_composer_clear` now removes that residual, so the S1 harm is already
+  # dead. This read removes the CAUSE: on a seat that is provably working there
+  # is nothing to force, and the row stays todo for the tick that is already
+  # going to reach it.
+  #
+  # THE SAME PREDICATE AS THE TICK, not a copy of it — a second derivation of
+  # "is this seat busy" is exactly the shape DIVE-4276 cost us. It is also
+  # strictly better than the raw native word: `_hb_agent_idle` carries DIVE-4298's
+  # cross-check, so a seat held at native `busy` only by an orphaned background
+  # shell still reads idle here and is still woken.
+  #
+  # FAILS OPEN, deliberately. rc 2 is "no signal" (a non-claude runtime, claude
+  # not running, tmux unreadable) and must not block a debugging verb on a seat
+  # we cannot measure — the old behaviour is the right default there. Only a
+  # POSITIVE reading of working (1) or blocked (3) holds the wake, and `--force`
+  # takes it anyway for the operator who has looked at the pane and disagrees.
+  if [[ "$force_busy" != "true" ]]; then
+    local _fw_idle_rc=0
+    _hb_agent_idle "$name" || _fw_idle_rc=$?
+    if (( _fw_idle_rc == 1 || _fw_idle_rc == 3 )); then
+      local _fw_state="mid-turn (a turn is in flight)"
+      (( _fw_idle_rc == 3 )) && _fw_state="blocked on ${_HB_IDLE_REASON:-input needed}"
+      local _fw_note
+      _fw_note="[$name] forced wake REFUSED onto ${task_ident} — the seat is ${_fw_state}, and typing a goal into a live composer cannot submit and leaves a draft that fires at the turn's boundary (DIVE-4642). The row stays todo and the next tick reaches it. Override with '--force' if you have looked at the pane, or 'sudo 5dive agent restart ${name}' if the seat is genuinely stuck."
+      _hb_log "$_fw_note"
+      warn "$_fw_note"
+      return 0
+    fi
+  fi
+  _hb_log "[$name] forced wake onto ${task_ident} (fresh=${fresh}${fresh_override:+, caller override}$([[ "$force_busy" == "true" ]] && printf ', busy-guard forced')"
   _hb_wake_task_record_defect "$name" "$task_id" "$task_ident"
   # DIVE-4310: a forced wake fails with the same named cause as a tick wake.
   local _fw_rc=0
@@ -2295,11 +2334,123 @@ _hb_landed_check() {
   return 0
 }
 
+# DIVE-4642 — ONE LINE, OR IT IS NOT A SUBMIT.
+#
+# `send-keys -l` puts the payload in the composer; the Enter that follows is what
+# submits it. On a MULTI-LINE payload that Enter does not submit — Claude Code
+# binds Enter to "insert a newline" the moment the buffer has more than one line,
+# and prints `ctrl+x ctrl+s to send now` under it. Measured on quinn 2026-09-19
+# 23:27Z: an entire multi-line `/goal DIVE-4614` verifier brief sat in the
+# composer as an unsent draft, the seat never started a turn, and every later
+# tick read `busy — 1 in_progress, skip` for 9.5 hours.
+#
+# `ctrl+x ctrl+s` IS NOT AN OPTION: it cannot be delivered through tmux. Measured
+# twice on the live wedge — `send-keys C-x C-s`, and the two-step `send-keys C-x;
+# sleep 1; send-keys C-s`. Neither submits. The hint is written for a human at a
+# terminal, not for an injector.
+#
+# So the transport's real contract is: the payload we type must be ONE line. The
+# nudge itself already is (`_hb_nudge_text` builds a single long string); what
+# breaks it is the ENRICHMENTS, which interpolate free text written by other
+# seats — `_hb_reject_fix_clause` carries a verifier's `FINDING:/FIX:/VERIFY:`
+# feedback verbatim and `_hb_carryover_clause` carries a last message. Both are
+# multi-line whenever their author pressed Return, and neither author can know
+# their prose is about to become a keystroke stream.
+#
+# Flattening is lossless for what rides here: every payload on this path is
+# PROSE, and the newlines are paragraph breaks, not syntax. The alternative
+# transports both cost more than they buy — a file pointer makes the seat read a
+# file before it can read its goal (a turn, and a new failure mode when the file
+# is unreadable), and a real bracketed paste would still leave a multi-line
+# buffer whose Enter inserts a newline.
+_hb_flatten_payload() {
+  local t="$1"
+  t="${t//$'\r'/ }"
+  t="${t//$'\n'/ }"
+  t="${t//$'\t'/ }"
+  # collapse the runs the substitutions just created, and trim.
+  printf '%s' "$t" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+# Count of newlines in a payload — the log line's evidence that flattening did
+# something, so a green log never claims a fix it did not perform.
+_hb_payload_newlines() {
+  local t="$1" nl
+  nl="${t//[!$'\n']/}"
+  printf '%s' "${#nl}"
+}
+
+# DIVE-4642 — NEVER LEAVE TYPED TEXT IN A COMPOSER YOU COULD NOT SUBMIT.
+#
+# What the failed attempt LEAVES BEHIND is the destructive half. `wake-task`
+# injects `/clear` before the goal; when that injection fails today it does not
+# roll back, it sits in the composer and FIRES WHEN THE TARGET'S TURN ENDS —
+# a scheduled wipe of another agent's context. Measured: two wakes on quinn
+# (23:17:36Z, 23:17:41Z) wiped the seat's session.
+#
+# C-u, never Escape: Escape on a seat that is mid-turn ABORTS the turn; C-u only
+# edits the composer (verified on quinn and dev — both turns survived). The Up
+# arm is the second half of the measured recovery: when the payload has already
+# left the composer for the queue, Up recalls it so C-u can drop it. On an
+# already-empty composer Up+C-u recalls one history entry and clears it again,
+# which is a no-op on the seat.
+#
+# Returns 0 when the composer is EMPTY afterwards, 1 when text survived both
+# arms; sets _HB_COMPOSER_UNSENT either way.
+_hb_composer_clear() {
+  local name="$1"
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
+  _hb_verify_submit "$name" && return 0
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Up 2>/dev/null || true
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
+  _hb_verify_submit "$name" && return 0
+  return 1
+}
+
+# DIVE-4642 — the deadlock probe, read at the busy-guard.
+#
+# `busy` is inferred from `in_progress` alone, and that is the deadlock: the row
+# keeps the seat busy, and being busy is what stops the seat ever being re-woken.
+# A wedged seat satisfies THREE things at once, and only a wedged seat does:
+#   1. it is a claude seat (the pane has a composer to read at all),
+#   2. its native run-state is a DEFINITE `idle` — `claude agents --json` says no
+#      turn is in flight, so "busy" is already false on the seat's own word,
+#   3. its composer holds non-ghost text — something was typed and never sent.
+# Conjunction, and every leg must be measured: an unavailable native signal
+# returns rc 1 here (false-negative bias, the house rule), because reporting a
+# working seat as wedged would clear a composer mid-thought.
+#
+# On a positive reading this MARKS the ledger and CLEARS the draft, so the caller
+# is free to dispatch into an empty composer on this same tick.
+_hb_wedge_probe() {
+  local name="$1" st unsent
+  [[ -n "$(_hb_claude_pid "$name")" ]] || return 1
+  st=$(_hb_agent_native_state "$name") || return 1
+  [[ "$st" == "idle" ]] || return 1
+  unsent=$(_hb_composer_unsent "$name")
+  [[ -n "$unsent" ]] || return 1
+  _HB_COMPOSER_UNSENT="$unsent"
+  _wedge_mark "$name" "${#unsent}" "$unsent" "residual"
+  if _hb_composer_clear "$name"; then
+    _wedge_mark "$name" "${#unsent}" "$unsent" "cleared"
+  fi
+  return 0
+}
+
 # Inject one literal line + Enter into an agent's tmux pane. Returns nonzero
 # (never exits) so a single dead pane can't abort the whole tick.
 _hb_send_line() {
   local name="$1" text="$2" tries=0
   _HB_SEND_FAIL_REASON=""   # DIVE-4310: never report a previous attempt's cause
+  # DIVE-4642: FIRST, before the inbox route and before anything is typed — the
+  # payload becomes ONE line or it can never be submitted by an Enter. See
+  # _hb_flatten_payload for why this is the transport's contract and not a
+  # cosmetic tidy-up.
+  local _hb_nl; _hb_nl=$(_hb_payload_newlines "$text")
+  if (( _hb_nl > 0 )); then
+    text=$(_hb_flatten_payload "$text")
+    _hb_log "[$name] payload carried ${_hb_nl} newline(s) — flattened to one line before typing; a multi-line composer binds Enter to newline and the submit could never land (DIVE-4642)" 2>/dev/null || true
+  fi
   # DIVE-2137: the heartbeat is the FOURTH typed-send site (send / ask / _deliver
   # are the three in cmd_agent_runtime.sh) and had the same blind spot — it types
   # a nudge into whatever the pane happens to be showing. An agent that booted
@@ -2378,12 +2529,25 @@ _hb_send_line() {
   # claim on a prompt nobody received.
   if [[ -n "$(_hb_claude_pid "$name")" ]]; then
     _hb_send_keys_step "$name" "submit (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
-    _hb_verify_submit "$name" && return 0
+    _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
     sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
     _hb_send_keys_step "$name" "submit retry (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
-    _hb_verify_submit "$name" && return 0
-    _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}') (DIVE-4242)"
-    _hb_log "[$name] submit UNVERIFIED — the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}'); returning failure so nothing is claimed on it (DIVE-4242)" 2>/dev/null || true
+    _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
+    # DIVE-4642: the submit failed and we KNOW it. Two things follow, and today
+    # neither happened: the seat is marked unhealthy so `5dive supervisor` names
+    # it within one tick instead of reporting it busy forever, and the text we
+    # typed is REMOVED. Leaving it is not neutral — on the wake-task path the
+    # residual is a `/clear` that fires at the target's next turn boundary and
+    # wipes a working seat's context.
+    local _hb_wedged="${_HB_COMPOSER_UNSENT}"
+    _wedge_mark "$name" "${#_hb_wedged}" "$_hb_wedged" "residual"
+    if _hb_composer_clear "$name"; then
+      _wedge_mark "$name" "${#_hb_wedged}" "$_hb_wedged" "cleared"
+      _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still held ${#_hb_wedged} chars of non-ghost text after 2 Enters ('${_hb_wedged:0:60}') — the draft has been CLEARED and the seat marked wedged, so nothing of it fires later (DIVE-4642; was DIVE-4242)"
+    else
+      _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}') AND the clear did not take — the seat is wedged with a residual draft that may fire at its next turn boundary; it needs 'sudo 5dive agent restart ${name}' (DIVE-4642)"
+    fi
+    _hb_log "[$name] submit UNVERIFIED — ${_HB_SEND_FAIL_REASON}; returning failure so nothing is claimed on it" 2>/dev/null || true
     return 1
   fi
   sleep 0.4
@@ -2424,13 +2588,38 @@ _hb_composer_unsent() {
   line="${line//$'\xc2\xa0'/ }"
   line="${line//[$'\t\r\n']/ }"
   line=$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")
+  # DIVE-4642 — EXCLUDE THE HARNESS'S OWN COMPOSER HINTS, BY CONTENT.
+  #
+  # `Press up to edit queued messages` is exactly 32 bytes and it is NOT our
+  # string (`grep -rn` across src finds nothing): it is Claude Code's own hint,
+  # rendered only when at least one message IS queued. So on a mid-turn seat the
+  # guard's failure condition and the success it exists to detect coincide — the
+  # payload was typed, the Enter queued it, the TUI announced that in the only
+  # place this function looks, and the announcement was read as leftover input.
+  # Measured on main 2026-09-14 09:12Z (DIVE-4355), and the addendum to
+  # community/wiki/an-injected-prompt-can-sit-unsent-while-the-seat-reads-busy-verify-the-submit-before-you-claim.md
+  # names the repair: exclude it by CONTENT, not by dim attribute, and treat its
+  # presence as a POSITIVE receipt.
+  #
+  # This is a precondition of the clear that DIVE-4642 added above it, not a
+  # cosmetic tidy-up. Without it, `_hb_composer_clear` would fire on a seat that
+  # had submitted successfully, and its `Up` arm would RECALL the queued message
+  # so the following `C-u` could delete it — destroying the very payload the
+  # wake delivered. A guard that is wrong in this direction is worse than none.
+  case "$line" in
+    'Press up to edit queued messages'|'ctrl+x ctrl+s to send now') line="" ;;
+  esac
   printf '%s' "$line"
 }
 
 # DIVE-4242: did the Enter take? 0 = composer empty of non-ghost text (the
 # payload left it), 1 = text still sitting there (sets _HB_COMPOSER_UNSENT for
 # the caller's log line). Waits a beat first so the TUI has redrawn.
-_HB_COMPOSER_UNSENT=""
+#
+# _HB_COMPOSER_UNSENT is DECLARED IN src/lib/state.sh, not here. cmd_agent_runtime
+# reads it too, and a column-0 assignment in this module would make cmd_heartbeat
+# its lazy-dispatch provider — an edge that closes over every verb in the CLI
+# (DIVE-4642). This module writes it; core declares it.
 _hb_verify_submit() {
   local name="$1"
   sleep "${_HB_SUBMIT_VERIFY_SEC:-0.3}"
@@ -7639,7 +7828,18 @@ cmd_heartbeat_tick() {
                   WHERE assignee=$(sqlq "$name") AND status='in_progress'
                     AND NOT ( (${_TASKS_TFV_SQL})
                               AND $(_tasks_merge_owner_sql) <> $(sqlq "$name") );" 2>/dev/null || echo 0)
-    if [[ "${inprog:-0}" != "0" ]]; then
+    # DIVE-4642 — BUSY MUST NOT BE INFERRED FROM `in_progress` ALONE. That
+    # inference is the deadlock: the row keeps the seat "busy", and being "busy"
+    # is what stops the seat ever being re-woken, so a seat whose goal never
+    # submitted stays skipped forever while the board paints it healthy. Cross-
+    # check the seat before believing the count — _hb_wedge_probe returns 0 only
+    # when the seat's OWN native state says no turn is in flight AND its composer
+    # holds unsent text. On a positive reading it has already marked the ledger
+    # and cleared the draft, so we fall through to dispatch into a clean composer
+    # on this same tick rather than `continue`.
+    if [[ "${inprog:-0}" != "0" ]] && _hb_wedge_probe "$name"; then
+      _hb_log "[$name] ALARM: WEDGED, not busy — ${inprog} in_progress but the seat reports idle with ${#_HB_COMPOSER_UNSENT} chars of unsent text in its composer ('${_HB_COMPOSER_UNSENT:0:60}'); draft cleared, seat marked unhealthy, dispatching this tick (DIVE-4642)"
+    elif [[ "${inprog:-0}" != "0" ]]; then
       sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"
       # DIVE-4278: this tick just PROVED the seat is working. Say so on the
       # record, or `agent list` reports it as the most stalled seat on the box.
