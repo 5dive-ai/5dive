@@ -370,6 +370,52 @@ for label, agents, sn, want, want_src in acct_cases:
     okrow = (got == want and gsrc == want_src)
     print(("ok" if okrow else "no"), label, got, want, gsrc, want_src)
     if not okrow: bad += 1
+# DIVE-4629 — THE SURFACE MUST NOT PRINT A HOLD THE FLOOR IS NOT APPLYING.
+# The floor now clears an account whose provider can never publish a weekly
+# window; rendering that account as "blind — held at the soft floor" would be
+# the same drift between these two predicates that DIVE-4578 closed. The map is
+# seeded here the way the digest's own `_digest_account_unmetered` writes it,
+# from the floor's classifier.
+unmet_cases = [
+    # label, agents, snapshot, unmet-map, env, want-band
+    ("unmeterable-no-reading",        NULLSEAT, {"accounts": []}, {"m": True}, {}, "open"),
+    # The digest's population is the activity document plus the snapshot's
+    # names — NOT the registry — so an unmeterable account whose seats were
+    # idle all window has no row here at all. Pinned rather than left implicit:
+    # it is the one place the surface is narrower than the floor, and it errs by
+    # saying nothing rather than by printing a hold.
+    ("idle-account-has-no-row-at-all", NOSEAT,  snap(20, now+6*86400, name="other"),
+                                                                  {"m": True}, {}, "<no row>"),
+    ("not-in-the-map-is-still-blind", NULLSEAT, {"accounts": []}, {},          {}, "blind"),
+    ("a-reading-still-answers-first",
+     [{"name":"a","account":"m","sevenDayPct":95,"sevenDayResetsAt":now+6*86400}],
+     {"accounts": []}, {"m": True}, {}, "hard"),
+    ("policy-soft",   NULLSEAT, {"accounts": []}, {"m": True}, {"FIVE_PACE_UNMETERED": "soft"},   "soft"),
+    ("policy-hard",   NULLSEAT, {"accounts": []}, {"m": True}, {"FIVE_PACE_UNMETERED": "hard"},   "hard"),
+    ("policy-banana", NULLSEAT, {"accounts": []}, {"m": True}, {"FIVE_PACE_UNMETERED": "banana"}, "soft"),
+    # Under FIVE_PACE_BLIND=refuse the floor does not consult the unmetered
+    # policy, so neither does the surface: the account keeps rendering as held.
+    ("blind-refuse-keeps-the-hold", NULLSEAT, {"accounts": []}, {"m": True},
+                                    {"FIVE_PACE_BLIND": "refuse"}, "blind"),
+]
+for label, agents, sn, unmet, env, want in unmet_cases:
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        ns = {"os": os, "time": time, "to_epoch": to_epoch, "agents": agents,
+              "acct_snap": sn, "_unmet": unmet}
+        exec(block, ns)
+        row = next((r for r in ns["pace_l"] if r["account"] == "m"), None)
+        got = row["band"] if row else "<no row>"
+        # An open account is breach-only: it must not render a line at all.
+        if want == "open" and ns["paced"]:
+            got = "open-but-still-rendered"
+    finally:
+        for k, v in saved.items():
+            if v is None: os.environ.pop(k, None)
+            else: os.environ[k] = v
+    print(("ok" if got == want else "no"), "unmetered-" + label, got, want)
+    if got != want: bad += 1
 # breach-only: an open account must produce NO digest line.
 ns = {"os": os, "time": time, "to_epoch": to_epoch, "acct_snap": {},
       "agents": [{"name":"a","account":"m","sevenDayPct":20,"sevenDayResetsAt":now+6*86400}]}
@@ -739,6 +785,140 @@ kb=$(kbarm soft "$(snap_ 100 "$FAR" "$STALE")"); [[ "${kb%% *}" == 3 ]] \
 # it is a decision and not a regression.
 kcase "K: a live seat document still answers ahead of the bound" \
       0 "$(snap_ 100 "$FAR" "$STALE")" "$(mkjson 20 "$FAR")" "from the seat reading"
+
+# ── M (DIVE-4629): A PROVIDER THAT PUBLISHES NO WEEKLY WINDOW AT ALL ───────
+#
+# Every arm above grades a number that EXISTS and could not be read. These
+# grade the other state: `codex`'s three seats run a CLI with no Anthropic 5h/7d
+# window, so no carrier, cadence or bound can ever produce one and the blind
+# soft floor held them at high|urgent-only permanently (DIVE-4586's signed
+# residual). What must hold:
+#
+#   1. the classification is POSITIVE — read off the REGISTRY (which seats are
+#      bound and what they run), never off the meter's silence, so a carrier
+#      outage on a claude account can never reach the new branch;
+#   2. any doubt at all — no registry, no bound seat, one unreadable type, one
+#      claude sibling — is `unknown` and changes NOTHING;
+#   3. a real reading, and even a stale-but-unreset lower bound, still answers
+#      AHEAD of the new branch. Capability is the last question asked, never the
+#      first;
+#   4. `FIVE_PACE_BLIND=refuse` is not loosened by it, and the verdict says the
+#      unmetered policy was not consulted rather than leaving a silent no-op.
+
+# M1 — `_pace_seat_types` against a REAL registry file, including the
+# `@self:<name>` synthesis the floor's callers use and a seat with no type.
+MREG="$TMPD/agents.json"
+cat > "$MREG" <<'JSON'
+{"agents": {
+  "codexy":  {"type": "codex",  "authProfile": "codex"},
+  "vesper":  {"type": "codex",  "authProfile": "codex"},
+  "claudey": {"type": "claude", "authProfile": "mark"},
+  "mixed1":  {"type": "codex",  "authProfile": "mixed"},
+  "mixed2":  {"type": "claude", "authProfile": "mixed"},
+  "untyped": {"authProfile": "partial"},
+  "typed":   {"type": "codex",  "authProfile": "partial"},
+  "selfie":  {"type": "codex"}
+}}
+JSON
+mtypes(){ ( REGISTRY="$MREG"; source src/task/grader_pool.sh; _pace_seat_types "$1" | sort | tr '\n' ' ' ); }
+[[ "$(mtypes codex)" == "codex codex " ]] \
+  && ok_ "M1: _pace_seat_types reads the registry binding" \
+  || bad_ "M1: _pace_seat_types" "got '$(mtypes codex)'"
+[[ "$(mtypes '@self:selfie')" == "codex " ]] \
+  && ok_ "M1: the @self:<name> synthesis is the one the floor's callers pass" \
+  || bad_ "M1: @self synthesis" "got '$(mtypes '@self:selfie')'"
+[[ "$(mtypes partial)" == "? codex " ]] \
+  && ok_ "M1: a seat with no readable type is reported as ? and not silently dropped" \
+  || bad_ "M1: untyped seat" "got '$(mtypes partial)'"
+
+# M2 — the classifier's three answers. 1 is the only one that is evidence.
+mcap(){ ( REGISTRY="${2-$MREG}"; source src/task/grader_pool.sh
+          local rc=0; _pace_window_capable "$1" || rc=$?; printf '%s' "$rc" ); }
+for probe in "codex 1" "mark 0" "mixed 0" "partial 2" "@self:selfie 1" "nosuchaccount 2"; do
+  read -r acct want <<<"$probe"
+  got=$(mcap "$acct")
+  [[ "$got" == "$want" ]] && ok_ "M2: _pace_window_capable ${acct} -> ${want}" \
+    || bad_ "M2: _pace_window_capable ${acct}" "expected ${want}, got ${got}"
+done
+got=$(mcap codex "$TMPD/no-such-registry.json")
+[[ "$got" == "2" ]] && ok_ "M2: NO READABLE REGISTRY is unknown (2), never 'unmeterable' — absence is not evidence" \
+  || bad_ "M2: unreadable registry" "expected 2, got ${got}"
+
+# M3 — the band. `marm <types> <usage-json> <snapshot-json>` in a subshell so
+# the caller can set FIVE_PACE_* before the file is sourced.
+marm(){ # <types|""> <usage-json|""> <snapshot-json|""> -> "<rc> <verdict>"
+  ( source src/task/grader_pool.sh
+    MTYPES="$1"; MSNAP="$3"
+    # shellcheck disable=SC2317
+    _m_types(){ local t; for t in $MTYPES; do printf '%s\n' "$t"; done; }
+    # shellcheck disable=SC2317
+    quota_snapshot_read(){ printf '%s' "$MSNAP"; }
+    _PACE_SEAT_TYPES_CMD=_m_types
+    local rc=0 out
+    out=$(printf '%s' "$2" | _pace_band acct "$NOW") || rc=$?
+    printf '%s %s' "$rc" "$out" )
+}
+mcase(){ # <label> <want-rc> <types> <usage-json> <snapshot-json> <want-substr>
+  local got; got=$(marm "$3" "$4" "$5")
+  if [[ "${got%% *}" == "$2" && "${got#* }" == *"$6"* ]]; then ok_ "$1"
+  else bad_ "$1" "rc=${got%% *} want=$2 | verdict: ${got#* }"; fi
+}
+msnap(){ printf '{"accounts":[{"name":"acct","usage":{"asOf":%s,"sevenDay":{"pct":%s,"resetsAt":%s}}}]}' "$3" "$1" "$2"; }
+MSTALE=$(( NOW - 7200 ))
+
+mcase "M3: an account whose every bound seat runs a provider with no weekly window is NOT blind — the floor has no jurisdiction and says so" \
+      0 "codex" "" "" "no weekly usage window at all"
+mcase "M3: ...and the verdict refuses the 0% reading explicitly" \
+      0 "codex" "" "" "not a reading of 0%"
+mcase "M3: CONTROL — one claude seat on the account and it is blind-held exactly as before" \
+      2 "claude codex" "" "" "no weekly reading"
+mcase "M3: CONTROL — an unreadable seat type is doubt, and doubt holds" \
+      2 "? codex" "" "" "no weekly reading"
+mcase "M3: CONTROL — no bound seat at all is unknown, not unmeterable" \
+      2 "" "" "" "no weekly reading"
+
+# ORDERING. Capability is the LAST question. A current reading answers first...
+mcase "M3: a CURRENT seat reading still answers ahead of the capability branch" \
+      3 "codex" "$(mkjson 95 "$FAR")" "" "from the seat reading"
+# ...and so does DIVE-4586's stale-but-unreset lower bound, which is the arm
+# that keeps this row from re-opening a floor that one already closed.
+mcase "M3: DIVE-4586's lower bound still hardens an unmeterable-looking account" \
+      3 "codex" "" "$(msnap 100 "$FAR" "$MSTALE")" "at AT LEAST 100%"
+
+# THE POLICY KNOB, every value, including one that is not a value.
+for probe in "open 0" "soft 2" "hard 3" "refuse 1"; do
+  read -r pol want <<<"$probe"
+  got=$( FIVE_PACE_UNMETERED="$pol" marm "codex" "" "" )
+  [[ "${got%% *}" == "$want" ]] && ok_ "M4: FIVE_PACE_UNMETERED=${pol} -> band ${want}" \
+    || bad_ "M4: FIVE_PACE_UNMETERED=${pol}" "expected ${want}, got ${got%% *}"
+done
+got=$( FIVE_PACE_UNMETERED=banana marm "codex" "" "" )
+[[ "${got%% *}" == "2" && "${got#* }" == *"is not a policy I know"* ]] \
+  && ok_ "M4: an unrecognised policy falls back to the soft floor and names itself" \
+  || bad_ "M4: unrecognised policy" "rc=${got%% *} want=2 | ${got#* }"
+# A `%` in the env value must not be read as a printf conversion.
+got=$( FIVE_PACE_UNMETERED='100%s%d' marm "codex" "" "" )
+[[ "${got#* }" == *'100%s%d'* ]] \
+  && ok_ "M4: the policy value is a printf ARGUMENT, not part of the format" \
+  || bad_ "M4: printf format injection" "verdict: ${got#* }"
+
+# FIVE_PACE_BLIND=refuse is an operator's explicit freeze and the new branch
+# does not loosen it — and the verdict says the knob was not consulted, which is
+# what keeps it from reading as a knob that quietly does nothing.
+got=$( FIVE_PACE_BLIND=refuse FIVE_PACE_UNMETERED=open marm "codex" "" "" )
+[[ "${got%% *}" == "1" && "${got#* }" == *"not consulted under refuse"* ]] \
+  && ok_ "M4: FIVE_PACE_BLIND=refuse is not loosened by the capability branch, and says so" \
+  || bad_ "M4: refuse + unmeterable" "rc=${got%% *} want=1 | ${got#* }"
+
+# M5 — `_pace_admits` is untouched by all of this: band 0 dispatches every
+# priority AND the recurring beats, which is what "no hold" has to mean.
+mad=0
+for probe in "low standard" "low recurring" "urgent recurring"; do
+  read -r prio kind <<<"$probe"
+  _pace_admits 0 "$prio" "$kind" || mad=1
+done
+(( mad == 0 )) && ok_ "M5: band 0 admits every priority and the recurring beats — the seats are genuinely unheld" \
+  || bad_ "M5: band 0 admits" "a row was still held under the open band"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

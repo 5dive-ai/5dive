@@ -1660,6 +1660,121 @@ _pace_account_seven_bound() {  # <account> [<now-epoch>] -> "<pct><US><resets>" 
 # Overridable by the same contract as _PACE_ACCOUNT_CMD, for the same reason.
 _PACE_ACCOUNT_BOUND_CMD="${_PACE_ACCOUNT_BOUND_CMD:-_pace_account_seven_bound}"
 
+# ── DIVE-4629: "NOT MEASURED YET" AND "CANNOT BE MEASURED HERE" ARE TWO STATES
+#
+# Everything above this point is about a number that exists and could not be
+# read: a carrier that went quiet, a reading that aged out, a window that
+# turned over. DIVE-4586 closed the last of those and signed the one it could
+# not: the `codex` account's three seats run a CLI that is not Claude Code and
+# whose provider publishes no Anthropic 5h/7d window AT ALL. `usage_read_ratelimits`
+# (cmd_account.sh) says so in its own contract — it emits nothing for "a
+# non-claude type whose CLI doesn't surface Anthropic 5h/7d limits". No carrier,
+# no cadence and no lower bound can produce a number that does not exist, so
+# under `FIVE_PACE_BLIND=soft` those seats are held to high|urgent-only on every
+# tick, forever. Measured 2026-09-17 (DIVE-4586): 3 of 16 seats, 19% of the
+# fleet, paced down permanently by a meter that was never about them.
+#
+# That is not caution. A fail-safe default is only safe over the population the
+# meter can in principle measure; outside it the default is a standing penalty
+# nobody ever decided, with no appeal and no event that can ever lift it.
+#
+# ═══ WHY THE ANSWER IS NOT "TREAT THE MISSING READING AS HEALTHY" ═══════════
+#
+# It would be the 2026-09-09 bug again (absence read as 0% used), and the row
+# refuses it explicitly. The claim made here is a different one, and it is a
+# claim about JURISDICTION rather than about consumption:
+#
+#   This floor rations ONE quantity — the percentage of an Anthropic weekly
+#   subscription window an account has consumed. For an account whose provider
+#   has no such window, every band above `open` is a statement about a quantity
+#   that does not exist, and `open` is not "we measured 0%" — it is "this meter
+#   has nothing to say here".
+#
+# What is NOT claimed: that those seats cost nothing. They spend on their own
+# provider's plan, and that spend is unmetered by us — DIVE-3968 (codex native
+# quota telemetry) is the row that would give it a meter. Until it does, the
+# honest state is "unrationed and visibly so", which the verdict line below says
+# in words, rather than "rationed by a meter that cannot see it".
+#
+# ═══ THE CLASSIFICATION IS POSITIVE, NEVER INFERRED FROM ABSENCE ════════════
+#
+# The dangerous mistake would be to read "no reading arrived" as "this provider
+# cannot publish one" — that is a fail-open on exactly the carrier outage this
+# family exists to survive. So the capability is decided from the REGISTRY, not
+# from the meter: the account is unmeterable only when the registry is readable,
+# it binds at least one seat to the account, EVERY bound seat's type is known,
+# and NONE of those types can report the window. Anything else — an unreadable
+# registry, no bound seat, a seat whose type is missing, a single claude seat —
+# is `unknown`, which changes nothing and leaves today's blind branch to answer.
+#
+# The capable list is an ALLOW-list for the same reason. A BYO-claude seat is
+# type `claude` pointed at a non-Anthropic endpoint, so it is classified capable
+# and keeps today's behaviour even though its endpoint may publish nothing; a
+# false "capable" costs a hold that already happens, where a false "unmeterable"
+# would buy dispatch. The two errors are not symmetric, and the list leans the
+# way the cheap one falls.
+_PACE_WINDOW_TYPES="${FIVE_PACE_WINDOW_TYPES:-claude}"
+#   open   (default) — the floor has no jurisdiction over this account; dispatch
+#                      as normal and SAY SO in the verdict, so the absence of a
+#                      meter is visible rather than silent.
+#   soft|hard|refuse — the pre-DIVE-4629 behaviour (`soft`) and the two tighter
+#                      readings, for an operator who wants unmetered spend
+#                      rationed by default. Unrecognised values fall back to
+#                      `soft`, which is the behaviour this row changed.
+_PACE_UNMETERED="${FIVE_PACE_UNMETERED:-open}"
+
+# `_pace_seat_types <account>` — the runtime type of every seat the REGISTRY
+# binds to this account, one per line, `?` for a seat whose type is unreadable.
+# EMPTY when there is no readable registry or no seat is bound — which the
+# caller must read as "unknown", never as "none".
+#
+# The `@self:<name>` synthesis is the one the floor's own callers use
+# (cmd_heartbeat.sh 4493/7419: `.agents[$n].authProfile // ("@self:" + $n)`), so
+# the domain this walks is exactly the domain the floor is asked about.
+_pace_seat_types() {  # <account> -> one type per line, or EMPTY
+  local acct="${1:-}"
+  [[ -n "$acct" ]] || return 0
+  [[ -n "${REGISTRY:-}" && -r "${REGISTRY:-}" ]] || return 0
+  jq -r --arg a "$acct" '
+    (.agents // {}) | to_entries[]
+    | select(((.value.authProfile // ("@self:" + .key)) == $a))
+    | (if (.value.type | type) == "string" and (.value.type | length) > 0
+       then .value.type else "?" end)
+  ' "$REGISTRY" 2>/dev/null || printf ''
+}
+# Overridable by the same contract as _PACE_ACCOUNT_CMD — a FUNCTION NAME, not a
+# command string — so the unit harness can feed a seat population without a
+# registry and without root.
+_PACE_SEAT_TYPES_CMD="${_PACE_SEAT_TYPES_CMD:-_pace_seat_types}"
+
+# `_pace_window_capable <account>` — can this account's provider EVER publish
+# the weekly window the floor waits for?
+#
+#   0  yes      — at least one bound seat runs a type that reports it
+#   1  no       — the registry answered, seats are bound, every type is known,
+#                 and not one of them can report it
+#   2  unknown  — no account, no readable registry, no bound seat, or a seat
+#                 whose type we could not read
+#
+# Only exit 1 is evidence. 0 and 2 both leave every existing branch untouched.
+_pace_window_capable() {  # <account>
+  local acct="${1:-}" t seen=0 unknown=0
+  [[ -n "$acct" ]] || return 2
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    if [[ "$t" == "?" ]]; then unknown=1; continue; fi
+    seen=1
+    case " $_PACE_WINDOW_TYPES " in *" $t "*) return 0 ;; esac
+  done < <($_PACE_SEAT_TYPES_CMD "$acct" 2>/dev/null || printf '')
+  (( unknown )) && return 2
+  (( seen )) || return 2
+  return 1
+}
+# Overridable so a caller that already knows the answer can supply it; the
+# digest uses the function itself (src/cmd_digest.sh) so the surface and the
+# floor cannot drift into disagreeing about which accounts are unmeterable.
+_PACE_WINDOW_CAPABLE_CMD="${_PACE_WINDOW_CAPABLE_CMD:-_pace_window_capable}"
+
 # `_pace_field <account> <field>` — one numeric field for an account, or EMPTY
 # when the meter has no number for it.
 #
@@ -1693,6 +1808,7 @@ _pace_field() {  # <account> <field>  [<usage-json-on-stdin>]
 _pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   local acct="$1" now="${2:-$(date +%s)}" json seven="" resets="" days_left src="" pair=""
   local lb_pair="" lb_seven="" lb_resets=""
+  local pw=0 unmet_band unmet_why
   if [[ -z "$acct" ]]; then
     # No account named is not a measurement, and it must not read as headroom.
     printf 'pace: no account named — holding at the soft floor rather than reading it as 0%%\n'
@@ -1759,6 +1875,41 @@ _pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
           return 2
         fi
       fi
+    fi
+  fi
+  # DIVE-4629. Still no number, and no bound either. Before calling the account
+  # BLIND — a word that means "we could not read it" and carries a hold that
+  # waits for a carrier — ask whether this account's provider can ever publish
+  # the number at all. The answer comes from the REGISTRY (which seats are bound
+  # and what they run), never from the meter's silence, so a carrier outage on a
+  # claude account can never reach this branch. See the block above
+  # `_pace_seat_types` for why the default is `open` and why that is a statement
+  # about jurisdiction rather than about consumption.
+  if [[ -z "$seven" ]]; then
+    pw=0; $_PACE_WINDOW_CAPABLE_CMD "$acct" >/dev/null 2>&1 || pw=$?
+    if (( pw == 1 )); then
+      # `FIVE_PACE_BLIND=refuse` is an operator saying "no current meter, no
+      # dispatch". An account that can NEVER be metered is the strongest case of
+      # that, not an exception to it, so the policy below is not consulted — and
+      # the verdict says so out loud rather than leaving a knob that silently
+      # does nothing.
+      if [[ "$_PACE_BLIND" == "refuse" ]]; then
+        printf 'pace: %s runs on a provider that publishes no weekly usage window at all, so this floor can never measure it — FIVE_PACE_BLIND=refuse holds it anyway (FIVE_PACE_UNMETERED=%s is not consulted under refuse) — no dispatch\n' \
+               "$acct" "$_PACE_UNMETERED"
+        return 1
+      fi
+      case "$_PACE_UNMETERED" in
+        open)   unmet_band=0; unmet_why='this floor rations a weekly Anthropic window and this provider has none — not a reading of 0%, a meter with no jurisdiction here; its own plan is unmetered by us (DIVE-3968) — no hold' ;;
+        soft)   unmet_band=2; unmet_why='policy FIVE_PACE_UNMETERED=soft rations it anyway — high/urgent only' ;;
+        hard)   unmet_band=3; unmet_why='policy FIVE_PACE_UNMETERED=hard rations it anyway — urgent only' ;;
+        refuse) unmet_band=1; unmet_why='policy FIVE_PACE_UNMETERED=refuse — no dispatch' ;;
+        *)      unmet_band=2; unmet_why="FIVE_PACE_UNMETERED=${_PACE_UNMETERED} is not a policy I know (open|soft|hard|refuse) — falling back to the soft floor" ;;
+      esac
+      # The reason is a %s ARGUMENT, never part of the format: one of these
+      # strings interpolates an env value, and a `%` in it would be read as a
+      # conversion.
+      printf 'pace: %s runs on a provider that publishes no weekly usage window at all: %s\n' "$acct" "$unmet_why"
+      return "$unmet_band"
     fi
   fi
   if [[ -z "$seven" ]]; then
