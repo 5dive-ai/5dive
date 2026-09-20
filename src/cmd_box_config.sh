@@ -1,6 +1,6 @@
 # ── DIVE-4251: `5dive config` — the per-box settings surface ────────────────
 #
-# TWO KEYS (`verify`, `verify_small`), and the shape stays open for the next:
+# Box settings, shared by every seat:
 # the company wizard needs somewhere to write a per-box choice that every seat
 # reads and no seat can change for itself. `5dive agent config <name> set …` is
 # the PER-AGENT surface and could not host this — a box default that each seat
@@ -23,6 +23,7 @@ cmd_box_config() {
         "usage: 5dive config                 # show this box's settings" \
         "       5dive config verify=<always|delivered-only|never>" \
         "       5dive config verify-small=<lines>|off" \
+        "       5dive config coauthor=<on|off>" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
         "             always          every standard row is graded" \
@@ -42,7 +43,7 @@ cmd_box_config() {
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
-      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify)" ;;
+      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor)" ;;
     esac
     shift
   done
@@ -57,10 +58,13 @@ cmd_box_config() {
     local small; small=$(box_verify_small)
     local ssrc="off — every delivery is graded on its own merits"
     [[ "$small" != "off" ]] && ssrc="a delivery under ${small} changed lines closes without a grader (DIVE-4559)"
+    local coauthor; coauthor=$(jq -r '.coauthor // "on"' <<<"$(_box_config_read)" 2>/dev/null || printf on)
+    [[ "$coauthor" == on || "$coauthor" == off ]] || coauthor=on
     ok "verify = ${policy} (${src})
-verify-small = ${small} (${ssrc})" \
-       '{verify:$v, source:$s, verify_small:$sm, path:$p}' \
-       --arg v "$policy" --arg s "$src" --arg sm "$small" --arg p "$(_box_config_path)"
+verify-small = ${small} (${ssrc})
+coauthor = ${coauthor} (box-wide, default on)" \
+       '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, path:$p}' \
+       --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" --arg p "$(_box_config_path)"
     return 0
   fi
 
@@ -80,7 +84,9 @@ verify-small = ${small} (${ssrc})" \
       # key is unknown.
       verify-small|verify_small) _verify_small_valid "$v" \
                 || fail "$E_VALIDATION" "verify-small takes a positive number of changed lines, or 'off' — got '$v'" ;;
-      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small)" ;;
+      coauthor) [[ "$v" == on || "$v" == off ]] \
+                || fail "$E_VALIDATION" "coauthor takes one of: on, off — got '$v'" ;;
+      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor)" ;;
     esac
   done
   require_root
