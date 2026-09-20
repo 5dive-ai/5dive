@@ -83,9 +83,32 @@ run() {
 # A registered clone of the real registry's SHAPE: the three channel plugins and
 # the two box-level ones, with the categories they actually carry — which is the
 # point of T2b, since `category` splits the wrong way.
-MKTDIR="$(_plugin_mkt_dir)/$(_plugin_registry_name)/.claude-plugin"
-mkdir -p "$MKTDIR"
-cat > "$MKTDIR/marketplace.json" <<'JSON'
+#
+# DIVE-4708 — REGISTERED through the shipping verb, not written into the store.
+# This fixture used to be `mkdir -p` + `cat >` straight into
+# $(_plugin_mkt_dir)/5dive-plugins, which left it absent from marketplaces.json.
+# _plugin_register_registry keys its once-only self-registration on THAT file, so
+# the first `plugin add` in T1 below found the registry unregistered, `rm -rf`'d
+# this directory and cloned the LIVE 5dive-ai/5dive-plugins over it — over the
+# network, from a repo this one does not control. Everything T2 graded after that
+# was whatever the registry had published that morning. On 2026-09-20T15:55:49Z it
+# published a sixth plugin (`mod`, 5dive-plugins@a609407) and T2a went red on
+# every tree built afterwards, with no commit in this repo and nothing a 5dive
+# author could do about it. Registering the fixture first makes the
+# self-registration a no-op, so the catalogue under T2 is the one written here.
+# T2a-pin is the arm that keeps it that way.
+#
+# The pin goes through FIVEDIVE_PLUGIN_REGISTRY, the seam the product already
+# owns: _plugin_register_registry copies a LOCAL source verbatim and only falls
+# back to `git clone https://github.com/<org>/5dive-plugins.git` when the seam is
+# unset. Registering with `plugin marketplace add` cannot work here and that is
+# not a detail — _plugin_ensure_store calls _plugin_register_registry ITSELF, so
+# the clone has already landed by the time the verb looks, and the verb refuses
+# with E_CONFLICT (measured). The seam is the only place the substitution can be
+# made before the network is reached.
+MKTSRC="$TMP/registry-src"
+mkdir -p "$MKTSRC/.claude-plugin"
+cat > "$MKTSRC/.claude-plugin/marketplace.json" <<'JSON'
 {
   "name": "5dive-plugins",
   "plugins": [
@@ -97,14 +120,24 @@ cat > "$MKTDIR/marketplace.json" <<'JSON'
   ]
 }
 JSON
+export FIVEDIVE_PLUGIN_REGISTRY="$MKTSRC"
+run _plugin_ensure_store
+t "T0 the store initialised (rc)" "0" "$RC"
+MKTDIR="$(_plugin_mkt_dir)/$(_plugin_registry_name)/.claude-plugin"
+t "T0a the registry registered from the fixture, not cloned from the live one (DIVE-4708)" \
+  "browser buzz dashboard telegram voice" \
+  "$(jq -r '[.plugins[].name] | sort | join(" ")' "$MKTDIR/marketplace.json" 2>/dev/null)"
 
 # A SECOND marketplace publishing a name that collides with one of ours. The
 # constant pins each channel to 5dive-plugins, so this one is a stranger.
-THIRD="$(_plugin_mkt_dir)/acme/.claude-plugin"
-mkdir -p "$THIRD"
-cat > "$THIRD/marketplace.json" <<'JSON'
+THIRDSRC="$TMP/acme-src"
+mkdir -p "$THIRDSRC/.claude-plugin"
+cat > "$THIRDSRC/.claude-plugin/marketplace.json" <<'JSON'
 {"name":"acme","plugins":[{"name":"telegram","category":"productivity","description":"Not ours."}]}
 JSON
+run _plugin_mkt_add "$THIRDSRC" --as=acme
+t "T0b the foreign marketplace registered (T1e must refuse a RESOLVABLE stranger)" "0" "$RC"
+THIRD="$(_plugin_mkt_dir)/acme/.claude-plugin"
 
 echo "== T1: plugin add refuses a built-in channel, bare AND qualified =="
 
@@ -170,6 +203,17 @@ t "T2 listing succeeded (rc)" "0" "$RC"
 got=$(jq -r '[.data.plugins[] | "\(.name)=\(.installs)"] | sort | join(" ")' <<<"$OUT" 2>/dev/null)
 t "T2a installs is agent for the three channels, box for the two others" \
   "browser=box buzz=agent dashboard=agent telegram=agent voice=box" "$got"
+
+# T2a-pin — DIVE-4708. T2a's expected string is a contract on the fixture above,
+# and it is only honest while that fixture is still what the listing read. Assert
+# the catalogue on disk, AFTER the T1 block has run every `plugin add` this
+# harness makes, so a replacement is reported as a replacement instead of
+# arriving as an unexplained extra name in T2a's diff. Revert the registration
+# above and this arm is the one that names the cause (measured: it reports the
+# live six-name catalogue, `mod` included).
+pinned=$(jq -r '[.plugins[].name] | sort | join(" ")' "$MKTDIR/marketplace.json" 2>/dev/null)
+t "T2a-pin the catalogue T2a graded is the fixture, not a live registry clone (DIVE-4708)" \
+  "browser buzz dashboard telegram voice" "$pinned"
 
 # The field must be its own answer, not a rename of `category`: telegram is
 # `productivity` and voice is `channel`, so a consumer keying on category gets

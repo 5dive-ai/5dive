@@ -96,7 +96,41 @@ run() {
 # ---- what we ship ----------------------------------------------------------
 # Discovered from the registry's own manifest, never listed. A hardcoded list is
 # how this gap reappears.
-BUNDLED=()
+#
+# DIVE-4708 — SPLIT BY THE TIER EACH PLUGIN DECLARES, and that split is the fix.
+# This loop used to produce one set and T1 asserted rc 0 for all of it. But the
+# harness enumerated the CATALOGUE while the product enumerates the `official`
+# ALLOWLIST (_plugin_trust_gate refuses anything whose own manifest does not
+# declare fivedive.trust.review == "official"). Those two sets were equal by
+# COINCIDENCE, and nothing anywhere asserted they must be — so when
+# 5dive-plugins@a609407 published `mod` with no review block on
+# 2026-09-20T15:55:49Z, T1 demanded an install the trust gate is SUPPOSED to
+# refuse, and this repo went red with no commit of its own.
+#
+# The outcome is not the contract; the RELATIONSHIP is. A box-installable plugin
+# installs if and only if it declares `official`, so each discovered plugin is
+# graded against the tier IT declares. Plugin #7 is then covered the day it lands
+# whichever tier it carries, and neither half can go vacuous: T0b requires an
+# installable one (or the T1/T2/T7 loops grade nothing) and T0c asserts the
+# biconditional itself, so "install everything" and "refuse everything" are both
+# red.
+#
+# A plugin's manifest is resolved through the `source` its publisher DECLARES in
+# the index, not by guessing $REGISTRY/plugins/<name>: the index is the only
+# thing that says where a plugin lives.
+_reg_review() {   # <name> -> the review tier the plugin's OWN manifest declares
+  local n="$1" src mf
+  src=$(jq -r --arg n "$n" '.plugins[] | select(.name==$n) | .source // ""' \
+        "$REGISTRY/.claude-plugin/marketplace.json" 2>/dev/null)
+  [[ -n "$src" ]] || src="./plugins/$n"
+  mf="$REGISTRY/${src#./}/.claude-plugin/plugin.json"
+  [[ -f "$mf" ]] || { printf 'NO-MANIFEST'; return; }
+  jq -r '.fivedive.trust.review // "unreviewed"' "$mf" 2>/dev/null
+}
+
+BUNDLED=()     # every box-installable plugin the registry publishes
+OFFICIAL=()    # ...those whose own manifest declares review "official"
+UNREVIEWED=()  # ...and those that do not: the trust gate MUST refuse these
 if [[ -n "$REGISTRY" ]]; then
   while IFS= read -r n; do
     [[ -z "$n" ]] && continue
@@ -107,6 +141,7 @@ if [[ -n "$REGISTRY" ]]; then
     # box-installable kind is this harness's subject.
     _plugin_is_builtin_channel "$n" && continue
     BUNDLED+=("$n")
+    if [[ "$(_reg_review "$n")" == official ]]; then OFFICIAL+=("$n"); else UNREVIEWED+=("$n"); fi
   done < <(jq -r '.plugins[].name' "$REGISTRY/.claude-plugin/marketplace.json" 2>/dev/null | sort)
   # Two separate facts. The manifest must declare plugins at all (a checkout
   # pointed at the wrong tree fails HERE, loudly, instead of silently grading an
@@ -115,8 +150,10 @@ if [[ -n "$REGISTRY" ]]; then
   # but channels, the loops below would be vacuous and must say so, not pass.
   t "T0 the registry manifest declares at least one plugin (else the checkout is not a registry)" \
     "yes" "$([[ $(jq -r '.plugins | length' "$REGISTRY/.claude-plugin/marketplace.json" 2>/dev/null || echo 0) -ge 1 ]] && echo yes || echo no)"
-  t "T0b ...and at least one of them is box-installable, so the corpus loops are not vacuous" \
-    "yes" "$([[ ${#BUNDLED[@]} -ge 1 ]] && echo yes || echo no)"
+  t "T0b ...and at least one of them is box-installable AND official, so the corpus loops are not vacuous" \
+    "yes" "$([[ ${#OFFICIAL[@]} -ge 1 ]] && echo yes || echo no)"
+  t "T0b2 ...and every box-installable plugin landed in exactly one tier bucket" \
+    "${#BUNDLED[@]}" "$(( ${#OFFICIAL[@]} + ${#UNREVIEWED[@]} ))"
 else
   NOTRUN=1
   printf '\n'
@@ -127,20 +164,54 @@ else
   printf '\n'
 fi
 
-# ---- T1: every bundled plugin INSTALLS -------------------------------------
+# ---- T1: every OFFICIAL bundled plugin INSTALLS -----------------------------
 # The row's whole subject. rc 0, from the real cmd_plugin_add, against the real
-# manifest — not a file-list comparison.
-for p in "${BUNDLED[@]}"; do
+# manifest — not a file-list comparison. Scoped to the official set by DIVE-4708:
+# an unreviewed plugin not installing is the trust gate working, and demanding
+# rc 0 from it asserted the opposite of the product's own rule.
+_inst=(); _ref=()
+for p in "${OFFICIAL[@]}"; do
   run cmd_plugin_add "$p@$RMKT" --yes
   t "T1 'plugin add $p' installs on a stock box" "0" "$RC"
-  [[ "$RC" == 0 ]] || printf '   stderr: %s\n' "$ERR"
+  [[ "$RC" == 0 ]] && _inst+=("$p") || { _ref+=("$p"); printf '   stderr: %s\n' "$ERR"; }
 done
+
+# ---- T1b: NEGATIVE CONTROL — an unreviewed bundled plugin is REFUSED --------
+# The other half of T0c, asserted end to end with its message. Without this arm
+# the fix to T1 above reads as "stop grading the plugins that fail", which is the
+# forbidden shape. Vacuous while the registry publishes only official plugins,
+# and that is correct: there is nothing to refuse.
+for p in "${UNREVIEWED[@]}"; do
+  run cmd_plugin_add "$p@$RMKT" --yes
+  t  "T1b 'plugin add $p' is REFUSED — it declares no 'official' review" "$E_PERMISSION" "$RC"
+  tc "T1b2 ...and the refusal names the tier, not something internal" "installs only 'official'" "$ERR"
+  [[ "$RC" == 0 ]] && _inst+=("$p") || _ref+=("$p")
+done
+
+# T1c — THE RELATIONSHIP ARM, and the one that disarms the generator. Not "the
+# catalogue installs" (a third repo decides that) but "installing and being
+# official are the same set" (this repo decides that). Publishing a plugin moves
+# a name between the two buckets; it can no longer move the verdict. It is also
+# what stops the T1/T1b split degenerating: "install everything" and "refuse
+# everything" are each red here, and a plugin silently dropped from BOTH loops
+# shows up as a missing name.
+if [[ -n "$REGISTRY" ]]; then
+  t "T1c a box-installable plugin installs IFF its own manifest declares 'official'" \
+    "install=[${OFFICIAL[*]}] refuse=[${UNREVIEWED[*]}]" "install=[${_inst[*]}] refuse=[${_ref[*]}]"
+fi
 
 # ---- T2: and it is recorded as installed and enabled ------------------------
 # rc 0 is necessary and not sufficient: an installer that returned 0 having
 # copied nothing would pass T1. Read the registry the dispatcher reads.
-for p in "${BUNDLED[@]}"; do
+for p in "${OFFICIAL[@]}"; do
   t "T2 $p is recorded in installed.json as enabled" "true" \
+    "$(jq -r --arg k "$p@$RMKT" '.[$k].enabled // false' "$(_plugin_installed_json)" 2>/dev/null)"
+done
+
+# T2b — the negative half, and it is not symmetry for its own sake: a refusal
+# that had already copied the tree would pass T1b on rc alone.
+for p in "${UNREVIEWED[@]}"; do
+  t "T2b $p left NO record behind — a refused install copies nothing" "false" \
     "$(jq -r --arg k "$p@$RMKT" '.[$k].enabled // false' "$(_plugin_installed_json)" 2>/dev/null)"
 done
 
@@ -241,7 +312,7 @@ fi
 # the claim; the other half is that the verb the manifest declares actually runs.
 # _plugin_dispatch_verb ends in `exec`, so this runs in run()'s subshell and
 # reads the child's exit status.
-for p in "${BUNDLED[@]}"; do
+for p in "${OFFICIAL[@]}"; do
   mf="$REGISTRY/plugins/$p/.claude-plugin/plugin.json"
   [[ -f "$mf" ]] || continue
   while IFS= read -r v; do
