@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+#
+# TIER: nightly — this harness was added by #1025 and took core shard 1/3 from at-cap to 307s
+# against its 300s budget (102%, 164 harnesses, on a runner calibrated at 94% of baseline, so
+# not runner slowness). It is the newest cost in that shard, so it pays for itself here rather
+# than by demoting a guard somebody else argued for. It is a pure-fixture unit test of a picker
+# WHERE clause with no flaky surface, which is the safest class to move off the PR path.
+# OWED BACK: restore it to core the moment the shard has headroom — it guards DIVE-4604, the
+# row-stranding bug, and a regression there is invisible on the board by construction.
 # upstream #1009 — a graded row held for merge must land on the seat that owes the merge.
 #
 # THE STRANDING, as the maintainer measured it: six rows graded ACCEPT, five with their pull
