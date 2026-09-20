@@ -296,6 +296,36 @@ cmd_digest() {
     jq -cn --argjson a "$rows" '{accounts: $a}' 2>/dev/null || printf '%s\n' '{}'
   }
 
+  # ── DIVE-4629: the surface must not print a hold the floor is not applying ──
+  #
+  # The floor now clears an account whose PROVIDER publishes no weekly window at
+  # all (src/task/grader_pool.sh, `_pace_window_capable`) instead of holding it
+  # at the blind soft floor forever. This block renders the same six situations
+  # and one of them would otherwise read "blind — held at the soft floor" for an
+  # account nothing is holding, which is the exact drift DIVE-4578 closed
+  # between these two predicates.
+  #
+  # It calls the FLOOR'S OWN classifier rather than re-deriving the rule here,
+  # so there is one definition of "unmeterable" and not two. Without
+  # src/task/grader_pool.sh in the process (a digest sourced without it) the map
+  # is empty and every account renders exactly as it did before.
+  _digest_account_unmetered() {
+    if ! declare -F _pace_window_capable >/dev/null 2>&1; then
+      printf '%s\n' '{"unmetered":{}}'; return 0
+    fi
+    local a rc out='{}' next accts
+    accts="$(jq -r '(.agents // {}) | to_entries[] | (.value.authProfile // ("@self:" + .key))' \
+             "${REGISTRY:-/nonexistent}" 2>/dev/null | awk 'NF && !seen[$0]++')" || accts=""
+    while IFS= read -r a; do
+      [ -n "$a" ] || continue
+      rc=0; _pace_window_capable "$a" >/dev/null 2>&1 || rc=$?
+      [ "$rc" = "1" ] || continue
+      next="$(jq -c --arg a "$a" '. + {($a): true}' <<<"$out" 2>/dev/null)" || next=""
+      [ -n "$next" ] && out="$next"
+    done <<<"$accts"
+    jq -cn --argjson u "$out" '{unmetered: $u}' 2>/dev/null || printf '%s\n' '{"unmetered":{}}'
+  }
+
   # Stage each source in a temp file (a large task queue blows past the env-var
   # size limit if passed inline). Paths — not payloads — go to python.
   local tmpd
@@ -323,6 +353,10 @@ cmd_digest() {
   # publisher and is stale on almost every tick (see _digest_account_reading).
   _digest_account_reading >"$tmpd/acct.json" 2>/dev/null || echo '{}' >"$tmpd/acct.json"
   [ -s "$tmpd/acct.json" ] || echo '{}' >"$tmpd/acct.json"
+  # DIVE-4629: which accounts can never have a weekly reading at all, from the
+  # floor's own classifier. Absent/unreadable = `{}` = nothing changes.
+  _digest_account_unmetered >"$tmpd/unmet.json" 2>/dev/null || echo '{"unmetered":{}}' >"$tmpd/unmet.json"
+  [ -s "$tmpd/unmet.json" ] || echo '{"unmetered":{}}' >"$tmpd/unmet.json"
   _digest_run heartbeat ls >"$tmpd/hb.txt" 2>/dev/null || : >"$tmpd/hb.txt"
   # DIVE-3501: seats whose ENTIRE runnable queue is tier-guard held. This is the
   # ONLY surface for that state — the rows read `todo`, the unit reads `active`,
@@ -426,7 +460,7 @@ cmd_digest() {
   DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" DIGEST_OBJ_F="$tmpd/obj.json" \
   DIGEST_UPDATE_F="$tmpd/update.json" DIGEST_HELD_F="$tmpd/held.json" \
   DIGEST_BUZZ_F="$tmpd/buzz.json" DIGEST_CAP_F="$tmpd/cap.json" \
-  DIGEST_ACCT_F="$tmpd/acct.json" \
+  DIGEST_ACCT_F="$tmpd/acct.json" DIGEST_UNMET_F="$tmpd/unmet.json" \
   QUOTA_SNAPSHOT_MAX_AGE="${QUOTA_SNAPSHOT_MAX_AGE:-600}" \
   DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
@@ -630,6 +664,26 @@ hot = [a for a in usage_l if (a.get("fiveHourPct") or 0) >= 80]
 _pace_soft = int(os.environ.get("FIVE_PACE_7D_SOFT") or 60)
 _pace_hard = int(os.environ.get("FIVE_PACE_7D_HARD") or 90)
 _pace_reset_days = int(os.environ.get("FIVE_PACE_RESET_DAYS") or 3)
+# DIVE-4629: read here for the same reason the floors above are — the surface
+# and the dispatcher must answer with the same policy.
+_pace_unmetered = os.environ.get("FIVE_PACE_UNMETERED") or "open"
+_pace_blind = os.environ.get("FIVE_PACE_BLIND") or "soft"
+# {"<account>": true} for accounts whose provider can never publish a weekly
+# window, written by the FLOOR'S OWN classifier (see _digest_account_unmetered).
+# Loaded here, inside the block, and only when the name is not already bound:
+# tests/pace_the_week_unit.sh execs this block on its own with a fixture
+# namespace, so a name it resolves from the enclosing script would be a
+# NameError there. An unreadable map is `{}` — nothing known, nothing changed.
+try:
+    _unmet
+except NameError:
+    try:
+        with open(os.environ["DIGEST_UNMET_F"]) as _uf:
+            _unmet = (json.load(_uf) or {}).get("unmetered") or {}
+    except Exception:
+        _unmet = {}
+if not isinstance(_unmet, dict):
+    _unmet = {}
 _pace_now = int(time.time())
 # DIVE-4578 — THE ACCOUNT'S READING FIRST, the activity document second.
 #
@@ -714,7 +768,17 @@ for e in sorted(_pace_by_acct.values(), key=lambda x: x["account"]):
     if pct is None:
         src = None
     days_left = int((resets - _pace_now) // 86400) if isinstance(resets, (int, float)) and resets > _pace_now else None
-    if pct is None:
+    if pct is None and _pace_blind != "refuse" and _unmet.get(e["account"]) is True:
+        # DIVE-4629: not blind — unmeterable. Same policy knob and the same
+        # default as the floor (`FIVE_PACE_UNMETERED`), and under
+        # FIVE_PACE_BLIND=refuse the floor does not consult that knob, so
+        # neither does this (the test above), and the account keeps rendering as
+        # held.
+        band = _pace_unmetered if _pace_unmetered in ("open", "soft", "hard", "refuse") else "soft"
+        why = ("this provider publishes no weekly usage window at all, so the floor can never "
+               "measure this account — not a reading of 0%, a meter with no jurisdiction here"
+               + ("" if band == "open" else f"; FIVE_PACE_UNMETERED={_pace_unmetered} rations it anyway"))
+    elif pct is None:
         band, why = "blind", ("no weekly reading from the account and none from any of its seats "
                               "— held at the soft floor, never read as 0%")
     elif pct >= _pace_hard:
