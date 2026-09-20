@@ -786,6 +786,243 @@ kb=$(kbarm soft "$(snap_ 100 "$FAR" "$STALE")"); [[ "${kb%% *}" == 3 ]] \
 kcase "K: a live seat document still answers ahead of the bound" \
       0 "$(snap_ 100 "$FAR" "$STALE")" "$(mkjson 20 "$FAR")" "from the seat reading"
 
+
+# ── L: the SESSION window, DIVE-4631 ───────────────────────────────────────
+# The floor read the week and nothing else. Measured on this host 2026-09-19:
+# `dev` at fiveHourPct 101 / sevenDayPct 12 read `open`, was handed a row, and
+# died at the session wall mid-attempt. The meter that predicts that is the next
+# field in the document the floor was already reading.
+#
+# `_pace_band` is now the COMBINER (tighter of the two); the old body is
+# `_pace_band_7d`. Every arm above still runs against `_pace_band`, and they all
+# feed a document with no 5h field at all — so those arms double as the
+# compatibility check: a blind session window must change none of them.
+F5=$(( NOW + 3*3600 ))               # the session window has 3h to run
+F5_NEAR=$(( NOW + 120 ))             # 2 minutes to the reset — NOT a relaxation
+F5_PAST=$(( NOW - 600 ))             # this window has already turned over
+
+mk5(){ # <7d-pct> <7d-resets> <5h-pct> <5h-resets>
+  printf '{"agents":[{"name":"s1","account":"acct","sevenDayPct":%s,"sevenDayResetsAt":%s,"fiveHourPct":%s,"fiveHourResetsAt":%s}]}' \
+         "$1" "$2" "$3" "$4"
+}
+band5(){ # <7d-pct> <7d-resets> <5h-pct> <5h-resets> -> "<rc>"
+  local rc=0
+  printf '%s' "$(mk5 "$1" "$2" "$3" "$4")" | _pace_band acct "$NOW" >/dev/null || rc=$?
+  printf '%s' "$rc"
+}
+say5(){ # same args -> the VERDICT text
+  printf '%s' "$(mk5 "$1" "$2" "$3" "$4")" | _pace_band acct "$NOW" || true
+}
+lcase(){ # <label> <want-rc> <7d> <7dr> <5h> <5hr>
+  local label="$1" want="$2"; shift 2
+  local got; got=$(band5 "$@")
+  [[ "$got" == "$want" ]] && ok_ "$label" || bad_ "$label" "expected band ${want}, got ${got}"
+}
+
+# L1 — lodar's number. 85% of the session window holds a medium row and still
+# admits an urgent one: `hard`, never `refuse`.
+lcase "L1: 5h=85% (the cutoff) with a healthy week -> hard" 3 20 "$FAR" 85 "$F5"
+[[ "$(adm 3 medium standard)" == "1" ]] && ok_ "L1: at the 5h cutoff a MEDIUM row is held" \
+  || bad_ "L1: medium held" "expected a hold"
+[[ "$(adm 3 urgent standard)" == "0" ]] && ok_ "L1: at the 5h cutoff an URGENT row still dispatches (hard, never refuse)" \
+  || bad_ "L1: urgent admitted" "expected a dispatch"
+lcase "L2: 5h=84% is under the cutoff -> no hold" 0 20 "$FAR" 84 "$F5"
+lcase "L2: the filed case, 5h=101% / 7d=12% -> hard (this is the row)" 3 12 "$FAR" 101 "$F5"
+
+# L3 — THE DECISION THAT BREAKS THE BOX IF IT IS WRONG. A blind 5h reading
+# contributes NOTHING. `fiveHourPct: null` is ordinary steady state (5 of 15
+# seats on this host read null), and the weekly already holds a blind account at
+# the soft floor — a second hold on the same silence double-counts it.
+lcase "L3: a NULL 5h with a healthy week still dispatches (blind 5h contributes nothing)" 0 20 "$FAR" null "$F5"
+lcase "L3: a NULL 5h AND a null week is ONE hold at the soft floor, not two" 2 null "$FAR" null null
+lcase "L3: an UNPARSEABLE 5h contributes nothing either" 0 20 "$FAR" '"78%"' "$F5"
+
+# L4 — decision 3: a 5h window turns over five times a day, so a stale high
+# reading is the common case. A reading whose reset has passed is dropped.
+lcase "L4: 5h=101% from a window that has ALREADY reset is dropped" 0 20 "$FAR" 101 "$F5_PAST"
+# ...but an ABSENT reset is not a passed one, and the unmeasured case never buys
+# dispatch — same posture as the weekly's unreadable-reset branch.
+lcase "L4: 5h=101% with NO readable reset leaves the floor armed" 3 20 "$FAR" 101 null
+
+# L5 — decision 4: no near-reset relaxation. The weekly relaxes inside
+# _PACE_RESET_DAYS because unspent headroom expires; this floor is not a pacing
+# rule, so being near the reset is a reason to WAIT for a whole window.
+lcase "L5: 2 minutes to the 5h reset is NOT a relaxation" 3 20 "$FAR" 95 "$F5_NEAR"
+
+# L6 — the tighter band wins, in BOTH directions.
+lcase "L6: 5h hard + week open   -> hard (the 5h tightens)" 3 20 "$FAR" 101 "$F5"
+lcase "L6: 5h open + week hard   -> hard (the weekly tightens)" 3 95 "$FAR" 10 "$F5"
+lcase "L6: 5h hard + week soft   -> hard (tighter of the two)" 3 70 "$FAR" 101 "$F5"
+lcase "L6: 5h open + week soft   -> soft (the 5h does not loosen it)" 2 70 "$FAR" 10 "$F5"
+lcase "L6: both open             -> open" 0 20 "$FAR" 10 "$F5"
+
+# L7 — the 5h band can never produce `refuse`, and can never loosen one.
+( _PACE_BLIND=refuse
+  rc=0; printf '%s' "$(mk5 20 "$FAR" 101 "$F5")" | _pace_band acct "$NOW" >/dev/null || rc=$?
+  [[ "$rc" == "3" ]] && exit 0 || exit 1 ) \
+  && ok_ "L7: even under FIVE_PACE_BLIND=refuse the 5h band tops out at hard" \
+  || bad_ "L7: 5h never refuses" "expected 3"
+( _PACE_BLIND=refuse
+  rc=0; printf '%s' "$(mk5 null "$FAR" 101 "$F5")" | _pace_band acct "$NOW" >/dev/null || rc=$?
+  [[ "$rc" == "1" ]] && exit 0 || exit 1 ) \
+  && ok_ "L7: a refusal from the weekly is tighter than the 5h hold and still wins" \
+  || bad_ "L7: refuse still wins" "expected 1"
+
+# L8 — the knob is a knob.
+( FIVE_PACE_5H=50; source src/task/grader_pool.sh
+  rc=0; printf '%s' "$(printf '{"agents":[{"account":"acct","sevenDayPct":20,"sevenDayResetsAt":%s,"fiveHourPct":60,"fiveHourResetsAt":%s}]}' "$FAR" "$F5")" \
+    | _pace_band acct "$NOW" >/dev/null || rc=$?
+  [[ "$rc" == "3" ]] && exit 0 || exit 1 ) \
+  && ok_ "L8: FIVE_PACE_5H moves the session floor" || bad_ "L8: FIVE_PACE_5H" "60% did not hold at a floor of 50"
+lcase "L8: CONTROL — the same 60% does NOT hold at the default 85" 0 20 "$FAR" 60 "$F5"
+
+# L9 — max across the account's seats. CONFIRMED on the live document before it
+# was written: every chemmonitor seat reported 38/39/38% against ONE
+# fiveHourResetsAt, so the window is per-ACCOUNT and any seat answers for it.
+got=$(printf '{"agents":[{"account":"acct","sevenDayPct":20,"sevenDayResetsAt":%s,"fiveHourPct":5,"fiveHourResetsAt":%s},{"account":"acct","sevenDayPct":20,"sevenDayResetsAt":%s,"fiveHourPct":101,"fiveHourResetsAt":%s}]}' \
+        "$FAR" "$F5" "$FAR" "$F5" | { _pace_band acct "$NOW" >/dev/null; printf '%s' "$?"; })
+[[ "$got" == "3" ]] && ok_ "L9: max across the account's seats — one seat at 101% answers for the pool" \
+  || bad_ "L9: max across seats" "expected 3, got ${got}"
+
+# L13 — TWO SEATS OF ONE ACCOUNT THAT DISAGREE ABOUT THE CLOCK (quinn's
+# iteration-1 finding). Every row of the usage document comes from that SEAT's
+# own statusline cache, rewritten only when the seat runs, so a seat idle since
+# it hit the wall carries a stale pct AND the stale reset that belongs to it
+# while a busy sibling carries a current pair. L4 (expired -> dropped) is
+# single-seat and L9 gives both seats the SAME reset, so neither of them can see
+# a per-FIELD max pick the pct from one seat and the clock from the other. This
+# arm is the one that does: the over-floor seat's window turned over an hour
+# ago, the under-floor seat's is live, and the account must NOT be held.
+mk5_two(){ # <5h-a> <5hr-a> <5h-b> <5hr-b>  — one account, two seats, healthy week
+  printf '{"agents":[{"name":"stale","account":"acct","sevenDayPct":20,"sevenDayResetsAt":%s,"fiveHourPct":%s,"fiveHourResetsAt":%s},{"name":"fresh","account":"acct","sevenDayPct":20,"sevenDayResetsAt":%s,"fiveHourPct":%s,"fiveHourResetsAt":%s}]}' \
+         "$FAR" "$1" "$2" "$FAR" "$3" "$4"
+}
+band_two(){ local rc=0; printf '%s' "$(mk5_two "$@")" | _pace_band acct "$NOW" >/dev/null || rc=$?; printf '%s' "$rc"; }
+got=$(band_two 101 "$F5_PAST" 5 "$F5")
+[[ "$got" == "0" ]] \
+  && ok_ "L13: a stale 101% whose OWN window has reset, beside a live 5%, does not hold the account" \
+  || bad_ "L13: cross-seat clock pairing" "expected 0, got ${got} — the pct and the reset were maxed independently"
+# ...and the same document with the stale seat's window still LIVE must hold, or
+# the arm above would pass simply because two seats never hold anything.
+got=$(band_two 101 "$F5" 5 "$F5")
+[[ "$got" == "3" ]] \
+  && ok_ "L13: CONTROL — the same two seats with the 101% window still live DO hold (L13 is not vacuous)" \
+  || bad_ "L13: cross-seat control" "expected 3, got ${got}"
+# The mirror: the OVER-floor seat is the fresh one and the stale sibling is
+# under the floor. The survivor is 101%, so the hold stands — a per-reading
+# fence must not throw away a live reading just because a sibling is stale.
+got=$(band_two 5 "$F5_PAST" 101 "$F5")
+[[ "$got" == "3" ]] \
+  && ok_ "L13: a live 101% beside a stale 5% still holds (the fence drops readings, not accounts)" \
+  || bad_ "L13: mirror" "expected 3, got ${got}"
+
+# L10 — the operator reading a hold needs the exit for the band that caused it.
+v=$(say5 20 "$FAR" 101 "$F5")
+[[ "$v" == *"5-hour session window"* && "$v" == *"weekly:"* ]] \
+  && ok_ "L10: the verdict names the session window AND carries the weekly reading" \
+  || bad_ "L10: verdict text" "got '${v}'"
+grep -q 'FIVE_PACE_5H' src/cmd_heartbeat.sh \
+  && ok_ "L10: the held-row log line names FIVE_PACE_5H as an exit" \
+  || bad_ "L10: the held-row log line" "the operator has no exit for the 5h band"
+
+# L11 — BOTH halves are fed with a here-string, and the combiner reads stdin
+# before any early return, so a PIPE cannot hand a caller an EPIPE status in
+# place of a band. Both shipping call sites pipe.
+got=$(printf '%s' "$(mk5 20 "$FAR" 10 "$F5")" | { _pace_band "" "$NOW" >/dev/null; printf '%s' "$?"; })
+[[ "$got" == "2" ]] && ok_ "L11: the no-account path through a PIPE returns the band (2), not a pipe status" \
+  || bad_ "L11: pipe safety" "expected 2, got ${got}"
+
+# L12 — THE DIFFERENTIAL, through the block that actually ships. Section D
+# graded the dispatch block on the weekly alone; these two arms drive the SAME
+# verbatim-extracted block with a document that carries a 5h field, so the
+# combiner is graded where it is really called and not only at the function.
+if declare -F probe_board >/dev/null 2>&1; then
+  got_5h=$(probe_board "$(mk5 20 "$FAR" 101 "$F5")")
+  [[ "$got_5h" == "DIVE-1 " ]] \
+    && ok_ "L12: the shipping dispatch block holds everything but the urgent row on a 101% session window" \
+    || bad_ "L12: dispatch block, 5h hard" "expected 'DIVE-1 ', got '${got_5h}'"
+  got_5o=$(probe_board "$(mk5 20 "$FAR" 10 "$F5")")
+  [[ "$got_5o" == "DIVE-1 DIVE-2 DIVE-3 DIVE-4 " ]] \
+    && ok_ "L12: CONTROL — the same block with a healthy session window dispatches all four (the arm above is not vacuous)" \
+    || bad_ "L12: dispatch block, 5h open" "expected all four rows, got '${got_5o}'"
+else
+  bad_ "L12: the dispatch-block differential" "probe_board is not defined — section D's extraction failed, so this arm cannot run"
+fi
+
+# ── M: the mutants ─────────────────────────────────────────────────────────
+# Every L arm above is paired here with a mutation that reverts the fix, so a
+# green L section cannot be green vacuously.
+MUT="$TMPD/mut.sh"
+grep -q '_pace_band_5h' src/task/grader_pool.sh && grep -q '_PACE_FLOOR_5H' src/task/grader_pool.sh \
+  && ok_ "M0: the session floor is IN the shipped source (the mutants below are not vacuous)" \
+  || bad_ "M0: the session floor is in the shipped source" "not found"
+mutant(){ # <sed-expr> ; writes $MUT, returns 1 if the sed did not change anything
+  sed "$1" src/task/grader_pool.sh > "$MUT"
+  ! cmp -s "$MUT" src/task/grader_pool.sh
+}
+mband(){ # <7d> <7dr> <5h> <5hr> -> rc, against the MUTANT
+  ( source "$MUT"
+    rc=0; printf '%s' "$(mk5 "$1" "$2" "$3" "$4")" | _pace_band acct "$NOW" >/dev/null || rc=$?
+    printf '%s' "$rc" )
+}
+# M1 — the combiner never asks the session window (the pre-fix behaviour).
+if mutant 's|^  v5=$(_pace_band_5h .*|  v5="" rc5=0|'; then
+  ok_ "M1: the mutation took (the combiner no longer consults the 5h band)"
+  [[ "$(mband 20 "$FAR" 101 "$F5")" == "0" ]] \
+    && ok_ "M1: REVERTED — 5h=101% / 7d=20% reads 'open' again, exactly the filed defect" \
+    || bad_ "M1: the mutant did not flip the arm" "L1/L6 would pass against a floor that is not there"
+else bad_ "M1: the mutation took" "the sed matched nothing — this mutant is vacuous"; fi
+# M2 — decision 2 reverted: a blind 5h HOLDS instead of contributing nothing.
+if mutant 's|^    printf .pace/5h: %s has no session-window reading.*|    printf "pace/5h: MUTANT blind hold\\n" "$acct"; return 3|'; then
+  ok_ "M2: the mutation took (a blind 5h now holds)"
+  [[ "$(mband 20 "$FAR" null "$F5")" == "3" ]] \
+    && ok_ "M2: REVERTED — a null 5h now holds a healthy seat, which is the fleet-wide freeze L3 forbids" \
+    || bad_ "M2: the mutant did not flip the arm" "L3 is not grading the blind branch"
+else bad_ "M2: the mutation took" "the sed matched nothing — this mutant is vacuous"; fi
+# M3 — decision 3 reverted: the per-reading expired-window fence removed.
+if mutant 's|^    if _grader_reading_expired "${reset%%.\*}" "$now"; then continue; fi|    if false; then continue; fi|'; then
+  ok_ "M3: the mutation took (the expired-window fence is gone)"
+  [[ "$(mband 20 "$FAR" 101 "$F5_PAST")" == "3" ]] \
+    && ok_ "M3: REVERTED — a reading from a window that already reset holds again" \
+    || bad_ "M3: the mutant did not flip the arm" "L4 is not grading the reset fence"
+else bad_ "M3: the mutation took" "the sed matched nothing — this mutant is vacuous"; fi
+# M3b — the PRE-FIX reduction restored verbatim: max the pct over the seats, max
+# the reset over the seats separately, then fence the one against the other.
+# This is the shape that shipped at 319f9074 and that quinn rejected. It leaves
+# L4 GREEN — which is the whole point, and is asserted below, because it is what
+# makes L13 and not L4 the arm that catches this.
+if mutant 's#^  five=$(printf .%s. "$json" | _pace_field_5h "$acct" "$now")#  five=$(printf "%s" "$json" | _pace_field "$acct" fiveHourPct); _mr=$(printf "%s" "$json" | _pace_field "$acct" fiveHourResetsAt); if _grader_reading_expired "${_mr%%.*}" "$now"; then five=""; fi#'; then
+  ok_ "M3b: the mutation took (the pct and the reset are maxed independently again)"
+  mband_two(){ ( source "$MUT"
+      rc=0; printf '%s' "$(mk5_two "$@")" | _pace_band acct "$NOW" >/dev/null || rc=$?; printf '%s' "$rc" ); }
+  [[ "$(mband_two 101 "$F5_PAST" 5 "$F5")" == "3" ]] \
+    && ok_ "M3b: REVERTED — the stale 101% is fenced against the SIBLING's live clock and pins the account at hard" \
+    || bad_ "M3b: the mutant did not flip the arm" "L13 is not grading the pct/reset pairing"
+  [[ "$(mband 20 "$FAR" 101 "$F5_PAST")" == "0" ]] \
+    && ok_ "M3b: the single-seat arm L4 stays GREEN against this mutant — L13 is what catches it" \
+    || bad_ "M3b: L4 under the mutant" "expected 0; this mutant is not the pre-fix shape"
+else bad_ "M3b: the mutation took" "the sed matched nothing — this mutant is vacuous"; fi
+# M4 — the ranking reverted: the LOOSER band wins the combine.
+if mutant 's|^  if (( $(_pace_rank "$rc5") > $(_pace_rank "$rc7") )); then|  if false; then|'; then
+  ok_ "M4: the mutation took (the 5h band can no longer win the combine)"
+  [[ "$(mband 20 "$FAR" 101 "$F5")" == "0" ]] \
+    && ok_ "M4: REVERTED — the tighter band no longer wins, and the filed case dispatches" \
+    || bad_ "M4: the mutant did not flip the arm" "L6 is not grading the combiner"
+else bad_ "M4: the mutation took" "the sed matched nothing — this mutant is vacuous"; fi
+# M5 — the floor itself moved out of reach: 101% no longer clears it.
+if mutant 's|^_PACE_FLOOR_5H=.*|_PACE_FLOOR_5H=999|'; then
+  ok_ "M5: the mutation took (the session floor was raised out of reach)"
+  [[ "$(mband 20 "$FAR" 101 "$F5")" == "0" ]] \
+    && ok_ "M5: REVERTED — with the floor at 999% the filed case dispatches again" \
+    || bad_ "M5: the mutant did not flip the arm" "L1 is not grading the threshold"
+else bad_ "M5: the mutation took" "the sed matched nothing — this mutant is vacuous"; fi
+# The mutants ran in subshells against $MUT; this process still holds the real
+# source. Re-source it so nothing below grades a mutant.
+# shellcheck source=/dev/null
+source src/task/grader_pool.sh
+[[ "$(band5 20 "$FAR" 101 "$F5")" == "3" ]] \
+  && ok_ "M6: RESTORE — the shipping source is back in this process (later arms grade the product)" \
+  || bad_ "M6: RESTORE" "the process is still holding a mutant"
 # ── M (DIVE-4629): A PROVIDER THAT PUBLISHES NO WEEKLY WINDOW AT ALL ───────
 #
 # Every arm above grades a number that EXISTS and could not be read. These
