@@ -144,6 +144,14 @@ sudo 5dive agent set-account cheap-coder kimi        # rebinds + restarts the ag
 sudo 5dive agent create glm-coder --type=claude --provider=openrouter --api-key=<key> --auth-profile=openrouter --model=z-ai/glm-5.2
 ```
 
+Prefer to save the key once and hand it to agents by name? `account set` configures the account with no agent involved; every later `agent create --auth-profile=<name>` or `agent set-account` reuses it (more under [Accounts](#accounts-shared-auth-profiles)):
+
+```sh
+sudo 5dive account add or-alpha
+printf '%s' "$OPENROUTER_API_KEY" | sudo 5dive account set or-alpha --type=claude --provider=openrouter --api-key=-
+sudo 5dive agent create scout --type=claude --auth-profile=or-alpha
+```
+
 Not on that list? `--base-url` points the harness at **any** Anthropic-compatible
 endpoint — a model you host yourself, or a vendor host we don't ship a row for:
 
