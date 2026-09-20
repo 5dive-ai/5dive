@@ -218,8 +218,8 @@ Watch the whole team in real time.
 `5dive ui`<br>
 Open local browser views for the org chart, task queue, human gates, and signed trigger deliveries.
 
-`5dive wall`<br>
-Every agent's live terminal tiled on one screen, read-only. `C-b w` makes one pane writable, `C-b d` detaches.
+`5dive wall main olivia dev quinn ops --grid=3x2`<br>
+Those five seats' live terminals tiled on one screen, read-only; plain `5dive wall` tiles every running seat. `C-b w` makes one pane writable, `C-b d` detaches.
 
 `5dive project add mobile --prefix=MOB --lead-agent=dev`<br>
 Run several products off one team. Each project numbers its own tasks (MOB-1, MOB-2) and has its own lead.
