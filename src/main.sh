@@ -613,6 +613,11 @@ _agent_verb_dispatch() {
         _default_skills) cmd_agent_default_skills "$@" ;;
         # DIVE-3966: hidden installer migration for existing Codex seats.
         _sync_codex_baseline) cmd_agent_sync_codex_baseline "$@" ;;
+        # DIVE-4667: hidden installer migration for stable OpenAgent ids and
+        # the per-seat global prepare-commit-msg hook.
+        _reconcile_coauthors)
+          AUDIT_CMD="agent _reconcile_coauthors"; AUDIT_ARGS=()
+          with_registry_lock cmd_agent_reconcile_coauthors "$@" ;;
         # DIVE-4081: hidden installer migration. Refresh managed standard-seat
         # sudoers after a bundle upgrade so existing routed reviewers gain the
         # narrow _task_answer path already rendered for newly-created seats.

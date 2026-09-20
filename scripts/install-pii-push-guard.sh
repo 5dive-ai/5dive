@@ -115,16 +115,19 @@ sync_guard_home() {
   fi
   [[ -z "$sudo_pfx" && ! -w "$home" ]] && sudo_pfx="sudo -n"
   local hook="$SRC_REPO/scripts/git-hooks-portable/pre-push"
+  local coauthor_hook="$SRC_REPO/scripts/git-hooks-portable/prepare-commit-msg"
   local scan="$SRC_REPO/scripts/pii-scan.sh"
   local deny="$SRC_REPO/.github/pii-denylist.txt"
   local f
-  for f in "$hook" "$scan" "$deny"; do
+  for f in "$hook" "$coauthor_hook" "$scan" "$deny"; do
     [[ -f "$f" ]] || { say "source file missing: $f — guard home NOT synced"; return 1; }
   done
   $sudo_pfx cp -f "$hook" "$home/pre-push"          || rc=1
+  $sudo_pfx cp -f "$coauthor_hook" "$home/prepare-commit-msg" || rc=1
   $sudo_pfx cp -f "$scan" "$home/pii-scan.sh"       || rc=1
   $sudo_pfx cp -f "$deny" "$home/pii-denylist.txt"  || rc=1
   $sudo_pfx chmod 0755 "$home/pre-push" 2>/dev/null || true
+  $sudo_pfx chmod 0755 "$home/prepare-commit-msg" 2>/dev/null || true
   $sudo_pfx chmod 0644 "$home/pii-scan.sh" "$home/pii-denylist.txt" 2>/dev/null || true
   # The stamp must not name a sha that does not contain what was just copied.
   # Syncing from a dirty tree is the NORMAL case while a change is in review, so

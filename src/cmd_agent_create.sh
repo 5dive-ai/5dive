@@ -110,6 +110,45 @@ seed_agent_git_identity() {
   return 0
 }
 
+_openagent_id_candidate() {
+  printf 'oa-%s\n' "$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+}
+
+mint_agent_openagent_id() {
+  local registry_json="$1" candidate attempts=0
+  while (( attempts < 32 )); do
+    candidate=$(_openagent_id_candidate)
+    if [[ "$candidate" =~ ^oa-[0-9a-f]{12}$ ]] \
+      && ! jq -e --arg id "$candidate" '.agents[]? | select(.openagentId == $id)' <<<"$registry_json" >/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
+cmd_agent_reconcile_coauthors() {
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _reconcile_coauthors takes no arguments"
+  require_root
+  local reg name openagent_id changed=0 failed=0
+  reg=$(registry_read)
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    openagent_id=$(jq -r --arg n "$name" '.agents[$n].openagentId // empty' <<<"$reg")
+    if [[ ! "$openagent_id" =~ ^oa-[0-9a-f]{12}$ ]]; then
+      openagent_id=$(mint_agent_openagent_id "$reg") || { failed=$((failed + 1)); continue; }
+      reg=$(jq --arg n "$name" --arg id "$openagent_id" '.agents[$n].openagentId = $id' <<<"$reg")
+      changed=1
+    fi
+    install_agent_coauthor_hook "$name" "$openagent_id" \
+      || { warn "could not install the co-author hook for agent-${name}"; failed=$((failed + 1)); }
+  done < <(jq -r '.agents | keys[]?' <<<"$reg")
+  (( changed == 0 )) || registry_write <<<"$reg"
+  (( failed == 0 )) || return 1
+  ok "agent co-author hooks reconciled"
+}
+
 # DIVE-1002: an 'admin' agent can run the company, not `rm -rf` the box. Its sudo
 # is scoped to a single mediated surface — the 5dive CLI (the sanctioned API for
 # create/rm/provision/restart agents and box ops). Service lifecycle (start|stop|
@@ -2803,6 +2842,9 @@ cmd_create() {
   if jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null; then
     fail "$E_CONFLICT" "agent '$name' already exists"
   fi
+  local openagent_id
+  openagent_id=$(mint_agent_openagent_id "$reg") \
+    || fail "$E_GENERIC" "could not mint a collision-free OpenAgent id for agent '$name'"
   # DIVE-2138: and refuse a stale home BEFORE any mutation. Deliberately placed
   # next to the name-conflict check rather than next to create_agent_user (~350
   # lines further down, after the team-bot attach and the registry write) — the
@@ -3081,13 +3123,19 @@ cmd_create() {
   fi
 
   step "Registering in $REGISTRY"
-  jq --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$workdir" --arg p "$profile" --arg bu "$bot_username" --arg ts "$(date -Iseconds)" --arg iso "$isolation" \
+  jq --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$workdir" --arg p "$profile" --arg bu "$bot_username" --arg ts "$(date -Iseconds)" --arg iso "$isolation" --arg oid "$openagent_id" \
     '.agents[$n] = (
-      {type: $t, channels: $c, createdAt: $ts, isolation: $iso}
+      {type: $t, channels: $c, createdAt: $ts, isolation: $iso, openagentId: $oid}
       + (if $w == "" then {} else {workdir: $w} end)
       + (if $p == "" then {} else {authProfile: $p} end)
       + (if $bu == "" then {} else {botUsername: $bu} end)
     )' <<<"$reg" | registry_write
+
+  # Git reads hooksPath on each commit, so this covers every coding tool and
+  # needs no service restart. Identity is stored before installation so a
+  # partial hook write can be repaired idempotently by the upgrade reconciler.
+  install_agent_coauthor_hook "$name" "$openagent_id" \
+    || warn "could not install the co-author hook for agent-${name}; re-run 5dive install --upgrade"
 
   # DIVE-4589: a seat's FIRST binding is a binding event like any other. Without
   # it the agent's whole history before its first rebind has no event at or
