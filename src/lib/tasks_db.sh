@@ -380,6 +380,36 @@ CREATE TABLE IF NOT EXISTS tasks (
   merge_proof_by TEXT,
   merge_proof_ref TEXT,
   merge_proof_cmd TEXT,
+  -- DIVE-4654: THE MERGE LANDED ON THE FORGE, RECORDED SO THE STAGE CAN EXIT.
+  -- `_TASKS_TFV_SQL` below is the MERGING stage, and until this column the only
+  -- thing that could take a row out of it was `task merge` -- a verb bound to the
+  -- seat that GRADED. When the grading seat holds no merge rail on the repo the
+  -- merge is pressed on the FORGE instead (the documented play: withhold the
+  -- graded-sha token so merge_owner routes to a seat that can push), and then
+  -- nothing ever advanced the stage: the tick dispatched the merge owner, who had
+  -- no verb, forever, while the assignee -- the only seat that may close -- was
+  -- excluded by the picker's own merge-owner clause. Measured on DIVE-4632:
+  -- 5dive-ai/ops#20 merged 2026-09-19T19:08:15Z, four dispatches, the last three
+  -- no-ops (community/wiki/a-merge-pressed-on-the-forge-never-leaves-the-boards-
+  -- merging-stage.md).
+  --   merge_landed_at   when the landing was RECORDED (never backdated; the
+  --                     forge's own mergedAt goes in the audit line, not here)
+  --   merge_landed_sha  the merge commit the forge reported
+  --   merge_landed_by   the seat that recorded it
+  --   merge_landed_ref  the delivery_ref it was recorded AGAINST -- the stage
+  --                     predicate accepts the record only while it still equals
+  --                     the row's CURRENT binding, so a re-pointed delivery
+  --                     re-enters MERGING rather than carrying a stale landing
+  --                     onto a different pull request. Same rule, and the same
+  --                     reason, as merge_proof_ref above.
+  -- BARE SET, not COALESCE, for merge_proof's reason: this is CURRENT STATE about
+  -- a specific binding. NULL = no landing has been recorded, which is every row
+  -- that existed before this column, so the migration is a pure ALTER with no
+  -- backfill and no row changes stage on the way in.
+  merge_landed_at TEXT,
+  merge_landed_sha TEXT,
+  merge_landed_by TEXT,
+  merge_landed_ref TEXT,
   -- DIVE-2615: why this gate has this tier — axis=pinned|type-default|secret-type
   -- |ask|title|title-fallback|none, plus ;term=<t> where a term is what fired.
   -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS: a fresh store takes this
@@ -1917,6 +1947,10 @@ _TASKS_ADDITIVE_COLUMNS=(
   # merge_proof_ref must match the CURRENT binding.
   'merge_proof_at TEXT' 'merge_proof_by TEXT'
   'merge_proof_ref TEXT' 'merge_proof_cmd TEXT'
+  # DIVE-4654: the recorded forge landing that lets the MERGING stage exit. See
+  # the CREATE TABLE comment; merge_landed_ref must match the CURRENT binding.
+  'merge_landed_at TEXT' 'merge_landed_sha TEXT'
+  'merge_landed_by TEXT' 'merge_landed_ref TEXT'
   # DIVE-2354: approve-to-send | confirm-after-send. See the CREATE TABLE comment.
   'gate_mode TEXT'
   # DIVE-3342: humans.id of the person who may CLEAR this gate. See the CREATE
@@ -1993,6 +2027,22 @@ _TASKS_ADDITIVE_COLUMNS=(
 # already-graded row off the board the moment this shipped — a silent regression on
 # live data, in the direction this predicate is least able to afford. See the CREATE
 # TABLE comment for why no backfill can do better than that.
+# DIVE-4654 — A LANDING RECORDED AGAINST THE ROW'S CURRENT BINDING, as one
+# string, because three readers need the same answer: the stage predicate below
+# (which subtracts it), the board (which paints it) and task show. The whole
+# point of the row that added it is that a stage and its exit must not be two
+# hand-copied opinions.
+#
+# SCOPED TO THE BINDING, exactly as merge_proof_ref is. A landing recorded
+# against a delivery_ref the row no longer carries is a landing of a DIFFERENT
+# pull request, so a re-pointed delivery re-enters the merging stage rather than
+# inheriting the old record. NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT:
+# the constant is one double-quoted bash string.
+_TASKS_MERGE_LANDED_SQL="merge_landed_at IS NOT NULL
+       AND merge_landed_ref IS NOT NULL
+       AND delivery_ref IS NOT NULL
+       AND merge_landed_ref = delivery_ref"
+
 _TASKS_TFV_SQL="graded_at IS NOT NULL
        AND delivery_ref IS NOT NULL AND TRIM(delivery_ref) <> ''
        AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
@@ -2036,6 +2086,29 @@ _TASKS_TFV_SQL="graded_at IS NOT NULL
        -- decide the very same question on the nag rail.
        AND (handoff_delivered_at IS NULL
             OR handoff_delivered_at <= COALESCE(graded_verdict_at, graded_at))
+       -- DIVE-4654 - AND A MERGE ALREADY ON THE TARGET BRANCH IS NOT A MERGE
+       -- STILL OWED. NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT, for the
+       -- reason the DIVE-4327 block above states: the whole constant is one
+       -- double-quoted bash string.
+       --
+       -- Every other conjunct here reads a CLOCK or a COLUMN, and none of them
+       -- can see the forge. Until this one the only thing that took a row out of
+       -- this predicate was a close or a cancel -- and the verb that leads to
+       -- either, task merge, is bound to the seat named in graded_by. When that
+       -- seat holds no merge rail on the repo the merge is pressed on the FORGE
+       -- by a seat that can push, and then the stage had no exit at all: the tick
+       -- dispatched the merge owner, who has no verb for it, while this same
+       -- predicate excluded the assignee from the picker -- the only seat that
+       -- may close. Measured on DIVE-4632 (5dive-ai/ops#20 merged
+       -- 2026-09-19T19:08:15Z, four dispatches, three of them no-ops).
+       --
+       -- SCOPED TO THE CURRENT BINDING, exactly as merge_proof_ref is: a landing
+       -- recorded against a delivery_ref the row no longer carries is a landing
+       -- of a DIFFERENT pull request, so the row re-enters this stage rather
+       -- than carrying the old record onto the new one. NULL on either column is
+       -- every row that existed before DIVE-4654, which is why the migration
+       -- needs no backfill and no row changes stage on the way in.
+       AND NOT (${_TASKS_MERGE_LANDED_SQL})
        AND status NOT IN ('done','cancelled')"
 
 # DIVE-4327 — THE MERGE OWNER IS ONE FUNCTION, NOT NINE COPIES.

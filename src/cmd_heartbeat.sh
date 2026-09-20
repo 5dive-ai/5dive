@@ -4073,10 +4073,19 @@ _hb_loop_terminal_clause() {
     # ungated by the guard. So branch (1) names that, and branch (2) hands off the
     # same way after the merge instead of saying "then close".
     if [[ -n "$_tfv_owner" && "$_tfv_owner" == "$name" ]]; then
-      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS (%s): graded, delivery ref bound, and you own the merge. Read the pull request FIRST, then do exactly one of three and say which: (1) ALREADY MERGED -> the close is NOT yours to run from here (the row is still assigned to the maker, so a close from this seat re-delivers the row and is refused, DIVE-4520): hand it to the seat that closes a loop row — its verifier %s, which may be you — with %s, and that seat closes it; honour any owed clause in the PASS verdict first (a merged PR is not automatically a finished row) and leave it open if something is still owed; (2) mergeable and green -> %s, then hand it on exactly as in (1); (3) a required check is red or it conflicts -> that is the MAKER%s move: %s naming the check, and stop. Do not re-grade, re-deliver or route it onward.' \
+      # DIVE-4654 — BRANCH (1) NAMES THE VERB THAT EXITS THE STAGE. It used to
+      # name `task assign` onto the verifier, which moves the row and leaves it
+      # in MERGING: the board goes on painting graded->merge, the picker goes on
+      # excluding the assignee it just handed the row to, and this same dispatch
+      # fires again next tick. That is the loop ops measured on DIVE-4632 (four
+      # dispatches, three no-ops). `task merge-landed` records the landing the
+      # forge already reports, retires the hold, exits the stage AND hands the
+      # row to the closing seat in one act — so the seat this note wakes now has
+      # a verb for the state it is woken into.
+      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS (%s): graded, delivery ref bound, and you own the merge. Read the pull request FIRST, then do exactly one of three and say which: (1) ALREADY MERGED -> %s, which records the landing, takes the row out of the merging stage and hands it to the seat that closes a loop row (its verifier %s, which may be you); the close is NOT yours to run from here while the row is assigned to the maker (DIVE-4520), and you must honour any owed clause in the PASS verdict first — a merged PR is not automatically a finished row, so leave it open if something is still owed; (2) mergeable and green -> %s, then record the landing exactly as in (1); (3) a required check is red or it conflicts -> that is the MAKER%s move: %s naming the check, and stop. Do not re-grade, re-deliver or route it onward.' \
         "$task_ident" "$name" \
+        "'5dive task merge-landed ${task_ident}'" \
         "'$vfier'" \
-        "'5dive task assign ${task_ident} ${vfier}'" \
         "'5dive task merge ${task_ident}'" \
         "$([[ -n "$maker" ]] && printf "'s (%s)" "$maker" || printf "'s")" \
         "'5dive task reject ${task_ident} --feedback=...'"

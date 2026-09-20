@@ -2246,7 +2246,28 @@ cmd_task_merge() {
     # is made here for the same reason: a row whose pull request is on the target
     # branch is owed no merge by anybody, and leaving `merge_owner` set paints
     # the board with an action nobody can take.
-    db "UPDATE tasks SET merge_owner=NULL, merge_hold_reason=NULL WHERE ident=$(sqlq "$ident");" || true
+    # DIVE-4654: AND IT LEAVES THE MERGING STAGE, not only the hold. Retiring
+    # merge_owner alone still left the row matching `_TASKS_TFV_SQL`, so the
+    # board went on painting it graded->merge (owner falling back to the maker)
+    # and the picker went on excluding its assignee — the deadlock this branch
+    # was already standing in the middle of. The record is the same one
+    # `task merge-landed` writes, through the same function.
+    local _am_id _am_dref _am_ml _am_sha="" _am_at=""
+    _am_id=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')
+    _am_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')
+    # The sha and the mergedAt come from the SAME credential-free read the
+    # primitive itself used, not from parsing its sentence back out of stderr: a
+    # message is a message, and a record built by scraping one is a record that
+    # breaks the next time the wording improves.
+    if [[ -n "$_am_dref" ]]; then
+      _am_ml=$(_merge_landed_read "$_am_dref" "$(_gate_slug_from_url "$_am_dref")") || _am_ml=""
+      [[ -n "$_am_ml" ]] && { _am_sha="${_am_ml%%|*}"; _am_at="${_am_ml#*|}"; }
+    fi
+    if [[ -n "$_am_id" && -n "$_am_dref" ]]; then
+      _task_merge_landed_record "$_am_id" "$_am_sha" "$_am_at" "$actor" "$_am_dref" || true
+    else
+      db "UPDATE tasks SET merge_owner=NULL, merge_hold_reason=NULL WHERE ident=$(sqlq "$ident");" || true
+    fi
     _task_store_audit_log "task.merge-already-landed" ok 0 -- "$ident" "actor=$actor"
     ok "$ident: the pull request this seat graded PASS was ALREADY MERGED upstream — recorded, NO MERGE PERFORMED and no machine account used. The merge hold is retired; this seat did not land it and is not credited with it" \
        '{ident:$id, merged:true, enqueued:false, already_merged:true, performed:false, actor:$ac}' --arg id "$ident" --arg ac "$actor"
@@ -2293,6 +2314,169 @@ _task_merge_preflight() {
   case "$st" in
     done|cancelled) fail "$E_CONFLICT" "${ident} is ${st} — a terminal row is not a merge queue." ;;
   esac
+}
+
+# ── DIVE-4654 — `task merge-landed`: THE EXIT FROM THE MERGING STAGE ──────────
+#
+# THE DEADLOCK, measured on DIVE-4632 2026-09-20. Its pull request (5dive-ai/ops#20)
+# merged on the forge at 19:08:15Z and its owed host-side clause was discharged
+# twelve minutes later. Nine hours on, the row was still `in_progress` and a forced
+# wake printed the whole thing in one line:
+#
+#     stage=MERGING stage-owner=ops assignee=quinn pickable-by-quinn=no
+#
+# The tick dispatches on the STAGE OWNER (ops, forever); the close is gated on the
+# ASSIGNEE (quinn, excluded from the picker by the very same predicate); and the
+# only verb that advances the stage — `task merge` — is grader-only by construction
+# and refuses ops by name. Dispatched and unable to act; able to act and never
+# dispatched. Four dispatches, the last three no-ops costing a session each.
+#
+# THE CAUSE IS A CORRECT DECISION, NOT A MISTAKE. The grading seat positive-
+# controlled its rights on that repo as push=false/admin=false and therefore
+# deliberately withheld the `graded-sha:` token so `merge_owner` would route to the
+# seat that CAN push. That is the documented play, and it is also the play that
+# makes the stage unreachable: the verb that exits MERGING is bound to the seat
+# that GRADED, while the merge itself is bound to the seat that can PUSH. Whenever
+# a capability is split across two seats, a state machine that ties its transition
+# to one of them has a hole the size of the other.
+#
+# SO THE TRANSITION IS REACHABLE BY THE SEAT THE STAGE DISPATCHES TO. This verb
+# RECORDS an observation — that the bound pull request is already on the target
+# branch — and records nothing else. It is the observation half of the same pair
+# `_merge_do_already_landed` already makes for the grader (DIVE-4528's branch),
+# lifted to the seat the board actually wakes.
+#
+# IT WIDENS NO AUTHORITY AND IT MERGES NOTHING. The pull request is read from the
+# row's own delivery_ref, never from the caller; the read is credential-free by
+# construction (`_merge_landed_read` is handed an EMPTY token — asking what a pull
+# request IS has never needed a machine account); and a read that does not come
+# back with a `mergedAt` is a REFUSAL, so an unreachable GitHub leaves the row
+# exactly where it is. There is no flag through which a caller can assert a
+# landing the forge did not report: the only writes are the ones the probe's own
+# answer produces.
+#
+# AND IT HANDS THE ROW TO THE SEAT THAT CAN CLOSE IT, which is the other half of
+# the deadlock. Exiting the stage without moving the row would leave a graded loop
+# row assigned to its MAKER, whose `task done` re-delivers (DIVE-4520) — the
+# deadlock displaced by one seat rather than removed. On a loop row the seat whose
+# close is ungated is the VERIFIER, which is precisely what the merge-owner wake
+# note already tells a seat to do by hand (`task assign <ident> <verifier>`); doing
+# it here makes it one act instead of two, and it is a no-op when the row is
+# already assigned there.
+#
+# _task_merge_landed_record <id> <sha> <at> <actor> <ref> — the write, in one
+# place, so the verb and `task merge`'s already-merged branch record a landing the
+# same way. RETIRES THE HOLD for the reason that branch already states: a merged
+# pull request is owed a merge by nobody, and leaving merge_owner set paints the
+# board with an action nobody can take.
+_task_merge_landed_record() {
+  local id="$1" sha="$2" at="$3" actor="$4" ref="$5"
+  db "UPDATE tasks SET
+        merge_landed_at=datetime('now'),
+        merge_landed_sha=$(sqlq "$sha"),
+        merge_landed_by=$(sqlq "$actor"),
+        merge_landed_ref=$(sqlq "$ref"),
+        merge_owner=NULL,
+        merge_hold_reason=NULL
+      WHERE id=${id};" || return 1
+  _task_store_audit_log "task.merge-landed" ok 0 -- \
+    "id=${id}" "ref=${ref}" "sha=${sha}" "merged_at=${at}" "actor=${actor}" 2>/dev/null || true
+  return 0
+}
+
+# _task_merge_landed_handoff <id> <ident> <assignee> <verifier> — put the row on
+# the seat whose close is ungated. Prints a sentence when it moved the row and
+# nothing when it did not. NOT `cmd_task_assign`: that verb has its own refusals
+# (it declines to hand a row to its own verifier while nothing is delivered —
+# exactly this row shape), and this is not a routing decision anybody is making,
+# it is the recorded consequence of a merge that has already happened.
+_task_merge_landed_handoff() {
+  local id="$1" ident="$2" assignee="$3" vfier="$4"
+  [[ -n "$vfier" && "$vfier" != "$assignee" ]] || return 0
+  # The same clock reset `task assign` makes, and for its reason: an inherited
+  # in_progress row that keeps the previous owner's started_at is eligible for the
+  # stale reaper on the new owner's very first tick.
+  db "UPDATE tasks SET
+        assignee=$(sqlq "$vfier"),
+        started_at=CASE WHEN status='in_progress' THEN datetime('now') ELSE started_at END
+      WHERE id=${id};" || return 0
+  printf ' The row is now assigned to %s, the seat whose close is ungated on a loop row.' "$vfier"
+}
+
+cmd_task_merge_landed() {
+  local ident="" json=0 a
+  for a in "$@"; do
+    case "$a" in
+      --json) json=1 ;;
+      -h|--help)
+        printf 'usage: 5dive task merge-landed <ident> [--json]\n\n  Record that the pull request bound to a row MERGED ON THE FORGE, so the row\n  leaves the MERGING stage (DIVE-4654). Runnable by the seat that owes the merge,\n  the assignee, or the grader. Merges nothing and needs no credential: it asks\n  GitHub whether the bound pull request already landed and REFUSES if it has not.\n'
+        return 0 ;;
+      --*) fail "$E_VALIDATION" "task merge-landed: unknown flag '$a' — usage: 5dive task merge-landed <ident> [--json]" ;;
+      *) [[ -z "$ident" ]] && ident="$a" ;;
+    esac
+  done
+  [[ -n "$ident" ]] || fail "$E_VALIDATION" "task merge-landed needs a task ident — usage: 5dive task merge-landed <ident>"
+  (( json )) && JSON_MODE=1
+  tasks_db_init
+
+  local actor; task_actor_claim ""; actor="$ACTOR_BOARD"
+
+  local row
+  row=$(db "SELECT id||x'1f'||COALESCE(delivery_ref,'')||x'1f'||COALESCE(status,'')||x'1f'||
+                   COALESCE(assignee,'')||x'1f'||COALESCE(verifier,'')||x'1f'||
+                   COALESCE(graded_by,'')||x'1f'||$(_tasks_merge_owner_sql)||x'1f'||
+                   COALESCE(merge_landed_at,'')||x'1f'||COALESCE(merge_landed_ref,'')||x'1f'||
+                   CASE WHEN (${_TASKS_TFV_SQL}) THEN '1' ELSE '0' END
+              FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
+  [[ -n "$row" ]] || fail "$E_VALIDATION" "no task ${ident}."
+  local id dref st asgn vfier gb owner landed_at landed_ref tfv rest
+  id="${row%%$'\x1f'*}";        rest="${row#*$'\x1f'}"
+  dref="${rest%%$'\x1f'*}";     rest="${rest#*$'\x1f'}"
+  st="${rest%%$'\x1f'*}";       rest="${rest#*$'\x1f'}"
+  asgn="${rest%%$'\x1f'*}";     rest="${rest#*$'\x1f'}"
+  vfier="${rest%%$'\x1f'*}";    rest="${rest#*$'\x1f'}"
+  gb="${rest%%$'\x1f'*}";       rest="${rest#*$'\x1f'}"
+  owner="${rest%%$'\x1f'*}";    rest="${rest#*$'\x1f'}"
+  landed_at="${rest%%$'\x1f'*}"; rest="${rest#*$'\x1f'}"
+  landed_ref="${rest%%$'\x1f'*}"; tfv="${rest#*$'\x1f'}"
+
+  case "$st" in
+    done|cancelled) fail "$E_CONFLICT" "${ident} is ${st} — a terminal row is owed no merge and records no landing." ;;
+  esac
+  [[ -n "$dref" ]] \
+    || fail "$E_CONFLICT" "${ident} has no delivery_ref, so no pull request is bound to it and there is no landing to record. Bind it: 5dive task deliver ${ident} --pr=<url>."
+  # IDEMPOTENT BY THE SAME BINDING TEST THE PREDICATE USES. A second run is a
+  # seat re-reading the board, not a second event, and it must not look like a
+  # failure — but a record against a delivery_ref the row no longer carries is a
+  # record of a DIFFERENT pull request, so that one is re-recorded rather than
+  # reported as already done.
+  if [[ -n "$landed_at" && "$landed_ref" == "$dref" ]]; then
+    ok "${ident}: the landing of ${dref} is ALREADY RECORDED (at ${landed_at}) — the row has left the merging stage and is owed a close by '${asgn:-its assignee}', not a merge by anyone. Nothing was written." \
+       '{ident:$id, recorded:true, already:true, closer:$cl}' --arg id "$ident" --arg cl "$asgn"
+    return 0
+  fi
+  [[ "$tfv" == "1" ]] \
+    || fail "$E_CONFLICT" "${ident} is NOT in the merging stage — it is not graded PASS with a live binding (\`5dive task show ${ident}\` prints the fields: graded_at, graded_verdict, delivery_ref, handoff_rejected_at). This verb records the exit from a stage this row is not in; it cannot stand in for a grade."
+  # STANDING: the seat the stage DISPATCHES to, the seat that must CLOSE, or the
+  # seat that GRADED. Deliberately not "any seat": the record is an observation,
+  # but it moves a row and retires a hold, and a row's moves belong to the seats
+  # the row names. Deliberately not "the grader only" either — that is the
+  # constraint this whole row exists to remove.
+  [[ "$actor" == "$owner" || "$actor" == "$asgn" || ( -n "$gb" && "$actor" == "$gb" ) ]] \
+    || fail "$E_AUTH_REQUIRED" "${ident} names '${owner}' as the seat that owes its merge, '${asgn:-nobody}' as its assignee and '${gb:-nobody}' as its grader — '${actor}' is none of them, REFUSED. This verb records a landing on a row that names the seat recording it; it is not a board-wide reconciliation."
+
+  local _ml
+  _ml=$(_merge_landed_read "$dref" "$(_gate_slug_from_url "$dref")") || _ml=""
+  [[ -n "$_ml" ]] \
+    || fail "$E_CONFLICT" "${dref} does NOT read as merged (no mergedAt came back), so nothing was recorded and ${ident} still holds at MERGING, owed by '${owner}'. That is the same answer for a pull request that is still open, one closed without merging, one the queue ejected, and a GitHub that could not be asked at all — this verb records only a landing the forge itself reports. If it IS merged and this still refuses, the read could not reach GitHub: re-run it, or check the binding with \`gh pr view ${dref} --json state,mergedAt\`."
+  local _sha="${_ml%%|*}" _at="${_ml#*|}"
+  _task_merge_landed_record "$id" "$_sha" "$_at" "$actor" "$dref" \
+    || fail "$E_GENERIC" "${ident}: the landing of ${dref} could not be recorded (the task store refused the write). Nothing changed."
+  local _moved; _moved=$(_task_merge_landed_handoff "$id" "$ident" "$asgn" "$vfier")
+  ok "${ident}: ${dref} is ON THE TARGET BRANCH (merged ${_at} as ${_sha:0:12}) — recorded, NO MERGE PERFORMED and no machine account used. The row has LEFT the merging stage, the merge hold is retired, and what it is owed now is a close.${_moved}" \
+     '{ident:$id, recorded:true, already:false, sha:$sha, merged_at:$at, closer:$cl, actor:$ac}' \
+     --arg id "$ident" --arg sha "$_sha" --arg at "$_at" \
+     --arg cl "$([[ -n "$vfier" ]] && printf '%s' "$vfier" || printf '%s' "$asgn")" --arg ac "$actor"
 }
 
 # _merge_landed_read <pr-ref> <repo-slug> — HAS THIS PULL REQUEST ALREADY MERGED?
