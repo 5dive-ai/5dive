@@ -42,6 +42,22 @@ set +e
 # production audit sink. The wrapper's arguments are the receipt under test.
 _task_store_audit_log() { printf '%s\n' "$*" >>"$AUDIT_CALLS"; }
 
+# COUNT THE VERB, NOT THE LINES (DIVE-4684). Every arm below asks one question:
+# "did this verify record a MAKER SELF-CLOSE receipt?" The original predicate
+# asked a different one — "did the audit log stay completely silent?" — and the
+# two were the same number only for as long as `task verify` wrote nothing else.
+# #1020 (c421a527) made every STORED VERDICT leave its own `task.graded` row, on
+# purpose and correctly ("like every other task state change"), and five arms
+# went red reading that row as the self-close receipt. Bisected: the identical
+# harness is 10/0 at c421a527^ and 5/5 at c421a527.
+#
+# The verb-specific count is also the STRONGER predicate, which is why it is the
+# fix rather than a loosened one: a line count passes as long as the total does
+# not move, so a self-close receipt that REPLACED some other row would have gone
+# straight through it. This cannot.
+sc_rows()     { local n; n=$(grep -c '^task\.verify-self-close ' "$AUDIT_CALLS"); printf '%s' "${n:-0}"; }
+graded_rows() { local n; n=$(grep -c '^task\.graded '            "$AUDIT_CALLS"); printf '%s' "${n:-0}"; }
+
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
@@ -59,7 +75,16 @@ run_with_identity() { local authenticated="$1" claimed_user="$2" verb="$3"; shif
       [[ -n "$authenticated" ]] \
         && printf 'agent-%s:x:%s:%s::/nonexistent:/bin/false\n' \
              "$authenticated" "$pinned_uid" "$pinned_uid"
-      printf '%s\n' "$(</etc/passwd)"
+      # The fixture row is FIRST on purpose: `actor_uid_to_name` reads this stream
+      # through a `while read` that RETURNS on its match, so the host tail below is
+      # never needed to answer the question and the reader closes the pipe under
+      # this printf. That EPIPE is the `printf: write error: Broken pipe` that
+      # appeared in the DIVE-4684 CI tail and was read there as evidence of a
+      # truncated audit stream; it is neither — it is this dump losing a race it
+      # cannot lose anything by losing. Silence the writer's complaint only. The
+      # tail itself stays: it is what makes a NON-fixture uid resolve to nothing
+      # rather than to whoever happens to own it on the runner.
+      printf '%s\n' "$(</etc/passwd)" 2>/dev/null || :
     }
     USER="$claimed_user"; SUDO_UID=""; SUDO_USER=""; JSON_MODE=1
     "cmd_task_$verb" "$@"
@@ -102,7 +127,7 @@ show_json=$(run show "$M")
 [[ "$maker_err" == *"self-verified-close"* ]] \
   && ok_t "maker self-close warns on stderr" \
   || bad_t "stderr warning missing" "$maker_err"
-audit_row=$(tail -n 1 "$AUDIT_CALLS")
+audit_row=$(grep '^task.verify-self-close ' "$AUDIT_CALLS" | tail -n 1)
 [[ "$audit_row" == "task.verify-self-close self-verified-close 0 -- task=${maker_ident} maker=alice verifier=boss iteration=1" ]] \
   && ok_t "distinct audit verb/result attributes the maker close" \
   || bad_t "audit receipt wrong" "$audit_row"
@@ -117,22 +142,22 @@ printf '#!/bin/bash\n[[ "${1:-}" == "-u" ]] && printf "1000\\n" || printf "agent
 printf '#!/bin/bash\nprintf "agent-nobody:x:1000:1000::/nonexistent:/bin/false\\n"\n' >"$FORGED_PATH/getent"
 chmod +x "$FORGED_PATH/id" "$FORGED_PATH/getent"
 P=$(make_delivered "maker forged provenance visibility")
-before=$(wc -l <"$AUDIT_CALLS")
+before=$(sc_rows)
 forged_out=$(PATH="$FORGED_PATH:$PATH" run_with_identity alice nobody verify "$P" --cmd=true); forged_rc=$?
-after=$(wc -l <"$AUDIT_CALLS")
+after=$(sc_rows)
 [[ $forged_rc -eq 0 && "$(col "$P" status)" == "done" \
    && "$(col "$P" result)" == *"self-verified-close: maker=alice; verifier=boss never graded; iteration=1"* \
    && "$after" -eq $((before+1)) && "$(cat "$TMP/err")" == *"self-verified-close"* ]] \
   && ok_t "forged USER/PATH cannot suppress an authenticated maker self-close mark" \
-  || bad_t "forged USER/PATH bypass remains" "rc=$forged_rc status=$(col "$P" status) audit=$before/$after out=$forged_out err=$(cat "$TMP/err")"
+  || bad_t "forged USER/PATH bypass remains" "rc=$forged_rc status=$(col "$P" status) self-close-rows=$before/$after out=$forged_out err=$(cat "$TMP/err")"
 
 # Fail closed when the kernel identity resolver cannot attribute a caller. The
 # passing command remains useful evidence, but an unclassifiable caller cannot
 # create the exact silent-close shape this visibility rail exists to prevent.
 U=$(make_delivered "unidentified caller control")
-before=$(wc -l <"$AUDIT_CALLS")
+before=$(sc_rows)
 unknown_out=$(run_with_identity "" nobody verify "$U" --cmd=true); unknown_rc=$?
-after=$(wc -l <"$AUDIT_CALLS")
+after=$(sc_rows)
 [[ $unknown_rc -ne 0 && "$(col "$U" status)" == "todo" \
    # DIVE-2483 (iteration 2): was a PREFIX match on the verdict. That pinned the
    # WIPE in a subtler form than an equality would — on a DELIVERED (open) row the
@@ -145,39 +170,47 @@ after=$(wc -l <"$AUDIT_CALLS")
    && "$(col "$U" result)" != *"self-verified-close"* && "$before" == "$after" \
    && "$(cat "$TMP/err")" == *"caller identity could not be authenticated"* ]] \
   && ok_t "unidentified caller records PASS evidence but cannot close a delivered loop" \
-  || bad_t "unidentified caller did not fail closed" "rc=$unknown_rc status=$(col "$U" status) result=$(col "$U" result) audit=$before/$after out=$unknown_out err=$(cat "$TMP/err")"
+  || bad_t "unidentified caller did not fail closed" "rc=$unknown_rc status=$(col "$U" status) result=$(col "$U" result) self-close-rows=$before/$after out=$unknown_out err=$(cat "$TMP/err")"
 
 # Control: the assigned verifier's same PASS is an ordinary independent grade.
 V=$(make_delivered "verifier grade control")
-before=$(wc -l <"$AUDIT_CALLS")
+before=$(sc_rows)
+graded_before=$(graded_rows)
 run_as boss verify "$V" --cmd=true >/dev/null
-after=$(wc -l <"$AUDIT_CALLS")
+after=$(sc_rows); graded_after=$(graded_rows)
 [[ "$(col "$V" status)" == "done" && "$(col "$V" result)" != *"self-verified-close"* \
    && "$before" == "$after" && "$(cat "$TMP/err")" != *"self-verified-close"* ]] \
   && ok_t "verifier close carries no maker self-close mark, audit, or warning" \
-  || bad_t "independent grade was mislabeled" "result=$(col "$V" result) audit=$before/$after err=$(cat "$TMP/err")"
+  || bad_t "independent grade was mislabeled" "self-close-rows=$before/$after result=$(col "$V" result) err=$(cat "$TMP/err")"
+# The other half of the same measurement, and the reason the arm above can now be
+# read: the independent grade DOES leave the ordinary `task.graded` receipt. Pin
+# it, so the next change to what `task verify` writes is a named red here rather
+# than a drifting line count five arms wide.
+[[ "$graded_after" -eq $((graded_before+1)) ]] \
+  && ok_t "an independent grade still leaves exactly one ordinary task.graded receipt" \
+  || bad_t "the ordinary grade receipt moved" "task.graded rows $graded_before -> $graded_after (want +1)"
 
 # Negative arm: a failing maker-selected command records evidence but does not
 # close, so it earns none of the three close-only marks.
 F=$(make_delivered "maker failing check")
-before=$(wc -l <"$AUDIT_CALLS")
+before=$(sc_rows)
 run_as alice verify "$F" --cmd=false >/dev/null; fail_rc=$?
-after=$(wc -l <"$AUDIT_CALLS")
+after=$(sc_rows)
 [[ $fail_rc -ne 0 && "$(col "$F" status)" == "todo" \
    && "$(col "$F" result)" != *"self-verified-close"* && "$before" == "$after" \
    && "$(cat "$TMP/err")" != *"self-verified-close"* ]] \
   && ok_t "failed maker verify does not claim a self-verified close" \
-  || bad_t "failed check was mislabeled" "rc=$fail_rc status=$(col "$F" status) audit=$before/$after"
+  || bad_t "failed check was mislabeled" "rc=$fail_rc status=$(col "$F" status) self-close-rows=$before/$after"
 
 # Negative arm: --no-done explicitly records a check without closing.
 N=$(make_delivered "maker no-done check")
-before=$(wc -l <"$AUDIT_CALLS")
+before=$(sc_rows)
 run_as alice verify "$N" --cmd=true --no-done >/dev/null
-after=$(wc -l <"$AUDIT_CALLS")
+after=$(sc_rows)
 [[ "$(col "$N" status)" == "todo" && "$(col "$N" result)" != *"self-verified-close"* \
    && "$before" == "$after" && "$(cat "$TMP/err")" != *"self-verified-close"* ]] \
   && ok_t "--no-done maker check is not mislabeled as a close" \
-  || bad_t "no-done check was mislabeled" "status=$(col "$N" status) audit=$before/$after"
+  || bad_t "no-done check was mislabeled" "status=$(col "$N" status) self-close-rows=$before/$after"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
