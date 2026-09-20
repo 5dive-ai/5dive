@@ -316,7 +316,13 @@ ok  "arm73: an 11-arg call is byte-identical to pre-4666" \
 # quinn's it.1 third finding was that the I/O half of this row had zero arms.
 # This is the half THIS iteration adds, so it gets one: the real
 # `_sup_output_stats` text, run by sqlite3 against a throwaway store.
-SCRATCH=$(mktemp -d); trap 'rm -rf "$SCRATCH"' EXIT
+# The cleanup is FOLDED INTO the marker trap at the top of this file, not
+# registered as a second one: bash keeps only the LAST trap per signal, so a
+# bare `trap ... EXIT` here silently removes the HARNESS-RC line the corpus
+# contract requires (tests/harness_rc_corpus_contract_unit.sh). rc=$? stays
+# first so the cleanup cannot overwrite the exit code.
+SCRATCH=$(mktemp -d)
+trap 'rc=$?; rm -rf "$SCRATCH"; echo "HARNESS-RC=$rc"' EXIT
 STORE="$SCRATCH/tasks.db"
 sqlite3 "$STORE" "CREATE TABLE tasks (id INTEGER PRIMARY KEY, assignee TEXT, status TEXT,
   kind TEXT DEFAULT 'standard', created_at TEXT, started_at TEXT, first_started_at TEXT, done_at TEXT);"
