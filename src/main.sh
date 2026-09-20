@@ -312,6 +312,7 @@ Triggers (signed external event -> ordinary task):
 Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
   5dive project add <key> --prefix=FROG [--name=] [--goal=] [--folder=] [--lead-agent=<agent>]
   5dive project ls | show <key>
+  5dive project set-status <key> active|complete|archived|binned|backlogged
   # tasks then number per project: FROG-1, FROG-2 …
 
   5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # orchestration (JSON in/out)
