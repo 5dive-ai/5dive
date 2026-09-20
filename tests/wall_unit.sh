@@ -254,6 +254,43 @@ armrc=$?
 is "the follow loop survives repeated failure under set -e" "$(cat "$TMP/loops")" "3"
 is "it is the arm that stops the loop, not errexit"          "$armrc" "7"
 
+# THE ARM ABOVE GRADES THE PROPERTY, NOT THE LINE. It drives the `ok` branch,
+# where the attach already carries its own `|| true` — so deleting `set +e`
+# alone leaves it green and the mutant proves nothing about that line (quinn,
+# DIVE-4614 iteration 1). This second arm drives a branch `|| true` does NOT
+# cover: the no-session branch, whose first statement is a bare `clear`. A
+# `clear` that exits non-zero is not hypothetical — it is what a pane with no
+# terminfo entry for its TERM does, which is a pane the wall respawns. With
+# `set +e` the loop shrugs and retries; without it, the pane dies on pass one,
+# which is the collapse this whole section exists to prevent.
+cat >"$TMP/errexit_line_arm.sh" <<'ARM'
+set -euo pipefail          # exactly what header.sh gives every bundle function
+SRCDIR="$1"; COUNTFILE="$2"   # captured HERE: inside a stub, $1/$2 are the STUB's args
+source "$SRCDIR/cmd_wall.sh"
+id()   { case "${1:-}" in -u) printf '1000' ;; -un) printf 'operator' ;; esac; }
+# The runas IS granted (the positive control passes) and the seat has NO
+# session — a seat that is merely restarting, the normal case.
+sudo() {
+  while (( $# )); do case "$1" in -n) shift ;; -u) shift 2 ;; *) break ;; esac; done
+  case "${1:-}:${2:-}" in
+    true:*)            return 0 ;;
+    tmux:has-session)  return 1 ;;
+  esac
+  return 1
+}
+clear() { return 1; }   # NOT guarded by `|| true` anywhere in the loop
+_n=0
+sleep() { _n=$((_n+1)); printf '%s
+' "$_n" >"$COUNTFILE"; (( _n < 3 )) || exit 7; }
+wall_watch_seat someseat
+ARM
+: >"$TMP/loops2"
+( bash "$TMP/errexit_line_arm.sh" "$PWD/$SRC" "$TMP/loops2" ) >/dev/null 2>&1
+armrc2=$?
+is "a non-zero \`clear\` on the no-session branch does not kill the pane" \
+   "$(cat "$TMP/loops2")" "3"
+is "and it is still the arm that stops that loop, not errexit" "$armrc2" "7"
+
 # A vacant slot must HOLD its slot and say what it is. A pane that exits takes
 # its slot with it and the surviving panes reflow — which is the unreadable
 # layout this feature was built to replace.
@@ -291,6 +328,37 @@ case "$log" in
   *"-T alpha"*) ok "the registry seats are what get titled" ;;
   *) bad "the registry seats are titled" "-T alpha" "$log" ;;
 esac
+
+# ---------------------------------------------------------------------------
+echo "7. the SAVED grid governs the ROSTER, not just the shape"
+# ---------------------------------------------------------------------------
+# quinn, iteration 1: the roster cap was the literal 6, resolved BEFORE the
+# saved grid was consulted, while the SHAPE came from the saved grid. So an
+# operator who ran `--grid=4x3` once got, on the next plain `5dive wall`, a
+# twelve-pane wall holding six seats and six tiles each asserting its slot was
+# EMPTY — four running agents hidden behind "vacant". That is the failure the
+# whole feature exists to prevent, and it is worse than not seeing a seat:
+# the wall says, positively, that there is nothing there.
+: >"$TMUXLOG"
+rm -f "$BOX_CONFIG"
+wall_save_grid 4 3          # the operator's choice, saved on this box
+registry_read() {
+  local i out=""
+  for i in 01 02 03 04 05 06 07 08 09 10; do out="$out\"seat$i\":{\"type\":\"claude\"},"; done
+  printf '{"agents":{%s}}\n' "${out%,}"
+}
+_wall_unit_active() { return 0; }
+tmux() { printf '%s\n' "$*" >>"$TMUXLOG"; case "$1" in has-session) return 1 ;; new-session|split-window) printf '%%%s\n' "$RANDOM" ;; esac; return 0; }
+( cmd_wall ) >/dev/null 2>&1          # NO --grid: the saved one has to carry
+log=$(cat "$TMUXLOG")
+is "all ten running seats are laid out under the saved 4x3" \
+   "$(grep -c -- '-T seat' <<<"$log")" "10"
+is "only the two genuinely spare slots read as vacant" \
+   "$(grep -c -- '-T vacant' <<<"$log")" "2"
+# ...and the shape itself is still the saved one, so the two halves agree.
+is "the saved grid is four columns wide" \
+   "$(grep -c -- 'split-window -h' <<<"$log")" "3"
+rm -f "$BOX_CONFIG"
 
 echo
 echo "passed: $PASS   failed: $FAIL"

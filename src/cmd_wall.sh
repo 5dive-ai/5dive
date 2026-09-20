@@ -343,7 +343,7 @@ cmd_wall() {
       # `tmux attach -t wall` and nest the wall inside its own pane; tmux
       # refuses, the pane dies, and the layout collapses with it. It reads like
       # a no-op reordering and silently breaks the whole feature, so
-      # tests/wall_pane_mode_ordering_unit.sh pins it.
+      # section 5 of tests/wall_unit.sh pins it.
       --follow)
         shift
         local s="${1:-$(_wall_pane_seat)}"
@@ -383,14 +383,25 @@ cmd_wall() {
   # remembered for next time (per box).
   local n cols rows grid
   if (( ${#seats[@]} == 0 )); then
-    # Cap the roster at the grid the operator asked for, or at the default 3x2,
-    # so a 16-seat box does not silently produce an unreadable 16-pane wall.
-    local cap=6
+    # Cap the roster at the grid that will actually be used, so a 16-seat box
+    # does not silently produce an unreadable 16-pane wall.
+    #
+    # THE CAP FOLLOWS THE SAME PRECEDENCE AS THE SHAPE — flag, then the saved
+    # choice, then the default — and that is the whole point of this block.
+    # Capping at a literal 6 while the SHAPE came from the saved grid is how an
+    # operator who once ran `--grid=4x3` got a twelve-pane wall next time
+    # holding six seats and six tiles asserting the slot was empty: four
+    # running agents rendered as vacant, which is the "a seat you cannot see"
+    # failure this feature exists to prevent (quinn, DIVE-4614 iteration 1).
+    local cap=6 gspec="" gc gr
     if [[ -n "$grid_spec" ]]; then
       # Capture BEFORE read: `read <<<"$(f)"` succeeds on f's failure, so a bad
       # --grid would be swallowed here and only caught later, or not at all.
-      local gspec gc gr
       gspec=$(wall_parse_grid "$grid_spec") || return 2
+    else
+      gspec=$(wall_saved_grid)
+    fi
+    if [[ -n "$gspec" ]]; then
       read -r gc gr <<<"$gspec"
       cap=$(( gc * gr ))
     fi
