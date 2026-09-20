@@ -73,6 +73,7 @@ sleep()                    { :; }
 _REAL_FLATTEN="$(declare -f _hb_flatten_payload)"
 _REAL_CLEAR="$(declare -f _hb_composer_clear)"
 _REAL_PROBE="$(declare -f _hb_wedge_probe)"
+_REAL_IDLE="$(declare -f _hb_agent_idle)"
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 not_ok(){ FAIL=$((FAIL+1)); printf 'not ok - %s\n' "$1"; }
@@ -221,6 +222,65 @@ grade "W4e ...and unwedging the same seat drives it back GREEN (the red was the 
       "[[ '$DET_GREEN' != 'composer-wedged' ]]"
 grade "W4f the ledger names the SEAT — a fleet alarm that cannot say which seat is not actionable" \
       "[[ ! -e '$TMP/composer-wedge/seatx' ]]"
+
+# --- W5: the FORCED path reads the seat before it types into it (DIVE-4642) ---
+#
+# luca, box-1, 5dive 0.45.0, 2026-09-20, rated S1: `heartbeat wake-task` against a
+# seat 21 minutes into a turn typed `/clear` into a LIVE composer, could not
+# submit it, and left it queued to fire at that turn's boundary. The tick has
+# always asked `_hb_agent_idle` first; the forced verb asked nothing. These arms
+# grade the read, its two fail-open cases, and the override.
+#
+# `_hb_agent_idle` is stubbed per arm because the arm under test is the GUARD,
+# not the predicate — W5e is the one that drives the REAL `_hb_agent_idle`, so
+# the group is not grading a stub against itself.
+WAKES="$TMP/wakes"
+require_root()              { :; }
+db()                        { printf 'DIVE-4642'; }
+_hb_effective_fresh()       { printf 'false'; }
+_hb_wake_task_record_defect() { :; }
+warn()                      { printf '%s\n' "$*" >>"$LOG"; }
+_hb_wake()                  { printf 'WAKE %s\n' "$1" >>"$WAKES"; return 0; }
+_wt() { : >"$WAKES"; : >"$LOG"; cmd_heartbeat_wake_task "$@" >/dev/null 2>&1; }
+_woke() { grep -c . "$WAKES"; }
+
+_hb_agent_idle() { return 1; }                       # working: a turn is in flight
+_wt seatx 4642
+grade "W5a a forced wake onto a seat that is MID-TURN does not reach the pane at all" \
+      "[[ \$(_woke) -eq 0 ]]"
+grade "W5b ...and it says so by name, with both ways forward (the row stays todo)" \
+      "grep -q 'forced wake REFUSED' '$LOG' && grep -q 'seatx' '$LOG' && grep -q -- '--force' '$LOG'"
+
+_hb_agent_idle() { return 0; }                       # idle: the wedged seat's own reading
+_wt seatx 4642
+grade "W5c an IDLE seat is still woken — a wedged seat reads idle, and that is the case this verb exists for" \
+      "[[ \$(_woke) -eq 1 ]]"
+
+_hb_agent_idle() { return 2; }                       # no signal at all
+_wt seatx 4642
+grade "W5d the guard FAILS OPEN on rc 2 (non-claude runtime / no signal): an unmeasurable seat is not a blocked one" \
+      "[[ \$(_woke) -eq 1 ]]"
+
+# W5e — the only arm here that runs the SHIPPED `_hb_agent_idle`. This harness's
+# `_hb_agent_native_state` stub returns the word ALREADY MAPPED (the real body is
+# what turns `waiting` into `blocked:<reason>`), so the fixture is the mapped
+# form; a `blocked:` reading needs no pane sampling and reaches rc 3 through the
+# real `_hb_agent_idle` body.
+eval "$_REAL_IDLE"
+NATIVE_ST='blocked:a permission prompt'
+_wt seatx 4642
+grade "W5e a seat BLOCKED on a permission prompt is refused through the real \`_hb_agent_idle\`, and the reason names the block" \
+      "[[ \$(_woke) -eq 0 ]] && grep -q 'blocked on' '$LOG'"
+NATIVE_ST=''
+
+# W5f — THE MUTATION ARM, and it is exact: same seat, same state, one flag. The
+# pre-fix behaviour IS `--force`, so this proves in one shot that the override
+# works AND that the guard is what withheld the wake in W5a.
+_hb_agent_idle() { return 1; }
+_wt --force seatx 4642
+grade "W5f MUTANT/override: \`--force\` on the SAME mid-turn seat wakes it, so W5a is the guard and not an accident" \
+      "[[ \$(_woke) -eq 1 ]]"
+_hb_agent_idle() { return 0; }
 
 # ------------------------------------------------------------- mutation arms
 # Each reverts one guard to its pre-fix body against the SAME scripted pane. A

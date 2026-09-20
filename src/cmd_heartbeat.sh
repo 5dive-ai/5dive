@@ -752,19 +752,20 @@ _hb_effective_fresh() {
 # (pick the task up in the running context) and `--fresh` forces the clear.
 cmd_heartbeat_wake_task() {
   require_root
-  local fresh_override=""
+  local fresh_override="" force_busy="false"
   local -a _pos=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --fresh)    fresh_override="true"; shift ;;
       --no-fresh) fresh_override="false"; shift ;;
+      --force)    force_busy="true"; shift ;;
       --)         shift; while [[ $# -gt 0 ]]; do _pos+=("$1"); shift; done ;;
       *)          _pos+=("$1"); shift ;;
     esac
   done
   local name="${_pos[0]:-}" task_id="${_pos[1]:-}"
   [[ -n "$name" && "$task_id" =~ ^[0-9]+$ ]] \
-    || fail "$E_USAGE" "usage: 5dive heartbeat wake-task [--fresh|--no-fresh] <agent> <task_id> [<task_ident>]"
+    || fail "$E_USAGE" "usage: 5dive heartbeat wake-task [--fresh|--no-fresh] [--force] <agent> <task_id> [<task_ident>]"
   # THE IDENT IS RESOLVED FROM THE ROW, NEVER FABRICATED FROM THE ID.
   #
   # `<task_ident>` is optional and the exit hints deliberately omit it, so the
@@ -798,7 +799,45 @@ cmd_heartbeat_wake_task() {
   else
     fresh="$(_hb_effective_fresh "$name" "$task_id")"
   fi
-  _hb_log "[$name] forced wake onto ${task_ident} (fresh=${fresh}${fresh_override:+, caller override})"
+  # DIVE-4642 — THE FORCED PATH READS THE SEAT BEFORE IT TYPES INTO IT.
+  #
+  # The tick has always asked `_hb_agent_idle` first and deferred a mid-turn
+  # seat; `wake-task` skipped that read entirely and went straight to _hb_wake.
+  # So a forced wake onto a seat 21 minutes into a turn typed `/clear` into a
+  # LIVE composer, could not submit it (the composer is busy), and left the
+  # `/clear` queued to fire at that turn's boundary — wiping a working seat's
+  # context. Measured by luca on box-1, 5dive 0.45.0, 2026-09-20; rated S1.
+  #
+  # `_hb_composer_clear` now removes that residual, so the S1 harm is already
+  # dead. This read removes the CAUSE: on a seat that is provably working there
+  # is nothing to force, and the row stays todo for the tick that is already
+  # going to reach it.
+  #
+  # THE SAME PREDICATE AS THE TICK, not a copy of it — a second derivation of
+  # "is this seat busy" is exactly the shape DIVE-4276 cost us. It is also
+  # strictly better than the raw native word: `_hb_agent_idle` carries DIVE-4298's
+  # cross-check, so a seat held at native `busy` only by an orphaned background
+  # shell still reads idle here and is still woken.
+  #
+  # FAILS OPEN, deliberately. rc 2 is "no signal" (a non-claude runtime, claude
+  # not running, tmux unreadable) and must not block a debugging verb on a seat
+  # we cannot measure — the old behaviour is the right default there. Only a
+  # POSITIVE reading of working (1) or blocked (3) holds the wake, and `--force`
+  # takes it anyway for the operator who has looked at the pane and disagrees.
+  if [[ "$force_busy" != "true" ]]; then
+    local _fw_idle_rc=0
+    _hb_agent_idle "$name" || _fw_idle_rc=$?
+    if (( _fw_idle_rc == 1 || _fw_idle_rc == 3 )); then
+      local _fw_state="mid-turn (a turn is in flight)"
+      (( _fw_idle_rc == 3 )) && _fw_state="blocked on ${_HB_IDLE_REASON:-input needed}"
+      local _fw_note
+      _fw_note="[$name] forced wake REFUSED onto ${task_ident} — the seat is ${_fw_state}, and typing a goal into a live composer cannot submit and leaves a draft that fires at the turn's boundary (DIVE-4642). The row stays todo and the next tick reaches it. Override with '--force' if you have looked at the pane, or 'sudo 5dive agent restart ${name}' if the seat is genuinely stuck."
+      _hb_log "$_fw_note"
+      warn "$_fw_note"
+      return 0
+    fi
+  fi
+  _hb_log "[$name] forced wake onto ${task_ident} (fresh=${fresh}${fresh_override:+, caller override}$([[ "$force_busy" == "true" ]] && printf ', busy-guard forced')"
   _hb_wake_task_record_defect "$name" "$task_id" "$task_ident"
   # DIVE-4310: a forced wake fails with the same named cause as a tick wake.
   local _fw_rc=0
@@ -2576,7 +2615,11 @@ _hb_composer_unsent() {
 # DIVE-4242: did the Enter take? 0 = composer empty of non-ghost text (the
 # payload left it), 1 = text still sitting there (sets _HB_COMPOSER_UNSENT for
 # the caller's log line). Waits a beat first so the TUI has redrawn.
-_HB_COMPOSER_UNSENT=""
+#
+# _HB_COMPOSER_UNSENT is DECLARED IN src/lib/state.sh, not here. cmd_agent_runtime
+# reads it too, and a column-0 assignment in this module would make cmd_heartbeat
+# its lazy-dispatch provider — an edge that closes over every verb in the CLI
+# (DIVE-4642). This module writes it; core declares it.
 _hb_verify_submit() {
   local name="$1"
   sleep "${_HB_SUBMIT_VERIFY_SEC:-0.3}"

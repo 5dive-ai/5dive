@@ -124,3 +124,22 @@ _wedge_read() {
       "$chars" $(( age / 60 )) "${excerpt:0:80}"
   fi
 }
+
+# The text a seat's composer was still holding the last time a submit was
+# verified — set by the heartbeat's `_hb_verify_submit`, read by the heartbeat's
+# failure/alarm lines AND by `inject_and_submit` in cmd_agent_runtime, which
+# needs to know what it failed to send before it clears the draft.
+#
+# WHY THE DECLARATION LIVES HERE AND NOT BESIDE ITS WRITER. It is unsent-draft
+# state, so it belongs with `_wedge_mark`/`_wedge_clear` above on subject matter
+# alone — but the reason it MOVED is mechanical. Its column-0 assignment used to
+# sit in `src/cmd_heartbeat.sh`, which made cmd_heartbeat the lazy-dispatch
+# PROVIDER of the name; cmd_agent_runtime reading it therefore recorded a
+# `cmd_agent_runtime -> cmd_heartbeat` edge, and since cmd_agent_runtime is in
+# the universal provider set that edge closed over every verb in the CLI —
+# `whoami` 8 -> 12 modules, `task ls` 16 -> 20, dragging in cmd_goal,
+# cmd_objective and task__loops (DIVE-4642; same shape as DIVE-4585, DIVE-4087).
+# state.sh is CORE, parsed on every invocation, so a name declared here is free
+# to read from any module and creates no edge at all. A cross-module global
+# belongs in core; only its writer belongs in the module.
+_HB_COMPOSER_UNSENT=""
