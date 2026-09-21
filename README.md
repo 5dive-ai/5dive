@@ -407,12 +407,12 @@ sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 A plugin adds something to every seat on the box at once: a channel (Telegram, Discord), a verb (a new top-level `5dive <verb>`), or a capability such as a shared browser or voice. It is a directory with a Claude Code plugin manifest (`.claude-plugin/plugin.json`). 5dive installs it box-level and registers it with every existing agent and every agent created later: Claude Code seats through their own plugin install, other harnesses through the plugin's `AGENTS.md` section.
 
 ```sh
-sudo 5dive plugin add browser@5dive-plugins        # from the 5dive marketplace
+sudo 5dive plugin add 5dive-ai/5dive-browser       # from its own repository
 sudo 5dive plugin add 5dive-ai/5dive-voice         # from any GitHub repo that carries a marketplace.json
 sudo 5dive plugin list                             # version, tier, enabled, what it registers
-sudo 5dive plugin upgrade browser@5dive-plugins
-sudo 5dive plugin disable browser@5dive-plugins    # a flag flip; the code stays on disk
-sudo 5dive plugin rollback browser@5dive-plugins 1.1.0
+sudo 5dive plugin upgrade browser@5dive-browser
+sudo 5dive plugin disable browser@5dive-browser    # a flag flip; the code stays on disk
+sudo 5dive plugin rollback browser@5dive-browser 1.1.0
 ```
 
 `add` prints who published the plugin and exactly what it will be handed, then waits for you to agree: a plugin is code that runs with your agents' access. `5dive market --kind=plugin` is the catalog, and the same list is on the dashboard under **Plugins**.
