@@ -174,5 +174,18 @@ out="$(IDLE_RC=0 JSON_MODE=1 cmd_send quinn --urgent --message="idle target" 2>/
 is "T7: sent:true"     "true" "$(jq -r '.data.sent' <<<"$out")"
 is "T7: nothing spooled" "0"  "$(spool_count quinn)"
 
+# --- T8: downgraded AND delivered — the one case where sent:true must still
+# say urgent:false. The budget is spent and the target is IDLE, so there is no
+# queue to fall into and the send succeeds; a receipt that reported the FLAG
+# here would tell the sender it interrupted a seat it did not.
+reset_arm; reset_budget
+for n in 1 2 3; do IDLE_RC=0 cmd_send quinn --urgent --message="urgent ${n}" >/dev/null 2>&1; done
+reset_arm
+out="$(IDLE_RC=0 JSON_MODE=1 cmd_send quinn --urgent --message="urgent 4 to an idle seat" 2>/dev/null)"
+is "T8: sent:true"                        "true"  "$(jq -r '.data.sent' <<<"$out")"
+is "T8: urgent:false (budget was spent)"  "false" "$(jq -r '.data.urgent' <<<"$out")"
+is "T8: urgent_requested:true"            "true"  "$(jq -r '.data.urgent_requested' <<<"$out")"
+hasnt "T8: and the envelope does not claim it" "urgent=1" "$(typed_text)"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
