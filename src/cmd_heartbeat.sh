@@ -4191,6 +4191,29 @@ _hb_is_grade_wake() {  # <agent> <task_id>
   [[ -n "$vfier" && "$vfier" == "$name" && -n "$maker" && "$maker" != "$name" ]]
 }
 
+# DIVE-4723 — IS THE BOUNDED PACKET ACTUALLY BUILDABLE FOR THIS ROW?
+#
+# `_hb_is_grade_wake` says the seat is being woken to grade. It does NOT say the
+# grade can be taken from `task grade-context`: that verb hard-fails
+# ("has no usable delivered checkout+sha") on a handoff delivered without a bound
+# checkout and 40-hex sha — a docs row, a `task done` with no `--pr`, a delivery
+# bound from outside a git checkout. Telling THAT grader to read the packet and
+# not to `task show` would leave it with no read at all, which is strictly worse
+# than the line this branch replaces. So the dispatch narrows: the packet is
+# named only on a row where the same two columns `cmd_task_grade_context` reads
+# are populated, and every other grade wake keeps the row read.
+#
+# Deliberately NOT a third restatement of the grade predicate — it is a column
+# test, ANDed with `_hb_is_grade_wake`, so it cannot disagree with the verifier
+# clause about who is grading, only about what they can read.
+_hb_grade_packet_available() {  # <task_id>
+  local task_id="$1" repo sha
+  [[ "$task_id" =~ ^[0-9]+$ ]] || return 1
+  repo=$(db "SELECT COALESCE(delivery_repo_path,'') FROM tasks WHERE id=${task_id};" 2>/dev/null) || return 1
+  sha=$(db "SELECT COALESCE(delivered_sha,'') FROM tasks WHERE id=${task_id};" 2>/dev/null) || return 1
+  [[ -n "$repo" && -d "$repo" && "$sha" =~ ^[0-9a-f]{40}$ ]]
+}
+
 # DIVE-4406 — assemble the dispatch text for one wake. Pure: reads the DB and the
 # seat's transcript, writes nothing, injects nothing, so a harness can grade the
 # exact bytes a seat would receive (tests/heartbeat_dispatch_compaction_unit.sh).
@@ -4222,9 +4245,26 @@ _hb_nudge_text() { # <agent> <task_id> <task_ident>
   # soft 6. Two numbers in one sentence is what a hardcoded 6 plus a budget in
   # the grader clause would have produced, and a dispatch that contradicts itself
   # is read as neither.
-  local _hb_turns=6
-  _hb_is_grade_wake "$name" "$task_id" 2>/dev/null && _hb_turns=$(_hb_grade_turn_budget)
-  local nudge="/goal ${task_ident} — your only row this turn; read it with '5dive task show ${task_ident}'. TERMINAL, then stop: DONE — '5dive task done ${task_ident} --result=\"<1-2 self-contained sentences; the creator and the dashboard read this field>\"' (on a row that carries a verifier the same verb DELIVERS instead, and delivered is terminal for you); GATED — '5dive task need ${task_ident} --type=decision|approval|secret|manual --ask=\"<one crisp question>\" --recommend=\"<the advised answer>\"' if it needs a human; CANCELLED — '5dive task cancel ${task_ident} --result=\"<why>\"' only if the row is genuinely impossible. Self-audit before you close. The rest of the contract (gate vs cancel, the ask's shape, single-row scope, maker/verifier separation, the knowledge clause) is in /home/claude/projects/CLAUDE.md under \"Task lifecycle\" — read it ONCE per session, it is not repeated here. Stop after ${_hb_turns} turns."
+  #
+  # DIVE-4723 — AND THE READ THE DISPATCH NAMES DEPENDS ON THE ROLE TOO.
+  # DIVE-4634 shipped `task grade-context`: the bounded grading packet, measured
+  # at −35% bytes / −40% words against the legacy row read. For eight hours it
+  # was a NO-OP for the seat that does every grade on this box, because the
+  # instruction to use it existed only in the ephemeral clone-grader goal (that
+  # lane's cron was disabled 2026-09-19) and in the `review_mode=rubric` branch
+  # (no row is filed rubric). The standing verifier is dispatched by THIS line,
+  # which said "read it with `task show`" — 41 quinn transcripts after the
+  # upgrade, `grade-context` occurrences = 0. An optimisation wired into the lane
+  # you turned off is a no-op; the acceptance is a transcript of the seat that
+  # does the work.
+  local _hb_turns=6 _hb_read
+  _hb_read="read it with '5dive task show ${task_ident}'"
+  if _hb_is_grade_wake "$name" "$task_id" 2>/dev/null; then
+    _hb_turns=$(_hb_grade_turn_budget)
+    _hb_grade_packet_available "$task_id" 2>/dev/null \
+      && _hb_read="you are GRADING it: run '5dive task grade-context ${task_ident}' and grade from that bounded packet (acceptance criteria, the delivery's claim block, the diff at the delivered sha, the checks to re-run) — do not '5dive task show ${task_ident}' unless the packet says a field is missing"
+  fi
+  local nudge="/goal ${task_ident} — your only row this turn; ${_hb_read}. TERMINAL, then stop: DONE — '5dive task done ${task_ident} --result=\"<1-2 self-contained sentences; the creator and the dashboard read this field>\"' (on a row that carries a verifier the same verb DELIVERS instead, and delivered is terminal for you); GATED — '5dive task need ${task_ident} --type=decision|approval|secret|manual --ask=\"<one crisp question>\" --recommend=\"<the advised answer>\"' if it needs a human; CANCELLED — '5dive task cancel ${task_ident} --result=\"<why>\"' only if the row is genuinely impossible. Self-audit before you close. The rest of the contract (gate vs cancel, the ask's shape, single-row scope, maker/verifier separation, the knowledge clause) is in /home/claude/projects/CLAUDE.md under \"Task lifecycle\" — read it ONCE per session, it is not repeated here. Stop after ${_hb_turns} turns."
 
   # DIVE-2063: a task carrying a maker→verifier loop can NEVER reach any of the
   # three terminal states above by the MAKER's own hand. A correct 'task done'
