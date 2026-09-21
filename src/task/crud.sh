@@ -1149,9 +1149,10 @@ cmd_task_ls() {
         --arg dv "$(_task_doctor_explain dead-verifier)" \
         --arg un "$(_task_doctor_explain unassigned-no-coordinator)" \
         --arg gh "$(_task_doctor_explain graded-merge-held)" \
+        --arg cv "$(_task_doctor_explain claim-outlived-verdict)" \
         '{"no-anchor":$na,"stale-edge":$se,"wake-passed":$wp,"park-no-wake":$pn,
           "dead-lane":$dl,"dead-verifier":$dv,"unassigned-no-coordinator":$un,
-          "graded-merge-held":$gh}')
+          "graded-merge-held":$gh,"claim-outlived-verdict":$cv}')
     fi
     local _dispatch_jq='map(.dispatch_reason = (.dispatch_reason // null)
                             | .dispatch_fix = (if .dispatch_reason == null then null
