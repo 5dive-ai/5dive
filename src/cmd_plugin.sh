@@ -984,6 +984,54 @@ _plugin_add_foreign() {  # <source-ref> <as-name> <assume-yes>
   cmd_plugin_add "${install_args[@]}"
 }
 
+# DIVE-4751 — what `add` copies is the plugin's FILES; its node packages are not
+# among them, and on this fleet nothing installs them at add time.
+#
+# The browser plugin's executor resolves a pinned `playwright-core` from the
+# plugin's OWN node_modules and nowhere else. `plugin add` materialises the tree
+# and enables it; the packages arrive only when 5dive-api's nightly browser-stack
+# converge runs. So a customer who followed the published migrate text
+# (`plugin remove browser@5dive-plugins`, then `plugin add 5dive-ai/5dive-browser`)
+# had `5dive browser run` REFUSE on that box for up to ~24h, and `add` said
+# nothing — measured 2026-09-21 05:57Z on exact-swallow, 30 min after the swap,
+# where `5dive-browser-stack-install --check` read DEGRADED and a hand-run
+# converge fixed it in one command.
+#
+# It PRINTS. That is the same door as `fivedive.setup` above and it is shut for
+# the same reason, only wider: `npm install` fetches publisher-chosen packages
+# from a registry as root, and it would run BEFORE the user had seen what they
+# installed. The manifest `command` door was deferred on 2026-09-07; this one is
+# not the place to re-open it. So `add` names the exact line and a human runs it.
+#
+# The line names the ENABLED path, not the version-keyed cache dir, because that
+# is the path the converge and browser-stack.sh's own DEGRADED report already
+# name — two messages about one box must not disagree about where it goes.
+_plugin_node_deps_missing() {  # <dir> -> the declared dependencies that are absent
+  local d="${1:-}" deps n
+  [[ -f "$d/package.json" ]] || return 0
+  deps=$(jq -r '(.dependencies // {}) | keys[]' "$d/package.json" 2>/dev/null) || return 0
+  [[ -n "$deps" ]] || return 0
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    [[ -f "$d/node_modules/$n/package.json" ]] || printf '%s\n' "$n"
+  done <<<"$deps"
+  return 0
+}
+
+_plugin_node_deps_notice() {  # <key> <dir>
+  local key="${1:-}" d="${2:-}" missing list
+  missing=$(_plugin_node_deps_missing "$d")
+  [[ -n "$missing" ]] || return 0
+  list=$(tr '\n' ' ' <<<"$missing"); list="${list% }"
+  echo >&2
+  echo "  $key declares node packages that are NOT installed on this box: $list" >&2
+  echo "  Installing a plugin copies its files; it does not fetch its packages, so" >&2
+  echo "  anything in $key that needs them refuses until they are there." >&2
+  echo "  Run this now (5dive does not run it for you — it fetches code from a registry):" >&2
+  echo "    sudo npm install --prefix $(_plugin_enabled_dir)/$key --omit=dev --ignore-scripts" >&2
+  return 0
+}
+
 cmd_plugin_add() {
   local ref="" as_name="" assume_yes=0 a
   for a in "$@"; do
@@ -1071,6 +1119,9 @@ cmd_plugin_add() {
     # seat that missed the original walk is still missing it, and this is the
     # only verb that can put it back without deleting the enabled directory.
     _plugin_seat_reregister "$key" "$plugin" "$mkt" "$caps" "$dest"
+    # DIVE-4751: nothing was fetched, but the packages can still be missing —
+    # this is the branch a second `add` lands on after the first one told you.
+    _plugin_node_deps_notice "$key" "$dest"
     ok "$key already at $version" '{plugin:$p, marketplace:$m, version:$v, changed:false}' \
        --arg p "$plugin" --arg m "$mkt" --arg v "$version"
     return 0
@@ -1145,6 +1196,10 @@ cmd_plugin_add() {
     [[ -n "$setup_cmd"  ]] && echo "  Or have 5dive run exactly that line for you:  sudo 5dive plugin setup $key" >&2
     echo "  (5dive does not run this on its own — read it first; it is the publisher's text.)" >&2
   fi
+
+  # DIVE-4751, and deliberately AFTER the setup hint: the hint is the publisher's
+  # sentence about the host, this is 5dive's own sentence about the box.
+  _plugin_node_deps_notice "$key" "$dest"
   # DIVE-4522. Enabling the plugin for the BOX is half of "installed": a `skill`
   # or `mcp` plugin is only real once the seat's harness loads it, and until this
   # line existed nothing here ever touched a seat. Measured on lodar's canary:
@@ -1330,6 +1385,12 @@ cmd_plugin_upgrade() {
     echo "  Re-registering $key with existing agents:" >&2
     plugin_seat_apply "$plugin" "$mkt" "$_up_caps" register "$dest" || true
   fi
+
+  # DIVE-4751, and upgrade needs it MORE than add: the new version is a fresh
+  # copy of the tree, so an upgrade DELETES a node_modules the converge had
+  # already installed under the old version and puts the box straight back into
+  # the state this notice exists to name.
+  _plugin_node_deps_notice "$key" "$dest"
 
   ok "$key upgraded $cur -> $new (roll back: 5dive plugin rollback $key)" \
      '{plugin:$k, from:$f, to:$t, changed:true}' --arg k "$key" --arg f "$cur" --arg t "$new"

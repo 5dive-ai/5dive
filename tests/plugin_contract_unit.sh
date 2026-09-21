@@ -417,6 +417,73 @@ t "T9c3 ...carrying no run receipt yet"                                        "
 t "T9c4 ...and a plugin with no setup block records none (absence is a signal)" "null" \
   "$(jq -r '."good@fixture".setup // "null"' "$STATE_DIR/plugins/installed.json")"
 
+# =============================================================================
+# DIVE-4751 — the packages a plugin DECLARES are not part of the tree `add` copies
+# =============================================================================
+# The live instance: browser's executor resolves a pinned playwright-core from
+# the plugin's own node_modules, `add` copies files only, and the packages
+# arrived on a customer box only at the next nightly converge — so
+# `5dive browser run` refused for up to ~24h with nothing said at add time
+# (measured 2026-09-21 on exact-swallow, 30 min after the published migrate).
+#
+# T9h/T9i are a PAIR and neither means anything alone, the same shape as T9c/T9g
+# above: T9h says the add NAMES the exact line, T9i is the negative control that
+# it did not RUN it. Running `npm install` here would be a wider door than the
+# manifest `command` we refuse to execute — publisher-chosen packages fetched
+# from a registry as root, before the user has seen what they installed.
+mkplugin needsdeps "$(manifest needsdeps 1.0.0 official '["channel"]')"
+printf '%s\n' '{"name":"needsdeps","private":true,"dependencies":{"playwright-core":"1.63.0"}}' \
+  > "$MKT/needsdeps/package.json"
+# The control plugin: same shape, but its package is already present where the
+# executor would look, so the box is not missing anything and must stay quiet.
+mkplugin hasdeps "$(manifest hasdeps 1.0.0 official '["channel"]')"
+printf '%s\n' '{"name":"hasdeps","private":true,"dependencies":{"playwright-core":"1.63.0"}}' \
+  > "$MKT/hasdeps/package.json"
+mkdir -p "$MKT/hasdeps/node_modules/playwright-core"
+printf '%s\n' '{"name":"playwright-core","version":"1.63.0"}' \
+  > "$MKT/hasdeps/node_modules/playwright-core/package.json"
+mkindex
+run _plugin_mkt_upgrade fixture
+
+run cmd_plugin_add needsdeps@fixture --yes
+t  "T9h a plugin whose declared packages are absent still installs"   "0" "$RC"
+tc "T9h2 ...and the add NAMES the package that is missing"            "playwright-core" "$OUT$ERR"
+tc "T9h3 ...and the exact command that installs it, at the enabled path" \
+   "npm install --prefix $STATE_DIR/plugins/enabled/needsdeps@fixture --omit=dev --ignore-scripts" "$OUT$ERR"
+tc "T9h4 ...and says why the files alone were not enough"             "does not fetch its packages" "$OUT$ERR"
+t  "T9i ...and it PRINTED, did not RUN it: no node_modules was created (negative control)" "no" \
+   "$([[ -e "$STATE_DIR/plugins/enabled/needsdeps@fixture/node_modules" ]] && echo yes || echo no)"
+
+# T9i2/T9i3 are what stop the notice becoming noise on every install.
+run cmd_plugin_add hasdeps@fixture --yes
+tn "T9i2 a plugin whose packages ARE present says nothing about npm" "npm install --prefix" "$OUT$ERR"
+run cmd_plugin_add good@fixture --yes
+tn "T9i3 a plugin with no package.json at all says nothing about npm" "npm install --prefix" "$OUT$ERR"
+
+# T9j: `upgrade` re-copies the tree, which DELETES a node_modules the converge
+# had already put there — so the box goes straight back into the missing state
+# and the notice has to fire there too, or the fix covers one of the two verbs
+# that can cause it.
+mkplugin needsdeps "$(manifest needsdeps 1.1.0 official '["channel"]')"
+printf '%s\n' '{"name":"needsdeps","private":true,"dependencies":{"playwright-core":"1.63.0"}}' \
+  > "$MKT/needsdeps/package.json"
+mkindex
+run _plugin_mkt_upgrade fixture
+run cmd_plugin_upgrade needsdeps@fixture
+t  "T9j upgrading a plugin with declared packages succeeds"          "0" "$RC"
+tc "T9j2 ...and names the install line again, because the upgrade wiped the packages" \
+   "npm install --prefix $STATE_DIR/plugins/enabled/needsdeps@fixture --omit=dev --ignore-scripts" "$OUT$ERR"
+
+# T9k: the live manifest, not only the fixture. If the browser plugin ever stops
+# pinning a package this arm goes quiet on its own; if the pin moves out of
+# `dependencies` where the driver resolves it, this reds.
+if [[ -n "$REGISTRY" && -f "$(_plugin_source_dir 5dive-plugins browser 2>/dev/null)/package.json" ]]; then
+  t "T9k the real browser plugin declares the dependency this notice is about" "playwright-core" \
+    "$(jq -r '(.dependencies // {}) | keys[0] // ""' "$(_plugin_source_dir 5dive-plugins browser)/package.json")"
+else
+  printf '  !! NOT RUN — T9k (the real browser manifest) needs a registry checkout carrying browser.\n'
+fi
+
 # The bundled voice plugin is the live instance of that, so grade the real file
 # rather than only the fixture: if someone later drops the setup block from
 # voice, or points it at something other than the host installer, this reds.
