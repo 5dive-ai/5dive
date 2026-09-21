@@ -2208,10 +2208,19 @@ cmd_deliver() {
   _buzz_mirror_outbound "$target" "$message"
   if (( _delivered )); then
     # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
-    ok "delivered to agent '$target'.${urgent_note:+ (}${urgent_note}${urgent_note:+)}" \
-       '({name:$n, delivered:true, from:$s, tier:($t|select(length>0))}
-         + (if $ur == "1" then {urgent:($ue=="1"), urgent_requested:true} else {} end))' \
-       --arg n "$target" --arg s "$s" --arg t "$tier" --arg ur "$urgent" --arg ue "$urgent_eff"
+    # DIVE-4769: the urgent split, for the reason written out at cmd_send's
+    # receipt — T21 pins the ordinary expression in this source byte-for-byte.
+    if (( urgent )); then
+      ok "delivered to agent '$target'.${urgent_note:+ (}${urgent_note}${urgent_note:+)}" \
+         '({name:$n, delivered:true, from:$s, urgent:($ue=="1"), urgent_requested:true}
+           + (if ($t|length) > 0 then {tier:$t} else {} end))' \
+         --arg n "$target" --arg s "$s" --arg t "$tier" --arg ue "$urgent_eff"
+      return 0
+    fi
+    # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
+    ok "delivered to agent '$target'." \
+       '{name:$n, delivered:true, from:$s, tier:($t|select(length>0))}' \
+       --arg n "$target" --arg s "$s" --arg t "$tier"
   else
     if (( _queued )); then
       _summary="queued for agent '$target' — ${_reason}."
@@ -2818,10 +2827,21 @@ cmd_send() {
     # reviewer a gate exists. Carried across as an explicit flag instead. It is
     # exactly as forgeable as the env var (any holder of the _deliver grant can
     # pass it), and no more: this is a rail marker, not a privilege.
-    local -a _scoped_flags=()
-    if [[ "${_5DIVE_A2A_NOTIFY:-0}" == "1" ]]; then _scoped_flags+=(--notify); fi
-    if (( urgent )); then _scoped_flags+=(--urgent); fi
-    exec sudo -n /usr/local/bin/5dive agent _deliver "${_scoped_flags[@]}" "$name" "$message"
+    # WRITTEN OUT, not assembled from an array. tests/a2a_round_cap_unit.sh pins
+    # the literal `_deliver --notify` argv in this source, and the reason it does
+    # is the reason to keep it: on this rail a flag that is silently dropped is a
+    # gate ping that gets refused, or an interrupt that quietly becomes an
+    # ordinary queued message. Four lines that can be read is the control.
+    if [[ "${_5DIVE_A2A_NOTIFY:-0}" == "1" ]]; then
+      if (( urgent )); then
+        exec sudo -n /usr/local/bin/5dive agent _deliver --notify --urgent "$name" "$message"
+      fi
+      exec sudo -n /usr/local/bin/5dive agent _deliver --notify "$name" "$message"
+    fi
+    if (( urgent )); then
+      exec sudo -n /usr/local/bin/5dive agent _deliver --urgent "$name" "$message"
+    fi
+    exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
   fi
 
   # DIVE-3318: the round cap. Placed AFTER the scoped-`_deliver` exec above, so a
@@ -3077,28 +3097,36 @@ cmd_send() {
   # mistake this ticket is about.
   if (( _sent )); then
     # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
-    # DIVE-4769: `urgent` is additive and appears only when the flag was passed,
-    # so a caller that never passes it reads the same keys it read before.
+    # DIVE-4769: an URGENT send gets its OWN renderer, and the ordinary rc=0
+    # receipt below is left byte-for-byte as DIVE-2362 promised it (and as
+    # tests/agent_send_unconfirmed_unit.sh T20 pins it in this source).
     #
-    # THE OPTIONAL KEYS ARE NOW BUILT WITH if/else, not `select(length>0)`, and
-    # that is a FIX this row could not avoid. jq drops the WHOLE object when any
-    # constructed value is `empty`, so on every send that did not have to --wake
-    # the target (AGENT_WAKE_READY unset, i.e. nearly all of them) this branch
-    # rendered an EMPTY JSON envelope — recorded on DIVE-4214's body as
-    # pre-existing and reproduced against pristine origin/main by
-    # tests/a2a_busy_queue_unit.sh, which asserts the success case on the PROSE
-    # line for exactly this reason. It is fixed here rather than filed because
-    # `urgent:` lands in this object: a field a caller cannot read is not a field.
-    # The queued branch below already had the correct form and is unchanged.
-    ok "sent to agent '$name'.${urgent_note:+ (}${urgent_note}${urgent_note:+)}" \
-       '({name:$n, sent:true, bytes:($p|length), woken:($w=="1")}
-         + (if ($rd|length) > 0 then {ready:$rd} else {} end)
-         + (if ($s|length) > 0 then {from:$s} else {} end)
-         + (if ($i|length) > 0 then {msg_id:$i} else {} end)
-         + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
-         + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end)
-         + (if $ur == "1" then {urgent:($ue=="1"), urgent_requested:true} else {} end))' \
-       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg ur "$urgent" --arg ue "$urgent_eff"
+    # Two things forced the split rather than one `+ (if $ur ...)`. The pin is a
+    # control on this expression and widening it to fit a new field is the thing
+    # this repo does not do mid-ship. And the pinned expression carries a known
+    # defect — jq drops the WHOLE object when any constructed value is `empty`,
+    # so with AGENT_WAKE_READY unset (nearly every send) it renders an EMPTY JSON
+    # envelope, recorded on DIVE-4214's body and the reason
+    # tests/a2a_busy_queue_unit.sh asserts the success case on the prose line.
+    # Inheriting that for `urgent:` would have shipped a field no caller could
+    # read. So the urgent branch uses the correct if/else form; fixing the
+    # ordinary one is a byte-compatibility decision that belongs to DIVE-2362's
+    # owner, not to this row.
+    if (( urgent )); then
+      ok "sent to agent '$name'.${urgent_note:+ (}${urgent_note}${urgent_note:+)}" \
+         '({name:$n, sent:true, bytes:($p|length), woken:($w=="1"), urgent:($ue=="1"), urgent_requested:true}
+           + (if ($rd|length) > 0 then {ready:$rd} else {} end)
+           + (if ($s|length) > 0 then {from:$s} else {} end)
+           + (if ($i|length) > 0 then {msg_id:$i} else {} end)
+           + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
+           + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end))' \
+         --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg ue "$urgent_eff"
+      return 0
+    fi
+    # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
+    ok "sent to agent '$name'." \
+       '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), ready:($rd|select(length>0)), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
+       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY"
   else
     if (( _queued )); then
       _summary="queued for agent '$name' — ${_reason}."
