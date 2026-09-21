@@ -767,7 +767,25 @@ _gate_gh_nocred() {
   # No rail at all is NOT "the query ran and found nothing" — there was nothing
   # to run it with. Returning 0 here made an unusable bot rail count as a
   # completed scan, which is the same laundering as a failed listing.
-  if ! _gate_gh_bot_ok; then
+  #
+  # DIVE-585: the rail is selected on AVAILABILITY, not PERMISSION. This asked
+  # `_gate_gh_bot_ok` — "may this seat run `_gh_do`" — and on a box holding the
+  # sudo grant with no `/etc/5dive/connectors/github-bot.env` the two answers are
+  # opposite: permitted, and not usable. The bot rail was therefore taken, `_gh_do`
+  # died on "machine-account credential missing", and the anonymous rail below —
+  # the one DIVE-2770 added precisely so a caller holding NOTHING can still read a
+  # public repo — was never reached. `_merge_landed_probe` hands us an EMPTY token
+  # and its own comment calls that read credential-free by construction; on such a
+  # box it was not. Measured 2026-09-21: `task merge-landed` refused on a pull
+  # request that had landed, while an unauthenticated read of the same public repo
+  # returned its `merged_at`. `_gate_gh_bot_present` is the predicate that was
+  # added (2026-09-18) for exactly this distinction, and until now only the
+  # selftest's reporting consulted it.
+  #
+  # The bot rail still wins whenever the connector IS present: `_gate_gh_bot_present`
+  # is `_gate_gh_bot_ok` AND the credential, so this can only ever ADD a rail to a
+  # seat that had none — it never diverts a call that would have been answered.
+  if ! _gate_gh_bot_present; then
     # DIVE-2770: LAST rail, and only reached when the caller holds nothing.
     # An unauthenticated read of a public repo answers "did this land" without
     # any grant at all; on a private repo it declines and we fall through to
@@ -780,7 +798,19 @@ _gate_gh_nocred() {
       printf '%s' "$_anon_out"
       return 0
     fi
-    _GATE_GH_LAST_ERR="no gh rail: no token, the gate bot is not usable here, and the anonymous rail could not answer (private repo, or a query it does not serve)"
+    # DIVE-585: name WHICH of the two bot states we are in. "not usable here"
+    # covers both "no grant" and "grant but no credential", and only the second has
+    # a provisioning step — the one `_gate_gh_bot_state` already spells, including
+    # the `secret write` that fixes it. Losing that hint is the one way this fix
+    # could cost a reader something the old message gave them.
+    #
+    # THE LEGACY SENTENCE IS PRESERVED VERBATIM and the state APPENDED, rather than
+    # the wording replaced. `tests/task_merge_gate_blind_credential_unit.sh` T6
+    # pins this substring on the ground that downstream refusals quote it, and a
+    # rewording would be a silent diagnostic regression in every one of them. The
+    # parenthesis is additive, so both readers are served.
+    local _bot_state; _bot_state="$(_gate_gh_bot_state)"
+    _GATE_GH_LAST_ERR="no gh rail: no token, the gate bot is not usable here (${_bot_state}), and the anonymous rail could not answer (private repo, or a query it does not serve)"
     _gate_gh_nocred_publish "$_sink"
     rm -f "$_errf" 2>/dev/null || true
     printf ''
