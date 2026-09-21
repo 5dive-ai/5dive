@@ -40,6 +40,7 @@ done
 # shellcheck source=/dev/null
 source "$SRC/cmd_agent.sh"
 # shellcheck source=/dev/null
+source "$SRC/lib/plugin_seats.sh"
 source "$SRC/cmd_agent_create.sh"
 # shellcheck source=/dev/null
 source "$SRC/cmd_agent_lifecycle.sh"
@@ -311,6 +312,40 @@ BOX_HOME="$AGENT_HOME_ROOT/agent-iso3294box"
 grep -q 'u:agent-iso3294box:--x' "$TMP/setfacl.log" 2>/dev/null \
   && ok_t "DIVE-1033 traverse-only ACL on /home/claude still granted to sandboxed" \
   || bad_t "sandboxed must still get its DIVE-1033 ACL" "$(cat "$TMP/setfacl.log" 2>/dev/null)"
+
+# ---- DIVE-4730: the plugin root is the OTHER path the group alone opens ------
+# A plugin is enabled for the BOX and its record is read per SEAT, so a seat
+# outside the shared group loses every enabled plugin verb (DIVE-4709) — and a
+# sandboxed seat is outside that group on purpose, so the repair cannot be the
+# group. Measured on two customer boxes (DIVE-4727): the single refusing
+# component was $STATE_DIR at 2750, everything below it already 2755.
+ISO_STATE="$TMP/state4730"; mkdir -p "$ISO_STATE/plugins/enabled"
+chmod 2750 "$ISO_STATE"; chmod 2755 "$ISO_STATE/plugins" "$ISO_STATE/plugins/enabled"
+: > "$TMP/setfacl.log"
+STATE_DIR="$ISO_STATE" create_agent_user iso4730box sandboxed >/dev/null 2>&1
+grep -qF "u:agent-iso4730box:--x $ISO_STATE" "$TMP/setfacl.log" \
+  && ok_t "DIVE-4730: a sandboxed seat is granted traverse on the refusing plugin-root ancestor" \
+  || bad_t "sandboxed seat must reach the box plugin record" "$(cat "$TMP/setfacl.log")"
+# SIZED BY WHAT REFUSES. Opening a directory makes every mode inside it
+# load-bearing, so a grant on an already-world-traversable component is not
+# harmless tidiness — it is a wider residual and a mode the next reader will
+# think is load-bearing when it is not.
+grep -qF "u:agent-iso4730box:--x $ISO_STATE/plugins" "$TMP/setfacl.log" \
+  && bad_t "the grant must skip already-traversable components" "granted on a 2755 directory" \
+  || ok_t "DIVE-4730: and NOT on the 2755 components, which already traverse"
+# The policy that makes this a repair rather than a sandbox escape: a named uid,
+# traverse only. `o+x` is smaller in bits and larger in principals; the group is
+# larger still, and the group is what the box's shared credentials are scoped to.
+grep -qE "u:agent-iso4730box:(r|w)" "$TMP/setfacl.log" \
+  && bad_t "the grant must be traverse-only" "$(cat "$TMP/setfacl.log")" \
+  || ok_t "DIVE-4730: the grant carries no read and no listing bit"
+
+: > "$TMP/setfacl.log"
+STATE_DIR="$ISO_STATE" create_agent_user iso4730std standard >/dev/null 2>&1
+grep -qF "u:agent-iso4730std" "$TMP/setfacl.log" \
+  && bad_t "a non-sandboxed seat needs no ACL — it is in the group" "$(cat "$TMP/setfacl.log")" \
+  || ok_t "DIVE-4730: a non-sandboxed seat gets NO ACL (group membership already reaches it)"
+
 unset -f adduser usermod setfacl write_admin_sudoers write_standard_sudoers seed_agent_git_identity
 unset AGENT_HOME_ROOT AGENT_SHARED_GROUP
 

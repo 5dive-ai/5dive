@@ -434,3 +434,89 @@ plugin_seat_unregistered_rows() {
     done
   done < <(plugin_seat_graded_rows)
 }
+
+# ---------------------------------------------------------------------------
+# DIVE-4730 — traverse-only access to the box plugin record, for a seat that is
+# outside the shared group ON PURPOSE.
+#
+# DIVE-4709 established that a seat which cannot READ $STATE_DIR/plugins/
+# installed.json loses every enabled plugin verb, and prescribed
+# `gpasswd -a agent-<seat> claude`. Reading two customer boxes (DIVE-4727)
+# showed the prescription is wrong for the only population it ever fires on.
+# On both boxes the record itself was already 0644 and every directory below
+# $STATE_DIR was already 2755: the single refusing component was $STATE_DIR
+# (2750 root:claude), and the single seat outside the group was the blind one.
+# Box 11's was the box's ONLY `isolation: sandboxed` seat, and DIVE-1033 takes
+# sandboxed seats out of that group deliberately — the group is what the box's
+# shared credentials are scoped to. Adding the seat back does not repair the
+# sandbox, it dissolves it.
+#
+# The create path already solved this exact shape one directory over: a
+# traverse-only ACL on /home/claude. Its own comment carries the argument, and
+# it applies unchanged here — `--x` on a NAMED principal is smaller in
+# permission bits AND smaller in principals than `chmod o+x`, which would hand
+# traversal to every uid on the box, and smaller than group membership, which
+# hands over the credentials group itself.
+#
+# THE GRANT IS SIZED BY WHAT REFUSES, not by the whole path. Only a component
+# with no o+x bit is touched: on both measured boxes that is exactly one
+# directory. Opening a directory makes every mode inside it load-bearing, so
+# the narrower the set, the smaller the residual (on box 11: the o+r files
+# directly under $STATE_DIR become reachable BY KNOWN PATH — pace-usage.json,
+# account-usage.json, cli-target.json, digest.json, usage-budgets.json,
+# browser-stack.status, the stamps. No secret is among them; `voice/config`'s
+# one credential-shaped line is a comment pointing at /etc. Re-run that read
+# before widening this to a path it was not sized against).
+
+# plugin_root_traverse_components <path> — the ancestors of <path>, INCLUSIVE,
+# that a uid in none of their groups cannot traverse today, top-down.
+#
+# Top-down and `-e`-guarded for the same reason _plugin_record_blocker_path is:
+# a stat below an untraversable parent fails for the parent's reason, so a
+# bottom-up walk cannot tell "absent" from "hidden". Stops at the first absent
+# component and emits nothing further — there is nothing to grant on a path
+# that does not exist yet.
+#
+# The test is the o+x bit and only that bit. A 2755 directory is already
+# traversable by every uid, so granting there would be a no-op ACL that makes
+# the next reader think the mode matters. `stat -c %a` prints 4 digits on a
+# setgid directory (2750), which is why this reads the LAST character rather
+# than masking a whole number.
+plugin_root_traverse_components() {
+  local target="${1:-}" p="" rest comp mode
+  [[ "$target" == /* ]] || return 0
+  rest="${target#/}"
+  while [[ -n "$rest" ]]; do
+    comp="${rest%%/*}"
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+    [[ -n "$comp" ]] || continue
+    p="$p/$comp"
+    [[ -e "$p" ]] || return 0
+    mode=$(stat -c '%a' "$p" 2>/dev/null) || return 0
+    (( ${mode: -1} & 1 )) || printf '%s\n' "$p"
+  done
+}
+
+# plugin_root_traverse_grant <user> <path> — setfacl -m u:<user>:--x on each of
+# those components. Prints every path it granted; returns 1 (and prints the
+# failures to stderr) if any setfacl refused, so a caller can warn precisely
+# instead of guessing which half landed.
+#
+# IDEMPOTENT by construction: `setfacl -m` on an entry that already exists is a
+# no-op, which is what lets the same helper serve the create path and the retro
+# pass for seats minted before it.
+plugin_root_traverse_grant() {
+  local user="${1:-}" target="${2:-}" p rc=0
+  [[ -n "$user" && -n "$target" ]] || return 0
+  command -v setfacl >/dev/null 2>&1 || { printf 'setfacl not installed\n' >&2; return 1; }
+  while read -r p; do
+    [[ -n "$p" ]] || continue
+    if setfacl -m "u:${user}:--x" "$p" 2>/dev/null; then
+      printf '%s\n' "$p"
+    else
+      printf '%s\n' "$p" >&2
+      rc=1
+    fi
+  done < <(plugin_root_traverse_components "$target")
+  return "$rc"
+}

@@ -1613,17 +1613,78 @@ _plugin_record_blocker_path() {
 
 # _plugin_record_blocked_message <blocker> — the sentence the two dead seats
 # should have been printing for a week.
+#
+# DIVE-4730. The first version prescribed `gpasswd -a <seat> <group>` flat, and
+# that is the repair for exactly one of the three shapes this fires on — a seat
+# that belongs in the shared group and drifted out. On both boxes where it was
+# measured (DIVE-4727) the blind seat was outside the group ON PURPOSE: box 11's
+# is the box's only `isolation: sandboxed` seat, which DIVE-1033 removes from
+# that group deliberately because the group is what the box's shared credentials
+# are scoped to. Telling its operator to add it back prescribes dissolving the
+# sandbox to fix a plugin verb.
+#
+# THIS RUNS AS THE BLIND SEAT, so it cannot answer "am I sandboxed?" the way
+# doctor does — the registry is 0640 root:<group> and a seat outside the group
+# cannot read it either. It branches on what the seat CAN observe about itself,
+# and the two observations happen to partition the cases that matter:
+#
+#   in the group, still blocked   membership is not the missing thing; the
+#                                 blocker's own mode is. Say so, and do not
+#                                 send the operator to gpasswd for an account
+#                                 that is already there.
+#   outside it, but /home/claude  that is the create path's sandbox signature —
+#   is traversable                a traverse-only ACL on a named principal, the
+#                                 one thing that grants this and nothing else.
+#                                 Prescribe the same grant here, and say in as
+#                                 many words not to reach for the group.
+#   outside it, no grant either   drift or an orphan, and the seat cannot tell
+#                                 which. Name both and hand the question to
+#                                 doctor, which reads the registry as root.
+#
+# The ACL is the safe prescription in ALL THREE: it is additive, reversible by
+# one `setfacl -x`, and it grants traverse on one directory to one named uid,
+# where the group grants that box's shared credential scope to an account.
+# The two observations, each its own function so the unit suite can grade the
+# branch without two real accounts and a real sandbox (same seam discipline as
+# doctor_record_probe_as).
+_plugin_seat_in_shared_group() {
+  id -nG 2>/dev/null | tr ' ' '\n' | grep -qxF "${AGENT_SHARED_GROUP:-claude}"
+}
+# The create path's sandbox signature: DIVE-1033 leaves a sandboxed seat out of
+# the shared group, and DIVE-1034's workaround grants it `u:<seat>:--x` on
+# /home/claude so it can exec the shared runtime. Nothing else on a 5dive box
+# produces "outside the group AND able to traverse claude's home".
+_plugin_seat_has_sandbox_grant() { [[ -x /home/claude ]]; }
+
 _plugin_record_blocked_message() {
-  local blocker="$1" rec who grp
+  local blocker="$1" rec who grp head fix
   rec="$(_plugin_installed_json)"
   who="$(id -un 2>/dev/null || printf 'uid %s' "${EUID:-?}")"
   grp="${AGENT_SHARED_GROUP:-claude}"
-  printf '%s' "this seat cannot read the box's plugin record ($rec): $blocker refuses $who. \
+  head="this seat cannot read the box's plugin record ($rec): $blocker refuses $who. \
 Every enabled plugin verb therefore reads as \"unknown command\" here even though the box has them \
 enabled, and any unit that runs one fails on every fire. This is per-seat visibility, NOT a missing \
-install — do not reinstall the plugin. Fix on the box, as root: add the account to the shared group \
-(gpasswd -a $who $grp) and make the record readable (chmod 644 $rec; chmod o+x or g+x each directory \
-above it). 'sudo 5dive doctor' reports which seats are affected."
+install — do not reinstall the plugin."
+  if _plugin_seat_in_shared_group; then
+    fix="$who is ALREADY in group $grp and is still refused, so group membership is not what is \
+missing — the mode on $blocker is. Fix on the box, as root: chmod g+x $blocker (and chmod 644 $rec \
+if the record itself is the blocker)."
+  elif _plugin_seat_has_sandbox_grant; then
+    fix="$who is outside group $grp and can still traverse /home/claude, which is the signature of a \
+SANDBOXED seat: 5dive keeps those out of the shared group on purpose, because that group is what this \
+box's shared credentials are scoped to. Do NOT add this account to $grp — that would dissolve the \
+sandbox to fix a plugin verb. Grant the same traverse-only access it already has on /home/claude, as \
+root: setfacl -m u:$who:--x $blocker (reverse: setfacl -x u:$who $blocker)."
+  else
+    fix="$who is outside group $grp. If this seat is a registered, non-sandboxed one that drifted out, \
+the repair is the group: gpasswd -a $who $grp. If it is SANDBOXED it is outside on purpose and the \
+group would dissolve the sandbox; if it has no registry entry at all it is an orphan account and \
+should be reaped, not granted. Either way the narrow grant is safe and reversible, as root: \
+setfacl -m u:$who:--x $blocker."
+  fi
+  printf '%s %s %s' "$head" "$fix" \
+    "'sudo 5dive doctor --category=plugins' reads the registry as root and says which of those this \
+seat is, and --fix applies the sandboxed repair in place."
 }
 
 # _plugin_dispatch_verb <verb> [args...]
