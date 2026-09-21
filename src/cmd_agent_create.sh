@@ -54,6 +54,23 @@ create_agent_user() {
     if ! setfacl -m "u:${user}:--x" /home/claude 2>/dev/null; then
       warn "setfacl failed granting ${user} traverse on /home/claude — install the 'acl' package, then re-run"
     fi
+    # DIVE-4730: the SAME grant, for the same reason, on the other path a
+    # sandboxed seat needs and the shared group is the only thing that opens —
+    # the box plugin record. A plugin is enabled for the BOX and its record is
+    # read per SEAT, so a seat outside the group loses EVERY enabled plugin
+    # verb (DIVE-4709), silently, and any unit running one fails on every fire.
+    # $STATE_DIR is 2750 root:<group> on a stock install; everything under it is
+    # already 2755, so in practice this grants on exactly one directory and
+    # no-ops on the rest. Deliberately NOT `gpasswd -a`: that is the repair for
+    # a seat that fell OUT of the group, and this seat was never in it —
+    # DIVE-1033 keeps sandboxed seats out because the group is what the box's
+    # shared credentials are scoped to.
+    local _pr_granted
+    if _pr_granted=$(plugin_root_traverse_grant "$user" "${STATE_DIR:-/var/lib/5dive}/plugins" 2>/dev/null); then
+      [[ -z "$_pr_granted" ]] || step "granted ${user} traverse-only on $(tr '\n' ' ' <<<"$_pr_granted" | sed 's/ $//') (box plugin record, DIVE-4730)"
+    else
+      warn "could not grant ${user} traverse on the box plugin record under ${STATE_DIR:-/var/lib/5dive}/plugins — every plugin verb enabled on this box will read as 'unknown command' for this seat, and any unit running one will fail on every fire (DIVE-4730). Install the 'acl' package and re-run, or grant by hand: setfacl -m u:${user}:--x ${STATE_DIR:-/var/lib/5dive}"
+    fi
   fi
   # Admin gets sudo SCOPED to fleet-management ops (not blanket root). standard
   # gets a NARROW grant for real-time inter-agent send (DIVE-1065: ONLY the

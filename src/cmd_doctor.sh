@@ -626,6 +626,66 @@ doctor_verb_claiming_plugins() {
          | .key' "$rec" 2>/dev/null | tr '\n' ' ' | sed 's/ $//'
 }
 
+# DIVE-4730 — WHICH repair a blind seat needs is a question about the seat, not
+# about the record. DIVE-4709 printed one prescription for every blind seat:
+# `gpasswd -a agent-<seat> claude`. That is the repair for DRIFT — a seat that
+# belongs in the shared group and fell out of it. Reading the two boxes where
+# this check fires (DIVE-4727) found no drift at all. Both blind seats were
+# outside the group on purpose or by abandonment:
+#
+#   sandboxed     DIVE-1033 removes it from the group deliberately, because the
+#                 group is what the box's shared credentials are scoped to.
+#                 Adding it back does not repair the sandbox, it dissolves it.
+#                 Repair: the traverse-only ACL the create path already writes
+#                 for /home/claude, on the components of the plugin root that
+#                 refuse (DIVE-4730).
+#   unregistered  a de-registered seat whose unix account survived — one of the
+#                 orphans `doctor --category=registry` already names. Handing a
+#                 de-registered account the credentials group is worse than the
+#                 blindness. Repair: reap it.
+#   otherwise     drift, and DIVE-4709's prescription is right.
+#
+# Returns "<class>\t<sentence>".
+doctor_record_repair_for() {
+  local name="$1" rec="$2" grp="${AGENT_SHARED_GROUP:-claude}" tier blockers
+  tier="$(agent_tier "$name" 2>/dev/null || printf 'unknown:lookup-failed')"
+  blockers="$(plugin_root_traverse_components "$(dirname "$rec")" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+  [[ -n "$blockers" ]] || blockers="$(dirname "$rec")"
+  case "$tier" in
+    sandboxed)
+      printf 'sandboxed\tagent-%s is SANDBOXED: it is outside group %s on purpose (DIVE-1033 — that group is what this box'"'"'s shared credentials are scoped to), so do NOT add it back. Grant traverse-only, as root: setfacl -m u:agent-%s:--x %s (reverse: setfacl -x u:agent-%s %s). That is the same grant the create path already writes for /home/claude, and `sudo 5dive doctor --category=plugins --fix` applies it here\n' \
+        "$name" "$grp" "$name" "$blockers" "$name" "$blockers" ;;
+    unknown:unregistered)
+      printf 'orphan\tagent-%s has NO registry entry — it is an orphan account, not a seat, and `agent rm` cannot reach it. Do NOT add it to group %s; reap it instead: sudo 5dive doctor --category=registry --fix (DIVE-4340, destructive — it deletes the account and quarantines the home)\n' \
+        "$name" "$grp" ;;
+    unknown:*)
+      printf 'unmeasured\tagent-%s'"'"'s isolation could not be read from the registry (%s), so which repair it needs is UNKNOWN — a sandboxed seat and a drifted one look identical from here and their repairs are opposites. Read the registry first, then apply one\n' \
+        "$name" "${tier#unknown:}" ;;
+    *)
+      printf 'drift\tagent-%s is a registered %s seat that belongs in group %s and is not in it. Fix, as root: gpasswd -a agent-%s %s; chmod 644 %s; and make every directory above it traversable by that group\n' \
+        "$name" "$tier" "$grp" "$name" "$grp" "$rec" ;;
+  esac
+}
+
+# DIVE-4730 — `agent-*` accounts the registry does not know. The DIVE-4709 check
+# graded `plugin_seat_graded_rows`, which is the REGISTRY, so on box 10 it was
+# green while that box's one blind seat sat right there: `agent-mp`, blind since
+# 2026-09-16, absent from the registry, with a probe timer firing into a journal
+# nobody reads. A check whose population cannot contain the case it was written
+# for is not evidence about that case. These are graded and reported separately
+# — they are a different defect with a different repair.
+doctor_record_orphan_candidates() {
+  local known line user name
+  known=" $(doctor_registry_seat_names) "
+  [[ "$known" != "  " ]] || return 0
+  while IFS= read -r line; do
+    user="${line%%:*}"; name="${user#agent-}"
+    [[ -n "$name" ]] || continue
+    [[ "$known" == *" $name "* ]] && continue
+    printf '%s\n' "$name"
+  done < <(doctor_orphan_passwd_users)
+}
+
 doctor_check_plugin_record_visibility() {
   local rec; rec="$(_plugin_installed_json)"
   if [[ ! -e "$rec" ]]; then
@@ -652,14 +712,52 @@ doctor_check_plugin_record_visibility() {
     esac
   done < <(plugin_seat_graded_rows 2>/dev/null)
 
+  # The other population, graded the same way and reported on its own line.
+  local -a orphan_blind=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    [[ "$(doctor_record_probe_as "agent-$name" "$rec")" == BLOCKED ]] && orphan_blind+=("$name")
+  done < <(doctor_record_orphan_candidates 2>/dev/null)
+  if (( ${#orphan_blind[@]} )); then
+    doctor_add plugins record-visibility-orphans warn \
+      "${#orphan_blind[@]} agent-* account(s) with NO registry entry also cannot read $rec: ${orphan_blind[*]} — their plugin-verb units (a probe timer, a status unit) fail on every fire into a journal nobody reads. This is NOT the seat repair: do not add a de-registered account to ${AGENT_SHARED_GROUP:-claude}. Reap them: sudo 5dive doctor --category=registry --fix (DIVE-4340, destructive)" \
+      false false
+  fi
+
   if (( seats == 0 )); then
     doctor_add plugins record-visibility warn \
       "UNKNOWN: no agent seat could be graded (none registered, or none with a home on this box) — nothing was measured, which is not the same as clean"
     return 0
   fi
   if (( ${#blind[@]} )); then
+    # DIVE-4730 — the repair is per seat, because the seats are not one
+    # population. Apply the sandboxed one under --fix: it is additive,
+    # reversible by one `setfacl -x`, idempotent on a seat that already has it,
+    # and it is exactly what the create path writes for a seat minted today.
+    # The other two classes are NOT auto-healed: `gpasswd -a` changes what a
+    # credentials group contains and reaping deletes an account.
+    local -a repairs=() healed=()
+    local cls sentence
+    for name in "${blind[@]}"; do
+      IFS=$'\t' read -r cls sentence < <(doctor_record_repair_for "$name" "$rec")
+      if (( DOCTOR_REPAIR )) && [[ "$cls" == sandboxed ]] \
+         && plugin_root_traverse_grant "agent-$name" "$(dirname "$rec")" >/dev/null 2>&1 \
+         && [[ "$(doctor_record_probe_as "agent-$name" "$rec")" == READ ]]; then
+        healed+=("$name")
+      else
+        repairs+=("$sentence")
+      fi
+    done
+    if (( ${#healed[@]} )) && (( ${#repairs[@]} == 0 )); then
+      doctor_add plugins record-visibility warn \
+        "${#healed[@]} sandboxed seat(s) could not read $rec and were granted traverse-only access in place (${healed[*]}) — every enabled plugin verb ($verbs) is reachable from them now, and they are still outside group ${AGENT_SHARED_GROUP:-claude}. Reverse one with: setfacl -x u:agent-<seat> $(dirname "$rec") (DIVE-4730)" \
+        true true
+      return 0
+    fi
+    local healed_clause=""
+    (( ${#healed[@]} )) && healed_clause=" (${#healed[@]} sandboxed seat(s) were repaired in place: ${healed[*]})"
     doctor_add plugins record-visibility error \
-      "${#blind[@]} of $seats seat(s) cannot read $rec: ${blind[*]} — for those seats EVERY enabled plugin verb ($verbs) is unreachable, so any unit running one fails on every fire and whatever it feeds (a connected-sites tile, a status probe) silently never updates. Fix, as root, per seat: gpasswd -a agent-<seat> ${AGENT_SHARED_GROUP:-claude}; chmod 644 $rec; and make every directory above $rec traversable by that group. Reinstalling the plugin does NOT fix this — the plugin is already enabled box-wide" \
+      "${#blind[@]} of $seats seat(s) cannot read $rec: ${blind[*]} — for those seats EVERY enabled plugin verb ($verbs) is unreachable, so any unit running one fails on every fire and whatever it feeds (a connected-sites tile, a status probe) silently never updates. Reinstalling the plugin does NOT fix this — the plugin is already enabled box-wide. The repair differs per seat and two of the three are NOT group membership: $(printf '%s ' "${repairs[@]}" | sed 's/ $//')${healed_clause}" \
       false false
     return 0
   fi
