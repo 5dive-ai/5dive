@@ -96,7 +96,15 @@ has   "the PR-leg warn names the actor"       "$S" "5dive-bot"
 # The PR leg must stay NON-fatal and stay AFTER the push: that ordering is what makes
 # "the branch is up" true when the warn fires. A regression here is silent otherwise.
 has   "the PR leg is still called after the delegated push" "$S" '_push_open_pr "$ident" "$slug" "$branch"'
-if grep -q 'if ! _push_open_pr' "$SRC/cmd_push.sh"; then ok_ "the PR leg is still non-fatal (warn, not fail)"; else bad_ "the PR leg is still non-fatal" "no 'if ! _push_open_pr' guard"; fi
+# DIVE-4748 iteration 2. This arm used to be `grep -q 'if ! _push_open_pr'`, which
+# graded the SHAPE of the branch and not its body: turning the failure handler from
+# `warn` into `fail` leaves that conditional exactly as it was, so the arm stayed
+# green through the very regression its comment calls silent. Assert the CONTENT of
+# the handler instead — the thing that makes the leg non-fatal is the verb in front
+# of the message, so name the verb and the message together, and forbid the fatal
+# twin so a handler carrying both cannot read as a pass.
+has   "the PR leg is still non-fatal (warn, not fail)" "$S" 'warn "the BRANCH IS UP'
+hasnt "the PR-leg failure does not exit fatal"         "$S" 'fail "$E_GENERIC" "the BRANCH IS UP'
 
 printf '\n%s arms: %s pass, %s fail\n' "$((PASS+FAIL))" "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
