@@ -112,15 +112,21 @@ _GRADER_READING_MAX_AGE="${_GRADER_READING_MAX_AGE:-${QUOTA_SNAPSHOT_MAX_AGE:-60
 # statement about the week, and there is no 24-hour span in which it becomes a
 # different number by more than the floor's own granularity.
 #
-# So the weekly window gets its own fence, 24h. This is NOT the one-directional
+# So the weekly window gets its own fence. DIVE-4777 sets it at 4h, not the 24h
+# this first shipped with: the drift figure above is the whole justification, and
+# ~0.6 %/h over 24h is ~14 points against a `_GRADER_FLOOR_7D` of 90 — a fence
+# six times looser than the reason given for it. This widening can OPEN dispatch
+# as well as close it, so the fence has to be no wider than the number that
+# argues for it: 4h is ~2.4 points, inside the floor's own granularity.
+# This is NOT the one-directional
 # lower bound of DIVE-4586 (`_pace_account_seven_bound`, further down) and does
 # not replace it: that admits an EXPIRED-fence reading in the raise-only
 # direction. This widens the fence itself for one window, so an accepted weekly
 # reading is an ordinary reading and may open as well as close. The reason that
 # is sound here and was refused for the 5-hour window (DIVE-4578, DIVE-4342) is
 # the drift rate above, and only that — keep the two numbers apart.
-_GRADER_READING_WEEKLY_MAX_AGE="${_GRADER_READING_WEEKLY_MAX_AGE:-${QUOTA_SNAPSHOT_WEEKLY_MAX_AGE:-86400}}"
-[[ "$_GRADER_READING_WEEKLY_MAX_AGE" =~ ^[0-9]+$ ]] || _GRADER_READING_WEEKLY_MAX_AGE=86400
+_GRADER_READING_WEEKLY_MAX_AGE="${_GRADER_READING_WEEKLY_MAX_AGE:-${QUOTA_SNAPSHOT_WEEKLY_MAX_AGE:-14400}}"
+[[ "$_GRADER_READING_WEEKLY_MAX_AGE" =~ ^[0-9]+$ ]] || _GRADER_READING_WEEKLY_MAX_AGE=14400
 # A weekly fence NARROWER than the 5-hour one would be a misconfiguration that
 # silently blinds the window this knob exists to open; the wider of the two wins.
 (( _GRADER_READING_WEEKLY_MAX_AGE >= _GRADER_READING_MAX_AGE )) \

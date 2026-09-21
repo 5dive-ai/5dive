@@ -15,7 +15,8 @@
 #      reparented to pid 1 — stays in its unit's cgroup and is still collected,
 #      which is the arm that keeps this fix from being a regression.
 #   B. The pacing floor's WEEKLY verdict is fenced at the weekly window's own
-#      drift rate (24h), not the 5-hour window's (600s). The 5-hour verdict is
+#      drift rate (4h — DIVE-4777 narrowed it from the 24h this first shipped
+#      with), not the 5-hour window's (600s). The 5-hour verdict is
 #      unmoved — arm B3 is the one that fails if someone "simplifies" the two
 #      fences back into one.
 #   C. The distiller child gets the seat token even when its uid CANNOT read the
@@ -54,26 +55,75 @@ echo "== A: cgroup membership is the reaper's scope, not the uid =="
 
 # v2: one line, `0::<path>`. The seat's own unit.
 CG_V2_SEAT=$'0::/system.slice/system-5dive\\x2dagent.slice/5dive-agent@marcus.service'
+REF_V2_SEAT='/system.slice/system-5dive\x2dagent.slice/5dive-agent@marcus.service'
 # v1: several controllers, same path. Still the seat's unit.
-CG_V1_SEAT=$'12:pids:/system.slice/5dive-agent@marcus.service\n1:name=systemd:/system.slice/5dive-agent@marcus.service'
+CG_V1_SEAT=$'12:pids:/system.slice/system-5dive\\x2dagent.slice/5dive-agent@marcus.service\n1:name=systemd:/system.slice/system-5dive\\x2dagent.slice/5dive-agent@marcus.service'
 # The victim of the incident: a service with User=agent-marcus, its own unit.
 CG_SERVICE=$'0::/system.slice/mp-staging.service'
 # A sibling seat. Same slice family, different instance.
 CG_OTHER_SEAT=$'0::/system.slice/5dive-agent@quinn.service'
 # A user session — what a hand-run shell lands in.
 CG_USER=$'0::/user.slice/user-1001.slice/session-3.scope'
+# DIVE-4777. The `claude` seat, which `_reap_at_task_boundary` ADMITS and which
+# has no `5dive-agent@` unit at all: 16 such units exist on the box and none is
+# its. These are the real strings, measured 2026-09-21.
+CG_CLAUDE=$'0::/user.slice/user-1000.slice/user@1000.service/init.scope'
+REF_CLAUDE='/user.slice/user-1000.slice/user@1000.service/init.scope'
+# A `claude`-uid process in a service of its own — shares the uid, not the seat.
+CG_CLAUDE_SVC=$'0::/system.slice/zerohuman.service'
+# A child scope nested under the seat's reference cgroup.
+CG_NESTED=$'0::/system.slice/system-5dive\\x2dagent.slice/5dive-agent@marcus.service/task.scope'
 
-_reap_cgroup_is_seat "$CG_V2_SEAT"    marcus && ok "cgroup v2, seat's own unit -> in"    || bad "cgroup v2, seat's own unit" "read as OUT"
-_reap_cgroup_is_seat "$CG_V1_SEAT"    marcus && ok "cgroup v1, seat's own unit -> in"    || bad "cgroup v1, seat's own unit" "read as OUT"
-_reap_cgroup_is_seat "$CG_SERVICE"    marcus && bad "service unit under the seat's uid" "read as IN — this is the incident" || ok "service unit under the seat's uid -> out"
-_reap_cgroup_is_seat "$CG_OTHER_SEAT" marcus && bad "another seat's unit" "read as IN"   || ok "another seat's unit -> out"
-_reap_cgroup_is_seat "$CG_USER"       marcus && bad "user session scope" "read as IN"    || ok "user session scope -> out"
+_reap_cgroup_in_ref "$CG_V2_SEAT"    "$REF_V2_SEAT" && ok "cgroup v2, seat's own unit -> in"    || bad "cgroup v2, seat's own unit" "read as OUT"
+_reap_cgroup_in_ref "$CG_V1_SEAT"    "$REF_V2_SEAT" && ok "cgroup v1, seat's own unit -> in"    || bad "cgroup v1, seat's own unit" "read as OUT"
+_reap_cgroup_in_ref "$CG_NESTED"     "$REF_V2_SEAT" && ok "a scope nested under the seat -> in" || bad "a scope nested under the seat" "read as OUT"
+_reap_cgroup_in_ref "$CG_SERVICE"    "$REF_V2_SEAT" && bad "service unit under the seat's uid" "read as IN — this is the incident" || ok "service unit under the seat's uid -> out"
+_reap_cgroup_in_ref "$CG_OTHER_SEAT" "$REF_V2_SEAT" && bad "another seat's unit" "read as IN"   || ok "another seat's unit -> out"
+_reap_cgroup_in_ref "$CG_USER"       "$REF_V2_SEAT" && bad "user session scope" "read as IN"    || ok "user session scope -> out"
+
+# ── DIVE-4777: the seat the caller ADMITS but the old predicate could not name ──
+# THE REGRESSION ARM. Against the pre-fix tree the first of these is a NO MATCH
+# for every candidate, so the `claude` seat reaped nothing, permanently and
+# without a word. "Fails closed" is a safety property only for the identifiers
+# the predicate can match.
+_reap_cgroup_in_ref "$CG_CLAUDE"     "$REF_CLAUDE"  && ok "the claude seat's own cgroup -> in"  || bad "the claude seat's own cgroup" "read as OUT — the DIVE-4776 hole"
+_reap_cgroup_in_ref "$CG_CLAUDE_SVC" "$REF_CLAUDE"  && bad "a claude-uid service" "read as IN"  || ok "a claude-uid service (zerohuman) -> out"
+_reap_cgroup_in_ref "$CG_V2_SEAT"    "$REF_CLAUDE"  && bad "an agent unit vs the claude ref" "read as IN" || ok "an agent unit is not in the claude ref -> out"
+
 # Fails CLOSED. Every unreadable answer is OUT: no /proc, a pid that exited
 # between `ps` and the read, a layout we do not recognise.
-_reap_cgroup_is_seat ""               marcus && bad "empty cgroup text" "read as IN — must fail closed" || ok "empty cgroup text -> out (fails closed)"
-_reap_cgroup_is_seat "$CG_V2_SEAT"    ""     && bad "empty seat name" "read as IN"       || ok "empty seat name -> out (fails closed)"
-# A seat whose name is a PREFIX of another must not match it.
-_reap_cgroup_is_seat "$CG_V2_SEAT"    marc   && bad "prefix seat name" "matched marcus's unit" || ok "prefix seat name -> out"
+_reap_cgroup_in_ref ""               "$REF_V2_SEAT" && bad "empty cgroup text" "read as IN — must fail closed" || ok "empty cgroup text -> out (fails closed)"
+_reap_cgroup_in_ref "$CG_V2_SEAT"    ""             && bad "empty reference" "read as IN"       || ok "empty reference -> out (fails closed)"
+_reap_cgroup_in_ref $'1:cpu\n'       "$REF_V2_SEAT" && bad "unparseable cgroup text" "read as IN" || ok "unparseable cgroup text -> out (fails closed)"
+# The boundary is a PATH COMPONENT, not a substring: a seat whose name is a
+# prefix of another must not match it, and neither must a sibling scope whose
+# name merely starts with the reference.
+_reap_cgroup_in_ref "$CG_V2_SEAT" '/system.slice/system-5dive\x2dagent.slice/5dive-agent@marc.service' \
+  && bad "prefix seat name" "matched marcus's unit" || ok "prefix seat name -> out"
+_reap_cgroup_in_ref $'0::/system.slice/foo.service-extra' '/system.slice/foo.service' \
+  && bad "sibling path sharing a string prefix" "read as IN" || ok "sibling path sharing a string prefix -> out"
+
+echo "== A: the reference cgroup is RESOLVED, not formatted from the seat name =="
+# Our OWN seat resolves through /proc/self/cgroup — the only resolution that is
+# correct for `claude` and `agent-*` alike.
+_REAP_SELF_CGROUP_CMD=fake_self; fake_self() { printf '%s' "$CG_CLAUDE"; }
+# `\x2d` is systemd's escaping of the `-` in the slice name, so the fixture must
+# emit it LITERALLY — `printf '%s'`, never a format string printf would unescape.
+AGENT_SLICE='/system.slice/system-5dive\x2dagent.slice'
+_REAP_UNIT_CGROUP_CMD=fake_unit; fake_unit() { printf '%s/%s' "$AGENT_SLICE" "$1"; }
+USER=claude
+is "own seat (claude) resolves to its own cgroup" "$(_reap_seat_ref_cgroup claude)" "$REF_CLAUDE"
+USER=agent-marcus
+# Same branch for an `agent-*` seat: /proc/self/cgroup, not the unit name — the
+# stub returns the same fixture, so a match here IS the self branch being taken.
+is "own seat (agent-*) takes the self branch too" "$(_reap_seat_ref_cgroup marcus)" "$REF_CLAUDE"
+# Another seat: systemd is ASKED for the unit's control group.
+is "another seat resolves through systemd" "$(_reap_seat_ref_cgroup quinn)" \
+   '/system.slice/system-5dive\x2dagent.slice/5dive-agent@quinn.service'
+# Unresolvable -> empty -> nothing is reaped (checked at the call site below).
+fake_unit() { printf ''; }
+is "an unknown unit resolves to nothing" "$(_reap_seat_ref_cgroup nosuch)" ""
+fake_unit() { printf '%s/%s' "$AGENT_SLICE" "$1"; }
 
 echo "== A: the acting reaper, on a fabricated table =="
 # One row per process. PID 9001 is the incident's victim, 9002 the runaway the
@@ -97,6 +147,9 @@ fixture_cgroup() {
   esac
 }
 _REAP_CGROUP_CMD=fixture_cgroup
+# The pass resolves its reference once; `agent-marcus` is not this runner's own
+# seat, so it takes the systemd branch, stubbed above.
+USER=someone-else
 # `_reap_stale_shells` asks `id -u <seat_user>` to refuse an unknown seat. The
 # fixture seat does not exist on any runner, so the lookup is stubbed — this is
 # the ONLY host fact the section needs, and stubbing it is what keeps the
@@ -113,6 +166,7 @@ has "the reparented runaway is still collected"   "$err" "pid=9003"
 hasnt "the service under the seat's uid is spared" "$err" "pid=9001"
 hasnt "another seat's shell is spared"             "$err" "pid=9004"
 has "the spared-by-cgroup count is reported, not silent" "$err" "2 process(es) of uid agent-marcus left alone"
+has "the message names the resolved cgroup, not a unit name" "$err" "5dive-agent@marcus.service)"
 # The audit row's new payload: a count cannot be traced back to what died.
 # The victim list has to cross a command substitution to reach the audit row —
 # every call site invokes the reaper inside `$( )`, so a global cannot carry it.
@@ -126,23 +180,44 @@ else
   bad "call site: the audit row carries the victim list" "not found in src/lib/reap.sh"
 fi
 
+# DIVE-4777: an UNRESOLVABLE reference still reaps nothing — but says so. The
+# pre-fix shape of this exact state (the `claude` seat) was a wordless 0.
+fake_unit() { printf ''; }
+n_blind=$(reap_report); err_blind=$(cat "$TMPD/reap.err")
+is  "unresolvable reference reaps nothing (fails closed)" "$n_blind" "0"
+has "…and says so instead of being silent" "$err_blind" "no resolvable cgroup, nothing reaped"
+fake_unit() { printf '%s/%s' "$AGENT_SLICE" "$1"; }
+
 echo "== A: MUTANT — uid membership, the pre-fix behaviour =="
 # Re-introduce the defect in the narrowest possible way: membership becomes the
 # uid again. If the guard were not load-bearing, this would change nothing.
-_reap_in_seat_unit() { return 0; }
+_reap_in_cgroup() { return 0; }
 n_mut=$(reap_report)
 err_mut=$(cat "$TMPD/reap.err")
 is  "MUTANT: uid-scoped reaper takes all four" "$n_mut" "4"
 has "MUTANT: it kills the service — the incident" "$err_mut" "pid=9001"
 if [[ "$n_mut" == "$n" ]]; then bad "MUTANT differential" "mutant and fixed tree agree ($n) — arm A is vacuous"; else ok "MUTANT differential: fixed=$n mutant=$n_mut"; fi
-unset -f _reap_in_seat_unit id _reap_seat_table
+unset -f _reap_in_cgroup id _reap_seat_table
 
 # The fix must be WIRED, not merely defined: the call site has to consult it.
-if grep -q '_reap_in_seat_unit "$pid" "$seat_name"' src/lib/reap.sh; then
-  ok "call site: the candidate loop consults unit membership"
+if grep -q '_reap_in_cgroup "$pid" "$ref_cgroup"' src/lib/reap.sh; then
+  ok "call site: the candidate loop consults the RESOLVED cgroup"
 else
-  bad "call site: the candidate loop consults unit membership" "not found in src/lib/reap.sh"
+  bad "call site: the candidate loop consults the RESOLVED cgroup" "not found in src/lib/reap.sh"
 fi
+# DIVE-4777 MUTANT, the exact pre-fix predicate: a formatted unit-name literal.
+# It answers identically for `agent-*` and is wrong for `claude` — which is why
+# 46 arms were green while one admitted seat reaped nothing.
+_reap_cgroup_in_ref_pre() { [[ -n "$1" && -n "$2" ]] || return 1; [[ "$1" == *"/5dive-agent@$2.service"* ]]; }
+if _reap_cgroup_in_ref_pre "$CG_CLAUDE" claude; then
+  bad "MUTANT: the pre-fix literal predicate" "matched the claude seat — the fixture is wrong"
+else
+  ok "MUTANT: the pre-fix literal predicate reads the claude seat as OUT (the defect)"
+fi
+_reap_cgroup_in_ref_pre "$CG_V2_SEAT" marcus \
+  && ok "MUTANT: …while answering correctly for agent-marcus (why the suite was green)" \
+  || bad "MUTANT: agent-marcus under the pre-fix predicate" "read as OUT"
+unset -f _reap_cgroup_in_ref_pre
 
 # ═══════════════════ B — the weekly pacing fence ═══════════════════
 echo "== B: the weekly window is fenced at its own drift rate =="
@@ -164,10 +239,15 @@ p=$(pair "$(reading 700 "$FUTURE")")
 is "700s: 5h blind, weekly measured"        "$p" "${US}64"
 p=$(pair "$(reading 10800 "$FUTURE")")
 is "3h: 5h blind, weekly measured"          "$p" "${US}64"
+p=$(pair "$(reading 14399 "$FUTURE")")
+is "just inside 4h: weekly still measured"  "$p" "${US}64"
+# DIVE-4777 reversed in place: 86399s used to be INSIDE the fence and is now
+# outside it. The arm is kept (not deleted) with its reason corrected, so the
+# narrowing is the thing that is graded rather than silently unpinned.
 p=$(pair "$(reading 86399 "$FUTURE")")
-is "just inside 24h: weekly still measured" "$p" "${US}64"
-p=$(pair "$(reading 90000 "$FUTURE")")
-is "25h: nothing — past the weekly fence"   "$p" ""
+is "24h: nothing — the old fence is gone"   "$p" ""
+p=$(pair "$(reading 18000 "$FUTURE")")
+is "5h: nothing — past the weekly fence"    "$p" ""
 p=$(pair "$(reading -600 "$FUTURE")")
 is "a reading from the future is nothing"   "$p" ""
 # The reset fence is untouched and still outranks the age fence: a percentage
@@ -180,8 +260,8 @@ fixture_reading() { printf '%s' "$FIXTURE_RL"; }
 _PACE_READING_JSON_CMD=fixture_reading
 FIXTURE_RL=$(reading 10800 "$FUTURE")
 is "_pace_account_seven: 3h old -> the value, not blind" "$(_pace_account_seven acct "$NOW")" "64${US}${FUTURE}"
-FIXTURE_RL=$(reading 90000 "$FUTURE")
-is "_pace_account_seven: 25h old -> blind"               "$(_pace_account_seven acct "$NOW")" ""
+FIXTURE_RL=$(reading 18000 "$FUTURE")
+is "_pace_account_seven: 5h old -> blind"                "$(_pace_account_seven acct "$NOW")" ""
 FIXTURE_RL=$(reading 10800 "$(( NOW - 10 ))")
 is "_pace_account_seven: turned-over window -> blind"    "$(_pace_account_seven acct "$NOW")" ""
 
@@ -190,8 +270,16 @@ _GRADER_READING_WEEKLY_MAX_AGE="$_GRADER_READING_MAX_AGE"
 FIXTURE_RL=$(reading 10800 "$FUTURE")
 is "MUTANT: 3h weekly reads blind again"  "$(_pace_account_seven acct "$NOW")" ""
 is "MUTANT: 3h pair is empty again"       "$(pair "$(reading 10800 "$FUTURE")")" ""
-_GRADER_READING_WEEKLY_MAX_AGE=86400
+_GRADER_READING_WEEKLY_MAX_AGE=14400
 is "fence restored"                       "$(_pace_account_seven acct "$NOW")" "64${US}${FUTURE}"
+# DIVE-4777: the NUMBER is the finding, so it is pinned at its source. ~0.6 %/h
+# of weekly drift over 24h is ~14 points against _GRADER_FLOOR_7D=90; over 4h it
+# is ~2.4. A future widening has to argue past this arm.
+if grep -qE '^_GRADER_READING_WEEKLY_MAX_AGE="\$\{_GRADER_READING_WEEKLY_MAX_AGE:-\$\{QUOTA_SNAPSHOT_WEEKLY_MAX_AGE:-14400\}\}"$' src/task/grader_pool.sh; then
+  ok "the weekly fence default is 14400s (4h), not 86400s"
+else
+  bad "the weekly fence default is 14400s (4h), not 86400s" "src/task/grader_pool.sh does not read 14400"
+fi
 # The two fences must not be the same number, or B3 grades nothing.
 if (( _GRADER_READING_WEEKLY_MAX_AGE > _GRADER_READING_MAX_AGE )); then
   ok "the weekly fence is wider than the 5-hour fence"
@@ -290,8 +378,9 @@ done
 ( export CONNECTORS_DIR="$TMPD/nope/connectors" STATE_DIR="$TMPD/nope/state" \
          ENV_DIR="$TMPD/nope/agents.d" SELF_BIN="$TMPD/nope/5dive"
   r=0
-  _reap_cgroup_is_seat "$CG_SERVICE" marcus && r=1
-  _reap_cgroup_is_seat "$CG_V2_SEAT" marcus || r=1
+  _reap_cgroup_in_ref "$CG_SERVICE" "$REF_V2_SEAT" && r=1
+  _reap_cgroup_in_ref "$CG_V2_SEAT" "$REF_V2_SEAT" || r=1
+  _reap_cgroup_in_ref "$CG_CLAUDE"  "$REF_CLAUDE"  || r=1
   [[ "$(printf '%s' "$(reading 10800 "$FUTURE")" | _grader_reading_pair "$NOW")" == "${US}64" ]] || r=1
   [[ -z "$(_hb_distiller_preserve_list)" ]] || r=1
   exit $r ) && ok "every predicate answers the same with no 5dive install present" \
