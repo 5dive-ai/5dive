@@ -5424,8 +5424,19 @@ _hb_gate_renag_agent_rail() { # <reviewer> <ids> -> 0 delivered, 1 = caller must
   done < <(db "SELECT '['||ident||'] '||COALESCE(need_type,'gate')||' — '||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
                FROM tasks WHERE id IN (${idlist}) ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
   text+=$'\n\n'"Clear one with: 5dive task answer <ident> --value=\"<choice>\" — or re-file to escalate to the human."
+  # DIVE-4725: the DELIVERY-TIME re-check, over the DIVE-4295 guard sidecar.
+  # This send is correct when it is written — _HB_GATE_RENAG_WHERE already
+  # requires need_answered_at IS NULL — and goes wrong in the spool: a reviewer
+  # who is mid-turn has it queued (DIVE-4214) and reads it minutes later, by
+  # which time the gate it names can be answered. Measured 2026-09-21: row 4906
+  # re-nagged to ops at 00:05:04Z, answered at 00:05:11Z, typed at 00:10:36Z.
+  # The guard re-runs the SAME need_answered_at clause the sweep selected on and
+  # `5dive task queue` reads, at the moment the seat actually sees the message,
+  # so the notice can no longer contradict the board. A seat that is idle takes
+  # the direct inject and never touches this path — unchanged.
   local out="" rc=0
-  out=$(cmd_send "$reviewer" --message="$text" 2>&1) || rc=$?
+  out=$(_A2A_GUARD="task:${idlist}:${reviewer}:gate_unanswered" \
+        cmd_send "$reviewer" --message="$text" 2>&1) || rc=$?
   if (( rc != 0 )); then
     _hb_log "[gate-renag] agent rail to ${reviewer} FAILED rc=${rc} for rows ${idlist}; falling back to the paired channel: ${out//$'\n'/ }"
     return 1
