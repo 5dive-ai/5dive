@@ -154,6 +154,18 @@ db() {
   return 0
 }
 
+# --- H8: the notice cannot be spooled behind the turn it reports on ---------
+# The seat is read BUSY again at inject time (the Escape has not settled in the
+# pane's markers, or a peer's turn started). Without the interrupting marker the
+# notice would go to the spool and be read at the next idle — i.e. the seat
+# would be halted and told about it later, by which time it has been
+# re-dispatched onto the row it was told not to resume.
+reset_arm
+out="$(BUSY_SEQ="1 0 1" ROW_IDS="4603" ROW_STATUS="in_progress" JSON_MODE=1 \
+        cmd_halt quinn --reason="moot grade" 2>/dev/null)"
+is "H8: the notice was typed, not spooled" "0"    "$(spool_count quinn)"
+is "H8: notice_delivered:true"             "true" "$(jq -r '.data.notice_delivered' <<<"$out")"
+
 # --- H6: no session -> E_NOT_RUNNING, and nothing is typed ------------------
 reset_arm
 _rc=0
