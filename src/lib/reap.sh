@@ -98,35 +98,103 @@ _REAP_LAST_VICTIMS=""
 # `nohup`/`setsid` shell that detaches to pid 1 stays in its unit's cgroup, so
 # the DIVE-3503 runaway this whole reaper exists for is still collected.
 #
-# Pure string function, so the harness can grade it with no /proc and no real
-# processes: it takes the TEXT of `/proc/<pid>/cgroup` (v2's single `0::/path`
-# line, or v1's several `n:ctl:/path` lines) and the seat NAME. Exit 0 = the
-# process is in that seat's agent unit.
-_reap_cgroup_is_seat() {  # <cgroup-text> <seat-name>
-  local text="$1" seat="$2"
-  [[ -n "$text" && -n "$seat" ]] || return 1
-  [[ "$text" == *"/5dive-agent@${seat}.service"* ]]
+# DIVE-4777. The unit NAME is not the seat's cgroup. `_reap_at_task_boundary`
+# admits two seat shapes, `agent-*` and `claude`, and only the first has a
+# `5dive-agent@<seat>.service` unit: on this box 16 such units exist and none is
+# `claude`, whose processes sit in
+# `0::/user.slice/user-1000.slice/user@1000.service/init.scope`. A predicate that
+# compares against the `/5dive-agent@<seat>.service` LITERAL can never match
+# that, so the DIVE-3503 collection was removed for exactly one seat — and
+# failing closed is what made it invisible: no error, a permanent count of 0,
+# which on a healthy box reads the same as nothing to reap. Substituting a
+# different unit name for `claude` does not help; the literal is the problem.
+#
+# So the reference cgroup is RESOLVED, once per pass, and victims must be inside
+# it. For the caller's OWN seat that resolution is `/proc/self/cgroup`, which is
+# correct for `claude` and `agent-*` alike and is strictly NARROWER than a name
+# match — the `claude` process in `/system.slice/zerohuman.service` shares the
+# uid, is not under the caller's cgroup, and stays out of a task-boundary sweep.
+# For another seat (the root heartbeat's cross-seat pass) systemd is asked for
+# the unit's real control group rather than formatting its name.
+
+# `_reap_cgroup_path <cgroup-text>` — the PATH out of the text of
+# `/proc/<pid>/cgroup`. v2 is one `0::<path>` line; v1 is several
+# `<n>:<controllers>:<path>` lines, whose `name=systemd` line is the unit one.
+# Pure, and EMPTY when nothing parses — empty is never membership below.
+_reap_cgroup_path() {  # <cgroup-text> -> <path> | ""
+  local text="$1" line
+  [[ -n "$text" ]] || return 0
+  while IFS= read -r line; do
+    [[ "$line" == 0::* ]] || continue
+    printf '%s' "${line#0::}"; return 0
+  done <<<"$text"
+  while IFS= read -r line; do
+    [[ "$line" == *:name=systemd:* ]] || continue
+    printf '%s' "${line#*:*:}"; return 0
+  done <<<"$text"
+  while IFS= read -r line; do
+    [[ "$line" == *:*:/* ]] || continue
+    printf '%s' "${line#*:*:}"; return 0
+  done <<<"$text"
+  return 0
 }
 
-# The cgroup text for one pid. Overridable by the same contract the rest of this
-# family uses — a FUNCTION NAME, not a command string, because it is expanded
-# unquoted — so a unit harness can serve a fixture per pid.
-_reap_pid_cgroup() { cat "/proc/$1/cgroup" 2>/dev/null || printf ''; }
-_REAP_CGROUP_CMD="${_REAP_CGROUP_CMD:-_reap_pid_cgroup}"
+# `_reap_cgroup_in_ref <cgroup-text> <reference-path>` — is this process in the
+# reference cgroup, or in one nested under it? A process keeps its parent's
+# cgroup unless something moves it, so "the reference or below" is what "shares
+# the caller's cgroup" means in practice, and the boundary is a PATH COMPONENT:
+# `…@marc.service` must not match `…@marcus.service`, which a bare substring
+# test would. Pure, so the harness grades it with no /proc and no processes.
+_reap_cgroup_in_ref() {  # <cgroup-text> <reference-path>
+  local text="$1" ref="$2" path
+  [[ -n "$text" && -n "$ref" ]] || return 1
+  path=$(_reap_cgroup_path "$text")
+  [[ -n "$path" ]] || return 1
+  [[ "$path" == "$ref" || "$path" == "$ref"/* ]]
+}
 
-# `_reap_in_seat_unit <pid> <seat-name>` — the impure half, kept to one line.
+# The cgroup text for one pid, and for OURSELVES. Overridable by the same
+# contract the rest of this family uses — a FUNCTION NAME, not a command string,
+# because it is expanded unquoted — so a unit harness can serve a fixture.
+_reap_pid_cgroup()  { cat "/proc/$1/cgroup" 2>/dev/null || printf ''; }
+_reap_self_cgroup() { cat /proc/self/cgroup 2>/dev/null || printf ''; }
+_REAP_CGROUP_CMD="${_REAP_CGROUP_CMD:-_reap_pid_cgroup}"
+_REAP_SELF_CGROUP_CMD="${_REAP_SELF_CGROUP_CMD:-_reap_self_cgroup}"
+# `systemctl show -p ControlGroup --value <unit>` — split out so the harness can
+# stub the cross-seat branch without systemd.
+_reap_unit_cgroup() {  # <unit> -> <path> | ""
+  systemctl show -p ControlGroup --value "$1" 2>/dev/null | head -n1 | tr -d '\n'
+}
+_REAP_UNIT_CGROUP_CMD="${_REAP_UNIT_CGROUP_CMD:-_reap_unit_cgroup}"
+
+# `_reap_seat_ref_cgroup <seat-name>` — the cgroup victims of this pass must be
+# inside. Resolved ONCE by `_reap_stale_shells`, never per victim.
+_reap_seat_ref_cgroup() {  # <seat-name> -> <path> | ""
+  local seat="$1" me
+  [[ -n "$seat" ]] || return 0
+  me="${USER:-}"; [[ -n "$me" ]] || me=$(id -un 2>/dev/null) || me=""
+  if [[ -n "$me" && "${me#agent-}" == "$seat" ]]; then
+    # Our own seat: our own cgroup. Exact for every seat shape, including the
+    # `claude` seat, which has no `5dive-agent@` unit at all.
+    _reap_cgroup_path "$($_REAP_SELF_CGROUP_CMD)"
+    return 0
+  fi
+  $_REAP_UNIT_CGROUP_CMD "5dive-agent@${seat}.service"
+}
+
+# `_reap_in_cgroup <pid> <reference-path>` — the impure half, kept to one line.
 #
 # FAILS CLOSED, and that direction is the point of the row: a host with no
 # /proc, a pid that exited between `ps` and this read, or a cgroup layout this
 # does not recognise all yield EMPTY, and empty is NOT membership. The cost of
 # the closed answer is a stale shell that survives to the next pass; the cost of
-# the open one is a killed service. A seat with no `5dive-agent@<name>.service`
-# unit therefore reaps NOTHING from now on — deliberate: with no unit there is
-# no runtime to have descended from, so every match would be a uid match.
-_reap_in_seat_unit() {  # <pid> <seat-name>
-  local pid="$1" seat="$2" text
+# the open one is a killed service. What DIVE-4777 adds is that the closed
+# answer is no longer SILENT: `_reap_stale_shells` names an unresolvable
+# reference on stderr whenever there were candidates it therefore left alone.
+_reap_in_cgroup() {  # <pid> <reference-path>
+  local pid="$1" ref="$2" text
   text=$($_REAP_CGROUP_CMD "$pid" 2>/dev/null || printf '')
-  _reap_cgroup_is_seat "$text" "$seat"
+  _reap_cgroup_in_ref "$text" "$ref"
 }
 
 # ---- pure predicate: is this command line an AGENT-WRITTEN shell? ----
@@ -332,20 +400,32 @@ _reap_stale_shells() {
   # DIVE-584: the seat NAME, which is what the unit is instantiated on — the
   # table above was collected by UID, and `seat` may arrive either spelling.
   local seat_name="${seat#agent-}"
+  # DIVE-4777: the reference cgroup is resolved ONCE, here, and is a real path
+  # rather than a formatted unit name — see `_reap_seat_ref_cgroup`. Empty means
+  # unresolvable, which stays fail-closed (nothing is reaped) but is now SAID.
+  local ref_cgroup; ref_cgroup=$(_reap_seat_ref_cgroup "$seat_name")
   local foreign=0
   while IFS=$'\t' read -r pid ppid etimes cmd; do
     if _reap_is_reapable "$pid" "$cmd"; then
       # A uid is not a membership. A reapable-CLASS command line that is not in
-      # this seat's unit belongs to some other service that merely runs as this
-      # user, and is not ours to end.
-      if ! _reap_in_seat_unit "$pid" "$seat_name"; then
+      # this seat's cgroup belongs to some other service that merely runs as
+      # this user, and is not ours to end.
+      if ! _reap_in_cgroup "$pid" "$ref_cgroup"; then
         foreign=$((foreign + 1)); continue
       fi
       class_table+="${pid}"$'\t'"${ppid}"$'\t'"${etimes}"$'\t'"${cmd}"$'\n'
     fi
   done <<<"$table"
-  (( foreign == 0 )) || printf '5dive: reap: %s process(es) of uid %s left alone (outside 5dive-agent@%s.service)\n' \
-    "$foreign" "$seat_user" "$seat_name" >&2
+  if (( foreign > 0 )); then
+    if [[ -z "$ref_cgroup" ]]; then
+      # The pre-DIVE-4777 shape of this failure was a permanent, wordless 0.
+      printf '5dive: reap: %s process(es) of uid %s left alone (seat %s: no resolvable cgroup, nothing reaped)\n' \
+        "$foreign" "$seat_user" "$seat_name" >&2
+    else
+      printf '5dive: reap: %s process(es) of uid %s left alone (outside %s)\n' \
+        "$foreign" "$seat_user" "$ref_cgroup" >&2
+    fi
+  fi
   [[ -n "$class_table" ]] || { printf '0'; return 0; }
 
   # The ancestor walk must see the FULL table (the caller's parents are mostly
@@ -435,7 +515,9 @@ _reap_at_task_boundary() {
   # DIVE-584: `reaped=3` in the audit row cannot be traced back to what died —
   # which is how the mp-staging.service kills went unnoticed for a day. `$$` is
   # a builtin, so naming the drop file costs no fork on this hot path.
-  local vf="${TMPDIR:-/tmp}/5dive-reap.$$.victims"
+  # DIVE-4777: `mktemp`, not a predictable `$$` name — /tmp is shared with 15
+  # other seats here, so a fixed name is a file another seat may own.
+  local vf; vf=$(mktemp "${TMPDIR:-/tmp}/5dive-reap.XXXXXX" 2>/dev/null) || return 0
   local n; n=$(_reap_stale_shells "$seat" --reason="task ${ident} ${verb}" --victims-file="$vf") || { rm -f "$vf" 2>/dev/null || true; return 0; }
   [[ "${n:-0}" =~ ^[0-9]+$ ]] && (( n > 0 )) || { rm -f "$vf" 2>/dev/null || true; return 0; }
   local victims=""; victims=$(cat "$vf" 2>/dev/null) || victims=""
