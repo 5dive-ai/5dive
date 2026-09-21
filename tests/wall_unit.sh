@@ -160,15 +160,17 @@ registry_read() {
 }}
 JSON
 }
-# Only bravo (codex, no TUI to mirror) and delta (unit down) are excluded.
+# Only delta (unit down) is excluded. bravo is a codex seat and STAYS: DIVE-4737
+# dropped the type=claude filter — every harness runs in tmux, so every running
+# seat has a pane to mirror, whatever its TUI happens to show.
 _wall_unit_active() { [[ "$1" != "delta" ]]; }
 
 seats=$(wall_registry_seats 6 | tr '\n' ' ')
-is "claude seats with a running unit, in registry order" "$seats" "alpha charlie echo "
+is "every seat with a running unit, any harness, in registry order" "$seats" "alpha bravo charlie echo "
 case "$seats" in *main*|*olivia*|*quinn*)
     bad "no hard-coded 5dive seat survives" "none of our seat names" "$seats" ;;
   *) ok "no hard-coded 5dive seat name appears" ;; esac
-is "the cap is honoured"        "$(wall_registry_seats 2 | tr '\n' ' ')" "alpha charlie "
+is "the cap is honoured"        "$(wall_registry_seats 2 | tr '\n' ' ')" "alpha bravo "
 _wall_unit_active() { return 1; }
 is "no running unit -> empty roster (not a default list)" "$(wall_registry_seats 6)" ""
 # An unreadable registry must not invent seats either.

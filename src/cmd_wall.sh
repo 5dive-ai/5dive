@@ -136,8 +136,14 @@ _wall_unit_active() {  # <seat>
 # those do not exist and the wall comes up as six "no tmux session" panes, which
 # is a bad first impression of an otherwise good feature. Read the registry.
 #
-# type=claude only: a codex seat has no tmux TUI to mirror, so a pane on one is
-# a guaranteed blank. Running units only, for the same reason.
+# ANY harness, running units only. This used to filter type=claude on the claim
+# that a codex seat "has no tmux TUI to mirror" — false: every seat runs under
+# 5dive-agent-start inside tmux session agent-<seat>, codex included, and the
+# follow path below attaches to whatever that session shows. The one codex seat
+# that showed a blank did so because its Telegram channel suppresses the TUI,
+# not because codex has none (lodar, 2026-09-21, DIVE-4737). A seat whose TUI
+# is suppressed shows its pane as-is, which still beats not being on the wall.
+# Running units only, because a stopped seat has no session to attach at all.
 wall_registry_seats() {  # <max>
   local max="${1:-6}" reg name n=0
   reg=$(registry_read 2>/dev/null) || return 0
@@ -147,9 +153,7 @@ wall_registry_seats() {  # <max>
     printf '%s\n' "$name"
     n=$(( n + 1 ))
     (( n >= max )) && break
-  done < <(jq -r '(.agents // {}) | to_entries
-                  | map(select(.value.type == "claude"))
-                  | .[].key' <<<"$reg" 2>/dev/null)
+  done < <(jq -r '(.agents // {}) | to_entries | .[].key' <<<"$reg" 2>/dev/null)
   return 0
 }
 
