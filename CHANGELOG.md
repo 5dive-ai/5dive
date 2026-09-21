@@ -1,32 +1,5 @@
 # Changelog
 
-## Unreleased — feat(a2a): an urgent route that reaches a BUSY seat, and a halt that requeues instead of orphaning (DIVE-4769)
-
-Two verbs, for the two things the fleet could not do to a seat that is mid-turn.
-
-**`5dive agent send <seat> --urgent`** jumps the DIVE-4214 spool. A plain send to a busy seat is
-written to its queue and flushed at its next idle, which for a single grade turn is *after* the
-grade — measured 2026-09-21, when a "stop, rubber-stamp it" could not reach quinn in time.
-`--urgent` types it now, so it is read as soon as the current turn ends.
-
-DIVE-4214 refused a caller flag by name ("a flag whose only cost is typing it becomes every
-caller's default"). That argument is about cost, so the flag is given one: **bounded** at 400
-bytes (a steer, not a briefing — over it is refused and nothing is typed), **budgeted** at 3 per
-sender per hour, and **legible** — `urgent=1` in the envelope, an interrupt marker at the head of
-the payload, and `urgent=` on the audit row. Past the budget the message is *not* lost: it goes on
-the normal path and the receipt says `urgent:false`.
-
-**`5dive agent halt <seat>`** ends the current turn and gives the row back. Escape (which is what
-ends a claude turn), then the reaper's own `_hb_reclaim_to_todo`: `started_at` cleared, the run
-closed `abandoned`, `task.reclaimed` on the ledger, and a delivered row returned to the verifier's
-queue rather than bounced to its maker. That is the whole difference from `heartbeat wake-task`,
-which reaches a busy seat and leaves its claim orphaned (DIVE-4724). The seat stays running and
-takes its next dispatch — `agent stop` still means "stop the service".
-
-What it does **not** do, stated because the row asked for it: no keystroke can preempt a running
-turn at a tool boundary. `--urgent` skips the queue and the heartbeat tick; `halt` ends the turn
-outright. A true mid-turn inject needs an in-process run-loop hook, not a transport change.
-
 ## Unreleased — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
 
 0.26.1 shipped a launcher that could not start any agent (DIVE-4067). The nightly installs the
