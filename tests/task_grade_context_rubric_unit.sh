@@ -126,11 +126,6 @@ if maker_repo_is_readonly; then
     (( RC != 0 )) \
       && ok_t "MUTANT: the pre-fix worktree materialization fails on an unwritable maker repo" \
       || bad_t "MUTANT SURVIVED: pre-fix materialization succeeded — the permission arm above grades nothing" "rc=$RC"
-    rw2; drop_tree2
-    ( cmd_task_grade_context "$IDENT2" >/dev/null 2>&1 )
-    [[ -e "$R2/.git/worktrees" ]] \
-      && ok_t "MUTANT: the pre-fix materialization does write into the maker's repo" \
-      || bad_t "MUTATION NOT APPLIED: pre-fix materialization left no worktree record — the no-bookkeeping arm grades nothing" "$(ls -a "$R2/.git" 2>/dev/null | tr '\n' ' ')"
   else
     bad_t "MUTATION NOT APPLIED: could not install the pre-fix materialization"
   fi
@@ -139,8 +134,29 @@ if maker_repo_is_readonly; then
 else
   rw2
   skip_t "maker-repo permission arms (DIVE-4803) — this process writes through a cleared write bit (root?), so no denial exists to grade" \
-    "uid=$(id -u); the uid-independent no-bookkeeping arm above still ran"
+    "uid=$(id -u); the uid-independent no-bookkeeping arm and its mutant below still run"
 fi
+
+# THE MUTANT FOR THE UID-INDEPENDENT ARM, AND IT RUNS AT EVERY UID. The pre-push
+# rail and CI run this harness as root (measured: uid=0 on the DIVE-4803 push),
+# where the permission arms above skip — so a mutant that lived inside that
+# branch would leave the no-bookkeeping arm ungraded on exactly the two lanes
+# that decide whether the change ships. Restoring `git worktree add` must put a
+# worktree record back into the maker's repo; if it does not, the arm above is
+# passing for a reason that has nothing to do with the fix.
+_orig_materialize2=$(declare -f _task_grade_materialize_tree)
+_task_grade_materialize_tree(){ git --git-dir="$1" worktree add --detach -q "$3" "$2" >/dev/null 2>&1; }
+if declare -f _task_grade_materialize_tree | grep -q 'worktree add'; then
+  rw2; drop_tree2; rm -rf "$R2/.git/worktrees"
+  ( cmd_task_grade_context "$IDENT2" >/dev/null 2>&1 )
+  [[ -e "$R2/.git/worktrees" ]] \
+    && ok_t "MUTANT: the pre-fix materialization does write into the maker's repo" \
+    || bad_t "MUTATION NOT APPLIED: pre-fix materialization left no worktree record — the no-bookkeeping arm grades nothing" "$(ls -a "$R2/.git" 2>/dev/null | tr '\n' ' ')"
+else
+  bad_t "MUTATION NOT APPLIED: could not install the pre-fix materialization (uid-independent arm)"
+fi
+eval "$_orig_materialize2"
+rw2; git -C "$R2" worktree prune >/dev/null 2>&1; rm -rf "$R2/.git/worktrees"; drop_tree2
 
 db "UPDATE tasks SET review_mode='rubric', verify_forced=NULL, verify_command=NULL WHERE id=$ID;"
 _task_delivery_paths(){ printf 'docs/readme.md\n'; }
