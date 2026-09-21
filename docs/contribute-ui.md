@@ -53,17 +53,17 @@ Never installed 5dive? [Quickstart](../README.md#quickstart) is a one-liner and 
 
 | | Issue | Size |
 |---|---|---|
-| Roster | [Every agent on the box, and whether it is working right now](https://github.com/5dive-ai/5dive/issues/1065) | M |
-| Live view | [Poll `/api/state` and surface the runs in flight](https://github.com/5dive-ai/5dive/issues/1066) | M |
-| Queue | [Group the board by status instead of one flat table](https://github.com/5dive-ai/5dive/issues/1067) | **S — good first issue** |
-| Gates | [Show the answered gates, not just the open ones](https://github.com/5dive-ai/5dive/issues/1068) | M |
-| Mobile | [There is no width breakpoint — make the four views work on a phone](https://github.com/5dive-ai/5dive/issues/1069) | **S — good first issue** |
+| Roster | [Every agent on the box, and whether it is working right now](https://github.com/5dive-ai/5dive-ui/issues/2) | M |
+| Live view | [Poll `/api/state` and surface the runs in flight](https://github.com/5dive-ai/5dive-ui/issues/3) | M |
+| Queue | [Group the board by status instead of one flat table](https://github.com/5dive-ai/5dive-ui/issues/4) | **S — good first issue** |
+| Gates | [Show the answered gates, not just the open ones](https://github.com/5dive-ai/5dive-ui/issues/5) | M |
+| Mobile | [There is no width breakpoint — make the four views work on a phone](https://github.com/5dive-ai/5dive-ui/issues/6) | **S — good first issue** |
 
 Every one of them names **what you see, where the data comes from, what done looks like, and
 roughly how big it is.** If an issue ever sends you into archaeology to find out where a number
 comes from, that is a bug in the issue — say so in the thread and we will fix it.
 
-Two of the five are labelled [good first issue](https://github.com/5dive-ai/5dive/labels/good%20first%20issue),
+Two of the five are labelled [good first issue](https://github.com/5dive-ai/5dive-ui/labels/good%20first%20issue),
 because two of them are. A page where everything is tagged beginner-friendly is a page where
 nothing was measured.
 
