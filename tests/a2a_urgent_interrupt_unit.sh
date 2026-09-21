@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# TIER: nightly — the urgent a2a interrupt, graded by simulating a busy seat's turn.
+# CORE (the default tier): 4.1s measured on this host, 2026-09-21. It grades a
+# rail that is NEW and therefore not yet exercised by the fleet continuously —
+# which is the argument that demoted its sibling a2a_busy_queue_unit.sh to
+# nightly, and does not hold here. The nightly sweep is also already at 83-86%
+# of its own cap (tests/lib/tier.sh), so 4.1s belongs in the 300s PR core.
 # DIVE-4769 — `agent send --urgent` must REACH a busy seat, and must stay a class.
 #
 # WHAT THIS GRADES, and it is the row's acceptance:

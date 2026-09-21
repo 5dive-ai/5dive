@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# TIER: nightly — `5dive agent halt`, graded by simulating a busy seat's turn.
+# CORE (the default tier): 2.1s measured on this host, 2026-09-21. Same argument
+# as tests/a2a_urgent_interrupt_unit.sh — a new rail, and the only guard that a
+# halt requeues rather than orphans.
 # DIVE-4769 — halting a busy seat must END THE TURN and GIVE THE ROW BACK.
 #
 # The defect it exists against is DIVE-4724's: `heartbeat wake-task` reaches a
