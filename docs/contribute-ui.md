@@ -54,7 +54,7 @@ Never installed 5dive? [Quickstart](../README.md#quickstart) is a one-liner and 
 | | Issue | Size |
 |---|---|---|
 | Roster | [Every agent on the box, and whether it is working right now](https://github.com/5dive-ai/5dive/issues/1065) | M |
-| Live view | [Poll `/data` and surface the runs in flight](https://github.com/5dive-ai/5dive/issues/1066) | M |
+| Live view | [Poll `/api/state` and surface the runs in flight](https://github.com/5dive-ai/5dive/issues/1066) | M |
 | Queue | [Group the board by status instead of one flat table](https://github.com/5dive-ai/5dive/issues/1067) | **S — good first issue** |
 | Gates | [Show the answered gates, not just the open ones](https://github.com/5dive-ai/5dive/issues/1068) | M |
 | Mobile | [There is no width breakpoint — make the four views work on a phone](https://github.com/5dive-ai/5dive/issues/1069) | **S — good first issue** |
@@ -72,7 +72,7 @@ nothing was measured.
 All of it is [`src/cmd_ui.sh`](../src/cmd_ui.sh), one file:
 
 - `_ui_state_json()` builds the view state from the local SQLite store and serves it at
-  `GET /data`.
+  `GET /api/state`.
 - `_ui_html()` emits the page — inline CSS and JS, no build step, no CDN, because the single-file
   bundle is the only artifact we ship.
 
