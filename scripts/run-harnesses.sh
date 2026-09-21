@@ -79,17 +79,16 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 2
 # it unauthenticated), so this needs no token. A failure is not fatal: the
 # harnesses still run and still say the arms did not, which is a louder and more
 # accurate report than aborting the whole tier over a plugin corpus.
-if [[ -z "${FIVEDIVE_PLUGIN_REGISTRY:-}" && -n "${CI:-}" ]]; then
-  _reg="${RUNNER_TEMP:-/tmp}/5dive-plugins-registry"
-  _org="${GITHUB_REPOSITORY_OWNER:-5dive-ai}"
-  if [[ -d "$_reg/.claude-plugin" ]] \
-     || timeout 60 git clone --quiet --depth 1           "https://github.com/$_org/5dive-plugins.git" "$_reg" 2>/dev/null; then
-    export FIVEDIVE_PLUGIN_REGISTRY="$_reg"
-    printf 'plugin registry: %s @ %s\n' "$_reg" "$(git -C "$_reg" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  else
-    printf 'plugin registry: UNRESOLVED — the registry arms will report NOT RUN\n' >&2
-  fi
-fi
+#
+# DIVE-4754 — AND IT IS PINNED. This fetch used to be a bare `git clone` of
+# plugins@main, so a merge in THAT repo decided the verdict on THIS tree: on
+# 2026-09-21 a delete there took the required `test` context on main to 23/5 red
+# with zero commits here and froze the merge queue (DIVE-4752). The resolution,
+# the 40-hex refusal and the argument now live in one function so a test can
+# drive them; tests/plugins_registry_pin_unit.sh does.
+# shellcheck source=scripts/lib/plugin-registry-pin.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/lib/plugin-registry-pin.sh"
+fivedive_resolve_plugin_registry || true
 
 # DIVE-3077 — RAISE A SIGNAL THE BOARD-WRITE FENCE READS. `_task_human_send_allowed`
 # (DIVE-1506) has refused on FIVEDIVE_TEST since it was written; measured across the
