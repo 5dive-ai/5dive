@@ -160,15 +160,25 @@ registry_read() {
 }}
 JSON
 }
-# Only bravo (codex, no TUI to mirror) and delta (unit down) are excluded.
+# Only delta (unit down) is excluded. bravo is a codex seat and STAYS: DIVE-4737
+# dropped the type=claude filter — every harness runs in tmux, so every running
+# seat has a pane to mirror, whatever its TUI happens to show.
 _wall_unit_active() { [[ "$1" != "delta" ]]; }
 
 seats=$(wall_registry_seats 6 | tr '\n' ' ')
-is "claude seats with a running unit, in registry order" "$seats" "alpha charlie echo "
+is "every seat with a running unit, any harness, in registry order" "$seats" "alpha bravo charlie echo "
 case "$seats" in *main*|*olivia*|*quinn*)
     bad "no hard-coded 5dive seat survives" "none of our seat names" "$seats" ;;
   *) ok "no hard-coded 5dive seat name appears" ;; esac
-is "the cap is honoured"        "$(wall_registry_seats 2 | tr '\n' ' ')" "alpha charlie "
+is "the cap is honoured"        "$(wall_registry_seats 2 | tr '\n' ' ')" "alpha bravo "
+# DIVE-4737 (quinn, iteration 1): dropping the filter from the code is not enough if
+# `5dive wall --help` still tells a codex-seat owner that only Claude seats are eligible.
+# Pin the docs to the code: no seat-selection line in wall_usage may name type=claude.
+# `grep -c` prints 0 AND exits 1 on no match; the `|| true` keeps that a value rather
+# than an abort under the set -e the later arms switch on (the grep is a candidate list,
+# not a verdict — its exit status is not the finding).
+is "wall --help makes no type=claude seat-selection claim" \
+   "$(wall_usage | grep -cE 'running claude|type .claude.' || true)" "0"
 _wall_unit_active() { return 1; }
 is "no running unit -> empty roster (not a default list)" "$(wall_registry_seats 6)" ""
 # An unreadable registry must not invent seats either.

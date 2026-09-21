@@ -136,8 +136,14 @@ _wall_unit_active() {  # <seat>
 # those do not exist and the wall comes up as six "no tmux session" panes, which
 # is a bad first impression of an otherwise good feature. Read the registry.
 #
-# type=claude only: a codex seat has no tmux TUI to mirror, so a pane on one is
-# a guaranteed blank. Running units only, for the same reason.
+# ANY harness, running units only. This used to filter type=claude on the claim
+# that a codex seat "has no tmux TUI to mirror" — false: every seat runs under
+# 5dive-agent-start inside tmux session agent-<seat>, codex included, and the
+# follow path below attaches to whatever that session shows. The one codex seat
+# that showed a blank did so because its Telegram channel suppresses the TUI,
+# not because codex has none (lodar, 2026-09-21, DIVE-4737). A seat whose TUI
+# is suppressed shows its pane as-is, which still beats not being on the wall.
+# Running units only, because a stopped seat has no session to attach at all.
 wall_registry_seats() {  # <max>
   local max="${1:-6}" reg name n=0
   reg=$(registry_read 2>/dev/null) || return 0
@@ -147,9 +153,7 @@ wall_registry_seats() {  # <max>
     printf '%s\n' "$name"
     n=$(( n + 1 ))
     (( n >= max )) && break
-  done < <(jq -r '(.agents // {}) | to_entries
-                  | map(select(.value.type == "claude"))
-                  | .[].key' <<<"$reg" 2>/dev/null)
+  done < <(jq -r '(.agents // {}) | to_entries | .[].key' <<<"$reg" 2>/dev/null)
   return 0
 }
 
@@ -409,7 +413,7 @@ cmd_wall() {
   fi
   n=${#seats[@]}
   if (( n == 0 )); then
-    printf '5dive wall: no running claude agents to show (5dive agent ls).\n' >&2
+    printf '5dive wall: no running agents to show (5dive agent ls).\n' >&2
     return 1
   fi
 
@@ -440,7 +444,7 @@ wall_usage() {
   cat <<'WALLUSAGE'
 5dive wall — one screen holding every agent's live TUI, read-only.
 
-  5dive wall                       # every running claude seat, from the registry
+  5dive wall                       # every running seat, from the registry
   5dive wall main dev ops          # only these seats, in this order
   5dive wall --grid=4x2            # a different shape; remembered for this box
   5dive wall --rebuild             # tear the wall down and lay it out again
@@ -453,7 +457,7 @@ Inside the wall:
 Read-only is the default and it is a safety property: a Ctrl-C into an agent
 pane kills that seat's unit. C-b w opts ONE pane in, never the wall.
 
-Seats come from the registry: running agents of type `claude`, in registry
+Seats come from the registry: running agents of any harness, in registry
 order, capped at the grid's pane count. Spare slots stay as vacant panes so
 the layout does not move when a seat is down.
 
