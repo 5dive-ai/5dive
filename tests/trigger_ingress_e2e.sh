@@ -25,7 +25,7 @@ BUILD_OUT="$FIVE" bash build.sh >/dev/null 2>&1 || bail "could not build 5dive"
 export STATE_DIR="$TMP/state"
 fixture_box_verify_policy always || exit 1
 mkdir -p "$STATE_DIR/tasks"
-"$FIVE" ui --data >/dev/null 2>&1 || bail "could not initialize isolated task store"
+"$FIVE" board --json >/dev/null 2>&1 || bail "could not initialize isolated task store"
 DB="$STATE_DIR/tasks/tasks.db"
 sq(){ sqlite3 "$DB" "$1"; }
 
@@ -222,12 +222,12 @@ chk "unknown trigger is hidden behind not found" 404 "$(jq -r '.[0].status' "$TM
 chk "bad signature does not reveal registered trigger" 404 "$(jq -r '.[1].status' "$TMP/http-enum.json")"
 chk "enumeration responses are indistinguishable" "$(jq -r '.[0].body' "$TMP/http-enum.json")" "$(jq -r '.[1].body' "$TMP/http-enum.json")"
 
-UI="$("$FIVE" ui --data)"
-chk "dashboard lists trigger" 1 "$(jq -r '[.data.triggers[]|select(.name=="issues")]|length' <<<"$UI")"
-chk "dashboard delivery links to task" "$TASK" "$(jq -r '.data.deliveries[]|select(.id==1).task' <<<"$UI")"
-HTML="$("$FIVE" ui --html)"
-chk "dashboard has trigger detail view" 1 "$(grep -c 'id="view-triggers"' <<<"$HTML")"
-chk "dashboard renders delivery-to-task link" 1 "$(grep -c 'link.href = "#queue"' <<<"$HTML")"
+# DIVE-4783 released the `ui` verb to the 5dive-ai/5dive-ui plugin: core owns the board
+# document (`5dive board --json`, the same JSON `ui --data` used to delegate to), the plugin owns
+# the rendered views. The two HTML arms that lived here moved with the views to that repo's harness.
+UI="$("$FIVE" board --json)"
+chk "board lists trigger" 1 "$(jq -r '[.data.triggers[]|select(.name=="issues")]|length' <<<"$UI")"
+chk "board delivery links to task" "$TASK" "$(jq -r '.data.deliveries[]|select(.id==1).task' <<<"$UI")"
 
 summary
 (( F == 0 ))
