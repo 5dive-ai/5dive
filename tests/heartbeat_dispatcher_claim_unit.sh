@@ -68,6 +68,19 @@ source "$SRC/task/grader_pool.sh"
 _pace_open_meter(){ printf '{"agents":[{"account":"acct-dev","sevenDayPct":0,"sevenDayResetsAt":99999999999}]}'; }
 _PACE_USAGE_CMD=_pace_open_meter
 
+# DIVE-4732: `_hb_forge_merge_sweep` (DIVE-4701) polls the FORGE for every
+# graded->merge row on every tick, and this harness stubs nothing on that rail.
+# So the fixture below — a pull-request URL on the real repo with a plausible
+# number — resolved to a pull request that EXISTS and is MERGED; the sweep
+# recorded the landing, `_TASKS_TFV_SQL` subtracted the row, and the DIVE-4261
+# discount the [4261] arms grade vanished: full-pristine (1) red on every main
+# push from a7dc57dc, while the PR core (which does not run a nightly harness)
+# stayed green. Pin the forge to "not landed": the sweep still runs its code path
+# on every tick, and no arm here can reach the network. OPEN<US>OPEN is the
+# record `_merge_landed_probe` prints for an unmerged pull request; MERGED is the
+# only answer that WRITES, and it must never come from a fixture's URL.
+_merge_landed_probe(){ printf 'OPEN\x1fOPEN\n'; }
+
 STATE_DIR="$TMP"
 TASKS_DIR="$STATE_DIR/tasks"
 TASKS_DB="$TASKS_DIR/tasks.db"
@@ -485,7 +498,7 @@ gm() {
   local id; id=$(mk "graded, merge owed by ${1}" in_progress standard dev)
   db "UPDATE tasks SET maker_agent='dev2', verifier='dev', graded_by='dev',
              graded_at=datetime('now','-5 minutes'), graded_verdict='pass',
-             delivery_ref='https://github.com/5dive-ai/5dive/pull/9$id',
+             delivery_ref='https://github.com/fixture.invalid/harness/pull/9$id',
              merge_owner=$(sqlq "$1"), handoff_rejected_at=NULL,
              started_at=datetime('now','-5 minutes')
        WHERE id=${id};"
