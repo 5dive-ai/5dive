@@ -160,6 +160,57 @@ _push_fetch_why() {
   esac
 }
 
+# _push_why <git-push-stderr> <slug> <installation-id> — a SHORT named cause for a
+# failed delegated PUSH, the push-side twin of `_push_fetch_why` (DIVE-4748).
+#
+# Why it exists: the rail used to end a failed push with "push failed (branch X);
+# see output above", and the output above is git's own text. For the delegated rail
+# that text is systematically misleading in one specific way — GitHub answers an
+# UNAUTHORISED write on a repo you can read with `404 Repository not found`, never
+# 403 — so the operator reads "the repository does not exist" for what is a
+# permissions answer about a repository that plainly does. DIVE-4744 lost a turn to
+# exactly that: the maker was told `Repository not found` for lodar/5dive-api, a repo
+# `git ls-remote` reached with the same credential minutes later.
+#
+# The same gloss already exists for the FETCH side (`_push_fetch_why`, DIVE-2566) and
+# was never carried to the push. Kept as a separate function rather than widening that
+# one: the causes genuinely differ. A fetch fails on the CALLER's credential helper;
+# this push runs root-side on a freshly minted App installation token, so "no
+# credential helper" is not a reachable cause here and "the installation does not
+# carry this permission" is not reachable there.
+#
+# Callers own their own wording; this owns only "what did the remote actually refuse".
+_push_why() {
+  local err="$1" slug="$2" inst="$3"
+  case "$err" in
+    # The headline case. Print the installation, because that — not the repo — is
+    # the object whose permissions decide this, and it is the one thing the
+    # operator cannot see from the error.
+    *"Repository not found"*|*"repository"*"not found"*)
+      printf 'GitHub answered 404 for %s. On a WRITE that is a permissions answer far more often than a missing repository: an App installation that may READ a repo but not write it gets 404, not 403. Check that installation %s carries contents:write for %s (GET /app/installations/%s -> .permissions), and that the repo was not renamed or transferred. Verify the repo itself is reachable with the same token via `git ls-remote` before believing the noun' \
+        "$slug" "$inst" "$slug" "$inst" ;;
+    *"Permission to"*"denied"*|*"403"*|*"Write access to repository not granted"*)
+      printf 'the remote REFUSED the write explicitly — installation %s reached %s and does not hold contents:write on it' "$inst" "$slug" ;;
+    # NOTE the absent backticks. GitHub's own text is "without \`workflow\` scope",
+    # but a backtick inside a double-quoted case PATTERN is command substitution —
+    # bash ran `workflow` and printed "command not found" on every non-matching
+    # input. The two unquoted-word patterns match the same message and cannot run
+    # anything (DIVE-4748, caught by this row's own harness).
+    *"refusing to allow"*|*"workflow"*"scope"*)
+      printf 'the branch changes a file under .github/workflows/ and the minted token did not carry workflows:write — the scope is requested only when the branch is DIFFABLE against the remote default branch' ;;
+    *"protected branch"*|*GH006*|*"pre-receive hook declined"*)
+      printf 'the remote accepted the credential and a branch-protection or pre-receive rule declined the ref' ;;
+    *"non-fast-forward"*|*"fetch first"*|*"failed to push some refs"*)
+      printf 'the remote branch has commits this branch does not — this is a HISTORY conflict, not a credential one; rebase onto the remote branch and push again' ;;
+    *"pre-push hook"*|*"hook declined"*)
+      printf 'a LOCAL pre-push hook refused before anything left this box — nothing reached GitHub and no credential was rejected' ;;
+    *"Could not resolve host"*|*"Connection timed out"*|*"unable to access"*|*"Failed to connect"*)
+      printf 'GitHub was not reachable from this box — nothing was refused, the call did not complete' ;;
+    "") printf 'git push failed without printing a reason' ;;
+    *) printf 'git said: %s' "$(printf '%s' "$err" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-200)" ;;
+  esac
+}
+
 # _push_range_base <repo-path> <repo-url> <branch> — the ONE range-bound resolver
 # every fail-closed pre-push scan shares (author: DIVE-2161; content/PII:
 # DIVE-2268). Extracted rather than copied on purpose: the bound is the part that
@@ -817,8 +868,22 @@ cmd_push() {
   # while making it fatal would turn a successful push into a red exit and invite a
   # re-push. The push is the irreversible half; the PR is the recoverable one.
   if [[ $open_pr -eq 1 ]]; then
-    _push_open_pr "$ident" "$slug" "$branch" "$pr_base" "$pr_title" "$pr_body_file" "$pr_draft" "$repopath" \
-      || warn "the branch pushed but the pull request was not opened (see above) — re-run just the PR with: 5dive gh pr create --repo ${slug} --head ${branch}"
+    if ! _push_open_pr "$ident" "$slug" "$branch" "$pr_base" "$pr_title" "$pr_body_file" "$pr_draft" "$repopath"; then
+      # DIVE-4748: the advice has to be a command that RUNS. The old line printed
+      # `5dive gh pr create --repo <r> --head <b>` — no --base, no --title, no
+      # --body — and `gh pr create` with those missing PROMPTS. No agent seat has a
+      # tty, so the advertised recovery could only fail, which is how DIVE-4744
+      # ended up reaching for an undocumented path instead.
+      #
+      # Also name the ACTOR, and name it as the same one this verb just used.
+      # `pr create` is routing class `write`, so `5dive gh` already sends it as
+      # 5dive-bot with no flag (cmd_gh.sh:_gh_route_class) — the same credential
+      # --open-pr goes out on. Saying so is what stops the next reader concluding
+      # the two are different rails and going looking for a second credential.
+      local _retry; _retry=$(_push_pr_retry_cmd "$slug" "${pr_base:-${FIVE_GATE_MAIN_BRANCH:-main}}" \
+                                                 "$branch" "$pr_title" "$pr_body_file" "$pr_draft")
+      warn "the BRANCH IS UP — only the pull-request leg failed (see above), so do NOT re-push. Open the PR with: ${_retry}   (that is the same rail and the same actor this verb just used: 'pr create' is routing class write, so it goes out as 5dive-bot without any --as flag.)"
+    fi
   fi
 }
 
@@ -946,6 +1011,24 @@ _push_mint_pr_title() {
   (( room < 4 )) && room=4
   (( ${#t} > room )) && t="${t:0:$((room - 3))}..."
   printf '%s(%s): %s' "$type" "$ident" "$t"
+}
+
+# _push_pr_retry_cmd <slug> <base> <branch> <title> <body-file> <draft> — the exact
+# command that opens the pull request this push could not (DIVE-4748). PURE: it
+# reads six strings and prints one line, so the harness can assert the advice
+# without a credential, a gate or a network.
+#
+# It is a whole command on purpose. `gh pr create` with no --title/--body PROMPTS,
+# and no agent seat has a tty, so a partial command is advice that can only fail —
+# which is what it did on DIVE-4744. Placeholders are angle-bracketed rather than
+# omitted so a missing piece is visibly the caller's to fill in, not a flag we forgot.
+_push_pr_retry_cmd() {
+  local slug="$1" base="$2" branch="$3" title="$4" body_file="$5" draft="$6" cmd
+  cmd="5dive gh pr create --repo ${slug} --base ${base} --head ${branch} --title '${title:-<title>}'"
+  if [[ -n "$body_file" ]]; then cmd="${cmd} --body-file ${body_file}"
+  else                           cmd="${cmd} --body '<body>'"; fi
+  [[ "$draft" == "1" ]] && cmd="${cmd} --draft"
+  printf '%s' "$cmd"
 }
 
 # _push_open_pr <ident> <slug> <branch> <base> <title> <body-file> <draft> [repopath]
@@ -1308,12 +1391,37 @@ cmd_push_do() {
   # a process table, and this is not the place to start.
   export FIVE_PUSH_DELEGATED=1 FIVE_PUSH_TASK="$ident"
   [[ -n "$override" ]] && export FIVE_PUSH_OVERRIDE="$override"
-  "${G[@]}" -c http."https://github.com/".extraheader="$authhdr" \
-      push "$repourl" "refs/heads/${branch}:refs/heads/${branch}" 2>&1 | sed 's/^/  /' || rc=$?
+  # DIVE-4748: TEE, do not just pipe. The output still streams through `sed` exactly
+  # as before — a long push keeps printing progress — but a copy is kept so the
+  # refusal can NAME the cause instead of ending on "see output above". `mktemp`
+  # rather than a fixed path: this runs as root and a predictable name under a
+  # world-writable /tmp is a symlink target (the DIVE-4288 lesson, one directory
+  # over). Still outside the agent's checkout, which this function never touches.
+  local errf; errf=$(mktemp "${TMPDIR:-/tmp}/.5dive-push-err.XXXXXX") || errf=""
+  [[ -n "$errf" ]] && chmod 600 "$errf" 2>/dev/null
+  if [[ -n "$errf" ]]; then
+    "${G[@]}" -c http."https://github.com/".extraheader="$authhdr" \
+        push "$repourl" "refs/heads/${branch}:refs/heads/${branch}" 2>&1 \
+        | tee "$errf" | sed 's/^/  /' || rc=$?
+  else
+    "${G[@]}" -c http."https://github.com/".extraheader="$authhdr" \
+        push "$repourl" "refs/heads/${branch}:refs/heads/${branch}" 2>&1 | sed 's/^/  /' || rc=$?
+  fi
   unset FIVE_PUSH_OVERRIDE FIVE_PUSH_DELEGATED FIVE_PUSH_TASK
   tok=""; authhdr=""   # discard
 
-  [[ $rc -eq 0 ]] || fail "$E_GENERIC" "push failed (branch ${branch}); see output above."
+  if [[ $rc -ne 0 ]]; then
+    local _perr="" _pwhy
+    [[ -n "$errf" ]] && _perr=$(cat "$errf" 2>/dev/null)
+    _pwhy=$(_push_why "$_perr" "$slug" "$inst")
+    [[ -n "$errf" ]] && rm -f "$errf"
+    # Name the LEG. `5dive push --open-pr` is two operations behind one verb, and a
+    # maker reading "push failed" after passing --open-pr cannot tell which of the
+    # two it is. This one is the push, and it means the pull request was never
+    # attempted — so there is nothing to clean up on GitHub and the branch is NOT up.
+    fail "$E_GENERIC" "the PUSH leg failed for branch ${branch} -> ${slug}; nothing was pushed, and any --open-pr was never attempted. Cause: ${_pwhy}."
+  fi
+  [[ -n "$errf" ]] && rm -f "$errf"
   local sha
   sha=$("${G[@]}" rev-parse --short "refs/heads/${branch}")
   # DIVE-1923: ship ledger. After the push, never before — this records what
