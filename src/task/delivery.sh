@@ -544,6 +544,26 @@ PACKET
 # route around by pasting the labels with nothing under them. It WARNS, loudly,
 # and the reason is recorded on the delivery — a grader reading it knows it is
 # about to pay for a full re-derivation and can price the grade accordingly.
+# DIVE-4733: a delivery with no source checkout under it binds a row that no
+# grading packet can ever be built for. Refuses BEFORE the binding UPDATE; see
+# the call site for why this is a refusal and not the warning it replaces.
+#
+# THE AUDITED EXIT IS NOT A STYLE ESCAPE, same posture as --force-unevidenced
+# below: `--force-no-checkout="<why>"` exists for the delivery that genuinely has
+# no tree to stand in (a row delivering a pull request in a repo that is not
+# cloned on this box), and the reason is echoed for the grader to read, because
+# the grader is the one who then pays for the full row read.
+_task_guard_delivery_checkout() {  # <ident> <delivered-sha>
+  local ident="$1" sha="${2:-}"
+  [[ -z "$sha" ]] || return 0
+  if [[ -n "${_TASK_NO_CHECKOUT_WAIVER:-}" ]]; then
+    warn "$ident: delivered from OUTSIDE a git checkout (--force-no-checkout, DIVE-4733) — '${_TASK_NO_CHECKOUT_WAIVER}'. No delivered sha is recorded, so '5dive task grade-context' cannot build this row's packet and the grader falls back to reading the whole row."
+    return 0
+  fi
+  policy_refuse "$E_VALIDATION" deliver-outside-checkout DIVE-4733 "$ident" \
+    "$ident: this delivery was invoked from outside a git checkout ($PWD), so there is no delivered sha to record (DIVE-4733). NOTHING WAS WRITTEN — the row is unchanged, unbound, and still yours. WHY THIS IS REFUSED RATHER THAN WARNED: the binding would succeed and look finished, while '5dive task grade-context $ident' would silently be unable to materialize the tree and the grader would fall back to reading the entire row — the cost DIVE-4723 exists to remove, paid without anyone noticing it was avoidable (DIVE-4634). THE FIX IS A cd: run the same command again from the checkout the work was done in, the one whose HEAD is the sha you pushed. If this delivery genuinely has no tree to stand in (the pull request is in a repo that is not cloned on this box), say so and it proceeds, audited and recorded for the grader: --force-no-checkout=\"<why>\"."
+}
+
 _task_guard_delivery_evidence() {  # <id> <ident> <verb> <result-text> <want_result> [<binding-being-bound>]
   local id="$1" ident="$2" verb="$3" text="$4" want="${5:-0}" binding="${6:-}"
   # A delivery is only graded against a diff when one is bound. The binding is
@@ -605,6 +625,14 @@ cmd_task_deliver() {
   local task="" pr="" result="" want_result=0 result_src=""
   local deliver_cmd=""                   # DIVE-4576: --verify=<cmd> given at delivery
   local deliver_mutant=""   # DIVE-4623: the negative control, named at delivery
+  # DIVE-4733: LOCAL, unlike _TASK_EVIDENCE_WAIVER beside it. Bash's dynamic
+  # scoping still hands it to the guard below, and a waiver held in a bare global
+  # outlives the command that set it — a second delivery in the same shell would
+  # inherit it and be waived in silence. Not reachable from the CLI, where each
+  # invocation is its own process; this is scope hygiene, and the harness's W3
+  # arm is written to be able to SEE it (two calls, one subshell) rather than
+  # passing vacuously the way a per-call subshell makes it.
+  local _TASK_NO_CHECKOUT_WAIVER=""
   local append_result=0 force_result=0   # DIVE-2476: the two sanctioned answers to the
                                          # already-closed-row refusal, spelled exactly
                                          # as `task done|cancel` spells them.
@@ -635,6 +663,11 @@ cmd_task_deliver() {
       # a waiver nobody can price, and the grader is the party that pays.
       --force-unevidenced=*) _TASK_EVIDENCE_WAIVER="${1#*=}" ;;
       --force-unevidenced)   fail "$E_USAGE" "--force-unevidenced needs a reason: --force-unevidenced=\"<why this delivery has no such evidence to give>\" (DIVE-4576)" ;;
+      # DIVE-4733: the audited exit from the no-checkout refusal. Same shape as
+      # the flag above and for the same reason — a bare flag with no reason is a
+      # usage error, because the reason is the whole point of the exit.
+      --force-no-checkout=*) _TASK_NO_CHECKOUT_WAIVER="${1#*=}" ;;
+      --force-no-checkout)   fail "$E_USAGE" "--force-no-checkout needs a reason: --force-no-checkout=\"<why this delivery has no source checkout to stand in>\" (DIVE-4733)" ;;
       # DIVE-4576 deliverable 3: a maker may ADD the grading command AT DELIVERY.
       # `task add --verify=<cmd>` already picks `--review=check` at filing, but a
       # row is frequently only gradeable by a command once the work exists — and
@@ -651,7 +684,7 @@ cmd_task_deliver() {
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>|--result-file=<path>] [--append-result|--force-result] [--verify=<cmd>] [--force-unevidenced=<why>]"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>|--result-file=<path>] [--append-result|--force-result] [--verify=<cmd>] [--force-unevidenced=<why>] [--force-no-checkout=<why>]"
   [[ -n "$pr" ]]   || fail "$E_USAGE" "task deliver requires --pr=<url> (the PR that delivers this task; done stays blocked until it is MERGED — DIVE-1830)"
   # Basic sanity: a delivery ref must look like a PR URL, not a bare word.
   if [[ "$pr" != http*://* && "$pr" != *github.com* ]]; then
@@ -704,11 +737,28 @@ cmd_task_deliver() {
   _delivery_repo=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || printf '')
   _delivered_sha=$(git rev-parse HEAD 2>/dev/null || printf '')
   [[ "$_delivered_sha" =~ ^[0-9a-f]{40}$ ]] || { _delivery_repo=""; _delivered_sha=""; }
+  # DIVE-4733: and if there is no checkout here, REFUSE — before the UPDATE on the
+  # next line, so a refused delivery is wholly non-mutating exactly like DIVE-2317's
+  # and DIVE-4576's guards above it.
+  #
+  # WHY THIS STOPPED BEING A WARNING. DIVE-4634 bound these two columns so the
+  # grader could be handed a bounded packet instead of a full row read; DIVE-4723
+  # then pointed the standing verifier at that packet. A delivery stamped from
+  # outside a checkout leaves delivered_sha NULL, `task grade-context` cannot
+  # materialize the tree, and the grader silently falls back to the full row read.
+  # The warning described that outcome to the one person who could no longer act
+  # on it — the delivery had already succeeded and the row was already bound, so
+  # the maker's next act was `task done`, not a re-delivery. Measured at grading
+  # on 2026-09-21 (DIVE-4733): of six real rows sampled, DIVE-4719 was row-read
+  # for exactly this reason and nothing downstream noticed. Every such delivery is
+  # a DIVE-4723 saving that does not happen.
+  #
+  # THE REMEDY IS A `cd`, which is why refusing is proportionate: the maker has
+  # the checkout, they just were not standing in it.
+  _task_guard_delivery_checkout "$ident" "$_delivered_sha"
   db "UPDATE tasks SET delivery_ref=$(sqlq "$pr"), delivered_at=datetime('now'), delivery_ref_iteration=COALESCE(iteration,0),
                        delivery_repo_path=$(sqlq_or_null "$_delivery_repo"), delivered_sha=$(sqlq_or_null "$_delivered_sha")
         WHERE id=${id};"
-  [[ -n "$_delivered_sha" ]] \
-    || warn "$ident: delivery was invoked outside a git checkout; the bounded grader cannot materialize the delivered SHA until this row is re-delivered from its source checkout (DIVE-4634)."
   # A DELIVERY IS A TASK STATE CHANGE, so it leaves an audit row like every other
   # one. `task start|done|cancel|set-body|merge|answer gate` all call this helper;
   # `deliver` did not, and the only trace of a delivery was the row's own mutable
