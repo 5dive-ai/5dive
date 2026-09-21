@@ -2707,6 +2707,165 @@ cmd_task_merge_landed() {
      --arg cl "$([[ -n "$vfier" ]] && printf '%s' "$vfier" || printf '%s' "$asgn")" --arg ac "$actor"
 }
 
+
+# ── DIVE-4778 — `task merge-declined`: THE MERGING STAGE'S OTHER EXIT ─────────
+#
+# WHAT IT RECORDS, AND WHY IT IS NOT `merge-landed` WITH A FLAG. `merge-landed`
+# answers *did the forge merge this pull request* and may only be written by the
+# probe's own answer — that is the merging rail's whole safety property. This verb
+# answers a DIFFERENT question: *is anybody still owed a merge on this row at all*.
+# A deliberately held, superseded or re-pointed pull request is owed a merge by
+# nobody, and NO PROBE CAN REPORT THAT — a refusal cannot report intent, so a
+# hold and an accident come back as the same error string (measured on DIVE-4773:
+# main converted the pull request to a draft as the hold, and the merge rail read
+# the draft flag as the one obstacle to remove; community/wiki/a-draft-flag-is-a-
+# hold-the-merge-dispatch-cannot-see.md). So the fact is asserted by a seat, in
+# words, and it lands in `merge_declined_*` — never in `merge_landed_*`.
+#
+# WHAT IT COSTS TO NOT HAVE IT. Before this verb a merge owner woken onto a row
+# whose pull request will never merge had no move that was true: `task merge` is
+# grader-only and `enqueuePullRequest` refuses a draft; `task merge-landed` is
+# refused by `_merge_landed_read` (no mergedAt) and its own refusal text says it
+# cannot distinguish a hold from an outage; `task reject` is wrong (nothing is
+# red) and, at the iteration cap, destructive — it runs `UPDATE tasks SET result=
+# <feedback>` over the delivery record and files a decision gate. Five ops merge
+# dispatches on DIVE-4773, five declines, zero moves; DIVE-4370 in the same shape.
+#
+# WHY IT HANDS THE ROW TO THE MAKER AND NOT THE VERIFIER. `merge-landed` hands
+# off to the verifier because a landed row is owed a CLOSE. A declined row is
+# owed the opposite: the work is fine and its destination is not, so what happens
+# next — re-point the binding at the pull request that will land, or take the row
+# terminal — is the maker's act. Handing it to the verifier would ask the one seat
+# that cannot re-deliver to move it.
+#
+# _task_merge_declined_record <id> <ref> <reason> <actor> — the write, in one
+# place. RETIRES THE HOLD for merge-landed's reason (a row owed no merge must not
+# paint an action nobody can take) and TOUCHES NO merge_landed_* COLUMN.
+_task_merge_declined_record() {
+  local id="$1" ref="$2" why="$3" actor="$4"
+  db "UPDATE tasks SET
+        merge_declined_at=datetime('now'),
+        merge_declined_by=$(sqlq "$actor"),
+        merge_declined_ref=$(sqlq "$ref"),
+        merge_declined_reason=$(sqlq "$why"),
+        merge_owner=NULL,
+        merge_hold_reason=NULL
+      WHERE id=${id};" || return 1
+  _task_store_audit_log "task.merge-declined" ok 0 -- \
+    "id=${id}" "ref=${ref}" "reason=${why}" "actor=${actor}" 2>/dev/null || true
+  return 0
+}
+
+# _task_merge_declined_handoff <id> <ident> <assignee> <maker> — put the row on
+# the seat that can re-point the binding. Prints a sentence when it moved the row
+# and nothing when it did not. Not `cmd_task_assign`, for `_task_merge_landed_
+# handoff`'s reason: this is not a routing decision anybody is making, it is the
+# recorded consequence of a merge that is not going to happen.
+_task_merge_declined_handoff() {
+  local id="$1" ident="$2" assignee="$3" maker="$4"
+  [[ -n "$maker" && "$maker" != "$assignee" ]] || return 0
+  # The same clock reset `task assign` makes: an inherited in_progress row that
+  # keeps the previous owner's started_at is eligible for the stale reaper on the
+  # new owner's very first tick.
+  db "UPDATE tasks SET
+        assignee=$(sqlq "$maker"),
+        started_at=CASE WHEN status='in_progress' THEN datetime('now') ELSE started_at END
+      WHERE id=${id};" || return 0
+  printf ' The row is now assigned to %s, the seat that can re-point the binding.' "$maker"
+}
+
+cmd_task_merge_declined() {
+  local ident="" why="" json=0 a
+  for a in "$@"; do
+    case "$a" in
+      --reason=*) why="${a#--reason=}" ;;
+      --json) json=1 ;;
+      -h|--help)
+        printf 'usage: 5dive task merge-declined <ident> --reason="<why this pull request will never merge>" [--json]\n\n  Record that the pull request bound to a row IS NOT THE ONE THAT WILL LAND --\n  held, superseded, or re-pointed at another repository -- so the row leaves the\n  MERGING stage and stops being dispatched to a merge owner with no available\n  move (DIVE-4778). Runnable by the seat that owes the merge, the assignee, or\n  the grader. ASSERTS NO LANDING: it writes none of the merge_landed_* columns,\n  it asks GitHub nothing, and it merges nothing. If the pull request DID merge,\n  the verb is `5dive task merge-landed <ident>` instead.\n'
+        return 0 ;;
+      --*) fail "$E_VALIDATION" "task merge-declined: unknown flag '$a' — usage: 5dive task merge-declined <ident> --reason=\"<why>\"" ;;
+      *) [[ -z "$ident" ]] && ident="$a" ;;
+    esac
+  done
+  [[ -n "$ident" ]] || fail "$E_VALIDATION" "task merge-declined needs a task ident — usage: 5dive task merge-declined <ident> --reason=\"<why>\""
+  (( json )) && JSON_MODE=1
+  tasks_db_init
+
+  local actor; task_actor_claim ""; actor="$ACTOR_BOARD"
+
+  local row
+  row=$(db "SELECT id||x'1f'||COALESCE(delivery_ref,'')||x'1f'||COALESCE(status,'')||x'1f'||
+                   COALESCE(assignee,'')||x'1f'||COALESCE(maker_agent,'')||x'1f'||
+                   COALESCE(graded_by,'')||x'1f'||$(_tasks_merge_owner_sql)||x'1f'||
+                   COALESCE(merge_declined_at,'')||x'1f'||COALESCE(merge_declined_ref,'')||x'1f'||
+                   COALESCE(merge_declined_reason,'')||x'1f'||
+                   CASE WHEN (${_TASKS_TFV_SQL}) THEN '1' ELSE '0' END||x'1f'||
+                   CASE WHEN (${_TASKS_MERGE_LANDED_SQL}) THEN '1' ELSE '0' END
+              FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
+  [[ -n "$row" ]] || fail "$E_VALIDATION" "no task ${ident}."
+  local id dref st asgn maker gb owner dec_at dec_ref dec_why tfv landed rest
+  id="${row%%$'\x1f'*}";        rest="${row#*$'\x1f'}"
+  dref="${rest%%$'\x1f'*}";     rest="${rest#*$'\x1f'}"
+  st="${rest%%$'\x1f'*}";       rest="${rest#*$'\x1f'}"
+  asgn="${rest%%$'\x1f'*}";     rest="${rest#*$'\x1f'}"
+  maker="${rest%%$'\x1f'*}";    rest="${rest#*$'\x1f'}"
+  gb="${rest%%$'\x1f'*}";       rest="${rest#*$'\x1f'}"
+  owner="${rest%%$'\x1f'*}";    rest="${rest#*$'\x1f'}"
+  dec_at="${rest%%$'\x1f'*}";   rest="${rest#*$'\x1f'}"
+  dec_ref="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  dec_why="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  tfv="${rest%%$'\x1f'*}";      landed="${rest#*$'\x1f'}"
+
+  # THE REASON IS THE RECORD. A decline is the one write on this rail that no
+  # probe corroborates, so the only thing standing behind it is the sentence the
+  # seat wrote; an unexplained decline on the board is indistinguishable from a
+  # seat clearing a dispatch it did not want. Required, and required to say
+  # something — DIVE-4654's own board cell falls back to "no reason recorded" for
+  # merge_hold_reason and that fallback is exactly what must not be reachable here.
+  why="${why#"${why%%[![:space:]]*}"}"; why="${why%"${why##*[![:space:]]}"}"
+  [[ -n "$why" ]] \
+    || fail "$E_VALIDATION" "task merge-declined ${ident} needs --reason=\"<why this pull request will never merge>\" — held, superseded, re-pointed at another repository. This verb records a judgement no forge read can corroborate, so the sentence IS the record: it is painted on the board, written to the audit log, and read by whoever picks the row up. Nothing was written."
+
+  case "$st" in
+    done|cancelled) fail "$E_CONFLICT" "${ident} is ${st} — a terminal row is owed no merge by anybody already, so there is nothing to decline." ;;
+  esac
+  [[ -n "$dref" ]] \
+    || fail "$E_CONFLICT" "${ident} has no delivery_ref, so no pull request is bound to it and there is no merge to decline. Bind it: 5dive task deliver ${ident} --pr=<url>."
+  # A LANDING IS NOT DECLINABLE. This verb's whole contract is that it asserts no
+  # landing; the mirror of that is that it must not be able to overwrite one. A
+  # recorded landing against the current binding is the forge's own answer and
+  # this verb never contradicts it.
+  [[ "$landed" != "1" ]] \
+    || fail "$E_CONFLICT" "${dref} is RECORDED AS MERGED on ${ident} — a landed pull request cannot be declined, and this verb never overwrites a landing (\`5dive task show ${ident}\` prints it). The row has already left the merging stage; what it is owed now is a close. Nothing was written."
+  # IDEMPOTENT BY THE BINDING, exactly as merge-landed is: a second run is a seat
+  # re-reading the board, not a second event. A decline recorded against a
+  # delivery_ref the row no longer carries is a decline of a DIFFERENT pull
+  # request, so that one is re-recorded rather than reported as already done.
+  if [[ -n "$dec_at" && "$dec_ref" == "$dref" ]]; then
+    ok "${ident}: the decline of ${dref} is ALREADY RECORDED (at ${dec_at}, reason: ${dec_why:-none recorded}) — the row has left the merging stage and is owed a merge by nobody. Nothing was written." \
+       '{ident:$id, declined:true, already:true, reason:$why, owner:$cl}' \
+       --arg id "$ident" --arg why "$dec_why" --arg cl "${maker:-$asgn}"
+    return 0
+  fi
+  [[ "$tfv" == "1" ]] \
+    || fail "$E_CONFLICT" "${ident} is NOT in the merging stage — it is not graded PASS with a live binding (\`5dive task show ${ident}\` prints the fields: graded_at, graded_verdict, delivery_ref, handoff_rejected_at). This verb records the exit from a stage this row is not in; it is not a way to disown a delivery that has not been graded."
+  # STANDING: the seat the stage DISPATCHES to, the seat that must move the row,
+  # or the seat that GRADED — merge-landed's three, and for its reason. The whole
+  # point of this verb is to give the DISPATCHED seat a move, so that seat is
+  # first; it is deliberately not board-wide, because this write retires a hold
+  # and moves a row, and a row's moves belong to the seats the row names.
+  [[ "$actor" == "$owner" || "$actor" == "$asgn" || ( -n "$maker" && "$actor" == "$maker" ) || ( -n "$gb" && "$actor" == "$gb" ) ]] \
+    || fail "$E_AUTH_REQUIRED" "${ident} names '${owner}' as the seat that owes its merge, '${asgn:-nobody}' as its assignee, '${maker:-nobody}' as its maker and '${gb:-nobody}' as its grader — '${actor}' is none of them, REFUSED. This verb declines a merge on a row that names the seat declining it; it is not a board-wide reconciliation."
+
+  _task_merge_declined_record "$id" "$dref" "$why" "$actor" \
+    || fail "$E_GENERIC" "${ident}: the decline of ${dref} could not be recorded (the task store refused the write). Nothing changed."
+  local _moved; _moved=$(_task_merge_declined_handoff "$id" "$ident" "$asgn" "$maker")
+  ok "${ident}: ${dref} IS NOT THE PULL REQUEST THAT WILL LAND — recorded (${why}). NO LANDING WAS ASSERTED: nothing was merged, no machine account was used, GitHub was not asked and no merge_landed_* field was touched. The row has LEFT the merging stage and is owed a merge by nobody; re-pointing the binding (\`5dive task deliver ${ident} --pr=<url>\`) puts it back in.${_moved}" \
+     '{ident:$id, declined:true, already:false, ref:$ref, reason:$why, owner:$cl, actor:$ac}' \
+     --arg id "$ident" --arg ref "$dref" --arg why "$why" \
+     --arg cl "$([[ -n "$maker" ]] && printf '%s' "$maker" || printf '%s' "$asgn")" --arg ac "$actor"
+}
+
 # _merge_landed_read <pr-ref> <repo-slug> — HAS THIS PULL REQUEST ALREADY MERGED?
 # Prints `<merge-commit-sha>|<mergedAt>` when it has, and NOTHING otherwise (not
 # merged, or GitHub could not be asked). Never fails the caller: an unanswerable

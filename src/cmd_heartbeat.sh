@@ -4166,13 +4166,27 @@ _hb_loop_terminal_clause() {
       # forge already reports, retires the hold, exits the stage AND hands the
       # row to the closing seat in one act — so the seat this note wakes now has
       # a verb for the state it is woken into.
-      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS (%s): graded, delivery ref bound, and you own the merge. Read the pull request FIRST, then do exactly one of three and say which: (1) ALREADY MERGED -> %s, which records the landing, takes the row out of the merging stage and hands it to the seat that closes a loop row (its verifier %s, which may be you); the close is NOT yours to run from here while the row is assigned to the maker (DIVE-4520), and you must honour any owed clause in the PASS verdict first — a merged PR is not automatically a finished row, so leave it open if something is still owed; (2) mergeable and green -> %s, then record the landing exactly as in (1); (3) a required check is red or it conflicts -> that is the MAKER%s move: %s naming the check, and stop. Do not re-grade, re-deliver or route it onward.' \
+      # DIVE-4778 — AND A FOURTH BRANCH, BECAUSE THE THIRD WAS NOT THE LAST
+      # ANSWER. Three branches assumed the only question was whether this pull
+      # request CAN merge. It is not: it may be one nobody WANTS merged — held,
+      # superseded, or re-pointed at another repository — and none of the three
+      # is true then. `merge` refuses a draft, `merge-landed` is refused by its
+      # own probe, and `reject` is wrong (nothing is red) and destructive at the
+      # iteration cap. A seat woken into that state read this note, found no move
+      # in it, and declined; DIVE-4773 did it five times in one morning. So the
+      # note now names the verb for it, and — the part that matters most here —
+      # it says READ THE ROW BODY FOR A RULING DATED AFTER THE DELIVERY, because
+      # this whole dispatch was computed from fields a later ruling does not
+      # touch (community/wiki/a-draft-flag-is-a-hold-the-merge-dispatch-cannot-
+      # see.md).
+      printf ' NOTE — %s is GRADED AND THE MERGE IS YOURS (%s): graded, delivery ref bound, and you own the merge. Read the pull request FIRST — and read the row BODY for a ruling dated AFTER the delivery, because this note was computed from fields a later ruling does not touch — then do exactly one of four and say which: (1) ALREADY MERGED -> %s, which records the landing, takes the row out of the merging stage and hands it to the seat that closes a loop row (its verifier %s, which may be you); the close is NOT yours to run from here while the row is assigned to the maker (DIVE-4520), and you must honour any owed clause in the PASS verdict first — a merged PR is not automatically a finished row, so leave it open if something is still owed; (2) mergeable and green -> %s, then record the landing exactly as in (1); (3) a required check is red or it conflicts -> that is the MAKER%s move: %s naming the check, and stop; (4) THIS PULL REQUEST IS NOT THE ONE THAT WILL LAND — it is deliberately held (a draft flag is a hold, not an obstacle to clear), superseded, or pointed at the wrong repository -> %s, which records that the row is owed a merge by nobody, asserts NO landing, and hands the row back to the seat that can re-point the binding. Do not make a held pull request mergeable to satisfy this note. Do not re-grade, re-deliver or route it onward.' \
         "$task_ident" "$name" \
         "'5dive task merge-landed ${task_ident}'" \
         "'$vfier'" \
         "'5dive task merge ${task_ident}'" \
         "$([[ -n "$maker" ]] && printf "'s (%s)" "$maker" || printf "'s")" \
-        "'5dive task reject ${task_ident} --feedback=...'"
+        "'5dive task reject ${task_ident} --feedback=...'" \
+        "'5dive task merge-declined ${task_ident} --reason=\"<why it will never merge>\"'"
       return 0
     fi
     printf ' NOTE — %s is GRADED AND WAITING ON A MERGE owed by %s, not by you: the verifier has discharged the role, so this is TERMINAL FOR THIS GOAL. Treat the goal as MET and stop. The row stays open on purpose and closes on the merge (%s renders it as %s). Do not re-grade it, re-deliver it, or close it to make the loop stop.' \
