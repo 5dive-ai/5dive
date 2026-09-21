@@ -436,6 +436,8 @@ Four views over the box you are on:
 
 It is read-only and binds to loopback (there is no sign-in, so `--host` refuses a routable address unless you set `FIVE_UI_ALLOW_REMOTE=1`). Anything that changes state has a CLI verb. `5dive ui --data` prints the same JSON the views render, so you can pipe it somewhere else.
 
+Four views is a start, not a finish — [docs/contribute-ui.md](docs/contribute-ui.md) lists what is missing and where each screen's data would come from.
+
 ### Command reference
 
 ```
@@ -576,6 +578,10 @@ If you'd rather click than `ssh`, [5dive.ai](https://5dive.ai?utm_source=github&
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The `5dive` bundle at the repo root is built from `src/` via `./build.sh`; CI enforces no drift.
+
+Want a scoped first thing to build? The control plane on top of the runtime is early, and
+[docs/contribute-ui.md](docs/contribute-ui.md) is the honest map of what is missing from `5dive ui`,
+with the data source named for each one.
 
 ## License
 
