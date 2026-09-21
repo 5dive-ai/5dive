@@ -1,6 +1,269 @@
 # Changelog
 
-## Unreleased — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
+## v0.47.0 — feat(project): set-status moves a project between active, complete, archived, binned and backlogged (DIVE-4680) (#1048)
+
+`projects.status` and `projects.archived_at` have been in the schema since DIVE-484, and the
+read side has been printing both ever since — `project ls --json`, `project show`. Two
+consumers already branch on the value: `goal add` resolves a project's planner with
+`… AND status='active'`, and `task add --project=` refuses a row with "no active project" on
+the same predicate. Nothing in `src/` ever wrote either column, and `project` dispatched
+`add|ls|show` only, so `5dive project set-status x complete` answered "unknown project
+command". Every project on every box was stuck at `active` for its whole life — reported in
+#1036 by someone building a pipeline UI over the queue with no way to retire a lane.
+
+`5dive project set-status <key> <status>` is that writer. The five statuses are `active`,
+`complete`, `archived`, `binned` and `backlogged`, taken in any case and stored lowercase.
+Entering `complete`, `archived` or `binned` stamps `archived_at` and each later transition
+re-stamps it; entering `active` or `backlogged` clears it back to NULL. Setting the status a
+project already has exits 0, says `already <status>` and leaves the stamp alone, because a
+no-op is not a transition. This is the first change that lets those two `status='active'`
+predicates be false, so a project moved off `active` also stops taking new tasks.
+
+`tests/project_set_status_unit.sh` sources `src/` into a throwaway `TASKS_DB` and grades all
+five statuses through `show --json` and `ls --json`, the `archived_at` stamp and clear, the
+three refusals, and the `status='active'` query itself. Its mutant arm swallows the one
+`UPDATE` to reproduce the unwritten column and asserts the mutation took before striking out.
+
+## v0.47.0 — fix(tests): the dispatcher-claim harness no longer reaches the forge (DIVE-4732)
+
+- **The nightly dispatcher-claim harness is hermetic again.** DIVE-4701's per-tick forge-merge
+  sweep polled the harness's fixture pull request on the REAL repository, found a merged one
+  behind the plausible number, recorded the landing and took the row out of the DIVE-4261
+  busy discount — `full-pristine (1)` red on every main push since a7dc57dc, and the release
+  cut refused v0.47.0 on it. The harness now pins the forge read to "not landed" and its
+  fixture slug to a reserved `.invalid` host, so the sweep still runs and no arm can reach the
+  network. Test-only; no runtime change.
+
+## v0.47.0 — fix(heartbeat): a fresh wake no longer wipes a grade, and a claim that outlived its verdict is reclaimed (DIVE-4724)
+
+- **A dispatch no longer `/clear`s a seat whose last turn is still live.** DIVE-4298 reads an
+  idle pane with running background shells as "the turn is over" — true for DISPATCH, false for
+  the `/clear` that rode with it, because on a grading seat the background shell *is* the grade.
+  The tick now DOWNGRADES `fresh` to warm (it never defers, and never refuses the row) when the
+  seat has live background shells, or holds a delivered-and-unACKed row as its own verifier — the
+  two states where the session about to be wiped still owes a hand-back. A seat with neither
+  signal clears exactly as before.
+- **A claim that outlived its verdict is reclaimed instead of held forever.** DIVE-2560 exempts a
+  delivered, unACKed, verifier-held row from the idle-stall and hard-cap arms, because the clock
+  that matters there is the verifier's reading latency. Once a verdict for *this iteration* is on
+  the row that latency is over, and the exemption became permanent: the busy-guard counts the row
+  (a landed merge takes it out of `_TASKS_TFV_SQL`, so DIVE-4261's graded-merge discount stops
+  applying) so the seat is never dispatched, and the exemption is why the reaper never reached it.
+  Both doors, one claim — quinn's verifier lane read `busy — 2 in_progress, skip` every minute for
+  seven hours on 2026-09-20. The exemption now yields past the SAME budget every other arm uses;
+  inside it the verifier still gets its own window to finish the hand-back.
+- **`5dive task doctor` names the class: `claim-outlived-verdict`**, with the verb that clears it.
+  The repair above needs a running heartbeat; the report does not.
+
+## v0.47.0 — fix(heartbeat): send the standing verifier to the bounded grading packet (DIVE-4723)
+
+DIVE-4634's `5dive task grade-context` — the bounded grading packet — was a no-op for the seat that
+does every grade on this box. The instruction to run it existed in two places only: the ephemeral
+clone-grader goal (that lane's cron was disabled 2026-09-19) and the `review_mode=rubric` branch (no
+row is filed rubric). The standing verifier is woken by the heartbeat's generic dispatch, which
+still said *"read it with `5dive task show <ident>`"*. Measured on the grading seat's own
+transcripts after the v0.46.0 install (2026-09-20 16:15Z): **44 transcripts, `grade-context`
+occurrences = 0, `5dive task show` occurrences = 915.**
+
+The dispatch now branches its READ on the role it is waking, the same way DIVE-4576 branched the
+turn cap. A verifier woken to grade a delivery that carries a bound checkout and sha is told to run
+`grade-context` and grade from the packet; a maker's dispatch is byte-identical to before.
+
+The branch is narrowed by a column test (`_hb_grade_packet_available`) and not by the grade
+predicate alone: `grade-context` hard-fails on a handoff delivered without a usable checkout+sha, so
+naming the packet there would leave that grader with no read at all. Those grade wakes keep the row
+read.
+
+## v0.47.0 — fix(plugins): a seat that cannot READ the plugin record no longer reports every plugin verb as `unknown command` (DIVE-4709)
+
+- A plugin is enabled for the BOX; the record that says so
+  (`$STATE_DIR/plugins/installed.json`) is read per SEAT. `_plugin_verb_claims` opens with
+  `[[ -r "$f" ]] || return 0`, so a record the caller cannot read declares nothing — which
+  from the dispatcher is indistinguishable from a box with no plugins at all, and the verb
+  fell through to the typo's message. Measured on two customer boxes: two seats' connected-site
+  probe units failed EVERY fire for a week with `unknown command: browser`, exit
+  2/INVALIDARGUMENT, while the plugin was enabled box-wide and every other seat on the same
+  box probed fine. The customer-visible tile simply never updated, and an empty tile reads as
+  "nothing is connected".
+- The dispatcher now separates the two causes: it names the first path component that refuses
+  this caller and exits `E_PERMISSION`, saying in as many words that this is per-seat
+  visibility and not a missing install. An unclaimed verb on a healthy box stays silent
+  exactly as before — that quiet is the contract `main()` relies on for a typo.
+- `5dive doctor` grades the same question ahead of the failure: for every graded seat, can it
+  read the record? A seat that cannot is an `error` naming the seat, the consequence (its
+  plugin-verb units fail on every fire and whatever they feed silently never updates) and the
+  repair. The privilege drop runs a positive control first and reports UNKNOWN when that
+  fails, because a drop a sudoers policy denies exits exactly like a blinded seat.
+
+## v0.47.0 — fix(tests): pin the plugin catalogue the corpus harnesses read, and grade the tier relationship instead of the outcome (DIVE-4708)
+
+Two core harnesses asserted the SHAPE of a catalogue that a different repository owns, so the
+verdict on this tree was not determined by this tree. On 2026-09-20T15:55:49Z
+`5dive-ai/5dive-plugins@a609407` published a sixth plugin, `mod`, and from that instant every
+build of this repo went red on the required `test` context with no commit of its own. The merge
+queue froze; PR #1041, whose whole diff was `src/lib/tasks_db.sh`, one test and a changelog, was
+graded red for it.
+
+The two arms broke for OPPOSITE reasons, which is the tell — and neither discipline was the fix.
+
+`tests/plugin_installs_scope_unit.sh` wrote its fixture catalogue straight into the plugin store
+but never registered it in `marketplaces.json`. `_plugin_register_registry` keys its once-only
+self-registration on that file, so the first `plugin add` in T1 `rm -rf`'d the fixture and cloned
+the LIVE registry over it — over the network, from a repo this one does not control. T2a's
+five-name expectation was therefore never grading a fixture at all. The fixture is now supplied
+through `FIVEDIVE_PLUGIN_REGISTRY`, the seam the product already owns, which is the only place
+the substitution can be made before the network is reached: `_plugin_ensure_store` calls
+`_plugin_register_registry` itself, so `plugin marketplace add` arrives too late and refuses with
+`E_CONFLICT`. `T0a` and `T2a-pin` assert the catalogue on disk before and after the `plugin add`
+block, so a replacement is reported as a replacement rather than as an unexplained extra name.
+
+`tests/plugin_bundled_install_unit.sh` did the opposite and refused to hard-code, so `mod` entered
+`BUNDLED` the moment it was published and T1 then demanded an install the trust gate is SUPPOSED
+to refuse. The harness enumerated the CATALOGUE while the product enumerates the `official`
+ALLOWLIST — `_plugin_trust_gate` reads each plugin's own `fivedive.trust.review` — and those two
+sets were equal by coincidence with nothing anywhere asserting that they must be. Discovery now
+splits the box-installable plugins by the tier each one DECLARES, resolved through the `source`
+its publisher declares in the index: T1/T2/T7 grade the official set, T1b/T2b grade that an
+unreviewed one is refused and leaves no record, and T1c asserts the biconditional itself. A
+publisher adding a plugin now moves a name between two buckets; it can no longer move the verdict.
+
+Adding `mod=box` to the expected string would have re-armed both generators on plugin #7.
+Neither arm was deleted and no safety control was widened — `T0b` still requires an installable
+plugin so the corpus loops cannot go vacuous, and three mutation controls are measured: widening
+`_plugin_trust_gate` to accept unreviewed reddens T1b/T1b2/T1c/T2b, re-widening the T1 loop back
+to the whole catalogue reddens T1/T1c/T2, and removing the seam pin reddens T0a/T2a/T2a-pin with
+the live six-name catalogue named in the diff.
+
+## v0.47.0 — feat(heartbeat): the heartbeat records a merge the maintainer made on the forge (DIVE-4701)
+
+- **The heartbeat now records a merge the maintainer made on the forge.** Every row in
+  `graded->merge` has its bound pull request polled on each tick over the credential-free
+  rail. When the forge reports a landing, the heartbeat records the merge sha, retires the
+  merge hold, takes the row out of the merging stage and hands it to the seat whose close
+  is ungated — so a row no longer waits for a seat to be woken and to look. On a box with
+  no machine credential that wait was a human noticing. It **never closes a row**: a
+  merged pull request is not automatically a finished row, so the close stays a judgement
+  a seat makes. An open pull request and an unreachable rail both change nothing; an
+  unreachable rail is reported once by `5dive doctor --category=creds` rather than on every
+  tick. Off switch: `FIVEDIVE_FORGE_MERGE_POLL=off`.
+
+## v0.47.0 — fix(fleet): opt out of claude.ai account plugin/skill sync on every box (DIVE-4697)
+
+Claude Code 2.1.275 added a second path by which plugin and skill code reaches a seat: the skills
+and plugins enabled on the **claude.ai account** are synced into every terminal session signed in
+with it — plugins re-synced at each launch, skills every ten minutes. Our auth profiles are shared
+across seats and boxes (one of them carries 11 seats), so a single toggle in that account's web UI
+would land code in every seat on the profile, everywhere, while the decided direction is that what
+runs in a seat is a BOX decision (`/dashboard/plugins`, DIVE-4434).
+
+The channel allowlist does not cover it. Measured in the 2.1.278 binary: the channel-start path
+compares a synced plugin's marketplace and then requires an `allowedChannelPlugins` entry, so such a
+plugin cannot push inbound messages — and that is *all* it gates. Skills, commands, hooks, agents
+and MCP servers from a synced plugin load exactly like ones we installed ourselves. The
+managed-settings key is the only control we have proven, which is why it is a floor and not a
+preference.
+
+`syncClaudeAiSkills` and `syncClaudeAiPlugins` are now written `false` by every path that produces
+`/etc/claude-code/managed-settings.json`: `install.sh`'s new-file template (a box provisioned from
+now on), `install.sh`'s reconcile (**every existing box, on its next nightly** — the updater curls
+this file from `main`, so no tag cut is owed for that half), and `reconcile_managed_settings()`
+(`doctor --fix`). `doctor --category=plugins` reports the gap and names the row.
+
+Three choices worth the words:
+
+- **One constant, not a literal per site.** `FIVEDIVE_MANAGED_SYNC_OFF_JSON` in `src/header.sh` is
+  read by the fixer AND by the gate that decides whether to call the fixer. Those two were separate
+  hand-kept literals for the channel list, drifted the day buzz shipped, and the gate printed `[ok]`
+  on every affected box (DIVE-3537). `install.sh` is curl-piped and cannot source it, so it keeps
+  its own copies — diffed against the constant by `tests/managed_settings_selfheal_unit.sh`.
+- **The keys are assigned, not merged.** Only `false` is honoured (the feature is enabled
+  server-side, so `true` turns nothing on early), which makes `true` a misconfiguration to correct
+  rather than an operator preference to keep. A box that wants the sync ON deletes the keys and
+  stops running the reconcile — a per-box decision the template is not where to express.
+- **An absent key is not an opt-out.** `null == false` is false in jq, so every box provisioned
+  before 2026-09-20 routes to the repair path rather than to `[ok]`.
+
+Graded by 38 arms in `tests/managed_settings_selfheal_unit.sh` (11 of them red on a control worktree
+at unmodified `origin/main`, including two counters that fail if a data-driven loop covers nothing),
+plus two arms on real documents: the patched reconcile is a byte-identical no-op against this control
+host's live settings file, and adds both keys to that file's pre-change backup while keeping all five
+allowlist entries.
+
+On a claude.ai **team/enterprise** login the org's remote managed settings override this local file
+entirely; there the control is the org admin's settings, not this key.
+
+- `tests/managed_settings_reconcile_unit.sh`: the pre-existing guard on this filter now
+  builds its "already-current" fixture from BOTH managed constants, and adds the positive
+  half — a file WITHOUT the sync keys is rewritten and gains them.
+
+## v0.47.0 — perf(tests): the core corpus stops re-resolving the prod-store path on every SQL statement (DIVE-4669)
+
+`_tasks_store_fence` (DIVE-2249) is what stops a harness that lost its `STATE_DIR` isolation from
+appending real-looking rows to the live board. It short-circuits on the entrypoint marker that
+`src/main.sh` sets as its first statement, so **no production call ever reaches past that line** —
+everything the rest of the fence spends is spent by sourced-library callers, which in this repo
+means `tests/*.sh`, once per `db()` call.
+
+What it spent: `_tasks_store_is_prod` resolved BOTH candidate paths with `readlink -f` on every
+statement — two process spawns (three with `FIVEDIVE_FENCE_EXTRA_STORE` set) to re-answer a
+question whose inputs had not changed. Measured on the control plane, that was 7.3ms of the 9.5ms
+a `db()` call cost, against 2.2ms for the `sqlite3` spawn the call exists to make: the fence was
+costing three times the query.
+
+The answer is now memoised on the inputs it is a function of — the active store path and the
+extra-store knob — so a harness that re-points `TASKS_DB` between arms re-resolves from scratch and
+one that does not, does not. **This is a corpus-cost change, not a fence change**: no path is
+removed from the fenced set, no caller is exempted, and the refusal is byte-identical.
+
+Graded by four new arms in `tests/tasks_store_fence_unit.sh`, both directions of a stale answer
+plus the reclaim itself. A stale "not prod" would ADMIT a write the fence exists to refuse, and a
+stale "prod" would fence every isolated harness in the corpus, so each is asserted by re-pointing
+`TASKS_DB` mid-process rather than by reading the key. The reclaim arm counts `readlink` spawns
+across five identical fence calls and requires ONE resolution — with a lower bound too, so a stub
+that never ran cannot report zero and pass.
+
+The residual, stated rather than left to be found: the memo does not see a path whose SYMLINK
+TARGET is re-pointed underneath an unchanged path string inside a single process. No caller in this
+repo does that, and the key covers every input a caller can actually change.
+
+## v0.47.0 — feat(agent): every seat's commits name the seat by its stable OpenAgent id (DIVE-4667)
+
+`git log` could not answer "which seat made this". The author line is the human — deliberately, and it
+stays that way (DIVE-3113: the author is a readable accountability trail, and the Vercel tripwire stands)
+— so the seat had nowhere to appear at all. Every commit a 5dive agent makes now carries one extra
+trailer naming it:
+
+    Co-Authored-By: dario <oa-7f3a00000000@openagent.5dive.ai>
+
+The address is the seat's **stable** OpenAgent id, minted once at `5dive agent create` (and once, on
+upgrade, for seats that predate this). The display name in front of it may change; the id may not, so the
+trail survives a rename. The local part is the seat's public card: `oa-7f3a00000000` →
+`https://openagent.5dive.ai/card/oa-7f3a00000000`. Claude Code's own `Co-Authored-By: Claude …` trailer is
+untouched — theirs names the model, ours names the seat.
+
+**Git has no co-author setting, so this is a `prepare-commit-msg` hook**, not a config key. That choice is
+what makes it tool-agnostic: codex, grok, opencode, pi and antigravity seats all commit through the same
+git, so none of them needed per-tool work. It is idempotent by the id, not by the line — an amend, rebase
+or cherry-pick that already carries the seat's trailer under an older display name has that spelling
+replaced, never doubled. It never writes author or committer; a mutant that does reds the suite.
+
+**The hook had to be installed into all three hook-path populations**, because `core.hooksPath` is
+single-valued and the nearest scope wins. The PII push guard already owns a *local* `core.hooksPath` in
+most repos, which silently outranks anything global: a copy that only reached the new global path would
+have covered exactly the repos the guard had not been installed in. So the hook ships to the seat's global
+hooks dir, into the portable guard home beside `pre-push`, and into the repo's own `scripts/git-hooks`.
+
+**One switch, and it is per box, not per seat** — `5dive config coauthor=on|off`, default on. A customer
+who does not want an openagent address in their history turns it off for the whole box; existing commits
+are untouched. There is deliberately no per-seat toggle: a trail with holes answers "which seat made this"
+for nobody.
+
+**Not closed here:** `openagent.5dive.ai` has no MX record, so it is neither a null MX (RFC 7505) nor a
+confirmed bouncing catch-all, and nothing stops a third party claiming it as a mailbox. Ops has it. The
+hook is deliberately not gated on that DNS operation — the addresses are identifiers, never a destination
+anyone sends to.
+
+## v0.47.0 — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
 
 0.26.1 shipped a launcher that could not start any agent (DIVE-4067). The nightly installs the
 release and then restarts every agent, so every box that took it **emptied itself, unattended**,
@@ -38,7 +301,7 @@ first agent it restarts:
 
 `self-update`'s JSON gains a `health_gate` object; every existing field keeps its meaning.
 
-## Unreleased — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
+## v0.47.0 — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
 
 `5dive team import <slug>` provisioned a **roster**, not a working company. Agents, roles and
 reporting lines came up with nothing recurring on the board, so an imported team sat idle
@@ -95,7 +358,7 @@ functional against a real sqlite task store with a stub CLI, not source greps; e
 (kill the reconcile, drop the title arm, fold loop errors into `errors`, move the pass above
 the creates, strip the template's loops, …) were each run alone and each went red.
 
-## Unreleased — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
+## v0.47.0 — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
 
 All four bundled team templates hard-set `defaults.type: claude`, so `5dive team import
 content-studio` could only ever produce Claude Code seats — even though `agent create` has
@@ -134,7 +397,7 @@ long accepted every harness in `TYPE_BIN` and per-agent `type:` was already read
 and `cmd_team` themselves, each with a no-flag negative control. The wiring arms are not decoration: a
 mutation that parses `--type` and never applies it survived every transform-level arm.
 
-## Unreleased — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
+## v0.47.0 — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
 
 DIVE-3885 shipped the right rule — *a checker that could not RUN is `unknown`, never `stale`,
 because a broken instrument must not accuse a true fact* — and encoded it as a list of EXIT CODES
@@ -165,7 +428,7 @@ cases that must be classified oppositely share an exit code. **Parseability is t
 - 3 new harness sections (74/74 green), including the **negative control that decides the design**:
   an rc=2 check that PARSES must stay `stale`.
 
-## Unreleased — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
+## v0.47.0 — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
 
 Item 3 of the memory-janitor plan is a `check:` whose exit code re-derives a fact, plus a pass that
 flips it stale. It looked buildable on the existing `--evidence=<kind>:<ref>`: `cmd:` *is* a check,
@@ -203,7 +466,7 @@ arm through the built binary — that arm is what caught the stale exit code bei
 "this is a bug in the CLI" by the `lib/output.sh` backstop, which would have buried the digest a
 nightly pass exists to produce.
 
-## Unreleased — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
+## v0.47.0 — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
 
 `agent info` printed **⚠ NOT TRANSACTING (quota-exhausted)** about a seat that was executing the very
 command that read the flag. Measured 2026-09-01 14:17Z on `ops`: the pane refusal it quoted said
@@ -232,7 +495,7 @@ Undated pane lines resolve to the NEAREST of yesterday/today/tomorrow at that ti
 at 23:55 is tomorrow and `11pm` read at 00:05 is yesterday. Residual, stated rather than hidden: a refusal
 still on screen more than ~12h later reads as the same time-of-day today.
 
-## Unreleased — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
+## v0.47.0 — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
 
 Two rails, each correct, that intersect on a seat which can satisfy neither:
 
@@ -266,7 +529,7 @@ STATUS proves the merge". Nothing read it.
 
 Not touched: only-the-verifier-closes stays exactly as it is.
 
-## Unreleased — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
+## v0.47.0 — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
 
 `task show` printed a row's gate at the TAIL of the record, below the body; `task ls` printed nothing at
 all. So the board could not answer the one question a fleet with a paired human is most often asked —
@@ -304,7 +567,7 @@ all. So the board could not answer the one question a fleet with a paired human 
   fleet-wide by DEFAULT since DIVE-3224, so the flag OSS-36 specified was never built and anyone reaching
   for it got `unknown flag: --fleet` — a hard error where the view they wanted was already on screen.
 
-## Unreleased — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
+## v0.47.0 — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
 
 On 2026-08-28 05:00Z the board read **31 open rows** and `5dive-ai/5dive` main had not moved in **~42h**
 (`5816e7a` / `v0.23.0`, since 2026-08-26 10:23Z). Of the 31: 30 `blocked`, exactly **1 `todo`**. A reader
@@ -345,7 +608,7 @@ Complements the heartbeat's `_hb_blocked_sweep` (DIVE-1355) rather than replacin
 a2a at most once per 24h and covers two of these four classes. A throttled push to one seat's inbox is a
 different job from an operator looking at a stalled board now.
 
-## Unreleased — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
+## v0.47.0 — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
 
 The **v0.23 headline capability**. The theme was ratified 2026-08-26 as "Liveness you cannot fake"
 (DIVE-3738); v0.23.0 shipped its substrate — courier-routed alarms (DIVE-3727) and the rung-4
@@ -390,7 +653,7 @@ both directions — the third state folded UP into `alive`, folded DOWN into `no
 freshness window removed — each asserted to have applied and to turn a *named* arm red while leaving
 the others green, so no arm's green is the fixture's doing.
 
-## Unreleased — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
+## v0.47.0 — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
 
 On 2026-08-26 the supervisor printed `ESCALATE <seat> (poller-dead: rung-4-needed)` for `marketing`,
 `main`, `dev` and `olivia`. The detection was correct, it fired on time — and **nothing served rung 4**,
@@ -446,7 +709,7 @@ out of sqlite), `poller_liveness_unit` (41), `supervisor_classify_unit` (37),
 case, the tick dispatch entry, the counter exclusion, the limiter and the retired remedy text each red
 exactly the arms that claim them.
 
-## Unreleased — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
+## v0.47.0 — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
 
 INST-4 made the *record* of an action idempotent (`lifecycle_events` has a UNIQUE index on
 `idem_key`). INST-5 bounded *who* may act and *what* they may act on. Neither could answer the
@@ -493,7 +756,7 @@ next (email / pay / publish) would have been double-send, double-pay, double-pub
   the double-claim refusal must go red), the inversion arm with its live control, and a realistic
   pre-INST-8 store fixture for the migration.
 
-## Unreleased — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
+## v0.47.0 — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
 
 `5dive memory consolidate` had produced atoms **once across the entire fleet** while
 `/var/log/5dive-heartbeat.log` reported `13 seat(s) distilled, 4 failed, 0 not due` every six hours
@@ -533,7 +796,7 @@ it is a liveness check wearing a productivity label; and **hand-written artifact
 are not evidence the pipeline ran** — a populated output directory reads exactly like a working
 extractor, and only the ledger tells them apart.
 
-## Unreleased — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
+## v0.47.0 — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
 
 A session window dies and everything it learned dies with it, because "compile before you close" is
 a HABIT and a habit is not a mechanism. The motivating case is on the record: the very
@@ -601,7 +864,7 @@ Tests: `tests/memory_consolidate_unit.sh`, 53 assertions, offline by constructio
 an injected seam). Four mutants — the live-session skip, the dry-run ledger guard, the ledger skip,
 and the errexit fix — each red exactly the arm meant to catch it.
 
-## Unreleased — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
+## v0.47.0 — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
 
 DIVE-3172 made the nightly restart conditional on the agent payload actually moving, which takes a
 CLI-only night to zero restarts. This is the belt for the nights the payload genuinely moves: those
@@ -640,7 +903,7 @@ concern - our nightly updates kills some active agents mid tasks"*).
   three sweeps of one marker — parked mid-task is NOT restarted and keeps its marker; the row closes
   and the SAME marker fires the bounce; the next sweep does not bounce it again.
 
-## Unreleased — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
+## v0.47.0 — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
 
 Since DIVE-1935 the mandatory auto-detect merge gate has said so when its repo scan cannot
 complete: it warns, writes a `task.merge-gate-unverified` row to the audit log, and lets the close
@@ -672,7 +935,7 @@ never read is a receipt, not a control.
 - **Exit status is the consumable signal** (1 when any stamped close still has an open PR), because
   a stamp with no consumer is the whole defect.
 
-## Unreleased — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
+## v0.47.0 — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
 
 `--apply` was already safe: it deletes only on a closed PR whose head SHA equals the branch's
 current SHA, and age never entered that path. **The digest above it was the problem.** Its
@@ -736,7 +999,7 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
   the invariant `branch-hygiene-report.sh` greps for when it runs this same script against
   `lodar/5dive-api` and `lodar/5dive-frontend`.
 
-## Unreleased — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
+## v0.47.0 — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
 
 The constitution validator and the authority reader accepted **disjoint** subsets of YAML, so the
 key was unsettable through any path: `council amend` threw `use inline arrays in constitution v0`
@@ -762,7 +1025,7 @@ worked example — so the template failed the validator shipping beside it.
   *"no motion could have succeeded"*, not *"nobody convened one"* — an instrument that measured its
   own writer.
 
-## Unreleased — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
+## v0.47.0 — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
 
 lodar, 2026-08-16, on a routine branch-push approval waking the org lead: *"why dev2 cannot do
 delegated push himself and burns your token for approval?"* An approval gate whose ask is an
@@ -796,7 +1059,7 @@ permanent gate record and digest line intact, and **no ping to anyone**.
 - **`5dive task pfr-autoclear [on|off|status]`**, default **on**, restores the lead ping with no
   release.
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.47.0 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -826,7 +1089,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.47.0 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -850,7 +1113,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.47.0 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -883,7 +1146,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.47.0 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -917,7 +1180,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.47.0 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -959,7 +1222,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.47.0 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -1023,7 +1286,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.47.0 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
