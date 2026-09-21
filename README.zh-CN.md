@@ -210,7 +210,7 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 `5dive watch`<br>
 实时查看整个团队。
 
-`5dive ui`<br>
+`5dive plugin add 5dive-ai/5dive-ui`<br>
 在本地浏览器中查看组织架构、任务队列和人工关卡。
 
 `5dive wall main olivia dev quinn ops --grid=3x2`<br>
@@ -372,9 +372,10 @@ sudo 5dive plugin rollback browser@5dive-browser 1.1.0
 
 ### 查看组织层：`5dive ui`
 
-CLI 自带一个 Web 界面。无需安装、无需构建、无需账户：
+Web 界面是一个插件，有[自己的仓库](https://github.com/5dive-ai/5dive-ui)。安装一次即可，无需构建、无需账户：
 
 ```sh
+5dive plugin add 5dive-ai/5dive-ui
 5dive ui                 # http://127.0.0.1:8735
 ```
 
@@ -384,7 +385,7 @@ CLI 自带一个 Web 界面。无需安装、无需构建、无需账户：
 - **队列（Queue）** 每一条未关闭的任务、负责人、验收人，以及 maker 到 verifier 的交接进展到了哪一步。
 - **闸门（Gates）** 哪些事项停在人那里、处于哪个层级，以及提问智能体建议的答案。
 
-界面只读，并绑定到 loopback（没有登录，因此除非设置 `FIVE_UI_ALLOW_REMOTE=1`，`--host` 会拒绝可路由的地址）。任何会改变状态的操作都有对应的 CLI 命令。`5dive ui --data` 会输出视图渲染所用的同一份 JSON，方便你把它传给其他工具。
+界面只读，并绑定到 loopback（没有登录，因此除非设置 `FIVE_UI_ALLOW_REMOTE=1`，`--host` 会拒绝可路由的地址）。任何会改变状态的操作都有对应的 CLI 命令。`5dive ui --data` 会输出视图渲染所用的同一份 JSON，方便你把它传给其他工具——这份 JSON 来自内置命令 `5dive board --json`：核心拥有[看板文档](docs/board-contract.md)，插件负责呈现。
 
 ### 命令参考
 
@@ -408,7 +409,8 @@ CLI 自带一个 Web 界面。无需安装、无需构建、无需账户：
 5dive heartbeat on / off / ls / tick     # 唤醒有排队任务的智能体
 5dive org       set / tree               # 谁向谁汇报
 5dive wall [--grid=CxR] [<seat>...]      # 所有智能体的实时终端平铺在一个屏幕上，只读
-5dive ui                                 # 浏览器中的三个视图（见下文）
+5dive board [--json]                     # 本主机的看板（一份带版本的文档）
+5dive ui                                 # 浏览器中的视图（插件：5dive-ai/5dive-ui）
 
 5dive account   add / login / list / show / usage / rename / remove
 5dive auth      set / login / status     # 底层接口；人通常使用 account
