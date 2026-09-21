@@ -100,6 +100,43 @@ NM=$(_hb_nudge_text dev "$TM" DIVE-M1)
 has "$NM" "Stop after 6 turns" && ok_t "a non-grade wake keeps the historical cap" || bad_t "a non-grade wake keeps the historical cap" "$NM"
 ! has "$NM" "VERIFY THE CLAIMS" && ok_t "a maker is not handed the grader's method" || bad_t "a maker is not handed the grader's method" "$NM"
 
+echo "── PART 3b — DIVE-4723: the READ the dispatch names, per role ────"
+# The defect this part exists for: DIVE-4634's bounded packet was reachable from
+# the clone-grader goal and the rubric branch only, so the seat that does every
+# grade on this box was still told "read it with `task show`" and never once ran
+# the verb (41 quinn transcripts after the upgrade, 0 occurrences). These arms
+# read the exact bytes, which is the only thing that reaches the seat.
+#
+# A grade wake is NOT sufficient on its own: `task grade-context` hard-fails on a
+# handoff with no bound checkout+sha, so the packet is named only where it can be
+# built, and every other grade wake keeps the row read. Both halves are armed.
+mkd() { # <ident> <assignee> <verifier> <maker> <repo-dir> <sha> -> task id
+  local id; id=$(mk "$1" "$2" "$3" "$4")
+  db "UPDATE tasks SET delivery_repo_path=$(sqlq "$5"), delivered_sha=$(sqlq "$6") WHERE id=${id};"
+  printf '%s' "$id"
+}
+SHA40=1111111111111111111111111111111111111111
+TGP=$(mkd DIVE-G2 quinn quinn dev "$TMP" "$SHA40")   # delivered WITH a bound checkout+sha
+NGP=$(_hb_nudge_text quinn "$TGP" DIVE-G2)
+has "$NGP" "5dive task grade-context DIVE-G2" \
+  && ok_t "a grade wake on a bound delivery names the bounded packet" \
+  || bad_t "a grade wake on a bound delivery names the bounded packet" "$NGP"
+! has "$NGP" "read it with '5dive task show DIVE-G2'" \
+  && ok_t "and it no longer opens by sending the grader to the full row read" \
+  || bad_t "and it no longer opens by sending the grader to the full row read" "$NGP"
+has "$NGP" "Stop after 25 turns" \
+  && ok_t "the grade budget survives the new branch" || bad_t "the grade budget survives the new branch" "$NGP"
+# TG is the same grade wake with NO delivered checkout/sha: grade-context would
+# fail, so naming it would leave the grader with no read at all.
+! has "$NG" "grade-context" \
+  && ok_t "a grade wake with no buildable packet is not sent to the verb" || bad_t "a grade wake with no buildable packet is not sent to the verb" "$NG"
+has "$NG" "read it with '5dive task show DIVE-G1'" \
+  && ok_t "it keeps the row read instead" || bad_t "it keeps the row read instead" "$NG"
+! has "$NM" "grade-context" \
+  && ok_t "a MAKER dispatch is unchanged — no packet verb" || bad_t "a MAKER dispatch is unchanged — no packet verb" "$NM"
+has "$NM" "read it with '5dive task show DIVE-M1'" \
+  && ok_t "a MAKER dispatch still opens with the row read" || bad_t "a MAKER dispatch still opens with the row read" "$NM"
+
 echo "── PART 4 — the restated predicate agrees with the variant ───────"
 # Every shape through BOTH. `want` is what the CLAUSE does (the authority);
 # `_hb_is_grade_wake` must match it exactly.
@@ -119,20 +156,32 @@ agree "self-graded row (maker == verifier)" DIVE-A5 quinn quinn quinn quinn
 agree "bystander woken"                    DIVE-A6 quinn quinn dev   olivia
 agree "no verifier at all"                 DIVE-A7 dev   ''    ''    dev
 
-echo "── PART 5 — mutation: the budget is actually read ────────────────"
+echo "── PART 5 — mutation: the role test is what produces both ───────"
 ORIG=$(declare -f _hb_nudge_text)
 # `declare -f` reprints the body, not the source bytes (it spaces `2> /dev/null`
-# and adds a trailing `;`), so the pattern matches the reprinted shape.
-MUT=$(printf '%s\n' "$ORIG" | sed '0,/_hb_is_grade_wake .*_hb_grade_turn_budget)/s//:/')
-if [[ "$MUT" == "$ORIG" ]]; then
-  bad_t "mutation landed" "sed matched nothing — the arm below would be vacuous"
-else
-  eval "$MUT"
-  has "$(_hb_nudge_text quinn "$TG" DIVE-G1)" "Stop after 6 turns" \
-    && ok_t "cutting the role test reverts the cap to 6 (the test is what raises it)" \
-    || bad_t "cutting the role test reverts the cap to 6" "the cap is not attributable to the role test"
+# and adds a trailing `;`), so the patterns match the reprinted shape.
+mutate() { # <label> <sed-expr> <text-that-must-vanish> <subject-task-id> <ident>
+  local label="$1" expr="$2" gone="$3" tid="$4" ident="$5" mut
+  mut=$(printf '%s\n' "$ORIG" | sed "$expr")
+  if [[ "$mut" == "$ORIG" ]]; then
+    bad_t "mutation landed: $label" "sed matched nothing — the arm would be vacuous"; return
+  fi
+  eval "$mut"
+  ! has "$(_hb_nudge_text quinn "$tid" "$ident")" "$gone" \
+    && ok_t "mutant: $label" || bad_t "mutant: $label" "survived — the behaviour is not attributable to that line"
   eval "$ORIG"
-fi
+}
+# Cut the role test: the cap must fall back to 6 (DIVE-4576) AND the packet verb
+# must disappear with it (DIVE-4723) — both hang off the one predicate.
+mutate "cutting the role test reverts the cap to 6" \
+  '0,/if _hb_is_grade_wake .*; then/s//if false; then/' "Stop after 25 turns" "$TG" DIVE-G1
+mutate "cutting the role test also removes the packet verb" \
+  '0,/if _hb_is_grade_wake .*; then/s//if false; then/' "grade-context" "$TGP" DIVE-G2
+# Cut ONLY the packet-availability test: the grade wake still gets its budget,
+# but the verb is gone — so the verb is attributable to that branch and not to
+# some other sentence that happens to mention it.
+mutate "cutting the packet test removes the packet verb" \
+  '0,/_hb_grade_packet_available /s//false /' "grade-context" "$TGP" DIVE-G2
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAILN"
 (( FAILN == 0 ))
