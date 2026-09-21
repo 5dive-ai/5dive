@@ -49,6 +49,13 @@ bad_(){ FAIL=$((FAIL+1)); printf 'FAIL %s — %s\n' "$1" "${2:-}"; }
 TMPD="$(mktemp -d "${TMPDIR:-/tmp}/pace-week.XXXXXX")"
 trap 'rc=$?; rm -rf "$TMPD"; echo "HARNESS-RC=$rc"' EXIT
 
+# DIVE-4731: the account-reading cache is a FILE cache and its default lives in
+# STATE_DIR (/var/lib/5dive). Point it at the scratch tree before anything
+# sources grader_pool.sh, so this harness can never read — or poison — the
+# running host's pacing state.
+export FIVE_PACE_READING_CACHE_DIR="$TMPD/pace-reading"
+PACE_RCD="$TMPD/pace-reading"
+
 # ── A/B/C: the floor itself ────────────────────────────────────────────────
 # shellcheck source=/dev/null
 source src/task/grader_pool.sh
@@ -660,6 +667,11 @@ CF="$TMPD/pace-cache.json"
 # the reset fence all execute and only the file read is replaced. Stubbing the
 # command seam instead would grade the caller and nothing else.
 jarm(){ # <snapshot-json> <usage-doc-or-empty> -> "<rc> <verdict>"
+  # DIVE-4731 put a per-account reading cache under `_pace_account_seven`. Every
+  # arm below grades ONE reading, so each starts from a COLD cache — otherwise
+  # arm N+1 would be served arm N's snapshot and this whole section would grade
+  # the cache instead of the floor. The cache's own behaviour is section N.
+  rm -rf "$PACE_RCD" 2>/dev/null
   ( source src/task/grader_pool.sh
     quota_snapshot_read(){ printf '%s' "$1"; }
     # shellcheck disable=SC2317
@@ -1084,6 +1096,7 @@ got=$(mcap codex "$TMPD/no-such-registry.json")
 # M3 — the band. `marm <types> <usage-json> <snapshot-json>` in a subshell so
 # the caller can set FIVE_PACE_* before the file is sourced.
 marm(){ # <types|""> <usage-json|""> <snapshot-json|""> -> "<rc> <verdict>"
+  rm -rf "$PACE_RCD" 2>/dev/null   # DIVE-4731: one reading per arm (see jarm)
   ( source src/task/grader_pool.sh
     MTYPES="$1"; MSNAP="$3"
     # shellcheck disable=SC2317
@@ -1156,6 +1169,168 @@ for probe in "low standard" "low recurring" "urgent recurring"; do
 done
 (( mad == 0 )) && ok_ "M5: band 0 admits every priority and the recurring beats — the seats are genuinely unheld" \
   || bad_ "M5: band 0 admits" "a row was still held under the open band"
+
+# ── N: DIVE-4731 — ONE ACCOUNT READING PER TICK, NOT ONE PER TEMPLATE ──────
+# The row, from /var/log/5dive-heartbeat.log: two recurring beats due in the
+# SAME minute on the SAME account got OPPOSITE verdicts two seconds apart, twice
+# (2026-09-20 03:00, 2026-09-18 04:00). The per-seat document is collected once
+# per tick and is a `max`, so it could not have differed; the ACCOUNT reading is
+# re-read once per TEMPLATE, and the materializer's SELECT is unordered, so the
+# lowest row id ate the blind read. That is the whole reason creative's OpenAgent
+# beat stayed dead a day longer than dev's (DIVE-4728).
+#
+# Every arm here is about ONE claim: carrying the last good reading across a
+# flicker must not make the floor looser, fresher, or inventive.
+narm(){ # <body...> -> runs in a cold-cache subshell with the real functions
+  rm -rf "$PACE_RCD" 2>/dev/null
+  ( source src/task/grader_pool.sh
+    # A CARRIER MUST EXIST for the cache to be consulted at all (N9 grades that
+    # gate). These arms are about what the cache does once there IS one, so the
+    # cheapest possible carrier is declared here; every arm that cares about the
+    # carrier's ANSWER redefines it below and wins.
+    # shellcheck disable=SC2317
+    quota_snapshot_read(){ printf ''; }
+    # An arm that names a function this tree does not have must go RED with a
+    # reason, not green on an empty expansion — that is how the control run
+    # against origin/main proves these arms discriminate at all.
+    declare -F _pace_account_reading_cached >/dev/null 2>&1 \
+      || { printf 'NO-SUCH-FUNCTION'; exit 0; }
+    eval "$1" )
+}
+
+# N1 — ONE READ PER TICK. Two calls inside the TTL reach the carrier ONCE.
+# This is the defect's mechanism stated as a count: today it is two reads and
+# therefore two chances to land in a gap.
+got=$(narm '
+  CNT="$TMPD/reads"; : > "$CNT"
+  _grader_account_reading_json(){ printf x >> "$CNT"; printf "{\"asOf\":1,\"sevenDayPct\":20}"; }
+  a=$(_pace_account_reading_cached acct); b=$(_pace_account_reading_cached acct)
+  printf "%s|%s|%s" "$(wc -c < "$CNT" | tr -d " ")" "$a" "$b"')
+[[ "${got%%|*}" == "1" ]] && [[ "${got#*|}" == '{"asOf":1,"sevenDayPct":20}|{"asOf":1,"sevenDayPct":20}' ]] \
+  && ok_ "N1: two templates in one tick reach the carrier ONCE and get the SAME reading" \
+  || bad_ "N1: one read per tick" "reads|a|b = $got"
+
+# N2 — THE ROW ITSELF, through the real reader. The carrier answers the first
+# template and goes quiet for the second; the seat document says 100% (the
+# stale `max` that has no measurement time of its own). Before this row the two
+# verdicts were OPEN and HARD — a beat fired or lost by two seconds.
+FLICK=$(narm '
+  FLAG="$TMPD/once"
+  quota_snapshot_read(){ if [[ -e "$FLAG" ]]; then printf ""; else : > "$FLAG"; printf "%s" "$SNAP"; fi; }
+  SNAP='"'"'{"writtenAt":0,"accounts":[{"name":"acct","usage":{"asOf":'"$(( NOW - 60 ))"',"fiveHour":{"pct":5,"resetsAt":'"$(( NOW + 3600 ))"'},"sevenDay":{"pct":20,"resetsAt":'"$FAR"'}}}]}'"'"'
+  DOC='"'"'{"agents":[{"name":"s1","account":"acct","sevenDayPct":100,"sevenDayResetsAt":'"$FAR"'}]}'"'"'
+  r1=0; v1=$(printf "%s" "$DOC" | _pace_band_7d acct '"$NOW"') || r1=$?
+  r2=0; v2=$(printf "%s" "$DOC" | _pace_band_7d acct '"$NOW"') || r2=$?
+  printf "%s %s|%s|%s" "$r1" "$r2" "$v1" "$v2"')
+[[ "${FLICK%%|*}" == "0 0" ]] \
+  && ok_ "N2: THE ROW — two beats in one tick, the carrier flickering, now get the SAME band" \
+  || bad_ "N2: flicker gives two bands" "rc1 rc2 = ${FLICK%%|*} | ${FLICK#*|}"
+# And the fix is a CARRY, not a relaxation: the verdict still names the account
+# reading as its source, so a flicker never silently promotes the seat document.
+[[ "${FLICK#*|}" == *"from the account reading"*"from the account reading"* ]] \
+  && ok_ "N2: both verdicts are still sourced to the ACCOUNT reading, not to the stale seat max" \
+  || bad_ "N2: verdict source" "${FLICK#*|}"
+
+# N3 — IT CANNOT INVENT A NUMBER. A COLD cache plus a silent carrier is still
+# blind. The carry is only ever of something the carrier actually said.
+got=$(narm '
+  _grader_account_reading_json(){ printf ""; }
+  out=$(_pace_account_reading_cached acct); printf "[%s]" "$out"')
+[[ "$got" == "[]" ]] \
+  && ok_ "N3: a cold cache and a silent carrier stay EMPTY — the blind branch, never a number" \
+  || bad_ "N3: invented a reading" "got $got"
+
+# N4 — IT CANNOT INVENT FRESHNESS. The cache stores the reading UNFENCED; the
+# asOf fence runs on every call against the reading's OWN timestamp. A carried
+# reading that has aged out is dropped exactly like a carrier read that has.
+got=$(narm '
+  FLAG="$TMPD/once2"
+  quota_snapshot_read(){ if [[ -e "$FLAG" ]]; then printf ""; else : > "$FLAG"; printf "%s" "$SNAP"; fi; }
+  SNAP='"'"'{"writtenAt":0,"accounts":[{"name":"acct","usage":{"asOf":'"$(( NOW - 4000 ))"',"sevenDay":{"pct":20,"resetsAt":'"$FAR"'}}}]}'"'"'
+  DOC='"'"'{"agents":[{"name":"s1","account":"acct","sevenDayPct":70,"sevenDayResetsAt":'"$FAR"'}]}'"'"'
+  printf "%s" "$DOC" | _pace_band_7d acct '"$NOW"' >/dev/null 2>&1
+  r=0; v=$(printf "%s" "$DOC" | _pace_band_7d acct '"$NOW"') || r=$?
+  printf "%s|%s" "$r" "$v"')
+[[ "${got%%|*}" == "2" && "${got#*|}" == *"from the seat reading"* ]] \
+  && ok_ "N4: a CARRIED reading past the asOf fence is still dropped — the cache cannot manufacture freshness" \
+  || bad_ "N4: carried reading defeated the asOf fence" "rc=${got%%|*} | ${got#*|}"
+
+# N5 — IT CANNOT OUTLIVE THE FENCE. The carry is bounded by the same window the
+# caller grades against, so the cache never hands back something the caller
+# would have rejected had the carrier said it.
+got=$(narm '
+  _grader_account_reading_json(){ printf "{\"asOf\":1,\"sevenDayPct\":20}"; }
+  _pace_account_reading_cached acct >/dev/null
+  f=$(_pace_reading_cache_path acct)
+  touch -d "@$(( $(date +%s) - _GRADER_READING_MAX_AGE - 60 ))" "$f"
+  _grader_account_reading_json(){ printf ""; }
+  printf "[%s]" "$(_pace_account_reading_cached acct)"')
+[[ "$got" == "[]" ]] \
+  && ok_ "N5: a cached reading older than _GRADER_READING_MAX_AGE is not carried across a flicker" \
+  || bad_ "N5: the carry outlived the fence" "got $got"
+
+# N6 — ONLY A NON-EMPTY READING IS EVER WRITTEN. `_pace_usage_snapshot`'s rule,
+# here for the same reason: a failed carrier read must not demote a good cache
+# into no cache at all on the NEXT tick.
+got=$(narm '
+  _grader_account_reading_json(){ printf "{\"asOf\":1,\"sevenDayPct\":20}"; }
+  _pace_account_reading_cached acct >/dev/null
+  f=$(_pace_reading_cache_path acct)
+  touch -d "@$(( $(date +%s) - _PACE_READING_CACHE_SEC - 5 ))" "$f"
+  _grader_account_reading_json(){ printf ""; }
+  out=$(_pace_account_reading_cached acct)
+  printf "%s|%s" "$([[ -s $f ]] && echo kept || echo destroyed)" "$out"')
+[[ "${got%%|*}" == "kept" && "${got#*|}" == '{"asOf":1,"sevenDayPct":20}' ]] \
+  && ok_ "N6: a dead carrier read neither destroys the cache nor blinds the tick" \
+  || bad_ "N6: dead read damaged the cache" "$got"
+
+# N7 — ONE FILE PER ACCOUNT. Accounts share a floor but never a reading; a
+# single cache would be the DIVE-4575 misattribution with a new carrier.
+got=$(narm '
+  _grader_account_reading_json(){ printf "{\"asOf\":1,\"sevenDayPct\":20,\"who\":\"%s\"}" "$1"; }
+  a=$(_pace_account_reading_cached one); b=$(_pace_account_reading_cached two)
+  printf "%s|%s" "$a" "$b"')
+[[ "${got%%|*}" == *'"who":"one"'* && "${got#*|}" == *'"who":"two"'* ]] \
+  && ok_ "N7: the cache is keyed per ACCOUNT — one account's reading never answers for another" \
+  || bad_ "N7: cross-account leak" "$got"
+
+# N8 — THE ACCOUNT NAME IS DATA, NOT A PATH. It arrives from the registry and
+# the floor's own callers synthesise `@self:<seat>`; a `/` in it must not become
+# a directory, and two different names must not collapse onto one file.
+got=$(narm '
+  for a in "@self:agent-dev" "../../etc/x" "a/b"; do
+    p=$(_pace_reading_cache_path "$a"); printf "%s|" "$(dirname "$p")=$(basename "$p")"
+  done')
+# every path must sit DIRECTLY in the cache dir: the name is one component, so a
+# `/` or a `..` in the account can neither escape it nor become a directory.
+bads=0
+for e in ${got//|/ }; do
+  [[ "${e%%=*}" == "$PACE_RCD" ]] || bads=1
+  case "${e#*=}" in */*|..|.) bads=1 ;; esac
+done
+(( bads == 0 )) \
+  && ok_ "N8: an account name is sanitised into ONE path component — no traversal, no directory" \
+  || bad_ "N8: unsanitised cache path" "$got"
+
+# N9 — NO CARRIER IN THE PROCESS, NOTHING TO CARRY. A hand-picked source list or
+# a caller that sources this file alone can never have WRITTEN this cache, so it
+# must not read one either: a reading left by an unrelated process answering
+# here would be the cross-source confusion DIVE-4575/4578 exist to refuse. This
+# is also what keeps every arm above section N — which runs against the top-level
+# source with no carrier at all — grading the floor instead of this cache.
+got=$( rm -rf "$PACE_RCD" 2>/dev/null
+  ( source src/task/grader_pool.sh
+    quota_snapshot_read(){ printf ''; }
+    _grader_account_reading_json(){ printf '{"asOf":1,"sevenDayPct":20}'; }
+    _pace_account_reading_cached acct >/dev/null )
+  ( source src/task/grader_pool.sh          # same cache dir, NO carrier declared
+    declare -F _pace_account_reading_cached >/dev/null 2>&1 \
+      || { printf 'NO-SUCH-FUNCTION'; exit 0; }
+    _grader_account_reading_json(){ printf '{"asOf":1,"sevenDayPct":99}'; }
+    printf '[%s]' "$(_pace_account_reading_cached acct)" ) )
+[[ "$got" == "[]" ]] \
+  && ok_ "N9: a process with no carrier neither reads nor writes the cache" \
+  || bad_ "N9: carrier gate" "got $got"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

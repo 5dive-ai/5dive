@@ -1558,6 +1558,124 @@ _PACE_USAGE_CMD="${_PACE_USAGE_CMD:-sudo -n 5dive usage --json}"
 # source we still hold at the soft floor and never read the emptiness as 0%
 # (DIVE-4342).
 
+# ── DIVE-4731: ONE ACCOUNT READING PER TICK, NOT ONE PER TEMPLATE ───────────
+#
+# THE MEASUREMENT. /var/log/5dive-heartbeat.log, two ticks, both on `mark`:
+#
+#   2026-09-20T03:00:04Z  DIVE-1236 NOT fired — hard … 100% … from the SEAT reading
+#   2026-09-20T03:00:06Z  DIVE-1483 fired -> new standard todo
+#   2026-09-18T04:00:06Z  DIVE-1237 NOT fired — hard … 100% … from the SEAT reading
+#   2026-09-18T04:00:07Z  DIVE-1430 fired -> new standard todo
+#
+# Same tick, same account, two seconds apart, opposite verdicts. The per-seat
+# usage document is collected ONCE PER TICK (`_HB_PACE_USAGE`) and is a `max`
+# across the account's seats, so it cannot have differed between the two
+# iterations. The account reading is what differed: it was unreadable on the
+# first template and readable on the second, because `_pace_band_7d` re-reads it
+# ONCE PER TEMPLATE. The materializer's SELECT is unordered, so the lowest row
+# id due in a minute eats the blind read — DIVE-1236 (id 1288) lost a recovery
+# that DIVE-1483 (id 1618) caught two seconds later, and creative's OpenAgent
+# beat stayed dead a day longer than dev's for that reason alone (DIVE-4728).
+#
+# ═══ WHAT A FLICKER MEANS FOR A BEAT — THE DECISION THIS ROW OWED ══════════
+#
+# A momentary failure to read the account's reading is NOT a measurement of the
+# account, and it must not silently hand the verdict to the per-seat activity
+# document. That document is a `max` over seats and carries no per-seat
+# measurement time, so a seat that hit 100% two hours ago and went quiet answers
+# for the account forever — on 09-20 03:00 it said 100% while the account's own
+# reading had headroom. The fallback chain is right in its ORDER and wrong in
+# its TRIGGER: it should fire when the account has had no readable reading for
+# the whole fence window, not when one read happened to land in a gap.
+#
+# So the last GOOD account reading is carried across the gap, and only a gap
+# wider than the fence itself reaches the seat document. Three properties make
+# that safe, and each one is an arm in tests/pace_the_week_unit.sh:
+#
+#   * IT CANNOT INVENT FRESHNESS. The cache stores the reading UNFENCED and
+#     re-prints it verbatim; `_pace_account_seven`'s asOf fence and
+#     `_grader_reading_expired`'s reset fence still run on every call, against
+#     the reading's OWN timestamps and the CURRENT clock. A reading that has
+#     aged out is dropped whether it came from the carrier or from here.
+#   * IT CANNOT INVENT A NUMBER. Only a NON-EMPTY reading is ever written, and
+#     an empty read with no cache behind it stays empty — the blind branch, the
+#     soft floor, and never 0%. This is `_pace_usage_snapshot`'s rule and it is
+#     the same rule for the same reason (DIVE-4342).
+#   * IT CANNOT OUTLIVE THE FENCE. The stale-serve is bounded by
+#     `_GRADER_READING_MAX_AGE`, the same window `_pace_account_seven` grades
+#     against, so the cache never holds a reading past the point where the
+#     caller would have thrown it away anyway.
+#
+# WHY A FILE AND NOT A SHELL VARIABLE. The materializer grades each template
+# inside a command substitution (`_mz_verdict=$(… | _pace_band …)`), which is a
+# SUBSHELL — an in-memory memo written there dies with it and the next template
+# reads a cold cache. The TTL is therefore what makes the reading per-tick: one
+# real carrier read per account per `_PACE_READING_CACHE_SEC`, every template
+# after the first in that window served from it.
+_PACE_READING_CACHE_SEC="${FIVE_PACE_READING_CACHE_SEC:-60}"
+_PACE_READING_CACHE_DIR="${FIVE_PACE_READING_CACHE_DIR:-${STATE_DIR:-/var/lib/5dive}/pace-reading}"
+
+# `_pace_reading_cache_path <account>` — one file per account, named from a
+# SANITISED account (an account name reaches this from the registry and may
+# carry `@self:` or a slash; neither may become a path component).
+_pace_reading_cache_path() {  # <account>
+  local acct="${1:-}"
+  printf '%s/%s.json' "$_PACE_READING_CACHE_DIR" "${acct//[^A-Za-z0-9_.-]/_}"
+}
+
+# `_pace_account_reading_cached <account>` — the account's reading JSON, from
+# the carrier at most once per TTL, or from the last good read across a flicker.
+# EMPTY when neither has one. Unfenced, exactly like the function it wraps.
+_pace_account_reading_cached() {  # <account> -> reading JSON or EMPTY
+  local acct="${1:-}" f now mt age out tmp
+  [[ -n "$acct" ]] || return 0
+  declare -F _grader_account_reading_json >/dev/null 2>&1 || return 0
+  # NO CARRIER IN THIS PROCESS, NOTHING TO CARRY. `_grader_account_reading_json`
+  # is always defined beside this function, but the two things it actually reads
+  # are not: a hand-picked harness source list, or a caller that sources this
+  # file alone, has neither. Such a process could never have WRITTEN this cache,
+  # so it must not READ one either — otherwise a reading left by an unrelated
+  # process becomes an answer here, which is the cross-source confusion this
+  # whole family (DIVE-4575/4578) exists to refuse.
+  declare -F account_best_ratelimits >/dev/null 2>&1 \
+    || declare -F quota_snapshot_read >/dev/null 2>&1 \
+    || return 0
+  f=$(_pace_reading_cache_path "$acct")
+  now=$(date +%s)
+  mt=0
+  if [[ -r "$f" && -s "$f" ]]; then
+    mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    [[ "$mt" =~ ^[0-9]+$ ]] || mt=0
+    age=$(( now - mt ))
+    if (( mt > 0 && age >= 0 && age < _PACE_READING_CACHE_SEC )); then
+      cat "$f"; return 0
+    fi
+  fi
+  out=$(_grader_account_reading_json "$acct" 2>/dev/null || printf '')
+  if [[ -n "$out" ]]; then
+    tmp="${f}.$$"
+    if mkdir -p "$_PACE_READING_CACHE_DIR" 2>/dev/null \
+       && printf '%s' "$out" > "$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    fi
+    printf '%s' "$out"; return 0
+  fi
+  # THE FLICKER BRANCH. The carrier said nothing THIS call; the last thing it
+  # said is still the account's most recent reading, and the caller's own fences
+  # will grade it. Bounded by the fence window so this can never hand back
+  # something the caller would have rejected as a carrier read.
+  if (( mt > 0 )) && [[ -r "$f" && -s "$f" ]]; then
+    age=$(( now - mt ))
+    if (( age >= 0 && age < _GRADER_READING_MAX_AGE )); then
+      cat "$f"; return 0
+    fi
+  fi
+  return 0
+}
+# Overridable by the same contract as `_PACE_ACCOUNT_CMD` — a FUNCTION NAME, not
+# a command string — so a unit harness can drive the fences without a carrier.
+_PACE_READING_JSON_CMD="${_PACE_READING_JSON_CMD:-_pace_account_reading_cached}"
+
 # `_pace_account_seven <account> [<now>]` — the account's own WEEKLY reading as
 # `<pct><US><resetsAt-epoch>`, or EMPTY.
 #
@@ -1580,8 +1698,7 @@ _pace_account_seven() {  # <account> [<now-epoch>] -> "<pct><US><resets>" or EMP
   local acct="${1:-}" now="${2:-}" rl asof seven sr
   [[ -n "$acct" ]] || return 0
   [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
-  declare -F _grader_account_reading_json >/dev/null 2>&1 || return 0
-  rl=$(_grader_account_reading_json "$acct" 2>/dev/null || printf '')
+  rl=$($_PACE_READING_JSON_CMD "$acct" 2>/dev/null || printf '')
   [[ -n "$rl" && "$rl" != "null" ]] || return 0
   asof=$(jq -r '.asOf // empty' <<<"$rl" 2>/dev/null || printf '')
   [[ "$asof" =~ ^[0-9]+$ ]] || return 0
@@ -1648,8 +1765,7 @@ _pace_account_seven_bound() {  # <account> [<now-epoch>] -> "<pct><US><resets>" 
   local acct="${1:-}" now="${2:-}" rl asof seven sr
   [[ -n "$acct" ]] || return 0
   [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
-  declare -F _grader_account_reading_json >/dev/null 2>&1 || return 0
-  rl=$(_grader_account_reading_json "$acct" 2>/dev/null || printf '')
+  rl=$($_PACE_READING_JSON_CMD "$acct" 2>/dev/null || printf '')
   [[ -n "$rl" && "$rl" != "null" ]] || return 0
   asof=$(jq -r '.asOf // empty' <<<"$rl" 2>/dev/null || printf '')
   # An undated reading is not a bound either: with no measurement time we cannot
