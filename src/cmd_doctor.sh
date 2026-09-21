@@ -129,6 +129,55 @@ doctor_check_audit_drop_dir() {
 #
 # A box with NO reading is reported `ok` with "not measured" — never a clean
 # bill. An absent measurement and a measured pass must not read the same.
+# doctor_check_forge_merge_poll
+#
+# DIVE-4701 — THE POLLER'S STANDING CONDITION, SAID ONCE.
+#
+# `_hb_forge_merge_sweep` reads the bound pull request of every row in
+# graded->merge on every tick. When the credential-free rail cannot be asked, the
+# correct behaviour at the tick is to change NOTHING and retry — so the tick has
+# nothing to say, every minute, forever. That is the DIVE-4619 shape exactly: a
+# standing property of the box's credentials does not belong on the surface that
+# repeats, it belongs on the one a person reads. The sweep records what it
+# measured; this reads the recording and never probes (a live probe here is one
+# network call per dashboard poll).
+#
+# A box with NO reading is `ok` with "not measured" — never a clean bill. An
+# absent measurement and a measured pass must not read the same.
+doctor_check_forge_merge_poll() {
+  local f reading class rows landed unreadable reason asof asof_epoch age now
+  f="${STATE_DIR:-/var/lib/5dive}/forge-merge-poll.reading"
+  if [[ ! -r "$f" ]]; then
+    doctor_add creds forge-merge-poll ok \
+      "the forge merge poll has taken no reading on this box yet — it records one on each heartbeat tick that has at least one row waiting on a merge, so an idle board reads this way too"
+    return 0
+  fi
+  reading="$(cat "$f" 2>/dev/null || printf '')"
+  _dfmp() { sed -n "s/^$1=//p" <<<"$reading" | head -1; }
+  class="$(_dfmp class)"; rows="$(_dfmp rows)"; landed="$(_dfmp landed)"
+  unreadable="$(_dfmp unreadable)"; reason="$(_dfmp reason)"
+  asof="$(_dfmp asof)"; asof_epoch="$(_dfmp asof_epoch)"
+  age="as of ${asof:-unknown}"
+  now=$(date +%s 2>/dev/null || printf '')
+  if [[ "$now" =~ ^[0-9]+$ && "$asof_epoch" =~ ^[0-9]+$ && $asof_epoch -gt 0 ]]; then
+    age="$age ($(( (now - asof_epoch) / 60 ))m ago)"
+  fi
+  case "$class" in
+    unreadable)
+      doctor_add creds forge-merge-poll warn \
+        "the forge merge poll could NOT ask GitHub about ${unreadable:-?} of the ${rows:-?} row(s) waiting on a merge, so a pull request the maintainer has already merged will keep reading as un-landed and its row will keep waiting for a seat to look. ${reason:-} Nothing was written — an unreadable rail changes no row. $age" \
+        true false ;;
+    ok)
+      doctor_add creds forge-merge-poll ok \
+        "the forge merge poll read all ${rows:-0} row(s) waiting on a merge over the credential-free rail; ${landed:-0} landing(s) recorded on that pass — $age" ;;
+    *)
+      doctor_add creds forge-merge-poll ok \
+        "the forge merge poll left a reading this check does not recognise (class='${class:-empty}') — treating it as not measured rather than as a pass. $age" ;;
+  esac
+  unset -f _dfmp 2>/dev/null || true
+  return 0
+}
+
 doctor_check_gate_repo_visibility() {
   local dir f n=0
   # The gate helpers live in src/task/gate_evidence.sh, later in the bundle. A
@@ -1590,6 +1639,11 @@ cmd_doctor() {
     # DIVE-4619: the merge-gate's repo visibility is a credential fact about this
     # box, so it is reported here once rather than on every close.
     doctor_check_gate_repo_visibility
+    # DIVE-4701: whether the credential-free rail could be asked about the bound
+    # pull requests of the rows waiting on a merge is the same class of fact —
+    # a standing property of this box's credentials — so it is reported here
+    # once rather than by the poller on every tick.
+    doctor_check_forge_merge_poll
   fi
 
   # --- registry + per-agent state ---
@@ -2172,6 +2226,49 @@ cmd_doctor() {
     # DIVE-4709: and the layer under it — a seat that cannot READ the record at
     # all, whose every plugin verb therefore dies as "unknown command".
     doctor_check_plugin_record_visibility
+
+    # DIVE-4697: the plugin path that arrives from OUTSIDE the box. Claude Code
+    # 2.1.275 syncs the skills and plugins enabled on the claude.ai ACCOUNT into
+    # every session signed in with it, and our auth profiles are shared across
+    # seats and boxes — so a toggle in one web UI lands code in every seat on
+    # the profile. This check asks the only question that has a proven answer:
+    # is the opt-out written where Claude reads it?
+    #
+    # It sits in `plugins` and NOT in `channels` on purpose. The file is the
+    # same, but allowedChannelPlugins gates a synced plugin's CHANNEL only
+    # (measured in the 2.1.278 binary) — its skills, commands, hooks, agents and
+    # MCP servers load regardless. So the channels category cannot answer this,
+    # and an operator asking "what plugin code can reach this box?" runs
+    # --category=plugins. WARN, not error: a box missing the keys is exposed to
+    # a toggle nobody has flipped, which is a gap to close, not an outage.
+    local _sync_ms=/etc/claude-code/managed-settings.json
+    if [[ ! -f "$_sync_ms" ]]; then
+      doctor_add plugins claudeai-sync warn \
+        "$_sync_ms missing — claude.ai account sync of skills/plugins is NOT opted out (DIVE-4697); rerun install.sh" false false
+    elif managed_settings_sync_off_ok "$_sync_ms"; then
+      doctor_add plugins claudeai-sync ok \
+        "claude.ai account sync opted out in $_sync_ms (syncClaudeAiSkills + syncClaudeAiPlugins = false)"
+    else
+      local _sync_gap=""
+      _sync_gap=$(managed_settings_sync_missing "$_sync_ms") || _sync_gap=""
+      [[ -n "$_sync_gap" ]] || _sync_gap="syncClaudeAiSkills, syncClaudeAiPlugins"
+      if (( DOCTOR_REPAIR )); then
+        # Same fixer as the channels check — reconcile_managed_settings sets
+        # both keys from FIVEDIVE_MANAGED_SYNC_OFF_JSON. 0=changed, 3=already
+        # current (unreachable from this branch, but it is the helper's
+        # contract), 1=cannot reconcile.
+        reconcile_managed_settings "$_sync_ms"
+        case $? in
+          0|3) doctor_add plugins claudeai-sync warn \
+                 "claude.ai account sync was not opted out ($_sync_gap) — written to $_sync_ms in place (DIVE-4697)" true true ;;
+          *)   doctor_add plugins claudeai-sync error \
+                 "claude.ai account sync not opted out ($_sync_gap) and $_sync_ms could not be reconciled (no jq, or the file is not valid JSON) — fix it by hand: skills and plugins enabled on the shared claude.ai account load in every seat here (DIVE-4697)" false false ;;
+        esac
+      else
+        doctor_add plugins claudeai-sync warn \
+          "claude.ai account sync NOT opted out in $_sync_ms ($_sync_gap) — skills/plugins enabled on the shared claude.ai account load in every seat on this box; fix: sudo 5dive doctor --category=plugins --fix (DIVE-4697)" false false
+      fi
+    fi
   fi
 
   if (( run_memory )); then

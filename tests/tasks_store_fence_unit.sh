@@ -240,6 +240,94 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# DIVE-4669 — THE MEMO. `_tasks_store_is_prod` caches its answer keyed on the
+# inputs it is a function of, because unmemoised it spawned `readlink -f` two or
+# three times PER STATEMENT and no production call ever reaches it (the
+# entrypoint marker short-circuits first), so every one of those spawns was
+# charged to the harness corpus and to nothing else.
+#
+# A cache on a SAFETY CONTROL is only as good as its key, so the two arms that
+# matter are the two directions of a STALE answer inside one process. Arm 6a is
+# the dangerous one: a stale "not prod" ADMITS a write the fence exists to
+# refuse. Arm 6b is the loud one: a stale "prod" would fence every properly
+# isolated harness in the corpus. Both re-point TASKS_DB mid-process, which is
+# what a harness with more than one store actually does.
+
+# --- arm 6a: a re-point INTO the prod store is still fenced (no stale "not prod")
+ISO3="$TMP/iso3"; mkdir -p "$ISO3/tasks"
+pre6a=$(rows)
+out6a=$(sourced_caller \
+  "export STATE_DIR='$ISO3' TASKS_DIR='$ISO3/tasks' TASKS_DB='$ISO3/tasks/tasks.db'" \
+  "tasks_db_init
+   db \"INSERT INTO tasks(ident,title,status,created_by,assignee) VALUES('DIVE-501','loop task','todo','dev','dev');\"
+   export STATE_DIR='$PROD_DIR' TASKS_DIR='$PROD_DIR/tasks' TASKS_DB='$PROD_DB'
+   db \"INSERT INTO tasks(ident,title,status,created_by,assignee) VALUES('DIVE-502','loop task','todo','dev','dev');\"
+   printf 'EXECUTION-CONTINUED-PAST-FENCE\n'")
+iso3_rows=$(sqlite3 "$ISO3/tasks/tasks.db" 'SELECT COUNT(*) FROM tasks;' 2>/dev/null || echo MISSING)
+if [[ "$(rows)" == "$pre6a" ]] && grep -qi 'DIVE-2249' <<<"$out6a" \
+   && ! grep -q 'EXECUTION-CONTINUED-PAST-FENCE' <<<"$out6a" && [[ "$iso3_rows" == "1" ]]; then
+  ok_t "re-pointing TASKS_DB at the prod board mid-process is still fenced (the memo re-keys; a stale 'not prod' would admit the write)"
+else
+  bad_t "a mid-process re-point into the prod store is still fenced" \
+        "prod rows $pre6a -> $(rows); isolated write landed=$iso3_rows (want 1, or arm 6a proves nothing); out: $(head -c 300 <<<"$out6a")"
+fi
+
+# --- arm 6b: a re-point OUT of the prod store still writes (no stale "prod")
+ISO4="$TMP/iso4"; mkdir -p "$ISO4/tasks"
+out6b=$(sourced_caller \
+  "export STATE_DIR='$PROD_DIR' TASKS_DIR='$PROD_DIR/tasks' TASKS_DB='$PROD_DB'" \
+  "db 'SELECT COUNT(*) FROM tasks;' >/dev/null
+   export STATE_DIR='$ISO4' TASKS_DIR='$ISO4/tasks' TASKS_DB='$ISO4/tasks/tasks.db'
+   tasks_db_init
+   db \"INSERT INTO tasks(ident,title,status,created_by,assignee) VALUES('DIVE-501','loop task','todo','dev','dev');\"")
+iso4_rows=$(sqlite3 "$ISO4/tasks/tasks.db" 'SELECT COUNT(*) FROM tasks;' 2>/dev/null || echo MISSING)
+if [[ "$iso4_rows" == "1" ]]; then
+  ok_t "a store touched AFTER the prod board in the same process still writes (a stale 'prod' would fence the whole corpus)"
+else
+  bad_t "a re-point out of the prod store still writes" \
+        "expected 1 row in the throwaway store, got '$iso4_rows'; out: $(head -c 300 <<<"$out6b")"
+fi
+
+# --- arm 6c: the memo is LIVE, not merely intended.
+# The reclaim IS the removed `readlink` spawns, so grade the spawns and not the
+# comment: five fence calls on an unchanged key must resolve ONCE. Counted with
+# a shadowing function, and the lower bound is asserted too — a stub that is
+# never reached would report 0 and pass a arm that measured nothing.
+out6c=$(sourced_caller \
+  "export STATE_DIR='$TMP/iso5' TASKS_DIR='$TMP/iso5/tasks' TASKS_DB='$TMP/iso5/tasks/tasks.db'" \
+  "RL_COUNT='$TMP/rlcount'; : >\"\$RL_COUNT\"
+   readlink() { echo x >>\"\$RL_COUNT\"; command readlink \"\$@\"; }
+   for _i in 1 2 3 4 5; do _tasks_store_fence 'SELECT 1;'; done
+   printf 'RESOLVES=%s\n' \"\$(wc -l <\"\$RL_COUNT\")\"")
+n6c=$(sed -n 's/.*RESOLVES=\([0-9]*\).*/\1/p' <<<"$out6c" | tail -1)
+if [[ -n "$n6c" ]] && (( n6c >= 1 && n6c <= 3 )); then
+  ok_t "five fence calls on an unchanged store resolve the path ONCE ($n6c readlink spawns, not 5x that)"
+else
+  bad_t "the memo actually removes the repeated path resolution" \
+        "readlink spawns across five identical fence calls = '${n6c:-unreported}'; want 1-3 (one pass over the candidate paths). 0 or unreported means the counting stub was never reached and this arm graded nothing; >3 means the memo is not keyed on what it claims. out: $(head -c 300 <<<"$out6c")"
+fi
+
+# --- arm 6d: FIVEDIVE_FENCE_EXTRA_STORE is part of the key
+# The knob only ever ADDS a fenced path, so arming it mid-process must start
+# fencing a store that was writable a statement earlier.
+ISO6="$TMP/iso6"; mkdir -p "$ISO6/tasks"
+out6d=$(sourced_caller \
+  "export STATE_DIR='$ISO6' TASKS_DIR='$ISO6/tasks' TASKS_DB='$ISO6/tasks/tasks.db'; unset FIVEDIVE_FENCE_EXTRA_STORE" \
+  "tasks_db_init
+   db \"INSERT INTO tasks(ident,title,status,created_by,assignee) VALUES('DIVE-501','loop task','todo','dev','dev');\"
+   export FIVEDIVE_FENCE_EXTRA_STORE='$ISO6/tasks/tasks.db'
+   db \"INSERT INTO tasks(ident,title,status,created_by,assignee) VALUES('DIVE-502','loop task','todo','dev','dev');\"
+   printf 'EXECUTION-CONTINUED-PAST-FENCE\n'")
+iso6_rows=$(sqlite3 "$ISO6/tasks/tasks.db" 'SELECT COUNT(*) FROM tasks;' 2>/dev/null || echo MISSING)
+if [[ "$iso6_rows" == "1" ]] && grep -qi 'DIVE-2249' <<<"$out6d" \
+   && ! grep -q 'EXECUTION-CONTINUED-PAST-FENCE' <<<"$out6d"; then
+  ok_t "arming FIVEDIVE_FENCE_EXTRA_STORE mid-process fences the next write (the knob is in the memo key)"
+else
+  bad_t "FIVEDIVE_FENCE_EXTRA_STORE is part of the memo key" \
+        "rows in the store: '$iso6_rows' (want 1 — the first write lands, the second is refused); out: $(head -c 300 <<<"$out6d")"
+fi
+
 printf -- '-----\ntasks_store_fence_unit: %s passed, %s failed\n' "$PASS" "$FAIL"
 SUMMARY_PRINTED=1
 (( FAIL == 0 ))

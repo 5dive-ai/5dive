@@ -251,5 +251,20 @@ _r=$(cmd_box_config 2>&1)
 [[ "$_r" == *"verify-small = off"* ]] \
   && ok_t "config with no args prints the size knob beside the policy" || bad_t "small shown" "got: ${_r:0:300}"
 
+echo "── DIVE-4667: the box-wide coauthor switch ─────────────────────"
+cmd_box_config coauthor=off >/dev/null 2>&1
+[[ "$(jq -r '.coauthor' "$BOX_CONFIG")" == off && "$(box_verify_policy)" == always ]] \
+  && ok_t "config coauthor=off round-trips without changing verification" \
+  || bad_t "coauthor off round-trip" "$(cat "$BOX_CONFIG")"
+cmd_box_config coauthor=on >/dev/null 2>&1
+[[ "$(jq -r '.coauthor' "$BOX_CONFIG")" == on ]] \
+  && ok_t "config coauthor=on round-trips" || bad_t "coauthor on round-trip"
+_r=$(cmd_box_config coauthor=maybe 2>&1)
+[[ "$_r" == *"coauthor takes one of: on, off"* ]] \
+  && ok_t "config rejects an invalid coauthor switch" || bad_t "coauthor validation" "got: $_r"
+_r=$(cmd_box_config 2>&1)
+[[ "$_r" == *"coauthor = on"* ]] \
+  && ok_t "config shows the coauthor switch" || bad_t "coauthor shown" "got: ${_r:0:400}"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAILN"
 [[ "$FAILN" -eq 0 ]]

@@ -10,10 +10,11 @@
 cmd_project() {
   local sub="${1:-ls}"; shift || true
   case "$sub" in
-    add|new)     cmd_project_add "$@" ;;
-    ls|list)     cmd_project_ls "$@" ;;
-    show|view)   cmd_project_show "$@" ;;
-    *)           fail "$E_USAGE" "unknown project command: $sub (add|ls|show)" ;;
+    add|new)      cmd_project_add "$@" ;;
+    ls|list)      cmd_project_ls "$@" ;;
+    show|view)    cmd_project_show "$@" ;;
+    set-status)   cmd_project_set_status "$@" ;;
+    *)            fail "$E_USAGE" "unknown project command: $sub (add|ls|show|set-status)" ;;
   esac
 }
 
@@ -212,4 +213,66 @@ cmd_project_show() {
     "$chain" "$(( $(printf '%s' "$chain" | grep -o ' -> ' | wc -l) + 1 ))"
   return 0   # DIVE-2751: a render that reached the end succeeded, whatever the
              # last conditional chose not to print.
+}
+
+# -------- project lifecycle status (DIVE-4680) --------
+#
+# `projects.status` and `projects.archived_at` have been writable columns with no
+# writer since DIVE-484: the schema declares them, `project ls --json` and
+# `project show` read them back, and `task add --project=` / `goal add` already
+# branch on `status='active'` — but nothing in src/ ever UPDATEd either one, so
+# every project on every box stayed 'active' for its whole life. Reported in #1036
+# by someone building a pipeline UI over the queue with no way to retire a lane.
+#
+# ONE list, deliberately. The membership check and the refusal message both read
+# this string (same shape as PLUGIN_CAPABILITIES in cmd_plugin.sh), so a sixth
+# status is one edit here and cannot ship with a refusal that denies it exists.
+readonly PROJECT_STATUSES="active complete archived binned backlogged"
+# Entering one of these stamps archived_at; every other status clears it to NULL.
+# archived_at answers "when did this project stop being live", and all three of
+# these mean it stopped — so `complete` and `binned` stamp it as much as
+# `archived` does. It is a subset of the line above, never a separate vocabulary.
+readonly PROJECT_STATUSES_ARCHIVING="complete archived binned"
+
+project_status_known()     { [[ " $PROJECT_STATUSES "           == *" $1 "* ]]; }
+project_status_archives()  { [[ " $PROJECT_STATUSES_ARCHIVING " == *" $1 "* ]]; }
+
+cmd_project_set_status() {
+  tasks_db_init
+  local key="${1:-}" status="${2:-}"
+  [[ -n "$key" && -n "$status" ]] \
+    || fail "$E_USAGE" "usage: 5dive project set-status <key> <status>"
+  # Both arguments case-insensitively, stored lowercase — `project show`/`add`
+  # already fold the key that way and the column is compared as a literal.
+  key="${key,,}"; status="${status,,}"
+  # Shape before existence, same order as cmd_project_add: a typo'd status is a
+  # typo whether or not the project exists.
+  project_status_known "$status" \
+    || fail "$E_VALIDATION" "unknown project status '$status' (one of: $PROJECT_STATUSES)"
+  [[ "$(db "SELECT 1 FROM projects WHERE key=$(sqlq "$key");")" == "1" ]] \
+    || fail "$E_NOT_FOUND" "no such project: $key"
+
+  local current; current=$(db "SELECT status FROM projects WHERE key=$(sqlq "$key");")
+  if [[ "$current" != "$status" ]]; then
+    # Each transition re-stamps: archived_at is when the project entered the
+    # state it is in now, not the first time it ever left 'active'.
+    local stamp="NULL"; project_status_archives "$status" && stamp="datetime('now')"
+    db "UPDATE projects SET status=$(sqlq "$status"), archived_at=$stamp
+        WHERE key=$(sqlq "$key");"
+  fi
+  local archived_at
+  archived_at=$(db "SELECT COALESCE(archived_at,'') FROM projects WHERE key=$(sqlq "$key");")
+
+  # `project=`, not `key=`: DIVE-4297 redacts any argument whose KEY NAME contains
+  # "key", so `key=$key` writes `key=<redacted>` and the row loses the one field
+  # that says WHICH project was moved. Same shape as `agent=` in cmd_org.sh.
+  audit_log "project set-status" ok 0 -- "project=$key" "status=$status" "by_claimed=${SUDO_USER:-root}"
+
+  # A no-op still exits 0 and still says so: the caller asked for an end state,
+  # and it holds. Only the prose distinguishes it from a transition.
+  local prose="project '$key' is now $status"
+  [[ "$current" == "$status" ]] && prose="project '$key' is already $status"
+  [[ -n "$archived_at" ]] && prose+=" (archived_at $archived_at)"
+  ok "$prose" '{key:$k, status:$s, archived_at:(if $a=="" then null else $a end)}' \
+     --arg k "$key" --arg s "$status" --arg a "$archived_at"
 }

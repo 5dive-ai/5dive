@@ -224,6 +224,9 @@ Those five seats' live terminals tiled on one screen, read-only; plain `5dive wa
 `5dive project add mobile --prefix=MOB --lead-agent=dev`<br>
 Run several products off one team. Each project numbers its own tasks (MOB-1, MOB-2) and has its own lead.
 
+`5dive project set-status mobile complete`<br>
+Move a lane through its life: `active`, `complete`, `archived`, `binned`, `backlogged`. Anything but `active` or `backlogged` stamps `archived_at`, and only an `active` project takes new tasks.
+
 `5dive org tree`<br>
 Who reports to whom. Gates route up this chart, and `sudo 5dive human add you --telegram=<chat id>` names the person whose phone they reach.
 

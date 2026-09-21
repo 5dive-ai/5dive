@@ -915,6 +915,11 @@ refresh_managed_files() {
   if ! "$BIN_DIR/5dive" agent _sync_codex_baseline; then
     echo "warn: existing Codex AGENTS.md baselines were not fully reconciled; user-authored text was left untouched" >&2
   fi
+  # DIVE-4667: mint stable ids for old seats and install the hook immediately;
+  # no agent restart is needed because git reads hooksPath on every commit.
+  if ! "$BIN_DIR/5dive" agent _reconcile_coauthors; then
+    echo "warn: existing agent co-author hooks were not fully reconciled" >&2
+  fi
 
   # DIVE-3554: the relay binaries the shipped Connect Buzz panel shells out to.
   # Fail-soft on purpose (see stage_buzz_binaries) — a buzz release outage must
@@ -1389,6 +1394,20 @@ JOURNALD
   # allowedChannelPlugins entry to actually take effect. Without it,
   # the allowlist is silently inert and inbound channel messages
   # don't reach the session.
+  # syncClaudeAiSkills / syncClaudeAiPlugins (DIVE-4697): OFF. Claude Code
+  # 2.1.275 syncs the skills and plugins enabled on the claude.ai ACCOUNT into
+  # every session signed in with it. Our auth profiles are shared across seats
+  # and boxes, so one toggle in that account's web UI would land code in every
+  # seat on the profile — while what runs in a seat is a BOX decision
+  # (/dashboard/plugins, DIVE-4434). allowedChannelPlugins does NOT cover this
+  # path: it gates a synced plugin's CHANNEL only, so skills, commands, hooks,
+  # agents and MCP servers from a synced plugin load like ones we installed.
+  # Only `false` is honoured (the feature is enabled server-side), and on a
+  # claude.ai TEAM/Enterprise login the org's remote managed settings override
+  # this file entirely — there the control is the org admin's, not this key.
+  # Mirrors FIVEDIVE_MANAGED_SYNC_OFF_JSON in src/header.sh, which this
+  # curl-piped script cannot source; tests/managed_settings_selfheal_unit.sh
+  # diffs the two copies below against that constant.
   # requiredMinimumVersion (DIVE-133): a known-good CC floor. CC 2.1.163+ refuses
   # to start below it; older CC ignores the key, so it can never brick a box.
   # Pure downgrade guardrail (botched rollback / accidental pin-back) — every box
@@ -1403,6 +1422,8 @@ JOURNALD
 {
   "channelsEnabled": true,
   "requiredMinimumVersion": "2.1.163",
+  "syncClaudeAiSkills": false,
+  "syncClaudeAiPlugins": false,
   "allowedChannelPlugins": [
     {"plugin": "telegram", "marketplace": "5dive-plugins"},
     {"plugin": "dashboard", "marketplace": "5dive-plugins"},
@@ -1431,8 +1452,17 @@ MANAGED
     if command -v jq >/dev/null 2>&1 && jq -e . "$msj" >/dev/null 2>&1; then
       local msj_tmp
       msj_tmp=$(mktemp)
+      # DIVE-4697: the two sync keys are ASSIGNED here, so an existing box gains
+      # them on its next nightly run of this installer. Assigned and not merged:
+      # `false` is the only value Claude honours, so a box carrying `true` is
+      # corrected rather than preserved. Everything else in the document — the
+      # operator's own keys and allowlist entries — survives untouched, which is
+      # what makes a hand edit ahead of this change durable (it is exactly how
+      # the two keys placed on the control host by hand on 2026-09-20 persist).
       if jq '
             .channelsEnabled = true
+          | .syncClaudeAiSkills = false
+          | .syncClaudeAiPlugins = false
           | .allowedChannelPlugins = ((.allowedChannelPlugins // []) as $have
               | $have + ([{"plugin":"telegram","marketplace":"5dive-plugins"},
                           {"plugin":"dashboard","marketplace":"5dive-plugins"},
@@ -1442,7 +1472,7 @@ MANAGED
           ' "$msj" > "$msj_tmp" 2>/dev/null && [[ -s "$msj_tmp" ]]; then
         if ! jq -e --slurpfile a "$msj_tmp" '. == $a[0]' "$msj" >/dev/null 2>&1; then
           install -m 644 "$msj_tmp" "$msj"
-          ok "/etc/claude-code/managed-settings.json (reconciled: +5dive channels / channelsEnabled)"
+          ok "/etc/claude-code/managed-settings.json (reconciled: +5dive channels / channelsEnabled / claude.ai sync off)"
         else
           ok "/etc/claude-code/managed-settings.json (kept existing; already current)"
         fi
@@ -1568,12 +1598,13 @@ sync_managed_block() {
   if install -d -m 755 "$_pg_tmp/scripts/git-hooks-portable" "$_pg_tmp/.github" \
      && curl -fsSL "$REPO/scripts/install-pii-push-guard.sh"   -o "$_pg_tmp/scripts/install-pii-push-guard.sh" \
      && curl -fsSL "$REPO/scripts/git-hooks-portable/pre-push" -o "$_pg_tmp/scripts/git-hooks-portable/pre-push" \
+     && curl -fsSL "$REPO/scripts/git-hooks-portable/prepare-commit-msg" -o "$_pg_tmp/scripts/git-hooks-portable/prepare-commit-msg" \
      && curl -fsSL "$REPO/scripts/pii-scan.sh"                 -o "$_pg_tmp/scripts/pii-scan.sh" \
      && curl -fsSL "$REPO/.github/pii-denylist.txt"            -o "$_pg_tmp/.github/pii-denylist.txt"; then
     rm -rf "$_pg_src"
     install -d -m 755 "$_pg_src"
     cp -a "$_pg_tmp/." "$_pg_src/"
-    chmod 755 "$_pg_src/scripts/install-pii-push-guard.sh" "$_pg_src/scripts/git-hooks-portable/pre-push"
+    chmod 755 "$_pg_src/scripts/install-pii-push-guard.sh" "$_pg_src/scripts/git-hooks-portable/pre-push" "$_pg_src/scripts/git-hooks-portable/prepare-commit-msg"
     chmod 644 "$_pg_src/scripts/pii-scan.sh" "$_pg_src/.github/pii-denylist.txt"
     if _pg_out="$(PII_GUARD_SRC_SHA="${GH_PINNED_SHA:-}" "$_pg_src/scripts/install-pii-push-guard.sh" --sync 2>&1)"; then
       ok "pii-guard home — ${_pg_out#pii-push-guard: }"

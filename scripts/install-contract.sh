@@ -217,11 +217,90 @@ else
     fi
   done
 
+  # ------------------------------------------------------------------------
+  # DIVE-4713 — SPLIT THE INSTALLABLE SET BY THE TIER EACH PLUGIN DECLARES
+  # ------------------------------------------------------------------------
+  # The loop below used to demand rc 0 from EVERY box-installable plugin the
+  # registry publishes. That asserted an OUTCOME the registry decides, not a
+  # property this repo owns: `_plugin_trust_gate` installs a plugin only if the
+  # plugin's OWN manifest declares fivedive.trust.review == "official", and the
+  # catalogue and that allowlist were equal by COINCIDENCE. When
+  # 5dive-ai/5dive-plugins@a609407 published `mod` (2026-09-20T15:55:49Z) with
+  # no `fivedive` block, T1b demanded an install the product is SUPPOSED to
+  # refuse, and install-smoke went red on every branch of this repo — including
+  # four whose whole diff was README text. The 15:04Z run was green; nothing
+  # here changed between them. Same generator as DIVE-4708's two corpus
+  # harnesses, third site; found while grading that row.
+  #
+  # The fix is DIVE-4708's, applied here: grade the RELATIONSHIP, not the
+  # outcome. A box-installable plugin installs IF AND ONLY IF its own manifest
+  # declares `official`. Publishing a plugin then moves a name between the two
+  # buckets and can no longer move the verdict — plugin #7 is covered the day it
+  # lands, whichever tier it carries, with no edit here.
+  #
+  # NOT a skip-list. `mod` is named nowhere below; it lands in UNREVIEWED
+  # because of what its manifest says, and it is GRADED there — refused, with
+  # the refusal's own wording, and with nothing left behind on disk. A name-
+  # based skip would be the generator wearing a hat: it re-arms on the next
+  # publish and it stops grading a plugin we ship.
+  #
+  # THE TIER IS READ FROM THE PUBLISHER, not from the box's clone, for the
+  # reason at the top of this file: read the box's own copy and the box becomes
+  # its own examiner. The marketplace manifest mounted at $MARKET does not carry
+  # the tier (it carries name/source/description), so each plugin's own
+  # manifest is fetched from the same publisher, over the network, inside the
+  # container — exactly what T3 does with the team index, and for the same
+  # reason a fetch failure there is a FAIL and never a skip. That also buys a
+  # third fact for free: a box whose clone is stale relative to the publisher
+  # now reads as a red on T1b/T1e rather than as agreement with itself.
+  PUB_RAW="${FIVE_PLUGIN_MANIFEST_BASE:-https://raw.githubusercontent.com/${FIVE_GH_ORG:-5dive-ai}/5dive-plugins/main}"
+
+  # <plugin> -> the directory its PUBLISHER declares it lives in. The index is
+  # the only thing that says where a plugin is; $REGISTRY/plugins/<name> is a
+  # guess that happens to be right today.
+  _psrc() {
+    local s; s=$(jq -r --arg p "$1" '.plugins[] | select(.name==$p) | .source // ""' "$MARKET" 2>/dev/null)
+    s="${s#./}"; [[ -n "$s" ]] || s="plugins/$1"
+    printf '%s' "$s"
+  }
+
+  OFFICIAL=(); UNREVIEWED=(); UNKNOWN_TIER=()
   for p in "${INSTALLABLE[@]}"; do
+    pj=$(mktemp); purl="$PUB_RAW/$(_psrc "$p")/.claude-plugin/plugin.json"
+    if curl -fsSL --max-time 30 "$purl" -o "$pj" 2>/dev/null && jq -e . "$pj" >/dev/null 2>&1; then
+      tier=$(jq -r '.fivedive.trust.review // "unreviewed"' "$pj")
+      ok_t "T1d $p: the publisher's own manifest declares review tier '$tier'"
+      if [[ "$tier" == official ]]; then OFFICIAL+=("$p"); else UNREVIEWED+=("$p"); fi
+    else
+      UNKNOWN_TIER+=("$p")
+      bad_t "T1d $p: read the publisher's own manifest for its review tier" \
+        "could not fetch or parse $purl — NOT a skip: without the tier this harness cannot say what 'plugin add $p' is supposed to do, and assuming one is how the catalogue/allowlist coincidence came back"
+    fi
+    rm -f "$pj"
+  done
+
+  # Two floors, so neither half of the split can go quietly vacuous.
+  if (( ${#OFFICIAL[@]} > 0 )); then
+    ok_t "T1 preconditions: ${#OFFICIAL[@]} official plugin(s) to install (${OFFICIAL[*]}), ${#UNREVIEWED[@]} to refuse (${UNREVIEWED[*]:-none})"
+  else
+    bad_t "T1 preconditions: at least one box-installable plugin declares 'official'" \
+      "every box-installable plugin the registry publishes is unreviewed — the T1b/T2 install arms would run on nothing and pass vacuously, which is what a registry-wide loss of the trust block looks like"
+  fi
+  if (( ${#OFFICIAL[@]} + ${#UNREVIEWED[@]} + ${#UNKNOWN_TIER[@]} == ${#INSTALLABLE[@]} )); then
+    ok_t "T1 preconditions: every box-installable plugin landed in exactly one tier bucket (${#INSTALLABLE[@]})"
+  else
+    bad_t "T1 preconditions: every box-installable plugin landed in exactly one tier bucket" \
+      "${#INSTALLABLE[@]} installable, $(( ${#OFFICIAL[@]} + ${#UNREVIEWED[@]} + ${#UNKNOWN_TIER[@]} )) bucketed — a plugin that falls out of both loops is ungraded, not passing"
+  fi
+
+  # What the box actually did, accumulated across BOTH loops and compared
+  # against what the publishers declared, in T1e.
+  _inst=(); _ref=()
+
+  for p in "${OFFICIAL[@]}"; do
     # Resolve the plugin's directory inside the REGISTERED clone the same way
     # the CLI does: the manifest's own `source`, relative to the clone root.
-    psrc=$(jq -r --arg p "$p" '.plugins[] | select(.name==$p) | .source // ""' "$MARKET")
-    psrc="${psrc#./}"
+    psrc=$(_psrc "$p")
     offered="$STATE/plugins/marketplaces/5dive-plugins/$psrc/.claude-plugin/plugin.json"
     if [[ -f "$offered" ]]; then
       ok_t "T1a $p: offered by the registry on the box at $offered"
@@ -233,8 +312,10 @@ else
     out=$(timeout 120 "$FIVE" plugin add "$p" --yes </dev/null 2>&1); rc=$?
     if (( rc == 0 )); then
       ok_t "T1b $p: 5dive plugin add $p --yes"
+      _inst+=("$p")
     else
       bad_t "T1b $p: 5dive plugin add $p --yes" "rc=$rc — $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+      _ref+=("$p")
       continue
     fi
 
@@ -251,6 +332,61 @@ else
       fi
     done
   done
+
+  # T1e/T1f — NEGATIVE CONTROL. Without these arms the split above reads as
+  # "stop grading the plugins that fail", which is the forbidden shape: the
+  # unreviewed half is still a population and its EXPECTED behaviour is still
+  # graded. Vacuous while the registry publishes only official plugins, and that
+  # is correct — there is then nothing to refuse.
+  for p in "${UNREVIEWED[@]}"; do
+    out=$(timeout 120 "$FIVE" plugin add "$p" --yes </dev/null 2>&1); rc=$?
+    if (( rc != 0 )); then
+      ok_t "T1e $p: 'plugin add' is REFUSED — the plugin declares no 'official' review (rc=$rc)"
+      _ref+=("$p")
+    else
+      bad_t "T1e $p: 'plugin add' is REFUSED — the plugin declares no 'official' review" \
+        "rc=0 — an unreviewed plugin installed on a fresh box. The trust gate is the only thing between a published plugin and root on a customer's box."
+      _inst+=("$p")
+    fi
+    if printf '%s' "$out" | grep -q "installs only 'official'"; then
+      ok_t "T1e2 $p: the refusal names the review tier, not something internal"
+    else
+      bad_t "T1e2 $p: the refusal names the review tier, not something internal" "$(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+    fi
+    # rc alone is not enough: a refusal that had already copied the tree would
+    # pass T1e. Read the registry the dispatcher reads.
+    inst_json="$STATE/plugins/installed.json"
+    left=$(jq -r --arg p "$p" '[to_entries[] | select(.key == $p or (.key | startswith($p + "@"))) | .value.enabled // true] | any' "$inst_json" 2>/dev/null)
+    if [[ "$left" == "false" || -z "$left" || "$left" == "null" ]]; then
+      ok_t "T1f $p: the refused install left NO record behind in installed.json"
+    else
+      bad_t "T1f $p: the refused install left NO record behind in installed.json" "$inst_json records it as enabled — 'plugin add' refused and copied anyway"
+    fi
+  done
+
+  # T1g — THE RELATIONSHIP ARM, and the one that actually disarms the generator.
+  # Not "the catalogue installs" (a third repository decides that) but
+  # "installing and being official are the same set" (this repository decides
+  # that). It is also what stops the split above degenerating: "install
+  # everything" and "refuse everything" are each red here, and a plugin that
+  # fell out of both loops shows up as a missing name.
+  #
+  # A biconditional over an INCOMPLETE population is not a verdict: if any
+  # plugin's tier could not be read, both sides can be empty and this arm would
+  # agree with itself. Measured — with the publisher unreachable it read
+  # `install=[] refuse=[]` and passed. So the unknowns fail it explicitly rather
+  # than being quietly excluded from the claim.
+  t1g_want="install=[${OFFICIAL[*]}] refuse=[${UNREVIEWED[*]}]"
+  t1g_got="install=[${_inst[*]}] refuse=[${_ref[*]}]"
+  if (( ${#UNKNOWN_TIER[@]} > 0 )); then
+    bad_t "T1g a box-installable plugin installs IFF its own manifest declares 'official'" \
+      "not graded — the publisher's tier is unknown for ${UNKNOWN_TIER[*]}, so this arm's population is incomplete and would agree with itself (see the T1d failure above)"
+  elif [[ "$t1g_want" == "$t1g_got" ]]; then
+    ok_t "T1g a box-installable plugin installs IFF its own manifest declares 'official' ($t1g_want)"
+  else
+    bad_t "T1g a box-installable plugin installs IFF its own manifest declares 'official'" \
+      "publishers declare $t1g_want — the box did $t1g_got"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

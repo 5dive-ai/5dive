@@ -269,6 +269,34 @@ declare -A TYPE_CHANNELS=(
 # the box), so it keeps its own two copies — guarded against drift by
 # tests/buzz_channel_wiring_unit.sh, which diffs them against this constant.
 readonly FIVEDIVE_CHANNEL_PLUGINS_JSON='[{"plugin":"telegram","marketplace":"5dive-plugins"},{"plugin":"dashboard","marketplace":"5dive-plugins"},{"plugin":"buzz","marketplace":"5dive-plugins"}]'
+
+# DIVE-4697: claude.ai ACCOUNT-level sync of skills and plugins — the keys that
+# turn it OFF, as one constant for the same reason the channel list above is one
+# (a fixer and the check that gates it drifted, and the check read [ok] either
+# way). Claude Code 2.1.275 (2026-09-17) began syncing the skills and plugins
+# enabled on the claude.ai ACCOUNT into every terminal session signed in with
+# it. Our auth profiles are SHARED across seats and boxes, so one toggle in that
+# account's web UI would land code in every seat on the profile, everywhere, at
+# the next launch — while the decided direction is that what runs in a seat is a
+# BOX decision (/dashboard/plugins, DIVE-4434).
+#
+# allowedChannelPlugins does NOT cover this path: measured in the 2.1.278
+# binary, it gates a synced plugin's CHANNEL only, so a synced plugin cannot
+# push inbound messages — its skills, commands, hooks, agents and MCP servers
+# load like a plugin we installed ourselves. The key is the only control we have
+# proven, which is why it is a floor and not a preference.
+#
+# Both are restrictive booleans (strictest source wins) and only `false` is
+# honoured — the feature is enabled server-side, so `true` here turns nothing on
+# early and a box that wants the sync ON removes the key rather than flipping it.
+# Managed settings are an honoured source. On a claude.ai TEAM/Enterprise login
+# the org's REMOTE managed settings override this local file entirely, so for
+# such a profile the control is the org admin's settings, not this file.
+#
+# install.sh cannot source this (curl-piped, must run before jq is on the box),
+# so it keeps its own copy — guarded against drift by
+# tests/managed_settings_selfheal_unit.sh.
+readonly FIVEDIVE_MANAGED_SYNC_OFF_JSON='{"syncClaudeAiSkills":false,"syncClaudeAiPlugins":false}'
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for
 # claude-family types we check /etc/5dive/connectors/anthropic.env (0640

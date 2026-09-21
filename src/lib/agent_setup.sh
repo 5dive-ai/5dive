@@ -18,6 +18,64 @@
 # below no longer wires either of them.
 AGENT_SKILLS_DIR="/usr/local/lib/5dive/skills"
 
+# DIVE-4667: every seat commits through the same git hook, independent of the
+# coding tool it runs.  The hook reads identity from the seat's GLOBAL git
+# config, while the box-wide switch remains in root-owned box.json.
+render_agent_coauthor_hook() {
+  cat <<'HOOK'
+#!/usr/bin/env bash
+set -u
+
+message_file="${1:-}"
+[[ -n "$message_file" && -f "$message_file" ]] || exit 0
+
+seat="$(git config --global --get 5dive.seat-name 2>/dev/null || true)"
+openagent_id="$(git config --global --get 5dive.openagent-id 2>/dev/null || true)"
+[[ -n "$seat" && "$openagent_id" =~ ^oa-[0-9a-f]{12}$ ]] || exit 0
+
+box_config="$(git config --global --get 5dive.box-config 2>/dev/null || true)"
+box_config="${box_config:-/var/lib/5dive/box.json}"
+coauthor=on
+if [[ -r "$box_config" ]]; then
+  configured="$(jq -r 'if (.coauthor? | type) == "string" then .coauthor else empty end' "$box_config" 2>/dev/null || true)"
+  [[ -n "$configured" ]] && coauthor="$configured"
+fi
+[[ "$coauthor" == off ]] && exit 0
+
+email="${openagent_id}@openagent.5dive.ai"
+tmp="${message_file}.5dive-coauthor.$$"
+trap 'rm -f "$tmp"' EXIT
+
+# Remove this seat's prior spelling first: the stable id is authoritative even
+# if the display name changed. Then append exactly one canonical trailer.
+awk -v needle="<${email}>" '
+  tolower($0) ~ /^co-authored-by:[[:space:]]/ && index(tolower($0), tolower(needle)) { next }
+  { print }
+' "$message_file" >"$tmp" || exit 1
+mv "$tmp" "$message_file" || exit 1
+git interpret-trailers --in-place --if-exists=addIfDifferent --if-missing=add \
+  --trailer "Co-Authored-By: ${seat} <${email}>" "$message_file"
+HOOK
+}
+
+install_agent_coauthor_hook() {
+  local name="$1" openagent_id="$2" user="agent-${1}"
+  command -v git >/dev/null 2>&1 || return 0
+  id -u "$user" >/dev/null 2>&1 || return 0
+  [[ "$openagent_id" =~ ^oa-[0-9a-f]{12}$ ]] || return 1
+  local home="${AGENT_HOME_ROOT:-/home}/${user}"
+  local hooks="$home/.config/5dive/git-hooks" hook="$home/.config/5dive/git-hooks/prepare-commit-msg"
+  install -d -m 700 -o "$user" -g "$user" "$hooks" || return 1
+  local tmp; tmp=$(mktemp)
+  render_agent_coauthor_hook >"$tmp" || { rm -f "$tmp"; return 1; }
+  install -m 755 -o "$user" -g "$user" "$tmp" "$hook" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  sudo -u "$user" -H git config --global 5dive.seat-name "$name" || return 1
+  sudo -u "$user" -H git config --global 5dive.openagent-id "$openagent_id" || return 1
+  sudo -u "$user" -H git config --global 5dive.box-config "${BOX_CONFIG:-${STATE_DIR:-/var/lib/5dive}/box.json}" || return 1
+  sudo -u "$user" -H git config --global core.hooksPath "$hooks" || return 1
+}
+
 # DIVE-4203 — THE ONE DEFAULT-SKILLS LIST. Both consumers read this and only
 # this: the provisioner (preseed_default_skills_for_type, called from all SEVEN
 # preseed call sites below — claude, codex, grok, opencode, pi, and antigravity
@@ -2249,14 +2307,24 @@ reconcile_managed_settings() {
   # same constant the doctor CHECK asserts. These were two hand-kept literals and
   # they drifted on buzz; do not re-type the list here.
   [[ -n "${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}" ]] || return 1
+  # DIVE-4697: and the claude.ai account-sync opt-out, from its own constant
+  # (header.sh). Same rule as the channel list: never re-type it here.
+  [[ -n "${FIVEDIVE_MANAGED_SYNC_OFF_JSON:-}" ]] || return 1
   local tmp
   tmp=$(mktemp) || return 1
-  if jq --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" '
+  # The sync keys are ASSIGNED, not merged with `+`: `false` is the only value
+  # Claude honours, so a box that carries `true` (or a typo) must be corrected,
+  # not preserved. A box that genuinely wants the account sync ON deletes the
+  # keys AND stops running this reconcile — that is a per-box decision, and the
+  # template is not where it is expressed (DIVE-4697).
+  if jq --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
+        --argjson sync "$FIVEDIVE_MANAGED_SYNC_OFF_JSON" '
         .channelsEnabled = true
       | .allowedChannelPlugins = ((.allowedChannelPlugins // []) as $have
           | $have + ($need
               | map(select(. as $n
                   | ($have | any(.plugin == $n.plugin and .marketplace == $n.marketplace)) | not))))
+      | reduce ($sync | to_entries[]) as $kv (.; .[$kv.key] = $kv.value)
       ' "$msj" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
     if jq -e --slurpfile a "$tmp" '. == $a[0]' "$msj" >/dev/null 2>&1; then
       rm -f "$tmp"; return 3          # already current
@@ -2304,6 +2372,41 @@ managed_settings_channels_missing() {
       | [$need[] | select(. as $n
           | ($have | any(.plugin == $n.plugin and .marketplace == $n.marketplace)) | not)
         | "\(.plugin)@\(.marketplace)"] | join(", ")
+    ' "$msj" 2>/dev/null
+}
+
+# DIVE-4697: the GATE for the claude.ai account-sync opt-out, living beside the
+# fixer that repairs it and reading the SAME constant, for the reason spelled
+# out above the channel gate: a self-heal whose gate cannot fire is the same as
+# no self-heal, and it reports [ok] either way.
+#
+# Returns 0 only when EVERY key of FIVEDIVE_MANAGED_SYNC_OFF_JSON is present and
+# carries exactly its value. 1 otherwise — including a missing/unreadable/not-
+# JSON file, or no jq, because "cannot prove the sync is off" must route to the
+# repair path and never to [ok]. `null == false` is not true in jq, so an ABSENT
+# key reads as not-current, which is the whole point: absent is the state every
+# box provisioned before 2026-09-20 is in.
+managed_settings_sync_off_ok() {
+  local msj="${1:-/etc/claude-code/managed-settings.json}"
+  [[ -f "$msj" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -n "${FIVEDIVE_MANAGED_SYNC_OFF_JSON:-}" ]] || return 1
+  jq -e --argjson sync "$FIVEDIVE_MANAGED_SYNC_OFF_JSON" '
+      . as $doc | $sync | to_entries | all(. as $kv | $doc[$kv.key] == $kv.value)
+    ' "$msj" >/dev/null 2>&1
+}
+
+# The keys the gate above is missing, "key, key" on stdout (empty when none
+# are). Derived from the same constant so a third sync key shipped upstream is
+# named in the doctor line without anyone editing a message string.
+managed_settings_sync_missing() {
+  local msj="${1:-/etc/claude-code/managed-settings.json}"
+  [[ -f "$msj" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -n "${FIVEDIVE_MANAGED_SYNC_OFF_JSON:-}" ]] || return 1
+  jq -r --argjson sync "$FIVEDIVE_MANAGED_SYNC_OFF_JSON" '
+      . as $doc
+      | [$sync | to_entries[] | select($doc[.key] != .value) | .key] | join(", ")
     ' "$msj" 2>/dev/null
 }
 
