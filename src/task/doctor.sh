@@ -263,7 +263,27 @@ _task_doctor_reason_case_sql() {  # <bad-lanes-inlist> <bad-graders-inlist> [wit
               AND kind='standard'
               AND merge_hold_reason IS NOT NULL AND merge_hold_reason<>''
               AND (${_TASKS_TFV_SQL})
-           THEN 'graded-merge-held'"
+           THEN 'graded-merge-held'
+         -- DIVE-4724: A CLAIM THAT OUTLIVED ITS VERDICT. The grade happened --
+         -- a verdict for THIS iteration is on the row -- and the hand-back did
+         -- not, so the row sits in_progress on the grading seat with nothing
+         -- behind the claim. It is undispatchable for the same reason
+         -- graded-merge-held is (both pickers are scoped to status='todo') and
+         -- worse than it: the busy-guard counts the row, so the SEAT is
+         -- undispatchable too, and DIVE-2560's verifier-latency skip is why the
+         -- reaper did not reach it. Measured on quinn 2026-09-20: two such rows
+         -- held the verifier lane for 7 hours. The heartbeat now reclaims one
+         -- past its budget; this names the class in the meantime and names it
+         -- for a store whose heartbeat is not running at all.
+         WHEN status='in_progress'
+              AND kind='standard'
+              AND verifier IS NOT NULL AND verifier=assignee
+              AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
+              AND (handoff_rejected_at IS NULL OR handoff_rejected_at < handoff_delivered_at)
+              AND graded_verdict IS NOT NULL AND TRIM(graded_verdict)<>''
+              AND graded_verdict_at IS NOT NULL
+              AND graded_verdict_at >= handoff_delivered_at
+           THEN 'claim-outlived-verdict'"
   [[ "$unassigned" == "1" ]] && out+="
          WHEN assignee IS NULL OR assignee='' THEN 'unassigned-no-coordinator'"
   [[ -z "$lanes"   ]] || out+="
@@ -307,6 +327,7 @@ _task_doctor_explain() {
     unassigned-no-coordinator) printf '%s' "no assignee, so no tick ever reaches it - the heartbeat iterates SEATS and hands each one its own rows, and this row is on no seat. -> 5dive task assign <id> <agent>   (roster: 5dive agent list). If the board keeps producing these, the chart resolves no coordinator for filing to default to: 5dive org set <agent> --role='<their prose> coordinator'" ;;
     dead-lane)    printf '%s' "assigned to a seat the heartbeat tick never wakes (heartbeat disabled or absent) — nothing will pick it up. -> 5dive task assign <id> <agent>   (roster: 5dive agent list)" ;;
     graded-merge-held) printf '%s' "graded ACCEPT and HELD for a merge, at status=in_progress - so NO tick reaches it. Both pickers are scoped to status='todo' (cmd_heartbeat.sh:2076/:2085), so the merge-owner arm at :2097 that exists for exactly this row never runs, and the assignee is the grading seat, often an ephemeral clone that is already gone. The work shipped; only the bookkeeping stalled. -> the seat named below runs 5dive task merge <id>. A row that predates this fix is still at in_progress and nothing will dispatch it: re-record the grade (5dive task verify <id> --no-done --cmd=<the acceptance test>), which now hands the row to that seat and puts the status back." ;;
+    claim-outlived-verdict) printf '%s' "GRADED, but never handed back: a verdict for this delivery is recorded and the handoff was never ACKed, so the row is still in_progress on the grading seat. Nothing dispatches it (both pickers are scoped to status='todo') AND the claim makes that seat read busy, so the whole verifier lane stops behind it. -> the grading seat runs 5dive task done <id> (accept) or 5dive task reject <id> --feedback=... to finish the hand-back; if that session is gone, 5dive task start <id> is not the verb - reclaim it with 5dive heartbeat wake-task <seat> <id> on an idle pane, or clear the claim with 5dive task assign <id> <the grading seat>." ;;
     dead-verifier) printf '%s' "GRADER nothing wakes: this row dispatches fine and STRANDS AT HANDOFF, not now — \`task done\` writes assignee=<verifier>, so the maker spends the whole task first and the delivery goes to a seat no tick will ever iterate. -> 5dive task verifier <id> <agent>   (roster: 5dive agent list)" ;;
     *)            printf '%s' "undispatchable" ;;
   esac

@@ -738,6 +738,46 @@ _hb_effective_fresh() {
   printf '%s' "$agent_fresh"
 }
 
+# DIVE-4724 — WHY THIS SEAT MUST NOT BE /clear'ed THIS TICK, or empty when it
+# may be. Prints ONE reason (the first that holds) and decides nothing else: the
+# caller keeps the dispatch and only downgrades `fresh` to warm, so the worst
+# case this can cause is a goal landing in a context that did not need keeping.
+# Reading it the other way round is what it exists to stop — a /clear is the one
+# dispatch-side act that destroys state the seat has not written down yet, and
+# on a grading seat that state is the grade.
+#
+# Two signals, deliberately different shapes:
+#   * live background shells — the previous turn's own work is still producing
+#     output the session is waiting on (DIVE-4298 reads this pane state as
+#     "the turn is over", which is true for DISPATCH and false for /clear);
+#   * an unacked delivery this seat holds AS ITS VERIFIER — the verdict's
+#     hand-back is still owed by the session we are about to wipe. Same
+#     predicate the reclaimer's awaiting_verifier column uses, so the two
+#     cannot disagree about what an open handoff is.
+#
+# `_HB_IDLE_BG_SHELLS` is set by the idle probe on this tick; empty or unset
+# means "no shells, or not probed" and is treated as no signal.
+_hb_fresh_downgrade_reason() {
+  local name="$1"
+  if [[ -n "${_HB_IDLE_BG_SHELLS:-}" ]]; then
+    printf '%s background shell(s) from the previous turn are still running' "$_HB_IDLE_BG_SHELLS"
+    return 0
+  fi
+  local owed
+  owed=$(db "SELECT COUNT(*) FROM tasks
+              WHERE assignee=$(sqlq "$name") AND verifier=$(sqlq "$name")
+                AND status<>'done' AND status<>'cancelled'
+                AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
+                AND (handoff_rejected_at IS NULL
+                     OR handoff_rejected_at < handoff_delivered_at);" 2>/dev/null || echo 0)
+  [[ "${owed:-0}" =~ ^[0-9]+$ ]] || owed=0
+  if (( owed > 0 )); then
+    printf '%s delivered row(s) this seat holds as verifier are still unacked' "$owed"
+    return 0
+  fi
+  return 0
+}
+
 # DIVE-1349 wake-on-spawn helper (internal plumbing, not in _hb_usage). Nudges
 # ONE agent to start a specific just-spawned task now instead of on its next
 # tick. Root-gated because it drives systemd + the agent's tmux session; invoked
@@ -3547,7 +3587,7 @@ _hb_reclaim() {
   local budget=$(( everyMin * _HB_STALE_MULT ))
   (( budget < _HB_STALE_MIN_MINUTES )) && budget=$_HB_STALE_MIN_MINUTES
   local proc_start; proc_start=$(_hb_claude_started "$name" 2>/dev/null || true)
-  local reclaimed=0 escalated=0 id started_epoch age_min awaiting_verifier delivered_live merge_elsewhere
+  local reclaimed=0 escalated=0 id started_epoch age_min awaiting_verifier delivered_live merge_elsewhere verdict_recorded
   # DIVE-4328 iteration 3 — ONE QUERY, NOT TWO. The un-park needs the seat's
   # newest supervisor observation, and this function was already about to ask
   # sqlite for the seat's rows. Iteration 2 asked in a second `db` call at the
@@ -3611,6 +3651,27 @@ _hb_reclaim() {
                  -- this statement.
                  CASE WHEN (${_TASKS_TFV_SQL})
                            AND $(_tasks_merge_owner_sql) <> $(sqlq "$name")
+                      THEN 1 ELSE 0 END || '|' ||
+                 -- DIVE-4724: THE VERDICT IS ALREADY ON THE ROW. DIVE-2560's skip
+                 -- below exempts a delivered, unacked, verifier-held row from the
+                 -- idle-stall and hard-cap arms because the clock that matters is
+                 -- the verifier's reading latency, not the claim age. Once a
+                 -- verdict for THIS iteration has been recorded that latency is
+                 -- over -- the grade happened -- and what is left is a claim with
+                 -- nothing behind it, which the skip then protects forever.
+                 -- Measured 2026-09-20 on quinn: DIVE-4664 passed 17:23:53Z and
+                 -- DIVE-4708 17:31:46Z, both stayed in_progress and unacked, every
+                 -- tick from 17:34Z to 00:23Z read busy -- 2 in_progress, skip, and
+                 -- the 45m reaper never fired on either because this skip ran
+                 -- first. Bound to the ITERATION, like every other grade predicate
+                 -- here: a verdict older than the delivery in front of it graded a
+                 -- different iteration and confers nothing.
+                 -- NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT -- the whole
+                 -- statement is one double-quoted bash string.
+                 CASE WHEN graded_verdict IS NOT NULL AND TRIM(graded_verdict) <> ''
+                           AND graded_verdict_at IS NOT NULL
+                           AND handoff_delivered_at IS NOT NULL
+                           AND graded_verdict_at >= handoff_delivered_at
                       THEN 1 ELSE 0 END
                FROM tasks
                WHERE assignee=$(sqlq "$name") AND status='in_progress';"
@@ -3646,7 +3707,7 @@ ${_q_sql}" 2>/dev/null || true)
     mapfile -t _rows < <(db "$_rows_sql" 2>/dev/null || true)
   fi
   for _line in ${_rows[@]+"${_rows[@]}"}; do
-    IFS='|' read -r id started_epoch age_min awaiting_verifier delivered_live merge_elsewhere <<<"$_line"
+    IFS='|' read -r id started_epoch age_min awaiting_verifier delivered_live merge_elsewhere verdict_recorded <<<"$_line"
     [[ -n "$id" ]] || continue
     # DIVE-4206 — GRADED, AND THE MERGE IS ANOTHER SEAT'S. Recorded here for
     # the log ONLY; the three rules below still run and the row still reclaims.
@@ -3739,7 +3800,30 @@ ${_q_sql}" 2>/dev/null || true)
     # above and never reaches here unless maker_agent is NULL — but the whole
     # defect being fixed is a hold with no exit, so it gets no second door.)
     if (( awaiting_verifier && ! _hold_lapsed )); then
-      continue
+      # DIVE-4724 -- THE SKIP IS FOR A GRADE IN FLIGHT, NOT FOR A CLAIM THAT
+      # OUTLIVED ITS VERDICT. With a verdict for this iteration already on the
+      # row there is no verifier latency left to wait out: the seat holds a
+      # claim whose work is done and whose only remaining move is the hand-back.
+      # Left standing it is permanent, because the two mechanisms that would
+      # normally end it both refuse: the busy-guard counts the row (once the
+      # merge lands, _TASKS_TFV_SQL subtracts it and the DIVE-4261 discount
+      # stops applying) so the seat is never dispatched, and this skip is the
+      # reason the reaper never runs. Both doors, one claim -- 7 hours of
+      # busy -- 2 in_progress, skip on quinn, 2026-09-20 17:34Z -> 00:23Z.
+      #
+      # BOUNDED BY THE SAME BUDGET AS EVERYTHING ELSE, and that is the whole
+      # narrowing: inside it, a verifier that has just stamped a verdict still
+      # gets its full budget to run the hand-back itself, which is the ordinary
+      # path and must not be raced. Past it, the ordinary rules own the row --
+      # (c) requeues it to todo on the SAME seat (clean mode leaves the assignee
+      # alone), so the picker re-presents the row that owes the ack rather than
+      # handing it to anyone else, and _hb_reclaim_to_todo closes the dangling
+      # run receipt (DIVE-3932) that a wiped grading session left open.
+      if (( verdict_recorded && age_min >= budget )); then
+        _hb_log "[$name] $(_hb_ident "$id") carries a recorded verdict but no hand-back and the claim is ${age_min}m past the ${budget}m budget — the verifier-latency skip does NOT hold (claim outlived its verdict, DIVE-4724); the ordinary rules take it"
+      else
+        continue
+      fi
     fi
     # (c) hard cap before stall: in_progress past the budget but rule (a) didn't
     # fire (the claiming process did NOT restart — e.g. an in-process /clear or
@@ -8560,6 +8644,32 @@ cmd_heartbeat_tick() {
     # from the $reg snapshot this loop already holds.
     local eff_fresh
     eff_fresh="$(_hb_effective_fresh "$name" "$task_id" "$fresh")"
+
+    # DIVE-4724 — A /clear IS NOT FREE WHILE THE LAST TURN IS STILL LIVE.
+    # `fresh` buys a clean context; it costs whatever the seat had not finished
+    # writing down. DIVE-4298 decided (correctly) that an idle pane with live
+    # background shells is dispatchable — the turn IS over — but it made the
+    # dispatch carry the seat's ordinary /clear, and on a grading seat the
+    # background shell IS the grade: quinn, 2026-09-20 17:33:56Z, "idle with 1
+    # background shell(s) -- the turn is over, dispatching" and one line later a
+    # fresh wake onto DIVE-4667, while the DIVE-4708 verdict it had stamped two
+    # minutes earlier still owed its hand-back. The same shape at 17:25:49Z had
+    # done it to DIVE-4664. Both rows then sat claimed and unreapable for seven
+    # hours.
+    #
+    # So: DISPATCH, but WARM. Nothing here refuses the row or defers the tick —
+    # a downgrade to warm is strictly weaker than a skip, keeps the queue
+    # moving, and leaves intact the one thing a /clear destroys: the session
+    # that still owes a hand-back, or is still reading its own background shell.
+    # A seat with neither signal is unaffected and clears exactly as before.
+    if [[ "$eff_fresh" == "true" ]]; then
+      local _warm_why
+      _warm_why="$(_hb_fresh_downgrade_reason "$name")"
+      if [[ -n "$_warm_why" ]]; then
+        eff_fresh="false"
+        _hb_log "[$name] fresh wake DOWNGRADED to warm for ${task_ident} — ${_warm_why}; a /clear here destroys work in flight (DIVE-4724)"
+      fi
+    fi
 
     # DIVE-1858 Stage 1: wake-budget guardrail. A cold-mode agent that has spent
     # today's wake cap is skipped this tick so a chatty trigger can't thrash it
