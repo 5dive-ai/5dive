@@ -1236,7 +1236,7 @@ _a2a_guard_holds() {
   # the send spooled (DIVE-4214), and the drain typed it at 00:10:36Z. The seat
   # then spent a turn establishing what `5dive task queue` already said --
   # "ops: no gates routed to you are waiting." The re-nag's selection predicate
-  # (_HB_GATE_RENAG_WHERE) is not wrong: it requires need_answered_at IS NULL
+  # in cmd_heartbeat.sh is not wrong: it requires need_answered_at IS NULL
   # and did so correctly at 00:05:04. The staleness is entirely in the spool,
   # which is why the re-check belongs here rather than in a tighter sweep.
   #
