@@ -76,6 +76,59 @@ _REAP_MIN_AGE_DEFAULT="${FIVEDIVE_REAP_MIN_AGE:-900}"
 # reapers entirely without touching an explicit `5dive agent reap` invocation.
 _reap_enabled() { [[ "${FIVEDIVE_REAP:-1}" != "0" ]]; }
 
+# The last acting pass's victims, `<pid>:<cmdline>` joined by `; `, for the
+# audit row. Set by `_reap_stale_shells`; read by `_reap_at_task_boundary`.
+_REAP_LAST_VICTIMS=""
+
+# ---- pure predicate: is this process inside the SEAT'S UNIT? ----
+#
+# DIVE-584. `_reap_seat_table` below asks `ps -u <seat>`, which answers "every
+# process of this uid" — and the header's own rule is narrower than that: a
+# shell descended from the seat's RUNTIME. A systemd unit written with
+# `User=agent-<seat>` shares the uid and nothing else, so an ExecStart that goes
+# through `sh -c` landed in the reapable class and was killed by the next
+# `task done` from that seat. Measured 2026-09-21 on `mp-staging.service`
+# (`php -S` under `sh -c`): `journalctl -u mp-staging.service` shows status=15
+# and the restart counter moving 41 -> 43 across three closes in one day. Silent
+# by construction, because systemd restarts the unit — only the journal names
+# the reaper.
+#
+# The CGROUP is the discriminator because it is what systemd itself uses for
+# unit membership, and — unlike a parent walk — it SURVIVES REPARENTING: a
+# `nohup`/`setsid` shell that detaches to pid 1 stays in its unit's cgroup, so
+# the DIVE-3503 runaway this whole reaper exists for is still collected.
+#
+# Pure string function, so the harness can grade it with no /proc and no real
+# processes: it takes the TEXT of `/proc/<pid>/cgroup` (v2's single `0::/path`
+# line, or v1's several `n:ctl:/path` lines) and the seat NAME. Exit 0 = the
+# process is in that seat's agent unit.
+_reap_cgroup_is_seat() {  # <cgroup-text> <seat-name>
+  local text="$1" seat="$2"
+  [[ -n "$text" && -n "$seat" ]] || return 1
+  [[ "$text" == *"/5dive-agent@${seat}.service"* ]]
+}
+
+# The cgroup text for one pid. Overridable by the same contract the rest of this
+# family uses — a FUNCTION NAME, not a command string, because it is expanded
+# unquoted — so a unit harness can serve a fixture per pid.
+_reap_pid_cgroup() { cat "/proc/$1/cgroup" 2>/dev/null || printf ''; }
+_REAP_CGROUP_CMD="${_REAP_CGROUP_CMD:-_reap_pid_cgroup}"
+
+# `_reap_in_seat_unit <pid> <seat-name>` — the impure half, kept to one line.
+#
+# FAILS CLOSED, and that direction is the point of the row: a host with no
+# /proc, a pid that exited between `ps` and this read, or a cgroup layout this
+# does not recognise all yield EMPTY, and empty is NOT membership. The cost of
+# the closed answer is a stale shell that survives to the next pass; the cost of
+# the open one is a killed service. A seat with no `5dive-agent@<name>.service`
+# unit therefore reaps NOTHING from now on — deliberate: with no unit there is
+# no runtime to have descended from, so every match would be a uid match.
+_reap_in_seat_unit() {  # <pid> <seat-name>
+  local pid="$1" seat="$2" text
+  text=$($_REAP_CGROUP_CMD "$pid" 2>/dev/null || printf '')
+  _reap_cgroup_is_seat "$text" "$seat"
+}
+
 # ---- pure predicate: is this command line an AGENT-WRITTEN shell? ----
 #
 # Unit-testable: takes the command line as a string, no /proc, no ps, no kill.
@@ -245,12 +298,17 @@ _reap_pid_ended() {
 # attached to would make `task done` refusable for a reason the agent cannot fix.
 _reap_stale_shells() {
   local seat="$1"; shift
-  local min_age="$_REAP_MIN_AGE_DEFAULT" dry=0 reason=""
+  local min_age="$_REAP_MIN_AGE_DEFAULT" dry=0 reason="" victims_file=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --min-age=*) min_age="${1#*=}" ;;
       --dry-run)   dry=1 ;;
       --reason=*)  reason="${1#*=}" ;;
+      # DIVE-584: where to leave the victim list for the caller's audit row.
+      # A FILE and not a variable, because every call site in this codebase
+      # invokes this function inside `$( )` — a global set here dies with the
+      # subshell, which is exactly the way the first attempt at this was wrong.
+      --victims-file=*) victims_file="${1#*=}" ;;
     esac
     shift
   done
@@ -271,11 +329,23 @@ _reap_stale_shells() {
   # subshell today — but `cmd` is a heavily reused name in this codebase and a
   # future direct call would clobber the caller's.
   local class_table="" pid ppid etimes cmd
+  # DIVE-584: the seat NAME, which is what the unit is instantiated on — the
+  # table above was collected by UID, and `seat` may arrive either spelling.
+  local seat_name="${seat#agent-}"
+  local foreign=0
   while IFS=$'\t' read -r pid ppid etimes cmd; do
     if _reap_is_reapable "$pid" "$cmd"; then
+      # A uid is not a membership. A reapable-CLASS command line that is not in
+      # this seat's unit belongs to some other service that merely runs as this
+      # user, and is not ours to end.
+      if ! _reap_in_seat_unit "$pid" "$seat_name"; then
+        foreign=$((foreign + 1)); continue
+      fi
       class_table+="${pid}"$'\t'"${ppid}"$'\t'"${etimes}"$'\t'"${cmd}"$'\n'
     fi
   done <<<"$table"
+  (( foreign == 0 )) || printf '5dive: reap: %s process(es) of uid %s left alone (outside 5dive-agent@%s.service)\n' \
+    "$foreign" "$seat_user" "$seat_name" >&2
   [[ -n "$class_table" ]] || { printf '0'; return 0; }
 
   # The ancestor walk must see the FULL table (the caller's parents are mostly
@@ -300,12 +370,20 @@ _reap_stale_shells() {
   # signalled twice, which is harmless but makes the log lie about the count.
   tree_pids=$(tr ' ' '\n' <<<"$tree_pids" | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ') || tree_pids=""
 
+  # DIVE-584: the audit row carried a COUNT, and a count cannot be traced back
+  # to what died. Every victim's pid and (truncated) command line is recorded
+  # here so `_reap_at_task_boundary` can name them in the `reaped=` field.
+  _REAP_LAST_VICTIMS=""
   for pid in $victims; do
     local cmd_short; cmd_short=$(grep -E "^${pid}"$'\t' <<<"$class_table" | cut -f4 | cut -c1-160) || cmd_short=""
     printf '5dive: reaping stale agent shell pid=%s (age>=%ss%s): %s\n' \
       "$pid" "$min_age" "${reason:+, $reason}" "$cmd_short" >&2
+    _REAP_LAST_VICTIMS+="${_REAP_LAST_VICTIMS:+; }${pid}:${cmd_short:0:80}"
     n=$((n + 1))
   done
+  # Best-effort, always: an audit field is not worth failing the verb it is
+  # attached to (the whole function returns 0 for the same reason).
+  [[ -z "$victims_file" ]] || printf '%s' "$_REAP_LAST_VICTIMS" > "$victims_file" 2>/dev/null || true
 
   if (( dry == 1 )); then printf '%s' "$n"; return 0; fi
 
@@ -354,9 +432,15 @@ _reap_at_task_boundary() {
   local seat="${USER:-}"
   [[ -n "$seat" ]] || seat=$(id -un 2>/dev/null) || return 0
   [[ "$seat" == agent-* || "$seat" == "claude" ]] || return 0
-  local n; n=$(_reap_stale_shells "$seat" --reason="task ${ident} ${verb}") || return 0
-  [[ "${n:-0}" =~ ^[0-9]+$ ]] && (( n > 0 )) || return 0
+  # DIVE-584: `reaped=3` in the audit row cannot be traced back to what died —
+  # which is how the mp-staging.service kills went unnoticed for a day. `$$` is
+  # a builtin, so naming the drop file costs no fork on this hot path.
+  local vf="${TMPDIR:-/tmp}/5dive-reap.$$.victims"
+  local n; n=$(_reap_stale_shells "$seat" --reason="task ${ident} ${verb}" --victims-file="$vf") || { rm -f "$vf" 2>/dev/null || true; return 0; }
+  [[ "${n:-0}" =~ ^[0-9]+$ ]] && (( n > 0 )) || { rm -f "$vf" 2>/dev/null || true; return 0; }
+  local victims=""; victims=$(cat "$vf" 2>/dev/null) || victims=""
+  rm -f "$vf" 2>/dev/null || true
   printf 'note: reaped %s stale background shell(s) left over past this task boundary (DIVE-3503). A wait loop with no deadline is a leak; bound the next one.\n' "$n" >&2
-  audit_log "task ${verb}" ok 0 -- "$ident" "reaped=$n" 2>/dev/null || true
+  audit_log "task ${verb}" ok 0 -- "$ident" "reaped=$n" "victims=${victims:-none}" 2>/dev/null || true
   return 0
 }
