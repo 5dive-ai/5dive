@@ -1197,6 +1197,10 @@ _a2a_queued_reason() {
 #     rail exists precisely for rows whose ack is already stamped — which is why
 #     it needs the graded clause below explicitly, where verifier_unacked got it
 #     for free.
+#   gate_unanswered  — the heartbeat's gate re-nag (DIVE-4725). <ident> is the
+#     sweep's COMMA-SEPARATED NUMERIC ID LIST, not one ident, because the re-nag
+#     is a batch. Still true iff ANY named gate is open and unanswered — the one
+#     condition here that asks nothing about ownership, reasoned at the clause.
 #   assignee_owns    — the grader-pool "go grade this" wake. Assignment only,
 #     NO verifier clause: the pool assigns a grading session to a pool seat that
 #     is not the row's `verifier` column, so requiring verifier=seat there would
@@ -1222,6 +1226,49 @@ _a2a_guard_holds() {
   [[ "$kind" == "task" && -n "$ident" && -n "$seat" && -n "$cond" ]] || return 2
   declare -F db >/dev/null 2>&1 || return 2
   declare -F sqlq >/dev/null 2>&1 || return 2
+
+  # DIVE-4725 — the GATE RE-NAG's own condition, and the one cond in this
+  # grammar that is not a statement about ownership.
+  #
+  # MEASURED 2026-09-21 on this box (/var/log/5dive-heartbeat.log + the board):
+  # `[gate-renag] delivered 4906 via agent rail to ops` at 00:05:04Z; ops
+  # answered that gate at 00:05:11Z, SEVEN SECONDS later; ops was mid-turn so
+  # the send spooled (DIVE-4214), and the drain typed it at 00:10:36Z. The seat
+  # then spent a turn establishing what `5dive task queue` already said --
+  # "ops: no gates routed to you are waiting." The re-nag's selection predicate
+  # (_HB_GATE_RENAG_WHERE) is not wrong: it requires need_answered_at IS NULL
+  # and did so correctly at 00:05:04. The staleness is entirely in the spool,
+  # which is why the re-check belongs here rather than in a tighter sweep.
+  #
+  # THIS IS THE DANGEROUS HALF OF THE DEFECT, not the noisy one. A duplicate
+  # report is noise a reader learns to skip; a reminder that an ALREADY-ANSWERED
+  # gate is waiting teaches a seat that the notification layer disagrees with
+  # the board -- and the next real one gets skipped too.
+  #
+  # `ident` here is the sweep's own COMMA-SEPARATED NUMERIC ID LIST, because a
+  # re-nag is a BATCH: one message naming every unanswered gate routed to that
+  # reviewer. It carries no assignee or verifier clause on purpose -- a gate is
+  # routed to a REVIEWER (routed_reviewer / the org-lead resolution), who is
+  # routinely not the row's assignee, so borrowing the ownership clauses below
+  # would read false on healthy rows and drop every re-nag.
+  #
+  # STILL TRUE IFF ANY named gate is still open, so a mixed batch DELIVERS. The
+  # message then names one answered row among live ones, which is a line to skip
+  # rather than a reminder about nothing -- the fail-open direction this whole
+  # function takes. Only an all-answered batch is dropped, and that is exactly
+  # the case measured above.
+  if [[ "$cond" == "gate_unanswered" ]]; then
+    [[ "$ident" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 2
+    n=$(db "SELECT COUNT(*) FROM tasks
+            WHERE id IN (${ident})
+              AND need_type IS NOT NULL
+              AND need_answered_at IS NULL
+              AND status NOT IN ('done','cancelled');" 2>/dev/null) || return 2
+    [[ "$n" =~ ^[0-9]+$ ]] || return 2
+    (( n > 0 ))
+    return
+  fi
+
   local extra="" vclause
   vclause="AND verifier=$(sqlq "$seat")"
   case "$cond" in
