@@ -87,6 +87,11 @@ envelope_via()            { :; }
 envelope_provenance()     { printf 'derived\n'; }
 _envelope_caller()        { printf "${CALLER:-main}\n"; }
 gen_msg_id()              { printf 'u4769\n'; }
+# Same stub as tests/a2a_busy_queue_unit.sh: the peer-forgery guard resolves
+# `envelope_peer_forgery` from a lib this harness does not source, and a 127
+# inside it aborts the send under errexit — a harness fault that would read as a
+# send failure.
+_agent_refuse_peer_forgery() { :; }
 audit_log()               { :; }
 _hb_agent_idle() { return "${IDLE_RC:-0}"; }
 
