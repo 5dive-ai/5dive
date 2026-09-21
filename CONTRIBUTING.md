@@ -18,8 +18,10 @@ headed — items there are safe bets for contributions.
 
 If you want something scoped and visual to start on, the local web UI
 (`5dive ui`) is the thinnest part of the project and the easiest to see your
-change in. [docs/contribute-ui.md](docs/contribute-ui.md) maps what exists, what
-is missing, and which table each missing screen reads from.
+change in. It has its own repository:
+[5dive-ai/5dive-ui](https://github.com/5dive-ai/5dive-ui/blob/main/CONTRIBUTING.md)
+maps what exists, what is missing, and which table each missing screen reads
+from.
 
 ## Dev setup
 
