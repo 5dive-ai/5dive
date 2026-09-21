@@ -7,6 +7,9 @@
 # caught. Same shape as src/cmd_task.sh's module loader.
 declare -F a2a_round_guard >/dev/null 2>&1 \
   || . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/a2a_rounds.sh"
+# DIVE-4769: same shape, same reason, for the urgent interrupt's budget.
+declare -F a2a_urgent_count >/dev/null 2>&1 \
+  || . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/a2a_urgent.sh"
 
 # Shared: resolve a registry entry or die. Echo nothing on success; used for
 # presence checks in the lifecycle commands below.
@@ -52,6 +55,147 @@ cmd_stop() {
     && echo "$reg" | registry_write
   ok "agent '$name' stopped." \
      '{name:$n, action:"stop"}' --arg n "$name"
+}
+
+# DIVE-4769 — `5dive agent halt <name>`: END THE CURRENT TURN AND GIVE THE ROW
+# BACK. The third thing the fleet could not do to a busy seat.
+#
+# The two routes that existed both fail, in opposite directions. `agent send`
+# waits for idle, which for a single grade turn is AFTER the grade — the exact
+# case measured on 2026-09-21, when a "stop, rubber-stamp it" could not reach
+# quinn mid-grade. `heartbeat wake-task` reaches a busy seat and ORPHANS its
+# in-flight claim (DIVE-4724): the row stays in_progress under a turn that no
+# longer exists, and the next reader cannot tell a live claim from a corpse.
+#
+# So: Escape (which is what ENDS a claude turn — the injector's own comment says
+# so, and types C-u instead for precisely that reason), then hand the claim back
+# through `_hb_reclaim_to_todo`, the reaper's own primitive. That is the whole
+# difference from a force-wake: the row returns to the queue with started_at
+# cleared, the run is closed `abandoned`, and the ledger carries a
+# `task.reclaimed` event. A halted row is requeued, never orphaned and never
+# cancelled.
+#
+# THE VERB IS `halt`, NOT `stop`, and that is not cosmetic: `agent stop` already
+# means "stop the systemd unit" and has callers. Two verbs, two scopes — `stop`
+# ends the SERVICE, `halt` ends the TURN and leaves the seat running and ready
+# for its next dispatch.
+#
+# Privileged: it types into another seat's pane and writes the task row. There is
+# no scoped `_halt` primitive on purpose — handing a standard seat the power to
+# end a peer's turn and move its row is a lead-level capability, and the seats
+# that need it (main, ops) are admin.
+cmd_halt() {
+  local name="" reason="" requeue=1
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason=*)   reason="${1#--reason=}" ;;
+      --no-requeue) requeue=0 ;;
+      -h|--help)    usage; exit 0 ;;
+      --)           shift; positional+=("$@"); break ;;
+      -*)           fail "$E_USAGE" "unknown flag: $1" ;;
+      *)            positional+=("$1") ;;
+    esac
+    shift
+  done
+  name="${positional[0]:-}"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent halt <name> [--reason=<why>] [--no-requeue]   # ends the current TURN and requeues its row; 'agent stop' stops the SERVICE"
+  require_agent "$name"
+  if a2a_needs_scoped "$name"; then
+    fail "$E_PERMISSION" "halt ends another seat's turn and moves its task row — that needs admin/root, and this caller holds only the scoped a2a delivery grant. Send the steer with '5dive agent send $name --urgent \"<one line>\"' instead, or ask a lead seat to halt it."
+  fi
+  sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
+    || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found — there is no turn to halt (to stop the service, use '5dive agent stop $name')"
+
+  local _caller; _caller="$(_envelope_caller)"
+  [[ -n "$_caller" ]] || _caller="human"
+  [[ -n "$reason" ]] || reason="halted by ${_caller}"
+
+  # WAS it mid-turn? Measured BEFORE the Escape, because afterwards nothing can
+  # tell "I ended a turn" from "there was nothing to end", and the receipt is the
+  # only place a caller learns which of the two it paid for. rc 1 = busy, and
+  # nothing else is read as busy (the DIVE-4214 rule).
+  local _irc=0 was_busy=0
+  if declare -F _hb_agent_idle >/dev/null 2>&1; then
+    _hb_agent_idle "$name" "${FIVE_A2A_QUEUE_IDLE_GAP:-0.4}" || _irc=$?
+    (( _irc == 1 )) && was_busy=1
+  fi
+
+  # Escape ends the turn. Two at most: a second one covers the case where the
+  # first landed while the TUI was rendering, and a third keystroke into a pane
+  # that is not accepting is a stray, not a fix (the injector's own ceiling).
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Escape 2>/dev/null || true
+  sleep "${_HALT_SETTLE_SEC:-0.6}"
+  local still=0 _jrc=0
+  if declare -F _hb_agent_idle >/dev/null 2>&1; then
+    _hb_agent_idle "$name" "${FIVE_A2A_QUEUE_IDLE_GAP:-0.4}" || _jrc=$?
+    (( _jrc == 1 )) && still=1
+  fi
+  if (( still )); then
+    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Escape 2>/dev/null || true
+    sleep "${_HALT_SETTLE_SEC:-0.6}"
+  fi
+  # And clear whatever the composer was holding, so the notice below is not
+  # prepended to an abandoned draft (DIVE-4246's residual).
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
+
+  # Hand the claim back. The reaper's primitive, not a hand-rolled UPDATE: it
+  # clears started_at, closes the run as `abandoned`, and emits task.reclaimed —
+  # three things a bare status write would silently skip, and the absence of
+  # which is what makes a force-wake's orphan unreadable afterwards.
+  local -a requeued=()
+  local requeue_note=""
+  if (( requeue )); then
+    if declare -F _hb_reclaim_to_todo >/dev/null 2>&1 && declare -F db >/dev/null 2>&1 \
+       && declare -F sqlq >/dev/null 2>&1; then
+      local _id _ident
+      while read -r _id; do
+        [[ "$_id" =~ ^[0-9]+$ ]] || continue
+        # A DELIVERED row goes back to the VERIFIER's queue, not to its maker:
+        # keep-handoff's own WHERE guard decides whether that applies, so try it
+        # first and fall back to the clean reclaim when the row is still
+        # in_progress afterwards. Getting this backwards would bounce a graded
+        # delivery back to the maker as if it had never been handed over.
+        if declare -F _hb_reclaim_to_verifier >/dev/null 2>&1; then
+          _hb_reclaim_to_verifier "$name" "$_id" "halted by ${_caller} (DIVE-4769): ${reason}" || true
+        fi
+        if [[ "$(db "SELECT status FROM tasks WHERE id=${_id};" 2>/dev/null)" == "in_progress" ]]; then
+          _hb_reclaim_to_todo "$name" "$_id" "halted by ${_caller} (DIVE-4769): ${reason}" || true
+        fi
+        _ident="$_id"
+        declare -F _hb_ident >/dev/null 2>&1 && _ident="$(_hb_ident "$_id")"
+        requeued+=("$_ident")
+      done < <(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='in_progress' AND kind='standard';" 2>/dev/null || true)
+    else
+      # DEGRADE LOUDLY. A halt that ended the turn but could not reach the board
+      # has left exactly the orphan this verb exists to prevent, and saying
+      # nothing would make it indistinguishable from a seat that held no row.
+      requeue_note="the task board was not reachable from this process — the turn was ended but NO row was requeued; check '5dive task ls --assignee=${name}' by hand"
+    fi
+  else
+    requeue_note="--no-requeue: the turn was ended and the claim was left exactly as it was"
+  fi
+
+  # Tell the seat what happened to it, on the interrupting path (it has just been
+  # halted, so it is idle by construction — the marker is there so the notice
+  # cannot be spooled behind the very turn it is reporting on).
+  local _idents="none"
+  (( ${#requeued[@]} )) && _idents="$(IFS=,; printf '%s' "${requeued[*]}")"
+  local notice="[5dive-halt from=${_caller}] Your turn was ENDED by ${_caller}: ${reason}"
+  if (( ${#requeued[@]} )); then
+    notice+=" — your claim on ${_idents} has been RETURNED TO THE QUEUE (not cancelled, not orphaned): do not resume it in this session, it will be re-dispatched."
+  else
+    notice+=" — no in-progress row of yours was requeued."
+  fi
+  notice+=" Read the row before you restart it; the halt reason is the first thing to answer."
+  local _nrc=0
+  _A2A_INTERRUPTING=1 inject_and_submit "$name" "$notice" || _nrc=$?
+
+  ok "agent '$name' halted${requeue_note:+ — }${requeue_note}" \
+     '{name:$n, action:"halt", was_busy:($b=="1"), requeued:($rq|split(",")|map(select(length>0))), notice_delivered:($nd=="1"), reason:$r}' \
+     --arg n "$name" --arg b "$was_busy" --arg r "$reason" \
+     --arg rq "$( (( ${#requeued[@]} )) && { IFS=,; printf '%s' "${requeued[*]}"; } )" \
+     --arg nd "$( (( _nrc == 0 )) && printf 1 || printf 0 )"
 }
 
 # Emit the {ok:true, …, lines:[…]} envelope for a BUFFERED read.
@@ -1902,12 +2046,19 @@ sys.stdout.write("\n".join(out))
 cmd_deliver() {
   require_root "agent _deliver"
   local msgid=""
+  local urgent=0 urgent_eff=0 urgent_note=""
   local -a _pos=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id=*) msgid="${1#--id=}" ;;
       # DIVE-3318: set by cmd_send when a notification rail re-execs into here.
       --notify) _5DIVE_A2A_NOTIFY=1 ;;
+      # DIVE-4769: set by cmd_send when a scoped caller asked to interrupt. Carried
+      # as a flag for the same reason --notify is: sudo scrubs the environment, so
+      # nothing set in cmd_send survives the re-exec. As forgeable as --notify and
+      # no more — any holder of the _deliver grant can pass it, and it buys a
+      # budgeted queue bypass, not a privilege.
+      --urgent) urgent=1 ;;
       --)     shift; _pos+=("$@"); break ;;
       *)      _pos+=("$1") ;;
     esac
@@ -1956,6 +2107,18 @@ cmd_deliver() {
   if ! _a2a_refusal="$(a2a_round_guard "$_caller" "$target" "$message")"; then
     fail "$E_VALIDATION" "$_a2a_refusal"
   fi
+  # DIVE-4769: the urgent bound + budget for the SCOPED path — the branch every
+  # standard-isolation seat's `agent send --urgent` re-execs into. Budgeted
+  # against `_caller` (derived from the real sudo caller), never a claim, so a
+  # seat cannot spend another seat's interrupts.
+  if (( urgent )); then
+    local _u_out
+    if ! _u_out="$(a2a_urgent_grant "$_caller" "$target" "$message")"; then
+      fail "$E_VALIDATION" "$_u_out"
+    fi
+    urgent_eff=$(( _u_out == 1 ? 1 : 0 ))
+    (( urgent_eff )) || urgent_note="urgent budget spent — delivered on the normal path"
+  fi
   # DIVE-2210: ALWAYS stamped, never conditional. A non-agent caller gets
   # tier=unknown:no-caller rather than a clean envelope with the field missing.
   local tier
@@ -1973,8 +2136,11 @@ cmd_deliver() {
   # spoofed --from. Stamped through the same resolver so all three sites agree.
   local _via; _via="$(envelope_via "$s" "$_caller")"
   [[ -n "$_via" ]] && header+=" via=${_via}"
+  # DIVE-4769: stamped only on a GRANTED interrupt, as in cmd_send.
+  (( urgent_eff )) && header+=" urgent=1"
   header+="]"
   local payload="${header} ${message}"
+  if (( urgent_eff )); then payload="$(a2a_urgent_prefix)${payload}"; fi
 
   # DIVE-2797: the row for the SCOPED delivery path. `s` here is already derived
   # from the real sudo caller — _deliver accepts no --from — so from_claimed and
@@ -1994,6 +2160,8 @@ cmd_deliver() {
     "provenance=$(envelope_provenance "$s" "$_caller")"
     "bytes=${#message}"
     "msg_id=${msgid:-<none>}"
+    "urgent_requested=${urgent}"
+    "urgent=${urgent_eff}"
   )
 
   # Same boot-race guard as cmd_send, then deliver by REUSING the literal-inject
@@ -2006,7 +2174,11 @@ cmd_deliver() {
     step "agent '$target' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
   local _rc=0 _delivered=1 _queued=0 _reason="" _summary=""
-  inject_and_submit "$target" "$payload" || _rc=$?
+  if (( urgent_eff )); then
+    _A2A_INTERRUPTING=1 inject_and_submit "$target" "$payload" || _rc=$?
+  else
+    inject_and_submit "$target" "$payload" || _rc=$?
+  fi
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$target")"
   elif (( _rc == 4 )); then
@@ -2036,9 +2208,10 @@ cmd_deliver() {
   _buzz_mirror_outbound "$target" "$message"
   if (( _delivered )); then
     # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
-    ok "delivered to agent '$target'." \
-       '{name:$n, delivered:true, from:$s, tier:($t|select(length>0))}' \
-       --arg n "$target" --arg s "$s" --arg t "$tier"
+    ok "delivered to agent '$target'.${urgent_note:+ (}${urgent_note}${urgent_note:+)}" \
+       '({name:$n, delivered:true, from:$s, tier:($t|select(length>0))}
+         + (if $ur == "1" then {urgent:($ue=="1"), urgent_requested:true} else {} end))' \
+       --arg n "$target" --arg s "$s" --arg t "$tier" --arg ur "$urgent" --arg ue "$urgent_eff"
   else
     if (( _queued )); then
       _summary="queued for agent '$target' — ${_reason}."
@@ -2049,8 +2222,9 @@ cmd_deliver() {
        '({name:$n, delivered:false, from:$s}
          + (if ($t|length) > 0 then {tier:$t} else {} end)
          + (if $q == "1" then {queued:true} else {} end)
+         + (if $ur == "1" then {urgent:($ue=="1"), urgent_requested:true} else {} end)
          + {reason:$r})' \
-       --arg n "$target" --arg s "$s" --arg t "$tier" --arg r "$_reason" --arg q "$_queued"
+       --arg n "$target" --arg s "$s" --arg t "$tier" --arg r "$_reason" --arg q "$_queued" --arg ur "$urgent" --arg ue "$urgent_eff"
   fi
 }
 
@@ -2548,6 +2722,11 @@ _agent_body_shell_hint() {
 
 cmd_send() {
   local name="" message="" from="" from_set=0 raw=0 wake=0
+  # DIVE-4769: --urgent asks to JUMP THE DIVE-4214 SPOOL, i.e. to join the
+  # interrupting class the transport otherwise enumerates for itself. `urgent`
+  # is what the caller asked for; `urgent_eff` is what the budget granted, and
+  # they are separate variables on purpose — the receipt reports the second.
+  local urgent=0 urgent_eff=0 urgent_note=""
   local reply_to_chat="" reply_to_msg=""
   # DIVE-2627: which flag supplied the body, so --message and --message-file
   # cannot silently race each other. See _read_prose_file in lib/validation.sh.
@@ -2565,6 +2744,7 @@ cmd_send() {
       --from=*)           from="${1#--from=}"; from_set=1 ;;
       --raw)              raw=1 ;;
       --wake)             wake=1 ;;
+      --urgent)           urgent=1 ;;
       --reply-to-chat=*)  reply_to_chat="${1#--reply-to-chat=}" ;;
       --reply-to-msg=*)   reply_to_msg="${1#--reply-to-msg=}" ;;
       # DIVE-4421: `5dive agent send --help` used to die on `unknown flag: --help`,
@@ -2625,6 +2805,12 @@ cmd_send() {
   if (( wake )) && a2a_needs_scoped "$name"; then
     fail "$E_PERMISSION" "--wake needs admin/root; this caller holds only the a2a delivery grant — re-run via sudo, or file a task row"
   fi
+  # DIVE-4769: --urgent is NOT refused for a scoped caller the way --wake is. It
+  # needs no privilege _deliver lacks (it is a queue decision, not a lifecycle
+  # power), and refusing it here would put the whole interrupt rail out of reach
+  # of exactly the population that has to use it — a standard-isolation seat is
+  # most of the fleet. It is carried across the re-exec as an explicit flag, the
+  # way --notify is, because sudo scrubs the environment.
   if a2a_needs_scoped "$name"; then
     # DIVE-3318: sudo scrubs the environment, so `_5DIVE_A2A_NOTIFY` set by a
     # notification rail would not survive this re-exec and cmd_deliver would grade
@@ -2632,10 +2818,10 @@ cmd_send() {
     # reviewer a gate exists. Carried across as an explicit flag instead. It is
     # exactly as forgeable as the env var (any holder of the _deliver grant can
     # pass it), and no more: this is a rail marker, not a privilege.
-    if [[ "${_5DIVE_A2A_NOTIFY:-0}" == "1" ]]; then
-      exec sudo -n /usr/local/bin/5dive agent _deliver --notify "$name" "$message"
-    fi
-    exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
+    local -a _scoped_flags=()
+    if [[ "${_5DIVE_A2A_NOTIFY:-0}" == "1" ]]; then _scoped_flags+=(--notify); fi
+    if (( urgent )); then _scoped_flags+=(--urgent); fi
+    exec sudo -n /usr/local/bin/5dive agent _deliver "${_scoped_flags[@]}" "$name" "$message"
   fi
 
   # DIVE-3318: the round cap. Placed AFTER the scoped-`_deliver` exec above, so a
@@ -2647,6 +2833,18 @@ cmd_send() {
   _a2a_from="$(_envelope_caller)"
   if ! _a2a_refusal="$(a2a_round_guard "$_a2a_from" "$name" "$message")"; then
     fail "$E_VALIDATION" "$_a2a_refusal"
+  fi
+
+  # DIVE-4769: the urgent bound + budget, on the same side of the scoped exec as
+  # the round cap and for the same reason — a scoped caller is graded once, by
+  # cmd_deliver, on the far side of it. `urgent_eff` is what was GRANTED.
+  if (( urgent )); then
+    local _u_out
+    if ! _u_out="$(a2a_urgent_grant "$_a2a_from" "$name" "$message")"; then
+      fail "$E_VALIDATION" "$_u_out"
+    fi
+    urgent_eff=$(( _u_out == 1 ? 1 : 0 ))
+    (( urgent_eff )) || urgent_note="urgent budget spent — delivered on the normal path"
   fi
 
   require_agent "$name"
@@ -2685,6 +2883,13 @@ cmd_send() {
   # raw (and accept anonymity).
   if (( raw && from_set )); then
     fail "$E_USAGE" "--raw cannot be combined with --from (raw mode strips the envelope that carries sender identity)"
+  fi
+  # DIVE-4769: an urgent send is one the RECEIVER has to recognise as an
+  # interrupt — that is the whole difference between it and the message it jumps
+  # ahead of. --raw strips the envelope that says so, which would leave a seat
+  # with an ordinary-looking line that cost it its turn.
+  if (( raw && urgent )); then
+    fail "$E_USAGE" "--raw cannot be combined with --urgent (raw strips the envelope marker that tells the receiver it is being interrupted)"
   fi
   if [[ -n "$reply_to_chat" ]]; then
     valid_telegram_chat_id "$reply_to_chat" \
@@ -2738,6 +2943,10 @@ cmd_send() {
       _tier="$(envelope_tier "$_caller")"
       local header="[5dive-msg from=${sender} id=${msg_id}"
       header+=" tier=${_tier}"
+      # DIVE-4769: stamped only when the budget GRANTED the interrupt, never on
+      # the bare flag — the header is read as a claim about what the transport
+      # did, and a downgraded send did the ordinary thing.
+      (( urgent_eff )) && header+=" urgent=1"
       # DIVE-2552: `sender` (claimed) and `_caller` (measured) have both been in
       # hand here since 2281 and were never compared, so a same-tier `--from`
       # spoof had no tell. Stamped only when they DIVERGE, so the ordinary send
@@ -2749,6 +2958,13 @@ cmd_send() {
       header+="]"
       payload="${header} ${message}"
     fi
+  fi
+  # DIVE-4769: the line the receiving MODEL reads. The envelope field above is
+  # for the log and for a parser; a seat needs to be told, in words, that this
+  # one is meant to land before it finishes what it is doing. Applied outside the
+  # envelope branch so an unmeasurable sender (no header at all) still marks it.
+  if (( urgent_eff )); then
+    payload="$(a2a_urgent_prefix)${payload}"
   fi
 
   # DIVE-2797: the audit row for this send. Populated HERE, after parsing, because
@@ -2778,6 +2994,12 @@ cmd_send() {
     "bytes=${#message}"
     "msg_id=${msg_id:-<none>}"
     "raw=${raw}"
+    # DIVE-4769: the interrupting class is now countable. `urgent_requested` vs
+    # `urgent` is the pair that makes the budget legible after the fact — a fleet
+    # where the two diverge often is one where the flag is being reached for as a
+    # default, which is the failure DIVE-4214 predicted.
+    "urgent_requested=${urgent}"
+    "urgent=${urgent_eff}"
   )
 
   # Don't fire keystrokes into a still-booting TUI — they'd be dropped and the
@@ -2796,7 +3018,14 @@ cmd_send() {
   fi
 
   local _rc=0 _sent=1 _queued=0 _reason="" _summary=""
-  inject_and_submit "$name" "$payload" || _rc=$?
+  # DIVE-4769: a granted urgent joins the interrupting class for this one call.
+  # _A2A_INTERRUPTING is the SAME door the flush and the TUI control lines use
+  # (_a2a_should_queue reads it first), so there is one bypass, not two.
+  if (( urgent_eff )); then
+    _A2A_INTERRUPTING=1 inject_and_submit "$name" "$payload" || _rc=$?
+  else
+    inject_and_submit "$name" "$payload" || _rc=$?
+  fi
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
   elif (( _rc == 4 )); then
@@ -2848,9 +3077,28 @@ cmd_send() {
   # mistake this ticket is about.
   if (( _sent )); then
     # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
-    ok "sent to agent '$name'." \
-       '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), ready:($rd|select(length>0)), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
-       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY"
+    # DIVE-4769: `urgent` is additive and appears only when the flag was passed,
+    # so a caller that never passes it reads the same keys it read before.
+    #
+    # THE OPTIONAL KEYS ARE NOW BUILT WITH if/else, not `select(length>0)`, and
+    # that is a FIX this row could not avoid. jq drops the WHOLE object when any
+    # constructed value is `empty`, so on every send that did not have to --wake
+    # the target (AGENT_WAKE_READY unset, i.e. nearly all of them) this branch
+    # rendered an EMPTY JSON envelope — recorded on DIVE-4214's body as
+    # pre-existing and reproduced against pristine origin/main by
+    # tests/a2a_busy_queue_unit.sh, which asserts the success case on the PROSE
+    # line for exactly this reason. It is fixed here rather than filed because
+    # `urgent:` lands in this object: a field a caller cannot read is not a field.
+    # The queued branch below already had the correct form and is unchanged.
+    ok "sent to agent '$name'.${urgent_note:+ (}${urgent_note}${urgent_note:+)}" \
+       '({name:$n, sent:true, bytes:($p|length), woken:($w=="1")}
+         + (if ($rd|length) > 0 then {ready:$rd} else {} end)
+         + (if ($s|length) > 0 then {from:$s} else {} end)
+         + (if ($i|length) > 0 then {msg_id:$i} else {} end)
+         + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
+         + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end)
+         + (if $ur == "1" then {urgent:($ue=="1"), urgent_requested:true} else {} end))' \
+       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg ur "$urgent" --arg ue "$urgent_eff"
   else
     if (( _queued )); then
       _summary="queued for agent '$name' — ${_reason}."
@@ -2865,8 +3113,9 @@ cmd_send() {
          + (if ($i|length) > 0 then {msg_id:$i} else {} end)
          + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
          + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end)
+         + (if $ur == "1" then {urgent:($ue=="1"), urgent_requested:true} else {} end)
          + {reason:$reason})' \
-       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg reason "$_reason" --arg q "$_queued"
+       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg reason "$_reason" --arg q "$_queued" --arg ur "$urgent" --arg ue "$urgent_eff"
   fi
 }
 
