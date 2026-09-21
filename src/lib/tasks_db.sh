@@ -434,6 +434,40 @@ CREATE TABLE IF NOT EXISTS tasks (
   merge_landed_sha TEXT,
   merge_landed_by TEXT,
   merge_landed_ref TEXT,
+  -- DIVE-4778: THE OTHER EXIT FROM THE MERGING STAGE -- the one that is not a
+  -- landing. merge_landed_* above records that the forge merged this pull
+  -- request. These record the DIFFERENT fact that it never will: it is held,
+  -- superseded, or re-pointed at another repository, so this row is owed a merge
+  -- by NOBODY. Without them the stage had exactly one exit and a row whose pull
+  -- request was deliberately ruled out parked in it forever -- measured on
+  -- DIVE-4773, five ops merge dispatches from 10:00Z on 2026-09-21 with no
+  -- available move at the woken seat (community/wiki/a-draft-flag-is-a-hold-the-
+  -- merge-dispatch-cannot-see.md).
+  --
+  -- SEPARATE COLUMNS, NOT A merge_landed_* WRITE WITH A FLAG. The merging rail's
+  -- whole safety property is that only the forge probe's own answer may write
+  -- merge_landed_*, so a decline -- which no probe can report, because a refusal
+  -- cannot distinguish a deliberate hold from an accidental one -- must never
+  -- touch those four. A reader asking has this landed? keeps getting its answer
+  -- from the forge and only from the forge.
+  --   merge_declined_at      when the decline was RECORDED
+  --   merge_declined_by      the seat that recorded it
+  --   merge_declined_ref     the delivery_ref it was recorded AGAINST -- the
+  --                          stage predicate accepts it only while it still
+  --                          equals the row's CURRENT binding, so re-pointing
+  --                          the delivery re-enters MERGING. Same rule and same
+  --                          reason as merge_landed_ref and merge_proof_ref.
+  --   merge_declined_reason  why this pull request will never merge, in the
+  --                          decliner's own words -- the only part of this
+  --                          record a person reads, and required by the verb.
+  -- BARE SET, not COALESCE: CURRENT STATE about a specific binding. NULL = no
+  -- decline recorded, which is every row that existed before these columns, so
+  -- the migration is a pure ALTER with no backfill and no row changes stage on
+  -- the way in.
+  merge_declined_at TEXT,
+  merge_declined_by TEXT,
+  merge_declined_ref TEXT,
+  merge_declined_reason TEXT,
   -- DIVE-2615: why this gate has this tier — axis=pinned|type-default|secret-type
   -- |ask|title|title-fallback|none, plus ;term=<t> where a term is what fired.
   -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS: a fresh store takes this
@@ -1983,6 +2017,11 @@ _TASKS_ADDITIVE_COLUMNS=(
   # the CREATE TABLE comment; merge_landed_ref must match the CURRENT binding.
   'merge_landed_at TEXT' 'merge_landed_sha TEXT'
   'merge_landed_by TEXT' 'merge_landed_ref TEXT'
+  # DIVE-4778: the recorded DECLINE that lets the MERGING stage exit without
+  # asserting a landing. See the CREATE TABLE comment; merge_declined_ref must
+  # match the CURRENT binding, and none of these may ever be written by a probe.
+  'merge_declined_at TEXT' 'merge_declined_by TEXT'
+  'merge_declined_ref TEXT' 'merge_declined_reason TEXT'
   # DIVE-2354: approve-to-send | confirm-after-send. See the CREATE TABLE comment.
   'gate_mode TEXT'
   # DIVE-3342: humans.id of the person who may CLEAR this gate. See the CREATE
@@ -2075,6 +2114,19 @@ _TASKS_MERGE_LANDED_SQL="merge_landed_at IS NOT NULL
        AND delivery_ref IS NOT NULL
        AND merge_landed_ref = delivery_ref"
 
+# DIVE-4778 — A DECLINE RECORDED AGAINST THE ROW'S CURRENT BINDING. The sibling
+# of _TASKS_MERGE_LANDED_SQL above and binding-scoped for the identical reason:
+# a decline of a delivery_ref the row no longer carries is a decline of a
+# DIFFERENT pull request, so re-pointing the delivery re-enters MERGING rather
+# than inheriting it. Three readers subtract or paint it -- the stage predicate
+# below, task show, and the merge-owner dispatch -- so it is one string, not
+# three opinions. NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT: the
+# constant is one double-quoted bash string.
+_TASKS_MERGE_DECLINED_SQL="merge_declined_at IS NOT NULL
+       AND merge_declined_ref IS NOT NULL
+       AND delivery_ref IS NOT NULL
+       AND merge_declined_ref = delivery_ref"
+
 _TASKS_TFV_SQL="graded_at IS NOT NULL
        AND delivery_ref IS NOT NULL AND TRIM(delivery_ref) <> ''
        AND (maker_agent IS NULL OR graded_by IS NULL OR graded_by <> maker_agent)
@@ -2141,6 +2193,22 @@ _TASKS_TFV_SQL="graded_at IS NOT NULL
        -- every row that existed before DIVE-4654, which is why the migration
        -- needs no backfill and no row changes stage on the way in.
        AND NOT (${_TASKS_MERGE_LANDED_SQL})
+       -- DIVE-4778 - AND A MERGE NOBODY OWES IS NOT A MERGE STILL OWED. The
+       -- conjunct above exits the stage on a LANDING; this one exits it on the
+       -- other true answer, that this pull request is not the one that will
+       -- land. Until it existed the stage had a single exit and a deliberately
+       -- held pull request could not reach it: task merge is grader-only and
+       -- refuses a draft, task merge-landed is refused by its own probe (no
+       -- mergedAt), and task reject at the iteration cap overwrites the delivery
+       -- record and files a gate. So the dispatch fired at a seat with no
+       -- available move, every tick, forever -- measured on DIVE-4773 (five ops
+       -- merge dispatches from 10:00Z, 2026-09-21, five declines, zero moves),
+       -- with DIVE-4370 standing in the same shape.
+       --
+       -- SCOPED TO THE CURRENT BINDING exactly as the landing is, so the exit is
+       -- undone by the one act that makes it wrong: re-pointing the delivery at
+       -- the pull request that WILL land.
+       AND NOT (${_TASKS_MERGE_DECLINED_SQL})
        AND status NOT IN ('done','cancelled')"
 
 # DIVE-4327 — THE MERGE OWNER IS ONE FUNCTION, NOT NINE COPIES.

@@ -186,6 +186,9 @@ _task_usage() {
 
   loops [--stuck] [--escalate-stuck] [--all] [--runs] [--watch[=secs]] [--kill <loopId>]
   merge <id>                                    merge the PR on a row THIS seat graded PASS (DIVE-3474)
+  merge-landed <id>                             record that the bound PR MERGED; exit MERGING (DIVE-4654)
+  merge-declined <id> --reason="<why>"          record that it NEVER WILL (held/superseded/wrong repo);
+                                                exits MERGING, asserts no landing (DIVE-4778)
   merge-audit [--limit=N] [--json]              closed rows whose named PR never merged
   merge-unverified [--limit=N] [--since=Nd]     re-derive closes the merge-gate could NOT check
   merge-gate-selftest [--pr=<url>] [--json]     can THIS seat's merge-gate actually query GitHub?
@@ -407,6 +410,7 @@ cmd_task() {
     deliver)         cmd_task_deliver "$@" ;;
     merge)           cmd_task_merge "$@" ;;         # DIVE-3474 verifier merges what IT graded
     merge-landed)    cmd_task_merge_landed "$@" ;; # DIVE-4654 record a forge merge; exit MERGING
+    merge-declined)  cmd_task_merge_declined "$@" ;; # DIVE-4778 record a merge nobody owes; exit MERGING
     merge-audit)     cmd_task_merge_audit "$@" ;;   # DIVE-1935 retrospective sweep
     grader-replay)   cmd_task_grader_replay "$@" ;;  # DIVE-4164 dry-run capacity replay
     grader-tick)     cmd_task_grader_tick "$@" ;;    # DIVE-4164 pool lane (dark by default)
