@@ -324,6 +324,25 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # Whichever of the two lands second must RE-READ off the merged tree — git will
 # conflict on this line, and the resolution is a read, not 107 + 2.
 #
+# 109 -> 113 (DIVE-4778, 2026-09-21): +merge_declined_at/_by/_ref/_reason, the
+# recorded refusal of a pull request that is NOT the one that will land — what lets
+# a row leave stage MERGING when no merge is owed by anybody, without asserting a
+# landing the forge never reported. READ off a fresh tasks_db_init on THIS tree the
+# way this file instructs (`bad` patched at line 41 to print its detail, one run,
+# `count=113` with rc=0 and got==want, patch reverted); not derived by adding this
+# branch's four-column delta. Control done first, as the DIVE-3483 entry instructs:
+# a same-seat detached worktree at bare origin/main 5c155882 scored 56/0 on this
+# harness while this branch scored 55/1 with got==want, so the count was the ONLY
+# thing failing and the four columns are the whole delta.
+#
+# AND THIS IS THE ENTRY'S OWN LESSON, paid for once more: the literal was missed on
+# the first delivery of this branch and CI caught it (`core-pristine (2)`), because
+# the four columns were added to BOTH the CREATE TABLE and `_TASKS_ADDITIVE_COLUMNS`
+# and the branch's own migration arm graded only the additive half. The two schema
+# lists agreeing is necessary and is not what this arm grades — it grades the COUNT,
+# which every column-adding branch must re-read here. A column-adding diff owes this
+# harness a run even when nothing it touched is named in the harness.
+#
 # 107 -> 109 (DIVE-4634, 2026-09-20, the SECOND of the collision the entry above
 # predicted): `delivery_repo_path` + `delivered_sha` — the checkout and immutable
 # head from which a grader materializes its private detached worktree without
@@ -347,8 +366,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "109" ]] \
-  && ok "fresh schema: all 109 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "113" ]] \
+  && ok "fresh schema: all 113 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

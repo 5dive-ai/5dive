@@ -85,11 +85,19 @@ PR2="https://github.com/5dive-ai/5dive-ui/pull/4"
 # PASS by ME, binding bound, merge_owner naming ME. Built by UPDATE rather than by
 # driving the verbs so the fixture is the STATE under test and not a second
 # integration test of `task verify`.
+#
+# THE ROW SITS ON ME, NOT ON THE MAKER — this is the real shape and the only one in
+# which C6 grades anything. A graded-PASS row awaiting a merge is parked on the seat
+# that graded it (on DIVE-4773 it sat on the verifier with dev as maker), and
+# `_task_merge_declined_handoff` returns early when maker == assignee. Seeded the
+# other way, C6's assertion was already true before the verb ran and a no-op handoff
+# left it GREEN (quinn, 2026-09-21). `task add` refuses assignee == verifier, which
+# is why the seat is set by the UPDATE below and not by the flag above.
 mkrow() {
   local ref="${1:-$PR1}" id
   id=$(addt "merging-stage row" --assignee="$MAKER" --verifier="$ME" --priority=medium)
   [[ "$id" =~ ^[0-9]+$ ]] || { bad_t "FIXTURE could not be created" "addt returned '$id'"; printf '0'; return; }
-  db "UPDATE tasks SET maker_agent='${MAKER}', assignee='${MAKER}', verifier='${ME}',
+  db "UPDATE tasks SET maker_agent='${MAKER}', assignee='${ME}', verifier='${ME}',
         status='in_progress', kind='standard',
         handoff_delivered_at=datetime('now','-40 minutes'),
         graded_at=datetime('now','-10 minutes'),
@@ -108,6 +116,11 @@ R=$(mkrow)
   || bad_t "F1 fixture is in the merging stage" "tfv=$(tfv "$R") — every arm below would be vacuous"
 [[ "$(col merge_owner "$R")" == "$ME" ]] \
   && ok_t "F2 fixture names a merge owner ($ME)" || bad_t "F2 merge_owner set"
+# The premise C6 stands on: if the row already sat on the maker, C6 would assert a
+# state the verb did not produce and a no-op handoff would pass it.
+[[ "$(col assignee "$R")" == "$ME" && "$(col maker_agent "$R")" == "$MAKER" && "$ME" != "$MAKER" ]] \
+  && ok_t "F3 the row starts on the GRADER ($ME), NOT on the maker — C6's move is observable" \
+  || bad_t "F3 fixture starts off the maker" "assignee=$(col assignee "$R") maker=$(col maker_agent "$R") — C6 would be vacuous"
 
 echo "── A: the reason IS the record — no unexplained decline ──"
 rc=$(run "$R"); out=$(cat "$TMP/out")
@@ -152,6 +165,13 @@ rc=$(run "$R" --reason="main ruled the page lands in 5dive-ai/5dive-ui, not core
   || bad_t "C6 handoff target" "assignee=$(col assignee "$R"), expected the maker $MAKER"
 [[ "$(col status "$R")" == "in_progress" ]] \
   && ok_t "C7 the row is NOT closed — a decline is not a cancellation" || bad_t "C7 row stays open"
+# The other half of the handoff: a row ALREADY on its maker is left where it is. The
+# early return is correct, not a missing move, and it must not be a failure.
+H=$(mkrow); db "UPDATE tasks SET assignee='${MAKER}' WHERE id=${H};"
+rc=$(run "$H" --reason="already on the seat that can re-point it")
+[[ "$rc" == "0" && "$(col assignee "$H")" == "$MAKER" ]] \
+  && ok_t "C8 a row already held by its maker is left there, and that is not a failure" \
+  || bad_t "C8 no-op handoff" "rc=$rc assignee=$(col assignee "$H")"
 
 echo "── D: NO LANDING IS ASSERTED (the bar the row set) ──"
 land=$(db "SELECT COALESCE(merge_landed_at,'')||'|'||COALESCE(merge_landed_sha,'')||'|'||COALESCE(merge_landed_by,'')||'|'||COALESCE(merge_landed_ref,'') FROM tasks WHERE id=${R};")
