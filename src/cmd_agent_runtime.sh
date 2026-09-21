@@ -1259,6 +1259,11 @@ _a2a_guard_holds() {
   # the case measured above.
   if [[ "$cond" == "gate_unanswered" ]]; then
     [[ "$ident" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 2
+    # Declared at the point of use. The function-top `local` list already names
+    # `n`, but that name is shared with the graded-handoff clause far below, and
+    # a count that is only ever read two lines later should not depend on a
+    # declaration sixty lines away to stay out of the caller's scope.
+    local n
     n=$(db "SELECT COUNT(*) FROM tasks
             WHERE id IN (${ident})
               AND need_type IS NOT NULL

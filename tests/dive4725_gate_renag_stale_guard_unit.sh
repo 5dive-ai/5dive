@@ -198,5 +198,17 @@ grep -q 'Gate reminder' "$SENT" \
   || bad_t "I: the message is unchanged" "sent=[$(cat "$SENT")]"
 is "I: _A2A_GUARD does not leak past the call" "" "${_A2A_GUARD:-}"
 
+# --- J: the branch's row count stays inside the function --------------------
+# Asked for by the DIVE-4725 grade. `n` is declared BOTH at the function top
+# (pre-existing, shared with the graded-handoff clause) and now at the point of
+# use, so this arm passes at origin/main too: it is a scope REGRESSION guard,
+# not a discriminator for this fix. It reds only if BOTH declarations go. The
+# call and the read must sit in the SAME shell — wrapping either in $( ) makes
+# the arm vacuous, because a leaked global cannot cross a subshell back.
+db() { echo 2; }
+n_before="${n-unset}"
+_a2a_guard_holds "task:4906,4910:ops:gate_unanswered" >/dev/null 2>&1 || true
+is "J: the gate_unanswered count does not leak into the caller" "$n_before" "${n-unset}"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
