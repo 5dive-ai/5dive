@@ -5655,6 +5655,168 @@ _hb_gate_shipped_sweep() {
   return 0
 }
 
+# ── DIVE-4701 — POLL THE BOUND PULL REQUEST OF A GRADED ROW ───────────────────
+#
+# AXIS: the autonomy number. A row whose pull request the MAINTAINER merged on
+# the forge waits today for a seat to be woken and to run a verb. On a box with
+# no machine credential — every outside-contributor box; teal-fox is one — that
+# wait is a HUMAN noticing, which is the loop this sweep removes. luca's ask 3
+# (2026-09-18, `2026-09-18-task-flow-simplification.md`): *"A merged PR closes
+# its row. Poll the PR on rows with delivery_ref; when it is merged, stamp the
+# merge sha and close — a read needs no bot token."*
+#
+# IT DOES NOT CLOSE, AND THE NARROWING IS THE POINT. *"A merged pull request is
+# not automatically a finished row"* — DIVE-4520 measured two of seven rows one
+# morning carrying an owed clause inside their own PASS verdict, which survives
+# the merge. So this sweep RECORDS the landing the forge already reports (the
+# DIVE-4654 columns), retires the hold, takes the row out of the MERGING stage
+# and hands it to the seat whose close is ungated. The close stays a judgement a
+# seat makes. What changes is that the row now SAYS it is owed a close, to the
+# seat that can give it one, without anybody having had to look.
+#
+# WHY THE HEARTBEAT AND NOT THE VERB. `task merge-landed` (DIVE-4654) already
+# does all of the above, correctly, and is reachable by the three seats the row
+# names. Every one of them has to be DISPATCHED first, and the dispatch is the
+# expensive part — `cmd_heartbeat.sh:4085` wakes the merge owner to read a pull
+# request by hand, and DIVE-4632 measured four such dispatches of which the last
+# three were no-ops costing a session each. The observation needs no session.
+#
+# SCOPED TO `graded->merge`, deliberately, and not to every row with a binding.
+# That is the one stage whose EXIT is the landing; a `delivered` or `reviewing`
+# row whose pull request merged early is a different question (the grade has not
+# happened) and recording a landing on it would retire a hold nobody placed. If
+# this arm proves quiet, widening is a second row, not a wider predicate here.
+#
+# COST: one read per merging row per tick, and the row leaves the population the
+# moment it is recorded — `_TASKS_MERGE_LANDED_SQL` is subtracted below, so a
+# landing is read ONCE and never again. An OPEN pull request is re-read each
+# tick, which is the whole job. A rail that cannot answer changes NOTHING and is
+# reported once on `doctor`, never per tick (the DIVE-4619 shape: the sweep
+# records what it measured, the health check reads the recording).
+#
+# OFF SWITCH: FIVEDIVE_FORGE_MERGE_POLL=off. Default on.
+_HB_FORGE_MERGE_POLL="${FIVEDIVE_FORGE_MERGE_POLL:-on}"
+
+# _hb_forge_merge_reading_path — where the sweep leaves what it measured, for
+# `doctor` to read. A FILE and not a task_prefs row on purpose: `doctor` runs
+# health checks that must not open or migrate the task store to answer.
+_hb_forge_merge_reading_path() {
+  printf '%s/forge-merge-poll.reading' "${STATE_DIR:-/var/lib/5dive}"
+}
+
+# _hb_forge_merge_record_reading <class> <rows> <landed> <unreadable> <reason>
+# Best-effort: a reading that cannot be written costs a doctor line, never a tick.
+_hb_forge_merge_record_reading() {
+  local f; f="$(_hb_forge_merge_reading_path)"
+  local d; d="$(dirname "$f")"
+  [[ -d "$d" ]] || return 0
+  printf 'class=%s\nasof=%s\nasof_epoch=%s\nrows=%s\nlanded=%s\nunreadable=%s\nreason=%s\n' \
+    "$1" "$(date -u +%FT%TZ 2>/dev/null || printf 'unknown')" \
+    "$(date +%s 2>/dev/null || printf '0')" "$2" "$3" "$4" "$5" \
+    >"$f" 2>/dev/null || return 0
+  return 0
+}
+
+_hb_forge_merge_sweep() {
+  [[ "$_HB_FORGE_MERGE_POLL" == "on" || "$_HB_FORGE_MERGE_POLL" == "1" ]] || return 0
+  # The probe and the recorder live in src/task/delivery.sh, later in the bundle.
+  # ~10 harnesses drive this tick with only cmd_heartbeat.sh sourced, and a box
+  # mid-self-update can hold a partial tree. Degrade to a no-op — but SAY SO:
+  # a silent skip here is indistinguishable from "nothing had merged", which is
+  # the exact failure class DIVE-2003 measured one sweep over.
+  if ! declare -F _merge_landed_probe      >/dev/null 2>&1 \
+     || ! declare -F _task_merge_landed_record >/dev/null 2>&1 \
+     || ! declare -F _gate_slug_from_url   >/dev/null 2>&1; then
+    _hb_log "[forge-merge] the merge-landing helpers are not loaded in this context; sweep did NOT run — no row was read and nothing was written (this is not 'nothing had merged')"
+    return 0
+  fi
+  local row id ident dref asgn vfier owner probe verdict rest sha at moved
+  local n_rows=0 n_landed=0 n_open=0 n_unread=0 n_wfail=0
+  local first_reason=""
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\x1f' read -r id ident dref asgn vfier owner <<<"$row"
+    # A row with no binding is NEVER read. The predicate below already excludes
+    # it (`_TASKS_TFV_SQL` requires a non-blank delivery_ref); this is the second
+    # half of that assertion, here because a read is the only thing in this sweep
+    # that leaves the box.
+    [[ -n "$id" && -n "$dref" ]] || continue
+    n_rows=$((n_rows+1))
+    probe=$(_merge_landed_probe "$dref" "$(_gate_slug_from_url "$dref" 2>/dev/null || printf '')" 2>/dev/null) || probe="UNKNOWN"
+    verdict="${probe%%$'\x1f'*}"
+    rest="${probe#*$'\x1f'}"
+    case "$verdict" in
+      OPEN)
+        # THE NEGATIVE CONTROL, and it is the common case: the forge answered and
+        # it has not landed. Nothing is written, nothing is stamped, no throttle
+        # is consumed — the next tick asks again, which is the entire job.
+        n_open=$((n_open+1))
+        continue ;;
+      MERGED) : ;;
+      *)
+        # A non-verdict is not a negative (DIVE-2318/DIVE-2414). Nothing is
+        # written and no stamp is taken, so a later tick retries. Counted, and
+        # said once through the reading `doctor` reads — never per tick.
+        n_unread=$((n_unread+1))
+        [[ -n "$first_reason" ]] || first_reason="${dref}"
+        continue ;;
+    esac
+    sha="${rest%%$'\x1f'*}"
+    at="${rest#*$'\x1f'}"
+    # `forge-poll` and not this box's seat name: the ACTOR on this record is the
+    # poller, and a record that named a seat would credit a landing to somebody
+    # who was not there — the same false-credit class `_merge_disp_read` refuses
+    # one outcome further out.
+    if ! _task_merge_landed_record "$id" "$sha" "$at" "forge-poll" "$dref"; then
+      n_wfail=$((n_wfail+1))
+      _hb_log "[forge-merge] ${ident} — ${dref} is MERGED (${sha:0:12} at ${at}) but the task store REFUSED the record; the row is unchanged and still holds at MERGING"
+      continue
+    fi
+    n_landed=$((n_landed+1))
+    moved=""
+    declare -F _task_merge_landed_handoff >/dev/null 2>&1 \
+      && moved=$(_task_merge_landed_handoff "$id" "$ident" "$asgn" "$vfier" 2>/dev/null || printf '')
+    _task_store_audit_log "task.merge-landed" ok 0 -- \
+      "id=${id}" "task=${ident}" "ref=${dref}" "sha=${sha}" "merged_at=${at}" \
+      "actor=forge-poll" "owed=${owner}" 2>/dev/null || true
+    _hb_log "[forge-merge] ${ident} — ${dref} is ON THE TARGET BRANCH (merged ${at} as ${sha:0:12}); landing RECORDED, merge hold on '${owner:-nobody}' retired, row has LEFT the merging stage. NOT closed — a merged pull request is not automatically a finished row (DIVE-4520).${moved}"
+    # WAKE THE SEAT THAT OWES THE CLOSE, which after the handoff is the row's
+    # assignee. The dispatcher will reach it on its own next tick now that the
+    # row has left the stage that was excluding it; this is the same one-shot
+    # courtesy ping `_hb_gate_shipped_sweep` sends, and it is one-shot for the
+    # same reason — the landing is recorded, so this row is never seen again.
+    local closer; closer=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    if [[ -n "$closer" ]] && _task_agent_channel "$closer"; then
+      ( cmd_send "$closer" --message="🚢 ${ident} — the pull request bound to this row (${dref}) is MERGED ON THE FORGE (${sha:0:12}, ${at}). The heartbeat recorded the landing, retired the merge hold and took the row out of the merging stage, so what it is owed now is a CLOSE and nobody owes it a merge. Read the PASS verdict FIRST: a merged pull request is not automatically a finished row (DIVE-4520), so if the verdict left something owed, discharge that before you close. \`5dive task show ${ident}\`" ) >/dev/null 2>&1 || true
+    fi
+  # THE POPULATION IS THE STAGE PREDICATE AND NOTHING ELSE, and that is where the
+  # cost bound comes from rather than from a throttle written here.
+  # `_TASKS_TFV_SQL` already subtracts a recorded landing (`_TASKS_MERGE_LANDED_SQL`)
+  # and every terminal row, so a row is polled exactly while it is IN the merging
+  # stage: once this sweep records the landing, the row leaves the stage and is
+  # never read again. Re-stating either clause here would be a second copy of a
+  # constant this repo deliberately has one of (DIVE-4327), and a second copy is
+  # how the poller and the board come to disagree about which rows are merging.
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||COALESCE(delivery_ref,'')||x'1f'||
+                      COALESCE(assignee,'')||x'1f'||COALESCE(verifier,'')||x'1f'||$(_tasks_merge_owner_sql)
+                 FROM tasks
+                WHERE (${_TASKS_TFV_SQL});" 2>/dev/null)
+  # THE READING, not a log line. Written on every pass including a clean one: an
+  # absent measurement and a measured pass must not read the same (DIVE-4619).
+  if (( n_unread > 0 )); then
+    _hb_forge_merge_record_reading "unreadable" "$n_rows" "$n_landed" "$n_unread" \
+      "the credential-free rail could not be asked about ${n_unread} of ${n_rows} merging row(s); first was ${first_reason}"
+  else
+    _hb_forge_merge_record_reading "ok" "$n_rows" "$n_landed" "0" ""
+  fi
+  # Log only when something HAPPENED. A tick that read three open pull requests
+  # and wrote nothing is the steady state, and a line per tick for it is how the
+  # tick log stops being read at all.
+  (( n_landed > 0 || n_wfail > 0 )) \
+    && _hb_log "[forge-merge] pass done — ${n_rows} merging row(s) polled, ${n_landed} landing(s) recorded, ${n_open} still open, ${n_unread} unreadable, ${n_wfail} write-refused"
+  return 0
+}
+
 # CNCL-12: the recurring rot-triage scan. A tier-2 gate left unanswered 48h+ gets a council
 # convene that ONLY re-briefs it sharper for the human — it NEVER clears a tier-2 gate (the
 # fail-closed rule lives in the pure mapper + a belt-and-suspenders check in `council rot-triage`).
@@ -7727,6 +7889,15 @@ cmd_heartbeat_tick() {
   # DIVE-1140: flag open gates whose fix already merged so the overnight recap
   # stops surfacing ghost gates. Flag-only, never auto-closes. Same isolation.
   _hb_gate_shipped_sweep || _hb_log "[gate-shipped] pass errored (non-fatal)"
+  # DIVE-4701: poll the bound pull request of every row in graded->merge and
+  # RECORD a landing the maintainer already made on the forge — retiring the
+  # hold, exiting the merging stage and handing the row to the seat whose close
+  # is ungated. Records only; it never closes a row (DIVE-4520). Runs next to
+  # gate-shipped because it is the same shape one stage over: an outside event
+  # the board cannot see until somebody looks. Same isolation contract as every
+  # other sweep — a failure here must never abort the wake loop, and its failure
+  # direction is already the safe one: it can miss a landing, never invent one.
+  _hb_forge_merge_sweep || _hb_log "[forge-merge] pass errored (non-fatal)"
   # CNCL-12: rot-triage stale tier-2 gates via a council convene (re-brief only,
   # NEVER clears). Default OFF (COUNCIL_ROT_TRIAGE=on) — a live convene injects into
   # seat sessions, so it stays gated on an explicit opt-in until main's CNCL-7 window.

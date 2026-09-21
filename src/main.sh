@@ -312,6 +312,7 @@ Triggers (signed external event -> ordinary task):
 Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
   5dive project add <key> --prefix=FROG [--name=] [--goal=] [--folder=] [--lead-agent=<agent>]
   5dive project ls | show <key>
+  5dive project set-status <key> active|complete|archived|binned|backlogged
   # tasks then number per project: FROG-1, FROG-2 …
 
   5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # orchestration (JSON in/out)
@@ -613,6 +614,11 @@ _agent_verb_dispatch() {
         _default_skills) cmd_agent_default_skills "$@" ;;
         # DIVE-3966: hidden installer migration for existing Codex seats.
         _sync_codex_baseline) cmd_agent_sync_codex_baseline "$@" ;;
+        # DIVE-4667: hidden installer migration for stable OpenAgent ids and
+        # the per-seat global prepare-commit-msg hook.
+        _reconcile_coauthors)
+          AUDIT_CMD="agent _reconcile_coauthors"; AUDIT_ARGS=()
+          with_registry_lock cmd_agent_reconcile_coauthors "$@" ;;
         # DIVE-4081: hidden installer migration. Refresh managed standard-seat
         # sudoers after a bundle upgrade so existing routed reviewers gain the
         # narrow _task_answer path already rendered for newly-created seats.

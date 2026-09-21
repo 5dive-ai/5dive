@@ -130,6 +130,7 @@ mkdir -p "$PROV/scripts" "$PROV/.github"
 cp -f "$ROOT/scripts/install-pii-push-guard.sh" "$ROOT/scripts/pii-scan.sh" "$PROV/scripts/"
 mkdir -p "$PROV/scripts/git-hooks-portable"
 cp -f "$ROOT/scripts/git-hooks-portable/pre-push" "$PROV/scripts/git-hooks-portable/"
+cp -f "$ROOT/scripts/git-hooks-portable/prepare-commit-msg" "$PROV/scripts/git-hooks-portable/"
 cp -f "$ROOT/.github/pii-denylist.txt" "$PROV/.github/"
 git init -q "$PROV" && git -C "$PROV" add -A && git -C "$PROV" commit -qm "fixture"
 if [[ -d "$PROV/scripts" ]]; then
@@ -301,6 +302,7 @@ else
   mkdir -p "$PGREPO/scripts/git-hooks-portable" "$PGREPO/.github"
   cp "$INSTALLER" "$PGREPO/scripts/install-pii-push-guard.sh"
   cp "$ROOT/scripts/git-hooks-portable/pre-push" "$PGREPO/scripts/git-hooks-portable/pre-push"
+  cp "$ROOT/scripts/git-hooks-portable/prepare-commit-msg" "$PGREPO/scripts/git-hooks-portable/prepare-commit-msg"
   cp "$SCANNER" "$PGREPO/scripts/pii-scan.sh"
   printf '%s\n' "$(printf '1234567890' | sha256sum | awk '{print $1}')" > "$PGREPO/.github/pii-denylist.txt"
 
@@ -323,7 +325,7 @@ mkdir -p "$LIB_DIR"
   # All four files, because a hook whose payload never arrived reads exactly
   # like an installed one (the same reason arm 2 exists).
   miss=""
-  for f in pre-push pii-scan.sh pii-denylist.txt INSTALLED; do
+  for f in pre-push prepare-commit-msg pii-scan.sh pii-denylist.txt INSTALLED; do
     [[ -s "$PGHOME/$f" ]] || miss="$miss $f"
   done
   if [[ -z "$miss" ]]; then
@@ -334,6 +336,9 @@ mkdir -p "$LIB_DIR"
   [[ -x "$PGHOME/pre-push" ]] \
     && ok_t "arm9 the staged hook is executable (a non-exec hook is silently skipped by git)" \
     || fail_t "arm9 staged pre-push is not executable"
+  [[ -x "$PGHOME/prepare-commit-msg" ]] \
+    && ok_t "arm9 the staged co-author hook is executable" \
+    || fail_t "arm9 staged prepare-commit-msg is not executable"
 
   # arm 10: the stamp NAMES THE COMMIT. The row's ACCEPTANCE says the INSTALLED
   # stamp on a provisioned box names a real commit; a staged tree has no .git,

@@ -2678,19 +2678,61 @@ cmd_task_merge_landed() {
 # or DIVE-2770's anonymous rail for a public repo. Asking what a pull request IS
 # has never needed a machine account; only merging one does.
 _merge_landed_read() {
-  local ref="$1" slug="${2:-}" out=""
+  local _p _rest
+  _p=$(_merge_landed_probe "$1" "${2:-}")
+  [[ "${_p%%$'\x1f'*}" == "MERGED" ]] || return 0
+  _rest="${_p#*$'\x1f'}"
+  printf '%s|%s\n' "${_rest%%$'\x1f'*}" "${_rest#*$'\x1f'}"
+}
+
+# _merge_landed_probe <pr-ref> <repo-slug> — ONE READ, THREE ANSWERS.
+#
+# DIVE-4701. `_merge_landed_read` above collapses "the forge says it has not
+# landed" and "the forge could not be asked" into the same empty string, and that
+# is exactly right for the decision IT feeds: is there still a merge to perform?
+# Both answers mean yes. It is exactly wrong for a POLLER, which must report an
+# unreachable rail as a standing condition and must never report an open pull
+# request as one. So the read lives here and the three answers are named, and the
+# verb above is re-expressed on top of it rather than reading GitHub a second
+# time — the same "there is exactly one reader" argument `_merge_disp_read`
+# makes twenty lines up, for the same reason: a second grep is how two answers
+# drift apart.
+#
+# Prints exactly one x1f-separated record:
+#   MERGED<US><merge-commit-sha><US><mergedAt>   the forge reports a landing
+#   OPEN<US><state>                              the forge answered; no landing
+#   UNKNOWN<US>                                  the forge could not be asked
+#
+# `mergedAt` is the operand for MERGED, not `state`: it is the field that only a
+# LANDING sets. A queue-evicted pull request reads state=OPEN and a closed-
+# unmerged one reads state=CLOSED, and neither carries a mergedAt (DIVE-4337) —
+# both are OPEN to this function, which is a statement about the LANDING and not
+# about whether the pull request is open for business.
+#
+# THE READ IS CREDENTIAL-FREE BY CONSTRUCTION, unchanged: `_gate_gh` is handed an
+# EMPTY token. Never fails the caller — an unanswerable read is UNKNOWN, which is
+# a verdict, not an error.
+_merge_landed_probe() {
+  local ref="$1" slug="${2:-}" out="" st sha at rest
   local -a repo_arg=()
   [[ "$ref" =~ ^[0-9]+$ ]] && repo_arg=(--repo "$slug")
   out=$(_gate_gh "" 10 pr view "$ref" "${repo_arg[@]}" \
           --json state,mergedAt,mergeCommit \
-          -q '[ (.mergeCommit.oid // "null"), (.mergedAt // "null") ] | join("|")' \
+          -q '[ (.state // "null"), (.mergeCommit.oid // "null"), (.mergedAt // "null") ] | join("|")' \
           2>/dev/null) || out=""
-  # `mergedAt` is the operand, not `state`: it is the field that only a LANDING
-  # sets. A queue-evicted pull request reads state=OPEN and a closed-unmerged one
-  # reads state=CLOSED, and neither of them carries a mergedAt (DIVE-4337).
-  local _at="${out#*|}"
-  [[ -n "$out" && "$out" == *"|"* && -n "$_at" && "$_at" != "null" ]] || return 0
-  printf '%s\n' "$out"
+  # THREE fields or it is not an answer. A short record is a rail that returned
+  # something other than what was asked for, and reading field 1 out of it as a
+  # state would invent a verdict — the failure direction that matters here, since
+  # UNKNOWN changes nothing and OPEN also changes nothing, but MERGED WRITES.
+  st="${out%%|*}"; rest="${out#*|}"
+  sha="${rest%%|*}"; at="${rest#*|}"
+  [[ -n "$out" && "$rest" != "$out" && "$at" != "$rest" ]] \
+    || { printf 'UNKNOWN\x1f\n'; return 0; }
+  if [[ -n "$at" && "$at" != "null" ]]; then
+    printf 'MERGED\x1f%s\x1f%s\n' "$sha" "$at"
+    return 0
+  fi
+  printf 'OPEN\x1f%s\n' "${st:-unknown}"
 }
 
 # _merge_do_already_landed <pr-ref> — 0 when the pull request has ALREADY merged

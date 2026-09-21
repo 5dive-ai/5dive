@@ -129,6 +129,55 @@ doctor_check_audit_drop_dir() {
 #
 # A box with NO reading is reported `ok` with "not measured" — never a clean
 # bill. An absent measurement and a measured pass must not read the same.
+# doctor_check_forge_merge_poll
+#
+# DIVE-4701 — THE POLLER'S STANDING CONDITION, SAID ONCE.
+#
+# `_hb_forge_merge_sweep` reads the bound pull request of every row in
+# graded->merge on every tick. When the credential-free rail cannot be asked, the
+# correct behaviour at the tick is to change NOTHING and retry — so the tick has
+# nothing to say, every minute, forever. That is the DIVE-4619 shape exactly: a
+# standing property of the box's credentials does not belong on the surface that
+# repeats, it belongs on the one a person reads. The sweep records what it
+# measured; this reads the recording and never probes (a live probe here is one
+# network call per dashboard poll).
+#
+# A box with NO reading is `ok` with "not measured" — never a clean bill. An
+# absent measurement and a measured pass must not read the same.
+doctor_check_forge_merge_poll() {
+  local f reading class rows landed unreadable reason asof asof_epoch age now
+  f="${STATE_DIR:-/var/lib/5dive}/forge-merge-poll.reading"
+  if [[ ! -r "$f" ]]; then
+    doctor_add creds forge-merge-poll ok \
+      "the forge merge poll has taken no reading on this box yet — it records one on each heartbeat tick that has at least one row waiting on a merge, so an idle board reads this way too"
+    return 0
+  fi
+  reading="$(cat "$f" 2>/dev/null || printf '')"
+  _dfmp() { sed -n "s/^$1=//p" <<<"$reading" | head -1; }
+  class="$(_dfmp class)"; rows="$(_dfmp rows)"; landed="$(_dfmp landed)"
+  unreadable="$(_dfmp unreadable)"; reason="$(_dfmp reason)"
+  asof="$(_dfmp asof)"; asof_epoch="$(_dfmp asof_epoch)"
+  age="as of ${asof:-unknown}"
+  now=$(date +%s 2>/dev/null || printf '')
+  if [[ "$now" =~ ^[0-9]+$ && "$asof_epoch" =~ ^[0-9]+$ && $asof_epoch -gt 0 ]]; then
+    age="$age ($(( (now - asof_epoch) / 60 ))m ago)"
+  fi
+  case "$class" in
+    unreadable)
+      doctor_add creds forge-merge-poll warn \
+        "the forge merge poll could NOT ask GitHub about ${unreadable:-?} of the ${rows:-?} row(s) waiting on a merge, so a pull request the maintainer has already merged will keep reading as un-landed and its row will keep waiting for a seat to look. ${reason:-} Nothing was written — an unreadable rail changes no row. $age" \
+        true false ;;
+    ok)
+      doctor_add creds forge-merge-poll ok \
+        "the forge merge poll read all ${rows:-0} row(s) waiting on a merge over the credential-free rail; ${landed:-0} landing(s) recorded on that pass — $age" ;;
+    *)
+      doctor_add creds forge-merge-poll ok \
+        "the forge merge poll left a reading this check does not recognise (class='${class:-empty}') — treating it as not measured rather than as a pass. $age" ;;
+  esac
+  unset -f _dfmp 2>/dev/null || true
+  return 0
+}
+
 doctor_check_gate_repo_visibility() {
   local dir f n=0
   # The gate helpers live in src/task/gate_evidence.sh, later in the bundle. A
@@ -1495,6 +1544,11 @@ cmd_doctor() {
     # DIVE-4619: the merge-gate's repo visibility is a credential fact about this
     # box, so it is reported here once rather than on every close.
     doctor_check_gate_repo_visibility
+    # DIVE-4701: whether the credential-free rail could be asked about the bound
+    # pull requests of the rows waiting on a merge is the same class of fact —
+    # a standing property of this box's credentials — so it is reported here
+    # once rather than by the poller on every tick.
+    doctor_check_forge_merge_poll
   fi
 
   # --- registry + per-agent state ---

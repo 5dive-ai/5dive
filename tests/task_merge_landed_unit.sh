@@ -79,7 +79,7 @@ picks() { _hb_pick_tasks "$1" 20 | grep -cx "$2"; }
 # The token is recorded in a FILE: every call below is inside a command
 # substitution (a subshell), and a variable set there does not reach this scope.
 TOKF="$TMP/tok"
-_gate_gh_payload="$SHA|$AT"; _gate_gh_rc=0
+_gate_gh_payload="MERGED|$SHA|$AT"; _gate_gh_rc=0
 _gate_gh() { printf '[%s]' "$1" >"$TOKF"; shift 2
              [[ -n "$_gate_gh_payload" ]] && printf '%s\n' "$_gate_gh_payload"
              return "$_gate_gh_rc"; }
@@ -154,7 +154,7 @@ db "UPDATE tasks SET delivery_ref='https://github.com/5dive-ai/ops/pull/21' WHER
 # The handoff: on a row assigned to its MAKER, the exit must land the row on the
 # seat whose close is ungated, or the deadlock has only moved one seat over.
 id2=$(seed DIVE-4633 todo "$MAKER" "$GRADER")
-_gate_gh_payload="$SHA|$AT"; _gate_gh_rc=0; ACT="$OWNER"
+_gate_gh_payload="MERGED|$SHA|$AT"; _gate_gh_rc=0; ACT="$OWNER"
 out=$(cmd_task_merge_landed DIVE-4633 2>&1); rc=$?
 { (( rc == 0 )) && [[ "$(col DIVE-4633 assignee)" == "$GRADER" ]]; } \
   && ok_t "D3 on a row assigned to its MAKER the exit hands it to the VERIFIER, whose close is ungated (DIVE-4520)" \
@@ -165,7 +165,7 @@ out=$(cmd_task_merge_landed DIVE-4633 2>&1); rc=$?
 
 # ACCEPTANCE 3 — THE NEGATIVE CONTROL. An unmerged pull request changes nothing.
 id3=$(seed DIVE-4634)
-_gate_gh_payload="null|null"; _gate_gh_rc=0; ACT="$OWNER"
+_gate_gh_payload="OPEN|null|null"; _gate_gh_rc=0; ACT="$OWNER"
 out=$(cmd_task_merge_landed DIVE-4634 2>&1); rc=$?
 (( rc != 0 )) && ok_t "B1 ACCEPTANCE 3: an UNMERGED pull request is REFUSED — this verb records only a landing the forge itself reports" \
   || bad_t "B1 unmerged refused" "rc=$rc out=$out"
@@ -181,7 +181,7 @@ out=$(cmd_task_merge_landed DIVE-4634 2>&1); rc=$?
 
 # STANDING. The row names three seats; nobody else moves it.
 id4=$(seed DIVE-4635)
-_gate_gh_payload="$SHA|$AT"; _gate_gh_rc=0
+_gate_gh_payload="MERGED|$SHA|$AT"; _gate_gh_rc=0
 ACT=marketing
 out=$(cmd_task_merge_landed DIVE-4635 2>&1); rc=$?
 { (( rc != 0 )) && [[ "$out" == *"none of them"* && "$(col DIVE-4635 merge_landed_at)" == "-" ]]; } \
@@ -216,7 +216,7 @@ out=$(cmd_task_merge_landed --help 2>&1); rc=$?
 # close from work nobody has started.
 # ===========================================================================
 id5=$(seed DIVE-4637 todo "$GRADER" "$GRADER")
-_gate_gh_payload="$SHA|$AT"; _gate_gh_rc=0; ACT="$OWNER"
+_gate_gh_payload="MERGED|$SHA|$AT"; _gate_gh_rc=0; ACT="$OWNER"
 board_before=$(cmd_task_ls 2>&1)
 out=$(cmd_task_merge_landed DIVE-4637 2>&1)
 board_after=$(cmd_task_ls 2>&1)

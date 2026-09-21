@@ -915,6 +915,11 @@ refresh_managed_files() {
   if ! "$BIN_DIR/5dive" agent _sync_codex_baseline; then
     echo "warn: existing Codex AGENTS.md baselines were not fully reconciled; user-authored text was left untouched" >&2
   fi
+  # DIVE-4667: mint stable ids for old seats and install the hook immediately;
+  # no agent restart is needed because git reads hooksPath on every commit.
+  if ! "$BIN_DIR/5dive" agent _reconcile_coauthors; then
+    echo "warn: existing agent co-author hooks were not fully reconciled" >&2
+  fi
 
   # DIVE-3554: the relay binaries the shipped Connect Buzz panel shells out to.
   # Fail-soft on purpose (see stage_buzz_binaries) — a buzz release outage must
@@ -1568,12 +1573,13 @@ sync_managed_block() {
   if install -d -m 755 "$_pg_tmp/scripts/git-hooks-portable" "$_pg_tmp/.github" \
      && curl -fsSL "$REPO/scripts/install-pii-push-guard.sh"   -o "$_pg_tmp/scripts/install-pii-push-guard.sh" \
      && curl -fsSL "$REPO/scripts/git-hooks-portable/pre-push" -o "$_pg_tmp/scripts/git-hooks-portable/pre-push" \
+     && curl -fsSL "$REPO/scripts/git-hooks-portable/prepare-commit-msg" -o "$_pg_tmp/scripts/git-hooks-portable/prepare-commit-msg" \
      && curl -fsSL "$REPO/scripts/pii-scan.sh"                 -o "$_pg_tmp/scripts/pii-scan.sh" \
      && curl -fsSL "$REPO/.github/pii-denylist.txt"            -o "$_pg_tmp/.github/pii-denylist.txt"; then
     rm -rf "$_pg_src"
     install -d -m 755 "$_pg_src"
     cp -a "$_pg_tmp/." "$_pg_src/"
-    chmod 755 "$_pg_src/scripts/install-pii-push-guard.sh" "$_pg_src/scripts/git-hooks-portable/pre-push"
+    chmod 755 "$_pg_src/scripts/install-pii-push-guard.sh" "$_pg_src/scripts/git-hooks-portable/pre-push" "$_pg_src/scripts/git-hooks-portable/prepare-commit-msg"
     chmod 644 "$_pg_src/scripts/pii-scan.sh" "$_pg_src/.github/pii-denylist.txt"
     if _pg_out="$(PII_GUARD_SRC_SHA="${GH_PINNED_SHA:-}" "$_pg_src/scripts/install-pii-push-guard.sh" --sync 2>&1)"; then
       ok "pii-guard home — ${_pg_out#pii-push-guard: }"

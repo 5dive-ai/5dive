@@ -42,7 +42,7 @@ export STATE_DIR="$TMP/state"; mkdir -p "$STATE_DIR"
 export BOX_CONFIG="$STATE_DIR/box.json"
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/state.sh lib/audit.sh lib/registry.sh; do
+         lib/state.sh lib/audit.sh lib/registry.sh lib/actor.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -55,6 +55,46 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     want: %s\n     got:  %s\n' "$1" "$2" "$3"; }
 is()  { [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "$3" "$2"; }
+
+# ---------------------------------------------------------------------------
+# CALLER-IDENTITY PIN (DIVE-2601's identity-stub guard; the in-tree pattern is
+# tests/gate_enforce_env_bypass_unit.sh:127-154).
+#
+# `cmd_wall` genuinely asks who is calling through `id -u` / `id -un`, and the
+# sections below stub those. THAT STUB ALONE IS THE INERT SHAPE THE GUARD EXISTS
+# TO CATCH. The sealed derivation in lib/actor.sh has not read `id` since
+# DIVE-2330 — `_gate_caller_uid` reports $EUID and `_gate_passwd_stream` walks
+# /etc/passwd in pure bash — so every OTHER identity question in the bundle this
+# harness sources (lib/audit.sh's `_actor_identity_derived`, and anything reading
+# it) still answers from the HOST, no matter what `id` says.
+#
+# Measured, not argued: unpinned, `_gate_authenticated_actor` returns `dev` on
+# this box because uid 1007 is `agent-dev` here; the same uid on the CI runner is
+# `runner` and it returns ''. One harness, two different callers, decided by
+# whoever ran the suite — the precondition-supplied-by-the-host defect DIVE-2365
+# named.
+#
+# So the persona is ONE thing: `wall_as <unix-name> <uid>` moves the `id` stub and
+# both seams together, and section 0 asserts the pin through the REAL resolver
+# before any arm leans on it. A pin that silently yielded '' would make the
+# non-agent arms below look correct for the wrong reason.
+# ---------------------------------------------------------------------------
+WALL_NAME=operator; WALL_UID=1000
+_gate_caller_uid()    { printf '%s' "$WALL_UID"; }
+_gate_passwd_stream() { printf '%s:x:%s:%s::/nonexistent:/bin/false\n' "$WALL_NAME" "$WALL_UID" "$WALL_UID"; }
+wall_as() { WALL_NAME="$1"; WALL_UID="$2"
+  id() { case "${1:-}" in -u) printf '%s' "$WALL_UID" ;; -un) printf '%s' "$WALL_NAME" ;; esac; }
+}
+
+# ---------------------------------------------------------------------------
+echo "0. the caller-identity pin resolves from the fixture, not from the host"
+# ---------------------------------------------------------------------------
+wall_as agent-fixture 987654
+is "the pin reaches the sealed resolver"   "$(_gate_authenticated_actor)" "fixture"
+is "and the id stub agrees with the same pin" "$(id -un)"                    "agent-fixture"
+wall_as operator 1000
+is "a non-agent caller resolves to no agent" "$(_gate_authenticated_actor)" ""
+is "the operator persona is the pinned uid"  "$(id -u)"                     "1000"
 
 # ---------------------------------------------------------------------------
 echo "1. the grid: parse, default, and the refusal"
@@ -143,7 +183,7 @@ echo "4. privilege: DENIED and NO-SESSION are different answers"
 # which is the trap. An implementation that only asked about the session reads
 # non-zero and says "no session", i.e. paints a permissions problem as a dead
 # fleet.
-id() { case "${1:-}" in -u) printf '1000' ;; -un) printf 'operator' ;; esac; }
+wall_as operator 1000
 sudo() {  # -n -u <user> <cmd...>
   local u=""; while (( $# )); do case "$1" in -n) shift ;; -u) u="$2"; shift 2 ;; *) break ;; esac; done
   case "$u" in
@@ -166,7 +206,7 @@ case "$(_wall_denied_help nogrant)" in
   *) ok "the denied pane never claims 'no tmux session'" ;;
 esac
 # Root needs no grant, and must not be told it lacks one.
-id() { case "${1:-}" in -u) printf '0' ;; -un) printf 'root' ;; esac; }
+wall_as root 0
 sudo() { local u=""; while (( $# )); do case "$1" in -n) shift ;; -u) u="$2"; shift 2 ;; *) break ;; esac; done
          [[ "${1:-}" == "tmux" ]] && return 0; return 0; }
 is "as root the probe never reports denied" "$(wall_probe_seat anyseat)" "ok"
@@ -184,7 +224,7 @@ TMUXLOG="$TMP/tmux.log"
 tmux() { printf '%s\n' "$*" >>"$TMUXLOG"; case "$1" in has-session) return 0 ;; esac; return 0; }
 sudo() { local u=""; while (( $# )); do case "$1" in -n) shift ;; -u) u="$2"; shift 2 ;; *) break ;; esac; done
          printf 'AS:%s %s\n' "$u" "$*" >>"$TMUXLOG"; [[ "${1:-}" == "tmux" && "${2:-}" == "has-session" ]] && return 0; return 0; }
-id() { case "${1:-}" in -u) printf '0' ;; -un) printf 'root' ;; esac; }
+wall_as root 0
 # One pass of the follow loop, then out.
 sleep() { printf 'SLEEP %s\n' "$*" >>"$TMUXLOG"; exit 0; }
 ( cmd_wall --follow charlie ) >/dev/null 2>&1

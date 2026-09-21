@@ -144,6 +144,14 @@ sudo 5dive agent set-account cheap-coder kimi        # rebinds + restarts the ag
 sudo 5dive agent create glm-coder --type=claude --provider=openrouter --api-key=<key> --auth-profile=openrouter --model=z-ai/glm-5.2
 ```
 
+Prefer to save the key once and hand it to agents by name? `account set` configures the account with no agent involved; every later `agent create --auth-profile=<name>` or `agent set-account` reuses it (more under [Accounts](#accounts-shared-auth-profiles)):
+
+```sh
+sudo 5dive account add or-alpha
+printf '%s' "$OPENROUTER_API_KEY" | sudo 5dive account set or-alpha --type=claude --provider=openrouter --api-key=-
+sudo 5dive agent create scout --type=claude --auth-profile=or-alpha
+```
+
 Not on that list? `--base-url` points the harness at **any** Anthropic-compatible
 endpoint — a model you host yourself, or a vendor host we don't ship a row for:
 
@@ -209,6 +217,27 @@ Watch the whole team in real time.
 
 `5dive ui`<br>
 Open local browser views for the org chart, task queue, human gates, and signed trigger deliveries.
+
+`5dive wall main olivia dev quinn ops --grid=3x2`<br>
+Those five seats' live terminals tiled on one screen, read-only; plain `5dive wall` tiles every running seat. `C-b w` makes one pane writable, `C-b d` detaches.
+
+`5dive project add mobile --prefix=MOB --lead-agent=dev`<br>
+Run several products off one team. Each project numbers its own tasks (MOB-1, MOB-2) and has its own lead.
+
+`5dive project set-status mobile complete`<br>
+Move a lane through its life: `active`, `complete`, `archived`, `binned`, `backlogged`. Anything but `active` or `backlogged` stamps `archived_at`, and only an `active` project takes new tasks.
+
+`5dive org tree`<br>
+Who reports to whom. Gates route up this chart, and `sudo 5dive human add you --telegram=<chat id>` names the person whose phone they reach.
+
+`sudo 5dive plugin add 5dive-ai/5dive-browser`<br>
+Install a plugin straight from a GitHub repo. This one gives the whole team a shared, human-authenticated browser.
+
+`5dive fleet status`<br>
+Reachability and agent counts across every box you registered with `5dive fleet add`.
+
+`5dive digest --7d`<br>
+The last seven days of the team's work on one page. `5dive digest on` delivers it to your Telegram every day.
 
 `5dive trigger`<br>
 Turn signed GitHub or generic webhook events into ordinary tasks.
@@ -373,6 +402,23 @@ sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 
 `--as` is the agent's name on your box; the pack supplies the persona, model, and skills. Add `--channels=telegram` to wire a bot at import time. Packs live in the [`5dive-ai/5dive-marketplace`](https://github.com/5dive-ai/5dive-marketplace) registry, and a `5dive.yaml` can reference one with `pack: <slug>`.
 
+### Plugins
+
+A plugin adds something to every seat on the box at once: a channel (Telegram, Discord), a verb (a new top-level `5dive <verb>`), or a capability such as a shared browser or voice. It is a directory with a Claude Code plugin manifest (`.claude-plugin/plugin.json`). 5dive installs it box-level and registers it with every existing agent and every agent created later: Claude Code seats through their own plugin install, other harnesses through the plugin's `AGENTS.md` section.
+
+```sh
+sudo 5dive plugin add browser@5dive-plugins        # from the 5dive marketplace
+sudo 5dive plugin add 5dive-ai/5dive-voice         # from any GitHub repo that carries a marketplace.json
+sudo 5dive plugin list                             # version, tier, enabled, what it registers
+sudo 5dive plugin upgrade browser@5dive-plugins
+sudo 5dive plugin disable browser@5dive-plugins    # a flag flip; the code stays on disk
+sudo 5dive plugin rollback browser@5dive-plugins 1.1.0
+```
+
+`add` prints who published the plugin and exactly what it will be handed, then waits for you to agree: a plugin is code that runs with your agents' access. `5dive market --kind=plugin` is the catalog, and the same list is on the dashboard under **Plugins**.
+
+**Develop your own.** Any repo with a `.claude-plugin/marketplace.json` naming its plugins installs with `5dive plugin add <owner>/<repo>`. [5dive-browser](https://github.com/5dive-ai/5dive-browser) and [5dive-voice](https://github.com/5dive-ai/5dive-voice) are the two we ship that way; [5dive-plugins](https://github.com/5dive-ai/5dive-plugins) is the marketplace with the rest (telegram, dashboard, buzz). A plugin declares what it registers (`channel`, `verb`, `skill`, `mcp`). A verb plugin ships `bin/<verb>` and is reached only after every builtin command, so it can never take `5dive task` from you; a manifest naming a builtin, or a verb another plugin already claims, is refused at install. Publish under your own name: `add` shows the publisher before anything runs.
+
 ### See the org layer: `5dive ui`
 
 The CLI serves its own web UI. No install, no build step, no account:
@@ -414,6 +460,7 @@ sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<princip
 5dive trigger   add / ls / show / deliveries / replay / serve
 5dive heartbeat on / off / ls / tick     # wake agents that have queued work
 5dive org       set / tree               # who reports to whom
+5dive wall [--grid=CxR] [<seat>...]      # every agent's live TUI on one screen, read-only
 5dive ui                                 # local org/queue/gates/triggers views
 
 5dive account   add / login / list / show / usage / rename / remove
