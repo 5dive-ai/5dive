@@ -332,15 +332,31 @@ jobs:
       - uses: actions/checkout@v4
       - name: Grade this workflow's own structure (DIVE-3315 arms, DIVE-3479 arm 99)
         run: bash tests/corpus_tier_budget_unit.sh
+      # DIVE-4754 -- THE REPO-WIDE HALF, and it is first because it is the half
+      # that was missing. tests/plugins_registry_pin_unit.sh grades the BEHAVIOUR
+      # ("CI resolves the plugins tree from a moving ref") over the whole tree
+      # with a named allowlist, and drives the resolver itself. Run here as well
+      # as in the corpus so a reviewer reading this job sees the whole guard.
+      - name: The plugins tree is pinned wherever CI resolves it (DIVE-4754)
+        run: bash tests/plugins_registry_pin_unit.sh
       # DIVE-4452: the pin must not silently regress. This grades the WORKFLOWS,
-      # not the product, so it lives here rather than in the corpus: a reviewer who
-      # re-adds a bare `git clone` of 5dive-plugins re-opens the cross-repo red.
+      # not the product: a reviewer who re-adds a bare `git clone` of
+      # 5dive-plugins to a workflow re-opens the cross-repo red.
       #
-      # SELECTOR: a file is in scope when it fetches the plugins TREE for grading,
-      # marked by RUNNER_TEMP/5dive-plugins. That deliberately excludes
-      # install-guard.yml (documents the install.sh tarball sites, clones nothing)
-      # and install-smoke.yml (reads the LIVE registry marketplace.json on purpose,
-      # DIVE-4202 -- a pinned manifest would grade a file no customer reads).
+      # SELECTOR, AND ITS CORRECTED REASON (DIVE-4754). A file is in scope here
+      # when it fetches the plugins TREE for grading, marked by
+      # RUNNER_TEMP/5dive-plugins. That was written as though it were the whole
+      # guard, and it was not: on 2026-09-21 these arms printed
+      # `OK: ... everywhere it is graded` while an unpinned clone in
+      # scripts/run-harnesses.sh froze the merge queue for 20 minutes
+      # (DIVE-4752). A directory in a selector is a bet that the code will not
+      # move. These arms are kept -- they are cheap and they are specific about
+      # the four workflow clone sites -- but the claim they support is now only
+      # "the workflow sites agree with each other"; the repo-wide claim is the
+      # step above. install-guard.yml (documents the install.sh tarball sites,
+      # clones nothing) and install-smoke.yml (reads the LIVE registry
+      # marketplace.json on purpose, DIVE-4202 -- a pinned manifest would grade
+      # a file no customer reads) are exempt there, BY NAME.
       - name: No workflow may clone 5dive-plugins unpinned (DIVE-4452)
         run: |
           set -euo pipefail
@@ -377,7 +393,7 @@ jobs:
             echo "FAIL: pins disagree across workflows ($n distinct)"; fail=1
           fi
           if [ "$fail" = "0" ]; then
-            echo "OK: 5dive-plugins is pinned, consistently, everywhere it is graded."
+            echo "OK: the workflow clone sites agree on one pin. (Repo-wide coverage is tests/plugins_registry_pin_unit.sh -- DIVE-4754.)"
           fi
           exit "$fail"
 
