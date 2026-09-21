@@ -102,6 +102,7 @@ CORE_FILES=(
   src/lib/actor.sh
   src/lib/routing_receipt.sh
   src/lib/a2a_rounds.sh
+  src/lib/a2a_urgent.sh
 )
 
 LAZY_FILES=(

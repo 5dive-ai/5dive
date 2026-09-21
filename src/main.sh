@@ -83,7 +83,14 @@ Agents:
   5dive agent clone <src> <dst> [--channels=...] [--telegram-token=...]
                                 [--discord-token=...] [--workdir=...]
   5dive agent start <name>
-  5dive agent stop <name>
+  5dive agent stop <name>                            # stops the SERVICE. To end the current TURN, see 'agent halt'
+  5dive agent halt <name> [--reason=<why>] [--no-requeue]
+                                                     # END THE CURRENT TURN of a BUSY seat and hand its row back:
+                                                     # Escape (which is what ends a claude turn), then the reaper's
+                                                     # own reclaim -- started_at cleared, run closed, task.reclaimed
+                                                     # on the ledger. A halted row is REQUEUED, never orphaned the
+                                                     # way 'heartbeat wake-task' leaves it, and never cancelled. The
+                                                     # seat stays running and takes its next dispatch. Admin/root.
   5dive agent restart <name>
   5dive agent rm <name> [--purge-home]               # aliases: 5dive agent fire <name>  /  5dive fire <name>
                                                      # home is quarantined to /home/.5dive-reaped/ (root 0700);
@@ -196,8 +203,17 @@ Agents:
   5dive agent <name> tui                             # attach to an interactive agent tmux session (dispatcher-only seats explain the alternative)
   5dive agent logs <name> [--follow] [--lines=N] [--tmux]
   5dive agent send <name> --message-file=<path>|--message-file=-|--message=<text>|<text...>
-                                    [--from=<sender>] [--raw] [--wake]
+                                    [--from=<sender>] [--raw] [--wake] [--urgent]
                                     [--reply-to-chat=<id> [--reply-to-msg=<id>]]
+                                                     # --urgent: JUMP THE QUEUE. A send to a busy seat is normally
+                                                     # spooled and delivered at its next idle (DIVE-4214); --urgent
+                                                     # types it now, so it is read as soon as the current turn ends
+                                                     # instead of at the next idle flush. It does NOT preempt a
+                                                     # running turn at a tool boundary -- no keystroke can; the verb
+                                                     # that ENDS the turn is 'agent halt'. Bounded to 400 bytes (a
+                                                     # steer, not a briefing) and budgeted at 3 per sender per hour;
+                                                     # past the budget the send still goes, on the normal path, and
+                                                     # the receipt says urgent:false.
                                                      # --message-file is FIRST because it is the only form your shell
                                                      # cannot corrupt: the body is read VERBATIM (DIVE-2627), and '-'
                                                      # reads it from stdin, so no temp file is needed:
@@ -669,6 +685,13 @@ _agent_verb_dispatch() {
         stop)
           AUDIT_CMD="agent stop"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_stop "$@" ;;
+        # DIVE-4769: ends the seat's current TURN and requeues its row. Audited
+        # like the lifecycle verbs and NOT under the registry lock — it changes no
+        # registry state (the unit keeps running), and taking the lock would make
+        # an urgent halt queue behind whatever create/start is in flight.
+        halt)
+          AUDIT_CMD="agent halt"; AUDIT_ARGS=("$@")
+          cmd_halt "$@" ;;
         restart)
           AUDIT_CMD="agent restart"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_restart "$@" ;;
