@@ -7343,6 +7343,57 @@ _hb_consolidate_seat_user() {
 #
 # Same isolation contract as every other sweep — a failure here must NEVER abort
 # the wake loop.
+# ── DIVE-584: the distiller child's credentials ─────────────────────────────
+#
+# `/etc/5dive/connectors/anthropic.env` and `<seat>-auth.env` are `root:claude
+# 0640`. Every seat whose uid is in group `claude` can read them; an
+# `isolation=sandboxed` seat cannot, and that is the whole point of the
+# isolation. The heartbeat runs as root, so the read belongs HERE and the child
+# is handed the result.
+#
+# Both are split so a unit harness can grade them without root, sudo or a real
+# seat: `_hb_distiller_seed_env` is `set -a` + `.` over two paths, and
+# `_hb_distiller_preserve_list` is a pure inspection of the environment it
+# leaves behind. Call them in a SUBSHELL — `set -a` sourcing into a long-lived
+# process is how one seat's token reaches the next seat's child.
+
+# The credential variables the distiller needs, in the order `5dive-agent-start`
+# seeds them. Named explicitly rather than passing the whole environment: a
+# blanket `--preserve-env` would carry the heartbeat's own PATH, HOME and
+# TMPDIR into a seat's child and undo the `-H` this call is written with.
+_HB_DISTILLER_ENV_VARS="${_HB_DISTILLER_ENV_VARS:-ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL}"
+
+# `_hb_distiller_seed_env <shared-env> <profile-env>` — source what is readable,
+# exporting as we go. Order is the unit's `EnvironmentFile` order (DIVE-4648):
+# shared connector FIRST, the `<seat>-auth.env` overlay LAST, so a profiled seat
+# still wins. An unreadable or absent file is skipped exactly as before — the
+# difference is only WHO is doing the reading. Always returns 0: a seat with no
+# credential at all is a reportable outcome, not an error in this function.
+_hb_distiller_seed_env() {  # <shared-env> <profile-env>
+  local f
+  for f in "$@"; do
+    [ -n "$f" ] || continue
+    [ -r "$f" ] || continue
+    # shellcheck source=/dev/null
+    set -a; . "$f" || true; set +a
+  done
+  return 0
+}
+
+# `_hb_distiller_preserve_list` — the comma-joined names of the credential
+# variables that are actually SET and non-empty, for `sudo --preserve-env=`.
+# EMPTY when none is: the caller then invokes sudo with no `--preserve-env` at
+# all, so a box where this read found nothing behaves exactly as it did before
+# this row, and `memory consolidate` reports `distiller_unauthed` (DIVE-4562)
+# rather than the child inventing a reason.
+_hb_distiller_preserve_list() {
+  local v out=""
+  for v in $_HB_DISTILLER_ENV_VARS; do
+    if [ -n "${!v:-}" ]; then out="${out:+$out,}$v"; fi
+  done
+  printf '%s' "$out"
+}
+
 _hb_memory_consolidate_sweep() {
   local now="$1"
   _HB_CONS_RAN=0; _HB_CONS_SKIPPED=0; _HB_CONS_FAILED=0
@@ -7437,14 +7488,38 @@ _hb_memory_consolidate_sweep() {
     # with no credential at all — memory consolidation lost with no signal, and
     # doctor pointing the operator at a credential `auth status --probe` reports
     # healthy. Shared FIRST, profile LAST so a profiled seat still wins.
+    #
+    # DIVE-584: SOURCING IN THE CHILD ASSUMES THE CHILD CAN READ. The two files
+    # are `root:claude 0640`, and an `isolation=sandboxed` seat's uid is outside
+    # group `claude` — so both `[ -r ]` tests are FALSE, the shell takes neither
+    # branch, and the distiller runs with zero ANTHROPIC/OAUTH variables and
+    # answers `Not logged in`. Silent twice over: `[ -r ]` has no else, and
+    # `src/cmd_doctor.sh` then reports the streak as an API refusal and tells the
+    # operator to raise the account limit, while `5dive auth status --probe`
+    # says ok — because the seat's LIVE runtime was seeded by `5dive-agent-start`
+    # and only this child was not. Measured on claude-lab: 20 consecutive passes.
+    #
+    # The heartbeat is root and CAN read both. So it sources them here and hands
+    # the variables to the child through the ENVIRONMENT (`--preserve-env`,
+    # never argv — a token in argv is in every `ps` line on the box). The
+    # in-child sourcing stays as the fallback for a seat that can read the files
+    # and a sudoers policy that refuses to preserve: it is now a second chance,
+    # not the only one.
     local sharedenv="${CONNECTORS_DIR:-/etc/5dive/connectors}/anthropic.env"
     local authenv="${ENV_DIR:-${STATE_DIR:-/var/lib/5dive}/agents.d}/${name}-auth.env"
     local out=""
     # One line, deliberately: a multi-line -c payload carries newlines into every
     # log, `ps` line and test recorder that echoes the argv back.
-    out=$(timeout "${_HB_CONSOLIDATE_TIMEOUT_S}" sudo -n -u "$user" -H bash -c \
-         'set -a; [ -r "$1" ] && . "$1"; [ -r "$2" ] && . "$2"; set +a; exec "$3" memory consolidate --max-sessions=1 --json' \
-         _ "$sharedenv" "$authenv" "${SELF_BIN:-/usr/local/bin/5dive}" 2>/dev/null) || out="${out:-}"
+    #
+    # The whole seeding runs in a SUBSHELL: sourcing a profile overlay into the
+    # heartbeat's own long-lived root process would leak one seat's token into
+    # the next seat's iteration, which is the credential cross-wiring this lane
+    # exists to keep straight.
+    out=$( _hb_distiller_seed_env "$sharedenv" "$authenv"
+           _hb_pe=$(_hb_distiller_preserve_list)
+           timeout "${_HB_CONSOLIDATE_TIMEOUT_S}" sudo -n ${_hb_pe:+--preserve-env="$_hb_pe"} -u "$user" -H bash -c \
+             'set -a; [ -r "$1" ] && . "$1"; [ -r "$2" ] && . "$2"; set +a; exec "$3" memory consolidate --max-sessions=1 --json' \
+             _ "$sharedenv" "$authenv" "${SELF_BIN:-/usr/local/bin/5dive}" 2>/dev/null ) || out="${out:-}"
     local n_atoms n_proc n_dfail
     # `--slurp` and take the FIRST object that carries the field, because the
     # stream can hold TWO envelopes: on a non-zero exit the CLI's EXIT-trap

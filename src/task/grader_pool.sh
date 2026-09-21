@@ -93,6 +93,39 @@ _grader_pct() {  # <account> <fiveHourPct|sevenDayPct> [<json-on-stdin>]
 # both predicates move; the `600` here is only the no-quota_wall.sh fallback a
 # hand-picked harness source list would hit.
 _GRADER_READING_MAX_AGE="${_GRADER_READING_MAX_AGE:-${QUOTA_SNAPSHOT_MAX_AGE:-600}}"
+
+# ── DIVE-584: THE WEEKLY WINDOW DOES NOT MOVE AT THE 5-HOUR WINDOW'S SPEED ──
+#
+# The fence above is one number applied to both windows, and a reading only
+# refreshes while a seat of that account is TALKING. Measured on this host
+# 2026-09-20: 27 of 29 accounts read `null` for the week and landed in
+# `blind meter, policy=soft` — `/var/log/5dive-heartbeat.log`
+# `2026-09-20T06:00:05Z … DIVE-382 slot NOT fired — pacing floor soft on
+# claude-dimon … no weekly reading (null)`. The floor was holding dispatch on
+# the absence of a measurement, not on a measurement.
+#
+# 600s is the right fence for the FIVE-HOUR window: at a 5-hour horizon a
+# ten-minute-old percentage is most of a percent out of date, and a window that
+# resets four or five times a day can move a long way while nobody looks.
+# Applied to the WEEKLY window it is a category error — a 7-day window moves
+# ~0.6 %/h at a full-tilt burn, so a reading a few hours old is still a fair
+# statement about the week, and there is no 24-hour span in which it becomes a
+# different number by more than the floor's own granularity.
+#
+# So the weekly window gets its own fence, 24h. This is NOT the one-directional
+# lower bound of DIVE-4586 (`_pace_account_seven_bound`, further down) and does
+# not replace it: that admits an EXPIRED-fence reading in the raise-only
+# direction. This widens the fence itself for one window, so an accepted weekly
+# reading is an ordinary reading and may open as well as close. The reason that
+# is sound here and was refused for the 5-hour window (DIVE-4578, DIVE-4342) is
+# the drift rate above, and only that — keep the two numbers apart.
+_GRADER_READING_WEEKLY_MAX_AGE="${_GRADER_READING_WEEKLY_MAX_AGE:-${QUOTA_SNAPSHOT_WEEKLY_MAX_AGE:-86400}}"
+[[ "$_GRADER_READING_WEEKLY_MAX_AGE" =~ ^[0-9]+$ ]] || _GRADER_READING_WEEKLY_MAX_AGE=86400
+# A weekly fence NARROWER than the 5-hour one would be a misconfiguration that
+# silently blinds the window this knob exists to open; the wider of the two wins.
+(( _GRADER_READING_WEEKLY_MAX_AGE >= _GRADER_READING_MAX_AGE )) \
+  || _GRADER_READING_WEEKLY_MAX_AGE="$_GRADER_READING_MAX_AGE"
+
 _GRADER_READING_US=$'\037'
 
 # `_grader_reading_expired <resetsAt> <now>` — exit 0 when this window has
@@ -119,9 +152,16 @@ _grader_reading_pair() {  # <now>   [<reading-json-on-stdin>]
   [[ -n "$json" && "$json" != "null" ]] || return 0
   asof=$(jq -r '.asOf // empty'         <<<"$json" 2>/dev/null || printf '')
   [[ "$asof" =~ ^[0-9]+$ ]] || return 0
-  (( now >= asof && now - asof <= _GRADER_READING_MAX_AGE )) || return 0
+  # DIVE-584: the age fence is PER WINDOW now. A reading outside the weekly
+  # fence is nothing at all (the caller's fall-back signal, as before); one
+  # between the two fences is a weekly measurement whose 5-hour half has gone
+  # stale, and only the 5-hour half is dropped. A reading from the FUTURE is
+  # still nothing, on either window — that is a clock fault, not an age.
+  (( now >= asof )) || return 0
+  (( now - asof <= _GRADER_READING_WEEKLY_MAX_AGE )) || return 0
   five=$(jq -r  '.fiveHourPct // empty'   <<<"$json" 2>/dev/null || printf '')
   seven=$(jq -r '.sevenDayPct // empty'   <<<"$json" 2>/dev/null || printf '')
+  (( now - asof <= _GRADER_READING_MAX_AGE )) || five=""
   fr=$(jq -r    '.fiveResetsAt // empty'  <<<"$json" 2>/dev/null || printf '')
   sr=$(jq -r    '.sevenResetsAt // empty' <<<"$json" 2>/dev/null || printf '')
   if _grader_reading_expired "$fr" "$now"; then five=""; fi
@@ -252,7 +292,7 @@ _grader_window_ok() {  # <account>  [<usage-json-on-stdin>]
   fi
   if [[ -z "$seven" ]]; then
     printf 'refuse: %s has no weekly reading (null) — no account reading measured within %ss and no seat of the account carries one; failing closed, not assuming 0%%\n' \
-           "$acct" "$_GRADER_READING_MAX_AGE"; return 1
+           "$acct" "$_GRADER_READING_WEEKLY_MAX_AGE"; return 1
   fi
   # Percentages arrive as floats (56.99999999999999); strip to integer for the
   # comparison rather than trusting bash arithmetic with a decimal point, which
@@ -1666,7 +1706,12 @@ _pace_account_reading_cached() {  # <account> -> reading JSON or EMPTY
   # something the caller would have rejected as a carrier read.
   if (( mt > 0 )) && [[ -r "$f" && -s "$f" ]]; then
     age=$(( now - mt ))
-    if (( age >= 0 && age < _GRADER_READING_MAX_AGE )); then
+    # DIVE-584: bounded by the WIDEST fence any caller applies, not the 5-hour
+    # one. This branch is a carrier, not a verdict — every consumer re-fences
+    # the reading's own `asOf` per window on the way out — so narrowing it here
+    # threw the weekly reading away before the weekly fence ever saw it, which
+    # is the second of the three places one number was doing two jobs.
+    if (( age >= 0 && age < _GRADER_READING_WEEKLY_MAX_AGE )); then
       cat "$f"; return 0
     fi
   fi
@@ -1680,8 +1725,9 @@ _PACE_READING_JSON_CMD="${_PACE_READING_JSON_CMD:-_pace_account_reading_cached}"
 # `<pct><US><resetsAt-epoch>`, or EMPTY.
 #
 # Both fences of `_grader_reading_pair`, applied to the weekly window only:
-#   * the READING's own measurement time (`asOf`) within `_GRADER_READING_MAX_AGE`
-#     — not the age of the file that quotes it;
+#   * the READING's own measurement time (`asOf`) within
+#     `_GRADER_READING_WEEKLY_MAX_AGE` (DIVE-584: the weekly fence, not the
+#     5-hour one) — not the age of the file that quotes it;
 #   * a window whose `sevenResetsAt` has already passed is DROPPED entirely,
 #     because a percentage from a window that has since turned over is not a
 #     statement about the week we are pacing.
@@ -1702,7 +1748,11 @@ _pace_account_seven() {  # <account> [<now-epoch>] -> "<pct><US><resets>" or EMP
   [[ -n "$rl" && "$rl" != "null" ]] || return 0
   asof=$(jq -r '.asOf // empty' <<<"$rl" 2>/dev/null || printf '')
   [[ "$asof" =~ ^[0-9]+$ ]] || return 0
-  (( now >= asof && now - asof <= _GRADER_READING_MAX_AGE )) || return 0
+  # DIVE-584: this function reads the WEEKLY window and nothing else, so it
+  # fences on the weekly age. The reset fence below is unchanged and still does
+  # the work the age fence cannot — a percentage from a window that has already
+  # turned over is dropped however fresh it is.
+  (( now >= asof && now - asof <= _GRADER_READING_WEEKLY_MAX_AGE )) || return 0
   seven=$(jq -r '.sevenDayPct // empty'   <<<"$rl" 2>/dev/null || printf '')
   sr=$(jq -r    '.sevenResetsAt // empty' <<<"$rl" 2>/dev/null || printf '')
   [[ -n "$seven" ]] || return 0

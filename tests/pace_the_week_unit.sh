@@ -711,8 +711,13 @@ jcase "the account reading at 70% with 6d to the reset holds at the soft floor" 
 jcase "the days-to-reset relaxation uses the ACCOUNT's reset, never the document's" \
       0 "$(snap_ 70 "$NEAR")" "$(mkjson 70 "$FAR")" "to the reset"
 # FENCE 1: the age of the READING, not of the file that quotes it.
-jcase "a reading past _GRADER_READING_MAX_AGE is not a reading — the document answers instead" \
-      2 "$(snap_ 20 "$FAR" "$(( NOW - 4000 ))")" "$(mkjson 70 "$FAR")" "from the seat reading"
+# DIVE-584 moved which fence this arm names. The weekly window is now fenced at
+# its own drift rate (`_GRADER_READING_WEEKLY_MAX_AGE`, 24h) rather than the
+# 5-hour window's 600s, so the fixture is aged past THAT to still grade a fence.
+# The claim is unchanged: past the fence is not a reading, and the floor falls
+# through to the document rather than inventing a number.
+jcase "a reading past _GRADER_READING_WEEKLY_MAX_AGE is not a reading — the document answers instead" \
+      2 "$(snap_ 20 "$FAR" "$(( NOW - _GRADER_READING_WEEKLY_MAX_AGE - 3600 ))")" "$(mkjson 70 "$FAR")" "from the seat reading"
 # FENCE 2: a window that has already turned over says nothing about this week.
 jcase "a weekly window whose reset has passed is dropped — the document answers instead" \
       2 "$(snap_ 20 "$(( NOW - 3600 ))")" "$(mkjson 70 "$FAR")" "from the seat reading"
@@ -736,7 +741,13 @@ jcase "a malformed snapshot is not a measurement" 2 'not json at all' "" "no wee
 # resets, so an aged reading inside an unreset window bounds the current one
 # from BELOW — and the floor is a lower-bound test. Admitted in the restrictive
 # direction only; every arm below that could open the floor must stay shut.
-STALE=$(( NOW - 4000 ))              # past _GRADER_READING_MAX_AGE
+# DIVE-584: the bound's DOMAIN moved, not its rule. A weekly reading up to 24h
+# old is now an ordinary reading (it drifts ~0.6 %/h, so it is a current
+# measurement, not merely a bound) and is graded by the arms above. The bound is
+# what answers BEYOND that fence, where there is still no current measurement —
+# so every arm below is re-aged past the weekly fence and asserts exactly what
+# it asserted before: admitted in the restrictive direction only, never opening.
+STALE=$(( NOW - _GRADER_READING_WEEKLY_MAX_AGE - 3600 ))   # past _GRADER_READING_WEEKLY_MAX_AGE
 kcase(){ jcase "$@"; }
 
 # THE ROW. Stale 100%, window not reset, no document: was blind/soft, now hard.
@@ -1114,7 +1125,7 @@ mcase(){ # <label> <want-rc> <types> <usage-json> <snapshot-json> <want-substr>
   else bad_ "$1" "rc=${got%% *} want=$2 | verdict: ${got#* }"; fi
 }
 msnap(){ printf '{"accounts":[{"name":"acct","usage":{"asOf":%s,"sevenDay":{"pct":%s,"resetsAt":%s}}}]}' "$3" "$1" "$2"; }
-MSTALE=$(( NOW - 7200 ))
+MSTALE=$(( NOW - _GRADER_READING_WEEKLY_MAX_AGE - 3600 ))   # DIVE-584: past the weekly fence, so the bound is what answers
 
 mcase "M3: an account whose every bound seat runs a provider with no weekly window is NOT blind — the floor has no jurisdiction and says so" \
       0 "codex" "" "" "no weekly usage window at all"
@@ -1240,13 +1251,17 @@ got=$(narm '
   && ok_ "N3: a cold cache and a silent carrier stay EMPTY — the blind branch, never a number" \
   || bad_ "N3: invented a reading" "got $got"
 
+# N4/N5 — DIVE-584: both fixtures are aged past the WEEKLY fence, which is the
+# widest any caller applies. The carry is bounded by that fence for the same
+# reason it was bounded by the 5-hour one: the cache must never hand back
+# something the caller would have rejected from the carrier itself.
 # N4 — IT CANNOT INVENT FRESHNESS. The cache stores the reading UNFENCED; the
 # asOf fence runs on every call against the reading's OWN timestamp. A carried
 # reading that has aged out is dropped exactly like a carrier read that has.
 got=$(narm '
   FLAG="$TMPD/once2"
   quota_snapshot_read(){ if [[ -e "$FLAG" ]]; then printf ""; else : > "$FLAG"; printf "%s" "$SNAP"; fi; }
-  SNAP='"'"'{"writtenAt":0,"accounts":[{"name":"acct","usage":{"asOf":'"$(( NOW - 4000 ))"',"sevenDay":{"pct":20,"resetsAt":'"$FAR"'}}}]}'"'"'
+  SNAP='"'"'{"writtenAt":0,"accounts":[{"name":"acct","usage":{"asOf":'"$(( NOW - _GRADER_READING_WEEKLY_MAX_AGE - 3600 ))"',"sevenDay":{"pct":20,"resetsAt":'"$FAR"'}}}]}'"'"'
   DOC='"'"'{"agents":[{"name":"s1","account":"acct","sevenDayPct":70,"sevenDayResetsAt":'"$FAR"'}]}'"'"'
   printf "%s" "$DOC" | _pace_band_7d acct '"$NOW"' >/dev/null 2>&1
   r=0; v=$(printf "%s" "$DOC" | _pace_band_7d acct '"$NOW"') || r=$?
@@ -1262,11 +1277,11 @@ got=$(narm '
   _grader_account_reading_json(){ printf "{\"asOf\":1,\"sevenDayPct\":20}"; }
   _pace_account_reading_cached acct >/dev/null
   f=$(_pace_reading_cache_path acct)
-  touch -d "@$(( $(date +%s) - _GRADER_READING_MAX_AGE - 60 ))" "$f"
+  touch -d "@$(( $(date +%s) - _GRADER_READING_WEEKLY_MAX_AGE - 60 ))" "$f"
   _grader_account_reading_json(){ printf ""; }
   printf "[%s]" "$(_pace_account_reading_cached acct)"')
 [[ "$got" == "[]" ]] \
-  && ok_ "N5: a cached reading older than _GRADER_READING_MAX_AGE is not carried across a flicker" \
+  && ok_ "N5: a cached reading older than _GRADER_READING_WEEKLY_MAX_AGE is not carried across a flicker" \
   || bad_ "N5: the carry outlived the fence" "got $got"
 
 # N6 — ONLY A NON-EMPTY READING IS EVER WRITTEN. `_pace_usage_snapshot`'s rule,
