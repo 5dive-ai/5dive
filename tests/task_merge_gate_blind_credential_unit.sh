@@ -128,6 +128,15 @@ mkdir -p "$TASKS_DIR"; set +e
 # not the path: what this file grades is the routing decision, and the probe's
 # own correctness is graded by its own siblings. T6 restores the real answer.
 _gate_gh_bot_ok() { [[ "${BOT_STUB_AVAILABLE:-1}" == "1" ]]; }
+# DIVE-585: `_gate_gh_nocred` selects its rail on AVAILABILITY now, so the second
+# predicate is load-bearing on these paths too and needs the same override for the
+# same stated reason. Left real it forks an actual `_gh_do --probe`: that is an
+# extra `BOT` line in T7's budget, and when the probe fails it diverts T4 and T6
+# onto the anonymous rail. Pointing both at the one knob keeps every arm in this
+# file routing exactly as it did — the CROSSING of the two predicates is what
+# tests/gate_gh_nocred_rail_select_unit.sh exists to grade, and grading it here
+# too would only make this file fail for that file's reasons.
+_gate_gh_bot_present() { [[ "${BOT_STUB_AVAILABLE:-1}" == "1" ]]; }
 
 pass=0; fail=0
 # The stub knobs must be EXPORTED — the stubs are separate processes. A bare
