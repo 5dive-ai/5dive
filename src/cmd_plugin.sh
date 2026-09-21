@@ -1561,6 +1561,71 @@ _plugin_verb_install_check() {
   return 0
 }
 
+# DIVE-4709 — the box's plugin record is a BOX-wide file, and whether a SEAT can
+# read it is a per-seat question nothing was asking.
+#
+# Measured on two customer boxes (exact-swallow seat `mp`, teal-fox-cx43 seat
+# `claude-lab`): `browser@5dive-plugins` was enabled box-wide, every other seat
+# on the same box probed fine, and those two seats' probe units failed EVERY
+# fire with `error: unknown command: browser`, exit 2/INVALIDARGUMENT. The verb
+# was not missing. `_plugin_verb_claims` opens with `[[ -r "$f" ]] || return 0`,
+# so a record the caller cannot READ is indistinguishable from a record that
+# declares nothing — and the dispatcher turns that emptiness into "unknown
+# command", which names the wrong cause and sends the reader looking for a
+# missing install that is not missing.
+#
+# This is the same defect DIVE-4035 fixed one layer down (mktemp's 0600 left
+# `installed.json` root-only, and `_plugin_publish_json` now chmods 644) — but
+# that fix only fires on a WRITE. A box whose record was published before it, or
+# whose seat is not in the shared group that makes $STATE_DIR traversable, still
+# has an unreadable record and still reads as "unknown command" forever.
+#
+# So: separate "nothing is installed" from "something is installed and this
+# caller cannot see it". The second is a refusal we owe a sentence.
+#
+# _plugin_record_blocker_path — prints the FIRST path component that exists and
+# refuses this caller, or nothing at all when the record is readable or is
+# genuinely absent. Nothing printed is the quiet path, and the quiet path must
+# stay quiet: a typo on a healthy box has to read exactly as it did before.
+_plugin_record_blocker_path() {
+  local f p rest comp
+  f="$(_plugin_installed_json)"
+  [[ -r "$f" ]] && return 0
+
+  # Top-down, and that direction is the whole correctness argument: `-e` on a
+  # component below an untraversable parent is false for the SAME reason the
+  # read failed, so a bottom-up test cannot tell "absent" from "hidden". The
+  # first component that exists and will not let us through is the one an
+  # operator has to fix; everything under it is unknowable, not missing.
+  p=""; rest="${f#/}"
+  while [[ "$rest" == */* ]]; do
+    comp="${rest%%/*}"; rest="${rest#*/}"
+    p="$p/$comp"
+    [[ -e "$p" ]] || return 0          # genuinely absent above us: nothing installed
+    # `-x` only. A directory may legitimately be 0711 (the browser profile store
+    # is, on purpose) — traversal is all a named lookup needs, and demanding -r
+    # here would report a blocker where there is none.
+    [[ -x "$p" ]] || { printf '%s' "$p"; return 0; }
+  done
+  [[ -e "$f" ]] || return 0            # every directory traversable, no record
+  printf '%s' "$f"
+}
+
+# _plugin_record_blocked_message <blocker> — the sentence the two dead seats
+# should have been printing for a week.
+_plugin_record_blocked_message() {
+  local blocker="$1" rec who grp
+  rec="$(_plugin_installed_json)"
+  who="$(id -un 2>/dev/null || printf 'uid %s' "${EUID:-?}")"
+  grp="${AGENT_SHARED_GROUP:-claude}"
+  printf '%s' "this seat cannot read the box's plugin record ($rec): $blocker refuses $who. \
+Every enabled plugin verb therefore reads as \"unknown command\" here even though the box has them \
+enabled, and any unit that runs one fails on every fire. This is per-seat visibility, NOT a missing \
+install — do not reinstall the plugin. Fix on the box, as root: add the account to the shared group \
+(gpasswd -a $who $grp) and make the record readable (chmod 644 $rec; chmod o+x or g+x each directory \
+above it). 'sudo 5dive doctor' reports which seats are affected."
+}
+
 # _plugin_dispatch_verb <verb> [args...]
 # EXECS on success and therefore does not return. Returns 1 — quietly, with
 # nothing printed — only when no installed, enabled plugin claims <verb>, which
@@ -1580,7 +1645,16 @@ _plugin_dispatch_verb() {
   command -v jq >/dev/null 2>&1 || return 1
 
   local claims; claims=$(_plugin_verb_claims "$verb")
-  [[ -n "$claims" ]] || return 1
+  if [[ -z "$claims" ]]; then
+    # DIVE-4709. Empty has two causes and only one of them is "no such verb".
+    # A record we cannot READ claims nothing either, and that is a refusal, not
+    # an answer — say so instead of letting it wear the typo's message. The
+    # blocker path is empty on every healthy box, so the quiet contract above
+    # survives intact for the case it was written for.
+    local blocker; blocker=$(_plugin_record_blocker_path)
+    [[ -n "$blocker" ]] || return 1
+    fail "$E_PERMISSION" "$(_plugin_record_blocked_message "$blocker")"
+  fi
 
   if [[ "$(wc -l <<<"$claims")" -gt 1 ]]; then
     fail "$E_VALIDATION" "verb '$verb' is claimed by more than one enabled plugin ($(tr '\n' ' ' <<<"$claims" | sed 's/ $//')) — 5dive will not pick between them. Disable all but one: 5dive plugin disable <plugin>"
