@@ -168,13 +168,27 @@ echo "── M: MUTATION ARMS — revert each divergence, assert the property re
 # ERROR, loudly, because it is the one outcome that cannot distinguish a working
 # mutation from a broken one.
 MUTBIN="$TMP/5dive-mut"
-mut() { # <name> <sed-expr> <file> <check-cmd...>
+# MUT_LINES is the arm's declared BLAST RADIUS: how many source lines the sed is
+# supposed to hit. It exists because "it applied somewhere" is not the same as
+# "it applied everywhere the property lives". DIVE-4779 iteration 1 shipped a
+# mutation anchored on one of the contract block's TWO emit paths; it applied,
+# the tree changed, and the arm then graded whichever document the box happened
+# to serve — green in CI (no store, absent path, unmutated) and red here (a
+# populated store). A count is the only thing that tells those two apart.
+mut() { # [MUT_LINES=n] <name> <sed-expr> <file> <check-cmd...>
   local name="$1" expr="$2" file="$3"; shift 3
+  local want="${MUT_LINES:-1}"; unset MUT_LINES   # one arm at a time; never leaks to the next
   local bak="$TMP/bak-$RANDOM"; cp "$file" "$bak"
   sed -i "$expr" "$file"
   if cmp -s "$bak" "$file"; then
     cp "$bak" "$file"
     bad_t "M:$name THE MUTATION DID NOT APPLY" "the sed matched nothing in $file, so this arm would grade the UNMUTATED tree — a vacuous green, not a pass"
+    return
+  fi
+  local hit; hit=$(diff "$bak" "$file" | grep -c '^<')
+  if [[ "$hit" != "$want" ]]; then
+    cp "$bak" "$file"
+    bad_t "M:$name THE MUTATION HIT $hit SITE(S), THE ARM DECLARES $want" "a partial mutation greens wherever the untouched site is the one that answers — that is environment-dependent grading, not a pass. Re-anchor the sed or correct MUT_LINES."
     return
   fi
   local built=1
@@ -204,8 +218,15 @@ mut "one-producer" '/^_ui_state_json() { _board_state_json/s|.*|_ui_state_json()
     bash -c 'a=$("$MUTBIN" board --json 2>/dev/null | jq -S "del(.data.generated_at)"); b=$("$MUTBIN" ui --data 2>/dev/null | jq -S "del(.data.generated_at)"); [[ -n "$a" && "$a" == "$b" ]]'
 # M4 — the contract block inside the document. A consumer handed only the document
 # must be able to check the version without a second exec.
-mut "contract-in-document" 's|        contract: {name: \$cn, version: \$cv},||' 'src/cmd_board.sh' \
-    bash -c '"$MUTBIN" board --json 2>/dev/null | jq -e ".data.contract.version" >/dev/null'
+# BOTH emit paths, and the property asserted on BOTH documents. The populated
+# board and the store-absent board are separate jq expressions (property 2 in the
+# header), so a single-site mutation is graded by whichever one the environment
+# serves — and CI has no store. MUT_LINES=2 makes that a loud harness failure
+# rather than a silent vacuous green.
+MUT_LINES=2 mut "contract-in-document" 's|contract: {name: \$cn, version: \$cv},||g' 'src/cmd_board.sh' \
+    bash -c 'm=$(mktemp -d); "$MUTBIN" board --json 2>/dev/null | jq -e ".data.contract.version" >/dev/null \
+             && STATE_DIR="$m/none" TASKS_DIR="$m/none/tasks" TASKS_DB="$m/none/tasks/tasks.db" \
+                "$MUTBIN" board --json 2>/dev/null | jq -e ".data.contract.version" >/dev/null'
 # M5 — the bundle actually carries the file. Drop cmd_board.sh from build.sh's
 # list: the source is perfect and the verb does not exist on a box.
 mut "in-the-bundle" '\|^  src/cmd_board.sh$|d' 'build.sh' \
