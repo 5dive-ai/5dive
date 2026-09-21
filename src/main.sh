@@ -1244,6 +1244,13 @@ main() {
       # tasks/org; reads unprivileged, writes take root themselves (the table is
       # trusted input to gate delivery). No lock: plain sqlite writes, like org.
       cmd_human "$@" ;;
+    board)
+      # DIVE-4779: the READ CONTRACT — one versioned JSON document describing this
+      # host's board, for a consumer that must not open core's private store. Same
+      # group-writable read as `ui` and `task ls`: no root, no lock, no write path.
+      # `--contract-version` answers without touching the store at all, so it is
+      # the negotiation a plugin runs before it decides whether it can run here.
+      cmd_board "$@" ;;
     ui)
       # DIVE-2655/DIVE-3931: the free single-host UI (org/queue/gates/triggers).
       # Reads the same group-writable store as tasks + org; GET/HEAD only, no
