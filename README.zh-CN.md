@@ -358,12 +358,12 @@ sudo 5dive agent import olivia --as=ceo    # 从 pack 创建具名智能体
 插件一次给机器上的所有席位加上某样东西：一个渠道（Telegram、Discord）、一个动词（新的顶层 `5dive <verb>`），或一项能力，比如共享浏览器或语音。它是一个带 Claude Code 插件清单（`.claude-plugin/plugin.json`）的目录。5dive 在机器层面安装它，并把它注册给现有的每个智能体和之后创建的每个智能体：Claude Code 席位通过各自的插件安装，其他框架通过插件的 `AGENTS.md` 段落。
 
 ```sh
-sudo 5dive plugin add browser@5dive-plugins        # 从 5dive 市场安装
+sudo 5dive plugin add 5dive-ai/5dive-browser       # 从它自己的仓库安装
 sudo 5dive plugin add 5dive-ai/5dive-voice         # 从任何带 marketplace.json 的 GitHub 仓库安装
 sudo 5dive plugin list                             # 版本、层级、是否启用、注册了什么
-sudo 5dive plugin upgrade browser@5dive-plugins
-sudo 5dive plugin disable browser@5dive-plugins    # 只是翻转开关；代码留在磁盘上
-sudo 5dive plugin rollback browser@5dive-plugins 1.1.0
+sudo 5dive plugin upgrade browser@5dive-browser
+sudo 5dive plugin disable browser@5dive-browser    # 只是翻转开关；代码留在磁盘上
+sudo 5dive plugin rollback browser@5dive-browser 1.1.0
 ```
 
 `add` 会打印插件的发布者以及它将被赋予的确切权限，然后等你确认：插件是以你的智能体的权限运行的代码。`5dive market --kind=plugin` 是目录，仪表盘的 **Plugins** 页面显示同一份列表。
