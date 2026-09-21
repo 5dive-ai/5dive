@@ -413,7 +413,7 @@ cmd_wall() {
   fi
   n=${#seats[@]}
   if (( n == 0 )); then
-    printf '5dive wall: no running claude agents to show (5dive agent ls).\n' >&2
+    printf '5dive wall: no running agents to show (5dive agent ls).\n' >&2
     return 1
   fi
 
@@ -444,7 +444,7 @@ wall_usage() {
   cat <<'WALLUSAGE'
 5dive wall — one screen holding every agent's live TUI, read-only.
 
-  5dive wall                       # every running claude seat, from the registry
+  5dive wall                       # every running seat, from the registry
   5dive wall main dev ops          # only these seats, in this order
   5dive wall --grid=4x2            # a different shape; remembered for this box
   5dive wall --rebuild             # tear the wall down and lay it out again
@@ -457,7 +457,7 @@ Inside the wall:
 Read-only is the default and it is a safety property: a Ctrl-C into an agent
 pane kills that seat's unit. C-b w opts ONE pane in, never the wall.
 
-Seats come from the registry: running agents of type `claude`, in registry
+Seats come from the registry: running agents of any harness, in registry
 order, capped at the grid's pane count. Spare slots stay as vacant panes so
 the layout does not move when a seat is down.
 
