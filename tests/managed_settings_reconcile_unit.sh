@@ -39,6 +39,19 @@ CONST="$(grep -m1 '^readonly FIVEDIVE_CHANNEL_PLUGINS_JSON=' src/header.sh)"
   || bad_t "channel-plugin constant missing" "no readonly FIVEDIVE_CHANNEL_PLUGINS_JSON= in src/header.sh"
 eval "$CONST"
 
+# DIVE-4697: the installer manages a SECOND set of keys now — the claude.ai
+# account-sync opt-outs. Same rule as above: read them from the ONE constant in
+# src/header.sh, never retype them here. Retyping is exactly how this fixture
+# desynced from the filter the first time (DIVE-3537, the channel list) and how
+# the "already-current" arm below went red the second (this row, iteration 1).
+SYNC_CONST="$(grep -m1 '^readonly FIVEDIVE_MANAGED_SYNC_OFF_JSON=' src/header.sh)"
+[[ -n "$SYNC_CONST" ]] \
+  && ok_t "FIVEDIVE_MANAGED_SYNC_OFF_JSON present in src/header.sh" \
+  || bad_t "sync-off constant missing" "no readonly FIVEDIVE_MANAGED_SYNC_OFF_JSON= in src/header.sh"
+eval "$SYNC_CONST"
+SYNC_JSON="${FIVEDIVE_MANAGED_SYNC_OFF_JSON:-}"
+[[ -n "$SYNC_JSON" ]] || SYNC_JSON='{}'
+
 # ---- 1. template ships EVERY 5dive fork channel -----------------------------
 TPL=$(sed -n '/cat > "\$msj" <<.\?MANAGED/,/^MANAGED/p' install.sh)
 while read -r p m; do
@@ -95,14 +108,43 @@ N2=$(rec <(echo "$OUT") 2>/dev/null | jq '.allowedChannelPlugins | length')
   && ok_t "reconcile is idempotent (no duplicate entries on re-run)" \
   || bad_t "reconcile idempotent" "len $N1 -> $N2"
 
-# already-current file: filter produces an equal object (change-detector skips write).
-# Built FROM the constant — hand-writing this fixture is how it silently stopped
-# being "already current" the moment a channel was added (DIVE-3537).
+# ---- 3. the sync-off keys the filter also manages (DIVE-4697) ---------------
+# POSITIVE half FIRST, because it is the property item 1 of DIVE-4697 actually
+# buys and nothing asserted it: a file that does NOT carry the sync keys must be
+# REWRITTEN and gain them. The no-op arm below cannot see this, and neither
+# could the live-document arm run at delivery — the host's real file had been
+# hand-edited to carry both keys hours earlier, so it was already current under
+# the NEW definition. Only a fixture that is genuinely behind can grade this.
 jq -c --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
-   -n '{channelsEnabled:true, allowedChannelPlugins:$need}' > "$TMP/cur.json"
+   -n '{channelsEnabled:true, allowedChannelPlugins:$need}' > "$TMP/nosync.json"
+NOSYNC_OUT=$(rec "$TMP/nosync.json")
+_sync_arms=0
+while read -r k v; do
+  _sync_arms=$((_sync_arms+1))
+  jq -e --arg k "$k" --argjson v "$v" '.[$k] == $v' <<<"$NOSYNC_OUT" >/dev/null \
+    && ok_t "reconcile sets $k=$v on a file that lacks it" \
+    || bad_t "reconcile sets $k" "an existing box keeps claude.ai account sync ON. Got: $NOSYNC_OUT"
+done < <(jq -r 'to_entries[] | "\(.key) \(.value)"' <<<"$SYNC_JSON")
+[[ "$_sync_arms" -ge 2 ]] \
+  && ok_t "sync-key loop ran $_sync_arms arms (>=2)" \
+  || bad_t "sync-key loop ran $_sync_arms arms" \
+          "FIVEDIVE_MANAGED_SYNC_OFF_JSON is empty/unparseable — the arms above asserted NOTHING"
+jq -e --slurpfile a <(printf '%s\n' "$NOSYNC_OUT") '. != $a[0]' "$TMP/nosync.json" >/dev/null \
+  && ok_t "a file lacking the sync keys IS changed by the filter (so it gets rewritten)" \
+  || bad_t "no-sync file unchanged" \
+          "the change-detector would skip the write and the box never gains the keys. Got: $NOSYNC_OUT"
+jq -e '.allowedChannelPlugins | length as $n | $n > 0' <<<"$NOSYNC_OUT" >/dev/null \
+  && ok_t "the sync-key rewrite keeps the channel allowlist" || bad_t "sync rewrite drops channels" "$NOSYNC_OUT"
+
+# already-current file: filter produces an equal object (change-detector skips write).
+# Built FROM BOTH constants — hand-writing this fixture is how it silently stopped
+# being "already current" the moment a channel was added (DIVE-3537), and again
+# the moment the sync keys joined the managed set (DIVE-4697 iteration 1).
+jq -c --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" --argjson sync "$SYNC_JSON" \
+   -n '{channelsEnabled:true, allowedChannelPlugins:$need} + $sync' > "$TMP/cur.json"
 jq -e --slurpfile a <(rec "$TMP/cur.json") '. == $a[0]' "$TMP/cur.json" >/dev/null \
   && ok_t "already-current file is unchanged by the filter (no needless rewrite)" \
-  || bad_t "current-file no-op" ""
+  || bad_t "current-file no-op" "filter output: $(rec "$TMP/cur.json")"
 
 echo "-----"
 echo "PASS=$PASS FAIL=$FAIL"

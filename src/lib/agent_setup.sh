@@ -2307,14 +2307,24 @@ reconcile_managed_settings() {
   # same constant the doctor CHECK asserts. These were two hand-kept literals and
   # they drifted on buzz; do not re-type the list here.
   [[ -n "${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}" ]] || return 1
+  # DIVE-4697: and the claude.ai account-sync opt-out, from its own constant
+  # (header.sh). Same rule as the channel list: never re-type it here.
+  [[ -n "${FIVEDIVE_MANAGED_SYNC_OFF_JSON:-}" ]] || return 1
   local tmp
   tmp=$(mktemp) || return 1
-  if jq --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" '
+  # The sync keys are ASSIGNED, not merged with `+`: `false` is the only value
+  # Claude honours, so a box that carries `true` (or a typo) must be corrected,
+  # not preserved. A box that genuinely wants the account sync ON deletes the
+  # keys AND stops running this reconcile — that is a per-box decision, and the
+  # template is not where it is expressed (DIVE-4697).
+  if jq --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
+        --argjson sync "$FIVEDIVE_MANAGED_SYNC_OFF_JSON" '
         .channelsEnabled = true
       | .allowedChannelPlugins = ((.allowedChannelPlugins // []) as $have
           | $have + ($need
               | map(select(. as $n
                   | ($have | any(.plugin == $n.plugin and .marketplace == $n.marketplace)) | not))))
+      | reduce ($sync | to_entries[]) as $kv (.; .[$kv.key] = $kv.value)
       ' "$msj" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
     if jq -e --slurpfile a "$tmp" '. == $a[0]' "$msj" >/dev/null 2>&1; then
       rm -f "$tmp"; return 3          # already current
@@ -2362,6 +2372,41 @@ managed_settings_channels_missing() {
       | [$need[] | select(. as $n
           | ($have | any(.plugin == $n.plugin and .marketplace == $n.marketplace)) | not)
         | "\(.plugin)@\(.marketplace)"] | join(", ")
+    ' "$msj" 2>/dev/null
+}
+
+# DIVE-4697: the GATE for the claude.ai account-sync opt-out, living beside the
+# fixer that repairs it and reading the SAME constant, for the reason spelled
+# out above the channel gate: a self-heal whose gate cannot fire is the same as
+# no self-heal, and it reports [ok] either way.
+#
+# Returns 0 only when EVERY key of FIVEDIVE_MANAGED_SYNC_OFF_JSON is present and
+# carries exactly its value. 1 otherwise — including a missing/unreadable/not-
+# JSON file, or no jq, because "cannot prove the sync is off" must route to the
+# repair path and never to [ok]. `null == false` is not true in jq, so an ABSENT
+# key reads as not-current, which is the whole point: absent is the state every
+# box provisioned before 2026-09-20 is in.
+managed_settings_sync_off_ok() {
+  local msj="${1:-/etc/claude-code/managed-settings.json}"
+  [[ -f "$msj" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -n "${FIVEDIVE_MANAGED_SYNC_OFF_JSON:-}" ]] || return 1
+  jq -e --argjson sync "$FIVEDIVE_MANAGED_SYNC_OFF_JSON" '
+      . as $doc | $sync | to_entries | all(. as $kv | $doc[$kv.key] == $kv.value)
+    ' "$msj" >/dev/null 2>&1
+}
+
+# The keys the gate above is missing, "key, key" on stdout (empty when none
+# are). Derived from the same constant so a third sync key shipped upstream is
+# named in the doctor line without anyone editing a message string.
+managed_settings_sync_missing() {
+  local msj="${1:-/etc/claude-code/managed-settings.json}"
+  [[ -f "$msj" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -n "${FIVEDIVE_MANAGED_SYNC_OFF_JSON:-}" ]] || return 1
+  jq -r --argjson sync "$FIVEDIVE_MANAGED_SYNC_OFF_JSON" '
+      . as $doc
+      | [$sync | to_entries[] | select($doc[.key] != .value) | .key] | join(", ")
     ' "$msj" 2>/dev/null
 }
 
