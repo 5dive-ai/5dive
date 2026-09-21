@@ -133,18 +133,39 @@ for k in $V1_STATS; do printf '%s' "$adoc" | jq -e --arg k "$k" '.data.stats | h
 [[ "$(printf '%s' "$adoc" | jq -r '.data.contract.version')" == "$SRC_V" ]] \
   && ok_t "D5 ...and the contract block" || bad_t "D5 contract block on the empty board"
 
-echo "── E: ONE PRODUCER — the in-core UI and the contract cannot disagree ──"
-# While `ui` still exists in core (step 3 removes it) both it and `board` serve
-# this document. Two producers would let the shipped UI and the plugin UI drift
-# apart with nothing in either repo able to see it.
-a=$("$BIN" board --json 2>/dev/null | jq -S 'del(.data.generated_at)')
-b=$("$BIN" ui --data 2>/dev/null | jq -S 'del(.data.generated_at)')
-[[ -n "$a" && "$a" == "$b" ]] \
-  && ok_t "E1 \`board --json\` and \`ui --data\` are byte-identical (one producer)" \
-  || bad_t "E1 one producer" "they diverged — _ui_state_json no longer delegates to _board_state_json"
-grep -qE '^_ui_state_json\(\) \{ _board_state_json' src/cmd_ui.sh \
-  && ok_t "E2 ...and it is a delegation, not a copy (so deleting cmd_ui.sh in step 3 changes nothing)" \
-  || bad_t "E2 delegation not duplication" "cmd_ui.sh carries its own producer again"
+echo "── E: THE NAME IS RELEASED — ui left core, and the shim is a FALLTHROUGH ──"
+# DIVE-4783 steps 2-3. `board` is now the ONLY producer of this document in core;
+# the UI is `5dive-ai/5dive-ui` and reads it. What this section grades is not the
+# document but the thing that lets the plugin exist at all: core must have given
+# the NAME up, in both enumerations at once. A shim that kept `ui` as a case
+# label would keep it in FIVEDIVE_BUILTIN_VERBS (T5 asserts set equality), and
+# _plugin_verb_is_builtin would then refuse `plugin add 5dive-ai/5dive-ui` on
+# every box forever — the plugin would be inert and the refusal would be correct.
+grep -q ' ui ' <(grep -E '^readonly FIVEDIVE_BUILTIN_VERBS=' src/cmd_plugin.sh) \
+  && bad_t "E1 the name is released" "\`ui\` is back in FIVEDIVE_BUILTIN_VERBS — _plugin_verb_is_builtin will refuse the plugin's own verb claim" \
+  || ok_t "E1 \`ui\` is gone from FIVEDIVE_BUILTIN_VERBS, so the plugin's verb claim resolves"
+awk 'f&&/^}$/{exit} /^main\(\) \{$/{f=1} f' src/main.sh | grep -qE '^    ui\)' \
+  && bad_t "E2 no dispatch label" "main() still answers \`ui\` itself — a builtin always wins over a plugin verb" \
+  || ok_t "E2 ...and out of main()'s case table too (the two enumerations moved together)"
+[[ -e src/cmd_ui.sh ]] \
+  && bad_t "E3 the file is gone" "src/cmd_ui.sh is still in the tree" \
+  || ok_t "E3 src/cmd_ui.sh is deleted — one producer, in one repo"
+ushim=$("$BIN" ui 2>&1 >/dev/null); urc=0; "$BIN" ui >/dev/null 2>&1 || urc=$?
+[[ "$urc" != "0" ]] && printf '%s' "$ushim" | grep -q '5dive plugin add 5dive-ai/5dive-ui' \
+  && ok_t "E4 an un-migrated box gets the install line and a non-zero exit (rc=$urc), not \"unknown command\" alone" \
+  || bad_t "E4 the moved-verb notice" "rc=$urc, stderr: $(printf '%s' "$ushim" | tr '\n' ' ')"
+
+# The usage text is a cat <<USAGE heredoc, which SUBSTITUTES `cmd`. A backtick
+# around a verb name in there runs that verb on every --help — silently, and for
+# a MOVED verb it runs the shim, so the notice lands on the stderr of a person
+# who only asked for help. Cheap arm, whole class.
+helpout=$("$BIN" --help 2>"$TMP/help.err"); helperr=$(cat "$TMP/help.err")
+printf '%s' "$helpout" | grep -q '5dive plugin add 5dive-ai/5dive-ui' \
+  && ok_t "E5 --help tells you where the UI went" \
+  || bad_t "E5 --help names the plugin" "the install line is not in the usage text"
+[[ -z "$helperr" ]] \
+  && ok_t "E6 ...and --help writes NOTHING to stderr (no backticked verb ran inside the heredoc)" \
+  || bad_t "E6 --help is quiet on stderr" "got: $(printf '%s' "$helperr" | tr '\n' ' ')"
 
 echo "── F: the verb is reachable and refuses what it should ──"
 grep -qE '^\s+board\)' src/main.sh && ok_t "F1 registered in main.sh's dispatch" || bad_t "F1 registered"
@@ -213,9 +234,11 @@ mut "version-drift" 's|^FIVEDIVE_BOARD_CONTRACT_VERSION=1|FIVEDIVE_BOARD_CONTRAC
 # check becomes a store read — the exact property the refused view option lacked.
 mut "store-free-negotiation" '/--contract-version) printf/s|.*|      --contract-version) : ;;|' 'src/cmd_board.sh' \
     bash -c 'm=$(mktemp -d); STATE_DIR="$m/none" TASKS_DIR="$m/none/tasks" TASKS_DB="$m/none/tasks/tasks.db" "$MUTBIN" board --contract-version 2>/dev/null | grep -qE "^[0-9]+$"'
-# M3 — one producer. Give cmd_ui.sh its own copy back and arm E1 must red.
-mut "one-producer" '/^_ui_state_json() { _board_state_json/s|.*|_ui_state_json() { printf "{\\"ok\\":true,\\"data\\":{}}\\n"; }|' 'src/cmd_ui.sh' \
-    bash -c 'a=$("$MUTBIN" board --json 2>/dev/null | jq -S "del(.data.generated_at)"); b=$("$MUTBIN" ui --data 2>/dev/null | jq -S "del(.data.generated_at)"); [[ -n "$a" && "$a" == "$b" ]]'
+# M3 — the moved-verb notice. Drop `ui` from the fallthrough table: the verb is
+# still gone from core, still non-zero, and a human is told it never existed.
+# That is the silent-nothing outcome acceptance names, and arm E4 must red on it.
+mut "moved-verb-notice" '/^    ui) printf .5dive-ai\/5dive-ui/s|.*|    __never_a_verb__) return 1 ;;|' 'src/main.sh' \
+    bash -c 'out=$("$MUTBIN" ui 2>&1 >/dev/null); "$MUTBIN" ui >/dev/null 2>&1 && exit 1; printf "%s" "$out" | grep -q "5dive plugin add 5dive-ai/5dive-ui"'
 # M4 — the contract block inside the document. A consumer handed only the document
 # must be able to check the version without a second exec.
 # BOTH emit paths, and the property asserted on BOTH documents. The populated

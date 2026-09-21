@@ -215,8 +215,8 @@ Every attempt has a receipt. A run is one agent's one attempt at one task — wh
 `5dive watch`<br>
 Watch the whole team in real time.
 
-`5dive ui`<br>
-Open local browser views for the org chart, task queue, human gates, and signed trigger deliveries.
+`5dive plugin add 5dive-ai/5dive-ui`<br>
+Then `5dive ui` opens local browser views for the org chart, task queue, human gates, and signed trigger deliveries. The UI is a plugin with [its own repo](https://github.com/5dive-ai/5dive-ui).
 
 `5dive wall main olivia dev quinn ops --grid=3x2`<br>
 Those five seats' live terminals tiled on one screen, read-only; plain `5dive wall` tiles every running seat. `C-b w` makes one pane writable, `C-b d` detaches.
@@ -421,9 +421,10 @@ sudo 5dive plugin rollback browser@5dive-browser 1.1.0
 
 ### See the org layer: `5dive ui`
 
-The CLI serves its own web UI. No install, no build step, no account:
+The web UI is a plugin, in [its own repository](https://github.com/5dive-ai/5dive-ui). One install, no build step, no account:
 
 ```sh
+5dive plugin add 5dive-ai/5dive-ui
 5dive ui                 # http://127.0.0.1:8735
 ```
 
@@ -434,9 +435,9 @@ Four views over the box you are on:
 - **Gates** what is parked on a person, at which tier, with the asking agent's recommended answer.
 - **Triggers** configured GitHub/generic rules plus delivery outcomes and links from accepted deliveries to their tasks.
 
-It is read-only and binds to loopback (there is no sign-in, so `--host` refuses a routable address unless you set `FIVE_UI_ALLOW_REMOTE=1`). Anything that changes state has a CLI verb. `5dive ui --data` prints the same JSON the views render, so you can pipe it somewhere else.
+It is read-only and binds to loopback (there is no sign-in, so `--host` refuses a routable address unless you set `FIVE_UI_ALLOW_REMOTE=1`). Anything that changes state has a CLI verb. `5dive ui --data` prints the same JSON the views render, so you can pipe it somewhere else — and `5dive board --json`, a builtin, is where that JSON comes from: core owns the [board document](docs/board-contract.md), the plugin owns the presentation.
 
-Four views is a start, not a finish — [docs/contribute-ui.md](docs/contribute-ui.md) lists what is missing and where each screen's data would come from.
+Four views is a start, not a finish — the [5dive-ui repo](https://github.com/5dive-ai/5dive-ui) lists what is missing and where each screen's data would come from, and a change to a screen never needs this repo cloned.
 
 ### Command reference
 
@@ -463,7 +464,8 @@ sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<princip
 5dive heartbeat on / off / ls / tick     # wake agents that have queued work
 5dive org       set / tree               # who reports to whom
 5dive wall [--grid=CxR] [<seat>...]      # every agent's live TUI on one screen, read-only
-5dive ui                                 # local org/queue/gates/triggers views
+5dive board [--json]                     # this host's board as one versioned document
+5dive ui                                 # local org/queue/gates/triggers views (plugin: 5dive-ai/5dive-ui)
 
 5dive account   add / login / list / show / usage / rename / remove
 5dive auth      set / login / status     # lower-level; account is the human path
@@ -580,8 +582,8 @@ If you'd rather click than `ssh`, [5dive.ai](https://5dive.ai?utm_source=github&
 See [CONTRIBUTING.md](CONTRIBUTING.md). The `5dive` bundle at the repo root is built from `src/` via `./build.sh`; CI enforces no drift.
 
 Want a scoped first thing to build? The control plane on top of the runtime is early, and
-[docs/contribute-ui.md](docs/contribute-ui.md) is the honest map of what is missing from `5dive ui`,
-with the data source named for each one.
+[5dive-ai/5dive-ui](https://github.com/5dive-ai/5dive-ui) is the honest map of what is missing from
+`5dive ui`, with the data source named for each one — and it is one small repo, not this one.
 
 ## License
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# `5dive board` — THE READ CONTRACT. DIVE-4779 step 1.
+# `5dive board` — THE READ CONTRACT. DIVE-4779 step 1; the UI left in DIVE-4783.
 #
-# WHAT THIS IS AND WHY IT IS NOT IN cmd_ui.sh. The UI is leaving core to become a
-# standalone plugin (`5dive-ai/5dive-ui`), so that an outside developer can fork,
-# run and send a PR to the control plane WITHOUT cloning 121k lines of core. The
+# WHAT THIS IS AND WHY IT IS THE ONLY HALF OF THE UI STILL IN CORE. The UI is now
+# a standalone plugin (`5dive-ai/5dive-ui`), so that an outside developer can
+# fork, run and send a PR to the control plane WITHOUT cloning 121k lines of
+# core; `src/cmd_ui.sh` is deleted and this file is what it reads. The
 # blocker quinn named on DIVE-4618 is that the ported plugin does not read core
 # through a seam at all: it opens core's private sqlite store and issues five
 # queries naming `tasks`, `agents_org`, `event_triggers`, `event_deliveries` and

@@ -583,7 +583,6 @@ tests/trigger_ingress_e2e.sh	9553	13347
 tests/truncation_marker_guard_unit.sh	1472	2159
 tests/type_install_gate_dimension_unit.sh	324	268
 tests/type_map_registration_contract_unit.sh	59	77
-tests/ui_views_e2e.sh	9090	9292
 tests/unguarded_probe_substitution_unit.sh	6222	6255
 tests/update_check_propagation_unit.sh	525	575
 tests/usage_codex_rollouts_unit.sh	183	159

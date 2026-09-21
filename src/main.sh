@@ -350,10 +350,10 @@ Human accounts (who may CLEAR a gate — one identity, all transports):
   5dive human ls | show <id> | owner <agent> | recipient <ident> | rm <id>
   # With NO human accounts, gate delivery is unchanged. full surface: 5dive human --help
 
-Web UI for this host (org chart, queue, gates, triggers):
-  5dive ui [--port=8735] [--host=127.0.0.1]          # open the local views in a browser. Read-only, no sign-in.
-  5dive ui --data | --html                           # the JSON the views render / the page itself
-  # full surface: 5dive ui --help
+Web UI for this host (org chart, queue, gates, triggers) — now a PLUGIN:
+  5dive plugin add 5dive-ai/5dive-ui                 # install it once, then 5dive ui works as before
+  5dive board [--json]                               # the versioned document the views render (core owns this)
+  # the UI moved out of core so a contributor can fork it alone: github.com/5dive-ai/5dive-ui
 
 Heartbeat (wake an agent only when it has queued tasks, one per tick):
   5dive heartbeat on  <name> [--every=<dur>] [--fresh]      # enrol (default 30m, fresh off: no /clear between tasks)
@@ -909,6 +909,46 @@ _account_verb_dispatch() {
       esac
 }
 
+# ---------------------------------------------------------------------------
+# MOVED VERBS — a deprecation shim that lives in the FALLTHROUGH, never in the
+# dispatch table (DIVE-4618/DIVE-4783).
+#
+# WHY IT CANNOT BE A CASE LABEL, which is the shape this was first specified as.
+# A verb name in core is a `case` label in main(), and three enumerations are
+# chained to it: FIVEDIVE_BUILTIN_VERBS (src/cmd_plugin.sh), which
+# tests/plugin_verb_dispatch_unit.sh T5 asserts is SET-EQUAL to those labels, and
+# _plugin_verb_is_builtin, which REFUSES to install any plugin declaring a name
+# in that string — correctly, because a plugin verb is only ever reached after
+# the builtin table, so a shadowed one could never run. A shim that keeps the
+# name is a builtin. The shim and the plugin would be the same name in the same
+# table, and the table holds one: keeping the "kindness" would have made
+# `5dive plugin add 5dive-ai/5dive-ui` rc=3 on every box, forever.
+#
+# Here instead, the name is released completely — out of the case table and out
+# of FIVEDIVE_BUILTIN_VERBS together, so T5 stays green and the plugin's verb
+# claim resolves. A box that HAS installed the plugin never reaches this code at
+# all (_plugin_dispatch_verb execs first). A box that has not gets the install
+# line instead of `unknown command`. Retiring a shim is deleting one entry.
+#
+# Full reasoning: community/wiki/a-deprecation-shim-that-keeps-the-verb-name-blocks-the-plugin-that-replaces-it.md
+_moved_verb_repo() {
+  case "$1" in
+    ui) printf '5dive-ai/5dive-ui\n' ;;
+    *)  return 1 ;;
+  esac
+}
+
+# Printed on the way to `unknown command`, never instead of it: the exit stays
+# non-zero and the classifier keeps reading E_USAGE, because from a script's
+# point of view this box genuinely does not answer that verb. What changes is
+# that a human is told WHERE it went rather than being told it never existed.
+_moved_verb_notice() {
+  local repo; repo="$(_moved_verb_repo "$1")" || return 0
+  printf "note: '%s' moved out of the core CLI and is now a plugin.\n      Install it once, and '5dive %s' works exactly as before:\n\n        5dive plugin add %s\n\n" \
+    "$1" "$1" "$repo" >&2
+  return 0
+}
+
 main() {
   # DIVE-2249: mark that this process entered through the real CLI entrypoint.
   # The tasks-store fence (src/lib/tasks_db.sh) allows writes to the PRODUCTION
@@ -1251,11 +1291,6 @@ main() {
       # `--contract-version` answers without touching the store at all, so it is
       # the negotiation a plugin runs before it decides whether it can run here.
       cmd_board "$@" ;;
-    ui)
-      # DIVE-2655/DIVE-3931: the free single-host UI (org/queue/gates/triggers).
-      # Reads the same group-writable store as tasks + org; GET/HEAD only, no
-      # root, no lock, no write path. Loopback bind unless the caller opts out.
-      cmd_ui "$@" ;;
     project|projects)
       # Project namespaces for the task queue (DIVE-484). Same group-writable
       # store as tasks; read/write, no root/lock.
@@ -1491,6 +1526,7 @@ main() {
       # fail(), which exits on its own, and every other non-zero (no jq, no
       # store, unreadable json) is meant to fall through to "unknown command".
       if ! _plugin_dispatch_verb "$top" "$@"; then
+        _moved_verb_notice "$top"
         fail "$E_USAGE" "unknown command: $top"
       fi ;;
   esac
