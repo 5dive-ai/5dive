@@ -813,6 +813,22 @@ CREATE TABLE IF NOT EXISTS tasks (
   need_asked_at       TEXT,
   gate_pinged_at      TEXT,
   gate_filed_by       TEXT,
+  -- DIVE-4817: gate_prev_status = the row's status at the moment THIS gate was
+  -- filed, so retiring the gate can put the row back where it was instead of
+  -- asserting 'todo'. Filing writes status='blocked' unconditionally; before
+  -- this column nothing anywhere recorded what that overwrote, so every clear
+  -- path (withdraw, tier-0, push-for-review, precedent, track-record, a typed
+  -- answer) restored 'todo' — dropping an in_progress row out from under a maker
+  -- who was still working, with started_at still set and the heartbeat's
+  -- "busy — N in_progress" guard no longer counting it (lodar, DIVE-4811).
+  -- Stamped only when the pre-gate status is NOT already 'blocked', so a re-file
+  -- on top of an open gate keeps the ORIGINAL pre-gate status rather than
+  -- recording 'blocked' and laundering it into a 'todo' restore. NULL on every
+  -- legacy row and on every row whose gate predates this build — readers
+  -- COALESCE back to 'todo', which is exactly the pre-DIVE-4817 behaviour, so
+  -- the backfill is a no-op. Keep byte-identical to the copy in
+  -- _tasks_db_migrate.
+  gate_prev_status    TEXT,
   wake_at             TEXT,
   -- DIVE-931 secure credential drop: a --type=secret gate can name WHERE the
   -- value should land — secret_key is the env-var name, connector the
@@ -1948,6 +1964,12 @@ _TASKS_ADDITIVE_COLUMNS=(
   'reap_escalated_at TEXT' 'reap_escalated_n INTEGER'
   'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'
   'gate_filed_by TEXT'
+  # DIVE-4817: the pre-gate status, so a gate clear restores it instead of
+  # asserting 'todo'. Nullable — NULL is "this build never recorded it", which is
+  # every pre-existing row and every gate filed before this column existed;
+  # _gate_restore_status_sql COALESCEs it back to 'todo', so the backfill is a
+  # no-op. See the CREATE TABLE comment.
+  'gate_prev_status TEXT'
   'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT'
   'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT'
   'needs_capability TEXT'
@@ -3638,6 +3660,50 @@ _gate_archive_and_clear_sql() {
     "   SET need_answer=NULL, need_answered_at=NULL, need_answered_by=NULL," \
     "       need_answered_uid=NULL, need_answer_sig=NULL, human_nonce_hash=NULL" \
     " WHERE (${pred});"
+}
+
+# DIVE-4817: retire a gate's hold on the row's STATUS. Emits the one UPDATE that
+# every gate-clear path used to inline as `SET status='todo'`.
+#
+# Why a helper and not six inlined copies: there are six of them (withdraw, the
+# tier-0 / push-for-review / precedent / track-record auto-clears, and the typed
+# `task answer`), they were byte-identical, and being byte-identical is precisely
+# how they all shipped the same defect. Filing asserts status='blocked' over
+# whatever the row held; restoring asserted 'todo' back over it. An in_progress
+# row that filed an inert gate mid-work — which every `5dive push` does — came
+# out `todo` with started_at still set and its maker still typing, and the
+# heartbeat's in_progress busy guard stopped counting it (lodar, on DIVE-4811).
+#
+# The restore is a WHITELIST, not a copy-back: only 'todo' and 'in_progress' are
+# restorable states for a gate clear. Anything else — a NULL from a legacy row, a
+# stale 'blocked' from a park, and above all 'done'/'cancelled' — falls back to
+# 'todo', so retiring a gate can never resurrect a closed row. NULL therefore
+# reproduces the pre-DIVE-4817 behaviour exactly, which is what makes this safe
+# to land on a live store with no backfill.
+#
+# The WHERE is unchanged from the six copies and is load-bearing twice over:
+# status='blocked' means a row that is NOT blocked is never touched, and the
+# task_deps check means a gate clear does not unblock a row still waiting on
+# another task (`status='blocked'` is overloaded — human gate AND task-task block
+# edges). When it does not fire, gate_prev_status is deliberately LEFT STANDING:
+# the row is still blocked on a dep, and the status it must eventually return to
+# is still the one recorded at filing.
+#
+# `UPDATE tasks SET` is kept on ONE line on purpose: the static enumerators that
+# grade these writes (tests/task_answer_closed_row_unit.sh arm G) flatten the SQL
+# and match that exact prefix, so wrapping it after `UPDATE tasks` would make this
+# write invisible to the fence checker instead of fenced by it.
+#
+# Usage: db "... $(_gate_restore_status_sql "${id}")"
+_gate_restore_status_sql() {
+  local id="$1"
+  # printf, not a heredoc — same reason as _gate_archive_and_clear_sql above.
+  printf '%s\n' \
+    "UPDATE tasks SET status=CASE WHEN gate_prev_status IN ('todo','in_progress')" \
+    "                             THEN gate_prev_status ELSE 'todo' END," \
+    "                 gate_prev_status=NULL" \
+    "  WHERE id=${id} AND status='blocked'" \
+    "    AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
 }
 
 # Constant-time compare: full-length scan, no early exit. Length isn't secret (the

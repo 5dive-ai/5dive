@@ -1862,9 +1862,11 @@ cmd_task_answer() {
     # flip to todo only if no block edges remain — same edge-check `unblock` does
     # — else stay blocked (still waiting on another task). Answered-ness lives in
     # need_answered_at, so the task already left the inbox regardless of status.
-    db "UPDATE tasks SET status='todo'
-        WHERE id=${id} AND status='blocked'
-          AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+    # DIVE-4817: ...and RECOMPUTE means recompute, not assert. The status the
+    # row held when the gate was filed is on the row (gate_prev_status), so a
+    # human's answer returns an in_progress row to its maker instead of dropping
+    # it back into the queue as unclaimed work an hour later.
+    db "$(_gate_restore_status_sql "${id}")"
   fi
 
   # DIVE-4537: the cap escalation was just answered — EXECUTE the disposition.
