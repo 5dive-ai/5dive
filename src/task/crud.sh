@@ -393,7 +393,11 @@ cmd_task_add() {
   local auto_coordinated=0
   if [[ -z "$assignee" && "$kind" == "standard" ]]; then
     assignee="$proj_lead"
-    [[ -z "$assignee" ]] && assignee=$(_task_resolve_coordinator)
+    # DIVE-4823: resolved in the FILER's own team (org root + subtree). On a
+    # single-root chart subtree() is the whole chart, so this is byte-identical
+    # to the board-wide answer; on a multi-root board it is the difference
+    # between an owner and the silent no-owner of DIVE-4555.
+    [[ -z "$assignee" ]] && assignee=$(_task_resolve_coordinator "$(task_actor "$from")")
     [[ -n "$assignee" ]] && auto_coordinated=1
   fi
   # DIVE-4555: A ROW NOBODY WILL EVER DISPATCH IS ACCEPTED SILENTLY — the two

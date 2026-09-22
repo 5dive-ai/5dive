@@ -151,8 +151,24 @@ cmd_org_set() {
   if declare -F _task_resolve_coordinator >/dev/null 2>&1; then
     local _coord=""; _coord=$(_task_resolve_coordinator 2>/dev/null) || _coord=""
     if [[ -z "$_coord" ]]; then
-      local _roots; _roots=$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);")
-      warn "this chart still resolves NO coordinator (${_roots} top-level agent(s), none tagged) — an unassigned row has no default owner, and nothing wakes a row with no owner. 'task add' with no --assignee now refuses on this board rather than accepting work nothing will dispatch. Tag one: 5dive org set <agent> --role='<existing role text> coordinator'   (the marker lives inside the role prose, so it costs the chart no display text)"
+      # DIVE-4823 — THE MULTI-ROOT ARM IS NOW INFORMATIONAL, and the rewrite is
+      # the point: with per-root resolution a second root is the FEATURE (a team
+      # is a root plus its subtree), so a row filed BY an on-chart agent now
+      # resolves inside that agent's own team and the old text — "an unassigned
+      # row has no default owner" — would be a false alarm on exactly the chart
+      # this change fixes. What is still true, and all that is still warned, is
+      # the residue: a row with no on-chart filer has no team to resolve in.
+      # NAME THE ROOTS. An operator reading "9 top-level agents" cannot act on
+      # it; reading the nine names, they can see at a glance which ones are teams
+      # they meant and which are an agent nobody re-parented.
+      local _roots _rootn
+      _rootn=$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);")
+      _roots=$(db "SELECT GROUP_CONCAT(name, ', ') FROM (SELECT name FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org) ORDER BY name);")
+      if [[ "${_rootn:-0}" -gt 1 ]] 2>/dev/null; then
+        warn "this chart has ${_rootn} top-level agents — ${_roots} — so it is ${_rootn} TEAMS, and no single agent is the board-wide coordinator. That is supported: a row filed by an agent on this chart resolves the coordinator inside that agent's OWN team (its root, or a tagged agent under it). What still has no owner is a row filed by nobody on the chart. If these were meant to be one org, re-parent the extras: 5dive org set <agent> --manager=<agent>   To name a coordinator inside a team: 5dive org set <agent> --role='<existing role text> coordinator'   (the marker lives inside the role prose, so it costs the chart no display text)"
+      else
+        warn "this chart still resolves NO coordinator (${_rootn:-0} top-level agent(s), none tagged) — an unassigned row has no default owner, and nothing wakes a row with no owner. 'task add' with no --assignee now refuses on this board rather than accepting work nothing will dispatch. Tag one: 5dive org set <agent> --role='<existing role text> coordinator'   (the marker lives inside the role prose, so it costs the chart no display text)"
+      fi
     fi
   fi
 

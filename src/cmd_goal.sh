@@ -505,7 +505,7 @@ cmd_goal_add() {
   if [[ -z "$planner" && -n "$project" ]]; then
     planner=$(db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key=$(sqlq "${project,,}") AND status='active';")
   fi
-  [[ -n "$planner" ]] || planner=$(_task_resolve_coordinator)
+  [[ -n "$planner" ]] || planner=$(_task_resolve_coordinator "$(task_actor "$from")")   # DIVE-4823: the filer's team
   [[ -n "$planner" ]] || fail "$E_VALIDATION" "no --planner given and no project lead / org coordinator to fall back to"
 
   if [[ -n "$wait_flag" ]]; then

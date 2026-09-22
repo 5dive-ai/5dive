@@ -709,7 +709,9 @@ _objective_preflight() {
   PREFLIGHT_REASON="" PREFLIGHT_DETAIL="" PREFLIGHT_PLANNER=""
   local planner budget spent orgn
   planner=$(db "SELECT COALESCE(planner,'') FROM objectives WHERE id=$obj_id;")
-  [[ -n "$planner" ]] || planner=$(_task_resolve_coordinator)
+  # DIVE-4823: the objective's own creator is the subject — an objective filed
+  # inside one team plans inside that team.
+  [[ -n "$planner" ]] || planner=$(_task_resolve_coordinator "$(db "SELECT COALESCE(created_by,'') FROM objectives WHERE id=$obj_id;")")
   orgn=$(db "SELECT COUNT(*) FROM agents_org;")
 
   # over-budget: checkable with no org — a spent-out objective can't drive at all.
@@ -1203,7 +1205,7 @@ cmd_objective_replan() {
       return
     fi
 
-    [[ -n "$planner" ]] || planner=$(_task_resolve_coordinator)
+    [[ -n "$planner" ]] || planner=$(_task_resolve_coordinator "$(db "SELECT COALESCE(created_by,'') FROM objectives WHERE id=$obj_id;")")   # DIVE-4823
     [[ -n "$planner" ]] || fail "$E_VALIDATION" "no --planner, objective planner, or org coordinator to plan with"
     local contract; contract=$(_objective_build_contract "$oname" "$obj_id" "$cur" "$prev" "$trend" "$o_target" "$o_dir" "$o_unit" "$max_new")
     step "objective '$oname' cycle ${cycle_no}: invoking planner '$planner' (ceiling ${ceiling}tok)…"

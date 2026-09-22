@@ -114,12 +114,45 @@ t2_asg=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE title='routed to the 
 if (( t2_rc == 0 )) && [[ "$t2_asg" == "boss" ]]; then
   ok_t "T2a an ownerless row routes to the filer's manager instead of being refused"
 else bad_t "T2a did not route to the manager" "rc=$t2_rc assignee='$t2_asg' err=$t2_err"; fi
-if has "$t2_err" "manager 'boss'" ; then
-  ok_t "T2b the route is announced, not silent"
-else bad_t "T2b the route was silent" "$t2_err"; fi
-if has "$t2_out" "manager of filer: boss"; then
-  ok_t "T2c the created line names WHY it landed there"
-else bad_t "T2c created line does not name the route" "$t2_out"; fi
+# T2b/T2c UPDATED BY DIVE-4823, and the fixture is deliberately NOT touched —
+# only what the arms expect it to print. This chart has TWO roots (boss and
+# sleeper), which is exactly the shape per-root routing changes: `filer` now
+# resolves a coordinator inside its OWN team (root boss, nothing tagged under
+# it, so boss) and the row lands on boss through the ordinary coordinator path.
+# It used to fall past that path entirely — all three board-wide tiers missed on
+# a two-root chart — and get caught by DIVE-4555's manager RESCUE, which is the
+# thing the old text announced.
+#
+# The owner is the same agent either way (T2a is untouched and still green); the
+# ROUTE is what moved, so the announcement moved with it. The rescue's own
+# announcement is not dropped from the corpus — T2e below grades it on the
+# shape where it is still the operative path.
+if has "$t2_out" "coordinator: boss"; then
+  ok_t "T2b the route is announced on the created line, not silent"
+else bad_t "T2b the route was silent" "out=$t2_out err=$t2_err"; fi
+if [[ "$t2_asg" == "boss" ]] && ! has "$t2_err" "no default owner"; then
+  ok_t "T2c a two-root chart ROUTES rather than warning about having no owner"
+else bad_t "T2c a routed row still drew the ownerless warning" "asg=$t2_asg err=$t2_err"; fi
+
+# T2e — DIVE-4823 REGRESSION FENCE FOR DIVE-4555. Per-root resolution narrows the
+# manager rescue (most charts now resolve a coordinator before reaching it) but it
+# does NOT retire it, and a narrowed control that quietly stops firing altogether
+# is the failure mode worth a dedicated arm. The shape that still reaches it: a
+# filer inside a reports_to CYCLE. No member of a cycle is a root, so the subject
+# has no root, so the ladder falls through to the board-wide one, which on a
+# two-root chart resolves nothing — and the rescue picks the filer's manager and
+# says so, exactly as it did before this row.
+chart_reset
+db "INSERT INTO agents_org (name,role) VALUES ('boss','AI CEO'),('sleeper','QA / testing');
+    INSERT INTO agents_org (name,reports_to) VALUES ('ring_a','ring_b'),('ring_b','ring_a');"
+# NOT run_add: that helper pins --from=filer, and this arm needs a different
+# principal.
+( cmd_task_add --from=ring_a -- 'cycle-bound filer still rescued' ) >"$TMP/t2e.out" 2>"$TMP/t2e.err"
+t2e_out=$(<"$TMP/t2e.out"); t2e_err=$(<"$TMP/t2e.err")
+t2e_asg=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE title='cycle-bound filer still rescued';")
+if [[ "$t2e_asg" == "ring_b" ]] && has "$t2e_out" "manager of ring_a: ring_b"; then
+  ok_t "T2e the DIVE-4555 manager rescue is still live where it is still the operative path"
+else bad_t "T2e the manager rescue stopped firing" "asg=$t2e_asg out=$t2e_out err=$t2e_err"; fi
 
 # ---------------------------------------------------------------------------
 # T7 — THE MATERIALIZED EXEMPTION (ops review finding on the delivery).
@@ -236,9 +269,19 @@ require_root() { :; }
 ( cmd_org_set boss --role='AI CEO' ) >"$TMP/t6a.out" 2>"$TMP/t6a.err"
 ( cmd_org_set sleeper --role='QA / testing' ) >"$TMP/t6b.out" 2>"$TMP/t6b.err"
 t6b_err=$(<"$TMP/t6b.err")
-if has "$t6b_err" "resolves NO coordinator"; then
-  ok_t "T6a a chart left with no resolvable coordinator says so at the moment it is built"
-else bad_t "T6a org set was silent about an unroutable chart" "$t6b_err"; fi
+# T6a UPDATED BY DIVE-4823. The old text — "this chart still resolves NO
+# coordinator … an unassigned row has no default owner" — is no longer TRUE on
+# this chart: two top-level agents is two TEAMS now, and a row filed by anyone
+# on the chart resolves inside their own. Asserting the old sentence would be
+# asserting a false alarm. What is still warned, and what this arm now grades,
+# is the residue plus the row's own ask: NAME THE ROOTS, so an operator reading
+# it can see which ones they meant.
+if has "$t6b_err" "2 TEAMS" && has "$t6b_err" "boss, sleeper"; then
+  ok_t "T6a a multi-root chart is NAMED at the moment it is built (roots listed, not counted)"
+else bad_t "T6a org set was silent, or did not name the roots" "$t6b_err"; fi
+if ! has "$t6b_err" "has no default owner"; then
+  ok_t "T6a2 and it no longer claims routing is broken — per-root resolution fixed that"
+else bad_t "T6a2 the stale unroutable claim survived the rewrite" "$t6b_err"; fi
 ( cmd_org_set boss --role='AI CEO — fleet coordinator' ) >"$TMP/t6c.out" 2>"$TMP/t6c.err"
 t6c_err=$(<"$TMP/t6c.err")
 if ! has "$t6c_err" "resolves NO coordinator"; then
