@@ -2357,6 +2357,43 @@ seed_inherited_memory() {
   fi
 }
 
+# DIVE-4698 — the two reads/writes `--human=` needs, kept local and TOLERANT.
+#
+# Not `_human_transport_id` / `cmd_human_link` directly: the first is fine but the
+# second is a VERB — it calls require_root and fails the process, which would turn
+# a bookkeeping miss into a failed agent creation after the agent is already up.
+# These carry the same SQL and the same one-agent-one-owner rule, and report by
+# exit status so the caller can decide (it warns, it does not fail).
+_create_human_telegram_id() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || return 0
+  declare -F tasks_db_init >/dev/null 2>&1 || return 0
+  tasks_db_init >/dev/null 2>&1 || return 0
+  db "SELECT COALESCE(telegram_id,'') FROM humans WHERE id=$(sqlq "$id") LIMIT 1;" 2>/dev/null || true
+}
+
+# Subshell + explicit status, for _pair_record_human's reason: `db`/`tasks_db_init`
+# exit on failure, and this call happens AFTER the agent is running — a hard exit
+# here would report a working agent as a failed create.
+_create_human_link() {
+  ( _create_human_link_do "$@" )
+}
+
+_create_human_link_do() {
+  local id="${1:-}" agent="${2:-}"
+  [[ -n "$id" && -n "$agent" ]] || return 1
+  declare -F tasks_db_init >/dev/null 2>&1 || return 1
+  tasks_db_init >/dev/null 2>&1 || return 1
+  local exists; exists=$(db "SELECT 1 FROM humans WHERE id=$(sqlq "$id");" 2>/dev/null) || return 1
+  [[ -n "$exists" ]] || return 1
+  # Replace, never accumulate — `human link`'s rule: two owners on one agent is
+  # the arbitrary-recipient defect the registry exists to end.
+  db "DELETE FROM human_agents WHERE agent=$(sqlq "$agent");
+      INSERT OR IGNORE INTO human_agents (human_id, agent) VALUES ($(sqlq "$id"), $(sqlq "$agent"));" 2>/dev/null || return 1
+  audit_log "human link" ok 0 -- "human=$id" "agent=$agent" "source=create" 2>/dev/null || true
+  return 0
+}
+
 cmd_create() {
   local name="" type="" channels="none" channels_explicit=0 telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
@@ -2371,6 +2408,7 @@ cmd_create() {
   local can_push=0            # DIVE-1462/STEER-4: delegated-push (builder) capability
   local can_deploy=0          # INST-5: delegated-deploy (production ship) capability
   local inherit_memory=""     # DIVE-990 memory-as-onboarding
+  local human_id=""           # DIVE-4698: quick-pair to a person this box already knows
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --type=*)                    type="${1#--type=}" ;;
@@ -2398,6 +2436,7 @@ cmd_create() {
       --defer-auth)                defer_auth=1 ;;
       --isolation=*)               isolation="${1#--isolation=}"; isolation_explicit=1 ;;
       --inherit-memory=*)          inherit_memory="${1#--inherit-memory=}" ;;
+      --human=*)                   human_id="${1#--human=}" ;;
       --can-push)                  can_push=1 ;;
       --can-deploy)                can_deploy=1 ;;
       -*)                          fail "$E_USAGE" "unknown flag: $1" ;;
@@ -2405,7 +2444,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -2842,6 +2881,29 @@ cmd_create() {
       telegram_allowed_users=$(_operator_ids)
       [[ -n "$telegram_allowed_users" ]] \
         && step "Auto-pairing '$name' to known operator(s): $telegram_allowed_users"
+    fi
+    # DIVE-4698 — `--human=<id>`: NAME the person this agent belongs to, and
+    # pre-allow them on its bot so there is no code to exchange. The box-wide
+    # operator allowlist above already gives no-code pairing, but anonymously —
+    # every new bot inherits every id ever seen. This is the explicit form: one
+    # named person, recorded on the agent, and it is ADDITIVE to whatever the
+    # allowlist resolved to (never a narrowing, so an existing operator does not
+    # lose a bot because somebody named a colleague).
+    #
+    # NOT A GRANT BEYOND THIS BOT. The id only reaches this agent's own
+    # access.json allowFrom, exactly as a pairing would write it, which is why
+    # this is safe to do from a create call: the person still has to open the bot
+    # and press Start before Telegram will let it speak (a bot may never DM
+    # first), so `--human=` removes the CODE, not the tap.
+    if [[ -n "$human_id" ]]; then
+      local _hu_tg=""
+      _hu_tg=$(_create_human_telegram_id "$human_id")
+      [[ -n "$_hu_tg" ]] \
+        || fail "$E_NOT_FOUND" "no person '$human_id' with a telegram id on this box — list them with '5dive human ls', or add one: sudo 5dive human add $human_id --telegram=<chat id>"
+      if [[ ",${telegram_allowed_users}," != *",${_hu_tg},"* ]]; then
+        telegram_allowed_users="${telegram_allowed_users:+${telegram_allowed_users},}${_hu_tg}"
+      fi
+      step "Pre-pairing '$name' to $human_id (telegram $_hu_tg) — no code needed; they open the bot and press Start."
     fi
     if [[ -n "$telegram_allowed_users" ]]; then
       valid_telegram_chat_id_list "$telegram_allowed_users" \
@@ -3520,9 +3582,21 @@ cmd_create() {
     for _hc_i in "${_hc_issues[@]}"; do warn "  - $_hc_i"; done
     (( ${#_hc_ok[@]} > 0 )) && warn "  (ok: ${_hc_ok[*]})"
   fi
+  # DIVE-4698: the link lands AFTER the agent exists, so a failed create leaves
+  # no dangling ownership row. Best-effort like every other post-create record:
+  # the agent is up, and a missing link is repairable with one command, while a
+  # failure here would report a working agent as broken.
+  if [[ -n "$human_id" ]]; then
+    if _create_human_link "$human_id" "$name"; then
+      step "$human_id owns ${name}'s gates (5dive human show $human_id)"
+    else
+      warn "could not link '$human_id' to '$name' — the agent is fine; link it with: sudo 5dive human link $human_id --agent=$name"
+    fi
+  fi
   ok "agent '$name' (type=$type, channels=$channels${profile:+, profile=$profile}) is running." \
-     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, skills:{installed:$inst, failed:$fail}, teamBot:$tb, channelWarmRestart:$wr}' \
+     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, human:(($hu|select(length>0)) // null), skills:{installed:$inst, failed:$fail}, teamBot:$tb, channelWarmRestart:$wr}' \
      --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$effective_workdir" --arg p "${profile:-}" \
+     --arg hu "${human_id:-}" \
      --arg wr "$warm_restart" \
      --argjson ap "$auto_paired" \
      --argjson inst "$installed_skills_json" --argjson fail "$failed_skills_json" --arg tb "$team_bot_status"
