@@ -750,10 +750,32 @@ _hb_effective_fresh() {
 #   * live background shells — the previous turn's own work is still producing
 #     output the session is waiting on (DIVE-4298 reads this pane state as
 #     "the turn is over", which is true for DISPATCH and false for /clear);
-#   * an unacked delivery this seat holds AS ITS VERIFIER — the verdict's
-#     hand-back is still owed by the session we are about to wipe. Same
-#     predicate the reclaimer's awaiting_verifier column uses, so the two
-#     cannot disagree about what an open handoff is.
+#   * a VERDICT THIS SEAT HAS RECORDED AND NOT YET HANDED BACK — the grade
+#     happened, the `task done`/`task reject` that carries it has not, and that
+#     hand-back is the thing living only in the session we are about to wipe.
+#
+# DIVE-4814 — THE SECOND SIGNAL IS THE HAND-BACK, NOT THE QUEUE. Iteration 1
+# asked for "any delivery this seat holds as verifier that is still unacked",
+# which is every row waiting IN the grading queue. On a grading seat with a
+# queue that count is >0 on essentially every tick, so the downgrade fired on
+# every wake and the seat was never /clear'ed at all: 60 of the 66 downgrades in
+# /var/log/5dive-heartbeat.log between 2026-09-21T04:23Z and 2026-09-22T02:27Z
+# were quinn's, and quinn's grading session ran 1051 turns to a 930k context and
+# 503M quota tokens in one sitting (09-21: 907M for the day against 488M the day
+# before, with FEWER sessions). A delivery merely SITTING in the queue is not in
+# the session and loses nothing to a /clear — the row carries it. Only a verdict
+# that has been stamped on the row but not yet handed back is state the /clear
+# can strand, and that is exactly the 2026-09-20 17:33Z incident this guard was
+# built for.
+#
+# `handoff_ack_at` is deliberately NOT in this predicate, and its absence is the
+# point rather than an omission: `task start` acks, so keying on "unacked" both
+# admits the whole queue (nothing here has been started yet) and would MISS a
+# verifier who did start the row before grading it. The verdict is the signal.
+#
+# Bound to THIS iteration, like every other grade predicate in this file: a
+# verdict older than the delivery in front of it graded a different iteration
+# and confers nothing.
 #
 # `_HB_IDLE_BG_SHELLS` is set by the idle probe on this tick; empty or unset
 # means "no shells, or not probed" and is treated as no signal.
@@ -763,18 +785,75 @@ _hb_fresh_downgrade_reason() {
     printf '%s background shell(s) from the previous turn are still running' "$_HB_IDLE_BG_SHELLS"
     return 0
   fi
+  # NAME THE ROWS IT PROTECTS. A count made the 60-downgrade run unauditable —
+  # every line said "3 delivered row(s)" and no line said which, so the log
+  # could not be read back row by row against the store.
   local owed
-  owed=$(db "SELECT COUNT(*) FROM tasks
-              WHERE assignee=$(sqlq "$name") AND verifier=$(sqlq "$name")
-                AND status<>'done' AND status<>'cancelled'
-                AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
-                AND (handoff_rejected_at IS NULL
-                     OR handoff_rejected_at < handoff_delivered_at);" 2>/dev/null || echo 0)
-  [[ "${owed:-0}" =~ ^[0-9]+$ ]] || owed=0
-  if (( owed > 0 )); then
-    printf '%s delivered row(s) this seat holds as verifier are still unacked' "$owed"
+  owed=$(db "SELECT group_concat(i, ', ') FROM (
+               SELECT COALESCE(NULLIF(ident,''), 'id:' || id) AS i
+                 FROM tasks
+                WHERE assignee=$(sqlq "$name") AND verifier=$(sqlq "$name")
+                  AND status<>'done' AND status<>'cancelled'
+                  AND handoff_delivered_at IS NOT NULL
+                  AND (handoff_rejected_at IS NULL
+                       OR handoff_rejected_at < handoff_delivered_at)
+                  AND graded_verdict IS NOT NULL AND TRIM(graded_verdict)<>''
+                  AND graded_verdict_at IS NOT NULL
+                  AND graded_verdict_at >= handoff_delivered_at
+                ORDER BY graded_verdict_at DESC LIMIT 3);" 2>/dev/null) || owed=""
+  if [[ -n "$owed" ]]; then
+    printf 'this seat has recorded a verdict on %s and has not handed it back yet' "$owed"
     return 0
   fi
+  return 0
+}
+
+# DIVE-4814 — AND IT MAY NOT HOLD THE SAME SEAT WARM TWICE RUNNING.
+#
+# Both signals above are read from state that OUTLIVES a turn: a background
+# shell can poll for an hour, and a PASS on a bound row stays graded-and-unhanded
+# until a human merges it. So "the reason still holds" is not evidence the
+# SESSION still holds anything — after one warm dispatch the seat has had a full
+# turn with that state in front of it. A guard that can fire forever is how a
+# protection for one 2026-09-20 incident turned into a seat that never resets.
+#
+# The bound is therefore counted in WAKES, not minutes, and it is a hard ceiling
+# rather than a heuristic: a seat gives up at most every OTHER /clear, whatever
+# the store says. The latch is one flag file per seat, written only here, and
+# read only on a wake that was going to be fresh — a warm tick never touches it.
+#
+# Fail-open by construction: an unwritable STATE_DIR loses the latch, which
+# degrades to iteration 1's behaviour (always protect) rather than to a wipe.
+# TWO OUT-PARAMETERS, NOT A PRINTED STRING, and that is forced rather than
+# stylistic: this call has to report BOTH "keep it warm, because X" and "it
+# stays fresh even though X", and the second one is not a reason the caller can
+# print from a captured stdout. A `why="$(_hb_fresh_downgrade_decide …)"` call
+# site runs the function in a SUBSHELL, so anything it assigns dies with that
+# subshell and the suppression branch would be unreachable code that still
+# reads green (the latch, being a file, would keep working — which is what makes
+# this shape dangerous rather than merely broken). Call it BARE and read the
+# globals. Arm D4 in tests/heartbeat_claim_outlives_verdict_unit.sh holds this.
+_HB_FRESH_DOWNGRADE_WHY=""
+_HB_FRESH_DOWNGRADE_SUPPRESSED=""
+_hb_fresh_downgrade_decide() {
+  local name="$1"
+  _HB_FRESH_DOWNGRADE_WHY=""
+  _HB_FRESH_DOWNGRADE_SUPPRESSED=""
+  local why; why="$(_hb_fresh_downgrade_reason "$name")"
+  local latch="${STATE_DIR:-/var/lib/5dive}/fresh-downgrade.${name}.held"
+  if [[ -z "$why" ]]; then
+    rm -f "$latch" 2>/dev/null || true
+    return 0
+  fi
+  if [[ -f "$latch" ]]; then
+    # Second fresh wake in a row wanting the same mercy. Clear the latch (so the
+    # next one may protect again) and let the /clear through.
+    rm -f "$latch" 2>/dev/null || true
+    _HB_FRESH_DOWNGRADE_SUPPRESSED="$why"
+    return 0
+  fi
+  : > "$latch" 2>/dev/null || true
+  _HB_FRESH_DOWNGRADE_WHY="$why"
   return 0
 }
 
@@ -8764,10 +8843,13 @@ cmd_heartbeat_tick() {
     # A seat with neither signal is unaffected and clears exactly as before.
     if [[ "$eff_fresh" == "true" ]]; then
       local _warm_why
-      _warm_why="$(_hb_fresh_downgrade_reason "$name")"
+      _hb_fresh_downgrade_decide "$name"
+      _warm_why="${_HB_FRESH_DOWNGRADE_WHY:-}"
       if [[ -n "$_warm_why" ]]; then
         eff_fresh="false"
         _hb_log "[$name] fresh wake DOWNGRADED to warm for ${task_ident} — ${_warm_why}; a /clear here destroys work in flight (DIVE-4724)"
+      elif [[ -n "${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}" ]]; then
+        _hb_log "[$name] fresh wake KEPT fresh for ${task_ident} although ${_HB_FRESH_DOWNGRADE_SUPPRESSED} — this seat was already held warm on its previous fresh wake, and a guard that never lets go is how a grading seat stops resetting (DIVE-4814)"
       fi
     fi
 
