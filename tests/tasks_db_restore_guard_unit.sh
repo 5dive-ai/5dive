@@ -335,6 +335,29 @@ out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
 # harness while this branch scored 55/1 with got==want, so the count was the ONLY
 # thing failing and the four columns are the whole delta.
 #
+# 113 -> 114 (DIVE-4817, 2026-09-22): +gate_prev_status, the row's status at the
+# moment a gate was FILED, so retiring the gate restores it instead of asserting
+# 'todo' and dropping an in_progress row out from under the maker still working on
+# it. READ off a fresh tasks_db_init on THIS tree the way this file instructs
+# (`bad` patched at line 41 to print its detail AND the literal held at 113, one run,
+# `count=114` with rc=0 and got==want, both patches reverted); NOT derived as
+# 113 + 1. Control done first, as the DIVE-3483 entry instructs: a same-seat
+# detached worktree at bare origin/main 9e224524 scored 56/0 on this harness while
+# this branch scored 55/1 with got==want, so the count was the ONLY thing failing
+# and the one column is the whole delta. The read was reproduced on the pushed tree
+# itself (base 13661c22, one commit behind that control) because the branch is
+# stacked on the delivered sha rather than rebased -- DIVE-4698 landed in between
+# and adds no `tasks` column, which is why both bases read 113 without it.
+#
+# AND THIS ENTRY IS THE DIVE-4778 ENTRY'S LESSON COLLECTED A THIRD TIME, by the
+# delivery below it rather than by CI: the column was added to BOTH the CREATE TABLE
+# and `_TASKS_ADDITIVE_COLUMNS`, the branch's own migration arm graded the additive
+# half on a pre-existing store, and this harness was still missed -- because the
+# maker ran `scripts/changed-harnesses.sh`, which selects the harnesses a diff
+# EDITED, and a schema change does not edit the guard whose whole job is to notice
+# one. A column-adding diff owes this harness a run even when nothing it touched is
+# named in it, and no changed-file selector will ever say so.
+#
 # AND THIS IS THE ENTRY'S OWN LESSON, paid for once more: the literal was missed on
 # the first delivery of this branch and CI caught it (`core-pristine (2)`), because
 # the four columns were added to BOTH the CREATE TABLE and `_TASKS_ADDITIVE_COLUMNS`
@@ -366,8 +389,8 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "113" ]] \
-  && ok "fresh schema: all 113 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "114" ]] \
+  && ok "fresh schema: all 114 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------
