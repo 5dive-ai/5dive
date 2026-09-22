@@ -431,6 +431,54 @@ _task_grade_tree_assert() {  # <id> <ident> <tree> [quiet]
   (( quiet )) || printf 'GRADE-TREE-OK: %s (HEAD=%s, clean, seal=%s)\n' "$tree" "$want" "$now"
 }
 
+# ── DIVE-4803 — THE GRADING TREE IS THE GRADER'S, SO ITS BOOKKEEPING MUST BE TOO ──
+#
+# `git worktree add` writes the tree's admin record into the SOURCE repository
+# (`<git-dir>/worktrees/<name>`), so the grading tree only looked private: its
+# state lived in the maker's checkout. Makers normally deliver from their own
+# home and graders normally run as a different unix user, so on any
+# maker != verifier pair the packet could not be built at all — measured
+# 2026-09-21 grading DIVE-4802 (maker main, verifier quinn):
+#
+#   fatal: could not create leading directories of
+#     '/home/agent-main/wt/cli-hotfix-ingress/.git/worktrees/DIVE-4802-33cb7c71c40f': Permission denied
+#
+# and the grader fell back to cloning the repo by hand — which is precisely the
+# full re-derivation the bounded packet exists to avoid. It read as rare only
+# because a row delivered from a SHARED checkout (group-writable) still worked,
+# so the lane that failed was the one nobody graded.
+#
+# THE MATERIALIZATION IS READ-ONLY ON THE MAKER'S REPO: an empty repository in
+# the grader's own state dir, its object store BORROWED through `objects/info/
+# alternates`, then a detached checkout of the delivered sha. Nothing is written
+# outside `$root`, so the only permission required is the one a grader already
+# has — read.
+#
+# IT IS NOT A WEAKER TREE THAN THE WORKTREE IT REPLACES. A `git worktree` shares
+# the source object store too, so the coupling to the maker's repo is unchanged;
+# what changes is who owns the bookkeeping. The tree is still detached at the
+# delivered sha, still sealed by `_task_grade_tree_digest`, and still asserted by
+# `_task_grade_tree_assert` before any verdict.
+#
+# ONE PATH, ALWAYS TAKEN — not a fallback behind a writability probe. A lane that
+# only some deliveries reach is exactly what hid this: the grade-time cost of the
+# two shapes is the same, and a second shape would owe a second arm forever. It
+# also stops leaving a `git worktree` registration behind in a repo whose owner
+# never asked for one; nothing prunes those, and this host never does.
+#
+# `core.hooksPath=/dev/null` because `git checkout` runs `post-checkout`: the new
+# repo has no hooks of its own, but an ambient `init.templateDir` could install
+# some, and a grade must not execute code it did not read.
+_task_grade_materialize_tree() {  # <repo-git-dir> <sha> <tree>
+  local repo="$1" sha="$2" tree="$3" alt
+  git init -q "$tree" >/dev/null 2>&1 || return 1
+  alt="${tree}/.git/objects/info/alternates"
+  mkdir -p "${alt%/*}" 2>/dev/null || return 1
+  printf '%s\n' "${repo}/objects" >"$alt" 2>/dev/null || return 1
+  git -C "$tree" -c core.hooksPath=/dev/null checkout -q --detach "$sha" >/dev/null 2>&1 || return 1
+  return 0
+}
+
 # `task grade-context` is the grader's only entry point. It intentionally never
 # selects tasks.body, routing history, or a maker transcript.
 cmd_task_grade_context() {
@@ -467,9 +515,11 @@ cmd_task_grade_context() {
   tree_q=$(printf '%q' "$tree")
   seal="${root}/.${ident}-${sha}.seal"
   if [[ ! -d "$tree" ]]; then
-    git --git-dir="$repo" worktree prune >/dev/null 2>&1 || true
-    git --git-dir="$repo" worktree add --detach -q "$tree" "$sha" \
-      || fail "$E_GENERIC" "$ident could not create detached grading worktree at $sha"
+    # A half-built tree is removed rather than left for the next invocation to
+    # find: the `-d "$tree"` test above is the only reuse gate, so a directory
+    # that exists but never got its checkout would be graded as if it had.
+    _task_grade_materialize_tree "$repo" "$sha" "$tree" \
+      || { rm -rf "$tree"; fail "$E_GENERIC" "$ident could not create detached grading tree at $sha from $repo (DIVE-4803)"; }
     chmod -R go-w "$tree" 2>/dev/null || true
     digest=$(_task_grade_tree_digest "$tree") || fail "$E_GENERIC" "$ident could not seal grading worktree"
     printf '%s' "$digest" >"$seal"; chmod 600 "$seal" 2>/dev/null || true

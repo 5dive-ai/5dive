@@ -144,14 +144,15 @@ echo "── E: THE NAME IS RELEASED — ui left core, and the shim is a FALLTHR
 grep -q ' ui ' <(grep -E '^readonly FIVEDIVE_BUILTIN_VERBS=' src/cmd_plugin.sh) \
   && bad_t "E1 the name is released" "\`ui\` is back in FIVEDIVE_BUILTIN_VERBS — _plugin_verb_is_builtin will refuse the plugin's own verb claim" \
   || ok_t "E1 \`ui\` is gone from FIVEDIVE_BUILTIN_VERBS, so the plugin's verb claim resolves"
-awk 'f&&/^}$/{exit} /^main\(\) \{$/{f=1} f' src/main.sh | grep -qE '^    ui\)' \
+_mainfn=$(awk 'f&&/^}$/{exit} /^main\(\) \{$/{f=1} f' src/main.sh)
+grep -qE '^    ui\)' <<<"$_mainfn" \
   && bad_t "E2 no dispatch label" "main() still answers \`ui\` itself — a builtin always wins over a plugin verb" \
   || ok_t "E2 ...and out of main()'s case table too (the two enumerations moved together)"
 [[ -e src/cmd_ui.sh ]] \
   && bad_t "E3 the file is gone" "src/cmd_ui.sh is still in the tree" \
   || ok_t "E3 src/cmd_ui.sh is deleted — one producer, in one repo"
 ushim=$("$BIN" ui 2>&1 >/dev/null); urc=0; "$BIN" ui >/dev/null 2>&1 || urc=$?
-[[ "$urc" != "0" ]] && printf '%s' "$ushim" | grep -q '5dive plugin add 5dive-ai/5dive-ui' \
+[[ "$urc" != "0" ]] && grep -q '5dive plugin add 5dive-ai/5dive-ui' <<<"$ushim" \
   && ok_t "E4 an un-migrated box gets the install line and a non-zero exit (rc=$urc), not \"unknown command\" alone" \
   || bad_t "E4 the moved-verb notice" "rc=$urc, stderr: $(printf '%s' "$ushim" | tr '\n' ' ')"
 
@@ -160,12 +161,56 @@ ushim=$("$BIN" ui 2>&1 >/dev/null); urc=0; "$BIN" ui >/dev/null 2>&1 || urc=$?
 # a MOVED verb it runs the shim, so the notice lands on the stderr of a person
 # who only asked for help. Cheap arm, whole class.
 helpout=$("$BIN" --help 2>"$TMP/help.err"); helperr=$(cat "$TMP/help.err")
-printf '%s' "$helpout" | grep -q '5dive plugin add 5dive-ai/5dive-ui' \
+grep -q '5dive plugin add 5dive-ai/5dive-ui' <<<"$helpout" \
   && ok_t "E5 --help tells you where the UI went" \
   || bad_t "E5 --help names the plugin" "the install line is not in the usage text"
 [[ -z "$helperr" ]] \
   && ok_t "E6 ...and --help writes NOTHING to stderr (no backticked verb ran inside the heredoc)" \
   || bad_t "E6 --help is quiet on stderr" "got: $(printf '%s' "$helperr" | tr '\n' ' ')"
+
+# E7 (DIVE-4806) — THE ASSERTION MUST NOT BE ABLE TO FAIL ON A TRUE PROPERTY.
+# E5 red `test-installed-host` on main at 0b7b154f while the merge_group run at
+# the SAME sha was green, and the install line it looks for was in the usage text
+# the whole time (src/main.sh). Under `set -o pipefail` (line 23) a pipeline
+# reports the RIGHTMOST non-zero status; `grep -q` exits the moment it matches
+# and closes the read end; the writer's NEXT write takes SIGPIPE/EPIPE (141) —
+# and a MATCHING grep is scored as a miss. It is a race, so it fails one run in
+# many and never the one you re-run. A herestring has no writer process at all,
+# so there is nothing to kill.
+#
+# ITERATION 2 (quinn's finding, 2026-09-22). The first version of this arm
+# matched `printf[^|]*| grep -q` — the WRITER that happened to be in front of me,   # EPIPE-SELF
+# not the hazard. Four lines below it, F6 was `"$BIN" board -h | grep -q          # EPIPE-SELF
+# 'contract-version'` and the detector returned ZERO matches on it while quinn
+# measured that pipeline failing 13 of 60 runs at the sha the first fix shipped.
+# The detector now matches the INGREDIENT — any `| grep -q` — because the          # EPIPE-SELF
+# ingredients are pipefail, a reader that can exit early, and a writer with a
+# write still to come. Nothing about `printf` is one of them.
+#
+# AND THE EXEMPTION LIST IS EMPTY, DELIBERATELY. The obvious scope statement is
+# "exempt the sites whose payload is drained before the reader exits" — a
+# dozen lines of awk, a one-line `--contract-version`. I could not sign it.
+# Measured on this box at this head: `5dive board -h` emits 838 bytes and the
+# process makes 258 separate write(2) calls; the byte count is not the
+# ingredient and a shell writer's write COUNT is not something a reader of this
+# file can check. An exemption I cannot state a test for is not a scope
+# statement, it is the same blind spot in prose. So every site is converted
+# instead — E2's awk, E4/E5's help text, F6's `board -h`, and both mutation
+# arms' `--contract-version` — and this arm asserts ZERO, which is the only
+# scope that needs no argument. A future site is fixed, not exempted.
+#
+# The detector's own two lines are tagged EPIPE-SELF and excluded, so neither the
+# pattern nor its positive control can be counted as a site.
+_epipe_pat='\| *grep -q'                                         # EPIPE-SELF
+_epipe_sample='"$BIN" board -h 2>/dev/null | grep -q PAT'        # EPIPE-SELF
+grep -qE "$_epipe_pat" <<<"$_epipe_sample" \
+  && ok_t "E7 control: the detector does fire on the shape it is looking for" \
+  || bad_t "E7 control" "the detector matches nothing — the arm below would pass vacuously"
+_epipe_body=$(grep -v 'EPIPE-SELF' "$0")
+_epipe_hits=$(grep -cE "$_epipe_pat" <<<"$_epipe_body")
+[[ "$_epipe_hits" == "0" ]] \
+  && ok_t "E7 no assertion in this harness pipes anything into \`grep -q\` (0 sites, 0 exemptions)" \
+  || bad_t "E7 EPIPE-prone assertion" "$_epipe_hits site(s) pipe into \`grep -q\` — under pipefail a matching grep can score as a miss. Convert it to \`grep -q PAT <<<\"\$var\"\`; this arm has no exemption list on purpose"
 
 echo "── F: the verb is reachable and refuses what it should ──"
 grep -qE '^\s+board\)' src/main.sh && ok_t "F1 registered in main.sh's dispatch" || bad_t "F1 registered"
@@ -178,7 +223,8 @@ grep -q ' board ' <(grep -E '^readonly FIVEDIVE_BUILTIN_VERBS=' src/cmd_plugin.s
   || ok_t "F4 a positional argument is refused"
 "$BIN" board --json >/dev/null 2>&1 && ok_t "F5 --json is accepted as a no-op (habit must not be a usage error)" \
   || bad_t "F5 --json accepted"
-"$BIN" board -h 2>/dev/null | grep -q 'contract-version' \
+_bh=$("$BIN" board -h 2>/dev/null)
+grep -q 'contract-version' <<<"$_bh" \
   && ok_t "F6 --help names the negotiation flag" || bad_t "F6 help names it"
 
 echo "── M: MUTATION ARMS — revert each divergence, assert the property reds ──"
@@ -233,12 +279,12 @@ mut "version-drift" 's|^FIVEDIVE_BOARD_CONTRACT_VERSION=1|FIVEDIVE_BOARD_CONTRAC
 # and it stops answering on a box with no store, so the consumer's only pre-flight
 # check becomes a store read — the exact property the refused view option lacked.
 mut "store-free-negotiation" '/--contract-version) printf/s|.*|      --contract-version) : ;;|' 'src/cmd_board.sh' \
-    bash -c 'm=$(mktemp -d); STATE_DIR="$m/none" TASKS_DIR="$m/none/tasks" TASKS_DB="$m/none/tasks/tasks.db" "$MUTBIN" board --contract-version 2>/dev/null | grep -qE "^[0-9]+$"'
+    bash -c 'm=$(mktemp -d); v=$(STATE_DIR="$m/none" TASKS_DIR="$m/none/tasks" TASKS_DB="$m/none/tasks/tasks.db" "$MUTBIN" board --contract-version 2>/dev/null); grep -qE "^[0-9]+$" <<<"$v"'
 # M3 — the moved-verb notice. Drop `ui` from the fallthrough table: the verb is
 # still gone from core, still non-zero, and a human is told it never existed.
 # That is the silent-nothing outcome acceptance names, and arm E4 must red on it.
 mut "moved-verb-notice" '/^    ui) printf .5dive-ai\/5dive-ui/s|.*|    __never_a_verb__) return 1 ;;|' 'src/main.sh' \
-    bash -c 'out=$("$MUTBIN" ui 2>&1 >/dev/null); "$MUTBIN" ui >/dev/null 2>&1 && exit 1; printf "%s" "$out" | grep -q "5dive plugin add 5dive-ai/5dive-ui"'
+    bash -c 'out=$("$MUTBIN" ui 2>&1 >/dev/null); "$MUTBIN" ui >/dev/null 2>&1 && exit 1; grep -q "5dive plugin add 5dive-ai/5dive-ui" <<<"$out"'
 # M4 — the contract block inside the document. A consumer handed only the document
 # must be able to check the version without a second exec.
 # BOTH emit paths, and the property asserted on BOTH documents. The populated
@@ -253,7 +299,7 @@ MUT_LINES=2 mut "contract-in-document" 's|contract: {name: \$cn, version: \$cv},
 # M5 — the bundle actually carries the file. Drop cmd_board.sh from build.sh's
 # list: the source is perfect and the verb does not exist on a box.
 mut "in-the-bundle" '\|^  src/cmd_board.sh$|d' 'build.sh' \
-    bash -c '"$MUTBIN" board --contract-version 2>/dev/null | grep -qE "^[0-9]+$"'
+    bash -c 'v=$("$MUTBIN" board --contract-version 2>/dev/null); grep -qE "^[0-9]+$" <<<"$v"'
 # The tree must be byte-identical to how it started, or a later arm (or a commit)
 # carries a mutation. Asserted, not assumed.
 BUILD_OUT="$TMP/5dive-restored" ./build.sh >/dev/null 2>&1 \
