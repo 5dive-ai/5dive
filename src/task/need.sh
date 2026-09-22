@@ -2479,9 +2479,7 @@ cmd_task_need() {
               floor_provenance=NULL,
               need_asked_at=NULL, gate_pinged_at=NULL, gate_filed_by=NULL
         WHERE id=${id};
-        UPDATE tasks SET status='todo'
-          WHERE id=${id} AND status='blocked'
-            AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});
+        $(_gate_restore_status_sql "${id}")
         COMMIT;"
     # DIVE-2054: DELIBERATELY UNFENCED. Carries asserted_from=, the identity-assertion
     # audit trail red-teamed on DIVE-1401 — a fixture store must never be able to
@@ -4039,6 +4037,18 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
         -- already cover -- this only stops a NEW collision, never touches an
         -- existing one (no retro-grading, same as the rest of DIVE-3097).
         SET status='blocked',
+            -- DIVE-4817: record what this filing is about to overwrite, BEFORE
+            -- it overwrites it (same statement, so the CASE still sees the old
+            -- value). Every clear path then restores this instead of asserting
+            -- 'todo'. Fenced on status<>'blocked' so a RE-FILE on top of an open
+            -- gate keeps the original pre-gate status: without the fence the
+            -- second filing would record 'blocked', the whitelist in
+            -- _gate_restore_status_sql would reject it, and the row would land
+            -- back on 'todo' — the exact defect, reintroduced through the one
+            -- path (withdraw-and-refile) most likely to be used on a row a maker
+            -- is actively working.
+            gate_prev_status=CASE WHEN status='blocked' THEN gate_prev_status
+                                  ELSE status END,
             assignee=CASE
               WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL
                    AND assignee=verifier AND handoff_delivered_at IS NOT NULL
@@ -4139,9 +4149,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
     local _ts0; _ts0=$(date -u '+%Y-%m-%d %H:%M:%S')
     db "UPDATE tasks SET need_answer=$(sqlq "$recommend"), need_answered_at=$(sqlq "$_ts0"),
           need_answered_by='auto:t0' WHERE id=${id};
-        UPDATE tasks SET status='todo'
-          WHERE id=${id} AND status='blocked'
-            AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+        $(_gate_restore_status_sql "${id}")"
     # DIVE-4537 (iteration 2): AN AUTO-APPLIED ANSWER OWES THE SAME WORK A TYPED
     # ONE DOES. The iteration-cap stop is the one gate whose answer IS a verb, and
     # every auto-clear here writes need_answer directly and returns — so without
@@ -4267,9 +4275,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
         db "UPDATE tasks SET need_answer=$(sqlq "$recommend_arg"), need_answered_at=$(sqlq "$_pfr_ts"),
               need_answered_by='auto:pfr', need_answered_uid=0, need_answer_sig=$(sqlq "$_pfr_sig")
             WHERE id=${id};
-            UPDATE tasks SET status='todo'
-              WHERE id=${id} AND status='blocked'
-                AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+            $(_gate_restore_status_sql "${id}")"
         # DIVE-2054: an auto-clear applied from task-store data — fenced on store
         # identity, same primitive as the tier-0 and TTL auto-clears.
         _task_store_audit_log "task need pfr-auto" "ok" 0 -- \
@@ -4401,9 +4407,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
             db "UPDATE tasks SET need_answer=$(sqlq "$_qans"), need_answered_at=$(sqlq "$_tsp"),
                   need_answered_by='auto:precedent', precedent_ref=${_qid}, precedent_kind='exact'
                 WHERE id=${id};
-                UPDATE tasks SET status='todo'
-                  WHERE id=${id} AND status='blocked'
-                    AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+                $(_gate_restore_status_sql "${id}")"
             # DIVE-4537 (iteration 2) — see the same line at the tier-0 clear above.
             local _pr_esc=""
             if declare -F _task_escalation_auto_apply >/dev/null 2>&1; then
@@ -4485,9 +4489,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
       db "UPDATE tasks SET need_answer=$(sqlq "$recommend_arg"), need_answered_at=$(sqlq "$_tr_ts"),
             need_answered_by='auto:record', need_answered_uid=0
           WHERE id=${id};
-          UPDATE tasks SET status='todo'
-            WHERE id=${id} AND status='blocked'
-              AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+          $(_gate_restore_status_sql "${id}")"
       # DIVE-4537 (iteration 2) — THE PATH THIS DEFECT WAS MEASURED ON. Every seat
       # that files an iteration-cap stop is promoted on this host (quinn 93%, dev
       # 94%, ops 100%), the escalation carries a --recommend, and `track_record`

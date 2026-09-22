@@ -245,8 +245,25 @@ as dev2 cmd_task_answer "$f" --value="Approve →" >/dev/null; rcf=$?
 # being the next person to touch the function.
 _answer_fn() {   # the function body, comments stripped so prose can neither
                  # mask a real violation nor invent a phantom one
+  #
+  # DIVE-4817: the gate-clear write moved OUT of this function and into
+  # `_gate_restore_status_sql` (lib/tasks_db.sh), shared with the five clear
+  # paths in task/need.sh. A status write behind a helper is still a status
+  # write against the answered row, so it is EXPANDED here rather than dropped
+  # — the alternative was lowering the non-vacuity threshold, which would have
+  # silently retired one of the four writes this arm exists to fence. The
+  # expansion calls the REAL function (sourced above) with the literal string
+  # `${id}`, so what gets graded is the SQL that actually ships, not a re-typed
+  # copy of it that could drift.
   cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | awk '/^cmd_task_answer\(\) \{$/{on=1} on{print} on&&/^\}$/{exit}' \
-    | grep -v '^[[:space:]]*#'
+    | grep -v '^[[:space:]]*#' \
+    | while IFS= read -r _l; do
+        if [[ "$_l" == *'$(_gate_restore_status_sql'* ]]; then
+          _gate_restore_status_sql '${id}'
+        else
+          printf '%s\n' "$_l"
+        fi
+      done
 }
 _status_writes() {   # stdin -> one flattened SQL statement per line
   tr '\n' ' ' | sed 's/;/;\n/g' | grep 'UPDATE tasks SET' | grep "status='"
