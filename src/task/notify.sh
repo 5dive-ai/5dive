@@ -2869,6 +2869,14 @@ _task_need_notify_deliver_now() {
   # (quinn's iteration-1 grade caught this path still emitting the full ask).
   # The full ask stays one tap away behind /task_<id>.
   _task_gate_text_both $'\n\n'"$(_task_gate_ask_line "$ask") /task_${numid}"
+  # DIVE-4833 — SAY THE DEADLINE IN THE MESSAGE. An expiring action whose message
+  # does not mention the expiry is a trap: the reader has no way to know the
+  # button has a clock on it, and finds out only by tapping a dead one. The line
+  # is only emitted when a deadline exists, so every gate filed without one reads
+  # exactly as it did before.
+  local _gexp; _gexp=$(db "SELECT COALESCE(need_expires_at,'') FROM tasks WHERE id=${numid};" 2>/dev/null || printf '')
+  [[ -n "$_gexp" ]] \
+    && _task_gate_text_both $'\n'"⏳ Expires ${_gexp}Z — after that this is resolved as NOT approved and tapping does nothing (DIVE-4833)."
 
   # DIVE-4381: the bound PR, right under the ask and above the type CTA — the
   # human reads "what am I deciding", then "here is the thing to look at", then

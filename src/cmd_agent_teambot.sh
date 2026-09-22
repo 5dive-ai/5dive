@@ -770,8 +770,23 @@ const TNA_RE = /^tna:(\d+):([^:]+)(?::([0-9a-f]{32}))?$/
 function resolveTnaAnswer(task: any, token: string): any {
   if (!task || !task.need_type) return { kind: 'nogate' }
   if (task.need_answered_at) {
+    // DIVE-4833: an offer the clock resolved reads DIFFERENTLY from one a person
+    // answered, because the two are different facts and the tapper needs to know
+    // which they are looking at. `auto:timeout` is the stamp _gate_expire_due
+    // writes; a person who taps afterwards must not be told "already answered:
+    // timeout" as though someone had decided, and must not be left thinking their
+    // tap authorised anything.
+    if (task.need_answered_by === 'auto:timeout') return { kind: 'expired' }
     const prior = task.need_type === 'secret' ? '(provided)' : (task.need_answer ?? '—')
     return { kind: 'already', prior }
+  }
+  // The deadline has passed but nothing has resolved it yet — the sweep runs on
+  // the tick, and a tap can land between the two. Refuse here rather than letting
+  // the CLI refuse below: the CLI is the enforcement point and does audit the
+  // stale response, but a round trip we already know the answer to is a worse
+  // experience and the ack text would be the CLI's error string.
+  if (task.need_expires_at && Date.parse(String(task.need_expires_at).replace(' ', 'T') + 'Z') <= Date.now()) {
+    return { kind: 'expired' }
   }
   if (task.need_type === 'decision') {
     const opts = String(task.need_options ?? '').split('|').map((s: string) => s.trim()).filter(Boolean)
@@ -828,6 +843,14 @@ async function handleCallback(cq: any): Promise<void> {
   }
   if (r.kind === 'already') {
     await ackCallback(cbId, `Already answered: ${r.prior}`)
+    return
+  }
+  if (r.kind === 'expired') {
+    // DIVE-4833. Said in full rather than as "expired": the button is still in the
+    // chat because Telegram never removes one, so the person tapping has every
+    // reason to think it should work, and the thing they most need to know is that
+    // NOTHING was authorised.
+    await ackCallback(cbId, 'This approval expired — nothing was authorised. Ask for a fresh one.')
     return
   }
   if (r.kind === 'invalid') {

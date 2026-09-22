@@ -200,7 +200,7 @@ require_sqlite() {
 # block, and a store stamped '3932-1' has never seen the triggers block, so
 # either literal skips one population's migration entirely. A THIRD value that
 # no store carries is the only resolution that re-migrates both.
-_TASKS_SCHEMA_EPOCH='4589-1'  # DIVE-4589: +account_binding_events/account_usage_samples (on top of 3932-2)
+_TASKS_SCHEMA_EPOCH='4833-1'  # DIVE-4833: +tasks.need_expires_at (on top of 4589-1)
 
 # DIVE-3931: Event -> Task ingress lives in the task store because ingress ends
 # at the queue. One SQL emitter serves fresh stores and migrations so the two
@@ -591,6 +591,20 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- as TEXT because Telegram ids are opaque identifiers, not arithmetic.
   need_answered_relay   TEXT,
   need_answered_tap_uid TEXT,
+  -- DIVE-4833: THE APPROVAL ACTION EXPIRES. A gate offered to a human is an
+  -- OFFER, and an offer with no deadline is answerable forever — which is not a
+  -- theoretical worry here: `cmd_task_answer`'s own DIVE-2228 note records that
+  -- "Telegram inline buttons on already-delivered messages never expire", so a
+  -- button sitting in someone's chat history from weeks ago still lands a live
+  -- answer today. For a `decision` that is merely untidy; for an `approval` it
+  -- means a risky action can be authorised by a tap on a question nobody
+  -- remembers being asked.
+  --
+  -- NULL means no deadline, which is every gate filed before this column and
+  -- every gate that does not ask for one — so the migration is a no-op and the
+  -- default behaviour is unchanged. A non-NULL value is a hard boundary read by
+  -- ONE predicate (`_GATE_EXPIRED_SQL`) that every surface goes through.
+  need_expires_at       TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -2018,6 +2032,9 @@ _TASKS_ADDITIVE_COLUMNS=(
   # DIVE-3128: the tapping human vs the relaying bot, separated. See the CREATE
   # TABLE comment above for why folding them into one string was the defect.
   'need_answered_relay TEXT' 'need_answered_tap_uid TEXT'
+  # DIVE-4833: the approval action's deadline. NULL = no deadline, so this add is
+  # a no-op for every existing gate. See the CREATE TABLE comment.
+  'need_expires_at TEXT'
   # DIVE-3098: a verifier grade recorded by `task verify --no-done`. Structural on
   # purpose — the terminal-for-verifier predicate must not key on result TEXT,
   # which the MAKER's `task deliver --result=` also writes.
@@ -2148,6 +2165,38 @@ _TASKS_MERGE_DECLINED_SQL="merge_declined_at IS NOT NULL
        AND merge_declined_ref IS NOT NULL
        AND delivery_ref IS NOT NULL
        AND merge_declined_ref = delivery_ref"
+
+# ── DIVE-4833 — AN APPROVAL ACTION EXPIRES, AND ONE PREDICATE SAYS WHEN ──────
+#
+# THE DEFECT THIS CLOSES, in the product's own words. `cmd_task_answer`'s
+# DIVE-2228 note records that "Telegram inline buttons on already-delivered
+# messages never expire" — a button sitting in a chat from three weeks ago still
+# lands a live answer today, and the CLI had no way to tell that tap from one
+# made in response to the question. For a `decision` that is untidy. For an
+# `approval` it means a risky action gets authorised by a tap on a question
+# nobody remembers being asked, with full provenance recorded for it.
+#
+# SO THE OFFER CARRIES A DEADLINE, and this is the only place that reads it. Two
+# surfaces answer gates — the Telegram listener (cmd_agent_teambot.sh) and the
+# dashboard (needs-you.tsx) — and BOTH reach the store through `task answer`, so
+# enforcing here covers both by construction rather than by two guards that have
+# to be kept in step. The surfaces render the deadline; they never decide it.
+#
+# NULL EXPIRY IS NOT EXPIRED. Every gate filed before this column has NULL, and a
+# predicate that treated NULL as "past" would retro-expire the entire board on
+# upgrade. The clause is written so the NULL case short-circuits first.
+_GATE_EXPIRED_SQL="need_type IS NOT NULL
+       AND need_answered_at IS NULL
+       AND need_expires_at IS NOT NULL
+       AND need_expires_at <= datetime('now')"
+
+# `_GATE_LIVE_SQL` — the complement, for the surfaces that ask "may this still be
+# answered?". Deliberately NOT written as NOT(_GATE_EXPIRED_SQL): that would also
+# be true for a row with no gate at all, and a renderer asking this question wants
+# "there is an offer and it is still open".
+_GATE_LIVE_SQL="need_type IS NOT NULL
+       AND need_answered_at IS NULL
+       AND (need_expires_at IS NULL OR need_expires_at > datetime('now'))"
 
 _TASKS_TFV_SQL="graded_at IS NOT NULL
        AND delivery_ref IS NOT NULL AND TRIM(delivery_ref) <> ''
