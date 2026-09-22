@@ -769,6 +769,130 @@ _compose_apply_type_override() {
 # Names of the agents _compose_apply_type_override would strip a Claude-only
 # model/effort pin from, comma-joined. Reported to the user: a silently dropped
 # pin is the same class of defect as a silently kept one.
+# -------- DIVE-4822: the roster's NAMESPACE ---------------------------------
+#
+# `compose up` checks the registry per declared agent and, when the name already
+# exists, takes the "already exists -- ensuring started" branch and `continue`s --
+# which skips the WHOLE provisioning block, including the `org set` edge. Two of
+# the three shipped templates root at `ceo`, so `team import eng-studio` followed
+# by `team import startup` produced ONE org tree: the second template's root IS
+# the first's, never re-parented, with the second roster hanging off it. It failed
+# silently, and "two teams on one box" -- the model DIVE-4700 is built on -- was
+# not reachable at all.
+#
+# The fix is a namespace: rename the whole declared roster to `<prefix>-<name>`
+# before anything is provisioned, so the second import lands its own root. The
+# refusal below is what happens when a namespace cannot resolve the clash.
+
+# The template's root: the declared agent with no `reports_to`. DERIVED, not
+# declared -- templates carry per-agent reports_to and nothing names a lead, so
+# this needs no YAML change and no schema change. Prints nothing when the spec
+# has zero roots or more than one (both are "this template does not have a single
+# root", and guessing which of two is the lead is exactly the kind of confident
+# wrong answer that put this row on the board).
+_compose_spec_root() {
+  local roots; roots=$(jq -r '
+    .agents | to_entries[]
+    | select((.value.reports_to // null)
+             | if type=="array" then length == 0 else (. == null or . == "") end)
+    | .key' <<<"$1" 2>/dev/null)
+  [[ "$(printf '%s\n' "$roots" | grep -c .)" == "1" ]] || return 1
+  printf '%s' "$roots"
+}
+
+# Rename every declared agent to `<prefix>-<name>` and rewrite the reports_to
+# edges that point INSIDE the roster. An edge naming an agent this spec does not
+# declare is left alone -- `_compose_parse` already refuses those (it validates
+# every reports_to target resolves to a declared agent), so the guard is belt and
+# braces for a caller that hands us an unvalidated spec.
+#
+# `.agents` keys and `reports_to` are the ONLY places a spec names an agent
+# (checked at origin/main 2026-09-22: `goals`/`loops`/`pack`/`skills` carry no
+# agent names, and _compose_wire_role derives --from from reports_to). If a
+# future key names one, it must be added here or the rename splits the roster.
+_compose_apply_name_prefix() {
+  local spec="$1" p="$2"
+  [[ -n "$p" ]] || { printf '%s' "$spec"; return 0; }
+  jq -c --arg p "$p" '
+    (.agents | keys) as $decl
+    | def rn: if (. as $m | $decl | index($m)) then ($p + "-" + .) else . end;
+      .agents |= with_entries(
+        .value.reports_to = (
+          .value.reports_to
+          | if . == null then null
+            elif type == "array" then map(rn)
+            else rn end))
+    | .agents |= with_entries(.key |= ($p + "-" + .))
+  ' <<<"$spec"
+}
+
+# The longest prefix that keeps every declared name a legal agent name.
+#
+# THIS IS THE CONSTRAINT THE ROW'S SKETCH DID NOT ACCOUNT FOR. `valid_name` caps
+# an agent at 16 characters, so "default the prefix to the template slug" is not
+# implementable for most rosters: `content-studio-editor` is 21 characters and
+# `compose up` would warn-and-skip the whole team. Measured over the six shipped
+# and fixture templates, the full slug overflows for 26 of 35 declared agents.
+#
+# So the budget is computed from the roster: 16 - 1 (the dash) - the longest name
+# that is legal TODAY. Names that are already illegal (eng-studio ships
+# `eng_manager`, `release_manager`, `doc_engineer` -- underscores, which
+# valid_name has never accepted) are excluded from the budget on purpose: they are
+# skipped by `up` with or without a prefix, so letting them shrink the namespace
+# would punish every other agent for a defect in one template. Prints 0 when no
+# prefix can fit, which is the caller's signal to refuse rather than to truncate.
+_compose_prefix_budget() {
+  local longest
+  longest=$(jq -r '[ .agents | keys[] | select(test("^[a-z][a-z0-9-]{0,15}$")) | length ]
+                   | max // 0' <<<"$1" 2>/dev/null) || longest=0
+  [[ "$longest" =~ ^[0-9]+$ ]] || longest=0
+  local budget=$(( 16 - 1 - longest ))
+  (( budget < 0 )) && budget=0
+  printf '%s' "$budget"
+}
+
+# The default namespace for a slug: its letters and digits, truncated to whatever
+# the roster's budget allows. Deterministic in (slug, roster), which is what makes
+# a re-import idempotent -- the same template resolves to the same prefix, so the
+# second run adopts the roster it created rather than provisioning a third copy.
+# Empty when nothing fits.
+_compose_default_prefix() {
+  local slug="$1" spec="$2" budget base
+  budget=$(_compose_prefix_budget "$spec")
+  (( budget > 0 )) || { printf ''; return 0; }
+  # A unix user name must START WITH A LETTER, so the leading digits of a slug
+  # like `5dive-team` are dropped rather than carried into `5diveteam-vesper`,
+  # which valid_name refuses for a reason that has nothing to do with length.
+  base=$(printf '%s' "$slug" | tr -cd 'a-z0-9')
+  while [[ -n "$base" && "${base:0:1}" =~ [0-9] ]]; do base="${base:1}"; done
+  printf '%s' "${base:0:budget}"
+}
+
+# The declared names a prefix would push past valid_name's 16-character cap,
+# comma-joined. Empty means the prefix fits.
+#
+# A separate function, and not three lines inline at the call site, because
+# `cmd_compose_up` gates on root before it reaches them — so inlined, the one
+# refusal that stops a TRUNCATED name (which is a different agent) being
+# provisioned could only be graded by a harness running as root, and would not
+# have been. Names that are already illegal are excluded for the same reason
+# _compose_prefix_budget excludes them: a prefix does not make them worse.
+_compose_prefix_overflow() {
+  jq -r --arg p "$2" '
+    [ .agents | keys[]
+      | select(test("^[a-z][a-z0-9-]{0,15}$"))
+      | select((($p + "-" + .) | test("^[a-z][a-z0-9-]{0,15}$")) | not) ] | join(", ")
+    ' <<<"$1" 2>/dev/null
+}
+
+# Declared names that are already on the box, newline-separated. The caller reads
+# this against the PRE-run registry: an agent this run is about to create is not a
+# collision with itself.
+_compose_name_collisions() {
+  local spec="$1" reg="$2"
+  jq -r --argjson reg "$reg" '.agents | keys[] | select($reg.agents[.] != null)' <<<"$spec" 2>/dev/null
+}
+
 _compose_type_override_pins() {
   local spec="$1" t="$2"
   [[ "$t" == "claude" ]] && { printf ''; return 0; }
@@ -798,19 +922,31 @@ _compose_browser_mode() {
 }
 
 cmd_compose_up() {
-  local file="" type_override=""
+  local file="" type_override="" name_prefix=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--file)    file="$2"; shift ;;
       --file=*)     file="${1#--file=}" ;;
       --type=*)     type_override="${1#--type=}" ;;
       --type)       type_override="$2"; shift ;;
+      # DIVE-4822: the roster's namespace. `up` owns APPLYING it; `team import`
+      # owns CHOOSING it (that is where the template slug lives, and the slug is
+      # the default). Omit it and nothing changes -- the same posture --type takes.
+      --prefix=*)   name_prefix="${1#--prefix=}" ;;
+      --prefix)     name_prefix="$2"; shift ;;
       -h|--help)
         cat >&2 <<HELP
-usage: 5dive up [-f file] [--type=<harness>]
+usage: 5dive up [-f file] [--type=<harness>] [--prefix=<p>]
   Bring up agents declared in 5dive.yaml. Idempotent — existing agents are
   left alone, missing ones are created and started.
   Default file: 5dive.yaml or 5dive.yml in the current directory.
+
+  --prefix=<p>      Name the whole roster <p>-<name>, so a second team can come
+                    up on a box that already uses the declared names. Rewrites
+                    the reports_to edges with it, so the roster keeps its shape
+                    and gets its own org root. Agent names are capped at 16
+                    characters, so a prefix that would overflow one is refused
+                    rather than truncated.
 
   --type=<harness>  Create the WHOLE roster on this harness, overriding the
                     spec's type:/defaults.type:. Known: ${!TYPE_BIN[*]}.
@@ -828,6 +964,12 @@ HELP
   if [[ -n "$type_override" ]]; then
     is_known_type "$type_override" \
       || fail "$E_NOT_FOUND" "unknown --type: $type_override (known: ${!TYPE_BIN[*]})"
+  fi
+  # DIVE-4822: the prefix's own shape, checked before the spec is read. The
+  # per-name LENGTH check needs the roster and happens after the parse.
+  if [[ -n "$name_prefix" ]]; then
+    [[ "$name_prefix" =~ ^[a-z][a-z0-9]*$ ]] \
+      || fail "$E_VALIDATION" "bad --prefix '$name_prefix' — a namespace is lowercase letters and digits, starting with a letter (it becomes the first part of every agent's unix user name)"
   fi
   if [[ -z "$file" ]]; then
     file=$(_compose_default_file) \
@@ -847,6 +989,21 @@ HELP
     if [[ -n "$_pins" ]]; then
       warn "dropped Claude-only model/effort pins (not valid on '$type_override'): $_pins — the harness default applies; set one later with: 5dive agent config <name> set model=<id>"
     fi
+  fi
+  # DIVE-4822: namespace the roster BEFORE anything reads it — the preflight, the
+  # create loop and the loops pass must all see ONE set of names, or half the run
+  # provisions `ceo` and the other half looks for `start-ceo`. Refuse on overflow
+  # rather than truncate: a truncated name is a DIFFERENT agent, and silently
+  # provisioning one is the same class of defect as the silent adoption this row
+  # exists to stop.
+  if [[ -n "$name_prefix" ]]; then
+    local _pfx_bad
+    _pfx_bad=$(_compose_prefix_overflow "$spec" "$name_prefix")
+    [[ -z "$_pfx_bad" ]] || fail "$E_VALIDATION" \
+      "--prefix=$name_prefix does not fit this roster — an agent name is capped at 16 characters and these would overflow: ${_pfx_bad}. The longest prefix that fits this roster is $(_compose_prefix_budget "$spec") character(s)."
+    spec=$(_compose_apply_name_prefix "$spec" "$name_prefix") \
+      || fail "$E_VALIDATION" "could not apply --prefix=$name_prefix to the spec"
+    step "namespace: the whole roster comes up as ${name_prefix}-<name>, with its own org root"
   fi
   # DIVE-4103: what this team needs from the BOX, answered before anything is
   # provisioned. Never fatal — a missing capability names the reduced mode.
@@ -889,6 +1046,27 @@ HELP
     exists=$(jq --arg n "$name" '.agents[$n] != null' <<<"$reg")
     if [[ "$exists" == "true" ]]; then
       step "[$name] already exists — ensuring started"
+      # DIVE-4822: THIS `continue` IS THE SILENT MERGE. It skips the whole
+      # provisioning block below, INCLUDING _compose_wire_role and therefore the
+      # `org set` edge, so an adopted name keeps whatever manager it already had
+      # and this spec's reports_to is never written. That is correct for a re-run
+      # of the same spec (the edge is already there) and wrong for a name that
+      # belongs to somebody else's roster — and nothing in the output told the
+      # difference.
+      #
+      # It STAYS a `continue`: re-wiring an adopted agent would let one `up` steal
+      # a seat out of another team's chart, which is a worse failure than the one
+      # being fixed. What changes is that it now says what it did NOT do and names
+      # the manager the agent actually reports to, so a merge is legible in the
+      # output instead of discovered later in `org tree`. Turning the clash into a
+      # namespace, or into a refusal, is `team import`'s job.
+      local _adopt_mgr _adopt_want
+      _adopt_mgr=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$name");" 2>/dev/null | head -1)
+      _adopt_want=$(jq -r --arg n "$name" '.agents[$n].reports_to // empty
+                      | if type=="array" then (.[0] // "") else . end' <<<"$spec" 2>/dev/null)
+      if [[ "${_adopt_mgr:-}" != "${_adopt_want:-}" ]]; then
+        warn "[$name] adopted an agent that was ALREADY on this box — its org edge was not changed (it reports to '${_adopt_mgr:-nobody}'; this spec says '${_adopt_want:-nobody}'), and its role text and goals were not re-applied. If this is a different team that happens to use the same name, bring it up in its own namespace: 5dive team import <slug> --prefix=<p>"
+      fi
       if bash "$self" agent start "$name" >/dev/null 2>&1; then
         ((started++)) || true
       else
@@ -1492,7 +1670,7 @@ _team_assert_schema() {
 _team_usage() {
   cat >&2 <<HELP
 usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
-                                   [--telegram-token=<bot-token>|-]
+                                   [--telegram-token=<bot-token>|-] [--prefix=<p>]
        5dive team ps [<slug|path>] [--type=<harness>]
        5dive team ls
   Provision a whole company-structure template in one call (wraps 5dive up).
@@ -1507,6 +1685,15 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
                             point of contact with you. '-' reads it from stdin.
                             Omit it and the whole company comes up channel-less
                             — that is a supported path, not an error.
+  --prefix=<p>      Name this team's agents <p>-<name>. Two templates can then
+                    live on one box even though both call their lead 'ceo'.
+                    Left out, a prefix is chosen from the slug ONLY when a
+                    declared name is already taken by another team; on a box
+                    where the names are free, nothing is renamed. Use
+                    --prefix='' to force the declared names and adopt whatever
+                    is already there.
+                    (Not the same thing as 'project add --prefix', which is a
+                    task-ident prefix like DIVE-.)
 HELP
 }
 
@@ -1550,6 +1737,200 @@ _team_resolve_template() {
   _teams_get "$(_teams_registry_base)/$path" "$dest"; rc=$?
   if (( rc != 0 )); then rm -rf "$(dirname "$dest")"; return 4; fi
   printf '%s' "$dest"
+}
+
+# -------- DIVE-4822: a team import writes the TEAM ---------------------------
+#
+# A team is an org-chart root plus its subtree (design record:
+# community/wiki/a-team-is-an-org-root-and-the-resolver-needs-a-subject.md).
+# Nothing about a team is stored -- it is derived -- with one exception: which
+# template produced which root. That is what these three helpers persist, and
+# they persist it in the `projects` row rather than in a new table, because
+# `projects.lead_agent` is already "the project's coordinator" and a team's lead
+# IS its root.
+
+# The project key for an import ref. A slug is already a key; a path contributes
+# its file stem (`./my-team.5dive.yaml` -> `my-team`). Lowercased and stripped to
+# the key charset, because `project add` refuses anything else and a refusal here
+# would fail an import that otherwise worked.
+_team_slug_key() {
+  local ref="$1" base
+  base="${ref##*/}"
+  base="${base%.5dive.yaml}"; base="${base%.5dive.yml}"
+  base="${base%.yaml}"; base="${base%.yml}"
+  base="${base,,}"
+  base=$(printf '%s' "$base" | tr -cd 'a-z0-9-')
+  base="${base##-}"
+  printf '%s' "$base"
+}
+
+# The lead_agent recorded for this slug, or nothing. This is the ONE piece of
+# import state on the box, and it is what makes a re-import idempotent instead of
+# a second copy: the prefix is recovered from it by stripping the template's root
+# name off the end. `team ps` deliberately refuses to keep a "last import"
+# pointer; this is not one -- it is per-team and it is the project's own lead.
+_team_installed_lead() {
+  local key="$1"
+  [[ -n "$key" ]] || return 0
+  declare -F db >/dev/null 2>&1 || return 0
+  tasks_db_init 2>/dev/null || return 0
+  db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key=$(sqlq "$key");" 2>/dev/null | head -1
+}
+
+# An ident prefix (DIVE-, FROG-) for a project key. `projects.prefix` is UNIQUE
+# and uppercase LETTERS only, so `eng-studio` cannot simply be upper-cased -- the
+# dash is rejected by valid_project_prefix and the import would fail on a
+# cosmetic column. Letters only, capped at 8, then disambiguated by a digit.
+# Prints nothing when every candidate is taken, which the caller treats as "do
+# not write the row" rather than as an error.
+_team_project_prefix() {
+  local key="$1" base cand n
+  base=$(printf '%s' "$key" | tr -cd 'a-zA-Z')
+  base="${base^^}"; base="${base:0:8}"
+  [[ -n "$base" ]] || return 0
+  # valid_project_prefix is LETTERS ONLY, so a taken prefix cannot be
+  # disambiguated with a digit the way a slug would be. The ladder shortens
+  # instead: ENGSTUDI, ENGSTUD, ENGSTU, ... E. Prints nothing when every one of
+  # them is taken, which the caller treats as "do not write the row" and says so
+  # with the hand-written command, rather than failing an import that worked.
+  for (( n=${#base}; n>=1; n-- )); do
+    cand="${base:0:n}"
+    [[ "$(db "SELECT 1 FROM projects WHERE prefix=$(sqlq "$cand");" 2>/dev/null)" == "1" ]] && continue
+    printf '%s' "$cand"; return 0
+  done
+  return 0
+}
+
+# Write (or complete) the project row that IS this team.
+#
+# Three shapes, and the third is why this is not a bare INSERT: the row may not
+# exist (create it), may exist with no lead (fill it in -- this is the upgrade
+# path for a team imported before this change), or may exist with a lead already
+# (leave it; re-pointing a project's lead silently MOVES the project between
+# teams, because a project's team is derived from root_of(lead_agent)).
+_team_record_team() {
+  local key="$1" lead="$2" ref="$3"
+  [[ -n "$key" ]] || { warn "could not derive a project key from '$ref' — the roster is up, but this team was not recorded. Record it yourself: 5dive project add <key> --lead-agent=<lead>"; return 0; }
+  [[ -n "$lead" ]] || { warn "this template has no single root (no agent without reports_to, or more than one) — the roster is up, but its team lead could not be derived, so no project row was written."; return 0; }
+  declare -F db >/dev/null 2>&1 || return 0
+  tasks_db_init 2>/dev/null || return 0
+
+  local existing
+  existing=$(db "SELECT COALESCE(lead_agent,'@none') FROM projects WHERE key=$(sqlq "$key");" 2>/dev/null | head -1)
+  if [[ -z "$existing" ]]; then
+    local pfx; pfx=$(_team_project_prefix "$key")
+    if [[ -z "$pfx" ]]; then
+      warn "team '$key' was imported but no project row was written — every task-ident prefix derived from '$key' is already in use by another project. Add it by hand with a free prefix: 5dive project add $key --prefix=<ABC> --lead-agent=$lead"
+      return 0
+    fi
+    db "INSERT INTO projects (key, prefix, name, lead_agent)
+        VALUES ($(sqlq "$key"), $(sqlq "$pfx"), $(sqlq "$key"), $(sqlq "$lead"));" 2>/dev/null \
+      || { warn "team '$key' was imported but its project row could not be written (try: 5dive project add $key --lead-agent=$lead)"; return 0; }
+    step "team recorded: project '$key' (${pfx}-N), led by '$lead'"
+  elif [[ "$existing" == "@none" ]]; then
+    db "UPDATE projects SET lead_agent=$(sqlq "$lead") WHERE key=$(sqlq "$key");" 2>/dev/null || true
+    step "team recorded: project '$key' had no lead — set to '$lead'"
+  elif [[ "$existing" != "$lead" ]]; then
+    warn "project '$key' already exists and is led by '$existing', not '$lead' — left alone. A project's team is derived from its lead, so re-pointing it would move the project between teams; do that deliberately if you meant to: 5dive project add/show $key"
+  fi
+}
+
+# Tag the team's root as its subtree's coordinator.
+#
+# The marker is the DIVE-2041 PROSE marker (' coordinator' inside the role text),
+# never role='coordinator' exactly -- that column carries the agent's displayed
+# job title, and overwriting it would destroy the role to record a routing fact.
+# Space-anchored, so it appends to whatever title the template gave.
+#
+# HONEST LIMIT, and it is the reason DIVE-4823 exists: today's
+# `_task_resolve_coordinator` is BOARD-WIDE and needs exactly one marker holder,
+# so a second team on a box leaves the board-level ladder resolving nobody. That
+# is not caused by this tag -- it is caused by the board having two roots, which
+# is the feature this row delivers -- but the user finds out through an
+# unassigned row that will not file, so it is said out loud here instead.
+_team_tag_root_coordinator() {
+  local lead="$1"
+  [[ -n "$lead" ]] || return 0
+  declare -F db >/dev/null 2>&1 || return 0
+  tasks_db_init 2>/dev/null || return 0
+  local cur; cur=$(db "SELECT COALESCE(role,'') FROM agents_org WHERE name=$(sqlq "$lead");" 2>/dev/null | head -1)
+  [[ -n "$(db "SELECT 1 FROM agents_org WHERE name=$(sqlq "$lead");" 2>/dev/null)" ]] || return 0
+  if [[ " ${cur,,} " == *" coordinator"* ]]; then
+    :
+  else
+    db "UPDATE agents_org SET role=TRIM($(sqlq "$cur")||' coordinator') WHERE name=$(sqlq "$lead");" 2>/dev/null || true
+  fi
+  local roots
+  roots=$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to='';" 2>/dev/null | head -1)
+  if [[ "${roots:-1}" =~ ^[0-9]+$ ]] && (( roots > 1 )); then
+    warn "this box now has ${roots} teams (${roots} org roots). Routing is still board-wide, so an unassigned task has no default owner until per-team routing lands — assign rows explicitly, or give one root the board-wide tag: 5dive org set <agent> --role='<role> coordinator'"
+  fi
+}
+
+# DIVE-4822 — WHICH NAMESPACE DOES THIS TEAM COME UP IN?
+#
+# Pure: everything it needs is an argument, so the ladder is gradeable without
+# provisioning a single agent. That matters more here than anywhere else in this
+# change — renaming a roster is the most destructive thing a provisioning path
+# can do by accident, and the arm that must never fire (a namespace applied when
+# nobody asked for one, provisioning a DUPLICATE team) cannot be observed from
+# outside.
+#
+# Prints "<why>|<prefix>" and returns 0, or a refusal message and returns 1. The
+# `<why>` is what the caller turns into the line the user reads; keeping it out
+# of this function is what lets the ladder be graded on its DECISION rather than
+# on its prose.
+#
+#   installed   this template is already on the box -> the prefix it was
+#               installed under, recovered from the project row's lead_agent, so
+#               a re-import lands in the same namespace instead of making a
+#               second copy
+#   free        no declared name is taken -> none. A VIRGIN BOX IS UNCHANGED,
+#               which is the load-bearing control of the whole row
+#   adopt-all   every declared name is taken -> none. This is a re-run of this
+#               same roster from before DIVE-4822 (no project row yet), and
+#               renaming it would provision a second copy of a team that is
+#               already here
+#   namespaced  SOME declared names are taken -> the slug, truncated to fit.
+#               A partial overlap is somebody else's roster, and adopting into it
+#               is the silent merge this row exists to stop
+#
+# The order is not arbitrary: `installed` must beat `adopt-all`, or a re-import
+# of a team that came up prefixed would see its own agents as "all taken", read
+# that as an unprefixed re-run, and come up a second time under the bare names.
+_team_choose_prefix() {
+  local slug="$1" spec="$2" reg="$3" installed_lead="$4" root="$5"
+  local declared_n collide_n
+
+  if [[ -n "$installed_lead" && -n "$root" ]]; then
+    if [[ "$installed_lead" == "$root" ]]; then
+      printf 'installed|'; return 0
+    elif [[ "$installed_lead" == *"-$root" ]]; then
+      printf 'installed|%s' "${installed_lead%-$root}"; return 0
+    fi
+    # The recorded lead does not end in this template's root: the project key was
+    # taken by something that is not this team. Fall through and treat the box as
+    # if this template were not installed — the collision arms below still
+    # protect the roster, and _team_record_team refuses to re-point the lead.
+  fi
+
+  declared_n=$(jq -r '.agents | keys | length' <<<"$spec" 2>/dev/null || echo 0)
+  collide_n=$(_compose_name_collisions "$spec" "$reg" | grep -c . || true)
+  [[ "$declared_n" =~ ^[0-9]+$ ]] || declared_n=0
+  [[ "$collide_n"  =~ ^[0-9]+$ ]] || collide_n=0
+
+  if (( collide_n == 0 )); then printf 'free|'; return 0; fi
+  if (( declared_n > 0 && collide_n == declared_n )); then printf 'adopt-all|'; return 0; fi
+
+  local p; p=$(_compose_default_prefix "$slug" "$spec")
+  if [[ -z "$p" ]]; then
+    local clashes; clashes=$(_compose_name_collisions "$spec" "$reg" | paste -sd', ' -)
+    printf "'%s' cannot be imported onto this box: %s already exist(s) here and belong(s) to another team, and this roster has no room for a namespace (an agent name is capped at 16 characters, and this template's longest name leaves %s). Rename the clashing agent, or import a template with shorter role names." \
+      "$slug" "$clashes" "$(_compose_prefix_budget "$spec") character(s)"
+    return 1
+  fi
+  printf 'namespaced|%s' "$p"
+  return 0
 }
 
 # The message a caller shows when _team_resolve_template did not produce a file.
@@ -1683,12 +2064,19 @@ HELP
   esac
 
   local ref="" profile="" type_override="" tg_token="" tg_token_set=0
+  local name_prefix="" prefix_set=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --auth-profile=*) profile="${1#--auth-profile=}" ;;
       --auth-profile)   profile="$2"; shift ;;
       --telegram-token=*) tg_token="${1#--telegram-token=}"; tg_token_set=1 ;;
       --telegram-token)   tg_token="$2"; tg_token_set=1; shift ;;
+      # DIVE-4822. `prefix_set` is what distinguishes "the caller said nothing"
+      # (choose one if the names are taken) from `--prefix=''` ("use the declared
+      # names and adopt what is there"), which is the escape hatch for anyone who
+      # WANTS today's merge. An empty string cannot carry that on its own.
+      --prefix=*)       name_prefix="${1#--prefix=}"; prefix_set=1 ;;
+      --prefix)         name_prefix="$2"; prefix_set=1; shift ;;
       # DIVE-3998: forwarded verbatim to `up`, which owns the validation and
       # the override itself. This wrapper stays thin on purpose.
       --type=*)         type_override="${1#--type=}" ;;
@@ -1733,10 +2121,69 @@ HELP
     [[ -n "$tg_token" ]] && export TEAM_TG_TOKEN="$tg_token"
   fi
 
+  # ---- DIVE-4822: which NAMESPACE does this team come up in? -----------------
+  #
+  # The template slug is only in scope here, so `team import` CHOOSES the prefix
+  # and `up` APPLIES it. The ladder, in order:
+  #
+  #   1. the caller said --prefix=<p>       -> that, validated by `up`
+  #   2. the caller said --prefix=''        -> none; adopt whatever is on the box
+  #   3. this template is already installed -> the prefix it was installed under,
+  #                                            so a re-import is idempotent
+  #   4. no declared name is taken          -> none; a virgin box is unchanged
+  #   5. EVERY declared name is taken       -> none; this is a re-run of this same
+  #                                            roster from before DIVE-4822, and
+  #                                            renaming it would provision a
+  #                                            second copy of a team that is
+  #                                            already here
+  #   6. SOME declared names are taken      -> the slug, because a partial overlap
+  #                                            is another team's roster and
+  #                                            adopting into it is the silent
+  #                                            merge this row exists to stop
+  #
+  # Step 3 reads the project row written at the bottom of this function: its
+  # lead_agent is `<prefix>-<root>`, so the prefix is recoverable with no new
+  # column. That is also why the write happens even when the prefix is empty.
+  local slug_key spec_for_prefix root_name
+  slug_key=$(_team_slug_key "$ref")
+  spec_for_prefix=$(_compose_parse "$file" 2>/dev/null) || spec_for_prefix=""
+  root_name=""
+  [[ -n "$spec_for_prefix" ]] && root_name=$(_compose_spec_root "$spec_for_prefix" 2>/dev/null) || root_name=""
+
+  if (( ! prefix_set )) && [[ -n "$spec_for_prefix" ]]; then
+    local _choice _rc
+    _choice=$(_team_choose_prefix "$slug_key" "$spec_for_prefix" \
+                "$(registry_read 2>/dev/null || echo '{}')" \
+                "$(_team_installed_lead "$slug_key")" "$root_name"); _rc=$?
+    case "$_rc" in
+      0) name_prefix="${_choice#*|}" ;;
+      *) fail "$E_VALIDATION" "$_choice" ;;
+    esac
+    case "${_choice%%|*}" in
+      installed) step "team '$slug_key' is already installed as '$(_team_installed_lead "$slug_key")' — re-importing into the same namespace" ;;
+      adopt-all) step "every agent this template declares is already on this box — adopting the existing roster rather than provisioning a second copy" ;;
+      namespaced)
+        local _clashes
+        _clashes=$(_compose_name_collisions "$spec_for_prefix" "$(registry_read 2>/dev/null || echo '{}')" | paste -sd', ' -)
+        warn "${_clashes} already exist(s) on this box and belong(s) to another team — importing '$slug_key' as '${name_prefix}-<name>' instead of merging into it. Pass --prefix=<p> to choose the namespace yourself, or --prefix='' to adopt the existing agents (which is what this used to do, silently)." ;;
+    esac
+  fi
+
   step "importing team from $file"
   local -a _up_args=(-f "$file")
   [[ -n "$type_override" ]] && _up_args+=("--type=$type_override")
-  cmd_compose_up "${_up_args[@]}"
+  [[ -n "$name_prefix"   ]] && _up_args+=("--prefix=$name_prefix")
+  cmd_compose_up "${_up_args[@]}" || return $?
+
+  # ---- DIVE-4822: an import now writes the TEAM, not just the roster ---------
+  # Best-effort, and deliberately AFTER the roster is up: a team row over a
+  # roster that failed to provision is worse than no row, and neither of these
+  # writes may turn a successful import into a failure (the same posture
+  # `loops:` and `team.requires:` already take).
+  local _lead=""
+  [[ -n "$root_name" ]] && _lead="${name_prefix:+${name_prefix}-}${root_name}"
+  _team_record_team "$slug_key" "$_lead" "$ref" || true
+  _team_tag_root_coordinator "$_lead" || true
 }
 
 cmd_compose_ps() {
