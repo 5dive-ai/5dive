@@ -126,9 +126,14 @@ jobs:
   # rarely, main is normally ahead. #890 added a fail-closed download of a hook
   # first shipped two tags later; every test passed, because the file exists on
   # main — and under `set -e` the 404 at the pin was the entire install, for
-  # every fresh box and every 04:00Z self-update, for eight hours (DIVE-4349).
+  # every fresh box and every self-update, for eight hours (DIVE-4349).
   #
-  # This job evaluates the condition the fleet evaluates at 04:00Z, at PR time.
+  # This job evaluates the condition the fleet evaluates at its update hour, at
+  # PR time. (DIVE-4804: that hour is NOT a fleet-wide 04:00Z and never was — it
+  # is each box's `servers.update_hour_utc`, written by 5dive-api's
+  # scripts/install/tools.sh as `0 <hour> * * *` with a default of 3, and our two
+  # canary boxes are on 1. Nothing in this job depends on the number; it is fixed
+  # here only because the old one was quoted as fact.)
   # It is a SEPARATE job from `diff` on purpose: that one is a human-facing
   # summary that must never fail a PR, this one is an assertion that must.
   pin-compat:
