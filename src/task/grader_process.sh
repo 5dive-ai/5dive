@@ -295,8 +295,23 @@ _grader_process_run_open() {  # <seat> <ident> <session_id> [<clone>]
 # re-derivation this row exists to end.
 _GRADER_TURN_BUDGET="${_GRADER_TURN_BUDGET:-25}"
 _grader_grade_method_clause() {  # [ident]
-  local ident="${1:-}" mode="temp"
+  local ident="${1:-}" mode="temp" tbl=""
   [[ -n "$ident" ]] && mode=$(db "SELECT COALESCE(review_mode,'temp') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf temp)
+  # DIVE-4825: A ROW THAT ALREADY CARRIES A COMPUTED TABLE IS NOT RE-DERIVED.
+  # The suite, the source-revert control, every mutant and the rails were run
+  # from clean checkouts at the delivered sha before this seat existed; re-running
+  # them is exactly the ~78-call burn that made the computed pass necessary. This
+  # seat was woken for the FLAGGED line, or for the read a green table was
+  # sampled for, and for nothing else.
+  if [[ -n "$ident" ]] && declare -F _task_grade_table_from_body >/dev/null 2>&1; then
+    local _gid; _gid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || printf '')
+    [[ -n "$_gid" ]] && tbl=$(_task_grade_table_from_body "$_gid" 2>/dev/null || printf '')
+  fi
+  if [[ -n "$tbl" ]]; then
+    printf 'COMPUTED GRADE (DIVE-4825): the packet carries a COMPUTED GRADE TABLE produced from clean checkouts at DELIVERED_SHA. DO NOT re-run its unflagged lines and do not build a control or a mutant tree — that work is already done and re-deriving it is the burn this pass removed. If the table says FLAGGED, re-derive ONLY the flagged line and decide on it; budget %s turns. If the table says PASS, you were drawn for a READ: judge intent and honesty from the diff, the table and the claim block — a harness that is green but tests the wrong thing, a criterion the result claims and the diff does not close — then accept, or reject with FINDING/FIX/VERIFY; budget 5 turns and no clone. Run `5dive task grade-context %s` for the packet and its --check command before the verdict.' \
+      "${_GRADER_FLAGGED_TURN_BUDGET:-10}" "$ident"
+    return 0
+  fi
   if [[ "$mode" == "rubric" ]]; then
     printf 'RUBRIC GRADE (cheap fixed pass): Run `5dive task grade-context %s` and use only that bounded packet. Answer all six yes/no, quoting the exact packet line for each: (1) does a test exercise the change; (2) is a mutant arm present and does it go red; (3) is any file outside stated scope; (4) do changelog/result claims match the diff; (5) is any secret or real identifier present; (6) does CHECKED contradict the diff. Any adverse flag is a REJECT/escalation; an all-clean pass is the grade. The packet is built at the DELIVERED-SHA the maker wrote, and GRADE_TREE is pinned to it. Re-run the named CHECKED commands in GRADE_TREE, then run the packet'"'"'s grade-context --check command before the verdict.' "$ident"
   else
