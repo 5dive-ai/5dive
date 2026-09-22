@@ -163,8 +163,19 @@ rc=$(run "$R" --reason="main ruled the page lands in 5dive-ai/5dive-ui, not core
 [[ "$(col assignee "$R")" == "$MAKER" ]] \
   && ok_t "C6 the row is handed to the MAKER (the seat that can re-point the binding)" \
   || bad_t "C6 handoff target" "assignee=$(col assignee "$R"), expected the maker $MAKER"
-[[ "$(col status "$R")" == "in_progress" ]] \
-  && ok_t "C7 the row is NOT closed — a decline is not a cancellation" || bad_t "C7 row stays open"
+# DIVE-4843 — THIS ARM ASSERTS THE PROPERTY, NOT THE LITERAL IT USED TO READ.
+# It was always about "a decline is not a cancellation", and it happened to spell
+# that `in_progress` because the hand-over carried the previous seat's claim. That
+# claim was the defect: both picker arms select `status='todo'`, so the row it left
+# behind was open and UNREACHABLE. The hand-over now writes todo, so the arm is
+# split — the property it was written for, then the new reachability it gained.
+_c7=$(col status "$R")
+[[ "$_c7" != "done" && "$_c7" != "cancelled" ]] \
+  && ok_t "C7 the row is NOT closed — a decline is not a cancellation" \
+  || bad_t "C7 row stays open" "status=$_c7"
+[[ "$_c7" == "todo" ]] \
+  && ok_t "C7b ...and it is dispatchable, so the maker it was just handed to actually gets woken onto it (DIVE-4843)" \
+  || bad_t "C7b the declined row is open but unreachable" "status=$_c7 — the dispatcher only picks todo"
 # The other half of the handoff: a row ALREADY on its maker is left where it is. The
 # early return is correct, not a missing move, and it must not be a failure.
 H=$(mkrow); db "UPDATE tasks SET assignee='${MAKER}' WHERE id=${H};"
