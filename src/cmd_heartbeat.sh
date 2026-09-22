@@ -646,6 +646,106 @@ _hb_escalate() {  # <rail> <subject> <class> <message> [recipient]
   fi
 }
 
+# ---------------------------------------------------------------------------
+# DIVE-4826 — the ops BOARD-FACT rails batch into one daily notice.
+#
+# THE RAILS THIS COVERS (and no others): 🧊 stranded-row, ⚠️ blocked-no-reason,
+# ⏳ recurring-stall. All three are INFORMATIONAL: each states a fact `task ls`
+# already renders, and each asks ops to triage a row that is not ops's. Delivery
+# is tmux send-keys into the live pane, so each one became ops's NEXT USER TURN
+# in the middle of whatever row it was working — 36 such turns in 7 days,
+# measured in ops's transcripts 2026-09-15..22, ~5/day.
+#
+# WHAT IS DELIBERATELY *NOT* ON THIS RAIL, because batching it would change an
+# outcome rather than a delivery time:
+#   - the DIVE-3218 nudge-enforcement and DIVE-2853 recurring ladders. They
+#     REASSIGN and CANCEL. Separate code, untouched, still acting per tick.
+#   - the assignee-addressed sends (▶️ Unblocked, ⏳ your recurring instance).
+#     Those go to the seat that can act, which is the shape DIVE-4206 kept.
+#   - gap#3's fleet-idle alarm. It fires on a condition that is TRUE NOW and
+#     stops being true; a day-old copy of it is not information.
+#
+# WHY A SPOOL FILE AND NOT A COLUMN: the notes are transient and per-box, and a
+# schema change costs a `_tasks_db_migrate` rung + a restore-guard run on every
+# live board (DIVE-2512). The daily clock reuses `task_prefs`, which already
+# carries `blocked_sweep_pinged_at` for exactly this kind of throttle.
+#
+# WHY NOT `5dive digest`: it is Telegram-delivered and DEFAULT OFF (digest.json
+# is seeded disabled and opted into per box), so routing these there would have
+# turned "one turn per row" into "nothing at all" on every fleet that never ran
+# `digest on`. This rail delivers on its own clock, to the same seat, whatever
+# the digest pref says.
+_HB_OPS_DIGEST_HOURS="${HEARTBEAT_OPS_DIGEST_HOURS:-24}"
+[[ "$_HB_OPS_DIGEST_HOURS" =~ ^[0-9]+$ ]] || _HB_OPS_DIGEST_HOURS=24
+# How many notices are rendered IN FULL in the batched message. Past this the
+# message names the count and the spool path instead — a digest that grows without
+# bound is the wall of text the batching was supposed to remove.
+_HB_OPS_DIGEST_MAX_INLINE="${HEARTBEAT_OPS_DIGEST_MAX_INLINE:-20}"
+[[ "$_HB_OPS_DIGEST_MAX_INLINE" =~ ^[0-9]+$ ]] || _HB_OPS_DIGEST_MAX_INLINE=20
+
+_hb_ops_digest_spool() { printf '%s' "${STATE_DIR}/heartbeat-ops-digest.tsv"; }
+
+# _hb_ops_digest_note <class> <subject> <message>
+# Records one board fact for the next batch. Tab-separated, message newline-escaped
+# so one notice is exactly one line and a partial write cannot eat the next one.
+_hb_ops_digest_note() {
+  local class="$1" subject="$2" msg="$3" raw="$3" f
+  f="$(_hb_ops_digest_spool)"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  # \n -> literal "\n" on the way in, restored on the way out. printf '%b' is the
+  # inverse and is applied ONLY at render, so a message containing a backslash
+  # round-trips unchanged rather than being re-interpreted here.
+  msg="${msg//\\/\\\\}"; msg="${msg//$'\n'/\\n}"; msg="${msg//$'\t'/ }"
+  printf '%s\t%s\t%s\t%s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$class" "$subject" "$msg" >>"$f" 2>/dev/null || {
+    # An unwritable spool must not silently delete the surfacing. Fall back to
+    # the live send this row exists to remove — one noisy turn beats a lost one.
+    _hb_log "[ops-digest] spool unwritable (${f}) — delivering '${class}' for ${subject} LIVE instead of batching"
+    _hb_escalate "ops-digest-fallback" "$subject" "$class" "$raw" "$(_hb_ops_recipient)"
+    return 0
+  }
+  chmod 640 "$f" 2>/dev/null || true
+  _hb_log "[ops-digest] queued ${class} ${subject} (batched; next flush after ${_HB_OPS_DIGEST_HOURS}h)"
+}
+
+# _hb_ops_digest_flush — send at most ONE batched notice per _HB_OPS_DIGEST_HOURS.
+# Called from the tick. No-op when the spool is empty, so a quiet fleet is silent
+# rather than sending "nothing happened" once a day.
+_hb_ops_digest_flush() {
+  local f; f="$(_hb_ops_digest_spool)"
+  [[ -s "$f" ]] || return 0
+  local last cutoff
+  last=$(db "SELECT value FROM task_prefs WHERE key='ops_digest_flushed_at';" 2>/dev/null) || last=""
+  cutoff=$(date -u -d "${_HB_OPS_DIGEST_HOURS} hours ago" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+  # No cutoff (a date(1) that cannot do -d) means we cannot prove the window has
+  # elapsed, so we do not flush — the spool keeps accumulating and nothing is lost.
+  [[ -n "$cutoff" ]] || return 0
+  if [[ -n "$last" && ! "$last" < "$cutoff" ]]; then return 0; fi
+
+  # Rotate BEFORE composing: a note written during the compose lands in the new
+  # spool and is carried to the next batch instead of being truncated away.
+  local roll="${f}.last"
+  mv -f "$f" "$roll" 2>/dev/null || return 0
+  chmod 640 "$roll" 2>/dev/null || true
+
+  local total counts body ts class subject msg n=0 skipped=0
+  total=$(wc -l <"$roll" 2>/dev/null | tr -d ' ') || total=0
+  counts=$(awk -F'\t' '{c[$2]++} END {for (k in c) printf "%s×%d ", k, c[k]}' "$roll" 2>/dev/null)
+  body=""
+  while IFS=$'\t' read -r ts class subject msg; do
+    [[ -n "$class" ]] || continue
+    if (( n >= _HB_OPS_DIGEST_MAX_INLINE )); then skipped=$((skipped+1)); continue; fi
+    n=$((n+1))
+    body+="$(printf '\n%d. [%sZ %s] %b' "$n" "$ts" "$subject" "$msg")"
+  done <"$roll"
+
+  local hdr="📋 Board digest — ${total} notice(s) in the last ${_HB_OPS_DIGEST_HOURS}h (${counts:-none}). These are board facts, batched instead of typed into your turn one at a time (DIVE-4826); every one is also on the board — \`5dive task ls\`."
+  if (( skipped > 0 )); then body+=$'\n'"…and ${skipped} more — full text: ${roll}"; fi
+  _hb_escalate "ops-digest" "task-engine" "ops-digest" "${hdr}${body}" "$(_hb_ops_recipient)"
+  db "INSERT INTO task_prefs (key,value) VALUES ('ops_digest_flushed_at', datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
+  _hb_log "[ops-digest] flushed ${total} notice(s) (${counts:-none}) to '${_HB_ESCALATE_TO:-nobody (undeliverable)}'; spool rotated to ${roll}"
+}
+
 _hb_usage() {
   cat <<USAGE
 5dive heartbeat — wake agents only when they have queued tasks
@@ -5741,9 +5841,11 @@ _hb_blocked_sweep() {
     last=$(db "SELECT value FROM task_prefs WHERE key='blocked_sweep_pinged_at';" 2>/dev/null)
     cutoff=$(date -u -d '24 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
     if [[ -z "$last" || ( -n "$cutoff" && "$last" < "$cutoff" ) ]]; then
-      _hb_escalate "blocked-sweep" "task-engine" "blocked-no-reason" \
-          "⚠️ Blocked with no live reason (no open dependency, no human gate, no park) — likely manually blocked + forgotten. Unblock (5dive task unblock <id>) or cancel if dead: ${orphan}" \
-        "$(_hb_ops_recipient)"
+      # DIVE-4826: batched, not sent live. This is a once-per-24h roll-up of rows
+      # that were manually blocked and forgotten — a state that has already lasted
+      # a day and will still be true tomorrow, so nothing about it needs a turn.
+      _hb_ops_digest_note "blocked-no-reason" "task-engine" \
+          "⚠️ Blocked with no live reason (no open dependency, no human gate, no park) — likely manually blocked + forgotten. Unblock (5dive task unblock <id>) or cancel if dead: ${orphan}"
       db "INSERT INTO task_prefs (key,value) VALUES ('blocked_sweep_pinged_at', datetime('now'))
           ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
       _hb_log "[blocked-sweep] surfaced no-reason blocked: ${orphan}"
@@ -6245,17 +6347,42 @@ _hb_stall_sweep() {
     IFS=$'\x1f' read -r vid vident vfier vdelivered <<<"$vrow"
     [[ -n "$vid" && -n "$vfier" ]] || continue
     vmins=$(( ($(date -u +%s) - $(date -u -d "$vdelivered" +%s 2>/dev/null || date -u +%s)) / 60 ))
-    # DIVE-4295: the guard is re-read at DELIVERY time, not here. This send is
-    # SPOOLED whenever the verifier is mid-attempt (DIVE-4214) and drains one
-    # message per idle observation, so a sentence asserting "still
-    # unacknowledged" can be typed into the seat an hour after it stopped being
-    # true — measured on quinn 2026-09-11: a nag for a row that had been done
-    # and MERGED for ~50 minutes. _a2a_guard_holds re-runs this rail's own three
-    # clauses (open, still this verifier's, still unacked) against the board at
-    # the moment the seat reads it, and drops the message instead.
-    ( _A2A_GUARD="task:${vident}:${vfier}:verifier_unacked" \
-      cmd_send "$vfier" --from="task-engine" \
-        --message="📥 ${vident} was delivered to you for review ${vmins}m ago and is still unacknowledged — run \`5dive task start ${vident}\` then \`task done\`/\`task reject\` so it doesn't rot in your queue." ) >/dev/null 2>&1 || true
+    # DIVE-4826 removed the SECOND-SEAT SEND that used to fire here, to the
+    # VERIFIER itself:
+    #
+    #   _A2A_GUARD="task:<ident>:<vfier>:verifier_unacked" \
+    #   cmd_send "$vfier" "📥 <ident> was delivered to you for review <n>m ago
+    #                      and is still unacknowledged — run 5dive task start…"
+    #
+    # IT IS REDUNDANT BY CONSTRUCTION, not merely noisy. The row this query
+    # selects is `status NOT IN ('done','cancelled') AND assignee=verifier`,
+    # which is exactly the predicate `_hb_pick_tasks` dispatches on — so the
+    # dispatcher already wakes that seat onto that row at its next idle. And the
+    # send could never BEAT that wake: it is spooled (DIVE-4214) and
+    # `a2a_queue_flush_one` drains only when `_hb_agent_idle` says the seat is
+    # idle, i.e. at the moment of that same dispatch or later. So what landed was
+    # a second `type=user` turn repeating what the /goal on the same idle had
+    # already said. Measured 2026-09-15..22: 42 rows stamped here in 7d (all of
+    # them one verifier), 68 user-turns carrying this text in that seat's
+    # transcripts — it re-fires on every re-delivery of the same row. What it
+    # actually measured was a verifier grading serially, which is DIVE-4825's
+    # row, not a lost hand-off.
+    #
+    # DIVE-4206 had already deleted the ops COPY of this line on this same
+    # argument ("the VERIFIER is pinged directly on the line above") — that line
+    # was this one, and the argument finishes here.
+    #
+    # NOT DELETED, deliberately: the `handoff_stale_pinged_at` stamp and the
+    # ledger line below. The board keeps rendering the stall, `task ls` and the
+    # digest keep reading it, and `_a2a_guard_holds`' `verifier_unacked` clause
+    # (cmd_agent_runtime.sh) stays — the guard classes are a vocabulary, and this
+    # one keeps its harness. Only the live turn is gone.
+    #
+    # THE ONE CASE THIS WOULD HAVE COVERED ALONE is a verifier seat with no
+    # dispatcher (`heartbeat.enabled` not true), where no wake follows. Not built:
+    # no verifier seat on any fleet runs without the dispatcher, and a fallback
+    # send guarded on a condition that never holds is a rail nobody can grade.
+    #
     # DIVE-4206 removed the third-seat COPY that used to fire here:
     #
     #   cmd_send ops "📥 Delivered-awaiting-verifier: <ident> handed to '<vfier>'
@@ -6345,9 +6472,11 @@ _hb_stall_sweep() {
     rbusy=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks
                 WHERE kind='standard' AND status='in_progress'
                   AND assignee=$(sqlq "${rasg:-}") ORDER BY id LIMIT 1;" 2>/dev/null || echo "")
-    _hb_escalate "recurring-stall" "${rident}" "recurring-stall" \
-        "⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}'${rbusy:+ — who is OCCUPIED on ${rbusy}, so this notice may be undeliverable-in-effect (a goal-fenced assignee cannot take a second row)} — ${rsupp_main}. If it is still unstarted in ${_HB_RECURRING_ESCALATE_HOURS}h the ladder reassigns or cancels it (DIVE-2853)." \
-        "$(_hb_ops_recipient)"
+    # DIVE-4826: batched. The ASSIGNEE-addressed send above is unchanged — that is
+    # the seat that can act. This one is ops's situational copy, and the DIVE-2853
+    # ladder (which reassigns/cancels) is separate code that keeps firing per tick.
+    _hb_ops_digest_note "recurring-stall" "${rident}" \
+        "⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}'${rbusy:+ — who is OCCUPIED on ${rbusy}, so this notice may be undeliverable-in-effect (a goal-fenced assignee cannot take a second row)} — ${rsupp_main}. If it is still unstarted in ${_HB_RECURRING_ESCALATE_HOURS}h the ladder reassigns or cancels it (DIVE-2853)."
     db "UPDATE tasks SET recurring_stall_pinged_at=datetime('now') WHERE id=${rid};"
     _hb_log "[recurring-stall] ${rident} never-started ${rhours}h (template ${rtmpl}) -> surfaced"
   done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||t.created_at||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)||x'1f'||COALESCE(p.on_overlap,'skip')
@@ -6667,9 +6796,11 @@ _hb_stall_sweep() {
     else
       slane="that seat holds nothing else and is not visibly busy, so READ THE ROW before treating this as a lane problem"
     fi
-    _hb_escalate "stranded" "${sident}" "stranded-row" \
-        "🧊 Stranded ${sdays}d: ${sident} ${sphase} on '${sasg}'${sbusy:+, while that seat is ACTIVE on ${sbusy}}${sload:+ and holds ${sload} other todo row(s)} — ${slane} (reassign; cancel it if it is dead; or, if it is waiting on a date or an event, give that wait its verb — \`5dive task park --wake=\` — because a wait written only in the body leaves the row in the rotation and lands here). Surfaced once per row and never again (DIVE-3483)." \
-        "$(_hb_ops_recipient)"
+    # DIVE-4826: batched. Surfaced once per row either way (stranded_pinged_at,
+    # DIVE-3483) — the change is only that N rows arrive as one notice rather than
+    # as N user turns in the middle of whatever ops was working.
+    _hb_ops_digest_note "stranded-row" "${sident}" \
+        "🧊 Stranded ${sdays}d: ${sident} ${sphase} on '${sasg}'${sbusy:+, while that seat is ACTIVE on ${sbusy}}${sload:+ and holds ${sload} other todo row(s)} — ${slane} (reassign; cancel it if it is dead; or, if it is waiting on a date or an event, give that wait its verb — \`5dive task park --wake=\` — because a wait written only in the body leaves the row in the rotation and lands here). Surfaced once per row and never again (DIVE-3483)."
     db "UPDATE tasks SET stranded_pinged_at=datetime('now') WHERE id=${sid};"
     _hb_log "[stranded] ${sident} todo ${sdays}d on ${sasg}${sbusy:+ (active on ${sbusy})} -> surfaced"
   done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(first_started_at,created_at)||x'1f'||COALESCE(first_started_at,'')
@@ -8212,6 +8343,10 @@ cmd_heartbeat_tick() {
   # class. Same isolation contract — a failure here must never abort the wake
   # loop, and must never itself go silent the way the incident it targets did.
   _hb_stall_sweep || _hb_log "[stall-sweep] pass errored (non-fatal)"
+  # DIVE-4826 — after the sweeps have QUEUED their board facts, deliver at most one
+  # batched notice per window. Ordered last on purpose: notices raised by this very
+  # tick ride out in this flush instead of waiting a full window.
+  _hb_ops_digest_flush || _hb_log "[ops-digest] flush errored (non-fatal)"
   # DIVE-972: enforce per-loop token ceilings for async (non --wait) loops. Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_loop_ceiling_sweep || _hb_log "[loop-ceiling] pass errored (non-fatal)"
