@@ -565,7 +565,7 @@ $(printf '%s\n' "$_cmt_edges" | sed 's/^/      /')
   # broken token match all produce the same silence otherwise.
   printf '# regression probe: _GATE_HUMAN_CAPABILITIES seal (DIVE-2241/2131)\n' >"$TMP/probe_cmt"
   _probe_edges=$(_edges_bought_by "$TMP/probe_cmt")
-  if printf '%s\n' "$_probe_edges" | grep -q '^_GATE_HUMAN_CAPABILITIES '; then
+  if grep -q '^_GATE_HUMAN_CAPABILITIES ' <<<"$_probe_edges"; then
     ok_t "positive control: the same predicate DOES flag iteration 2's comment citation, so the clean answer above is a reading and not a silence"
   else
     fail_t "positive control failed — the predicate did not flag a comment naming _GATE_HUMAN_CAPABILITIES, so the arm above is vacuous. Got: ${_probe_edges:-<nothing>}"

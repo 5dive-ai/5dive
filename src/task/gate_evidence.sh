@@ -2406,7 +2406,7 @@ _gate_scan_class() {
   if [[ "$why" =~ ^partial-repo-scan-([0-9]+)-of-([0-9]+)$ ]]; then
     [[ "${BASH_REMATCH[1]}" != "0" ]] && { printf 'credential-partial'; return 0; }
     [[ -n "$err" ]] || { printf 'scan-silent'; return 0; }
-    if printf '%s' "$err" | grep -qiE 'could not resolve to a repository|not found \(http 404\)|http 404|resource not accessible by integration'; then
+    if grep -qiE 'could not resolve to a repository|not found \(http 404\)|http 404|resource not accessible by integration' <<<"$err"; then
       printf 'credential-blind'; return 0
     fi
     printf 'scan-failed'; return 0

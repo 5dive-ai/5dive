@@ -245,7 +245,7 @@ mk_db "$DB" 2; STUB_JOURNAL_PUSH=1 STUB_JOURNAL_NOISE=5 run
 expect "one malformed audit line does not abort the count and hide the traffic" pass ""
 
 # ── 17. the probe is registered everywhere the runner reads ──────────────────
-printf '%s\n' "${SELFCHECK_PROBES[@]}" | grep -qx ship-ledger-liveness \
+grep -qx ship-ledger-liveness <<<"$(printf '%s\n' "${SELFCHECK_PROBES[@]}")" \
   && ok_t "ship-ledger-liveness is in SELFCHECK_PROBES (so --list, the report header and the union all see it)" \
   || fail_t "probe missing from SELFCHECK_PROBES"
 [[ "$(_sc_title ship-ledger-liveness)" != "ship-ledger-liveness" ]] \

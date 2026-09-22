@@ -313,25 +313,25 @@ u3=$(db "SELECT COALESCE(CAST(value AS TEXT),'NULL') FROM run_usage WHERE run_id
 # racy. `--agent=` a seat that never ran is deterministically empty.
 m=$( cmd_run_metrics --since=7d --agent=nobody-ever-ran 2>/dev/null )
 for _rate_line in 'success rate' 'first-attempt success' 'verifier rejection rate' 'human touches'; do
-  printf '%s' "$m" | grep -qE "^ +${_rate_line} +NO DATA$" \
+  grep -qE "^ +${_rate_line} +NO DATA$" <<<"$m" \
     && ok_t "empty window: '${_rate_line}' prints NO DATA, not a 0% that reads as measured" \
     || bad_t "empty window produced a rate for '${_rate_line}'" "out=[$m]"
 done
 m2=$( cmd_run_metrics --since=7d 2>/dev/null )
-printf '%s' "$m2" | grep -qE 'success rate +[0-9]+% \([0-9]+/[0-9]+\)' \
+grep -qE 'success rate +[0-9]+% \([0-9]+/[0-9]+\)' <<<"$m2" \
   && ok_t "every rate names its own denominator" || bad_t "a rate printed without its denominator" "out=[$m2]"
 
 # ---------------------------------------------------------------------------
 # 10. RUNS DO NOT REPLACE TRACE.
 # ---------------------------------------------------------------------------
 tr=$( cmd_trace "$(db "SELECT ident FROM tasks WHERE id=$id3;")" --no-audit 2>/dev/null )
-printf '%s' "$tr" | grep -q 'timeline (goal' \
+grep -q 'timeline (goal' <<<"$tr" \
   && ok_t "trace still renders its own causal timeline" || bad_t "trace lost its timeline"
-printf '%s' "$tr" | grep -q 'lifecycle ledger' \
+grep -q 'lifecycle ledger' <<<"$tr" \
   && ok_t "trace still renders the lifecycle ledger" || bad_t "trace lost the ledger section"
-printf '%s' "$tr" | grep -q "attempts (runs" \
+grep -q "attempts (runs" <<<"$tr" \
   && ok_t "trace shows runs as ANCHORS beneath the narrative" || bad_t "trace does not link runs"
-printf '%s' "$tr" | grep -q "$r3" \
+grep -q "$r3" <<<"$tr" \
   && ok_t "the anchor names the actual run id" || bad_t "run id absent from trace" "out=[$tr]"
 
 # ---------------------------------------------------------------------------

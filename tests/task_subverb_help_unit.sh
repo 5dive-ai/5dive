@@ -63,7 +63,7 @@ mapfile -t LABELS < <(awk '/^cmd_task\(\) \{/,/^\}/' "$SRC/task/dispatch.sh" \
 (( ${#LABELS[@]} >= 49 )) \
   && ok_t "precondition: cmd_task's case dispatches ${#LABELS[@]} subverb labels" \
   || bad_t "precondition: the case statement enumerates its subverbs" "found only ${#LABELS[@]}"
-printf '%s\n' "${LABELS[@]}" | grep -qx 'ls' && printf '%s\n' "${LABELS[@]}" | grep -qx 'list' \
+grep -qx 'ls' <<<"$(printf '%s\n' "${LABELS[@]}")" && grep -qx 'list' <<<"$(printf '%s\n' "${LABELS[@]}")" \
   && ok_t "precondition: the corpus carries aliases too (ls and list are both in it)" \
   || bad_t "precondition: aliases are in the corpus" "ls/list missing from ${#LABELS[@]} labels"
 

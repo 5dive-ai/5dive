@@ -74,7 +74,7 @@ OUT=$(run_export missing-dir 2>&1); RC=$?
                 || bad_ "missing-dir: cmd_export exits non-zero" "rc=$RC out=[$OUT]"
 [[ -n "$OUT" ]] && ok_ "missing-dir: something is printed (not the silent zero-byte death)" \
                 || bad_ "missing-dir: something is printed (not the silent zero-byte death)" "0 bytes on stdout+stderr — DIVE-2680 regressed"
-printf '%s' "$OUT" | grep -qi 'no persona memory to export' \
+grep -qi 'no persona memory to export' <<<"$OUT" \
   && ok_ "missing-dir: the existing, specific refusal message is what prints" \
   || bad_ "missing-dir: the existing, specific refusal message is what prints" "out=[$OUT]"
 
@@ -82,7 +82,7 @@ printf '%s' "$OUT" | grep -qi 'no persona memory to export' \
 COUT=$(run_export empty-result 2>&1); CRC=$?
 [[ $CRC -ne 0 ]] && ok_ "control (empty-result): also exits non-zero" \
                  || bad_ "control (empty-result): also exits non-zero" "rc=$CRC out=[$COUT]"
-printf '%s' "$COUT" | grep -qi 'no persona memory to export' \
+grep -qi 'no persona memory to export' <<<"$COUT" \
   && ok_ "control (empty-result): same message, unaffected by the fix" \
   || bad_ "control (empty-result): same message, unaffected by the fix" "out=[$COUT]"
 

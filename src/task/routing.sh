@@ -1293,9 +1293,14 @@ _gate_withdraw_actor() {
   local _cuid; _cuid=$(_gate_caller_uid)
   local _a; _a=$(_gate_uid_to_agent "$_cuid")
   if [[ -n "$_a" ]]; then printf 'agent %s' "$_a"; return; fi
+  # DIVE-4811: capture first, read from a herestring. `done < <(_gate_passwd_stream)`
+  # with a `return` on the match kills the writer with SIGPIPE mid-stream and leaks
+  # `printf: write error: Broken pipe` onto the caller's stderr. Same fix, same
+  # reason, as actor_uid_to_name in src/lib/actor.sh.
+  local _pw; _pw=$(_gate_passwd_stream)
   local _n _x _u; while IFS=: read -r _n _x _u _; do
     [[ "$_u" == "$_cuid" ]] && { printf 'human'; return; }
-  done < <(_gate_passwd_stream)
+  done <<<"$_pw"
   printf 'none'
 }
 

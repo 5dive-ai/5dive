@@ -78,9 +78,9 @@ esac
 STUB_RC=0 STUB_OUT="published 468 shipped / 61 asks" _proof_tick --log="$_PROOF_LOG" >/dev/null 2>&1
 rc=$?
 body="$(cat "$_PROOF_LOG")"
-if [ "$rc" -eq 0 ] && printf '%s' "$body" | grep -q 'proof tick: PUBLISHED' \
-   && printf '%s' "$body" | grep -q 'lastPublished=2026-07-26' \
-   && printf '%s' "$body" | grep -q '468 shipped'; then
+if [ "$rc" -eq 0 ] && grep -q 'proof tick: PUBLISHED' <<<"$body" \
+   && grep -q 'lastPublished=2026-07-26' <<<"$body" \
+   && grep -q '468 shipped' <<<"$body"; then
   ok_t "a successful tick writes a PUBLISHED record with the stamp and the publisher's summary"
 else
   bad_t "a successful tick writes a PUBLISHED record" "rc=$rc log=<<$body>>"
@@ -91,7 +91,7 @@ fi
 STUB_RC=3 STUB_OUT="proof: already published today for status" _proof_tick --log="$_PROOF_LOG" >/dev/null 2>&1
 rc=$?
 body="$(cat "$_PROOF_LOG")"
-if [ "$rc" -eq 0 ] && printf '%s' "$body" | grep -q 'proof tick: no-op'; then
+if [ "$rc" -eq 0 ] && grep -q 'proof tick: no-op' <<<"$body"; then
   ok_t "rc 3 is recorded as a no-op and still exits 0"
 else
   bad_t "rc 3 is recorded as a no-op and still exits 0" "rc=$rc log=<<$body>>"
@@ -102,7 +102,7 @@ fi
 STUB_RC=4 STUB_OUT="" _proof_tick --log="$_PROOF_LOG" >/dev/null 2>&1
 rc=$?
 body="$(cat "$_PROOF_LOG")"
-if [ "$rc" -eq 4 ] && printf '%s' "$body" | grep -q 'FAILED rc=4 — no publishing identity'; then
+if [ "$rc" -eq 4 ] && grep -q 'FAILED rc=4 — no publishing identity' <<<"$body"; then
   ok_t "rc 4 is recorded as FAILED and the tick stays non-zero"
 else
   bad_t "rc 4 is recorded as FAILED and the tick stays non-zero" "rc=$rc log=<<$body>>"
@@ -118,8 +118,8 @@ fi
   _proof_tick --log="$_PROOF_LOG" >/dev/null 2>&1 )
 rc=$?
 body="$(cat "$_PROOF_LOG")"
-if [ "$rc" -eq 0 ] && printf '%s' "$body" | grep -q 'proof tick: SKIPPED' \
-   && ! printf '%s' "$body" | grep -q 'PUBLISHED' && [ ! -s "$SENTINEL" ]; then
+if [ "$rc" -eq 0 ] && grep -q 'proof tick: SKIPPED' <<<"$body" \
+   && ! grep -q 'PUBLISHED' <<<"$body" && [ ! -s "$SENTINEL" ]; then
   ok_t "an unconfigured box records SKIPPED (never PUBLISHED) and exits 0"
 else
   bad_t "an unconfigured box records SKIPPED, never PUBLISHED" "rc=$rc log=<<$body>>"
@@ -130,7 +130,7 @@ echo '{"enabled":false}' > "$TMP/off-state-proof.json"
   cp "$TMP/off-state-proof.json" "$STATE_DIR/proof.json"
   _proof_tick --log="$_PROOF_LOG" >/dev/null 2>&1 )
 body="$(cat "$_PROOF_LOG")"
-printf '%s' "$body" | grep -q 'proof tick: SKIPPED' \
+grep -q 'proof tick: SKIPPED' <<<"$body" \
   && ok_t "a disabled publisher records SKIPPED, not PUBLISHED" \
   || bad_t "a disabled publisher records SKIPPED, not PUBLISHED" "log=<<$body>>"
 
@@ -153,7 +153,7 @@ else
   bad_t "a FAILING tick names its reason on stderr" "rc=$rc stderr=<<$(cat "$TMP/err")>>"
 fi
 # The record still reaches the log too — stderr is an ADDITION, not a diversion.
-printf '%s' "$body" | grep -q 'FAILED' \
+grep -q 'FAILED' <<<"$body" \
   && ok_t "…and the log still carries the FAILED record (stderr added, not diverted)" \
   || bad_t "the log still carries the FAILED record" "log=<<$body>>"
 # Non-vacuity: a SUCCESSFUL tick must stay quiet on stderr, or the arm above
@@ -199,7 +199,7 @@ LOGGER_CAPTURE="$TMP/journald" : > "$TMP/journald"
 LOGGER_CAPTURE="$TMP/journald" PATH="$TMP/bin:$PATH" \
   STUB_RC=0 STUB_OUT="published 468 shipped / 61 asks" _proof_tick --log="$DEAD_LOG" >/dev/null 2>"$TMP/err"
 jr="$(cat "$TMP/journald")"
-if printf '%s' "$jr" | grep -q 'proof tick: PUBLISHED' && printf '%s' "$jr" | grep -q 'could NOT append'; then
+if grep -q 'proof tick: PUBLISHED' <<<"$jr" && grep -q 'could NOT append' <<<"$jr"; then
   ok_t "the record falls back to journald, carrying BOTH the run and why the file rail was skipped"
 else
   bad_t "the record falls back to journald" "captured=<<$jr>>"
@@ -224,8 +224,8 @@ cat > "$_PROOF_CRON" <<'LEGACY'
 LEGACY
 warn="$(_proof_cron_legacy_check 2>&1)"
 after="$(grep -E '^[0-9]' "$_PROOF_CRON")"
-if printf '%s' "$warn" | grep -q 'legacy' && ! printf '%s' "$after" | grep -q '>>' \
-   && printf '%s' "$after" | grep -q -- '--log=' && printf '%s' "$after" | grep -q ' claude '; then
+if grep -q 'legacy' <<<"$warn" && ! grep -q '>>' <<<"$after" \
+   && grep -q -- '--log=' <<<"$after" && grep -q ' claude ' <<<"$after"; then
   ok_t "a legacy >> cron is detected, warned about, and rewritten (user preserved)"
 else
   bad_t "a legacy >> cron is detected and rewritten" "warn=<<$warn>> after=<<$after>>"

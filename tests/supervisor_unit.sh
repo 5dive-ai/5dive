@@ -577,11 +577,11 @@ tp() { ( PGREP_OUT="$1"; pgrep() { [[ -n "$PGREP_OUT" ]] && printf '%s\n' $PGREP
          _sup_true_poller_count "${2:-unit-p}" "${3:-claude}" ); }
 _PAT_C="${_SUP_TRUE_POLLER_PAT[claude]}"
 t "3856 predicate: matches the bare poller argv (\`bun start.ts\`, plugin >= 0.5.49)" "yes" \
-  "$(printf '%s\n' 'bun start.ts' | grep -qE "$_PAT_C" && printf yes || printf no)"
+  "$(grep -qE "$_PAT_C" <<<'bun start.ts' && printf yes || printf no)"
 t "3856 predicate: matches the OLDER argv (\`bun server.ts\`) — a start.ts-only pattern reads zero on healthy seats" "yes" \
-  "$(printf '%s\n' 'bun server.ts' | grep -qE "$_PAT_C" && printf yes || printf no)"
+  "$(grep -qE "$_PAT_C" <<<'bun server.ts' && printf yes || printf no)"
 t "3856 predicate: matches the path-qualified telegram-<x> variant" "yes" \
-  "$(printf '%s\n' 'bun /home/agent-x/.claude/plugins/cache/telegram-codex/0.4.0/server.ts' | grep -qE "$_PAT_C" && printf yes || printf no)"
+  "$(grep -qE "$_PAT_C" <<<'bun /home/agent-x/.claude/plugins/cache/telegram-codex/0.4.0/server.ts' && printf yes || printf no)"
 t "3856 predicate: does NOT match the LAUNCHER (the whole point — it is state 2 blindness)" "no" \
   "$(printf '%s\n' 'bun run --cwd /home/agent-x/.claude/plugins/cache/5dive-plugins/telegram/0.5.49 --shell=bun --silent start' \
      | grep -qE "$_PAT_C" && printf yes || printf no)"

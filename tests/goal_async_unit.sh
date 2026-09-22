@@ -149,13 +149,13 @@ POST=$(db "SELECT COUNT(*) FROM tasks WHERE project_key='widgetjob' AND title NO
 # --from-job before the plan is ready is a clean error, not a materialize
 out=$(run cmd_goal_add --planner=dev --dry-run -- "Not ready yet"); JOB5=$(printf '%s' "$out" | jq -r '.data.job // ""')
 out=$(run cmd_goal_add --from-job="$JOB5"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "no plan yet" \
+[[ $rc -ne 0 ]] && grep -qi "no plan yet" <<<"$out" \
   && ok_t "--from-job before plan ready rejected cleanly" \
   || bad_t "--from-job not-ready rejected" "rc=$rc out=$out"
 
 # ---- (6) unknown job id is a clean error ----
 out=$(run cmd_goal_status "L-does-not-exist"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "no goal job" \
+[[ $rc -ne 0 ]] && grep -qi "no goal job" <<<"$out" \
   && ok_t "unknown job id rejected cleanly" \
   || bad_t "unknown job id rejected" "rc=$rc out=$out"
 

@@ -93,14 +93,14 @@ run set_body "$tid" "template instructions live here" >/dev/null
 id4=$(run add --assignee=alice --no-verify -- "closeable task" | jf '.data.id')
 run done "$id4" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" >/dev/null
 e6=$(run set_body "$id4" "too late"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$e6" | grep -q "already done" \
+[[ $rc -ne 0 ]] && grep -q "already done" <<<"$e6" \
   && ok_t "set-body refuses a closed (done) task" || bad_t "set-body refuses a closed task" "rc=$rc $e6"
 [[ "$(bodyof "$id4")" != "too late" ]] \
   && ok_t "rejected set-body left the closed task's body untouched" || bad_t "rejected set-body left body untouched" "$(bodyof "$id4")"
 
 # --- T7: missing text arg -> usage error, not a silent no-op
 e7=$(run set_body "$id1"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$e7" | grep -q "usage: 5dive task set-body" \
+[[ $rc -ne 0 ]] && grep -q "usage: 5dive task set-body" <<<"$e7" \
   && ok_t "set-body with no text errors" || bad_t "set-body with no text errors" "rc=$rc $e7"
 
 # --- T8: boolean --append=<payload> fails safely without echoing the payload

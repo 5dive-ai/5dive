@@ -119,7 +119,7 @@ cat_at() {  # <category> <literal that must be on that line>
   fi
   # Assert a finding AT that line — not "the first hit of this category", which
   # a line that leaks two categories at once would answer with the wrong line.
-  if printf '%s\n' "$OUT" | grep -q "^poller\.md:${want}: ${ctg}: "; then
+  if grep -q "^poller\.md:${want}: ${ctg}: " <<<"$OUT"; then
     ok_t "$ctg detected and located (poller.md:$want)"
   else
     have=$(printf '%s\n' "$OUT" | grep ": ${ctg}: " | cut -d: -f2 | paste -sd, -)
@@ -182,7 +182,7 @@ Hand the queue back to zebra once it drains.
 MD
 _pack_leak_roster_raw() { echo zebra; }
 ROUT=$(scan "$TMP/roster"); RRC=$?
-{ [[ $RRC -eq 1 ]] && printf '%s\n' "$ROUT" | grep -q 'identity-name'; } \
+{ [[ $RRC -eq 1 ]] && grep -q 'identity-name' <<<"$ROUT"; } \
   && ok_t "a name from the box roster is caught (no pattern would have)" \
   || bad_t "a name from the box roster is caught" "rc=$RRC out=$ROUT"
 _pack_leak_roster_raw() { :; }
@@ -247,12 +247,12 @@ GOUT=$(scan "$TMP/generic"); GRC=$?
 printf 'Hand it back to main once the queue drains.\n' >> "$TMP/generic/ownership.md"
 GOUT2=$(scan "$TMP/generic"); GRC2=$?
 WANT=$(grep -n 'Hand it back to main' "$TMP/generic/ownership.md" | cut -d: -f1)
-{ [[ $GRC2 -eq 1 ]] && printf '%s\n' "$GOUT2" | grep -q "^ownership\.md:${WANT}: identity-name: "; } \
+{ [[ $GRC2 -eq 1 ]] && grep -q "^ownership\.md:${WANT}: identity-name: " <<<"$GOUT2"; } \
   && ok_t "the SAME generic name REFUSES when it names a person (ownership.md:$WANT)" \
   || bad_t "the same generic name refuses when it names a person" "rc=$GRC2 out=$GOUT2 — identity-name has a hole for agents named after generic words"
 # ...and the noun line must STILL be clean in that same run, or the rule is just noise.
 NOUNLN=$(grep -n 'commit to main' "$TMP/generic/ownership.md" | cut -d: -f1)
-printf '%s\n' "$GOUT2" | grep -q "^ownership\.md:${NOUNLN}: " \
+grep -q "^ownership\.md:${NOUNLN}: " <<<"$GOUT2" \
   && bad_t "the noun use stays clean alongside the actor use" "line $NOUNLN (commit to main) also fired: $GOUT2" \
   || ok_t "the noun use (line $NOUNLN) stays clean in the same file as the actor use (line $WANT)"
 _pack_leak_roster_raw() { :; }
@@ -273,7 +273,7 @@ MALFORMED=$(printf '%s' "$RREAL" | grep -cvE '^[a-z][a-z0-9_-]{2,}$' 2>/dev/null
                                || bad_t "real roster emits only well-formed slugs" "$MALFORMED bad: $RREAL"
 if compgen -G '/home/agent-*' >/dev/null 2>&1; then
   ONE=$(basename "$(compgen -G '/home/agent-*' | head -1)"); ONE="${ONE#agent-}"
-  printf '%s\n' "$RREAL" | grep -qx "$ONE" \
+  grep -qx "$ONE" <<<"$RREAL" \
     && ok_t "real roster derives an agent account that exists on this box ($ONE)" \
     || bad_t "real roster derives an agent account that exists on this box" "'$ONE' missing from: $RREAL"
 else
@@ -289,7 +289,7 @@ _pack_memory_publish_gate self "$TMP/raw" >/dev/null 2>&1; G2=$?
 [[ $G2 -eq 0 ]] && ok_t "gate: self + the same raw memory is unaffected" \
                || bad_t "gate: self + the same raw memory is unaffected" "rc=$G2"
 GW=$(_pack_memory_publish_gate self "$TMP/raw" 2>&1 >/dev/null)
-printf '%s' "$GW" | grep -qi 'skipped' \
+grep -qi 'skipped' <<<"$GW" \
   && ok_t "gate: the self path SAYS the check was skipped" \
   || bad_t "gate: the self path SAYS the check was skipped" "warned: '$GW'"
 _pack_memory_publish_gate publish "$TMP/distilled" >/dev/null 2>&1; G3=$?

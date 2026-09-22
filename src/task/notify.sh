@@ -223,13 +223,22 @@ _task_chain_channel() {
 # agent. Empty + rc 1 means the ask is genuinely undeliverable to any human.
 _task_chain_paired() {
   local filer="$1" c rc
-  while IFS= read -r c; do
+  # DIVE-4811: mapfile FIRST, exactly as _task_chain_channel above already does.
+  # The `return 0` on the first paired agent used to close the read end of
+  # `< <(_task_escalation_chain …)` while that function was still printing the
+  # rest of the chain (src/task/notify.sh:175), so the writer took SIGPIPE and
+  # printed `printf: write error: Broken pipe`. It fired four times per CI run,
+  # on every shard, on main — harmless to this function's own result and NOT
+  # harmless to any harness that grades stderr emptiness.
+  local -a chain=()
+  mapfile -t chain < <(_task_escalation_chain "$filer")
+  for c in "${chain[@]}"; do
     [[ -n "$c" ]] || continue
     _task_agent_paired "$c"; rc=$?
     # 0 paired, 2 undetermined — both mean "a privileged sender may well reach
     # this agent", and only an all-1 chain licenses refusing the gate.
     [[ "$rc" == "0" || "$rc" == "2" ]] && { printf '%s' "$c"; return 0; }
-  done < <(_task_escalation_chain "$filer")
+  done
   return 1
 }
 

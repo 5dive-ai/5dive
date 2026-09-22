@@ -210,7 +210,7 @@ else
   # T1c — the filtered-out members, graded on the refusal rather than skipped.
   for p in "${CHANNEL_MEMBERS[@]}"; do
     out=$(timeout 120 "$FIVE" plugin add "$p" --yes </dev/null 2>&1); rc=$?
-    if (( rc != 0 )) && printf '%s' "$out" | grep -qi "built-in channel"; then
+    if (( rc != 0 )) && grep -qi "built-in channel" <<<"$out"; then
       ok_t "T1c $p: 'plugin add' refuses a built-in channel plugin, per agent not per box (rc=$rc)"
     else
       bad_t "T1c $p: 'plugin add' refuses a built-in channel plugin" "rc=$rc — $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
@@ -348,7 +348,7 @@ else
         "rc=0 — an unreviewed plugin installed on a fresh box. The trust gate is the only thing between a published plugin and root on a customer's box."
       _inst+=("$p")
     fi
-    if printf '%s' "$out" | grep -q "installs only 'official'"; then
+    if grep -q "installs only 'official'" <<<"$out"; then
       ok_t "T1e2 $p: the refusal names the review tier, not something internal"
     else
       bad_t "T1e2 $p: the refusal names the review tier, not something internal" "$(printf '%s' "$out" | tail -3 | tr '\n' ' ')"

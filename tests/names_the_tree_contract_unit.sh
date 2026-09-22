@@ -110,7 +110,7 @@ else
     # extraction has to be confirmed, not assumed.
     if [[ -n "$SNIPPET" ]] \
        && [[ "$(printf '%s\n' "$SNIPPET" | wc -l)" -le 15 ]] \
-       && printf '%s\n' "$SNIPPET" | grep -q 'no tree named'; then
+       && grep -q 'no tree named' <<<"$SNIPPET"; then
       EXEMPLAR="$t"
       break
     fi

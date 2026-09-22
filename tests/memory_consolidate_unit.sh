@@ -97,10 +97,10 @@ run() { ( _memory_consolidate "$@" ) ; }
 
 echo "── excerpt (L0 -> L1): keeps speech, collapses tool payloads, caps ──"
 EX=$(_memory_consolidate_excerpt "$PROJ/aaaa-1111.jsonl" 20000)
-printf '%s' "$EX" | grep -q 'keep the deploy gate manual' && ok "user turn survives" || bad "user turn survives"
-printf '%s' "$EX" | grep -q '\[tool: Bash\]' && ok "tool_use collapses to its name" || bad "tool_use collapses to its name"
-printf '%s' "$EX" | grep -q 'xxxxxxxxxx' && bad "4KB tool payload elided" || ok "4KB tool payload elided"
-printf '%s' "$EX" | grep -q 'ignored' && bad "non user/assistant records skipped" || ok "non user/assistant records skipped"
+grep -q 'keep the deploy gate manual' <<<"$EX" && ok "user turn survives" || bad "user turn survives"
+grep -q '\[tool: Bash\]' <<<"$EX" && ok "tool_use collapses to its name" || bad "tool_use collapses to its name"
+grep -q 'xxxxxxxxxx' <<<"$EX" && bad "4KB tool payload elided" || ok "4KB tool payload elided"
+grep -q 'ignored' <<<"$EX" && bad "non user/assistant records skipped" || ok "non user/assistant records skipped"
 EXC=$(_memory_consolidate_excerpt "$PROJ/aaaa-1111.jsonl" 600)
 [ "${#EXC}" -le 700 ] && ok "--max-chars caps the excerpt (${#EXC} <= 700)" || bad "--max-chars caps the excerpt (got ${#EXC})"
 
@@ -133,7 +133,7 @@ cp "$TMP/ledger.bak" "$LEDGER"
 echo "── NEGATIVE CONTROL: the live-session skip is the idle rule, not a break ──"
 mk_transcript "$PROJ/cccc-3333.jsonl" "a session still being written" "Live."
 OUT=$(run --distiller="$EMPTY" --max-sessions=5 2>&1)
-printf '%s' "$OUT" | grep -q '1 live' && ok "fresh transcript reported as skipped-live" || bad "fresh transcript reported as skipped-live (got: $OUT)"
+grep -q '1 live' <<<"$OUT" && ok "fresh transcript reported as skipped-live" || bad "fresh transcript reported as skipped-live (got: $OUT)"
 grep -q '^cccc-3333' "$LEDGER" && bad "live transcript stayed out of the ledger" || ok "live transcript stayed out of the ledger"
 # Same transcript, same pass, only the idle rule relaxed -> it MUST be processed.
 OUT=$(run --distiller="$EMPTY" --max-sessions=5 --idle-min=0 2>&1)
@@ -145,7 +145,7 @@ touch -d '3 hours ago' "$PROJ/dddd-4444.jsonl"
 D4=$(stub d4 '{"atoms":[{"type":"project","name":"fourth-session-atom","description":"an atom from the fourth session","body":"A durable project fact distilled from the fourth session transcript.","confidence":"medium"}]}')
 LB=$(wc -l < "$LEDGER")
 OUT=$(run --distiller="$D4" --max-sessions=1 --dry-run 2>&1)
-printf '%s' "$OUT" | grep -q 'would write: \[project\] fourth-session-atom' && ok "dry run names the atom" || bad "dry run names the atom (got: $OUT)"
+grep -q 'would write: \[project\] fourth-session-atom' <<<"$OUT" && ok "dry run names the atom" || bad "dry run names the atom (got: $OUT)"
 [ -f "$STORE/project_fourth_session_atom.md" ] && bad "dry run wrote no file" || ok "dry run wrote no file"
 check "dry run left the ledger untouched" "$(wc -l < "$LEDGER")" "$LB"
 run --distiller="$D4" --max-sessions=1 >/dev/null 2>&1
@@ -156,7 +156,7 @@ mk_transcript "$PROJ/eeee-5555.jsonl" "a session that mentions a token" "Ok."
 touch -d '3 hours ago' "$PROJ/eeee-5555.jsonl"
 ERR=$(run --distiller="$SECRET" --max-sessions=1 2>&1 >/dev/null)
 [ -f "$STORE/reference_leaky_atom.md" ] && bad "leaky atom not on disk" || ok "leaky atom not on disk"
-printf '%s' "$ERR" | grep -q 'refused' && ok "refusal is reported, not swallowed" || bad "refusal is reported, not swallowed (got: $ERR)"
+grep -q 'refused' <<<"$ERR" && ok "refusal is reported, not swallowed" || bad "refusal is reported, not swallowed (got: $ERR)"
 grep -q 'leaky-atom' "$STORE/MEMORY.md" && bad "no index line for a refused atom" || ok "no index line for a refused atom"
 
 echo "── malformed atoms are dropped individually; the good one still lands ──"
@@ -174,13 +174,13 @@ mk_transcript "$PROJ/iiii-9999.jsonl" "a session the distiller cannot handle" "O
 touch -d '3 hours ago' "$PROJ/iiii-9999.jsonl"
 NOAUTH=$(stub noauth 'Not logged in · Please run /login')
 ERR=$(run --distiller="$NOAUTH" --max-sessions=1 2>&1 >/dev/null)
-printf '%s' "$ERR" | grep -q 'DISTILLER FAILED on 1 session' && ok "distiller failure is counted and loud" || bad "distiller failure is counted and loud (got: $ERR)"
+grep -q 'DISTILLER FAILED on 1 session' <<<"$ERR" && ok "distiller failure is counted and loud" || bad "distiller failure is counted and loud (got: $ERR)"
 grep -q '^iiii-9999' "$LEDGER" && bad "a failed distill is NOT ledgered (it must retry)" || ok "a failed distill is NOT ledgered (it must retry)"
 # CONTROL: a distiller that legitimately finds nothing IS ledgered and is silent.
 run --distiller="$EMPTY" --max-sessions=1 >/dev/null 2>&1
 grep -q '^iiii-9999' "$LEDGER" && ok "CONTROL: an honest empty answer retires the transcript" || bad "CONTROL: an honest empty answer retires the transcript"
 ERR=$(run --distiller="$EMPTY" --max-sessions=1 --force 2>&1 >/dev/null)
-printf '%s' "$ERR" | grep -q 'DISTILLER FAILED' && bad "CONTROL: an empty answer is not reported as a failure" || ok "CONTROL: an empty answer is not reported as a failure"
+grep -q 'DISTILLER FAILED' <<<"$ERR" && bad "CONTROL: an empty answer is not reported as a failure" || ok "CONTROL: an empty answer is not reported as a failure"
 
 echo "── DIVE-3711: a pass that wrote NOTHING because the distiller failed exits non-zero ──"
 # The exit code is what the heartbeat's failure bucket is built on, so rc 0 on a
@@ -288,7 +288,7 @@ mk_transcript "$PROJ/oooo-3711.jsonl" "a session for the human-mode control" "Ok
 touch -d '3 hours ago' "$PROJ/oooo-3711.jsonl"
 PURE2=$(stub pure2 '{"atoms":[{"type":"reference","name":"human-mode-progress-atom","description":"an atom whose write must still be announced to a human","body":"A durable reference fact written by the pass whose progress line a human still sees."}]}')
 OUT=$(run --distiller="$PURE2" --max-sessions=1 --force 2>/dev/null)
-printf '%s' "$OUT" | grep -q 'human-mode-progress-atom' \
+grep -q 'human-mode-progress-atom' <<<"$OUT" \
   && ok "CONTROL: in human mode the same pass still announces the atom" \
   || bad "CONTROL: in human mode the same pass still announces the atom (got: $OUT)"
 

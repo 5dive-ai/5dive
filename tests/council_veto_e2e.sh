@@ -243,7 +243,7 @@ fi
 RCPTS_BEFORE="$(ls -1 "$TMP/council/receipts/"*.json 2>/dev/null | wc -l | tr -d ' ')"
 NOSUBJ="$(COUNCIL_VETO_NONCE_SINK="$TMP/nsubj" "$FIVE" council convene "subject-less convene" --mode=quick 2>&1)"; rcns=$?
 [[ "$rcns" -ne 0 ]] && ok "a primary-council convene with NO --subject is REFUSED (rc=$rcns)" || no "subject-less primary convene was NOT refused (rc=$rcns)"
-printf '%s' "$NOSUBJ" | grep -q -- '--subject' && ok "the refusal names the --subject flag the caller must supply" || no "the refusal does not name --subject (got: $NOSUBJ)"
+grep -q -- '--subject' <<<"$NOSUBJ" && ok "the refusal names the --subject flag the caller must supply" || no "the refusal does not name --subject (got: $NOSUBJ)"
 RCPTS_AFTER="$(ls -1 "$TMP/council/receipts/"*.json 2>/dev/null | wc -l | tr -d ' ')"
 [[ "$RCPTS_BEFORE" == "$RCPTS_AFTER" ]] && ok "the refused convene sealed NO receipt (receipts $RCPTS_BEFORE -> $RCPTS_AFTER)" || no "a refused convene still sealed a receipt ($RCPTS_BEFORE -> $RCPTS_AFTER)"
 [[ ! -s "$TMP/nsubj" ]] && ok "the refused convene minted no veto nonce" || no "a refused convene still minted a veto nonce"

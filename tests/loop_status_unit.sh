@@ -110,7 +110,7 @@ out=$( cmd_loop_status )
 JSON_MODE=0
 tout=$( cmd_loop_status --handle=L-run 2>&1 )
 JSON_MODE=1
-printf '%s' "$tout" | grep -q "loop L-run" && printf '%s' "$tout" | grep -q "backing tasks" \
+grep -q "loop L-run" <<<"$tout" && grep -q "backing tasks" <<<"$tout" \
   && ok_t "text mode renders header + backing-task board" || bad_t "T9" "$tout"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

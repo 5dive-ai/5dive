@@ -163,7 +163,7 @@ fi
 # The load-bearing privacy property, stated as a property of the TABLE rather
 # than of any one column: the raw payload must appear NOWHERE in the row.
 dump=$(sqlite3 "$DB" "SELECT * FROM lifecycle_events;" 2>/dev/null)
-if [[ -n "$dump" ]] && ! printf '%s' "$dump" | grep -qF "$SECRET"; then
+if [[ -n "$dump" ]] && ! grep -qF "$SECRET" <<<"$dump"; then
   ok_t "privacy: the raw out= payload is nowhere in the table (digest only)"
 else
   bad_t "privacy: the raw payload reached the ledger" \
@@ -325,7 +325,7 @@ else
     ledger_emit task.created ident=MUT-1 task_id=1 actor=dev out="$SECRET" detail=x
   ) >/dev/null 2>&1
   mdump=$(sqlite3 "$MDB" "SELECT * FROM lifecycle_events;" 2>/dev/null)
-  if printf '%s' "$mdump" | grep -qF "$SECRET"; then
+  if grep -qF "$SECRET" <<<"$mdump"; then
     ok_t "mutation arm: with hashing removed the privacy assertion goes RED (it can bite)"
   else
     bad_t "mutation arm: privacy assertion stayed GREEN against a mutant that stores raw payloads" \

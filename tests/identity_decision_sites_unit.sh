@@ -150,7 +150,7 @@ ctl_halffix='_task_owner_channel() {
   [[ -n "$s" ]] && name="$s"
   _task_agent_channel "$name"
 }'
-if printf '%s\n' "$ctl_halffix" | grep -qE '\$\{USER:-\$\(id -un'; then
+if grep -qE '\$\{USER:-\$\(id -un' <<<"$ctl_halffix"; then
   no "CONTROL SETUP BROKEN — the half-fix fixture still contains the token it must not"
 elif is_clean "$ctl_halffix"; then
   no "CONTROL FAILED — the HALF-FIX passes: closing only the fallback would be certified complete, which is the exact defect on this row"
@@ -229,7 +229,7 @@ while IFS=: read -r f l rest; do
   IFS=$'\t' read -r fn fl < <(_su_enclosing_fn "$f" "$l")
   fbody=$(awk -v S="$fl" 'NR>=S {print} NR>=S && /^}/ {exit}' "$f")
   if [[ "$fn" == "actor_routing_agent" ]]; then _su_sanctioned=$((_su_sanctioned+1))
-  elif printf '%s' "$fbody" | grep -qE '_gate_is_root|EUID -eq 0|require_root'; then _su_guarded=$((_su_guarded+1))
+  elif grep -qE '_gate_is_root|EUID -eq 0|require_root' <<<"$fbody"; then _su_guarded=$((_su_guarded+1))
   elif sudo_uid_exempt "$f" "$fn" "$code"; then _su_exempt=$((_su_exempt+1))
   else _su_unclassified+="${f}:${l} (${fn:-<top level>}) "
   fi
@@ -247,7 +247,7 @@ done < <(grep -rnE '\$\{?SUDO_UID' src/ 2>/dev/null)
 _su_ctl=$(mktemp); printf 'some_new_helper() {\n  local u="${SUDO_UID:-}"\n  printf %%s "$u"\n}\n' > "$_su_ctl"
 _su_ctl_fn=$(_su_enclosing_fn "$_su_ctl" 2 | cut -f1)
 if [[ "$_su_ctl_fn" == "some_new_helper" ]] \
-   && ! printf 'some_new_helper() {\n  local u="${SUDO_UID:-}"\n}\n' | grep -qE '_gate_is_root|EUID -eq 0|require_root' \
+   && ! grep -qE '_gate_is_root|EUID -eq 0|require_root' <<<"$(printf 'some_new_helper() {\n  local u="${SUDO_UID:-}"\n}\n')" \
    && ! sudo_uid_exempt "src/some_new.sh" "some_new_helper" 'local u="${SUDO_UID:-}"'; then
   ok "CONTROL: an unguarded SUDO_UID read in a new ordinary function is classified UNCLASSIFIED"
 else
@@ -286,7 +286,7 @@ while IFS=: read -r f l rest; do
   [[ "$code" == *auto_sender_from_sudo* ]] || continue      # comment-only mention
   IFS=$'\t' read -r fn fl < <(_su_enclosing_fn "$f" "$l")
   fbody=$(awk -v S="$fl" 'NR>=S {print} NR>=S && /^}/ {exit}' "$f")
-  if printf '%s' "$fbody" | grep -qE '_gate_is_root|EUID -eq 0|require_root'; then _asfs_guarded=$((_asfs_guarded+1))
+  if grep -qE '_gate_is_root|EUID -eq 0|require_root' <<<"$fbody"; then _asfs_guarded=$((_asfs_guarded+1))
   elif asfs_exempt "$f" "$fn"; then _asfs_exempt=$((_asfs_exempt+1))
   else _asfs_bad+="${f}:${l} (${fn:-<top level>}) "
   fi

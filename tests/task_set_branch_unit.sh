@@ -66,7 +66,7 @@ id2=$(run add --body="do the thing
 second line" --assignee=alice -- "task with body" | jf '.data.id')
 run set_branch "$id2" main >/dev/null
 body2=$(db "SELECT body FROM tasks WHERE id=$id2;")
-{ printf '%s' "$body2" | grep -q "second line" && [[ "$(pushbranch "$id2")" == "main" ]]; } \
+{ grep -q "second line" <<<"$body2" && [[ "$(pushbranch "$id2")" == "main" ]]; } \
   && ok_t "set-branch preserves the pre-existing body" || bad_t "set-branch preserves the pre-existing body" "$body2"
 
 # --- T4: `task add --branch` seeds the binding at creation
@@ -77,7 +77,7 @@ id3=$(run add --branch=release/0.9 --assignee=alice -- "born with a branch" | jf
 # --- T5: whitespace / junk branch names are rejected (push parses one \S+ token)
 # In JSON_MODE the `fail` payload is emitted on stdout, so assert against it.
 e5=$(run set_branch "$id1" "bad name"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$e5" | grep -q "invalid branch name" \
+[[ $rc -ne 0 ]] && grep -q "invalid branch name" <<<"$e5" \
   && ok_t "set-branch rejects a name with whitespace" || bad_t "set-branch rejects a name with whitespace" "rc=$rc $e5"
 # the rejected write left the prior binding intact
 [[ "$(pushbranch "$id1")" == "feat/rebound" ]] \
@@ -85,7 +85,7 @@ e5=$(run set_branch "$id1" "bad name"); rc=$?
 
 # --- T6: missing branch arg -> usage error, not a silent no-op
 e6=$(run set_branch "$id1"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$e6" | grep -q "usage: 5dive task set-branch" \
+[[ $rc -ne 0 ]] && grep -q "usage: 5dive task set-branch" <<<"$e6" \
   && ok_t "set-branch with no branch arg errors" || bad_t "set-branch with no branch arg errors" "rc=$rc $e6"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
