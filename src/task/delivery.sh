@@ -793,8 +793,13 @@ _task_grade_tree_digest() {  # <tree>
 }
 
 _task_grade_tree_assert() {  # <id> <ident> <tree> [quiet]
-  local id="$1" ident="$2" tree="$3" quiet="${4:-0}" want got dirty base seal now
-  want=$(db "SELECT COALESCE(delivered_sha,'') FROM tasks WHERE id=${id};")
+  local id="$1" ident="$2" tree="$3" quiet="${4:-0}" want got dirty base seal now _res
+  # DIVE-4831: the SAME resolver the packet serves from, so the tree this check
+  # demands and the tree the packet handed over are the same tree by construction.
+  # Reading `delivered_sha` here instead would refuse the grader's own tree on
+  # exactly the rows this fix is for -- the ones whose board sha had gone stale.
+  _res=$(_task_grade_delivered_sha "$id" 2>/dev/null || printf '')
+  want="${_res%%$'\x1f'*}"
   [[ "$want" =~ ^[0-9a-f]{40}$ ]] || fail "$E_CONFLICT" "$ident has no recorded delivered sha; re-deliver from the source checkout (DIVE-4634)"
   [[ -d "$tree" ]] || fail "$E_NOT_FOUND" "$ident grading tree does not exist: $tree"
   got=$(git -C "$tree" rev-parse HEAD 2>/dev/null || printf '')
@@ -858,6 +863,133 @@ _task_grade_materialize_tree() {  # <repo-git-dir> <sha> <tree>
 
 # `task grade-context` is the grader's only entry point. It intentionally never
 # selects tasks.body, routing history, or a maker transcript.
+# ── DIVE-4831 — THE PACKET'S SHA IS READ FROM THE FORGE, NOT FROM THE BOARD ──
+#
+# `delivered_sha` is a column the board wrote at some earlier delivery. Three
+# measured specimens where it was not the sha under grade:
+#   DIVE-4725  an OLDER ITERATION of the same branch;
+#   DIVE-4744  an UNRELATED LINEAGE entirely (a different repo's branch);
+#   DIVE-4825  the sha quinn had already REJECTED at iteration 1 (2b808908),
+#              while the claim block and `gh pr view 1091 --json headRefOid`
+#              both said 21ee01b6 — and the bounded diff was served at the
+#              rejected tree, missing both fixes the reject demanded.
+#
+# WHY THAT STOPPED BEING HYGIENE ON 2026-09-22. Before DIVE-4825 the staleness
+# was self-correcting: the grader read the diff, saw it lacked the response to
+# its own reject, and bounced. DIVE-4825 put a COMPUTED GRADE TABLE in the packet
+# under the words "do NOT re-run the unflagged lines". Compose the two and a
+# stale packet stops costing a wasted re-grade and starts CLOSING A ROW on a
+# verdict computed at a tree that was rejected. A green table read by a grader
+# who has been told the lines are settled is not self-correcting by anything.
+#
+# `_task_grade_pr_shas <id>` prints `<head>|<merge>` off the DELIVERY PR, or
+# EMPTY when the forge could not be asked. Empty is NOT a mismatch — same
+# fail-open contract as `_gate_pr_shas`, which this wraps: an outage must never
+# manufacture a refusal, it only costs the check.
+_task_grade_pr_shas() {  # <id>
+  local id="$1" dref tok slug pair
+  declare -F _gate_pr_shas >/dev/null 2>&1 || return 1
+  declare -F _gate_gh_token >/dev/null 2>&1 || return 1
+  dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  [[ -n "$dref" ]] || return 1
+  slug=$(_gate_slug_from_url "$dref" 2>/dev/null || printf '')
+  tok=$(_gate_gh_token 2>/dev/null) || tok=""
+  pair=$(_gate_pr_shas "$dref" "$tok" "$slug" 2>/dev/null) || pair=""
+  [[ -n "${pair//|/}" ]] || return 1
+  printf '%s' "$pair"
+}
+
+# `_task_grade_table_sha <table>` — the sha the stored computed table was produced
+# at, read off its own `GRADE <ident> @ <sha12> (base <base12>)` header. Prints
+# empty for a NOT COMPUTED table, which has no `@ <sha>` at all.
+_task_grade_table_sha() {  # <table-text>
+  head -1 <<<"$1" | grep -oE '@ [0-9a-f]{7,40}' | head -1 | sed 's/^@ //'
+}
+
+# `_task_grade_delivered_sha <id>` — THE ONE RESOLVER. Prints three US-separated
+# fields: `<sha>` `<state>` `<pr-head>`, where state is one of:
+#
+#   match             the board's sha IS the delivery pull request's head (or its
+#                     merge commit). The ONLY state that licenses DIVE-4825's
+#                     "do NOT re-run the unflagged lines".
+#   superseded        the head is readable, is a different commit, and is present
+#                     in the delivery checkout -> THE HEAD WINS and <sha> is it.
+#   superseded-absent the head is readable and different but is NOT in the
+#                     checkout, so the board's sha is kept and everything is
+#                     marked unverified. Never a refusal: a packet that cannot be
+#                     built is worse than one that is honest about what it is.
+#   unread            the forge could not be asked. NOT CHECKED, never MATCHED.
+#
+# WHY ONE FUNCTION AND NOT TWO READS. `cmd_task_grade_context` SERVES the sha and
+# `_task_grade_tree_assert` ENFORCES it -- including on the grader's separate
+# `--check=<tree>` invocation, which has no packet in scope. If each resolved the
+# sha its own way they would disagree exactly when it matters: the build would
+# re-point at the head and the pre-verdict check would then refuse the very tree
+# the packet had just handed over. One resolver makes that unrepresentable.
+#
+# MEMOISED PER PROCESS because the assert runs more than once per packet build,
+# and because two forge reads straddling a push would otherwise return different
+# answers inside one packet.
+# `_task_grade_claim_sha <result>` — the sha the MAKER wrote on the DIVE-4576
+# `DELIVERED-SHA:` line. The packet's SECOND, INDEPENDENT record of what was
+# delivered, and on the measured DIVE-4825 specimen it was the one that was RIGHT
+# (21ee01b6) while the board column was stale (2b808908). Last occurrence wins: a
+# re-delivery prepends, so the newest claim is the last line.
+_task_grade_claim_sha() {  # <result>
+  printf '%s\n' "$1" | grep -oiE '^ *DELIVERED[-_]?SHA *: *[0-9a-f]{7,40}' \
+    | grep -oE '[0-9a-f]{7,40}' | tail -1
+}
+
+_TASK_GRADE_SHA_CACHE_ID=""
+_TASK_GRADE_SHA_CACHE=""
+_task_grade_delivered_sha() {  # <id>
+  local id="$1" repo board pair head="" merge state="unread" sha
+  if [[ "$_TASK_GRADE_SHA_CACHE_ID" == "$id" && -n "$_TASK_GRADE_SHA_CACHE" ]]; then
+    printf '%s' "$_TASK_GRADE_SHA_CACHE"; return 0
+  fi
+  board=$(db "SELECT COALESCE(delivered_sha,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  repo=$(db "SELECT COALESCE(delivery_repo_path,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  sha="$board"
+  pair=$(_task_grade_pr_shas "$id" 2>/dev/null) || pair=""
+  if [[ -n "$pair" ]]; then
+    head="${pair%%|*}"; merge="${pair#*|}"
+    if [[ -n "$board" && ( "$board" == "$head" || ( -n "$merge" && "$board" == "$merge" ) ) ]]; then
+      state="match"
+    elif [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+      if [[ -d "$repo" ]] && git --git-dir="$repo" cat-file -e "${head}^{commit}" 2>/dev/null; then
+        state="superseded"; sha="$head"
+      else
+        state="superseded-absent"
+      fi
+    fi
+  else
+    # ── NO FORGE? THEN USE THE PACKET'S OTHER INDEPENDENT RECORD. ────────────
+    # Most boxes hold no gh credential, so treating every unreadable forge as
+    # "unconfirmed" would withdraw DIVE-4825's instruction fleet-wide and hand
+    # back the entire saving that row bought — a freshness check that costs more
+    # than the staleness it prevents is not a trade anybody asked for.
+    #
+    # The maker's own `DELIVERED-SHA:` line is a SECOND record of the same fact,
+    # written at delivery by a different writer than the column. On the measured
+    # DIVE-4825 specimen the two DISAGREED and the claim block was the correct
+    # one — which is precisely how quinn noticed. So two independent records
+    # agreeing is corroboration, and their disagreement is the specimen's own
+    # tell, available with no credential at all.
+    #
+    # It is weaker evidence than the forge and is labelled as such, never as
+    # `match`: it cannot see a push that happened after the delivery was written.
+    local claim; claim=$(_task_grade_claim_sha "$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')")
+    if [[ -n "$claim" && -n "$board" && "$board" == "$claim"* ]]; then
+      state="unread-corroborated"
+    elif [[ -n "$claim" ]]; then
+      state="unread-contradicted"; head="$claim"
+    fi
+  fi
+  _TASK_GRADE_SHA_CACHE_ID="$id"
+  _TASK_GRADE_SHA_CACHE=$(printf '%s\x1f%s\x1f%s' "$sha" "$state" "$head")
+  printf '%s' "$_TASK_GRADE_SHA_CACHE"
+}
+
 cmd_task_grade_context() {
   tasks_db_init
   local task="" check=""
@@ -885,6 +1017,28 @@ cmd_task_grade_context() {
   git --git-dir="$repo" cat-file -e "${sha}^{commit}" 2>/dev/null \
     || fail "$E_CONFLICT" "$ident delivered sha $sha is absent from $repo — REJECT (DIVE-4634)"
 
+  # ── DIVE-4831: the sha served is the DELIVERY's, through the one resolver ──
+  local _res _sha_state _pr_head _sha_board="$sha" _sha_note=""
+  _res=$(_task_grade_delivered_sha "$id")
+  sha="${_res%%$'\x1f'*}"; _res="${_res#*$'\x1f'}"
+  _sha_state="${_res%%$'\x1f'*}"; _pr_head="${_res#*$'\x1f'}"
+  case "$_sha_state" in
+    superseded)
+      _sha_note="STALE BOARD SHA (DIVE-4831): the task store said ${_sha_board:0:12}, but the delivery pull request carries head ${_pr_head:0:12}. THIS PACKET IS BUILT AT THE PR HEAD. The board's sha is an earlier delivery of this row — on the measured specimen it was a sha the verifier had already REJECTED, served with a diff missing the fixes that reject demanded." ;;
+    superseded-absent)
+      _sha_note="STALE BOARD SHA (DIVE-4831), AND THE PR HEAD IS NOT IN THIS CHECKOUT: the task store said ${_sha_board:0:12}; the delivery pull request carries head ${_pr_head:0:12}, which is absent from the delivery repo, so the tree below is at the BOARD's sha. TREAT EVERYTHING BELOW AS UNVERIFIED against the delivery — read the pull request head yourself before any verdict." ;;
+    unread-contradicted)
+      _sha_note="THE TWO RECORDS OF THE DELIVERED SHA DISAGREE (DIVE-4831): the task store says ${sha:0:12}, the maker's own DELIVERED-SHA line says ${_pr_head:0:12}, and the pull request could not be read to break the tie. On the measured specimen the MAKER's line was the correct one and the store was serving a sha the verifier had already rejected. TREAT THE TREE BELOW AS UNVERIFIED and read the pull request head yourself before any verdict." ;;
+    unread-corroborated)
+      _sha_note="" ;;
+    unread)
+      _sha_note="PR HEAD NOT CHECKED (DIVE-4831): the delivery pull request could not be read (no binding, no credential, or the forge was unreachable) AND the result states no DELIVERED-SHA to corroborate it, so whether ${sha:0:12} is still the delivered sha is UNKNOWN here. This is 'not checked', never 'matched'." ;;
+  esac
+  # Re-run the presence check against the sha we will ACTUALLY serve, not the one
+  # the column happened to hold.
+  git --git-dir="$repo" cat-file -e "${sha}^{commit}" 2>/dev/null \
+    || fail "$E_CONFLICT" "$ident sha $sha is absent from $repo — REJECT (DIVE-4634)"
+
   root="${XDG_STATE_HOME:-${HOME}/.local/state}/5dive/grades"
   mkdir -p "$root" || fail "$E_GENERIC" "cannot create private grader state at $root"
   chmod 700 "$root" 2>/dev/null || true
@@ -911,6 +1065,32 @@ cmd_task_grade_context() {
   # the seat that was woken because of it — and the whole point of waking that
   # seat is the one line the computation could not settle.
   local ctable=""; ctable=$(_task_grade_table_from_body "$id" 2>/dev/null || printf '')
+  # DIVE-4831 — THE "DO NOT RE-RUN" CLAUSE IS EARNED, NOT PRINTED UNCONDITIONALLY.
+  # It is the only sentence in this packet that tells the grader to STOP checking,
+  # so it may appear only when the table was computed at the very sha this packet
+  # is served at. Two independent ways it can fail to be, and both were live:
+  #   - the packet's sha is not the delivery's (the three specimens above), and
+  #   - the table's own `GRADE <ident> @ <sha>` header names a different commit,
+  #     which happens on a re-delivery that did not recompute.
+  # When either holds the table still ships — it is evidence a grader should see —
+  # but under a header that says what it is and withdraws the instruction. That is
+  # the cheap interim arm the row asked for, made the permanent rule: a settled
+  # verdict and an unverified one must not read the same.
+  local _ctable_sha="" _ctable_hdr=""
+  if [[ -n "$ctable" ]]; then
+    _ctable_sha=$(_task_grade_table_sha "$ctable")
+    # LICENSED BY TWO INDEPENDENT CONDITIONS. The sha must be confirmed -- by the
+    # forge (`match`) or, on a box that cannot ask it, by the maker's own
+    # DELIVERED-SHA line agreeing with the store (`unread-corroborated`) -- AND the
+    # stored table's own header must name the sha being served, which is what
+    # catches a re-delivery that did not recompute on a perfectly current sha.
+    if [[ ( "$_sha_state" == "match" || "$_sha_state" == "unread-corroborated" ) \
+          && -n "$_ctable_sha" && "$sha" == "$_ctable_sha"* ]]; then
+      _ctable_hdr="COMPUTED GRADE TABLE (DIVE-4825 — produced from clean checkouts at DELIVERED_SHA, and DELIVERED_SHA is confirmed to be this delivery's pull-request head; do NOT re-run the unflagged lines):"
+    else
+      _ctable_hdr="COMPUTED GRADE TABLE — ⚠️ NOT CONFIRMED AT THIS SHA (DIVE-4831), SO THE 'DO NOT RE-RUN' INSTRUCTION IS WITHDRAWN. It was computed at ${_ctable_sha:-an unrecorded sha} and this packet is served at ${sha:0:12}; the pull-request head check says ${_sha_state}. Read it as a CLAIM to check, exactly like the claim block, not as settled work. Re-derive whatever your verdict rests on:"
+    fi
+  fi
   # DIVE-4634 iteration 3: the truncation is hoisted OUT of the heredoc rather than
   # spelled inline. `<<PACKET` is deliberately unquoted — it has to interpolate
   # ${ident} ${mode} ${tree} ${sha} ${base} ${claim} ${diff} — and an unquoted heredoc
@@ -920,12 +1100,14 @@ cmd_task_grade_context() {
   # literal text and emit a packet naming no task, no tree and no sha.
   criteria_b=$(printf '%s' "$criteria" | head -c 16384)
   cat <<PACKET
-BEGIN BOUNDED GRADING PACKET DIVE-4634
+BEGIN BOUNDED GRADING PACKET DIVE-4634 (sha reconciliation DIVE-4831)
 TASK: ${ident}
 MODE: ${mode}
 GRADE_TREE: ${tree}
 DELIVERED_SHA: ${sha}
 BASE_SHA: ${base}
+PR_HEAD_CHECK: ${_sha_state}${_pr_head:+ (pull-request head ${_pr_head:0:12})}${_sha_note:+
+⚠️  ${_sha_note}}
 
 ACCEPTANCE CRITERIA (bounded at 16384 bytes):
 ${criteria_b}
@@ -933,7 +1115,7 @@ ${criteria_b}
 DELIVERY CLAIM BLOCK (the CHECKED lines are the commands and reported outputs to re-run):
 ${claim}
 ${ctable:+
-COMPUTED GRADE TABLE (DIVE-4825 — produced from clean checkouts at DELIVERED_SHA; do NOT re-run the unflagged lines):
+${_ctable_hdr}
 ${ctable}}
 
 GIT DIFF AT DELIVERED SHA (bounded at ${FIVEDIVE_GRADE_DIFF_MAX_BYTES:-131072} bytes):
@@ -3056,14 +3238,46 @@ _task_merge_landed_record() {
 _task_merge_landed_handoff() {
   local id="$1" ident="$2" assignee="$3" vfier="$4"
   [[ -n "$vfier" && "$vfier" != "$assignee" ]] || return 0
-  # The same clock reset `task assign` makes, and for its reason: an inherited
-  # in_progress row that keeps the previous owner's started_at is eligible for the
-  # stale reaper on the new owner's very first tick.
+  # ── DIVE-4843: A HAND-OVER WRITES `todo`. IT NEVER WRITES `in_progress`. ────
+  #
+  # This used to carry the in_progress the PREVIOUS seat's turn had claimed, and
+  # only refresh started_at. The result is a claim nobody made: the row reads as
+  # live work on a seat that has not been woken onto it, and BOTH picker arms
+  # select `t.status='todo'` (cmd_heartbeat.sh ~2227 and ~2243), so the dispatcher
+  # cannot see it. The one-shot courtesy ping the sweep sends afterwards is not a
+  # dispatch — a grader mid-turn drops it (one row per turn) and nothing re-sends
+  # it. The row then waits for the stale reaper, which is hours.
+  #
+  # MEASURED 2026-09-22 (main): DIVE-4837's pull request merged 09:48:05Z and
+  # DIVE-4824's 09:56:57Z; both rows went to `in_progress assignee=quinn` with a
+  # fresh started_at and no wake, neither ever appeared in a quinn `/goal`, and a
+  # `task done` from any other seat is correctly refused (writer != grader,
+  # DIVE-477). Two rows merged on the forge that nobody could close. lodar saw the
+  # other face of it: "how can one agent still hold several in_progress tasks if
+  # he locks on one goal per time" — quinn showed three in_progress rows while
+  # running exactly one turn.
+  #
+  # So the claim is left to the dispatcher, which is the only thing that makes
+  # one: it writes in_progress at wake time for every other row and there is no
+  # reason this row is different. started_at is CLEARED rather than refreshed —
+  # a started_at with no turn behind it is what fed the stale reaper the illusion
+  # it was reaping real work.
+  #
+  # ORDER-OF-EVALUATION, and it is load-bearing: in a single SQLite UPDATE every
+  # CASE reads the row's PRE-UPDATE values, so the `started_at` arm still sees the
+  # old `in_progress` even though the `status` arm above has already rewritten it.
+  # The two arms fire together or not at all. Arm B3 of the harness asserts
+  # exactly that pairing, because a reader who assumed left-to-right assignment
+  # would "fix" this into a row with status=todo and a stale started_at.
+  #
+  # ONLY `in_progress` IS TOUCHED. A row that is blocked, done or cancelled keeps
+  # its status: this hand-over releases a claim, it does not re-open a row.
   db "UPDATE tasks SET
         assignee=$(sqlq "$vfier"),
-        started_at=CASE WHEN status='in_progress' THEN datetime('now') ELSE started_at END
+        status=CASE WHEN status='in_progress' THEN 'todo' ELSE status END,
+        started_at=CASE WHEN status='in_progress' THEN NULL ELSE started_at END
       WHERE id=${id};" || return 0
-  printf ' The row is now assigned to %s, the seat whose close is ungated on a loop row.' "$vfier"
+  printf ' The row is now assigned to %s, the seat whose close is ungated on a loop row, and is DISPATCHABLE — the claim is the dispatcher'"'"'s to make at wake time (DIVE-4843).' "$vfier"
 }
 
 cmd_task_merge_landed() {
@@ -3199,14 +3413,18 @@ _task_merge_declined_record() {
 _task_merge_declined_handoff() {
   local id="$1" ident="$2" assignee="$3" maker="$4"
   [[ -n "$maker" && "$maker" != "$assignee" ]] || return 0
-  # The same clock reset `task assign` makes: an inherited in_progress row that
-  # keeps the previous owner's started_at is eligible for the stale reaper on the
-  # new owner's very first tick.
+  # DIVE-4843, the same rule and the same reason as `_task_merge_landed_handoff`
+  # above — read the long note there. This is the OTHER exit from the merging
+  # stage and it re-homes a row exactly the same way, so it stranded exactly the
+  # same way; it is fixed here rather than left to be measured in its own
+  # incident. A hand-over writes `todo` and clears the claim; the dispatcher makes
+  # the claim at wake time. Only `in_progress` is touched.
   db "UPDATE tasks SET
         assignee=$(sqlq "$maker"),
-        started_at=CASE WHEN status='in_progress' THEN datetime('now') ELSE started_at END
+        status=CASE WHEN status='in_progress' THEN 'todo' ELSE status END,
+        started_at=CASE WHEN status='in_progress' THEN NULL ELSE started_at END
       WHERE id=${id};" || return 0
-  printf ' The row is now assigned to %s, the seat that can re-point the binding.' "$maker"
+  printf ' The row is now assigned to %s, the seat that can re-point the binding, and is DISPATCHABLE (DIVE-4843).' "$maker"
 }
 
 cmd_task_merge_declined() {

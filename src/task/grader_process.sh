@@ -308,7 +308,15 @@ _grader_grade_method_clause() {  # [ident]
     [[ -n "$_gid" ]] && tbl=$(_task_grade_table_from_body "$_gid" 2>/dev/null || printf '')
   fi
   if [[ -n "$tbl" ]]; then
-    printf 'COMPUTED GRADE (DIVE-4825): the packet carries a COMPUTED GRADE TABLE produced from clean checkouts at DELIVERED_SHA. DO NOT re-run its unflagged lines and do not build a control or a mutant tree — that work is already done and re-deriving it is the burn this pass removed. If the table says FLAGGED, re-derive ONLY the flagged line and decide on it; budget %s turns. If the table says PASS, you were drawn for a READ: judge intent and honesty from the diff, the table and the claim block — a harness that is green but tests the wrong thing, a criterion the result claims and the diff does not close — then accept, or reject with FINDING/FIX/VERIFY; budget 5 turns and no clone. Run `5dive task grade-context %s` for the packet and its --check command before the verdict.' \
+    # DIVE-4831 — THE GOAL MUST NOT ISSUE THE INSTRUCTION THE PACKET MAY WITHDRAW.
+    # This text reaches the grader BEFORE the packet does, and it used to say "DO
+    # NOT re-run" flatly. The packet now checks the served sha against the delivery
+    # pull request's head and withdraws that instruction when they disagree — but a
+    # grader who has already been told the lines are settled has no reason to read
+    # the header that un-tells them. So the goal defers: the packet's own
+    # PR_HEAD_CHECK line is what licenses skipping the re-run, and this sentence
+    # names the condition rather than asserting it.
+    printf 'COMPUTED GRADE (DIVE-4825): the packet carries a COMPUTED GRADE TABLE produced from clean checkouts at a delivered sha. READ THE PACKET FIRST AND CHECK ITS `PR_HEAD_CHECK:` LINE (DIVE-4831). If it says `match`, DO NOT re-run the table'"'"'s unflagged lines and do not build a control or a mutant tree — that work is already done and re-deriving it is the burn this pass removed. If it says anything else, the table was NOT confirmed at the sha you are being served and the packet withdraws that instruction: treat the table as a claim to check, and re-derive whatever your verdict rests on. If the table says FLAGGED, re-derive ONLY the flagged line and decide on it; budget %s turns. If the table says PASS, you were drawn for a READ: judge intent and honesty from the diff, the table and the claim block — a harness that is green but tests the wrong thing, a criterion the result claims and the diff does not close — then accept, or reject with FINDING/FIX/VERIFY; budget 5 turns and no clone. Run `5dive task grade-context %s` for the packet and its --check command before the verdict.' \
       "${_GRADER_FLAGGED_TURN_BUDGET:-10}" "$ident"
     return 0
   fi
