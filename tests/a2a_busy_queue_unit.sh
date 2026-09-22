@@ -187,16 +187,22 @@ is "T8: queued:true"  "true"  "$(jq -r '.data.queued' <<<"$out")"
 prose="$(IDLE_RC=1 cmd_send ops --message="mid-attempt ping" 2>/dev/null | tail -1)"
 [[ "$prose" == *"queued for agent 'ops'"* ]] \
   && ok_t "T8: prose says queued, not sent" || bad_t "T8: prose says queued, not sent" "$prose"
-# The IDLE receipt is what it was. Asserted on the PROSE line, not the JSON one,
-# and that is a finding rather than a convenience: on main today the sent:true
-# branch renders an EMPTY JSON envelope whenever AGENT_WAKE_READY is unset (i.e.
-# every send that did not have to --wake the target), because the jq object
-# carries `ready:($rd|select(length>0))` and jq drops the WHOLE object when any
-# constructed value is `empty`. Reproduced against pristine origin/main with the
-# same stubs, so it is pre-existing and out of this row's scope — recorded on
-# DIVE-4214's body. The queued branch does not inherit it: its receipt builds the
-# optional keys with `if ... then ... else {} end`.
+# The IDLE receipt is what it was, and it is now asserted on the JSON envelope
+# like its queued sibling above. It used to be asserted on the PROSE line, which
+# was a finding rather than a convenience: the sent:true branch rendered an EMPTY
+# JSON envelope whenever AGENT_WAKE_READY was unset (i.e. every send that did not
+# have to --wake the target), because the jq object carried
+# `ready:($rd|select(length>0))` and jq drops the WHOLE object when any
+# constructed value is `empty`. Recorded on DIVE-4214's body, fixed by putting the
+# ordinary receipt on the same `if ... then ... else {} end` form the queued
+# branch always used. tests/agent_send_json_receipt_unit.sh grades that receipt in
+# full; here it is the control that the QUEUE decision left it alone.
 reset_arm
+out="$(IDLE_RC=0 JSON_MODE=1 cmd_send ops --message="ping" 2>/dev/null)"
+is "T8: idle receipt is exactly one line" "1" "$(printf '%s\n' "${out:-}" | grep -c '^{' || true)"
+is "T8: idle send is sent:true"    "true"  "$(jq -r '.data.sent|tostring' <<<"$out" 2>/dev/null || true)"
+is "T8: idle send carries a msg_id" "q4214" "$(jq -r '.data.msg_id // "ABSENT"' <<<"$out" 2>/dev/null || true)"
+is "T8: idle send has no queued key" "false" "$(jq -r '.data|has("queued")|tostring' <<<"$out" 2>/dev/null || true)"
 prose="$(IDLE_RC=0 cmd_send ops --message="ping" 2>/dev/null | tail -1)"
 [[ "$prose" == *"sent to agent 'ops'"* ]] \
   && ok_t "T8: idle send still reports sent" || bad_t "T8: idle send still reports sent" "$prose"
