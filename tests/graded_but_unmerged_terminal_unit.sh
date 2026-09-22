@@ -100,18 +100,31 @@ mkrow() {
   esac
   printf '%s' "$id"
 }
-# Match the GAP#2 delivery nudge specifically. `grep -q .` would also match the
-# gap#3 fleet-idle alarm, so an unrelated alarm would read as "the delivery was
-# nudged" — assert on a signal only the system under test can produce.
-# Must match the gap#2 nudge FOR THIS ROW. Two earlier versions of this helper were
-# wrong in the same direction and both produced a confident green: `grep -q .` also
-# matched the gap#3 fleet-idle alarm, and matching the gap#2 text alone also matched
-# a nudge fired for a DIFFERENT row in the same sweep — the positive-control row is
-# eligible on every call. Scope the assertion to the subject, not just the signal.
+# Did the GAP#2 rot-nudger SELECT this row on the last sweep?
+#
+# THE OBSERVABLE MOVED, AND THE ARMS BELOW DEPEND ON IT (DIVE-4826). This helper
+# used to grep the send log for the "delivered to you for review … still
+# unacknowledged" a2a. DIVE-4826 deleted that send — it was redundant by
+# construction with the dispatcher, which wakes the same seat onto the same row —
+# so a text match on the log now reads EMPTY FOR EVERY ROW. That does not merely
+# red the positive control: it makes arm B ("graded+bound is EXEMPT") pass
+# VACUOUSLY, which is the exact failure this helper's own history (two earlier
+# wrong versions, both confidently green) exists to prevent.
+#
+# `handoff_stale_pinged_at` is the observable DIVE-4826 deliberately KEPT: gap#2
+# stamps it on every row it selects, on the line where the send used to be, and
+# the select still carries `AND NOT (${_TASKS_TFV_SQL})` — the exemption these
+# arms grade. Same move DIVE-4296 made for the gate arms when their send went away.
+#
+# It is also strictly better scoped than the text was. The stamp is written per
+# ROW BY CONSTRUCTION, so the two ways the old helper was wrong — matching the
+# gap#3 fleet-idle alarm, and matching a gap#2 nudge fired for a DIFFERENT row in
+# the same sweep (the positive-control row is eligible on every call) — cannot
+# recur here. No ident scoping is needed because there is nothing to scope.
 nudged() {
-  local id="$1" ident hits
-  ident=$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks WHERE id=${id};")
-  [[ -n "$ident" ]] || { bad_t "nudged(): could not resolve ident for id=$id" "any match would be vacuous"; return 1; }
+  local id="$1" existed
+  existed=$(db "SELECT COUNT(*) FROM tasks WHERE id=${id};")
+  [[ "$existed" == "1" ]] || { bad_t "nudged(): no row id=$id" "any verdict would be vacuous"; return 1; }
   # Clear the throttle BEFORE the sweep, not after. gap#2 skips any row whose
   # handoff_stale_pinged_at is already set, and an EARLIER nudged() call in this
   # harness sweeps the whole board — so a row pinged during someone else's call is
@@ -120,13 +133,7 @@ nudged() {
   db "UPDATE tasks SET handoff_stale_pinged_at=NULL WHERE id=${id};"
   : >"$SEND_LOG"
   _hb_stall_sweep >/dev/null 2>&1
-  # Count gap#2 lines naming THIS row. Word-boundary anchored so DIVE-1 does not
-  # match DIVE-10, and counted rather than piped: a `grep A | grep -q B` pipeline
-  # reports the exit status of the second grep over the FIRST grep's output, which
-  # is easy to get subtly wrong and returns a confident wrong answer either way.
-  hits=$(grep -E 'Delivered-awaiting-verifier|delivered to you for review' "$SEND_LOG" 2>/dev/null \
-         | grep -cE "\b${ident}\b" 2>/dev/null)
-  [[ "${hits:-0}" -gt 0 ]]
+  [[ -n "$(db "SELECT COALESCE(handoff_stale_pinged_at,'') FROM tasks WHERE id=${id};")" ]]
 }
 
 echo "── the real verb stamps the structural marker (it must not be prose) ──"
@@ -167,7 +174,7 @@ P=$(mkrow ref_no_grade)
 nudged "$P" && ok_t "B/POSITIVE CONTROL: an aged, ungraded delivery IS nudged (the window really elapsed)" \
              || bad_t "B/POSITIVE CONTROL: the nudger was going to fire" "absence below would prove nothing"
 if nudged "$G"; then
-  bad_t "B: a graded+bound row must be EXEMPT from the nudger" "still pinged; log=$(tr '\n' ';' <"$SEND_LOG" | head -c 300)"
+  bad_t "B: a graded+bound row must be EXEMPT from the nudger" "gap#2 stamped it: handoff_stale_pinged_at=$(db "SELECT handoff_stale_pinged_at FROM tasks WHERE id=${G};")"
   printf '   DEBUG tfv=%s ident=%s\n' \
     "$(db "SELECT CASE WHEN ${_TASKS_TFV_SQL} THEN 'TRUE' ELSE 'FALSE' END FROM tasks WHERE id=${G};")" \
     "$(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks WHERE id=${G};")"

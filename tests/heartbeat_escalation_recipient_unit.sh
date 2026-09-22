@@ -6,7 +6,8 @@
 # THE DEFECT. `src/cmd_heartbeat.sh` addressed eleven escalations to a literal
 # seat name — three to `main` (the DIVE-3465 spend-cap wall, the DIVE-1666
 # usage-limit freeze, the DIVE-3503/1486 stranded seat) and eight to `ops` (the
-# queue-housekeeping rails). Both names exist on exactly one box in the world:
+# queue-housekeeping rails). The census is ten today, not eleven: DIVE-4826 moved
+# three ops rails onto the batching spool and added two sites of its own — see B0. Both names exist on exactly one box in the world:
 # ours. Worse than the supervisor rails this mirrors: every one was wrapped
 # `( … ) >/dev/null 2>&1 || true`, so on a box with no such seat the send failed
 # with ZERO trace — no warn in the cron log, no `supervisor_events` row, nothing
@@ -127,8 +128,18 @@ while IFS= read -r _line; do
   elif [[ $_in -eq 1 ]]; then _buf+=$'\n'"$_line"; fi
   if [[ $_in -eq 1 && "$_buf" != *'\' ]]; then CALLS+=("$_buf"); _in=0; _buf=""; fi
 done < src/cmd_heartbeat.sh
-t "B0 every escalation in the product file was extracted (11 sites: 3 billing/stranded + 8 housekeeping)" \
-  "11" "${#CALLS[@]}"
+# THE CENSUS MOVES WHEN THE PRODUCT MOVES, and DIVE-4826 moved it: three
+# housekeeping rails (🧊 stranded-row, ⚠️ blocked-no-reason, ⏳ recurring-stall)
+# stopped calling `_hb_escalate` directly and now queue through
+# `_hb_ops_digest_note`, and two NEW sites arrived on the batching rail itself —
+# `ops-digest` (the once-per-window flush) and `ops-digest-fallback` (the
+# unwritable-spool escape, which is a live send on purpose). 8 - 3 + 2 = 7
+# housekeeping, and the three billing/stranded rails are untouched. Both
+# digest-owned sites still resolve through `_hb_ops_recipient`, which is why they
+# belong in this census and not outside it: the batcher changed WHEN ops is told,
+# never WHO resolves.
+t "B0 every escalation in the product file was extracted (10 sites: 3 billing/stranded + 7 housekeeping, 2 of them digest-owned since DIVE-4826)" \
+  "10" "${#CALLS[@]}"
 
 # The product sends inside a SUBSHELL — deliberately, so a `fail`ing send cannot
 # exit the tick (DIVE-1127). So the recorder writes to a FILE: an array would be
@@ -150,13 +161,17 @@ drive() {
   : >"$SENT_LOG"
   local name=claude-ivan acct=pooled-1 defer_n=7 task_ident=DIVE-9001 heal_gap=91
   local -a rec=(1 2); local idlist="DIVE-9001 DIVE-9002 " orphan="DIVE-9003 "
-  local rident=DIVE-9004 rtmpl=DIVE-8000 rhours=26 rasg=claude-ivan rbusy="" rsupp_main="skip"
   local eident=DIVE-9005 etmpl=DIVE-8001 easg=claude-ivan etarget=claude-jane ehours=51
   local emsg="Recurring-stall ESCALATED:"
-  local sident=DIVE-9006 sdays=9 sphase=todo sasg=claude-ivan sbusy="" sload=2 slane="reassign"
   local _hdr="FLEET IDLE" total_stranded=4 stranded_todo=3 open_gates=1 since_secs=5400 parked_gates=0
   local _act_detail="0 active" _tail="(detail)" eligible=6 last_ping="never"
-  local _HB_RECURRING_ESCALATE_HOURS=24
+  # DIVE-4826's two digest-owned sites. `subject/class/raw` are _hb_ops_digest_note's
+  # own locals at the unwritable-spool fallback; `hdr/body` are the flush's composed
+  # message. The stranded/recurring-stall/blocked-no-reason fixtures that used to sit
+  # here were deleted with their call sites — a fixture for a line that no longer
+  # exists is a claim this harness cannot back.
+  local subject=DIVE-9007 class="stranded-row" raw="🧊 Stranded 9d: DIVE-9007"
+  local hdr="📋 Board digest — 3 notice(s)" body=$'\n1. [ts DIVE-9007] 🧊 Stranded 9d'
   local c
   for c in "${CALLS[@]}"; do eval "$c" || return 1; done
   return 0
@@ -165,18 +180,18 @@ drive() {
 this_box; clear_events
 drive; rc=$?
 t "B1 this box: every extracted site runs and none aborts the tick" "0" "$rc"
-t "B2 this box: all 11 escalations were sent" "11" "$(sent_n)"
+t "B2 this box: all 10 escalations were sent" "10" "$(sent_n)"
 t "B3 this box: the three billing/stranded rails still go to main (no behaviour change here)" \
   "3" "$(sent_to main)"
-t "B4 this box: the eight housekeeping rails still go to ops (no behaviour change here)" \
-  "8" "$(sent_to ops)"
+t "B4 this box: the seven housekeeping rails still go to ops (no behaviour change here)" \
+  "7" "$(sent_to ops)"
 t "B5 this box: and nothing was lost" "0" "$(undeliv_count)"
 
 lone_root; clear_events
 drive; rc=$?
 t "B6 lone-root customer chart: every site runs" "0" "$rc"
-t "B7 lone-root customer chart: ALL ELEVEN reach claude-aleks — including the three billing/stranded rails that used to reach nobody" \
-  "11" "$(sent_to claude-aleks)"
+t "B7 lone-root customer chart: ALL TEN reach claude-aleks — including the three billing/stranded rails that used to reach nobody" \
+  "10" "$(sent_to claude-aleks)"
 t "B8 lone-root customer chart: no seat named main was addressed" \
   "0" "$(sent_to main)"
 t "B9 lone-root customer chart: nothing lost" "0" "$(undeliv_count)"
@@ -186,15 +201,15 @@ three_roots; clear_events
 drive; rc=$?
 t "C1 teal-fox chart: the tick still completes — a dark chart must not abort it (DIVE-1127)" "0" "$rc"
 t "C2 teal-fox chart: nothing was sent, because nothing resolves" "0" "$(sent_n)"
-t "C3 teal-fox chart: and every one of the eleven left an audited row instead of nothing at all" \
-  "11" "$(undeliv_count)"
+t "C3 teal-fox chart: and every one of the ten left an audited row instead of nothing at all" \
+  "10" "$(undeliv_count)"
 t "C4 teal-fox chart: with the reason recorded" "no-recipient" "$(undeliv_reasons)"
 
 this_box; clear_events
 cmd_send() { return 1; }   # the rail refuses: the seat resolves but the send fails
 drive; rc=$?
 t "C5 a refused send does not abort the tick either" "0" "$rc"
-t "C6 a refused send is audited, not swallowed by the old || true" "11" "$(undeliv_count)"
+t "C6 a refused send is audited, not swallowed by the old || true" "10" "$(undeliv_count)"
 t "C7 ...with the reason recorded" "send-failed" "$(undeliv_reasons)"
 t "C8 ...and the recipient we tried, so the audit says WHO was unreachable" \
   "main|ops" "$(db "SELECT DISTINCT json_extract(signals,'\$.recipient') FROM supervisor_events WHERE event='alert-undeliverable' ORDER BY 1;" | paste -sd'|' -)"
@@ -205,7 +220,7 @@ cmd_send() { printf '%s\n' "$1" >>"$SENT_LOG"; return 0; }
 # window the shipped check reads. That a heartbeat leg lights a check written for
 # the supervisor is the reuse this row is claiming.
 t "D1 a lost heartbeat leg is inside the window the shipped doctor check reads" \
-  "11" "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event='alert-undeliverable' AND ts >= datetime('now','-7 days');")"
+  "10" "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event='alert-undeliverable' AND ts >= datetime('now','-7 days');")"
 t "D2 ...so the check cannot read [ok] — its error branch is (undeliv > 0)" \
   "error" "$( [[ "$(db "SELECT COUNT(*) FROM supervisor_events WHERE event='alert-undeliverable' AND ts >= datetime('now','-7 days');")" -gt 0 ]] && echo error || echo ok )"
 clear_events
@@ -237,11 +252,11 @@ while IFS= read -r _line; do
   if [[ $_in -eq 1 && "$_buf" != *'\' ]]; then CALLS+=("$_buf"); _in=0; _buf=""; fi
 done < "$MUT"
 lone_root; clear_events
-t "E3b MUTANT: all eleven sites still extract (one of them now a no-op)" "11" "${#CALLS[@]}"
+t "E3b MUTANT: all ten sites still extract (one of them now a no-op)" "10" "${#CALLS[@]}"
 drive; rc=$?
 t "E3c MUTANT: drive still returns 0" "0" "$rc"
-t "E4 MUTANT: on the customer chart one escalation no longer reaches the root (10, not 11)" \
-  "10" "$(sent_to claude-aleks)"
+t "E4 MUTANT: on the customer chart one escalation no longer reaches the root (9, not 10)" \
+  "9" "$(sent_to claude-aleks)"
 t "E5 MUTANT: and it leaves no audit row behind — the silent loss this row exists to end" \
   "0" "$(undeliv_count)"
 

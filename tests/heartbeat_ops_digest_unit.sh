@@ -261,5 +261,36 @@ grep -q 'Stranded' "$SEND_LOG" && [[ "$(sends)" == "1" ]] \
   && ok_t "E2 ...and the flush delivers it as one batched message" \
   || bad_t "E2 batch did not carry the swept notice" "$(cat "$SEND_LOG")"
 
+# =============================================================================
+# F — THE FLUSH IS WIRED INTO THE TICK, AND RUNS AFTER THE SWEEPS THAT FEED IT
+#
+# Without this section every arm above is satisfied by a batcher NOTHING CALLS.
+# Delete `_hb_ops_digest_flush` from cmd_heartbeat_tick and A-E all stay green
+# while the ops rail goes permanently silent — one live turn per row replaced by
+# no turn ever, which is the silent-drop this row exists to avoid, not the fix it
+# claims. A and E prove the notice is batched rather than deleted; F is the arm
+# that proves the batch is ever delivered.
+#
+# READ FROM `declare -f`, NOT FROM THE FILE. The parsed function body is the code
+# bash will actually run, and it has no comments in it — a grep over the source
+# would match this rail's own explanatory comment block at the call site and stay
+# green over a deleted call, which is precisely the vacuous pass being closed here.
+# =============================================================================
+_tick_body=$(declare -f cmd_heartbeat_tick 2>/dev/null)
+[[ -n "$_tick_body" ]] \
+  && ok_t "F0/PRECONDITION: cmd_heartbeat_tick is defined — the arms below read real parsed code" \
+  || bad_t "F0/PRECONDITION: tick not defined" "F1/F2 would be vacuous"
+_sweep_at=$(grep -n '_hb_stall_sweep' <<<"$_tick_body" | head -1 | cut -d: -f1)
+[[ -n "$_sweep_at" ]] \
+  && ok_t "F0/PRECONDITION: ...and it calls _hb_stall_sweep — the producer the ordering arm is anchored on" \
+  || bad_t "F0/PRECONDITION: tick does not call _hb_stall_sweep" "the ordering arm below would be vacuous"
+_flush_at=$(grep -n '_hb_ops_digest_flush' <<<"$_tick_body" | head -1 | cut -d: -f1)
+[[ -n "$_flush_at" ]] \
+  && ok_t "F1 the tick CALLS _hb_ops_digest_flush — a spool nothing drains is a deleted notice, not a batched one" \
+  || bad_t "F1 the batcher is never drained by the tick" "the spool would grow forever and ops would hear nothing"
+[[ -n "$_flush_at" && -n "$_sweep_at" && "$_flush_at" -gt "$_sweep_at" ]] \
+  && ok_t "F2 ...and it runs AFTER _hb_stall_sweep, so notices raised by THIS tick ride out now instead of waiting a full window" \
+  || bad_t "F2 flush does not follow the sweep that feeds it" "sweep@${_sweep_at:-none} flush@${_flush_at:-none}"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
