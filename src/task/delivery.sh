@@ -3056,14 +3056,46 @@ _task_merge_landed_record() {
 _task_merge_landed_handoff() {
   local id="$1" ident="$2" assignee="$3" vfier="$4"
   [[ -n "$vfier" && "$vfier" != "$assignee" ]] || return 0
-  # The same clock reset `task assign` makes, and for its reason: an inherited
-  # in_progress row that keeps the previous owner's started_at is eligible for the
-  # stale reaper on the new owner's very first tick.
+  # ── DIVE-4843: A HAND-OVER WRITES `todo`. IT NEVER WRITES `in_progress`. ────
+  #
+  # This used to carry the in_progress the PREVIOUS seat's turn had claimed, and
+  # only refresh started_at. The result is a claim nobody made: the row reads as
+  # live work on a seat that has not been woken onto it, and BOTH picker arms
+  # select `t.status='todo'` (cmd_heartbeat.sh ~2227 and ~2243), so the dispatcher
+  # cannot see it. The one-shot courtesy ping the sweep sends afterwards is not a
+  # dispatch — a grader mid-turn drops it (one row per turn) and nothing re-sends
+  # it. The row then waits for the stale reaper, which is hours.
+  #
+  # MEASURED 2026-09-22 (main): DIVE-4837's pull request merged 09:48:05Z and
+  # DIVE-4824's 09:56:57Z; both rows went to `in_progress assignee=quinn` with a
+  # fresh started_at and no wake, neither ever appeared in a quinn `/goal`, and a
+  # `task done` from any other seat is correctly refused (writer != grader,
+  # DIVE-477). Two rows merged on the forge that nobody could close. lodar saw the
+  # other face of it: "how can one agent still hold several in_progress tasks if
+  # he locks on one goal per time" — quinn showed three in_progress rows while
+  # running exactly one turn.
+  #
+  # So the claim is left to the dispatcher, which is the only thing that makes
+  # one: it writes in_progress at wake time for every other row and there is no
+  # reason this row is different. started_at is CLEARED rather than refreshed —
+  # a started_at with no turn behind it is what fed the stale reaper the illusion
+  # it was reaping real work.
+  #
+  # ORDER-OF-EVALUATION, and it is load-bearing: in a single SQLite UPDATE every
+  # CASE reads the row's PRE-UPDATE values, so the `started_at` arm still sees the
+  # old `in_progress` even though the `status` arm above has already rewritten it.
+  # The two arms fire together or not at all. Arm B3 of the harness asserts
+  # exactly that pairing, because a reader who assumed left-to-right assignment
+  # would "fix" this into a row with status=todo and a stale started_at.
+  #
+  # ONLY `in_progress` IS TOUCHED. A row that is blocked, done or cancelled keeps
+  # its status: this hand-over releases a claim, it does not re-open a row.
   db "UPDATE tasks SET
         assignee=$(sqlq "$vfier"),
-        started_at=CASE WHEN status='in_progress' THEN datetime('now') ELSE started_at END
+        status=CASE WHEN status='in_progress' THEN 'todo' ELSE status END,
+        started_at=CASE WHEN status='in_progress' THEN NULL ELSE started_at END
       WHERE id=${id};" || return 0
-  printf ' The row is now assigned to %s, the seat whose close is ungated on a loop row.' "$vfier"
+  printf ' The row is now assigned to %s, the seat whose close is ungated on a loop row, and is DISPATCHABLE — the claim is the dispatcher'"'"'s to make at wake time (DIVE-4843).' "$vfier"
 }
 
 cmd_task_merge_landed() {
@@ -3199,14 +3231,18 @@ _task_merge_declined_record() {
 _task_merge_declined_handoff() {
   local id="$1" ident="$2" assignee="$3" maker="$4"
   [[ -n "$maker" && "$maker" != "$assignee" ]] || return 0
-  # The same clock reset `task assign` makes: an inherited in_progress row that
-  # keeps the previous owner's started_at is eligible for the stale reaper on the
-  # new owner's very first tick.
+  # DIVE-4843, the same rule and the same reason as `_task_merge_landed_handoff`
+  # above — read the long note there. This is the OTHER exit from the merging
+  # stage and it re-homes a row exactly the same way, so it stranded exactly the
+  # same way; it is fixed here rather than left to be measured in its own
+  # incident. A hand-over writes `todo` and clears the claim; the dispatcher makes
+  # the claim at wake time. Only `in_progress` is touched.
   db "UPDATE tasks SET
         assignee=$(sqlq "$maker"),
-        started_at=CASE WHEN status='in_progress' THEN datetime('now') ELSE started_at END
+        status=CASE WHEN status='in_progress' THEN 'todo' ELSE status END,
+        started_at=CASE WHEN status='in_progress' THEN NULL ELSE started_at END
       WHERE id=${id};" || return 0
-  printf ' The row is now assigned to %s, the seat that can re-point the binding.' "$maker"
+  printf ' The row is now assigned to %s, the seat that can re-point the binding, and is DISPATCHABLE (DIVE-4843).' "$maker"
 }
 
 cmd_task_merge_declined() {
