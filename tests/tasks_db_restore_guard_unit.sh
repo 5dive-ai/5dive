@@ -389,8 +389,15 @@ actual=$(sqlite3 "$TASKS_DB" \
     WHERE name IN ('delivery_ref','delivered_at','delivery_ref_iteration','parked_at','park_reason','escalated_at','escalated_by','human_evidence')
     ORDER BY name;" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('tasks');" 2>/dev/null)
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "114" ]] \
-  && ok "fresh schema: all 114 columns, including the eight former holes, are present" \
+# THE COUNT MOVES WHEN THE SCHEMA MOVES, and that is the arm working rather than
+# breaking: it is a CENSUS, so it is invalidated by an ADDED column exactly as
+# surely as by a dropped one, and it matches no text a grep for the new column
+# would find. 114 -> 115 on DIVE-4833 (+tasks.need_expires_at, the approval
+# offer's deadline). Anyone adding a column lands here, which is the point — the
+# schema and its migration twin are two writes, and this arm is what proves the
+# fresh-store half actually produced them.
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "115" ]] \
+  && ok "fresh schema: all 115 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------

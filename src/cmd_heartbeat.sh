@@ -6047,6 +6047,26 @@ _hb_forge_merge_record_reading() {
   return 0
 }
 
+# DIVE-4833 — the approval offer's clock. One pass per tick over gates whose
+# `need_expires_at` has passed, resolving each through the SAME `_gate_expire_due`
+# the answer path calls. Deliberately not its own UPDATE: two writers for one
+# transition is how the sweep and the verb come to disagree about what a timeout
+# records, and the audit row is the thing an operator reads afterwards.
+#
+# BOUNDED BY THE PREDICATE, not by a throttle written here: `_GATE_EXPIRED_SQL`
+# stops matching a row the moment it is resolved, so each gate is read once ever.
+_hb_gate_expire_sweep() {
+  declare -F _gate_expire_due >/dev/null 2>&1 || return 0
+  local row id ident n=0
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    id="${row%%|*}"; ident="${row#*|}"
+    _gate_expire_due "$id" "$ident" && n=$((n+1))
+  done < <(db "SELECT id||'|'||COALESCE(ident,'DIVE-'||id) FROM tasks WHERE ${_GATE_EXPIRED_SQL};" 2>/dev/null)
+  (( n > 0 )) && _hb_log "[gate-expire] resolved ${n} expired approval offer(s) as not-approved (DIVE-4833)"
+  return 0
+}
+
 _hb_forge_merge_sweep() {
   [[ "$_HB_FORGE_MERGE_POLL" == "on" || "$_HB_FORGE_MERGE_POLL" == "1" ]] || return 0
   # The probe and the recorder live in src/task/delivery.sh, later in the bundle.
@@ -8347,6 +8367,12 @@ cmd_heartbeat_tick() {
   # batched notice per window. Ordered last on purpose: notices raised by this very
   # tick ride out in this flush instead of waiting a full window.
   _hb_ops_digest_flush || _hb_log "[ops-digest] flush errored (non-fatal)"
+  # DIVE-4833: resolve approval offers whose deadline has passed. Without this the
+  # deadline would only be noticed by someone TRYING to answer — the gate would sit
+  # unanswerable and unresolved, and the agent waiting on it would wait forever,
+  # which is a worse shape than the never-expiring button this row set out to fix.
+  # Same isolation contract as every other sweep.
+  _hb_gate_expire_sweep || _hb_log "[gate-expire] pass errored (non-fatal)"
   # DIVE-972: enforce per-loop token ceilings for async (non --wait) loops. Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_loop_ceiling_sweep || _hb_log "[loop-ceiling] pass errored (non-fatal)"

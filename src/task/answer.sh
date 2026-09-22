@@ -640,6 +640,36 @@ _task_answer_try_delegated() {
   return 1
 }
 
+# `_gate_expire_due <id> <ident>` — DIVE-4833. Resolve one gate whose deadline
+# has passed. Idempotent: the UPDATE carries the expiry predicate, so a second
+# call after the first writes nothing and emits nothing.
+#
+# IT FAILS CLOSED, AND THAT IS THE WHOLE POINT OF A DEADLINE. An approval nobody
+# answered is NOT an approval. The row is resolved as `timeout`, which reads to
+# the waiting agent as "not authorised" — the same direction as a deny, and
+# deliberately not a separate third state the callers would each have to learn.
+#
+# STAMPED `auto:timeout`, which is load-bearing beyond legibility: the zero-human
+# KPI counts `need_answered_by NOT LIKE 'auto:%'`, so a timeout can never be
+# miscounted as a person having decided something. The signature column is left
+# NULL for the same reason — nothing was signed, because nobody answered.
+_gate_expire_due() {  # <id> <ident>
+  local id="$1" ident="${2:-}" exp_at
+  exp_at=$(db "SELECT COALESCE(need_expires_at,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  local moved
+  moved=$(db "UPDATE tasks SET
+                need_answer='timeout',
+                need_answered_at=datetime('now'),
+                need_answered_by='auto:timeout',
+                need_answer_sig=NULL
+              WHERE id=${id} AND (${_GATE_EXPIRED_SQL});
+            SELECT changes();" 2>/dev/null || printf '0')
+  [[ "${moved:-0}" == "1" ]] || return 1
+  _task_store_audit_log "gate.approval-timeout" ok 0 -- \
+    "id=${id}" "task=${ident}" "expired_at=${exp_at}" "resolved=not-approved" 2>/dev/null || true
+  return 0
+}
+
 cmd_task_answer() {
   local _tc_rc=0
   _task_channel_try answer "$@" || _tc_rc=$?
@@ -709,6 +739,44 @@ cmd_task_answer() {
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task answer <id|DIVE-N> --value=\"...\"  (omit --value for a secret gate)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   # Must have a pending (unanswered) gate to answer.
+  # ── DIVE-4833 — THE STALE RESPONSE, REFUSED AND RECORDED ────────────────────
+  #
+  # THIS RUNS BEFORE THE "no pending gate" CHECK BELOW, AND THAT ORDER IS THE
+  # WHOLE ARM. The first cut put it after, which was wrong in the common case: the
+  # heartbeat sweep resolves an expired offer on its next tick, so by the time a
+  # person actually taps the stale button the gate is ALREADY answered — and the
+  # check below would refuse it with the generic "no pending human gate", emitting
+  # no stale-response row at all. The one moment the record matters most is the
+  # one it was missing. Measured on the harness: arm D1's second tap returned
+  # `DIVE-8 has no pending human gate` and audited nothing.
+  #
+  # TWO STATES, ONE ANSWER. `expired` is the deadline passed with the sweep not
+  # yet run; `auto:timeout` is the sweep having run. Both mean the same thing to
+  # the person tapping — the offer is gone and nothing they do here authorises
+  # anything — so both produce the same refusal and the same audit row.
+  #
+  # IT IS THE ENFORCEMENT POINT FOR BOTH SURFACES, by design: the Telegram
+  # listener and the dashboard both answer through this verb, so one check here
+  # covers them rather than two that have to be kept in step. Neither surface is
+  # trusted to have withheld its button — the DIVE-2228 note below says why in the
+  # product's own words: "Telegram inline buttons on already-delivered messages
+  # never expire".
+  local _gexpired
+  _gexpired=$(db "SELECT CASE
+                    WHEN (${_GATE_EXPIRED_SQL}) THEN 'expired'
+                    WHEN need_type IS NOT NULL AND need_answered_by='auto:timeout' THEN 'timed-out'
+                    ELSE '' END
+                  FROM tasks WHERE id=${id};")
+  if [[ -n "$_gexpired" ]]; then
+    local _exp_at _gt
+    _exp_at=$(db "SELECT COALESCE(need_expires_at,'') FROM tasks WHERE id=${id};")
+    _gt=$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE id=${id};")
+    [[ "$_gexpired" == "expired" ]] && { _gate_expire_due "$id" "$ident" || true; }
+    _task_store_audit_log "gate.approval-stale-response" refused 0 -- \
+      "id=${id}" "task=${ident}" "type=${_gt}" "expired_at=${_exp_at}" "state=${_gexpired}" 2>/dev/null || true
+    fail "$E_CONFLICT" "$ident: this approval EXPIRED at ${_exp_at} and has already been resolved as NOT approved, so your answer was NOT applied (DIVE-4833). Nothing was authorised by this tap. The button is still in your chat because Telegram never removes one — which is why the deadline is enforced here and not on the button. If the action is still wanted, file a fresh gate."
+  fi
+
   local nt
   nt=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN need_type ELSE '' END FROM tasks WHERE id=${id};")
   [[ -n "$nt" ]] || fail "$E_CONFLICT" "$ident has no pending human gate (nothing to answer)"
@@ -1591,6 +1659,27 @@ cmd_task_answer() {
   else
     (( value_set )) || fail "$E_USAGE" "--value is required (the human's answer)"
     db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=$(sqlq "$_ts"), need_answered_by=$(sqlq "$answered_by"), need_answered_uid=${_uidsql}, need_answer_sig=$(sqlq "$_sig") WHERE id=${id};"
+  fi
+
+  # DIVE-4833 — THE AUDIT ROW FOR AN APPROVAL OUTCOME. Allow and deny are
+  # recorded as DIFFERENT events rather than one 'answered' event carrying a
+  # value, because the question an auditor asks is "what was authorised here",
+  # and a grep that has to parse the value to answer it will eventually be
+  # written wrong. The other two outcomes of the same four — timeout and
+  # stale-response — are emitted by _gate_expire_due and by the expiry guard
+  # above, so all four live in one namespace and one `audit_log` grep finds them.
+  #
+  # Scoped to `approval`: a decision's value is free text and a secret's must
+  # never be written anywhere, so neither has an allow/deny shape to record.
+  if [[ "$nt" == "approval" ]]; then
+    local _outcome="other"
+    case "$value" in
+      approve|approved|allow|allowed|yes) _outcome="allow" ;;
+      deny|denied|reject|rejected|no)     _outcome="deny" ;;
+    esac
+    _task_store_audit_log "gate.approval-${_outcome}" ok 0 -- \
+      "id=${id}" "task=${ident}" "value=${value}" "by=${answered_by}" \
+      "expires_at=$(db "SELECT COALESCE(need_expires_at,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')" 2>/dev/null || true
   fi
 
   # DIVE-2760: an unsigned closure is stored, reported OK, and then refused by a

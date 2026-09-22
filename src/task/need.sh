@@ -2143,6 +2143,7 @@ cmd_task_need() {
   local _cu_derived=""
   local gate_owner=""   # DIVE-3342
   local urgent=0        # DIVE-3474 arm 2
+  local expires_in=""   # DIVE-4833: the approval action's deadline, unset = no deadline
   local self_minted=0 escalate=0   # DIVE-4365 part 1
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local ask_src="" recommend_src=""
@@ -2178,6 +2179,10 @@ cmd_task_need() {
       # routed gate is QUEUED for the reviewer's next natural wake instead of
       # waking their window; with it, the file-time a2a ping fires as it did before.
       --urgent)      urgent=1 ;;
+      # DIVE-4833: the OFFER's deadline. Accepts the same grammar `task park
+      # --wake` already uses (+Nm/+Nh/+Nd or an absolute timestamp) rather than a
+      # new one, so an operator who knows one knows both.
+      --expires-in=*) expires_in="${1#*=}" ;;
       # DIVE-4365 part 1: THE VALUE IS OURS TO INVENT AND OURS TO PLACE. A
       # `secret` gate is tier 2 by TYPE because the historical secret gate asks a
       # person for a credential only they can issue (a Stripe key, an OAuth token).
@@ -3994,7 +3999,35 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
 
   _task_gate_card_apply "$ident" die "superseded by a re-filed gate" || true
 
-  db "BEGIN IMMEDIATE;
+    # DIVE-4833 — normalise the deadline BEFORE the transaction, so a bad value is
+  # a refusal rather than a half-filed gate. Same grammar as `task park --wake`,
+  # and resolved through sqlite's own `datetime()` so the stored value is in the
+  # store's clock rather than the caller's.
+  local expires_sql="NULL"
+  if [[ -n "$expires_in" ]]; then
+    local _exp_ts=""
+    case "$expires_in" in
+      +*m) local _n="${expires_in#+}"; _n="${_n%m}"
+           [[ "$_n" =~ ^[0-9]+$ && "$_n" -gt 0 ]] || fail "$E_VALIDATION" "bad --expires-in '$expires_in' (use +Nm, +Nh, +Nd, or 'YYYY-MM-DD[ HH:MM]')"
+           _exp_ts=$(db "SELECT datetime('now', '+${_n} minutes');") ;;
+      +*h) local _n="${expires_in#+}"; _n="${_n%h}"
+           [[ "$_n" =~ ^[0-9]+$ && "$_n" -gt 0 ]] || fail "$E_VALIDATION" "bad --expires-in '$expires_in' (use +Nm, +Nh, +Nd, or 'YYYY-MM-DD[ HH:MM]')"
+           _exp_ts=$(db "SELECT datetime('now', '+${_n} hours');") ;;
+      +*d) local _n="${expires_in#+}"; _n="${_n%d}"
+           [[ "$_n" =~ ^[0-9]+$ && "$_n" -gt 0 ]] || fail "$E_VALIDATION" "bad --expires-in '$expires_in' (use +Nm, +Nh, +Nd, or 'YYYY-MM-DD[ HH:MM]')"
+           _exp_ts=$(db "SELECT datetime('now', '+${_n} days');") ;;
+      *)   _exp_ts=$(db "SELECT datetime($(sqlq "$expires_in"));")
+           [[ -n "$_exp_ts" ]] || fail "$E_VALIDATION" "bad --expires-in '$expires_in' (use +Nm, +Nh, +Nd, or 'YYYY-MM-DD[ HH:MM]')" ;;
+    esac
+    # A DEADLINE ALREADY IN THE PAST IS REFUSED, not stored. Storing it would file
+    # a gate that is expired the instant it exists: nobody can answer it, the
+    # filer is told it was filed, and the row waits for a timeout that already
+    # happened. That is the silent shape this row exists to remove, not add.
+    [[ "$(db "SELECT CASE WHEN $(sqlq "$_exp_ts") > datetime('now') THEN 1 ELSE 0 END;")" == "1" ]] \
+      || fail "$E_VALIDATION" "--expires-in '$expires_in' resolves to ${_exp_ts}, which is not in the future — a gate filed already-expired could never be answered by anyone."
+    expires_sql=$(sqlq "$_exp_ts")
+  fi
+db "BEGIN IMMEDIATE;
       $(_gate_archive_and_clear_sql file "id=${id}")
       UPDATE tasks
         -- DIVE-2624: DO NOT STEAL THE ASSIGNEE off a live maker-to-verifier handoff.
@@ -4101,6 +4134,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
             -- Written on the SAME statement as need_type, so a row can never hold a
             -- mode belonging to a gate it no longer carries.
             gate_mode=$(sqlq_or_null "$gate_mode"),
+            need_expires_at=${expires_sql},
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             gate_filed_by=$(sqlq "$actor")
       WHERE id=${id};
