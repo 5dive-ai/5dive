@@ -121,9 +121,17 @@ read -r g_sha g_by g_owner g_asgn g_st g_done < <(snap "$id")
   || bad_t "C1d handoff" "assignee='$g_asgn'"
 
 # --- Case 2: IT DOES NOT CLOSE ------------------------------------------------
-[[ "$g_st" == "in_progress" && "$g_done" == "-" ]] \
+# DIVE-4843 — the narrowing is "NOT CLOSED", and that is what is asserted. The
+# literal `in_progress` here was never the subject: it was whatever the hand-over
+# happened to leave, and what it left was a claim no seat had made on a row the
+# dispatcher could not see (both picker arms select `status='todo'`). C2b is the
+# other half, and it is the one the DIVE-4837/4824 incident would have caught.
+[[ "$g_st" != "done" && "$g_st" != "cancelled" && "$g_done" == "-" ]] \
   && ok_t "C2 THE NARROWING: the row is NOT closed — a merged pull request is not automatically a finished row (DIVE-4520), so the close stays a judgement a seat makes" \
   || bad_t "C2 sweep closed the row" "status=$g_st done_at=$g_done"
+[[ "$g_st" == "todo" ]] \
+  && ok_t "C2b ...and it is left DISPATCHABLE, not holding a claim nobody made — the seat that owes the close gets woken (DIVE-4843)" \
+  || bad_t "C2b the sweep left an unreachable row" "status=$g_st — the picker only selects todo, so nothing would ever wake '$g_asgn'"
 [[ "$(cat "$TOKF")" == "[]" ]] \
   && ok_t "C2a the read went out with an EMPTY token — no machine account was resolved to ask what a pull request IS" \
   || bad_t "C2a credential-free read" "token seen '$(cat "$TOKF")'"
