@@ -286,6 +286,39 @@ def nonnegative_int(value):
     except (TypeError, ValueError):
         return 0
 
+def codex_window_deltas(last_usage, pre_usage, fields):
+    """Window a CUMULATIVE per-rollout counter to what it spent inside [since, now).
+
+    DIVE-4815: `total_token_usage` counts from the moment the rollout was opened,
+    so a rollout that STARTS before the window and is still being written inside
+    it contributes its whole lifetime when only its final snapshot is read. codex's
+    dispatcher rollout is exactly that file — one pane, opened 2026-09-08, never
+    rotated — and it reported an identical 662M in the 24h and the 7d window (the
+    tell), against ~29M actually spent in the last 24h. The budget evaluator reads
+    this number, so the seat sat `OVER CEILING` on a reading of work it did a
+    fortnight ago.
+
+    The window's spend is the last snapshot INSIDE it minus the last snapshot
+    BEFORE it (no earlier snapshot -> the rollout opened inside the window and the
+    whole of it counts). If the totals went DOWN the counter restarted mid-window,
+    which no subtraction can span: the post-restart run is entirely inside the
+    window, so `last` itself is the answer and `pre` is dropped. Per-field
+    clamping alone would split one rollout across two counter epochs and mix
+    classes that must stay consistent, so the restart is decided ONCE per file
+    from the totals, never per field.
+    """
+    if pre_usage is not None:
+        cur_total = sum(nonnegative_int(last_usage.get(k)) for k in fields)
+        pre_total = sum(nonnegative_int(pre_usage.get(k)) for k in fields)
+        if cur_total < pre_total:
+            pre_usage = None
+    out = []
+    for k in fields:
+        cur = nonnegative_int(last_usage.get(k))
+        prev = nonnegative_int(pre_usage.get(k)) if pre_usage is not None else 0
+        out.append(max(0, cur - prev))
+    return out
+
 # --- scan transcripts: per agent per model token sums + per-turn timeline ---
 # turns[name] = list of (epoch, out_tokens, total_tokens) for task attribution.
 agent_rows = []
@@ -343,10 +376,14 @@ for name, meta in agents.items():
                 denied = denied or "some transcript files unreadable: %s" % (e.strerror or e.errno)
             continue
         if agent_type == "codex":
-            # Codex's total_token_usage is cumulative within ONE rollout. Sum
-            # only the final valid snapshot from each file; summing snapshots
-            # multiplies the same tokens on every turn. A rollout whose final
-            # snapshot predates the requested window contributes nothing.
+            # Codex's total_token_usage is cumulative within ONE rollout, so a
+            # snapshot is a running total, never a turn's cost: summing snapshots
+            # multiplies the same tokens on every turn. The last snapshot alone is
+            # only the window's spend when the rollout also STARTED inside it —
+            # DIVE-4815. So the last snapshot from BEFORE the window is kept too,
+            # and the two are differenced below. A rollout whose every snapshot
+            # predates the requested window contributes nothing.
+            pre_usage = None
             last_usage = None
             last_ts = None
             last_rate_limits = None
@@ -367,17 +404,23 @@ for name, meta in agents.items():
                             payload.get("type") != "token_count" or
                             not isinstance(usage, dict) or ts is None):
                         continue
+                    if ts < since:
+                        # The baseline to subtract, not a contribution. Its
+                        # rate_limits are stale too, and its turn was not spent
+                        # in this window — neither is taken.
+                        pre_usage = usage
+                        continue
                     last_usage = usage
                     last_ts = ts
                     last_rate_limits = payload.get("rate_limits") or {}
                     token_events += 1
-            if last_usage is None or last_ts < since:
+            if last_usage is None:
                 continue
 
-            raw_input = nonnegative_int(last_usage.get("input_tokens"))
-            cr = nonnegative_int(last_usage.get("cached_input_tokens"))
-            cc = nonnegative_int(last_usage.get("cache_write_input_tokens"))
-            ot = nonnegative_int(last_usage.get("output_tokens"))
+            raw_input, cr, cc, ot = codex_window_deltas(
+                last_usage, pre_usage,
+                ("input_tokens", "cached_input_tokens",
+                 "cache_write_input_tokens", "output_tokens"))
             # Codex reports cached/cache-write tokens as subsets of input_tokens,
             # unlike Claude's disjoint usage fields. Split them before feeding
             # the shared classes so the headline still excludes cache reads.
