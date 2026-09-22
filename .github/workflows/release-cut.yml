@@ -47,14 +47,31 @@ on:
     #   2026-07-30  -> no run created at all
     #
     # The delay also silently voided this slot's OWN rationale, which used to read
-    # "an hour ahead of the fleet's 04:00 self-update, so a nightly cut is available
+    # "an hour ahead of the fleet's (then believed) 04:00 self-update, so a nightly cut is available
     # to the boxes that same night". At +163 min the cut landed 05:43 — AFTER the
     # fleet had already self-updated. The stated reason for 03:00 had never once held
     # in practice, so moving the slot repairs the rationale as well as the schedule.
     #
+    # DIVE-4804 — READ THIS BEFORE THE NEXT TWO PARAGRAPHS. Two of their premises
+    # have since been measured false. (a) THERE IS NO FLEET-WIDE 04:00 SELF-UPDATE.
+    # Each box updates at its own `servers.update_hour_utc`; 5dive-api's
+    # scripts/install/tools.sh writes the box crontab as `0 <hour> * * *` with a
+    # DEFAULT OF 3, the dashboard rewrites that line live, and our two canary boxes
+    # are on 1. The margin below is therefore an hour smaller than it reads, and the
+    # quantity that matters is the EARLIEST hour on the fleet, not a constant.
+    # (b) THE SLOT BELOW DID NOT HOLD EITHER: measured starts 2026-09-12..09-15 were
+    # 01:26Z / 01:36Z / 01:44Z / 01:55Z and 2026-09-21 was 01:43:47Z and 05:34:02Z,
+    # i.e. +1.5h to +4.5h, exactly the "do not re-tune the minute a third time"
+    # failure the last paragraph warns about. The fix taken was the one that
+    # paragraph names — ORDERING, not another quiet minute: the control plane now
+    # DISPATCHES this workflow at 23:50Z from /etc/cron.d/5dive-release-cut-dispatch
+    # (5dive-api scripts/control-plane/), which has no jitter. These two schedule
+    # arms are kept as the fallback for a night that host is down; a duplicate cut
+    # is a no-op through the early exit and the concurrency group below.
+    #
     # 23:52 (lodar, 2026-09-08 23:54Z: "23:52 UTC is fine", after "so we can catch and fix
     # bugs before customer boxes' nightly update"): the cut lands ~4h ahead of the boxes'
-    # 04:00 self-update (install.sh cron) instead of ~1h, so a bad cut can be caught by the
+    # self-update window (install.sh cron) instead of ~1h, so a bad cut can be caught by the
     # nightly smoke and our own boxes, and re-cut, before customers pull it. Even the
     # +163/+168 min schedule delay measured at 03:00Z lands a 23:52 cron by ~02:40 and its
     # poll by ~03:25 — inside the window, which the 02:37 slot never was.
