@@ -32,9 +32,9 @@ is()  { [[ "$2" == "$3" ]] && ok "$1" || no "$1 (got '$2', want '$3')"; }
 source "$ROOT/src/lib/models.sh"
 
 echo "== 1. alias -> current id =="
-is "opus resolves"        "$(resolve_model_alias opus)"    "claude-opus-5"
+is "opus resolves"        "$(resolve_model_alias opus)"    "claude-opus-5-5"
 is "sonnet resolves"      "$(resolve_model_alias sonnet)"  "claude-sonnet-5"
-is "fable resolves"       "$(resolve_model_alias fable)"   "claude-fable-5"
+is "fable resolves"       "$(resolve_model_alias fable)"   "claude-fable-5-1"
 is "haiku resolves"       "$(resolve_model_alias haiku)"   "claude-haiku-4-5-20251001"
 
 echo "== 2. pass-through for non-aliases =="
@@ -53,8 +53,8 @@ echo "== 4. models_json is valid JSON with all four families =="
 j=$(models_json)
 if command -v jq >/dev/null 2>&1; then
   echo "$j" | jq -e . >/dev/null 2>&1 && ok "models_json parses" || no "models_json is not valid JSON: $j"
-  is "json opus"   "$(echo "$j" | jq -r .opus)"   "claude-opus-5"
-  is "json fable"  "$(echo "$j" | jq -r .fable)"  "claude-fable-5"
+  is "json opus"   "$(echo "$j" | jq -r .opus)"   "claude-opus-5-5"
+  is "json fable"  "$(echo "$j" | jq -r .fable)"  "claude-fable-5-1"
   is "json keys"   "$(echo "$j" | jq -r 'keys_unsorted|join(",")')" "opus,sonnet,fable,haiku"
 else
   echo "  skip jq assertions (jq not installed)"
@@ -89,9 +89,9 @@ echo "== 7. 5dive models --json emits the standard {ok,data} envelope =="
 if [[ -x "$ROOT/5dive" ]] && command -v jq >/dev/null 2>&1; then
   env_out=$(bash "$ROOT/5dive" models --json 2>/dev/null)
   is "envelope ok"    "$(echo "$env_out" | jq -r .ok)"           "true"
-  is "envelope opus"  "$(echo "$env_out" | jq -r .data.opus)"    "claude-opus-5"
-  is "envelope fable" "$(echo "$env_out" | jq -r .data.fable)"   "claude-fable-5"
-  is "text form"      "$(bash "$ROOT/5dive" models 2>/dev/null | awk '$1=="fable"{print $2}')" "claude-fable-5"
+  is "envelope opus"  "$(echo "$env_out" | jq -r .data.opus)"    "claude-opus-5-5"
+  is "envelope fable" "$(echo "$env_out" | jq -r .data.fable)"   "claude-fable-5-1"
+  is "text form"      "$(bash "$ROOT/5dive" models 2>/dev/null | awk '$1=="fable"{print $2}')" "claude-fable-5-1"
 else
   echo "  skip envelope assertions (no built ./5dive or no jq)"
 fi
@@ -100,8 +100,8 @@ echo "== 8. the built bundle carries the catalogue =="
 if [[ -f "$ROOT/5dive" ]]; then
   grep -q 'resolve_model_alias()' "$ROOT/5dive" && ok "bundle has resolve_model_alias" \
     || no "bundle is missing resolve_model_alias — run ./build.sh"
-  grep -q 'claude-opus-5' "$ROOT/5dive" && ok "bundle has the current opus id" \
-    || no "bundle does not carry claude-opus-5 — run ./build.sh"
+  grep -q 'claude-opus-5-5' "$ROOT/5dive" && ok "bundle has the current opus id" \
+    || no "bundle does not carry claude-opus-5-5 — run ./build.sh"
 else
   echo "  skip bundle assertions (no ./5dive built)"
 fi
