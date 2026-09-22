@@ -59,6 +59,13 @@ Agents:
                             [--provider=<id> --api-key=<key|->]
                             [--with-skills=<spec>[,<spec>...]] [--no-skills]
                             [--no-team-bot] [--defer-auth] [--can-push]
+                            [--human=<id>]
+                            # --human=<id> names the PERSON this agent belongs to
+                            # (a row from '5dive human ls'): their telegram id is
+                            # pre-allowed on the new bot, so there is no code to
+                            # exchange, and they are recorded as the owner of this
+                            # agent's gates. They still open the bot once and press
+                            # Start — Telegram never lets a bot speak first.
                             # --can-push grants a STANDARD (builder) agent the
                             # delegated-push capability: a scoped NOPASSWD sudoers
                             # grant for '5dive push' (exact-path _push_do). Off by

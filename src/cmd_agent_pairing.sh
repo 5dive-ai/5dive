@@ -386,6 +386,139 @@ cmd_telegram_resolve_handle() {
      --arg d  "$display"
 }
 
+# ---- DIVE-4698: the pairing that makes a PERSON, not just an allowlist entry ----
+#
+# WHAT WAS MISSING. `5dive human` (DIVE-3342) gave a person a row — identity on
+# each transport, so a gate can name whose phone rings. Nothing ever wrote one:
+# `git grep` found no INSERT outside src/cmd_human.sh, so the table was empty on
+# this box and, in effect, on every box. Meanwhile pairing DID learn the person —
+# it wrote their numeric id into the bot's allowFrom and into the box-wide
+# operator allowlist — and then threw the identity away. So the one moment where
+# a human demonstrably proves who they are was also the one moment we recorded
+# them as an anonymous integer.
+#
+# THIS IS THE WRITE, and it belongs at pairing approval rather than at create or
+# in the UI, because pairing is the only step where the person themselves acted.
+#
+# ADOPTION IS BY PRESENCE, AND THAT IS WHY THIS IS CAREFUL. `_human_registry_active`
+# is `COUNT(*) > 0`: the FIRST row on a box switches every gate send from the
+# pre-DIVE-3342 pointer/fan-out path onto registry routing, where an unresolved
+# recipient is HELD on the agent rail rather than broadcast. That switch is safe
+# at one row and only at one row — `_human_gate_recipient`'s last arm resolves a
+# one-person registry to that person unconditionally, so a single-human box (the
+# supported configuration, and what every box on the fleet is) routes to exactly
+# the person it used to reach. At two rows that arm switches off by design.
+#
+# So this function:
+#   * writes AND links, always together. A row with no `human_agents` edge is
+#     the state that resolves to nobody; writing one without the link would be
+#     the regression, not the feature.
+#   * reuses an existing identity when this telegram id is already on record,
+#     rather than minting a second row for the same person (the registry's own
+#     one-id-one-person invariant, enforced in cmd_human_set with a CONFLICT).
+#   * WARNS when its write is the one that takes the box from one human to two,
+#     naming the consequence and the remedy — that is the threshold where an
+#     unlinked agent's gate stops reaching anyone, and it must not cross in
+#     silence.
+#   * is best-effort in every failure mode, exactly like `_operator_record`
+#     beside it: a pairing that worked must not be reported as failed because a
+#     bookkeeping write did not land.
+#
+# The id is the person's Telegram @username lowercased when they have one (a
+# name a human recognises on `5dive human ls`), else `tg-<numeric id>`. The
+# profile read is one getChat through the agent's own bot token and is allowed to
+# fail — an id of `tg-<n>` with no display name is a complete, correct record.
+#
+# RUN IN A SUBSHELL, ALWAYS RETURN 0. `tasks_db_init` and `db` report failure by
+# calling `fail`, which EXITS — so on a box whose task store is unreadable this
+# helper would have aborted `cmd_pair` after the pairing had already been written
+# to access.json, reporting a completed pairing as a failure. Containment here is
+# what makes "best-effort" true rather than intended; arm A8 in
+# tests/human_at_pairing_unit.sh holds it.
+_pair_record_human() {
+  ( _pair_record_human_do "$@" ) || true
+  return 0
+}
+
+_pair_record_human_do() {
+  local agent="$1" sender="${2:-}" chat="${3:-}" token="${4:-}"
+  [[ -n "$agent" && -n "$sender" ]] || return 0
+  valid_telegram_chat_id "$sender" || return 0
+  declare -F tasks_db_init >/dev/null 2>&1 || return 0
+  tasks_db_init >/dev/null 2>&1 || return 0
+
+  local before hid=""
+  before=$(db "SELECT COUNT(*) FROM humans;" 2>/dev/null) || return 0
+  [[ "${before:-}" =~ ^[0-9]+$ ]] || return 0
+
+  # Already on record? Then this pairing adds an AGENT to a person we know, and
+  # the identity — including a display name someone may have corrected by hand —
+  # is left exactly as it is.
+  hid=$(db "SELECT id FROM humans WHERE telegram_id=$(sqlq "$sender") LIMIT 1;" 2>/dev/null) || hid=""
+
+  if [[ -z "$hid" ]]; then
+    local uname="" first="" last="" display=""
+    if [[ -n "$token" ]]; then
+      local resp
+      resp=$(curl -sS -m 10 --get --data-urlencode "chat_id=${sender}" \
+        "https://api.telegram.org/bot${token}/getChat" 2>/dev/null || true)
+      if [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == "true" ]]; then
+        uname=$(jq -r '.result.username // empty'   <<<"$resp" 2>/dev/null)
+        first=$(jq -r '.result.first_name // empty' <<<"$resp" 2>/dev/null)
+        last=$(jq -r '.result.last_name // empty'   <<<"$resp" 2>/dev/null)
+      fi
+    fi
+    display="$first"
+    [[ -n "$last" ]] && display="${display:+$display }${last}"
+
+    # The slug. A @username is the readable choice; anything that does not fit
+    # the registry's own id rule falls back rather than being mangled into a
+    # near-miss, because a half-sanitised handle is a second identity for the
+    # same person the next time this runs.
+    local cand=""
+    if [[ -n "$uname" ]]; then
+      cand=$(printf '%s' "${uname,,}" | tr -c 'a-z0-9_-' '-')
+      [[ "$cand" =~ $_HUMAN_ID_RX ]] || cand=""
+    fi
+    [[ -n "$cand" ]] || cand="tg-${sender#-}"
+    [[ "$cand" =~ $_HUMAN_ID_RX ]] || cand="tg-${sender#-}"
+    # That slug may already belong to somebody else (two Telegram accounts, same
+    # handle history). Never overwrite another person's row: fall back to the id
+    # that cannot collide.
+    local taken
+    taken=$(db "SELECT COALESCE(telegram_id,'') FROM humans WHERE id=$(sqlq "$cand") LIMIT 1;" 2>/dev/null) || taken=""
+    if [[ -n "$taken" && "$taken" != "$sender" ]]; then
+      cand="tg-${sender#-}"
+    fi
+    hid="$cand"
+    db "INSERT OR IGNORE INTO humans (id) VALUES ($(sqlq "$hid"));
+        UPDATE humans SET telegram_id=$(sqlq "$sender"),
+               display_name=COALESCE(display_name, $(sqlq_or_null "$display")),
+               updated_at=datetime('now')
+         WHERE id=$(sqlq "$hid");" 2>/dev/null || return 0
+  fi
+
+  # WRITE AND LINK ARE ONE ACT. Same replace-not-accumulate rule as
+  # `human link`: one agent has one human owner.
+  db "DELETE FROM human_agents WHERE agent=$(sqlq "$agent");
+      INSERT OR IGNORE INTO human_agents (human_id, agent) VALUES ($(sqlq "$hid"), $(sqlq "$agent"));" \
+    2>/dev/null || return 0
+
+  local after
+  after=$(db "SELECT COUNT(*) FROM humans;" 2>/dev/null) || after="$before"
+  audit_log "human auto-record" ok 0 -- "human=$hid" "agent=$agent" "telegram=$sender" \
+    "humans_before=$before" "humans_after=$after" "source=pair" 2>/dev/null || true
+
+  if (( before == 0 )); then
+    step "Recorded '$hid' as a person on this box and linked them to '$agent' (5dive human ls). Gate delivery now names them instead of guessing from bot traffic."
+  elif (( before == 1 && after == 2 )); then
+    # THE THRESHOLD. Stated in full because it is the one behaviour change a
+    # second pairing makes, and it is invisible otherwise.
+    warn "This box now has TWO people on record, so gates are no longer auto-resolved to a single owner: a gate whose agent has no linked human is HELD on the agent rail instead of reaching anyone (DIVE-3342). Check with '5dive human ls' and link the rest: sudo 5dive human link <id> --agent=<name>"
+  fi
+  return 0
+}
+
 # Interactive pairing for a telegram- or discord-enabled claude-family agent.
 # Two paths:
 #   --code=<code>     classic: user DMs bot, bot replies with "pair <code>",
@@ -531,6 +664,10 @@ PY
     # Remember this operator id box-wide so future agents auto-pair to it
     # (shared operator allowlist — DIVE-320/325).
     _operator_record "$preuser"
+    # DIVE-4698: and record the PERSON. Deliberately IN LOCK-STEP with
+    # _operator_record rather than derived from it — see the note on
+    # _pair_record_human. Best-effort, never fails the pairing.
+    _pair_record_human "$name" "$preuser" "$chat_id" "$bot_token" || true
     local welcome_rc=0
     if [[ ",$channels," == *",telegram,"* ]]; then
       send_welcome_message "$chat_id" "$bot_token" "$name" "$type" || welcome_rc=$?
@@ -587,7 +724,7 @@ INTRO
   fi
 
   # Either prompt interactively (TTY) or consume --code once (exec path).
-  local msg code chat_id tries_left=5
+  local msg code chat_id pair_out="" paired_sender="" tries_left=5
   [[ -n "$precode" ]] && tries_left=1
   while (( tries_left-- > 0 )); do
     if [[ -n "$precode" ]]; then
@@ -609,7 +746,7 @@ INTRO
       continue
     fi
 
-    if chat_id=$(sudo -u "$user" env CODE="$code" ACCESS="$access" python3 - <<'PY'
+    if pair_out=$(sudo -u "$user" env CODE="$code" ACCESS="$access" python3 - <<'PY'
 import json, os, sys, tempfile
 
 path = os.environ['ACCESS']
@@ -648,9 +785,18 @@ with os.fdopen(fd, 'w') as f:
     json.dump(data, f, indent=2)
 os.replace(tmp, path)
 print(f"Paired user {sender}", file=sys.stderr)
+# TWO LINES, sender then chat (DIVE-4698). The chat id alone was enough to send a
+# welcome DM; recording the person needs the id that proves WHO pressed Start,
+# and it was being printed to stderr for a human to read and then discarded.
+# Order is load-bearing: the caller reads line 1 as the sender and line 2 as the
+# chat, and the two differ for a group pairing.
+print(sender)
 print(chat)
 PY
     ); then
+      # sender on line 1, chat on line 2 (see the python above).
+      paired_sender=$(printf '%s\n' "$pair_out" | sed -n '1p')
+      chat_id=$(printf '%s\n' "$pair_out" | sed -n '2p')
       if [[ -n "$chat_id" ]]; then
         break
       fi
@@ -663,6 +809,13 @@ PY
   done
 
   [[ -n "${chat_id:-}" ]] || fail "$E_PAIRING" "exhausted retries without a successful pairing"
+
+  # DIVE-4698: the code path learns the person too. Same call, same best-effort
+  # posture — and the same box-wide operator memory the auto path already had.
+  # A code pairing was the ONE path that never seeded it, so an agent created
+  # after a code pairing did not inherit the operator (DIVE-320/325).
+  _operator_record "$paired_sender"
+  _pair_record_human "$name" "$paired_sender" "$chat_id" "$bot_token" || true
 
   # Telegram: CLI sends a welcome DM via Telegram's HTTP API.
   # Discord: the plugin's channel server polls approved/<senderId> and sends
