@@ -125,8 +125,16 @@ if declare -f cmd_task_ls | grep -q 'gate_pinged_at' \
 else
   bad_t "M0a: precondition for the mutant arm" "a projection does not name gate_pinged_at to begin with, so M1/M2 below cannot re-introduce anything: ls=$(declare -f cmd_task_ls | grep -c gate_pinged_at) inbox=$(declare -f cmd_task_inbox | grep -c gate_pinged_at)"
 fi
-eval "$(sed 's/need_answered_tap_uid, gate_pinged_at, tier/need_answered_tap_uid, tier/' <<<"$ORIG_LS")"
-eval "$(sed 's/need_answered_at, gate_pinged_at FROM tasks/need_answered_at FROM tasks/' <<<"$ORIG_INBOX")"
+# DIVE-4833: the strikes anchor on the SMALLEST unique token that names the
+# column, never on its neighbour. The old anchors quoted the column BEFORE
+# gate_pinged_at in each list, so inserting a new column between the two (which
+# DIVE-4833 did, twice) made both seds match nothing: the mutant never installed
+# and M0b — correctly — refused to let M1/M2 pass vacuously. A projection is an
+# ordered list other people edit; the neighbour is not a stable anchor, and the
+# column's own name is. `declare -f` strips comments, so each of these matches
+# exactly one line in the declared body.
+eval "$(sed 's/gate_pinged_at, //' <<<"$ORIG_LS")"
+eval "$(sed 's/, gate_pinged_at FROM tasks/ FROM tasks/' <<<"$ORIG_INBOX")"
 if ! declare -f cmd_task_ls | grep -q 'gate_pinged_at' \
    && ! declare -f cmd_task_inbox | grep -q 'gate_pinged_at'; then
   ok_t "M0b: ... and the strike landed — neither projection names it now"
