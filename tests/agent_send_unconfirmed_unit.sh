@@ -178,14 +178,35 @@ else
   bad_t 'T19 scoped ask rc=1 final prose still looks successful' "$out"
 fi
 
-# Approval condition: the rc=0 renderer itself stays the old expression. This
-# is intentionally source-level because the promise is byte compatibility, not
-# merely an equivalent boolean after a jq rewrite.
+# Approval condition: the rc=0 renderer stays the pinned expression. Still
+# source-level, because the promise is the rendered shape and not merely an
+# equivalent boolean after a jq rewrite.
+#
+# RE-PINNED on the ADDITIVE form (DIVE-2362's owner, 2026-09-22). The literal
+# this used to pin annihilated its own object: `select` on an empty string is
+# `empty`, and jq drops the WHOLE object when any constructed value is `empty`,
+# so with AGENT_WAKE_READY unset and no --reply-to-* — nearly every send —
+# `--json` printed nothing at all on stdout with rc 0. The keys and their order
+# are unchanged; what changed is that an empty optional is now merely absent.
+# tests/agent_send_json_receipt_unit.sh grades the rendered receipt, including a
+# mutant arm that re-renders the old literal to show it printed nothing.
+#
+# Compared after folding the continuation lines, so the pin is on the expression
+# and not on where it wraps.
 SRC=src/cmd_agent_runtime.sh
-if grep -Fq "'{name:\$n, sent:true, bytes:(\$p|length), woken:(\$w==\"1\"), ready:(\$rd|select(length>0)), from:(\$s|select(length>0)), msg_id:(\$i|select(length>0)), reply_to_chat:(\$rc|select(length>0)), reply_to_msg:(\$rm|select(length>0))}'" "$SRC"; then
-  ok_t 'T20 confirmed send keeps the pre-DIVE-2362 renderer byte-for-byte'
+src_folded="$(tr '\n' ' ' <"$SRC" | tr -s ' ')"
+want_rc0='({name:$n, sent:true, bytes:($p|length), woken:($w=="1")} + (if ($rd|length) > 0 then {ready:$rd} else {} end) + (if ($s|length) > 0 then {from:$s} else {} end) + (if ($i|length) > 0 then {msg_id:$i} else {} end) + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end) + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end))'
+if [[ "$src_folded" == *"$want_rc0"* ]]; then
+  ok_t 'T20 confirmed send keeps the pinned rc=0 renderer byte-for-byte'
 else
-  bad_t 'T20 confirmed send renderer changed' 'rc=0 must stay on the original expression'
+  bad_t 'T20 confirmed send renderer changed' 'rc=0 must stay on the additive expression'
+fi
+# The other direction, named rather than implied: the annihilating literal must
+# not come back — not here, and not anywhere else in this source.
+if ! grep -Fq 'ready:($rd|select(length>0))' "$SRC"; then
+  ok_t 'T20b the annihilating select(length>0) receipt is gone from the source'
+else
+  bad_t 'T20b the annihilating select(length>0) receipt is back' 'an empty optional would delete the whole envelope again'
 fi
 if grep -Fq "'{name:\$n, delivered:true, from:\$s, tier:(\$t|select(length>0))}'" "$SRC"; then
   ok_t 'T21 confirmed scoped delivery keeps the pre-DIVE-2362 renderer byte-for-byte'

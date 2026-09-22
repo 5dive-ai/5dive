@@ -3096,22 +3096,23 @@ cmd_send() {
   # is an assumption. A scheduler that treats those the same is making the exact
   # mistake this ticket is about.
   if (( _sent )); then
-    # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
-    # DIVE-4769: an URGENT send gets its OWN renderer, and the ordinary rc=0
-    # receipt below is left byte-for-byte as DIVE-2362 promised it (and as
-    # tests/agent_send_unconfirmed_unit.sh T20 pins it in this source).
+    # DIVE-4769: an URGENT send gets its OWN renderer. It was split off rather
+    # than folded into the ordinary one below with a `+ (if $ur ...)` because
+    # the pin in tests/agent_send_unconfirmed_unit.sh is a control on that
+    # expression, and widening it to fit a new field is the thing this repo does
+    # not do mid-ship.
     #
-    # Two things forced the split rather than one `+ (if $ur ...)`. The pin is a
-    # control on this expression and widening it to fit a new field is the thing
-    # this repo does not do mid-ship. And the pinned expression carries a known
-    # defect — jq drops the WHOLE object when any constructed value is `empty`,
-    # so with AGENT_WAKE_READY unset (nearly every send) it renders an EMPTY JSON
-    # envelope, recorded on DIVE-4214's body and the reason
-    # tests/a2a_busy_queue_unit.sh asserts the success case on the prose line.
-    # Inheriting that for `urgent:` would have shipped a field no caller could
-    # read. So the urgent branch uses the correct if/else form; fixing the
-    # ordinary one is a byte-compatibility decision that belongs to DIVE-2362's
-    # owner, not to this row.
+    # The OTHER reason the split was forced is fixed here rather than inherited.
+    # The ordinary receipt was a single jq object literal whose optional values
+    # read `($x|select(length>0))`, and `select` on an empty string yields
+    # `empty`, which makes jq discard the WHOLE object. With AGENT_WAKE_READY
+    # unset and no --reply-to-* — nearly every seat-to-seat send — `--json`
+    # therefore printed NOTHING on stdout with rc 0: measured on 0.48.0, a
+    # caller that reads the receipt to confirm delivery re-sent, and the target
+    # received the message twice. Recorded on DIVE-4214's body, and the reason
+    # tests/a2a_busy_queue_unit.sh had to assert its success case on the prose
+    # line. Both branches now build their optional keys the one way that cannot
+    # annihilate the object it is building.
     if (( urgent )); then
       ok "sent to agent '$name'.${urgent_note:+ (}${urgent_note}${urgent_note:+)}" \
          '({name:$n, sent:true, bytes:($p|length), woken:($w=="1"), urgent:($ue=="1"), urgent_requested:true}
@@ -3123,9 +3124,20 @@ cmd_send() {
          --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg ue "$urgent_eff"
       return 0
     fi
-    # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
+    # The pre-DIVE-2362 receipt, and still it: same keys, same order. The four
+    # mandatory fields are unconditional and each optional is ADDED only when it
+    # carries a value, so an empty one is merely absent from the object instead
+    # of deleting the object. tests/agent_send_json_receipt_unit.sh grades the
+    # rendered shape and re-renders the old literal in a mutant arm to show it
+    # printed nothing; T20 of tests/agent_send_unconfirmed_unit.sh pins this
+    # expression in this source.
     ok "sent to agent '$name'." \
-       '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), ready:($rd|select(length>0)), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
+       '({name:$n, sent:true, bytes:($p|length), woken:($w=="1")}
+         + (if ($rd|length) > 0 then {ready:$rd} else {} end)
+         + (if ($s|length) > 0 then {from:$s} else {} end)
+         + (if ($i|length) > 0 then {msg_id:$i} else {} end)
+         + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
+         + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end))' \
        --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY"
   else
     if (( _queued )); then
