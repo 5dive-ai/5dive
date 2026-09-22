@@ -16,15 +16,31 @@
 #
 # WHAT THIS PROVES, arm by arm:
 #   A1  `_hb_fresh_downgrade_reason` names live background shells;
-#   A2  ... and an unacked delivery this seat holds AS VERIFIER;
+#   A2  ... and a VERDICT this seat recorded and has not handed back (DIVE-4814:
+#       the signal is the stranded hand-back, not the grading queue);
+#   A2c CONTROL (DIVE-4814) — a delivery merely SITTING unacked in this seat's
+#       queue, with no verdict on it, is NOT a reason: nothing about it lives in
+#       the session, and treating it as one is what stopped quinn ever being
+#       /clear'ed (60 downgrades, 907M quota tokens on 09-21);
 #   A3  CONTROL — a seat with neither signal gets NO reason (it still /clears);
-#   A4  CONTROL — once ACKed, no reason: the signal is the open handoff, not
-#       "this seat is a verifier";
+#   A4  CONTROL — an ACKed handoff with no verdict is not a reason either;
+#   A4b (DIVE-4814) — but an ACKed row DOES downgrade once its verdict is
+#       stamped: the predicate keys on the verdict, not on handoff_ack_at, so a
+#       verifier who ran `task start` before grading is still protected;
 #   A5  CONTROL — a row bounced back to the MAKER (assignee != verifier) is not
 #       an open handoff here either;
 #   A6  STRUCTURAL — the dispatch path consults the helper and downgrades
 #       `eff_fresh`, rather than skipping the tick: a downgrade is strictly
 #       weaker than a defer and must stay that way;
+#   D1-D4 (DIVE-4814) — the guard may not hold one seat warm twice running:
+#       D1  the first fresh wake with a live reason is downgraded;
+#       D2  the SECOND consecutive one is not — it reports the reason as
+#           SUPPRESSED and the seat gets its /clear;
+#       D3  a wake with no reason releases the latch, so protection returns;
+#       D4  STRUCTURAL+BEHAVIOURAL — the decision is read from the caller's own
+#           shell. A `$(…)` call site puts the assignment in a subshell, the
+#           suppression branch becomes unreachable, and nothing else in this
+#           file would notice (the latch is a file and keeps working);
 #   B1  a verifier-held, unacked row that ALREADY CARRIES A VERDICT and is past
 #       the budget is reclaimed to `todo` — and stays on the same seat, which
 #       is the seat that owes the hand-back;
@@ -115,10 +131,36 @@ R=$(_hb_fresh_downgrade_reason olivia)
 reset_all
 _HB_IDLE_BG_SHELLS=""
 TA2=$(mk_delivered_unacked)
+stamp_verdict "$TA2"
 R=$(_hb_fresh_downgrade_reason olivia)
-[[ "$R" == *"unacked"* ]] \
-  && ok_t "A2 an unacked delivery held AS VERIFIER is a reason to keep the context warm" \
-  || bad_t "A2 unacked verifier delivery produced no reason" "got '${R}' row=$(rowa "$TA2")"
+[[ "$R" == *"recorded a verdict"* ]] \
+  && ok_t "A2 a verdict recorded and not handed back is a reason to keep the context warm" \
+  || bad_t "A2 a stranded hand-back produced no reason" "got '${R}' row=$(rowa "$TA2")"
+# ... and the line NAMES the row it is protecting, so a run of downgrades can be
+# audited row by row against the store instead of reading "3 delivered row(s)".
+IDA2=$(db "SELECT ident FROM tasks WHERE id=${TA2};")
+[[ -n "$IDA2" && "$R" == *"$IDA2"* ]] \
+  && ok_t "A2b the reason names the row whose hand-back it is protecting" \
+  || bad_t "A2b the reason does not name the row" "ident='${IDA2}' got '${R}'"
+
+# A2c THE DIVE-4814 CONTROL, and the one arm that fails on the pre-fix tree: an
+# ordinary delivery waiting in the grading queue, ungraded. Iteration 1 counted
+# exactly this and downgraded on it.
+reset_all
+TA2C=$(mk_delivered_unacked)
+R=$(_hb_fresh_downgrade_reason olivia)
+[[ -z "$R" ]] \
+  && ok_t "A2c [control] an ungraded delivery sitting in the queue is NOT a reason (DIVE-4814)" \
+  || bad_t "A2c the queue itself still downgrades the wake" "got '${R}' row=$(rowa "$TA2C")"
+
+# ... and it is still not a reason when there are several of them, which is the
+# state a grading seat is in all day.
+reset_all
+mk_delivered_unacked >/dev/null; mk_delivered_unacked >/dev/null; mk_delivered_unacked >/dev/null
+R=$(_hb_fresh_downgrade_reason olivia)
+[[ -z "$R" ]] \
+  && ok_t "A2d [control] three ungraded deliveries in the queue are still not a reason" \
+  || bad_t "A2d a queue of deliveries downgraded the wake" "got '${R}'"
 
 reset_all
 R=$(_hb_fresh_downgrade_reason olivia)
@@ -131,8 +173,20 @@ TA4=$(mk_delivered_unacked)
 db "UPDATE tasks SET handoff_ack_at=datetime('now') WHERE id=${TA4};"
 R=$(_hb_fresh_downgrade_reason olivia)
 [[ -z "$R" ]] \
-  && ok_t "A4 [control] an ACKed handoff is not an open handoff — no downgrade" \
+  && ok_t "A4 [control] an ACKed handoff with no verdict is not a reason — no downgrade" \
   || bad_t "A4 an ACKed handoff still downgraded" "got '${R}'"
+
+# A4b the other half of that, and the reason handoff_ack_at is NOT in the
+# predicate: `task start` acks, so a verifier who starts the row before grading
+# it would drop out of an ack-keyed guard exactly when it is owed most.
+reset_all
+TA4B=$(mk_delivered_unacked)
+db "UPDATE tasks SET handoff_ack_at=datetime('now') WHERE id=${TA4B};"
+stamp_verdict "$TA4B"
+R=$(_hb_fresh_downgrade_reason olivia)
+[[ "$R" == *"recorded a verdict"* ]] \
+  && ok_t "A4b an ACKed row whose verdict is stamped but unhanded still downgrades (DIVE-4814)" \
+  || bad_t "A4b the predicate still keys on the ack" "got '${R}'"
 
 reset_all
 TA5=$(mk_delivered_unacked)
@@ -145,11 +199,83 @@ R=$(_hb_fresh_downgrade_reason olivia)
 # A6 STRUCTURAL: the dispatch path downgrades, it does not defer. Read the source
 # rather than the pane — the surrounding function is the whole tick loop and has
 # no seam a unit harness can drive.
-A6=$(awk '/_warm_why="\$\(_hb_fresh_downgrade_reason/{f=1} f&&/eff_fresh="false"/{print "hit"; exit}' "$SRC/cmd_heartbeat.sh")
-A6C=$(awk '/_warm_why="\$\(_hb_fresh_downgrade_reason/{f=1} f&&n++<12&&/continue/{print "defer"; exit}' "$SRC/cmd_heartbeat.sh")
+A6=$(awk '/_hb_fresh_downgrade_decide "\$name"/{f=1} f&&/eff_fresh="false"/{print "hit"; exit}' "$SRC/cmd_heartbeat.sh")
+A6C=$(awk '/_hb_fresh_downgrade_decide "\$name"/{f=1} f&&n++<12&&/continue/{print "defer"; exit}' "$SRC/cmd_heartbeat.sh")
 [[ "$A6" == "hit" && -z "$A6C" ]] \
   && ok_t "A6 the dispatch path downgrades eff_fresh and never defers the tick on this signal" \
   || bad_t "A6 dispatch wiring is wrong" "downgrade='${A6}' defer='${A6C}'"
+
+# =============================================================================
+# D) DIVE-4814 — the guard may not hold one seat warm twice running
+# =============================================================================
+# THE BOUND IS COUNTED IN WAKES, NOT MINUTES. Both signals are read from state
+# that outlives a turn (a poll shell, a PASS parked on a human's merge), so
+# "the reason still holds" is not evidence the SESSION still holds anything.
+latch_p() { printf '%s/fresh-downgrade.%s.held' "$STATE_DIR" "$1"; }
+
+reset_all
+rm -f "$(latch_p olivia)"
+_HB_IDLE_BG_SHELLS=""
+TD=$(mk_delivered_unacked)
+stamp_verdict "$TD"
+_hb_fresh_downgrade_decide olivia 2>/dev/null || true
+[[ -n "${_HB_FRESH_DOWNGRADE_WHY:-}" && -z "${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}" && -f "$(latch_p olivia)" ]] \
+  && ok_t "D1 the first fresh wake with a live reason is downgraded and latches" \
+  || bad_t "D1 first wake did not downgrade/latch" "why='${_HB_FRESH_DOWNGRADE_WHY:-}' supp='${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}' latch=$([[ -f "$(latch_p olivia)" ]] && echo yes || echo no)"
+
+# The store has not changed — same row, same stranded verdict. The SEAT has: it
+# already had one warm turn with it in front of it.
+_hb_fresh_downgrade_decide olivia 2>/dev/null || true
+[[ -z "${_HB_FRESH_DOWNGRADE_WHY:-}" && -n "${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}" && ! -f "$(latch_p olivia)" ]] \
+  && ok_t "D2 the second consecutive fresh wake is NOT downgraded — reported suppressed, latch released" \
+  || bad_t "D2 the guard fired twice running" "why='${_HB_FRESH_DOWNGRADE_WHY:-}' supp='${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}' latch=$([[ -f "$(latch_p olivia)" ]] && echo yes || echo no)"
+
+# ... and it is a ceiling, not an off switch: the third wake protects again,
+# because the state that survived the /clear is a NEW claim on the session.
+_hb_fresh_downgrade_decide olivia 2>/dev/null || true
+[[ -n "${_HB_FRESH_DOWNGRADE_WHY:-}" ]] \
+  && ok_t "D2b the ceiling is every-other-wake, not a permanent disarm" \
+  || bad_t "D2b the guard stopped firing altogether" "why='${_HB_FRESH_DOWNGRADE_WHY:-}' supp='${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}'"
+
+# D3 a wake with NOTHING to protect releases the latch, so the next real reason
+# is honoured rather than eaten by a stale flag.
+reset_all
+_hb_fresh_downgrade_decide olivia 2>/dev/null || true
+[[ -z "${_HB_FRESH_DOWNGRADE_WHY:-}" && -z "${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}" && ! -f "$(latch_p olivia)" ]] \
+  && ok_t "D3 a clean wake releases the latch (no reason, no suppression)" \
+  || bad_t "D3 the latch survived a clean wake" "why='${_HB_FRESH_DOWNGRADE_WHY:-}' supp='${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}' latch=$([[ -f "$(latch_p olivia)" ]] && echo yes || echo no)"
+TD3=$(mk_delivered_unacked); stamp_verdict "$TD3"
+_hb_fresh_downgrade_decide olivia 2>/dev/null || true
+[[ -n "${_HB_FRESH_DOWNGRADE_WHY:-}" ]] \
+  && ok_t "D3b ... and the next real reason is honoured" \
+  || bad_t "D3b a released latch still ate the downgrade" "why='${_HB_FRESH_DOWNGRADE_WHY:-}'"
+
+# D4 THE SUBSHELL TRAP. The decision is TWO answers (warm-because-X, and
+# fresh-although-X); only the first can travel through stdout. Capture the call
+# the way a `why="$(…)"` call site does and the suppression is invisible — the
+# branch that logs it becomes dead code while every other arm here still passes.
+# So: the behaviour (the global is set in the CALLER's shell) and the wiring
+# (the dispatch site calls it bare) are both asserted.
+rm -f "$(latch_p olivia)"
+_hb_fresh_downgrade_decide olivia >/dev/null 2>&1 || true   # latch
+_HB_FRESH_DOWNGRADE_SUPPRESSED=""
+CAP=$(_hb_fresh_downgrade_decide olivia 2>/dev/null)  # the WRONG shape, on purpose
+[[ -z "$CAP" && -z "${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}" ]] \
+  && ok_t "D4 a \$(…) capture cannot see the decision — which is why the call site must not use one" \
+  || bad_t "D4 the subshell capture leaked a value" "cap='${CAP}' supp='${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}'"
+rm -f "$(latch_p olivia)"
+_hb_fresh_downgrade_decide olivia 2>/dev/null || true
+_hb_fresh_downgrade_decide olivia 2>/dev/null || true
+[[ -n "${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}" ]] \
+  && ok_t "D4b a BARE call sets the suppression in the caller's own shell" \
+  || bad_t "D4b the bare call did not export the decision" "supp='${_HB_FRESH_DOWNGRADE_SUPPRESSED:-}'"
+D4W=$(grep -c '^ *_hb_fresh_downgrade_decide "\$name"$' "$SRC/cmd_heartbeat.sh")
+D4B=$(grep -c '_warm_why="\$(_hb_fresh_downgrade_decide' "$SRC/cmd_heartbeat.sh")
+(( D4W >= 1 && D4B == 0 )) \
+  && ok_t "D4c the dispatch site calls the decision BARE, not through a capture" \
+  || bad_t "D4c the dispatch site re-introduced the subshell" "bare=${D4W} captured=${D4B}"
+rm -f "$(latch_p olivia)"
+_HB_FRESH_DOWNGRADE_WHY=""; _HB_FRESH_DOWNGRADE_SUPPRESSED=""
 
 # =============================================================================
 # B) the claim the reaper could never reach
