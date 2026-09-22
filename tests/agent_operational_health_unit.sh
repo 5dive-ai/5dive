@@ -64,25 +64,42 @@ is "unrefreshable future expiry keeps the ordinary rendering" \
   "$(_agent_auth_display ok 4102444800 false)" \
   "ok · expires 2100-01-01T00:00:00Z"
 
-# Drive cmd_tui's real dispatcher refusal. The interactive negative controls use
-# a fake sudo binary so exec reaches the attach branch without touching tmux.
+# Drive cmd_tui's audited dispatcher takeover. Fake systemctl/sudo prove the
+# stop -> interactive Codex -> restore ordering without touching a live seat.
 . src/cmd_agent_config.sh
 ensure_state() { :; }
-REG='{"agents":{"dash":{"type":"codex","channels":"dashboard"},"combo":{"type":"codex","channels":"telegram,dashboard"},"plain":{"type":"codex","channels":"none"},"claude":{"type":"claude","channels":"dashboard"}}}'
+REG='{"agents":{"dash":{"type":"codex","channels":"dashboard"},"combo":{"type":"codex","channels":"telegram,dashboard"},"missing":{"type":"codex","channels":"dashboard","workdir":"/definitely/not/a/real/workdir"},"plain":{"type":"codex","channels":"none"},"claude":{"type":"claude","channels":"dashboard"}}}'
 registry_read() { printf '%s\n' "$REG"; }
-E_USAGE=2; E_NOT_FOUND=4; E_CONFLICT=5
+DEFAULT_WORKDIR="$TMP"
+E_GENERIC=1; E_USAGE=2; E_NOT_FOUND=4; E_CONFLICT=5
 fail() { printf 'REFUSED[%s]: %s\n' "$1" "$2" >&2; exit "$1"; }
+push_exit_handler() { trap "$1" EXIT; }
 mkdir -p "$TMP/bin"
-printf '#!/usr/bin/env bash\nprintf "ATTACH:%%s\\n" "$*"\n' > "$TMP/bin/sudo"
+printf '#!/usr/bin/env bash\nprintf "ATTACH:%%s\\n" "$*"\n[[ "${FAKE_TUI_FAIL:-0}" == 1 ]] && exit 9\nexit 0\n' > "$TMP/bin/sudo"
+printf '#!/usr/bin/env bash\nprintf "SYSTEMCTL:%%s\\n" "$*"\n[[ "$1" == start && "${FAKE_RESTORE_FAIL:-0}" == 1 ]] && exit 8\nexit 0\n' > "$TMP/bin/systemctl"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/logger"
 chmod +x "$TMP/bin/sudo"
+chmod +x "$TMP/bin/systemctl" "$TMP/bin/logger"
+sudo() { "$TMP/bin/sudo" "$@"; }
 
-run_tui() { ( PATH="$TMP/bin:$PATH"; cmd_tui "$1" ) 2>&1; }
+run_tui() { ( set -e; PATH="$TMP/bin:$PATH"; hash -r; cmd_tui "$1" ) 2>&1; }
 for seat in dash combo; do
-  rc=0; out=$(run_tui "$seat") || rc=$?
-  is "$seat dispatcher refuses false TUI attach" "$rc" 5
-  has "$seat refusal names no interactive Codex TUI" "$out" "no interactive Codex TUI"
-  has "$seat refusal points to transport logs" "$out" "5dive agent logs $seat --tmux"
+  out=$(run_tui "$seat")
+  has "$seat takeover stops dispatcher" "$out" "SYSTEMCTL:stop 5dive-agent@$seat.service"
+  has "$seat takeover opens native Codex" "$out" "ATTACH:-u agent-$seat env CODEX_HOME=/home/agent-$seat/.codex /home/claude/.local/bin/codex"
+  has "$seat takeover restores dispatcher" "$out" "SYSTEMCTL:start 5dive-agent@$seat.service"
 done
+rc=0; out=$(FAKE_TUI_FAIL=1 run_tui dash) || rc=$?
+is "failed TUI returns its status" "$rc" 9
+has "failed TUI still restores dispatcher" "$out" "SYSTEMCTL:start 5dive-agent@dash.service"
+rc=0; out=$(FAKE_TUI_FAIL=1 FAKE_RESTORE_FAIL=1 run_tui dash) || rc=$?
+is "failed TUI plus failed restore is reported" "$rc" "$E_GENERIC"
+has "failed restore names the dispatcher recovery failure" "$out" \
+  "Codex TUI exited, but 5dive-agent@dash.service could not be restored"
+rc=0; out=$(run_tui missing) || rc=$?
+is "setup failure returns the product error" "$rc" "$E_NOT_FOUND"
+has "exit-chain restores dispatcher after setup failure" "$out" \
+  "SYSTEMCTL:start 5dive-agent@missing.service"
 is "plain Codex still reaches interactive attach" "$(run_tui plain)" \
   "ATTACH:-u agent-plain tmux attach -t agent-plain"
 is "Claude dashboard still reaches its native TUI" "$(run_tui claude)" \
