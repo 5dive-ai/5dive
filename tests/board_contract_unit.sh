@@ -151,7 +151,7 @@ awk 'f&&/^}$/{exit} /^main\(\) \{$/{f=1} f' src/main.sh | grep -qE '^    ui\)' \
   && bad_t "E3 the file is gone" "src/cmd_ui.sh is still in the tree" \
   || ok_t "E3 src/cmd_ui.sh is deleted — one producer, in one repo"
 ushim=$("$BIN" ui 2>&1 >/dev/null); urc=0; "$BIN" ui >/dev/null 2>&1 || urc=$?
-[[ "$urc" != "0" ]] && printf '%s' "$ushim" | grep -q '5dive plugin add 5dive-ai/5dive-ui' \
+[[ "$urc" != "0" ]] && grep -q '5dive plugin add 5dive-ai/5dive-ui' <<<"$ushim" \
   && ok_t "E4 an un-migrated box gets the install line and a non-zero exit (rc=$urc), not \"unknown command\" alone" \
   || bad_t "E4 the moved-verb notice" "rc=$urc, stderr: $(printf '%s' "$ushim" | tr '\n' ' ')"
 
@@ -160,12 +160,33 @@ ushim=$("$BIN" ui 2>&1 >/dev/null); urc=0; "$BIN" ui >/dev/null 2>&1 || urc=$?
 # a MOVED verb it runs the shim, so the notice lands on the stderr of a person
 # who only asked for help. Cheap arm, whole class.
 helpout=$("$BIN" --help 2>"$TMP/help.err"); helperr=$(cat "$TMP/help.err")
-printf '%s' "$helpout" | grep -q '5dive plugin add 5dive-ai/5dive-ui' \
+grep -q '5dive plugin add 5dive-ai/5dive-ui' <<<"$helpout" \
   && ok_t "E5 --help tells you where the UI went" \
   || bad_t "E5 --help names the plugin" "the install line is not in the usage text"
 [[ -z "$helperr" ]] \
   && ok_t "E6 ...and --help writes NOTHING to stderr (no backticked verb ran inside the heredoc)" \
   || bad_t "E6 --help is quiet on stderr" "got: $(printf '%s' "$helperr" | tr '\n' ' ')"
+
+# E7 (DIVE-4806) — THE ASSERTION MUST NOT BE ABLE TO FAIL ON A TRUE PROPERTY.
+# E5 red `test-installed-host` on main at 0b7b154f while the merge_group run at
+# the SAME sha was green, and the install line it looks for was in the usage text
+# the whole time (src/main.sh). The shape was a builtin piped into `grep -q`:
+# under `set -o pipefail` (line 23) the pipeline reports the RIGHTMOST non-zero
+# status, and when `grep -q` exits on its match it closes the pipe under a writer
+# that has not finished — the writer dies on SIGPIPE/EPIPE (141) and a MATCHING
+# grep is scored as a miss. It is a race, so it fails one run in many and never
+# the one you re-run. A herestring has no writer process, so there is nothing to
+# kill. The detector's own lines are tagged EPIPE-SELF and excluded, so neither
+# the pattern nor its control can be counted as a site.
+_epipe_pat="printf[^|]*"'\| *grep -q'                            # EPIPE-SELF
+_epipe_sample="printf '%s' \"\$x\" "'| grep -q PAT'              # EPIPE-SELF
+grep -qE "$_epipe_pat" <<<"$_epipe_sample" \
+  && ok_t "E7 control: the detector does fire on the shape it is looking for" \
+  || bad_t "E7 control" "the detector matches nothing — the arm below would pass vacuously"
+_epipe_hits=$(grep -v 'EPIPE-SELF' "$0" | grep -cE "$_epipe_pat")
+[[ "$_epipe_hits" == "0" ]] \
+  && ok_t "E7 no assertion in this harness pipes a builtin into \`grep -q\`" \
+  || bad_t "E7 EPIPE-prone assertion" "$_epipe_hits site(s) match the shape — under pipefail a matching grep can still score as a miss"
 
 echo "── F: the verb is reachable and refuses what it should ──"
 grep -qE '^\s+board\)' src/main.sh && ok_t "F1 registered in main.sh's dispatch" || bad_t "F1 registered"
@@ -238,7 +259,7 @@ mut "store-free-negotiation" '/--contract-version) printf/s|.*|      --contract-
 # still gone from core, still non-zero, and a human is told it never existed.
 # That is the silent-nothing outcome acceptance names, and arm E4 must red on it.
 mut "moved-verb-notice" '/^    ui) printf .5dive-ai\/5dive-ui/s|.*|    __never_a_verb__) return 1 ;;|' 'src/main.sh' \
-    bash -c 'out=$("$MUTBIN" ui 2>&1 >/dev/null); "$MUTBIN" ui >/dev/null 2>&1 && exit 1; printf "%s" "$out" | grep -q "5dive plugin add 5dive-ai/5dive-ui"'
+    bash -c 'out=$("$MUTBIN" ui 2>&1 >/dev/null); "$MUTBIN" ui >/dev/null 2>&1 && exit 1; grep -q "5dive plugin add 5dive-ai/5dive-ui" <<<"$out"'
 # M4 — the contract block inside the document. A consumer handed only the document
 # must be able to check the version without a second exec.
 # BOTH emit paths, and the property asserted on BOTH documents. The populated
