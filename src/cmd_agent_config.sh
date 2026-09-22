@@ -542,32 +542,29 @@ cmd_tui() {
         local workdir service
         workdir=$(jq -r --arg n "$name" --arg d "$DEFAULT_WORKDIR" '.agents[$n].workdir // $d' <<<"$reg")
         service="5dive-agent@${name}.service"
-        (
-          local stopped=0 restored=0 restore_rc=0
-          restore_dispatcher() {
-            (( stopped == 1 && restored == 0 )) || return 0
-            restored=1
-            systemctl start "$service" || restore_rc=$?
-            logger -t 5dive-agent-tui "agent=$name action=takeover-restored service=$service rc=$restore_rc" 2>/dev/null || true
-          }
-          trap restore_dispatcher EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM HUP
-          logger -t 5dive-agent-tui "agent=$name action=takeover-start channels=$channels" 2>/dev/null || true
-          systemctl stop "$service" \
-            || fail "$E_GENERIC" "could not stop $service for interactive takeover"
-          stopped=1
-          cd "$workdir" || fail "$E_NOT_FOUND" "agent workdir is not reachable: $workdir"
-          sudo -u "agent-${name}" env CODEX_HOME="/home/agent-${name}/.codex" \
-            /home/claude/.local/bin/codex
-          local tui_rc=$?
-          restore_dispatcher
-          trap - EXIT INT TERM HUP
-          (( restore_rc == 0 )) \
-            || fail "$E_GENERIC" "Codex TUI exited, but $service could not be restored"
-          exit "$tui_rc"
-        )
-        return $?
+        local stopped=0 restored=0 restore_rc=0
+        restore_dispatcher() {
+          (( stopped == 1 && restored == 0 )) || return 0
+          restored=1
+          systemctl start "$service" || restore_rc=$?
+          logger -t 5dive-agent-tui "agent=$name action=takeover-restored service=$service rc=$restore_rc" 2>/dev/null || true
+        }
+        push_exit_handler restore_dispatcher
+        trap 'exit 130' INT
+        trap 'exit 143' TERM HUP
+        logger -t 5dive-agent-tui "agent=$name action=takeover-start channels=$channels" 2>/dev/null || true
+        systemctl stop "$service" \
+          || fail "$E_GENERIC" "could not stop $service for interactive takeover"
+        stopped=1
+        cd "$workdir" || fail "$E_NOT_FOUND" "agent workdir is not reachable: $workdir"
+        local tui_rc=0
+        sudo -u "agent-${name}" env CODEX_HOME="/home/agent-${name}/.codex" \
+          /home/claude/.local/bin/codex || tui_rc=$?
+        restore_dispatcher
+        trap - INT TERM HUP
+        (( restore_rc == 0 )) \
+          || fail "$E_GENERIC" "Codex TUI exited, but $service could not be restored"
+        exit "$tui_rc"
         ;;
     esac
   fi
