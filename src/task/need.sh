@@ -2777,6 +2777,43 @@ cmd_task_need() {
     else case "$type" in decision|approval) tier=1 ;; *) tier=2 ;; esac  # DIVE-1284
     fi
   fi
+
+  # ── DIVE-4809 — AN URGENT ROW'S GATE ROUTES NOW, AND THE ROW ALREADY SAID SO ──
+  #
+  # Measured on the 2026-09-22 red-main freeze (DIVE-4806): a ~70-minute outage of
+  # which ~10 minutes were work. The single largest slice — 34 minutes, 00:40:14Z to
+  # 01:14:05Z — was one approval gate sitting QUEUED for its reviewer's next natural
+  # wake. Nothing about the gate was slow; nothing about it was ever read as urgent,
+  # because urgency had been declared on the ROW and the routing decision read only
+  # the flag.
+  #
+  # THE TWO HALVES OF THIS RAIL ALREADY DISAGREED. `_task_gate_undo_window_secs`
+  # (src/task/notify.sh, DIVE-4154) resolves exactly this question from "the three
+  # vocabularies that exist" and `priority='urgent'` is the third of them — so an
+  # urgent row's HUMAN-bound gate has skipped the 120s phone hold for weeks, while
+  # the same row's LEAD-bound gate waited for a natural wake. One rail, two answers,
+  # from the same column. This makes the routing half read what the window half
+  # already reads.
+  #
+  # IT CAN ONLY TURN URGENCY ON, and only where the filer passed no `--urgent`, so an
+  # explicit flag is never reinterpreted and the derivation can never downgrade one.
+  #
+  # AND IT IS RECORDED AS DERIVED, not laundered into the filer's declaration.
+  # `gate_urgent` means "somebody said this cannot wait"; `urgent_src` says WHICH of
+  # the two said it. That distinction is the only thing a later reader of an
+  # over-firing rail can act on — "the filer over-declares" and "the priority
+  # inheritance over-fires" are different defects with different fixes, and a column
+  # that answers both with `1` names neither. DIVE-3474 arm 2's whole argument was
+  # that a recommendation is evidence about the ANSWER and never about the CLOCK;
+  # the same care is owed to where the clock claim came from.
+  local urgent_src=""
+  if (( urgent )); then
+    urgent_src="--urgent"
+  else
+    local _row_prio
+    _row_prio=$(db "SELECT COALESCE(priority,'') FROM tasks WHERE id=${id};" 2>/dev/null) || _row_prio=""
+    if [[ "$_row_prio" == "urgent" ]]; then urgent=1; urgent_src="priority=urgent"; fi
+  fi
   local tier_floored=0
   local _floored_by_title=0 _floor_axis=none _ft_title=""   # DIVE-2224
   # DIVE-2615: WHY this gate has the tier it has, recorded at the moment it is
@@ -4914,6 +4951,7 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
   _task_store_audit_log "task need filed" ok 0 -- \
     "task=$ident" "type=$type" "tier=$tier" "tier_arg=${tier_arg:-<unset>}" \
     "tier_floored=${tier_floored:-0}" "needs=${needs:-<none>}" "urgent=${urgent:-0}" \
+    "urgent_src=${urgent_src:-<none>}" \
     "filer=$actor" || true
   if [[ -n "$needs" ]]; then
     _task_store_audit_log "task need declared-capability" \
@@ -5141,6 +5179,12 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
           inflight)  _rnote=" [handoff dispatched — delivery not yet confirmed; the gate-delivery row lands when the send completes]" ;;
           *)         _rnote=" [HANDOFF NOT DELIVERED — ${_reviewer} was NOT pinged${TASK_NOTIFY_FAIL_REASON:+ (${TASK_NOTIFY_FAIL_REASON})}; the gate stands, the re-nag escalates it (<=15 min), and it is answerable now with: 5dive task answer ${ident}]" ;;
         esac
+        # DIVE-4809: say WHERE the urgency came from, on the line the filer reads.
+        # A wake nobody asked for in the command they typed is otherwise indistinguishable
+        # from the rail over-firing, and the filer is the one who can tell us which it was.
+        if [[ "$urgent_src" == "priority=urgent" ]]; then
+          _rnote+=" [woken NOW, not queued, because the ROW is priority=urgent — no --urgent was passed (DIVE-4809). Drop the row's priority if this did not need a wake.]"
+        fi
         # DIVE-2224: when the floor declined to fire only because the term was in the
         # TITLE, say so HERE. A stderr warn is not the durable surface -- the routed
         # reviewer reads this line, and "escalate if the ask really is asking for
