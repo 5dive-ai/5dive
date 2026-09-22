@@ -51,12 +51,13 @@ STATE_DIR="$TMP"
 fixture_box_verify_policy always || exit 1
 TASKS_DIR="$STATE_DIR/tasks"
 TASKS_DB="$TASKS_DIR/tasks.db"
+DIGEST_SPOOL="$STATE_DIR/heartbeat-ops-digest.tsv"
 JSON_MODE=1
 mkdir -p "$TASKS_DIR"
 set +e
 
 # --- stubs: record pings, never touch tmux/network ---------------------------
-SEND_LOG="$TMP/sent"; : >"$SEND_LOG"
+SEND_LOG="$TMP/sent"; : >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 cmd_send() {  # $1 = target agent; --message=… carries the body
   local tgt="$1" msg=""; shift
   for a in "$@"; do case "$a" in --message=*) msg="${a#--message=}";; esac; done
@@ -103,9 +104,16 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 addt()  { ( cmd_task_add "$@" ) 2>/dev/null | jq -r '.data.id'; }
+# DIVE-4826: the three ops housekeeping rails (stranded / recurring-stall /
+# blocked-no-reason) no longer cmd_send at all — they append to this spool, which
+# the tick flushes as ONE batched notice per window. So for those rails the SEND
+# LOG IS THE WRONG INSTRUMENT: it now reads empty whether the rail fired or was
+# deleted. Every arm that grades one of them reads the spool instead, and the
+# send log keeps its job of proving no LIVE turn was produced.
 reset_all() {
   db "DELETE FROM tasks; DELETE FROM loop_runs; DELETE FROM task_prefs;"
   : >"$SEND_LOG"
+  rm -f "$DIGEST_SPOOL" "$DIGEST_SPOOL.last"
 }
 
 # =============================================================================
@@ -121,7 +129,7 @@ delivered=$(db "SELECT COALESCE(handoff_delivered_at,'NULL') FROM tasks WHERE id
 [[ "$delivered" != "NULL" ]] \
   && ok_t "task done to a verifier stamps handoff_delivered_at" \
   || bad_t "handoff_delivered_at not stamped" "got $delivered"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ ! -s "$SEND_LOG" || "$(cut -f2 "$SEND_LOG" | grep -c 'delivered to you')" == "0" ]] \
   && ok_t "fresh delivery is not surfaced yet (under _HB_VERIFY_STALE_MIN)" \
@@ -129,10 +137,21 @@ _hb_stall_sweep >/dev/null 2>&1
 
 # --- A2: backdate the delivery past the staleness window -> verifier + main pinged, flag stamped
 db "UPDATE tasks SET handoff_delivered_at=datetime('now','-${_HB_VERIFY_STALE_MIN} minutes','-5 minutes') WHERE id=${a};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
-grep -q $'^olivia\t.*delivered to you' "$SEND_LOG" \
-  && ok_t "stale delivery pings the verifier" || bad_t "verifier not pinged" "$(cat "$SEND_LOG")"
+# DIVE-4826 INVERTED this arm too, for the reason DIVE-4206 gave about the ops
+# copy and which finishes here. The row this sweep selects is `status NOT IN
+# ('done','cancelled') AND assignee=verifier` — the dispatcher's own predicate —
+# so the verifier is already woken onto it, and the send is spooled to that same
+# idle and could never arrive first. 68 user turns in 7d repeating the /goal.
+# What is graded now: the sweep still SELECTS and STAMPS the row (below), and
+# produces NO live turn for anyone.
+[[ ! -s "$SEND_LOG" ]] \
+  && ok_t "stale delivery produces NO a2a at all — the dispatcher already wakes the verifier onto the row (DIVE-4826)" \
+  || bad_t "the delivered-unacked nag is back" "$(cat "$SEND_LOG")"
+[[ "$(cut -f2 "$SEND_LOG" | grep -c 'delivered to you')" == "0" ]] \
+  && ok_t "...specifically, no seat receives the 'delivered to you … still unacknowledged' text" \
+  || bad_t "the nag text is back" "$(cat "$SEND_LOG")"
 # DIVE-4206 INVERTED this assertion. It used to demand a COPY to ops on every
 # stale delivery in the fleet — 295 of them in ops's session log over two days,
 # none of them ops's move, each one landing as a user turn in the middle of the
@@ -146,7 +165,7 @@ grep -q $'^olivia\t.*delivered to you' "$SEND_LOG" \
   && ok_t "stale-ping flag stamped" || bad_t "flag not stamped" ""
 
 # --- A3: throttle — a second sweep does not re-ping the same delivery
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ ! -s "$SEND_LOG" ]] \
   && ok_t "already-flagged delivery is not re-pinged" \
@@ -158,7 +177,7 @@ b=$(addt --assignee=dev --verifier=olivia -- "ship the gadget")
 ( cmd_task_done "$b" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 db "UPDATE tasks SET handoff_delivered_at=datetime('now','-999 minutes'),
        handoff_ack_at=datetime('now') WHERE id=${b};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ ! -s "$SEND_LOG" ]] \
   && ok_t "acknowledged handoff is never surfaced" \
@@ -186,7 +205,7 @@ db "UPDATE tasks SET handoff_delivered_at=datetime('now','-999 minutes'),
        need_type='decision', need_asked_at=datetime('now','-300 minutes'),
        need_answered_at=datetime('now','-${_HB_VERIFY_STALE_MIN} minutes','-5 minutes')
      WHERE id=${ag};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 # DIVE-4296 iteration 2 (DO 5) REPOINTED THIS WHOLE BLOCK, and the reason matters
 # more than the edit. The arm's observable used to be the a2a SEND; the send is
@@ -202,7 +221,7 @@ _hb_stall_sweep >/dev/null 2>&1
 # STAMP, which is the effect the predicate still has.
 stamped() { [[ "$(db "SELECT COALESCE(gate_answered_nudged_at,'NULL') FROM tasks WHERE id=${1};")" != "NULL" ]]; }
 db "UPDATE tasks SET gate_answered_nudged_at=NULL WHERE id=${ag};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 stamped "$ag" \
   && ok_t "A5 the answered-gate row is SELECTED by the arm (ack stamped, old throttle burned)" \
@@ -224,7 +243,7 @@ grep -q 'still unacknowledged' "$SEND_LOG" \
 [[ "$(db "SELECT COALESCE(gate_answered_nudged_at,'NULL') FROM tasks WHERE id=${ag};")" != "NULL" ]] \
   && ok_t "A7 gate_answered_nudged_at stamped" || bad_t "A7 new throttle not stamped" ""
 _a7_first="$(db "SELECT gate_answered_nudged_at FROM tasks WHERE id=${ag};")"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 # The throttle is what stops the arm re-examining the row every tick. Graded on
 # the stamp rather than on a send (DIVE-4296): an unchanged stamp means the
@@ -244,7 +263,7 @@ db "UPDATE tasks SET handoff_delivered_at=datetime('now','-999 minutes'),
        handoff_stale_pinged_at=datetime('now','-400 minutes'),
        need_type='decision', need_asked_at=datetime('now','-300 minutes'),
        need_answered_at=NULL WHERE id=${ah};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 stamped "$ah" \
   && bad_t "A8 selected a row whose gate is STILL OPEN (DIVE-2196 defect)" "stamped" \
@@ -252,7 +271,7 @@ stamped "$ah" \
 
 # --- A9: answered, but not yet past the window -> not yet
 db "UPDATE tasks SET need_answered_at=datetime('now') WHERE id=${ah};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 stamped "$ah" \
   && bad_t "A9 selected a gate answered seconds ago" "stamped" \
@@ -262,13 +281,13 @@ stamped "$ah" \
 #     mirroring the (a2) rail; 22 parked rows were live fleet-wide when it was added.
 db "UPDATE tasks SET need_answered_at=datetime('now','-${_HB_VERIFY_STALE_MIN} minutes','-5 minutes'),
        parked_at=datetime('now') WHERE id=${ah};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 stamped "$ah" \
   && bad_t "A10 selected a PARKED row" "stamped" \
   || ok_t "A10 a parked row is not selected"
 db "UPDATE tasks SET parked_at=NULL WHERE id=${ah};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 stamped "$ah" \
   && ok_t "A10 CONTROL un-parking the same row makes it fire (A10 was not vacuous)" \
@@ -290,7 +309,7 @@ _hb_stall_sweep >/dev/null 2>&1
 # --- B2: fleet idle + stranded todo -> starts the persistence clock, no alarm yet
 reset_all
 strand=$(addt --assignee=bob -- "stranded todo")
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ -n "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")" ]] \
   && ok_t "fleet-idle-with-stranded-work starts the persistence clock" \
@@ -302,7 +321,7 @@ _hb_stall_sweep >/dev/null 2>&1
 # --- B3: backdate the persistence clock past the threshold -> alarms ops
 db "UPDATE task_prefs SET value=datetime('now','-${_HB_STALL_MIN_MINUTES} minutes','-1 minutes')
     WHERE key='stall_first_seen_at';"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 grep -q $'^ops\t.*fleet-stall' "$SEND_LOG" \
   && ok_t "persisted stall (past _HB_STALL_MIN_MINUTES) alarms ops" \
@@ -311,7 +330,7 @@ grep -q $'^ops\t.*fleet-stall' "$SEND_LOG" \
   && ok_t "stall alert throttle key stamped" || bad_t "throttle key missing" ""
 
 # --- B4: throttle — re-running immediately does not re-alarm
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ ! -s "$SEND_LOG" ]] \
   && ok_t "stall alarm throttled (no re-alarm within the window)" \
@@ -390,7 +409,7 @@ done
 _hb_stall_sweep >/dev/null 2>&1
 db "UPDATE task_prefs SET value=datetime('now','-${_HB_STALL_MIN_MINUTES} minutes','-1 minutes')
     WHERE key='stall_first_seen_at';"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 _alert=$(grep $'^ops\t' "$SEND_LOG" | grep 'fleet-stall' | head -1)
 
@@ -435,7 +454,7 @@ g=$(addt --assignee=dev -- "stale gate")
 db "UPDATE tasks SET status='blocked', need_type='approval', tier=2,
        need_asked_at=datetime('now','-10 days'), gate_pinged_at=NULL
      WHERE id=${g};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 grep -q $'^ops\t.*pinger-liveness canary tripped' "$SEND_LOG" \
   && ok_t "eligible gate + no fleet-wide gate_pinged_at advance -> canary trips" \
@@ -444,7 +463,7 @@ grep -q $'^ops\t.*pinger-liveness canary tripped' "$SEND_LOG" \
   && ok_t "canary trip is stamped" || bad_t "trip not stamped" ""
 
 # --- C3: throttle — re-running immediately does not re-alarm
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ ! -s "$SEND_LOG" ]] \
   && ok_t "canary alarm throttled (no re-alarm within the window)" \
@@ -460,7 +479,7 @@ other=$(addt --assignee=dev -- "some other already-pinged gate")
 db "UPDATE tasks SET status='blocked', need_type='approval', tier=2,
        need_asked_at=datetime('now','-10 days'), gate_pinged_at=datetime('now','-5 minutes')
      WHERE id=${other};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ ! -s "$SEND_LOG" ]] \
   && ok_t "recent fleet-wide gate_pinged_at -> pinger looks alive, canary does not trip" \
@@ -556,7 +575,13 @@ _hb_stall_sweep >/dev/null 2>&1
 # because a fixture with an idle seat would pass against the old code too and
 # grade nothing.
 # =============================================================================
-strandmsg() { grep -c $'^ops\t.*Stranded' "$SEND_LOG"; }
+# DIVE-4826: reads the batch spool, not the send log. Column 2 is the class, so
+# this cannot be satisfied by some other rail's text that happens to say "Stranded".
+strandmsg() { local n; n=$(grep -c $'\tstranded-row\t' "$DIGEST_SPOOL" 2>/dev/null); printf '%s' "${n:-0}"; }
+strandtxt() { grep $'\tstranded-row\t' "$DIGEST_SPOOL" 2>/dev/null | head -1; }
+# The rail must produce NO live turn — that is the whole change. Asserted once
+# here and re-asserted at the arm that proves the notice still exists (E1).
+strandlive() { local n; n=$(grep -c 'Stranded' "$SEND_LOG" 2>/dev/null); printf '%s' "${n:-0}"; }
 
 # --- E1: todo, past the window, on a seat that is demonstrably ACTIVE -> surfaced
 reset_all
@@ -564,26 +589,29 @@ e=$(addt --assignee=dev -- "stranded row")
 ebusy=$(addt --assignee=dev -- "what dev is actually doing")
 db "UPDATE tasks SET status='in_progress' WHERE id=${ebusy};"
 db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour') WHERE id=${e};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" -ge 1 ]] \
   && ok_t "E1 a row stranded past the window on an ACTIVE seat is surfaced (the shape both old rails miss)" \
-  || bad_t "E1 stranded row not surfaced" "$(cat "$SEND_LOG")"
+  || bad_t "E1 stranded row not surfaced" "spool=[$(cat "$DIGEST_SPOOL" 2>/dev/null)]"
+[[ "$(strandlive)" == "0" ]] \
+  && ok_t "E1 ...and it is BATCHED, not typed into a live seat turn (DIVE-4826)" \
+  || bad_t "E1 the stranded notice is still a live send" "$(cat "$SEND_LOG")"
 [[ "$(db "SELECT COALESCE(stranded_pinged_at,'NULL') FROM tasks WHERE id=${e};")" != "NULL" ]] \
   && ok_t "E1 ...and the per-row stamp is set" || bad_t "E1 stamp not set" ""
 
 # --- E2: it NAMES THE LANE — the active row and the seat's other load. Without
 #     this the reader has to re-investigate, which is the cost the row was filed over.
-grep -q $'^ops\t.*Stranded.*ACTIVE on' "$SEND_LOG" \
+grep -q 'ACTIVE on' <<<"$(strandtxt)" \
   && ok_t "E2 the alert names what the seat is actively doing" \
-  || bad_t "E2 lane not named" "$(grep $'^ops\t.*Stranded' "$SEND_LOG" | head -1)"
-grep -q $'^ops\t.*LANE problem' "$SEND_LOG" \
+  || bad_t "E2 lane not named" "$(strandtxt)"
+grep -q 'LANE problem' <<<"$(strandtxt)" \
   && ok_t "E2 ...and says it is a lane problem, not a priority problem" \
-  || bad_t "E2 remedy not named" ""
+  || bad_t "E2 remedy not named" "$(strandtxt)"
 
 # --- E3: THROTTLE. This is the whole design — naive surfacing emits thousands of
 #     pings, gets muted, and recreates the silent-monitoring defect of DIVE-3460.
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" == "0" ]] \
   && ok_t "E3 THROTTLE: a second sweep does not re-ping the same row (once per row, not once per sweep)" \
@@ -596,7 +624,7 @@ f=$(addt --assignee=dev -- "young row")
 fbusy=$(addt --assignee=dev -- "seat is busy")
 db "UPDATE tasks SET status='in_progress' WHERE id=${fbusy};"
 db "UPDATE tasks SET created_at=datetime('now','-1 hour') WHERE id=${f};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" == "0" ]] \
   && ok_t "E4 a row inside the window is NOT surfaced (the instrument can return a negative)" \
@@ -610,7 +638,7 @@ gbusy=$(addt --assignee=dev -- "seat is busy")
 db "UPDATE tasks SET status='in_progress' WHERE id=${gbusy};"
 db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
                      from_template_id=${gbusy} WHERE id=${g};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" == "0" ]] \
   && ok_t "E5 a recurring instance is left to the (a2) rail, not double-announced here" \
@@ -622,7 +650,7 @@ h=$(addt --assignee=dev --verifier=olivia -- "delivered, awaiting grade")
 ( cmd_task_done "$h" --result="closed in fixture setup" ) >/dev/null 2>&1
 db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
                      handoff_stale_pinged_at=datetime('now') WHERE id=${h};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" == "0" ]] \
   && ok_t "E6 a maker->verifier delivery is left to gap#2, not double-announced here" \
@@ -636,7 +664,7 @@ ibusy=$(addt --assignee=dev -- "seat is busy")
 db "UPDATE tasks SET status='in_progress' WHERE id=${ibusy};"
 db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
                      need_type='approval', need_answered_at=NULL WHERE id=${i};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" == "0" ]] \
   && ok_t "E7 a row with an unanswered human gate is NOT surfaced as stranded" \
@@ -649,7 +677,7 @@ jbusy=$(addt --assignee=dev -- "seat is busy")
 db "UPDATE tasks SET status='in_progress' WHERE id=${jbusy};"
 db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
                      parked_at=datetime('now') WHERE id=${j};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" == "0" ]] \
   && ok_t "E8 a parked row is a deliberate wait, not a stall" \
@@ -666,7 +694,7 @@ db "UPDATE tasks SET status='in_progress' WHERE id=${kbusy};"
 db "UPDATE tasks SET created_at=datetime('now','-9 days'),
                      first_started_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
                      started_at=NULL WHERE id=${k};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" -ge 1 ]] \
   && ok_t "E9 REGRESSION (DIVE-3330 shape): a dropped row on a live, busy seat is surfaced" \
@@ -681,7 +709,7 @@ lbusy=$(addt --assignee=codex -- "codex is busy")
 db "UPDATE tasks SET status='in_progress' WHERE id=${lbusy};"
 db "UPDATE tasks SET created_at=datetime('now','-9 days'),
                      first_started_at=datetime('now','-1 hour'), started_at=NULL WHERE id=${l};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" == "0" ]] \
   && ok_t "E10 the DROP clock governs, not created_at (a 9-day-old row touched an hour ago is silent)" \
@@ -695,7 +723,6 @@ _hb_stall_sweep >/dev/null 2>&1
 # "the clause is gone" and "the clause is conditional" pass identically
 # otherwise and only one of them is the fix.
 # =============================================================================
-strandtxt() { grep $'^ops\t.*Stranded' "$SEND_LOG" | head -1; }
 
 # --- E11: SELF-COUNT. The stranded row is itself todo, so an unfiltered COUNT()
 #     on the seat returns 1 and the sentence called it "1 OTHER todo row" — the
@@ -706,7 +733,7 @@ m=$(addt --assignee=dev -- "stranded, and the seat's only todo")
 mbusy=$(addt --assignee=dev -- "seat is busy")
 db "UPDATE tasks SET status='in_progress' WHERE id=${mbusy};"
 db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour') WHERE id=${m};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" -ge 1 ]] && ! grep -q 'other todo row' <<<"$(strandtxt)" \
   && ok_t "E11 a seat whose ONLY todo row is the stranded one claims no OTHER load" \
@@ -720,7 +747,7 @@ nbusy=$(addt --assignee=dev -- "seat is busy")
 nother=$(addt --assignee=dev -- "genuine second todo on the same seat")
 db "UPDATE tasks SET status='in_progress' WHERE id=${nbusy};"
 db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour') WHERE id=${n};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 grep -q 'holds 1 other todo row' <<<"$(strandtxt)" \
   && ok_t "E11b POSITIVE CONTROL: genuine other load is still counted, and counted correctly" \
@@ -739,7 +766,7 @@ db "UPDATE tasks SET status='in_progress' WHERE id=${obusy};"
 db "UPDATE tasks SET created_at=datetime('now','-9 days'),
                      first_started_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
                      started_at=NULL WHERE id=${o};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" -ge 1 ]] && ! grep -q 'without ever being started' <<<"$(strandtxt)" \
   && grep -q 'was started' <<<"$(strandtxt)" \
@@ -753,7 +780,7 @@ qbusy=$(addt --assignee=codex -- "codex is busy elsewhere")
 db "UPDATE tasks SET status='in_progress' WHERE id=${qbusy};"
 db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour'),
                      first_started_at=NULL WHERE id=${q};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 grep -q 'without ever being started' <<<"$(strandtxt)" \
   && ok_t "E12b POSITIVE CONTROL: a never-started row is still called never-started" \
@@ -766,7 +793,7 @@ grep -q 'without ever being started' <<<"$(strandtxt)" \
 reset_all
 r=$(addt --assignee=quinn -- "stranded on a seat with no other load and nothing in flight")
 db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour') WHERE id=${r};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 [[ "$(strandmsg)" -ge 1 ]] && ! grep -q 'LANE problem, not a priority problem' <<<"$(strandtxt)" \
   && grep -q 'READ THE ROW' <<<"$(strandtxt)" \
@@ -779,7 +806,7 @@ reset_all
 u=$(addt --assignee=quinn -- "stranded row")
 uother=$(addt --assignee=quinn -- "genuine second todo, seat has nothing in flight")
 db "UPDATE tasks SET created_at=datetime('now','-${_HB_STRANDED_HOURS} hours','-1 hour') WHERE id=${u};"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
 _hb_stall_sweep >/dev/null 2>&1
 grep -q 'LANE problem, not a priority problem' <<<"$(strandtxt)" \
   && ok_t "E13b POSITIVE CONTROL: measured load alone still earns the lane verdict" \
