@@ -127,10 +127,10 @@ printf '%s\n' "$BODY" | add --name=nocheck2 --type=reference --description=d \
 
 OUT=$(mcheck --slug=green --slug=red --slug=broken --dry-run 2>&1); MRC=$?
 check "pass exits 1 when a fact went stale" "$MRC" "1"
-printf '%s' "$OUT" | grep -q '✓ fresh   green'  && ok "green check reads fresh" || bad "green check reads fresh — $OUT"
-printf '%s' "$OUT" | grep -q '✗ STALE   red'    && ok "red check reads STALE"  || bad "red check reads STALE — $OUT"
-printf '%s' "$OUT" | grep -q '? unknown broken' && ok "a checker that could not RUN is unknown, NOT stale" || bad "missing binary is unknown — $OUT"
-printf '%s' "$OUT" | grep -q 'may be wrong, or its CHECK may be' && ok "digest states the row's guardrail" || bad "digest states the guardrail"
+grep -q '✓ fresh   green' <<<"$OUT"  && ok "green check reads fresh" || bad "green check reads fresh — $OUT"
+grep -q '✗ STALE   red' <<<"$OUT"    && ok "red check reads STALE"  || bad "red check reads STALE — $OUT"
+grep -q '? unknown broken' <<<"$OUT" && ok "a checker that could not RUN is unknown, NOT stale" || bad "missing binary is unknown — $OUT"
+grep -q 'may be wrong, or its CHECK may be' <<<"$OUT" && ok "digest states the row's guardrail" || bad "digest states the guardrail"
 
 echo "── 7. --dry-run touches nothing; the pass STAMPS by default; nothing is deleted ──"
 grep -q 'check_status' "$STORE/reference_red.md" && bad "dry-run stamped nothing" || ok "dry-run stamped nothing"
@@ -157,13 +157,13 @@ echo "── 9. a store with no checks is a clean exit 0, not an error ──"
 EMPTY="$TMP/empty"; mkdir -p "$EMPTY"
 printf -- '---\nname: plain\ndescription: "no check here"\n---\n\nbody\n' > "$EMPTY/plain.md"
 OUT2=$( ( _memory_check --roots="$EMPTY" ) 2>&1 ); check "no-checks store exits 0" "$?" "0"
-printf '%s' "$OUT2" | grep -q 'nothing to re-derive' && ok "no-checks store says so" || bad "no-checks store says so"
+grep -q 'nothing to re-derive' <<<"$OUT2" && ok "no-checks store says so" || bad "no-checks store says so"
 
 echo "── 10. recall DEMOTES a stale fact and never hides it ──"
 if command -v node >/dev/null 2>&1; then
   R=$( ( _memory_search "nginx vhost proxied request" --roots="$STORE" --limit=20 ) 2>&1 )
-  printf '%s' "$R" | grep -q 'check red' && ok "recall flags the stale atom" || bad "recall flags the stale atom — $R"
-  printf '%s' "$R" | grep -q 'reference_red.md' && ok "recall still SURFACES it (demoted, not hidden)" || bad "recall still surfaces it"
+  grep -q 'check red' <<<"$R" && ok "recall flags the stale atom" || bad "recall flags the stale atom — $R"
+  grep -q 'reference_red.md' <<<"$R" && ok "recall still SURFACES it (demoted, not hidden)" || bad "recall still surfaces it"
 else
   echo "  skip — node absent, recall demotion not exercised"
 fi
@@ -180,9 +180,9 @@ if [ -x ./5dive ]; then
     --description="absent path" --check='test -f /nope/nope/3885' >/dev/null 2>&1
   LOUT=$(HOME="$LIVEHOME" ./5dive memory check --write 2>&1); LRC=$?
   check "built binary exits 1 on a stale fact" "$LRC" "1"
-  printf '%s' "$LOUT" | grep -q 'bug in the CLI' && bad "no CLI-bug banner over a real finding" || ok "no CLI-bug banner over a real finding"
-  printf '%s' "$LOUT" | grep -qi 'DeprecationWarning' && bad "no interpreter warnings on stderr" || ok "no interpreter warnings on stderr"
-  printf '%s' "$LOUT" | grep -q '✗ STALE   live-red' && ok "digest survives to the operator" || bad "digest survives — $LOUT"
+  grep -q 'bug in the CLI' <<<"$LOUT" && bad "no CLI-bug banner over a real finding" || ok "no CLI-bug banner over a real finding"
+  grep -qi 'DeprecationWarning' <<<"$LOUT" && bad "no interpreter warnings on stderr" || ok "no interpreter warnings on stderr"
+  grep -q '✗ STALE   live-red' <<<"$LOUT" && ok "digest survives to the operator" || bad "digest survives — $LOUT"
 else
   echo "  skip — ./5dive not built (run build.sh to exercise the live arm)"
 fi
@@ -210,7 +210,7 @@ check "  ...and its rc really was 2" "$(printf '%s' "$J2" | jq -r '.data.results
 echo '── 13. DIVE-3909: `add` REFUSES a check the shell cannot parse ──' 
 OUT=$(add --name=prose-a --type=reference --description="d" --check="$PROSE" <<<"$BODY" 2>&1); RC=$?
 check "prose that does not parse is refused" "$([ "$RC" -ne 0 ] && echo refused || echo ACCEPTED)" "refused"
-printf '%s' "$OUT" | grep -q 'not a runnable command' && ok "refusal names the cause" || bad "refusal names the cause — $OUT"
+grep -q 'not a runnable command' <<<"$OUT" && ok "refusal names the cause" || bad "refusal names the cause — $OUT"
 [ -f "$STORE/reference_prose_a.md" ] && bad "nothing was written" || ok "nothing was written"
 
 # THE RESIDUAL, asserted rather than left implicit: prose that happens to PARSE

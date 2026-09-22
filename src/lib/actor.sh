@@ -60,10 +60,20 @@ _gate_passwd_stream() { printf '%s\n' "$(</etc/passwd)"; }
 actor_uid_to_name() {
   local want="${1:-}" name _x uid
   [[ "$want" =~ ^[0-9]+$ ]] || { printf ''; return; }
+  # DIVE-4811: the stream is CAPTURED, then read from a herestring. The obvious
+  # form — `done < <(_gate_passwd_stream)` with a `return` on the match — closes
+  # the read end of the process substitution mid-write, so the writer takes
+  # SIGPIPE. In production that writer is `printf '%s\n' "$(</etc/passwd)"`, one
+  # bash printf over a multi-KB payload: it dies on EPIPE and prints
+  # `printf: write error: Broken pipe` to the STDERR OF WHOEVER CALLED 5dive.
+  # Measured in 11 distinct harness logs (run 35675798411 and siblings) — and a
+  # harness that asserts "this command writes nothing to stderr" reds on it.
+  # A herestring has no writer process, so there is nothing to kill.
+  local _pw; _pw=$(_gate_passwd_stream)
   while IFS=: read -r name _x uid _; do
     [[ "$uid" == "$want" ]] || continue
     printf '%s' "$name"; return
-  done < <(_gate_passwd_stream)
+  done <<<"$_pw"
   printf ''
 }
 

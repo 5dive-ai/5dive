@@ -116,17 +116,17 @@ c1=$(printf '%s' "$out" | jq --arg i "$I1" '.data.graph.nodes[] | select(.ident=
 # ================= human render =================
 JSON_MODE=0
 htxt=$(run cmd_project_show widget)
-printf '%s' "$htxt" | grep -q "Dependency graph" && ok_t "human: graph header" || bad_t "human header" "$htxt"
-printf '%s' "$htxt" | grep -q "$(printf '\xe2\x97\x86')" && ok_t "human: ◆ critical marker" || bad_t "no ◆ marker" "$htxt"
-printf '%s' "$htxt" | grep -q "Critical path:" && ok_t "human: critical path line" || bad_t "no crit line" "$htxt"
-printf '%s' "$htxt" | grep -q "<- " && ok_t "human: inline blockers" || bad_t "no blockers shown" "$htxt"
+grep -q "Dependency graph" <<<"$htxt" && ok_t "human: graph header" || bad_t "human header" "$htxt"
+grep -q "$(printf '\xe2\x97\x86')" <<<"$htxt" && ok_t "human: ◆ critical marker" || bad_t "no ◆ marker" "$htxt"
+grep -q "Critical path:" <<<"$htxt" && ok_t "human: critical path line" || bad_t "no crit line" "$htxt"
+grep -q "<- " <<<"$htxt" && ok_t "human: inline blockers" || bad_t "no blockers shown" "$htxt"
 
 # ================= empty-graph path =================
 db "INSERT INTO projects (key, prefix, name) VALUES ('empty','EMP','Empty');"
 db "INSERT INTO tasks (title, assignee, created_by, project_key, kind, status)
     VALUES ('lonely','dev','dev','empty','standard','todo');"
 etxt=$(run cmd_project_show empty)
-printf '%s' "$etxt" | grep -q "no task_deps recorded" \
+grep -q "no task_deps recorded" <<<"$etxt" \
   && ok_t "empty graph: no-deps notice" || bad_t "empty notice" "$etxt"
 JSON_MODE=1
 ej=$(run cmd_project_show empty)

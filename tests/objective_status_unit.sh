@@ -143,7 +143,7 @@ printf '%s' "$out" | jq -e '.data.next_gate==null and .data.stop_reason=="target
 # ============================================================================
 JSON_MODE=0
 out=$( (cmd_objective_status "conv") 2>/dev/null )
-printf '%s' "$out" | grep -q '^objective: conv' && printf '%s' "$out" | grep -q '^next gate:' \
+grep -q '^objective: conv' <<<"$out" && grep -q '^next gate:' <<<"$out" \
   && ok_t "text dashboard renders" || bad_t "text mode" "$out"
 JSON_MODE=1
 

@@ -171,7 +171,7 @@ fi
 # ANCHOR against the reflex returning to these functions specifically. Scoped to the
 # resolver bodies, so an unrelated privileged WRITE elsewhere in the file cannot red it.
 res_block=$(sed -n '/^resolve_cli_version()/,/^}/p;/^resolve_agent_model()/,/^}/p;/^resolve_agent_effort()/,/^}/p' "$SRC")
-if printf '%s\n' "$res_block" | grep -qE '(^|[^-[:alnum:]_])sudo[[:space:]]+(-u[[:space:]]+[[:alnum:]_-]+[[:space:]]+)?(jq|sed|bash|cat)'; then
+if grep -qE '(^|[^-[:alnum:]_])sudo[[:space:]]+(-u[[:space:]]+[[:alnum:]_-]+[[:space:]]+)?(jq|sed|bash|cat)' <<<"$res_block"; then
   bad_t 'T7 a resolver still calls sudo directly on a read — routing bypassed' \
         "$(printf '%s\n' "$res_block" | grep -nE 'sudo[[:space:]]+' | head -3)"
 else

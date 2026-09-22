@@ -262,7 +262,7 @@ bash "$GUARD" "$r0" "$c0" >/dev/null 2>&1
 assert_exit "guard: regression — the canonical line still passes directly in tests/" 0 "$?"
 
 # --- DIVE-4108: a LARGE compliant harness must never be refused -----------
-# The guard asked `printf '%s\n' "$content" | grep -qE "$RE"` under `set -o
+# The guard asked `grep -qE "$RE"` under `set -o <<<"$content"
 # pipefail`. grep -q exits the instant it matches; on a blob bigger than the
 # pipe can hold, printf is still writing, dies of SIGPIPE (141), pipefail
 # promotes 141 to the pipeline's status, and `if !` reads that as NO MATCH --

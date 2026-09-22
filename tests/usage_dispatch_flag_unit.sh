@@ -267,10 +267,10 @@ lift=$(printf '%s\n' "$tasks_block" | awk -v a="$bare_total" -v b="$bare_out" \
 [[ -z "$lift" ]] && ok_t "flagged row prints NO bare liftable figure in TOP TASKS ($bare_total / $bare_out never stand alone)" \
   || bad_t "a flagged figure is still quotable as a bare number" "$lift"
 
-printf '%s\n' "$tasks_block" | grep -qF "~${bare_total}(unverified)" \
+grep -qF "~${bare_total}(unverified)" <<<"$tasks_block" \
   && ok_t "flagged TOTAL renders qualified in-cell as ~${bare_total}(unverified)" \
   || bad_t "expected ~${bare_total}(unverified) in TOP TASKS" "$(printf '%s\n' "$tasks_block" | grep DIVE-90001)"
-printf '%s\n' "$tasks_block" | grep -qF "~${bare_out}(unverified)" \
+grep -qF "~${bare_out}(unverified)" <<<"$tasks_block" \
   && ok_t "flagged OUTPUT renders qualified in-cell as ~${bare_out}(unverified)" \
   || bad_t "expected ~${bare_out}(unverified) in TOP TASKS" "$(printf '%s\n' "$tasks_block" | grep DIVE-90001)"
 
@@ -292,7 +292,7 @@ ctl_total=$(htok_of "$(jq -r '.tasks[] | select(.ident=="DIVE-90003") | .total' 
 ctl_hit=$(printf '%s\n' "$tasks_block4" | awk -v a="$ctl_total" '{for(i=1;i<=NF;i++) if($i==a) print NR}')
 [[ -n "$ctl_hit" ]] && ok_t "control: dispatched=true row still prints its figure bare ($ctl_total) — the qualifier tracks doubt, not every row" \
   || bad_t "expected DIVE-90003's $ctl_total as a standalone field" "$(printf '%s\n' "$tasks_block4" | grep DIVE-90003)"
-printf '%s\n' "$tasks_block4" | grep -q "DIVE-90003.*(unverified)" \
+grep -q "DIVE-90003.*(unverified)" <<<"$tasks_block4" \
   && bad_t "control: an unflagged row was wrongly qualified" "$(printf '%s\n' "$tasks_block4" | grep DIVE-90003)" \
   || ok_t "control: unflagged row carries no (unverified) marker"
 

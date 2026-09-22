@@ -237,7 +237,7 @@ mutate() { # <fn> <sed-expr> <marker-that-must-disappear> -> writes $CUT, echoes
   body=$(declare -f "$fn") || { printf 'NOFN'; return 1; }
   local cut; cut=$(printf '%s\n' "$body" | sed "$expr")
   if [[ "$cut" == "$body" ]]; then printf 'NOOP'; return 1; fi
-  if printf '%s\n' "$cut" | grep -q -- "$gone"; then printf 'STILLTHERE'; return 1; fi
+  if grep -q -- "$gone" <<<"$cut"; then printf 'STILLTHERE'; return 1; fi
   printf '%s\n' "$cut" > "$CUT"
   bash -n "$CUT" || { printf 'BADSYNTAX'; return 1; }
   printf 'OK'

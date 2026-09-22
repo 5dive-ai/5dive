@@ -146,12 +146,12 @@ got_both=$(reason "$OUT" "$I_BOTH")
 
 # --- E: `task doctor`'s finding set is NOT widened ------------------------
 DOC=$(JSON_MODE=0 cmd_task_doctor 2>&1)
-if printf '%s' "$DOC" | grep -q "unassigned-no-coordinator"; then
+if grep -q "unassigned-no-coordinator" <<<"$DOC"; then
   bad_t "E: doctor unchanged" "the report now carries the ls-only class; widening it is a decision, not a side effect"
 else
   ok_t "E: doctor's report does not carry the ls-only unassigned class"
 fi
-printf '%s' "$DOC" | grep -q "$I_LANE" \
+grep -q "$I_LANE" <<<"$DOC" \
   && ok_t "E: doctor still reports its own dead-lane finding" \
   || bad_t "E: doctor dead-lane" "$I_LANE absent from the report"
 

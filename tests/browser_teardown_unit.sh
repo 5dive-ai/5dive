@@ -226,7 +226,7 @@ reap_fakes "$d/pids"
 # self-matched the checking shell, and `kill` on that ends the session.
 PAT="$(sed -n 's/^PATTERN="\${AGENT_BROWSER_PROC_PATTERN:-\(.*\)}"$/\1/p' "$HOOK")"
 check "arm8 pattern extracted from the shipped hook" "${PAT:+yes}" "yes"
-matches() { printf '%s' "$1" | grep -qE -- "$PAT" && echo yes || echo no; }
+matches() { grep -qE -- "$PAT" <<<"$1" && echo yes || echo no; }
 check "arm8 matches the agent-browser CLI" \
   "$(matches '/usr/lib/node_modules/agent-browser/bin/agent-browser-linux-x64')" "yes"
 check "arm8 matches the Chrome it spawns" \

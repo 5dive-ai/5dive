@@ -163,7 +163,7 @@ NY=$(jn '.data.needs_you'); NI=$(jn '.data.inbox|length')
 [[ "$(jn '[.data.lead_hold[].ident]|index("'"$PAST"'")')" == "null" ]] \
   && ok "(b) and it is not in the held subset" \
   || bad "(b) a gate past its hold is still in data.lead_hold"
-if printf '%s' "$BOX" | grep -q "^.*${PAST}.*with ${LEAD} until"; then
+if grep -q "^.*${PAST}.*with ${LEAD} until" <<<"$BOX"; then
   bad "(b) a gate past its hold still carries the hold marker"
 else
   ok "(b) no hold marker on a gate past its hold"
@@ -230,7 +230,7 @@ eb=$(PATH="$TMP/bin:$PATH" $CLI task answer "$PAST" --value="done by hand" 2>&1)
 # it must not say it DIFFERENTLY because the gate is held, and it must never
 # mention the hold at all. Same exit code above; no reference to the hold here.
 for _m in "$ea" "$eb"; do
-  if printf '%s' "$_m" | grep -qiE 'lead[- ]?hold|with .* until|yours if unanswered'; then
+  if grep -qiE 'lead[- ]?hold|with .* until|yours if unanswered' <<<"$_m"; then
     bad "(e) 'task answer' mentions the lead hold to the person clearing the gate: $(printf '%s' "$_m" | grep -iE 'lead[- ]?hold|with .* until|yours if unanswered' | head -1)"
   else
     ok "(e) 'task answer' says nothing about the hold — it decides reading order, never standing"
@@ -274,7 +274,7 @@ J2=$($CLI task inbox --json 2>/dev/null || true)
 for fn in cmd_task_inbox _task_inbox_send; do
   BODY=$(sed -n "/^${fn}()/,/^}/p" src/task/inbox.sh)
   [[ -n "$BODY" ]] || { bad "(g) $fn not found in src/task/inbox.sh (renamed?)"; continue; }
-  printf '%s' "$BODY" | grep -q '_task_gate_lead_hold_line' \
+  grep -q '_task_gate_lead_hold_line' <<<"$BODY" \
     && ok "(g) $fn renders the held line by CALLING the shared renderer" \
     || bad "(g) $fn does not call _task_gate_lead_hold_line — a second wording of the hold"
 done
@@ -303,14 +303,14 @@ BODY=$(sed -n "/^_task_inbox_send()/,/^}/p" src/task/inbox.sh)
 if [[ -z "$BODY" ]]; then
   bad "(h) _task_inbox_send not found in src/task/inbox.sh (renamed?)"
 else
-  printf '%s' "$BODY" | grep -q 'gate_text_plain="\$gate_text"' \
+  grep -q 'gate_text_plain="\$gate_text"' <<<"$BODY" \
     && ok "(h) the keyboard-less variant from DIVE-4412 is still composed here" \
     || bad "(h) gate_text_plain is gone from _task_inbox_send — #927's fallback variant was dropped in a merge"
   HOLDBLK=$(printf '%s' "$BODY" | sed -n '/_task_gate_lead_hold_line/,/^    fi$/p')
-  printf '%s' "$HOLDBLK" | grep -q 'gate_text+=' \
+  grep -q 'gate_text+=' <<<"$HOLDBLK" \
     && ok "(h) the hold line is appended to the keyboard variant" \
     || bad "(h) the hold line never reaches gate_text — the ordinary gate message lost its marking"
-  printf '%s' "$HOLDBLK" | grep -q 'gate_text_plain+=' \
+  grep -q 'gate_text_plain+=' <<<"$HOLDBLK" \
     && ok "(h) and to the keyboard-less variant — a rejected keyboard cannot strip the marking" \
     || bad "(h) the hold line is appended to gate_text only: a human whose keyboard was rejected still reads the held gate as 'needs you' (DIVE-4412's fallback path)"
 fi

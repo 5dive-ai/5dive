@@ -231,7 +231,7 @@ EOSH
   r="$(probe "" 0 "" "" "" 1)"
   [[ "${r%%|*}" == "2" && "$(printf '%s' "$r" | cut -d'|' -f2)" == "1" ]] \
     && ok "primary bench + no subject + genesis -> REFUSE (elig=2, check=1)" || no "primary/no-subject did not refuse (got $r)"
-  printf '%s' "$r" | grep -q -- '--subject' && ok "the refusal message names the --subject flag the caller must supply" || no "refusal message does not name --subject (got $r)"
+  grep -q -- '--subject' <<<"$r" && ok "the refusal message names the --subject flag the caller must supply" || no "refusal message does not name --subject (got $r)"
   # the three combinations that must NOT refuse — a check that refused everything would otherwise
   # read as a pass on the arm above.
   r="$(probe "" 0 "DIVE-1" "" "" 1)"
@@ -269,16 +269,16 @@ EOSH
       bash "$TMP/seam.sh" 2>&1
     }
     t="$(seam 1)"
-    if printf '%s' "$t" | grep -q 'FAILED rc=2' && ! printf '%s' "$t" | grep -q 'CONVENE-PROCEEDED'; then
+    if grep -q 'FAILED rc=2' <<<"$t" && ! grep -q 'CONVENE-PROCEEDED' <<<"$t"; then
       ok "the call site ABORTS the convene on a refusal (fail rc=E_USAGE, deliberation never runs)"
     else
       no "the call site did not abort — this is the iteration-1 defect (trace: $t)"
     fi
-    printf '%s' "$t" | grep -q 'OMITTED' && ok "the refusal is still written to the auditable veto ledger before aborting" \
+    grep -q 'OMITTED' <<<"$t" && ok "the refusal is still written to the auditable veto ledger before aborting" \
       || no "a refused convene leaves no audit row (trace: $t)"
     # negative control: with the check standing down the SAME block must fall through and convene.
     t="$(seam 0)"
-    printf '%s' "$t" | grep -q 'CONVENE-PROCEEDED' && ok "with nothing to refuse the same block falls through and the convene proceeds" \
+    grep -q 'CONVENE-PROCEEDED' <<<"$t" && ok "with nothing to refuse the same block falls through and the convene proceeds" \
       || no "the call site aborts unconditionally (trace: $t)"
   fi
 

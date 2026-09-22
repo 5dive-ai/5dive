@@ -74,7 +74,7 @@ fi
 # This is the DIVE-1401 property. An earlier cut used `id -un`, which resolves
 # through the caller's PATH and was forgeable by an agent controlling its own
 # environment. Assert the implementation cannot reach a PATH lookup at all.
-if printf '%s' "$FN" | grep -qE '(^|[^a-z_])(id|getent|whoami)[[:space:]]'; then
+if grep -qE '(^|[^a-z_])(id|getent|whoami)[[:space:]]' <<<"$FN"; then
   bad_t 'T2 the helper shells out — that is PATH-forgeable (DIVE-1401)' \
         "$(printf '%s' "$FN" | grep -nE '(^|[^a-z_])(id|getent|whoami)[[:space:]]' | head -2)"
 else
@@ -82,14 +82,14 @@ else
 fi
 
 # --- T3 it reads $EUID, the one input a caller cannot set --------------------
-printf '%s' "$FN" | grep -q 'EUID' \
+grep -q 'EUID' <<<"$FN" \
   && ok_t 'T3 derives from $EUID (bash builtin: not PATH-resolved, not env-settable)' \
   || bad_t 'T3 does not use $EUID' ''
 
 # --- T4 no env-settable passwd source ----------------------------------------
 # The value feeds envelope_tier, so an env-overridable source would be a NEW forgery
 # vector in the field the design treats as unforgeable.
-printf '%s' "$FN" | grep -q 'done < /etc/passwd' \
+grep -q 'done < /etc/passwd' <<<"$FN" \
   && ok_t 'T4 passwd source is hardcoded — no env-settable override into tier=' \
   || bad_t 'T4 passwd source is overridable' "$(printf '%s' "$FN" | grep -n 'done <')"
 

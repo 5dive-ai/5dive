@@ -304,10 +304,10 @@ if [[ $RC -ne 0 && "$(statusof DIVE-2556)" == "in_progress" ]]; then
 else
   bad_t 'DIVE-3265 6a TRUE POSITIVE: still refuses' "rc=$RC status=$(statusof DIVE-2556) — the extension filter became a bypass; that is worse than the bug it fixed. out=$OUT"
 fi
-printf '%s' "$OUT" | grep -q 'dive-2556-maker-credit' \
+grep -q 'dive-2556-maker-credit' <<<"$OUT" \
   && ok_t 'DIVE-3265 6a: the refusal still names the BRANCH (and not the artifact)' \
   || bad_t 'DIVE-3265 6a: refusal names the branch' "out=$OUT"
-printf '%s' "$OUT" | grep -q 'dive-2556-handoff.md' \
+grep -q 'dive-2556-handoff.md' <<<"$OUT" \
   && bad_t 'DIVE-3265 6a: the refusal must NOT name the artifact' "the .md is back in the candidate set: $OUT" \
   || ok_t 'DIVE-3265 6a: the artifact is absent from the refusal (it was never a candidate)'
 

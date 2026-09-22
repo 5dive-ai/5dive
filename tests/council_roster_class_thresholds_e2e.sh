@@ -125,14 +125,14 @@ chk "ordinary quorum stays majority(6) = 4" "4" \
 
 # The TEXT rail is the one a seat actually reads — assert the 6 reaches stdout, not just JSON.
 T="$("$FIVE" council roster 2>/dev/null)"
-if printf '%s' "$T" | grep -qE '^\s*constitutional\s+4 to pass, quorum 6'; then
+if grep -qE '^\s*constitutional\s+4 to pass, quorum 6' <<<"$T"; then
   ok "text roster prints 'constitutional 4 to pass, quorum 6'"
 else
   no "text roster does not print the constitutional row with quorum 6"; printf '%s\n' "$T" | sed 's/^/    | /'
 fi
 # No unlabelled bare threshold line may survive: pre-fix output led with "threshold: N to pass,
 # quorum N" with nothing naming which class it described. That exact shape is what misled a reader.
-if printf '%s' "$T" | grep -qE '^threshold: [0-9]+ to pass, quorum [0-9]+'; then
+if grep -qE '^threshold: [0-9]+ to pass, quorum [0-9]+' <<<"$T"; then
   no "the old unlabelled 'threshold: N to pass, quorum N' line is still printed"
 else
   ok "no unlabelled class-less threshold line remains"
@@ -147,7 +147,7 @@ chk "--class=constitutional row still says quorum 6" "6" "$(printf '%s' "$JC" | 
 # --- 4. an unknown class FAILS CLOSED (a typo must not silently return the default bar) ----------
 out="$("$FIVE" council roster --class=bogus 2>&1)"; rc=$?
 chk "unknown --class exits non-zero" "1" "$([[ $rc -ne 0 ]] && echo 1 || echo 0)"
-if printf '%s' "$out" | grep -q "unknown decision class 'bogus'"; then
+if grep -q "unknown decision class 'bogus'" <<<"$out"; then
   ok "unknown --class names the class and lists the valid ones"
 else
   no "unknown --class did not explain itself: $out"
@@ -155,7 +155,7 @@ fi
 # DIVE-2711 idiom: a deliberate usage refusal must be MARKED REPORTED, or lib/output.sh's EXIT
 # backstop appends "exited N without reporting a reason … a bug in the CLI" — and under --json
 # emits a SECOND document, breaking every reader that pipes roster through jq.
-if printf '%s' "$out" | grep -q "without reporting a reason"; then
+if grep -q "without reporting a reason" <<<"$out"; then
   no "the generic CLI-bug backstop fired over a deliberate usage refusal (missing mark_reported)"
 else
   ok "no spurious 'this is a bug in the CLI' backstop on a usage refusal"
@@ -168,7 +168,7 @@ fi
 
 # --- 5. --help explains the surface instead of re-printing the roster ----------------------------
 H="$("$FIVE" council roster --help 2>&1)"
-if printf '%s' "$H" | grep -q -- "--class=" && ! printf '%s' "$H" | grep -q "^council:   council"; then
+if grep -q -- "--class=" <<<"$H" && ! grep -q "^council:   council" <<<"$H"; then
   ok "roster --help prints usage (not the roster itself)"
 else
   no "roster --help did not print usage"

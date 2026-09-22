@@ -91,8 +91,8 @@ mapfile -t ACCOUNT_LABELS < <(labels _account_verb_dispatch)
 (( ${#ACCOUNT_LABELS[@]} >= 10 )) \
   && ok_t "P2: _account_verb_dispatch's case dispatches ${#ACCOUNT_LABELS[@]} subverb labels" \
   || bad_t "P2: the account case enumerates its subverbs" "found only ${#ACCOUNT_LABELS[@]}"
-{ printf '%s\n' "${AGENT_LABELS[@]}" | grep -qx 'fire rm' \
-  && printf '%s\n' "${ACCOUNT_LABELS[@]}" | grep -qx 'rm remove'; } \
+{ grep -qx 'fire rm' <<<"$(printf '%s\n' "${AGENT_LABELS[@]}")" \
+  && grep -qx 'rm remove' <<<"$(printf '%s\n' "${ACCOUNT_LABELS[@]}")"; } \
   && ok_t "P3: the corpus carries aliases too (agent fire->rm, account rm->remove)" \
   || bad_t "P3: aliases are in the corpus" "fire/rm missing"
 

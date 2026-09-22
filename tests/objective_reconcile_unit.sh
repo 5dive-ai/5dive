@@ -55,7 +55,7 @@ objid() { db "SELECT id FROM objectives WHERE name=$(sqlq "$1");"; }
 
 # --- schema: the additive planner-handle columns exist
 cols=$(db "SELECT name FROM pragma_table_info('objective_cycles');")
-{ printf '%s\n' "$cols" | grep -qx planner_loop_id && printf '%s\n' "$cols" | grep -qx planner_task_id; } \
+{ grep -qx planner_loop_id <<<"$cols" && grep -qx planner_task_id <<<"$cols"; } \
   && ok_t "objective_cycles has planner_loop_id + planner_task_id" \
   || bad_t "schema" "cols=$cols"
 

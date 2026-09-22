@@ -141,7 +141,7 @@ for h in cmd_send cmd_ask cmd_deliver; do
   args_block="$(fn "$h" | awk '/AUDIT_ARGS=\(/,/^  \)$/')"
   [[ -n "$args_block" ]] || continue
   # `${#message}` is a length and is fine; a bare `$message`/`${message}` is the leak.
-  printf '%s' "$args_block" | grep -qE '\$\{?message\}?([^[:alnum:]_]|$)' \
+  grep -qE '\$\{?message\}?([^[:alnum:]_]|$)' <<<"$args_block" \
     && { body_leak=1; bad_t "T8 $h puts the message body in the audit row" "$args_block"; }
 done
 (( body_leak )) || ok_t 'T8 no handler logs the message body (bytes only)'

@@ -139,7 +139,7 @@ fi
 # A grep that can no longer find its own target passes forever. Positive-control
 # the pattern against the pre-fix line so a silent regex rot is visible.
 canary='          j|J) (( count > 0 && selected < count - 1 )) && ((selected++)) ;;'
-if printf '%s\n' "$canary" | grep -qE '&&[[:space:]]*\(\([[:space:]]*[A-Za-z_][A-Za-z0-9_]*(\+\+|--)[[:space:]]*\)\)'; then
+if grep -qE '&&[[:space:]]*\(\([[:space:]]*[A-Za-z_][A-Za-z0-9_]*(\+\+|--)[[:space:]]*\)\)' <<<"$canary"; then
   ok "the class pattern still matches the original defective line"
 else
   bad "the class pattern no longer matches the line it was written for — the scan above proves nothing"

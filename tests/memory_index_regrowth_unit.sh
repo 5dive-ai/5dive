@@ -124,9 +124,9 @@ mk_index 200
 OVER_BYTES=$(sz)
 OUT=$(_memory_size 2>&1); RC=$?
 check "a read exits 0 even when over the limit" "$RC" "0"
-printf '%s' "$OUT" | grep -q "OVER" && ok "over-limit index is labelled OVER" || bad "over-limit index is labelled OVER (got: $OUT)"
-printf '%s' "$OUT" | grep -q "$OVER_BYTES B / 4000 B" && ok "prints bytes AND the limit" || bad "prints bytes AND the limit (got: $OUT)"
-printf '%s' "$OUT" | grep -q 'flat index — never routed' && ok "names a never-routed flat index" || bad "names a never-routed flat index"
+grep -q "OVER" <<<"$OUT" && ok "over-limit index is labelled OVER" || bad "over-limit index is labelled OVER (got: $OUT)"
+grep -q "$OVER_BYTES B / 4000 B" <<<"$OUT" && ok "prints bytes AND the limit" || bad "prints bytes AND the limit (got: $OUT)"
+grep -q 'flat index — never routed' <<<"$OUT" && ok "names a never-routed flat index" || bad "names a never-routed flat index"
 _memory_size --strict >/dev/null 2>&1
 check "--strict exits E_VALIDATION when over" "$?" "3"
 JSON_MODE=1
@@ -140,8 +140,8 @@ check "json: atoms counted, MEMORY.md excluded" "$(jq -r '.data.indexes[0].atoms
 echo "── CONTROL: an UNDER-limit index reports under, and --strict exits 0 ──"
 mk_index 5
 OUT=$(_memory_size 2>&1)
-printf '%s' "$OUT" | grep -q 'under' && ok "under-limit index is labelled under" || bad "under-limit index is labelled under (got: $OUT)"
-printf '%s' "$OUT" | grep -q 'OVER' && bad "CONTROL: no OVER label when under" || ok "CONTROL: no OVER label when under"
+grep -q 'under' <<<"$OUT" && ok "under-limit index is labelled under" || bad "under-limit index is labelled under (got: $OUT)"
+grep -q 'OVER' <<<"$OUT" && bad "CONTROL: no OVER label when under" || ok "CONTROL: no OVER label when under"
 _memory_size --strict >/dev/null 2>&1
 check "CONTROL: --strict exits 0 when under" "$?" "0"
 
@@ -152,8 +152,8 @@ echo "── a store with NO index is not an unreadable one, and rows name the S
 mk_index 5
 EMPTYPROJ="$HOME/.claude/projects/never-used/memory"; mkdir -p "$EMPTYPROJ"
 OUT=$(_memory_size 2>&1)
-printf '%s' "$OUT" | grep -q 'unreadable' && bad "an index-less store is NOT reported unreadable" || ok "an index-less store is NOT reported unreadable"
-printf '%s' "$OUT" | grep -q 'no MEMORY.md yet' && ok "it is reported in its own bucket" || bad "it is reported in its own bucket (got: $OUT)"
+grep -q 'unreadable' <<<"$OUT" && bad "an index-less store is NOT reported unreadable" || ok "an index-less store is NOT reported unreadable"
+grep -q 'no MEMORY.md yet' <<<"$OUT" && ok "it is reported in its own bucket" || bad "it is reported in its own bucket (got: $OUT)"
 _memory_size --strict >/dev/null 2>&1
 check "CONTROL: an index-less store does not red --strict" "$?" "0"
 JSON_MODE=1; J=$(_memory_size 2>/dev/null); JSON_MODE=0
@@ -175,8 +175,8 @@ if [ -r "$STORE2/MEMORY.md" ]; then
   echo "  skip — running as root, 0600 does not bite"
 else
   OUT=$(_memory_size 2>&1)
-  printf '%s' "$OUT" | grep -q 'unreadable' && ok "an unreadable index is reported, not skipped" || bad "an unreadable index is reported, not skipped (got: $OUT)"
-  printf '%s' "$OUT" | grep -q 'NOT a clean result' && ok "and the summary says the result is not clean" || bad "and the summary says the result is not clean"
+  grep -q 'unreadable' <<<"$OUT" && ok "an unreadable index is reported, not skipped" || bad "an unreadable index is reported, not skipped (got: $OUT)"
+  grep -q 'NOT a clean result' <<<"$OUT" && ok "and the summary says the result is not clean" || bad "and the summary says the result is not clean"
   _memory_size --strict >/dev/null 2>&1
   check "--strict reds on unreadable even with every readable index under" "$?" "3"
   JSON_MODE=1; J=$(_memory_size 2>/dev/null); JSON_MODE=0
@@ -226,7 +226,7 @@ AFTER=$(sz)
 check "the pass still exits 0" "$RC" "0"
 [ "$AFTER" -le 3000 ] && ok "index regenerated to the BUDGET, not merely to the limit ($BEFORE B → $AFTER B)" \
                        || bad "index regenerated under budget (got $AFTER B, want <= 3000)"
-printf '%s' "$OUT" | grep -q 'router re-invoked' && ok "the pass says it re-invoked the router" || bad "the pass says it re-invoked the router (got: $OUT)"
+grep -q 'router re-invoked' <<<"$OUT" && ok "the pass says it re-invoked the router" || bad "the pass says it re-invoked the router (got: $OUT)"
 grep -q '<!-- router:generated -->' "$STORE/MEMORY.md" && ok "the new index is a router, not a trimmed flat list" || bad "the new index is a router"
 grep -q 'atom-1' "$STORE/MEMORY.md" && bad "not every atom is enumerated any more" || ok "not every atom is enumerated any more"
 ls "$STORE"/MEMORY.md.pre-router-* >/dev/null 2>&1 && ok "the previous index is backed up, nothing deleted" || bad "the previous index is backed up"
@@ -237,7 +237,7 @@ echo "── it is NOT gated on having distilled anything (the growth is from \`
 mk_index 200
 rm -f "$PROJ"/*.jsonl          # nothing at all to distil
 OUT=$(run --distiller="$EMPTY" --max-sessions=1 2>&1)
-printf '%s' "$OUT" | grep -q '0 session(s) distilled' && ok "CONTROL: the pass really did distil nothing" || bad "CONTROL: the pass really did distil nothing (got: $OUT)"
+grep -q '0 session(s) distilled' <<<"$OUT" && ok "CONTROL: the pass really did distil nothing" || bad "CONTROL: the pass really did distil nothing (got: $OUT)"
 [ "$(sz)" -le 3000 ] && ok "over-limit index re-routed with zero atoms written" || bad "over-limit index re-routed with zero atoms written (got $(sz) B)"
 
 echo "── hand-written router:keep lines survive the re-invoke ──"
@@ -254,7 +254,7 @@ SUM_BEFORE=$(md5sum < "$STORE/MEMORY.md")
 fresh_transcript bbbb-2222
 OUT=$(run --distiller="$EMPTY" --max-sessions=1 2>&1)
 check "under-limit index untouched (same bytes)" "$(md5sum < "$STORE/MEMORY.md")" "$SUM_BEFORE"
-printf '%s' "$OUT" | grep -q 'router re-invoked' && bad "no reroute is reported when under the limit" || ok "no reroute is reported when under the limit"
+grep -q 'router re-invoked' <<<"$OUT" && bad "no reroute is reported when under the limit" || ok "no reroute is reported when under the limit"
 ls "$STORE"/MEMORY.md.pre-router-* >/dev/null 2>&1 && bad "no backup churn when under the limit" || ok "no backup churn when under the limit"
 
 echo "── --dry-run reports the reroute and writes nothing; a real pass then does ──"
@@ -262,7 +262,7 @@ mk_index 200
 SUM_BEFORE=$(md5sum < "$STORE/MEMORY.md")
 fresh_transcript cccc-3333
 OUT=$(run --distiller="$EMPTY" --max-sessions=1 --dry-run 2>&1)
-printf '%s' "$OUT" | grep -q 'would re-invoke the router' && ok "dry run names the reroute it would do" || bad "dry run names the reroute it would do (got: $OUT)"
+grep -q 'would re-invoke the router' <<<"$OUT" && ok "dry run names the reroute it would do" || bad "dry run names the reroute it would do (got: $OUT)"
 check "dry run left the index untouched" "$(md5sum < "$STORE/MEMORY.md")" "$SUM_BEFORE"
 run --distiller="$EMPTY" --max-sessions=1 >/dev/null 2>&1
 [ "$(sz)" -le 3000 ] && ok "CONTROL: the real pass after a dry run does re-route" || bad "CONTROL: the real pass after a dry run does re-route"
@@ -303,8 +303,8 @@ PY
 [ "$(sz)" -gt 4000 ] && ok "fixture is over the limit and unshrinkable" || bad "fixture is over the limit and unshrinkable"
 fresh_transcript ffff-6666
 ERR=$(run --distiller="$EMPTY" --max-sessions=1 2>&1 >/dev/null); RC=$?
-printf '%s' "$ERR" | grep -q 'INDEX OVER LIMIT' && ok "the unfixable case is reported on stderr" || bad "the unfixable case is reported on stderr (got: $ERR)"
-printf '%s' "$ERR" | grep -q 'TAIL' && ok "the warning names the consequence (a dropped tail), not just a number" || bad "the warning names the consequence"
+grep -q 'INDEX OVER LIMIT' <<<"$ERR" && ok "the unfixable case is reported on stderr" || bad "the unfixable case is reported on stderr (got: $ERR)"
+grep -q 'TAIL' <<<"$ERR" && ok "the warning names the consequence (a dropped tail), not just a number" || bad "the warning names the consequence"
 check "a truncated index does NOT red the consolidate pass" "$RC" "0"
 JSON_MODE=1
 J=$(run --distiller="$EMPTY" --max-sessions=1 --force 2>/dev/null); JSON_MODE=0
@@ -322,7 +322,7 @@ printf '%s' "$OUT" | jq -r '.hookSpecificOutput.additionalContext' 2>/dev/null |
   && ok "the warning names the fix" || bad "the warning names the fix"
 mk_index 5
 OUT=$(printf '{"source":"startup"}' | FIVEDIVE_MEMORY_INDEX_LIMIT=4000 PATH=/usr/bin:/bin HOME="$HOME" bash "$HOOK" 2>/dev/null)
-printf '%s' "$OUT" | grep -q 'MEMORY INDEX OVER THE LOAD LIMIT' \
+grep -q 'MEMORY INDEX OVER THE LOAD LIMIT' <<<"$OUT" \
   && bad "CONTROL: no warning when the index is under the limit" || ok "CONTROL: no warning when the index is under the limit"
 # CONTROL: the hook must still skip a 'compact' source, warning or not.
 mk_index 200

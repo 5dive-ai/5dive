@@ -60,7 +60,7 @@ R="$("$FIVE" council roster --json 2>/dev/null)"
 # CNCL-27: the chair flag must survive genesis -> persisted bench -> roster (JSON + text badge)
 [[ "$(printf '%s' "$R" | jq -r '.data.seats[] | select(.id=="main") | .chair')" == "true" ]] && ok "roster JSON carries the chair flag (main)" || no "roster dropped the chair flag ($R)"
 RT="$("$FIVE" council roster 2>/dev/null)"
-printf '%s' "$RT" | grep -qE 'seat main \(chair\)' && ok "roster text renders the chair badge" || no "roster text missing (chair) badge ($RT)"
+grep -qE 'seat main \(chair\)' <<<"$RT" && ok "roster text renders the chair badge" || no "roster text missing (chair) badge ($RT)"
 
 # --- verify: intact single-record chain is GREEN ------------------------------------------------
 "$FIVE" council verify >/dev/null 2>&1 && ok "verify GREEN on the seeded genesis" || no "verify RED on a fresh genesis"
@@ -115,7 +115,7 @@ RB="$("$FIVE" council roster --json 2>/dev/null)"
 printf '%s' "$RB" | jq -e '.data.seats[] | select(.id=="main")' >/dev/null 2>&1 \
   && ok "lineage-derived roster still seats main after bench drift" || no "lineage roster lost main after bench drift"
 RBT="$("$FIVE" council roster 2>&1)"
-printf '%s' "$RBT" | grep -qiE 'no genesis roster|seed it first' \
+grep -qiE 'no genesis roster|seed it first' <<<"$RBT" \
   && no "roster hit the 'seed it first' death with an intact lineage (DIVE-1664 regression)" \
   || ok "roster renders from the lineage with a drifted bench (no 'seed it first' death)"
 "$FIVE" council verify >/dev/null 2>&1 && ok "verify still GREEN — bench drift never touched the sealed chain" || no "verify RED after a bench-only drift"

@@ -62,7 +62,7 @@ PLAN_OK='{"project":{"key":"widget","name":"Ship widget","goal":"Ship the widget
 
 # ---- (1) validation: shape/schema reject ----
 out=$(run cmd_goal_add --plan='{"nope":1}' -- "x"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -q "project" \
+[[ $rc -ne 0 ]] && grep -q "project" <<<"$out" \
   && ok_t "malformed plan (no tasks/project) rejected" \
   || bad_t "malformed plan rejected" "rc=$rc out=$out"
 
@@ -71,7 +71,7 @@ BIG='{"project":{"name":"n","goal":"g"},"tasks":['
 for i in 1 2 3; do BIG+="{\"local_id\":\"t$i\",\"title\":\"T$i\",\"assignee_or_role\":\"dev\"},"; done
 BIG="${BIG%,}]}"
 out=$(run cmd_goal_add --plan="$BIG" --max-tasks=2 -- "x"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "cap" \
+[[ $rc -ne 0 ]] && grep -qi "cap" <<<"$out" \
   && ok_t "over --max-tasks cap rejected" \
   || bad_t "over-cap rejected" "rc=$rc out=$out"
 
@@ -80,7 +80,7 @@ CYC='{"project":{"name":"n","goal":"g"},"tasks":[
   {"local_id":"a","title":"A","assignee_or_role":"dev","depends_on":["b"]},
   {"local_id":"b","title":"B","assignee_or_role":"dev","depends_on":["a"]}]}'
 out=$(run cmd_goal_add --plan="$CYC" -- "x"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "cycle" \
+[[ $rc -ne 0 ]] && grep -qi "cycle" <<<"$out" \
   && ok_t "cyclic dependency graph rejected" \
   || bad_t "cycle rejected" "rc=$rc out=$out"
 
@@ -88,7 +88,7 @@ out=$(run cmd_goal_add --plan="$CYC" -- "x"); rc=$?
 UNK='{"project":{"name":"n","goal":"g"},"tasks":[
   {"local_id":"a","title":"A","assignee_or_role":"dev","depends_on":["ghost"]}]}'
 out=$(run cmd_goal_add --plan="$UNK" -- "x"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "unknown" \
+[[ $rc -ne 0 ]] && grep -qi "unknown" <<<"$out" \
   && ok_t "unknown depends_on rejected" \
   || bad_t "unknown dep rejected" "rc=$rc out=$out"
 
@@ -99,7 +99,7 @@ CHAIN='{"project":{"name":"n","goal":"g"},"tasks":[
   {"local_id":"t3","title":"3","assignee_or_role":"dev","depends_on":["t2"]},
   {"local_id":"t4","title":"4","assignee_or_role":"dev","depends_on":["t3"]}]}'
 out=$(run cmd_goal_add --plan="$CHAIN" --depth-cap=2 -- "x"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "depth" \
+[[ $rc -ne 0 ]] && grep -qi "depth" <<<"$out" \
   && ok_t "over --depth-cap rejected" \
   || bad_t "depth rejected" "rc=$rc out=$out"
 
@@ -107,7 +107,7 @@ out=$(run cmd_goal_add --plan="$CHAIN" --depth-cap=2 -- "x"); rc=$?
 LOWER='{"project":{"name":"n","goal":"g"},"tasks":[
   {"local_id":"t1","title":"Delete the production database and wipe backups","assignee_or_role":"dev","risk":"low"}]}'
 out=$(run cmd_goal_add --plan="$LOWER" -- "x"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "lower a tier" \
+[[ $rc -ne 0 ]] && grep -qi "lower a tier" <<<"$out" \
   && ok_t "tier-lowered task (low label, T2 text) rejected" \
   || bad_t "tier-lower rejected" "rc=$rc out=$out"
 
@@ -115,7 +115,7 @@ out=$(run cmd_goal_add --plan="$LOWER" -- "x"); rc=$?
 BADROLE='{"project":{"name":"n","goal":"g"},"tasks":[
   {"local_id":"t1","title":"do it","assignee_or_role":"role:doesnotexist"}]}'
 out=$(run cmd_goal_add --plan="$BADROLE" -- "x"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "resolve" \
+[[ $rc -ne 0 ]] && grep -qi "resolve" <<<"$out" \
   && ok_t "unresolvable role rejected" \
   || bad_t "bad role rejected" "rc=$rc out=$out"
 
@@ -153,7 +153,7 @@ nedges=$(db "SELECT COUNT(*) FROM task_deps td JOIN tasks t ON t.id=td.task_id W
 
 # ---- (7b) re-materialize guard (dup protection) ----
 out=$(run cmd_goal_add --plan="$PLAN_OK" --project=widget -- "ship widget"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "already has" \
+[[ $rc -ne 0 ]] && grep -qi "already has" <<<"$out" \
   && ok_t "re-materialize into a populated project refused" \
   || bad_t "dup guard" "rc=$rc out=$out"
 
@@ -200,7 +200,7 @@ t2_tier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE project_key='pay' AND ne
 # ---- (10) --from-gate refuses an UNANSWERED gate ----
 pay_gate=$(db "SELECT id FROM tasks WHERE project_key='pay' AND title LIKE 'Goal:%' ORDER BY id LIMIT 1;")
 out=$(run cmd_goal_add --from-gate="$pay_gate"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "not answered yet" \
+[[ $rc -ne 0 ]] && grep -qi "not answered yet" <<<"$out" \
   && ok_t "--from-gate refuses an unanswered plan gate" \
   || bad_t "from-gate unanswered" "rc=$rc out=$out"
 
@@ -209,14 +209,14 @@ out=$(run cmd_goal_add --from-gate="$pay_gate"); rc=$?
 db "UPDATE tasks SET need_answer='approve', need_answered_at=datetime('now'), need_answered_by='auto:t1' WHERE id=${pay_gate};" >/dev/null
 out=$(run cmd_goal_add --from-gate="$pay_gate"); rc=$?
 nstd=$(db "SELECT COUNT(*) FROM tasks WHERE project_key='pay' AND kind='standard' AND title NOT LIKE 'Goal:%';")
-[[ $rc -ne 0 && "$nstd" == "0" ]] && printf '%s' "$out" | grep -qi "human" \
+[[ $rc -ne 0 && "$nstd" == "0" ]] && grep -qi "human" <<<"$out" \
   && ok_t "--from-gate refuses a non-human (auto/agent) approval" \
   || bad_t "from-gate non-human" "rc=$rc nstd=$nstd out=$out"
 
 # ---- (10c) --from-gate refuses a human answer that is NOT 'approve' ----
 db "UPDATE tasks SET need_answer='revise', need_answered_by='human:mark' WHERE id=${pay_gate};" >/dev/null
 out=$(run cmd_goal_add --from-gate="$pay_gate"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "not 'approve'" \
+[[ $rc -ne 0 ]] && grep -qi "not 'approve'" <<<"$out" \
   && ok_t "--from-gate refuses a human 'revise' (only 'approve' builds)" \
   || bad_t "from-gate non-approve" "rc=$rc out=$out"
 
@@ -232,13 +232,13 @@ nstd=$(db "SELECT COUNT(*) FROM tasks WHERE project_key='pay' AND kind='standard
 
 # ---- (10e) --from-gate is idempotent: refuses to re-materialize a built goal ----
 out=$(run cmd_goal_add --from-gate="$pay_gate"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "already has" \
+[[ $rc -ne 0 ]] && grep -qi "already has" <<<"$out" \
   && ok_t "--from-gate refuses to re-materialize an already-built goal" \
   || bad_t "from-gate dup guard" "rc=$rc out=$out"
 
 # ---- (10f) --from-gate rejects a non-goal task ----
 out=$(run cmd_goal_add --from-gate="$(db "SELECT id FROM tasks WHERE project_key='widget' AND title='Build widget';")"); rc=$?
-[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "not a goal plan gate" \
+[[ $rc -ne 0 ]] && grep -qi "not a goal plan gate" <<<"$out" \
   && ok_t "--from-gate rejects a non-goal task" \
   || bad_t "from-gate non-goal" "rc=$rc out=$out"
 

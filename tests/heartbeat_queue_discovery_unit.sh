@@ -420,7 +420,7 @@ run_mutant() { # <label> <sed-program-on-src/cmd_heartbeat.sh> <arm-failure-labe
     return
   fi
   local out; out=$(cd "$MUT" && bash tests/heartbeat_queue_discovery_unit.sh 2>&1)
-  if printf '%s' "$out" | grep -q "^FAIL - .*${arm}"; then
+  if grep -q "^FAIL - .*${arm}" <<<"$out"; then
     ok_t "mutant: $label reds the arm that pins it"
   else
     bad_t "mutant: $label left every arm GREEN — that arm is vacuous" \
