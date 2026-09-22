@@ -364,3 +364,21 @@ box_verify_small() {
   _verify_small_valid "$v" || v="off"
   printf '%s' "$v"
 }
+
+# `_task_grade_table_from_body <id>` — the LAST computed table written onto the
+# row, or nothing.
+#
+# READ BACK OUT OF THE BODY because that is where it was written for a human to
+# find on `task show`, and a second copy in a column is a second thing to keep in
+# sync. The fence is the contract: `_task_grade_flagged_route` writes the header
+# and then one fenced block, so the extraction is the last fence after the last
+# header rather than a guess at where the prose ends.
+_task_grade_table_from_body() {  # <id>
+  local body; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${1};" 2>/dev/null || printf '')
+  [[ "$body" == *"COMPUTED GRADE (DIVE-4825)"* ]] || return 1
+  printf '%s\n' "$body" | awk '
+    /COMPUTED GRADE \(DIVE-4825\)/ { seen=1; buf=""; infence=0; next }
+    seen && /^```$/ { infence = !infence; if (!infence && buf != "") { last=buf; buf="" } ; next }
+    seen && infence { buf = buf $0 "\n" }
+    END { printf "%s", last }'
+}

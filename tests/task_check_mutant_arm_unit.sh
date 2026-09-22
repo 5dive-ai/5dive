@@ -9,7 +9,7 @@
 #
 #   PART 1  FILING      `--review=check` is refused without a control, and the
 #                       control (or its audited waiver) is PERSISTED.
-#   PART 2  THE ARMS    `_task_check_control_arms` against REAL git repositories
+#   PART 2  THE ARMS    `_task_grade_table` against REAL git repositories
 #                       (not a stub): healthy, vacuous, red-at-sha, broken-mutant,
 #                       no-git — and it leaks no worktree in any of them.
 #   PART 3  DELIVERY    a vacuous check is REFUSED at `task deliver`, the row
@@ -144,21 +144,22 @@ mkrepo() { # <name> -> path; three commits, a guard token in src/foo.sh at HEAD
 wt_count() { git -C "$1" worktree list 2>/dev/null | wc -l | tr -d ' '; }
 
 R1=$(mkrepo repo1); B1=$(wt_count "$R1")
-( cd "$R1" && _task_check_control_arms X-1 "$CHK" "$MUT" >/dev/null 2>&1 ); rc=$?
+( cd "$R1" && _task_grade_table X-1 "$CHK" "$MUT" >/dev/null 2>&1 ); rc=$?
 (( rc == 0 )) && ok_t "healthy control: check passes as delivered, fails on the mutated tree" \
   || bad_t "healthy control: check passes as delivered, fails on the mutated tree" "rc=$rc"
-RCPT=$( cd "$R1" && _task_check_control_arms X-1 "$CHK" "$MUT" >/dev/null 2>&1; printf '%s' "$_TASK_CONTROL_RECEIPT" )
-grep -q 'A as delivered — PASS' <<<"$RCPT" && grep -q 'B after mutant — FAIL' <<<"$RCPT" \
-  && ok_t "the receipt records BOTH arms with their exit status" \
-  || bad_t "the receipt records BOTH arms with their exit status" "receipt='$RCPT'"
+RCPT=$( cd "$R1" && _task_grade_table X-1 "$CHK" "$MUT" >/dev/null 2>&1; printf '%s' "$_TASK_GRADE_TABLE" )
+grep -q 'suite ' <<<"$RCPT" && grep -qE 'mutant  M1  killed-by' <<<"$RCPT" \
+  && grep -q 'VERDICT computed: PASS' <<<"$RCPT" \
+  && ok_t "the TABLE records the suite arm, the killed mutant and a computed verdict (DIVE-4825)" \
+  || bad_t "the TABLE records the suite arm, the killed mutant and a computed verdict (DIVE-4825)" "table='$RCPT'"
 [[ "$(wt_count "$R1")" == "$B1" ]] && ok_t "no worktree is leaked in the maker's repo" \
   || bad_t "no worktree is leaked in the maker's repo" "$B1 -> $(wt_count "$R1")"
 
 # THE CRITERION-3 ARM at the unit level: a check that cannot fail.
 R2=$(mkrepo repo2); B2=$(wt_count "$R2")
-( cd "$R2" && _task_check_control_arms X-2 "true" "true" >/dev/null 2>&1 ); rc=$?
-(( rc == 1 )) && ok_t "VACUOUS: a check of 'true' survives the mutant and is caught" \
-  || bad_t "VACUOUS: a check of 'true' survives the mutant and is caught" "rc=$rc (want 1)"
+( cd "$R2" && _task_grade_table X-2 "true" "true" >/dev/null 2>&1 ); rc=$?
+(( rc == 4 )) && ok_t "VACUOUS: a check of 'true' with a mutant that changes nothing is caught" \
+  || bad_t "VACUOUS: a check of 'true' with a mutant that changes nothing is caught" "rc=$rc (want 4)"
 [[ "$(wt_count "$R2")" == "$B2" ]] && ok_t "…and still leaks no worktree" \
   || bad_t "…and still leaks no worktree" "$B2 -> $(wt_count "$R2")"
 
@@ -166,19 +167,22 @@ R2=$(mkrepo repo2); B2=$(wt_count "$R2")
 # clean checkout at HEAD does not carry it.
 R3=$(mkrepo repo3)
 printf 'ONLY_IN_THE_DIRTY_TREE\n' > "$R3/src/untracked.sh"
-( cd "$R3" && _task_check_control_arms X-3 "grep -q ONLY_IN_THE_DIRTY_TREE src/untracked.sh" "$MUT" >/dev/null 2>&1 ); rc=$?
+( cd "$R3" && _task_grade_table X-3 "grep -q ONLY_IN_THE_DIRTY_TREE src/untracked.sh" "$MUT" >/dev/null 2>&1 ); rc=$?
 (( rc == 3 )) && ok_t "arm A red: a check that passes only in the maker's dirty tree is caught at the sha" \
   || bad_t "arm A red: a check that passes only in the maker's dirty tree is caught at the sha" "rc=$rc (want 3)"
 
 R4=$(mkrepo repo4); B4=$(wt_count "$R4")
-( cd "$R4" && _task_check_control_arms X-4 "$CHK" "exit 7" >/dev/null 2>&1 ); rc=$?
-(( rc == 2 )) && ok_t "a mutant that ITSELF fails is 'not run', never a healthy control" \
-  || bad_t "a mutant that ITSELF fails is 'not run', never a healthy control" "rc=$rc (want 2)"
+cd "$R4" || exit 1
+_task_grade_table X-4 "$CHK" "exit 7" >/dev/null 2>&1; rc=$?   # NOT a subshell: the flags are read below
+(( rc == 1 )) && grep -q '^MUTANT-BROKEN' <<<"$_TASK_GRADE_FLAGS" \
+  && ok_t "a mutant that ITSELF fails is FLAGGED for a reader, never a healthy control" \
+  || bad_t "a mutant that ITSELF fails is FLAGGED for a reader, never a healthy control" "rc=$rc (want 1) flags='$_TASK_GRADE_FLAGS'"
 [[ "$(wt_count "$R4")" == "$B4" ]] && ok_t "…and cleans up the worktree it had already made" \
   || bad_t "…and cleans up the worktree it had already made" "$B4 -> $(wt_count "$R4")"
+cd "$REPO_ROOT" || exit 1
 
 NOGIT="$TMP/nogit"; mkdir -p "$NOGIT"
-( cd "$NOGIT" && _task_check_control_arms X-5 "$CHK" "$MUT" >/dev/null 2>&1 ); rc=$?
+( cd "$NOGIT" && _task_grade_table X-5 "$CHK" "$MUT" >/dev/null 2>&1 ); rc=$?
 (( rc == 2 )) && ok_t "outside a git checkout the control is 'not run', not 'passed'" \
   || bad_t "outside a git checkout the control is 'not run', not 'passed'" "rc=$rc (want 2)"
 
@@ -207,9 +211,10 @@ IDH=$(add_row "healthy at delivery" --review=check --verify="$CHK" --mutant="$MU
 (( rc == 0 )) && ok_t "a controlled, passing check DELIVERS" \
   || bad_t "a controlled, passing check DELIVERS" "exit $rc"
 RES="$(col "$IDH" result)"
-grep -q 'A as delivered — PASS' <<<"$RES" && grep -q 'B after mutant — FAIL' <<<"$RES" \
-  && ok_t "both arms are recorded on the delivered row" \
-  || bad_t "both arms are recorded on the delivered row" "result='$RES'"
+grep -q 'GRADE ' <<<"$RES" && grep -qE 'mutant  M1  killed-by' <<<"$RES" \
+  && grep -q 'VERDICT computed: PASS' <<<"$RES" \
+  && ok_t "the computed TABLE is recorded on the delivered row (DIVE-4825)" \
+  || bad_t "the computed TABLE is recorded on the delivered row (DIVE-4825)" "result='$RES'"
 [[ "$(spawn_count)" == "0" ]] && ok_t "…for no grader session" \
   || bad_t "…for no grader session" "spawns=$(spawn_count)"
 
@@ -243,19 +248,19 @@ mutate() { # <fn> <sed-expr> <marker-that-must-disappear> -> writes $CUT, echoes
   printf 'OK'
 }
 
-ORIG_ARMS=$(declare -f _task_check_control_arms)
-r=$(mutate _task_check_control_arms 's/(( rcB == 0 )) \&\& return 1/: /' 'rcB == 0 )) && return 1')
+ORIG_ARMS=$(declare -f _task_grade_table)
+r=$(mutate _task_grade_table 's/^\( *\)return 4$/\1return 0/' 'return 4')
 if [[ "$r" == "OK" ]] && . "$CUT"; then
   ok_t "mutation A landed: the vacuity verdict is cut out of the shipping function"
-  ( cd "$R2" && _task_check_control_arms X-2 "true" "true" >/dev/null 2>&1 ); rc=$?
-  (( rc != 1 )) && ok_t "…and the VACUOUS arm goes red (rc=$rc, no longer 1)" \
+  ( cd "$R2" && _task_grade_table X-2 "true" "true" >/dev/null 2>&1 ); rc=$?
+  (( rc != 4 )) && ok_t "…and the VACUOUS arm goes red (rc=$rc, no longer 4)" \
     || bad_t "…and the VACUOUS arm goes red" "still returns 1 with the verdict removed — the arm is not testing it"
 else
   bad_t "mutation A landed" "$r"
 fi
 eval "$ORIG_ARMS"
-( cd "$R2" && _task_check_control_arms X-2 "true" "true" >/dev/null 2>&1 )
-(( $? == 1 )) && ok_t "the original function is restored" || bad_t "the original function is restored" "still mutated"
+( cd "$R2" && _task_grade_table X-2 "true" "true" >/dev/null 2>&1 )
+(( $? == 4 )) && ok_t "the original function is restored" || bad_t "the original function is restored" "still mutated"
 
 ORIG_ADD=$(declare -f cmd_task_add)
 r=$(mutate cmd_task_add 's/\[\[ -n "\$mutant_cmd" || -n "\$mutant_waiver" \]\] || fail/[[ 1 == 1 ]] || fail/' 'n "\$mutant_cmd" || -n "\$mutant_waiver" \]\] || fail')

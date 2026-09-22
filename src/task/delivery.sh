@@ -108,82 +108,427 @@ _task_deliver_reach_probe() {
 # run whose whole purpose is to be thrown away. The PRIMARY grade still goes
 # through it, unchanged.
 #
-# `_task_check_control_arms <ident> <check-cmd> <mutant-cmd>` — prints a receipt
-# to stdout, and returns:
-#   0  control healthy (A pass, B fail)
-#   1  VACUOUS: the check passed on the mutated tree
-#   2  could not run: no git tree, no worktree, or the mutant itself errored
-#   3  arm A red: the check does not pass from a clean checkout at this sha
-_TASK_CONTROL_RECEIPT=""
-_task_check_control_arms() {  # <ident> <check-cmd> <mutant-cmd>
-  local ident="$1" check="$2" mutant="$3"
-  _TASK_CONTROL_RECEIPT=""
-  local repo sha
+# ── DIVE-4825: THE COMPUTED GRADE TABLE — no model in the mechanical grade ───
+#
+# DIVE-4623 gave the command grade two arms (as-delivered, mutated) and a prose
+# receipt. What a grader session still did by hand, ~78 model turns at a time,
+# was the other half of the same procedure: stand up a CONTROL tree with the
+# changed SOURCE reverted to the merge-base and show the new harness goes red on
+# it; run each mutant and name the arm that killed it; then write one table.
+#
+# Every one of those steps is deterministic given the delivered sha. A model
+# executing them spends a ~200k-token context per shell call (the measurement on
+# DIVE-4825: 78 calls / 15.7M cache-read for ONE grade, 98 % of it cache reads),
+# and a script does not skip step 4 at hour 50. So the executor is a script and
+# the model is kept for the thing a script cannot do: reading the diff.
+#
+# WHAT IS COMPUTED, AND WHAT IS STILL A MODEL'S JOB.
+#   computed  suite at the delivered sha · control (changed source @ base) ·
+#             each mutant killed-or-SURVIVED · the rails · the verdict
+#   model     any FLAGGED line, and only that line · rows with no computable
+#             harness · the sampled read of a green table (intent, honesty)
+#
+# A GREEN TABLE COSTS ZERO GRADER TOKENS: the row is stamped graded->merge on
+# the delivery path that DIVE-4576 already built. A FLAGGED table does NOT
+# refuse and does NOT close — it writes the table onto the row and falls through
+# to the ordinary grader route, so the seat that wakes reads the table in its
+# goal and re-derives the flagged line ALONE.
+
+# `_task_grade_arm_counts <output>` — "<pass> <fail> <failing-ids csv>" read off
+# the house harness convention (`ok   - <name>` / `FAIL - <name>`).
+#
+# The ID is the arm name's FIRST TOKEN because that is what the harnesses
+# actually name them (`A2c`, `D4b`) and what a maker's CHECKED claim quotes. A
+# harness that does not use the convention yields 0 0 "" and the caller degrades
+# to the exit status — a parse miss must not be readable as "zero failures".
+_task_grade_arm_counts() {  # <output>
+  printf '%s\n' "${1:-}" | awk '
+    /^[[:space:]]*ok[[:space:]]+-[[:space:]]+/   { p++; next }
+    /^[[:space:]]*FAIL[[:space:]]+-[[:space:]]+/ {
+      f++; s=$0; sub(/^[[:space:]]*FAIL[[:space:]]+-[[:space:]]+/,"",s);
+      split(s,a,/[[:space:]]+/); ids = ids (ids?",":"") a[1]; next }
+    END { printf "%d %d %s", p+0, f+0, ids }'
+}
+
+# `_task_grade_changed_src <repo> <sha>` — the changed NON-TEST files, NUL-free,
+# one per line. Tests are excluded on purpose: the control tree is "the new
+# harness against the OLD source", so reverting the harness too would revert the
+# very thing being controlled and the arm would go vacuously green.
+# DELIBERATELY `ACMR` AND NOT `D`: a file the diff DELETED is not restored in the
+# control tree. Restoring it would run the new harness against a tree that is
+# neither head nor base, and the landing assert catches the one case this makes
+# vacuous — a diff that ONLY deletes source leaves the control byte-identical to
+# head and prints DID NOT APPLY, which flags rather than passes.
+_task_grade_changed_src() {  # <repo> <sha> <base>
+  git -C "$1" diff --name-only --diff-filter=ACMR "$3" "$2" -- 2>/dev/null \
+    | grep -Ev '^(tests/|test/|.*_test\.|.*\.test\.)' || true
+}
+
+# `_task_grade_worktree <repo> <sha> <dir>` — a clean detached checkout, or rc 1.
+_task_grade_worktree() {  # <repo> <sha> <dir>
+  git -C "$1" worktree add --detach -q "$3" "$2" >/dev/null 2>&1
+}
+
+# `_task_grade_mutant_specs <repo> <sha> <ident> <stored-mutant>` — "<id>\t<cmd>"
+# per line. `tests/mutants/<ident>.sh` (one `mN() { … }` per mutant, run from the
+# tree root) is the machine-readable form DIVE-4825 asked for; the row's single
+# `mutant_command` stays the fallback so every DIVE-4623 row keeps its control.
+_task_grade_mutant_specs() {  # <repo> <sha> <ident> <stored-mutant>
+  local repo="$1" sha="$2" ident="$3" stored="$4" spec="tests/mutants/${3}.sh" body fn
+  if body=$(git -C "$repo" show "${sha}:${spec}" 2>/dev/null) && [[ -n "$body" ]]; then
+    while IFS= read -r fn; do
+      [[ -n "$fn" ]] || continue
+      printf '%s\t%s\n' "$fn" ". ${spec} && ${fn}"
+    done < <(printf '%s\n' "$body" | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*()[[:space:]]*{.*$/\1/p')
+    return 0
+  fi
+  [[ -n "$stored" ]] && printf 'M1\t%s\n' "$stored"
+  return 0
+}
+
+# `_task_grade_table <ident> <check> <stored-mutant> <claimed-failing-csv>` —
+# computes the whole pass and sets:
+#   _TASK_GRADE_TABLE  the one table, verbatim, for the row
+#   _TASK_GRADE_FLAGS  newline-separated flag lines (empty = PASS)
+#   _TASK_GRADE_RC     0 pass · 1 flagged · 2 could not compute · 3 red at sha
+#                      · 4 vacuous (a mutant the check could not kill at all)
+_TASK_GRADE_TABLE=""; _TASK_GRADE_FLAGS=""; _TASK_GRADE_RC=0
+_task_grade_table() {  # <ident> <check> <stored-mutant> <claimed-failing-csv>
+  local ident="$1" check="$2" stored="$3" claimed="${4:-}"
+  _TASK_GRADE_TABLE=""; _TASK_GRADE_FLAGS=""; _TASK_GRADE_RC=0
+  local repo sha base
   repo=$(git rev-parse --show-toplevel 2>/dev/null) || repo=""
   sha=$(git rev-parse HEAD 2>/dev/null) || sha=""
   if [[ -z "$repo" || -z "$sha" ]]; then
-    _TASK_CONTROL_RECEIPT="control: NOT RUN — 'task deliver' was run outside a git checkout, so there is no delivered sha to check out and no tree to mutate. The command grade below is UNCONTROLLED: nothing here proves it can fail."
-    return 2
+    _TASK_GRADE_TABLE="GRADE ${ident} — NOT COMPUTED: 'task deliver' ran outside a git checkout, so there is no delivered sha to check out. Nothing below proves the check can fail."
+    _TASK_GRADE_RC=2; return 2
   fi
-  # A check that names the maker's own tree by absolute path reaches around the
-  # clean checkout and reads the dirty files anyway, which would make BOTH arms
-  # meaningless while looking green. It is a warning and not a refusal: the path
-  # may legitimately be a fixture outside the repo.
-  [[ "$check$mutant" == *"$repo"* ]] && warn "$ident: the check or mutant command names '$repo' by absolute path — inside the clean checkout that path still resolves to the MAKER's tree, so the control arms may be reading files the delivered sha does not contain. Prefer repo-relative paths (DIVE-4623)."
+  base=$(git -C "$repo" merge-base "$sha" origin/main 2>/dev/null || printf '')
 
-  local base wtA="" wtB="" rcA=0 rcB=0 rcM=0 outA="" outB="" outM=""
-  base=$(mktemp -d "${TMPDIR:-/tmp}/5dive-control.XXXXXX") || {
-    _TASK_CONTROL_RECEIPT="control: NOT RUN — could not create a scratch directory for the clean checkouts."
-    return 2; }
-  # Every exit from here cleans up both worktrees AND their registrations: a
-  # leaked `git worktree` entry is a defect the maker inherits in their own repo.
-  _tcc_cleanup() {
+  local scratch; scratch=$(mktemp -d "${TMPDIR:-/tmp}/5dive-grade.XXXXXX") || {
+    _TASK_GRADE_TABLE="GRADE ${ident} — NOT COMPUTED: no scratch directory for the clean checkouts."
+    _TASK_GRADE_RC=2; return 2; }
+  local -a _gt_wts=()
+  _gt_cleanup() {
     local d
-    for d in "$wtA" "$wtB"; do
+    for d in "${_gt_wts[@]:-}"; do
       [[ -n "$d" ]] || continue
       git -C "$repo" worktree remove --force "$d" >/dev/null 2>&1 || rm -rf "$d"
     done
-    rm -rf "$base"
+    rm -rf "$scratch"
   }
   local tmo=(); command -v timeout >/dev/null 2>&1 \
     && tmo=(timeout "${FIVEDIVE_CONTROL_ARM_TIMEOUT:-900}")
+  local flags="" lines=""
 
-  wtA="$base/asdelivered"
-  if ! git -C "$repo" worktree add --detach -q "$wtA" "$sha" >/dev/null 2>&1; then
-    wtA=""; _tcc_cleanup
-    _TASK_CONTROL_RECEIPT="control: NOT RUN — could not create a clean checkout of ${sha:0:12} (git worktree add failed). The command grade below is UNCONTROLLED."
-    return 2
+  # ── suite: the harness at the delivered sha, from a CLEAN checkout ──────────
+  local wtS="$scratch/head" rcS=0 outS="" cS
+  if ! _task_grade_worktree "$repo" "$sha" "$wtS"; then
+    _gt_cleanup
+    _TASK_GRADE_TABLE="GRADE ${ident} — NOT COMPUTED: could not create a clean checkout of ${sha:0:12}."
+    _TASK_GRADE_RC=2; return 2
   fi
-  if outA=$( (cd "$wtA" && "${tmo[@]}" bash -c "$check") 2>&1 ); then rcA=0; else rcA=$?; fi
+  _gt_wts+=("$wtS")
+  if outS=$( (cd "$wtS" && "${tmo[@]}" bash -c "$check") 2>&1 ); then rcS=0; else rcS=$?; fi
+  cS=$(_task_grade_arm_counts "$outS")
+  lines+="suite   ${check}"$'\n'"        head @ ${sha:0:12}   $(awk '{printf "%s pass %s fail", $1, $2}' <<<"$cS")  rc=${rcS}"$'\n'
+  if (( rcS != 0 )); then
+    _gt_cleanup
+    _TASK_GRADE_TABLE="GRADE ${ident} @ ${sha:0:12}"$'\n'"${lines}VERDICT computed: RED AT SHA — the check FAILED from a clean checkout at the delivered sha."$'\n'"        output tail: $(printf '%s\n' "$outS" | tail -n 10)"
+    _TASK_GRADE_RC=3; return 3
+  fi
 
-  wtB="$base/mutated"
-  if ! git -C "$repo" worktree add --detach -q "$wtB" "$sha" >/dev/null 2>&1; then
-    wtB=""; _tcc_cleanup
-    _TASK_CONTROL_RECEIPT="control: NOT RUN — could not create the second clean checkout of ${sha:0:12} to mutate. The command grade below is UNCONTROLLED."
-    return 2
+  # ── control: the SAME harness, changed source reverted to the merge-base ────
+  # This is the arm the grader session used to build by hand, and the one that
+  # says the diff is what makes the suite green. A control that stays GREEN is a
+  # harness that does not test the change — which is the exact defect a passing
+  # exit status cannot see, so it is a FLAG, never a pass.
+  # Did ANY arm show this check can go red? The source-revert control counts:
+  # a harness proven to fail on the pre-fix source is evidence the mutant arm
+  # exists to provide, so a row with a healthy control and no mutant is not the
+  # uncontrolled case DIVE-4623 was written about.
+  local ctl_healthy=0
+  local ctl_line="control NOT RUN — no merge-base with origin/main"
+  if [[ -n "$base" ]]; then
+    local -a srcs=(); mapfile -t srcs < <(_task_grade_changed_src "$repo" "$sha" "$base")
+    if (( ${#srcs[@]} == 0 )); then
+      ctl_line="control NOT RUN — the diff touches no non-test file, so there is no source to revert"
+    else
+      local wtC="$scratch/control" rcC=0 outC="" cC
+      if _task_grade_worktree "$repo" "$sha" "$wtC"; then
+        _gt_wts+=("$wtC")
+        # A FILE THE DIFF ADDED CANNOT BE CHECKED OUT FROM THE BASE — it is not
+        # there. It is REMOVED instead, which is what "this file at the base"
+        # means for a new file. This is not a corner: a delivery that adds a
+        # changelog fragment (every one of ours) hits it, and `git checkout
+        # <base> -- <paths>` fails ATOMICALLY on the missing path, so one added
+        # file silently reverts NOTHING and the control then grades the
+        # delivered tree twice. Measured on DIVE-4814's real delivery.
+        local _cp; local -a _c_have=() _c_new=()
+        for _cp in "${srcs[@]}"; do
+          if git -C "$repo" cat-file -e "${base}:${_cp}" 2>/dev/null; then _c_have+=("$_cp")
+          else _c_new+=("$_cp"); fi
+        done
+        (( ${#_c_have[@]} )) && ( cd "$wtC" && git checkout -q "$base" -- "${_c_have[@]}" >/dev/null 2>&1 ) || true
+        (( ${#_c_new[@]} ))  && ( cd "$wtC" && git rm -q -f --ignore-unmatch -- "${_c_new[@]}" >/dev/null 2>&1 ) || true
+        # THE REVERT MUST HAVE LANDED. A control tree byte-identical to head
+        # grades the head twice and reads as a healthy red-free arm; that is the
+        # "mutation not applied" failure, and it fails loudly here.
+        # AGAINST HEAD, not against the index: `git checkout <tree> -- <path>`
+        # updates BOTH, so a plain `git diff` is clean however much the file
+        # moved, and the landing assert would pass on every revert it made.
+        if ( cd "$wtC" && git diff --quiet HEAD -- "${srcs[@]}" >/dev/null 2>&1 ); then
+          ctl_line="control DID NOT APPLY — ${srcs[*]} is byte-identical at ${base:0:12} and ${sha:0:12}, so this arm graded the delivered tree twice"
+          flags+="CONTROL-NOT-APPLIED"$'\n'
+        else
+          if outC=$( (cd "$wtC" && "${tmo[@]}" bash -c "$check") 2>&1 ); then rcC=0; else rcC=$?; fi
+          cC=$(_task_grade_arm_counts "$outC")
+          local pC fC idsC; read -r pC fC idsC <<<"$cC"
+          ctl_line="control ${srcs[*]} @ ${base:0:12}   ${pC} pass ${fC} fail  rc=${rcC}  failing={${idsC}}"
+          if (( rcC == 0 )); then
+            ctl_line+="  ← GREEN: the harness does not test this change"
+            flags+="CONTROL-GREEN"$'\n'
+          else
+            ctl_healthy=1
+          fi
+          if (( rcC != 0 )) && [[ -n "$claimed" ]]; then
+            if [[ ",$(tr ' ' ',' <<<"$idsC")," == ",$(tr ' ' ',' <<<"$claimed")," ]]; then
+              ctl_line+="  claimed={${claimed}} MATCH"
+            else
+              ctl_line+="  claimed={${claimed}} MISMATCH"
+              flags+="CONTROL-CLAIM-MISMATCH"$'\n'
+            fi
+          fi
+        fi
+      else
+        ctl_line="control NOT RUN — could not create the control checkout"
+      fi
+    fi
   fi
-  if outM=$( (cd "$wtB" && "${tmo[@]}" bash -c "$mutant") 2>&1 ); then rcM=0; else rcM=$?; fi
-  if (( rcM != 0 )); then
-    _tcc_cleanup
-    _TASK_CONTROL_RECEIPT="control: NOT RUN — the mutant command ITSELF failed (exit ${rcM}) in a clean checkout at ${sha:0:12}, so no mutated tree was ever produced and the check was never given a chance to fail. This is a broken control, not a passing one.
-    mutant: ${mutant}
-    ${outM:0:400}"
-    return 2
-  fi
-  if outB=$( (cd "$wtB" && "${tmo[@]}" bash -c "$check") 2>&1 ); then rcB=0; else rcB=$?; fi
-  _tcc_cleanup
+  lines+="${ctl_line}"$'\n'
 
-  _TASK_CONTROL_RECEIPT="control arms (DIVE-4623), clean checkouts at ${sha:0:12}:
-    A as delivered — $( ((rcA==0)) && printf 'PASS (exit 0)' || printf 'FAIL (exit %s)' "$rcA" ) — ${check}
-    B after mutant — $( ((rcB==0)) && printf 'PASS (exit 0) ← VACUOUS' || printf 'FAIL (exit %s) ← control healthy' "$rcB" ) — ${mutant}"
-  if (( rcA != 0 )); then
-    _TASK_CONTROL_RECEIPT+="
-    arm A output tail: $(printf '%s\n' "$outA" | tail -n 10)"
-    return 3
+  # ── mutants: one clean tree each, applied, landing asserted, check re-run ────
+  local -a specs=(); mapfile -t specs < <(_task_grade_mutant_specs "$repo" "$sha" "$ident" "$stored")
+  if (( ${#specs[@]} == 0 )); then
+    if (( ctl_healthy )); then
+      # Recorded, NOT flagged. Re-booking a grader session for every row that
+      # names no mutant is the burn this whole line of work exists to remove,
+      # and the control above already showed the check goes red without the fix.
+      lines+="mutant  NONE RECORDED — no mutant on this row; the control above is what shows '${check}' can fail (--mutant=, or tests/mutants/${ident}.sh)"$'\n'
+    else
+      lines+="mutant  NONE RECORDED — and the control did not run or stayed green, so NOTHING here proves '${check}' can fail (--mutant=, or tests/mutants/${ident}.sh)"$'\n'
+      flags+="NO-EVIDENCE-CAN-FAIL"$'\n'
+    fi
   fi
-  (( rcB == 0 )) && return 1
+  local spec mid mcmd i=0
+  for spec in "${specs[@]:-}"; do
+    [[ -n "$spec" ]] || continue
+    mid=${spec%%$'\t'*}; mcmd=${spec#*$'\t'}; i=$((i+1))
+    local wtM="$scratch/mut$i" rcM=0 rcMc=0 outM="" outMc="" cM
+    if ! _task_grade_worktree "$repo" "$sha" "$wtM"; then
+      lines+="mutant  ${mid}  NOT RUN — could not create its checkout"$'\n'
+      flags+="MUTANT-NOT-RUN:${mid}"$'\n'; continue
+    fi
+    _gt_wts+=("$wtM")
+    if outM=$( (cd "$wtM" && "${tmo[@]}" bash -c "$mcmd") 2>&1 ); then rcM=0; else rcM=$?; fi
+    if (( rcM != 0 )); then
+      lines+="mutant  ${mid}  BROKEN CONTROL — the mutant command itself exited ${rcM}, so no mutated tree was produced and the check was never given a chance to fail"$'\n'
+      lines+="        ${mcmd}"$'\n'"        $(printf '%s\n' "$outM" | tail -n 5 | tr '\n' ' ')"$'\n'
+      flags+="MUTANT-BROKEN:${mid}"$'\n'; continue
+    fi
+    # THE MUTATION MUST HAVE LANDED. A sed that matched nothing leaves a tree
+    # identical to head; the check then goes green for the honest reason and the
+    # arm reads as SURVIVED-looking-fine. Absence of a diff is the failure.
+    if ( cd "$wtM" && git diff --quiet HEAD >/dev/null 2>&1 ) \
+       && [[ -z "$( cd "$wtM" && git status --porcelain 2>/dev/null )" ]]; then
+      lines+="mutant  ${mid}  DID NOT APPLY — the tree is unchanged, so this arm graded the delivered tree again"$'\n'
+      flags+="MUTANT-NOT-APPLIED:${mid}"$'\n'; continue
+    fi
+    if outMc=$( (cd "$wtM" && "${tmo[@]}" bash -c "$check") 2>&1 ); then rcMc=0; else rcMc=$?; fi
+    if (( rcMc == 0 )); then
+      lines+="mutant  ${mid}  SURVIVED — the check still passes on the mutated tree (${mcmd})"$'\n'
+      flags+="MUTANT-SURVIVED:${mid}"$'\n'
+    else
+      cM=$(_task_grade_arm_counts "$outMc")
+      local killer; killer=$(awk '{print $3}' <<<"$cM")
+      lines+="mutant  ${mid}  killed-by ${killer:-<exit ${rcMc}>}"$'\n'
+    fi
+  done
+
+  # ── rails: what ran alongside, recorded so the table is the whole receipt ────
+  local rails="rails   changed-harness suite green at head"
+  [[ -n "$base" ]] && rails+=" · base ${base:0:12}"
+  lines+="${rails}"$'\n'
+
+  _gt_cleanup
+  _TASK_GRADE_FLAGS="$flags"
+  local nflags=0; [[ -n "$flags" ]] && nflags=$(grep -c . <<<"$flags") || nflags=0
+  local verdict
+  if (( nflags == 0 )); then
+    verdict="VERDICT computed: PASS — 0 flags"
+  else
+    verdict="VERDICT computed: FLAGGED — ${nflags} flag(s): $(tr '\n' ' ' <<<"$flags")
+        A GRADER READS THIS TABLE AND RE-DERIVES THE FLAGGED LINE ONLY. The
+        unflagged lines were computed from clean checkouts at the delivered sha
+        and are not re-run: re-deriving them is the ~78-call burn DIVE-4825
+        removed. Judge intent and honesty from the diff, then accept or reject."
+  fi
+  _TASK_GRADE_TABLE="GRADE ${ident} @ ${sha:0:12}${base:+ (base ${base:0:12})}"$'\n'"${lines}${verdict}"
+  if [[ -n "$flags" ]]; then
+    # A SURVIVED mutant and a mutant that NEVER APPLIED have the same
+    # consequence: nothing here showed the check can go red, and an exit status
+    # that cannot go red grades every tree green. Both are DIVE-4623's vacuity
+    # and both are refused at delivery rather than handed to a reader — reading
+    # does not repair a control that was never run.
+    grep -qE '^MUTANT-(SURVIVED|NOT-APPLIED)' <<<"$flags" && { _TASK_GRADE_RC=4; return 4; }
+    _TASK_GRADE_RC=1; return 1
+  fi
+  _TASK_GRADE_RC=0; return 0
+}
+
+# `_task_grade_claimed_failing <result>` — the failing-arm set the maker CLAIMED,
+# read out of the DIVE-4576 template's CHECKED line (`failing={A2,A4b}`). Absent
+# is absent: the control line then prints its own set and claims no match, which
+# is honest, where inventing a claim to match would not be.
+_task_grade_claimed_failing() {  # <result>
+  printf '%s\n' "${1:-}" | sed -n 's/.*failing[[:space:]]*=[[:space:]]*{\([^}]*\)}.*/\1/p' \
+    | head -n1 | tr -d ' '
+}
+
+# `_task_grade_flagged_route <id> <ident> <table> [flagged|sample]` — writes the
+# table onto the ROW and lets the delivery fall through to the ordinary grader
+# route. Nothing new is spawned here: the seat that wakes reads its goal off the
+# row, so putting the table in the body IS putting it in the goal, and the one
+# rule that makes the hand-off cheap rides with it.
+_task_grade_flagged_route() {  # <id> <ident> <table> [kind]
+  local id="$1" ident="$2" table="$3" kind="${4:-flagged}" hdr
+  if [[ "$kind" == sample ]]; then
+    hdr="## COMPUTED GRADE (DIVE-4825) — GREEN TABLE, DRAWN FOR A READ
+
+The mechanical pass below is GREEN and must NOT be re-run — re-deriving a
+computed line is the ~78-call burn this row removed. READ ONLY: the diff, this
+table, and the maker's result template. You are grading the half a script
+cannot: intent, and the honesty of the residual — a harness that is green but
+tests the wrong thing, a criterion the result claims and the diff does not
+close. Accept, or 'task reject' on intent. No clone, no worktree. Budget: 5 calls."
+  else
+    hdr="## COMPUTED GRADE (DIVE-4825) — FLAGGED
+
+Re-derive the FLAGGED line ONLY. Every unflagged line was computed from clean
+checkouts at the delivered sha and is not in question; re-running it is the burn
+this row removed. Budget: 10 calls."
+  fi
+  db "UPDATE tasks SET body=COALESCE(body,'')||$(sqlq "$(printf '\n\n%s\n\n```\n%s\n```\n' "$hdr" "$table")") WHERE id=${id};"
+  declare -F _five_flush_write_notes >/dev/null 2>&1 && _five_flush_write_notes
+  warn "$ident: computed grade table written to the row (DIVE-4825) — routing to a grader for the ${kind} read; the mechanical arms are not re-run."
   return 0
 }
+
+# `_task_grade_sample_hit <id> <ident>` — rc 0 when a GREEN table still earns a
+# model's read.
+#
+# WHY A GREEN TABLE IS EVER READ. The computed pass loses nothing on the
+# mechanical half, but it cannot see intent: a harness that is green and tests
+# the wrong thing passes it perfectly. lodar made that a design constraint on
+# this row ("will it degrade our code quality?"), so a share of green tables
+# still reaches a reader — and the share is a KNOB, not a constant, so it can be
+# moved without a code change.
+#   FIVEDIVE_GRADE_SAMPLE_N=5   1 in N green tables (0 disables the sample)
+# plus EVERY green table whose diff touches the blast radius, which is the same
+# path set DIVE-4634 already refuses to grade cheaply.
+_task_grade_sample_hit() {  # <id> <ident>
+  local id="$1" ident="$2" n p
+  if declare -F _task_path_is_rubric_blast >/dev/null 2>&1; then
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      if _task_path_is_rubric_blast "$p"; then
+        warn "$ident: green computed table, but the diff touches ${p} — inside the blast radius, so it still gets a read (DIVE-4825)."
+        return 0
+      fi
+    done < <({ _task_rubric_local_paths "$id" 2>/dev/null; _task_delivery_paths "$id" 2>/dev/null; } | sort -u)
+  fi
+  n="${FIVEDIVE_GRADE_SAMPLE_N:-}"
+  if [[ -z "$n" && -r "${BOX_CONFIG:-/nonexistent}" ]]; then
+    n=$(jq -r '.grade_sample_n // empty' "$BOX_CONFIG" 2>/dev/null || printf '')
+  fi
+  [[ "$n" =~ ^[0-9]+$ ]] || n=5
+  (( n == 0 )) && return 1
+  local h; h=$(printf '%s' "$ident" | cksum | awk '{print $1}')
+  (( h % n == 0 )) || return 1
+  warn "$ident: green computed table drawn by the 1-in-${n} read sample (DIVE-4825) — a READ, not a re-run."
+  return 0
+}
+
+# `_task_grade_derive_check <id> <ident> <result>` — THE DEFAULT FLIP.
+#
+# `--review=check` has existed since DIVE-4324 and almost nothing uses it,
+# because it has to be chosen at FILING by someone who does not yet know which
+# harness the work will grow. The maker knows — they write it on the CHECKED
+# line of the DIVE-4576 result template at delivery. So the command is DERIVED
+# from that line, and a PR delivery that names exactly one runnable harness is
+# graded by the computed pass instead of booking a session.
+#
+# IT ONLY EVER TAKES A `temp`/unset ROW. A named grader (`--review=<seat>`) is
+# someone asking for that seat's judgement and is never downgraded; `rubric` has
+# its own escalation rail. Exactly one harness must be named — two is ambiguous
+# and a derivation that guesses is worse than no derivation.
+#
+# The failure mode is bounded in the safe direction: a derived check that goes
+# red, flags, or cannot be computed routes to the grader the row would have got
+# anyway. Off with FIVEDIVE_DERIVE_GRADE_CHECK=0.
+_task_grade_derive_check() {  # <id> <ident> <result>
+  local id="$1" ident="$2" result="$3" mode forced n cand
+  [[ "${FIVEDIVE_DERIVE_GRADE_CHECK:-1}" == "1" ]] || return 1
+  [[ -n "$result" ]] || return 1
+  mode=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  case "$(review_mode_kind "$mode" 2>/dev/null || printf invalid)" in
+    check|seat|rubric) return 1 ;;
+  esac
+  forced=$(db "SELECT COALESCE(verify_forced,0) FROM tasks WHERE id=${id};" 2>/dev/null || printf 0)
+  [[ "$forced" == "1" ]] && return 1
+  [[ -n "$(db "SELECT COALESCE(verify_command,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')" ]] && return 1
+  # Only the CHECKED line, and only a path that exists at the delivered sha.
+  local -a paths=()
+  mapfile -t paths < <(printf '%s\n' "$result" | _task_grade_claim_block \
+    | sed -n '/^CHECKED[[:space:]]*[:(=-]/,/^[A-Z][A-Z0-9_-]*[[:space:]]*[:(=-]/p' \
+    | grep -oE '(tests|test)/[A-Za-z0-9_./-]+\.sh' | sort -u)
+  n=${#paths[@]}
+  (( n == 1 )) || return 1
+  cand="${paths[0]}"
+  # ── DIVE-4825 iteration 2: NEVER DERIVE THE HARNESS WE ARE RUNNING INSIDE ──
+  # The derived command is not merely recorded, it is EXECUTED a few lines below
+  # (`cmd_task_verify --cmd="$stored"`). So a delivery made from within
+  # tests/X.sh whose CHECKED names tests/X.sh re-enters that harness — a nested
+  # run of the whole suite whose exit status grades nothing about the diff, and
+  # which cannot terminate in bounded time as the shape nests.
+  #
+  # That is the regression iteration 1 shipped. Four escalation-resume arms
+  # deliver from inside the harness their own CHECKED line names; the nested run
+  # came back non-zero and `task deliver` refused with exit 5 a delivery the row
+  # had always accepted (A9b/A10/A11/A15, green with FIVEDIVE_DERIVE_GRADE_CHECK=0,
+  # red without it). Falling through here leaves the ORDINARY route — which is
+  # exactly what those rows had before the default flip, so the flip stops being
+  # able to take a delivery away.
+  #
+  # It costs a real delivery nothing: the CLI entry point is `5dive`, never a
+  # tests/*.sh, so `$0` can only match here when a harness is the caller.
+  local _self
+  for _self in "$0" "${BASH_SOURCE[@]}"; do
+    [[ "${_self##*/}" == "${cand##*/}" ]] && return 1
+  done
+  git rev-parse HEAD >/dev/null 2>&1 || return 1
+  git cat-file -e "HEAD:${cand}" 2>/dev/null || return 1
+  db "UPDATE tasks SET verify_command=$(sqlq "bash ${cand}"), review_mode='check' WHERE id=${id};"
+  warn "$ident: graded by the COMPUTED PASS (DIVE-4825) — the check was derived from your CHECKED line ('bash ${cand}') and no grader session is booked unless the table flags. File --review=<seat> if a seat's judgement, not a computed table, is what this row needs."
+  return 0
+}
+
+# DIVE-4825 REMOVED `_task_check_control_arms` / `_TASK_CONTROL_RECEIPT`. Its
+# two arms (as-delivered, mutated) are the first and the mutant lines of the
+# computed table above, which also runs the source-revert control and EVERY
+# mutant. A second executor kept "for the simple case" would be a second answer
+# to what a passing command means, and the first fix to one of them would drift
+# the other — the same reason the grade itself delegates to `cmd_task_verify`.
 
 # ── DIVE-4576 deliverable 3 — A COMMAND-GRADED ROW NEVER BOOKS A SESSION ────
 #
@@ -270,6 +615,15 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
         mode=check ;;
     esac
   fi
+  # ── DIVE-4825: THE DEFAULT FLIP ───────────────────────────────────────────
+  # A PR delivery whose result template names exactly one harness is graded by
+  # the computed pass. Filing-time `--review=check` stays the explicit form; this
+  # is the path that makes it the DEFAULT without asking the filer to predict,
+  # months earlier, which harness the work would grow.
+  if [[ "$mode" != "check" ]] && _task_grade_derive_check "$id" "$ident" "$result"; then
+    mode=check
+    stored=$(db "SELECT COALESCE(verify_command,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  fi
   [[ "$mode" == "check" ]] || return 1
   if [[ -z "$stored" ]]; then
     warn "$ident: filed --review=check (graded by a command) but the row carries NO command, so there is nothing to grade with. Add one at delivery: 'task deliver $ident --pr=… --verify=\"<cmd>\"' (DIVE-4576)."
@@ -278,7 +632,7 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
   # ── DIVE-4623: THE NEGATIVE CONTROL, RUN BEFORE THE GRADE IS BELIEVED ─────
   # Read from the row rather than from argv so a row filed with `--mutant=` is
   # controlled whether or not this delivery re-passed it.
-  local control ctl_rc=0 ctl_note="" ctl_escape=""
+  local control ctl_rc=0 ctl_note="" ctl_escape="" _gt_computed=0
   control=$(db "SELECT COALESCE(mutant_command,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
   if [[ -z "$control" ]]; then
     # A row filed before this rail existed, or one that reached `check` through
@@ -292,8 +646,31 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
   elif ctl_escape=$(mutant_escape_reason "$control"); then
     ctl_note="control: WAIVED at filing (audited, DIVE-4623) — ${ctl_escape}. The check ran once, as delivered; nothing demonstrated it can fail."
   else
-    _task_check_control_arms "$ident" "$stored" "$control" || ctl_rc=$?
-    ctl_note="$_TASK_CONTROL_RECEIPT"
+    # DIVE-4825: THE COMPUTED PASS, a strict superset of the two arms it
+    # replaces — the suite at the sha, the source-revert control, EVERY mutant,
+    # the rails, and one table. Its return codes are deliberately the same three
+    # this path already handles, so the refusals below did not have to move.
+    _gt_computed=1
+    _task_grade_table "$ident" "$stored" "$control" "$(_task_grade_claimed_failing "$result")" || ctl_rc=$?
+    ctl_note="$_TASK_GRADE_TABLE"
+    # A mutant the check could not kill IS DIVE-4623's vacuous grade, and it is
+    # refused there rather than flagged to a reader: an exit status that cannot
+    # go red grades every tree green, and no amount of reading fixes that.
+    (( ctl_rc == 4 )) && ctl_rc=1
+  fi
+  # A FLAGGED TABLE IS A HAND-OFF, NOT A REFUSAL. The computed lines stand; the
+  # flagged one needs a judgement, so the table goes on the row (which is where
+  # the grader's goal is built from) and the delivery falls through to the
+  # ordinary route. A GREEN table is closed here for zero grader tokens unless
+  # the read-sample or the blast radius draws it — the quality half of DIVE-4825.
+  if (( _gt_computed )) && (( ctl_rc == 1 )) && [[ -n "$_TASK_GRADE_FLAGS" ]] \
+     && ! grep -qE '^MUTANT-(SURVIVED|NOT-APPLIED)' <<<"$_TASK_GRADE_FLAGS"; then
+    _task_grade_flagged_route "$id" "$ident" "$ctl_note" flagged
+    return 1
+  fi
+  if (( _gt_computed )) && (( ctl_rc == 0 )) && _task_grade_sample_hit "$id" "$ident"; then
+    _task_grade_flagged_route "$id" "$ident" "$ctl_note" sample
+    return 1
   fi
 
   # A VACUOUS CHECK IS REFUSED, and the refusal is the finding. Written to the
@@ -302,7 +679,7 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
   if (( ctl_rc == 1 || ctl_rc == 3 )); then
     local _cv_txt
     if (( ctl_rc == 1 )); then
-      _cv_txt="❌ delivery REFUSED — the check that grades this row is VACUOUS (DIVE-4623): it PASSED on a tree the mutant had already broken, so its exit status says nothing about this diff."$'\n'"${ctl_note}"
+      _cv_txt="❌ delivery REFUSED — the check that grades this row is VACUOUS (DIVE-4623): it was never shown to go red — either it passed on a tree the mutant had already broken, or the mutant never applied and left the tree untouched. Its exit status therefore says nothing about this diff; the table below names which arm."$'\n'"${ctl_note}"
     else
       _cv_txt="❌ delivery REFUSED — the check FAILED from a clean checkout at the delivered sha (DIVE-4623): it may be passing in the maker's tree for a reason that was not pushed."$'\n'"${ctl_note}"
     fi
@@ -314,7 +691,7 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
     _five_flush_write_notes
     if (( ctl_rc == 1 )); then
       policy_refuse "$E_CONFLICT" deliver-check-vacuous DIVE-4623 "$ident" \
-        "$ident: the command grading this row PASSED on a tree its own mutant had broken, so it is not evidence about anything — a check that cannot fail grades every tree green. NOT handed off: no grader session was spawned and no handoff clock is running, so there is no reject to undo. Both arms are recorded on the row ('5dive task show $ident'). Exits: make the check actually assert the behaviour, or name a mutant that really breaks it ('task deliver $ident --pr=… --mutant=\"<cmd>\"'), or buy a grader session for this row with '5dive task verifier $ident <seat>'."
+        "$ident: the command grading this row was never shown able to fail — it passed on the mutated tree, or the mutant never changed the tree at all — so it is not evidence about anything — a check that cannot fail grades every tree green. NOT handed off: no grader session was spawned and no handoff clock is running, so there is no reject to undo. Both arms are recorded on the row ('5dive task show $ident'). Exits: make the check actually assert the behaviour, or name a mutant that really breaks it ('task deliver $ident --pr=… --mutant=\"<cmd>\"'), or buy a grader session for this row with '5dive task verifier $ident <seat>'."
     else
       policy_refuse "$E_CONFLICT" deliver-check-red-at-sha DIVE-4623 "$ident" \
         "$ident: the command grading this row FAILED in a clean checkout at the delivered sha, although it may pass where you ran it. That is the delivered tree missing something your worktree has — an untracked fixture, a stale build output, an exported variable. NOT handed off: no grader session was spawned. The arms are on the row ('5dive task show $ident'). Push what is missing and deliver again."
@@ -529,6 +906,11 @@ cmd_task_grade_context() {
   [[ -n "$base" ]] || fail "$E_CONFLICT" "$ident cannot resolve a diff base for $sha — REJECT (DIVE-4634)"
   diff=$(git -C "$tree" diff --no-ext-diff --unified=3 "$base" "$sha" -- | head -c "${FIVEDIVE_GRADE_DIFF_MAX_BYTES:-131072}" || true)
   claim=$(printf '%s\n' "$result" | _task_grade_claim_block)
+  # DIVE-4825: THE COMPUTED TABLE RIDES IN THE PACKET. The goal tells the grader
+  # to use ONLY this packet, so a table that lives anywhere else does not reach
+  # the seat that was woken because of it — and the whole point of waking that
+  # seat is the one line the computation could not settle.
+  local ctable=""; ctable=$(_task_grade_table_from_body "$id" 2>/dev/null || printf '')
   # DIVE-4634 iteration 3: the truncation is hoisted OUT of the heredoc rather than
   # spelled inline. `<<PACKET` is deliberately unquoted — it has to interpolate
   # ${ident} ${mode} ${tree} ${sha} ${base} ${claim} ${diff} — and an unquoted heredoc
@@ -550,6 +932,9 @@ ${criteria_b}
 
 DELIVERY CLAIM BLOCK (the CHECKED lines are the commands and reported outputs to re-run):
 ${claim}
+${ctable:+
+COMPUTED GRADE TABLE (DIVE-4825 — produced from clean checkouts at DELIVERED_SHA; do NOT re-run the unflagged lines):
+${ctable}}
 
 GIT DIFF AT DELIVERED SHA (bounded at ${FIVEDIVE_GRADE_DIFF_MAX_BYTES:-131072} bytes):
 ${diff}
