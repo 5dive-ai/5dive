@@ -306,12 +306,17 @@ _cmd_list_legacy() {
     # Same best-effort reads `info` uses; empty -> null (model unset / non-claude
     # effort). Two extra per-agent file reads, in line with the systemctl + b2b
     # reads this loop already does.
-    local amodel aeffort
+    local amodel aeffort aapproval="" asandbox="" aconfig_source=""
     # `|| true`: belt-and-suspenders with the resolvers' own exit-0 contract so a
     # best-effort per-agent config read can never abort the whole list under
     # `set -e` (DIVE-230).
     amodel=$(resolve_agent_model "$ltype" "$name" || true)
     aeffort=$(resolve_agent_effort "$ltype" "$name" || true)
+    if [[ "$ltype" == "codex" ]]; then
+      aapproval=$(resolve_codex_setting "$name" approval_policy || true)
+      asandbox=$(resolve_codex_setting "$name" sandbox_mode || true)
+      aconfig_source="/home/agent-${name}/.codex/config.toml"
+    fi
     # DIVE-1219: surface reachability/autonomy health so the dashboard can badge
     # agents that look up-and-running but are silently broken. Mirrors the
     # DIVE-1197 create-time self-check, computed here for the live fleet:
@@ -387,6 +392,7 @@ _cmd_list_legacy() {
     _sg_implied=$(isolation_implied_by_grant "$_sg_class")
     enriched=$(jq -c --arg n "$name" --arg a "$active" --arg e "$sub" --argjson b2b "$b2b" \
       --arg model "$amodel" --arg effort "$aeffort" \
+      --arg approval "$aapproval" --arg sandbox "$asandbox" --arg configSource "$aconfig_source" \
       --argjson hdeaf "$hdeaf" --argjson hasleep "$hasleep" \
       --arg haState "$_ha_state" --arg haExp "$_ha_exp" --arg haRefresh "$_ha_refresh" \
       --arg hsState "$_hs_state" --arg hsReason "$_hs_reason" --arg opState "$_op_state" \
@@ -396,6 +402,9 @@ _cmd_list_legacy() {
       '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b,
                 model: (if $model == "" then null else $model end),
                 effort: (if $effort == "" then null else $effort end),
+                approvalPolicy: (if $approval == "" then null else $approval end),
+                sandboxMode: (if $sandbox == "" then null else $sandbox end),
+                configSource: (if $configSource == "" then null else $configSource end),
                 sudo: {grant: $sgClass, runas: $sgRunas, impliedIsolation: $sgImplied,
                        measured: ($sgClass != "unknown"),
                        extraEntries: ($sgExtra == "1")},
@@ -426,6 +435,9 @@ _cmd_list_legacy() {
     botToBotEnabled: ($live[.key].botToBotEnabled // false),
     model: ($live[.key].model // null),
     effort: ($live[.key].effort // null),
+    approvalPolicy: ($live[.key].approvalPolicy // null),
+    sandboxMode: ($live[.key].sandboxMode // null),
+    configSource: ($live[.key].configSource // null),
     # DIVE-2088: same shape `agent info` reports, so one schema serves both
     # readers. `isolation` above is the stored LABEL; `sudo` here is the MEASURED
     # grant; `diverges` is true only when a REAL measurement contradicts the
@@ -1285,7 +1297,7 @@ resolve_cli_version() {
 # render "—"/null rather than treat empty as an error.
 resolve_agent_model() {
   local type="$1" name="$2"
-  local home="/home/agent-${name}"
+  local home="${AGENT_HOME_ROOT:-/home}/agent-${name}"
   # MUST stay exit-0 on a missing/unreadable config: the caller assigns this in
   # `amodel=$(resolve_agent_model …)`, and under the bundle's `set -e` a non-zero
   # here aborts the whole command. A `--defer-auth` antigravity agent has no
@@ -1313,8 +1325,7 @@ resolve_agent_model() {
   esac
 }
 
-# Resolve the reasoning effort an agent is configured with — claude-only
-# (`effortLevel` in settings.json). Best-effort: returns "" for non-claude types
+# Resolve the reasoning effort an agent is configured with. Best-effort: returns "" for other types
 # or when unset (Claude Code then uses its built-in default), so callers render
 # "—"/null rather than treat empty as an error.
 resolve_agent_effort() {
@@ -1322,10 +1333,20 @@ resolve_agent_effort() {
   local f
   case "$type" in
     claude)
-      f="/home/agent-${name}/.claude/settings.json"
+      f="${AGENT_HOME_ROOT:-/home}/agent-${name}/.claude/settings.json"
       priv_read "$f" jq -r '.effortLevel // empty' "$f" ;;
+    codex)
+      f="${AGENT_HOME_ROOT:-/home}/agent-${name}/.codex/config.toml"
+      { priv_read "$f" sed -nE 's/^[[:space:]]*model_reasoning_effort[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' "$f" | head -1; } || true ;;
     *) printf '' ;;
   esac
+}
+
+resolve_codex_setting() {
+  local name="$1" key="$2" f
+  f="${AGENT_HOME_ROOT:-/home}/agent-${name}/.codex/config.toml"
+  [[ "$key" == "approval_policy" || "$key" == "sandbox_mode" ]] || { printf ''; return; }
+  { priv_read "$f" sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"?([^\"#]*[^\"# ])\"?.*/\\1/p" "$f" | head -1; } || true
 }
 
 # Write the selected model into the per-type runtime config the CLI loads, so
@@ -1344,7 +1365,7 @@ resolve_agent_effort() {
 # rename) with the existing owner:group + 600 mode preserved.
 write_runtime_model() {
   local type="$1" name="$2" model="$3"
-  local home="/home/agent-${name}" file fmt
+  local home="${AGENT_HOME_ROOT:-/home}/agent-${name}" file fmt
   case "$type" in
     claude)      file="$home/.claude/settings.json"; fmt=json ;;
     codex)       file="$home/.codex/config.toml";     fmt=toml ;;
@@ -1397,8 +1418,12 @@ PY
 # (other types have no effort knob). Same atomic merge-write contract as
 # write_runtime_model: refuse to create a missing file, preserve owner:group + 600.
 write_runtime_effort() {
-  local name="$1" effort="$2"
-  local file="/home/agent-${name}/.claude/settings.json"
+  local type="$1" name="$2" effort="$3"
+  if [[ "$type" == "codex" ]]; then
+    write_runtime_codex_setting "$name" model_reasoning_effort "$effort"
+    return
+  fi
+  local file="${AGENT_HOME_ROOT:-/home}/agent-${name}/.claude/settings.json"
   [[ -f "$file" ]] \
     || fail "$E_NOT_FOUND" "no claude runtime config at $file yet — start agent '$name' once before setting effort"
   local dir own tmp
@@ -1421,6 +1446,33 @@ PY
   then
     rm -f "$tmp"; fail "$E_GENERIC" "failed to write effortLevel into $file"
   fi
+  chown "$own" "$tmp" 2>/dev/null || true
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+# Atomically replace one document-root Codex TOML string key while preserving
+# every table and unrelated setting. The provisioned config must already exist.
+write_runtime_codex_setting() {
+  local name="$1" key="$2" value="$3"
+  local file="${AGENT_HOME_ROOT:-/home}/agent-${name}/.codex/config.toml" dir own tmp
+  [[ "$key" == "model_reasoning_effort" || "$key" == "approval_policy" || "$key" == "sandbox_mode" ]] \
+    || fail "$E_VALIDATION" "unsupported codex setting '$key'"
+  [[ -f "$file" ]] || fail "$E_NOT_FOUND" "no codex runtime config at $file yet — start agent '$name' once before setting $key"
+  dir=$(dirname "$file"); own=$(stat -c '%U:%G' "$file")
+  tmp=$(mktemp -p "$dir" .config.XXXXXX) || fail "$E_GENERIC" "mktemp failed in $dir"
+  if ! TOML_KEY="$key" TOML_VAL="$value" TOML_SRC="$file" python3 - "$tmp" <<'PY'
+import os, re, sys
+key, val, src, dst = os.environ['TOML_KEY'], os.environ['TOML_VAL'], os.environ['TOML_SRC'], sys.argv[1]
+orig = open(src).read()
+m = re.search(r'^\s*\[', orig, re.M)
+head, tail = (orig, '') if m is None else (orig[:m.start()], orig[m.start():])
+line = f'{key} = "{val}"'
+pat = rf'^[ \t]*{re.escape(key)}[ \t]*=.*$'
+head = re.sub(pat, line, head, count=1, flags=re.M) if re.search(pat, head, re.M) else line + '\n' + head
+open(dst, 'w').write(head + tail)
+PY
+  then rm -f "$tmp"; fail "$E_GENERIC" "failed to write $key into $file"; fi
   chown "$own" "$tmp" 2>/dev/null || true
   chmod 600 "$tmp"
   mv -f "$tmp" "$file"
@@ -1670,12 +1722,17 @@ cmd_info() {
   local type
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
 
-  local cli_version model effort
+  local cli_version model effort approval_policy="" sandbox_mode="" config_source=""
   cli_version=$(resolve_cli_version "$type")
   # `|| true`: a best-effort per-agent config read must never abort `info` under
   # `set -e` when the file is absent (e.g. --defer-auth agy pre-boot — DIVE-230).
   model=$(resolve_agent_model "$type" "$name" || true)
   effort=$(resolve_agent_effort "$type" "$name" || true)
+  if [[ "$type" == "codex" ]]; then
+    approval_policy=$(resolve_codex_setting "$name" approval_policy || true)
+    sandbox_mode=$(resolve_codex_setting "$name" sandbox_mode || true)
+    config_source="/home/agent-${name}/.codex/config.toml"
+  fi
 
   # DIVE-3113: for openclaw, an absent model is not a neutral "unset" — it is a
   # SILENT SWITCH TO A DIFFERENT PROVIDER. openclaw model ids are
@@ -1787,6 +1844,7 @@ cmd_info() {
     --arg cliVersion "$cli_version" \
     --arg model "$model" \
     --arg effort "$effort" \
+    --arg approval "$approval_policy" --arg sandbox "$sandbox_mode" --arg configSource "$config_source" \
     --arg ocUnpinned "$oc_unpinned" \
     --arg cbState "$_cb_state" \
     --arg cbDetail "$_cb_detail" \
@@ -1867,6 +1925,9 @@ cmd_info() {
       cliVersion: (if $cliVersion == "" then null else $cliVersion end),
       model: (if $model == "" then null else $model end),
       effort: (if $effort == "" then null else $effort end),
+      approvalPolicy: (if $approval == "" then null else $approval end),
+      sandboxMode: (if $sandbox == "" then null else $sandbox end),
+      configSource: (if $configSource == "" then null else $configSource end),
       # DIVE-3113: true == an openclaw agent holding a BYO credential with no
       # model pin, i.e. running on the built-in openclaw default and therefore
       # on a provider whose key it does not have. (No apostrophes in this jq
@@ -1887,6 +1948,7 @@ cmd_info() {
       "type:        \(.type)",
       "cli:         \(.cliName) \(.cliVersion // "unknown")",
       "model:       \(.model // (if .modelUnpinnedWithCreds then "— UNPINNED (see warning below)" else "—" end))\(if .effort then " · effort \(.effort)" else "" end)",
+      (if .type == "codex" then "policy:      \(.approvalPolicy // "—") · sandbox \(.sandboxMode // "—")\nsource:      \(.configSource // "—")" else empty end),
       # DIVE-2766: the word DECLARED is the fix. It is what this line always
       # reported and never said, and the `bound:` line under it is what the
       # reader was actually after.

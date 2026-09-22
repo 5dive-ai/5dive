@@ -8,6 +8,10 @@ cmd_config() {
   #     model                     (model id for the agent's CLI — claude/codex/
   #                                grok/antigravity; written into the type's
   #                                runtime config, applied on the deferred restart)
+  #     effort                    (low|medium|high|xhigh|max; claude/codex)
+  #     approval-policy           (on-request|never; codex only)
+  #     sandbox                   (read-only|workspace-write|danger-full-access;
+  #                                codex only)
   #     workdir                   (absolute path; tmux cwd on next launch;
   #                                value "default" or "" clears the override)
   #     telegram.token            (bot token for this agent's telegram plugin)
@@ -67,6 +71,8 @@ cmd_config() {
   local new_allowed_users=""
   local new_model=""
   local new_effort=""
+  local new_approval_policy=""
+  local new_sandbox_mode=""
   # DIVE-499: when set, write_agent_env stamps this as AGENT_AUTONOMY; left empty
   # it preserves the file's current value (so a non-autonomy set won't drop it).
   local _AUTONOMY_OVERRIDE=""
@@ -184,20 +190,36 @@ cmd_config() {
         applied_keys+=("model")
         ;;
       effort|effortLevel)
-        # Reasoning-effort switch — claude-only (Claude Code's settings.json
-        # effortLevel). Mirrors the telegram plugin's /effort: writes effortLevel
-        # then restarts (deferred below). Not registry-stored — `agent info`
-        # reads the live settings.json so an effort changed in-TUI stays truth.
+        # Reasoning-effort switch. Claude persists effortLevel in settings.json;
+        # Codex persists model_reasoning_effort in config.toml.
         # Levels match the plugin's EFFORT_LEVELS; xhigh/max are Opus-only at the
         # model level but we don't gate by model here (same as the plugin picker).
-        [[ "$type" == "claude" ]] \
-          || fail "$E_VALIDATION" "type '$type' does not support 'effort' config (claude only)"
+        [[ "$type" == "claude" || "$type" == "codex" ]] \
+          || fail "$E_VALIDATION" "type '$type' does not support 'effort' config (claude/codex only)"
         case "$v" in
           low|medium|high|xhigh|max) ;;
           *) fail "$E_VALIDATION" "invalid effort '$v' (allowed: low, medium, high, xhigh, max)" ;;
         esac
         new_effort="$v"
         applied_keys+=("effort")
+        ;;
+      approval-policy|approval_policy)
+        [[ "$type" == "codex" ]] \
+          || fail "$E_VALIDATION" "type '$type' does not support 'approval-policy' config (codex only)"
+        case "$v" in on-request|never) ;; *)
+          fail "$E_VALIDATION" "invalid approval policy '$v' (allowed: on-request, never)" ;;
+        esac
+        new_approval_policy="$v"
+        applied_keys+=("approval-policy")
+        ;;
+      sandbox|sandbox-mode|sandbox_mode)
+        [[ "$type" == "codex" ]] \
+          || fail "$E_VALIDATION" "type '$type' does not support 'sandbox' config (codex only)"
+        case "$v" in read-only|workspace-write|danger-full-access) ;; *)
+          fail "$E_VALIDATION" "invalid sandbox '$v' (allowed: read-only, workspace-write, danger-full-access)" ;;
+        esac
+        new_sandbox_mode="$v"
+        applied_keys+=("sandbox")
         ;;
       auth-profile|auth.profile)
         if [[ -z "$v" || "$v" == "default" ]]; then
@@ -420,8 +442,16 @@ cmd_config() {
     write_runtime_model "$type" "$name" "$new_model"
   fi
   if [[ -n "$new_effort" ]]; then
-    step "Writing effortLevel=$new_effort into claude runtime config"
-    write_runtime_effort "$name" "$new_effort"
+    step "Writing effort=$new_effort into $type runtime config"
+    write_runtime_effort "$type" "$name" "$new_effort"
+  fi
+  if [[ -n "$new_approval_policy" ]]; then
+    step "Writing approval_policy=$new_approval_policy into codex runtime config"
+    write_runtime_codex_setting "$name" approval_policy "$new_approval_policy"
+  fi
+  if [[ -n "$new_sandbox_mode" ]]; then
+    step "Writing sandbox_mode=$new_sandbox_mode into codex runtime config"
+    write_runtime_codex_setting "$name" sandbox_mode "$new_sandbox_mode"
   fi
   # Fail-closed gate (DIVE-250): when this call attached a channel to a
   # claude agent, the restarted session boots with `--channels
@@ -502,15 +532,42 @@ cmd_tui() {
   local type channels
   type=$(jq -r --arg n "$name" '.agents[$n].type // ""' <<<"$reg")
   channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
-  # DIVE-4032: a channel-enabled Codex seat runs the app-server dispatcher as
-  # its tmux process. Attaching to it shows transport logs, not an interactive
-  # coding agent, so the old promise ("attach ... to the agent") made a healthy
-  # dispatcher look like a broken Codex TUI. Refuse the false view and name the
-  # useful observable instead.
+  # A channel-enabled Codex seat's tmux process is the dispatcher, not a TUI.
+  # Use the audited takeover path from #794: stop the dispatcher, run Codex in
+  # the same home/workdir, then unconditionally restore the service. The inbox
+  # is file-backed, so messages arriving during the terminal session survive.
   if [[ "$type" == "codex" ]]; then
     case ",${channels}," in
       *,telegram,*|*,dashboard,*)
-fail "$E_CONFLICT" "agent '$name' has no interactive Codex TUI: its tmux session is the ${channels} dispatcher. View transport logs with '5dive agent logs $name --tmux'; inspect Codex work in /home/agent-${name}/.codex/sessions."
+        local workdir service
+        workdir=$(jq -r --arg n "$name" --arg d "$DEFAULT_WORKDIR" '.agents[$n].workdir // $d' <<<"$reg")
+        service="5dive-agent@${name}.service"
+        (
+          local stopped=0 restored=0 restore_rc=0
+          restore_dispatcher() {
+            (( stopped == 1 && restored == 0 )) || return 0
+            restored=1
+            systemctl start "$service" || restore_rc=$?
+            logger -t 5dive-agent-tui "agent=$name action=takeover-restored service=$service rc=$restore_rc" 2>/dev/null || true
+          }
+          trap restore_dispatcher EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM HUP
+          logger -t 5dive-agent-tui "agent=$name action=takeover-start channels=$channels" 2>/dev/null || true
+          systemctl stop "$service" \
+            || fail "$E_GENERIC" "could not stop $service for interactive takeover"
+          stopped=1
+          cd "$workdir" || fail "$E_NOT_FOUND" "agent workdir is not reachable: $workdir"
+          sudo -u "agent-${name}" env CODEX_HOME="/home/agent-${name}/.codex" \
+            /home/claude/.local/bin/codex
+          local tui_rc=$?
+          restore_dispatcher
+          trap - EXIT INT TERM HUP
+          (( restore_rc == 0 )) \
+            || fail "$E_GENERIC" "Codex TUI exited, but $service could not be restored"
+          exit "$tui_rc"
+        )
+        return $?
         ;;
     esac
   fi
