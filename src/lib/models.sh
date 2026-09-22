@@ -28,9 +28,9 @@ model_families() { printf 'opus\nsonnet\nfable\nhaiku\n'; }
 # release edits the right-hand side here and nowhere else.
 model_latest() {
   case "${1:-}" in
-    opus)   printf '%s' "claude-opus-5" ;;
+    opus)   printf '%s' "claude-opus-5-5" ;;
     sonnet) printf '%s' "claude-sonnet-5" ;;
-    fable)  printf '%s' "claude-fable-5" ;;
+    fable)  printf '%s' "claude-fable-5-1" ;;
     haiku)  printf '%s' "claude-haiku-4-5-20251001" ;;
     *)      return 1 ;;
   esac
@@ -45,7 +45,7 @@ resolve_model_alias() {
   printf '%s' "$want"
 }
 
-# models_json -> {"opus":"claude-opus-5",...}. This is what the telegram plugin
+# models_json -> {"opus":"claude-opus-5-5",...}. This is what the telegram plugin
 # reads at boot so its /model picker can't drift from the CLI again.
 models_json() {
   local fam id first=1 out='{'
