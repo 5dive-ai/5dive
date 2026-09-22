@@ -207,6 +207,7 @@ run_refresh_agent() { # <seat-home> -> $WORK/order.log
     export PATH="$WORK/obin:$PATH"
     export ORDER_LOG="$WORK/order.log" SEAT_HOME="$home" SEAT_CACHE="$home/$CACHE_REL"
     # GH_ORG=5dive-com short-circuits migrate_marketplace_org (no network probe).
+    # shellcheck disable=SC2034  # CHANGED_AGENTS is appended to by refresh_agent; unset, it trips `set -u`
     GH_ORG=5dive-com CLAUDE_BIN=/nonexistent/claude KEEP_PLUGIN_VERSIONS=2 CHANGED_AGENTS=""
     export GH_ORG CLAUDE_BIN KEEP_PLUGIN_VERSIONS
     eval "$block"
@@ -313,13 +314,20 @@ else
   bad_t "A2 a CLEARS caller never touches the cache file" "$blind"
 fi
 
+# A MENTION IS NOT A DROP, and the arms below were wrong in exactly that way until a
+# mutant proved it: removing the `rm` from plugin_seats.sh left the explanatory comment
+# beside it, the comment names the file, and a presence grep read that as the fix. So
+# require an actual uncommented `rm` of the cache path — the same discriminator A2's
+# note demands and, being a per-block fact, the one A2 itself cannot apply.
+_drops_cache() { grep -E '^[^#]*\brm\b[^#]*mcp-needs-auth-cache\.json' <<<"${1:-}" | grep -q .; }
+
 # agent_setup.sh had the drop already - but only inside `if [[ "$plugin" == telegram ]]`
 # and only once a token was passed, so a seat given any other seat-facing plugin got
 # the poisoned cache and no clear. A2 above cannot see that: the string was present
 # the whole time it was wrong (the same reason DIVE-4399's A2 could not clear
 # cmd_heartbeat.sh). So assert the unconditional drop sits in the install shell.
 setup_install_block="$(sed -n "/^  if ! sudo -u \"\$user\" -H env PLUGIN=/,/^AGENT_PLUGIN_INSTALL\$/p" "$ROOT/src/lib/agent_setup.sh")"
-if grep -q 'plugin install' <<<"$setup_install_block" && grep -q 'mcp-needs-auth-cache.json' <<<"$setup_install_block"; then
+if grep -q 'plugin install' <<<"$setup_install_block" && _drops_cache "$setup_install_block"; then
   ok_t "A3 agent-create drops the cache in the SAME seat shell that runs the install, for every plugin - not only telegram"
 else
   bad_t "A3 the agent-create clear is not in the install shell" \
@@ -327,7 +335,7 @@ else
 fi
 
 seat_register_block="$(sed -n "/<<'SEAT_PLUGIN_REGISTER'/,/^SEAT_PLUGIN_REGISTER\$/p" "$ROOT/src/lib/plugin_seats.sh")"
-if grep -q 'plugin install' <<<"$seat_register_block" && grep -q 'mcp-needs-auth-cache.json' <<<"$seat_register_block"; then
+if grep -q 'plugin install' <<<"$seat_register_block" && _drops_cache "$seat_register_block"; then
   ok_t "A4 the plugin add/upgrade seat fan-out drops the cache inside the seat's own shell (so the file keeps the seat's ownership)"
 else
   bad_t "A4 plugin_seat_register_claude does not clear the cache it poisons" \
