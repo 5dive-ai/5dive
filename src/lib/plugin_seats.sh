@@ -152,6 +152,14 @@ PREREG
 "$CLAUDE" plugin marketplace update "$MARKETPLACE" >/dev/null 2>&1 \
   || "$CLAUDE" plugin marketplace add "$MKT_REPO" >/dev/null 2>&1 || true
 yes | "$CLAUDE" plugin install "${PLUGIN}@${MARKETPLACE}" >/dev/null 2>&1 || true
+# DIVE-4852: `plugin install` STARTS the plugin's MCP server, and this shell has no
+# channel secret (the unit launcher injects it; `sudo -u` does not). Claude Code
+# caches that failure in mcp-needs-auth-cache.json and SKIPS the server for 15
+# minutes on every session the seat starts — so a seat restarted behind this call
+# comes up deaf on its channel. Same one-line drop the nightly refresh takes; see
+# 5dive-refresh-plugins.sh's DIVE-4852 fence for the measurement and why removal,
+# not an edit, is the safe verb here.
+rm -f "$HOME/.claude/mcp-needs-auth-cache.json" 2>/dev/null || true
 SEAT_PLUGIN_REGISTER
   plugin_seat_registered "$name" "$plugin" "$mkt"
 }

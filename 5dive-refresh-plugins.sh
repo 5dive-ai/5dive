@@ -176,6 +176,64 @@ prune_plugin_cache() {
   return 0
 }
 
+# >>> DIVE-4852 clear Claude Code's MCP failure cache after the per-seat plugin probe
+# `claude plugin update` STARTS the plugin's MCP server to refresh it (Claude Code
+# 2.1.278). The server we start here is the seat's telegram channel, and it starts
+# WITHOUT the channel secret: `TELEGRAM_BOT_TOKEN` is injected by the unit launcher,
+# and `sudo -u <seat>` above is not the unit. It dies in ~375ms, and Claude Code
+# records that in `~/.claude/mcp-needs-auth-cache.json`:
+#
+#     {"plugin:telegram:telegram":{"timestamp":<ms>,"id":"<hash>"}}
+#
+# For the next FIFTEEN MINUTES every session that seat starts prints "Skipping
+# connection (recent failure cached …)" and never spawns the server at all — no
+# mcp-logs file, no lifecycle `start` line. A session already inside the window does
+# NOT retry when it expires; it stays deaf until it is restarted again.
+#
+# This script's own `--restart` pass, and `5dive self-update`'s restart loop (which
+# runs after install.sh calls us), both bounce seats within ~4 minutes of this probe.
+# That is the whole of DIVE-4852: four seats deaf on Telegram 13:19–13:36Z on
+# 2026-09-22, main through three restarts, and lodar had to report it. The identical
+# probe at 07:15Z the same morning hurt nobody — nothing restarted behind it — which
+# is why the hazard sat invisible for three days of 2.1.278.
+#
+# So the poisoned cache is dropped BEFORE anything can restart the seat. Three fixes
+# were on the row; this is the one with no failure mode of its own:
+#   (a) drop the entry here                      — taken;
+#   (b) run the probe with the channel env       — puts a live bot token into every
+#       nightly cron's argv/environment to fix a cache file;
+#   (c) refuse to restart inside the 15-min window — makes the nightly refresh a no-op
+#       for the seats it JUST updated, i.e. trades deaf for stale, forever.
+#
+# WHY THE WHOLE FILE AND NOT THE TELEGRAM KEY. Every entry in it was written by this
+# same tokenless probe, the file is a NEGATIVE cache and nothing else, and removing
+# it costs exactly one retry. Editing it in place has a failure mode that removal
+# does not: we run as root here, so a rewritten file is left root-owned in a seat's
+# home and that seat can never cache again. `rm` needs no such care — and it is what
+# src/lib/agent_setup.sh already does on the create path, for this same reason.
+#
+# NEVER a silent no-op: an absent receipt and a receipt we failed to print are the
+# same empty log, so both outcomes say which one happened.
+_clear_mcp_failure_cache() { # <user> <home>
+  local user="${1:-}" home="${2:-}" f
+  [[ -n "$user" && -n "$home" ]] || return 0
+  f="$home/.claude/mcp-needs-auth-cache.json"
+  if [[ ! -e "$f" ]]; then
+    echo "    mcp failure cache for $user: nothing cached"
+    return 0
+  fi
+  if rm -f "$f" 2>/dev/null && [[ ! -e "$f" ]]; then
+    echo "    cleared mcp failure cache for $user"
+  else
+    # Loud, and NOT fatal. A refresh that aborts here leaves the rest of the fleet
+    # on yesterday's plugins to protect one seat's channel — the freeze direction,
+    # which DIVE-3269 already measured as the more expensive one.
+    echo "    WARN: could not clear $f for $user — if this seat is restarted within 15 minutes it will come up deaf on its channel (fix by hand: rm -f '$f')" >&2
+  fi
+  return 0
+}
+# <<< DIVE-4852 clear Claude Code's MCP failure cache after the per-seat plugin probe
+
 refresh_agent() {
   local ag="$1"
   local user="agent-$ag"
@@ -229,6 +287,12 @@ refresh_agent() {
       | sed "s/^/    [plugin $verb $key] /" \
       | grep -E 'updated|already|installed|error|warn|fail|Restart' || true
   done <<<"$all_keys"
+
+  # DIVE-4852: AFTER the last `claude plugin` invocation for this seat and before
+  # anything can restart it. Clearing before the probe is a no-op — the probe
+  # re-poisons the file microseconds later — so the position of this call is the fix,
+  # not the call.
+  _clear_mcp_failure_cache "$user" "$home"
 
   local after
   after=$(snapshot_state "$installed")

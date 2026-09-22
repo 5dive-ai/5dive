@@ -943,6 +943,14 @@ PREREG
   || "$CLAUDE" plugin marketplace add "$MKT_REPO"
 
 yes | "$CLAUDE" plugin install "${PLUGIN}@${MARKETPLACE}" >/dev/null || true
+# DIVE-4852: the install above STARTS the plugin's MCP server, before this agent's
+# channel secret exists on disk, and Claude Code caches that failure for 15 minutes
+# across EVERY session the seat then starts. The telegram branch further down already
+# dropped this file, but only for `--channels telegram` and only once a token was
+# passed; a seat given any other seat-facing plugin got the same poisoned cache and no
+# clear. Unconditional, and beside the call that writes it. See 5dive-refresh-plugins.sh's
+# DIVE-4852 fence for the measurement.
+rm -f "$HOME/.claude/mcp-needs-auth-cache.json" 2>/dev/null || true
 
 PLUGIN_DIR=$(PLUGIN="$PLUGIN" MARKETPLACE="$MARKETPLACE" python3 -c '
 import json, os
