@@ -118,9 +118,28 @@ deliver() {
 }
 age() { db "UPDATE tasks SET handoff_delivered_at=datetime('now','-${_HB_VERIFY_STALE_MIN} minutes','-5 minutes'),
                              handoff_stale_pinged_at=NULL WHERE ident=$(sqlq "$1");"; }
-# grep -c prints 0 and EXITS 1 on no match, so `|| echo 0` would emit "0\n0" and
-# break the arithmetic test — count with grep alone and default only if it dies.
-pinged() { local n; n=$(grep -c "${1}[ .]" "$SEND_LOG" 2>/dev/null); printf '%s' "${n:-0}"; }
+# DIVE-4826: this helper used to count lines in $SEND_LOG — it defined its OWN
+# cmd_send (above) and grepped the resulting file for the row's ident, so it
+# matched the gap#2 "delivered to you … still unacknowledged" send BY ITS EXISTENCE
+# rather than by its text. That send is gone (redundant by construction: its
+# select is the dispatcher's select), and the log now reads EMPTY for every row:
+# the two LIVENESS/CONTROL positives below went red, and the three arms asserting
+# `-eq 0` passed VACUOUSLY — the exact failure this file's own ARM 1 comment
+# records from an earlier round, one helper further out.
+#
+# RE-POINTED, NOT RE-WORDED: handoff_stale_pinged_at is the observable the deletion
+# deliberately KEPT (src/cmd_heartbeat.sh gap#2 still stamps it on every row it
+# surfaces), the same move DIVE-4296 made for the gate arms and DIVE-4826 made for
+# graded_but_unmerged_terminal_unit.sh. It is strictly better scoped than the log
+# grep it replaces: the stamp is per-row BY CONSTRUCTION, so a ping fired for a
+# DIFFERENT row in the same sweep can no longer satisfy it, and `age()` clears the
+# column before each sweep so it reads THIS sweep only.
+#
+# Because a harness that DEFINES the thing being deleted cannot be found by
+# grepping for the thing being deleted, neither the message-text grep nor the
+# sender-name grep surfaced this file — see RULE 6 in
+# community/wiki/deleting-a-send-deletes-every-harness-that-used-it-as-a-positive-control.md.
+pinged() { [[ -n "$(col "$1" handoff_stale_pinged_at)" ]] && printf '1' || printf '0'; }
 
 # =============================================================================
 # ARM 2 — filing a gate as the assigned verifier IS the ACK
@@ -188,10 +207,19 @@ _hb_stall_sweep >/dev/null 2>&1
   || bad_t "over-broad exclusion" "row $C (gate answered, wait is back on the verifier) was skipped"
 [[ "$(pinged "$G")" -eq 0 ]] \
   && ok_t "ARM1 a row blocked on an UNANSWERED gate is NOT nagged" \
-  || bad_t "ARM1 nag still fires" "G=$G count=$(pinged "$G") log:$(cat "$SEND_LOG")"
-[[ -z "$(col "$G" handoff_stale_pinged_at)" ]] \
-  && ok_t "ARM1 skipped row is not marked pinged (stays eligible once the gate clears)" \
-  || bad_t "ARM1 throttle stamped on a skipped row" "handoff_stale_pinged_at=$(col "$G" handoff_stale_pinged_at)"
+  || bad_t "ARM1 nag still fires" "G=$G stamp=$(col "$G" handoff_stale_pinged_at)"
+# This arm used to read handoff_stale_pinged_at directly ("the throttle is not
+# burned on a skipped row"). Now that pinged() reads that same column, that form
+# would be a byte-for-byte repeat of the arm above. So it asserts instead what its
+# own label always PROMISED and never actually checked — the skip is not a CONSUME:
+# clear the gate, sweep again, and the row surfaces. Only G can move here; B and C
+# are already stamped and A is acked, so all three are outside the select.
+db "UPDATE tasks SET need_answered_at=datetime('now'), need_answer='answered',
+      need_answered_by='human:test', status='todo' WHERE ident=$(sqlq "$G");"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(pinged "$G")" -ge 1 ]] \
+  && ok_t "ARM1 the skip is not a consume — answer the gate and the row IS surfaced" \
+  || bad_t "ARM1 skipped row was consumed, not deferred" "G=$G still unstamped after the gate was answered and the sweep re-run"
 [[ "$(pinged "$A")" -eq 0 ]] \
   && ok_t "ARM1+2 a row the verifier gated itself is skipped twice over (ACK and gate)" \
   || bad_t "gated+acked row nagged" "A=$A count=$(pinged "$A")"
