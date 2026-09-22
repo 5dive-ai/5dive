@@ -34,16 +34,96 @@
 # contain the marker, so this tier adds no candidate today and the resolution
 # stays on the lone-root fallback — it widens what an operator CAN express, it
 # does not re-route anything already resolved.
+# DIVE-4823 — the same ladder, walked PER ORG ROOT when the caller can say whose
+# root. A team is an org-chart root plus its subtree (design record:
+# community/wiki/a-team-is-an-org-root-and-the-resolver-needs-a-subject.md), and
+# every tier above is BOARD-WIDE, which is why a second root silently disables
+# the whole ladder: teal-fox grew nine roots and every unassigned row landed
+# nowhere (DIVE-4555). With a subject the tiers are scoped to that subject's own
+# subtree and the last tier returns the root itself instead of nothing.
+#
+# `_task_org_root_of <agent>` — the top of the chain the agent hangs from, by the
+# SAME definition the board-wide tier 3 uses (`reports_to IS NULL OR reports_to
+# NOT IN (SELECT name FROM agents_org)`), so a dangling manager is a root here
+# exactly as it is there. Three answers are deliberately EMPTY, and each one
+# hands the caller back to today's board-wide ladder rather than to a guess:
+#   - no subject at all (the board-level readers: the digest, the pinned banner,
+#     `task doctor`'s report — there is no filer to pass and inventing one is a
+#     guess about whose phone rings);
+#   - a subject that is not on the chart (an agent nobody has placed yet);
+#   - a reports_to CYCLE. The chart is agent-writable, so a loop is reachable;
+#     none of its members is a root by the predicate above, so "no root" is the
+#     honest answer and the guard is what keeps the walk from hanging. Same shape
+#     as _human_owner_of_agent / _task_verify_content_lane, except that the depth
+#     cap is the seen-set and not a constant: those two bound a LOOKUP that may
+#     legitimately give up, while a root walk that stops early would return a
+#     middle manager as a root — a confident wrong answer on a deep chart.
+_task_org_root_of() {
+  local cur="${1:-}" seen="" mgr
+  [[ -n "$cur" ]] || return 0
+  [[ -n "$(db "SELECT 1 FROM agents_org WHERE name=$(sqlq "$cur") LIMIT 1;" 2>/dev/null)" ]] || return 0
+  while [[ -n "$cur" ]]; do
+    case ",$seen," in *",$cur,"*) return 0 ;; esac   # cycle guard: the chart is agent-writable
+    seen="${seen:+$seen,}$cur"
+    mgr=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$cur") LIMIT 1;" 2>/dev/null)
+    if [[ -z "$mgr" ]] || [[ -z "$(db "SELECT 1 FROM agents_org WHERE name=$(sqlq "$mgr") LIMIT 1;" 2>/dev/null)" ]]; then
+      printf '%s' "$cur"; return 0
+    fi
+    cur="$mgr"
+  done
+}
+
+# The CTE that names one root's subtree — emitted as a PREFIX so the caller
+# appends its own SELECT, because SQLite takes `WITH` only at the head of a
+# statement. `UNION` (not `UNION ALL`) is the cycle guard on the SQL side: a
+# reports_to loop re-derives names already in the set and the recursion stops.
+_task_org_subtree_cte() {
+  printf "WITH RECURSIVE _sub(name) AS (
+            SELECT name FROM agents_org WHERE name=%s
+            UNION
+            SELECT a.name FROM agents_org a JOIN _sub s ON a.reports_to = s.name
+          ) " "$(sqlq "${1:-}")"
+}
+
+# WHY THE SUBJECT IS OPTIONAL AND NOT REQUIRED. Counted at origin/main
+# 2026-09-22 (`git grep '\$(_task_resolve_coordinator'`, calls only): 16 live
+# call sites across 11 files, and only 10 of them have a subject in scope. The
+# other six are genuinely board-level — the pinned needs-you banner, the digest
+# sender, `task doctor`'s report, the `org set` warning. With the subject
+# optional those sites need NO edit and the blast radius is the ten that can
+# answer the question.
+#
+# THE SINGLE-ROOT NO-OP, which is this change's acceptance criterion. On a chart
+# with exactly one root R, every on-chart agent has root_of = R and subtree(R) is
+# the whole chart — so tier 1 and tier 2 are today's board-wide uniqueness tests
+# verbatim, and the new last tier returns R, which is exactly what today's "lone
+# org root" tier returns. An off-chart or cycle-bound subject falls through to
+# today's function unchanged. Therefore every existing routing test passes with
+# no fixture edit; a delivery that had to touch a routing fixture changed
+# single-root behaviour and is wrong.
+#
+# The ONLY behaviour that changes is the one we want: on a MULTI-root board the
+# last tier used to return nothing and now returns the subject's own root.
 _task_resolve_coordinator() {
-  if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE role='coordinator';")" == "1" ]]; then
-    db "SELECT name FROM agents_org WHERE role='coordinator' LIMIT 1;"
+  local _subject="${1:-}" _root="" _cte="" _scope=""
+  [[ -n "$_subject" ]] && _root=$(_task_org_root_of "$_subject")
+  if [[ -n "$_root" ]]; then
+    _cte="$(_task_org_subtree_cte "$_root")"
+    _scope="name IN (SELECT name FROM _sub) AND "
+  fi
+  if [[ "$(db "${_cte}SELECT COUNT(*) FROM agents_org WHERE ${_scope}role='coordinator';")" == "1" ]]; then
+    db "${_cte}SELECT name FROM agents_org WHERE ${_scope}role='coordinator' LIMIT 1;"
     return
   fi
   local _marker="lower(' '||COALESCE(role,'')) LIKE '% coordinator%'"
-  if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_marker};")" == "1" ]]; then
-    db "SELECT name FROM agents_org WHERE ${_marker} LIMIT 1;"
+  if [[ "$(db "${_cte}SELECT COUNT(*) FROM agents_org WHERE ${_scope}${_marker};")" == "1" ]]; then
+    db "${_cte}SELECT name FROM agents_org WHERE ${_scope}${_marker} LIMIT 1;"
     return
   fi
+  # Scoped: the subject's own root IS the answer — a team with no tagged
+  # coordinator is led by its lead. Board-wide: unchanged, including the empty
+  # fourth tier that leaves an ambiguous multi-root board unrouted.
+  if [[ -n "$_root" ]]; then printf '%s' "$_root"; return; fi
   if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);")" == "1" ]]; then
     db "SELECT name FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org) LIMIT 1;"
   fi
@@ -80,9 +160,21 @@ _GATE_NOTIFIER_MARKER="lower(' '||COALESCE(role,'')) LIKE '% gate notifier%'"
 # untagged chart the gate ping must resolve exactly as it does today (the filer's
 # own channel, then up the org chain), so the notifier preference has to be able
 # to say "nobody asked for this" rather than falling back to a name.
+#
+# DIVE-4823: takes the SAME optional subject as the coordinator and scopes the
+# uniqueness test to that subject's subtree. The emptiness property is unchanged
+# in both directions — an untagged subtree is as empty as an untagged board — and
+# what becomes expressible is a per-team notifier: two roots, each with its own
+# tagged holder, used to be "two holders, ambiguous, nobody" board-wide.
 _task_gate_notifier_explicit() {
-  [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_GATE_NOTIFIER_MARKER};")" == "1" ]] || return 0
-  db "SELECT name FROM agents_org WHERE ${_GATE_NOTIFIER_MARKER} LIMIT 1;"
+  local _subject="${1:-}" _root="" _cte="" _scope=""
+  [[ -n "$_subject" ]] && _root=$(_task_org_root_of "$_subject")
+  if [[ -n "$_root" ]]; then
+    _cte="$(_task_org_subtree_cte "$_root")"
+    _scope="name IN (SELECT name FROM _sub) AND "
+  fi
+  [[ "$(db "${_cte}SELECT COUNT(*) FROM agents_org WHERE ${_scope}${_GATE_NOTIFIER_MARKER};")" == "1" ]] || return 0
+  db "${_cte}SELECT name FROM agents_org WHERE ${_scope}${_GATE_NOTIFIER_MARKER} LIMIT 1;"
 }
 
 # The notifier for the re-nag: the tagged holder, else the coordinator. The
@@ -90,10 +182,16 @@ _task_gate_notifier_explicit() {
 # that has not been tagged — DIVE-3742's "one sender, not one per filer" property
 # is preserved byte for byte, and only the CHOICE of that one sender becomes
 # expressible.
+#
+# DIVE-4823: the subject is forwarded to BOTH rungs, so the fallback stays what
+# it has always been — the coordinator resolved in the SAME scope the notifier
+# was looked for in. Mixing the two (a subtree notifier falling back to a
+# board-wide coordinator) is what would break DIVE-4365's no-op, because on a
+# multi-root board the board-wide coordinator is nothing.
 _task_resolve_gate_notifier() {
-  local _n; _n=$(_task_gate_notifier_explicit) || _n=""
+  local _subject="${1:-}" _n; _n=$(_task_gate_notifier_explicit "$_subject") || _n=""
   if [[ -n "$_n" ]]; then printf '%s' "$_n"; return 0; fi
-  _task_resolve_coordinator
+  _task_resolve_coordinator "$_subject"
 }
 
 # DIVE-969: verifier-by-default posture (Karpathy autonomy slider). Non-trivial
@@ -1021,7 +1119,7 @@ _task_default_verifier() {
     "$_lane_first"
     "$_qa"
     "$_proj_lead"
-    "$(_task_resolve_coordinator)"
+    "$(_task_resolve_coordinator "$_assignee")"
     "$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$_assignee") LIMIT 1;")"
     "$_root"
     "$(_task_resolve_deputy "$_assignee")"
@@ -1090,7 +1188,7 @@ _gate_route_reviewer() {
   [[ -n "$_filer" ]] || return
   local -a cands=(
     "$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$_filer") LIMIT 1;")"
-    "$(_task_resolve_coordinator)"
+    "$(_task_resolve_coordinator "$_filer")"
   )
   for c in "${cands[@]}"; do
     [[ -n "$c" && "$c" != "$_filer" ]] || continue

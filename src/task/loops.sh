@@ -327,7 +327,7 @@ cmd_task_loop_start() {
   printf '%s' "$steps" | jq -e 'type=="array" and length>0' >/dev/null 2>&1 \
     || fail "$E_VALIDATION" "--steps must be a non-empty JSON array"
   local creator; creator=$(task_actor "$from")
-  [[ -n "$owner" ]] || owner=$(_task_resolve_coordinator)
+  [[ -n "$owner" ]] || owner=$(_task_resolve_coordinator "$creator")   # DIVE-4823: the loop's creator names the team
 
   # Run parent — marked, assigned to the owner so it always has a home.
   local run_body="Loop run.

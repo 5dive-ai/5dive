@@ -5623,7 +5623,7 @@ _hb_gate_renag_sweep() {
     IFS=$'\x1f' read -r gid filer routed <<<"$grow"
     reviewer="$routed"
     [[ -n "$reviewer" ]] || reviewer=$(_gate_route_reviewer "$filer")
-    [[ -n "$reviewer" ]] || reviewer=$(_task_resolve_coordinator)
+    [[ -n "$reviewer" ]] || reviewer=$(_task_resolve_coordinator "$filer")   # DIVE-4823: the filer's team
     if [[ -z "$reviewer" ]]; then
       warn "gate re-nag for task row ${gid}: no org lead resolved; will retry next heartbeat"
       _hb_log "[gate-renag] no org lead for T1 row ${gid} (filer=${filer:-unknown})"

@@ -2337,7 +2337,7 @@ _task_gate_lead_reviewer() {
   local ident="$1" _hf _lead=""
   _hf=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
   _lead=$(_gate_route_reviewer "$_hf" 2>/dev/null) || _lead=""
-  [[ -n "$_lead" ]] || { _lead=$(_task_resolve_gate_notifier 2>/dev/null) || _lead=""; }
+  [[ -n "$_lead" ]] || { _lead=$(_task_resolve_gate_notifier "$_hf" 2>/dev/null) || _lead=""; }   # DIVE-4823: the gate filer's team
   printf '%s' "$_lead"
 }
 

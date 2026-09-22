@@ -2299,6 +2299,18 @@ cmd_task_need() {
     e_kind="${e_id%% *}"
     [[ "$e_kind" == "agent" ]] && e_name="${e_id#agent }"
     e_lead=$(_gate_route_reviewer "$e_filer") || e_lead=""
+    # DIVE-4823 DELIBERATELY PASSES NO SUBJECT HERE, and the two sites below are
+    # the only ones in the row's list that were left board-wide. This is not a
+    # routing question — it is an AUTHORIZATION question ("may this caller
+    # withdraw / escalate someone else's gate?"), and scoping it to the filer's
+    # own team would NARROW a standing grant as a side effect of a routing
+    # change. Measured: tests/gate_withdraw_unit.sh's T-2382a builds a two-root
+    # chart on purpose and asserts that the board-wide coordinator can retire a
+    # gate filed OUTSIDE their reporting line; with a subject, `main` loses that
+    # and only `grok` keeps it. Whether a per-team coordinator SHOULD be able to
+    # retire another team's gate is a real question and it belongs to its own
+    # row — taking it silently here would ship a permissions change inside a
+    # change whose acceptance criterion is that it changes nothing.
     e_coord=$(_task_resolve_coordinator) || e_coord=""
     # FAILS CLOSED WHERE THE CALLER CANNOT BE IDENTIFIED. Iteration 1 shipped this
     # guard open in exactly that state, and CI caught what this box could not: the
@@ -2417,7 +2429,7 @@ cmd_task_need() {
     # bundle: the unit harness is `set -uo pipefail` with no -e and therefore
     # cannot reproduce an errexit abort at all.
     w_lead=$(_gate_route_reviewer "$w_filer") || w_lead=""
-    w_coord=$(_task_resolve_coordinator) || w_coord=""
+    w_coord=$(_task_resolve_coordinator) || w_coord=""   # DIVE-4823: board-wide on purpose — see the escalate arm above
     [[ "$w_kind" == "human" ]] && w_ok=1                                    # a genuine human caller
     [[ -n "$w_name" && "$w_name" == "$w_filer" ]] && w_ok=1                # the filer
     [[ -n "$w_name" && -n "$w_lead"  && "$w_name" == "$w_lead"  ]] && w_ok=1  # filer's lead
