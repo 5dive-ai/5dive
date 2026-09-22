@@ -362,7 +362,7 @@ _task_grade_table() {  # <ident> <check> <stored-mutant> <claimed-failing-csv>
 
   _gt_cleanup
   _TASK_GRADE_FLAGS="$flags"
-  local nflags=0; [[ -n "$flags" ]] && nflags=$(grep -c . <<<"$flags")
+  local nflags=0; [[ -n "$flags" ]] && nflags=$(grep -c . <<<"$flags") || nflags=0
   local verdict
   if (( nflags == 0 )); then
     verdict="VERDICT computed: PASS — 0 flags"
@@ -495,6 +495,27 @@ _task_grade_derive_check() {  # <id> <ident> <result>
   n=${#paths[@]}
   (( n == 1 )) || return 1
   cand="${paths[0]}"
+  # ── DIVE-4825 iteration 2: NEVER DERIVE THE HARNESS WE ARE RUNNING INSIDE ──
+  # The derived command is not merely recorded, it is EXECUTED a few lines below
+  # (`cmd_task_verify --cmd="$stored"`). So a delivery made from within
+  # tests/X.sh whose CHECKED names tests/X.sh re-enters that harness — a nested
+  # run of the whole suite whose exit status grades nothing about the diff, and
+  # which cannot terminate in bounded time as the shape nests.
+  #
+  # That is the regression iteration 1 shipped. Four escalation-resume arms
+  # deliver from inside the harness their own CHECKED line names; the nested run
+  # came back non-zero and `task deliver` refused with exit 5 a delivery the row
+  # had always accepted (A9b/A10/A11/A15, green with FIVEDIVE_DERIVE_GRADE_CHECK=0,
+  # red without it). Falling through here leaves the ORDINARY route — which is
+  # exactly what those rows had before the default flip, so the flip stops being
+  # able to take a delivery away.
+  #
+  # It costs a real delivery nothing: the CLI entry point is `5dive`, never a
+  # tests/*.sh, so `$0` can only match here when a harness is the caller.
+  local _self
+  for _self in "$0" "${BASH_SOURCE[@]}"; do
+    [[ "${_self##*/}" == "${cand##*/}" ]] && return 1
+  done
   git rev-parse HEAD >/dev/null 2>&1 || return 1
   git cat-file -e "HEAD:${cand}" 2>/dev/null || return 1
   db "UPDATE tasks SET verify_command=$(sqlq "bash ${cand}"), review_mode='check' WHERE id=${id};"

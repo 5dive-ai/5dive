@@ -364,6 +364,35 @@ IDD5=$(add_row "harness absent at sha")
   && ok_t "a harness that is not AT the delivered sha is not derived from" \
   || bad_t "a harness that is not AT the delivered sha is not derived from" "mode='$(col "$IDD5" review_mode)'"
 
+# DIVE-4825 iteration 2 — THE HARNESS WE ARE RUNNING INSIDE IS NEVER DERIVED.
+# The derived command is EXECUTED, not merely recorded, so deriving the harness
+# that is currently the caller re-enters it: a nested run of this whole suite
+# whose exit status grades nothing and whose nesting does not terminate. That is
+# the shape iteration 1 regressed on — four escalation-resume arms deliver from
+# inside the harness their own CHECKED line names, and the nested run's non-zero
+# exit made `task deliver` REFUSE (exit 5) a delivery the row had always taken.
+#
+# This arm is the control for that: same row shape as the PART 5 positive above,
+# only the harness NAME changed to this script's own, so a pass here and a pass
+# there together say the guard is narrow — it declines the self-named case and
+# nothing else.
+SELFH="${0##*/}"
+RD6=$(mkrepo repoD6); SHAD6=$(git -C "$RD6" rev-parse HEAD)
+cp "$RD6/tests/h.sh" "$RD6/tests/$SELFH"
+git -C "$RD6" add -A >/dev/null; git -C "$RD6" commit -qm selfharness >/dev/null
+SHAD6=$(git -C "$RD6" rev-parse HEAD)
+IDD6=$(add_row "CHECKED names the running harness")
+( cd "$RD6" && cmd_task_deliver "$IDD6" --pr="$PR" \
+    --result="$(printf 'CHANGED: x\nCHECKED: bash tests/%s\nDELIVERED-SHA: %s\nCI: green\nCRITERIA: x\n' "$SELFH" "$SHAD6")" >/dev/null 2>&1 ); RC6=$?
+[[ "$(col "$IDD6" review_mode)" != "check" ]] \
+  && ok_t "the harness we are running INSIDE is never derived (no recursive self-grade)" \
+  || bad_t "the harness we are running INSIDE is never derived" "mode='$(col "$IDD6" review_mode)'"
+# …and the delivery still goes through. The regression was not the flip, it was
+# the flip taking a delivery AWAY, so the arm that matters is the exit status.
+(( RC6 == 0 )) \
+  && ok_t "…and that delivery is still ACCEPTED, not refused (the iteration-1 regression)" \
+  || bad_t "…and that delivery is still ACCEPTED" "cmd_task_deliver exited $RC6"
+
 echo "── PART 6 — mutation: cut the predicates, the arms above must go RED ─────"
 
 # THE EVAL HAPPENS IN THE PARENT SHELL. Done inside `r=$(mutate …)` the cut
@@ -503,6 +532,27 @@ if declare -F _grader_grade_method_clause >/dev/null 2>&1; then
 else
   bad_t "grader method clause reachable" "_grader_grade_method_clause not defined — PART 7's clause arms did not run"
 fi
+
+echo "── PART 8 — mutation: cut the self-recursion guard ───────────────────────"
+# Without a mutant this arm is a predicate that has never been shown able to
+# fail: the row could stop deriving for an unrelated reason and the control
+# above would still read green.
+ORIG_DERIVE2=$(declare -f _task_grade_derive_check)
+r=$(mutate _task_grade_derive_check 's|\[\[ "\${_self##\*/}" == "\${cand##\*/}" \]\] && return 1|:|' '_self##\*/')
+if [[ "$r" == "OK" ]] && . "$CUT"; then
+  ok_t "mutation F landed: the self-harness guard is cut out of the derive"
+  RD7=$(mkrepo repoD7)
+  cp "$RD7/tests/h.sh" "$RD7/tests/$SELFH"
+  git -C "$RD7" add -A >/dev/null; git -C "$RD7" commit -qm selfharness >/dev/null
+  SHAD7=$(git -C "$RD7" rev-parse HEAD)
+  IDD7=$(add_row "CHECKED names the running harness, guard cut")
+  ( cd "$RD7" && cmd_task_deliver "$IDD7" --pr="$PR" \
+      --result="$(printf 'CHANGED: x\nCHECKED: bash tests/%s\nDELIVERED-SHA: %s\nCI: green\nCRITERIA: x\n' "$SELFH" "$SHAD7")" >/dev/null 2>&1 )
+  [[ "$(col "$IDD7" review_mode)" == "check" ]] \
+    && ok_t "…and the self-harness arm goes red (the running harness now derives)" \
+    || bad_t "…and the self-harness arm goes red" "mode='$(col "$IDD7" review_mode)' — the arm would pass with the guard gone, so it proves nothing"
+else bad_t "mutation F landed" "$r"; fi
+eval "$ORIG_DERIVE2"
 
 
 echo
