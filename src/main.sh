@@ -642,6 +642,11 @@ _agent_verb_dispatch() {
         _reconcile_coauthors)
           AUDIT_CMD="agent _reconcile_coauthors"; AUDIT_ARGS=()
           with_registry_lock cmd_agent_reconcile_coauthors "$@" ;;
+        # DIVE-4863: hidden installer migration — add the per-model effortLevel
+        # Claude Code >= 2.1.280 actually reads to every existing claude seat.
+        _heal_effort)
+          AUDIT_CMD="agent _heal_effort"; AUDIT_ARGS=()
+          cmd_agent_heal_effort "$@" ;;
         # DIVE-4081: hidden installer migration. Refresh managed standard-seat
         # sudoers after a bundle upgrade so existing routed reviewers gain the
         # narrow _task_answer path already rendered for newly-created seats.

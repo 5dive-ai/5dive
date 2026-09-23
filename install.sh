@@ -915,6 +915,17 @@ refresh_managed_files() {
   if ! "$BIN_DIR/5dive" agent _sync_codex_baseline; then
     echo "warn: existing Codex AGENTS.md baselines were not fully reconciled; user-authored text was left untouched" >&2
   fi
+  # DIVE-4863: Claude Code >= 2.1.280 ignores the top-level effortLevel for
+  # claude-opus-5-5 and newer, so every existing seat ran at medium. Add the
+  # per-model key it does read; self-update's settings.json fingerprint then
+  # restarts idle seats (busy ones at their next task boundary). This file
+  # deploys on merge, ahead of the release carrying the verb, so a bundle that
+  # predates it is skipped rather than warned about; a failed heal warns and
+  # never fails the upgrade.
+  if grep -q 'cmd_agent_heal_effort' "$BIN_DIR/5dive" 2>/dev/null \
+     && ! "$BIN_DIR/5dive" agent _heal_effort >/dev/null 2>&1; then
+    echo "warn: per-model effort was not healed on every claude seat; those seats run Opus 5.5 at medium until 'sudo 5dive agent _heal_effort' succeeds" >&2
+  fi
   # DIVE-4667: mint stable ids for old seats and install the hook immediately;
   # no agent restart is needed because git reads hooksPath on every commit.
   if ! "$BIN_DIR/5dive" agent _reconcile_coauthors; then

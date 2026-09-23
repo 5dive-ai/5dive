@@ -89,3 +89,78 @@ EOF
     printf '%-8s %s\n' "$fam" "$(model_latest "$fam")"
   done < <(model_families)
 }
+
+# ---------------------------------------------------------------------------
+# Per-model reasoning effort (DIVE-4863).
+#
+# Claude Code >= 2.1.280 applies a user-settings top-level `effortLevel` ONLY to
+# a fixed set of models it calls legacy (claude-opus-5, claude-sonnet-5, ...).
+# Any newer model (claude-opus-5-5 is the first) ignores it and runs at the
+# model's default, medium. The key it honours is
+# `modelSettings.<canonical model id>.effortLevel` — what `/effort` writes. So
+# every writer sets BOTH keys, and every reader prefers the per-model one.
+#
+# The per-model schema accepts low|medium|high|xhigh only: "max" is
+# session-only in Claude Code, and an unknown value is dropped silently (the
+# model then reads its default). So `max` is written per-model as `xhigh`, the
+# highest level that persists; the top-level key keeps "max" for the legacy
+# models that still read it.
+# ---------------------------------------------------------------------------
+
+# model_canonical <model> -> the id Claude Code keys modelSettings by: a
+# trailing "[1m]"-style suffix dropped and a family alias resolved. Anything
+# else (a full id, a BYO `vendor/model` string, empty) passes through.
+model_canonical() {
+  local m="${1:-}"
+  m="${m%%\[*}"
+  resolve_model_alias "$m"
+}
+
+# model_effort_ids_json [model] -> JSON array of the ids that get a per-model
+# effortLevel: every family's current id — so a later `/model` switch keeps the
+# level — plus the seat's own canonical model when it is a claude-* id the
+# table does not list (a seat pinned to an older model).
+model_effort_ids_json() {
+  local fam id own
+  own=$(model_canonical "${1:-}")
+  {
+    while read -r fam; do
+      id=$(model_latest "$fam") && printf '%s\n' "$id"
+    done < <(model_families)
+    [[ "$own" == claude-* ]] && printf '%s\n' "$own"
+  } | jq -R . | jq -sc 'unique'
+}
+
+# jq definitions shared by every settings.json effort writer and reader.
+#   apply_effort($e; $ids)  set the top-level key and the per-model key of every
+#                           id in $ids (overwrites: an explicit set is the truth).
+#   heal_effort($ids)       fill ONLY the per-model keys that are missing, from
+#                           the top-level value — never overwrite one, since a
+#                           per-model value is what `/effort` chose last.
+#   effective_effort($a)    what Claude Code runs: the per-model key for the
+#                           seat's model ($a = models_json), else top-level.
+# shellcheck disable=SC2016
+MODEL_EFFORT_JQ='
+def _pm_effort: if . == "max" then "xhigh" else . end;
+def _ms: if (.modelSettings | type) == "object" then .modelSettings else {} end;
+def apply_effort($e; $ids):
+  .effortLevel = $e
+  | .modelSettings = (reduce $ids[] as $id (_ms;
+      .[$id] = ((if (.[$id] | type) == "object" then .[$id] else {} end) + {effortLevel: ($e | _pm_effort)})));
+def heal_effort($ids):
+  if (.effortLevel | type) == "string"
+     and (.effortLevel | IN("low", "medium", "high", "xhigh", "max"))
+     and ((.modelSettings == null) or ((.modelSettings | type) == "object"))
+  then .effortLevel as $e
+    | .modelSettings = (reduce $ids[] as $id (_ms;
+        if (.[$id] | type) == "object" and .[$id].effortLevel != null then .
+        else .[$id] = ((if (.[$id] | type) == "object" then .[$id] else {} end) + {effortLevel: ($e | _pm_effort)})
+        end))
+  else . end;
+def _canon_model($a):
+  ((if (.model | type) == "string" then .model else "" end) | sub("\\[[^\\]]*\\]$"; "")) as $s
+  | ($a[$s] // $s);
+def effective_effort($a):
+  _canon_model($a) as $k
+  | ((_ms[$k] | if type == "object" then .effortLevel else null end) // .effortLevel // empty);
+'

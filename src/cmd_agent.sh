@@ -860,13 +860,38 @@ def auth_health(agent_type, profile):
         return "expired", exp, False
     return "ok", exp, renew
 
+def _model_version_key(model_id):
+    return [int(p) if p.isdigit() else -1 for p in model_id.split("-")]
+
+def claude_effective_effort(obj):
+    # DIVE-4863: Claude Code >= 2.1.280 runs modelSettings.<canonical model>
+    # .effortLevel and ignores the top-level key for newer models. This shaper
+    # also runs as the sealed, env-less agent-list helper, so it cannot be handed
+    # the CLI's alias table (src/lib/models.sh): a bare family alias ("opus")
+    # resolves to the highest-versioned claude-<family>-* key present, which is
+    # the id the table maps it to whenever the CLI wrote the keys.
+    model = obj.get("model") if isinstance(obj.get("model"), str) else ""
+    model = re.sub(r"\[[^\]]*\]$", "", model)
+    ms = obj.get("modelSettings") if isinstance(obj.get("modelSettings"), dict) else {}
+    def level(key):
+        v = ms.get(key)
+        return v.get("effortLevel") if isinstance(v, dict) and isinstance(v.get("effortLevel"), str) else None
+    per_model = None
+    if model:
+        per_model = level(model)
+        if per_model is None and re.fullmatch(r"[a-z]+", model):
+            keys = [k for k in ms if k.startswith(f"claude-{model}-") and level(k)]
+            if keys:
+                per_model = level(max(keys, key=_model_version_key))
+    return per_model or obj.get("effortLevel") or None
+
 def model_and_effort(name, agent_type):
     home = os.path.join(home_root, f"agent-{name}")
     if agent_type == "claude":
         obj = read_json(os.path.join(home, ".claude/settings.json"))
         if not isinstance(obj, dict):
             return None, None
-        return obj.get("model") or None, obj.get("effortLevel") or None
+        return obj.get("model") or None, claude_effective_effort(obj)
     if agent_type in ("codex", "grok"):
         text = read_text(os.path.join(home, f".{agent_type}/config.toml")) or ""
         for line in text.splitlines():
@@ -1333,8 +1358,10 @@ resolve_agent_effort() {
   local f
   case "$type" in
     claude)
+      # DIVE-4863: the per-model key for the seat's model is what Claude Code
+      # runs (>= 2.1.280); the top-level key is only the fallback.
       f="${AGENT_HOME_ROOT:-/home}/agent-${name}/.claude/settings.json"
-      priv_read "$f" jq -r '.effortLevel // empty' "$f" ;;
+      priv_read "$f" jq -r --argjson a "$(models_json)" "$MODEL_EFFORT_JQ"'effective_effort($a)' "$f" ;;
     codex)
       f="${AGENT_HOME_ROOT:-/home}/agent-${name}/.codex/config.toml"
       { priv_read "$f" sed -nE 's/^[[:space:]]*model_reasoning_effort[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' "$f" | head -1; } || true ;;
@@ -1413,8 +1440,11 @@ PY
   mv -f "$tmp" "$file"
 }
 
-# Write the reasoning effort into claude's settings.json (`effortLevel`) — the
-# same key Claude Code reads and the telegram plugin's /effort writes. Claude-only
+# Write the reasoning effort into claude's settings.json — the top-level
+# `effortLevel` AND `modelSettings.<model>.effortLevel` for every current model
+# (DIVE-4863: Claude Code >= 2.1.280 ignores the top-level key for
+# claude-opus-5-5 and newer, so writing it alone left the seat at medium; the
+# per-model key is what `/effort` writes and what Claude Code reads). Claude-only
 # (other types have no effort knob). Same atomic merge-write contract as
 # write_runtime_model: refuse to create a missing file, preserve owner:group + 600.
 write_runtime_effort() {
@@ -1426,29 +1456,64 @@ write_runtime_effort() {
   local file="${AGENT_HOME_ROOT:-/home}/agent-${name}/.claude/settings.json"
   [[ -f "$file" ]] \
     || fail "$E_NOT_FOUND" "no claude runtime config at $file yet — start agent '$name' once before setting effort"
-  local dir own tmp
+  local dir own tmp cur ids
+  cur=$(cat "$file") || fail "$E_GENERIC" "failed to read $file"
+  [[ -n "${cur//[[:space:]]/}" ]] || cur='{}'
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$cur" \
+    || fail "$E_GENERIC" "failed to write effortLevel into $file (existing file is not a JSON object)"
+  ids=$(model_effort_ids_json "$(jq -r 'if (.model | type) == "string" then .model else "" end' <<<"$cur")")
   dir=$(dirname "$file")
   own=$(stat -c '%U:%G' "$file")
   tmp=$(mktemp -p "$dir" .effort.XXXXXX) || fail "$E_GENERIC" "mktemp failed in $dir"
-  if ! EFFORT_VAL="$effort" EFFORT_SRC="$file" python3 - "$tmp" <<'PY'
-import os, sys, json
-val, src, tmp = os.environ["EFFORT_VAL"], os.environ["EFFORT_SRC"], sys.argv[1]
-with open(src) as f: orig = f.read()
-try:
-    data = json.loads(orig) if orig.strip() else {}
-except ValueError:
-    sys.stderr.write("existing %s is not valid JSON\n" % src); sys.exit(3)
-if not isinstance(data, dict):
-    sys.stderr.write("existing %s is not a JSON object\n" % src); sys.exit(3)
-data["effortLevel"] = val
-with open(tmp, "w") as f: f.write(json.dumps(data, indent=2) + "\n")
-PY
-  then
+  if ! jq --arg e "$effort" --argjson ids "$ids" "$MODEL_EFFORT_JQ"'apply_effort($e; $ids)' \
+         <<<"$cur" >"$tmp" 2>/dev/null || [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"; fail "$E_GENERIC" "failed to write effortLevel into $file"
   fi
   chown "$own" "$tmp" 2>/dev/null || true
   chmod 600 "$tmp"
   mv -f "$tmp" "$file"
+}
+
+# Resolve a claude seat's EFFECTIVE effort from its settings.json text on stdin:
+# the per-model key for the seat's model, else the top-level one (DIVE-4863).
+# Prints "" when neither is set or the input is not JSON.
+settings_effective_effort() {
+  jq -r --argjson a "$(models_json)" "$MODEL_EFFORT_JQ"'effective_effort($a)' 2>/dev/null || true
+}
+
+# DIVE-4863: hidden installer migration. For every registered claude seat whose
+# settings.json has a top-level `effortLevel` but no per-model one, add
+# `modelSettings.<model>.effortLevel` for every current model — never
+# overwriting a per-model value (that is what `/effort` chose last). Claude Code
+# reads effort at session start, so the change lands on the seat's next
+# restart; self-update's payload fingerprint covers settings.json, so the pass
+# that runs this bounces idle seats and defers busy ones. Idempotent.
+cmd_agent_heal_effort() {
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _heal_effort takes no arguments"
+  require_root
+  local name file cur ids healed own tmp healed_n=0 failed=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    file="${AGENT_HOME_ROOT:-/home}/agent-${name}/.claude/settings.json"
+    [[ -f "$file" ]] || continue
+    cur=$(cat "$file" 2>/dev/null) || { failed=$((failed + 1)); continue; }
+    jq -e 'type == "object"' >/dev/null 2>&1 <<<"$cur" || continue
+    ids=$(model_effort_ids_json "$(jq -r 'if (.model | type) == "string" then .model else "" end' <<<"$cur")")
+    healed=$(jq --argjson ids "$ids" "$MODEL_EFFORT_JQ"'heal_effort($ids)' <<<"$cur" 2>/dev/null) \
+      || { failed=$((failed + 1)); continue; }
+    # Compare parsed, not text: a no-op must not rewrite (and so re-fingerprint)
+    # a file that differs from jq's output only in whitespace.
+    jq -n -e --argjson x "$cur" --argjson y "$healed" '$x == $y' >/dev/null 2>&1 && continue
+    own=$(stat -c '%U:%G' "$file")
+    tmp=$(mktemp -p "$(dirname "$file")" .effort.XXXXXX) || { failed=$((failed + 1)); continue; }
+    printf '%s\n' "$healed" >"$tmp"
+    chown "$own" "$tmp" 2>/dev/null || true
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$file"
+    healed_n=$((healed_n + 1))
+  done < <(registry_read | jq -r '.agents // {} | to_entries[] | select((.value.type // "claude") == "claude") | .key')
+  (( failed == 0 )) || { warn "per-model effort heal failed for $failed agent(s)"; return 1; }
+  ok "per-model effort healed on $healed_n agent(s)"
 }
 
 # Atomically replace one document-root Codex TOML string key while preserving

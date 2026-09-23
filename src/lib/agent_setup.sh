@@ -278,10 +278,13 @@ JSON
   # model. Valid full ids (claude-opus-5) are left untouched. See DIVE-506.
   # DIVE-1883: which id "opus" resolves to lives in src/lib/models.sh — never
   # re-inline a literal here.
+  # DIVE-4863: effort goes in BOTH the top-level key and modelSettings.<model> —
+  # Claude Code >= 2.1.280 ignores the top-level one for claude-opus-5-5 and
+  # newer, so a seat created with only that key ran at medium. See models.sh.
   local settings
-  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" --arg model "$selected_model" --arg effort "$selected_effort" '{
+  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" --arg model "$selected_model" --arg effort "$selected_effort" \
+    --argjson effort_ids "$(model_effort_ids_json "$selected_model")" "$MODEL_EFFORT_JQ"'{
     model: $model,
-    effortLevel: $effort,
     permissions: {
       defaultMode: "bypassPermissions",
       allow: ["Bash(5dive-transcribe:*)"]
@@ -296,7 +299,7 @@ JSON
         source: {source: "github", repo: "\($ghorg)/5dive-plugins"}
       }
     }
-  } + $sl')
+  } + $sl | apply_effort($effort; $effort_ids)')
   # channels is a comma-separable list (DIVE-856): build enabledPlugins from
   # membership so "telegram,dashboard" enables both.
   local enabled_plugins='{}'

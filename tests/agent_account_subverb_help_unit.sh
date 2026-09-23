@@ -163,23 +163,23 @@ rc="$(run account list --help)"
 # the list cannot quietly grow — a new PUBLIC verb landing in it would be a
 # missing usage entry, which is the defect class this harness exists for.
 UNDOC=()
-for lab in _self_restart _default_skills _sync_codex_baseline _reconcile_sudoers _reconcile_coauthors; do
+for lab in _self_restart _default_skills _sync_codex_baseline _reconcile_sudoers _reconcile_coauthors _heal_effort; do
   rc="$(run agent "$lab" --help)"
   { [[ "$rc" != "0" ]] && has "$(err)" 'no usage text'; } || UNDOC+=("$lab(rc=$rc)")
 done
 (( ${#UNDOC[@]} == 0 )) \
-  && ok_t "C1: the 5 undocumented internals are refused BY NAME, not answered with an invented line" \
+  && ok_t "C1: the 6 undocumented internals (DIVE-4863 added _heal_effort) are refused BY NAME, not answered with an invented line" \
   || bad_t "C1: an undocumented verb is refused by name" "${UNDOC[*]}"
 C_GREW=()
 for pair in "${AGENT_LABELS[@]}"; do
   read -r lab _ <<<"$pair"
-  case "$lab" in _self_restart|_default_skills|_sync_codex_baseline|_reconcile_sudoers|_reconcile_coauthors) continue ;; _*) ;; *) continue ;; esac
+  case "$lab" in _self_restart|_default_skills|_sync_codex_baseline|_reconcile_sudoers|_reconcile_coauthors|_heal_effort) continue ;; _*) ;; *) continue ;; esac
   rc="$(run agent "$lab" --help)"
   [[ "$rc" == "0" ]] || C_GREW+=("$lab(rc=$rc)")
 done
 (( ${#C_GREW[@]} == 0 )) \
-  && ok_t "C2: ... and every OTHER internal does answer, so C1's list is exactly 5 and not 'whatever failed'" \
-  || bad_t "C2: the undocumented list is exactly those 5" "these also failed: ${C_GREW[*]}"
+  && ok_t "C2: ... and every OTHER internal does answer, so C1's list is exactly 6 and not 'whatever failed'" \
+  || bad_t "C2: the undocumented list is exactly those 6" "these also failed: ${C_GREW[*]}"
 
 # --- D) The flag is a question, not a seat name ------------------------------
 # `agent skill` takes an agent NAME first, so the unfixed tree read `--help` as

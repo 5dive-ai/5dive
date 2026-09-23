@@ -2464,7 +2464,8 @@ cmd_export() {
   cfg=$(_pack_agent_config "$name")
   # model/effort/plugins come from the agent's settings.json (no secrets there).
   model=$(jq -r '.model // empty'        "$cdir/settings.json" 2>/dev/null || true)
-  effort=$(jq -r '.effortLevel // empty' "$cdir/settings.json" 2>/dev/null || true)
+  # DIVE-4863: the effective level (per-model key first), not the legacy key.
+  effort=$(settings_effective_effort <"$cdir/settings.json" 2>/dev/null || true)
   plugins=$(jq -c '.enabledPlugins // []' "$cdir/settings.json" 2>/dev/null || echo '[]')
 
   # Per-agent instructions (the identity doc) — copied verbatim if present.
@@ -3166,14 +3167,18 @@ cmd_import() {
       plugins=$(jq -c 'walk(if type == "object" then del(.hooks) else . end)' <<<"$plugins" 2>/dev/null || echo "$plugins")
     fi
     cur=$( [[ -f "$sfile" ]] && cat "$sfile" || echo '{}' )
+    # DIVE-4863: effort lands in the top-level key AND modelSettings.<model>
+    # (apply_effort) — Claude Code >= 2.1.280 ignores the top-level one alone.
+    local effort_ids
+    effort_ids=$(model_effort_ids_json "${model:-$(jq -r 'if (.model | type) == "string" then .model else "" end' <<<"$cur" 2>/dev/null)}")
     if jq -n --argjson cur "$cur" \
-          --arg model "$model" --arg effort "$effort" \
+          --arg model "$model" --arg effort "$effort" --argjson effort_ids "$effort_ids" \
           --argjson hooks "$hooks" --argjson plugins "$plugins" \
-      '$cur
+      "$MODEL_EFFORT_JQ"'$cur
        + (if $model  != "" then {model:$model}        else {} end)
-       + (if $effort != "" then {effortLevel:$effort} else {} end)
-       + (if ($hooks   | length) > 0 then {hooks:$hooks}            else {} end)
-       + (if ($plugins | length) > 0 then {enabledPlugins:$plugins} else {} end)' \
+       | (if $effort != "" then apply_effort($effort; $effort_ids) else . end)
+       | . + (if ($hooks   | length) > 0 then {hooks:$hooks}            else {} end)
+           + (if ($plugins | length) > 0 then {enabledPlugins:$plugins} else {} end)' \
       > "$sfile.imp.$$" 2>/dev/null; then
       install -o "agent-${as}" -g "agent-${as}" -m 600 "$sfile.imp.$$" "$sfile" 2>/dev/null || true
     fi
