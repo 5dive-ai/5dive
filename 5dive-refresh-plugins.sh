@@ -54,9 +54,10 @@ KEEP_PLUGIN_VERSIONS="${KEEP_PLUGIN_VERSIONS:-2}"
 AGENTS_REGISTRY="${AGENTS_REGISTRY:-/var/lib/5dive/agents.json}"
 
 # GitHub org migration (5dive-com -> 5dive-ai, 2026-06): existing agents
-# persist the marketplace source in known_marketplaces.json AND in the
-# marketplace clone's origin remote. Both break once the old org name is
-# parked, so rewrite them as soon as the new org is live. Probe once per
+# persist the marketplace source in THREE places — known_marketplaces.json, the
+# marketplace clone's origin remote, and settings.json extraKnownMarketplaces
+# (the declaration the other two derive from; DIVE-4867). All break once the old
+# org name is parked, so rewrite them as soon as the new org is live. Probe once per
 # run; no-op until the rename happens. GH_ORG env overrides the probe.
 GH_ORG="${GH_ORG:-}"
 if [[ -z "$GH_ORG" ]]; then
@@ -87,8 +88,71 @@ migrate_marketplace_org() {
           && echo "    migrated $(basename "$mpdir") clone remote -> $GH_ORG" ;;
     esac
   done
+  _migrate_settings_marketplace_source "$user" "$home" "$km"
   return 0
 }
+
+# >>> DIVE-4867 settings.json carries the marketplace source too
+# The two rewrites above left the THIRD copy of the source alone:
+# settings.json `.extraKnownMarketplaces.<name>.source`. That copy is the
+# declaration, and known_marketplaces.json is Claude Code's state derived from
+# it — so the log said "migrated known_marketplaces.json -> 5dive-ai" EVERY night
+# on the same seats (the rewrite was being undone between runs), and when the two
+# disagree `claude plugin marketplace update` answers `Marketplace '5dive-plugins'
+# not found`. telegram@5dive-plugins sat on 0.5.49 on five control-plane seats
+# from 2026-08-26 to 2026-09-23 on exactly that.
+#
+# THE SOURCE MUST MATCH EXACTLY, FORM INCLUDED. A github-form source
+# (`{"source":"github","repo":…}`) beside a git-form one
+# (`{"source":"git","url":…}`) for the same repo still fails — measured on two
+# seats, where rewriting only the org name was not enough. So the settings entry
+# takes known_marketplaces' source OBJECT verbatim; the string rewrite is the
+# fallback only when known_marketplaces has no usable entry for that name.
+#
+# SCOPE: only entries whose source names one of OUR orgs. A third-party
+# marketplace the operator declared is their configuration, not our migration.
+#
+# Written as root with `cat >` into the existing file (not a rename), so the
+# seat keeps ownership and mode — a root-owned settings.json in a seat's home is
+# a seat that can no longer save its own settings.
+_migrate_settings_marketplace_source() { # <user> <home> <known_marketplaces.json>
+  local user="${1:-}" home="${2:-}" km="${3:-}" st raw before after tmp name
+  st="$home/.claude/settings.json"
+  [[ -n "$user" && -f "$st" ]] || return 0
+  grep -qE '5dive-(com|ai)/' "$st" || return 0
+  local kmjson='{}'
+  [[ -f "$km" ]] && kmjson=$(jq -c '.' "$km" 2>/dev/null) && [[ -n "$kmjson" ]] || kmjson='{}'
+  # Transform the file in its OWN key order and compare sorted: a rewrite must not
+  # reorder the seat's whole settings.json to change one source object.
+  raw=$(jq -c '.' "$st" 2>/dev/null) && [[ -n "$raw" ]] || {
+    echo "    WARN: $st is not valid JSON — marketplace source NOT migrated for $user" >&2; return 0; }
+  after=$(jq -c --argjson km "$kmjson" --arg org "$GH_ORG" '
+    def ours: tojson | test("5dive-(com|ai)/");
+    def stale: tojson | test("5dive-com/");
+    if (.extraKnownMarketplaces | type) != "object" then . else
+      .extraKnownMarketplaces |= with_entries(
+        .key as $n | (.value.source // null) as $s | ($km[$n].source // null) as $k
+        | if ($s == null) or ($s | ours | not) then .
+          elif ($k != null) and ($k | stale | not) then .value.source = $k
+          elif ($s | stale) then .value.source = ($s | tojson | gsub("5dive-com/"; $org + "/") | fromjson)
+          else . end)
+    end' <<<"$raw" 2>/dev/null) && [[ -n "$after" ]] || return 0
+  before=$(jq -S -c '.' <<<"$raw")
+  [[ "$(jq -S -c '.' <<<"$after")" != "$before" ]] || return 0
+  tmp=$(mktemp) || return 0
+  if jq '.' <<<"$after" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]] && cat "$tmp" > "$st"; then
+    for name in $(jq -r --argjson b "$before" \
+        '.extraKnownMarketplaces // {} | to_entries[] | select(.value.source != ($b.extraKnownMarketplaces[.key].source)) | .key' \
+        <<<"$after" 2>/dev/null); do
+      echo "    migrated settings.json marketplace $name -> $(jq -c --arg n "$name" '.extraKnownMarketplaces[$n].source' <<<"$after")"
+    done
+  else
+    echo "    WARN: could not write $st — marketplace source NOT migrated for $user" >&2
+  fi
+  rm -f "$tmp"
+  return 0
+}
+# <<< DIVE-4867 settings.json carries the marketplace source too
 
 RESTART_CHANGED=0
 STATUS_ONLY=0
@@ -234,6 +298,77 @@ _clear_mcp_failure_cache() { # <user> <home>
 }
 # <<< DIVE-4852 clear Claude Code's MCP failure cache after the per-seat plugin probe
 
+# >>> DIVE-4867 a failed claude plugin step is logged and counted
+# Until DIVE-4867 each step was piped through `grep -E 'updated|error|warn|fail'`
+# — case-sensitive — and Claude Code reports a failure as `✘ Failed to update
+# marketplace(s): …`. Capital F: the filter dropped the ONLY line a failure
+# prints, so a seat that failed every night for a month logged exactly what a
+# seat with nothing to do logs. The DEFAULT of a filter is what decides what the
+# operator never sees, so here the direction is inverted: a failure prints
+# EVERYTHING it said (capped), and only a success is filtered down.
+#
+# A step failed when it exits non-zero OR prints a `✘` / fail / error line —
+# either alone, because nothing guarantees Claude Code's exit code tracks its
+# own `✘`. A failed step makes the seat a failed seat; the run ends with a
+# `refresh_failed_count:` line that is printed even at 0 (an absent line cannot
+# be told from a run that never reached the count — DIVE-4399's parked_count rule).
+REFRESH_FAIL_LINES="${REFRESH_FAIL_LINES:-20}"
+FAILED_AGENTS=""
+# It runs `claude plugin <args>` and nothing else. The `plugin` word is written HERE,
+# at the one real call site, so the plugin-caller sweep in
+# tests/self_update_mcp_failure_cache_unit.sh still sees this file as a caller.
+# _claude_step <user> <label> <claude plugin args…> — returns 1 when the step failed.
+# (Arguments on their own line: the harnesses lift a function by `^name() {$`.)
+_claude_step() {
+  local user="$1" label="$2" out rc=0 line failed=0 n=0
+  shift 2
+  out=$(sudo -u "$user" -H "$CLAUDE_BIN" plugin "$@" 2>&1) || rc=$?
+  (( rc != 0 )) && failed=1
+  grep -qiE '✘|fail|error' <<<"$out" && failed=1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if (( failed )); then
+      n=$((n + 1)); (( n > REFRESH_FAIL_LINES )) && continue
+    else
+      grep -qiE 'updated|already|installed|warn|restart' <<<"$line" || continue
+    fi
+    echo "    [$label] $line"
+  done <<<"$out"
+  (( n > REFRESH_FAIL_LINES )) && echo "    [$label] … $((n - REFRESH_FAIL_LINES)) more line(s) not shown"
+  if (( failed )); then
+    echo "    [$label] FAILED (exit $rc)"
+    return 1
+  fi
+  return 0
+}
+
+# Files in a seat's marketplaces dir that the seat does not own make Claude Code's
+# own update fail (`EACCES … rmdir 5dive-plugins.bak` on agent-main: 72 root-owned
+# files left by an earlier root-run step). Named, not fixed — whether to chown or
+# move them aside is a judgement about how they got there.
+# _warn_foreign_owned_marketplace_files <user> <home>
+_warn_foreign_owned_marketplace_files() {
+  local user="${1:-}" home="${2:-}" dir first count
+  dir="$home/.claude/plugins/marketplaces"
+  [[ -n "$user" && -d "$dir" ]] || return 0
+  count=$(find "$dir" ! -user "$user" 2>/dev/null | wc -l)
+  (( count > 0 )) || return 0
+  first=$(find "$dir" ! -user "$user" 2>/dev/null | head -1)
+  echo "    WARN: $count file(s) under $dir are not owned by $user (first: $first) — Claude Code's marketplace update can fail with EACCES on them (seen on agent-main, 2026-09-23)"
+  return 0
+}
+
+_refresh_summary() {
+  local n=0 ag
+  for ag in $FAILED_AGENTS; do n=$((n + 1)); done
+  if (( n > 0 )); then
+    echo "--- $n seat(s) FAILED a plugin step this run: $FAILED_AGENTS — see the FAILED lines above; whatever those steps were fetching did not arrive ---"
+    echo "  refresh_failed: $FAILED_AGENTS"
+  fi
+  echo "  refresh_failed_count: $n"
+}
+# <<< DIVE-4867 a failed claude plugin step is logged and counted
+
 refresh_agent() {
   local ag="$1"
   local user="agent-$ag"
@@ -267,12 +402,12 @@ refresh_agent() {
 
   migrate_marketplace_org "$user" "$home"
 
-  local marketplaces
+  _warn_foreign_owned_marketplace_files "$user" "$home"
+
+  local marketplaces seat_failed=0
   marketplaces=$(printf '%s\n' "$all_keys" | awk -F@ '{print $NF}' | sort -u)
   for mp in $marketplaces; do
-    sudo -u "$user" -H "$CLAUDE_BIN" plugin marketplace update "$mp" 2>&1 \
-      | sed "s/^/    [marketplace $mp] /" \
-      | grep -E 'updated|error|warn|fail' || true
+    _claude_step "$user" "marketplace $mp" marketplace update "$mp" || seat_failed=1
   done
 
   while IFS= read -r key; do
@@ -283,10 +418,9 @@ refresh_agent() {
     elif [[ -z "$installed_keys" ]]; then
       verb="install"
     fi
-    sudo -u "$user" -H "$CLAUDE_BIN" plugin "$verb" "$key" 2>&1 \
-      | sed "s/^/    [plugin $verb $key] /" \
-      | grep -E 'updated|already|installed|error|warn|fail|Restart' || true
+    _claude_step "$user" "plugin $verb $key" "$verb" "$key" || seat_failed=1
   done <<<"$all_keys"
+  (( seat_failed )) && FAILED_AGENTS="${FAILED_AGENTS:+$FAILED_AGENTS }$ag"
 
   # DIVE-4852: AFTER the last `claude plugin` invocation for this seat and before
   # anything can restart it. Clearing before the probe is a no-op — the probe
@@ -457,4 +591,5 @@ if (( RESTART_CHANGED )); then
   _restart_changed_agents "$CHANGED_AGENTS"
 fi
 
+_refresh_summary
 echo "=== $(date -Iseconds) plugin refresh done ==="
