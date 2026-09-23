@@ -174,8 +174,8 @@ done
 #     where the policy is authoritative. An org's own unanchored terms are
 #     anchored by the wrapper too. -------------------------------------------
 printf 'hard_gates: {}\n' > "$TMP/constitution.yaml"
-_council_constitution_path() { printf '%s' "$TMP/constitution.yaml"; }
-_council_hard_gate_rx()      { printf 'press|charge|\\$[0-9]'; }
+_constitution_path() { printf '%s' "$TMP/constitution.yaml"; }
+_constitution_hard_gate_rx()      { printf 'press|charge|\\$[0-9]'; }
 _gate_tier2_floor_hit 'suppression' \
   && bad_t "T7 constitution-loaded terms are boundary-anchored too" \
            "custom rx still matched inside 'suppression'" \
@@ -186,7 +186,7 @@ _gate_tier2_floor_hit 'we need a press release' \
 _gate_tier2_floor_hit 'approve $500 for ads' \
   && ok_t "T7 a constitution-loaded money term still floors" \
   || bad_t "T7 constitution-loaded money term" "custom \$[0-9] stopped matching"
-unset -f _council_constitution_path _council_hard_gate_rx
+unset -f _constitution_path _constitution_hard_gate_rx
 
 # --- T8: END TO END through cmd_task_need — the tier the filer actually gets.
 #     T1..T7 grade the helpers; this grades the decision. --------------------

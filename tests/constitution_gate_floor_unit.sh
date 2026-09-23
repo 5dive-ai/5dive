@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_council.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh cmd_council.sh; do
   # shellcheck source=/dev/null
   source "src/$f"
 done
@@ -42,7 +42,7 @@ ok_t() { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
 
 # No file: byte-identical shipped floor (publish hits; brand does not).
-[[ "$(_council_hard_gate_rx)" == "$_GATE_T2_FLOOR_RX" ]] \
+[[ "$(_constitution_hard_gate_rx)" == "$_GATE_T2_FLOOR_RX" ]] \
   && ok_t "missing constitution returns exact legacy floor regex" || bad_t "missing regex drift"
 _gate_tier2_floor_hit "publish the launch post" \
   && ok_t "missing constitution preserves public-comms floor" || bad_t "missing public-comms floor"
@@ -50,8 +50,8 @@ if _gate_tier2_floor_hit "review the brand strategy"; then bad_t "brand absent f
 else ok_t "brand remains absent from shipped default"; fi
 
 # The no-file hot path must not invoke the Node/runtime loader at all.
-original_hard_gate_fn="$(declare -f _council_hard_gate_rx)"
-_council_hard_gate_rx() { : > "$TMP/hard-gate-loader.called"; printf '%s\n' "$_GATE_T2_FLOOR_RX"; }
+original_hard_gate_fn="$(declare -f _constitution_hard_gate_rx)"
+_constitution_hard_gate_rx() { : > "$TMP/hard-gate-loader.called"; printf '%s\n' "$_GATE_T2_FLOOR_RX"; }
 rm -f "$TMP/hard-gate-loader.called"
 _gate_tier2_floor_hit "approve billing" >/dev/null
 [[ ! -e "$TMP/hard-gate-loader.called" ]] \
@@ -90,7 +90,7 @@ grep -q 'invalid POSIX ERE; falling back to the shipped tier-2 floor' "$ere_warn
 
 # Malformed frontmatter is never partially applied: conservative shipped defaults return.
 printf '%s\n' 'not yaml frontmatter' > "$FIVEDIVE_CONSTITUTION_FILE"
-[[ "$(_council_hard_gate_rx)" == "$_GATE_T2_FLOOR_RX" ]] \
+[[ "$(_constitution_hard_gate_rx)" == "$_GATE_T2_FLOOR_RX" ]] \
   && ok_t "malformed constitution falls back atomically" || bad_t "malformed policy partially applied"
 
 # DIVE-1695: the on-disk constitution is trusted for the floor ONLY when it
@@ -105,7 +105,7 @@ _live_digest() { sha256sum < "$FIVEDIVE_CONSTITUTION_FILE" | awk '{print $1}'; }
 printf '%s\n' 'hard_gates:' "  money: 'spend|billing'" \
   "  public_comms: 'brand|press'" '# sealed policy' > "$FIVEDIVE_CONSTITUTION_FILE"
 _seal_digest "$(_live_digest)"
-if _council_constitution_drifted; then bad_t "in-sync constitution reported as drift"
+if _constitution_drifted; then bad_t "in-sync constitution reported as drift"
 else ok_t "constitution matching the sealed digest is not drift"; fi
 _gate_tier2_floor_hit "review the brand strategy" \
   && ok_t "sealed+matching constitution floors its added brand class" || bad_t "sealed+matching not trusted"
@@ -117,7 +117,7 @@ _gate_tier2_floor_hit "review the brand strategy" \
 sealed_before="$(_live_digest)"; _seal_digest "$sealed_before"
 printf '%s\n' 'hard_gates:' "  public_comms: 'brand'" \
   '# tampered: money class removed after sealing' > "$FIVEDIVE_CONSTITUTION_FILE"
-if _council_constitution_drifted; then ok_t "post-seal edit detected as drift"
+if _constitution_drifted; then ok_t "post-seal edit detected as drift"
 else bad_t "post-seal edit not detected as drift"; fi
 drift_warning="$TMP/drift-warning"
 _gate_tier2_floor_hit "approve billing" 2>"$drift_warning" \
@@ -130,11 +130,11 @@ grep -q 'drifted from the sealed digest' "$drift_warning" \
 
 # Sealed but the file is deleted entirely: fail closed (drift).
 rm -f "$FIVEDIVE_CONSTITUTION_FILE"
-if _council_constitution_drifted; then ok_t "sealed digest with missing file is drift"
+if _constitution_drifted; then ok_t "sealed digest with missing file is drift"
 else bad_t "missing file under a seal was not flagged"; fi
 _seal_digest ""  # no non-empty digest sealed -> pre-constitution lineage, never drift
 printf '%s\n' 'hard_gates:' "  money: 'spend'" '# unsealed setup file' > "$FIVEDIVE_CONSTITUTION_FILE"
-if _council_constitution_drifted; then bad_t "empty seal wrongly treated as drift"
+if _constitution_drifted; then bad_t "empty seal wrongly treated as drift"
 else ok_t "no sealed digest leaves CNCL-14 behavior unchanged"; fi
 unset COUNCIL_LINEAGE
 

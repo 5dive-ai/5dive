@@ -25,7 +25,7 @@ ok(){ pass=$((pass+1)); echo "ok   - $1"; }
 bad(){ fail=$((fail+1)); echo "FAIL - $1: $2"; }
 
 # --- (a) the shipped attribute, via check-attr -------------------------------
-for f in 5dive src/cmd_council.sh; do
+for f in 5dive src/cmd_council.sh src/constitution_kernel.sh; do
   got=$(git check-attr merge -- "$f" 2>/dev/null | sed 's/.*merge: //')
   [[ "$got" == "unset" ]] && ok "check-attr says merge is unset for $f" \
                           || bad "merge must be unset for $f" "got '$got'"
@@ -63,7 +63,7 @@ scenario() { # $1 = with-attrs|without-attrs, $2 = guarded path ; echoes UNMERGE
     if [[ -n "$(git ls-files -u -- "$path")" ]]; then echo UNMERGED; else echo MERGED-SILENTLY; fi
   ); rm -rf "$t"
 }
-for gp in 5dive src/cmd_council.sh; do
+for gp in 5dive src/cmd_council.sh src/constitution_kernel.sh; do
   r=$(scenario with-attrs "$gp")
   [[ "$r" == "UNMERGED" ]] && ok "a two-region concurrent edit leaves $gp UNMERGED (git refuses to stitch it)" \
                            || bad "the attribute must stop the content merge for $gp" "got '$r'"

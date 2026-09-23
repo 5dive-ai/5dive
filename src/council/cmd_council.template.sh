@@ -244,6 +244,10 @@ COUNCIL_HELP
 
 _council_write_runtime() {
   local dir="$1"
+  # DIVE-4869: engine.mjs imports the core constitution kernel; materialize it beside the engine.
+  cat > "$dir/constitution.mjs" <<'COUNCIL_CONSTITUTION_MJS'
+__CONSTITUTION_MJS__
+COUNCIL_CONSTITUTION_MJS
   cat > "$dir/engine.mjs" <<'COUNCIL_ENGINE_MJS'
 __ENGINE_MJS__
 COUNCIL_ENGINE_MJS

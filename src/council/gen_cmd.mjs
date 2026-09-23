@@ -11,11 +11,17 @@ import { fileURLToPath } from 'node:url'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const read = (p) => fs.readFileSync(path.join(here, p), 'utf-8')
-const engine = read('engine.mjs')
+// DIVE-4869: the constitution kernel is core-owned (src/constitution/) and imported by the engine.
+// The embedded runtime is one flat temp dir, so the source-tree specifier is rewritten to a sibling.
+const KERNEL_SPEC = "from '../constitution/constitution.mjs'"
+const rawEngine = read('engine.mjs')
+if (!rawEngine.includes(KERNEL_SPEC)) { console.error(`engine.mjs no longer imports ${KERNEL_SPEC} — update gen_cmd.mjs`); process.exit(1) }
+const engine = rawEngine.split(KERNEL_SPEC).join("from './constitution.mjs'")
+const kernel = read('../constitution/constitution.mjs')
 const cli = read('cli.mjs')
 const tmpl = read('cmd_council.template.sh')
 
-for (const [tok, body, delim] of [['__ENGINE_MJS__', engine, 'COUNCIL_ENGINE_MJS'], ['__CLI_MJS__', cli, 'COUNCIL_CLI_MJS']]) {
+for (const [tok, body, delim] of [['__CONSTITUTION_MJS__', kernel, 'COUNCIL_CONSTITUTION_MJS'], ['__ENGINE_MJS__', engine, 'COUNCIL_ENGINE_MJS'], ['__CLI_MJS__', cli, 'COUNCIL_CLI_MJS']]) {
   if (body.split('\n').some(l => l === delim)) { console.error(`refuse: ${delim} appears on its own line inside the embedded module`); process.exit(1) }
   // The marker sits on its own line; drop the trailing newline of the file so the
   // heredoc closes cleanly on the next line.
@@ -26,4 +32,4 @@ for (const [tok, body, delim] of [['__ENGINE_MJS__', engine, 'COUNCIL_ENGINE_MJS
 
 const dest = path.join(here, '..', 'cmd_council.sh')
 fs.writeFileSync(dest, out)
-console.error(`wrote ${dest} (${out.length} bytes; engine ${engine.length} + cli ${cli.length} embedded)`)
+console.error(`wrote ${dest} (${out.length} bytes; constitution ${kernel.length} + engine ${engine.length} + cli ${cli.length} embedded)`)

@@ -190,11 +190,11 @@ done
 #     wholesale (DIVE-1695/2301), the loaded terms are matched unqualified —
 #     otherwise this change would silently weaken a hard class an org sealed. --
 printf 'hard_gates: {}\n' > "$TMP/constitution.yaml"
-_council_constitution_path() { printf '%s' "$TMP/constitution.yaml"; }
-_council_hard_gate_rx()      { printf 'price|press'; }
+_constitution_path() { printf '%s' "$TMP/constitution.yaml"; }
+_constitution_hard_gate_rx()      { printf 'price|press'; }
 floor_t "T6 a constitution-loaded 'price' floors with NO spend signal" \
   "the board shows no price for that model"
-unset -f _council_constitution_path _council_hard_gate_rx
+unset -f _constitution_path _constitution_hard_gate_rx
 clean_t "T6 and the shipped default is contextual again once the policy is gone" \
   "the board shows no price for that model"
 
