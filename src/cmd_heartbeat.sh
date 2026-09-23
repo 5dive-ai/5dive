@@ -3288,6 +3288,21 @@ _hb_reclaim_to_todo() {
     actor="$name" authority="dispatcher" \
     idem="task.reclaimed|${id}|${now_stamp}" \
     detail="$_detail" || true
+  # DIVE-4866: the reaper's kill as a receipt (stuck). Counters and a reason
+  # class only, never transcript text (main's review, change 3). Additive only;
+  # see src/lib/reflex.sh.
+  local _rx_reason _rx_age="" _rx_now _rx_then
+  _rx_reason=$(reflex_reap_reason_class "$why" 2>/dev/null) || _rx_reason="other"
+  _rx_now=$(date -u +%s 2>/dev/null) || _rx_now=""
+  _rx_then=$(date -u -d "${prev_started:-x} UTC" +%s 2>/dev/null) || _rx_then=""
+  [[ "$_rx_now" =~ ^[0-9]+$ && "$_rx_then" =~ ^[0-9]+$ ]] && _rx_age=$(( (_rx_now - _rx_then) / 60 ))
+  # authority=dispatcher, as on task.reclaimed above: without it the reaper's own
+  # receipt reads as the reaped seat's work to _hb_seat_advanced.
+  reflex_receipt policy=stuck ident="$(_hb_ident "$id" 2>/dev/null)" task_id="$id" actor="$name" authority="dispatcher" \
+    result="reclaim" candidates="leave,reclaim" \
+    signals="$(jq -cn --arg r "$_rx_reason" --arg a "${_rx_age:-}" --arg m "$mode" '{reason:$r, claim_age_min:($a|tonumber? // null), mode:$m}' 2>/dev/null)" \
+    effect="$(jq -cn --arg t "$(_hb_ident "$id" 2>/dev/null)" --arg s "$name" '{task:$t, seat:$s, to:"todo"}' 2>/dev/null)" \
+    2>/dev/null || true
   # DIVE-3932 acceptance: A CRASH MUST LEAVE A FAILED RUN, NOT NO RUN. This sweep
   # is where an attempt that died without reaching any boundary is finally
   # observed — the process is gone, so nothing on the seat's side can close its
