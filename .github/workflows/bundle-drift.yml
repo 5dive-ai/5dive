@@ -54,10 +54,19 @@ jobs:
       # sha256sum-vs-5dive.sha256 and a re-seal both pass on such a commit too,
       # because they grade the artifact against its OWN recorded checksum and
       # never against what src produces.
+      # DIVE-4869: src/constitution_kernel.sh is generated the same way, by
+      # src/constitution/gen_kernel.mjs, and carries the same hazard.
       - name: Regenerate generated sources
-        run: node src/council/gen_cmd.mjs
+        run: node src/council/gen_cmd.mjs && node src/constitution/gen_kernel.mjs
       - name: Fail if a GENERATED source was hand-edited
         run: |
+          if ! git diff --exit-code src/constitution_kernel.sh; then
+            echo
+            echo "ERROR: src/constitution_kernel.sh does not match what its generator produces."
+            echo "It is GENERATED from src/constitution/{constitution,cli}.mjs + kernel.template.sh."
+            echo "Edit those, then run: node src/constitution/gen_kernel.mjs && ./build.sh"
+            exit 1
+          fi
           if ! git diff --exit-code src/cmd_council.sh; then
             echo
             echo "ERROR: src/cmd_council.sh does not match what its generator produces."

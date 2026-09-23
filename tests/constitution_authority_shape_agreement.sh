@@ -2,7 +2,7 @@
 # DIVE-3493 — the VALIDATOR and the ENFORCING READER must accept the same YAML.
 #
 # `authority.gate_clear_leads` is written through `council amend` / `constitution set`
-# (validated by src/council/engine.mjs, node) and enforced by `_gate_clear_leads`
+# (validated by src/constitution/constitution.mjs, node) and enforced by `_gate_clear_leads`
 # (src/task/need.sh, node-free bash). Before this harness the two accepted DISJOINT
 # subsets: the validator threw `use inline arrays in constitution v0` on a block sequence
 # while the reader returns rc=1 on an inline flow one — so the key could not be set
@@ -34,7 +34,7 @@ STATE_DIR="$TMP"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_council.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh cmd_council.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -57,7 +57,7 @@ validate() {
       const c = E.normalizeConstitution(E.parseConstitutionFrontmatter(readFileSync(process.argv[2], "utf8")))
       process.stdout.write(c.authority.gateClearLeads.join("\n"))
     } catch (e) { process.stdout.write("INVALID " + String(e && e.message || e)) }
-  ' "$PWD/src/council/engine.mjs" "$1" 2>&1
+  ' "$PWD/src/constitution/constitution.mjs" "$1" 2>&1
 }
 # reader: the shipped bash enforcer, against a SEALED copy of the same bytes.
 read_bash() {
@@ -112,7 +112,7 @@ done
 # A3 — the template's own worked example must pass the validator shipping beside it.
 node --input-type=module -e '
   const E = await import(process.argv[1]); process.stdout.write(E.renderConstitutionV0())
-' "$PWD/src/council/engine.mjs" > "$TMP/rendered.yaml" 2>/dev/null
+' "$PWD/src/constitution/constitution.mjs" > "$TMP/rendered.yaml" 2>/dev/null
 # The example is commented out in the template, so strip exactly the comment marker and
 # the one indent level the comment adds — relative indentation is the thing under test.
 tmpl="$(grep -A2 '^#       gate_clear_leads:$' "$TMP/rendered.yaml" | sed 's/^#     //')"
@@ -226,8 +226,8 @@ mutant_validate() {
 # $1 label · $2 sed program · $3 document · $4 expected output
 mutate_and_expect() {
   local label="$1" prog="$2" docf="$3" want="$4" m="$TMP/mutant.$RANDOM.mjs" got
-  sed "$prog" src/council/engine.mjs > "$m"
-  if cmp -s "$m" src/council/engine.mjs; then
+  sed "$prog" src/constitution/constitution.mjs > "$m"
+  if cmp -s "$m" src/constitution/constitution.mjs; then
     bad_t "A8 mutation '$label' DID NOT APPLY" "the mutant is byte-identical to the validator under test — this arm proves nothing, and a mutation that silently missed looks exactly like a passing test"
     return
   fi

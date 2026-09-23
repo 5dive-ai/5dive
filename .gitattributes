@@ -31,3 +31,4 @@
 # ──────────────────────────────────────────────────────────────────────────────
 5dive              -merge
 src/cmd_council.sh -merge
+src/constitution_kernel.sh -merge

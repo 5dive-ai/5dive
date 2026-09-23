@@ -244,227 +244,18 @@ COUNCIL_HELP
 
 _council_write_runtime() {
   local dir="$1"
-  cat > "$dir/engine.mjs" <<'COUNCIL_ENGINE_MJS'
-// The Council — standalone deliberation engine (CNCL-6, v0.11). Seats call the model API
-// directly via the injectable `modelCall` adapter (Anthropic Messages shape by default, a
-// {baseUrl,model,apiKey} config seam for a BYO/OpenRouter key later). No Workflow harness,
-// no `agent()` global. Invariant: a council NEVER self-clears a hard-gate class (tier>=2 or
-// a human-only type) — it escalates, fail-closed on a missing tier.
+  # DIVE-4869: engine.mjs imports the core constitution kernel; materialize it beside the engine.
+  cat > "$dir/constitution.mjs" <<'COUNCIL_CONSTITUTION_MJS'
+// The constitution kernel (DIVE-4869). CORE-owned: the one parser for constitution.yaml —
+// hard-gate classes, thresholds, veto windows, standing authorities — plus the digests the
+// sealed-drift check compares. It lives outside src/council/ because `task need`'s tier-2 floor
+// and its lead-clear authority read it on every box, with or without the council deliberation
+// engine. engine.mjs re-exports everything here, so council callers see no change and there is
+// still exactly ONE parser. Moved verbatim from engine.mjs; edit it here, then re-run
+// `node src/council/gen_cmd.mjs` and `node src/constitution/gen_kernel.mjs`.
 
-import { createHash, generateKeyPairSync, sign as edSign, verify as edVerify, createPrivateKey, createPublicKey } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
-
-export const HUMAN_ONLY_TYPES = ['secret', 'approval', 'manual', 'access']
-
-// Escalate-only guardrail, shared by the gate (P1), verifier + node (P2) roles.
-// tier>=2 or a human-only type is never council-decidable; a missing tier fails closed.
-export function guardrail(x) {
-  const tier = Number(x.tier == null ? 2 : x.tier)
-  if (tier >= 2) return { forceEscalate: true, reason: `tier-${tier} hard human gate (councils escalate, never self-clear tier>=2)` }
-  if (HUMAN_ONLY_TYPES.includes(x.type)) return { forceEscalate: true, reason: `type=${x.type} is human-only (money/secret/manual/access) — escalate` }
-  return { forceEscalate: false, reason: '' }
-}
-export const gateGuardrail = guardrail   // P1 name
-export const nodeGuardrail = guardrail   // P2 name
-
-export function shellQuote(s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
-export function tallyStr(t) { return `a${t.approve}/r${t.reject}/e${t.escalate}` }
-
-// (P1) GATE-CLEAR: council verdict -> clear the gate, or bump to a human. Never self-clears.
-export function verdictToAction(gate, verdict) {
-  if (verdict && verdict.recommendation === 'approve' && !verdict.escalated) {
-    const value = gate.recommend && gate.recommend !== '-' ? gate.recommend : 'approve'
-    return {
-      action: 'clear',
-      command: `5dive task answer ${gate.ident} --value=${shellQuote(`[council] ${value} (rec=${verdict.recommendation}, tally ${tallyStr(verdict.tally)}, conf ${verdict.confidence})`)}`,
-      value,
-    }
-  }
-  const brief = (verdict && (verdict.brief || verdict.dissent)) || 'Council could not clear; human decision required.'
-  // PRESERVE the original gate type on re-file. Never coerce a human-only type (secret/approval/
-  // manual/access) down to a free-text `decision` — that would re-open a `secret` gate (whose ask
-  // may say "do NOT paste here") as a plain decision and invite the human to paste the secret onto
-  // the fleet-readable board. A human-only escalation stays human-only (CNCL-12 main-gate amendment).
-  const t = gate.type || 'decision'
-  return {
-    action: 'escalate',
-    command: `5dive task need ${gate.ident} --type=${t} --tier=2 --ask=${shellQuote(`[council escalation] ${brief} — original ask: ${gate.ask}`)}`
-      + (gate.recommend && gate.recommend !== '-' ? ` --recommend=${shellQuote(gate.recommend)}` : '')
-      + (gate.options ? ` --options=${shellQuote(gate.options)}` : '')
-      + ` && 5dive task escalate ${gate.ident} --from=council`,
-    brief,
-  }
-}
-
-// (P2a) LOOP VERIFIER: approve -> done | reject -> reject --feedback (stays in the loop) | escalate -> human.
-export function verifierVerdictToAction(task, verdict) {
-  const conf = verdict.confidence, tly = tallyStr(verdict.tally)
-  if (verdict.recommendation === 'approve' && !verdict.escalated) {
-    return {
-      action: 'accept',
-      command: `5dive task done ${task.ident} --result=${shellQuote(`[council verifier] PASS (tally ${tly}, conf ${conf})`)}`,
-    }
-  }
-  if (verdict.recommendation === 'reject' && !verdict.escalated) {
-    const critique = verdict.dissent && verdict.dissent !== 'none' ? verdict.dissent : (verdict.brief || 'Did not meet the acceptance criteria.')
-    return {
-      action: 'reject',
-      command: `5dive task reject ${task.ident} --feedback=${shellQuote(`[council verifier] FAIL (tally ${tly}). FINDING: ${critique}`)} --no-fix=${shellQuote('council tally verdict — the critique above is the finding; the council prescribes no single change (DIVE-4144)')}`,
-    }
-  }
-  const brief = (verdict.brief || verdict.dissent) || 'Council could not grade; human decision required.'
-  const t = task.type && HUMAN_ONLY_TYPES.indexOf(task.type) === -1 ? task.type : 'decision'
-  return {
-    action: 'escalate',
-    command: `5dive task need ${task.ident} --type=${t} --tier=2 --ask=${shellQuote(`[council verifier escalation] ${brief} — original: ${task.ask}`)}`
-      + ` && 5dive task escalate ${task.ident} --from=council`,
-    brief,
-  }
-}
-
-// (P2b) GOAL-DAG DECISION NODE: valid winning branch -> task answer --value | else escalate.
-export function nodeVerdictToDecision(node, verdict) {
-  const opts = (node.options || '').split('|').map(o => o.trim()).filter(Boolean)
-  const choice = verdict.choice
-  const validChoice = choice && opts.length > 0 && opts.indexOf(choice) !== -1
-  if (!verdict.escalated && validChoice) {
-    return {
-      action: 'decide',
-      choice,
-      command: `5dive task answer ${node.ident} --value=${shellQuote(`[council] ${choice} (conf ${verdict.confidence}, tally ${tallyStr(verdict.tally)})`)}`,
-    }
-  }
-  const brief = (verdict.brief || verdict.dissent) || 'Council could not pick a branch; human decision required.'
-  return {
-    action: 'escalate',
-    command: `5dive task need ${node.ident} --type=decision --tier=2 --ask=${shellQuote(`[council node escalation] ${brief} — decision: ${node.question}`)}`
-      + (node.options ? ` --options=${shellQuote(node.options)}` : '')
-      + ` && 5dive task escalate ${node.ident} --from=council`,
-    brief,
-  }
-}
-
-// (CNCL-12) T2 ROT-TRIAGE: a tier-2 gate left unanswered 48h. The council re-briefs it
-// sharper (or, in its brief, recommends a rescope/park to the human) and re-escalates —
-// but it NEVER clears a tier-2 gate. This is the fail-closed rule: tier-2 stays human-only,
-// so this mapping has NO `task answer` branch AT ALL, not even for an `approve` verdict.
-// The load-bearing invariant (asserted in the unit test): `.cleared === false` and the
-// command never contains `task answer`, regardless of what the verdict says.
-export function triageVerdictToAction(gate, verdict) {
-  const brief = (verdict && (verdict.brief || verdict.dissent))
-    || 'Council reviewed the stale gate; the human decision still stands and needs an answer.'
-  // Re-file the SAME type (never downgrade a human-only type to `decision` — see the module note above).
-  const t = gate.type || 'decision'
-  return {
-    action: 'triage-rebrief',
-    cleared: false,
-    command: `5dive task need ${gate.ident} --type=${t} --tier=2 --ask=${shellQuote(`[council triage] ${brief} — original ask: ${gate.ask}`)}`
-      + (gate.recommend && gate.recommend !== '-' ? ` --recommend=${shellQuote(gate.recommend)}` : '')
-      + (gate.options ? ` --options=${shellQuote(gate.options)}` : '')
-      + ` && 5dive task escalate ${gate.ident} --from=council-triage`,
-    brief,
-  }
-}
-
-// (P3.1) STANDING / NAMED COUNCILS — the built-in defaults. The CLI layer persists an
-// editable copy (benches.json) seeded from these; resolveCouncil fails CLOSED on a miss.
-export const STANDING_COUNCILS = {
-  ship: {
-    description: 'Ship-worthiness of a build/diff before it goes live.',
-    mode: 'deliberate',
-    seats: [
-      { id: 'reviewer', lens: 'Review, correctness, ship-worthiness. Reversible? Tested? Any regression?' },
-      { id: 'security', lens: 'Injection, blast radius, secrets, auth boundaries.' },
-      { id: 'cost', lens: 'Token + infra spend, capacity/egress, provider concentration.' },
-    ],
-  },
-  brand: {
-    description: 'Customer-facing / brand + messaging call on a mature surface.',
-    mode: 'deliberate',
-    seats: [
-      { id: 'brand', lens: 'Brand + customer read; how it lands, support load.' },
-      { id: 'operator', lens: 'Operational soundness + ship-worthiness.' },
-      { id: 'contrarian', lens: 'Divergent/contrarian; the take everyone is too polite to say.' },
-    ],
-  },
-  security: {
-    description: 'Security-sensitive change (auth, sudo, gate/tamper rails, MCP).',
-    mode: 'adversarial',
-    seats: [
-      { id: 'security', lens: 'Injection, privilege, blast radius, forgeability.' },
-      { id: 'red-team', lens: 'Actively try to REFUTE the leading option / find the bypass.' },
-      { id: 'reviewer', lens: 'Correctness + reversibility of the change.' },
-    ],
-  },
-}
-
-// Fails CLOSED: an unknown bench name is NOT silently defaulted. Pass a registry map to
-// resolve against a persisted copy; defaults to the built-ins. Returns null on a miss.
-export function resolveCouncil(name, registry = STANDING_COUNCILS) {
-  if (!name) return null
-  const c = registry[name]
-  if (!c) return null
-  return { name, description: c.description, mode: c.mode, seats: c.seats }
-}
-
-// (P3.1b) THE default Council: a self-governed standing body, one vote each. Seat count is
-// UNBOUNDED and the roster is MUTABLE (addSeat/removeSeat, gated at the CLI layer by a real
-// convene). These 5 are the STARTING membership, not a cap or a fixed roster.
-export const DEFAULT_COUNCIL = {
-  name: 'council', description: 'The 5dive Council — self-governed standing body, one vote each. Seats mutable by quorum vote.',
-  mode: 'deliberate', threshold: 3, thresholdRule: 'flat',
-  seats: [
-    { id: 'eng-lead', lens: 'Engineering lead. Correctness, ship-worthiness, reversibility.' },
-    { id: 'brand', lens: 'Brand + customer read; how it lands publicly.' },
-    { id: 'builder', lens: 'Implementation soundness, edge cases, blast radius.' },
-    { id: 'strategy', lens: 'Strategic fit, organizational priorities, risk appetite.' },
-    { id: 'contrarian', lens: 'Divergent view; the objection everyone is too polite to raise.' },
-  ],
-}
-
-// (CNCL-16) SEAT ID vs REGISTRY AGENT. A seat `id` is a PERSONA; `5dive agent ask` dispatches to
-// a REGISTRY NAME, not always the same string (persona 'theo' is the 'marketing' agent). A seat
-// MAY carry an explicit `agent` (canonical, wins); else this alias map; else the id IS the name.
-export const SEAT_AGENT_ALIAS = { theo: 'marketing', lilbro: 'creative' }
-export function resolveSeatAgent(seat) {
-  if (!seat) return ''
-  if (typeof seat === 'string') return SEAT_AGENT_ALIAS[seat] || seat
-  if (seatIsHuman(seat)) return ''   // (DIVE-1563) a human seat is a principal, never dispatched as a registry agent
-  if (seat.agent && typeof seat.agent === 'string') return seat.agent
-  return SEAT_AGENT_ALIAS[seat.id] || seat.id
-}
-
-// (DIVE-1563) HUMAN-AS-SEAT SCHEMA. A council seat MAY be a human principal rather than a registry
-// agent — marked `{ kind: 'human' }` (or `human: true`) with a chat/principal binding naming which
-// Telegram chat the ballot goes to + whose allowFrom the tap is authenticated against (DIVE-1564
-// branches on seatIsHuman to emit a ballot instead of an agent-directed ask). PURELY ADDITIVE +
-// back-compat: a bare-string or existing {id, agent?, lens?} seat is NEVER human, needs zero
-// migration, and serializes byte-identical (canonicalGenesis/canonicalMotion seal only id/chair/lens).
-export function seatIsHuman(seat) {
-  return !!seat && typeof seat === 'object' && (seat.kind === 'human' || seat.human === true)
-}
-// The chat/principal a human seat's ballot is delivered to + authenticated against. An explicit
-// `chat` (a resolved tg chat/user id) wins; else a resolvable `principal` string (e.g. 'human:main')
-// the bash/plugin layer resolves via the DIVE-1546 founder resolver. Returns '' for a non-human OR an
-// unbound human seat — dispatch (DIVE-1564) must fail closed on '' and never silently drop the ballot.
-export function resolveSeatChat(seat) {
-  if (!seatIsHuman(seat)) return ''
-  if (seat.chat != null && String(seat.chat).trim()) return String(seat.chat).trim()
-  if (seat.principal && typeof seat.principal === 'string' && seat.principal.trim()) return seat.principal.trim()
-  return ''
-}
-// The extra record fields a HUMAN seat carries beyond {id,lens,chair}. Empty {} for an agent seat, so
-// spreading it into a seat projection is a no-op for all-agent rosters (seal + JSON both unchanged).
-// Applied at every seat->record projection (addSeat + genesis/motion/bench serializers) so a promoted
-// human seat keeps its marker across reloads instead of silently reverting to an agent.
-export function humanSeatFields(seat) {
-  if (!seatIsHuman(seat)) return {}
-  const f = { kind: 'human' }
-  const chat = resolveSeatChat(seat)
-  if (chat) f.chat = chat
-  return f
-}
-export const DEFAULT_THRESHOLD = 3   // default flat pass-threshold; overridable per bench
 
 // (P3.1b2) TIERED THRESHOLD POLICY. Per decision-CLASS pass rule + quorum, all config. A rule is
 // 'flat' (fixed N), 'majority' (floor(seats/2)+1), or 'fraction' (ceil(value*seats), e.g. 2/3).
@@ -929,6 +720,235 @@ export function loadConstitution(path, readFile = p => fs.readFileSync(p, 'utf8'
     return withDigests(normalizeConstitution({}), '', { source: 'defaults', path, valid: false, error: String(e && e.message || e) })
   }
 }
+COUNCIL_CONSTITUTION_MJS
+  cat > "$dir/engine.mjs" <<'COUNCIL_ENGINE_MJS'
+// The Council — standalone deliberation engine (CNCL-6, v0.11). Seats call the model API
+// directly via the injectable `modelCall` adapter (Anthropic Messages shape by default, a
+// {baseUrl,model,apiKey} config seam for a BYO/OpenRouter key later). No Workflow harness,
+// no `agent()` global. Invariant: a council NEVER self-clears a hard-gate class (tier>=2 or
+// a human-only type) — it escalates, fail-closed on a missing tier.
+
+import { createHash, generateKeyPairSync, sign as edSign, verify as edVerify, createPrivateKey, createPublicKey } from 'node:crypto'
+import fs from 'node:fs'
+
+export const HUMAN_ONLY_TYPES = ['secret', 'approval', 'manual', 'access']
+
+// Escalate-only guardrail, shared by the gate (P1), verifier + node (P2) roles.
+// tier>=2 or a human-only type is never council-decidable; a missing tier fails closed.
+export function guardrail(x) {
+  const tier = Number(x.tier == null ? 2 : x.tier)
+  if (tier >= 2) return { forceEscalate: true, reason: `tier-${tier} hard human gate (councils escalate, never self-clear tier>=2)` }
+  if (HUMAN_ONLY_TYPES.includes(x.type)) return { forceEscalate: true, reason: `type=${x.type} is human-only (money/secret/manual/access) — escalate` }
+  return { forceEscalate: false, reason: '' }
+}
+export const gateGuardrail = guardrail   // P1 name
+export const nodeGuardrail = guardrail   // P2 name
+
+export function shellQuote(s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
+export function tallyStr(t) { return `a${t.approve}/r${t.reject}/e${t.escalate}` }
+
+// (P1) GATE-CLEAR: council verdict -> clear the gate, or bump to a human. Never self-clears.
+export function verdictToAction(gate, verdict) {
+  if (verdict && verdict.recommendation === 'approve' && !verdict.escalated) {
+    const value = gate.recommend && gate.recommend !== '-' ? gate.recommend : 'approve'
+    return {
+      action: 'clear',
+      command: `5dive task answer ${gate.ident} --value=${shellQuote(`[council] ${value} (rec=${verdict.recommendation}, tally ${tallyStr(verdict.tally)}, conf ${verdict.confidence})`)}`,
+      value,
+    }
+  }
+  const brief = (verdict && (verdict.brief || verdict.dissent)) || 'Council could not clear; human decision required.'
+  // PRESERVE the original gate type on re-file. Never coerce a human-only type (secret/approval/
+  // manual/access) down to a free-text `decision` — that would re-open a `secret` gate (whose ask
+  // may say "do NOT paste here") as a plain decision and invite the human to paste the secret onto
+  // the fleet-readable board. A human-only escalation stays human-only (CNCL-12 main-gate amendment).
+  const t = gate.type || 'decision'
+  return {
+    action: 'escalate',
+    command: `5dive task need ${gate.ident} --type=${t} --tier=2 --ask=${shellQuote(`[council escalation] ${brief} — original ask: ${gate.ask}`)}`
+      + (gate.recommend && gate.recommend !== '-' ? ` --recommend=${shellQuote(gate.recommend)}` : '')
+      + (gate.options ? ` --options=${shellQuote(gate.options)}` : '')
+      + ` && 5dive task escalate ${gate.ident} --from=council`,
+    brief,
+  }
+}
+
+// (P2a) LOOP VERIFIER: approve -> done | reject -> reject --feedback (stays in the loop) | escalate -> human.
+export function verifierVerdictToAction(task, verdict) {
+  const conf = verdict.confidence, tly = tallyStr(verdict.tally)
+  if (verdict.recommendation === 'approve' && !verdict.escalated) {
+    return {
+      action: 'accept',
+      command: `5dive task done ${task.ident} --result=${shellQuote(`[council verifier] PASS (tally ${tly}, conf ${conf})`)}`,
+    }
+  }
+  if (verdict.recommendation === 'reject' && !verdict.escalated) {
+    const critique = verdict.dissent && verdict.dissent !== 'none' ? verdict.dissent : (verdict.brief || 'Did not meet the acceptance criteria.')
+    return {
+      action: 'reject',
+      command: `5dive task reject ${task.ident} --feedback=${shellQuote(`[council verifier] FAIL (tally ${tly}). FINDING: ${critique}`)} --no-fix=${shellQuote('council tally verdict — the critique above is the finding; the council prescribes no single change (DIVE-4144)')}`,
+    }
+  }
+  const brief = (verdict.brief || verdict.dissent) || 'Council could not grade; human decision required.'
+  const t = task.type && HUMAN_ONLY_TYPES.indexOf(task.type) === -1 ? task.type : 'decision'
+  return {
+    action: 'escalate',
+    command: `5dive task need ${task.ident} --type=${t} --tier=2 --ask=${shellQuote(`[council verifier escalation] ${brief} — original: ${task.ask}`)}`
+      + ` && 5dive task escalate ${task.ident} --from=council`,
+    brief,
+  }
+}
+
+// (P2b) GOAL-DAG DECISION NODE: valid winning branch -> task answer --value | else escalate.
+export function nodeVerdictToDecision(node, verdict) {
+  const opts = (node.options || '').split('|').map(o => o.trim()).filter(Boolean)
+  const choice = verdict.choice
+  const validChoice = choice && opts.length > 0 && opts.indexOf(choice) !== -1
+  if (!verdict.escalated && validChoice) {
+    return {
+      action: 'decide',
+      choice,
+      command: `5dive task answer ${node.ident} --value=${shellQuote(`[council] ${choice} (conf ${verdict.confidence}, tally ${tallyStr(verdict.tally)})`)}`,
+    }
+  }
+  const brief = (verdict.brief || verdict.dissent) || 'Council could not pick a branch; human decision required.'
+  return {
+    action: 'escalate',
+    command: `5dive task need ${node.ident} --type=decision --tier=2 --ask=${shellQuote(`[council node escalation] ${brief} — decision: ${node.question}`)}`
+      + (node.options ? ` --options=${shellQuote(node.options)}` : '')
+      + ` && 5dive task escalate ${node.ident} --from=council`,
+    brief,
+  }
+}
+
+// (CNCL-12) T2 ROT-TRIAGE: a tier-2 gate left unanswered 48h. The council re-briefs it
+// sharper (or, in its brief, recommends a rescope/park to the human) and re-escalates —
+// but it NEVER clears a tier-2 gate. This is the fail-closed rule: tier-2 stays human-only,
+// so this mapping has NO `task answer` branch AT ALL, not even for an `approve` verdict.
+// The load-bearing invariant (asserted in the unit test): `.cleared === false` and the
+// command never contains `task answer`, regardless of what the verdict says.
+export function triageVerdictToAction(gate, verdict) {
+  const brief = (verdict && (verdict.brief || verdict.dissent))
+    || 'Council reviewed the stale gate; the human decision still stands and needs an answer.'
+  // Re-file the SAME type (never downgrade a human-only type to `decision` — see the module note above).
+  const t = gate.type || 'decision'
+  return {
+    action: 'triage-rebrief',
+    cleared: false,
+    command: `5dive task need ${gate.ident} --type=${t} --tier=2 --ask=${shellQuote(`[council triage] ${brief} — original ask: ${gate.ask}`)}`
+      + (gate.recommend && gate.recommend !== '-' ? ` --recommend=${shellQuote(gate.recommend)}` : '')
+      + (gate.options ? ` --options=${shellQuote(gate.options)}` : '')
+      + ` && 5dive task escalate ${gate.ident} --from=council-triage`,
+    brief,
+  }
+}
+
+// (P3.1) STANDING / NAMED COUNCILS — the built-in defaults. The CLI layer persists an
+// editable copy (benches.json) seeded from these; resolveCouncil fails CLOSED on a miss.
+export const STANDING_COUNCILS = {
+  ship: {
+    description: 'Ship-worthiness of a build/diff before it goes live.',
+    mode: 'deliberate',
+    seats: [
+      { id: 'reviewer', lens: 'Review, correctness, ship-worthiness. Reversible? Tested? Any regression?' },
+      { id: 'security', lens: 'Injection, blast radius, secrets, auth boundaries.' },
+      { id: 'cost', lens: 'Token + infra spend, capacity/egress, provider concentration.' },
+    ],
+  },
+  brand: {
+    description: 'Customer-facing / brand + messaging call on a mature surface.',
+    mode: 'deliberate',
+    seats: [
+      { id: 'brand', lens: 'Brand + customer read; how it lands, support load.' },
+      { id: 'operator', lens: 'Operational soundness + ship-worthiness.' },
+      { id: 'contrarian', lens: 'Divergent/contrarian; the take everyone is too polite to say.' },
+    ],
+  },
+  security: {
+    description: 'Security-sensitive change (auth, sudo, gate/tamper rails, MCP).',
+    mode: 'adversarial',
+    seats: [
+      { id: 'security', lens: 'Injection, privilege, blast radius, forgeability.' },
+      { id: 'red-team', lens: 'Actively try to REFUTE the leading option / find the bypass.' },
+      { id: 'reviewer', lens: 'Correctness + reversibility of the change.' },
+    ],
+  },
+}
+
+// Fails CLOSED: an unknown bench name is NOT silently defaulted. Pass a registry map to
+// resolve against a persisted copy; defaults to the built-ins. Returns null on a miss.
+export function resolveCouncil(name, registry = STANDING_COUNCILS) {
+  if (!name) return null
+  const c = registry[name]
+  if (!c) return null
+  return { name, description: c.description, mode: c.mode, seats: c.seats }
+}
+
+// (P3.1b) THE default Council: a self-governed standing body, one vote each. Seat count is
+// UNBOUNDED and the roster is MUTABLE (addSeat/removeSeat, gated at the CLI layer by a real
+// convene). These 5 are the STARTING membership, not a cap or a fixed roster.
+export const DEFAULT_COUNCIL = {
+  name: 'council', description: 'The 5dive Council — self-governed standing body, one vote each. Seats mutable by quorum vote.',
+  mode: 'deliberate', threshold: 3, thresholdRule: 'flat',
+  seats: [
+    { id: 'eng-lead', lens: 'Engineering lead. Correctness, ship-worthiness, reversibility.' },
+    { id: 'brand', lens: 'Brand + customer read; how it lands publicly.' },
+    { id: 'builder', lens: 'Implementation soundness, edge cases, blast radius.' },
+    { id: 'strategy', lens: 'Strategic fit, organizational priorities, risk appetite.' },
+    { id: 'contrarian', lens: 'Divergent view; the objection everyone is too polite to raise.' },
+  ],
+}
+
+// (CNCL-16) SEAT ID vs REGISTRY AGENT. A seat `id` is a PERSONA; `5dive agent ask` dispatches to
+// a REGISTRY NAME, not always the same string (persona 'theo' is the 'marketing' agent). A seat
+// MAY carry an explicit `agent` (canonical, wins); else this alias map; else the id IS the name.
+export const SEAT_AGENT_ALIAS = { theo: 'marketing', lilbro: 'creative' }
+export function resolveSeatAgent(seat) {
+  if (!seat) return ''
+  if (typeof seat === 'string') return SEAT_AGENT_ALIAS[seat] || seat
+  if (seatIsHuman(seat)) return ''   // (DIVE-1563) a human seat is a principal, never dispatched as a registry agent
+  if (seat.agent && typeof seat.agent === 'string') return seat.agent
+  return SEAT_AGENT_ALIAS[seat.id] || seat.id
+}
+
+// (DIVE-1563) HUMAN-AS-SEAT SCHEMA. A council seat MAY be a human principal rather than a registry
+// agent — marked `{ kind: 'human' }` (or `human: true`) with a chat/principal binding naming which
+// Telegram chat the ballot goes to + whose allowFrom the tap is authenticated against (DIVE-1564
+// branches on seatIsHuman to emit a ballot instead of an agent-directed ask). PURELY ADDITIVE +
+// back-compat: a bare-string or existing {id, agent?, lens?} seat is NEVER human, needs zero
+// migration, and serializes byte-identical (canonicalGenesis/canonicalMotion seal only id/chair/lens).
+export function seatIsHuman(seat) {
+  return !!seat && typeof seat === 'object' && (seat.kind === 'human' || seat.human === true)
+}
+// The chat/principal a human seat's ballot is delivered to + authenticated against. An explicit
+// `chat` (a resolved tg chat/user id) wins; else a resolvable `principal` string (e.g. 'human:main')
+// the bash/plugin layer resolves via the DIVE-1546 founder resolver. Returns '' for a non-human OR an
+// unbound human seat — dispatch (DIVE-1564) must fail closed on '' and never silently drop the ballot.
+export function resolveSeatChat(seat) {
+  if (!seatIsHuman(seat)) return ''
+  if (seat.chat != null && String(seat.chat).trim()) return String(seat.chat).trim()
+  if (seat.principal && typeof seat.principal === 'string' && seat.principal.trim()) return seat.principal.trim()
+  return ''
+}
+// The extra record fields a HUMAN seat carries beyond {id,lens,chair}. Empty {} for an agent seat, so
+// spreading it into a seat projection is a no-op for all-agent rosters (seal + JSON both unchanged).
+// Applied at every seat->record projection (addSeat + genesis/motion/bench serializers) so a promoted
+// human seat keeps its marker across reloads instead of silently reverting to an agent.
+export function humanSeatFields(seat) {
+  if (!seatIsHuman(seat)) return {}
+  const f = { kind: 'human' }
+  const chat = resolveSeatChat(seat)
+  if (chat) f.chat = chat
+  return f
+}
+export const DEFAULT_THRESHOLD = 3   // default flat pass-threshold; overridable per bench
+
+// DIVE-4869: the constitution block (THRESHOLD_POLICY through loadConstitution) moved to the core
+// kernel, src/constitution/constitution.mjs, so the gate floor can read it without this engine.
+// Re-exported unchanged: every `E.<name>` caller and test keeps working, and it is still ONE parser.
+// gen_cmd.mjs rewrites this specifier to './constitution.mjs' in the embedded runtime.
+import { THRESHOLD_POLICY, DEFAULT_HARD_GATE_CLASSES, DEFAULT_HARD_GATE_RX, CONSTITUTION_SCHEMA_VERSION, digestConstitution, canonicalPolicyJSON, policyDigest, constitutionDriftCheck, renderConstitutionV0, DEFAULT_CONSTITUTION, parseConstitutionFrontmatter, normalizeConstitution, loadConstitution } from './constitution.mjs'
+export { THRESHOLD_POLICY, DEFAULT_HARD_GATE_CLASSES, DEFAULT_HARD_GATE_RX, CONSTITUTION_SCHEMA_VERSION, digestConstitution, canonicalPolicyJSON, policyDigest, constitutionDriftCheck, renderConstitutionV0, DEFAULT_CONSTITUTION, parseConstitutionFrontmatter, normalizeConstitution, loadConstitution }
 
 // Resolve the numeric pass-threshold for a roster from a spec. 'flat' (fixed N, clamped to
 // the roster), 'majority' (floor/2+1), 'fraction' (ceil(value*seats)). Never hardcoded.

@@ -45,7 +45,12 @@ function extractHeredoc(sh, delim) {
   return lines.slice(start + 1, end).join('\n')
 }
 const shipped = R('src/cmd_council.sh')
-ok('engine embed matches canonical', extractHeredoc(shipped, 'COUNCIL_ENGINE_MJS') === R('src/council/engine.mjs').replace(/\n$/, ''))
+// DIVE-4869: the engine imports the core constitution kernel by a source-tree path; the embed
+// rewrites that one specifier to the flat runtime dir's sibling and carries the kernel beside it.
+const KERNEL_SPEC = "from '../constitution/constitution.mjs'"
+ok('engine source imports the core constitution kernel', R('src/council/engine.mjs').includes(KERNEL_SPEC))
+ok('engine embed matches canonical', extractHeredoc(shipped, 'COUNCIL_ENGINE_MJS') === R('src/council/engine.mjs').split(KERNEL_SPEC).join("from './constitution.mjs'").replace(/\n$/, ''))
+ok('constitution kernel embed matches canonical', extractHeredoc(shipped, 'COUNCIL_CONSTITUTION_MJS') === R('src/constitution/constitution.mjs').replace(/\n$/, ''))
 ok('cli embed matches canonical', extractHeredoc(shipped, 'COUNCIL_CLI_MJS') === R('src/council/cli.mjs').replace(/\n$/, ''))
 execFileSync('node', [path.join(root, 'src/council/gen_cmd.mjs')], { stdio: 'ignore' })
 ok('gen_cmd reproducible (clean tree)', R('src/cmd_council.sh') === shipped)

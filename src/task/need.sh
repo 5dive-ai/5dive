@@ -622,15 +622,16 @@ _gate_floor_capability_class() {
 _gate_tier2_floor_hit() {
   local text floor_rx="$_GATE_T2_FLOOR_RX" loaded_rx="" constitution_path="" ere_rc=0
   text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-  # CNCL-14: production bundles include the council loader later in the file;
+  # CNCL-14: production bundles include the constitution loader later in the file
+  # (DIVE-4869: the core kernel, src/constitution_kernel.sh — not the council engine);
   # isolated task tests that source cmd_task alone retain the byte-identical
   # legacy regex. The overwhelmingly common no-file path must stay in-process:
   # do not start Node or materialize the embedded council runtime merely to
   # rediscover the same default. A present-but-malformed file still goes through
   # the loader and atomically resolves to the legacy regex.
-  if declare -F _council_hard_gate_rx >/dev/null 2>&1 \
-     && declare -F _council_constitution_path >/dev/null 2>&1; then
-    constitution_path="$(_council_constitution_path 2>/dev/null || true)"
+  if declare -F _constitution_hard_gate_rx >/dev/null 2>&1 \
+     && declare -F _constitution_path >/dev/null 2>&1; then
+    constitution_path="$(_constitution_path 2>/dev/null || true)"
     if [[ -n "$constitution_path" && -f "$constitution_path" ]]; then
       # DIVE-1695: the on-disk constitution is trusted for the human-gate floor
       # ONLY when it matches the digest SEALED into the council lineage. The
@@ -640,11 +641,11 @@ _gate_tier2_floor_hit() {
       # defaults, the exact verdict `council verify`/`convene` reach on drift.
       # No seal in the lineage yet (pre-constitution org) leaves CNCL-14 behavior
       # unchanged: the present file is loaded as before.
-      if declare -F _council_constitution_drifted >/dev/null 2>&1 \
-         && _council_constitution_drifted; then
+      if declare -F _constitution_drifted >/dev/null 2>&1 \
+         && _constitution_drifted; then
         warn "constitution.yaml drifted from the sealed digest; enforcing the shipped tier-2 floor, not the on-disk file (amend via a constitutional-class council motion) (${constitution_path})"
       else
-        loaded_rx="$(_council_hard_gate_rx 2>/dev/null || true)"
+        loaded_rx="$(_constitution_hard_gate_rx 2>/dev/null || true)"
         if [[ -n "$loaded_rx" ]]; then
           floor_rx="$loaded_rx"
           # CNCL-28: engine.mjs can reject known JS-only syntax, but Bash is the
@@ -1087,7 +1088,7 @@ _gate_access_lead_clearable() {
 # the DIVE-1695 precedent, already load-bearing for the tier-2 hard-gate floor a
 # few hundred lines up: the file is forgeable, the chain is not. An agent CAN
 # `sudo` a new name into constitution.yaml — and the moment it does, the live
-# sha256 stops matching the sealed one, `_council_constitution_drifted` says
+# sha256 stops matching the sealed one, `_constitution_drifted` says
 # DRIFTED, and this function denies EVERYONE, including the name that was there
 # before. Re-sealing is a constitutional-class council motion (2/3 + full quorum +
 # founder veto), which no agent can convene against itself. So the write is not
@@ -1106,7 +1107,7 @@ _gate_access_lead_clearable() {
 # the chart after filing and the clear must still be refused.
 _GATE_STANDING_LEAD_NAME_RX='^[a-z0-9][a-z0-9_-]{0,31}$'
 # Node-free reader for the one constitution field this authority needs, mirroring
-# `_council_constitution_drifted`'s reason for existing: the gate path must not
+# `_constitution_drifted`'s reason for existing: the gate path must not
 # spin up the Node runtime (and must stay testable when cmd_task.sh is sourced
 # alone). Deliberately a STRICT subset of YAML — a top-level `authority:` block
 # and a scalar `eng_approval_lead:` inside it. Anything it cannot parse reads as
@@ -1141,17 +1142,17 @@ _gate_constitution_standing_lead() {
 }
 # _gate_standing_lead -> prints the named holder on stdout, or nothing + rc 1.
 _gate_standing_lead() {
-  declare -F _council_constitution_path >/dev/null 2>&1 || return 1
-  declare -F _council_sealed_constitution_digest >/dev/null 2>&1 || return 1
-  declare -F _council_constitution_drifted >/dev/null 2>&1 || return 1
+  declare -F _constitution_path >/dev/null 2>&1 || return 1
+  declare -F _constitution_sealed_digest >/dev/null 2>&1 || return 1
+  declare -F _constitution_drifted >/dev/null 2>&1 || return 1
   # A constitution that was never sealed carries no authority: without a lineage
   # record to drift FROM, the file is exactly as writable as the org chart, and
   # anchoring to it would reproduce the self-grant path in a different file.
-  local sealed; sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
+  local sealed; sealed="$(_constitution_sealed_digest 2>/dev/null || true)"
   [[ -n "$sealed" ]] || return 1
   # Sealed but the live bytes differ (or the file is gone) -> deny everyone.
-  ! _council_constitution_drifted || return 1
-  local path; path="$(_council_constitution_path 2>/dev/null || true)"
+  ! _constitution_drifted || return 1
+  local path; path="$(_constitution_path 2>/dev/null || true)"
   local name; name="$(_gate_constitution_standing_lead "$path" 2>/dev/null || true)"
   # A plain agent name only. Rejecting `human:main`, `*`, `all`, a path or a shell
   # metacharacter keeps this a name comparison and nothing more.
@@ -1186,7 +1187,7 @@ _gate_standing_lead() {
 #
 # The seal is what carries the property, same as DIVE-2099: an agent CAN sudo a new name
 # into constitution.yaml, and the moment it does the live sha256 stops matching the digest
-# sealed in the council lineage, `_council_constitution_drifted` says DRIFTED, and this
+# sealed in the council lineage, `_constitution_drifted` says DRIFTED, and this
 # returns EMPTY — denying every lead including the legitimate ones. Re-sealing is a
 # constitutional-class motion (2/3 + full quorum + founder veto) no agent convenes against
 # itself. The write is not prevented, it is made self-defeating.
@@ -1254,15 +1255,15 @@ _gate_constitution_clear_leads() {
 # _gate_clear_leads -> prints the sealed allowlist, one name per line, or nothing + rc 1.
 # Same fail-closed chain as _gate_standing_lead, for the same reasons.
 _gate_clear_leads() {
-  declare -F _council_constitution_path >/dev/null 2>&1 || return 1
-  declare -F _council_sealed_constitution_digest >/dev/null 2>&1 || return 1
-  declare -F _council_constitution_drifted >/dev/null 2>&1 || return 1
+  declare -F _constitution_path >/dev/null 2>&1 || return 1
+  declare -F _constitution_sealed_digest >/dev/null 2>&1 || return 1
+  declare -F _constitution_drifted >/dev/null 2>&1 || return 1
   # Never sealed = the file is exactly as writable as the org chart, so anchoring to it
   # would reproduce the self-grant in a different file.
-  local sealed; sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
+  local sealed; sealed="$(_constitution_sealed_digest 2>/dev/null || true)"
   [[ -n "$sealed" ]] || return 1
-  ! _council_constitution_drifted || return 1
-  local path; path="$(_council_constitution_path 2>/dev/null || true)"
+  ! _constitution_drifted || return 1
+  local path; path="$(_constitution_path 2>/dev/null || true)"
   local names; names="$(_gate_constitution_clear_leads "$path" 2>/dev/null || true)"
   [[ -n "$names" ]] || return 1
   # Validate EVERY entry and refuse the whole list if any one is malformed. Dropping the
@@ -1287,10 +1288,12 @@ _gate_clear_lead_allowed() {
 # completely different responses (convene a motion vs. investigate a self-grant attempt)
 # and are indistinguishable from the gate's behaviour alone.
 _gate_clear_lead_denied_reason() {
-  declare -F _council_sealed_constitution_digest >/dev/null 2>&1 || { printf 'no-council-loader'; return; }
-  local sealed; sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
+  # The reason literal predates DIVE-4869 and is what cmd_selfcheck.sh keys on; the loader it
+  # names is now the core constitution kernel.
+  declare -F _constitution_sealed_digest >/dev/null 2>&1 || { printf 'no-council-loader'; return; }
+  local sealed; sealed="$(_constitution_sealed_digest 2>/dev/null || true)"
   [[ -n "$sealed" ]] || { printf 'constitution-unsealed'; return; }
-  if _council_constitution_drifted 2>/dev/null; then printf 'constitution-drifted'; return; fi
+  if _constitution_drifted 2>/dev/null; then printf 'constitution-drifted'; return; fi
   local names; names="$(_gate_clear_leads 2>/dev/null || true)"
   [[ -n "$names" ]] || { printf 'no-gate-clear-leads-key'; return; }
   printf 'not-a-sealed-lead'
@@ -1525,12 +1528,12 @@ _gate_floor_appeal_residual() {
 _gate_tier2_floor_term() {
   local text rx="$_GATE_T2_FLOOR_RX" loaded=""
   text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-  if declare -F _council_hard_gate_rx >/dev/null 2>&1 \
-     && declare -F _council_constitution_path >/dev/null 2>&1; then
-    local cp; cp="$(_council_constitution_path 2>/dev/null || true)"
+  if declare -F _constitution_hard_gate_rx >/dev/null 2>&1 \
+     && declare -F _constitution_path >/dev/null 2>&1; then
+    local cp; cp="$(_constitution_path 2>/dev/null || true)"
     if [[ -n "$cp" && -f "$cp" ]] \
-       && ! { declare -F _council_constitution_drifted >/dev/null 2>&1 && _council_constitution_drifted; }; then
-      loaded="$(_council_hard_gate_rx 2>/dev/null || true)"
+       && ! { declare -F _constitution_drifted >/dev/null 2>&1 && _constitution_drifted; }; then
+      loaded="$(_constitution_hard_gate_rx 2>/dev/null || true)"
       # Same ERE-validity guard as the floor (CNCL-28): Bash returns 2 for an
       # invalid expression, and this helper must never report a term the floor
       # itself did not use.
