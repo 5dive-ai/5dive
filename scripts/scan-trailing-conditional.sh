@@ -82,6 +82,7 @@ if (( ${#files[@]} == 0 )); then
   # src/council/*.template.sh is in the default set on purpose: src/cmd_council.sh
   # is GENERATED from it, so guarding only the derived artifact is silently
   # reverted by the next regen — the DIVE-2604 lesson, same file pair.
+  # src/constitution/*.template.sh is in it for the same reason (src/constitution_kernel.sh, DIVE-4869).
   # install/update/build are the customer-facing runners that call into these
   # functions (paperclip_seed_all_from_registry is reached from update.sh), and
   # they run under `set -e` themselves.
@@ -89,7 +90,7 @@ if (( ${#files[@]} == 0 )); then
   # ships from elsewhere. An ABSENT default is not the same event as an
   # UNREADABLE argument: the caller naming a file it cannot read is exit 2.
   files=()
-  for f in src/*.sh src/lib/*.sh src/task/*.sh src/council/*.sh scripts/*.sh install.sh update.sh build.sh; do
+  for f in src/*.sh src/lib/*.sh src/task/*.sh src/council/*.sh src/constitution/*.sh scripts/*.sh install.sh update.sh build.sh; do
     [[ -r "$f" ]] && files+=("$f")
   done
   shopt -u nullglob
