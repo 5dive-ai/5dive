@@ -1076,9 +1076,14 @@ JOURNALD
   # pre-expansion command string, so it couldn't see heredoc bodies. The
   # receiver-side userprompt-mirror-inter-agent.sh below replaces it.
   rm -f "$LIB_DIR/mirror-agent-send.sh"
+  # DIVE-4889: the Telegram Stop hook lives in the telegram plugin
+  # (5dive-ai/5dive-plugins plugins/telegram/hooks/stop-reply-check.ts), which
+  # has owned it since plugin 0.4.4. This shell copy was left installed for
+  # pre-fork agents that no longer exist (0 seats wired it, measured
+  # 2026-09-23), and a fix landed in it by mistake (#1005). Shed it.
+  rm -f "$LIB_DIR/stop-telegram-reply-check.sh"
   for hook in stop-failure-telegram.sh resume-after-reset.sh run-loop.sh \
               pretool-telegram-question.sh pretool-headless-question.sh \
-              stop-telegram-reply-check.sh \
               posttool-telegram-relay.sh userprompt-mirror-inter-agent.sh \
               stop-mirror-inter-agent.sh push-notify.sh \
               sessionstart-resume-context.sh; do

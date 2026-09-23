@@ -12,7 +12,8 @@
 #
 # Mid-turn the hook fundamentally can't tell a preamble from a forgotten answer
 # (it can't see whether a reply is still coming later in the turn). So all
-# relay decisions now live in stop-telegram-reply-check.sh, which sees the
+# relay decisions now live in the telegram plugin's Stop hook
+# (5dive-ai/5dive-plugins plugins/telegram/hooks/stop-reply-check.ts), which sees the
 # whole turn and relays transcript text ONLY when no reply/edit_message was
 # sent at all — the genuine "talked to the transcript instead of replying"
 # miss. Anything the agent wants the user to see goes through the
