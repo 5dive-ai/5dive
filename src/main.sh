@@ -945,7 +945,7 @@ _account_verb_dispatch() {
 # Full reasoning: community/wiki/a-deprecation-shim-that-keeps-the-verb-name-blocks-the-plugin-that-replaces-it.md
 _moved_verb_repo() {
   case "$1" in
-    ui)      printf '5dive-ai/5dive-ui\n' ;;
+    ui) printf '5dive-ai/5dive-ui\n' ;;
     council) printf '5dive-ai/5dive-council\n' ;;   # DIVE-4893
     *)  return 1 ;;
   esac
