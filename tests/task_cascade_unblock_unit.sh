@@ -145,35 +145,57 @@ grep -q $'^ops\t' "$SEND_LOG" \
   && ok_t "sweep recovery pings ops" || bad_t "recover ping" "no ops ping"
 
 # --- T7 (b) SURFACE (never auto-unblock): blocked, no edge, no gate, no park
+# DIVE-4826 (#1096) moved this surfacing off the live cmd_send and onto the ops
+# digest spool (one batched notice per window). The send-log grep this arm used
+# to make then read 0 for every row, and the throttle arm below passed VACUOUSLY.
+# It reddened main only at the cut: this harness runs in the FULL tier, which a
+# PR does not run (DIVE-4862). RE-POINTED, NOT RE-WORDED — the observables the
+# deletion kept are the spool row (class blocked-no-reason, carrying the ident)
+# and the blocked_sweep_pinged_at stamp; same move as #1100 for the stall sweep.
+SPOOL="$STATE_DIR/heartbeat-ops-digest.tsv"
+# grep -c prints 0 AND exits 1 on no match, so `|| echo 0` would emit "0\n0";
+# count with grep alone and default only when the file is missing. The ident is
+# anchored on its right edge so DIVE-1 cannot be satisfied by DIVE-14.
+surfaced() {
+  local n
+  n=$(grep -c -E "blocked-no-reason.*$(db "SELECT ident FROM tasks WHERE id=$1;")( |\$)" "$SPOOL" 2>/dev/null)
+  printf '%s' "${n:-0}"
+}
 o=$(addt --assignee=frank -- "orphan blocked")
 db "UPDATE tasks SET status='blocked' WHERE id=$o;"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; rm -f "$SPOOL"
 db "DELETE FROM task_prefs WHERE key='blocked_sweep_pinged_at';"
 _hb_blocked_sweep
-pinged="$(cut -f2 "$SEND_LOG" | grep -c 'no live reason')"
+pinged="$(surfaced "$o")"
 [[ "$(st "$o")" == "blocked" && "$pinged" -ge 1 ]] \
-  && ok_t "no-reason blocked is SURFACED, not auto-unblocked" \
-  || bad_t "surface" "O status=$(st "$o") pinged=$pinged"
+  && ok_t "no-reason blocked is SURFACED (spooled to the ops digest), not auto-unblocked" \
+  || bad_t "surface" "O status=$(st "$o") spooled=$pinged spool=[$(cat "$SPOOL" 2>/dev/null)]"
+# The live send is GONE by design; one coming back here is the DIVE-4826 regression.
+[[ "$(cut -f2 "$SEND_LOG" | grep -c 'no live reason')" == "0" ]] \
+  && ok_t "surface is batched into the digest, not sent live" || bad_t "live send is back" "$(cat "$SEND_LOG")"
 [[ -n "$(db "SELECT value FROM task_prefs WHERE key='blocked_sweep_pinged_at';")" ]] \
   && ok_t "surface stamps the throttle key" || bad_t "throttle stamp" "no key"
 
-# --- T7b: throttle — a second sweep within 24h does NOT re-ping
-: >"$SEND_LOG"
+# --- T7b: throttle — a second sweep within 24h does NOT re-spool
+: >"$SEND_LOG"; rm -f "$SPOOL"
 _hb_blocked_sweep
-[[ "$(cut -f2 "$SEND_LOG" | grep -c 'no live reason')" == "0" ]] \
-  && ok_t "surface throttled to once/24h (no re-ping)" || bad_t "throttle" "re-pinged"
+[[ "$(surfaced "$o")" == "0" ]] \
+  && ok_t "surface throttled to once/24h (no re-spool)" || bad_t "throttle" "re-spooled: $(cat "$SPOOL" 2>/dev/null)"
 
 # --- T8 GUARDRAIL: a parked no-edge task is neither recovered nor surfaced
 p=$(addt --assignee=greg -- "parked orphan")
 db "UPDATE tasks SET status='blocked', parked_at=datetime('now') WHERE id=$p;"
 db "DELETE FROM task_prefs WHERE key='blocked_sweep_pinged_at';"
-: >"$SEND_LOG"
+: >"$SEND_LOG"; rm -f "$SPOOL"
 _hb_blocked_sweep
-# it must stay blocked, and must not appear in a 'no live reason' surface line
-if [[ "$(st "$p")" == "blocked" ]] && ! cut -f2 "$SEND_LOG" | grep -q "$(db "SELECT ident FROM tasks WHERE id=$p;")"; then
-  ok_t "parked no-edge task left untouched (not recovered, not surfaced)"
+# it must stay blocked, and must not appear in the digest's blocked-no-reason row
+# (DIVE-4862: re-pointed from the send log, which reads empty since DIVE-4826).
+# Positive control in the SAME sweep: O (blocked, no edge, not parked) IS on that
+# row, so an empty spool cannot pass this arm by absence.
+if [[ "$(st "$p")" == "blocked" && "$(surfaced "$o")" -ge 1 && "$(surfaced "$p")" == "0" ]]; then
+  ok_t "parked no-edge task left untouched (not recovered, not surfaced; unparked O still is)"
 else
-  bad_t "park sweep guardrail" "P status=$(st "$p")"
+  bad_t "park sweep guardrail" "P status=$(st "$p") P-spooled=$(surfaced "$p") O-spooled=$(surfaced "$o") spool=[$(cat "$SPOOL" 2>/dev/null)]"
 fi
 
 # =============================================================================
