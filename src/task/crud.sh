@@ -1340,6 +1340,11 @@ cmd_task_show() {
     else
       dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, CASE WHEN (${_TASKS_MERGE_LANDED_SQL}) THEN 'none — MERGED ON THE FORGE as '||substr(COALESCE(NULLIF(merge_landed_sha,''),'an unrecorded sha'),1,12)||', recorded '||merge_landed_at||' by '||COALESCE(NULLIF(merge_landed_by,''),'?')||'; this row is owed a CLOSE' WHEN (${_TASKS_MERGE_DECLINED_SQL}) THEN 'none — MERGE DECLINED '||merge_declined_at||' by '||COALESCE(NULLIF(merge_declined_by,''),'?')||': '||COALESCE(NULLIF(merge_declined_reason,''),'no reason recorded')||'; NO LANDING WAS ASSERTED — this pull request is not the one that will land, and re-pointing the binding puts the row back in the merging stage' WHEN COALESCE(merge_owner,'')='' THEN '-' ELSE merge_owner||' ('||COALESCE(NULLIF(merge_hold_reason,''),'no reason recorded')||')' END AS merge_owner, body, result FROM tasks WHERE id=${id};"
     fi
+    # DIVE-4899: the companions bound beside delivery_ref, printed only when a
+    # row has some — a single-PR row's show output is unchanged byte for byte.
+    local _show_comp; _show_comp=$(db "SELECT COALESCE(replace(delivery_companions, char(10), ' '),'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    _show_comp="${_show_comp% }"
+    [[ -n "$_show_comp" ]] && printf '     also bound = %s   (every bound pull request must merge before this row closes — DIVE-4899)\n' "$_show_comp"
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed
     # by a lower-privilege peer.

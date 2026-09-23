@@ -200,7 +200,7 @@ require_sqlite() {
 # block, and a store stamped '3932-1' has never seen the triggers block, so
 # either literal skips one population's migration entirely. A THIRD value that
 # no store carries is the only resolution that re-migrates both.
-_TASKS_SCHEMA_EPOCH='4833-1'  # DIVE-4833: +tasks.need_expires_at (on top of 4589-1)
+_TASKS_SCHEMA_EPOCH='4899-1'  # DIVE-4899: +tasks.delivery_companions (on top of 4833-1)
 
 # DIVE-3931: Event -> Task ingress lives in the task store because ingress ends
 # at the queue. One SQL emitter serves fresh stores and migrations so the two
@@ -929,6 +929,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- Both are nullable for deliveries made before this shipped.
   delivery_repo_path     TEXT,
   delivered_sha          TEXT,
+  -- DIVE-4899: the pull requests bound BESIDE delivery_ref (the primary), one
+  -- full pull URL per line; NULL when the delivery is a single pull request.
+  -- A row closes, and a landing is recorded, only when every one has merged.
+  delivery_companions    TEXT,
   -- OSS-27 (OSS-19 re-plan cycle): provenance for a task ORIGINATED by an
   -- objective's planner cycle. originated_by_objective = objectives.id that
   -- filed it; originated_cycle = the objective_cycles.cycle_no it was filed in.
@@ -1996,6 +2000,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'gate_urgent INTEGER'
   'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER'
   'delivery_repo_path TEXT' 'delivered_sha TEXT'
+  'delivery_companions TEXT'
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
   # DIVE-2730: the add-time `--no-verify`, persisted. Nullable — NULL is "the
