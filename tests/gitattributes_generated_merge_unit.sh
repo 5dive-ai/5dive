@@ -25,7 +25,7 @@ ok(){ pass=$((pass+1)); echo "ok   - $1"; }
 bad(){ fail=$((fail+1)); echo "FAIL - $1: $2"; }
 
 # --- (a) the shipped attribute, via check-attr -------------------------------
-for f in 5dive src/cmd_council.sh src/constitution_kernel.sh; do
+for f in 5dive src/constitution_kernel.sh; do
   got=$(git check-attr merge -- "$f" 2>/dev/null | sed 's/.*merge: //')
   [[ "$got" == "unset" ]] && ok "check-attr says merge is unset for $f" \
                           || bad "merge must be unset for $f" "got '$got'"
@@ -50,7 +50,8 @@ got=$(git check-attr merge -- 5dive.sha256 2>/dev/null | sed 's/.*merge: //')
 # bare name matches at any depth, so the two entries take different code paths in
 # git's matcher. And per DIVE-2185 the bundle eventually leaves git entirely, which
 # makes cmd_council.sh the entry with PERMANENT value — i.e. the longest-lived arm
-# was the uncovered one.
+# was the uncovered one. (DIVE-4893: the council left core; src/constitution_kernel.sh
+# is now the slash-anchored generated path that carries that arm.)
 scenario() { # $1 = with-attrs|without-attrs, $2 = guarded path ; echoes UNMERGED|MERGED-SILENTLY
   local mode="$1" path="$2" t; t=$(mktemp -d /tmp/gitattr-unit.XXXXXX) || return 1
   ( set -e; cd "$t"; git init -q .; git config user.email t@t; git config user.name t
@@ -63,7 +64,7 @@ scenario() { # $1 = with-attrs|without-attrs, $2 = guarded path ; echoes UNMERGE
     if [[ -n "$(git ls-files -u -- "$path")" ]]; then echo UNMERGED; else echo MERGED-SILENTLY; fi
   ); rm -rf "$t"
 }
-for gp in 5dive src/cmd_council.sh src/constitution_kernel.sh; do
+for gp in 5dive src/constitution_kernel.sh; do
   r=$(scenario with-attrs "$gp")
   [[ "$r" == "UNMERGED" ]] && ok "a two-region concurrent edit leaves $gp UNMERGED (git refuses to stitch it)" \
                            || bad "the attribute must stop the content merge for $gp" "got '$r'"

@@ -6,7 +6,7 @@
 #     re-serializes + validates the YAML in the CLI (no browser YAML — DIVE-1700), and seals via the
 #     EXACT SAME routing as `set --file=` (solo direct-seal / org council-amend from the sealed seat count).
 #   · on a SOLO seal it emits EXACTLY ONE envelope — the `constitution show --json` view — and
-#     `council verify` stays GREEN (DIVE-1695 drift applies to the sealed bytes).
+#     `constitution verify` stays GREEN (DIVE-1695 drift applies to the sealed bytes).
 #   · governance keys (council/quorum/veto/thresholds) are UNREACHABLE via this path (fail-closed),
 #     and a real multi-seat council returns the machine amend-route and NEVER clobbers.
 # Needs root for the in-process gate-proof seal; re-execs under passwordless sudo, else SKIPs green
@@ -67,7 +67,7 @@ SEALED1="$(jq -r '.data.sealedDigest' <<<"$OUT")"
 # 2) the on-disk file matches the sealed digest, show agrees, verify is GREEN.
 [[ "$(sha256sum < "$CFILE" | awk '{print $1}')" == "$SEALED1" ]] && ok "the live constitution.yaml digest == the sealed digest" || no "live file digest != sealed"
 [[ "$(jq -r '.data.drifted' <<<"$OUT")" == "false" ]] && ok "not drifted right after the structured seal" || no "drifted right after seal"
-"$FIVE" council verify >/dev/null 2>&1 && ok "council verify GREEN after the structured seal" || no "council verify RED after structured seal"
+"$FIVE" constitution verify >/dev/null 2>&1 && ok "constitution verify GREEN after the structured seal" || no "constitution verify RED after structured seal"
 
 # 3) re-seal editing ONE hard_gates class — the OTHER classes are preserved (merge, not replace).
 OUT2="$(echo '{"hard_gates":{"secrets":"secret|token|apikey|passphrase"}}' | "$FIVE" constitution set --json 2>/dev/null)"
@@ -76,7 +76,7 @@ OUT2="$(echo '{"hard_gates":{"secrets":"secret|token|apikey|passphrase"}}' | "$F
 [[ "$(jq -r '.data.hard_gates_source.spend_billing' <<<"$OUT2")" == "default" ]] && ok "untouched classes survive the merge (spend_billing still default)" || no "an untouched class was clobbered"
 [[ "$(jq -r '.data.sealedDigest' <<<"$OUT2")" != "$SEALED1" ]] && ok "the re-seal chains a NEW sealed digest" || no "re-seal did not change the sealed digest"
 [[ "$(jq -sr 'map(select(.record.seats!=null)) | (last.record.seats|length)' "$LIN")" == "1" ]] && ok "re-seal keeps a single-principal genesis (no convene)" || no "re-seal changed the seat count"
-"$FIVE" council verify >/dev/null 2>&1 && ok "council verify GREEN after the structured re-seal" || no "verify RED after re-seal"
+"$FIVE" constitution verify >/dev/null 2>&1 && ok "constitution verify GREEN after the structured re-seal" || no "verify RED after re-seal"
 
 # 4) governance keys are UNREACHABLE via the structured path (fail-closed) — lineage untouched.
 LINES_BEFORE="$(wc -l < "$LIN")"
@@ -101,7 +101,7 @@ done
 # 6) an empty patch is a no-op SAVE (re-serialize + re-seal current) — still a valid green envelope.
 OUT3="$(echo '{}' | "$FIVE" constitution set --json 2>/dev/null)"
 [[ "$(jq -r '.data.valid' <<<"$OUT3")" == "true" ]] && ok "an empty patch re-seals the current constitution (no-op save)" || no "empty patch envelope invalid ($OUT3)"
-"$FIVE" council verify >/dev/null 2>&1 && ok "council verify GREEN after the empty-patch re-seal" || no "verify RED after empty-patch re-seal"
+"$FIVE" constitution verify >/dev/null 2>&1 && ok "constitution verify GREEN after the empty-patch re-seal" || no "verify RED after empty-patch re-seal"
 
 # ============================ ORG route (multi-seat council) ====================================
 # A real multi-seat council governs -> the structured write is REFUSED with a machine amend-route and
@@ -109,8 +109,11 @@ OUT3="$(echo '{}' | "$FIVE" constitution set --json 2>/dev/null)"
 O="$BASE/org"; mkdir -p "$O"
 export STATE_DIR="$O"
 OLIN="$O/council/lineage.jsonl"
-"$FIVE" council init --seats="main:chair,theo,olivia" --threshold="majority" --veto="tg:1234567890" >/dev/null 2>&1 \
-  || { echo "FAIL: could not seed a multi-seat council for the org route"; exit 1; }
+# DIVE-4893: the council is a plugin, so core cannot seed a multi-seat council. The route reads only
+# the seat count off the lineage head, so a synthetic 3-seat genesis is the whole fixture.
+mkdir -p "$O/council"
+printf '%s\n' '{"kind":"genesis","seats":[{"id":"main","chair":true},{"id":"theo"},{"id":"olivia"}]}' > "$O/council/genesis.json"
+printf '%s\n' '{"seq":0,"kind":"genesis","digest":"g0","prevDigest":"","record":{"seats":[{"id":"main","chair":true},{"id":"theo"},{"id":"olivia"}]}}' > "$O/council/lineage.jsonl"
 OB="$(echo '{"ship":{"require_ci":true}}' | "$FIVE" constitution set --json 2>/dev/null)"
 [[ "$(jq -r '.ok' <<<"$OB")" == "true" ]] && ok "org structured write returns a machine envelope" || no "org write no envelope ($OB)"
 [[ "$(jq -r '.data.mode' <<<"$OB")" == "council" ]] && ok "a multi-seat council routes to the amend-route (not a solo seal)" || no "org route not 'council' ($OB)"

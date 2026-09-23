@@ -6,9 +6,11 @@
 # instead of parsing constitution.yaml in-browser (DIVE-1731 no-mutation line + DIVE-1700 YAML bug
 # class); the engine loadConstitution is the ONE shared parser for CLI + dashboard.
 #
-# Aliases into the council internals: it reuses `_council_constitution_path`,
-# `_council_sealed_constitution_digest`, `_council_live_constitution_digest`, `$COUNCIL_LINEAGE`, and
-# the `_council_write_runtime` node materializer — all defined in cmd_council.sh (assembled before this).
+# DIVE-4893: the council left core for a plugin (5dive-ai/5dive-council). Everything this verb family
+# does with no council — parse, show, render, merge, the SOLO seal and the lineage verify — is the
+# constitution kernel's (src/constitution_kernel.sh). The one thing it hands off is a MULTI-seat
+# amendment, which only the council can convene: `5dive council amend` when the plugin is installed,
+# otherwise a refusal naming the install line.
 
 cmd_constitution() {
   local action="${1:-show}"
@@ -17,6 +19,8 @@ cmd_constitution() {
     show) _constitution_show "$@" ;;
     init) _constitution_init "$@" ;;
     set|edit) _constitution_set "$action" "$@" ;;
+    verify) _constitution_verify_cmd "$@" ;;
+    floor-rx) _constitution_floor_rx "$@" ;;
     -h|--help|help)
       cat >&2 <<'CONSTITUTION_HELP'
 5dive constitution — view + amend the machine-enforced constitution (guardrails, thresholds, veto, seal state)
@@ -57,11 +61,67 @@ cmd_constitution() {
       Open the current constitution (or the v0 default) in $EDITOR, then seal the edited bytes via
       the same routing as `set`. No-op if you exit without changes.
 
+  sudo 5dive constitution verify [--json]
+      Verify the seal: the lineage hash chain is intact, every record re-seals to its stored digest
+      on the root gate-proof rail, and the live constitution.yaml matches its sealed digest. Exits
+      non-zero on any failure (fail-closed). What `council verify` reported before the council
+      became a plugin; the plugin's `council verify` reaches the same verdict. Needs root (the key).
+
+  5dive constitution floor-rx
+      Print the SHIPPED tier-2 human-gate floor regex — the one `task need` enforces when the
+      constitution is absent, invalid or drifted. The council plugin's `council floor-diff` reads it.
+
   (init → seeds the full default; today `set`/`edit` seal a proposed file.)
 CONSTITUTION_HELP
       ;;
-    *) fail "$E_USAGE" "unknown: 5dive constitution $action (want: show)" ;;
+    *) fail "$E_USAGE" "unknown: 5dive constitution $action (want: show|init|set|edit|verify|floor-rx)" ;;
   esac
+}
+
+# DIVE-4893: the shipped tier-2 floor, for the council plugin's floor-diff (a plugin cannot read core's
+# globals in-process). Plain text, one line, no JSON wrapper: a caller captures it verbatim.
+_constitution_floor_rx() {
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "constitution floor-rx takes no arguments"
+  printf '%s\n' "$_GATE_T2_FLOOR_RX"
+}
+
+# DIVE-4893: the solo box's `council verify`. The kernel computes the verdict; this is its front door.
+_constitution_verify_cmd() {
+  require_node "constitution verify"
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --json) JSON_MODE=1 ;;
+      -h|--help) cmd_constitution --help; return 0 ;;
+      *) fail "$E_USAGE" "unknown flag for constitution verify: $a" ;;
+    esac
+  done
+  [[ -f "$COUNCIL_LINEAGE" ]] || fail "$E_VALIDATION" "nothing to verify — no constitution has been sealed on this box (seal one: sudo 5dive constitution edit)"
+  local dir res rc=0
+  dir="$(mktemp -d -t 5dive-constitution-verify.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
+  _constitution_write_runtime "$dir"
+  res="$(_constitution_verify "$dir")" || rc=$?
+  rm -rf "$dir"
+  if (( JSON_MODE )); then
+    jq -c --argjson ok "$([[ $rc -eq 0 ]] && echo true || echo false)" '{ok:$ok, data:.}' <<<"$res"
+  elif (( rc == 0 )); then
+    echo "constitution verify: OK — $(jq -r .records <<<"$res") record(s), chain intact + every record re-seals + constitution matches its sealed digest"
+  else
+    echo "constitution verify: FAILED" >&2
+    jq -r '(if .chainOk then empty else "  chain: " + (.chain.reason // "broken") end),
+           (if .resealOk then empty else "  re-seal: " + .resealBad end),
+           (if .constitutionOk then empty else "  constitution: " + .constitution end)' <<<"$res" >&2
+  fi
+  # A failed verify has reported its reason on both rails, so it is a deliberate non-zero exit,
+  # not a silent one (the DIVE-2711 double-report the council's verify once had).
+  (( rc == 0 )) || { mark_reported; return "$E_GENERIC"; }
+}
+
+# Run `5dive council <args>` through the council plugin as a CHILD (not an exec, so the caller's
+# temp dir survives and its trap still cleans it). 127 when no installed plugin claims `council`.
+_constitution_council() {
+  [[ -n "$(_plugin_verb_claims council 2>/dev/null)" ]] || return 127
+  ( _plugin_dispatch_verb council "$@" )
 }
 
 # Compose the DIVE-1742 read envelope. node parses the constitution + lineage receipts (the shared
@@ -78,22 +138,23 @@ _constitution_show() {
     esac
   done
   local dir path sealed live verify_file="" envelope rc=0 genesis_exists=0
-  path="$(_council_constitution_path)"
-  sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
-  live="$(_council_live_constitution_digest 2>/dev/null || true)"
+  path="$(_constitution_path)"
+  sealed="$(_constitution_sealed_digest 2>/dev/null || true)"
+  live="$(_constitution_live_digest 2>/dev/null || true)"
   [[ -f "$COUNCIL_GENESIS" ]] && genesis_exists=1
   dir="$(mktemp -d -t 5dive-constitution-show.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
-  _council_write_runtime "$dir"
-  # Chain-verify status is authoritative from `council verify` (re-seals each record; root owns the
-  # key). Best-effort passthrough: capture its --json .data when a lineage exists, else the envelope's
-  # verify field stays null. A verify that can't run (no key / no root) never fails the READ.
+  _constitution_write_runtime "$dir"
+  # Chain-verify status (re-seals each record; root owns the key). Best-effort: captured when a
+  # lineage exists and the verify passes, else the envelope's verify field stays null. A verify that
+  # can't run (no key / no root) or fails never fails the READ — the same null `council verify
+  # --json | jq .data` produced under pipefail before the council left core.
   if [[ -f "$COUNCIL_LINEAGE" ]]; then
     verify_file="$dir/verify.json"
-    if ! JSON_MODE=1 cmd_council verify --json 2>/dev/null | jq -c '.data // empty' > "$verify_file" 2>/dev/null || [[ ! -s "$verify_file" ]]; then
+    if ! _constitution_verify "$dir" > "$verify_file" 2>/dev/null || [[ ! -s "$verify_file" ]]; then
       verify_file=""
     fi
   fi
-  envelope="$(node "$dir/cli.mjs" constitution-show \
+  envelope="$(node "$dir/constitution-cli.mjs" constitution-show \
     --path="$path" --sealed="$sealed" --live="$live" --genesis-exists="$genesis_exists" \
     --lineage="$COUNCIL_LINEAGE" ${verify_file:+--verify-file="$verify_file"})" || rc=$?
   rm -rf "$dir"
@@ -141,13 +202,13 @@ _constitution_init() {
       *) fail "$E_USAGE" "unknown flag for constitution init: $a" ;;
     esac
   done
-  local cpath; cpath="$(_council_constitution_path)"
+  local cpath; cpath="$(_constitution_path)"
 
   # Anti-clobber (HARD): a Council has SEALED a constitution into the lineage. `init` must NEVER
   # silently rewrite governed policy — route to the sanctioned amend path. --force does NOT override.
-  local sealed; sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
+  local sealed; sealed="$(_constitution_sealed_digest 2>/dev/null || true)"
   if [[ -n "$sealed" ]]; then
-    fail "$E_VALIDATION" "a Council has SEALED this constitution (${sealed:0:12}…) — amend it: sudo 5dive council amend --file=…"
+    fail "$E_VALIDATION" "this constitution is already SEALED (${sealed:0:12}…) — change it through the seal, not over it: sudo 5dive constitution edit (a multi-seat council routes that to 'council amend')"
   fi
 
   # Anti-clobber (soft): an unsealed constitution.yaml already exists — don't blow away hand edits
@@ -159,7 +220,7 @@ _constitution_init() {
   local dir; dir="$(mktemp -d -t 5dive-constitution-init.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
   # shellcheck disable=SC2064
   trap "rm -rf '$dir'" RETURN
-  _council_write_runtime "$dir"
+  _constitution_write_runtime "$dir"
 
   mkdir -p "$(dirname "$cpath")" 2>/dev/null || true
   if { [[ -e "$cpath" ]] && [[ ! -w "$cpath" ]]; } || { [[ ! -e "$cpath" ]] && [[ ! -w "$(dirname "$cpath")" ]]; }; then
@@ -169,8 +230,8 @@ _constitution_init() {
   # Render the default (guardrails-first, Council keys dormant) and validate it parses BEFORE placing
   # it (ONE parser, fail-closed) — never leave a broken governance file on disk.
   local tmp="$dir/constitution.yaml"
-  node "$dir/cli.mjs" constitution-render > "$tmp" || fail "$E_GENERIC" "could not render the default constitution"
-  node "$dir/cli.mjs" constitution --path="$tmp" | jq -e '.valid == true' >/dev/null 2>&1 \
+  node "$dir/constitution-cli.mjs" constitution-render > "$tmp" || fail "$E_GENERIC" "could not render the default constitution"
+  node "$dir/constitution-cli.mjs" constitution --path="$tmp" | jq -e '.valid == true' >/dev/null 2>&1 \
     || fail "$E_VALIDATION" "the rendered default constitution did not validate — refusing to write it (fail-closed)"
   ( umask 022; cat "$tmp" > "$cpath" ) || fail "$E_GENERIC" "could not write $cpath"
 
@@ -213,15 +274,15 @@ _constitution_set() {
   local dir; dir="$(mktemp -d -t 5dive-constitution-set.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
   # shellcheck disable=SC2064
   trap "rm -rf '$dir'" RETURN
-  _council_write_runtime "$dir"
+  _constitution_write_runtime "$dir"
 
   # `edit`: materialize the CURRENT constitution (or the v0 default when none) into a scratch file,
   # open $EDITOR on it, then seal the edited bytes through the same routing as `set`. No-op on no change.
   if [[ "$verb" == "edit" ]]; then
     [[ -z "$file" ]] || fail "$E_USAGE" "constitution edit opens \$EDITOR — pass no --file (use 'set --file=' for a non-interactive write)"
     local cur scratch before after
-    cur="$(_council_constitution_path)"; scratch="$dir/constitution.yaml"
-    if [[ -f "$cur" ]]; then cp "$cur" "$scratch"; else node "$dir/cli.mjs" constitution-render > "$scratch"; fi
+    cur="$(_constitution_path)"; scratch="$dir/constitution.yaml"
+    if [[ -f "$cur" ]]; then cp "$cur" "$scratch"; else node "$dir/constitution-cli.mjs" constitution-render > "$scratch"; fi
     before="$(sha256sum < "$scratch" | awk '{print $1}')"
     "${EDITOR:-vi}" "$scratch" || fail "$E_GENERIC" "editor exited non-zero — constitution unchanged"
     after="$(sha256sum < "$scratch" | awk '{print $1}')"
@@ -241,8 +302,8 @@ _constitution_set() {
     stdin_write=1
     [[ ! -t 0 ]] || fail "$E_USAGE" "constitution set --json reads a JSON patch from STDIN — pipe it in, or use 'set --file=' for a full YAML write"
     local cur_path merged="$dir/merged.yaml" merr
-    cur_path="$(_council_constitution_path)"
-    if ! merr="$(node "$dir/cli.mjs" constitution-merge --path="$cur_path" 2>&1 >"$merged")"; then
+    cur_path="$(_constitution_path)"
+    if ! merr="$(node "$dir/constitution-cli.mjs" constitution-merge --path="$cur_path" 2>&1 >"$merged")"; then
       fail "$E_VALIDATION" "constitution set --json: ${merr:-could not merge the structured fields} — nothing sealed (fail-closed)"
     fi
     file="$merged"
@@ -254,7 +315,7 @@ _constitution_set() {
   # loadConstitution always exits 0 (it emits {valid, error} in the payload, defaulting when a file
   # can't parse), so gate on the `valid` flag — not the exit code — and surface its error. Fail-closed.
   local vout vvalid
-  vout="$(node "$dir/cli.mjs" constitution --path="$file" 2>/dev/null)"
+  vout="$(node "$dir/constitution-cli.mjs" constitution --path="$file" 2>/dev/null)"
   vvalid="$(printf '%s' "$vout" | jq -r '.valid // false' 2>/dev/null)"
   [[ "$vvalid" == "true" ]] \
     || fail "$E_VALIDATION" "the proposed $file is not a valid constitution ($(printf '%s' "$vout" | jq -r '.error // "parse error"' 2>/dev/null)) — refusing to seal it (fail-closed)"
@@ -284,12 +345,18 @@ _constitution_set() {
       else echo "constitution $verb: a $seat_count-seat council governs — would convene a constitutional amendment (council amend)"; fi
       return 0
     fi
-    _council_amend "$dir" --file="$file"
-    return $?
+    # DIVE-4893: the amendment is the council plugin's. Run it as a child so this temp dir (which
+    # may hold the edited file) outlives it; without the plugin, refuse — never seal around a council.
+    local arc=0
+    _constitution_council amend --file="$file" || arc=$?
+    if (( arc == 127 )); then
+      fail "$E_NOT_INSTALLED" "a $seat_count-seat council governs this constitution, and amending it is a council motion — the council is a plugin now. Install it once: 5dive plugin add 5dive-ai/5dive-council"
+    fi
+    return "$arc"
   fi
 
   # ---- SOLO direct-seal --------------------------------------------------------------------------
-  local cpath; cpath="$(_council_constitution_path)"
+  local cpath; cpath="$(_constitution_path)"
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   if [[ ! -w "$COUNCIL_DIR" ]]; then
     fail "$E_PERMISSION" "constitution $verb writes root-owned governance files — run: sudo 5dive constitution $verb --file=$file"
@@ -308,7 +375,7 @@ _constitution_set() {
 
   if (( dry )); then
     if (( JSON_MODE )); then jq -nc --arg p "$principal" --arg s "$seat_id" --argjson f "$([[ -n "$forced" ]] && echo true || echo false)" \
-      '{ok:true,data:{mode:"solo",dryRun:true,principal:$p,seat:$s,reseal:$f,route:"council init (direct-seal, no convene)"}}'
+      '{ok:true,data:{mode:"solo",dryRun:true,principal:$p,seat:$s,reseal:$f,route:"solo seal (direct-seal, no convene)"}}'
     else echo "constitution $verb: would direct-seal (solo, principal=$principal, seat=$seat_id${forced:+, re-seal}) — no convene"; fi
     return 0
   fi
@@ -321,13 +388,13 @@ _constitution_set() {
   # swallow the seal's own JSON_MODE genesis envelope here (it would otherwise concatenate a second JSON
   # object onto stdout and break the dashboard's single-envelope parse). The file writes still happen.
   if (( stdin_write )); then
-    _council_init_or_lineage "init" "$dir" --seats="$seat_id:chair" --veto="$principal" $forced >/dev/null
+    _constitution_solo_seal "$dir" --seats="$seat_id:chair" --veto="$principal" $forced >/dev/null
   else
-    _council_init_or_lineage "init" "$dir" --seats="$seat_id:chair" --veto="$principal" $forced
+    _constitution_solo_seal "$dir" --seats="$seat_id:chair" --veto="$principal" $forced
   fi
   local rc=$?
   if (( rc != 0 )); then
-    fail "$E_GENERIC" "solo direct-seal failed (council init rc=$rc) — $cpath may be updated but UNSEALED; re-run once fixed"
+    fail "$E_GENERIC" "solo direct-seal failed (seal rc=$rc) — $cpath may be updated but UNSEALED; re-run once fixed"
   fi
   # DIVE-1751: the browser-callable structured write emits the `constitution show --json` envelope the
   # dashboard consumes directly (the freshly sealed digest + guardrails, read back through the one parser).

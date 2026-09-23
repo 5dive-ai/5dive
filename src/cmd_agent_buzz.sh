@@ -382,7 +382,7 @@ _buzz_status() {
   # run to completion and its effect is exactly nothing.
   #
   # `mark_reported` is what claims the report (same fix pattern as DIVE-2890 /
-  # DIVE-2711 in cmd_council.sh and DIVE-3135 in cmd_gh.sh). Claiming it OBLIGES us
+  # DIVE-2711 in the council's verify and DIVE-3135 in cmd_gh.sh). Claiming it OBLIGES us
   # to make one: three `no`s in a table are a reading exercise, so the missing
   # pieces are named in prose and the fix command is printed.
   if [[ "$chan_decl" == "yes" && ( "$plugin" == "no" || "$conf" == "no" || "$bin" == "no" ) ]]; then

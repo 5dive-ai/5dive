@@ -1561,7 +1561,7 @@ readonly PLUGIN_VERB_BINDIR="bin"
 # re-extracts the case labels from src/main.sh and asserts set equality, so a new
 # builtin verb that forgets this line reds the suite rather than silently
 # becoming claimable by a plugin.
-readonly FIVEDIVE_BUILTIN_VERBS="a2a account acp activity agent _audit_append board bug buzz company config constitution cost council crew deploy _deploy_do digest doctor down export fire fleet gate-proof gh _gh_do goal -h heartbeat --help help hire host human humans init liveness loop market memory _merge_do models objective objectives org paperclip-seed plugin plugins project projects proof ps push _push_do run runs secret selfcheck self-update self_update supervisor task _task_answer _task_channel team trace trigger triggers uninstall up update usage -v --version version wall watch whoami"
+readonly FIVEDIVE_BUILTIN_VERBS="a2a account acp activity agent _audit_append board bug buzz company config constitution cost crew deploy _deploy_do digest doctor down export fire fleet gate-proof gh _gh_do goal -h heartbeat --help help hire host human humans init liveness loop market memory _merge_do models objective objectives org paperclip-seed plugin plugins project projects proof ps push _push_do run runs secret selfcheck self-update self_update supervisor task _task_answer _task_channel team trace trigger triggers uninstall up update usage -v --version version wall watch whoami"
 
 _plugin_verb_name_ok()   { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; }
 _plugin_verb_is_builtin(){ [[ " $FIVEDIVE_BUILTIN_VERBS " == *" $1 "* ]]; }
@@ -1793,6 +1793,10 @@ _plugin_dispatch_verb() {
   export FIVEDIVE_PLUGIN_DIR="$dir"
   export FIVEDIVE_PLUGIN_KEY="$key"
   export FIVEDIVE_VERB="$verb"
+  # DIVE-4893: main() strips a global `--json` out of argv BEFORE dispatch, so without this every
+  # plugin verb lost --json wherever the caller put it. Forward the mode itself; a plugin reads
+  # FIVEDIVE_JSON_MODE (the council plugin already does).
+  export FIVEDIVE_JSON_MODE="${JSON_MODE:-0}"
 
   # DIVE-2797: `exec` replaces the process, so the dispatcher's EXIT trap never
   # fires and AUDIT_CMD would be lost. Same fix cmd_acp uses — write the row

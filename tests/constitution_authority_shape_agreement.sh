@@ -34,7 +34,7 @@ STATE_DIR="$TMP"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh cmd_council.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -170,7 +170,7 @@ authority:
     - main
     - olivia
 ")"
-merged="$(printf '{"ship":{"require_ci":true}}' | node src/council/cli.mjs constitution-merge --path="$f" 2>"$TMP/merge.err")"
+merged="$(printf '{"ship":{"require_ci":true}}' | node src/constitution/cli.mjs constitution-merge --path="$f" 2>"$TMP/merge.err")"
 if [[ -n "$merged" ]]; then
   printf '%s' "$merged" > "$TMP/merged.yaml"
   v="$(validate "$TMP/merged.yaml")"; b="$(read_bash "$TMP/merged.yaml")"

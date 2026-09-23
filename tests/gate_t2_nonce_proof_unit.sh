@@ -38,19 +38,19 @@ cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-t2-nonce-proof.XXXXXX)"
 
-# STATE_DIR must be set BEFORE cmd_council.sh is sourced (COUNCIL_DIR/COUNCIL_LINEAGE are
+# STATE_DIR must be set BEFORE constitution_kernel.sh is sourced (COUNCIL_DIR/COUNCIL_LINEAGE are
 # source-time globals derived from it).
 STATE_DIR="$TMP"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh cmd_council.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
   || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
-# cmd_council.sh LAST, matching the production bundle order (CNCL-14). Sourcing it is not
+# constitution_kernel.sh LAST (it carries the seal reader since the council left core, DIVE-4893). Sourcing it is not
 # convenience: the anchor lives in those council helpers, and a harness that stubbed them
 # would be grading its own stubs.
 COUNCIL_DIR="$STATE_DIR/council"; COUNCIL_LINEAGE="$COUNCIL_DIR/lineage.jsonl"

@@ -20,8 +20,8 @@ require_root() {
 # no reader present at the write to notice the missing words.
 #
 # The fix is to keep prose OUT of argv: pass a PATH, read the bytes here. This
-# COPIES council's `--context-file` precedent (src/council/cli.mjs:916, fed by
-# src/cmd_council.sh:4966, whose own wrapper writes prose to a temp file
+# COPIES council's `--context-file` precedent (council/cli.mjs, now in the
+# 5dive-ai/5dive-council plugin, whose own wrapper writes prose to a temp file
 # specifically to keep it out of argv). It is not a new design.
 #
 # NOT stdin. stdin already carries the auth token (DIVE-880); a second reader on

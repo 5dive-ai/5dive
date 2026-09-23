@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh cmd_council.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh; do
   # shellcheck source=/dev/null
   source "src/$f"
 done
@@ -25,7 +25,7 @@ done
 TMP="$(mktemp -d /tmp/constitution-floor.XXXXXX)"
 STATE_DIR="$TMP"
 export FIVEDIVE_CONSTITUTION_FILE="$TMP/constitution.yaml"
-# DIVE-1752: hermetic council seal. cmd_council.sh (sourced above) sets
+# DIVE-1752: hermetic council seal. constitution_kernel.sh (sourced above) sets
 # COUNCIL_LINEAGE="${STATE_DIR}/council/lineage.jsonl" from the SHIPPED default
 # STATE_DIR (/var/lib/5dive) at source time, and re-assigns it on every source —
 # so it froze to the BOX lineage before line 15 could redirect STATE_DIR, and an

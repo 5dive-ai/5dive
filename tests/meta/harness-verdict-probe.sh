@@ -93,19 +93,12 @@ trap 'rm -rf "$_PROBE_CANARY_DIR"' EXIT
 # not covered by this and reds the check, which is the property olivia asked for
 # (a silent skip here is the defect the check exists to find).
 #
-#   council_amend_e2e.sh          hand-verified by olivia: exits 1 at `if (( fail ))`
-#                                 and only reaches its hardcoded "0 failed" echo when
-#                                 fail==0.
 #   schema_sync_unit.sh           hand-verified by olivia: ends in `EOF` closing a
 #                                 python heredoc whose own `sys.exit(1 if fail else 0)`
 #                                 propagates.
-#   council_roster_lineage_e2e.sh READ, NOT EMPIRICALLY PROVEN: `set -uo pipefail` with
-#                                 per-assertion `|| { echo "FAIL: …"; exit 1; }`, so it
-#                                 is wired by explicit exit — but it has no verdict
-#                                 variable and no `set -e`, so neither mutation applies
-#                                 and this probe cannot demonstrate it. Weaker evidence
-#                                 than the other two; say so rather than imply parity.
-ALLOW_UNPROBEABLE="council_amend_e2e.sh council_roster_lineage_e2e.sh schema_sync_unit.sh"
+#   (DIVE-4893: council_amend_e2e.sh and council_roster_lineage_e2e.sh left with the council,
+#    for the 5dive-ai/5dive-council plugin repo.)
+ALLOW_UNPROBEABLE="schema_sync_unit.sh"
 
 WIRED=(); UNWIRED=(); UNPROBEABLE=(); ALREADY_RED=(); ALLOWED=(); NOT_REACHED=()
 # DIVE-2555: killed by the time cap. Its own class, because it is neither of the two

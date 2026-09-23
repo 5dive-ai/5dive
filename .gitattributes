@@ -30,5 +30,4 @@
 # does not use those words: there is nothing in the file to resolve.
 # ──────────────────────────────────────────────────────────────────────────────
 5dive              -merge
-src/cmd_council.sh -merge
 src/constitution_kernel.sh -merge

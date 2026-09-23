@@ -36,43 +36,25 @@ jobs:
       # DIVE-2107: regenerate the GENERATED sources BEFORE building, because the
       # bundle check below cannot see one level up.
       #
-      # src/cmd_council.sh is itself generated — src/council/gen_cmd.mjs embeds
-      # engine.mjs + cli.mjs into cmd_council.template.sh. build.sh does NOT run
-      # that generator; it only bundles whatever src/ currently contains. So a
-      # COMMITTED hand-edit of src/cmd_council.sh is faithfully carried into the
-      # bundle, `git diff 5dive` is clean, and every existing check passes: the
-      # canonical .mjs carries nothing, the next gen_cmd.mjs run silently reverts
-      # the change, and the node harnesses (which import engine.mjs) never
-      # exercise it.
-      #
-      # Measured on a committed hand-edit, both directions: build.sh + `git diff
-      # 5dive` stays SILENT; regenerating first reports ` M src/cmd_council.sh`.
-      # The edit must be COMMITTED to reproduce — editing only the working tree
-      # is reverted by the generator and proves nothing.
-      #
-      # Found by olivia verifying DIVE-2103, where iteration 1 did exactly this.
+      # src/constitution_kernel.sh is itself generated — src/constitution/gen_kernel.mjs
+      # embeds {constitution,seal,cli}.mjs into kernel.template.sh. build.sh does NOT
+      # run that generator; it only bundles whatever src/ currently contains. So a
+      # COMMITTED hand-edit of the generated file is faithfully carried into the
+      # bundle, `git diff 5dive` is clean, and every existing check passes, while the
+      # next generator run silently reverts the change. (Found by olivia verifying
+      # DIVE-2103 on the council's generated file, which left core in DIVE-4893.)
       # sha256sum-vs-5dive.sha256 and a re-seal both pass on such a commit too,
       # because they grade the artifact against its OWN recorded checksum and
       # never against what src produces.
-      # DIVE-4869: src/constitution_kernel.sh is generated the same way, by
-      # src/constitution/gen_kernel.mjs, and carries the same hazard.
       - name: Regenerate generated sources
-        run: node src/council/gen_cmd.mjs && node src/constitution/gen_kernel.mjs
+        run: node src/constitution/gen_kernel.mjs
       - name: Fail if a GENERATED source was hand-edited
         run: |
           if ! git diff --exit-code src/constitution_kernel.sh; then
             echo
             echo "ERROR: src/constitution_kernel.sh does not match what its generator produces."
-            echo "It is GENERATED from src/constitution/{constitution,cli}.mjs + kernel.template.sh."
+            echo "It is GENERATED from src/constitution/{constitution,seal,cli}.mjs + kernel.template.sh."
             echo "Edit those, then run: node src/constitution/gen_kernel.mjs && ./build.sh"
-            exit 1
-          fi
-          if ! git diff --exit-code src/cmd_council.sh; then
-            echo
-            echo "ERROR: src/cmd_council.sh does not match what its generator produces."
-            echo "It is GENERATED from src/council/{engine,cli}.mjs + cmd_council.template.sh."
-            echo "Edit those, then run: node src/council/gen_cmd.mjs && ./build.sh"
-            echo "Editing src/cmd_council.sh directly is silently reverted by the next build."
             exit 1
           fi
       - name: Rebuild bundle from src/

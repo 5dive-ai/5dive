@@ -37,19 +37,19 @@ cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-lead-standing-unit.XXXXXX)"
 
-# STATE_DIR must be set BEFORE cmd_council.sh is sourced: its COUNCIL_DIR/COUNCIL_LINEAGE
+# STATE_DIR must be set BEFORE constitution_kernel.sh is sourced: its COUNCIL_DIR/COUNCIL_LINEAGE
 # are source-time globals derived from it (they are re-pinned below anyway, belt-and-braces).
 STATE_DIR="$TMP"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
-         lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh cmd_council.sh; do
+         lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
   || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
-# cmd_council.sh LAST, matching the production bundle order (CNCL-14) — the council
+# constitution_kernel.sh LAST (it carries the seal reader since the council left core, DIVE-4893) — the council
 # loader is what makes `_gate_standing_lead` resolvable at all. Sourcing it here is not
 # convenience: the whole iteration-2 anchor lives in those three council helpers, and a
 # harness that stubbed them would be testing its own stubs.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DIVE-1686 e2e — belt-and-suspenders for the DIVE-1676 rename (5dive.md -> constitution.yaml).
-# Proves `_council_constitution_path` reads a LEGACY ${STATE_DIR}/5dive.md when the canonical
+# Proves `_constitution_path` (the kernel's; the council's copy left core in DIVE-4893) reads a LEGACY ${STATE_DIR}/5dive.md when the canonical
 # constitution.yaml is absent, does a ONE-TIME byte-preserving rename to the canonical name, and
 # — crucially — that a box which SEALED a digest under the old name does NOT trip drift or silently
 # revert to built-in defaults after upgrading to a post-rename build. Exercises the BUILT binary via

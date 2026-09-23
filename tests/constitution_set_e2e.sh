@@ -4,7 +4,7 @@
 # routes off ONE shared parser:
 #   SOLO  (no genesis, or a single-principal genesis) -> DIRECT-seal via a single-principal `council
 #         init` (NO convene). First seal creates the genesis; a re-seal (--force, inherited principal)
-#         chains a new digest. `constitution show` reflects the sealed digest, `council verify` is
+#         chains a new digest. `constitution show` reflects the sealed digest, `constitution verify` is
 #         GREEN, and a later hand-edit DRIFTS + fails closed (DIVE-1695).
 #   ORG   (a real multi-seat council governs) -> routes to a constitutional amendment (`council
 #         amend`); exercised here as --dry-run (a live convene needs live seats — covered by
@@ -88,7 +88,7 @@ SEATS="$(jq -sr 'map(select(.record.seats!=null)) | (last.record.seats|length) /
 [[ "$(sha256sum < "$CFILE" | awk '{print $1}')" == "$PDIG" ]] && ok "the proposed constitution is now the live file" || no "live constitution != proposed"
 SEALED="$(jq -r 'select((.record.constitutionDigest // "")!="") | .record.constitutionDigest' "$LIN" | tail -n1)"
 [[ "$SEALED" == "$PDIG" ]] && ok "the proposed digest is sealed + hash-chained into the lineage" || no "sealed digest != proposed (sealed=$SEALED)"
-"$FIVE" council verify >/dev/null 2>&1 && ok "council verify GREEN after solo seal" || no "council verify RED after solo seal"
+"$FIVE" constitution verify >/dev/null 2>&1 && ok "constitution verify GREEN after solo seal" || no "constitution verify RED after solo seal"
 
 SHOW="$("$FIVE" constitution show --json 2>/dev/null)"
 [[ "$(jq -r '.data.sealedDigest' <<<"$SHOW")" == "$PDIG" ]] && ok "constitution show reports the sealed digest" || no "show sealedDigest wrong"
@@ -102,7 +102,7 @@ PDIG2="$(sha256sum < "$PROP2" | awk '{print $1}')"
 SEALED2="$(jq -r 'select((.record.constitutionDigest // "")!="") | .record.constitutionDigest' "$LIN" | tail -n1)"
 [[ "$SEALED2" == "$PDIG2" ]] && ok "solo re-seal chains the NEW digest (inherited principal, --force)" || no "re-seal digest not chained (sealed=$SEALED2 want=$PDIG2)"
 [[ "$(jq -sr 'map(select(.record.seats!=null)) | (last.record.seats|length)' "$LIN")" == "1" ]] && ok "re-seal keeps a single-principal genesis (no convene)" || no "re-seal changed the seat count"
-"$FIVE" council verify >/dev/null 2>&1 && ok "council verify GREEN after re-seal" || no "verify RED after re-seal"
+"$FIVE" constitution verify >/dev/null 2>&1 && ok "constitution verify GREEN after re-seal" || no "verify RED after re-seal"
 
 # an INVALID proposed constitution is refused BEFORE any write
 LINES_BEFORE="$(wc -l < "$LIN")"
@@ -113,19 +113,30 @@ if "$FIVE" constitution set --file="$S/bad.yaml" >/dev/null 2>&1; then no "solo 
 # DRIFT fails closed: hand-edit the live file -> show drifted + verify RED
 printf '\n# sneaky unsanctioned edit\n' >> "$CFILE"
 [[ "$(jq -r '.data.drifted' <<<"$("$FIVE" constitution show --json 2>/dev/null)")" == "true" ]] && ok "constitution show: DRIFT after a hand-edit (DIVE-1695)" || no "show did not flag drift after hand-edit"
-if "$FIVE" council verify >/dev/null 2>&1; then no "verify GREEN on a drifted constitution"; else ok "council verify RED on a drifted constitution (fail-closed)"; fi
+if "$FIVE" constitution verify >/dev/null 2>&1; then no "verify GREEN on a drifted constitution"; else ok "constitution verify RED on a drifted constitution (fail-closed)"; fi
 
 # ============================ ORG route (multi-seat council) ====================================
 O="$BASE/org"; mkdir -p "$O"
 export STATE_DIR="$O"
-"$FIVE" council init --seats="main:chair,theo,olivia" --threshold="majority" --veto="tg:1234567890" >/dev/null 2>&1 \
-  || { echo "FAIL: could not seed a multi-seat council for the org route"; exit 1; }
+# DIVE-4893: the council is a plugin, so core cannot seed a multi-seat council. The route reads only
+# the seat count off the lineage head, so a synthetic 3-seat genesis is the whole fixture.
+mkdir -p "$O/council"
+printf '%s\n' '{"kind":"genesis","seats":[{"id":"main","chair":true},{"id":"theo"},{"id":"olivia"}]}' > "$O/council/genesis.json"
+printf '%s\n' '{"seq":0,"kind":"genesis","digest":"g0","prevDigest":"","record":{"seats":[{"id":"main","chair":true},{"id":"theo"},{"id":"olivia"}]}}' > "$O/council/lineage.jsonl"
 ORGPROP="$O/proposed.yaml"; good > "$ORGPROP"
 OD="$("$FIVE" constitution set --file="$ORGPROP" --dry-run --json 2>/dev/null)"
 [[ "$(jq -r '.data.mode' <<<"$OD")" == "council" ]] && ok "a multi-seat council routes to the ORG amendment path" || no "org route not 'council' ($OD)"
 [[ "$(jq -r '.data.seats' <<<"$OD")" == "3" ]] && ok "org route reports the 3-seat roster" || no "org route seat count wrong"
 # the dry-run convened nothing / sealed nothing new
 [[ "$(wc -l < "$O/council/lineage.jsonl")" == "1" ]] && ok "org dry-run seals nothing (routing only)" || no "org dry-run touched the lineage"
+# DIVE-4893: a real (non-dry-run) org write on a box WITHOUT the council plugin is refused with the
+# install line — it must never fall through to a solo seal that would overwrite a council's lineage.
+ORGLIVE_BEFORE="$(sha256sum < "$O/council/lineage.jsonl")"
+OUT="$("$FIVE" constitution set --file="$ORGPROP" 2>&1)"; RC=$?
+[[ "$RC" == "7" ]] && ok "org write with no council plugin exits E_NOT_INSTALLED (7)" || no "org write without the plugin rc=$RC (want 7): $OUT"
+grep -q "5dive plugin add 5dive-ai/5dive-council" <<<"$OUT" && ok "the refusal names the plugin install line" || no "refusal does not name the install line: $OUT"
+[[ "$(sha256sum < "$O/council/lineage.jsonl")" == "$ORGLIVE_BEFORE" && ! -f "$O/constitution.yaml" ]] \
+  && ok "the refused org write touched neither the lineage nor the live constitution" || no "the refused org write mutated state"
 
 echo "DIVE-1743 constitution set e2e: $pass passed, $fail failed"
 [[ "$fail" -eq 0 ]] || exit 1
