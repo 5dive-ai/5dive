@@ -21,6 +21,8 @@ source src/header.sh
 # shellcheck disable=SC1091
 source src/lib/validation.sh
 # shellcheck disable=SC1091
+source src/lib/models.sh
+# shellcheck disable=SC1091
 source src/lib/agent_setup.sh
 # shellcheck disable=SC1091
 source src/cmd_agent_create.sh
@@ -86,6 +88,11 @@ install_default_skill_for_agent() { :; }
 preseed_claude_agent "$test_agent" none google/gemini-2.5-pro low
 jq -e '.model == "google/gemini-2.5-pro"' "$captured_settings" >/dev/null
 jq -e '.effortLevel == "low"' "$captured_settings" >/dev/null
+# DIVE-4863: Claude Code >= 2.1.280 ignores the top-level key for
+# claude-opus-5-5 and newer — the create path must also write the per-model one,
+# for every current model, so a later /model switch keeps the level.
+jq -e --arg o "$(resolve_model_alias opus)" '.modelSettings[$o].effortLevel == "low"' "$captured_settings" >/dev/null
+jq -e --arg s "$(resolve_model_alias sonnet)" '.modelSettings[$s].effortLevel == "low"' "$captured_settings" >/dev/null
 
 create_src=$(<src/cmd_agent_create.sh)
 setup_src=$(<src/lib/agent_setup.sh)

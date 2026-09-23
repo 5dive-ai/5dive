@@ -927,7 +927,7 @@ EOF
       for f in "${candidates[@]}"; do
         [[ -r "$f" ]] || continue
         model=$(jq -r '.model // empty' "$f" 2>/dev/null)
-        effort=$(jq -r '.effortLevel // empty' "$f" 2>/dev/null)
+        effort=$(settings_effective_effort <"$f")
         [[ -n "$model" ]] && break
       done
       local model_line="Model and effort are switchable anytime, just ask."

@@ -202,7 +202,9 @@ check "T4b fixture pack really pins effort"   "$(jq -r '.config.effort' "$mf")" 
 # The claude branch is the ONLY writer of these keys — prove it by grepping the
 # one sink rather than by trusting the comment above it. If a second sink ever
 # appears, the premise of the whole report changes and this arm says so.
-SINK=$(grep -c 'effortLevel:\$effort' "$SRC/cmd_pack.sh")
+# DIVE-4863: the sink writes through apply_effort (top-level AND per-model key);
+# the per-model behaviour itself is graded in tests/per_model_effort_unit.sh.
+SINK=$(grep -c 'apply_effort(\$effort; \$effort_ids)' "$SRC/cmd_pack.sh")
 check "T4c exactly one settings.json sink for effort" "$SINK" "1"
 
 # BEHAVIOURAL, not textual. An earlier cut of these arms grepped cmd_import for
