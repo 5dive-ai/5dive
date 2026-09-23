@@ -195,9 +195,17 @@ eval "$_tg_orig"
 
 echo "== T2: market --kind=plugin --json says which unit each row installs into =="
 
+# DIVE-4900: the listing now also FETCHES first-party standalone repos (council).
+# T2a grades the registry fixture, so the network is shut for it — a curl that
+# fails contributes no standalone row, which is also the arm that proves an
+# unreachable standalone repo never fails the listing. GH_ORG pinned so gh_org's
+# own probe (a curl) cannot resolve differently under the stub.
+export GH_ORG=5dive-ai; _GH_ORG_RESOLVED=""
+curl() { return 22; }
 JSON_MODE=1
 run cmd_market_plugins --kind=plugin
 JSON_MODE=0
+unset -f curl
 t "T2 listing succeeded (rc)" "0" "$RC"
 
 got=$(jq -r '[.data.plugins[] | "\(.name)=\(.installs)"] | sort | join(" ")' <<<"$OUT" 2>/dev/null)
@@ -254,6 +262,47 @@ t "T2d remote-index listing succeeded (rc)" "0" "$RC"
 remote_got=$(jq -r '[.data.plugins[] | "\(.name)=\(.installs)/\(.ready)"] | sort | join(" ")' <<<"$OUT" 2>/dev/null)
 t "T2d fetched rows carry installs too (and are not ready)" \
   "telegram=agent/false voice=box/false" "$remote_got"
+
+# T2e-T2h — DIVE-4900: council lives in its own repo and is listed beside the
+# registry, with the install source `plugin add` actually takes for it.
+got_ref=$(jq -r '[.data.plugins[] | "\(.name)=\(.install)"] | sort | join(" ")' <<<"$(export STATE_DIR="$_st_save"; curl() { return 22; }; JSON_MODE=1; cmd_market_plugins --kind=plugin 2>/dev/null)")
+t "T2e every registry row carries install = <name>@<marketplace>" \
+  "browser=browser@5dive-plugins buzz=buzz@5dive-plugins dashboard=dashboard@5dive-plugins telegram=telegram@5dive-plugins voice=voice@5dive-plugins" "$got_ref"
+
+export STATE_DIR="$TMP/state-standalone"
+CURL_LOG="$TMP/curl.log"; : >"$CURL_LOG"
+curl() {
+  local u="${*: -1}"; printf '%s\n' "$u" >>"$CURL_LOG"
+  case "$u" in
+    */5dive-council/main/.claude-plugin/marketplace.json)
+      printf '%s\n' '{"name":"5dive-council","plugins":[{"name":"council","category":"governance","description":"A sealed council.","source":"./council"},{"name":"voice","description":"a second voice"}]}' ;;
+    */5dive-plugins/main/.claude-plugin/marketplace.json)
+      printf '%s\n' '{"name":"5dive-plugins","plugins":[{"name":"telegram","category":"productivity"},{"name":"voice","category":"channel"}]}' ;;
+    *) return 22 ;;
+  esac
+}
+JSON_MODE=1
+run cmd_market_plugins --kind=plugin
+JSON_MODE=0
+t "T2f listing with a standalone repo succeeded (rc)" "0" "$RC"
+t "T2f council is listed from its OWN repo, installed box-wide, with the repo as its install source" \
+  "council|5dive-council|box|5dive-ai/5dive-council|false" \
+  "$(jq -r '.data.plugins[] | select(.name=="council") | "\(.name)|\(.marketplace)|\(.installs)|\(.install)|\(.ready)"' <<<"$OUT")"
+t "T2g a name the registry already lists is NOT listed a second time from a standalone repo" \
+  "1" "$(jq '[.data.plugins[] | select(.name=="voice")] | length' <<<"$OUT")"
+# A registered clone is read from disk (ready) and the network is not asked.
+mkdir -p "$(_plugin_mkt_dir)/5dive-council/.claude-plugin"
+printf '%s\n' '{"name":"5dive-council","plugins":[{"name":"council","category":"governance"}]}' \
+  >"$(_plugin_mkt_dir)/5dive-council/.claude-plugin/marketplace.json"
+: >"$CURL_LOG"
+JSON_MODE=1
+run cmd_market_plugins --kind=plugin
+JSON_MODE=0
+t "T2h a box that already registered 5dive-council reads it from disk and calls it ready" \
+  "true" "$(jq -r '.data.plugins[] | select(.name=="council") | .ready' <<<"$OUT")"
+tn "T2h ...without fetching the council repo" "5dive-council" "$(cat "$CURL_LOG")"
+unset -f curl
+export STATE_DIR="$_st_save"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

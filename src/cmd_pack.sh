@@ -3422,6 +3422,43 @@ _plugin_market_base() { echo "https://raw.githubusercontent.com/$(gh_org)/5dive-
 # --arg m (the marketplace) and --argjson c (the channel constant).
 _PLUGIN_INSTALLS_JQ='installs:(if (.name as $n | any($c[]; .plugin==$n and .marketplace==$m)) then "agent" else "box" end)'
 
+# DIVE-4900: every row also carries `install` — the exact source `plugin add`
+# takes for it. For a registry row that is `<name>@<marketplace>`, which is what
+# consumers already build; for a standalone first-party repo it is `<org>/<repo>`,
+# because its marketplace does not exist on a box until that install registers it.
+_PLUGIN_INSTALL_REF_JQ='install:(.name + "@" + $m)'
+
+# _market_standalone_rows <rows-json> — <rows-json> plus a row for every plugin
+# in FIVEDIVE_STANDALONE_PLUGIN_REPOS that <rows-json> does not already name.
+# Reads the registered clone when the box has one (ready:true), else the repo's
+# published marketplace.json. A repo that cannot be read contributes nothing and
+# never fails the listing — the registry rows are the listing's floor.
+_market_standalone_rows() {
+  local rows="$1" repo org idx mname ready
+  org=$(gh_org)
+  for repo in $FIVEDIVE_STANDALONE_PLUGIN_REPOS; do
+    idx="" ready=false
+    local lp; lp="$(_plugin_mkt_dir)/${repo}/.claude-plugin/marketplace.json"
+    if [[ -r "$lp" ]] && jq -e '.plugins' >/dev/null 2>&1 <"$lp"; then
+      idx=$(cat "$lp"); ready=true
+    else
+      idx=$(curl -fsSL --max-time 10 "https://raw.githubusercontent.com/${org}/${repo}/main/.claude-plugin/marketplace.json" 2>/dev/null) || idx=""
+      jq -e '.plugins' >/dev/null 2>&1 <<<"$idx" || continue
+    fi
+    # The marketplace name is the REPO name — what `plugin add <org>/<repo>`
+    # registers it as (_plugin_add_foreign) — not the index's own `name` field,
+    # so the row's key matches the installed key the box will report.
+    mname="$repo"
+    rows=$(jq -c --arg m "$mname" --arg src "${org}/${repo}" --argjson r "$rows" --argjson rd "$ready" \
+             --argjson c "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
+      '($r | map(.name)) as $have
+       | $r + [.plugins[]? | select(.name as $n | $have | index($n) | not)
+               | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:$rd,
+                  '"$_PLUGIN_INSTALLS_JQ"', install:$src}]' <<<"$idx") || rows="$1"
+  done
+  printf '%s\n' "$rows"
+}
+
 cmd_market_plugins() {
   local kw="" a
   for a in "$@"; do
@@ -3453,7 +3490,7 @@ cmd_market_plugins() {
     local lname; lname=$(jq -r '.name // "5dive-plugins"' "$local_mkt")
     rows=$(jq -c --arg m "$lname" --argjson r "$rows" --argjson c "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
       '$r + [.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:true,
-             '"$_PLUGIN_INSTALLS_JQ"'}]' \
+             '"$_PLUGIN_INSTALLS_JQ"', '"$_PLUGIN_INSTALL_REF_JQ"'}]' \
       "$local_mkt")
   fi
 
@@ -3466,9 +3503,11 @@ cmd_market_plugins() {
     local rname; rname=$(jq -r '.name // "5dive-plugins"' <<<"$idx")
     rows=$(jq -c --arg m "$rname" --argjson r "$rows" --argjson c "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
       '$r + [.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:false,
-             '"$_PLUGIN_INSTALLS_JQ"'}]' \
+             '"$_PLUGIN_INSTALLS_JQ"', '"$_PLUGIN_INSTALL_REF_JQ"'}]' \
       <<<"$idx")
   fi
+  # DIVE-4900: and the first-party plugins that live in their own repo (council).
+  rows=$(_market_standalone_rows "$rows")
 
   # With one registry there is no offline half-list to degrade to: either the
   # registered clone is on disk or the manifest fetch worked. Say which is
@@ -3507,6 +3546,8 @@ cmd_market_plugins() {
   } | column -t -s $'\t' | sed 's/^/  /'
   echo
   echo "  install:  5dive plugin add <name>"
+  local _standalone; _standalone=$(jq -r '[.[] | select(.install != null and (.install | contains("/"))) | "\(.name): 5dive plugin add \(.install)"] | join("; ")' <<<"$filtered")
+  [[ -n "$_standalone" ]] && echo "  from its own repo — ${_standalone}"
   local _notready; _notready=$(jq '[.[] | select(.ready|not)] | length' <<<"$filtered")
   (( _notready > 0 )) && \
     echo "  the rows marked 'add source' need their marketplace first:  5dive plugin marketplace add $(gh_org)/5dive-plugins"

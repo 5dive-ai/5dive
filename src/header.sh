@@ -270,6 +270,15 @@ declare -A TYPE_CHANNELS=(
 # tests/buzz_channel_wiring_unit.sh, which diffs them against this constant.
 readonly FIVEDIVE_CHANNEL_PLUGINS_JSON='[{"plugin":"telegram","marketplace":"5dive-plugins"},{"plugin":"dashboard","marketplace":"5dive-plugins"},{"plugin":"buzz","marketplace":"5dive-plugins"}]'
 
+# DIVE-4900: first-party plugins published from their OWN repo, with no copy in
+# the 5dive-plugins registry — `5dive market --kind=plugin` lists them beside the
+# registry so the one place a customer looks for plugins can see them. Repo names
+# under $(gh_org). Each row carries `install: "<org>/<repo>"`, the one-command
+# DIVE-4290 foreign add, because `<name>@<marketplace>` only resolves once that
+# marketplace is registered — which is what the install itself does. A plugin the
+# registry ALSO lists is not re-listed from here (registry wins, no second copy).
+readonly FIVEDIVE_STANDALONE_PLUGIN_REPOS="5dive-council"
+
 # DIVE-4697: claude.ai ACCOUNT-level sync of skills and plugins — the keys that
 # turn it OFF, as one constant for the same reason the channel list above is one
 # (a fixer and the check that gates it drifted, and the check read [ok] either
