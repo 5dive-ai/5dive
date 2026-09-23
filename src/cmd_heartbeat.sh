@@ -6121,6 +6121,17 @@ _hb_forge_merge_sweep() {
     esac
     sha="${rest%%$'\x1f'*}"
     at="${rest#*$'\x1f'}"
+    # DIVE-4899: THE PRIMARY IS NOT THE ROW. A companion bound beside it that
+    # has not landed keeps the row in the merging stage — counted OPEN, nothing
+    # written — so the merge owner goes on being dispatched to merge the rest.
+    # Recording here is what let DIVE-4895 read done with its frontend half open.
+    if declare -F _task_companions_unlanded >/dev/null 2>&1; then
+      local _comp_open; _comp_open=$(_task_companions_unlanded "$id" 2>/dev/null || printf '')
+      if [[ -n "$_comp_open" ]]; then
+        n_open=$((n_open+1))
+        continue
+      fi
+    fi
     # `forge-poll` and not this box's seat name: the ACTOR on this record is the
     # poller, and a record that named a seat would credit a landing to somebody
     # who was not there — the same false-credit class `_merge_disp_read` refuses

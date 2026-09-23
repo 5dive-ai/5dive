@@ -677,7 +677,13 @@ _task_status_cmd() {
     # from the paths this delivery actually touched (see _task_delivery_depth).
     # Empty = unknown = every branch below behaves exactly as it did before.
     local _depth=""
-    if [[ "$_route_st" != "done" && "$_route_st" != "cancelled" ]]; then
+    # DIVE-4899: both downgrades below (DIVE-2719 shallow, DIVE-4559 small)
+    # measure the PRIMARY pull request's diff only. A row that binds companions
+    # has diff the measurement never saw, so neither may skip its grader: the
+    # depth stays unknown and the size rule is not consulted.
+    local _has_comp=""
+    declare -F _task_companion_refs >/dev/null 2>&1 && _has_comp=$(_task_companion_refs "$id")
+    if [[ "$_route_st" != "done" && "$_route_st" != "cancelled" && -z "$_has_comp" ]]; then
       _depth=$(_task_delivery_paths "$id" | _task_delivery_depth)
     fi
     # DIVE-4251: the box's verification policy is consulted BEFORE the routing
@@ -723,7 +729,7 @@ _task_status_cmd() {
         # box sets it, so every existing box keeps today's behaviour and pays
         # not even the extra gh call.
         local _small=""
-        [[ "$_depth" != "deep" ]] && _small=$(_task_delivery_small_reason "$id")
+        [[ "$_depth" != "deep" && -z "$_has_comp" ]] && _small=$(_task_delivery_small_reason "$id")
         if [[ -n "$_small" ]]; then
           warn "$ident: verifier round skipped (DIVE-4559) — ${_small}. A cold grader session costs more than this diff is worth; CI and the DIVE-1830 merge gate still apply. Grader on the row was '$_vfier'; file with '--verify' to buy the round back, or lower the threshold with '5dive config verify-small=<lines>|off'."
         else
@@ -1094,6 +1100,34 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
         policy_refuse "$E_CONFLICT" done-with-stale-delivery-binding DIVE-2682 "$ident" \
           "$ident cannot close: its delivery binding ${_dref} was recorded at loop iteration ${_bind_iter}, and the loop is now at ${_cur_iter}. The work bounced back to the maker and was re-delivered after that PR was bound, so closing here would grade a PR that does not contain the re-delivered work (DIVE-2057 is the clean instance of that). Re-point the binding to the PR carrying the CURRENT iteration — \`task deliver $ident --pr=https://github.com/<owner>/<repo>/pull/N\` — then \`task done\`."
       fi
+    fi
+    # DIVE-4899: EVERY BOUND PULL REQUEST, NOT JUST THE PRIMARY. The gate below
+    # interrogates `delivery_ref` alone; a companion bound beside it by a
+    # multi-PR `task deliver` is checked here, with the same credential-free read
+    # the forge poller uses, and anything short of a confirmed landing refuses.
+    # BEFORE the primary's gate on purpose: that gate can MERGE the primary at
+    # close (DIVE-4137), and landing the primary while a companion is open is the
+    # half-shipped state this exists to prevent.
+    if [[ -n "$_dref" ]] && declare -F _task_companions_unlanded >/dev/null 2>&1; then
+      local _comp_open; _comp_open=$(_task_companions_unlanded "$id")
+      if [[ -n "$_comp_open" ]]; then
+        local _comp_list; _comp_list=$(paste -sd';' - <<<"$_comp_open"); _comp_list="${_comp_list//;/; }"
+        if [[ $force_merge_gate -eq 1 ]]; then
+          warn "$ident: closing with --force-merge-gate while bound pull request(s) are NOT merged — ${_comp_list} (DIVE-4899, audited)."
+          _task_store_audit_log "task.done-unmerged-companion" ok 0 -- "$ident" "open=${_comp_list}" "escape=force-merge-gate"
+        else
+          policy_refuse "$E_CONFLICT" done-with-unmerged-companion DIVE-4899 "$ident" \
+            "$ident cannot close: it binds more than one pull request and not all of them have merged — ${_comp_list}. A row is done only when EVERY bound pull request is on its target branch; DIVE-4895 closed done with its frontend half open for 80 minutes (DIVE-4899). Merge it (\`5dive task merge $ident\` merges each bound one), then \`task done\`. If that pull request is no longer part of this delivery, re-bind without it (\`task deliver $ident --pr=<each one that is>\`). \`--force-merge-gate\` overrides (audited)."
+        fi
+      fi
+    fi
+    # DIVE-4899: a result naming a pull URL that is bound to NOTHING on this row
+    # is refused the way DIVE-2096 refuses an unbound citation — here for the case
+    # where SOMETHING is bound (DIVE-2096 covers the case where nothing is).
+    if [[ -n "$_dref" ]] && declare -F _task_guard_unbound_pr_urls >/dev/null 2>&1; then
+      local -a _bound_all=("$_dref")
+      local _bc; while IFS= read -r _bc; do [[ -n "$_bc" ]] && _bound_all+=("$_bc"); done < <(_task_companion_refs "$id")
+      _task_guard_unbound_pr_urls "$ident" done "$result" "$no_pr" "$force_merge_gate" "${_bound_all[@]}"
     fi
     # DIVE-3823: THE RECORDED-EVIDENCE RAIL, read BEFORE the gate interrogates
     # GitHub — because on the seat this rescues there is no GitHub to interrogate.
