@@ -208,9 +208,14 @@ run_refresh_agent() { # <seat-home> -> $WORK/order.log
     export ORDER_LOG="$WORK/order.log" SEAT_HOME="$home" SEAT_CACHE="$home/$CACHE_REL"
     # GH_ORG=5dive-com short-circuits migrate_marketplace_org (no network probe).
     # shellcheck disable=SC2034  # CHANGED_AGENTS is appended to by refresh_agent; unset, it trips `set -u`
-    GH_ORG=5dive-com CLAUDE_BIN=/nonexistent/claude KEEP_PLUGIN_VERSIONS=2 CHANGED_AGENTS=""
+    # shellcheck disable=SC2034  # FAILED_AGENTS / REFRESH_FAIL_LINES are the step helper's globals (DIVE-4867)
+    GH_ORG=5dive-com CLAUDE_BIN=/nonexistent/claude KEEP_PLUGIN_VERSIONS=2 CHANGED_AGENTS="" FAILED_AGENTS="" REFRESH_FAIL_LINES=20
     export GH_ORG CLAUDE_BIN KEEP_PLUGIN_VERSIONS
     eval "$block"
+    # DIVE-4867 routed every probe through _claude_step. Without it here no probe
+    # runs at all and O1/O2 cannot grade the ordering, so it is lifted with the rest.
+    eval "$(fn _claude_step)"
+    eval "$(fn _warn_foreign_owned_marketplace_files)"
     eval "$(fn snapshot_state)"
     eval "$(fn migrate_marketplace_org)"
     eval "$(fn prune_plugin_cache)"

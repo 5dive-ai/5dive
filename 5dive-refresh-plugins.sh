@@ -314,10 +314,15 @@ _clear_mcp_failure_cache() { # <user> <home>
 # be told from a run that never reached the count — DIVE-4399's parked_count rule).
 REFRESH_FAIL_LINES="${REFRESH_FAIL_LINES:-20}"
 FAILED_AGENTS=""
-_claude_step() { # <user> <label> <claude args…>; returns 1 when the step failed
+# It runs `claude plugin <args>` and nothing else. The `plugin` word is written HERE,
+# at the one real call site, so the plugin-caller sweep in
+# tests/self_update_mcp_failure_cache_unit.sh still sees this file as a caller.
+# _claude_step <user> <label> <claude plugin args…> — returns 1 when the step failed.
+# (Arguments on their own line: the harnesses lift a function by `^name() {$`.)
+_claude_step() {
   local user="$1" label="$2" out rc=0 line failed=0 n=0
   shift 2
-  out=$(sudo -u "$user" -H "$CLAUDE_BIN" "$@" 2>&1) || rc=$?
+  out=$(sudo -u "$user" -H "$CLAUDE_BIN" plugin "$@" 2>&1) || rc=$?
   (( rc != 0 )) && failed=1
   grep -qiE '✘|fail|error' <<<"$out" && failed=1
   while IFS= read -r line; do
@@ -341,7 +346,8 @@ _claude_step() { # <user> <label> <claude args…>; returns 1 when the step fail
 # own update fail (`EACCES … rmdir 5dive-plugins.bak` on agent-main: 72 root-owned
 # files left by an earlier root-run step). Named, not fixed — whether to chown or
 # move them aside is a judgement about how they got there.
-_warn_foreign_owned_marketplace_files() { # <user> <home>
+# _warn_foreign_owned_marketplace_files <user> <home>
+_warn_foreign_owned_marketplace_files() {
   local user="${1:-}" home="${2:-}" dir first count
   dir="$home/.claude/plugins/marketplaces"
   [[ -n "$user" && -d "$dir" ]] || return 0
@@ -401,7 +407,7 @@ refresh_agent() {
   local marketplaces seat_failed=0
   marketplaces=$(printf '%s\n' "$all_keys" | awk -F@ '{print $NF}' | sort -u)
   for mp in $marketplaces; do
-    _claude_step "$user" "marketplace $mp" plugin marketplace update "$mp" || seat_failed=1
+    _claude_step "$user" "marketplace $mp" marketplace update "$mp" || seat_failed=1
   done
 
   while IFS= read -r key; do
@@ -412,7 +418,7 @@ refresh_agent() {
     elif [[ -z "$installed_keys" ]]; then
       verb="install"
     fi
-    _claude_step "$user" "plugin $verb $key" plugin "$verb" "$key" || seat_failed=1
+    _claude_step "$user" "plugin $verb $key" "$verb" "$key" || seat_failed=1
   done <<<"$all_keys"
   (( seat_failed )) && FAILED_AGENTS="${FAILED_AGENTS:+$FAILED_AGENTS }$ag"
 
