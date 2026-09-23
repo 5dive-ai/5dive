@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# DIVE-4869 phase 1: the constitution kernel is CORE, not council.
+# DIVE-4869 phase 1 / DIVE-4893: the constitution kernel is CORE, not council — and the council is gone.
 #
 # `task need`'s tier-2 floor and its lead-clear authority read the constitution and trust it only
 # when it matches the digest sealed in the council lineage. Before this change every one of those
 # reads went through `_council_*` functions defined in the council engine, behind `declare -F`
 # guards that FAIL CLOSED — so taking council out of the bundle would silently have dropped every
 # box to the shipped floor and denied every sealed lead. This harness grades the property the
-# extraction depends on: with src/cmd_council.sh NOT sourced at all, the gate floor and the
-# lead-clear allowlist behave exactly as they do with it.
+# extraction depends on: with no council code in scope at all, the gate floor and the lead-clear
+# allowlist behave exactly as they did with it. DIVE-4893 deleted the council from core, so the
+# parity arm against its copies became a GOLDEN arm: the solo seal core now writes into the shared
+# lineage must stay byte-identical to what the council's own writer produced, because the council
+# plugin still appends to — and verifies — that same chain.
 #
 #   K1  the kernel's embedded modules match their canonical sources; the generator is reproducible
 #   K2  control: the council engine really is absent in the K3 shell (no vacuous green)
 #   K3  gate floor + seal + drift + lead allowlist, council ABSENT
 #   K4  negative control: without the kernel the same shell fails closed (K3's green is the kernel)
-#   K5  parity with the council's own copies while both exist (and a mutant proves it can fail)
-#   K6  the kernel's loader and the council's loader print identical JSON for the same file
+#   K5  the solo genesis writer's output is byte-identical to the pre-move council engine's
+#       (golden bytes; a mutant proves the arm can fail)
+#   K6  the structural chain check gives the pre-move verdicts (intact / broken link / reordered)
 set -uo pipefail
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
@@ -40,6 +44,9 @@ heredoc() { awk -v d="$2" 'f && $0==d {exit} f {print} index($0, "<<'"'"'" d "'"
 [[ "$(heredoc src/constitution_kernel.sh CONSTITUTION_KERNEL_CLI_MJS)" == "$(cat src/constitution/cli.mjs)" ]] \
   && ok_t "K1 embedded cli.mjs matches src/constitution/cli.mjs" \
   || bad_t "K1 cli.mjs embed drifted" "run: node src/constitution/gen_kernel.mjs"
+[[ "$(heredoc src/constitution_kernel.sh CONSTITUTION_KERNEL_SEAL_MJS)" == "$(cat src/constitution/seal.mjs)" ]] \
+  && ok_t "K1 embedded seal.mjs matches src/constitution/seal.mjs" \
+  || bad_t "K1 seal.mjs embed drifted" "run: node src/constitution/gen_kernel.mjs"
 cp src/constitution_kernel.sh "$TMP/kernel.shipped"
 node src/constitution/gen_kernel.mjs 2>/dev/null
 cmp -s src/constitution_kernel.sh "$TMP/kernel.shipped" \
@@ -111,41 +118,52 @@ chk drift_reason   constitution-drifted "the denial names the drift"
   && ok_t "K4 without the kernel the constitution is ignored and every lead denied (K3's green is the kernel's)" \
   || bad_t "K4 control did not fail closed" "$(tr '\n' ' ' <<<"$N")"
 
-# --- K5 parity with the council's copies (they coexist until council leaves core) ----------
-# Normalise the council's names to the kernel's, then compare the function bodies.
-PAIRS="_council_constitution_path:_constitution_path _council_sealed_constitution_digest:_constitution_sealed_digest
-_council_live_constitution_digest:_constitution_live_digest _council_constitution_drifted:_constitution_drifted"
-norm() { sed 's/_council_constitution_path/_constitution_path/g; s/_council_sealed_constitution_digest/_constitution_sealed_digest/g; s/_council_live_constitution_digest/_constitution_live_digest/g; s/_council_constitution_drifted/_constitution_drifted/g'; }
-parity() { # $1 = kernel file to compare; prints the first pair that differs, or nothing
-  bash -c 'source "$1/src/header.sh"; source "$1/src/cmd_council.sh"; source "$2"; shift 2
-    for p in $1; do printf "%s\n" "${p%%:*}:${p##*:}"; done' _ "$ROOT" "$1" "$PAIRS" |
-  while IFS=: read -r c k; do
-    [[ "$(bash -c 'source "$1/src/header.sh"; source "$1/src/cmd_council.sh"; declare -f "$2"' _ "$ROOT" "$c" | norm)" \
-       == "$(bash -c 'source "$1/src/header.sh"; source "$2"; declare -f "$3"' _ "$ROOT" "$1" "$k")" ]] || echo "$c"
-  done
+# --- K5 the solo seal is byte-identical to the council's writer -----------------------------
+# Golden bytes captured from the council engine at 5dive-ai/5dive 853725fd (src/council/cli.mjs
+# `init`, the last core commit that carried it — identical to the plugin's provenance fcd81d73) on
+# exactly these arguments. Both writers append to ONE hash chain, so a divergence here is a record
+# one of them cannot re-derive.
+GEN_ARGS=(--seats=solo:chair --veto=human:solo --veto-resolved=1234567890 --prev-digest=0a1b2c
+          --seq=3 --stamped-at=2026-01-01T00:00:00Z --constitution-digest=deadbeef --force --genesis-exists=1)
+GOLDEN_CANONICAL='genesis: council v1 seq=3
+stampedAt: 2026-01-01T00:00:00Z
+forced: true
+prevDigest: 0a1b2c
+seat solo (chair): solo — council seat.
+chair: solo
+threshold: rule=majority value= flat=
+veto: human:solo -> 1234567890
+constitution: deadbeef'
+GOLDEN_OUT_SHA=2e25c61d6ae04a0a4932582189e252ed0c1edf336bff840aa455d5bc0d8e71ee
+GOLDEN_BENCH_SHA=bb658e78cb804596fc55d3a30fca44bc3749757bdbf4c87e2fb55cacfcb80acd
+genesis_run() { # $1 = kernel dir holding cli.mjs + siblings; prints "<canonical>\n--\n<out sha> <bench sha>"
+  local reg="$TMP/bench.$RANDOM.json" out
+  out="$(node "$1/cli.mjs" genesis "${GEN_ARGS[@]}" --registry="$reg")" || return 1
+  printf '%s\n--\n%s %s\n' "$(jq -r .canonical <<<"$out")" \
+    "$(printf '%s\n' "$out" | sha256sum | awk '{print $1}')" "$(sha256sum < "$reg" | awk '{print $1}')"
 }
-d="$(parity "$ROOT/src/constitution_kernel.sh")"
-[[ -z "$d" ]] && ok_t "K5 the four kernel functions are body-identical to the council's copies" \
-              || bad_t "K5 kernel and council copies drifted" "differs: $d"
-sed 's/\[\[ -z "\$live" \]\] \&\& return 0 /[[ -z "$live" ]] \&\& return 1 /' src/constitution_kernel.sh > "$TMP/mutant.sh"
-if cmp -s "$TMP/mutant.sh" src/constitution_kernel.sh; then bad_t "K5 mutant did not apply" "the parity control proves nothing"
+WANT="$(printf '%s\n--\n%s %s\n' "$GOLDEN_CANONICAL" "$GOLDEN_OUT_SHA" "$GOLDEN_BENCH_SHA")"
+[[ "$(genesis_run src/constitution)" == "$WANT" ]] \
+  && ok_t "K5 the solo genesis record, canonical bytes and seeded bench match the council writer's golden" \
+  || bad_t "K5 the solo seal drifted from the council's writer" "$(diff <(genesis_run src/constitution) <(printf '%s' "$WANT"))"
+mkdir -p "$TMP/k5mut"; cp src/constitution/*.mjs "$TMP/k5mut/"
+sed -i 's/L.push(`forced: ${!!rec.forced}`)/L.push(`forced:${!!rec.forced}`)/' "$TMP/k5mut/seal.mjs"
+if cmp -s "$TMP/k5mut/seal.mjs" src/constitution/seal.mjs; then bad_t "K5 mutant did not apply" "the golden control proves nothing"
 else
-  d="$(parity "$TMP/mutant.sh")"
-  [[ "$d" == _council_constitution_drifted ]] \
-    && ok_t "K5 control: a mutant that trusts a deleted sealed file is caught by the parity arm" \
-    || bad_t "K5 control: mutant not caught" "got '$d'"
+  [[ "$(genesis_run "$TMP/k5mut")" != "$WANT" ]] \
+    && ok_t "K5 control: a one-space change to the canonical preimage is caught by the golden" \
+    || bad_t "K5 control: mutant not caught" "the golden arm cannot fail"
 fi
 
-# --- K6 one parser: kernel loader == council loader, byte for byte ------------------------
-printf '%s\n' "${POLICY[@]}" > "$TMP/doc-policy.yaml"
-printf '%s\n' 'not yaml frontmatter' > "$TMP/doc-bad.yaml"
-for doc in "" "$TMP/doc-policy.yaml" "$TMP/doc-bad.yaml" "$TMP/doc-missing.yaml"; do
-  a="$(node src/constitution/cli.mjs constitution --path="$doc" 2>&1)"
-  b="$(node src/council/cli.mjs constitution --path="$doc" 2>&1)"
-  [[ -n "$a" && "$a" == "$b" ]] \
-    && ok_t "K6 kernel and council loaders agree on '${doc##*/}' ($(jq -r .source <<<"$a"))" \
-    || bad_t "K6 loaders disagree on '${doc##*/}'" "kernel=$a council=$b"
-done
+# --- K6 the chain check keeps the council's verdicts ----------------------------------------
+chain() { node src/constitution/cli.mjs verify-chain --entries="$1"; echo "rc=$?"; }
+[[ "$(chain '[{"seq":0,"prevDigest":"","digest":"a"},{"seq":1,"prevDigest":"a","digest":"b"}]')" \
+   == $'{"ok":true,"head":"b","length":2}\nrc=0' ]] \
+  && ok_t "K6 an intact two-record chain verifies (head b, rc 0)" || bad_t "K6 intact chain" "$(chain '[{"seq":0,"prevDigest":"","digest":"a"},{"seq":1,"prevDigest":"a","digest":"b"}]')"
+[[ "$(chain '[{"seq":0,"prevDigest":"","digest":"a"},{"seq":1,"prevDigest":"x","digest":"b"}]')" == *'"ok":false,"reason":"broken chain at record 1'*'rc=5' ]] \
+  && ok_t "K6 an edited link is a broken chain (rc 5)" || bad_t "K6 broken link not caught" ""
+[[ "$(chain '[{"seq":1,"prevDigest":"","digest":"a"},{"seq":1,"prevDigest":"a","digest":"b"}]')" == *'non-monotonic seq'*'rc=5' ]] \
+  && ok_t "K6 a reordered/duplicated seq is refused (rc 5)" || bad_t "K6 non-monotonic seq not caught" ""
 
 printf '\nconstitution_kernel_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

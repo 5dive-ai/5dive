@@ -946,6 +946,7 @@ _account_verb_dispatch() {
 _moved_verb_repo() {
   case "$1" in
     ui) printf '5dive-ai/5dive-ui\n' ;;
+    council) printf '5dive-ai/5dive-council\n' ;;   # DIVE-4893
     *)  return 1 ;;
   esac
 }
@@ -1448,18 +1449,13 @@ main() {
       # new state or engine. Same group-writable store as tasks; no root/lock
       # (the sub-commands it calls own their own writes).
       cmd_company "$@" ;;
-    council)
-      # CNCL-6 (v0.11): standalone deliberation council. Embeds a node engine
-      # materialized to a temp dir; reads are unprivileged, bench add/rm + the
-      # receipt seal (gate-proof) take root themselves. No registry lock (the
-      # persisted bench file is a plain jq write behind the sudo gate).
-      cmd_council "$@" ;;
     constitution)
       # DIVE-1742: top-level front door onto the machine-enforced constitution.
       # `show` (READ) composes one JSON envelope (guardrails/thresholds/veto +
       # seal/verify state + amendment receipts) the dashboard consumes instead
-      # of parsing constitution.yaml in-browser. Read-only; init (DIVE-1701) +
-      # set (DIVE-1743) land next. Aliases into cmd_council internals.
+      # of parsing constitution.yaml in-browser; init (DIVE-1701) + set/edit
+      # (DIVE-1743) seed and solo-seal it. All of it is the constitution kernel
+      # — no council (DIVE-4893: `council` is a plugin, see _moved_verb_repo).
       cmd_constitution "$@" ;;
     up)
       # Compose-style: bring up agents declared in 5dive.yaml. Mutating but

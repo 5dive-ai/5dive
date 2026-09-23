@@ -300,11 +300,8 @@ else
   bad "cmd_deliver does not parse --notify"
 fi
 # And the in-repo notification rails set it.
-# src/cmd_council.sh is GENERATED from src/council/cli.mjs by src/council/gen_cmd.mjs,
-# and tests/council_cli_contract.mjs re-runs the generator — so a hand-edit to the
-# generated file is silently reverted mid-suite and the marker vanishes. Assert the
-# CANONICAL source too, or this check passes on an edit that cannot survive.
-for f in src/cmd_supervisor.sh src/task/notify.sh src/council/cli.mjs src/cmd_council.sh; do
+# (DIVE-4893: the council's sends left core with it — its marker is the council plugin's to keep.)
+for f in src/cmd_supervisor.sh src/task/notify.sh; do
   if grep -qE "_5DIVE_A2A_NOTIFY=1 5dive agent send|_5DIVE_A2A_NOTIFY: '1'" "$ROOT/$f"; then
     ok "$f marks its notification sends"
   else

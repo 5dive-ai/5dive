@@ -24,12 +24,12 @@ cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-clear-leads-reader.XXXXXX)"
 
-# STATE_DIR before cmd_council.sh: COUNCIL_DIR/COUNCIL_LINEAGE are source-time globals.
+# STATE_DIR before constitution_kernel.sh: COUNCIL_DIR/COUNCIL_LINEAGE are source-time globals.
 STATE_DIR="$TMP"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh cmd_council.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

@@ -201,6 +201,9 @@ sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 `5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`<br>
 让智能体在明确边界内持续自主工作。
 
+`5dive plugin add 5dive-ai/5dive-council`<br>
+安装 Council（可选插件）；`5dive constitution` 与其封存的人工审批底线无需它即可工作。
+
 `5dive council convene "Should we ship?" --mode=adversarial`<br>
 发起一次可审计的多智能体对抗式评审。
 
@@ -400,6 +403,7 @@ Web 界面是一个插件，有[自己的仓库](https://github.com/5dive-ai/5di
 5dive company                            # 搭建一家自主运转的公司
 5dive goal add "<outcome>"                # 将结果转成带护栏的任务图
 5dive loop spawn --role=<r> --agent=<a> --prompt="<work>"
+5dive plugin add 5dive-ai/5dive-council   # Council 是可选插件
 5dive council convene "<question>" --mode=adversarial
 5dive trace <task>                       # 从起点到结论的因果时间线
 5dive memory search "<query>"             # 搜索带来源的长期知识

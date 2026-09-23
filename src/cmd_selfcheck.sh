@@ -197,7 +197,7 @@ _sc_probe_lead_clear_seal() {
     constitution-drifted)
       _sc_fail "the on-disk constitution does not match the digest sealed into the council lineage (drifted) — routed lead-clear is denied to EVERYONE including its legitimate holder, and this is the tamper alarm, not a config gap. Re-sealing is a council motion; $standing" ;;
     no-council-loader)
-      _sc_notreached "no-council-loader" "the council constitution helpers are absent from this build, so the allowlist cannot be resolved at all" ;;
+      _sc_notreached "no-council-loader" "the constitution kernel's seal reader is absent from this build, so the allowlist cannot be resolved at all (the reason literal predates DIVE-4869; the council is not involved)" ;;
     *)
       _sc_pass "routed lead-clear is INERT on this box ($why): NO agent can clear an approval/manual/access gate routed to it, and every such gate falls through to a human. Fail-closed and safe — arming it means sealing authority.gate_clear_leads via a council motion, which is deliberately not something an agent can do for itself. $standing" ;;
   esac

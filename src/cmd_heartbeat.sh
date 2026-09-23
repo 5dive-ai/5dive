@@ -6173,11 +6173,14 @@ _hb_forge_merge_sweep() {
 # DEFAULT OFF: a live convene injects into seat sessions, so this stays gated on an explicit
 # COUNCIL_ROT_TRIAGE=on opt-in AND a seeded genesis, until main's CNCL-7 live-dispatch window.
 # Throttled to once/6h fleet-wide so the same backlog isn't re-convened every wake.
+# DIVE-4893: the council is a plugin now, so the sweep reaches it over the CLI and is a no-op on a
+# box without it — checked BEFORE the throttle stamp, so installing the plugin later is not
+# pre-empted by a sweep that never ran.
 _HB_COUNCIL_ROT="${COUNCIL_ROT_TRIAGE:-off}"
 _hb_council_rot_sweep() {
   [[ "$_HB_COUNCIL_ROT" == "on" || "$_HB_COUNCIL_ROT" == "1" ]] || return 0
   [[ -f "${STATE_DIR}/council/genesis.json" ]] || return 0   # no seeded council -> nothing to convene
-  ensure_node_on_path || return 0
+  [[ -n "$(_plugin_verb_claims council 2>/dev/null)" ]] || return 0   # no council plugin -> nothing to convene
   # Fleet-wide throttle: skip if a rot sweep ran within the last 6h.
   local last; last="$(db "SELECT value FROM task_prefs WHERE key='council_rot_swept_at';" 2>/dev/null)"
   if [[ -n "$last" ]]; then
@@ -6186,8 +6189,8 @@ _hb_council_rot_sweep() {
   fi
   db "INSERT INTO task_prefs (key,value) VALUES ('council_rot_swept_at', datetime('now'))
         ON CONFLICT(key) DO UPDATE SET value=datetime('now');" 2>/dev/null || true
-  # cmd_council owns the convene + the never-clear guarantee; JSON output kept quiet.
-  local n; n="$(JSON_MODE=1 cmd_council rot-triage --all --older-than-hours=48 2>/dev/null | jq -r '.data.count // 0' 2>/dev/null)" || n=0
+  # The plugin owns the convene + the never-clear guarantee; JSON output kept quiet.
+  local n; n="$(JSON_MODE=1 _constitution_council rot-triage --all --older-than-hours=48 2>/dev/null | jq -r '.data.count // 0' 2>/dev/null)" || n=0
   [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) && _hb_log "[council-rot] re-briefed ${n} stale tier-2 gate(s) (none cleared)"
   return 0
 }

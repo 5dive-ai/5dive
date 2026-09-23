@@ -685,7 +685,6 @@ NEXT
 
     5dive task add 'ship the landing page'       queue work for your team
     5dive company 'launch my SaaS'               stand up a company from a goal
-    5dive council convene 'should we ship?'      convene a decision council
     5dive market                                 hire a ready-made teammate
     5dive --help                                 every verb
 

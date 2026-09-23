@@ -200,6 +200,9 @@ Turn an outcome into a guarded task graph.
 `5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`<br>
 Run bounded autonomous work in a persistent agent loop.
 
+`5dive plugin add 5dive-ai/5dive-council`<br>
+Add the Council. It is an opt-in plugin; the constitution (`5dive constitution`) and the human-gate floor it seals work without it.
+
 `sudo 5dive council init --seats=alice:chair,bob,carol --threshold=majority --veto=human:you`<br>
 Seed the Council's genesis roster. A human does this once; the primary Council refuses to convene until it exists.
 
@@ -452,6 +455,7 @@ Four views is a start, not a finish — the [5dive-ui repo](https://github.com/5
 5dive company                            # stand up a self-steering company
 5dive goal add "<outcome>"                # outcome -> guarded task graph
 5dive loop spawn --role=<r> --agent=<a> --prompt="<work>"
+5dive plugin add 5dive-ai/5dive-council   # the Council is an opt-in plugin
 sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<principal>
 5dive council convene "<question>" --mode=adversarial
 5dive trace <task>                       # causal timeline from origin to verdict

@@ -55,11 +55,11 @@ exec 8>&2
 # shellcheck disable=SC2154  # rc is assigned inside the trap body
 trap 'rc=$?; rm -rf "$TMP"; [[ "$SUMMARY_PRINTED" == 1 ]] || printf "ABORTED - gate_root_filer_standing_route_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8; echo "HARNESS-RC=$rc"' EXIT
 
-# STATE_DIR before cmd_council.sh: COUNCIL_DIR/COUNCIL_LINEAGE are source-time globals.
+# STATE_DIR before constitution_kernel.sh: COUNCIL_DIR/COUNCIL_LINEAGE are source-time globals.
 STATE_DIR="$TMP"
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh cmd_council.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh constitution_kernel.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

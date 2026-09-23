@@ -643,7 +643,7 @@ _gate_tier2_floor_hit() {
       # unchanged: the present file is loaded as before.
       if declare -F _constitution_drifted >/dev/null 2>&1 \
          && _constitution_drifted; then
-        warn "constitution.yaml drifted from the sealed digest; enforcing the shipped tier-2 floor, not the on-disk file (amend via a constitutional-class council motion) (${constitution_path})"
+        warn "constitution.yaml drifted from the sealed digest; enforcing the shipped tier-2 floor, not the on-disk file (re-seal it: sudo 5dive constitution edit — a multi-seat council routes that to 'council amend') (${constitution_path})"
       else
         loaded_rx="$(_constitution_hard_gate_rx 2>/dev/null || true)"
         if [[ -n "$loaded_rx" ]]; then

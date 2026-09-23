@@ -50,8 +50,7 @@ import re, sys, os, glob
 
 root = sys.argv[1]
 files = sorted(glob.glob(os.path.join(root, 'src', '*.sh'))
-               + glob.glob(os.path.join(root, 'src', 'task', '*.sh'))
-               + glob.glob(os.path.join(root, 'src', 'council', '*.sh')))
+               + glob.glob(os.path.join(root, 'src', 'task', '*.sh')))
 
 def strip_heredocs(lines):
     """Blank out heredoc BODIES. cmd_proof.sh's help heredoc contains prose like
