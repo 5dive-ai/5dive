@@ -854,6 +854,13 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     parent="$(db "SELECT COALESCE(p.ident,'') FROM tasks t LEFT JOIN tasks p ON p.id=t.parent_id WHERE t.id=${id};" 2>/dev/null)" \
     actor="$creator" claimed_by="$derived_actor" in="$title" \
     detail="${priority} → ${assignee:-unassigned}${verifier:+ (verifier ${verifier})}"
+  # DIVE-4866: the routing decision's receipt (task-route). Additive only; see
+  # src/lib/reflex.sh. The `|| true` covers a harness with no reflex.sh sourced.
+  reflex_receipt policy=task-route ident="$ident" task_id="$id" actor="$creator" \
+    result="${assignee:-unassigned}" candidates="$(reflex_roster_csv 2>/dev/null)" \
+    signals="$(jq -cn --arg p "$priority" --arg v "${verifier:-}" '{via:"add", priority:$p, has_verifier:($v!="")}' 2>/dev/null)" \
+    effect="$(jq -cn --arg t "$ident" --arg to "${assignee:-}" '{task:$t, from:null, to:(if $to=="" then null else $to end)}' 2>/dev/null)" \
+    2>/dev/null || true
   if [[ "$kind" == "recurring" ]]; then
     ok "created recurring ${ident} (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title" \
        '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
@@ -1748,6 +1755,13 @@ cmd_task_assign() {
                         THEN datetime('now') ELSE started_at END
       WHERE id=${id};"
   ok "$ident assigned to $who" '{id:($i|tonumber), ident:$id, assignee:$a}' --arg i "$id" --arg id "$ident" --arg a "$who"
+  # DIVE-4866: a reassignment is a routing decision too (task-route, via=assign).
+  # Additive only; see src/lib/reflex.sh.
+  reflex_receipt policy=task-route ident="$ident" task_id="$id" \
+    result="$who" candidates="$(reflex_roster_csv 2>/dev/null)" \
+    signals="$(jq -cn --arg p "$(db "SELECT COALESCE(priority,'') FROM tasks WHERE id=${id};" 2>/dev/null)" '{via:"assign", priority:$p}' 2>/dev/null)" \
+    effect="$(jq -cn --arg t "$ident" --arg f "$_asg_cur_assignee" --arg to "$who" '{task:$t, from:(if $f=="" then null else $f end), to:$to}' 2>/dev/null)" \
+    2>/dev/null || true
   # DIVE-3499: sender-visible receipt — owner, queue position, next wake. Cannot
   # fail; see src/lib/routing_receipt.sh.
   # The `|| true` and the stderr drop are the additive-only contract AT THE CALL

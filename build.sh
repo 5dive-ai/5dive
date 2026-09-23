@@ -101,6 +101,7 @@ CORE_FILES=(
   src/lib/runs.sh
   src/lib/actor.sh
   src/lib/routing_receipt.sh
+  src/lib/reflex.sh
   src/lib/a2a_rounds.sh
   src/lib/a2a_urgent.sh
 )
@@ -150,6 +151,7 @@ LAZY_FILES=(
   src/cmd_task.sh
   src/cmd_trigger.sh
   src/cmd_trace.sh
+  src/cmd_reflex.sh
   src/cmd_run.sh
   src/cmd_org.sh
   src/cmd_human.sh

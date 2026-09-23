@@ -2339,6 +2339,16 @@ _task_reject_emit_event() {
   ledger_emit task.rejected ident="$ident" task_id="$id" actor="$actor" \
     out="$prev" \
     detail="rejected by ${actor} at iteration ${iter}${maxi:+/$maxi}, ${disposition}; prior_result=${prior}"
+  # DIVE-4866: what happens after a failed attempt (retry-action). Both reject
+  # sites come through here, so the escalation is receipted as well as the
+  # bounce. Additive only; see src/lib/reflex.sh.
+  local _rx_res="retry_with_feedback"
+  [[ "$disposition" == escalated* ]] && _rx_res="human"
+  reflex_receipt policy=retry-action ident="$ident" task_id="$id" actor="$actor" \
+    result="$_rx_res" candidates="retry_with_feedback,human" \
+    signals="$(jq -cn --arg i "$iter" --arg m "$maxi" '{iteration:($i|tonumber? // null), max_iterations:($m|tonumber? // null)}' 2>/dev/null)" \
+    effect="$(jq -cn --arg t "$ident" --arg d "$disposition" '{task:$t, disposition:(if ($d|startswith("escalated")) then "escalated" else "bounced" end)}' 2>/dev/null)" \
+    2>/dev/null || true
   # DIVE-3932: the verdict lands on the VERIFIER's own open run, and closes it —
   # producing a verdict is the verifier's end boundary. The maker's run for this
   # iteration was already closed `handed_to_verifier`; it is deliberately NOT

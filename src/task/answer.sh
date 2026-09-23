@@ -1756,6 +1756,10 @@ cmd_task_answer() {
   ledger_emit gate.answered ident="$ident" task_id="$id" actor="${_lg_prov:-unknown}" \
     policy="tier${gtier}:${nt}" out="$_vfs" \
     detail="${nt} gate cleared by ${_lg_prov:-<unrecorded>}$([[ "$_lg_prov" == human:* ]] && echo ' (human touchpoint)')"
+  # DIVE-4866: the gate-answer receipt, including whether the answer matched
+  # --recommend. Read off the row, never from $value; a secret's value is not
+  # carried at all. Additive only; see src/lib/reflex.sh.
+  reflex_gate_receipt "$id" 2>/dev/null || true
   # DIVE-3932: gate.closed on whatever run is open for the row. The answer is
   # not stored (it can be a credential — see the hashing note above); only the
   # fact and the answerer's PROVENANCE CLASS are, which is what a run timeline

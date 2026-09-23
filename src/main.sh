@@ -406,6 +406,7 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
 Trace (causal timeline for one task, goal → ship —):
   5dive run ls|show|events|logs|retry|metrics        # execution attempts beneath tasks (DIVE-3932); one run = one agent's one attempt
   5dive trace <id|DIVE-N> [--json] [--no-audit]      # read-only: origin (goal/parent/objective/loop) + lifecycle + gate provenance + verdict
+  5dive reflex log|replay|fake [...]                 # read-only: decision receipts + offline replay of a candidate backend (DIVE-4866)
 
 Memory (queryable team memory — read-path,):
   5dive memory search "<query>" [--limit=N] [--max-tokens=T]  # BM25-ranked snippets from the agent's memory stores + wiki, with provenance
@@ -1421,6 +1422,10 @@ main() {
       # group-writable store as tasks (`run retry` only ever APPENDS an attempt);
       # no root, no registry lock, no audit line — same posture as trace/usage.
       cmd_run "$@" ;;
+    reflex)
+      # DIVE-4866: decision receipts (phase 0) — read-only log + offline replay
+      # harness over the task store. No mutation/lock/audit, same posture as trace.
+      cmd_reflex "$@" ;;
     trace)
       # INST-1: causal timeline for one task (goal → ship). Read-only view over
       # existing data — task transition columns + project/parent/objective/loop

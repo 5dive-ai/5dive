@@ -352,7 +352,13 @@ cmd_trace() {
   if [[ "$(printf '%s' "$ledger_json" | jq 'length')" -gt 0 ]]; then
     printf '%s' "$ledger_json" | jq -r '.[] |
       "  \(.ts)  \(.kind | (. + "                ")[0:16])  \(.actor | (. + "            ")[0:12])  " +
-      "\(.authority | (. + "            ")[0:12])  \(.detail)" +
+      "\(.authority | (. + "            ")[0:12])  " +
+      # DIVE-4866: a decision receipt stores its JSON in detail; show the pick,
+      # not the blob. `5dive reflex log --json` has the whole receipt.
+      (if (.kind | startswith("decision.")) then
+         ((.detail | fromjson? // {}) as $r
+          | "decided \($r.result // "?") of \(($r.candidates // []) | length) option(s) (\($r.backend.adapter // "?"))")
+       else .detail end) +
       (if .policy   != "" then "\n      policy: \(.policy)"       else "" end) +
       (if .in_hash  != "" then "\n      in:  sha256:\(.in_hash)"  else "" end) +
       (if .out_hash != "" then "\n      out: sha256:\(.out_hash)" else "" end)'
