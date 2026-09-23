@@ -5226,10 +5226,18 @@ _hb_gate_ttl_sweep() {
     # which on a stopped loop is the VERIFIER — telling them to "resume the task"
     # is the hand-back that left DIVE-4520 with no owner, and the executor has
     # already sent the maker the hand-over receipt.
-    if [[ -z "$_ttl_esc" && -n "$gowner" ]]; then
+    # DIVE-4896: nor does a seat busy on ANOTHER in_progress row — a gate-answer
+    # ping is not a dispatch. The row is already 'todo' (this sweep never
+    # restores in_progress), so the dispatcher hands it over once the seat is
+    # free; see the ping comment in cmd_task_answer.
+    local _ttl_busy=""
+    if [[ -n "$gowner" ]] && declare -F _gate_seat_busy_elsewhere >/dev/null 2>&1; then
+      _ttl_busy=$(_gate_seat_busy_elsewhere "$gid" "$gowner") || _ttl_busy=""
+    fi
+    if [[ -z "$_ttl_esc" && -n "$gowner" && -z "$_ttl_busy" ]]; then
       ( cmd_send "$gowner" --message="⏱ ${gident} tier-1 gate hit its 48h TTL — recommendation applied: ${grec}. Resume the task; run \`5dive task show ${gident}\`." ) >/dev/null 2>&1 || true
     fi
-    _hb_log "[gate-ttl] ${gident} T1 48h TTL -> applied rec${_ttl_esc}"
+    _hb_log "[gate-ttl] ${gident} T1 48h TTL -> applied rec${_ttl_esc}${_ttl_busy:+ (owner ${gowner} busy on ${_ttl_busy} — not pinged, DIVE-4896)}"
   done < <(db "SELECT id||x'1f'||need_type||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(assignee,'')
                FROM tasks
                WHERE need_type IS NOT NULL AND need_answered_at IS NULL

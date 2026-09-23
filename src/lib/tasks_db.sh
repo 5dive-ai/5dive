@@ -3743,9 +3743,40 @@ _gate_archive_and_clear_sql() {
 # and match that exact prefix, so wrapping it after `UPDATE tasks` would make this
 # write invisible to the fence checker instead of fenced by it.
 #
-# Usage: db "... $(_gate_restore_status_sql "${id}")"
+# DIVE-4896 — THE SECOND ARGUMENT, `yield`, and why only ONE caller passes it.
+# Restoring 'in_progress' is right when the maker is still sat on this row
+# waiting for the answer. It is wrong when the maker has since moved on: at
+# 10:39Z on 2026-09-23 ops answered DIVE-4891's gate while dev had taken
+# DIVE-4893, the restore handed 4891 back as in_progress, and dev held TWO
+# in_progress rows — the heartbeat's busy guard then reads the seat as busy on
+# both and neither is dispatchable fresh. With `yield`, an in_progress restore
+# on a row whose ASSIGNEE holds another in_progress row lands on 'todo' with
+# started_at cleared instead, so the heartbeat dispatches it with a proper goal
+# once the seat is free. The answer is on the row either way.
+#
+# Only the typed `task answer` passes it. The other five callers run INSIDE the
+# filer's own call (tier-0, push-for-review, precedent and track-record clear at
+# filing; withdraw is the filer retiring its own ask), so the filer is by
+# construction at the keyboard on THIS row — yielding there would drop the row
+# a maker is actively pushing out from under it. The TTL sweep does not restore
+# at all (it writes 'todo').
+#
+# Usage: db "... $(_gate_restore_status_sql "${id}" [yield])"
 _gate_restore_status_sql() {
-  local id="$1"
+  local id="$1" yield="${2:-}"
+  if [[ "$yield" == "yield" ]]; then
+    local busy; busy=$(_gate_seat_busy_elsewhere_pred "${id}" "tasks.assignee")
+    printf '%s\n' \
+      "UPDATE tasks SET status=CASE WHEN gate_prev_status='in_progress' AND ${busy} THEN 'todo'" \
+      "                             WHEN gate_prev_status IN ('todo','in_progress')" \
+      "                             THEN gate_prev_status ELSE 'todo' END," \
+      "                 started_at=CASE WHEN gate_prev_status='in_progress' AND ${busy}" \
+      "                                 THEN NULL ELSE started_at END," \
+      "                 gate_prev_status=NULL" \
+      "  WHERE id=${id} AND status='blocked'" \
+      "    AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+    return 0
+  fi
   # printf, not a heredoc — same reason as _gate_archive_and_clear_sql above.
   printf '%s\n' \
     "UPDATE tasks SET status=CASE WHEN gate_prev_status IN ('todo','in_progress')" \
@@ -3753,6 +3784,33 @@ _gate_restore_status_sql() {
     "                 gate_prev_status=NULL" \
     "  WHERE id=${id} AND status='blocked'" \
     "    AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+}
+
+# DIVE-4896: "this seat is working a DIFFERENT row right now" — the one
+# predicate both halves of the busy-maker rule read, so the status the row is
+# restored to and the ping decision cannot disagree about who is busy. `seat` is
+# a SQL expression (a quoted name, or `tasks.assignee` inside an UPDATE). Every
+# in_progress row counts, not only kind='standard': the heartbeat's busy guard
+# ("busy — N in_progress, skip") counts every one, and this rule exists so that
+# guard is not handed a second row.
+_gate_seat_busy_elsewhere_where() {   # <row id> <seat sql expr> -> WHERE conjuncts over alias o
+  printf "o.id<>%s AND o.status='in_progress' AND COALESCE(o.assignee,'')<>'' AND o.assignee=%s" "$1" "$2"
+}
+_gate_seat_busy_elsewhere_pred() {   # <row id> <seat sql expr> -> SQL boolean
+  printf 'EXISTS (SELECT 1 FROM tasks o WHERE %s)' "$(_gate_seat_busy_elsewhere_where "$1" "$2")"
+}
+
+# The in_progress row that makes `seat` busy elsewhere, as its ident; empty when
+# it is not. Oldest claim first, so a seat that somehow holds several names the
+# one it has been on longest.
+_gate_seat_busy_elsewhere() {   # <row id> <seat name> -> prints ident, rc 0 when busy
+  local id="${1:-}" seat="${2:-}" b
+  [[ "$id" =~ ^[0-9]+$ && -n "$seat" ]] || return 1
+  b=$(db "SELECT COALESCE(NULLIF(o.ident,''), CAST(o.id AS TEXT)) FROM tasks o
+           WHERE $(_gate_seat_busy_elsewhere_where "${id}" "$(sqlq "$seat")")
+           ORDER BY COALESCE(o.started_at,''), o.id LIMIT 1;" 2>/dev/null) || return 1
+  [[ -n "$b" ]] || return 1
+  printf '%s' "$b"
 }
 
 # Constant-time compare: full-length scan, no early exit. Length isn't secret (the

@@ -166,6 +166,28 @@ eq_t "A14: ... and answering THAT one resumes the loop too" \
 eq_t "A15: ... buying exactly one more pass" "$(field ESC-KEEP max_iterations)" "4"
 
 echo
+echo "== A-BUSY. DIVE-4896: 'keep going' TO A MAKER NOW BUSY ON ANOTHER ROW =="
+# DIVE-4891's exact shape: the stop is lifted while the maker is working a
+# different row. The row goes back to the queue on the maker, as in A, but the
+# resume ping is NOT sent — a ping to a busy seat is a dispatch nobody chose.
+seed_capped ESC-BUSY
+file_escalation ESC-BUSY
+db "INSERT INTO tasks (ident, title, priority, assignee, created_by, kind, status, started_at)
+    VALUES ('ESC-BUSY-B', 'what the maker took meanwhile', 'medium', 'dev', 'main', 'standard',
+            'in_progress', datetime('now'));"
+: >"$SENT"
+AB_OUT=$( (cmd_task_answer "$(rowid ESC-BUSY)" --value="$_ESCALATION_RECOMMEND" --from=main) 2>&1 ); AB_RC=$?
+eq_t "AB1: the answer succeeds"                         "$AB_RC" "0"
+eq_t "AB2: the row is still handed back to the MAKER"   "$(field ESC-BUSY assignee)" "dev"
+eq_t "AB3: ... on todo, for the heartbeat to dispatch"  "$(field ESC-BUSY status)" "todo"
+eq_t "AB4: ... with the cap still raised to N+1"        "$(field ESC-BUSY max_iterations)" "3"
+eq_t "AB5: the row the maker is working is untouched"   "$(field ESC-BUSY-B status)" "in_progress"
+eq_t "AB6: NOTHING is sent to the busy maker"           "$(wc -l <"$SENT" | tr -d ' ')" "0"
+has_t "AB7: the receipt names the row the maker is on"  "$AB_OUT" "not pinged: dev is working ESC-BUSY-B"
+# Clear the busy row so the sections below grade an idle maker, as A did.
+db "UPDATE tasks SET status='done' WHERE ident='ESC-BUSY-B';"
+
+echo
 echo "== B. 'drop it' STOPS IT, AND KEEPS THE FINDINGS =="
 seed_capped ESC-DROP
 file_escalation ESC-DROP
@@ -489,6 +511,22 @@ if source "$SRC/cmd_heartbeat.sh" 2>/dev/null && declare -F _hb_gate_ttl_sweep >
   grep -q 'Resume the task' "$SENT" \
     && ok_t "I8: CONTROL — ... and its owner still gets the sweep's ping" \
     || bad_t "I8: the suppression silenced the whole sweep" "$(cat "$SENT")"
+  # DIVE-4896: the sweep's ping is a gate-answer ping too — a seat busy on ANOTHER
+  # in_progress row is not pinged; the row is already todo for the dispatcher.
+  db "INSERT INTO tasks (ident, title, priority, assignee, created_by, kind, status,
+                         need_type, tier, recommend, ask, need_asked_at)
+      VALUES ('TTL-BUSY', 'an ordinary tier-1 gate', 'medium', 'dev', 'main', 'standard', 'todo',
+              'decision', 1, 'widen the cap now', 'Widen the cap now, or fix the rows first?',
+              datetime('now','-72 hours'));
+      INSERT INTO tasks (ident, title, priority, assignee, created_by, kind, status, started_at)
+      VALUES ('TTL-BUSY-B', 'what dev is on', 'medium', 'dev', 'main', 'standard', 'in_progress', datetime('now'));"
+  : >"$SENT"
+  _hb_gate_ttl_sweep >/dev/null 2>&1
+  eq_t "I9: the busy owner's gate is still auto-applied" "$(field TTL-BUSY need_answered_by)" "auto:ttl"
+  grep -q 'TTL-BUSY' "$SENT" \
+    && bad_t "I10: the sweep pinged a seat busy on another row" "$(cat "$SENT")" \
+    || ok_t "I10: ... and the seat busy on another row is NOT pinged (DIVE-4896)"
+  db "UPDATE tasks SET status='done' WHERE ident='TTL-BUSY-B';"
 else
   bad_t "I0: the real TTL sweep is NOT reachable from this harness" \
     "src/cmd_heartbeat.sh did not source; the auto:ttl writer would ship ungraded"
