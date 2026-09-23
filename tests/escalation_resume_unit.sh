@@ -537,5 +537,22 @@ if [[ -n "$_real_promoted" ]]; then eval "$_real_promoted"; else unset -f _gate_
 if [[ -n "$_real_stats" ]];    then eval "$_real_stats";    else unset -f _gate_record_stats; fi
 
 echo
+echo "== EV. DIVE-4896: 'task escalate' STILL RUNS UNDER set -u =="
+# Iteration 1 left a cmd_task_answer-only local (_busy_on) in cmd_task_escalate:
+# under the CLI's set -u every escalate died 'unbound variable' after the bump
+# and pings, with no receipt — and the heartbeat reap ladder calls it `|| true`,
+# so it failed silently there. Escalate computes no busy seat; grade the verb.
+db "INSERT INTO tasks (ident, title, priority, assignee, created_by, kind, status)
+    VALUES ('ESC-VERB', 'a row someone escalates', 'medium', 'dev', 'main', 'standard', 'todo');"
+: >"$SENT"
+E_OUT=$( (set -u; cmd_task_escalate "$(rowid ESC-VERB)" --from=main) 2>&1 ); E_RC=$?
+eq_t  "EV1: escalate exits 0 under set -u"            "$E_RC" "0"
+has_t "EV2: ... and prints the 'escalated' receipt"   "$E_OUT" "ESC-VERB escalated — priority medium → high"
+eq_t  "EV3: ... having raised the priority"           "$(field ESC-VERB priority)" "high"
+[[ "$E_OUT" != *"unbound variable"* ]] \
+  && ok_t "EV4: ... with no unbound-variable error" \
+  || bad_t "EV4: escalate tripped set -u" "$E_OUT"
+
+echo
 printf 'TOTAL: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

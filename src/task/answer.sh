@@ -2191,7 +2191,6 @@ cmd_task_escalate() {
 
   local note=""
   [[ $pinged -eq 1 ]] && note=" + pinged $owner"
-  [[ -n "$_busy_on" ]] && note=" — not pinged: $owner is working ${_busy_on}, so this row waits in the queue for the heartbeat to hand over once that one closes"
   ok "$ident escalated — priority ${pri_note}${note}" \
      '{id:($i|tonumber), priority:$np, was:$op, owner:(($o|select(length>0)) // null), pinged:($p=="1"), human_notified:($h=="1")}' \
      --arg i "$id" --arg np "$new_pri" --arg op "$old_pri" --arg o "$owner" --arg p "$pinged" --arg h "$notified_human"
