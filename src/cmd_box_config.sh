@@ -24,6 +24,8 @@ cmd_box_config() {
         "       5dive config verify=<always|delivered-only|never>" \
         "       5dive config verify-small=<lines>|off" \
         "       5dive config coauthor=<on|off>" \
+        "       5dive config pace-week=<soft>/<hard>|off|default" \
+        "       5dive config pace-5h=<pct>|off|default" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
         "             always          every standard row is graded" \
@@ -39,11 +41,24 @@ cmd_box_config() {
         "           Paths override the number: anything touching the scheduler, the task" \
         "           store, credentials, deploy, a shared lib, sudo policy, systemd, the" \
         "           schema or the provisioning scripts is never small, at any size." \
-        "           'task add --verify' still demands a grade whatever the size."
+        "           'task add --verify' still demands a grade whatever the size." \
+        "" \
+        "  pace-week  how much of an account's WEEK the heartbeat spends before it" \
+        "             paces the account's seats (DIVE-4430)." \
+        "             <soft>/<hard>  past <soft>% of the week only high/urgent rows run;" \
+        "                            past <hard>% only urgent ones (default 60/90)." \
+        "                            Integers, soft <= hard <= 100." \
+        "             off            no weekly floor at all" \
+        "             default        clear back to 60/90" \
+        "  pace-5h    the same for the 5-hour session window: past <pct>% only urgent" \
+        "             rows run (default 85); off, or default." \
+        "           An explicit FIVE_PACE_7D_SOFT / FIVE_PACE_7D_HARD / FIVE_PACE_5H in the" \
+        "           heartbeat's environment still wins over this setting. The source shown" \
+        "           names the environment of THIS shell, not of the heartbeat's cron line."
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
-      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor)" ;;
+      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h)" ;;
     esac
     shift
   done
@@ -60,11 +75,22 @@ cmd_box_config() {
     [[ "$small" != "off" ]] && ssrc="a delivery under ${small} changed lines closes without a grader (DIVE-4559)"
     local coauthor; coauthor=$(jq -r '.coauthor // "on"' <<<"$(_box_config_read)" 2>/dev/null || printf on)
     [[ "$coauthor" == on || "$coauthor" == off ]] || coauthor=on
+    # DIVE-4890: the effective floors and where each came from, off the SAME
+    # loader the heartbeat and the digest use.
+    local pw="unknown" p5="unknown" pws="the pacing floor is not in this process" p5s
+    p5s="$pws"
+    if declare -F _pace_floors_load >/dev/null 2>&1; then
+      pw=$(_pace_week_effective); p5=$(_pace_5h_effective)
+      _pace_floors_load; pws="$_PACE_WEEK_SRC"; p5s="$_PACE_5H_SRC"
+    fi
     ok "verify = ${policy} (${src})
 verify-small = ${small} (${ssrc})
-coauthor = ${coauthor} (box-wide, default on)" \
-       '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, path:$p}' \
-       --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" --arg p "$(_box_config_path)"
+coauthor = ${coauthor} (box-wide, default on)
+pace-week = ${pw} (${pws})
+pace-5h = ${p5} (${p5s})" \
+       '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s, path:$p}' \
+       --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" \
+       --arg pw "$pw" --arg pws "$pws" --arg p5 "$p5" --arg p5s "$p5s" --arg p "$(_box_config_path)"
     return 0
   fi
 
@@ -86,7 +112,13 @@ coauthor = ${coauthor} (box-wide, default on)" \
                 || fail "$E_VALIDATION" "verify-small takes a positive number of changed lines, or 'off' — got '$v'" ;;
       coauthor) [[ "$v" == on || "$v" == off ]] \
                 || fail "$E_VALIDATION" "coauthor takes one of: on, off — got '$v'" ;;
-      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor)" ;;
+      # DIVE-4890. Validated in full before anything is written, like every key
+      # above: one bad value in a multi-key call writes none of them.
+      pace-week|pace_week) _pace_week_valid "$v" \
+                || fail "$E_VALIDATION" "pace-week takes <soft>/<hard> (integers, soft <= hard <= 100, e.g. 85/95), off, or default — got '$v'" ;;
+      pace-5h|pace_5h) _pace_5h_valid "$v" \
+                || fail "$E_VALIDATION" "pace-5h takes a percentage (an integer 0-100, e.g. 85), off, or default — got '$v'" ;;
+      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h)" ;;
     esac
   done
   require_root
@@ -99,7 +131,14 @@ coauthor = ${coauthor} (box-wide, default on)" \
   # invalid: the setting vanishes and the command reports success).
   for kv in "${sets[@]}"; do
     k="${kv%%=*}"; v="${kv#*=}"
-    json=$(jq --arg k "${k//-/_}" --arg v "$v" '.[$k] = $v' <<<"$json")
+    # DIVE-4890: `default` on a pace key CLEARS it rather than storing the word,
+    # so the loader falls through to the built-in floor and the file stops
+    # carrying a setting nobody chose.
+    if [[ "$v" == default && ( "$k" == pace-week || "$k" == pace_week || "$k" == pace-5h || "$k" == pace_5h ) ]]; then
+      json=$(jq --arg k "${k//-/_}" 'del(.[$k])' <<<"$json")
+    else
+      json=$(jq --arg k "${k//-/_}" --arg v "$v" '.[$k] = $v' <<<"$json")
+    fi
     applied+=("$k")
   done
   local cfg; cfg=$(_box_config_path)
@@ -113,7 +152,9 @@ coauthor = ${coauthor} (box-wide, default on)" \
   mv "$tmp" "$cfg"
   local policy; policy=$(box_verify_policy)
   local small; small=$(box_verify_small)
-  ok "box config updated (${applied[*]}) — verify = ${policy}, verify-small = ${small}" \
-     '{verify:$v, verify_small:$sm, applied:($a|split(",")), path:$p}' \
-     --arg v "$policy" --arg sm "$small" --arg a "$(IFS=,; printf '%s' "${applied[*]}")" --arg p "$cfg"
+  local pw="" p5=""
+  if declare -F _pace_floors_load >/dev/null 2>&1; then pw=$(_pace_week_effective); p5=$(_pace_5h_effective); fi
+  ok "box config updated (${applied[*]}) — verify = ${policy}, verify-small = ${small}${pw:+, pace-week = ${pw}, pace-5h = ${p5}}" \
+     '{verify:$v, verify_small:$sm, pace_week:$pw, pace_5h:$p5, applied:($a|split(",")), path:$p}' \
+     --arg v "$policy" --arg sm "$small" --arg pw "$pw" --arg p5 "$p5" --arg a "$(IFS=,; printf '%s' "${applied[*]}")" --arg p "$cfg"
 }

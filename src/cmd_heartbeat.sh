@@ -8605,7 +8605,7 @@ cmd_heartbeat_tick() {
         _pace_prio=$(db "SELECT COALESCE(NULLIF(priority,''),'medium') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
         if ! _pace_admits "$_pace_rc" "$_pace_prio" standard; then
           sk_pace=$((sk_pace + 1))
-          _hb_log "[$name] ${task_ident} (${_pace_prio:-<priority unreadable>}) HELD by the pacing floor — $(_pace_band_name "$_pace_rc") band: ${_pace_verdict}. Considering the next candidate; exits: 5dive task escalate ${task_id} to push this row through, or raise the floor that caused this band — FIVE_PACE_7D_SOFT/FIVE_PACE_7D_HARD for the week, FIVE_PACE_5H for the 5-hour session window (DIVE-4430, DIVE-4631)"
+          _hb_log "[$name] ${task_ident} (${_pace_prio:-<priority unreadable>}) HELD by the pacing floor — $(_pace_band_name "$_pace_rc") band: ${_pace_verdict}. Considering the next candidate; exits: 5dive task escalate ${task_id} to push this row through, or raise the floor that caused this band — 5dive config pace-week=<soft>/<hard> for the week, pace-5h=<pct> for the 5-hour session window (an env FIVE_PACE_7D_SOFT/FIVE_PACE_7D_HARD/FIVE_PACE_5H on the tick wins over both) (DIVE-4430, DIVE-4631, DIVE-4890)"
           continue
         fi
       fi

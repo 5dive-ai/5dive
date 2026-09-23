@@ -456,6 +456,17 @@ cmd_digest() {
     printf '{"buzzes":null,"partial":1}\n' >"$tmpd/buzz.json"
   fi
 
+  # DIVE-4890: the weekly floor the TICK applies, resolved by the tick's own
+  # loader (env, then `5dive config pace-week`, then the default) and handed to
+  # the python block as one string. Re-reading FIVE_PACE_7D_* in python is how
+  # this surface rendered holds at 60/90 while the tick paced at 85/95. Empty
+  # when the floor is not in this process; the block then falls back to the env.
+  local _dg_pace_week=""
+  if declare -F _pace_week_effective >/dev/null 2>&1; then
+    _dg_pace_week=$(_pace_week_effective 2>/dev/null || printf '')
+  fi
+
+  DIGEST_PACE_WEEK="$_dg_pace_week" \
   DIGEST_TASKS_F="$tmpd/tasks.json" DIGEST_USAGE_F="$tmpd/usage.json" DIGEST_HB_F="$tmpd/hb.txt" \
   DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" DIGEST_OBJ_F="$tmpd/obj.json" \
   DIGEST_UPDATE_F="$tmpd/update.json" DIGEST_HELD_F="$tmpd/held.json" \
@@ -661,8 +672,18 @@ hot = [a for a in usage_l if (a.get("fiveHourPct") or 0) >= 80]
 # numbers, same file, one read. A blind account is NEVER folded in with a
 # measured one — it is named as blind, because "no meter" and "60% used" want
 # different reactions from the reader.
-_pace_soft = int(os.environ.get("FIVE_PACE_7D_SOFT") or 60)
-_pace_hard = int(os.environ.get("FIVE_PACE_7D_HARD") or 90)
+# DIVE-4890: DIGEST_PACE_WEEK is the tick's resolved weekly setting (`off` or
+# `<soft>/<hard>`, see the bash above), so this block answers with the SAME
+# floors the dispatcher applies — including a floor set with `5dive config`,
+# which the env below cannot see. The env read is the fallback for a digest run
+# without the floor in the process, and for harnesses that exec this block alone.
+_pace_week = (os.environ.get("DIGEST_PACE_WEEK") or "").strip()
+_pace_week_off = _pace_week == "off"
+try:
+    _pace_soft, _pace_hard = (int(x) for x in _pace_week.split("/", 1))
+except ValueError:
+    _pace_soft = int(os.environ.get("FIVE_PACE_7D_SOFT") or 60)
+    _pace_hard = int(os.environ.get("FIVE_PACE_7D_HARD") or 90)
 _pace_reset_days = int(os.environ.get("FIVE_PACE_RESET_DAYS") or 3)
 # DIVE-4629: read here for the same reason the floors above are — the surface
 # and the dispatcher must answer with the same policy.
@@ -768,7 +789,11 @@ for e in sorted(_pace_by_acct.values(), key=lambda x: x["account"]):
     if pct is None:
         src = None
     days_left = int((resets - _pace_now) // 86400) if isinstance(resets, (int, float)) and resets > _pace_now else None
-    if pct is None and _pace_blind != "refuse" and _unmet.get(e["account"]) is True:
+    if _pace_week_off:
+        # The tick returns open for EVERY reading when the weekly floor is off
+        # (blind and unmeterable included), so the surface does too.
+        band, why = "open", "the weekly floor is off on this box (pace-week=off)"
+    elif pct is None and _pace_blind != "refuse" and _unmet.get(e["account"]) is True:
         # DIVE-4629: not blind — unmeterable. Same policy knob and the same
         # default as the floor (`FIVE_PACE_UNMETERED`), and under
         # FIVE_PACE_BLIND=refuse the floor does not consult that knob, so
@@ -1249,7 +1274,7 @@ else:
         icon = "\U0001F534" if pa["band"] == "hard" else "\U0001F7E1"
         out.append(f"{icon} Pacing floor {pa['band'].upper()} on account "
                    f"{pa['account']} ({pa['seats']} seat(s)): {pa['detail']}. "
-                   f"Raise it for the week with FIVE_PACE_7D_SOFT / FIVE_PACE_7D_HARD, "
+                   f"Raise it with 5dive config pace-week=<soft>/<hard> (or pace-week=off), "
                    f"or push one row through with 5dive task escalate <id>.")
     if not hot and not stale:
         # "no rate-limit pressure" is a claim about every agent. It may only be

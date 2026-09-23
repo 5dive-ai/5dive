@@ -54,6 +54,10 @@ trap 'rc=$?; rm -rf "$TMPD"; echo "HARNESS-RC=$rc"' EXIT
 # sources grader_pool.sh, so this harness can never read — or poison — the
 # running host's pacing state.
 export FIVE_PACE_READING_CACHE_DIR="$TMPD/pace-reading"
+# DIVE-4890: the floors are also a box setting now, read at call time from the
+# box file. Point it at scratch too, or a host that ran `5dive config
+# pace-week=…` would grade every arm below against its own floors.
+export BOX_CONFIG="$TMPD/box.json"
 PACE_RCD="$TMPD/pace-reading"
 
 # ── A/B/C: the floor itself ────────────────────────────────────────────────
@@ -1033,7 +1037,9 @@ if mutant 's|^  if (( $(_pace_rank "$rc5") > $(_pace_rank "$rc7") )); then|  if 
     || bad_ "M4: the mutant did not flip the arm" "L6 is not grading the combiner"
 else bad_ "M4: the mutation took" "the sed matched nothing — this mutant is vacuous"; fi
 # M5 — the floor itself moved out of reach: 101% no longer clears it.
-if mutant 's|^_PACE_FLOOR_5H=.*|_PACE_FLOOR_5H=999|'; then
+# DIVE-4890: the floor is resolved at read time from `_PACE_DEFAULT_5H` (no env,
+# no box setting here), so that is the line the mutant moves.
+if mutant 's|^_PACE_DEFAULT_5H=.*|_PACE_DEFAULT_5H=999|'; then
   ok_ "M5: the mutation took (the session floor was raised out of reach)"
   [[ "$(mband 20 "$FAR" 101 "$F5")" == "0" ]] \
     && ok_ "M5: REVERTED — with the floor at 999% the filed case dispatches again" \
