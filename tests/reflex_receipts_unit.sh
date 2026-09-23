@@ -76,7 +76,7 @@ check "the receipt carries the proposal's hashes and an id that is its idem key"
   "$(jq -e '(.state_hash|startswith("sha256:")) and (.candidate_hash|startswith("sha256:")) and (.id|startswith("dec_"))' <<<"$R" >/dev/null \
      && [[ "$(db "SELECT idem_key FROM lifecycle_events WHERE kind='decision.task-route' AND task_id=$T1;")" == "$(jq -r .id <<<"$R")" ]]; echo $?)" "$R"
 check "no title text in any receipt" \
-  "$(db "SELECT COUNT(*) FROM lifecycle_events WHERE kind LIKE 'decision.%' AND detail LIKE '%SECRETTITLE%';" | grep -qx 0; echo $?)"
+  "$(grep -qx 0 <<<"$(db "SELECT COUNT(*) FROM lifecycle_events WHERE kind LIKE 'decision.%' AND detail LIKE '%SECRETTITLE%';")"; echo $?)"
 
 # --- task-route, via assign ------------------------------------------------
 cmd_task_assign "$I1" dev2 >/dev/null 2>&1
@@ -99,9 +99,9 @@ _hb_reclaim_to_todo dev2 "$T1" "overran 45m budget (reap #1) — requeued from a
 R=$(rcpt stuck "$T1")
 check "the reaper writes a stuck receipt with the reason class and claim age" \
   "$(jq -e '.result=="reclaim" and .signals.reason=="budget" and (.signals.claim_age_min>=49 and .signals.claim_age_min<=51) and .effect.seat=="dev2"' <<<"$R" >/dev/null; echo $?)" "$R"
-check "the reclaim itself still happened" "$(db "SELECT status FROM tasks WHERE id=$T1;" | grep -qx todo; echo $?)"
+check "the reclaim itself still happened" "$(grep -qx todo <<<"$(db "SELECT status FROM tasks WHERE id=$T1;")"; echo $?)"
 check "the reaper's receipt is not the reaped seat's work (authority=dispatcher, as task.reclaimed)" \
-  "$(db "SELECT authority FROM lifecycle_events WHERE kind='decision.stuck' AND task_id=$T1;" | grep -qx dispatcher; echo $?)"
+  "$(grep -qx dispatcher <<<"$(db "SELECT authority FROM lifecycle_events WHERE kind='decision.stuck' AND task_id=$T1;")"; echo $?)"
 OUT=$(JSON_MODE=0 cmd_trace "$I1" --no-audit 2>/dev/null)
 check "trace shows a receipt as its pick, not as the JSON blob" \
   "$(grep -q 'decision.task-ro.*decided dev2 of 4 option(s) (current_behavior)' <<<"$OUT" && ! grep -q '"state_hash"' <<<"$OUT"; echo $?)" "$(grep -n decision <<<"$OUT")"
@@ -117,7 +117,7 @@ check "task answer writes a gate-answer receipt labelled by option, with matched
 check "the gate-answer candidates are the legal set, never the answer text" \
   "$(jq -e '.candidates==["opt1","opt2","other"] and .signals.recommend=="opt1" and .signals.n_options==2' <<<"$R" >/dev/null; echo $?)" "$R"
 check "no ask, option or answer text in any receipt" \
-  "$(db "SELECT COUNT(*) FROM lifecycle_events WHERE kind LIKE 'decision.%' AND (detail LIKE '%ASKTEXT%' OR detail LIKE '%KEEPOPT%' OR detail LIKE '%DROPOPT%');" | grep -qx 0; echo $?)"
+  "$(grep -qx 0 <<<"$(db "SELECT COUNT(*) FROM lifecycle_events WHERE kind LIKE 'decision.%' AND (detail LIKE '%ASKTEXT%' OR detail LIKE '%KEEPOPT%' OR detail LIKE '%DROPOPT%');")"; echo $?)"
 
 # A secret: the helper reads the row, so drive it directly off a stored secret.
 OUT=$(JSON_MODE=1 cmd_task_add --assignee=dev -- "secret row" 2>/dev/null); T3=$(idof "$(jq -r '.data.ident' <<<"$OUT")")
