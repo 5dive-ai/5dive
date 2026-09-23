@@ -1955,7 +1955,10 @@ cmd_task_answer() {
     # row held when the gate was filed is on the row (gate_prev_status), so a
     # human's answer returns an in_progress row to its maker instead of dropping
     # it back into the queue as unclaimed work an hour later.
-    db "$(_gate_restore_status_sql "${id}")"
+    # DIVE-4896: ...unless the maker has moved on to another row since. `yield`
+    # restores such a row to 'todo' instead, so the seat never holds two
+    # in_progress rows; see the helper's header for why only this caller yields.
+    db "$(_gate_restore_status_sql "${id}" yield)"
   fi
 
   # DIVE-4537: the cap escalation was just answered — EXECUTE the disposition.
@@ -2055,10 +2058,24 @@ cmd_task_answer() {
   # via `task show` (its own pane only). A stopped or non-agent owner just
   # yields pinged:false — it never fails the answer.
   local pinged=0
+  # DIVE-4896: A GATE-ANSWER PING IS NOT A DISPATCH. When the seat it would go
+  # to is working a DIFFERENT in_progress row, the ping either lands mid-turn on
+  # that row (one row per turn, broken) or — what the journal actually showed on
+  # DIVE-4891 — sits spooled until a restart and is drained as the fresh
+  # session's first input, pre-empting the heartbeat's own choice of row while
+  # the other row is still marked in_progress. So send nothing: the restore above
+  # already put this row back on 'todo', the answer is on the row, and the
+  # heartbeat hands it over with a proper goal once the seat is free. The same
+  # holds for the cap-escalation "resume" branch, whose executor writes 'todo'
+  # itself. A seat idle-waiting on THIS gate still gets the ping, unchanged.
+  local _busy_on=""
+  if [[ -n "$owner" ]] && (( ! _close_done )); then
+    _busy_on=$(_gate_seat_busy_elsewhere "$id" "$owner") || _busy_on=""
+  fi
   # DIVE-909: a close-as-done manual gate needs no "resume the task" ping — the
   # task is finished, not waiting to resume. Skip it (the `now done` output is
   # the signal); pinging the owner to resume a closed task is just confusing.
-  if [[ -n "$owner" ]] && (( ! _close_done )); then
+  if [[ -n "$owner" ]] && (( ! _close_done )) && [[ -z "$_busy_on" ]]; then
     local pingmsg
     if [[ -n "${_esc_pingmsg:-}" ]]; then
       pingmsg="$_esc_pingmsg"
@@ -2077,6 +2094,7 @@ cmd_task_answer() {
 
   local note=""
   [[ $pinged -eq 1 ]] && note=" + pinged $owner"
+  [[ -n "$_busy_on" ]] && note=" — not pinged: $owner is working ${_busy_on}, so this row waits in the queue for the heartbeat to hand over once that one closes"
   # DIVE-2212: do not make the answerer re-read the ambiguous option as the only
   # confirmation. Name both accounts and declare the authored frame. The raw
   # value remains in the structured need_answer field for compatibility, but the
@@ -2096,8 +2114,8 @@ cmd_task_answer() {
     _frame_note=" — account frame: filer=${_frame_filer}, answerer=${_frame_answerer}; second-person terms in the selected filer-authored option refer to ${_frame_answerer}"
   fi
   ok "$ident answered ($nt) — now ${newstatus}${note}${_frame_note}" \
-     '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1"), option_account_frame:(if $af=="1" then {filer:$gf, answerer:$ga, second_person_refers_to:$ga} else null end)}' \
-     --arg i "$id" --arg st "$newstatus" --arg nt "$nt" --arg v "$value" --arg o "$owner" --arg p "$pinged" \
+     '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1"), owner_busy_on:(($bo|select(length>0)) // null), option_account_frame:(if $af=="1" then {filer:$gf, answerer:$ga, second_person_refers_to:$ga} else null end)}' \
+     --arg i "$id" --arg st "$newstatus" --arg nt "$nt" --arg v "$value" --arg o "$owner" --arg p "$pinged" --arg bo "$_busy_on" \
      --arg af "$_account_frame" --arg gf "$_frame_filer" --arg ga "$_frame_answerer"
 }
 
