@@ -1558,8 +1558,14 @@ _grader_spawn_session() {  # <seat> <ident>
 #                          one. Left available, not made the default.
 #
 # The alternative not taken is written on DIVE-4430's body, not only here.
-_PACE_FLOOR_7D_SOFT="${FIVE_PACE_7D_SOFT:-60}"
-_PACE_FLOOR_7D_HARD="${FIVE_PACE_7D_HARD:-90}"
+# The built-in floors. What a band actually reads is `_PACE_FLOOR_*`, which
+# `_pace_floors_load` resolves from these, the box config and the env at READ
+# time (DIVE-4890, below); the initial values here are only what a caller sees
+# before the first load.
+_PACE_DEFAULT_7D_SOFT=60
+_PACE_DEFAULT_7D_HARD=90
+_PACE_FLOOR_7D_SOFT="${FIVE_PACE_7D_SOFT:-$_PACE_DEFAULT_7D_SOFT}"
+_PACE_FLOOR_7D_HARD="${FIVE_PACE_7D_HARD:-$_PACE_DEFAULT_7D_HARD}"
 # The soft floor is a PACING rule, so it only binds while there is still a week
 # left to pace. Inside the last `_PACE_RESET_DAYS` days the unspent remainder
 # expires at the reset and holding it back buys nothing — only the hard floor
@@ -1579,7 +1585,111 @@ _PACE_BLIND="${FIVE_PACE_BLIND:-soft}"
 # never `refuse`. Freezing is the failure mode this family keeps re-learning
 # (DIVE-4430, DIVE-4575, DIVE-4586): an incident is worth a turn that may be
 # truncated; a medium row is not.
-_PACE_FLOOR_5H="${FIVE_PACE_5H:-85}"
+_PACE_DEFAULT_5H=85
+_PACE_FLOOR_5H="${FIVE_PACE_5H:-$_PACE_DEFAULT_5H}"
+
+# ── DIVE-4890: THE FLOORS ARE A BOX SETTING, NOT ONLY A CRON ENV VAR ─────────
+#
+# Until this row the floors were env-only. An owner changed how much of an
+# account's week the heartbeat spends by hand-editing an env var on a root cron
+# line — impossible on a customer box — and the digest, which runs from a
+# different line, never saw it: on this host (2026-09-23) the tick paced at
+# 85/95 while the digest still rendered holds at 60/90.
+#
+# So the floors are `5dive config pace-week=<soft>/<hard>|off|default` and
+# `5dive config pace-5h=<pct>|off|default`, stored as `.pace_week` / `.pace_5h`
+# in the box file every seat reads (src/cmd_box_config.sh), and resolved HERE,
+# once, for every reader — the tick and the digest both call this, so the two
+# cannot answer from different numbers again.
+#
+# PRECEDENCE: env, then config, then the built-in default. An explicit env var
+# still wins so every existing cron line keeps meaning what it meant. For the
+# week the pair is one setting: either FIVE_PACE_7D_* var set makes the week
+# env-sourced (the unset half takes its default, as before this row), because
+# mixing an env soft floor with a config hard floor is a band nobody chose.
+#
+# `off` means NO FLOOR in that window: the weekly band returns open for every
+# reading, blind and unmeterable included, and the 5h band contributes nothing.
+#
+# RESOLVED AT READ TIME, not load time, for the reason src/lib/verify_policy.sh
+# gives: harnesses reassign STATE_DIR after sourcing, and a load-time read would
+# pace them from the LIVE box's file.
+_pace_box_config_path() {
+  if declare -F _box_config_path >/dev/null 2>&1; then _box_config_path; return 0; fi
+  printf '%s' "${BOX_CONFIG:-${STATE_DIR:-/var/lib/5dive}/box.json}"
+}
+
+# One percentage: an integer 0..100 with no leading zero. The leading-zero ban is
+# not pedantry — bash reads `085` as octal and aborts on it under errexit.
+_pace_pct_valid() { [[ "${1:-}" =~ ^(0|[1-9][0-9]?|100)$ ]]; }
+
+# `pace-week` values: `<soft>/<hard>` with soft <= hard <= 100, `off`, `default`.
+_pace_week_valid() {  # <value>
+  local v="${1:-}" s h
+  [[ "$v" == off || "$v" == default ]] && return 0
+  [[ "$v" == */* ]] || return 1
+  s="${v%%/*}"; h="${v#*/}"
+  _pace_pct_valid "$s" && _pace_pct_valid "$h" || return 1
+  (( s <= h ))
+}
+
+# `pace-5h` values: `<pct>`, `off`, `default`.
+_pace_5h_valid() {  # <value>
+  local v="${1:-}"
+  [[ "$v" == off || "$v" == default ]] && return 0
+  _pace_pct_valid "$v"
+}
+
+# Sets _PACE_FLOOR_7D_SOFT/_HARD, _PACE_FLOOR_5H, _PACE_WEEK_OFF/_PACE_5H_OFF
+# (1 = no floor in that window) and _PACE_WEEK_SRC/_PACE_5H_SRC (env, config,
+# default, or default with the reason a stored value was ignored).
+_pace_floors_load() {
+  local f cw="" c5="" s h
+  local -a kv=()
+  f=$(_pace_box_config_path)
+  if [[ -r "$f" ]]; then
+    mapfile -t kv < <(jq -r '(.pace_week // "" | tostring), (.pace_5h // "" | tostring)' "$f" 2>/dev/null || true)
+    cw="${kv[0]:-}"; c5="${kv[1]:-}"
+  fi
+  _PACE_WEEK_OFF=0; _PACE_5H_OFF=0
+  if [[ -n "${FIVE_PACE_7D_SOFT:-}" || -n "${FIVE_PACE_7D_HARD:-}" ]]; then
+    _PACE_FLOOR_7D_SOFT="${FIVE_PACE_7D_SOFT:-$_PACE_DEFAULT_7D_SOFT}"
+    _PACE_FLOOR_7D_HARD="${FIVE_PACE_7D_HARD:-$_PACE_DEFAULT_7D_HARD}"
+    _PACE_WEEK_SRC="env FIVE_PACE_7D_SOFT/FIVE_PACE_7D_HARD"
+  elif [[ "$cw" == off ]]; then
+    _PACE_WEEK_OFF=1; _PACE_WEEK_SRC="config"
+  elif [[ -n "$cw" && "$cw" != default ]] && _pace_week_valid "$cw"; then
+    s="${cw%%/*}"; h="${cw#*/}"
+    _PACE_FLOOR_7D_SOFT="$s"; _PACE_FLOOR_7D_HARD="$h"; _PACE_WEEK_SRC="config"
+  else
+    _PACE_FLOOR_7D_SOFT="$_PACE_DEFAULT_7D_SOFT"; _PACE_FLOOR_7D_HARD="$_PACE_DEFAULT_7D_HARD"
+    _PACE_WEEK_SRC="default"
+    [[ -n "$cw" && "$cw" != default ]] && _PACE_WEEK_SRC="default — the stored pace_week '${cw}' is not a valid value and is ignored"
+  fi
+  if [[ -n "${FIVE_PACE_5H:-}" ]]; then
+    _PACE_FLOOR_5H="$FIVE_PACE_5H"; _PACE_5H_SRC="env FIVE_PACE_5H"
+  elif [[ "$c5" == off ]]; then
+    _PACE_5H_OFF=1; _PACE_5H_SRC="config"
+  elif [[ -n "$c5" && "$c5" != default ]] && _pace_pct_valid "$c5"; then
+    _PACE_FLOOR_5H="$c5"; _PACE_5H_SRC="config"
+  else
+    _PACE_FLOOR_5H="$_PACE_DEFAULT_5H"; _PACE_5H_SRC="default"
+    [[ -n "$c5" && "$c5" != default ]] && _PACE_5H_SRC="default — the stored pace_5h '${c5}' is not a valid value and is ignored"
+  fi
+  return 0
+}
+
+# The effective weekly setting as ONE string: `off` or `<soft>/<hard>`. This is
+# what `5dive config` prints and what cmd_digest hands its python block, so the
+# surface renders the band the tick applies.
+_pace_week_effective() {
+  _pace_floors_load
+  if (( _PACE_WEEK_OFF )); then printf 'off'; else printf '%s/%s' "$_PACE_FLOOR_7D_SOFT" "$_PACE_FLOOR_7D_HARD"; fi
+}
+_pace_5h_effective() {
+  _pace_floors_load
+  if (( _PACE_5H_OFF )); then printf 'off'; else printf '%s' "$_PACE_FLOOR_5H"; fi
+}
 # Overridable so the unit harness feeds a fixture instead of needing root and a
 # live meter. Same posture as _GRADER_USAGE_CMD / _SUP_QUOTA_PAT.
 _PACE_USAGE_CMD="${_PACE_USAGE_CMD:-sudo -n 5dive usage --json}"
@@ -2000,6 +2110,17 @@ _pace_band_7d() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   local acct="$1" now="${2:-$(date +%s)}" json seven="" resets="" days_left src="" pair=""
   local lb_pair="" lb_seven="" lb_resets=""
   local pw=0 unmet_band unmet_why
+  [[ "${_PACE_FLOORS_FRESH:-}" == 1 ]] || _pace_floors_load
+  # DIVE-4890: `pace-week=off` is no weekly floor at all — ahead of every branch
+  # below, blind and unmeterable included, because each of those is a way the
+  # weekly floor holds and the owner turned the weekly floor off. Stdin is
+  # drained so a piping caller is never handed an EPIPE in place of a band.
+  if (( _PACE_WEEK_OFF )); then
+    cat >/dev/null
+    printf 'pace: the weekly floor is off on this box (pace-week=off, from %s) — %s is not held for its week\n' \
+           "$_PACE_WEEK_SRC" "${acct:-<no account>}"
+    return 0
+  fi
   if [[ -z "$acct" ]]; then
     # No account named is not a measurement, and it must not read as headroom.
     printf 'pace: no account named — holding at the soft floor rather than reading it as 0%%\n'
@@ -2251,6 +2372,11 @@ _pace_band_5h() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   # Read stdin FIRST and unconditionally, before any early return, so a caller
   # that pipes cannot be handed an EPIPE in place of a band.
   json=$(cat)
+  [[ "${_PACE_FLOORS_FRESH:-}" == 1 ]] || _pace_floors_load
+  if (( _PACE_5H_OFF )); then
+    printf 'pace/5h: the session-window floor is off on this box (pace-5h=off, from %s) — contributes nothing\n' "$_PACE_5H_SRC"
+    return 0
+  fi
   if [[ -z "$acct" || -z "$json" ]]; then
     printf 'pace/5h: no session-window reading (%s) — the session floor contributes nothing; the weekly band stands alone\n' \
            "$( [[ -z "$acct" ]] && printf 'no account named' || printf 'no usage document' )"
@@ -2319,6 +2445,10 @@ _pace_band() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   local acct="${1:-}" now="${2:-}" json v7="" v5="" rc7=0 rc5=0
   [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
   json=$(cat)
+  # ONE read of the floors per band, shared by both windows (the flag is local,
+  # so it reaches the two subshells below and nothing after this call).
+  _pace_floors_load
+  local _PACE_FLOORS_FRESH=1
   v7=$(_pace_band_7d "$acct" "$now" <<<"$json") || rc7=$?
   v5=$(_pace_band_5h "$acct" "$now" <<<"$json") || rc5=$?
   if (( $(_pace_rank "$rc5") > $(_pace_rank "$rc7") )); then
