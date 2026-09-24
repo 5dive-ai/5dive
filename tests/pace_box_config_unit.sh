@@ -9,6 +9,8 @@
 #            window.
 #   8595.    `pace-week=85/95` → a high row passes at 91% and a medium row is held.
 #   DEFAULT. `pace-week=default` clears the key and restores 60/90.
+#   5H-SET.  `pace-5h=70` (config, no env) moves the session floor: 5h 69% is
+#            open, 70% is held urgent-only, and the source is named `config`.
 #   ENV.     an explicit FIVE_PACE_7D_* / FIVE_PACE_5H still wins over the config.
 #   PARITY.  the digest reports the same weekly band as the tick for the same
 #            reading, under every setting — and the digest's bash really hands the
@@ -95,6 +97,21 @@ arm_env() {
   rc=$( FIVE_PACE_7D_HARD=90; band 95 ); [[ "$rc" == 3 ]] || { echo "env hard 90 over config off: 95% -> $rc, want 3"; return 1; }
   setcfg '{"pace_5h":"off"}'
   rc=$( FIVE_PACE_5H=50; band 20 60 ); [[ "$rc" == 3 ]] || { echo "env 5h 50 over config off: 5h 60% -> $rc, want 3"; return 1; }
+  return 0
+}
+arm_5hset() {  # 0 = a stored pace_5h NUMBER is the floor the tick applies, sourced to config
+  setcfg '{"pace_5h":"70"}'
+  local r69 r70 show
+  r69=$(band 20 69); r70=$(band 20 70)
+  [[ "$r69" == 0 ]]                      || { echo "5h 69% -> band $r69 under pace-5h=70, want 0 (open)"; return 1; }
+  [[ "$r70" == 3 ]]                      || { echo "5h 70% -> band $r70 under pace-5h=70, want 3 (hard)"; return 1; }
+  [[ "$(adm "$r70" high)" == 1 && "$(adm "$r70" urgent)" == 0 ]] \
+                                         || { echo "at 5h 70% a high row passed or an urgent row was held"; return 1; }
+  _pace_floors_load   # in THIS shell: $(_pace_5h_effective) sets the source only in its subshell
+  [[ "$(_pace_5h_effective)" == 70 && "${_PACE_5H_SRC:-}" == config ]] \
+                                         || { echo "effective=$(_pace_5h_effective) source=${_PACE_5H_SRC:-<unset>}, want 70/config"; return 1; }
+  show=$(cmd_box_config 2>&1)
+  [[ "$show" == *"pace-5h = 70 (config)"* ]] || { echo "show does not print 'pace-5h = 70 (config)': ${show:0:200}"; return 1; }
   return 0
 }
 arm_bad() {  # 0 = every bad value refused and the file byte-identical
@@ -209,6 +226,9 @@ cmd_box_config pace-week=default pace-5h=default >/dev/null 2>&1
 r=$(arm_env) && ok_ "ENV: FIVE_PACE_7D_SOFT / FIVE_PACE_7D_HARD / FIVE_PACE_5H each win over the box config (including over off)" \
   || bad_ "ENV" "$r"
 
+r=$(arm_5hset) && ok_ "5H-SET: pace-5h=70 with no env — 5h 69% open, 70% held urgent-only, and the source is config" \
+  || bad_ "5H-SET" "$r"
+
 # SHOW names the value and where it came from.
 setcfg '{"pace_week":"85/95"}'
 s1=$(cmd_box_config 2>&1)
@@ -258,6 +278,8 @@ mut "M3: env loses to config for the week -> ENV reds" \
     's|^  if \[\[ -n "${FIVE_PACE_7D_SOFT:-}" \|\| -n "${FIVE_PACE_7D_HARD:-}" \]\]; then|  if false; then|' arm_env
 mut "M4: the validator stops checking soft <= hard -> BAD reds" \
     's|^  (( s <= h ))$|  true|' arm_bad
+mut "M7: the loader ignores a stored pace_5h number (falls back to 85) -> 5H-SET reds" \
+    's|^  elif \[\[ -n "$c5" \&\& "$c5" != default \]\] \&\& _pace_pct_valid "$c5"; then$|  elif false; then|' arm_5hset
 
 # M5 — THE ONE THE ROW NAMES: a digest that ignores the config. The python block
 # goes back to reading only the env, exactly as it did before this row.
