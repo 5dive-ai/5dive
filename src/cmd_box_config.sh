@@ -26,6 +26,10 @@ cmd_box_config() {
         "       5dive config coauthor=<on|off>" \
         "       5dive config pace-week=<soft>/<hard>|off|default" \
         "       5dive config pace-5h=<pct>|off|default" \
+        "       5dive config reflex-receipts=on|off|default" \
+        "       5dive config reflex-model=<openrouter model id>|default" \
+        "       5dive config reflex-key=- < keyfile     # the key is read from stdin, never argv" \
+        "       5dive config reflex-key=clear" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
         "             always          every standard row is graded" \
@@ -54,11 +58,19 @@ cmd_box_config() {
         "             rows run (default 85); off, or default." \
         "           An explicit FIVE_PACE_7D_SOFT / FIVE_PACE_7D_HARD / FIVE_PACE_5H in the" \
         "           heartbeat's environment still wins over this setting. The source shown" \
-        "           names the environment of THIS shell, not of the heartbeat's cron line."
+        "           names the environment of THIS shell, not of the heartbeat's cron line." \
+        "" \
+        "  reflex-receipts  whether scheduler decisions are recorded for 'reflex replay'" \
+        "             (default on). FIVEDIVE_REFLEX_RECEIPTS=0 in the environment still wins." \
+        "  reflex-model     the model the reference replay backend asks (default" \
+        "             ${REFLEX_MODEL_DEFAULT:-typesafe/jev-1.13}); a replay's own --model wins." \
+        "  reflex-key       the OpenRouter key for replays, written root-only 600 to" \
+        "             $(declare -F _reflex_key_file >/dev/null && _reflex_key_file || printf /etc/5dive/reflex-openrouter.key)." \
+        "             Write-only: nothing ever prints it; 'config' shows set or unset."
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
-      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h)" ;;
+      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key)" ;;
     esac
     shift
   done
@@ -83,24 +95,53 @@ cmd_box_config() {
       pw=$(_pace_week_effective); p5=$(_pace_5h_effective)
       _pace_floors_load; pws="$_PACE_WEEK_SRC"; p5s="$_PACE_5H_SRC"
     fi
+    # DIVE-4915: reflex's settings, each with its source. The key is reported as
+    # set/unset only — this path never opens the key file.
+    local rr="on" rrs="reflex is not in this build" rm="" rms="" rk="unknown"
+    if declare -F reflex_receipts_resolve >/dev/null 2>&1; then
+      reflex_receipts_resolve; reflex_model_resolve
+      rr="$_REFLEX_RECEIPTS"; rrs="$_REFLEX_RECEIPTS_SRC"; rm="$_REFLEX_MODEL"; rms="$_REFLEX_MODEL_SRC"
+      rk=$(reflex_key_status)
+    fi
     ok "verify = ${policy} (${src})
 verify-small = ${small} (${ssrc})
 coauthor = ${coauthor} (box-wide, default on)
 pace-week = ${pw} (${pws})
-pace-5h = ${p5} (${p5s})" \
-       '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s, path:$p}' \
+pace-5h = ${p5} (${p5s})
+reflex-receipts = ${rr} (${rrs})
+reflex-model = ${rm} (${rms})
+reflex-key = ${rk}" \
+       '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s,
+         reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk, path:$p}' \
        --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" \
-       --arg pw "$pw" --arg pws "$pws" --arg p5 "$p5" --arg p5s "$p5s" --arg p "$(_box_config_path)"
+       --arg pw "$pw" --arg pws "$pws" --arg p5 "$p5" --arg p5s "$p5s" \
+       --arg rr "$rr" --arg rrs "$rrs" --arg rm "$rm" --arg rms "$rms" --arg rk "$rk" --arg p "$(_box_config_path)"
     return 0
   fi
 
   # VALIDATE BEFORE require_root. A typo'd value is a typo whether or not the
   # caller is root, and refusing it with "must run as root" sends the reader
   # after the wrong problem — they sudo, and only then learn the value was wrong.
-  local kv k v json
+  local kv k v json key_op="" key_val=""
   for kv in "${sets[@]}"; do
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in
+      # DIVE-4915. Error messages here NEVER quote the value: a key pasted inline
+      # by mistake must not be echoed back into a terminal, a log or an API body.
+      reflex-key|reflex_key)
+        case "$v" in
+          -)     key_op="set"
+                 IFS= read -r key_val || true
+                 key_val="${key_val%$'\r'}"
+                 [[ "$key_val" =~ ^[A-Za-z0-9_.:-]{16,256}$ ]] \
+                   || fail "$E_VALIDATION" "reflex-key: stdin did not hold one key (16-256 characters of A-Z a-z 0-9 _ . : -); nothing was written" ;;
+          clear) key_op=clear ;;
+          *)     fail "$E_VALIDATION" "reflex-key is read from stdin only: use reflex-key=- (or reflex-key=clear). The value you passed was not used or stored" ;;
+        esac ;;
+      reflex-receipts|reflex_receipts) [[ "$v" == on || "$v" == off || "$v" == default ]] \
+                || fail "$E_VALIDATION" "reflex-receipts takes one of: on, off, default — got '$v'" ;;
+      reflex-model|reflex_model) [[ "$v" == default || ( ${#v} -le 100 && "$v" =~ $REFLEX_MODEL_RE ) ]] \
+                || fail "$E_VALIDATION" "reflex-model takes an OpenRouter model id like ${REFLEX_MODEL_DEFAULT} (provider/model, at most 100 characters), or default — got '$v'" ;;
       verify) _verify_policy_valid "$v" \
                 || fail "$E_VALIDATION" "verify takes one of: ${_VERIFY_POLICIES// /, } — got '$v'" ;;
       # DIVE-4559. `verify-small` on the command line, `.verify_small` in the
@@ -118,7 +159,7 @@ pace-5h = ${p5} (${p5s})" \
                 || fail "$E_VALIDATION" "pace-week takes <soft>/<hard> (integers, soft <= hard <= 100, e.g. 85/95), off, or default — got '$v'" ;;
       pace-5h|pace_5h) _pace_5h_valid "$v" \
                 || fail "$E_VALIDATION" "pace-5h takes a percentage (an integer 0-100, e.g. 85), off, or default — got '$v'" ;;
-      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h)" ;;
+      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key)" ;;
     esac
   done
   require_root
@@ -134,7 +175,9 @@ pace-5h = ${p5} (${p5s})" \
     # DIVE-4890: `default` on a pace key CLEARS it rather than storing the word,
     # so the loader falls through to the built-in floor and the file stops
     # carrying a setting nobody chose.
-    if [[ "$v" == default && ( "$k" == pace-week || "$k" == pace_week || "$k" == pace-5h || "$k" == pace_5h ) ]]; then
+    case "$k" in reflex-key|reflex_key) applied+=("reflex-key"); continue ;; esac
+    if [[ "$v" == default && ( "$k" == pace-week || "$k" == pace_week || "$k" == pace-5h || "$k" == pace_5h \
+          || "$k" == reflex-receipts || "$k" == reflex_receipts || "$k" == reflex-model || "$k" == reflex_model ) ]]; then
       json=$(jq --arg k "${k//-/_}" 'del(.[$k])' <<<"$json")
     else
       json=$(jq --arg k "${k//-/_}" --arg v "$v" '.[$k] = $v' <<<"$json")
@@ -150,11 +193,35 @@ pace-5h = ${p5} (${p5s})" \
   chown root:claude "$tmp" 2>/dev/null || true
   chmod 640 "$tmp"
   mv "$tmp" "$cfg"
+  if [[ -n "$key_op" ]]; then _reflex_key_write "$key_op" "$key_val"; key_val=""; fi
   local policy; policy=$(box_verify_policy)
   local small; small=$(box_verify_small)
   local pw="" p5=""
   if declare -F _pace_floors_load >/dev/null 2>&1; then pw=$(_pace_week_effective); p5=$(_pace_5h_effective); fi
-  ok "box config updated (${applied[*]}) — verify = ${policy}, verify-small = ${small}${pw:+, pace-week = ${pw}, pace-5h = ${p5}}" \
-     '{verify:$v, verify_small:$sm, pace_week:$pw, pace_5h:$p5, applied:($a|split(",")), path:$p}' \
-     --arg v "$policy" --arg sm "$small" --arg pw "$pw" --arg p5 "$p5" --arg a "$(IFS=,; printf '%s' "${applied[*]}")" --arg p "$cfg"
+  local rr="" rm="" rk=""
+  if declare -F reflex_receipts_resolve >/dev/null 2>&1; then
+    reflex_receipts_resolve; reflex_model_resolve; rr="$_REFLEX_RECEIPTS"; rm="$_REFLEX_MODEL"; rk=$(reflex_key_status)
+  fi
+  ok "box config updated (${applied[*]}) — verify = ${policy}, verify-small = ${small}${pw:+, pace-week = ${pw}, pace-5h = ${p5}}${rr:+, reflex-receipts = ${rr}, reflex-model = ${rm}, reflex-key = ${rk}}" \
+     '{verify:$v, verify_small:$sm, pace_week:$pw, pace_5h:$p5, reflex_receipts:$rr, reflex_model:$rm, reflex_key:$rk, applied:($a|split(",")), path:$p}' \
+     --arg v "$policy" --arg sm "$small" --arg pw "$pw" --arg p5 "$p5" --arg rr "$rr" --arg rm "$rm" --arg rk "$rk" \
+     --arg a "$(IFS=,; printf '%s' "${applied[*]}")" --arg p "$cfg"
+}
+
+# DIVE-4915: write or remove the reflex OpenRouter key. Root-only 600 in a file
+# of its own (not box.json, which every seat reads). The value arrives from
+# stdin via the validator above and leaves only into the file.
+_reflex_key_write() {
+  local op="$1" val="${2:-}" f d tmp
+  f=$(_reflex_key_file); d=$(dirname "$f")
+  if [[ "$op" == clear ]]; then
+    rm -f "$f" || fail "$E_GENERIC" "could not remove the reflex key file"
+    return 0
+  fi
+  install -d -m 750 "$d" 2>/dev/null || mkdir -p "$d"
+  tmp=$(umask 077; mktemp "${f}.XXXXXX") || fail "$E_GENERIC" "could not stage the reflex key file"
+  printf '%s\n' "$val" > "$tmp"
+  chmod 600 "$tmp"
+  chown root:root "$tmp" 2>/dev/null || true
+  mv "$tmp" "$f" || { rm -f "$tmp"; fail "$E_GENERIC" "could not write the reflex key file"; }
 }
