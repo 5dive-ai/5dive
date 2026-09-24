@@ -7,7 +7,7 @@
 #   5dive reflex log     [--policy=<p>] [--limit=N] [--json]
 #   5dive reflex replay  [--since=14d|YYYY-MM-DD] [--policy=<p>]
 #                        [--backend=fake:echo|fake:first|fake:recommend|<command>]
-#                        [--timeout=<seconds>] [--dump=<file>] [--json]
+#                        [--inputs=none|titles] [--timeout=<seconds>] [--dump=<file>] [--json]
 #   5dive reflex fake    [--strategy=echo|first|recommend]
 #
 # ── THE REPLAY ────────────────────────────────────────────────────────────────
@@ -47,8 +47,32 @@
 #              "probabilities":{...}|null,"probability_source":"logprob|head|verbal"|null}
 #
 # state.current is what today's code chose. It is absent on gate-answer, because
-# there the thing being predicted IS the human's answer. The request never carries
-# a title, a body or any gate text (src/lib/reflex.sh, "what a receipt may carry").
+# there the thing being predicted IS the human's answer.
+#
+# A request never carries a field derived from the OUTCOME (DIVE-4910). The case
+# keeps them for scoring; the request is built without them. On gate-answer those
+# are matched_recommend (it says whether the answer equalled the recommendation, so
+# a backend reading it scores ~100% without predicting anything) and answered_by
+# (who answered is known only once it was answered). The list is
+# _REFLEX_OUTCOME_FIELDS below, and a new outcome-derived signal goes there.
+#
+# What text a request may carry, by --inputs:
+#   none (default)  ids, seat names, labels and counts. Never a title, a body, a
+#                   gate's ask or option text (src/lib/reflex.sh, "what a receipt
+#                   may carry"). A customer box sends no task text to a backend
+#                   unless someone asks for it.
+#   titles          adds state.title (the row's title as it stands NOW) and
+#                   state.project, on gate-answer state.gate {ask, options
+#                   {opt1: <text>, ...}, recommend}, and on task-route state.lanes
+#                   {seat: <org-chart role>}. Opt-in, for a replay against a model
+#                   whose key and box are the operator's own (DIVE-4910).
+#   A BODY is never sent under any value: it is never read.
+#
+# task-route options are the seats that can take work NOW: the roster the board
+# accepts (registry + org chart), minus grader clones (gr-*) and seats whose
+# desiredState is stopped. History whose worker has since left the roster stays in
+# the set as a case no backend can get right; the report counts those as the
+# ceiling (outcome_in_options).
 # A response whose choice is not one of the options, a malformed line, a missing
 # line, or a backend that times out counts as INVALID. The case then falls back to
 # state.current, which is the proposal's fail-closed rule, and the report counts
@@ -64,6 +88,9 @@
 #              recommendation" rate.
 
 _REFLEX_POLICIES="task-route retry-action stuck gate-answer"
+# Signals a case may carry for SCORING that a request must never carry, because
+# they are read off the outcome (DIVE-4910; see "A request never carries" above).
+_REFLEX_OUTCOME_FIELDS='["matched_recommend","answered_by"]'
 
 cmd_reflex() {
   local sub="${1:-help}"; shift || true
@@ -78,10 +105,13 @@ cmd_reflex() {
   5dive reflex log     [--policy=<p>] [--limit=N] [--json]
   5dive reflex replay  [--since=14d|YYYY-MM-DD] [--policy=<p>]
                        [--backend=fake:echo|fake:first|fake:recommend|<command>]
-                       [--timeout=<seconds>] [--dump=<file>] [--json]
+                       [--inputs=none|titles] [--timeout=<seconds>] [--dump=<file>] [--json]
   5dive reflex fake    [--strategy=echo|first|recommend]   (JSONL stdin -> stdout)
 
 Policies: task-route, retry-action, stuck, gate-answer.
+--inputs=titles lets a replay request carry task titles, gate asks/options and
+seat roles (never a body). The default sends ids and labels only.
+A reference OpenRouter backend: scripts/reflex-openrouter-backend.sh.
 Receipts are written by the decision points themselves. Set
 FIVEDIVE_REFLEX_RECEIPTS=0 to stop writing them. Nothing here changes behaviour.
 EOF
@@ -171,10 +201,41 @@ _reflex_since_sql() {
   fi
 }
 
+# _reflex_route_seats -> JSON [{seat, role}]: the seats a task can be routed to
+# NOW. The board's roster (registry + org chart, _task_roster), minus grader
+# clones, which the pool mints and retires per grade, and minus seats whose unit
+# is desiredState=stopped. role is the org chart's, or null. [] when the roster
+# is unreadable, and the caller then falls back to the seats seen in the window.
+_reflex_route_seats() {
+  local roster reg='{}' org='[]'
+  roster=$(reflex_roster_csv 2>/dev/null) || roster=""
+  [[ -n "$roster" ]] || { printf '[]\n'; return 0; }
+  reg=$(REGISTRY="${STATE_DIR:-/var/lib/5dive}/agents.json" registry_read_checked 2>/dev/null) || reg='{}'
+  org=$(_reflex_sql_json "SELECT name, role FROM agents_org WHERE name IS NOT NULL AND name<>'';")
+  jq -nc --arg r "$roster" --arg pfx "${_GRADER_CLONE_PREFIX:-gr-}" \
+    --argjson reg "$(jq -c '.agents // {}' <<<"$reg" 2>/dev/null || printf '{}')" --argjson org "$org" '
+    ($org | map({key: .name, value: .role}) | from_entries) as $roles
+    | [ $r | split(",")[] | select(length > 0)
+        | select(startswith($pfx) | not)
+        | select(($reg[.].desiredState // "") != "stopped")
+        | {seat: ., role: ($roles[.] // null | if . == "" then null else . end)} ]' 2>/dev/null \
+    || printf '[]\n'
+}
+
 # The cases, as JSONL on stdout. Every field a backend will see is built here, and
 # the outcome is attached here, from the board as it stands now.
 _reflex_build_cases() {
-  local since="$1" only="${2:-}" d="$3"
+  local since="$1" only="${2:-}" d="$3" inputs="${4:-none}"
+  # Text columns are READ only under --inputs=titles; the default never selects
+  # them, so there is nothing to leak. A body is never selected at all.
+  local ask_col="''" title_q="SELECT NULL AS id WHERE 0;"
+  if [[ "$inputs" == "titles" ]]; then
+    ask_col="COALESCE(ask,'')"
+    title_q="SELECT id, COALESCE(title,'') AS title, COALESCE(project_key,'') AS project FROM tasks WHERE id IN
+               (SELECT task_id FROM lifecycle_events WHERE ts >= ${since} AND task_id IS NOT NULL);"
+  fi
+  _reflex_sql_json >"$d/titles.json" "$title_q"
+  _reflex_route_seats >"$d/seats.json"
   _reflex_sql_json >"$d/receipts.json" "SELECT ts, ident, task_id, actor, detail FROM lifecycle_events
                                WHERE kind LIKE 'decision.%' AND ts >= ${since} ORDER BY id;"
   _reflex_sql_json >"$d/hist_route.json" "SELECT ts, ident, task_id, actor, detail FROM lifecycle_events
@@ -190,11 +251,11 @@ _reflex_build_cases() {
   _reflex_sql_json >"$d/gates.json" "
     SELECT need_answered_at AS ts, ident, task_id, need_type AS nt, COALESCE(need_options,'') AS opts,
            COALESCE(recommend,'') AS rec, need_answer AS ans, COALESCE(need_answered_by,'') AS \"by\",
-           COALESCE(tier,'') AS tier
+           COALESCE(tier,'') AS tier, ${ask_col} AS ask
       FROM gate_history WHERE need_answer IS NOT NULL AND need_answer<>'' AND need_answered_at >= ${since}
     UNION ALL
     SELECT need_answered_at, ident, id, need_type, COALESCE(need_options,''), COALESCE(recommend,''),
-           need_answer, COALESCE(need_answered_by,''), COALESCE(tier,'')
+           need_answer, COALESCE(need_answered_by,''), COALESCE(tier,''), ${ask_col}
       FROM tasks WHERE need_answer IS NOT NULL AND need_answer<>'' AND need_answered_at >= ${since}
     ORDER BY 1;"
   _reflex_sql_json >"$d/tasks.json" "SELECT id, status FROM tasks WHERE id IN
@@ -203,13 +264,16 @@ _reflex_build_cases() {
             WHERE kind IN ('task.delivered','task.done') AND ts >= ${since} AND task_id IS NOT NULL ORDER BY id;"
 
   # Files and --slurpfile, not --argjson: two weeks of ledger is past ARG_MAX.
-  jq -nc --arg only "$only" \
+  jq -nc --arg only "$only" --arg inputs "$inputs" --argjson outf "$_REFLEX_OUTCOME_FIELDS" \
+    --slurpfile titles "$d/titles.json" --slurpfile active "$d/seats.json" \
     --slurpfile receipts "$d/receipts.json" --slurpfile route "$d/hist_route.json" \
     --slurpfile reject "$d/hist_reject.json" --slurpfile reap "$d/hist_reap.json" \
     --slurpfile gates "$d/gates.json" --slurpfile tasks "$d/tasks.json" --slurpfile events "$d/events.json" \
     "${_REFLEX_JQ_DEFS}"'
     ($receipts[0]) as $receipts | ($route[0]) as $route | ($reject[0]) as $reject
     | ($reap[0]) as $reap | ($gates[0]) as $gates | ($tasks[0]) as $tasks | ($events[0]) as $events
+    | ($titles[0] | map({key: (.id|tostring), value: {title, project}}) | from_entries) as $tt
+    | ($active[0]) as $active
     | def epoch: (. // "") | sub("T"; " ") | sub("Z$"; "") | sub("\\.[0-9]+$"; "")
                           | (strptime("%Y-%m-%d %H:%M:%S") | mktime)? // null;
     ($tasks | map({key: (.id|tostring), value: .status}) | from_entries) as $status
@@ -219,13 +283,16 @@ _reflex_build_cases() {
     | [ $receipts[] | (.detail | fromjson? // null) as $r | select($r != null)
         | {policy: $r.policy, ts: .ts, ident: .ident, task_id: .task_id, source: "receipt",
            seat: ($r.effect.seat // .actor), current: $r.result,
-           options: ($r.candidates // []), signals: ($r.signals // {})} ] as $live
-    | ($live | group_by(.policy) | map({key: .[0].policy, value: (map(.ts) | min)}) | from_entries) as $cut
+           options: ($r.candidates // []), signals: ($r.signals // {})} ] as $live0
+    | ($live0 | group_by(.policy) | map({key: .[0].policy, value: (map(.ts) | min)}) | from_entries) as $cut
     | def before($p): (.ts < ($cut[$p] // "9999"));
       # Seats that took part in the window, as the candidate set for rebuilt
       # route cases. The live receipts carry the real roster instead.
       ([ $events[].actor, ($route[] | .detail | capture("→ (?<a>[^ ]+)").a? // empty) ]
-        | map(select(. != null and . != "unassigned" and (test(":") | not))) | unique) as $seats
+        | map(select(. != null and . != "unassigned" and (test(":") | not))) | unique) as $seen
+    # The route candidates: the seats that can take work now. Only an unreadable
+    # roster falls back to the seats seen in the window.
+    | (if ($active|length) > 0 then [ $active[].seat ] else $seen end) as $seats
     | ( [ $route[] | select(before("task-route"))
           | (.detail | capture("^(?<p>[a-z]+) → (?<a>[^ ]+)")? // {p: null, a: "unassigned"}) as $d
           | {policy: "task-route", ts, ident, task_id, source: "history", seat: null,
@@ -247,7 +314,7 @@ _reflex_build_cases() {
       + [ $gates[] | select(before("gate-answer")) | rx_gate_case as $g
           | {policy: "gate-answer", ts, ident, task_id, source: "history", seat: null,
              current: $g.result, options: $g.candidates, signals: $g.signals} ]
-      + $live ) as $all
+      + [ $live0[] | if .policy == "task-route" then .options = $seats else . end ] ) as $all
     | now as $now
     | $all[] | select($only == "" or .policy == $only)
     | ($status[(.task_id|tostring)] // null) as $st
@@ -271,11 +338,29 @@ _reflex_build_cases() {
           | (if $quick then "leave" elif ($now - ($t // $now)) >= 600 then "reclaim" else null end)
         elif .policy == "gate-answer" then .current
         else null end)}
-    # The request a backend sees. The outcome is never in it, and on gate-answer
-    # neither is today'"'"'s "current": there the answer IS the outcome.
+    # The request a backend sees. The outcome is never in it, nor any signal read
+    # off the outcome ($outf), and on gate-answer neither is today'"'"'s "current":
+    # there the answer IS the outcome.
+    | (if $inputs != "titles" then {}
+       else ($tt[(.task_id|tostring)] // {}) as $x
+         | {title: ($x.title // null), project: ($x.project // "" | if . == "" then null else . end)}
+         + (if .policy == "task-route" then
+              {lanes: ($active | map({key: .seat, value: .role}) | from_entries)}
+            elif .policy == "gate-answer" then
+              (.task_id) as $tid | ((.ts|epoch) // 0) as $ct
+              # The gate this case answered: history cases ARE a gate row; a
+              # receipt is matched to its task'"'"'s gate answered at or just before it.
+              | ([ $gates[] | select(.task_id == $tid and ((.ts|epoch) // 0) <= $ct + 5) ] | last) as $gr
+              | {gate: (if $gr == null then null else
+                  {ask: ($gr.ask // "" | if . == "" then null else . end),
+                   options: ([ ($gr.opts // "") | split("|") | to_entries[] | select(.value != "")
+                               | {key: "opt\(.key + 1)", value: .value} ] | from_entries),
+                   recommend: ($gr.rec // "" | if . == "" then null else . end)} end)}
+            else {} end) end) as $text
     | . + {request: {policy, version: 1, type: "choice",
-                     state: ({task: .ident, signals}
-                             + (if .policy == "gate-answer" then {} else {current} end)),
+                     state: ({task: .ident, signals: (.signals | delpaths([$outf[] | [.]]))}
+                             + (if .policy == "gate-answer" then {} else {current} end)
+                             + $text),
                      options}}'
 }
 
@@ -288,7 +373,7 @@ _reflex_run_backend() { # <backend> <requests file> <timeout s> -> responses on 
 }
 
 _reflex_replay() {
-  local since_spec="14d" policy="" backend="fake:echo" to=300 dump="" a
+  local since_spec="14d" policy="" backend="fake:echo" to=300 dump="" inputs="none" a
   for a in "$@"; do
     case "$a" in
       --since=*)   since_spec="${a#*=}" ;;
@@ -296,12 +381,14 @@ _reflex_replay() {
       --backend=*) backend="${a#*=}" ;;
       --timeout=*) to="${a#*=}" ;;
       --dump=*)    dump="${a#*=}" ;;
+      --inputs=*)  inputs="${a#*=}" ;;
       --json)      JSON_MODE=1 ;;
       *) fail "$E_USAGE" "unknown flag: $a" ;;
     esac
   done
   _reflex_check_policy "$policy"
   [[ "$to" =~ ^[1-9][0-9]{0,4}$ ]] || fail "$E_VALIDATION" "--timeout must be a positive number of seconds"
+  case "$inputs" in none|titles) ;; *) fail "$E_VALIDATION" "--inputs must be none or titles (got: $inputs)" ;; esac
   case "$backend" in
     fake:echo|fake:first|fake:recommend) ;;
     fake:*) fail "$E_VALIDATION" "unknown fake backend: $backend (fake:echo, fake:first, fake:recommend)" ;;
@@ -310,7 +397,7 @@ _reflex_replay() {
   _reflex_need_store
   local since; since=$(_reflex_since_sql "$since_spec")
   local tmp; tmp=$(mktemp -d "${TMPDIR:-/tmp}/reflex-replay.XXXXXX") || fail "$E_GENERIC" "mktemp failed"
-  if ! _reflex_build_cases "$since" "$policy" "$tmp" >"$tmp/cases.jsonl"; then
+  if ! _reflex_build_cases "$since" "$policy" "$tmp" "$inputs" >"$tmp/cases.jsonl"; then
     rm -rf "$tmp"; fail "$E_GENERIC" "could not build replay cases from ${TASKS_DB}"
   fi
   jq -c '.request' "$tmp/cases.jsonl" >"$tmp/req.jsonl"
@@ -329,9 +416,9 @@ _reflex_replay() {
     | . + {valid: $valid, choice: (if $valid then $ch else .request.state.current end)}' \
     >"$tmp/paired.jsonl"
   local report
-  report=$(jq -sc --arg backend "$backend" --arg since "$since_spec" --arg only "$policy" '
+  report=$(jq -sc --arg backend "$backend" --arg since "$since_spec" --arg only "$policy" --arg inputs "$inputs" '
     . as $all
-    | {backend: $backend, since: $since, generated_at: (now | todate),
+    | {backend: $backend, since: $since, inputs: $inputs, generated_at: (now | todate),
        policies: [ "task-route", "retry-action", "stuck", "gate-answer" | select($only == "" or . == $only) ] | map(. as $p
          | [ $all[] | select(.policy == $p) ] as $cs
          | [ $cs[] | select(.outcome != null) ] as $res
@@ -342,6 +429,9 @@ _reflex_replay() {
             from_history: ([ $cs[] | select(.source == "history") ] | length),
             first: ([ $cs[].ts ] | min), last: ([ $cs[].ts ] | max),
             resolved: ($res|length),
+            # The ceiling: resolved cases whose outcome is one of the options. A
+            # seat that has since left the roster is an outcome no backend can pick.
+            outcome_in_options: ([ $res[] | select(.outcome as $o | .options | index([$o]) != null) ] | length),
             current_behavior_accuracy: (if ($withcur|length) > 0
               then ([ $withcur[] | select(.request.state.current == .outcome) ] | length) / ($withcur|length)
               else null end),
@@ -372,7 +462,7 @@ _reflex_replay() {
   fi
   jq -r '
     def pct: if . == null then "   n/a" else (. * 1000 | round / 10 | tostring | .[0:5] + "%") end;
-    "reflex replay — backend \(.backend), since \(.since)",
+    "reflex replay — backend \(.backend), since \(.since), inputs \(.inputs)",
     "",
     "policy        cases  receipts  history  resolved  current  backend  agree  invalid",
     (.policies[] |
@@ -380,7 +470,7 @@ _reflex_replay() {
     "",
     (.policies[] | select(.policy == "gate-answer" and .with_recommend != null) |
       "gate-answer: \(.with_recommend) answered gates carried a recommendation; \(.matched_recommend_rate|pct) were answered with it."),
-    (.policies[] | select(.cases > 0) | "  \(.policy): \(.first) → \(.last); outcomes \(.outcome_labels|tostring)"),
+    (.policies[] | select(.cases > 0) | "  \(.policy): \(.first) → \(.last); outcomes \(.outcome_labels|tostring); outcome among the options in \(.outcome_in_options) of \(.resolved)"),
     "",
     "current = today'"'"'s recorded decision scored against the outcome proxy; backend = the",
     "candidate'"'"'s pick (a fallback to current where it was invalid); agree = backend == current.",
