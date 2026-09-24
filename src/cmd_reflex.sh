@@ -90,7 +90,7 @@
 
 _REFLEX_POLICIES="task-route retry-action stuck gate-answer"
 # Shadow-only policies: `reflex log` lists them; the replay has no history for them.
-_REFLEX_SHADOW_POLICIES="browser-login-marker"
+_REFLEX_SHADOW_POLICIES="browser-login-marker browser-recipe-step"
 # Signals a case may carry for SCORING that a request must never carry, because
 # they are read off the outcome (DIVE-4910; see "A request never carries" above).
 _REFLEX_OUTCOME_FIELDS='["matched_recommend","answered_by"]'
@@ -104,6 +104,7 @@ cmd_reflex() {
     fake)   _reflex_fake "$@" ;;
     report) _reflex_report "$@" ;;
     login-marker) _reflex_login_marker "$@" ;;
+    pick-ref) _reflex_pick_ref "$@" ;;
     help|-h|--help)
       cat <<'EOF'
 5dive reflex — decision receipts (phase 0: receipts + offline replay, no model)
@@ -120,6 +121,9 @@ cmd_reflex() {
   5dive reflex login-marker <site> --logged-out=<html> [--logged-out=<html 2>] [--logged-in=<html>] [--url=<probe url>]
                        [--spa] [--compare=<adapter.json>] [--backend=fake:first|<command>]
                        [--out=<file>] [--json]
+  5dive reflex pick-ref <site> --tree=<tree.json> --op=click|fill|select|press|upload|wait_for
+                       --intent="<what the step is for>" [--value=|--key=|--path=]
+                       [--backend=fake:first|<command>] [--json]
 
 Policies: task-route, retry-action, stuck, gate-answer.
 --inputs=titles lets a replay request carry task titles, gate asks/options and
@@ -135,6 +139,9 @@ two renders of a site's probe page, signed out and signed in. The code lists
 and verifies candidate markers; the model only picks one. Nothing is written
 to an adapter directory. --compare=<adapter.json> scores the pick against a
 hand-written marker. The real model needs the root-only key: run it with sudo.
+`pick-ref` (DIVE-4929, SHADOW) drafts ONE recipe step from a `browser snapshot`
+tree: the code keeps the elements whose role can take the op, the model picks
+one, and the step's selector is that element's ref. Nothing is written.
 Receipts are written by the decision points themselves. Stop them with
 `5dive config reflex-receipts=off` (FIVEDIVE_REFLEX_RECEIPTS=0 in the
 environment wins over that). Nothing here changes behaviour.
