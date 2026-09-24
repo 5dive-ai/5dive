@@ -35,7 +35,7 @@
 # Run: bash tests/task_grade_derive_widen_unit.sh
 set -uo pipefail
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 SRC=src
 TMP="$(mktemp -d /tmp/derive-widen.XXXXXX)"
 REPO_ROOT="$PWD"
