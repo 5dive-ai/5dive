@@ -42,9 +42,9 @@ source src/lib/agent_setup.sh
 set +e
 
 # Not named ok/fail/check: output.sh and error_codes.sh own those names.
-n_pass=0 n_fail=0
-t_ok()  { echo "ok: $1"; n_pass=$((n_pass+1)); }
-t_bad() { echo "FAIL: $1" >&2; n_fail=$((n_fail+1)); }
+pass=0; fail=0
+t_ok()  { echo "ok: $1"; pass=$((pass+1)); }
+t_bad() { echo "FAIL: $1" >&2; fail=$((fail+1)); }
 t_eq()  { if [[ "$2" == "$3" ]]; then t_ok "$1"; else t_bad "$1 (want=$3 got=$2)"; fi; }
 
 # sudo stub: drop `-u <user>` / `-H` and run the command as us, so the real
@@ -203,5 +203,5 @@ t_eq "M3 plugin-blind helper -> codex arm RED" "$(seat m3 "$CODEX")" "STAGED-TEL
 eval "$REAL_SRC"
 
 echo
-echo "$n_pass passed, $n_fail failed"
-[[ "$n_fail" -eq 0 ]]
+echo "$pass passed, $fail failed"
+[[ $fail -eq 0 ]]
