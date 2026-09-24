@@ -78,7 +78,7 @@ usage: 5dive hire <name> [--type=claude] [--role=<text>] [--title=<text>] [+ any
                                                      # --heartbeat-every= --inherit-memory= --no-heartbeat
                                                      # --no-team-bot --can-push --can-deploy --base-url=
                                                      # --telegram-home-channel= --telegram-allowed-users=
-                                                     # --telegram-cos= --telegram-cos-avatar=
+                                                     # --telegram-cos= --telegram-cos-avatar= --human=
                                                      # --dry-run rejects an unknown flag just like the real run
 
 FRESH  — sugar for `agent create` (+ `org set` when --role/--title given):

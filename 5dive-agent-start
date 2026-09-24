@@ -499,6 +499,23 @@ if [[ "$TYPE" == "codex" ]]; then
       cred_seed_failed "could not seed codex auth.json from $SHARED_AUTH ($(cred_seed_why "$SHARED_AUTH")) — agent will boot UNAUTHENTICATED"
     fi
   fi
+  # Set <key> = true under [features] in a codex config.toml, TOML-safely and
+  # idempotently: an explicit `<key> = …` there (true OR false) is the user's and
+  # is left alone; an existing [features] table gets the key under its header;
+  # otherwise a whole table is appended. ONE writer for [features], so no path
+  # can append a second table (a duplicate table header is a codex parse error).
+  codex_ensure_feature() {   # codex_ensure_feature <config.toml> <key>
+    local f="$1" k="$2"
+    [[ -f "$f" ]] || return 0
+    awk -v k="$k" '/^[[:space:]]*\[/{inf=($0 ~ /^[[:space:]]*\[features\][[:space:]]*$/)}
+         inf && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {found=1}
+         END{exit !found}' "$f" && return 0
+    if grep -q '^[[:space:]]*\[features\][[:space:]]*$' "$f"; then
+      sed -i "0,/^[[:space:]]*\\[features\\][[:space:]]*\$/s//[features]\\n${k} = true/" "$f"
+    else
+      printf '\n[features]\n%s = true\n' "$k" >> "$f"
+    fi
+  }
   # Bypass codex's first-run trust prompt + approval/sandbox dialogs. Mirrors
   # the `--dangerously-skip-permissions` posture we use for claude-family.
   #
@@ -549,10 +566,6 @@ TOML
 command = "bun"
 args = ["${CODEX_PLUGIN_DIR}/server.ts"]
 
-[features]
-hooks = true
-memories = true
-
 [[hooks.Stop]]
 
 [[hooks.Stop.hooks]]
@@ -582,10 +595,17 @@ command = "bun ${CODEX_PLUGIN_DIR}/hooks/request-permission.ts"
 timeout = 180
 async = false
 TOML
+      codex_ensure_feature "$AGENT_CODEX_HOME/config.toml" hooks
     else
       echo "warn: telegram channel set for codex agent '$NAME' but telegram-codex plugin not found (TELEGRAM_CODEX_PLUGIN_DIR / /usr/local/lib/5dive/telegram-codex / 5dive-plugins checkout) — MCP + hooks not wired" >&2
     fi
   fi
+  # DIVE-4923: DIVE-1192 promised every codex seat native memory, but the only
+  # writer of `memories = true` was the telegram MCP block above, which a
+  # dispatcher-mode seat (and any seat without telegram) never gets — measured on
+  # an imported codex seat, 2026-09-24. Ensured on every boot; an explicit
+  # `memories = false` stays the user's.
+  codex_ensure_feature "$AGENT_CODEX_HOME/config.toml" memories
   CODEX_OVERRIDE="export CODEX_HOME=$(printf %q "$AGENT_CODEX_HOME"); "
   if codex_dispatcher_enabled "$CHANNELS"; then
     CODEX_OVERRIDE+="export CODEX_BIN=$(printf %q "$CODEX_REAL_BIN") CODEX_DISPATCHER_CHANNELS=$(printf %q "$CHANNELS") CODEX_DISPATCHER_WORKDIR=$(printf %q "$WORKDIR"); "
