@@ -1,0 +1,13 @@
+# DIVE-4878 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+CHANGED-FILE: src/app/dashboard/_components/browser-brief.test.ts
+CHANGED-FILE: src/app/dashboard/_components/browser-install-state.test.ts
+CHANGED-FILE: src/app/dashboard/company/_components/company-shell.tsx
+CHANGED-FILE: src/app/dashboard/company/team-rules.test.ts
+CHANGED-FILE: src/app/dashboard/plugins/install-flow.test.ts
+---
+CHECKED: install-flow.test.ts 18/18; team-rules.test.ts 9/9; browser-install-state.test.ts 15/15; full `npm test` 964/964; `tsc --noEmit` clean; eslint on changed files: 1 error, pre-existing on main (company-shell.tsx effect setState, main line 104); 5 source mutants each red (setup ignores allowlist: 5 fail; setup after failed install: 1; re-run failed setup on enable: 1; hard-coded floor list: 1; default line on failed read: 2). `npm run build` not run (cannot run on this host: Google Fonts fetch).
+CHECKED: browser-brief.test.ts 8/8 (3 mutants red: ignore existing seat, show on unread agents, match by name not slug); full `npm test` at 37386a63 972/972; the merge with main's #290 was checked: browser-install-state.test.ts 16/16 with #290's arm applied. Earlier: install-flow.test.ts 18/18; team-rules.test.ts 9/9; browser-install-state.test.ts 15/15; full `npm test` 964/964; `tsc --noEmit` clean; eslint on changed files: 1 error, pre-existing on main (company-shell.tsx effect setState, main line 104); 5 source mutants each red (setup ignores allowlist: 5 fail; setup after failed install: 1; re-run failed setup on enable: 1; hard-coded floor list: 1; default line on failed read: 2). `npm run build` not run (cannot run on this host: Google Fonts fetch).

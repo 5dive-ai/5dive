@@ -1,0 +1,8 @@
+# DIVE-4889 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+CHANGED-FILE: test/dive4889-react-newest-no-relay.test.ts
+---
+CHECKED: bun test test/dive4889-react-newest-no-relay.test.ts — 12 pass / 0 fail (real hook as subprocess vs a Bot API stub; #1005's cases + react-on-older, react-then-newer-inbound, other-chat). Mutants red: newest-inbound check deleted (arms 2/2b/2c + unit), chat half deleted (2c), hook guard deleted (1), react folded into hadSend (2/2b/2c + unit). Full plugins suite 1623 pass / 0 fail; generator --check clean. CLI: bash -n install.sh ok; tests/install_pin_compat_unit.sh 26/0; scripts/install-pin-compat.sh vs pin v0.49.1 missing=0 unclassified=0; pre-push rail 2/2 changed harnesses green. Cross-repo consumers: git grep origin/main of 5dive-api, 5dive-plugins, app, ops, 5dive-skills, agent-profile — prose only. Seats wiring either CLI hook on the control plane: 0 of 11 (sudo, positive control ok).

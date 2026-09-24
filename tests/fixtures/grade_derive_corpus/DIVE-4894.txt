@@ -1,0 +1,9 @@
+# DIVE-4894 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+TREE-FILE: scripts/tsx-loader.mjs
+CHANGED-FILE: src/app/dashboard/company/team-rules.test.ts
+---
+CHECKED: app `node --import ./scripts/tsx-loader.mjs --test src/app/dashboard/company/team-rules.test.ts` 18/18; 8 mutants red (coauthor→wrong key, read-back skipped, refused write rereads, confirm removed, People card restored, value snapped to preset, choices live under confirm, block card restored); `npm test` 982/982 vs clean-main control ac2cc9cf 973/973; `npx tsc --noEmit` clean. api `node --import tsx --test src/routes/agents.sanitize.*.test.ts` 29/29; `npm test` 765/765; `npx tsc --noEmit` clean; 4 mutants red (hasOwn removed, --json requirement removed, one-key rule removed, verify allowed). `npm run build` can't run on this host (Google Fonts fetch). ESLint on the changed files: 3 pre-existing set-state-in-effect errors, all on untouched lines.

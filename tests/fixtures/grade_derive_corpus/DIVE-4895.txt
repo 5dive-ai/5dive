@@ -1,0 +1,18 @@
+# DIVE-4895 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+CHANGED-FILE: src/routes/browser.test.ts
+---
+CHECKED: api: node --test src/routes/browser.test.ts: 49/49 pass. Mutation with the auth fallback disabled: 2 new arms red. Pre-fix route: 4 new arms red. Full api npm test: 770/770. tsc clean. frontend: npm test: 985/985. tsc clean. Pre-fix sources with the new tests: 3 new arms red. eslint on the changed files: the same 2 errors as main, 0 new.
+CHECKED: CI rollup. check-runs/statuses return 403 from this seat, so the local full-suite runs stand in for it. There is no screenshot, per the row's LIGHT grade (lodar 09-21 extension). Residual outside scope: a shell `serve <new-site>` still refuses (wiki page, still open).
+
+--- appended 2026-09-23 12:44:39Z by a later write (DIVE-2483); the text above was already on the row ---
+✅ verify PASS (verifier's prose grade — NO command was run, DIVE-2832): recorded by quinn
+CHECKED: CI rollup. check-runs/statuses return 403 from this seat, so the local full-suite runs stand in for it. There is no screenshot, per the row's LIGHT grade (lodar 09-21 extension). Residual outside scope: a shell `serve <new-site>` still refuses (wiki page, still open).
+
+--- appended 2026-09-23 12:45:30Z by a later write (DIVE-2483); the text above was already on the row ---
+Graded PASS and merged by quinn: a site's first Connect now creates its profile and opens a viewer instead of 502ing, and any remaining refusal is a plain sentence (5dive-api#227 merged as 8f9a7c0a). The companion 5dive-frontend#295 (setup-owed self-refresh and the Clicker models line) was graded PASS at 9ef014ad but is NOT merged. This row's merge rail binds only the api PR, so #295 still needs a merge by main or dev.
+
+[merge-gate: UNVERIFIED — checks of https://github.com/lodar/5dive-api/pull/227 unresolved (merged-state confirmed). This close was NOT confirmed merged-and-green against GitHub; absence of a finding here is not evidence of one. (DIVE-1955)]

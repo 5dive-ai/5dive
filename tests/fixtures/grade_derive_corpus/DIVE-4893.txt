@@ -1,0 +1,46 @@
+# DIVE-4893 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+TREE-FILE: scripts/tsx-loader.mjs
+CHANGED-FILE: src/app/dashboard/council/council-plugin.test.ts
+---
+CHECKED:
+- pre-push rail: 15/15 changed harnesses green (254s).
+- constitution_kernel_unit 21/21, with the K5 mutant red.
+- Run as root (the harness sudo guard makes them SKIP otherwise): constitution_set_e2e 23/23, set_json_e2e 33/33.
+- show_e2e 29/29, init_e2e 23/23, legacy_migration 13/13, gate_floor 19/19, authority_shape 24/24, gate_t2_nonce 25/25, gate_lead_standing 74/74, root_filer_route 31/31, clear_leads_reader 20/20, plugin_verb_dispatch 73/73, lazy_dispatch 42/42, a2a_round_cap 83/83, heartbeat_dispatcher_claim 42/42, heartbeat_tier_head 32/32, selfcheck_mutation 41/41, gitattributes 7/7, usage_enumeration 9/9, scan-trailing-conditional rc 0.
+- Genesis writer, chain check, show and merge are byte-identical to the pre-move council cli (853725fd) on fixed args. The only show difference is none (parser untouched).
+- Plugin suite tests/run_all.sh at c95c418: 30/30 against this core (plugin_unit 52+1 skip; P4 engine parity skips post-unwire as designed) and 30/30 against core main.
+- Before the shim fix: roster_class and schedule FAILED against this core and passed against main.
+- P8 goes red on the old shim.
+- Root install e2e with a throwaway STATE_DIR:
+  - old core `plugin add council@local`: rc 3
+  - lineage sealed by old core; `constitution verify` on the new core with no plugin: 0
+  - `council verify` with no plugin: rc 2 plus the install line
+  - multi-seat `constitution set` with no plugin: rc 7
+  - new core `plugin add`: 0
+  - `council verify` via dispatch: 0
+  - `council roster --json` and `--json council roster`: 4 seats both ways
+  - `demote`: 0 (3 records)
+  - mixed chain: verifies on old and new
+  - tamper: `constitution verify` 1, `council verify` 5
+  - multi-seat `constitution set` with the plugin: `council amend` CARRIED, lineage 1→2
+- Other repos' .github: no src/council / cmd_council / council_* consumer.
+CHECKED:
+- bash tests/board_contract_unit.sh at cbfc855d: 46 pass, 0 fail, HARNESS-RC=0; 'M:moved-verb-notice reverting it turns the property RED (rc=1)' ok (was THE MUTATION DID NOT APPLY at 10ce5b64).
+- bash tests/plugin_verb_dispatch_unit.sh at cbfc855d: 73/73, HARNESS-RC=0.
+- pre-push rail at cbfc855d: 15/15 changed harnesses green (273.8s).
+- grep: no other test anchors on the _moved_verb_repo ui line (only board_contract_unit.sh:286).
+CHECKED (local, non-root, at the council tree = bdfdacc):
+- tests/run_all.sh vs core cbfc855d (built) + FIVEDIVE_CORE_COUNCIL_DIR=fcd81d73: 30 passed, 0 not. That includes council_gate/notify/roster_lineage/veto_e2e, the four that were red at c95c418 in run 35850457998; plugin_unit 52 pass + 1 skip.
+- tests/run_all.sh vs core main 853725fd: 30 passed, 0 not.
+- tests/council_mutants.sh vs core main: 5 red as required, 0 not (M4 runs and goes red). Vs core cbfc855d: 4 red, 0 not, M4 skipped with its reason. Before the M4 gate, vs cbfc855d: 'FAIL M4 stayed GREEN', HARNESS-RC=1.
+- P5 did not run in these (it needs root).
+CHECKED: `node --import ./scripts/tsx-loader.mjs --test src/app/dashboard/council/council-plugin.test.ts` 5/5; 6 mutants red (tab unguarded, view when absent, unknown→absent, CouncilView imported outside the gate, init before plugin add, disabled counted as installed); `npm test` 978/978 vs clean main ac2cc9cf 973/973; `npx tsc --noEmit` clean; `git grep '"council"' -- src` finds an exec only in dashboard/council/_components (the gated view). Screenshots of both states at 1280px and 390px were rendered locally with the real CompanyShell and a stubbed plugin list (Clerk gates previews, DIVE-4441), and I looked at them: /home/claude/projects/5dive/DIVE-4893-council-{absent,installed}-{desktop,phone}.png.
+CHECKED:
+- node --test src/app/dashboard/council/council-plugin.test.ts: 6/6. Mutant: with the error branch disabled, the new arm goes red (5 pass, 1 fail).
+- npm test: 988/988 at 5045a449.
+- npx tsc --noEmit: rc 0. A stale .next/dev/types entry from the earlier local screenshot route gave a false TS2307; I removed .next/dev/types before this run.
+- git merge-tree --write-tree origin/main 5045a449: clean.

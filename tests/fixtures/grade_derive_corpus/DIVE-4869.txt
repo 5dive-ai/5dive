@@ -1,0 +1,13 @@
+# DIVE-4869 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+CHANGED-FILE: build.sh
+CHANGED-FILE: src/cmd_council.sh
+CHANGED-FILE: src/task/need.sh
+CHANGED-FILE: tests/constitution_kernel_unit.sh
+---
+CHECKED: tests/constitution_kernel_unit.sh 21/21 (K3 floor+seal+drift+leads with cmd_council.sh NOT sourced; K2 and K4 are controls, K4 = without the kernel it fails closed; K5 mutant caught). All 39 council_*/constitution_*/secret_gate_delivery_path_* harnesses rc=0 on the branch. Counts equal origin/main 4f1fa52d on every re-pointed harness: gate_floor 19, word_boundary 32, price_spend 43, shape_agreement 24, root_filer 31, clear_leads 20, t2_nonce 25, lead_standing 74. Added arms: gitattributes 7->10, council_cli_contract 64->66. Before the tests were re-pointed, 5 harnesses went red on the src change, which shows they grade the loader. The pre-push rail ran 12/12 changed harnesses green (243s).
+CHECKED: merge owner, fresh clone at 842bc721: tests/constitution_kernel_unit.sh 21/21. Mutant M1 (need.sh reverted to main) gave 16/21, rc=1. Mutant M2 (kernel drift check disabled) gave 16/21, rc=1. build.sh rc=0, and the kernel functions get core lazy stubs.
+CHECKED: quinn, iteration 1, at 842bc721: constitution_kernel_unit 21/21; the 8 re-pointed harnesses have the same counts as base 4f1fa52d; M1 = 16/21. Merge owner: M2 = 16/21, and build.sh rc=0. I re-ran nothing, because the sha did not change.

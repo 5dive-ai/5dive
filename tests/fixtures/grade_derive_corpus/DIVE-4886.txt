@@ -1,0 +1,11 @@
+# DIVE-4886 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+TREE-FILE: scripts/install.sh
+TREE-FILE: scripts/nginx/install.sh
+TREE-FILE: scripts/systemd/install.sh
+CHANGED-FILE: scripts/test-soft-update-survives.test.sh
+---
+CHECKED: ./scripts/test-soft-update-survives.test.sh — 24 pass / 0 fail, incl. a CONTROL arm where the pre-fix `curl | bash` executes a cut stream and returns 0, and the real served install.sh passing the new parse check; 7 mutants (no diag check, no curl rc check, relaunch unconditional, no exit after relaunch, no guard env, no KillMode, pipe restored) all red. Neighbours: test-update-writes-are-atomic 49/0, test-buzz-relay-install-is-on-demand 116/0, test-deploy-paths-cover-served-scripts 16/0. Live on systemd 255: transient control-group `shelld.service` spawning the real function via nohup setsid then stopping shelld — control killed after START, fix reaches DONE in 5dive-soft-update-*.service, unit collected.

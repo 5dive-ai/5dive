@@ -1,0 +1,27 @@
+# DIVE-4899 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+CHANGED-FILE: src/task/status.sh
+CHANGED-FILE: tests/task_multi_pr_delivery_unit.sh
+CHANGED-FILE: tests/tasks_db_restore_guard_unit.sh
+---
+CHECKED:
+- `bash tests/task_multi_pr_delivery_unit.sh`: 22/22 pass.
+- Done-gate mutant (both new status.sh blocks disabled): G1, G1a and G3 red, 16 passed / 3 failed. The poller mutant is arm M1 in the harness.
+- 24 neighbouring harnesses green, including heartbeat_forge_merge_poll, task_merge_landed, task_merge_already_merged (T9 positional assertion kept), task_merge_disposition/declined, task_deliver_*, task_grade_context_*, schema_sync and the merge_gate suites.
+- 3 fail identically on untouched origin/main on this seat (environment: gh_config_dir / host credential): task_deliver_reach_probe, task_merge_gate_result_pr, task_merge_gate_multirepo.
+- Core tier: the 4 FAILED files (actor_claim_corroboration, agent_priv_read_breaker, builder_gh_rail, gate_telemetry_fence) fail identically on origin/main here with a built bundle (no passwordless-sudo grant for the harness store).
+- pii-scan clean.
+CHECKED:
+- `bash tests/task_multi_pr_delivery_unit.sh`: 22/22 pass at 7a759e09.
+- `bash tests/tasks_db_restore_guard_unit.sh`: 56/56 at 7a759e09 (was 55/56 at 0dd860c0). No other harness pins the column count or the old epoch (grepped).
+- Done-gate mutant (both new status.sh blocks disabled): G1, G1a and G3 red, 16 passed / 3 failed. The poller mutant is arm M1 in the harness.
+- 24 neighbouring harnesses green, including heartbeat_forge_merge_poll, task_merge_landed, task_merge_already_merged (T9 positional assertion kept), task_merge_disposition/declined, task_deliver_*, task_grade_context_*, schema_sync and the merge_gate suites.
+- 3 fail identically on untouched origin/main on this seat (environment: gh_config_dir / host credential): task_deliver_reach_probe, task_merge_gate_result_pr, task_merge_gate_multirepo.
+- Core tier: the 4 FAILED files (actor_claim_corroboration, agent_priv_read_breaker, builder_gh_rail, gate_telemetry_fence) fail identically on origin/main here with a built bundle (no passwordless-sudo grant for the harness store).
+- pii-scan clean.
+CHECKED (ops merge-owner control, fresh clone at 7a759e09): bash tests/task_multi_pr_delivery_unit.sh 22/22. bash tests/tasks_db_restore_guard_unit.sh 56/56. Mutant with _task_companions_unlanded returning nothing: P1, P1a, L1, G1 and G1a red, 17 pass / 5 fail. The diff since 0dd860c0 is only the pin fix, and the base is current against origin/main.
+CHECKED: bash tests/task_multi_pr_delivery_unit.sh 22/22 at 7a759e09 (ops control, fresh clone; quinn re-ran 22/22). bash tests/tasks_db_restore_guard_unit.sh 56/56. Mutant _task_companions_unlanded -> nothing: P1, P1a, L1, G1, G1a red (17/5). Mutant _task_unbound_pr_urls -> nothing: U1, U1a, H1, G3 red (18/4).
+CHECKED: bash tests/task_multi_pr_delivery_unit.sh 22/22 at 7a759e09 (ops control, fresh clone; quinn re-ran 22/22). bash tests/tasks_db_restore_guard_unit.sh 56/56. Mutant _task_companions_unlanded -> nothing: P1, P1a, L1, G1, G1a red (17/5). Mutant _task_unbound_pr_urls -> nothing: U1, U1a, H1, G3 red (18/4).

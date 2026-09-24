@@ -1,0 +1,11 @@
+# DIVE-4896 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+CHANGED-FILE: src/task/answer.sh
+CHANGED-FILE: tests/escalation_resume_unit.sh
+CHANGED-FILE: tests/gate_prev_status_restore_unit.sh
+---
+CHECKED: bash tests/gate_prev_status_restore_unit.sh — 32 pass, 0 fail; bash tests/escalation_resume_unit.sh — 99 pass, 0 fail; mutation: same two harnesses against pre-fix src/ — 6 + 3 new arms red, the scope controls (7b/7d/7e) green; 46 other harnesses that reference cmd_task_answer/_hb_gate_ttl_sweep/_gate_restore_status_sql (incl. task_answer_closed_row_unit 24/24, task_first_started_at_unit 42/42, tasks_db_restore_guard_unit 56/56) all rc=0; pre-push rail green (71s).
+CHECKED: bash tests/escalation_resume_unit.sh — 103 pass, 0 fail; bash tests/gate_prev_status_restore_unit.sh — 32 pass, 0 fail; mutation: escalation_resume_unit against d73929ed's answer.sh — EV1/EV2/EV4 red (100 pass/3 fail), EV3 green there as expected since the bump runs before the crash; every harness that calls cmd_task_escalate (heartbeat_reap_escalate_latch 12/12, heartbeat_dispatcher_claim 42/42, heartbeat_nudge_enforce 62/62, heartbeat_reclaim_loop 33/33, runs_unit 44/44, +7 more) plus task_answer_closed_row 24/24 and task_first_started_at 42/42 — all rc=0; pre-push rail green (66s).

@@ -1,0 +1,7 @@
+# DIVE-4872 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+---
+CHECKED: npm test 922/922 pass; tsc --noEmit clean; node --test cli-state 38/38, plugin-model+server-plugins 34/34, marketplace-routes 6/6. 10 mutations, 9 red: route rule off (2 red), dedupe off (4), copy reverted (1), #companies map dropped (1), route file deleted (1), hash link restored (1), link regex broken (1), behind-target naming latest (1), server offering voice@5dive-voice (1). The #characters map dropped is an equivalent mutant (the fallback is Agents). eslint on touched files: only pre-existing set-state-in-effect findings (moved with the company body). npm run build not run (Google Fonts unreachable on this host). Live local next dev render (Clerk keyless + a stub API serving this host's real plugin list): tab click, Back, Forward and Reload all held the URL's tab; #companies went to /marketplace/teams; bare /marketplace to /agents; /company to /objectives; /goals to /company/goals; /plugins to /marketplace/plugins.

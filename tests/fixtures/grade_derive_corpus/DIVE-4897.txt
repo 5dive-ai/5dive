@@ -1,0 +1,7 @@
+# DIVE-4897 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+---
+CHECKED: `npx tsc --noEmit` rc 0; `node --test` over company/** and tasks/**: 62/62; `npm test`: 988/988; `npx eslint` on both files: rc 0. Run with complete node_modules (app-4893-dev).
