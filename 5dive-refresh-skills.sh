@@ -75,6 +75,21 @@ if [[ -n "${REFRESH_SKILLS_PRINT_PLAN:-}" ]]; then
   exit 0
 fi
 
+# DIVE-4919: retire core's stale notify-user copy from a claude seat. Core used
+# to seed ~/.claude/skills/notify-user on every telegram seat; the telegram
+# plugin ships the same skill as `telegram:notify-user`, so the seat loaded TWO
+# playbooks and the core one (no ~60-word cap) was the older. The create path no
+# longer seeds it; this removes the copy seats created before that. Keyed on the
+# telegram plugin being ENABLED, so a seat is never left with no copy at all.
+# Idempotent: nothing to remove is a silent no-op.
+retire_core_notify_user() {
+  local home="$1" dir="$1/.claude/skills/notify-user"
+  [[ -e "$dir" || -L "$dir" ]] || return 0
+  jq -e '.enabledPlugins["telegram@5dive-plugins"] == true' \
+    "$home/.claude/settings.json" >/dev/null 2>&1 || return 0
+  rm -rf "$dir" && echo "  removed stale core notify-user (telegram plugin carries it)"
+}
+
 # Resolve the requested agents: an explicit name argument, else every
 # registered agent (registry first, /home/agent-* fallback like
 # 5dive-refresh-plugins.sh).
@@ -99,6 +114,8 @@ for ag in $agents; do
     booting=$((booting+1))
     continue
   fi
+
+  retire_core_notify_user "$home"
 
   # Force re-pull every managed default to its current pinned version. No
   # skip-if-present check: that's the whole point (DIVE-698) — an existing copy

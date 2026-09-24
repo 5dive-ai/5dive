@@ -660,7 +660,9 @@ USAGE
 
 # jq helper text shared by the market renderers: rarity ranking, base-skill set
 # (baseline skills every agent gets — filtered from the "distinctive" count so a
-# pack isn't credited for them), and a 0-100 completeness score.
+# pack isn't credited for them), and a 0-100 completeness score. `notify-user`
+# stays in the base set by NAME (DIVE-4919): the skill now ships only in the
+# telegram plugins, but a pack listing it is still not distinctive.
 _MARKET_JQ='
   def rank: {"mythical":0,"legendary":1,"epic":2,"rare":3}[(.//"")] // 4;
   def base: ["notify-user","find-skills","compile-knowledge","5dive-cli"];

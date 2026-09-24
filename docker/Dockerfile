@@ -55,7 +55,6 @@ RUN systemctl mask \
 # (DIVE-3269 added 5dive-stage-fork-plugins.sh and this line went red first.)
 COPY 5dive 5dive-agent-list-snapshot 5dive-agent-start 5dive-agent-stop-notify 5dive-refresh-plugins.sh 5dive-stage-fork-plugins.sh 5dive-refresh-skills.sh install.sh projects-CLAUDE.md telegram-agent-CLAUDE.md model-tiering-CLAUDE.md operational-comms-CLAUDE.md /opt/5dive-bundle/
 COPY hooks /opt/5dive-bundle/hooks/
-COPY skills /opt/5dive-bundle/skills/
 COPY systemd /opt/5dive-bundle/systemd/
 # NOTHING template- or plugin-shaped is COPYed into the bundle any more.
 #

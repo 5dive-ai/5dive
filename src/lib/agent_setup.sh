@@ -93,9 +93,9 @@ install_agent_coauthor_hook() {
 # CONTENTS are DIVE-4130's measured keep-set. `openagent` (one-shot persona/card
 # minting, no charter names it) and `find-skills` (self-install-on-demand, zero
 # fires) are DELIBERATELY ABSENT — do not re-add either without a row that says
-# why. `notify-user` is not here on purpose: it is a direct SKILL.md copy out of
-# $AGENT_SKILLS_DIR in the telegram branches, not an `npx skills add` pull, and
-# it is per-channel rather than per-seat.
+# why. `notify-user` is not here on purpose: it is a direct SKILL.md copy in the
+# non-claude telegram branches (seed_notify_user_skill below), not an `npx
+# skills add` pull, and it is per-channel rather than per-seat.
 #
 # FORMAT is the refresh script's spec form, `<owner>/<repo>:<skill-id>`, so the
 # two consumers compare byte-for-byte (tests/default_skills_single_list_unit.sh
@@ -114,6 +114,39 @@ default_agent_skill_specs() {
   for spec in "${DEFAULT_AGENT_SKILLS[@]}"; do
     printf '%s\n' "${spec/@org/$(gh_org)}"
   done
+}
+
+# DIVE-4919: the notify-user skill comes from the PLUGINS repo, never from core.
+# Core used to ship its own skills/notify-user/SKILL.md and seed it everywhere; it
+# had gone stale (no ~60-word cap) and on a claude seat it loaded NEXT TO the
+# telegram plugin's own `telegram:notify-user` — two playbooks that disagreed.
+#
+# - claude seats get NO seed: the telegram@5dive-plugins plugin carries the skill.
+#   5dive-refresh-skills.sh deletes the stale core copy from existing seats.
+# - every other type is seeded from its own channel plugin's copy
+#   (<plugin>/skills/notify-user/SKILL.md — telegram-codex, -grok, -agy), and a
+#   channel plugin that ships none (telegram-pi, telegram-opencode today) falls
+#   back to $AGENT_SKILLS_DIR/notify-user, which install.sh now stages FROM the
+#   telegram plugin rather than from this repo.
+#
+# notify_user_skill_src [<channel-plugin-dir>] -> the SKILL.md to seed, or rc 1.
+notify_user_skill_src() {
+  local d="${1:-}"
+  if [[ -n "$d" && -f "$d/skills/notify-user/SKILL.md" ]]; then
+    printf '%s\n' "$d/skills/notify-user/SKILL.md"; return 0
+  fi
+  [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]] || return 1
+  printf '%s\n' "$AGENT_SKILLS_DIR/notify-user/SKILL.md"
+}
+
+# seed_notify_user_skill <user> <skills-dir> [<channel-plugin-dir>] — copy the
+# resolved SKILL.md to <skills-dir>/notify-user/. No source on the box is a
+# silent no-op, the same best-effort contract the per-type copies always had.
+seed_notify_user_skill() {
+  local user="$1" dest="$2" src
+  src=$(notify_user_skill_src "${3:-}") || return 0
+  sudo -u "$user" mkdir -p "$dest/notify-user"
+  sudo -u "$user" cp "$src" "$dest/notify-user/SKILL.md"
 }
 
 # Hidden read-only primitive behind `5dive agent _default_skills` (main.sh).
@@ -357,13 +390,9 @@ JSON
   printf '%s\n' "$settings" | sudo -u "$user" tee "$home/.claude/settings.json" >/dev/null
   chmod 600 "$home/.claude/settings.json"
 
-  # Telegram agents get the notify-user skill so claude knows how to ping the
-  # paired chat with progress/completion/option-prompt messages.
-  if channel_in_list telegram "$channels" && [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
-    sudo -u "$user" mkdir -p "$home/.claude/skills/notify-user"
-    sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
-      "$home/.claude/skills/notify-user/SKILL.md"
-  fi
+  # No notify-user seed here (DIVE-4919): telegram@5dive-plugins, enabled above,
+  # ships it as `telegram:notify-user`. A second copy in ~/.claude/skills was a
+  # stale duplicate playbook. See seed_notify_user_skill.
 
   # DIVE-1210: every claude agent (not gated on channel) gets the haiku-pinned
   # Explore override at $HOME/.claude/agents/, scoped "all your projects" so it
@@ -1498,11 +1527,7 @@ CODEX_ENV
   # from its per-type skills dir natively. Without this, new codex+telegram
   # agents go dark on first contact until the operator manually copies SKILL.md
   # (or waits for update.sh's 03:00 type-aware refresh to heal them).
-  if [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
-    sudo -u "$user" mkdir -p "/home/${user}/.agents/skills/notify-user"
-    sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
-      "/home/${user}/.agents/skills/notify-user/SKILL.md"
-  fi
+  seed_notify_user_skill "$user" "/home/${user}/.agents/skills" "$(codex_plugin_dir)"
   fi
 
   # Default skills — the one DEFAULT_AGENT_SKILLS list (DIVE-4203). Upstream `npx skills add --agent codex` IS supported (see SKILLS_AGENT_ID),
@@ -1631,15 +1656,10 @@ GROK_ENV
   seed_grok_telegram_access "$name" "$allowed_users"
 
   # Seed the notify-user skill into ~/.grok/skills so the agent self-starts
-  # its comms loop on first DM. Mirrors what preseed_claude_agent does for
-  # claude-channel=telegram agents; grok has no claude-style plugin marketplace,
-  # but it does read ~/.grok/skills/*/SKILL.md natively, so a direct copy is
-  # all that's needed.
-  if [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
-    sudo -u "$user" mkdir -p "/home/${user}/.grok/skills/notify-user"
-    sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
-      "/home/${user}/.grok/skills/notify-user/SKILL.md"
-  fi
+  # its comms loop on first DM. grok has no claude-style plugin marketplace
+  # (which is how claude seats get it), but it does read ~/.grok/skills/*/SKILL.md
+  # natively, so a direct copy of telegram-grok's own copy is all that's needed.
+  seed_notify_user_skill "$user" "/home/${user}/.grok/skills" "$(grok_plugin_dir)"
 
   # Default skills — the one DEFAULT_AGENT_SKILLS list (DIVE-4203). Upstream `npx skills add` doesn't recognize --agent grok, so these
   # route through the manual-install fallback in install_default_skill_for_agent.
@@ -1766,11 +1786,7 @@ AGY_ENV
   # Seed the notify-user skill into agy's skills dir so the agent self-starts
   # its comms loop on first DM. Mirrors the grok path; agy reads skills from
   # $HOME/.agents/skills/<name>/SKILL.md (per SKILLS_INSTALL_DIR[antigravity]).
-  if [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
-    sudo -u "$user" mkdir -p "/home/${user}/.agents/skills/notify-user"
-    sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
-      "/home/${user}/.agents/skills/notify-user/SKILL.md"
-  fi
+  seed_notify_user_skill "$user" "/home/${user}/.agents/skills" "$(antigravity_plugin_dir)"
 
   # Default skills — the one DEFAULT_AGENT_SKILLS list (DIVE-4203).
   # (preseed_antigravity_agent already runs these
@@ -1903,11 +1919,7 @@ OPENCODE_ENV
   # Seed the notify-user skill so the agent self-starts its comms loop on first
   # DM. opencode reads skills from $HOME/.agents/skills/<name>/SKILL.md
   # (SKILLS_INSTALL_DIR[opencode]).
-  if [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
-    sudo -u "$user" mkdir -p "/home/${user}/.agents/skills/notify-user"
-    sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
-      "/home/${user}/.agents/skills/notify-user/SKILL.md"
-  fi
+  seed_notify_user_skill "$user" "/home/${user}/.agents/skills" "$(opencode_plugin_dir)"
 
   # Default skills — the one DEFAULT_AGENT_SKILLS list (DIVE-4203). opencode IS in
   # the upstream skills registry (SKILLS_AGENT_ID[opencode]=opencode), so these
@@ -2041,11 +2053,7 @@ PI_ENV
   # Seed the notify-user skill so the agent self-starts its comms loop on first
   # DM. pi reads skills from $HOME/.agents/skills (see SKILLS_INSTALL_DIR[pi];
   # DIVE-1265) — the same generic fallback dir as agy.
-  if [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
-    sudo -u "$user" mkdir -p "/home/${user}/.agents/skills/notify-user"
-    sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
-      "/home/${user}/.agents/skills/notify-user/SKILL.md"
-  fi
+  seed_notify_user_skill "$user" "/home/${user}/.agents/skills" "$(pi_plugin_dir)"
 
   # Default skills — the one DEFAULT_AGENT_SKILLS list (DIVE-4203). pi has
   # no upstream skills-registry id, so these route through the generic path and
