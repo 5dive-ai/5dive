@@ -1110,9 +1110,23 @@ JOURNALD
     fi
   done
   # <<< DIVE-4349/DIVE-4350
-  curl -fsSL "$REPO/skills/notify-user/SKILL.md" -o "$LIB_DIR/skills/notify-user/SKILL.md"
-  chmod 644 "$LIB_DIR/skills/notify-user/SKILL.md"
-  ok "notify-user skill"
+  # DIVE-4919: notify-user is staged FROM THE TELEGRAM PLUGIN, not from this
+  # repo — core's own skills/notify-user copy was stale and is gone. This staged
+  # file is only the fallback for a channel plugin that ships no copy of its own
+  # (telegram-pi, telegram-opencode); claude seats get the skill from the plugin
+  # itself and codex/grok/agy seats from their per-channel plugin
+  # (seed_notify_user_skill). 5dive-api's update.sh still reads this path.
+  # MERGE-DEPLOYS (DIVE-2288): a BRANCH file, like the plugin tarballs below.
+  # Fail-soft like them too: a miss keeps the previously staged copy.
+  NOTIFY_USER_SKILL_URL="${NOTIFY_USER_SKILL_URL:-https://raw.githubusercontent.com/$GH_ORG/5dive-plugins/main/plugins/telegram/skills/notify-user/SKILL.md}"
+  _nu_tmp=$(mktemp)
+  if curl -fsSL "$NOTIFY_USER_SKILL_URL" -o "$_nu_tmp" 2>/dev/null && grep -q '^name: notify-user' "$_nu_tmp"; then
+    install -m 644 "$_nu_tmp" "$LIB_DIR/skills/notify-user/SKILL.md"
+    ok "notify-user skill (telegram plugin)"
+  else
+    echo "warn: failed to stage notify-user from $NOTIFY_USER_SKILL_URL — keeping any previously staged copy" >&2
+  fi
+  rm -f "$_nu_tmp"
 
   # Stage 5dive-cli skill (from the skills repo — separate repo from this
   # CLI's source). Unlike notify-user which is a single SKILL.md, this one
