@@ -1845,6 +1845,20 @@ _pack_manifest_memory_shape() {   # _pack_manifest_memory_shape <stage>
   printf '%s\n' "$sh"
 }
 
+# DIVE-4923: which store an import seeds, from the shape of the staged bytes and
+# the target's harness. Pure — no filesystem — so the negative ("claude atoms
+# never land in codex's native dir") is gradeable without a seat. Two answers:
+#   native-codex  a codex-shaped store onto a codex seat: codex loads it itself.
+#   5dive-store   everything else: ~/.claude/projects/<slug>/memory, the store
+#                 `5dive memory search` reads for any agent (_memory_own_roots).
+_pack_import_memory_target() {   # _pack_import_memory_target <type> <shape>
+  if [[ "${1:-}" == "codex" && "${2:-}" == "codex-docs" ]]; then
+    printf 'native-codex\n'
+  else
+    printf '5dive-store\n'
+  fi
+}
+
 # DIVE-4541: seed a CLAUDE seat's memory dir from a pack's staged memory, routed
 # on the shape of the staged bytes. Extracted from cmd_import so the routing is
 # executable without a seat: it is the branch that decides CONVERT vs verbatim
@@ -2114,25 +2128,104 @@ _agents_md_render_memory() {
 _pack_inline_memory_into_doc() {   # _pack_inline_memory_into_doc <stage> <type> <mem_inc>
   local stage="${1:-}" type="${2:-}" mem_inc="${3:-}"
   local doc="$stage/CLAUDE.md"
+  _PACK_INLINE_MODE="none"
   [[ -f "$doc" ]] || return 1
   # DIVE-3877: any memory mode that actually staged files inlines. Keying this
   # on "distilled" made a raw restore onto a non-claude seat silently load nothing.
   [[ "$type" != "claude" && "$mem_inc" != "false" ]] || return 1
   [[ -d "$stage/memory" ]] || return 1
   grep -q . < <(find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null) || return 1
-  local inl="$doc.inline.$$" n
+  local inl="$doc.inline.$$" sec="$doc.memsec.$$" n budget sec_b
   n=$(find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
-  if { cat "$doc"; printf '\n'; _agents_md_render_memory "$stage"; } > "$inl" 2>/dev/null \
-     && [[ -s "$inl" ]]; then
-    mv "$inl" "$doc"
-    step "Inlined $n $mem_inc memory fact(s) into the persona doc — a '$type' seat does not auto-load 5dive's memory store"
+  budget=$(_pack_inline_memory_budget "$doc")
+  # DIVE-4923: the doc is ALWAYS-LOADED and has a byte limit (codex's project-doc
+  # budget is 32 KiB), so the whole store is inlined only when it FITS. A raw
+  # 662-atom claude store inlined 1,560,263 bytes and pushed the operating
+  # baseline to line 20316 — present, and past the limit, which reads as success.
+  # Over budget the section degrades, DECLARED, to a pointer plus a bounded index.
+  if _agents_md_render_memory "$stage" > "$sec" 2>/dev/null && [[ -s "$sec" ]]; then
+    sec_b=$(wc -c < "$sec")
+    if (( sec_b <= budget )); then
+      _PACK_INLINE_MODE="full"
+    elif _agents_md_render_memory_pointer "$stage" "$type" "$budget" > "$sec" 2>/dev/null && [[ -s "$sec" ]]; then
+      _PACK_INLINE_MODE="pointer"
+    fi
+  fi
+  if [[ "$_PACK_INLINE_MODE" != "none" ]] \
+     && { cat "$doc"; printf '\n'; cat "$sec"; } > "$inl" 2>/dev/null && [[ -s "$inl" ]]; then
+    mv "$inl" "$doc"; rm -f "$sec"
+    if [[ "$_PACK_INLINE_MODE" == "full" ]]; then
+      step "Inlined $n $mem_inc memory fact(s) into the persona doc — a '$type' seat does not auto-load 5dive's memory store"
+    else
+      step "Memory too large to inline ($n file(s), $sec_b bytes > $budget-byte budget) — the persona doc carries a pointer and a bounded index instead"
+    fi
     return 0
   fi
-  rm -f "$inl"
+  rm -f "$inl" "$sec"
+  _PACK_INLINE_MODE="none"
   # NEVER a silent failure: the facts are still seeded and searchable, but this
   # harness will not load them, and that difference is the whole point of the row.
   warn "could not inline $mem_inc memory into the persona doc for this '$type' seat — the facts are still seeded and reachable via '5dive memory search', but this harness will not load them automatically"
   return 1
+}
+
+# DIVE-4923 — THE BUDGET for memory in a non-claude persona doc. The doc it
+# lands in is always-loaded and bounded: codex reads ~/.codex/AGENTS.md up to
+# project_doc_max_bytes (32 KiB default) and persona_install_doc PREPENDS it
+# above the operating baseline, which is ~12 KB on a live codex seat (12,023 B
+# measured 2026-09-24). So memory gets what is left after the persona and a
+# baseline reserve, capped at _PACK_INLINE_MEMORY_BUDGET, and never less than
+# the floor a pointer needs — a huge persona still gets told where memory is.
+_PACK_INLINE_MEMORY_BUDGET="${_PACK_INLINE_MEMORY_BUDGET:-8000}"
+_PACK_HARNESS_DOC_LIMIT="${_PACK_HARNESS_DOC_LIMIT:-32768}"
+_PACK_BASELINE_RESERVE="${_PACK_BASELINE_RESERVE:-14000}"
+_PACK_INLINE_MEMORY_FLOOR=1200
+_pack_inline_memory_budget() {   # _pack_inline_memory_budget <persona-doc> -> bytes
+  local persona_b=0 room budget="$_PACK_INLINE_MEMORY_BUDGET"
+  [[ -f "${1:-}" ]] && persona_b=$(wc -c < "$1")
+  room=$(( _PACK_HARNESS_DOC_LIMIT - _PACK_BASELINE_RESERVE - persona_b ))
+  (( room < budget )) && budget=$room
+  (( budget < _PACK_INLINE_MEMORY_FLOOR )) && budget=$_PACK_INLINE_MEMORY_FLOOR
+  printf '%s\n' "$budget"
+}
+
+# DIVE-4923 — the DEGRADED memory section: where the memory is, how to reach it,
+# and a router listing bounded by the same writer the claude store uses
+# (_pack_atoms_index, DIVE-4541/4545). NOT the export sentinel: that one tells
+# _agents_md_explode "the fenced bodies follow", and a pointer carries none.
+AGENTS_MD_S_MEMPTR='<!-- 5dive:memory-pointer -->'
+_agents_md_render_memory_pointer() {   # _agents_md_render_memory_pointer <stage> <type> <budget>
+  local stage="$1" type="$2" budget="$3" shape n bytes head idx tmpd f room
+  shape=$(_pack_manifest_memory_shape "$stage")
+  n=$(find "$stage/memory" -maxdepth 1 -name '*.md' ! -name MEMORY.md 2>/dev/null | wc -l)
+  bytes=$(find "$stage/memory" -maxdepth 1 -name '*.md' -exec cat {} + 2>/dev/null | wc -c)
+  if [[ "$type" == "codex" && "$shape" == "codex-docs" ]]; then
+    printf -v head '%s\n# Memory\n\nThis agent'"'"'s memory (%s file(s), %s bytes) is too large to load from this file, so it is NOT inlined. It is in codex'"'"'s own memory store, `~/.codex/memories/`, which codex loads itself; read those files directly when you need more than it recalls.\n' \
+      "$AGENTS_MD_S_MEMPTR" "$n" "$bytes"
+    printf '%s' "$head"
+    return 0
+  fi
+  printf -v head '%s\n# Memory\n\nThis agent'"'"'s memory (%s file(s), %s bytes) is too large to load from this file, so it is NOT inlined. It is in 5dive'"'"'s memory store for this seat, `~/.claude/projects/<slug>/memory/`, one fact per file. Search it before concluding a fact is absent:\n\n    5dive memory search --index "<topic>"\n    5dive memory get <slug>\n\n' \
+    "$AGENTS_MD_S_MEMPTR" "$n" "$bytes"
+  _pack_blen "$head"; room=$(( budget - _PACK_BLEN ))
+  idx=""
+  if (( room > 600 )); then
+    tmpd=$(mktemp -d) || { printf '%s' "$head"; return 0; }
+    for f in "$stage"/memory/*.md; do
+      [[ -e "$f" && "$(basename "$f")" != "MEMORY.md" ]] && ln -s "$(readlink -f "$f")" "$tmpd/$(basename "$f")"
+    done
+    _PACK_INDEX_BUDGET="$room" _pack_atoms_index "$tmpd" "Memory index" >/dev/null 2>&1 || true
+    # The index writer's own H1 is demoted so it reads as a subsection here.
+    [[ -f "$tmpd/MEMORY.md" ]] && idx=$(sed '1s/^# /## /' "$tmpd/MEMORY.md")
+    rm -rf "$tmpd"
+    # A listing that names nothing (no frontmatter `name:` anywhere) is noise.
+    grep -q '^- \[' <<<"$idx" || idx=""
+    # Belt and braces: never let the listing breach the budget it was given.
+    _pack_blen "$idx"; (( _PACK_BLEN > room )) && idx=""
+  fi
+  printf '%s' "$head"
+  [[ -n "$idx" ]] && printf '%s\n' "$idx"
+  return 0
 }
 
 # Is <file> a 5dive single-file agent export? Anchored on the frontmatter key we
@@ -2673,9 +2766,12 @@ _IMPORT_OWN_BOOL_FLAGS=(--report-import --allow-hooks)
 # from the real run only. These are the create flags that do not collide with
 # something import computes itself (type/channels/isolation/model/auth-profile/
 # workdir/tokens/--no-skills/--defer-auth/BYO), so forwarding them is additive.
+# DIVE-4923: --human too. An imported seat's new bot came up in dmPolicy=pairing
+# with allowFrom=[] and the owner's first DM got "Pairing required"; create
+# already pre-pairs a named person (DIVE-4698), import simply never forwarded it.
 _IMPORT_CREATE_PASSTHRU_VALUE_FLAGS=(--heartbeat-every --inherit-memory --base-url
                                      --telegram-home-channel --telegram-allowed-users
-                                     --telegram-cos --telegram-cos-avatar)
+                                     --telegram-cos --telegram-cos-avatar --human)
 _IMPORT_CREATE_PASSTHRU_BOOL_FLAGS=(--no-heartbeat --no-team-bot --can-push --can-deploy)
 
 # rc 0 if <arg> matches one of the <flag> names in value form (--flag=<v>).
@@ -2804,7 +2900,7 @@ cmd_import() {
       || fail "$E_VALIDATION" "could not build a pack from persona '$from_persona' (is it a valid OpenAgent persona?)"
     pack="$persona_tmp"
   fi
-  [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent import <pack>|--from-persona=<file.persona.yaml> --as=<name> [--type=claude] [--isolation=admin|standard|sandboxed] [--channels=...] [--telegram-token=...] [--discord-token=...] [--auth-profile=...] [--workdir=...]"
+  [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent import <pack>|--from-persona=<file.persona.yaml> --as=<name> [--type=claude] [--isolation=admin|standard|sandboxed] [--channels=...] [--telegram-token=...] [--discord-token=...] [--auth-profile=...] [--workdir=...] [--human=<id>]"
 
   # DIVE-2565: a single-file AGENTS.md export is a pack too. Explode it back into
   # a v1 stage and re-tar, so EVERYTHING below — safe-extract, manifest
@@ -3059,7 +3155,11 @@ cmd_import() {
   # same doc to the harness's own instruction path. See _pack_inline_memory_into_doc.
   local mem_effect="none"
   if _pack_inline_memory_into_doc "$stage" "$type" "$mem_inc"; then
-    mem_effect="inlined into the persona doc"
+    if [[ "$_PACK_INLINE_MODE" == "pointer" ]]; then
+      mem_effect="pointer and bounded index in the persona doc (too large to inline)"
+    else
+      mem_effect="inlined into the persona doc"
+    fi
   fi
 
   # Layer the identity doc into the file THIS harness actually reads (DIVE-2223).
@@ -3230,9 +3330,14 @@ cmd_import() {
   # want? A pack written before this field exists carries atoms — that is what
   # every writer before now produced.
   local mem_shape_in; mem_shape_in=$(_pack_manifest_memory_shape "$stage")
-  # A codex TARGET keeps memory in ~/.codex/memories, not under .claude/projects
-  # — seeding it there would report a landing nothing on that seat can read.
-  if [[ "$mem_inc" != "false" && -d "$stage/memory" && "$type" == "codex" ]]; then
+  # DIVE-4923: WHERE the staged bytes land is routed on shape AND type — see
+  # _pack_import_memory_target. Only a codex-shaped store onto a codex seat goes
+  # into codex's native dir; claude-shaped atoms go to 5dive's own store on EVERY
+  # type, because that is what `5dive memory search` reads, and because
+  # ~/.codex/memories is owned by codex's native memory pipeline (it writes its
+  # own MEMORY.md there — the name a claude router would land on).
+  local mem_target; mem_target=$(_pack_import_memory_target "$type" "$mem_shape_in")
+  if [[ "$mem_inc" != "false" && -d "$stage/memory" && "$mem_target" == "native-codex" ]]; then
     local codexdir="/home/agent-${as}/.codex/memories" cpacked clanded
     cpacked=$(find "$stage/memory" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
     install -d -o "agent-${as}" -g "agent-${as}" "$codexdir" 2>/dev/null || true
@@ -3242,11 +3347,6 @@ cmd_import() {
     if (( clanded > 0 )); then
       mem_seeded="$codexdir ($cpacked file(s) copied, $clanded present)"
       [[ "$mem_effect" == "none" ]] && mem_effect="codex reads $codexdir"
-      # Atoms landing on a codex seat stay one-file-per-fact: codex loads
-      # MEMORY.md, so say plainly that the atoms are readable-but-not-loaded
-      # rather than implying the store was merged.
-      [[ "$mem_shape_in" == "atoms" && ! -f "$codexdir/MEMORY.md" ]] \
-        && warn "the pack's memory is claude-shaped atoms and landed in $codexdir as separate files; codex loads MEMORY.md, so these are readable but not auto-loaded (the persona doc carries the same facts inline)"
     else
       mem_seeded="FAILED (0 of $cpacked files reached $codexdir)"
     fi
