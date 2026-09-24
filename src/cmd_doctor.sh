@@ -1559,8 +1559,8 @@ cmd_doctor() {
     # `--category=policy` failed usage for every caller who read the error message
     # and did what it said. Pre-existing; fixed here because this change lands its
     # surface under that category and would otherwise be unreachable by filter.
-    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps|models) ;;
-    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins|caps|models)" ;;
+    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|mod|policy|plugins|caps|models) ;;
+    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|mod|policy|plugins|caps|models)" ;;
   esac
 
   local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0 run_host=0 run_memory=0 run_policy=0
@@ -1583,6 +1583,13 @@ cmd_doctor() {
   [[ -z "$filter" || "$filter" == "plugins"  ]] && run_plugins=1
   [[ -z "$filter" || "$filter" == "caps"     ]] && run_caps=1
   [[ "$filter" == "models" ]] && run_models=1
+  # DIVE-4936: `mod` is opt-in for the same reason as `models` — it starts
+  # claude once per claude seat (~3s each, measured on 2.1.281), and the
+  # dashboard polls `doctor --json`. The nightly Claude Code upgrade asks for
+  # it by name, which is the moment a module can stop loading. With the
+  # box switch off (every box but ours) it probes nothing — see lib/mod_seat.sh.
+  local run_mod=0
+  [[ "$filter" == "mod" ]] && run_mod=1
 
   # --- deps ---
   if (( run_deps )); then
@@ -2548,6 +2555,10 @@ cmd_doctor() {
 
   if (( run_models )); then
     doctor_check_openclaw_model_pins
+  fi
+
+  if (( run_mod )); then
+    doctor_check_mod_seats
   fi
 
   # --- summary + output ---
