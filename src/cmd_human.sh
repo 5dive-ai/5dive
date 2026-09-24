@@ -53,7 +53,7 @@ _human_usage() {
   5dive human link <id> --agent=<name>                       # they own that agent's gates
   5dive human unlink <id> --agent=<name>
   5dive human owner <agent>                                 # resolved owner of that agent
-  5dive human recipient <ident|row id>                      # who a gate on that row pages
+  5dive human recipient <ident|row id> [--no-probe]         # who a gate on that row pages, and via which bot
   5dive human rm <id>
 
   READS  (ls/show/owner/recipient) — any agent (group claude), no sudo.
@@ -242,6 +242,11 @@ cmd_human_link() {
   local prev; prev=$(db "SELECT human_id FROM human_agents WHERE agent=$(sqlq "$agent") AND human_id<>$(sqlq "$id") LIMIT 1;")
   db "DELETE FROM human_agents WHERE agent=$(sqlq "$agent");
       INSERT OR IGNORE INTO human_agents (human_id, agent) VALUES ($(sqlq "$id"), $(sqlq "$agent"));"
+  # DIVE-4911: a new link is a new route to this person, so their gates that
+  # are backing off after an undelivered reminder retry on the next tick
+  # instead of waiting out the 24h.
+  db "UPDATE tasks SET gate_renag_failed_at=NULL, gate_renag_failed_via=NULL
+      WHERE human_owner=$(sqlq "$id") AND gate_renag_failed_at IS NOT NULL;" 2>/dev/null || true
   audit_log "human link" ok 0 -- "human=$id" "agent=$agent" "replaced=${prev:-none}" "by_claimed=${SUDO_USER:-root}"
   if (( JSON_MODE )); then
     jq -cn --arg h "$id" --arg a "$agent" --arg p "$prev" \
@@ -270,24 +275,97 @@ cmd_human_owner() {
 # The observability the fix needs to be checkable by a person: for one gate row,
 # print the human it would page and WHY that human (or why none). This is the
 # verb to reach for when a customer asks "who is this bot going to wake up".
+#
+# DIVE-4911: and THROUGH WHICH BOT. Naming the person was not enough — the
+# customer report that opened DIVE-4911 had this verb print `OK — <K>` for a gate
+# that had failed 230 times that day, because the bot carrying it was one K had
+# never started. So it now lists the bots the re-nag would try, in the order it
+# tries them (_human_gate_sender_candidates), and asks Telegram whether each one
+# can reach the person: a read-only getChat, the one check that told the truth
+# on that box. --no-probe skips the network and prints the order only.
 cmd_human_recipient() {
   tasks_db_init
-  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive human recipient <ident|row id>"
-  local key="$1" numid
+  local key="" probe=1 a
+  for a in "$@"; do
+    case "$a" in
+      --no-probe) probe=0 ;;
+      -*) fail "$E_USAGE" "unknown flag: $a" ;;
+      *)  [[ -z "$key" ]] && key="$a" || fail "$E_USAGE" "unexpected arg: $a" ;;
+    esac
+  done
+  [[ -n "$key" ]] || fail "$E_USAGE" "usage: 5dive human recipient <ident|row id> [--no-probe]"
+  local numid
   if [[ "$key" =~ ^[0-9]+$ ]]; then numid="$key"; else numid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$key");"); fi
   [[ -n "$numid" ]] || fail "$E_NOT_FOUND" "no task '$key'"
   local who reason
   # Not `who=$(...)`: the basis is set by the resolver and a subshell would drop it.
   _human_gate_recipient "$numid" >/dev/null
   who="$HUMAN_RECIPIENT_ID"; reason="$HUMAN_RECIPIENT_BASIS"
+
+  # The sender plan: only meaningful when a person resolves on a box using the
+  # registry (with no registry the legacy path sends through the filer's bot).
+  local chat="" filer="" failed_at="" failed_via="" row c r sender="" senders='[]' plan=""
+  row=$(db "SELECT COALESCE(NULLIF(created_by,''),assignee,'')||x'1f'||COALESCE(gate_renag_failed_at,'')||x'1f'||COALESCE(gate_renag_failed_via,'')
+            FROM tasks WHERE id=${numid};")
+  IFS=$'\x1f' read -r filer failed_at failed_via <<<"$row"
+  if [[ -n "$who" ]] && _human_registry_active; then
+    chat=$(_human_transport_id "$who" telegram)
+    local -a cands=()
+    # Same fallbacks the T2 sweep passes: the gate notifier (when it resolves),
+    # then the filer.
+    local notifier; notifier=$(_task_resolve_gate_notifier 2>/dev/null || true)
+    mapfile -t cands < <(_human_gate_sender_candidates "$who" "${notifier:+${notifier},}${filer}")
+    for c in "${cands[@]}"; do
+      [[ -n "$c" ]] || continue
+      if (( probe )) && [[ -n "$chat" ]]; then r=$(_human_bot_reach "$c" "$chat"); else r="not probed"; fi
+      [[ -z "$sender" && ( "$r" == "reachable" || "$r" == "not probed" ) ]] && sender="$c"
+      senders=$(jq -c --arg a "$c" --arg r "$r" '. + [{agent:$a, reach:$r}]' <<<"$senders")
+      plan+=$'\n'"  ${c}: ${r}"
+    done
+  fi
+
   if (( JSON_MODE )); then
-    jq -cn --arg h "$who" --arg b "$reason" --arg i "$numid" \
-      '{ok:true, data:{task_id:($i|tonumber), human:(($h|select(length>0)) // null), basis:$b}}'
+    jq -cn --arg h "$who" --arg b "$reason" --arg i "$numid" --arg s "$sender" --argjson ss "$senders" \
+          --arg fa "$failed_at" --arg fv "$failed_via" \
+      '{ok:true, data:{task_id:($i|tonumber), human:(($h|select(length>0)) // null), basis:$b,
+                       sender:(($s|select(length>0)) // null), senders:$ss,
+                       renag_failed_at:(($fa|select(length>0)) // null),
+                       renag_failed_via:(($fv|select(length>0)) // null)}}'
   elif [[ -n "$who" ]]; then
-    ok "$who (via ${reason})"
+    local out="$who (via ${reason})"
+    if [[ -n "$plan" ]]; then
+      out+=$'\n'"bots the reminder tries, in order:${plan}"
+      [[ -n "$sender" ]] && out+=$'\n'"sender: ${sender}" \
+        || out+=$'\n'"sender: NONE — no bot above can reach ${who}; have them /start one, or link a seat they did start (sudo 5dive human link ${who} --agent=<seat>)"
+    elif _human_registry_active; then
+      out+=$'\n'"sender: NONE — no linked seat, no bot with a confirmed send to ${who}, and no filer to fall back to"
+    fi
+    [[ -n "$failed_at" ]] && out+=$'\n'"last reminder NOT delivered at ${failed_at} (tried ${failed_via:-?}); the next try is 24h after that"
+    ok "$out"
   else
     ok "(no human recipient: ${reason}) — a gate here stays on the agent rail rather than paging the allowlist"
   fi
+}
+
+# _human_bot_reach <agent> <chat id> — DIVE-4911. Can <agent>'s bot reach this
+# chat? One read-only getChat through that bot; nothing is sent to the person.
+# Prints `reachable`, `chat not found` (they never started that bot), `no bot`
+# (no token on record for the seat), or `unknown: <why>`. Never fails.
+_human_bot_reach() {
+  local agent="$1" chat="$2" token="" resp desc
+  local f="${CONNECTORS_DIR}/telegram-${agent}.env"
+  [[ -r "$f" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$f" | head -1)
+  [[ -n "$token" ]] || { printf 'no bot'; return 0; }
+  resp=$(curl -sS -m 5 --get --data-urlencode "chat_id=${chat}" \
+         "https://api.telegram.org/bot${token}/getChat" 2>/dev/null || true)
+  if [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == "true" ]]; then printf 'reachable'; return 0; fi
+  desc=$(jq -r '.description // empty' <<<"$resp" 2>/dev/null)
+  case "$desc" in
+    *"chat not found"*) printf 'chat not found' ;;
+    "")                 printf 'unknown: no answer from the Bot API' ;;
+    *)                  printf 'unknown: %s' "$desc" ;;
+  esac
+  return 0
 }
 
 cmd_human_rm() {

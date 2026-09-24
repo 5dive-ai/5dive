@@ -200,7 +200,7 @@ require_sqlite() {
 # block, and a store stamped '3932-1' has never seen the triggers block, so
 # either literal skips one population's migration entirely. A THIRD value that
 # no store carries is the only resolution that re-migrates both.
-_TASKS_SCHEMA_EPOCH='4899-1'  # DIVE-4899: +tasks.delivery_companions (on top of 4833-1)
+_TASKS_SCHEMA_EPOCH='4911-1'  # DIVE-4911: +tasks.gate_renag_failed_at/_via (on top of 4899-1)
 
 # DIVE-3931: Event -> Task ingress lives in the task store because ingress ends
 # at the queue. One SQL emitter serves fresh stores and migrations so the two
@@ -514,6 +514,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- named", never "send it to everybody". Declared HERE as well as in
   -- _TASKS_ADDITIVE_COLUMNS, per the rule above.
   human_owner TEXT,
+  -- DIVE-4911: the re-nag's NEGATIVE receipt. Stamped when every bot that could
+  -- carry a reminder to human_owner failed (a bot the person never started
+  -- answers `chat not found`), with the bots tried in _via. The sweep waits 24h
+  -- after it instead of re-sending on every tick, and doctor / `human recipient`
+  -- read it to name the gate as undelivered. gate_pinged_at is deliberately NOT
+  -- touched by a failure: that column means "a person was reached". Cleared by
+  -- the next confirmed send. Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS.
+  gate_renag_failed_at  TEXT,
+  gate_renag_failed_via TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -2071,6 +2080,8 @@ _TASKS_ADDITIVE_COLUMNS=(
   # DIVE-3342: humans.id of the person who may CLEAR this gate. See the CREATE
   # TABLE comment — recorded at filing, never re-derived from bot traffic.
   'human_owner TEXT'
+  # DIVE-4911: the re-nag's negative receipt. See the CREATE TABLE comment.
+  'gate_renag_failed_at TEXT' 'gate_renag_failed_via TEXT'
 )
 
 # DIVE-3098 - TERMINAL FOR THE VERIFIER, as ONE SQL boolean expression.

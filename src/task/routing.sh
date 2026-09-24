@@ -1355,6 +1355,55 @@ _human_gate_ids_by_owner() {
   done
 }
 
+# _human_gate_sender_candidates <human id> [fallback agents, comma-separated] —
+# DIVE-4911. WHICH BOT carries a gate to its owner, one agent per line, best first.
+#
+# _human_gate_recipient answers WHO a gate is for. Until this, nothing answered
+# HOW to reach that person: the re-nag sent through whichever bot the row's filer
+# owned (COALESCE(created_by, assignee)), and human_owner only partitioned the
+# batch. On a box where each human has started only their own assistant's bot,
+# that is `400 chat not found` for every gate filed by anybody else's seat —
+# measured on a 10-human customer box: 230 failed reminders a day on one gate
+# while two other seats reached the same chat fine.
+#
+# Order, deduplicated, first hit wins at the send site:
+#   1. seats `5dive human link` ties to this person — their own assistant. Among
+#      several, the one with the most recent confirmed send to their chat first.
+#   2. any seat with a confirmed send to their chat (gate_cards, newest first).
+#      Every confirmed gate send writes a card with chat_id + via, so this IS the
+#      (human, bot) -> reachable table; no second ledger to keep in step.
+#   3. the fallbacks the caller names (the filer, the gate notifier) — the old
+#      behaviour, kept last so a box with no links and no history still tries it.
+# Empty output means nobody can be tried. The send site still applies the
+# allowFrom narrowing, so a name here is a candidate, never a grant.
+_human_gate_sender_candidates() {
+  local hid="${1:-}" fallback="${2:-}" chat a seen=","
+  [[ -n "$hid" ]] || return 0
+  chat=$(_human_transport_id "$hid" telegram)
+  local -a cand=()
+  mapfile -t cand < <(db "
+    SELECT ha.agent FROM human_agents ha
+     WHERE ha.human_id=$(sqlq "$hid")
+     ORDER BY (SELECT MAX(gc.minted_at) FROM gate_cards gc
+                WHERE gc.via=ha.agent AND gc.chat_id=$(sqlq "${chat:-}")) IS NULL,
+              (SELECT MAX(gc.minted_at) FROM gate_cards gc
+                WHERE gc.via=ha.agent AND gc.chat_id=$(sqlq "${chat:-}")) DESC,
+              ha.agent;" 2>/dev/null)
+  if [[ -n "$chat" ]]; then
+    mapfile -t -O "${#cand[@]}" cand < <(db "
+      SELECT via FROM gate_cards WHERE chat_id=$(sqlq "$chat") AND COALESCE(via,'') NOT IN ('','none')
+       GROUP BY via ORDER BY MAX(minted_at) DESC, via;" 2>/dev/null)
+  fi
+  local -a fb=()
+  IFS=',' read -r -a fb <<<"$fallback"
+  for a in "${cand[@]}" "${fb[@]}"; do
+    [[ -n "$a" && "$seen" != *",$a,"* ]] || continue
+    seen+="$a,"
+    printf '%s\n' "$a"
+  done
+  return 0
+}
+
 # DIVE-1401 (olivia review, iter 2): the TRUSTED caller identity for gate-withdraw
 # AUTHORIZATION. This is deliberately NOT task_actor: --from is caller-asserted and
 # SUDO_USER/SUDO_UID are plain env vars a NON-root process can forge with no real

@@ -394,11 +394,12 @@ column_count=$(sqlite3 "$TASKS_DB" "SELECT count(*) FROM pragma_table_info('task
 # surely as by a dropped one, and it matches no text a grep for the new column
 # would find. 114 -> 115 on DIVE-4833 (+tasks.need_expires_at, the approval
 # offer's deadline); 115 -> 116 on DIVE-4899 (+tasks.delivery_companions, the
-# pull requests bound beside delivery_ref). Anyone adding a column lands here, which is the point — the
+# pull requests bound beside delivery_ref); 116 -> 118 on DIVE-4911
+# (+tasks.gate_renag_failed_at/_via, the re-nag's negative receipt). Anyone adding a column lands here, which is the point — the
 # schema and its migration twin are two writes, and this arm is what proves the
 # fresh-store half actually produced them.
-[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "116" ]] \
-  && ok "fresh schema: all 116 columns, including the eight former holes, are present" \
+[[ $rc -eq 0 && "$actual" == "$required" && "$column_count" == "118" ]] \
+  && ok "fresh schema: all 118 columns, including the eight former holes, are present" \
   || bad "fresh schema: init returned a partial tasks table" "rc=$rc count=$column_count got=[$actual] want=[$required] out=$out"
 
 # --- Case 10 (DIVE-2197): migrate arm still rejects a failed ALTER ------------
