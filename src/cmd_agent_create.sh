@@ -3132,6 +3132,18 @@ cmd_create() {
     plugin_seat_backfill "$name" "$type" || true
   fi
 
+  # DIVE-4936: on a box that turned it on (`5dive config mod-seat=on` — OUR box;
+  # off everywhere else by default), a new claude seat gets the mod and its
+  # function-hooks flag BEFORE the unit starts below, so the first session loads
+  # the tool-call guard. Switch off: nothing here runs. Best-effort: a failed
+  # seating leaves the seat exactly as it would have been, and
+  # `doctor --category=mod` reports it.
+  if [[ "$type" == claude ]] && declare -F mod_seat_enabled >/dev/null 2>&1 && mod_seat_enabled; then
+    step "Seating the mod guard on agent-${name}"
+    mod_seat_ensure "$name" \
+      || warn "the mod guard was NOT seated on agent-${name} — it runs without the tool-call guard"
+  fi
+
   # Hermes BYO Kimi/Moonshot: KIMI_API_KEY lives in the agent user's
   # ~/.hermes/.env (hermes' Kimi provider reads it directly; there is no
   # `hermes auth add moonshot`). apply_byo_provider stamped it into the

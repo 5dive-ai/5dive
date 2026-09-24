@@ -33,6 +33,7 @@ cmd_box_config() {
         "       5dive config reflex-endpoint=<url>|default" \
         "       5dive config reflex-api=decisions|systemone|chat|default" \
         "       5dive config reflex-endpoint-key=- < keyfile | clear" \
+        "       5dive config mod-seat=on|off|default" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
         "             always          every standard row is graded" \
@@ -80,11 +81,14 @@ cmd_box_config() {
         "             systemone (Jev/Laya, the same body), chat (chat completions)." \
         "             default reads it off the endpoint's path, else decisions." \
         "  reflex-endpoint-key  an optional bearer for the custom endpoint, from stdin," \
-        "             root-only 600 at $(declare -F _reflex_endpoint_key_file >/dev/null && _reflex_endpoint_key_file || printf /etc/5dive/reflex-endpoint.key)."
+        "             root-only 600 at $(declare -F _reflex_endpoint_key_file >/dev/null && _reflex_endpoint_key_file || printf /etc/5dive/reflex-endpoint.key)." \
+        "  mod-seat     whether a NEW claude seat gets the mod tool-call guard at create" \
+        "             time, and whether 'doctor --category=mod' probes seats (DIVE-4936)." \
+        "             Default off: the plugin's hooks are an early-access Claude Code API."
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
-      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key)" ;;
+      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, mod-seat)" ;;
     esac
     shift
   done
@@ -123,6 +127,9 @@ cmd_box_config() {
       re="$_REFLEX_ENDPOINT"; res="$_REFLEX_ENDPOINT_SRC"; ra="$_REFLEX_API"; ras="$_REFLEX_API_SRC"
       rek=$(reflex_endpoint_key_status)
     fi
+    # DIVE-4936: whether new claude seats get the mod guard.
+    local ms=off
+    if declare -F mod_seat_enabled >/dev/null 2>&1 && mod_seat_enabled; then ms=on; fi
     ok "verify = ${policy} (${src})
 verify-small = ${small} (${ssrc})
 coauthor = ${coauthor} (box-wide, default on)
@@ -134,11 +141,13 @@ reflex-key = ${rk}
 reflex-endpoint = ${re} (${res})
 reflex-api = ${ra} (${ras})
 reflex-endpoint-key = ${rek}
-reflex-configured = ${rc}" \
+reflex-configured = ${rc}
+mod-seat = ${ms} (box-wide, default off)" \
        '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s,
          reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk,
          reflex_endpoint:$re, reflex_endpoint_source:$res, reflex_api:$ra, reflex_api_source:$ras, reflex_endpoint_key:$rek,
-         reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), path:$p}' \
+         reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), mod_seat:$ms, path:$p}' \
+       --arg ms "$ms" \
        --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" \
        --arg pw "$pw" --arg pws "$pws" --arg p5 "$p5" --arg p5s "$p5s" \
        --arg rr "$rr" --arg rrs "$rrs" --arg rm "$rm" --arg rms "$rms" --arg re "$re" --arg res "$res" \
@@ -215,13 +224,16 @@ reflex-configured = ${rc}" \
                 || fail "$E_VALIDATION" "verify-small takes a positive number of changed lines, or 'off' — got '$v'" ;;
       coauthor) [[ "$v" == on || "$v" == off ]] \
                 || fail "$E_VALIDATION" "coauthor takes one of: on, off — got '$v'" ;;
+      # DIVE-4936. Stored as .mod_seat; `default` clears it (= off).
+      mod-seat|mod_seat) [[ "$v" == on || "$v" == off || "$v" == default ]] \
+                || fail "$E_VALIDATION" "mod-seat takes one of: on, off, default — got '$v'" ;;
       # DIVE-4890. Validated in full before anything is written, like every key
       # above: one bad value in a multi-key call writes none of them.
       pace-week|pace_week) _pace_week_valid "$v" \
                 || fail "$E_VALIDATION" "pace-week takes <soft>/<hard> (integers, soft <= hard <= 100, e.g. 85/95), off, or default — got '$v'" ;;
       pace-5h|pace_5h) _pace_5h_valid "$v" \
                 || fail "$E_VALIDATION" "pace-5h takes a percentage (an integer 0-100, e.g. 85), off, or default — got '$v'" ;;
-      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key)" ;;
+      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, mod-seat)" ;;
     esac
   done
   require_root
@@ -243,7 +255,8 @@ reflex-configured = ${rc}" \
     esac
     if [[ "$v" == default && ( "$k" == pace-week || "$k" == pace_week || "$k" == pace-5h || "$k" == pace_5h \
           || "$k" == reflex-receipts || "$k" == reflex_receipts || "$k" == reflex-model || "$k" == reflex_model \
-          || "$k" == reflex-endpoint || "$k" == reflex_endpoint || "$k" == reflex-api || "$k" == reflex_api ) ]]; then
+          || "$k" == reflex-endpoint || "$k" == reflex_endpoint || "$k" == reflex-api || "$k" == reflex_api \
+          || "$k" == mod-seat || "$k" == mod_seat ) ]]; then
       json=$(jq --arg k "${k//-/_}" 'del(.[$k])' <<<"$json")
     else
       json=$(jq --arg k "${k//-/_}" --arg v "$v" '.[$k] = $v' <<<"$json")
