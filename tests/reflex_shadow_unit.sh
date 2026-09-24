@@ -14,7 +14,8 @@
 #      the box and records effect.error=timeout; the kick returns at once.
 #  S3. Opt-in. No model in box.json, or a model with neither key nor backend,
 #      shadows nothing. Secret gates are never shadowed. A gate shadowed once is
-#      never shadowed twice.
+#      never shadowed twice. Receipts switched off on the box (reflex_receipts=off)
+#      makes no backend call at all.
 #  S4. `reflex report --live` bands and scores a fixture of answered gates, lists
 #      the >=0.9 picks auto-apply would have got wrong, and the replay never counts
 #      a shadow receipt as today's decision.
@@ -190,6 +191,16 @@ db "UPDATE tasks SET need_type='decision', need_asked_at=datetime('now','-2 hour
 FIVEDIVE_REFLEX_SHADOW_BACKEND="$FAKE" reflex_shadow_sweep
 check "S3 a gate asked before the window is history, not live: not shadowed" "$([[ -z "$(shadow_rcpt "$T3")" ]]; echo $?)"
 
+# Receipts off on the box (DIVE-4915's switch) stops the shadow: no receipt
+# would land, the dedup would re-select the gate, and every tick would pay again.
+board "$TMP/rcptoff"; set_model "typesafe/jev-1.13"; ident=$(file_gate)
+jq '.reflex_receipts="off"' "$BOX_CONFIG" >"$BOX_CONFIG.t" && mv "$BOX_CONFIG.t" "$BOX_CONFIG"
+: >"$RX_REQ_LOG"
+( unset FIVEDIVE_REFLEX_RECEIPTS _REFLEX_BOX_RECEIPTS
+  FIVEDIVE_REFLEX_SHADOW_BACKEND="$FAKE" reflex_shadow_sweep
+  FIVEDIVE_REFLEX_SHADOW_BACKEND="$FAKE" reflex_shadow_sweep )
+calls=$(grep -c . "$RX_REQ_LOG")
+check "S3 box reflex_receipts=off: 0 backend calls across two sweeps (${calls})" "$([[ "$calls" == 0 ]]; echo $?)"
 echo "── S4: the live report ─────────────────────────────────────────────────"
 board "$TMP/report"
 AT=$(date -u '+%Y-%m-%d %H:%M:%S')

@@ -378,7 +378,9 @@ REFLEX_SHADOW_WINDOW_MIN=60
 # nothing (rc 1). Cheap: one jq over box.json and a readability test.
 reflex_shadow_model() {
   [[ "${FIVEDIVE_REFLEX_SHADOW:-1}" == "0" ]] && return 1
-  [[ "${FIVEDIVE_REFLEX_RECEIPTS:-1}" == "0" ]] && return 1
+  # Receipts off (env, or the box's `5dive config reflex-receipts=off`) stops the
+  # shadow too: with no receipt to dedup on, the sweep would re-ask every tick.
+  _reflex_receipts_on || return 1
   local f="${BOX_CONFIG:-${STATE_DIR:-/var/lib/5dive}/box.json}" m=""
   [[ -r "$f" ]] || return 1
   m=$(jq -r '.reflex_model // empty | strings' "$f" 2>/dev/null) || return 1
