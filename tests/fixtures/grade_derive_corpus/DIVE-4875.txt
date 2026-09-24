@@ -1,0 +1,8 @@
+# DIVE-4875 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+CHANGED-FILE: src/app/dashboard/plugins/plugin-settings.test.ts
+---
+CHECKED: voice tests/verb-config.test.sh 51/51 root, 23/23 user; verb-backend 21/21; verb-setup 26/26; 2 mutations red. api plugin-settings 12/12, route 12/12 (incl. voice-predates-verb → empty 200), shelld 4/4, full npm test 758/758, tsc clean, 3 mutations red. app plugin-settings.test.ts 10/10 (no declaration → renders nothing, mutation → 2 red), full npm test 937/937, tsc and eslint clean; screenshots shots/DIVE-4875/*.png from a local render (the Vercel preview is Clerk-gated).

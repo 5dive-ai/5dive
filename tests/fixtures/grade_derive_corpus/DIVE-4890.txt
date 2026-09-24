@@ -1,0 +1,11 @@
+# DIVE-4890 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+TREE-FILE: src/task/grader_pool.sh
+CHANGED-FILE: tests/pace_box_config_unit.sh
+TREE-FILE: tests/pace_the_week_unit.sh
+---
+CHECKED: tests/pace_box_config_unit.sh 19/19 pass (6 mutants all red, M5 = a digest that ignores config reds PARITY), 6.9s; tests/pace_the_week_unit.sh 164/164; verify_policy_matrix_unit 39/39; digest_autonomy 8/8, digest_mttu 9/9, digest_maker_credit 17/17, digest_window_30d 21/21, digest_buzz_count 9/9, digest_window_30d_controls 4/4; heartbeat_dispatcher_claim 42/42, heartbeat_tier_head_of_line 32/32, reaper_pace_distiller 63/63, heartbeat_grade_dispatch 35/35, build_bundle_self_order 2/2; built bundle: 'config' show prints pace-week/pace-5h defaults, pace-week=95/85 refused with no file written.
+CHECKED: tests/pace_box_config_unit.sh 21/21 (M1-M7 red, 6.0s); Q2 applied directly to src/task/grader_pool.sh in a scratch copy -> 'FAIL 5H-SET — 5h 70% -> band 0 under pace-5h=70, want 3 (hard)'; push rail re-ran the changed harness 21/21.

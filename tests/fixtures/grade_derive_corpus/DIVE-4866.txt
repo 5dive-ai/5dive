@@ -1,0 +1,40 @@
+# DIVE-4866 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+TREE-FILE: tests/epipe_corpus_guard_unit.sh
+TREE-FILE: tests/plugin_verb_dispatch_unit.sh
+CHANGED-FILE: tests/reflex_receipts_unit.sh
+---
+CHECKED:
+- bash tests/reflex_receipts_unit.sh: 26 arms, 26 pass. 4 call-site mutants (neuter each call) went red with 3, 2, 1 and 1 FAIL lines.
+- Neighbouring harnesses, all rc=0: routing_receipt_unit, task_first_started_at_unit, task_reject_trace_unit, task_reject_actor_and_closed_unit, task_reject_fix_template_unit, task_assign_asleep_lane_unit, trace_human_touchpoint_history_unit, ledger_unit (19/19 with a built bundle), lazy_dispatch_unit, build_bundle_self_order_unit, gate_answer_audit_unit, liveness_effect_derived_unit.
+- pii-scan: clean. lint-changelog-fragments: ok. The pre-push rail passed.
+- Live replay, read-only against /var/lib/5dive/tasks/tasks.db: `5dive reflex replay --since=14d` (built bundle), fake:echo, 1.1s:
+
+  | policy | cases | resolved | current | backend |
+  |---|---|---|---|---|
+  | task-route | 663 | 581 | 63.3% | 63.3% |
+  | retry-action | 298 | 298 | 89.6% | 89.6% |
+  | stuck | 659 | 659 | 90.7% | 90.7% |
+  | gate-answer | 481 | 481 | n/a | 75.1% |
+
+  fake:recommend scores gate-answer at 88.1% (88.5% of 391 recommended gates were answered with the recommendation). Broken backends (malformed output, exit 3, timeout) are all counted as invalid, and no case is dropped.
+
+CHECKED:
+- Iteration 2, at e02e44f0: bash tests/plugin_verb_dispatch_unit.sh passes 73/73 (T5 ok). bash tests/epipe_corpus_guard_unit.sh has 0 fails (B3 census 164, baseline 165). bash tests/reflex_receipts_unit.sh passes 26/26.
+- bash tests/reflex_receipts_unit.sh: 26 arms, 26 pass. 4 call-site mutants (neuter each call) went red with 3, 2, 1 and 1 FAIL lines.
+- Neighbouring harnesses, all rc=0: routing_receipt_unit, task_first_started_at_unit, task_reject_trace_unit, task_reject_actor_and_closed_unit, task_reject_fix_template_unit, task_assign_asleep_lane_unit, trace_human_touchpoint_history_unit, ledger_unit (19/19 with a built bundle), lazy_dispatch_unit, build_bundle_self_order_unit, gate_answer_audit_unit, liveness_effect_derived_unit.
+- pii-scan: clean. lint-changelog-fragments: ok. The pre-push rail passed.
+- Live replay, read-only against /var/lib/5dive/tasks/tasks.db: `5dive reflex replay --since=14d` (built bundle), fake:echo, 1.1s:
+
+  | policy | cases | resolved | current | backend |
+  |---|---|---|---|---|
+  | task-route | 663 | 581 | 63.3% | 63.3% |
+  | retry-action | 298 | 298 | 89.6% | 89.6% |
+  | stuck | 659 | 659 | 90.7% | 90.7% |
+  | gate-answer | 481 | 481 | n/a | 75.1% |
+
+  fake:recommend scores gate-answer at 88.1% (88.5% of 391 recommended gates were answered with the recommendation). Broken backends (malformed output, exit 3, timeout) are all counted as invalid, and no case is dropped.
+

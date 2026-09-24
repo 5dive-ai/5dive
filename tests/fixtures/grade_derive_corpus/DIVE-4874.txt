@@ -1,0 +1,11 @@
+# DIVE-4874 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+TREE-FILE: scripts/tsx-loader.mjs
+CHANGED-FILE: src/app/dashboard/_components/browser-install-state.test.ts
+TREE-FILE: src/app/dashboard/marketplace/marketplace-routes.test.ts
+---
+CHECKED: api `node --import tsx --test src/routes/browser.test.ts` 44/44; `npm test` 733/733; `tsc --noEmit` clean; 3 mutants (route field dropped / done check dropped / none check dropped) red 1/1/10 arms. app `node --import ./scripts/tsx-loader.mjs --test src/app/dashboard/_components/browser-install-state.test.ts` 15/15; `npm test` 909/909; `tsc --noEmit` clean; 4 source mutants (`!== false` loosening, branch deleted, pre-fix connect(), coerced setSetupOwed) each red. eslint on changed files: 2 errors, both also on main (not a CI gate).
+CHECKED (at 81221fc0, on top of merged main 9826ba50): `npm test` 928/928 (merged main was 926/927; +1 new arm); `node --import ./scripts/tsx-loader.mjs --test src/app/dashboard/_components/browser-install-state.test.ts src/app/dashboard/marketplace/marketplace-routes.test.ts` 22/22; `tsc --noEmit` exit 0; `git grep -n dashboard/marketplace# -- src/app/dashboard/_components` no hits. Mutants: link put back to #plugins -> marketplace-routes arm 5 red (1 fail); setBusy(null) removed from connect()'s catch -> new arm 16 red (1 fail).

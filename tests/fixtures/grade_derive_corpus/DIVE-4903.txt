@@ -1,0 +1,6 @@
+# DIVE-4903 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: no — the delivered sha is in no checkout on the host that recorded this corpus
+---
+CHECKED: bash host-bin/5dive-disk-reclaim.test.sh 306 pass 0 fail (the 25 new arms included); 5dive-disk-reclaim-archive.test.sh PASS=112 FAIL=0; 5dive-disk-reclaim-notice.test.sh 55/0; run-disk-reclaim-test.test.sh 20/0. Mutant arm CM strips the four '# DIVE-4903 HOLD' lines: CM0 counts exactly 4 removed, and CM1/2/4/5 show the fd-held, fresh, npm-held and blind-owner caches DELETED by the mutant. Against the pre-fix origin/main script, 18 of the 25 new arms fail. A live `npm exec` shows cmdline argv0 'npm exec', which the guard matches. A real-box dry run from agent-ops: 1 cache seen, held owner-unprobed=1 (expected blind degrade for a non-root seat).

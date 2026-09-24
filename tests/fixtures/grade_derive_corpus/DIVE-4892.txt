@@ -1,0 +1,7 @@
+# DIVE-4892 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+---
+CHECKED: `node --test marketplace-routes.test.ts team-rules.test.ts`: 14/15 pass. The 1 failure is environmental: `Cannot find package 'react-dom'` from borrowed node_modules, with an identical failure on untouched main (control run). Local eslint/tsc could not load (same borrowed-node_modules gap), so CI's `npm test + tsc` is the full check.

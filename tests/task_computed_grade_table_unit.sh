@@ -334,9 +334,34 @@ RD2=$(mkrepo repoD2); SHAD2=$(git -C "$RD2" rev-parse HEAD)
 IDD2=$(add_row "two harnesses named")
 AMBIG=$(printf 'CHANGED: src/foo.sh\nCHECKED: bash tests/h.sh and bash tests/other.sh\nDELIVERED-SHA: %s\nCI: green\nCRITERIA: x\n' "$SHAD2")
 ( cd "$RD2" && cmd_task_deliver "$IDD2" --pr="$PR" --result="$AMBIG" >/dev/null 2>&1 )
-[[ "$(col "$IDD2" review_mode)" != "check" ]] \
-  && ok_t "two harnesses on CHECKED is ambiguous and is NOT derived (a guess is worse than nothing)" \
-  || bad_t "two harnesses on CHECKED is NOT derived" "mode='$(col "$IDD2" review_mode)'"
+# DIVE-4906 changed this arm's meaning: a named harness that is not AT the sha
+# is dropped, not counted, so this CHECKED names ONE runnable harness. (Refusing
+# every two-name CHECKED refused 4 of the 25 field deliveries DIVE-4828 read.)
+[[ "$(col "$IDD2" review_mode)" == "check" && "$(col "$IDD2" verify_command)" == "bash tests/h.sh" ]] \
+  && ok_t "a second harness that is not at the sha is dropped, and the one that is IS derived (DIVE-4906)" \
+  || bad_t "a second harness not at the sha is dropped" "mode='$(col "$IDD2" review_mode)' cmd='$(col "$IDD2" verify_command)'"
+
+# …and the cap: four harnesses that all exist and that the diff did not touch
+# is a suite, not a check — the computed pass runs the check once per arm.
+mkrepo_suite() { # <name> -> path; four harnesses at BASE, HEAD changes source only
+  local d="$TMP/$1" h
+  mkdir -p "$d/src" "$d/tests"; git -C "$d" init -q 2>/dev/null
+  printf 'echo hello\n' > "$d/src/foo.sh"
+  for h in a b c d; do printf '%s' "$HARNESS_BODY" > "$d/tests/$h.sh"; done
+  git -C "$d" add -A >/dev/null; git -C "$d" commit -qm base
+  git -C "$d" update-ref refs/remotes/origin/main "$(git -C "$d" rev-parse HEAD)"
+  printf 'echo hello\nGUARDTOKEN\nSECOND\n' > "$d/src/foo.sh"
+  git -C "$d" add -A >/dev/null; git -C "$d" commit -qm guard
+  printf '%s' "$d"
+}
+SUITE4='bash tests/a.sh, bash tests/b.sh, bash tests/c.sh and bash tests/d.sh, all green'
+RD8=$(mkrepo_suite repoD8); SHAD8=$(git -C "$RD8" rev-parse HEAD)
+IDD8=$(add_row "four untouched harnesses named")
+( cd "$RD8" && cmd_task_deliver "$IDD8" --pr="$PR" \
+    --result="$(printf 'CHANGED: src/foo.sh\nCHECKED: %s\nDELIVERED-SHA: %s\nCI: green\nCRITERIA: x\n' "$SUITE4" "$SHAD8")" >/dev/null 2>&1 )
+[[ "$(col "$IDD8" review_mode)" != "check" ]] \
+  && ok_t "more harnesses than FIVEDIVE_DERIVE_MAX_HARNESSES (3) is a suite and is NOT derived" \
+  || bad_t "more harnesses than the cap is NOT derived" "mode='$(col "$IDD8" review_mode)' cmd='$(col "$IDD8" verify_command)'"
 
 RD3=$(mkrepo repoD3); SHAD3=$(git -C "$RD3" rev-parse HEAD)
 IDD3=$(add_row "pinned grader" --review=quinn)
@@ -468,16 +493,16 @@ export FIVEDIVE_GRADE_SAMPLE_N=0
 eval "$ORIG_SAMPLE"
 
 ORIG_DERIVE=$(declare -f _task_grade_derive_check)
-r=$(mutate _task_grade_derive_check 's/(( n == 1 )) || return 1/: /' 'n == 1')
+r=$(mutate _task_grade_derive_check 's/(( n <= max )) || return 1/: /' 'n <= max')
 if [[ "$r" == "OK" ]] && . "$CUT"; then
-  ok_t "mutation D landed: the 'exactly one harness' requirement is cut out"
-  RM=$(mkrepo repoM); SHAM=$(git -C "$RM" rev-parse HEAD)
-  IDM=$(add_row "mutated ambiguity")
+  ok_t "mutation D landed: the harness-count cap is cut out"
+  RM=$(mkrepo_suite repoM); SHAM=$(git -C "$RM" rev-parse HEAD)
+  IDM=$(add_row "mutated cap")
   ( cd "$RM" && cmd_task_deliver "$IDM" --pr="$PR" \
-      --result="$(printf 'CHANGED: x\nCHECKED: bash tests/h.sh and bash tests/other.sh\nDELIVERED-SHA: %s\nCI: green\nCRITERIA: x\n' "$SHAM")" >/dev/null 2>&1 )
-  [[ "$(col "$IDM" review_mode)" == "check" ]] \
-    && ok_t "…and the ambiguity arm goes red (an ambiguous CHECKED now derives)" \
-    || bad_t "…and the ambiguity arm goes red" "mode='$(col "$IDM" review_mode)' — the arm is not testing the requirement"
+      --result="$(printf 'CHANGED: x\nCHECKED: %s\nDELIVERED-SHA: %s\nCI: green\nCRITERIA: x\n' "$SUITE4" "$SHAM")" >/dev/null 2>&1 )
+  [[ "$(col "$IDM" verify_command)" == *"tests/d.sh"* ]] \
+    && ok_t "…and the cap arm goes red (a four-harness suite now derives)" \
+    || bad_t "…and the cap arm goes red" "mode='$(col "$IDM" review_mode)' — the arm is not testing the cap"
 else bad_t "mutation D landed" "$r"; fi
 eval "$ORIG_DERIVE"
 

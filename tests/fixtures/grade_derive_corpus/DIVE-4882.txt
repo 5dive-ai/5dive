@@ -1,0 +1,6 @@
+# DIVE-4882 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: no — the delivered sha is in no checkout on the host that recorded this corpus
+---
+CHECKED: openagent validate PASS (RARE, 63%); openagent verify VERIFIED; build:index clicker undefined->rare; check:index rc=0; build-cards --check 39/39; check-skills rc=0 (1 expected warning: leads with generic notify-user, the real hero is the plugin skill); test-check-skills 114/0; check:teams 5/0; check:team-skills 4 refs resolve; 39 dirs / 39 index entries. The import-merge jq replayed on a real seat map: a non-empty plugins map replaces {telegram,mod,browser@5dive-browser} with the pack's map; [] leaves it intact.

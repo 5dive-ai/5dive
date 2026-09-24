@@ -1,0 +1,12 @@
+# DIVE-4900 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+---
+CHECKED:
+- CLI:
+  - `bash tests/plugin_installs_scope_unit.sh` 36/36. With main's cmd_pack.sh, T2e, T2f and T2h go red (33/3); T2g is a fence.
+  - Every tests/plugin_* harness green.
+  - Real install on the branch bundle in a throwaway STATE_DIR: `market --kind=plugin --json` lists council|5dive-council|box|5dive-ai/5dive-council; `plugin add 5dive-ai/5dive-council --yes` rc 0 (council@5dive-council 1.0.0); `council init --seats=a:chair,b,c --threshold=majority --veto=tg:<id> --yes` gives "initialized (seq 0)", genesis sealed.
+- Frontend: `npm test` 998/998; `npx tsc --noEmit` clean; eslint on the changed files clean.

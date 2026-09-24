@@ -1,0 +1,8 @@
+# DIVE-4870 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+CHANGED-FILE: src/app/dashboard/_components/server-plugins.test.ts
+---
+CHECKED: node --test server-plugins.test.ts 11/11 pass; 5 mutations each red ≥1 arm (key dedupe, voice restored in config, mod icon dropped, failed→manage, origin/main's list component = 3 red); npm test 904/904; tsc --noEmit clean; eslint on touched files clean; npm run build not run (Google Fonts unreachable on this host). Rendered local next dev screenshots of the real components (Clerk + GET /server/plugins stubbed; Vercel preview is Clerk-gated, DIVE-4441) in /home/claude/projects/5dive/shots/DIVE-4870/: host (real plugin list), empty box, mixed (all icons) at 1280 and 390, and the terminal modal.

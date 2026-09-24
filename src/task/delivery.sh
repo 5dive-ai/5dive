@@ -141,13 +141,26 @@ _task_deliver_reach_probe() {
 # actually name them (`A2c`, `D4b`) and what a maker's CHECKED claim quotes. A
 # harness that does not use the convention yields 0 0 "" and the caller degrades
 # to the exit status — a parse miss must not be readable as "zero failures".
+#
+# DIVE-4906: a derived check is now often `node --test` or `bun test`, which
+# print neither. When the house convention reads nothing, the runner's own
+# summary is read instead — node's TAP (`# pass N` / `# fail N`, a failing test
+# named by its top-level ordinal `#N`) and bun's (` N pass` / ` N fail`, no ids).
 _task_grade_arm_counts() {  # <output>
   printf '%s\n' "${1:-}" | awk '
     /^[[:space:]]*ok[[:space:]]+-[[:space:]]+/   { p++; next }
     /^[[:space:]]*FAIL[[:space:]]+-[[:space:]]+/ {
       f++; s=$0; sub(/^[[:space:]]*FAIL[[:space:]]+-[[:space:]]+/,"",s);
       split(s,a,/[[:space:]]+/); ids = ids (ids?",":"") a[1]; next }
-    END { printf "%d %d %s", p+0, f+0, ids }'
+    /^# pass [0-9]+$/ { tp = $3; tap = 1; next }
+    /^# fail [0-9]+$/ { tf = $3; tap = 1; next }
+    /^not ok [0-9]+ - / { tids = tids (tids?",":"") "#" $3; next }
+    /^[[:space:]]*[0-9]+ pass$/ { bp = $1; bun = 1; next }
+    /^[[:space:]]*[0-9]+ fail$/ { bf = $1; bun = 1; next }
+    END {
+      if (p + f == 0 && tap) { printf "%d %d %s", tp+0, tf+0, tids; exit }
+      if (p + f == 0 && bun) { printf "%d %d ", bp+0, bf+0; exit }
+      printf "%d %d %s", p+0, f+0, ids }'
 }
 
 # `_task_grade_changed_src <repo> <sha>` — the changed NON-TEST files, NUL-free,
@@ -165,8 +178,18 @@ _task_grade_changed_src() {  # <repo> <sha> <base>
 }
 
 # `_task_grade_worktree <repo> <sha> <dir>` — a clean detached checkout, or rc 1.
+#
+# DIVE-4906: a node/bun harness cannot run in a checkout with no dependencies,
+# and a clean worktree never has them — so every derived `node --test` would go
+# red at the sha for a reason that is not the diff. The delivering checkout's
+# `node_modules` is LINKED in (read, never written: nothing here installs). The
+# link is untracked, so the mutant landing assert excludes it by name.
 _task_grade_worktree() {  # <repo> <sha> <dir>
-  git -C "$1" worktree add --detach -q "$3" "$2" >/dev/null 2>&1
+  git -C "$1" worktree add --detach -q "$3" "$2" >/dev/null 2>&1 || return 1
+  if [[ -d "$1/node_modules" && ! -e "$3/node_modules" ]]; then
+    ln -s "$1/node_modules" "$3/node_modules" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # `_task_grade_mutant_specs <repo> <sha> <ident> <stored-mutant>` — "<id>\t<cmd>"
@@ -193,12 +216,16 @@ _task_grade_mutant_specs() {  # <repo> <sha> <ident> <stored-mutant>
 #   _TASK_GRADE_RC     0 pass · 1 flagged · 2 could not compute · 3 red at sha
 #                      · 4 vacuous (a mutant the check could not kill at all)
 _TASK_GRADE_TABLE=""; _TASK_GRADE_FLAGS=""; _TASK_GRADE_RC=0
-_task_grade_table() {  # <ident> <check> <stored-mutant> <claimed-failing-csv>
+#
+# [repo] (DIVE-4906): the checkout to grade. Default is the delivering shell's —
+# a derived check passes the checkout of the repository the bound PR lives in,
+# which on a two-repo row is not always the one the maker delivered from.
+_task_grade_table() {  # <ident> <check> <stored-mutant> <claimed-failing-csv> [repo]
   local ident="$1" check="$2" stored="$3" claimed="${4:-}"
   _TASK_GRADE_TABLE=""; _TASK_GRADE_FLAGS=""; _TASK_GRADE_RC=0
   local repo sha base
-  repo=$(git rev-parse --show-toplevel 2>/dev/null) || repo=""
-  sha=$(git rev-parse HEAD 2>/dev/null) || sha=""
+  repo=$(git -C "${5:-.}" rev-parse --show-toplevel 2>/dev/null) || repo=""
+  sha=$(git -C "${5:-.}" rev-parse HEAD 2>/dev/null) || sha=""
   if [[ -z "$repo" || -z "$sha" ]]; then
     _TASK_GRADE_TABLE="GRADE ${ident} — NOT COMPUTED: 'task deliver' ran outside a git checkout, so there is no delivered sha to check out. Nothing below proves the check can fail."
     _TASK_GRADE_RC=2; return 2
@@ -340,7 +367,7 @@ _task_grade_table() {  # <ident> <check> <stored-mutant> <claimed-failing-csv>
     # identical to head; the check then goes green for the honest reason and the
     # arm reads as SURVIVED-looking-fine. Absence of a diff is the failure.
     if ( cd "$wtM" && git diff --quiet HEAD >/dev/null 2>&1 ) \
-       && [[ -z "$( cd "$wtM" && git status --porcelain 2>/dev/null )" ]]; then
+       && [[ -z "$( cd "$wtM" && git status --porcelain -- . ':(exclude)node_modules' 2>/dev/null )" ]]; then
       lines+="mutant  ${mid}  DID NOT APPLY — the tree is unchanged, so this arm graded the delivered tree again"$'\n'
       flags+="MUTANT-NOT-APPLIED:${mid}"$'\n'; continue
     fi
@@ -459,25 +486,203 @@ _task_grade_sample_hit() {  # <id> <ident>
   return 0
 }
 
+# ── DIVE-4906: THE RECOGNISER, WIDENED ────────────────────────────────────────
+# DIVE-4828 replayed the first 25 PR deliveries after DIVE-4825's install: the
+# derivation below took 0 of them. It read `tests/*.sh` only, only from a line
+# that STARTS with `CHECKED:`, and only in the delivering shell's checkout — the
+# CLI repo's convention and almost nothing else the fleet ships (node/bun/npm
+# harnesses, `host-bin/*.test.sh`, `scripts/*.test.sh`, one-line templates,
+# two-repo rows delivered from the other checkout). Fail-safe in the right
+# direction also meant SILENT: every miss looked exactly like "this row has no
+# harness". So the recogniser is now three small stages, each replayable
+# offline against real results (tests/task_grade_derive_widen_unit.sh):
+#   mentions  what the CHECKED text names         (text only)
+#   plan      which of those exist at the sha     (one repo, one sha)
+#   repo      which checkout that is              (the PR's repo, not the cwd)
+
+# `_task_grade_checked_text` [stdin: result] — the CHECKED range(s) of the
+# DIVE-4576 claim block, every other label's lines dropped. A template written
+# on ONE line (DIVE-4875 wrote all five labels on one) is split at its labels
+# first — otherwise no line starts with `CHECKED:` and nothing is read.
+_task_grade_checked_text() {  # [stdin]
+  sed -E 's/[[:space:]]+((CHANGED|CHECKED|DELIVERED[-_]?SHA|CI|CRITERIA)[[:space:]]*:)/\n\1/g' \
+    | _task_grade_claim_block \
+    | awk '/^[A-Z][A-Z0-9_-]*[[:space:]]*[:(=-]/ { on = ($0 ~ /^CHECKED[[:space:]]*[:(=-]/) } on { print }'
+}
+
+# `_task_grade_harness_mentions` [stdin: result] — every runnable harness the
+# CHECKED range names, "<kind>\t<invocation>" per line (kind: sh · node · bun ·
+# npm), each once. Shell harnesses: any `tests/…sh`, `*.test.sh` or `*_unit.sh`
+# path. A harness the maker ran under `sudo` is skipped: the grade runs
+# unprivileged, so deriving it would buy a red that is the environment's.
+_task_grade_harness_mentions() {  # [stdin]
+  local t tf
+  t=$(_task_grade_checked_text | sed -E 's/sudo([[:space:]]+-[A-Za-z]+)*[[:space:]]+[^[:space:]`;,]+//g')
+  [[ -n "$t" ]] || return 0
+  tf='[^-[:space:]`;,()][^[:space:]`;,()]*\.test\.[cm]?[jt]sx?'
+  {
+    grep -oE "node([[:space:]]+--[A-Za-z][A-Za-z-]*(=[^[:space:]\`;,]+|[[:space:]]+[^-[:space:]\`;,][^[:space:]\`;,]*)?)*[[:space:]]+--test([[:space:]]+${tf})+" <<<"$t" | sed 's/^/node\t/'
+    grep -oE "node[[:space:]]+[^-[:space:]\`;,()][^[:space:]\`;,()]*\.test\.m?js" <<<"$t" | sed 's/^/node\t/'
+    grep -oE "bun[[:space:]]+test([[:space:]]+${tf})*" <<<"$t" | sed 's/^/bun\t/'
+    grep -oE 'npm[[:space:]]+(run[[:space:]]+)?test([^A-Za-z0-9_:-]|$)' <<<"$t" | sed 's/.*/npm\tnpm test/'
+    grep -oE '[A-Za-z0-9_.-][A-Za-z0-9_./-]*\.sh' <<<"$t" | sed 's#^\./##' \
+      | grep -E '(^|/)tests?/.+\.sh$|\.test\.sh$|_unit\.sh$' | grep -vE '(^|/)tests/mutants/' | sed 's/^/sh\t/'
+  } | awk '!seen[$0]++'
+}
+
+# `_task_grade_resolve_path <repo> <sha> <path>` — the path AT the sha, or rc 1.
+# A bare file name (`server-plugins.test.ts`, as makers write it) resolves when
+# exactly one file at the sha has that name; two is not guessed between.
+_task_grade_resolve_path() {  # <repo> <sha> <path>
+  local repo="$1" sha="$2" p="${3#./}" m
+  git -C "$repo" cat-file -e "${sha}:${p}" 2>/dev/null && { printf '%s' "$p"; return 0; }
+  [[ "$p" == */* ]] && return 1
+  m=$(git -C "$repo" ls-tree -r --name-only "$sha" 2>/dev/null | awk -v b="$p" '{n=$0; sub(/.*\//,"",n)} n==b')
+  [[ -n "$m" && "$m" != *$'\n'* ]] || return 1
+  printf '%s' "$m"
+}
+
+# `_task_grade_derive_plan <repo> <sha> <base>` [stdin: mentions] — the harness
+# commands to run, "<command>\t<paths>" per line; rc 1 when none exist at the sha.
+#
+# WHICH, WHEN SEVERAL ARE NAMED. Refusing two (DIVE-4825) refused 4 of 25 rows.
+# The harness the DIFF touched is the one written for this change, so those are
+# taken; when the diff touched none of them, all of them run — each is one
+# command, and the caller caps how many.
+_task_grade_derive_plan() {  # <repo> <sha> <base>
+  local repo="$1" sha="$2" base="$3" kind inv tok r cmd paths okp p changed="" line pfx
+  local -a out=() toks=() picked=()
+  local -A seen=()
+  while IFS=$'\t' read -r kind inv; do
+    [[ -n "$kind" ]] || continue
+    case "$kind" in
+      sh)  r=$(_task_grade_resolve_path "$repo" "$sha" "$inv") || continue
+           line="bash ${r}"$'\t'"${r}" ;;
+      npm) git -C "$repo" show "${sha}:package.json" 2>/dev/null \
+             | jq -e '.scripts.test // empty' >/dev/null 2>&1 || continue
+           line="npm test"$'\t' ;;
+      node|bun)
+           cmd=""; paths=""; okp=1
+           read -ra toks <<<"$inv"          # read -a: a `*` in a token is never globbed
+           for tok in "${toks[@]}"; do
+             if [[ "$tok" != -* && "$tok" =~ \.test\.[cm]?[jt]sx?$ ]]; then
+               r=$(_task_grade_resolve_path "$repo" "$sha" "$tok") || { okp=0; break; }
+               tok="$r"; paths+="${paths:+ }${r}"
+             fi
+             cmd+="${cmd:+ }${tok}"
+           done
+           (( okp )) || continue
+           # A maker's `node --test x.test.ts` is SHORTHAND: the loader flags the
+           # repository needs live in its own test script (`node --import tsx
+           # --experimental-test-module-mocks --test …` on the API), and without
+           # them the file is red in any clean tree — measured on DIVE-4895's
+           # delivery. So the files are run under the repository's prefix.
+           if [[ "$kind" == node && " $inv " == *" --test "* ]]; then
+             pfx=$(git -C "$repo" show "${sha}:package.json" 2>/dev/null | jq -r '.scripts.test // empty' 2>/dev/null \
+               | sed -nE 's/^(node[[:space:]].*[[:space:]]--test)([[:space:]].*)?$/\1/p' | head -n1)
+             [[ -n "$pfx" ]] && cmd="${pfx} ${paths}"
+           fi
+           line="${cmd}"$'\t'"${paths}" ;;
+      *) continue ;;
+    esac
+    [[ -n "${seen[${line%%$'\t'*}]:-}" ]] && continue
+    seen["${line%%$'\t'*}"]=1
+    out+=("$line")
+  done
+  (( ${#out[@]} )) || return 1
+  # The same test file run twice (once with a loader, once without; or once
+  # alone and once beside another) is one harness: keep the invocation whose
+  # file set CONTAINS the other's, and the first of two equal sets.
+  local -a kept=()
+  local i j a b sub
+  for i in "${!out[@]}"; do
+    a="${out[$i]#*$'\t'}"; [[ -n "$a" ]] || { kept+=("${out[$i]}"); continue; }
+    sub=0
+    for j in "${!out[@]}"; do
+      (( i == j )) && continue
+      b="${out[$j]#*$'\t'}"; [[ -n "$b" ]] || continue
+      [[ -z "$(comm -23 <(tr ' ' '\n' <<<"$a" | sort -u) <(tr ' ' '\n' <<<"$b" | sort -u))" ]] || continue
+      # a ⊆ b: drop a unless the sets are equal and a came first
+      if [[ -n "$(comm -13 <(tr ' ' '\n' <<<"$a" | sort -u) <(tr ' ' '\n' <<<"$b" | sort -u))" ]] || (( j < i )); then sub=1; break; fi
+    done
+    (( sub )) || kept+=("${out[$i]}")
+  done
+  out=("${kept[@]}")
+  [[ -n "$base" ]] && changed=$(git -C "$repo" diff --name-only "$base" "$sha" -- 2>/dev/null)
+  if [[ -n "$changed" ]]; then
+    for line in "${out[@]}"; do
+      read -ra toks <<<"${line#*$'\t'}"
+      for p in "${toks[@]}"; do
+        grep -qxF -- "$p" <<<"$changed" && { picked+=("$line"); break; }
+      done
+    done
+  fi
+  (( ${#picked[@]} )) || picked=("${out[@]}")
+  printf '%s\n' "${picked[@]}"
+}
+
+# `_task_grade_origin_slug <dir>` — "owner/repo", lower-cased, off origin's URL.
+_task_grade_origin_slug() {  # <dir>
+  git -C "$1" remote get-url origin 2>/dev/null \
+    | sed -E 's#^.*github\.com[:/]##; s#\.git$##; s#/+$##' | tr '[:upper:]' '[:lower:]'
+}
+
+# `_task_grade_derive_repo <id> <ident>` — the checkout to derive against: the
+# one holding the repository the row's PRIMARY bound PR lives in.
+#
+# The delivering shell's checkout, when its origin IS that repository (or when
+# either side is unreadable — a fixture, a PR host we cannot parse: that is the
+# pre-DIVE-4906 behaviour, unchanged). When it is NOT — a two-repo row delivered
+# from the other checkout, which is how DIVE-4889 fell through — a sibling
+# checkout of the PR's repository on a branch naming this row is used, and only
+# when exactly one exists. Nothing is fetched and nothing is guessed between.
+_TASK_GRADE_DERIVED_REPO=""
+_task_grade_derive_repo() {  # <id> <ident>
+  local id="$1" ident="$2" here want have d found="" nfound=0 br
+  local num; num=$(printf '%s' "$ident" | tr '[:upper:]' '[:lower:]')
+  here=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  want=$(_task_pr_url_key "$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null)")
+  want="${want%%#*}"
+  have=$(_task_grade_origin_slug "$here")
+  if [[ -z "$want" || -z "$have" || "$have" == "$want" ]]; then printf '%s' "$here"; return 0; fi
+  for d in "${here%/*}"/*/; do
+    d="${d%/}"
+    [[ "$d" != "$here" && -e "$d/.git" ]] || continue
+    [[ "$(_task_grade_origin_slug "$d")" == "$want" ]] || continue
+    br=$(git -C "$d" symbolic-ref --short -q HEAD 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    [[ "$br" =~ (^|[^a-z0-9])${num}([^0-9]|$) ]] || continue
+    found="$d"; nfound=$((nfound+1))
+  done
+  if (( nfound == 1 )); then
+    warn "$ident: delivered from a checkout of ${have}, but the bound PR is in ${want} — the check is derived against ${found} (DIVE-4906)."
+    printf '%s' "$found"; return 0
+  fi
+  warn "$ident: delivered from a checkout of ${have}, but the bound PR is in ${want}, and ${nfound} sibling checkouts of ${want} are on a ${num} branch — the check is not derived, so this row takes its ordinary grader. Deliver from the PR's own checkout to be graded by the computed pass (DIVE-4906)."
+  return 1
+}
+
 # `_task_grade_derive_check <id> <ident> <result>` — THE DEFAULT FLIP.
 #
 # `--review=check` has existed since DIVE-4324 and almost nothing uses it,
 # because it has to be chosen at FILING by someone who does not yet know which
 # harness the work will grow. The maker knows — they write it on the CHECKED
 # line of the DIVE-4576 result template at delivery. So the command is DERIVED
-# from that line, and a PR delivery that names exactly one runnable harness is
-# graded by the computed pass instead of booking a session.
+# from that line, and a PR delivery that names a runnable harness is graded by
+# the computed pass instead of booking a session.
 #
 # IT ONLY EVER TAKES A `temp`/unset ROW. A named grader (`--review=<seat>`) is
 # someone asking for that seat's judgement and is never downgraded; `rubric` has
-# its own escalation rail. Exactly one harness must be named — two is ambiguous
-# and a derivation that guesses is worse than no derivation.
+# its own escalation rail. More than FIVEDIVE_DERIVE_MAX_HARNESSES (default 3)
+# harnesses after DIVE-4906's selection is not derived: that is a suite, and the
+# computed pass runs the check once per arm.
 #
 # The failure mode is bounded in the safe direction: a derived check that goes
 # red, flags, or cannot be computed routes to the grader the row would have got
-# anyway. Off with FIVEDIVE_DERIVE_GRADE_CHECK=0.
+# anyway (DIVE-4906 made that true of red too — see _task_deliver_command_grade).
+# Off with FIVEDIVE_DERIVE_GRADE_CHECK=0.
 _task_grade_derive_check() {  # <id> <ident> <result>
-  local id="$1" ident="$2" result="$3" mode forced n cand
+  local id="$1" ident="$2" result="$3" mode forced n cand max repo sha base
+  _TASK_GRADE_DERIVED_REPO=""
   [[ "${FIVEDIVE_DERIVE_GRADE_CHECK:-1}" == "1" ]] || return 1
   [[ -n "$result" ]] || return 1
   mode=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
@@ -487,14 +692,20 @@ _task_grade_derive_check() {  # <id> <ident> <result>
   forced=$(db "SELECT COALESCE(verify_forced,0) FROM tasks WHERE id=${id};" 2>/dev/null || printf 0)
   [[ "$forced" == "1" ]] && return 1
   [[ -n "$(db "SELECT COALESCE(verify_command,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')" ]] && return 1
-  # Only the CHECKED line, and only a path that exists at the delivered sha.
-  local -a paths=()
-  mapfile -t paths < <(printf '%s\n' "$result" | _task_grade_claim_block \
-    | sed -n '/^CHECKED[[:space:]]*[:(=-]/,/^[A-Z][A-Z0-9_-]*[[:space:]]*[:(=-]/p' \
-    | grep -oE '(tests|test)/[A-Za-z0-9_./-]+\.sh' | sort -u)
-  n=${#paths[@]}
-  (( n == 1 )) || return 1
-  cand="${paths[0]}"
+  local mentions; mentions=$(printf '%s\n' "$result" | _task_grade_harness_mentions)
+  [[ -n "$mentions" ]] || return 1
+  repo=$(_task_grade_derive_repo "$id" "$ident") || return 1
+  sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || return 1
+  base=$(git -C "$repo" merge-base "$sha" origin/main 2>/dev/null || printf '')
+  local -a plan=()
+  mapfile -t plan < <(_task_grade_derive_plan "$repo" "$sha" "$base" <<<"$mentions")
+  n=${#plan[@]}
+  if (( n == 0 )); then
+    warn "$ident: CHECKED names $(wc -l <<<"$mentions" | tr -d ' ') harness(es), and none is at ${sha:0:12} in ${repo} — not derived, so this row takes its ordinary grader (DIVE-4906)."
+    return 1
+  fi
+  max="${FIVEDIVE_DERIVE_MAX_HARNESSES:-3}"; [[ "$max" =~ ^[0-9]+$ ]] || max=3
+  (( n <= max )) || return 1
   # ── DIVE-4825 iteration 2: NEVER DERIVE THE HARNESS WE ARE RUNNING INSIDE ──
   # The derived command is not merely recorded, it is EXECUTED a few lines below
   # (`cmd_task_verify --cmd="$stored"`). So a delivery made from within
@@ -512,15 +723,37 @@ _task_grade_derive_check() {  # <id> <ident> <result>
   #
   # It costs a real delivery nothing: the CLI entry point is `5dive`, never a
   # tests/*.sh, so `$0` can only match here when a harness is the caller.
-  local _self
-  for _self in "$0" "${BASH_SOURCE[@]}"; do
-    [[ "${_self##*/}" == "${cand##*/}" ]] && return 1
+  local _self _line _p _check=""
+  local -a _ps=()
+  for _line in "${plan[@]}"; do
+    read -ra _ps <<<"${_line#*$'\t'}"
+    for cand in "${_ps[@]}"; do
+      for _self in "$0" "${BASH_SOURCE[@]}"; do
+        [[ "${_self##*/}" == "${cand##*/}" ]] && return 1
+      done
+    done
   done
-  git rev-parse HEAD >/dev/null 2>&1 || return 1
-  git cat-file -e "HEAD:${cand}" 2>/dev/null || return 1
-  db "UPDATE tasks SET verify_command=$(sqlq "bash ${cand}"), review_mode='check' WHERE id=${id};"
-  warn "$ident: graded by the COMPUTED PASS (DIVE-4825) — the check was derived from your CHECKED line ('bash ${cand}') and no grader session is booked unless the table flags. File --review=<seat> if a seat's judgement, not a computed table, is what this row needs."
+  if (( n == 1 )); then
+    _check="${plan[0]%%$'\t'*}"
+  else
+    _check="rc=0"
+    for _line in "${plan[@]}"; do _check+="; ${_line%%$'\t'*} || rc=1"; done
+    _check+='; exit $rc'
+  fi
+  _TASK_GRADE_DERIVED_REPO="$repo"
+  db "UPDATE tasks SET verify_command=$(sqlq "$_check"), review_mode='check' WHERE id=${id};"
+  warn "$ident: graded by the COMPUTED PASS (DIVE-4825) — the check was derived from your CHECKED line ('${_check}') and no grader session is booked unless the table flags. File --review=<seat> if a seat's judgement, not a computed table, is what this row needs."
   return 0
+}
+
+# `_task_grade_underive <id> <mode-before>` — undo the derivation's two writes.
+# A derived check that did not produce a green table hands the row to its
+# ORDINARY grader, and the row must then look exactly as it did before the flip:
+# left as `check` with a stored command, the NEXT delivery would skip the
+# derivation and be graded by that command under the explicit-row rules, where
+# a red refuses — the flip taking a delivery away one iteration late.
+_task_grade_underive() {  # <id> <mode-before>
+  db "UPDATE tasks SET verify_command=NULL, review_mode=$(sqlq_or_null "$2") WHERE id=${1};"
 }
 
 # DIVE-4825 REMOVED `_task_check_control_arms` / `_TASK_CONTROL_RECEIPT`. Its
@@ -616,12 +849,14 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
     esac
   fi
   # ── DIVE-4825: THE DEFAULT FLIP ───────────────────────────────────────────
-  # A PR delivery whose result template names exactly one harness is graded by
+  # A PR delivery whose result template names a runnable harness is graded by
   # the computed pass. Filing-time `--review=check` stays the explicit form; this
   # is the path that makes it the DEFAULT without asking the filer to predict,
   # months earlier, which harness the work would grow.
+  local _derived=0 _mode_before="$mode"
+  _TASK_GRADE_DERIVED_REPO=""   # never a previous delivery's checkout
   if [[ "$mode" != "check" ]] && _task_grade_derive_check "$id" "$ident" "$result"; then
-    mode=check
+    mode=check; _derived=1
     stored=$(db "SELECT COALESCE(verify_command,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
   fi
   [[ "$mode" == "check" ]] || return 1
@@ -634,7 +869,12 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
   # controlled whether or not this delivery re-passed it.
   local control ctl_rc=0 ctl_note="" ctl_escape="" _gt_computed=0
   control=$(db "SELECT COALESCE(mutant_command,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
-  if [[ -z "$control" ]]; then
+  # DIVE-4906: a DERIVED check is always computed, mutant or not. The table's
+  # source-revert control is what shows the check can fail (DIVE-4825 wrote the
+  # "NONE RECORDED — the control above…" line for exactly this row); without it
+  # the default flip closed rows on a bare exit status nobody had shown able to
+  # go red — DIVE-4623's vacuity, taken by default.
+  if [[ -z "$control" ]] && (( ! _derived )); then
     # A row filed before this rail existed, or one that reached `check` through
     # the delivery-time downgrade above. Deliberately NOT a refusal: that would
     # re-book a grader session for every legacy command-graded row, which is the
@@ -643,7 +883,7 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
     # silently equal to a proven one.
     ctl_note="control: NONE RECORDED — this row names no mutant, so nothing here proves '$stored' can fail. File the control with --mutant=\"<cmd>\" (or record why it cannot be inverted with --no-mutant=\"<reason>\") (DIVE-4623)."
     warn "$ident: graded by a command with NO negative control. $ctl_note"
-  elif ctl_escape=$(mutant_escape_reason "$control"); then
+  elif [[ -n "$control" ]] && ctl_escape=$(mutant_escape_reason "$control"); then
     ctl_note="control: WAIVED at filing (audited, DIVE-4623) — ${ctl_escape}. The check ran once, as delivered; nothing demonstrated it can fail."
   else
     # DIVE-4825: THE COMPUTED PASS, a strict superset of the two arms it
@@ -651,12 +891,37 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
     # the rails, and one table. Its return codes are deliberately the same three
     # this path already handles, so the refusals below did not have to move.
     _gt_computed=1
-    _task_grade_table "$ident" "$stored" "$control" "$(_task_grade_claimed_failing "$result")" || ctl_rc=$?
+    _task_grade_table "$ident" "$stored" "$control" "$(_task_grade_claimed_failing "$result")" \
+      "${_TASK_GRADE_DERIVED_REPO:-.}" || ctl_rc=$?
     ctl_note="$_TASK_GRADE_TABLE"
     # A mutant the check could not kill IS DIVE-4623's vacuous grade, and it is
     # refused there rather than flagged to a reader: an exit status that cannot
     # go red grades every tree green, and no amount of reading fixes that.
     (( ctl_rc == 4 )) && ctl_rc=1
+  fi
+  # DIVE-4906: A DERIVED CHECK NEVER SUBTRACTS A DELIVERY. Red at the sha, a
+  # vacuous mutant, a table that could not be computed: on an EXPLICIT check row
+  # those refuse, because the filer chose to be graded by that command. On a
+  # derived row nobody chose it — the flip did — and the row had a grader before
+  # the flip, so every non-green outcome goes back to that grader with the table
+  # on the row, and the derivation is undone. DIVE-4825's page claimed this bound
+  # and the code held it only for FLAGGED; a node harness in a clean checkout
+  # is red for reasons that are not the diff often enough to make it matter.
+  # A green table on a row that binds COMPANION pull requests is read too: the
+  # table graded the primary PR's repository only.
+  if (( _derived )); then
+    local _dg_kind=""
+    if (( ctl_rc != 0 )); then _dg_kind=flagged
+    elif [[ -n "$(db "SELECT COALESCE(delivery_companions,'') FROM tasks WHERE id=${id};" 2>/dev/null)" ]]; then
+      _dg_kind=sample
+      ctl_note+=$'\n'"NOTE (DIVE-4906): this row binds companion pull requests, and the table above graded the primary PR's repository only."
+    elif _task_grade_sample_hit "$id" "$ident"; then _dg_kind=sample
+    fi
+    if [[ -n "$_dg_kind" ]]; then
+      _task_grade_underive "$id" "$_mode_before"
+      _task_grade_flagged_route "$id" "$ident" "$ctl_note" "$_dg_kind"
+      return 1
+    fi
   fi
   # A FLAGGED TABLE IS A HAND-OFF, NOT A REFUSAL. The computed lines stand; the
   # flagged one needs a judgement, so the table goes on the row (which is where
@@ -713,7 +978,9 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
   # The receipt rides in as the grade's prose, so BOTH ARMS ARE RECORDED ON THE
   # ROW in the one cell the board and the merge owner already read — rather than
   # in a second column nothing renders.
-  out=$(cmd_task_verify "$ident" --no-done --cmd="$stored" --result="$ctl_note" 2>&1) || rc=$?
+  # DIVE-4906: in the checkout the check was derived against — on a two-repo row
+  # that is the PR's repository, which need not be the one the shell stands in.
+  out=$(cd "${_TASK_GRADE_DERIVED_REPO:-.}" && cmd_task_verify "$ident" --no-done --cmd="$stored" --result="$ctl_note" 2>&1) || rc=$?
   printf '%s\n' "$out" >&2
   if (( rc == 0 )); then
     local _ok_ctl="with a PROVEN negative control (the check goes red on the mutated tree, DIVE-4623)"

@@ -1,0 +1,11 @@
+# DIVE-4901 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+CHANGED-FILE: scripts/inc/shelld.mjs
+CHANGED-FILE: scripts/test-shelld-viewer-novnc-graph.test.mjs
+CHANGED-FILE: scripts/test-shelld-viewer-relay.test.sh
+TREE-FILE: scripts/test-shelld-viewer-unfurler-ua.test.mjs
+---
+CHECKED: sudo -E scripts/test-shelld-viewer-relay.test.sh → 66 passed, 0 failed; same harness on origin/main's shelld.mjs → 50 passed, 16 failed (T11a-e, T12a/b/d/f/g incl. the exact deep-marlin "unknown view", T13a-f); TTL-only mutant (60_000) → 64/2, T12a/b red; node scripts/test-shelld-viewer-novnc-graph.test.mjs → PASS (50 modules), dropped-module mutant → AssertionError; node scripts/test-shelld-viewer-unfurler-ua.test.mjs → PASS; test-shelld-turn-channel → PASS; test-shelld-collect-now → 23/23; node --check shelld.mjs → ok.

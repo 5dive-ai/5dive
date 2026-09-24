@@ -1,0 +1,7 @@
+# DIVE-4880 — the CHECKED text of the stored delivery result, as the recogniser reads it
+# (DIVE-4828 pass 2's corpus). TREE lists the files at the delivered sha whose names
+# the text mentions; CHANGED is the subset the delivered diff touched.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+---
+CHECKED: diff -r <5dive-voice@1f32297>/voice plugins/voice → empty. 5dive-voice's own harness run as root against this tree (scratch root, voice → plugins/voice): verb-backend 21/21, verb-config 51/51, verb-setup 26/26; control on pre-port origin/main tree 7/21, 11/51, 4/22 (red). bun test 1610 pass / 1 fail (dive3809-drain-lock, telegram timing under load; alone 2/2 pass). generator --check clean; jq -e marketplace.json OK.
