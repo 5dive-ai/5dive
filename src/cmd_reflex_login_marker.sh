@@ -262,7 +262,9 @@ _reflex_login_marker() {
   local model=""
   if [[ "$backend" == builtin ]]; then
     reflex_model_resolve; model="$_REFLEX_MODEL"
-    [[ -r "$(_reflex_key_file)" ]] \
+    # DIVE-4932: a custom endpoint needs no key (its own bearer is optional).
+    reflex_endpoint_resolve
+    (( _REFLEX_CUSTOM )) || [[ -r "$(_reflex_key_file)" ]] \
       || fail "$E_PERMISSION" "the reflex key ($(_reflex_key_file)) is not readable by $(id -un). Run it as root (sudo 5dive reflex login-marker ...), or pass --backend=fake:first for the heuristic alone."
   fi
   local inm=false; if [[ -n "$fi_" ]]; then inm=true; fi
@@ -296,7 +298,7 @@ _reflex_login_marker() {
   fi
 
   local report
-  report=$(jq -nc --arg site "$site" --arg url "$url" --arg backend "$backend" --arg model "$model" \
+  report=$(jq -nc --arg site "$site" --arg url "$url" --arg backend "$backend" --arg adapter "$(reflex_adapter_name)" --arg model "$model" \
       --argjson c_out "$c_out" --argjson d_out "$d_out" --argjson c_in "$c_in" --argjson d_in "$d_in" \
       --argjson spa "$spa" --argjson inm "$inm" --arg compare "$compare" --argjson nout "$(( 1 + ${#fo_more[@]} ))" \
       --arg hand_out "$hand_out" --arg hand_in "$hand_in" \
@@ -306,7 +308,7 @@ _reflex_login_marker() {
     pick($c_out; $d_out) as $po | (if $spa == 1 then pick($c_in; $d_in) else null end) as $pi
     | ($c_out[0] // null) as $top
     | {site: $site, probe_url: $url, mode: "shadow", written: false,
-       backend: (if $backend == "builtin" then "openrouter" else $backend end),
+       backend: (if $backend == "builtin" then $adapter else $backend end),
        model: (if $model == "" then null else $model end),
        signed_in_render: $inm, signed_out_renders: $nout,
        logged_out: {candidates: $c_out, choice: $d_out.choice, confidence: $d_out.confidence, error: $d_out.error,
@@ -340,7 +342,7 @@ _reflex_login_marker() {
     confidence="$(jq -c '.logged_out.confidence' <<<"$report")" \
     fallback="$(jq -r '.logged_out.error != null' <<<"$report")" \
     signals="$(jq -c '{site, signed_in_render, signed_out_renders, spa: (.logged_in != null), n_candidates: (.logged_out.candidates | length)}' <<<"$report")" \
-    backend="$(jq -c '{adapter: (if .backend == "openrouter" then "openrouter" elif (.backend | startswith("fake:")) then .backend else "command" end), model}' <<<"$report")" \
+    backend="$(jq -c '{adapter: (if .backend == "openrouter" or .backend == "endpoint" then .backend elif (.backend | startswith("fake:")) then .backend else "command" end), model}' <<<"$report")" \
     effect="$(jq -c --arg mh "$mh" '{acted: false, written: false, marker_hash: (if $mh == "" then null else $mh end),
         error: .logged_out.error, logged_in_choice: (.logged_in.choice // null),
         compare: (if .compare == null then null else

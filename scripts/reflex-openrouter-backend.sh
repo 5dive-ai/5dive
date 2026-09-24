@@ -36,22 +36,52 @@
 # FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE. FIVEDIVE_REFLEX_OPENROUTER_URL overrides the
 # base URL (default https://openrouter.ai/api).
 #
-# Flags: --model=<id> (default: `5dive config reflex-model`, else typesafe/jev-1.13)  --api=decisions|chat
+# ANY ENDPOINT (DIVE-4932). The name is historical: OpenRouter is only the
+# default. `5dive config reflex-endpoint=<url>` (or --endpoint=<url>) sends every
+# call to that full URL instead, e.g. a local Laya's
+# http://127.0.0.1:8000/v1/systemone. systemone is the decisions body and
+# response under another path, so the same mapping serves both. A custom
+# endpoint NEVER gets the OpenRouter key: it gets its own optional bearer,
+# FIVEDIVE_REFLEX_ENDPOINT_KEY_FILE (default /etc/5dive/reflex-endpoint.key,
+# `5dive config reflex-endpoint-key=-`), or no Authorization header at all.
+#
+# Flags: --model=<id> (default: `5dive config reflex-model`, else typesafe/jev-1.13)
+#        --api=decisions|systemone|chat (default: `5dive config reflex-api`, else
+#          the endpoint's path, else decisions for Jev and chat for other models)
+#        --endpoint=<url>|default (default: `5dive config reflex-endpoint`)
 #        --concurrency=N (1-32, default 8)  --request-timeout=S (default 60)
 #        --retries=N (on 429/5xx/no answer, default 2)  --with-current
 set -uo pipefail
 
-model="typesafe/jev-1.13" api="" conc=8 rto=60 retries=2 with_current=0
+model="typesafe/jev-1.13" api="" endpoint="" conc=8 rto=60 retries=2 with_current=0
+_ep_re='^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?(/[A-Za-z0-9._~%/-]*)?$'
 # DIVE-4915: the box's `5dive config reflex-model=` is the default; --model wins.
+# DIVE-4932: so are its reflex-endpoint and reflex-api; --endpoint / --api win.
 _box="${BOX_CONFIG:-${STATE_DIR:-/var/lib/5dive}/box.json}"
+_m="" _a=""
 if [[ -r "$_box" ]] && command -v jq >/dev/null 2>&1; then
   _m=$(jq -r '.reflex_model // empty | strings' "$_box" 2>/dev/null || true)
+  _a=$(jq -r '.reflex_api // empty | strings' "$_box" 2>/dev/null || true)
+  endpoint=$(jq -r '.reflex_endpoint // empty | strings' "$_box" 2>/dev/null || true)
+  [[ ${#endpoint} -le 200 && "$endpoint" =~ $_ep_re ]] || endpoint=""
+fi
+_box_api="$_a"
+for a in "$@"; do
+  case "$a" in
+    --endpoint=*)        endpoint="${a#*=}"; [[ "$endpoint" == default ]] && endpoint="" ;;
+  esac
+done
+if [[ -n "$endpoint" ]]; then
+  [[ ${#_m} -le 100 && "$_m" =~ ^[A-Za-z0-9._~:/-]+$ ]] && model="$_m"
+else
   [[ "$_m" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$ ]] && model="$_m"
+  [[ "$_box_api" == systemone ]] && _box_api=""
 fi
 for a in "$@"; do
   case "$a" in
     --model=*)           model="${a#*=}" ;;
     --api=*)             api="${a#*=}" ;;
+    --endpoint=*)        ;;
     --concurrency=*)     conc="${a#*=}" ;;
     --request-timeout=*) rto="${a#*=}" ;;
     --retries=*)         retries="${a#*=}" ;;
@@ -60,8 +90,16 @@ for a in "$@"; do
     *) echo "reflex-openrouter-backend: unknown flag: $a" >&2; exit 2 ;;
   esac
 done
+if [[ -n "$endpoint" ]] && ! [[ ${#endpoint} -le 200 && "$endpoint" =~ $_ep_re ]]; then
+  echo "reflex-openrouter-backend: --endpoint must be a full http(s) URL with no credentials, query string or fragment" >&2; exit 2
+fi
+[[ -n "$api" ]] || api="$_box_api"
+if [[ -z "$api" && -n "$endpoint" ]]; then
+  case "${endpoint%/}" in */systemone) api=systemone ;; */decisions) api=decisions ;; */chat/completions) api=chat ;; *) api=decisions ;; esac
+fi
 [[ -n "$api" ]] || { [[ "$model" =~ ^~?typesafe/jev ]] && api=decisions || api=chat; }
-[[ "$api" == decisions || "$api" == chat ]] || { echo "reflex-openrouter-backend: --api must be decisions or chat" >&2; exit 2; }
+[[ "$api" == decisions || "$api" == chat || "$api" == systemone ]] || { echo "reflex-openrouter-backend: --api must be decisions, systemone or chat" >&2; exit 2; }
+[[ "$api" != systemone || -n "$endpoint" ]] || { echo "reflex-openrouter-backend: --api=systemone needs --endpoint (OpenRouter does not serve it)" >&2; exit 2; }
 [[ "$conc" =~ ^[0-9]+$ ]] && (( conc >= 1 && conc <= 32 )) || { echo "reflex-openrouter-backend: --concurrency must be 1-32" >&2; exit 2; }
 [[ "$rto" =~ ^[1-9][0-9]*$ ]] || { echo "reflex-openrouter-backend: --request-timeout must be a positive integer" >&2; exit 2; }
 [[ "$retries" =~ ^[0-9]$ ]] || { echo "reflex-openrouter-backend: --retries must be 0-9" >&2; exit 2; }
@@ -78,10 +116,17 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   printf '%s\n' "$line" >"$RX_DIR/req/$n"; n=$((n + 1))
 done
 
-key_file="${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5dive/reflex-openrouter.key}"
 key=""
-[[ -r "$key_file" ]] && key=$(tr -d ' \r\n' <"$key_file")
-if [[ -z "$key" ]]; then
+if [[ -n "$endpoint" ]]; then
+  # A custom endpoint: its own bearer if one is readable, else none. Never the
+  # OpenRouter key.
+  key_file="${FIVEDIVE_REFLEX_ENDPOINT_KEY_FILE:-/etc/5dive/reflex-endpoint.key}"
+  [[ -r "$key_file" ]] && key=$(tr -d ' \r\n' <"$key_file")
+else
+  key_file="${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5dive/reflex-openrouter.key}"
+  [[ -r "$key_file" ]] && key=$(tr -d ' \r\n' <"$key_file")
+fi
+if [[ -z "$key" && -z "$endpoint" ]]; then
   echo "reflex-openrouter-backend: no key readable at $key_file" >&2
   for ((i = 0; i < n; i++)); do
     jq -cn --arg e "no OpenRouter key readable at $key_file" '{choice:null, error:$e}'
@@ -91,10 +136,12 @@ fi
 if [[ -n "$(find "$key_file" -maxdepth 0 -perm /044 2>/dev/null)" ]]; then
   echo "reflex-openrouter-backend: warning: $key_file is readable by group/other; chmod 600 it" >&2
 fi
-printf 'Authorization: Bearer %s\n' "$key" >"$RX_DIR/auth"; key=""
+: >"$RX_DIR/auth"
+[[ -n "$key" ]] && printf 'Authorization: Bearer %s\n' "$key" >"$RX_DIR/auth"; key=""
 
 export RX_DIR RX_MODEL="$model" RX_API="$api" RX_RTO="$rto" RX_RETRIES="$retries" RX_WITH_CURRENT="$with_current"
-export RX_BASE="${FIVEDIVE_REFLEX_OPENROUTER_URL:-https://openrouter.ai/api}"
+export RX_BASE="${FIVEDIVE_REFLEX_OPENROUTER_URL:-https://openrouter.ai/api}" RX_ENDPOINT="$endpoint"
+export RX_NAME; [[ -n "$endpoint" ]] && RX_NAME=endpoint || RX_NAME=openrouter
 
 # The question and its criteria for one request, per policy. criteria maps each
 # option id to a line of meaning; the backend must answer with an id.
@@ -127,12 +174,12 @@ _rx_one() { # <index> -> writes $RX_DIR/resp/<index>, exactly one line
   local q body url code attempt=0 err="" out="$RX_DIR/resp/$i"
   q=$(jq -c "$RX_QUESTION_JQ" "$RX_DIR/req/$i" 2>/dev/null) \
     || { jq -cn '{choice:null, error:"unparseable request line"}' >"$out"; return 0; }
-  if [[ "$RX_API" == decisions ]]; then
-    url="$RX_BASE/alpha/decisions"
+  if [[ "$RX_API" == decisions || "$RX_API" == systemone ]]; then
+    url="${RX_ENDPOINT:-$RX_BASE/alpha/decisions}"
     body=$(jq -c --arg m "$RX_MODEL" '{model:$m, state:.state,
                   questions:{decision:{type:"choice", instructions, criteria}}}' <<<"$q")
   else
-    url="$RX_BASE/v1/chat/completions"
+    url="${RX_ENDPOINT:-$RX_BASE/v1/chat/completions}"
     body=$(jq -c --arg m "$RX_MODEL" '{model:$m, temperature:0, max_tokens:24,
       messages:[{role:"system", content:"You are a decision function. Reply with exactly one option id from the options object, and nothing else: no quotes, no explanation."},
                 {role:"user", content:({question:.instructions, options:.criteria, state:.state} | tojson)}]}' <<<"$q")
@@ -151,11 +198,11 @@ _rx_one() { # <index> -> writes $RX_DIR/resp/<index>, exactly one line
     attempt=$((attempt + 1)); sleep $((attempt * 2))
   done
   if [[ -n "$err" ]]; then
-    jq -cn --arg e "$err" --arg m "$RX_MODEL" '{choice:null, error:$e, backend:{name:"openrouter", model:$m}}' >"$out"
+    jq -cn --arg e "$err" --arg m "$RX_MODEL" --arg n "$RX_NAME" '{choice:null, error:$e, backend:{name:$n, model:$m}}' >"$out"
     return 0
   fi
-  jq -c --arg m "$RX_MODEL" --arg api "$RX_API" --argjson opts "$(jq -c '.options' <<<"$q")" '
-    if $api == "decisions" then
+  jq -c --arg m "$RX_MODEL" --arg api "$RX_API" --arg n "$RX_NAME" --argjson opts "$(jq -c '.options' <<<"$q")" '
+    if $api == "decisions" or $api == "systemone" then
       (.answers.decision // {}) as $d
       | {choice: ($d.choice // null), confidence: ($d.confidence // null),
          probabilities: ($d.probabilities // null),
@@ -169,9 +216,9 @@ _rx_one() { # <index> -> writes $RX_DIR/resp/<index>, exactly one line
       | {choice: (if ($opts | index([$t])) != null then $t elif ($hits|length) == 1 then $hits[0] else $t end),
          confidence: null, probabilities: null, probability_source: null}
     end
-    + {backend: {name: "openrouter", api: $api, model: (.model // $m), cost: (.usage.cost // null)}}' \
+    + {backend: {name: $n, api: $api, model: (.model // $m), cost: (.usage.cost // null)}}' \
     "$RX_DIR/raw.$i" >"$out" 2>/dev/null \
-    || jq -cn --arg m "$RX_MODEL" '{choice:null, error:"unparseable response", backend:{name:"openrouter", model:$m}}' >"$out"
+    || jq -cn --arg m "$RX_MODEL" --arg n "$RX_NAME" '{choice:null, error:"unparseable response", backend:{name:$n, model:$m}}' >"$out"
   return 0
 }
 export -f _rx_one
@@ -185,4 +232,4 @@ for ((i = 0; i < n; i++)); do
 done
 cost=$(cat "$RX_DIR"/resp/* 2>/dev/null | jq -s '[.[].backend.cost // 0] | add // 0 | . * 1000000 | round / 1000000' 2>/dev/null)
 errs=$(cat "$RX_DIR"/resp/* 2>/dev/null | jq -s '[.[] | select(.error)] | length' 2>/dev/null)
-echo "reflex-openrouter-backend: $n request(s), ${errs:-?} error(s), cost \$${cost:-?} ($RX_API, $model)" >&2
+echo "reflex-openrouter-backend: $n request(s), ${errs:-?} error(s), cost \$${cost:-?} ($RX_API, $model${endpoint:+, $endpoint})" >&2

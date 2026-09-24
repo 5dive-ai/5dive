@@ -68,8 +68,12 @@ _reflex_key_file() { printf '%s' "${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5d
 
 # _reflex_box_get <key> -> the box.json value, or nothing
 _reflex_box_get() {
-  declare -F _box_config_path >/dev/null 2>&1 || return 0
-  local f; f=$(_box_config_path)
+  # DIVE-4932: the same fallback path reflex_shadow_model reads, so a process
+  # without _box_config_path (a partial source, the detached sweep) still sees
+  # the box's endpoint instead of silently resolving to OpenRouter.
+  local f
+  if declare -F _box_config_path >/dev/null 2>&1; then f=$(_box_config_path)
+  else f="${BOX_CONFIG:-${STATE_DIR:-/var/lib/5dive}/box.json}"; fi
   [[ -r "$f" ]] || return 0
   jq -r --arg k "$1" '.[$k] // empty | strings' "$f" 2>/dev/null || true
 }
@@ -88,23 +92,132 @@ reflex_receipts_resolve() {
   esac
 }
 
-# Sets _REFLEX_MODEL and _REFLEX_MODEL_SRC.
+# Sets _REFLEX_MODEL and _REFLEX_MODEL_SRC. On a custom endpoint (DIVE-4932)
+# the id is whatever that server calls its models (Laya: `typed-decisions`), so
+# only the charset is checked; on OpenRouter it must be provider/model.
 reflex_model_resolve() {
-  local v; v=$(_reflex_box_get reflex_model)
-  if [[ -n "$v" && "$v" =~ $REFLEX_MODEL_RE ]]; then
+  local v re="$REFLEX_MODEL_RE"; v=$(_reflex_box_get reflex_model)
+  [[ -n "$(_reflex_box_get reflex_endpoint)" ]] && re="$REFLEX_MODEL_ANY_RE"
+  if [[ -n "$v" && ${#v} -le 100 && "$v" =~ $re ]]; then
     _REFLEX_MODEL="$v"; _REFLEX_MODEL_SRC="box setting"
+  elif [[ -n "$v" ]]; then
+    _REFLEX_MODEL="$REFLEX_MODEL_DEFAULT"; _REFLEX_MODEL_SRC="default (the box's '${v:0:100}' is not an OpenRouter id, and the endpoint is OpenRouter)"
   else
     _REFLEX_MODEL="$REFLEX_MODEL_DEFAULT"; _REFLEX_MODEL_SRC="default"
   fi
 }
 
 # set | unset | unknown. Presence only: this function never opens the file.
-reflex_key_status() {
-  local f; f=$(_reflex_key_file)
+reflex_key_status() { _reflex_file_status "$(_reflex_key_file)"; }
+_reflex_file_status() {
+  local f="$1"
   if [[ -s "$f" ]]; then printf 'set'
   elif [[ -x "$(dirname "$f")" ]]; then printf 'unset'
   else printf 'unknown'
   fi
+}
+
+# ── DIVE-4932: the endpoint is a setting, OpenRouter is only its default ────
+#
+# lodar, 2026-09-24: "we should have made custom endpoint option for 5dive
+# reflex. not hardcode openrouter." Two box settings:
+#   endpoint  box.json .reflex_endpoint: the FULL URL a decision is POSTed to
+#             (http://127.0.0.1:8000/v1/systemone for a local Laya). Unset is
+#             OpenRouter: ${FIVEDIVE_REFLEX_OPENROUTER_URL:-https://openrouter.ai/api}
+#             plus the api's path, exactly as before.
+#   api       box.json .reflex_api: decisions | systemone | chat. Unset, it is
+#             read off a custom endpoint's path (…/systemone, …/decisions,
+#             …/chat/completions), and on OpenRouter it is decisions.
+#             decisions and systemone are ONE wire format — {model, state,
+#             questions} in, {answers:{decision:{choice, confidence,
+#             probabilities}}} out; Laya's serve.py says so and returns the same
+#             shape — so they differ only in the name. chat is any
+#             OpenAI-compatible chat model, asked for one option id.
+#
+# THE KEY IS PER ENDPOINT. The OpenRouter key is sent to OpenRouter and nowhere
+# else: a custom endpoint gets its OWN bearer (`5dive config
+# reflex-endpoint-key=-`, root-only 600 like the OpenRouter one) or none at all.
+# Sending the OpenRouter key to whatever URL a box names would hand the key to
+# that URL. A custom endpoint's URL may not carry credentials or a query string
+# either (refused at `config`, ignored here), so a receipt, a status line or a
+# `ps` listing never holds one.
+REFLEX_MODEL_ANY_RE='^[A-Za-z0-9._~:/-]+$'
+REFLEX_ENDPOINT_RE='^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?(/[A-Za-z0-9._~%/-]*)?$'
+
+_reflex_endpoint_key_file() { printf '%s' "${FIVEDIVE_REFLEX_ENDPOINT_KEY_FILE:-/etc/5dive/reflex-endpoint.key}"; }
+reflex_endpoint_key_status() { _reflex_file_status "$(_reflex_endpoint_key_file)"; }
+
+# reflex_endpoint_valid <url> — an http(s) URL with no userinfo, query or fragment.
+reflex_endpoint_valid() { [[ ${#1} -le 200 && "$1" =~ $REFLEX_ENDPOINT_RE ]]; }
+
+# reflex_api_from_path <url> -> decisions | systemone | chat, or nothing
+reflex_api_from_path() {
+  case "${1%/}" in
+    */systemone)        printf 'systemone' ;;
+    */decisions)        printf 'decisions' ;;
+    */chat/completions) printf 'chat' ;;
+  esac
+}
+
+# Sets _REFLEX_ENDPOINT (the URL, or "default"), _REFLEX_ENDPOINT_SRC,
+# _REFLEX_CUSTOM (0|1), _REFLEX_API, _REFLEX_API_SRC and _REFLEX_URL (what is
+# POSTed to). An invalid stored value degrades to the default and says so.
+reflex_endpoint_resolve() {
+  local e a base="${FIVEDIVE_REFLEX_OPENROUTER_URL:-https://openrouter.ai/api}"
+  e=$(_reflex_box_get reflex_endpoint); a=$(_reflex_box_get reflex_api)
+  _REFLEX_CUSTOM=0; _REFLEX_ENDPOINT=default; _REFLEX_ENDPOINT_SRC="default (OpenRouter)"
+  if [[ -n "$e" ]]; then
+    if reflex_endpoint_valid "$e"; then
+      _REFLEX_CUSTOM=1; _REFLEX_ENDPOINT="$e"; _REFLEX_ENDPOINT_SRC="box setting"
+    else
+      _REFLEX_ENDPOINT_SRC="default (OpenRouter; the box's endpoint is not a valid URL and was ignored)"
+    fi
+  fi
+  _REFLEX_API=""; _REFLEX_API_SRC=""
+  case "$a" in
+    decisions|chat) _REFLEX_API="$a"; _REFLEX_API_SRC="box setting" ;;
+    systemone) (( _REFLEX_CUSTOM )) && { _REFLEX_API="$a"; _REFLEX_API_SRC="box setting"; } ;;
+  esac
+  if [[ -z "$_REFLEX_API" ]] && (( _REFLEX_CUSTOM )); then
+    _REFLEX_API=$(reflex_api_from_path "$e"); [[ -n "$_REFLEX_API" ]] && _REFLEX_API_SRC="from the endpoint's path"
+  fi
+  [[ -n "$_REFLEX_API" ]] || { _REFLEX_API=decisions; _REFLEX_API_SRC="default"; }
+  if (( _REFLEX_CUSTOM )); then _REFLEX_URL="$e"
+  elif [[ "$_REFLEX_API" == chat ]]; then _REFLEX_URL="$base/v1/chat/completions"
+  else _REFLEX_URL="$base/alpha/decisions"
+  fi
+}
+
+# reflex_configured -> true | false | unknown. Can this box make a call at all?
+# A custom endpoint is configured by being named (its key is optional); the
+# OpenRouter default needs its key, and "unknown" is a caller that cannot see
+# /etc/5dive. The dashboard's "set up reflex" card reads this, not `key`.
+reflex_configured() {
+  reflex_endpoint_resolve
+  if (( _REFLEX_CUSTOM )); then printf 'true'; return 0; fi
+  case "$(reflex_key_status)" in set) printf 'true' ;; unset) printf 'false' ;; *) printf 'unknown' ;; esac
+}
+
+# reflex_adapter_name -> openrouter | endpoint, the receipt's backend.adapter.
+reflex_adapter_name() { reflex_endpoint_resolve; (( _REFLEX_CUSTOM )) && printf 'endpoint' || printf 'openrouter'; }
+
+# reflex_endpoint_probe [<timeout s>] -> one JSON object: GET <origin>/health.
+# Only the reachability of the endpoint's host is claimed, plus the server's own
+# word when it answers JSON (Laya's /health says {status, loaded, device}).
+reflex_endpoint_probe() {
+  local to="${1:-3}" origin code ms t0 d body="null"
+  reflex_endpoint_resolve
+  [[ "$_REFLEX_URL" =~ ^(https?://[^/]+) ]] || { jq -cn '{probed:false, ok:false, error:"no url"}'; return 0; }
+  origin="${BASH_REMATCH[1]}"
+  command -v curl >/dev/null 2>&1 || { jq -cn '{probed:false, ok:false, error:"curl not installed"}'; return 0; }
+  d=$(mktemp -d "${TMPDIR:-/tmp}/reflex-probe.XXXXXX") || return 0
+  t0=$(date +%s%N)
+  code=$(curl -sS -m "$to" -o "$d/raw" -w '%{http_code}' "$origin/health" 2>/dev/null) || code="${code:-000}"
+  ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  jq -e 'type=="object"' "$d/raw" >/dev/null 2>&1 && body=$(head -c 2000 "$d/raw" | jq -c '{status, loaded, device} | with_entries(select(.value != null)) | if . == {} then null else . end' 2>/dev/null || printf null)
+  rm -rf "$d"
+  jq -cn --arg u "$origin/health" --arg c "${code:-000}" --argjson ms "$ms" --argjson b "${body:-null}" \
+    '{probed:true, url:$u, http:($c|tonumber? // 0), ok:($c|test("^2")), ms:$ms, server:$b}'
 }
 
 # The env is read on every call (a caller may set it for one command); the box
@@ -384,9 +497,17 @@ reflex_shadow_model() {
   local f="${BOX_CONFIG:-${STATE_DIR:-/var/lib/5dive}/box.json}" m=""
   [[ -r "$f" ]] || return 1
   m=$(jq -r '.reflex_model // empty | strings' "$f" 2>/dev/null) || return 1
-  [[ -n "$m" && ${#m} -le 100 && "$m" =~ ^[A-Za-z0-9._~-]+/[A-Za-z0-9._:-]+$ ]] || return 1
-  if [[ -z "${FIVEDIVE_REFLEX_SHADOW_BACKEND:-}" ]]; then
-    [[ -r "${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5dive/reflex-openrouter.key}" ]] || return 1
+  # DIVE-4932: a custom endpoint names its models its own way, and needs no key
+  # (its own bearer is optional); OpenRouter still needs both the id shape and
+  # the key.
+  reflex_endpoint_resolve
+  if (( _REFLEX_CUSTOM )); then
+    [[ -n "$m" && ${#m} -le 100 && "$m" =~ $REFLEX_MODEL_ANY_RE ]] || return 1
+  else
+    [[ -n "$m" && ${#m} -le 100 && "$m" =~ ^[A-Za-z0-9._~-]+/[A-Za-z0-9._:-]+$ ]] || return 1
+    if [[ -z "${FIVEDIVE_REFLEX_SHADOW_BACKEND:-}" ]]; then
+      [[ -r "${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5dive/reflex-openrouter.key}" ]] || return 1
+    fi
   fi
   printf '%s' "$m"
 }
@@ -476,7 +597,7 @@ _reflex_shadow_one() {
   if [[ -n "${FIVEDIVE_REFLEX_SHADOW_BACKEND:-}" ]]; then
     timeout "$to" bash -c "$FIVEDIVE_REFLEX_SHADOW_BACKEND" <"$tmp/req" >"$tmp/resp" 2>/dev/null; rc=$?
   else
-    _reflex_openrouter_decide "$model" "$to" <"$tmp/req" >"$tmp/resp" 2>/dev/null; rc=$?
+    _reflex_endpoint_decide "$model" "$to" <"$tmp/req" >"$tmp/resp" 2>/dev/null; rc=$?
   fi
   resp=$(head -n1 "$tmp/resp" 2>/dev/null)
   rm -rf "$tmp"
@@ -497,45 +618,74 @@ _reflex_shadow_one() {
     confidence="$([[ -z "$err" ]] && jq -c '.confidence // null' <<<"$resp" || echo null)" \
     probabilities="$([[ -z "$err" ]] && jq -c '.probabilities // null' <<<"$resp" || echo null)" \
     probability_source="$([[ -z "$err" ]] && jq -r '.probability_source // empty' <<<"$resp")" \
-    backend="$(jq -cn --arg m "$model" --arg a "$([[ -n "${FIVEDIVE_REFLEX_SHADOW_BACKEND:-}" ]] && echo command || echo openrouter)" \
-                 '{adapter: $a, model: $m}')" \
+    backend="$(jq -cn --arg m "$model" --arg a "$([[ -n "${FIVEDIVE_REFLEX_SHADOW_BACKEND:-}" ]] && echo command || reflex_adapter_name)" \
+                 --arg api "$(reflex_endpoint_resolve; printf '%s' "$_REFLEX_API")" \
+                 '{adapter: $a, model: $m} + (if $a == "command" then {} else {api: $api} end)')" \
     effect="$(jq -cn --arg at "$(jq -r '.asked' <<<"$g")" --arg e "$err" --argjson ans "$answered" --argjson to "$to" \
                 '{gate_asked_at: $at, acted: false, answered_before_shadow: $ans, time_box_s: $to}
                  + (if $e == "" then {} else {error: $e} end)')" \
     actor="reflex" authority="heartbeat"
 }
 
-# _reflex_openrouter_decide <model> <timeout s> — one request on stdin, one
-# response on stdout, through OpenRouter's Decisions API. The same mapping as
+# _reflex_endpoint_decide <model> <timeout s> — one request on stdin, one
+# response on stdout, through the box's endpoint (DIVE-4932; OpenRouter's
+# Decisions API when none is set). The same mapping as
 # scripts/reflex-openrouter-backend.sh (the replay's reference backend), inlined
-# because that script is not installed on a box. The key reaches curl through a
-# mode-600 header file, never argv. A request may name its own `instructions` and
-# `criteria` (DIVE-4928, `reflex login-marker`); a gate request names neither and
-# is sent exactly as before.
-_reflex_openrouter_decide() {
-  local model="$1" to="$2" key_file="${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5dive/reflex-openrouter.key}"
-  local base="${FIVEDIVE_REFLEX_OPENROUTER_URL:-https://openrouter.ai/api}" key d code
-  key=$(tr -d ' \r\n' <"$key_file" 2>/dev/null)
-  [[ -n "$key" ]] || { jq -cn '{choice:null, error:"no_key"}'; return 0; }
+# because that script is not installed on a box. A key reaches curl through a
+# mode-600 header file, never argv: the OpenRouter key on OpenRouter only, the
+# endpoint's own bearer (optional) on a custom endpoint. A request may name its
+# own `instructions` and `criteria` (DIVE-4928, `reflex login-marker`); a gate
+# request names neither and is sent exactly as before.
+_reflex_endpoint_decide() {
+  local model="$1" to="$2" key="" key_file d code
+  reflex_endpoint_resolve
+  local url="$_REFLEX_URL" api="$_REFLEX_API"
+  if (( _REFLEX_CUSTOM )); then
+    key_file=$(_reflex_endpoint_key_file)
+    [[ -r "$key_file" ]] && key=$(tr -d ' \r\n' <"$key_file" 2>/dev/null)
+  else
+    key_file="${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5dive/reflex-openrouter.key}"
+    key=$(tr -d ' \r\n' <"$key_file" 2>/dev/null)
+    [[ -n "$key" ]] || { jq -cn '{choice:null, error:"no_key"}'; return 0; }
+  fi
   d=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/reflex-or.XXXXXX") || return 1
-  printf 'Authorization: Bearer %s\n' "$key" >"$d/auth"; key=""
-  jq -c --arg m "$model" '
+  : >"$d/auth"
+  [[ -n "$key" ]] && printf 'Authorization: Bearer %s\n' "$key" >"$d/auth"; key=""
+  cat >"$d/req"
+  jq -c --arg m "$model" --arg api "$api" '
     (.options // []) as $o | (.state // {}) as $s
     | ((($s.gate.options // {}) + {approve: "Approve.", deny: "Deny.", other: "Some other, free-text answer."})) as $d
-    | {model: $m, state: $s,
-       questions: {decision: {type: "choice",
-         instructions: (.instructions // "A person was asked to answer a gate on this task. Predict which answer they gave."),
-         criteria: (.criteria // ($o | map({key: ., value: ($d[.] // null)}) | from_entries))}}}' >"$d/body" || { rm -rf "$d"; return 1; }
-  code=$(timeout "$to" curl -sS -m "$to" -o "$d/raw" -w '%{http_code}' -X POST "$base/alpha/decisions" \
+    | (.instructions // "A person was asked to answer a gate on this task. Predict which answer they gave.") as $i
+    | (.criteria // ($o | map({key: ., value: ($d[.] // null)}) | from_entries)) as $c
+    | if $api == "chat" then
+        {model: $m, temperature: 0, max_tokens: 24,
+         messages: [{role: "system", content: "You are a decision function. Reply with exactly one option id from the options object, and nothing else: no quotes, no explanation."},
+                    {role: "user", content: ({question: $i, options: $c, state: $s} | tojson)}]}
+      else
+        {model: $m, state: $s, questions: {decision: {type: "choice", instructions: $i, criteria: $c}}}
+      end' "$d/req" >"$d/body" || { rm -rf "$d"; return 1; }
+  code=$(timeout "$to" curl -sS -m "$to" -o "$d/raw" -w '%{http_code}' -X POST "$url" \
            -H @"$d/auth" -H 'Content-Type: application/json' --data-binary @"$d/body" 2>/dev/null); local rc=$?
   if (( rc == 124 || rc == 28 )); then rm -rf "$d"; return 124; fi
   if [[ "$code" != 2?? ]]; then
     jq -cn --arg c "${code:-000}" '{choice:null, error:("http " + $c)}'; rm -rf "$d"; return 0
   fi
-  jq -c '(.answers.decision // {}) as $x
-    | {choice: ($x.choice // null), confidence: ($x.confidence // null),
-       probabilities: ($x.probabilities // null),
-       probability_source: (if $x.probabilities then "head" else null end)}' "$d/raw" 2>/dev/null \
+  jq -c --arg api "$api" --argjson opts "$(jq -c 'if (.criteria | type) == "object" then (.criteria | keys_unsorted) else (.options // []) end' "$d/req" 2>/dev/null || echo '[]')" '
+    if $api == "chat" then
+      ((.choices[0].message.content // "") | gsub("^[^A-Za-z0-9_-]+|[^A-Za-z0-9_-]+$"; "")) as $t
+      | ([ $t | scan("[A-Za-z0-9_-]+") ]) as $toks
+      | ([ $opts[] | select(. as $o | $toks | index([$o]) != null) ]) as $hits
+      | {choice: (if ($opts | index([$t])) != null then $t elif ($hits|length) == 1 then $hits[0] elif $t == "" then null else $t end),
+         confidence: null, probabilities: null, probability_source: null}
+    else
+      (.answers.decision // {}) as $x
+      | {choice: ($x.choice // null), confidence: ($x.confidence // null),
+         probabilities: ($x.probabilities // null),
+         probability_source: (if $x.probabilities then "head" else null end)}
+    end' "$d/raw" 2>/dev/null \
     || jq -cn '{choice:null, error:"unparseable response"}'
   rm -rf "$d"
 }
+
+# The pre-DIVE-4932 name. On a box with no endpoint set it is the same call.
+_reflex_openrouter_decide() { _reflex_endpoint_decide "$@"; }
