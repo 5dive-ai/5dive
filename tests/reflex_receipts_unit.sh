@@ -16,10 +16,20 @@
 #     from their first timestamp (nothing counted twice), the fake backend scores
 #     deterministically, and a backend that answers badly (a choice outside the
 #     options, a missing line) is scored INVALID and never silently dropped.
+#  E. What a replay REQUEST may carry (DIVE-4910): never a signal read off the
+#     outcome (matched_recommend, answered_by), with a control that the leak
+#     predicate fires when nothing is stripped; no title/ask/option text or body
+#     by default; titles, gate ask/options and seat roles only under
+#     --inputs=titles, and a body never; route options are the seats that can
+#     take work now (no grader clone, no stopped seat).
+#  F. scripts/reflex-openrouter-backend.sh against a fake curl: Jev's decisions
+#     answer maps to confidence/probabilities, concurrent calls keep request
+#     order, the key never reaches argv, a chat model's reply maps to an option,
+#     and a failed call or a missing key is one INVALID line per case.
 #
 # Runs against a real sqlite board in a throwaway STATE_DIR, never the live one.
-# No root, no network.
-# TIER: core — 5.7s measured on the 5dive control plane (agent-dev seat, worktree cli-4866-dev, 2026-09-23, slowest of 3: 5.67/5.73/4.79s).
+# No root, no network (section F's curl is a stand-in).
+# TIER: core — 8.8s measured on the 5dive control plane (agent-dev seat, worktree cli-4910-dev, 2026-09-24, slowest of 3: 7.63/8.77/8.74s).
 # Run: bash tests/reflex_receipts_unit.sh
 set -uo pipefail
 
@@ -224,6 +234,119 @@ check "a live receipt replaces the history rebuilt at or after its timestamp" \
 
 OUT=$(_reflex_log --policy=stuck 2>/dev/null)
 check "reflex log lists the receipt" "$(grep -q 'stuck.*DIVE-4.*reclaim' <<<"$OUT"; echo $?)" "$OUT"
+
+echo "── E: what a replay REQUEST may carry (DIVE-4910) ───────────────────────"
+
+# Text a request must not carry by default, planted where the replay could read it.
+for i in 1 2 3 4; do db "UPDATE tasks SET title='TITLE$i route me', body='BODYSECRET$i' WHERE id=$i;"; done
+db "UPDATE gate_history SET ask='ASKTEXT which way' WHERE task_id IN (1,2);"
+# The roster now holds a grader clone and a stopped seat; neither can take work.
+printf '{"agents":{"main":{},"dev":{},"dev2":{"desiredState":"stopped"},"quinn":{},"gr-quinn-1":{}}}\n' >"$REGISTRY"
+db "INSERT INTO agents_org (name, role) VALUES ('dev', 'Lead Engineer (backend)');"
+_TASK_ROSTER_STATE=""; _TASK_ROSTER=""
+leak_q='select(.policy=="gate-answer") | .request.state.signals | (has("matched_recommend") or has("answered_by"))'
+
+_reflex_replay --since=7d --backend=fake:echo --dump="$TMP/d0.jsonl" --json >/dev/null 2>&1
+check "no gate-answer request carries an outcome-derived signal (matched_recommend, answered_by)" \
+  "$([[ "$(jq -c "$leak_q" "$TMP/d0.jsonl" | sort -u)" == false ]]; echo $?)" "$(jq -c "$leak_q" "$TMP/d0.jsonl" | sort | uniq -c)"
+check "the CASE still carries them, so the recommend-match rate is still scored" \
+  "$(jq -e -s '[.[] | select(.policy=="gate-answer") | .signals | has("matched_recommend") and has("answered_by")] | all and length==3' "$TMP/d0.jsonl" >/dev/null; echo $?)"
+# The arm's own control: with the strip list emptied (the pre-fix request), the
+# same predicate must find the leak, or the arm above is proving nothing.
+( _REFLEX_OUTCOME_FIELDS='[]'; _reflex_replay --since=7d --backend=fake:echo --dump="$TMP/dm.jsonl" --json >/dev/null 2>&1 )
+check "control: with nothing stripped the leak predicate fires on every gate case" \
+  "$([[ "$(jq -c "$leak_q" "$TMP/dm.jsonl" | sort -u)" == true ]]; echo $?)" "$(jq -c "$leak_q" "$TMP/dm.jsonl" | sort | uniq -c)"
+check "default (--inputs=none): no title, ask, option text or body in any request" \
+  "$(! jq -c '.request' "$TMP/d0.jsonl" | grep -qE 'TITLE|ASKTEXT|Yes do it|No wait|BODYSECRET' \
+     && jq -e -s 'map(.request.state | has("title") or has("gate") or has("lanes")) | any | not' "$TMP/d0.jsonl" >/dev/null; echo $?)" \
+  "$(jq -c '.request' "$TMP/d0.jsonl" | grep -E 'TITLE|ASKTEXT|Yes do it|BODYSECRET' | head -2)"
+check "route options are the seats that can take work now: no grader clone, no stopped seat" \
+  "$(jq -e -s '[.[] | select(.policy=="task-route") | .request.options] | length==2 and all(. == ["dev","main","quinn"])' "$TMP/d0.jsonl" >/dev/null; echo $?)" \
+  "$(jq -c 'select(.policy=="task-route") | .request.options' "$TMP/d0.jsonl")"
+J=$(_reflex_replay --since=7d --backend=fake:echo --json --policy=task-route 2>/dev/null)
+check "an outcome outside the options is counted as the ceiling (dev2 delivered row 2, and is stopped)" \
+  "$(jq -e '.policies[0].resolved==2 and .policies[0].outcome_in_options==1' <<<"$J" >/dev/null; echo $?)" "$J"
+
+_reflex_replay --since=7d --backend=fake:echo --inputs=titles --dump="$TMP/d1.jsonl" --json >/dev/null 2>&1
+check "--inputs=titles: every request carries its row's title" \
+  "$(jq -e -s 'map(.request.state.title == "TITLE\(.task_id) route me") | all and length > 0' "$TMP/d1.jsonl" >/dev/null; echo $?)" \
+  "$(jq -c '.request.state | {task, title}' "$TMP/d1.jsonl" | head -3)"
+check "--inputs=titles: a gate request carries the ask, the option texts and the recommendation" \
+  "$(jq -e -s '[.[] | select(.policy=="gate-answer" and .task_id==1) | .request.state.gate]
+                | .[0] == {ask:"ASKTEXT which way", options:{opt1:"Yes do it", opt2:"No wait"}, recommend:"Yes do it"}' "$TMP/d1.jsonl" >/dev/null; echo $?)" \
+  "$(jq -c 'select(.policy=="gate-answer") | .request.state.gate' "$TMP/d1.jsonl")"
+check "--inputs=titles: a route request carries each seat's role" \
+  "$(jq -e -s '[.[] | select(.policy=="task-route") | .request.state.lanes][0] == {dev:"Lead Engineer (backend)", main:null, quinn:null}' "$TMP/d1.jsonl" >/dev/null; echo $?)" \
+  "$(jq -c 'select(.policy=="task-route") | .request.state.lanes' "$TMP/d1.jsonl" | head -1)"
+check "--inputs=titles: never a body, and still no outcome-derived signal" \
+  "$(! grep -q BODYSECRET "$TMP/d1.jsonl" && [[ "$(jq -c "$leak_q" "$TMP/d1.jsonl" | sort -u)" == false ]]; echo $?)"
+check "--inputs rejects anything but none|titles" \
+  "$( ( _reflex_replay --since=7d --inputs=bodies --json >/dev/null 2>&1 ); [[ $? -ne 0 ]]; echo $?)"
+
+echo "── F: the reference OpenRouter backend, against a fake curl (DIVE-4910) ──"
+
+# A curl stand-in: logs its argv, sleeps a random beat so calls finish out of
+# order, and answers from the request it was sent. confidence encodes the case's
+# task number, so a response written onto the wrong line is visible.
+mkdir -p "$TMP/fakebin"
+cat >"$TMP/fakebin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$FAKE_CURL_LOG"
+out="" body="" url=""
+while (( $# )); do
+  case "$1" in
+    -o) out="$2"; shift ;;
+    --data-binary) body="${2#@}"; shift ;;
+    http*) url="$1" ;;
+  esac
+  shift
+done
+cp "$body" "$FAKE_CURL_LOG.body.$(basename "$body")"
+sleep "0.0$((RANDOM % 9))"
+if [[ "${FAKE_CURL_MODE:-}" == 500 ]]; then echo '{"error":{"code":500}}' >"$out"; printf 500; exit 0; fi
+n=$(jq -r '.state.task // "DIVE-0" | ltrimstr("DIVE-")' "$body")
+if [[ "$url" == */alpha/decisions ]]; then
+  jq -c --argjson n "$n" '.questions.decision.criteria | keys_unsorted | last as $k
+    | {model: "typesafe/jev-1.13-20260917", answers: {decision: {type: "choice", choice: $k,
+       confidence: ($n / 1000), probabilities: {($k): 0.9}}}, usage: {cost: 0.00001}}' "$body" >"$out"
+else
+  jq -c '.messages[1].content | fromjson | .options | keys_unsorted | last as $k
+    | {model: "cheap/chat", choices: [{message: {content: "  `\($k)`. "}}], usage: {cost: 0.00002}}' "$body" >"$out"
+fi
+printf 200
+EOF
+chmod +x "$TMP/fakebin/curl"
+printf 'sk-or-FAKEKEY123\n' >"$TMP/or.key"; chmod 600 "$TMP/or.key"
+BK="bash $PWD/scripts/reflex-openrouter-backend.sh"
+export FAKE_CURL_LOG="$TMP/curl.log" FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE="$TMP/or.key"
+PATH="$TMP/fakebin:$PATH" _reflex_replay --since=7d --inputs=titles --backend="$BK --concurrency=4" \
+  --dump="$TMP/f1.jsonl" --json >"$TMP/f1.json" 2>/dev/null
+check "Jev (decisions API): every case answered validly, with confidence/probabilities mapped" \
+  "$(jq -e -s 'length==8 and all(.valid and .response.probability_source=="head" and (.response.probabilities|type)=="object")' "$TMP/f1.jsonl" >/dev/null; echo $?)" \
+  "$(jq -c '{task_id, valid, response}' "$TMP/f1.jsonl" | head -3)"
+check "concurrent calls still land on their own line (confidence == the case's task / 1000)" \
+  "$(jq -e -s 'all(.response.confidence == (.task_id / 1000))' "$TMP/f1.jsonl" >/dev/null; echo $?)" \
+  "$(jq -c '[.task_id, .response.confidence]' "$TMP/f1.jsonl" | tr '\n' ' ')"
+check "the request sent is Jev's choice question; the default drops state.current" \
+  "$(for f in "$TMP"/curl.log.body.*; do jq -e '.model=="typesafe/jev-1.13" and .questions.decision.type=="choice"
+       and (.state|has("current")|not) and (.state.signals|has("matched_recommend")|not)' "$f" >/dev/null || exit 1; done; echo $?)"
+check "the key never reaches curl's argv (it goes in through a header file)" \
+  "$(! grep -q FAKEKEY "$TMP/curl.log" && grep -q -- '-H @' "$TMP/curl.log"; echo $?)" "$(head -1 "$TMP/curl.log")"
+rm -f "$TMP"/curl.log*
+PATH="$TMP/fakebin:$PATH" _reflex_replay --since=7d --policy=stuck --backend="$BK --model=cheap/chat" \
+  --dump="$TMP/f2.jsonl" --json >/dev/null 2>/dev/null
+check "a chat model: a padded one-option reply maps to that option, over the chat API" \
+  "$(jq -e -s 'length==1 and all(.valid and .response.choice=="reclaim" and .response.confidence==null)' "$TMP/f2.jsonl" >/dev/null \
+     && grep -q 'v1/chat/completions' "$TMP/curl.log"; echo $?)" "$(cat "$TMP/f2.jsonl")"
+FAKE_CURL_MODE=500 PATH="$TMP/fakebin:$PATH" _reflex_replay --since=7d --backend="$BK --retries=0" \
+  --dump="$TMP/f3.jsonl" --json >/dev/null 2>/dev/null
+FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE="$TMP/none.key" PATH="$TMP/fakebin:$PATH" \
+  _reflex_replay --since=7d --backend="$BK" --dump="$TMP/f4.jsonl" --json >/dev/null 2>/dev/null
+check "a failing call and a missing key are one error line per case, scored INVALID" \
+  "$(jq -e -s 'length==8 and all((.valid|not) and (.response.error|test("http 500")))' "$TMP/f3.jsonl" >/dev/null \
+     && jq -e -s 'length==8 and all((.valid|not) and (.response.error|test("no OpenRouter key")))' "$TMP/f4.jsonl" >/dev/null; echo $?)" \
+  "$(head -1 "$TMP/f3.jsonl" | jq -c .response) $(head -1 "$TMP/f4.jsonl" | jq -c .response)"
+unset FAKE_CURL_LOG FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE
 
 echo
 echo "reflex receipts: $PASS passed, $FAIL failed"
