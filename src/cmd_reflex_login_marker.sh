@@ -239,7 +239,8 @@ _reflex_login_marker() {
   [[ "$url" =~ ^https?://[^[:space:]]{1,500}$ ]] || fail "$E_VALIDATION" "--url must be an http(s) URL"
   # Shadow is structural: the proposal may never land where the browser loads adapters from.
   if [[ -n "$out" ]]; then
-    case "/$(dirname -- "$out")/" in
+    # Resolve symlinks first: a link that points into .adapters/ is still .adapters/.
+    case "/$(dirname -- "$(realpath -m -- "$out")")/" in
       */.adapters/*|*/adapters/*) fail "$E_VALIDATION" "--out may not be an adapter directory: this is a shadow proposal, and an adapter is trusted only once a person has measured it on both halves" ;;
     esac
   fi
@@ -252,7 +253,10 @@ _reflex_login_marker() {
     fi
   done
   _REFLEX_LM_OUT_MORE=("${fo_more[@]}")
-  if grep -qiE "$_REFLEX_LM_CHALLENGE" "$fo" || grep -qiE "$_REFLEX_LM_CHALLENGE_TITLE" <<<"$title"; then
+  local challenge=false
+  if grep -qiE "$_REFLEX_LM_CHALLENGE" "$fo"; then challenge=true; fi
+  if grep -qiE "$_REFLEX_LM_CHALLENGE_TITLE" <<<"$title"; then challenge=true; fi
+  if [[ "$challenge" == true ]]; then
     fail "$E_VALIDATION" "the signed-out render is a challenge page (captcha or verification), not a sign-in page. Nothing was proposed. Render it again from a browser the site does not challenge."
   fi
   local model=""

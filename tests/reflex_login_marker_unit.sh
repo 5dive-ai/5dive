@@ -175,6 +175,10 @@ lm example.test --logged-out="$OUT" --url=https://example.test/s --backend=fake:
 lm example.test --logged-out="$OUT" --url=https://example.test/s --backend=fake:first --out="$TMP/pkg/adapters/example.test.json" >/dev/null; r2=$?
 (( r1 == E_VALIDATION && r2 == E_VALIDATION )) && [[ ! -e "$TMP/seat/.adapters/example.test.json" && ! -e "$TMP/pkg/adapters/example.test.json" ]]
 check "L6 --out into .adapters/ or adapters/ is refused and writes nothing" $?
+ln -s "$TMP/seat/.adapters" "$TMP/adlink"
+lm example.test --logged-out="$OUT" --url=https://example.test/s --backend=fake:first --out="$TMP/adlink/example.test.json" >/dev/null; r3=$?
+(( r3 == E_VALIDATION )) && [[ ! -e "$TMP/seat/.adapters/example.test.json" ]]
+check "L6 --out through a symlink into .adapters/ is refused and writes nothing" $?
 lm example.test --logged-out="$OUT" --logged-in="$IN" --url=https://example.test/s --backend=fake:first --out="$TMP/proposal.json" >/dev/null
 jq -e '.site == "example.test" and (.probe.logged_out_when_dom_matches | type) == "string" and .actions == {}' "$TMP/proposal.json" >/dev/null
 check "L6 --out elsewhere writes the proposed adapter" $?
@@ -279,7 +283,7 @@ if cmp -s "$MUT" "$SRC/cmd_reflex_login_marker.sh"; then bad_t "M1 the mutant di
 fi
 ( l1_arm ); check "M1 control: the unmutated source stays green on L1" $?
 MUT2="$TMP/mut2.sh"
-sed 's/if grep -qiE "\$_REFLEX_LM_CHALLENGE" "\$fo" || grep -qiE "\$_REFLEX_LM_CHALLENGE_TITLE" <<<"\$title"; then/if false; then/' \
+sed 's/^  if \[\[ "\$challenge" == true \]\]; then$/  if false; then/' \
   "$SRC/cmd_reflex_login_marker.sh" >"$MUT2"
 if cmp -s "$MUT2" "$SRC/cmd_reflex_login_marker.sh"; then bad_t "M2 the mutant did not apply"; else
   ( source "$MUT2"; l5_arm ); MRC=$?
