@@ -76,7 +76,7 @@ check "the key is not in box.json" "$(grep -qF "$SECRET" "$BOX_CONFIG"; [[ $? -n
 
 echo "── NOLEAK ──────────────────────────────────────────────────────────────"
 noleak() { # <label> <output>
-  if grep -qF "$SECRET" <<<"$2" || grep -qF "${SECRET:10:12}" <<<"$2"; then bad_t "NOLEAK: $1" "key material in output"
+  if grep -qF -e "$SECRET" -e "${SECRET:10:12}" <<<"$2"; then bad_t "NOLEAK: $1" "key material in output"
   else ok_t "NOLEAK: $1"; fi
 }
 noleak "the set's own output" "$SET_OUT"
@@ -97,7 +97,7 @@ cfg reflex-receipts=on >/dev/null
 E=$( ( export FIVEDIVE_REFLEX_RECEIPTS=0; JSON_MODE=1; cmd_box_config ) 2>/dev/null)
 check "FIVEDIVE_REFLEX_RECEIPTS=0 beats reflex-receipts=on" "$([[ "$(jq -r .data.reflex_receipts <<<"$E")" == off ]]; echo $?)"
 check "config names the environment as the source" \
-  "$(jq -r .data.reflex_receipts_source <<<"$E" | grep -q '^FIVEDIVE_REFLEX_RECEIPTS=0'; echo $?)"
+  "$([[ "$(jq -r .data.reflex_receipts_source <<<"$E")" == FIVEDIVE_REFLEX_RECEIPTS=0* ]]; echo $?)"
 E1=$( ( export FIVEDIVE_REFLEX_RECEIPTS=1; cfg reflex-receipts=off >/dev/null; JSON_MODE=1; cmd_box_config ) 2>/dev/null)
 check "FIVEDIVE_REFLEX_RECEIPTS=1 beats reflex-receipts=off" "$([[ "$(jq -r .data.reflex_receipts <<<"$E1")" == on ]]; echo $?)"
 # Behaviour, not just the readout: the box setting stops a real receipt.
