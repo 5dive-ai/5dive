@@ -153,6 +153,7 @@ LAZY_FILES=(
   src/cmd_trigger.sh
   src/cmd_trace.sh
   src/cmd_reflex.sh
+  src/cmd_reflex_login_marker.sh
   src/cmd_run.sh
   src/cmd_org.sh
   src/cmd_human.sh
