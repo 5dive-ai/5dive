@@ -2282,6 +2282,50 @@ _sup_cli_check() {
   _SUP_CLI_STALE="$stale"
 }
 
+# DIVE-3968 — the Codex rollout, joined into the three values the classifier and
+# the park already consume. Pure: measurement + clock in, no db, no fleet.
+#
+#   <codex_quota_json> <now> <pane_excerpt> <pane_deadline> <pane_epoch> <account_wall>
+#   -> "<deadline>\x1f<epoch>\x1f<account_wall>"
+#
+# THE PANE IS NOT OVERRULED BY ABSENCE. `missing` (no rollout, or no rate-limit
+# reading in it — a codex seat on a non-ChatGPT provider) returns the pane's own
+# three values untouched. Otherwise, first-hand beats scrollback:
+#   exhausted  → `live` + the window's reset epoch (the park keys to it: this is
+#                the 2026-09-14 fix — "7:00 AM" left the park on its 6h cap), and
+#                the account wall is named even when the pane has scrolled, so
+#                the seat classifies `quota-exhausted` off a record, not a scrape.
+#   recovered  → `lapsed` + that same epoch: the reset HAS passed. A past epoch
+#                is an answer (DIVE-4328) — the park reads it and ends.
+#   healthy / near-limit, newest turn served (no error) → a pane refusal still on
+#                screen predates a turn the provider served, so it is scrollback:
+#                `lapsed`, epoch = that turn. A turn that FAILED some other way
+#                (a provider credit wall, a network error) proves nothing about
+#                the pane and leaves it alone.
+_sup_codex_quota_join() {
+  local m="${1:-}" now="${2:-}" excerpt="${3:-}" dl="${4:-unknown}" ep="${5:-}" wall="${6:-}"
+  local st win pct reset asof note terr tat
+  if [[ -n "$m" ]] && declare -f codex_quota_state >/dev/null 2>&1; then
+    IFS=$'\037' read -r st win pct reset asof note <<<"$(codex_quota_state "$m" "$now")"
+    case "$st" in
+      exhausted)
+        if [[ "$reset" =~ ^[0-9]+$ ]]; then dl="live"; ep="$reset"; else dl="unknown"; ep=""; fi
+        [[ -n "$wall" ]] || wall="codex $(quota_wall_phrase "$win" "$pct" "$reset" "$now")"
+        ;;
+      recovered)
+        dl="lapsed"; ep="$reset"; wall=""
+        ;;
+      healthy|near-limit)
+        IFS=$'\t' read -r terr tat <<<"$(jq -r '[(.lastTurn.error // "ok"), (.lastTurn.at // "")] | @tsv' <<<"$m" 2>/dev/null)"
+        if [[ -n "$excerpt" && "$terr" == "ok" && "$tat" =~ ^[0-9]+$ ]]; then
+          dl="lapsed"; ep="$tat"
+        fi
+        ;;
+    esac
+  fi
+  printf '%s\x1f%s\x1f%s' "$dl" "$ep" "$wall"
+}
+
 # Pure classification decision — NO I/O, directly unit-testable (mirrors the
 # _sup_act_plan factoring the P2 ladder already uses). Takes every signal
 # _sup_agent_record collects and returns "<class>\x1f<cause>\x1f<detail>" on
@@ -2687,6 +2731,16 @@ _sup_agent_record() {
     IFS=$'\037' read -r _sw_state _sw_win _sw_pct _sw_reset _sw_age _sw_note <<<"$(quota_wall_seat "$name")"
     [[ "$_sw_state" == "exhausted" ]] && _sup_wall="$(quota_wall_phrase "$_sw_win" "$_sw_pct" "$_sw_reset")"
   fi
+  # DIVE-3968: a CODEX seat's quota is read from its own rollout, first-hand, on
+  # every tick — and it overrides the pane parse, because the pane's "try again
+  # at 7:00 AM" is only a rendering of the `resets_at` the rollout carries.
+  local codex_quota="" _cq_join
+  if [[ "$type" == "codex" ]] && declare -f codex_quota_read >/dev/null 2>&1; then
+    codex_quota=$(codex_quota_read "$home")
+    _cq_join=$(_sup_codex_quota_join "$codex_quota" "$now" "$quota_excerpt" \
+                 "$quota_deadline" "$quota_deadline_epoch" "$_sup_wall")
+    IFS=$'\x1f' read -r quota_deadline quota_deadline_epoch _sup_wall <<<"$_cq_join"
+  fi
   # DIVE-4342 it.2: one per-seat verdict out of the three probe return codes.
   # `unprobed` never invents a fault — it only refuses to let a CLEAN word be
   # printed by a caller that was never allowed to observe (see _sup_classify).
@@ -2719,6 +2773,7 @@ _sup_agent_record() {
     --arg quotaExcerpt "$quota_excerpt" \
     --arg quotaDeadline "$quota_deadline" \
     --arg quotaDeadlineEpoch "$quota_deadline_epoch" \
+    --arg codexQuota "$codex_quota" \
     --arg chanState "$chan_state" --arg chanDetail "$chan_detail" \
     --arg chanRepair "$chan_repair" --arg chanEvidence "$chan_evidence" \
     --arg promptExcerpt "$prompt_excerpt" \
@@ -2751,6 +2806,10 @@ _sup_agent_record() {
                # unknown state above). This is what a park keys to; the string
                # above says only which of three states the parse landed in.
                quotaDeadlineEpoch:(if $quotaDeadlineEpoch == "" then null else ($quotaDeadlineEpoch|tonumber) end),
+               # DIVE-3968: the rate-limit MEASUREMENT from the Codex rollout (null
+               # for every other runtime). Stored raw, never as its verdict —
+               # `codex_quota_state` classifies it against the clock of whoever reads it.
+               codexQuota:(if $codexQuota == "" then null else ($codexQuota|fromjson? // null) end),
                # DIVE-3964. `state` is the bridge handshake verdict
                # (bound|stale|mismatched|unbound|failed|absent|n/a) and `repair`
                # is what a supervisor may SAFELY do about it — never inferred

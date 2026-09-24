@@ -94,6 +94,7 @@ CORE_FILES=(
   src/lib/reap.sh
   src/lib/registry.sh
   src/lib/quota_wall.sh
+  src/lib/codex_quota.sh
   src/lib/agent_env.sh
   src/lib/verify_policy.sh
   src/lib/tasks_db.sh
