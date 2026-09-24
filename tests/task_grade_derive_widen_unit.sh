@@ -34,6 +34,8 @@
 # derived and compared as text; PART D runs bash harnesses only).
 # Run: bash tests/task_grade_derive_widen_unit.sh
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.." || exit 1
 SRC=src
