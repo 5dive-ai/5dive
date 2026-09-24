@@ -357,6 +357,14 @@ usage_agent_home() {
   printf '/home/agent-%s\n' "$agent"
 }
 
+# usage_agent_type <agent> — the registered runtime type (default claude).
+usage_agent_type() {
+  local reg
+  reg=$(registry_read 2>/dev/null) || reg=""
+  [[ -n "$reg" ]] || { printf 'claude'; return 0; }
+  jq -r --arg a "$1" '.agents[$a].type // "claude"' <<<"$reg" 2>/dev/null || printf 'claude'
+}
+
 # usage_read_ratelimits <agent> — emit a compact JSON object
 #   {asOf, fiveHourPct, fiveResetsAt, sevenDayPct, sevenResetsAt}
 # from the agent's statusline cache (the JSON Claude Code hands its
@@ -366,8 +374,17 @@ usage_agent_home() {
 # there's no readable cache or no rate_limits block: an agent that hasn't
 # rendered its statusline since boot, or a non-claude type whose CLI doesn't
 # surface Anthropic 5h/7d limits.
+#
+# DIVE-3968: a CODEX seat never writes that cache — its limits live in its
+# session rollout — so for a codex-typed seat the same shape is read from there
+# (src/lib/codex_quota.sh). The type comes from the registry, never from which
+# directories happen to exist (DIVE-4034).
 usage_read_ratelimits() {
   local agent="$1" cache mtime
+  if [[ "$(usage_agent_type "$agent")" == "codex" ]] && declare -f codex_quota_read >/dev/null 2>&1; then
+    codex_quota_ratelimits "$(codex_quota_read "$(usage_agent_home "$agent")")"
+    return 0
+  fi
   cache="$(usage_agent_home "$agent")/.claude/statusline-last.json"
   [[ -s "$cache" ]] || return 0
   mtime=$(stat -c %Y "$cache" 2>/dev/null) || return 0

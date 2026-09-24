@@ -97,6 +97,7 @@ cmd_reflex() {
   local sub="${1:-help}"; shift || true
   case "$sub" in
     log)    _reflex_log "$@" ;;
+    status) _reflex_status "$@" ;;
     replay) _reflex_replay "$@" ;;
     fake)   _reflex_fake "$@" ;;
     report) _reflex_report "$@" ;;
@@ -104,6 +105,7 @@ cmd_reflex() {
       cat <<'EOF'
 5dive reflex — decision receipts (phase 0: receipts + offline replay, no model)
 
+  5dive reflex status  [--json]      receipts on/off, decisions in 24h, model, key set?
   5dive reflex log     [--policy=<p>] [--limit=N] [--json]
   5dive reflex replay  [--since=14d|YYYY-MM-DD] [--policy=<p>]
                        [--backend=fake:echo|fake:first|fake:recommend|<command>]
@@ -119,8 +121,9 @@ A reference OpenRouter backend: scripts/reflex-openrouter-backend.sh.
 model's pick on each new gate, recorded and never acted on, against the answer
 the gate actually got, by confidence band. The shadow runs only on a box that
 set `5dive config reflex-model=` and has the key.
-Receipts are written by the decision points themselves. Set
-FIVEDIVE_REFLEX_RECEIPTS=0 to stop writing them. Nothing here changes behaviour.
+Receipts are written by the decision points themselves. Stop them with
+`5dive config reflex-receipts=off` (FIVEDIVE_REFLEX_RECEIPTS=0 in the
+environment wins over that). Nothing here changes behaviour.
 EOF
       ;;
     *) fail "$E_USAGE" "unknown reflex subcommand: $sub (try: 5dive reflex help)" ;;
@@ -174,6 +177,43 @@ _reflex_log() {
   fi
   jq -r '.[] | (.detail | fromjson? // {}) as $r
     | "\(.ts)  \($r.policy // "?")\t\($r.task // "-")\t\($r.result // "?")\t\($r.effect | tostring)"' <<<"$rows"
+}
+
+# DIVE-4915: `reflex status` — the one-glance state the dashboard banner reads.
+# Never opens the key file (presence only), and never fails on an unreadable
+# store: decisions_24h is null then, not an error, so the banner still renders.
+_reflex_last_replay_file() { printf '%s' "${STATE_DIR:-/var/lib/5dive}/reflex/last-replay.json"; }
+
+_reflex_status() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --json) JSON_MODE=1 ;;
+      *) fail "$E_USAGE" "unknown flag: $a" ;;
+    esac
+  done
+  command -v jq >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "jq is required"
+  reflex_receipts_resolve; reflex_model_resolve
+  local key; key=$(reflex_key_status)
+  local n="null"
+  if [[ -r "${TASKS_DB:-}" ]]; then
+    n=$(_reflex_sql_json "SELECT COUNT(*) AS n FROM lifecycle_events WHERE kind LIKE 'decision.%' AND ts >= datetime('now', '-1 day');" \
+        | jq -r '.[0].n // "null"' 2>/dev/null || printf 'null')
+    [[ "$n" =~ ^[0-9]+$ ]] || n="null"
+  fi
+  local last="null" lf; lf=$(_reflex_last_replay_file)
+  [[ -r "$lf" ]] && last=$(jq -c '{at, backend, decisions} | select(.at != null)' "$lf" 2>/dev/null || printf 'null')
+  [[ -n "$last" ]] || last="null"
+  local body
+  body=$(jq -nc --arg r "$_REFLEX_RECEIPTS" --arg rs "$_REFLEX_RECEIPTS_SRC" --arg m "$_REFLEX_MODEL" \
+    --arg ms "$_REFLEX_MODEL_SRC" --arg k "$key" --argjson n "$n" --argjson last "$last" \
+    '{receipts:$r, receipts_source:$rs, model:$m, model_source:$ms, key:$k, decisions_24h:$n, last_replay:$last}')
+  if (( JSON_MODE )); then printf '%s\n' "$body"; return 0; fi
+  jq -r '"receipts      \(.receipts) (\(.receipts_source))",
+    "decisions 24h \(.decisions_24h // "unknown (task store not readable)")",
+    "model         \(.model) (\(.model_source))",
+    "key           \(.key)",
+    "last replay   \(if .last_replay then "\(.last_replay.at) · \(.last_replay.decisions) decisions · \(.last_replay.backend)" else "none" end)"' <<<"$body"
 }
 
 # `reflex fake` — the deterministic backend. JSONL requests in, JSONL out.
@@ -465,6 +505,7 @@ _reflex_replay() {
     cp "$tmp/paired.jsonl" "$dump" 2>/dev/null || warn "could not write --dump file: $dump"
   fi
   rm -rf "$tmp"
+  _reflex_record_last_replay "$report"
   if (( JSON_MODE )); then
     printf '%s\n' "$report"
     return 0
@@ -588,4 +629,20 @@ _reflex_report() {
     (.would_be_wrong[] | "  \(.ident)  picked \(.pick) at \(.confidence)  answered \(.answer)\(if .answer_text then " (\(.answer_text))" else "" end)"),
     "",
     "Shadow only: no pick is ever applied. Failed calls are not scored."' <<<"$report"
+}
+
+# DIVE-4915: remember the newest replay's headline for `reflex status`. Best
+# effort: STATE_DIR is root-written, so an unprivileged replay records nothing,
+# and that must never fail the replay itself. The backend is recorded as a LABEL,
+# not the command line: the script's basename (past any bash/sh/env) plus its
+# --model, because a command line carries paths and flags nobody needs to see.
+_reflex_record_last_replay() {
+  local f d; f=$(_reflex_last_replay_file); d=$(dirname "$f")
+  ( mkdir -p "$d" && jq -c '{at: .generated_at,
+        backend: (.backend | split(" ") | map(select(length > 0)) as $t
+          | (([ $t[] | select(test("^(bash|sh|env|sudo)$") | not) ][0] // "") | split("/") | last)
+            + ([ $t[] | select(startswith("--model=")) | " " + .[8:] ][0] // "") | .[0:120]),
+        decisions: ([.policies[].cases] | add // 0)}' <<<"$1" > "$f.tmp.$$" && mv "$f.tmp.$$" "$f" ) 2>/dev/null \
+    || rm -f "$f.tmp.$$" 2>/dev/null
+  return 0
 }

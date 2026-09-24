@@ -47,9 +47,77 @@
 # harness that sources only part of src/ has no reflex_receipt at all, and bash
 # turns that into rc=127 on a verb that already succeeded.
 #
-# Off switch: FIVEDIVE_REFLEX_RECEIPTS=0 writes nothing.
+# Off switch: FIVEDIVE_REFLEX_RECEIPTS=0 writes nothing, and so does
+# `5dive config reflex-receipts=off` (DIVE-4915). The env wins over the box.
 
 REFLEX_RECEIPT_SCHEMA=1
+
+# ── DIVE-4915: reflex's box settings ────────────────────────────────────────
+#
+# Three settings, each with the SOURCE it came from, so `5dive config` and the
+# dashboard can say why a value is what it is:
+#   receipts  env FIVEDIVE_REFLEX_RECEIPTS (0 = off, anything else = on), then
+#             box.json .reflex_receipts (on|off), then on.
+#   model     box.json .reflex_model, then REFLEX_MODEL_DEFAULT. The reference
+#             backend's --model flag still wins for a single replay.
+#   key       set / unset / unknown — the key FILE's presence, never its bytes.
+REFLEX_MODEL_DEFAULT="typesafe/jev-1.13"
+REFLEX_MODEL_RE='^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$'
+
+_reflex_key_file() { printf '%s' "${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5dive/reflex-openrouter.key}"; }
+
+# _reflex_box_get <key> -> the box.json value, or nothing
+_reflex_box_get() {
+  declare -F _box_config_path >/dev/null 2>&1 || return 0
+  local f; f=$(_box_config_path)
+  [[ -r "$f" ]] || return 0
+  jq -r --arg k "$1" '.[$k] // empty | strings' "$f" 2>/dev/null || true
+}
+
+# Sets _REFLEX_RECEIPTS (on|off) and _REFLEX_RECEIPTS_SRC.
+reflex_receipts_resolve() {
+  if [[ -n "${FIVEDIVE_REFLEX_RECEIPTS+x}" ]]; then
+    if [[ "$FIVEDIVE_REFLEX_RECEIPTS" == "0" ]]; then _REFLEX_RECEIPTS=off; else _REFLEX_RECEIPTS=on; fi
+    _REFLEX_RECEIPTS_SRC="FIVEDIVE_REFLEX_RECEIPTS=${FIVEDIVE_REFLEX_RECEIPTS} in this environment (wins over the box setting)"
+    return 0
+  fi
+  local v; v=$(_reflex_box_get reflex_receipts)
+  case "$v" in
+    on|off) _REFLEX_RECEIPTS="$v"; _REFLEX_RECEIPTS_SRC="box setting" ;;
+    *)      _REFLEX_RECEIPTS=on;   _REFLEX_RECEIPTS_SRC="default (on)" ;;
+  esac
+}
+
+# Sets _REFLEX_MODEL and _REFLEX_MODEL_SRC.
+reflex_model_resolve() {
+  local v; v=$(_reflex_box_get reflex_model)
+  if [[ -n "$v" && "$v" =~ $REFLEX_MODEL_RE ]]; then
+    _REFLEX_MODEL="$v"; _REFLEX_MODEL_SRC="box setting"
+  else
+    _REFLEX_MODEL="$REFLEX_MODEL_DEFAULT"; _REFLEX_MODEL_SRC="default"
+  fi
+}
+
+# set | unset | unknown. Presence only: this function never opens the file.
+reflex_key_status() {
+  local f; f=$(_reflex_key_file)
+  if [[ -s "$f" ]]; then printf 'set'
+  elif [[ -x "$(dirname "$f")" ]]; then printf 'unset'
+  else printf 'unknown'
+  fi
+}
+
+# The env is read on every call (a caller may set it for one command); the box
+# file is read once per process, because a heartbeat tick writes several
+# receipts and a jq per receipt buys nothing.
+_reflex_receipts_on() {
+  if [[ -n "${FIVEDIVE_REFLEX_RECEIPTS+x}" ]]; then
+    [[ "$FIVEDIVE_REFLEX_RECEIPTS" != "0" ]]
+    return
+  fi
+  [[ -n "${_REFLEX_BOX_RECEIPTS:-}" ]] || { _REFLEX_BOX_RECEIPTS=$(_reflex_box_get reflex_receipts); _REFLEX_BOX_RECEIPTS="${_REFLEX_BOX_RECEIPTS:-unset}"; }
+  [[ "$_REFLEX_BOX_RECEIPTS" != off ]]
+}
 
 # reflex_receipt policy=<p> [policy_version=<n>] [ident=] [task_id=] result=<label>
 #                [candidates=<a,b,c>] [effect=<json obj>] [signals=<json obj>]
@@ -62,7 +130,7 @@ REFLEX_RECEIPT_SCHEMA=1
 # seat's progress. The stuck call site passes authority=dispatcher, as its
 # task.reclaimed row does.
 reflex_receipt() {
-  [[ "${FIVEDIVE_REFLEX_RECEIPTS:-1}" == "0" ]] && return 0
+  _reflex_receipts_on || return 0
   ( _reflex_receipt_write "$@" ) >/dev/null 2>&1 || true
   return 0
 }
@@ -228,7 +296,7 @@ reflex_reap_reason_class() {
 # the answer has landed (same reason the gate.answered ledger row reads provenance
 # back: the persisted column is what landed, the shell variable is only intent).
 reflex_gate_receipt() {
-  [[ "${FIVEDIVE_REFLEX_RECEIPTS:-1}" == "0" ]] && return 0
+  _reflex_receipts_on || return 0
   ( _reflex_gate_receipt_write "$@" ) >/dev/null 2>&1 || true
   return 0
 }

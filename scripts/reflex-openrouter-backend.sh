@@ -36,12 +36,18 @@
 # FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE. FIVEDIVE_REFLEX_OPENROUTER_URL overrides the
 # base URL (default https://openrouter.ai/api).
 #
-# Flags: --model=<id> (default typesafe/jev-1.13)  --api=decisions|chat
+# Flags: --model=<id> (default: `5dive config reflex-model`, else typesafe/jev-1.13)  --api=decisions|chat
 #        --concurrency=N (1-32, default 8)  --request-timeout=S (default 60)
 #        --retries=N (on 429/5xx/no answer, default 2)  --with-current
 set -uo pipefail
 
 model="typesafe/jev-1.13" api="" conc=8 rto=60 retries=2 with_current=0
+# DIVE-4915: the box's `5dive config reflex-model=` is the default; --model wins.
+_box="${BOX_CONFIG:-${STATE_DIR:-/var/lib/5dive}/box.json}"
+if [[ -r "$_box" ]] && command -v jq >/dev/null 2>&1; then
+  _m=$(jq -r '.reflex_model // empty | strings' "$_box" 2>/dev/null || true)
+  [[ "$_m" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$ ]] && model="$_m"
+fi
 for a in "$@"; do
   case "$a" in
     --model=*)           model="${a#*=}" ;;
