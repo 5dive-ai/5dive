@@ -1,6 +1,6 @@
 # cmd_reflex_login_marker — reflex proposes a site's login check, in SHADOW (DIVE-4928).
 #
-#   5dive reflex login-marker <site> --logged-out=<html> [--logged-in=<html>]
+#   5dive reflex login-marker <site> --logged-out=<html> [--logged-out=<html 2>] [--logged-in=<html>]
 #                             [--url=<probe url>] [--spa] [--compare=<adapter.json>]
 #                             [--backend=fake:first|<command>] [--timeout=<s>]
 #                             [--out=<file>] [--json]
@@ -21,6 +21,9 @@
 #      the engine the probe itself uses (browser bin/browser: "two regex engines
 #      must never both be allowed to decide a login"). A signed-out candidate must
 #      match the signed-out render and must match the signed-in render ZERO times.
+#      Given a second signed-out render (--logged-out twice; `5dive browser
+#      capture` makes two), it must match EVERY one: a sign-in page carries
+#      per-render tokens, and a token only one render has is not a marker.
 #   3. The survivors, ranked by a fixed heuristic and capped, are the OPTIONS of
 #      one Decisions-API choice. The model returns one key, or `none`. A choice
 #      that is not an option falls back to `none`, which proposes nothing.
@@ -60,6 +63,7 @@ _REFLEX_LM_CHALLENGE_TITLE='(captcha|prove your humanity|are you a robot|just a 
 _REFLEX_LM_MAX_OPTIONS=20
 _REFLEX_LM_SHORTLIST=150
 _REFLEX_LM_MAX_BYTES=8000000
+_REFLEX_LM_OUT_MORE=()
 
 # _reflex_lm_extract <out|in> <file> -> "<score>\t<marker>" lines, best first,
 # unverified. Pure text processing; the verification is _reflex_lm_count.
@@ -72,6 +76,20 @@ _reflex_lm_extract() {
     function esc(s) { gsub(/\./, "\\.", s); return s }
     function loginish(v) { return tolower(v) ~ /(login|log-in|log_in|signin|sign-in|sign_in|session|passw|username|auth|otp|qr|signup|sign-up|register)/ }
     function emit(score, m) { if (!(m in seen)) { seen[m] = 1; printf "%d\t%s\n", score, m } }
+    # A PER-RENDER TOKEN IS NOT A MARKER (DIVE-4929, measured on github.com): the
+    # sign-in page carries honeypot fields named required_field_<4 hex> and ids
+    # with a UUID, new on every render. One passes the both-halves bar by
+    # construction (it is on this signed-out render and on no other page), and as
+    # a marker it would never match again, so every expired login would read as
+    # signed in. Any segment of 4+ hex characters holding a digit, or any run of 3+
+    # digits, is treated as random. The second signed-out render (--logged-out
+    # given twice) is the structural check; this is the cheap one.
+    function randomish(v,   n, i, seg) {
+      if (v ~ /[0-9][0-9][0-9]/) return 1
+      n = split(v, seg, /[-_:.\/]/)
+      for (i = 1; i <= n; i++) if (seg[i] ~ /^[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]+$/ && seg[i] ~ /[0-9]/) return 1
+      return 0
+    }
     {
       s = $0; sub(/^[[:space:]<]/, "", s)
       eq = index(s, "="); a = tolower(substr(s, 1, eq - 1)); v = substr(s, eq + 2); v = substr(v, 1, length(v) - 1)
@@ -81,7 +99,7 @@ _reflex_lm_extract() {
           t = tok[i]
           if (half == "out" && t !~ /^[A-Za-z][A-Za-z0-9_-]{2,40}$/) continue
           if (half == "in"  && t !~ /^[A-Za-z][A-Za-z_-]{2,40}$/) continue
-          if (t ~ /[0-9]{4,}/) continue
+          if (randomish(t)) continue
           emit(1 + 10 * loginish(t), "class=\"[^\"]*" esc(t))
         }
         next
@@ -92,7 +110,7 @@ _reflex_lm_extract() {
       if (a == "name" && tolower(v) ~ /^(viewport|robots|referrer|description|keywords|theme-color|format-detection|color-scheme|generator|author|csrf.*|twitter:.*|og:.*|al:.*|fb:.*|apple-.*|msapplication.*|google.*|mobile-web-app-capable)$/) next
       if (half == "out" && v !~ /^[A-Za-z0-9_.\/:-]{1,60}$/) next
       if (half == "in"  && v !~ /^[A-Za-z][A-Za-z_-]{2,40}$/) next
-      if (v ~ /[0-9]{5,}/) next
+      if (randomish(v)) next
       w = (a == "action") ? 5 : (a == "type") ? 5 : (a == "name") ? 4 : (a == "autocomplete") ? 4 : (a == "data-testid") ? 3 : (a == "id") ? 2 : 1
       emit(w + 10 * loginish(v), a "=[\"'"'"']?" esc(v))
     }' \
@@ -119,6 +137,15 @@ _reflex_lm_half() {
       else
         (( ci >= 1 && co == 0 )) || continue
       fi
+      # Every EXTRA signed-out render must agree: a signed-out marker must match
+      # each of them (stable across renders), and a signed-in one must match none.
+      local x ok=1
+      for x in "${_REFLEX_LM_OUT_MORE[@]}"; do
+        if [[ "$half" == out ]]; then (( $(_reflex_lm_count "$m" "$x") >= 1 )) || { ok=0; break; }
+        else (( $(_reflex_lm_count "$m" "$x") == 0 )) || { ok=0; break; }
+        fi
+      done
+      (( ok )) || continue
       jq -cn --arg m "$m" --argjson s "$score" --argjson o "$co" --argjson i "$ci" '{marker:$m, score:$s, out:$o, in:$i}'
     done < <(if [[ "$half" == out ]]; then _reflex_lm_extract out "$fo"; else _reflex_lm_extract in "$fi_"; fi)
   } | jq -sc --argjson max "$_REFLEX_LM_MAX_OPTIONS" --arg half "$half" '
@@ -166,9 +193,10 @@ _reflex_lm_decide() {
 
 _reflex_login_marker() {
   local site="" fo="" fi_="" url="" spa=0 compare="" backend="builtin" to=30 out="" a
+  local -a fo_more=()
   for a in "$@"; do
     case "$a" in
-      --logged-out=*) fo="${a#*=}" ;;
+      --logged-out=*) if [[ -z "$fo" ]]; then fo="${a#*=}"; else fo_more+=("${a#*=}"); fi ;;
       --logged-in=*)  fi_="${a#*=}" ;;
       --url=*)        url="${a#*=}" ;;
       --spa)          spa=1 ;;
@@ -186,7 +214,8 @@ _reflex_login_marker() {
   [[ "$site" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || fail "$E_VALIDATION" "site must be a host name like linkedin.com (got: $site)"
   [[ -n "$fo" ]] || fail "$E_USAGE" "--logged-out=<html> is required: the probe URL rendered by a signed-out browser (a throwaway profile)"
   local f
-  for f in "$fo" ${fi_:+"$fi_"}; do
+  (( ${#fo_more[@]} <= 3 )) || fail "$E_USAGE" "at most four --logged-out renders"
+  for f in "$fo" "${fo_more[@]}" ${fi_:+"$fi_"}; do
     [[ -f "$f" && -r "$f" && -s "$f" ]] || fail "$E_NOT_FOUND" "render not readable or empty: $f"
     (( $(wc -c <"$f") <= _REFLEX_LM_MAX_BYTES )) || fail "$E_VALIDATION" "render over ${_REFLEX_LM_MAX_BYTES} bytes: $f"
   done
@@ -217,6 +246,12 @@ _reflex_login_marker() {
   # A challenge page is not a sign-in page. A marker drafted off one would read
   # every future challenge as "signed out" and send a person to log in again.
   local title; title=$({ grep -oiE '<title[^>]*>[^<]{1,200}' "$fo" 2>/dev/null || true; } | head -n1 | sed -E 's/<title[^>]*>//; s/[[:space:]]+/ /g; s/^ //; s/ $//')
+  for f in "${fo_more[@]}"; do
+    if grep -qiE "$_REFLEX_LM_CHALLENGE" "$f"; then
+      fail "$E_VALIDATION" "the signed-out render $f is a challenge page (captcha or verification), not a sign-in page. Nothing was proposed."
+    fi
+  done
+  _REFLEX_LM_OUT_MORE=("${fo_more[@]}")
   if grep -qiE "$_REFLEX_LM_CHALLENGE" "$fo" || grep -qiE "$_REFLEX_LM_CHALLENGE_TITLE" <<<"$title"; then
     fail "$E_VALIDATION" "the signed-out render is a challenge page (captcha or verification), not a sign-in page. Nothing was proposed. Render it again from a browser the site does not challenge."
   fi
@@ -259,7 +294,7 @@ _reflex_login_marker() {
   local report
   report=$(jq -nc --arg site "$site" --arg url "$url" --arg backend "$backend" --arg model "$model" \
       --argjson c_out "$c_out" --argjson d_out "$d_out" --argjson c_in "$c_in" --argjson d_in "$d_in" \
-      --argjson spa "$spa" --argjson inm "$inm" --arg compare "$compare" \
+      --argjson spa "$spa" --argjson inm "$inm" --arg compare "$compare" --argjson nout "$(( 1 + ${#fo_more[@]} ))" \
       --arg hand_out "$hand_out" --arg hand_in "$hand_in" \
       --argjson ho "$ho" --argjson hi "$hi" --argjson hio "$hio" --argjson hii "$hii" '
     def pick($c; $d): ($c | map(select(.key == $d.choice)) | .[0]) // null;
@@ -269,7 +304,7 @@ _reflex_login_marker() {
     | {site: $site, probe_url: $url, mode: "shadow", written: false,
        backend: (if $backend == "builtin" then "openrouter" else $backend end),
        model: (if $model == "" then null else $model end),
-       signed_in_render: $inm,
+       signed_in_render: $inm, signed_out_renders: $nout,
        logged_out: {candidates: $c_out, choice: $d_out.choice, confidence: $d_out.confidence, error: $d_out.error,
                     marker: ($po.marker // null), heuristic_top: ($top.marker // null)},
        logged_in: (if $spa == 1 then {candidates: $c_in, choice: $d_in.choice, confidence: $d_in.confidence,
@@ -300,7 +335,7 @@ _reflex_login_marker() {
     candidates="$(jq -r '[.logged_out.candidates[].key] + ["none"] | join(",")' <<<"$report")" \
     confidence="$(jq -c '.logged_out.confidence' <<<"$report")" \
     fallback="$(jq -r '.logged_out.error != null' <<<"$report")" \
-    signals="$(jq -c '{site, signed_in_render, spa: (.logged_in != null), n_candidates: (.logged_out.candidates | length)}' <<<"$report")" \
+    signals="$(jq -c '{site, signed_in_render, signed_out_renders, spa: (.logged_in != null), n_candidates: (.logged_out.candidates | length)}' <<<"$report")" \
     backend="$(jq -c '{adapter: (if .backend == "openrouter" then "openrouter" elif (.backend | startswith("fake:")) then .backend else "command" end), model}' <<<"$report")" \
     effect="$(jq -c --arg mh "$mh" '{acted: false, written: false, marker_hash: (if $mh == "" then null else $mh end),
         error: .logged_out.error, logged_in_choice: (.logged_in.choice // null),
@@ -325,6 +360,7 @@ _reflex_login_marker() {
     "probe url: \(.probe_url)",
     "backend:   \(.backend)\(if .model then " " + .model else "" end)",
     (if .signed_in_render then empty else "signed-in render: NOT SUPPLIED — the signed-in half is unmeasured" end),
+    (if .signed_out_renders > 1 then "signed-out renders: \(.signed_out_renders) (a candidate must match every one)" else "signed-out renders: 1 — stability across renders is unmeasured (pass --logged-out twice)" end),
     side(.logged_out; "signed-out marker"),
     side(.logged_in; "signed-in marker"),
     (if .compare then

@@ -115,7 +115,7 @@ cmd_reflex() {
                        [--inputs=none|titles] [--timeout=<seconds>] [--dump=<file>] [--json]
   5dive reflex fake    [--strategy=echo|first|recommend]   (JSONL stdin -> stdout)
   5dive reflex report  --live [--policy=gate-answer] [--since=7d|YYYY-MM-DD] [--json]
-  5dive reflex login-marker <site> --logged-out=<html> [--logged-in=<html>] [--url=<probe url>]
+  5dive reflex login-marker <site> --logged-out=<html> [--logged-out=<html 2>] [--logged-in=<html>] [--url=<probe url>]
                        [--spa] [--compare=<adapter.json>] [--backend=fake:first|<command>]
                        [--out=<file>] [--json]
 

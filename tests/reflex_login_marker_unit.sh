@@ -25,8 +25,10 @@
 #      criteria, and a gate request is sent exactly as before (fake curl on PATH).
 #  L9. Real-shaped: every shipped hand-written marker is itself among the
 #      candidates of a render that carries it (a fixture per shipped marker form).
+#  L10. A per-render token (hex suffix, UUID, digit run) is never a candidate.
+#  L11. A second signed-out render: a candidate must match every one.
 #  M.  Mutants: drop the signed-in filter -> L1 red; drop the challenge check -> L5
-#      red. Each with an unmutated control on the same arm.
+#      red; random-token filter off -> L10 red. Each with an unmutated control.
 #
 # Throwaway STATE_DIR, fake backends and a fake curl only: no root, no network, no key.
 # Run: bash tests/reflex_login_marker_unit.sh
@@ -233,6 +235,41 @@ jq -e '[.logged_out.candidates[].marker] as $c
          and ($c | index("name=[\"'"'"']?username_or_email") != null)' <<<"$R9" >/dev/null
 check "L9 the shipped github/reddit/x marker forms are generated verbatim from a page that carries them" $? "$R9"
 
+# ── L10: a per-render token is never a candidate (DIVE-4929) ────────────────
+# Measured on github.com: two renders of the SAME signed-out page, fed as the
+# two halves, left four "verified" candidates, all random: honeypot fields
+# required_field_<hex> and a UUID id. Each passes the both-halves bar by
+# construction and would never match again as a marker.
+RND="$TMP/random.html"
+cat >"$RND" <<'HTML'
+<html><head><title>Sign in</title></head><body><form action="/session">
+<input name="required_field_6df7"><input name="required_field_dca6"><input name="csrf_12345">
+<button id="icon-button-0d47aed3-e915-4c11-a46e-da351a291fcc">x</button><input name="login"></form></body></html>
+HTML
+l10_arm() {
+  local r; r=$(lmj example.test --logged-out="$RND" --logged-in="$IN" --url=https://example.test/s --backend=fake:first) || return 1
+  jq -e '[.logged_out.candidates[].marker] as $c
+         | ($c | map(select(test("required_field|0d47aed3|csrf_12345"))) | length) == 0
+           and ($c | index("action=[\"'"'"']?/session") != null) and ($c | index("name=[\"'"'"']?login") != null)' <<<"$r" >/dev/null
+}
+l10_arm; check "L10 random per-render tokens (hex suffixes, a UUID, a digit run) are never candidates; the real ones are" $?
+
+# ── L11: a second signed-out render is a stability check ────────────────────
+OUT2="$TMP/out2.html"
+sed 's|<a href="/password_reset">Forgot?</a>|<input name="step_alpha">|' "$OUT" >"$TMP/out1b.html"
+cp "$OUT" "$OUT2"
+R11a=$(lmj example.test --logged-out="$TMP/out1b.html" --logged-in="$IN" --url=https://example.test/s --backend=fake:first)
+R11b=$(lmj example.test --logged-out="$TMP/out1b.html" --logged-out="$OUT2" --logged-in="$IN" --url=https://example.test/s --backend=fake:first)
+jq -e '[.logged_out.candidates[].marker] | index("name=[\"'"'"']?step_alpha") != null' <<<"$R11a" >/dev/null \
+  && jq -e '([.logged_out.candidates[].marker] | index("name=[\"'"'"']?step_alpha") == null) and .signed_out_renders == 2
+            and ([.logged_out.candidates[].marker] | index("action=[\"'"'"']?/session") != null)' <<<"$R11b" >/dev/null
+check "L11 a token on only one of two signed-out renders is dropped (control: kept with one render)" $?
+grep -q 'stability across renders is unmeasured' <<<"$(lm example.test --logged-out="$OUT" --url=https://example.test/s --backend=fake:first)"
+check "L11 one signed-out render: the report says stability is unmeasured" $?
+printf '<html><head><title>Sign in to Example</title></head><body><div class="g-recaptcha"></div></body></html>\n' >"$TMP/ch3.html"
+lm example.test --logged-out="$OUT" --logged-out="$TMP/ch3.html" --url=https://example.test/s --backend=fake:first >/dev/null; rc=$?
+check "L11 a challenge page as the SECOND signed-out render is refused too" "$(( rc == E_VALIDATION ? 0 : 1 ))"
+
 # ── M: mutants ───────────────────────────────────────────────────────────────
 MUT="$TMP/mut1.sh"
 sed 's/\[\[ "\$ci" == null || "\$ci" == 0 \]\] || continue/true/' "$SRC/cmd_reflex_login_marker.sh" >"$MUT"
@@ -249,6 +286,13 @@ if cmp -s "$MUT2" "$SRC/cmd_reflex_login_marker.sh"; then bad_t "M2 the mutant d
   check "M2 with the challenge check dropped, L5 goes RED" "$(( MRC != 0 ? 0 : 1 ))"
 fi
 ( l5_arm ); check "M2 control: the unmutated source stays green on L5" $?
+MUT3="$TMP/mut3.sh"
+sed 's/^    function randomish(v,   n, i, seg) {$/    function randomish(v,   n, i, seg) { return 0/' "$SRC/cmd_reflex_login_marker.sh" >"$MUT3"
+if cmp -s "$MUT3" "$SRC/cmd_reflex_login_marker.sh"; then bad_t "M3 the mutant did not apply"; else
+  ( source "$MUT3"; l10_arm ); MRC=$?
+  check "M3 with the random-token filter off, L10 goes RED" "$(( MRC != 0 ? 0 : 1 ))"
+fi
+( l10_arm ); check "M3 control: the unmutated source stays green on L10" $?
 
 echo
 echo "passed $pass, failed $fail"
