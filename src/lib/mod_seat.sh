@@ -121,7 +121,8 @@ mod_seat_probe_run() { # <name> <debug-file>
       export PATH="/home/claude/.local/bin:$PATH"
       CLAUDE="${CLAUDE_BIN:-/home/claude/.local/bin/claude}"
       [ -x "$CLAUDE" ] || CLAUDE="$(command -v claude 2>/dev/null || echo "$CLAUDE")"
-      cd "$HOME" && "$CLAUDE" -p /cost --no-session-persistence \
+      cd "$HOME" || exit 1
+      exec "$CLAUDE" -p /cost --no-session-persistence \
         --strict-mcp-config --mcp-config "{\"mcpServers\":{}}" --debug-file "$DBG" >/dev/null 2>&1' \
     </dev/null >/dev/null 2>&1
 }

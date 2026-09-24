@@ -152,7 +152,7 @@ rm -f "$CACHE"
 t  "T4d the probe starts NO MCP server" "yes" \
   "$(grep -q -- '--strict-mcp-config --mcp-config "{\\"mcpServers\\":{}}"' src/lib/mod_seat.sh && echo yes || echo no)"
 t  "T4e and never reads the loop's stdin" "yes" \
-  "$(sed -n '/^mod_seat_probe_run()/,/^}/p' src/lib/mod_seat.sh | grep -q '</dev/null >/dev/null' && echo yes || echo no)"
+  "$(grep -q '</dev/null >/dev/null' <<<"$(sed -n '/^mod_seat_probe_run()/,/^}/p' src/lib/mod_seat.sh)" && echo yes || echo no)"
 PROBE=refused; r=$(mod_seat_probe ceo)
 tc "T4f a module the engine refuses is NOT loaded" "not-loaded" "$r"
 tc "T4g and carries the engine's own words" "does not parse" "$r"
