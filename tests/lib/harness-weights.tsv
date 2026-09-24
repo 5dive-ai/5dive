@@ -1,6 +1,6 @@
 # harness weights — MEASURED milliseconds per harness, per environment (DIVE-4391).
 # Regenerate with scripts/refresh-harness-weights.sh; never hand-edit a number.
-# generated=2026-09-24 source_run=35947481762 full_run=35947481758 tiers=core+full rows=645
+# generated=2026-09-24 source_run=35953408256 full_run=35947481758 tiers=core+full rows=646
 # path	pristine_ms	installed_ms   (-1 = not measured green in that environment)
 tests/a2a_busy_queue_unit.sh	16879	16811
 tests/a2a_drain_and_wake_fresh_unit.sh	23639	23612
@@ -217,6 +217,7 @@ tests/gate_proof_verify_history_unit.sh	21021	22114
 tests/gate_proof_verify_unit.sh	617	758
 tests/gate_recommend_cap_unit.sh	4726	4776
 tests/gate_refusal_empty_filer_e2e.sh	4583	5442
+tests/gate_renag_route_by_human_owner_unit.sh	3069	3848
 tests/gate_reply_to_clear_unit.sh	1610	1541
 tests/gate_root_filer_standing_route_unit.sh	7532	9213
 tests/gate_route_delivery_unit.sh	22552	22751

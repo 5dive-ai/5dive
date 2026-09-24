@@ -387,6 +387,7 @@ for name, meta in agents.items():
             last_usage = None
             last_ts = None
             last_rate_limits = None
+            last_rl_ts = None
             token_events = 0
             with f:
                 for line in f:
@@ -412,7 +413,14 @@ for name, meta in agents.items():
                         continue
                     last_usage = usage
                     last_ts = ts
-                    last_rate_limits = payload.get("rate_limits") or {}
+                    # DIVE-3968: a REFUSED turn writes a `premium` record with
+                    # both windows null. Taking it as the reading blanked the
+                    # gauge exactly while the seat was walled — keep the last
+                    # record that actually carries a window, and its own time.
+                    rl = payload.get("rate_limits") or {}
+                    if rl.get("primary") or rl.get("secondary"):
+                        last_rate_limits = rl
+                        last_rl_ts = ts
                     token_events += 1
             if last_usage is None:
                 continue
@@ -441,18 +449,24 @@ for name, meta in agents.items():
             m["in"] += i; m["out"] += ot; m["cc"] += cc; m["cr"] += cr
             m["turns"] += token_events
 
-            if last_ts > newest_codex_rate_limit_ts:
-                newest_codex_rate_limit_ts = last_ts
+            if last_rate_limits is not None and last_rl_ts > newest_codex_rate_limit_ts:
+                newest_codex_rate_limit_ts = last_rl_ts
                 primary = (last_rate_limits.get("primary") or {}).get("used_percent")
                 secondary = (last_rate_limits.get("secondary") or {}).get("used_percent")
                 five, seven = primary, secondary
-                # DIVE-4430: Codex rollouts carry resets_in_seconds, not an
-                # epoch. Converted here, against the snapshot's own timestamp,
-                # so both providers hand the pacing floor the same field.
+                # DIVE-4430: Codex 0.4x rollouts carry resets_in_seconds, not
+                # an epoch. Converted here, against the snapshot's own
+                # timestamp, so both providers hand the pacing floor the same
+                # field. DIVE-3968: current Codex writes the epoch itself as
+                # `resets_at` and no resets_in_seconds at all — this returned
+                # None for every reading since that change. Epoch first.
                 def _cx_reset(d):
-                    r = (d or {}).get("resets_in_seconds")
+                    d = d or {}
+                    if isinstance(d.get("resets_at"), (int, float)):
+                        return int(d["resets_at"])
+                    r = d.get("resets_in_seconds")
                     try:
-                        return int(last_ts) + int(r)
+                        return int(last_rl_ts) + int(r)
                     except Exception:
                         return None
                 five_r  = _cx_reset(last_rate_limits.get("primary"))
