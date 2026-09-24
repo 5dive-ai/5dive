@@ -509,7 +509,9 @@ _reflex_shadow_one() {
 # response on stdout, through OpenRouter's Decisions API. The same mapping as
 # scripts/reflex-openrouter-backend.sh (the replay's reference backend), inlined
 # because that script is not installed on a box. The key reaches curl through a
-# mode-600 header file, never argv.
+# mode-600 header file, never argv. A request may name its own `instructions` and
+# `criteria` (DIVE-4928, `reflex login-marker`); a gate request names neither and
+# is sent exactly as before.
 _reflex_openrouter_decide() {
   local model="$1" to="$2" key_file="${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5dive/reflex-openrouter.key}"
   local base="${FIVEDIVE_REFLEX_OPENROUTER_URL:-https://openrouter.ai/api}" key d code
@@ -522,8 +524,8 @@ _reflex_openrouter_decide() {
     | ((($s.gate.options // {}) + {approve: "Approve.", deny: "Deny.", other: "Some other, free-text answer."})) as $d
     | {model: $m, state: $s,
        questions: {decision: {type: "choice",
-         instructions: "A person was asked to answer a gate on this task. Predict which answer they gave.",
-         criteria: ($o | map({key: ., value: ($d[.] // null)}) | from_entries)}}}' >"$d/body" || { rm -rf "$d"; return 1; }
+         instructions: (.instructions // "A person was asked to answer a gate on this task. Predict which answer they gave."),
+         criteria: (.criteria // ($o | map({key: ., value: ($d[.] // null)}) | from_entries))}}}' >"$d/body" || { rm -rf "$d"; return 1; }
   code=$(timeout "$to" curl -sS -m "$to" -o "$d/raw" -w '%{http_code}' -X POST "$base/alpha/decisions" \
            -H @"$d/auth" -H 'Content-Type: application/json' --data-binary @"$d/body" 2>/dev/null); local rc=$?
   if (( rc == 124 || rc == 28 )); then rm -rf "$d"; return 124; fi
