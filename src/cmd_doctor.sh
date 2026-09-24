@@ -32,6 +32,56 @@ doctor_add() {
   return 0
 }
 
+# doctor_check_gate_owner_delivery — DIVE-4911: human gates that never REACHED
+# their owner.
+#
+# Every other check read green while two tier-2 gates sat undelivered for a
+# day on a 10-human box: `human recipient` named the right person, the person
+# was in the sending bot's allowFrom, and the only delivery lane above counts
+# supervisor alerts. What was wrong was that the person had never started that
+# bot. The evidence for "reached" is the row's own receipt, gate_pinged_at, set
+# only on a confirmed Bot API send; a gate asked over an hour ago (past the
+# routed grace if it is routed) with no receipt since it was asked has reached
+# nobody. The re-nag's negative receipt names the bots that were tried, which
+# is what an operator needs to act: have the person /start one of them, or
+# link a seat whose bot they did start (5dive human link).
+doctor_check_gate_owner_delivery() {
+  local _ug_rows _ug_n _ug_failed _ug_list="" _ug_line _ug_ident _ug_owner _ug_via _ug_i=0
+  _ug_rows=$(db "SELECT ident||x'1f'||COALESCE(NULLIF(human_owner,''),'-')||x'1f'||COALESCE(gate_renag_failed_via,'')
+                 FROM tasks
+                WHERE need_type IS NOT NULL AND need_answered_at IS NULL
+                  AND status NOT IN ('done','cancelled') AND COALESCE(tier,2)=2
+                  AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-1 hour')
+                  AND ( COALESCE(routed_reviewer,'')='' OR COALESCE(gate_urgent,0)=1
+                        OR COALESCE(need_asked_at,updated_at,created_at)
+                             <= datetime('now','-${FIVEDIVE_GATE_RENAG_ROUTED_GRACE_HOURS:-2} hours') )
+                  AND (gate_pinged_at IS NULL
+                       OR gate_pinged_at < COALESCE(need_asked_at,updated_at,created_at))
+                ORDER BY COALESCE(need_asked_at,updated_at,created_at), id;" 2>/dev/null || true)
+  _ug_n=0; _ug_failed=0
+  while IFS=$'\x1f' read -r _ug_ident _ug_owner _ug_via; do
+    [[ -n "$_ug_ident" ]] || continue
+    _ug_n=$(( _ug_n + 1 ))
+    [[ -n "$_ug_via" ]] && _ug_failed=$(( _ug_failed + 1 ))
+    (( _ug_i < 8 )) || continue
+    _ug_i=$(( _ug_i + 1 ))
+    _ug_line="${_ug_ident} (owner ${_ug_owner}"
+    [[ -n "$_ug_via" ]] && _ug_line+="; failed via ${_ug_via}" || _ug_line+="; no reminder attempt recorded yet"
+    _ug_list+="${_ug_list:+, }${_ug_line})"
+  done <<<"$_ug_rows"
+  (( _ug_n > _ug_i )) && _ug_list+=", +$(( _ug_n - _ug_i )) more"
+  if (( _ug_failed > 0 )); then
+    doctor_add channels gate-owner-delivery error \
+      "${_ug_n} human gate(s) NOT delivered to their owner an hour after they were asked: ${_ug_list}. Every bot tried failed (a bot the person never started answers 'chat not found'); fix: have them /start one of their seats' bots, or link a seat they did start (sudo 5dive human link <human> --agent=<seat>) (DIVE-4911)" false false
+  elif (( _ug_n > 0 )); then
+    doctor_add channels gate-owner-delivery warn \
+      "${_ug_n} human gate(s) have no confirmed delivery an hour after they were asked: ${_ug_list}; check who each one pages with 5dive human recipient <ident> (DIVE-4911)" false false
+  else
+    doctor_add channels gate-owner-delivery ok \
+      "every open human gate older than an hour has a confirmed delivery since it was asked"
+  fi
+}
+
 # _doctor_registry_types — space-separated harness types at least one REGISTERED
 # seat runs on. Empty (so nothing is scoped in) when the registry cannot be read:
 # an unreadable registry must not silence a real credential error, so the caller
@@ -1916,6 +1966,9 @@ cmd_doctor() {
         fi
       fi
     fi
+
+    # --- DIVE-4911: human gates that never REACHED their owner ---
+    [[ -f "${TASKS_DB:-}" ]] && doctor_check_gate_owner_delivery
 
     # --- DIVE-3964: per-seat channel BINDING, from the bridge handshake ---
     #
