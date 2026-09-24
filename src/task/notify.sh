@@ -1255,7 +1255,11 @@ _task_send_owner_groups() { # <token> <access> <text> <markup> <task_ids> [exclu
 _task_stamp_confirmed_delivery() { # <comma-separated numeric task ids>
   local task_ids="$1"
   [[ "${TASK_SEND_DELIVERED:-0}" == "1" && "$task_ids" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
-  db "UPDATE tasks SET gate_pinged_at=datetime('now')
+  # DIVE-4911: a confirmed send also retires the re-nag's negative receipt, on
+  # every path (file-time, re-nag, privileged re-send), so an undelivered gate
+  # stops reading as undelivered the moment ANY route reaches the person.
+  db "UPDATE tasks SET gate_pinged_at=datetime('now'),
+             gate_renag_failed_at=NULL, gate_renag_failed_via=NULL
       WHERE id IN (${task_ids}) AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || true
 }
 

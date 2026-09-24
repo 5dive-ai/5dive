@@ -5462,6 +5462,14 @@ _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
            AND COALESCE(need_asked_at,updated_at,created_at) > datetime('now','-11 minutes'))
   AND NOT (tier=1 AND recommend IS NOT NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-48 hours'))
+  -- DIVE-4911: THE BACKOFF. A reminder no bot could deliver stamps
+  -- gate_renag_failed_at and waits the 24h cadence the reminder text promises,
+  -- instead of re-trying every tick (460 dead Bot API calls a day on one
+  -- customer box). A re-ask (need_asked_at moves past the stamp) re-arms it at
+  -- once; so does any confirmed send, which clears the stamp.
+  AND (gate_renag_failed_at IS NULL
+       OR gate_renag_failed_at <= datetime('now','-24 hours')
+       OR gate_renag_failed_at < COALESCE(need_asked_at,updated_at,created_at))
   AND (gate_pinged_at IS NULL
        OR gate_pinged_at < datetime(COALESCE(need_asked_at,updated_at,created_at),'+1 hour')
        OR gate_pinged_at <= datetime('now','-24 hours'))"
@@ -5476,7 +5484,7 @@ _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
 # Rows nobody owns (group `-`) still go through the renderer: it calls
 # _task_send_gate_owner, which holds them on the agent rail and records why,
 # rather than falling back to the allowlist.
-_hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_label>
+_hb_gate_renag_batch() { # <recipient_agent|''> <comma-separated task ids> <route_label>
   local recipient="$1" idlist="$2" label="${3:-}"
   if ! _human_registry_active; then
     _hb_gate_renag_batch_one "$recipient" "$idlist" "$label"
@@ -5486,13 +5494,101 @@ _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_l
   while IFS=$'\t' read -r owner ids; do
     [[ -n "$ids" ]] || continue
     _hb_log "[gate-renag] owner=${owner} rows=${ids} (partitioned by human owner)"
-    _hb_gate_renag_batch_one "$recipient" "$ids" "$label" || rc=$?
+    if [[ "$owner" == "-" ]]; then
+      _hb_gate_renag_unowned "$recipient" "$ids" "$label" || rc=$?
+    else
+      _hb_gate_renag_to_human "$owner" "$ids" "$label" "$recipient" || rc=$?
+    fi
   done < <(_human_gate_ids_by_owner "$idlist")
   return $rc
 }
 
+# DIVE-4911: rows no human owns, on a box whose registry IS in use. Delivered as
+# before — through the caller's recipient, or per filer when the caller named
+# none (the T2 fan-out hands the whole batch over unsplit so owned rows are not
+# sent once per filer) — and a miss backs off 24h like an owned one. Nothing a
+# retry does can make an unowned gate deliverable; only `human link` can, and
+# that clears the stamp.
+_hb_gate_renag_unowned() { # <recipient|''> <ids> <label>
+  local recipient="$1" idlist="$2" label="$3" filer fids missed=""
+  if [[ -n "$recipient" ]]; then
+    _hb_gate_renag_batch_one "$recipient" "$idlist" "$label"
+    (( HB_RENAG_DELIVERED )) || missed="$idlist"
+  else
+    while IFS= read -r filer; do
+      fids=$(db "SELECT id FROM tasks WHERE id IN (${idlist})
+                 AND COALESCE(NULLIF(created_by,''),assignee,'')=$(sqlq "$filer") ORDER BY id;" | paste -sd, -)
+      [[ -n "$fids" ]] || continue
+      _hb_gate_renag_batch_one "$filer" "$fids" "$label"
+      (( HB_RENAG_DELIVERED )) || missed="${missed:+${missed},}${fids}"
+    done < <(db "SELECT DISTINCT COALESCE(NULLIF(created_by,''),assignee,'') FROM tasks WHERE id IN (${idlist});")
+  fi
+  [[ -n "$missed" ]] && _hb_gate_renag_backoff "$missed" "${recipient:-filer}" "-"
+  return 0
+}
+
+# DIVE-4911 — route a reminder by the PERSON, not by the filer.
+#
+# THE DEFECT (customer box, 10 humans, 20 seats, 0.50.0). Every reminder rode the
+# filer's bot: `COALESCE(created_by, assignee)` in the T2 fan-out, and the
+# notifier or the lead elsewhere. human_owner only split the batch. A human who
+# had started only their own assistant's bot got `400 chat not found` on every
+# gate another seat filed — 230 failed sends a day on one urgent gate while two
+# other seats reached the same chat fine — and a row created BY the human
+# (created_by = their handle, not a seat) resolved no channel at all, 2005 times
+# in nine days. A failed send never stamped anything, so both re-ran every tick.
+#
+# THE FIX. Try the bots that can reach this person, best first
+# (_human_gate_sender_candidates: their linked seats, then any seat with a
+# confirmed send to their chat, then the caller's recipient and the rows'
+# filers), and stop at the first confirmed delivery. If none confirms, stamp the
+# negative receipt and let the WHERE clause's backoff hold the row for 24h.
+# gate_pinged_at is untouched by a miss, so the row never reads as reminded.
+# Each candidate goes through _hb_gate_renag_batch_one unchanged, so the text,
+# the nonce rotation and the allowFrom narrowing in _task_send_gate_owner are
+# identical whichever bot carries it. The DIVE-1927 walk up reports_to is not
+# used here: it follows the FILER's chart, and the question is the human's bots.
+_hb_gate_renag_to_human() { # <human id> <ids> <label> [caller recipient]
+  local hid="$1" idlist="$2" label="$3" recipient="${4:-}" fallback c tried=""
+  fallback=$(db "SELECT group_concat(f, ',') FROM (
+                   SELECT DISTINCT COALESCE(NULLIF(created_by,''),assignee,'') AS f
+                     FROM tasks WHERE id IN (${idlist}));" 2>/dev/null)
+  local -a cands=()
+  mapfile -t cands < <(_human_gate_sender_candidates "$hid" "${recipient:+${recipient},}${fallback}")
+  for c in "${cands[@]}"; do
+    [[ -n "$c" ]] || continue
+    if ! _task_agent_channel "$c"; then
+      tried+="${tried:+,}${c}(no channel)"
+      continue
+    fi
+    _hb_gate_renag_batch_one "$c" "$idlist" "$label"
+    if (( HB_RENAG_DELIVERED )); then
+      [[ -n "$tried" ]] && _hb_log "[gate-renag] ${hid}: delivered ${idlist} via ${c} after ${tried} failed"
+      return 0
+    fi
+    tried+="${tried:+,}${c}"
+  done
+  _hb_gate_renag_backoff "$idlist" "${tried:-no candidate bot}" "$hid"
+  return 0
+}
+
+# DIVE-4911: the negative receipt. Named bots, not a count — doctor and
+# `human recipient` print this column so an operator can see WHICH bot the person
+# has not started.
+_hb_gate_renag_backoff() { # <ids> <tried> <human|->
+  local idlist="$1" tried="$2" hid="$3"
+  [[ "$idlist" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
+  db "UPDATE tasks SET gate_renag_failed_at=datetime('now'), gate_renag_failed_via=$(sqlq "$tried")
+      WHERE id IN (${idlist}) AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || true
+  _hb_log "[gate-renag] UNDELIVERED to ${hid} rows=${idlist} tried=${tried}; backing off 24h (DIVE-4911)"
+}
+
+# HB_RENAG_DELIVERED: 1 when the batch below reached a person with a confirmed
+# receipt, else 0 — what _hb_gate_renag_to_human reads to try the next bot.
+HB_RENAG_DELIVERED=0
 _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <route_label>
   local recipient="$1" idlist="$2" route_label="$3"
+  HB_RENAG_DELIVERED=0
   [[ -n "$recipient" && "$idlist" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
   # DIVE-1927: an unpaired recipient used to mean "retry next heartbeat" forever —
   # the same silent hole as the file-time path. A channel-less filer's gate can
@@ -5585,6 +5681,7 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
       db "UPDATE tasks SET human_nonce_hash=$(sqlq "${nonce_hashes[$i]}")
           WHERE id=${nonce_ids[$i]} AND need_answered_at IS NULL;" 2>/dev/null || true
     done
+    HB_RENAG_DELIVERED=1
     _hb_log "[gate-renag] delivered ${idlist} via ${recipient}; message_id=${TASK_SEND_MESSAGE_IDS:-unknown}"
   else
     _hb_log "[gate-renag] delivery unconfirmed for ${idlist} via ${recipient}; receipt left unchanged"
@@ -5721,6 +5818,17 @@ _hb_gate_renag_sweep() {
     [[ -n "$_renag_coord" ]] \
       && _hb_log "[gate-renag] gate notifier ${_renag_coord} has no paired channel; T2 falls back to per-filer fan-out (DIVE-3742/4365)" \
       || _hb_log "[gate-renag] no gate notifier resolved; T2 falls back to per-filer fan-out (DIVE-3742/2031)"
+    # DIVE-4911: with the human registry in use the batch goes over WHOLE and is
+    # split by person, not by filer: an owned row is carried by a bot that
+    # reaches its owner (_hb_gate_renag_to_human), so partitioning by filer first
+    # would only send the same person one reminder per filing seat. Unowned rows
+    # still fan out per filer inside _hb_gate_renag_unowned.
+    if _human_registry_active; then
+      ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}
+                AND COALESCE(tier,2)=2
+                ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;" | paste -sd, -)
+      [[ -n "$ids" ]] && _hb_gate_renag_batch "" "$ids" "paired human"
+    else
     while IFS= read -r owner; do
       [[ -n "$owner" ]] || continue
       ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}
@@ -5730,6 +5838,7 @@ _hb_gate_renag_sweep() {
       [[ -n "$ids" ]] && _hb_gate_renag_batch "$owner" "$ids" "paired human"
     done < <(db "SELECT DISTINCT COALESCE(NULLIF(created_by,''),assignee,'') FROM tasks
                  WHERE ${_HB_GATE_RENAG_WHERE} AND COALESCE(tier,2)=2;")
+    fi
   fi
 
   # T1 gates: group by the existing routed reviewer / org-lead resolution. A
