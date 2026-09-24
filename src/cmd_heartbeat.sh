@@ -8447,6 +8447,10 @@ cmd_heartbeat_tick() {
   # eligible for pickup this same tick. The renag's confirmed gate_pinged_at
   # stamp also preserves pass 3's existing seven-day throttle (no duplicate).
   _hb_gate_ttl_sweep || _hb_log "[gate-ttl] pass errored (non-fatal)"
+  # DIVE-4916: kick the reflex gate-answer shadow. Returns at once (the sweep
+  # runs detached) and is a no-op unless the box set reflex-model and has the
+  # key. It never writes a gate: see src/lib/reflex.sh.
+  reflex_shadow_kick 2>/dev/null || true
   # DIVE-1858 Stage 2: live auto-sleep pass. Stops cold + idle + no-open-work
   # agents after the idle threshold. Isolated like every other sweep — a failure
   # here must NEVER abort the wake loop (the heartbeat-never-woke bug class). No-op

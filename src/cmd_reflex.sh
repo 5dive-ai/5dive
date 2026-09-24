@@ -9,6 +9,7 @@
 #                        [--backend=fake:echo|fake:first|fake:recommend|<command>]
 #                        [--inputs=none|titles] [--timeout=<seconds>] [--dump=<file>] [--json]
 #   5dive reflex fake    [--strategy=echo|first|recommend]
+#   5dive reflex report  --live [--policy=gate-answer] [--since=7d] [--json]
 #
 # ── THE REPLAY ────────────────────────────────────────────────────────────────
 # Builds one CASE per past decision, asks a candidate backend what it would have
@@ -99,6 +100,7 @@ cmd_reflex() {
     status) _reflex_status "$@" ;;
     replay) _reflex_replay "$@" ;;
     fake)   _reflex_fake "$@" ;;
+    report) _reflex_report "$@" ;;
     help|-h|--help)
       cat <<'EOF'
 5dive reflex — decision receipts (phase 0: receipts + offline replay, no model)
@@ -109,11 +111,16 @@ cmd_reflex() {
                        [--backend=fake:echo|fake:first|fake:recommend|<command>]
                        [--inputs=none|titles] [--timeout=<seconds>] [--dump=<file>] [--json]
   5dive reflex fake    [--strategy=echo|first|recommend]   (JSONL stdin -> stdout)
+  5dive reflex report  --live [--policy=gate-answer] [--since=7d|YYYY-MM-DD] [--json]
 
 Policies: task-route, retry-action, stuck, gate-answer.
 --inputs=titles lets a replay request carry task titles, gate asks/options and
 seat roles (never a body). The default sends ids and labels only.
 A reference OpenRouter backend: scripts/reflex-openrouter-backend.sh.
+`report --live` scores the gate-answer SHADOW (DIVE-4916): the configured
+model's pick on each new gate, recorded and never acted on, against the answer
+the gate actually got, by confidence band. The shadow runs only on a box that
+set `5dive config reflex-model=` and has the key.
 Receipts are written by the decision points themselves. Stop them with
 `5dive config reflex-receipts=off` (FIVEDIVE_REFLEX_RECEIPTS=0 in the
 environment wins over that). Nothing here changes behaviour.
@@ -320,7 +327,9 @@ _reflex_build_cases() {
     | ($events | group_by(.task_id) | map({key: (.[0].task_id|tostring), value: .}) | from_entries) as $ev
     # Receipts first. The earliest receipt per policy is where history stops, so a
     # decision is never counted twice.
-    | [ $receipts[] | (.detail | fromjson? // null) as $r | select($r != null)
+    # A shadow receipt (DIVE-4916) is a model'"'"'s pick, not what today'"'"'s code
+    # decided, so it is never a replay case: `reflex report --live` scores those.
+    | [ $receipts[] | (.detail | fromjson? // null) as $r | select($r != null and ($r.mode // "observe") != "shadow")
         | {policy: $r.policy, ts: .ts, ident: .ident, task_id: .task_id, source: "receipt",
            seat: ($r.effect.seat // .actor), current: $r.result,
            options: ($r.candidates // []), signals: ($r.signals // {})} ] as $live0
@@ -516,6 +525,110 @@ _reflex_replay() {
     "current = today'"'"'s recorded decision scored against the outcome proxy; backend = the",
     "candidate'"'"'s pick (a fallback to current where it was invalid); agree = backend == current.",
     "The outcome proxies are documented in `5dive reflex help` source (src/cmd_reflex.sh)."' <<<"$report"
+}
+
+# ── `reflex report --live` (DIVE-4916) ───────────────────────────────────────
+# Scores the gate-answer SHADOW receipts (mode=shadow, written by the heartbeat's
+# sweep in src/lib/reflex.sh) against the answers those gates actually got.
+#
+# The join is (task_id, the gate's need_asked_at), which the shadow receipt
+# records as effect.gate_asked_at, so it holds whichever came first: the pick or
+# the answer. An answer is labelled with the same rx_gate_case the receipts and
+# the replay use, so "right" means the pick equals the answer's opt<N>/verb label.
+#
+# Bands are on the model's confidence: >=0.9, 0.7-0.9, <0.7, and "none" for a
+# pick that came back without one. A failed call (timeout, error, invalid pick)
+# is never scored; it is counted as failed. Next to each band: how often the same
+# gates were answered with their --recommend, the number the model has to beat.
+# `would_be_wrong` lists every >=0.9 pick that did NOT match its answer, i.e. what
+# auto-applying at 0.9 would have got wrong. Nothing here builds that switch.
+_reflex_report() {
+  local live=0 policy="gate-answer" since_spec="7d" a
+  for a in "$@"; do
+    case "$a" in
+      --live)      live=1 ;;
+      --policy=*)  policy="${a#*=}" ;;
+      --since=*)   since_spec="${a#*=}" ;;
+      --json)      JSON_MODE=1 ;;
+      *) fail "$E_USAGE" "unknown flag: $a" ;;
+    esac
+  done
+  (( live )) || fail "$E_USAGE" "reflex report needs --live (the only report so far: the live shadow; for history use 'reflex replay')"
+  [[ "$policy" == "gate-answer" ]] || fail "$E_VALIDATION" "--policy: only gate-answer has a live shadow so far"
+  _reflex_need_store
+  local since; since=$(_reflex_since_sql "$since_spec")
+  local tmp; tmp=$(mktemp -d "${TMPDIR:-/tmp}/reflex-report.XXXXXX") || fail "$E_GENERIC" "mktemp failed"
+  # Files and --slurpfile, not --argjson, for the replay's ARG_MAX reason.
+  _reflex_sql_json >"$tmp/picks.json" "SELECT ident, task_id, ts, detail FROM lifecycle_events
+            WHERE kind='decision.gate-answer' AND ts >= ${since}
+              AND json_extract(detail,'\$.mode')='shadow' ORDER BY id;"
+  # Answered gates, wherever the epoch sits now. The answer text is read here to
+  # be labelled; only an option's text (never a free-text answer) is printed.
+  _reflex_sql_json >"$tmp/gates.json" "
+    SELECT task_id, need_asked_at AS asked, need_type AS nt, COALESCE(need_options,'') AS opts,
+           COALESCE(recommend,'') AS rec, need_answer AS ans, COALESCE(need_answered_by,'') AS \"by\", COALESCE(tier,'') AS tier
+      FROM gate_history WHERE need_answer IS NOT NULL AND need_answer<>'' AND need_asked_at >= ${since}
+    UNION ALL
+    SELECT id, need_asked_at, need_type, COALESCE(need_options,''), COALESCE(recommend,''),
+           need_answer, COALESCE(need_answered_by,''), COALESCE(tier,'')
+      FROM tasks WHERE need_answer IS NOT NULL AND need_answer<>'' AND need_asked_at >= ${since};"
+  local report
+  report=$(jq -nc --arg since "$since_spec" --slurpfile picks "$tmp/picks.json" --slurpfile gates "$tmp/gates.json" "${_REFLEX_JQ_DEFS}"'
+    ($picks[0]) as $picks | ($gates[0]) as $gates
+    | ($gates | map({key: "\(.task_id)|\(.asked)", value: .}) | from_entries) as $gm
+    | [ $picks[] | (.detail | fromjson? // null) as $r | select($r != null)
+        | ($gm["\(.task_id)|\($r.effect.gate_asked_at // "")"] // null) as $g
+        | {ident: (.ident // $r.task), ts, pick: $r.result, confidence: $r.confidence,
+           failed: (($r.effect.error // null) != null), error: ($r.effect.error // null),
+           model: ($r.backend.model // $r.backend.adapter // null),
+           answered: ($g != null)}
+        + (if $g == null then {} else
+             ($g | rx_gate_case) as $c
+             | {answer: $c.result,
+                answer_text: ($c.result | if test("^opt[0-9]+$") then
+                                (($g.opts | split("|"))[(.[3:] | tonumber) - 1] // null | if . == null then null else .[0:80] end)
+                              else null end),
+                matched_recommend: $c.signals.matched_recommend,
+                right: ($r.result == $c.result)} end)
+        | . + {band: (if .failed then "failed"
+                      elif .confidence == null then "none"
+                      elif .confidence >= 0.9 then ">=0.9"
+                      elif .confidence >= 0.7 then "0.7-0.9"
+                      else "<0.7" end)} ] as $rows
+    | def rate($xs; f): if ($xs|length) == 0 then null else ([ $xs[] | select(f) ] | length) / ($xs|length) end;
+    { policy: "gate-answer", since: $since, generated_at: (now | todate),
+      models: ([ $rows[].model ] | unique),
+      shadowed: ($rows | length),
+      answered: ([ $rows[] | select(.answered) ] | length),
+      pending: ([ $rows[] | select(.answered | not) ] | length),
+      failed: ([ $rows[] | select(.failed) ] | length),
+      failures: ([ $rows[] | select(.failed) | .error ] | group_by(.) | map({key: .[0], value: length}) | from_entries),
+      bands: [ ">=0.9", "0.7-0.9", "<0.7", "none" ] | map(. as $b
+        | [ $rows[] | select(.band == $b and .answered) ] as $xs
+        | {band: $b, scored: ($xs|length),
+           accuracy: rate($xs; .right),
+           recommend_match: rate($xs; .matched_recommend)}),
+      overall: ([ $rows[] | select(.answered and (.failed | not)) ] as $xs
+        | {scored: ($xs|length), accuracy: rate($xs; .right), recommend_match: rate($xs; .matched_recommend)}),
+      would_be_wrong: [ $rows[] | select(.band == ">=0.9" and .answered and (.right | not))
+                        | {ident, ts, pick, confidence, answer, answer_text} ] }')
+  rm -rf "$tmp"
+  [[ -n "$report" ]] || fail "$E_GENERIC" "could not build the live report from ${TASKS_DB}"
+  if (( JSON_MODE )); then printf '%s\n' "$report"; return 0; fi
+  jq -r '
+    def pct: if . == null then "   n/a" else (. * 1000 | round / 10 | tostring | .[0:5] + "%") end;
+    "reflex report — gate-answer shadow, live, since \(.since); model \(.models | join(", ") | if . == "" then "-" else . end)",
+    "",
+    "\(.shadowed) gate(s) shadowed: \(.answered) answered, \(.pending) still open, \(.failed) failed call(s)\(if .failed > 0 then " \(.failures|tostring)" else "" end)",
+    "",
+    "band       scored  model right  answered = recommend",
+    (.bands[] | "\(.band | .+"         " | .[0:9])  \(.scored|tostring|("      "+.)[-6:])  \(.accuracy|pct|("           "+.)[-11:])  \(.recommend_match|pct|("                    "+.)[-20:])"),
+    "all        \(.overall.scored|tostring|("      "+.)[-6:])  \(.overall.accuracy|pct|("           "+.)[-11:])  \(.overall.recommend_match|pct|("                    "+.)[-20:])",
+    "",
+    "Auto-applying every >=0.9 pick would have been WRONG on \(.would_be_wrong|length) gate(s)\(if (.would_be_wrong|length) > 0 then ":" else "." end)",
+    (.would_be_wrong[] | "  \(.ident)  picked \(.pick) at \(.confidence)  answered \(.answer)\(if .answer_text then " (\(.answer_text))" else "" end)"),
+    "",
+    "Shadow only: no pick is ever applied. Failed calls are not scored."' <<<"$report"
 }
 
 # DIVE-4915: remember the newest replay's headline for `reflex status`. Best
