@@ -108,7 +108,9 @@ cmd_reflex() {
       cat <<'EOF'
 5dive reflex — decision receipts (phase 0: receipts + offline replay, no model)
 
-  5dive reflex status  [--json]      receipts on/off, decisions in 24h, model, key set?
+  5dive reflex status  [--probe] [--json]
+                       receipts on/off, decisions in 24h, endpoint, model, configured?
+                       --probe also GETs the endpoint host's /health (3s)
   5dive reflex log     [--policy=<p>] [--limit=N] [--json]
   5dive reflex replay  [--since=14d|YYYY-MM-DD] [--policy=<p>]
                        [--backend=fake:echo|fake:first|fake:recommend|<command>]
@@ -126,7 +128,8 @@ A reference OpenRouter backend: scripts/reflex-openrouter-backend.sh.
 `report --live` scores the gate-answer SHADOW (DIVE-4916): the configured
 model's pick on each new gate, recorded and never acted on, against the answer
 the gate actually got, by confidence band. The shadow runs only on a box that
-set `5dive config reflex-model=` and has the key.
+set `5dive config reflex-model=` and has the key, or that set a custom
+`5dive config reflex-endpoint=<url>` (a local Laya needs no key).
 `login-marker` (DIVE-4928, SHADOW) drafts a browser adapter's login check from
 two renders of a site's probe page, signed out and signed in. The code lists
 and verifies candidate markers; the model only picks one. Nothing is written
@@ -197,16 +200,25 @@ _reflex_log() {
 _reflex_last_replay_file() { printf '%s' "${STATE_DIR:-/var/lib/5dive}/reflex/last-replay.json"; }
 
 _reflex_status() {
-  local a
+  local a probe=0
   for a in "$@"; do
     case "$a" in
       --json) JSON_MODE=1 ;;
+      --probe) probe=1 ;;
       *) fail "$E_USAGE" "unknown flag: $a" ;;
     esac
   done
   command -v jq >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "jq is required"
   reflex_receipts_resolve; reflex_model_resolve
   local key; key=$(reflex_key_status)
+  # DIVE-4932: which endpoint, which wire format, and can this box call it at
+  # all. `configured` is what a "set up reflex" prompt reads: a keyless local
+  # endpoint is configured, and `key` alone would call it unset.
+  local configured; configured=$(reflex_configured); reflex_endpoint_resolve
+  local ekey; ekey=$(reflex_endpoint_key_status)
+  local health="null"
+  (( probe )) && health=$(reflex_endpoint_probe 3 2>/dev/null)
+  [[ -n "$health" ]] || health="null"
   local n="null"
   if [[ -r "${TASKS_DB:-}" ]]; then
     n=$(_reflex_sql_json "SELECT COUNT(*) AS n FROM lifecycle_events WHERE kind LIKE 'decision.%' AND ts >= datetime('now', '-1 day');" \
@@ -219,12 +231,21 @@ _reflex_status() {
   local body
   body=$(jq -nc --arg r "$_REFLEX_RECEIPTS" --arg rs "$_REFLEX_RECEIPTS_SRC" --arg m "$_REFLEX_MODEL" \
     --arg ms "$_REFLEX_MODEL_SRC" --arg k "$key" --argjson n "$n" --argjson last "$last" \
-    '{receipts:$r, receipts_source:$rs, model:$m, model_source:$ms, key:$k, decisions_24h:$n, last_replay:$last}')
+    --arg e "$_REFLEX_ENDPOINT" --arg es "$_REFLEX_ENDPOINT_SRC" --arg api "$_REFLEX_API" --arg apis "$_REFLEX_API_SRC" \
+    --argjson custom "$_REFLEX_CUSTOM" --arg ek "$ekey" --arg c "$configured" --argjson h "$health" \
+    '{receipts:$r, receipts_source:$rs, model:$m, model_source:$ms, key:$k,
+      endpoint:$e, endpoint_source:$es, provider:(if $custom == 1 then "custom" else "openrouter" end),
+      api:$api, api_source:$apis, endpoint_key:$ek,
+      configured:(if $c == "true" then true elif $c == "false" then false else null end),
+      health:$h, decisions_24h:$n, last_replay:$last}')
   if (( JSON_MODE )); then printf '%s\n' "$body"; return 0; fi
   jq -r '"receipts      \(.receipts) (\(.receipts_source))",
     "decisions 24h \(.decisions_24h // "unknown (task store not readable)")",
+    "endpoint      \(.endpoint) (\(.endpoint_source)) · api \(.api) (\(.api_source))",
     "model         \(.model) (\(.model_source))",
-    "key           \(.key)",
+    "key           \(if .provider == "custom" then "endpoint key \(.endpoint_key) (optional; the OpenRouter key is not sent here)" else .key end)",
+    "configured    \(if .configured == null then "unknown (cannot see the key file; try sudo)" else .configured end)",
+    (if .health then "health        \(if .health.ok then "ok" else "DOWN" end) · \(.health.url) · http \(.health.http // 0) · \(.health.ms // 0)ms" else empty end),
     "last replay   \(if .last_replay then "\(.last_replay.at) · \(.last_replay.decisions) decisions · \(.last_replay.backend)" else "none" end)"' <<<"$body"
 }
 
