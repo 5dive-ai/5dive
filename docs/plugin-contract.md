@@ -12,6 +12,11 @@ sudo 5dive plugin add <owner>/<repo>             # one plugin in the repo
 sudo 5dive plugin add <owner>/<repo>/<plugin>    # pick one from several
 ```
 
+**Start from the template.** [5dive-ai/5dive-plugin-template](https://github.com/5dive-ai/5dive-plugin-template)
+is the smallest plugin that installs: one verb, one skill and one setting, with a README
+that walks through renaming it. Press **Use this template** on GitHub, or ask your agent to
+build your plugin from it.
+
 ## Repository shape
 
 ```
