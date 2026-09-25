@@ -588,7 +588,9 @@ cmd_auth_status() {
 # install halfway with no record (DIVE-4886 hit this on the soft-update route).
 # systemd-run hands the job to PID 1, out of shelld's reach. RuntimeMaxSec is
 # the job's hard bound — a hung upstream installer ends as `failed`, never as a
-# wizard that polls forever. The wizard's own deadline sits just above it.
+# wizard that polls forever. The wizard's own deadline sits just above it. The
+# bound holds only while the installer stays in the unit's cgroup, which is why
+# the job sets FIVE_INSTALL_IN_UNIT and cmd_install then drops sudo's -i.
 #
 # State lives in two files per type under INSTALL_JOB_DIR: <type>.log (the
 # install's output) and <type>.status (JSON, written by the job at start and
@@ -634,7 +636,7 @@ jq -cn --arg t "$3" --argjson rc "$rc" --arg f "$(date -Iseconds)" --slurpfile p
 exit "$rc"'
   if ! systemd-run --quiet --collect --unit="$unit" \
          --property=RuntimeMaxSec="$INSTALL_JOB_MAX_SEC" \
-         --setenv=PATH="$PATH" \
+         --setenv=PATH="$PATH" --setenv=FIVE_INSTALL_IN_UNIT=1 \
          -- /bin/bash -c "$wrap" _ "$log" "$st" "$type" "${job[@]}" >/dev/null 2>&1; then
     rm -f "$st"
     fail "$E_GENERIC" "could not start the $type install job ($unit) — systemd-run refused it"
@@ -741,7 +743,19 @@ LOCALBIN
 ' || true
   fi
   # -i loads claude's login env (nvm, XDG redirects, etc.)
-  sudo -u claude -i bash -lc "${prelude}${recipe}" >&2
+  if [[ "${FIVE_INSTALL_IN_UNIT:-}" == 1 ]]; then
+    # Inside the --detach job's unit, -i must not be used: sudo -i runs the
+    # sudo-i PAM stack (common-session -> pam_systemd), which moves the
+    # installer into a logind session scope OUTSIDE the unit. A stop or
+    # RuntimeMaxSec then marks the job failed while the installer runs on, and
+    # a retry races a second installer into the same home (measured on a box,
+    # DIVE-4973). Plain sudo runs common-session-noninteractive (no
+    # pam_systemd), so the installer stays in the unit's cgroup and dies with
+    # it; -H plus bash -l and the cd give it the same login env -i would.
+    sudo -u claude -H bash -lc "cd ~ && ${prelude}${recipe}" >&2
+  else
+    sudo -u claude -i bash -lc "${prelude}${recipe}" >&2
+  fi
   # DIVE-901: some installers finish async or drop the binary via a late
   # rename — give the bin a short grace before declaring failure. Only sleeps
   # on the would-have-failed path; the happy path pays nothing.
