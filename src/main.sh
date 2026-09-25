@@ -273,7 +273,7 @@ Agents:
                                                      # 'agent send' above: --message-file (or '-' for
                                                      # stdin) is the form your shell cannot corrupt.
   5dive agent stats <name>                           # state, restart count, last exit
-  5dive agent install <type> [--upgrade]             # install the CLI for a type if missing (--upgrade forces a reinstall)
+  5dive agent install <type> [--upgrade] [--detach|--status]  # install the CLI for a type if missing (--upgrade forces a reinstall; --detach runs it as a background job, --status reads that job)
   5dive agent set-account <agent> <account|default>  # rebind to a named account; "default" clears
 
 Default workdir: ${DEFAULT_WORKDIR}

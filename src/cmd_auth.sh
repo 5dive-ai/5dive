@@ -573,23 +573,142 @@ cmd_auth_status() {
   fi
 }
 
+# ---- detached install jobs (DIVE-4973) ----
+#
+# The dashboard wizard ran `agent install <type>` as ONE blocking exec, and both
+# the api and the box's shelld kill an exec at 300s. A cold hermes install went
+# to 272-321s after upstream's 2026-09-24 installer rework, and a killed install
+# re-runs and dies the same way (DIVE-3182) — so past 300s the customer's first
+# create failed every time. `--detach` starts the same install in its own
+# transient unit and returns at once; `--status` is what the wizard polls.
+#
+# Why a transient unit and not `setsid nohup ... &`: shelld.service runs with
+# the default KillMode=control-group, and setsid does not leave the cgroup, so
+# any shelld restart (Restart=on-failure, the nightly update) would kill the
+# install halfway with no record (DIVE-4886 hit this on the soft-update route).
+# systemd-run hands the job to PID 1, out of shelld's reach. RuntimeMaxSec is
+# the job's hard bound — a hung upstream installer ends as `failed`, never as a
+# wizard that polls forever. The wizard's own deadline sits just above it.
+#
+# State lives in two files per type under INSTALL_JOB_DIR: <type>.log (the
+# install's output) and <type>.status (JSON, written by the job at start and
+# exit). A status still saying "running" with no live unit means the job died
+# without reaching its own exit line (reboot, OOM kill), and reads as failed.
+INSTALL_JOB_DIR="${INSTALL_JOB_DIR:-$STATE_DIR/install-jobs}"
+INSTALL_JOB_MAX_SEC="${INSTALL_JOB_MAX_SEC:-900}"
+
+_install_job_unit() { printf '5dive-install-%s' "$1"; }
+_install_job_self() { printf '%s' "${FIVE_INSTALL_SELF:-$(realpath "${BASH_SOURCE[0]}")}"; }
+
+# _install_detach <type> <upgrade 0|1>
+_install_detach() {
+  local type="$1" upgrade="$2"
+  local unit; unit=$(_install_job_unit "$type")
+  local log="$INSTALL_JOB_DIR/$type.log" st="$INSTALL_JOB_DIR/$type.status"
+  if systemctl is-active --quiet "$unit" 2>/dev/null; then
+    # A retry while the first attempt is still running (a reloaded wizard, a
+    # second tab) joins that job instead of racing a second installer into the
+    # same ~/.hermes.
+    ok "$type install already running in $unit (poll: 5dive agent install $type --status)" \
+       '{type:$t, detached:true, started:false, state:"running", unit:$u, log:$l}' \
+       --arg t "$type" --arg u "$unit" --arg l "$log"
+    return 0
+  fi
+  mkdir -p "$INSTALL_JOB_DIR"
+  # A failed transient unit stays loaded and blocks its own name until reset.
+  systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  local self; self=$(_install_job_self)
+  local -a job=("$self" agent install "$type" --json)
+  (( upgrade )) && job+=(--upgrade)
+  jq -cn --arg t "$type" --arg s "$(date -Iseconds)" \
+    '{type:$t, state:"running", exitCode:null, startedAt:$s, finishedAt:null}' >"$st"
+  : >"$log"
+  # The wrapper writes the exit record itself, so a finished job is readable
+  # after systemd has collected the unit. $1..$4 are positional: nothing from
+  # the caller is interpolated into the script text.
+  # shellcheck disable=SC2016
+  local wrap='"${@:4}" >>"$1" 2>&1; rc=$?
+jq -cn --arg t "$3" --argjson rc "$rc" --arg f "$(date -Iseconds)" --slurpfile p "$2" \
+  '"'"'($p[0] // {}) + {type:$t, state:(if $rc == 0 then "installed" else "failed" end), exitCode:$rc, finishedAt:$f}'"'"' >"$2.tmp" \
+  && mv -f "$2.tmp" "$2"
+exit "$rc"'
+  if ! systemd-run --quiet --collect --unit="$unit" \
+         --property=RuntimeMaxSec="$INSTALL_JOB_MAX_SEC" \
+         --setenv=PATH="$PATH" \
+         -- /bin/bash -c "$wrap" _ "$log" "$st" "$type" "${job[@]}" >/dev/null 2>&1; then
+    rm -f "$st"
+    fail "$E_GENERIC" "could not start the $type install job ($unit) — systemd-run refused it"
+  fi
+  ok "$type install started in $unit (poll: 5dive agent install $type --status)" \
+     '{type:$t, detached:true, started:true, state:"running", unit:$u, log:$l}' \
+     --arg t "$type" --arg u "$unit" --arg l "$log"
+}
+
+# _install_status <type> — never fails on a missing job: "idle" is an answer.
+_install_status() {
+  local type="$1" bin="${TYPE_BIN[$1]}"
+  local unit; unit=$(_install_job_unit "$type")
+  local log="$INSTALL_JOB_DIR/$type.log" st="$INSTALL_JOB_DIR/$type.status"
+  local rec='{}' state rc="null" msg active=0
+  [[ -f "$st" ]] && rec=$(jq -c '.' "$st" 2>/dev/null || echo '{}')
+  systemctl is-active --quiet "$unit" 2>/dev/null && active=1
+  state=$(jq -r '.state // ""' <<<"$rec")
+  rc=$(jq -c '.exitCode // null' <<<"$rec")
+  if (( active )); then
+    state="running"; msg="$type is installing"
+  elif [[ "$state" == "running" ]]; then
+    # The job's exit line never ran: RuntimeMaxSec, a reboot or an OOM kill.
+    state="failed"; msg="$type install was interrupted before it finished"
+  elif [[ "$state" == "failed" ]]; then
+    msg="$type install failed (exit $rc)"
+  elif [[ "$state" == "installed" || -x "$bin" ]]; then
+    # rc 0 with the binary missing is cmd_install's own failure line, so an
+    # "installed" record is only trusted while the binary is really there.
+    if [[ -x "$bin" ]]; then state="installed"; msg="$type installed at $bin"
+    else state="failed"; msg="$type install reported success but $bin is missing"; fi
+  else
+    state="idle"; msg="no $type install has run"
+  fi
+  local logtail=""
+  [[ "$state" == "failed" && -f "$log" ]] && logtail=$(tail -n 20 "$log" 2>/dev/null || true)
+  local installed=false; [[ "$state" == "installed" ]] && installed=true
+  ok "$msg" \
+     '{type:$t, state:$s, installed:$i, exitCode:$rc, message:$m, unit:$u, log:$l, logTail:$tl,
+       startedAt:($r.startedAt // null), finishedAt:($r.finishedAt // null)}' \
+     --arg t "$type" --arg s "$state" --argjson i "$installed" --argjson rc "$rc" \
+     --arg m "$msg" --arg u "$unit" --arg l "$log" --arg tl "$logtail" --argjson r "$rec"
+  [[ "$state" == "failed" && $JSON_MODE -eq 0 && -n "$logtail" ]] && printf '%s\n' "$logtail" >&2
+  return 0
+}
+
 cmd_install() {
-  local type="" upgrade=0
+  local type="" upgrade=0 detach=0 status=0
+  local usage="usage: 5dive agent install <type> [--upgrade] [--detach | --status]"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --upgrade|--force|-u) upgrade=1 ;;
-      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive agent install <type> [--upgrade])" ;;
+      --detach) detach=1 ;;
+      --status) status=1 ;;
+      -*) fail "$E_USAGE" "unknown flag: $1 ($usage)" ;;
       *) if [[ -z "$type" ]]; then type="$1"; else fail "$E_USAGE" "unexpected argument: $1"; fi ;;
     esac
     shift
   done
-  [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent install <type> [--upgrade]"
+  [[ -n "$type" ]] || fail "$E_USAGE" "$usage"
+  (( detach && status )) && fail "$E_USAGE" "--detach and --status are exclusive ($usage)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type"
+  if (( status )); then _install_status "$type"; return 0; fi
   local bin="${TYPE_BIN[$type]}"
   if [[ -x "$bin" && $upgrade -eq 0 ]]; then
     ok "$type already installed at $bin (pass --upgrade to force a reinstall)" \
        '{type:$t, bin:$b, installed:true, alreadyInstalled:true, upgraded:false}' \
        --arg t "$type" --arg b "$bin"
+    return 0
+  fi
+  if (( detach )); then
+    [[ -n "${TYPE_INSTALL[$type]:-}" ]] \
+      || fail "$E_NOT_INSTALLED" "no installer configured for '$type' — please install $bin manually"
+    _install_detach "$type" "$upgrade"
     return 0
   fi
   local recipe="${TYPE_INSTALL[$type]:-}"
