@@ -544,6 +544,32 @@ fetch_optional_at_pin() {
   die "failed to download $_path from $REPO/$_path (http ${_code:-000}, curl rc $_rc) — this is NOT a 404, so it is not 'absent at this pin'; refusing to silently drop a file the pinned tree may well ship (DIVE-4350)"
 }
 # <<< DIVE-4350 optional-at-pin download contract
+
+# Replace an executable by RENAME, never in place. `curl -o <path>` opens the
+# existing file with O_TRUNC and keeps its inode, and bash reads a running script
+# by byte offset as it goes. So a `bash <path>` that is still running when this
+# installer rewrites the file (every seat's main process is
+# `bash /usr/local/bin/5dive-agent-start <seat>`) resumes at its OLD offset in the
+# NEW bytes. Measured on a 0.50.0 -> 0.53.0 update: one seat, stopped fourteen
+# minutes after the write, died with `line 2065: $'\200\224': command not found`
+# (the tail of a UTF-8 em-dash) and status 127.
+#
+# The temp sits beside <dest>, so the `mv` is a same-filesystem rename: <dest>
+# gets a new inode and a running bash keeps reading the old one to its end.
+# The fetch command stays on the CALLER's line (the helper appends `-o <temp>`)
+# so scripts/install-pin-compat.sh still sees, and grades, `curl … "$REPO/<path>"`.
+#
+# Usage: replace_by_rename <dest> <fetch command…>
+replace_by_rename() {
+  local _dest="$1" _tmp; shift
+  _tmp="$(mktemp "${_dest}.XXXXXX")" || die "failed to create a temp file beside $_dest"
+  if ! "$@" -o "$_tmp"; then
+    rm -f "$_tmp"
+    die "failed to download ${_dest##*/} ($*)"
+  fi
+  chmod 755 "$_tmp"
+  mv -f "$_tmp" "$_dest"
+}
 say() { echo "→ $*"; }
 
 [[ $EUID -eq 0 ]] || die "run as root: curl -fsSL ... | sudo bash"
@@ -979,8 +1005,8 @@ JOURNALD
     ok "/etc/systemd/journald.conf.d/5dive.conf (journal capped 200M/14d)"
   fi
 
-  curl -fsSL "$REPO/5dive-agent-start" -o "$BIN_DIR/5dive-agent-start"
-  chmod 755 "$BIN_DIR/5dive-agent-start"
+  # By rename: every running seat is executing this file (see replace_by_rename).
+  replace_by_rename "$BIN_DIR/5dive-agent-start" curl -fsSL "$REPO/5dive-agent-start"
   ok "5dive-agent-start → $BIN_DIR/5dive-agent-start"
 
   # DIVE-3965: the unit's ExecStopPost notifier. Installed next to the launcher
@@ -1041,8 +1067,7 @@ JOURNALD
   fi
   while IFS= read -r _hs_name; do
     [[ -n "$_hs_name" ]] || continue
-    curl -fsSL "$REPO/$_hs_name" -o "$BIN_DIR/$_hs_name"
-    chmod 755 "$BIN_DIR/$_hs_name"
+    replace_by_rename "$BIN_DIR/$_hs_name" curl -fsSL "$REPO/$_hs_name"
     ok "$_hs_name → $BIN_DIR/$_hs_name"
   done <<< "$_hs_list"
   # <<< DIVE-4194 box-side scripts
