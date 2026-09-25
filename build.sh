@@ -178,6 +178,7 @@ LAZY_FILES=(
   src/cmd_usage.sh
   src/cmd_digest.sh
   src/cmd_proof.sh
+  src/cmd_owner_ask.sh
   src/cmd_selfcheck.sh
   src/cmd_push.sh
   src/cmd_deploy.sh

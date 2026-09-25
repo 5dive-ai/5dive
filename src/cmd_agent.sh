@@ -936,6 +936,7 @@ def classify_sudo(text, measurable):
                   command.startswith("/usr/local/bin/5dive _gh_do") or
                   command.startswith("/usr/local/bin/5dive _task_answer") or
                   command.startswith("/usr/local/bin/5dive _task_channel") or
+                  command.startswith("/usr/local/bin/5dive _owner_ask") or
                   command.startswith("/usr/local/bin/5dive _merge_do")):
                 has_scoped = True
             else:

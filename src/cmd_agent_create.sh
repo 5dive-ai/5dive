@@ -589,6 +589,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _gh_do"*|\
         "/usr/local/bin/5dive _task_answer"*|\
         "/usr/local/bin/5dive _task_channel"*|\
+        "/usr/local/bin/5dive _owner_ask"*|\
         "/usr/local/bin/5dive _merge_do"*)              has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
@@ -738,6 +739,14 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_answer
 # signed write. This is unconditional because every standard Telegram seat needs
 # working gate taps, while the primitive grants no authority without channel proof.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_channel
+# DIVE-5001: let this seat hand a browser ask to its owner as one Telegram tap,
+# and relay that tap back. EXACT path, NO args, NO wildcard: the operation and
+# arguments travel over stdin and the seat is derived from SUDO_UID. The verb
+# touches only this seat's own approvals directory, reads the seat's files as the
+# seat, sends only to the owner resolved for this seat, and answers only an ask
+# whose root-written proof the tap carries. UNCONDITIONAL, like _task_channel: it
+# confers no authority without the owner's tap.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _owner_ask
 # DIVE-3474: let a VERIFIER merge the pull request on a row IT ITSELF graded PASS.
 # EXACT path, NO args, NO wildcard: one task ident travels over stdin, the caller
 # is derived from SUDO_UID inside _merge_do, and the merge standing is re-derived

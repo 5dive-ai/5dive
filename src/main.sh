@@ -357,6 +357,10 @@ Human accounts (who may CLEAR a gate — one identity, all transports):
   5dive human ls | show <id> | owner <agent> | recipient <ident> | rm <id>
   # With NO human accounts, gate delivery is unchanged. full surface: 5dive human --help
 
+Owner asks (one Telegram tap answers an agent's ask — run by plugins, not by hand):
+  5dive owner-ask browser <request-file>             # browser plugin: send the ask with Approve / Decline
+  echo '<callback>' | 5dive owner-ask tap --from=<id> # Telegram plugin: answer it from the owner's tap
+
 Web UI for this host (org chart, queue, gates, triggers) — now a PLUGIN:
   5dive plugin add 5dive-ai/5dive-ui                 # install it once, then 5dive ui works as before
   5dive board [--json]                               # the versioned document the views render (core owns this)
@@ -1053,6 +1057,14 @@ main() {
       # channel before the ordinary task functions authorize and sign the write.
       cmd_task_channel_delegated
       exit $? ;;
+    _owner_ask)
+      # DIVE-5001: hidden, privileged half of `owner-ask`. Reachable through one
+      # exact-path grant; operation and arguments arrive on stdin, the seat is
+      # SUDO_UID's. It mints the tap's nonce, writes its hash into the seat's ask
+      # as root, sends the owner Approve / Decline, and answers a relayed tap.
+      # Audited inside, per outcome (deliver / tap), never with the nonce.
+      cmd_owner_ask_priv
+      exit $? ;;
     _audit_append)
       # DIVE-1268: hidden, privileged, APPEND-ONLY audit primitive. Reachable
       # ONLY via NOPASSWD sudo — the admin whole-CLI grant, or the scoped
@@ -1411,6 +1423,12 @@ main() {
       # token. Mutating + credential-bearing -> audited.
       AUDIT_CMD="deploy"; AUDIT_ARGS=("$@")
       cmd_deploy "$@" ;;
+    owner-ask)
+      # DIVE-5001: an agent's ask reaches its owner as one Telegram tap. The
+      # browser plugin runs `owner-ask browser <request-file>` after writing an
+      # ask; the seat's Telegram plugin runs `owner-ask tap` on Approve/Decline.
+      # Both cross to root only through the `_owner_ask` primitive.
+      cmd_owner_ask "$@" ;;
     proof)
       # OSS-17: publish this box's zero-human proof (badge.json/zero-human.json/
       # history.jsonl) to a git status branch, computed verbatim from `digest`.
