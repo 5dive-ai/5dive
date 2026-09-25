@@ -545,6 +545,66 @@ _pending_restart_sweep() {
   done
   return 0
 }
+# >>> DIVE-5007 restart-or-defer, for callers that restart from OUTSIDE the CLI
+#     (tests/restart_decide_unit.sh extracts the DIVE-3173 block and drives this.)
+#
+# The control plane's nightly `5dive-host-updates.sh` (5dive-api) restarts every
+# agent unit after a Claude Code / codex upgrade, and it had no busy check: on
+# 2026-09-25 23:48Z it bounced all twelve seats ~1s apart and main lost its turn.
+# The ledger above already answers "may this agent be restarted NOW" — this
+# exposes that answer as ONE verb so the script asks it instead of carrying a
+# second busy predicate in bash that drifts from `_agent_busy_state`.
+#
+# It DECIDES and RECORDS; it never restarts. The caller owns the restart, because
+# the caller owns the health gate that must grade it. One line on stdout:
+#
+#   restart idle           free right now — the caller restarts it
+#   deferred busy|unknown  marker written; `_pending_restart_sweep` bounces it at
+#                          the agent's next task boundary. `unknown` defers too.
+#   held parked            desiredState=stopped: marker written, never restarted
+#                          here — the sweep fires once the park is reconciled
+#   held parked-unmarked   same, but the marker could not be written (warned)
+#   restart mark-failed    busy/unknown and the marker could not be written.
+#                          Same trade self-update makes: a bounce is loud and
+#                          recoverable, a restart nobody remembers is neither.
+_restart_decide() {
+  local name="${1:-}" reason="${2:-payload changed}" busy
+  [[ -n "$name" ]] || return 1
+  if _agent_is_parked "$name"; then
+    if _pending_restart_mark "$name" "$reason (while parked)"; then
+      printf 'held parked\n'
+    else
+      printf 'held parked-unmarked\n'
+    fi
+    return 0
+  fi
+  busy="$(_agent_busy_state "$name")"
+  if [[ "$busy" == "idle" ]]; then printf 'restart idle\n'; return 0; fi
+  if _pending_restart_mark "$name" "$reason"; then
+    printf 'deferred %s\n' "$busy"; return 0
+  fi
+  printf 'restart mark-failed\n'
+  return 0
+}
+
+cmd_agent_restart_decide() {
+  require_root "agent _restart_decide"
+  local name="" reason="payload changed"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason=*) reason="${1#--reason=}" ;;
+      -*) fail "$E_USAGE" "unknown flag '$1' — usage: 5dive agent _restart_decide <name> [--reason=<why>]" ;;
+      *)  [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "usage: 5dive agent _restart_decide <name> [--reason=<why>]" ;;
+    esac
+    shift
+  done
+  # A name, not a registry lookup: the caller enumerates units from systemd, and
+  # a unit whose registry row is missing is still a unit whose restart can kill
+  # a turn. The board and the park check both answer for an unregistered name.
+  valid_name "$name" || fail "$E_USAGE" "usage: 5dive agent _restart_decide <name> [--reason=<why>]"
+  _restart_decide "$name" "$reason"
+}
+# <<< DIVE-5007 restart-or-defer
 # <<< DIVE-3173 deferred restart for a busy agent
 
 # >>> DIVE-4068 post-install health gate
