@@ -3659,7 +3659,9 @@ cmd_market_plugins() {
   echo "  install:  5dive plugin add <name>"
   local _standalone; _standalone=$(jq -r '[.[] | select(.install != null and (.install | contains("/"))) | "\(.name): 5dive plugin add \(.install)"] | join("; ")' <<<"$filtered")
   [[ -n "$_standalone" ]] && echo "  from its own repo — ${_standalone}"
-  local _notready; _notready=$(jq '[.[] | select(.ready|not)] | length' <<<"$filtered")
+  # A row whose install is <org>/<repo> registers its own source (the line
+  # above names it), so only REGISTRY rows need the registry added first.
+  local _notready; _notready=$(jq '[.[] | select((.ready|not) and ((.install // "") | contains("/") | not))] | length' <<<"$filtered")
   (( _notready > 0 )) && \
     echo "  the rows marked 'add source' need their marketplace first:  5dive plugin marketplace add $(gh_org)/5dive-plugins"
   # Truthful about the two install paths that currently coexist. telegram,

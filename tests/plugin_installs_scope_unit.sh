@@ -362,6 +362,17 @@ t "T2l control: without the (voice, 5dive-voice) pair the registry row wins" \
 OUT="$_mv_saved_out"
 export STATE_DIR="$_st_save"
 
+# T2m — the human table's "add the registry first" hint is for REGISTRY rows. On a
+# box with the registry registered, voice's not-ready repo row installs in one
+# command (it registers its own source), so the hint must not send the owner to
+# `marketplace add 5dive-plugins` for it (DIVE-4964 rejection, iteration 1).
+human_out=$(curl() { case "${*: -1}" in
+    */5dive-voice/main/*) printf '%s\n' '{"name":"5dive-voice","plugins":[{"name":"voice","category":"channel"}]}' ;;
+    *) return 22 ;; esac; }
+  JSON_MODE=0; cmd_market_plugins --kind=plugin 2>&1)
+tn "T2m no 'add the registry first' hint when only a repo row is not ready" "need their marketplace first" "$human_out"
+tc "T2m ...the repo row names its one-command install instead" "voice: 5dive plugin add 5dive-ai/5dive-voice" "$human_out"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
