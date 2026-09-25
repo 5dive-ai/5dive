@@ -81,6 +81,9 @@ run_block() {  # MANIFEST_TEXT -> populates $BIN_DIR, prints the block's output
     if [[ -n "$out" ]]; then cat "$ROOT/$f" > "$out"; else cat "$ROOT/$f"; fi
   }
   ok() { echo "  ok $*"; }
+  die() { echo "error: $*" >&2; return 1; }
+  # The block writes through install.sh's replace_by_rename; define the shipped one.
+  eval "$(sed -n '/^replace_by_rename() {$/,/^}$/p' install.sh)"
   # `local` is legal only in a function, so wrap the shipped bytes in one.
   eval "_dive4194_block() {
 $(sed -n '/# >>> DIVE-4194 box-side scripts/,/# <<< DIVE-4194 box-side scripts/p' install.sh)
