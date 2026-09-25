@@ -159,6 +159,7 @@ LAZY_FILES=(
   src/cmd_run.sh
   src/cmd_org.sh
   src/cmd_human.sh
+  src/cmd_owner_ask.sh
   src/cmd_board.sh
   src/cmd_hire.sh
   src/cmd_project.sh
