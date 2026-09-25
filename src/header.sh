@@ -455,7 +455,15 @@ declare -A TYPE_INSTALL=(
   # users from traversing it to exec the venv binary — the unit then
   # crash-loops with `binary not installed`. chmod back to 0775 to match
   # the live perms of /home/claude/.opencode and .local/share/claude.
-  [hermes]="[[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup && chmod 0775 /home/claude/.hermes; }"
+  # DIVE-4973: upstream's 2026-09-24 installer rework puts the browser tools
+  # (agent-browser + Chromium) in the default install, and a cold install went
+  # from ~110-140s to 272-297s — 3s under the wizard's 300s exec kill. Install
+  # WITHOUT them inside the blocking exec, then fetch them detached (setsid, all
+  # fds off the exec's pipe, or the api would wait for it) so hermes still gets
+  # its browser a few minutes later. The flag is passed only when the installer's
+  # --help lists it: between 09-24 13:20Z and 21:27Z upstream made --skip-browser
+  # exit 1, and a blind flag would turn a slow install into a failed one.
+  [hermes]="[[ -x /home/claude/.local/bin/hermes ]] || { _hi=\$(mktemp) || exit 1; _hf=(--skip-setup); curl -fsSL https://hermes-agent.nousresearch.com/install.sh -o \"\$_hi\" && { bash \"\$_hi\" --help 2>/dev/null | grep -q -- --skip-browser && _hf+=(--skip-browser); bash \"\$_hi\" \"\${_hf[@]}\"; } && chmod 0775 /home/claude/.hermes; _rc=\$?; rm -f \"\$_hi\"; if (( _rc == 0 )) && [[ \" \${_hf[*]} \" == *\" --skip-browser \"* ]]; then setsid nohup /home/claude/.local/bin/hermes pm install agent-browser >>/home/claude/.hermes/logs/browser-install.log 2>&1 </dev/null & fi; (exit \"\$_rc\"); }"
   # openclaw's launcher is `#!/usr/bin/env node`, so symlinking only the CLI
   # into ~/.local/bin leaves it unexecutable in systemd/create-time envs where
   # nvm's per-version bin directory is absent from PATH. Install a supported
