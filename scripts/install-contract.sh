@@ -268,9 +268,12 @@ else
   for p in "${INSTALLABLE[@]}"; do
     pj=$(mktemp); purl="$PUB_RAW/$(_psrc "$p")/.claude-plugin/plugin.json"
     if curl -fsSL --max-time 30 "$purl" -o "$pj" 2>/dev/null && jq -e . "$pj" >/dev/null 2>&1; then
-      tier=$(jq -r '.fivedive.trust.review // "unreviewed"' "$pj")
-      ok_t "T1d $p: the publisher's own manifest declares review tier '$tier'"
-      if [[ "$tier" == official ]]; then OFFICIAL+=("$p"); else UNREVIEWED+=("$p"); fi
+      # DIVE-4955: whether a plugin installs is now decided by the STANDARD (a
+      # non-empty fivedive block), not by the tier — the tier comes from the
+      # source and only labels it. The bucket names are kept for history.
+      tier=$(jq -r 'if (.fivedive | type) == "object" and (.fivedive | length) > 0 then "follows-standard" else "no-fivedive-block" end' "$pj")
+      ok_t "T1d $p: the publisher's own manifest reads '$tier'"
+      if [[ "$tier" == follows-standard ]]; then OFFICIAL+=("$p"); else UNREVIEWED+=("$p"); fi
     else
       UNKNOWN_TIER+=("$p")
       bad_t "T1d $p: read the publisher's own manifest for its review tier" \
@@ -341,17 +344,17 @@ else
   for p in "${UNREVIEWED[@]}"; do
     out=$(timeout 120 "$FIVE" plugin add "$p" --yes </dev/null 2>&1); rc=$?
     if (( rc != 0 )); then
-      ok_t "T1e $p: 'plugin add' is REFUSED — the plugin declares no 'official' review (rc=$rc)"
+      ok_t "T1e $p: 'plugin add' is REFUSED — the plugin carries no fivedive block (rc=$rc)"
       _ref+=("$p")
     else
-      bad_t "T1e $p: 'plugin add' is REFUSED — the plugin declares no 'official' review" \
+      bad_t "T1e $p: 'plugin add' is REFUSED — the plugin carries no fivedive block" \
         "rc=0 — an unreviewed plugin installed on a fresh box. The trust gate is the only thing between a published plugin and root on a customer's box."
       _inst+=("$p")
     fi
-    if grep -q "installs only 'official'" <<<"$out"; then
-      ok_t "T1e2 $p: the refusal names the review tier, not something internal"
+    if grep -q "does not follow the 5dive plugin standard" <<<"$out"; then
+      ok_t "T1e2 $p: the refusal names the standard, not something internal"
     else
-      bad_t "T1e2 $p: the refusal names the review tier, not something internal" "$(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+      bad_t "T1e2 $p: the refusal names the standard, not something internal" "$(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
     fi
     # rc alone is not enough: a refusal that had already copied the tree would
     # pass T1e. Read the registry the dispatcher reads.
@@ -379,12 +382,12 @@ else
   t1g_want="install=[${OFFICIAL[*]}] refuse=[${UNREVIEWED[*]}]"
   t1g_got="install=[${_inst[*]}] refuse=[${_ref[*]}]"
   if (( ${#UNKNOWN_TIER[@]} > 0 )); then
-    bad_t "T1g a box-installable plugin installs IFF its own manifest declares 'official'" \
+    bad_t "T1g a box-installable plugin installs IFF its own manifest follows the standard (DIVE-4955)" \
       "not graded — the publisher's tier is unknown for ${UNKNOWN_TIER[*]}, so this arm's population is incomplete and would agree with itself (see the T1d failure above)"
   elif [[ "$t1g_want" == "$t1g_got" ]]; then
-    ok_t "T1g a box-installable plugin installs IFF its own manifest declares 'official' ($t1g_want)"
+    ok_t "T1g a box-installable plugin installs IFF its own manifest follows the standard (DIVE-4955) ($t1g_want)"
   else
-    bad_t "T1g a box-installable plugin installs IFF its own manifest declares 'official'" \
+    bad_t "T1g a box-installable plugin installs IFF its own manifest follows the standard (DIVE-4955)" \
       "publishers declare $t1g_want — the box did $t1g_got"
   fi
 fi

@@ -198,11 +198,15 @@ t  "T2f ...and all three are recorded" '["channel","mcp","skill"]' \
 # §5 + lodar's gate answer (2026-09-07): official only, and the door has no flag
 # =============================================================================
 run cmd_plugin_add good@fixture --yes; t "T3a an official plugin installs" "0" "$RC"
-run cmd_plugin_add commonly@fixture --yes; t "T3b a community plugin is REFUSED, not warned" "$E_PERMISSION" "$RC"
-tc "T3b-msg and it says what is missing rather than blaming the publisher" "prove who wrote a plugin" "$ERR"
-run cmd_plugin_add bare@fixture --yes; t "T3c a plugin with no fivedive block reads as unreviewed and is refused" "$E_PERMISSION" "$RC"
-t "T3d ...and nothing was installed by either refusal" "null" \
-  "$(jq -c '.["commonly@fixture"] // "null"' "$(_plugin_installed_json)" | tr -d '"')"
+# DIVE-4955 opened community (lodar, 2026-09-25). A plugin that follows the
+# standard installs whatever tier it earns; the tier is a label on the consent
+# screen, and the refusal belongs to a plugin that declares nothing.
+run cmd_plugin_add commonly@fixture --yes; t "T3b a community plugin that follows the standard INSTALLS (DIVE-4955)" "0" "$RC"
+tc "T3b-msg ...behind a consent screen that says what it is" "review:     community" "$OUT"
+run cmd_plugin_add bare@fixture --yes; t "T3c a plugin with no fivedive block is refused" "$E_PERMISSION" "$RC"
+tc "T3c-msg ...naming the standard" "does not follow the 5dive plugin standard" "$ERR"
+t "T3d ...and nothing was installed by that refusal" "null" \
+  "$(jq -c '.["bare@fixture"] // "null"' "$(_plugin_installed_json)" | tr -d '"')"
 # The deferral is only real if there is no way around it. If someone later adds
 # an --allow-unreviewed flag without building contract §5.1, this arm reds.
 run cmd_plugin_add commonly@fixture --allow-unreviewed --yes; t "T3e there is NO --allow-unreviewed escape hatch" "$E_USAGE" "$RC"
