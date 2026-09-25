@@ -371,7 +371,7 @@ sudo 5dive plugin rollback browser@5dive-browser 1.1.0
 
 `add` 会打印插件的发布者以及它将被赋予的确切权限，然后等你确认：插件是以你的智能体的权限运行的代码。`5dive market --kind=plugin` 是目录，仪表盘的 **Plugins** 页面显示同一份列表。
 
-**开发你自己的插件。** 任何带 `.claude-plugin/marketplace.json`（列出其插件）的仓库都可以用 `5dive plugin add <owner>/<repo>` 安装。[5dive-browser](https://github.com/5dive-ai/5dive-browser) 和 [5dive-voice](https://github.com/5dive-ai/5dive-voice) 是我们以这种方式发布的两个；[5dive-plugins](https://github.com/5dive-ai/5dive-plugins) 是放着其余插件（telegram、dashboard、buzz）的市场。插件声明它注册什么（`channel`、`verb`、`skill`、`mcp`）。动词插件提供 `bin/<verb>`，且只在所有内置命令之后才会被匹配，所以它永远抢不走你的 `5dive task`；清单里若声明了内置命令名，或另一个插件已占用的动词，安装时会被拒绝。用你自己的名义发布：`add` 在任何东西运行之前都会先显示发布者。
+**开发你自己的插件。** 可以从 [5dive-plugin-template](https://github.com/5dive-ai/5dive-plugin-template) 开始：能安装的最小插件，含一个命令、一个技能和一个设置。任何带 `.claude-plugin/marketplace.json`（列出其插件）的仓库都可以用 `5dive plugin add <owner>/<repo>` 安装。[5dive-browser](https://github.com/5dive-ai/5dive-browser) 和 [5dive-voice](https://github.com/5dive-ai/5dive-voice) 是我们以这种方式发布的两个；[5dive-plugins](https://github.com/5dive-ai/5dive-plugins) 是放着其余插件（telegram、dashboard、buzz）的市场。插件声明它注册什么（`channel`、`verb`、`skill`、`mcp`）。动词插件提供 `bin/<verb>`，且只在所有内置命令之后才会被匹配，所以它永远抢不走你的 `5dive task`；清单里若声明了内置命令名，或另一个插件已占用的动词，安装时会被拒绝。用你自己的名义发布：`add` 在任何东西运行之前都会先显示发布者。
 
 ### 查看组织层：`5dive ui`
 
