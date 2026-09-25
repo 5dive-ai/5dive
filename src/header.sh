@@ -276,8 +276,20 @@ readonly FIVEDIVE_CHANNEL_PLUGINS_JSON='[{"plugin":"telegram","marketplace":"5di
 # under $(gh_org). Each row carries `install: "<org>/<repo>"`, the one-command
 # DIVE-4290 foreign add, because `<name>@<marketplace>` only resolves once that
 # marketplace is registered — which is what the install itself does. A plugin the
-# registry ALSO lists is not re-listed from here (registry wins, no second copy).
-readonly FIVEDIVE_STANDALONE_PLUGIN_REPOS="5dive-council"
+# registry ALSO lists is not re-listed from here (registry wins, no second copy) —
+# unless the pair is in FIVEDIVE_MOVED_PLUGINS below.
+readonly FIVEDIVE_STANDALONE_PLUGIN_REPOS="5dive-council 5dive-voice"
+
+# DIVE-4964: plugins that MOVED out of the registry into their own repo, as
+# `<plugin>:<repo>`. For these the standalone row REPLACES the registry row, so the
+# catalogue offers the repo copy (lodar, 2026-09-25: "i thought it goes from a
+# standalone repo 5dive-voice not from 5dive-plugins"). The registry copy stays
+# published and installable — boxes provisioned before the move name it (DIVE-4752
+# is what deleting one did) — it is just no longer what a fresh install is offered.
+# Keyed on the PAIR, not the name: another standalone repo that happens to publish
+# `voice` still loses to the registry. Browser is not here on purpose: its install
+# card and one-click allowlist in the app still install browser@5dive-plugins.
+readonly FIVEDIVE_MOVED_PLUGINS="voice:5dive-voice"
 
 # DIVE-4697: claude.ai ACCOUNT-level sync of skills and plugins — the keys that
 # turn it OFF, as one constant for the same reason the channel list above is one

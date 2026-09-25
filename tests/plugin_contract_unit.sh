@@ -383,9 +383,36 @@ if [[ -z "$REGISTRY" ]]; then
   # reasons that have nothing to do with this diff.
   printf '  !! NOT RUN — T8b/T8c (voice in the discovery list) need a registry checkout.\n'
 else
-  tc "T8b ...and the registry's voice is in it, so discovery and the installer agree" '"name":"voice"' "$OUT"
-  t  "T8c ...marked installable right now (it needs no marketplace to be added first)" "true" \
-     "$(jq -r '.data.plugins[] | select(.name=="voice") | .ready' <<<"$OUT")"
+  # DIVE-4964 restated these two for the move. Voice lists from its OWN repo
+  # (DIVE-4386), so the row discovery shows is the 5dive-voice row and its
+  # install is the one-command foreign add `5dive-ai/5dive-voice` — which
+  # registers the repo itself. `ready` means "this row's source is registered on
+  # the box", so on a box without the 5dive-voice clone ready:false is the honest
+  # value, and it does NOT mean "a marketplace must be added first" for a row
+  # whose install is <org>/<repo>. The voice repo's index is stubbed so the arm
+  # grades this tree, not whatever the network answers today.
+  curl() {
+    case "${*: -1}" in
+      */5dive-voice/main/.claude-plugin/marketplace.json)
+        printf '%s\n' '{"name":"5dive-voice","plugins":[{"name":"voice","category":"channel","source":"./voice"}]}' ;;
+      *) return 22 ;;
+    esac
+  }
+  JSON_MODE=1; run cmd_market --kind=plugin; JSON_MODE=0
+  t  "T8b ...and voice is in it ONCE, listed from its own repo (DIVE-4964)" "1|5dive-voice" \
+     "$(jq -r '[.data.plugins[] | select(.name=="voice")] | "\(length)|\(.[0].marketplace)"' <<<"$OUT")"
+  t  "T8c ...installed in one command by its repo, which registers the source itself" \
+     "$(gh_org)/5dive-voice|false" \
+     "$(jq -r '.data.plugins[] | select(.name=="voice") | "\(.install)|\(.ready)"' <<<"$OUT")"
+  # What the old T8c protected still holds for the registry copy that boxes
+  # provisioned before the move install by name (DIVE-4752): with voice's repo
+  # unreadable, the registry row is offered, installable right now.
+  curl() { return 22; }
+  JSON_MODE=1; run cmd_market --kind=plugin; JSON_MODE=0
+  t  "T8e ...and with voice's repo unreadable, the registry's voice is offered, installable now" \
+     "voice@5dive-plugins|true" \
+     "$(jq -r '.data.plugins[] | select(.name=="voice") | "\(.install)|\(.ready)"' <<<"$OUT")"
+  unset -f curl
 fi
 JSON_MODE=0
 run cmd_market --kind=banana; t "T8d an unknown --kind is refused rather than silently browsing agents" "$E_USAGE" "$RC"

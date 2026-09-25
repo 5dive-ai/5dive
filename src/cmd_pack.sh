@@ -3531,7 +3531,9 @@ _PLUGIN_INSTALLS_JQ='installs:(if (.name as $n | any($c[]; .plugin==$n and .mark
 _PLUGIN_INSTALL_REF_JQ='install:(.name + "@" + $m)'
 
 # _market_standalone_rows <rows-json> — <rows-json> plus a row for every plugin
-# in FIVEDIVE_STANDALONE_PLUGIN_REPOS that <rows-json> does not already name.
+# in FIVEDIVE_STANDALONE_PLUGIN_REPOS that <rows-json> does not already name. A
+# plugin listed in FIVEDIVE_MOVED_PLUGINS as `<name>:<this repo>` REPLACES the
+# registry row of that name instead (DIVE-4964) — in place, so the order holds.
 # Reads the registered clone when the box has one (ready:true), else the repo's
 # published marketplace.json. A repo that cannot be read contributes nothing and
 # never fails the listing — the registry rows are the listing's floor.
@@ -3551,12 +3553,18 @@ _market_standalone_rows() {
     # registers it as (_plugin_add_foreign) — not the index's own `name` field,
     # so the row's key matches the installed key the box will report.
     mname="$repo"
+    local moved="" mv
+    for mv in $FIVEDIVE_MOVED_PLUGINS; do
+      [[ "${mv#*:}" == "$repo" ]] && moved+="${moved:+ }${mv%%:*}"
+    done
     rows=$(jq -c --arg m "$mname" --arg src "${org}/${repo}" --argjson r "$rows" --argjson rd "$ready" \
-             --argjson c "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
-      '($r | map(.name)) as $have
-       | $r + [.plugins[]? | select(.name as $n | $have | index($n) | not)
-               | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:$rd,
-                  '"$_PLUGIN_INSTALLS_JQ"', install:$src}]' <<<"$idx") || rows="$1"
+             --argjson c "$FIVEDIVE_CHANNEL_PLUGINS_JSON" --arg mv "$moved" \
+      '($mv | split(" ") | map(select(. != ""))) as $moved
+       | [.plugins[]? | {name, description:(.description//""), category:(.category//"-"), marketplace:$m, ready:$rd,
+                         '"$_PLUGIN_INSTALLS_JQ"', install:$src}] as $mine
+       | ($r | map(.name)) as $have
+       | ($r | map(.name as $n | (if ($moved | index($n)) then ($mine | map(select(.name == $n)) | first) else null end) // .))
+         + [$mine[] | select(.name as $n | $have | index($n) | not)]' <<<"$idx") || rows="$1"
   done
   printf '%s\n' "$rows"
 }
@@ -3608,7 +3616,8 @@ cmd_market_plugins() {
              '"$_PLUGIN_INSTALLS_JQ"', '"$_PLUGIN_INSTALL_REF_JQ"'}]' \
       <<<"$idx")
   fi
-  # DIVE-4900: and the first-party plugins that live in their own repo (council).
+  # DIVE-4900: and the first-party plugins that live in their own repo (council,
+  # and voice, whose repo row replaces its registry row — DIVE-4964).
   rows=$(_market_standalone_rows "$rows")
 
   # With one registry there is no offline half-list to degrade to: either the
@@ -3650,7 +3659,9 @@ cmd_market_plugins() {
   echo "  install:  5dive plugin add <name>"
   local _standalone; _standalone=$(jq -r '[.[] | select(.install != null and (.install | contains("/"))) | "\(.name): 5dive plugin add \(.install)"] | join("; ")' <<<"$filtered")
   [[ -n "$_standalone" ]] && echo "  from its own repo — ${_standalone}"
-  local _notready; _notready=$(jq '[.[] | select(.ready|not)] | length' <<<"$filtered")
+  # A row whose install is <org>/<repo> registers its own source (the line
+  # above names it), so only REGISTRY rows need the registry added first.
+  local _notready; _notready=$(jq '[.[] | select((.ready|not) and ((.install // "") | contains("/") | not))] | length' <<<"$filtered")
   (( _notready > 0 )) && \
     echo "  the rows marked 'add source' need their marketplace first:  5dive plugin marketplace add $(gh_org)/5dive-plugins"
   # Truthful about the two install paths that currently coexist. telegram,
