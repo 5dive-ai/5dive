@@ -115,22 +115,28 @@ run() {
 # biconditional itself, so "install everything" and "refuse everything" are both
 # red.
 #
+# DIVE-4955 moved the line the split is drawn on. The tier no longer decides
+# whether a plugin installs — it is decided by the SOURCE and only labels it —
+# so the biconditional is now "installs IFF it follows the standard" (a
+# non-empty `fivedive` block, cmd_plugin.sh _plugin_follows_standard). `mod`,
+# which carries no block, is still refused; the message is now the standard's.
+#
 # A plugin's manifest is resolved through the `source` its publisher DECLARES in
 # the index, not by guessing $REGISTRY/plugins/<name>: the index is the only
 # thing that says where a plugin lives.
-_reg_review() {   # <name> -> the review tier the plugin's OWN manifest declares
+_reg_standard() {   # <name> -> "yes" iff the plugin's OWN manifest carries a non-empty fivedive block
   local n="$1" src mf
   src=$(jq -r --arg n "$n" '.plugins[] | select(.name==$n) | .source // ""' \
         "$REGISTRY/.claude-plugin/marketplace.json" 2>/dev/null)
   [[ -n "$src" ]] || src="./plugins/$n"
   mf="$REGISTRY/${src#./}/.claude-plugin/plugin.json"
   [[ -f "$mf" ]] || { printf 'NO-MANIFEST'; return; }
-  jq -r '.fivedive.trust.review // "unreviewed"' "$mf" 2>/dev/null
+  jq -r 'if (.fivedive | type) == "object" and (.fivedive | length) > 0 then "yes" else "no" end' "$mf" 2>/dev/null
 }
 
 BUNDLED=()     # every box-installable plugin the registry publishes
-OFFICIAL=()    # ...those whose own manifest declares review "official"
-UNREVIEWED=()  # ...and those that do not: the trust gate MUST refuse these
+OFFICIAL=()    # ...those that follow the standard (named for history: DIVE-4708 split on the tier)
+UNREVIEWED=()  # ...and those that do not: the gate MUST refuse these
 if [[ -n "$REGISTRY" ]]; then
   while IFS= read -r n; do
     [[ -z "$n" ]] && continue
@@ -141,7 +147,7 @@ if [[ -n "$REGISTRY" ]]; then
     # box-installable kind is this harness's subject.
     _plugin_is_builtin_channel "$n" && continue
     BUNDLED+=("$n")
-    if [[ "$(_reg_review "$n")" == official ]]; then OFFICIAL+=("$n"); else UNREVIEWED+=("$n"); fi
+    if [[ "$(_reg_standard "$n")" == yes ]]; then OFFICIAL+=("$n"); else UNREVIEWED+=("$n"); fi
   done < <(jq -r '.plugins[].name' "$REGISTRY/.claude-plugin/marketplace.json" 2>/dev/null | sort)
   # Two separate facts. The manifest must declare plugins at all (a checkout
   # pointed at the wrong tree fails HERE, loudly, instead of silently grading an
@@ -150,7 +156,7 @@ if [[ -n "$REGISTRY" ]]; then
   # but channels, the loops below would be vacuous and must say so, not pass.
   t "T0 the registry manifest declares at least one plugin (else the checkout is not a registry)" \
     "yes" "$([[ $(jq -r '.plugins | length' "$REGISTRY/.claude-plugin/marketplace.json" 2>/dev/null || echo 0) -ge 1 ]] && echo yes || echo no)"
-  t "T0b ...and at least one of them is box-installable AND official, so the corpus loops are not vacuous" \
+  t "T0b ...and at least one of them is box-installable AND follows the standard, so the corpus loops are not vacuous" \
     "yes" "$([[ ${#OFFICIAL[@]} -ge 1 ]] && echo yes || echo no)"
   t "T0b2 ...and every box-installable plugin landed in exactly one tier bucket" \
     "${#BUNDLED[@]}" "$(( ${#OFFICIAL[@]} + ${#UNREVIEWED[@]} ))"
@@ -183,8 +189,8 @@ done
 # and that is correct: there is nothing to refuse.
 for p in "${UNREVIEWED[@]}"; do
   run cmd_plugin_add "$p@$RMKT" --yes
-  t  "T1b 'plugin add $p' is REFUSED — it declares no 'official' review" "$E_PERMISSION" "$RC"
-  tc "T1b2 ...and the refusal names the tier, not something internal" "installs only 'official'" "$ERR"
+  t  "T1b 'plugin add $p' is REFUSED — it carries no fivedive block" "$E_PERMISSION" "$RC"
+  tc "T1b2 ...and the refusal names the standard, not something internal" "does not follow the 5dive plugin standard" "$ERR"
   [[ "$RC" == 0 ]] && _inst+=("$p") || _ref+=("$p")
 done
 
@@ -196,7 +202,7 @@ done
 # everything" are each red here, and a plugin silently dropped from BOTH loops
 # shows up as a missing name.
 if [[ -n "$REGISTRY" ]]; then
-  t "T1c a box-installable plugin installs IFF its own manifest declares 'official'" \
+  t "T1c a box-installable plugin installs IFF its own manifest follows the standard" \
     "install=[${OFFICIAL[*]}] refuse=[${UNREVIEWED[*]}]" "install=[${_inst[*]}] refuse=[${_ref[*]}]"
 fi
 

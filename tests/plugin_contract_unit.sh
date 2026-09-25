@@ -73,7 +73,14 @@ run() {
 # ---- fixtures ---------------------------------------------------------------
 # One fixture marketplace, one plugin per rule under test. Each is a REAL
 # directory with a REAL manifest, because the validator reads directories.
-MKT="$TMP/fixture-mkt"
+# DIVE-4955: `official` is decided by the GitHub owner the marketplace was
+# registered from, so the fixture is registered as 5dive-ai/fixture-mkt and git
+# fetches it from this directory (tests/lib/github_fixture.sh). A local-path
+# marketplace would read as community, whatever these manifests claim.
+# shellcheck source=/dev/null
+. "$ROOT/tests/lib/github_fixture.sh"
+gh_fixture_seam "$TMP/github"
+MKT="$TMP/github/5dive-ai/fixture-mkt.git"
 mkdir -p "$MKT/.claude-plugin"
 
 mkplugin() {  # mkplugin <dir-name> <manifest-json> [manifest-subdir]
@@ -116,11 +123,11 @@ mkplugin codexed  "$(manifest codexed 1.0.0 official '["channel"]')" .codex-plug
 # undeclared surfaces: ships the files, declares nothing
 mkplugin sneaky   "$(manifest sneaky 1.0.0 official '["channel"]')"
   echo '{"mcpServers":{}}' > "$MKT/sneaky/.mcp.json"
-  mkdir -p "$MKT/sneaky/skills"
+  mkdir -p "$MKT/sneaky/skills"; : > "$MKT/sneaky/skills/.keep"   # git does not carry an empty dir
 # declared surfaces: ships the same files AND names them
 mkplugin honest   "$(manifest honest 1.0.0 official '["channel","mcp","skill"]')"
   echo '{"mcpServers":{}}' > "$MKT/honest/.mcp.json"
-  mkdir -p "$MKT/honest/skills"
+  mkdir -p "$MKT/honest/skills"; : > "$MKT/honest/skills/.keep"   # git does not carry an empty dir
 mkindex
 
 # DIVE-4202: the CLI ships no plugins of its own. The registry arms below resolve
@@ -150,7 +157,8 @@ t "T0a the subject file really defined the verb (an empty source would pass ever
 t "T0b the fixture marketplace really has plugins" "yes" \
   "$([[ $(jq '.plugins|length' "$MKT/.claude-plugin/marketplace.json") -ge 10 ]] && echo yes || echo no)"
 
-run _plugin_mkt_add "$MKT" --as=fixture
+gh_fixture_publish "$MKT"
+run _plugin_mkt_add 5dive-ai/fixture-mkt --as=fixture
 t "T0c fixture marketplace registers" "0" "$RC"
 
 # =============================================================================
@@ -190,11 +198,15 @@ t  "T2f ...and all three are recorded" '["channel","mcp","skill"]' \
 # §5 + lodar's gate answer (2026-09-07): official only, and the door has no flag
 # =============================================================================
 run cmd_plugin_add good@fixture --yes; t "T3a an official plugin installs" "0" "$RC"
-run cmd_plugin_add commonly@fixture --yes; t "T3b a community plugin is REFUSED, not warned" "$E_PERMISSION" "$RC"
-tc "T3b-msg and it says what is missing rather than blaming the publisher" "prove who wrote a plugin" "$ERR"
-run cmd_plugin_add bare@fixture --yes; t "T3c a plugin with no fivedive block reads as unreviewed and is refused" "$E_PERMISSION" "$RC"
-t "T3d ...and nothing was installed by either refusal" "null" \
-  "$(jq -c '.["commonly@fixture"] // "null"' "$(_plugin_installed_json)" | tr -d '"')"
+# DIVE-4955 opened community (lodar, 2026-09-25). A plugin that follows the
+# standard installs whatever tier it earns; the tier is a label on the consent
+# screen, and the refusal belongs to a plugin that declares nothing.
+run cmd_plugin_add commonly@fixture --yes; t "T3b a community plugin that follows the standard INSTALLS (DIVE-4955)" "0" "$RC"
+tc "T3b-msg ...behind a consent screen that says what it is" "review:     community" "$OUT"
+run cmd_plugin_add bare@fixture --yes; t "T3c a plugin with no fivedive block is refused" "$E_PERMISSION" "$RC"
+tc "T3c-msg ...naming the standard" "does not follow the 5dive plugin standard" "$ERR"
+t "T3d ...and nothing was installed by that refusal" "null" \
+  "$(jq -c '.["bare@fixture"] // "null"' "$(_plugin_installed_json)" | tr -d '"')"
 # The deferral is only real if there is no way around it. If someone later adds
 # an --allow-unreviewed flag without building contract §5.1, this arm reds.
 run cmd_plugin_add commonly@fixture --allow-unreviewed --yes; t "T3e there is NO --allow-unreviewed escape hatch" "$E_USAGE" "$RC"
@@ -203,7 +215,7 @@ tc "T3e-msg and it is rejected as an unknown flag, i.e. the flag does not exist 
 # telegram/dashboard/buzz predate the contract; refusing them with the generic
 # third-party message would be true and useless.
 mkplugin telegram "$(manifest telegram 9.9.9 unreviewed '["channel"]')"; mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_add telegram@fixture --yes
 t  "T3f a built-in channel plugin is still refused" "$E_USAGE" "$RC"
 tc "T3f-msg ...but pointed at the per-AGENT path that actually works" "--channels=telegram" "$ERR"
@@ -217,7 +229,7 @@ tn "T3f-msg2 ...and NOT at the generic third-party wall" "prove who wrote a plug
 # assert against a screen that was never printed.
 mkplugin micy "$(manifest micy 1.0.0 official '["channel"]' '["audio-io"]')"
 mkplugin consenty "$(manifest consenty 1.0.0 official '["channel"]' '["agent-credentials"]')"; mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_add micy@fixture --yes
 t  "T4a-rc the fresh plugin installed, so the screen below really was printed" "0" "$RC"
 tc "T4a the consent screen names the grant in ENGLISH, not our enum" "your microphone and speakers" "$OUT$ERR"
@@ -237,7 +249,7 @@ tc "T5b re-adding the same version is LOUD about fetching nothing" "cannot arriv
 
 # The trap the whole clause exists to name: publish a change WITHOUT bumping.
 echo "a real change" > "$MKT/good/CHANGED"
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_upgrade good@fixture
 t  "T5c upgrade with an unbumped version reports no change" "0" "$RC"
 tc "T5c-msg ...and explains that the fix cannot arrive rather than saying 'up to date'" "keyed on the version" "$ERR"
@@ -245,7 +257,7 @@ t  "T5d ...and the installed copy really is still the old one" "no" \
    "$([[ -f "$(_plugin_cache_dir)/fixture/good/1.0.0/CHANGED" ]] && echo yes || echo no)"
 
 jq '.version="1.1.0"' "$MKT/good/.claude-plugin/plugin.json" > "$TMP/x" && mv "$TMP/x" "$MKT/good/.claude-plugin/plugin.json"
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_upgrade good@fixture
 t "T5e a bumped version upgrades" "0" "$RC"
 t "T5f ...installing ALONGSIDE: the old version dir is still on disk" "yes" \
@@ -300,7 +312,7 @@ t  "T11h ...and no dangling pointer was written" "no" \
 # decision the user did not make.
 run cmd_plugin_add good@fixture --yes
 jq '.version="1.2.0"' "$MKT/good/.claude-plugin/plugin.json" > "$TMP/x" && mv "$TMP/x" "$MKT/good/.claude-plugin/plugin.json"
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_upgrade good@fixture
 run cmd_plugin_disable good@fixture
 run cmd_plugin_rollback good@fixture
@@ -324,7 +336,7 @@ manifest good 2.0.0 official '["channel"]' > "$MKT2/good/.claude-plugin/plugin.j
 jq -n '{name:"fixture2", owner:{name:"t"}, plugins:[{name:"good", source:"./good"}]}' > "$MKT2/.claude-plugin/marketplace.json"
 run _plugin_mkt_add "$MKT2" --as=fixture2
 mkplugin good "$(manifest good 1.1.0 official '["channel"]')"; mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_add good --yes
 t "T7b a bare name that two marketplaces both offer is an ERROR, not a first-match" "$E_CONFLICT" "$RC"
 tc "T7b-msg and it shows how to disambiguate" "good@fixture" "$ERR"
@@ -399,7 +411,7 @@ SENTINEL="$TMP/EXECUTED"
 mkplugin setupy "$(manifest setupy 1.0.0 official '["channel"]' '[]' \
   "$(jq -cn --arg s "$SENTINEL" '{setup:{hint:"needs a host engine", command:("touch " + $s)}}')")"
 mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_add setupy@fixture --yes
 t  "T9a a plugin declaring a setup step installs"            "0" "$RC"
 tc "T9b ...and its hint is shown to the user"                "needs a host engine" "$OUT$ERR"
@@ -443,7 +455,7 @@ mkdir -p "$MKT/hasdeps/node_modules/playwright-core"
 printf '%s\n' '{"name":"playwright-core","version":"1.63.0"}' \
   > "$MKT/hasdeps/node_modules/playwright-core/package.json"
 mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 
 run cmd_plugin_add needsdeps@fixture --yes
 t  "T9h a plugin whose declared packages are absent still installs"   "0" "$RC"
@@ -468,7 +480,7 @@ mkplugin needsdeps "$(manifest needsdeps 1.1.0 official '["channel"]')"
 printf '%s\n' '{"name":"needsdeps","private":true,"dependencies":{"playwright-core":"1.63.0"}}' \
   > "$MKT/needsdeps/package.json"
 mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_upgrade needsdeps@fixture
 t  "T9j upgrading a plugin with declared packages succeeds"          "0" "$RC"
 tc "T9j2 ...and names the install line again, because the upgrade wiped the packages" \
@@ -555,7 +567,7 @@ t "T9h3 ...and its exit code"                            "0" \
 # as running nothing quietly.
 mkplugin nosetup "$(manifest nosetup 1.0.0 official '["channel"]')"
 mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_add nosetup@fixture --yes
 t  "T9i0 (precondition) the no-setup fixture installed"   "0" "$RC"
 run cmd_plugin_setup nosetup@fixture --yes
@@ -598,7 +610,7 @@ tc "T9k6 ...naming the flag it did not understand"        "unknown flag" "$OUT$E
 mkplugin setupbad "$(manifest setupbad 1.0.0 official '["channel"]' '[]' \
   "$(jq -cn '{setup:{hint:"will not work", command:"exit 7"}}')")"
 mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_add setupbad@fixture --yes
 run cmd_plugin_setup setupbad@fixture --yes
 t  "T9m a failing setup command fails the verb"           "1" "$RC"
@@ -647,7 +659,7 @@ PFS="$TMP/PREFLIGHT_RAN"
 mkplugin setupgone "$(manifest setupgone 1.0.0 official '["channel"]' '[]' \
   "$(jq -cn --arg s "$PFS" '{setup:{hint:"needs a host engine", command:("5dive-setup-nope-4491 ; touch " + $s)}}')")"
 mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_add setupgone@fixture --yes
 t  "T9o7 (precondition) the missing-program fixture installed" "0" "$RC"
 run cmd_plugin_setup setupgone@fixture --yes
@@ -666,7 +678,7 @@ t  "T9o12 ...and no run is recorded, so the page can still offer the button" "nu
 mkplugin setupgonesudo "$(manifest setupgonesudo 1.0.0 official '["channel"]' '[]' \
   "$(jq -cn '{setup:{hint:"needs a host engine", command:"sudo -n 5dive-setup-nope-4491"}}')")"
 mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_add setupgonesudo@fixture --yes
 run cmd_plugin_setup setupgonesudo@fixture --yes
 t  "T9o13 the voice shape (sudo + a missing program) is refused too" "4" "$RC"
@@ -707,7 +719,7 @@ mkplugin setupseat "$(manifest setupseat 1.0.0 official '["channel"]' '[]' \
   "$(jq -cn --arg f "$SEATSEEN" '{setup:{hint:"needs to know whose box-half this is",
                                           command:("printf %s \"$SUDO_USER\" > " + $f)}}')")"
 mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_add setupseat@fixture --yes
 t "T9q0 (precondition) the seat-reading fixture installed" "0" "$RC"
 
@@ -759,7 +771,7 @@ mkplugin setupwired "$(manifest setupwired 1.0.0 official '["channel"]' '[]' \
   "$(jq -cn --arg f "$SEATWIRED" '{setup:{hint:"box half, owned by a seat",
                                           command:("printf %s \"$SUDO_USER\" > " + $f)}}')")"
 mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_add setupwired@fixture --yes
 t "T9r0 (precondition) the wiring fixture installed" "0" "$RC"
 
@@ -811,7 +823,7 @@ t "T9t2 ...and that mutant is otherwise alive — it ran the command, just bare"
 mkplugin setupdenied "$(manifest setupdenied 1.0.0 official '["channel"]' '[]' \
   '{"setup":{"hint":"needs rights the seat has not got","command":"exit 77"}}')"
 mkindex
-run _plugin_mkt_upgrade fixture
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
 run cmd_plugin_add setupdenied@fixture --yes
 shimmed_setup alice setupdenied@fixture --yes
 t  "T9u a command that fails UNDER THE DROP fails the verb" "1" "$RC"

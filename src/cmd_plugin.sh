@@ -14,13 +14,16 @@
 # CLI-only self-hoster has no path to discovering or installing one at all.
 # That gap is what `plugin` closes.
 #
-# SCOPE, and it is narrower than the contract on purpose. lodar answered the
-# DIVE-4020 gate on 2026-09-07 02:43:57Z: *"Ship voice only now, defer
-# third-party."* So this file implements the `official` tier and REFUSES the
-# other two. That is not a stub — refusing is the shipped behaviour of the
-# deferral, and it is tested. The trust-root / CRL / launch-recheck machinery in
-# contract §5.1 is exactly what `community` would need, it does not exist, and
-# nothing here pretends it does. See _plugin_trust_gate.
+# SCOPE. DIVE-4020 shipped official-only (lodar, 2026-09-07: *"Ship voice only
+# now, defer third-party."*). DIVE-4955 opened it from the command line (lodar,
+# 2026-09-25: *"open for all via command line they can install from any repo
+# that follows our plugin standard"*): a plugin that carries the `fivedive`
+# block installs, and one not from 5dive installs as `community` after a
+# consent screen that names its source and says there is no sandbox. The
+# trust-root / CRL / launch-recheck machinery of contract §5.1 is still unbuilt,
+# so nothing here can switch a bad community plugin off remotely — `plugin
+# disable`/`remove` on the box is the off switch, and the consent screen says so.
+# See _plugin_trust_gate.
 #
 # ---- WHERE THE STORE LIVES, AND WHY IT IS NOT WHERE THE CONTRACT SAYS -------
 #
@@ -80,6 +83,13 @@ _plugin_publish_json() {
 readonly PLUGIN_CAPABILITIES="channel mcp skill verb hook"
 readonly PLUGIN_GRANTS="telegram-token audio-io agent-credentials fs-home network browser-profiles"
 readonly PLUGIN_REVIEW_TIERS="official community unreviewed"
+
+# DIVE-4955 — who may publish an `official` plugin. GitHub owners, compared
+# case-insensitively (GitHub logins are). 5dive-com is the org this CLI's own
+# gh_org() falls back to and redirects to 5dive-ai; both are ours. A CONSTANT on
+# purpose: gh_org() honours $GH_ORG, and a trust root that an environment
+# variable can rename is not a root. See _plugin_effective_review.
+readonly PLUGIN_OFFICIAL_OWNERS="5dive-ai 5dive-com"
 
 # Plain English for the consent screen (§5.2). The point of this map is that the
 # screen must describe what the user is HANDING OVER, not echo our enum back at
@@ -183,8 +193,8 @@ _plugin_usage() {
 5dive plugin — install and manage 5dive plugins
 
   5dive plugin list [--json]                      # what is installed, with version and tier
-  5dive plugin add <plugin>[@<marketplace>] [--yes]
-  5dive plugin add <owner>/<repo>[/<plugin>] [--as=<marketplace>] [--yes]
+  5dive plugin add <plugin>[@<marketplace>] [--yes] [--official-only]
+  5dive plugin add <owner>/<repo>[/<plugin>] [--as=<marketplace>] [--yes] [--official-only]
   5dive plugin remove <plugin>[@<marketplace>]
   5dive plugin upgrade <plugin>[@<marketplace>]
   5dive plugin enable|disable <plugin>[@<marketplace>]    # a flag flip; the code stays on disk
@@ -219,8 +229,20 @@ _plugin_usage() {
   a different user's config and fails with "not found in marketplace".
 
   Installing a plugin is installing CODE that runs with your agent's access.
-  `add` prints who published it and exactly what it will be handed, and waits
-  for you to agree. Pass --yes only when you have already read that.
+  `add` prints where it comes from and exactly what it will be handed, and
+  waits for you to agree. Pass --yes only when you have already read that.
+
+  Any repository whose plugin follows the 5dive plugin standard installs — its
+  plugin.json carries a "fivedive" block naming contract "1":
+  https://github.com/5dive-ai/5dive/blob/main/docs/plugin-contract.md
+  A plugin with no such block is refused.
+
+  The tier comes from WHERE the plugin comes from, never from what its manifest
+  says: `official` only from github.com/5dive-ai, `community` from anyone else.
+  A community plugin runs with your agents' access and there is no sandbox;
+  5dive cannot switch one off remotely, so `plugin disable` / `remove` on this
+  server is the off switch. --official-only refuses anything not official (the
+  dashboard's one-click install passes it).
 USAGE
 }
 
@@ -354,20 +376,30 @@ _plugin_validate_manifest() {
   _PL_MANIFEST="$j"
 }
 
-# ---- the trust gate (contract §5, narrowed by lodar's gate answer) ---------
+# ---- the trust gate (contract §5) ------------------------------------------
 #
-# This is where the deferral is IMPLEMENTED rather than described. lodar's
-# answer was "ship voice only now, defer third-party", so the only tier that
-# installs is `official`.
+# DIVE-4955. Two questions, asked of two different things, and the difference
+# is the whole design:
 #
-# It refuses rather than warning, and the difference matters: a warning would let
-# a third-party plugin land today and make the deferral a documentation claim.
-# The message names what is missing, because the honest reason this is closed is
-# not "we don't trust you", it is that contract §5.1's trust root, its
-# counter-signed key enrollment and its revocation list are all unbuilt — there
-# is nothing to verify a community signature AGAINST, and a check against the
-# marketplace the plugin came from proves only that a publisher agrees with
-# themselves (the circular check quinn caught in iteration 1).
+#   1. DOES IT FOLLOW THE STANDARD? — asked of the MANIFEST. It must carry the
+#      `fivedive` block and name contract "1" (_plugin_follows_standard). A plain
+#      Claude Code plugin with no block is refused, naming the contract doc: it
+#      has declared no surfaces and no grants, so there is nothing for §2 to
+#      register and nothing for the consent screen to show.
+#   2. WHO IS IT FROM? — asked of the SOURCE, never the manifest
+#      (_plugin_effective_review). `official` only from a GitHub owner in
+#      PLUGIN_OFFICIAL_OWNERS; everything else is `community` whatever it says
+#      about itself. The manifest can lower its own tier and never raise it.
+#
+# `community` INSTALLS on the command line, behind a consent screen that shows
+# the one thing we can verify (the source and commit), labels the publisher as
+# claimed, and says there is no sandbox. It is refused only on a path that asked
+# for official-only (`--official-only`, what the dashboard's one-click passes,
+# because that page shows no warning yet).
+#
+# Contract §5.1's trust root, key enrollment and revocation list are still
+# unbuilt, so a community plugin cannot be switched off remotely. That residual
+# was accepted by lodar's call and is printed at consent, not hidden.
 #
 # ONE special case, and it is not a carve-out in the gate — it is a better
 # error. Our own telegram / dashboard / buzz plugins predate the contract, carry
@@ -408,25 +440,150 @@ _plugin_builtin_channel_refusal() {
   fail "$E_USAGE" "'$p' is one of 5dive's built-in channel plugins — it is installed per AGENT, not per box, so 'plugin add' is not the path. Use: 5dive agent create <name> --channels=$p  (or, for an existing agent, 5dive agent config <name> --channels=$p). It predates the plugin contract and carries no 5dive manifest block, which is why it would otherwise read as unreviewed."
 }
 
-_plugin_trust_gate() {
-  local name="$1" review="$2"
-  case "$review" in
-    official) return 0 ;;
-    community|unreviewed|"")
-      if _plugin_is_builtin_channel "$name"; then
-        _plugin_builtin_channel_refusal "$name"
-      fi
-      fail "$E_PERMISSION" "$(cat <<MSG
-'$name' is a ${review:-unreviewed} plugin, and 5dive installs only 'official' plugins today.
+# ---- who decides `official` (DIVE-4955) -------------------------------------
+#
+# The tier used to be read straight out of the plugin's own plugin.json, so any
+# GitHub repo that wrote "fivedive":{"trust":{"review":"official"}} passed the
+# gate above and installed box-wide — the deferral was a field in a stranger's
+# manifest, and the refusal message named the missing word. The same shape as
+# community/wiki/a-guard-that-rests-on-a-field-in-someone-elses-manifest-is-not-a-guard.md,
+# one level up: there it was the channel guard, here it was the gate itself.
+#
+# `official` is now decided from WHERE the plugin came from, read out of our
+# own marketplaces.json (root-owned, written only by `marketplace add` and the
+# registry bootstrap from what the operator typed) — never from anything the
+# plugin publishes. The manifest keeps exactly one power: it may DOWNGRADE. A
+# 5dive-ai plugin that says `unreviewed` stays refused; nothing says `official`
+# for itself.
+#
+# Why the recorded REF and not the resolved clone URL: the ref is the question
+# we asked GitHub, and GitHub answers "5dive-ai/<repo>" only with a repository
+# that 5dive-ai controls. A fork is a different owner in the ref, so it is not
+# official. A rename inside 5dive-ai keeps the owner. The one residue is a repo
+# TRANSFERRED out of 5dive-ai, whose old name GitHub redirects until we reuse
+# it — that is an admin action on our own org, not something a stranger can do.
+#
+# This is not the circular check the gate's header rules out. That one asked the
+# marketplace to vouch for its own plugins ("a publisher agrees with
+# themselves"); this asks GitHub who owns the repository, which no publisher
+# outside 5dive-ai can answer for us.
 
-A third-party plugin runs as your agent, under your agent's user, with your
-agent's credentials — there is no sandbox between them. Opening that door needs
-a way to prove who wrote a plugin and to switch a bad one off after it is
-installed. That machinery is specified (contract §5.1) and is not built yet, so
-the door stays shut rather than being propped open with a flag.
-MSG
-)" ;;
+# <recorded-source> -> the GitHub owner, lowercased, or rc 1. Strict on purpose:
+# only the three spellings `_plugin_mkt_add` itself clones from GitHub, then an
+# exact owner/repo. Anything else — another host, http://, userinfo, a local
+# path — is not a GitHub source and gets no owner at all.
+_plugin_github_owner() {
+  local s="${1:-}"
+  case "$s" in
+    https://github.com/*)   s="${s#https://github.com/}" ;;
+    ssh://git@github.com/*) s="${s#ssh://git@github.com/}" ;;
+    git@github.com:*)       s="${s#git@github.com:}" ;;
+    *://*|*@*|/*|.*|"")     return 1 ;;
+    *) : ;;   # owner/repo shorthand: _plugin_mkt_add clones https://github.com/<it>.git
   esac
+  s="${s%/}"; s="${s%.git}"
+  [[ "$s" =~ ^([A-Za-z0-9-]+)/[A-Za-z0-9._-]+$ ]] || return 1
+  printf '%s' "${BASH_REMATCH[1],,}"
+}
+
+# <marketplace> -> rc 0 iff it was registered from a source 5dive owns.
+#
+# Two ways in, both about the SOURCE:
+#   1. a git marketplace recorded from a GitHub owner in PLUGIN_OFFICIAL_OWNERS.
+#      `kind` must be git — `marketplace add ./5dive-ai/x` from a directory
+#      that happens to be spelled like a repo is recorded as local, and a local
+#      directory is whatever was copied into it.
+#   2. the registry marketplace when the operator has pinned it to a local
+#      checkout with FIVEDIVE_PLUGIN_REGISTRY — the pre-existing seam CI and the
+#      harnesses use to say "this path IS 5dive-ai/5dive-plugins". It is root's
+#      own environment (the dashboard's exec path cannot set it), it must still
+#      be set now, it must match the recorded source exactly, and it binds only
+#      the registry's own name: the same path added under any other name is local.
+_plugin_mkt_is_official() {
+  local mkt="${1:-}" rec kind src owner
+  rec=$(jq -c --arg n "$mkt" '.[$n] // empty' "$(_plugin_mkt_json)" 2>/dev/null)
+  [[ -n "$rec" ]] || return 1
+  kind=$(jq -r '.kind // ""' <<<"$rec"); src=$(jq -r '.source // ""' <<<"$rec")
+  if [[ "$kind" == "git" ]] && owner=$(_plugin_github_owner "$src"); then
+    [[ " $PLUGIN_OFFICIAL_OWNERS " == *" $owner "* ]] && return 0
+  fi
+  [[ "$mkt" == "$(_plugin_registry_name)" && -n "${FIVEDIVE_PLUGIN_REGISTRY:-}" \
+     && "$src" == "$FIVEDIVE_PLUGIN_REGISTRY" ]]
+}
+
+# <marketplace> <tier-the-manifest-claims> -> the tier this box acts on:
+# the LOWER of what the source earns (official from a 5dive owner, community
+# from anyone else) and what the manifest claims. Down only: the claim can lower
+# the answer, never raise it.
+_plugin_effective_review() {
+  local mkt="$1" claimed="${2:-unreviewed}" earned=community
+  _plugin_mkt_is_official "$mkt" && earned=official
+  case "$claimed" in
+    official)  printf '%s' "$earned" ;;
+    community) printf 'community' ;;
+    *)         printf 'unreviewed' ;;
+  esac
+}
+
+# <manifest-json> -> rc 0 iff it follows the 5dive plugin standard: a
+# non-empty `fivedive` block. Everything INSIDE the block — a contract other
+# than "1", an unknown capability, grant or tier — is already refused by
+# _plugin_validate_manifest before this is asked, so the only question left is
+# whether the plugin declared anything at all. An empty block declares nothing,
+# which is the same as no block.
+_plugin_follows_standard() {
+  jq -e '(.fivedive | type) == "object" and (.fivedive | length) > 0' <<<"${1:-}" >/dev/null 2>&1
+}
+
+# Where the contract is published, for every message that tells a publisher to
+# read it. The public copy; the wiki page this file cites in its header is ours.
+readonly PLUGIN_CONTRACT_URL="https://github.com/5dive-ai/5dive/blob/main/docs/plugin-contract.md"
+
+# <marketplace> -> what the consent screen shows as the SOURCE: the recorded
+# ref, and for a git marketplace the commit it is at. This is the part of the
+# screen we can vouch for; the manifest's publisher line is not.
+_plugin_source_label() {
+  local mkt="$1" rec kind src sha=""
+  rec=$(jq -c --arg n "$mkt" '.[$n] // {}' "$(_plugin_mkt_json)" 2>/dev/null)
+  kind=$(jq -r '.kind // ""' <<<"$rec"); src=$(jq -r '.source // ""' <<<"$rec")
+  src="${src#https://github.com/}"; src="${src%.git}"
+  [[ "$kind" == git ]] && sha=$(git -C "$(_plugin_mkt_dir)/$mkt" rev-parse --short=12 HEAD 2>/dev/null)
+  printf '%s%s' "${src:-$mkt}" "${sha:+@$sha}"
+}
+
+_plugin_trust_gate() {  # <name> <review> <claimed> <follows-standard 0|1> <official-only 0|1> <ref>
+  local name="$1" review="$2" claimed="${3:-$2}" standard="${4:-1}" official_only="${5:-0}" ref="${6:-$1}"
+  # Unchanged from DIVE-4020/4466 and still first: anything not official that is
+  # NAMED like one of our per-agent channels gets the per-agent path, not a
+  # generic refusal and not a box-wide install.
+  if [[ "$review" != official ]] && _plugin_is_builtin_channel "$name"; then
+    _plugin_builtin_channel_refusal "$name"
+  fi
+  if [[ "$standard" != 1 ]]; then
+    fail "$E_PERMISSION" "$(cat <<MSG
+'$name' does not follow the 5dive plugin standard: its plugin.json has no
+"fivedive" block. 5dive installs only plugins that declare what they add and
+what they need, so it can show you both before anything runs.
+
+If you publish it, add the block — the standard is at
+$PLUGIN_CONTRACT_URL
+MSG
+)"
+  fi
+  [[ "$review" == official ]] && return 0
+  (( official_only )) || return 0
+  local _why=""
+  [[ "$claimed" == official ]] \
+    && _why=" Its manifest calls it 'official', but a plugin cannot vouch for itself: only plugins published by 5dive (github.com/5dive-ai) are official."
+  fail "$E_PERMISSION" "$(cat <<MSG
+'$name' is a $review plugin, not one published by 5dive, and this install path takes only official plugins.$_why
+
+A plugin not from 5dive runs with your agents' access, and there is no sandbox.
+To install it anyway, run this on the server, where you will see where its code
+comes from before you agree:
+  sudo 5dive plugin add $ref
+MSG
+)"
 }
 
 # ---- consent (contract §5.2) ----------------------------------------------
@@ -436,13 +593,20 @@ MSG
 # defaulting to yes there would make the screen decorative on exactly the path
 # (scripts, the dashboard exec tunnel) where nobody is watching.
 _plugin_consent() {
-  local name="$1" version="$2" publisher="$3" review="$4" grants="$5" assume_yes="$6"
+  local name="$1" version="$2" publisher="$3" review="$4" grants="$5" assume_yes="$6" mkt="${7:-}"
 
   echo
   echo "  Installing a plugin installs CODE that runs with your agent's access."
   echo
   echo "    plugin:     $name $version"
-  echo "    published:  ${publisher:-unknown}"
+  if [[ "$review" == official ]]; then
+    echo "    published:  ${publisher:-unknown}"
+  else
+    # DIVE-4955: the source is what we can check; the publisher line is the
+    # plugin's own claim, so it is labelled as one.
+    [[ -n "$mkt" ]] && echo "    source:     $(_plugin_source_label "$mkt")"
+    echo "    published:  ${publisher:-unknown} (claimed by the plugin — not checked)"
+  fi
   echo "    review:     $review"
   if [[ -n "$grants" ]]; then
     echo "    handed to it:"
@@ -452,6 +616,16 @@ _plugin_consent() {
     echo "    handed to it: nothing beyond its own directory"
   fi
   echo
+  if [[ "$review" != official ]]; then
+    if [[ -n "$mkt" ]] && _plugin_mkt_is_official "$mkt"; then
+      echo "  From 5dive's GitHub, but its publisher has not marked it official."
+    else
+      echo "  Not from 5dive. It runs with your agents' access; there is no sandbox."
+    fi
+    echo "  5dive cannot switch it off for you later: 'sudo 5dive plugin disable $name@${mkt:-<marketplace>}'"
+    echo "  (or remove) on this server is the off switch."
+    echo
+  fi
 
   (( assume_yes )) && { echo "  (--yes given)"; echo; return 0; }
   [[ -t 0 ]] || fail "$E_PERMISSION" "plugin add needs your confirmation and stdin is not a terminal — re-run with --yes if you have read the above"
@@ -934,8 +1108,8 @@ _plugin_sources_equivalent() {  # <registered> <requested>
   [[ "$a" == "$b" ]]
 }
 
-_plugin_add_foreign() {  # <source-ref> <as-name> <assume-yes>
-  local ref="$1" as_name="$2" assume_yes="$3"
+_plugin_add_foreign() {  # <source-ref> <as-name> <assume-yes> [<official-only>]
+  local ref="$1" as_name="$2" assume_yes="$3" official_only="${4:-0}"
   _plugin_foreign_parse "$ref"
   local source="$_PL_FOREIGN_SOURCE" wanted="$_PL_FOREIGN_PLUGIN"
   local mkt="${as_name:-$_PL_FOREIGN_MKT}"
@@ -978,6 +1152,7 @@ _plugin_add_foreign() {  # <source-ref> <as-name> <assume-yes>
 
   local -a install_args=("${wanted}@${mkt}")
   (( assume_yes )) && install_args+=(--yes)
+  (( official_only )) && install_args+=(--official-only)
   # Re-enter the canonical installer. This is load-bearing: the foreign path
   # gets the exact same trust gate and DIVE-995 consent disclosure as the
   # long-standing plugin@marketplace form, with no second copy to drift.
@@ -1033,21 +1208,25 @@ _plugin_node_deps_notice() {  # <key> <dir>
 }
 
 cmd_plugin_add() {
-  local ref="" as_name="" assume_yes=0 a
+  local ref="" as_name="" assume_yes=0 official_only=0 a
   for a in "$@"; do
     case "$a" in
       --yes|-y) assume_yes=1 ;;
+      # DIVE-4955: what the dashboard's one-click passes. That page shows no
+      # consent screen, so it must not be able to install anything the consent
+      # screen exists to warn about.
+      --official-only) official_only=1 ;;
       --as=*)   as_name="${a#--as=}" ;;
       --*)      fail "$E_USAGE" "unknown flag: $a" ;;
       *)        [[ -z "$ref" ]] && ref="$a" || fail "$E_USAGE" "one plugin at a time" ;;
     esac
   done
-  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive plugin add <plugin>[@<marketplace>]|<owner>/<repo>[/<plugin>] [--as=<marketplace>] [--yes]"
+  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive plugin add <plugin>[@<marketplace>]|<owner>/<repo>[/<plugin>] [--as=<marketplace>] [--yes] [--official-only]"
 
   if [[ "$ref" != *@* && "$ref" == */* ]] \
      || [[ "$ref" == */*@* ]] \
      || [[ "$ref" == *://* || "$ref" == git@*:* ]]; then
-    _plugin_add_foreign "$ref" "$as_name" "$assume_yes"
+    _plugin_add_foreign "$ref" "$as_name" "$assume_yes" "$official_only"
     return
   fi
   [[ -z "$as_name" ]] || fail "$E_USAGE" "--as applies only to a repository source (<owner>/<repo> or URL)"
@@ -1081,11 +1260,17 @@ cmd_plugin_add() {
   local version publisher review grants caps
   version=$(jq -r '.version' <<<"$j")
   publisher=$(jq -r '.fivedive.trust.publisher // .author.name // ""' <<<"$j")
-  review=$(jq -r '.fivedive.trust.review // "unreviewed"' <<<"$j")
+  local claimed
+  claimed=$(jq -r '.fivedive.trust.review // "unreviewed"' <<<"$j")
+  # DIVE-4955: decided from the marketplace's recorded source, never taken from
+  # the manifest. What is stored below, printed on the consent screen and read
+  # back by `setup` is THIS value, not the claim.
+  review=$(_plugin_effective_review "$mkt" "$claimed")
   grants=$(jq -r '(.fivedive.grants // []) | join(" ")' <<<"$j")
   caps=$(jq -r '(.fivedive.capabilities // []) | join(" ")' <<<"$j")
 
-  _plugin_trust_gate "$plugin" "$review"
+  local standard=0; _plugin_follows_standard "$j" && standard=1
+  _plugin_trust_gate "$plugin" "$review" "$claimed" "$standard" "$official_only" "${plugin}@${mkt}"
 
   local key="${plugin}@${mkt}"
 
@@ -1127,7 +1312,7 @@ cmd_plugin_add() {
     return 0
   fi
 
-  _plugin_consent "$plugin" "$version" "$publisher" "$review" "$grants" "$assume_yes"
+  _plugin_consent "$plugin" "$version" "$publisher" "$review" "$grants" "$assume_yes" "$mkt"
 
   mkdir -p "$(dirname "$dest")"
   # §3: install is a COPY of the whole directory, node_modules and all. Not a
@@ -1261,9 +1446,23 @@ _plugin_seat_reregister() { # <key> <plugin> <marketplace> <caps> <dir>
   return 0
 }
 
+# DIVE-4955: a record written before the tier was decided from the source says
+# whatever its manifest claimed. Show the tier we would decide now (down only),
+# so `list` and the dashboard stop repeating a stranger's `official`.
+_plugin_installed_redecided() {  # <installed-json> -> the same json, tiers re-decided
+  local j="$1" m ours="[]"
+  while IFS= read -r m; do
+    [[ -z "$m" ]] && continue
+    _plugin_mkt_is_official "$m" && ours=$(jq -c --arg m "$m" '. + [$m]' <<<"$ours")
+  done < <(jq -r '[.[] | .marketplace // empty] | unique[]' <<<"$j")
+  jq -c --argjson ours "$ours" \
+    'with_entries(if .value.review == "official" and ((.value.marketplace // "") as $m | $ours | index($m) | not)
+                  then .value.review = "community" else . end)' <<<"$j"
+}
+
 cmd_plugin_list() {
   _plugin_ensure_store
-  local j; j=$(cat "$(_plugin_installed_json)")
+  local j; j=$(_plugin_installed_redecided "$(cat "$(_plugin_installed_json)")")
   if (( JSON_MODE )); then ok "" '$p' --argjson p "$j"; return; fi
   if [[ "$j" == "{}" ]]; then
     echo "No plugins installed."
@@ -1356,8 +1555,24 @@ cmd_plugin_upgrade() {
     return 0
   fi
 
-  local review; review=$(jq -r '.fivedive.trust.review // "unreviewed"' <<<"$nj")
-  _plugin_trust_gate "$plugin" "$review"
+  # DIVE-4955: the same decision as `add`, against the marketplace this key was
+  # installed from — an upgrade is a new version of someone's code, and the
+  # claim in its manifest is no more trustworthy the second time.
+  local claimed review standard=0
+  claimed=$(jq -r '.fivedive.trust.review // "unreviewed"' <<<"$nj")
+  review=$(_plugin_effective_review "$mkt" "$claimed")
+  _plugin_follows_standard "$nj" && standard=1
+  _plugin_trust_gate "$plugin" "$review" "$claimed" "$standard" 0 "$key"
+  # Consent was given at `add`, to this source. An upgrade is new code from the
+  # same place, so it is not re-asked — but it is not silent either, and a record
+  # written before DIVE-4955 that said `official` on the manifest's word is told
+  # what it really is.
+  if [[ "$review" != official ]]; then
+    local _was; _was=$(jq -r --arg k "$key" '.[$k].review // ""' <<<"$j")
+    echo "  $key is $review — source $(_plugin_source_label "$mkt"), not published by 5dive; there is no sandbox." >&2
+    [[ "$_was" == official ]] \
+      && echo "  It was recorded as official on its own manifest's word; it is now recorded as $review." >&2
+  fi
 
   local dest; dest="$(_plugin_cache_dir)/$mkt/$plugin/$new"
   if [[ ! -d "$dest" ]]; then
@@ -1371,8 +1586,8 @@ cmd_plugin_upgrade() {
   local tmp; tmp=$(mktemp)
   jq --arg k "$key" --arg v "$new" --arg t "$(date -u +%FT%TZ)" \
      --argjson caps "$(jq -c '(.fivedive.capabilities // [])' <<<"$nj")" \
-     --argjson grants "$(jq -c '(.fivedive.grants // [])' <<<"$nj")" \
-     '.[$k].version = $v | .[$k].capabilities = $caps | .[$k].grants = $grants | .[$k].upgraded_at = $t' \
+     --argjson grants "$(jq -c '(.fivedive.grants // [])' <<<"$nj")" --arg r "$review" \
+     '.[$k].version = $v | .[$k].capabilities = $caps | .[$k].grants = $grants | .[$k].review = $r | .[$k].upgraded_at = $t' \
      <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
 
   # DIVE-4522: re-pin the seats at the new version. `5dive-refresh-plugins.sh`
@@ -1978,6 +2193,10 @@ cmd_plugin_setup() {
   local plugin review
   plugin=$(jq -r --arg k "$key" '.[$k].plugin' <<<"$j")
   review=$(jq -r --arg k "$key" '.[$k].review // "unreviewed"' <<<"$j")
+  # DIVE-4955: a record written before the tier was decided from the source
+  # holds whatever the manifest claimed. Re-decide it (down only), so a box
+  # that installed a self-described official plugin does not keep showing it.
+  review=$(_plugin_effective_review "$(jq -r --arg k "$key" '.[$k].marketplace // ""' <<<"$j")" "$review")
 
   # DIVE-4491: refuse a setup step whose program this box does not have, BEFORE
   # the consent block and before anything is run, so the dashboard panel reads a

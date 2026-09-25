@@ -60,12 +60,17 @@ CLONES="$TMP/clones"; : > "$CLONES"
 git(){
   if [[ "${1:-}" == clone ]]; then
     local url="${*: -2:1}" dest="${*: -1}" src=""
+    # DIVE-4955: the fixtures are published under 5dive-ai, because `official`
+    # is now decided by the owner a repository was fetched from and these arms
+    # grade the one-step SYNTAX, which has to get past the trust gate to be
+    # observed. A third-party owner is refused; plugin_official_from_source_unit.sh
+    # grades that half.
     case "$url" in
-      https://github.com/acme/weather.git) src="$REMOTE/weather" ;;
-      https://github.com/acme/tools.git)   src="$REMOTE/tools" ;;
-      https://github.com/acme/suite.git)   src="$REMOTE/suite" ;;
-      https://github.com/acme/urlonly.git|https://github.com/acme/urlonly) src="$REMOTE/urlonly" ;;
-      https://github.com/acme/broken.git)  src="$REMOTE/broken" ;;
+      https://github.com/5dive-ai/weather.git) src="$REMOTE/weather" ;;
+      https://github.com/5dive-ai/tools.git)   src="$REMOTE/tools" ;;
+      https://github.com/5dive-ai/suite.git)   src="$REMOTE/suite" ;;
+      https://github.com/5dive-ai/urlonly.git|https://github.com/5dive-ai/urlonly) src="$REMOTE/urlonly" ;;
+      https://github.com/5dive-ai/broken.git)  src="$REMOTE/broken" ;;
       *) return 91 ;;
     esac
     printf '%s -> %s\n' "$url" "$dest" >> "$CLONES"
@@ -79,49 +84,49 @@ git(){
 CONSENTS="$TMP/consents"; : > "$CONSENTS"
 _plugin_consent(){ printf '%s|%s|%s\n' "$1" "$2" "$5" >> "$CONSENTS"; }
 
-run cmd_plugin_add acme/weather --yes
+run cmd_plugin_add 5dive-ai/weather --yes
 eq_t 'single-plugin repository installs in one command' 0 "$RC"
 eq_t 'single-plugin install records its marketplace' weather \
   "$(jq -r '.["forecast@weather"].marketplace // ""' "$(_plugin_installed_json)")"
 has_t 'foreign install traverses the canonical DIVE-995 disclosure call' 'forecast|1.0.0|' "$(cat "$CONSENTS")"
 
 clone_before=$(wc -l < "$CLONES")
-run cmd_plugin_add acme/weather --yes
+run cmd_plugin_add 5dive-ai/weather --yes
 eq_t 'already-registered repository remains installable' 0 "$RC"
 eq_t 'already-registered repository is not cloned or duplicated' "$clone_before" "$(wc -l < "$CLONES")"
 eq_t 'marketplace registry contains one weather key' 1 \
   "$(jq '[to_entries[] | select(.key=="weather")] | length' "$(_plugin_mkt_json)")"
 
-run cmd_plugin_add acme/tools/beta --yes
+run cmd_plugin_add 5dive-ai/tools/beta --yes
 eq_t 'owner/repo/plugin selects the named plugin' 0 "$RC"
 eq_t 'explicit plugin is installed from repo marketplace' true \
   "$(jq 'has("beta@tools")' "$(_plugin_installed_json)")"
 
-run cmd_plugin_add acme/tools --yes
+run cmd_plugin_add 5dive-ai/tools --yes
 eq_t 'multi-plugin repository without matching repo name refuses' "$E_USAGE" "$RC"
 has_t 'multi-plugin refusal lists available names' 'alpha beta' "$ERR"
 has_t 'multi-plugin refusal gives the explicit form' '<owner>/<repo>/<plugin>' "$ERR"
 
-run cmd_plugin_add acme/suite --yes
+run cmd_plugin_add 5dive-ai/suite --yes
 eq_t 'multi-plugin repository selects plugin named after repo' 0 "$RC"
 eq_t 'repo-named plugin was installed' true "$(jq 'has("suite@suite")' "$(_plugin_installed_json)")"
 
-run cmd_plugin_add acme/broken --yes
+run cmd_plugin_add 5dive-ai/broken --yes
 eq_t 'repository without marketplace index refuses' "$E_VALIDATION" "$RC"
 has_t 'missing-index error names the required file' '.claude-plugin/marketplace.json' "$ERR"
 eq_t 'missing-index refusal leaves no registry entry' false "$(jq 'has("broken")' "$(_plugin_mkt_json)")"
 eq_t 'missing-index refusal removes the staged clone' no "$([[ -e "$(_plugin_mkt_dir)/broken" ]] && echo yes || echo no)"
 
-run cmd_plugin_add https://github.com/acme/urlonly --yes
+run cmd_plugin_add https://github.com/5dive-ai/urlonly --yes
 eq_t 'GitHub URL form installs in one command' 0 "$RC"
 eq_t 'URL form derives repository marketplace name' true "$(jq 'has("urlplug@urlonly")' "$(_plugin_installed_json)")"
 
-run cmd_plugin_add acme/weather --as=wx --yes
+run cmd_plugin_add 5dive-ai/weather --as=wx --yes
 eq_t '--as is honoured on repository source' 0 "$RC"
 eq_t '--as controls installed marketplace key' true "$(jq 'has("forecast@wx")' "$(_plugin_installed_json)")"
 
 json_add(){ JSON_MODE=1 cmd_plugin_add "$@"; }
-run json_add acme/weather --as=json-weather --yes
+run json_add 5dive-ai/weather --as=json-weather --yes
 eq_t 'JSON mode succeeds for one-step repository install' 0 "$RC"
 eq_t 'JSON mode emits one response envelope' 1 "$(printf '%s\n' "$OUT" | grep -c .)"
 jq -e '.ok == true and .data.plugin == "forecast" and .data.marketplace == "json-weather"' \
@@ -130,11 +135,11 @@ jq -e '.ok == true and .data.plugin == "forecast" and .data.marketplace == "json
   || bad_t 'JSON response identifies the installed plugin and marketplace' "$OUT"
 
 # Old two-step form and the literal aliases remain live.
-run cmd_plugin_marketplace add "$REMOTE/weather" --as=legacy
+run cmd_plugin_marketplace add 5dive-ai/weather --as=legacy
 eq_t 'existing marketplace-add step still works' 0 "$RC"
 run cmd_plugin_add forecast@legacy --yes
 eq_t 'existing plugin@marketplace install still works' 0 "$RC"
-run cmd_plugin install acme/weather --yes
+run cmd_plugin install 5dive-ai/weather --yes
 eq_t 'plugin install aliases canonical add' 0 "$RC"
 grep -qE '^[[:space:]]*plugin\|plugins\)' src/main.sh \
   && ok_t 'top-level plugins aliases plugin' \

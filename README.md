@@ -200,7 +200,7 @@ Turn an outcome into a guarded task graph.
 `5dive loop spawn --role=researcher --agent=scout --prompt="Track competitor launches"`<br>
 Run bounded autonomous work in a persistent agent loop.
 
-`5dive plugin add 5dive-ai/5dive-council`<br>
+`sudo 5dive plugin add 5dive-ai/5dive-council`<br>
 Add the Council. It is an opt-in plugin; the constitution (`5dive constitution`) and the human-gate floor it seals work without it.
 
 `sudo 5dive council init --seats=alice:chair,bob,carol --threshold=majority --veto=human:you`<br>
@@ -218,7 +218,7 @@ Every attempt has a receipt. A run is one agent's one attempt at one task — wh
 `5dive watch`<br>
 Watch the whole team in real time.
 
-`5dive plugin add 5dive-ai/5dive-ui`<br>
+`sudo 5dive plugin add 5dive-ai/5dive-ui`<br>
 Then `5dive ui` opens local browser views for the org chart, task queue, human gates, and signed trigger deliveries. The UI is a plugin with [its own repo](https://github.com/5dive-ai/5dive-ui).
 
 `5dive wall main olivia dev quinn ops --grid=3x2`<br>
@@ -418,16 +418,20 @@ sudo 5dive plugin disable browser@5dive-browser    # a flag flip; the code stays
 sudo 5dive plugin rollback browser@5dive-browser 1.1.0
 ```
 
-`add` prints who published the plugin and exactly what it will be handed, then waits for you to agree: a plugin is code that runs with your agents' access. `5dive market --kind=plugin` is the catalog, and the same list is on the dashboard under **Plugins**.
+`add` shows where the plugin comes from and exactly what it will be handed, then waits for you to agree: a plugin is code that runs with your agents' access. `5dive market --kind=plugin` is the catalog, and the same list is on the dashboard under **Plugins**.
 
-**Develop your own.** Any repo with a `.claude-plugin/marketplace.json` naming its plugins installs with `5dive plugin add <owner>/<repo>`. [5dive-browser](https://github.com/5dive-ai/5dive-browser) and [5dive-voice](https://github.com/5dive-ai/5dive-voice) are the two we ship that way; [5dive-plugins](https://github.com/5dive-ai/5dive-plugins) is the marketplace with the rest (telegram, dashboard, buzz). A plugin declares what it registers (`channel`, `verb`, `skill`, `mcp`). A verb plugin ships `bin/<verb>` and is reached only after every builtin command, so it can never take `5dive task` from you; a manifest naming a builtin, or a verb another plugin already claims, is refused at install. Publish under your own name: `add` shows the publisher before anything runs.
+**Official and community.** A plugin from [github.com/5dive-ai](https://github.com/5dive-ai) is `official`. A plugin from any other repository is `community`, whatever its own manifest says. Community plugins install from the command line after a consent screen that shows the repository and commit and says: *Not from 5dive. It runs with your agents' access; there is no sandbox.* The dashboard's one-click install takes official plugins only.
+
+> **There is no remote kill switch.** Plugins are not signed yet and 5dive cannot revoke one, so if a community plugin turns out to be bad, the off switch is on your server: `sudo 5dive plugin disable <plugin>@<marketplace>` (or `remove`). Install community plugins from publishers you would trust with your agents' credentials.
+
+**Develop your own.** Any repository that follows the [5dive plugin standard](docs/plugin-contract.md) installs with `sudo 5dive plugin add <owner>/<repo>`: a `.claude-plugin/marketplace.json` naming its plugins, and a `plugin.json` that carries a `fivedive` block. A plain Claude Code plugin with no `fivedive` block is refused. [5dive-browser](https://github.com/5dive-ai/5dive-browser) and [5dive-voice](https://github.com/5dive-ai/5dive-voice) are two we ship that way; [5dive-plugins](https://github.com/5dive-ai/5dive-plugins) is the marketplace with the rest (telegram, dashboard, buzz). A plugin declares what it registers (`channel`, `verb`, `skill`, `mcp`). A verb plugin ships `bin/<verb>` and is reached only after every builtin command, so it can never take `5dive task` from you; a manifest naming a builtin, or a verb another plugin already claims, is refused at install.
 
 ### See the org layer: `5dive ui`
 
 The web UI is a plugin, in [its own repository](https://github.com/5dive-ai/5dive-ui). One install, no build step, no account:
 
 ```sh
-5dive plugin add 5dive-ai/5dive-ui
+sudo 5dive plugin add 5dive-ai/5dive-ui
 5dive ui                 # http://127.0.0.1:8735
 ```
 
@@ -455,7 +459,7 @@ Four views is a start, not a finish — the [5dive-ui repo](https://github.com/5
 5dive company                            # stand up a self-steering company
 5dive goal add "<outcome>"                # outcome -> guarded task graph
 5dive loop spawn --role=<r> --agent=<a> --prompt="<work>"
-5dive plugin add 5dive-ai/5dive-council   # the Council is an opt-in plugin
+sudo 5dive plugin add 5dive-ai/5dive-council   # the Council is an opt-in plugin
 sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<principal>
 5dive council convene "<question>" --mode=adversarial
 5dive trace <task>                       # causal timeline from origin to verdict
