@@ -304,6 +304,64 @@ tn "T2h ...without fetching the council repo" "5dive-council" "$(cat "$CURL_LOG"
 unset -f curl
 export STATE_DIR="$_st_save"
 
+# T2i-T2l — DIVE-4964: voice MOVED to its own repo, so its repo row REPLACES the
+# registry row (lodar, 2026-09-25: "i thought it goes from a standalone repo
+# 5dive-voice not from 5dive-plugins"). T2e above is the fallback half: with the
+# repo unreachable, voice is still offered from the registry, never dropped.
+export STATE_DIR="$TMP/state-moved"
+curl() {
+  local u="${*: -1}"
+  case "$u" in
+    */5dive-voice/main/.claude-plugin/marketplace.json)
+      printf '%s\n' '{"name":"5dive-voice","plugins":[{"name":"voice","category":"channel","description":"Voice from its own repo.","source":"./voice"}]}' ;;
+    */5dive-plugins/main/.claude-plugin/marketplace.json)
+      printf '%s\n' '{"name":"5dive-plugins","plugins":[{"name":"telegram","category":"productivity"},{"name":"voice","category":"channel","description":"Registry mirror."},{"name":"browser","category":"channel"}]}' ;;
+    *) return 22 ;;
+  esac
+}
+JSON_MODE=1
+run cmd_market_plugins --kind=plugin
+JSON_MODE=0
+t "T2i listing with voice's own repo succeeded (rc)" "0" "$RC"
+t "T2i voice is listed ONCE" "1" "$(jq '[.data.plugins[] | select(.name=="voice")] | length' <<<"$OUT")"
+t "T2i ...from 5dive-voice, box-wide, installed by repo, not ready on a box with no clone" \
+  "voice|5dive-voice|box|5dive-ai/5dive-voice|false|Voice from its own repo." \
+  "$(jq -r '.data.plugins[] | select(.name=="voice") | "\(.name)|\(.marketplace)|\(.installs)|\(.install)|\(.ready)|\(.description)"' <<<"$OUT")"
+t "T2j the replacement is in place (catalogue order unchanged) and browser still lists from the registry" \
+  "telegram@5dive-plugins voice@5dive-voice browser@5dive-plugins" \
+  "$(jq -r '[.data.plugins[] | select(.name != "council") | "\(.name)@\(.marketplace)"] | join(" ")' <<<"$OUT")"
+# A registered 5dive-voice clone is read from disk and the row is ready.
+mkdir -p "$(_plugin_mkt_dir)/5dive-voice/.claude-plugin"
+printf '%s\n' '{"name":"5dive-voice","plugins":[{"name":"voice","category":"channel","source":"./voice"}]}' \
+  >"$(_plugin_mkt_dir)/5dive-voice/.claude-plugin/marketplace.json"
+JSON_MODE=1
+run cmd_market_plugins --kind=plugin
+JSON_MODE=0
+t "T2k a box with the 5dive-voice clone registered lists voice once, ready, from the repo" \
+  "1|5dive-voice|5dive-ai/5dive-voice|true" \
+  "$(jq -r '[.data.plugins[] | select(.name=="voice")] | "\(length)|\(.[0].marketplace)|\(.[0].install)|\(.[0].ready)"' <<<"$OUT")"
+unset -f curl
+# NEGATIVE CONTROL: the replacement is keyed on the (plugin, repo) PAIR. A moved
+# list naming a different repo leaves the registry row standing — which is also
+# what T2g asserts for council's repo publishing a stray `voice`.
+_mv_saved_out="$OUT"
+out_ctl=$(bash -c '
+  set -uo pipefail; cd "$1"
+  source src/lib/error_codes.sh; source src/lib/output.sh
+  source <(sed "s/^readonly FIVEDIVE_MOVED_PLUGINS=.*/FIVEDIVE_MOVED_PLUGINS=\"voice:5dive-elsewhere\"/" src/header.sh)
+  source src/cmd_plugin.sh; source src/cmd_pack.sh; set +e
+  export STATE_DIR="$2"; GH_ORG=5dive-ai; _GH_ORG_RESOLVED=""
+  curl() { local u="${*: -1}"; case "$u" in
+    */5dive-voice/main/*) printf "%s\n" "{\"name\":\"5dive-voice\",\"plugins\":[{\"name\":\"voice\"}]}" ;;
+    */5dive-plugins/main/*) printf "%s\n" "{\"name\":\"5dive-plugins\",\"plugins\":[{\"name\":\"voice\"}]}" ;;
+    *) return 22 ;; esac; }
+  JSON_MODE=1; cmd_market_plugins --kind=plugin' _ "$ROOT" "$TMP/state-moved-ctl" 2>/dev/null)
+t "T2l control: without the (voice, 5dive-voice) pair the registry row wins" \
+  "1|5dive-plugins" \
+  "$(jq -r '[.data.plugins[] | select(.name=="voice")] | "\(length)|\(.[0].marketplace)"' <<<"$out_ctl" 2>/dev/null)"
+OUT="$_mv_saved_out"
+export STATE_DIR="$_st_save"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
