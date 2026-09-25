@@ -4073,14 +4073,112 @@ _merge_do_already_landed() {
   return 0
 }
 
+# ---- DIVE-4999: CAN THIS BOX'S MERGE ACCOUNT MERGE AT ALL? -------------------
+#
+# The verify path writes "auto-mergeable at the graded sha — run `5dive task
+# merge <ident>`" on every PASS whose pull request is clean, and nothing on that
+# path asked whether the account `_merge_do` merges WITH may push to the base
+# repo. On a box whose account is pull-only upstream (luca, teal-fox,
+# 2026-09-25: `.permissions` = pull:true push:false on 5dive-ai/5dive-browser)
+# the line is an instruction no seat can carry out, and the seats followed it:
+# a tier-2 secret gate for a merge token (5dive-browser#16), and an approval
+# gate to a lead that answered "misrouted: no merge rights" (5dive#1129).
+#
+# THE QUESTION IS ASKED OF THE MERGE ACCOUNT, NOT OF THE SEAT. `task merge`
+# never merges with the grading seat's own gh login: `_merge_do` merges with
+# the machine account in `$_GH_BOT_ENV`, which is root-only. So the only honest
+# probe runs where that credential lives, behind the grant every grader already
+# holds (`_merge_do`), rather than behind `_gh_do`, which graders do not hold —
+# probing through `_gh_do` would read "unknown" on every grader and take the
+# hint away from the boxes where it is true.
+
+# _merge_push_verdict <permissions-json> -> push | pull-only | unknown. PURE.
+# `push` or `maintain` is what a merge needs (admin implies push). Anything that
+# is not a permissions OBJECT — empty, `null`, an error body — is `unknown`,
+# never `pull-only`: a read that failed is not a measurement of the account.
+_merge_push_verdict() {
+  local j="${1:-}" v=""
+  [[ -n "$j" ]] || { printf 'unknown'; return 0; }
+  v=$(jq -r 'if type == "object" and has("push")
+             then (if (.push == true or .maintain == true) then "push" else "pull-only" end)
+             else "unknown" end' <<<"$j" 2>/dev/null) || v=""
+  case "$v" in push|pull-only) printf '%s' "$v" ;; *) printf 'unknown' ;; esac
+}
+
+# _merge_bot_token — the machine account's token on stdout, or rc 1. ROOT-side
+# (the connectors dir is root-only); split out so the probe below is executable
+# in a harness without the readonly connector path.
+# (An `if`, not the `[[ -r ... ]] ||` shape: task_merge_already_merged_unit T9a
+# locates `_merge_do`'s own credential demand by that line's exact text.)
+_merge_bot_token() {
+  local tok=""
+  if [[ -r "$_GH_BOT_ENV" ]]; then
+    # shellcheck disable=SC1090
+    tok=$(set -a; . "$_GH_BOT_ENV"; set +a; printf '%s' "${GH_BOT_TOKEN:-}")
+  fi
+  [[ -n "$tok" ]] || return 1
+  printf '%s' "$tok"
+}
+
+# _merge_do_push_probe <ident> — ROOT half of `_merge_do --push-probe <ident>`.
+# Prints ONE line: `push <repo>`, `pull-only <repo>`, `no-credential <repo>` or
+# `unknown`. Always rc 0: the line is the answer, and the caller treats anything
+# else as `unknown`.
+#
+# READ-ONLY AND ROW-BOUND. The repo is derived from the row's own delivery_ref,
+# never taken from the caller, so this reaches exactly the repo a `task merge`
+# on that row would. It asks no STANDING, on purpose: the answer is a property
+# of the box's merge account and the repo, not of which seat asks, and the
+# verify path that asks is not always the seat the rail blesses (DIVE-4512's
+# graded-twice row) — requiring standing would read `unknown` there and drop a
+# hint that is true. What it returns is four booleans GitHub already shows to
+# any collaborator; it merges nothing and prints no token.
+_merge_do_push_probe() {
+  local ident="${1:-}" pr repo tok perms=""
+  tasks_db_init
+  pr=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
+  repo=$(_gate_slug_from_url "$pr")
+  [[ -n "$repo" ]] || { printf 'unknown\n'; return 0; }
+  tok=$(_merge_bot_token) || tok=""
+  [[ -n "$tok" ]] || { printf 'no-credential %s\n' "$repo"; return 0; }
+  perms=$(GH_TOKEN="$tok" GITHUB_TOKEN="" GH_CONFIG_DIR="$(gh_config_dir)" \
+            timeout 20 gh api "repos/${repo}" --jq .permissions 2>/dev/null) || perms=""
+  printf '%s %s\n' "$(_merge_push_verdict "$perms")" "$repo"
+}
+
+# _merge_push_probe <ident> — CALLER half. One line on stdout, same vocabulary.
+# FAILS CLOSED ON THE HINT: a refused sudo, an installed binary that predates
+# the sentinel (it rejects two arguments), a timeout, or any line outside the
+# strict shape reads `unknown`, and `unknown` never prints `task merge`. The one
+# network read is bounded root-side (`timeout 20 gh`), so a hung GitHub cannot
+# hold the verify that asked; `sudo -n` never prompts.
+_merge_push_probe() {
+  local ident="${1:-}" out=""
+  [[ -n "$ident" ]] || { printf 'unknown'; return 0; }
+  out=$(printf '%s\0' --push-probe "$ident" \
+          | sudo -n /usr/local/bin/5dive _merge_do 2>/dev/null) || out=""
+  out="${out%%$'\n'*}"
+  if [[ "$out" =~ ^(push|pull-only|no-credential)\ [A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+    printf '%s' "$out"
+  else
+    printf 'unknown'
+  fi
+}
+
 # cmd_task_merge_do — ROOT-ONLY (`_merge_do`). Re-derives everything: the caller
 # from SUDO_UID, the standing from the row, and the pull request from the row's
 # own delivery_ref. Accepts an IDENT and nothing else, so there is no argument
 # through which a caller can name a different pull request or a different grader.
+# The one exception is the DIVE-4999 READ, `--push-probe <ident>`, which merges
+# nothing and returns before any of the merge path runs.
 cmd_task_merge_do() {
   [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_merge_do is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
   local -a args=(); local a
   while IFS= read -r -d '' a; do args+=("$a"); done
+  if (( ${#args[@]} == 2 )) && [[ "${args[0]}" == "--push-probe" ]]; then
+    _merge_do_push_probe "${args[1]}"
+    return 0
+  fi
   (( ${#args[@]} == 1 )) || fail "$E_VALIDATION" "_merge_do takes exactly one task ident on stdin and no flags — got ${#args[@]} argument(s). The pull request is read from the row, never from the caller."
   local ident="${args[0]}"
   [[ "$ident" == --* ]] && fail "$E_VALIDATION" "_merge_do takes a task ident, not a flag ('${ident}')."

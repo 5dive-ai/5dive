@@ -330,6 +330,11 @@ DISP_ANSWER="merge"
 # grades the shipped decide->resolve chain end to end and needs it back.
 eval "_merge_disp_probe_real() $(declare -f _merge_disp_probe | tail -n +2)"
 _merge_disp_probe() { printf '%s' "$DISP_ANSWER"; }
+# DIVE-4999: the hint below is printed only when this box's merge account may push
+# to the repo. That read is its own leaf (graded in
+# tests/merge_hint_push_permission_unit.sh); here the account CAN, which is the
+# shape every C-arm about the hint's wording was written for.
+_merge_push_probe() { printf 'push 5dive-ai/5dive'; }
 
 mkrow() { # mkrow <title> -> row id of a DELIVERED maker->verifier row bound to a PR
   db "INSERT INTO tasks (title, assignee, created_by, kind, status, maker_agent, verifier,

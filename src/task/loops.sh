@@ -942,7 +942,30 @@ cmd_task_verify() {
           # (src/task/status.sh, same ticket) so that a hint we do not compose —
           # an older board line, a quoted screenshot, a human — cannot spend it
           # either; this half removes the trigger, that half makes the verb safe.
-          _md_why="auto-mergeable at the graded sha — run \`5dive task merge ${ident}\`"
+          #
+          # DIVE-4999: AND ONLY WHEN THIS BOX'S MERGE ACCOUNT CAN MERGE IT. The
+          # rail merges with the machine account, and on a box where that
+          # account is pull-only upstream (or absent) the verb above can only
+          # fail — the seats that followed it filed a secret gate for a token
+          # nobody would issue and an approval gate to a lead with no rights.
+          # Only a measured `push` prints the verb; `unknown` (a failed read, a
+          # refused sudo, an older installed binary) fails closed on the HINT
+          # and still writes the line, so the board render never waits on it.
+          local _md_push="" _md_repo=""
+          if declare -F _merge_push_probe >/dev/null 2>&1; then
+            _md_push=$(_merge_push_probe "$ident" 2>/dev/null) || _md_push=""
+          fi
+          [[ "$_md_push" == *" "* ]] && _md_repo="${_md_push#* }"
+          case "${_md_push%% *}" in
+            push)
+              _md_why="auto-mergeable at the graded sha — run \`5dive task merge ${ident}\`" ;;
+            pull-only)
+              _md_why="mergeable at the graded sha, waiting on the ${_md_repo} maintainer — this box's merge account is pull-only there, so no seat here can merge it" ;;
+            no-credential)
+              _md_why="mergeable at the graded sha, waiting on the ${_md_repo} maintainer — this box holds no merge account, so no seat here can merge it" ;;
+            *)
+              _md_why="mergeable at the graded sha, but this box could not confirm its merge account may push to the repo — no merge is suggested until it can" ;;
+          esac
         else
           _md_held=1
           _md_owner="${_md_disp#hold:}"; _md_why="${_md_owner#*:}"; _md_owner="${_md_owner%%:*}"
