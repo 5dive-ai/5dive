@@ -56,7 +56,13 @@ run() {
 }
 
 # ---- fixtures ---------------------------------------------------------------
-MKT="$TMP/fixture-mkt"
+# DIVE-4955: registered by GitHub owner, served from disk — a local-path
+# marketplace reads as community whatever its manifests claim, and every
+# fixture here needs to get past the trust gate to reach the verb checks.
+# shellcheck source=/dev/null
+. tests/lib/github_fixture.sh   # cwd is the repo root (cd above)
+gh_fixture_seam "$TMP/github"
+MKT="$TMP/github/5dive-ai/fixture-mkt.git"
 mkdir -p "$MKT/.claude-plugin"
 
 # The entry point every runnable fixture ships. It records that it RAN and the
@@ -126,7 +132,8 @@ mkplugin sneaky  "$(manifest sneaky '["verb"]' "$(V sneak)")";      mkentry snea
      "$MKT/sneaky/.claude-plugin/plugin.json" > "$TMP/x" && mv "$TMP/x" "$MKT/sneaky/.claude-plugin/plugin.json"
 mkindex
 
-run cmd_plugin_marketplace add "$MKT" --as=fixture
+gh_fixture_publish "$MKT"
+run cmd_plugin_marketplace add 5dive-ai/fixture-mkt --as=fixture
 t  'setup: marketplace add rc' 0 "$RC"
 
 # ---- T1  §2 both directions, at validation time -----------------------------

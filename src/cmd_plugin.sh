@@ -81,6 +81,13 @@ readonly PLUGIN_CAPABILITIES="channel mcp skill verb hook"
 readonly PLUGIN_GRANTS="telegram-token audio-io agent-credentials fs-home network browser-profiles"
 readonly PLUGIN_REVIEW_TIERS="official community unreviewed"
 
+# DIVE-4955 — who may publish an `official` plugin. GitHub owners, compared
+# case-insensitively (GitHub logins are). 5dive-com is the org this CLI's own
+# gh_org() falls back to and redirects to 5dive-ai; both are ours. A CONSTANT on
+# purpose: gh_org() honours $GH_ORG, and a trust root that an environment
+# variable can rename is not a root. See _plugin_effective_review.
+readonly PLUGIN_OFFICIAL_OWNERS="5dive-ai 5dive-com"
+
 # Plain English for the consent screen (§5.2). The point of this map is that the
 # screen must describe what the user is HANDING OVER, not echo our enum back at
 # them: "grants: agent-credentials" tells a customer nothing, and a consent
@@ -408,16 +415,101 @@ _plugin_builtin_channel_refusal() {
   fail "$E_USAGE" "'$p' is one of 5dive's built-in channel plugins — it is installed per AGENT, not per box, so 'plugin add' is not the path. Use: 5dive agent create <name> --channels=$p  (or, for an existing agent, 5dive agent config <name> --channels=$p). It predates the plugin contract and carries no 5dive manifest block, which is why it would otherwise read as unreviewed."
 }
 
+# ---- who decides `official` (DIVE-4955) -------------------------------------
+#
+# The tier used to be read straight out of the plugin's own plugin.json, so any
+# GitHub repo that wrote "fivedive":{"trust":{"review":"official"}} passed the
+# gate above and installed box-wide — the deferral was a field in a stranger's
+# manifest, and the refusal message named the missing word. The same shape as
+# community/wiki/a-guard-that-rests-on-a-field-in-someone-elses-manifest-is-not-a-guard.md,
+# one level up: there it was the channel guard, here it was the gate itself.
+#
+# `official` is now decided from WHERE the plugin came from, read out of our
+# own marketplaces.json (root-owned, written only by `marketplace add` and the
+# registry bootstrap from what the operator typed) — never from anything the
+# plugin publishes. The manifest keeps exactly one power: it may DOWNGRADE. A
+# 5dive-ai plugin that says `unreviewed` stays refused; nothing says `official`
+# for itself.
+#
+# Why the recorded REF and not the resolved clone URL: the ref is the question
+# we asked GitHub, and GitHub answers "5dive-ai/<repo>" only with a repository
+# that 5dive-ai controls. A fork is a different owner in the ref, so it is not
+# official. A rename inside 5dive-ai keeps the owner. The one residue is a repo
+# TRANSFERRED out of 5dive-ai, whose old name GitHub redirects until we reuse
+# it — that is an admin action on our own org, not something a stranger can do.
+#
+# This is not the circular check the gate's header rules out. That one asked the
+# marketplace to vouch for its own plugins ("a publisher agrees with
+# themselves"); this asks GitHub who owns the repository, which no publisher
+# outside 5dive-ai can answer for us.
+
+# <recorded-source> -> the GitHub owner, lowercased, or rc 1. Strict on purpose:
+# only the three spellings `_plugin_mkt_add` itself clones from GitHub, then an
+# exact owner/repo. Anything else — another host, http://, userinfo, a local
+# path — is not a GitHub source and gets no owner at all.
+_plugin_github_owner() {
+  local s="${1:-}"
+  case "$s" in
+    https://github.com/*)   s="${s#https://github.com/}" ;;
+    ssh://git@github.com/*) s="${s#ssh://git@github.com/}" ;;
+    git@github.com:*)       s="${s#git@github.com:}" ;;
+    *://*|*@*|/*|.*|"")     return 1 ;;
+    *) : ;;   # owner/repo shorthand: _plugin_mkt_add clones https://github.com/<it>.git
+  esac
+  s="${s%/}"; s="${s%.git}"
+  [[ "$s" =~ ^([A-Za-z0-9-]+)/[A-Za-z0-9._-]+$ ]] || return 1
+  printf '%s' "${BASH_REMATCH[1],,}"
+}
+
+# <marketplace> -> rc 0 iff it was registered from a source 5dive owns.
+#
+# Two ways in, both about the SOURCE:
+#   1. a git marketplace recorded from a GitHub owner in PLUGIN_OFFICIAL_OWNERS.
+#      `kind` must be git — `marketplace add ./5dive-ai/x` from a directory
+#      that happens to be spelled like a repo is recorded as local, and a local
+#      directory is whatever was copied into it.
+#   2. the registry marketplace when the operator has pinned it to a local
+#      checkout with FIVEDIVE_PLUGIN_REGISTRY — the pre-existing seam CI and the
+#      harnesses use to say "this path IS 5dive-ai/5dive-plugins". It is root's
+#      own environment (the dashboard's exec path cannot set it), it must still
+#      be set now, it must match the recorded source exactly, and it binds only
+#      the registry's own name: the same path added under any other name is local.
+_plugin_mkt_is_official() {
+  local mkt="${1:-}" rec kind src owner
+  rec=$(jq -c --arg n "$mkt" '.[$n] // empty' "$(_plugin_mkt_json)" 2>/dev/null)
+  [[ -n "$rec" ]] || return 1
+  kind=$(jq -r '.kind // ""' <<<"$rec"); src=$(jq -r '.source // ""' <<<"$rec")
+  if [[ "$kind" == "git" ]] && owner=$(_plugin_github_owner "$src"); then
+    [[ " $PLUGIN_OFFICIAL_OWNERS " == *" $owner "* ]] && return 0
+  fi
+  [[ "$mkt" == "$(_plugin_registry_name)" && -n "${FIVEDIVE_PLUGIN_REGISTRY:-}" \
+     && "$src" == "$FIVEDIVE_PLUGIN_REGISTRY" ]]
+}
+
+# <marketplace> <tier-the-manifest-claims> -> the tier this box acts on.
+# Down only: the claim can lower the answer, never raise it.
+_plugin_effective_review() {
+  local mkt="$1" claimed="${2:-unreviewed}"
+  [[ "$claimed" == official ]] || { printf '%s' "$claimed"; return 0; }
+  if _plugin_mkt_is_official "$mkt"; then printf 'official'; else printf 'community'; fi
+}
+
 _plugin_trust_gate() {
-  local name="$1" review="$2"
+  local name="$1" review="$2" claimed="${3:-$2}"
   case "$review" in
     official) return 0 ;;
     community|unreviewed|"")
       if _plugin_is_builtin_channel "$name"; then
         _plugin_builtin_channel_refusal "$name"
       fi
+      # DIVE-4955: say WHY a self-described official plugin reads as community,
+      # because "you are community" to a publisher whose manifest says
+      # otherwise reads as a bug in the installer, not as the rule.
+      local _why=""
+      [[ "$claimed" == official && "$review" != official ]] \
+        && _why=" Its manifest calls it 'official', but a plugin cannot vouch for itself: only plugins published by 5dive (github.com/5dive-ai) are official."
       fail "$E_PERMISSION" "$(cat <<MSG
-'$name' is a ${review:-unreviewed} plugin, and 5dive installs only 'official' plugins today.
+'$name' is a ${review:-unreviewed} plugin, and 5dive installs only 'official' plugins today.${_why}
 
 A third-party plugin runs as your agent, under your agent's user, with your
 agent's credentials — there is no sandbox between them. Opening that door needs
@@ -1081,11 +1173,16 @@ cmd_plugin_add() {
   local version publisher review grants caps
   version=$(jq -r '.version' <<<"$j")
   publisher=$(jq -r '.fivedive.trust.publisher // .author.name // ""' <<<"$j")
-  review=$(jq -r '.fivedive.trust.review // "unreviewed"' <<<"$j")
+  local claimed
+  claimed=$(jq -r '.fivedive.trust.review // "unreviewed"' <<<"$j")
+  # DIVE-4955: decided from the marketplace's recorded source, never taken from
+  # the manifest. What is stored below, printed on the consent screen and read
+  # back by `setup` is THIS value, not the claim.
+  review=$(_plugin_effective_review "$mkt" "$claimed")
   grants=$(jq -r '(.fivedive.grants // []) | join(" ")' <<<"$j")
   caps=$(jq -r '(.fivedive.capabilities // []) | join(" ")' <<<"$j")
 
-  _plugin_trust_gate "$plugin" "$review"
+  _plugin_trust_gate "$plugin" "$review" "$claimed"
 
   local key="${plugin}@${mkt}"
 
@@ -1356,8 +1453,13 @@ cmd_plugin_upgrade() {
     return 0
   fi
 
-  local review; review=$(jq -r '.fivedive.trust.review // "unreviewed"' <<<"$nj")
-  _plugin_trust_gate "$plugin" "$review"
+  # DIVE-4955: the same decision as `add`, against the marketplace this key was
+  # installed from — an upgrade is a new version of someone's code, and the
+  # claim in its manifest is no more trustworthy the second time.
+  local claimed review
+  claimed=$(jq -r '.fivedive.trust.review // "unreviewed"' <<<"$nj")
+  review=$(_plugin_effective_review "$mkt" "$claimed")
+  _plugin_trust_gate "$plugin" "$review" "$claimed"
 
   local dest; dest="$(_plugin_cache_dir)/$mkt/$plugin/$new"
   if [[ ! -d "$dest" ]]; then
@@ -1371,8 +1473,8 @@ cmd_plugin_upgrade() {
   local tmp; tmp=$(mktemp)
   jq --arg k "$key" --arg v "$new" --arg t "$(date -u +%FT%TZ)" \
      --argjson caps "$(jq -c '(.fivedive.capabilities // [])' <<<"$nj")" \
-     --argjson grants "$(jq -c '(.fivedive.grants // [])' <<<"$nj")" \
-     '.[$k].version = $v | .[$k].capabilities = $caps | .[$k].grants = $grants | .[$k].upgraded_at = $t' \
+     --argjson grants "$(jq -c '(.fivedive.grants // [])' <<<"$nj")" --arg r "$review" \
+     '.[$k].version = $v | .[$k].capabilities = $caps | .[$k].grants = $grants | .[$k].review = $r | .[$k].upgraded_at = $t' \
      <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
 
   # DIVE-4522: re-pin the seats at the new version. `5dive-refresh-plugins.sh`
@@ -1978,6 +2080,10 @@ cmd_plugin_setup() {
   local plugin review
   plugin=$(jq -r --arg k "$key" '.[$k].plugin' <<<"$j")
   review=$(jq -r --arg k "$key" '.[$k].review // "unreviewed"' <<<"$j")
+  # DIVE-4955: a record written before the tier was decided from the source
+  # holds whatever the manifest claimed. Re-decide it (down only), so a box
+  # that installed a self-described official plugin does not keep showing it.
+  review=$(_plugin_effective_review "$(jq -r --arg k "$key" '.[$k].marketplace // ""' <<<"$j")" "$review")
 
   # DIVE-4491: refuse a setup step whose program this box does not have, BEFORE
   # the consent block and before anything is run, so the dashboard panel reads a
