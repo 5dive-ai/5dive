@@ -179,8 +179,9 @@ _task_usage() {
       [--relay-agent=<name>]     a button tap: WHO tapped, and whose bot carried it
   clear-recs --channel-proof=<chat_id> [--only=<id>]     apply pending recommendations
   queue [--for=<agent>] [--json]                gates ROUTED TO YOU, filed without waking you
-  inbox [--send [--channel-proof=<chat>]]       every unanswered human gate IN THE FLEET (already
-                                                fleet-wide; --fleet accepted as a no-op); --send DMs the owner
+  inbox [--send [--channel-proof=<chat>] [--only=<id>]]  every unanswered human gate IN THE FLEET (already
+                                                fleet-wide; --fleet accepted as a no-op); --send DMs the owner,
+                                                --only re-sends that one gate's alert
   gates                                         alias of \`inbox\` (DIVE-4310)
   coordinator [--json]                          the agent fronting the needs-you banner
 

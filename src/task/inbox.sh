@@ -340,10 +340,16 @@ cmd_task_queue() {
 
 cmd_task_inbox() {
   tasks_db_init
-  local send=0 channel_proof=""
+  local send=0 channel_proof="" only=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --send)            send=1 ;;
+      # DIVE-4949: re-send ONE gate's alert. The telegram /task_<id> card calls
+      # this for a tier-2 gate so its CLI-minted, nonce-buttoned message lands
+      # right under the card. It only NARROWS the human predicate below — a row
+      # that is not a live human gate sends nothing — so it cannot widen what
+      # --send reaches, and the buttons keep their one provenance (this verb).
+      --only=*)          only="${1#*=}" ;;
       # DIVE-3785 (absorbing cancelled OSS-36): `inbox` has been fleet-wide by
       # DEFAULT since DIVE-3224 — run from any seat it returns every unanswered
       # gate in the fleet, with an `owner` column, not the caller's own. So the
@@ -419,6 +425,10 @@ cmd_task_inbox() {
   local human_pred; human_pred=$(_task_human_gate_pred)
   local human_where="${open_where} AND ${human_pred}"
   local where="$human_where"
+  if [[ -n "$only" ]]; then
+    (( send )) || fail "$E_USAGE" "--only only applies with --send (it narrows the re-send to one gate)"
+    resolve_task_id "$only"; where="${where} AND id=${RESOLVED_TASK_ID}"
+  fi
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   # DIVE-4424: the same rows, split by who is holding them RIGHT NOW. `where`
   # stays the unchanged human predicate so nothing is dropped from this view;

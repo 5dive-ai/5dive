@@ -231,5 +231,55 @@ out=$(cmd_task_inbox --send 2>&1); rc=$?
   && ok_t "--send stops delivering a gate once it is routed to an agent" \
   || bad_t "--send still pushed a routed gate to the human" "before=$sent_before after=$(nsends) rc=$rc out=$out"
 
+# ---------------------------------------------------------------------------
+# DIVE-4949 — `--send --only=<id>` re-sends ONE gate's alert. The telegram
+# /task_<id> card calls it for a tier-2 gate so the CLI-minted, nonce-buttoned
+# message lands under the card. It may only NARROW the human predicate.
+reset
+o1=$(mk_gate DIVE-51 approval '' approved)
+o2=$(mk_gate DIVE-52 decision 'A|B' A)
+out=$(cmd_task_inbox --send --only=DIVE-51 --channel-proof=1234567890 2>&1); rc=$?
+o_cb=$(jq -r --arg p "tna:${o1}:approved:" '[.inline_keyboard[][] | .callback_data | select(startswith($p))][0] // empty' "$ALL_MARKUP")
+o_nonce=${o_cb##*:}
+o_hash=$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${o1};")
+[[ "$rc" == "0" && "$(nsends)" == "1" && -n "$o_nonce" && "$o_hash" == "$(_human_nonce_sha "$o_nonce")" ]] \
+  && ok_t "--only sends exactly the named gate, with a working nonce button and its hash rotated" \
+  || bad_t "--only did not send exactly one working gate" "rc=$rc sends=$(nsends) cb=$o_cb out=$out"
+grep -q "DIVE-51" "$ALL_TEXT" && ! grep -q "DIVE-52" "$ALL_TEXT" \
+  && ok_t "--only leaves every other gate unsent" \
+  || bad_t "--only leaked another gate into the send" "all_text=$(cat "$ALL_TEXT")"
+# The bare numeric id resolves too (the plugin passes the row id it holds).
+: >"$SEND_LOG"; : >"$ALL_TEXT"
+out=$(cmd_task_inbox --send --only="${o2}" 2>&1); rc=$?
+[[ "$rc" == "0" && "$(nsends)" == "1" ]] && grep -q "DIVE-52" "$ALL_TEXT" \
+  && ok_t "--only accepts the numeric row id" \
+  || bad_t "--only=<row id> did not send that gate" "rc=$rc sends=$(nsends) out=$out"
+# NARROWS, NEVER WIDENS: a gate routed to an agent is not a human gate, so
+# naming it sends nothing — --only cannot reach past the human predicate.
+: >"$SEND_LOG"
+db "UPDATE tasks SET routed_reviewer='main2', tier=1 WHERE id=${o1};"
+out=$(cmd_task_inbox --send --only=DIVE-51 2>&1); rc=$?
+[[ "$rc" == "0" && "$(nsends)" == "0" && "$out" == *"nothing to send"* ]] \
+  && ok_t "NEGATIVE: --only on an agent-routed gate sends nothing (narrows, never widens)" \
+  || bad_t "--only reached a gate outside the human predicate" "rc=$rc sends=$(nsends) out=$out"
+# An answered gate is not live either.
+: >"$SEND_LOG"
+db "UPDATE tasks SET need_answer='A', need_answered_at=datetime('now') WHERE id=${o2};"
+out=$(cmd_task_inbox --send --only=DIVE-52 2>&1); rc=$?
+[[ "$rc" == "0" && "$(nsends)" == "0" ]] \
+  && ok_t "NEGATIVE: --only on an answered gate sends nothing" \
+  || bad_t "--only re-sent an answered gate" "rc=$rc sends=$(nsends) out=$out"
+# --only is a --send modifier; on the listing it is a usage error, not a silent no-op.
+out=$(cmd_task_inbox --only=DIVE-51 2>&1); rc=$?
+[[ "$rc" != "0" && "$out" == *"--only only applies with --send"* ]] \
+  && ok_t "--only without --send is refused by name" \
+  || bad_t "--only without --send was accepted" "rc=$rc out=$out"
+# An unknown row fails loudly rather than reading as an empty inbox.
+: >"$SEND_LOG"
+out=$(cmd_task_inbox --send --only=DIVE-99999 2>&1); rc=$?
+[[ "$rc" != "0" && "$(nsends)" == "0" ]] \
+  && ok_t "--only on an unknown row fails instead of reporting an empty inbox" \
+  || bad_t "--only on an unknown row read as success" "rc=$rc out=$out"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $(( FAIL > 0 ))
