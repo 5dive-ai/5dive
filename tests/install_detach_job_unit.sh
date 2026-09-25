@@ -65,6 +65,16 @@ if [[ "\${FAKE_MODE:-ok}" == fail ]]; then echo "npm ERR! boom while building th
 mkdir -p "$TMP/bin" && printf '#!/bin/sh\n' >"$TMP/bin/hermes" && chmod +x "$TMP/bin/hermes"
 echo '{"ok":true,"data":{"type":"hermes","installed":true}}'
 STUB
+# sudo: record argv; the recipe hop (bash -lc) "installs" the binary. Only the
+# blocking path reaches sudo — the detached path hands off before it.
+cat >"$TMP/stubs/sudo" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$TMP/sudo-argv"
+for a in "\$@"; do
+  [[ "\$a" == -lc ]] && { mkdir -p "$TMP/bin"; printf '#!/bin/sh\n' >"$TMP/bin/hermes"; chmod +x "$TMP/bin/hermes"; exit 0; }
+done
+exit 0
+STUB
 chmod +x "$TMP/stubs/"* "$TMP/fake-5dive"
 
 # install <args...> — run cmd_install in a subshell (fail exits); sets OUT RC MS.
@@ -82,6 +92,10 @@ install() {
     source "$ROOT/src/lib/validation.sh"
     # shellcheck disable=SC1091
     source "$ROOT/src/cmd_auth.sh"
+    # env_isolation's sudo guard refuses REAL sudo (PAM re-reads FIVE_* knobs).
+    # Here sudo resolves to the recording stub, which never reaches PAM, so the
+    # guard is lifted only once that is proven.
+    [[ "$(type -P sudo)" == "$TMP/stubs/sudo" ]] && unset -f sudo
     set +e
     # shellcheck disable=SC2034,SC2154  # all read by the sourced cmd_install
     JSON_MODE=1 INSTALL_JOB_DIR="$TMP/jobs" FIVE_INSTALL_SELF="$TMP/fake-5dive" TYPE_BIN[hermes]="$TMP/bin/hermes"
@@ -92,7 +106,7 @@ install() {
 }
 j() { jq -r "$1" <<<"$OUT" 2>/dev/null; }
 wait_idle() { local w=0; while ls "$TMP"/active-* >/dev/null 2>&1 && (( w < 60 )); do sleep 0.1; w=$((w+1)); done; }
-reset() { wait_idle; rm -rf "${TMP:?}/jobs" "${TMP:?}/bin" "$TMP"/sdrun-* "$TMP/job-argv" "$TMP"/active-*; }
+reset() { wait_idle; rm -rf "${TMP:?}/jobs" "${TMP:?}/bin" "$TMP"/sdrun-* "$TMP/sudo-argv" "$TMP/job-argv" "$TMP"/active-*; }
 
 # --- 1. a fresh detach returns while the install is still running -----------
 reset
@@ -106,6 +120,8 @@ check "detach: the job runs in its own unit 5dive-install-hermes, collected" \
   "$(grep -qx -- '--unit=5dive-install-hermes' <<<"$argv" && grep -qx -- '--collect' <<<"$argv"; echo $?)" "$argv"
 check "detach: the unit carries the hard bound RuntimeMaxSec=900" \
   "$(grep -qx -- '--property=RuntimeMaxSec=900' <<<"$argv"; echo $?)"
+check "detach: the unit tells the job it is inside the unit (FIVE_INSTALL_IN_UNIT=1)" \
+  "$(grep -qx -- '--setenv=FIVE_INSTALL_IN_UNIT=1' <<<"$argv"; echo $?)" "$argv"
 
 # --- 2. status while running, and a retry joins the running job --------------
 install hermes --status
@@ -164,6 +180,24 @@ export FAKE_SLEEP=0 FAKE_MODE=ok
 SDRUN_MODE=inert install hermes --detach
 sleep 0.5
 check "only systemd-run starts the job (inert systemd-run -> no install ran)" "$([[ ! -f "$TMP/job-argv" ]]; echo $?)"
+
+# --- 9. inside the unit the installer must stay in the unit's cgroup ---------
+# sudo -i opens a PAM login session (sudo-i -> common-session -> pam_systemd),
+# which moves the installer into a logind scope outside the unit: a stop or
+# RuntimeMaxSec then leaves it running (measured on a box, DIVE-4973). The job's
+# own run of the recipe must hop WITHOUT -i; the plain blocking path keeps it.
+recipe_hop() { grep -F 'hermes-agent.nousresearch.com/install.sh' "$TMP/sudo-argv" 2>/dev/null | head -1; }
+reset
+FIVE_INSTALL_IN_UNIT=1 install hermes
+hop=$(recipe_hop)
+check "in unit: the recipe runs as claude with -H and no -i (no login session)" \
+  "$([[ $RC -eq 0 && "$hop" == "-u claude -H bash -lc "* && " $hop " != *" -i "* ]]; echo $?)" "rc=$RC hop=$hop"
+check "in unit: the recipe still starts from claude's home" "$([[ "$hop" == *"-lc cd ~ && "* ]]; echo $?)" "$hop"
+reset
+install hermes
+hop=$(recipe_hop)
+check "blocking path: the recipe hop keeps sudo -i (unchanged outside the unit)" \
+  "$([[ $RC -eq 0 && "$hop" == "-u claude -i bash -lc "* ]]; echo $?)" "rc=$RC hop=$hop"
 
 reset
 TOTAL=$((PASS+FAIL))
