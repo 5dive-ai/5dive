@@ -357,6 +357,10 @@ Human accounts (who may CLEAR a gate — one identity, all transports):
   5dive human ls | show <id> | owner <agent> | recipient <ident> | rm <id>
   # With NO human accounts, gate delivery is unchanged. full surface: 5dive human --help
 
+Owner asks (a browser step only the owner may allow, answered on Telegram):
+  5dive owner-ask browser <request-file>             # send the ask to the owner with Approve / Decline (the browser plugin runs it)
+  5dive owner-ask tap <bap|bdn>:<12hex>:<nonce> --tap-uid=<id>   # root: apply the owner's tap (the team-bot listener runs it)
+
 Web UI for this host (org chart, queue, gates, triggers) — now a PLUGIN:
   5dive plugin add 5dive-ai/5dive-ui                 # install it once, then 5dive ui works as before
   5dive board [--json]                               # the versioned document the views render (core owns this)
@@ -1298,6 +1302,17 @@ main() {
       # tasks/org; reads unprivileged, writes take root themselves (the table is
       # trusted input to gate delivery). No lock: plain sqlite writes, like org.
       cmd_human "$@" ;;
+    owner-ask)
+      # DIVE-4982: a browser ask the owner answers from Telegram. `browser` sends it
+      # (the seat's run re-runs itself as root, where the proof is written); `tap`
+      # applies the owner's tap as root. The tap's argument carries the owner's
+      # nonce, so its audit row is filled in by the verb with the ask and the
+      # tapper only, never the argument.
+      case "${1:-}" in
+        browser) AUDIT_CMD="owner-ask browser"; AUDIT_ARGS=("${@:2}") ;;
+        tap) AUDIT_CMD="owner-ask tap"; AUDIT_ARGS=() ;;
+      esac
+      cmd_owner_ask "$@" ;;
     board)
       # DIVE-4779: the READ CONTRACT — one versioned JSON document describing this
       # host's board, for a consumer that must not open core's private store. Same

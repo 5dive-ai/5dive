@@ -821,11 +821,58 @@ async function ackCallback(id: string, text: string): Promise<void> {
   } catch {}
 }
 
+// DIVE-4982: the owner's one-tap answer to a browser ask. `5dive owner-ask browser`
+// sends Approve `bap:<12hex>:<nonce>` / Decline `bdn:<12hex>:<nonce>` (49 bytes; a
+// full request id would overflow Telegram's 64, so the seat is resolved on the box).
+// `5dive owner-ask tap` decides everything as root — the live request, the tapper
+// against the owner, the proof, the approve — so this carries the tap there and
+// shows the answer. A refusal exits non-zero with {ok:false,error:{message}} on
+// stdout, and that message is what the tapper is told.
+const OWNER_ASK_RE = /^(bap|bdn):[0-9a-f]{12}:[0-9a-f]{32}$/
+
+async function handleOwnerAsk(cq: any, data: string): Promise<void> {
+  const cbId = String(cq.id)
+  const tapUid = String(cq.from?.id ?? '')
+  let r: any
+  try {
+    const out = execFileSync('sudo', ['-n', '5dive', '--json', 'owner-ask', 'tap', data, `--tap-uid=${tapUid}`], { timeout: 45000 }).toString()
+    r = JSON.parse(out)
+  } catch (e: any) {
+    try {
+      r = JSON.parse(String(e?.stdout ?? ''))
+    } catch {
+      r = { ok: false }
+    }
+  }
+  if (!r?.ok) {
+    const why = String(r?.error?.message ?? "Couldn't apply — answer on the box: sudo 5dive browser approve <id>")
+    process.stderr.write(`team-bot-listener: owner-ask tap from ${tapUid} refused: ${why}\n`)
+    await ackCallback(cbId, why.slice(0, 190))
+    return
+  }
+  const d = r.data ?? {}
+  const stamp = d.result === 'approved' ? `✅ Approved — ${d.id}` : `❌ Declined — ${d.id}`
+  const chatId = cq.message?.chat?.id
+  const msgId = cq.message?.message_id
+  if (chatId != null && msgId != null) {
+    try {
+      const e = await tg('editMessageText', { chat_id: chatId, message_id: msgId, text: `${cq.message?.text ?? ''}\n\n${stamp}` })
+      if (!e?.ok) await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [] } })
+    } catch {}
+  }
+  await ackCallback(cbId, stamp)
+}
+
 // Fully fail-soft, mirroring the bridge's `tna:` handler: any stale/deleted task
 // or CLI error just acks the tap (clears Telegram's spinner) and never throws.
 async function handleCallback(cq: any): Promise<void> {
   const cbId = String(cq.id)
-  const m = TNA_RE.exec(String(cq.data ?? ''))
+  const data = String(cq.data ?? '')
+  if (OWNER_ASK_RE.test(data)) {
+    await handleOwnerAsk(cq, data)
+    return
+  }
+  const m = TNA_RE.exec(data)
   if (!m) {
     await ackCallback(cbId, '')
     return
