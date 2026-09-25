@@ -1287,6 +1287,10 @@ cmd_task_show() {
     # raw inputs, which is precisely the DIVE-3224/DIVE-3267 conflation those
     # fields exist to end. Same two single-source predicates, evaluated in the
     # same query as the row, so the two surfaces cannot disagree.
+    # DIVE-4949: `human_owner_name` is the display name of the human `human_owner`
+    # names (DIVE-3342). `human_owner` is only an id, and a reader that wants a
+    # name would otherwise have to fetch `human ls` and join it itself. NULL, and
+    # so absent from the JSON, when there is no owner or the human has no name.
     local _gate_open _gate_human
     _gate_open=$(_task_gate_open_pred); _gate_human=$(_task_human_gate_pred)
     # DIVE-3785: `gate` carries the states the two booleans cannot — an answered
@@ -1297,7 +1301,8 @@ cmd_task_show() {
     task=$(dbfmt -json "SELECT *,
              CASE WHEN ${_gate_open} THEN 1 ELSE 0 END AS gate_live,
              CASE WHEN ${_gate_open} AND ( ${_gate_human} ) THEN 1 ELSE 0 END AS needs_human,
-             $(_task_gate_header_sql) AS gate
+             $(_task_gate_header_sql) AS gate,
+             (SELECT NULLIF(h.display_name,'') FROM humans h WHERE h.id=tasks.human_owner) AS human_owner_name
            FROM tasks WHERE id=${id};")
     subs=$(dbfmt -json "SELECT id,ident,title,status FROM tasks WHERE parent_id=${id} ORDER BY id;")
     deps=$(dbfmt -json "SELECT t.id,t.ident,t.title,t.status FROM task_deps d JOIN tasks t ON t.id=d.blocked_by WHERE d.task_id=${id} ORDER BY t.id;")
