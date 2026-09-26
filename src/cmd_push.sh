@@ -673,6 +673,12 @@ _push_touches_workflows() { # <repopath> <repourl> <branch>
 }
 
 cmd_push() {
+  local usage="usage: 5dive push <id|DIVE-N> [--branch=<b>] [--repo=<url>] [--dry-run] [--open-pr[=<base>]] [--pr-title=<t>] [--pr-body-file=<f>] [--pr-draft]"
+  # Asking what the verb does needs no task store and no broker: answer first.
+  if _verb_help_wanted "$@"; then
+    printf '%s\n       5dive push setup   # scaffold + check the GitHub App credential (root)\n' "$usage"
+    return 0
+  fi
   require_loaded push broker_gate_check broker_bind_target broker_task_target broker_gate_sig_note
   tasks_db_init
   local branch="" repo="" dry=0 yes=0
@@ -697,8 +703,7 @@ cmd_push() {
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" \
-    "usage: 5dive push <id|DIVE-N> [--branch=<b>] [--repo=<url>] [--dry-run] [--open-pr[=<base>]] [--pr-title=<t>] [--pr-body-file=<f>] [--pr-draft]"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "$usage"
   # A PR flag without --open-pr is silently inert otherwise, and a silently inert
   # flag on a verb you run once per branch is a body you think you attached.
   if [[ $open_pr -eq 0 ]]; then

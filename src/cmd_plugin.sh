@@ -1217,6 +1217,7 @@ cmd_plugin_add() {
       # screen exists to warn about.
       --official-only) official_only=1 ;;
       --as=*)   as_name="${a#--as=}" ;;
+      -h|--help) _plugin_usage; return 0 ;;
       --*)      fail "$E_USAGE" "unknown flag: $a" ;;
       *)        [[ -z "$ref" ]] && ref="$a" || fail "$E_USAGE" "one plugin at a time" ;;
     esac

@@ -2259,7 +2259,7 @@ cmd_task_need() {
   # rule. Caught by tests/gate_precedent_unit.sh A5, whose fixture passes no
   # --recommend at all and was refused anyway.
   local recommend_arg="$recommend"
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id> --type=decision|secret|approval|manual|access --ask=\"...\"  (flags: 5dive task --help)"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id> --type=decision|secret|approval|manual|access --ask=\"...\" [--owner=<human>]  (flags: 5dive task --help)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
 
 
