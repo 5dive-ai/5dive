@@ -7673,6 +7673,250 @@ _hb_poller_liveness_sweep() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# An agent's unanswered question reaches a person when its seat has no channel.
+#
+# THE DEFECT (measured 2026-09-26 on 0.54.0): a seat with no paired channel that
+# ends its turn on a question waits forever, because nothing in 5dive reads what
+# an agent asks. DIVE-611 made the heartbeat's OWN poller alarm reach a person,
+# not the agents' questions. At 01:16:44Z marcus (no channel: every tick logs
+# "gate notifier marcus has no paired channel") ended its turn with "Should I
+# restart claude-swan on its own as a test? …". No person saw it, and 16 seats
+# stayed deaf on Telegram until an outside restart at 02:06Z.
+#
+# SCOPE: a seat whose unit is active, that has NO channel of its own (so no
+# person can see it), whose turn has ENDED, and whose last assistant text is not
+# the one this sweep judged last time (a hash per seat under STATE_DIR, so one
+# text is forwarded once).
+#
+# ONCE MEANS DELIVERED, NOT ATTEMPTED. The judged-text hash (<seat>.last) is
+# written only on a TERMINAL outcome: the base reads no ask, reflex holds, or at
+# least one chat confirmed the send. A failed send (0 confirmed) or no paired
+# channel resolving yet is not terminal — the text goes to <seat>.retry
+# (`<hash> <attempts> <due epoch>`) and a later tick sends it again, even with the
+# transcript untouched, backing off (_hb_stuck_q_backoff) so an unroutable seat
+# logs a handful of times, not every tick. It ends when a send lands, the seat
+# says something else, or the turn ages past _HB_STUCK_Q_MAX_AGE_MIN. A retry does
+# not ask reflex again: a pending retry exists only because it said forward.
+#
+# TWO TIERS, because reflex is optional and most boxes do not have it:
+#   base    every box, local, nothing leaves it: the text's final paragraph has
+#           a sentence ending in '?' or a direct ask phrase. It over-forwards on
+#           purpose — a rhetorical '?' costs the person one glance; a missed ask
+#           costs the seat its whole wait.
+#   reflex  only where the owner opted in, through the SAME gate the gate-answer
+#           shadow uses (reflex_shadow_model: a reflex model set on the box; a
+#           key alone is not enough). Asked only when the base says yes; it
+#           forwards on asks_human at >= _HB_STUCK_Q_REFLEX_CONF and fails OPEN to
+#           the base when it cannot answer. Only the last assistant text leaves
+#           the box, capped at _HB_STUCK_Q_TEXT_MAX, never the transcript, and the
+#           receipt holds the decision and confidence only, never text — the rule
+#           main set for the reaper's stuck receipt above.
+#
+# The seat's own pairing does not exist (that is the premise), so the forward
+# goes through the seat's gate notifier when that seat holds a channel, else the
+# nearest paired seat up its org chain — the same Bot API send the poller
+# alarm's per-seat fallback uses.
+_HB_STUCK_Q_TEXT_MAX=1500
+_HB_STUCK_Q_MAX_AGE_MIN=1440     # a first tick after install forwards nothing older
+_HB_STUCK_Q_REFLEX_CONF=0.9
+_HB_STUCK_Q_REFLEX_TIMEOUT=15
+_HB_STUCK_Q_RETRY_BASE_S=300    # one tick; the retry delay doubles from here
+_HB_STUCK_Q_RETRY_MAX_S=3600
+_HB_STUCK_Q_QMARK_RE='[?]([[:space:]"*_`)]|$)'
+_HB_STUCK_Q_ASK_RE='(^|[^[:alpha:]])(need you to|please confirm|should i|can you|waiting for your)([^[:alpha:]]|$)'
+_HB_STUCK_Q_OPTIONS='asks_human,progress,report,idle'
+
+# `_hb_seat_ended_turn_text <agent>` — the seat's last assistant text when its
+# turn has ENDED, else rc 1. Ended = the last user/assistant record of the newest
+# interactive transcript is an assistant record with stop_reason end_turn. Claude
+# Code stamps a message's FINAL stop_reason on every record of it, so text that
+# precedes a tool call reads tool_use (measured on this box: 128 text records
+# tool_use, 23 end_turn). The system records written after a turn
+# (stop_hook_summary, turn_duration, cost-state) are neither and are skipped.
+#
+# HEADLESS RUNS ARE WALKED PAST. Every 6h the memory distiller runs `claude -p`
+# in the seat's home, and its transcript (entrypoint sdk-cli) is then the newest
+# file — at 01:15:20Z it was, 84s before marcus asked. A headless run has nobody
+# waiting on it. Newlines are kept: the base reads the final PARAGRAPH.
+_hb_seat_ended_turn_text() { # <agent>
+  local name="$1" home tx out now mt n=0
+  home="${_HB_SEAT_HOME_ROOT}/agent-${name}"
+  [[ -d "$home/.claude/projects" ]] || return 1
+  now=$(date +%s)
+  while IFS= read -r tx; do
+    n=$((n + 1)); (( n <= 5 )) || return 1
+    [[ -r "$tx" ]] || continue
+    mt=$(stat -c %Y "$tx" 2>/dev/null) || continue
+    (( now - mt <= _HB_STUCK_Q_MAX_AGE_MIN * 60 )) || return 1
+    out=$(tail -n "$_HB_CARRYOVER_TAIL_LINES" "$tx" 2>/dev/null | jq -rRn '
+      [ inputs | fromjson? | select(type == "object" and (.type == "user" or .type == "assistant")) ] as $r
+      | if ($r | length) == 0 then "\u0001none"
+        elif ($r[-1].entrypoint // "") == "sdk-cli" then "\u0001headless"
+        elif $r[-1].type != "assistant" or ($r[-1].message.stop_reason // "") != "end_turn" then "\u0001busy"
+        else ([ $r | to_entries[] | select(.value.type == "user") | .key ] | max // -1) as $u
+          | [ $r[($u + 1):][] | (.message.content // [])[]? | select(type == "object" and .type == "text") | .text ]
+          | join("\n\n")
+        end' 2>/dev/null) || continue
+    case "$out" in
+      $'\001headless') continue ;;
+      $'\001'*|'') return 1 ;;
+    esac
+    printf '%s' "$out"; return 0
+  done < <(find "$home/.claude/projects" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
+             | sort -rn | cut -d' ' -f2-)
+  return 1
+}
+
+# `_hb_stuck_base_asks <text>` — the base tier. rc 0 when the final paragraph
+# (the text after its last blank line) asks a person something.
+_hb_stuck_base_asks() { # <text>
+  local para
+  para=$(printf '%s\n' "$1" | awk 'BEGIN { RS = "" } { p = $0 } END { print p }')
+  [[ -n "$para" ]] || return 1
+  grep -qE "$_HB_STUCK_Q_QMARK_RE" <<<"$para" && return 0
+  grep -qiE "$_HB_STUCK_Q_ASK_RE" <<<"$para"
+}
+
+# `_hb_stuck_reflex <seat> <text> <model>` — the reflex tier's one call. Prints
+# `forward` or `hold` and writes the receipt either way. A timeout, an error or
+# an invalid pick is `forward`: the base already said yes, and a reflex that
+# cannot answer must not silence it. A pick with no confidence (the chat api
+# returns none) stands on the pick alone.
+_hb_stuck_reflex() { # <seat> <text> <model>
+  local seat="$1" text="$2" model="$3" req resp rc err="" choice="" conf="null" verdict=forward
+  req=$(jq -cn --arg t "$text" --arg o "$_HB_STUCK_Q_OPTIONS" \
+    --arg q "Is this agent's latest output waiting for a human to answer or approve something?" '
+    {policy: "stuck", version: 1, type: "choice", instructions: $q,
+     criteria: {asks_human: "It asks a person a question, or to approve, confirm or choose something, and waits for the answer.",
+                progress: "It reports work still under way; the agent carries on without an answer.",
+                report: "It reports finished work or findings; nothing is needed from a person, even if it contains a rhetorical question.",
+                idle: "It is an idle or acknowledgement line with nothing in it for a person."},
+     options: ($o | split(",")), state: {output: $t}}') || { printf 'forward'; return 0; }
+  resp=$(_reflex_endpoint_decide "$model" "$_HB_STUCK_Q_REFLEX_TIMEOUT" <<<"$req" 2>/dev/null); rc=$?
+  resp="${resp%%$'\n'*}"
+  if (( rc == 124 )); then err="timeout"
+  elif ! jq -e 'type == "object"' <<<"$resp" >/dev/null 2>&1; then err="no_response"
+  else
+    choice=$(jq -r '.choice // empty | strings' <<<"$resp" 2>/dev/null)
+    if [[ -z "$choice" ]]; then err=$(jq -r '.error // "no_choice" | tostring | .[0:120]' <<<"$resp" 2>/dev/null)
+    elif [[ ",${_HB_STUCK_Q_OPTIONS}," != *",${choice},"* ]]; then err="invalid_choice"; choice=""
+    else conf=$(jq -c '.confidence | if type == "number" then . else null end' <<<"$resp" 2>/dev/null) || conf="null"
+    fi
+  fi
+  if [[ -z "$err" ]]; then
+    if [[ "$choice" != asks_human ]]; then verdict=hold
+    elif [[ "$conf" != null ]] && ! jq -en --argjson c "$conf" --argjson m "$_HB_STUCK_Q_REFLEX_CONF" '$c >= $m' >/dev/null 2>&1; then verdict=hold
+    fi
+  fi
+  reflex_receipt policy=stuck actor="$seat" authority="heartbeat" \
+    result="${choice:-none}" candidates="$_HB_STUCK_Q_OPTIONS" confidence="${conf:-null}" \
+    fallback="$([[ -n "$err" ]] && echo true || echo false)" \
+    backend="$(jq -cn --arg m "$model" --arg a "$(reflex_adapter_name 2>/dev/null)" '{adapter: $a, model: $m}')" \
+    signals='{"question":"waiting-for-human","base":"asks"}' \
+    effect="$(jq -cn --arg s "$seat" --arg v "$verdict" --arg e "$err" \
+                '{seat: $s, forwarded: ($v == "forward")} + (if $e == "" then {} else {error: $e} end)')" \
+    2>/dev/null || true
+  printf '%s' "$verdict"
+}
+
+# Resolves the person-facing channel for a channel-less seat into TASK_CH_*: its
+# gate notifier when that seat holds a channel, else the nearest paired seat up
+# its chain (_task_chain_channel ends at the coordinator). Never call it inside
+# $( ) — the TASK_CH_* it sets would die with the subshell.
+_hb_stuck_q_route() { # <seat>
+  local n=""
+  n=$(_task_resolve_gate_notifier "$1" 2>/dev/null) || n=""
+  if [[ -n "$n" && "$n" != "$1" ]] && _task_agent_channel "$n"; then return 0; fi
+  _task_chain_channel "$1"
+}
+
+# The sweep's clock, a function so the harness can move time past a backoff.
+_hb_stuck_q_now() { date +%s; }
+
+# `_hb_stuck_q_backoff <attempts>` — seconds until the next try after <attempts>
+# failed ones: the first failure retries on the very next tick, then 10, 20, 40
+# minutes, then hourly.
+_hb_stuck_q_backoff() { # <attempts>
+  local n="$1" d
+  (( n <= 1 )) && { printf '0'; return 0; }
+  d=$(( _HB_STUCK_Q_RETRY_BASE_S << (n - 1) ))
+  (( n > 12 || d > _HB_STUCK_Q_RETRY_MAX_S )) && d=$_HB_STUCK_Q_RETRY_MAX_S
+  printf '%s' "$d"
+}
+
+_hb_stuck_question_sweep() {
+  declare -F _task_agent_channel >/dev/null 2>&1 || return 0
+  # No channel anywhere on the box (solo, CI): there is nobody to forward to.
+  _task_deployment_has_channels || return 0
+  local reg; reg=$(registry_read 2>/dev/null) || return 0
+  local dir="${STATE_DIR}/stuck-question" model="" name key text hash chat sent now
+  local r_hash r_n r_due retrying
+  mkdir -p "$dir" 2>/dev/null || return 0
+  model=$(reflex_shadow_model 2>/dev/null) || model=""
+  now=$(_hb_stuck_q_now)
+  while IFS= read -r name; do
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+    systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null || continue
+    _task_agent_channel "$name" && continue          # a person already sees this seat
+    # One stat per seat per tick; the transcript is parsed only when it moved, or
+    # when an undelivered question is due for another try.
+    key=$(find "${_HB_SEAT_HOME_ROOT}/agent-${name}/.claude/projects" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' \
+            -printf '%T@ %s %p\n' 2>/dev/null | sort -rn | head -1)
+    [[ -n "$key" ]] || continue
+    r_hash="" r_n=0 r_due=0
+    [[ -f "$dir/${name}.retry" ]] && read -r r_hash r_n r_due < "$dir/${name}.retry" 2>/dev/null || true
+    [[ "$r_n" =~ ^[0-9]+$ && "$r_due" =~ ^[0-9]+$ ]] || { r_hash="" r_n=0 r_due=0; }
+    if [[ "$key" == "$(cat "$dir/${name}.tx" 2>/dev/null)" ]]; then
+      [[ -n "$r_hash" ]] && (( now >= r_due )) || continue
+    fi
+    printf '%s\n' "$key" > "$dir/${name}.tx" 2>/dev/null || true
+    text=$(_hb_seat_ended_turn_text "$name") || continue
+    hash=$(printf '%s' "$text" | sha256sum | cut -c1-32)
+    [[ "$hash" == "$(cat "$dir/${name}.last" 2>/dev/null)" ]] && continue
+    retrying=0
+    if [[ "$hash" == "$r_hash" ]]; then
+      (( now >= r_due )) || continue                 # touched mid-backoff: wait it out
+      retrying=1
+    else
+      r_n=0                                          # a new text starts its own count
+    fi
+    if ! _hb_stuck_base_asks "$text"; then           # terminal: nothing asked
+      printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true
+      rm -f "$dir/${name}.retry"; continue
+    fi
+    (( ${#text} > _HB_STUCK_Q_TEXT_MAX )) && text="…${text: -_HB_STUCK_Q_TEXT_MAX}"
+    if (( ! retrying )) && [[ -n "$model" && "$(_hb_stuck_reflex "$name" "$text" "$model")" == hold ]]; then
+      printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true   # terminal: reflex held
+      rm -f "$dir/${name}.retry"
+      _hb_log "[stuck-question] ${name}: the base read an ask and reflex did not; receipt only, nothing forwarded"
+      continue
+    fi
+    r_n=$((r_n + 1))
+    if ! _hb_stuck_q_route "$name"; then
+      printf '%s %s %s\n' "$hash" "$r_n" "$((now + $(_hb_stuck_q_backoff "$r_n")))" > "$dir/${name}.retry" 2>/dev/null || true
+      _hb_log "[stuck-question] ${name} is waiting for an answer and no paired channel resolves (its gate notifier or anyone up its chain); not forwarded, try ${r_n}, retrying in $(( $(_hb_stuck_q_backoff "$r_n") / 60 ))m"
+      continue
+    fi
+    sent=0
+    while IFS= read -r chat; do
+      [[ "$chat" =~ ^-?[0-9]+$ ]] || continue
+      _gate_channel_api "$TASK_CH_TOKEN" sendMessage -d "chat_id=${chat}" \
+        --data-urlencode "text=${name} is waiting for an answer: ${text}"$'\n\n'"Reply with sudo 5dive agent send ${name} '…'" \
+        | jq -e '.ok == true' >/dev/null 2>&1 && sent=$((sent + 1))
+    done < <(jq -r '(.allowFrom // [])[] | tostring' "$TASK_CH_ACCESS" 2>/dev/null)
+    if (( sent > 0 )); then                          # terminal: a person has it
+      printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true
+      rm -f "$dir/${name}.retry"
+      _hb_log "[stuck-question] ${name} is waiting for an answer; forwarded through ${TASK_CH_AGENT}'s bot, ${sent} chat(s) confirmed"
+    else
+      printf '%s %s %s\n' "$hash" "$r_n" "$((now + $(_hb_stuck_q_backoff "$r_n")))" > "$dir/${name}.retry" 2>/dev/null || true
+      _hb_log "[stuck-question] ${name} is waiting for an answer; forwarded through ${TASK_CH_AGENT}'s bot, 0 chat(s) confirmed, try ${r_n}, retrying in $(( $(_hb_stuck_q_backoff "$r_n") / 60 ))m"
+    fi
+  done < <(jq -r '.agents | keys[]?' <<<"$reg")
+  return 0
+}
+
 # DIVE-1737: async self-heal materialize sweep. An objective planner loop that
 # times out past OBJ_PLANNER_WAIT_DEFAULT records an 'awaiting_planner' cycle
 # stamped with the backing loop/task ids (see cmd_objective.sh) instead of the
@@ -8615,6 +8859,9 @@ cmd_heartbeat_tick() {
   # Telegram poller died (stale beacon => gate-ping taps won't land). Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_poller_liveness_sweep || _hb_log "[poller-liveness] pass errored (non-fatal)"
+  # An agent's unanswered question reaches a person when its seat has no channel
+  # (sharpened by reflex where the owner opted in). Same isolation contract.
+  _hb_stuck_question_sweep || _hb_log "[stuck-question] pass errored (non-fatal)"
   # DIVE-1737: async self-heal materialize — pull a late objective-planner diff
   # (recorded 'awaiting_planner' when its loop timed out past the wait window) and
   # re-drive the existing `objective replan --diff` path. Same isolation contract
