@@ -634,6 +634,12 @@ _agent_verb_dispatch() {
         # Reached via the scoped render_standard_sudoers grant so a standard
         # agent's /restart + /model work without a raw systemd-run/sudo grant.
         _self_restart) cmd_self_restart "$@" ;;
+        # DIVE-5007: hidden root primitive — restart | deferred | held for one
+        # agent, from the self-update ledger (busy row or live turn, park,
+        # pending-restart marker). Exists so 5dive-host-updates.sh, which
+        # restarts every seat after a Claude Code upgrade, defers a seat that is
+        # mid-turn instead of killing it. Decides and records; never restarts.
+        _restart_decide) cmd_agent_restart_decide "$@" ;;
         # DIVE-4203: hidden read-only primitive — prints THE default-skills list
         # (DEFAULT_AGENT_SKILLS in lib/agent_setup.sh), one `<owner>/<repo>:<skill>`
         # per line. Exists so 5dive-refresh-skills.sh, installed standalone beside
