@@ -206,6 +206,12 @@ mut_check "mutation B: restart race still silent" "OK" "$(dead_or_ok "$(run_mut 
 REMEDY=$(awk '/^_hb_poller_liveness_sweep\(\) \{/,/^\}/' "$SRC/cmd_heartbeat.sh" \
          | grep -F 'Telegram poller DEAD on:')
 has() { [[ "$2" == *"$1"* ]] && printf yes || printf no; }
+# The rung-4 sentence is spliced into the alarm from _hb_poller_rung4_sentence,
+# which says it only where the supervisor's actions sentinel exists. Its ARMED
+# wording is graded here with the rest of the prose; the gate itself (absent
+# without the sentinel) is graded in tests/poller_alarm_human_fallback_unit.sh.
+check "remedy: the alarm splices the rung-4 sentence in" "yes" "$(has '${rung4}' "$REMEDY")"
+REMEDY+=$'\n'$(awk '/^_hb_poller_rung4_sentence\(\) \{/,/^\}/' "$SRC/cmd_heartbeat.sh" | grep -F 'at rung 4')
 
 # 36. Liveness: the alarm string is reachable at all.
 check "remedy: alarm string extracted" "yes" "$(has 'Gate-ping tap buttons still SEND' "$REMEDY")"
