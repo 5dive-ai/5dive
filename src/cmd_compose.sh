@@ -420,9 +420,12 @@ _compose_write_role_md() {
   mapfile -t mgrs    < <(jq -r --arg n "$name" '.agents[$n].reports_to // empty | if type=="array" then .[] else . end' <<<"$spec")
   mapfile -t reports < <(jq -r --arg n "$name" '.agents | to_entries[] | select((.value.reports_to // empty) | if type=="array" then any(. == $n) else . == $n end) | .key' <<<"$spec")
 
+  # DIVE-5038: set by `team import` (dynamic scope), empty for a bare `up`.
+  local manifest="${COMPOSE_TEAM_MANIFEST:-}"
+
   # Nothing role-specific → leave the agent's CLAUDE.md exactly as cmd_create
   # left it (keeps plain v1 specs byte-identical to before).
-  [[ -n "$role" || -n "$instructions" || ${#mgrs[@]} -gt 0 || ${#reports[@]} -gt 0 ]] || return 0
+  [[ -n "$role" || -n "$instructions" || -n "$manifest" || ${#mgrs[@]} -gt 0 || ${#reports[@]} -gt 0 ]] || return 0
 
   local block=$'\n\n'
   if [[ -n "$role" ]]; then block+="## Role: ${role}"$'\n\n'; else block+="## Role"$'\n\n'; fi
@@ -441,6 +444,15 @@ _compose_write_role_md() {
     for r in "${reports[@]}"; do
       block+="- Direct report **${r}**. Delegate: \`5dive agent send ${r} '<task>'\`."$'\n'
     done
+  fi
+
+  # DIVE-5038: a template's role text says "read X from <block>" (the
+  # Distribution roles read distribution.channels), and the only place that
+  # block exists on the box is the team's persisted manifest. Without this line
+  # no seat can find it: a slug import resolved the template into a mktemp dir.
+  if [[ -n "$manifest" ]]; then
+    block+=$'\n'"## Team manifest"$'\n'
+    block+="- Your team's manifest is \`${manifest}\`. Anything your instructions tell you to read from the template (a policy block such as \`distribution.channels\`) is read from THIS file, at the time you act — the owner edits it after import, so never work from a remembered copy. If it is missing or unreadable, stop and escalate; do not guess a policy."$'\n'
   fi
 
   # DIVE-2223: land the block in the file THIS harness reads. It used to go to
@@ -1677,6 +1689,9 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
   <slug> resolves in the marketplace registry (<org>/5dive-marketplace, teams/),
   read live — a template published there works on this box with no update.
   A path is used as-is, and is the offline / bring-your-own route.
+  Either way the template is saved as the team's manifest at
+  ${STATE_DIR:-/var/lib/5dive}/teams/<slug>.5dive.yaml, every role is told that path, and
+  'team ps' prints it. Edit it there to change policy (e.g. channel tiers).
 
   --type=<harness>  Create the whole roster on this harness instead of the
                     template's own (every bundled template says claude).
@@ -1933,6 +1948,47 @@ _team_choose_prefix() {
   return 0
 }
 
+# -------- DIVE-5038: a team's manifest lives at ONE stable path --------------
+#
+# Role text tells seats to read policy out of the template ("read every
+# channel's tier from distribution.channels"), and SCHEMA-v2 says the roles read
+# whatever the file says at the time they run. That only works if the file is
+# somewhere a seat can find: a slug import resolved it into a mktemp dir that
+# nothing recorded, and a path import left it wherever the caller happened to
+# keep it. So the import copies it to a path derived from the project key alone
+# (no new column: `teams/<key>.5dive.yaml` is recomputable from the key that the
+# projects row already carries), names that path in every role's instructions,
+# and `team ps` prints it. It is also the file an "edit tiers later" route edits.
+_team_manifest_path() { printf '%s/teams/%s.5dive.yaml' "${STATE_DIR:-/var/lib/5dive}" "$1"; }
+
+# Persist <src> as team <key>'s manifest and print its path. Three shapes:
+#   absent     copy it in
+#   identical  nothing to do
+#   differs    KEEP the box's copy. After import the manifest is the owner's
+#              (DIVE-4119 made the tiers theirs to edit), and a re-import that
+#              silently put an edited HUMAN channel back to AUTO would be a post
+#              nobody approved. The template just imported is left beside it as
+#              <path>.incoming, and the warning says so.
+# World-readable (0644 in a 2755 dir): every seat on the team reads it, and a
+# sandboxed seat already holds traverse on $STATE_DIR (DIVE-4730).
+_team_persist_manifest() {
+  local key="$1" src="$2" dest dir
+  [[ -n "$key" && -f "$src" ]] || return 1
+  dest=$(_team_manifest_path "$key"); dir="${dest%/*}"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  chmod a+rx "$dir" 2>/dev/null || true
+  if [[ ! -e "$dest" ]]; then
+    install -m 644 "$src" "$dest" 2>/dev/null || return 1
+    step "team manifest saved: $dest"
+  elif cmp -s "$src" "$dest"; then
+    :
+  else
+    install -m 644 "$src" "${dest}.incoming" 2>/dev/null || true
+    warn "team '$key' already has a manifest at $dest and it differs from the template you just imported — kept yours (it may carry your edits, e.g. channel tiers). The imported template is at ${dest}.incoming; copy across what you want."
+  fi
+  printf '%s' "$dest"
+}
+
 # The message a caller shows when _team_resolve_template did not produce a file.
 _team_resolve_fail() {
   local ref="$1" rc="$2" why
@@ -1965,6 +2021,8 @@ HELP
         local ps_file ps_rc
         ps_file=$(_team_resolve_template "$ps_ref") || { ps_rc=$?; _team_resolve_fail "$ps_ref" "$ps_rc"; }
         _team_assert_schema "$ps_file" "$ps_ref"
+        local COMPOSE_TEAM_MANIFEST
+        COMPOSE_TEAM_MANIFEST=$(_team_manifest_path "$(_team_slug_key "$ps_ref")")
         cmd_compose_ps -f "$ps_file" "$@"
         return 0
       fi
@@ -2035,7 +2093,8 @@ HELP
         if (( ${#ps_matches[@]} > 1 )); then
           echo "TEAM  ${ps_names[$ps_i]}"
         fi
-        cmd_compose_ps -f "$ps_file" "$@"
+        COMPOSE_TEAM_MANIFEST=$(_team_manifest_path "$(_team_slug_key "${ps_names[$ps_i]}")") \
+          cmd_compose_ps -f "$ps_file" "$@"
         ps_i=$((ps_i+1))
       done
       return 0 ;;
@@ -2146,6 +2205,14 @@ HELP
   # column. That is also why the write happens even when the prefix is empty.
   local slug_key spec_for_prefix root_name
   slug_key=$(_team_slug_key "$ref")
+
+  # DIVE-5038: persisted BEFORE `up`, because the role text naming it is written
+  # on create only. Read by _compose_write_role_md through dynamic scope.
+  local COMPOSE_TEAM_MANIFEST=""
+  if [[ -n "$slug_key" ]]; then
+    COMPOSE_TEAM_MANIFEST=$(_team_persist_manifest "$slug_key" "$file") || COMPOSE_TEAM_MANIFEST=""
+  fi
+  [[ -n "$COMPOSE_TEAM_MANIFEST" ]] || warn "could not save this team's manifest to $(_team_manifest_path "${slug_key:-<key>}") — the roster still comes up, but no role is told where its policy (e.g. channel tiers) lives. Copy the template there by hand and tell each role its path."
   spec_for_prefix=$(_compose_parse "$file" 2>/dev/null) || spec_for_prefix=""
   root_name=""
   [[ -n "$spec_for_prefix" ]] && root_name=$(_compose_spec_root "$spec_for_prefix" 2>/dev/null) || root_name=""
@@ -2262,10 +2329,16 @@ HELP
       '. + [{name:$n, type:$t, state:$a, loops:$l}]' <<<"$rows")
   done
 
+  # DIVE-5038: `team ps` names the team's manifest — the file its roles read
+  # policy from and the one to edit. Shown only when it exists on this box.
+  local manifest="${COMPOSE_TEAM_MANIFEST:-}"
+  [[ -n "$manifest" && -f "$manifest" ]] || manifest=""
+
   if (( JSON_MODE )); then
-    ok "" '{file:$f, agents:$rows} + (if $bm == "" then {} else {capabilities:{browser:$bm}} end)' \
-      --arg f "$file" --argjson rows "$rows" --arg bm "$browser_mode"
+    ok "" '{file:$f, agents:$rows} + (if $bm == "" then {} else {capabilities:{browser:$bm}} end) + (if $mf == "" then {} else {manifest:$mf} end)' \
+      --arg f "$file" --argjson rows "$rows" --arg bm "$browser_mode" --arg mf "$manifest"
   else
+    [[ -n "$manifest" ]] && echo "MANIFEST    $manifest"
     [[ -n "$browser_mode" ]] && echo "PUBLISHING  $browser_mode"
     echo "$rows" | jq -r '
       (["NAME","TYPE","STATE","LOOP SCHEDULES"] | @tsv),
