@@ -27,11 +27,19 @@
 #      (distiller) transcript that must be walked past
 #   R  routing: an unpaired notifier falls to the nearest paired seat up the chain;
 #      nobody paired means logged, not sent
+#   S  a send that fails (0 chats confirmed) is retried on a later tick, transcript
+#      untouched or touched, and stops once one lands; a retry does not ask reflex
+#      again
+#   U  nobody paired yet, then the gate notifier paired: the next tick delivers
+#   K  backoff: a seat that stays undeliverable is retried and logged on a
+#      doubling delay, not every tick; a new text from the seat replaces the
+#      pending one
 #   W  the tick runs the sweep
 #   L  LIVE BOX: this box's own transcripts (read-only) have the record shape the
 #      reader keys on; SKIP on a runner that has none. CONTROL: no seat home at all
 #   M  MUTANT: the sweep that never looks at a channel-less seat, and the one that
-#      forgets the text it judged, turn G and B red
+#      forgets the text it judged, turn G and B red; the one that marks the text
+#      judged BEFORE the send (the iteration-1 defect) turns S and U red
 #
 # Stubs: systemctl, _tg_access_state_dir (channel dirs into the temp tree),
 # _gate_channel_api (the Bot API seam), _reflex_endpoint_decide (the model),
@@ -139,8 +147,12 @@ _gate_channel_api() { # <token> <method> [curl args...] -> api.log: token|method
     shift
   done
   printf '%s|%s|%s|%s\n' "$tok" "$m" "$chat" "${text//$'\n'/\\n}" >> "$TMP/api.log"
-  printf '{"ok":true,"result":{"message_id":1}}\n'
+  if (( API_OK )); then printf '{"ok":true,"result":{"message_id":1}}\n'
+  else printf '{"ok":false,"error_code":502,"description":"Bad Gateway"}\n'; fi
 }
+API_OK=1
+CLOCK=$NOW
+_hb_stuck_q_now() { printf '%s' "$CLOCK"; }
 RX_RESP='{"choice":"asks_human","confidence":0.95}'; RX_RC=0
 _reflex_endpoint_decide() { # <model> <timeout> — stdin request, stdout response
   cat > "$TMP/rx.req"; printf '%s\n' "$1" >> "$TMP/rx.calls"
@@ -316,6 +328,81 @@ fresh; tx quiet "$MARCUS_Q"; unchannel boss; tick
   || bad_t "R2: undeliverable is logged" "api=$(cat "$TMP/api.log") hb=$(cat "$TMP/hb.log")"
 channel boss '["701"]'; channel lead '["501"]'
 
+# --- S) a failed send is retried, not marked judged ------------------------------------------------
+# sends() counts ATTEMPTS (every sendMessage the stub saw, ok or not); the log line
+# says how many landed.
+opt_out; fresh; tx quiet "$MARCUS_Q"; API_OK=0; tick
+[[ "$(sends)" == 1 ]] && has "$(cat "$TMP/hb.log")" "0 chat(s) confirmed, try 1" \
+  && ok_t "S1: the Bot API refuses the send: one attempt, logged as 0 confirmed, try 1" \
+  || bad_t "S1: failed send" "api=$(cat "$TMP/api.log") hb=$(cat "$TMP/hb.log")"
+API_OK=1; tick
+[[ "$(sends)" == 1 ]] && has "$(cat "$TMP/hb.log")" "1 chat(s) confirmed" \
+  && ok_t "S2: the API back, transcript untouched: the next tick sends it again and it lands" \
+  || bad_t "S2: retry after a failed send" "sends=$(sends) hb=$(cat "$TMP/hb.log")"
+tick
+[[ "$(sends)" == 0 ]] \
+  && ok_t "S3: once it landed, the following tick sends nothing (still once)" \
+  || bad_t "S3: no repeat after delivery" "$(cat "$TMP/api.log")"
+fresh; tx quiet "$MARCUS_Q"; API_OK=0; tick; API_OK=1
+touch -d "@$((NOW - 5))" "$TMP/home/agent-quiet/.claude/projects/-home-claude-projects/session.jsonl"; tick
+[[ "$(sends)" == 1 ]] && has "$(cat "$TMP/hb.log")" "1 chat(s) confirmed" \
+  && ok_t "S4: a failed send, then the transcript touched with the same text: sent again and it lands" \
+  || bad_t "S4: retry after a touch" "sends=$(sends)"
+opt_in; fresh; RX_RESP='{"choice":"asks_human","confidence":0.95}'; RX_RC=0
+tx quiet "$MARCUS_Q"; API_OK=0; tick; R0=$(receipts | grep -c .); API_OK=1; tick
+[[ "$(calls)" == 0 && "$(sends)" == 1 ]] && [[ "$(receipts | grep -c .)" == "$R0" ]] \
+  && ok_t "S5: opted in, the retry does not ask reflex again or write another receipt (it already said forward)" \
+  || bad_t "S5: retry skips reflex" "calls=$(calls) sends=$(sends) receipts $R0 -> $(receipts | grep -c .)"
+opt_out
+
+# --- U) unpaired, then paired -------------------------------------------------------------------------
+fresh; tx quiet "$MARCUS_Q"; unchannel lead; unchannel boss; tick
+[[ "$(sends)" == 0 ]] && has "$(cat "$TMP/hb.log")" "no paired channel resolves" \
+  && ok_t "U1: nobody paired above the seat: logged, nothing sent" \
+  || bad_t "U1: unroutable" "api=$(cat "$TMP/api.log") hb=$(cat "$TMP/hb.log")"
+channel lead '["501"]'; tick
+[[ "$(cut -d'|' -f1-3 "$TMP/api.log")" == "tok-lead|sendMessage|501" ]] \
+  && ok_t "U2: the gate notifier paired afterwards: the next tick delivers the waiting question through it" \
+  || bad_t "U2: re-pair delivers" "$(cat "$TMP/api.log")"
+tick
+[[ "$(sends)" == 0 ]] \
+  && ok_t "U3: and only once" \
+  || bad_t "U3: no repeat after the re-pair" "$(cat "$TMP/api.log")"
+channel boss '["701"]'
+
+# --- K) backoff ------------------------------------------------------------------------------------------
+[[ "$(_hb_stuck_q_backoff 1) $(_hb_stuck_q_backoff 2) $(_hb_stuck_q_backoff 3) $(_hb_stuck_q_backoff 5) $(_hb_stuck_q_backoff 40)" == "0 600 1200 3600 3600" ]] \
+  && ok_t "K1: backoff: next tick, then 10m, 20m, capped at 60m" \
+  || bad_t "K1: backoff schedule" "$(_hb_stuck_q_backoff 1) $(_hb_stuck_q_backoff 2) $(_hb_stuck_q_backoff 3) $(_hb_stuck_q_backoff 5) $(_hb_stuck_q_backoff 40)"
+fresh; tx quiet "$MARCUS_Q"; unchannel lead; unchannel boss
+tick; tick; N2=$(grep -c 'no paired channel resolves' "$TMP/hb.log")
+tick; N3=$(grep -c 'no paired channel resolves' "$TMP/hb.log")
+touch -d "@$((NOW - 5))" "$TMP/home/agent-quiet/.claude/projects/-home-claude-projects/session.jsonl"
+tick; N4=$(grep -c 'no paired channel resolves' "$TMP/hb.log")
+[[ "$N2" == 1 && "$N3" == 0 && "$N4" == 0 ]] \
+  && ok_t "K2: unroutable: try 2 logs, then a tick inside its 10m backoff logs nothing, touched transcript or not" \
+  || bad_t "K2: backoff holds" "try2=$N2 inside=$N3 touched=$N4"
+CLOCK=$((NOW + 600)); tick; N5=$(grep -c 'try 3, retrying in 20m' "$TMP/hb.log")
+CLOCK=$((NOW + 900)); tick; N6=$(grep -c . "$TMP/hb.log")
+[[ "$N5" == 1 && "$N6" == 0 ]] \
+  && ok_t "K3: 10m later it tries again (try 3, next in 20m) and is quiet again inside that window" \
+  || bad_t "K3: backoff doubles" "try3=$N5 after=$N6"
+channel lead '["501"]'; channel boss '["701"]'
+CLOCK=$((NOW + 1800)); tick
+[[ "$(sends)" == 1 ]] \
+  && ok_t "K4: once its backoff is up and a channel exists, the question is delivered" \
+  || bad_t "K4: delivered after backoff" "$(cat "$TMP/api.log")"
+CLOCK=$NOW
+fresh; tx quiet "$MARCUS_Q"; API_OK=0; tick; API_OK=1
+tx quiet "$REPORT"; tick
+[[ "$(sends)" == 0 && ! -e "$STATE_DIR/stuck-question/quiet.retry" ]] \
+  && ok_t "K5: a failed send, then the seat reports without asking: the pending retry is dropped, nothing sent" \
+  || bad_t "K5: new text replaces the pending one" "sends=$(sends) retry=$(cat "$STATE_DIR/stuck-question/quiet.retry" 2>/dev/null)"
+tick
+[[ "$(sends)" == 0 ]] \
+  && ok_t "K6: and the superseded question is never sent afterwards" \
+  || bad_t "K6: superseded question stays dropped" "$(cat "$TMP/api.log")"
+
 # --- W) the tick runs the sweep ---------------------------------------------------------------------
 grep -q '^  _hb_stuck_question_sweep || _hb_log "\[stuck-question\] pass errored (non-fatal)"$' "$SRC/cmd_heartbeat.sh" \
   && ok_t "W1: cmd_heartbeat's tick calls the sweep under the non-fatal contract" \
@@ -393,6 +480,19 @@ touch -d "@$((NOW - 5))" "$TMP/home/agent-quiet/.claude/projects/-home-claude-pr
 [[ "$(sends)" == 1 ]] \
   && ok_t "M2: MUTANT (text not remembered): the touched transcript forwards again — B2 goes red" \
   || bad_t "M2: mutant must repeat the forward" "sends=$(sends)"
+# M3 is the iteration-1 sweep's ordering: the text is marked judged as soon as it
+# is hashed, before the route and the send.
+eval "$(sed 's/^    retrying=0$/    echo "$hash" > "$dir\/${name}.last"; retrying=0/' <<<"$SWEEP_SRC")"
+has "$(declare -f _hb_stuck_question_sweep)" 'echo "$hash" > "$dir/${name}.last";' \
+  && ok_t "M0c: (anchor) the mark-before-send mutation landed" \
+  || bad_t "M0c: mark-before-send mutation anchor" "the sed pattern no longer matches src/cmd_heartbeat.sh"
+opt_out; fresh; tx quiet "$MARCUS_Q"; API_OK=0; tick; API_OK=1; tick
+S_MUT=$(sends)
+fresh; tx quiet "$MARCUS_Q"; unchannel lead; unchannel boss; tick; channel lead '["501"]'; channel boss '["701"]'; tick
+U_MUT=$(sends)
+[[ "$S_MUT" == 0 && "$U_MUT" == 0 ]] \
+  && ok_t "M3: MUTANT (marked judged before the send): the failed send and the unpaired question are lost — S2 and U2 go red" \
+  || bad_t "M3: mutant must lose the retry" "send-fail retry sends=$S_MUT re-pair sends=$U_MUT"
 eval "$SWEEP_SRC"
 
 echo "-----"

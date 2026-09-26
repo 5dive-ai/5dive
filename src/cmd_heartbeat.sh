@@ -7689,6 +7689,16 @@ _hb_poller_liveness_sweep() {
 # the one this sweep judged last time (a hash per seat under STATE_DIR, so one
 # text is forwarded once).
 #
+# ONCE MEANS DELIVERED, NOT ATTEMPTED. The judged-text hash (<seat>.last) is
+# written only on a TERMINAL outcome: the base reads no ask, reflex holds, or at
+# least one chat confirmed the send. A failed send (0 confirmed) or no paired
+# channel resolving yet is not terminal — the text goes to <seat>.retry
+# (`<hash> <attempts> <due epoch>`) and a later tick sends it again, even with the
+# transcript untouched, backing off (_hb_stuck_q_backoff) so an unroutable seat
+# logs a handful of times, not every tick. It ends when a send lands, the seat
+# says something else, or the turn ages past _HB_STUCK_Q_MAX_AGE_MIN. A retry does
+# not ask reflex again: a pending retry exists only because it said forward.
+#
 # TWO TIERS, because reflex is optional and most boxes do not have it:
 #   base    every box, local, nothing leaves it: the text's final paragraph has
 #           a sentence ending in '?' or a direct ask phrase. It over-forwards on
@@ -7711,6 +7721,8 @@ _HB_STUCK_Q_TEXT_MAX=1500
 _HB_STUCK_Q_MAX_AGE_MIN=1440     # a first tick after install forwards nothing older
 _HB_STUCK_Q_REFLEX_CONF=0.9
 _HB_STUCK_Q_REFLEX_TIMEOUT=15
+_HB_STUCK_Q_RETRY_BASE_S=300    # one tick; the retry delay doubles from here
+_HB_STUCK_Q_RETRY_MAX_S=3600
 _HB_STUCK_Q_QMARK_RE='[?]([[:space:]"*_`)]|$)'
 _HB_STUCK_Q_ASK_RE='(^|[^[:alpha:]])(need you to|please confirm|should i|can you|waiting for your)([^[:alpha:]]|$)'
 _HB_STUCK_Q_OPTIONS='asks_human,progress,report,idle'
@@ -7819,36 +7831,71 @@ _hb_stuck_q_route() { # <seat>
   _task_chain_channel "$1"
 }
 
+# The sweep's clock, a function so the harness can move time past a backoff.
+_hb_stuck_q_now() { date +%s; }
+
+# `_hb_stuck_q_backoff <attempts>` — seconds until the next try after <attempts>
+# failed ones: the first failure retries on the very next tick, then 10, 20, 40
+# minutes, then hourly.
+_hb_stuck_q_backoff() { # <attempts>
+  local n="$1" d
+  (( n <= 1 )) && { printf '0'; return 0; }
+  d=$(( _HB_STUCK_Q_RETRY_BASE_S << (n - 1) ))
+  (( n > 12 || d > _HB_STUCK_Q_RETRY_MAX_S )) && d=$_HB_STUCK_Q_RETRY_MAX_S
+  printf '%s' "$d"
+}
+
 _hb_stuck_question_sweep() {
   declare -F _task_agent_channel >/dev/null 2>&1 || return 0
   # No channel anywhere on the box (solo, CI): there is nobody to forward to.
   _task_deployment_has_channels || return 0
   local reg; reg=$(registry_read 2>/dev/null) || return 0
-  local dir="${STATE_DIR}/stuck-question" model="" name key text hash chat sent
+  local dir="${STATE_DIR}/stuck-question" model="" name key text hash chat sent now
+  local r_hash r_n r_due retrying
   mkdir -p "$dir" 2>/dev/null || return 0
   model=$(reflex_shadow_model 2>/dev/null) || model=""
+  now=$(_hb_stuck_q_now)
   while IFS= read -r name; do
     [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || continue
     systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null || continue
     _task_agent_channel "$name" && continue          # a person already sees this seat
-    # One stat per seat per tick; the transcript is parsed only when it moved.
+    # One stat per seat per tick; the transcript is parsed only when it moved, or
+    # when an undelivered question is due for another try.
     key=$(find "${_HB_SEAT_HOME_ROOT}/agent-${name}/.claude/projects" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' \
             -printf '%T@ %s %p\n' 2>/dev/null | sort -rn | head -1)
     [[ -n "$key" ]] || continue
-    [[ "$key" == "$(cat "$dir/${name}.tx" 2>/dev/null)" ]] && continue
+    r_hash="" r_n=0 r_due=0
+    [[ -f "$dir/${name}.retry" ]] && read -r r_hash r_n r_due < "$dir/${name}.retry" 2>/dev/null || true
+    [[ "$r_n" =~ ^[0-9]+$ && "$r_due" =~ ^[0-9]+$ ]] || { r_hash="" r_n=0 r_due=0; }
+    if [[ "$key" == "$(cat "$dir/${name}.tx" 2>/dev/null)" ]]; then
+      [[ -n "$r_hash" ]] && (( now >= r_due )) || continue
+    fi
     printf '%s\n' "$key" > "$dir/${name}.tx" 2>/dev/null || true
     text=$(_hb_seat_ended_turn_text "$name") || continue
     hash=$(printf '%s' "$text" | sha256sum | cut -c1-32)
     [[ "$hash" == "$(cat "$dir/${name}.last" 2>/dev/null)" ]] && continue
-    printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true
-    _hb_stuck_base_asks "$text" || continue
+    retrying=0
+    if [[ "$hash" == "$r_hash" ]]; then
+      (( now >= r_due )) || continue                 # touched mid-backoff: wait it out
+      retrying=1
+    else
+      r_n=0                                          # a new text starts its own count
+    fi
+    if ! _hb_stuck_base_asks "$text"; then           # terminal: nothing asked
+      printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true
+      rm -f "$dir/${name}.retry"; continue
+    fi
     (( ${#text} > _HB_STUCK_Q_TEXT_MAX )) && text="…${text: -_HB_STUCK_Q_TEXT_MAX}"
-    if [[ -n "$model" && "$(_hb_stuck_reflex "$name" "$text" "$model")" == hold ]]; then
+    if (( ! retrying )) && [[ -n "$model" && "$(_hb_stuck_reflex "$name" "$text" "$model")" == hold ]]; then
+      printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true   # terminal: reflex held
+      rm -f "$dir/${name}.retry"
       _hb_log "[stuck-question] ${name}: the base read an ask and reflex did not; receipt only, nothing forwarded"
       continue
     fi
+    r_n=$((r_n + 1))
     if ! _hb_stuck_q_route "$name"; then
-      _hb_log "[stuck-question] ${name} is waiting for an answer and no paired channel resolves (its gate notifier or anyone up its chain); not forwarded"
+      printf '%s %s %s\n' "$hash" "$r_n" "$((now + $(_hb_stuck_q_backoff "$r_n")))" > "$dir/${name}.retry" 2>/dev/null || true
+      _hb_log "[stuck-question] ${name} is waiting for an answer and no paired channel resolves (its gate notifier or anyone up its chain); not forwarded, try ${r_n}, retrying in $(( $(_hb_stuck_q_backoff "$r_n") / 60 ))m"
       continue
     fi
     sent=0
@@ -7858,7 +7905,14 @@ _hb_stuck_question_sweep() {
         --data-urlencode "text=${name} is waiting for an answer: ${text}"$'\n\n'"Reply with sudo 5dive agent send ${name} '…'" \
         | jq -e '.ok == true' >/dev/null 2>&1 && sent=$((sent + 1))
     done < <(jq -r '(.allowFrom // [])[] | tostring' "$TASK_CH_ACCESS" 2>/dev/null)
-    _hb_log "[stuck-question] ${name} is waiting for an answer; forwarded through ${TASK_CH_AGENT}'s bot, ${sent} chat(s) confirmed"
+    if (( sent > 0 )); then                          # terminal: a person has it
+      printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true
+      rm -f "$dir/${name}.retry"
+      _hb_log "[stuck-question] ${name} is waiting for an answer; forwarded through ${TASK_CH_AGENT}'s bot, ${sent} chat(s) confirmed"
+    else
+      printf '%s %s %s\n' "$hash" "$r_n" "$((now + $(_hb_stuck_q_backoff "$r_n")))" > "$dir/${name}.retry" 2>/dev/null || true
+      _hb_log "[stuck-question] ${name} is waiting for an answer; forwarded through ${TASK_CH_AGENT}'s bot, 0 chat(s) confirmed, try ${r_n}, retrying in $(( $(_hb_stuck_q_backoff "$r_n") / 60 ))m"
+    fi
   done < <(jq -r '.agents | keys[]?' <<<"$reg")
   return 0
 }
