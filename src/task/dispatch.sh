@@ -75,6 +75,7 @@ _task_usage() {
   assign <id> <agent>                           reassign
   verifier <id> <agent> [--accept=] [--max-iters=]   attach or re-point the verifier rail
   set-body <id> <text...>|--file=<path> [--append]   replace the body, or append to it
+                                                (--body-file=<path> is the same as --file=)
   set-title <id> <text...>                      overwrite the title (audited; refused once closed)
   set-branch <id> <branch>                      bind the row to a git branch
   set-parent <id> <DIVE-N|none>                 attach the row to its parent (audited; works on a
@@ -145,6 +146,7 @@ _task_usage() {
                    keyboard, before the gate exists; a letter never fails and
                    just means the wrong thing.
       [--needs=<capability>] [--discusses=<why>] [--rubber-stamp-ok="<why>"]
+      [--owner=<human>]   route the gate to that person (a human account: 5dive human ls)
       [--ask-ok="<why>"]   DIVE-4176: a gate that reaches the PAIRED HUMAN is refused
                    when its --ask runs over 25 words or names an ident/sha/branch/
                    path/flag — that text is all he sees. Rewrite it as a choice
@@ -530,9 +532,11 @@ cmd_task_set_body() {
       # faithful than the positional form even with a well-behaved shell: the
       # positional words are re-joined with single spaces below, so a multi-line
       # body typed inline is already flattened before it reaches the row.
-      --file=*)      _prose_flag_dupe --file "$text_src"
-                     _read_prose_file --file "${1#*=}"
-                     file_text="$_PROSE_FILE_VALUE"; text_src="--file" ;;
+      # --body-file= is the spelling `task add` takes; the same file read here.
+      --file=*|--body-file=*)
+                     _prose_flag_dupe "${1%%=*}" "$text_src"
+                     _read_prose_file "${1%%=*}" "${1#*=}"
+                     file_text="$_PROSE_FILE_VALUE"; text_src="${1%%=*}" ;;
       --)            shift; words+=("$@"); break ;;
       -*)            fail "$E_USAGE" "unknown flag: $1" ;;
       *)             if [[ -z "$task" ]]; then task="$1"; else words+=("$1"); fi ;;
@@ -542,11 +546,11 @@ cmd_task_set_body() {
   local text="${words[*]:-}"
   if [[ -n "$text_src" ]]; then
     [[ -z "$text" ]] \
-      || fail "$E_USAGE" "--file conflicts with the positional text — pass the body exactly once, either inline or from a file."
+      || fail "$E_USAGE" "$text_src conflicts with the positional text — pass the body exactly once, either inline or from a file."
     text="$file_text"
   fi
   [[ -n "$task" && -n "$text" ]] \
-    || fail "$E_USAGE" "usage: 5dive task set-body <id|DIVE-N> <text...>|--file=<path> [--append]"
+    || fail "$E_USAGE" "usage: 5dive task set-body <id|DIVE-N> <text...>|--file=<path>|--body-file=<path> [--append]"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local st
   st=$(db "SELECT status FROM tasks WHERE id=${id};")

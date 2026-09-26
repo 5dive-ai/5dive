@@ -1523,7 +1523,11 @@ main() {
       # the installed CLI to the published release so the dashboard maintenance
       # tile can show a "your CLI is behind — update now" prompt. Everything
       # else in this branch mutates the box, so it stays root-gated.
-      if [[ "${1:-}" == "--check" ]]; then
+      if _verb_help_wanted "$@"; then
+        # Before the root check: asking what a verb does must not need root.
+        printf '%s\n' "usage: 5dive self-update     # update the CLI + plugins, then restart agents (root; alias: 5dive update)" \
+                       "       5dive update --check   # read-only: is the CLI behind/stale? (no root)"
+      elif [[ "${1:-}" == "--check" ]]; then
         shift
         cmd_update_check "$@"
       else

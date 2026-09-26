@@ -7544,11 +7544,23 @@ _hb_poller_verdict() {
   return 0
 }
 
+# The alarm's rung-4 promise, made only where the ladder may act. Without the
+# actions sentinel (the file cmd_supervisor.sh reads as _SUP_ACTIONS_FLAG) the
+# supervisor records 'planned' rows and restarts nothing, so an alarm saying it
+# will leaves the reader waiting on a restart that never comes. Read-only.
+_hb_poller_rung4_sentence() {
+  if [[ -f "${STATE_DIR}/supervisor.actions.enabled" ]]; then
+    printf '%s' "The supervisor restarts a poller-dead seat on its own at rung 4. Its budget counts restarts that did NOT bring the poller back (1 per seat per 6h) plus a flap bound on all restarts (3 per 6h), so a recovery that WORKED no longer spends the allowance for the next episode (DIVE-3915) — if the seat is still dead after a restart, the budget is spent and it needs you."
+  else
+    printf '%s' "Nothing on this box restarts a poller-dead seat on its own (the supervisor's actions are off), so it needs you."
+  fi
+}
+
 _hb_poller_liveness_sweep() {
   local reg; reg=$(registry_read 2>/dev/null) || return 0
   local now; now=$(date +%s)
   local thresh=120                                 # >> 3s beat; rides a restart/GC pause
-  local -a dead=()
+  local -a dead=() dead_seats=() dead_tokens=() dead_access=()
   local name type allowfrom beacon mtime verdict uptime
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
@@ -7582,7 +7594,11 @@ _hb_poller_liveness_sweep() {
       fi
     fi
     verdict=$(_hb_poller_verdict "$type" "$mtime" "$now" "$allowfrom" "$thresh" "$supposed" "$uptime")
-    [[ -n "$verdict" ]] && dead+=("${name}: ${verdict}")
+    [[ -n "$verdict" ]] || continue
+    dead+=("${name}: ${verdict}")
+    # Kept per seat for the no-coordinator-channel fallback below: the seat's OWN
+    # bot and its human(s). TASK_CH_* is overwritten by the next seat's lookup.
+    dead_seats+=("$name"); dead_tokens+=("$TASK_CH_TOKEN"); dead_access+=("$TASK_CH_ACCESS")
   done < <(jq -r '.agents | keys[]?' <<<"$reg")
 
   local flag="${STATE_DIR}/poller-liveness.alarmed"
@@ -7599,7 +7615,26 @@ _hb_poller_liveness_sweep() {
     return 0
   fi
   : > "$flag" 2>/dev/null || true
+  local rung4; rung4=$(_hb_poller_rung4_sentence)
   local coord; coord=$(_task_resolve_coordinator 2>/dev/null)
+  # The coordinator is an AGENT; the alarm reaches a person only when it holds a
+  # paired channel to relay through. Measured 2026-09-26: the coordinator had
+  # none, 16 seats were deaf after an update restart, and the alarm sat in one
+  # pane for 50 minutes. So with no channel there, each dead seat's own bot tells
+  # its own human(s) — sendMessage needs no poller, only the token. Same shape as
+  # the gate re-nag's per-filer fallback above (DIVE-3742/4365).
+  if [[ -z "$coord" ]] || ! _task_agent_channel "$coord"; then
+    _hb_log "[poller-liveness] coordinator ${coord:-(none)} has no paired channel; alarming each dead seat's own human"
+    local i chat
+    for i in "${!dead_seats[@]}"; do
+      while IFS= read -r chat; do
+        [[ "$chat" =~ ^-?[0-9]+$ ]] || continue
+        _gate_channel_api "${dead_tokens[$i]}" sendMessage -d "chat_id=${chat}" \
+          --data-urlencode "text=${dead_seats[$i]} cannot receive your Telegram messages right now (its poller is not running). Fix: sudo 5dive agent restart ${dead_seats[$i]}" \
+          >/dev/null 2>&1 || true
+      done < <(jq -r '(.allowFrom // [])[] | tostring' "${dead_access[$i]}" 2>/dev/null)
+    done
+  fi
   if [[ -n "$coord" ]]; then
     # DIVE-3753 retires DIVE-2384's prohibition and REPLACES it, in the same
     # change that gave the supervisor ladder a restart rung — the alarm and the
@@ -7633,7 +7668,7 @@ _hb_poller_liveness_sweep() {
     #
     # DIVE-818 / DIVE-1434 are provenance refs from code comments, NOT board
     # rows — say so, or the reader looks them up and hits "no such task".
-    ( cmd_send "$coord" --message="🔴 Telegram poller DEAD on: ${dead[*]}. Gate-ping tap buttons still SEND but the human's TAP won't land (getUpdates slot not held) — those gates can't be cleared from the phone. CONFIRM BEFORE ACTING, one seat at a time — do not blanket-restart the fleet. Count the poller for the named agent: pgrep -u agent-<name> -f 'bun (start|server)\.ts' (BOTH names — the plugin's launcher is start.ts since DIVE-3752, older caches and the non-claude variants still run server.ts; the beacon alone cannot separate 'never started' from 'genuinely dead'; the process table can). Zero —> restart THAT ONE agent (5dive agent restart <name>); a poller should appear within ~10s, measured at 9. The supervisor restarts a poller-dead seat on its own at rung 4. Its budget counts restarts that did NOT bring the poller back (1 per seat per 6h) plus a flap bound on all restarts (3 per 6h), so a recovery that WORKED no longer spends the allowance for the next episode (DIVE-3915) — if the seat is still dead after a restart, the budget is spent and it needs you. (Canary provenance — code refs, not board rows: DIVE-1434 canary, DIVE-818 single-getUpdates-slot incident, DIVE-2384 restart grace, DIVE-3748 the three-state measurement, DIVE-3753 the rung-4 restart. Re-pings hourly until healthy.)" ) >/dev/null 2>&1 || true
+    ( cmd_send "$coord" --message="🔴 Telegram poller DEAD on: ${dead[*]}. Gate-ping tap buttons still SEND but the human's TAP won't land (getUpdates slot not held) — those gates can't be cleared from the phone. CONFIRM BEFORE ACTING, one seat at a time — do not blanket-restart the fleet. Count the poller for the named agent: pgrep -u agent-<name> -f 'bun (start|server)\.ts' (BOTH names — the plugin's launcher is start.ts since DIVE-3752, older caches and the non-claude variants still run server.ts; the beacon alone cannot separate 'never started' from 'genuinely dead'; the process table can). Zero —> restart THAT ONE agent (5dive agent restart <name>); a poller should appear within ~10s, measured at 9. ${rung4} (Canary provenance — code refs, not board rows: DIVE-1434 canary, DIVE-818 single-getUpdates-slot incident, DIVE-2384 restart grace, DIVE-3748 the three-state measurement, DIVE-3753 the rung-4 restart. Re-pings hourly until healthy.)" ) >/dev/null 2>&1 || true
   fi
   return 0
 }
