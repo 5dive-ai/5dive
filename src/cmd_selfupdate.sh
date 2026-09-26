@@ -302,9 +302,17 @@ _PENDING_RESTART_MAX_DEFER_SECS=$((24 * 3600))
 #   * `unknown` stays `unknown` — an unreadable board is not upgraded to a
 #     session reading, because the two are answers to different questions and
 #     `unknown` already defers.
-#   * rc 1 / no reading changes nothing, so a non-claude runtime, an older
-#     `claude` without `agents --json`, or a split tree where the helper is not
-#     loaded all behave exactly as before.
+#   * rc 1 / no reading falls through to the PANE (DIVE-5014), and only a pane
+#     that says working (rc 1: the two samples differ, the status line reads
+#     "esc to interrupt", or a byte-stable pane is not at its composer) turns it
+#     busy. No pane at all (rc 2) is still idle, so a non-claude runtime with no
+#     session, or a split tree where neither helper is loaded, restarts as before.
+#     WHY rc 1 CANNOT MEAN IDLE: main sets `disableAgentView: true` (the left-
+#     arrow agent view spawns spare sessions, each with a Telegram poller that
+#     swallows inbound), and that setting makes `claude agents --json` print a
+#     refusal and exit 1. Measured 2026-09-26 02:01:36Z: the v0.55.0 self-update
+#     restarted main mid-answer to lodar, board idle, native unreadable. Do not
+#     fix it by removing the setting.
 #   * a board that says BUSY short-circuits — no reason to shell out to the
 #     seat to confirm a deferral already decided.
 #
@@ -327,10 +335,18 @@ _agent_busy_state() {
   if [[ "$n" =~ ^[0-9]+$ ]]; then
     if (( n > 0 )); then printf 'busy\n'; return 0; fi
     # Board idle. The session may still be mid-turn with nothing claimed.
+    local native="" nrc=1
     if declare -F _hb_agent_native_state >/dev/null 2>&1; then
-      case "$(_hb_agent_native_state "$name" 2>/dev/null || true)" in
+      native=$(_hb_agent_native_state "$name" 2>/dev/null) && nrc=0 || nrc=$?
+      case "$native" in
         busy|blocked:*) printf 'busy\n'; return 0 ;;
       esac
+    fi
+    # DIVE-5014: NO native reading is not an idle reading. Only the pane is left.
+    if (( nrc != 0 )) && declare -F _hb_agent_pane_idle >/dev/null 2>&1; then
+      local prc=0
+      _hb_agent_pane_idle "$name" || prc=$?
+      if (( prc == 1 )); then printf 'busy\n'; return 0; fi
     fi
     printf 'idle\n'
   else
