@@ -3021,9 +3021,38 @@ _hb_agent_idle() {
     blocked:*)  _HB_IDLE_REASON="${native#blocked:}"; return 3 ;;
   esac
   # Fallback: pane-scrape (codex/grok/agy/opencode, or native unavailable).
-  local user="agent-${name}" a b
+  _hb_agent_pane_idle "$name" "$gap"
+}
+
+# The pane half of _hb_agent_idle on its own: 0 = idle, 1 = working/active,
+# 2 = no signal (no pane to read). Split out for DIVE-5014 so a caller whose
+# native reading came back EMPTY can ask the pane without re-running
+# `claude agents --json` — `_agent_busy_state` (cmd_selfupdate.sh) is that
+# caller. The two-sample diff below is the byte-for-byte body _hb_agent_idle
+# always had; the only addition is the status-line check before the sleep.
+#
+# DIVE-5014: the STATUS LINE can say "a turn is running" in one sample. Two
+# shapes: the older "(7s · esc to interrupt)" suffix, and the running spinner
+# itself, "✻ Fermenting… (1m 39s · ↓ 9.1k tokens · thought for 2s)" -- measured
+# on a live agent-dev pane 2026-09-26, which carried NO "esc to interrupt", so
+# the phrase alone would be dead on today's Claude Code. A finished turn's line
+# ("✻ Worked for 9m 11s · done 8:09 AM") has no "… (" and does not match.
+# Read from _hb_pane_status_line (the one line directly above the composer),
+# never from the whole pane: a transcript that merely QUOTES either shape --
+# this row's own body did -- must not read busy forever. It can only move a
+# verdict toward busy, and it answers without the sleep; the diff is still the
+# load-bearing signal (the spinner's timer changes every second). A pane with no
+# ❯ composer (codex/agy/...) has no status line, so for those runtimes this is a
+# no-op and the diff alone decides, as before.
+_hb_agent_pane_idle() {
+  local name="$1" gap="${2:-$_HB_IDLE_SAMPLE_SEC}"
+  local user="agent-${name}" a b st
   a=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 2
   [[ -n "$a" ]] || return 2
+  if st=$(_hb_pane_status_line "$a" 2>/dev/null); then
+    case "$st" in *"esc to interrupt"*) return 1 ;; esac
+    grep -qE '…[[:space:]]*\([0-9]+[smh]' <<<"$st" && return 1
+  fi
   sleep "$gap"
   b=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 2
   [[ "$a" == "$b" ]] || return 1
