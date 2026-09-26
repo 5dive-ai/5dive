@@ -124,7 +124,8 @@ _memory_usage() {
                         (default 30). This is what keeps it off the LIVE session.
         --max-chars     excerpt cap per transcript (default 20000)
         --distiller     command reading the excerpt on stdin, returning
-                        {"atoms":[...]} (default: headless `claude --print`;
+                        {"atoms":[...]} (default: headless `claude --print
+                        --strict-mcp-config`, i.e. no MCP servers;
                         env FIVEDIVE_MEMORY_DISTILLER also sets it)
         --dry-run       print the atoms, write nothing, leave the ledger alone
         --force         re-distil a transcript the ledger already records
@@ -1691,7 +1692,18 @@ _memory_consolidate() {
     command -v claude >/dev/null 2>&1 || [ -x /home/claude/.local/bin/claude ] \
       || fail "$E_NOT_FOUND" "no distiller: pass --distiller=<cmd> or install the claude CLI"
     local _cl; _cl=$(command -v claude 2>/dev/null || echo /home/claude/.local/bin/claude)
-    distiller="$_cl --print"
+    # DIVE-5013 — NO MCP SERVERS. `--strict-mcp-config` with no `--mcp-config`
+    # starts none. The distiller reads stdin and answers JSON; it calls no tool.
+    # Without the flag this pass boots every plugin server the seat has, and the
+    # telegram channel, whose token lives only in the seat unit's env, dies with
+    # "TELEGRAM_BOT_TOKEN required". Claude Code records that failure in the
+    # seat's ~/.claude/mcp-needs-auth-cache.json, and a seat started while the
+    # entry stands SKIPS telegram: no spawn, no mcp-logs line, no poller.
+    # 2026-09-26: this pass ran 01:05-01:09Z, after 5dive-refresh-plugins.sh had
+    # already cleared the cache (DIVE-4852), and the 01:12Z update restart left
+    # 16 seats deaf on Telegram until 02:06Z. Clearing the cache after the fact
+    # cannot win against a writer that runs on its own clock; not writing it can.
+    distiller="$_cl --print --strict-mcp-config"
   fi
 
   local considered=0 processed=0 written=0 refused=0 dupes=0 skipped_live=0 skipped_done=0

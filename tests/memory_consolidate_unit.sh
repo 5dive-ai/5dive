@@ -434,6 +434,40 @@ check "CONTROL: the same sentence inside a valid payload is written, not classif
 check "CONTROL: and raises no refusal" \
   "$(jq -r '.data.distiller_unauthed' <<<"$JOUT" 2>/dev/null)" "0"
 
+echo "── DIVE-5013: the DEFAULT distiller starts NO MCP servers ──"
+# Every arm above injects --distiller, so none of them reaches the default
+# command line, and that default is what the heartbeat cron runs on every seat.
+# A stub `claude` first on PATH records its argv; no model is reached. Without
+# --strict-mcp-config the real CLI boots the seat's plugin servers, telegram
+# fails with no token, and Claude Code caches that failure into the seat's
+# next start (16 seats deaf 2026-09-26 01:12-02:06Z).
+FAKEBIN="$TMP/fakebin"; mkdir -p "$FAKEBIN"; ARGV="$TMP/claude.argv"
+cat > "$FAKEBIN/claude" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' "\$@" > "$ARGV"
+echo '{"atoms":[]}'
+EOF
+chmod +x "$FAKEBIN/claude"
+default_run() { ( unset FIVEDIVE_MEMORY_DISTILLER; PATH="$FAKEBIN:$PATH"; _memory_consolidate "$@" ) ; }
+rm -f "$ARGV"
+default_run --max-sessions=1 --force >/dev/null 2>&1
+check "the default distiller exits clean on an empty answer" "$?" "0"
+[ -s "$ARGV" ] && ok "the default path reached the stub claude" || bad "the default path reached the stub claude"
+grep -qx -- '--print' "$ARGV" 2>/dev/null && ok "default distiller is headless (--print)" || bad "default distiller is headless (--print)"
+grep -qx -- '--strict-mcp-config' "$ARGV" 2>/dev/null && ok "default distiller passes --strict-mcp-config" || bad "default distiller passes --strict-mcp-config"
+grep -qx -- '--mcp-config' "$ARGV" 2>/dev/null && bad "default distiller names no --mcp-config, so no server at all" || ok "default distiller names no --mcp-config, so no server at all"
+# MUTANT: the pre-fix command line. The arm must go red on it or it grades nothing.
+check "BEFORE: the live function carries the flag" "$(declare -f _memory_consolidate | grep -c -- '--strict-mcp-config')" "1"
+eval "$(declare -f _memory_consolidate | sed 's/ --strict-mcp-config"/"/')"
+check "AFTER: the mutation took" "$(declare -f _memory_consolidate | grep -c -- '--strict-mcp-config')" "0"
+rm -f "$ARGV"
+default_run --max-sessions=1 --force >/dev/null 2>&1
+[ -s "$ARGV" ] && ok "MUTANT: the stub still ran" || bad "MUTANT: the stub still ran"
+grep -qx -- '--strict-mcp-config' "$ARGV" 2>/dev/null && bad "MUTANT: the pre-fix line is caught" || ok "MUTANT: the pre-fix line is caught"
+# shellcheck source=/dev/null
+source "$SRC/cmd_memory.sh"
+
 echo "── validation ──"
 run --distiller="$EMPTY" --max-sessions=x >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--max-sessions must be numeric" || bad "--max-sessions must be numeric"
 run --distiller="$EMPTY" --idle-min=-1 >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--idle-min must be numeric" || bad "--idle-min must be numeric"
