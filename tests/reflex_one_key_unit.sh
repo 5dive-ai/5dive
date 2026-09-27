@@ -19,8 +19,13 @@
 #   PERMS.     the resolver moves and re-permissions nothing: the connector stays
 #              640, the override 600, and neither file is rewritten by a read.
 #   NOLEAK.    neither key appears in config (--json and text) or status output.
-#   MUTANT.    a resolver with the connector branch deleted reds CONNECTOR; a
-#              backend that prefers the connector reds BOTH.
+#   PLUGIN.    (REVISED scope) openrouter-key.<plugin>=- writes that plugin's OWN
+#              key (openrouter-<plugin>.env) beside the shared one; config
+#              reports which key each consumer resolves to; reflex never takes a
+#              plugin's key; refusals, one key per call, clear.
+#   MUTANT.    a writer that ignores the plugin name reds PLUGIN; a resolver
+#              with the connector branch deleted reds CONNECTOR; a backend that
+#              prefers the connector reds BOTH.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
@@ -200,7 +205,51 @@ rm -f "$FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE"
 noleak "config --json (connector only)" "$(cfg)"
 noleak "reflex status text (connector only)" "$(stt)"
 
+echo "── PLUGIN ──────────────────────────────────────────────────────────────"
+# REVISED scope: a shared key plus per-consumer OWN keys, so OpenRouter's
+# per-key usage splits who spends. Here the connector holds CONNKEY and there is
+# no root-only reflex key.
+PLUGKEY="sk-or-v1-PLUGSENTINEL$(date +%s%N)voi"
+SETOUT=$(printf '%s\n' "$PLUGKEY" | cfg openrouter-key.voice=-)
+check "openrouter-key.voice=- writes openrouter-voice.env (640) and leaves the shared key alone" \
+  "$(grep -q '"ok":true' <<<"$SETOUT" && grep -qx "OPENROUTER_API_KEY=$PLUGKEY" "$CONNECTORS_DIR/openrouter-voice.env" \
+     && [[ "$(stat -c %a "$CONNECTORS_DIR/openrouter-voice.env")" == 640 ]] && grep -qx "OPENROUTER_API_KEY=$CONNKEY" "$CONNECTORS_DIR/openrouter.env"; echo $?)" "$SETOUT"
+check "config --json reports each consumer's key: shared set, reflex shared, voice its own" \
+  "$(jq -e '.data.openrouter_keys == {shared: "set", reflex: "shared", plugins: {voice: "own"}}' <<<"$(cfg)" >/dev/null; echo $?)" \
+  "$(cfg | jq -c .data.openrouter_keys)"
+check "config text says it in words" \
+  "$(grep -qx 'openrouter-keys = reflex: shared · voice: own · any other plugin: shared' <<<"$(cfgt)"; echo $?)" "$(cfgt | grep openrouter-keys)"
+check "…and the set's own response carries it" "$(jq -e '.data.openrouter_keys.plugins.voice == "own" and .data.applied == ["openrouter-key.voice"]' <<<"$SETOUT" >/dev/null; echo $?)"
+decide >/dev/null
+check "reflex still authenticates with the SHARED key, never a plugin's" "$(authed_with "$CONNKEY" && ! grep -qF "$PLUGKEY" "$FAKE_CURL_LOG"; echo $?)" "$(cat "$FAKE_CURL_LOG")"
+noleak "config --json with a plugin key" "$(cfg | sed "s/$CONNKEY//g")"
+check "…and the plugin key never appears in config output" "$(! grep -qF -e "$PLUGKEY" -e "${PLUGKEY:9:16}" <<<"$(cfg; cfgt; printf '%s\n' "$PLUGKEY" | cfg openrouter-key.voice=-)"; echo $?)"
+for bad in "openrouter-key.reflex=-" "openrouter-key.Voice=-" "openrouter-key.vo_ice=clear" "openrouter-key.voice=$PLUGKEY"; do
+  out=$(printf '%s\n' "$PLUGKEY" | cfg "$bad")
+  check "refused: ${bad%%=*}=… (nothing written, the value never echoed)" \
+    "$(! grep -q '"ok":true' <<<"$out" && ! grep -qF "$PLUGKEY" <<<"$out" && [[ ! -e "$CONNECTORS_DIR/openrouter-Voice.env" && ! -e "$CONNECTORS_DIR/openrouter-reflex.env" ]]; echo $?)" "$out"
+done
+out=$(printf '%s\n' "$PLUGKEY" | cfg openrouter-key=clear openrouter-key.voice=-)
+check "one OpenRouter key per call: shared + plugin in one call is refused, nothing written" \
+  "$(grep -q 'one OpenRouter key per call' <<<"$out" && grep -qx "OPENROUTER_API_KEY=$CONNKEY" "$CONNECTORS_DIR/openrouter.env"; echo $?)" "$out"
+OUT=$(cfg openrouter-key.voice=clear)
+check "openrouter-key.voice=clear removes only voice's file; voice falls back to shared" \
+  "$([[ ! -e "$CONNECTORS_DIR/openrouter-voice.env" && -s "$CONNECTORS_DIR/openrouter.env" ]] \
+     && jq -e '.data.openrouter_keys.plugins == {}' <<<"$OUT" >/dev/null; echo $?)" "$OUT"
+
 echo "── MUTANT ──────────────────────────────────────────────────────────────"
+# 0. A writer that ignores the plugin name clobbers the SHARED key with the
+#    plugin's. PLUGIN must go red.
+MC="$TMP/box_config.mut.sh"
+sed "s|^_openrouter_connector_file() { printf '%s/openrouter%s.env' \"\${CONNECTORS_DIR:-/etc/5dive/connectors}\" \"\${1:+-\$1}\"; }|_openrouter_connector_file() { printf '%s/openrouter.env' \"\${CONNECTORS_DIR:-/etc/5dive/connectors}\"; }|" \
+  src/cmd_box_config.sh >"$MC"
+if cmp -s "$MC" src/cmd_box_config.sh; then bad_t "MUTANT 0: the plugin-file anchor moved" "update the sed in this harness"
+else
+  MR=$( ( source "$MC"; printf '%s\n' "$PLUGKEY" | ( JSON_MODE=1; cmd_box_config openrouter-key.voice=- ) >/dev/null 2>&1
+         grep -qx "OPENROUTER_API_KEY=$CONNKEY" "$CONNECTORS_DIR/openrouter.env" && [[ -e "$CONNECTORS_DIR/openrouter-voice.env" ]]; echo $? ) )
+  check "MUTANT 0: a writer that ignores the plugin name reds PLUGIN (the shared key is clobbered)" "$([[ "$MR" != 0 ]]; echo $?)" "rc=$MR"
+  printf 'OPENROUTER_API_KEY=%s\n' "$CONNKEY" >"$CONNECTORS_DIR/openrouter.env"; rm -f "$CONNECTORS_DIR/openrouter-voice.env"
+fi
 # 1. The resolver with its connector branch deleted: reflex is blind to the
 #    shared key again. CONNECTOR must go red.
 ML="$TMP/reflex.mut.sh"
