@@ -110,6 +110,20 @@ sel() { db "SELECT ident FROM tasks WHERE ident='$1' AND $(_task_merge_standing_
 # the negative controls included — would pass vacuously. Measured while writing it.
 selid() { db "SELECT id FROM tasks WHERE id=$1 AND $(_task_merge_standing_sql "$2");" 2>/dev/null; }
 ITER_PR=https://github.com/5dive-ai/5dive/pull/659
+# DIVE-5048: THIS SECTION IS ABOUT AN OPEN PULL REQUEST, so it must not ask GitHub.
+# ITER_PR is a real PR that merged 2026-08-16; since DIVE-5048 a verify PASS on a
+# MERGED PR records the landing and owes no merge, so on any seat whose read
+# reached GitHub the re-grade below took that branch and THE BUG arm went red for
+# a reason that has nothing to do with the clocks (quinn, iteration 1). The probe is
+# pinned to an OPEN record whose mergeability GitHub is still computing, and it
+# still goes through the REAL decider and resolver — only the network read is
+# replaced. Restored after the section. A landed row losing merge standing is
+# intended (nobody owes a merge; the verifier closes it with `task done`) and is
+# graded where the landing is: tests/task_merge_disposition_unit.sh C10*.
+eval "_vms_real_merge_disp_probe() $(declare -f _merge_disp_probe | tail -n +2)"
+_merge_disp_probe() {
+  _merge_hold_resolve "$(_merge_disp_decide UNKNOWN UNKNOWN "" "${2:-}" low OPEN)" "5dive-ai/5dive"
+}
 ME_V=$(task_actor "")
 MAKER_V="fixturemaker"
 [[ "$MAKER_V" != "$ME_V" ]] || { printf 'FATAL: fixture maker == harness actor; task add refuses assignee==verifier.\n' >&2; exit 1; }
@@ -154,6 +168,11 @@ db "UPDATE tasks SET graded_by='${ME_V}', maker_agent='${MAKER_V}' WHERE id=${IT
 [[ "$(selid "$IT" "$ME_V")" == "$IT" ]] \
   && ok_t "1b/THE BUG: after reject -> re-deliver -> re-grade PASS the verifier HOLDS merge standing (DIVE-4357)" \
   || bad_t "1b/THE BUG: standing held at the end of a reject cycle" "the rail is closed for the life of the row; the verifier must hand the merge to a second seat, which is the hand-move DIVE-4137 removed"
+[[ "$(db "SELECT COALESCE(merge_landed_at,'') FROM tasks WHERE id=${IT};")" == "" ]] \
+  && ok_t "1b/FIXTURE: the re-grade read the PR as OPEN — no landing was recorded, so THE BUG arm above graded the clocks and not a merged PR" \
+  || bad_t "1b/FIXTURE: PR read as OPEN" "a landing was recorded, so the probe stub did not take and this section read the network"
+eval "_merge_disp_probe() $(declare -f _vms_real_merge_disp_probe | tail -n +2)"
+unset -f _vms_real_merge_disp_probe
 
 # THE MIGRATION ARM. A row graded before graded_verdict_at existed (DIVE-3430) has
 # only graded_at, and COALESCE must fall back to it — in BOTH directions, or this
