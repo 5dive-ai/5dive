@@ -3357,14 +3357,26 @@ _merge_disp_risk() {
   printf 'low'
 }
 
-# _merge_disp_decide <mergeable> <merge_state> <head_sha> <graded_sha> <risk>
-#   -> "merge" | "hold:merger:<why>" | "hold:maker:<why>"
+# _merge_disp_decide <mergeable> <merge_state> <head_sha> <graded_sha> <risk> [<pr_state>]
+#   -> "merge" | "merged" | "hold:merger:<why>" | "hold:maker:<why>"
 #
 # PURE, same reason. <risk> is _merge_disp_risk's output; the caller passes it in
 # rather than this function calling it, so each of (i), (ii) and (iii) can be
 # driven independently in a harness.
 _merge_disp_decide() {
   local mergeable="${1^^}" state="${2^^}" head="${3,,}" graded="${4,,}" risk="${5:-}"
+  local pr_state="${6:-}"; pr_state="${pr_state^^}"
+
+  # (0) DIVE-5048: A MERGED PULL REQUEST IS OWED A MERGE BY NOBODY, so it gets no
+  # hold at all — and it is tested FIRST, before every rule below, because none of
+  # them can answer it. GitHub reports a merged pull request as
+  # mergeable=UNKNOWN / mergeStateStatus=UNKNOWN (checked on 5dive-ai/5dive#1142),
+  # so it fell through to `hold:merger:mergeable-UNKNOWN` and a grade recorded
+  # after the landing sent the row back to be merged again (DIVE-616 on teal-fox,
+  # 2026-09-26: reassigned twice, sat at todo until a person closed it). Ahead of
+  # (i) as well: a landed head that differs from the graded one is DIVE-2656's
+  # question, asked at the close, and a merge hold cannot answer it either.
+  [[ "$pr_state" == "MERGED" ]] && { printf 'merged'; return 0; }
 
   # (i) A GRADE IS BOUND TO A SHA, NOT TO A PULL REQUEST. This is DIVE-2656's rule
   # read forwards instead of at the close: if the head has moved since the grade,
@@ -3411,7 +3423,7 @@ _merge_disp_decide() {
 # be — one read, then the two pure functions above. A read that fails for any
 # reason yields a hold naming that fact, never a merge.
 _merge_disp_probe() {
-  local pr="${1:-}" graded="${2:-}" tok raw mergeable state head files repo url rest
+  local pr="${1:-}" graded="${2:-}" tok raw mergeable state head files repo url rest prstate seps
   [[ -n "$pr" ]] || { printf '%s' "$(_merge_hold_resolve hold:merger:no-delivery-ref '')"; return 0; }
   tok=$(_gate_gh_token 2>/dev/null || printf '')
   # US (unit separator) BETWEEN fields, joined by jq. A newline separator would be
@@ -3421,16 +3433,27 @@ _merge_disp_probe() {
   # join re-split with `tr` (what shipped at iteration 1) turns one path
   # containing a space into two tokens, and the look patterns are line-anchored,
   # so `a b/install.sh` would stop matching. Quinn flagged the shape; arm E13.
+  # DIVE-5048: `state` rides the same read, as the field before the file list —
+  # without it a MERGED pull request is indistinguishable from one whose
+  # mergeability GitHub is still computing (both read mergeable=UNKNOWN).
   raw=$(_gate_gh "$tok" 20 pr view "$pr" \
-          --json mergeable,mergeStateStatus,headRefOid,files,url \
+          --json mergeable,mergeStateStatus,headRefOid,files,url,state \
           -q '[ (.mergeable // ""), (.mergeStateStatus // ""), (.headRefOid // ""),
-                (.url // ""), ([ (.files // [])[]?.path ] | join("\n")) ] | join("\u001f")' \
+                (.url // ""), (.state // ""),
+                ([ (.files // [])[]?.path ] | join("\n")) ] | join("\u001f")' \
           2>/dev/null) || raw=""
   [[ -n "$raw" ]] || { printf '%s' "$(_merge_hold_resolve hold:merger:pr-state-unreadable '')"; return 0; }
+  # FIVE separators or it is not the record that was asked for. A short record
+  # does not error here — `${rest#*US}` on a string with no US returns it
+  # unchanged, shifting every field left — and since DIVE-5048 a shifted field
+  # can land in `state`, the one field whose answer WRITES (a recorded landing).
+  seps="${raw//[^$'\x1f']/}"
+  (( ${#seps} >= 5 )) || { printf '%s' "$(_merge_hold_resolve hold:merger:pr-state-unreadable '')"; return 0; }
   mergeable="${raw%%$'\x1f'*}"; rest="${raw#*$'\x1f'}"
   state="${rest%%$'\x1f'*}";    rest="${rest#*$'\x1f'}"
   head="${rest%%$'\x1f'*}";     rest="${rest#*$'\x1f'}"
-  url="${rest%%$'\x1f'*}";      files="${rest#*$'\x1f'}"
+  url="${rest%%$'\x1f'*}";      rest="${rest#*$'\x1f'}"
+  prstate="${rest%%$'\x1f'*}";  files="${rest#*$'\x1f'}"
   # owner/name out of the RESOLVED url, not out of the caller's ref: a bare `#12`
   # delivery_ref names no repo at all.
   repo=$(sed -nE 's#^https?://[^/]+/([^/]+/[^/]+)/pull/.*#\1#p' <<<"$url")
@@ -3442,7 +3465,7 @@ _merge_disp_probe() {
   # The ROLE the pure decider emits becomes a SEAT here, where the repo is known.
   _merge_hold_resolve \
     "$(_merge_disp_decide "$mergeable" "$state" "$head" "$graded" \
-                          "$(_merge_disp_risk "$repo" "$files")")" \
+                          "$(_merge_disp_risk "$repo" "$files")" "$prstate")" \
     "$repo"
 }
 
