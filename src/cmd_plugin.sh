@@ -1576,6 +1576,16 @@ cmd_plugin_upgrade() {
       && echo "  It was recorded as official on its own manifest's word; it is now recorded as $review." >&2
   fi
 
+  # DIVE-5070: the new version's verbs get the same refusals `add` gives them,
+  # before anything is copied. Upgrade used to leave `.verbs` at whatever the
+  # FIRST install declared, so a verb (or alias) a later version added was never
+  # recorded and never dispatched — the a2a plugin's `a2a` alias would not have
+  # reached a single box that already had it.
+  _plugin_verb_install_check "$srcdir" "$plugin" "$key" \
+    "$(jq -r '((.fivedive.capabilities // []) | join(" "))' <<<"$nj")" "$nj"
+  local _old_verbs; _old_verbs=$(jq -r --arg k "$key" \
+    '(.[$k].verbs // []) | map((.name? // empty), ((.aliases? // [])[]? | strings))[]' <<<"$j" 2>/dev/null) || _old_verbs=""
+
   local dest; dest="$(_plugin_cache_dir)/$mkt/$plugin/$new"
   if [[ ! -d "$dest" ]]; then
     mkdir -p "$(dirname "$dest")"
@@ -1589,8 +1599,17 @@ cmd_plugin_upgrade() {
   jq --arg k "$key" --arg v "$new" --arg t "$(date -u +%FT%TZ)" \
      --argjson caps "$(jq -c '(.fivedive.capabilities // [])' <<<"$nj")" \
      --argjson grants "$(jq -c '(.fivedive.grants // [])' <<<"$nj")" --arg r "$review" \
-     '.[$k].version = $v | .[$k].capabilities = $caps | .[$k].grants = $grants | .[$k].review = $r | .[$k].upgraded_at = $t' \
+     --argjson verbs "$(jq -c '(.fivedive.verbs // [])' <<<"$nj")" \
+     '.[$k].version = $v | .[$k].capabilities = $caps | .[$k].grants = $grants | .[$k].verbs = $verbs | .[$k].review = $r | .[$k].upgraded_at = $t' \
      <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
+  if [[ " $(jq -r '((.fivedive.capabilities // []) | join(" "))' <<<"$nj") " == *" verb "* ]]; then
+    local _v
+    while IFS= read -r _v; do
+      [[ -z "$_v" ]] && continue
+      grep -qFx -- "$_v" <<<"$_old_verbs" && continue
+      echo "  '5dive $_v' now runs this plugin ($PLUGIN_VERB_BINDIR/$_v)." >&2
+    done < <(_plugin_verbs_of_manifest "$nj")
+  fi
 
   # DIVE-4522: re-pin the seats at the new version. `5dive-refresh-plugins.sh`
   # re-pins nightly, but only plugins ALREADY in a seat's installed_plugins.json —
@@ -1707,8 +1726,18 @@ cmd_plugin_rollback() {
   if [[ "$(jq -r --arg k "$key" '.[$k].enabled' <<<"$j")" == "true" ]]; then
     ln -sfn "$base/$want" "$(_plugin_enabled_dir)/$key"
   fi
+  # DIVE-5070: the verbs go back with the code. Upgrade now records the new
+  # version's verbs, so a rollback that kept them would claim a verb whose
+  # bin/<verb> the older version never shipped. Read from the version's own
+  # manifest on disk; if that cannot be read, the record is left as it was.
+  local _rb_mf _rb_verbs=""
+  if _rb_mf=$(_plugin_manifest_path "$base/$want"); then
+    _rb_verbs=$(jq -c '(.fivedive.verbs // [])' "$_rb_mf" 2>/dev/null) || _rb_verbs=""
+  fi
   local tmp; tmp=$(mktemp)
-  jq --arg k "$key" --arg v "$want" '.[$k].version = $v' <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
+  jq --arg k "$key" --arg v "$want" --arg verbs "$_rb_verbs" \
+     '.[$k].version = $v | (if $verbs == "" then . else .[$k].verbs = ($verbs | fromjson) end)' \
+     <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
   ok "$key rolled back $cur -> $want" '{plugin:$k, from:$f, to:$t}' --arg k "$key" --arg f "$cur" --arg t "$want"
 }
 

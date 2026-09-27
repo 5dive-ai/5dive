@@ -426,5 +426,44 @@ E2EENTRY
   tc 'T8j ...as verb peer'     'E2E-RAN verb=peer key=peers@fixture argc=3' "$out"
 fi
 
+# ---- T9  upgrade and rollback carry the verbs (DIVE-5070) --------------------
+# Upgrade used to refresh capabilities and grants but leave `.verbs` as the FIRST
+# install declared them, so an alias a later version added never dispatched.
+vmanifest() {  # vmanifest <version> <verbs-json>
+  jq -cn --arg v "$1" --argjson verbs "$2" \
+     '{name:"grows", version:$v, description:"fixture", author:{name:"t"},
+       fivedive:{contract:"1", capabilities:["verb"], verbs:$verbs, grants:[],
+                 trust:{publisher:"t", did:"did:key:t", review:"official"}}}'
+}
+republish() { mkindex; gh_fixture_publish "$MKT" >/dev/null; run cmd_plugin_marketplace upgrade fixture; }
+mkplugin grows "$(vmanifest 1.0.0 "$(V grow)")"; mkentry grows grow
+republish
+run cmd_plugin_add grows@fixture --yes
+t  'T9a v1 installs' 0 "$RC"
+t  'T9a v1 claims grow'         'grows@fixture' "$(_plugin_verb_claims grow)"
+t  'T9a v1 has no sprout'       ''              "$(_plugin_verb_claims sprout)"
+
+mkplugin grows "$(vmanifest 2.0.0 "$(A grow sprout)")"; mkentry grows sprout
+republish
+run cmd_plugin_upgrade grows@fixture --yes
+t  'T9b upgrade to a version adding an alias' 0 "$RC"
+tc 'T9b says the new alias is live' "'5dive sprout' now runs this plugin" "$ERR"
+tn 'T9b does not re-announce the verb it already had' "'5dive grow' now runs" "$ERR"
+t  'T9b the alias is recorded and resolves' 'grows@fixture' "$(_plugin_verb_claims sprout)"
+t  'T9b the name still resolves'            'grows@fixture' "$(_plugin_verb_claims grow)"
+
+run cmd_plugin_rollback grows@fixture 1.0.0
+t  'T9c rollback' 0 "$RC"
+t  'T9c the verbs go back with the code: no sprout' '' "$(_plugin_verb_claims sprout)"
+t  'T9c ...and grow is still there' 'grows@fixture' "$(_plugin_verb_claims grow)"
+
+mkplugin grows "$(vmanifest 3.0.0 "$(A grow task)")"; mkentry grows task
+republish
+run cmd_plugin_upgrade grows@fixture --yes
+t  'T9d an upgrade adding an alias that names a builtin is refused' "$E_VALIDATION" "$RC"
+tc 'T9d names the builtin' "verb 'task'" "$ERR"
+t  'T9d ...and the installed version is untouched' '1.0.0' \
+   "$(jq -r '.["grows@fixture"].version' "$STATE_DIR/plugins/installed.json")"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
