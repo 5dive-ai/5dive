@@ -893,12 +893,50 @@ cmd_task_verify() {
     # `|| true` covers a tree that sourced a subset of src/ without delivery.sh.
     if (( rc == 0 )); then
       local _md_dref _md_disp _md_owner _md_why
-      local _md_held=0 _md_asg=''
+      local _md_held=0 _md_asg='' _md_landed=0
       _md_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
       if [[ -n "$_md_dref" ]] && declare -F _merge_disp_probe >/dev/null 2>&1; then
         _md_disp=$(_merge_disp_probe "$_md_dref" "$(_gate_graded_sha "$result_txt")" 2>/dev/null) \
           || _md_disp="hold:merger:disposition-probe-failed"
-        if [[ "$_md_disp" == "merge" ]]; then
+        # DIVE-4899's rule, applied here too: THE PRIMARY IS NOT THE ROW. A
+        # companion bound beside a merged primary that has not landed is still
+        # owed a merge, so the row stays a hold for the seat that can give it.
+        if [[ "$_md_disp" == "merged" ]] && declare -F _task_companions_unlanded >/dev/null 2>&1 \
+           && [[ -n "$(_task_companions_unlanded "$id" 2>/dev/null)" ]]; then
+          _md_disp="hold:merger:companion-not-merged"
+        fi
+        if [[ "$_md_disp" == "merged" ]]; then
+          # DIVE-5048: THE PULL REQUEST ALREADY LANDED, so nobody owes a merge and
+          # the row gets the close path, not a hold. Before this, GitHub's
+          # mergeable=UNKNOWN on a merged pull request became
+          # `hold:merger:mergeable-UNKNOWN`: the row went back to todo, was handed
+          # to the merge seat, and sat there until a person closed it (DIVE-616 on
+          # teal-fox, twice in nine minutes, after the forge poll had ALREADY
+          # recorded the landing).
+          #
+          # THE CLOSE PATH IS `task merge-landed`'s, not a close from here. Record
+          # the landing (unless the forge poll or the verb already has — its
+          # provenance is not ours to overwrite), retire the hold, and hand the
+          # row to the seat whose close is ungated. Deliberately NOT an auto-close:
+          # a merged pull request is not a finished row (main2, 2026-09-10;
+          # DIVE-4520), a PASS can carry an owed clause, and DIVE-2656's
+          # landed-vs-graded comparison lives in `task done`'s gate, not here.
+          _md_landed=1
+          if [[ "$(db "SELECT 1 FROM tasks WHERE id=${id} AND ${_TASKS_MERGE_LANDED_SQL};" 2>/dev/null)" != "1" ]] \
+             && declare -F _task_merge_landed_record >/dev/null 2>&1; then
+            local _md_ml="" _md_lsha="" _md_lat=""
+            # The sha and mergedAt from the credential-free read `merge-landed`
+            # uses. Unreadable is not a veto: the probe above already read MERGED
+            # with this seat's token, and the record renders a missing sha as such.
+            declare -F _merge_landed_read >/dev/null 2>&1 \
+              && { _md_ml=$(_merge_landed_read "$_md_dref" "$(_gate_slug_from_url "$_md_dref" 2>/dev/null || printf '')" 2>/dev/null) || _md_ml=""; }
+            [[ -n "$_md_ml" ]] && { _md_lsha="${_md_ml%%|*}"; _md_lat="${_md_ml#*|}"; }
+            _task_merge_landed_record "$id" "$_md_lsha" "$_md_lat" "$(task_actor "")" "$_md_dref" || true
+          else
+            db "UPDATE tasks SET merge_owner=NULL, merge_hold_reason=NULL WHERE id=${id};" || true
+          fi
+          warn "$ident: ${_md_dref} is ALREADY MERGED — no merge is owed, so no merge hold was recorded and the row was not handed to a merge seat (DIVE-5048). It is owed a CLOSE: \`5dive task done ${ident}\` from the row's verifier, after any clause the PASS verdict left owed."
+        elif [[ "$_md_disp" == "merge" ]]; then
           # Auto-mergeable at the graded sha. The MERGE itself is not done here —
           # it belongs to `task done`, where the DIVE-1830 gate can re-derive that
           # it landed and DIVE-2656 can compare what landed against what was
@@ -995,7 +1033,8 @@ cmd_task_verify() {
         # `_tasks_merge_owner_sql` COALESCEs '' to maker_agent and then to the
         # assignee, so the render degrades to a seat that exists rather than to
         # a constant that may not (DIVE-4571).
-        db "UPDATE tasks SET merge_owner=$(sqlq "${_md_owner:-}"),
+        # A LANDED row (DIVE-5048) is owed no merge, so it gets no owner written.
+        (( _md_landed )) || db "UPDATE tasks SET merge_owner=$(sqlq "${_md_owner:-}"),
                merge_hold_reason=$(sqlq "$_md_why")
             WHERE id=${id};" || true
         # ---- upstream #1009: A HELD ROW MUST LAND SOMEWHERE, NOT JUST BE LABELLED ----
@@ -1066,6 +1105,15 @@ cmd_task_verify() {
           _task_store_audit_log "task.merge-hold-reassigned" ok 0 -- \
             "$ident" "from=${_md_asg:-<none>} to=$_md_owner reason=$_md_why"
           warn "$ident: held for merge — handed from '${_md_asg:-<none>}' to '${_md_owner}', the seat that owes the merge."
+        fi
+        # DIVE-5048: a landed row goes where `task merge-landed` puts it — the
+        # verifier, whose close is ungated on a loop row. A no-op when it is
+        # already there, which is the common case (the grader IS the verifier).
+        if (( _md_landed )) && declare -F _task_merge_landed_handoff >/dev/null 2>&1; then
+          local _md_vf _md_mv
+          _md_vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
+          _md_mv=$(_task_merge_landed_handoff "$id" "$ident" "$_md_asg" "$_md_vf" 2>/dev/null) || _md_mv=""
+          [[ -n "$_md_mv" ]] && warn "$ident:${_md_mv}"
         fi
       fi
     fi

@@ -69,6 +69,17 @@ _task_default_verifier() { printf 'grader'; }
 _task_require_lane()      { return 0; }
 _task_deliver_reach_probe() { return 0; }
 _grader_spawn_request() { return 0; }
+# DIVE-5048: THE PR READ IS PINNED TO AN OPEN RECORD. PR_CLI below is a REAL pull
+# request (merged 2026-09-16), and since DIVE-5048 a computed PASS on a MERGED PR
+# records the landing and hands the row to its verifier — so on any seat whose read
+# reached GitHub, "…green closes" saw assignee=grader and went red for a reason
+# that has nothing to do with deriving the grade. Only the network read is
+# replaced: the real decider and resolver still answer, on an OPEN pull request
+# whose mergeability GitHub is still computing. The MERGED case is graded in
+# tests/task_merge_disposition_unit.sh (C10*).
+_merge_disp_probe() {
+  _merge_hold_resolve "$(_merge_disp_decide UNKNOWN UNKNOWN "" "${2:-}" low OPEN)" "5dive-ai/5dive"
+}
 add_row() { local t="$1"; shift
   cmd_task_add "$t $RANDOM" --assignee=dev --from=main --priority=high "$@" 2>/dev/null \
     | jq -r '.data.ident // empty' 2>/dev/null; }
@@ -200,6 +211,9 @@ mkrepo "$W/cli-other" https://github.com/5dive-ai/5dive.git "an-unrelated-branch
 (( rc == 0 )) && [[ "$(col "$IDC" assignee)" == dev ]] && grep -q 'verify PASS' <<<"$(col "$IDC" result)" \
   && ok_t "…and its green table closed it with no grader session" \
   || bad_t "…green closes" "rc=$rc assignee='$(col "$IDC" assignee)'"
+[[ -z "$(col "$IDC" merge_landed_at)" ]] \
+  && ok_t "FIXTURE: the delivery read its PR as OPEN — no landing was recorded, so the arm above graded the derivation and not a merged PR" \
+  || bad_t "FIXTURE: PR read as OPEN" "a landing was recorded, so the probe stub did not take and this harness read the network"
 
 W="$TMP/ws2"; mkdir -p "$W"
 IDC2=$(add_row "two sibling checkouts on the row's branch")

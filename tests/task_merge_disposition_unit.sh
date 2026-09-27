@@ -71,6 +71,21 @@
 #                                                  C8d, C8e, C8f, C8h)
 # M9 is the defect DIVE-4512 exists to fix, stated as a mutant.
 #
+# DIVE-5048 adds arms A14-A17, E14-E15 and section C10 — a PASS recorded after the
+# pull request already MERGED (GitHub: mergeable=UNKNOWN), which used to become
+# `hold:merger:mergeable-UNKNOWN`. Mutants, driven by hand the same way:
+#   M12  decide's `pr_state == MERGED` line deleted   killed 5 arms (A14, A15,
+#                                                      E14, E14b, E14c)
+#   M13  the probe stops passing `state` to decide    killed 3 arms (E14 x3)
+#   M14  the probe's five-separator guard deleted     killed 1 arm  (E7, the
+#        old five-field shape then MERGES)
+#   M15  loops.sh `merged` branch -> `if false`       killed 9 arms (C10a-e,
+#                                                      C10i-l)
+#   M16  an existing landing record is overwritten    killed 1 arm  (C10h)
+#   M17  the hand-off to the verifier deleted         killed 2 arms (C10c, C10l)
+#   M18  the companion rule deleted                   killed 2 arms (C10m, C10n)
+# M12 is the defect DIVE-5048 exists to fix, stated as a mutant.
+#
 # Run: bash tests/task_merge_disposition_unit.sh   (no root, no network).
 set -uo pipefail
 
@@ -170,6 +185,17 @@ eq "A13 sha mismatch OUTRANKS a low-risk clean-and-green PR    -> hold:merger" \
    "hold:merger:graded-sha-is-not-the-head" \
    "$(_merge_disp_decide MERGEABLE CLEAN "$SHA40" ffffffffffffffffffffffffffffffffffffffff low)"
 
+# DIVE-5048 — (0), THE PULL REQUEST'S OWN STATE, ahead of all of the above. The
+# exact operands GitHub returns for a merged pull request (#1142): both UNKNOWN.
+eq "A14 MERGED, mergeable+state UNKNOWN (the #1142 answer)     -> merged" \
+   "merged" "$(_merge_disp_decide UNKNOWN UNKNOWN "$SHA40" "$SHA40" low MERGED)"
+eq "A15 MERGED outranks the sha check and a look-worthy risk   -> merged" \
+   "merged" "$(_merge_disp_decide UNKNOWN UNKNOWN "$SHA40" ffffffffffffffffffffffffffffffffffffffff look:codeowners-path MERGED)"
+eq "A16 NEGATIVE CONTROL: OPEN with the same operands still holds" \
+   "hold:merger:mergeable-UNKNOWN" "$(_merge_disp_decide UNKNOWN UNKNOWN "$SHA40" "$SHA40" low OPEN)"
+eq "A17 ...and a caller that passes no state keeps the old answer" \
+   "hold:merger:mergeable-UNKNOWN" "$(_merge_disp_decide UNKNOWN UNKNOWN "$SHA40" "$SHA40" low)"
+
 # ===================================================================
 # B. _merge_disp_risk — (iii), from a file list. Fixture-driven, so each
 #    class of "a person has to look at this" is graded without a repo.
@@ -225,10 +251,14 @@ GH_RAW=""; GH_RC=0
 _gate_gh_token() { printf 'fixture-token'; }
 _gate_gh() { [[ -n "$GH_RAW" ]] && printf '%s' "$GH_RAW"; return "$GH_RC"; }
 US=$'\x1f'
+# DIVE-5048: the record carries the pull request's own `state` as its fifth field,
+# ahead of the file list. REC_STATE sets it; every arm written before DIVE-5048
+# is about an OPEN pull request, so that is the default.
+REC_STATE=OPEN
 rec() { # rec <mergeable> <state> <head> <url> <file>... -> one US-joined record
   local m="$1" st="$2" hd="$3" u="$4"; shift 4
   local f=""; if (( $# )); then printf -v f '%s\n' "$@"; f="${f%$'\n'}"; fi
-  printf '%s%s%s%s%s%s%s%s%s' "$m" "$US" "$st" "$US" "$hd" "$US" "$u" "$US" "$f"
+  printf '%s%s%s%s%s%s%s%s%s%s%s' "$m" "$US" "$st" "$US" "$hd" "$US" "$u" "$US" "$REC_STATE" "$US" "$f"
 }
 PRURL=https://github.com/5dive-ai/5dive/pull/809
 APIURL=https://github.com/lodar/5dive-api/pull/7
@@ -264,11 +294,16 @@ eq "E6  the HEAD field is the one compared against the grade" \
 # a string with no US returns the string UNCHANGED, so a truncated record does not
 # error — it silently shifts every field left and would otherwise be parsed as if
 # it were whole. Each of these must hold; none may merge.
-for _shape in "MERGEABLE" "MERGEABLE${US}CLEAN" "MERGEABLE${US}CLEAN${US}${SHA40}"; do
+# DIVE-5048 adds the 4- and 5-field shapes: the old five-field record (no
+# `state`) and one whose missing field shifts a value into `state`, which is the
+# one field whose answer now WRITES. Both must hold, never read as merged.
+for _shape in "MERGEABLE" "MERGEABLE${US}CLEAN" "MERGEABLE${US}CLEAN${US}${SHA40}" \
+              "MERGEABLE${US}CLEAN${US}${SHA40}${US}${PRURL}${US}src/task/loops.sh" \
+              "UNKNOWN${US}UNKNOWN${US}${SHA40}${US}MERGED${US}src/task/loops.sh"; do
   GH_RAW="$_shape"
   _got=$(_merge_disp_probe "$PRURL" "$SHA40")
   case "$_got" in
-    hold:*) ok_t "E7  a truncated record ($(( $(grep -o "$US" <<<"$_shape" | wc -l) + 1 )) of 5 fields) holds: $_got" ;;
+    hold:*) ok_t "E7  a truncated record ($(( $(grep -o "$US" <<<"$_shape" | wc -l) + 1 )) of 6 fields) holds: $_got" ;;
     *)      bad_t "E7  a truncated record must hold" "got '$_got'" ;;
   esac
 done
@@ -310,6 +345,36 @@ eq "E13a a look-worthy path that is NOT last is still found" \
 GH_RAW=$(rec MERGEABLE CLEAN "$SHA40" "$PRURL" "a dir/install.sh")
 eq "E13b a path containing a SPACE stays one token" \
    "hold:ops:codeowners-path" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+
+# --- E14/E15 DIVE-5048: A MERGED PULL REQUEST. GitHub answers one with
+# mergeable=UNKNOWN / mergeStateStatus=UNKNOWN (5dive-ai/5dive#1142, checked), and
+# before the `state` field rode this read that was `hold:ops:mergeable-UNKNOWN` —
+# a merge hold on something nobody can merge again (DIVE-616 on teal-fox).
+REC_STATE=MERGED
+GH_RAW=$(rec UNKNOWN UNKNOWN "$SHA40" "$PRURL" src/task/loops.sh)
+eq "E14 a MERGED pull request (mergeable=UNKNOWN) reads merged, not a hold" \
+   "merged" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+# ...and the merged answer outranks every hold the other fields would raise: a
+# look-worthy path and a head that moved are both questions about a merge that
+# is not going to happen.
+GH_RAW=$(rec UNKNOWN UNKNOWN 0123456789abcdef0123456789abcdef01234567 "$PRURL" install.sh)
+eq "E14b ...even with a moved head and a CODEOWNERS path" \
+   "merged" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+REC_STATE=merged
+GH_RAW=$(rec UNKNOWN UNKNOWN "$SHA40" "$PRURL" src/task/loops.sh)
+eq "E14c ...case-insensitively" "merged" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+# THE NEGATIVE CONTROLS, and they are the alternative the filing rejected:
+# UNKNOWN is NOT made non-blocking. An OPEN pull request whose mergeability
+# GitHub is still computing reads exactly the same two UNKNOWNs and must hold.
+REC_STATE=OPEN
+GH_RAW=$(rec UNKNOWN UNKNOWN "$SHA40" "$PRURL" src/task/loops.sh)
+eq "E15 an OPEN pull request with mergeable=UNKNOWN still holds" \
+   "hold:ops:mergeable-UNKNOWN" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+REC_STATE=CLOSED
+GH_RAW=$(rec UNKNOWN UNKNOWN "$SHA40" "$PRURL" src/task/loops.sh)
+eq "E15b a CLOSED-unmerged pull request is not merged either" \
+   "hold:ops:mergeable-UNKNOWN" "$(_merge_disp_probe "$PRURL" "$SHA40")"
+REC_STATE=OPEN
 
 unset -f _gate_gh _gate_gh_token
 
@@ -486,6 +551,69 @@ db "UPDATE tasks SET graded_by='' WHERE id=${c10};"
 grade_prose "$c10"
 eq "C8h an EMPTY graded_by falls back to the grading seat, never to 'main'" \
    "quinn" "$(col "$c10" merge_owner)"
+
+# --- C10: DIVE-5048 — A PASS RECORDED AFTER THE PULL REQUEST MERGED.
+#
+# The shape luca measured on teal-fox (DIVE-616, 2026-09-26): the forge poll
+# recorded the landing at 13:00, the grader's PASS followed at 13:27, and the
+# disposition — mergeable=UNKNOWN on a merged pull request — became a merge hold
+# that set the row to todo and handed it to a merge seat, twice. Expected: no
+# hold, no hand-off to a merger; the row takes `task merge-landed`'s close path
+# (landing recorded, row on its verifier, owed a close). Deliberately NOT closed
+# here — see the loops.sh comment; C10f asserts that half.
+DISP_ANSWER="merged"
+_merge_landed_read() { printf '%s|%s\n' 1111111111111111111111111111111111111111 2026-09-26T12:57:00Z; }
+merged_row() { # merged_row <title> <assignee> -> a delivered row, bound, on <assignee>
+  local r; r=$(mkrow "$1"); db "UPDATE tasks SET assignee=$(sqlq "$2") WHERE id=${r};"; printf '%s' "$r"
+}
+c11=$(merged_row "merged before the grade — row still on the maker" dev)
+grade_prose "$c11"
+eq "C10a a merged PR records NO merge owner (was: ops, mergeable-UNKNOWN)" \
+   "" "$(col "$c11" merge_owner)"
+eq "C10b ...and no hold reason" "" "$(col "$c11" merge_hold_reason)"
+eq "C10c ...the row is on its VERIFIER, not handed to a merge seat" \
+   "quinn" "$(col "$c11" assignee)"
+eq "C10d ...the landing is recorded against the binding, by the grading seat" \
+   "quinn|1111111111111111111111111111111111111111|https://github.com/5dive-ai/5dive/pull/809" \
+   "$(db "SELECT COALESCE(merge_landed_by,'')||'|'||COALESCE(merge_landed_sha,'')||'|'||COALESCE(merge_landed_ref,'') FROM tasks WHERE id=${c11};")"
+eq "C10e ...so the board no longer paints it graded->merge" "todo" "$(board "$c11")"
+eq "C10f ...and it is NOT closed from here — the close is the verifier's" \
+   "todo" "$(col "$c11" status)"
+eq "C10g ...the PASS itself is still recorded" "pass" "$(col "$c11" graded_verdict)"
+
+# The luca shape exactly: the forge poll got there FIRST. Its record is the
+# provenance and a later grade must not overwrite it.
+c12=$(merged_row "forge poll recorded the landing before the grade" quinn)
+db "UPDATE tasks SET merge_landed_at='2026-09-26 13:00:18', merge_landed_by='forge-poll',
+       merge_landed_sha='2222222222222222222222222222222222222222', merge_landed_ref=delivery_ref
+     WHERE id=${c12};"
+grade_prose "$c12"
+eq "C10h an already-recorded landing keeps its provenance (forge-poll)" \
+   "forge-poll|2222222222222222222222222222222222222222|2026-09-26 13:00:18" \
+   "$(db "SELECT merge_landed_by||'|'||merge_landed_sha||'|'||merge_landed_at FROM tasks WHERE id=${c12};")"
+eq "C10i ...and still gets no merge owner" "" "$(col "$c12" merge_owner)"
+eq "C10j ...and stays on quinn" "quinn" "$(col "$c12" assignee)"
+
+# The other verifier shape: `verify --cmd` on a bound row (the DIVE-3330 divert).
+c13=$(merged_row "merged, graded by --cmd" dev)
+grade_cmd "$c13"
+eq "C10k \`verify --cmd\` on a merged PR records no merge owner either" \
+   "" "$(col "$c13" merge_owner)"
+eq "C10l ...and lands the row on its verifier" "quinn" "$(col "$c13" assignee)"
+
+# THE COMPANION RULE (DIVE-4899): a merged PRIMARY with a companion still open is
+# owed a merge, so it holds — the negative control that `merged` is not a blanket
+# release.
+eval "_task_companions_unlanded_real() $(declare -f _task_companions_unlanded | tail -n +2)"
+_task_companions_unlanded() { printf 'https://github.com/lodar/5dive-api/pull/9 (OPEN, not merged)\n'; }
+c14=$(merged_row "merged primary, open companion" quinn)
+grade_prose "$c14"
+eq "C10m a merged primary with an OPEN companion still holds for a merge seat" \
+   "companion-not-merged" "$(col "$c14" merge_hold_reason)"
+eq "C10n ...and records no landing" "" "$(col "$c14" merge_landed_at)"
+eval "_task_companions_unlanded() $(declare -f _task_companions_unlanded_real | tail -n +2)"
+unset -f _merge_landed_read merged_row
+DISP_ANSWER="merge"
 
 # ===================================================================
 # C9. DIVE-4520 — `task done` ON A MERGE-PENDING ROW REFUSES INSTEAD OF
