@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # TIER: nightly — a READ-ONLY JSON view over the a2a round store, 8.0s. A read surface cannot corrupt state, cannot strand a PR, and is graded every night by the full sweep (DIVE-4465).
-# DIVE-3903: `5dive a2a rounds` — the read-only JSON view over the a2a round
+# DIVE-3903: `5dive agent rounds` (was `5dive a2a rounds` until DIVE-5070) — the read-only JSON view over the a2a round
 # ledger that the floor projects.
 #
 # WHAT THIS GRADES AND WHY IT IS THE BUNDLE. Every assertion runs the BUILT
@@ -54,7 +54,7 @@ NOW=$(date +%s)
   printf 'a\tb\tc\tnotanumber\n'                        # malformed timestamp
 } > "$L"
 
-run() { A2A_ROUND_LEDGER="$1" "$BIN" a2a rounds "${@:2}"; }
+run() { A2A_ROUND_LEDGER="$1" "$BIN" agent rounds "${@:2}"; }
 j()   { run "$@" --json; }
 
 echo "== the verb is dispatched from the BUNDLE (not just present in src/) =="
@@ -103,7 +103,7 @@ check "--agent is echoed back in the payload" \
 echo "== THE THIRD STATE: absent, unreadable and idle are three answers =="
 out_abs="$(j "$TMP/never-written.tsv")"
 check "absent state"          "$(jq -r '.data.source.state'     <<<"$out_abs")" "absent"
-check "absent is rc 0"        "$(A2A_ROUND_LEDGER="$TMP/never-written.tsv" "$BIN" a2a rounds >/dev/null 2>&1; echo $?)" "0"
+check "absent is rc 0"        "$(A2A_ROUND_LEDGER="$TMP/never-written.tsv" "$BIN" agent rounds >/dev/null 2>&1; echo $?)" "0"
 check "absent carries a note" "$(jq -r '.data.source.note|length>0' <<<"$out_abs")" "true"
 
 : > "$TMP/idle.tsv"
@@ -119,7 +119,7 @@ else
   out_un="$(j "$U" 2>/dev/null)"
   check "unreadable state"    "$(jq -r '.data.source.state' <<<"$out_un")" "unreadable"
   check "unreadable is NOT rendered as zero traffic, it exits 3" \
-    "$(A2A_ROUND_LEDGER="$U" "$BIN" a2a rounds >/dev/null 2>&1; echo $?)" "3"
+    "$(A2A_ROUND_LEDGER="$U" "$BIN" agent rounds >/dev/null 2>&1; echo $?)" "3"
   # The note must report the mode it STATTED, not the mode the writer intends —
   # the interesting case is the file that is NOT 0660 root:claude (DIVE-3658).
   check "unreadable note names the observed mode" \
@@ -147,9 +147,8 @@ check "ledger mode unchanged"  "$(stat -c '%a' "$L")" "$before_mode"
 check "the pruner did not run" "$(grep -c 'DIVE-9' "$L")" "1"
 
 echo "== usage / bad input =="
-check "bad window refused"      "$(A2A_ROUND_LEDGER="$L" "$BIN" a2a rounds --window=0 2>&1 >/dev/null | grep -c 'positive whole number')" "1"
-check "unknown flag refused"    "$(A2A_ROUND_LEDGER="$L" "$BIN" a2a rounds --nope 2>&1 >/dev/null | grep -c "unknown argument")" "1"
-check "unknown subcommand refused" "$(A2A_ROUND_LEDGER="$L" "$BIN" a2a bogus 2>&1 >/dev/null | grep -c 'unknown subcommand')" "1"
+check "bad window refused"      "$(A2A_ROUND_LEDGER="$L" "$BIN" agent rounds --window=0 2>&1 >/dev/null | grep -c 'positive whole number')" "1"
+check "unknown flag refused"    "$(A2A_ROUND_LEDGER="$L" "$BIN" agent rounds --nope 2>&1 >/dev/null | grep -c "unknown argument")" "1"
 # Presence, not an exact count: an exact grep count asserts how many times the
 # help text happens to spell the verb, which any wording edit breaks for no
 # reason. What must hold is that the verb is REACHABLE from both help surfaces —
@@ -160,12 +159,16 @@ check "unknown subcommand refused" "$(A2A_ROUND_LEDGER="$L" "$BIN" a2a bogus 2>&
 # a failed match on a help text that contained the verb three times. The
 # harness was wrong, not the wiring; a probe whose plumbing can fabricate a
 # negative is the class this repo keeps paying for.
-help_a2a="$("$BIN" a2a 2>/dev/null)"
+help_a2a="$("$BIN" agent rounds --help 2>/dev/null)"
 help_top="$("$BIN" 2>&1 || true)"
-check "bare 'a2a' prints its own usage" \
-  "$(case "$help_a2a" in *'5dive a2a rounds'*) echo yes ;; *) echo no ;; esac)" "yes"
+check "'agent rounds --help' prints its own usage" \
+  "$(case "$help_a2a" in *'5dive agent rounds'*) echo yes ;; *) echo no ;; esac)" "yes"
 check "the verb is advertised in the top-level usage" \
-  "$(case "$help_top" in *'5dive a2a rounds'*) echo yes ;; *) echo no ;; esac)" "yes"
+  "$(case "$help_top" in *'5dive agent rounds'*) echo yes ;; *) echo no ;; esac)" "yes"
+# DIVE-5070: `a2a` is FREED for the a2a plugin, not kept as a builtin alias.
+# With no plugin claiming it, it must read as any other unknown command.
+check "'a2a' is no longer a builtin (unknown command without the plugin)" \
+  "$(STATE_DIR="$TMP/nostate" "$BIN" a2a rounds 2>&1 >/dev/null | grep -c 'unknown command')" "1"
 
 echo "== nextSendWarns is counted in the WRITER's window, not the caller's (iteration 2) =="
 # quinn's exact repro. a2a_round_guard decides via a2a_round_count, which counts
@@ -223,9 +226,9 @@ echo "== --window is range-checked BEFORE it is multiplied (iteration 2) =="
 for w in 9223372036854775807 99999999999999999999 2562047788015215 87601 \
          18446744073709551716 18446744073709638400; do
   check "--window=$w refused" \
-    "$(A2A_ROUND_LEDGER="$L" "$BIN" a2a rounds --window="$w" 2>&1 >/dev/null | grep -c 'capped at')" "1"
+    "$(A2A_ROUND_LEDGER="$L" "$BIN" agent rounds --window="$w" 2>&1 >/dev/null | grep -c 'capped at')" "1"
   check "--window=$w does not render an idle fleet" \
-    "$(A2A_ROUND_LEDGER="$L" "$BIN" a2a rounds --json --window="$w" 2>/dev/null | jq -r '.data.summary.rounds // "refused"')" "refused"
+    "$(A2A_ROUND_LEDGER="$L" "$BIN" agent rounds --json --window="$w" 2>/dev/null | jq -r '.data.summary.rounds // "refused"')" "refused"
 done
 check "the largest accepted window still reads"  "$(jq -r '.data.summary.rounds' <<<"$(j "$L" --window=87600)")" "5"
 check "and is still flagged as past retention"   "$(jq -r '.data.source.windowExceedsRetention' <<<"$(j "$L" --window=87600)")" "true"

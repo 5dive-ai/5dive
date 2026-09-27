@@ -130,6 +130,17 @@ mkplugin sneaky  "$(manifest sneaky '["verb"]' "$(V sneak)")";      mkentry snea
   jq --arg c 'touch '"$TMP/MANIFEST-STRING-RAN" \
      '.fivedive.setup = {hint:"h", command:$c} | .fivedive.verbs[0].command = $c' \
      "$MKT/sneaky/.claude-plugin/plugin.json" > "$TMP/x" && mv "$TMP/x" "$MKT/sneaky/.claude-plugin/plugin.json"
+# DIVE-5070 — verb ALIASES. A rename keeps the old name in `name` (all a CLI that
+# predates the field reads) and the new one in `aliases`.
+A() { jq -cn --arg n "$1" --arg a "$2" '[{name:$n, summary:"fixture verb", aliases:[$a]}]'; }
+mkplugin renamed     "$(manifest renamed '["verb"]' "$(A chirp tweet)")";   mkentry renamed chirp; mkentry renamed tweet
+mkplugin aliasusurp  "$(manifest aliasusurp '["verb"]' "$(A peep task)")";  mkentry aliasusurp peep; mkentry aliasusurp task
+mkplugin aliashollow "$(manifest aliashollow '["verb"]' "$(A croak ribbit)")"; mkentry aliashollow croak
+mkplugin aliasrival  "$(manifest aliasrival '["verb"]' "$(A yodel tweet)")"; mkentry aliasrival yodel; mkentry aliasrival tweet
+mkplugin aliasshouty "$(manifest aliasshouty '["verb"]' "$(A honk HONK)")"; mkentry aliasshouty honk
+# the a2a plugin's own shape: `peer` for every box that has it, `a2a` once the
+# CLI stops owning that name
+mkplugin peers       "$(manifest peers '["verb"]' "$(A peer a2a)")";        mkentry peers peer; mkentry peers a2a
 mkindex
 
 gh_fixture_publish "$MKT"
@@ -353,6 +364,106 @@ else
   t  'T7d a disabled plugin is not dispatched by the built CLI' 2 "$rc"
   tc 'T7d ...and reads as an unknown command' 'unknown command: sing' "$(cat "$TMP/.e2ee")"
 fi
+
+# ---- T8  verb aliases (DIVE-5070) ------------------------------------------
+# An alias is a verb in every respect the install check and the dispatcher care
+# about: same refusals, its own bin/<alias>, and it dispatches as itself.
+run cmd_plugin_add aliasusurp@fixture --yes
+t  'T8a an alias naming a builtin is refused' "$E_VALIDATION" "$RC"
+tc 'T8a names the builtin' "verb 'task'" "$ERR"
+
+run cmd_plugin_add aliashollow@fixture --yes
+t  'T8b an alias with no executable is refused' "$E_VALIDATION" "$RC"
+tc 'T8b names the missing bin/<alias>' 'bin/ribbit' "$ERR"
+
+run cmd_plugin_add aliasshouty@fixture --yes
+t  'T8c a non-kebab alias is refused' "$E_VALIDATION" "$RC"
+tc 'T8c names the offending alias' "'HONK'" "$ERR"
+
+run cmd_plugin_add renamed@fixture --yes
+t  'T8d a name + alias installs' 0 "$RC"
+tc 'T8d says the name is live'  "'5dive chirp' now runs this plugin" "$ERR"
+tc 'T8d says the alias is live' "'5dive tweet' now runs this plugin" "$ERR"
+t  'T8e the name resolves'  'renamed@fixture' "$(_plugin_verb_claims chirp)"
+t  'T8e the alias resolves' 'renamed@fixture' "$(_plugin_verb_claims tweet)"
+
+run cmd_plugin_add aliasrival@fixture --yes
+t  'T8f an alias another plugin already holds is refused' "$E_VALIDATION" "$RC"
+tc 'T8f names the incumbent' 'renamed@fixture' "$ERR"
+
+rm -f "$SENTINEL"
+run _plugin_dispatch_verb tweet x
+t  'T8g dispatching the alias execs' 0 "$RC"
+tc 'T8g ...bin/<alias>, told the verb it was called by' 'RAN=tweet' "$(cat "$SENTINEL" 2>/dev/null)"
+tc 'T8g ...and its key'                                  'KEY=renamed@fixture' "$(cat "$SENTINEL" 2>/dev/null)"
+
+# `a2a` is no longer a builtin, so the a2a plugin's alias installs.
+run cmd_plugin_add peers@fixture --yes
+t  'T8h peer + alias a2a installs (a2a is free)' 0 "$RC"
+t  'T8h a2a resolves to the plugin' 'peers@fixture' "$(_plugin_verb_claims a2a)"
+t  'T8h peer still resolves'        'peers@fixture' "$(_plugin_verb_claims peer)"
+
+# The same, through the BUILT binary: main() must reach the plugin for `a2a`.
+if [[ -x "$ROOT/5dive" ]]; then
+  mkdir -p "$E2E/plugins/cache/fixture/peers/1.0.0/bin"
+  for v in peer a2a; do
+    cat > "$E2E/plugins/cache/fixture/peers/1.0.0/bin/$v" <<'E2EENTRY'
+#!/usr/bin/env bash
+printf 'E2E-RAN verb=%s key=%s argc=%s\n' "${FIVEDIVE_VERB:-?}" "${FIVEDIVE_PLUGIN_KEY:-?}" "$#"
+E2EENTRY
+    chmod +x "$E2E/plugins/cache/fixture/peers/1.0.0/bin/$v"
+  done
+  ln -sfn "$E2E/plugins/cache/fixture/peers/1.0.0" "$E2E/plugins/enabled/peers@fixture"
+  jq '.["peers@fixture"] = {plugin:"peers", marketplace:"fixture", version:"1.0.0",
+        enabled:true, review:"official", publisher:"t", capabilities:["verb"],
+        grants:[], verbs:[{name:"peer", aliases:["a2a"]}], installed_at:"x"}' \
+    "$E2E/plugins/installed.json" > "$TMP/x" && mv "$TMP/x" "$E2E/plugins/installed.json"
+  out=$( ( STATE_DIR="$E2E" "$ROOT/5dive" a2a send bob hi ) 2>&1 ); rc=$?
+  t  'T8i the built CLI dispatches `5dive a2a` to the plugin' 0 "$rc"
+  tc 'T8i ...as verb a2a'      'E2E-RAN verb=a2a key=peers@fixture argc=3' "$out"
+  out=$( ( STATE_DIR="$E2E" "$ROOT/5dive" peer send bob hi ) 2>&1 ); rc=$?
+  t  'T8j `5dive peer` still dispatches' 0 "$rc"
+  tc 'T8j ...as verb peer'     'E2E-RAN verb=peer key=peers@fixture argc=3' "$out"
+fi
+
+# ---- T9  upgrade and rollback carry the verbs (DIVE-5070) --------------------
+# Upgrade used to refresh capabilities and grants but leave `.verbs` as the FIRST
+# install declared them, so an alias a later version added never dispatched.
+vmanifest() {  # vmanifest <version> <verbs-json>
+  jq -cn --arg v "$1" --argjson verbs "$2" \
+     '{name:"grows", version:$v, description:"fixture", author:{name:"t"},
+       fivedive:{contract:"1", capabilities:["verb"], verbs:$verbs, grants:[],
+                 trust:{publisher:"t", did:"did:key:t", review:"official"}}}'
+}
+republish() { mkindex; gh_fixture_publish "$MKT" >/dev/null; run cmd_plugin_marketplace upgrade fixture; }
+mkplugin grows "$(vmanifest 1.0.0 "$(V grow)")"; mkentry grows grow
+republish
+run cmd_plugin_add grows@fixture --yes
+t  'T9a v1 installs' 0 "$RC"
+t  'T9a v1 claims grow'         'grows@fixture' "$(_plugin_verb_claims grow)"
+t  'T9a v1 has no sprout'       ''              "$(_plugin_verb_claims sprout)"
+
+mkplugin grows "$(vmanifest 2.0.0 "$(A grow sprout)")"; mkentry grows sprout
+republish
+run cmd_plugin_upgrade grows@fixture --yes
+t  'T9b upgrade to a version adding an alias' 0 "$RC"
+tc 'T9b says the new alias is live' "'5dive sprout' now runs this plugin" "$ERR"
+tn 'T9b does not re-announce the verb it already had' "'5dive grow' now runs" "$ERR"
+t  'T9b the alias is recorded and resolves' 'grows@fixture' "$(_plugin_verb_claims sprout)"
+t  'T9b the name still resolves'            'grows@fixture' "$(_plugin_verb_claims grow)"
+
+run cmd_plugin_rollback grows@fixture 1.0.0
+t  'T9c rollback' 0 "$RC"
+t  'T9c the verbs go back with the code: no sprout' '' "$(_plugin_verb_claims sprout)"
+t  'T9c ...and grow is still there' 'grows@fixture' "$(_plugin_verb_claims grow)"
+
+mkplugin grows "$(vmanifest 3.0.0 "$(A grow task)")"; mkentry grows task
+republish
+run cmd_plugin_upgrade grows@fixture --yes
+t  'T9d an upgrade adding an alias that names a builtin is refused' "$E_VALIDATION" "$RC"
+tc 'T9d names the builtin' "verb 'task'" "$ERR"
+t  'T9d ...and the installed version is untouched' '1.0.0' \
+   "$(jq -r '.["grows@fixture"].version' "$STATE_DIR/plugins/installed.json")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

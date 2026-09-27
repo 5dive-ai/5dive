@@ -216,7 +216,8 @@ _plugin_usage() {
   from you — a manifest naming a builtin, or a verb a second plugin already
   claims, is refused at install rather than installed dead. 5dive runs
   <plugin>/bin/<verb> and nothing else: the manifest names the verb, it never
-  supplies a command line.
+  supplies a command line. A verb entry's `aliases` are verbs too (same
+  refusals, own bin/<alias>); a CLI older than the field sees only the name.
 
   A plugin that declares `skill` or `mcp` is registered with EVERY existing
   agent on the box at `add` time, and with every agent created afterwards —
@@ -353,7 +354,7 @@ _plugin_validate_manifest() {
     # manifest claiming the `verb` capability while naming no verbs asks for a
     # surface and then declines to say what goes on it, and every later step
     # (collision check, entry-point check, dispatch) has nothing to read.
-    local vnames; vnames=$(jq -r '(.verbs // []) | map(.name? // empty) | join(" ")' <<<"$fd")
+    local vnames; vnames=$(jq -r '(.verbs // []) | map((.name? // empty), ((.aliases? // [])[]? | strings)) | join(" ")' <<<"$fd")
     if [[ " $caps " == *" verb "* ]]; then
       [[ -n "$vnames" ]] \
         || fail "$E_VALIDATION" "$name declares the 'verb' capability but names no verbs — add fivedive.verbs: [{\"name\": \"...\"}] (contract §2)"
@@ -1575,6 +1576,16 @@ cmd_plugin_upgrade() {
       && echo "  It was recorded as official on its own manifest's word; it is now recorded as $review." >&2
   fi
 
+  # DIVE-5070: the new version's verbs get the same refusals `add` gives them,
+  # before anything is copied. Upgrade used to leave `.verbs` at whatever the
+  # FIRST install declared, so a verb (or alias) a later version added was never
+  # recorded and never dispatched — the a2a plugin's `a2a` alias would not have
+  # reached a single box that already had it.
+  _plugin_verb_install_check "$srcdir" "$plugin" "$key" \
+    "$(jq -r '((.fivedive.capabilities // []) | join(" "))' <<<"$nj")" "$nj"
+  local _old_verbs; _old_verbs=$(jq -r --arg k "$key" \
+    '(.[$k].verbs // []) | map((.name? // empty), ((.aliases? // [])[]? | strings))[]' <<<"$j" 2>/dev/null) || _old_verbs=""
+
   local dest; dest="$(_plugin_cache_dir)/$mkt/$plugin/$new"
   if [[ ! -d "$dest" ]]; then
     mkdir -p "$(dirname "$dest")"
@@ -1588,8 +1599,17 @@ cmd_plugin_upgrade() {
   jq --arg k "$key" --arg v "$new" --arg t "$(date -u +%FT%TZ)" \
      --argjson caps "$(jq -c '(.fivedive.capabilities // [])' <<<"$nj")" \
      --argjson grants "$(jq -c '(.fivedive.grants // [])' <<<"$nj")" --arg r "$review" \
-     '.[$k].version = $v | .[$k].capabilities = $caps | .[$k].grants = $grants | .[$k].review = $r | .[$k].upgraded_at = $t' \
+     --argjson verbs "$(jq -c '(.fivedive.verbs // [])' <<<"$nj")" \
+     '.[$k].version = $v | .[$k].capabilities = $caps | .[$k].grants = $grants | .[$k].verbs = $verbs | .[$k].review = $r | .[$k].upgraded_at = $t' \
      <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
+  if [[ " $(jq -r '((.fivedive.capabilities // []) | join(" "))' <<<"$nj") " == *" verb "* ]]; then
+    local _v
+    while IFS= read -r _v; do
+      [[ -z "$_v" ]] && continue
+      grep -qFx -- "$_v" <<<"$_old_verbs" && continue
+      echo "  '5dive $_v' now runs this plugin ($PLUGIN_VERB_BINDIR/$_v)." >&2
+    done < <(_plugin_verbs_of_manifest "$nj")
+  fi
 
   # DIVE-4522: re-pin the seats at the new version. `5dive-refresh-plugins.sh`
   # re-pins nightly, but only plugins ALREADY in a seat's installed_plugins.json —
@@ -1706,8 +1726,18 @@ cmd_plugin_rollback() {
   if [[ "$(jq -r --arg k "$key" '.[$k].enabled' <<<"$j")" == "true" ]]; then
     ln -sfn "$base/$want" "$(_plugin_enabled_dir)/$key"
   fi
+  # DIVE-5070: the verbs go back with the code. Upgrade now records the new
+  # version's verbs, so a rollback that kept them would claim a verb whose
+  # bin/<verb> the older version never shipped. Read from the version's own
+  # manifest on disk; if that cannot be read, the record is left as it was.
+  local _rb_mf _rb_verbs=""
+  if _rb_mf=$(_plugin_manifest_path "$base/$want"); then
+    _rb_verbs=$(jq -c '(.fivedive.verbs // [])' "$_rb_mf" 2>/dev/null) || _rb_verbs=""
+  fi
   local tmp; tmp=$(mktemp)
-  jq --arg k "$key" --arg v "$want" '.[$k].version = $v' <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
+  jq --arg k "$key" --arg v "$want" --arg verbs "$_rb_verbs" \
+     '.[$k].version = $v | (if $verbs == "" then . else .[$k].verbs = ($verbs | fromjson) end)' \
+     <<<"$j" > "$tmp" && _plugin_publish_json "$tmp" "$(_plugin_installed_json)"
   ok "$key rolled back $cur -> $want" '{plugin:$k, from:$f, to:$t}' --arg k "$key" --arg f "$cur" --arg t "$want"
 }
 
@@ -1777,7 +1807,7 @@ readonly PLUGIN_VERB_BINDIR="bin"
 # re-extracts the case labels from src/main.sh and asserts set equality, so a new
 # builtin verb that forgets this line reds the suite rather than silently
 # becoming claimable by a plugin.
-readonly FIVEDIVE_BUILTIN_VERBS="a2a account acp activity agent _audit_append board bug buzz company config constitution cost crew deploy _deploy_do digest doctor down export fire fleet gate-proof gh _gh_do goal -h heartbeat --help help hire host human humans init liveness loop market memory _merge_do models objective objectives org owner-ask paperclip-seed plugin plugins project projects proof ps push _push_do reflex run runs secret selfcheck self-update self_update supervisor task _task_answer _task_channel team trace trigger triggers uninstall up update usage -v --version version wall watch whoami"
+readonly FIVEDIVE_BUILTIN_VERBS="account acp activity agent _audit_append board bug buzz company config constitution cost crew deploy _deploy_do digest doctor down export fire fleet gate-proof gh _gh_do goal -h heartbeat --help help hire host human humans init liveness loop market memory _merge_do models objective objectives org owner-ask paperclip-seed plugin plugins project projects proof ps push _push_do reflex run runs secret selfcheck self-update self_update supervisor task _task_answer _task_channel team trace trigger triggers uninstall up update usage -v --version version wall watch whoami"
 
 _plugin_verb_name_ok()   { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; }
 _plugin_verb_is_builtin(){ [[ " $FIVEDIVE_BUILTIN_VERBS " == *" $1 "* ]]; }
@@ -1800,7 +1830,7 @@ _plugin_verb_claims() {
     | select(.key != $skip)
     | select(.value.enabled == true)
     | select((.value.capabilities // []) | index("verb"))
-    | select((.value.verbs // []) | map(.name? // empty) | index($v))
+    | select((.value.verbs // []) | map((.name? // empty), ((.aliases? // [])[]? | strings)) | index($v))
     | .key' "$f" 2>/dev/null || true
 }
 
@@ -1814,9 +1844,20 @@ _plugin_verb_entry_in() {
   printf '%s\n' "$entry"
 }
 
-# _plugin_verbs_of_manifest <manifest-json> — one verb name per line.
+# _plugin_verbs_of_manifest <manifest-json> — one verb name per line, aliases
+# included.
+#
+# DIVE-5070 — `aliases`. A verb entry may carry `"aliases": ["other", ...]`, and
+# each alias is a verb in every respect that matters here: it is refused if it
+# names a builtin or another plugin's verb, it needs its own bin/<alias>, and it
+# dispatches exactly like the name. It exists for a RENAME. A CLI that predates
+# this field reads `.name` only, so the manifest keeps the old name there and
+# puts the new one in `aliases` — the plugin still installs on that CLI (under
+# the old name) and gains the new one the day the box's CLI learns the field.
+# The a2a plugin is the first user: `peer` is the name every existing box runs,
+# `a2a` was a builtin until this CLI freed it.
 _plugin_verbs_of_manifest() {
-  jq -r '(.fivedive.verbs // []) | map(.name? // empty)[]' <<<"$1" 2>/dev/null || true
+  jq -r '(.fivedive.verbs // []) | map((.name? // empty), ((.aliases? // [])[]? | strings))[]' <<<"$1" 2>/dev/null || true
 }
 
 # _plugin_verb_install_check <srcdir> <plugin> <key> <caps> <manifest-json>
