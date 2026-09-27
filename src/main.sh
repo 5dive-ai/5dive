@@ -374,9 +374,10 @@ Heartbeat (wake an agent only when it has queued tasks, one per tick):
   # full surface: 5dive heartbeat --help
 
 Agent-to-agent traffic (read-only, non-root; the ledger holds no message text):
-  5dive a2a rounds                                   # per-seat: who they talked to, on which rows
-  5dive a2a rounds --json                            # what the floor projects
-  5dive a2a rounds --agent=<seat> [--window=<hours>] # one seat; default 24h (= the ledger's retention)
+  5dive agent rounds                                 # per-seat: who they talked to, on which rows
+  5dive agent rounds --json                          # what the floor projects
+  5dive agent rounds --agent=<seat> [--window=<hours>] # one seat; default 24h (= the ledger's retention)
+  # (was '5dive a2a rounds' before DIVE-5070; 'a2a' now belongs to the a2a plugin: 5dive plugin add 5dive-ai/5dive-a2a)
   # an unreadable ledger reports UNKNOWN and exits 3 — it never renders as an idle fleet.
 
 Liveness (effect-derived — a seat is alive only against an artifact it WROTE, DIVE-3778):
@@ -590,6 +591,10 @@ _agent_verb_dispatch() {
         info)    cmd_info "$@" ;;
         types)   cmd_types "$@" ;;
         logs)    cmd_logs "$@" ;;
+        # DIVE-3903 read-only, non-root view over the a2a round ledger; moved here
+        # from `5dive a2a rounds` by DIVE-5070 so the a2a plugin can have the name.
+        # No audit wrapper: pure reporting, called at page-render frequency.
+        rounds)  cmd_a2a_rounds "$@"; exit $? ;;
         # DIVE-2797: the send rail is AUDITED. `task inbox send` had 78 rows in
         # agent-audit.log and `agent send` had zero, so an inter-agent message —
         # including an admin-tier one carrying a forgeable `--from=` — left no
@@ -1361,17 +1366,6 @@ main() {
       # — tick fires every few minutes and would flood the log; the wakes it
       # triggers are visible via each agent's own transcript.
       cmd_heartbeat "$@" ;;
-    a2a)
-      # DIVE-3903: read-only, non-root views over the a2a round ledger
-      # (/var/lib/5dive/a2a-rounds.tsv, 0660 root:claude). This is the verb the
-      # floor projects for per-seat "who has been talking to whom" — DIVE-3902
-      # established that 5dive-api cannot reach the file itself (/files is
-      # clamped to /home, /shell/exec only runs `5dive <verb>`), so the surface
-      # has to start here. No audit wrapper: pure reporting, no mutation, and it
-      # is called at page-render frequency. Never writes, prunes or re-modes the
-      # ledger — that half belongs to a2a_record_round (DIVE-3658).
-      cmd_a2a "$@"
-      exit $? ;;
     liveness)
       # DIVE-3778 v0.23 headline: effect-derived liveness. Read-only, no root, no
       # process table — a seat is alive only against a timestamped artifact it

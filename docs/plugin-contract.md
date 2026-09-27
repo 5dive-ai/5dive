@@ -68,6 +68,10 @@ Put the plugin in its own directory, not at the repository root. `.5dive-plugin/
   and nothing else. The manifest names the verb and never supplies a command line.
   A verb that is a builtin 5dive command, or one another installed plugin already
   claims, is refused at install. So is a verb with no executable `bin/<name>`.
+  A verb entry may also list `"aliases": ["other"]`: each alias is checked and
+  dispatched exactly like a name and needs its own `bin/<alias>`. Use it to rename a
+  verb. Keep the old name in `name`, because a 5dive CLI older than the field reads
+  only `name` and will still install the plugin under it.
 - **`fivedive.grants`** lists the host resources the plugin needs:
   `telegram-token`, `audio-io`, `agent-credentials`, `fs-home`, `network`,
   `browser-profiles`. These appear in plain English on the consent screen. If you

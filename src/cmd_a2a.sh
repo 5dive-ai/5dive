@@ -1,4 +1,10 @@
-# -------- 5dive a2a — read the agent-to-agent round ledger (DIVE-3903) --------
+# -------- 5dive agent rounds — read the agent-to-agent round ledger (DIVE-3903) --------
+#
+# DIVE-5070: this was `5dive a2a rounds` until the a2a plugin (5dive-ai/5dive-a2a)
+# needed the `a2a` name — people looking for "a2a" found this reader and not the
+# plugin that actually messages other boxes. Only the verb moved: same flags,
+# same JSON, same ledger. Nothing outside the CLI called the old name, so it
+# was not kept as an alias; `a2a` is now free for a plugin to claim.
 #
 # WHY THIS VERB EXISTS. DIVE-3902 asked for per-seat "a2a recaps" on the floor
 # and instructed: BIND THE SEND LOG, DO NOT INVENT IT. dev2 followed that and
@@ -101,13 +107,13 @@ _A2A_WINDOW_HOURS_MAX=87600
 
 _a2a_usage() {
   cat <<USAGE
-5dive a2a — read-only views over the agent-to-agent round ledger (DIVE-3903)
+5dive agent rounds — read-only view over the agent-to-agent round ledger (DIVE-3903)
 
-  5dive a2a rounds                          # who has been talking to whom, per seat
-  5dive a2a rounds --json                   # machine-readable; this is what the floor projects
-  5dive a2a rounds --window=<hours>         # default ${_A2A_WINDOW_HOURS_DEFAULT}h (= the ledger's own retention), max ${_A2A_WINDOW_HOURS_MAX}
-  5dive a2a rounds --agent=<seat>           # one seat's partners and topics
-  5dive a2a rounds --topic=<ident>          # one topic (a task ident, or 'pair' for identless chat)
+  5dive agent rounds                        # who has been talking to whom, per seat
+  5dive agent rounds --json                 # machine-readable; this is what the floor projects
+  5dive agent rounds --window=<hours>       # default ${_A2A_WINDOW_HOURS_DEFAULT}h (= the ledger's own retention), max ${_A2A_WINDOW_HOURS_MAX}
+  5dive agent rounds --agent=<seat>         # one seat's partners and topics
+  5dive agent rounds --topic=<ident>        # one topic (a task ident, or 'pair' for identless chat)
 
 Read-only and non-root: the ledger is 0660 root:claude and every agent seat is in
 group claude. Nothing here writes, prunes or re-modes the file.
@@ -128,15 +134,6 @@ the guard never looks at your window. 'guardWindowRounds' is that count.
 USAGE
 }
 
-cmd_a2a() {
-  local sub="${1:-}"
-  case "$sub" in
-    rounds)      shift; cmd_a2a_rounds "$@" ;;
-    ''|-h|--help) _a2a_usage; return 0 ;;
-    *) fail "$E_USAGE" "unknown subcommand 'a2a ${sub}'. See 5dive a2a --help." ;;
-  esac
-}
-
 cmd_a2a_rounds() {
   local window_hours="$_A2A_WINDOW_HOURS_DEFAULT" only="" topic_only=""
   local a
@@ -147,7 +144,7 @@ cmd_a2a_rounds() {
       --agent=*)   only="${a#--agent=}" ;;
       --topic=*)   topic_only="${a#--topic=}" ;;
       -h|--help)   _a2a_usage; return 0 ;;
-      *) fail "$E_USAGE" "unknown argument '$a'. See 5dive a2a --help." ;;
+      *) fail "$E_USAGE" "unknown argument '$a'. See 5dive agent rounds --help." ;;
     esac
   done
   # Bound the DIGIT COUNT first: `$(( ))` on a 20-digit literal already wraps, so

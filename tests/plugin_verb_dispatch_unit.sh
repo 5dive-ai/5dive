@@ -130,6 +130,17 @@ mkplugin sneaky  "$(manifest sneaky '["verb"]' "$(V sneak)")";      mkentry snea
   jq --arg c 'touch '"$TMP/MANIFEST-STRING-RAN" \
      '.fivedive.setup = {hint:"h", command:$c} | .fivedive.verbs[0].command = $c' \
      "$MKT/sneaky/.claude-plugin/plugin.json" > "$TMP/x" && mv "$TMP/x" "$MKT/sneaky/.claude-plugin/plugin.json"
+# DIVE-5070 — verb ALIASES. A rename keeps the old name in `name` (all a CLI that
+# predates the field reads) and the new one in `aliases`.
+A() { jq -cn --arg n "$1" --arg a "$2" '[{name:$n, summary:"fixture verb", aliases:[$a]}]'; }
+mkplugin renamed     "$(manifest renamed '["verb"]' "$(A chirp tweet)")";   mkentry renamed chirp; mkentry renamed tweet
+mkplugin aliasusurp  "$(manifest aliasusurp '["verb"]' "$(A peep task)")";  mkentry aliasusurp peep; mkentry aliasusurp task
+mkplugin aliashollow "$(manifest aliashollow '["verb"]' "$(A croak ribbit)")"; mkentry aliashollow croak
+mkplugin aliasrival  "$(manifest aliasrival '["verb"]' "$(A yodel tweet)")"; mkentry aliasrival yodel; mkentry aliasrival tweet
+mkplugin aliasshouty "$(manifest aliasshouty '["verb"]' "$(A honk HONK)")"; mkentry aliasshouty honk
+# the a2a plugin's own shape: `peer` for every box that has it, `a2a` once the
+# CLI stops owning that name
+mkplugin peers       "$(manifest peers '["verb"]' "$(A peer a2a)")";        mkentry peers peer; mkentry peers a2a
 mkindex
 
 gh_fixture_publish "$MKT"
@@ -352,6 +363,67 @@ else
   e2e sing >/dev/null; rc=$?
   t  'T7d a disabled plugin is not dispatched by the built CLI' 2 "$rc"
   tc 'T7d ...and reads as an unknown command' 'unknown command: sing' "$(cat "$TMP/.e2ee")"
+fi
+
+# ---- T8  verb aliases (DIVE-5070) ------------------------------------------
+# An alias is a verb in every respect the install check and the dispatcher care
+# about: same refusals, its own bin/<alias>, and it dispatches as itself.
+run cmd_plugin_add aliasusurp@fixture --yes
+t  'T8a an alias naming a builtin is refused' "$E_VALIDATION" "$RC"
+tc 'T8a names the builtin' "verb 'task'" "$ERR"
+
+run cmd_plugin_add aliashollow@fixture --yes
+t  'T8b an alias with no executable is refused' "$E_VALIDATION" "$RC"
+tc 'T8b names the missing bin/<alias>' 'bin/ribbit' "$ERR"
+
+run cmd_plugin_add aliasshouty@fixture --yes
+t  'T8c a non-kebab alias is refused' "$E_VALIDATION" "$RC"
+tc 'T8c names the offending alias' "'HONK'" "$ERR"
+
+run cmd_plugin_add renamed@fixture --yes
+t  'T8d a name + alias installs' 0 "$RC"
+tc 'T8d says the name is live'  "'5dive chirp' now runs this plugin" "$ERR"
+tc 'T8d says the alias is live' "'5dive tweet' now runs this plugin" "$ERR"
+t  'T8e the name resolves'  'renamed@fixture' "$(_plugin_verb_claims chirp)"
+t  'T8e the alias resolves' 'renamed@fixture' "$(_plugin_verb_claims tweet)"
+
+run cmd_plugin_add aliasrival@fixture --yes
+t  'T8f an alias another plugin already holds is refused' "$E_VALIDATION" "$RC"
+tc 'T8f names the incumbent' 'renamed@fixture' "$ERR"
+
+rm -f "$SENTINEL"
+run _plugin_dispatch_verb tweet x
+t  'T8g dispatching the alias execs' 0 "$RC"
+tc 'T8g ...bin/<alias>, told the verb it was called by' 'RAN=tweet' "$(cat "$SENTINEL" 2>/dev/null)"
+tc 'T8g ...and its key'                                  'KEY=renamed@fixture' "$(cat "$SENTINEL" 2>/dev/null)"
+
+# `a2a` is no longer a builtin, so the a2a plugin's alias installs.
+run cmd_plugin_add peers@fixture --yes
+t  'T8h peer + alias a2a installs (a2a is free)' 0 "$RC"
+t  'T8h a2a resolves to the plugin' 'peers@fixture' "$(_plugin_verb_claims a2a)"
+t  'T8h peer still resolves'        'peers@fixture' "$(_plugin_verb_claims peer)"
+
+# The same, through the BUILT binary: main() must reach the plugin for `a2a`.
+if [[ -x "$ROOT/5dive" ]]; then
+  mkdir -p "$E2E/plugins/cache/fixture/peers/1.0.0/bin"
+  for v in peer a2a; do
+    cat > "$E2E/plugins/cache/fixture/peers/1.0.0/bin/$v" <<'E2EENTRY'
+#!/usr/bin/env bash
+printf 'E2E-RAN verb=%s key=%s argc=%s\n' "${FIVEDIVE_VERB:-?}" "${FIVEDIVE_PLUGIN_KEY:-?}" "$#"
+E2EENTRY
+    chmod +x "$E2E/plugins/cache/fixture/peers/1.0.0/bin/$v"
+  done
+  ln -sfn "$E2E/plugins/cache/fixture/peers/1.0.0" "$E2E/plugins/enabled/peers@fixture"
+  jq '.["peers@fixture"] = {plugin:"peers", marketplace:"fixture", version:"1.0.0",
+        enabled:true, review:"official", publisher:"t", capabilities:["verb"],
+        grants:[], verbs:[{name:"peer", aliases:["a2a"]}], installed_at:"x"}' \
+    "$E2E/plugins/installed.json" > "$TMP/x" && mv "$TMP/x" "$E2E/plugins/installed.json"
+  out=$( ( STATE_DIR="$E2E" "$ROOT/5dive" a2a send bob hi ) 2>&1 ); rc=$?
+  t  'T8i the built CLI dispatches `5dive a2a` to the plugin' 0 "$rc"
+  tc 'T8i ...as verb a2a'      'E2E-RAN verb=a2a key=peers@fixture argc=3' "$out"
+  out=$( ( STATE_DIR="$E2E" "$ROOT/5dive" peer send bob hi ) 2>&1 ); rc=$?
+  t  'T8j `5dive peer` still dispatches' 0 "$rc"
+  tc 'T8j ...as verb peer'     'E2E-RAN verb=peer key=peers@fixture argc=3' "$out"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
