@@ -13,6 +13,9 @@
 #            malformed stdin). The file holds it, mode 600.
 #   BAD.     bad values are refused and nothing is written.
 #   STATUS.  `reflex status --json` shape, decisions in the last 24h, last replay.
+#   DIRMODE. (DIVE-5059) writing the key never re-modes an existing parent (a 755
+#            /etc/5dive stays 755); a missing one is created 755; the file is 600.
+#            Its mutant — the pre-fix unguarded `install -d -m 750` — reds it.
 #   MUTANT.  a config that prints the key in --json reds NOLEAK.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -142,6 +145,31 @@ check "an unreadable store is decisions_24h null, not an error" "$(grep -q '"dec
 printf '%s\n' "x" | cfg reflex-key=clear >/dev/null
 check "reflex-key=clear removes the file and reads back unset" \
   "$([[ ! -e "$FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE" && "$(get reflex_key)" == unset ]]; echo $?)"
+
+echo "── DIRMODE (DIVE-5059) ─────────────────────────────────────────────────"
+# The key's parent is /etc/5dive on a box: 755 from the provisioner, and shelld
+# (claude) must traverse it to read connectord.env. Writing the key must leave an
+# existing parent's mode alone — `install -d -m 750` re-moded it and broke token
+# rotation on chill-gorge. A missing parent is created 755; the file is 600.
+DM="$TMP/dirmode"; mkdir -p "$DM/etc"; chmod 755 "$DM/etc"
+dm_set() { printf '%s\n' "$SECRET" | FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE="$DM/$1/reflex-openrouter.key" cfg reflex-key=- >/dev/null; }
+dm_set etc
+check "an existing 755 parent stays 755 after reflex-key=-" "$([[ "$(stat -c %a "$DM/etc")" == 755 ]]; echo $?)" "got $(stat -c %a "$DM/etc")"
+check "the key file under it is 600" "$([[ "$(stat -c %a "$DM/etc/reflex-openrouter.key")" == 600 ]]; echo $?)"
+dm_set fresh
+check "a missing parent is created 755" "$([[ "$(stat -c %a "$DM/fresh")" == 755 ]]; echo $?)" "got $(stat -c %a "$DM/fresh" 2>&1)"
+check "the key file in a fresh parent is 600" "$([[ "$(stat -c %a "$DM/fresh/reflex-openrouter.key")" == 600 ]]; echo $?)"
+# Mutant: the pre-fix line (re-mode unconditionally). The 755 arm must go red.
+DMM=$(mktemp "$TMP/dmmut.XXXXXX.sh")
+sed 's/\[\[ -d "\$d" \]\] || install -d -m 755 "\$d"/install -d -m 750 "$d"/' src/cmd_box_config.sh >"$DMM"
+if cmp -s "$DMM" src/cmd_box_config.sh; then
+  bad_t "DIRMODE MUTANT: the anchor for the re-mode mutant moved" "update the sed in this harness"
+else
+  mkdir -p "$DM/mut"; chmod 755 "$DM/mut"
+  ( source "$DMM"; printf '%s\n' "$SECRET" | FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE="$DM/mut/reflex-openrouter.key" JSON_MODE=1 cmd_box_config reflex-key=- ) >/dev/null 2>&1
+  if [[ "$(stat -c %a "$DM/mut")" != 755 ]]; then ok_t "DIRMODE MUTANT: the unguarded install re-modes the parent ($(stat -c %a "$DM/mut")) and the arm catches it"
+  else bad_t "DIRMODE MUTANT: the unguarded install left the parent 755 — the arm is not proven"; fi
+fi
 
 echo "── MUTANT ──────────────────────────────────────────────────────────────"
 # The row's own mutant: a config that prints the key in --json. The NOLEAK

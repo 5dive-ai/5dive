@@ -374,7 +374,11 @@ _reflex_key_write() {
     rm -f "$f" || fail "$E_GENERIC" "could not remove the reflex key file"
     return 0
   fi
-  install -d -m 750 "$d" 2>/dev/null || mkdir -p "$d"
+  # DIVE-5059: never re-mode a directory that exists. The default parent is
+  # /etc/5dive, which the provisioner leaves 755 so shelld (claude) can reach
+  # connectord.env; GNU `install -d -m` re-modes an existing directory, and a 750
+  # here broke every dashboard token rotation. The key file's 600 is the guard.
+  [[ -d "$d" ]] || install -d -m 755 "$d" 2>/dev/null || mkdir -p "$d"
   tmp=$(umask 077; mktemp "${f}.XXXXXX") || fail "$E_GENERIC" "could not stage the reflex key file"
   printf '%s\n' "$val" > "$tmp"
   chmod 600 "$tmp"
