@@ -4078,7 +4078,14 @@ _gate_cgroup_human_capable() {
   # ACCEPT 2 — A REAL LOGIN SESSION, structural rather than named: a person who
   # logs in and sudo's lands in /user.slice/user-<uid>.slice/session-<n>.scope.
   # No unit name to forget, and no system service can manufacture one.
-  [[ "$cg" == /user.slice/*/session-*.scope ]] && return 0
+  #
+  # DIVE-5079: ANCHORED, one path segment per level. The old glob
+  # `/user.slice/*/session-*.scope` let `*` cross `/`, so a scope the user's OWN
+  # systemd manager made passed: `systemd-run --user --scope --unit=session-x`,
+  # no privilege, lands at …/user@<uid>.service/app.slice/session-x.scope. For a
+  # process running as claude the uid half admits it, so this line was the only
+  # guard. Only logind (root) creates a scope DIRECTLY under user-<uid>.slice.
+  [[ "$cg" =~ ^/user\.slice/user-[0-9]+\.slice/session-[^/]+\.scope$ ]] && return 0
 
   # Everything else refused: agent units, the primary claude runtime, an
   # unreadable cgroup, a non-systemd host. An unresolved principal is not a

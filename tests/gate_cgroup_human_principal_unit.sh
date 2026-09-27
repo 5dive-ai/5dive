@@ -180,6 +180,67 @@ fi
   && ok_t "E7 a colon in the unit path is preserved" \
   || bad_t "E7 colon in path" "got '$(pick '0::/system.slice/weird:name.service')'"
 
+# --- F. DIVE-5079 — a session scope the USER made is not a login session ----
+# `systemd-run --user --scope --unit=session-x` needs no privilege and lands under
+# the user's own manager (measured as claude, 2026-09-27). Only logind, as root,
+# puts a scope directly under user-<uid>.slice.
+# The manager unit is `user<AT><uid>.service`; spelled through $AT so the fixture
+# guard does not read the segment as an email address.
+AT='@'
+_FORGED="/user.slice/user-1000.slice/user${AT}1000.service/app.slice/session-dive5073probe.scope"
+if try "$_FORGED"; then
+  bad_t "F1 THE FORGE: a user-manager session-x.scope was ACCEPTED" "any process running as claude can make this path with systemd-run --user"
+else
+  ok_t "F1 a session-*.scope under the user's own manager is REFUSED — only logind's direct child passes"
+fi
+
+# F2 the same forge by the v1/hybrid route: the reader picks the systemd line,
+# and the accept list must still refuse it.
+_CG="$(pick $'12:pids:/\n1:name=systemd:'"$_FORGED")"
+if [[ "$_CG" == "$_FORGED" ]] && ! _gate_cgroup_human_capable; then
+  ok_t "F2 the v1/hybrid forge is REFUSED end-to-end (reader -> accept list)"
+else
+  bad_t "F2 v1/hybrid forge refused" "picked '$_CG'; expected the forged path to be picked and refused"
+fi
+
+# F3 near-misses on each anchored segment.
+for p in \
+  '/user.slice/user-1000.slice/session-3.scope/child' \
+  '/user.slice/user-x.slice/session-3.scope' \
+  '/user.slice/user-.slice/session-3.scope' \
+  '/user.slice/user-1000.slice/session-.scope' \
+  '/nested/user.slice/user-1000.slice/session-3.scope' \
+  '/user.slice/user-1000.slice/app.slice/session-3.scope'; do
+  if try "$p"; then
+    bad_t "F3 near-miss ACCEPTED: $p" "every segment of the login-session path is anchored"
+  else
+    ok_t "F3 near-miss refused: $p"
+  fi
+done
+
+# F4 MUTATION: the shipped function with ONLY its accept-2 line swapped back to
+# the pre-DIVE-5079 glob ACCEPTS the forged path, so F1 grades the anchor and not
+# a fixture nothing could have passed.
+MUT=$(declare -f _gate_cgroup_human_capable \
+  | sed -e 's/^_gate_cgroup_human_capable ()/_gate_cgroup_human_capable_PRE5079 ()/' \
+        -e 's#\[\[ "\$cg" =~ .*session-.*\]\]#[[ "$cg" == /user.slice/*/session-*.scope ]]#')
+if grep -qF '/user.slice/*/session-*.scope' <<<"$MUT" && grep -q '_PRE5079 ()' <<<"$MUT"; then
+  eval "$MUT"
+  if _CG="$_FORGED"; _gate_cgroup_human_capable_PRE5079; then
+    ok_t "F4 MUTATION: the old glob ACCEPTS the forged path — F1 grades the fix"
+  else
+    bad_t "F4 MUTATION" "the reverted glob refused the forge too; F1 may pass for an unrelated reason"
+  fi
+  # and the real login session is accepted by BOTH forms, so the fix narrowed only the forge
+  if _CG='/user.slice/user-1000.slice/session-3.scope'; _gate_cgroup_human_capable_PRE5079; then
+    ok_t "F5 the real login session passed before the fix too — only the forge was removed"
+  else
+    bad_t "F5 pre-fix login session" "the mutated function refused a real session; the mutation is broken"
+  fi
+else
+  bad_t "F4 MUTATION" "could not swap the accept-2 line back to the glob — the shipped line changed shape"
+fi
+
 printf '\nDIVE-2371 cgroup human-principal guard: passed: %s  failed: %s\n' "$PASS" "$FAIL"
 [[ $PASS -gt 0 ]] || { printf 'FAIL - nothing was graded\n'; exit 1; }
 [[ $FAIL -eq 0 ]] || exit 1
