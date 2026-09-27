@@ -49,9 +49,9 @@
 # class/id/data-testid/role values made of letters, `-` and `_` only: no digits,
 # no free text, nothing an account name or id is likely to be.
 #
-# THE KEY. The built-in backend reads the root-only reflex key
-# (/etc/5dive/reflex-openrouter.key), so a real run is `sudo 5dive reflex
-# login-marker ...`. --backend=fake:first picks the heuristic's top candidate and
+# THE KEY. The built-in backend reads the box's OpenRouter key (DIVE-5043: the
+# root-only /etc/5dive/reflex-openrouter.key when present, else the connector
+# store's, root:claude), so a real run is `sudo 5dive reflex login-marker ...`. --backend=fake:first picks the heuristic's top candidate and
 # needs no key: it is the "today's code" baseline the model is compared against.
 
 # The browser's own default challenge marker (bin/browser _site_challenge_marker),
@@ -264,8 +264,8 @@ _reflex_login_marker() {
     reflex_model_resolve; model="$_REFLEX_MODEL"
     # DIVE-4932: a custom endpoint needs no key (its own bearer is optional).
     reflex_endpoint_resolve
-    (( _REFLEX_CUSTOM )) || [[ -r "$(_reflex_key_file)" ]] \
-      || fail "$E_PERMISSION" "the reflex key ($(_reflex_key_file)) is not readable by $(id -un). Run it as root (sudo 5dive reflex login-marker ...), or pass --backend=fake:first for the heuristic alone."
+    (( _REFLEX_CUSTOM )) || reflex_key_readable \
+      || fail "$E_PERMISSION" "$(reflex_key_unreadable_msg login-marker), or pass --backend=fake:first for the heuristic alone."
   fi
   local inm=false; if [[ -n "$fi_" ]]; then inm=true; fi
 

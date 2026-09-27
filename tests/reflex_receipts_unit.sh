@@ -48,6 +48,9 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+# DIVE-5043: reflex falls back to the connector store's OpenRouter key; an empty
+# scratch store keeps the box this runs on from lending its own.
+export CONNECTORS_DIR="$TMP/connectors"
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" 2>/dev/null || true
 
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"

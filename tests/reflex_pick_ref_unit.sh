@@ -40,6 +40,9 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+# DIVE-5043: reflex falls back to the connector store's OpenRouter key; an empty
+# scratch store keeps the box this runs on from lending its own.
+export CONNECTORS_DIR="$TMP/connectors"
 set +e
 JSON_MODE=0
 audit_log() { return 0; }

@@ -71,9 +71,11 @@ cmd_box_config() {
         "             ${REFLEX_MODEL_DEFAULT:-typesafe/jev-1.13}); a replay's own --model wins." \
         "             On OpenRouter it is provider/model; on a custom endpoint, any id" \
         "             that server knows (a local Laya: typed-decisions)." \
-        "  reflex-key       the OpenRouter key for replays, written root-only 600 to" \
-        "             $(declare -F _reflex_key_file >/dev/null && _reflex_key_file || printf /etc/5dive/reflex-openrouter.key)." \
-        "             Write-only: nothing ever prints it; 'config' shows set or unset." \
+        "  reflex-key       optional: a separate OpenRouter key for reflex only, written" \
+        "             root-only 600 to $(declare -F _reflex_key_file >/dev/null && _reflex_key_file || printf /etc/5dive/reflex-openrouter.key)." \
+        "             When present it wins over openrouter-key for reflex; without it" \
+        "             reflex uses openrouter-key. Write-only; 'config' shows set or unset" \
+        "             and which of the two reflex is using (reflex-key-source)." \
         "  reflex-endpoint  where decisions are sent: a full http(s) URL, e.g." \
         "             http://127.0.0.1:8000/v1/systemone for a local Laya. default is" \
         "             OpenRouter. No credentials or query string in the URL. The" \
@@ -83,8 +85,8 @@ cmd_box_config() {
         "             default reads it off the endpoint's path, else decisions." \
         "  reflex-endpoint-key  an optional bearer for the custom endpoint, from stdin," \
         "             root-only 600 at $(declare -F _reflex_endpoint_key_file >/dev/null && _reflex_endpoint_key_file || printf /etc/5dive/reflex-endpoint.key)." \
-        "  openrouter-key  the OpenRouter key voice (and any plugin reading the" \
-        "             connector store) uses, written 640 root:claude to" \
+        "  openrouter-key  the box's OpenRouter key, used by reflex and voice," \
+        "             written 640 root:claude to" \
         "             ${CONNECTORS_DIR:-/etc/5dive/connectors}/openrouter.env as OPENROUTER_API_KEY." \
         "             Read from a pipe only: a terminal on stdin is refused." \
         "             Write-only: 'config' shows set or unset, never the key." \
@@ -122,11 +124,13 @@ cmd_box_config() {
     # DIVE-4915: reflex's settings, each with its source. The key is reported as
     # set/unset only — this path never opens the key file.
     local rr="on" rrs="reflex is not in this build" rm="" rms="" rk="unknown"
-    local re="default" res="" ra="decisions" ras="" rek="unknown" rc="unknown"
+    local re="default" res="" ra="decisions" ras="" rek="unknown" rc="unknown" rks="unknown"
     if declare -F reflex_receipts_resolve >/dev/null 2>&1; then
       reflex_receipts_resolve; reflex_model_resolve
       rr="$_REFLEX_RECEIPTS"; rrs="$_REFLEX_RECEIPTS_SRC"; rm="$_REFLEX_MODEL"; rms="$_REFLEX_MODEL_SRC"
-      rk=$(reflex_key_status)
+      # DIVE-5043: reflex-key is "does reflex have a key"; the source says whether
+      # it is the root-only override (file) or the box's openrouter-key (connector).
+      rk=$(reflex_key_status); rks=$(reflex_key_source)
       # DIVE-4932: the endpoint, its wire format, its own key, and whether the
       # box can make a call at all.
       rc=$(reflex_configured); reflex_endpoint_resolve
@@ -148,6 +152,7 @@ pace-5h = ${p5} (${p5s})
 reflex-receipts = ${rr} (${rrs})
 reflex-model = ${rm} (${rms})
 reflex-key = ${rk}
+reflex-key-source = ${rks} ($(_reflex_key_source_text "$rks"))
 reflex-endpoint = ${re} (${res})
 reflex-api = ${ra} (${ras})
 reflex-endpoint-key = ${rek}
@@ -155,14 +160,14 @@ reflex-configured = ${rc}
 openrouter-key = ${ok_k}
 mod-seat = ${ms} (box-wide, default off)" \
        '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s,
-         reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk,
+         reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk, reflex_key_source:$rks,
          reflex_endpoint:$re, reflex_endpoint_source:$res, reflex_api:$ra, reflex_api_source:$ras, reflex_endpoint_key:$rek,
          reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, mod_seat:$ms, path:$p}' \
        --arg ms "$ms" --arg ok "$ok_k" \
        --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" \
        --arg pw "$pw" --arg pws "$pws" --arg p5 "$p5" --arg p5s "$p5s" \
        --arg rr "$rr" --arg rrs "$rrs" --arg rm "$rm" --arg rms "$rms" --arg re "$re" --arg res "$res" \
-       --arg ra "$ra" --arg ras "$ras" --arg rek "$rek" --arg rc "$rc" --arg rk "$rk" --arg p "$(_box_config_path)"
+       --arg ra "$ra" --arg ras "$ras" --arg rek "$rek" --arg rks "$rks" --arg rc "$rc" --arg rk "$rk" --arg p "$(_box_config_path)"
     return 0
   fi
 
@@ -312,18 +317,28 @@ mod-seat = ${ms} (box-wide, default off)" \
   local small; small=$(box_verify_small)
   local pw="" p5=""
   if declare -F _pace_floors_load >/dev/null 2>&1; then pw=$(_pace_week_effective); p5=$(_pace_5h_effective); fi
-  local rr="" rm="" rk="" re="" ra="" rc=""
+  local rr="" rm="" rk="" rks="" re="" ra="" rc=""
   if declare -F reflex_receipts_resolve >/dev/null 2>&1; then
-    reflex_receipts_resolve; reflex_model_resolve; rr="$_REFLEX_RECEIPTS"; rm="$_REFLEX_MODEL"; rk=$(reflex_key_status)
+    reflex_receipts_resolve; reflex_model_resolve; rr="$_REFLEX_RECEIPTS"; rm="$_REFLEX_MODEL"; rk=$(reflex_key_status); rks=$(reflex_key_source)
     rc=$(reflex_configured); reflex_endpoint_resolve; re="$_REFLEX_ENDPOINT"; ra="$_REFLEX_API"
   fi
   ok "box config updated (${applied[*]}) — verify = ${policy}, verify-small = ${small}${pw:+, pace-week = ${pw}, pace-5h = ${p5}}${rr:+, reflex-receipts = ${rr}, reflex-model = ${rm}, reflex-key = ${rk}, reflex-endpoint = ${re}, reflex-api = ${ra}, reflex-configured = ${rc}}, openrouter-key = ${okst}" \
-     '{verify:$v, verify_small:$sm, pace_week:$pw, pace_5h:$p5, reflex_receipts:$rr, reflex_model:$rm, reflex_key:$rk,
+     '{verify:$v, verify_small:$sm, pace_week:$pw, pace_5h:$p5, reflex_receipts:$rr, reflex_model:$rm, reflex_key:$rk, reflex_key_source:$rks,
        reflex_endpoint:$re, reflex_api:$ra, reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end),
        openrouter_key:$ok, applied:($a|split(",")), path:$p}' \
-     --arg ok "$okst" --arg v "$policy" --arg sm "$small" --arg pw "$pw" --arg p5 "$p5" --arg rr "$rr" --arg rm "$rm" --arg rk "$rk" \
+     --arg ok "$okst" --arg v "$policy" --arg sm "$small" --arg pw "$pw" --arg p5 "$p5" --arg rr "$rr" --arg rm "$rm" --arg rk "$rk" --arg rks "$rks" \
      --arg re "$re" --arg ra "$ra" --arg rc "$rc" \
      --arg a "$(IFS=,; printf '%s' "${applied[*]}")" --arg p "$cfg"
+}
+
+# DIVE-5043: the reflex-key-source line in plain words.
+_reflex_key_source_text() {
+  case "$1" in
+    file)      printf 'the root-only reflex key; it wins over openrouter-key' ;;
+    connector) printf "the box's openrouter-key, shared with voice" ;;
+    none)      printf 'no key: set one with openrouter-key=-' ;;
+    *)         printf 'cannot see the key files; try sudo' ;;
+  esac
 }
 
 # DIVE-4915: write or remove the reflex OpenRouter key. Root-only 600 in a file

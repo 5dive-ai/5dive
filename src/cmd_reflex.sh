@@ -218,6 +218,7 @@ _reflex_status() {
   command -v jq >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "jq is required"
   reflex_receipts_resolve; reflex_model_resolve
   local key; key=$(reflex_key_status)
+  local ksrc; ksrc=$(reflex_key_source)
   # DIVE-4932: which endpoint, which wire format, and can this box call it at
   # all. `configured` is what a "set up reflex" prompt reads: a keyless local
   # endpoint is configured, and `key` alone would call it unset.
@@ -237,10 +238,10 @@ _reflex_status() {
   [[ -n "$last" ]] || last="null"
   local body
   body=$(jq -nc --arg r "$_REFLEX_RECEIPTS" --arg rs "$_REFLEX_RECEIPTS_SRC" --arg m "$_REFLEX_MODEL" \
-    --arg ms "$_REFLEX_MODEL_SRC" --arg k "$key" --argjson n "$n" --argjson last "$last" \
+    --arg ms "$_REFLEX_MODEL_SRC" --arg k "$key" --arg ks "$ksrc" --argjson n "$n" --argjson last "$last" \
     --arg e "$_REFLEX_ENDPOINT" --arg es "$_REFLEX_ENDPOINT_SRC" --arg api "$_REFLEX_API" --arg apis "$_REFLEX_API_SRC" \
     --argjson custom "$_REFLEX_CUSTOM" --arg ek "$ekey" --arg c "$configured" --argjson h "$health" \
-    '{receipts:$r, receipts_source:$rs, model:$m, model_source:$ms, key:$k,
+    '{receipts:$r, receipts_source:$rs, model:$m, model_source:$ms, key:$k, key_source:$ks,
       endpoint:$e, endpoint_source:$es, provider:(if $custom == 1 then "custom" else "openrouter" end),
       api:$api, api_source:$apis, endpoint_key:$ek,
       configured:(if $c == "true" then true elif $c == "false" then false else null end),
@@ -250,7 +251,7 @@ _reflex_status() {
     "decisions 24h \(.decisions_24h // "unknown (task store not readable)")",
     "endpoint      \(.endpoint) (\(.endpoint_source)) · api \(.api) (\(.api_source))",
     "model         \(.model) (\(.model_source))",
-    "key           \(if .provider == "custom" then "endpoint key \(.endpoint_key) (optional; the OpenRouter key is not sent here)" else .key end)",
+    "key           \(if .provider == "custom" then "endpoint key \(.endpoint_key) (optional; the OpenRouter key is not sent here)" else "\(.key)\(if .key_source == "file" then " (root-only reflex key)" elif .key_source == "connector" then " (the box openrouter-key, shared with voice)" else "" end)" end)",
     "configured    \(if .configured == null then "unknown (cannot see the key file; try sudo)" else .configured end)",
     (if .health then "health        \(if .health.ok then "ok" else "DOWN" end) · \(.health.url) · http \(.health.http // 0) · \(.health.ms // 0)ms" else empty end),
     "last replay   \(if .last_replay then "\(.last_replay.at) · \(.last_replay.decisions) decisions · \(.last_replay.backend)" else "none" end)"' <<<"$body"
