@@ -40,6 +40,9 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/state.
   # shellcheck source=/dev/null
   source "src/$f"
 done
+# DIVE-5043: reflex falls back to the connector store's OpenRouter key; an empty
+# scratch store keeps the box this runs on from lending its own.
+export CONNECTORS_DIR="$TMP/connectors"
 STATE_DIR="$TMP/state"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 export BOX_CONFIG="$TMP/box.json"
 export FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE="$TMP/etc/reflex-openrouter.key"

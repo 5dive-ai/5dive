@@ -31,9 +31,12 @@
 # mostly echoes it, and the replay already scores the incumbent on its own.
 #
 # THE KEY is read from a file, never from argv or the environment, and reaches
-# curl through a mode-600 header file, so it is not in `ps`. Default path
-# /etc/5dive/reflex-openrouter.key (root-only; run the replay under sudo), or
-# FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE. FIVEDIVE_REFLEX_OPENROUTER_URL overrides the
+# curl through a mode-600 header file, so it is not in `ps`. One OpenRouter key
+# per box (DIVE-5043), in the same order as the CLI's _reflex_openrouter_key:
+# /etc/5dive/reflex-openrouter.key (or FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE), the
+# root-only override, when it is non-empty; else OPENROUTER_API_KEY in
+# $CONNECTORS_DIR/openrouter.env (default /etc/5dive/connectors), the key
+# `5dive config openrouter-key=-` writes and voice reads. Run the replay under sudo. FIVEDIVE_REFLEX_OPENROUTER_URL overrides the
 # base URL (default https://openrouter.ai/api).
 #
 # ANY ENDPOINT (DIVE-4932). The name is historical: OpenRouter is only the
@@ -124,16 +127,26 @@ if [[ -n "$endpoint" ]]; then
   [[ -r "$key_file" ]] && key=$(tr -d ' \r\n' <"$key_file")
 else
   key_file="${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5dive/reflex-openrouter.key}"
-  [[ -r "$key_file" ]] && key=$(tr -d ' \r\n' <"$key_file")
+  if [[ -s "$key_file" ]]; then
+    [[ -r "$key_file" ]] && key=$(tr -d ' \r\n' <"$key_file")
+  else
+    key_file="${CONNECTORS_DIR:-${FIVEDIVE_CONNECTOR_DIR:-/etc/5dive/connectors}}/openrouter.env"
+    [[ -r "$key_file" ]] && key=$(grep -E '^(OPENROUTER_API_KEY|OPENROUTER_KEY)=.' "$key_file" | head -n 1 \
+      | sed -E 's/^[A-Z_]+=//; s/^["'"'"'](.*)["'"'"']$/\1/' | tr -d ' \r\n')
+  fi
 fi
 if [[ -z "$key" && -z "$endpoint" ]]; then
-  echo "reflex-openrouter-backend: no key readable at $key_file" >&2
+  if [[ -e "$key_file" && ! -r "$key_file" ]]; then e="no OpenRouter key readable at $key_file (run the replay under sudo)"
+  else e="this box has no OpenRouter key: set one with 5dive config openrouter-key=- (the key reflex and voice share)"; fi
+  echo "reflex-openrouter-backend: $e" >&2
   for ((i = 0; i < n; i++)); do
-    jq -cn --arg e "no OpenRouter key readable at $key_file" '{choice:null, error:$e}'
+    jq -cn --arg e "$e" '{choice:null, error:$e}'
   done
   exit 0
 fi
-if [[ -n "$(find "$key_file" -maxdepth 0 -perm /044 2>/dev/null)" ]]; then
+# The connector store is 640 root:claude by design; only the root-only override
+# is held to 600.
+if [[ "$key_file" != */openrouter.env && -n "$(find "$key_file" -maxdepth 0 -perm /044 2>/dev/null)" ]]; then
   echo "reflex-openrouter-backend: warning: $key_file is readable by group/other; chmod 600 it" >&2
 fi
 : >"$RX_DIR/auth"

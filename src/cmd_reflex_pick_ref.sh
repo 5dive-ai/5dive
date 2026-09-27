@@ -86,8 +86,8 @@ _reflex_pick_ref() {
   local model=""
   if [[ "$backend" == builtin ]]; then
     reflex_model_resolve; model="$_REFLEX_MODEL"
-    [[ -r "$(_reflex_key_file)" ]] \
-      || fail "$E_PERMISSION" "the reflex key ($(_reflex_key_file)) is not readable by $(id -un). Run it as root (sudo 5dive reflex pick-ref ...), or pass --backend=fake:first."
+    reflex_key_readable \
+      || fail "$E_PERMISSION" "$(reflex_key_unreadable_msg pick-ref), or pass --backend=fake:first."
   fi
 
   # The legal set: document order, the op's roles, a usable name, deduped by ref.

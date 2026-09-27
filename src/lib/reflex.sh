@@ -60,7 +60,8 @@ REFLEX_RECEIPT_SCHEMA=1
 #             box.json .reflex_receipts (on|off), then on.
 #   model     box.json .reflex_model, then REFLEX_MODEL_DEFAULT. The reference
 #             backend's --model flag still wins for a single replay.
-#   key       set / unset / unknown — the key FILE's presence, never its bytes.
+#   key       set / unset / unknown — a key's presence, never its bytes; which of
+#             the two sources it is: reflex_key_source (DIVE-5043).
 REFLEX_MODEL_DEFAULT="typesafe/jev-1.13"
 REFLEX_MODEL_RE='^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$'
 
@@ -107,8 +108,72 @@ reflex_model_resolve() {
   fi
 }
 
-# set | unset | unknown. Presence only: this function never opens the file.
-reflex_key_status() { _reflex_file_status "$(_reflex_key_file)"; }
+# DIVE-5043: ONE OpenRouter key per box. Reflex resolves its key as
+#   file       the root-only override above (reflex-key=-), when it is non-empty;
+#   connector  else OPENROUTER_API_KEY (or OPENROUTER_KEY, first match — what voice
+#              reads) in the connector store, set by `5dive config openrouter-key=-`.
+# Nothing is moved or re-permissioned: a box with the root-only file keeps using
+# it, and the connector's 640 root:claude is unchanged. An override that exists
+# but this process cannot read is still the source (the connector is not a silent
+# second choice for a caller that merely lacks root).
+_reflex_connector_key_file() { printf '%s/openrouter.env' "${CONNECTORS_DIR:-${FIVEDIVE_CONNECTOR_DIR:-/etc/5dive/connectors}}"; }
+_REFLEX_CONNECTOR_KEY_RE='^(OPENROUTER_API_KEY|OPENROUTER_KEY)=.'
+
+# reflex_key_source -> file | connector | none | unknown. Presence only: the
+# override is stat'ed, the connector is grepped for a key LINE; no key is read
+# into a variable.
+reflex_key_source() {
+  local f c; f=$(_reflex_key_file); c=$(_reflex_connector_key_file)
+  if [[ -s "$f" ]]; then printf 'file'; return 0; fi
+  if [[ -r "$c" ]]; then
+    grep -qE "$_REFLEX_CONNECTOR_KEY_RE" "$c" 2>/dev/null && { printf 'connector'; return 0; }
+  elif [[ -e "$c" ]]; then printf 'unknown'; return 0
+  fi
+  [[ -x "$(dirname "$f")" ]] && printf 'none' || printf 'unknown'
+}
+
+# set | unset | unknown — does reflex have an OpenRouter key from either source.
+reflex_key_status() {
+  case "$(reflex_key_source)" in file|connector) printf 'set' ;; none) printf 'unset' ;; *) printf 'unknown' ;; esac
+}
+
+# reflex_key_readable -> rc 0 when THIS process can read the key reflex would use.
+reflex_key_readable() {
+  case "$(reflex_key_source)" in
+    file) [[ -r "$(_reflex_key_file)" ]] ;;
+    connector) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# reflex_key_where -> the file reflex's key is (or would be) read from, for messages.
+reflex_key_where() {
+  [[ "$(reflex_key_source)" == connector ]] && _reflex_connector_key_file || _reflex_key_file
+}
+
+# reflex_key_unreadable_msg <verb> -> the refusal when reflex_key_readable fails.
+# With no key anywhere it names the one setting that fixes it.
+reflex_key_unreadable_msg() {
+  if [[ "$(reflex_key_source)" == none ]]; then
+    printf 'this box has no OpenRouter key. Set one with: printf %%s "$KEY" | sudo 5dive config openrouter-key=- (the key reflex and voice share)'
+  else
+    printf 'the OpenRouter key (%s) is not readable by %s. Run it as root (sudo 5dive reflex %s ...)' "$(reflex_key_where)" "$(id -un)" "$1"
+  fi
+}
+
+# _reflex_openrouter_key -> the key on stdout, or nothing. The one place in the
+# installed CLI that reads either source (the replay's reference backend,
+# scripts/reflex-openrouter-backend.sh, inlines the same order); callers pass it
+# to curl through a mode-600 header file.
+_reflex_openrouter_key() {
+  case "$(reflex_key_source)" in
+    file) [[ -r "$(_reflex_key_file)" ]] && tr -d ' \r\n' <"$(_reflex_key_file)" 2>/dev/null ;;
+    connector)
+      grep -E "$_REFLEX_CONNECTOR_KEY_RE" "$(_reflex_connector_key_file)" 2>/dev/null | head -n 1 \
+        | sed -E 's/^[A-Z_]+=//; s/^["'"'"'](.*)["'"'"']$/\1/' | tr -d ' \r\n' ;;
+  esac
+  return 0
+}
 _reflex_file_status() {
   local f="$1"
   if [[ -s "$f" ]]; then printf 'set'
@@ -468,7 +533,8 @@ _reflex_gate_receipt_write() {
 #   model  box.json .reflex_model, set explicitly (`5dive config reflex-model=`,
 #          DIVE-4915). A built-in default is NOT enough: a box that has a key for
 #          replays has not thereby agreed to a call on every gate.
-#   key    the key file is readable by this process, or a test/operator backend
+#   key    the OpenRouter key (the root-only file, else the connector store's,
+#          DIVE-5043) is readable by this process, or a test/operator backend
 #          is named in FIVEDIVE_REFLEX_SHADOW_BACKEND (a JSONL command, same
 #          contract as `reflex replay --backend=`).
 # FIVEDIVE_REFLEX_SHADOW=0 turns it off whatever the box says.
@@ -506,7 +572,7 @@ reflex_shadow_model() {
   else
     [[ -n "$m" && ${#m} -le 100 && "$m" =~ ^[A-Za-z0-9._~-]+/[A-Za-z0-9._:-]+$ ]] || return 1
     if [[ -z "${FIVEDIVE_REFLEX_SHADOW_BACKEND:-}" ]]; then
-      [[ -r "${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5dive/reflex-openrouter.key}" ]] || return 1
+      reflex_key_readable || return 1
     fi
   fi
   printf '%s' "$m"
@@ -644,8 +710,7 @@ _reflex_endpoint_decide() {
     key_file=$(_reflex_endpoint_key_file)
     [[ -r "$key_file" ]] && key=$(tr -d ' \r\n' <"$key_file" 2>/dev/null)
   else
-    key_file="${FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE:-/etc/5dive/reflex-openrouter.key}"
-    key=$(tr -d ' \r\n' <"$key_file" 2>/dev/null)
+    key=$(_reflex_openrouter_key)
     [[ -n "$key" ]] || { jq -cn '{choice:null, error:"no_key"}'; return 0; }
   fi
   d=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/reflex-or.XXXXXX") || return 1
