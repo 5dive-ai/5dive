@@ -7717,7 +7717,27 @@ _hb_poller_liveness_sweep() {
 # goes through the seat's gate notifier when that seat holds a channel, else the
 # nearest paired seat up its org chain — the same Bot API send the poller
 # alarm's per-seat fallback uses.
+#
+# DIVE-5113: A RUNNING AGENT UP THE CHAIN IS ASKED FIRST, AND A PERSON GETS ONLY
+# THE ASK. At 05:22:17Z on 2026-09-28 ops ended its turn on "Decision for you:
+# should I file this as a high row and open the PR?" — a question for its LEAD,
+# main, a running agent. The sweep sent it through main's bot to the owner's
+# phone instead, as the raw last 1500 chars cut from the FRONT, so it opened
+# mid-word ("…t-watch") with markdown, paths and idents. Now:
+#   - the nearest running agent above the seat (its org parent, then the gate
+#     notifier, then the rest of the chain; _hb_stuck_q_lead) gets it over
+#     `agent send`, cut at a paragraph or sentence boundary, never mid-word. A
+#     person is paged only when no agent up the chain is running. When the lead's
+#     own answer is a question for a person, the lead asks it on its own channel,
+#     or this sweep forwards it from the lead's seat on a later tick.
+#   - the Bot API send carries the final paragraph only, markdown stripped, cut
+#     at a sentence boundary to _HB_STUCK_Q_HUMAN_WORDS (_hb_stuck_q_plain_ask).
+#   - the envelope says task-engine, not the seat: cmd_send refuses a root
+#     process claiming a registered agent's name (DIVE-2183), so the seat is
+#     named in the text instead.
+# One text is still delivered once, on the same hash/retry/backoff state.
 _HB_STUCK_Q_TEXT_MAX=1500
+_HB_STUCK_Q_HUMAN_WORDS=60
 _HB_STUCK_Q_MAX_AGE_MIN=1440     # a first tick after install forwards nothing older
 _HB_STUCK_Q_REFLEX_CONF=0.9
 _HB_STUCK_Q_REFLEX_TIMEOUT=15
@@ -7831,6 +7851,92 @@ _hb_stuck_q_route() { # <seat>
   _task_chain_channel "$1"
 }
 
+# `_hb_stuck_q_lead <seat>` — DIVE-5113. The nearest RUNNING agent above the
+# seat: its org parent, then its gate notifier, then the rest of its escalation
+# chain (which ends at the coordinator). Running = its agent unit is active, the
+# same test the sweep puts to the seat itself; an org node that is a person has
+# no unit and is never picked. Prints the name, rc 1 when nobody is running.
+_hb_stuck_q_lead() { # <seat>
+  local seat="$1" n="" c seen=$'\n'
+  local -a chain=() cands=()
+  mapfile -t chain < <(_task_escalation_chain "$seat" 2>/dev/null)
+  n=$(_task_resolve_gate_notifier "$seat" 2>/dev/null) || n=""
+  (( ${#chain[@]} )) && cands+=("${chain[0]}")
+  [[ -n "$n" ]] && cands+=("$n")
+  cands+=("${chain[@]:1}")
+  for c in "${cands[@]}"; do
+    [[ -n "$c" && "$c" != "$seat" && "$c" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+    [[ "$seen" == *$'\n'"$c"$'\n'* ]] && continue
+    seen+="${c}"$'\n'
+    systemctl is-active --quiet "5dive-agent@${c}.service" 2>/dev/null || continue
+    printf '%s' "$c"; return 0
+  done
+  return 1
+}
+
+# `_hb_stuck_q_tail <text> <max>` — the text itself when it fits, else its last
+# <max> chars moved forward to the first paragraph start, else the first
+# sentence start, else the first word start. Never opens mid-word.
+_hb_stuck_q_tail() { # <text> <max>
+  local t="$1" max="$2" cut re='[.?!]["'"'"')]*[[:space:]]+(.*)$'
+  (( ${#t} <= max )) && { printf '%s' "$t"; return 0; }
+  t="${t: -max}"
+  if [[ "$t" == *$'\n\n'* ]]; then cut="${t#*$'\n\n'}"
+  elif [[ "$t" =~ $re ]]; then cut="${BASH_REMATCH[1]}"
+  else cut="${t#*[[:space:]]}"
+  fi
+  cut="${cut#"${cut%%[![:space:]]*}"}"
+  [[ -n "$cut" ]] || cut="$t"
+  printf '%s' "$cut"
+}
+
+# `_hb_stuck_q_plain_ask <text>` — what a PERSON receives: the final paragraph
+# (the one the base tier read the ask in), markdown stripped, on one line. Over
+# _HB_STUCK_Q_HUMAN_WORDS it starts at the first sentence that asks and keeps
+# whole sentences while they fit; a single asking sentence longer than that is
+# cut at a word with a trailing "…". Never from the front mid-word.
+_hb_stuck_q_plain_ask() { # <text>
+  local para s out="" w=0 sw started=0
+  local -a sents=()
+  para=$(printf '%s\n' "$1" | awk 'BEGIN { RS = "" } { p = $0 } END { print p }' \
+    | sed -E 's/\[([^]]*)\]\([^)]*\)/\1/g; s/^[[:space:]]*(#+|[-*+>]|[0-9]+[.)])[[:space:]]+//; s/\*\*|__|[*`]//g' \
+    | tr '\n' ' ' | tr -s '[:space:]' ' ')
+  para="${para# }"; para="${para% }"
+  if (( $(wc -w <<<"$para") <= _HB_STUCK_Q_HUMAN_WORDS )); then printf '%s' "$para"; return 0; fi
+  mapfile -t sents < <(sed -E 's/([.?!]["'\'')]*) +/\1\n/g' <<<"$para")
+  for s in "${sents[@]}"; do
+    [[ -n "$s" ]] || continue
+    if (( ! started )); then
+      grep -qE "$_HB_STUCK_Q_QMARK_RE" <<<"$s" || grep -qiE "$_HB_STUCK_Q_ASK_RE" <<<"$s" || continue
+      started=1
+    fi
+    sw=$(wc -w <<<"$s")
+    if (( w + sw > _HB_STUCK_Q_HUMAN_WORDS )); then
+      (( w == 0 )) && out="$(tr ' ' '\n' <<<"$s" | head -n "$_HB_STUCK_Q_HUMAN_WORDS" | tr '\n' ' ')" && out="${out% }…"
+      break
+    fi
+    out+="${out:+ }${s}"; w=$((w + sw))
+  done
+  # No sentence reads as an ask on its own (the '?' sat in a quote the split
+  # moved): the last sentences that fit, so the ask the base read is kept.
+  if [[ -z "$out" ]]; then
+    w=0
+    for (( i = ${#sents[@]} - 1; i >= 0; i-- )); do
+      s="${sents[i]}"; [[ -n "$s" ]] || continue
+      sw=$(wc -w <<<"$s")
+      (( w + sw > _HB_STUCK_Q_HUMAN_WORDS )) && break
+      out="${s}${out:+ }${out}"; w=$((w + sw))
+    done
+    [[ -n "$out" ]] || { out="$(tr ' ' '\n' <<<"${sents[-1]}" | tail -n "$_HB_STUCK_Q_HUMAN_WORDS" | tr '\n' ' ')"; out="…${out% }"; }
+  fi
+  printf '%s' "$out"
+}
+
+# The agent route's one send, a function so the harness can replace the rail.
+_hb_stuck_q_agent_send() { # <lead> <seat> <text>
+  ( cmd_send "$1" --from="task-engine" --message="${2} ended its turn waiting for an answer, and you are the nearest running agent above it. Its last words:"$'\n\n'"${3}"$'\n\n'"Answer with 5dive agent send ${2} '…'. If only a person can decide, ask your human." ) >/dev/null 2>&1
+}
+
 # The sweep's clock, a function so the harness can move time past a backoff.
 _hb_stuck_q_now() { date +%s; }
 
@@ -7851,7 +7957,7 @@ _hb_stuck_question_sweep() {
   _task_deployment_has_channels || return 0
   local reg; reg=$(registry_read 2>/dev/null) || return 0
   local dir="${STATE_DIR}/stuck-question" model="" name key text hash chat sent now
-  local r_hash r_n r_due retrying
+  local r_hash r_n r_due retrying full lead ask
   mkdir -p "$dir" 2>/dev/null || return 0
   model=$(reflex_shadow_model 2>/dev/null) || model=""
   now=$(_hb_stuck_q_now)
@@ -7885,7 +7991,8 @@ _hb_stuck_question_sweep() {
       printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true
       rm -f "$dir/${name}.retry"; continue
     fi
-    (( ${#text} > _HB_STUCK_Q_TEXT_MAX )) && text="…${text: -_HB_STUCK_Q_TEXT_MAX}"
+    full="$text"
+    (( ${#text} > _HB_STUCK_Q_TEXT_MAX )) && text="…${text: -_HB_STUCK_Q_TEXT_MAX}"   # the reflex model's input only
     if (( ! retrying )) && [[ -n "$model" && "$(_hb_stuck_reflex "$name" "$text" "$model")" == hold ]]; then
       printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true   # terminal: reflex held
       rm -f "$dir/${name}.retry"
@@ -7893,16 +8000,27 @@ _hb_stuck_question_sweep() {
       continue
     fi
     r_n=$((r_n + 1))
+    if lead=$(_hb_stuck_q_lead "$name"); then       # DIVE-5113: an agent above it answers first
+      if _hb_stuck_q_agent_send "$lead" "$name" "$(_hb_stuck_q_tail "$full" "$_HB_STUCK_Q_TEXT_MAX")"; then
+        printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true   # terminal: its lead has it
+        rm -f "$dir/${name}.retry"
+        _hb_log "[stuck-question] ${name} is waiting for an answer; sent to ${lead}, the nearest running agent above it (agent send)"
+      else
+        printf '%s %s %s\n' "$hash" "$r_n" "$((now + $(_hb_stuck_q_backoff "$r_n")))" > "$dir/${name}.retry" 2>/dev/null || true
+        _hb_log "[stuck-question] ${name} is waiting for an answer; agent send to ${lead} FAILED, try ${r_n}, retrying in $(( $(_hb_stuck_q_backoff "$r_n") / 60 ))m"
+      fi
+      continue
+    fi
     if ! _hb_stuck_q_route "$name"; then
       printf '%s %s %s\n' "$hash" "$r_n" "$((now + $(_hb_stuck_q_backoff "$r_n")))" > "$dir/${name}.retry" 2>/dev/null || true
       _hb_log "[stuck-question] ${name} is waiting for an answer and no paired channel resolves (its gate notifier or anyone up its chain); not forwarded, try ${r_n}, retrying in $(( $(_hb_stuck_q_backoff "$r_n") / 60 ))m"
       continue
     fi
-    sent=0
+    sent=0 ask=$(_hb_stuck_q_plain_ask "$full")
     while IFS= read -r chat; do
       [[ "$chat" =~ ^-?[0-9]+$ ]] || continue
       _gate_channel_api "$TASK_CH_TOKEN" sendMessage -d "chat_id=${chat}" \
-        --data-urlencode "text=${name} is waiting for an answer: ${text}"$'\n\n'"Reply with sudo 5dive agent send ${name} '…'" \
+        --data-urlencode "text=${name} is waiting for an answer: ${ask}"$'\n\n'"Reply with sudo 5dive agent send ${name} '…'" \
         | jq -e '.ok == true' >/dev/null 2>&1 && sent=$((sent + 1))
     done < <(jq -r '(.allowFrom // [])[] | tostring' "$TASK_CH_ACCESS" 2>/dev/null)
     if (( sent > 0 )); then                          # terminal: a person has it
