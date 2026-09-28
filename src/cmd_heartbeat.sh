@@ -2730,7 +2730,17 @@ _hb_send_line() {
   # C-u can never mean the line landed. (DIVE-4279 iteration 2 — checking here is
   # how the first cut counted a busy seat's tool_result as a delivered wake.)
   _hb_send_keys_step "$name" "composer clear (C-u)" C-u || return 1
-  _hb_send_keys_step "$name" "payload text" -l -- "$text" || { _hb_landed_check "$name" "$text" && return 0; return 1; }
+  # DIVE-5098: a long payload to a claude seat is a typed fixed line + a paste,
+  # so the turn carries the dispatcher's own words (_wake_split,
+  # cmd_agent_runtime.sh). The landed check matches on the pasted BODY.
+  _WAKE_HEAD=""; _WAKE_BODY="$text"
+  [[ -n "$(_hb_claude_pid "$name")" ]] && _wake_split "$text"
+  if [[ -n "$_WAKE_HEAD" ]]; then
+    _hb_send_keys_step "$name" "typed line" -l -- "$_WAKE_HEAD" || { _hb_composer_clear "$name" >/dev/null 2>&1; return 1; }
+    sleep "${_WAKE_TYPED_GAP_SEC:-0.3}"
+  fi
+  local _hb_body="$_WAKE_BODY"
+  _hb_send_keys_step "$name" "payload text" -l -- "$_hb_body" || { _hb_landed_check "$name" "$_hb_body" && return 0; return 1; }
   # DIVE-1217: `send-keys -l` lands as a bracketed PASTE. Claude commits it
   # synchronously so an immediate Enter submits (leave that path alone). Non-claude
   # TUIs (codex/grok/agy/opencode) render the paste inline and a trailing Enter
@@ -2747,10 +2757,10 @@ _hb_send_line() {
   # the pre-DIVE-2244 behaviour for exactly this task and strictly better than a
   # claim on a prompt nobody received.
   if [[ -n "$(_hb_claude_pid "$name")" ]]; then
-    _hb_send_keys_step "$name" "submit (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
+    _hb_send_keys_step "$name" "submit (Enter)" Enter || { _hb_landed_check "$name" "$_hb_body" && return 0; return 1; }
     _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
     sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
-    _hb_send_keys_step "$name" "submit retry (Enter)" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
+    _hb_send_keys_step "$name" "submit retry (Enter)" Enter || { _hb_landed_check "$name" "$_hb_body" && return 0; return 1; }
     _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
     # DIVE-4642: the submit failed and we KNOW it. Two things follow, and today
     # neither happened: the seat is marked unhealthy so `5dive supervisor` names
@@ -2771,7 +2781,7 @@ _hb_send_line() {
   fi
   sleep 0.4
   while (( tries < 5 )); do
-    _hb_send_keys_step "$name" "submit (Enter, attempt $((tries+1)))" Enter || { _hb_landed_check "$name" "$text" && return 0; return 1; }
+    _hb_send_keys_step "$name" "submit (Enter, attempt $((tries+1)))" Enter || { _hb_landed_check "$name" "$_hb_body" && return 0; return 1; }
     sleep 0.5
     # idle()==0 means the Enter did not take (still at the prompt) -> retry; any
     # other state (busy/blocked/unknown) means the composer accepted it.

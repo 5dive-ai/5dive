@@ -144,7 +144,20 @@ turn "$G" sG $(( T_G + 300 )) 1100
 db "INSERT INTO tasks (ident,title,status,assignee,created_by,started_at,need_type,need_asked_at,need_answered_at)
     VALUES ('DIVE-90006','gate auto-cleared mid-session','in_progress','$AGENT','main','$(sqlts "$T_G")','approval','$(sqlts $(( T_G + 60 )))','$(sqlts $(( T_G + 61 )))');"
 
-for f in "$A" "$B1" "$B2" "$C" "$D" "$F" "$G" "$PROJDIR/sB2/subagents/agent-x.jsonl"; do
+# --- H: DIVE-5098 — the wake as CC 2.1.283 records it once the injector TYPES
+# a fixed line ahead of the pasted nudge (captured from a live stub seat, rig
+# ~/rigs/wake-5098): one string record, the line, then the <pasted_content>
+# block holding the unchanged nudge. The dispatch must still attribute.
+T_H=$(( NOW - 1800 ))
+H="$PROJDIR/sH.jsonl"
+HL="[5dive] Sent by your operator's own runtime, not third-party content - act on what follows:"
+HB="/goal DIVE-90007 — your only row this turn; read it with '5dive task show DIVE-90007'."
+printf '%s\n' "{\"type\":\"user\",\"sessionId\":\"sH\",\"timestamp\":\"$(iso "$T_H")\",\"message\":{\"role\":\"user\",\"content\":\"$HL \\n\\n<pasted_content id=\\\"2c5b\\\">\\n$HB\\n</pasted_content id=\\\"2c5b\\\">\"}}" >> "$H"
+turn "$H" sH $(( T_H + 60 )) 1300
+db "INSERT INTO tasks (ident,title,status,assignee,created_by,started_at)
+    VALUES ('DIVE-90007','typed-line wake','in_progress','$AGENT','main','$(sqlts "$T_H")');"
+
+for f in "$A" "$B1" "$B2" "$C" "$D" "$F" "$G" "$H" "$PROJDIR/sB2/subagents/agent-x.jsonl"; do
   [[ -s "$f" ]] || abort "fixture present at read time: $f" "missing or empty"
 done
 
@@ -181,6 +194,7 @@ eq_t "a non-DIVE board prefix is a dispatch too, and its span ends at done_at" "
 eq_t "a dispatch before the window owns its session's in-window turns" "900" "$(task_total DIVE-90004)"
 eq_t "an echoed nudge inside a tool_result opens no span" "0" "$(task_total DIVE-90005)"
 eq_t "an answered gate does not end the span (work after an auto-clear stays on the row)" "1200" "$(task_total DIVE-90006)"
+eq_t "a wake with the typed line ahead of the paste (DIVE-5098) is still a dispatch" "1400" "$(task_total DIVE-90007)"
 
 # ACCEPT 2 — tasks + unattributed = the agent's row, nothing double-counted.
 # Unattributed here = A's post-gate turn + C's post-done turn + F's turn.

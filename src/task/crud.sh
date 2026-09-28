@@ -1853,10 +1853,15 @@ cmd_task_verifier() {
   # history do not change just because the grader did. Pointing at the grader who
   # already holds it is an idempotent no-op on the handoff (criteria still
   # refine), NOT an error.
+  # DIVE-5098: status goes back to 'todo' too. The outgoing grader's /goal wake
+  # may already have claimed the row (in_progress), and the heartbeat dispatches
+  # only todo rows — so a re-point that kept in_progress handed the new grader a
+  # review no tick would ever wake them for (DIVE-618 sat 9h). 'todo' is the
+  # state `task done` leaves a delivered row in.
   local move_sql="" new_owner="$asignee" repoint=0
   if (( mid_handoff )) && [[ "$who" != "$cur_vfier" ]]; then
     repoint=1; new_owner="$who"
-    move_sql=", assignee=$(sqlq "$who"), started_at=NULL, handoff_ack_at=NULL,
+    move_sql=", status='todo', assignee=$(sqlq "$who"), started_at=NULL, handoff_ack_at=NULL,
                handoff_delivered_at=datetime('now'), handoff_stale_pinged_at=NULL"
   fi
   db "UPDATE tasks SET verifier=$(sqlq "$who"),
