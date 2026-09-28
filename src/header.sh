@@ -973,7 +973,16 @@ declare -A OPENCLAW_PROVIDER_MODEL=(
   [deepseek]="deepseek/deepseek-chat"
   [moonshot]="moonshot/kimi-k2.6"
   [minimax]="minimax/MiniMax-M2.7"
-  [openrouter]="openrouter/auto"
+  # openrouter: a concrete model, not the openrouter/auto router (DIVE-5127).
+  # auto picks a model per request, so neither the price nor the tool-calling
+  # behaviour was predictable. deepseek-v4.1-flash won the acceptance run: 2/2
+  # real two-turn tool-use sessions on openclaw 2026.9.6, 3/3 on Claude Code,
+  # ~98% of each warm call billed as cached reads. deepseek-v4-pro failed there:
+  # openclaw reserves its full 384k max output, and OpenRouter refuses it (402)
+  # on any capped key with less than ~$0.73 left. This namespace enumerates
+  # nothing until `models list --refresh`, so doctor reads NO ORACLE here, as it
+  # did for auto. The refreshed list carries this id.
+  [openrouter]="openrouter/deepseek/deepseek-v4.1-flash"
 )
 declare -A BYO_PROVIDER_LABEL=(
   [openai]="OpenAI"
@@ -1104,6 +1113,14 @@ valid_base_url() {
 # there is no claude-haiku-5 on OpenRouter, 4.5 is the current haiku. NOTE the opus
 # slot was the only stale entry — its sibling sonnet was already at 5, so one tier had
 # been bumped and the other had not.
+# DIVE-5127 moved all three openrouter tiers to deepseek/deepseek-v4.1-flash,
+# after a real two-turn tool-use session in this exact env shape: 3/3 passed,
+# about $0.008 per session, ~98% of each warm call billed as cached reads.
+# deepseek-v4-pro went 0/2: after a few tool calls it returned empty turns and
+# left the task unfinished. xiaomi/mimo-v2.6-pro passed 3/3, but it ran 3-4x slower
+# and its cost varied when OpenRouter moved it between providers, which drops
+# the cache. It is the fallback. The tier is a DEFAULT for new agents only:
+# nothing re-reads this table for an existing agent.
 # Qwen / Alibaba Model Studio (DIVE-2756): verified LIVE with a real Token Plan key
 # 2026-08-07 — not doc-and-probe-only like the pre-ship research. A full /v1/messages
 # POST to token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic returned 200 with
@@ -1141,21 +1158,21 @@ declare -A CLAUDE_PROVIDER_BASEURL=(
 declare -A CLAUDE_PROVIDER_OPUS_MODEL=(
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2.5"
-  [openrouter]="anthropic/claude-opus-5"
+  [openrouter]="deepseek/deepseek-v4.1-flash"
   [qwen]="qwen3.8-max"
   [zai]="glm-5.2"
 )
 declare -A CLAUDE_PROVIDER_SONNET_MODEL=(
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2.5"
-  [openrouter]="anthropic/claude-sonnet-5"
+  [openrouter]="deepseek/deepseek-v4.1-flash"
   [qwen]="qwen3.8-max"
   [zai]="glm-5-turbo"
 )
 declare -A CLAUDE_PROVIDER_HAIKU_MODEL=(
   [deepseek]="deepseek-v4-flash"
   [moonshot]="kimi-k2.5"
-  [openrouter]="anthropic/claude-haiku-4.5"
+  [openrouter]="deepseek/deepseek-v4.1-flash"
   [qwen]="qwen3.6-flash"
   [zai]="glm-4.5-air"
 )

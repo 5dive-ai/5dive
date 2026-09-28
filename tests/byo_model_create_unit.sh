@@ -106,4 +106,37 @@ setup_src=$(<src/lib/agent_setup.sh)
 [[ "$setup_src" == *'selected_model="${3:-$(resolve_model_alias opus)}"'* ]]
 [[ "$setup_src" == *'model: $model'* ]]
 
+# DIVE-5127: with NO --model, a new OpenRouter agent starts on a concrete model,
+# not the openrouter/auto router and not Anthropic Opus. The id is the one the
+# acceptance run picked; a later re-pick edits the two table lines and this arm.
+or_default="deepseek/deepseek-v4.1-flash"
+[[ "${CLAUDE_PROVIDER_OPUS_MODEL[openrouter]}" == "$or_default" ]]
+[[ "${CLAUDE_PROVIDER_SONNET_MODEL[openrouter]}" == "$or_default" ]]
+[[ "${CLAUDE_PROVIDER_HAIKU_MODEL[openrouter]}" == "$or_default" ]]
+[[ "${OPENCLAW_PROVIDER_MODEL[openrouter]}" == "openrouter/$or_default" ]]
+# The openclaw pin must pass the create path's own prefix check unchanged.
+[[ "$(openclaw_normalize_model openrouter "${OPENCLAW_PROVIDER_MODEL[openrouter]}")" == "openrouter/$or_default" ]]
+
+# Claude, no override: all three tier variables land on the default.
+: >"$capture"
+_apply_byo_claude openrouter sk-or-test-123456 qa-profile
+for tier in OPUS SONNET HAIKU; do
+  grep -qxF "PROFILE qa-profile ANTHROPIC_DEFAULT_${tier}_MODEL=$or_default" "$capture"
+done
+
+# The STARTUP model. Before DIVE-5127, no --model meant the preseed pinned
+# claude-opus-5-5, which OpenRouter serves as anthropic/claude-opus-5.5: the tier
+# table above was never consulted.
+[[ "$(claude_create_start_model "" openrouter "")" == "$or_default" ]]
+# An explicit --model still wins (pinned agents keep their pin).
+[[ "$(claude_create_start_model google/gemini-2.5-pro openrouter "")" == "google/gemini-2.5-pro" ]]
+# Out of scope, and so unchanged: the direct vendors, a --base-url endpoint, and
+# a create with no provider at all. Each still hands the preseed an empty model,
+# which resolves to the Anthropic opus id as before.
+[[ -z "$(claude_create_start_model "" deepseek "")" ]]
+[[ -z "$(claude_create_start_model "" openrouter https://example.invalid/api)" ]]
+[[ -z "$(claude_create_start_model "" "" "")" ]]
+[[ "$create_src" == *'_claude_create_model=$(claude_create_start_model "$_claude_create_model" "$byo_provider" "$byo_base_url")'* ]]
+
 echo 'PASS: explicit BYO model reaches Claude per-agent settings and Hermes config'
+echo 'PASS: a new OpenRouter agent defaults to a concrete model in claude and openclaw (DIVE-5127)'

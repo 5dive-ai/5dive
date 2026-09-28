@@ -1531,6 +1531,27 @@ _apply_byo_claude() {
   printf '%s' "" | profile_set_var "$profile" ANTHROPIC_API_KEY
 }
 
+# claude_create_start_model <--model> <--provider> <--base-url> — the model a new
+# claude agent's settings.json starts on. Empty means "no pin", and the preseed
+# then falls back to the Anthropic opus id.
+#
+# DIVE-5127: that fallback is wrong for OpenRouter. With no --model, the preseed
+# pins claude-opus-5-5, and OpenRouter serves that id as anthropic/claude-opus-5.5.
+# The CLAUDE_PROVIDER_*_MODEL tiers never get a say, because the profile's
+# ANTHROPIC_DEFAULT_* variables translate tier ALIASES only. So an OpenRouter agent
+# created with no --model ran on Opus. Start it on the catalog's opus-tier default
+# instead. An explicit --model always wins. Scope is the openrouter catalog row only:
+# a --base-url endpoint has no row, and the direct vendors (deepseek, moonshot,
+# qwen, zai) resolve the Anthropic id on their own side. Moving them is a separate
+# decision.
+claude_create_start_model() {
+  local model="${1:-}" provider="${2:-}" base_url="${3:-}"
+  if [[ -z "$model" && "$provider" == "openrouter" && -z "$base_url" ]]; then
+    model="${CLAUDE_PROVIDER_OPUS_MODEL[openrouter]:-}"
+  fi
+  printf '%s' "$model"
+}
+
 _apply_byo_hermes() {
   # override_model (DIVE-1318): an operator-supplied --model wins over the
   # per-provider catalog default (HERMES_PROVIDER_MODEL) — e.g. dashboard
@@ -3021,6 +3042,7 @@ cmd_create() {
     # be hard-pinned to claude-opus-4-8, overriding that intent. Pass the model
     # through so this agent starts on the requested OpenRouter/vendor slug.
     local _claude_create_model="$byo_model"
+    _claude_create_model=$(claude_create_start_model "$_claude_create_model" "$byo_provider" "$byo_base_url")
     preseed_claude_agent "$name" "$channels" "$_claude_create_model" "${byo_effort:-high}"
   elif [[ "$type" == "antigravity" ]]; then
     # antigravity needs no claude-style ~/.claude preseed (agy reads its own
