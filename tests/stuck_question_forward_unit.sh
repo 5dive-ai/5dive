@@ -41,7 +41,22 @@
 #      forgets the text it judged, turn G and B red; the one that marks the text
 #      judged BEFORE the send (the iteration-1 defect) turns S and U red
 #
-# Stubs: systemctl, _tg_access_state_dir (channel dirs into the temp tree),
+# DIVE-5113 arms. Every arm above runs with lead and boss's units DOWN, so no
+# agent above quiet is running and the person route they grade is the one taken.
+#   T  [a] an agent above the seat is running: the question goes to it over
+#      `agent send` (org parent first, then up the chain, channel or none), 0 Bot
+#      API sends; a failed agent send retries on the same state machine, once
+#   Q  [b] nobody running above it: the Bot API text is the final paragraph,
+#      starting at a sentence start, markdown stripped, <= 60 words
+#   X  [c] a 1500+ char turn: neither send opens with "…" or mid-word
+#   V  MUTANT: the pre-5113 route (no agent lead) turns T red; the pre-5113 text
+#      (the raw capped tail) turns Q and X red; the iteration-1 envelope
+#      (from=task-engine) turns Z red
+#   Z  the forward survives the a2a spool: the real payload, run through the
+#      UNSTUBBED stale-nudge predicate with the named row on another seat and on a
+#      done row, is delivered; a from=task-engine control of it is dropped
+#
+# Stubs: systemctl (per unit), cmd_send (the a2a rail), _tg_access_state_dir (channel dirs into the temp tree),
 # _gate_channel_api (the Bot API seam), _reflex_endpoint_decide (the model),
 # _hb_log. No root, no network, no box path written.
 #
@@ -136,7 +151,19 @@ tx() { # <seat> <text> [stop_reason] [entrypoint] [file] [age s]
 
 _tg_access_state_dir() { printf '%s/home/%s/.%s/channels/telegram' "$TMP" "$1" "$2"; }
 UNIT_ACTIVE=1
-systemctl() { [[ "$1" == is-active ]] && (( UNIT_ACTIVE )); }
+DOWN="lead boss"      # units not running; the pre-5113 arms page a person, so nobody above quiet runs
+systemctl() { # is-active --quiet 5dive-agent@<name>.service
+  [[ "$1" == is-active ]] && (( UNIT_ACTIVE )) || return 1
+  local u="${!#}"; u="${u#5dive-agent@}"; u="${u%.service}"
+  [[ " $DOWN " != *" $u "* ]]
+}
+A2A_RC=0
+cmd_send() { # <to> --from=… --message=… -> a2a.log: to|from|message
+  local to="$1" from="" msg=""; shift
+  for a in "$@"; do case "$a" in --from=*) from="${a#--from=}" ;; --message=*) msg="${a#--message=}" ;; esac; done
+  printf '%s|%s|%s\n' "$to" "$from" "${msg//$'\n'/\\n}" >> "$TMP/a2a.log"; printf '%s' "$msg" > "$TMP/a2a.last"
+  return "$A2A_RC"
+}
 _gate_channel_api() { # <token> <method> [curl args...] -> api.log: token|method|chat|text
   local tok="$1" m="$2" chat="" text=""; shift 2
   while [[ $# -gt 0 ]]; do
@@ -163,8 +190,9 @@ _hb_log() { printf '%s\n' "$*" >> "$TMP/hb.log"; }
 opt_in()  { printf '{"reflex_model":"typesafe/jev-1.13"}\n' > "$STATE_DIR/box.json"; printf 'sk-or-test\n' > "$FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE"; }
 opt_out() { printf '{}\n' > "$STATE_DIR/box.json"; printf 'sk-or-test\n' > "$FIVEDIVE_REFLEX_OPENROUTER_KEY_FILE"; }
 fresh()   { rm -rf "$STATE_DIR/stuck-question"; }         # forget every judged text
-tick()    { : > "$TMP/api.log"; : > "$TMP/rx.calls"; : > "$TMP/hb.log"; rm -f "$TMP/rx.req"; _hb_stuck_question_sweep; }
+tick()    { : > "$TMP/api.log"; : > "$TMP/a2a.log"; : > "$TMP/rx.calls"; : > "$TMP/hb.log"; rm -f "$TMP/rx.req"; _hb_stuck_question_sweep; }
 sends()   { grep -c . "$TMP/api.log"; }
+a2as()    { grep -c . "$TMP/a2a.log"; }
 calls()   { grep -c . "$TMP/rx.calls"; }
 receipts() { db "SELECT COALESCE(detail,'') FROM lifecycle_events WHERE kind='decision.stuck' ORDER BY id;"; }
 last_receipt() { receipts | tail -1; }
@@ -190,10 +218,10 @@ opt_out; fresh; tx quiet "$MARCUS_Q"; tick
   && ok_t "G1: one sendMessage, through the gate notifier's bot, to its human" \
   || bad_t "G1: one forward via lead" "api: $(cat "$TMP/api.log")"
 G_TEXT=$(cut -d'|' -f4- "$TMP/api.log")
-[[ "$G_TEXT" == "quiet is waiting for an answer: I haven't restarted anything."* ]] \
-  && has "$G_TEXT" "Should I restart claude-swan on its own as a test?" \
+[[ "$G_TEXT" == "quiet is waiting for an answer: Should I restart claude-swan on its own as a test? If Telegram still doesn't start there, the problem is the plugin, and restarting the other 15 won't help."* ]] \
+  && ! has "$G_TEXT" "restarted anything" \
   && [[ "$G_TEXT" == *"\\n\\nReply with sudo 5dive agent send quiet '…'" ]] \
-  && ok_t "G2: the forward names the seat, carries its question and the one command that answers it" \
+  && ok_t "G2: the forward names the seat, carries its asking paragraph (only) and the one command that answers it" \
   || bad_t "G2: forward text" "got: $G_TEXT"
 [[ "$(calls)" == 0 ]] && [[ -z "$(receipts)" ]] \
   && ok_t "G3: no reflex call and no receipt without an opt-in" \
@@ -420,11 +448,16 @@ fi
 if (( ${#LIVE_TX[@]} == 0 )); then
   skip_t "L1/L2: no transcript under ${LIVE_DIR:-~/.claude/projects} on this runner — nothing live to read"
 else
-  LIVE_ENDED="" LIVE_WANT="" LIVE_HEADLESS=""
+  LIVE_ENDED="" LIVE_WANT="" LIVE_HEADLESS="" LIVE_INTERACTIVE=0
   for f in "${LIVE_TX[@]}"; do
-    if [[ -z "$LIVE_HEADLESS" ]] && tail -n 50 "$f" | jq -e 'select(.type == "assistant" and .entrypoint == "sdk-cli")' >/dev/null 2>&1; then
-      LIVE_HEADLESS="$f"; continue
+    # DIVE-5113: EVERY headless file is walked past, not only the first. The root
+    # push rail runs this as root, whose only transcripts are two `claude -p` runs;
+    # the second was graded as an interactive turn and went red.
+    if tail -n 50 "$f" | jq -e 'select(.type == "assistant" and .entrypoint == "sdk-cli")' >/dev/null 2>&1; then
+      [[ -z "$LIVE_HEADLESS" ]] && LIVE_HEADLESS="$f"
+      continue
     fi
+    LIVE_INTERACTIVE=$((LIVE_INTERACTIVE + 1))
     [[ -z "$LIVE_ENDED" ]] || continue
     # Independent of the reader: the last user/assistant record, by grep and jq -s.
     LAST=$(tail -n 800 "$f" | grep -E '"type":"(user|assistant)"' | tail -1)
@@ -432,7 +465,9 @@ else
     LIVE_WANT=$(jq -r '[.message.content[]? | select(.type == "text") | .text] | join("\n\n")' <<<"$LAST")
     [[ -n "$LIVE_WANT" ]] && LIVE_ENDED="$f"
   done
-  if [[ -z "$LIVE_ENDED" ]]; then
+  if (( LIVE_INTERACTIVE == 0 )); then
+    skip_t "L1/L2: the ${#LIVE_TX[@]} transcript(s) under ${LIVE_DIR} are all headless — no interactive turn to read"
+  elif [[ -z "$LIVE_ENDED" ]]; then
     bad_t "L1: live transcripts exist but none ends a turn in the shape the reader keys on (assistant, stop_reason end_turn, entrypoint cli)" "read ${#LIVE_TX[@]} file(s) under $LIVE_DIR — the CLI's record shape moved"
   else
     LD="$TMP/home/agent-live/.claude/projects/live"; mkdir -p "$LD"
@@ -457,6 +492,89 @@ fi
 ! _hb_seat_ended_turn_text no-such-seat >/dev/null \
   && ok_t "L3: CONTROL: a seat with no home reads as no ended turn, and nothing errors" \
   || bad_t "L3: absent home" "the reader returned text for a seat with no home"
+
+# --- DIVE-5113 texts ----------------------------------------------------------------------------------
+# OPS_Q has the incident's SHAPE (the turn itself is ops's, not quoted here): a
+# long markdown report whose last paragraph is a decision for the seat's lead.
+# LONG_PARA's final paragraph runs past 60 words with the ask in its middle.
+OPS_BODY=""
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  OPS_BODY+="**Finding ${i} (unit-watch):** a watcher disarmed itself on 09-05, see \`src/cmd_heartbeat.sh\` and the log under \`/var/log/5dive-heartbeat.log\`; the pinger reported green while nothing was checked."$'\n\n'
+done
+OPS_Q="${OPS_BODY}**Decision for you:** should I file this as a high row and open the PR?"
+LONG_PARA="Short intro.
+
+I read the log for the last three days and the pattern holds on every seat that restarted after the plugin update, including the two that were paired at the time and the one that was asleep. The fix is a one-line change in the start script that every seat runs at boot. Should I ship it to all sixteen seats tonight, or only to claude-swan first? Either way I will watch the next tick and report what it shows, and I will not touch the paired seats until you say so."
+ASK_OF() { local t; t=$(cut -d'|' -f4- "$TMP/api.log" | head -1); t="${t#quiet is waiting for an answer: }"; printf '%s' "${t%%\\n\\nReply with*}"; }
+
+# --- T) [a] a running agent above the seat is asked, not a person ------------------------------------------
+opt_out; fresh; DOWN="boss"; tx quiet "$MARCUS_Q"; tick
+[[ "$(a2as)" == 1 && "$(sends)" == 0 ]] && [[ "$(cut -d'|' -f1-2 "$TMP/a2a.log")" == "lead|stuck-question" ]] \
+  && ok_t "T1: its org parent is a running agent: one agent send to it, 0 Bot API sends" \
+  || bad_t "T1: agent route" "a2a=$(cat "$TMP/a2a.log") api=$(cat "$TMP/api.log")"
+T_MSG=$(cat "$TMP/a2a.last")
+[[ "$T_MSG" == "quiet ended its turn waiting for an answer"* ]] && has "$T_MSG" "$MARCUS_Q" \
+  && has "$T_MSG" "5dive agent send quiet '…'" \
+  && ok_t "T2: the lead gets the seat's name, its whole turn (under the cap) and the command that answers it" \
+  || bad_t "T2: agent message" "$(head -c 300 <<<"$T_MSG")"
+has "$(cat "$TMP/hb.log")" "[stuck-question] quiet is waiting for an answer; sent to lead, the nearest running agent above it (agent send)" \
+  && ok_t "T3: the tick log names the lead it reached" \
+  || bad_t "T3: log line" "$(cat "$TMP/hb.log")"
+tick
+[[ "$(a2as)" == 0 && "$(sends)" == 0 ]] \
+  && ok_t "T4: the next tick sends nothing (one text, one delivery)" \
+  || bad_t "T4: no repeat" "a2a=$(cat "$TMP/a2a.log")"
+fresh; unchannel lead; tx quiet "$MARCUS_Q"; tick; channel lead '["501"]'
+[[ "$(a2as)" == 1 && "$(sends)" == 0 && "$(cut -d'|' -f1 "$TMP/a2a.log")" == lead ]] \
+  && ok_t "T5: a lead with NO channel of its own still gets it (an agent answers, not a phone)" \
+  || bad_t "T5: channel-less lead" "a2a=$(cat "$TMP/a2a.log") api=$(cat "$TMP/api.log")"
+fresh; DOWN="lead"; tx quiet "$MARCUS_Q"; tick
+[[ "$(a2as)" == 1 && "$(sends)" == 0 && "$(cut -d'|' -f1 "$TMP/a2a.log")" == boss ]] \
+  && ok_t "T6: its parent not running: the next running agent up the chain gets it" \
+  || bad_t "T6: chain walk" "a2a=$(cat "$TMP/a2a.log") api=$(cat "$TMP/api.log")"
+fresh; DOWN="boss"; A2A_RC=1; tx quiet "$MARCUS_Q"; tick; A2A_RC=0
+T7_LOG=$(cat "$TMP/hb.log"); tick; T7_N=$(a2as); tick
+[[ "$T7_LOG" == *"agent send to lead FAILED, try 1"* && "$T7_N" == 1 && "$(a2as)" == 0 && "$(sends)" == 0 ]] \
+  && ok_t "T7: a failed agent send is retried on the next tick, lands, and is not sent a third time" \
+  || bad_t "T7: agent-route retry" "log=$T7_LOG second=$T7_N third=$(a2as)"
+opt_in; fresh; RX_RESP='{"choice":"report","confidence":0.93}'; tx quiet "$RHETORICAL"; tick
+[[ "$(calls)" == 1 && "$(a2as)" == 0 && "$(sends)" == 0 ]] \
+  && ok_t "T8: reflex holding a report still suppresses the agent route" \
+  || bad_t "T8: reflex before the route" "calls=$(calls) a2a=$(a2as)"
+opt_out; RX_RESP='{"choice":"asks_human","confidence":0.95}'; DOWN="lead boss"
+
+# --- Q) [b] a person gets the ask only ------------------------------------------------------------------
+fresh; tx quiet "$OPS_Q"; tick
+[[ "$(sends)" == 1 && "$(ASK_OF)" == "Decision for you: should I file this as a high row and open the PR?" ]] \
+  && ok_t "Q1: nobody running above it: the phone gets the final paragraph, markdown stripped, nothing else" \
+  || bad_t "Q1: plain ask" "got: $(ASK_OF | head -c 300)"
+fresh; tx quiet "$LONG_PARA"; tick
+Q2=$(ASK_OF)
+[[ "$Q2" == "Should I ship it to all sixteen seats tonight, or only to claude-swan first?"* ]] \
+  && (( $(wc -w <<<"$Q2") <= 60 )) && [[ "$Q2" != *…* ]] \
+  && ok_t "Q2: a final paragraph over 60 words starts at its asking sentence and keeps whole sentences ($(wc -w <<<"$Q2") words)" \
+  || bad_t "Q2: long paragraph" "got ($(wc -w <<<"$Q2") words): $Q2"
+Q3=$(_hb_stuck_q_plain_ask $'## Heads up\n- see [the PR](https://example.com/pr/1) and `a.sh`\n- **Can you** merge it?')
+[[ "$Q3" == "Heads up see the PR and a.sh Can you merge it?" ]] \
+  && ok_t "Q3: links, code spans, bold, bullets and newlines are stripped to one plain line" \
+  || bad_t "Q3: markdown strip" "$Q3"
+
+# --- X) [c] a 1500+ char turn never opens mid-word ---------------------------------------------------------
+(( ${#OPS_Q} > _HB_STUCK_Q_TEXT_MAX + 200 )) || bad_t "X0: fixture" "OPS_Q is only ${#OPS_Q} chars"
+fresh; DOWN="boss"; tx quiet "$OPS_Q"; tick; DOWN="lead boss"
+X_MSG=$(cat "$TMP/a2a.last"); X_MSG="${X_MSG#*Its last words:$'\n\n'}"; X_MSG="${X_MSG%$'\n\n'Answer with*}"
+[[ "$X_MSG" != …* && "$X_MSG" == "**Finding "* && "$OPS_Q" == *$'\n\n'"$X_MSG" ]] && (( ${#X_MSG} <= _HB_STUCK_Q_TEXT_MAX )) \
+  && ok_t "X1: the lead's copy of a ${#OPS_Q}-char turn starts at a paragraph start (${#X_MSG} chars), no '…'" \
+  || bad_t "X1: agent tail" "starts: $(head -c 80 <<<"$X_MSG")"
+fresh; tx quiet "$OPS_Q"; tick
+[[ "$(ASK_OF)" != …* ]] && ! has "$(ASK_OF)" "t-watch" \
+  && ok_t "X2: the phone's copy of the same turn has no '…' prefix and no mid-word fragment" \
+  || bad_t "X2: human text" "$(ASK_OF | head -c 120)"
+ONE_PARA="$(for i in $(seq 1 60); do printf 'Sentence number %s is about the watcher. ' "$i"; done)Can you look?"
+X3=$(_hb_stuck_q_tail "$ONE_PARA" "$_HB_STUCK_Q_TEXT_MAX")
+[[ "$X3" == "Sentence number "* && "$ONE_PARA" == *". $X3" && "$X3" == *"Can you look?" ]] \
+  && ok_t "X3: one paragraph over the cap is cut at a sentence start (${#X3} chars)" \
+  || bad_t "X3: sentence cut" "starts: $(head -c 80 <<<"$X3")"
 
 # --- M) MUTANTS -------------------------------------------------------------------------------------------
 # M1 re-introduces the defect in-process: the sweep looks only at seats a person
@@ -494,6 +612,80 @@ U_MUT=$(sends)
   && ok_t "M3: MUTANT (marked judged before the send): the failed send and the unpaired question are lost — S2 and U2 go red" \
   || bad_t "M3: mutant must lose the retry" "send-fail retry sends=$S_MUT re-pair sends=$U_MUT"
 eval "$SWEEP_SRC"
+
+# Z) DIVE-5113 iteration 2: the forward must SURVIVE THE REAL SPOOL. cmd_send is
+# stubbed above, so nothing here would see a busy lead's spool delete the
+# question at drain. _a2a_stale_nudge_reason is the drop predicate, run UNSTUBBED
+# against this harness's tasks db on the envelope cmd_send renders around the
+# sweep's own send. The seat's words name its own row (on quiet, not the lead)
+# and a done row: the two drop reasons a task-engine envelope would hit.
+# One ident per LINE: the predicate's `grep -m1 -o` returns every ident on the
+# first matching line, and two of them make a lookup that finds no row and fails
+# open, which would let Z2 pass without the envelope doing anything (Z0 catches it).
+SEAT_ROW_Q="Watcher on DIVE-4990 disarmed itself on 09-05.
+
+Should I file this as a high row and open the PR?"
+DONE_ROW_Q="DIVE-4991 closed, but its watcher never re-armed.
+
+Should I reopen it or file a new row?"
+db "INSERT INTO tasks(ident, title, status, assignee) VALUES
+      ('DIVE-4990', 'watcher', 'in_progress', 'quiet'), ('DIVE-4991', 'old watcher', 'done', 'quiet');" >/dev/null
+spooled() { # [from] — the envelope cmd_send renders around the sweep's last send
+  local from="${1:-$(tail -1 "$TMP/a2a.log" | cut -d'|' -f2)}"
+  printf '[5dive-msg from=%s id=m-5113 tier=root] %s' "$from" "$(cat "$TMP/a2a.last")"
+}
+verdict() { # <payload> -> "deliver" or "DROP: <reason>"
+  local r; if r=$(_a2a_stale_nudge_reason lead "$1"); then printf 'DROP: %s' "$r"; else printf 'deliver'; fi
+}
+opt_out; fresh; DOWN="boss"; tx quiet "$SEAT_ROW_Q"; tick; DOWN="lead boss"
+Z_FROM=$(tail -1 "$TMP/a2a.log" | cut -d'|' -f2); Z_OWN=$(verdict "$(spooled)")
+Z_CTRL_OWN=$(verdict "$(spooled task-engine)")
+opt_out; fresh; DOWN="boss"; tx quiet "$DONE_ROW_Q"; tick; DOWN="lead boss"
+Z_DONE=$(verdict "$(spooled)"); Z_CTRL_DONE=$(verdict "$(spooled task-engine)")
+[[ "$Z_CTRL_OWN" == "DROP: DIVE-4990 is now on quiet" && "$Z_CTRL_DONE" == "DROP: DIVE-4991 is done" ]] \
+  && ok_t "Z0: (control) the live predicate DROPS this very text under from=task-engine, for both reasons" \
+  || bad_t "Z0: the predicate must drop the task-engine envelope" "own=$Z_CTRL_OWN done=$Z_CTRL_DONE"
+valid_sender_label "$Z_FROM" && [[ "$Z_FROM" != task-engine \
+    && "$(envelope_peer_forgery "$Z_FROM" root)" == ok:synthetic-label ]] \
+  && ok_t "Z1: the forward's sender '$Z_FROM' is a valid synthetic label the forgery guard lets root claim" \
+  || bad_t "Z1: sender label" "from=$Z_FROM forgery=$(envelope_peer_forgery "$Z_FROM" root)"
+[[ "$Z_OWN" == deliver ]] \
+  && ok_t "Z2: the real payload naming the seat's own row (on another seat than the lead) is DELIVERED at drain" \
+  || bad_t "Z2: own-row forward must be delivered" "$Z_OWN"
+[[ "$Z_DONE" == deliver ]] \
+  && ok_t "Z3: the real payload naming a done row is DELIVERED at drain" \
+  || bad_t "Z3: done-row forward must be delivered" "$Z_DONE"
+
+# V) DIVE-5113 mutants: the pre-5113 route and the pre-5113 text.
+eval "$(sed 's/if lead=\$(_hb_stuck_q_lead "\$name"); then/if false; then/' <<<"$SWEEP_SRC")"
+has "$(declare -f _hb_stuck_question_sweep)" 'if false; then' \
+  && ok_t "V0: (anchor) the no-agent-lead mutation landed" \
+  || bad_t "V0: route mutation anchor" "the sed pattern no longer matches src/cmd_heartbeat.sh"
+opt_out; fresh; DOWN="boss"; tx quiet "$MARCUS_Q"; tick; DOWN="lead boss"
+[[ "$(a2as)" == 0 && "$(sends)" == 1 ]] \
+  && ok_t "V1: MUTANT (old route): the running lead is skipped and the phone is paged — T1 goes red" \
+  || bad_t "V1: mutant must page the person" "a2a=$(a2as) sends=$(sends)"
+eval "$(sed 's/ask=\$(_hb_stuck_q_plain_ask "\$full")/ask="$text"/' <<<"$SWEEP_SRC")"
+has "$(declare -f _hb_stuck_question_sweep)" 'ask="$text"' \
+  && ok_t "V0b: (anchor) the raw-tail mutation landed" \
+  || bad_t "V0b: text mutation anchor" "the sed pattern no longer matches src/cmd_heartbeat.sh"
+fresh; tx quiet "$OPS_Q"; tick
+[[ "$(ASK_OF)" == …* ]] && has "$(ASK_OF)" "**" \
+  && ok_t "V2: MUTANT (old text): the phone gets a '…'-prefixed markdown tail — Q1 and X2 go red" \
+  || bad_t "V2: mutant must send the raw tail" "$(ASK_OF | head -c 120)"
+eval "$SWEEP_SRC"
+# V3: iteration 1's envelope. The same sweep, the same text, sent as task-engine.
+SEND_SRC=$(declare -f _hb_stuck_q_agent_send)
+eval "$(sed 's/--from="\$_HB_STUCK_Q_SENDER"/--from="task-engine"/' <<<"$SEND_SRC")"
+has "$(declare -f _hb_stuck_q_agent_send)" '--from="task-engine"' \
+  && ok_t "V0c: (anchor) the task-engine envelope mutation landed" \
+  || bad_t "V0c: envelope mutation anchor" "the sed pattern no longer matches src/cmd_heartbeat.sh"
+opt_out; fresh; DOWN="boss"; tx quiet "$SEAT_ROW_Q"; tick; V3_OWN=$(verdict "$(spooled)")
+fresh; tx quiet "$DONE_ROW_Q"; tick; V3_DONE=$(verdict "$(spooled)"); DOWN="lead boss"
+[[ "$V3_OWN" == DROP:* && "$V3_DONE" == DROP:* ]] \
+  && ok_t "V3: MUTANT (from=task-engine): the lead's spool drops the question — Z2 and Z3 go red" \
+  || bad_t "V3: mutant must be dropped" "own=$V3_OWN done=$V3_DONE"
+eval "$SEND_SRC"
 
 echo "-----"
 printf 'PASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
