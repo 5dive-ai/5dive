@@ -28,7 +28,10 @@ usage_window_secs() {
 #   {window:{since,now}, agents:[{name,account,models:{<model>:{in,out,cc,cr,turns}},
 #            total,output,sevenDayPct,fiveHourPct}],
 #    tasks:[{ident,title,assignee,total,output,turns}],
-#    untracked:{<assignee>:{total,output}}}
+#    untracked:{<assignee>:{total,quota,output,turns}}}
+# untracked = turns in no /goal dispatch span (DIVE-5090), rendered as
+# "unattributed". For a claude agent, its tasks[] rows plus its untracked entry
+# sum exactly to its agents[] row: every turn lands in one place.
 # All token fields are raw integers; the presentation layer formats + sorts.
 usage_collect() {
   local since="$1" db
@@ -320,19 +323,18 @@ def codex_window_deltas(last_usage, pre_usage, fields):
     return out
 
 # --- scan transcripts: per agent per model token sums + per-turn timeline ---
-# turns[name] = list of (epoch, out_tokens, total_tokens) for task attribution.
+# turns[name] = list of (epoch, out, total, quota, cacheRead, sessionId) for
+# task attribution.
 agent_rows = []
 turns_by_agent = {}
-# goal_pins[name] = {"DIVE-N", ...} — task idents named in a USER turn, inside
-# the reporting window, by the heartbeat's /goal nudge (cmd_heartbeat.sh's
-# templates: the legacy "/goal Task DIVE-N shows status …" and, since DIVE-4406,
-# "/goal DIVE-N — your only row this turn …"; both are matched). Cross-check for the
-# attribution below (DIVE-2058): it comes from message CONTENT inside THIS
-# window, not from the tasks table's started_at/done_at (which is what built
-# the window in the first place) and not from heartbeat.log (the subsystem
-# under suspicion in the incident this fixes) — an independently-sourced,
-# independently-timed signal. Same [since,now] scan as the usage turns below,
-# so no extra file I/O pass.
+# goal_pins[name][sessionId] = [(epoch, "DIVE-N"), ...] — every heartbeat /goal
+# nudge (cmd_heartbeat.sh's templates: the legacy "/goal Task DIVE-N shows
+# status …" and, since DIVE-4406, "/goal DIVE-N — your only row this turn …";
+# both are matched) found in a transcript this read opens, keyed by the SESSION
+# it arrived in. DIVE-5090: these pins are the attribution itself, not a
+# cross-check on it — see "task attribution" below. Pins from BEFORE the
+# reporting window are kept, because a session dispatched at 23:50 and still
+# working at 00:10 owes its in-window turns to that 23:50 dispatch.
 goal_pins = {}
 for name, meta in agents.items():
     home = home_of(name)
@@ -346,7 +348,7 @@ for name, meta in agents.items():
         continue
     models = {}
     turns = []
-    pins = set()
+    pins = {}
     denied = None
     # DIVE-3419: a middle level we could not read makes this agent a blind spot,
     # not a low scorer. Same destination as an unreadable home or file — never a
@@ -476,6 +478,15 @@ for name, meta in agents.items():
             # a task attribution at the rollout's final timestamp.
             continue
 
+        # DIVE-5090: the session this file belongs to — its basename, or for a
+        # subagent's file (<sid>/subagents/*.jsonl, DIVE-3468) the parent's, so
+        # a sidechain turn finds the dispatch that opened its parent. The line's
+        # own `sessionId` says the same thing: 520 of 520 transcripts on this
+        # host, 2026-09-28, never carried one that differed from the filename.
+        _parent = os.path.dirname(path)
+        sid = (os.path.basename(os.path.dirname(_parent))
+               if os.path.basename(_parent) == "subagents"
+               else os.path.basename(path)[:-len(".jsonl")])
         with f:
             for line in f:
                 # Match ONLY the heartbeat's fixed nudge phrasing (cmd_heartbeat.sh:
@@ -500,12 +511,23 @@ for name, meta in agents.items():
                         po = None
                     if po is not None and po.get("type") == "user":
                         pts = to_epoch(po.get("timestamp"))
-                        if pts is not None and pts >= since:
+                        # DIVE-5090: no `>= since` here. A dispatch before the
+                        # window still owns the in-window turns that follow it.
+                        if pts is not None:
                             pmsg = po.get("message") or {}
                             pcontent = pmsg.get("content")
                             if isinstance(pcontent, str):
-                                pins.update(re.findall(r"Task (DIVE-\d+) shows status done or cancelled", pcontent))
-                                pins.update(re.findall(r"/goal (DIVE-\d+)\s*\S?\s*your only row this turn", pcontent))
+                                named = (re.findall(r"Task ([A-Z][A-Z0-9]*-\d+) shows status done or cancelled", pcontent)
+                                         + re.findall(r"/goal ([A-Z][A-Z0-9]*-\d+)\s*\S?\s*your only row this turn", pcontent))
+                                # Any board prefix, not just DIVE: a customer
+                                # board's rows are OINOA-N, and once the pin IS
+                                # the attribution a DIVE-only match sends a whole
+                                # seat's work to "unattributed" (DIVE-5090).
+                                if named:
+                                    # One nudge names one row; if a pasted
+                                    # message somehow names two, the first is
+                                    # the dispatch and the rest are quotes.
+                                    pins.setdefault(sid, []).append((pts, named[0]))
                 if '"usage"' not in line or '"assistant"' not in line:
                     continue
                 try:
@@ -535,7 +557,7 @@ for name, meta in agents.items():
                 # board reports it (it is ~97% of a plan's meter), and like the
                 # two bases above it cannot be re-split out of a sum computed
                 # after the fact.
-                turns.append((ts, ot, i+ot+cc, i+ot+cc+cr, cr))
+                turns.append((ts, ot, i+ot+cc, i+ot+cc+cr, cr, sid))
     if pins:
         goal_pins[name] = pins
     # A partial read of ONE agent still makes the company total partial: the row
@@ -594,37 +616,90 @@ for name, meta in agents.items():
     })
     turns_by_agent[name] = sorted(turns)
 
-# --- task attribution: assign each turn to the task open for that assignee ---
+# --- task attribution: each turn goes to the /goal dispatch that opened its span ---
+# DIVE-5090. The old join gave every turn to the newest-started row whose
+# [started_at, done_at-or-now] window contained it. Both ends of that window were
+# wrong in the same direction: `started_at` is re-stamped on every re-start, so a
+# row worked across five wakes kept only its LAST span (DIVE-5082: 84 s), and a
+# `blocked` row never gets `done_at`, so its window ran to `now` forever and
+# caught every turn the short windows missed. DIVE-4930, parked on a gate since
+# 2026-09-24, was charged 10.3M of dev's 10.5M on 2026-09-27. DIVE-2058 only
+# FLAGGED that number; it still printed first.
+#
+# A span now opens at a /goal nudge and covers only turns of the SAME SESSION
+# after it, until the first of:
+#   - the next /goal nudge in that session (another row, or the same row again),
+#   - the row's done_at / delivered_at / parked_at, or its gate's need_asked_at
+#     while that gate is still unanswered — each only when it is AFTER the nudge,
+#     since those columns hold the LATEST event and an older span is closed by
+#     its own next nudge instead.
+# A turn in no span — a session nobody dispatched, the wrap-up after `task need`,
+# a human talking to the seat — goes to `untracked[agent]` (rendered as
+# "unattributed"). It is never handed to a row, so a parked row accrues nothing
+# once its session ends, and tasks[] + untracked sum to the agent's own total.
+#
+# Why sessions and not the agent's whole timeline: a seat can run two sessions
+# at once (a consolidate pass, a second pane), and a nudge in one says nothing
+# about the other. Measured on dev 2026-09-28: 40 sessions in 36 h, every one
+# opened with its nudge, 0 tokens before the first nudge in any of them.
 tasks = []
 untracked = {}
 try:
     con = sqlite3.connect(task_db)
     con.row_factory = sqlite3.Row
-    rows = con.execute(
-        "SELECT ident,title,assignee,started_at,done_at,iteration,status FROM tasks "
-        "WHERE started_at IS NOT NULL AND assignee IS NOT NULL"
-    ).fetchall()
+    # A column this board lacks reads as NULL rather than failing the whole
+    # select: a pre-migration board must still get its titles, and losing one
+    # close event only lets a span run to its session's end.
+    have = {c[1] for c in con.execute("PRAGMA table_info(tasks)")}
+    want = ("ident", "title", "iteration", "status", "done_at", "delivered_at",
+            "parked_at", "need_asked_at", "need_answered_at")
+    rows = con.execute("SELECT " + ",".join(c if c in have else "NULL AS " + c for c in want)
+                       + " FROM tasks").fetchall()
     con.close()
 except Exception:
     rows = []
-
-# windows per assignee, newest-started first (so an overlapping turn lands on
-# the most-recently-started task).
-wins = {}
+task_meta = {}
 for r in rows:
-    a = r["assignee"]
-    s = to_epoch(r["started_at"])
-    if s is None:
-        continue
-    e = to_epoch(r["done_at"]) or now
-    wins.setdefault(a, []).append({
-        "ident": r["ident"], "title": r["title"] or "",
-        "start": s, "end": e, "total": 0, "quota": 0, "output": 0, "turns": 0,
+    closes = [to_epoch(r["done_at"]), to_epoch(r["delivered_at"]), to_epoch(r["parked_at"])]
+    if r["need_asked_at"] and not r["need_answered_at"]:
+        closes.append(to_epoch(r["need_asked_at"]))
+    task_meta[r["ident"]] = {
+        "title": r["title"] or "",
         "iteration": r["iteration"],   # DIVE-478: maker→verifier loop round (NULL if not a loop)
         "status": r["status"],
-    })
-for a in wins:
-    wins[a].sort(key=lambda w: w["start"], reverse=True)
+        "closes": sorted(c for c in closes if c is not None),
+    }
+
+def _spans(pins):
+    """[(start, end, ident)] for one session's nudges, oldest first. `end` is the
+    row's first close at or after the nudge, or None. The NEXT nudge needs no
+    end of its own: span_at takes the latest nudge at or before a turn."""
+    out = []
+    for start, ident in sorted(pins):
+        end = next((c for c in (task_meta.get(ident) or {}).get("closes", [])
+                    if c >= start), None)
+        out.append((start, end, ident))
+    return out
+
+span_index = {}   # name -> sessionId -> ([starts], [spans])
+for name, by_sid in goal_pins.items():
+    for sid, pins in by_sid.items():
+        sp = _spans(pins)
+        span_index.setdefault(name, {})[sid] = ([x[0] for x in sp], sp)
+
+def span_at(name, sid, ts):
+    idx = (span_index.get(name) or {}).get(sid)
+    if not idx:
+        return None
+    k = bisect.bisect_right(idx[0], ts)
+    if not k:
+        return None                     # before this session's first nudge
+    start, end, ident = idx[1][k-1]
+    if end is not None and ts >= end:
+        return None                     # the span closed before this turn
+    return ident
+
+task_rows = {}    # (agent, ident) -> row
 
 # --- historical auth-profile attribution (DIVE-4589) -----------------------
 # The binding trail, oldest first per agent. A turn is attributed to the binding
@@ -694,18 +769,21 @@ def _sub(d, key, ts_hint=None):
                               "output": 0, "cacheRead": 0, "turns": 0})
 
 for name, turns in turns_by_agent.items():
-    ws = wins.get(name, [])
-    for ts, out, tot, qta, cr in turns:
+    for ts, out, tot, qta, cr, sid in turns:
         hit = None
-        for w in ws:
-            if w["start"] <= ts <= w["end"]:
-                hit = w
-                break
-        if hit:
+        ident = span_at(name, sid, ts)
+        if ident:
+            hit = task_rows.get((name, ident))
+            if hit is None:
+                tm = task_meta.get(ident) or {}
+                hit = task_rows[(name, ident)] = {
+                    "ident": ident, "title": tm.get("title", ""),
+                    "total": 0, "quota": 0, "output": 0, "turns": 0,
+                    "iteration": tm.get("iteration"), "status": tm.get("status")}
             hit["total"]+=tot; hit["quota"]+=qta; hit["output"]+=out; hit["turns"]+=1
         else:
-            u = untracked.setdefault(name, {"total":0,"quota":0,"output":0})
-            u["total"]+=tot; u["quota"]+=qta; u["output"]+=out
+            u = untracked.setdefault(name, {"total":0,"quota":0,"output":0,"turns":0})
+            u["total"]+=tot; u["quota"]+=qta; u["output"]+=out; u["turns"]+=1
         # Per-turn account attribution. Same single walk as the task attribution
         # above, deliberately: a turn is read once, and the account and the task
         # it lands on are decided from the SAME timestamp. A task that spans a
@@ -726,59 +804,26 @@ for name, turns in turns_by_agent.items():
             tb["total"]+=tot; tb["quota"]+=qta; tb["output"]+=out
             tb["cacheRead"]+=cr; tb["turns"]+=1
 
-# --- dispatch cross-check (DIVE-2058, FALSIFIABLE INVARIANT) ---------------
-# "Every usage-attributed token window must intersect at least one DISPATCH
-# of that task" (olivia, verifier review). The window here is the REPORTING
-# window (since..now, i.e. the --24h/--7d the reader is looking at) — not the
-# task's own started_at..done_at span, which is exactly what let DIVE-1817
-# (dispatched once, three days before this window opened) swallow three days
-# of a different, never-`task start`-ed task's turns and still read as
-# "actively worked". A row whose ident has no /goal pin anywhere in [since,now]
-# is FLAGGED, not reported as a confident number. If an agent has NO pins at
-# all in [since,now] (older transcript format, or dispatched some other way),
-# there is no signal to check against — leave `dispatched` as None (unknown)
-# rather than accusing every row: a partial read must not render as a
-# confident number (DIVE-1929/1937), and that cuts both ways — it must not
-# render as a confident accusation either.
-#
-# NEVER flag a task whose status is 'in_progress': the heartbeat only sends
-# the fixed /goal nudge on the todo->in_progress transition (never re-nudges
-# an already-started task — see cmd_heartbeat.sh's status='todo' dispatch
-# predicate), so a genuinely still-active task worked continuously past the
-# reporting window's start, OR started via a path other than the heartbeat
-# nudge (a human/admin instructing an already-live session directly — real
-# and observed on this fleet), can legitimately carry zero in-window pins.
-# 'blocked' is exactly the opposite case and the one this ticket targets: a
-# blocked task stays in the assignee's heartbeat rotation until
-# `task park --wake` (status alone does not remove it — see
-# community/wiki/gated-task-burns-no-park-lever.md), a confirmed mechanism by
-# which its open window keeps absorbing turns, so an absent pin there is
-# signal with a known cause, not noise. (INFERRED, not measured, from live
-# fleet config 2026-07-26 — flagging the distinction per olivia's review:
-# every currently-enrolled agent's heartbeat everyMin is 5-30min and the
-# hard-cap reaper force-closes in_progress at 3x that (cmd_heartbeat.sh
-# _HB_STALE_MULT) — well under the 24h default window — so under
-# heartbeat-only dispatch this case is near-empty today. That is a deduction
-# from config values, not an observation of zero false positives in
-# practice, and a direct human/admin dispatch bypasses the nudge path
-# entirely and is not provable false by timing regardless — hence the status
-# carve-out rather than relying on timing.)
-for a in wins:
-    have_signal = bool(goal_pins.get(a))
-    pinned_idents = goal_pins.get(a, set())
-    for w in wins[a]:
-        if w["turns"]:
-            has_pin = w["ident"] in pinned_idents
-            if not have_signal:
-                dispatched = None
-            elif w.get("status") == "in_progress":
-                dispatched = True if has_pin else None
-            else:
-                dispatched = has_pin
-            tasks.append({"ident":w["ident"],"title":w["title"],"assignee":a,
-                          "total":w["total"],"quota":w["quota"],
-                          "output":w["output"],"turns":w["turns"],
-                          "iteration":w["iteration"],"dispatched":dispatched})
+# --- task rows ---------------------------------------------------------------
+# `dispatched` stays in the payload because two readers key on it: the
+# `~N(unverified)` render (DIVE-2058/2312) and the per-row budget guard, which
+# charges ONLY `dispatched == true` (cmd_heartbeat.sh _hb_task_verified_quota).
+# Since DIVE-5090 a row exists only because a /goal dispatch opened the span its
+# turns sit in, so the cross-check DIVE-2058 ran after the fact is now true by
+# construction — a turn with no dispatch never reaches a row at all.
+for name, row in ((r["name"], r) for r in agent_rows):
+    # A Codex seat has no per-turn timeline (cumulative rollout snapshots, see
+    # above), so none of it can reach a row. Its whole total is unattributed,
+    # which keeps "tasks + unattributed = the agent's row" true for every seat.
+    if (agents.get(name) or {}).get("type", "claude") == "codex":
+        untracked[name] = {"total": row["total"], "quota": row["quota"],
+                           "output": row["output"],
+                           "turns": sum(m["turns"] for m in row["models"].values())}
+for (name, ident), w in task_rows.items():
+    tasks.append({"ident": ident, "title": w["title"], "assignee": name,
+                  "total": w["total"], "quota": w["quota"],
+                  "output": w["output"], "turns": w["turns"],
+                  "iteration": w["iteration"], "dispatched": True})
 
 # --- provider quota snapshots + anomaly diagnostics (DIVE-4589 sections 2/4) ---
 # The samples are the history that <profile>/usage.json and account-usage.json
@@ -1308,6 +1353,17 @@ usage_render_board() {
     echo "  ⚠ ${flagged} row(s) above are marked ~N(unverified): tokens attributed to a task with no /goal dispatch found in its window — likely misattributed. Do not quote those figures as fact (see DIVE-2058, DIVE-2312)."
   fi
 
+  # DIVE-5090: the turns no dispatch owns are printed, not dropped. Before this
+  # line they had nowhere to be seen, which is how they ended up on a row.
+  local unattr
+  unattr=$(jq -r "$USAGE_JQ_HELPERS"'
+    [(.untracked // {}) | to_entries[] | select((.value.total // 0) > 0)]
+    | sort_by(-.value.total)
+    | if length == 0 then empty
+      else "  unattributed (turns in no /goal dispatch span, API-EQ): "
+           + (map(.key + " " + (.value.total|htok)) | join(" · ")) end' <<<"$data" 2>/dev/null)
+  [[ -n "$unattr" ]] && echo "$unattr"
+
   # over-budget callout: ⚠ at the soft cap, ⛔ at the ceiling (see `5dive cost`).
   local over
   over=$(jq -r "$USAGE_BNORM"'
@@ -1391,7 +1447,9 @@ usage_render_agent() {
     if (.tasks | map(select(.assignee==$n)) | length) == 0 then "    (none attributed)"
     else (.tasks | map(select(.assignee==$n)) | sort_by(-.total)[] |
       (.dispatched == false) as $unv |
-      "    " + .ident + (if $unv then " ⚠" else "" end) + "  " + (.total|qtok($unv)) + "  " + .title) end
+      "    " + .ident + (if $unv then " ⚠" else "" end) + "  " + (.total|qtok($unv)) + "  " + .title) end,
+    (.untracked[$n] // null | if . == null or (.total // 0) == 0 then empty
+     else "    (unattributed)  " + (.total|htok) + "  turns in no /goal dispatch span" end)
     ' --arg n "$agent" <<<"$data"
 }
 
