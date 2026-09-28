@@ -71,6 +71,11 @@ turn() {  # <agent> <epoch>
   printf '%s\n' "{\"type\":\"assistant\",\"timestamp\":\"$(iso "$2")\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"cache_creation_input_tokens\":250,\"cache_read_input_tokens\":39600}}}" \
     >> "$d/session.jsonl"
 }
+# DIVE-5090: a turn belongs to a row only inside a /goal dispatch span, so the
+# seat's session opens with the heartbeat's nudge for DIVE-9001.
+mkdir -p "$R/agent-coder/.claude/projects/proj"
+printf '%s\n' "{\"type\":\"user\",\"timestamp\":\"$(iso $((T0-600)))\",\"message\":{\"role\":\"user\",\"content\":\"/goal DIVE-9001 — your only row this turn; read it with 5dive task show DIVE-9001.\"}}" \
+  >> "$R/agent-coder/.claude/projects/proj/session.jsonl"
 turn coder $((T0+60))    # bound to max-a then
 turn coder $((T1+60))    # bound to max-b then — SAME seat, SAME task
 turn quinn $((T2+60))    # a second seat on max-b

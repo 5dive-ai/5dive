@@ -81,6 +81,9 @@ mk_agent() {
 
 printf '{"agents":{"alpha":{"type":"claude"}}}' > "$TMP/reg.json"
 R="$TMP/homes"; mkdir -p "$R"; mk_agent "$R" alpha
+# DIVE-5090: attribution follows the /goal dispatch, so the session opens with one.
+sed -i "1i {\"type\":\"user\",\"timestamp\":\"$(date -u -d @$((NOW-600)) +%Y-%m-%dT%H:%M:%SZ)\",\"message\":{\"role\":\"user\",\"content\":\"/goal DIVE-9001 — your only row this turn; read it.\"}}" \
+  "$R/agent-alpha/.claude/projects/proj/session.jsonl"
 
 # a task open for alpha across the window, so attribution has somewhere to land
 DB="$TMP/tasks.db"
@@ -121,7 +124,9 @@ OUT="$(REGISTRY="$TMP/reg.json" TASK_DB="$DB" USAGE_SINCE="$((NOW-3600))" \
   && ok_t "collector: per-TASK rows carry both bases (400 / 40000)" \
   || bad_t "task attribution lost the quota basis" "$(jq -c '.tasks' <<<"$OUT")"
 
-# A6. and so does the untracked bucket (turns outside any task window).
+# A6. and so does the untracked bucket (turns outside any task window). Since
+#     DIVE-5090 that means a turn no /goal dispatch opened, so the pin goes.
+sed -i '1d' "$R/agent-alpha/.claude/projects/proj/session.jsonl"
 OUT_U="$(REGISTRY="$TMP/reg.json" TASK_DB="$TMP/empty.db" USAGE_SINCE="$((NOW-3600))" \
          USAGE_HOME_ROOT="$R" python3 "$TMP/collect.py" 2>/dev/null)"
 [[ "$(jq -r '.untracked.alpha.quota' <<<"$OUT_U")" == "40000" ]] \

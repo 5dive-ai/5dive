@@ -1,52 +1,30 @@
 #!/usr/bin/env bash
-# DIVE-2058 unit harness for the usage TOP TASKS misattribution flag.
+# Per-task usage attribution: a turn belongs to the /goal dispatch that opened
+# its span, never to whichever row's [started_at, now] window happens to be open.
 #
-# Bug reproduced: usage_collect's task attribution assigns a turn to whichever
-# task-window [started_at, done_at-or-now] for that assignee contains the
-# turn's timestamp, newest-started-first. A task that never closes (blocked —
-# done_at stays NULL forever) leaves its window open-ended, so it silently
-# absorbs every later turn from a task that was NEVER `task start`-ed (e.g.
-# dispatched via a /goal nudge the agent hadn't yet claimed) — no error, no
-# indication, just a wrong number under the wrong ident. Live incident:
-# DIVE-1817 (blocked since 2026-07-23, one dispatch, 3 days before the window)
-# read as a confident 13.8M-token row while the actual work (DIVE-2007/2039)
-# had no window of its own at all. See community/wiki/gated-task-burns-no-park-lever.md.
+# History of the subject this harness owns:
+#   DIVE-2058 (2026-07-26) — a BLOCKED row's window never closes (done_at stays
+#     NULL), so it swallowed a later row's turns: DIVE-1817 read 13.8M. The fix
+#     then only FLAGGED the row (`dispatched:false`).
+#   DIVE-2312 — the flag was not enough, so the flagged figure renders in-cell
+#     as `~N(unverified)`. The render half below still grades that.
+#   DIVE-5090 (2026-09-27) — the flag was still not enough. DIVE-4930, parked on
+#     a gate since 2026-09-24, was charged 10.3M of dev's 10.5M and ranked first;
+#     lodar asked why a parked row was burning. And the window was wrong at the
+#     other end too: `started_at` is re-stamped on every re-start, so a row
+#     worked in five wakes kept only its last 84 s. The collector now attributes
+#     by dispatch span (same session, from the nudge to the next nudge or the
+#     row's close) and puts every other turn in `untracked`.
 #
-# Fix under test: usage_collect cross-checks each attributed row's ident
-# against /goal pins (the literal task ident named in the heartbeat's fixed
-# nudge template) found in that agent's transcripts WITHIN THE REPORTING
-# WINDOW (since..now) — independent of the started_at/done_at columns used to
-# build the window, and independent of heartbeat.log. Zero pins for that ident
-# in the window => dispatched=false => the CLI flags the row (⚠) instead of
-# printing it as a confident number.
+# The fixture is the ACCEPT shape from DIVE-5090: a row blocked on a gate since
+# before the window, a later row worked in two iterations (the second re-stamps
+# started_at), plus the edge cases each design choice rests on.
 #
-# DIVE-2312 (second half of this harness): flagging the ROW turned out not to be
-# enough — the ⚠ and the footer caveat both rendered correctly and three readers
-# in a row still lifted the number beside them as fact, one of them the author of
-# the note warning about it. So the figure itself is now qualified in-cell
-# (`~5.1M(unverified)`), and the assertions at the bottom grade the property that
-# actually matters: a flagged figure never appears as a standalone
-# whitespace-delimited field, which is the token a reader quotes.
-#
-# Isolation (rewritten, DIVE-2069): tasks.db AND the agent-home tree both live in
-# a throwaway dir. The premise of the original note here — "the transcript scan
-# can't be redirected via env" — was FALSE: home_of() has honoured USAGE_HOME_ROOT
-# since DIVE-1929. Seeding into $HOME instead made this harness pass only when run
-# as an agent-* user, and on any box where that broke it did not fail — home_of()
-# fell back to the REAL agent homes and it scored partial marks off the fleet's
-# live transcripts. Nothing to select around now: the tree contains only fixtures,
-# so a real session cannot influence the result whoever runs it.
+# Isolation (DIVE-2069): tasks.db AND the agent-home tree live in a throwaway
+# dir via the USAGE_HOME_ROOT seam; nothing on this box's real homes is read.
 # Run: bash tests/usage_dispatch_flag_unit.sh  (no sudo, no network).
 set -uo pipefail
 
-# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
-# Three-state: if the helper is unreachable (a staged copy that did not carry
-# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
-# `set -e` harness is not killed by a failed source.
-# NOTE the absence of `2>/dev/null`. The obvious hardening -- redirect the
-# source's stderr so bash's "No such file" does not litter the log -- also
-# swallows the helper's own stderr line, which IS the payload. That silenced all
-# 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
@@ -61,240 +39,188 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 set +e
 
-TMP="$(mktemp -d /tmp/usage-dispatch-flag-unit.XXXXXX)"
-AGENT="$(whoami | sed 's/^agent-//')"
-# DIVE-2069: seed into a THROWAWAY agent-home tree via the USAGE_HOME_ROOT seam
-# (which cmd_usage.sh's home_of() already honoured — this harness predated knowing
-# it existed and wrote to $HOME instead). Both halves must agree: the seam makes
-# home_of() return <root>/agent-<name>, so the fixtures go exactly there. Setting
-# the seam WITHOUT moving the fixtures is strictly worse than neither — measured
-# 1 passed / 7 failed, because home_of() then points at an empty tree.
+TMP="$(mktemp -d /tmp/usage-dispatch-spans-unit.XXXXXX)"
+AGENT="coder"
 export USAGE_HOME_ROOT="$TMP/homes"
-HOMEDIR="$USAGE_HOME_ROOT/agent-$AGENT"
-PROJDIR="$HOMEDIR/.claude/projects/dive2058-unittest-$$"
+PROJDIR="$USAGE_HOME_ROOT/agent-$AGENT/.claude/projects/proj"
 mkdir -p "$PROJDIR"
-cleanup() { rm -rf "$TMP"; }
-trap 'rc=$?; cleanup; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path; cleanup() has no $? dependency of its own so wrapping it is safe.
+trap 'rc=$?; rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
 
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 REGISTRY="$TMP/registry.json"
 JSON_MODE=1
 mkdir -p "$TASKS_DIR"
 tasks_db_init
+printf '{"agents":{"%s":{"authProfile":"acctT","type":"claude"}}}' "$AGENT" > "$REGISTRY"
 
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
+eq_t()  { [[ "$2" == "$3" ]] && ok_t "$1" || bad_t "$1" "expected [$2] got [$3]"; }
+abort() { bad_t "$1" "${2:-}"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
 
-# write_fixture <path> <content> — writes, backdates mtime to NOW (callers can
-# re-touch older), then VERIFIES the write actually stuck. olivia's DIVE-2058
-# iteration-1 review caught this box silently losing files written under
-# $HOME/.claude/projects/... (the live harness-managed tree — required, since
-# home_of()'s glob pattern hardcodes it) within seconds of creation, on a path
-# NOT explained by EXIT-trap-in-subshell. A lost fixture must abort loudly,
-# never fall through to an assertion that a zero-data read can also satisfy.
-write_fixture() {
-  local path="$1" content="$2"
-  printf '%s\n' "$content" > "$path"
-  touch -d "@$NOW_EPOCH" "$path"
-  [[ -f "$path" ]] || { bad_t "fixture write survived: $path" "file missing immediately after write"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
-  grep -qF "${content:0:40}" "$path" 2>/dev/null || { bad_t "fixture content survived: $path" "content missing/truncated immediately after write"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
+NOW=$(date +%s)
+SINCE=$(( NOW - 86400 ))
+iso() { date -u -d "@$1" +"%Y-%m-%dT%H:%M:%SZ"; }
+sqlts() { date -u -d "@$1" +'%Y-%m-%d %H:%M:%S'; }
+
+# pin <file> <sessionId> <epoch> <ident>      — the heartbeat's current nudge
+# turn <file> <sessionId> <epoch> <output>    — one assistant turn; API-EQ = out+100
+pin() {
+  printf '%s\n' "{\"type\":\"user\",\"sessionId\":\"$2\",\"timestamp\":\"$(iso "$3")\",\"message\":{\"role\":\"user\",\"content\":\"/goal $4 — your only row this turn; read it with '5dive task show $4'.\"}}" >> "$1"
+}
+turn() {
+  printf '%s\n' "{\"type\":\"assistant\",\"sessionId\":\"$2\",\"timestamp\":\"$(iso "$3")\",\"message\":{\"role\":\"assistant\",\"model\":\"m\",\"usage\":{\"input_tokens\":100,\"output_tokens\":$4,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}" >> "$1"
 }
 
-printf '{"agents":{"%s":{"authProfile":"acctT","type":"claude"}}}' "$AGENT" > "$REGISTRY"
+# --- A: the parked row. Dispatched 3 days ago, gate asked 5 min later and never
+# answered, status blocked, done_at NULL — DIVE-4930's exact state. Its session
+# lives on: a human chats to the seat inside today's window.
+T_A=$(( NOW - 3*86400 )); T_GATE=$(( T_A + 300 ))
+A="$PROJDIR/sA.jsonl"
+pin  "$A" sA "$T_A" DIVE-90001
+turn "$A" sA $(( T_A + 60 )) 7                 # before the window: not counted at all
+# In window, after the gate, and before every later row's start: on the pre-fix
+# join the parked row's open window is the only one containing it.
+turn "$A" sA $(( NOW - 20*3600 )) 1000000       # -> unattributed
+db "INSERT INTO tasks (ident,title,status,assignee,created_by,started_at,first_started_at,need_type,need_asked_at)
+    VALUES ('DIVE-90001','parked on a gate','blocked','$AGENT','main','$(sqlts "$T_A")','$(sqlts "$T_A")','manual','$(sqlts "$T_GATE")');"
 
-# --- fixture clock: NOW is fixed relative to `date`, all timestamps derived from it ---
-NOW_EPOCH=$(date +%s)
-iso() { date -u -d "@$1" +"%Y-%m-%dT%H:%M:%SZ"; }
-SINCE_EPOCH=$(( NOW_EPOCH - 86400 ))          # usage --24h cutoff
-T_DISPATCH_OLD=$(( SINCE_EPOCH - 3*86400 ))   # DIVE-90001's ONE dispatch, 3 days before the window (like DIVE-1817)
-T_STOLEN=$(( NOW_EPOCH - 3600 ))              # DIVE-90002's real (unstarted) work, 1h ago, inside the window
+# --- B: the later row, two iterations in two sessions. Iteration 1 is delivered,
+# rejected, re-woken; the re-start re-stamps started_at to iteration 2's time.
+T_B1=$(( NOW - 5*3600 )); T_B1_DEL=$(( T_B1 + 1800 ))
+T_B2=$(( NOW - 3*3600 ))
+B1="$PROJDIR/sB1.jsonl"; B2="$PROJDIR/sB2.jsonl"
+pin  "$B1" sB1 "$T_B1" DIVE-90002
+turn "$B1" sB1 $(( T_B1 + 60 ))   20000
+turn "$B1" sB1 $(( T_B1 + 600 ))  30000
+pin  "$B2" sB2 "$T_B2" DIVE-90002
+turn "$B2" sB2 $(( T_B2 + 60 ))   40000
+db "INSERT INTO tasks (ident,title,status,assignee,created_by,started_at,first_started_at,iteration)
+    VALUES ('DIVE-90002','later row, two iterations','in_progress','$AGENT','main','$(sqlts "$T_B2")','$(sqlts "$T_B1")',2);"
 
-# DIVE-90001: dispatched once long before the window, then blocked (done_at NULL forever).
-db "INSERT INTO tasks (ident, title, status, assignee, created_by, started_at)
-    VALUES ('DIVE-90001','blocked task with a stale dispatch','blocked','$AGENT','main','$(iso "$T_DISPATCH_OLD")');"
-# DIVE-90002: real work in-window, but NEVER 'task start'-ed — no row at all,
-# exactly like the live DIVE-2039 case (started_at empty). Its turns have
-# nowhere of their own to land.
+# --- C: one session, two rows in sequence (a wake for another row arrives in a
+# live session), then that row is DONE and the seat keeps talking.
+T_C1=$(( NOW - 2*3600 )); T_C2=$(( NOW - 5400 )); T_C2_DONE=$(( T_C2 + 600 ))
+C="$PROJDIR/sC.jsonl"
+pin  "$C" sC "$T_C1" DIVE-90003
+turn "$C" sC $(( T_C1 + 60 ))  500
+pin  "$C" sC "$T_C2" OINOA-7                    # a customer board's prefix
+turn "$C" sC $(( T_C2 + 60 ))  600
+turn "$C" sC $(( T_C2_DONE + 60 )) 700          # after OINOA-7 closed -> unattributed
+db "INSERT INTO tasks (ident,title,status,assignee,created_by,started_at)
+    VALUES ('DIVE-90003','first row in a shared session','in_progress','$AGENT','main','$(sqlts "$T_C1")');"
+db "INSERT INTO tasks (ident,title,status,assignee,created_by,started_at,done_at)
+    VALUES ('OINOA-7','customer-board row','done','$AGENT','main','$(sqlts "$T_C2")','$(sqlts "$T_C2_DONE")');"
 
-# --- transcript: the ORIGINAL /goal dispatch for DIVE-90001 (outside the window) ---
-write_fixture "$PROJDIR/old.jsonl" \
-  "{\"type\":\"user\",\"timestamp\":\"$(iso "$T_DISPATCH_OLD")\",\"message\":{\"role\":\"user\",\"content\":\"/goal Task DIVE-90001 shows status done or cancelled...\"}}"
-touch -d "@$T_DISPATCH_OLD" "$PROJDIR/old.jsonl"
+# --- D: a dispatch from before the window whose session is still working in it.
+T_D=$(( SINCE - 600 ))
+D="$PROJDIR/sD.jsonl"
+pin  "$D" sD "$T_D" DIVE-90004
+turn "$D" sD $(( T_D + 60 ))    9               # before the window: not counted
+turn "$D" sD $(( SINCE + 600 )) 800             # in window, same span -> DIVE-90004
+db "INSERT INTO tasks (ident,title,status,assignee,created_by,started_at,done_at)
+    VALUES ('DIVE-90004','crosses the window start','done','$AGENT','main','$(sqlts "$T_D")','$(sqlts $(( SINCE + 1200 )))');"
 
-# --- transcript: no /goal pin for DIVE-90002 (it was never formally dispatched),
-#     just assistant turns burning tokens inside the window ---
-#
-# DIVE-2069: DIVE-90005's IN-WINDOW pin is load-bearing and must be seeded HERE,
-# before the first read. `dispatched` is a three-state: false means "we saw pins
-# this pass and none was yours", null means "we saw no pins at all, so we cannot
-# say". Without an in-window pin from SOME task the whole read has have_signal=false,
-# DIVE-90001 comes back null, and the three assertions below are unsatisfiable.
-#
-# They passed before this fix only because home_of() was resolving the REAL agent
-# homes, whose live transcripts happen to contain in-window /goal pins — so the
-# fleet's production data was silently supplying this harness's have_signal. That is
-# the DIVE-2069 finding made concrete: not a hypothetical contamination, three named
-# assertions whose green came from outside the fixture set. The pin below is what
-# makes them mean something in an isolated tree.
-write_fixture "$PROJDIR/recent.jsonl" \
-  "{\"type\":\"user\",\"timestamp\":\"$(iso "$T_STOLEN")\",\"message\":{\"role\":\"user\",\"content\":\"/goal DIVE-90005 — your only row this turn; read it with 5dive task show DIVE-90005.\"}}
-{\"type\":\"assistant\",\"timestamp\":\"$(iso "$T_STOLEN")\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":100000,\"output_tokens\":5000000,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}"
+# --- E: a subagent of session B2 — its own file, the PARENT's sessionId (DIVE-3468).
+mkdir -p "$PROJDIR/sB2/subagents"
+turn "$PROJDIR/sB2/subagents/agent-x.jsonl" sB2 $(( T_B2 + 120 )) 50000
 
-# Re-verify immediately before the read too — a fixture that vanished between
-# write and read is exactly as false-green-inducing as one that never landed.
-[[ -f "$PROJDIR/recent.jsonl" && -f "$PROJDIR/old.jsonl" ]] || { bad_t "fixtures still present at read time" "vanished between write and usage_collect"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
+# --- F: a session nobody dispatched (a Telegram chat, a consolidate pass),
+# running WHILE row B's second session is live: a nudge in one session says
+# nothing about another. A tool_result that ECHOES a nudge's text is list-shaped
+# content, not a dispatch, and must not open a span either.
+T_F=$(( T_B2 + 240 ))
+F="$PROJDIR/sF.jsonl"
+printf '%s\n' "{\"type\":\"user\",\"sessionId\":\"sF\",\"timestamp\":\"$(iso "$T_F")\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":\"/goal DIVE-90005 — your only row this turn; read it\"}]}}" >> "$F"
+turn "$F" sF $(( T_F + 60 )) 900
 
-data=$(usage_collect "$SINCE_EPOCH")
-[[ -n "$data" ]] || { bad_t "usage_collect produced output" "empty"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
+# --- G: a gate filed and cleared at once (the push-for-review auto-clear), and
+# the seat keeps working the row in the same session. Only an OPEN gate closes.
+T_G=$(( NOW - 3600 ))
+G="$PROJDIR/sG.jsonl"
+pin  "$G" sG "$T_G" DIVE-90006
+turn "$G" sG $(( T_G + 300 )) 1100
+db "INSERT INTO tasks (ident,title,status,assignee,created_by,started_at,need_type,need_asked_at,need_answered_at)
+    VALUES ('DIVE-90006','gate auto-cleared mid-session','in_progress','$AGENT','main','$(sqlts "$T_G")','approval','$(sqlts $(( T_G + 60 )))','$(sqlts $(( T_G + 61 )))');"
+
+for f in "$A" "$B1" "$B2" "$C" "$D" "$F" "$G" "$PROJDIR/sB2/subagents/agent-x.jsonl"; do
+  [[ -s "$f" ]] || abort "fixture present at read time: $f" "missing or empty"
+done
+
+data=$(usage_collect "$SINCE")
+[[ -n "$data" ]] || abort "usage_collect produced output" "empty"
 ok_t "usage_collect produced JSON"
+task_total() { jq -r --arg i "$1" '[.tasks[]|select(.ident==$i)|.total]|add // 0' <<<"$data"; }
+task_turns() { jq -r --arg i "$1" '[.tasks[]|select(.ident==$i)|.turns]|add // 0' <<<"$data"; }
 
-row=$(jq -c '.tasks[] | select(.ident=="DIVE-90001")' <<<"$data")
-[[ -n "$row" ]] && ok_t "stolen turns land under DIVE-90001 (reproduces the misattribution)" \
-  || bad_t "expected a DIVE-90001 row in .tasks" "$(jq -c '.tasks' <<<"$data")"
+# Precondition: the read genuinely saw the fixture (a lost fixture reads as
+# "0 everywhere", which is what the parked-row assertion wants to see).
+agent_total=$(jq -r --arg a "$AGENT" '.agents[]|select(.name==$a)|.total' <<<"$data")
+[[ "${agent_total:-0}" -gt 1000000 ]] || abort "precondition: the fixture's turns were read" "agent total=$agent_total"
+ok_t "precondition: the fixture's turns were read (agent total $agent_total)"
 
-total=$(jq -r '.total // 0' <<<"$row")
-[[ "${total:-0}" -gt 0 ]] && ok_t "DIVE-90001 row carries the stolen tokens ($total)" \
-  || bad_t "expected nonzero total on the misattributed row" "got $total"
+# ACCEPT 1 — the parked row accrues nothing after its gate.
+eq_t "parked row (blocked on an unanswered gate since before the window) is charged 0" "0" "$(task_total DIVE-90001)"
+eq_t "…and has no TOP TASKS row at all" "" "$(jq -r '.tasks[]|select(.ident=="DIVE-90001")|.ident' <<<"$data")"
 
-dispatched=$(jq -r '.dispatched' <<<"$row")
-[[ "$dispatched" == "false" ]] && ok_t "misattributed row is flagged dispatched=false (no pin for DIVE-90001 in [since,now])" \
-  || bad_t "expected dispatched=false" "got $dispatched"
+# ACCEPT 3 — both iterations' turns land on the later row, subagent included.
+eq_t "both iterations land on the later row (20k+30k+40k+50k subagent, +100 input each)" \
+  "140400" "$(task_total DIVE-90002)"
+eq_t "…as 4 turns: iteration 1's two survive the started_at re-stamp" "4" "$(task_turns DIVE-90002)"
+eq_t "an attributed row is dispatched=true (the budget guard charges only that)" \
+  "true" "$(jq -r '.tasks[]|select(.ident=="DIVE-90002")|.dispatched' <<<"$data")"
+eq_t "row title comes from the board" "later row, two iterations" \
+  "$(jq -r '.tasks[]|select(.ident=="DIVE-90002")|.title' <<<"$data")"
+eq_t "row iteration comes from the board" "2" \
+  "$(jq -r '.tasks[]|select(.ident=="DIVE-90002")|.iteration' <<<"$data")"
 
-# --- CLI text rendering: the ⚠ marker and caveat line must actually appear ---
-rendered=$(JSON_MODE=0 usage_render_board "$data" "24h" "{}")
-echo "$rendered" | grep -q "DIVE-90001 ⚠" && ok_t "TOP TASKS marks the flagged row inline with ⚠" \
-  || bad_t "expected 'DIVE-90001 ⚠' in rendered board" "$(echo "$rendered" | grep DIVE-90001)"
-echo "$rendered" | grep -q "no /goal dispatch found" && ok_t "caveat footer line printed" \
-  || bad_t "expected a caveat line about missing dispatch" ""
+# Edge cases the span rule rests on.
+eq_t "a second nudge in the same session ends the first row's span" "600" "$(task_total DIVE-90003)"
+eq_t "a non-DIVE board prefix is a dispatch too, and its span ends at done_at" "700" "$(task_total OINOA-7)"
+eq_t "a dispatch before the window owns its session's in-window turns" "900" "$(task_total DIVE-90004)"
+eq_t "an echoed nudge inside a tool_result opens no span" "0" "$(task_total DIVE-90005)"
+eq_t "an answered gate does not end the span (work after an auto-clear stays on the row)" "1200" "$(task_total DIVE-90006)"
 
-# --- control: a task genuinely dispatched and worked inside the window is NOT flagged ---
-T2=$(( NOW_EPOCH - 1800 ))
-db "INSERT INTO tasks (ident, title, status, assignee, created_by, started_at)
-    VALUES ('DIVE-90003','genuinely dispatched task','in_progress','$AGENT','main','$(iso "$T2")');"
-write_fixture "$PROJDIR/recent.jsonl" \
-  "{\"type\":\"user\",\"timestamp\":\"$(iso "$T2")\",\"message\":{\"role\":\"user\",\"content\":\"/goal Task DIVE-90003 shows status done or cancelled...\"}}
-{\"type\":\"assistant\",\"timestamp\":\"$(iso "$T2")\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":50,\"output_tokens\":1000,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}"
+# ACCEPT 2 — tasks + unattributed = the agent's row, nothing double-counted.
+# Unattributed here = A's post-gate turn + C's post-done turn + F's turn.
+eq_t "unattributed = post-gate + post-done + undispatched session" "1001900" \
+  "$(jq -r --arg a "$AGENT" '.untracked[$a].total' <<<"$data")"
+eq_t "unattributed carries its turn count" "3" "$(jq -r --arg a "$AGENT" '.untracked[$a].turns' <<<"$data")"
+sum=$(jq -r --arg a "$AGENT" '([.tasks[]|select(.assignee==$a)|.total]|add // 0) + (.untracked[$a].total // 0)' <<<"$data")
+eq_t "sum over tasks + unattributed == agent total (API-EQ)" "$agent_total" "$sum"
+qsum=$(jq -r --arg a "$AGENT" '([.tasks[]|select(.assignee==$a)|.quota]|add // 0) + (.untracked[$a].quota // 0)' <<<"$data")
+eq_t "sum over tasks + unattributed == agent total (QUOTA)" \
+  "$(jq -r --arg a "$AGENT" '.agents[]|select(.name==$a)|.quota' <<<"$data")" "$qsum"
+tturns=$(jq -r --arg a "$AGENT" '([.tasks[]|select(.assignee==$a)|.turns]|add // 0) + (.untracked[$a].turns // 0)' <<<"$data")
+eq_t "every in-window turn is counted exactly once" \
+  "$(jq -r --arg a "$AGENT" '[.agents[]|select(.name==$a)|.models[].turns]|add' <<<"$data")" "$tturns"
 
-[[ -f "$PROJDIR/recent.jsonl" ]] || { bad_t "fixture still present at read time (DIVE-90003)" "vanished between write and usage_collect"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
-data2=$(usage_collect "$SINCE_EPOCH")
-d3=$(jq -r '.tasks[] | select(.ident=="DIVE-90003") | .dispatched' <<<"$data2")
-[[ "$d3" == "true" ]] && ok_t "genuinely dispatched task reads dispatched=true (no false positives)" \
-  || bad_t "expected DIVE-90003 dispatched=true" "got $d3"
-
-# --- control: an in_progress task with NO pin at all (e.g. dispatched by a direct
-#     human/admin instruction to an already-live session, not the heartbeat's fixed
-#     /goal template) must NOT be flagged false — only 'blocked' (and other
-#     non-active statuses) are asserted against pin absence. Raised by olivia's
-#     verifier review: the heartbeat only nudges on the todo->in_progress
-#     transition, never re-nudges an already-started task, so a still-active task
-#     can legitimately carry zero in-window pins.
-#
-# olivia's DIVE-2058 iteration-1 finding: asserting only 'DIVE-90004 dispatched
-# == null' is a TAUTOLOGY — a silently-lost fixture (zero transcripts read)
-# produces have_signal=False -> dispatched=null too, for the WRONG reason (the
-# DIVE-90001 case, "no signal for this agent at all"), and the assertion cannot
-# tell the difference. Fix: give DIVE-90003 its OWN real turn in THIS SAME
-# fixture file (at T2b, between T2 and T4, so it lands in DIVE-90003's window
-# and shows up in .tasks[] with dispatched=true) and assert that FIRST, as a
-# positive precondition proving this exact read genuinely saw the pin data —
-# only then does DIVE-90004's null mean what it's supposed to mean. ---
-T2b=$(( NOW_EPOCH - 1500 ))   # DIVE-90003's own turn — between T2 (its start+pin) and T4
-T4=$(( NOW_EPOCH - 900 ))
-T4b=$(( NOW_EPOCH - 600 ))    # DIVE-90004's turn, after T4 so it lands in 90004's (newer) window
-db "INSERT INTO tasks (ident, title, status, assignee, created_by, started_at)
-    VALUES ('DIVE-90004','in_progress, dispatched some other way','in_progress','$AGENT','main','$(iso "$T4")');"
-write_fixture "$PROJDIR/recent.jsonl" \
-  "{\"type\":\"user\",\"timestamp\":\"$(iso "$T2")\",\"message\":{\"role\":\"user\",\"content\":\"/goal Task DIVE-90003 shows status done or cancelled...\"}}
-{\"type\":\"assistant\",\"timestamp\":\"$(iso "$T2b")\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":300,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}
-{\"type\":\"assistant\",\"timestamp\":\"$(iso "$T4b")\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":50,\"output_tokens\":2000,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}"
-
-[[ -f "$PROJDIR/recent.jsonl" ]] || { bad_t "fixture still present at read time (DIVE-90004)" "vanished between write and usage_collect"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
-data4=$(usage_collect "$SINCE_EPOCH")
-
-d3_precond=$(jq -r '.tasks[] | select(.ident=="DIVE-90003") | .dispatched' <<<"$data4")
-if [[ "$d3_precond" == "true" ]]; then
-  ok_t "precondition: DIVE-90003's pin+turn were genuinely read this pass (dispatched=true) — proves have_signal=true"
-else
-  bad_t "precondition failed: this read did not see DIVE-90003's pin/turn at all" "got dispatched=$d3_precond — DIVE-90004's result below would be a tautology, aborting rather than trust it"
-  printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
-  exit 1
-fi
-
-d4=$(jq -r '.tasks[] | select(.ident=="DIVE-90004") | .dispatched' <<<"$data4")
-[[ "$d4" == "null" ]] && ok_t "in_progress task with zero pins reads dispatched=null, NOT flagged false (verified against a proven-live read)" \
-  || bad_t "expected DIVE-90004 dispatched=null (unknown, not accused)" "got $d4"
+# Renderers — the unattributed share is printed, not dropped.
+board=$(JSON_MODE=0 usage_render_board "$data" "24h" "{}")
+grep -qE "unattributed .*$AGENT 1M( |$)" <<<"$board" \
+  && ok_t "board prints the agent's unattributed line" \
+  || bad_t "board prints the agent's unattributed line" "$(grep -i unattr <<<"$board")"
+grep -q "DIVE-90001" <<<"$board" && bad_t "board lists the parked row" "$(grep DIVE-90001 <<<"$board")" \
+  || ok_t "board does not list the parked row"
+aview=$(JSON_MODE=0 usage_render_agent "$data" "$AGENT" "24h")
+grep -q "(unattributed)  1M " <<<"$aview" && ok_t "agent view prints the (unattributed) line" \
+  || bad_t "agent view prints the (unattributed) line" "$(sed -n '/tasks (/,$p' <<<"$aview")"
 
 # =============================================================================
-# DIVE-2312 — the flagged VALUE must not be liftable, not merely marked.
-#
-# The assertions above prove the ⚠ and the caveat render. They rendered
-# correctly for three straight readers who then quoted the number as fact, one
-# of them the author of the note warning about it. So the property to grade is
-# not "does the caveat appear" but "can a reader still lift a bare number".
-#
-# Falsifiable form: for a flagged row, the humanized figure must never appear
-# as a STANDALONE whitespace-delimited field in the TOP TASKS block. That is
-# exactly the token a reader's eye lands on and a copy-paste picks up, and it
-# is only satisfiable if the qualifier is attached with no space.
-#
-# Scope is TOP TASKS (and the per-agent `tasks (...)` list) deliberately. The
-# TOP AGENTS row for this same agent prints the same 5.1M bare and SHOULD: the
-# agent really did burn those tokens. DIVE-2058 misattributes which TASK owns
-# them, not how many there were. Asserting over the whole board would be
-# asserting something the defect never claimed.
-# NOTE the argument order: jq takes the first non-flag word as the PROGRAM, so
-# `jq -rn "$USAGE_JQ_HELPERS" --argjson v ... '$v|htok'` compiles the helper
-# block alone (no top-level expression) and treats the real program as a
-# filename. It fails to stderr and leaves $bare_total EMPTY — under which the
-# "no bare liftable figure" assertion passes for a reason that has nothing to
-# do with the fix. The flags go first; the program is one concatenated word.
-htok_of() { jq -rn --argjson v "$1" "$USAGE_JQ_HELPERS"'$v|htok'; }
-bare_total=$(htok_of "$(jq -r '.total' <<<"$row")")
-bare_out=$(htok_of "$(jq -r '.output' <<<"$row")")
-# Abort rather than assert on empty needles: "the number 5.1M never appears as a
-# standalone field" and "the number '' never appears" are the same assertion to
-# awk, and only one of them is about the fix.
-[[ "$bare_total" =~ ^[0-9] && "$bare_out" =~ ^[0-9] ]] \
-  || { bad_t "humanized figures derived for the assertions below" "bare_total='$bare_total' bare_out='$bare_out' — an empty needle makes every check below vacuous"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
-
-# `rendered` is the board built from $data, where DIVE-90001 is the flagged row.
-tasks_block=$(printf '%s\n' "$rendered" | sed -n '/^TOP TASKS/,$p')
-[[ -n "$tasks_block" ]] || { bad_t "TOP TASKS block located in rendered board" "sed range matched nothing"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
-
-lift=$(printf '%s\n' "$tasks_block" | awk -v a="$bare_total" -v b="$bare_out" \
-  '{for(i=1;i<=NF;i++) if($i==a || $i==b) print "  line "NR": "$0}')
-[[ -z "$lift" ]] && ok_t "flagged row prints NO bare liftable figure in TOP TASKS ($bare_total / $bare_out never stand alone)" \
-  || bad_t "a flagged figure is still quotable as a bare number" "$lift"
-
-grep -qF "~${bare_total}(unverified)" <<<"$tasks_block" \
-  && ok_t "flagged TOTAL renders qualified in-cell as ~${bare_total}(unverified)" \
-  || bad_t "expected ~${bare_total}(unverified) in TOP TASKS" "$(printf '%s\n' "$tasks_block" | grep DIVE-90001)"
-grep -qF "~${bare_out}(unverified)" <<<"$tasks_block" \
-  && ok_t "flagged OUTPUT renders qualified in-cell as ~${bare_out}(unverified)" \
-  || bad_t "expected ~${bare_out}(unverified) in TOP TASKS" "$(printf '%s\n' "$tasks_block" | grep DIVE-90001)"
-
-# Same rule on the per-agent view — it is a second render site with its own
-# format string, and a fix applied to only one of them leaves the other lifting.
-agent_view=$(JSON_MODE=0 usage_render_agent "$data" "$AGENT" "24h")
-agent_tasks=$(printf '%s\n' "$agent_view" | sed -n '/^  tasks (/,$p')
-lift2=$(printf '%s\n' "$agent_tasks" | awk -v a="$bare_total" '{for(i=1;i<=NF;i++) if($i==a) print "  line "NR": "$0}')
-[[ -z "$lift2" ]] && ok_t "per-agent 'tasks' list prints no bare liftable figure for the flagged row" \
-  || bad_t "usage_render_agent still prints the flagged total bare" "$lift2"
-
-# CONTROL — without this the assertions above are satisfiable by a render that
-# prints no figures at all, or one that qualifies every row indiscriminately.
-# An UNFLAGGED row must still print its number bare and quotable: that is the
-# whole point of only qualifying what the collector actually doubts.
-rendered4=$(JSON_MODE=0 usage_render_board "$data4" "24h" "{}")
-tasks_block4=$(printf '%s\n' "$rendered4" | sed -n '/^TOP TASKS/,$p')
-ctl_total=$(htok_of "$(jq -r '.tasks[] | select(.ident=="DIVE-90003") | .total' <<<"$data4")")
-ctl_hit=$(printf '%s\n' "$tasks_block4" | awk -v a="$ctl_total" '{for(i=1;i<=NF;i++) if($i==a) print NR}')
-[[ -n "$ctl_hit" ]] && ok_t "control: dispatched=true row still prints its figure bare ($ctl_total) — the qualifier tracks doubt, not every row" \
-  || bad_t "expected DIVE-90003's $ctl_total as a standalone field" "$(printf '%s\n' "$tasks_block4" | grep DIVE-90003)"
-grep -q "DIVE-90003.*(unverified)" <<<"$tasks_block4" \
-  && bad_t "control: an unflagged row was wrongly qualified" "$(printf '%s\n' "$tasks_block4" | grep DIVE-90003)" \
-  || ok_t "control: unflagged row carries no (unverified) marker"
+# DIVE-2312 — a figure flagged `dispatched:false` must not be liftable. The
+# collector no longer emits one, but the renderer still honours the field for
+# any payload that carries it, so the rule is graded on a synthetic payload.
+flagged='{"agents":[],"untracked":{},"coverage":{"complete":true,"unreadable":[]},
+  "tasks":[{"ident":"DIVE-91001","title":"flagged","assignee":"x","total":5100000,"quota":5100000,"output":5000000,"turns":1,"iteration":null,"dispatched":false},
+           {"ident":"DIVE-91002","title":"clean","assignee":"x","total":2300000,"quota":2300000,"output":2000000,"turns":1,"iteration":null,"dispatched":true}]}'
+fb=$(JSON_MODE=0 usage_render_board "$flagged" "24h" "{}" | sed -n '/^TOP TASKS/,$p')
+lift=$(awk '{for(i=1;i<=NF;i++) if($i=="5.1M" || $i=="5M") print "  line "NR": "$0}' <<<"$fb")
+[[ -z "$lift" ]] && ok_t "flagged figure never stands alone in TOP TASKS" || bad_t "flagged figure is liftable" "$lift"
+grep -qF "~5.1M(unverified)" <<<"$fb" && ok_t "flagged figure renders qualified in-cell" \
+  || bad_t "flagged figure renders qualified in-cell" "$(grep DIVE-91001 <<<"$fb")"
+awk '{for(i=1;i<=NF;i++) if($i=="2.3M") f=1} END{exit !f}' <<<"$fb" \
+  && ok_t "control: an unflagged figure still prints bare" || bad_t "control: unflagged figure bare" "$(grep DIVE-91002 <<<"$fb")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
