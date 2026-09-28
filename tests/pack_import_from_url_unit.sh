@@ -59,10 +59,21 @@ if command -v openssl >/dev/null && command -v python3 >/dev/null \
    && openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=127.0.0.1 \
         -addext 'subjectAltName=IP:127.0.0.1' -keyout "$TMP/k.pem" -out "$TMP/c.pem" >/dev/null 2>&1; then
   PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
-  python3 - "$TMP/srv" "$PORT" "$TMP/c.pem" "$TMP/k.pem" >/dev/null 2>&1 <<'PY' &
-import http.server, ssl, sys, functools
-d, port, cert, key = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-h = functools.partial(http.server.SimpleHTTPRequestHandler, directory=d)
+  HPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+  # One process: https on PORT (with /to-http and /to-https 302s) and plain http
+  # on HPORT serving the same files, so a redirect can try to downgrade.
+  python3 - "$TMP/srv" "$PORT" "$TMP/c.pem" "$TMP/k.pem" "$HPORT" >/dev/null 2>&1 <<'PY' &
+import http.server, ssl, sys, functools, threading
+d, port, cert, key, hport = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5])
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        for pre, target in (("/to-http/", f"http://127.0.0.1:{hport}/"), ("/to-https/", f"https://127.0.0.1:{port}/")):
+            if self.path.startswith(pre):
+                self.send_response(302); self.send_header("Location", target + self.path[len(pre):]); self.end_headers(); return
+        super().do_GET()
+h = functools.partial(H, directory=d)
+plain = http.server.HTTPServer(("127.0.0.1", hport), h)
+threading.Thread(target=plain.serve_forever, daemon=True).start()
 s = http.server.HTTPServer(("127.0.0.1", port), h)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
 s.socket = ctx.wrap_socket(s.socket, server_side=True)
@@ -80,6 +91,21 @@ PY
     bad_t 'a 404 link fails the fetch' "out=[$out]"
   else
     ok_t 'a 404 link fails the fetch'
+  fi
+  # Redirects: https->https is followed (the control), https->http is refused.
+  # The plain-http target serves the real bytes, so only --proto-redir stops it.
+  got=$(CURL_CA_BUNDLE="$TMP/c.pem" _pack_fetch_url "https://127.0.0.1:$PORT/to-https/p.tar.gz?sig=x")
+  if [[ -n "$got" && -f "$got" ]]; then
+    eq_t 'an https->https redirect is followed' PACKBYTES "$(cat "$got")"; rm -f "$got"
+  else
+    bad_t 'an https->https redirect is followed' "out=[$got]"
+  fi
+  if [[ "$(curl -s "http://127.0.0.1:$HPORT/p.tar.gz")" != PACKBYTES ]]; then
+    bad_t 'an https->http redirect is refused' 'plain-http target not serving; arm cannot grade'
+  elif out=$(CURL_CA_BUNDLE="$TMP/c.pem" _pack_fetch_url "https://127.0.0.1:$PORT/to-http/p.tar.gz?sig=x"); then
+    bad_t 'an https->http redirect is refused' "downgraded and fetched: $out"; rm -f "$out"
+  else
+    ok_t 'an https->http redirect is refused'
   fi
 else
   ok_t 'SKIP live https fetch (no openssl/python3 on this host)'
