@@ -67,6 +67,11 @@ _agent_avatar_install() { # <agent> <file>
   fmt=$(_agent_avatar_sniff "$file") || { printf 'not a PNG, JPEG, WebP or GIF image\n'; return 1; }
   # Root writes into an agent-owned tree: never follow a link the agent planted.
   [[ ! -L "$dir" ]] || { printf '%s is a symlink; refusing to write through it\n' "$dir"; return 1; }
+  # Same for the file itself: a link or a directory planted at avatar.png would
+  # make `mv` drop the image wherever it points. Only a regular file is replaced.
+  if [[ -L "$dst" ]] || { [[ -e "$dst" ]] && [[ ! -f "$dst" ]]; }; then
+    printf '%s is a symlink or not a regular file; refusing to replace it\n' "$dst"; return 1
+  fi
   tmp="$dir/.avatar.png.$$"
   if (( EUID == 0 )); then
     install -d -o "agent-${agent}" -g "agent-${agent}" -m 755 "$dir" 2>/dev/null \
@@ -79,7 +84,8 @@ _agent_avatar_install() { # <agent> <file>
   else
     printf "setting another agent's avatar needs root (run with sudo)\n"; return 1
   fi
-  mv -f -- "$tmp" "$dst" 2>/dev/null || { rm -f -- "$tmp"; printf 'could not write %s\n' "$dst"; return 1; }
+  # -T: never move INTO dst, even if it became a directory after the check above.
+  mv -fT -- "$tmp" "$dst" 2>/dev/null || { rm -f -- "$tmp"; printf 'could not write %s\n' "$dst"; return 1; }
   printf '%s\n' "$fmt"
 }
 
@@ -226,7 +232,8 @@ _agent_avatar_backfill() {
     home="${AGENT_HOME_ROOT:-/home}/agent-${name}"
     dst=$(_agent_avatar_path "$name")
     [[ -d "$home" ]] || continue
-    [[ -f "$dst" ]] && continue
+    # Any existing entry (a portrait, or a link/dir the agent planted) is left alone.
+    [[ -e "$dst" || -L "$dst" ]] && continue
     src=""
     # Newest persona first: the one the agent last edited is its current face.
     while IFS= read -r yaml; do

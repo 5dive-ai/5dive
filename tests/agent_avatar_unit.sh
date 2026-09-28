@@ -53,6 +53,18 @@ mkdir -p "$AGENT_HOME_ROOT/agent-beta" "$TMP/elsewhere"
 ln -s "$TMP/elsewhere" "$AGENT_HOME_ROOT/agent-beta/.claude"
 out=$(_agent_avatar_install beta "$TMP/a.png") && bad 'install wrote through a symlinked .claude' \
   || { [[ ! -e "$TMP/elsewhere/avatar.png" && "$out" == *symlink* ]] && okk 'install refuses a symlinked .claude' || bad "symlink arm: $out"; }
+# avatar.png itself planted as a link to a directory: GNU `mv -f tmp dst` would
+# move the image INTO that directory and report success (quinn, DIVE-5104 iter 1).
+mkdir -p "$AGENT_HOME_ROOT/agent-zeta/.claude" "$TMP/rootonly"
+ln -s "$TMP/rootonly" "$AGENT_HOME_ROOT/agent-zeta/.claude/avatar.png"
+out=$(_agent_avatar_install zeta "$TMP/a.gif"); rc=$?
+(( rc == 1 )) && [[ -z "$(ls -A "$TMP/rootonly")" && -L "$AGENT_HOME_ROOT/agent-zeta/.claude/avatar.png" ]] \
+  && ! compgen -G "$AGENT_HOME_ROOT/agent-zeta/.claude/.avatar*" >/dev/null \
+  && okk 'install refuses an avatar.png that is a symlink to a directory' || bad "dir-symlink arm: rc=$rc out=$out rootonly=$(ls -A "$TMP/rootonly")"
+mkdir -p "$AGENT_HOME_ROOT/agent-eta/.claude/avatar.png"
+out=$(_agent_avatar_install eta "$TMP/a.png"); rc=$?
+(( rc == 1 )) && [[ -z "$(ls -A "$AGENT_HOME_ROOT/agent-eta/.claude/avatar.png")" ]] \
+  && okk 'install refuses an avatar.png that is a directory' || bad "dir arm: rc=$rc out=$out"
 if (( EUID != 0 )); then
   mkdir -p "$TMP/foreign"; chmod 755 "$TMP/foreign"
   # A home the caller does not own: simulate with a root-owned dir when one exists.
@@ -135,6 +147,23 @@ OUT=$(python3 "$PY" "$TMP/agents.json" "$TMP/profiles" "$TMP/connectors" "$AGENT
 [[ "$(jq -r '.[] | select(.name=="gamma") | .avatar' <<<"$OUT")" == null ]] && okk 'a symlinked avatar reads as none' || bad 'symlinked avatar reported'
 [[ "$(jq -r '.[] | select(.name=="delta") | .avatar' <<<"$OUT")" == null ]] && okk 'an avatar over the cap reads as none' || bad 'oversized avatar reported'
 [[ "$(jq -r '.[] | select(.name=="eps") | .avatar' <<<"$OUT")" == null ]] && okk 'an agent with no portrait reads null' || bad 'phantom avatar'
+
+# --- backfill never replaces an existing entry, link or not ---------------
+# Dry-run is enough: the skip is decided before the dry/real split, and a
+# "would set" line for theta is exactly the root write quinn's probe landed.
+h="$AGENT_HOME_ROOT/agent-theta"; mkdir -p "$h/.claude" "$h/cards" "$TMP/rootonly2"
+png "$h/cards/card.png"; cp "$TMP/inline.persona.yaml" "$h/cards/theta.persona.yaml"
+ln -s "$TMP/rootonly2" "$h/.claude/avatar.png"
+h="$AGENT_HOME_ROOT/agent-iota"; mkdir -p "$h/.claude" "$h/cards"
+png "$h/cards/card.png"; cp "$TMP/inline.persona.yaml" "$h/cards/iota.persona.yaml"
+BF=$(
+  registry_read() { printf '{"agents":{"theta":{},"iota":{}}}\n'; }
+  ensure_state_ro() { :; }; step() { echo "STEP: $*"; }; warn() { echo "WARN: $*"; }
+  ok() { echo "OK: $1"; }; json_array() { :; }; fail() { echo "FAILCALL: $2"; exit 1; }
+  STATE_DIR="$TMP" _agent_avatar_backfill --dry-run 2>&1
+)
+[[ "$BF" != *"'theta'"* && "$BF" == *"would set 'iota'"* ]] \
+  && okk 'backfill skips an avatar.png that is a symlink (and still sets a clean agent)' || bad "backfill link arm: $BF"
 
 # --- wiring ---------------------------------------------------------------
 grep -q '^  src/cmd_agent_avatar.sh$' "$ROOT/build.sh" && okk 'module is bundled' || bad 'module missing from build.sh'
