@@ -154,6 +154,21 @@ _marketplace_fetch_pack() {
   rm -rf "$dl"; echo "$out"
 }
 
+# DIVE-5114: `agent import --from-url` — download one pack tarball. The link is
+# a signed, short-lived capability, so it is never echoed: messages name the
+# host only. https end to end (no downgrade on a redirect), size-capped.
+_pack_url_host() { local h="${1#*://}"; printf '%s' "${h%%[/?#]*}"; }
+_pack_fetch_url() {
+  local url="$1" out
+  out=$(mktemp --suffix=.tar.gz) || return 1
+  if curl -fsSL --proto '=https' --proto-redir '=https' --max-time 120 \
+       --max-filesize $((64 * 1024 * 1024)) -o "$out" "$url" 2>/dev/null && [[ -s "$out" ]]; then
+    echo "$out"
+  else
+    rm -f "$out"; return 1
+  fi
+}
+
 # Render the classified fetch failure. Kept in one helper because both the
 # read-only inspect path and the provisioning import path resolve registry slugs.
 _marketplace_fetch_pack_fail() {
@@ -1189,6 +1204,9 @@ _pack_usage() {
                                   # recreate an agent from a pack into a FRESH name.
                                   # <pack> = a .tar.gz file OR a bare registry slug
                                   # (e.g. 'import lilbro --as=...') pulled from the git registry.
+                                  # --from-url=<https-url> (DIVE-5114) in place of <pack>: fetch
+                                  # the .tar.gz from that link (5dive-api's short-lived link to a
+                                  # partner's private registry pack) and import it as a file.
                                   # --report-import (opt-in, default OFF): ping a public
                                   # increment-only, zero-PII counter with just the pack slug
                                   # so the gallery can rank Most-imported. Registry slugs only.
@@ -2758,7 +2776,8 @@ cmd_export() {
 # the validator must reject it too or the preview lies in the other direction.
 _IMPORT_OWN_VALUE_FLAGS=(--as --channels --telegram-token --discord-token
                          --auth-profile --workdir --from-persona --type
-                         --isolation --model --effort --provider --api-key)
+                         --isolation --model --effort --provider --api-key
+                         --from-url)
 _IMPORT_OWN_BOOL_FLAGS=(--report-import --allow-hooks)
 
 # Create-only flags import FORWARDS verbatim into the cmd_create argv it already
@@ -2849,6 +2868,7 @@ cmd_import() {
   # "explicitly asked for <type>" apart from "took the pack's baked-in type";
   # the from-persona synth defaults it to claude locally below.
   local from_persona="" p_type="" p_iso="standard" p_iso_set=0 p_model="" p_effort=""
+  local from_url=""
   # DIVE-2676: BYO credentials on the import path. Without these an import onto
   # an API-key-only seat provisions an agent that cannot reach a model at all.
   local p_provider="" p_api_key=""
@@ -2863,6 +2883,7 @@ cmd_import() {
       --auth-profile=*)    profile="${1#--auth-profile=}" ;;
       --workdir=*)         workdir="${1#--workdir=}" ;;
       --from-persona=*)    from_persona="${1#--from-persona=}" ;;
+      --from-url=*)        from_url="${1#--from-url=}" ;;
       --type=*)            p_type="${1#--type=}" ;;
       --isolation=*)       p_iso="${1#--isolation=}"; p_iso_set=1
                             _import_validate_isolation "$p_iso" ;;
@@ -2890,6 +2911,22 @@ cmd_import() {
   done
   [[ -n "$as" ]]   || fail "$E_USAGE" "--as=<name> is required (the new agent's name)"
 
+  # DIVE-5114: a pack by URL. 5dive-api hands a partner box a short-lived signed
+  # link to a pack from the partner's PRIVATE registry, so the box fetches one
+  # tarball and never sees the registry or its credential. From here on it is a
+  # local .tar.gz on the normal path (safe-extract, manifest checks, hook strip).
+  local url_tmp=""
+  if [[ -n "$from_url" ]]; then
+    [[ -z "$pack" && -z "$from_persona" ]] \
+      || fail "$E_USAGE" "give ONE of a pack, --from-persona or --from-url"
+    [[ "$from_url" =~ ^https://[^[:space:]]+$ ]] \
+      || fail "$E_VALIDATION" "--from-url must be an https URL"
+    step "Fetching pack from $(_pack_url_host "$from_url")"
+    url_tmp=$(_pack_fetch_url "$from_url") \
+      || fail "$E_GENERIC" "could not fetch the pack from $(_pack_url_host "$from_url") (expired or unreachable link)"
+    pack="$url_tmp"
+  fi
+
   # Persona mode: synthesize a v1 pack from the OpenAgent persona, then fall into
   # the normal pack-import flow below (the synth tarball IS the pack).
   local persona_tmp=""
@@ -2902,7 +2939,7 @@ cmd_import() {
       || fail "$E_VALIDATION" "could not build a pack from persona '$from_persona' (is it a valid OpenAgent persona?)"
     pack="$persona_tmp"
   fi
-  [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent import <pack>|--from-persona=<file.persona.yaml> --as=<name> [--type=claude] [--isolation=admin|standard|sandboxed] [--channels=...] [--telegram-token=...] [--discord-token=...] [--auth-profile=...] [--workdir=...] [--human=<id>]"
+  [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent import <pack>|--from-persona=<file.persona.yaml>|--from-url=<https-url> --as=<name> [--type=claude] [--isolation=admin|standard|sandboxed] [--channels=...] [--telegram-token=...] [--discord-token=...] [--auth-profile=...] [--workdir=...] [--human=<id>]"
 
   # DIVE-2565: a single-file AGENTS.md export is a pack too. Explode it back into
   # a v1 stage and re-tar, so EVERYTHING below — safe-extract, manifest
@@ -2942,12 +2979,13 @@ cmd_import() {
 
   # Unpack into an isolated stage and validate the manifest before touching anything.
   local stage; stage=$(mktemp -d)
-  _pack_safe_extract "$pack" "$stage" || { local rc=$?; rm -rf "$stage" "$resolved_tmp" "$persona_tmp" "$md_tmp"
+  _pack_safe_extract "$pack" "$stage" || { local rc=$?; rm -rf "$stage" "$resolved_tmp" "$persona_tmp" "$md_tmp" "$url_tmp"
     (( rc == 2 )) && fail "$E_VALIDATION" "pack rejected: contains unsafe members (path traversal, absolute paths, or sym/hardlinks), refusing to extract"
     fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
   [[ -n "$resolved_tmp" ]] && rm -f "$resolved_tmp"
   [[ -n "$persona_tmp" ]] && rm -f "$persona_tmp"
   [[ -n "$md_tmp" ]] && rm -f "$md_tmp"
+  [[ -n "$url_tmp" ]] && rm -f "$url_tmp"
   [[ -f "$stage/manifest.json" ]] \
     || { rm -rf "$stage"; fail "$E_VALIDATION" "pack has no manifest.json — not a 5dive agent pack"; }
 
