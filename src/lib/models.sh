@@ -101,13 +101,14 @@ resolve_model_for_profile() {
 # be read off the value itself: a bare alias, or a family's CURRENT claude-* id.
 # Empty for anything else (a vendor slug, an older pinned id).
 model_family_of() {
-  local m="${1:-}" fam
+  local m="${1:-}" fam fams
   [[ -n "$m" ]] || return 0
+  fams=$(model_families)
   while read -r fam; do
     if [[ "$m" == "$fam" || "$m" == "$(model_latest "$fam")" ]]; then
       printf '%s' "$fam"; return 0
     fi
-  done < <(model_families)
+  done <<<"$fams"
 }
 
 # models_json -> {"opus":"claude-opus-5-5",...}. This is what the telegram plugin
