@@ -72,14 +72,18 @@ _agent_avatar_install() { # <agent> <file>
   if [[ -L "$dst" ]] || { [[ -e "$dst" ]] && [[ ! -f "$dst" ]]; }; then
     printf '%s is a symlink or not a regular file; refusing to replace it\n' "$dst"; return 1
   fi
+  # The temp name is predictable, so the agent can plant a link there too. -T makes
+  # install treat $tmp as a FILE: it unlinks whatever is there and creates a fresh
+  # one (O_EXCL). Without -T a link to a directory makes install copy the image
+  # INTO that directory under the source's basename, and exit 0 (quinn, iter 2).
   tmp="$dir/.avatar.png.$$"
   if (( EUID == 0 )); then
     install -d -o "agent-${agent}" -g "agent-${agent}" -m 755 "$dir" 2>/dev/null \
-      && install -o "agent-${agent}" -g "agent-${agent}" -m 644 -- "$file" "$tmp" 2>/dev/null \
+      && install -T -o "agent-${agent}" -g "agent-${agent}" -m 644 -- "$file" "$tmp" 2>/dev/null \
       || { rm -f -- "$tmp"; printf 'could not write %s\n' "$dst"; return 1; }
   elif [[ -O "$home" ]]; then
     # An agent setting its OWN portrait (it owns its home) needs no privilege.
-    mkdir -p -- "$dir" 2>/dev/null && install -m 644 -- "$file" "$tmp" 2>/dev/null \
+    mkdir -p -- "$dir" 2>/dev/null && install -T -m 644 -- "$file" "$tmp" 2>/dev/null \
       || { rm -f -- "$tmp"; printf 'could not write %s\n' "$dst"; return 1; }
   else
     printf "setting another agent's avatar needs root (run with sudo)\n"; return 1

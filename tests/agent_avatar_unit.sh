@@ -65,6 +65,26 @@ mkdir -p "$AGENT_HOME_ROOT/agent-eta/.claude/avatar.png"
 out=$(_agent_avatar_install eta "$TMP/a.png"); rc=$?
 (( rc == 1 )) && [[ -z "$(ls -A "$AGENT_HOME_ROOT/agent-eta/.claude/avatar.png")" ]] \
   && okk 'install refuses an avatar.png that is a directory' || bad "dir arm: rc=$rc out=$out"
+# The TEMP name is predictable too: plant .avatar.png.<pid> as a link. The $(...)
+# subshell keeps this shell's $$, so this is the exact name install writes to.
+# Without `install -T`, a link to a directory gets the image copied INTO it under
+# the source's basename, rc 0, and mv then renames the link to avatar.png (quinn, iter 2).
+mkdir -p "$AGENT_HOME_ROOT/agent-tau/.claude" "$TMP/rootonly3"
+ln -s "$TMP/rootonly3" "$AGENT_HOME_ROOT/agent-tau/.claude/.avatar.png.$$"
+out=$(_agent_avatar_install tau "$TMP/a.gif"); rc=$?
+dst="$AGENT_HOME_ROOT/agent-tau/.claude/avatar.png"
+[[ -z "$(ls -A "$TMP/rootonly3")" && ! -L "$dst" ]] && { (( rc == 1 )) || { [[ -f "$dst" ]] && cmp -s "$TMP/a.gif" "$dst"; }; } \
+  && okk 'install does not follow a temp-name link to a directory' \
+  || bad "temp dir-link arm: rc=$rc out=$out rootonly3=$(ls -A "$TMP/rootonly3") dst=$(ls -ld "$dst" 2>&1)"
+mkdir -p "$AGENT_HOME_ROOT/agent-upsilon/.claude"; printf 'victim\n' >"$TMP/victim"
+ln -s "$TMP/victim" "$AGENT_HOME_ROOT/agent-upsilon/.claude/.avatar.png.$$"
+out=$(_agent_avatar_install upsilon "$TMP/a.gif"); rc=$?
+[[ "$(cat "$TMP/victim")" == victim && ! -L "$AGENT_HOME_ROOT/agent-upsilon/.claude/avatar.png" ]] \
+  && okk 'install does not write through a temp-name link to a file' || bad "temp file-link arm: rc=$rc out=$out victim=$(cat "$TMP/victim")"
+# The arms above run the non-root branch only; the root branch (backfill, sudo set)
+# has its own install line. Both must carry -T.
+[[ "$(grep -cE 'install -T .*"\$tmp"' "$ROOT/src/cmd_agent_avatar.sh")" == 2 ]] \
+  && okk 'both install branches (root and self) pass -T at the temp path' || bad 'an install branch writes the temp path without -T'
 if (( EUID != 0 )); then
   mkdir -p "$TMP/foreign"; chmod 755 "$TMP/foreign"
   # A home the caller does not own: simulate with a root-owned dir when one exists.
