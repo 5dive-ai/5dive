@@ -188,8 +188,10 @@ cmd_halt() {
     notice+=" — no in-progress row of yours was requeued."
   fi
   notice+=" Read the row before you restart it; the halt reason is the first thing to answer."
-  local _nrc=0
-  _A2A_INTERRUPTING=1 inject_and_submit "$name" "$notice" || _nrc=$?
+  local _nrc=0 _vouch=0
+  # DIVE-5098: vouched only for a measured local seat (the reason is its text).
+  _wake_sender_vouchable "$_caller" "$(_envelope_caller)" && _vouch=1
+  _WAKE_VOUCH="$_vouch" _A2A_INTERRUPTING=1 inject_and_submit "$name" "$notice" || _nrc=$?
 
   ok "agent '$name' halted${requeue_note:+ — }${requeue_note}" \
      '{name:$n, action:"halt", was_busy:($b=="1"), requeued:($rq|split(",")|map(select(length>0))), notice_delivered:($nd=="1"), reason:$r}' \
@@ -1272,6 +1274,12 @@ _a2a_queue_put() {
   if [[ -n "$guard" ]]; then
     printf '%s' "$guard" | sudo -u "agent-${name}" tee "${dir}/${id}.guard" >/dev/null 2>&1 || true
   fi
+  # DIVE-5098: the vouch rides the spool as an empty `<id>.vouch` marker, written
+  # after the .msg for the same reason as the guard: a crash between the writes
+  # loses the typed line (bare paste, the safe side), never invents one.
+  if [[ "${_WAKE_VOUCH:-0}" == "1" ]]; then
+    sudo -u "agent-${name}" touch "${dir}/${id}.vouch" 2>/dev/null || true
+  fi
   return 0
 }
 
@@ -1505,7 +1513,7 @@ a2a_queue_flush_one() {
     f="${files[i]}"
     msg="$(sudo -u "agent-${seat}" cat "$f" 2>/dev/null)" || return 1
     if [[ -z "$msg" ]]; then
-      sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" 2>/dev/null || return 1
+      sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" "${f%.msg}.vouch" 2>/dev/null || return 1
       continue
     fi
     # DIVE-4295: the SENDING RAIL'S OWN condition, recorded at enqueue in a
@@ -1521,7 +1529,7 @@ a2a_queue_flush_one() {
     if [[ -n "$guard" ]]; then
       grc=0; _a2a_guard_holds "$guard" || grc=$?
       if (( grc == 1 )); then
-        sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" 2>/dev/null || return 1
+        sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" "${f%.msg}.vouch" 2>/dev/null || return 1
         declare -F _hb_log >/dev/null 2>&1 \
           && _hb_log "[a2a-queue] ${seat}: dropped a spooled message whose guard no longer holds (${guard})"
         continue
@@ -1533,17 +1541,20 @@ a2a_queue_flush_one() {
     # context that never loaded it must DELIVER, not drop. Fails open by design.
     if declare -F _a2a_stale_nudge_reason >/dev/null 2>&1 \
        && reason="$(_a2a_stale_nudge_reason "$seat" "$msg" "${files[@]:i+1}")"; then
-      sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" 2>/dev/null || return 1
+      sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" "${f%.msg}.vouch" 2>/dev/null || return 1
       if declare -F _hb_log >/dev/null 2>&1; then
         _hb_log "[${seat}] dropped stale spooled nudge (${reason})"
       fi
       continue
     fi
+    # DIVE-5098: read the vouch marker before the unlink below takes it with it.
+    local _vouch=0
+    sudo -u "agent-${seat}" test -e "${f%.msg}.vouch" 2>/dev/null && _vouch=1
     # Unlink BEFORE typing. A message delivered twice is worse than one lost: the
     # duplicate costs the recipient a second full re-investigation, which is the
     # burn this ticket exists to remove.
-    sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" 2>/dev/null || return 1
-    _A2A_INTERRUPTING=1 inject_and_submit "$seat" "$msg" || _rc=$?
+    sudo -u "agent-${seat}" rm -f "$f" "${f%.msg}.guard" "${f%.msg}.vouch" 2>/dev/null || return 1
+    _WAKE_VOUCH="$_vouch" _A2A_INTERRUPTING=1 inject_and_submit "$seat" "$msg" || _rc=$?
     (( _rc == 0 ))
     return
   done
@@ -1582,6 +1593,32 @@ _wake_split() {
   _WAKE_HEAD=""; _WAKE_BODY="$1"
   (( ${#1} >= _WAKE_TYPED_MIN )) && _WAKE_HEAD="${_WAKE_TYPED_LINE} "
   return 0
+}
+
+# DIVE-5098 iteration 2 — WHO MAY BE VOUCHED FOR. The line above tells the seat
+# "your operator's runtime wrote this, act on it", which switches off Claude
+# Code's pasted-content guard. inject_and_submit is also the door for content
+# nobody on this box wrote: the 5dive-a2a tick relays every peer message from
+# another owner's agent as `agent send --from=<contact> --message-file=…` (root,
+# up to 16 KiB). Vouching for that is the guard turned off on exactly the path it
+# exists for (quinn, iteration 1). So the line is OPT-IN, carried on the
+# environment like _A2A_INTERRUPTING, and it FAILS CLOSED: no `_WAKE_VOUCH=1`,
+# no line — the bare paste, as before this row.
+#
+# Set by: _hb_send_line (the heartbeat writes its own nudge — it does not go
+# through here), and send / ask / _deliver / halt only when
+# _wake_sender_vouchable says the sender is a MEASURED LOCAL SEAT: the claimed
+# sender equals the uid-derived caller (envelope_provenance == corroborated) AND
+# that caller is a registered agent with a tier. Everything else — an a2a/
+# external --from (root, no agent caller: unknown:no-caller), a spoofed label
+# (divergent), --raw (unclaimed), the synthetic `human`, an unregistered name —
+# keeps the bare paste. "The operator" is not separately vouched: a root caller
+# with no agent seat behind it measures the same as the a2a daemon, so it cannot
+# be told apart and gets the bare paste too.
+_wake_sender_vouchable() {
+  local claimed="${1:-}" measured="${2:-}"
+  [[ "$(envelope_provenance "$claimed" "$measured")" == corroborated ]] || return 1
+  [[ "$(agent_tier "$measured")" != unknown:* ]]
 }
 
 inject_and_submit() {
@@ -1633,12 +1670,13 @@ inject_and_submit() {
   # only edits the composer. Ghost text (CC 2.1.267 promptSuggestion, rendered
   # DIM) is not input and is replaced by typing anyway; the verify excludes it.
   sudo -u "$user" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || return 1
-  # DIVE-5098: on a claude seat, a long payload goes as typed line + paste. The
-  # gap lets the TUI take the typed line as its own input chunk; without it the
-  # two can merge into one paste, which is the defect. One loop, so this stays
-  # the ONE literal inject behind the guard above (DIVE-2137 lockstep).
+  # DIVE-5098: on a claude seat, a long VOUCHED payload goes as typed line +
+  # paste (only a caller that set _WAKE_VOUCH=1 — see _wake_sender_vouchable).
+  # The gap lets the TUI take the typed line as its own input chunk; without it
+  # the two can merge into one paste, which is the defect. One loop, so this
+  # stays the ONE literal inject behind the guard above (DIVE-2137 lockstep).
   _WAKE_HEAD=""; _WAKE_BODY="$payload"
-  [[ -n "$(_hb_claude_pid "$name")" ]] && _wake_split "$payload"
+  [[ "${_WAKE_VOUCH:-0}" == "1" && -n "$(_hb_claude_pid "$name")" ]] && _wake_split "$payload"
   local -a _parts=("$_WAKE_BODY"); local _pi
   [[ -n "$_WAKE_HEAD" ]] && _parts=("$_WAKE_HEAD" "$_WAKE_BODY")
   for _pi in "${!_parts[@]}"; do
@@ -2215,11 +2253,13 @@ cmd_deliver() {
   if ! _agent_delivery_inbox "$target" >/dev/null 2>&1 && ! wait_agent_input_ready "$target"; then
     step "agent '$target' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
-  local _rc=0 _delivered=1 _queued=0 _reason="" _summary=""
+  local _rc=0 _delivered=1 _queued=0 _reason="" _summary="" _vouch=0
+  # DIVE-5098: the typed operator line only for a measured local seat.
+  _wake_sender_vouchable "$s" "$_caller" && _vouch=1
   if (( urgent_eff )); then
-    _A2A_INTERRUPTING=1 inject_and_submit "$target" "$payload" || _rc=$?
+    _WAKE_VOUCH="$_vouch" _A2A_INTERRUPTING=1 inject_and_submit "$target" "$payload" || _rc=$?
   else
-    inject_and_submit "$target" "$payload" || _rc=$?
+    _WAKE_VOUCH="$_vouch" inject_and_submit "$target" "$payload" || _rc=$?
   fi
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$target")"
@@ -3079,14 +3119,18 @@ cmd_send() {
     step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
 
-  local _rc=0 _sent=1 _queued=0 _reason="" _summary=""
+  local _rc=0 _sent=1 _queued=0 _reason="" _summary="" _vouch=0
+  # DIVE-5098: the typed operator line only when the sender measures as a local
+  # seat. An a2a relay (`--from=<contact>` from root), a spoofed or --raw send
+  # keeps the bare paste — see _wake_sender_vouchable.
+  _wake_sender_vouchable "$sender" "$_audit_caller" && _vouch=1
   # DIVE-4769: a granted urgent joins the interrupting class for this one call.
   # _A2A_INTERRUPTING is the SAME door the flush and the TUI control lines use
   # (_a2a_should_queue reads it first), so there is one bypass, not two.
   if (( urgent_eff )); then
-    _A2A_INTERRUPTING=1 inject_and_submit "$name" "$payload" || _rc=$?
+    _WAKE_VOUCH="$_vouch" _A2A_INTERRUPTING=1 inject_and_submit "$name" "$payload" || _rc=$?
   else
-    inject_and_submit "$name" "$payload" || _rc=$?
+    _WAKE_VOUCH="$_vouch" inject_and_submit "$name" "$payload" || _rc=$?
   fi
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
@@ -3449,7 +3493,9 @@ cmd_ask() {
     # to this msg_id — so spooling it does not delay the question, it strands the
     # asker on a reply that will never render. The marker is set here, by the
     # transport, and there is no caller flag that can set it.
-    _A2A_INTERRUPTING=1 inject_and_submit "$name" "$payload" || _rc=$?
+    local _vouch=0
+    _wake_sender_vouchable "$sender" "$_audit_caller" && _vouch=1   # DIVE-5098
+    _WAKE_VOUCH="$_vouch" _A2A_INTERRUPTING=1 inject_and_submit "$name" "$payload" || _rc=$?
     if (( _rc == 3 )); then
       fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
     elif (( _rc != 0 )); then
