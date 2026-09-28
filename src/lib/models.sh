@@ -45,6 +45,71 @@ resolve_model_alias() {
   printf '%s' "$want"
 }
 
+# ---------------------------------------------------------------------------
+# Alias-mapping accounts (DIVE-5163).
+#
+# A non-Anthropic claude account (the seeded OpenRouter one on a partner box, a
+# client's own DeepSeek, any `--provider`/`--base-url` profile) carries an
+# ANTHROPIC_BASE_URL plus ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL: its own
+# answer to "sonnet". Claude Code applies that map to ALIASES only — a full
+# claude-* id goes out as-is, and OpenRouter serves claude-sonnet-5 as real
+# Claude Sonnet at API price. So resolve_model_alias above is wrong for these
+# accounts: an OINOA pack's "sonnet" became a Claude Sonnet bill on a box whose
+# account says sonnet = deepseek/deepseek-v4.1-flash.
+#
+# On such an account the family resolves to the account's MAPPED id instead. A
+# full vendor id, never the bare alias: the create/import config dir is fresh,
+# and migration 13 (header of this file) strips a bare alias there. An Anthropic
+# account (no base url) keeps resolve_model_alias, i.e. today's DIVE-506 id.
+#
+# The family is also recorded as the registry's `.agents[<n>].modelFamily`, so
+# `agent set-account` can re-derive the model for the new account: the mapped
+# id alone cannot say which family it came from (all three OpenRouter tiers map
+# to the same slug).
+# ---------------------------------------------------------------------------
+
+# profile_alias_model <profile> <family> -> the id the profile maps <family> to,
+# or "" when the profile is an Anthropic account, has no map for that family
+# (fable has no ANTHROPIC_DEFAULT_* variable), or maps it to a bare alias.
+profile_alias_model() {
+  local profile="${1:-}" fam="${2:-}" var mapped
+  case "$fam" in
+    opus|sonnet|haiku) var="ANTHROPIC_DEFAULT_${fam^^}_MODEL" ;;
+    *) return 0 ;;
+  esac
+  [[ -n "$profile" && -n "$(profile_env_value "$profile" ANTHROPIC_BASE_URL)" ]] || return 0
+  mapped=$(profile_env_value "$profile" "$var")
+  # A map entry that is itself a family alias would be written bare into a fresh
+  # config dir and stripped: not an answer, so fall back to the resolver.
+  model_latest "$mapped" >/dev/null && return 0
+  printf '%s' "$mapped"
+}
+
+# resolve_model_for_profile <alias-or-id> <profile> -> the id to write for an
+# agent bound to <profile>: the account's mapped id for a family alias on an
+# alias-mapping account, else exactly resolve_model_alias.
+resolve_model_for_profile() {
+  local want="${1:-}" profile="${2:-}" mapped
+  if model_latest "$want" >/dev/null; then
+    mapped=$(profile_alias_model "$profile" "$want")
+    [[ -n "$mapped" ]] && { printf '%s' "$mapped"; return 0; }
+  fi
+  resolve_model_alias "$want"
+}
+
+# model_family_of <model> -> the family a model value stands for when that can
+# be read off the value itself: a bare alias, or a family's CURRENT claude-* id.
+# Empty for anything else (a vendor slug, an older pinned id).
+model_family_of() {
+  local m="${1:-}" fam
+  [[ -n "$m" ]] || return 0
+  while read -r fam; do
+    if [[ "$m" == "$fam" || "$m" == "$(model_latest "$fam")" ]]; then
+      printf '%s' "$fam"; return 0
+    fi
+  done < <(model_families)
+}
+
 # models_json -> {"opus":"claude-opus-5-5",...}. This is what the telegram plugin
 # reads at boot so its /model picker can't drift from the CLI again.
 models_json() {

@@ -3043,6 +3043,14 @@ cmd_create() {
     # through so this agent starts on the requested OpenRouter/vendor slug.
     local _claude_create_model="$byo_model"
     _claude_create_model=$(claude_create_start_model "$_claude_create_model" "$byo_provider" "$byo_base_url")
+    # DIVE-5163: a family alias resolves against the account this agent is bound
+    # to. On an alias-mapping account (OpenRouter, a direct vendor) that is the
+    # account's own id for the family; on Anthropic it is the current claude-* id
+    # (DIVE-506: never the bare alias, which a fresh config dir strips). The
+    # no-model default is left to the preseed and claude_create_start_model.
+    if model_latest "$_claude_create_model" >/dev/null; then
+      _claude_create_model=$(resolve_model_for_profile "$_claude_create_model" "$profile")
+    fi
     preseed_claude_agent "$name" "$channels" "$_claude_create_model" "${byo_effort:-high}"
   elif [[ "$type" == "antigravity" ]]; then
     # antigravity needs no claude-style ~/.claude preseed (agy reads its own
@@ -3236,12 +3244,17 @@ cmd_create() {
   fi
 
   step "Registering in $REGISTRY"
-  jq --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$workdir" --arg p "$profile" --arg bu "$bot_username" --arg ts "$(date -Iseconds)" --arg iso "$isolation" --arg oid "$openagent_id" \
+  # DIVE-5163: a claude agent created with a family alias remembers the family,
+  # so `agent set-account` can re-derive its model for another account.
+  local _model_family=""
+  [[ "$type" == "claude" ]] && model_latest "$byo_model" >/dev/null && _model_family="$byo_model"
+  jq --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$workdir" --arg p "$profile" --arg bu "$bot_username" --arg ts "$(date -Iseconds)" --arg iso "$isolation" --arg oid "$openagent_id" --arg mf "$_model_family" \
     '.agents[$n] = (
       {type: $t, channels: $c, createdAt: $ts, isolation: $iso, openagentId: $oid}
       + (if $w == "" then {} else {workdir: $w} end)
       + (if $p == "" then {} else {authProfile: $p} end)
       + (if $bu == "" then {} else {botUsername: $bu} end)
+      + (if $mf == "" then {} else {modelFamily: $mf} end)
     )' <<<"$reg" | registry_write
 
   # Git reads hooksPath on each commit, so this covers every coding tool and
