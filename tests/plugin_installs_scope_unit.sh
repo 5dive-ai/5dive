@@ -373,6 +373,33 @@ human_out=$(curl() { case "${*: -1}" in
 tn "T2m no 'add the registry first' hint when only a repo row is not ready" "need their marketplace first" "$human_out"
 tc "T2m ...the repo row names its one-command install instead" "voice: 5dive plugin add 5dive-ai/5dive-voice" "$human_out"
 
+# T2n — DIVE-5123: a2a lives in 5dive-ai/5dive-a2a and no box offered it, because
+# that repo was not in FIVEDIVE_STANDALONE_PLUGIN_REPOS (lodar, 2026-09-28: "why no
+# a2a in the plugins for all ?"). The index below is the repo's published
+# .claude-plugin/marketplace.json, trimmed to the fields the listing reads.
+export STATE_DIR="$TMP/state-a2a"
+curl() {
+  case "${*: -1}" in
+    */5dive-a2a/main/.claude-plugin/marketplace.json)
+      printf '%s\n' '{"name":"5dive-a2a","plugins":[{"name":"a2a","category":"communication","description":"Experimental. Agents on different boxes message each other directly.","source":"./a2a"}]}' ;;
+    */5dive-plugins/main/.claude-plugin/marketplace.json)
+      printf '%s\n' '{"name":"5dive-plugins","plugins":[{"name":"telegram","category":"productivity"},{"name":"browser","category":"channel"}]}' ;;
+    *) return 22 ;;
+  esac
+}
+JSON_MODE=1
+run cmd_market_plugins --kind=plugin
+JSON_MODE=0
+t "T2n listing with a2a's repo succeeded (rc)" "0" "$RC"
+t "T2n a2a is listed once, from 5dive-a2a, box-wide, installed by repo, not ready on a box with no clone" \
+  "1|a2a|5dive-a2a|box|5dive-ai/5dive-a2a|false" \
+  "$(jq -r '[.data.plugins[] | select(.name=="a2a")] | "\(length)|\(.[0].name)|\(.[0].marketplace)|\(.[0].installs)|\(.[0].install)|\(.[0].ready)"' <<<"$OUT")"
+t "T2n ...added after the registry rows, which keep their order" \
+  "telegram@5dive-plugins browser@5dive-plugins a2a@5dive-a2a" \
+  "$(jq -r '[.data.plugins[] | "\(.name)@\(.marketplace)"] | join(" ")' <<<"$OUT")"
+unset -f curl
+export STATE_DIR="$_st_save"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

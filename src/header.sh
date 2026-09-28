@@ -278,7 +278,10 @@ readonly FIVEDIVE_CHANNEL_PLUGINS_JSON='[{"plugin":"telegram","marketplace":"5di
 # marketplace is registered — which is what the install itself does. A plugin the
 # registry ALSO lists is not re-listed from here (registry wins, no second copy) —
 # unless the pair is in FIVEDIVE_MOVED_PLUGINS below.
-readonly FIVEDIVE_STANDALONE_PLUGIN_REPOS="5dive-council 5dive-voice"
+# DIVE-5123: 5dive-a2a joins, so every customer box's catalogue (and the dashboard
+# tiles built from it) offers a2a. Customer boxes only: api.5dive.com still does not
+# run it (lodar, 2026-09-27) — offering a plugin is not installing it.
+readonly FIVEDIVE_STANDALONE_PLUGIN_REPOS="5dive-council 5dive-voice 5dive-a2a"
 
 # DIVE-4964: plugins that MOVED out of the registry into their own repo, as
 # `<plugin>:<repo>`. For these the standalone row REPLACES the registry row, so the
