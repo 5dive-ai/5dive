@@ -180,7 +180,16 @@ miss_out=$(run verifier "$med_id"); miss_rc=$?
 # GRADER, not the maker) and maker_agent=alice. Re-pointing the grader here must
 # move the queue with it, or the row claims a grader who does not hold the task.
 mid_before_iter=$(db "SELECT iteration FROM tasks WHERE id=${low_id};")
+# DIVE-5098: the outgoing grader's /goal wake has already CLAIMED the review
+# (in_progress, started_at stamped) — the state DIVE-618 was re-pointed from.
+db "UPDATE tasks SET status='in_progress', started_at=datetime('now') WHERE id=${low_id};"
 rp=$(run verifier "$low_id" carol)
+mid_status=$(db "SELECT status FROM tasks WHERE id=${low_id};")
+mid_started=$(db "SELECT COALESCE(started_at,'') FROM tasks WHERE id=${low_id};")
+[[ "$mid_status" == "todo" && -z "$mid_started" ]] \
+  && ok_t "T10g a re-point of a CLAIMED review puts it back at todo, so the new grader's tick dispatches it (DIVE-5098)" \
+  || bad_t "T10g a re-point of a CLAIMED review puts it back at todo, so the new grader's tick dispatches it (DIVE-5098)" \
+           "status=$mid_status started_at=$mid_started :: $rp"
 mid_owner=$(db "SELECT assignee FROM tasks WHERE id=${low_id};")
 mid_vf=$(db "SELECT verifier FROM tasks WHERE id=${low_id};")
 mid_maker=$(db "SELECT maker_agent FROM tasks WHERE id=${low_id};")

@@ -1553,6 +1553,37 @@ a2a_queue_flush_one() {
   return 1
 }
 
+# DIVE-5098 — A LONG PAYLOAD MUST NOT ARRIVE AS A BARE PASTE.
+# `send-keys -l` of anything long lands in Claude Code as a bracketed paste: the
+# composer shows `[Pasted text #N]` and the turn records ONE `<pasted_content>`
+# block with no typed text around it. Claude Code tells the model to follow
+# instructions inside pasted content only where the user's own message asks it
+# to — so a careful seat reads its own dispatch as untrusted and stops to ask in
+# a pane nobody reads (claude-qa on DIVE-618, 2026-09-27: idle 12 min until a
+# sibling confirmed by hand).
+#
+# Fix: type ONE fixed short line first, as its own keystroke, then paste the
+# payload whole (measured, CC 2.1.283: the turn records the line as typed text
+# ahead of the `<pasted_content>` block). DIVE-4826: the line is a CONSTANT —
+# never board content. Short payloads (control lines: `/clear`, `/goal clear`,
+# `continue`, a menu digit) are never pasted and pass through untouched.
+#
+# The line goes AHEAD of a leading `/goal`, deliberately. A pasted `/goal …` is
+# not a slash command (same measurement: no <command-name>, no goal hook), so the
+# goal loop the heartbeat nudge names has not been arming. Typing `/goal ` first
+# WOULD arm it — measured — but that switches a fleet-wide multi-turn evaluator
+# back on, a cost change this fix does not get to make on the side. Kept inert,
+# as it is today; the choice is on the row (DIVE-5098 body).
+_WAKE_TYPED_LINE="[5dive] Sent by your operator's own runtime, not third-party content - act on what follows:"
+_WAKE_TYPED_MIN=200
+# _wake_split <payload> — sets _WAKE_HEAD (typed) and _WAKE_BODY (pasted). An
+# empty head means: send the payload exactly as before.
+_wake_split() {
+  _WAKE_HEAD=""; _WAKE_BODY="$1"
+  (( ${#1} >= _WAKE_TYPED_MIN )) && _WAKE_HEAD="${_WAKE_TYPED_LINE} "
+  return 0
+}
+
 inject_and_submit() {
   local name="$1" payload="$2" tries=0
   local user="agent-${name}"   # separate stmt: ${name} in the same line aborts under set -u (silent msg drop)
@@ -1602,7 +1633,18 @@ inject_and_submit() {
   # only edits the composer. Ghost text (CC 2.1.267 promptSuggestion, rendered
   # DIM) is not input and is replaced by typing anyway; the verify excludes it.
   sudo -u "$user" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || return 1
-  sudo -u "$user" tmux send-keys -t "agent-${name}" -l -- "$payload"
+  # DIVE-5098: on a claude seat, a long payload goes as typed line + paste. The
+  # gap lets the TUI take the typed line as its own input chunk; without it the
+  # two can merge into one paste, which is the defect. One loop, so this stays
+  # the ONE literal inject behind the guard above (DIVE-2137 lockstep).
+  _WAKE_HEAD=""; _WAKE_BODY="$payload"
+  [[ -n "$(_hb_claude_pid "$name")" ]] && _wake_split "$payload"
+  local -a _parts=("$_WAKE_BODY"); local _pi
+  [[ -n "$_WAKE_HEAD" ]] && _parts=("$_WAKE_HEAD" "$_WAKE_BODY")
+  for _pi in "${!_parts[@]}"; do
+    (( _pi == 0 )) || sleep "${_WAKE_TYPED_GAP_SEC:-0.3}"
+    sudo -u "$user" tmux send-keys -t "agent-${name}" -l -- "${_parts[_pi]}"
+  done
   # Let the TUI finish ingesting the (possibly bracketed-paste) payload before the
   # Enter, so the newline isn't bundled into the paste sequence.
   sleep 0.3

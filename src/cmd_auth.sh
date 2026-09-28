@@ -113,7 +113,10 @@ auth_probe_output() {
     local pf="${AUTH_PROFILES_DIR}/${profile}/combined.env"
     env_src+="[ -r $pf ] && set -a && . $pf && set +a; "
   fi
-  sudo -u claude -i timeout "${secs}s" bash -lc "${env_src}${probe}" 2>&1 || true
+  # </dev/null (DIVE-5098): with a stdin attached, `claude --print` spent ~3 of
+  # the 5s waiting on it, and a probe that times out prints nothing — which the
+  # matcher below reads as ok.
+  sudo -u claude -i timeout "${secs}s" bash -lc "${env_src}${probe}" </dev/null 2>&1 || true
   return 0
 }
 
@@ -141,7 +144,11 @@ auth_probe_one() {
   # substrings rather than exit codes because --print flips its exit code
   # based on whether stdout is a TTY. Rate-limit / usage-limit responses
   # are NOT in here — those mean the token works, the account is throttled.
-  if grep -qiE 'not logged in|please run /login|invalid api key|invalid bearer token|failed to authenticate|authentication.{0,10}failed|unauthorized|\b401\b' <<<"$out"; then
+  # DIVE-5098: a 403 org refusal ("Your organization has disabled Claude
+  # subscription access for Claude Code", permission_error,
+  # oauth_org_not_allowed) is a credential the provider refuses on every turn —
+  # stale, not ok. 13 seats on 4 logins read `claude: ok` through it on 09-28.
+  if grep -qiE 'not logged in|please run /login|invalid api key|invalid bearer token|failed to authenticate|authentication.{0,10}failed|unauthorized|\b401\b|disabled claude subscription access|not allowed for (this|your) organi[sz]ation|oauth_org_not_allowed|oauth_not_allowed_for_organi[sz]ation|permission_error|\b403\b' <<<"$out"; then
     return 1
   fi
   return 0
