@@ -50,7 +50,11 @@
 #      starting at a sentence start, markdown stripped, <= 60 words
 #   X  [c] a 1500+ char turn: neither send opens with "…" or mid-word
 #   V  MUTANT: the pre-5113 route (no agent lead) turns T red; the pre-5113 text
-#      (the raw capped tail) turns Q and X red
+#      (the raw capped tail) turns Q and X red; the iteration-1 envelope
+#      (from=task-engine) turns Z red
+#   Z  the forward survives the a2a spool: the real payload, run through the
+#      UNSTUBBED stale-nudge predicate with the named row on another seat and on a
+#      done row, is delivered; a from=task-engine control of it is dropped
 #
 # Stubs: systemctl (per unit), cmd_send (the a2a rail), _tg_access_state_dir (channel dirs into the temp tree),
 # _gate_channel_api (the Bot API seam), _reflex_endpoint_decide (the model),
@@ -505,7 +509,7 @@ ASK_OF() { local t; t=$(cut -d'|' -f4- "$TMP/api.log" | head -1); t="${t#quiet i
 
 # --- T) [a] a running agent above the seat is asked, not a person ------------------------------------------
 opt_out; fresh; DOWN="boss"; tx quiet "$MARCUS_Q"; tick
-[[ "$(a2as)" == 1 && "$(sends)" == 0 ]] && [[ "$(cut -d'|' -f1-2 "$TMP/a2a.log")" == "lead|task-engine" ]] \
+[[ "$(a2as)" == 1 && "$(sends)" == 0 ]] && [[ "$(cut -d'|' -f1-2 "$TMP/a2a.log")" == "lead|stuck-question" ]] \
   && ok_t "T1: its org parent is a running agent: one agent send to it, 0 Bot API sends" \
   || bad_t "T1: agent route" "a2a=$(cat "$TMP/a2a.log") api=$(cat "$TMP/api.log")"
 T_MSG=$(cat "$TMP/a2a.last")
@@ -609,6 +613,49 @@ U_MUT=$(sends)
   || bad_t "M3: mutant must lose the retry" "send-fail retry sends=$S_MUT re-pair sends=$U_MUT"
 eval "$SWEEP_SRC"
 
+# Z) DIVE-5113 iteration 2: the forward must SURVIVE THE REAL SPOOL. cmd_send is
+# stubbed above, so nothing here would see a busy lead's spool delete the
+# question at drain. _a2a_stale_nudge_reason is the drop predicate, run UNSTUBBED
+# against this harness's tasks db on the envelope cmd_send renders around the
+# sweep's own send. The seat's words name its own row (on quiet, not the lead)
+# and a done row: the two drop reasons a task-engine envelope would hit.
+# One ident per LINE: the predicate's `grep -m1 -o` returns every ident on the
+# first matching line, and two of them make a lookup that finds no row and fails
+# open, which would let Z2 pass without the envelope doing anything (Z0 catches it).
+SEAT_ROW_Q="Watcher on DIVE-4990 disarmed itself on 09-05.
+
+Should I file this as a high row and open the PR?"
+DONE_ROW_Q="DIVE-4991 closed, but its watcher never re-armed.
+
+Should I reopen it or file a new row?"
+db "INSERT INTO tasks(ident, title, status, assignee) VALUES
+      ('DIVE-4990', 'watcher', 'in_progress', 'quiet'), ('DIVE-4991', 'old watcher', 'done', 'quiet');" >/dev/null
+spooled() { # [from] — the envelope cmd_send renders around the sweep's last send
+  local from="${1:-$(tail -1 "$TMP/a2a.log" | cut -d'|' -f2)}"
+  printf '[5dive-msg from=%s id=m-5113 tier=root] %s' "$from" "$(cat "$TMP/a2a.last")"
+}
+verdict() { # <payload> -> "deliver" or "DROP: <reason>"
+  local r; if r=$(_a2a_stale_nudge_reason lead "$1"); then printf 'DROP: %s' "$r"; else printf 'deliver'; fi
+}
+opt_out; fresh; DOWN="boss"; tx quiet "$SEAT_ROW_Q"; tick; DOWN="lead boss"
+Z_FROM=$(tail -1 "$TMP/a2a.log" | cut -d'|' -f2); Z_OWN=$(verdict "$(spooled)")
+Z_CTRL_OWN=$(verdict "$(spooled task-engine)")
+opt_out; fresh; DOWN="boss"; tx quiet "$DONE_ROW_Q"; tick; DOWN="lead boss"
+Z_DONE=$(verdict "$(spooled)"); Z_CTRL_DONE=$(verdict "$(spooled task-engine)")
+[[ "$Z_CTRL_OWN" == "DROP: DIVE-4990 is now on quiet" && "$Z_CTRL_DONE" == "DROP: DIVE-4991 is done" ]] \
+  && ok_t "Z0: (control) the live predicate DROPS this very text under from=task-engine, for both reasons" \
+  || bad_t "Z0: the predicate must drop the task-engine envelope" "own=$Z_CTRL_OWN done=$Z_CTRL_DONE"
+valid_sender_label "$Z_FROM" && [[ "$Z_FROM" != task-engine \
+    && "$(envelope_peer_forgery "$Z_FROM" root)" == ok:synthetic-label ]] \
+  && ok_t "Z1: the forward's sender '$Z_FROM' is a valid synthetic label the forgery guard lets root claim" \
+  || bad_t "Z1: sender label" "from=$Z_FROM forgery=$(envelope_peer_forgery "$Z_FROM" root)"
+[[ "$Z_OWN" == deliver ]] \
+  && ok_t "Z2: the real payload naming the seat's own row (on another seat than the lead) is DELIVERED at drain" \
+  || bad_t "Z2: own-row forward must be delivered" "$Z_OWN"
+[[ "$Z_DONE" == deliver ]] \
+  && ok_t "Z3: the real payload naming a done row is DELIVERED at drain" \
+  || bad_t "Z3: done-row forward must be delivered" "$Z_DONE"
+
 # V) DIVE-5113 mutants: the pre-5113 route and the pre-5113 text.
 eval "$(sed 's/if lead=\$(_hb_stuck_q_lead "\$name"); then/if false; then/' <<<"$SWEEP_SRC")"
 has "$(declare -f _hb_stuck_question_sweep)" 'if false; then' \
@@ -627,6 +674,18 @@ fresh; tx quiet "$OPS_Q"; tick
   && ok_t "V2: MUTANT (old text): the phone gets a '…'-prefixed markdown tail — Q1 and X2 go red" \
   || bad_t "V2: mutant must send the raw tail" "$(ASK_OF | head -c 120)"
 eval "$SWEEP_SRC"
+# V3: iteration 1's envelope. The same sweep, the same text, sent as task-engine.
+SEND_SRC=$(declare -f _hb_stuck_q_agent_send)
+eval "$(sed 's/--from="\$_HB_STUCK_Q_SENDER"/--from="task-engine"/' <<<"$SEND_SRC")"
+has "$(declare -f _hb_stuck_q_agent_send)" '--from="task-engine"' \
+  && ok_t "V0c: (anchor) the task-engine envelope mutation landed" \
+  || bad_t "V0c: envelope mutation anchor" "the sed pattern no longer matches src/cmd_heartbeat.sh"
+opt_out; fresh; DOWN="boss"; tx quiet "$SEAT_ROW_Q"; tick; V3_OWN=$(verdict "$(spooled)")
+fresh; tx quiet "$DONE_ROW_Q"; tick; V3_DONE=$(verdict "$(spooled)"); DOWN="lead boss"
+[[ "$V3_OWN" == DROP:* && "$V3_DONE" == DROP:* ]] \
+  && ok_t "V3: MUTANT (from=task-engine): the lead's spool drops the question — Z2 and Z3 go red" \
+  || bad_t "V3: mutant must be dropped" "own=$V3_OWN done=$V3_DONE"
+eval "$SEND_SRC"
 
 echo "-----"
 printf 'PASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"

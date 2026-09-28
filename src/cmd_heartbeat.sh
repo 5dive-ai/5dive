@@ -459,7 +459,9 @@ _HB_A2A_DRAIN_POLL_SEC="${FIVE_A2A_DRAIN_POLL_SEC:-5}"
 #   3. a newer nudge for the same row is already spooled behind it (3 older
 #      duplicates) — delivering both spends two rounds to say one thing.
 #
-# ONLY from=task-engine, AND THAT IS THE WHOLE SAFETY ARGUMENT. A machine nudge
+# ONLY from=task-engine, AND THAT IS THE WHOLE SAFETY ARGUMENT. A rail that
+# relays words an agent wrote must therefore use another sender (DIVE-5113's
+# stuck-question forward sends as from=stuck-question for exactly this reason). A machine nudge
 # is a re-derivable statement about a row's state, so re-deriving it at delivery
 # time and finding it false makes it noise. A human- or agent-authored message is
 # not re-derivable and is NEVER dropped: it may be a question, a correction, or
@@ -7746,6 +7748,7 @@ _HB_STUCK_Q_RETRY_MAX_S=3600
 _HB_STUCK_Q_QMARK_RE='[?]([[:space:]"*_`)]|$)'
 _HB_STUCK_Q_ASK_RE='(^|[^[:alpha:]])(need you to|please confirm|should i|can you|waiting for your)([^[:alpha:]]|$)'
 _HB_STUCK_Q_OPTIONS='asks_human,progress,report,idle'
+_HB_STUCK_Q_SENDER=stuck-question   # relayed agent words: never the droppable task-engine class
 
 # `_hb_seat_ended_turn_text <agent>` — the seat's last assistant text when its
 # turn has ENDED, else rc 1. Ended = the last user/assistant record of the newest
@@ -7896,7 +7899,7 @@ _hb_stuck_q_tail() { # <text> <max>
 # whole sentences while they fit; a single asking sentence longer than that is
 # cut at a word with a trailing "…". Never from the front mid-word.
 _hb_stuck_q_plain_ask() { # <text>
-  local para s out="" w=0 sw started=0
+  local para s out="" w=0 sw started=0 i
   local -a sents=()
   para=$(printf '%s\n' "$1" | awk 'BEGIN { RS = "" } { p = $0 } END { print p }' \
     | sed -E 's/\[([^]]*)\]\([^)]*\)/\1/g; s/^[[:space:]]*(#+|[-*+>]|[0-9]+[.)])[[:space:]]+//; s/\*\*|__|[*`]//g' \
@@ -7933,8 +7936,17 @@ _hb_stuck_q_plain_ask() { # <text>
 }
 
 # The agent route's one send, a function so the harness can replace the rail.
+#
+# NOT from=task-engine. That envelope is the class the a2a spool may DROP:
+# _a2a_stale_nudge_reason re-derives a task-engine message from the first DIVE-
+# ident in it and unlinks it at drain when that row is done or on another seat.
+# The text here is the seat's own words, which usually name the seat's own row,
+# so a busy lead's spool would delete the question with rc 0 already returned and
+# the sweep gone terminal: nobody would receive it (quinn, DIVE-5113 iteration 1).
+# A synthetic label that is not a registered agent passes the forgery guard
+# (envelope_peer_forgery: ok:synthetic-label) and is never matched as a nudge.
 _hb_stuck_q_agent_send() { # <lead> <seat> <text>
-  ( cmd_send "$1" --from="task-engine" --message="${2} ended its turn waiting for an answer, and you are the nearest running agent above it. Its last words:"$'\n\n'"${3}"$'\n\n'"Answer with 5dive agent send ${2} '…'. If only a person can decide, ask your human." ) >/dev/null 2>&1
+  ( cmd_send "$1" --from="$_HB_STUCK_Q_SENDER" --message="${2} ended its turn waiting for an answer, and you are the nearest running agent above it. Its last words:"$'\n\n'"${3}"$'\n\n'"Answer with 5dive agent send ${2} '…'. If only a person can decide, ask your human." ) >/dev/null 2>&1
 }
 
 # The sweep's clock, a function so the harness can move time past a backoff.
