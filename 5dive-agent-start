@@ -1468,11 +1468,29 @@ fi
 #                  let i = canon(resolve(n,"..")); if (i === n) break; n = i }
 #   return false;
 #
-# So: a workdir AT OR UNDER the trusted root is already covered by the walk —
-# skip it, and the JSON stays clean. And /home/agent-<name> walks to /home then
-# / and never meets /home/claude/projects, so the reported case is real and the
-# walk does not rescue it. The walk canonicalizes each key and the cwd claude
-# sees is already symlink-resolved, so seed the canonical form.
+# /home/agent-<name> walks to /home then / and never meets /home/claude/projects,
+# so the reported case is real and the walk does not rescue it. The walk
+# canonicalizes each key and the cwd claude sees is already symlink-resolved, so
+# seed the canonical form.
+#
+# DIVE-5089: the walk is NOT unbounded any more, so seed EVERY workdir, under
+# the root included. Measured in the 2.1.283 bundle and live on this host: the
+# walk now STOPS AT THE GIT REPOSITORY ROOT that contains cwd —
+#
+#   function dS(cfg, cwd, gitRoot) { let s = canon(cwd); while (true) {
+#     if (!(gitRoot === null || s === gitRoot || s.startsWith(gitRoot + "/")))
+#       return null;
+#     if (cfg.projects?.[s]?.hasTrustDialogAccepted) return s;
+#     if (s === gitRoot) return null; ... s = parent(s) } }
+#
+# so a workdir that is (or sits inside) its own git repo under
+# /home/claude/projects never reaches the root's entry. oinoa
+# (--workdir=/home/claude/projects/my-oinoa, a git repo) parked on the dialog
+# with "No, exit" selected for 6.6 h behind the old at-or-under-root skip. A
+# live control/treatment on 2.1.283: plain subdir of a trusted root → no dialog;
+# git-repo subdir of the same root → dialog; exact workdir key seeded → no
+# dialog, also for a subdir inside a repo. The seed costs one key and is a no-op
+# once the flag is already true, so there is nothing left to skip for.
 #
 # ASSERT THE FIELD, NOT THE KEY. Claude Code creates the project entry itself on
 # first visit with hasTrustDialogAccepted:FALSE (the bundle's default project
@@ -1489,17 +1507,18 @@ fi
 # throughout — this runs under `set -e` and must NEVER stop an agent launching.
 if [[ "$TYPE" == "claude" && -n "${WORKDIR:-}" ]]; then
   _wtr_cfg="$HOME/.claude.json"
-  # Canonicalize both sides the way the bundle's trust walk does. `cd && pwd -P`
+  # Canonicalize the way the bundle's trust walk does. `cd && pwd -P`
   # rather than `realpath -m` so an unreadable path degrades to the literal
   # instead of to a guess; WORKDIR was already accessibility-checked at the top.
   _wtr_dir=$(cd "$WORKDIR" 2>/dev/null && pwd -P) || _wtr_dir=""
   [[ -n "$_wtr_dir" ]] || _wtr_dir="$WORKDIR"
-  _wtr_root=$(cd "$DEFAULT_WORKDIR" 2>/dev/null && pwd -P) || _wtr_root=""
-  [[ -n "$_wtr_root" ]] || _wtr_root="$DEFAULT_WORKDIR"
-  # Keyed on the effective workdir differing from the trusted root, NOT on the
-  # sandboxed branch: an --workdir=/srv/x agent at standard isolation is the same
-  # defect. At-or-under the root is already covered by the parent walk.
-  if [[ "$_wtr_dir" != "$_wtr_root" && "$_wtr_dir" != "$_wtr_root"/* ]]; then
+  # Keyed on the effective workdir's OWN entry, NOT on the sandboxed branch (an
+  # --workdir=/srv/x agent at standard isolation is the same defect) and NOT on
+  # where it sits relative to the root (DIVE-5089: the walk stops at a git root).
+  # Skip only when that exact canonical key already carries the flag — which is
+  # every default-workdir agent, whose key the create-time preseed wrote.
+  if ! jq -e --arg d "$_wtr_dir" '.projects[$d].hasTrustDialogAccepted == true' \
+         "$_wtr_cfg" >/dev/null 2>&1; then
     _wtr_base='{}'
     if [[ -r "$_wtr_cfg" ]] && jq -e 'type == "object"' "$_wtr_cfg" >/dev/null 2>&1; then
       _wtr_base=$(cat "$_wtr_cfg")
@@ -1538,9 +1557,9 @@ if [[ "$TYPE" == "claude" && -n "${WORKDIR:-}" ]]; then
       echo "[5dive] agent=${NAME} WARN: could not build the workdir trust seed for ${_wtr_dir} — leaving ${_wtr_cfg} untouched" >&2
     fi
   else
-    echo "[5dive] agent=${NAME} workdir ${_wtr_dir} is under the trusted root ${_wtr_root} — no trust seed needed" >&2
+    echo "[5dive] agent=${NAME} workdir ${_wtr_dir} is already trusted in ${_wtr_cfg} — no trust seed needed" >&2
   fi
-  unset _wtr_cfg _wtr_dir _wtr_root _wtr_base _wtr_next _wtr_tmp 2>/dev/null || :
+  unset _wtr_cfg _wtr_dir _wtr_base _wtr_next _wtr_tmp 2>/dev/null || :
 fi
 
 # DIVE-1591: pre-answer Claude Code's custom-API-key gate.

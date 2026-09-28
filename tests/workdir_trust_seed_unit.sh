@@ -119,12 +119,36 @@ H=$(run standard claude "$ROOT")
 check "standard: config is untouched" "$(unchanged "$H" "$(preseed)")" "same"
 check "standard: only the trusted root is listed" "$(jqf "$H" '.projects | length')" "1"
 
-# --- 4. a workdir UNDER the root is already covered by the parent walk --------
-# Measured in the 2.1.222 bundle: the trust check walks cwd's parents, so
-# $ROOT/5dive inherits $ROOT's entry. Adding one would be noise, not a fix.
+# --- 4. a workdir UNDER the root is seeded too (DIVE-5089) --------------------
+# 2.1.222 walked cwd's parents without limit, so $ROOT/5dive inherited $ROOT's
+# entry and this arm used to assert "no entry added". 2.1.283 stops the walk at
+# the git repository root containing cwd, so a workdir that is its own repo never
+# reaches $ROOT — oinoa (/home/claude/projects/my-oinoa, a git repo) parked on
+# the dialog for 6.6 h. The seed must not reason about the walk at all.
 H=$(run underroot claude "$ROOT/5dive")
-check "under-root workdir: no redundant entry added" "$(jqf "$H" '.projects | length')" "1"
-check "under-root workdir: config untouched" "$(unchanged "$H" "$(preseed)")" "same"
+check "under-root workdir: entry is TRUSTED" "$(trusted "$H" "$ROOT/5dive")" "true"
+check "under-root workdir: root trust survives" "$(trusted "$H" "$ROOT")" "true"
+check "under-root workdir: announces the seed" \
+  "$(grep -c "trusted workdir $ROOT/5dive" "$H/.stderr")" "1"
+
+# 4b. THE oinoa SHAPE: `--workdir=<root>/<project>` where the project is a git
+# repo. A real `git init`, so the arm is the exact tree the bounded walk trips on.
+REPO="$ROOT/my-project"; mkdir -p "$REPO"
+git -C "$REPO" init -q 2>/dev/null || mkdir -p "$REPO/.git"
+H=$(run gitrepo claude "$REPO")
+check "git-repo workdir under root: entry is TRUSTED" "$(trusted "$H" "$REPO")" "true"
+check "git-repo workdir under root: project onboarding seeded" \
+  "$(jqf "$H" ".projects[\"$REPO\"].hasCompletedProjectOnboarding")" "true"
+check "git-repo workdir under root: root trust survives" "$(trusted "$H" "$ROOT")" "true"
+check "git-repo workdir under root: exits 0" "$(cat "$H/.rc")" "0"
+
+# 4c. already trusted (every default-workdir agent, and every later boot): the
+# guard reads the exact key's FLAG and leaves the file byte-for-byte alone.
+TRUSTED=$(preseed | jq -c --arg d "$REPO" '.projects[$d] = {hasTrustDialogAccepted:true}')
+H=$(run pretrusted claude "$REPO" "$TRUSTED")
+check "already-trusted workdir: config untouched" "$(unchanged "$H" "$TRUSTED")" "same"
+check "already-trusted workdir: says why it skipped" \
+  "$(grep -c "is already trusted" "$H/.stderr")" "1"
 
 # --- 5. ASSERT THE FIELD, NOT THE KEY ----------------------------------------
 # Claude Code creates the project entry itself on first visit with
@@ -170,12 +194,19 @@ check "missing config: mode 600"            "$(stat -c '%a' "$H/.claude.json")" 
 check "missing config: exits 0"             "$(cat "$H/.rc")" "0"
 
 # unwritable home: mktemp beside the target fails. Warn, launch anyway.
+# Root ignores mode bits, so chmod 500 cannot make a home unwritable for it — and
+# the delegated push runs this harness as root (DIVE-5089 hit it there). Skip
+# loudly as root; CI and every non-root run still grade the arm.
+if (( EUID == 0 )); then
+  echo "skip: unwritable home — running as root, which ignores the chmod this arm relies on"
+else
 UW="$TMP/unwritable"; mkdir -p "$UW"; printf '%s\n' "$(preseed)" > "$UW/.claude.json"; chmod 500 "$UW"
 ( set -euo pipefail; HOME="$UW"; NAME=probe; TYPE=claude; WORKDIR="$SANDBOX"; DEFAULT_WORKDIR="$ROOT"; eval "$BLOCK" ) 2>"$TMP/unwritable.stderr"
 UW_RC=$?; chmod 700 "$UW"
 check "unwritable home: exits 0 (never blocks a launch)" "$UW_RC" "0"
 check "unwritable home: warns"  "$(grep -c 'WARN' "$TMP/unwritable.stderr")" "1"
 check "unwritable home: leaves the config intact" "$(unchanged "$UW" "$(preseed)")" "same"
+fi
 
 # --- 9. other agent types are not touched ------------------------------------
 H=$(run codex codex "$SANDBOX")
@@ -227,17 +258,32 @@ M3="${BLOCK//hasTrustDialogAccepted: true,/}"
 mut_red "entry added without the trust boolean" "$M3" fieldless "$SANDBOX" "$(preseed)" \
   ".projects[\"$SANDBOX\"].hasTrustDialogAccepted" "true"
 
+# The shipped guard line, so every guard mutant below is a whole-line swap.
+GUARD='  if ! jq -e --arg d "$_wtr_dir" '"'"'.projects[$d].hasTrustDialogAccepted == true'"'"' \'
+check "guard line present in the block exactly once" "$(grep -cFx "$GUARD" <<<"$BLOCK")" "1"
+# Prefix/suffix split, NOT ${b/pat/rep}: bash 5.2's patsub_replacement expands a
+# bare `&` in the replacement to the matched text, so an `&&` guard came out as
+# the old line pasted twice — a syntax error that "goes red" for the wrong reason.
+swap_guard() { local b="$1" new="$2"; printf '%s%s%s\n' "${b%%"$GUARD"*}" "$new" "${b#*"$GUARD"}"; }
+
 # M4 — the sandboxed special case the ticket explicitly forbids. Passes the
-# sandboxed arm, strands every explicit --workdir agent.
-M4="${BLOCK//\"\$_wtr_dir\" != \"\$_wtr_root\" \&\& \"\$_wtr_dir\" != \"\$_wtr_root\"\/\*/\"\$_wtr_dir\" == *\/home\/agent-*}"
+# sandboxed arm, strands every explicit --workdir agent. (Trailing `true \`
+# swallows the guard's continuation line.)
+M4=$(swap_guard "$BLOCK" '  if [[ "$_wtr_dir" == */home/agent-* ]] && true \')
 mut_red "keyed on the sandboxed path shape, not on the workdir" "$M4" sandboxonly "$OUTSIDE" "$(preseed)" \
   ".projects[\"$OUTSIDE\"].hasTrustDialogAccepted" "true"
 
-# M5 — skip only on exact equality with the root, ignoring the parent walk.
-# Harmless-looking, but it grows a redundant entry per project subdir forever.
-M5="${BLOCK// \&\& \"\$_wtr_dir\" != \"\$_wtr_root\"\/\*/}"
-mut_red "equality-only skip (ignores the bundle's parent walk)" "$M5" eqonly "$ROOT/5dive" "$(preseed)" \
-  '.projects | length' "1"
+# M5 — THE PRE-DIVE-5089 SKIP restored: "at or under the root is covered by the
+# parent walk". It passes every arm outside the root and strands the oinoa shape.
+M5=$(swap_guard "$BLOCK" '  if [[ "$_wtr_dir" != "$DEFAULT_WORKDIR" && "$_wtr_dir" != "$DEFAULT_WORKDIR"/* ]] && true \')
+mut_red "at-or-under-root skip restored (the oinoa stall)" "$M5" underskip "$REPO" "$(preseed)" \
+  ".projects[\"$REPO\"].hasTrustDialogAccepted" "true"
+
+# M7 — skip on the KEY existing instead of the FLAG being true. Claude Code
+# writes the key itself with the flag false, so this strands a stranded agent.
+M7=$(swap_guard "$BLOCK" '  if ! jq -e --arg d "$_wtr_dir" '"'"'.projects[$d] != null'"'"' \')
+mut_red "skip keyed on the entry existing, not the flag" "$M7" keyskip "$SANDBOX" "$STRANDED" \
+  ".projects[\"$SANDBOX\"].hasTrustDialogAccepted" "true"
 
 # M6 — THE NAMED MUTATION from the ticket, transplanted. The create-path patch
 # (thread $workdir through to preseed_claude_agent at cmd_agent_create.sh:1752)
@@ -252,9 +298,13 @@ mut_red "workdir resolved too early (the create-path patch: empty for sandboxed)
   ".projects[\"$SANDBOX\"].hasTrustDialogAccepted" "true"
 
 # Every mutant must actually differ from the block, or mut_red graded a typo.
-for m in M2 M3 M4 M5 M6; do
+for m in M2 M3 M4 M5 M6 M7; do
   check "mutant $m really differs from the shipped block" \
     "$([[ "${!m}" != "$BLOCK" ]] && echo differs || echo identical)" "differs"
+  # A mutant that does not parse leaves the config untouched and so "goes red"
+  # without testing anything. It must be valid shell to count.
+  check "mutant $m is valid shell" \
+    "$(bash -n <(printf '%s\n' "${!m}") 2>/dev/null && echo parses || echo broken)" "parses"
 done
 
 echo
