@@ -262,7 +262,7 @@ _agent_avatar_backfill() {
   _agent_avatar_is_root || (( dry )) || fail "$E_GENERIC" "avatar backfill writes into every agent's home: run with sudo"
   ensure_state_ro
   local names; names=$(registry_read | jq -r '.agents | keys[]')
-  local set_list=() missing=() name home dst yaml ref src tmp why ytmp
+  local set_list=() missing=() name home dst yaml ref src tmp why ytmp personas
   ytmp=$(mktemp) || fail "$E_GENERIC" "mktemp failed"
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
@@ -275,15 +275,19 @@ _agent_avatar_backfill() {
     # Newest persona first: the one the agent last edited is its current face.
     # The walk, each persona read and the face.ref read below all run as the
     # agent (_agent_avatar_as): root reads nothing whose path the agent controls.
+    # Captured whole before the loop reads it (no procsub: an interrupted one
+    # would truncate the walk silently, the epipe census guard's shape).
+    personas=$(_agent_avatar_as "$name" find "$home" -maxdepth 4 \( -name node_modules -o -name .git -o -name .cache \) -prune \
+                 -o -type f \( -name '*.persona.yaml' -o -name 'persona.yaml' \) -printf '%T@ %p\n' 2>/dev/null \
+               | sort -rn | cut -d' ' -f2-)
     while IFS= read -r yaml; do
+      [[ -n "$yaml" ]] || continue
       _agent_avatar_as "$name" head -c 262144 -- "$yaml" >"$ytmp" 2>/dev/null || continue
       ref=$(_agent_avatar_persona_ref "$ytmp")
       [[ -n "$ref" ]] || continue
       src=$(_agent_avatar_resolve_ref "$name" "$yaml" "$ref") && break
       src=""
-    done < <(_agent_avatar_as "$name" find "$home" -maxdepth 4 \( -name node_modules -o -name .git -o -name .cache \) -prune \
-               -o -type f \( -name '*.persona.yaml' -o -name 'persona.yaml' \) -printf '%T@ %p\n' 2>/dev/null \
-             | sort -rn | cut -d' ' -f2-)
+    done <<<"$personas"
     [[ -n "$src" ]] || continue
     if (( dry )); then set_list+=("$name"); step "would set '$name' from $src"; continue; fi
     tmp=$(mktemp)
