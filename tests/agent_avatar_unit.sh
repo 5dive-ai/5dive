@@ -16,6 +16,10 @@ bad() { echo "FAIL: $1"; fail=$((fail+1)); }
 
 # shellcheck source=/dev/null
 source "$ROOT/src/cmd_agent_avatar.sh"
+# The fixture agents (alpha, beta, ...) are not real users, so a real `runuser -u
+# agent-alpha` cannot drop to them: every arm takes the caller branch, even when
+# the pre-push rail runs this as root. The root branch is graded by as_root below.
+_agent_avatar_is_root() { return 1; }
 export AGENT_HOME_ROOT="$TMP/home"
 mkdir -p "$AGENT_HOME_ROOT/agent-alpha/.claude"
 
@@ -81,10 +85,67 @@ ln -s "$TMP/victim" "$AGENT_HOME_ROOT/agent-upsilon/.claude/.avatar.png.$$"
 out=$(_agent_avatar_install upsilon "$TMP/a.gif"); rc=$?
 [[ "$(cat "$TMP/victim")" == victim && ! -L "$AGENT_HOME_ROOT/agent-upsilon/.claude/avatar.png" ]] \
   && okk 'install does not write through a temp-name link to a file' || bad "temp file-link arm: rc=$rc out=$out victim=$(cat "$TMP/victim")"
-# The arms above run the non-root branch only; the root branch (backfill, sudo set)
-# has its own install line. Both must carry -T.
-[[ "$(grep -cE 'install -T .*"\$tmp"' "$ROOT/src/cmd_agent_avatar.sh")" == 2 ]] \
-  && okk 'both install branches (root and self) pass -T at the temp path' || bad 'an install branch writes the temp path without -T'
+# The ROOT branch (backfill from `5dive update`, `sudo 5dive agent avatar set`, get
+# over the exec tunnel) must never touch an agent path as root: each check is a
+# snapshot the agent can race (quinn, iter 3: a link swapped in during install's
+# chmod-by-name made root chmod a 600 victim 644, 20/20). The harness is non-root,
+# so it SIMULATES root: _agent_avatar_is_root says yes, `runuser` is a stub that
+# marks what runs under it, and every file command is shadowed to log a call that
+# names a path under the agent homes WITHOUT that mark. Any such call is a root
+# syscall on an agent-controlled path, and the arm goes red.
+AS_LOG="$TMP/as.log"; ROOT_LOG="$TMP/rootwrite.log"; : >"$AS_LOG"; : >"$ROOT_LOG"
+as_root() { # <fn> <args...>: run one avatar function down its root branch
+  (
+    _agent_avatar_is_root() { return 0; }
+    runuser() {
+      [[ "$1" == -u && "$2" == agent-* && "$3" == -- ]] || { echo "BAD-RUNUSER $*" >>"$ROOT_LOG"; return 97; }
+      echo "$2 ${4:-}" >>"$AS_LOG"; local _AS_USER="$2"; shift 3; "$@"
+    }
+    _watch() { # <cmd> <args...>
+      local a; if [[ -z "${_AS_USER:-}" ]]; then
+        for a in "${@:2}"; do [[ "$a" == *"$AGENT_HOME_ROOT"* ]] && { echo "ROOT $*" >>"$ROOT_LOG"; break; }; done
+      fi
+      command "$@"
+    }
+    for c in mkdir rm dd chmod chown mv install cp cat head find ln tee base64 touch; do
+      eval "$c() { _watch $c \"\$@\"; }"
+    done
+    "$@"
+  )
+}
+h="$AGENT_HOME_ROOT/agent-kappa"; mkdir -p "$h"
+out=$(as_root _agent_avatar_install kappa "$TMP/a.gif"); rc=$?
+(( rc == 0 )) && cmp -s "$TMP/a.gif" "$h/.claude/avatar.png" && [[ ! -s "$ROOT_LOG" ]] \
+  && grep -q '^agent-kappa dd$' "$AS_LOG" && grep -q '^agent-kappa mv$' "$AS_LOG" && grep -q '^agent-kappa mkdir$' "$AS_LOG" \
+  && okk 'root install: mkdir, temp write and rename all run as agent-kappa; root touches no agent path' \
+  || bad "root install: rc=$rc out=$out root=[$(tr '\n' ';' <"$ROOT_LOG")] as=[$(tr '\n' ';' <"$AS_LOG")]"
+: >"$AS_LOG"; : >"$ROOT_LOG"
+out=$(as_root _agent_avatar_install kappa "$TMP/a.png"); rc=$?
+(( rc == 0 )) && cmp -s "$TMP/a.png" "$h/.claude/avatar.png" && [[ ! -s "$ROOT_LOG" ]] \
+  && okk 'root install replaces an existing portrait, still only as the agent' || bad "root replace: rc=$rc root=[$(tr '\n' ';' <"$ROOT_LOG")]"
+# Backfill end to end down the root branch: walk, persona read, face.ref read, write.
+: >"$AS_LOG"; : >"$ROOT_LOG"
+h="$AGENT_HOME_ROOT/agent-lambda"; mkdir -p "$h/cards"
+cp "$TMP/a.gif" "$h/cards/card.png"; cp "$TMP/inline.persona.yaml" "$h/cards/lambda.persona.yaml" 2>/dev/null \
+  || printf 'id: lambda\nface: {ref: card.png, style: holo}\n' >"$h/cards/lambda.persona.yaml"
+BF=$(
+  registry_read() { printf '{"agents":{"lambda":{}}}\n'; }
+  ensure_state_ro() { :; }; step() { echo "STEP: $*"; }; warn() { echo "WARN: $*"; }
+  ok() { echo "OK: $1"; }; json_array() { :; }; fail() { echo "FAILCALL: $2"; exit 1; }
+  STATE_DIR="$TMP" as_root _agent_avatar_backfill 2>&1
+)
+cmp -s "$TMP/a.gif" "$h/.claude/avatar.png" && [[ ! -s "$ROOT_LOG" ]] \
+  && grep -q '^agent-lambda find$' "$AS_LOG" && grep -q '^agent-lambda head$' "$AS_LOG" && grep -q '^agent-lambda dd$' "$AS_LOG" \
+  && okk 'root backfill walks, reads the persona and face.ref, and writes, all as the agent' \
+  || bad "root backfill: $BF root=[$(tr '\n' ';' <"$ROOT_LOG")] as=[$(tr '\n' ';' <"$AS_LOG")]"
+# Structural twin of the arms above (a redirection is not a command the shadows
+# can see): inside _agent_avatar_install every write command is behind the drop,
+# and the drop itself is runuser as agent-<agent>.
+body=$(awk '/^_agent_avatar_install\(\)/{e=1} e{print} e&&/^}/{exit}' "$ROOT/src/cmd_agent_avatar.sh")
+bare=$(grep -nE '(^|[;&|{(!]|&&|\|\|)[[:space:]]*(mkdir|rm|dd|chmod|chown|mv|install|cp|ln|touch)[[:space:]]' <<<"$body" | grep -v '^[0-9]*:[[:space:]]*#')
+[[ -z "$bare" ]] && okk 'no write in _agent_avatar_install runs outside _agent_avatar_as' || bad "bare write in install: $bare"
+grep -qE '^\s*runuser -u "agent-\$\{agent\}" -- "\$@"' "$ROOT/src/cmd_agent_avatar.sh" \
+  && okk '_agent_avatar_as drops to agent-<agent> with runuser' || bad '_agent_avatar_as does not runuser to the agent'
 if (( EUID != 0 )); then
   mkdir -p "$TMP/foreign"; chmod 755 "$TMP/foreign"
   # A home the caller does not own: simulate with a root-owned dir when one exists.
@@ -119,6 +180,12 @@ G=$(JSON_MODE=1 _agent_avatar_get alpha --data)
 [[ "$(jq -r '.data.avatar' <<<"$G")" == null ]] && okk 'get never serves a non-image' || bad "non-image get: $G"
 G=$(JSON_MODE=1 _agent_avatar_get gamma-x --data)
 [[ "$(jq -r '.data.avatar' <<<"$G")" == null ]] && okk 'get on an agent with no portrait is null' || bad "absent get: $G"
+# Root branch of get (the exec tunnel runs it as root): see as_root above.
+: >"$AS_LOG"; : >"$ROOT_LOG"
+G=$(JSON_MODE=1 as_root _agent_avatar_get kappa --data)
+[[ "$(jq -r '.data.avatar.dataUri' <<<"$G")" == "data:image/png;base64,$(base64 -w0 "$TMP/a.png")" && ! -s "$ROOT_LOG" ]] \
+  && grep -q '^agent-kappa head$' "$AS_LOG" \
+  && okk 'root get reads avatar.png once, as the agent, and serves that copy' || bad "root get: ${G:0:200} root=[$(tr '\n' ';' <"$ROOT_LOG")]"
 
 # --- persona face.ref ----------------------------------------------------
 printf 'id: alpha\nface:\n  ref: "https://example.test/p.png"\n  style: holo\nvoice: x\n' >"$TMP/block.persona.yaml"
