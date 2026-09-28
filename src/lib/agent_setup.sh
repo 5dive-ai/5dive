@@ -1092,6 +1092,31 @@ CLAUDE_TELEGRAM_STATE
   fi
 }
 
+# DIVE-5133: set (or, with an empty value, remove) one KEY=value line in a
+# claude agent's ~/.claude/channels/telegram/.env, keeping every other line —
+# the token above uses the same strip-then-append, so neither write drops the
+# other. Runs as the agent user so the file keeps its owner and 0600.
+set_claude_telegram_env_key() {
+  local name="$1" key="$2" val="$3"
+  local user="agent-${name}" state
+  state=$(_tg_access_state_dir "$user" claude) \
+    || fail "$E_GENERIC" "no telegram state dir for agent '$name'"
+  if ! sudo -u "$user" env STATE="$state" KEY="$key" VAL="$val" bash -s <<'CLAUDE_TELEGRAM_ENV_KEY' >&2; then
+set -euo pipefail
+ENV_FILE="$STATE/.env"
+TMP="$STATE/.env.tmp.$$"
+mkdir -p "$STATE"
+chmod 700 "$STATE"
+touch "$ENV_FILE"
+grep -v "^${KEY}=" "$ENV_FILE" >"$TMP" || true
+[[ -z "$VAL" ]] || printf '%s=%s\n' "$KEY" "$VAL" >>"$TMP"
+chmod 600 "$TMP"
+mv "$TMP" "$ENV_FILE"
+CLAUDE_TELEGRAM_ENV_KEY
+    fail "$E_GENERIC" "could not write $key into agent '$name' telegram .env"
+  fi
+}
+
 # Write ~/.claude/channels/telegram/access.json for agent-<name> with allowFrom
 # seeded from a CSV of user ids. Idempotent — merges into an existing file
 # rather than clobbering, so re-running on an already-paired agent only adds

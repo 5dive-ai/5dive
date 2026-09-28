@@ -177,6 +177,13 @@ valid_telegram_chat_id() {
 
 # Comma-separated list of telegram chat/user ids. No spaces — the API arg
 # allowlist forbids them anyway, and we don't want to depend on shell IFS.
+# DIVE-5133: the lite profile's /account button target. Same shape the
+# telegram plugin accepts (liteAccountUrl: https:// or tg://, no whitespace), and
+# nothing that could end the .env line or be read back as a second key.
+valid_telegram_account_url() {
+  (( ${#1} <= 512 )) && [[ "$1" =~ ^(https|tg)://[^[:space:]\"\'\`]+$ ]]
+}
+
 valid_telegram_chat_id_list() {
   local list="$1" id
   [[ -n "$list" ]] || return 1

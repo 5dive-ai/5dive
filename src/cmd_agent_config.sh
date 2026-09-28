@@ -22,6 +22,12 @@ cmd_config() {
   #                                Accepts <chat> or <chat>:<topic> for a forum topic)
   #     telegram.allowed-users    (csv of numeric ids allowed to DM the bot;
   #                                seeds access.json/openclaw.allowFrom/hermes env)
+  #     telegram.profile          (claude only — lite|default. lite = the partner-
+  #                                client bot: six commands, no org machinery.
+  #                                Written as TELEGRAM_PROFILE into the channel's
+  #                                .env; default removes the line. DIVE-5133)
+  #     telegram.account-url      (claude only — https:// or tg:// URL behind the
+  #                                lite bot's /account button; empty removes it)
   #     discord.token             (bot/app token for this agent's discord plugin)
   #     autonomy                  (claude only — standard|yolo; yolo appends the
   #                                approved "act on your recs, still honor hard
@@ -69,6 +75,10 @@ cmd_config() {
   local new_home_channel=""
   local new_home_thread=""
   local new_allowed_users=""
+  # DIVE-5133: the lite-profile pair. `*_set=1` separates "set to empty" (remove
+  # the line) from "not in this call" (leave the file alone).
+  local new_tg_profile="" tg_profile_set=0
+  local new_tg_account_url="" tg_account_url_set=0
   local new_model=""
   local new_effort=""
   local new_approval_policy=""
@@ -173,6 +183,24 @@ cmd_config() {
         new_allowed_users="$v"
         applied_keys+=("telegram.allowed-users")
         ;;
+      telegram.profile|telegram.account-url)
+        # DIVE-5133: only the claude telegram plugin has a lite profile; the
+        # codex/grok/pi/opencode bridges would take the line and ignore it, so
+        # refuse rather than accept-and-drop (the DIVE-4413 rule).
+        [[ "$type" == "claude" ]] \
+          || fail "$E_VALIDATION" "$k is claude-only (agent '$name' is type $type) — no other type's telegram bridge has a lite profile"
+        if [[ "$k" == "telegram.profile" ]]; then
+          case "$v" in lite|default) ;; *)
+            fail "$E_VALIDATION" "invalid telegram.profile '$v' (allowed: lite, default)" ;;
+          esac
+          new_tg_profile="$v"; tg_profile_set=1
+        else
+          [[ -z "$v" ]] || valid_telegram_account_url "$v" \
+            || fail "$E_VALIDATION" "telegram.account-url must be an https:// or tg:// URL with no spaces or quotes (or empty to remove it)"
+          new_tg_account_url="$v"; tg_account_url_set=1
+        fi
+        applied_keys+=("$k")
+        ;;
       model)
         # Uniform model switch — writes the selected model into the type's
         # runtime config (see write_runtime_model). Applied below, picked up by
@@ -268,6 +296,14 @@ cmd_config() {
       fail "$E_VALIDATION" \
         "channels=discord needs discord.token=<token> in the same set call"
     fi
+  fi
+  # DIVE-5133: checked BEFORE the registry write, so a profile set on a seat with
+  # no telegram channel refuses and changes nothing.
+  if (( tg_profile_set || tg_account_url_set )); then
+    local _tg_pre_channels
+    _tg_pre_channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
+    channel_in_list telegram "$_tg_pre_channels" \
+      || fail "$E_VALIDATION" "telegram.profile / telegram.account-url require channels=telegram (current: $_tg_pre_channels)"
   fi
   echo "$reg" | registry_write
   # DIVE-4589: the binding event is written after the registry write has SUCCEEDED
@@ -390,6 +426,22 @@ cmd_config() {
       reg=$(registry_read)
       jq --arg n "$name" --arg u "$bu" \
         '.agents[$n].botUsername = $u' <<<"$reg" | registry_write
+    fi
+  fi
+  # DIVE-5133: the lite profile lives in the SAME .env the plugin reads its
+  # token from, so it is written after the telegram dispatch above has created
+  # the state dir and written the token. The deferred restart below restarts
+  # the channel, which is what pushes the new command menu to the bot.
+  if (( tg_profile_set || tg_account_url_set )); then
+    local _tg_prof_val=""
+    [[ "$new_tg_profile" == "lite" ]] && _tg_prof_val="lite"
+    if (( tg_profile_set )); then
+      step "Writing TELEGRAM_PROFILE=${_tg_prof_val:-<unset>} for agent '$name'"
+      set_claude_telegram_env_key "$name" TELEGRAM_PROFILE "$_tg_prof_val"
+    fi
+    if (( tg_account_url_set )); then
+      step "Writing TELEGRAM_ACCOUNT_URL=${new_tg_account_url:-<unset>} for agent '$name'"
+      set_claude_telegram_env_key "$name" TELEGRAM_ACCOUNT_URL "$new_tg_account_url"
     fi
   fi
   if [[ -n "$new_discord_token" ]] \
