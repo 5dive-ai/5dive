@@ -427,6 +427,12 @@ cmd_agent_cos() {
     [[ -r "$tok_env" ]] || fail "$E_NOT_FOUND" "no telegram token for agent '$agent' at $tok_env (is it a telegram agent?)"
     atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]') || atok=""
     [[ -n "$atok" ]] || fail "$E_NOT_FOUND" "TELEGRAM_BOT_TOKEN empty/missing in $tok_env"
+    # DIVE-5104: the bot photo and the dashboard portrait are the same face, so
+    # this also writes the agent's canonical ~/.claude/avatar.png. Best-effort:
+    # the Telegram call is what was asked for, and it still runs.
+    local _av_why
+    _av_why=$(_agent_avatar_install "$agent" "$avatar") \
+      || warn "Telegram photo only — the dashboard avatar was not written: $_av_why"
     COS_TOKEN_OVERRIDE="$atok" "$bun" "$COS_RUN_DIR/cos-runner.ts" set-avatar --avatar="$avatar"
     return $?
   fi
