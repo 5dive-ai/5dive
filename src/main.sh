@@ -179,6 +179,11 @@ Agents:
                                                      # comma-separated numeric user ids; seeds
                                                      # access.json/openclaw.allowFrom/hermes env so the bot
                                                      # forwards DMs from these users without a pair-code gate.
+  5dive agent config <name> set telegram.profile=lite|default [telegram.account-url=<https://…|tg://…>]
+                                                     # claude only. lite = a partner client's bot: six commands,
+                                                     # no org machinery; account-url is its /account button.
+                                                     # Written into the channel .env; default / an empty url
+                                                     # removes the line.
   5dive agent pair <name> [--code=<code> | --user-id=<id> [--chat-id=<id>]]
                                                      # telegram/discord pairing. --code accepts the bot reply or
                                                      # bare pairing code. --user-id seeds access.json directly
