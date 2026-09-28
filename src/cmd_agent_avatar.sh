@@ -12,8 +12,8 @@
 #   agent cos set-avatar                 the Telegram bot photo writes the same file
 #   agent avatar backfill [--once]       one pass over *.persona.yaml face.ref
 # and ONE reader: `agent list --json` reports `avatar: {path,bytes,mtime}` (the
-# snapshot python in cmd_agent.sh), which the dashboard fetches through the
-# owner-authed files proxy.
+# snapshot python in cmd_agent.sh), and the dashboard then asks for the bytes
+# with `agent avatar get <agent> --data --json` over the exec tunnel.
 #
 # The name stays avatar.png whatever the bytes are (a face.ref is often a JPEG):
 # every consumer — the browser, Telegram's setMyProfilePhoto — sniffs the bytes.
@@ -139,7 +139,7 @@ cmd_agent_avatar() {
     set)      _agent_avatar_set "$@" ;;
     get)      _agent_avatar_get "$@" ;;
     backfill) _agent_avatar_backfill "$@" ;;
-    *) fail "$E_USAGE" "usage: 5dive agent avatar set <agent> <png-path|https-url> | get <agent> | backfill [--once] [--dry-run]" ;;
+    *) fail "$E_USAGE" "usage: 5dive agent avatar set <agent> <png-path|https-url> | get <agent> [--data] | backfill [--once] [--dry-run]" ;;
   esac
 }
 
@@ -162,18 +162,38 @@ _agent_avatar_set() {
     --arg a "$agent" --arg p "$dst" --arg f "$fmt"
 }
 
+# `--data` adds the bytes as a data: URI. That is how the dashboard gets them:
+# the box's file proxy runs as `claude` and cannot enter an agent's 0750 home,
+# while this verb runs as root through the exec tunnel and reads only this one
+# path. The 2 MB cap keeps the base64 (~2.7 MB) inside that tunnel's 4 MB buffer.
 _agent_avatar_get() {
-  local agent="${1:-}"
-  [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent avatar get <agent>"
+  local agent="" data=0 a
+  for a in "$@"; do
+    case "$a" in
+      --data) data=1 ;;
+      -*) fail "$E_USAGE" "usage: 5dive agent avatar get <agent> [--data]" ;;
+      *) [[ -z "$agent" ]] && agent="$a" ;;
+    esac
+  done
+  [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent avatar get <agent> [--data]"
   valid_name "$agent" || fail "$E_VALIDATION" "invalid agent name: $agent"
   require_agent "$agent"
   local dst size mtime fmt
   dst=$(_agent_avatar_path "$agent")
   if [[ -f "$dst" && ! -L "$dst" ]] && size=$(stat -c %s -- "$dst" 2>/dev/null) \
+     && (( size > 0 && size <= AGENT_AVATAR_MAX_BYTES )) \
      && mtime=$(stat -c %Y -- "$dst" 2>/dev/null) && fmt=$(_agent_avatar_sniff "$dst"); then
+    # The URI goes to jq through a FILE: a real portrait's base64 (~450 KB for
+    # 340 KB) is over the kernel's 128 KB limit for one argv string.
+    local uri; uri=$(mktemp) || fail "$E_GENERIC" "mktemp failed"
+    if (( data )); then
+      { printf 'data:image/%s;base64,' "$fmt"; base64 -w0 -- "$dst"; } >"$uri" \
+        || { rm -f -- "$uri"; fail "$E_GENERIC" "could not read $dst"; }
+    fi
     ok "'$agent' has an avatar ($fmt, $size bytes) at $dst" \
-      '{agent:$a, avatar:{path:$p, bytes:$b, mtime:$m, format:$f}}' \
-      --arg a "$agent" --arg p "$dst" --argjson b "$size" --argjson m "$mtime" --arg f "$fmt"
+      '{agent:$a, avatar:({path:$p, bytes:$b, mtime:$m, format:$f} + (if $u == "" then {} else {dataUri:$u} end))}' \
+      --arg a "$agent" --arg p "$dst" --argjson b "$size" --argjson m "$mtime" --arg f "$fmt" --rawfile u "$uri"
+    rm -f -- "$uri"
   else
     ok "'$agent' has no avatar" '{agent:$a, avatar:null}' --arg a "$agent"
   fi

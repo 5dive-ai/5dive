@@ -38,7 +38,7 @@ dst="$AGENT_HOME_ROOT/agent-alpha/.claude/avatar.png"
 if (( EUID != 0 )); then
   out=$(_agent_avatar_install alpha "$TMP/a.png") && [[ "$out" == png ]] && cmp -s "$TMP/a.png" "$dst" \
     && okk 'an agent that owns its home installs its own portrait' || bad "self install failed: $out"
-  [[ "$(stat -c %a "$dst")" == 644 ]] && okk 'portrait is world-readable (the files proxy reads it)' || bad 'portrait mode is not 644'
+  [[ "$(stat -c %a "$dst")" == 644 ]] && okk 'portrait is installed 644' || bad 'portrait mode is not 644'
   ls -a "$AGENT_HOME_ROOT/agent-alpha/.claude" | grep -q '^\.avatar' && bad 'install left a temp file' || okk 'install leaves no temp file'
 else
   echo "skip: self-install arms (running as root)"
@@ -61,6 +61,32 @@ if (( EUID != 0 )); then
     (( rc != 0 )) && okk 'a non-root caller cannot set a home it does not own' || bad 'non-owner install succeeded'
   fi
 fi
+
+# --- get --data: the bytes the dashboard draws ----------------------------
+# shellcheck source=/dev/null
+source "$ROOT/src/lib/output.sh"
+require_agent() { :; }; valid_name() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,15}$ ]]; }
+fail() { echo "FAILCALL: $2"; return 1; }
+png "$AGENT_HOME_ROOT/agent-alpha/.claude/avatar.png"
+G=$(JSON_MODE=1 _agent_avatar_get alpha --data)
+[[ "$(jq -r '.data.avatar.dataUri' <<<"$G")" == "data:image/png;base64,$(base64 -w0 "$AGENT_HOME_ROOT/agent-alpha/.claude/avatar.png")" ]] \
+  && okk 'get --data returns the exact bytes as a typed data URI' || bad "get --data: $G"
+# A real portrait is hundreds of KB: its base64 must not ride argv (128 KB cap).
+{ printf '\x89PNG\r\n\x1a\n'; head -c 400000 /dev/urandom; } >"$AGENT_HOME_ROOT/agent-alpha/.claude/avatar.png"
+G=$(JSON_MODE=1 _agent_avatar_get alpha --data 2>&1)
+[[ "$(jq -r '.data.avatar.dataUri | length' <<<"$G" 2>/dev/null)" -gt 500000 ]] \
+  && okk 'get --data carries a 400 KB portrait (no argv-length failure)' || bad "large get --data: ${G:0:200}"
+png "$AGENT_HOME_ROOT/agent-alpha/.claude/avatar.png"
+G=$(JSON_MODE=1 _agent_avatar_get alpha)
+[[ "$(jq -r '.data.avatar | has("dataUri")' <<<"$G")" == false && "$(jq -r '.data.avatar.format' <<<"$G")" == png ]] \
+  && okk 'get without --data carries metadata only' || bad "get: $G"
+G=$(JSON_MODE=1 AGENT_AVATAR_MAX_BYTES=8 _agent_avatar_get alpha --data)
+[[ "$(jq -r '.data.avatar' <<<"$G")" == null ]] && okk 'get never serves a file over the cap' || bad "over-cap get: $G"
+printf 'not an image' >"$AGENT_HOME_ROOT/agent-alpha/.claude/avatar.png"
+G=$(JSON_MODE=1 _agent_avatar_get alpha --data)
+[[ "$(jq -r '.data.avatar' <<<"$G")" == null ]] && okk 'get never serves a non-image' || bad "non-image get: $G"
+G=$(JSON_MODE=1 _agent_avatar_get gamma-x --data)
+[[ "$(jq -r '.data.avatar' <<<"$G")" == null ]] && okk 'get on an agent with no portrait is null' || bad "absent get: $G"
 
 # --- persona face.ref ----------------------------------------------------
 printf 'id: alpha\nface:\n  ref: "https://example.test/p.png"\n  style: holo\nvoice: x\n' >"$TMP/block.persona.yaml"

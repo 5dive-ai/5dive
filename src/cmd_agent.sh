@@ -1003,10 +1003,10 @@ def startup_health(name):
         return "clear", None
     return "unknown", "credential-start breadcrumb is not readable from here"
 
-# DIVE-5104: the agent's portrait, if it has one. Metadata only — the bytes go
-# to the dashboard through the owner-authed files proxy, which fetches exactly
-# this path. A symlink, an empty file or one over the cap reads as no avatar, so
-# the dashboard never asks for something the writers would have refused.
+# DIVE-5104: the agent's portrait, if it has one. Metadata only — the dashboard
+# asks for the bytes with `agent avatar get <name> --data`, keyed on mtime. A
+# symlink, an empty file or one over the cap reads as no avatar, so the
+# dashboard never asks for something the writers would have refused.
 AVATAR_MAX = 2 * 1024 * 1024
 
 def avatar_info(name):
