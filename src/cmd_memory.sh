@@ -148,6 +148,13 @@ _memory_usage() {
       Idempotent: a ledger (.consolidated.tsv beside the store) records each
       (session, byte count), and `add` refuses a slug that already exists — so a
       re-run is a no-op even if the ledger is lost.
+      A session that GREW after it was distilled is read from where the last
+      pass stopped, not from the top, and the distiller is handed the atoms
+      already written from that session (found by their `run:<session>`
+      evidence) with the instruction not to restate them. Before this, a session
+      that grew by 1 KB was re-distilled whole and the model picked a new slug
+      for the same fact, which `add` cannot catch. --force still reads the
+      whole transcript. --json counts these as `processed_continued`.
       Writes to YOUR OWN store only. There is deliberately no --store: an
       auto-extractor must not be able to publish to the shared wiki (DIVE-481
       deny-default). Publishing stays a curated act.
@@ -1455,8 +1462,17 @@ _memory_doctor() {
 #      transcript; without this it would distill its own thinking.
 #   2. It is idempotent. The ledger records (session, bytes); a re-run over an
 #      unchanged transcript does no work and writes nothing. Belt and braces:
-#      _memory_add refuses an existing slug without --force, so even a ledger
-#      loss cannot duplicate an atom — it re-derives the same slug and conflicts.
+#      _memory_add refuses an existing slug without --force, so a ledger loss
+#      only duplicates an atom if the model picks a NEW slug for the same fact.
+#      It does, which is why (session, bytes) alone was not enough: a session
+#      that grows past a pass (resumed after --idle-min, a /goal nudge) was a
+#      new key, was re-distilled from the top, and came back as the same facts
+#      under fresh slugs. Measured 2026-09-28 on two seats: one 1 KB regrowth
+#      re-distilled 5 atoms, each a rewording of one of the first pass's five;
+#      a lint pass the same day merged 13 such clusters on the other seat. So
+#      the ledger is read PER SESSION: a
+#      regrown session is excerpted from the last ledgered byte on, and the
+#      prompt carries the atoms that session already produced.
 #   3. It is bounded. --max-sessions per pass and --max-chars per transcript, so
 #      the cron cost is flat whatever the store or the backlog does.
 #
@@ -1491,22 +1507,29 @@ RULES
   secret LIVES, never what it is.
 - At most 5 atoms.'
 
-# _memory_consolidate_excerpt <jsonl> <max-chars>
+# _memory_consolidate_excerpt <jsonl> <max-chars> [<from-byte>]
 # L0 → L1: a bounded plain-text excerpt of one transcript. Tool payloads are the
 # bulk of a jsonl and almost never the durable part, so they collapse to a name;
 # what survives is what a person said and what the agent concluded.
+# <from-byte> is where the last pass over this session stopped: a regrown
+# session is excerpted from there, so the distiller sees only the continuation.
+# A byte that lands mid-record drops that partial record rather than guessing.
 _memory_consolidate_excerpt() {
-  python3 - "$1" "$2" <<'PYEOF'
+  python3 - "$1" "$2" "${3:-0}" <<'PYEOF'
 import json, sys
-path, cap = sys.argv[1], int(sys.argv[2])
+path, cap, start = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 out = []
 try:
-    fh = open(path, encoding="utf-8", errors="replace")
+    fh = open(path, "rb")
 except OSError:
     sys.exit(0)
 with fh:
+    if start > 0:
+        fh.seek(start - 1)
+        if fh.read(1) != b"\n":
+            fh.readline()
     for line in fh:
-        line = line.strip()
+        line = line.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:
@@ -1639,6 +1662,37 @@ for a in atoms[:5]:
 PYEOF
 }
 
+# _memory_consolidate_prior_atoms <store-dir> <session-id>
+# The atoms this store already holds from one session, one "- slug — description"
+# line each. Found by the `run:<session>` evidence every distilled atom carries,
+# so it holds even when the ledger was lost: the store is the record of what was
+# written, the ledger only of how far a transcript was read. Exact-id match —
+# `run:ab` must not claim the atoms of `run:abc`. Capped: this goes into a prompt.
+_memory_consolidate_prior_atoms() {
+  python3 - "$1" "$2" <<'PYEOF'
+import glob, os, re, sys
+store, sid = sys.argv[1], sys.argv[2]
+ref = re.compile(r"run:" + re.escape(sid) + r"(?![A-Za-z0-9_-])")
+rows = []
+for f in sorted(glob.glob(os.path.join(store, "*.md"))):
+    if os.path.basename(f) == "MEMORY.md":
+        continue
+    try:
+        text = open(f, encoding="utf-8", errors="replace").read()
+    except OSError:
+        continue
+    if not ref.search(text):
+        continue
+    def field(k):
+        m = re.search(r"^\s*" + k + r":\s*(.*)$", text, re.M)
+        return m.group(1).strip().strip('"').strip("'") if m else ""
+    name = field("name")
+    if name:
+        rows.append("- %s — %s" % (name, field("description")))
+sys.stdout.write("\n".join(rows[:25]))
+PYEOF
+}
+
 _memory_consolidate() {
   local max_sessions=3 idle_min=30 max_chars=20000 distiller="" dry=0 force=0
   while [ $# -gt 0 ]; do
@@ -1714,6 +1768,8 @@ _memory_consolidate() {
   # human. Folding them together is what made sixteen days of dead passes look
   # like ordinary retry noise.
   local distill_unauthed=0
+  # Sessions read from their last ledgered byte rather than from the top.
+  local continued=0
   local -a written_files=()
   local now; now=$(date +%s)
   local t
@@ -1733,13 +1789,35 @@ _memory_consolidate() {
     if [ "$force" -ne 1 ] && grep -qF "$(printf '%s\t%s\t' "$sid" "$bytes")" "$ledger" 2>/dev/null; then
       skipped_done=$((skipped_done+1)); continue
     fi
-    local excerpt; excerpt=$(_memory_consolidate_excerpt "$t" "$max_chars") || excerpt=""
+    # (3) continuation — the ledger is read per SESSION. A session with a row
+    # at a smaller byte count grew after it was distilled: read it from that
+    # byte on, not from the top, or the pass re-distils what it already wrote
+    # and the model names the same facts anew. --force reads the whole file.
+    local from=0
+    if [ "$force" -ne 1 ]; then
+      from=$(awk -F'\t' -v s="$sid" -v b="$bytes" \
+        '$1==s && $2+0<b+0 && $2+0>m {m=$2+0} END{print m+0}' "$ledger" 2>/dev/null) || from=0
+    fi
+    local excerpt; excerpt=$(_memory_consolidate_excerpt "$t" "$max_chars" "$from") || excerpt=""
     if [ -z "$(printf '%s' "$excerpt" | tr -d '[:space:]')" ]; then
       skipped_done=$((skipped_done+1)); continue
     fi
     processed=$((processed+1))
+    [ "$from" -gt 0 ] && continued=$((continued+1)) || :
+    # What this session already produced, whether or not the ledger survived.
+    # `add` refuses a repeated slug but not a repeated fact under a new one;
+    # only the distiller can tell those apart, so it is told.
+    local prior="" preface=""
+    prior=$(_memory_consolidate_prior_atoms "$dir" "$sid") || prior=""
+    if [ "$from" -gt 0 ]; then
+      preface="CONTINUATION: this session was already distilled up to an earlier point. The transcript below is ONLY what was written after that point."$'\n'
+    fi
+    if [ -n "$prior" ]; then
+      preface+="ATOMS ALREADY WRITTEN FROM THIS SESSION. Do not return any of these facts again, under the same name or a new one. Return an atom only for a durable fact none of them states; if there is none, return {\"atoms\":[]}."$'\n'"$prior"$'\n'
+    fi
+    [ -n "$preface" ] && preface+=$'\n' || :
     local rawf; rawf=$(mktemp "${TMPDIR:-/tmp}/5dive-mem-distill.XXXXXX") || continue
-    printf '%s\n\n---- TRANSCRIPT ----\n%s\n' "$_MEM_CONSOLIDATE_PROMPT" "$excerpt" \
+    printf '%s\n\n%s---- TRANSCRIPT ----\n%s\n' "$_MEM_CONSOLIDATE_PROMPT" "$preface" "$excerpt" \
       | eval "$distiller" > "$rawf" 2>/dev/null || :
     # `x=$(cmd); rc=$?` ABORTS under the bundle's `set -euo pipefail` — errexit
     # fires on the assignment before $? is ever read. The harness runs `set +e`
@@ -1879,6 +1957,7 @@ _memory_consolidate() {
        --argjson live "$skipped_live" --argjson done "$skipped_done" \
        --argjson dfail "$distill_failed" \
        --argjson dunauth "$distill_unauthed" \
+       --argjson continued "$continued" \
        --argjson ok "$([ "$pass_rc" -eq 0 ] && echo true || echo false)" \
        --argjson ibefore "$idx_before" --argjson iafter "$idx_after" \
        --argjson ilimit "$idx_limit" --argjson ibudget "$idx_budget" \
@@ -1886,7 +1965,8 @@ _memory_consolidate() {
        --argjson istill "$idx_still_over" \
        --arg store "$dir" --arg ledger "$ledger" --argjson dry "$([ "$dry" -eq 1 ] && echo true || echo false)" \
       '{ok:$ok, data:{store:$store, ledger:$ledger, dry_run:$dry, considered:$considered,
-        processed:$processed, atoms_written:$written, atoms_refused:$refused,
+        processed:$processed, processed_continued:$continued,
+        atoms_written:$written, atoms_refused:$refused,
         atoms_duplicate:$dupes, skipped_live:$live, skipped_consolidated:$done,
         distiller_failed:$dfail, distiller_unauthed:$dunauth,
         index_bytes_before:$ibefore, index_bytes_after:$iafter,
@@ -1896,6 +1976,7 @@ _memory_consolidate() {
   else
     echo "consolidate: $processed session(s) distilled → $written atom(s) into $dir"
     echo "  skipped: $skipped_live live (touched < ${idle_min}m ago) · $skipped_done already consolidated · $dupes duplicate atom(s)"
+    [ "$continued" -gt 0 ] && echo "  continued: $continued regrown session(s) read from where the last pass stopped" || :
     # Trailing `[ x ] && echo` is the last command of the function under errexit
     # when the test is false — it would return 1 and abort the caller. `|| :`.
     [ "$refused" -gt 0 ] && echo "  refused: $refused atom(s) — see stderr (tripwire/validation)" >&2 || :
