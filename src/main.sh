@@ -832,6 +832,11 @@ _agent_verb_dispatch() {
           # returned token into `agent create`).
           AUDIT_CMD="agent cos"; AUDIT_ARGS=("$@")
           cmd_agent_cos "$@" ;;
+        avatar)
+          # DIVE-5104: the ONE per-agent portrait path (~/.claude/avatar.png)
+          # the dashboard's agent list draws. get is read-only.
+          [[ "${1:-}" == "get" ]] || { AUDIT_CMD="agent avatar"; AUDIT_ARGS=("$@"); }
+          cmd_agent_avatar "$@" ;;
         install)
           AUDIT_CMD="agent install"; AUDIT_ARGS=("$@")
           cmd_install "$@" ;;   # no registry mutation; auditable install recipe

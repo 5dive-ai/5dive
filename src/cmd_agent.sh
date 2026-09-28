@@ -445,7 +445,8 @@ _cmd_list_legacy() {
     sudo: (($live[.key].sudo // {grant: "unknown", runas: "-", impliedIsolation: "custom",
                                  measured: false, extraEntries: false}) as $s
            | $s + {diverges: ($s.measured and $s.impliedIsolation != (.value.isolation // "admin"))}),
-    health: ($live[.key].health // null)
+    health: ($live[.key].health // null),
+    avatar: ($live[.key].avatar // null)
   })' <<<"$reg")
   if (( JSON_MODE )); then
     _agent_list_hb_json "$merged" | jq -c '{ok:true, data: .}'
@@ -1002,6 +1003,23 @@ def startup_health(name):
         return "clear", None
     return "unknown", "credential-start breadcrumb is not readable from here"
 
+# DIVE-5104: the agent's portrait, if it has one. Metadata only — the bytes go
+# to the dashboard through the owner-authed files proxy, which fetches exactly
+# this path. A symlink, an empty file or one over the cap reads as no avatar, so
+# the dashboard never asks for something the writers would have refused.
+AVATAR_MAX = 2 * 1024 * 1024
+
+def avatar_info(name):
+    path = os.path.join(home_root, f"agent-{name}", ".claude", "avatar.png")
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > AVATAR_MAX:
+        return None
+    return {"path": path, "bytes": st.st_size, "mtime": int(st.st_mtime)}
+
 def iso_time(epoch):
     if epoch is None:
         return None
@@ -1074,6 +1092,7 @@ for name, value in agents.items():
         "model": model,
         "effort": effort,
         "sudo": sudo,
+        "avatar": avatar_info(name),
         "health": {"deaf": deaf, "asleep": asleep,
                    "auth": {"state": auth_state, "expiresAt": iso_time(auth_exp), "refreshable": auth_refresh},
                    "quota": quota,

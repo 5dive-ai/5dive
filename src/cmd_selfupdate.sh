@@ -1210,6 +1210,16 @@ cmd_self_update() {
     fi
   fi
 
+  # DIVE-5104: one pass that copies each agent's OpenAgent portrait (face.ref in
+  # a *.persona.yaml under its home) into ~/.claude/avatar.png, the one path the
+  # dashboard's agent list reads. Runs from the freshly-installed binary in its
+  # own process, once per box (`--once` marker), and never fails the update.
+  # Same bin seam as the health gate, so a fixture run never reaches the live CLI.
+  if (( EUID == 0 )) && [[ -x "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" ]]; then
+    timeout 180 "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" agent avatar backfill --once >/dev/null 2>&1 \
+      || warn "avatar backfill did not finish (re-run: sudo 5dive agent avatar backfill)"
+  fi
+
   local r f s d pk prose
   r=$(json_array "${restarted[@]}")
   f=$(json_array "${failed[@]}")
