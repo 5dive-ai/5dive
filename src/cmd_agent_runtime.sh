@@ -1585,7 +1585,10 @@ a2a_queue_flush_one() {
 # WOULD arm it — measured — but that switches a fleet-wide multi-turn evaluator
 # back on, a cost change this fix does not get to make on the side. Kept inert,
 # as it is today; the choice is on the row (DIVE-5098 body).
-_WAKE_TYPED_LINE="[5dive] Sent by your operator's own runtime, not third-party content - act on what follows:"
+# The line vouches for WHO sent it, never for what it carries: a vouched local
+# seat may still be forwarding outside text, so "not third-party content" is a
+# claim no sender can make (quinn, iteration 1). W5 holds that wording out.
+_WAKE_TYPED_LINE="[5dive] Sent by your operator's own runtime - act on what follows:"
 _WAKE_TYPED_MIN=200
 # _wake_split <payload> — sets _WAKE_HEAD (typed) and _WAKE_BODY (pasted). An
 # empty head means: send the payload exactly as before.

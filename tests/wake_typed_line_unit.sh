@@ -13,10 +13,11 @@
 # is a function; seat 'seatx' does not exist). The live arm is on the row.
 #
 # Arms, both directions:
-#   W1-W4  _wake_split: short -> untouched; long -> constant line + whole text;
+#   W1-W5  _wake_split: short -> untouched; long -> constant line + whole text;
 #          a long /goal stays whole inside the paste (inert, as today — see the
 #          comment on _wake_split); the line is the same constant whatever the
-#          payload (DIVE-4826: no board content).
+#          payload (DIVE-4826: no board content); W5 it never says the content
+#          is not third-party (it vouches for the sender, not the text).
 #   H1-H3  _hb_send_line (heartbeat /goal wake): typed line, then body, then Enter.
 #   H4     a non-claude seat keeps the single-paste path (no behaviour change).
 #   H5     a short control line (`/clear`) is typed exactly as before.
@@ -98,6 +99,9 @@ h1="$_WAKE_HEAD"; _wake_split "$PLAIN"
 [[ "$h1" == "$_WAKE_HEAD" && "$LINE" != *DIVE-* && ${#LINE} -lt 120 ]] \
   && ok_t "W4 the typed line is one fixed short constant — no board content (DIVE-4826)" \
   || bad_t "W4 the typed line is one fixed short constant — no board content (DIVE-4826)" "$h1 | $_WAKE_HEAD"
+[[ "${LINE,,}" != *third-party* && "${LINE,,}" != *"not third"* ]] \
+  && ok_t "W5 the line vouches for the sender only — it never claims the content is not third-party" \
+  || bad_t "W5 the line vouches for the sender only — it never claims the content is not third-party" "$LINE"
 
 # --- H: the heartbeat injector ----------------------------------------------
 _reset; CLAUDE_PID=4242; _hb_send_line seatx "$GOAL"; rc=$?
