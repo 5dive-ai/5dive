@@ -468,6 +468,130 @@ grep -qx -- '--strict-mcp-config' "$ARGV" 2>/dev/null && bad "MUTANT: the pre-fi
 # shellcheck source=/dev/null
 source "$SRC/cmd_memory.sh"
 
+echo "── a session that GREW after its pass is read from where that pass stopped ──"
+# The measured defect: the ledger key was (session, bytes), so a session that
+# grew by 1 KB after its pass was a NEW key, was re-distilled from the top, and
+# the model named the same facts under fresh slugs, which `add` cannot refuse
+# (it only refuses a repeated slug). A stub cannot be asked whether it would
+# have reworded a fact; what the pass controls is what it SENDS, so these arms
+# read the distiller's stdin. Own HOME: exact counts, no other fixture in play.
+OLDHOME="$HOME"; export HOME="$TMP/grow"
+GPROJ="$HOME/.claude/projects/proj"; GSTORE="$GPROJ/memory"; GLEDGER="$GSTORE/.consolidated.tsv"
+mkdir -p "$GSTORE"; : > "$GSTORE/MEMORY.md"
+export CAPT="$TMP/distiller.stdin"
+capstub() { # <name> <stdout payload> — a stub that keeps what it was sent
+  local f="$TMP/$1.sh"
+  { echo '#!/usr/bin/env bash'; echo 'cat > "$CAPT"'; printf 'cat <<%s\n%s\n%s\n' "'JSONEOF'" "$2" "JSONEOF"; } > "$f"
+  chmod +x "$f"; echo "$f"
+}
+append_turns() { # <path> <user text> <assistant text>
+  python3 - "$1" "$2" "$3" <<'PY2'
+import json, sys
+p, u, a = sys.argv[1:4]
+with open(p, "a") as fh:
+    fh.write(json.dumps({"type":"user","message":{"role":"user","content":u}})+"\n")
+    fh.write(json.dumps({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":a}]}})+"\n")
+PY2
+}
+GROW="$GPROJ/pppp-1212.jsonl"
+mk_transcript "$GROW" "FIRSTHALF the release train leaves on tuesdays" "Recorded FIRSTHALF."
+touch -d '3 hours ago' "$GROW"
+FIRST=$(capstub first '{"atoms":[{"type":"project","name":"release-train-leaves-tuesday","description":"the release train leaves on tuesdays","body":"The release train leaves every Tuesday.","confidence":"high"}]}')
+CEMPTY=$(capstub cempty '{"atoms":[]}')
+rm -f "$CAPT"
+run --distiller="$FIRST" --max-sessions=1 >/dev/null 2>&1
+[ -f "$GSTORE/project_release_train_leaves_tuesday.md" ] && ok "first pass wrote its atom" || bad "first pass wrote its atom"
+B1=$(stat -c %s "$GROW")
+check "first pass ledgered the session at its size" "$(awk -F'\t' -v s=pppp-1212 -v b="$B1" '$1==s && $2==b' "$GLEDGER" | wc -l)" "1"
+grep -q 'FIRSTHALF the release train' "$CAPT" && ok "first pass read the transcript from the top" || bad "first pass read the transcript from the top"
+grep -q 'CONTINUATION' "$CAPT" && bad "a first pass is not marked as a continuation" || ok "a first pass is not marked as a continuation"
+grep -q 'ALREADY WRITTEN' "$CAPT" && bad "a first pass over a clean store lists no prior atoms" || ok "a first pass over a clean store lists no prior atoms"
+
+append_turns "$GROW" "SECONDHALF the deploy window moved to thursday" "Recorded SECONDHALF."
+touch -d '2 hours ago' "$GROW"
+B2=$(stat -c %s "$GROW")
+[ "$B2" -gt "$B1" ] && ok "fixture: the session grew ($B1 -> $B2 B)" || bad "fixture: the session grew ($B1 -> $B2 B)"
+rm -f "$CAPT"
+JOUT=$(JSON_MODE=1 run --distiller="$CEMPTY" --max-sessions=1 2>/dev/null)
+check "the regrown session is distilled again" "$(jq -r '.data.processed' <<<"$JOUT" 2>/dev/null)" "1"
+check "  ...and counted as a continuation" "$(jq -r '.data.processed_continued' <<<"$JOUT" 2>/dev/null)" "1"
+grep -q 'SECONDHALF the deploy window' "$CAPT" && ok "  ...the distiller sees the new turns" || bad "  ...the distiller sees the new turns"
+grep -q 'FIRSTHALF' "$CAPT" && bad "  ...and NOT the part the last pass already read" || ok "  ...and NOT the part the last pass already read"
+grep -q '^CONTINUATION' "$CAPT" && ok "  ...and is told it is reading a continuation" || bad "  ...and is told it is reading a continuation"
+grep -qx -- '- release-train-leaves-tuesday — the release train leaves on tuesdays' "$CAPT" \
+  && ok "  ...and is handed the atom this session already produced" \
+  || bad "  ...and is handed the atom this session already produced"
+check "the ledger now holds the session at both sizes" "$(awk -F'\t' '$1=="pppp-1212"' "$GLEDGER" | cut -f2 | tr '\n' ' ')" "$B1 $B2 "
+OUT=$(run --distiller="$CEMPTY" --max-sessions=1 2>/dev/null)
+grep -q 'continued: 1 regrown session' <<<"$OUT" && bad "an unchanged session is not a continuation" || ok "an unchanged session is not a continuation"
+
+rm -f "$CAPT"
+JOUT=$(JSON_MODE=1 run --distiller="$CEMPTY" --max-sessions=1 2>/dev/null)
+check "unchanged since the last pass: skipped, as before" "$(jq -r '.data.processed' <<<"$JOUT" 2>/dev/null)" "0"
+[ -e "$CAPT" ] && bad "  ...without calling the distiller" || ok "  ...without calling the distiller"
+
+# Growth that holds nothing distillable costs no distiller call and no row.
+printf '%s\n' '{"type":"system","content":"a hook line, nothing said"}' >> "$GROW"
+touch -d '100 minutes ago' "$GROW"
+rm -f "$CAPT"; LB=$(wc -l < "$GLEDGER")
+JOUT=$(JSON_MODE=1 run --distiller="$CEMPTY" --max-sessions=1 2>/dev/null)
+check "growth with nothing said is not distilled" "$(jq -r '.data.processed' <<<"$JOUT" 2>/dev/null)" "0"
+[ -e "$CAPT" ] && bad "  ...and the distiller is never called for it" || ok "  ...and the distiller is never called for it"
+check "  ...and it leaves no ledger row" "$(wc -l < "$GLEDGER")" "$LB"
+
+rm -f "$CAPT"
+run --distiller="$CEMPTY" --max-sessions=1 --force >/dev/null 2>&1
+grep -q 'FIRSTHALF the release train' "$CAPT" && ok "--force still reads the whole transcript" || bad "--force still reads the whole transcript"
+grep -q 'CONTINUATION' "$CAPT" && bad "  ...and does not call it a continuation" || ok "  ...and does not call it a continuation"
+grep -q 'release-train-leaves-tuesday' "$CAPT" && ok "  ...but still names the atoms already written" || bad "  ...but still names the atoms already written"
+
+# Ledger LOST: the whole file is read again, and the store — not the ledger — is
+# what tells the distiller what already exists.
+: > "$GLEDGER"; rm -f "$CAPT"
+run --distiller="$CEMPTY" --max-sessions=1 >/dev/null 2>&1
+grep -q 'FIRSTHALF the release train' "$CAPT" && ok "ledger lost: the transcript is read from the top" || bad "ledger lost: the transcript is read from the top"
+grep -q 'release-train-leaves-tuesday' "$CAPT" && ok "  ...and the prior atom still reaches the prompt" || bad "  ...and the prior atom still reaches the prompt"
+
+# The bundle runs set -euo pipefail; the continuation path must survive it.
+append_turns "$GROW" "ERREXITPART a turn read under errexit" "Recorded ERREXITPART."
+touch -d '95 minutes ago' "$GROW"
+rm -f "$CAPT"
+errexit_run --distiller="$CEMPTY" --max-sessions=1 >/dev/null 2>&1
+check "a continuation pass survives errexit" "$?" "0"
+grep -q '^CONTINUATION' "$CAPT" && grep -q 'ERREXITPART' "$CAPT" && ! grep -q 'FIRSTHALF' "$CAPT" \
+  && ok "  ...and really was a continuation read" || bad "  ...and really was a continuation read"
+
+echo "── the offset read and the prior-atom lookup, directly ──"
+EX=$(_memory_consolidate_excerpt "$GROW" 20000 "$B1")
+grep -q 'SECONDHALF the deploy window' <<<"$EX" && ok "from a record boundary: the next record is kept" || bad "from a record boundary: the next record is kept"
+grep -q 'FIRSTHALF' <<<"$EX" && bad "  ...and nothing before it" || ok "  ...and nothing before it"
+EX=$(_memory_consolidate_excerpt "$GROW" 20000 "$((B1+5))")
+grep -q 'SECONDHALF the deploy window' <<<"$EX" && bad "mid-record: the partial record is dropped, not half-read" || ok "mid-record: the partial record is dropped, not half-read"
+grep -q 'Recorded SECONDHALF' <<<"$EX" && ok "  ...and the whole records after it are kept" || bad "  ...and the whole records after it are kept"
+EX=$(_memory_consolidate_excerpt "$GROW" 20000)
+grep -q 'FIRSTHALF' <<<"$EX" && ok "no offset: the whole transcript, as before" || bad "no offset: the whole transcript, as before"
+printf -- '---\nname: other-session-atom\ndescription: "from a session whose id extends this one"\nmetadata:\n  evidence:\n    - "run:pppp-12120"\n---\nbody\n' > "$GSTORE/reference_other_session_atom.md"
+P=$(_memory_consolidate_prior_atoms "$GSTORE" pppp-1212)
+grep -q 'release-train-leaves-tuesday' <<<"$P" && ok "prior atoms: this session's atom is found" || bad "prior atoms: this session's atom is found"
+grep -q 'other-session-atom' <<<"$P" && bad "  ...and an id that merely STARTS with it is not" || ok "  ...and an id that merely STARTS with it is not"
+grep -qx -- '- other-session-atom — from a session whose id extends this one' <<<"$(_memory_consolidate_prior_atoms "$GSTORE" pppp-12120)" \
+  && ok "  ...CONTROL: that atom is found under its own id, quotes stripped" \
+  || bad "  ...CONTROL: that atom is found under its own id, quotes stripped"
+
+echo "── MUTANT: the pre-fix read (always from the top) must go red ──"
+append_turns "$GROW" "THIRDPART a later turn" "Recorded THIRDPART."
+touch -d '90 minutes ago' "$GROW"
+check "BEFORE: the live function passes the offset" "$(declare -f _memory_consolidate | grep -c '"$max_chars" "$from"')" "1"
+eval "$(declare -f _memory_consolidate | sed 's/"$max_chars" "$from"/"$max_chars"/')"
+check "AFTER: the mutation took" "$(declare -f _memory_consolidate | grep -c '"$max_chars" "$from"')" "0"
+rm -f "$CAPT"
+run --distiller="$CEMPTY" --max-sessions=1 >/dev/null 2>&1
+grep -q 'THIRDPART' "$CAPT" && ok "MUTANT: the stub still ran on the regrown session" || bad "MUTANT: the stub still ran on the regrown session"
+grep -q 'FIRSTHALF' "$CAPT" && ok "MUTANT: the whole-file re-read is caught" || bad "MUTANT: the whole-file re-read is caught"
+# shellcheck source=/dev/null
+source "$SRC/cmd_memory.sh"
+export HOME="$OLDHOME"
+
 echo "── validation ──"
 run --distiller="$EMPTY" --max-sessions=x >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--max-sessions must be numeric" || bad "--max-sessions must be numeric"
 run --distiller="$EMPTY" --idle-min=-1 >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--idle-min must be numeric" || bad "--idle-min must be numeric"
