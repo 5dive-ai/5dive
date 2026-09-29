@@ -220,7 +220,7 @@ is "12b section updated" "$(jq -r .claudeMd.status <<<"$out")" updated
 is "12c persona updated" "$(jq -r .persona.status <<<"$out")" updated
 grep -q 'within an hour' "$MD" && ok_ "12d the new line landed" || bad_ "12d new CLAUDE.md line missing"
 grep -q 'within a day' "$MD" && bad_ "12e the old line survived" || ok_ "12e the old line is gone"
-head -1 "$MD" | grep -qx '# Olga' && ok_ "12f the swapped section is renamed for the agent" || bad_ "12f section not renamed: $(head -1 "$MD")"
+[[ "$(head -1 "$MD")" == '# Olga' ]] && ok_ "12f the swapped section is renamed for the agent" || bad_ "12f section not renamed: $(head -1 "$MD")"
 is "12g the tail (CLI blocks + owner note) is kept byte-for-byte" "$(tail -c +"$(( $(jq -r '.agents.olga.pack.claudeMd.bytes' "$REGISTRY") + 1 ))" "$MD")" "$want_tail"
 grep -q 'audio: Puck' "$IH/persona.yaml" && ok_ "12h persona field landed" || bad_ "12h persona not refreshed"
 is "12i exactly one restart marker" "$(markers)" 1
