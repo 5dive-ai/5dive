@@ -163,6 +163,7 @@ LAZY_FILES=(
   src/cmd_owner_ask.sh
   src/cmd_board.sh
   src/cmd_hire.sh
+  src/cmd_partner.sh
   src/cmd_project.sh
   src/cmd_goal.sh
   src/cmd_objective.sh

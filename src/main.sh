@@ -49,6 +49,10 @@ Agents:
   5dive market --kind=plugin                         # browse plugins (voice, telegram, dashboard, buzz)
   5dive plugin add|list|remove|upgrade <plugin>      # install a plugin; see '5dive plugin --help'
   5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see '5dive hire --help'
+  5dive partner hire <pack> [--as=<name>]            # on a PARTNER box: hire a colleague from the partner's
+                                                     # catalogue through the partner path (5dive-api records it
+                                                     # on the partner's account). No root: any seat that can read
+                                                     # the box identity. See '5dive partner --help'
   5dive agent list
   5dive agent info <name>                            # type, CLI version, model, channel, state + OUTPUT (DIVE-3274:
                                                      # whether the seat is transacting, not only whether it is up)
@@ -1191,6 +1195,17 @@ main() {
         AUDIT_CMD="hire"; AUDIT_ARGS=("$@")
         with_registry_lock cmd_hire "$@"
       fi ;;
+    partner)
+      # DIVE-5168: a partner client's agent hires a colleague THROUGH THE PARTNER
+      # PATH — a box-token-authenticated call to 5dive-api, which checks the
+      # partner's catalogue, records the hire on the partner's account and installs
+      # the pack back onto this box. Creates nothing locally, so no registry lock
+      # and NO require_root: it runs as any seat that can read the box identity
+      # (/etc/5dive/connectord.env, 0640 root:claude). Audited — it is a hire.
+      case "${1:-}" in
+        hire) AUDIT_CMD="partner hire"; AUDIT_ARGS=("${@:2}") ;;
+      esac
+      cmd_partner "$@" ;;
     agent)
       _agent_verb_dispatch "$@" ;;
     fire)
