@@ -429,6 +429,7 @@ Zero-human proof (publish your own badge —):
   5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]  # push badge/datapoint/history, computed verbatim from digest
   5dive proof on --repo=<url> [--branch=status] [--at=<0-23>]    # save config + install daily root cron
   5dive proof off | status [--json]                             # remove cron (config kept) | report + staleness
+  5dive disk sweep [--dry-run] | alarm | tick                   # SAFE box-disk sweep (rebuildable caches only) + low-disk alarm
   # methodology + self-publish guide: docs/zero-human.md
 
 Delegated push (bring your own GitHub App —):
@@ -520,6 +521,10 @@ Health:
                                                      # write/edit path (crontab -e is an EDITOR escape).
                                                      # diff compares against the CLI's own snapshot,
                                                      # never a caller-supplied file.
+  5dive host timezone [set <IANA zone>] [--no-restart]
+                                                     # read or set the system zone (DIVE-5165). The zone
+                                                     # must be in the box's own timedatectl list; a change
+                                                     # restarts cron and each running agent unit.
     Host remediation for a privileged seat, delivered as scoped subcommands
     rather than raw systemctl/journalctl/crontab grants (DIVE-3221; DIVE-1088
     excluded those grants because each is a one-line root escape via the pager
@@ -1426,6 +1431,12 @@ main() {
       # usage + heartbeat health, zero agent tokens. Read-only reporting; no
       # registry mutation/lock, no audit (same posture as usage).
       cmd_digest "$@" ;;
+    disk)
+      # DIVE-5190: the SAFE box-disk sweep (allowlisted, rebuildable caches only)
+      # and the once-per-episode low-disk alarm; `tick` is the hourly root cron
+      # driver. No registry mutation/lock; no audit line — it logs what it freed
+      # to its own log, same posture as digest.
+      cmd_disk "$@" ;;
     push)
       # DIVE-1376/1460 (Bobby gripe #1): delegated push. Pushes ONLY the task's
       # branch, ONLY after the task gate clears, with a fail-closed author scan

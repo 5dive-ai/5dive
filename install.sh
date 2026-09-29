@@ -984,6 +984,29 @@ DIGESTCRON
     ok "digest pref seeded (off by default)"
   fi
 
+  # DIVE-5190: the SAFE box-disk sweep + low-disk alarm, hourly. The sweep
+  # deletes only an allowlist of caches a tool rebuilds (old unheld Chrome temp
+  # entries in /tmp, npm/nvm download caches via their own commands, apt-get
+  # clean, disabled snap revisions) and logs what it freed; the alarm tells the
+  # box owner once when the disk is under 10% free. install.sh comes from main but
+  # the bundle comes from the fleet pin, so the cron is written only when the
+  # INSTALLED bundle carries the verb — an older pin gets no cron rather than an
+  # hourly "unknown command" — and removed if a rollback takes the verb away.
+  if [[ -d /etc/cron.d ]]; then
+    if grep -q 'cmd_disk_tick' "$BIN_DIR/5dive" 2>/dev/null; then
+      mkdir -p /var/log/5dive
+      cat > /etc/cron.d/5dive-disk <<'DISKCRON'
+# 5dive box disk (DIVE-5190) — hourly: daily SAFE sweep (hourly while under 10%
+# free), then the once-per-episode low-disk alarm. Log: /var/log/5dive/disk-sweep.log
+23 * * * * root /usr/local/bin/5dive disk tick >/dev/null 2>>/var/log/5dive/disk-sweep.log
+DISKCRON
+      chmod 644 /etc/cron.d/5dive-disk
+      ok "/etc/cron.d/5dive-disk (safe disk sweep + low-disk alarm)"
+    else
+      rm -f /etc/cron.d/5dive-disk
+    fi
+  fi
+
   # DIVE-948: cap systemd journal growth. With no explicit limit journald drifts
   # to the distro default (~10% of disk, up to 4G); on the small cx plans that's
   # wasteful (boxes were reaching ~500M+/month). Idempotent drop-in, rewritten
@@ -1744,6 +1767,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   # 3. Binaries + shared libs
   rm -f "$BIN_DIR/5dive" "$BIN_DIR/5dive-agent-start" "$BIN_DIR/5dive-agent-stop-notify"
   ok "removed CLI binaries"
+  rm -f /etc/cron.d/5dive-disk   # DIVE-5190: its target is the binary just removed
   if [[ -d "$LIB_DIR" ]]; then
     rm -rf "$LIB_DIR"
     ok "removed $LIB_DIR (hooks, skills, ui)"

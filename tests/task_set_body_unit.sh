@@ -147,5 +147,24 @@ err10=$(<"$TMP/err")
   && ok_t "legacy unknown-flag errors truncate pasted payloads" \
   || bad_t "legacy unknown-flag payload truncation" "rc=$rc stdout=$e10 stderr=$err10"
 
+# --- T11: note text that STARTS with a dash is text, not a flag (luca, 2026-09-29).
+# The house append heading is "--- <seat> <date> — …"; it died as "unknown flag".
+# MUTATION GRADE: delete the `-*[[:space:]]*)` arm -> T11a and T11b FAIL.
+id11=$(run add --assignee=alice -- "dash-led append task" | jf '.data.id')
+run set_body "$id11" "first line" >/dev/null
+out11=$(run set_body "$id11" --append "--- claude-luca 2026-09-29 — a dash-led note"); rc=$?
+[[ $rc -eq 0 && "$(bodyof "$id11")" == *"--- claude-luca 2026-09-29 — a dash-led note"* ]] \
+  && ok_t "T11a: --append with dash-led text containing spaces appends it" \
+  || bad_t "T11a: dash-led append" "rc=$rc out=$out11 err=$(<"$TMP"/err) body=$(bodyof "$id11")"
+run set_body "$id11" "-- a replacement body that starts with two dashes" >/dev/null; rc=$?
+[[ $rc -eq 0 && "$(bodyof "$id11")" == "-- a replacement body that starts with two dashes" ]] \
+  && ok_t "T11b: replace mode takes dash-led text too" \
+  || bad_t "T11b: dash-led replace" "rc=$rc body=$(bodyof "$id11")"
+e11=$(run set_body "$id11" --bogus "text"); rc=$?
+err11=$(<"$TMP"/err)
+[[ $rc -eq "$E_USAGE" && "$e11$err11" == *"unknown flag: --bogus"* && "$e11$err11" == *"pass it after --"* ]] \
+  && ok_t "T11c: a whitespace-free unknown flag still fails, and the error names the -- escape" \
+  || bad_t "T11c: unknown flag still refused with hint" "rc=$rc out=$e11 err=$err11"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

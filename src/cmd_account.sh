@@ -195,6 +195,15 @@ account_signin_detail() {
             provider=$(jq -cn --arg p "$cand" '$p'); break
           fi
         done
+        # DIVE-5174: the model the account maps its sonnet tier to (a --model
+        # override, else the catalog default) — what an agent on it runs. The
+        # partner API shows it next to a client's OpenRouter key. A slug, never
+        # a secret. A plain subscription has no map, so model stays null.
+        local mapped
+        mapped=$(grep -E '^ANTHROPIC_DEFAULT_SONNET_MODEL=' "$env_file" 2>/dev/null \
+          | tail -1 | cut -d= -f2-) || mapped=""
+        mapped="${mapped%\"}"; mapped="${mapped#\"}"
+        [[ -z "$mapped" ]] || model=$(jq -cn --arg m "$mapped" '$m')
       fi
       # signedInAt: prefer the credential sentinel mtime when present, else
       # fall back to combined.env's (BYO has no .credentials.json).

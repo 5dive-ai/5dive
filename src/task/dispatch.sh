@@ -538,7 +538,14 @@ cmd_task_set_body() {
                      _read_prose_file "${1%%=*}" "${1#*=}"
                      file_text="$_PROSE_FILE_VALUE"; text_src="${1%%=*}" ;;
       --)            shift; words+=("$@"); break ;;
-      -*)            fail "$E_USAGE" "unknown flag: $1" ;;
+      # A flag token never contains whitespace; note text that merely STARTS with a
+      # dash does — "--- <seat> <date> — …" is how appended notes are headed on the
+      # board, and it used to die here as "unknown flag: --- …" on the first try.
+      # Checked AFTER --append=* and --file=*, so a flag's value may still carry spaces.
+      -*[[:space:]]*) if [[ -z "$task" ]]; then task="$1"; else words+=("$1"); fi ;;
+      # The hint goes BEFORE the marker: fail() caps whatever follows "unknown flag: "
+      # at 40 chars (DIVE-2121 payload safety), which would cut a trailing hint off.
+      -*)            fail "$E_USAGE" "if this is body text, pass it after -- (task set-body <id> [--append] -- \"<text>\"); unknown flag: $1" ;;
       *)             if [[ -z "$task" ]]; then task="$1"; else words+=("$1"); fi ;;
     esac
     shift
