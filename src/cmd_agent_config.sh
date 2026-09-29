@@ -25,7 +25,9 @@ cmd_config() {
   #     telegram.profile          (claude only — lite|default. lite = the partner-
   #                                client bot: six commands, no org machinery.
   #                                Written as TELEGRAM_PROFILE into the channel's
-  #                                .env; default removes the line. DIVE-5133)
+  #                                .env; default removes the line. DIVE-5133.
+  #                                On a seat with no bot yet it is staged there
+  #                                and applies when one is connected. DIVE-5227)
   #     telegram.account-url      (claude only — https:// or tg:// URL behind the
   #                                lite bot's /account button; empty removes it)
   #     discord.token             (bot/app token for this agent's discord plugin)
@@ -310,13 +312,19 @@ cmd_config() {
         "channels=discord needs discord.token=<token> in the same set call"
     fi
   fi
-  # DIVE-5133: checked BEFORE the registry write, so a profile set on a seat with
-  # no telegram channel refuses and changes nothing.
+  # DIVE-5133: checked BEFORE the registry write, so an account URL set on a seat
+  # with no telegram channel refuses and changes nothing.
+  # DIVE-5227: telegram.profile ALONE is staged on a seat with no bot yet. A
+  # Mini App hire picks the bot's profile from the agent's role at hire time,
+  # and the bot is connected later (from the dashboard); the line waits in the
+  # channel .env, which the token writer (agent_setup.sh) rewrites keeping every
+  # other key, so the bot's first boot comes up in the profile the hire chose.
   if (( tg_profile_set || tg_account_url_set )); then
     local _tg_pre_channels
     _tg_pre_channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
-    channel_in_list telegram "$_tg_pre_channels" \
-      || fail "$E_VALIDATION" "telegram.profile / telegram.account-url require channels=telegram (current: $_tg_pre_channels)"
+    if ! channel_in_list telegram "$_tg_pre_channels" && (( tg_account_url_set )); then
+      fail "$E_VALIDATION" "telegram.account-url requires channels=telegram (current: $_tg_pre_channels)"
+    fi
   fi
   # DIVE-5163: moving a claude seat to another account re-derives its model the
   # way create/import did, so a seat that asked for "sonnet" gets real Claude

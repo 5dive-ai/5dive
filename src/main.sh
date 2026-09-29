@@ -187,7 +187,8 @@ Agents:
                                                      # claude only. lite = a partner client's bot: six commands,
                                                      # no org machinery; account-url is its /account button.
                                                      # Written into the channel .env; default / an empty url
-                                                     # removes the line.
+                                                     # removes the line. profile alone works before a bot is
+                                                     # connected: it waits there for the bot's first boot.
   5dive agent pair <name> [--code=<code> | --user-id=<id> [--chat-id=<id>]]
                                                      # telegram/discord pairing. --code accepts the bot reply or
                                                      # bare pairing code. --user-id seeds access.json directly
