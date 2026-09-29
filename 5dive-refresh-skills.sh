@@ -149,3 +149,15 @@ for ag in $agents; do
 done
 
 echo "skills refresh done: $changed changed, $unchanged unchanged, $first_install first-install, $failed failed, $booting awaiting first boot"
+
+# DIVE-5205: hired agents get their marketplace PACK's later skill fixes too. A
+# pack was applied once at import and nothing re-applied it. `pack-sync --all`
+# walks every agent whose registry records a marketplace pack, touches only the
+# ids that pack lists, and leaves an owner-edited pack skill alone. A changed
+# agent restarts at its next quiet moment (heartbeat sweep), not here. Partner
+# boxes (a private registry the box cannot read) are synced by 5dive-api with a
+# fresh signed link instead. A bundle that predates the verb is skipped, not
+# warned about: install.sh refreshes the bundle before this runs.
+if [[ $# -eq 0 ]] && grep -q 'cmd_pack_sync' "$FIVE_BIN" 2>/dev/null; then
+  "$FIVE_BIN" agent pack-sync --all || echo "warn: pack skills sync did not complete for every agent (continuing)" >&2
+fi
