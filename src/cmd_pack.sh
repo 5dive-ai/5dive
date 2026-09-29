@@ -1214,14 +1214,15 @@ _pack_usage() {
                                   # token/auth-profile here. Skills are re-added from their
                                   # recorded refs (skills not in a published repo are skipped
                                   # + reported). Memory is never in a config pack.
-  5dive agent pack-sync <name> [--from-url=<https-url>] [--dry-run] [--no-restart]
+  5dive agent pack-sync <name> [--from-url=<https-url>|--marketplace=<slug>] [--dry-run] [--no-restart]
   5dive agent pack-sync --all [--dry-run] [--no-restart]
                                   # DIVE-5205: bring a hired agent's pack SKILLS up to the
                                   # pack's current version. Touches only ids the pack lists;
                                   # a pack skill the owner edited is left and reported as
                                   # drift. A changed agent restarts at its next quiet moment.
                                   # --all = every agent imported from a marketplace slug
-                                  # (the nightly skills refresh runs this).
+                                  # (the nightly skills refresh runs this). --marketplace names
+                                  # the pack for an agent hired before import recorded it.
 
   A pack carries an agent's portable identity (instructions, skills, settings subset),
   NEVER secrets (tokens/keys/sessions/transcripts are hard-excluded). --with-memory adds
@@ -3644,10 +3645,12 @@ _pack_record_write() {
       | .importedAt = ($o.importedAt // $t))' <<<"$reg" | registry_write
 }
 
-# _pack_sync_one <agent> <url> <dry:0|1> <restart:0|1> — one JSON result on stdout.
+# _pack_sync_one <agent> <url> <dry:0|1> <restart:0|1> [<marketplace-slug>] — one
+# JSON result on stdout. The slug names the pack for an agent hired before the
+# record existed (5dive-api knows it; the box does not).
 # rc 0 = synced or nothing to do; 1 = could not sync this agent.
 _pack_sync_one() {
-  local name="$1" url="$2" dry="$3" restart="$4"
+  local name="$1" url="$2" dry="$3" restart="$4" mslug="${5:-}"
   local res; res=$(jq -nc --arg n "$name" '{name:$n, status:"error"}')
   _ps_out() { jq -c "$@" <<<"$res"; }
   local reg rec src slug tgz="" rc
@@ -3657,6 +3660,14 @@ _pack_sync_one() {
   fi
   rec=$(jq -c --arg n "$name" '.agents[$n].pack // {}' <<<"$reg")
   src=$(jq -r '.source // ""' <<<"$rec"); slug=$(jq -r '.slug // ""' <<<"$rec")
+  if [[ -n "$mslug" ]]; then
+    [[ "$mslug" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || { _ps_out '.reason = "--marketplace must be a pack slug"'; return 1; }
+    if [[ -n "$slug" && "$slug" != "$mslug" ]]; then
+      _ps_out --arg a "$slug" --arg b "$mslug" '.reason = "this agent was hired from pack \($a), not \($b) — refusing to overlay another pack"'
+      return 1
+    fi
+    src="marketplace"; slug="$mslug"
+  fi
   if [[ -n "$url" ]]; then
     local uslug; uslug=$(_pack_url_slug "$url")
     [[ "$url" =~ ^https://[^[:space:]]+$ && -n "$uslug" ]] \
@@ -3758,11 +3769,12 @@ _pack_sync_one() {
 
 cmd_pack_sync() {
   require_root "agent pack-sync"
-  local name="" url="" all=0 dry=0 restart=1
-  local usage="usage: 5dive agent pack-sync <name> [--from-url=<https-link>] [--dry-run] [--no-restart] | --all [--dry-run] [--no-restart]"
+  local name="" url="" mslug="" all=0 dry=0 restart=1
+  local usage="usage: 5dive agent pack-sync <name> [--from-url=<https-link>|--marketplace=<slug>] [--dry-run] [--no-restart] | --all [--dry-run] [--no-restart]"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --from-url=*)  url="${1#--from-url=}" ;;
+      --marketplace=*) mslug="${1#--marketplace=}" ;;
       --all)         all=1 ;;
       --dry-run)     dry=1 ;;
       --no-restart)  restart=0 ;;
@@ -3771,7 +3783,8 @@ cmd_pack_sync() {
     esac
     shift
   done
-  (( all )) && [[ -n "$name$url" ]] && fail "$E_USAGE" "--all takes no agent name or link — $usage"
+  (( all )) && [[ -n "$name$url$mslug" ]] && fail "$E_USAGE" "--all takes no agent name, link or slug — $usage"
+  [[ -n "$url" && -n "$mslug" ]] && fail "$E_USAGE" "give --from-url OR --marketplace, not both — $usage"
   (( all )) || [[ -n "$name" ]] || fail "$E_USAGE" "$usage"
   local -a names=()
   if (( all )); then
@@ -3783,7 +3796,7 @@ cmd_pack_sync() {
   local n line results='[]' bad=0
   for n in "${names[@]+"${names[@]}"}"; do
     [[ -n "$n" ]] || continue
-    line=$(_pack_sync_one "$n" "$url" "$dry" "$restart") || bad=$((bad + 1))
+    line=$(_pack_sync_one "$n" "$url" "$dry" "$restart" "$mslug") || bad=$((bad + 1))
     results=$(jq -c --argjson r "${line:-null}" '. + [$r]' <<<"$results")
     (( JSON_MODE )) || step "$(jq -r '"\(.name): \(.status)" + (if .reason then " — \(.reason)" else "" end)
       + (if (.added|length? // 0) > 0 then "; added \(.added|join(","))" else "" end)

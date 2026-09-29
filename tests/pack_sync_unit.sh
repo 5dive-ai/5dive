@@ -131,6 +131,11 @@ is "6b status skipped" "$(jq -r .status <<<"$out")" skipped
 jq '.agents.nobody = {type:"claude"}' "$REGISTRY" >"$TMP/r" && mv "$TMP/r" "$REGISTRY"
 is "6c no record at all is skipped" "$(sync nobody | jq -r .status)" skipped
 
+mkdir -p "$AGENT_HOME_ROOT/agent-nobody/.claude/skills"
+out=$(_pack_sync_one nobody "" 1 1 otherslug); is "6d --marketplace names the pack for an unrecorded agent" "$(jq -r .slug <<<"$out")" otherslug
+out=$(_pack_sync_one maya "" 1 1 otherslug); rc=$?
+is "6e --marketplace for ANOTHER pack than recorded is refused" "$rc" 1
+
 echo "== 7. --all walks marketplace agents only =="
 FIX_PACK="$TMP/p3"; rm -rf "$PENDING_RESTART_DIR"
 out=$(cmd_pack_sync --all --no-restart)
