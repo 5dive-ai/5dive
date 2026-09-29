@@ -431,6 +431,9 @@ cmd_config() {
     step "Installing telegram channel for agent '$name' (type=$type)"
     install_channel_for_agent "$type" telegram "$name" \
       "$token_for_install" "$new_home_channel" "$new_allowed_users"
+    # DIVE-5187: ROOT set these ids, so they are the agent's approvers of
+    # record for sysadmin requests. access.json is the seat's own file.
+    [[ -n "$new_allowed_users" ]] && _sysadmin_pin_owners "$name" "$new_allowed_users"
     # DIVE-4413: install_channel_for_agent hands home_channel to the hermes and
     # openclaw installers ONLY (agent_setup.sh) — every other type took the value
     # and discarded it. The access.json types have a real lever for the same

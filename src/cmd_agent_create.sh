@@ -589,7 +589,9 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _gh_do"*|\
         "/usr/local/bin/5dive _task_answer"*|\
         "/usr/local/bin/5dive _task_channel"*|\
-        "/usr/local/bin/5dive _merge_do"*)              has_a2a=1 ;;
+        "/usr/local/bin/5dive _merge_do"*|\
+        "/usr/local/bin/5dive --json owner-ask tap"*|\
+        "/usr/local/bin/5dive sysadmin _broker"|"/usr/local/bin/5dive --json sysadmin _broker") has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
     done
@@ -752,6 +754,13 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_channel
 # sign in a COMMENT is executed and its output lands in the sudoers file. Keep
 # this block free of both.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _merge_do
+# DIVE-5187: relay the box owner's Approve or Decline tap from this seat's OWN bot
+# to root, the call the Telegram plugin makes. owner-ask tap validates both
+# arguments (a bap or bdn button of 12 hex and 32 hex, a numeric tapper id) and
+# acts only on the owner's proof, a nonce minted by root that this seat never
+# sees. Without it every standard seat's bot answered such a tap with an error,
+# so a partner client could not approve its sysadmin's changes (or browser asks).
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive --json owner-ask tap *
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
     cat <<SUDOERS
@@ -3256,6 +3265,13 @@ cmd_create() {
       + (if $bu == "" then {} else {botUsername: $bu} end)
       + (if $mf == "" then {} else {modelFamily: $mf} end)
     )' <<<"$reg" | registry_write
+  # DIVE-5187: the ids root paired at create are this agent's approvers of record
+  # for sysadmin requests (access.json is the seat's own file and can grow), and
+  # the seat user lingers so its own `systemctl --user` services outlive a turn.
+  if [[ -n "$telegram_allowed_users" ]] && channel_in_list telegram "$channels"; then
+    _sysadmin_pin_owners "$name" "$telegram_allowed_users"
+  fi
+  loginctl enable-linger "agent-${name}" >/dev/null 2>&1 || true
 
   # Git reads hooksPath on each commit, so this covers every coding tool and
   # needs no service restart. Identity is stored before installation so a

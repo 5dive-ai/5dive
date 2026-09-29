@@ -330,6 +330,12 @@ _owner_ask_tap() {
   local lock="${STATE_DIR:-/var/lib/5dive}/owner-ask.lock" fd
   exec {fd}>>"$lock" && flock -w 10 "$fd" || fail "$E_GENERIC" "cannot take $lock"
 
+  # DIVE-5187: a sysadmin request (cmd_sysadmin.sh) is answered on the same two
+  # buttons, so every relay that already carries bap/bdn to root carries it too.
+  if _sysadmin_has_request "$hex"; then
+    _sysadmin_tap "$kind" "$hex" "$nonce" "$uid"
+    return
+  fi
   _owner_ask_find "$hex" \
     || _owner_ask_refuse "no pending ask ${hex}: it was already answered, spent or expired — nothing was authorised"
   AUDIT_ARGS+=("id=${OA_ID}")

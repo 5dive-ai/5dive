@@ -937,7 +937,9 @@ def classify_sudo(text, measurable):
                   command.startswith("/usr/local/bin/5dive _gh_do") or
                   command.startswith("/usr/local/bin/5dive _task_answer") or
                   command.startswith("/usr/local/bin/5dive _task_channel") or
-                  command.startswith("/usr/local/bin/5dive _merge_do")):
+                  command.startswith("/usr/local/bin/5dive _merge_do") or
+                  command.startswith("/usr/local/bin/5dive --json owner-ask tap") or
+                  command in ("/usr/local/bin/5dive sysadmin _broker", "/usr/local/bin/5dive --json sysadmin _broker")):
                 has_scoped = True
             else:
                 has_other = True
