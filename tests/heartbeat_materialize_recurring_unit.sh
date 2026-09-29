@@ -589,5 +589,125 @@ else
   bad_t "2272 display: the box renderer carries the same bound + a policy column" "$disp_box"
 fi
 
+# ---------------------------------------------------------------------------
+# DIVE-5218: BOUNDED CATCH-UP. A template due in a minute that NO pass evaluated
+# (the tick overran 60s) used to be dropped: DIVE-1236's `0 3 * * *` on
+# 2026-09-29, passes at 02:59:09 and 03:01:05. Every arm below drives the pass
+# minute through the durable last-pass file, the same way two ticks would.
+#
+# THE CLOCK: these arms run two days in the PAST. last_fired_at is stamped with
+# the real datetime('now'), so a past slot reads as "already fired" once the
+# template has fired -- which is what the re-fire arm needs -- and a fresh
+# template (empty last_fired_at) is never blocked by it.
+db "UPDATE tasks SET status='cancelled' WHERE kind='recurring';"   # earlier arms' every-minute templates out of the way
+LP="$(_hb_mz_last_pass_file)"
+B=$(( ($(date -u +%s) - 2*86400) / 3600 * 3600 ))      # an hour boundary, two days ago
+cron_at() {  # cron_at <epoch> -> a cron that matches ONLY that minute (that day)
+  local M H d m; read -r M H d m < <(date -u -d "@$1" +'%M %H %d %m')
+  printf '%d %d %d %d *' "$((10#$M))" "$((10#$H))" "$((10#$d))" "$((10#$m))"
+}
+mk_at() {  # mk_at <title> <cron> [on_overlap] [bound] -> row id
+  db "INSERT INTO tasks (title, body, priority, assignee, created_by, kind, schedule, status, on_overlap, overlap_bound)
+      VALUES ($(sqlq "$1"), '', 'medium', 'main', 'main', 'recurring', $(sqlq "$2"), 'todo',
+              $( [[ -n "${3:-}" ]] && sqlq "$3" || echo NULL ), $( [[ -n "${4:-}" ]] && echo "$4" || echo NULL ));
+      SELECT last_insert_rowid();"
+}
+
+# K1 — THE ROW. Slot at B+30m; passes at B+29m and B+31m+5s, none in B+30m.
+k1=$(mk_at "5218 missed-minute template" "$(cron_at $((B + 1800)))")
+printf '%s\n' "$((B + 1740))" >"$LP"; : >"$LOG"
+_hb_materialize_recurring "$((B + 1865))"
+if [[ "$(instances_of "$k1")" == "1" ]]; then
+  ok_t "5218 K1: a slot between two passes 2 min apart fires exactly once"
+else
+  bad_t "5218 K1: a slot between two passes 2 min apart fires exactly once" "instances=$(instances_of "$k1") log=$(cat "$LOG")"
+fi
+slot_hm=$(date -u -d "@$((B + 1800))" +'%Y-%m-%d %H:%M')
+if grep -q "fired -> new standard todo (catch-up: slot ${slot_hm} UTC" "$LOG" && grep -q 'catch-up: 1 minute(s)' "$LOG"; then
+  ok_t "5218 K1: the catch-up fire logs its slot minute"
+else
+  bad_t "5218 K1: the catch-up fire logs its slot minute" "$(cat "$LOG")"
+fi
+if [[ "$(cat "$LP")" == "$((B + 1860))" ]]; then
+  ok_t "5218 K1: the pass records its own minute durably for the next pass"
+else
+  bad_t "5218 K1: the pass records its own minute durably for the next pass" "last-pass=$(cat "$LP" 2>&1)"
+fi
+
+# K2 — NO RE-FIRE. Close the instance so the dedup cannot be what holds it,
+# then: a second pass in the same minute, the next minute, and a pass whose
+# window is FORCED back over the slot (only the last_fired_at guard stops that).
+db "UPDATE tasks SET status='done' WHERE from_template_id=${k1};"
+_hb_materialize_recurring "$((B + 1900))"
+_hb_materialize_recurring "$((B + 1925))"
+printf '%s\n' "$((B + 1740))" >"$LP"
+_hb_materialize_recurring "$((B + 1870))"
+if [[ "$(instances_of "$k1")" == "1" ]]; then
+  ok_t "5218 K2: later passes over the same window do not re-fire the slot"
+else
+  bad_t "5218 K2: later passes over the same window do not re-fire the slot" "instances=$(instances_of "$k1")"
+fi
+
+# K3 — THE BOUND. 17 minutes with no pass is an outage: nothing backfilled.
+k3=$(mk_at "5218 over-bound template" "$(cron_at $((B + 9000)))")
+printf '%s\n' "$((B + 9000 - 17*60))" >"$LP"; : >"$LOG"
+_hb_materialize_recurring "$((B + 9065))"
+if [[ "$(instances_of "$k3")" == "0" ]] && grep -q 'NOT backfilling' "$LOG"; then
+  ok_t "5218 K3: a gap over the ${_HB_MZ_CATCHUP_MIN}m bound does not backfill, and says so"
+else
+  bad_t "5218 K3: a gap over the ${_HB_MZ_CATCHUP_MIN}m bound does not backfill, and says so" "instances=$(instances_of "$k3") log=$(cat "$LOG")"
+fi
+# ...and exactly AT the bound (15 missed minutes) it still catches up.
+k3b=$(mk_at "5218 at-bound template" "$(cron_at $((B + 14400)))")
+printf '%s\n' "$((B + 14400 - 15*60))" >"$LP"
+_hb_materialize_recurring "$((B + 14400 + 65))"
+if [[ "$(instances_of "$k3b")" == "1" ]]; then
+  ok_t "5218 K3: a gap of exactly ${_HB_MZ_CATCHUP_MIN} missed minutes is still caught up"
+else
+  bad_t "5218 K3: a gap of exactly ${_HB_MZ_CATCHUP_MIN} missed minutes is still caught up" "instances=$(instances_of "$k3b")"
+fi
+
+# K4 — THE PACING FLOOR. A catch-up slot inside a held band is NOT fired and
+# stamps NOTHING, exactly like an on-time slot (DIVE-4430). Stubs in a subshell:
+# this harness does not source grader_pool.sh.
+k4=$(mk_at "5218 paced template" "$(cron_at $((B + 18000)))")
+printf '%s\n' "$((B + 18000 - 60))" >"$LP"; : >"$LOG"
+( _HB_PACE_USAGE='{}'
+  _pace_band()      { printf 'soft floor (stub)'; return 2; }
+  _pace_admits()    { return 1; }
+  _pace_band_name() { printf 'soft'; }
+  registry_read()   { printf '{"agents":{}}'; }
+  _hb_materialize_recurring "$((B + 18065))" )
+k4_lf=$(last_fired_of "$k4"); k4_ls=$(last_skipped_of "$k4")
+if [[ "$(instances_of "$k4")" == "0" && -z "$k4_lf" && -z "$k4_ls" ]] \
+   && grep -q "NOT fired — pacing floor soft.*(catch-up: slot" "$LOG"; then
+  ok_t "5218 K4: a paced catch-up slot logs NOT fired and stamps nothing"
+else
+  bad_t "5218 K4: a paced catch-up slot logs NOT fired and stamps nothing" \
+        "instances=$(instances_of "$k4") last_fired='${k4_lf}' last_skipped='${k4_ls}' log=$(cat "$LOG")"
+fi
+
+# K5 — NO STATE, NO GUESS. With no last-pass record (first pass after install)
+# only `now` is evaluated: a slot one minute back is not invented.
+k5=$(mk_at "5218 no-state template" "$(cron_at $((B + 21600)))")
+rm -f "$LP"
+_hb_materialize_recurring "$((B + 21665))"
+if [[ "$(instances_of "$k5")" == "0" && "$(cat "$LP" 2>/dev/null)" == "$((B + 21660))" ]]; then
+  ok_t "5218 K5: with no last-pass record only now is evaluated, and the record is created"
+else
+  bad_t "5218 K5: with no last-pass record only now is evaluated, and the record is created" "instances=$(instances_of "$k5") last-pass=$(cat "$LP" 2>&1)"
+fi
+
+# K6 — ONCE PER PASS. An every-minute spawn template (no dedup to lean on) over
+# a 6-minute window fires ONE instance, not six.
+k6=$(mk_at "5218 every-minute spawn template" '* * * * *' spawn 50)
+printf '%s\n' "$((B + 25200))" >"$LP"
+_hb_materialize_recurring "$((B + 25200 + 6*60 + 5))"
+if [[ "$(instances_of "$k6")" == "1" ]]; then
+  ok_t "5218 K6: a multi-minute window fires a template at most once per pass"
+else
+  bad_t "5218 K6: a multi-minute window fires a template at most once per pass" "instances=$(instances_of "$k6")"
+fi
+
 echo "-- ${PASS} passed, ${FAIL} failed --"
 [[ $FAIL -eq 0 ]]

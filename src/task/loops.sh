@@ -1408,7 +1408,8 @@ cmd_task_park() {
   #     (_hb_materialize_recurring, src/cmd_heartbeat.sh) and a park sets
   #     status='blocked', so the parked instance HOLDS the template's only open
   #     slot. Every occurrence inside the park window is DROPPED, not deferred —
-  #     the materializer carries an explicit `V1 LIMITATION: no catch-up`.
+  #     DIVE-5218's catch-up covers only minutes NO pass evaluated, never a
+  #     slot the dedup skipped.
   #   - the DIVE-2693 stall ladder requires `status='todo' AND parked_at IS NULL`
   #     at BOTH rungs (rung 2 added by DIVE-2853), so the row that stopped the
   #     beat is the one state the watchdog cannot see.

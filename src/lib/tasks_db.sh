@@ -3599,11 +3599,21 @@ _cron_dow_match() {
 # otherwise every field ANDs. Backs the DIVE-138 heartbeat materializer.
 # Returns 0 if due at that minute, 1 otherwise.
 _cron_matches() {
-  local expr="$1" epoch="$2"
+  local fields
+  fields=$(date -u -d "@${2}" +'%M %H %d %m %w' 2>/dev/null) || return 1
+  _cron_matches_fields "$1" "$fields"
+}
+
+# DIVE-5218: the same test against a minute already split into
+# '<MM> <HH> <dd> <mm> <w>' (date -u +'%M %H %d %m %w'). The materializer's
+# catch-up window asks up to 16 minutes of every template, so it formats each
+# minute ONCE per pass instead of forking `date` per template per minute.
+_cron_matches_fields() {
+  local expr="$1"
   local -a cm=(); read -r -a cm <<<"$expr"
   [[ ${#cm[@]} -eq 5 ]] || return 1
   local emin ehour edom emon edow
-  read -r emin ehour edom emon edow < <(date -u -d "@${epoch}" +'%M %H %d %m %w' 2>/dev/null)
+  read -r emin ehour edom emon edow <<<"$2"
   [[ -n "$edow" ]] || return 1
   _cron_field_match "${cm[0]}" "$emin"  || return 1
   _cron_field_match "${cm[1]}" "$ehour" || return 1
