@@ -962,7 +962,10 @@ cmd_account_set() {
   [[ -z "$provider" ]] || args+=("--provider=$provider")
   [[ -z "$model" ]]    || args+=("--model=$model")
   [[ -z "$base_url" ]] || args+=("--base-url=$base_url")
-  cmd_auth_set "${args[@]}"
+  cmd_auth_set "${args[@]}" || return
+  # DIVE-5187: a partner spare's sysadmin seat is built before its box has a
+  # key, and waits on this account; bind it now. Silent, never fatal.
+  _sysadmin_bind_pending "$name" >/dev/null 2>&1 || true
 }
 
 cmd_agent_set_account() {

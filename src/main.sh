@@ -370,6 +370,11 @@ Owner asks (a browser step only the owner may allow, answered on Telegram):
   5dive owner-ask browser <request-file>             # send the ask to the owner with Approve / Decline (the browser plugin runs it)
   5dive owner-ask tap <bap|bdn>:<12hex>:<nonce> --tap-uid=<id>   # root: apply the owner's tap (the team-bot listener runs it)
 
+Sysadmin seat (a partner box's privileged work; each change waits for the owner's tap):
+  5dive sysadmin read | restart <agent> | propose --for=<agent> --summary=<line> | status [<sa-id>]
+  5dive sysadmin install [--auth-profile=<name>]      # root: the seat, its broker grant and its rules
+  5dive sysadmin answer <sa-id> approve|decline --sha=<hex>   # root: the owner's tap, relayed by 5dive-api
+
 Web UI for this host (org chart, queue, gates, triggers) — now a PLUGIN:
   5dive plugin add 5dive-ai/5dive-ui                 # install it once, then 5dive ui works as before
   5dive board [--json]                               # the versioned document the views render (core owns this)
@@ -1354,6 +1359,11 @@ main() {
         tap) AUDIT_CMD="owner-ask tap"; AUDIT_ARGS=() ;;
       esac
       cmd_owner_ask "$@" ;;
+    sysadmin)
+      # DIVE-5187: the sysadmin seat's broker. Scripts travel on stdin and never
+      # reach the audit row; the verb adds the request id and the target.
+      AUDIT_CMD="sysadmin ${1:-}"; AUDIT_ARGS=()
+      cmd_sysadmin "$@" ;;
     board)
       # DIVE-4779: the READ CONTRACT — one versioned JSON document describing this
       # host's board, for a consumer that must not open core's private store. Same

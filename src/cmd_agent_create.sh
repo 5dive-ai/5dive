@@ -589,7 +589,8 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _gh_do"*|\
         "/usr/local/bin/5dive _task_answer"*|\
         "/usr/local/bin/5dive _task_channel"*|\
-        "/usr/local/bin/5dive _merge_do"*)              has_a2a=1 ;;
+        "/usr/local/bin/5dive _merge_do"*|\
+        "/usr/local/bin/5dive sysadmin _broker"|"/usr/local/bin/5dive --json sysadmin _broker") has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
     done
@@ -3256,6 +3257,12 @@ cmd_create() {
       + (if $bu == "" then {} else {botUsername: $bu} end)
       + (if $mf == "" then {} else {modelFamily: $mf} end)
     )' <<<"$reg" | registry_write
+  # DIVE-5187: on a partner box (the one kind that has the sysadmin seat) the
+  # seat user lingers, so its own `systemctl --user` app outlives a turn and a
+  # reboot. 5dive's own boxes are unchanged.
+  if jq -e '.agents.sysadmin != null' "$REGISTRY" >/dev/null 2>&1; then
+    loginctl enable-linger "agent-${name}" >/dev/null 2>&1 || true
+  fi
 
   # Git reads hooksPath on each commit, so this covers every coding tool and
   # needs no service restart. Identity is stored before installation so a
