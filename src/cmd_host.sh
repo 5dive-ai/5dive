@@ -42,6 +42,11 @@
 #   host cron show      crontab -l -u <validated-user>
 #   host cron snapshot  crontab -l -u <validated-user>   (output stored under $STATE_DIR)
 #   host cron diff      diff -u <two CLI-owned files>
+#   host timezone       timedatectl show -p Timezone --value
+#   host timezone set   timedatectl list-timezones ; timedatectl set-timezone <validated zone> ;
+#                       systemctl try-restart cron.service ;
+#                       systemctl restart <each ACTIVE 5dive-agent@<name>.service, names read
+#                       back from systemd and re-validated, never from the caller>
 #
 # There is no eval, no `sh -c`, no editor, no caller-supplied file path, no
 # caller-supplied unit-file content, and no pager anywhere in this file. Every
@@ -613,6 +618,103 @@ cmd_host_cron() {
   esac
 }
 
+# --- host timezone (DIVE-5165) -----------------------------------------------
+# The box's system zone. A partner client's assistant keeps their calendar
+# (OINOA): on a UTC box, "remind me at 9" fires at 12:00 Moscow time and "today"
+# rolls over at 03:00. 5dive-api calls `set` over /shell/exec with the zone the
+# client's device reported; 5dive's own boxes are never sent it and stay UTC.
+#
+# The zone is the ONLY caller input, and it reaches timedatectl only after two
+# checks: an IANA name shape (no dot, no leading slash, so no path), and exact
+# membership in this box's own `timedatectl list-timezones`. The restart set is
+# read back from systemd, not taken from the caller. A process caches its zone at
+# start, so the running agents are restarted to pick it up (and cron, which reads
+# /etc/localtime for its schedule) — only when the zone actually changed.
+HOST_TZ_RE='^[A-Z][A-Za-z0-9_+-]*(/[A-Z][A-Za-z0-9_+-]*){0,2}$'
+HOST_AGENT_UNIT_RE='^5dive-agent@[a-z][a-z0-9-]*\.service$'
+
+# Single seam onto timedatectl, so the harness drives every decision without a
+# live systemd (the _host_unit_property precedent).
+_host_timedatectl() {
+  timedatectl "$@"
+}
+
+_host_tz_current() {
+  _host_timedatectl show -p Timezone --value 2>/dev/null || true
+}
+
+_host_validate_tz() {
+  local tz="$1"
+  [[ "$tz" =~ $HOST_TZ_RE ]] \
+    || fail "$E_VALIDATION" "not an IANA time zone name: '${tz:0:64}' (e.g. Europe/Moscow)"
+  _host_timedatectl list-timezones 2>/dev/null | grep -Fxq -- "$tz" \
+    || fail "$E_VALIDATION" "time zone '$tz' is not in this box's zone list (timedatectl list-timezones)"
+}
+
+_host_active_agent_units() {
+  local u
+  while read -r u _; do
+    [[ "$u" =~ $HOST_AGENT_UNIT_RE ]] && printf '%s\n' "$u"
+  done < <(_host_systemctl list-units --type=service --state=active --plain --no-legend '5dive-agent@*.service' 2>/dev/null)
+  return 0
+}
+
+cmd_host_timezone() {
+  local action="" tz="" do_restart=1
+  while (( $# )); do
+    case "$1" in
+      --json) JSON_MODE=1 ;;
+      --no-restart) do_restart=0 ;;
+      -h|--help) printf '%s\n' \
+        "usage: 5dive host timezone                          # this box's system time zone" \
+        "       5dive host timezone set <IANA zone> [--no-restart]" \
+        "  set   change the system zone, then restart cron and every running agent so they" \
+        "        pick it up. A no-op (nothing restarted) when the zone is already that one." \
+        "        --no-restart leaves the running processes on the old zone until they restart."
+        return 0 ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)
+        if [[ -z "$action" ]]; then action="$1"
+        elif [[ "$action" == set && -z "$tz" ]]; then tz="$1"
+        else fail "$E_USAGE" "extra arg: $1"; fi ;;
+    esac
+    shift
+  done
+
+  local cur; cur=$(_host_tz_current)
+  case "$action" in
+    "")
+      ok "time zone: ${cur:-unknown}" '{timezone:(if $t=="" then null else $t end)}' --arg t "$cur"
+      ;;
+    set)
+      [[ -n "$tz" ]] || fail "$E_USAGE" "usage: 5dive host timezone set <IANA zone> [--no-restart]"
+      require_root "host timezone set $tz"
+      _host_validate_tz "$tz"
+      if [[ "$tz" == "$cur" ]]; then
+        ok "time zone already $tz — nothing changed" \
+           '{timezone:$t, previous:$t, changed:false, restarted:[]}' --arg t "$tz"
+        return 0
+      fi
+      _host_timedatectl set-timezone "$tz" \
+        || fail "$E_GENERIC" "timedatectl set-timezone $tz failed"
+      local -a restarted=()
+      if (( do_restart )); then
+        _host_systemctl try-restart cron.service >/dev/null 2>&1 || true
+        local u
+        while read -r u; do
+          [[ -n "$u" ]] || continue
+          if _host_systemctl restart "$u" >&2; then restarted+=("$u"); fi
+        done < <(_host_active_agent_units)
+      fi
+      ok "time zone ${cur:-unknown} -> $tz${restarted[*]:+ (restarted: ${restarted[*]})}" \
+         '{timezone:$t, previous:(if $p=="" then null else $p end), changed:true,
+           restarted:($r | split("\n") | map(select(. != "")))}' \
+         --arg t "$tz" --arg p "$cur" --arg r "$(printf '%s\n' "${restarted[@]}")"
+      ;;
+    *) fail "$E_USAGE" "usage: 5dive host timezone [set <IANA zone>] [--no-restart]" ;;
+  esac
+}
+
 cmd_host_unit() {
   local action="${1:-}"; shift || true
   case "$action" in
@@ -630,6 +732,7 @@ cmd_host() {
     unit)    cmd_host_unit "$@" ;;
     journal) cmd_host_journal "$@" ;;
     cron)    cmd_host_cron "$@" ;;
-    *) fail "$E_USAGE" "usage: 5dive host <unit|journal|cron> ... (see: 5dive --help)" ;;
+    timezone) cmd_host_timezone "$@" ;;
+    *) fail "$E_USAGE" "usage: 5dive host <unit|journal|cron|timezone> ... (see: 5dive --help)" ;;
   esac
 }

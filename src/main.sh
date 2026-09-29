@@ -516,6 +516,10 @@ Health:
                                                      # write/edit path (crontab -e is an EDITOR escape).
                                                      # diff compares against the CLI's own snapshot,
                                                      # never a caller-supplied file.
+  5dive host timezone [set <IANA zone>] [--no-restart]
+                                                     # read or set the system zone (DIVE-5165). The zone
+                                                     # must be in the box's own timedatectl list; a change
+                                                     # restarts cron and each running agent unit.
     Host remediation for a privileged seat, delivered as scoped subcommands
     rather than raw systemctl/journalctl/crontab grants (DIVE-3221; DIVE-1088
     excluded those grants because each is a one-line root escape via the pager

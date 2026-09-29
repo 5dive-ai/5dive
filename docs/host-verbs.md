@@ -47,6 +47,7 @@ and nothing for the next `agent create` to silently revert.** `5dive agent _svc`
 5dive host unit revert  --unit=<u>.service [--no-restart]
 5dive host journal --unit=<unit> [--lines=N] [--since=<N>m|<N>h|<N>d]
 5dive host cron show|snapshot|diff --user=<user>
+5dive host timezone [set <IANA zone>] [--no-restart]
 ```
 
 `unit list` and `unit show` need no root (systemd exposes them unprivileged); everything else does,
@@ -84,6 +85,7 @@ can exec:
 | `journal` | `journalctl -u <validated-unit> -n <int> [--since "<int> <one of three words> ago"]` | — |
 | `cron show/snapshot` | `crontab -l -u <validated-user>` | `$STATE_DIR/host-cron/<user>.cron` (0600) |
 | `cron diff` | `diff -u` over two CLI-owned files | — |
+| `timezone set` | `timedatectl list-timezones`, `timedatectl set-timezone <zone in that list>`, `systemctl try-restart cron.service`, `systemctl restart` of each active `5dive-agent@<name>.service` systemd reports | the system zone (`/etc/localtime`, through timedatectl) |
 
 No `eval`, no `sh -c`, no editor, no caller-supplied path, no caller-supplied unit-file content, and
 no pager anywhere. `tests/host_verbs_unit.sh` asserts each of those as a grep over the source, so a
