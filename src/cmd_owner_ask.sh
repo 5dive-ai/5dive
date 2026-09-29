@@ -330,18 +330,6 @@ _owner_ask_tap() {
   local lock="${STATE_DIR:-/var/lib/5dive}/owner-ask.lock" fd
   exec {fd}>>"$lock" && flock -w 10 "$fd" || fail "$E_GENERIC" "cannot take $lock"
 
-  # DIVE-5187: a sysadmin request (cmd_sysadmin.sh) is answered on the same two
-  # buttons, so every relay that already carries bap/bdn to root carries it too.
-  if _sysadmin_has_request "$hex"; then
-    _sysadmin_tap "$kind" "$hex" "$nonce" "$uid"
-    return
-  fi
-  # A browser ask carries ONE proof on both buttons, so a seat relaying its own
-  # bot's tap would hold the Approve proof after the owner tapped Decline. Only
-  # the root team-bot listener answers these; a seat relay stays refused, as it
-  # was before a seat could sudo this verb (DIVE-5187).
-  [[ "${SUDO_USER:-}" == agent-* ]] \
-    && _owner_ask_refuse "a browser ask is answered on the team bot, not relayed by ${SUDO_USER} — nothing was authorised"
   _owner_ask_find "$hex" \
     || _owner_ask_refuse "no pending ask ${hex}: it was already answered, spent or expired — nothing was authorised"
   AUDIT_ARGS+=("id=${OA_ID}")

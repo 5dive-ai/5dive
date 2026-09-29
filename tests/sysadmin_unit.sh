@@ -4,16 +4,17 @@
 #
 # What is graded is the boundary, not the prose:
 #   (a) the lint refuses every hard-limit class and passes an honest service install;
-#   (b) only the sysadmin seat reaches the broker;
-#   (c) a proposal sends Approve / Decline to the asking agent's PINNED owner only —
-#       not to an id the seat added to its own access.json — and a refused script
-#       sends nothing and writes nothing;
-#   (d) the tap (through the real `owner-ask tap` entry) starts the script as root
-#       in the sandbox only for that owner, the right proof and in time, once;
+#   (b) only the sysadmin seat reaches the broker, and no seat's sudo reaches `answer`;
+#   (c) a proposal is handed to 5dive-api (never to a Telegram bot from the box), a
+#       refused script sends nothing and writes nothing, and an unsent one says so;
+#   (d) `answer` (root, as 5dive-api relays the owner's tap) starts the script as root
+#       in the sandbox only for the shown script, in time, once;
 #   (e) decline and (f) expiry run nothing; (g) status reads the result;
-#   (h) approvers are pinned where root sets them; (i) install creates, binds and
-#       grants exactly the broker; (j) mutants: without the pin a stranger's tap
-#       runs, and without the lint an off-limits script is sent.
+#   (h) HOSTILE SEAT: a seat holding everything the proposal put in its reach, calling
+#       every entry it can reach, approves nothing;
+#   (i) install creates, binds, grants exactly the broker and lingers the seats;
+#   (j) mutants: each defence of (h) removed turns (h) red, and without the lint an
+#       off-limits script is sent (tests/mutants/DIVE-5187.sh holds the (h) ones);
 #   (k) root + systemd only: the SHIPPED root props hide the box's secrets from an
 #       approved script and the exit code lands in the log.
 #
@@ -47,18 +48,10 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
-# --- fixtures: maya (a persona with a bot), sysadmin -------------------------
-OWNER=1111111111 BYSTANDER=2222222222 STRANGER=9999999999
-printf '{"agents":{"maya":{"type":"claude","channels":"telegram","telegramOwners":["%s"]},"sysadmin":{"type":"claude","channels":"none"}}}\n' "$OWNER" > "$REGISTRY"
-CONNECTORS_DIR="$TMP/connectors"; mkdir -p "$CONNECTORS_DIR"
-_tg_access_state_dir() { printf '%s/chan/%s/%s' "$TMP" "$1" "$2"; }
-mkdir -p "$TMP/chan/agent-maya/claude"
-printf 'TELEGRAM_BOT_TOKEN=123:fake\n' > "$CONNECTORS_DIR/telegram-maya.env"
-# BYSTANDER is paired to the bot but not on the root-side record; STRANGER is what
-# an injected maya would add to her own file.
-printf '{"allowFrom":["%s","%s","%s"],"groups":{}}\n' "$OWNER" "$BYSTANDER" "$STRANGER" > "$TMP/chan/agent-maya/claude/access.json"
+# --- fixtures: maya (a persona), sysadmin -------------------------------------
+printf '{"agents":{"maya":{"type":"claude","channels":"telegram"},"sysadmin":{"type":"claude","channels":"none"}}}\n' > "$REGISTRY"
 
-AS_ROOT=1 CALLER="agent-sysadmin" NOW=$(date +%s)
+AS_ROOT=1 CALLER="agent-sysadmin" NOW=$(date +%s) NOTIFY_RESP='{"sent":true}'
 seams() {
   _sysadmin_is_root() { (( AS_ROOT )); }
   _owner_ask_is_root() { (( AS_ROOT )); }
@@ -66,11 +59,12 @@ seams() {
   _sysadmin_now() { printf '%s' "$NOW"; }
   _sysadmin_root_uid() { id -u; }
   _sysadmin_dir_ensure() { mkdir -p "$SYSADMIN_DIR"; }
-  _sysadmin_tg_post() { jq -cn --arg tok "$1" --arg chat "$2" --arg text "$3" --arg mk "$4" '{tok:$tok, chat:$chat, text:$text, markup:$mk}' >> "$TMP/sends.jsonl"; }
+  _sysadmin_notify_post() { printf '%s\n' "$1" >> "$TMP/notify.jsonl"; [[ -n "$NOTIFY_RESP" ]] || return 1; printf '%s' "$NOTIFY_RESP"; }
   _sysadmin_systemd_run() { printf '%s\n' "$*" >> "$TMP/run.log"; return "${RUN_RC:-0}"; }
   _sysadmin_unit_active() { return 1; }
   _sysadmin_wake() { printf '%s | %s\n' "$1" "$2" >> "$TMP/wake.log"; }
   _sysadmin_self() { printf '%s' "$TMP/fake5dive"; }
+  _sysadmin_linger() { printf '%s\n' "$1" >> "$TMP/linger.log"; }
 }
 seams
 cat > "$TMP/fake5dive" <<EOF
@@ -79,17 +73,20 @@ printf '%s\n' "\$*" >> "$TMP/self.log"
 EOF
 chmod +x "$TMP/fake5dive"
 sudo() { printf '%s\n' "$*" >> "$TMP/sudo.log"; return 1; }
-for f in sends.jsonl run.log wake.log self.log sudo.log; do : > "$TMP/$f"; done
+curl() { printf '%s\n' "$*" >> "$TMP/curl.log"; return 7; }
+for f in notify.jsonl run.log wake.log self.log sudo.log curl.log linger.log; do : > "$TMP/$f"; done
 ensure_state() { :; }
 
 propose() { # <for> <summary> <script> — JSON on stdout, stderr to $TMP/err
   ( JSON_MODE=1 _sysadmin_broker <<<"$(jq -cn --arg f "$1" --arg m "$2" --arg s "$3" '{op:"propose", for:$f, summary:$m, script:$s}')" ) 2>"$TMP/err"
 }
-tap() { ( JSON_MODE=1 _owner_ask_tap "$1" "--tap-uid=$2" ) 2>"$TMP/err"; }
-nsends() { wc -l < "$TMP/sends.jsonl" | tr -d ' '; }
+answer() { # <id> <approve|decline> <sha> — as the caller in $CALLER
+  ( JSON_MODE=1 _sysadmin_answer "$1" "$2" "--sha=$3" --by=tg:1234567890 ) 2>"$TMP/err"
+}
+nnotify() { wc -l < "$TMP/notify.jsonl" | tr -d ' '; }
 nruns() { wc -l < "$TMP/run.log" | tr -d ' '; }
-cb() { tail -1 "$TMP/sends.jsonl" | jq -r --argjson i "$1" '.markup | fromjson | .inline_keyboard[0][$i].callback_data'; }
 reqs() { ls "$SYSADMIN_DIR"/*.json 2>/dev/null | wc -l | tr -d ' '; }
+state_of() { jq -r .state "$SYSADMIN_DIR/$1.json"; }
 
 GOOD='set -e
 apt-get install -y --no-install-recommends libgdbm-dev apache2-utils
@@ -127,7 +124,7 @@ done
 echo "# (b) only the sysadmin seat reaches the broker"
 CALLER=agent-maya
 out=$(propose maya "x" "$GOOD"); rc=$?
-(( rc != 0 )) && grep -q "only the sysadmin seat" "$TMP/err" && [[ $(nsends) == 0 ]] \
+(( rc != 0 )) && grep -q "only the sysadmin seat" "$TMP/err" && [[ $(nnotify) == 0 ]] \
   && ok_t "b1 agent-maya through sudo -> refused, nothing sent" || bad_t "b1 maya reached the broker" "rc=$rc $(cat "$TMP/err")"
 CALLER=agent-sysadmin
 AS_ROOT=0; out=$( ( JSON_MODE=1 _sysadmin_broker <<<'{"op":"status"}' ) 2>&1 ); rc=$?; AS_ROOT=1
@@ -138,88 +135,78 @@ grep -qx 'agent-sysadmin ALL=(root) NOPASSWD: /usr/local/bin/5dive sysadmin _bro
 
 pol=$(render_standard_sudoers agent-maya 0)
 printf '%s\n' "$pol" > "$TMP/maya.sudoers"
-grep -qxF 'agent-maya ALL=(root) NOPASSWD: /usr/local/bin/5dive --json owner-ask tap *' "$TMP/maya.sudoers" \
-  && visudo -cf "$TMP/maya.sudoers" >/dev/null 2>&1 \
-  && ok_t "b4 a standard seat's policy lets its own bot relay the owner's tap to root (visudo-valid)" || bad_t "b4 tap grant" "$pol"
-[[ "$(printf '%s\n' "$pol" | classify_sudo_grant | cut -d'|' -f1)" == cli-scoped ]] \
-  && [[ "$(_sysadmin_sudoers | classify_sudo_grant | cut -d'|' -f1)" == cli-scoped ]] \
-  && ok_t "b5 both new lines classify as scoped grants, not custom root" \
-  || bad_t "b5 classifier" "$(printf '%s\n' "$pol" | classify_sudo_grant) / $(_sysadmin_sudoers | classify_sudo_grant)"
+! grep -v '^#' "$TMP/maya.sudoers" | grep -qE 'owner-ask|sysadmin' \
+  && ok_t "b4 a standard seat's sudo reaches neither owner-ask nor sysadmin (its policy is main's)" || bad_t "b4 seat policy" "$(grep -E 'owner-ask|sysadmin' "$TMP/maya.sudoers")"
+[[ "$(_sysadmin_sudoers | classify_sudo_grant | cut -d'|' -f1)" == cli-scoped ]] \
+  && ! _sysadmin_sudoers | grep -v '^#' | grep -q answer \
+  && ok_t "b5 the broker grant classifies as scoped, and it is not a grant of answer" \
+  || bad_t "b5 classifier" "$(_sysadmin_sudoers | classify_sudo_grant)"
 
 echo "# (c) propose"
-out=$(propose ghost "x" "$GOOD"); (( $? != 0 )) && [[ $(nsends) == 0 ]] && ok_t "c1 unknown agent -> refused" || bad_t "c1 unknown agent" "$out"
-out=$(propose sysadmin "x" "$GOOD"); (( $? != 0 )) && [[ $(nsends) == 0 ]] && ok_t "c2 --for=sysadmin -> refused" || bad_t "c2" "$out"
+out=$(propose ghost "x" "$GOOD"); (( $? != 0 )) && [[ $(nnotify) == 0 ]] && ok_t "c1 unknown agent -> refused" || bad_t "c1 unknown agent" "$out"
+out=$(propose sysadmin "x" "$GOOD"); (( $? != 0 )) && [[ $(nnotify) == 0 ]] && ok_t "c2 --for=sysadmin -> refused" || bad_t "c2" "$out"
 out=$(propose maya "print the key" "${BAD[openrouter]}"); rc=$?
-(( rc != 0 )) && grep -q "off limits even with the owner's approval" "$TMP/err" && [[ $(nsends) == 0 && $(reqs) == 0 ]] \
+(( rc != 0 )) && grep -q "off limits even with the owner's approval" "$TMP/err" && [[ $(nnotify) == 0 && $(reqs) == 0 ]] \
   && ok_t "c3 the injected 'print the OpenRouter key' ask is refused: nothing sent, no request written" \
-  || bad_t "c3 key ask" "rc=$rc sends=$(nsends) reqs=$(reqs) $(cat "$TMP/err")"
+  || bad_t "c3 key ask" "rc=$rc notify=$(nnotify) reqs=$(reqs) $(cat "$TMP/err")"
 out=$(propose maya "x" 'if then'); (( $? != 0 )) && grep -q 'does not parse' "$TMP/err" && ok_t "c4 unparseable script refused" || bad_t "c4" "$(cat "$TMP/err")"
-jq '.agents.maya.telegramOwners = null' "$REGISTRY" > "$TMP/r" && cp "$TMP/r" "$REGISTRY.nopin"
-( REGISTRY="$REGISTRY.nopin"; propose maya "x" "$GOOD" >/dev/null ); rc=$?
-(( rc != 0 )) && [[ $(nsends) == 0 ]] && ok_t "c5 no approver on record -> refused, nothing sent" || bad_t "c5 unpinned agent sent" "rc=$rc"
 out=$(propose maya "A shared plan page for you and Galina" "$GOOD"); rc=$?
-id=$(jq -r '.data.id' <<<"$out"); hex=${id#sa-}
-(( rc == 0 )) && [[ "$id" =~ ^sa-[0-9a-f]{12}$ ]] && ok_t "c6 proposal accepted: $id" || bad_t "c6 proposal" "rc=$rc $out $(cat "$TMP/err")"
-[[ $(nsends) == 1 && "$(jq -r .chat "$TMP/sends.jsonl")" == "$OWNER" ]] \
-  && ok_t "c7 sent to the pinned owner only — not to the bystander or the id the seat added" \
-  || bad_t "c7 recipients" "$(jq -r .chat "$TMP/sends.jsonl" | tr '\n' ' ')"
-[[ "$(jq -r .tok "$TMP/sends.jsonl")" == "123:fake" ]] && ok_t "c8 through maya's own bot (the chat the ask came from)" || bad_t "c8 bot" ""
-text=$(jq -r .text "$TMP/sends.jsonl")
-grep -q 'maya asks for a change to the server' <<<"$text" && grep -qF 'A shared plan page for you and Galina' <<<"$text" \
-  && ! grep -qi '5dive' <<<"$text" && ok_t "c9 the owner reads who, the one-line summary, what runs — and no platform name" \
-  || bad_t "c9 text" "$text"
-a=$(cb 0); d=$(cb 1)
-[[ "$a" =~ ^bap:${hex}:[0-9a-f]{32}$ && "$d" =~ ^bdn:${hex}:[0-9a-f]{32}$ && "${a##*:}" != "${d##*:}" ]] \
-  && ok_t "c10 Approve/Decline are the owner-ask buttons (bap/bdn), 49 bytes, each with its OWN proof" || bad_t "c10 buttons" "$a / $d"
+id=$(jq -r '.data.id' <<<"$out"); hex=${id#sa-}; SHA=$(printf '%s' "$GOOD" | sha256sum | cut -c1-64)
+(( rc == 0 )) && [[ "$id" =~ ^sa-[0-9a-f]{12}$ ]] && ok_t "c5 proposal accepted: $id" || bad_t "c5 proposal" "rc=$rc $out $(cat "$TMP/err")"
+n=$(tail -1 "$TMP/notify.jsonl")
+[[ $(nnotify) == 1 && "$(jq -r '.id, .for, .summary, .sha256, .ttlSeconds' <<<"$n" | tr '\n' '|')" == "${id}|maya|A shared plan page for you and Galina|${SHA}|1800|" ]] \
+  && [[ "$(jq -r .script <<<"$n")" == "$GOOD" && "$(jq -c 'keys' <<<"$n")" == '["for","id","script","sha256","summary","ttlSeconds"]' ]] \
+  && ok_t "c6 handed to 5dive-api: id, agent, summary, the script and its sha256 — nothing else" || bad_t "c6 notify body" "$n"
+[[ ! -s "$TMP/curl.log" ]] && ! grep -qE 'api\.telegram\.org|TASK_CH_TOKEN|_task_send' src/cmd_sysadmin.sh \
+  && ok_t "c7 the box sends nothing on any Telegram bot (no seat's bot carries the ask)" || bad_t "c7 telegram from the box" "$(cat "$TMP/curl.log")"
 R="$SYSADMIN_DIR/$hex.json"
-[[ "$(stat -c %a "$R")" == 600 && "$(jq -r .state "$R")" == pending && "$(jq -r .nonce_hash "$R")" == "$(_human_nonce_sha "${a##*:}")" \
-   && "$(jq -r .decline_hash "$R")" == "$(_human_nonce_sha "${d##*:}")" ]] \
-  && ok_t "c11 request is 0600, pending, and holds only the proofs' hashes" || bad_t "c11 request" "$(cat "$R")"
-[[ $(nruns) == 0 ]] && ok_t "c12 nothing ran before the tap" || bad_t "c12 ran early" "$(cat "$TMP/run.log")"
+[[ "$(stat -c %a "$R")" == 600 && "$(jq -r .state "$R")" == pending && "$(jq -r .sha256 "$R")" == "$SHA" ]] \
+  && ok_t "c8 request is 0600, pending, and records the script's sha256" || bad_t "c8 request" "$(cat "$R")"
+[[ $(nruns) == 0 ]] && ok_t "c9 nothing ran before the tap" || bad_t "c9 ran early" "$(cat "$TMP/run.log")"
+NOTIFY_RESP='{"sent":false,"reason":"maya has no Telegram bot connected"}'
+out=$(propose maya "x" "$GOOD"); rc=$?; hx=$(ls -t "$SYSADMIN_DIR"/*.json | head -1)
+(( rc != 0 )) && grep -q 'maya has no Telegram bot connected' "$TMP/err" && grep -q 'nothing will run' "$TMP/err" && [[ "$(jq -r .state "$hx")" == unsent ]] \
+  && ok_t "c10 the API could not reach the owner -> the seat is told why, the request is unsent" || bad_t "c10 unsent" "rc=$rc $(cat "$TMP/err")"
+NOTIFY_RESP=''
+out=$(propose maya "x" "$GOOD"); rc=$?
+(( rc != 0 )) && grep -q 'did not answer' "$TMP/err" && ok_t "c11 the API unreachable -> refused, says so" || bad_t "c11 unreachable" "rc=$rc $(cat "$TMP/err")"
+NOTIFY_RESP='{"sent":true}'
 
-echo "# (d) the tap, through owner-ask tap"
-nonce=${a##*:}
-out=$(tap "$a" "$STRANGER"); (( $? != 0 )) && grep -q "only maya's owner" "$TMP/err" && [[ $(nruns) == 0 ]] \
-  && ok_t "d1 a tap from the id the seat added to access.json -> refused, nothing ran" || bad_t "d1 stranger" "$out $(cat "$TMP/err")"
-out=$(tap "$a" "$BYSTANDER"); (( $? != 0 )) && [[ $(nruns) == 0 ]] && ok_t "d2 a paired but unpinned user -> refused" || bad_t "d2 bystander" "$out"
-out=$(tap "bap:${hex}:$(printf '%032d' 7)" "$OWNER"); (( $? != 0 )) && grep -q stale "$TMP/err" && [[ $(nruns) == 0 ]] \
-  && ok_t "d3 the owner with a wrong proof -> refused" || bad_t "d3 wrong nonce" "$out $(cat "$TMP/err")"
-out=$(tap "$a" "$OWNER"); rc=$?
+echo "# (d) answer — root, as 5dive-api relays the owner's tap"
+CALLER=claude
+out=$(answer "$id" approve "0000000000000000"); (( $? != 0 )) && grep -q 'not the script the owner was shown' "$TMP/err" && [[ $(nruns) == 0 ]] \
+  && ok_t "d1 a sha that is not the shown script's -> refused, nothing ran" || bad_t "d1 wrong sha" "$out $(cat "$TMP/err")"
+out=$(answer "$id" approve "${SHA:0:16}"); rc=$?
 (( rc == 0 )) && [[ "$(jq -r .data.result <<<"$out")" == approved && "$(jq -r .data.id <<<"$out")" == "$id" ]] \
-  && ok_t "d4 the owner's Approve -> approved $id (the plugin's toast reads result + id)" || bad_t "d4 approve" "rc=$rc $out $(cat "$TMP/err")"
+  && ok_t "d2 the owner's Approve -> approved $id" || bad_t "d2 approve" "rc=$rc $out $(cat "$TMP/err")"
 run=$(cat "$TMP/run.log")
 grep -qF -- "--unit=5dive-sysadmin-${hex}" <<<"$run" && grep -qF -- "StandardInput=file:${SYSADMIN_DIR}/${hex}.sh" <<<"$run" \
   && grep -qF -- "InaccessiblePaths=-/etc/5dive -${STATE_DIR}" <<<"$run" && grep -qF -- 'CAP_SYS_PTRACE CAP_NET_ADMIN' <<<"$run" \
   && grep -qF -- 'ProtectHome=yes' <<<"$run" \
-  && ok_t "d5 started as root in the sandbox, script from its staged file" || bad_t "d5 run argv" "$run"
+  && ok_t "d3 started as root in the sandbox, script from its staged file" || bad_t "d3 run argv" "$run"
 cmp -s <(jq -r .script "$R") "$SYSADMIN_DIR/$hex.sh" && [[ "$(stat -c %a "$SYSADMIN_DIR/$hex.sh")" == 600 ]] \
-  && ok_t "d6 the staged script is byte-for-byte the proposed one, 0600" || bad_t "d6 staged script" ""
-[[ "$(jq -r .state "$R")" == running && "$(jq -r '.nonce_hash // .decline_hash // "gone"' "$R")" == gone ]] && ok_t "d7 proof spent, state running" || bad_t "d7 state" "$(cat "$R")"
-grep -q "^sysadmin | The owner APPROVED ${id}" "$TMP/wake.log" && ok_t "d8 the sysadmin seat is woken with the id" || bad_t "d8 wake" "$(cat "$TMP/wake.log")"
-out=$(tap "$a" "$OWNER"); (( $? != 0 )) && grep -q 'already answered' "$TMP/err" && [[ $(nruns) == 1 ]] \
-  && ok_t "d9 a second tap on the same button runs nothing" || bad_t "d9 replay" "runs=$(nruns) $(cat "$TMP/err")"
-grep -qx "id=${id}" "$TMP/audit" 2>/dev/null || true
+  && ok_t "d4 the staged script is byte-for-byte the proposed one, 0600" || bad_t "d4 staged script" ""
+[[ "$(jq -r .state "$R")" == running && "$(jq -r .answered_by "$R")" == tg:1234567890 ]] && ok_t "d5 state running, who answered recorded" || bad_t "d5 state" "$(cat "$R")"
+grep -q "^sysadmin | The owner APPROVED ${id}" "$TMP/wake.log" && ok_t "d6 the sysadmin seat is woken with the id" || bad_t "d6 wake" "$(cat "$TMP/wake.log")"
+out=$(answer "$id" approve "$SHA"); (( $? != 0 )) && grep -q 'already answered' "$TMP/err" && [[ $(nruns) == 1 ]] \
+  && ok_t "d7 a second tap runs nothing" || bad_t "d7 replay" "runs=$(nruns) $(cat "$TMP/err")"
 
 echo "# (e) decline"
-out=$(propose maya "Install a mail server" "$GOOD"); id2=$(jq -r .data.id <<<"$out"); hex2=${id2#sa-}; d2=$(cb 1)
+CALLER=agent-sysadmin; out=$(propose maya "Install a mail server" "$GOOD"); id2=$(jq -r .data.id <<<"$out"); CALLER=claude
 runs0=$(nruns)
-# The per-agent bridge runs as the seat, so an injected seat sees the Decline the
-# owner tapped. Re-labelled as an Approve it must be worth nothing.
-out=$(tap "bap:${hex2}:${d2##*:}" "$OWNER"); (( $? != 0 )) && grep -q stale "$TMP/err" && [[ $(nruns) == "$runs0" ]] \
-  && [[ "$(jq -r .state "$SYSADMIN_DIR/$hex2.json")" == pending ]] \
-  && ok_t "e0 the Decline proof relabelled as Approve (bap) -> refused, nothing ran, still pending" || bad_t "e0 decline->approve swap" "$out $(cat "$TMP/err")"
-out=$(tap "$d2" "$OWNER"); rc=$?
-(( rc == 0 )) && [[ "$(jq -r .data.result <<<"$out")" == declined && "$(jq -r .state "$SYSADMIN_DIR/$hex2.json")" == declined && $(nruns) == "$runs0" ]] \
-  && grep -q "DECLINED ${id2}" "$TMP/wake.log" && ok_t "e1 Decline -> declined, nothing ran, seat told" || bad_t "e1 decline" "rc=$rc $out"
-out=$(tap "bap:${hex2}:${d2##*:}" "$OWNER"); (( $? != 0 )) && [[ $(nruns) == "$runs0" ]] \
-  && ok_t "e2 Approve after Decline (same nonce) runs nothing" || bad_t "e2 approve-after-decline" "$out"
+out=$(answer "$id2" decline "$SHA"); rc=$?
+(( rc == 0 )) && [[ "$(jq -r .data.result <<<"$out")" == declined && "$(state_of "${id2#sa-}")" == declined && $(nruns) == "$runs0" ]] \
+  && grep -q "DECLINED ${id2}" "$TMP/wake.log" && ok_t "e1 Decline -> declined, nothing ran, seat told" || bad_t "e1 decline" "rc=$rc $out $(cat "$TMP/err")"
+out=$(answer "$id2" approve "$SHA"); (( $? != 0 )) && [[ $(nruns) == "$runs0" ]] \
+  && ok_t "e2 Approve after Decline runs nothing" || bad_t "e2 approve-after-decline" "$out"
 
 echo "# (f) expiry"
-out=$(propose maya "Old ask" "$GOOD"); hex3=$(jq -r .data.id <<<"$out"); hex3=${hex3#sa-}; a3=$(cb 0)
+CALLER=agent-sysadmin; out=$(propose maya "Old ask" "$GOOD"); id3=$(jq -r .data.id <<<"$out"); CALLER=claude
 NOW=$((NOW + SYSADMIN_TTL + 1)); runs0=$(nruns)
-out=$(tap "$a3" "$OWNER"); (( $? != 0 )) && grep -q expired "$TMP/err" && [[ $(nruns) == "$runs0" ]] \
+out=$(answer "$id3" approve "$SHA"); (( $? != 0 )) && grep -q expired "$TMP/err" && [[ $(nruns) == "$runs0" ]] \
   && ok_t "f1 an Approve after 30 minutes runs nothing" || bad_t "f1 expiry" "$(cat "$TMP/err")"
 NOW=$((NOW - SYSADMIN_TTL - 1))
+CALLER=agent-sysadmin
 
 echo "# (g) status"
 printf 'Created symlink plan.service\nactive\n__exit=0\n' > "$SYSADMIN_DIR/$hex.log"
@@ -230,20 +217,47 @@ gout=$(jq -r .data.output <<<"$out")
 out=$( ( JSON_MODE=1 _sysadmin_broker <<<'{"op":"status"}' ) 2>&1 )
 [[ "$(jq '.data.requests | length' <<<"$out")" -ge 3 ]] && ! grep -q script <<<"$out" && ok_t "g2 the list shows ids and states, not scripts" || bad_t "g2 list" "$out"
 
-echo "# (h) approvers are pinned where root sets them"
-_sysadmin_pin_owners maya "3333333333, junk,1111111111"
-[[ "$(jq -c '.agents.maya.telegramOwners' "$REGISTRY")" == '["1111111111","3333333333"]' ]] \
-  && ok_t "h1 pin merges, dedupes and drops junk" || bad_t "h1 pin" "$(jq -c '.agents.maya.telegramOwners' "$REGISTRY")"
-grep -q '_sysadmin_pin_owners "$name" "$new_allowed_users"' src/cmd_agent_config.sh \
-  && ok_t "h2 agent config set telegram.allowed-users pins" || bad_t "h2 config call site" ""
-grep -q '_sysadmin_pin_owners "$name" "$telegram_allowed_users"' src/cmd_agent_create.sh \
-  && grep -q 'loginctl enable-linger "agent-${name}"' src/cmd_agent_create.sh \
-  && ok_t "h3 agent create pins its paired ids and lingers the seat" || bad_t "h3 create call sites" ""
-grep -q '_sysadmin_has_request "$hex"' src/cmd_owner_ask.sh && ok_t "h4 owner-ask tap routes sa requests before browser asks" || bad_t "h4" ""
+echo "# (h) HOSTILE SEAT: everything in its reach approves nothing"
+# The seat proposes, then holds all it was given: the propose answer, the status
+# of its request (script, sha, state) and the hand-off body. It tries each piece
+# through every entry a seat can reach.
+CALLER=agent-sysadmin
+out=$(propose maya "Open a shell for me" "$GOOD"); idh=$(jq -r .data.id <<<"$out"); hh=${idh#sa-}; runs0=$(nruns)
+seen="$out $(cat "$TMP/err") $( ( JSON_MODE=1 _sysadmin_broker <<<"{\"op\":\"status\",\"id\":\"$idh\"}" ) 2>&1 ) $(tail -1 "$TMP/notify.jsonl")"
+toks=$(grep -oE '[0-9a-f]{16,64}' <<<"$seen" | sort -u)
+[[ -n "$toks" ]] || toks="$SHA"
+bad=""
+for who in agent-sysadmin agent-maya; do
+  CALLER=$who
+  for t in $toks; do
+    answer "$idh" approve "$t" >/dev/null && bad+=" answer:$who:${t:0:8}"
+  done
+done
+[[ -z "$bad" && $(nruns) == "$runs0" && "$(state_of "$hh")" == pending ]] \
+  && ok_t "h1 a seat caller of answer (root through any grant) is refused with every sha it saw; still pending" || bad_t "h1 seat answered" "$bad state=$(state_of "$hh")"
+CALLER=agent-sysadmin
+for t in $toks; do
+  ( JSON_MODE=1 _sysadmin_broker <<<"$(jq -cn --arg i "$idh" --arg s "$t" '{op:"answer", id:$i, answer:"approve", sha:$s}')" ) >/dev/null 2>&1 && bad+=" broker:${t:0:8}"
+done
+[[ -z "$bad" && $(nruns) == "$runs0" && "$(state_of "$hh")" == pending ]] \
+  && ok_t "h2 the broker (the sysadmin seat's one grant) does not route answer; still pending" || bad_t "h2 broker answered" "$bad"
+for t in $(grep -oE '[0-9a-f]{32}' <<<"$seen" | sort -u) "$(printf '%032d' 0)"; do
+  for k in bap bdn; do
+    ( SUDO_USER=agent-maya JSON_MODE=1 _owner_ask_tap "${k}:${hh}:${t}" --tap-uid=1234567890 ) >/dev/null 2>&1 && bad+=" tap:${k}"
+  done
+done
+[[ -z "$bad" && $(nruns) == "$runs0" && "$(state_of "$hh")" == pending ]] \
+  && ok_t "h3 owner-ask tap (the relay a seat's bot uses) knows no sysadmin request; still pending" || bad_t "h3 tap answered" "$bad"
+! grep -q '_sysadmin' src/cmd_owner_ask.sh \
+  && ok_t "h4 owner-ask has no route into the sysadmin (the old keyboard path is gone)" || bad_t "h4 owner-ask routes sysadmin" "$(grep -n _sysadmin src/cmd_owner_ask.sh)"
+CALLER=claude
+out=$(answer "$idh" approve "$SHA"); [[ $? == 0 && "$(state_of "$hh")" == running ]] \
+  && ok_t "h5 control: the same answer from root's own caller (5dive-api over the tunnel) runs" || bad_t "h5 control" "$out $(cat "$TMP/err")"
+CALLER=agent-sysadmin
 
 echo "# (i) install"
 jq 'del(.agents.sysadmin)' "$REGISTRY" > "$TMP/r" && cp "$TMP/r" "$REGISTRY"
-printf '{"agents":{"maya":{"type":"claude"}}}' > "$REGISTRY"   # maya predates the pin
+printf '{"agents":{"maya":{"type":"claude"}}}' > "$REGISTRY"
 chown() { :; }
 out=$( ( JSON_MODE=1 _sysadmin_install ) 2>&1 ); rc=$?
 self=$(cat "$TMP/self.log")
@@ -253,8 +267,11 @@ self=$(cat "$TMP/self.log")
 [[ -f "$SYSADMIN_HOME_DIR/CLAUDE.md" ]] && grep -q 'propose --for=' "$SYSADMIN_HOME_DIR/CLAUDE.md" && [[ "$(stat -c %a "$SYSADMIN_HOME_DIR/CLAUDE.md")" == 644 ]] \
   && ok_t "i2 the rules sit in the workdir's parent, 0644 (the seat cannot rewrite them)" || bad_t "i2 rules" ""
 [[ -f "$SYSADMIN_SUDOERS" ]] && visudo -cf "$SYSADMIN_SUDOERS" >/dev/null 2>&1 && ok_t "i3 the broker grant is installed and visudo-valid" || bad_t "i3 sudoers" ""
-[[ "$(jq -c '.agents.maya.telegramOwners' "$REGISTRY")" == "[\"$OWNER\",\"$BYSTANDER\",\"$STRANGER\"]" ]] \
-  && ok_t "i4 an agent that predates the pin gets its current pairing pinned once" || bad_t "i4 backfill pin" "$(jq -c .agents.maya "$REGISTRY")"
+id -u agent-maya >/dev/null 2>&1 && want_l=agent-maya || want_l=""
+[[ "$(tr '\n' ' ' < "$TMP/linger.log" | xargs)" == "$want_l" ]] \
+  && grep -q "jq -e '.agents.sysadmin != null'" src/cmd_agent_create.sh && grep -q 'loginctl enable-linger "agent-${name}"' src/cmd_agent_create.sh \
+  && ok_t "i4 install lingers the box's existing seat users; agent create lingers only where the sysadmin is (a partner box)" \
+  || bad_t "i4 linger" "$(cat "$TMP/linger.log")"
 # A warm spare: the seat exists, the seeded account does not yet.
 jq '.agents.sysadmin = {type:"claude"}' "$REGISTRY" > "$TMP/r" && cp "$TMP/r" "$REGISTRY"; : > "$TMP/self.log"
 out=$( ( JSON_MODE=1 _sysadmin_install --auth-profile=openrouter ) 2>&1 ); rc=$?
@@ -277,21 +294,24 @@ out=$( ( JSON_MODE=1 _sysadmin_install --auth-profile=openrouter ) 2>&1 )
 unset -f chown
 
 echo "# (j) mutants"
-printf '{"agents":{"maya":{"type":"claude","channels":"telegram","telegramOwners":["%s"]},"sysadmin":{"type":"claude"}}}\n' "$OWNER" > "$REGISTRY"
-sed 's/grep -qxF -- "\$id" <<<"\$pinned" && SA_OWNERS+=/SA_OWNERS+=/' src/cmd_sysadmin.sh > "$TMP/mut1.sh"
-if cmp -s src/cmd_sysadmin.sh "$TMP/mut1.sh" || ! bash -n "$TMP/mut1.sh"; then bad_t "j1 mutant did not apply or does not parse" ""
-else
-  ( source "$TMP/mut1.sh"; seams; SYSADMIN_DIR="$TMP/sysadmin"; : > "$TMP/run.log"
-    o=$(propose maya "x" "$GOOD"); a=$(cb 0); tap "$a" "$STRANGER" >/dev/null; [[ $(nruns) == 1 ]] )
-  (( $? == 0 )) && ok_t "j1 without the pin, the seat-added stranger's tap RUNS — d1 has teeth" || bad_t "j1 mutant stayed safe — d1 grades nothing" ""
-fi
+printf '{"agents":{"maya":{"type":"claude","channels":"telegram"},"sysadmin":{"type":"claude"}}}\n' > "$REGISTRY"
 sed 's/^  why=\$(_sysadmin_lint "\$script") || fail "\$E_PERMISSION" "refused, not sent.*$/  :/' src/cmd_sysadmin.sh > "$TMP/mut2.sh"
-if cmp -s src/cmd_sysadmin.sh "$TMP/mut2.sh" || ! bash -n "$TMP/mut2.sh"; then bad_t "j2 mutant did not apply or does not parse" ""
+if cmp -s src/cmd_sysadmin.sh "$TMP/mut2.sh" || ! bash -n "$TMP/mut2.sh"; then bad_t "j1 mutant did not apply or does not parse" ""
 else
-  ( source "$TMP/mut2.sh"; seams; SYSADMIN_DIR="$TMP/sysadmin"; : > "$TMP/sends.jsonl"
-    propose maya "x" "${BAD[openrouter]}" >/dev/null; [[ $(nsends) == 1 ]] )
-  (( $? == 0 )) && ok_t "j2 without the lint call, the key ask reaches the owner — c3 has teeth" || bad_t "j2 mutant stayed safe — c3 grades nothing" ""
+  ( source "$TMP/mut2.sh"; seams; SYSADMIN_DIR="$TMP/sysadmin"; : > "$TMP/notify.jsonl"; CALLER=agent-sysadmin
+    propose maya "x" "${BAD[openrouter]}" >/dev/null; [[ $(nnotify) == 1 ]] )
+  (( $? == 0 )) && ok_t "j1 without the lint call, the key ask is sent — c3 has teeth" || bad_t "j1 mutant stayed safe — c3 grades nothing" ""
 fi
+# The (h) defences, each removed on a copy of the tree by tests/mutants/DIVE-5187.sh:
+# (h) must go red under every one of them.
+[[ -n "${FIVEDIVE_SA_ONLY_H:-}" ]] || for m in m1 m2; do
+  M=$(mktemp -d "$TMP/mut.XXXX"); cp -r src tests "$M/"
+  ( cd "$M" && . tests/mutants/DIVE-5187.sh && "$m" ) >/dev/null 2>&1
+  if cmp -s src/cmd_sysadmin.sh "$M/src/cmd_sysadmin.sh" || ! bash -n "$M/src/cmd_sysadmin.sh"; then bad_t "j2 $m did not apply or does not parse" ""; continue; fi
+  hout=$( cd "$M" && FIVEDIVE_SA_ONLY_H=1 bash tests/sysadmin_unit.sh 2>&1 ); hrc=$?
+  (( hrc != 0 )) && grep -q '^FAIL - h' <<<"$hout" \
+    && ok_t "j2 $m ($(sed -n "s/^# ${m}: //p" tests/mutants/DIVE-5187.sh)) turns (h) red" || bad_t "j2 $m stayed green — (h) grades nothing" "$(grep -E '^(ok|FAIL) +- h' <<<"$hout")"
+done
 
 echo "# (k) the shipped root sandbox under systemd"
 if [[ $EUID -ne 0 ]] || ! command -v systemd-run >/dev/null || [[ ! -d /run/systemd/system ]]; then

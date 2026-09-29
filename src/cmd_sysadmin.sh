@@ -9,26 +9,33 @@
 #
 # THE SHAPE. One seat, `sysadmin`, installed at box build (`5dive sysadmin
 # install`, run by 5dive-api), with no Telegram channel and no heartbeat. Persona
-# agents ask it with `5dive agent send sysadmin "<what and why>"`. It holds NO
-# general sudo: its one grant is `5dive sysadmin _broker`, and the broker is where
-# every rule below is enforced — none of them rests on the seat's prompt, because
-# the seat reads what the personas send it and can be injected as well.
+# agents ask it on the box's agent rail (`agent send`). It holds NO general sudo:
+# its one grant is `5dive sysadmin _broker`, and the broker is where every rule
+# below is enforced — none of them rests on the seat's prompt, because the seat
+# reads what the personas send it and can be injected as well.
 #
 #   read      runs now, as `nobody` with the log groups: it reads logs, status and
 #             ports and cannot change anything or read a secret.
 #   restart   restarts one agent's own service. The only change with no tap.
 #   propose   a root script + a one-line summary, on behalf of the asking agent.
-#             Nothing runs. The OWNER of that agent gets the summary with
-#             Approve / Decline in the agent's own chat (the owner-ask buttons,
-#             bap/bdn — so the per-agent bridge and the team-bot listener already
-#             relay the tap to root). The two buttons carry DIFFERENT proofs: the
-#             per-agent bridge runs as the asking seat, so a seat sees the proof of
-#             the button the owner tapped, and one shared proof would let an
-#             injected seat turn a Decline into an Approve.
-#   (tap)     `owner-ask tap` finds the request here, checks the tapper against
-#             the owner, the proof and the 30-minute TTL, spends the proof and
-#             starts the script as root in a sandbox. Then it wakes the seat.
+#             Nothing runs. The request is handed to 5dive-api (box-authed with
+#             this box's connectord token), which puts it in front of the client
+#             with Approve / Decline on the PARTNER'S OWN Telegram bot — the one
+#             the client connected their agents' bots through, whose token only
+#             5dive-api holds.
+#   answer    root only, never on a seat's behalf: 5dive-api runs it over the
+#             box's tunnel when the client taps. It checks the request is pending,
+#             in its 30 minutes and the script the client was shown (sha256), then
+#             starts it as root in a sandbox and wakes the seat.
 #   status    a request's state, script and output.
+#
+# WHY NOT A BUTTON ON THE ASKING AGENT'S OWN BOT (the first cut, held at merge).
+# The seat holds its bot's token. Every button on a message that bot sent is
+# readable by the seat: a tap on either button hands the bot the whole keyboard,
+# and a reply to the message returns it. So an injected seat could read the
+# Approve proof off the owner's Decline and turn the No into a root run. No proof
+# can ride a channel the asking seat controls; the tap therefore arrives from
+# 5dive-api, and nothing a seat can reach approves anything.
 #
 # HARD LIMITS, even with the tap: the approved script runs as root with the box's
 # secrets made invisible (/etc/5dive, /var/lib/5dive, every home, /root), sudoers
@@ -38,12 +45,6 @@
 # script that names any of them. What the sandbox cannot hold: a system service
 # or cron job the script installs runs later outside it. The lint and the owner's
 # tap are the controls there; the seeded key is capped per box for that reason.
-#
-# WHO IS THE OWNER. An agent's access.json is the seat's own file: an injected
-# seat could add a stranger to its allowFrom and that stranger would get, and
-# could tap, the Approve button. So approvers are pinned ROOT-side in the
-# registry (`telegramOwners`, written when root sets telegram.allowed-users), and
-# only an id in both lists counts.
 
 SYSADMIN_NAME="sysadmin"
 SYSADMIN_USER="agent-sysadmin"
@@ -64,11 +65,13 @@ _sysadmin_usage() {
                                              unprivileged user (logs, status, ports, disk)
   5dive sysadmin restart <agent>             restart that agent's own service
   5dive sysadmin propose --for=<agent> --summary="<one line>"
-                                             root script on stdin: sends <agent>'s owner the
-                                             summary with Approve / Decline; nothing runs first
+                                             root script on stdin: the client gets the summary
+                                             with Approve / Decline; nothing runs first
   5dive sysadmin status [<sa-id>]            requests, or one request's script and output
 
-  Root:
+  Root (never a seat's):
+  5dive sysadmin answer <sa-id> approve|decline --sha=<hex> [--by=<who>]
+                                             the client's tap, as 5dive-api relays it
   5dive sysadmin install [--auth-profile=<name>]
                                              create the seat (idempotent), its broker grant
                                              and its rules; bind it to <name> when that exists
@@ -86,67 +89,21 @@ _sysadmin_unit_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
 _sysadmin_wake() { # <agent> <message>
   timeout 15 "$(_sysadmin_self)" agent send "$1" "--message=$2" >/dev/null 2>&1
 }
-# One Telegram send. The token goes to curl on stdin (a config line), never argv.
-_sysadmin_tg_post() { # <token> <chat> <text> <reply_markup json>
-  [[ -z "${FIVEDIVE_NOTIFY_DRYRUN:-}" || "${FIVEDIVE_NOTIFY_DRYRUN}" == "0" ]] || return 0
-  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$1" \
-    | curl -fsS --max-time 20 -K - --data-urlencode "chat_id=$2" --data-urlencode "text=$3" \
-        --data-urlencode "reply_markup=$4" >/dev/null 2>&1
+# Hand a request to 5dive-api, which asks the client. Box-authed with this box's
+# connectord token (root-readable; no seat reads it), passed to curl on stdin as a
+# config line, never argv. The API's JSON answer on stdout; 1 when it is unreachable.
+_sysadmin_notify_post() { # <json body>
+  local env_file="${FIVEDIVE_CONNECTORD_ENV:-/etc/5dive/connectord.env}" api="${FIVE_API_BASE:-https://api.5dive.com}" token=""
+  if [[ -r "$env_file" ]]; then token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$env_file" | head -1) || token=""; fi
+  [[ -n "$token" ]] || return 1
+  printf 'header = "authorization: Bearer %s"\n' "$token" \
+    | curl -fsS --max-time 30 -K - -X POST -H 'content-type: application/json' \
+        --data-binary "$1" "${api%/}/server/sysadmin/requests" 2>/dev/null
 }
-
-# owner-ask tap asks this first: is <12 hex> a sysadmin request rather than a browser ask?
-_sysadmin_has_request() { [[ "$1" =~ ^[0-9a-f]{12}$ && -f "$(_sysadmin_req "$1")" ]]; }
 
 _sysadmin_valid_name() { [[ "$1" =~ ^[a-z][a-z0-9-]{1,15}$ ]]; }
 _sysadmin_registered() { jq -e --arg n "$1" '.agents[$n] != null' "$REGISTRY" >/dev/null 2>&1; }
-
-# ---- owners ------------------------------------------------------------------
-
-# _sysadmin_pin_owners <agent> <csv of telegram ids> — add ids to the agent's
-# root-side approver list. Called where ROOT sets telegram.allowed-users (agent
-# create, agent config set), never from the seat's own file.
-_sysadmin_pin_owners() {
-  local name="$1" csv="$2"
-  [[ -n "$csv" && -f "$REGISTRY" ]] || return 0
-  _sysadmin_pin_owners_locked() {
-    local tmp ids
-    ids=$(jq -cn --arg c "$2" '$c | split(",") | map(gsub("\\s"; "")) | map(select(test("^-?[0-9]{1,20}$")))') || return 1
-    tmp=$(mktemp "${REGISTRY}.XXXXXX") || return 1
-    if jq --arg n "$1" --argjson ids "$ids" \
-         'if .agents[$n] then .agents[$n].telegramOwners = (((.agents[$n].telegramOwners // []) + $ids) | unique) else . end' \
-         "$REGISTRY" > "$tmp" 2>/dev/null; then
-      chmod --reference="$REGISTRY" "$tmp" 2>/dev/null; chown --reference="$REGISTRY" "$tmp" 2>/dev/null
-      mv -f "$tmp" "$REGISTRY"
-    else
-      rm -f "$tmp"; return 1
-    fi
-  }
-  with_registry_lock _sysadmin_pin_owners_locked "$name" "$csv" || warn "could not pin ${name}'s approvers in the registry"
-}
-
-# _sysadmin_owners <agent> — the ids whose tap counts for <agent>'s requests: the
-# route owner-ask uses (the seat's bot and paired users, narrowed by the human
-# registry when it is in use) AND the root-side pin. Sets SA_OWNERS (one id per
-# line) and TASK_CH_* (the agent's bot) — globals, so never call it in $( ): the
-# bot token would stay in the subshell. 1 with SA_WHY when there is nobody.
-SA_WHY="" SA_OWNERS=""
-_sysadmin_owners() {
-  local name="$1" pinned id
-  SA_WHY="" SA_OWNERS=""
-  if ! _owner_ask_route "$name"; then SA_WHY="$OA_ROUTE_WHY"; return 1; fi
-  pinned=$(jq -r --arg n "$name" '(.agents[$n].telegramOwners // [])[] | tostring' "$REGISTRY" 2>/dev/null)
-  if [[ -z "$pinned" ]]; then
-    SA_WHY="no approver is on record for ${name} (the ids root set with telegram.allowed-users)"
-    return 1
-  fi
-  while IFS= read -r id; do
-    [[ -n "$id" ]] && grep -qxF -- "$id" <<<"$pinned" && SA_OWNERS+="${id}"$'\n'
-  done <<<"$OA_OWNER_TG"
-  if [[ -z "$SA_OWNERS" ]]; then
-    SA_WHY="nobody paired to ${name}'s bot is on its approver record"
-    return 1
-  fi
-}
+_sysadmin_linger() { loginctl enable-linger "$1" >/dev/null 2>&1; }
 
 # ---- the lint ----------------------------------------------------------------
 
@@ -233,16 +190,9 @@ _sysadmin_req_write() { # <hex> <jq filter> [jq args…]
   mv -fT -- "$tmp" "$f"
 }
 _sysadmin_dir_ensure() {
-  mkdir -p "$SYSADMIN_DIR" && chown root:root "$SYSADMIN_DIR" && chmod 700 "$SYSADMIN_DIR"
-}
-
-# The ask as the owner reads it. Plain text (no parse_mode); every value is the
-# seat's, so control characters go and lengths are capped. Never names the host.
-_sysadmin_text() { # <agent> <summary> <script> <id>
-  local lines
-  lines=$(printf '%s\n' "$3" | grep -vE '^[[:space:]]*(#|$)' | head -6 | cut -c1-80 | sed 's/^/› /')
-  printf '🛠 %s asks for a change to the server:\n%s\n\nIt will run:\n%s\n\nApprove runs exactly this, once, within %s minutes. Decline drops it.\nid: %s' \
-    "$1" "$2" "$lines" "$((SYSADMIN_TTL / 60))" "$4"
+  mkdir -p "$SYSADMIN_DIR" || return 1
+  chown root:root "$SYSADMIN_DIR" || return 1
+  chmod 700 "$SYSADMIN_DIR"
 }
 
 _sysadmin_propose() { # <for> <summary> <script> <caller>
@@ -258,72 +208,91 @@ _sysadmin_propose() { # <for> <summary> <script> <caller>
   local why
   why=$(_sysadmin_lint "$script") || fail "$E_PERMISSION" "refused, not sent: the script touches ${why}. That is off limits even with the owner's approval."
 
-  _sysadmin_owners "$for" || fail "$E_PERMISSION" "not sent: ${SA_WHY}"
-  local hex nonce hash dnonce dhash id
+  local hex id sha
   hex=$(_human_nonce_mint) && hex="${hex:0:12}" || fail "$E_GENERIC" "could not mint a request id"
-  # One proof per button: seeing the Decline proof must not buy the Approve.
-  nonce=$(_human_nonce_mint) && dnonce=$(_human_nonce_mint) || fail "$E_GENERIC" "could not mint the owner's proof"
-  hash=$(_human_nonce_sha "$nonce"); dhash=$(_human_nonce_sha "$dnonce")
-  [[ "$hash" =~ ^[0-9a-f]{64}$ && "$dhash" =~ ^[0-9a-f]{64}$ && "$nonce" != "$dnonce" ]] \
-    || fail "$E_GENERIC" "could not hash the owner's proof"
   id="sa-${hex}"
+  sha=$(printf '%s' "$script" | sha256sum | cut -c1-64)
   _sysadmin_dir_ensure || fail "$E_GENERIC" "cannot create $SYSADMIN_DIR"
-  # The proof lands BEFORE the send, so a tap can never arrive ahead of it.
+  # The request lands BEFORE the hand-off, so a tap can never arrive ahead of it.
   _sysadmin_req_write "$hex" '{id: $id, for: $for, by: $by, summary: $sum, script: $scr, sha256: $sha,
-      asked_at: $at, nonce_hash: $h, decline_hash: $dh, state: "pending"}' \
+      asked_at: $at, state: "pending"}' \
     --arg id "$id" --arg for "$for" --arg by "$by" --arg sum "$summary" --arg scr "$script" \
-    --arg sha "$(printf '%s' "$script" | sha256sum | cut -c1-64)" --argjson at "$(_sysadmin_now)" --arg h "$hash" --arg dh "$dhash" \
+    --arg sha "$sha" --argjson at "$(_sysadmin_now)" \
     || fail "$E_GENERIC" "could not write the request"
 
-  local text markup chat sent=0
-  text=$(_sysadmin_text "$for" "$summary" "$script" "$id")
-  markup=$(jq -cn --arg a "bap:${hex}:${nonce}" --arg d "bdn:${hex}:${dnonce}" \
-    '{inline_keyboard: [[{text: "✅ Approve", callback_data: $a}, {text: "❌ Decline", callback_data: $d}]]}')
-  while IFS= read -r chat; do
-    [[ -n "$chat" ]] || continue
-    _sysadmin_tg_post "$TASK_CH_TOKEN" "$chat" "$text" "$markup" && sent=$((sent + 1))
-  done <<<"$SA_OWNERS"
-  if (( sent == 0 )); then
-    _sysadmin_req_write "$hex" 'del(.nonce_hash, .decline_hash) + {state: "unsent"}' || true
-    fail "$E_GENERIC" "the Telegram send to ${for}'s owner failed — nothing will run; try again"
+  local body resp="" sent reason
+  body=$(jq -cn --arg id "$id" --arg for "$for" --arg sum "$summary" --arg scr "$script" --arg sha "$sha" \
+    --argjson ttl "$SYSADMIN_TTL" '{id: $id, for: $for, summary: $sum, script: $scr, sha256: $sha, ttlSeconds: $ttl}')
+  resp=$(_sysadmin_notify_post "$body") || resp=""
+  sent=$(jq -r 'if .sent == true then "yes" else "no" end' <<<"$resp" 2>/dev/null) || sent="no"
+  if [[ "$sent" != yes ]]; then
+    reason=$(jq -r '.reason // empty | tostring | .[0:200]' <<<"$resp" 2>/dev/null) || reason=""
+    [[ -n "$resp" ]] || reason="the approval service did not answer"
+    _sysadmin_req_write "$hex" '. + {state: "unsent"}' || true
+    fail "$E_GENERIC" "not sent to ${for}'s owner${reason:+: ${reason}} — nothing will run"
   fi
   AUDIT_ARGS+=("id=${id}" "for=${for}")
-  ok "sent ${id} to ${for}'s owner with Approve / Decline — nothing runs before their tap (within $((SYSADMIN_TTL / 60)) min). You are woken with the answer." \
-     '{id: $id, for: $f, sent: $n, state: "pending"}' --arg id "$id" --arg f "$for" --argjson n "$sent"
+  ok "sent ${id}: ${for}'s owner gets it on Telegram with Approve / Decline — nothing runs before their tap (within $((SYSADMIN_TTL / 60)) min). You are woken with the answer." \
+     '{id: $id, for: $f, state: "pending"}' --arg id "$id" --arg f "$for"
 }
 
-# owner-ask tap lands here for an sa- request (it holds the tap lock). Root.
-_sysadmin_tap() { # <bap|bdn> <hex> <nonce> <tap uid>
-  local kind="$1" hex="$2" nonce="$3" uid="$4" f body for summary want asked id
+# `sysadmin answer` — the client's tap, relayed by 5dive-api over the box's
+# tunnel. ROOT, and never on a seat's behalf: no seat has a sudo grant that
+# reaches this verb, the broker does not route it, and a seat caller is refused
+# here as well. The sha is the script the client was shown: a request whose
+# script differs from it does not run.
+_sysadmin_answer() {
+  local id="" verdict="" sha="" by="" a
+  for a in "$@"; do
+    case "$a" in
+      --sha=*) sha="${a#*=}" ;;
+      --by=*) by="${a#*=}" ;;
+      -*) fail "$E_USAGE" "unknown flag: $a" ;;
+      *) if [[ -z "$id" ]]; then id="$a"; elif [[ -z "$verdict" ]]; then verdict="$a"
+         else fail "$E_USAGE" "usage: 5dive sysadmin answer <sa-id> approve|decline --sha=<hex>"; fi ;;
+    esac
+  done
+  local hex caller
+  hex=$(_sysadmin_hex_of "$id") || fail "$E_USAGE" "not a request id: ${id:-?} (want sa-<12 hex>)"
+  [[ "$verdict" == approve || "$verdict" == decline ]] || fail "$E_USAGE" "answer approve or decline"
+  [[ "$sha" =~ ^[0-9a-f]{16,64}$ ]] || fail "$E_USAGE" "--sha=<16-64 hex of the script the owner was shown> is required"
+  by=$(printf '%s' "$by" | tr -cd 'A-Za-z0-9:_.-' | cut -c1-64)
+  AUDIT_ARGS=("id=sa-${hex}" "answer=${verdict}" "by=${by}")
+  _sysadmin_is_root || fail "$E_PERMISSION" "sysadmin answer runs as root"
+  caller=$(_sysadmin_caller)
+  [[ "$caller" != agent-* ]] || fail "$E_PERMISSION" "${caller} cannot answer a request — only the owner's tap does"
+
+  # One answer at a time: the check and the spend below must not interleave.
+  local fd
+  _sysadmin_dir_ensure || fail "$E_GENERIC" "cannot create $SYSADMIN_DIR"
+  exec {fd}>>"${SYSADMIN_DIR}/.answer.lock" && flock -w 10 "$fd" || fail "$E_GENERIC" "cannot take the answer lock"
+
+  local f body rid for summary state want asked
   f=$(_sysadmin_req "$hex")
-  [[ -f "$f" && ! -L "$f" && "$(stat -c %u -- "$f")" == "$(_sysadmin_root_uid)" ]] || _owner_ask_refuse "no such request"
+  [[ -f "$f" && ! -L "$f" && "$(stat -c %u -- "$f")" == "$(_sysadmin_root_uid)" ]] || fail "$E_NOT_FOUND" "no such request"
   body=$(cat -- "$f")
-  id=$(jq -r '.id' <<<"$body"); for=$(jq -r '.for' <<<"$body"); summary=$(jq -r '.summary' <<<"$body")
-  AUDIT_ARGS+=("id=${id}")
-  # Each button is checked against its own proof (see THE SHAPE above).
-  want=$(jq -r --arg k "$kind" 'if $k == "bdn" then .decline_hash else .nonce_hash end // ""' <<<"$body")
-  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || _owner_ask_refuse "request ${id} was already answered — this button is spent"
-  _sysadmin_owners "$for" || _owner_ask_refuse "no approver for ${for}: ${SA_WHY}"
-  grep -qxF -- "$uid" <<<"$SA_OWNERS" || _owner_ask_refuse "only ${for}'s owner can answer ${id}"
-  _gate_proof_ct_equal "$(_human_nonce_sha "$nonce")" "$want" || _owner_ask_refuse "this button is stale — nothing was authorised"
+  rid=$(jq -r '.id' <<<"$body"); for=$(jq -r '.for' <<<"$body"); summary=$(jq -r '.summary' <<<"$body")
+  state=$(jq -r '.state' <<<"$body"); want=$(jq -r '.sha256 // ""' <<<"$body")
+  [[ "$state" == pending ]] || fail "$E_PERMISSION" "request ${rid} was already answered (${state}) — nothing was authorised"
+  [[ "$want" =~ ^[0-9a-f]{64}$ && "$want" == "$sha"* ]] \
+    || fail "$E_PERMISSION" "request ${rid} is not the script the owner was shown — nothing was authorised"
   asked=$(jq -r '.asked_at // 0 | floor' <<<"$body")
   [[ "$asked" =~ ^[0-9]+$ ]] && (( asked + SYSADMIN_TTL > $(_sysadmin_now) )) \
-    || _owner_ask_refuse "request ${id} expired — nothing was authorised; ask again"
+    || fail "$E_PERMISSION" "request ${rid} expired — nothing was authorised; ask again"
 
-  if [[ "$kind" == bdn ]]; then
-    _sysadmin_req_write "$hex" 'del(.nonce_hash, .decline_hash) + {state: "declined", answered_at: $at, answered_by: $u}' \
-      --argjson at "$(_sysadmin_now)" --arg u "$uid" || fail "$E_GENERIC" "could not record the decline"
-    _sysadmin_wake "$SYSADMIN_NAME" "The owner DECLINED ${id} (${for}: ${summary}). Nothing ran. Tell ${for}; do not re-propose it unless ${for} brings a new ask." \
+  if [[ "$verdict" == decline ]]; then
+    _sysadmin_req_write "$hex" '. + {state: "declined", answered_at: $at, answered_by: $u}' \
+      --argjson at "$(_sysadmin_now)" --arg u "$by" || fail "$E_GENERIC" "could not record the decline"
+    _sysadmin_wake "$SYSADMIN_NAME" "The owner DECLINED ${rid} (${for}: ${summary}). Nothing ran. Tell ${for}; do not re-propose it unless ${for} brings a new ask." \
       || warn "could not wake ${SYSADMIN_NAME}"
-    AUDIT_ARGS+=("answer=declined")
-    ok "declined: ${id}" '{result: "declined", id: $id, for: $f}' --arg id "$id" --arg f "$for"
+    ok "declined: ${rid}" '{result: "declined", id: $id, for: $f}' --arg id "$rid" --arg f "$for"
     return 0
   fi
 
-  # Spend the proof BEFORE the start: a crash between the two leaves a request
-  # that says approved and never ran, not one a second tap could run twice.
-  _sysadmin_req_write "$hex" 'del(.nonce_hash, .decline_hash) + {state: "approved", answered_at: $at, answered_by: $u}' \
-    --argjson at "$(_sysadmin_now)" --arg u "$uid" || fail "$E_GENERIC" "could not record the approval"
+  # Spent BEFORE the start: a crash between the two leaves a request that says
+  # approved and never ran, not one a second tap could run twice.
+  _sysadmin_req_write "$hex" '. + {state: "approved", answered_at: $at, answered_by: $u}' \
+    --argjson at "$(_sysadmin_now)" --arg u "$by" || fail "$E_GENERIC" "could not record the approval"
   local sh="${SYSADMIN_DIR}/${hex}.sh" log="${SYSADMIN_DIR}/${hex}.log"
   ( umask 077; jq -r '.script' <<<"$body" > "$sh" ) || fail "$E_GENERIC" "could not stage the script"
   : > "$log"; chmod 600 "$log"
@@ -337,13 +306,12 @@ _sysadmin_tap() { # <bap|bdn> <hex> <nonce> <tap uid>
     _sysadmin_req_write "$hex" '. + {state: "running", started_at: $at}' --argjson at "$(_sysadmin_now)" || true
   else
     _sysadmin_req_write "$hex" '. + {state: "failed_to_start"}' || true
-    _sysadmin_wake "$SYSADMIN_NAME" "The owner APPROVED ${id} (${for}: ${summary}) but it FAILED TO START. Nothing ran. Check 5dive sysadmin status ${id}." || true
-    fail "$E_GENERIC" "approved, but ${id} failed to start — nothing ran"
+    _sysadmin_wake "$SYSADMIN_NAME" "The owner APPROVED ${rid} (${for}: ${summary}) but it FAILED TO START. Nothing ran. Check 5dive sysadmin status ${rid}." || true
+    fail "$E_GENERIC" "approved, but ${rid} failed to start — nothing ran"
   fi
-  _sysadmin_wake "$SYSADMIN_NAME" "The owner APPROVED ${id} (${for}: ${summary}). It is running as root now. Read the result with: 5dive sysadmin status ${id} — then tell ${for}." \
+  _sysadmin_wake "$SYSADMIN_NAME" "The owner APPROVED ${rid} (${for}: ${summary}). It is running as root now. Read the result with: 5dive sysadmin status ${rid} — then tell ${for}." \
     || warn "could not wake ${SYSADMIN_NAME}"
-  AUDIT_ARGS+=("answer=approved")
-  ok "approved: ${id}" '{result: "approved", id: $id, for: $f}' --arg id "$id" --arg f "$for"
+  ok "approved: ${rid}" '{result: "approved", id: $id, for: $f}' --arg id "$rid" --arg f "$for"
 }
 
 _sysadmin_read() { # <script>
@@ -388,9 +356,10 @@ _sysadmin_status() { # [<id>]
   f=$(_sysadmin_req "$hex"); [[ -f "$f" ]] || fail "$E_NOT_FOUND" "no request $1"
   log="${SYSADMIN_DIR}/${hex}.log"
   if [[ -f "$log" ]]; then
-    out=$(tail -c "$SYSADMIN_OUT_MAX" -- "$log")
-    code=$(grep -oE '^__exit=[0-9]+$' <<<"$out" | tail -1); code="${code#__exit=}"
-    out=$(grep -vE '^__exit=[0-9]+$' <<<"$out")
+    out=$(tail -c "$SYSADMIN_OUT_MAX" -- "$log") || out=""
+    code=$(grep -oE '^__exit=[0-9]+$' <<<"$out" | tail -1) || code=""
+    code="${code#__exit=}"
+    out=$(grep -vE '^__exit=[0-9]+$' <<<"$out") || out=""
   fi
   state=$(jq -r '.state' "$f")
   if [[ "$state" == running ]]; then
@@ -404,7 +373,7 @@ _sysadmin_status() { # [<id>]
       '{ok: true, data: ({id, for, by, summary, script, asked_at, answered_at, started_at} + {state: $s, exit: $c, output: $o})}' "$f"
   else
     jq -r --arg s "$state" '"\(.id)  \($s)  \(.for): \(.summary)\n--- script\n\(.script)"' "$f"
-    [[ -n "$out" ]] && printf -- '--- output%s\n%s\n' "${code:+ (exit $code)}" "$out"
+    if [[ -n "$out" ]]; then printf -- '--- output%s\n%s\n' "${code:+ (exit $code)}" "$out"; fi
   fi
 }
 
@@ -462,8 +431,8 @@ _sysadmin_rules() {
 # You are this server's sysadmin
 
 The other agents on this box work for one client. They cannot change the server; you do it for them.
-You never talk to the client yourself: an agent sends you an ask (`5dive agent send sysadmin …`), and you
-answer that agent (`5dive agent send <agent> "…"`).
+You never talk to the client yourself: an agent sends you an ask on the box's agent rail, and you answer
+that agent the same way (`5dive agent send <agent> "…"`).
 
 Your only root access is `5dive sysadmin` — plain `sudo` does not work for you.
 
@@ -473,8 +442,8 @@ Your only root access is `5dive sysadmin` — plain `sudo` does not work for you
 - **Anything that changes the server** (a package, a system service, a Caddy route, a cron job, a user):
   write the whole change as one bash script and run
   `5dive sysadmin propose --for=<agent that asked> --summary="<one plain line: what the client gets>"`
-  with the script on stdin. The client gets your summary with Approve / Decline in that agent's chat.
-  Nothing runs before the tap. You are woken with the answer; read the result with
+  with the script on stdin. The client gets your summary with Approve / Decline on Telegram; tell the agent
+  so, so it can tell the client to look for it. Nothing runs before the tap. You are woken with the answer; read the result with
   `5dive sysadmin status <sa-id>` and tell the agent.
 - Write the summary for someone non-technical, in the client's language if you know it, and never name
   the hosting company or the platform.
@@ -548,20 +517,16 @@ _sysadmin_install() {
     rm -f "$tmp"; fail "$E_GENERIC" "the broker grant did not validate (visudo) — not installed"
   fi
 
-  # Pin approvers for agents that predate the pin, from their bot's pairing as it
-  # stands now — before any sysadmin existed to be asked for anything.
-  local n pinned=0 ids
+  # Every seat on a partner box lingers, so its own `systemctl --user` apps
+  # outlive a turn; agents created later linger at create (cmd_agent_create.sh).
+  local n lingered=0
   while IFS= read -r n; do
-    [[ -n "$n" && "$n" != "$SYSADMIN_NAME" ]] || continue
-    _task_agent_channel "$n" || continue
-    ids=$(jq -r '(.allowFrom // []) | map(tostring) | join(",")' "$TASK_CH_ACCESS" 2>/dev/null)
-    [[ -n "$ids" ]] || continue
-    _sysadmin_pin_owners "$n" "$ids" && pinned=$((pinned + 1))
-  done < <(jq -r '.agents | to_entries[] | select((.value.telegramOwners // null) == null) | .key' "$REGISTRY" 2>/dev/null)
+    [[ -n "$n" ]] && id -u "agent-${n}" >/dev/null 2>&1 && _sysadmin_linger "agent-${n}" && lingered=$((lingered + 1))
+  done < <(jq -r '.agents | keys[]' "$REGISTRY" 2>/dev/null)
 
-  ok "sysadmin seat ready (created: ${created}, bound: ${bound}, waiting for account: ${pending}, approvers pinned for ${pinned} agent(s))" \
-     '{agent: $n, created: $c, bound: $b, pending: $w, pinned: $p}' \
-     --arg n "$SYSADMIN_NAME" --argjson c "$created" --argjson b "$bound" --argjson w "$pending" --argjson p "$pinned"
+  ok "sysadmin seat ready (created: ${created}, bound: ${bound}, waiting for account: ${pending}, seats lingering: ${lingered})" \
+     '{agent: $n, created: $c, bound: $b, pending: $w, lingered: $l}' \
+     --arg n "$SYSADMIN_NAME" --argjson c "$created" --argjson b "$bound" --argjson w "$pending" --argjson l "$lingered"
 }
 
 # The account the seat waits on (registry `.agents.sysadmin.pendingAuthProfile`);
@@ -594,6 +559,7 @@ cmd_sysadmin() {
   local sub="$1"; shift
   case "$sub" in
     install) _sysadmin_install "$@" ;;
+    answer) _sysadmin_answer "$@" ;;
     _broker) _sysadmin_broker ;;
     read)
       [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive sysadmin read  (script on stdin)"
@@ -616,6 +582,6 @@ cmd_sysadmin() {
       [[ $# -le 1 ]] || fail "$E_USAGE" "usage: 5dive sysadmin status [<sa-id>]"
       _sysadmin_call "$(jq -cn --arg i "${1:-}" '{op: "status", id: $i}')" ;;
     -h|--help|help) _sysadmin_usage ;;
-    *) fail "$E_USAGE" "usage: 5dive sysadmin read|restart|propose|status|install (try: 5dive sysadmin --help)" ;;
+    *) fail "$E_USAGE" "usage: 5dive sysadmin read|restart|propose|status|install|answer (try: 5dive sysadmin --help)" ;;
   esac
 }

@@ -369,6 +369,7 @@ Owner asks (a browser step only the owner may allow, answered on Telegram):
 Sysadmin seat (a partner box's privileged work; each change waits for the owner's tap):
   5dive sysadmin read | restart <agent> | propose --for=<agent> --summary=<line> | status [<sa-id>]
   5dive sysadmin install [--auth-profile=<name>]      # root: the seat, its broker grant and its rules
+  5dive sysadmin answer <sa-id> approve|decline --sha=<hex>   # root: the owner's tap, relayed by 5dive-api
 
 Web UI for this host (org chart, queue, gates, triggers) — now a PLUGIN:
   5dive plugin add 5dive-ai/5dive-ui                 # install it once, then 5dive ui works as before
