@@ -267,6 +267,19 @@ def list_sessions(projects):
                 return [], "subagent dir %s unreadable: %s" % (subag, e.strerror or e.errno)
             out.extend(os.path.join(subag, m) for m in sa_names if m.endswith(".jsonl"))
     return out, None
+def unbilled(seen, rkey, vals):
+    """DIVE-677: the part of `vals` not yet charged for API response `rkey`.
+    Claude Code writes one line per content block of a response, each repeating
+    its message.id and usage (output_tokens can be a partial streaming count on
+    an early block), so each field is charged up to its largest value, once."""
+    if not rkey:
+        return vals                     # nothing to match it to: it counts
+    prev = seen.get(rkey)
+    if prev is None:
+        seen[rkey] = list(vals)
+        return vals
+    seen[rkey] = [max(v, p) for v, p in zip(vals, prev)]
+    return [max(0, v - p) for v, p in zip(vals, prev)]
 total = 0
 for name, ws in wins.items():
     meta = reg.get("agents", {}).get(name)
@@ -336,6 +349,7 @@ for name, ws in wins.items():
     sessions, why = list_sessions(projects)
     if why is not None:
         not_reached("%s: %s" % (name, why)); continue
+    seen_resp = {}   # DIVE-677: response -> [in, out, cc] already charged for this agent
     for path in sessions:
         try:
             if os.path.getmtime(path) < lo: continue
@@ -357,7 +371,9 @@ for name, ws in wins.items():
                 ts = to_epoch(o.get("timestamp"))
                 if ts is None: continue
                 u = (o.get("message") or {}).get("usage") or {}
-                tot = int(u.get("input_tokens") or 0)+int(u.get("output_tokens") or 0)+int(u.get("cache_creation_input_tokens") or 0)
+                tot = sum(unbilled(seen_resp, (o.get("message") or {}).get("id") or o.get("requestId"),
+                                   [int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
+                                    int(u.get("cache_creation_input_tokens") or 0)]))
                 for w in ws:  # newest-started window wins (matches usage_collect)
                     if w["start"] <= ts <= w["end"]:
                         w["tok"] += tot; break
@@ -537,6 +553,19 @@ def session_paths(home, sid):
                 return [], "subagent dir %s unreadable: %s" % (subag, e.strerror or e.errno)
             out.extend(os.path.join(subag, n) for n in sa if n.endswith(".jsonl"))
     return out, None
+def unbilled(seen, rkey, vals):
+    """DIVE-677: the part of `vals` not yet charged for API response `rkey`.
+    Claude Code writes one line per content block of a response, each repeating
+    its message.id and usage (output_tokens can be a partial streaming count on
+    an early block), so each field is charged up to its largest value, once."""
+    if not rkey:
+        return vals                     # nothing to match it to: it counts
+    prev = seen.get(rkey)
+    if prev is None:
+        seen[rkey] = list(vals)
+        return vals
+    seen[rkey] = [max(v, p) for v, p in zip(vals, prev)]
+    return [max(0, v - p) for v, p in zip(vals, prev)]
 buckets = {}
 for g in segs: buckets.setdefault((g["sid"], g["agent"]), []).append(g)
 total = 0
@@ -547,6 +576,7 @@ for (sid, agent), ws in buckets.items():
     if not paths:
         bail("NOT-REACHED", 4, "no transcript named %s.jsonl under %s's home" % (sid, agent))
     read_any = False
+    seen_resp = {}   # DIVE-677: response -> [in, out, cc] already charged for this session
     for path in paths:
         try: f = open(path, "r", errors="ignore")
         except OSError as e:
@@ -569,9 +599,11 @@ for (sid, agent), ws in buckets.items():
                 if ts is None: continue
                 u = (o.get("message") or {}).get("usage") or {}
                 # Same limit-moving metric as `5dive usage` and as the scan above:
-                # input + output + cache-WRITE, cache-read excluded.
-                tot = (int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
-                       + int(u.get("cache_creation_input_tokens") or 0))
+                # input + output + cache-WRITE, cache-read excluded. DIVE-677:
+                # charged once per API response, not once per content-block line.
+                tot = sum(unbilled(seen_resp, (o.get("message") or {}).get("id") or o.get("requestId"),
+                                   [int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
+                                    int(u.get("cache_creation_input_tokens") or 0)]))
                 for w in ws:
                     # DIVE-3374: HALF-OPEN — inclusive start, EXCLUSIVE end. The
                     # clip and the overlap detector above are one decision about
