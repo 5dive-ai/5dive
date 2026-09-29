@@ -190,6 +190,12 @@ grep -q "^refused=only the box owner" "$TMP/audit" && grep -q "^tap_uid=$STRANGE
   && ok_t "c2 the audit row names the tapper and the reason, never the nonce" || bad_t "c2 audit" "$(cat "$TMP/audit")"
 [[ "$(jq -r '.nonce_hash // ""' "$R1")" == "$nh" ]] && ok_t "c3 the refused tap leaves the proof live for the owner" || bad_t "c3 proof kept"
 
+out=$(SUDO_USER="$SEAT" tap "bap:${H1}:${NONCE1}" "$OWNER"); rc=$?
+[[ $rc == "$E_PERMISSION" && "$(jq -r '.error.message' <<<"$out")" == *"answered on the team bot"* && -z "$(approves)" \
+   && "$(jq -r '.nonce_hash // ""' "$R1")" == "$nh" ]] \
+  && ok_t "c4 a seat relaying a browser ask (one proof on both buttons) is refused, proof kept (DIVE-5187)" \
+  || bad_t "c4 seat relay refused" "rc=$rc $out approves=$(approves)"
+
 echo "# (b) the owner's taps: bap approves with the proof, bdn denies"
 out=$(tap "bap:${H1}:${NONCE1}" "$OWNER"); rc=$?
 [[ $rc == 0 && "$(jq -r '.data.result' <<<"$out")" == approved && "$(jq -r '.data.id' <<<"$out")" == "$SEAT-$H1" ]] \

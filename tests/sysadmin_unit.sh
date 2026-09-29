@@ -169,10 +169,12 @@ grep -q 'maya asks for a change to the server' <<<"$text" && grep -qF 'A shared 
   && ! grep -qi '5dive' <<<"$text" && ok_t "c9 the owner reads who, the one-line summary, what runs — and no platform name" \
   || bad_t "c9 text" "$text"
 a=$(cb 0); d=$(cb 1)
-[[ "$a" =~ ^bap:${hex}:[0-9a-f]{32}$ && "$d" == "bdn:${hex}:${a##*:}" ]] && ok_t "c10 Approve/Decline are the owner-ask buttons (bap/bdn), 49 bytes" || bad_t "c10 buttons" "$a / $d"
+[[ "$a" =~ ^bap:${hex}:[0-9a-f]{32}$ && "$d" =~ ^bdn:${hex}:[0-9a-f]{32}$ && "${a##*:}" != "${d##*:}" ]] \
+  && ok_t "c10 Approve/Decline are the owner-ask buttons (bap/bdn), 49 bytes, each with its OWN proof" || bad_t "c10 buttons" "$a / $d"
 R="$SYSADMIN_DIR/$hex.json"
-[[ "$(stat -c %a "$R")" == 600 && "$(jq -r .state "$R")" == pending && "$(jq -r .nonce_hash "$R")" == "$(_human_nonce_sha "${a##*:}")" ]] \
-  && ok_t "c11 request is 0600, pending, and holds only the proof's hash" || bad_t "c11 request" "$(cat "$R")"
+[[ "$(stat -c %a "$R")" == 600 && "$(jq -r .state "$R")" == pending && "$(jq -r .nonce_hash "$R")" == "$(_human_nonce_sha "${a##*:}")" \
+   && "$(jq -r .decline_hash "$R")" == "$(_human_nonce_sha "${d##*:}")" ]] \
+  && ok_t "c11 request is 0600, pending, and holds only the proofs' hashes" || bad_t "c11 request" "$(cat "$R")"
 [[ $(nruns) == 0 ]] && ok_t "c12 nothing ran before the tap" || bad_t "c12 ran early" "$(cat "$TMP/run.log")"
 
 echo "# (d) the tap, through owner-ask tap"
@@ -192,7 +194,7 @@ grep -qF -- "--unit=5dive-sysadmin-${hex}" <<<"$run" && grep -qF -- "StandardInp
   && ok_t "d5 started as root in the sandbox, script from its staged file" || bad_t "d5 run argv" "$run"
 cmp -s <(jq -r .script "$R") "$SYSADMIN_DIR/$hex.sh" && [[ "$(stat -c %a "$SYSADMIN_DIR/$hex.sh")" == 600 ]] \
   && ok_t "d6 the staged script is byte-for-byte the proposed one, 0600" || bad_t "d6 staged script" ""
-[[ "$(jq -r .state "$R")" == running && "$(jq -r '.nonce_hash // "gone"' "$R")" == gone ]] && ok_t "d7 proof spent, state running" || bad_t "d7 state" "$(cat "$R")"
+[[ "$(jq -r .state "$R")" == running && "$(jq -r '.nonce_hash // .decline_hash // "gone"' "$R")" == gone ]] && ok_t "d7 proof spent, state running" || bad_t "d7 state" "$(cat "$R")"
 grep -q "^sysadmin | The owner APPROVED ${id}" "$TMP/wake.log" && ok_t "d8 the sysadmin seat is woken with the id" || bad_t "d8 wake" "$(cat "$TMP/wake.log")"
 out=$(tap "$a" "$OWNER"); (( $? != 0 )) && grep -q 'already answered' "$TMP/err" && [[ $(nruns) == 1 ]] \
   && ok_t "d9 a second tap on the same button runs nothing" || bad_t "d9 replay" "runs=$(nruns) $(cat "$TMP/err")"
@@ -200,7 +202,13 @@ grep -qx "id=${id}" "$TMP/audit" 2>/dev/null || true
 
 echo "# (e) decline"
 out=$(propose maya "Install a mail server" "$GOOD"); id2=$(jq -r .data.id <<<"$out"); hex2=${id2#sa-}; d2=$(cb 1)
-runs0=$(nruns); out=$(tap "$d2" "$OWNER"); rc=$?
+runs0=$(nruns)
+# The per-agent bridge runs as the seat, so an injected seat sees the Decline the
+# owner tapped. Re-labelled as an Approve it must be worth nothing.
+out=$(tap "bap:${hex2}:${d2##*:}" "$OWNER"); (( $? != 0 )) && grep -q stale "$TMP/err" && [[ $(nruns) == "$runs0" ]] \
+  && [[ "$(jq -r .state "$SYSADMIN_DIR/$hex2.json")" == pending ]] \
+  && ok_t "e0 the Decline proof relabelled as Approve (bap) -> refused, nothing ran, still pending" || bad_t "e0 decline->approve swap" "$out $(cat "$TMP/err")"
+out=$(tap "$d2" "$OWNER"); rc=$?
 (( rc == 0 )) && [[ "$(jq -r .data.result <<<"$out")" == declined && "$(jq -r .state "$SYSADMIN_DIR/$hex2.json")" == declined && $(nruns) == "$runs0" ]] \
   && grep -q "DECLINED ${id2}" "$TMP/wake.log" && ok_t "e1 Decline -> declined, nothing ran, seat told" || bad_t "e1 decline" "rc=$rc $out"
 out=$(tap "bap:${hex2}:${d2##*:}" "$OWNER"); (( $? != 0 )) && [[ $(nruns) == "$runs0" ]] \

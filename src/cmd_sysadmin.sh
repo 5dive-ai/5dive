@@ -21,7 +21,10 @@
 #             Nothing runs. The OWNER of that agent gets the summary with
 #             Approve / Decline in the agent's own chat (the owner-ask buttons,
 #             bap/bdn — so the per-agent bridge and the team-bot listener already
-#             relay the tap to root; neither hands the nonce to the agent).
+#             relay the tap to root). The two buttons carry DIFFERENT proofs: the
+#             per-agent bridge runs as the asking seat, so a seat sees the proof of
+#             the button the owner tapped, and one shared proof would let an
+#             injected seat turn a Decline into an Approve.
 #   (tap)     `owner-ask tap` finds the request here, checks the tapper against
 #             the owner, the proof and the 30-minute TTL, spends the proof and
 #             starts the script as root in a sandbox. Then it wakes the seat.
@@ -256,30 +259,32 @@ _sysadmin_propose() { # <for> <summary> <script> <caller>
   why=$(_sysadmin_lint "$script") || fail "$E_PERMISSION" "refused, not sent: the script touches ${why}. That is off limits even with the owner's approval."
 
   _sysadmin_owners "$for" || fail "$E_PERMISSION" "not sent: ${SA_WHY}"
-  local hex nonce hash id
+  local hex nonce hash dnonce dhash id
   hex=$(_human_nonce_mint) && hex="${hex:0:12}" || fail "$E_GENERIC" "could not mint a request id"
-  nonce=$(_human_nonce_mint) || fail "$E_GENERIC" "could not mint the owner's proof"
-  hash=$(_human_nonce_sha "$nonce")
-  [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || fail "$E_GENERIC" "could not hash the owner's proof"
+  # One proof per button: seeing the Decline proof must not buy the Approve.
+  nonce=$(_human_nonce_mint) && dnonce=$(_human_nonce_mint) || fail "$E_GENERIC" "could not mint the owner's proof"
+  hash=$(_human_nonce_sha "$nonce"); dhash=$(_human_nonce_sha "$dnonce")
+  [[ "$hash" =~ ^[0-9a-f]{64}$ && "$dhash" =~ ^[0-9a-f]{64}$ && "$nonce" != "$dnonce" ]] \
+    || fail "$E_GENERIC" "could not hash the owner's proof"
   id="sa-${hex}"
   _sysadmin_dir_ensure || fail "$E_GENERIC" "cannot create $SYSADMIN_DIR"
   # The proof lands BEFORE the send, so a tap can never arrive ahead of it.
   _sysadmin_req_write "$hex" '{id: $id, for: $for, by: $by, summary: $sum, script: $scr, sha256: $sha,
-      asked_at: $at, nonce_hash: $h, state: "pending"}' \
+      asked_at: $at, nonce_hash: $h, decline_hash: $dh, state: "pending"}' \
     --arg id "$id" --arg for "$for" --arg by "$by" --arg sum "$summary" --arg scr "$script" \
-    --arg sha "$(printf '%s' "$script" | sha256sum | cut -c1-64)" --argjson at "$(_sysadmin_now)" --arg h "$hash" \
+    --arg sha "$(printf '%s' "$script" | sha256sum | cut -c1-64)" --argjson at "$(_sysadmin_now)" --arg h "$hash" --arg dh "$dhash" \
     || fail "$E_GENERIC" "could not write the request"
 
   local text markup chat sent=0
   text=$(_sysadmin_text "$for" "$summary" "$script" "$id")
-  markup=$(jq -cn --arg a "bap:${hex}:${nonce}" --arg d "bdn:${hex}:${nonce}" \
+  markup=$(jq -cn --arg a "bap:${hex}:${nonce}" --arg d "bdn:${hex}:${dnonce}" \
     '{inline_keyboard: [[{text: "✅ Approve", callback_data: $a}, {text: "❌ Decline", callback_data: $d}]]}')
   while IFS= read -r chat; do
     [[ -n "$chat" ]] || continue
     _sysadmin_tg_post "$TASK_CH_TOKEN" "$chat" "$text" "$markup" && sent=$((sent + 1))
   done <<<"$SA_OWNERS"
   if (( sent == 0 )); then
-    _sysadmin_req_write "$hex" 'del(.nonce_hash) + {state: "unsent"}' || true
+    _sysadmin_req_write "$hex" 'del(.nonce_hash, .decline_hash) + {state: "unsent"}' || true
     fail "$E_GENERIC" "the Telegram send to ${for}'s owner failed — nothing will run; try again"
   fi
   AUDIT_ARGS+=("id=${id}" "for=${for}")
@@ -295,7 +300,8 @@ _sysadmin_tap() { # <bap|bdn> <hex> <nonce> <tap uid>
   body=$(cat -- "$f")
   id=$(jq -r '.id' <<<"$body"); for=$(jq -r '.for' <<<"$body"); summary=$(jq -r '.summary' <<<"$body")
   AUDIT_ARGS+=("id=${id}")
-  want=$(jq -r '.nonce_hash // ""' <<<"$body")
+  # Each button is checked against its own proof (see THE SHAPE above).
+  want=$(jq -r --arg k "$kind" 'if $k == "bdn" then .decline_hash else .nonce_hash end // ""' <<<"$body")
   [[ "$want" =~ ^[0-9a-f]{64}$ ]] || _owner_ask_refuse "request ${id} was already answered — this button is spent"
   _sysadmin_owners "$for" || _owner_ask_refuse "no approver for ${for}: ${SA_WHY}"
   grep -qxF -- "$uid" <<<"$SA_OWNERS" || _owner_ask_refuse "only ${for}'s owner can answer ${id}"
@@ -305,7 +311,7 @@ _sysadmin_tap() { # <bap|bdn> <hex> <nonce> <tap uid>
     || _owner_ask_refuse "request ${id} expired — nothing was authorised; ask again"
 
   if [[ "$kind" == bdn ]]; then
-    _sysadmin_req_write "$hex" 'del(.nonce_hash) + {state: "declined", answered_at: $at, answered_by: $u}' \
+    _sysadmin_req_write "$hex" 'del(.nonce_hash, .decline_hash) + {state: "declined", answered_at: $at, answered_by: $u}' \
       --argjson at "$(_sysadmin_now)" --arg u "$uid" || fail "$E_GENERIC" "could not record the decline"
     _sysadmin_wake "$SYSADMIN_NAME" "The owner DECLINED ${id} (${for}: ${summary}). Nothing ran. Tell ${for}; do not re-propose it unless ${for} brings a new ask." \
       || warn "could not wake ${SYSADMIN_NAME}"
@@ -316,7 +322,7 @@ _sysadmin_tap() { # <bap|bdn> <hex> <nonce> <tap uid>
 
   # Spend the proof BEFORE the start: a crash between the two leaves a request
   # that says approved and never ran, not one a second tap could run twice.
-  _sysadmin_req_write "$hex" 'del(.nonce_hash) + {state: "approved", answered_at: $at, answered_by: $u}' \
+  _sysadmin_req_write "$hex" 'del(.nonce_hash, .decline_hash) + {state: "approved", answered_at: $at, answered_by: $u}' \
     --argjson at "$(_sysadmin_now)" --arg u "$uid" || fail "$E_GENERIC" "could not record the approval"
   local sh="${SYSADMIN_DIR}/${hex}.sh" log="${SYSADMIN_DIR}/${hex}.log"
   ( umask 077; jq -r '.script' <<<"$body" > "$sh" ) || fail "$E_GENERIC" "could not stage the script"

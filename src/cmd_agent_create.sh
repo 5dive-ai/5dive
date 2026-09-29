@@ -757,9 +757,11 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _merge_do
 # DIVE-5187: relay the box owner's Approve or Decline tap from this seat's OWN bot
 # to root, the call the Telegram plugin makes. owner-ask tap validates both
 # arguments (a bap or bdn button of 12 hex and 32 hex, a numeric tapper id) and
-# acts only on the owner's proof, a nonce minted by root that this seat never
-# sees. Without it every standard seat's bot answered such a tap with an error,
-# so a partner client could not approve its sysadmin's changes (or browser asks).
+# acts only on the owner's proof, a nonce minted by root per BUTTON, so the seat
+# that relays a Decline never holds the Approve proof. It answers sysadmin
+# requests only (a seat relay of a browser ask is refused), and sysadmin requests
+# exist only on partner boxes, so elsewhere this line authorises nothing.
+# Without it a partner client's tap could not approve its sysadmin's changes.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive --json owner-ask tap *
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
