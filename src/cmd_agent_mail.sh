@@ -264,6 +264,16 @@ EOF
   _agent_mail_block_end; printf '\n'
 }
 
+# A running seat reads its instructions file only at session start, so after a
+# change it must restart to learn (or forget) the mailbox. Deferred (~1s
+# transient unit, survives this call's own teardown) and best-effort: a SUBSHELL,
+# so cmd_restart's fail/ok can neither exit this verb nor print a second envelope
+# on stdout. Echoes true|false. cmd_restart lives in cmd_agent_lifecycle.sh; in
+# the bundle its autoload stub loads that module on first call.
+_agent_mail_restart() { # <agent>
+  if ( cmd_restart "$1" --defer ) >/dev/null 2>&1; then echo true; else echo false; fi
+}
+
 cmd_agent_mail() {
   local sub="${1:-}"; shift || true
   case "$sub" in
@@ -407,8 +417,11 @@ _agent_mail_set() {
   _agent_mail_persona "$agent" "$(_agent_mail_block "$email" "$calendar" "$caldav")" \
     || warn "mailbox connected, but the agent's instructions file could not be updated — tell the agent about $email yourself"
 
+  local restarted; restarted=$(_agent_mail_restart "$agent")
+  [[ "$restarted" == true ]] || warn "could not schedule a restart of '$agent'; it learns about the mailbox at its next restart"
   ok "mailbox $email connected for '$agent'$([[ $calendar == true ]] && echo ' (with calendar)')" \
-    '{agent:$a, email:$e, calendar:$c}' --arg a "$agent" --arg e "$email" --argjson c "$calendar"
+    '{agent:$a, email:$e, calendar:$c, restarted:$r}' --arg a "$agent" --arg e "$email" --argjson c "$calendar" \
+    --argjson r "$restarted"
 }
 
 _agent_mail_remove() {
@@ -434,8 +447,14 @@ _agent_mail_remove() {
     removed=true
   fi
   _agent_mail_persona "$agent" "" || warn "could not update the agent's instructions file; remove the 5dive:mail block by hand"
+  # Nothing changed, nothing to forget: no restart.
+  local restarted=false
+  if [[ "$removed" == true ]]; then
+    restarted=$(_agent_mail_restart "$agent")
+    [[ "$restarted" == true ]] || warn "could not schedule a restart of '$agent'; it forgets the mailbox at its next restart"
+  fi
   ok "mailbox $([[ $removed == true ]] && echo removed || echo 'was not connected') for '$agent'" \
-    '{agent:$a, removed:$r}' --arg a "$agent" --argjson r "$removed"
+    '{agent:$a, removed:$r, restarted:$s}' --arg a "$agent" --argjson r "$removed" --argjson s "$restarted"
 }
 
 # {agent,email,calendar} for one agent, or nothing. Read AS the agent, capped,

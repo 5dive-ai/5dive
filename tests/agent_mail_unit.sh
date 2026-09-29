@@ -58,6 +58,9 @@ ensure_state_ro() { :; }
 require_agent() { jq -e --arg n "$1" '.agents[$n] != null' <<<"$REG" >/dev/null || fail "$E_NOT_FOUND" "no agent named '$1'"; }
 agent_type() { jq -r --arg n "$1" '.agents[$n].type // empty' <<<"$REG"; }
 _agent_mail_is_root() { return 0; }
+# The deferred restart: record the call; RESTART_RC decides its outcome.
+export RESTART_LOG="$TMP/restart.log"; RESTART_RC=0; : >"$RESTART_LOG"
+cmd_restart() { printf '%s\n' "$*" >>"$RESTART_LOG"; echo '{"ok":true,"data":{"noise":1}}'; return "$RESTART_RC"; }
 
 # --- argv-recording wrappers for every external command the verb runs ---------
 for c in cat dd mv chmod mkdir rm head jq python3 grep sha256sum tar install env timeout date \
@@ -184,6 +187,7 @@ run "wrong-$PW\n" _agent_mail_set alpha "${SET_ARGS[@]}"
 [[ "$OUT$ERR" != *"wrong-$PW"* ]] && okk 'the password is scrubbed from the server text it echoed' || bad "password leaked in error: $(msg)"
 [[ ! -e "$home/.config/5dive-mail" && ! -e "$home/.config/himalaya/config.toml" ]] \
   && okk 'a failed login persists nothing' || bad "failed login left: $(find "$home/.config" 2>/dev/null | tr '\n' ' ')"
+[[ ! -s "$RESTART_LOG" ]] && okk 'a failed login restarts nothing' || bad "restart after failed login: $(cat "$RESTART_LOG")"
 [[ -z "$(ls -A "$TMP/agenttmp")" ]] && okk 'a failed login leaves no temp dir behind' || bad "temp left: $(ls -A "$TMP/agenttmp")"
 grep -q "^agent-alpha|himalaya -c $TMP/agenttmp/.* --json mailbox list$" "$ARGV_LOG" \
   && okk 'himalaya ran as the agent, against a temp config, with the global --json flag' || bad "himalaya argv: $(grep himalaya "$ARGV_LOG")"
@@ -203,8 +207,9 @@ echo unreach >"$HM_MODE"; run "$PW\n" _agent_mail_set alpha "${SET_ARGS[@]}"
 printf '# my notes\nkeep me\n' >"$TMP/persona-before"
 mkdir -p "$home/.claude"; cp "$TMP/persona-before" "$home/.claude/CLAUDE.md"; chmod 640 "$home/.claude/CLAUDE.md"
 run "$PW\r\n" _agent_mail_set alpha "${SET_ARGS[@]}"
-(( RC == 0 )) && [[ "$(jq -c .data <<<"$OUT")" == '{"agent":"alpha","email":"user@example.com","calendar":false}' ]] \
-  && okk 'a verified login connects: data {agent,email,calendar}, and a trailing CRLF was stripped' || bad "success: rc=$RC out=$OUT err=$ERR"
+(( RC == 0 )) && [[ "$(jq -c .data <<<"$OUT")" == '{"agent":"alpha","email":"user@example.com","calendar":false,"restarted":true}' ]] \
+  && okk 'a verified login connects: data {agent,email,calendar,restarted}, one envelope, and a trailing CRLF was stripped' || bad "success: rc=$RC out=$OUT err=$ERR"
+[[ "$(cat "$RESTART_LOG")" == "alpha --defer" ]] && okk 'set schedules a deferred restart of the agent' || bad "restart log: $(cat "$RESTART_LOG")"
 ! grep -q PRE-EXISTING-MAILJSON "$ARGV_LOG" && okk 'the login ran before any permanent file existed' || bad 'mail.json existed before the login check'
 m=$(stat -c %a "$home/.config/5dive-mail/password" "$home/.config/5dive-mail/mail.json" \
      "$home/.config/himalaya/config.toml" "$home/.config/5dive-mail" "$home/.config/himalaya" 2>&1 | tr '\n' ' ')
@@ -242,7 +247,7 @@ pf="$home/.claude/CLAUDE.md"
 : >"$ARGV_LOG"; printf '207' >"$CURL_CODE"
 run "$PW\n" _agent_mail_set alpha --email=other@example.com --imap=imap.example.com:143 --smtp=smtp.example.com:587 \
   --caldav=https://cal.example.com/dav/cal/ --password=-
-(( RC == 0 )) && [[ "$(jq -c .data <<<"$OUT")" == '{"agent":"alpha","email":"other@example.com","calendar":true}' ]] \
+(( RC == 0 )) && [[ "$(jq -c .data <<<"$OUT")" == '{"agent":"alpha","email":"other@example.com","calendar":true,"restarted":true}' ]] \
   && okk 'set again replaces the mailbox, and a 207 CalDAV answer sets calendar:true' || bad "replace: rc=$RC $OUT $ERR"
 grep -qx 'imap.server = "imap://imap.example.com:143"' "$cfg" && grep -qx 'imap.starttls = true' "$cfg" \
   && grep -qx 'smtp.server = "smtp://smtp.example.com:587"' "$cfg" && grep -qx 'smtp.starttls = true' "$cfg" \
@@ -259,6 +264,12 @@ run "$PW\n" _agent_mail_set alpha "${SET_ARGS[@]}" --caldav=https://cal.example.
   && [[ "$(jq -r .caldav "$home/.config/5dive-mail/mail.json")" == https://cal.example.com/dav/ ]] \
   && okk 'a non-207 CalDAV answer still connects mail, with calendar:false and no netrc' || bad "caldav 404: rc=$RC $OUT"
 [[ "$(_agent_mail_netrc h u 'abcd efgh ijkl')" == *'password "abcd efgh ijkl"'* ]] && okk 'a password with spaces is quoted in the netrc' || bad 'netrc quoting'
+
+RESTART_RC=1
+run "$PW\n" _agent_mail_set alpha "${SET_ARGS[@]}"
+(( RC == 0 )) && [[ "$(jq -r .data.restarted <<<"$OUT")" == false && "$(wc -l <<<"$OUT")" == 1 ]] \
+  && okk 'a restart that cannot be scheduled still connects, with restarted:false' || bad "restart fail: rc=$RC $OUT"
+RESTART_RC=0
 
 # --- a foreign himalaya config is refused before any write -----------------------------
 bh="$AGENT_HOME_ROOT/agent-beta"; mkdir -p "$bh/.config/himalaya"; printf '[accounts.mine]\nemail = "me@example.com"\n' >"$bh/.config/himalaya/config.toml"
@@ -283,12 +294,15 @@ run "" _agent_mail_show nobody
 (( RC == 4 )) && okk 'show on an unknown agent is E_NOT_FOUND' || bad "show unknown: rc=$RC"
 
 # --- remove -------------------------------------------------------------------------------
+: >"$RESTART_LOG"
 run "" _agent_mail_remove alpha
-(( RC == 0 )) && [[ "$(jq -c .data <<<"$OUT")" == '{"agent":"alpha","removed":true}' ]] && [[ ! -e "$home/.config/5dive-mail" && ! -e "$cfg" ]] \
+(( RC == 0 )) && [[ "$(jq -c .data <<<"$OUT")" == '{"agent":"alpha","removed":true,"restarted":true}' ]] && [[ "$(cat "$RESTART_LOG")" == "alpha --defer" ]] && [[ ! -e "$home/.config/5dive-mail" && ! -e "$cfg" ]] \
   && ! grep -q '5dive:mail' "$pf" && [[ "$(cat "$pf")" == "$(cat "$TMP/persona-before")" ]] \
   && okk 'remove deletes the files, the managed config and the persona block (the rest of the file intact)' || bad "remove: rc=$RC $OUT $(cat "$pf")"
+: >"$RESTART_LOG"
 run "" _agent_mail_remove alpha
-(( RC == 0 )) && [[ "$(jq -c .data <<<"$OUT")" == '{"agent":"alpha","removed":false}' ]] && okk 'remove is idempotent: removed:false when nothing is connected' || bad "remove again: $OUT"
+(( RC == 0 )) && [[ "$(jq -c .data <<<"$OUT")" == '{"agent":"alpha","removed":false,"restarted":false}' ]] && okk 'remove is idempotent: removed:false when nothing is connected' || bad "remove again: $OUT"
+[[ ! -s "$RESTART_LOG" ]] && okk 'remove with nothing connected restarts nothing' || bad "restart on no-op remove: $(cat "$RESTART_LOG")"
 run "" _agent_mail_remove beta
 cmp -s "$TMP/beta-before" "$bh/.config/himalaya/config.toml" && okk 'remove never deletes a foreign himalaya config' || bad 'remove deleted a foreign config'
 run "" _agent_mail_remove nobody
