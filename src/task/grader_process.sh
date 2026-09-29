@@ -582,8 +582,10 @@ _grader_clone_creds() {  # <clone> <pool_seat>
     # migration: permission denied", `5dive gh` read that as "you hold NO gh
     # credential on this seat" and routed the read to the bot — which needs a
     # NOPASSWD grant the clone lacks. One root-owned directory presented as a
-    # missing credential three layers away. `install -d` applies the owner to
-    # EVERY component it creates, which is the difference that matters here.
+    # missing credential three layers away. `install -d` owns the LEAF it names;
+    # like -D it still creates missing PARENTS root-owned (DIVE-5201), so this
+    # relies on `agent create` having already made ~/.config seat-owned
+    # (seat_own_dirs, via the co-author hook install).
     install -d -o "agent-${clone}" -g "agent-${clone}" -m 0700 "${dst%/*}" 2>/dev/null \
       || { warn "grader clone ${clone}: could not create ${rel%/*} owned by the clone"; return 3; }
     install -o "agent-${clone}" -g "agent-${clone}" -m 0600 "$src" "$dst" 2>/dev/null \
