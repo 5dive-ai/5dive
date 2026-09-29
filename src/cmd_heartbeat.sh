@@ -175,6 +175,12 @@ _HB_RECURRING_ESCALATE_HOURS="${HEARTBEAT_RECURRING_ESCALATE_HOURS:-24}"
 # than the materializer, and two independently-defaulted constants is exactly how
 # that drifts.
 _HB_OVERLAP_BOUND_DEFAULT="${TASKS_OVERLAP_BOUND_DEFAULT:-3}"
+# DIVE-5218: how many minutes back the recurring materializer will catch up a
+# slot that no pass evaluated (the tick overran a minute). Past this, the gap is
+# an outage, not a slow tick, and nothing is backfilled -- a host down for hours
+# must not fire a day of beats on boot.
+_HB_MZ_CATCHUP_MIN="${HEARTBEAT_MATERIALIZER_CATCHUP_MIN:-15}"
+[[ "$_HB_MZ_CATCHUP_MIN" =~ ^[0-9]+$ ]] || _HB_MZ_CATCHUP_MIN=15
 _HB_STALL_MIN_MINUTES="${HEARTBEAT_STALL_MIN_MINUTES:-30}"
 [[ "$_HB_STALL_MIN_MINUTES" =~ ^[0-9]+$ ]] || _HB_STALL_MIN_MINUTES=30
 # Orphan reclaim. An in_progress task whose claiming claude session is GONE — the
@@ -5028,13 +5034,51 @@ _hb_wake() {
 # title/body/priority/assignee/created_by/fresh into a kind='standard' todo
 # stamped with from_template_id, then stamp the template's last_fired_at.
 #
-# V1 LIMITATION: no catch-up for ticks the host missed — if the box was down over
-# a scheduled minute, that occurrence is skipped, not backfilled. Acceptable for
-# coarse (daily/hourly) recurring jobs; minute granularity finer than the tick
-# interval can also be missed. Both documented in the CHANGELOG.
+# DIVE-5218 — BOUNDED CATCH-UP. This used to test the cron against `now` alone
+# (the "V1 LIMITATION: no catch-up"), which rested on one pass per minute. When a
+# tick overruns 60s a minute gets NO pass, and a template due in it was never
+# evaluated: DIVE-1236's `0 3 * * *` was dropped on 2026-09-29 by passes at
+# 02:59:09 and 03:01:05, with no instance and no stamp. Each template is now
+# asked about every minute in (previous pass's minute, now] and fires at most
+# ONCE per pass, for the LATEST matching slot in that window. The previous
+# pass's minute is kept in a state file (each tick is a fresh process). A gap
+# over _HB_MZ_CATCHUP_MIN is an outage and is not backfilled -- only `now` is
+# asked, exactly as before. The same-minute guard now reads against the SLOT
+# (last_fired_at >= slot minute = that slot already fired), and a catch-up fire
+# passes the pacing floor, the dedup and the overlap policy exactly like an
+# on-time one.
+_hb_mz_last_pass_file() { printf '%s' "${STATE_DIR}/heartbeat-materializer-last-pass"; }
+
+# <now> -> newline list of "<epoch> <MM> <HH> <dd> <mm> <w>", NEWEST minute first,
+# covering (previous pass minute, now]. Logs a catch-up window or an over-bound gap.
+_hb_mz_window() {
+  local now="$1" now_min prev="" start m gap
+  now_min=$(( now / 60 * 60 ))
+  prev=$(cat "$(_hb_mz_last_pass_file)" 2>/dev/null) || prev=""
+  start="$now_min"
+  if [[ "$prev" =~ ^[0-9]+$ ]] && (( prev < now_min )); then
+    gap=$(( (now_min - prev) / 60 ))
+    if (( gap - 1 > _HB_MZ_CATCHUP_MIN )); then
+      _hb_log "[materializer] ${gap}m since the last pass (> ${_HB_MZ_CATCHUP_MIN}m catch-up bound) — NOT backfilling; only $(date -u -d "@${now_min}" +'%H:%M') is evaluated (DIVE-5218)"
+    else
+      start=$(( prev + 60 ))
+      (( gap > 1 )) && _hb_log "[materializer] catch-up: $(( gap - 1 )) minute(s) since the last pass had no pass — evaluating $(date -u -d "@${start}" +'%H:%M')..$(date -u -d "@${now_min}" +'%H:%M') (DIVE-5218)"
+    fi
+  fi
+  for (( m = now_min; m >= start; m -= 60 )); do
+    printf '%s %s\n' "$m" "$(date -u -d "@${m}" +'%M %H %d %m %w')"
+  done
+}
+
 _hb_materialize_recurring() {
-  local now="$1" minute_start tid sched last_fired policy bound assignee open open_read open_rc stamp_err n_made=0
-  minute_start=$(date -u -d "@${now}" +'%Y-%m-%d %H:%M:00')
+  local now="$1" minute_start slot_ep slot_tag _wi tid sched last_fired policy bound assignee open open_read open_rc stamp_err n_made=0
+  local -a win_ep=() win_f=()
+  local _w_ep _w_f
+  while read -r _w_ep _w_f; do
+    [[ -n "$_w_f" ]] || continue
+    win_ep+=("$_w_ep"); win_f+=("$_w_f")
+  done < <(_hb_mz_window "$now")
+  (( ${#win_ep[@]} )) || { win_ep=("$(( now / 60 * 60 ))"); win_f=("$(date -u -d "@${now}" +'%M %H %d %m %w')"); }
   # DIVE-2272: x'1f' + IFS=$'\x1f', NOT '|' + tr + IFS=$'\t'. Tab is an IFS
   # WHITESPACE character, so bash collapses runs of it and an EMPTY field in the
   # middle of the row silently disappears, shifting every column after it. The
@@ -5047,7 +5091,15 @@ _hb_materialize_recurring() {
   # already use, for the same reason.
   while IFS=$'\x1f' read -r tid sched last_fired policy bound assignee; do
     [[ -n "$tid" ]] || continue
-    _cron_matches "$sched" "$now" || continue
+    # DIVE-5218: the latest minute in the window this template is due in.
+    slot_ep=""
+    for _wi in "${!win_ep[@]}"; do
+      _cron_matches_fields "$sched" "${win_f[$_wi]}" && { slot_ep="${win_ep[$_wi]}"; break; }
+    done
+    [[ -n "$slot_ep" ]] || continue
+    minute_start=$(date -u -d "@${slot_ep}" +'%Y-%m-%d %H:%M:00')
+    slot_tag=""
+    (( slot_ep < now / 60 * 60 )) && slot_tag=" (catch-up: slot ${minute_start%:00} UTC, no pass ran in that minute — DIVE-5218)"
     # DIVE-4430 — A PACED WEEK GIVES UP THE BEATS FIRST.
     #
     # A recurring beat is the cheapest thing to defer and the most expensive
@@ -5067,12 +5119,13 @@ _hb_materialize_recurring() {
       _mz_acct=$(jq -r --arg n "${assignee:-}" '.agents[$n].authProfile // ("@self:" + $n)' <<<"$(registry_read)" 2>/dev/null) || _mz_acct=""
       _mz_verdict=$(printf '%s' "${_HB_PACE_USAGE-}" | _pace_band "$_mz_acct" "$now") || _mz_rc=$?
       if (( _mz_rc != 0 )) && ! _pace_admits "$_mz_rc" urgent recurring; then
-        _hb_log "[materializer] $(_hb_ident "$tid") slot at ${minute_start} NOT fired — pacing floor $(_pace_band_name "$_mz_rc") on ${_mz_acct:-<no account>} (assignee ${assignee:-<none>}): ${_mz_verdict}. Nothing stamped; the next matching slot re-asks the meter (DIVE-4430)"
+        _hb_log "[materializer] $(_hb_ident "$tid") slot at ${minute_start} NOT fired — pacing floor $(_pace_band_name "$_mz_rc") on ${_mz_acct:-<no account>} (assignee ${assignee:-<none>}): ${_mz_verdict}. Nothing stamped; the next matching slot re-asks the meter (DIVE-4430)${slot_tag}"
         continue
       fi
     fi
-    # Already fired this minute? (string compare on ISO 'YYYY-MM-DD HH:MM:SS';
-    # last_fired >= minute_start means a tick already materialized it this minute.)
+    # Already fired this slot? (string compare on ISO 'YYYY-MM-DD HH:MM:SS';
+    # last_fired >= minute_start means a pass already materialized it at or after
+    # the slot's minute -- on time, or by an earlier catch-up.)
     if [[ -n "$last_fired" ]] && ! [[ "$last_fired" < "$minute_start" ]]; then
       continue
     fi
@@ -5167,11 +5220,18 @@ _hb_materialize_recurring() {
     if db "INSERT INTO tasks (title, body, priority, assignee, created_by, kind, from_template_id, fresh)
            SELECT title, body, priority, assignee, created_by, 'standard', id, fresh FROM tasks WHERE id=${tid};
            UPDATE tasks SET last_fired_at=datetime('now') WHERE id=${tid};" >/dev/null 2>&1; then
-      n_made=$((n_made + 1)); _hb_log "[materializer] $(_hb_ident "$tid") fired -> new standard todo"
+      n_made=$((n_made + 1)); _hb_log "[materializer] $(_hb_ident "$tid") fired -> new standard todo${slot_tag}"
     else
       _hb_log "[materializer] $(_hb_ident "$tid") insert failed"
     fi
   done < <(db "SELECT id||x'1f'||schedule||x'1f'||COALESCE(last_fired_at,'')||x'1f'||COALESCE(on_overlap,'skip')||x'1f'||COALESCE(overlap_bound,'')||x'1f'||COALESCE(assignee,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL AND status='todo';" 2>/dev/null)
+  # DIVE-5218: record this pass's minute for the next pass's catch-up window.
+  # Written AFTER the loop: a pass that dies midway leaves the old minute, and
+  # the next pass re-asks those slots (the last_fired_at guard stops a re-fire).
+  local _lp_file _lp_err
+  _lp_file=$(_hb_mz_last_pass_file)
+  _lp_err=$( { printf '%s\n' "$(( now / 60 * 60 ))" > "${_lp_file}.tmp" && mv -f "${_lp_file}.tmp" "$_lp_file"; } 2>&1 ) \
+    || _hb_log "[materializer] last-pass minute NOT recorded (${_lp_err//$'\n'/ }) — the next pass evaluates only its own minute"
   _hb_log "[materializer] pass done — ${n_made} materialized"
   return 0
 }
