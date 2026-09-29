@@ -3613,8 +3613,11 @@ _pack_sync_managed_elsewhere() {  # <agent-home> <id>
   for spec in "${DEFAULT_AGENT_SKILLS[@]+"${DEFAULT_AGENT_SKILLS[@]}"}"; do
     [[ "${spec#*:}" == "$id" ]] && return 0
   done
-  [[ "$id" == notify-user ]] \
-    && jq -e '.enabledPlugins["telegram@5dive-plugins"] == true' "$home/.claude/settings.json" >/dev/null 2>&1
+  if [[ "$id" == notify-user ]] \
+    && jq -e '.enabledPlugins["telegram@5dive-plugins"] == true' "$home/.claude/settings.json" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
 }
 
 # _pack_skill_shas <agent> <id>... -> {"<id>":"<sha of the installed body>"}
