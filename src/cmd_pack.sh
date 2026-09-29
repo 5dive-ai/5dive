@@ -74,6 +74,22 @@ _marketplace_index() {
   fi
 }
 
+# DIVE-5162: the member a registry pack carries its persona.yaml as (5dive-api
+# partner-registry.ts REGISTRY_PERSONA builds the same member for a partner pack).
+REGISTRY_PERSONA="registry-persona.yaml"
+
+# _pack_install_registry_persona <stage> <cdir> <owner> [group] — install a registry
+# pack's persona as <cdir>/persona.yaml, the file the voice engine reads the
+# agent's own voice from. Only when the pack carries no persona.yaml of its own
+# (that one is installed by cmd_import itself) and the persona names no signing
+# key. 0 = installed, 1 = nothing to install, 2 = refused.
+_pack_install_registry_persona() {
+  local stage="$1" cdir="$2" owner="$3" group="${4:-$3}" src="$1/$REGISTRY_PERSONA"
+  [[ -f "$src" && ! -f "$stage/persona.yaml" ]] || return 1
+  grep -qF "signing_key" "$src" && return 2
+  install -o "$owner" -g "$group" -m 644 "$src" "$cdir/persona.yaml" 2>/dev/null || return 2
+}
+
 # Resolve registry pack <slug> → a local .tar.gz (same shape `agent export` writes,
 # so cmd_import's existing flow is unchanged). Echoes the path. The return value
 # deliberately preserves WHICH registry step failed so callers never turn a
@@ -117,6 +133,15 @@ _marketplace_fetch_pack() {
   for f in CLAUDE.md card.md avatar.png; do
     curl -fsSL --max-time 20 "$base/$path/$f" -o "$dl/$f" 2>/dev/null || true
   done
+  # DIVE-5162: the character's persona, for its voice (voice.audio). Carried as
+  # REGISTRY_PERSONA, never as persona.yaml: that name makes cmd_import re-render
+  # the agent from the persona, and a registry agent is rendered from the pack's
+  # own CLAUDE.md, as it always was. One naming a signing key is dropped here.
+  if curl -fsSL --max-time 20 "$base/$path/persona.yaml" -o "$dl/$REGISTRY_PERSONA" 2>/dev/null; then
+    grep -qF "signing_key" "$dl/$REGISTRY_PERSONA" && rm -f "$dl/$REGISTRY_PERSONA"
+  else
+    rm -f "$dl/$REGISTRY_PERSONA"
+  fi
   # Bundled skill bodies (manifest.skills[] names → skills/<id>/SKILL.md), so a
   # pack imports self-contained even if a skill isn't in a published repo.
   local id
@@ -3241,6 +3266,10 @@ cmd_import() {
     fi
     install -o "agent-${as}" -g "agent-${as}" -m 644 "$stage/persona.yaml" "$cdir/persona.yaml" 2>/dev/null || true
   fi
+  # DIVE-5162: a registry pack's persona, for the agent's own voice. Never fatal:
+  # the agent then speaks in the box's default voice, as before.
+  local _rp=0; _pack_install_registry_persona "$stage" "$cdir" "agent-${as}" || _rp=$?
+  (( _rp == 2 )) && warn "the pack's persona was not installed — '$as' speaks in the box's default voice"
 
   # DIVE-840: install the adopted signing key into the imported agent's keystore so
   # it OWNS its identity and signs as itself (no re-mint — rarity already rides in
