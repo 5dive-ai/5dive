@@ -60,6 +60,10 @@ cmd_config() {
   # exists to prevent. Keep the pre-call value so the gate can roll back.
   local prev_channels
   prev_channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
+  # DIVE-5163: the account before this call, so an auth-profile change can tell
+  # whether the seat's model is still the one that account resolved it to.
+  local prev_profile
+  prev_profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
   # env_dirty marks that we need to rewrite agents.d/<name>.env from the
   # post-update registry at the end — channels/workdir/auth-profile all live there.
   local env_dirty=0
@@ -216,6 +220,15 @@ cmd_config() {
         esac
         new_model="$v"
         applied_keys+=("model")
+        # DIVE-5163: an explicit model is the seat's new intent. A family alias
+        # is remembered for set-account; anything else is a pin and forgets it.
+        if [[ "$type" == "claude" ]]; then
+          if model_latest "$v" >/dev/null; then
+            reg=$(jq --arg n "$name" --arg f "$v" '.agents[$n].modelFamily = $f' <<<"$reg")
+          else
+            reg=$(jq --arg n "$name" 'del(.agents[$n].modelFamily)' <<<"$reg")
+          fi
+        fi
         ;;
       effort|effortLevel)
         # Reasoning-effort switch. Claude persists effortLevel in settings.json;
@@ -304,6 +317,33 @@ cmd_config() {
     _tg_pre_channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
     channel_in_list telegram "$_tg_pre_channels" \
       || fail "$E_VALIDATION" "telegram.profile / telegram.account-url require channels=telegram (current: $_tg_pre_channels)"
+  fi
+  # DIVE-5163: moving a claude seat to another account re-derives its model the
+  # way create/import did, so a seat that asked for "sonnet" gets real Claude
+  # Sonnet on a client's own Claude account and the account's mapped id (e.g.
+  # deepseek/deepseek-v4.1-flash) back on the seeded OpenRouter one. Only a seat
+  # still on what its OLD account resolved the family to (or on the family's
+  # current claude-* id, which every pre-5163 import wrote) is moved: anything
+  # else is a deliberate pin. A bare alias needs nothing — Claude Code applies
+  # the new account's map to it on its own. An explicit model= in this call wins.
+  # Re-setting the SAME account is therefore the one-off heal for a seat that
+  # was imported before this fix.
+  if (( profile_dirty )) && [[ "$type" == "claude" && -z "$new_model" ]]; then
+    local _mf _mcur _mwant _new_prof
+    _mcur=$(resolve_agent_model claude "$name") || _mcur=""
+    _mf=$(jq -r --arg n "$name" '.agents[$n].modelFamily // ""' <<<"$reg")
+    [[ -n "$_mf" ]] || _mf=$(model_family_of "$_mcur")
+    _new_prof=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
+    if [[ -n "$_mf" && -n "$_mcur" && "$_mcur" != "$_mf" ]] \
+        && { [[ "$_mcur" == "$(resolve_model_for_profile "$_mf" "$prev_profile")" ]] \
+             || [[ "$_mcur" == "$(model_latest "$_mf")" ]]; }; then
+      _mwant=$(resolve_model_for_profile "$_mf" "$_new_prof")
+      if [[ -n "$_mwant" && "$_mwant" != "$_mcur" ]]; then
+        step "Re-deriving model for account '${_new_prof:-default}': $_mf -> $_mwant (was $_mcur)"
+        new_model="$_mwant"
+        applied_keys+=("model")
+      fi
+    fi
   fi
   echo "$reg" | registry_write
   # DIVE-4589: the binding event is written after the registry write has SUCCEEDED

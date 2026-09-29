@@ -3080,6 +3080,9 @@ cmd_import() {
   # while the manifest still read correctly, which is what makes it hard to see.
   # A full id passes through resolve_model_alias untouched, so this is a no-op for
   # packs that deliberately pin.
+  # DIVE-5163: keep what the pack ASKED for — re-resolved against the bound
+  # account below, once the profile is known.
+  local model_req="$model"
   [[ -n "$model" ]] && model=$(resolve_model_alias "$model")
   [[ -n "$type" ]] || { rm -rf "$stage"; fail "$E_VALIDATION" "manifest has no agent type"; }
   is_known_type "$type" || { rm -rf "$stage"; fail "$E_NOT_FOUND" "unknown --type '$type' (known: ${!TYPE_BIN[*]})"; }
@@ -3138,6 +3141,16 @@ cmd_import() {
       || { rm -rf "$stage"; fail "$E_USAGE" "--provider and --api-key must be passed together"; }
     byo=1
   fi
+  # DIVE-5163: a family alias on an alias-mapping account (the seeded OpenRouter
+  # one on a partner box) lands as the ACCOUNT's id for that family, not
+  # claude-sonnet-5 — Claude Code sends a full id past the account's map, and
+  # OpenRouter bills it as real Claude. Anthropic accounts resolve exactly as the
+  # line above did. BYO is left on that line: its profile is written by
+  # cmd_create below, so there is no map to read yet, and the id is forwarded
+  # to create as --model, which overrides the provider's tier map.
+  if (( ! byo )) && [[ -n "$model_req" ]]; then
+    model=$(resolve_model_for_profile "$model_req" "$profile")
+  fi
   cargs+=("--auth-profile=$profile")
   if (( byo )); then
     cargs+=("--provider=$p_provider" "--api-key=$p_api_key")
@@ -3187,6 +3200,12 @@ cmd_import() {
   step "Recreating agent '$as' from pack (type=$type)"
   ( cmd_create "${cargs[@]}" ) >/dev/null \
     || { rm -rf "$stage"; fail "$E_GENERIC" "create step failed while importing '$as'"; }
+  # DIVE-5163: remember the family the pack asked for, so `agent set-account`
+  # can re-derive the model for another account (see src/lib/models.sh).
+  if [[ "$type" == "claude" ]] && model_latest "$model_req" >/dev/null; then
+    local _mf_reg; _mf_reg=$(registry_read)
+    jq --arg n "$as" --arg f "$model_req" '.agents[$n].modelFamily = $f' <<<"$_mf_reg" | registry_write
+  fi
 
   local cdir="/home/agent-${as}/.claude"
 
