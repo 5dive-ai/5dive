@@ -58,6 +58,38 @@ git interpret-trailers --in-place --if-exists=addIfDifferent --if-missing=add \
 HOOK
 }
 
+# DIVE-5201: `seat_own_dirs <user> <home> <rel-dir>` — make every component of
+# <home>/<rel-dir> a directory the seat owns. `install -d -o` applies -o/-m to
+# the LEAF only and creates the missing parents as the caller (root, 0755), so a
+# fresh seat's `install -d -o seat ~/.config/5dive/git-hooks` left ~/.config
+# root-owned, and Chrome (XDG_CONFIG_HOME unset by DIVE-4587) could not create
+# its crashpad DB there: rc 133 on every seat of a box. A missing component is
+# created and chowned; a component already ROOT-owned is chowned, non-recursive,
+# which is the backfill for seats made before this fix (the upgrade reconciler
+# re-runs the co-author install on every seat). A component owned by anyone else
+# is left alone. `chown -h` and refusing symlinks keep a seat-controlled path
+# from becoming a root chown of its target.
+seat_own_dirs() {
+  local user="$1" home="$2" rel="$3" p part
+  [[ -n "$user" && -d "$home" && ! -L "$home" ]] || return 1
+  [[ "/$rel/" != *"/../"* ]] || return 1
+  p="$home"
+  local IFS=/
+  for part in $rel; do
+    [[ -n "$part" && "$part" != . ]] || continue
+    p="$p/$part"
+    [[ ! -L "$p" ]] || return 1
+    if [[ ! -e "$p" ]]; then
+      mkdir -m 755 "$p" || return 1
+      chown -h "$user:$user" "$p" || return 1
+    elif [[ ! -d "$p" ]]; then
+      return 1
+    elif [[ "$(stat -c %u "$p")" == 0 ]]; then
+      chown -h "$user:$user" "$p" || return 1
+    fi
+  done
+}
+
 install_agent_coauthor_hook() {
   local name="$1" openagent_id="$2" user="agent-${1}"
   command -v git >/dev/null 2>&1 || return 0
@@ -65,6 +97,7 @@ install_agent_coauthor_hook() {
   [[ "$openagent_id" =~ ^oa-[0-9a-f]{12}$ ]] || return 1
   local home="${AGENT_HOME_ROOT:-/home}/${user}"
   local hooks="$home/.config/5dive/git-hooks" hook="$home/.config/5dive/git-hooks/prepare-commit-msg"
+  seat_own_dirs "$user" "$home" ".config/5dive" || return 1
   install -d -m 700 -o "$user" -g "$user" "$hooks" || return 1
   local tmp; tmp=$(mktemp)
   render_agent_coauthor_hook >"$tmp" || { rm -f "$tmp"; return 1; }
