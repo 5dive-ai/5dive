@@ -129,16 +129,17 @@ out=$(propose maya "x" "$GOOD"); rc=$?
 CALLER=agent-sysadmin
 AS_ROOT=0; out=$( ( JSON_MODE=1 _sysadmin_broker <<<'{"op":"status"}' ) 2>&1 ); rc=$?; AS_ROOT=1
 (( rc != 0 )) && ok_t "b2 the broker refuses to run without root" || bad_t "b2 broker ran unprivileged" "$out"
-grep -qx 'agent-sysadmin ALL=(root) NOPASSWD: /usr/local/bin/5dive sysadmin _broker' <(_sysadmin_sudoers) \
-  && ! grep -q '\*' <(_sysadmin_sudoers | grep -v '^#') \
+sa_pol=$(_sysadmin_sudoers); sa_rules=$(grep -v '^#' <<<"$sa_pol")
+grep -qx 'agent-sysadmin ALL=(root) NOPASSWD: /usr/local/bin/5dive sysadmin _broker' <<<"$sa_pol" \
+  && ! grep -q '\*' <<<"$sa_rules" \
   && ok_t "b3 the grant is the exact broker command, no wildcard" || bad_t "b3 grant shape" "$(_sysadmin_sudoers)"
 
 pol=$(render_standard_sudoers agent-maya 0)
 printf '%s\n' "$pol" > "$TMP/maya.sudoers"
-! grep -v '^#' "$TMP/maya.sudoers" | grep -qE 'owner-ask|sysadmin' \
+! grep -qE 'owner-ask|sysadmin' <<<"$(grep -v '^#' "$TMP/maya.sudoers")" \
   && ok_t "b4 a standard seat's sudo reaches neither owner-ask nor sysadmin (its policy is main's)" || bad_t "b4 seat policy" "$(grep -E 'owner-ask|sysadmin' "$TMP/maya.sudoers")"
 [[ "$(_sysadmin_sudoers | classify_sudo_grant | cut -d'|' -f1)" == cli-scoped ]] \
-  && ! _sysadmin_sudoers | grep -v '^#' | grep -q answer \
+  && ! grep -q answer <<<"$sa_rules" \
   && ok_t "b5 the broker grant classifies as scoped, and it is not a grant of answer" \
   || bad_t "b5 classifier" "$(_sysadmin_sudoers | classify_sudo_grant)"
 

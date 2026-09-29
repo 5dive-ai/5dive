@@ -483,6 +483,7 @@ sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<princip
 5dive up / down / ps / export            # declarative agents via 5dive.yaml
 5dive team import <slug>                 # provision a whole team template in one call
 5dive team import <slug> --type=codex    # ...on a non-Claude harness (whole roster)
+5dive partner hire <pack> [--as=<name>]  # on a partner box: hire from the partner's catalogue (no root)
 5dive push <task> [--branch=<b>]         # delegated git push via your own GitHub App (see below)
 5dive self-update                        # update CLI + plugins, then restart agents
 ```
