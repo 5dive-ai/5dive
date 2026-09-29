@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # DIVE-5205: a hired agent gets its pack's LATER skill fixes — `agent pack-sync`.
+# DIVE-5211 (arms 10-19): ...and its pack's later persona.yaml and CLAUDE.md section.
 #
 # A pack was applied once, at import, and nothing re-applied it: every pack fix
 # needed a by-hand root push per agent per box. This grades the sync on a fixture
@@ -20,7 +21,7 @@ trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.." || exit 1
 
 TMP="$(mktemp -d /tmp/pack-sync-unit.XXXXXX)"
-for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/registry.sh cmd_skill.sh cmd_pack.sh; do
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/registry.sh lib/agent_setup.sh cmd_skill.sh cmd_pack.sh; do
   # shellcheck source=/dev/null
   source "src/$f"
 done
@@ -80,7 +81,7 @@ is "1g owner-added skill untouched" "$(_pack_tree_sha "$SK/owner-tool")" "$owner
 is "1h owner-added skill not in the record" "$(rec '.skills["owner-tool"] // "none"')" '"none"'
 is "1i the record holds the installed hashes" "$(rec '.skills.mail')" "\"$(_pack_tree_sha "$SK/mail")\""
 [[ -f "$PENDING_RESTART_DIR/maya" ]] && ok_ "1j a restart is owed (marker, not a restart here)" || bad_ "1j no restart marker for a changed agent"
-is "1k persona/CLAUDE.md named as not synced" "$(jq -c .notSynced <<<"$out")" '["persona.yaml","CLAUDE.md"]'
+is "1k a pack with no persona/CLAUDE.md reports both absent" "$(jq -c '[.persona.status, .claudeMd.status]' <<<"$out")" '["absent","absent"]'
 
 echo "== 2. same pack again: nothing changes, no restart =="
 rm -rf "$PENDING_RESTART_DIR"
@@ -161,6 +162,250 @@ grep -q '_pack_record_write "$as" "$pk_src" "$pk_slug"' <<<"$imp" && ok_ "9a cmd
 first=$(rec .importedAt)
 _pack_record_write maya marketplace testpack '{}'
 is "9b a later write keeps importedAt" "$(rec .importedAt)" "$first"
+
+# ---------------------------------------------------------------------------
+# DIVE-5211: the identity members. The live instructions file is the pack's
+# section PREPENDED by persona_install_doc, then a tail the CLI owns — so only
+# the section may move, and only while it is still exactly what the pack put in.
+# ---------------------------------------------------------------------------
+IH="$AGENT_HOME_ROOT/agent-olga/.claude"; MD="$IH/CLAUDE.md"
+TAIL=$'## Role\nYou report to main.\n'
+# mk_idpack <dir> <section-line> <voice> — a pack named `idpack` whose CLAUDE.md
+# and registry persona call the agent by the PACK's name (import renames it).
+mk_idpack() {
+  mk_pack "$1"
+  jq '.agentName = "idpack"' "$1/manifest.json" >"$1/m" && mv "$1/m" "$1/manifest.json"
+  printf '# Idpack\nYou are Idpack, the office manager.\n%s\n' "$2" >"$1/CLAUDE.md"
+  printf 'name: Idpack\nvoice:\n  audio: %s\n' "$3" >"$1/registry-persona.yaml"
+}
+# What import would have left on disk: the renamed section, "\n", the tail.
+installed() { printf '# Olga\nYou are Olga, the office manager.\n%s\n\n%s' "$1" "$TAIL"; }
+sha() { sha256sum <"$1" | cut -d' ' -f1; }
+markers() { ls "$PENDING_RESTART_DIR" 2>/dev/null | wc -l | tr -d ' '; }
+mkdir -p "$IH"
+installed "Answer mail within a day." >"$MD"
+jq '.agents.olga = {type:"claude", pack:{source:"marketplace", slug:"idpack"}}' "$REGISTRY" >"$TMP/r" && mv "$TMP/r" "$REGISTRY"
+sync1() { _pack_sync_one olga "" 0 1; }
+
+echo "== 10. first sync of an agent hired before the record: baseline the section, install the persona =="
+FIX_PACK="$TMP/i1"; mk_idpack "$FIX_PACK" "Answer mail within a day." Kore
+rm -rf "$PENDING_RESTART_DIR"; before=$(sha "$MD")
+out=$(sync1); rc=$?
+is "10a rc 0" "$rc" 0
+is "10b the section is baselined, not rewritten" "$(jq -r .claudeMd.status <<<"$out")" baselined
+is "10c CLAUDE.md byte-identical" "$(sha "$MD")" "$before"
+is "10d persona.yaml added" "$(jq -r .persona.status <<<"$out")" added
+grep -q 'audio: Kore' "$IH/persona.yaml" && ok_ "10e persona body landed" || bad_ "10e persona body missing"
+grep -q '^name: Olga' "$IH/persona.yaml" && bad_ "10f registry persona was renamed (import installs it as-is)" || ok_ "10f registry persona installed as-is, like import"
+is "10g the record holds the section's size" "$(rec .claudeMd.bytes olga)" "$(installed "Answer mail within a day." | head -c -$(( ${#TAIL} + 1 )) | wc -c | tr -d ' ')"
+is "10h the record holds the persona's sha" "$(rec .persona olga)" "\"$(sha "$IH/persona.yaml")\""
+is "10i one restart marker (the persona changed)" "$(markers)" 1
+is "10j status changed" "$(jq -r .status <<<"$out")" changed
+
+echo "== 11. same pack again: unchanged, no restart =="
+rm -rf "$PENDING_RESTART_DIR"
+out=$(sync1)
+is "11a status unchanged" "$(jq -r .status <<<"$out")" unchanged
+is "11b section unchanged" "$(jq -r .claudeMd.status <<<"$out")" unchanged
+is "11c persona unchanged" "$(jq -r .persona.status <<<"$out")" unchanged
+is "11d no restart marker" "$(markers)" 0
+
+echo "== 12. pack bumps a CLAUDE.md line and a persona field: an unedited agent gets both, one restart =="
+FIX_PACK="$TMP/i2"; mk_idpack "$FIX_PACK" "Answer mail within an hour." Puck
+printf 'Owner note appended below the section.\n' >>"$MD"   # a TAIL edit is the owner's, and survives
+want_tail=$(tail -c +"$(( $(jq -r '.agents.olga.pack.claudeMd.bytes' "$REGISTRY") + 1 ))" "$MD")
+out=$(sync1); rc=$?
+is "12a rc 0" "$rc" 0
+is "12b section updated" "$(jq -r .claudeMd.status <<<"$out")" updated
+is "12c persona updated" "$(jq -r .persona.status <<<"$out")" updated
+grep -q 'within an hour' "$MD" && ok_ "12d the new line landed" || bad_ "12d new CLAUDE.md line missing"
+grep -q 'within a day' "$MD" && bad_ "12e the old line survived" || ok_ "12e the old line is gone"
+[[ "$(head -1 "$MD")" == '# Olga' ]] && ok_ "12f the swapped section is renamed for the agent" || bad_ "12f section not renamed: $(head -1 "$MD")"
+is "12g the tail (CLI blocks + owner note) is kept byte-for-byte" "$(tail -c +"$(( $(jq -r '.agents.olga.pack.claudeMd.bytes' "$REGISTRY") + 1 ))" "$MD")" "$want_tail"
+grep -q 'audio: Puck' "$IH/persona.yaml" && ok_ "12h persona field landed" || bad_ "12h persona not refreshed"
+is "12i exactly one restart marker" "$(markers)" 1
+is "12j status changed" "$(jq -r .status <<<"$out")" changed
+
+echo "== 13. and again: unchanged =="
+rm -rf "$PENDING_RESTART_DIR"
+out=$(sync1)
+is "13a status unchanged" "$(jq -r .status <<<"$out")" unchanged
+is "13b no restart marker" "$(markers)" 0
+FIX_PACK="$TMP/i2b"; mk_idpack "$FIX_PACK" "Answer mail within two hours." Puck
+out=$(sync1)
+is "13c a section-only change is updated" "$(jq -r .claudeMd.status <<<"$out")" updated
+is "13d ...with the persona unchanged" "$(jq -r .persona.status <<<"$out")" unchanged
+is "13e ...and it alone owes a restart" "$(markers)" 1
+rm -rf "$PENDING_RESTART_DIR"
+
+echo "== 14. the owner edited the section: left alone, reported as drift, never clobbered =="
+sed -i 's/within two hours/within ten minutes, always/' "$MD"
+before=$(sha "$MD")
+FIX_PACK="$TMP/i3"; mk_idpack "$FIX_PACK" "Answer mail within a week." Puck
+out=$(sync1); rc=$?
+is "14a rc 0 (drift is not a failure)" "$rc" 0
+is "14b section reported as drift" "$(jq -r .claudeMd.status <<<"$out")" drift
+jq -e '.claudeMd.reason | test("edited")' <<<"$out" >/dev/null && ok_ "14c drift says why" || bad_ "14c no drift reason"
+is "14d the edited file is byte-identical" "$(sha "$MD")" "$before"
+is "14e no restart for drift alone" "$(markers)" 0
+is "14f status unchanged" "$(jq -r .status <<<"$out")" unchanged
+grep -q 'CLAUDE.md section drift' < <(JSON_MODE=0 cmd_pack_sync olga 2>&1 >/dev/null) && ok_ "14g the prose line names the drift" || bad_ "14g prose line silent on drift"
+
+echo "== 15. the owner edited persona.yaml: left alone =="
+printf 'name: Olga (mine)\n' >"$IH/persona.yaml"; before=$(sha "$IH/persona.yaml")
+FIX_PACK="$TMP/i4"; mk_idpack "$FIX_PACK" "Answer mail within a week." Charon
+out=$(sync1)
+is "15a persona drift" "$(jq -r .persona.status <<<"$out")" drift
+is "15b the owner's persona is untouched" "$(sha "$IH/persona.yaml")" "$before"
+
+echo "== 16. no record and the file is not the current section: left alone, drift =="
+mkdir -p "$AGENT_HOME_ROOT/agent-pia/.claude"
+printf '# Pia\nAn older pack version, or a hand edit.\n\n%s' "$TAIL" >"$AGENT_HOME_ROOT/agent-pia/.claude/CLAUDE.md"
+before=$(sha "$AGENT_HOME_ROOT/agent-pia/.claude/CLAUDE.md")
+jq '.agents.pia = {type:"claude", pack:{source:"marketplace", slug:"idpack"}}' "$REGISTRY" >"$TMP/r" && mv "$TMP/r" "$REGISTRY"
+out=$(_pack_sync_one pia "" 0 1)
+is "16a unrecorded mismatch is drift" "$(jq -r .claudeMd.status <<<"$out")" drift
+jq -e '.claudeMd.reason | test("no install record")' <<<"$out" >/dev/null && ok_ "16b ...and says there was no record" || bad_ "16b reason"
+is "16c file untouched" "$(sha "$AGENT_HOME_ROOT/agent-pia/.claude/CLAUDE.md")" "$before"
+is "16d no section recorded for it" "$(rec '.claudeMd // "none"' pia)" '"none"'
+# The pack dropped its section's last line: the live file STARTS with the new
+# section's bytes, but the section it holds runs on. Baselining there would put
+# the dropped line in the tail forever, so it must not match.
+mkdir -p "$AGENT_HOME_ROOT/agent-rex/.claude"
+printf '# Rex
+You are Rex, the office manager.
+Answer mail within a day.
+A closing line the pack later dropped.
+
+%s' "$TAIL" >"$AGENT_HOME_ROOT/agent-rex/.claude/CLAUDE.md"
+jq '.agents.rex = {type:"claude", pack:{source:"marketplace", slug:"idpack"}}' "$REGISTRY" >"$TMP/r" && mv "$TMP/r" "$REGISTRY"
+FIX_PACK="$TMP/i1"; out=$(_pack_sync_one rex "" 0 0)
+is "16e a section that runs on past the pack's is not baselined" "$(jq -r .claudeMd.status <<<"$out")" drift
+
+echo "== 17. --dry-run writes neither member =="
+jq '.agents.dry = {type:"claude", pack:{source:"marketplace", slug:"idpack"}}' "$REGISTRY" >"$TMP/r" && mv "$TMP/r" "$REGISTRY"
+DH="$AGENT_HOME_ROOT/agent-dry/.claude"; mkdir -p "$DH"
+printf '# Dry\nYou are Dry, the office manager.\nAnswer mail within a day.\n\n%s' "$TAIL" >"$DH/CLAUDE.md"
+FIX_PACK="$TMP/i1"; _pack_sync_one dry "" 0 0 >/dev/null     # baseline at v1
+FIX_PACK="$TMP/i4"; before=$(sha "$DH/CLAUDE.md"); regb=$(cat "$REGISTRY"); rm -f "$DH/persona.yaml"
+out=$(_pack_sync_one dry "" 1 1)
+is "17a status would-change" "$(jq -r .status <<<"$out")" would-change
+is "17b section would update" "$(jq -r .claudeMd.status <<<"$out")" updated
+is "17c file unchanged" "$(sha "$DH/CLAUDE.md")" "$before"
+[[ ! -e "$DH/persona.yaml" ]] && ok_ "17d no persona written" || bad_ "17d persona written on a dry run"
+is "17e registry unchanged" "$(cat "$REGISTRY")" "$regb"
+
+echo "== 18. a pack persona naming a signing key is never installed with it =="
+FIX_PACK="$TMP/i5"; mk_idpack "$FIX_PACK" "Answer mail within a week." Charon
+rm -f "$FIX_PACK/registry-persona.yaml"
+printf 'name: Idpack\nvoice:\n  audio: Charon\next:\n  5dive:\n    signing_key: SECRETKEY\n' >"$FIX_PACK/persona.yaml"
+rm -f "$DH/persona.yaml"
+out=$(_pack_sync_one dry "" 0 0)
+[[ -f "$DH/persona.yaml" ]] && ok_ "18a the stripped persona is installed" || bad_ "18a persona missing: $out"
+grep -q 'SECRETKEY\|signing_key' "$DH/persona.yaml" 2>/dev/null && bad_ "18b the signing key reached the seat" || ok_ "18b no signing key on the seat"
+grep -q '^name: Dry' "$DH/persona.yaml" && ok_ "18c the pack's own persona is renamed, as import does" || bad_ "18c pack persona not renamed"
+grep -rq SECRETKEY "$REGISTRY" "$AGENT_HOME_ROOT" && bad_ "18d the key was written somewhere" || ok_ "18d the key was written nowhere"
+
+echo "== 19. a codex seat: the section at the head of AGENTS.md, the return-channel doc kept =="
+CH="$AGENT_HOME_ROOT/agent-cody/.codex"; mkdir -p "$CH"
+CODEX_TAIL=$'# Return channel (DIVE-1410)\nReply with 5dive agent send.\n'
+printf '# Cody\nYou are Cody, the office manager.\nAnswer mail within a day.\n\n%s' "$CODEX_TAIL" >"$CH/AGENTS.md"
+jq '.agents.cody = {type:"codex", pack:{source:"marketplace", slug:"idpack"}}' "$REGISTRY" >"$TMP/r" && mv "$TMP/r" "$REGISTRY"
+FIX_PACK="$TMP/i1"; out=$(_pack_sync_one cody "" 0 0)
+is "19a baselined on AGENTS.md" "$(jq -r .claudeMd.status <<<"$out")" baselined
+FIX_PACK="$TMP/i2"; out=$(_pack_sync_one cody "" 0 0)
+is "19b updated" "$(jq -r .claudeMd.status <<<"$out")" updated
+grep -q 'within an hour' "$CH/AGENTS.md" && ok_ "19c new line landed in AGENTS.md" || bad_ "19c AGENTS.md not updated"
+[[ "$(tail -c ${#CODEX_TAIL} "$CH/AGENTS.md")" == "${CODEX_TAIL%$'\n'}" ]] && ok_ "19d return-channel doc kept" || bad_ "19d return-channel doc lost"
+[[ ! -e "$AGENT_HOME_ROOT/agent-cody/.claude/CLAUDE.md" ]] && ok_ "19e no stray ~/.claude/CLAUDE.md on a codex seat" || bad_ "19e wrote ~/.claude/CLAUDE.md on a codex seat"
+
+echo "== 20. import records the section and the persona =="
+grep -q 'pk_members=$(jq -nc --arg s "$(_pack_file_sha "$stage/CLAUDE.md")"' <<<"$imp" && ok_ "20a cmd_import records the installed section" || bad_ "20a cmd_import does not record the section"
+grep -q '_pack_record_write "$as" "$pk_src" "$pk_slug" .* "$pk_members"' <<<"$imp" && ok_ "20b ...and passes it to the record" || bad_ "20b section not passed to the record"
+_pack_record_write olga marketplace idpack '{}' '{}'
+is "20c a write that names no member keeps the old member record" "$(rec '.claudeMd | type' olga)" '"object"'
+
+echo "== 21. persona.yaml is a link to a dir: never written through, the dir stays empty =="
+# quinn, DIVE-5211 iter 1: the live name resolved through a link, and `mv -f` put the
+# temp INTO the dir it pointed at (as root: an agent-owned file in any root-only dir).
+lnk_agent() { # <name> — an agent hired from idpack, its section installed as import left it
+  local h="$AGENT_HOME_ROOT/agent-$1/.claude"; mkdir -p "$h"
+  printf '# %s\nYou are %s, the office manager.\nAnswer mail within a day.\n\n%s' "${1^}" "${1^}" "$TAIL" >"$h/CLAUDE.md"
+  jq --arg n "$1" '.agents[$n] = {type:"claude", pack:{source:"marketplace", slug:"idpack"}}' "$REGISTRY" >"$TMP/r" && mv "$TMP/r" "$REGISTRY"
+}
+lnk_agent lina; LH="$AGENT_HOME_ROOT/agent-lina/.claude"
+mkdir -p "$TMP/victim-p"; ln -s "$TMP/victim-p" "$LH/persona.yaml"
+FIX_PACK="$TMP/i1"; out=$(_pack_sync_one lina "" 0 0)
+is "21a the persona is reported drift, not added/updated" "$(jq -r .persona.status <<<"$out")" drift
+is "21b the linked dir is still empty" "$(ls -A "$TMP/victim-p" | wc -l | tr -d ' ')" 0
+[[ -L "$LH/persona.yaml" ]] && ok_ "21c the link itself is left alone" || bad_ "21c the link was replaced"
+is "21d no persona sha recorded for it" "$(rec '.persona // "none"' lina)" '"none"'
+is "21e no temp left behind" "$(find "$LH" -maxdepth 1 -name '*pack-sync*' | wc -l | tr -d ' ')" 0
+
+echo "== 22. CLAUDE.md is a link to a dir: never written through, the dir stays empty =="
+lnk_agent lena; LH="$AGENT_HOME_ROOT/agent-lena/.claude"
+FIX_PACK="$TMP/i1"; _pack_sync_one lena "" 0 0 >/dev/null   # baseline: a record exists, so only the link stops the swap
+mv "$LH/CLAUDE.md" "$TMP/lena-md"; mkdir -p "$TMP/victim-c"; ln -s "$TMP/victim-c" "$LH/CLAUDE.md"
+FIX_PACK="$TMP/i2"; out=$(_pack_sync_one lena "" 0 0)
+is "22a the section is reported drift, not updated" "$(jq -r .claudeMd.status <<<"$out")" drift
+jq -e '.claudeMd.reason | test("symlink")' <<<"$out" >/dev/null && ok_ "22b drift says it is a link" || bad_ "22b reason: $out"
+is "22c the linked dir is still empty" "$(ls -A "$TMP/victim-c" | wc -l | tr -d ' ')" 0
+[[ -L "$LH/CLAUDE.md" ]] && ok_ "22d the link itself is left alone" || bad_ "22d the link was replaced"
+# ...and a link to a FILE that starts with the recorded section is refused too.
+rm -f "$LH/CLAUDE.md"; ln -s "$TMP/lena-md" "$LH/CLAUDE.md"; before=$(sha "$TMP/lena-md")
+out=$(_pack_sync_one lena "" 0 0)
+is "22e a link to a matching file is drift too" "$(jq -r .claudeMd.status <<<"$out")" drift
+is "22f ...and its target is byte-identical" "$(sha "$TMP/lena-md")" "$before"
+
+echo "== 23. a link planted at the temp name is removed, never followed =="
+lnk_agent tami; LH="$AGENT_HOME_ROOT/agent-tami/.claude"
+FIX_PACK="$TMP/i1"; _pack_sync_one tami "" 0 0 >/dev/null
+printf 'victim p\n' >"$TMP/victim-tp"; printf 'victim c\n' >"$TMP/victim-tc"
+vp=$(sha "$TMP/victim-tp"); vc=$(sha "$TMP/victim-tc")
+ln -s "$TMP/victim-tp" "$LH/.persona.yaml.pack-sync.$$"; ln -s "$TMP/victim-tc" "$LH/.CLAUDE.md.pack-sync.$$"
+FIX_PACK="$TMP/i2"; out=$(_pack_sync_one tami "" 0 0)
+is "23a persona still updated" "$(jq -r .persona.status <<<"$out")" updated
+is "23b section still updated" "$(jq -r .claudeMd.status <<<"$out")" updated
+is "23c the persona temp's link target is byte-identical" "$(sha "$TMP/victim-tp")" "$vp"
+is "23d the section temp's link target is byte-identical" "$(sha "$TMP/victim-tc")" "$vc"
+[[ ! -L "$LH/persona.yaml" && -f "$LH/persona.yaml" ]] && ok_ "23e persona.yaml is a regular file" || bad_ "23e persona.yaml is a link"
+[[ ! -L "$LH/CLAUDE.md" && -f "$LH/CLAUDE.md" ]] && ok_ "23f CLAUDE.md is a regular file" || bad_ "23f CLAUDE.md is a link"
+
+echo "== 24. as root, every touch of an agent-home path runs as the agent =="
+# The nightly is root. Stub root + runuser, and log every file command root runs
+# itself on a path under the agent homes: the log must stay empty while both
+# members are really rewritten.
+lnk_agent rudi; LH="$AGENT_HOME_ROOT/agent-rudi/.claude"
+FIX_PACK="$TMP/i1"; _pack_sync_one rudi "" 0 0 >/dev/null
+ROOTLOG="$TMP/rootlog"; RULOG="$TMP/runuserlog"; : >"$ROOTLOG"; : >"$RULOG"
+_pack_is_root() { return 0; }
+runuser() { while [[ $# -gt 0 && "$1" != -- ]]; do shift; done; shift; printf '%s\n' "$1" >>"$RULOG"; AS_AGENT=1 "$@"; }
+_rg() { local c="$1" a; shift; [[ -n "${AS_AGENT:-}" ]] && return 0
+  for a in "$@"; do [[ "$a" == *"$AGENT_HOME_ROOT"* ]] && { printf '%s %s\n' "$c" "$a" >>"$ROOTLOG"; break; }; done; return 0; }
+for c in rm mv cp dd chmod chown mkdir cat head tail install ln; do
+  eval "$c() { _rg $c \"\$@\"; [[ $c == chown ]] && return 0; command $c \"\$@\"; }"
+done
+test() { _rg test "$@"; builtin test "$@"; }
+FIX_PACK="$TMP/i2"; out=$(_pack_sync_one rudi "" 0 0)
+unset -f _pack_is_root runuser _rg rm mv cp dd chmod mkdir cat head tail install ln test
+_pack_is_root() { (( EUID == 0 )); }; chown() { :; }
+is "24a persona updated as root" "$(jq -r .persona.status <<<"$out")" updated
+is "24b section updated as root" "$(jq -r .claudeMd.status <<<"$out")" updated
+grep -q 'within an hour' "$LH/CLAUDE.md" && ok_ "24c the new section landed" || bad_ "24c section not written"
+is "24d root touched no agent-home path itself" "$(cat "$ROOTLOG")" ""
+[[ -s "$RULOG" ]] && ok_ "24e the writes went through runuser ($(sort -u "$RULOG" | tr '\n' ' '))" || bad_ "24e runuser never called"
+grep -qx mv "$RULOG" && ok_ "24f the rename runs as the agent" || bad_ "24f no mv as the agent"
+
+echo "== 25. a link swapped in AFTER the checks: the rename replaces the link, never lands in its dir =="
+# The lstat checks are snapshots; the agent can swap persona.yaml for a link to a
+# dir between them and the rename. mv -T renames over the name itself.
+lnk_agent rana; LH="$AGENT_HOME_ROOT/agent-rana/.claude"
+FIX_PACK="$TMP/i1"; _pack_sync_one rana "" 0 0 >/dev/null
+mkdir -p "$TMP/victim-r"
+dd() { command dd "$@" || return; [[ "$*" == *"$LH/.persona.yaml"* ]] && { rm -f "$LH/persona.yaml"; ln -s "$TMP/victim-r" "$LH/persona.yaml"; }; return 0; }
+FIX_PACK="$TMP/i2"; out=$(_pack_sync_one rana "" 0 0); unset -f dd
+is "25a the linked dir is still empty" "$(ls -A "$TMP/victim-r" | wc -l | tr -d ' ')" 0
+[[ ! -L "$LH/persona.yaml" ]] && grep -q 'audio: Puck' "$LH/persona.yaml" && ok_ "25b the new persona replaced the link itself" || bad_ "25b persona.yaml: $(ls -l "$LH/persona.yaml")"
 
 echo "RESULT: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

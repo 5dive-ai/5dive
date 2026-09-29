@@ -1248,6 +1248,9 @@ _pack_usage() {
                                   # --all = every agent imported from a marketplace slug
                                   # (the nightly skills refresh runs this). --marketplace names
                                   # the pack for an agent hired before import recorded it.
+                                  # DIVE-5211: also refreshes ~/.claude/persona.yaml and the
+                                  # pack's SECTION at the head of the agent's CLAUDE.md (its
+                                  # tail is kept); a section the owner edited is left as drift.
 
   A pack carries an agent's portable identity (instructions, skills, settings subset),
   NEVER secrets (tokens/keys/sessions/transcripts are hard-excluded). --with-memory adds
@@ -3259,8 +3262,13 @@ cmd_import() {
   # persona.yaml / avatar.png / settings.json below stay under ~/.claude because
   # 5dive itself reads those; the persona DOC is the one that has to follow the
   # type, and on a codex seat it prepends above the DIVE-1410 return-channel doc.
+  # DIVE-5211: remember exactly which section went in at the head of the file, so
+  # `agent pack-sync` can swap in a later version and leave the tail alone.
+  local pk_members='{}'
   if [[ -f "$stage/CLAUDE.md" ]]; then
-    persona_install_doc "$as" "$type" "$stage/CLAUDE.md" || true
+    persona_install_doc "$as" "$type" "$stage/CLAUDE.md" \
+      && pk_members=$(jq -nc --arg s "$(_pack_file_sha "$stage/CLAUDE.md")" --argjson b "$(wc -c <"$stage/CLAUDE.md" | tr -d ' ')" \
+           '{claudeMd:{sha:$s, bytes:$b}}')
   fi
 
   # Preserve the OpenAgent persona.yaml (DIVE-656) so the imported agent owns its
@@ -3549,7 +3557,9 @@ cmd_import() {
   if [[ -n "$import_slug" ]]; then pk_src="marketplace"; pk_slug="$import_slug"
   elif [[ -n "$from_url" ]]; then pk_src="url"; pk_slug=$(_pack_url_slug "$from_url")
   fi
-  _pack_record_write "$as" "$pk_src" "$pk_slug" "$(_pack_skill_shas "$as" "${added[@]+"${added[@]}"}")" \
+  [[ -f "$cdir/persona.yaml" ]] \
+    && pk_members=$(jq -c --arg s "$(_pack_file_sha "$cdir/persona.yaml")" '.persona = $s' <<<"$pk_members")
+  _pack_record_write "$as" "$pk_src" "$pk_slug" "$(_pack_skill_shas "$as" "${added[@]+"${added[@]}"}")" "$pk_members" \
     || warn "could not record the pack source for '$as' — 'agent pack-sync' will need the pack named explicitly"
 
   rm -rf "$stage"
@@ -3615,8 +3625,9 @@ cmd_import() {
 # a fresh signed link, the box never holds the registry), else the marketplace
 # slug recorded at import. `--all` walks every agent with a recorded marketplace
 # pack; it is what the nightly skills refresh runs.
-# NOT YET SYNCED, on purpose (the row's second half): persona.yaml and the pack's
-# CLAUDE.md section. Both are reported in the result as `notSynced`.
+# DIVE-5211 (the second half): the same sync also brings the two identity members
+# up to date — ~/.claude/persona.yaml, and the pack's SECTION of the agent's
+# instructions file (see _pack_sync_claudemd for why only the section).
 
 # Tree hash, the same recipe cmd_skill_add records as content_sha256.
 _pack_tree_sha() {
@@ -3663,18 +3674,188 @@ _pack_skill_shas() {
   printf '%s\n' "$out"
 }
 
-# _pack_record_write <agent> <source> <slug> <skills-json> — merge into
-# .agents[<agent>].pack; importedAt is kept from the first write.
+# _pack_record_write <agent> <source> <slug> <skills-json> [<members-json>] — merge
+# into .agents[<agent>].pack; importedAt is kept from the first write. The members
+# object (DIVE-5211: `persona` = the installed persona.yaml's sha, `claudeMd` =
+# {sha, bytes} of the pack section installed at the head of the instructions file)
+# replaces only the keys it names, so a member left alone keeps its old record.
 _pack_record_write() {
-  local name="$1" src="$2" slug="$3" skills="${4:-}" reg now
+  local name="$1" src="$2" slug="$3" skills="${4:-}" members="${5:-}" reg now
   [[ -n "$skills" ]] || skills='{}'
+  [[ -n "$members" ]] || members='{}'
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   reg=$(registry_read)
   jq -e --arg n "$name" '.agents[$n]' <<<"$reg" >/dev/null 2>&1 || return 1
-  jq --arg n "$name" --arg s "$src" --arg g "$slug" --arg t "$now" --argjson k "$skills" '
+  jq --arg n "$name" --arg s "$src" --arg g "$slug" --arg t "$now" --argjson k "$skills" --argjson m "$members" '
     .agents[$n].pack = ((.agents[$n].pack // {}) as $o
-      | $o + {source:$s, slug:$g, skills:(($o.skills // {}) + $k), syncedAt:$t}
+      | $o + {source:$s, slug:$g, skills:(($o.skills // {}) + $k), syncedAt:$t} + $m
       | .importedAt = ($o.importedAt // $t))' <<<"$reg" | registry_write
+}
+
+_pack_file_sha() { [[ -f "$1" ]] && sha256sum <"$1" | cut -d' ' -f1; }
+
+# The nightly runs this sync as ROOT (5dive-refresh-skills.sh -> pack-sync --all),
+# inside homes the agent owns. The agent can swap any name there for a link at any
+# moment, so a root check-then-act on a path is a race root loses (quinn, DIVE-5211
+# iter 1: persona.yaml -> a dir made `mv` drop the temp INTO it, and a chown by name
+# on the temp was a chown of whatever the agent linked there). The avatar writer
+# settled the same class (DIVE-5104, _agent_avatar_as): every root access to the
+# CONTENT of an agent-home path runs AS the agent, where a swapped link reaches
+# only what the agent could already reach. Root opens only its own stage.
+_pack_is_root() { (( EUID == 0 )); }
+_pack_as() { # <agent> <cmd...>
+  local agent="$1"; shift
+  if _pack_is_root; then
+    command -v runuser >/dev/null 2>&1 || { printf 'runuser not found; refusing to touch agent-%s as root\n' "$agent" >&2; return 1; }
+    runuser -u "agent-${agent}" -- "$@"
+  else
+    "$@"
+  fi
+}
+
+# A live member the sync may replace: a regular file (or nothing) at <file>, in a
+# parent that is not a link. An lstat snapshot that gives a planted link a clear
+# status; the guard itself is that the write runs as the agent.
+_pack_live_ok() { # <file>
+  [[ ! -L "$(dirname "$1")" && ! -L "$1" ]] && { [[ ! -e "$1" ]] || [[ -f "$1" ]]; }
+}
+
+# sha of a live agent-home file, read as the agent; empty when it is not a file.
+_pack_live_sha() { # <agent> <file>
+  _pack_as "$1" test -f "$2" 2>/dev/null || return 1
+  _pack_as "$1" cat -- "$2" 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+
+# _pack_head_is <agent> <file> <bytes> <sha> -> 0 when <file> STARTS with exactly
+# the section that hashes to <sha>, and the section ends where persona_install_doc
+# ended it: at end of file, or at the newline it put between section and tail.
+# The file is read as the agent.
+_pack_head_is() {
+  local a="$1" f="$2" n="$3" sha="$4" nb
+  [[ "$n" =~ ^[0-9]+$ && -n "$sha" ]] || return 1
+  _pack_as "$a" test -f "$f" 2>/dev/null || return 1
+  [[ "$(_pack_as "$a" head -c "$n" -- "$f" 2>/dev/null | sha256sum | cut -d' ' -f1)" == "$sha" ]] || return 1
+  nb=$(_pack_as "$a" tail -c +"$((n + 1))" -- "$f" 2>/dev/null | head -c1 | od -An -tx1 | tr -d ' ')
+  [[ -z "$nb" || "$nb" == 0a ]]
+}
+
+# _pack_write_as <agent> <src> <dst> [<mode>|--reference] — install root's staged
+# <src> at <dst> AS the agent: the bytes go in on stdin (the agent cannot read
+# root's stage), the temp is created O_EXCL at a fixed name after an agent-side rm
+# (a link planted there is removed, never followed), and mv -T renames over <dst>
+# itself, never INTO a dir it resolves to. Mode: 644, or copied from the old <dst>.
+_pack_write_as() {
+  local a="$1" src="$2" dst="$3" mode="${4:-644}" tmp
+  tmp="$(dirname "$dst")/.$(basename "$dst").pack-sync.$$"
+  if { _pack_as "$a" rm -f -- "$tmp" \
+       && _pack_as "$a" dd of="$tmp" conv=excl status=none <"$src" \
+       && if [[ "$mode" == --reference ]]; then _pack_as "$a" chmod --reference="$dst" -- "$tmp"
+          else _pack_as "$a" chmod "$mode" -- "$tmp"; fi \
+       && _pack_as "$a" mv -fT -- "$tmp" "$dst"; } 2>/dev/null; then
+    return 0
+  fi
+  _pack_as "$a" rm -f -- "$tmp" 2>/dev/null
+  return 1
+}
+
+# _pack_sync_render_identity <stage> <agent> <type> — put a FETCHED pack's
+# identity members in the shape cmd_import installed them, so a sync compares
+# like with like: the signing key stripped out of persona.yaml (never adopted
+# here — import already did that once), CLAUDE.md re-rendered from a valid
+# persona.yaml (DIVE-656), the pack's name swapped for the agent's, and memory
+# inlined on a seat that does not auto-load the store (DIVE-2568). The same
+# functions import calls, in the same order. A registry persona (DIVE-5162's
+# registry-persona.yaml) is installed as-is, as import does, and one naming a
+# signing key is dropped. rc 2 = the persona could not be processed safely, and
+# neither member may be synced from this pack.
+_pack_sync_render_identity() {
+  local stage="$1" name="$2" type="$3" mem_inc orig rc=0
+  local rp="$stage/${REGISTRY_PERSONA:-registry-persona.yaml}"
+  if [[ -f "$stage/persona.yaml" ]]; then
+    _persona_strip_signing_key "$stage/persona.yaml" "$stage/.signing_key" >/dev/null 2>&1 || rc=$?
+    [[ -e "$stage/.signing_key" ]] && { shred -u "$stage/.signing_key" 2>/dev/null || rm -f "$stage/.signing_key"; }
+    (( rc == 0 || rc == 9 )) || return 2
+    grep -qF "signing_key" "$stage/persona.yaml" && return 2
+    if _persona_render_claudemd "$stage/persona.yaml" "$stage/CLAUDE.md.oa" 2>/dev/null; then
+      mv "$stage/CLAUDE.md.oa" "$stage/CLAUDE.md"
+    else
+      rm -f "$stage/CLAUDE.md.oa"
+    fi
+    rm -f "$rp"
+  elif [[ -f "$rp" ]]; then
+    grep -qF "signing_key" "$rp" && rm -f "$rp"
+    [[ -f "$rp" ]] && mv "$rp" "$stage/persona.yaml.registry"
+  fi
+  orig=$(jq -r '.agentName // empty' "$stage/manifest.json" 2>/dev/null)
+  [[ -n "$orig" ]] && _pack_rename_persona "$stage" "$orig" "$name"
+  [[ -f "$stage/persona.yaml.registry" ]] && mv "$stage/persona.yaml.registry" "$stage/persona.yaml"
+  mem_inc=$(jq -r '.includes.memory // false' "$stage/manifest.json" 2>/dev/null)
+  _pack_inline_memory_into_doc "$stage" "$type" "$mem_inc" >/dev/null 2>&1 || true
+  return 0
+}
+
+# _pack_sync_persona <stage> <agent> <rec> <dry> -> "<status> <sha>" on stdout.
+# ~/.claude/persona.yaml (the voice engine and the avatar read it there, for
+# every type). Same rule as a skill: replace when the live file is still what
+# the pack installed — or there is no record (every agent hired before this) —
+# and leave an owner's edit alone as drift.
+_pack_sync_persona() {
+  local stage="$1" name="$2" rec="$3" dry="$4" home live new rsha
+  [[ -f "$stage/persona.yaml" ]] || { echo "absent -"; return 0; }
+  home="${AGENT_HOME_ROOT:-/home}/agent-${name}"; live="$home/.claude/persona.yaml"
+  new=$(_pack_file_sha "$stage/persona.yaml")
+  _pack_live_ok "$live" || { echo "drift -"; return 0; }   # a link or a non-file: never written through
+  local lsha; lsha=$(_pack_live_sha "$name" "$live") || lsha=""
+  rsha=$(jq -r '.persona // ""' <<<"$rec")
+  if [[ "$lsha" == "$new" ]]; then echo "unchanged $new"
+  elif [[ -n "$lsha" && -n "$rsha" && "$lsha" != "$rsha" ]]; then echo "drift -"
+  elif (( dry )); then [[ -z "$lsha" ]] && echo "added -" || echo "updated -"
+  elif _pack_as "$name" mkdir -p -- "$home/.claude" 2>/dev/null && _pack_live_ok "$live" \
+       && _pack_write_as "$name" "$stage/persona.yaml" "$live" 644; then
+    [[ -z "$lsha" ]] && echo "added $new" || echo "updated $new"
+  else
+    echo "failed -"; return 1
+  fi
+}
+
+# _pack_sync_claudemd <stage> <agent> <type> <rec> <dry> -> "<status> <sha> <bytes>"
+# The instructions file is NOT the pack's CLAUDE.md: persona_install_doc PREPENDED
+# the pack's section to whatever the seat already held, and the CLI appends its
+# own blocks after it (role, reporting line, plugin sections). So the unit a sync
+# may touch is the SECTION at the head of the file, never the file:
+#   - the record holds the {sha, bytes} of the section as installed; while the file
+#     still starts with exactly that section, the new section is swapped in and
+#     every byte after it (the tail) is kept;
+#   - a file that already starts with the pack's current section is in sync (a
+#     by-hand push that already landed this version included) and is re-recorded;
+#   - with no record (hired before this), a file that starts with the current
+#     section is BASELINED; any other file is left alone, since an older pack
+#     version and an owner's edit look the same without one;
+#   - anything else was edited by the agent or its owner: left alone, `drift`.
+_pack_sync_claudemd() {
+  local stage="$1" name="$2" type="$3" rec="$4" dry="$5" md new nb osha ob
+  [[ -s "$stage/CLAUDE.md" ]] || { echo "absent - -"; return 0; }
+  md=$(PERSONA_HOME_ROOT="${AGENT_HOME_ROOT:-${PERSONA_HOME_ROOT:-/home}}" persona_target "$name" "$type" 2>/dev/null)     || { echo "failed - -"; return 1; }
+  new=$(_pack_file_sha "$stage/CLAUDE.md"); nb=$(wc -c <"$stage/CLAUDE.md" | tr -d ' ')
+  osha=$(jq -r '.claudeMd.sha // ""' <<<"$rec"); ob=$(jq -r '.claudeMd.bytes // ""' <<<"$rec")
+  _pack_live_ok "$md" || { echo "drift-link - -"; return 0; }   # a link or a non-file: never written through
+  if [[ -n "$osha" ]] && _pack_head_is "$name" "$md" "$ob" "$osha"; then
+    if [[ "$osha" == "$new" ]]; then echo "unchanged $new $nb"; return 0; fi
+    (( dry )) && { echo "updated - -"; return 0; }
+    # The new file is assembled in root's stage: the pack section, then the tail
+    # READ AS THE AGENT (a link swapped in after the head check yields only what
+    # the agent could read), then installed as the agent with the old mode.
+    if { cat "$stage/CLAUDE.md" && _pack_as "$name" tail -c +"$((ob + 1))" -- "$md"; } >"$stage/.md.new" 2>/dev/null \
+       && _pack_write_as "$name" "$stage/.md.new" "$md" --reference; then
+      echo "updated $new $nb"
+    else
+      echo "failed - -"; return 1
+    fi
+  elif _pack_head_is "$name" "$md" "$nb" "$new"; then
+    [[ -n "$osha" ]] && echo "unchanged $new $nb" || echo "baselined $new $nb"
+  else
+    [[ -n "$osha" ]] && echo "drift - -" || echo "drift-unrecorded - -"
+  fi
 }
 
 # _pack_sync_one <agent> <url> <dry:0|1> <restart:0|1> [<marketplace-slug>] — one
@@ -3773,14 +3954,28 @@ _pack_sync_one() {
       failed+=("$sk")
     fi
   done < <(jq -r '.skills[]? // empty' "$stage/manifest.json")
-  rm -rf "$stage"
 
-  local changed=$(( ${#added[@]} + ${#updated[@]} )) restart_note="none"
+  # DIVE-5211: the identity members — persona.yaml, and the pack's section of the
+  # instructions file. Rendered first into the shape import installed them in.
+  local members='{}' p_st="failed" p_sha="-" c_st="failed" c_sha="-" c_nb="-" mchanged=0
+  if _pack_sync_render_identity "$stage" "$name" "${type:-claude}"; then
+    read -r p_st p_sha < <(_pack_sync_persona "$stage" "$name" "$rec" "$dry")
+    read -r c_st c_sha c_nb < <(_pack_sync_claudemd "$stage" "$name" "${type:-claude}" "$rec" "$dry")
+  fi
+  rm -rf "$stage"
+  [[ "$p_sha" != "-" ]] && members=$(jq -c --arg v "$p_sha" '.persona = $v' <<<"$members")
+  [[ "$c_sha" != "-" ]] && members=$(jq -c --arg v "$c_sha" --argjson b "$c_nb" '.claudeMd = {sha:$v, bytes:$b}' <<<"$members")
+  [[ "$p_st" == added || "$p_st" == updated ]] && mchanged=$((mchanged + 1))
+  [[ "$c_st" == updated ]] && mchanged=$((mchanged + 1))
+  [[ "$p_st" == failed ]] && failed+=("persona.yaml")
+  [[ "$c_st" == failed ]] && failed+=("CLAUDE.md")
+
+  local changed=$(( ${#added[@]} + ${#updated[@]} + mchanged )) restart_note="none"
   if (( ! dry )); then
-    _pack_record_write "$name" "$src" "$slug" "$shas" \
+    _pack_record_write "$name" "$src" "$slug" "$shas" "$members" \
       || { failed+=("<pack record>"); warn "could not record the pack sync for '$name'"; }
     if (( changed > 0 && restart )); then
-      if _pending_restart_mark "$name" "pack $slug skills updated (DIVE-5205)"; then
+      if _pending_restart_mark "$name" "pack $slug updated (DIVE-5205/DIVE-5211)"; then
         restart_note="pending (next quiet moment)"
       else
         restart_note="mark-failed"
@@ -3792,9 +3987,15 @@ _pack_sync_one() {
       --argjson c "$(_j "${unchanged[@]+"${unchanged[@]}"}")" --argjson d "$(_j "${drift[@]+"${drift[@]}"}")" \
       --argjson f "$(_j "${failed[@]+"${failed[@]}"}")" --argjson m "$(_j "${managed[@]+"${managed[@]}"}")" \
       --arg r "$restart_note" --argjson dry "$dry" \
-      '.status = (if ($f|length) > 0 then "partial" elif (($a|length)+($u|length)) > 0 then (if $dry == 1 then "would-change" else "changed" end) else "unchanged" end)
+      --arg ps "$p_st" --arg cs "$c_st" --argjson mc "$mchanged" \
+      '.status = (if ($f|length) > 0 then "partial" elif (($a|length)+($u|length)+$mc) > 0 then (if $dry == 1 then "would-change" else "changed" end) else "unchanged" end)
        | .added = $a | .updated = $u | .unchanged = $c | .drift = $d | .failed = $f | .managedElsewhere = $m | .restart = $r
-       | .notSynced = ["persona.yaml", "CLAUDE.md"]' <<<"$res")
+       | .persona = {status:$ps}
+       | .claudeMd = ({status:(if $cs == "drift-unrecorded" or $cs == "drift-link" then "drift" else $cs end)}
+           + (if $cs == "drift" then {reason:"edited since the pack installed it — left alone"}
+              elif $cs == "drift-link" then {reason:"the instructions file is a symlink or not a regular file — never written through, left alone"}
+              elif $cs == "drift-unrecorded" then {reason:"no install record, and the file does not start with the current pack section — left alone"}
+              else {} end))' <<<"$res")
   printf '%s\n' "$res"
   (( ${#failed[@]} == 0 ))
 }
@@ -3834,6 +4035,8 @@ cmd_pack_sync() {
       + (if (.added|length? // 0) > 0 then "; added \(.added|join(","))" else "" end)
       + (if (.updated|length? // 0) > 0 then "; updated \(.updated|join(","))" else "" end)
       + (if (.drift|length? // 0) > 0 then "; LEFT (edited since install) \(.drift|join(","))" else "" end)
+      + (if (.persona.status // "") | test("^(added|updated|drift)$") then "; persona.yaml \(.persona.status)" else "" end)
+      + (if (.claudeMd.status // "") | test("^(updated|baselined|drift)$") then "; CLAUDE.md section \(.claudeMd.status)" + (if .claudeMd.reason then " (\(.claudeMd.reason))" else "" end) else "" end)
       + (if (.failed|length? // 0) > 0 then "; FAILED \(.failed|join(","))" else "" end)
       + (if (.restart // "none") != "none" then "; restart \(.restart)" else "" end)' <<<"${line:-null}")"
   done
