@@ -7,8 +7,9 @@
 # lower-cased name and a well-shaped name the box does not know must all stop
 # before timedatectl is asked to set anything. Then the effects: an unchanged
 # zone restarts nothing, a changed one restarts cron and exactly the ACTIVE
-# agent units systemd reports (a stray unit line is never restarted), and
-# --no-restart restarts nothing.
+# agent units systemd reports (a stray unit line is never restarted), a parked
+# agent (registry desiredState=stopped) is skipped, and --no-restart restarts
+# nothing.
 #
 # timedatectl and systemctl are driven through the _host_timedatectl /
 # _host_systemctl seams and recorded to a call log — no root, no systemd.
@@ -135,6 +136,29 @@ else
   bad "JSON reply — $out"
 fi
 [[ "$(cat "$CUR_TZ")" == "Europe/Moscow" ]] && pass "the zone is now Europe/Moscow" || bad "zone not set"
+
+echo
+echo "== a parked agent (desiredState=stopped) is never restarted =="
+# The list-then-restart window: systemd still reports daria active, the registry
+# says she was parked. A restart would bring back an agent its operator stopped.
+REGISTRY="$TMP/agents.json"
+jq -n '{agents:{maya:{}, daria:{desiredState:"stopped"}}}' > "$REGISTRY"
+reset UTC
+UNITS_OUT="$MAYA loaded active running maya"$'\n'"$DARIA loaded active running daria"$'\n'
+out=$( JSON_MODE=1; cmd_host_timezone set Europe/Moscow --json 2>"$TMP/err" ); rc=$?
+restarts=$(grep -E '^systemctl restart ' "$CALLS" | sed 's/^systemctl restart //' | tr '\n' ' ')
+if (( rc == 0 )) && [[ "$restarts" == "$MAYA " ]] && grep -q "daria' is parked" "$TMP/err" \
+   && [[ $(jq -c '.data.restarted' <<<"$out") == "[\"$MAYA\"]" ]]; then
+  pass "parked daria skipped (warned), maya (no desiredState) restarted"
+else
+  bad "parked — rc=$rc restarts='$restarts' err=$(cat "$TMP/err") out=$out"
+fi
+jq -n '{agents:{maya:{desiredState:"running"}, daria:{desiredState:"running"}}}' > "$REGISTRY"
+reset UTC
+out=$( cmd_host_timezone set Europe/Moscow 2>/dev/null )
+restarts=$(grep -E '^systemctl restart ' "$CALLS" | sed 's/^systemctl restart //' | tr '\n' ' ')
+[[ "$restarts" == "$MAYA $DARIA " ]] && pass "desiredState=running restarts both" || bad "running — restarts='$restarts'"
+unset REGISTRY
 
 echo
 echo "== --no-restart =="

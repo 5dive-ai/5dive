@@ -274,6 +274,15 @@ bounced katya && ok_t "U7 an explicit null desiredState restarts" \
 # `systemctl restart` lines are `$svc` (telegram poller) and `shelld`, not agent
 # units.
 #
+# `src/cmd_host.sh` (DIVE-5165) is GUARDED, read per call site as the note above
+# asks. Three `systemctl restart` sites: `host timezone set` restarts only units
+# systemd lists as ACTIVE, and asks `_host_agent_parked` (registry desiredState)
+# before each one, because the list is read before the restarts and a unit
+# stopped in between would be started — tests/host_timezone_unit.sh drives it
+# with a parked agent whose unit still reads active. `host unit repoint|revert`
+# restart the one unit the caller named in --unit: an OPERATOR-VERB site, not a
+# fan-out, so it can only reach a parked agent that someone named explicitly.
+#
 # A1 asserts the inventory is EXACT in both directions. A new restart path
 # anywhere in the repo turns it red — because what DIVE-4033 shipped was not a
 # wrong verdict, it was a file nobody looked at.
@@ -282,6 +291,7 @@ declare -A RESTART_PATHS=(
   [src/cmd_selfupdate.sh]=GUARDED
   [src/cmd_agent_runtime.sh]=GUARDED
   [src/cmd_heartbeat.sh]=GUARDED
+  [src/cmd_host.sh]=GUARDED
   [src/cmd_doctor.sh]=CANNOT-RESURRECT
   [src/cmd_agent_lifecycle.sh]=OPERATOR-VERB
   [src/cmd_agent_config.sh]=OPERATOR-VERB

@@ -46,7 +46,8 @@
 #   host timezone set   timedatectl list-timezones ; timedatectl set-timezone <validated zone> ;
 #                       systemctl try-restart cron.service ;
 #                       systemctl restart <each ACTIVE 5dive-agent@<name>.service, names read
-#                       back from systemd and re-validated, never from the caller>
+#                       back from systemd and re-validated, never from the caller;
+#                       a parked agent (registry desiredState=stopped) is skipped>
 #
 # There is no eval, no `sh -c`, no editor, no caller-supplied file path, no
 # caller-supplied unit-file content, and no pager anywhere in this file. Every
@@ -659,6 +660,24 @@ _host_active_agent_units() {
   return 0
 }
 
+# PARKED AGENTS ARE NOT RESTARTED (DIVE-5165, DIVE-4033). `desiredState: stopped`
+# is the operator's recorded intent (`5dive agent stop` writes it). The restart set
+# is already only the ACTIVE units, and a parked agent's unit is normally stopped,
+# so it is not in that set — but the list is read BEFORE the loop restarts, and a
+# `systemctl restart` of a unit stopped in between STARTS it. Asking the registry
+# per unit closes that window, and it also leaves a running-but-parked
+# contradiction for the operator to reconcile rather than bouncing it.
+# Same reading as cmd_selfupdate.sh's _agent_is_parked: only an explicit,
+# parseable `stopped` skips; absent field, missing registry or no jq restart.
+_host_agent_parked() {
+  local name="${1:-}" desired=""
+  [[ -n "$name" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -n "${REGISTRY:-}" && -f "$REGISTRY" ]] || return 1
+  desired=$(jq -r --arg n "$name" '.agents[$n].desiredState // "running"' "$REGISTRY" 2>/dev/null) || return 1
+  [[ "$desired" == "stopped" ]]
+}
+
 cmd_host_timezone() {
   local action="" tz="" do_restart=1
   while (( $# )); do
@@ -703,6 +722,11 @@ cmd_host_timezone() {
         local u
         while read -r u; do
           [[ -n "$u" ]] || continue
+          local n="${u#5dive-agent@}"; n="${n%.service}"
+          if _host_agent_parked "$n"; then
+            warn "agent '$n' is parked (desiredState=stopped) — not restarting it; it picks up $tz when it is started"
+            continue
+          fi
           if _host_systemctl restart "$u" >&2; then restarted+=("$u"); fi
         done < <(_host_active_agent_units)
       fi
