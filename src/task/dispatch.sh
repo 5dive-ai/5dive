@@ -84,6 +84,12 @@ _task_usage() {
                                                 is NOT the ident number
   orphans [--all]                               rows whose assignee/verifier/creator is not a
                                                 registered agent (undispatchable, DIVE-3344)
+  rebalance [--dry-run|--apply]                 move un-started todo rows from an overloaded seat to an
+                                                idle sibling with quota, inside a declared pool. Bare
+                                                or --dry-run prints the next heartbeat pass and changes
+                                                nothing. Configure: rebalance pool <name> <seat,seat>,
+                                                rebalance pools, rebalance set min-todo=4 max-moves=2
+                                                (DIVE-5191). Off until a pool is declared.
   doctor [--fix <id> [--to=<agent>]           every open row nothing will dispatch, and WHY —
          [--dry-run]]                           no revisit anchor, a stale blocker edge, a park
                                                 past its wake or with none, or a seat nothing
@@ -408,6 +414,7 @@ cmd_task() {
     wip-cap-install) cmd_task_wip_cap_install "$@" ;;
     orphans)         cmd_task_orphans "$@" ;;       # DIVE-3344 undispatchable rows
     doctor)          cmd_task_doctor "$@" ;;        # DIVE-3784 every undispatchable class
+    rebalance)       cmd_task_rebalance "$@" ;;     # DIVE-5191 un-started rows between sibling seats
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;

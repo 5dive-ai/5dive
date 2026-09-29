@@ -6027,6 +6027,18 @@ _hb_blocked_sweep() {
   return 0
 }
 
+# DIVE-5191 — the heartbeat's half of `task rebalance` (src/task/rebalance.sh).
+# The pool pref is read first and alone, so a box with no pool pays one KV read.
+_hb_rebalance_sweep() {  # <now> <usage-json>
+  local now="$1" usage="${2:-}" pools moved
+  pools=$(db "SELECT value FROM task_prefs WHERE key='rebalance_pools';" 2>/dev/null) || pools=""
+  [[ -n "$pools" && "$pools" != "{}" ]] || return 0
+  declare -F _rebal_apply >/dev/null 2>&1 || { _hb_log "[rebalance] PACKAGING DEFECT: _rebal_apply is not defined in this process (src/task/rebalance.sh missing from the bundle or this harness's sources)"; return 0; }
+  moved=$(_rebal_apply "$now" "$usage") || moved=""
+  [[ -n "$moved" ]] && _hb_log "[rebalance] moved: $(tr '\n' ' ' <<<"$moved")(lead notified: ${_HB_ESCALATE_TO:-nobody})"
+  return 0
+}
+
 _hb_gate_shipped_sweep() {
   local grow gid gident gtype gowner repo hit _c_epoch _asked
   # Normalize the repo allow-list: commas or spaces both separate.
@@ -8938,6 +8950,11 @@ cmd_heartbeat_tick() {
   # before the wake loop so a just-recovered todo is eligible this same tick. Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_blocked_sweep || _hb_log "[blocked-sweep] pass errored (non-fatal)"
+  # DIVE-5191: hand un-started todo rows from an overloaded pool seat to an idle
+  # sibling with quota. AFTER the blocked sweep (a row it just freed counts) and
+  # BEFORE the wake loop (a moved row is picked up this same tick). Off until a
+  # pool is declared. Same isolation contract as every other sweep.
+  _hb_rebalance_sweep "$now" "$_HB_PACE_USAGE" || _hb_log "[rebalance] pass errored (non-fatal)"
   # DIVE-1140: flag open gates whose fix already merged so the overnight recap
   # stops surfacing ghost gates. Flag-only, never auto-closes. Same isolation.
   _hb_gate_shipped_sweep || _hb_log "[gate-shipped] pass errored (non-fatal)"

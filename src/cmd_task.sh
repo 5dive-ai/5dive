@@ -39,4 +39,5 @@ declare -F _task_agent_channel >/dev/null 2>&1 || . "$_task_src_dir/task/notify.
 declare -F cmd_task_coordinator >/dev/null 2>&1 || . "$_task_src_dir/task/inbox.sh"
 declare -F _loop_answer_is_bounce >/dev/null 2>&1 || . "$_task_src_dir/task/answer.sh"
 declare -F cmd_task_doctor >/dev/null 2>&1 || . "$_task_src_dir/task/doctor.sh"
+declare -F cmd_task_rebalance >/dev/null 2>&1 || . "$_task_src_dir/task/rebalance.sh"
 unset _task_src_dir
