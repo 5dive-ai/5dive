@@ -159,9 +159,38 @@ refuse "P13 a URL carrying a newline is refused (no second key smuggled into the
   swan set "telegram.account-url=https://x.example
 TELEGRAM_PROFILE=default"
 refuse "P14 a codex seat is refused, naming why (its bridge has no lite profile)" "claude-only" cdx set telegram.profile=lite
-refuse "P15 a claude seat with no telegram channel refuses before any write" "require channels=telegram" mute set telegram.profile=lite
+refuse "P15 an account URL on a claude seat with no telegram channel refuses before any write" \
+  "requires channels=telegram" mute set "telegram.account-url=$URL"
+refuse "P15b profile + account URL together on that seat refuse as a whole (no half write)" \
+  "requires channels=telegram" mute set telegram.profile=lite "telegram.account-url=$URL"
 [[ ! -e "$TMP/home/agent-mute" ]] \
   && ok_t "P16 the refused seat got no channel dir created" || bad_t "P16 dir created on refusal" ""
+
+# ------------- P17-P20 (DIVE-5227): profile alone is STAGED on a seat with no bot
+# A Mini App hire picks the profile at hire time; the bot is connected later.
+MUTE_ENV="$TMP/home/agent-mute/.claude/channels/telegram/.env"
+rc=$(run_cfg mute set telegram.profile=lite)
+[[ "$rc" == "0" && "$(grep -c '^TELEGRAM_PROFILE=lite$' "$MUTE_ENV" 2>/dev/null)" == "1" ]] \
+  && ok_t "P17 telegram.profile=lite on a claude seat with no bot stages the line (RED on main: require channels=telegram)" \
+  || bad_t "P17 profile not staged" "rc=$rc err=$(<"$TMP/err") env=$(cat "$MUTE_ENV" 2>/dev/null)"
+[[ "$(jq -r '.agents.mute.channels' "$TMP/reg")" == "none" ]] \
+  && ok_t "P18 staging does not attach a channel (channels stays none)" \
+  || bad_t "P18 channels changed" "$(cat "$TMP/reg")"
+[[ "$(stat -c %a "$MUTE_ENV" 2>/dev/null)" == "600" ]] \
+  && ok_t "P19 the staged .env is 0600" || bad_t "P19 mode" "$(stat -c %a "$MUTE_ENV" 2>/dev/null)"
+# The later connect: the REAL claude token writer, as `channels=telegram telegram.token=-` runs it.
+TOKEN3='3:cccccccccccccccccccccccc'
+if [[ -s "$TMP/token-writer.sh" ]] && HOME="$TMP/home/agent-mute" TOKEN="$TOKEN3" bash "$TMP/token-writer.sh"; then
+  [[ "$(grep -c '^TELEGRAM_PROFILE=lite$' "$MUTE_ENV")" == "1" && "$(grep '^TELEGRAM_BOT_TOKEN=' "$MUTE_ENV" | cut -d= -f2-)" == "$TOKEN3" ]] \
+    && ok_t "P20 connecting the bot later (the real token writer) keeps the staged lite line" \
+    || bad_t "P20 connect dropped the staged line" "$(cat "$MUTE_ENV")"
+else
+  bad_t "P20 could not run the token writer" ""
+fi
+rc=$(run_cfg mute set telegram.profile=default)
+[[ "$rc" == "0" && "$(grep -c '^TELEGRAM_PROFILE=' "$MUTE_ENV")" == "0" ]] \
+  && ok_t "P21 telegram.profile=default un-stages it" \
+  || bad_t "P21 default did not remove" "rc=$rc $(cat "$MUTE_ENV")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
