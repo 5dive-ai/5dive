@@ -336,7 +336,8 @@ rm -rf "$TMP/ibin"; why=$(inst 0000000000000000000000000000000000000000000000000
 (( irc != 0 )) && [[ "$why" == "sha256 mismatch"* && ! -e "$TMP/ibin/himalaya" ]] \
   && okk 'a sha256 mismatch refuses the install and installs nothing' || bad "sha mismatch: rc=$irc why=$why"
 rm -rf "$TMP/ibin"; why=$(inst "$fsha"); irc=$?
-(( irc == 0 )) && [[ "$(stat -c %a "$TMP/ibin/himalaya" 2>/dev/null)" == 755 ]] && "$TMP/ibin/himalaya" --version | grep -q '^himalaya v2.1.0' \
+hv=$("$TMP/ibin/himalaya" --version 2>/dev/null)
+(( irc == 0 )) && [[ "$(stat -c %a "$TMP/ibin/himalaya" 2>/dev/null)" == 755 ]] && grep -q '^himalaya v2.1.0' <<<"$hv" \
   && okk 'a matching sha256 installs the binary 0755' || bad "install ok: rc=$irc why=$why"
 OUT=$( ( PATH="$TMP/wrap:$PATH"; export TMPDIR="$TMP/agenttmp"; JSON_MODE=1; export AGENT_MAIL_HIMALAYA_BIN="$TMP/nobin/himalaya" CURL_FIXTURE="$TMP/fixture.tgz"
          _agent_mail_himalaya_asset() { printf 'https://example.invalid/h.tgz %s\n' 0000; }
