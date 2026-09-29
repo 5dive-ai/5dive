@@ -185,7 +185,7 @@ markers() { ls "$PENDING_RESTART_DIR" 2>/dev/null | wc -l | tr -d ' '; }
 mkdir -p "$IH"
 installed "Answer mail within a day." >"$MD"
 jq '.agents.olga = {type:"claude", pack:{source:"marketplace", slug:"idpack"}}' "$REGISTRY" >"$TMP/r" && mv "$TMP/r" "$REGISTRY"
-sync1() { _pack_sync_one olga "" "${1:-0}" 1; }
+sync1() { _pack_sync_one olga "" 0 1; }
 
 echo "== 10. first sync of an agent hired before the record: baseline the section, install the persona =="
 FIX_PACK="$TMP/i1"; mk_idpack "$FIX_PACK" "Answer mail within a day." Kore
