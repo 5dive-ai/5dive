@@ -192,6 +192,21 @@ out=$(_gate_branch_refs_from_text 'cut branch dive-3264-retry-v1.2 for the secon
 [[ "$out" == "dive-3264-retry-v1.2" ]] \
   && ok_t 'DIVE-3265: a dotted branch name that is not an ARTIFACT extension survives' \
   || bad_t 'DIVE-3265: dotted non-extension branch survives' "out=$out — the filter must be an extension denylist, not 'any dotted suffix'"
+# Sentence-final punctuation (luca, 2026-09-29, DIVE-639 close on 0.60.0): the class
+# takes '.', so the full stop after a filename or branch joined the token.
+# MUTATION GRADE: drop `s/\.+$//` from the extractor's sed -> the first two FAIL.
+out=$(_gate_branch_refs_from_text 'evidence in polymer-reports/builder/dive341/DIVE-639-2026-09-29.md.' 'DIVE-639')
+[[ -z "$out" ]] \
+  && ok_t 'trailing full stop: an artifact that ENDS a sentence is still not a branch' \
+  || bad_t 'trailing full stop: artifact at sentence end must not extract' "out=$out — the '.' defeated the extension filter"
+out=$(_gate_branch_refs_from_text 'landed on branch dive-639-fix-canon.' 'DIVE-639')
+[[ "$out" == "dive-639-fix-canon" ]] \
+  && ok_t 'trailing full stop: a real branch at sentence end extracts WITHOUT the dot' \
+  || bad_t 'trailing full stop: branch at sentence end extracts clean' "out=$out — looked up with the dot, it can never be found"
+out=$(_gate_branch_refs_from_text 'see dive-639-notes.txt; then cut dive-639-retry-v1.2.' 'DIVE-639')
+[[ "$out" == "dive-639-retry-v1.2" ]] \
+  && ok_t 'trailing full stop: only the TRAILING dot goes — the inner v1.2 dot is kept' \
+  || bad_t 'trailing full stop: inner dot kept' "out=$out"
 
 # --- 1. THE DIVE-2556 SHAPE: unbound, result names an unlanded branch -> REFUSE
 clear_fx

@@ -1316,11 +1316,22 @@ _gate_text_names_a_ref() {
 # extension-LESS artifact path (a delivered directory, `community/designs/dive-N-x/`)
 # still reads as a branch. Unmeasured — every artifact in the measured population
 # carries an extension — and a one-line follow-up if it ever bites.
+#
+# A TRAILING FULL STOP IS NOT PART OF THE TOKEN. The capture class takes `.`
+# (branches like `dive-N-retry-v1.2` need it), so a result that ENDS a sentence on
+# the row's evidence file — "evidence in dive341/DIVE-639-2026-09-29.md." —
+# captured `dive-639-2026-09-29.md.`, which the `\.(md|…)$` suffix test above no
+# longer matches: the artifact became a branch again (the DIVE-3264 false hit,
+# through the full stop), and the close was stamped UNVERIFIED on a box with a
+# partial repo scan / would be refused on one that sees every repo. A real branch
+# at the end of a sentence broke the other way: `dive-639-fix.` was looked up with
+# the dot and could never be found. `,;:` need no trim — the class never captures
+# them — and an inner dot (`v1.2`) is not trailing, so it stays.
 _gate_branch_refs_from_text() {
   local text="$1" ident="$2"
   printf '%s\n' "$text" \
     | grep -ioE "(^|[^A-Za-z0-9])${ident}-[A-Za-z0-9][A-Za-z0-9_.-]*" 2>/dev/null \
-    | sed -E 's/^[^A-Za-z0-9]//' \
+    | sed -E 's/^[^A-Za-z0-9]//; s/\.+$//' \
     | grep -ivE '\.(md|mdx|markdown|txt|rst|patch|diff|json|ya?ml|toml|sh|bash|[jt]sx?|mjs|cjs|py|rb|go|rs|sql|log|csv|tsv|html?|pdf|png|jpe?g|gif|svg|webp|zip|gz|tgz|tar|lock|env|ini|conf|cfg)$' \
     | tr 'A-Z' 'a-z' | sort -u
 }
