@@ -178,7 +178,7 @@ telegram-app = ${ta} (box-wide, default on)" \
          reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk, reflex_key_source:$rks,
          reflex_endpoint:$re, reflex_endpoint_source:$res, reflex_api:$ra, reflex_api_source:$ras, reflex_endpoint_key:$rek,
          reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, openrouter_keys:$oks, mod_seat:$ms, telegram_app:$ta, path:$p}' \
-       --arg ms "$ms" --arg ta "$ta" --arg ok "$ok_k" --argjson oks "$okeys" \
+       --arg ms "$ms" --arg ok "$ok_k" --arg ta "$ta" --argjson oks "$okeys" \
        --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" \
        --arg pw "$pw" --arg pws "$pws" --arg p5 "$p5" --arg p5s "$p5s" \
        --arg rr "$rr" --arg rrs "$rrs" --arg rm "$rm" --arg rms "$rms" --arg re "$re" --arg res "$res" \
