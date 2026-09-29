@@ -25,7 +25,7 @@ ok_(){ PASS=$((PASS+1)); printf 'ok   %s\n' "$1"; }
 bad_(){ FAIL=$((FAIL+1)); printf 'FAIL %s — %s\n' "$1" "${2:-}"; }
 
 TMPD="$(mktemp -d "${TMPDIR:-/tmp}/telegram-app-unit.XXXXXX")"
-trap 'rc=$?; chmod -R u+rw "$TMPD" 2>/dev/null; rm -rf "$TMPD"; echo "HARNESS-RC=$rc"; exit $(( FAIL > 0 ))' EXIT
+trap 'rc=$?; chmod -R u+rw "$TMPD" 2>/dev/null; rm -rf "$TMPD"; echo "HARNESS-RC=$rc"' EXIT
 
 export STATE_DIR="$TMPD/state"; mkdir -p "$STATE_DIR"
 export BOX_CONFIG="$TMPD/box.json"
@@ -71,8 +71,9 @@ run --telegram-id=$ID
   && ok_ "READY: paired id -> status ready with the link" || bad_ "READY" "$OUT"
 grep -q '/server/telegram/link-code' "$POSTS" && grep -q "\"telegramId\":\"$ID\"" "$POSTS" \
   && ok_ "READY: posts the tapping id to /server/telegram/link-code" || bad_ "READY post" "$(cat "$POSTS")"
-if grep '^ARGV:' "$POSTS" | grep -q box-secret-token-fixture; then bad_ "TOKEN: token appeared in curl argv"
-elif grep '^STDIN:' "$POSTS" | grep -q 'authorization: Bearer box-secret-token-fixture'; then ok_ "TOKEN: box token goes to curl on stdin only"
+argv=$(grep '^ARGV:' "$POSTS"); stdin=$(grep '^STDIN:' "$POSTS")
+if grep -q box-secret-token-fixture <<<"$argv"; then bad_ "TOKEN: token appeared in curl argv"
+elif grep -q 'authorization: Bearer box-secret-token-fixture' <<<"$stdin"; then ok_ "TOKEN: box token goes to curl on stdin only"
 else bad_ "TOKEN: token not on stdin" "$(cat "$POSTS")"; fi
 
 # OFF
@@ -142,3 +143,4 @@ SHOW=$(JSON_MODE=1 cmd_box_config 2>/dev/null)
 [[ "$(jq -r .data.telegram_app <<<"$SHOW")" == on ]] && ok_ "CONFIG: 5dive config --json reports telegram_app" || bad_ "CONFIG show" "$SHOW"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[[ "$FAIL" -eq 0 ]]
