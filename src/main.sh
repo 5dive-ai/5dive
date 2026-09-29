@@ -717,6 +717,12 @@ _agent_verb_dispatch() {
         import)
           AUDIT_CMD="agent import"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_import "$@" ;;
+        pack-sync)
+          # DIVE-5205: bring a hired agent's pack skills up to the pack's
+          # current version (nightly via 5dive-refresh-skills.sh; partner
+          # boxes via 5dive-api with a fresh signed --from-url link).
+          AUDIT_CMD="agent pack-sync"; AUDIT_ARGS=("<redacted>")
+          with_registry_lock cmd_pack_sync "$@" ;;
         inspect)
           # DIVE-995: read-only pack disclosure ("this pack runs X") — no lock,
           # no root; the safety precondition before importing a third-party pack.

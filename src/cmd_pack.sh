@@ -257,7 +257,7 @@ _pack_skill_refs() {
 _install_bundled_skill() {
   local name="$1" id="$2" srcdir="$3"
   [[ -f "$srcdir/SKILL.md" ]] || return 1
-  local user="agent-${name}" home="/home/agent-${name}" type install_dir
+  local user="agent-${name}" home="${AGENT_HOME_ROOT:-/home}/agent-${name}" type install_dir
   type=$(agent_type "$name"); [[ -n "$type" ]] || return 1
   # DIVE-2583: through the shared resolver, so the destination this function
   # actually writes to is the same value the export text quotes. Note what this
@@ -1214,6 +1214,15 @@ _pack_usage() {
                                   # token/auth-profile here. Skills are re-added from their
                                   # recorded refs (skills not in a published repo are skipped
                                   # + reported). Memory is never in a config pack.
+  5dive agent pack-sync <name> [--from-url=<https-url>|--marketplace=<slug>] [--dry-run] [--no-restart]
+  5dive agent pack-sync --all [--dry-run] [--no-restart]
+                                  # DIVE-5205: bring a hired agent's pack SKILLS up to the
+                                  # pack's current version. Touches only ids the pack lists;
+                                  # a pack skill the owner edited is left and reported as
+                                  # drift. A changed agent restarts at its next quiet moment.
+                                  # --all = every agent imported from a marketplace slug
+                                  # (the nightly skills refresh runs this). --marketplace names
+                                  # the pack for an agent hired before import recorded it.
 
   A pack carries an agent's portable identity (instructions, skills, settings subset),
   NEVER secrets (tokens/keys/sessions/transcripts are hard-excluded). --with-memory adds
@@ -3503,6 +3512,17 @@ cmd_import() {
     done
   fi
 
+  # DIVE-5205: remember WHICH pack this agent came from and the exact skill
+  # bodies it installed, so `agent pack-sync` can bring it up to the pack's later
+  # versions and tell a pack update apart from an owner's edit. The signed
+  # --from-url link is a live capability and is never stored — only its slug.
+  local pk_src="file" pk_slug=""
+  if [[ -n "$import_slug" ]]; then pk_src="marketplace"; pk_slug="$import_slug"
+  elif [[ -n "$from_url" ]]; then pk_src="url"; pk_slug=$(_pack_url_slug "$from_url")
+  fi
+  _pack_record_write "$as" "$pk_src" "$pk_slug" "$(_pack_skill_shas "$as" "${added[@]+"${added[@]}"}")" \
+    || warn "could not record the pack source for '$as' — 'agent pack-sync' will need the pack named explicitly"
+
   rm -rf "$stage"
 
   # DIVE-644: fire opt-in import telemetry AFTER a fully successful import. Only
@@ -3548,6 +3568,251 @@ cmd_import() {
      --arg mem "$mem_inc" --arg ms "$mem_seeded" --arg me "$mem_effect" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported" --arg hk "$hooks_note" --argjson disc "$disclosure"
 }
 
+
+# -------- 5dive agent pack-sync (DIVE-5205) ---------------------------------
+# A pack was applied ONCE, at import, and nothing ever re-applied it: a fix to a
+# marketplace pack reached a hired agent only by a root push per agent per box.
+# `agent pack-sync <name>` brings the agent's pack SKILLS up to the pack's current
+# version:
+#   - only ids the pack's manifest lists are touched — a skill the owner or the
+#     agent added under another id is never read, replaced or removed;
+#   - a pack skill whose live body still equals what the pack last installed (or
+#     that has no record — agents imported before this) is replaced when the pack
+#     changed it; one the owner EDITED since is left alone and reported as drift;
+#   - a changed agent is not restarted here: a pending-restart marker is written
+#     and the heartbeat sweep bounces it at its next quiet moment (board idle AND
+#     pane idle), so a client mid-conversation is never cut off.
+# Where the pack comes from: `--from-url=<link>` (a partner box — 5dive-api mints
+# a fresh signed link, the box never holds the registry), else the marketplace
+# slug recorded at import. `--all` walks every agent with a recorded marketplace
+# pack; it is what the nightly skills refresh runs.
+# NOT YET SYNCED, on purpose (the row's second half): persona.yaml and the pack's
+# CLAUDE.md section. Both are reported in the result as `notSynced`.
+
+# Tree hash, the same recipe cmd_skill_add records as content_sha256.
+_pack_tree_sha() {
+  [[ -d "$1" ]] || return 1
+  (cd "$1" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)
+}
+
+# `.../<slug>.tar.gz?e=…&sig=…` -> <slug>; empty when the URL names no pack file.
+_pack_url_slug() {
+  local p="${1%%[?#]*}"; p="${p##*/}"
+  [[ "$p" =~ ^([a-z0-9][a-z0-9_-]{0,63})\.tar\.gz$ ]] && printf '%s' "${BASH_REMATCH[1]}"
+  return 0
+}
+
+# A pack skill another reconciler already owns, so a sync must not fight it:
+#   - a DEFAULT skill (DEFAULT_AGENT_SKILLS) is force re-pulled from its own repo
+#     by the same nightly, so replacing it here would flip it back and forth and
+#     restart the agent every night;
+#   - notify-user on a seat whose telegram plugin carries it: the nightly RETIRES
+#     core's copy there (DIVE-4919), and re-adding it would be the same loop.
+_pack_sync_managed_elsewhere() {  # <agent-home> <id>
+  local home="$1" id="$2" spec
+  for spec in "${DEFAULT_AGENT_SKILLS[@]+"${DEFAULT_AGENT_SKILLS[@]}"}"; do
+    [[ "${spec#*:}" == "$id" ]] && return 0
+  done
+  if [[ "$id" == notify-user ]] \
+    && jq -e '.enabledPlugins["telegram@5dive-plugins"] == true' "$home/.claude/settings.json" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+# _pack_skill_shas <agent> <id>... -> {"<id>":"<sha of the installed body>"}
+_pack_skill_shas() {
+  local name="$1"; shift
+  local type dir id sha out='{}'
+  type=$(agent_type "$name" 2>/dev/null) || type=""
+  dir="${AGENT_HOME_ROOT:-/home}/agent-${name}/$(skills_install_dir "${type:-claude}")"
+  for id in "$@"; do
+    valid_skill_id "$id" || continue
+    sha=$(_pack_tree_sha "$dir/$id" 2>/dev/null) || continue
+    out=$(jq -c --arg k "$id" --arg v "$sha" '.[$k] = $v' <<<"$out")
+  done
+  printf '%s\n' "$out"
+}
+
+# _pack_record_write <agent> <source> <slug> <skills-json> — merge into
+# .agents[<agent>].pack; importedAt is kept from the first write.
+_pack_record_write() {
+  local name="$1" src="$2" slug="$3" skills="${4:-}" reg now
+  [[ -n "$skills" ]] || skills='{}'
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  reg=$(registry_read)
+  jq -e --arg n "$name" '.agents[$n]' <<<"$reg" >/dev/null 2>&1 || return 1
+  jq --arg n "$name" --arg s "$src" --arg g "$slug" --arg t "$now" --argjson k "$skills" '
+    .agents[$n].pack = ((.agents[$n].pack // {}) as $o
+      | $o + {source:$s, slug:$g, skills:(($o.skills // {}) + $k), syncedAt:$t}
+      | .importedAt = ($o.importedAt // $t))' <<<"$reg" | registry_write
+}
+
+# _pack_sync_one <agent> <url> <dry:0|1> <restart:0|1> [<marketplace-slug>] — one
+# JSON result on stdout. The slug names the pack for an agent hired before the
+# record existed (5dive-api knows it; the box does not).
+# rc 0 = synced or nothing to do; 1 = could not sync this agent.
+_pack_sync_one() {
+  local name="$1" url="$2" dry="$3" restart="$4" mslug="${5:-}"
+  local res; res=$(jq -nc --arg n "$name" '{name:$n, status:"error"}')
+  _ps_out() { jq -c "$@" <<<"$res"; }
+  local reg rec src slug tgz="" rc
+  reg=$(registry_read)
+  if ! jq -e --arg n "$name" '.agents[$n]' <<<"$reg" >/dev/null 2>&1; then
+    _ps_out '.reason = "no such agent"'; return 1
+  fi
+  rec=$(jq -c --arg n "$name" '.agents[$n].pack // {}' <<<"$reg")
+  src=$(jq -r '.source // ""' <<<"$rec"); slug=$(jq -r '.slug // ""' <<<"$rec")
+  if [[ -n "$mslug" ]]; then
+    [[ "$mslug" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || { _ps_out '.reason = "--marketplace must be a pack slug"'; return 1; }
+    if [[ -n "$slug" && "$slug" != "$mslug" ]]; then
+      _ps_out --arg a "$slug" --arg b "$mslug" '.reason = "this agent was hired from pack \($a), not \($b) — refusing to overlay another pack"'
+      return 1
+    fi
+    src="marketplace"; slug="$mslug"
+  fi
+  if [[ -n "$url" ]]; then
+    local uslug; uslug=$(_pack_url_slug "$url")
+    [[ "$url" =~ ^https://[^[:space:]]+$ && -n "$uslug" ]] \
+      || { _ps_out '.reason = "--from-url must be an https link to <slug>.tar.gz"'; return 1; }
+    if [[ -n "$slug" && "$slug" != "$uslug" ]]; then
+      _ps_out --arg a "$slug" --arg b "$uslug" '.reason = "this agent was hired from pack \($a), the link is for \($b) — refusing to overlay another pack"'
+      return 1
+    fi
+    src="url"; slug="$uslug"
+    tgz=$(_pack_fetch_url "$url") \
+      || { _ps_out --arg h "$(_pack_url_host "$url")" '.reason = "could not fetch the pack from \($h) (expired or unreachable link)"'; return 1; }
+  elif [[ "$src" == "marketplace" && -n "$slug" ]]; then
+    if tgz=$(_marketplace_fetch_pack "$slug"); then :; else
+      rc=$?
+      _ps_out --arg s "$slug" --argjson r "$rc" '.reason = "could not fetch marketplace pack \($s) (fetch rc \($r))"'; return 1
+    fi
+  else
+    _ps_out --arg s "$src" '.status = "skipped" | .reason = (if $s == "url" then "partner pack — synced by 5dive-api with a fresh link" elif $s == "" then "no pack recorded for this agent" else "pack source \($s) cannot be re-fetched" end)'
+    return 0
+  fi
+  res=$(jq -c --arg s "$src" --arg g "$slug" '.source = $s | .slug = $g' <<<"$res")
+
+  local stage; stage=$(mktemp -d)
+  if ! _pack_safe_extract "$tgz" "$stage" || [[ ! -f "$stage/manifest.json" ]]; then
+    rm -rf "$stage" "$tgz"; _ps_out '.reason = "the fetched pack is unreadable or unsafe"'; return 1
+  fi
+  rm -f "$tgz"
+  local pf; pf=$(jq -r '.packFormat // empty' "$stage/manifest.json" 2>/dev/null)
+  if [[ ! "$pf" =~ ^[0-9]+$ ]] || (( pf > PACK_FORMAT_VERSION )); then
+    rm -rf "$stage"; _ps_out '.reason = "pack format missing or newer than this CLI"'; return 1
+  fi
+
+  local type dir; type=$(agent_type "$name" 2>/dev/null) || type=""
+  dir="${AGENT_HOME_ROOT:-/home}/agent-${name}/$(skills_install_dir "${type:-claude}")"
+  local -a added=() updated=() unchanged=() drift=() failed=() managed=()
+  local sk pair ssrc id live_sha rec_sha new_sha shas='{}'
+  while IFS= read -r sk; do
+    [[ -n "$sk" ]] || continue
+    pair=$(parse_skill_spec "$sk" 2>/dev/null) || { failed+=("$sk"); continue; }
+    ssrc="${pair% *}"; id="${pair#* }"
+    valid_skill_id "$id" && skill_target_within "$dir" "$id" || { failed+=("$sk"); continue; }
+    if _pack_sync_managed_elsewhere "${AGENT_HOME_ROOT:-/home}/agent-${name}" "$id"; then
+      managed+=("$id"); continue
+    fi
+    live_sha=$(_pack_tree_sha "$dir/$id" 2>/dev/null) || live_sha=""
+    rec_sha=$(jq -r --arg k "$id" '.skills[$k] // ""' <<<"$rec")
+    if [[ -f "$stage/skills/$id/SKILL.md" ]]; then
+      new_sha=$(_pack_tree_sha "$stage/skills/$id")
+      if [[ "$live_sha" == "$new_sha" ]]; then
+        unchanged+=("$id"); shas=$(jq -c --arg k "$id" --arg v "$new_sha" '.[$k] = $v' <<<"$shas")
+      elif [[ -n "$live_sha" && -n "$rec_sha" && "$live_sha" != "$rec_sha" ]]; then
+        drift+=("$id")   # edited since the pack installed it — not ours to clobber
+      elif (( dry )); then
+        [[ -z "$live_sha" ]] && added+=("$id") || updated+=("$id")
+      elif _install_bundled_skill "$name" "$id" "$stage/skills/$id"; then
+        [[ -z "$live_sha" ]] && added+=("$id") || updated+=("$id")
+        shas=$(jq -c --arg k "$id" --arg v "$new_sha" '.[$k] = $v' <<<"$shas")
+      else
+        failed+=("$id")
+      fi
+    elif [[ -n "$live_sha" ]]; then
+      # A ref with no bundled body: present is as far as a sync can judge it.
+      unchanged+=("$id")
+    elif (( dry )); then
+      added+=("$id")
+    elif ( cmd_skill_add "$name" --source="$ssrc" --skill="$id" ) >/dev/null 2>&1; then
+      added+=("$id")
+      live_sha=$(_pack_tree_sha "$dir/$id" 2>/dev/null) \
+        && shas=$(jq -c --arg k "$id" --arg v "$live_sha" '.[$k] = $v' <<<"$shas")
+    else
+      failed+=("$sk")
+    fi
+  done < <(jq -r '.skills[]? // empty' "$stage/manifest.json")
+  rm -rf "$stage"
+
+  local changed=$(( ${#added[@]} + ${#updated[@]} )) restart_note="none"
+  if (( ! dry )); then
+    _pack_record_write "$name" "$src" "$slug" "$shas" \
+      || { failed+=("<pack record>"); warn "could not record the pack sync for '$name'"; }
+    if (( changed > 0 && restart )); then
+      if _pending_restart_mark "$name" "pack $slug skills updated (DIVE-5205)"; then
+        restart_note="pending (next quiet moment)"
+      else
+        restart_note="mark-failed"
+      fi
+    fi
+  fi
+  _j() { printf '%s\n' "$@" | jq -R . | jq -cs 'map(select(. != ""))'; }
+  res=$(jq -c --argjson a "$(_j "${added[@]+"${added[@]}"}")" --argjson u "$(_j "${updated[@]+"${updated[@]}"}")" \
+      --argjson c "$(_j "${unchanged[@]+"${unchanged[@]}"}")" --argjson d "$(_j "${drift[@]+"${drift[@]}"}")" \
+      --argjson f "$(_j "${failed[@]+"${failed[@]}"}")" --argjson m "$(_j "${managed[@]+"${managed[@]}"}")" \
+      --arg r "$restart_note" --argjson dry "$dry" \
+      '.status = (if ($f|length) > 0 then "partial" elif (($a|length)+($u|length)) > 0 then (if $dry == 1 then "would-change" else "changed" end) else "unchanged" end)
+       | .added = $a | .updated = $u | .unchanged = $c | .drift = $d | .failed = $f | .managedElsewhere = $m | .restart = $r
+       | .notSynced = ["persona.yaml", "CLAUDE.md"]' <<<"$res")
+  printf '%s\n' "$res"
+  (( ${#failed[@]} == 0 ))
+}
+
+cmd_pack_sync() {
+  require_root "agent pack-sync"
+  local name="" url="" mslug="" all=0 dry=0 restart=1
+  local usage="usage: 5dive agent pack-sync <name> [--from-url=<https-link>|--marketplace=<slug>] [--dry-run] [--no-restart] | --all [--dry-run] [--no-restart]"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from-url=*)  url="${1#--from-url=}" ;;
+      --marketplace=*) mslug="${1#--marketplace=}" ;;
+      --all)         all=1 ;;
+      --dry-run)     dry=1 ;;
+      --no-restart)  restart=0 ;;
+      -*)            fail "$E_USAGE" "unknown flag: $1 — $usage" ;;
+      *)             [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "$usage" ;;
+    esac
+    shift
+  done
+  (( all )) && [[ -n "$name$url$mslug" ]] && fail "$E_USAGE" "--all takes no agent name, link or slug — $usage"
+  [[ -n "$url" && -n "$mslug" ]] && fail "$E_USAGE" "give --from-url OR --marketplace, not both — $usage"
+  (( all )) || [[ -n "$name" ]] || fail "$E_USAGE" "$usage"
+  local -a names=()
+  if (( all )); then
+    mapfile -t names < <(registry_read | jq -r '.agents | to_entries[] | select(.value.pack.source == "marketplace") | .key')
+  else
+    valid_name "$name" || fail "$E_USAGE" "$usage"
+    names=("$name")
+  fi
+  local n line results='[]' bad=0
+  for n in "${names[@]+"${names[@]}"}"; do
+    [[ -n "$n" ]] || continue
+    line=$(_pack_sync_one "$n" "$url" "$dry" "$restart" "$mslug") || bad=$((bad + 1))
+    results=$(jq -c --argjson r "${line:-null}" '. + [$r]' <<<"$results")
+    (( JSON_MODE )) || step "$(jq -r '"\(.name): \(.status)" + (if .reason then " — \(.reason)" else "" end)
+      + (if (.added|length? // 0) > 0 then "; added \(.added|join(","))" else "" end)
+      + (if (.updated|length? // 0) > 0 then "; updated \(.updated|join(","))" else "" end)
+      + (if (.drift|length? // 0) > 0 then "; LEFT (edited since install) \(.drift|join(","))" else "" end)
+      + (if (.failed|length? // 0) > 0 then "; FAILED \(.failed|join(","))" else "" end)
+      + (if (.restart // "none") != "none" then "; restart \(.restart)" else "" end)' <<<"${line:-null}")"
+  done
+  if (( all == 0 && bad > 0 )); then
+    fail "$E_GENERIC" "pack-sync '$name': $(jq -r '.[0].reason // ("failed: " + ((.[0].failed // []) | join(",")))' <<<"$results")"
+  fi
+  ok "pack-sync: ${#names[@]} agent(s), $bad not fully synced" '{agents:$r}' --argjson r "$results"
+}
 
 # `5dive market --kind=plugin` (DIVE-4020 §7.2) — the discovery half of the
 # plugin contract. Read-only and root-free by design: it curls the published
