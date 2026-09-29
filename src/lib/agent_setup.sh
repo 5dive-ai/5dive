@@ -58,37 +58,103 @@ git interpret-trailers --in-place --if-exists=addIfDifferent --if-missing=add \
 HOOK
 }
 
-# DIVE-5201: `seat_own_dirs <user> <home> <rel-dir>` — make every component of
-# <home>/<rel-dir> a directory the seat owns. `install -d -o` applies -o/-m to
-# the LEAF only and creates the missing parents as the caller (root, 0755), so a
-# fresh seat's `install -d -o seat ~/.config/5dive/git-hooks` left ~/.config
-# root-owned, and Chrome (XDG_CONFIG_HOME unset by DIVE-4587) could not create
-# its crashpad DB there: rc 133 on every seat of a box. A missing component is
-# created and chowned; a component already ROOT-owned is chowned, non-recursive,
-# which is the backfill for seats made before this fix (the upgrade reconciler
-# re-runs the co-author install on every seat). A component owned by anyone else
-# is left alone. `chown -h` and refusing symlinks keep a seat-controlled path
-# from becoming a root chown of its target.
-seat_own_dirs() {
-  local user="$1" home="$2" rel="$3" p part
-  [[ -n "$user" && -d "$home" && ! -L "$home" ]] || return 1
-  [[ "/$rel/" != *"/../"* ]] || return 1
-  p="$home"
-  local IFS=/
-  for part in $rel; do
-    [[ -n "$part" && "$part" != . ]] || continue
-    p="$p/$part"
-    [[ ! -L "$p" ]] || return 1
-    if [[ ! -e "$p" ]]; then
-      mkdir -m 755 "$p" || return 1
-      chown -h "$user:$user" "$p" || return 1
-    elif [[ ! -d "$p" ]]; then
-      return 1
-    elif [[ "$(stat -c %u "$p")" == 0 ]]; then
-      chown -h "$user:$user" "$p" || return 1
-    fi
-  done
+# DIVE-5201: `seat_own_dirs <user> <home> <rel-dir> [<leaf-mode>]` — make every
+# component of <home>/<rel-dir> a directory the seat owns. `install -d -o` applies
+# -o/-m to the LEAF only and creates the missing parents as the caller (root,
+# 0755), so a fresh seat's `install -d -o seat ~/.config/5dive/git-hooks` left
+# ~/.config root-owned, and Chrome (XDG_CONFIG_HOME unset by DIVE-4587) could not
+# create its crashpad DB there: rc 133 on every seat of a box. A missing
+# component is created and chowned; a component already ROOT-owned is chowned,
+# non-recursive, which is the backfill for seats made before this fix (the
+# upgrade reconciler re-runs the co-author install on every seat). A component
+# owned by anyone else is left alone. <leaf-mode>, when given, is applied to the
+# leaf if it is new, root-owned or seat-owned (what `install -d -m` did).
+#
+# `seat_put_file <user> <home> <rel-dir> <name> <mode> <src>` writes <src> as
+# <home>/<rel-dir>/<name>, seat-owned, by an atomic rename inside that dir.
+#
+# Both run as root inside a tree the SEAT owns and may be rewriting while they
+# run (the reconciler runs against live seats), so neither resolves a path by
+# name below <home>: each component is opened relative to its parent's fd with
+# O_NOFOLLOW|O_DIRECTORY, and every mkdir/chown/chmod/create/rename goes through
+# the held fd. A string check (`[[ ! -L ]]`) plus `chown -h` cannot do this — a
+# parent swapped for a symlink after it was checked is still resolved by every
+# later path (quinn, DIVE-5201 iteration 1). A symlink or non-directory at open
+# time is refused; a swap after open cannot move the inode already held.
+# python3 is an install.sh dependency (python3-yaml); `agent list` already needs it.
+_seat_tree() {
+  python3 - "$@" <<'PY'
+import grp, os, pwd, sys
+
+def die(msg):
+    sys.stderr.write("seat_own_dirs: %s\n" % msg)
+    sys.exit(1)
+
+op, user, home, rel = sys.argv[1:5]
+rest = sys.argv[5:]
+try:
+    uid, gid = pwd.getpwnam(user).pw_uid, grp.getgrnam(user).gr_gid
+except KeyError:
+    die("no user/group %r" % user)
+parts = [p for p in rel.split("/") if p not in ("", ".")]
+if not parts or ".." in parts:
+    die("refusing path %r" % rel)
+leaf_mode = int(rest[0], 8) if op == "dirs" and rest and rest[0] else None
+DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+try:
+    fd = os.open(home, DIR)
+except OSError as e:
+    die("home %s: %s" % (home, e.strerror))
+for i, part in enumerate(parts):
+    leaf = i == len(parts) - 1
+    mode = leaf_mode if leaf and leaf_mode is not None else 0o755
+    created = False
+    if op == "dirs":
+        try:
+            os.mkdir(part, mode, dir_fd=fd)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError as e:
+            die("mkdir %s: %s" % (part, e.strerror))
+    try:
+        child = os.open(part, DIR, dir_fd=fd)
+    except OSError as e:
+        die("%s is not a real directory: %s" % ("/".join(parts[: i + 1]), e.strerror))
+    os.close(fd)
+    fd = child
+    st = os.fstat(fd)
+    if created or st.st_uid == 0:
+        os.fchown(fd, uid, gid)
+    if created or (leaf and leaf_mode is not None and st.st_uid in (0, uid)):
+        os.fchmod(fd, mode)
+if op == "put":
+    name, fmode, src = rest
+    if name in ("", ".", "..") or "/" in name:
+        die("refusing file name %r" % name)
+    with open(src, "rb") as f:
+        data = f.read()
+    tmp = ".%s.5dive.%d" % (name, os.getpid())
+    w = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600, dir_fd=fd)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(w, view):]
+        os.fchown(w, uid, gid)
+        os.fchmod(w, int(fmode, 8))
+        os.close(w)
+        os.rename(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+    except OSError as e:
+        try:
+            os.unlink(tmp, dir_fd=fd)
+        except OSError:
+            pass
+        die("write %s: %s" % (name, e.strerror))
+PY
 }
+seat_own_dirs() { _seat_tree dirs "$@"; }
+seat_put_file() { _seat_tree put "$@"; }
 
 install_agent_coauthor_hook() {
   local name="$1" openagent_id="$2" user="agent-${1}"
@@ -96,12 +162,12 @@ install_agent_coauthor_hook() {
   id -u "$user" >/dev/null 2>&1 || return 0
   [[ "$openagent_id" =~ ^oa-[0-9a-f]{12}$ ]] || return 1
   local home="${AGENT_HOME_ROOT:-/home}/${user}"
-  local hooks="$home/.config/5dive/git-hooks" hook="$home/.config/5dive/git-hooks/prepare-commit-msg"
-  seat_own_dirs "$user" "$home" ".config/5dive" || return 1
-  install -d -m 700 -o "$user" -g "$user" "$hooks" || return 1
+  local hooks="$home/.config/5dive/git-hooks"
+  seat_own_dirs "$user" "$home" ".config/5dive/git-hooks" 700 || return 1
   local tmp; tmp=$(mktemp)
   render_agent_coauthor_hook >"$tmp" || { rm -f "$tmp"; return 1; }
-  install -m 755 -o "$user" -g "$user" "$tmp" "$hook" || { rm -f "$tmp"; return 1; }
+  seat_put_file "$user" "$home" ".config/5dive/git-hooks" prepare-commit-msg 755 "$tmp" \
+    || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
   sudo -u "$user" -H git config --global 5dive.seat-name "$name" || return 1
   sudo -u "$user" -H git config --global 5dive.openagent-id "$openagent_id" || return 1
