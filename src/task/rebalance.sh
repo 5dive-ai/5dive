@@ -76,6 +76,24 @@ _rebal_unstarted_count() {
         AND status='todo' AND first_started_at IS NULL AND started_at IS NULL;" 2>/dev/null || printf '0'
 }
 
+# _rebal_dispatchable <seat> — rc 0 = the heartbeat will actually wake this seat;
+# the reason is on stdout when it will not. A seat an operator parked
+# (desiredState=stopped) or one with heartbeat.enabled not true is idle FOREVER,
+# because the wake loop skips it — and a row handed to it strands there behind
+# the 24h hold. Quota headroom cannot see either, so this is its own check, run
+# before the meter. FAILS CLOSED: no parked predicate in this process, or a
+# registry that does not name the seat, reads as "will not be woken".
+_rebal_dispatchable() {
+  local seat="$1" reg="" enabled=""
+  declare -F _hb_agent_is_parked >/dev/null 2>&1 || { printf 'no parked check in this process'; return 1; }
+  if _hb_agent_is_parked "$seat"; then printf 'parked by operator (desiredState=stopped)'; return 1; fi
+  reg=$(registry_read 2>/dev/null) || reg=""
+  [[ -n "$reg" ]] || reg='{}'
+  enabled=$(jq -r --arg n "$seat" '.agents[$n].heartbeat.enabled // false' <<<"$reg" 2>/dev/null) || enabled=""
+  if [[ "$enabled" != "true" ]]; then printf 'heartbeat off (the tick never dispatches it)'; return 1; fi
+  return 0
+}
+
 # _rebal_headroom <seat> <now> <usage-json> — rc 0 = the seat's account can take
 # work; the reason is on stdout either way. Split out so a harness can stand in
 # for the meter. FAILS CLOSED: an unreadable meter, an unresolved account, and
@@ -222,6 +240,10 @@ _rebal_plan() {
         busy+=("$u:$m"); printf 'seat\t%s\t%s\t%s\tbusy\t%s un-started (trigger %s)\n' "$m" "$u" "$w" "$u" "$min_todo"
       elif (( w == 0 )); then
         local why rc=0
+        if ! why=$(_rebal_dispatchable "$m"); then
+          printf 'seat\t%s\t%s\t%s\t-\tidle but %s\n' "$m" "$u" "$w" "$why"
+          continue
+        fi
         why=$(_rebal_headroom "$m" "$now" "$usage") || rc=$?
         if (( rc == 0 )); then
           idle+=("$m"); printf 'seat\t%s\t%s\t%s\tidle\t%s\n' "$m" "$u" "$w" "$why"

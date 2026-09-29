@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — 60s measured on the control plane (six full runs of task_rebalance_unit.sh): does not fit the 300s PR core; the nightly sweep runs it.
+# TIER: nightly — 135s measured on the control plane (thirteen full runs of task_rebalance_unit.sh): does not fit the 300s PR core; the nightly sweep runs it.
 #
 # DIVE-5191 mutation arms for tests/task_rebalance_unit.sh. Each guard in
 # src/task/rebalance.sh is removed from a COPY of the module, and the core
@@ -53,6 +53,9 @@ mutate pinned   's/if _rebal_pinned "$body" "$busy"; then/if false; then/'
 mutate branch   's/grep -qxF -- "$b" <<<"$_REBAL_WIP_BRANCHES"/false/'
 mutate started  's/\[\[ -z "$fsa" && -z "$sa" \]\]    ||/true ||/'
 mutate gated    's/\[\[ -z "$gate" \]\]               ||/true ||/'
+mutate dispatchable 's/if ! why=$(_rebal_dispatchable "$m"); then/if false; then/'
+mutate parked   's/if _hb_agent_is_parked "$seat"; then/if false; then/'
+mutate hboff    's/if \[\[ "$enabled" != "true" \]\]; then/if false; then/'
 mutate guarded  's/WHERE id=${id} AND assignee=$(sqlq "$from") AND status=.todo./WHERE id=${id}/'
 
 echo "---"

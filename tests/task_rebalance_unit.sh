@@ -9,7 +9,9 @@
 #   A1 an overloaded member plus an idle member with headroom moves the right
 #      rows (the ones the busy seat reaches LAST), appends one body line each,
 #      and sends ONE line to the lead and nothing to either seat
-#   A2 an idle member out of quota receives nothing
+#   A2 an idle member out of quota receives nothing — nor does one an operator
+#      parked (desiredState=stopped) or one whose heartbeat is off, since the
+#      wake loop never reaches either and the 24h hold would strand the rows
 #   A3 a started, gated, blocked, branch-linked or seat-named row never moves
 #      (plus parent/child, a named in-progress ident, a recurring template, a
 #      parked row) — and a bare mention of the seat name does NOT pin a row
@@ -44,6 +46,7 @@ TASKS_DIR="$STATE_DIR/tasks"
 TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=0
 _PACE_USAGE_CMD=:   # never read the host's real meter
+REGISTRY="$STATE_DIR/agents.json"   # a throwaway registry; the real one is never read
 mkdir -p "$TASKS_DIR"
 set +e
 
@@ -55,6 +58,11 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 check() { if [[ "$2" == "$3" ]]; then ok_t "$1"; else bad_t "$1" "want [$3] got [$2]"; fi; }
 
 # ── stand-ins ────────────────────────────────────────────────────────────────
+# Every pool seat is dispatchable (heartbeat on, not parked) unless an arm says
+# otherwise. The real _hb_agent_is_parked and registry_read read this file.
+REG_ALL='{"agents":{"dev":{"heartbeat":{"enabled":true}},"dev2":{"heartbeat":{"enabled":true}},
+  "fe1":{"heartbeat":{"enabled":true}},"fe2":{"heartbeat":{"enabled":true}}}}'
+printf '%s' "$REG_ALL" >"$REGISTRY"
 HEADROOM_OK=" dev2 fe2 "          # seats whose account reads open
 _rebal_headroom() {
   if [[ "$HEADROOM_OK" == *" $1 "* ]]; then printf 'account acct-%s open' "$1"; return 0; fi
@@ -117,6 +125,34 @@ check "A2 no lead message when nothing moved" "$(wc -l <"$SENT" | tr -d ' ')" "0
 plan=$(_rebal_plan "$NOW" "")
 grep -q 'idle but no headroom: account acct-dev2 hard' <<<"$plan" && ok_t "A2 plan says why" || bad_t "A2 plan reason" "$plan"
 HEADROOM_OK=" dev2 fe2 "
+# An operator-parked idle seat: headroom is open, but the wake loop skips it.
+reset_board; pools '{"builders":["dev","dev2"]}'
+for _ in 1 2 3 4 5 6; do mk dev medium >/dev/null; done
+jq '.agents.dev2.desiredState="stopped"' <<<"$REG_ALL" >"$REGISTRY"
+_hb_agent_is_parked dev2 && ok_t "A2 fixture: the heartbeat's own predicate reads dev2 as parked" \
+  || bad_t "A2 fixture: dev2 not parked" "$(cat "$REGISTRY")"
+plan=$(_rebal_plan "$NOW" "")
+grep -qP '^seat\tdev2\t.*\tidle but parked by operator' <<<"$plan" && ok_t "A2 parked: the seat line names the operator park" \
+  || bad_t "A2 parked seat line" "$plan"
+grep -q '^move' <<<"$plan" && bad_t "A2 parked: the plan moves nothing" "$plan" || ok_t "A2 parked: the plan moves nothing"
+_hb_rebalance_sweep "$NOW" "" 2>/dev/null
+check "A2 parked idle seat receives nothing" "$(db "SELECT COUNT(*) FROM tasks WHERE assignee='dev2';")" "0"
+check "A2 parked: no lead message" "$(wc -l <"$SENT" | tr -d ' ')" "0"
+# Heartbeat off: never dispatched, same shape.
+jq '.agents.dev2.heartbeat.enabled=false' <<<"$REG_ALL" >"$REGISTRY"
+plan=$(_rebal_plan "$NOW" "")
+grep -qP '^seat\tdev2\t.*\tidle but heartbeat off' <<<"$plan" && ok_t "A2 heartbeat off: the seat line says so" \
+  || bad_t "A2 heartbeat-off seat line" "$plan"
+_hb_rebalance_sweep "$NOW" "" 2>/dev/null
+check "A2 heartbeat-off idle seat receives nothing" "$(db "SELECT COUNT(*) FROM tasks WHERE assignee='dev2';")" "0"
+# A seat the registry does not name at all fails closed the same way.
+jq 'del(.agents.dev2)' <<<"$REG_ALL" >"$REGISTRY"
+_hb_rebalance_sweep "$NOW" "" 2>/dev/null
+check "A2 a seat missing from the registry receives nothing" "$(db "SELECT COUNT(*) FROM tasks WHERE assignee='dev2';")" "0"
+# Control for the three above: the same board with dev2 dispatchable moves rows.
+printf '%s' "$REG_ALL" >"$REGISTRY"
+_hb_rebalance_sweep "$NOW" "" 2>/dev/null
+check "A2 control: the same board moves 2 once dev2 is dispatchable" "$(db "SELECT COUNT(*) FROM tasks WHERE assignee='dev2';")" "2"
 # the REAL headroom reader fails closed with no meter in this process
 unset -f _rebal_headroom; source "$MODULE"
 _hb_quota_parked() { return 1; }   # not parked; the band decides below
