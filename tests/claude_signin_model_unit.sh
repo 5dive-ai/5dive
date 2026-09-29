@@ -54,8 +54,11 @@ mk_profile ds "ANTHROPIC_BASE_URL=$DS_URL" 'ANTHROPIC_DEFAULT_SONNET_MODEL="deep
   || bad_t "deepseek model" "$(account_signin_detail ds claude)"
 
 # The key never reaches the output.
-if account_signin_detail client-openrouter claude | grep -q 'sk-or-xxxx'; then
-  bad_t "no key in the detail" "$(account_signin_detail client-openrouter claude)"
+# Capture first: under pipefail a matching grep -q can SIGPIPE the writer and
+# score the leak as a miss (tests/epipe_corpus_guard_unit.sh).
+out=$(account_signin_detail client-openrouter claude)
+if grep -q 'sk-or-xxxx' <<<"$out"; then
+  bad_t "no key in the detail" "$out"
 else ok_t "no key in the detail"; fi
 
 # A plain subscription / Anthropic key: no base url, no map -> model null.
