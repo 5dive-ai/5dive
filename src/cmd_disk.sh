@@ -257,13 +257,14 @@ cmd_disk_sweep() {
 # The owner's normal channel: the paired chat of the first telegram-enabled seat,
 # the same resolution `digest tick` uses. Returns 0 only on a Bot API receipt.
 _disk_alarm_deliver() {
-  local msg="$1" name
+  local msg="$1" name names
+  names=$(jq -r '.agents | keys[]' "$REGISTRY" 2>/dev/null)   # captured: the loop returns early
   while IFS= read -r name; do
     [[ -n "$name" && -r "${CONNECTORS_DIR}/telegram-${name}.env" ]] || continue
     _task_agent_channel "$name" || continue
     _task_send_owner "$msg"
     [[ "${TASK_SEND_DELIVERED:-0}" == 1 ]] && return 0
-  done < <(jq -r '.agents | keys[]' "$REGISTRY" 2>/dev/null)
+  done <<<"$names"
   return 1
 }
 
