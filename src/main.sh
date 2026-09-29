@@ -204,6 +204,12 @@ Agents:
                                                      # caches botUsername in the registry. Used by the dashboard
                                                      # to backfill @handles for agents created before the
                                                      # botUsername-on-create change. --refresh forces re-fetch.
+  5dive agent mail set <name> --email=<addr> --imap=<host[:port]> --smtp=<host[:port]> [--caldav=<https-url>] --password=-
+                                                     # connect a mailbox (app password on STDIN only) for the
+                                                     # himalaya CLI; login is verified before anything is saved.
+                                                     # login_failed: -> rc 6, mail_unreachable: -> rc 3.
+  5dive agent mail remove <name>                     # delete the mailbox files and the agent's mail instructions
+  5dive agent mail list | show <name>                # connected mailboxes: {agent,email,calendar}, never a secret
   5dive agent telegram-access get <name>             # read access.json: who can DM the bot, group settings.
   5dive agent telegram-access set <name>             # write access.json from {dmPolicy,allowFrom,groups} JSON
                                                      # piped on stdin. Plugin re-reads per-message — no restart.
@@ -842,6 +848,16 @@ _agent_verb_dispatch() {
           # the dashboard's agent list draws. get is read-only.
           [[ "${1:-}" == "get" ]] || { AUDIT_CMD="agent avatar"; AUDIT_ARGS=("$@"); }
           cmd_agent_avatar "$@" ;;
+        mail)
+          # DIVE-5161: connect one mailbox (IMAP/SMTP app password, optional
+          # CalDAV) to an agent for the himalaya CLI. The password rides STDIN
+          # (--password=-), never argv, so the audited args carry no secret.
+          # list/show are read-only: no audit.
+          case "${1:-}" in
+            list|show) ;;
+            *) AUDIT_CMD="agent mail"; AUDIT_ARGS=("$@") ;;
+          esac
+          cmd_agent_mail "$@" ;;
         install)
           AUDIT_CMD="agent install"; AUDIT_ARGS=("$@")
           cmd_install "$@" ;;   # no registry mutation; auditable install recipe
