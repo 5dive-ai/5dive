@@ -103,6 +103,8 @@ cat >"$AGENT_MAIL_HIMALAYA_BIN" <<'EOF'
 printf '%s|himalaya %s\n' "${_AS_USER:-ROOT}" "$*" >>"$ARGV_LOG"
 [[ "$1" == --version ]] && { echo "himalaya v2.1.0 +stub"; exit 0; }
 cfg="$2"
+# Positive control for the cleanup arms: record where the verify config lived.
+[[ -e "$cfg" ]] && dirname -- "$cfg" >>"${ARGV_LOG%/*}/tmpdirs.seen"
 [[ -e "$AGENT_HOME_ROOT/${_AS_USER:-x}/.config/5dive-mail/mail.json" ]] && echo "PRE-EXISTING-MAILJSON $cfg" >>"$ARGV_LOG"
 cmd=$(sed -n 's/^imap\.sasl\.plain\.password\.command = "\(.*\)"$/\1/p' "$cfg")
 got=$(sh -c "$cmd")
@@ -124,7 +126,7 @@ printf '%s' "$PW" >"$HM_EXPECT"
 # wrappers; sets OUT (JSON on stdout), ERR, RC.
 run() {
   local input="$1"; shift
-  OUT=$( { printf '%b' "$input" | ( PATH="$TMP/wrap:$PATH"; TMPDIR="$TMP/agenttmp"; JSON_MODE=1; "$@" ); } 2>"$TMP/err"); RC=$?
+  OUT=$( { printf '%b' "$input" | ( PATH="$TMP/wrap:$PATH"; export TMPDIR="$TMP/agenttmp"; JSON_MODE=1; "$@" ); } 2>"$TMP/err"); RC=$?
   ERR=$(cat "$TMP/err")
 }
 msg() { jq -r '.error.message // empty' <<<"$OUT" 2>/dev/null; }
@@ -179,7 +181,7 @@ OUT=$( { printf '%s\n' "$PW" | ( PATH="$TMP/wrap:$PATH"; JSON_MODE=1; _agent_mai
 (( RC == 10 )) && okk 'set without root is E_PERMISSION' || bad "non-root: rc=$RC"
 
 # --- login verification: failures persist nothing ------------------------------------
-: >"$ARGV_LOG"
+: >"$ARGV_LOG"; : >"$TMP/tmpdirs.seen"
 echo check >"$HM_MODE"
 run "wrong-$PW\n" _agent_mail_set alpha "${SET_ARGS[@]}"
 (( RC == 6 )) && [[ "$(msg)" == "login_failed: IMAP AUTHENTICATE PLAIN failed: NO Invalid credentials"* ]] \
@@ -188,6 +190,12 @@ run "wrong-$PW\n" _agent_mail_set alpha "${SET_ARGS[@]}"
 [[ ! -e "$home/.config/5dive-mail" && ! -e "$home/.config/himalaya/config.toml" ]] \
   && okk 'a failed login persists nothing' || bad "failed login left: $(find "$home/.config" 2>/dev/null | tr '\n' ' ')"
 [[ ! -s "$RESTART_LOG" ]] && okk 'a failed login restarts nothing' || bad "restart after failed login: $(cat "$RESTART_LOG")"
+# The cleanup arms below are only meaningful if the verb's temp dir lived under
+# $TMP/agenttmp; prove it did, so they cannot pass vacuously (a TMPDIR not exported
+# into the verb sends mktemp to /tmp and leaves $TMP/agenttmp empty either way).
+seen=$(cat "$TMP/tmpdirs.seen" 2>/dev/null)
+[[ -n "$seen" ]] && ! grep -qv "^$TMP/agenttmp/" <<<"$seen" \
+  && okk 'positive control: the login check ran against a temp dir under $TMP/agenttmp' || bad "temp dir not under agenttmp: ${seen:-none seen}"
 [[ -z "$(ls -A "$TMP/agenttmp")" ]] && okk 'a failed login leaves no temp dir behind' || bad "temp left: $(ls -A "$TMP/agenttmp")"
 grep -q "^agent-alpha|himalaya -c $TMP/agenttmp/.* --json mailbox list$" "$ARGV_LOG" \
   && okk 'himalaya ran as the agent, against a temp config, with the global --json flag' || bad "himalaya argv: $(grep himalaya "$ARGV_LOG")"
@@ -203,7 +211,7 @@ echo unreach >"$HM_MODE"; run "$PW\n" _agent_mail_set alpha "${SET_ARGS[@]}"
 [[ ! -e "$home/.config/5dive-mail" && -z "$(ls -A "$TMP/agenttmp")" ]] && okk 'an unreachable server persists nothing' || bad 'unreachable persisted something'
 
 # --- success ------------------------------------------------------------------------
-: >"$ARGV_LOG"; echo check >"$HM_MODE"
+: >"$ARGV_LOG"; : >"$TMP/tmpdirs.seen"; echo check >"$HM_MODE"
 printf '# my notes\nkeep me\n' >"$TMP/persona-before"
 mkdir -p "$home/.claude"; cp "$TMP/persona-before" "$home/.claude/CLAUDE.md"; chmod 640 "$home/.claude/CLAUDE.md"
 run "$PW\r\n" _agent_mail_set alpha "${SET_ARGS[@]}"
@@ -226,6 +234,9 @@ grep -qx "imap.sasl.plain.password.command = \"cat $home/.config/5dive-mail/pass
 [[ "$(jq -c '{email,imap,smtp,caldav,calendar}' "$home/.config/5dive-mail/mail.json")" == '{"email":"user@example.com","imap":"imap.example.com:993","smtp":"smtp.example.com:465","caldav":null,"calendar":false}' ]] \
   && jq -e '.connectedAt | test("^[0-9]{4}-")' "$home/.config/5dive-mail/mail.json" >/dev/null && ! grep -q "$PW" "$home/.config/5dive-mail/mail.json" \
   && okk 'mail.json carries {email,imap,smtp,caldav,calendar,connectedAt} and no secret' || bad "mail.json: $(cat "$home/.config/5dive-mail/mail.json")"
+seen=$(cat "$TMP/tmpdirs.seen" 2>/dev/null)
+[[ -n "$seen" ]] && ! grep -qv "^$TMP/agenttmp/" <<<"$seen" \
+  && okk 'positive control: the successful set verified in a temp dir under $TMP/agenttmp' || bad "success temp dir: ${seen:-none seen}"
 [[ -z "$(ls -A "$TMP/agenttmp")" ]] && okk 'success cleans up its temp dir' || bad "temp left: $(ls -A "$TMP/agenttmp")"
 # Every write/read of an agent path ran under runuser as the agent.
 rootw=$(grep -E '^ROOT\|(dd|mv|chmod|mkdir|rm|python3|install|cat|head|test|mktemp) ' "$ARGV_LOG" | grep -F "$AGENT_HOME_ROOT" || true)
@@ -316,7 +327,7 @@ tar -czf "$TMP/fixture.tgz" -C "$TMP/pkg" himalaya share
 fsha=$(sha256sum "$TMP/fixture.tgz" | awk '{print $1}')
 inst() { # <sha> -> runs _agent_mail_ensure_himalaya into a fresh bin path
   local fixture_sha="$1"
-  ( PATH="$TMP/wrap:$PATH"; TMPDIR="$TMP/agenttmp"
+  ( PATH="$TMP/wrap:$PATH"; export TMPDIR="$TMP/agenttmp"
     export CURL_FIXTURE="$TMP/fixture.tgz" AGENT_MAIL_HIMALAYA_BIN="$TMP/ibin/himalaya"
     _agent_mail_himalaya_asset() { printf 'https://example.invalid/himalaya.tgz %s\n' "$fixture_sha"; }
     _agent_mail_ensure_himalaya )
@@ -327,7 +338,7 @@ rm -rf "$TMP/ibin"; why=$(inst 0000000000000000000000000000000000000000000000000
 rm -rf "$TMP/ibin"; why=$(inst "$fsha"); irc=$?
 (( irc == 0 )) && [[ "$(stat -c %a "$TMP/ibin/himalaya" 2>/dev/null)" == 755 ]] && "$TMP/ibin/himalaya" --version | grep -q '^himalaya v2.1.0' \
   && okk 'a matching sha256 installs the binary 0755' || bad "install ok: rc=$irc why=$why"
-OUT=$( ( PATH="$TMP/wrap:$PATH"; TMPDIR="$TMP/agenttmp"; JSON_MODE=1; export AGENT_MAIL_HIMALAYA_BIN="$TMP/nobin/himalaya" CURL_FIXTURE="$TMP/fixture.tgz"
+OUT=$( ( PATH="$TMP/wrap:$PATH"; export TMPDIR="$TMP/agenttmp"; JSON_MODE=1; export AGENT_MAIL_HIMALAYA_BIN="$TMP/nobin/himalaya" CURL_FIXTURE="$TMP/fixture.tgz"
          _agent_mail_himalaya_asset() { printf 'https://example.invalid/h.tgz %s\n' 0000; }
          printf '%s\n' "$PW" | _agent_mail_set alpha "${SET_ARGS[@]}" ) 2>/dev/null); RC=$?
 (( RC == 7 )) && [[ "$(msg)" == "himalaya_install_failed: sha256 mismatch"* ]] && okk 'set surfaces a failed install as E_NOT_INSTALLED himalaya_install_failed:' || bad "set install fail: rc=$RC $(msg)"
