@@ -375,6 +375,9 @@ Sysadmin seat (a partner box's privileged work; each change waits for the owner'
   5dive sysadmin install [--auth-profile=<name>]      # root: the seat, its broker grant and its rules
   5dive sysadmin answer <sa-id> approve|decline --sha=<hex>   # root: the owner's tap, relayed by 5dive-api
 
+Telegram app (open 5dive inside Telegram from your agent's bot):
+  5dive telegram-app link --telegram-id=<id> [--json]   # one-time Mini App link for this box's owner (the bot's /app runs it)
+
 Web UI for this host (org chart, queue, gates, triggers) — now a PLUGIN:
   5dive plugin add 5dive-ai/5dive-ui                 # install it once, then 5dive ui works as before
   5dive board [--json]                               # the versioned document the views render (core owns this)
@@ -1365,6 +1368,13 @@ main() {
         tap) AUDIT_CMD="owner-ask tap"; AUDIT_ARGS=() ;;
       esac
       cmd_owner_ask "$@" ;;
+    telegram-app)
+      # DIVE-5185: an existing customer's agent bot (/app) asks for a one-time
+      # my.5dive.ai Mini App link signed into the box owner's account. Read-shaped
+      # (no registry, no lock); the Telegram id is not a secret, the link is never
+      # audited because it is one.
+      AUDIT_CMD="telegram-app ${1:-}"; AUDIT_ARGS=()
+      cmd_telegram_app "$@" ;;
     sysadmin)
       # DIVE-5187: the sysadmin seat's broker. Scripts travel on stdin and never
       # reach the audit row; the verb adds the request id and the target.

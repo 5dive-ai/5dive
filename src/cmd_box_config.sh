@@ -35,6 +35,7 @@ cmd_box_config() {
         "       5dive config reflex-endpoint-key=- < keyfile | clear" \
         "       5dive config openrouter-key=- < keyfile | clear" \
         "       5dive config mod-seat=on|off|default" \
+        "       5dive config telegram-app=on|off|default" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
         "             always          every standard row is graded" \
@@ -97,11 +98,14 @@ cmd_box_config() {
         "             'config' reports which key each consumer uses (openrouter-keys)." \
         "  mod-seat     whether a NEW claude seat gets the mod tool-call guard at create" \
         "             time, and whether 'doctor --category=mod' probes seats (DIVE-4936)." \
-        "             Default off: the plugin's hooks are an early-access Claude Code API."
+        "             Default off: the plugin's hooks are an early-access Claude Code API." \
+        "  telegram-app whether this box's agent bots answer /app with a button that opens" \
+        "             5dive inside Telegram, signed into the box owner's account (DIVE-5185)." \
+        "             Default on; off hides nothing else and changes no other command."
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
-      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat)" ;;
+      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app)" ;;
     esac
     shift
   done
@@ -150,6 +154,9 @@ cmd_box_config() {
     local okeys; okeys=$(openrouter_keys_json)
     local ms=off
     if declare -F mod_seat_enabled >/dev/null 2>&1 && mod_seat_enabled; then ms=on; fi
+    # DIVE-5185: the /app button; anything but "off" is on.
+    local ta; ta=$(jq -r '.telegram_app // "on"' <<<"$(_box_config_read)" 2>/dev/null || printf on)
+    [[ "$ta" == off ]] || ta=on
     ok "verify = ${policy} (${src})
 verify-small = ${small} (${ssrc})
 coauthor = ${coauthor} (box-wide, default on)
@@ -165,12 +172,13 @@ reflex-endpoint-key = ${rek}
 reflex-configured = ${rc}
 openrouter-key = ${ok_k}
 openrouter-keys = $(jq -r '"reflex: \(.reflex) · " + (if (.plugins | length) == 0 then "every plugin: shared" else ((.plugins | keys | map(. + ": own") | join(" · ")) + " · any other plugin: shared") end)' <<<"$okeys")
-mod-seat = ${ms} (box-wide, default off)" \
+mod-seat = ${ms} (box-wide, default off)
+telegram-app = ${ta} (box-wide, default on)" \
        '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s,
          reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk, reflex_key_source:$rks,
          reflex_endpoint:$re, reflex_endpoint_source:$res, reflex_api:$ra, reflex_api_source:$ras, reflex_endpoint_key:$rek,
-         reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, openrouter_keys:$oks, mod_seat:$ms, path:$p}' \
-       --arg ms "$ms" --arg ok "$ok_k" --argjson oks "$okeys" \
+         reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, openrouter_keys:$oks, mod_seat:$ms, telegram_app:$ta, path:$p}' \
+       --arg ms "$ms" --arg ok "$ok_k" --arg ta "$ta" --argjson oks "$okeys" \
        --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" \
        --arg pw "$pw" --arg pws "$pws" --arg p5 "$p5" --arg p5s "$p5s" \
        --arg rr "$rr" --arg rrs "$rrs" --arg rm "$rm" --arg rms "$rms" --arg re "$re" --arg res "$res" \
@@ -282,13 +290,16 @@ mod-seat = ${ms} (box-wide, default off)" \
       # DIVE-4936. Stored as .mod_seat; `default` clears it (= off).
       mod-seat|mod_seat) [[ "$v" == on || "$v" == off || "$v" == default ]] \
                 || fail "$E_VALIDATION" "mod-seat takes one of: on, off, default — got '$v'" ;;
+      # DIVE-5185. Stored as .telegram_app; `default` clears it (= on).
+      telegram-app|telegram_app) [[ "$v" == on || "$v" == off || "$v" == default ]] \
+                || fail "$E_VALIDATION" "telegram-app takes one of: on, off, default — got '$v'" ;;
       # DIVE-4890. Validated in full before anything is written, like every key
       # above: one bad value in a multi-key call writes none of them.
       pace-week|pace_week) _pace_week_valid "$v" \
                 || fail "$E_VALIDATION" "pace-week takes <soft>/<hard> (integers, soft <= hard <= 100, e.g. 85/95), off, or default — got '$v'" ;;
       pace-5h|pace_5h) _pace_5h_valid "$v" \
                 || fail "$E_VALIDATION" "pace-5h takes a percentage (an integer 0-100, e.g. 85), off, or default — got '$v'" ;;
-      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat)" ;;
+      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app)" ;;
     esac
   done
   require_root
@@ -313,7 +324,7 @@ mod-seat = ${ms} (box-wide, default off)" \
     if [[ "$v" == default && ( "$k" == pace-week || "$k" == pace_week || "$k" == pace-5h || "$k" == pace_5h \
           || "$k" == reflex-receipts || "$k" == reflex_receipts || "$k" == reflex-model || "$k" == reflex_model \
           || "$k" == reflex-endpoint || "$k" == reflex_endpoint || "$k" == reflex-api || "$k" == reflex_api \
-          || "$k" == mod-seat || "$k" == mod_seat ) ]]; then
+          || "$k" == mod-seat || "$k" == mod_seat || "$k" == telegram-app || "$k" == telegram_app ) ]]; then
       json=$(jq --arg k "${k//-/_}" 'del(.[$k])' <<<"$json")
     else
       json=$(jq --arg k "${k//-/_}" --arg v "$v" '.[$k] = $v' <<<"$json")
