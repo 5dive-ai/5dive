@@ -151,6 +151,7 @@ LAZY_FILES=(
   src/task/inbox.sh
   src/task/answer.sh
   src/task/doctor.sh
+  src/task/rebalance.sh
   src/cmd_task.sh
   src/cmd_trigger.sh
   src/cmd_trace.sh
@@ -180,6 +181,7 @@ LAZY_FILES=(
   src/cmd_fleet.sh
   src/cmd_usage.sh
   src/cmd_digest.sh
+  src/cmd_disk.sh
   src/cmd_proof.sh
   src/cmd_selfcheck.sh
   src/cmd_push.sh
