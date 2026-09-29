@@ -349,6 +349,20 @@ for name, meta in agents.items():
     models = {}
     turns = []
     pins = {}
+    # DIVE-677: one entry per API RESPONSE, not per transcript line. Claude Code
+    # writes one line per content block (thinking / text / tool_use) of a single
+    # response, and every one of those lines repeats the same message.id and
+    # requestId with the same usage — except output_tokens, which an early block
+    # can carry as a partial streaming count (8, then 205 on the next block).
+    # Summing per line billed each response once per block: marcus's session
+    # 5ff518ff read 195.0M against 84.8M per response (2.30x), and DIVE-675 was
+    # charged 174.9M against 77.3M. So each field keeps its largest value across
+    # the response's lines, and the response is charged once, after the scan.
+    # Keyed agent-wide, not per file: a message.id names one API call, and a
+    # forked subagent's file repeats its parent's calls (14 on ivan, 2026-09-29).
+    resp = {}      # message.id or requestId -> [ts, model, in, out, cc, cr, sid],
+                   # or None when its first block predates the window
+    unkeyed = []   # lines carrying neither id: nothing to match, so each counts
     denied = None
     # DIVE-3419: a middle level we could not read makes this agent a blind spot,
     # not a low scorer. Same destination as an unreadable home or file — never a
@@ -536,28 +550,42 @@ for name, meta in agents.items():
                     continue
                 if o.get("type") != "assistant":
                     continue
-                ts = to_epoch(o.get("timestamp"))
-                if ts is None or ts < since:
-                    continue
                 msg = o.get("message") or {}
                 u = msg.get("usage") or {}
-                model = msg.get("model") or "unknown"
-                i  = int(u.get("input_tokens") or 0)
-                ot = int(u.get("output_tokens") or 0)
-                cc = int(u.get("cache_creation_input_tokens") or 0)
-                cr = int(u.get("cache_read_input_tokens") or 0)
-                m = models.setdefault(model, {"in":0,"out":0,"cc":0,"cr":0,"turns":0})
-                m["in"]+=i; m["out"]+=ot; m["cc"]+=cc; m["cr"]+=cr; m["turns"]+=1
-                # Two bases per turn (DIVE-4037): `tot` = API-equivalent cost
-                # (excludes cache-read), `qta` = plan/quota consumption (all four
-                # classes). They are carried side by side rather than one being
-                # derived later, because the task-attribution below sums turns and
-                # a ratio computed after the fact cannot be re-split per task.
-                # DIVE-4589 adds cache-read as a fifth member: the per-ACCOUNT
-                # board reports it (it is ~97% of a plan's meter), and like the
-                # two bases above it cannot be re-split out of a sum computed
-                # after the fact.
-                turns.append((ts, ot, i+ot+cc, i+ot+cc+cr, cr, sid))
+                row = [to_epoch(o.get("timestamp")), msg.get("model") or "unknown",
+                       int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
+                       int(u.get("cache_creation_input_tokens") or 0),
+                       int(u.get("cache_read_input_tokens") or 0), sid]
+                inside = row[0] is not None and row[0] >= since
+                rkey = msg.get("id") or o.get("requestId")
+                if not rkey:
+                    if inside:
+                        unkeyed.append(row)
+                    continue
+                if rkey not in resp:
+                    # The FIRST block decides the window, so a response that
+                    # straddles `since` is counted in one window, never two.
+                    # Outside it, only the key is held, to swallow later blocks.
+                    resp[rkey] = row if inside else None
+                    continue
+                seen = resp[rkey]
+                if seen is not None:
+                    for k in (2, 3, 4, 5):
+                        if row[k] > seen[k]:
+                            seen[k] = row[k]
+    for ts, model, i, ot, cc, cr, sid in [r for r in resp.values() if r] + unkeyed:
+        m = models.setdefault(model, {"in":0,"out":0,"cc":0,"cr":0,"turns":0})
+        m["in"]+=i; m["out"]+=ot; m["cc"]+=cc; m["cr"]+=cr; m["turns"]+=1
+        # Two bases per turn (DIVE-4037): `tot` = API-equivalent cost
+        # (excludes cache-read), `qta` = plan/quota consumption (all four
+        # classes). They are carried side by side rather than one being
+        # derived later, because the task-attribution below sums turns and
+        # a ratio computed after the fact cannot be re-split per task.
+        # DIVE-4589 adds cache-read as a fifth member: the per-ACCOUNT
+        # board reports it (it is ~97% of a plan's meter), and like the
+        # two bases above it cannot be re-split out of a sum computed
+        # after the fact.
+        turns.append((ts, ot, i+ot+cc, i+ot+cc+cr, cr, sid))
     if pins:
         goal_pins[name] = pins
     # A partial read of ONE agent still makes the company total partial: the row
@@ -2019,6 +2047,20 @@ commands = []   # {"ts","cmd","desc"}
 skills = {}     # DIVE-1026: skill name -> {"fires":n, "cold":n} (cold = fired, no follow-on tool)
 counts = {"edit":0,"write":0,"multiedit":0,"notebook":0,"bash":0,"read":0,"turns":0}
 tot = out = 0
+seen_resp = {}   # DIVE-677: response -> [in, out, cc] already in tot/out
+def unbilled(seen, rkey, vals):
+    """DIVE-677: the part of `vals` not yet charged for API response `rkey`.
+    Claude Code writes one line per content block of a response, each repeating
+    its message.id and usage (output_tokens can be a partial streaming count on
+    an early block), so each field is charged up to its largest value, once."""
+    if not rkey:
+        return vals                     # nothing to match it to: it counts
+    prev = seen.get(rkey)
+    if prev is None:
+        seen[rkey] = list(vals)
+        return vals
+    seen[rkey] = [max(v, p) for v, p in zip(vals, prev)]
+    return [max(0, v - p) for v, p in zip(vals, prev)]
 lo = since if tstart is None else max(since, tstart)
 hi = now   if tend   is None else tend
 
@@ -2112,8 +2154,13 @@ for path in list_sessions(os.path.join(home, ".claude", "projects")):
                 continue
             msg = o.get("message") or {}
             u = msg.get("usage") or {}
-            tot += int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0)
-            out += int(u.get("output_tokens") or 0)
+            # DIVE-677: usage once per response; its tool_use blocks are still
+            # read per line below, since each line carries a different block.
+            i, o_, cc = unbilled(seen_resp, msg.get("id") or o.get("requestId"),
+                                 [int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
+                                  int(u.get("cache_creation_input_tokens") or 0)])
+            tot += i + o_ + cc
+            out += o_
             content = msg.get("content") or []
             if not isinstance(content, list):
                 continue
