@@ -279,7 +279,7 @@ out=$(cmd_task_rebalance --dry-run 2>&1)
 out2=$(cmd_task_rebalance 2>&1)
 check "A6 dry run leaves the board byte-identical" "$(snap)" "$b"
 check "A6 dry run sends nothing" "$(wc -l <"$SENT" | tr -d ' ')" "0"
-grep -q '^DRY RUN' <<<"$out" && grep -c '  MOVE ' <<<"$out" | grep -qx 2 \
+n=$(grep -c '  MOVE ' <<<"$out"); grep -q '^DRY RUN' <<<"$out" && [[ $n == 2 ]] \
   && ok_t "A6 dry run prints the two moves the tick would make" || bad_t "A6 dry run output" "$out"
 [[ "$out" == "$out2" ]] && ok_t "A6 bare verb is the dry run" || bad_t "A6 bare verb" "$out2"
 JSON_MODE=1; js=$(cmd_task_rebalance --dry-run 2>&1); JSON_MODE=0

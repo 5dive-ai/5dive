@@ -194,11 +194,12 @@ _rebal_why_not() {
       printf 'names %s' "$wident"; return 0
     fi
   done
-  local b
+  local b branches
+  branches=$(_rebal_branches "$body")
   while IFS= read -r b; do
     [[ -n "$b" ]] || continue
     if grep -qxF -- "$b" <<<"$_REBAL_WIP_BRANCHES"; then printf 'shares Branch: %s' "$b"; return 0; fi
-  done < <(_rebal_branches "$body")
+  done <<<"$branches"
   return 0
 }
 
@@ -206,13 +207,14 @@ _rebal_why_not() {
 # "<id>:<ident>" in _REBAL_WIP, and the branches those rows declare.
 _rebal_load_wip() {
   _REBAL_WIP=(); _REBAL_WIP_BRANCHES=""; _REBAL_WIP_IDS=""
-  local id ident
+  local id ident rows
+  rows=$(db "SELECT id||x'1f'||COALESCE(ident,'') FROM tasks
+              WHERE assignee=$(sqlq "$1") AND status IN ('in_progress','blocked') ORDER BY id;" 2>/dev/null)
   while IFS=$'\x1f' read -r id ident; do
     [[ -n "$id" ]] || continue
     _REBAL_WIP+=("${id}:${ident}"); _REBAL_WIP_IDS+="${_REBAL_WIP_IDS:+,}${id}"
     _REBAL_WIP_BRANCHES+="$(_rebal_branches "$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};" 2>/dev/null)")"$'\n'
-  done < <(db "SELECT id||x'1f'||COALESCE(ident,'') FROM tasks
-                WHERE assignee=$(sqlq "$1") AND status IN ('in_progress','blocked') ORDER BY id;" 2>/dev/null)
+  done <<<"$rows"
 }
 
 # _rebal_plan <now> <usage-json> — the decision, with no write. One TSV line per
@@ -227,12 +229,14 @@ _rebal_plan() {
   pools=$(_rebal_pools_json)
   min_todo=$(_rebal_knob rebalance_min_todo 4)
   max_moves=$(_rebal_knob rebalance_max_moves 2)
-  local pool
+  local pool names
+  names=$(jq -r 'keys[]' <<<"$pools" 2>/dev/null)
   while IFS= read -r pool; do
     [[ -n "$pool" ]] || continue
     local -a members=() busy=() idle=()
-    local m u w
-    mapfile -t members < <(jq -r --arg p "$pool" '.[$p][]? // empty' <<<"$pools")
+    local m u w list
+    list=$(jq -r --arg p "$pool" '.[$p][]? // empty' <<<"$pools")
+    [[ -z "$list" ]] || mapfile -t members <<<"$list"
     printf 'pool\t%s\t%s\n' "$pool" "$(IFS=,; printf '%s' "${members[*]}")"
     for m in "${members[@]}"; do
       u=$(_rebal_unstarted_count "$m"); w=$(_rebal_workable_count "$m")
@@ -257,11 +261,16 @@ _rebal_plan() {
     if (( ${#busy[@]} == 0 )); then printf 'none\t%s\tno member holds %s+ un-started rows\n' "$pool" "$min_todo"; continue; fi
     if (( ${#idle[@]} == 0 )); then printf 'none\t%s\tno member is idle with headroom\n' "$pool"; continue; fi
     # Heaviest queue first.
-    local b from total taken=0 ri=0 id ident prio to why
-    mapfile -t busy < <(printf '%s\n' "${busy[@]}" | sort -t: -k1,1nr -k2,2)
+    local b from total taken=0 ri=0 id ident prio to why sorted rows
+    sorted=$(printf '%s\n' "${busy[@]}" | sort -t: -k1,1nr -k2,2)
+    mapfile -t busy <<<"$sorted"
     for b in "${busy[@]}"; do
       total="${b%%:*}"; from="${b#*:}"; taken=0
       _rebal_load_wip "$from"
+      rows=$(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||priority FROM tasks
+                  WHERE assignee=$(sqlq "$from") AND kind='standard' AND status='todo'
+                  ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
+                                         WHEN 'medium' THEN 2 ELSE 3 END DESC, id DESC;" 2>/dev/null)
       while IFS=$'\x1f' read -r id ident prio; do
         [[ -n "$id" ]] || continue
         (( moves < max_moves )) || break
@@ -271,12 +280,9 @@ _rebal_plan() {
         if [[ -n "$why" ]]; then printf 'keep\t%s\t%s\t%s\t%s\n' "$id" "$ident" "$from" "$why"; continue; fi
         printf 'move\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$ident" "$from" "$to" "$pool" "$prio"
         moves=$((moves + 1)); taken=$((taken + 1)); ri=$((ri + 1))
-      done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||priority FROM tasks
-                    WHERE assignee=$(sqlq "$from") AND kind='standard' AND status='todo'
-                    ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
-                                           WHEN 'medium' THEN 2 ELSE 3 END DESC, id DESC;" 2>/dev/null)
+      done <<<"$rows"
     done
-  done < <(jq -r 'keys[]' <<<"$pools" 2>/dev/null)
+  done <<<"$names"
   return 0
 }
 
