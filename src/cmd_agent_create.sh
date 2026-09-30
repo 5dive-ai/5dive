@@ -1524,6 +1524,15 @@ _apply_byo_claude() {
   # Custom endpoints (esp. z.ai during peak hours) can be slow; raise the
   # client-side request timeout so long tool turns don't get cut off.
   printf '%s' "3000000" | profile_set_var "$profile" API_TIMEOUT_MS
+  # DIVE-5255: OpenRouter pre-authorises every turn's max_tokens against what is
+  # LEFT on the key. Claude Code asks for 128000 on an opus-named model, so a key
+  # with about $1 left (the my.5dive demo key, a partner allowance near its end)
+  # 402s on the very first "hi" with almost nothing spent. 16000 was measured
+  # live to answer. Written only when the profile has no value yet, so an
+  # operator's own cap survives a key rotation.
+  if [[ "$canonical" == "openrouter" && -z "$(profile_env_value "$profile" CLAUDE_CODE_MAX_OUTPUT_TOKENS)" ]]; then
+    printf '%s' "$CLAUDE_OPENROUTER_MAX_OUTPUT_TOKENS" | profile_set_var "$profile" CLAUDE_CODE_MAX_OUTPUT_TOKENS
+  fi
   # Neutralize any shared-account creds the template's unconditional
   # anthropic.env EnvironmentFile= would inject ahead of our override —
   # combined.env loads last so empty values win, forcing the harness onto
