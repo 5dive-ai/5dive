@@ -972,6 +972,127 @@ cmd_account_set() {
   fi
 }
 
+# `5dive account set-model <name> --model=<slug>` (DIVE-5259)
+#
+# Moves an alias-mapping account (the seeded OpenRouter one on a partner or
+# my.5dive box, any --provider profile) to another model WITHOUT its key: the
+# key was minted for the box and 5dive-api keeps only its hash, so `account set
+# --replace` cannot be the path. 5dive-api's included-model switch runs this on
+# every box of an org.
+#
+# THREE THINGS MOVE, and a switch that does fewer is one that looks done:
+#   1. The account's opus and sonnet tiers (ANTHROPIC_DEFAULT_{OPUS,SONNET}_MODEL).
+#      HAIKU STAYS: it is the background slot, and `--model` has left it on the
+#      catalog default since DIVE-1103, so a promo model that is pulled does not
+#      take background turns down with it.
+#   2. Each claude agent bound to the account that FOLLOWS it. Create and import
+#      write the account's mapped id into settings.json (DIVE-5163), so moving
+#      the map alone moves no agent. An agent follows when it is on what its
+#      recorded family resolved to on this account, on that family's claude-*
+#      id, or (no family recorded) on the old opus/sonnet mapping. Any other id
+#      is a deliberate pin and is left. A bare alias follows the map by itself.
+#   3. A restart, because the map is an EnvironmentFile. Only an IDLE agent is
+#      restarted now; a busy one is marked and the heartbeat's pending-restart
+#      sweep bounces it at its next task boundary (_restart_decide, DIVE-5007).
+#      A client mid-conversation keeps its turn.
+_account_set_model_usage() {
+  cat <<'ACCTSETMODEL'
+usage: 5dive account set-model <name> --model=<slug>
+
+  Move an alias-mapping account (one with its own base URL, e.g. the seeded
+  OpenRouter account) to another model, keeping its key. Rewrites the opus and
+  sonnet tiers, re-pins every claude agent bound to the account that follows
+  it, and restarts those agents when idle (busy ones at their next task
+  boundary). The haiku (background) tier is left as it is.
+ACCTSETMODEL
+}
+
+cmd_account_set_model() {
+  local name="" model=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model=*) model="${1#--model=}" ;;
+      -*)        fail "$E_USAGE" "unknown flag: $1"$'\n'"$(_account_set_model_usage)" ;;
+      *)         [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" && -n "$model" ]] || fail "$E_USAGE" "$(_account_set_model_usage)"
+  valid_profile_name "$name" || fail "$E_VALIDATION" "invalid account name"
+  valid_model "$model" \
+    || fail "$E_VALIDATION" "invalid model '$model' (allowed chars: letters/digits/._:/-)"
+  # A family alias as a map entry is ignored by the resolver (profile_alias_model)
+  # and would be stripped bare from a fresh config dir: not a model to move to.
+  ! model_latest "$model" >/dev/null \
+    || fail "$E_VALIDATION" "'$model' is a family alias, not a model id — pass the provider's id (e.g. deepseek/deepseek-v4.1-flash)"
+  require_root "account set-model"
+  local file="${AUTH_PROFILES_DIR}/${name}/combined.env"
+  [[ -f "$file" ]] || fail "$E_NOT_FOUND" "no account named '$name'"
+  [[ -n "$(profile_env_value "$name" ANTHROPIC_BASE_URL)" ]] \
+    || fail "$E_VALIDATION" "account '$name' has no base URL of its own: it is an Anthropic account, whose models are Anthropic's"
+
+  local old_opus old_sonnet changed=0
+  old_opus=$(profile_env_value "$name" ANTHROPIC_DEFAULT_OPUS_MODEL)
+  old_sonnet=$(profile_env_value "$name" ANTHROPIC_DEFAULT_SONNET_MODEL)
+  if [[ "$old_opus" != "$model" || "$old_sonnet" != "$model" ]]; then
+    printf '%s' "$model" | profile_set_var "$name" ANTHROPIC_DEFAULT_OPUS_MODEL
+    printf '%s' "$model" | profile_set_var "$name" ANTHROPIC_DEFAULT_SONNET_MODEL
+    changed=1
+  fi
+
+  local reg bound agent type fam cur old_fam want repin restart rows=()
+  reg=$(registry_read)
+  bound=$(jq -r --arg p "$name" '.agents | to_entries[] | select(.value.authProfile == $p) | .key' <<<"$reg")
+  while IFS= read -r agent; do
+    [[ -n "$agent" ]] || continue
+    type=$(jq -r --arg n "$agent" '.agents[$n].type // ""' <<<"$reg")
+    [[ "$type" == "claude" ]] || continue
+    cur=$(resolve_agent_model claude "$agent") || cur=""
+    fam=$(jq -r --arg n "$agent" '.agents[$n].modelFamily // ""' <<<"$reg")
+    [[ -n "$fam" ]] || fam=$(model_family_of "$cur")
+    case "$fam" in
+      opus)   old_fam="$old_opus" ;;
+      sonnet) old_fam="$old_sonnet" ;;
+      *)      old_fam="" ;;
+    esac
+    want="" repin=0
+    if [[ -z "$cur" ]] || model_latest "$cur" >/dev/null; then
+      :  # no pin, or a bare alias: the map carries it
+    elif [[ "$fam" == opus || "$fam" == sonnet ]]; then
+      [[ "$cur" == "$old_fam" || "$cur" == "$(model_latest "$fam")" ]] && want="$model"
+    elif [[ -z "$fam" ]] && [[ "$cur" == "$old_opus" || "$cur" == "$old_sonnet" ]]; then
+      want="$model"
+    fi
+    if [[ -n "$want" && "$want" != "$cur" ]]; then
+      step "Re-pinning agent '$agent': $cur -> $want"
+      write_runtime_model claude "$agent" "$want"
+      repin=1
+    fi
+    restart=none
+    if (( changed || repin )); then
+      case "$(_restart_decide "$agent" "account $name moved to $model")" in
+        "restart idle"|"restart mark-failed")
+          if systemctl restart "5dive-agent@${agent}.service" >&2 2>&1; then restart=now; else
+            restart=failed
+            warn "restart of agent '$agent' failed — check journalctl -u 5dive-agent@${agent}"
+          fi ;;
+        deferred*) restart=deferred ;;
+        held*)     restart=held ;;
+        *)         restart=failed ;;
+      esac
+    fi
+    rows+=("$(jq -cn --arg n "$agent" --arg f "$cur" --arg t "${want:-$cur}" --argjson r "$repin" --arg s "$restart" \
+      '{name:$n, from:$f, to:$t, repinned:($r == 1), restart:$s}')")
+  done <<<"$bound"
+
+  local agents_json
+  agents_json=$(printf '%s\n' ${rows[@]+"${rows[@]}"} | jq -cs '.')
+  ok "account '$name' on $model ($(jq -r 'length' <<<"$agents_json") claude agent(s) bound)" \
+     '{account:$a, model:$m, changed:($c == 1), previous:{opus:$po, sonnet:$ps}, agents:$ag}' \
+     --arg a "$name" --arg m "$model" --argjson c "$changed" \
+     --arg po "$old_opus" --arg ps "$old_sonnet" --argjson ag "$agents_json"
+}
+
 cmd_agent_set_account() {
   local agent="${1:-}" account="${2:-}"
   [[ -n "$agent" && -n "$account" ]] \
