@@ -354,8 +354,11 @@ fi
 # ------------------------------------------------------------- live arm -----
 # The row's acceptance test: a COMPLETED browser run leaves no agent-browser
 # or chrome process behind. Real CLI, real Chrome, real hook — skipped (not
-# failed) where the browser is not installed, e.g. CI.
-if command -v agent-browser >/dev/null 2>&1 \
+# failed) where the browser is not installed, e.g. CI. Opt-in: it launches a
+# real browser under this $HOME and runs the hook against this uid's processes.
+if ! live_arm_ok; then
+  printf 'SKIP live arm: not opted in — it launches a real browser and kills this uid'"'"'s agent-browser processes (FIVEDIVE_LIVE_ARMS=1 runs it)\n'
+elif command -v agent-browser >/dev/null 2>&1 \
    && [[ -d "$HOME/.agent-browser/browsers" || -n "${AGENT_BROWSER_LIVE:-}" ]]; then
   # Count with the SHIPPED pattern, not a bare word: a bare one self-matches
   # the very shell running the count (see arm8).
