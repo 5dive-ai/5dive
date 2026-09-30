@@ -98,8 +98,9 @@ DENY='uninstall self-update self_update update paperclip-seed fire hire'
 # gave `agent`/`account` subverbs their `--help` gave the surface one too. T5 is
 # what required it to come off here in the same PR — which is the point of a
 # self-retiring waiver. `push` came off on 2026-09-26 the same way: its flag loop
-# gained a --help arm.
-WAIVED='activity buzz cost deploy doctor gate-proof host objective objectives project projects trace usage'
+# gained a --help arm. `doctor` came off on 2026-09-30: it answers --help before
+# its root check.
+WAIVED='activity buzz cost deploy gate-proof host objective objectives project projects trace usage'
 
 in_list() { local n="$1"; shift; local x; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
 

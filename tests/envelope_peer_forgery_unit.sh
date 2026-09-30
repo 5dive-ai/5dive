@@ -242,13 +242,17 @@ eq_t "every --from acceptor in $RT calls the guard" "" "${_unguarded% }"
 # ---------------------------------------------------------------------------
 LIVE_REG=/var/lib/5dive/agents.json
 _peer=""
-if [[ -x ./5dive && -r "$LIVE_REG" ]] && command -v jq >/dev/null 2>&1; then
+_live_skip="live arm needs a built ./5dive and a populated registry with a peer (absent here — A-D are the graded set)"
+if ! live_arm_ok; then
+  # Both runs land in this box's fleet audit log under the caller's real name.
+  _live_skip="live arm not opted in: it runs the shipped ./5dive, which writes this box's fleet audit log (FIVEDIVE_LIVE_ARMS=1 runs it — A-D are the graded set)"
+elif [[ -x ./5dive && -r "$LIVE_REG" ]] && command -v jq >/dev/null 2>&1; then
   # A registered peer that is NOT this caller, chosen from the live registry.
   _self="$(id -un)"; _self="${_self#agent-}"
   _peer="$(jq -r --arg me "$_self" '.agents|keys[]|select(. != $me)' "$LIVE_REG" 2>/dev/null | head -1)"
 fi
 if [[ -z "$_peer" ]]; then
-  skip_t "live arm needs a built ./5dive and a populated registry with a peer (absent here — A-D are the graded set)"
+  skip_t "$_live_skip"
 else
   _t="nonexistent-target-2183"
   ./5dive agent ask "$_t" "probe" --from="$_peer" --timeout=1 >/dev/null 2>&1; _rc_forged=$?

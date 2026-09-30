@@ -1530,6 +1530,17 @@ doctor_check_consolidate_transacting() {
 }
 
 cmd_doctor() {
+  # Asking what doctor does needs no root, so answer before require_root — with
+  # the block `5dive --help` prints, not a second copy of it. It used to fail
+  # the root check, and then, under sudo, `unknown flag: --help`.
+  if _verb_help_wanted "$@"; then
+    AUDIT_CMD=""   # a help request mutates nothing, even alongside --fix
+    local _help
+    _help=$(_verb_surface_help usage "5dive" "5dive " doctor) || _help=""
+    [[ -n "$_help" ]] || fail "$E_USAGE" "5dive doctor: no usage text — the verb is not documented in '5dive --help'"
+    printf '%s\n' "$_help"
+    return 0
+  fi
   require_root
   local filter="" want_fix=0 dry=0
   DOCTOR_REPAIR=0

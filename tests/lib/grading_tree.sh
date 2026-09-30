@@ -115,4 +115,15 @@ fi
 # call, so a production default change cannot silently move their fixture.
 . "$(dirname -- "${BASH_SOURCE[0]}")/verify_policy_fixture.sh" \
   || printf 'verify-policy fixture: UNRESOLVED (tests/lib/verify_policy_fixture.sh not reachable)\n' >&2
+
+# LIVE ARMS ARE OPT-IN. A live arm runs the shipped ./5dive against this box, or
+# writes the box's live state, and neither can be sandboxed: a built ./5dive is
+# not a sourced caller, so src/lib/audit.sh's fence does not spare it, and
+# src/header.sh hardcodes AUDIT_LOG on purpose. Run by default, such an arm put
+# its fixture rows in /var/log/5dive/agent-audit.log on every run — a real seat,
+# on the record, forging a peer's --from. So each one skips unless the caller
+# asks for it with FIVEDIVE_LIVE_ARMS=1.
+#   FIVEDIVE_, not FIVE_: env_isolation.sh above unsets every inherited FIVE_*
+# knob, so a FIVE_ opt-in would be cleared before any arm could read it.
+live_arm_ok() { [[ -n "${FIVEDIVE_LIVE_ARMS:-}" ]]; }
 :

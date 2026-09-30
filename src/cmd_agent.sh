@@ -353,7 +353,7 @@ _cmd_list_legacy() {
     # refreshable token, and why an unreadable credential is `unknown` rather
     # than an alarm. `|| true` keeps a best-effort read from aborting the list.
     local _ha _ha_state _ha_exp _ha_refresh _hs _hs_state _hs_reason _op_state
-    _ha=$(agent_auth_health "$ltype" "$lprof" || true)
+    _ha=$(agent_auth_health "$ltype" "$lprof" "$name" || true)
     [[ -n "$_ha" ]] || _ha="unknown|-|false"
     _ha_state="${_ha%%|*}"
     _ha_exp="${_ha#*|}"; _ha_exp="${_ha_exp%%|*}"
@@ -1892,7 +1892,7 @@ cmd_info() {
   # let either one veto liveness in the primary operational state.
   local _info_prof _ha _ha_state _ha_exp _ha_refresh _hs _hs_state _hs_reason _op_state _auth_line
   _info_prof=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
-  _ha=$(agent_auth_health "$type" "$_info_prof" || true)
+  _ha=$(agent_auth_health "$type" "$_info_prof" "$name" || true)
   [[ -n "$_ha" ]] || _ha='unknown|-|false'
   _ha_state="${_ha%%|*}"
   _ha_exp="${_ha#*|}"; _ha_exp="${_ha_exp%%|*}"

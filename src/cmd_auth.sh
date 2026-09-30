@@ -1081,7 +1081,7 @@ _cred_refreshable() {
   [[ -n "$r" ]]
 }
 
-# agent_auth_health <type> <profile> — "<state>|<expiryEpoch|->|<refreshable>"
+# agent_auth_health <type> <profile> [<name>] — "<state>|<expiryEpoch|->|<refreshable>"
 # for one agent. Never fails, never blocks; unreadable input yields `unknown`.
 #
 #   ok          — credential present (and either unexpired, or renewable)
@@ -1093,9 +1093,22 @@ _cred_refreshable() {
 # ships with free models and needs no sign-in, which is the same answer to the
 # only question this column asks.
 agent_auth_health() {
-  local type="$1" profile="${2:-}"
+  local type="$1" profile="${2:-}" name="${3:-}"
   local sentinel="${TYPE_AUTH[$type]:-}"
   [[ -n "$sentinel" ]] || { echo "ok|-|false"; return 0; }
+  # A codex seat does not run on the profile file: 5dive-agent-start only SEEDS
+  # $HOME/.codex/auth.json from it and points CODEX_HOME there, and from then on
+  # the seat rotates its own tokens. So the profile copy only ages — grading it
+  # reported a months-old expiry for a seat that had just signed in, and `ok` for
+  # a seat sitting on Codex's sign-in menu. Given the seat's name, read the file
+  # the seat runs on. No blob (first boot, or a caller that cannot read the
+  # seat's home) falls through to the profile path unchanged.
+  if [[ "$type" == codex && -n "$name" ]]; then
+    local seat_path seat_blob
+    seat_path="${AGENT_HOME_ROOT:-/home}/agent-${name}/.codex/auth.json"
+    seat_blob=$(cat "$seat_path" 2>/dev/null || sudo -n cat "$seat_path" 2>/dev/null || true)
+    [[ -n "$seat_blob" ]] && { _auth_health_grade_blob "$seat_blob"; return 0; }
+  fi
   # Sentinels are "<path>" or "<path>:<key>"; only the path half is needed here
   # (auth_creds_present owns the key half).
   local path="${sentinel%%:*}"
@@ -1147,7 +1160,13 @@ agent_auth_health() {
   local blob
   blob=$(cat "$path" 2>/dev/null || sudo -n cat "$path" 2>/dev/null || true)
   [[ -n "$blob" ]] || { echo "ok|-|false"; return 0; }
-  local refreshable=false exp=""
+  _auth_health_grade_blob "$blob"
+}
+
+# _auth_health_grade_blob <blob> — the expiry half of agent_auth_health, for a
+# credential blob already known to be present.
+_auth_health_grade_blob() {
+  local blob="$1" refreshable=false exp=""
   _cred_refreshable "$blob" && refreshable=true
   exp=$(_cred_expiry_epoch "$blob" 2>/dev/null || true)
   if [[ -n "$exp" ]] && (( exp < $(date +%s) )) && [[ "$refreshable" == "false" ]]; then
