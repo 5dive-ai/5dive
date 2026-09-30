@@ -13,7 +13,7 @@ set -euo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; rm -f "${capture:-}" "${captured_settings:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
+trap 'rc=$?; rm -f "${capture:-}" "${captured_settings:-}" "${captured_claude_json:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091
@@ -29,6 +29,7 @@ source src/cmd_agent_create.sh
 
 capture=$(mktemp)
 captured_settings=$(mktemp)
+captured_claude_json=$(mktemp)
 step() { :; }
 warn() { printf 'WARN %s\n' "$*" >>"$capture"; }
 profile_set_var() {
@@ -78,6 +79,8 @@ sudo() {
   local args="$*"
   if [[ "$args" == *"tee ${expected_settings_path}"* ]]; then
     cat >"$captured_settings"
+  elif [[ "$args" == *"tee /home/agent-${test_agent}/.claude.json"* ]]; then
+    cat >"$captured_claude_json"
   elif [[ "$args" == *'tee '* ]]; then
     cat >/dev/null
   fi
@@ -87,6 +90,10 @@ chmod() { :; }
 install_default_skill_for_agent() { :; }
 preseed_claude_agent "$test_agent" none google/gemini-2.5-pro low
 jq -e '.model == "google/gemini-2.5-pro"' "$captured_settings" >/dev/null
+# DIVE-5255: the auto-mode offer is pre-answered, or a new agent's first
+# Telegram message is typed into that dialog and lost (and its Enter says Yes).
+jq -e '.hasSeenAutoDefaultNudge == true and .hasCompletedOnboarding == true' "$captured_claude_json" >/dev/null
+jq -e '.permissions.defaultMode == "bypassPermissions"' "$captured_settings" >/dev/null
 jq -e '.effortLevel == "low"' "$captured_settings" >/dev/null
 # DIVE-4863: Claude Code >= 2.1.280 ignores the top-level key for
 # claude-opus-5-5 and newer — the create path must also write the per-model one,

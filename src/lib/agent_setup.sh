@@ -366,10 +366,17 @@ preseed_claude_agent() {
   sudo -u "$user" ln -sfn /home/claude/.local/bin/claude "$home/.local/bin/claude"
 
   # .claude.json: theme + onboarding + trust for /home/claude/projects
+  # DIVE-5255: hasSeenAutoDefaultNudge. On its first boot a bypassPermissions
+  # session opens "Make auto mode your default permission mode?" (Yes / No). A
+  # new agent's first input is its first Telegram message, typed into the pane
+  # on a seat whose channels are refused: the text went into the dialog, the
+  # Enter chose "Yes", and the message was lost while the agent switched itself
+  # to auto mode. Seeding the flag skips the offer and keeps the mode set below.
   sudo -u "$user" tee "$home/.claude.json" >/dev/null <<JSON
 {
   "theme": "dark",
   "hasCompletedOnboarding": true,
+  "hasSeenAutoDefaultNudge": true,
   "projects": {
     "/home/claude/projects": {
       "hasTrustDialogAccepted": true,

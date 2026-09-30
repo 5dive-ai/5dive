@@ -1180,6 +1180,14 @@ declare -A CLAUDE_PROVIDER_HAIKU_MODEL=(
   [zai]="glm-4.5-air"
 )
 
+# DIVE-5255: the output cap a claude profile on OpenRouter is written with (see
+# _apply_byo_claude). OpenRouter holds back the worst case of a turn's max_tokens
+# from what is left on the key, so the cap is also how much of a small key can
+# never be spent: $1 affords about 60000 on deepseek-v4.1-flash (measured), so
+# at 16000 turns stop once about $0.27 is left, and at Claude Code's own 128000
+# a $1 key never answers at all.
+CLAUDE_OPENROUTER_MAX_OUTPUT_TOKENS=16000
+
 # claude_baseurl_catalog_provider <url> — reverse the CLAUDE_PROVIDER_BASEURL
 # catalog: echo the canonical vendor id that serves <url>, or nothing when no
 # row does. Empty output is the load-bearing answer: it means the url came from

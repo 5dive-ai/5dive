@@ -249,6 +249,46 @@ RC="$(run_in "$KEY2" cmd_account_set or-literal --type=claude --provider=deepsee
   && ok_t "M2: RESTORE took — the guard is back and refuses again" \
   || bad_t "M2: restore took" "rc=$RC (later arms would grade the mutant)"
 
+# =============================================================================
+# DIVE-5255 — an OpenRouter claude profile is written with an output cap. Without
+# it Claude Code asks for 128000 tokens and OpenRouter refuses a small key's very
+# first turn (402 "can only afford 60000"), with almost nothing spent.
+# =============================================================================
+capof() { grep -E '^CLAUDE_CODE_MAX_OUTPUT_TOKENS=' "$(envf "$1")" 2>/dev/null | tail -1 | cut -d= -f2-; }
+RC="$(run_in "$KEY1" cmd_account_set or-cap --type=claude --provider=openrouter --api-key=-)"
+[[ "$RC" == "0" && "$(capof or-cap)" == "16000" ]] \
+  && ok_t "E1: account set --provider=openrouter writes CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000" \
+  || bad_t "E1: the openrouter profile carries the cap" "rc=$RC cap='$(capof or-cap)'"
+printf '%s' 64000 | profile_set_var or-cap CLAUDE_CODE_MAX_OUTPUT_TOKENS
+RC="$(run_in "$KEY2" cmd_account_set or-cap --type=claude --provider=openrouter --api-key=- --replace)"
+{ [[ "$RC" == "0" && "$(capof or-cap)" == "64000" ]] && has "$(cat "$(envf or-cap)")" "ANTHROPIC_AUTH_TOKEN=${KEY2}"; } \
+  && ok_t "E2: a key rotation keeps an operator's own cap (64000 stays, the new key lands)" \
+  || bad_t "E2: rotation preserves the cap" "rc=$RC cap='$(capof or-cap)'"
+RC="$(run_in "$KEY1" cmd_account_set ds-cap --type=claude --provider=deepseek --api-key=-)"
+[[ "$RC" == "0" && -f "$(envf ds-cap)" && -z "$(capof ds-cap)" ]] \
+  && ok_t "E3: a non-OpenRouter profile gets no cap (only OpenRouter pre-authorises max_tokens)" \
+  || bad_t "E3: deepseek is left alone" "rc=$RC cap='$(capof ds-cap)'"
+
+# MUTANT — take the cap write out and E1 goes red.
+ORIG="$(declare -f _apply_byo_claude)"
+MUT="$(printf '%s\n' "$ORIG" | sed 's/^\([[:space:]]*\)if \[\[ "\$canonical" == "openrouter" && .*CLAUDE_CODE_MAX_OUTPUT_TOKENS.*; then$/\1if false; then/')"
+has "$ORIG" '"$canonical" == "openrouter" &&' \
+  && ok_t "M3a: BEFORE — the shipped writer really does carry the cap" \
+  || bad_t "M3a: the cap is in the shipped writer" "not found; the mutant arm below is vacuous"
+{ has "$MUT" 'if false; then' && ! has "$MUT" '"$canonical" == "openrouter" &&'; } \
+  && ok_t "M3b: AFTER — the mutation really removed it (the sed matched)" \
+  || bad_t "M3b: the mutation took" "the sed did not match; the mutant is not mutated"
+eval "$MUT"
+RC="$(run_in "$KEY1" cmd_account_set or-nocap --type=claude --provider=openrouter --api-key=-)"
+[[ "$RC" == "0" && -z "$(capof or-nocap)" ]] \
+  && ok_t "M4: MUTANT — the openrouter profile is written with NO cap (E1 would be red on it)" \
+  || bad_t "M4: mutant drops the cap" "rc=$RC cap='$(capof or-nocap)'"
+eval "$ORIG"
+RC="$(run_in "$KEY1" cmd_account_set or-cap2 --type=claude --provider=openrouter --api-key=-)"
+[[ "$RC" == "0" && "$(capof or-cap2)" == "16000" ]] \
+  && ok_t "M5: RESTORE took — the cap is written again" \
+  || bad_t "M5: restore took" "rc=$RC cap='$(capof or-cap2)'"
+
 echo "-----"
 printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
