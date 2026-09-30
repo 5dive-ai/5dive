@@ -40,13 +40,15 @@
 # an-unscoped-alarm-can-only-offer-spend.md). A non-root run ignores root-owned
 # holders it cannot see; it can only unlink its OWN entries anyway (sticky /tmp).
 #
-# THE ALARM. Under 10% free the box owner is told ONCE, through the same paired
+# THE ALARM. Under 5% free (lodar 2026-09-30: tell them at 95% full, not 90%)
+# the box owner is told ONCE, through the same paired
 # chat the gate alerts use, and is not told again until the disk recovers past
 # the re-arm line. A tick that cannot deliver does not mark the episode told, so
 # it retries next hour rather than going silent.
 #
 # CADENCE: /etc/cron.d/5dive-disk runs `disk tick` hourly. The tick sweeps once a
-# day, or every hour while the disk is under the alarm line, then checks the alarm.
+# day, or every hour while the disk is under the pressure line (10% free), then
+# checks the alarm.
 
 DISK_TMP_ROOT="${FIVEDIVE_DISK_TMP_ROOT:-/tmp}"
 # Test seam: the harness points this at a proc tree of its own holders (plus a
@@ -58,8 +60,9 @@ if [[ -n "${FIVEDIVE_DISK_PROC_ROOT:-}" && "$EUID" -ne 0 ]]; then DISK_PROC="$FI
 DISK_CHROME_MIN_AGE="${FIVEDIVE_DISK_CHROME_MIN_AGE_MIN:-60}"
 DISK_SWEEP_LOG="${FIVEDIVE_DISK_SWEEP_LOG:-/var/log/5dive/disk-sweep.log}"
 DISK_ALARM_PATH="${FIVEDIVE_DISK_ALARM_PATH:-/}"
-DISK_ALARM_PCT="${FIVEDIVE_DISK_ALARM_PCT:-10}"
-DISK_REARM_PCT="${FIVEDIVE_DISK_REARM_PCT:-15}"
+DISK_ALARM_PCT="${FIVEDIVE_DISK_ALARM_PCT:-5}"
+DISK_REARM_PCT="${FIVEDIVE_DISK_REARM_PCT:-10}"
+DISK_PRESSURE_PCT="${FIVEDIVE_DISK_PRESSURE_PCT:-10}"   # hourly sweeps start here, ahead of the alarm
 DISK_SWEEP_EVERY="${FIVEDIVE_DISK_SWEEP_EVERY_S:-82800}"   # ~daily; the cron is hourly
 DISK_PRESSURE_SWEEP_EVERY="${FIVEDIVE_DISK_PRESSURE_SWEEP_EVERY_S:-3600}"
 
@@ -304,7 +307,7 @@ cmd_disk_tick() {
   local now last pct
   now=$(date +%s); last=$(_disk_state_get '.last_sweep_at'); [[ "$last" =~ ^[0-9]+$ ]] || last=0
   pct=$(_disk_free_pct "$DISK_ALARM_PATH" || echo 100)
-  if (( now - last >= DISK_SWEEP_EVERY )) || { (( pct < DISK_ALARM_PCT )) && (( now - last >= DISK_PRESSURE_SWEEP_EVERY )); }; then
+  if (( now - last >= DISK_SWEEP_EVERY )) || { (( pct < DISK_PRESSURE_PCT )) && (( now - last >= DISK_PRESSURE_SWEEP_EVERY )); }; then
     cmd_disk_sweep || true
     _disk_state_set '.last_sweep_at=($t|tonumber)' --arg t "$now"
   fi
@@ -324,7 +327,7 @@ usage: 5dive disk sweep [--dry-run]   delete ONLY caches a tool rebuilds on its 
                                       old, unheld Chrome temp files in /tmp; npm and nvm
                                       download caches (via npm/nvm); apt-get clean;
                                       disabled snap revisions. Logs what it freed.
-       5dive disk alarm               tell the box owner once when the disk is under 10% free
+       5dive disk alarm               tell the box owner once when the disk is under 5% free
        5dive disk tick                the hourly cron driver: daily sweep (hourly under
                                       pressure), then the alarm
 Never touched: homes, projects, agent memory and transcripts, model caches,
