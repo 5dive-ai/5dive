@@ -235,6 +235,8 @@ echo "── M: MUTATION ARMS — revert each divergence, assert the property re
 # ERROR, loudly, because it is the one outcome that cannot distinguish a working
 # mutation from a broken one.
 MUTBIN="$TMP/5dive-mut"
+# THE RESTORE BASELINE for M6, taken before any arm touches the tree.
+for _f in src/cmd_board.sh src/main.sh build.sh; do cp "$_f" "$TMP/orig-${_f//\//_}"; done
 # MUT_LINES is the arm's declared BLAST RADIUS: how many source lines the sed is
 # supposed to hit. It exists because "it applied somewhere" is not the same as
 # "it applied everywhere the property lives". DIVE-4779 iteration 1 shipped a
@@ -242,9 +244,18 @@ MUTBIN="$TMP/5dive-mut"
 # the tree changed, and the arm then graded whichever document the box happened
 # to serve — green in CI (no store, absent path, unmutated) and red here (a
 # populated store). A count is the only thing that tells those two apart.
-mut() { # [MUT_LINES=n] <name> <sed-expr> <file> <check-cmd...>
+# MUT_SOURCE_ONLY=1 declares an arm whose check reads SOURCE files and never runs
+# "$MUTBIN" (M1): building a bundle for it grades nothing and costs a full build
+# against the core tier's 300s budget (DIVE-5291). The declaration is enforced —
+# a source-only check that names $MUTBIN is a harness error, not a skip.
+mut() { # [MUT_LINES=n] [MUT_SOURCE_ONLY=1] <name> <sed-expr> <file> <check-cmd...>
   local name="$1" expr="$2" file="$3"; shift 3
   local want="${MUT_LINES:-1}"; unset MUT_LINES   # one arm at a time; never leaks to the next
+  local source_only="${MUT_SOURCE_ONLY:-0}"; unset MUT_SOURCE_ONLY
+  if (( source_only )) && [[ "$*" == *MUTBIN* ]]; then
+    bad_t "M:$name DECLARED SOURCE-ONLY BUT ITS CHECK RUNS \$MUTBIN" "a source-only arm is never built, so this check would run a stale or absent bundle — drop MUT_SOURCE_ONLY or the \$MUTBIN call"
+    return
+  fi
   local bak="$TMP/bak-$RANDOM"; cp "$file" "$bak"
   sed -i "$expr" "$file"
   if cmp -s "$bak" "$file"; then
@@ -259,7 +270,7 @@ mut() { # [MUT_LINES=n] <name> <sed-expr> <file> <check-cmd...>
     return
   fi
   local built=1
-  BUILD_OUT="$MUTBIN" ./build.sh >/dev/null 2>&1 || built=0
+  (( source_only )) || { BUILD_OUT="$MUTBIN" ./build.sh >/dev/null 2>&1 || built=0; }
   if (( built )); then
     ( MUTBIN="$MUTBIN" "$@" ) >/dev/null 2>&1
     local rc=$?
@@ -273,7 +284,7 @@ mut() { # [MUT_LINES=n] <name> <sed-expr> <file> <check-cmd...>
 }
 # M1 — the drift tripwire itself. Bump the code's version and leave the doc alone;
 # arm A3's comparison must red, or "two copies of one fact" is unguarded.
-mut "version-drift" 's|^FIVEDIVE_BOARD_CONTRACT_VERSION=1|FIVEDIVE_BOARD_CONTRACT_VERSION=2|' 'src/cmd_board.sh' \
+MUT_SOURCE_ONLY=1 mut "version-drift" 's|^FIVEDIVE_BOARD_CONTRACT_VERSION=1|FIVEDIVE_BOARD_CONTRACT_VERSION=2|' 'src/cmd_board.sh' \
     bash -c 'v=$(grep -E "^FIVEDIVE_BOARD_CONTRACT_VERSION=" src/cmd_board.sh | cut -d= -f2); d=$(grep -oE "^\| [0-9]+ \|" docs/board-contract.md | grep -oE "[0-9]+" | sort -rn | head -1); [[ "$v" == "$d" ]]'
 # M2 — store-free negotiation. Let --contract-version fall through to the producer
 # and it stops answering on a box with no store, so the consumer's only pre-flight
@@ -301,11 +312,17 @@ MUT_LINES=2 mut "contract-in-document" 's|contract: {name: \$cn, version: \$cv},
 mut "in-the-bundle" '\|^  src/cmd_board.sh$|d' 'build.sh' \
     bash -c 'v=$("$MUTBIN" board --contract-version 2>/dev/null); grep -qE "^[0-9]+$" <<<"$v"'
 # The tree must be byte-identical to how it started, or a later arm (or a commit)
-# carries a mutation. Asserted, not assumed.
-BUILD_OUT="$TMP/5dive-restored" ./build.sh >/dev/null 2>&1 \
-  && [[ "$("$TMP/5dive-restored" board --contract-version 2>/dev/null)" == "$SRC_V" ]] \
-  && ok_t "M6 the tree is restored after every mutation (the bundle rebuilds and reports $SRC_V)" \
-  || bad_t "M6 tree restored" "a mutation was left in the working tree — do not commit this"
+# carries a mutation. Asserted, not assumed — and asserted BYTE-FOR-BYTE on every
+# file an arm mutates. That is the property itself; the rebuild-and-ask-the-version
+# check it replaces could only see a mutation that changed the version string, and
+# cost a full build for it (DIVE-5291).
+_unrestored=""
+for _f in src/cmd_board.sh src/main.sh build.sh; do
+  cmp -s "$_f" "$TMP/orig-${_f//\//_}" || _unrestored+=" $_f"
+done
+[[ -z "$_unrestored" ]] \
+  && ok_t "M6 the tree is restored after every mutation (every mutated file is byte-identical to its start)" \
+  || bad_t "M6 tree restored" "a mutation was left in:$_unrestored — do not commit this"
 
 printf '\n%s\n' "── $PASS pass, $FAIL fail ──"
 [[ "$FAIL" -eq 0 ]]
