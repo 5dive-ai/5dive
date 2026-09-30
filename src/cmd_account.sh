@@ -965,7 +965,11 @@ cmd_account_set() {
   cmd_auth_set "${args[@]}" || return
   # DIVE-5187: a partner spare's sysadmin seat is built before its box has a
   # key, and waits on this account; bind it now. Silent, never fatal.
-  _sysadmin_bind_pending "$name" >/dev/null 2>&1 || true
+  # DIVE-5247: the seat's code is the partner plugin's now, so ask it through
+  # the verb, and only on a box that has the seat (a regular box spawns nothing).
+  if jq -e '.agents.sysadmin != null' "$REGISTRY" >/dev/null 2>&1; then
+    "${FIVEDIVE_SELF_BIN:-/usr/local/bin/5dive}" sysadmin _bind-pending "$name" >/dev/null 2>&1 || true
+  fi
 }
 
 cmd_agent_set_account() {

@@ -371,10 +371,8 @@ Owner asks (a browser step only the owner may allow, answered on Telegram):
   5dive owner-ask browser <request-file>             # send the ask to the owner with Approve / Decline (the browser plugin runs it)
   5dive owner-ask tap <bap|bdn>:<12hex>:<nonce> --tap-uid=<id>   # root: apply the owner's tap (the team-bot listener runs it)
 
-Sysadmin seat (a partner box's privileged work; each change waits for the owner's tap):
-  5dive sysadmin read | restart <agent> | propose --for=<agent> --summary=<line> | status [<sa-id>]
-  5dive sysadmin install [--auth-profile=<name>]      # root: the seat, its broker grant and its rules
-  5dive sysadmin answer <sa-id> approve|decline --sha=<hex>   # root: the owner's tap, relayed by 5dive-api
+Sysadmin seat (partner boxes only): `5dive sysadmin` comes from the partner plugin
+  (5dive-ai/5dive-partner), which the partner box profile installs.
 
 Telegram app (open 5dive inside Telegram from your agent's bot):
   5dive telegram-app link --telegram-id=<id> [--json]   # one-time Mini App link for this box's owner (the bot's /app runs it)
@@ -997,6 +995,7 @@ _moved_verb_repo() {
   case "$1" in
     ui) printf '5dive-ai/5dive-ui\n' ;;
     council) printf '5dive-ai/5dive-council\n' ;;   # DIVE-4893
+    sysadmin) printf '5dive-ai/5dive-partner\n' ;;  # DIVE-5247: partner boxes only
     *)  return 1 ;;
   esac
 }
@@ -1007,6 +1006,13 @@ _moved_verb_repo() {
 # that a human is told WHERE it went rather than being told it never existed.
 _moved_verb_notice() {
   local repo; repo="$(_moved_verb_repo "$1")" || return 0
+  # DIVE-5247: sysadmin is a partner-box feature, not something to offer every
+  # box. Its seat, broker grant and approvals only work where 5dive-api routes a
+  # partner's approvals, so the line says it is not installed, not how to add it.
+  if [[ "$1" == sysadmin ]]; then
+    printf "note: 'sysadmin' is not installed on this box. It is a partner-box feature, installed by the partner box profile (plugin %s).\n" "$repo" >&2
+    return 0
+  fi
   printf "note: '%s' moved out of the core CLI and is now a plugin.\n      Install it once, and '5dive %s' works exactly as before:\n\n        5dive plugin add %s\n\n" \
     "$1" "$1" "$repo" >&2
   return 0
@@ -1376,11 +1382,6 @@ main() {
       # audited because it is one.
       AUDIT_CMD="telegram-app ${1:-}"; AUDIT_ARGS=()
       cmd_telegram_app "$@" ;;
-    sysadmin)
-      # DIVE-5187: the sysadmin seat's broker. Scripts travel on stdin and never
-      # reach the audit row; the verb adds the request id and the target.
-      AUDIT_CMD="sysadmin ${1:-}"; AUDIT_ARGS=()
-      cmd_sysadmin "$@" ;;
     board)
       # DIVE-4779: the READ CONTRACT — one versioned JSON document describing this
       # host's board, for a consumer that must not open core's private store. Same
