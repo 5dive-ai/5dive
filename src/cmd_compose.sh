@@ -482,13 +482,36 @@ _compose_wire_role() {
   # config dir, so a template that says `model: opus` silently loses it. Normalise
   # the alias to the full resolved id the runtime keeps; full ids pass untouched.
   # DIVE-1883: the id itself lives in src/lib/models.sh — do NOT re-inline it here.
-  model=$(resolve_model_alias "$model")
+  # DIVE-5264: resolve against the account the seat was just BOUND to, as pack
+  # import does since DIVE-5163. Every curated template says opus/sonnet, and on
+  # an alias-mapping account (the seeded OpenRouter one, a my.5dive demo key) a
+  # full claude-* id goes past the account's tier map and is billed as real
+  # Claude. An Anthropic account, or no account yet (defer_auth), resolves
+  # exactly as before; `agent set-account` re-derives those later from the
+  # family recorded below.
+  local family="" profile=""
+  if [[ "$type" == "claude" ]] && model_latest "$model" >/dev/null; then
+    family="$model"
+    profile=$(registry_read 2>/dev/null | jq -r --arg n "$name" '.agents[$n].authProfile // ""' 2>/dev/null) || profile=""
+  fi
+  model=$(resolve_model_for_profile "$model" "$profile")
 
   # model / effort via the public config path (process-isolated; warns if the
   # runtime config isn't written yet — model just stays at its default).
   if [[ -n "$model" ]]; then
-    bash "$self" agent config "$name" set "model=$model" >/dev/null 2>&1 \
-      || warn "[$name] set model=$model failed (apply later: 5dive agent config $name set model=$model)"
+    if bash "$self" agent config "$name" set "model=$model" >/dev/null 2>&1; then
+      # `config set model=<full id>` forgets the family (a full id reads as a
+      # pin), and a mapped vendor slug cannot say which family it came from.
+      # Record it after the set, or a later account switch cannot move the seat.
+      if [[ -n "$family" ]]; then
+        local _mf_reg
+        _mf_reg=$(registry_read) \
+          && jq --arg n "$name" --arg f "$family" '.agents[$n].modelFamily = $f' <<<"$_mf_reg" | registry_write \
+          || warn "[$name] could not record model family '$family' (a later account switch will not re-derive its model)"
+      fi
+    else
+      warn "[$name] set model=$model failed (apply later: 5dive agent config $name set model=$model)"
+    fi
   fi
   if [[ -n "$effort" ]]; then
     bash "$self" agent config "$name" set "effort=$effort" >/dev/null 2>&1 \
