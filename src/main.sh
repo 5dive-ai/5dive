@@ -371,7 +371,7 @@ Owner asks (a browser step only the owner may allow, answered on Telegram):
   5dive owner-ask browser <request-file>             # send the ask to the owner with Approve / Decline (the browser plugin runs it)
   5dive owner-ask tap <bap|bdn>:<12hex>:<nonce> --tap-uid=<id>   # root: apply the owner's tap (the team-bot listener runs it)
 
-Sysadmin seat (partner boxes only): `5dive sysadmin` comes from the partner plugin
+Sysadmin seat (partner boxes only): 5dive sysadmin comes from the partner plugin
   (5dive-ai/5dive-partner), which the partner box profile installs.
 
 Telegram app (open 5dive inside Telegram from your agent's bot):
