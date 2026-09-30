@@ -66,10 +66,13 @@ mkdir -p "$TMP/reg/teams"
 cp "$FIX/index.json" "$TMP/reg/teams/index.json"
 cp "$FIX/startup.5dive.yaml" "$FIX/distribution.5dive.yaml" "$TMP/reg/teams/"
 REG_BASE="$(_teams_registry_base)"
-_teams_get() {
-  local rel="${1#"$REG_BASE"/}"
-  [[ -f "$TMP/reg/$rel" ]] || return 1
-  cp "$TMP/reg/$rel" "$2"
+stub_seams() {
+  _teams_get() {
+    local rel="${1#"$REG_BASE"/}"
+    [[ -f "$TMP/reg/$rel" ]] || return 1
+    cp "$TMP/reg/$rel" "$2"
+  }
+  _compose_self() { printf '%s' "$TMP/fake5dive"; }
 }
 
 # ---- provisioning seams ------------------------------------------------------
@@ -94,7 +97,10 @@ fi
 exit 0
 SH
 chmod +x "$TMP/fake5dive"
-_compose_self()   { printf '%s' "$TMP/fake5dive"; }
+# Both stubs live in cmd_compose.sh, so every re-source below must re-apply
+# them: a mutant arm that only restored _compose_self fetched the LIVE
+# marketplace template (DIVE-5280) and went red when it gained a ceo pack.
+stub_seams
 ensure_state()    { :; }
 ensure_state_ro() { :; }
 registry_read()   { cat "$REGF"; }
@@ -185,7 +191,7 @@ if cmp -s src/cmd_compose.sh "$MUT"; then
   bad_t 'M1 mutant did not apply — the resolve line moved' ''
 else
   # shellcheck source=/dev/null
-  source "$MUT"; set +e; _compose_self() { printf '%s' "$TMP/fake5dive"; }
+  source "$MUT"; set +e; stub_seams
   out=$(grade_openrouter M1.)
   grep -q '^FAIL - M1.1' <<<"$out" && grep -q '^FAIL - M1.2' <<<"$out" \
     && ok_t 'M1 reverting to resolve_model_alias turns T1 and T2 red (claude ids on OpenRouter)' \
@@ -196,14 +202,14 @@ if cmp -s src/cmd_compose.sh "$MUT"; then
   bad_t 'M2 mutant did not apply — the family write moved' ''
 else
   # shellcheck source=/dev/null
-  source "$MUT"; set +e; _compose_self() { printf '%s' "$TMP/fake5dive"; }
+  source "$MUT"; set +e; stub_seams
   out=$(grade_openrouter M2.)
   grep -q '^FAIL - M2.3' <<<"$out" && grep -q '^ok   - M2.1' <<<"$out" \
     && ok_t 'M2 dropping the family write turns T3 red and nothing else' \
     || bad_t 'M2 the mutant survived' "$out"
 fi
 # shellcheck source=/dev/null
-source src/cmd_compose.sh; set +e
+source src/cmd_compose.sh; set +e; stub_seams
 
 printf '\n%s\n' "team_import_model_for_account_unit: pass=$PASS fail=$FAIL"
 (( FAIL == 0 ))
