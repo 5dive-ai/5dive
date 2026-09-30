@@ -47,7 +47,7 @@ _tg_app_paired() { # <user> <telegram id>
 }
 
 # <token> <json body> -> "<http status> <body>" on stdout. The token goes to curl
-# on stdin as a config line, never argv (the _sysadmin_notify_post shape).
+# on stdin as a config line, never argv (the shape the partner plugin's sysadmin notify uses).
 _tg_app_post() {
   printf 'header = "authorization: Bearer %s"\n' "$1" \
     | curl -sS --max-time 12 -K - -X POST -H 'content-type: application/json' \

@@ -1843,6 +1843,23 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   # best-effort: never block an upgrade on it.
   "$BIN_DIR/5dive" gate-proof enforce on >/dev/null 2>&1 || true
 
+  # >>> DIVE-5247 partner plugin migration (extracted verbatim by tests/sysadmin_core_seams_unit.sh)
+  # `5dive sysadmin` left core for the partner plugin. A box that already has the
+  # sysadmin seat (a partner box built before the move) gets the plugin in the SAME
+  # upgrade that removed the built-in. There is no earlier moment: while the
+  # built-in exists the plugin's claim is refused (rc=3, "already a 5dive
+  # command"), and without the plugin the seat's one grant, `5dive sysadmin
+  # _broker`, reaches "unknown command". A box without the seat is untouched; a box
+  # whose `sysadmin` already answers skips, so a failed add is retried next upgrade.
+  # Best-effort: never block an upgrade on it.
+  if jq -e '.agents.sysadmin != null' "$STATE_DIR/agents.json" >/dev/null 2>&1 \
+     && ! "$BIN_DIR/5dive" sysadmin --help >/dev/null 2>&1; then
+    say "Installing the partner plugin (this box has the sysadmin seat)"
+    "$BIN_DIR/5dive" plugin add "$GH_ORG/5dive-partner" --yes 2>&1 | tail -3 \
+      || echo "warn: partner plugin not installed — the sysadmin seat is down until the next upgrade retries" >&2
+  fi
+  # <<< DIVE-5247 partner plugin migration
+
   echo
   # DIVE-1260: report the version actually swapped in, read from the new bundle.
   _new_ver="$(grep -m1 'readonly FIVE_VERSION=' "$BIN_DIR/5dive" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')"
