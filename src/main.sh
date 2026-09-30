@@ -298,6 +298,9 @@ Accounts (a named auth profile — group sign-ins so multiple agents share one l
   5dive account set <name> --type=<type> --provider=<id> --api-key=-
                                                        # BYO provider key on an account, no agent needed;
                                                        # key on stdin, --replace to overwrite existing creds
+  5dive account set-model <name> --model=<slug>        # move an alias-mapping account (e.g. the seeded
+                                                       # OpenRouter one) to another model, keeping its key;
+                                                       # re-pins its agents, restarts them when idle
   5dive account rename <old> <new>                     # repoints all bound agents + restarts them
   5dive account remove <name>                          # refuses if any agents still bound
 
@@ -933,7 +936,7 @@ _agent_verb_dispatch() {
 }
 
 _account_verb_dispatch() {
-      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|usage|add|rename|remove|login|set|set-active-provider"
+      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|usage|add|rename|remove|login|set|set-model|set-active-provider"
       local acctcmd="$1"; shift
       # `--help` after a subverb is a question about THAT verb, not an unknown
       # flag. Answered before the dispatch, through the same helper `task`
@@ -964,6 +967,11 @@ _account_verb_dispatch() {
           # `--api-key=` before anything reaches the log (src/lib/audit.sh).
           AUDIT_CMD="account set"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_account_set "$@" ;;
+        set-model)
+          # DIVE-5259: an account's model without its key (the included-model
+          # switch). Audited, and under the lock `set-account` takes.
+          AUDIT_CMD="account set-model"; AUDIT_ARGS=("$@")
+          with_registry_lock cmd_account_set_model "$@" ;;
         set-active-provider)
           AUDIT_CMD="account set-active-provider"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_account_set_active_provider "$@" ;;
