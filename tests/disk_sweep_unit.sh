@@ -175,19 +175,22 @@ alarm() {
 }
 sent() { grep -c '^SENT' "$TMP/sent" 2>/dev/null || echo 0; }
 : >"$TMP/sent"
+FIVEDIVE_DISK_FAKE_DF="91 9"  alarm
 FIVEDIVE_DISK_FAKE_DF="95 5"  alarm
+check "at 9% and 5% free (the old 10% line) nobody is told" '! grep -q "^SENT" "$TMP/sent"'
 FIVEDIVE_DISK_FAKE_DF="96 4"  alarm
-check "under 10% free the owner is told exactly once"      '[[ $(sent) == 1 ]]' "sent=$(sent)"
-check "the message names the free percentage, plainly"     'grep -q "SENT Your 5dive box .* 5% free" "$TMP/sent"'
-FIVEDIVE_DISK_FAKE_DF="88 12" alarm
+FIVEDIVE_DISK_FAKE_DF="97 3"  alarm
+check "under 5% free the owner is told exactly once"       '[[ $(sent) == 1 ]]' "sent=$(sent)"
+check "the message names the free percentage, plainly"     'grep -q "SENT Your 5dive box .* 4% free" "$TMP/sent"'
+FIVEDIVE_DISK_FAKE_DF="93 7"  alarm
 check "between the alarm and re-arm lines stays quiet"      '[[ $(sent) == 1 ]]'
 FIVEDIVE_DISK_FAKE_DF="50 50" alarm
-FIVEDIVE_DISK_FAKE_DF="95 5"  alarm
+FIVEDIVE_DISK_FAKE_DF="96 4"  alarm
 check "after recovery a new low episode alarms again"      '[[ $(sent) == 2 ]]' "sent=$(sent)"
 rm -f "$STATE_DIR/disk.json"; : >"$TMP/sent"
-FIVEDIVE_DISK_FAKE_DF="95 5" DELIVER_RC=1 alarm
-FIVEDIVE_DISK_FAKE_DF="95 5" DELIVER_RC=0 alarm
-FIVEDIVE_DISK_FAKE_DF="95 5" DELIVER_RC=0 alarm
+FIVEDIVE_DISK_FAKE_DF="96 4" DELIVER_RC=1 alarm
+FIVEDIVE_DISK_FAKE_DF="96 4" DELIVER_RC=0 alarm
+FIVEDIVE_DISK_FAKE_DF="96 4" DELIVER_RC=0 alarm
 check "an undelivered alarm is retried, then told once"    '[[ $(sent) == 2 ]] && grep -q UNDELIVERED "$TMP/alarm.out"' "sent=$(sent)"
 
 echo "== tick: sweeps daily, hourly under pressure"
@@ -198,7 +201,7 @@ FIVEDIVE_DISK_FAKE_DF="50 50" tick; FIVEDIVE_DISK_FAKE_DF="50 50" tick
 check "with room, two ticks in a row sweep once"            '[[ $(sweeps) == 1 ]]' "sweeps=$(sweeps)"
 jq '.last_sweep_at -= 7200' "$STATE_DIR/disk.json" >"$STATE_DIR/d" && mv "$STATE_DIR/d" "$STATE_DIR/disk.json"
 FIVEDIVE_DISK_FAKE_DF="95 5" tick
-check "under the alarm line a tick sweeps again after 1h"  '[[ $(sweeps) == 2 ]]' "sweeps=$(sweeps)"
+check "at 5% free (under the pressure line, not yet the alarm) a tick sweeps again after 1h"  '[[ $(sweeps) == 2 ]]' "sweeps=$(sweeps)"
 
 echo "== wiring"
 check "build.sh bundles src/cmd_disk.sh"                   'grep -qx "  src/cmd_disk.sh" build.sh'

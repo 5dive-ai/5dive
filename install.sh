@@ -988,7 +988,7 @@ DIGESTCRON
   # deletes only an allowlist of caches a tool rebuilds (old unheld Chrome temp
   # entries in /tmp, npm/nvm download caches via their own commands, apt-get
   # clean, disabled snap revisions) and logs what it freed; the alarm tells the
-  # box owner once when the disk is under 10% free. install.sh comes from main but
+  # box owner once when the disk is under 5% free. install.sh comes from main but
   # the bundle comes from the fleet pin, so the cron is written only when the
   # INSTALLED bundle carries the verb — an older pin gets no cron rather than an
   # hourly "unknown command" — and removed if a rollback takes the verb away.
