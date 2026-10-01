@@ -78,10 +78,21 @@ unset -f auth_probe_output
 source "$SRC/cmd_auth.sh"
 sudo() { while [[ "$1" == -* ]]; do [[ "$1" == -u ]] && shift; shift; done; "$@"; }
 probe='if IFS= read -r -t 1 line; then echo "STDIN:$line"; else echo NO-STDIN; fi'
-got=$(printf 'caller-stdin\n' | auth_probe_output claude "" 5 "$probe")
-[[ "$got" == *NO-STDIN* && "$got" != *caller-stdin* ]] \
-  && ok "the probe runs with </dev/null (the caller's stdin never reaches it)" \
-  || bad "the probe runs with </dev/null (the caller's stdin never reaches it)" "$got"
+# 60s, not the production 5s (DIVE-5323): this arm grades stdin, not latency,
+# and it runs a real `bash -l` — on a loaded CI runner the login shell alone
+# outlived 5s once, the cap killed it before it printed, and main went red on
+# an empty string. A wall-clock cap must not be able to fail a stdin assertion.
+got=$(printf 'caller-stdin\n' | auth_probe_output claude "" 60 "$probe")
+if [[ -z "$got" ]]; then
+  # Still a failure (fail closed), but named for what it is: the probe never
+  # answered, so this run says nothing about stdin either way.
+  bad "the probe runs with </dev/null (the caller's stdin never reaches it)" \
+      "probe printed nothing — it was killed by the 60s cap or never ran; stdin unmeasured"
+else
+  [[ "$got" == *NO-STDIN* && "$got" != *caller-stdin* ]] \
+    && ok "the probe runs with </dev/null (the caller's stdin never reaches it)" \
+    || bad "the probe runs with </dev/null (the caller's stdin never reaches it)" "$got"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
