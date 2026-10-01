@@ -1580,18 +1580,20 @@ _task_close_notify() {
 # or nothing. It never asks 5dive's API: the value must not pass through it, and
 # the api /drop/mint this used to call was never built.
 # Minting is root-only, because a link is the right to write one key into a
-# root-owned connector file. So it mints when this runs as root or on a seat
-# whose sudo already covers `5dive` (an admin seat, root-equivalent anyway). A
-# standard seat gets nothing here, and the alert sends the owner to the app,
-# whose card mints the link through the box's own root path.
+# root-owned connector file. So it mints when this runs as root, or on an ADMIN
+# seat, whose grant is `5dive *` already (root-equivalent, nothing widened). The
+# tier is read from the registry, never probed with sudo: a refused `sudo -n`
+# mails root (DIVE-4397: 83,898 mails on one box), and a sandboxed seat has no
+# sudoers file at all. Any other seat gets nothing here, and the alert sends the
+# owner to the app, whose card mints the link through the box's own root path.
 _task_mint_drop_link() {
-  local ident="$1" out="" url ttl
+  local ident="$1" out="" url ttl me
   if [[ $EUID -eq 0 ]]; then
     out=$(5dive --json secret link "$ident" 2>/dev/null) || return 0
-  elif sudo -n -l 5dive secret link "$ident" >/dev/null 2>&1; then
-    out=$(sudo -n 5dive --json secret link "$ident" 2>/dev/null) || return 0
   else
-    return 0
+    me=$(id -un 2>/dev/null)
+    [[ "$me" == agent-* && "$(agent_tier "${me#agent-}")" == admin ]] || return 0
+    out=$(sudo -n 5dive --json secret link "$ident" 2>/dev/null) || return 0
   fi
   url=$(printf '%s' "$out" | jq -r '.data.url // empty' 2>/dev/null)
   ttl=$(printf '%s' "$out" | jq -r '.data.ttl_minutes // empty' 2>/dev/null)

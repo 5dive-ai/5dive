@@ -102,36 +102,36 @@ out=$(cmd_task_need DIVE-903 --type=secret --ask="x" --secret-key=OK_KEY --conne
 CURL_LOG="$TMP/curl.log"; : > "$CURL_LOG"
 curl() { echo "$*" >> "$CURL_LOG"; return 0; }
 SUDO_LOG="$TMP/sudo.log"; : > "$SUDO_LOG"
-SUDO_LIST_OK=1
 MINT_OUT='{"ok":true,"data":{"url":"https://secrets.box.example.com/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCd","ttl_minutes":30}}'
-sudo() {
-  echo "$*" >> "$SUDO_LOG"
-  if [[ "$1 $2" == "-n -l" ]]; then (( SUDO_LIST_OK )); return; fi
-  printf '%s' "$MINT_OUT"
-}
+sudo() { echo "$*" >> "$SUDO_LOG"; printf '%s' "$MINT_OUT"; }
+id() { [[ "${1:-}" == -un ]] && { printf 'agent-mailer\n'; return 0; }; command id "$@"; }
+SEAT_TIER=admin
+agent_tier() { [[ "$1" == mailer ]] && printf '%s\n' "$SEAT_TIER" || printf 'unknown:unregistered\n'; }
 
 got=$(_task_mint_drop_link DIVE-901)
 [[ "$got" == "https://secrets.box.example.com/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCd|30" ]] \
-  && ok_t "T4a a seat whose sudo covers it mints on the box -> url|ttl" \
-  || bad_t "T4a a seat whose sudo covers it mints on the box -> url|ttl" "got: $got"
-grep -q -- '-n 5dive --json secret link DIVE-901' "$SUDO_LOG" \
-  && ok_t "T4b the mint is \`5dive secret link\` on this box" \
-  || bad_t "T4b the mint is \`5dive secret link\` on this box" "sudo calls: $(cat "$SUDO_LOG")"
+  && ok_t "T4a an admin seat (grant already covers 5dive) mints on the box -> url|ttl" \
+  || bad_t "T4a an admin seat (grant already covers 5dive) mints on the box -> url|ttl" "got: $got"
+[[ "$(cat "$SUDO_LOG")" == "-n 5dive --json secret link DIVE-901" ]] \
+  && ok_t "T4b the mint is \`5dive secret link\` on this box, one sudo call, no probe" \
+  || bad_t "T4b the mint is \`5dive secret link\` on this box, one sudo call, no probe" "sudo calls: $(cat "$SUDO_LOG")"
 
-: > "$SUDO_LOG"; SUDO_LIST_OK=0
-got=$(_task_mint_drop_link DIVE-901)
-[[ -z "$got" ]] && ! grep -q 'secret link' <(grep -v -- '-n -l' "$SUDO_LOG") \
-  && ok_t "T4c a standard seat (no sudo for it) mints nothing -> empty (app line)" \
-  || bad_t "T4c a standard seat (no sudo for it) mints nothing -> empty (app line)" "got: $got calls: $(cat "$SUDO_LOG")"
+for SEAT_TIER in standard sandboxed unknown:unregistered; do
+  : > "$SUDO_LOG"
+  got=$(_task_mint_drop_link DIVE-901)
+  [[ -z "$got" && ! -s "$SUDO_LOG" ]] \
+    && ok_t "T4c a ${SEAT_TIER} seat mints nothing and runs NO sudo (a refused sudo mails root)" \
+    || bad_t "T4c a ${SEAT_TIER} seat mints nothing and runs NO sudo (a refused sudo mails root)" "got: $got calls: $(cat "$SUDO_LOG")"
+done
 
-SUDO_LIST_OK=1; MINT_OUT='{"ok":true,"data":{"url":"http://secrets.box.example.com/x","ttl_minutes":30}}'
+SEAT_TIER=admin; MINT_OUT='{"ok":true,"data":{"url":"http://secrets.box.example.com/x","ttl_minutes":30}}'
 got=$(_task_mint_drop_link DIVE-901)
 [[ -z "$got" ]] && ok_t "T4d a non-https link is never put in the alert" \
   || bad_t "T4d a non-https link is never put in the alert" "got: $got"
 
 [[ ! -s "$CURL_LOG" ]] && ok_t "T4e no arm called out to any API (curl never ran)" \
   || bad_t "T4e no arm called out to any API (curl never ran)" "curl: $(cat "$CURL_LOG")"
-unset -f curl sudo
+unset -f curl sudo id agent_tier
 
 # --- T5: secret write --task writes value + auto-resolves the gate ------------
 # Mock the box environment: no real root, connectors dir in TMP, and a fake
