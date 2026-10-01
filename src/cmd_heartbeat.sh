@@ -5659,6 +5659,63 @@ _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
        OR gate_pinged_at < datetime(COALESCE(need_asked_at,updated_at,created_at),'+1 hour')
        OR gate_pinged_at <= datetime('now','-24 hours'))"
 
+# DIVE-5307: THE ROW'S OWN PULL REQUEST LANDED AFTER THE GATE WAS ASKED. Measured on
+# DIVE-632 (daily bug report 2026-10-01 #1): a tier-2 manual gate asking the owner
+# to "please merge" an upstream PR, the PR merged and forge-poll recorded it 64
+# minutes later, and this sweep then paged the owner the same ask on 09-29 and
+# again on 09-30. Nothing here read the landing, and nothing else moves the row:
+# _task_merge_landed_handoff leaves a blocked row blocked on purpose, and the
+# shipped sweep only greps the repos it is configured for.
+#
+# Such a row goes to its ASSIGNEE over the agent rail instead of to the human —
+# the seat the board already names as owing the close. NOT a bare exclusion: that
+# stops the false page and leaves the row blocked with nobody told, a loud defect
+# turned silent. NOT an automatic withdraw: the sweep cannot tell a merge ask from
+# an unrelated decision or secret gate on the same row (the DIVE-2382 trap
+# _hb_gate_shipped_sweep documents), so the seat decides and the message says how.
+#
+# The landing must be LATER than the ask. A gate filed after the merge is asking
+# something the merge cannot have answered, so it re-nags as before; a re-filed
+# gate re-arms the same way, which is the exit for an unrelated gate the seat wants
+# back in front of the human. Built on _TASKS_MERGE_LANDED_SQL, the predicate
+# task show uses for "this row is owed a CLOSE", so the two cannot disagree on what
+# a landing is. A rail that cannot deliver (no assignee, an assignee off the org
+# chart, a failed send) leaves the row in the human lanes: LOUD, never dropped.
+_hb_gate_renag_landed_where() {
+  printf '%s' "${_HB_GATE_RENAG_WHERE}
+  AND (${_TASKS_MERGE_LANDED_SQL})
+  AND merge_landed_at > COALESCE(need_asked_at,updated_at,created_at)"
+}
+
+_hb_gate_renag_landed_rail() { # <assignee> <ids> -> 0 delivered, 1 = rows stay in the human lanes
+  local seat="$1" idlist="$2"
+  [[ -n "$seat" && "$idlist" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  [[ -n "$(db "SELECT name FROM agents_org WHERE name=$(sqlq "$seat");")" ]] || return 1
+  local text row
+  text="🚢 Merged, still gated — your row's pull request has landed, but its gate is still open, so the daily reminder would have asked a human for it:"
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    text+=$'\n'"• ${row}"
+  done < <(db "SELECT '['||ident||'] PR merged '||substr(COALESCE(NULLIF(merge_landed_sha,''),'(sha unrecorded)'),1,12)
+                     ||' at '||merge_landed_at||'; open '||COALESCE(need_type,'gate')||' gate: '
+                     ||substr(replace(COALESCE(ask,''),x'0a',' '),1,200)
+               FROM tasks WHERE id IN (${idlist}) ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
+  text+=$'\n\n'"If a gate asked for that merge: 5dive task need <ident> --withdraw, then close the row. If it asks for something else, re-file it and the human reminder resumes."
+  local out="" rc=0
+  out=$(_A2A_GUARD="task:${idlist}:${seat}:gate_unanswered" \
+        cmd_send "$seat" --message="$text" 2>&1) || rc=$?
+  if (( rc != 0 )); then
+    _hb_log "[gate-renag] landed rail to ${seat} FAILED rc=${rc} for rows ${idlist}; they stay in the human lanes: ${out//$'\n'/ }"
+    return 1
+  fi
+  db "UPDATE tasks SET gate_pinged_at=datetime('now')
+      WHERE id IN (${idlist}) AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || true
+  _task_gate_delivery_log ok "$idlist" "agent:${seat}" "" \
+    "gate re-nag rerouted to assignee ${seat}: the row's PR landed after the ask (DIVE-5307; no human channel send)" || true
+  _hb_log "[gate-renag] landed ${idlist}: rerouted to assignee ${seat} (DIVE-5307)"
+  return 0
+}
+
 # DIVE-3342: partition a re-nag batch by the PERSON each gate belongs to, then
 # run the renderer once per owner. This sweep is the surface that caused the
 # reported harm — a customer CTO re-nagged nightly for six days on rows he had no
@@ -5952,6 +6009,19 @@ _hb_gate_renag_agent_rail() { # <reviewer> <ids> -> 0 delivered, 1 = caller must
 _hb_gate_renag_sweep() {
   [[ "${FIVEDIVE_GATE_RENAG:-1}" != "0" ]] || return 0
   local owner ids
+
+  # DIVE-5307: landed-after-ask rows go to their assignee first. Every lane below
+  # reads _HB_GATE_RENAG_WHERE, so the delivered ids are subtracted by shadowing it
+  # for the rest of this call; a row whose rail failed is not subtracted.
+  local _HB_GATE_RENAG_WHERE="$_HB_GATE_RENAG_WHERE" _landed_seat _landed_ids _landed_done=""
+  while IFS=$'\x1f' read -r _landed_seat _landed_ids; do
+    [[ -n "$_landed_ids" ]] || continue
+    _hb_gate_renag_landed_rail "$_landed_seat" "$_landed_ids" \
+      && _landed_done="${_landed_done:+${_landed_done},}${_landed_ids}"
+  done < <(db "SELECT COALESCE(assignee,'')||x'1f'||group_concat(id)
+               FROM tasks WHERE $(_hb_gate_renag_landed_where)
+               GROUP BY COALESCE(assignee,'');")
+  [[ -n "$_landed_done" ]] && _HB_GATE_RENAG_WHERE+=" AND id NOT IN (${_landed_done})"
 
   # T2/legacy hard-human gates. DIVE-3742: ONE SENDER, not one per filer.
   #
