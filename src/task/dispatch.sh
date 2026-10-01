@@ -198,6 +198,8 @@ _task_usage() {
   merge-landed <id>                             record that the bound PR MERGED; exit MERGING (DIVE-4654)
   merge-declined <id> --reason="<why>"          record that it NEVER WILL (held/superseded/wrong repo);
                                                 exits MERGING, asserts no landing (DIVE-4778)
+  unbind-pr <id> <url> --reason="<why>"        drop a pull request from the set the row must see merged
+                                                before it closes; the reason stays on the row (DIVE-5348)
   merge-audit [--limit=N] [--json]              closed rows whose named PR never merged
   merge-unverified [--limit=N] [--since=Nd]     re-derive closes the merge-gate could NOT check
   merge-gate-selftest [--pr=<url>] [--json]     can THIS seat's merge-gate actually query GitHub?
@@ -421,6 +423,7 @@ cmd_task() {
     merge)           cmd_task_merge "$@" ;;         # DIVE-3474 verifier merges what IT graded
     merge-landed)    cmd_task_merge_landed "$@" ;; # DIVE-4654 record a forge merge; exit MERGING
     merge-declined)  cmd_task_merge_declined "$@" ;; # DIVE-4778 record a merge nobody owes; exit MERGING
+    unbind-pr)       cmd_task_unbind_pr "$@" ;;     # DIVE-5348 drop a bound PR, with the reason
     merge-audit)     cmd_task_merge_audit "$@" ;;   # DIVE-1935 retrospective sweep
     grader-replay)   cmd_task_grader_replay "$@" ;;  # DIVE-4164 dry-run capacity replay
     grader-tick)     cmd_task_grader_tick "$@" ;;    # DIVE-4164 pool lane (dark by default)

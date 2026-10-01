@@ -942,6 +942,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- full pull URL per line; NULL when the delivery is a single pull request.
   -- A row closes, and a landing is recorded, only when every one has merged.
   delivery_companions    TEXT,
+  -- DIVE-5348: the pull requests this row DROPPED from its bound set, each with
+  -- the reason a seat wrote (`task unbind-pr`, or a delivery's `--no-pr`). One
+  -- line per pull request: url<TAB>reason<TAB>actor<TAB>utc. NULL when nothing
+  -- was ever unbound. A bound pull request leaves the set only through here.
+  delivery_unbound       TEXT,
   -- OSS-27 (OSS-19 re-plan cycle): provenance for a task ORIGINATED by an
   -- objective's planner cycle. originated_by_objective = objectives.id that
   -- filed it; originated_cycle = the objective_cycles.cycle_no it was filed in.
@@ -2009,7 +2014,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'gate_urgent INTEGER'
   'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER'
   'delivery_repo_path TEXT' 'delivered_sha TEXT'
-  'delivery_companions TEXT'
+  'delivery_companions TEXT' 'delivery_unbound TEXT'
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
   # DIVE-2730: the add-time `--no-verify`, persisted. Nullable — NULL is "the

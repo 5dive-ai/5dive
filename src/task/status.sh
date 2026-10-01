@@ -1117,7 +1117,7 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           _task_store_audit_log "task.done-unmerged-companion" ok 0 -- "$ident" "open=${_comp_list}" "escape=force-merge-gate"
         else
           policy_refuse "$E_CONFLICT" done-with-unmerged-companion DIVE-4899 "$ident" \
-            "$ident cannot close: it binds more than one pull request and not all of them have merged — ${_comp_list}. A row is done only when EVERY bound pull request is on its target branch; DIVE-4895 closed done with its frontend half open for 80 minutes (DIVE-4899). Merge it (\`5dive task merge $ident\` merges each bound one), then \`task done\`. If that pull request is no longer part of this delivery, re-bind without it (\`task deliver $ident --pr=<each one that is>\`). \`--force-merge-gate\` overrides (audited)."
+            "$ident cannot close: it binds more than one pull request and not all of them have merged — ${_comp_list}. A row is done only when EVERY bound pull request is on its target branch; DIVE-4895 closed done with its frontend half open for 80 minutes (DIVE-4899). Merge it (\`5dive task merge $ident\` merges each bound one), then \`task done\`. If that pull request is no longer part of this delivery, drop it with the reason: \`5dive task unbind-pr $ident <url> --reason=\"<why>\"\` (DIVE-5348) — a re-delivery without it no longer drops it. \`--force-merge-gate\` overrides (audited)."
         fi
       fi
     fi
@@ -1126,7 +1126,8 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
     # where SOMETHING is bound (DIVE-2096 covers the case where nothing is).
     if [[ -n "$_dref" ]] && declare -F _task_guard_unbound_pr_urls >/dev/null 2>&1; then
       local -a _bound_all=("$_dref")
-      local _bc; while IFS= read -r _bc; do [[ -n "$_bc" ]] && _bound_all+=("$_bc"); done < <(_task_companion_refs "$id")
+      local _bc _bset; _bset=$(_task_bound_pr_refs "$id"; _task_unbound_refs "$id")
+      while IFS= read -r _bc; do [[ -n "$_bc" ]] && _bound_all+=("$_bc"); done <<<"$_bset"
       _task_guard_unbound_pr_urls "$ident" done "$result" "$no_pr" "$force_merge_gate" "${_bound_all[@]}"
     fi
     # DIVE-3823: THE RECORDED-EVIDENCE RAIL, read BEFORE the gate interrogates
