@@ -3314,8 +3314,8 @@ cmd_create() {
         install_channel_for_agent "$type" buzz "$name" "" ;;
     esac
   done
-  # DIVE-5306: a standard or sandboxed claude seat starts on the lite Telegram
-  # bot profile; admin seats keep the stock bot. It is written into the channel
+  # DIVE-5306: a sandboxed claude seat starts on the lite Telegram bot profile;
+  # standard and admin seats keep the stock bot. It is written into the channel
   # .env through the same setter as `agent config set telegram.profile=`, and
   # after the telegram install above, whose token writer keeps every other line.
   # With no bot yet, the line is staged the way DIVE-5227 stages it, so a bot
