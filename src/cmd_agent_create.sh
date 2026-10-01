@@ -2428,6 +2428,7 @@ _create_human_link_do() {
 cmd_create() {
   local name="" type="" channels="none" channels_explicit=0 telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
+  local telegram_profile=""   # DIVE-5306: explicit --telegram-profile=lite|default
   local cos_owner_id=""
   local byo_provider="" byo_api_key="" byo_model="" byo_effort="" byo_base_url=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
@@ -2451,6 +2452,7 @@ cmd_create() {
       --telegram-allowed-users=*)  telegram_allowed_users="${1#--telegram-allowed-users=}" ;;
       --telegram-cos=*)            telegram_cos="${1#--telegram-cos=}" ;;
       --telegram-cos-avatar=*)     telegram_cos_avatar="${1#--telegram-cos-avatar=}" ;;
+      --telegram-profile=*)        telegram_profile="${1#--telegram-profile=}" ;;
       --discord-token=*)           discord_token="${1#--discord-token=}" ;;
       --workdir=*)                 workdir="${1#--workdir=}" ;;
       --auth-profile=*)            profile="${1#--auth-profile=}" ;;
@@ -2475,7 +2477,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--telegram-profile=lite|default] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -2603,6 +2605,15 @@ cmd_create() {
     fi
   fi
   valid_isolation "$isolation" || fail "$E_VALIDATION" "invalid --isolation (admin|standard|sandboxed)"
+  # DIVE-5306: same values and the same claude-only rule as
+  # `agent config set telegram.profile=` (no accept-and-drop, DIVE-4413).
+  if [[ -n "$telegram_profile" ]]; then
+    case "$telegram_profile" in lite|default) ;; *)
+      fail "$E_VALIDATION" "invalid --telegram-profile '$telegram_profile' (allowed: lite, default)" ;;
+    esac
+    [[ "$type" == "claude" ]] \
+      || fail "$E_VALIDATION" "--telegram-profile is claude-only (type is $type) — no other type's telegram bridge has a lite profile"
+  fi
   valid_autonomy "$autonomy" || fail "$E_VALIDATION" "invalid --autonomy '$autonomy' (standard|yolo|son-of-anton)"
   # DIVE-1462/STEER-4: --can-push grants the delegated-push (builder) capability.
   # It is a STANDARD-isolation refinement: admin agents already reach `_push_do`
@@ -3160,6 +3171,18 @@ cmd_create() {
         install_channel_for_agent "$type" buzz "$name" "" ;;
     esac
   done
+  # DIVE-5306: a standard or sandboxed claude seat starts on the lite Telegram
+  # bot profile; admin seats keep the stock bot. It is written into the channel
+  # .env through the same setter as `agent config set telegram.profile=`, and
+  # after the telegram install above, whose token writer keeps every other line.
+  # With no bot yet, the line is staged the way DIVE-5227 stages it, so a bot
+  # connected later also comes up lite. This runs only at create.
+  local _tg_create_profile
+  _tg_create_profile=$(create_telegram_profile_default "$type" "$isolation" "$telegram_profile")
+  if [[ -n "$_tg_create_profile" ]]; then
+    step "Writing TELEGRAM_PROFILE=${_tg_create_profile} for agent '$name' (isolation ${isolation})"
+    set_claude_telegram_env_key "$name" TELEGRAM_PROFILE "$_tg_create_profile"
+  fi
 
   # DIVE-4522: a new seat gets every seat-facing plugin the BOX already has
   # enabled, not only its own channel plugins. Per-seat registration used to run
