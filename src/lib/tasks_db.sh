@@ -4114,6 +4114,37 @@ _gate_human_principal() {
   _gate_cgroup_human_capable
 }
 
+# DIVE-5319: the REDEEMED DROP LINK, the evidence form of the box-served paste
+# page. That page runs `secret _redeem` in a systemd-run transient unit: no
+# SUDO_UID and a system.slice cgroup, so _gate_human_principal can never admit it,
+# and on a box with `gate-proof enforce on` the gate stayed open after the value
+# landed (main's on-box arm, 2026-10-01). What the page DOES hold is the link: the
+# owner opened a one-time URL only the box minted and the owner was handed.
+# Admitted only when ALL of these read true from the STORE, never from the
+# caller's word: the caller is root, the gate is an open secret gate, a link with
+# this hash exists in the root-only store, is unexpired, is bound to this ident,
+# KEY and connector, and the KEY is already in that connector file (the value
+# landed). `_redeem` burns the link right after this answer, so it is single use.
+# Residual, the same class as DIVE-916: a root-equivalent seat can mint and
+# redeem a link itself; a link is no weaker than the sudo that mints it.
+_gate_drop_link_ok() { # <task id> <link hash>
+  local id="$1" h="${2:-}"
+  _gate_is_root || return 1
+  [[ "$h" =~ ^[0-9a-f]{64}$ ]] || return 1
+  local f="${SECRET_DROP_DIR:-${STATE_DIR}/secret-drop}/$h"
+  [[ -f "$f" && ! -L "$f" ]] || return 1
+  local row nt answered ident key conn
+  row=$(db "SELECT COALESCE(need_type,'')||x'1f'||COALESCE(need_answered_at,'')||x'1f'||ident||x'1f'||COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'') FROM tasks WHERE id=${id};")
+  IFS=$'\x1f' read -r nt answered ident key conn <<<"$row"
+  [[ "$nt" == "secret" && -z "$answered" && -n "$key" && -n "$conn" ]] || return 1
+  [[ "$(sed -n 's/^task=//p' "$f")" == "$ident" \
+     && "$(sed -n 's/^key=//p' "$f")" == "$key" \
+     && "$(sed -n 's/^connector=//p' "$f")" == "$conn" ]] || return 1
+  local exp; exp=$(sed -n 's/^expires=//p' "$f")
+  [[ "$exp" =~ ^[0-9]+$ ]] && (( exp > $(date +%s) )) || return 1
+  grep -q "^${key}=" "${CONNECTORS_DIR:-/etc/5dive/connectors}/${conn}.env" 2>/dev/null
+}
+
 # ── DIVE-756: persisted closure signature (tamper-evidence) ──────────────────
 # Unlike the short-lived answer-time --proof (bound to id:type, TTL 120s, then
 # discarded), this HMAC is STORED on the row and binds the durable closure facts,

@@ -190,7 +190,9 @@ _secret_drop_peek() {
   fi
   local ask agent
   ask=$(db "SELECT COALESCE(ask,'') FROM tasks WHERE id=${id};")
-  agent=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+  # The seat that filed the gate is the one asking; the assignee can differ (a
+  # box's routing may move the row), which made the page name the wrong agent.
+  agent=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),assignee,'') FROM tasks WHERE id=${id};")
   ok "$ident $key" '{task: $i, key: $k, connector: $c, ask: $a, agent: $g, expires: ($x|tonumber)}' \
      --arg i "$ident" --arg k "$key" --arg c "$connector" --arg a "$ask" --arg g "$agent" --arg x "$exp"
 }
@@ -217,13 +219,27 @@ _secret_drop_redeem() {
   # The write reads stdin and refuses an empty or multi-line value BEFORE it
   # touches the file; a refusal leaves the link live for a corrected paste. Its
   # own output is discarded: nothing it says may reach the page but the outcome.
-  local rc=0
-  ( _secret_write "$key" --connector="$connector" --task="$ident" ) >/dev/null 2>&1 || rc=$?
+  local rc=0 id
+  id=$(_secret_drop_gate_open "$ident" "$key" "$connector")
+  ( _secret_write "$key" --connector="$connector" ) >/dev/null 2>&1 || rc=$?
   if (( rc != 0 )); then
     fail "$E_VALIDATION" "value refused (empty, or more than one line)"
   fi
+  # Clear the gate with the link as the evidence, BEFORE the burn: task answer
+  # reads the link back from the store (_gate_drop_link_ok). The page's unit has
+  # no SUDO_UID and no login cgroup, so no other human-evidence form can hold
+  # here, and `gate-proof enforce on` refuses a bare --human (main's on-box arm,
+  # 2026-10-01: the value landed and the gate stayed open). Called through this
+  # same bundle, so the evidence check is the one that minted the link.
+  local five; five=$(five_self_bundle 2>/dev/null) || five=5dive
+  "$five" task answer "$ident" --human --from=drop --drop-link="$hash" >/dev/null 2>&1 || true
   _secret_drop_burn_task "$ident"
   exec 8>&-
+  # Say "told" only when the row says so. A distinct code lets the page tell the
+  # owner where the value is instead of claiming a clear that did not happen.
+  if [[ -n "$id" && -z "$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")" ]]; then
+    fail "$E_AUTH_REQUIRED" "saved $key in ${connector}.env, but $ident did not update; tell its agent the value is there"
+  fi
   ok "saved $key for $ident" '{task: $i, key: $k, connector: $c}' \
      --arg i "$ident" --arg k "$key" --arg c "$connector"
 }
@@ -436,10 +452,20 @@ class Handler(BaseHTTPRequestHandler):
         vals = None
         if not value or "\n" in value or "\r" in value:
             return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>Paste the value as one line, then try again. The link still works.</p>"))
+        rc, out = run(["_peek", "--hash=" + h])
+        if rc != 0:
+            value = None
+            return self.gone(rc)
+        what = json.loads(out).get("data", {})
         rc, out = run(["_redeem", "--hash=" + h], stdin=value.encode())
         value = None
         if rc == 3:
             return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>The server refused that value. The link still works.</p>"))
+        if rc == 6:
+            # Saved, but the task row did not take the clear: never claim "told".
+            return self.send_page(200, page("Saved", "<h1>Saved on your server</h1><p>But the task did not update. "
+                "Tell your agent it is in <code>%s.env</code> as <code>%s</code>. You can close this tab.</p>"
+                % (html.escape(what.get("connector", "its connector")), html.escape(what.get("key", "the key")))))
         if rc != 0: return self.gone(rc)
         d = json.loads(out).get("data", {})
         return self.send_page(200, page("Saved", "<h1>Saved</h1><p>%s is on your server now, and %s has been told. "

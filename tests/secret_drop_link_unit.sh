@@ -45,9 +45,14 @@ set +e
 
 MOCKBIN="$TMP/bin"; mkdir -p "$MOCKBIN"
 export MOCK5DIVE_LOG="$TMP/5dive-calls.log"; : > "$MOCK5DIVE_LOG"
+export MOCK5DIVE_DB="$TASKS_DB"
 cat > "$MOCKBIN/5dive" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$MOCK5DIVE_LOG"
+# A clear that takes. The real evidence rules are graded in L10, against the real verb.
+if [[ "${1:-} ${2:-}" == "task answer" ]]; then
+  sqlite3 "$MOCK5DIVE_DB" "UPDATE tasks SET need_answered_at=datetime('now') WHERE ident='$3';"
+fi
 EOF
 chmod +x "$MOCKBIN/5dive"
 PATH="$MOCKBIN:$PATH"
@@ -61,8 +66,10 @@ task_need_notify() { :; }
 seed_gate() {   # <ident> <key> <connector>
   db "INSERT INTO tasks (ident, title, status, created_by, assignee) VALUES ('$1','t','todo','main','mailer');"
   cmd_task_need "$1" --type=secret --ask="Gmail app password for the inbox" --secret-key="$2" --connector="$3" >/dev/null 2>&1
-  db "UPDATE tasks SET assignee='mailer' WHERE ident='$1';"
+  # The filer is the seat asking; routing may move the assignee (main's on-box run).
+  db "UPDATE tasks SET gate_filed_by='mailer', assignee='router-moved' WHERE ident='$1';"
 }
+reopen() { db "UPDATE tasks SET need_answered_at=NULL WHERE ident='$1';"; }
 mint() { ( _secret_link "$@" --no-start ) 2>&1; }
 tok_of() { printf '%s' "$1" | jq -r '.data.url // empty' | sed 's#.*/##'; }
 hash_of() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
@@ -158,9 +165,9 @@ printf '%s' "$VALUE" | ( _secret_drop_redeem --hash="$(hash_of "$tok1")" ) > "$T
   || bad_t "L4b a redeem writes the value exactly once into the gate's connector file" "rc=$rc env=$(cat "$CONNECTORS_DIR/gmail.env" 2>/dev/null)"
 ! grep -qF "$VALUE" "$TMP/redeem.out" && ok_t "L4c the redeem's output never carries the value" \
   || bad_t "L4c the redeem's output never carries the value" "$(cat "$TMP/redeem.out")"
-grep -q 'task answer DIVE-11 --human --from=drop' "$MOCK5DIVE_LOG" \
-  && ok_t "L4d the write clears the gate (task answer --from=drop)" \
-  || bad_t "L4d the write clears the gate (task answer --from=drop)" "calls: $(cat "$MOCK5DIVE_LOG")"
+grep -q "task answer DIVE-11 --human --from=drop --drop-link=$(hash_of "$tok1")" "$MOCK5DIVE_LOG" \
+  && ok_t "L4d the write clears the gate, citing the redeemed link (task answer --drop-link=<hash>)" \
+  || bad_t "L4d the write clears the gate, citing the redeemed link (task answer --drop-link=<hash>)" "calls: $(cat "$MOCK5DIVE_LOG")"
 [[ ! -e "$SECRET_DROP_DIR/$(hash_of "$tok1")" && ! -e "$SECRET_DROP_DIR/$(hash_of "$tok2")" ]] \
   && ok_t "L4e single use: every link for the gate burns, not only the one used" \
   || bad_t "L4e single use: every link for the gate burns, not only the one used" "ls: $(ls "$SECRET_DROP_DIR")"
@@ -168,6 +175,7 @@ printf 'second' | ( _secret_drop_redeem --hash="$(hash_of "$tok1")" ) >/dev/null
 [[ $rc -eq $E_NOT_FOUND && "$(grep -c '^GMAIL_APP_PASSWORD=' "$CONNECTORS_DIR/gmail.env")" == 1 ]] \
   && ok_t "L4f a second use is refused and writes nothing" \
   || bad_t "L4f a second use is refused and writes nothing" "rc=$rc"
+reopen DIVE-11
 out=$(mint DIVE-11); tok=$(tok_of "$out")
 db "UPDATE tasks SET need_answered_at=datetime('now') WHERE ident='DIVE-11';"
 printf 'late' | ( _secret_drop_redeem --hash="$(hash_of "$tok")" ) >/dev/null 2>&1; rc=$?
@@ -207,8 +215,8 @@ out=$(mint DIVE-11); tok=$(tok_of "$out")
 B="http://127.0.0.1:$PORT"
 code=$(curl -s -o "$TMP/page.html" -D "$TMP/page.hdr" -w '%{http_code}' "$B/$tok")
 [[ "$code" == 200 ]] && grep -q 'type=password name=value' "$TMP/page.html" && grep -q 'mailer needs GMAIL_APP_PASSWORD' "$TMP/page.html" \
-  && ok_t "L5a GET shows a masked field and who asks for which KEY" \
-  || bad_t "L5a GET shows a masked field and who asks for which KEY" "code=$code $(head -c 400 "$TMP/page.html")"
+  && ok_t "L5a GET shows a masked field and which seat FILED the ask (not the routed assignee) for which KEY" \
+  || bad_t "L5a GET shows a masked field and which seat FILED the ask (not the routed assignee) for which KEY" "code=$code $(head -c 400 "$TMP/page.html")"
 grep -qi '^cache-control: no-store' "$TMP/page.hdr" && grep -qi '^referrer-policy: no-referrer' "$TMP/page.hdr" \
   && grep -qi "^content-security-policy: default-src 'none'" "$TMP/page.hdr" && grep -qi '^x-frame-options: DENY' "$TMP/page.hdr" \
   && ok_t "L5b no-store, no-referrer, CSP default-src none, no framing" \
@@ -218,6 +226,9 @@ code=$(curl -s -o "$TMP/post.html" -w '%{http_code}' --data-urlencode "value=$VA
 [[ "$code" == 200 && "$(grep -cxF "GMAIL_APP_PASSWORD=$VALUE" "$CONNECTORS_DIR/gmail.env")" == 1 ]] \
   && ok_t "L5c POST lands the value exactly once in the connector file" \
   || bad_t "L5c POST lands the value exactly once in the connector file" "code=$code env=$(cat "$CONNECTORS_DIR/gmail.env" 2>/dev/null) body=$(head -c 300 "$TMP/post.html")"
+grep -q 'has been told' "$TMP/post.html" && ok_t "L5c2 a clear that took says the task has been told" \
+  || bad_t "L5c2 a clear that took says the task has been told" "$(head -c 400 "$TMP/post.html")"
+reopen DIVE-11
 ! grep -qF "$VALUE" "$TMP/post.html" && ! grep -qF "$VALUE" "$TMP/server.log" \
   && ok_t "L5d the value is in neither the response nor the server log" \
   || bad_t "L5d the value is in neither the response nor the server log" "leaked"
@@ -293,6 +304,110 @@ EOF
 else
   ok_t "L9 SKIP (no script(1) on this host)"
 fi
+
+# --- L10: the gate CLOSES on a box that enforces human evidence -------------------
+# main's on-box arm (2026-10-01): the page's systemd-run unit has no SUDO_UID and a
+# system.slice cgroup, so with `gate-proof enforce on` the old bare `task answer
+# --human` was refused and the gate stayed open while the page said "told". Here the
+# REAL `task answer` runs as a separate process (the page's shell-out), as root,
+# enforcement on, no SUDO_UID, the transient unit's cgroup.
+REALBIN="$TMP/realbin"; mkdir -p "$REALBIN"; : > "$TMP/enforce"
+export AUDIT_LOG_T="$TMP/audit.log"; : > "$AUDIT_LOG_T"
+cat > "$REALBIN/5dive" <<EOF
+#!/usr/bin/env bash
+cd "$REPO"; for f in $LIBS; do source "src/\$f"; done
+STATE_DIR="$STATE_DIR"; TASKS_DIR="$TASKS_DIR"; TASKS_DB="$TASKS_DB"; CONNECTORS_DIR="$CONNECTORS_DIR"
+SECRET_DROP_DIR="$SECRET_DROP_DIR"; AUDIT_LOG="$AUDIT_LOG_T"
+export GATE_PROOF_ENFORCE="$TMP/enforce"; unset SUDO_UID
+# Root, as the page's unit is: euid 0 (no agent), no SUDO_UID, so the uid half of
+# the principal test passes and the STRUCTURAL half refuses, exactly as on the box.
+_gate_is_root() { return 0; }; _gate_caller_uid() { printf '0'; }
+_gate_sudo_uid_nonagent() { return 0; }
+_gate_caller_cgroup() { printf '%s' '/system.slice/5dive-secret-drop.service'; }
+task_need_notify() { :; }; cmd_send() { :; }; _task_send_owner() { :; }
+# The audit fence withholds lines on a non-prod store; AUDIT_LOG is the harness's file.
+_task_store_audit_log() { audit_log "\$@"; }
+# Mutation seam: break the link between the redeem's checks and the answer.
+case "\${MUTATE_LINK:-}" in
+  delete) rm -f "$SECRET_DROP_DIR"/* ;;
+  retask) sed -i 's/^task=.*/task=DIVE-99/' "$SECRET_DROP_DIR"/* ;;
+esac
+[[ "\${1:-}" == task ]] && shift
+cmd_task "\$@"
+EOF
+chmod +x "$REALBIN/5dive"
+ans_at() { db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE ident='$1';"; }
+# The page's own bundle, with the real verb on PATH instead of the mock.
+WRAP2="$TMP/5dive-bundle-real"; sed "s#$MOCKBIN#$REALBIN#" "$WRAP" > "$WRAP2"; chmod +x "$WRAP2"
+redeem_real() {   # <hash> <value> [VAR=val...]
+  local h="$1" v="$2"; shift 2
+  printf '%s' "$v" | env "$@" "$WRAP2" secret _redeem --hash="$h" --json
+}
+
+seed_gate DIVE-21 E2E_KEY e2e5319
+out=$(printf 'x' | PATH="$REALBIN:$PATH" 5dive task answer DIVE-21 --human --from=drop 2>&1); rc=$?
+[[ $rc -eq $E_AUTH_REQUIRED && -z "$(ans_at DIVE-21)" && "$out" == *"needs a human"* ]] \
+  && ok_t "L10a control: this arm models the box (bare --human, no SUDO_UID, enforce on -> refused, gate open)" \
+  || bad_t "L10a control: this arm models the box (bare --human, no SUDO_UID, enforce on -> refused, gate open)" "rc=$rc at=$(ans_at DIVE-21) out=$out"
+out=$(mint DIVE-21); tok=$(tok_of "$out"); h=$(hash_of "$tok")
+VALUE='e2e-value-5319'
+out=$(redeem_real "$h" "$VALUE" 2>&1); rc=$?
+ev=$(db "SELECT COALESCE(human_evidence,'') FROM tasks WHERE ident='DIVE-21';")
+by=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='DIVE-21';")
+[[ $rc -eq 0 && -n "$(ans_at DIVE-21)" && "$ev" == "drop-link" && "$by" == human:* ]] \
+  && ok_t "L10b redeem closes the gate with no human principal: need_answered_at set, evidence=drop-link, answered_by human:*" \
+  || bad_t "L10b redeem closes the gate with no human principal: need_answered_at set, evidence=drop-link, answered_by human:*" "rc=$rc at=$(ans_at DIVE-21) ev=$ev by=$by out=$out"
+grep -q 'task=DIVE-21.*evidence=drop-link' "$AUDIT_LOG_T" && grep -q 'enforce=on' "$AUDIT_LOG_T" \
+  && ok_t "L10c the audit line names evidence=drop-link, under enforce=on" \
+  || bad_t "L10c the audit line names evidence=drop-link, under enforce=on" "audit: $(grep DIVE-21 "$AUDIT_LOG_T" | tail -3)"
+[[ ! -e "$SECRET_DROP_DIR/$h" && "$(grep -cxF "E2E_KEY=$VALUE" "$CONNECTORS_DIR/e2e5319.env")" == 1 ]] && ! grep -qF "$VALUE" "$AUDIT_LOG_T" \
+  && ok_t "L10d the link is burned after the clear, the value is in the file once and never in the audit" \
+  || bad_t "L10d the link is burned after the clear, the value is in the file once and never in the audit" "ls=$(ls "$SECRET_DROP_DIR")"
+
+# Mutation arms: the evidence is read from the STORE, so a link gone or re-bound
+# between the checks and the answer leaves the gate open, and redeem says so.
+seed_gate DIVE-22 E2E_KEY e2e22
+out=$(mint DIVE-22); h=$(hash_of "$(tok_of "$out")")
+out=$(redeem_real "$h" "v22" MUTATE_LINK=delete 2>&1); rc=$?
+[[ $rc -eq $E_AUTH_REQUIRED && -z "$(ans_at DIVE-22)" && "$out" == *"did not update"* \
+   && "$(grep -c '^E2E_KEY=v22$' "$CONNECTORS_DIR/e2e22.env")" == 1 ]] \
+  && ok_t "L10e mutation: link deleted before the answer -> gate stays open, distinct rc, 'did not update' (value still saved)" \
+  || bad_t "L10e mutation: link deleted before the answer -> gate stays open, distinct rc, 'did not update' (value still saved)" "rc=$rc at=$(ans_at DIVE-22) out=$out"
+out=$(mint DIVE-22 2>&1); rc=$?
+[[ $rc -eq 0 ]] || reopen DIVE-22
+out=$(mint DIVE-22); h=$(hash_of "$(tok_of "$out")")
+printf 'E2E_KEY=x\n' > "$CONNECTORS_DIR/e2e22.env"
+out=$(PATH="$REALBIN:$PATH" 5dive task answer DIVE-22 --human --from=drop --drop-link="$(hash_of forged)" 2>&1); rc=$?
+out2=$(PATH="$REALBIN:$PATH" 5dive task answer DIVE-22 --human --from=drop --drop-link=../../etc 2>&1); rc2=$?
+rm -f "$CONNECTORS_DIR/e2e22.env"
+out3=$(PATH="$REALBIN:$PATH" 5dive task answer DIVE-22 --human --from=drop --drop-link="$h" 2>&1); rc3=$?
+[[ $rc -eq $E_AUTH_REQUIRED && $rc2 -eq $E_AUTH_REQUIRED && $rc3 -eq $E_AUTH_REQUIRED && -z "$(ans_at DIVE-22)" ]] \
+  && ok_t "L10f a bare --drop-link is not evidence: unknown hash, malformed hash, or a live link whose KEY never landed -> refused" \
+  || bad_t "L10f a bare --drop-link is not evidence: unknown hash, malformed hash, or a live link whose KEY never landed -> refused" "rc=$rc/$rc2/$rc3 at=$(ans_at DIVE-22)"
+db "UPDATE tasks SET need_type='approval' WHERE ident='DIVE-22';"
+printf 'E2E_KEY=x\n' > "$CONNECTORS_DIR/e2e22.env"
+_gate_is_root() { return 0; }
+_gate_drop_link_ok "$(db "SELECT id FROM tasks WHERE ident='DIVE-22';")" "$h"; rc=$?
+unset -f _gate_is_root; . src/lib/actor.sh
+db "UPDATE tasks SET need_type='secret' WHERE ident='DIVE-22';"
+_gate_drop_link_ok "$(db "SELECT id FROM tasks WHERE ident='DIVE-22';")" "$h"; rc2=$?
+[[ $rc -ne 0 && $rc2 -ne 0 ]] \
+  && ok_t "L10g the link is evidence on a SECRET gate only, and only for a root caller" \
+  || bad_t "L10g the link is evidence on a SECRET gate only, and only for a root caller" "approval-gate rc=$rc non-root rc=$rc2"
+
+# The page, with the real verb: a re-bound link -> "Saved on your server, but the
+# task did not update", never "has been told".
+PORT3=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+MUTATE_LINK=retask python3 "$TMP/server.py" 127.0.0.1 "$PORT3" "$WRAP2" "$SECRET_DROP_DIR" 0 2> "$TMP/server3.log" & SRV_PID=$!
+for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT3/healthz" >/dev/null 2>&1 && break; sleep 0.1; done
+seed_gate DIVE-23 E2E_KEY e2e23
+out=$(mint DIVE-23); tok=$(tok_of "$out")
+code=$(curl -s -o "$TMP/post3.html" -w '%{http_code}' --data-urlencode "value=v23" "http://127.0.0.1:$PORT3/$tok")
+[[ "$code" == 200 && -z "$(ans_at DIVE-23)" ]] && grep -q 'did not update' "$TMP/post3.html" \
+  && grep -q 'e2e23.env' "$TMP/post3.html" && ! grep -q 'has been told' "$TMP/post3.html" \
+  && ok_t "L10h page: the clear did not take -> it names the file and never says 'has been told'" \
+  || bad_t "L10h page: the clear did not take -> it names the file and never says 'has been told'" "code=$code at=$(ans_at DIVE-23) body=$(head -c 400 "$TMP/post3.html")"
+kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
 
 echo
 echo "secret-drop-link unit: $PASS passed, $FAIL failed"

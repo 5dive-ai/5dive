@@ -451,7 +451,7 @@ _gate_tap_log() {
 # usual failure of an extracted check is a call site that quietly stops using it.
 _task_answer_forbidden_flag() {
   case "${1:-}" in
-    --human|--human-proof=*|--channel-proof=*|--channel-msg=*|--tap-uid=*|--tap-username=*|--tap-msg=*|--relay-agent=*|--from=*) return 0 ;;
+    --human|--human-proof=*|--channel-proof=*|--channel-msg=*|--tap-uid=*|--tap-username=*|--tap-msg=*|--relay-agent=*|--from=*|--drop-link=*) return 0 ;;
   esac
   return 1
 }
@@ -679,7 +679,7 @@ cmd_task_answer() {
   # before any parsing so the executor sees the caller's arguments verbatim.
   _task_answer_try_delegated "$@" && return 0
   local value="" value_set=0 from="" human=0 human_proof="" channel_proof="" channel_msg=""
-  local tap_uid="" tap_username="" tap_msg="" relay_agent=""
+  local tap_uid="" tap_username="" tap_msg="" relay_agent="" drop_link=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -730,6 +730,10 @@ cmd_task_answer() {
       --tap-username=*) tap_username="${1#*=}" ;;
       --tap-msg=*)      tap_msg="${1#*=}" ;;
       --relay-agent=*)  relay_agent="${1#*=}" ;;
+      # DIVE-5319: the hash of the one-time drop link the owner just redeemed.
+      # `secret _redeem` passes it; it counts only as _gate_drop_link_ok reads it
+      # back from the root-only store (below), never on the caller's word.
+      --drop-link=*)    drop_link="${1#*=}" ;;
       --)        shift; positional+=("$@"); break ;;
       -*)        fail "$E_USAGE" "unknown flag: $1" ;;
       *)         positional+=("$1") ;;
@@ -925,6 +929,10 @@ cmd_task_answer() {
   # scope so that stamp reads an initialized 0 on the gate types that never enter
   # that block, rather than an unset variable. Values are still set there, once.
   local _hp=0 _su=0
+  # DIVE-5319: the redeemed drop link, the box page's evidence form. Measured once
+  # here; it is verified against the store, so a bare flag raises nothing.
+  local _dl_ok=0
+  [[ -n "$drop_link" ]] && _gate_drop_link_ok "$id" "$drop_link" && _dl_ok=1
 
   # DIVE-2412 (DIVE-2382 fix #4): the CITED-MESSAGE form, which a tier-2 gate DOES
   # accept. The chat-only proof above stays tier<2 for the reason lodar scoped it
@@ -1212,7 +1220,7 @@ cmd_task_answer() {
     # routed_reviewer (never secret), so no un-routed human gate is affected.
     # DIVE-2412: _cs_ok is the attested cited-message form. Unlike _cp_ok it is
     # NOT tier-fenced, so it satisfies the evidence rule on a tier-2 approval too.
-    local _evid=$(( _hp || _su || _lead_clear || _cp_ok || _cs_ok ))
+    local _evid=$(( _hp || _su || _lead_clear || _cp_ok || _cs_ok || _dl_ok ))
     local _caller2; _caller2=$(_gate_caller_user)
     # DIVE-2054: the human-proof/nonce evidence being scored here is stored
     # against $ident in TASKS_DB (not an independent channel/delivery fact like
@@ -1224,8 +1232,8 @@ cmd_task_answer() {
       "task=$ident" "type=$nt" "channel_proof=$([[ -n "$channel_proof" ]] && echo present || echo absent)" "cp_ok=$_cp_ok" \
       "channel_msg=${channel_msg:-none}" "cs_ok=$_cs_ok" "cs_origin=${TASK_CS_ORIGIN:-none}" "cs_age=${TASK_CS_AGE:-none}" \
       "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" "nonce_valid=$_hp" \
-      "sudo_nonagent=$_su" "human=$human" \
-      "evidence=$(_gate_evidence_form "$_hp" "$_su" "$_cs_ok" "$_cp_ok" "$_lead_clear")" \
+      "sudo_nonagent=$_su" "drop_link=$_dl_ok" "human=$human" \
+      "evidence=$(_gate_evidence_form "$_hp" "$_su" "$_cs_ok" "$_cp_ok" "$_lead_clear" "$_dl_ok")" \
       "filer_answered=$(_gate_filer_answered "$id" "$_caller2")" \
       "caller=$_caller2" "sudo_uid=${SUDO_UID:-}" \
       "enforce=$(_gate_proof_enforced && echo on || echo off)"
@@ -1427,14 +1435,18 @@ cmd_task_answer() {
       # human evidence) — and they are passed explicitly rather than omitted so the
       # arity and token order are identical at both sites.
       _task_store_audit_log "task answer t2-human-evidence" \
-        "$([[ $(( _t2_hp || _t2_su || _t2_cs )) -eq 1 ]] && echo ok || echo error)" 0 -- \
+        "$([[ $(( _t2_hp || _t2_su || _t2_cs || _dl_ok )) -eq 1 ]] && echo ok || echo error)" 0 -- \
         "task=$ident" "type=$nt" "tier=$gtier" "nonce_valid=$_t2_hp" "sudo_nonagent=$_t2_su" \
         "channel_session=$_t2_cs" \
         "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" \
-        "evidence=$(_gate_evidence_form "$_t2_hp" "$_t2_su" "$_t2_cs" 0 0)" \
+        "evidence=$(_gate_evidence_form "$_t2_hp" "$_t2_su" "$_t2_cs" 0 0 "$_dl_ok")" \
         "filer_answered=$(_gate_filer_answered "$id" "$_t2_caller")" \
         "caller=$_t2_caller" "sudo_uid=${SUDO_UID:-}" 2>/dev/null || true
-      if (( ! _t2_hp && ! _t2_su && ! _t2_cs )); then
+      # DIVE-5319: the redeemed drop link is admitted here too, on a secret gate
+      # only (_gate_drop_link_ok checks need_type), for the same reason as the
+      # citation above: omitted, it would clear the evidence block and then be
+      # refused here as an unproven claim.
+      if (( ! _t2_hp && ! _t2_su && ! _t2_cs && ! _dl_ok )); then
         fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) and the --human claim is unproven — tap the button in Telegram"
       fi
     fi
@@ -1495,7 +1507,7 @@ cmd_task_answer() {
   # stop — a new root path must not widen the DIVE-916/1115/2224 forged-human
   # residual, which is open.
   [[ -z "${TASK_ANSWER_DELEGATED:-}" ]] || human=0
-  local _human_evid=$(( _hp || _su || _cp_ok ))
+  local _human_evid=$(( _hp || _su || _cp_ok || _dl_ok ))
   local _human_claim="$human"
   if (( human && ! _human_evid )) && [[ "$_lead_clear" == "1" ]]; then
     human=0
@@ -1807,7 +1819,7 @@ cmd_task_answer() {
   # `${_t2_*:-0}` because those locals exist only when the tier-2 branch ran.
   local _evform; _evform=$(_gate_evidence_form \
     "$(( ${_hp:-0} || ${_t2_hp:-0} ))" "$(( ${_su:-0} || ${_t2_su:-0} ))" \
-    "${_cs_ok:-0}" "${_cp_ok:-0}" "${_lead_clear:-0}")
+    "${_cs_ok:-0}" "${_cp_ok:-0}" "${_lead_clear:-0}" "${_dl_ok:-0}")
   db "UPDATE tasks SET human_evidence=$(sqlq "${_evform:-none}") WHERE id=${id};"
 
   # DIVE-3128: the RELAY and the TAPPING UID, in their own columns.

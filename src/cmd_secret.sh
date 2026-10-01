@@ -150,8 +150,13 @@ _secret_write() {
   # `task answer` accepts it; --human marks it human-sourced. Shelled out (not an
   # in-process call) so its `fail`/exit on an already-answered or closed gate can
   # NEVER abort this command: the write has succeeded and must report success.
+  # DIVE-5319: the write still reports success when the clear is refused (the
+  # value IS on the box), but it says so instead of swallowing it. The page path
+  # (`secret _redeem`) clears with its own evidence and checks the row itself.
   if [[ -n "$task" ]]; then
-    5dive task answer "$task" --human --from=drop >/dev/null 2>&1 || true
+    local _ans_out _ans_rc=0
+    _ans_out=$(5dive task answer "$task" --human --from=drop 2>&1 >/dev/null) || _ans_rc=$?
+    (( _ans_rc == 0 )) || warn "saved, but $task was not marked provided (${_ans_out:-rc $_ans_rc}); tell its agent the value is in ${connector}.env"
   fi
 
   ok "secret $action: $key -> ${connector}.env" \

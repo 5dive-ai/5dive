@@ -1164,13 +1164,15 @@ _task_board_write_allowed() {
 # nonce-only class stops being a reconstruction and becomes a fact the row states
 # about itself — which is what makes the population countable and a floor legible
 # AS a floor.
-_gate_evidence_form() { # <nonce> <sudo_uid> <channel_session> <channel_chat> <lead>
+_gate_evidence_form() { # <nonce> <sudo_uid> <channel_session> <channel_chat> <lead> [<drop_link>]
   local out=""
   if [[ "${1:-0}" == "1" ]]; then out+="${out:++}nonce"; fi
   if [[ "${2:-0}" == "1" ]]; then out+="${out:++}sudo-uid"; fi
   if [[ "${3:-0}" == "1" ]]; then out+="${out:++}channel-session"; fi
   if [[ "${4:-0}" == "1" ]]; then out+="${out:++}channel-chat"; fi
   if [[ "${5:-0}" == "1" ]]; then out+="${out:++}lead"; fi
+  # DIVE-5319: the redeemed one-time drop link (_gate_drop_link_ok).
+  if [[ "${6:-0}" == "1" ]]; then out+="${out:++}drop-link"; fi
   printf '%s' "${out:-none}"
 }
 
