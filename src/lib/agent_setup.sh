@@ -1223,6 +1223,26 @@ CLAUDE_TELEGRAM_ENV_KEY
   fi
 }
 
+# DIVE-5306: the Telegram bot profile a NEW seat starts with. Prints "lite" or
+# nothing. Only claude has a lite profile. An explicit --telegram-profile wins
+# either way. Otherwise a standard or sandboxed seat gets lite, and admin,
+# beyond-admin or any other label gets nothing, so its .env is the same as
+# before this change. Create calls this once. Nothing later calls it again, so
+# a token push, a rotation or a later `telegram.profile=default` is never
+# overwritten by this default.
+create_telegram_profile_default() {
+  local type="$1" isolation="$2" explicit="${3:-}"
+  [[ "$type" == "claude" ]] || return 0
+  if [[ -n "$explicit" ]]; then
+    [[ "$explicit" == "lite" ]] && printf 'lite'
+    return 0
+  fi
+  case "$isolation" in
+    standard|sandboxed) printf 'lite' ;;
+  esac
+  return 0
+}
+
 # Write ~/.claude/channels/telegram/access.json for agent-<name> with allowFrom
 # seeded from a CSV of user ids. Idempotent — merges into an existing file
 # rather than clobbering, so re-running on an already-paired agent only adds
