@@ -202,8 +202,8 @@ grade "M12-window-knob-dead" "CS12 a TIGHTER window from the env" \
 # them lands inside that branch — dropping `_t2_cs` kills the feature on its main
 # case while leaving all twelve mutants above green.
 grade "M13-t2-evidence-omits-citation" "CS1 tier-2 gate CLEARS" \
-  '      if (( ! _t2_hp && ! _t2_su && ! _t2_cs )); then' \
-  '      if (( ! _t2_hp && ! _t2_su )); then'
+  '      if (( ! _t2_hp && ! _t2_su && ! _t2_cs && ! _dl_ok )); then' \
+  '      if (( ! _t2_hp && ! _t2_su && ! _dl_ok )); then'
 
 printf '\ngate_channel_session_t2_mutation: %d mutants killed, %d ungraded\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

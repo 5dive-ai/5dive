@@ -85,7 +85,7 @@ grade "M1-writesite-field-dropped" "EV1 the audit row's evidence= must equal" \
 
 # ── and the tier-2 evidence site, so ONE grep spans both ─────────────────────
 grade "M2-t2site-field-dropped" "EV2 the tier-2 evidence site must carry evidence=" \
-  '        "evidence=$(_gate_evidence_form "$_t2_hp" "$_t2_su" "$_t2_cs" 0 0)" \' \
+  '        "evidence=$(_gate_evidence_form "$_t2_hp" "$_t2_su" "$_t2_cs" 0 0 "$_dl_ok")" \' \
   '        "human=$human" \'
 
 # ── the VOCABULARY: a rename breaks the join to tasks.human_evidence ─────────

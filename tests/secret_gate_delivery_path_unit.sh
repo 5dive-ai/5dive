@@ -279,5 +279,56 @@ txt=$(_task_secret_gate_cta DIVE-2406 "$(db "SELECT id FROM tasks WHERE ident='D
   && ok_t "T8b the out-of-band alert names the declared channel and keeps the tap" \
   || bad_t "T8b the out-of-band alert names the declared channel and keeps the tap" "text: $txt"
 
+# ============================ DIVE-5319: THE BOX-SERVED LINK ===================
+# An owner with no shell answers a secret gate on a one-time page served by THEIR
+# box (`5dive secret link`), never through 5dive's API or a chat. The alert carries
+# that link when this seat could mint it; otherwise it sends the owner to the app,
+# whose card mints one. Either way it keeps the box command and forbids a chat
+# paste. The resume ping tells the asking seat which file the value is now in.
+_drop_id=$(db "SELECT id FROM tasks WHERE ident='DIVE-2405';")
+for _shape in ONBOX ""; do
+  txt=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "$_shape")
+  if [[ "$txt" == *"5dive.ai/dashboard/tasks"* && "$txt" == *"5dive app on Telegram"* \
+        && "$txt" == *"Open secure link"* && "$txt" == *"Never paste it here"* \
+        && "$txt" == *"sudo 5dive secret write GH_BOT_TOKEN --connector=github-bot --task=DIVE-2405"* ]]; then
+    ok_t "T9 the drop-target alert (${_shape:-no link}) sends the owner to the app's secure link, keeps the box command, forbids a chat paste"
+  else
+    bad_t "T9 the drop-target alert (${_shape:-no link}) sends the owner to the app's secure link, keeps the box command, forbids a chat paste" "text: $txt"
+  fi
+done
+_link="https://secrets.box.example.com/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCd"
+txt=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "${_link}|30")
+[[ "$txt" == *"$_link"* && "$txt" == *"single use, expires in 30m"* && "$txt" == *"never through 5dive or this chat"* \
+   && "$txt" == *"Never paste it here"* \
+   && "$txt" == *"sudo 5dive secret write GH_BOT_TOKEN --connector=github-bot --task=DIVE-2405"* ]] \
+  && ok_t "T9b a minted link goes in the alert with its expiry, and the box command stays" \
+  || bad_t "T9b a minted link goes in the alert with its expiry, and the box command stays" "text: $txt"
+_all=""
+for _shape in ONBOX "" "${_link}|30"; do _all+=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "$_shape"); done
+[[ "$_all" != *"api.5dive"* && "$_all" != *"/drop/"* ]] \
+  && ok_t "T9c no alert shape points the owner at 5dive's API" \
+  || bad_t "T9c no alert shape points the owner at 5dive's API" "text: $_all"
+
+PINGS="$TMP/pings"; : >"$PINGS"
+cmd_send() { local a; for a in "$@"; do [[ "$a" == --message=* ]] && printf '%s\n' "${a#--message=}" >>"$PINGS"; done; return 0; }
+_gate_seat_busy_elsewhere() { return 1; }
+seed_task DIVE-2411; db "UPDATE tasks SET assignee='dev' WHERE ident='DIVE-2411';"
+NONCE=""
+cmd_task_need DIVE-2411 --type=secret --ask="drop the gmail app password" --secret-key=GMAIL_APP_PASSWORD --connector=gmail >/dev/null 2>&1
+cmd_task_answer DIVE-2411 --from=main --human --human-proof="$NONCE" >/dev/null 2>&1
+got=$(cat "$PINGS")
+[[ "$got" == *"GMAIL_APP_PASSWORD is in ${CONNECTORS_DIR}/gmail.env"* && "$got" == *"NOT from the task"* ]] \
+  && ok_t "T10 the resume ping names the key and the file it landed in" \
+  || bad_t "T10 the resume ping names the key and the file it landed in" "pings: $got"
+: >"$PINGS"
+seed_task DIVE-2412; db "UPDATE tasks SET assignee='dev' WHERE ident='DIVE-2412';"
+NONCE=""
+cmd_task_need DIVE-2412 --type=secret --ask="drop it" --out-of-band="already in my .env on this box" >/dev/null 2>&1
+cmd_task_answer DIVE-2412 --from=main --human --human-proof="$NONCE" >/dev/null 2>&1
+got=$(cat "$PINGS")
+[[ "$got" == *"from where it was placed"* && "$got" != *"connectors/"* ]] \
+  && ok_t "T10b an out-of-band gate's ping names no file it was never told" \
+  || bad_t "T10b an out-of-band gate's ping names no file it was never told" "pings: $got"
+
 printf '\nsecret-gate delivery-path unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1

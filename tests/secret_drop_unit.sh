@@ -2,8 +2,8 @@
 # DIVE-931 isolated unit harness for the secure credential drop wiring:
 #   * `task need --type=secret --secret-key=K --connector=C` stores the drop
 #     target on the gate row and validates key/connector charsets + pairing.
-#   * `_task_mint_drop_link` maps the api /drop/mint response to url|ttl / ONBOX /
-#     empty (curl mocked — no network).
+#   * `_task_mint_drop_link` mints on THIS box (`5dive secret link`, DIVE-5319)
+#     and never calls an API (sudo + curl mocked — no network).
 #   * `secret write <K> --connector=C --task=DIVE-N` writes the value from stdin
 #     and shells `5dive task answer` to auto-resolve the gate (5dive mocked).
 # Isolation matches the loop harnesses: source src/ libs, throwaway STATE_DIR —
@@ -96,33 +96,42 @@ out=$(cmd_task_need DIVE-903 --type=secret --ask="x" --secret-key=OK_KEY --conne
 [[ $rc -ne 0 && "$out" == *"invalid --connector"* ]] && ok_t "T3d bad connector charset rejected" \
   || bad_t "T3d bad connector charset rejected" "rc=$rc out=$out"
 
-# --- T4: _task_mint_drop_link response mapping (curl mocked) -------------------
-export CONNECTORD_TOKEN="unit-test-box-token"
-MOCK_RESP=""
-curl() { printf '%s' "$MOCK_RESP"; return 0; }   # mock: echo canned body, ignore args
+# --- T4: _task_mint_drop_link is box-local (DIVE-5319) -------------------------
+# It mints through `5dive secret link` on THIS box, never 5dive's API: curl is
+# mocked to record any call, and every arm requires that record to stay empty.
+CURL_LOG="$TMP/curl.log"; : > "$CURL_LOG"
+curl() { echo "$*" >> "$CURL_LOG"; return 0; }
+SUDO_LOG="$TMP/sudo.log"; : > "$SUDO_LOG"
+MINT_OUT='{"ok":true,"data":{"url":"https://secrets.box.example.com/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCd","ttl_minutes":30}}'
+sudo() { echo "$*" >> "$SUDO_LOG"; printf '%s' "$MINT_OUT"; }
+id() { [[ "${1:-}" == -un ]] && { printf 'agent-mailer\n'; return 0; }; command id "$@"; }
+SEAT_TIER=admin
+agent_tier() { [[ "$1" == mailer ]] && printf '%s\n' "$SEAT_TIER" || printf 'unknown:unregistered\n'; }
 
-MOCK_RESP='{"url":"https://api.5dive.com/drop/abc123","expiresAt":"x","ttlMinutes":30}'
-got=$(_task_mint_drop_link DIVE-901 PYPI_TOKEN pypi)
-[[ "$got" == "https://api.5dive.com/drop/abc123|30" ]] && ok_t "T4a live link -> url|ttl" \
-  || bad_t "T4a live link -> url|ttl" "got: $got"
+got=$(_task_mint_drop_link DIVE-901)
+[[ "$got" == "https://secrets.box.example.com/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCd|30" ]] \
+  && ok_t "T4a an admin seat (grant already covers 5dive) mints on the box -> url|ttl" \
+  || bad_t "T4a an admin seat (grant already covers 5dive) mints on the box -> url|ttl" "got: $got"
+[[ "$(cat "$SUDO_LOG")" == "-n 5dive --json secret link DIVE-901" ]] \
+  && ok_t "T4b the mint is \`5dive secret link\` on this box, one sudo call, no probe" \
+  || bad_t "T4b the mint is \`5dive secret link\` on this box, one sudo call, no probe" "sudo calls: $(cat "$SUDO_LOG")"
 
-MOCK_RESP='{"useOnBoxPath":true}'
-got=$(_task_mint_drop_link DIVE-901 PYPI_TOKEN pypi)
-[[ "$got" == "ONBOX" ]] && ok_t "T4b useOnBoxPath -> ONBOX" \
-  || bad_t "T4b useOnBoxPath -> ONBOX" "got: $got"
+for SEAT_TIER in standard sandboxed unknown:unregistered; do
+  : > "$SUDO_LOG"
+  got=$(_task_mint_drop_link DIVE-901)
+  [[ -z "$got" && ! -s "$SUDO_LOG" ]] \
+    && ok_t "T4c a ${SEAT_TIER} seat mints nothing and runs NO sudo (a refused sudo mails root)" \
+    || bad_t "T4c a ${SEAT_TIER} seat mints nothing and runs NO sudo (a refused sudo mails root)" "got: $got calls: $(cat "$SUDO_LOG")"
+done
 
-# curl failure (api down) -> empty (caller falls back to legacy text)
-curl() { return 7; }
-got=$(_task_mint_drop_link DIVE-901 PYPI_TOKEN pypi)
-[[ -z "$got" ]] && ok_t "T4c mint failure -> empty (legacy fallback)" \
-  || bad_t "T4c mint failure -> empty (legacy fallback)" "got: $got"
+SEAT_TIER=admin; MINT_OUT='{"ok":true,"data":{"url":"http://secrets.box.example.com/x","ttl_minutes":30}}'
+got=$(_task_mint_drop_link DIVE-901)
+[[ -z "$got" ]] && ok_t "T4d a non-https link is never put in the alert" \
+  || bad_t "T4d a non-https link is never put in the alert" "got: $got"
 
-# no box identity (token absent, no /etc file on this host) -> empty
-unset CONNECTORD_TOKEN
-got=$(_task_mint_drop_link DIVE-901 PYPI_TOKEN pypi)
-[[ -z "$got" ]] && ok_t "T4d no connectord token -> empty" \
-  || bad_t "T4d no connectord token -> empty" "got: $got"
-unset -f curl
+[[ ! -s "$CURL_LOG" ]] && ok_t "T4e no arm called out to any API (curl never ran)" \
+  || bad_t "T4e no arm called out to any API (curl never ran)" "curl: $(cat "$CURL_LOG")"
+unset -f curl sudo id agent_tier
 
 # --- T5: secret write --task writes value + auto-resolves the gate ------------
 # Mock the box environment: no real root, connectors dir in TMP, and a fake
