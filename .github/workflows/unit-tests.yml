@@ -55,8 +55,8 @@ env:
 jobs:
   # DIVE-3315: INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s
   # stands; the core corpus does not fit under it any more. (Two when this was written;
-  # THREE since DIVE-4147 and FOUR since DIVE-4658 — the gates and the measurements are the
-  # blocks below.) Measured on main
+  # THREE since DIVE-4147, FOUR since DIVE-4658 and SIX since DIVE-5344 — the gates and the
+  # measurements are the blocks below.) Measured on main
   # 2026-08-11/12: 313s pristine against a 312s effective cap, with ~6% runner spread
   # and the mutation-harness lever exhausted at ~7s available against ~13s needed
   # (olivia's by-construction census, DIVE-3313). A cap breached by 1s on the draw of a
@@ -135,6 +135,30 @@ jobs:
   # COUNT, so it reads the same at three shards and at four, which is the entire reason it was
   # built.
   #
+  # DIVE-5344: N = 6, decided by dev on that row on 2026-10-01. The lead's brief named a fifth
+  # shard; five is the alternative, recorded with its numbers on the row and below. The nine-day forecast above was close: on 2026-10-01 (eleven days on) main's own push
+  # run 36835715525 read 219/288/315/298s pristine and 294/230/312/300s installed-host, so it
+  # passed only because a confirm re-time came in 2s under, and cli #1193 was ejected from the
+  # merge queue twice with 145 of 145 harnesses passing (runs 36846865686, 36859123131). The
+  # corpus is 578 core harnesses and 1120s pristine / 1136s installed-host un-sharded.
+  #
+  # Same method as above, plus one change: the weights table is REFRESHED in the same commit
+  # (scripts/refresh-harness-weights.sh, core run 36835715525, full run 36847757495). The old
+  # table priced the tier at 241s per shard against a true 280. Each split is planned with the
+  # table that ships and costed at a DIFFERENT green main run's per-harness times (36821797088),
+  # so the prices do not come from the run the table was built from. Worst shard, pristine /
+  # installed-host:
+  #   four,  refreshed table   260 / 303s  (101%)  balanced but still over: a refresh alone is not enough
+  #   five,  old table         222 / 254s  (85%)
+  #   five,  refreshed table   213 / 245s  (82%)   about two days of headroom at the measured growth
+  #   six,   refreshed table   178 / 206s  (69%)   what this commit takes
+  # Main grew about 8s per shard per day at four shards (229s on 09-20 to 315s on 10-01). Five
+  # shards would leave about 10s of headroom against that growth, and the row's acceptance is
+  # three consecutive main runs under 85%, so five would be back over within days. Six gives
+  # 49s of headroom to 85%, about nine days, and costs two more runner jobs per environment.
+  # As above, this is capacity and not paydown. core_us_per_harness reads 177% of its reference
+  # on run 36835715525, and that is the number to bring down.
+  #
   # AND THE UN-SHARDED TOTAL IS STILL PRINTED, by `core-budget-report` below: sharding
   # is the obvious way to lose the number this whole scheme exists to surface. Two jobs
   # reporting 157s read as comfortable while the corpus still costs 313s. Per-shard is
@@ -158,7 +182,7 @@ jobs:
       # un-sharded total is re-summed from the shards' reports, and a cancelled shard
       # is a hole in exactly the number this row exists to keep legible.
       fail-fast: false
-      matrix: { shard: [1, 2, 3, 4] }
+      matrix: { shard: [1, 2, 3, 4, 5, 6] }
     steps:
       # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
       # moves a payload the real CLI produced into the real dispatcher that lives in
@@ -627,7 +651,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: { shard: [1, 2, 3, 4] }
+      matrix: { shard: [1, 2, 3, 4, 5, 6] }
     steps:
       # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
       # moves a payload the real CLI produced into the real dispatcher that lives in
@@ -1090,7 +1114,8 @@ jobs:
       - name: The ACP server must have been GRADED (pristine)
         run: |
           bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
-            core-pristine-1.txt core-pristine-2.txt core-pristine-3.txt core-pristine-4.txt
+            core-pristine-1.txt core-pristine-2.txt core-pristine-3.txt core-pristine-4.txt \
+            core-pristine-5.txt core-pristine-6.txt
 
   acp-graded-installed:
     # DIVE-4186: queue-time only. Its `needs` would carry the skip anyway; spelled out
@@ -1107,7 +1132,8 @@ jobs:
       - name: The ACP server must have been GRADED (installed host)
         run: |
           bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
-            core-installed-1.txt core-installed-2.txt core-installed-3.txt core-installed-4.txt
+            core-installed-1.txt core-installed-2.txt core-installed-3.txt core-installed-4.txt \
+            core-installed-5.txt core-installed-6.txt
 
   # DIVE-3315: THE FOUR REQUIRED CHECKS, kept by NAME. `test`, `test-installed-host`,
   # `test-confirm` and `test-installed-host-confirm` are required status checks on main.

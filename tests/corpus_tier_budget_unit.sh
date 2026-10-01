@@ -2002,7 +2002,7 @@ if len(summ) == 1:
 
 # 98 — THE SHARD COUNT IS A PINNED NUMBER, NOT A SENTENCE. Found by codex grading this
 # row's own PR: changing BOTH core matrices from [1, 2] to [1, 2, 3] passes 142/0.
-# (N is 4 as of DIVE-4658 — see the notes on CORE_SHARDS below. Read every `[1, 2, 3]`
+# (N is 6 as of DIVE-5344 — see the notes on CORE_SHARDS below. Read every `[1, 2, 3]`
 # in this header as "one more shard than is pinned"; the arm is about N moving in the
 # workflow alone, whatever N is.) Every
 # arm above stays green because every one of them is about the shape of the split and not
@@ -2100,7 +2100,19 @@ if len(summ) == 1:
 # against a true 336/317/275. Worst shard at four: 246s pristine (82% of cap), 212s installed-host
 # (70%). TIER_BUDGET_CORE, TIER_CAL_SCALE_MAX_PCT and TIER_CAL_BASELINE_US are
 # untouched by that change, as they were by DIVE-4147's and by this arm's own commit.
-CORE_SHARDS = 4
+#
+# DIVE-5344 MOVED THIS LINE FROM 4 TO 6, and as this arm requires it came with a decision
+# recorded on the row (dev, 2026-10-01). The lead's brief named a fifth shard, and five is the
+# alternative recorded there. The cause was measured: main's own
+# push run 36835715525 read 315s on core-pristine s3 and 312s on core-installed-host s3. It
+# passed only because a confirm re-time came in 2s under. cli #1193 was ejected from the merge
+# queue twice with every harness passing (36859123131: `OVER BUDGET by 1s`, 145 of 145 passed).
+# The split was planned with the weights table refreshed in the same commit and costed at a
+# different green main run (36821797088). Worst shard at five is 213s pristine / 245s
+# installed-host (82%), about two days of headroom at the ~8s/shard/day growth measured since
+# DIVE-4658. At six it is 178s / 206s (69%). TIER_BUDGET_CORE, TIER_CAL_SCALE_MAX_PCT and
+# TIER_CAL_BASELINE_US are untouched by this change too.
+CORE_SHARDS = 6
 # One corpus job per environment (pristine, installed-host) and one confirm job per
 # environment. Both are counts of JOBS, and both are capacity: another corpus job is
 # another 300s cap, and another confirm job is another box re-running a shard.
