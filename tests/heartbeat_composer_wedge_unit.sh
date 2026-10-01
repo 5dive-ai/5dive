@@ -113,7 +113,7 @@ grade "W1f the flattening is on the record — a green log never claims a fix it
 # goal; a /clear left unsent FIRES AT THE TARGET'S NEXT TURN BOUNDARY and wipes a
 # working seat's context — that is how quinn lost its session (23:17:36Z,
 # 23:17:41Z). So a submit that cannot be verified must remove what it typed.
-_reset; PANES=("$P_WEDGE" "$P_WEDGE" "$P_EMPTY"); _hb_send_line seatx "/clear"; rc=$?
+_reset; PANES=("$P_EMPTY" "$P_WEDGE" "$P_WEDGE" "$P_EMPTY"); _hb_send_line seatx "/clear"; rc=$?
 grade "W2a a submit that survives both Enters returns 1 so nothing is claimed on it" "[[ $rc -eq 1 ]]"
 grade "W2b ...and the composer is CLEARED afterwards (C-u after the two Enters, not before them only)" \
       "[[ \$(cus) -ge 2 ]] && [[ \$(grep -n 'C-u' '$KEYS' | tail -1 | cut -d: -f1) -gt \$(grep -n 'Enter' '$KEYS' | tail -1 | cut -d: -f1) ]]"
@@ -125,7 +125,7 @@ grade "W2e ...and the seat is written to the wedge ledger by name" \
       "[[ -s '$TMP/composer-wedge/seatx' ]]"
 
 # The clear does not take: the reason must say so and name the only measured exit.
-_reset; PANES=("$P_WEDGE"); _hb_send_line seatx "/clear"; rc=$?
+_reset; PANES=("$P_EMPTY" "$P_WEDGE"); _hb_send_line seatx "/clear"; rc=$?
 grade "W2f a clear that does NOT take is reported as a live residual, naming 'agent restart' as the exit" \
       "[[ $rc -eq 1 && \"\$_HB_SEND_FAIL_REASON\" == *'agent restart'* ]]"
 
@@ -292,7 +292,7 @@ grade "M1 MUTANT (no flattening): the newlines reach the pane, so W1d is live" \
 eval "$_REAL_FLATTEN"
 
 _hb_composer_clear() { return 1; }                   # M2: pre-fix — leave the draft
-_reset; PANES=("$P_WEDGE" "$P_WEDGE"); _hb_send_line seatx "/clear" >/dev/null 2>&1
+_reset; PANES=("$P_EMPTY" "$P_WEDGE" "$P_WEDGE"); _hb_send_line seatx "/clear" >/dev/null 2>&1
 grade "M2 MUTANT (no clear on failure): the residual survives and the reason stops saying CLEARED, so W2b/W2d are live" \
       "[[ \$(cus) -eq 1 && \"\$_HB_SEND_FAIL_REASON\" != *'CLEARED'* ]]"
 eval "$_REAL_CLEAR"

@@ -92,6 +92,7 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 not_ok(){ FAIL=$((FAIL+1)); printf 'not ok - %s\n' "$1"; }
 grade() { if eval "$2"; then ok_t "$1"; else not_ok "$1"; fi; }
 enters() { grep -cx 'Enter' "$KEYS"; }
+keys_before_msg() { awk -v m="$MSG" '$0 == m { exit } { print }' "$KEYS"; }   # every key sent before the payload
 E=$'\e'; NB=$'\xc2\xa0'   # CC renders "❯" + NO-BREAK SPACE (U+00A0), exactly as live panes show it
 P_EMPTY="${E}[39m❯${NB} ${E}[39m\n  Opus 5 5h: 3%\n"
 P_GHOST="${E}[39m❯${NB} ${E}[2mnext task${E}[0m\n  Opus 5 5h: 3%\n"
@@ -108,10 +109,12 @@ grade "B2 the injector clears the composer (C-u) BEFORE typing the payload" "[[ 
 grade "B3 the clear is C-u, never Escape (Escape would abort a running turn)" "! grep -qx 'Escape' '$KEYS'"
 
 # B4 — a leftover line in the composer is cleared, not prepended. The keys are the
-# whole record: the payload is typed as its own send-keys after a C-u.
+# whole record: the payload is typed as its own send-keys after a C-u. DIVE-5299:
+# the first capture is now the PRE-TYPE read, so the leftover is seen before
+# typing and cleared until the composer reads empty; only C-u/BSpace precede it.
 _reset; PANES=("$P_LEFTOVER" "$P_EMPTY"); inject_and_submit seatx "$MSG"; rc=$?
 grade "B4 a composer holding an operator's half-typed line is cleared first, and the payload is typed alone" \
-      "[[ \$(sed -n 1p '$KEYS') == 'C-u' && \$(sed -n 2p '$KEYS') == '$MSG' ]] && ! grep -q 'half a line' '$KEYS'"
+      "[[ \$(sed -n 1p '$KEYS') == 'C-u' && -z \$(keys_before_msg | grep -vxE 'C-u|BSpace') ]] && grep -qxF -- \"\$MSG\" '$KEYS' && ! grep -q 'half a line' '$KEYS'"
 
 # B5 — dim ghost text is not unsent input: one Enter, rc 0. Without the DIM
 # exclusion every idle seat would fail the verify and every send would read false.
@@ -119,13 +122,13 @@ _reset; PANES=("$P_GHOST"); inject_and_submit seatx "$MSG"; rc=$?
 grade "B5 dim ghost text is not read as unsent input (rc 0, one Enter)" "[[ $rc -eq 0 && \$(enters) -eq 1 ]]"
 
 # B6 — tail sits after the first Enter, clears after the retry: rc 0, two Enters.
-_reset; PANES=("$P_STUCK" "$P_EMPTY"); inject_and_submit seatx "$MSG"; rc=$?
+_reset; PANES=("$P_EMPTY" "$P_STUCK" "$P_EMPTY"); inject_and_submit seatx "$MSG"; rc=$?
 grade "B6 a tail left after the first Enter is retried once and then accepted (rc 0, two Enters)" \
       "[[ $rc -eq 0 && \$(enters) -eq 2 ]]"
 
 # B7 — tail survives both Enters: rc 1 (so the caller renders sent:false), and
 # exactly two Enters — no five-Enter loop hammering a composer that is not taking.
-_reset; PANES=("$P_STUCK" "$P_STUCK"); inject_and_submit seatx "$MSG"; rc=$?
+_reset; PANES=("$P_EMPTY" "$P_STUCK" "$P_STUCK"); inject_and_submit seatx "$MSG"; rc=$?
 grade "B7 a tail that survives both Enters returns 1 so the caller reports sent:false" "[[ $rc -eq 1 ]]"
 grade "B8 ...and stops at two Enters rather than looping stray keystrokes into the pane" "[[ \$(enters) -eq 2 ]]"
 
@@ -135,7 +138,7 @@ grade "B8 ...and stops at two Enters rather than looping stray keystrokes into t
 # composer, that grep matches nothing and the pre-fix path returns 0 on the first
 # Enter — a receipt for a message still sitting unsent. B10 runs exactly that.
 P_TAIL_NOPLACEHOLDER="${E}[39m❯${NB} ${E}[39mirst (verify before relying)\n  Opus 5 5h: 3%\n"
-_reset; PANES=("$P_TAIL_NOPLACEHOLDER" "$P_TAIL_NOPLACEHOLDER"); inject_and_submit seatx "$MSG"; rc=$?
+_reset; PANES=("$P_EMPTY" "$P_TAIL_NOPLACEHOLDER" "$P_TAIL_NOPLACEHOLDER"); inject_and_submit seatx "$MSG"; rc=$?
 grade "B9 unsent text with NO paste placeholder — invisible to the pre-fix grep — now returns 1" "[[ $rc -eq 1 ]]"
 
 # B10 — the pre-fix injector itself, on B9's pane, as the differential. This is
@@ -176,7 +179,7 @@ _hb_agent_idle()  { return "${IDLE_RC:-0}"; }
 # returns 0 again on one Enter. Proves B7/B9 are graded by the verify, not by the
 # fixture happening to be short.
 _hb_verify_submit() { return 0; }
-_reset; PANES=("$P_STUCK" "$P_STUCK"); inject_and_submit seatx "$MSG"; rc=$?
+_reset; PANES=("$P_EMPTY" "$P_STUCK" "$P_STUCK"); inject_and_submit seatx "$MSG"; rc=$?
 grade "B12 mutation: dropping the verify turns B7's rc back to 0 — the arm is live" "[[ $rc -eq 0 && \$(enters) -eq 1 ]]"
 
 # --- B13/B14 — the seam with DIVE-4214, graded from THIS side --------------

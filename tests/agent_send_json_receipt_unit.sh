@@ -115,6 +115,8 @@ _agent_delivery_inbox()   { return 1; }
 _agent_pane_safe_to_type(){ return 0; }
 _hb_claude_pid()          { printf '2362\n'; }
 _hb_verify_submit()       { return 0; }
+_hb_submit_settled()      { return 0; }   # DIVE-5299: same seam, same reason (cmd_heartbeat.sh is not sourced)
+_hb_composer_scrub()      { return 0; }
 _wedge_clear()            { :; }
 require_agent()           { :; }
 mirror_interagent_outbound() { :; }
