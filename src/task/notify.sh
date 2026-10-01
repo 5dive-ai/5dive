@@ -1575,34 +1575,28 @@ _task_close_notify() {
 # task_actor does; the token comes from the group-claude-readable connector
 # file (or an inherited env var); and access.json is found by probing the
 # per-type channel dirs (own file when direct, root-readable when sudo).
-# _task_mint_drop_link — DIVE-931. Mint a one-time secure credential drop link
-# for a secret gate (api POST /drop/mint, box-authed with the box's connectord
-# token). Echoes exactly one of:
-#   <url>|<ttlMinutes>   a live burnable link (api pushes the value to the box)
-#   ONBOX                 api holds no usable token for this box -> on-box path
-#   (empty)               mint unavailable (self-hosted / api down) -> legacy text
-# Best-effort: never fails the caller and never touches the secret VALUE (only the
-# destination coordinates). The value crosses solely via the drop page -> stdin.
+# _task_mint_drop_link <ident> — DIVE-5319. A one-time drop link served by THIS
+# box (`5dive secret link`): https://secrets.<box>/<token>. Echoes "<url>|<ttl>"
+# or nothing. It never asks 5dive's API: the value must not pass through it, and
+# the api /drop/mint this used to call was never built.
+# Minting is root-only, because a link is the right to write one key into a
+# root-owned connector file. So it mints when this runs as root or on a seat
+# whose sudo already covers `5dive` (an admin seat, root-equivalent anyway). A
+# standard seat gets nothing here, and the alert sends the owner to the app,
+# whose card mints the link through the box's own root path.
 _task_mint_drop_link() {
-  local ident="$1" secret_key="$2" connector="$3"
-  local token="" env_file="/etc/5dive/connectord.env"
-  [[ -n "${CONNECTORD_TOKEN:-}" ]] && token="$CONNECTORD_TOKEN"
-  [[ -z "$token" && -r "$env_file" ]] && token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$env_file" | head -1)
-  [[ -n "$token" ]] || return 0   # no box identity (self-hosted OSS) -> legacy text
-  local api="${FIVE_API_BASE:-https://api.5dive.com}" body resp
-  body=$(jq -nc --arg t "$ident" --arg k "$secret_key" --arg c "$connector" \
-           '{taskIdent:$t, secretKey:$k, connector:$c, ttlMinutes:30}') || return 0
-  resp=$(curl -fsS --max-time 10 -X POST "${api%/}/drop/mint" \
-           -H "authorization: Bearer ${token}" -H "content-type: application/json" \
-           -d "$body" 2>/dev/null) || return 0
-  if [[ "$(printf '%s' "$resp" | jq -r '.useOnBoxPath // false' 2>/dev/null)" == "true" ]]; then
-    echo "ONBOX"; return 0
+  local ident="$1" out="" url ttl
+  if [[ $EUID -eq 0 ]]; then
+    out=$(5dive --json secret link "$ident" 2>/dev/null) || return 0
+  elif sudo -n -l 5dive secret link "$ident" >/dev/null 2>&1; then
+    out=$(sudo -n 5dive --json secret link "$ident" 2>/dev/null) || return 0
+  else
+    return 0
   fi
-  local url ttl
-  url=$(printf '%s' "$resp" | jq -r '.url // empty' 2>/dev/null)
-  ttl=$(printf '%s' "$resp" | jq -r '.ttlMinutes // empty' 2>/dev/null)
-  [[ -n "$url" ]] || return 0
-  echo "${url}|${ttl:-15}"
+  url=$(printf '%s' "$out" | jq -r '.data.url // empty' 2>/dev/null)
+  ttl=$(printf '%s' "$out" | jq -r '.data.ttl_minutes // empty' 2>/dev/null)
+  [[ "$url" == https://* ]] || return 0
+  echo "${url}|${ttl:-30}"
 }
 
 # Render the canonical tap keyboard for one gate. Kept separate from the alert
@@ -1619,25 +1613,28 @@ _task_mint_drop_link() {
 # Provided", which on a gate that never named a target asks the human to do
 # something undefined and then attest to it; that attestation is what produced
 # the DIVE-2232 record — signed, nonced, human-attested, empty.
-# DIVE-5319: where an owner with no shell answers a secret gate. The dashboard's
-# task card and the Telegram Mini App both take a paste and run `secret write`
-# for this gate over the box's own tunnel, so the value never sits in a chat.
-# This chat is the one place it must not go: said in the same line.
+# DIVE-5319: where an owner with no shell answers a secret gate when this alert
+# carries no link. The dashboard's task card and the Telegram Mini App both open
+# a one-time page served by THIS box, so the value never passes through 5dive or
+# a chat. This chat is the one place it must not go: said in the same line.
 _task_secret_gate_app_line() {
-  printf '%s' "Paste it in the 5dive app: this task's card on 5dive.ai/dashboard/tasks, or My team in the 5dive app on Telegram. It goes straight to this server. Never paste it in this chat."
+  printf '%s' "Open this task in the 5dive app (its card on 5dive.ai/dashboard/tasks, or My team in the 5dive app on Telegram) and tap Open secure link. You paste it on a page served by this server, never through 5dive or this chat. Never paste it here."
+}
+
+# The terminal path, for a box no owner's browser can reach: asks, hidden input.
+_task_secret_gate_box_line() {
+  printf '%s' "On the box instead: sudo 5dive secret write $1 --connector=$2 --task=$3 (it asks for the value, hidden)."
 }
 
 _task_secret_gate_cta() {
   local ident="$1" numid="$2" secret_key="$3" connector="$4" _drop="$5"
-  if [[ "$_drop" == "ONBOX" ]]; then
-    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. $(_task_secret_gate_app_line)"$'\n'"On the box instead:"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"Either one writes it and clears this gate. Or tap ✅ Provided once it is done."
-  elif [[ -n "$_drop" ]]; then
+  if [[ -n "$_drop" && "$_drop" != "ONBOX" ]]; then
     local _url="${_drop%%|*}" _ttl="${_drop##*|}"
-    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. Drop it securely (single-use, expires in ${_ttl}m):"$'\n'"${_url}"$'\n'"The value goes straight onto your box and is never shown in chat. Prefer the box? echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"
+    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. Open this one-time link and paste it there (single use, expires in ${_ttl}m):"$'\n'"${_url}"$'\n'"It goes straight to this server, never through 5dive or this chat. Never paste it here. Link expired? The task's card in the 5dive app makes a fresh one. $(_task_secret_gate_box_line "$secret_key" "$connector" "$ident")"
   elif [[ -n "$secret_key" && -n "$connector" ]]; then
-    # Target named, mint unavailable (api unreachable / tokenless): still name the
-    # target, because the box-side write is a real delivery path.
-    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. $(_task_secret_gate_app_line)"$'\n'"On the box instead:"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"Either one writes it and clears this gate. Or tap ✅ Provided once it is done."
+    # Target named, no link minted here (a standard seat cannot mint one, or
+    # this box has no reachable name): the app's card mints it, the box takes it.
+    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. $(_task_secret_gate_app_line)"$'\n'"$(_task_secret_gate_box_line "$secret_key" "$connector" "$ident")"$'\n'"Either one writes it and clears this gate. Or tap ✅ Provided once it is done."
   else
     local _oob; _oob=$(db "SELECT COALESCE(secret_oob,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
     if [[ -n "$_oob" ]]; then

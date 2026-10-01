@@ -279,22 +279,35 @@ txt=$(_task_secret_gate_cta DIVE-2406 "$(db "SELECT id FROM tasks WHERE ident='D
   && ok_t "T8b the out-of-band alert names the declared channel and keeps the tap" \
   || bad_t "T8b the out-of-band alert names the declared channel and keeps the tap" "text: $txt"
 
-# ============================ DIVE-5319: THE APP PASTE ========================
-# An owner with no shell answers a secret gate by pasting in the dashboard or the
-# Mini App (`secret write --task` over the box tunnel). The chat alert has to send
-# them there, and still say never to paste in the chat; the resume ping has to tell
-# the asking seat which file the value is now in.
+# ============================ DIVE-5319: THE BOX-SERVED LINK ===================
+# An owner with no shell answers a secret gate on a one-time page served by THEIR
+# box (`5dive secret link`), never through 5dive's API or a chat. The alert carries
+# that link when this seat could mint it; otherwise it sends the owner to the app,
+# whose card mints one. Either way it keeps the box command and forbids a chat
+# paste. The resume ping tells the asking seat which file the value is now in.
 _drop_id=$(db "SELECT id FROM tasks WHERE ident='DIVE-2405';")
 for _shape in ONBOX ""; do
   txt=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "$_shape")
   if [[ "$txt" == *"5dive.ai/dashboard/tasks"* && "$txt" == *"5dive app on Telegram"* \
-        && "$txt" == *"Never paste it in this chat"* \
+        && "$txt" == *"Open secure link"* && "$txt" == *"Never paste it here"* \
         && "$txt" == *"sudo 5dive secret write GH_BOT_TOKEN --connector=github-bot --task=DIVE-2405"* ]]; then
-    ok_t "T9 the drop-target alert (${_shape:-no link}) sends the owner to the app, keeps the box command, forbids a chat paste"
+    ok_t "T9 the drop-target alert (${_shape:-no link}) sends the owner to the app's secure link, keeps the box command, forbids a chat paste"
   else
-    bad_t "T9 the drop-target alert (${_shape:-no link}) sends the owner to the app, keeps the box command, forbids a chat paste" "text: $txt"
+    bad_t "T9 the drop-target alert (${_shape:-no link}) sends the owner to the app's secure link, keeps the box command, forbids a chat paste" "text: $txt"
   fi
 done
+_link="https://secrets.box.example.com/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCd"
+txt=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "${_link}|30")
+[[ "$txt" == *"$_link"* && "$txt" == *"single use, expires in 30m"* && "$txt" == *"never through 5dive or this chat"* \
+   && "$txt" == *"Never paste it here"* \
+   && "$txt" == *"sudo 5dive secret write GH_BOT_TOKEN --connector=github-bot --task=DIVE-2405"* ]] \
+  && ok_t "T9b a minted link goes in the alert with its expiry, and the box command stays" \
+  || bad_t "T9b a minted link goes in the alert with its expiry, and the box command stays" "text: $txt"
+_all=""
+for _shape in ONBOX "" "${_link}|30"; do _all+=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "$_shape"); done
+[[ "$_all" != *"api.5dive"* && "$_all" != *"/drop/"* ]] \
+  && ok_t "T9c no alert shape points the owner at 5dive's API" \
+  || bad_t "T9c no alert shape points the owner at 5dive's API" "text: $_all"
 
 PINGS="$TMP/pings"; : >"$PINGS"
 cmd_send() { local a; for a in "$@"; do [[ "$a" == --message=* ]] && printf '%s\n' "${a#--message=}" >>"$PINGS"; done; return 0; }

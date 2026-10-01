@@ -193,6 +193,7 @@ LAZY_FILES=(
   src/cmd_pack.sh
   src/cmd_plugin.sh
   src/cmd_secret.sh
+  src/cmd_secret_drop.sh
   src/cmd_selfupdate.sh
 )
 

@@ -39,6 +39,17 @@ _secret_usage() {
       write clears that task's pending secret gate (secure-drop path).
 
       echo -n "$TOKEN" | sudo 5dive secret write OPENAI_API_KEY --connector=openai
+      Run at a terminal with nothing piped, it asks for the value (hidden input).
+
+  5dive secret link <DIVE-N> [--ttl=<minutes>]
+      Mint a one-time link for an open secret gate: https://secrets.<box>/<token>.
+      The owner opens it, pastes, taps once; the value goes from their browser to
+      this box only, lands as the gate's KEY, and clears the gate. Single use,
+      expires in 30 min by default. Root-only.
+
+  5dive secret serve [--listen=127.0.0.1:3127]
+      The page behind those links. Started on demand by `secret link`; exits by
+      itself once no link is live. Root-only.
 EOF
 }
 
@@ -55,8 +66,13 @@ cmd_secret() {
   local sub="$1"; shift
   case "$sub" in
     write) _secret_write "$@" ;;
+    # DIVE-5319: the box-served drop link (src/cmd_secret_drop.sh).
+    link)    _secret_link "$@" ;;
+    serve)   _secret_serve "$@" ;;
+    _peek)   _secret_drop_peek "$@" ;;
+    _redeem) _secret_drop_redeem "$@" ;;
     -h|--help|help) _secret_usage ;;
-    *) fail "$E_USAGE" "unknown secret command: $sub (write)" ;;
+    *) fail "$E_USAGE" "unknown secret command: $sub (write|link|serve)" ;;
   esac
 }
 
@@ -83,10 +99,16 @@ _secret_write() {
   _valid_env_key "$key"       || fail "$E_USAGE" "invalid KEY '$key' (env-var name: ^[A-Z_][A-Z0-9_]*\$)"
   _valid_connector "$connector" || fail "$E_USAGE" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]*\$)"
 
-  # Value on stdin ONLY. A tty means no value was piped -> refuse rather than
-  # block reading from the keyboard (and rather than accept an empty secret).
-  [[ -t 0 ]] && fail "$E_USAGE" "secret value must be piped on stdin (never passed as an argument)"
-  local value; value="$(cat)"
+  # Value on stdin ONLY, never argv. DIVE-5319: at a terminal (nothing piped) it
+  # asks with hidden input, the fallback for a box no owner's browser can reach.
+  local value
+  if [[ -t 0 ]]; then
+    printf 'Paste the value for %s (hidden), then Enter: ' "$key" >&2
+    IFS= read -rs value || value=""
+    printf '\n' >&2
+  else
+    value="$(cat)"
+  fi
   # Strip a single trailing CR/LF pair left by echo / heredocs; preserve any
   # other bytes verbatim.
   value="${value%$'\n'}"; value="${value%$'\r'}"
