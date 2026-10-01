@@ -1524,9 +1524,10 @@ _task_guard_delivery_evidence() {  # <id> <ident> <verb> <result-text> <want_res
 #
 # SHAPE: `delivery_ref` stays the PRIMARY (the first `--pr=`), so every rail that
 # reads it is unchanged. The rest land in `delivery_companions`, one full pull URL
-# per line, NULL when there are none. A re-delivery REPLACES the set — what you
-# bind is what is bound — so a single `--pr=` clears companions left by an earlier
-# delivery rather than inheriting them.
+# per line, NULL when there are none. DIVE-5348 changed what a re-delivery does:
+# it ADDS to the set and never drops from it (see _task_deliver_carried_companions
+# below), because "what you bind is what is bound" let DIVE-5322's iteration-4
+# re-delivery name only the API pull request and silently unbind the frontend one.
 #
 # THE RULE ON TOP: a landing is recorded, and a row closes, only when EVERY bound
 # pull request has merged. The companions are read with the same credential-free
@@ -1553,9 +1554,105 @@ _task_companion_refs() {
   return 0
 }
 
-# _task_companions_unlanded <id> — every companion that has NOT landed, one per
-# line as `<url> (<state>)`. Empty output = every companion merged (or none are
-# bound). Never fails the caller.
+# ── DIVE-5348 — THE BOUND SET IS EVERY PULL REQUEST THE ROW CLAIMS ───────────
+#
+# MEASURED 2026-10-01, twice in one afternoon. DIVE-5322 closed done with api#337
+# merged and fe#382 open and conflicting for ~3h: iteration 3 had bound fe#382 as
+# a companion, iteration 4 re-delivered with ONE --pr, and the replace-the-set
+# rule above dropped it without a word. DIVE-5343 reached its close with api#346
+# merged and fe#391 still a draft: it was delivered with one --pr and a result
+# that said "api#346 + fe#391" — shorthand, which the full-URL guard cannot see.
+# Every landing check was correct about the set it was given; the set was wrong.
+#
+# SO THE SET IS DERIVED, NOT JUST STORED. Beside the primary, a row binds:
+#   - every companion (`task deliver --pr= --pr=`),
+#   - every GitHub pull URL in its RESULT,
+#   - every GitHub pull URL in its BODY's "Delivered as" paragraph,
+# minus the ones a seat dropped with a written reason (`delivery_unbound`, filled
+# by `task unbind-pr` and by a delivery's `--no-pr`). Leaving the set is a
+# recorded act; arriving in it is anything that names the pull request as
+# delivered. `merge-landed`, the forge poller, the close gate and the merge
+# dispatch all read it through _task_companions_unlanded below.
+
+# _task_pr_urls_in <text> — every GitHub pull URL in <text>, one per line.
+_task_pr_urls_in() {
+  grep -oE 'https?://(www\.)?github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+' <<<"${1:-}" 2>/dev/null || true
+}
+
+# _task_delivered_as_text <body> — the body's "Delivered as" paragraph: the line
+# that says it and every line after it up to the first blank one.
+_task_delivered_as_text() {
+  awk 'on && /^[[:space:]]*$/ {exit} tolower($0) ~ /delivered as/ {on=1} on {print}' <<<"${1:-}" 2>/dev/null || true
+}
+
+# _task_unbound_keys <id> — the `owner/repo#N` key of every pull request this row
+# dropped, one per line.
+_task_unbound_keys() {
+  local u l; u=$(db "SELECT COALESCE(delivery_unbound,'') FROM tasks WHERE id=${1};" 2>/dev/null || printf '')
+  [[ -n "$u" ]] || return 0
+  while IFS= read -r l; do [[ -n "$l" ]] && _task_pr_url_key "${l%%$'\t'*}"; done <<<"$u"
+  return 0
+}
+
+# _task_unbound_refs <id> — the URL of every pull request this row dropped. The
+# prose guards treat these as ACCOUNTED FOR: a seat already wrote down why the
+# row does not deliver them, so naming one again is not an unbound citation.
+_task_unbound_refs() {
+  local u l; u=$(db "SELECT COALESCE(delivery_unbound,'') FROM tasks WHERE id=${1};" 2>/dev/null || printf '')
+  [[ -n "$u" ]] || return 0
+  while IFS= read -r l; do [[ -n "$l" ]] && printf '%s\n' "${l%%$'\t'*}"; done <<<"$u"
+  return 0
+}
+
+# _task_bound_pr_refs <id> — every pull request bound to the row BESIDE its
+# primary, one full URL per line, deduplicated by `owner/repo#N`. See above.
+_task_bound_pr_refs() {
+  local id="$1" row dref body result u k
+  row=$(db "SELECT COALESCE(delivery_ref,'')||x'1f'||COALESCE(body,'')||x'1f'||COALESCE(result,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  dref="${row%%$'\x1f'*}"; row="${row#*$'\x1f'}"
+  body="${row%%$'\x1f'*}"; result="${row#*$'\x1f'}"
+  local -A skip=()
+  k=$(_task_pr_url_key "$dref"); [[ -n "$k" ]] && skip["$k"]=1
+  while IFS= read -r k; do [[ -n "$k" ]] && skip["$k"]=1; done < <(_task_unbound_keys "$id")
+  while IFS= read -r u; do
+    [[ -n "$u" ]] || continue
+    k=$(_task_pr_url_key "$u")
+    if [[ -n "$k" ]]; then
+      [[ -n "${skip[$k]:-}" ]] && continue
+      skip["$k"]=1
+    fi
+    printf '%s\n' "$u"
+  done < <(_task_companion_refs "$id"; _task_pr_urls_in "$result"; _task_pr_urls_in "$(_task_delivered_as_text "$body")")
+  return 0
+}
+
+# _task_record_unbound <id> <url> <reason> <actor> — drop <url> from the row's
+# bound set, durably and with the reason. Idempotent by key: a second drop of the
+# same pull request rewrites its line rather than adding one.
+_task_record_unbound() {
+  local id="$1" url="$2" why="$3" who="$4" k cur l keep=""
+  k=$(_task_pr_url_key "$url")
+  why="${why//$'\t'/ }"; why="${why//$'\n'/ }"
+  cur=$(db "SELECT COALESCE(delivery_unbound,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  while IFS= read -r l; do
+    [[ -n "$l" ]] || continue
+    [[ -n "$k" && "$(_task_pr_url_key "${l%%$'\t'*}")" == "$k" ]] && continue
+    keep+="$l"$'\n'
+  done <<<"$cur"
+  keep+="${url}"$'\t'"${why}"$'\t'"${who}"$'\t'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local comp="" c
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    [[ -n "$k" && "$(_task_pr_url_key "$c")" == "$k" ]] && continue
+    comp+="${comp:+$'\n'}$c"
+  done < <(_task_companion_refs "$id")
+  db "UPDATE tasks SET delivery_unbound=$(sqlq "$keep"), delivery_companions=$(sqlq_or_null "$comp") WHERE id=${id};"
+}
+
+# _task_companions_unlanded <id> — every bound pull request beside the primary
+# (DIVE-5348: the derived set, not just the stored companions) that has NOT
+# landed, one per line as `<url> (<state>)`. Empty output = every one merged (or
+# none are bound). Never fails the caller.
 _task_companions_unlanded() {
   local id="$1" ref probe verdict rest
   while IFS= read -r ref; do
@@ -1567,7 +1664,7 @@ _task_companions_unlanded() {
       OPEN)   printf '%s (%s, not merged)\n' "$ref" "${rest:-open}" ;;
       *)      printf '%s (state NOT READ — the forge could not be asked, which is not a merge)\n' "$ref" ;;
     esac
-  done < <(_task_companion_refs "$id")
+  done < <(_task_bound_pr_refs "$id")
   return 0
 }
 
@@ -1588,6 +1685,27 @@ _task_unbound_pr_urls() {
   return 0
 }
 
+# _task_unbound_pr_shorthand <text> <bound-url>... — every `name#N` token in
+# <text> (fe#391, api#346, PR#12, lodar/5dive-frontend#391) whose N is not the number of a bound pull
+# request, one per line, deduplicated. A bare `#N` is not shorthand for this
+# purpose (DIVE-1965 territory). Pure text.
+_task_unbound_pr_shorthand() {
+  local text="$1"; shift
+  local -A nums=() seen=()
+  local b k t n
+  for b in "$@"; do k=$(_task_pr_url_key "$b"); [[ -n "$k" ]] && nums["${k##*#}"]=1; done
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    [[ "$t" =~ ^[A-Za-z0-9] ]] || t="${t#?}"
+    [[ "${t%%#*}" =~ [A-Za-z] ]] || continue
+    n="${t##*#}"
+    [[ -n "${nums[$n]:-}" || -n "${seen[${t,,}]:-}" ]] && continue
+    seen["${t,,}"]=1
+    printf '%s\n' "$t"
+  done < <(grep -oE '(^|[^A-Za-z0-9_/#.-])[A-Za-z0-9][A-Za-z0-9_./-]*#[0-9]+' <<<" $text" 2>/dev/null || true)
+  return 0
+}
+
 # _task_guard_unbound_pr_urls <ident> <verb> <text> <no_pr> <force> <bound-url>...
 #
 # DIVE-2096 refuses a close whose result names a pull request while NOTHING is
@@ -1600,12 +1718,35 @@ _task_unbound_pr_urls() {
 _task_guard_unbound_pr_urls() {
   local ident="$1" verb="$2" text="$3" no_pr="${4:-0}" force="${5:-0}"; shift 5
   [[ -n "$text" ]] || return 0
+  # DIVE-5348: the MAKER's verbs (deliver, and the hand-off through `task done`)
+  # also refuse SHORTHAND — `fe#391` — whose number is no bound pull request's.
+  # DIVE-5343's result said "api#346 + fe#391" with only api#346 bound, and the
+  # full-URL check below could not see the second half at all. Not on a closer's
+  # `done`: the closer cannot add a --pr, and the stored result was already
+  # checked at the delivery that wrote it.
+  if [[ "$verb" != done ]] && (( ! no_pr && ! force )); then
+    local _sh; _sh=$(_task_unbound_pr_shorthand "$text" "$@")
+    if [[ -n "$_sh" ]]; then
+      local _sh_list; _sh_list=$(paste -sd, - <<<"$_sh"); _sh_list="${_sh_list//,/, }"
+      policy_refuse "$E_CONFLICT" "${verb}-names-unbound-pr" DIVE-5348 "$ident" \
+        "$ident: the result names ${_sh_list}, and no pull request with that number is bound to this row (bound: $(printf '%s\n' "$@" | paste -sd' ' -)). NOTHING WAS WRITTEN. A pull request named in shorthand is invisible to every close, merge and landing check — DIVE-5343 reached its close with 'fe#391' still a draft because the result said 'api#346 + fe#391' and only api#346 was bound (DIVE-5348). If it is part of this delivery, bind it by its full URL: add --pr=https://github.com/<owner>/<repo>/pull/<n>. If the result only REPORTS ON it, re-run with --no-pr (audited)."
+    fi
+  fi
   local _ub; _ub=$(_task_unbound_pr_urls "$text" "$@")
   [[ -n "$_ub" ]] || return 0
   local _ub_list; _ub_list=$(paste -sd, - <<<"$_ub"); _ub_list="${_ub_list//,/, }"
   if (( no_pr )); then
     warn "$ident: ${verb} with --no-pr — ${_ub_list} named in the result is asserted to be REPORTED ON, not delivered by this task (DIVE-4899, audited)."
     _task_store_audit_log "task.${verb}-unbound-pr-url" ok 0 -- "$ident" "urls=${_ub_list}" "escape=no-pr" 2>/dev/null || true
+    # DIVE-5348: and that assertion is RECORDED as a drop, because a pull URL in
+    # the result is otherwise part of the row's bound set and would hold its close.
+    local _np_id _np_u
+    _np_id=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
+    if [[ -n "$_np_id" ]]; then
+      while IFS= read -r _np_u; do
+        [[ -n "$_np_u" ]] && _task_record_unbound "$_np_id" "$_np_u" "named in the result with --no-pr at ${verb}: reported on, not delivered by this row" "${ACTOR_BOARD:-${verb}}" 2>/dev/null
+      done <<<"$_ub"
+    fi
     return 0
   fi
   if (( force )); then
@@ -1714,9 +1855,24 @@ cmd_task_deliver() {
     _seen_pr["$_k"]=1
     companions+=("$_p")
   done
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-5348: A RE-DELIVERY ADDS, IT NEVER DROPS. A companion an earlier delivery
+  # bound, and that nobody unbound with a reason, stays bound even when this
+  # delivery does not repeat it — DIVE-5322's iteration 4 re-delivered with the
+  # API pull request alone and the frontend one fell out of every landing check.
+  # Dropping one is `task unbind-pr`, which writes down why.
+  local -a _carried=()
+  local -A _unb=()
+  while IFS= read -r _k; do [[ -n "$_k" ]] && _unb["$_k"]=1; done < <(_task_unbound_keys "$id")
+  while IFS= read -r _p; do
+    [[ -n "$_p" ]] || continue
+    _k=$(_task_pr_url_key "$_p"); [[ -n "$_k" ]] || continue
+    [[ -n "${_seen_pr[$_k]:-}" || -n "${_unb[$_k]:-}" ]] && continue
+    _seen_pr["$_k"]=1
+    companions+=("$_p"); _carried+=("$_p")
+  done < <(_task_companion_refs "$id")
   local _companions_txt=""
   (( ${#companions[@]} > 0 )) && _companions_txt=$(printf '%s\n' "${companions[@]}")
-  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   # DIVE-2317 follow-through: the ticket asked whether deliver has the same
   # hole as start. It does on the distinct-verifier arm: delivery routes the row
   # to status=todo while preserving its live blocked_by edge. Refuse before the
@@ -1786,9 +1942,22 @@ cmd_task_deliver() {
   # THE REMEDY IS A `cd`, which is why refusing is proportionate: the maker has
   # the checkout, they just were not standing in it.
   _task_guard_delivery_checkout "$ident" "$_delivered_sha"
+  # DIVE-5348: binding a pull request with --pr takes it back out of the dropped
+  # set, so an unbind is undone by the same verb that binds.
+  local _unb_keep="" _unb_l _unb_cur
+  local -A _named=()
+  for _p in "${prs[@]}"; do _k=$(_task_pr_url_key "$_p"); [[ -n "$_k" ]] && _named["$_k"]=1; done
+  _unb_cur=$(db "SELECT COALESCE(delivery_unbound,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  while IFS= read -r _unb_l; do
+    [[ -n "$_unb_l" ]] || continue
+    _k=$(_task_pr_url_key "${_unb_l%%$'\t'*}")
+    [[ -n "$_k" && -n "${_named[$_k]:-}" ]] && continue
+    _unb_keep+="${_unb_keep:+$'\n'}$_unb_l"
+  done <<<"$_unb_cur"
   db "UPDATE tasks SET delivery_ref=$(sqlq "$pr"), delivered_at=datetime('now'), delivery_ref_iteration=COALESCE(iteration,0),
                        delivery_repo_path=$(sqlq_or_null "$_delivery_repo"), delivered_sha=$(sqlq_or_null "$_delivered_sha"),
-                       delivery_companions=$(sqlq_or_null "$_companions_txt")
+                       delivery_companions=$(sqlq_or_null "$_companions_txt"),
+                       delivery_unbound=$(sqlq_or_null "$_unb_keep")
         WHERE id=${id};"
   # A DELIVERY IS A TASK STATE CHANGE, so it leaves an audit row like every other
   # one. `task start|done|cancel|set-body|merge|answer gate` all call this helper;
@@ -1818,6 +1987,7 @@ cmd_task_deliver() {
   local -a _dl_fields=("$ident" "ref=$pr" "iteration=$_dl_iter" "review=$_dl_review")
   (( ${#companions[@]} > 0 )) && _dl_fields+=("companions=$(printf '%s\n' "${companions[@]}" | paste -sd, -)")
   _task_store_audit_log "task deliver" ok 0 -- "${_dl_fields[@]}"
+  (( ${#_carried[@]} > 0 )) && warn "$ident: this delivery did not name $(printf '%s\n' "${_carried[@]}" | paste -sd' ' -), which an earlier delivery bound — it STAYS BOUND (a re-delivery adds and never drops, DIVE-5348). If it is no longer part of this delivery, drop it with the reason: \`5dive task unbind-pr $ident <url> --reason=\"<why>\"\`."
   (( ${#companions[@]} > 0 )) && warn "$ident: ${#companions[@]} companion pull request(s) bound beside $pr — $(printf '%s\n' "${companions[@]}" | paste -sd' ' -). The grader grades each, the merge owner merges each, and the row closes only when EVERY one has merged (DIVE-4899)."
   # DIVE-3496 (iteration 2): the ref is now bound — assert the gate's credential
   # can SEE it, here, rather than leaving the verifier to discover it at close.
@@ -2436,7 +2606,7 @@ _task_route_to_verifier() {
     local _rd_dref; _rd_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
     if [[ -n "$_rd_dref" ]]; then
       local -a _rd_bound=("$_rd_dref"); local _rd_c
-      while IFS= read -r _rd_c; do [[ -n "$_rd_c" ]] && _rd_bound+=("$_rd_c"); done < <(_task_companion_refs "$id")
+      while IFS= read -r _rd_c; do [[ -n "$_rd_c" ]] && _rd_bound+=("$_rd_c"); done < <(_task_bound_pr_refs "$id"; _task_unbound_refs "$id")
       _task_guard_unbound_pr_urls "$_rd_ident" hand-off "${_TASK_RAW_RESULT-${result:-}}" "${no_pr:-0}" "${force_merge_gate:-0}" "${_rd_bound[@]}"
     fi
   fi
@@ -3995,6 +4165,73 @@ cmd_task_merge_declined() {
      '{ident:$id, declined:true, already:false, ref:$ref, reason:$why, owner:$cl, actor:$ac}' \
      --arg id "$ident" --arg ref "$dref" --arg why "$why" \
      --arg cl "$([[ -n "$maker" ]] && printf '%s' "$maker" || printf '%s' "$asgn")" --arg ac "$actor"
+}
+
+
+# ── DIVE-5348 — `task unbind-pr`: THE ONE WAY A PULL REQUEST LEAVES A ROW ─────
+#
+# A row with an API pull request and a frontend one is done only when both have
+# merged. When one of them genuinely is no longer part of the delivery — folded
+# into the other, superseded, moved to its own row — this records that, with the
+# sentence the seat wrote, so the row can close without it. It asserts no
+# landing, merges nothing, and asks GitHub nothing. The primary (`delivery_ref`)
+# is not unbindable here: that is `task merge-declined` or a re-delivery.
+cmd_task_unbind_pr() {
+  local ident="" url="" why="" json=0 a
+  for a in "$@"; do
+    case "$a" in
+      --reason=*) why="${a#--reason=}" ;;
+      --json) json=1 ;;
+      -h|--help)
+        printf 'usage: 5dive task unbind-pr <ident> <pull-url> --reason="<why it is no longer part of this delivery>" [--json]\n\n  Drop a pull request from the set a row must see merged before it closes\n  (DIVE-5348). Runnable by the seat that owes the merge, the assignee, the maker\n  or the grader. The reason is shown on the row and audited. Merges nothing.\n'
+        return 0 ;;
+      --*) fail "$E_VALIDATION" "task unbind-pr: unknown flag '$a' — usage: 5dive task unbind-pr <ident> <pull-url> --reason=\"<why>\"" ;;
+      *) if [[ -z "$ident" ]]; then ident="$a"; elif [[ -z "$url" ]]; then url="$a"; else fail "$E_USAGE" "unexpected arg: $a"; fi ;;
+    esac
+  done
+  [[ -n "$ident" && -n "$url" ]] || fail "$E_VALIDATION" "usage: 5dive task unbind-pr <ident> <pull-url> --reason=\"<why it is no longer part of this delivery>\""
+  (( json )) && JSON_MODE=1
+  tasks_db_init
+  local actor; task_actor_claim ""; actor="$ACTOR_BOARD"
+  why="${why#"${why%%[![:space:]]*}"}"; why="${why%"${why##*[![:space:]]}"}"
+  [[ -n "$why" ]] \
+    || fail "$E_VALIDATION" "task unbind-pr ${ident} needs --reason=\"<why this pull request is no longer part of the delivery>\" — the row closes without it on the strength of that sentence, so the sentence IS the record. Nothing was written."
+  local key; key=$(_task_pr_url_key "$url")
+  [[ -n "$key" ]] || fail "$E_VALIDATION" "'${url}' is not a GitHub pull URL (https://github.com/<owner>/<repo>/pull/<n>). Nothing was written."
+
+  local row
+  row=$(db "SELECT id||x'1f'||COALESCE(delivery_ref,'')||x'1f'||COALESCE(status,'')||x'1f'||
+                   COALESCE(assignee,'')||x'1f'||COALESCE(maker_agent,'')||x'1f'||
+                   COALESCE(graded_by,'')||x'1f'||COALESCE(merge_owner,'')
+              FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
+  [[ -n "$row" ]] || fail "$E_VALIDATION" "no task ${ident}."
+  local id dref st asgn maker gb owner rest
+  id="${row%%$'\x1f'*}";     rest="${row#*$'\x1f'}"
+  dref="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  st="${rest%%$'\x1f'*}";    rest="${rest#*$'\x1f'}"
+  asgn="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  maker="${rest%%$'\x1f'*}"; rest="${rest#*$'\x1f'}"
+  gb="${rest%%$'\x1f'*}";    owner="${rest#*$'\x1f'}"
+
+  case "$st" in
+    done|cancelled) fail "$E_CONFLICT" "${ident} is ${st} — a terminal row holds nothing open, so there is nothing to unbind." ;;
+  esac
+  [[ "$(_task_pr_url_key "$dref")" != "$key" ]] \
+    || fail "$E_CONFLICT" "${url} is ${ident}'s PRIMARY delivery (delivery_ref). This verb drops the pull requests bound BESIDE it; for the primary, record that it will never land with \`5dive task merge-declined ${ident} --reason=\"<why>\"\`, or re-point it with \`5dive task deliver ${ident} --pr=<url>\`. Nothing was written."
+  local b found=""
+  while IFS= read -r b; do [[ "$(_task_pr_url_key "$b")" == "$key" ]] && found="$b"; done < <(_task_bound_pr_refs "$id")
+  [[ -n "$found" ]] \
+    || fail "$E_CONFLICT" "${url} is not bound to ${ident} (bound beside ${dref:-nothing}: $(_task_bound_pr_refs "$id" | paste -sd' ' -)). Nothing was written."
+  [[ "$actor" == "$asgn" || ( -n "$owner" && "$actor" == "$owner" ) || ( -n "$maker" && "$actor" == "$maker" ) || ( -n "$gb" && "$actor" == "$gb" ) ]] \
+    || fail "$E_AUTH_REQUIRED" "${ident} names '${owner:-nobody}' as the seat that owes its merge, '${asgn:-nobody}' as its assignee, '${maker:-nobody}' as its maker and '${gb:-nobody}' as its grader — '${actor}' is none of them, REFUSED. A pull request leaves a row's bound set only by a seat the row names."
+
+  _task_record_unbound "$id" "$found" "$why" "$actor" \
+    || fail "$E_GENERIC" "${ident}: the unbind of ${found} could not be recorded (the task store refused the write). Nothing changed."
+  _task_store_audit_log "task.unbind-pr" ok 0 -- "$ident" "ref=${found}" "reason=${why}" 2>/dev/null || true
+  local _left; _left=$(_task_bound_pr_refs "$id" | paste -sd' ' -)
+  ok "${ident}: ${found} is NO LONGER BOUND — recorded (${why}). Nothing was merged and GitHub was not asked. The row now closes when ${dref:-its primary}${_left:+ and ${_left}} ha$([[ -n "$_left" ]] && printf 've' || printf 's') merged; the forge poller records that landing on its next tick, or run \`5dive task merge-landed ${ident}\`." \
+     '{ident:$id, unbound:$ref, reason:$why, actor:$ac, still_bound:$left}' \
+     --arg id "$ident" --arg ref "$found" --arg why "$why" --arg ac "$actor" --arg left "$_left"
 }
 
 # _merge_landed_read <pr-ref> <repo-slug> — HAS THIS PULL REQUEST ALREADY MERGED?

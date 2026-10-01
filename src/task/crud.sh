@@ -1354,9 +1354,17 @@ cmd_task_show() {
     fi
     # DIVE-4899: the companions bound beside delivery_ref, printed only when a
     # row has some — a single-PR row's show output is unchanged byte for byte.
-    local _show_comp; _show_comp=$(db "SELECT COALESCE(replace(delivery_companions, char(10), ' '),'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
-    _show_comp="${_show_comp% }"
+    # DIVE-5348: the DERIVED set (companions + pull URLs in the result and the
+    # body's "Delivered as"), and every pull request a seat dropped, with why.
+    local _show_comp=""
+    declare -F _task_bound_pr_refs >/dev/null 2>&1 && _show_comp=$(_task_bound_pr_refs "$id" | paste -sd' ' -)
     [[ -n "$_show_comp" ]] && printf '     also bound = %s   (every bound pull request must merge before this row closes — DIVE-4899)\n' "$_show_comp"
+    local _show_unb _show_l _su_url _su_why _su_who _su_at; _show_unb=$(db "SELECT COALESCE(delivery_unbound,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    while IFS= read -r _show_l; do
+      [[ -n "$_show_l" ]] || continue
+      IFS=$'\t' read -r _su_url _su_why _su_who _su_at <<<"$_show_l"
+      printf '        unbound = %s — %s (by %s, %s; DIVE-5348)\n' "$_su_url" "${_su_why:-no reason recorded}" "${_su_who:-?}" "${_su_at:-?}"
+    done <<<"$_show_unb"
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed
     # by a lower-privilege peer.
