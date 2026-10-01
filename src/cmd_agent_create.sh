@@ -1232,18 +1232,157 @@ _rm_drop_group_membership() {
   return 0
 }
 
+# DIVE-5308: every systemd unit instance named for the seat, not just the agent
+# unit. Plugins instance their own templates on the seat's USER name — the
+# browser plugin's `5dive-browser-probe@agent-<name>.timer` is the measured one
+# — and the remove only ever stopped `5dive-agent@<name>.service`, so after a
+# reap that timer stayed enabled and fired every 6h for a user that no longer
+# existed. Enumerated by pattern rather than listed, so a plugin's next unit is
+# covered without this file learning its name. `list-unit-files` as well as
+# `list-units`: an enabled timer whose unit is not loaded is still enabled.
+#
+# The sandbox drop-in goes too. It is written per NAME at create time and was
+# never removed, so a later STANDARD seat re-created under the same name came
+# up with the old seat's MemoryMax/CPUQuota.
+_rm_disable_seat_units() {
+  local name="$1" u
+  local -a units=()
+  mapfile -t units < <(
+    {
+      printf '%s\n' "5dive-agent@${name}.service"
+      systemctl list-units --all --plain --no-legend "*@agent-${name}.*" 2>/dev/null
+      systemctl list-unit-files --plain --no-legend "*@agent-${name}.*" 2>/dev/null
+    } | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /@/) { print $i; break } }' | sort -u
+  )
+  for u in "${units[@]}"; do
+    # The glob is the filter systemd applied; this is the one we trust. A name
+    # is never a prefix match: `agent-a.` cannot select `agent-ab.timer`.
+    [[ "$u" == "5dive-agent@${name}.service" || "$u" == *"@agent-${name}."* ]] || continue
+    systemctl disable --now "$u" >/dev/null 2>&1 || true
+    systemctl reset-failed "$u" >/dev/null 2>&1 || true
+  done
+  local dropin="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}/5dive-agent@${name}.service.d"
+  if [[ -d "$dropin" && ! -L "$dropin" ]]; then
+    rm -rf -- "$dropin" 2>/dev/null \
+      || warn "could not remove ${dropin} — a seat re-created as '${name}' would inherit its limits. Remove it by hand: sudo rm -rf ${dropin}"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# DIVE-5308: files OUTSIDE the home that the freed uid still owns. DIVE-2138
+# quarantined the home because adduser recycles uids; the same recycling hands
+# the next seat everything else the old uid owned — measured: its browser
+# profile under browser-profiles/agent-<name> (logged-in site sessions), and
+# shared logs such as notify/audit-drops.log. Run AFTER deluser, with the uid
+# resolved BEFORE it.
+#
+#   - a path named for the seat (a component that is `agent-<name>`, or begins
+#     `agent-<name>.` / `agent-<name>_`) is seat-private: the topmost such path
+#     is moved into the quarantine, root-only, exactly like the home;
+#   - anything else is a shared file the seat happened to create: it stays put
+#     and is handed to root:<shared group>, so it keeps working for the others.
+#
+# Sets _RM_FILES_DISPOSITION: none / swept:<chowned>+<quarantined> / incomplete.
+SEAT_SWEEP_ROOTS="${SEAT_SWEEP_ROOTS:-${STATE_DIR:-/var/lib/5dive} /var/log/5dive}"
+_rm_sweep_uid_files() {
+  local name="$1" uid="$2" group="${AGENT_SHARED_GROUP:-claude}"
+  _RM_FILES_DISPOSITION="none"
+  # A uid that is root, not a number, or that already resolves to an account is
+  # not a freed uid, and everything below hands its files to someone else.
+  [[ "$uid" =~ ^[0-9]+$ ]] && (( uid > 0 )) || return 0
+  if getent passwd "$uid" >/dev/null 2>&1; then
+    warn "uid ${uid} of the removed agent-${name} already belongs to another account — not sweeping its files (DIVE-5308)"
+    return 0
+  fi
+  local -a roots=() hits=()
+  local r
+  for r in $SEAT_SWEEP_ROOTS; do [[ -d "$r" && ! -L "$r" ]] && roots+=("$r"); done
+  (( ${#roots[@]} )) || return 0
+  mapfile -d '' -t hits < <(find "${roots[@]}" -uid "$uid" -print0 2>/dev/null)
+  (( ${#hits[@]} )) || return 0
+
+  local f rel top comp ts dest qroot="" moved=0 chowned=0 failed=0
+  local -A private=()
+  for f in "${hits[@]}"; do
+    for r in "${roots[@]}"; do
+      [[ "$f" == "$r"/* ]] || continue
+      rel="${f#"$r"/}"; top="$r"
+      while [[ -n "$rel" ]]; do
+        comp="${rel%%/*}"; top="${top}/${comp}"
+        if [[ "$comp" == "agent-${name}" || "$comp" == "agent-${name}."* || "$comp" == "agent-${name}_"* ]]; then
+          private["$top"]=1; break
+        fi
+        [[ "$rel" == */* ]] && rel="${rel#*/}" || rel=""
+      done
+      break
+    done
+  done
+  if (( ${#private[@]} )); then
+    ts=$(date +%Y%m%d%H%M%S)
+    qroot="${REAPED_DIR}/${name}-${ts}-files"
+    if mkdir -p "$qroot" 2>/dev/null; then
+      chown root:root "$REAPED_DIR" "$qroot" 2>/dev/null || true
+      chmod 0700 "$REAPED_DIR" "$qroot" 2>/dev/null || true
+      local -a tops=()
+      mapfile -t tops < <(printf '%s\n' "${!private[@]}" | sort)
+      for top in "${tops[@]}"; do
+        [[ -e "$top" || -L "$top" ]] || continue   # inside a path already moved
+        dest="${qroot}${top}"
+        if mkdir -p "$(dirname "$dest")" 2>/dev/null && mv -- "$top" "$dest" 2>/dev/null; then
+          chown -hR root:root "$dest" 2>/dev/null || true
+          moved=$((moved+1))
+        else
+          failed=$((failed+1))
+          warn "could not move ${top} aside — a later agent recycling uid ${uid} would inherit it. Move it by hand into ${qroot}"
+        fi
+      done
+    else
+      failed=$((failed+${#private[@]}))
+      warn "could not create ${qroot} — the paths named for agent-${name} stay in place, owned by the freed uid ${uid}"
+    fi
+  fi
+  for f in "${hits[@]}"; do
+    [[ -e "$f" || -L "$f" ]] || continue   # moved with a seat-private path
+    [[ "$(stat -c %u -- "$f" 2>/dev/null)" == "$uid" ]] || continue
+    if chown -h "root:${group}" -- "$f" 2>/dev/null; then
+      chowned=$((chowned+1))
+    else
+      failed=$((failed+1))
+    fi
+  done
+  if (( failed )); then
+    _RM_FILES_DISPOSITION="incomplete"
+    _rm_audit_teardown_failure "agent-${name}" "uid ${uid}: ${failed} file(s) under ${SEAT_SWEEP_ROOTS} could not be handed back"
+    warn "${failed} file(s) still owned by the freed uid ${uid} — a later agent on that uid inherits them. List them with: sudo find ${SEAT_SWEEP_ROOTS} -uid ${uid} (DIVE-5308)"
+  else
+    _RM_FILES_DISPOSITION="swept:${chowned}+${moved}"
+  fi
+  (( moved )) && step "quarantined ${moved} path(s) named for agent-${name} -> ${qroot}"
+  (( chowned )) && step "handed ${chowned} shared file(s) of the freed uid ${uid} to root:${group}"
+  return 0
+}
+
 delete_agent_user() {
   local name="$1" purge_home="${2:-0}"
   local user="agent-${name}"
   _RM_HOME_DISPOSITION="absent"
   _RM_USER_DISPOSITION="absent"
   _RM_GROUP_DISPOSITION="absent"
+  _RM_FILES_DISPOSITION="none"
+  # DIVE-5308: units are matched by name, so this runs with or without an
+  # account — a unit can outlive the passwd entry it was started for.
+  _rm_disable_seat_units "$name"
   if ! id -u "$user" &>/dev/null; then
     # No passwd entry is NOT the same as nothing left to do.
     _rm_drop_group_membership "$name"
     return 0
   fi
   _RM_USER_DISPOSITION="deleted"
+  # DIVE-5308: the uid, while the name still resolves — the file sweep below
+  # runs after deluser and can only find what the freed uid owns by number.
+  local old_uid
+  old_uid=$(id -u "$user" 2>/dev/null) || old_uid=""
   # DIVE-2138: resolve the home from passwd BEFORE deluser, while the name
   # still resolves — afterwards there is no record of where it was.
   local home
@@ -1285,6 +1424,10 @@ delete_agent_user() {
   # inherit its predecessor's confirmations.
   capability_forget_agent "$user" || true
   quarantine_agent_home "$name" "$home" "$purge_home"
+  # Only a uid that is actually free: if the account survived deluser, its
+  # files are still its own.
+  [[ "$_RM_USER_DISPOSITION" == "deleted" ]] && _rm_sweep_uid_files "$name" "$old_uid"
+  return 0
 }
 
 # DIVE-2138 (gh#222, A-MO7SEN): refuse a create whose home dir is a leftover.
@@ -3171,8 +3314,8 @@ cmd_create() {
         install_channel_for_agent "$type" buzz "$name" "" ;;
     esac
   done
-  # DIVE-5306: a standard or sandboxed claude seat starts on the lite Telegram
-  # bot profile; admin seats keep the stock bot. It is written into the channel
+  # DIVE-5306: a sandboxed claude seat starts on the lite Telegram bot profile;
+  # standard and admin seats keep the stock bot. It is written into the channel
   # .env through the same setter as `agent config set telegram.profile=`, and
   # after the telegram install above, whose token writer keeps every other line.
   # With no bot yet, the line is staged the way DIVE-5227 stages it, so a bot

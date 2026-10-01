@@ -193,23 +193,26 @@ rc=$(run_cfg mute set telegram.profile=default)
   || bad_t "P21 default did not remove" "rc=$rc $(cat "$MUTE_ENV")"
 
 # =====================================================================
-# DIVE-5306 — create-time default: a new standard or sandboxed claude seat
-# starts on the LITE profile; admin seats keep the stock bot, with no line.
+# DIVE-5306 — create-time default: a new SANDBOXED claude seat starts on the
+# LITE profile; standard and admin seats keep the stock bot, with no line
+# (lodar 2026-10-01 07:54Z narrowed it from standard+sandboxed: standard is the
+# default tier for every seat after a box's first).
 # Folded in from agent_create_telegram_profile_default_unit.sh (same subject,
 # same setter; one harness keeps the core shard budget). Create writes the line
 # through set_claude_telegram_env_key, the setter P1-P21 pin above; with no bot
 # it is staged the DIVE-5227 way. The tier rule is one resolver,
 # create_telegram_profile_default (lib/agent_setup.sh), and create is its only
 # caller, so nothing later puts the default back.
-#   R*  the resolver: standard/sandboxed -> lite; admin, beyond-admin, empty or
-#       unknown -> nothing; an explicit --telegram-profile wins both ways; only
+#   R*  the resolver: sandboxed -> lite; standard, admin, beyond-admin, empty
+#       or unknown -> nothing; an explicit --telegram-profile wins both ways; only
 #       claude gets a profile.
 #   C*  the REAL create call site, cut out of cmd_agent_create.sh and run
-#       against the real setter: standard -> one lite line in a 0600 .env; admin
-#       -> no .env written at all (same as before); explicit default on a
-#       standard seat -> no line; with a token already written, the token stays.
+#       against the real setter: sandboxed -> one lite line in a 0600 .env;
+#       standard and admin -> no .env written at all (same as before); explicit
+#       default on a sandboxed seat -> no line; with a token already written,
+#       the token stays.
 #       RED CONTROL: replace the set_claude_telegram_env_key line in the create
-#       block with `:` -> 5 FAIL (C0 C1 C2 C3 C7).
+#       block with `:` -> 4 FAIL (C0 C1 C2 C7).
 #   L*  later events: `telegram.profile=default` removes the line and a token
 #       rotation (the real writer) does not bring it back; a partner token push
 #       that sends telegram.profile=lite (DIVE-5133) leaves exactly one line.
@@ -226,14 +229,15 @@ check_r() { # <label> <want> <args...>
   local got; got=$(r "$@")
   [[ "$got" == "$want" ]] && ok_t "$label" || bad_t "$label" "args=($*) want='$want' got='$got'"
 }
-check_r "R1 claude standard -> lite"                    lite claude standard ""
+check_r "R1 claude standard -> nothing (stock bot)"     ""   claude standard ""
 check_r "R2 claude sandboxed -> lite"                   lite claude sandboxed ""
 check_r "R3 claude admin -> nothing (stock bot)"        ""   claude admin ""
 check_r "R4 claude beyond-admin -> nothing"             ""   claude beyond-admin ""
 check_r "R5 claude empty/unknown label -> nothing"      ""   claude "" ""
-check_r "R6 explicit default on standard -> nothing"    ""   claude standard default
+check_r "R6 explicit default on sandboxed -> nothing"   ""   claude sandboxed default
 check_r "R7 explicit lite on admin -> lite"             lite claude admin lite
-check_r "R8 codex standard -> nothing (no lite bridge)" ""   codex standard ""
+check_r "R8 codex sandboxed -> nothing (no lite bridge)" ""  codex sandboxed ""
+check_r "R9 explicit lite on standard -> lite"         lite claude standard lite
 
 # ----------------------------------------- C: the real create call site
 # Cut the block out of cmd_create, from its `local` to the closing `fi`, so the
@@ -249,41 +253,42 @@ create_block() { # <name> <type> <isolation> <explicit>
     source "$TMP/create-block.sh" ) >/dev/null 2>"$TMP/err"
 }
 
-create_block std claude standard ""
-[[ "$(plines std)" == "1" && "$(grep '^TELEGRAM_PROFILE=' "$(envf std)")" == "TELEGRAM_PROFILE=lite" ]] \
-  && ok_t "C1 a standard claude create writes TELEGRAM_PROFILE=lite (staged with no bot)" \
-  || bad_t "C1 no lite line" "err=$(<"$TMP/err") env=$(cat "$(envf std)" 2>/dev/null)"
-[[ "$(stat -c %a "$(envf std)" 2>/dev/null)" == "600" ]] \
-  && ok_t "C2 the .env is 0600" || bad_t "C2 mode" "$(stat -c %a "$(envf std)" 2>/dev/null)"
-
 create_block sbx claude sandboxed ""
-[[ "$(plines sbx)" == "1" ]] \
-  && ok_t "C3 a sandboxed claude create writes the lite line" || bad_t "C3 no line" "$(<"$TMP/err")"
+[[ "$(plines sbx)" == "1" && "$(grep '^TELEGRAM_PROFILE=' "$(envf sbx)")" == "TELEGRAM_PROFILE=lite" ]] \
+  && ok_t "C1 a sandboxed claude create writes TELEGRAM_PROFILE=lite (staged with no bot)" \
+  || bad_t "C1 no lite line" "err=$(<"$TMP/err") env=$(cat "$(envf sbx)" 2>/dev/null)"
+[[ "$(stat -c %a "$(envf sbx)" 2>/dev/null)" == "600" ]] \
+  && ok_t "C2 the .env is 0600" || bad_t "C2 mode" "$(stat -c %a "$(envf sbx)" 2>/dev/null)"
+
+create_block std claude standard ""
+[[ ! -e "$TMP/home/agent-std/.claude/channels/telegram" ]] \
+  && ok_t "C3 a standard claude create writes nothing (stock bot, same as before DIVE-5306)" \
+  || bad_t "C3 standard seat got a profile write" "$(cat "$(envf std)" 2>/dev/null)"
 
 create_block adm claude admin ""
 [[ ! -e "$TMP/home/agent-adm/.claude/channels/telegram" ]] \
   && ok_t "C4 an admin create writes nothing (no telegram dir, no .env: same as before)" \
   || bad_t "C4 admin seat got a profile write" "$(ls -la "$TMP/home/agent-adm/.claude/channels/telegram" 2>&1; cat "$(envf adm)" 2>/dev/null)"
 
-create_block opt claude standard default
+create_block opt claude sandboxed default
 [[ ! -e "$(envf opt)" ]] \
-  && ok_t "C5 --telegram-profile=default on a standard create writes no line" \
+  && ok_t "C5 --telegram-profile=default on a sandboxed create writes no line" \
   || bad_t "C5 explicit default ignored" "$(cat "$(envf opt)")"
 
-create_block cdxnew codex standard ""
+create_block cdxnew codex sandboxed ""
 [[ ! -e "$TMP/home/agent-cdxnew" ]] \
-  && ok_t "C6 a standard codex create writes nothing" || bad_t "C6 codex touched" ""
+  && ok_t "C6 a sandboxed codex create writes nothing" || bad_t "C6 codex touched" ""
 
 # With telegram attached at create, the token is already in the .env.
 mkdir -p "$(dirname "$(envf tok)")"
 printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN1" >"$(envf tok)"; chmod 600 "$(envf tok)"
-create_block tok claude standard ""
+create_block tok claude sandboxed ""
 [[ "$(plines tok)" == "1" && "$(grep -c "^TELEGRAM_BOT_TOKEN=$TOKEN1\$" "$(envf tok)")" == "1" ]] \
-  && ok_t "C7 a standard create with a bot keeps the token and adds the lite line" \
+  && ok_t "C7 a sandboxed create with a bot keeps the token and adds the lite line" \
   || bad_t "C7 token or profile wrong" "$(cat "$(envf tok)")"
 
 # ------------------------------------------------------- L: later events
-printf '%s' '{"agents":{"tok":{"type":"claude","channels":"telegram","isolation":"standard"}}}' >"$TMP/reg"
+printf '%s' '{"agents":{"tok":{"type":"claude","channels":"telegram","isolation":"sandboxed"}}}' >"$TMP/reg"
 
 rc=$(run_cfg tok set telegram.profile=lite)
 [[ "$rc" == "0" && "$(plines tok)" == "1" ]] \
@@ -292,7 +297,7 @@ rc=$(run_cfg tok set telegram.profile=lite)
 
 rc=$(run_cfg tok set telegram.profile=default)
 [[ "$rc" == "0" && "$(plines tok)" == "0" ]] \
-  && ok_t "L2 a later telegram.profile=default on the standard seat removes the line" \
+  && ok_t "L2 a later telegram.profile=default on the sandboxed seat removes the line" \
   || bad_t "L2 default not honoured" "rc=$rc $(cat "$(envf tok)")"
 if [[ -s "$TMP/token-writer.sh" ]] && HOME="$TMP/home/agent-tok" TOKEN="$TOKEN2" bash "$TMP/token-writer.sh"; then
   [[ "$(plines tok)" == "0" && "$(grep -c "^TELEGRAM_BOT_TOKEN=$TOKEN2\$" "$(envf tok)")" == "1" ]] \

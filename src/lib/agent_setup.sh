@@ -1225,9 +1225,10 @@ CLAUDE_TELEGRAM_ENV_KEY
 
 # DIVE-5306: the Telegram bot profile a NEW seat starts with. Prints "lite" or
 # nothing. Only claude has a lite profile. An explicit --telegram-profile wins
-# either way. Otherwise a standard or sandboxed seat gets lite, and admin,
-# beyond-admin or any other label gets nothing, so its .env is the same as
-# before this change. Create calls this once. Nothing later calls it again, so
+# either way. Otherwise only a sandboxed seat gets lite. Standard (the default
+# tier for every seat after a box's first), admin, beyond-admin or any other
+# label gets nothing, so its .env is the same as before DIVE-5306: lodar asked
+# for sandboxed only (2026-10-01 07:54Z, "patch standard to standard"). Create calls this once. Nothing later calls it again, so
 # a token push, a rotation or a later `telegram.profile=default` is never
 # overwritten by this default.
 create_telegram_profile_default() {
@@ -1237,9 +1238,7 @@ create_telegram_profile_default() {
     [[ "$explicit" == "lite" ]] && printf 'lite'
     return 0
   fi
-  case "$isolation" in
-    standard|sandboxed) printf 'lite' ;;
-  esac
+  [[ "$isolation" == "sandboxed" ]] && printf 'lite'
   return 0
 }
 
