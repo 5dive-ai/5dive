@@ -1536,95 +1536,12 @@ _task_guard_delivery_evidence() {  # <id> <ident> <verb> <result-text> <want_res
 # counts as NOT landed. That is the fail-closed direction: an unanswerable read
 # costs a retry, a wrong one ships half a change.
 
-# _task_pr_url_key <url> — `owner/repo#N`, lowercased, or nothing if <url> is not
-# a GitHub pull URL. The comparison key: `…/pull/295/files`, a trailing `#issue…`
-# anchor and a case difference in the owner all name the same pull request.
-_task_pr_url_key() {
-  local u="${1:-}" re='^https?://(www\.)?github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([0-9]+)'
-  [[ "$u" =~ $re ]] || return 0
-  local k="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}#${BASH_REMATCH[4]}"
-  printf '%s\n' "${k,,}"
-}
-
-# _task_companion_refs <id> — the row's companion pull URLs, one per line.
-_task_companion_refs() {
-  local c; c=$(db "SELECT COALESCE(delivery_companions,'') FROM tasks WHERE id=${1};" 2>/dev/null || printf '')
-  [[ -n "$c" ]] || return 0
-  local l; while IFS= read -r l; do [[ -n "$l" ]] && printf '%s\n' "$l"; done <<<"$c"
-  return 0
-}
-
-# ── DIVE-5348 — THE BOUND SET IS EVERY PULL REQUEST THE ROW CLAIMS ───────────
-#
-# MEASURED 2026-10-01, twice in one afternoon. DIVE-5322 closed done with api#337
-# merged and fe#382 open and conflicting for ~3h: iteration 3 had bound fe#382 as
-# a companion, iteration 4 re-delivered with ONE --pr, and the replace-the-set
-# rule above dropped it without a word. DIVE-5343 reached its close with api#346
-# merged and fe#391 still a draft: it was delivered with one --pr and a result
-# that said "api#346 + fe#391" — shorthand, which the full-URL guard cannot see.
-# Every landing check was correct about the set it was given; the set was wrong.
-#
-# SO THE SET IS DERIVED, NOT JUST STORED. Beside the primary, a row binds:
-#   - every companion (`task deliver --pr= --pr=`),
-#   - every GitHub pull URL in its RESULT,
-#   - every GitHub pull URL in its BODY's "Delivered as" paragraph,
-# minus the ones a seat dropped with a written reason (`delivery_unbound`, filled
-# by `task unbind-pr` and by a delivery's `--no-pr`). Leaving the set is a
-# recorded act; arriving in it is anything that names the pull request as
-# delivered. `merge-landed`, the forge poller, the close gate and the merge
-# dispatch all read it through _task_companions_unlanded below.
-
-# _task_pr_urls_in <text> — every GitHub pull URL in <text>, one per line.
-_task_pr_urls_in() {
-  grep -oE 'https?://(www\.)?github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+' <<<"${1:-}" 2>/dev/null || true
-}
-
-# _task_delivered_as_text <body> — the body's "Delivered as" paragraph: the line
-# that says it and every line after it up to the first blank one.
-_task_delivered_as_text() {
-  awk 'on && /^[[:space:]]*$/ {exit} tolower($0) ~ /delivered as/ {on=1} on {print}' <<<"${1:-}" 2>/dev/null || true
-}
-
-# _task_unbound_keys <id> — the `owner/repo#N` key of every pull request this row
-# dropped, one per line.
-_task_unbound_keys() {
-  local u l; u=$(db "SELECT COALESCE(delivery_unbound,'') FROM tasks WHERE id=${1};" 2>/dev/null || printf '')
-  [[ -n "$u" ]] || return 0
-  while IFS= read -r l; do [[ -n "$l" ]] && _task_pr_url_key "${l%%$'\t'*}"; done <<<"$u"
-  return 0
-}
-
-# _task_unbound_refs <id> — the URL of every pull request this row dropped. The
-# prose guards treat these as ACCOUNTED FOR: a seat already wrote down why the
-# row does not deliver them, so naming one again is not an unbound citation.
-_task_unbound_refs() {
-  local u l; u=$(db "SELECT COALESCE(delivery_unbound,'') FROM tasks WHERE id=${1};" 2>/dev/null || printf '')
-  [[ -n "$u" ]] || return 0
-  while IFS= read -r l; do [[ -n "$l" ]] && printf '%s\n' "${l%%$'\t'*}"; done <<<"$u"
-  return 0
-}
-
-# _task_bound_pr_refs <id> — every pull request bound to the row BESIDE its
-# primary, one full URL per line, deduplicated by `owner/repo#N`. See above.
-_task_bound_pr_refs() {
-  local id="$1" row dref body result u k
-  row=$(db "SELECT COALESCE(delivery_ref,'')||x'1f'||COALESCE(body,'')||x'1f'||COALESCE(result,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
-  dref="${row%%$'\x1f'*}"; row="${row#*$'\x1f'}"
-  body="${row%%$'\x1f'*}"; result="${row#*$'\x1f'}"
-  local -A skip=()
-  k=$(_task_pr_url_key "$dref"); [[ -n "$k" ]] && skip["$k"]=1
-  while IFS= read -r k; do [[ -n "$k" ]] && skip["$k"]=1; done < <(_task_unbound_keys "$id")
-  while IFS= read -r u; do
-    [[ -n "$u" ]] || continue
-    k=$(_task_pr_url_key "$u")
-    if [[ -n "$k" ]]; then
-      [[ -n "${skip[$k]:-}" ]] && continue
-      skip["$k"]=1
-    fi
-    printf '%s\n' "$u"
-  done < <(_task_companion_refs "$id"; _task_pr_urls_in "$result"; _task_pr_urls_in "$(_task_delivered_as_text "$body")")
-  return 0
-}
+# The bound set's READERS (_task_pr_url_key, _task_companion_refs,
+# _task_bound_pr_refs and its helpers) live in gate_evidence.sh beside the other
+# pull-request references read out of a row: `task show` (crud.sh) prints the
+# set too, and reaching delivery.sh from crud pushed task__crud past the lazy
+# bundle's preload fan-out cap (scripts/lib/lazy-dispatch.sh), which drops the
+# whole entry. Only the writers stay here.
 
 # _task_record_unbound <id> <url> <reason> <actor> — drop <url> from the row's
 # bound set, durably and with the reason. Idempotent by key: a second drop of the
@@ -1640,12 +1557,13 @@ _task_record_unbound() {
     keep+="$l"$'\n'
   done <<<"$cur"
   keep+="${url}"$'\t'"${why}"$'\t'"${who}"$'\t'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  local comp="" c
+  local comp="" c stored
+  stored=$(_task_companion_refs "$id")
   while IFS= read -r c; do
     [[ -n "$c" ]] || continue
     [[ -n "$k" && "$(_task_pr_url_key "$c")" == "$k" ]] && continue
     comp+="${comp:+$'\n'}$c"
-  done < <(_task_companion_refs "$id")
+  done <<<"$stored"
   db "UPDATE tasks SET delivery_unbound=$(sqlq "$keep"), delivery_companions=$(sqlq_or_null "$comp") WHERE id=${id};"
 }
 
@@ -1654,7 +1572,8 @@ _task_record_unbound() {
 # landed, one per line as `<url> (<state>)`. Empty output = every one merged (or
 # none are bound). Never fails the caller.
 _task_companions_unlanded() {
-  local id="$1" ref probe verdict rest
+  local id="$1" ref probe verdict rest bound
+  bound=$(_task_bound_pr_refs "$id")
   while IFS= read -r ref; do
     [[ -n "$ref" ]] || continue
     probe=$(_merge_landed_probe "$ref" "$(_gate_slug_from_url "$ref" 2>/dev/null || printf '')" 2>/dev/null) || probe="UNKNOWN"
@@ -1664,7 +1583,7 @@ _task_companions_unlanded() {
       OPEN)   printf '%s (%s, not merged)\n' "$ref" "${rest:-open}" ;;
       *)      printf '%s (state NOT READ — the forge could not be asked, which is not a merge)\n' "$ref" ;;
     esac
-  done < <(_task_bound_pr_refs "$id")
+  done <<<"$bound"
   return 0
 }
 
@@ -1863,14 +1782,15 @@ cmd_task_deliver() {
   # Dropping one is `task unbind-pr`, which writes down why.
   local -a _carried=()
   local -A _unb=()
-  while IFS= read -r _k; do [[ -n "$_k" ]] && _unb["$_k"]=1; done < <(_task_unbound_keys "$id")
+  local _unb_keys _stored_comp; _unb_keys=$(_task_unbound_keys "$id"); _stored_comp=$(_task_companion_refs "$id")
+  while IFS= read -r _k; do [[ -n "$_k" ]] && _unb["$_k"]=1; done <<<"$_unb_keys"
   while IFS= read -r _p; do
     [[ -n "$_p" ]] || continue
     _k=$(_task_pr_url_key "$_p"); [[ -n "$_k" ]] || continue
     [[ -n "${_seen_pr[$_k]:-}" || -n "${_unb[$_k]:-}" ]] && continue
     _seen_pr["$_k"]=1
     companions+=("$_p"); _carried+=("$_p")
-  done < <(_task_companion_refs "$id")
+  done <<<"$_stored_comp"
   local _companions_txt=""
   (( ${#companions[@]} > 0 )) && _companions_txt=$(printf '%s\n' "${companions[@]}")
   # DIVE-2317 follow-through: the ticket asked whether deliver has the same
@@ -2605,8 +2525,9 @@ _task_route_to_verifier() {
   if (( want_result )) && [[ -z "${_TASK_UNBOUND_CHECKED:-}" ]]; then
     local _rd_dref; _rd_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
     if [[ -n "$_rd_dref" ]]; then
-      local -a _rd_bound=("$_rd_dref"); local _rd_c
-      while IFS= read -r _rd_c; do [[ -n "$_rd_c" ]] && _rd_bound+=("$_rd_c"); done < <(_task_bound_pr_refs "$id"; _task_unbound_refs "$id")
+      local -a _rd_bound=("$_rd_dref"); local _rd_c _rd_set
+      _rd_set=$(_task_bound_pr_refs "$id"; _task_unbound_refs "$id")
+      while IFS= read -r _rd_c; do [[ -n "$_rd_c" ]] && _rd_bound+=("$_rd_c"); done <<<"$_rd_set"
       _task_guard_unbound_pr_urls "$_rd_ident" hand-off "${_TASK_RAW_RESULT-${result:-}}" "${no_pr:-0}" "${force_merge_gate:-0}" "${_rd_bound[@]}"
     fi
   fi
@@ -4218,8 +4139,9 @@ cmd_task_unbind_pr() {
   esac
   [[ "$(_task_pr_url_key "$dref")" != "$key" ]] \
     || fail "$E_CONFLICT" "${url} is ${ident}'s PRIMARY delivery (delivery_ref). This verb drops the pull requests bound BESIDE it; for the primary, record that it will never land with \`5dive task merge-declined ${ident} --reason=\"<why>\"\`, or re-point it with \`5dive task deliver ${ident} --pr=<url>\`. Nothing was written."
-  local b found=""
-  while IFS= read -r b; do [[ "$(_task_pr_url_key "$b")" == "$key" ]] && found="$b"; done < <(_task_bound_pr_refs "$id")
+  local b found="" bound
+  bound=$(_task_bound_pr_refs "$id")
+  while IFS= read -r b; do [[ "$(_task_pr_url_key "$b")" == "$key" ]] && found="$b"; done <<<"$bound"
   [[ -n "$found" ]] \
     || fail "$E_CONFLICT" "${url} is not bound to ${ident} (bound beside ${dref:-nothing}: $(_task_bound_pr_refs "$id" | paste -sd' ' -)). Nothing was written."
   [[ "$actor" == "$asgn" || ( -n "$owner" && "$actor" == "$owner" ) || ( -n "$maker" && "$actor" == "$maker" ) || ( -n "$gb" && "$actor" == "$gb" ) ]] \

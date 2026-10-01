@@ -1126,7 +1126,8 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
     # where SOMETHING is bound (DIVE-2096 covers the case where nothing is).
     if [[ -n "$_dref" ]] && declare -F _task_guard_unbound_pr_urls >/dev/null 2>&1; then
       local -a _bound_all=("$_dref")
-      local _bc; while IFS= read -r _bc; do [[ -n "$_bc" ]] && _bound_all+=("$_bc"); done < <(_task_bound_pr_refs "$id"; _task_unbound_refs "$id")
+      local _bc _bset; _bset=$(_task_bound_pr_refs "$id"; _task_unbound_refs "$id")
+      while IFS= read -r _bc; do [[ -n "$_bc" ]] && _bound_all+=("$_bc"); done <<<"$_bset"
       _task_guard_unbound_pr_urls "$ident" done "$result" "$no_pr" "$force_merge_gate" "${_bound_all[@]}"
     fi
     # DIVE-3823: THE RECORDED-EVIDENCE RAIL, read BEFORE the gate interrogates
