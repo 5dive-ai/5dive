@@ -1619,17 +1619,25 @@ _task_mint_drop_link() {
 # Provided", which on a gate that never named a target asks the human to do
 # something undefined and then attest to it; that attestation is what produced
 # the DIVE-2232 record — signed, nonced, human-attested, empty.
+# DIVE-5319: where an owner with no shell answers a secret gate. The dashboard's
+# task card and the Telegram Mini App both take a paste and run `secret write`
+# for this gate over the box's own tunnel, so the value never sits in a chat.
+# This chat is the one place it must not go: said in the same line.
+_task_secret_gate_app_line() {
+  printf '%s' "Paste it in the 5dive app: this task's card on 5dive.ai/dashboard/tasks, or My team in the 5dive app on Telegram. It goes straight to this server. Never paste it in this chat."
+}
+
 _task_secret_gate_cta() {
   local ident="$1" numid="$2" secret_key="$3" connector="$4" _drop="$5"
   if [[ "$_drop" == "ONBOX" ]]; then
-    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. On the box, drop it straight in (never paste it here):"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"That writes it and clears this gate. Or tap ✅ Provided once it is done."
+    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. $(_task_secret_gate_app_line)"$'\n'"On the box instead:"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"Either one writes it and clears this gate. Or tap ✅ Provided once it is done."
   elif [[ -n "$_drop" ]]; then
     local _url="${_drop%%|*}" _ttl="${_drop##*|}"
     printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. Drop it securely (single-use, expires in ${_ttl}m):"$'\n'"${_url}"$'\n'"The value goes straight onto your box and is never shown in chat. Prefer the box? echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"
   elif [[ -n "$secret_key" && -n "$connector" ]]; then
     # Target named, mint unavailable (api unreachable / tokenless): still name the
     # target, because the box-side write is a real delivery path.
-    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. The drop link could not be minted right now, so put it in on the box (never paste it here):"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"That writes it and clears this gate. Or tap ✅ Provided once it is done."
+    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. $(_task_secret_gate_app_line)"$'\n'"On the box instead:"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"Either one writes it and clears this gate. Or tap ✅ Provided once it is done."
   else
     local _oob; _oob=$(db "SELECT COALESCE(secret_oob,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
     if [[ -n "$_oob" ]]; then

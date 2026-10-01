@@ -279,5 +279,43 @@ txt=$(_task_secret_gate_cta DIVE-2406 "$(db "SELECT id FROM tasks WHERE ident='D
   && ok_t "T8b the out-of-band alert names the declared channel and keeps the tap" \
   || bad_t "T8b the out-of-band alert names the declared channel and keeps the tap" "text: $txt"
 
+# ============================ DIVE-5319: THE APP PASTE ========================
+# An owner with no shell answers a secret gate by pasting in the dashboard or the
+# Mini App (`secret write --task` over the box tunnel). The chat alert has to send
+# them there, and still say never to paste in the chat; the resume ping has to tell
+# the asking seat which file the value is now in.
+_drop_id=$(db "SELECT id FROM tasks WHERE ident='DIVE-2405';")
+for _shape in ONBOX ""; do
+  txt=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "$_shape")
+  if [[ "$txt" == *"5dive.ai/dashboard/tasks"* && "$txt" == *"5dive app on Telegram"* \
+        && "$txt" == *"Never paste it in this chat"* \
+        && "$txt" == *"sudo 5dive secret write GH_BOT_TOKEN --connector=github-bot --task=DIVE-2405"* ]]; then
+    ok_t "T9 the drop-target alert (${_shape:-no link}) sends the owner to the app, keeps the box command, forbids a chat paste"
+  else
+    bad_t "T9 the drop-target alert (${_shape:-no link}) sends the owner to the app, keeps the box command, forbids a chat paste" "text: $txt"
+  fi
+done
+
+PINGS="$TMP/pings"; : >"$PINGS"
+cmd_send() { local a; for a in "$@"; do [[ "$a" == --message=* ]] && printf '%s\n' "${a#--message=}" >>"$PINGS"; done; return 0; }
+_gate_seat_busy_elsewhere() { return 1; }
+seed_task DIVE-2411; db "UPDATE tasks SET assignee='dev' WHERE ident='DIVE-2411';"
+NONCE=""
+cmd_task_need DIVE-2411 --type=secret --ask="drop the gmail app password" --secret-key=GMAIL_APP_PASSWORD --connector=gmail >/dev/null 2>&1
+cmd_task_answer DIVE-2411 --from=main --human --human-proof="$NONCE" >/dev/null 2>&1
+got=$(cat "$PINGS")
+[[ "$got" == *"GMAIL_APP_PASSWORD is in ${CONNECTORS_DIR}/gmail.env"* && "$got" == *"NOT from the task"* ]] \
+  && ok_t "T10 the resume ping names the key and the file it landed in" \
+  || bad_t "T10 the resume ping names the key and the file it landed in" "pings: $got"
+: >"$PINGS"
+seed_task DIVE-2412; db "UPDATE tasks SET assignee='dev' WHERE ident='DIVE-2412';"
+NONCE=""
+cmd_task_need DIVE-2412 --type=secret --ask="drop it" --out-of-band="already in my .env on this box" >/dev/null 2>&1
+cmd_task_answer DIVE-2412 --from=main --human --human-proof="$NONCE" >/dev/null 2>&1
+got=$(cat "$PINGS")
+[[ "$got" == *"from where it was placed"* && "$got" != *"connectors/"* ]] \
+  && ok_t "T10b an out-of-band gate's ping names no file it was never told" \
+  || bad_t "T10b an out-of-band gate's ping names no file it was never told" "pings: $got"
+
 printf '\nsecret-gate delivery-path unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1

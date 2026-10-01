@@ -2084,7 +2084,17 @@ cmd_task_answer() {
     if [[ -n "${_esc_pingmsg:-}" ]]; then
       pingmsg="$_esc_pingmsg"
     elif [[ "$nt" == "secret" ]]; then
-      pingmsg="${ident} secret gate marked provided — resume the task and load the key from where it was placed (its .env / your own channel), NOT from the task."
+      # DIVE-5319: say WHERE when the gate named it. The owner may have pasted it
+      # from the dashboard or the Mini App, so "where you expected it" is now a
+      # file this seat should be told, not left to remember.
+      local _ping_sk _ping_conn
+      _ping_sk=$(db "SELECT COALESCE(secret_key,'') FROM tasks WHERE id=${id};")
+      _ping_conn=$(db "SELECT COALESCE(connector,'') FROM tasks WHERE id=${id};")
+      if [[ -n "$_ping_sk" && -n "$_ping_conn" ]]; then
+        pingmsg="${ident} secret gate provided — ${_ping_sk} is in ${CONNECTORS_DIR:-/etc/5dive/connectors}/${_ping_conn}.env on this box. Resume the task and load it from there, NOT from the task."
+      else
+        pingmsg="${ident} secret gate marked provided — resume the task and load the key from where it was placed (its .env / your own channel), NOT from the task."
+      fi
     else
       pingmsg="${ident} gate cleared — your '${nt}' ask was answered. Resume the task; run \`5dive task show ${ident}\` for the value."
     fi
