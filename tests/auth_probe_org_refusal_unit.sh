@@ -78,7 +78,12 @@ unset -f auth_probe_output
 source "$SRC/cmd_auth.sh"
 sudo() { while [[ "$1" == -* ]]; do [[ "$1" == -u ]] && shift; shift; done; "$@"; }
 probe='if IFS= read -r -t 1 line; then echo "STDIN:$line"; else echo NO-STDIN; fi'
-got=$(printf 'caller-stdin\n' | auth_probe_output claude "" 5 "$probe")
+# 30s, not the production 5s (DIVE-5321): this arm grades stdin isolation, not
+# the cap. The stubbed sudo still runs a real `bash -l`, and on a loaded CI shard
+# its startup alone ate the 5s — the timeout then printed nothing and the arm went
+# red with an empty $got. A pass still returns in ~0.2s; a leaked stdin is read
+# instantly, so the wider budget hides nothing.
+got=$(printf 'caller-stdin\n' | auth_probe_output claude "" 30 "$probe")
 [[ "$got" == *NO-STDIN* && "$got" != *caller-stdin* ]] \
   && ok "the probe runs with </dev/null (the caller's stdin never reaches it)" \
   || bad "the probe runs with </dev/null (the caller's stdin never reaches it)" "$got"
