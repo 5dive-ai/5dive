@@ -1627,6 +1627,12 @@ _wake_sender_vouchable() {
 inject_and_submit() {
   local name="$1" payload="$2" tries=0
   local user="agent-${name}"   # separate stmt: ${name} in the same line aborts under set -u (silent msg drop)
+  # DIVE-5299: a TRAILING newline is never content. Typed into a claude composer
+  # it adds an empty last line that the cursor then sits on, so the next send's
+  # one-C-u hygiene clears nothing and the whole draft is prepended to that send
+  # (measured on chill-gorge 2026-09-30, `_deliver` with a `…\n` payload). Inner
+  # newlines stay: on this path they are the message's fields.
+  while [[ "$payload" == *$'\n' || "$payload" == *$'\r' ]]; do payload="${payload%?}"; done
   # DIVE-4036: route BEFORE the pane guard, because on a dispatcher seat there is
   # no chat pane to guard. _agent_pane_safe_to_type exists to stop a payload being
   # typed into an API-key field (DIVE-2137); writing a JSON message file into the
@@ -1673,6 +1679,9 @@ inject_and_submit() {
   # only edits the composer. Ghost text (CC 2.1.267 promptSuggestion, rendered
   # DIM) is not input and is replaced by typing anyway; the verify excludes it.
   sudo -u "$user" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || return 1
+  # DIVE-5299: and keep clearing until the composer reads empty — one C-u leaves
+  # a multi-line leftover in place. Fail open (as before this row) if it will not.
+  [[ -n "$(_hb_claude_pid "$name")" ]] && { _hb_composer_scrub "$name" || true; }
   # DIVE-5098: on a claude seat, a long VOUCHED payload goes as typed line +
   # paste (only a caller that set _WAKE_VOUCH=1 — see _wake_sender_vouchable).
   # The gap lets the TUI take the typed line as its own input chunk; without it
@@ -1708,11 +1717,14 @@ inject_and_submit() {
   # instead of handing back a receipt for a message the seat never received. Two
   # Enters is the ceiling, as in `_hb_send_line`: a third Enter into a composer
   # that is not accepting is a stray keystroke, not a fix.
+  # DIVE-5299: "empty" must hold TWICE (_hb_submit_settled) — one sample at
+  # +0.3s passed on 2026-09-30 while the Enter had been eaten as a newline and
+  # the text was not yet drawn; `_deliver` said OK and the seat sat idle 9h.
   sudo -u "$user" tmux send-keys -t "agent-${name}" Enter
-  _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
+  _hb_submit_settled "$name" && { _wedge_clear "$name"; return 0; }
   sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
   sudo -u "$user" tmux send-keys -t "agent-${name}" Enter
-  _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
+  _hb_submit_settled "$name" && { _wedge_clear "$name"; return 0; }
   # DIVE-4642 — THE SECOND TYPED-SEND SITE OWES THE SAME TWO THINGS. A composer
   # -hygiene claim is graded per SITE (the DIVE-4246 addendum), and the symptom
   # cannot enumerate them: the pane looks identical either way. This site is left

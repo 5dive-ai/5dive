@@ -80,6 +80,8 @@ _hb_claude_pid()          { printf '4214\n'; }
 # verify (tests/agent_send_injector_hygiene_unit.sh grades that, and pins both
 # halves of it with its own mutation arm).
 _hb_verify_submit()       { return 0; }
+_hb_submit_settled()      { return 0; }   # DIVE-5299: same seam, same reason (cmd_heartbeat.sh is not sourced)
+_hb_composer_scrub()      { return 0; }
 wait_agent_input_ready()  { return 0; }
 require_agent()           { :; }
 mirror_interagent_outbound() { :; }

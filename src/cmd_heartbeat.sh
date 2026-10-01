@@ -2622,16 +2622,48 @@ _hb_payload_newlines() {
 # already-empty composer Up+C-u recalls one history entry and clears it again,
 # which is a no-op on the seat.
 #
+# DIVE-5299: the C-u arm is now a LOOP (`_hb_composer_scrub`), because one C-u
+# clears only the line the cursor is on, and on a multi-line draft that line is
+# usually the payload's own trailing empty one — measured on chill-gorge
+# 2026-09-30: the next send's C-u cleared nothing and the stale draft was
+# submitted as the head of the new message.
+#
 # Returns 0 when the composer is EMPTY afterwards, 1 when text survived both
 # arms; sets _HB_COMPOSER_UNSENT either way.
 _hb_composer_clear() {
   local name="$1"
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
-  _hb_verify_submit "$name" && return 0
+  _hb_composer_scrub "$name" && return 0
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Up 2>/dev/null || true
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
   _hb_verify_submit "$name" && return 0
   return 1
+}
+
+# DIVE-5299 — CLEAR A MULTI-LINE DRAFT, LINE BY LINE, AND CHECK IT TOOK.
+#
+# C-u kills back to the start of the CURRENT composer line; BSpace at the start
+# of a line joins it to the line above. So C-u, read, BSpace, repeat empties a
+# draft of any height from the bottom up. Measured on a live CC 2.1.285 pane
+# with a 2-line draft plus its trailing newline: one C-u left both lines in
+# place; three rounds emptied it. Never Escape (it aborts a running turn) and no
+# Up here: this is also the PRE-TYPE hygiene step, where the seat may have a
+# queued message that Up would recall into the composer (DIVE-4355).
+#
+# Bounded: a pane that never reads empty (a draft taller than the bound, or a
+# reader that misjudges a pane) stops after _HB_SCRUB_MAX rounds instead of
+# BSpacing into it forever. The CALLER sends the first C-u (both typed-send
+# sites already do, as their DIVE-4242/4246 hygiene step), so a composer that
+# was single-line costs one read here and no extra keystroke. Returns 0 =
+# composer read empty, 1 = text survived; sets _HB_COMPOSER_UNSENT either way.
+_hb_composer_scrub() {
+  local name="$1" i
+  for (( i = 0; i < ${_HB_SCRUB_MAX:-12}; i++ )); do
+    _hb_verify_submit "$name" && return 0
+    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" BSpace 2>/dev/null || true
+    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
+  done
+  _hb_verify_submit "$name"
 }
 
 # DIVE-4642 — the deadlock probe, read at the busy-guard.
@@ -2738,6 +2770,13 @@ _hb_send_line() {
   # C-u can never mean the line landed. (DIVE-4279 iteration 2 — checking here is
   # how the first cut counted a busy seat's tool_result as a delivered wake.)
   _hb_send_keys_step "$name" "composer clear (C-u)" C-u || return 1
+  # DIVE-5299: one C-u is not a clear on a MULTI-LINE leftover (it kills only
+  # the cursor's line). On a claude seat, read the composer and keep clearing
+  # until it is empty. Fail OPEN: a draft that survives the bound is logged and
+  # the send proceeds as it always did, so a misread pane cannot mute a seat.
+  if [[ -n "$(_hb_claude_pid "$name")" ]] && ! _hb_composer_scrub "$name"; then
+    _hb_log "[$name] composer still held ${#_HB_COMPOSER_UNSENT} chars before typing ('${_HB_COMPOSER_UNSENT:0:60}') after ${_HB_SCRUB_MAX:-12} clear rounds — typing anyway (DIVE-5299)" 2>/dev/null || true
+  fi
   # DIVE-5098: a long payload to a claude seat is a typed fixed line + a paste,
   # so the turn carries the dispatcher's own words (_wake_split,
   # cmd_agent_runtime.sh). The landed check matches on the pasted BODY.
@@ -2766,10 +2805,10 @@ _hb_send_line() {
   # claim on a prompt nobody received.
   if [[ -n "$(_hb_claude_pid "$name")" ]]; then
     _hb_send_keys_step "$name" "submit (Enter)" Enter || { _hb_landed_check "$name" "$_hb_body" && return 0; return 1; }
-    _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
+    _hb_submit_settled "$name" && { _wedge_clear "$name"; return 0; }   # DIVE-5299: empty twice, not once
     sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
     _hb_send_keys_step "$name" "submit retry (Enter)" Enter || { _hb_landed_check "$name" "$_hb_body" && return 0; return 1; }
-    _hb_verify_submit "$name" && { _wedge_clear "$name"; return 0; }
+    _hb_submit_settled "$name" && { _wedge_clear "$name"; return 0; }
     # DIVE-4642: the submit failed and we KNOW it. Two things follow, and today
     # neither happened: the seat is marked unhealthy so `5dive supervisor` names
     # it within one tick instead of reporting it busy forever, and the text we
@@ -2811,20 +2850,47 @@ _hb_send_line() {
 # a half-typed line). Empty output = composer empty (or unreadable: a pane we
 # cannot read is handled by the credential guard before we ever type).
 _hb_composer_unsent() {
-  local name="$1" raw line esc=$'\e'
+  local name="$1" raw blk line="" l c esc=$'\e' first=1 bordered=0
+  local -a cont=()
   raw=$(sudo -u "agent-${name}" tmux capture-pane -e -p -t "agent-${name}" 2>/dev/null) || { printf ''; return 0; }
-  line=$(grep -a '❯' <<<"$raw" | tail -1) || line=""   # no glyph on the pane = empty composer, not a fatal probe
-  [[ -n "$line" ]] || { printf ''; return 0; }
-  line="${line#*❯}"
+  # The block from the LAST `❯` line to the end of the pane; no glyph on the pane
+  # = empty composer, not a fatal probe.
+  blk=$(awk '/❯/ { b = "" ; f = 1 } f { b = b $0 "\n" } END { printf "%s", b }' <<<"$raw")
+  [[ -n "$blk" ]] || { printf ''; return 0; }
   # 1) drop DIM runs (ghost text); 2) strip every remaining CSI sequence.
-  line=$(sed -E "s/${esc}\[2m[^${esc}]*(${esc}\[0m|${esc}\[22m)//g; s/${esc}\[[0-9;?]*[A-Za-z]//g" <<<"$line")
+  blk=$(sed -E "s/${esc}\[2m[^${esc}]*(${esc}\[0m|${esc}\[22m)//g; s/${esc}\[[0-9;?]*[A-Za-z]//g" <<<"$blk")
   # The composer glyph is followed by a NO-BREAK SPACE (U+00A0, bytes C2 A0),
   # which [[:space:]] does not match. Measured 2026-09-10 15:58Z on all 13 live
   # seats: without this line every idle composer read as one leftover character,
   # i.e. every wake would have failed the verify and nothing would ever be claimed.
-  line="${line//$'\xc2\xa0'/ }"
-  line="${line//[$'\t\r\n']/ }"
-  line=$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")
+  blk="${blk//$'\xc2\xa0'/ }"
+  # DIVE-5299 — A MULTI-LINE DRAFT IS STILL A DRAFT. A composer holding more than
+  # one line draws its continuation lines BELOW the `❯` line, indented, down to
+  # the composer's bottom border (a `─` rule). Measured on a live CC 2.1.285 pane:
+  #     ───────
+  #     ❯ RESULT: line one of the message
+  #       NEXT: check the sha
+  #                                   <- the payload's trailing newline
+  #     ───────
+  # Reading the `❯` line alone misses every continuation line, so the reader
+  # takes them too — but ONLY when that bottom border is found. A pane with no
+  # rule under the glyph (a picker, a fixture) keeps the old one-line read, so
+  # nothing outside a real composer can start reading as unsent input.
+  while IFS= read -r l; do
+    l="${l//[$'\t\r']/ }"
+    (( first )) && l="${l#*❯}"
+    c="${l#"${l%%[![:space:]]*}"}"; c="${c%"${c##*[![:space:]]}"}"
+    if (( first )); then first=0; line="$c"; continue; fi
+    [[ "$c" == ─* ]] && { bordered=1; break; }
+    cont+=("$c")
+  done <<<"$blk"
+  if (( bordered )); then
+    local -a parts=("$line" "${cont[@]}"); line=""
+    for c in "${parts[@]}"; do
+      case "$c" in ''|'Press up to edit queued messages'|'ctrl+x ctrl+s to send now') continue ;; esac
+      line="${line:+$line }$c"
+    done
+  fi
   # DIVE-4642 — EXCLUDE THE HARNESS'S OWN COMPOSER HINTS, BY CONTENT.
   #
   # `Press up to edit queued messages` is exactly 32 bytes and it is NOT our
@@ -2862,6 +2928,24 @@ _hb_verify_submit() {
   sleep "${_HB_SUBMIT_VERIFY_SEC:-0.3}"
   _HB_COMPOSER_UNSENT=$(_hb_composer_unsent "$name")
   [[ -z "$_HB_COMPOSER_UNSENT" ]]
+}
+
+# DIVE-5299 — AN EMPTY COMPOSER AT +0.3s IS NOT A SUBMIT. Measured on chill-gorge
+# 2026-09-30 14:31Z (publisher): Enter at 04.470, ONE capture at 04.801 read an
+# empty `❯`, `_deliver` returned OK — and the seat never started a turn. The
+# Enter had landed inside Claude Code's paste ingest and was taken as a NEWLINE;
+# the pasted text was drawn into the composer only AFTER the sample. Nine hours
+# later the pane still held the message plus two blank lines.
+#
+# So the verify must read empty TWICE: at +0.3s, and again once the TUI has had
+# time to draw whatever it was still ingesting (_HB_SUBMIT_SETTLE_SEC). Text on
+# the second read means the Enter was swallowed, and the caller's retry Enter is
+# exactly the right move: the composer now holds a drawn draft, which an Enter
+# submits. Same rc and _HB_COMPOSER_UNSENT contract as _hb_verify_submit.
+_hb_submit_settled() {
+  local name="$1"
+  _hb_verify_submit "$name" || return 1
+  _HB_SUBMIT_VERIFY_SEC="${_HB_SUBMIT_SETTLE_SEC:-1.5}" _hb_verify_submit "$name"
 }
 
 # PID of this agent's live inner `claude` process, or empty if not found. This is

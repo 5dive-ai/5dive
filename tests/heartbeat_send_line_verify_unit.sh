@@ -78,11 +78,11 @@ _reset; PANES=("$P_GHOST"); _hb_send_line seatx "/goal do the thing"; rc=$?
 grade "A3 dim ghost text is not read as unsent input (rc 0, one Enter)" "[[ $rc -eq 0 && $(enters) -eq 1 ]]"
 
 # A4 — tail sits after the first Enter, clears after the retry: rc 0, two Enters, no UNVERIFIED.
-_reset; PANES=("$P_STUCK" "$P_EMPTY"); _hb_send_line seatx "/goal do the thing"; rc=$?
+_reset; PANES=("$P_EMPTY" "$P_STUCK" "$P_EMPTY"); _hb_send_line seatx "/goal do the thing"; rc=$?
 grade "A4 a tail left after the first Enter is retried once and then accepted (rc 0, two Enters)" "[[ $rc -eq 0 && $(enters) -eq 2 ]] && ! grep -q 'submit UNVERIFIED' '$HBLOG'"
 
 # A5 — tail survives both Enters: rc 1, loud log, exactly two Enters (no loop).
-_reset; PANES=("$P_STUCK" "$P_STUCK"); _hb_send_line seatx "/goal do the thing"; rc=$?
+_reset; PANES=("$P_EMPTY" "$P_STUCK" "$P_STUCK"); _hb_send_line seatx "/goal do the thing"; rc=$?
 grade "A5 a tail that survives both Enters returns 1 so the tick does not claim" "[[ $rc -eq 1 && $(enters) -eq 2 ]]"
 grade "A6 ...and logs 'submit UNVERIFIED' naming the leftover text" "grep -q \"submit UNVERIFIED.*Pasted text #7\" '$HBLOG'"
 
@@ -99,7 +99,7 @@ grade "A7b a composer holding only the glyph's U+00A0 reads as empty (live shape
 
 # A8 — MUTATION: with the verify stubbed to always-pass, the stuck fixture returns 0 again.
 _hb_verify_submit() { return 0; }
-_reset; PANES=("$P_STUCK" "$P_STUCK"); _hb_send_line seatx "/goal do the thing"; rc=$?
+_reset; PANES=("$P_EMPTY" "$P_STUCK" "$P_STUCK"); _hb_send_line seatx "/goal do the thing"; rc=$?
 grade "A8 mutation: dropping the verify turns A5's rc back to 0 — the arm is live" "[[ $rc -eq 0 && $(enters) -eq 1 ]]"
 
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
