@@ -313,5 +313,95 @@ eval "$_orig_coord"
   || bad_t "DIVE-3742: unresolvable coordinator silenced the re-nag" \
            "sends=$(nsends) a=$(pinged "$f1") b=$(pinged "$f2")"
 
+# DIVE-5307 — the row's own pull request LANDED after the gate was asked (the
+# DIVE-632 shape: a tier-2 "please merge" gate, forge-poll recorded the merge, and
+# the owner was still paged daily). Nothing reaches the human; ONE agent-rail
+# message reaches the assignee, naming the sha and the withdraw-then-close exit.
+mk_landed() { # id landed_modifier
+  db "UPDATE tasks SET delivery_ref='https://github.com/o/r/pull/1155',
+        merge_landed_ref='https://github.com/o/r/pull/1155',
+        merge_landed_sha='2839f57ca9f0abcdef', merge_landed_at=datetime('now','$2')
+      WHERE id=$1;"
+}
+reset
+l1=$(mk_gate DIVE-27 2 manual '-50 hours' '-25 hours' '' '' '')
+mk_landed "$l1" '-49 hours'
+_hb_gate_renag_sweep
+[[ "$(nsends)" == "0" && "$(nagent)" == "1" && "$(tail -1 "$AGENT_SEND_LOG")" == "dev" \
+   && "$(pinged "$l1")" == "SET" ]] \
+  && ok_t "DIVE-5307: landed-after-ask T2 gate -> no human send, one agent-rail message to the assignee" \
+  || bad_t "DIVE-5307: landed-after-ask gate still paged the human / missed the assignee" \
+           "human=$(nsends) agent=$(nagent) to=$(tail -1 "$AGENT_SEND_LOG") pinged=$(pinged "$l1")"
+grep -q '2839f57ca9f0' "$LAST_AGENT_TEXT" && grep -q 'task need <ident> --withdraw' "$LAST_AGENT_TEXT" \
+  && grep -q '\[DIVE-27\]' "$LAST_AGENT_TEXT" \
+  && ok_t "DIVE-5307: the assignee message names the row, the merge sha and the withdraw-then-close exit" \
+  || bad_t "DIVE-5307: assignee message incomplete" "$(cat "$LAST_AGENT_TEXT")"
+grep -q "^ok|${l1}|agent:dev$" "$DELIV_LOG" \
+  && ok_t "DIVE-5307: the reroute is recorded in the gate delivery log" \
+  || bad_t "DIVE-5307: no delivery-log receipt for the reroute" "$(cat "$DELIV_LOG")"
+# Throttle: the receipt holds it for 24h, exactly like every other re-nag.
+: >"$AGENT_SEND_LOG"; _hb_gate_renag_sweep
+[[ "$(nagent)" == "0" && "$(nsends)" == "0" ]] \
+  && ok_t "DIVE-5307: the next tick sends nothing (gate_pinged_at throttles the reroute)" \
+  || bad_t "DIVE-5307: reroute re-sent inside 24h" "agent=$(nagent) human=$(nsends)"
+
+# NEGATIVE CONTROL — the same gate with NO landing re-nags the human as today.
+reset
+l2=$(mk_gate DIVE-28 2 manual '-50 hours' '-25 hours' '' '' '')
+_hb_gate_renag_sweep
+[[ "$(nsends)" == "1" && "$(nagent)" == "0" ]] \
+  && ok_t "DIVE-5307 control: a gate with no landing still re-nags the human" \
+  || bad_t "DIVE-5307 control: an unlanded gate lost its human re-nag" "human=$(nsends) agent=$(nagent)"
+
+# A gate asked AFTER the landing is asking something the merge cannot have
+# answered: it keeps the human lane.
+reset
+l3=$(mk_gate DIVE-29 2 decision '-2 hours' '-119 minutes' 'A|B' A '')
+mk_landed "$l3" '-3 hours'
+_hb_gate_renag_sweep
+[[ "$(nsends)" == "1" && "$(nagent)" == "0" ]] \
+  && ok_t "DIVE-5307: a gate filed after the landing still re-nags the human" \
+  || bad_t "DIVE-5307: a post-landing gate was rerouted" "human=$(nsends) agent=$(nagent)"
+
+# A landing on a binding the row no longer carries is a different PR: human lane.
+reset
+l4=$(mk_gate DIVE-30 2 manual '-50 hours' '-25 hours' '' '' '')
+mk_landed "$l4" '-49 hours'
+db "UPDATE tasks SET delivery_ref='https://github.com/o/r/pull/2000' WHERE id=${l4};"
+_hb_gate_renag_sweep
+[[ "$(nsends)" == "1" && "$(nagent)" == "0" ]] \
+  && ok_t "DIVE-5307: a landing on a stale binding is not this row's landing — human lane kept" \
+  || bad_t "DIVE-5307: a stale-binding landing rerouted the gate" "human=$(nsends) agent=$(nagent)"
+
+# LOUD, NEVER DROPPED: a failed rail, or an assignee off the org chart, leaves the
+# row in the human lane.
+reset
+l5=$(mk_gate DIVE-31 2 manual '-50 hours' '-25 hours' '' '' '')
+mk_landed "$l5" '-49 hours'
+FAIL_AGENT_SEND=1
+_hb_gate_renag_sweep
+[[ "$(nsends)" == "1" && "$(pinged "$l5")" == "SET" ]] \
+  && ok_t "DIVE-5307: a failed assignee rail falls back to the human re-nag" \
+  || bad_t "DIVE-5307: a failed assignee rail dropped the gate" "human=$(nsends) pinged=$(pinged "$l5")"
+reset
+l6=$(mk_gate DIVE-32 2 manual '-50 hours' '-25 hours' '' '' '')
+mk_landed "$l6" '-49 hours'
+db "UPDATE tasks SET assignee='ghost' WHERE id=${l6};"
+_hb_gate_renag_sweep
+[[ "$(nsends)" == "1" && "$(nagent)" == "0" ]] \
+  && ok_t "DIVE-5307: an off-chart assignee keeps the human lane" \
+  || bad_t "DIVE-5307: an off-chart assignee swallowed the gate" "human=$(nsends) agent=$(nagent)"
+
+# A mixed batch: the landed row reroutes, the unlanded one still reaches the human,
+# and the human message does not carry the rerouted row.
+reset
+l7=$(mk_gate DIVE-33 2 manual '-50 hours' '-25 hours' '' '' '')
+mk_landed "$l7" '-49 hours'
+l8=$(mk_gate DIVE-34 2 approval '-2 hours' '-119 minutes' '' approved '')
+_hb_gate_renag_sweep
+[[ "$(nagent)" == "1" && "$(nsends)" == "1" && "$(tail -1 "$SEND_LOG")" == "$l8" ]] \
+  && ok_t "DIVE-5307: mixed batch — landed row to the assignee, the other alone to the human" \
+  || bad_t "DIVE-5307: mixed batch mis-split" "agent=$(nagent) human=$(nsends) human_ids=$(tail -1 "$SEND_LOG")"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
