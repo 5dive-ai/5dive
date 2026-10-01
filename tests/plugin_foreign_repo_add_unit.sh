@@ -49,6 +49,18 @@ mk_repo "$REMOTE/weather" forecast
 mk_repo "$REMOTE/tools" alpha beta
 mk_repo "$REMOTE/suite" suite extra
 mk_repo "$REMOTE/urlonly" urlplug
+mk_repo "$REMOTE/tools2" gamma delta
+# DIVE-5308: two repositories whose plugins declare the same verb.
+mk_verb_repo(){ # <repo-dir> <plugin> <verb>
+  local repo="$1" p="$2" v="$3"
+  mk_repo "$repo" "$p"
+  jq --arg v "$v" '.fivedive.capabilities=["verb"] | .fivedive.verbs=[{name:$v,summary:"fixture verb"}]' \
+    "$repo/$p/.claude-plugin/plugin.json" > "$repo/x" && mv "$repo/x" "$repo/$p/.claude-plugin/plugin.json"
+  mkdir -p "$repo/$p/bin"; printf '#!/bin/sh\n' > "$repo/$p/bin/$v"; chmod +x "$repo/$p/bin/$v"
+}
+mk_verb_repo "$REMOTE/choir" choir sing
+mk_verb_repo "$REMOTE/rival" rival sing
+mk_verb_repo "$REMOTE/rival2" rival2 sing
 mkdir -p "$REMOTE/broken/plugin/.claude-plugin"
 printf '{"name":"plugin","version":"1.0.0"}\n' > "$REMOTE/broken/plugin/.claude-plugin/plugin.json"
 
@@ -71,6 +83,10 @@ git(){
       https://github.com/5dive-ai/suite.git)   src="$REMOTE/suite" ;;
       https://github.com/5dive-ai/urlonly.git|https://github.com/5dive-ai/urlonly) src="$REMOTE/urlonly" ;;
       https://github.com/5dive-ai/broken.git)  src="$REMOTE/broken" ;;
+      https://github.com/5dive-ai/tools2.git)  src="$REMOTE/tools2" ;;
+      https://github.com/5dive-ai/choir.git)   src="$REMOTE/choir" ;;
+      https://github.com/5dive-ai/rival.git)   src="$REMOTE/rival" ;;
+      https://github.com/5dive-ai/rival2.git)  src="$REMOTE/rival2" ;;
       *) return 91 ;;
     esac
     printf '%s -> %s\n' "$url" "$dest" >> "$CLONES"
@@ -144,6 +160,43 @@ eq_t 'plugin install aliases canonical add' 0 "$RC"
 grep -qE '^[[:space:]]*plugin\|plugins\)' src/main.sh \
   && ok_t 'top-level plugins aliases plugin' \
   || bad_t 'top-level plugins alias' 'main dispatch lacks plugin|plugins)'
+
+# ---- DIVE-5308: a refused add leaves the marketplace list as it found it -----
+# Before the fix `_plugin_add_foreign` registered the repository's marketplace
+# and then refused, so every refused add stacked one more marketplace with
+# nothing installed from it. The verdict is the list itself, read before and
+# after, not the absence of one key.
+mkt_list(){ jq -c 'keys' "$(_plugin_mkt_json)"; }
+run cmd_plugin_add 5dive-ai/choir --yes
+eq_t 'setup: the first verb-claiming plugin installs' 0 "$RC"
+before=$(mkt_list)
+run cmd_plugin_add 5dive-ai/rival --yes
+eq_t 'a verb-claim refusal keeps its rc (E_VALIDATION)' "$E_VALIDATION" "$RC"
+has_t 'the verb-claim refusal is the one that fired' "already claimed by" "$ERR"
+eq_t 'a refused add leaves the marketplace list unchanged' "$before" "$(mkt_list)"
+eq_t 'a refused add leaves no staged clone behind' no "$([[ -e "$(_plugin_mkt_dir)/rival" ]] && echo yes || echo no)"
+eq_t 'a refused add installs nothing' false "$(jq 'has("rival@rival")' "$(_plugin_installed_json)")"
+run cmd_plugin_add 5dive-ai/rival2 --yes
+eq_t 'a second refused add does not stack another marketplace' "$before" "$(mkt_list)"
+
+# A refusal that fires before the installer (no plugin chosen) is the same case.
+run cmd_plugin_add 5dive-ai/tools2 --yes
+eq_t 'a multi-plugin refusal keeps its rc (E_USAGE)' "$E_USAGE" "$RC"
+eq_t 'a multi-plugin refusal leaves the marketplace list unchanged' "$before" "$(mkt_list)"
+
+# Negative control on scope: a marketplace the OPERATOR registered beforehand is
+# theirs, and a refused add through it must not remove it.
+run cmd_plugin_marketplace add 5dive-ai/rival --as=rival-kept
+eq_t 'setup: operator registers the rival marketplace' 0 "$RC"
+before=$(mkt_list)
+run cmd_plugin_add 5dive-ai/rival --as=rival-kept --yes
+eq_t 'a refused add through a pre-registered marketplace keeps its rc' "$E_VALIDATION" "$RC"
+eq_t 'a pre-registered marketplace survives a refused add' "$before" "$(mkt_list)"
+
+# And a successful add from a new repository still keeps its marketplace.
+run cmd_plugin_add 5dive-ai/tools2/gamma --yes
+eq_t 'a successful add after a refusal still installs' 0 "$RC"
+eq_t 'a successful add keeps the marketplace it registered' true "$(jq 'has("tools2")' "$(_plugin_mkt_json)")"
 
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAILN"
 [[ "$FAILN" == 0 ]]

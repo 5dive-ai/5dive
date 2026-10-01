@@ -1127,8 +1127,27 @@ _plugin_add_foreign() {  # <source-ref> <as-name> <assume-yes> [<official-only>]
     # Suppress the intermediate success envelope: one CLI invocation has one
     # result, especially under --json. Errors remain on stderr.
     _plugin_mkt_add "$source" --as="$mkt" --require-index >/dev/null
+    # DIVE-5308: this call registered the marketplace, so a refusal from here
+    # on must take it back. Every refusal below — and the verb-claim, trust and
+    # consent refusals inside cmd_plugin_add — is a `fail`, i.e. an `exit`, so
+    # the rest runs in a subshell and the parent undoes the registration on any
+    # non-zero. Checking first is not an option: the plugin list and its verbs
+    # are in the index, which exists only after the clone. A marketplace that
+    # was already registered is the operator's and is never removed here.
+    local rc=0
+    ( _plugin_add_foreign_install "$source" "$mkt" "$wanted" "$assume_yes" "$official_only" ) || rc=$?
+    if (( rc != 0 )); then
+      _plugin_mkt_remove "$mkt" >/dev/null 2>&1 \
+        || warn "the refused add registered marketplace '$mkt' and could not remove it — remove it by hand: 5dive plugin marketplace remove $mkt"
+      exit "$rc"
+    fi
+    return 0
   fi
+  _plugin_add_foreign_install "$source" "$mkt" "$wanted" "$assume_yes" "$official_only"
+}
 
+_plugin_add_foreign_install() {  # <source> <marketplace> <wanted-plugin> <assume-yes> <official-only>
+  local source="$1" mkt="$2" wanted="$3" assume_yes="$4" official_only="$5"
   local idx
   idx="$(_plugin_mkt_dir)/$mkt/.claude-plugin/marketplace.json"
   [[ -f "$idx" ]] \
