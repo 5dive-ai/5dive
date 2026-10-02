@@ -8,7 +8,8 @@
 #            leaves the 5h floor alone. `pace-5h=off` is the same for the session
 #            window.
 #   8595.    `pace-week=85/95` → a high row passes at 91% and a medium row is held.
-#   DEFAULT. `pace-week=default` clears the key and restores 60/90.
+#   DEFAULT. `pace-week=default` clears the key and restores 95/95 (DIVE-5364;
+#   60/90 before it).
 #   5H-SET.  `pace-5h=70` (config, no env) moves the session floor: 5h 69% is
 #            open, 70% is held urgent-only, and the source is named `config`.
 #   ENV.     an explicit FIVE_PACE_7D_* / FIVE_PACE_5H still wins over the config.
@@ -205,8 +206,8 @@ setcfg '{"pace_week":"off"}'
 [[ "$(band 20 90)" == 3 ]] && ok_ "OFF: pace-week=off leaves the 5h floor armed (5h=90% still urgent-only)" \
   || bad_ "OFF: 5h independence" "5h=90% under pace-week=off -> $(band 20 90)"
 setcfg '{"pace_5h":"off"}'
-[[ "$(band 20 101)" == 0 && "$(band 70 101)" == 2 ]] && ok_ "OFF: pace-5h=off drops the session floor (5h=101% no hold) and leaves the weekly one armed" \
-  || bad_ "OFF: pace-5h=off" "20/101 -> $(band 20 101), 70/101 -> $(band 70 101)"
+[[ "$(band 20 101)" == 0 && "$(band 96 101)" == 3 ]] && ok_ "OFF: pace-5h=off drops the session floor (5h=101% no hold) and leaves the weekly one armed" \
+  || bad_ "OFF: pace-5h=off" "20/101 -> $(band 20 101), 96/101 -> $(band 96 101)"
 
 r=$(arm_8595) && ok_ "8595: pace-week=85/95 — at 91% a high row passes and a medium row is held; 84 open, 85 soft, 95 hard" \
   || bad_ "8595" "$r"
@@ -219,9 +220,9 @@ cmd_box_config pace-week=default pace-5h=default >/dev/null 2>&1
 [[ "$(jq -c '[has("pace_week"), has("pace_5h")]' "$BOX_CONFIG")" == "[false,false]" ]] \
   && ok_ "DEFAULT: pace-week=default / pace-5h=default CLEAR the keys rather than storing the word" \
   || bad_ "DEFAULT: cleared" "$(cat "$BOX_CONFIG")"
-[[ "$(band 59)" == 0 && "$(band 60)" == 2 && "$(band 89)" == 2 && "$(band 90)" == 3 && "$(_pace_week_effective)" == 60/90 && "$(_pace_5h_effective)" == 85 ]] \
-  && ok_ "DEFAULT: after default the floors are 60/90 and 85 again (59 open, 60 soft, 90 hard)" \
-  || bad_ "DEFAULT: restored" "59=$(band 59) 60=$(band 60) 90=$(band 90) week=$(_pace_week_effective) 5h=$(_pace_5h_effective)"
+[[ "$(band 60)" == 0 && "$(band 90)" == 0 && "$(band 94)" == 0 && "$(band 95)" == 3 && "$(band null)" == 0 && "$(_pace_week_effective)" == 95/95 && "$(_pace_5h_effective)" == 85 ]] \
+  && ok_ "DEFAULT: after default the floors are 95/95 and 85 again (60/90/94 open, 95 hard, blind open — DIVE-5364)" \
+  || bad_ "DEFAULT: restored" "60=$(band 60) 90=$(band 90) 94=$(band 94) 95=$(band 95) null=$(band null) week=$(_pace_week_effective) 5h=$(_pace_5h_effective)"
 
 r=$(arm_env) && ok_ "ENV: FIVE_PACE_7D_SOFT / FIVE_PACE_7D_HARD / FIVE_PACE_5H each win over the box config (including over off)" \
   || bad_ "ENV" "$r"
@@ -236,9 +237,9 @@ s2=$(FIVE_PACE_7D_SOFT=70 cmd_box_config 2>&1)
 rm -f "$BOX_CONFIG"; s3=$(cmd_box_config 2>&1)
 setcfg '{"pace_week":"95/85","pace_5h":"off"}'; s4=$(cmd_box_config 2>&1)
 [[ "$s1" == *"pace-week = 85/95 (config)"* && "$s1" == *"pace-5h = 85 (default)"* \
-   && "$s2" == *"pace-week = 70/90 (env FIVE_PACE_7D_SOFT/FIVE_PACE_7D_HARD)"* \
-   && "$s3" == *"pace-week = 60/90 (default)"* \
-   && "$s4" == *"pace-week = 60/90 (default — the stored pace_week '95/85' is not a valid value and is ignored)"* \
+   && "$s2" == *"pace-week = 70/95 (env FIVE_PACE_7D_SOFT/FIVE_PACE_7D_HARD)"* \
+   && "$s3" == *"pace-week = 95/95 (default)"* \
+   && "$s4" == *"pace-week = 95/95 (default — the stored pace_week '95/85' is not a valid value and is ignored)"* \
    && "$s4" == *"pace-5h = off (config)"* ]] \
   && ok_ "SHOW: 5dive config prints each effective floor and its source (config, env, default, and a hand-edited bad value named as ignored)" \
   || bad_ "SHOW" "s1=[$s1] s2=[$s2] s3=[$s3] s4=[$s4]"

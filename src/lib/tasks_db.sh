@@ -634,6 +634,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- reaching it at all. Deliberately a separate column, not a status: the
   -- dedup decision itself is unchanged by this.
   last_skipped_at  TEXT,
+  -- DIVE-5364. WHY the last skip happened, written with every last_skipped_at
+  -- stamp: 'open instance', 'overlap bound', or 'pace <band> on <account> | …'
+  -- when the pacing floor held the slot. Without it a pace hold either stamps
+  -- nothing (the 2026-10-01 day-long silent hold) or reads as "close the stuck
+  -- instance" when there is no instance to close. NULL on every row that
+  -- predates it, which is the truth: nobody recorded a reason.
+  last_skip_reason TEXT,
   -- DIVE-2272 (decision DIVE-2270). The PER-TEMPLATE overlap policy. NULL means
   -- 'skip' -- every template that predates this column keeps today's behaviour
   -- byte for byte, which is why this is a nullable add and not a NOT NULL
@@ -2017,6 +2024,8 @@ _TASKS_ADDITIVE_COLUMNS=(
   'delivery_companions TEXT' 'delivery_unbound TEXT'
   'originated_by_objective INTEGER' 'originated_cycle INTEGER'
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
+  # DIVE-5364: why the last skip happened (see the CREATE TABLE comment).
+  'last_skip_reason TEXT'
   # DIVE-2730: the add-time `--no-verify`, persisted. Nullable — NULL is "the
   # filer did not opt out", which is the truth for every pre-existing row, so the
   # backfill is a no-op. See the CREATE TABLE comment for why an unpersisted

@@ -59,6 +59,13 @@ export FIVE_PACE_READING_CACHE_DIR="$TMPD/pace-reading"
 # pace-week=…` would grade every arm below against its own floors.
 export BOX_CONFIG="$TMPD/box.json"
 PACE_RCD="$TMPD/pace-reading"
+# DIVE-5364: the shipped default became 95/95 with a blind meter OPEN. Every arm
+# below grades the floor's MECHANICS — two distinct floors, the near-reset
+# relaxation, the blind hold, the bound — and those need a soft band to exist and
+# a blind hold to observe. So this harness pins the pre-5364 policy, which is
+# still a supported opt-in (`pace-week=60/90`, FIVE_PACE_BLIND=soft). The new
+# defaults themselves are graded in tests/pace_default_95_unit.sh.
+export FIVE_PACE_7D_SOFT=60 FIVE_PACE_7D_HARD=90 FIVE_PACE_BLIND=soft
 
 # ── A/B/C: the floor itself ────────────────────────────────────────────────
 # shellcheck source=/dev/null
