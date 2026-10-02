@@ -41,6 +41,13 @@ SECRET_DROP_CADDYFILE="/etc/caddy/Caddyfile"
 SECRET_DROP_PORT=3127
 SECRET_DROP_TTL_MIN=30
 SECRET_DROP_LOCK="/run/5dive-secret-drop.lock"
+# DIVE-5372: how long `secret link` waits for its page to answer over valid TLS
+# before it hands the URL out. Under the 30s the dashboard's exec call allows
+# (shelld's default), so a slow first certificate degrades to ready:false
+# instead of a dead request. ACME on a fresh name took ~4s on chill-gorge.
+SECRET_DROP_WAIT_S="${SECRET_DROP_WAIT_S:-20}"
+SECRET_DROP_POLL_S="${SECRET_DROP_POLL_S:-1}"
+SECRET_DROP_PROBE_ADDR="${SECRET_DROP_PROBE_ADDR:-127.0.0.1}"
 
 # The https base a link starts with, or nothing when this box has no name an
 # owner's browser can reach (the terminal path then).
@@ -156,17 +163,43 @@ _secret_link() {
   ( umask 077; printf 'task=%s\nkey=%s\nconnector=%s\nexpires=%s\n' "$ident" "$key" "$connector" "$exp" > "$SECRET_DROP_DIR/$hash" ) \
     || fail "$E_GENERIC" "cannot store the link"
 
+  # DIVE-5372: the first link on a box appends the secrets.<domain> route and
+  # DEFERS the reload, and Caddy only then asks ACME for the certificate. A URL
+  # handed out before that ends in ERR_SSL_PROTOCOL_ERROR on the owner's first
+  # tap (lodar on chill-gorge, 2026-10-02 05:34Z). So wait, bounded, until the
+  # page answers over valid TLS; past the bound, still return the link, marked
+  # ready:false, so the caller can say "getting your secure page ready".
+  # "null" = not checked: --no-start, or a SECRET_DROP_BASE_URL (the owner's own
+  # tunnel, which this box may not be able to reach by its public name).
+  local ready=null
   if (( start )); then
     _secret_drop_ensure_route || true
     _secret_drop_ensure_server || true
+    local domain
+    if ! _secret_drop_has_base_url && domain=$(_secret_drop_domain); then
+      _secret_drop_wait_ready "$domain" "$SECRET_DROP_WAIT_S" && ready=true || ready=false
+    fi
   fi
 
-  local url="${base}/${token}" exp_iso
+  local url="${base}/${token}" exp_iso note=""
   exp_iso=$(date -u -d "@$exp" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -r "$exp" '+%Y-%m-%dT%H:%M:%SZ')
+  [[ "$ready" == false ]] && note="
+not ready yet: the secure page is still getting its certificate. If the link does not open, wait a minute and open it again (it stays valid)."
   ok "$url
-single use, expires ${exp_iso} (${ttl} min); the value lands as ${key} in ${connector}.env and clears ${ident}" \
-     '{url: $u, expires_at: $e, ttl_minutes: ($t|tonumber), task: $i, key: $k, connector: $c}' \
-     --arg u "$url" --arg e "$exp_iso" --arg t "$ttl" --arg i "$ident" --arg k "$key" --arg c "$connector"
+single use, expires ${exp_iso} (${ttl} min); the value lands as ${key} in ${connector}.env and clears ${ident}${note}" \
+     '{url: $u, expires_at: $e, ttl_minutes: ($t|tonumber), task: $i, key: $k, connector: $c, ready: ($r|fromjson)}' \
+     --arg u "$url" --arg e "$exp_iso" --arg t "$ttl" --arg i "$ident" --arg k "$key" --arg c "$connector" --arg r "$ready"
+}
+
+# `secret _prewarm` (root; install.sh, every install and --upgrade): route
+# secrets.<domain> and let Caddy fetch its certificate long before any gate
+# needs a link, so even a box's FIRST link opens on the first tap (DIVE-5372).
+# Only the route: the page still starts on demand. Best-effort, quiet, rc 0
+# when there is nothing to do (no Caddy, no FIVE_DOMAIN, an owner's base URL).
+_secret_drop_prewarm() {
+  require_root secret _prewarm
+  _secret_drop_ensure_route || return 1
+  return 0
 }
 
 # ---- the page's two internal calls (root; the server runs them) -------------
@@ -254,7 +287,7 @@ _secret_drop_redeem() {
 _secret_drop_ensure_route() {
   local cf="$SECRET_DROP_CADDYFILE" domain
   [[ -f "$cf" ]] && command -v caddy >/dev/null 2>&1 || return 0
-  [[ -r "$SECRET_DROP_CONF" ]] && grep -q '^SECRET_DROP_BASE_URL=.' "$SECRET_DROP_CONF" && return 0
+  _secret_drop_has_base_url && return 0
   domain=$(_secret_drop_domain) || return 0
   grep -qE "^secrets\.${domain//./\\.}[[:space:]]*\{" "$cf" && return 0
   local bak; bak=$(mktemp "${cf}.dive5319.XXXXXX") || return 1
@@ -280,6 +313,36 @@ EOF
   mv -f "$bak" "$cf"
   warn "secret drop: Caddyfile failed validate with the secrets.${domain} block; restored the previous file"
   return 1
+}
+
+_secret_drop_has_base_url() {
+  [[ -r "$SECRET_DROP_CONF" ]] && grep -q '^SECRET_DROP_BASE_URL=.' "$SECRET_DROP_CONF"
+}
+
+# DIVE-5372: does https://secrets.<domain>/ answer as the owner will see it?
+# A TLS handshake that verifies a certificate for that exact name (curl's
+# default; never -k), through this box's Caddy (--resolve to loopback, so no
+# hairpin NAT or DNS cache is in the way), reaching the page itself: /healthz
+# is the page's own 200, where a route with no page behind it is a 502 and a
+# name Caddy has no certificate for fails the handshake. /healthz, not a random
+# token path: a 404 there counts against the page's failed-lookup rate limit.
+_secret_drop_ready() {
+  local domain="$1" body
+  body=$(curl -fsS --max-time 3 --resolve "secrets.${domain}:443:${SECRET_DROP_PROBE_ADDR}" \
+    "https://secrets.${domain}/healthz" 2>/dev/null) || return 1
+  [[ "$body" == *'"ok":true'* ]]
+}
+
+# Poll _secret_drop_ready until it holds or <seconds> pass. rc 0 = ready.
+_secret_drop_wait_ready() {
+  local domain="$1" secs="$2" deadline
+  [[ "$secs" =~ ^[0-9]+$ ]] || secs=20
+  deadline=$(( $(date +%s) + secs ))
+  while :; do
+    _secret_drop_ready "$domain" && return 0
+    (( $(date +%s) >= deadline )) && return 1
+    sleep "$SECRET_DROP_POLL_S"
+  done
 }
 
 # Start the page if nothing answers on its port. It exits by itself once no link

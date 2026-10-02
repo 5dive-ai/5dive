@@ -1843,6 +1843,12 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   # best-effort: never block an upgrade on it.
   "$BIN_DIR/5dive" gate-proof enforce on >/dev/null 2>&1 || true
 
+  # DIVE-5372: route secrets.<domain> and let Caddy fetch its certificate now, so
+  # a box's first one-time secret link opens on the first tap instead of failing
+  # TLS while the certificate is still being issued. No-op without Caddy or
+  # FIVE_DOMAIN, idempotent once routed. Best-effort: never block an upgrade on it.
+  "$BIN_DIR/5dive" secret _prewarm >/dev/null 2>&1 || true
+
   # >>> DIVE-5247 partner plugin migration (extracted verbatim by tests/sysadmin_core_seams_unit.sh)
   # `5dive sysadmin` left core for the partner plugin. A box that already has the
   # sysadmin seat (a partner box built before the move) gets the plugin in the SAME
@@ -2064,6 +2070,10 @@ say "Running health check"
 # DIVE-758: secure-by-default — new boxes get gate-proof enforcement ON (same as
 # the --upgrade path flips it for existing boxes). Best-effort; never block install.
 5dive gate-proof enforce on >/dev/null 2>&1 || true
+
+# DIVE-5372: same pre-warm as the --upgrade path — the secrets.<domain> route
+# and its certificate exist before the first secret gate needs a link.
+5dive secret _prewarm >/dev/null 2>&1 || true
 
 echo
 echo "Next steps:"

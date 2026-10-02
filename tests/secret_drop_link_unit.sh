@@ -7,6 +7,8 @@
 #   * the page itself (python, loopback): GET form + headers, POST writes the value
 #     exactly once, never echoes it, never logs the token, 404/410/429.
 #   * the Caddy route for secrets.<domain>: appended once, restored on a bad validate.
+#   * DIVE-5372: `secret link` returns only once the page answers over verified TLS
+#     (bounded; ready:false past it), and install.sh pre-warms the route.
 #   * `secret write` at a terminal asks with hidden input (the no-domain fallback).
 # Isolation: src/ libs sourced, throwaway STATE_DIR / connectors dir / Caddyfile;
 # `5dive` (task answer) and `caddy` are mocks on PATH. No root, no network beyond
@@ -282,6 +284,96 @@ cmp -s "$SECRET_DROP_CADDYFILE" "$TMP/cf.before" && ! ls "$TMP"/Caddyfile.dive53
   && ok_t "L7b a failed validate restores the previous Caddyfile byte for byte" \
   || bad_t "L7b a failed validate restores the previous Caddyfile byte for byte" "$(diff "$TMP/cf.before" "$SECRET_DROP_CADDYFILE")"
 unset -f systemd-run systemctl
+
+# --- L11: DIVE-5372 — the link waits for its page over valid TLS ---------------
+# lodar's first real link (chill-gorge, 2026-10-02) went out before Caddy had a
+# certificate for secrets.<box>, and the first tap failed TLS. A box that has
+# never minted (no secrets. route) must hand the URL out only once
+# https://secrets.<d>/healthz answers through Caddy with a verified certificate,
+# or after the bound, marked ready:false. `curl` is a mock: probes with
+# --resolve are the TLS check (counted, args logged); anything else is the
+# page's own loopback healthz in _secret_drop_ensure_server, answered "up".
+export PROBE_LOG="$TMP/probe.log" PROBE_COUNT="$TMP/probe.count"
+cat > "$MOCKBIN/curl" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in *" --resolve "*) ;; *) echo '{"ok":true}'; exit 0 ;; esac
+echo "$*" >> "$PROBE_LOG"
+n=$(( $(cat "$PROBE_COUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$PROBE_COUNT"
+# PROBE_READY_AFTER=k: the first k probes fail the handshake (curl rc 35).
+(( n > ${PROBE_READY_AFTER:-0} )) && [[ "${PROBE_NEVER:-0}" != 1 ]] || exit 35
+echo '{"ok":true}'
+EOF
+chmod +x "$MOCKBIN/curl"; hash -r   # L5 already ran the real curl: drop bash's cached path
+export RELOAD_LOG="$TMP/reload.log"
+systemd-run() { echo "systemd-run $*" >> "$RELOAD_LOG"; }; systemctl() { :; }
+probe_reset() { : > "$PROBE_LOG"; rm -f "$PROBE_COUNT"; : > "$RELOAD_LOG"; }
+mint_live() { ( _secret_link "$@" ) 2>/dev/null; }   # NOT --no-start: route, page, wait
+fresh_box() { printf 'teal-fox.example.com {\n    handle /shell/* {\n        reverse_proxy localhost:3101\n    }\n}\n' > "$SECRET_DROP_CADDYFILE"; }
+probes() { cat "$PROBE_COUNT" 2>/dev/null || echo 0; }
+export SECRET_DROP_POLL_S=0.1
+
+seed_gate DIVE-31 READY_KEY ready31
+fresh_box; probe_reset
+out=$(PROBE_READY_AFTER=3 mint_live DIVE-31); rc=$?
+[[ $rc -eq 0 && "$(printf '%s' "$out" | jq -r '.data.ready')" == true && "$(probes)" == 4 ]] \
+  && grep -q '^secrets\.teal-fox\.example\.com {' "$SECRET_DROP_CADDYFILE" && grep -q 'systemd-run.*reload caddy' "$RELOAD_LOG" \
+  && ok_t "L11a a never-routed box: route added + reload scheduled, and the link returns only once the TLS probe succeeds (3 failed handshakes, then ready:true)" \
+  || bad_t "L11a a never-routed box: route added + reload scheduled, and the link returns only once the TLS probe succeeds (3 failed handshakes, then ready:true)" "rc=$rc probes=$(probes) out=$out reload=$(cat "$RELOAD_LOG")"
+p1=$(head -1 "$PROBE_LOG")
+[[ "$p1" == *"--resolve secrets.teal-fox.example.com:443:127.0.0.1"* && "$p1" == *"https://secrets.teal-fox.example.com/healthz"* ]] \
+  && ! grep -qE -- '(^| )(-k|--insecure)( |$)' "$PROBE_LOG" \
+  && ok_t "L11b the probe is https://secrets.<d>/healthz through this box's Caddy (--resolve to loopback), certificate verified (never -k)" \
+  || bad_t "L11b the probe is https://secrets.<d>/healthz through this box's Caddy (--resolve to loopback), certificate verified (never -k)" "probe: $p1"
+
+seed_gate DIVE-32 READY_KEY ready32
+fresh_box; probe_reset
+t0=$(date +%s)
+out=$(PROBE_NEVER=1 SECRET_DROP_WAIT_S=2 mint_live DIVE-32); rc=$?
+el=$(( $(date +%s) - t0 ))
+[[ $rc -eq 0 && "$(printf '%s' "$out" | jq -r '.data.ready')" == false \
+   && "$(printf '%s' "$out" | jq -r '.data.url')" =~ ^https://secrets\.teal-fox\.example\.com/[A-Za-z0-9_-]{43}$ \
+   && $el -ge 2 && $el -le 6 && "$(probes)" -ge 2 ]] \
+  && ok_t "L11c never ready: the link still comes back after the bound (2s here, ${el}s measured), marked ready:false" \
+  || bad_t "L11c never ready: the link still comes back after the bound (2s here, ${el}s measured), marked ready:false" "rc=$rc el=$el probes=$(probes) out=$out"
+probe_reset
+out=$( (JSON_MODE=0; PROBE_NEVER=1 SECRET_DROP_WAIT_S=0 _secret_link DIVE-32) 2>&1 ); rc=$?
+[[ $rc -eq 0 && "$out" == *"not ready yet"*"open it again"* ]] \
+  && ok_t "L11d text mode says the page is not ready yet and the link stays valid" \
+  || bad_t "L11d text mode says the page is not ready yet and the link stays valid" "rc=$rc out=$out"
+
+probe_reset
+out=$(mint DIVE-31); rc=$?
+[[ $rc -eq 0 && "$(printf '%s' "$out" | jq -r '.data.ready')" == null && "$(probes)" == 0 ]] \
+  && ok_t "L11e --no-start never probes (ready:null, not checked)" \
+  || bad_t "L11e --no-start never probes (ready:null, not checked)" "probes=$(probes) out=$out"
+printf 'SECRET_DROP_BASE_URL=https://drop.example.net\n' > "$SECRET_DROP_CONF"
+fresh_box; probe_reset
+out=$(PROBE_NEVER=1 mint_live DIVE-31); rc=$?
+[[ $rc -eq 0 && "$(printf '%s' "$out" | jq -r '.data.ready')" == null && "$(probes)" == 0 ]] \
+  && ! grep -q '^secrets\.' "$SECRET_DROP_CADDYFILE" \
+  && ok_t "L11f an owner's own base URL: no route, no probe, no wait (ready:null)" \
+  || bad_t "L11f an owner's own base URL: no route, no probe, no wait (ready:null)" "rc=$rc probes=$(probes) out=$out"
+rm -f "$SECRET_DROP_CONF"
+
+# Pre-warm (install.sh, every install and --upgrade): the route and its reload
+# exist before any gate, so Caddy fetches the certificate ahead of the first link.
+fresh_box; probe_reset
+( _secret_drop_prewarm ); rc=$?; ( _secret_drop_prewarm ); rc2=$?
+[[ $rc -eq 0 && $rc2 -eq 0 && "$(grep -c '^secrets\.teal-fox\.example\.com {' "$SECRET_DROP_CADDYFILE")" == 1 \
+   && "$(grep -c 'reload caddy' "$RELOAD_LOG")" == 1 && "$(probes)" == 0 ]] \
+  && ok_t "L11g secret _prewarm routes secrets.<d> once and schedules one reload (idempotent, no page, no probe)" \
+  || bad_t "L11g secret _prewarm routes secrets.<d> once and schedules one reload (idempotent, no page, no probe)" "rc=$rc/$rc2 reloads=$(grep -c 'reload caddy' "$RELOAD_LOG") cf=$(cat "$SECRET_DROP_CADDYFILE")"
+mv "$SECRET_DROP_PROVISIONING" "$TMP/prov.off2"; fresh_box; cp "$SECRET_DROP_CADDYFILE" "$TMP/cf.nodomain"
+( _secret_drop_prewarm ); rc=$?
+mv "$TMP/prov.off2" "$SECRET_DROP_PROVISIONING"
+[[ $rc -eq 0 ]] && cmp -s "$SECRET_DROP_CADDYFILE" "$TMP/cf.nodomain" \
+  && ok_t "L11h _prewarm on a box with no FIVE_DOMAIN: rc 0, Caddyfile untouched" \
+  || bad_t "L11h _prewarm on a box with no FIVE_DOMAIN: rc 0, Caddyfile untouched" "rc=$rc"
+n=$(grep -c '5dive" secret _prewarm >/dev/null 2>&1 || true\|^5dive secret _prewarm >/dev/null 2>&1 || true' install.sh)
+[[ "$n" == 2 ]] \
+  && ok_t "L11i install.sh pre-warms on both the fresh-install and the --upgrade path, best-effort" \
+  || bad_t "L11i install.sh pre-warms on both the fresh-install and the --upgrade path, best-effort" "matches=$n"
+unset -f systemd-run systemctl; rm -f "$MOCKBIN/curl"; hash -r
 
 # --- L8: serve refuses a routable plain-HTTP bind --------------------------------
 out=$( ( _secret_serve --listen=0.0.0.0:3127 ) 2>&1 ); rc=$?
