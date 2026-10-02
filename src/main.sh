@@ -338,6 +338,9 @@ Tasks (shared queue, sqlite — any agent, no sudo):
   5dive task block <id|PREFIX-N> --by=<id|PREFIX-N>
   # full surface: 5dive task --help
 
+Tool keys (every agent sees them as env vars; values on stdin):
+  5dive tool ls | sudo 5dive tool set <github|vercel|stripe|cloudflare|meta|elevenlabs|fal|higgsfield> | sudo 5dive tool rm <tool>
+
 Triggers (signed external event -> ordinary task):
   sudo 5dive trigger add github --name=<n> --event=issues.labeled --repo=owner/repo --assignee=<agent> --secret-from-stdin
   sudo 5dive trigger add webhook --name=<n> --event=<type> --role=<role> --secret-from-stdin
@@ -1362,6 +1365,11 @@ main() {
       # STDIN, so auditing argv here never captures the secret.
       AUDIT_CMD="secret"; AUDIT_ARGS=("$@")
       cmd_secret "$@" ;;
+    tool|tools)
+      # DIVE-5366: keys for the tools agents use (GitHub, Vercel, Stripe, ...),
+      # pasted in the Mini App. Values arrive on STDIN, so argv is safe to audit.
+      case "${1:-}" in set|rm|remove) AUDIT_CMD="tool ${1}"; AUDIT_ARGS=("${@:2}") ;; esac
+      cmd_tool "$@" ;;
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;
