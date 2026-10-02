@@ -25,7 +25,7 @@ SUD=$(render_standard_sudoers agent-tap 0 0)
 [[ $(grep -v '^#' <<<"$SUD" | grep '_self_account') != *'*'* ]] \
   && ok 'self-account grant has no wildcard' || bad 'self-account grant has no wildcard'
 # No line names set-account / account usage directly: the only reach is the rail.
-grep -v '^#' <<<"$SUD" | grep -qE 'set-account|account usage|account list' \
+grep -qE 'set-account|account usage|account list' <<<"$(grep -v '^#' <<<"$SUD")" \
   && bad 'no direct set-account/account grant' || ok 'no direct set-account/account grant'
 # The classifier must still read a freshly rendered file as standard with NO
 # unrecognised entry, or every reconciled seat reports a drifted grant (DIVE-3160)
@@ -127,9 +127,9 @@ GRANTED=0; : >"$CALLS"; : >"$WIRE"
 [[ "$(cat "$CALLS")" == 'require_root' && ! -s "$WIRE" ]] && ok 'account usage on an ungranted seat still requires root' || bad 'account usage on an ungranted seat still requires root'
 
 # the dispatcher reaches the executor, with argv, so it can refuse argv
-grep -A8 '^    _self_account)' "$SRC/main.sh" | grep -q 'cmd_self_account_delegated "\$@"' \
+grep -q 'cmd_self_account_delegated "\$@"' <<<"$(grep -A8 '^    _self_account)' "$SRC/main.sh")" \
   && ok 'main.sh dispatches _self_account with argv' || bad 'main.sh dispatches _self_account with argv'
-grep -A3 '^        set-account)' "$SRC/main.sh" | grep -q 'agent_set_account_dispatch "\$@"' \
+grep -q 'agent_set_account_dispatch "\$@"' <<<"$(grep -A3 '^        set-account)' "$SRC/main.sh")" \
   && ok 'main.sh routes set-account through the dispatch' || bad 'main.sh routes set-account through the dispatch'
 
 echo "$P passed, $F failed"
