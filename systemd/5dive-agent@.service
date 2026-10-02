@@ -44,6 +44,11 @@ EnvironmentFile=-/var/lib/5dive/agents.d/%i.env
 # profile's combined.env overrides the shared anthropic/openai/gemini envs
 # above, letting two same-type agents run against different accounts.
 EnvironmentFile=-/var/lib/5dive/agents.d/%i-auth.env
+# DIVE-5366: tool keys pasted in the Mini App (`5dive tool set`). Not an
+# EnvironmentFile, which is read once at start: every Bash command an agent runs
+# is a fresh non-interactive bash, which sources BASH_ENV, so a key saved or
+# removed reaches a running agent on its next command. Missing file = no keys.
+Environment=BASH_ENV=/etc/5dive/connectors/tools.sh
 ExecStart=/usr/local/bin/5dive-agent-start %i
 # Stop: tear down the tmux session, then SIGHUP the antigravity CLI binary
 # specifically. agy (the Go `agy` binary) IGNORES SIGTERM but dies on SIGHUP —
