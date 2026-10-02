@@ -48,7 +48,11 @@ EnvironmentFile=-/var/lib/5dive/agents.d/%i-auth.env
 # EnvironmentFile, which is read once at start: every Bash command an agent runs
 # is a fresh non-interactive bash, which sources BASH_ENV, so a key saved or
 # removed reaches a running agent on its next command. Missing file = no keys.
-Environment=BASH_ENV=/etc/5dive/connectors/tools.sh
+# DIVE-5373: BASH_ENV is a world-readable shim that sources the keys only when
+# the seat can read them. Pointed straight at the keys, a sandboxed seat (not in
+# group claude, so it cannot traverse /etc/5dive) printed "Permission denied"
+# on every command, with or without a key saved.
+Environment=BASH_ENV=/usr/local/lib/5dive/tool-env.sh
 ExecStart=/usr/local/bin/5dive-agent-start %i
 # Stop: tear down the tmux session, then SIGHUP the antigravity CLI binary
 # specifically. agy (the Go `agy` binary) IGNORES SIGTERM but dies on SIGHUP —

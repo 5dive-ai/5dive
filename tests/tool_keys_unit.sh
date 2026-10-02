@@ -5,7 +5,8 @@
 #     BASH_ENV (the agent's next command), and a removed one is gone the same way
 #   * a value that could break out of its quotes, or the wrong number of
 #     fields, is refused and nothing is written
-#   * the unit points BASH_ENV at the file the verb writes
+#   * the unit points BASH_ENV at a 644 shim that sources that file, and a seat
+#     that cannot read it gets no key and no stderr (DIVE-5373)
 # Isolation: src/ sourced into a throwaway connectors dir; no root, no network.
 # Run: bash tests/tool_keys_unit.sh
 set -uo pipefail
@@ -90,11 +91,52 @@ out=$(run rm higgsfield)
 out=$(printf 'x1234567890\n' | run set dropbox); rc=$?
 [[ $rc -ne 0 && "$out" == *"unknown tool"* ]] && ok_t "T7 unknown tool refused" || bad_t "T7 unknown" "rc=$rc $out"
 
-# --- T8: the unit hands the file to every agent -----------------------------------
+# --- T8: the unit hands the keys to every agent, through the shim ------------------
+# DIVE-5373: BASH_ENV is the 644 shim install.sh writes, never the key file itself,
+# which a sandboxed seat cannot open (bash then prints "Permission denied").
 unit_env=$(grep -E '^Environment=BASH_ENV=' systemd/5dive-agent@.service | sed 's/^Environment=BASH_ENV=//')
-[[ "$unit_env" == "/etc/5dive/connectors/tools.sh" ]] && ok_t "T8 5dive-agent@.service sets BASH_ENV to the tool key file" || bad_t "T8 unit" "got: $unit_env"
+[[ "$unit_env" == "/usr/local/lib/5dive/tool-env.sh" ]] && ok_t "T8 5dive-agent@.service sets BASH_ENV to the tool-env shim" || bad_t "T8 unit" "got: $unit_env"
+shim=$(sed -n "/<<'TOOLENV'$/,/^TOOLENV$/p" install.sh | sed '1d;$d')
+[[ "$shim" == *"/etc/5dive/connectors/tools.sh"* ]] && ok_t "T8 install.sh writes a shim that sources the key file" || bad_t "T8 shim body" "$shim"
+shim_ln=$(grep -n 'mv -f "$_te_tmp" "$LIB_DIR/tool-env.sh"' install.sh | head -1 | cut -d: -f1)
+unit_ln=$(grep -n 'systemd/5dive-agent%40.service" -o' install.sh | head -1 | cut -d: -f1)
+[[ -n "$shim_ln" && -n "$unit_ln" ]] && (( shim_ln < unit_ln )) \
+  && ok_t "T8 the shim is installed before the unit that points at it" || bad_t "T8 order" "shim@$shim_ln unit@$unit_ln"
+grep -qE '^  chmod 644 "\$_te_tmp"$' install.sh && ok_t "T8 the shim is 644" || bad_t "T8 shim mode"
 grep -qE '^EnvironmentFile=.*tools' systemd/5dive-agent@.service \
   && bad_t "T8 not an EnvironmentFile (read once at start)" || ok_t "T8 not an EnvironmentFile (read once at start)"
+
+# --- T9: the shipped shim, run as a seat that cannot read the keys ---------------
+# The shim from install.sh, re-pointed at this run's key file. "Outsider" is a
+# seat outside group claude: as root, a real other uid (root reads anything);
+# otherwise this uid against a mode-000 file / dir, which it cannot open either.
+SH="$TMP/tool-env.sh"
+printf '%s\n' "${shim//\/etc\/5dive\/connectors\/tools.sh/$F}" > "$SH"
+[[ "$(cat "$SH")" == *"$F"* ]] && ok_t "T9 shim re-pointed at the test key file" || bad_t "T9 shim rewrite" "$(cat "$SH")"
+outsider() {
+  if (( EUID == 0 )); then
+    chmod 755 "$TMP"; chmod 644 "$SH"
+    setpriv --reuid=65534 --regid=65534 --clear-groups env BASH_ENV="$1" /bin/bash -c "$2"
+  else
+    env BASH_ENV="$1" /bin/bash -c "$2"
+  fi
+}
+printf 'sk_el_FAKE_999999\n' | run set elevenlabs >/dev/null
+v=$(BASH_ENV="$SH" /bin/bash -c 'printf %s "${ELEVENLABS_API_KEY:-}"' 2>"$TMP/err0")
+[[ "$v" == sk_el_FAKE_999999 && ! -s "$TMP/err0" ]] && ok_t "T9 a seat that can read the keys gets them through the shim, no stderr" || bad_t "T9 reader" "v=$v err=$(cat "$TMP/err0")"
+(( EUID == 0 )) || chmod 000 "$F"
+# Positive control: the 0.68.0 shape (BASH_ENV = the key file) IS noisy for this seat.
+outsider "$F" 'echo ok' >"$TMP/out1" 2>"$TMP/err1"
+grep -q 'Permission denied' "$TMP/err1" && ok_t "T9 control: BASH_ENV at the unreadable key file prints Permission denied" || bad_t "T9 control (the arm cannot see the failure)" "$(cat "$TMP/err1")"
+outsider "$SH" 'printf %s "${ELEVENLABS_API_KEY:-}"; echo ok' >"$TMP/out2" 2>"$TMP/err2"
+[[ ! -s "$TMP/err2" && "$(cat "$TMP/out2")" == ok ]] && ok_t "T9 through the shim, the same seat gets no key and EMPTY stderr" || bad_t "T9 shim noise" "out=$(cat "$TMP/out2") err=$(cat "$TMP/err2")"
+(( EUID == 0 )) || chmod 640 "$F"
+# Missing file inside a directory the seat cannot traverse (the /etc/5dive case).
+(( EUID == 0 )) || chmod 000 "$FIVEDIVE_CONNECTOR_DIR"
+(( EUID == 0 )) && chmod 700 "$FIVEDIVE_CONNECTOR_DIR"
+outsider "$SH" 'echo ok' >"$TMP/out3" 2>"$TMP/err3"
+[[ ! -s "$TMP/err3" && "$(cat "$TMP/out3")" == ok ]] && ok_t "T9 untraversable keys dir: empty stderr, rc 0" || bad_t "T9 dir" "out=$(cat "$TMP/out3") err=$(cat "$TMP/err3")"
+chmod 755 "$FIVEDIVE_CONNECTOR_DIR"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
