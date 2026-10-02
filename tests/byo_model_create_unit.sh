@@ -143,7 +143,35 @@ done
 [[ -z "$(claude_create_start_model "" deepseek "")" ]]
 [[ -z "$(claude_create_start_model "" openrouter https://example.invalid/api)" ]]
 [[ -z "$(claude_create_start_model "" "" "")" ]]
-[[ "$create_src" == *'_claude_create_model=$(claude_create_start_model "$_claude_create_model" "$byo_provider" "$byo_base_url")'* ]]
+[[ "$create_src" == *'_claude_create_model=$(claude_create_start_model "$_claude_create_model" "$byo_provider" "$byo_base_url" "$profile")'* ]]
+
+# DIVE-5359: the same default through an EXISTING account. A my.5dive hire is
+# `agent import <pack> --auth-profile=demo-ai` with no --provider; a custom
+# agent's pack carries no model, so before this the preseed pinned
+# claude-opus-5-5 and the $1 demo key paid for real Opus (09-30: 16 requests,
+# $1.05). An alias-mapping profile now starts the agent on its opus-tier id.
+prof_root=$(mktemp -d)
+AUTH_PROFILES_DIR="$prof_root"
+mkdir -p "$prof_root/demo-ai" "$prof_root/anth" "$prof_root/bare-url"
+printf 'ANTHROPIC_BASE_URL=https://openrouter.ai/api\nANTHROPIC_DEFAULT_OPUS_MODEL=%s\nANTHROPIC_DEFAULT_SONNET_MODEL=%s\n' "$or_default" "$or_default" >"$prof_root/demo-ai/combined.env"
+printf 'CLAUDE_CODE_OAUTH_TOKEN=x\n' >"$prof_root/anth/combined.env"
+printf 'ANTHROPIC_BASE_URL=https://example.invalid/api\n' >"$prof_root/bare-url/combined.env"
+[[ "$(claude_create_start_model "" "" "" demo-ai)" == "$or_default" ]]
+# An explicit --model on the same account still wins.
+[[ "$(claude_create_start_model sonnet "" "" demo-ai)" == "sonnet" ]]
+# An Anthropic account, a base URL with no tier map, and an empty or unknown
+# profile hand the preseed an empty model exactly as before.
+[[ -z "$(claude_create_start_model "" "" "" anth)" ]]
+[[ -z "$(claude_create_start_model "" "" "" bare-url)" ]]
+[[ -z "$(claude_create_start_model "" "" "" no-such-profile)" ]]
+# A --provider create is the branch above, never the existing account's map.
+[[ -z "$(claude_create_start_model "" deepseek "" demo-ai)" ]]
+rm -rf "$prof_root"
+# The seat remembers the family, so `agent set-account` onto a Claude account
+# re-derives real Opus instead of keeping the OpenRouter id.
+[[ "$create_src" == *'&& _claude_create_family=opus'* ]]
+[[ "$create_src" == *'_model_family="${_claude_create_family:-}"'* ]]
 
 echo 'PASS: explicit BYO model reaches Claude per-agent settings and Hermes config'
 echo 'PASS: a new OpenRouter agent defaults to a concrete model in claude and openclaw (DIVE-5127)'
+echo 'PASS: an unpinned agent on an existing alias-mapping account starts on its opus-tier id (DIVE-5359)'
