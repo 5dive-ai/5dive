@@ -1625,6 +1625,29 @@ _task_secret_gate_app_line() {
   printf '%s' "Open this task in the 5dive app (its card on 5dive.ai/dashboard/tasks, or My team in the 5dive app on Telegram) and tap Open secure link. You paste it on a page served by this server, never through 5dive or this chat. Never paste it here."
 }
 
+# _task_secret_gate_app_button <access_file> — DIVE-5370. A seat that cannot
+# mint a drop link (a standard seat) sends its owner to the Mini App, whose Team
+# screen carries the gate's "Open secure link" card. Prose alone made the owner
+# go and find the app, so the alert also gets a button that opens it. Not a fixed
+# t.me link: tapped by a Telegram id that is not the owner's account, that opens
+# a NEW empty account (DIVE-5185). `telegram-app link` asks the API, which hands a
+# link only when the tapper already signs in to this box owner's account; any
+# other answer (web-bought box, partner box, the button turned off, no network)
+# means no button and the prose stands. Asks for the first id in the seat's own
+# allowlist, the owner it answers. Echoes one inline-keyboard button, or nothing.
+_task_secret_gate_app_button() {
+  local access="${1:-}" tid out url five
+  [[ -r "$access" ]] || return 0
+  tid=$(jq -r '(.allowFrom // [])[0] // empty | tostring' "$access" 2>/dev/null)
+  [[ "$tid" =~ ^[1-9][0-9]{4,15}$ ]] || return 0
+  five=$(five_self_bundle 2>/dev/null) || five=5dive
+  out=$("$five" --json telegram-app link --telegram-id="$tid" 2>/dev/null) || return 0
+  [[ "$(jq -r '.data.status // empty' <<<"$out" 2>/dev/null)" == ready ]] || return 0
+  url=$(jq -r '.data.url // empty' <<<"$out" 2>/dev/null)
+  [[ "$url" =~ ^https://t\.me/[A-Za-z0-9_]+\?startapp=link_[A-Za-z0-9_-]+$ ]] || return 0
+  jq -nc --arg u "$url" '{text: "🔑 Open secure link", url: $u}'
+}
+
 # The terminal path, for a box no owner's browser can reach: asks, hidden input.
 _task_secret_gate_box_line() {
   printf '%s' "On the box instead: sudo 5dive secret write $1 --connector=$2 --task=$3 (it asks for the value, hidden)."
@@ -2926,6 +2949,19 @@ _task_need_notify_deliver_now() {
       # instruction to do the impossible followed by the button that files the
       # false record. See tests/secret_gate_delivery_path_unit.sh arms T8/T8b.
       _task_gate_text_both $'\n\n'"$(_task_secret_gate_cta "$ident" "$numid" "$secret_key" "$connector" "$_drop")"
+      # DIVE-5370: no link minted here, so the prose sends the owner to the app;
+      # give them the button that opens it. Appended as its own row under ✅
+      # Provided, and only to this first alert: re-nags keep their keyboard.
+      if [[ -z "$_drop" && -n "$secret_key" && -n "$connector" ]]; then
+        local _appbtn; _appbtn=$(_task_secret_gate_app_button "$TASK_CH_ACCESS")
+        if [[ -n "$_appbtn" ]]; then
+          local _base='{"inline_keyboard":[]}' _merged
+          [[ -n "$reply_markup" ]] && _base="$reply_markup"
+          # A merge that fails keeps the keyboard it had (✅ Provided must not go).
+          _merged=$(jq -c --argjson b "$_appbtn" '.inline_keyboard += [[$b]]' <<<"$_base" 2>/dev/null) \
+            && [[ -n "$_merged" ]] && reply_markup="$_merged"
+        fi
+      fi
       ;;
     manual) _task_gate_text_both $'\n\n'"✋ Tap ✅ Done below once it is handled, which closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
     # DIVE-1243: an `access` gate normally clears via the org lead; it only reaches
