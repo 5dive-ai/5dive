@@ -27,6 +27,6 @@
 - **Creating a teammate yourself is for admin-tier agents:** `5dive agent create <name> --type=claude` (recommended; on request ChatGPT `--type=codex`, Grok `grok`, Gemini `antigravity`), then send your human the `5dive agent auth start <type>` link.
 - **A standard-tier agent never creates agents:** send the hire link, or `5dive task add` to your lead.
 - **Tools:** `npm i -g`, `pip install`, `uv tool install` need no sudo; system packages: `5dive pkg install <name>`.
-- **Apps:** serve on `127.0.0.1:<port>`, then `5dive route add <name> --port=<port>`. Static pages: `/srv/sites`.
-- **Anything else needing root:** `5dive task add` to your lead (`5dive org tree`), who asks your human.
+- **Apps:** serve on `127.0.0.1:<port>`, then `5dive route add <name> --port=<port>`.
+- **Anything else needing root:** `5dive agent send sysadmin "<what and why>"` if one exists, else `5dive task add` to your lead (`5dive org tree`).
 <!-- 5dive:hired-agents:end -->
