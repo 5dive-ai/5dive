@@ -22,10 +22,20 @@
 # The candidate file is validated with `caddy validate` before it replaces the
 # live one, and a failed reload restores the previous file.
 
+# Test seams. Under sudo (root, SUDO_UID set) they are ignored whatever the
+# environment carries, ROUTE_RELOAD_CMD (an eval) above all: env_reset strips
+# them today, and the root half must not depend on that staying true.
+_route_trust_env() {
+  [[ "${1:-$EUID}" == 0 && -n "${SUDO_UID:-}" ]] || return 0
+  ROUTE_CADDYFILE=/etc/caddy/Caddyfile ROUTE_PROVISIONING=/etc/5dive/provisioning.env
+  ROUTE_CADDY_BIN=caddy ROUTE_LOCK=/run/5dive-route.lock
+  unset ROUTE_RELOAD_CMD
+}
 ROUTE_CADDYFILE="${ROUTE_CADDYFILE:-/etc/caddy/Caddyfile}"
 ROUTE_PROVISIONING="${ROUTE_PROVISIONING:-/etc/5dive/provisioning.env}"
 ROUTE_CADDY_BIN="${ROUTE_CADDY_BIN:-caddy}"
 ROUTE_LOCK="${ROUTE_LOCK:-/run/5dive-route.lock}"
+_route_trust_env
 # Names the box itself serves or will serve. A subdomain block for one of these
 # would shadow (or be shadowed by) the box's own.
 ROUTE_RESERVED_SUBS=" shell secrets paperclip buzz relay www mail api admin dashboard "
@@ -201,6 +211,7 @@ cmd_route_delegated() {
 
 # _route_exec <add|rm> <name> <port> <caller uid> — runs as root.
 _route_exec() {
+  _route_trust_env
   local op="$1" name="$2" port="$3" uid="$4" by="" privileged=0
   [[ "$uid" =~ ^[0-9]+$ ]] || fail "$E_AUTH_REQUIRED" "route: no caller uid"
   if [[ "$uid" == 0 ]]; then

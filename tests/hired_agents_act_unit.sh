@@ -183,6 +183,17 @@ esac
 exit 0
 EOF
 chmod +x "$TMP/apt-get"; export PKG_APT_GET="$TMP/apt-get"
+# apt-cache stub: `pkgnames -- <prefix>` over a fixed list, prefix-matched like
+# the real one; missingpkg exists only once the lists are updated.
+cat >"$TMP/apt-cache" <<EOF
+#!/usr/bin/env bash
+[[ "\$1" == pkgnames && "\$2" == -- ]] || exit 100
+names="jq jqp g++ conflicting x11-apps x11-utils openssh-server"
+[[ -f "$TMP/updated" ]] && names="\$names missingpkg"
+for n in \$names; do [[ "\$n" == "\$3"* ]] && echo "\$n"; done
+exit 0
+EOF
+chmod +x "$TMP/apt-cache"; export PKG_APT_CACHE="$TMP/apt-cache"
 pr(){ local uid="$1"; shift; : >"$APT_LOG"
   ( ok(){ cli_ok "$@"; }; export SUDO_UID="$uid"; printf '%s\0' "$@" | cmd_pkg_delegated ) >"$TMP/out" 2>&1; }
 pr 1042 json install jq; rc=$?
@@ -203,6 +214,33 @@ pkgneg 'flag-shaped name'   1042 json install --reinstall
 pkgneg 'path-shaped name'   1042 json install ./x.deb
 pkgneg 'no package'         1042 json install
 pkgneg 'bad output mode'    1042 yaml install jq
+# apt-get reads a name with no exact match as a REGEX: 'x11-.+' would install
+# every x11-* package (708 on a real box). Only an exact package name reaches it.
+nonexact(){ local label="$1"; shift; pr 1042 json install "$@"; local r=$?
+  [[ $r != 0 ]] && ! grep -q '^install ' "$APT_LOG" && grep -q 'no package is named exactly' "$TMP/out" \
+    && ok "pkg refused, no install ran: $label" || bad "pkg non-exact: $label (rc=$r; $(cat "$TMP/out"))"
+  rm -f "$TMP/updated"; }
+nonexact "regex 'x11-.+'"            'x11-.+'
+nonexact "regex 'o.+'"               'o.+'
+nonexact "a prefix of a real package" 'openssh'
+nonexact "regex 'jq.'"              'jq.'
+nonexact 'one regex among exact names' jq 'x11-.+'
+grep -q 'AUDIT _pkg_do install refused' "$TMP/audit" && ok 'a non-exact name is audited as refused' || bad 'non-exact audited'
+pr 1042 json install g++; rc=$?
+[[ $rc == 0 ]] && grep -q -- '-- g++$' "$APT_LOG" && ok "an exact name with regex characters (g++) still installs" || bad "g++ ($(cat "$TMP/out"))"
+# The same refusal against the REAL apt-cache, where the box has one.
+if command -v apt-cache >/dev/null 2>&1; then
+  PKG_APT_CACHE=apt-cache; nonexact "regex 'x11-.+' (real apt-cache)" 'x11-.+'; PKG_APT_CACHE="$TMP/apt-cache"
+fi
+# Under sudo the root half ignores its test seams: env_reset strips them today,
+# and nothing here depends on that.
+v=$( export SUDO_UID=1042 PKG_APT_GET=/tmp/evil PKG_APT_CACHE=/tmp/evil; _pkg_trust_env 0; printf '%s %s' "$PKG_APT_GET" "$PKG_APT_CACHE" )
+[[ "$v" == 'apt-get apt-cache' ]] && ok 'root under sudo ignores PKG_APT_GET / PKG_APT_CACHE from the env' || bad "pkg seams under sudo ($v)"
+v=$( export SUDO_UID=1042 ROUTE_RELOAD_CMD='touch /tmp/pwn' ROUTE_CADDYFILE=/tmp/cf ROUTE_CADDY_BIN=/tmp/evil; _route_trust_env 0
+  printf '%s|%s|%s' "${ROUTE_RELOAD_CMD-unset}" "$ROUTE_CADDYFILE" "$ROUTE_CADDY_BIN" )
+[[ "$v" == 'unset|/etc/caddy/Caddyfile|caddy' ]] && ok 'root under sudo ignores ROUTE_RELOAD_CMD and the ROUTE_* paths' || bad "route seams under sudo ($v)"
+v=$( export SUDO_UID=1042 PKG_APT_GET=/x/apt-get; _pkg_trust_env 1007; printf '%s' "$PKG_APT_GET" )
+[[ "$v" == /x/apt-get ]] && ok 'a non-root run keeps the seams (the harness itself)' || bad "seams off root ($v)"
 
 # ── hire-link ────────────────────────────────────────────────────────────────
 _tg_app_api(){ printf 'https://api.example.com'; }

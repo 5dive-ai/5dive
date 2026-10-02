@@ -16,7 +16,16 @@
 # Root half: `_pkg_do`, one exact-path NOPASSWD line in every standard seat's
 # sudoers (render_standard_sudoers); the names travel NUL-separated on stdin.
 
+# Test seams. Under sudo (root, SUDO_UID set) they are ignored whatever the
+# environment carries: env_reset strips them today, and the root half must not
+# depend on that staying true.
+_pkg_trust_env() {
+  [[ "${1:-$EUID}" == 0 && -n "${SUDO_UID:-}" ]] || return 0
+  PKG_APT_GET=apt-get PKG_APT_CACHE=apt-cache
+}
 PKG_APT_GET="${PKG_APT_GET:-apt-get}"
+PKG_APT_CACHE="${PKG_APT_CACHE:-apt-cache}"
+_pkg_trust_env
 PKG_MAX=20
 
 # Debian package-name shape (policy 5.6.1), plus a leading-letter-or-digit rule
@@ -79,8 +88,21 @@ cmd_pkg_delegated() {
   _pkg_exec "${SUDO_UID:-0}" "${wire[@]:2}"
 }
 
+# _pkg_exact <name> — a package in the box's lists is named exactly <name>.
+# apt-get reads a name it cannot find exactly as a REGEX ('x11-.+' simulates 708
+# new packages), so only an exact name ever reaches it. pkgnames matches a
+# PREFIX, hence the whole-line grep; captured first so pipefail cannot see a
+# SIGPIPE from an early grep exit.
+_pkg_exact() {
+  local all; all=$("$PKG_APT_CACHE" pkgnames -- "$1" 2>/dev/null) || true
+  grep -qxF -- "$1" <<<"$all"
+}
+# _pkg_unknown <name>... — prints the names that are not exact packages.
+_pkg_unknown() { local n; for n in "$@"; do _pkg_exact "$n" || printf '%s ' "$n"; done; }
+
 # _pkg_exec <caller uid> <name>... — runs as root.
 _pkg_exec() {
+  _pkg_trust_env
   local uid="$1"; shift
   local by="root"
   if [[ "$uid" =~ ^[0-9]+$ && "$uid" != 0 ]]; then
@@ -93,11 +115,28 @@ _pkg_exec() {
   local -a env=(DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l)
   local -a opts=(-y -q --no-install-recommends --no-remove -o DPkg::Lock::Timeout=300
     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-  local out rc=0
-  out=$(env "${env[@]}" "$PKG_APT_GET" install "${opts[@]}" -- "$@" 2>&1) || rc=$?
-  if (( rc != 0 )) && grep -qE 'Unable to locate package|has no installation candidate' <<<"$out"; then
-    # Stale package lists on a box that has not updated lately: refresh once.
+  local out rc=0 updated=0 miss
+  # Every name must be an exact package BEFORE apt-get sees it. A miss may be a
+  # stale list on a box that has not updated lately: refresh once, then ask again.
+  miss=$(_pkg_unknown "$@")
+  if [[ -n "$miss" ]]; then
     env "${env[@]}" "$PKG_APT_GET" update -q -o DPkg::Lock::Timeout=300 >/dev/null 2>&1 || true
+    updated=1; miss=$(_pkg_unknown "$@")
+  fi
+  if [[ -n "$miss" ]]; then
+    audit_log "_pkg_do install" refused "$E_VALIDATION" -- "by=$by" "$@"
+    fail "$E_VALIDATION" "no package is named exactly: ${miss% } (check the spelling with apt-cache search; nothing was installed)"
+  fi
+  out=$(env "${env[@]}" "$PKG_APT_GET" install "${opts[@]}" -- "$@" 2>&1) || rc=$?
+  if (( rc != 0 && ! updated )) && grep -qE 'Unable to locate package|has no installation candidate' <<<"$out"; then
+    # The lists moved under us: refresh once, and hold the new lists to the
+    # same exact-name rule before the second install.
+    env "${env[@]}" "$PKG_APT_GET" update -q -o DPkg::Lock::Timeout=300 >/dev/null 2>&1 || true
+    miss=$(_pkg_unknown "$@")
+    if [[ -n "$miss" ]]; then
+      audit_log "_pkg_do install" refused "$E_VALIDATION" -- "by=$by" "$@"
+      fail "$E_VALIDATION" "no package is named exactly: ${miss% } (nothing was installed)"
+    fi
     rc=0; out=$(env "${env[@]}" "$PKG_APT_GET" install "${opts[@]}" -- "$@" 2>&1) || rc=$?
   fi
   if (( rc != 0 )); then
