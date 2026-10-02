@@ -2715,6 +2715,11 @@ cmd_task_need() {
       || fail "$E_VALIDATION" "invalid --secret-key '$secret_key' (env-var name: ^[A-Z][A-Z0-9_]{0,63}\$)"
     [[ "$connector" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
       || fail "$E_VALIDATION" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]{0,63}\$)"
+    # DIVE-5370: refuse at filing, not only at `secret write`, so the owner is
+    # never sent a link whose answer the box would then refuse.
+    if [[ "$connector" == tools ]] && _tools_var_reserved "$secret_key"; then
+      fail "$E_VALIDATION" "--secret-key=$secret_key is reserved for --connector=tools: every agent loads tools.sh, so it would override $secret_key for every seat on the box. Name the tool's own variable (e.g. ELEVENLABS_API_KEY)"
+    fi
   fi
   # DIVE-4416: --options=A|B was the shape the usage string taught for years, and
   # filers copied the placeholder rather than writing the choice. A letter records

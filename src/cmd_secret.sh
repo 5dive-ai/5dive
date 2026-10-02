@@ -101,6 +101,10 @@ _secret_write() {
   [[ -n "$connector" ]] || fail "$E_USAGE" "--connector=<name> is required"
   _valid_env_key "$key"       || fail "$E_USAGE" "invalid KEY '$key' (env-var name: ^[A-Z_][A-Z0-9_]*\$)"
   _valid_connector "$connector" || fail "$E_USAGE" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]*\$)"
+  # Before stdin is read: a refused name never asks for its value.
+  if [[ "$connector" == tools ]] && _tools_var_reserved "$key"; then
+    fail "$E_VALIDATION" "$key is reserved: every agent loads tools.sh, so it would override $key for every seat on the box. Use the tool's own variable name (e.g. ELEVENLABS_API_KEY). Nothing was saved"
+  fi
 
   # Value on stdin ONLY, never argv. DIVE-5319: at a terminal (nothing piped) it
   # asks with hidden input, the fallback for a box no owner's browser can reach.

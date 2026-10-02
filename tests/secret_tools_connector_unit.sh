@@ -98,5 +98,26 @@ grep -q '_ping_conn" == tools' src/task/answer.sh \
   && ok_t "S6 the gate-cleared ping for a tools key says \$KEY is in the environment" \
   || bad_t "S6 answer.sh ping" "no tools branch in the secret-gate ping"
 
+# --- S7: a reserved name is refused for tools.sh, and the file does not move ----
+# tools.sh is every agent's BASH_ENV: `export PATH='<key>'` there leaves every
+# seat on the box unable to run a command, with no verb that undoes it. Each
+# refusal is graded on rc, reason AND an unchanged file (rc alone passes the
+# wrong refusal). Same value as S1, so only the NAME decides.
+before=$(cat "$F")
+for name in PATH LD_PRELOAD IFS HOME BASH_ENV PS4 LC_ALL ANTHROPIC_API_KEY OPENAI_API_KEY TELEGRAM_BOT_TOKEN OPENROUTER_API_KEY; do
+  out=$(put sk_el_FAKE_123456 "$name" --connector=tools); rc=$?
+  [[ $rc -eq 3 && "$out" == *"$name is reserved"* && "$(cat "$F")" == "$before" ]] \
+    && ok_t "S7 $name is refused for --connector=tools and tools.sh is unchanged" \
+    || bad_t "S7 must refuse $name" "rc=$rc out=$out"
+done
+[[ "$(BASH_ENV="$F" /bin/bash -c 'command -v git >/dev/null && printf ran')" == ran ]] \
+  && ok_t "S7 a fresh agent bash still finds its commands" || bad_t "S7 PATH broken" "$(cat "$F")"
+# The same names are fine in a plain connector: it is a 600 file nothing sources.
+out=$(put sk-FAKE-openai-02 OPENAI_API_KEY --connector=openai); rc=$?
+[[ $rc -eq 0 ]] && ok_t "S7 a reserved name still writes to a plain connector" || bad_t "S7 plain connector" "rc=$rc $out"
+
+# S8 (the gate cannot be FILED with a reserved name for tools) lives in
+# tests/secret_gate_delivery_path_unit.sh N8/P8, which already pays for a task DB.
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

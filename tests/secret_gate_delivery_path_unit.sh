@@ -45,6 +45,8 @@
 #   P6  drop-target gate still gets its ✅ Provided button
 #   P7  out-of-band gate still gets its ✅ Provided button
 #   T8  the no-path gate's alert text names the missing path and offers no tap
+#   N8  a --connector=tools gate for a reserved name (PATH, LD_PRELOAD) is refused
+#   P8  an ordinary tools key still files; the check is scoped to tools (DIVE-5370)
 # Isolation matches the sibling harnesses: source src/ libs, throwaway STATE_DIR —
 # the live shared tasks.db is NEVER touched.
 # Run: bash tests/secret_gate_delivery_path_unit.sh   (no root, no network)
@@ -329,6 +331,28 @@ got=$(cat "$PINGS")
 [[ "$got" == *"from where it was placed"* && "$got" != *"connectors/"* ]] \
   && ok_t "T10b an out-of-band gate's ping names no file it was never told" \
   || bad_t "T10b an out-of-band gate's ping names no file it was never told" "pings: $got"
+
+# --- N8/P8 (DIVE-5370): a tools gate cannot be FILED for a reserved name -------
+# --connector=tools writes the answer into tools.sh, every agent's BASH_ENV, so a
+# gate for PATH or LD_PRELOAD would leave every seat on the box unable to run a
+# command. `secret write` refuses it too (secret_tools_connector_unit S7); refusing
+# only there would send the owner a link whose answer the box then refuses.
+for k in PATH LD_PRELOAD; do
+  seed_task "DIVE-58${#k}"
+  out=$(cmd_task_need "DIVE-58${#k}" --type=secret --ask="the ElevenLabs key for voice notes" --secret-key="$k" --connector=tools 2>&1); rc=$?
+  [[ $rc -eq 3 && "$out" == *"--secret-key=$k is reserved"* && "$(field "DIVE-58${#k}" need_type)" == "∅" ]] \
+    && ok_t "N8 --secret-key=$k --connector=tools is refused at filing, no gate written" \
+    || bad_t "N8 --secret-key=$k --connector=tools is refused at filing, no gate written" "rc=$rc need_type=$(field "DIVE-58${#k}" need_type) out=$out"
+done
+seed_task DIVE-5801
+cmd_task_need DIVE-5801 --type=secret --ask="the ElevenLabs key for voice notes" --secret-key=ELEVENLABS_API_KEY --connector=tools >/dev/null 2>&1
+got="$(field DIVE-5801 need_type)|$(field DIVE-5801 secret_key)|$(field DIVE-5801 connector)"
+[[ "$got" == "secret|ELEVENLABS_API_KEY|tools" ]] \
+  && ok_t "P8 an ordinary key still files a tools gate" || bad_t "P8 an ordinary key still files a tools gate" "got: $got"
+seed_task DIVE-5802
+cmd_task_need DIVE-5802 --type=secret --ask="drop the deploy path" --secret-key=PATH --connector=github-bot >/dev/null 2>&1
+[[ "$(field DIVE-5802 need_type)" == secret ]] \
+  && ok_t "P8 the reserved-name check is scoped to --connector=tools" || bad_t "P8 the reserved-name check is scoped to --connector=tools" "need_type=$(field DIVE-5802 need_type)"
 
 printf '\nsecret-gate delivery-path unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1
