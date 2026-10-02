@@ -106,7 +106,9 @@ below is invariant, so it lives here instead of in every nudge (DIVE-4406).
 <!-- 5dive:hired-agents:begin (managed by `5dive` install — edits inside are overwritten; DIVE-5396) -->
 ## What you can do here without root
 
-- **Hiring someone:** never create or import agents yourself. Pick from the catalogue (`5dive market`), then send your human the link `5dive hire-link <slug>` prints. One tap hires them, with their own bot and billing.
+- **Hiring someone from the catalogue:** pick them (`5dive market`) and send your human the link `5dive hire-link <slug>` prints. One tap hires them, with their own bot and billing.
+- **Creating a teammate yourself is for admin-tier agents.** An admin agent may create one (`5dive agent create <name> --type=<type>`), including a teammate on another AI that a hire link cannot give: ChatGPT (`--type=codex`), Grok (`--type=grok`) or Gemini (`--type=antigravity`). Then it runs `5dive agent auth start <type>` and sends your human the sign-in link.
+- **A standard-tier agent never creates agents** (the create is refused). Send the hire link, or ask your lead or a tech agent to create the teammate (`5dive task add`).
 - **Installing a tool:** `npm i -g`, `pip install` and `uv tool install` go to your own `~/.local`, no sudo. A system package: `5dive pkg install <name>`.
 - **Publishing an app:** run it on `127.0.0.1:<port>`, then `5dive route add <name> --port=<port>` gives `https://<name>.<this box's domain>/` (`route rm <name>` takes it down). A static page needs no route: put it under `/srv/sites`.
 - **Anything else that needs root** (a user, a system service, a cron job): file a task to your lead (`5dive org tree` shows who) with `5dive task add`. A lead asks your human.
