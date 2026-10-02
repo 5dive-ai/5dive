@@ -1546,24 +1546,43 @@ _grader_spawn_session() {  # <seat> <ident>
 # So `blind` gets its own policy, and the choice is a named knob rather than a
 # buried branch:
 #
-#   FIVE_PACE_BLIND=soft   (default) — a blind account is held AT THE SOFT
-#                          FLOOR. It is never read as 0% (that is the 2026-09-09
-#                          bug this whole family of guards exists to prevent),
-#                          it never counts as headroom, and high/urgent work
-#                          still flows. Strictly tighter than today's no-floor
-#                          behaviour and strictly looser than a freeze.
+#   FIVE_PACE_BLIND=open   (default since DIVE-5364) — a blind account is not
+#                          held. It is still never read as 0% (the verdict says
+#                          "blind", and a remembered reading over a floor still
+#                          tightens it — DIVE-4586 below), but no reading is not
+#                          a reason to stop the team.
+#   FIVE_PACE_BLIND=soft   (the default until DIVE-5364) — a blind account is
+#                          held AT THE SOFT FLOOR: high/urgent work flows,
+#                          medium work and every recurring beat wait.
 #   FIVE_PACE_BLIND=refuse — the filing's literal reading: no meter, no
 #                          dispatch. Correct on a fleet whose meters are
 #                          reliable; it freezes chemmonitor and codex on this
 #                          one. Left available, not made the default.
 #
 # The alternative not taken is written on DIVE-4430's body, not only here.
+#
+# ── DIVE-5364: WHY THE DEFAULT IS NOW 95/95 AND A BLIND METER HOLDS NOTHING ──
+#
+# 2026-10-01, a 12-seat distribution team on a customer box: every recurring
+# slot from 07:00Z to 16:30Z was "NOT fired — pacing floor soft … blind meter,
+# policy=soft". The account's meter was blind BECAUSE the team was idle — the
+# only current reading comes from a seat active in the last 600s, so a team
+# waiting on its schedule has no reading exactly when the materializer asks —
+# and its remembered reading (63%) was under every floor. The team could not
+# wake itself for a day and the board showed nothing (last_skipped stayed `-`).
+# lodar, 2026-10-02: "pacing shouldnt be so aggressive … default 95%".
+#
+# So below 95% of the week everything runs; at 95% only urgent work runs, which
+# keeps the last 5% for incidents. The soft band is empty by default
+# (soft == hard). A blind meter returns open, and the remembered lower bound is
+# the only thing that can still tighten it. An owner who wants the old pacing
+# back sets `5dive config pace-week=60/90` and FIVE_PACE_BLIND=soft.
 # The built-in floors. What a band actually reads is `_PACE_FLOOR_*`, which
 # `_pace_floors_load` resolves from these, the box config and the env at READ
 # time (DIVE-4890, below); the initial values here are only what a caller sees
 # before the first load.
-_PACE_DEFAULT_7D_SOFT=60
-_PACE_DEFAULT_7D_HARD=90
+_PACE_DEFAULT_7D_SOFT=95
+_PACE_DEFAULT_7D_HARD=95
 _PACE_FLOOR_7D_SOFT="${FIVE_PACE_7D_SOFT:-$_PACE_DEFAULT_7D_SOFT}"
 _PACE_FLOOR_7D_HARD="${FIVE_PACE_7D_HARD:-$_PACE_DEFAULT_7D_HARD}"
 # The soft floor is a PACING rule, so it only binds while there is still a week
@@ -1571,7 +1590,28 @@ _PACE_FLOOR_7D_HARD="${FIVE_PACE_7D_HARD:-$_PACE_DEFAULT_7D_HARD}"
 # expires at the reset and holding it back buys nothing — only the hard floor
 # (which protects the window itself) stays armed.
 _PACE_RESET_DAYS="${FIVE_PACE_RESET_DAYS:-3}"
-_PACE_BLIND="${FIVE_PACE_BLIND:-soft}"
+_PACE_BLIND="${FIVE_PACE_BLIND:-open}"
+
+# `_pace_blind_rc` — the band a blind meter gets under `_PACE_BLIND`. One place,
+# because the floor has three ways to be blind (no account named, no reading,
+# an unparseable reading) and they must not answer differently. An unknown
+# policy word falls to the soft hold and the caller's verdict names it.
+_pace_blind_rc() {
+  case "$_PACE_BLIND" in
+    open)   return 0 ;;
+    refuse) return 1 ;;
+    *)      return 2 ;;
+  esac
+}
+# The verdict's tail for a blind meter, matching `_pace_blind_rc`.
+_pace_blind_what() {
+  case "$_PACE_BLIND" in
+    open)   printf 'not held (FIVE_PACE_BLIND=open)' ;;
+    refuse) printf 'no dispatch (FIVE_PACE_BLIND=refuse)' ;;
+    soft)   printf 'held at the soft floor, high/urgent only (FIVE_PACE_BLIND=soft)' ;;
+    *)      printf 'held at the soft floor — FIVE_PACE_BLIND=%s is not a policy I know (open|soft|refuse)' "$_PACE_BLIND" ;;
+  esac
+}
 
 # ── DIVE-4631: THE WEEK IS NOT THE ONLY WINDOW THE WORK HAS TO FIT IN ───────
 #
@@ -2106,6 +2146,9 @@ _pace_field() {  # <account> <field>  [<usage-json-on-stdin>]
 #   2  soft   — high|urgent only, no recurring template firing
 #   3  hard   — urgent only, no recurring template firing
 #   1  refuse — no dispatch at all (only reachable under FIVE_PACE_BLIND=refuse)
+#
+# Blind (no account, no reading, unparseable) answers `_pace_blind_rc`: open by
+# default since DIVE-5364, soft or refuse when the box opts in.
 _pace_band_7d() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   local acct="$1" now="${2:-$(date +%s)}" json seven="" resets="" days_left src="" pair=""
   local lb_pair="" lb_seven="" lb_resets=""
@@ -2122,10 +2165,10 @@ _pace_band_7d() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
     return 0
   fi
   if [[ -z "$acct" ]]; then
-    # No account named is not a measurement, and it must not read as headroom.
-    printf 'pace: no account named — holding at the soft floor rather than reading it as 0%%\n'
-    [[ "$_PACE_BLIND" == "refuse" ]] && return 1
-    return 2
+    # No account named is not a measurement, and it must not read as headroom:
+    # it is a blind meter and gets the blind policy, never a 0% reading.
+    printf 'pace: no account named — blind, never read as 0%%; %s\n' "$(_pace_blind_what)"
+    local _brc=0; _pace_blind_rc || _brc=$?; return "$_brc"
   fi
   json=$(cat)
   # DIVE-4578: the ACCOUNT's reading first, the per-seat document second. The
@@ -2164,8 +2207,11 @@ _pace_band_7d() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   #
   # THE BOUND IS ONLY EVER A TIGHTENING DEVICE, under every policy — so it is
   # measured against what the blind branch below would otherwise return.
-  # `FIVE_PACE_BLIND=soft` (the default) falls to the soft floor, so a bound may
-  # move it to hard (tighter) or leave it at soft (equal). `FIVE_PACE_BLIND=refuse`
+  # `FIVE_PACE_BLIND=open` (the default since DIVE-5364) falls to open, so a
+  # bound over a floor is the ONLY thing that holds a blind account — at the
+  # default 95/95, a remembered 95% or more is urgent-only. `FIVE_PACE_BLIND=soft`
+  # falls to the soft floor, so a bound may move it to hard (tighter) or leave it
+  # at soft (equal). `FIVE_PACE_BLIND=refuse`
   # already returns the tightest answer there is, so a bound could only ever
   # LOOSEN it — and that policy's contract is "no current meter, no dispatch",
   # which a lower bound does not satisfy. Under `refuse` the bound is therefore
@@ -2226,23 +2272,21 @@ _pace_band_7d() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
   fi
   if [[ -z "$seven" ]]; then
     if [[ -z "$json" ]]; then
-      printf 'pace: %s has no weekly reading — no account reading measured within %ss and %s returned nothing; blind meter, policy=%s (never 0%%)\n' \
-             "$acct" "$_GRADER_READING_MAX_AGE" "$_PACE_USAGE_CMD" "$_PACE_BLIND"
+      printf 'pace: %s has no weekly reading — no account reading measured within %ss and %s returned nothing; blind meter, policy=%s (never 0%%) — %s\n' \
+             "$acct" "$_GRADER_READING_MAX_AGE" "$_PACE_USAGE_CMD" "$_PACE_BLIND" "$(_pace_blind_what)"
     else
-      printf 'pace: %s has no weekly reading (null) — no account reading measured within %ss and no seat of the account carries one; blind meter, policy=%s\n' \
-             "$acct" "$_GRADER_READING_MAX_AGE" "$_PACE_BLIND"
+      printf 'pace: %s has no weekly reading (null) — no account reading measured within %ss and no seat of the account carries one; blind meter, policy=%s — %s\n' \
+             "$acct" "$_GRADER_READING_MAX_AGE" "$_PACE_BLIND" "$(_pace_blind_what)"
     fi
-    [[ "$_PACE_BLIND" == "refuse" ]] && return 1
-    return 2
+    local _brc=0; _pace_blind_rc || _brc=$?; return "$_brc"
   fi
   # Percentages arrive as floats (56.99999999999999); truncate to an integer
   # rather than hand bash a decimal point, which is a syntax error and aborts
   # under errexit.
   seven="${seven%%.*}"
   if ! [[ "$seven" =~ ^[0-9]+$ ]]; then
-    printf 'pace: %s weekly meter is unparseable (7d=%s) — holding at the soft floor\n' "$acct" "$seven"
-    [[ "$_PACE_BLIND" == "refuse" ]] && return 1
-    return 2
+    printf 'pace: %s weekly meter is unparseable (7d=%s) — blind, never read as 0%%; %s\n' "$acct" "$seven" "$(_pace_blind_what)"
+    local _brc=0; _pace_blind_rc || _brc=$?; return "$_brc"
   fi
   if (( seven >= _PACE_FLOOR_7D_HARD )); then
     printf 'pace: %s is at %s%% of its week (hard floor %s%%, from the %s reading) — urgent only\n' \

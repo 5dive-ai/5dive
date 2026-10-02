@@ -682,13 +682,14 @@ _pace_week_off = _pace_week == "off"
 try:
     _pace_soft, _pace_hard = (int(x) for x in _pace_week.split("/", 1))
 except ValueError:
-    _pace_soft = int(os.environ.get("FIVE_PACE_7D_SOFT") or 60)
-    _pace_hard = int(os.environ.get("FIVE_PACE_7D_HARD") or 90)
+    _pace_soft = int(os.environ.get("FIVE_PACE_7D_SOFT") or 95)
+    _pace_hard = int(os.environ.get("FIVE_PACE_7D_HARD") or 95)
 _pace_reset_days = int(os.environ.get("FIVE_PACE_RESET_DAYS") or 3)
 # DIVE-4629: read here for the same reason the floors above are — the surface
 # and the dispatcher must answer with the same policy.
 _pace_unmetered = os.environ.get("FIVE_PACE_UNMETERED") or "open"
-_pace_blind = os.environ.get("FIVE_PACE_BLIND") or "soft"
+# DIVE-5364: `open` is the floor's default too — a blind meter holds nothing.
+_pace_blind = os.environ.get("FIVE_PACE_BLIND") or "open"
 # {"<account>": true} for accounts whose provider can never publish a weekly
 # window, written by the FLOOR'S OWN classifier (see _digest_account_unmetered).
 # Loaded here, inside the block, and only when the name is not already bound:
@@ -803,9 +804,18 @@ for e in sorted(_pace_by_acct.values(), key=lambda x: x["account"]):
         why = ("this provider publishes no weekly usage window at all, so the floor can never "
                "measure this account — not a reading of 0%, a meter with no jurisdiction here"
                + ("" if band == "open" else f"; FIVE_PACE_UNMETERED={_pace_unmetered} rations it anyway"))
+    elif pct is None and _pace_blind == "open":
+        # DIVE-5364: the floor returns open for a blind meter under the default
+        # policy, so the surface must not render a hold the tick does not apply
+        # (the 2026-10-01 "Pacing floor BLIND" line named a hold on an idle
+        # team). The bound the floor still consults is not rendered here; this
+        # surface never carried it.
+        band, why = "open", ("no weekly reading from the account and none from any of its seats "
+                             "— not held (FIVE_PACE_BLIND=open), never read as 0%")
     elif pct is None:
         band, why = "blind", ("no weekly reading from the account and none from any of its seats "
-                              "— held at the soft floor, never read as 0%")
+                              + ("— no dispatch (FIVE_PACE_BLIND=refuse)" if _pace_blind == "refuse"
+                                 else "— held at the soft floor, never read as 0%"))
     elif pct >= _pace_hard:
         band, why = "hard", f"{int(pct)}% of the week used (hard floor {_pace_hard}%) — urgent only"
     elif pct < _pace_soft:
