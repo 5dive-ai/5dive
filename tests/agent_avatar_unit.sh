@@ -273,6 +273,7 @@ oa_backfill() { # <provisioning.env> -> the backfill's output, down the root bra
       if [[ "$u" == https://pale-plain.5dive.com/openagent/*.png && -f "$TMP/site/openagent/${u##*/}" ]]; then
         command cp "$TMP/site/openagent/${u##*/}" "$o"; return 0
       fi
+      [[ -e "$TMP/site-big" && "$u" == */able.png ]] && return 63 # able's portrait is over --max-filesize
       [[ -e "$TMP/site-404" ]] && return 22 # a box whose site 404s an unknown path
       printf '<!doctype html><title>5dive</title>' >"$o"
     }
@@ -308,6 +309,14 @@ rm -f "$TMP/state/avatar-backfill.v2.done"; : >"$TMP/site-404"
 BF5=$(oa_backfill "$TMP/provisioning.env"); rm -f "$TMP/site-404"
 grep -q '/openagent/able.png$' "$CURL_LOG" && cmp -s "$TMP/site/openagent/ceo.png" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" \
   && [[ "$BF5" != *able* ]] && okk "a 404 for one agent does not stop the next agent's fetch" || bad "404 arm: $BF5 curl=[$(tr '\n' ';' <"$CURL_LOG")]"
+# An over-cap portrait is the site answering, not the site down: the earlier
+# agent (able) is reported, and the later one (ceo) still gets its portrait.
+rm -f "$TMP/state/avatar-backfill.v2.done" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png"; : >"$TMP/site-big"
+BF6=$(oa_backfill "$TMP/provisioning.env"); rm -f "$TMP/site-big"
+grep -q '/openagent/able.png$' "$CURL_LOG" && grep -q '/openagent/ceo.png$' "$CURL_LOG" \
+  && cmp -s "$TMP/site/openagent/ceo.png" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" \
+  && [[ "$BF6" == *"WARN: could not set 'able'"*"over the cap"* && "$BF6" == *"1 set, 1 unresolved"* ]] \
+  && okk "a portrait over the cap is reported unresolved and does not stop the next agent" || bad "63 arm: $BF6 curl=[$(tr '\n' ';' <"$CURL_LOG")]"
 printf 'FIVE_DOMAIN="evil.test/x?"\n' >"$TMP/bad.env"
 AGENT_AVATAR_PROVISIONING="$TMP/bad.env" _agent_avatar_openagent_url ceo >/dev/null \
   && bad 'a malformed FIVE_DOMAIN made a URL' || okk 'a malformed FIVE_DOMAIN makes no URL'
