@@ -358,6 +358,7 @@ CSS = ("body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;
        "main{max-width:30rem;margin:0 auto;padding:2rem 1rem}h1{font-size:1.25rem;margin:0 0 .75rem}"
        "p{margin:.5rem 0}.ask{background:#fff;border:1px solid #ddd;border-radius:8px;padding:.75rem;white-space:pre-wrap}"
        "input{width:100%;box-sizing:border-box;font:inherit;padding:.7rem;border:1px solid #bbb;border-radius:8px;margin:.75rem 0}"
+       ".secret{-webkit-text-security:disc}"
        "button{width:100%;font:inherit;font-weight:600;padding:.75rem;border:0;border-radius:8px;background:#1b1b1a;color:#fff}"
        "small{color:#666}code{font-size:.9em}"
        "@media (prefers-color-scheme:dark){body{background:#151514;color:#eee}.ask{background:#1f1f1e;border-color:#333}"
@@ -428,7 +429,10 @@ class Handler(BaseHTTPRequestHandler):
         body = ("<h1>%s needs %s</h1>" % (who, html.escape(d["key"])) +
                 ("<p class=ask>%s</p>" % html.escape(ask) if ask else "") +
                 "<form method=post autocomplete=off>"
-                "<input type=password name=value autocomplete=off autocapitalize=off spellcheck=false "
+                # A plain text field masked by CSS, not type=password: browsers offer to save
+                # every password field, and this value is not the owner's login (lodar 10-02).
+                "<input type=text name=value class=secret autocomplete=off autocapitalize=off "
+                "autocorrect=off spellcheck=false data-1p-ignore data-lpignore=true data-bwignore "
                 "required autofocus aria-label='Paste the value'>"
                 "<button type=submit>Save on the server</button></form>"
                 "<p><small>This page is served by your own server. The value goes only there, "
