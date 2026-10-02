@@ -380,6 +380,11 @@ Owner asks (a browser step only the owner may allow, answered on Telegram):
 Sysadmin seat (partner boxes only): 5dive sysadmin comes from the partner plugin
   (5dive-ai/5dive-partner), which the partner box profile installs.
 
+Hire, publish, install (any agent, no sudo — DIVE-5396):
+  5dive hire-link <slug> [--json]                    # the one-tap hire link to send your human (never create agents yourself)
+  5dive route add <name>|/<name> --port=<port>       # publish an app you run on 127.0.0.1:<port>; route rm|ls
+  5dive pkg install <package>...                     # a system package from the box's apt repositories (install only)
+
 Telegram app (open 5dive inside Telegram from your agent's bot):
   5dive telegram-app link --telegram-id=<id> [--json]   # one-time Mini App link for this box's owner (the bot's /app runs it)
 
@@ -1112,6 +1117,18 @@ main() {
       # the exec case, which this deliberately is not). Never advertised.
       cmd_task_answer_delegated
       exit $? ;;
+    _route_do)
+      # DIVE-5396: hidden, privileged route writer for any seat. Reachable ONLY
+      # via the exact-path NOPASSWD line render_standard_sudoers writes; the
+      # operation travels on stdin, the caller is derived from SUDO_UID, and the
+      # root side audits it (src/cmd_route.sh). Never advertised.
+      cmd_route_delegated "$@"
+      exit $? ;;
+    _pkg_do)
+      # DIVE-5396: hidden, privileged apt INSTALL for any seat (names on stdin,
+      # no flags, --no-remove; src/cmd_pkg.sh). Audited root-side. Never advertised.
+      cmd_pkg_delegated "$@"
+      exit $? ;;
     _self_account)
       # DIVE-5367: hidden, privileged, self-scoped account rail for a standard
       # seat. Reachable ONLY via the exact-path NOPASSWD line render_standard_sudoers
@@ -1375,6 +1392,21 @@ main() {
       # STDIN, so auditing argv here never captures the secret.
       AUDIT_CMD="secret"; AUDIT_ARGS=("$@")
       cmd_secret "$@" ;;
+    hire-link)
+      # DIVE-5396: the one-tap hire link a lead sends its owner instead of
+      # creating agents. Read-shaped (no registry, no lock, nothing written).
+      AUDIT_CMD="hire-link"; AUDIT_ARGS=()
+      cmd_hire_link "$@" ;;
+    route)
+      # DIVE-5396: publish an agent's app on the box's domain (one managed
+      # reverse-proxy block; a non-root seat crosses _route_do).
+      case "${1:-}" in add|rm|remove) AUDIT_CMD="route ${1}"; AUDIT_ARGS=("${@:2}") ;; esac
+      cmd_route "$@" ;;
+    pkg)
+      # DIVE-5396: install a system package from the box's apt repositories
+      # (a non-root seat crosses _pkg_do). Install only.
+      case "${1:-}" in install) AUDIT_CMD="pkg install"; AUDIT_ARGS=("${@:2}") ;; esac
+      cmd_pkg "$@" ;;
     tool|tools)
       # DIVE-5366: keys for the tools agents use (GitHub, Vercel, Stripe, ...),
       # pasted in the Mini App. Values arrive on STDIN, so argv is safe to audit.

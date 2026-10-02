@@ -195,6 +195,9 @@ LAZY_FILES=(
   src/cmd_secret.sh
   src/cmd_secret_drop.sh
   src/cmd_tool.sh
+  src/cmd_hire_link.sh
+  src/cmd_route.sh
+  src/cmd_pkg.sh
   src/cmd_selfupdate.sh
 )
 

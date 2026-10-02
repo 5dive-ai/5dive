@@ -591,6 +591,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _task_channel"*|\
         "/usr/local/bin/5dive _self_account"*|\
         "/usr/local/bin/5dive _merge_do"*|\
+        "/usr/local/bin/5dive _route_do"|"/usr/local/bin/5dive _pkg_do"|\
         "/usr/local/bin/5dive sysadmin _broker"|"/usr/local/bin/5dive --json sysadmin _broker") has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
@@ -761,6 +762,15 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _self_account
 # sign in a COMMENT is executed and its output lands in the sudoers file. Keep
 # this block free of both.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _merge_do
+# DIVE-5396: every hired agent can publish its own app and install a system
+# package, without holding root. EXACT paths, NO args, NO wildcard: the
+# operation travels on stdin and the caller is derived from SUDO_UID. The route
+# writer adds or removes only its own fenced reverse-proxy blocks, refuses the
+# box's own names and ports, and publishes only a port this seat listens on.
+# The package verb runs apt INSTALL only, names only, with no-remove, from the
+# box's configured repositories. Both audit root-side.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _route_do
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _pkg_do
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
     cat <<SUDOERS

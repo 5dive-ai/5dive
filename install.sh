@@ -1110,6 +1110,17 @@ JOURNALD
 # 5dive tool keys (DIVE-5366/DIVE-5373): every agent's BASH_ENV. Silent when
 # this seat cannot read the keys.
 if [ -r /etc/5dive/connectors/tools.sh ]; then . /etc/5dive/connectors/tools.sh; fi
+# DIVE-5396: a seat installs its own tools with no sudo. npm -g, pip and uv tool
+# go to ~/.local (bins in ~/.local/bin). npm's default prefix is root-owned /usr,
+# and Ubuntu marks the system python externally managed, which refuses even
+# --user installs; a seat's own ~/.local cannot break the system's packages.
+if [ "$(id -u)" != 0 ] && [ -n "${HOME:-}" ]; then
+  case ":${PATH:-}:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:${PATH:-/usr/bin:/bin}"; export PATH ;; esac
+  if [ -z "${NPM_CONFIG_PREFIX:-}${npm_config_prefix:-}" ] && [ ! -s "$HOME/.nvm/nvm.sh" ]; then
+    NPM_CONFIG_PREFIX="$HOME/.local"; export NPM_CONFIG_PREFIX
+  fi
+  PIP_BREAK_SYSTEM_PACKAGES=1; export PIP_BREAK_SYSTEM_PACKAGES
+fi
 TOOLENV
   chmod 644 "$_te_tmp"
   mv -f "$_te_tmp" "$LIB_DIR/tool-env.sh"
@@ -1630,6 +1641,9 @@ sync_managed_block() {
   install -d -m 755 -o claude -g claude /home/claude/projects
   if [[ ! -f /home/claude/projects/CLAUDE.md ]]; then
     curl -fsSL "$REPO/projects-CLAUDE.md" -o /home/claude/projects/CLAUDE.md
+    # DIVE-5396: the hired-agents block is for boxes 5dive built (see below).
+    [[ -f /etc/5dive/provisioning.env ]] \
+      || sed -i '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/d' /home/claude/projects/CLAUDE.md
     chown claude:claude /home/claude/projects/CLAUDE.md
     chmod 644 /home/claude/projects/CLAUDE.md
     ok "projects/CLAUDE.md"
@@ -1647,6 +1661,16 @@ sync_managed_block() {
   sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:task-lifecycle \
     && ok "projects/CLAUDE.md (task-lifecycle block synced)" \
     || echo "warn: could not sync the task-lifecycle block into projects/CLAUDE.md — the heartbeat dispatch cites it" >&2
+  # DIVE-5396: what a hired agent can do without root (hire by link, install a
+  # tool, publish an app, ask its lead). Only on a box 5dive built: hire-link
+  # needs the box's 5dive account, and a self-hosted host keeps its own rules.
+  # Synced by the CLI that ships the verbs, so the text never names a verb the
+  # box does not have.
+  if [[ -f /etc/5dive/provisioning.env ]]; then
+    sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:hired-agents \
+      && ok "projects/CLAUDE.md (hired-agents block synced)" \
+      || echo "warn: could not sync the hired-agents block into projects/CLAUDE.md" >&2
+  fi
   if [[ ! -e /home/claude/projects/AGENTS.md ]]; then
     ln -sfn CLAUDE.md /home/claude/projects/AGENTS.md
     chown -h claude:claude /home/claude/projects/AGENTS.md
