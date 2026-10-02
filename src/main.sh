@@ -875,7 +875,8 @@ _agent_verb_dispatch() {
           cmd_install "$@" ;;   # no registry mutation; auditable install recipe
         set-account)
           AUDIT_CMD="agent set-account"; AUDIT_ARGS=("$@")
-          with_registry_lock cmd_agent_set_account "$@" ;;
+          # DIVE-5367: a standard seat switching ITSELF crosses its own grant.
+          agent_set_account_dispatch "$@" ;;
         rotation)
           [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent rotation get|set|rotate|cooldown|clear-cooldown <agent> [...]"
           local rotcmd="$1"; shift
@@ -1110,6 +1111,15 @@ main() {
       # outer EXIT trap still fires and attribution survives (DIVE-2797 is about
       # the exec case, which this deliberately is not). Never advertised.
       cmd_task_answer_delegated
+      exit $? ;;
+    _self_account)
+      # DIVE-5367: hidden, privileged, self-scoped account rail for a standard
+      # seat. Reachable ONLY via the exact-path NOPASSWD line render_standard_sudoers
+      # writes; the operation travels on stdin, the seat is derived from SUDO_UID
+      # (src/cmd_account.sh). Not audited HERE: the parent verb is audited and
+      # reaches this through a pipe, so its EXIT trap still fires (the _task_answer
+      # reason). Never advertised.
+      cmd_self_account_delegated "$@"
       exit $? ;;
     _task_channel)
       # DIVE-4609: hidden, privileged Telegram human-action bridge. Standard

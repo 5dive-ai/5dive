@@ -678,6 +678,8 @@ cmd_account_usage() {
   fi
   ensure_state
   [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account usage [--history [--7d] [--account=<name>]]"
+  # DIVE-5367: a standard seat reads the board over its own exact-path grant.
+  _self_account_eligible && _self_account_cross usage
   require_root
   local rows; rows=$(account_usage_rows)
   # Publish for the unprivileged health surfaces (liveness, supervisor,
@@ -1595,4 +1597,95 @@ cmd_account_set_active_provider() {
   ok "active provider set to '$provider' on profile '$profile'" \
      '{profile:$p, type:$t, provider:$pr}' \
      --arg p "$profile" --arg t "$type" --arg pr "$provider"
+}
+
+# ---------------------------------------------------------------------------
+# DIVE-5367: a standard seat's OWN account verbs, without the root CLI.
+#
+# lodar, 2026-10-02: on a standard-isolation seat (every seat after a box's
+# first) the Telegram /account picker was read-only and /usage said "not
+# available", because `agent set-account` and `account usage` are root and the
+# seat's grant holds neither. This is the one narrow rail that gives the owner
+# both back, on the _task_channel template (DIVE-4609):
+#
+#   * ONE sudoers line, exact path, NO args, NO wildcard
+#     (render_standard_sudoers). The operation travels NUL-separated on stdin,
+#     so no global flag in front of the verb can fall outside the grant.
+#   * The seat is derived from SUDO_UID, never from the caller. There is no
+#     target argument to pass, so this cannot switch or read ANOTHER seat.
+#   * Two operations: `usage` (the every-account 5h/1w board, a read) and
+#     `set <account|default>` (bind THIS seat to an account the box already
+#     holds). Nothing that adds, signs in, renames or removes an account, and
+#     nothing box-wide.
+#
+# Caller half: the ordinary verbs (`account usage`, `agent set-account <self>`)
+# cross this rail on their own when the caller is a non-root seat that holds the
+# grant, so the plugin and a human at the seat's shell use the same commands.
+# A seat without the grant is left on today's path byte for byte: a probe miss
+# is "this path does not exist here", not a refusal (the DIVE-4609 lesson).
+_self_account_eligible() {
+  _gate_is_root && return 1
+  [[ -z "${SELF_ACCOUNT_DELEGATED:-}" ]] || return 1
+  sudo -n -l /usr/local/bin/5dive _self_account >/dev/null 2>&1
+}
+
+# _self_account_cross <op> [arg] — run the operation on the root side and exit
+# with its status. Its stdout/stderr ARE the answer (the executor reports, in the
+# caller's own output mode), so this only marks the exit reported.
+_self_account_cross() {
+  local mode=text rc=0
+  (( ${JSON_MODE:-0} )) && mode=json
+  printf '%s\0' "$mode" "$@" | sudo -n /usr/local/bin/5dive _self_account || rc=$?
+  (( rc == 0 )) || mark_reported
+  exit "$rc"
+}
+
+# `agent set-account <agent> <account>`. A non-root seat naming ITSELF crosses
+# its own grant (the seat is re-derived root-side from SUDO_UID, so the name
+# here only picks the path). Any other target, and every root or admin caller,
+# stays on the root path, where a standard seat is refused.
+agent_set_account_dispatch() {
+  if [[ $# -eq 2 && -n "$1" ]] && [[ "$1" == "$(_gate_uid_to_agent "$(_gate_caller_uid)")" ]] \
+     && _self_account_eligible; then
+    _self_account_cross set "$2"
+  fi
+  with_registry_lock cmd_agent_set_account "$@"
+}
+
+# Root half. Reached ONLY through the exact-path NOPASSWD grant (or by root).
+cmd_self_account_delegated() {
+  _gate_is_root || fail "$E_PERMISSION" "_self_account is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "_self_account takes no arguments (the operation is read from stdin, the seat from the sudo caller)."
+
+  local -a wire=(); local a
+  while IFS= read -r -d '' a; do wire+=("$a"); done
+  (( ${#wire[@]} >= 2 )) || fail "$E_VALIDATION" "_self_account requires an output mode and an operation on stdin."
+  case "${wire[0]}" in
+    json) JSON_MODE=1 ;;
+    text) JSON_MODE=0 ;;
+    *)    fail "$E_VALIDATION" "_self_account output mode must be json or text." ;;
+  esac
+
+  local ruid="${SUDO_UID:-}" seat=""
+  [[ "$ruid" =~ ^[0-9]+$ && "$ruid" != 0 ]] \
+    || fail "$E_AUTH_REQUIRED" "_self_account requires sudo from an agent seat."
+  seat=$(_gate_uid_to_agent "$ruid")
+  [[ -n "$seat" ]] || fail "$E_AUTH_REQUIRED" "_self_account caller uid ${ruid} is not an agent seat."
+
+  SELF_ACCOUNT_DELEGATED=1
+  case "${wire[1]}" in
+    usage)
+      (( ${#wire[@]} == 2 )) || fail "$E_VALIDATION" "_self_account usage takes no arguments."
+      cmd_account_usage ;;
+    set)
+      (( ${#wire[@]} == 3 )) || fail "$E_VALIDATION" "_self_account set takes exactly one account name."
+      local account="${wire[2]}"
+      # The account name is the only caller-chosen value. cmd_config checks it
+      # again and refuses one the box does not hold; this is the cheap shape check.
+      [[ "$account" == "default" ]] || valid_profile_name "$account" \
+        || fail "$E_VALIDATION" "_self_account set: invalid account name."
+      with_registry_lock cmd_agent_set_account "$seat" "$account" ;;
+    *)
+      fail "$E_VALIDATION" "_self_account allows only usage or set." ;;
+  esac
 }
