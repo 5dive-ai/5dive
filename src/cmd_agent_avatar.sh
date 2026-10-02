@@ -10,7 +10,8 @@
 # always a real image under the size cap:
 #   agent avatar set <agent> <png|url>   the openagent skill, once the portrait is final
 #   agent cos set-avatar                 the Telegram bot photo writes the same file
-#   agent avatar backfill [--once]       one pass over *.persona.yaml face.ref
+#   agent avatar backfill [--once]       one pass over *.persona.yaml face.ref,
+#                                        then the box's own /openagent/<agent>.png
 # and ONE reader: `agent list --json` reports `avatar: {path,bytes,mtime}` (the
 # snapshot python in cmd_agent.sh), and the dashboard then asks for the bytes
 # with `agent avatar get <agent> --data --json` over the exec tunnel.
@@ -19,6 +20,13 @@
 # every consumer — the browser, Telegram's setMyProfilePhoto — sniffs the bytes.
 
 AGENT_AVATAR_MAX_BYTES="${AGENT_AVATAR_MAX_BYTES:-2097152}"
+# Where the box's public domain is recorded (FIVE_DOMAIN). Root always reads the
+# one fixed file, so no caller can point root at another. The variable is honoured
+# only for a non-root caller (the harness); the harness stubs this for root.
+_agent_avatar_provisioning() {
+  if _agent_avatar_is_root; then printf '/etc/5dive/provisioning.env\n'
+  else printf '%s\n' "${AGENT_AVATAR_PROVISIONING:-/etc/5dive/provisioning.env}"; fi
+}
 
 _agent_avatar_path() { # <name>
   printf '%s/agent-%s/.claude/avatar.png\n' "${AGENT_HOME_ROOT:-/home}" "$1"
@@ -169,6 +177,20 @@ _agent_avatar_resolve_ref() { # <agent> <yaml> <ref>
   printf '%s\n' "$real"
 }
 
+# DIVE-5413 (lodar 10-02, of a CEO agent: "generated [his openagent avatar] in
+# june ... and also online at <box>.5dive.com/openagent/<agent>.png"):
+# before DIVE-5104 an OpenAgent portrait was hosted on the box's own site, as the
+# openagent skill said to, and no persona under the agent's home names it. The
+# public URL is the one place every such box agrees on, wherever the file sits on
+# disk, so the backfill asks for it. Echoes the URL, or fails with no domain.
+_agent_avatar_openagent_url() { # <agent>
+  local d="" pfile; pfile=$(_agent_avatar_provisioning)
+  [[ -r "$pfile" ]] && d=$(sed -n 's/^FIVE_DOMAIN=//p' "$pfile" | tail -1)
+  d="${d%\"}"; d="${d#\"}"
+  [[ "$d" =~ ^[a-z0-9_]([a-z0-9_.-]*[a-z0-9])?$ && "$d" == *.* ]] || return 1
+  printf 'https://%s/openagent/%s.png\n' "$d" "$1"
+}
+
 cmd_agent_avatar() {
   local sub="${1:-}"; shift || true
   case "$sub" in
@@ -242,9 +264,12 @@ _agent_avatar_get() {
 }
 
 # One pass: every registered agent WITHOUT an avatar whose home holds a persona
-# yaml with a resolvable face.ref gets that portrait. Never overwrites a portrait
-# that is already there, so it is safe to re-run; `--once` makes `5dive update`
-# run it a single time per box.
+# yaml with a resolvable face.ref gets that portrait; failing that, the portrait
+# its box serves at /openagent/<agent>.png (DIVE-5413). Never overwrites a
+# portrait that is already there, so it is safe to re-run; `--once` makes
+# `5dive update` run it a single time per box (a pass that could not reach the
+# box's own site stays unmarked, so the next update retries). The marker is v2
+# so a box that ran the persona-only pass once runs this one too.
 _agent_avatar_backfill() {
   local once=0 dry=0 a
   for a in "$@"; do
@@ -254,7 +279,7 @@ _agent_avatar_backfill() {
       *) fail "$E_USAGE" "usage: 5dive agent avatar backfill [--once] [--dry-run]" ;;
     esac
   done
-  local marker="$STATE_DIR/avatar-backfill.v1.done"
+  local marker="$STATE_DIR/avatar-backfill.v2.done"
   if (( once )) && [[ -e "$marker" ]]; then
     ok "avatar backfill already ran on this box" '{skipped:"already-ran", set:[], missing:[]}'
     return 0
@@ -262,7 +287,8 @@ _agent_avatar_backfill() {
   _agent_avatar_is_root || (( dry )) || fail "$E_GENERIC" "avatar backfill writes into every agent's home: run with sudo"
   ensure_state_ro
   local names; names=$(registry_read | jq -r '.agents | keys[]')
-  local set_list=() missing=() name home dst yaml ref src tmp why ytmp personas
+  local set_list=() missing=() name home dst yaml ref src tmp why ytmp personas got="" oa_down=0 rc
+  local unchecked=()
   ytmp=$(mktemp) || fail "$E_GENERIC" "mktemp failed"
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
@@ -288,21 +314,55 @@ _agent_avatar_backfill() {
       src=$(_agent_avatar_resolve_ref "$name" "$yaml" "$ref") && break
       src=""
     done <<<"$personas"
-    [[ -n "$src" ]] || continue
-    if (( dry )); then set_list+=("$name"); step "would set '$name' from $src"; continue; fi
-    tmp=$(mktemp)
-    if _agent_avatar_fetch "$src" "$tmp" "$name" && why=$(_agent_avatar_install "$name" "$tmp"); then
+    if [[ -z "$src" ]]; then
+      # The box's own OpenAgent page. Most agents have none, and a box whose site
+      # answers every path with its app returns HTML: only an image counts, and
+      # a miss is not "unresolved" (nothing pointed here).
+      # Fetched once, here, into root's own temp file; installed from that copy.
+      # Only three outcomes are the site ANSWERING for this one agent: a page
+      # (0, an image or the app's HTML), an HTTP error (22), or a portrait over
+      # the cap (63, reported as unresolved; the walk goes on). Anything else
+      # (resolve, connect, timeout, a bad certificate, a cut transfer) means
+      # the site could not be read at all: it is asked once, not 20s per agent
+      # inside update's 180s budget, and the pass is left for the next update.
+      (( oa_down )) && { unchecked+=("$name"); continue; }
+      src=$(_agent_avatar_openagent_url "$name") || continue
+      got=$(mktemp)
+      _agent_avatar_fetch "$src" "$got"; rc=$?
+      if (( rc != 0 )) || ! _agent_avatar_sniff "$got" >/dev/null; then
+        rm -f -- "$got"; got=""
+        case "$rc" in
+          0|22) ;;
+          63) missing+=("$name"); warn "could not set '$name' avatar from $src: portrait over the cap" ;;
+          *)  oa_down=1; unchecked+=("$name")
+              warn "could not reach this box's own site (${src%/openagent/*}, curl $rc): portraits not checked; the next update tries again" ;;
+        esac
+        continue
+      fi
+    fi
+    if (( dry )); then
+      set_list+=("$name"); step "would set '$name' from $src"
+      [[ -z "$got" ]] || rm -f -- "$got"; got=""; continue
+    fi
+    tmp=${got:-$(mktemp)}
+    if { [[ -n "$got" ]] || _agent_avatar_fetch "$src" "$tmp" "$name"; } && why=$(_agent_avatar_install "$name" "$tmp"); then
       set_list+=("$name"); step "set '$name' avatar from $src"
     else
       missing+=("$name"); warn "could not set '$name' avatar from $src${why:+: $why}"
     fi
-    rm -f -- "$tmp"; why=""
+    rm -f -- "$tmp"; why=""; got=""
   done <<<"$names"
   rm -f -- "$ytmp"
-  (( once && !dry )) && { : >"$marker" 2>/dev/null || true; }
-  local sj mj
+  # The marker means "every agent was looked at". An unreachable own site is a
+  # blip (update runs this right after restarting services), so that pass is
+  # left unmarked and the next update asks again: one fetch, bounded by 20s.
+  (( once && !dry && !oa_down )) && { : >"$marker" 2>/dev/null || true; }
+  local sj mj uj summary
   sj=$(json_array "${set_list[@]+"${set_list[@]}"}")
   mj=$(json_array "${missing[@]+"${missing[@]}"}")
-  ok "avatar backfill: ${#set_list[@]} set, ${#missing[@]} unresolved" '{set:$s, missing:$m, dryRun:$d}' \
-    --argjson s "$sj" --argjson m "$mj" --argjson d "$( (( dry )) && echo true || echo false)"
+  uj=$(json_array "${unchecked[@]+"${unchecked[@]}"}")
+  summary="avatar backfill: ${#set_list[@]} set, ${#missing[@]} unresolved"
+  (( oa_down )) && summary+=", ${#unchecked[@]} not checked (own site unreachable; the next update tries again)"
+  ok "$summary" '{set:$s, missing:$m, notChecked:$u, dryRun:$d}' \
+    --argjson s "$sj" --argjson m "$mj" --argjson u "$uj" --argjson d "$( (( dry )) && echo true || echo false)"
 }
