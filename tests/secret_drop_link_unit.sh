@@ -214,9 +214,9 @@ rm -rf "$SECRET_DROP_DIR"; rm -f "$CONNECTORS_DIR/gmail.env"; : > "$MOCK5DIVE_LO
 out=$(mint DIVE-11); tok=$(tok_of "$out")
 B="http://127.0.0.1:$PORT"
 code=$(curl -s -o "$TMP/page.html" -D "$TMP/page.hdr" -w '%{http_code}' "$B/$tok")
-[[ "$code" == 200 ]] && grep -q 'type=password name=value' "$TMP/page.html" && grep -q 'mailer needs GMAIL_APP_PASSWORD' "$TMP/page.html" \
-  && ok_t "L5a GET shows a masked field and which seat FILED the ask (not the routed assignee) for which KEY" \
-  || bad_t "L5a GET shows a masked field and which seat FILED the ask (not the routed assignee) for which KEY" "code=$code $(head -c 400 "$TMP/page.html")"
+[[ "$code" == 200 ]] && grep -q 'type=text name=value class=secret' "$TMP/page.html" && ! grep -q 'type=password' "$TMP/page.html" && grep -q '[.]secret{-webkit-text-security:disc}' "$TMP/page.html" && grep -q 'mailer needs GMAIL_APP_PASSWORD' "$TMP/page.html" \
+  && ok_t "L5a GET shows a CSS-masked text field (never type=password, so no save-password prompt) and which seat FILED the ask (not the routed assignee) for which KEY" \
+  || bad_t "L5a GET shows a CSS-masked text field (never type=password, so no save-password prompt) and which seat FILED the ask (not the routed assignee) for which KEY" "code=$code $(head -c 400 "$TMP/page.html")"
 grep -qi '^cache-control: no-store' "$TMP/page.hdr" && grep -qi '^referrer-policy: no-referrer' "$TMP/page.hdr" \
   && grep -qi "^content-security-policy: default-src 'none'" "$TMP/page.hdr" && grep -qi '^x-frame-options: DENY' "$TMP/page.hdr" \
   && ok_t "L5b no-store, no-referrer, CSP default-src none, no framing" \
