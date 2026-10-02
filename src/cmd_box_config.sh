@@ -56,10 +56,11 @@ cmd_box_config() {
         "  pace-week  how much of an account's WEEK the heartbeat spends before it" \
         "             paces the account's seats (DIVE-4430)." \
         "             <soft>/<hard>  past <soft>% of the week only high/urgent rows run;" \
-        "                            past <hard>% only urgent ones (default 60/90)." \
+        "                            past <hard>% only urgent ones (default 95/95:" \
+        "                            below 95% everything runs, at 95% only urgent)." \
         "                            Integers, soft <= hard <= 100." \
         "             off            no weekly floor at all" \
-        "             default        clear back to 60/90" \
+        "             default        clear back to 95/95" \
         "  pace-5h    the same for the 5-hour session window: past <pct>% only urgent" \
         "             rows run (default 85); off, or default." \
         "           An explicit FIVE_PACE_7D_SOFT / FIVE_PACE_7D_HARD / FIVE_PACE_5H in the" \

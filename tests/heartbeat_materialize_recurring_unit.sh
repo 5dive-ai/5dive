@@ -357,7 +357,7 @@ _hb_materialize_recurring "$((t0 + 720))"
 db "UPDATE tasks SET last_fired_at='${SENTINEL}' WHERE id=${t_stamp};" >/dev/null
 : >"$LOG"
 
-DB_FAIL_MATCH="UPDATE tasks SET last_skipped_at=datetime('now') WHERE id=${t_stamp}"
+DB_FAIL_MATCH="UPDATE tasks SET last_skipped_at=datetime('now'), last_skip_reason='open instance' WHERE id=${t_stamp}"
 DB_FAIL_MODE='error'
 _hb_materialize_recurring "$((t0 + 840))"
 DB_FAIL_MATCH=''
@@ -667,24 +667,59 @@ else
   bad_t "5218 K3: a gap of exactly ${_HB_MZ_CATCHUP_MIN} missed minutes is still caught up" "instances=$(instances_of "$k3b")"
 fi
 
-# K4 — THE PACING FLOOR. A catch-up slot inside a held band is NOT fired and
-# stamps NOTHING, exactly like an on-time slot (DIVE-4430). Stubs in a subshell:
-# this harness does not source grader_pool.sh.
+# K4 — THE PACING FLOOR. A catch-up slot inside a held band is NOT fired, and
+# since DIVE-5364 it STAMPS last_skipped_at with the pace reason (it used to
+# stamp nothing, which left a team held for a day reading healthy on the board).
+# last_fired_at is still untouched. Stubs in a subshell: this harness does not
+# source grader_pool.sh.
 k4=$(mk_at "5218 paced template" "$(cron_at $((B + 18000)))")
 printf '%s\n' "$((B + 18000 - 60))" >"$LP"; : >"$LOG"
 ( _HB_PACE_USAGE='{}'
-  _pace_band()      { printf 'soft floor (stub)'; return 2; }
+  _pace_band()      { printf 'pace: acct blind (stub)'; return 2; }
   _pace_admits()    { return 1; }
   _pace_band_name() { printf 'soft'; }
   registry_read()   { printf '{"agents":{}}'; }
   _hb_materialize_recurring "$((B + 18065))" )
 k4_lf=$(last_fired_of "$k4"); k4_ls=$(last_skipped_of "$k4")
-if [[ "$(instances_of "$k4")" == "0" && -z "$k4_lf" && -z "$k4_ls" ]] \
-   && grep -q "NOT fired — pacing floor soft.*(catch-up: slot" "$LOG"; then
-  ok_t "5218 K4: a paced catch-up slot logs NOT fired and stamps nothing"
+k4_why=$(db "SELECT COALESCE(last_skip_reason,'') FROM tasks WHERE id=${k4};")
+if [[ "$(instances_of "$k4")" == "0" && -z "$k4_lf" && -n "$k4_ls" && "$k4_why" == "pace soft on @self:main | acct blind (stub)" ]] \
+   && grep -q "NOT fired — pacing floor soft.*Stamped last_skipped with the pace reason.*(catch-up: slot" "$LOG"; then
+  ok_t "5364 K4: a paced catch-up slot logs NOT fired, leaves last_fired alone, and stamps last_skipped with the pace reason"
 else
-  bad_t "5218 K4: a paced catch-up slot logs NOT fired and stamps nothing" \
-        "instances=$(instances_of "$k4") last_fired='${k4_lf}' last_skipped='${k4_ls}' log=$(cat "$LOG")"
+  bad_t "5364 K4: a paced catch-up slot logs NOT fired, leaves last_fired alone, and stamps last_skipped with the pace reason" \
+        "instances=$(instances_of "$k4") last_fired='${k4_lf}' last_skipped='${k4_ls}' reason='${k4_why}' log=$(cat "$LOG")"
+fi
+# ...and `task ls --recurring` names the hold under blocked_by — there is no
+# instance to close, so it must not read '-' (healthy) or an ident.
+k4_row=$(JSON_MODE=0 cmd_task_ls --recurring --all 2>&1 | grep "5218 paced template")
+if [[ "$k4_row" == *"pace soft on @self:main"* && "$k4_row" != *"acct blind (stub)"* ]]; then
+  ok_t "5364 K4: task ls --recurring prints the pace hold under blocked_by (the short form, not the verdict)"
+else
+  bad_t "5364 K4: task ls --recurring prints the pace hold under blocked_by" "row=[${k4_row}] all=[$(JSON_MODE=0 cmd_task_ls --recurring --all 2>&1 | tail -5)]"
+fi
+# ...and once the template FIRES again the stale pace reason stops showing.
+db "UPDATE tasks SET last_fired_at=datetime('now','+1 minute') WHERE id=${k4};"
+k4_row=$(JSON_MODE=0 cmd_task_ls --recurring --all 2>&1 | grep "5218 paced template")
+if [[ -n "$k4_row" && "$k4_row" != *"pace soft"* ]]; then
+  ok_t "5364 K4: a fire newer than the hold clears the pace reason from blocked_by"
+else
+  bad_t "5364 K4: a fire newer than the hold clears the pace reason from blocked_by" "row=[${k4_row}]"
+fi
+# ...and a slot that ALREADY FIRED is never stamped as skipped, even if the
+# floor holds on a later pass over the same window.
+k4b=$(mk_at "5364 fired-then-paced template" "$(cron_at $((B + 19800)))")
+db "UPDATE tasks SET last_fired_at=datetime('now') WHERE id=${k4b};"
+printf '%s\n' "$((B + 19800 - 60))" >"$LP"
+( _HB_PACE_USAGE='{}'
+  _pace_band()      { printf 'pace: held (stub)'; return 3; }
+  _pace_admits()    { return 1; }
+  _pace_band_name() { printf 'hard'; }
+  registry_read()   { printf '{"agents":{}}'; }
+  _hb_materialize_recurring "$((B + 19865))" )
+if [[ -z "$(last_skipped_of "$k4b")" ]]; then
+  ok_t "5364 K4: an already-fired slot is not stamped as skipped by a later held pass"
+else
+  bad_t "5364 K4: an already-fired slot is not stamped as skipped by a later held pass" "last_skipped=$(last_skipped_of "$k4b")"
 fi
 
 # K5 — NO STATE, NO GUESS. With no last-pass record (first pass after install)

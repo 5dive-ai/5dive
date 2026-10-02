@@ -1130,7 +1130,7 @@ cmd_task_ls() {
     # surfaces cannot disagree. Still absent on a NULL row, like every column here.
     # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, need_expires_at, gate_pinged_at, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier, review_mode,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, need_expires_at, gate_pinged_at, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, last_skip_reason, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier, review_mode,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
@@ -1192,7 +1192,12 @@ cmd_task_ls() {
     # does start skipping. The expression reproduces the materializer's own branch,
     # including the same default bound (TASKS_OVERLAP_BOUND_DEFAULT), so the two
     # cannot drift.
-    dbfmt -box "SELECT ident, status, COALESCE(schedule,'-') AS schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, COALESCE(last_skipped_at,'-') AS last_skipped, COALESCE(CASE WHEN kind='recurring' THEN CASE WHEN COALESCE(on_overlap,'skip')='spawn' THEN (SELECT CASE WHEN COUNT(*) >= COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) THEN 'bound '||COUNT(*)||'/'||COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) ELSE NULL END FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled')) ELSE (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) END ELSE NULL END,'-') AS blocked_by, COALESCE(on_overlap,'skip') AS on_overlap, title FROM tasks WHERE ${where} ${order};"
+    #
+    # DIVE-5364: a slot the PACING FLOOR held has no instance to name, so when
+    # no instance blocks and the latest skip (newer than the latest fire) was a
+    # pace hold, blocked_by prints that hold — `pace soft on mark` — instead of
+    # '-'. Before this a team held for a whole day read as healthy here.
+    dbfmt -box "SELECT ident, status, COALESCE(schedule,'-') AS schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, COALESCE(last_skipped_at,'-') AS last_skipped, COALESCE(CASE WHEN kind='recurring' THEN CASE WHEN COALESCE(on_overlap,'skip')='spawn' THEN (SELECT CASE WHEN COUNT(*) >= COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) THEN 'bound '||COUNT(*)||'/'||COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) ELSE NULL END FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled')) ELSE (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) END ELSE NULL END,CASE WHEN kind='recurring' AND last_skip_reason LIKE 'pace %' AND last_skipped_at >= COALESCE(last_fired_at,'') THEN CASE WHEN instr(last_skip_reason,' | ') > 0 THEN substr(last_skip_reason,1,instr(last_skip_reason,' | ')-1) ELSE last_skip_reason END END,'-') AS blocked_by, COALESCE(on_overlap,'skip') AS on_overlap, title FROM tasks WHERE ${where} ${order};"
   else
     # DIVE-2316: the binding audit is a list question — "which closed rows have
     # no pointer?"  Show the column whenever closed rows were requested, and

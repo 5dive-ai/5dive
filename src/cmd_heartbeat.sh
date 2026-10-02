@@ -5184,6 +5184,14 @@ _hb_materialize_recurring() {
     minute_start=$(date -u -d "@${slot_ep}" +'%Y-%m-%d %H:%M:00')
     slot_tag=""
     (( slot_ep < now / 60 * 60 )) && slot_tag=" (catch-up: slot ${minute_start%:00} UTC, no pass ran in that minute — DIVE-5218)"
+    # Already fired this slot? (string compare on ISO 'YYYY-MM-DD HH:MM:SS';
+    # last_fired >= minute_start means a pass already materialized it at or after
+    # the slot's minute -- on time, or by an earlier catch-up.) Asked BEFORE the
+    # pacing floor since DIVE-5364: a hold now stamps last_skipped, and a slot
+    # that already fired must never be stamped as skipped.
+    if [[ -n "$last_fired" ]] && ! [[ "$last_fired" < "$minute_start" ]]; then
+      continue
+    fi
     # DIVE-4430 — A PACED WEEK GIVES UP THE BEATS FIRST.
     #
     # A recurring beat is the cheapest thing to defer and the most expensive
@@ -5191,27 +5199,32 @@ _hb_materialize_recurring() {
     # construction, and each instance is a full fresh session. So past the soft
     # floor the slot is not fired at all.
     #
-    # NOTHING IS STAMPED ON THIS PATH -- not last_fired_at, not last_skipped_at.
-    # DIVE-2273's rule: last_skipped_at means "an open instance suppressed this
-    # slot", the reading table turns that into "a human must close the blocker",
-    # and there is no blocker to close here. An instrument must not report a
-    # cause it did not observe. The slot is simply missed, and the next matching
-    # slot re-asks the meter.
+    # DIVE-5364: THE HOLD IS STAMPED, WITH ITS CAUSE. Until this row nothing
+    # was stamped here, on DIVE-2273's rule that last_skipped_at meant "an open
+    # instance suppressed this slot". The cost was measured on 2026-10-01: a
+    # 12-seat team's slots were held for ten hours and `task ls --recurring`
+    # read `last_skipped = -` the whole time, so the board said healthy. Now the
+    # stamp carries last_skip_reason, the listing prints that reason under
+    # blocked_by, and DIVE-2273's rule stays true: a pace hold never names an
+    # instance to close, because the reason says what actually held it.
+    # last_fired_at is still untouched, and the next matching slot re-asks the
+    # meter.
     if declare -F _pace_band >/dev/null 2>&1 \
-       && { [[ -n "${_HB_PACE_USAGE-}" ]] || [[ "${_PACE_BLIND:-soft}" == "refuse" ]]; }; then
+       && { [[ -n "${_HB_PACE_USAGE-}" ]] || [[ "${_PACE_BLIND:-open}" == "refuse" ]]; }; then
       local _mz_acct _mz_verdict _mz_rc=0
       _mz_acct=$(jq -r --arg n "${assignee:-}" '.agents[$n].authProfile // ("@self:" + $n)' <<<"$(registry_read)" 2>/dev/null) || _mz_acct=""
       _mz_verdict=$(printf '%s' "${_HB_PACE_USAGE-}" | _pace_band "$_mz_acct" "$now") || _mz_rc=$?
       if (( _mz_rc != 0 )) && ! _pace_admits "$_mz_rc" urgent recurring; then
-        _hb_log "[materializer] $(_hb_ident "$tid") slot at ${minute_start} NOT fired — pacing floor $(_pace_band_name "$_mz_rc") on ${_mz_acct:-<no account>} (assignee ${assignee:-<none>}): ${_mz_verdict}. Nothing stamped; the next matching slot re-asks the meter (DIVE-4430)${slot_tag}"
+        # Best-effort, like the other two stamps: a failed write never changes
+        # whether the pass fires anything. The reason is `pace <band> on
+        # <account> | <verdict>`: `task ls --recurring` prints the part before
+        # ` | ` (an account can itself contain a colon, `@self:<seat>`).
+        stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now'), last_skip_reason=$(sqlq "pace $(_pace_band_name "$_mz_rc") on ${_mz_acct:-<no account>} | ${_mz_verdict#pace: }") WHERE id=${tid};" 2>&1) \
+          || _hb_log "[materializer] $(_hb_ident "$tid") last_skipped_at stamp FAILED: ${stamp_err//$'\n'/ }" \
+          || true
+        _hb_log "[materializer] $(_hb_ident "$tid") slot at ${minute_start} NOT fired — pacing floor $(_pace_band_name "$_mz_rc") on ${_mz_acct:-<no account>} (assignee ${assignee:-<none>}): ${_mz_verdict}. Stamped last_skipped with the pace reason; the next matching slot re-asks the meter (DIVE-4430, DIVE-5364)${slot_tag}"
         continue
       fi
-    fi
-    # Already fired this slot? (string compare on ISO 'YYYY-MM-DD HH:MM:SS';
-    # last_fired >= minute_start means a pass already materialized it at or after
-    # the slot's minute -- on time, or by an earlier catch-up.)
-    if [[ -n "$last_fired" ]] && ! [[ "$last_fired" < "$minute_start" ]]; then
-      continue
     fi
     # DIVE-2273: "the count is non-zero" and "the count could not be read" are
     # DIFFERENT STATES and only one of them is a suppression. The old form
@@ -5281,7 +5294,7 @@ _hb_materialize_recurring() {
         # than new alarm machinery -- `task ls --recurring` and the DIVE-2237
         # reading table keep working unchanged, and a spawn-class template that
         # has genuinely run away reads the same as any other suppressed one.
-        stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now') WHERE id=${tid};" 2>&1) \
+        stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now'), last_skip_reason='overlap bound' WHERE id=${tid};" 2>&1) \
           || _hb_log "[materializer] $(_hb_ident "$tid") last_skipped_at stamp FAILED: ${stamp_err//$'\n'/ }" \
           || true
         _hb_log "[materializer] $(_hb_ident "$tid") on-overlap=spawn but ${open} open >= bound ${bound} — skip (bounded)"
@@ -5295,7 +5308,7 @@ _hb_materialize_recurring() {
       # one the scheduler never reached, and a monitor implemented as a
       # recurring task can switch itself off in silence. Best-effort: a failed
       # stamp must never change whether the pass fires anything.
-      stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now') WHERE id=${tid};" 2>&1) \
+      stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now'), last_skip_reason='open instance' WHERE id=${tid};" 2>&1) \
         || _hb_log "[materializer] $(_hb_ident "$tid") last_skipped_at stamp FAILED: ${stamp_err//$'\n'/ }" \
         || true
       _hb_log "[materializer] $(_hb_ident "$tid") due but an open instance exists — skip"
@@ -9109,7 +9122,7 @@ cmd_heartbeat_tick() {
   else
     _HB_PACE_USAGE=$($_HB_PACE_CMD 2>/dev/null || printf '')
   fi
-  [[ -n "$_HB_PACE_USAGE" ]] || _hb_log "[pace] the account meter could not be read this tick (${_HB_PACE_CMD}) — every account is treated as BLIND, policy=${_PACE_BLIND:-soft} (a blind meter is never read as 0% used)"
+  [[ -n "$_HB_PACE_USAGE" ]] || _hb_log "[pace] the account meter could not be read this tick (${_HB_PACE_CMD}) — every account is treated as BLIND, policy=${_PACE_BLIND:-open} (a blind meter is never read as 0% used)"
   _hb_materialize_recurring "$now" || _hb_log "[materializer] pass errored (non-fatal)"
   # DIVE-1490: receipt-backed reminder first, so an old gate whose initial send
   # failed gets a button-bearing + group-fallback attempt before the legacy 72h
