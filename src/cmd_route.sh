@@ -25,8 +25,10 @@
 # Test seams. Under sudo (root, SUDO_UID set) they are ignored whatever the
 # environment carries, ROUTE_RELOAD_CMD (an eval) above all: env_reset strips
 # them today, and the root half must not depend on that staying true.
+# $1 stands in for a root euid in the harness; it can only narrow (reset to defaults).
 _route_trust_env() {
-  [[ "${1:-$EUID}" == 0 && -n "${SUDO_UID:-}" ]] || return 0
+  [[ $EUID -eq 0 || "${1:-}" == 0 ]] || return 0
+  [[ -n "${SUDO_UID:-}" ]] || return 0
   ROUTE_CADDYFILE=/etc/caddy/Caddyfile ROUTE_PROVISIONING=/etc/5dive/provisioning.env
   ROUTE_CADDY_BIN=caddy ROUTE_LOCK=/run/5dive-route.lock
   unset ROUTE_RELOAD_CMD
@@ -178,19 +180,21 @@ cmd_route() {
     [[ -z "$port" ]] || fail "$E_USAGE" "route rm takes no --port"
   fi
 
-  # A non-root caller crosses the scoped root rail; root runs it in-process.
-  if [[ $EUID -ne 0 ]]; then
-    local mode=text rc=0
-    (( ${JSON_MODE:-0} )) && mode=json
-    if [[ "$sub" == add ]]; then
-      printf '%s\0' "$mode" add "$name" "$port" | sudo -n /usr/local/bin/5dive _route_do || rc=$?
-    else
-      printf '%s\0' "$mode" rm "$name" | sudo -n /usr/local/bin/5dive _route_do || rc=$?
-    fi
-    (( rc == 0 )) || mark_reported
-    exit "$rc"
+  # Root runs it in-process (SUDO_UID is sudo's stamp, read only under this guard);
+  # a non-root caller crosses the scoped root rail.
+  if [[ $EUID -eq 0 ]]; then
+    _route_exec "$sub" "$name" "$port" "${SUDO_UID:-0}"
+    return
   fi
-  _route_exec "$sub" "$name" "$port" "${SUDO_UID:-0}"
+  local mode=text rc=0
+  (( ${JSON_MODE:-0} )) && mode=json
+  if [[ "$sub" == add ]]; then
+    printf '%s\0' "$mode" add "$name" "$port" | sudo -n /usr/local/bin/5dive _route_do || rc=$?
+  else
+    printf '%s\0' "$mode" rm "$name" | sudo -n /usr/local/bin/5dive _route_do || rc=$?
+  fi
+  (( rc == 0 )) || mark_reported
+  exit "$rc"
 }
 
 # Root half. Reached ONLY through the exact-path NOPASSWD grant (or by root).

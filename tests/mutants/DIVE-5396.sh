@@ -9,4 +9,4 @@ m1() { sed -i 's/^_pkg_exact() {$/_pkg_exact() { return 0;/' src/cmd_pkg.sh; }
 # m2: the prefix match is taken as a hit -> 'jq.' (prefix of jqp) passes.
 m2() { sed -i 's/grep -qxF -- "\$1" <<<"\$all"/[[ -n "$all" ]]/' src/cmd_pkg.sh; }
 # m3: the root half trusts the env under sudo -> the seam arms red.
-m3() { sed -i 's/^  \[\[ "\${1:-\$EUID}" == 0 \&\& -n "\${SUDO_UID:-}" \]\] || return 0$/  return 0/' src/cmd_pkg.sh src/cmd_route.sh; }
+m3() { sed -i 's/^  \[\[ \$EUID -eq 0 || "\${1:-}" == 0 \]\] || return 0$/  return 0/' src/cmd_pkg.sh src/cmd_route.sh; }

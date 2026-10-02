@@ -19,8 +19,10 @@
 # Test seams. Under sudo (root, SUDO_UID set) they are ignored whatever the
 # environment carries: env_reset strips them today, and the root half must not
 # depend on that staying true.
+# $1 stands in for a root euid in the harness; it can only narrow (reset to defaults).
 _pkg_trust_env() {
-  [[ "${1:-$EUID}" == 0 && -n "${SUDO_UID:-}" ]] || return 0
+  [[ $EUID -eq 0 || "${1:-}" == 0 ]] || return 0
+  [[ -n "${SUDO_UID:-}" ]] || return 0
   PKG_APT_GET=apt-get PKG_APT_CACHE=apt-cache
 }
 PKG_APT_GET="${PKG_APT_GET:-apt-get}"
@@ -62,14 +64,16 @@ cmd_pkg() {
   (( ${#names[@]} )) || fail "$E_USAGE" "usage: 5dive pkg install <package>..."
   (( ${#names[@]} <= PKG_MAX )) || fail "$E_VALIDATION" "at most $PKG_MAX packages per call"
 
-  if [[ $EUID -ne 0 ]]; then
-    local mode=text rc=0
-    (( ${JSON_MODE:-0} )) && mode=json
-    printf '%s\0' "$mode" install "${names[@]}" | sudo -n /usr/local/bin/5dive _pkg_do || rc=$?
-    (( rc == 0 )) || mark_reported
-    exit "$rc"
+  # Root runs it in-process; SUDO_UID is sudo's stamp, read only under this guard.
+  if [[ $EUID -eq 0 ]]; then
+    _pkg_exec "${SUDO_UID:-0}" "${names[@]}"
+    return
   fi
-  _pkg_exec "${SUDO_UID:-0}" "${names[@]}"
+  local mode=text rc=0
+  (( ${JSON_MODE:-0} )) && mode=json
+  printf '%s\0' "$mode" install "${names[@]}" | sudo -n /usr/local/bin/5dive _pkg_do || rc=$?
+  (( rc == 0 )) || mark_reported
+  exit "$rc"
 }
 
 # Root half. Reached ONLY through the exact-path NOPASSWD grant (or by root).
@@ -141,7 +145,7 @@ _pkg_exec() {
   fi
   if (( rc != 0 )); then
     audit_log "_pkg_do install" error "$rc" -- "by=$by" "$@"
-    local why; why=$(grep -E '^E: ' <<<"$out" | head -3 | tr '\n' ' ')
+    local why; why=$(grep -E '^E: ' <<<"$out" | head -3 | tr '\n' ' ') || why=""
     [[ -n "$why" ]] || why=$(tail -3 <<<"$out" | tr '\n' ' ')
     if grep -q 'Packages need to be removed' <<<"$out"; then
       fail "$E_PERMISSION" "installing $* would remove other packages, so nothing was installed (ask the box owner)"
