@@ -223,7 +223,7 @@ _secret_drop_redeem() {
   id=$(_secret_drop_gate_open "$ident" "$key" "$connector")
   ( _secret_write "$key" --connector="$connector" ) >/dev/null 2>&1 || rc=$?
   if (( rc != 0 )); then
-    fail "$E_VALIDATION" "value refused (empty, or more than one line)"
+    fail "$E_VALIDATION" "value refused (empty, more than one line, or a space or quote in a tools key)"
   fi
   # Clear the gate with the link as the evidence, BEFORE the burn: task answer
   # reads the link back from the store (_gate_drop_link_ok). The page's unit has

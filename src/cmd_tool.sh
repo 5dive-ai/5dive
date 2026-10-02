@@ -133,6 +133,16 @@ _tool_rewrite() {
   exec 9>&-
 }
 
+# One var into the shared file, for `secret write --connector=tools` (DIVE-5370):
+# a key the owner pastes through a secret gate's one-time link lands where every
+# agent reads it, under the same quote rule. The caller is root and holds the value.
+_tool_put_var() {
+  local key="$1" value="$2"
+  _tool_value_ok "$value" \
+    || fail "$E_VALIDATION" "$key must be one line of printable characters, no spaces or quotes. Nothing was saved"
+  _tool_rewrite "$key" "export ${key}='${value}'"$'\n'
+}
+
 _tool_set() {
   local id="${1:-}"
   require_root tool set
