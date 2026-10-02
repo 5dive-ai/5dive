@@ -6,9 +6,10 @@
 #           silently skipped ensure_hermes_gateway: the agent came up with no
 #           gateway and NO error.
 #   site B  bot_username resolution    — every claude create with an explicit
-#           `--channels=telegram` arrives here as "telegram,dashboard" (the
-#           DIVE-856 append at cmd_agent_create.sh), so getMe never ran and
-#           botUsername was written EMPTY to the registry.
+#           `--channels=telegram` arrived here as "telegram,dashboard" (the
+#           DIVE-856 append, removed by DIVE-5406; an owner can still pass the
+#           list explicitly), so getMe never ran and botUsername was written
+#           EMPTY to the registry.
 #
 # HOW THIS GRADES (and why it is not the idiom swap restated):
 # the harness does NOT contain a copy of either predicate. It EXTRACTS each
@@ -54,9 +55,10 @@ valid_channel 'telegram,discord' \
 if grep -q 'hermes' <<<"$(grep -A2 'no discord build yet' "$SRC")"; then
   echo 'FAIL: hermes now refuses discord; site A is unreachable' >&2; exit 1
 fi
-# The DIVE-856 append is what puts a LIST in front of site B on the ordinary path.
-grep -qF 'channels="${channels},dashboard"' "$SRC" \
-  || { echo 'FAIL: the DIVE-856 dashboard append is gone; site B repro premise is stale' >&2; exit 1; }
+# An explicit --channels list is what puts a LIST in front of site B (DIVE-5406
+# removed the DIVE-856 append that used to make it the ordinary path).
+valid_channel 'telegram,dashboard' \
+  || { echo 'FAIL: valid_channel rejects telegram,dashboard; site B is unreachable' >&2; exit 1; }
 
 pass=0 fail=0
 check() { # check <expected 0|1> <label>
