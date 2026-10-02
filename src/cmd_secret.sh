@@ -45,7 +45,9 @@ _secret_usage() {
       Mint a one-time link for an open secret gate: https://secrets.<box>/<token>.
       The owner opens it, pastes, taps once; the value goes from their browser to
       this box only, lands as the gate's KEY, and clears the gate. Single use,
-      expires in 30 min by default. Root-only.
+      expires in 30 min by default. Root-only. Returns once the page answers over
+      a valid certificate (at most ~20s on a box's first link); --json carries
+      ready:false if it did not in time (the link still works a moment later).
 
   5dive secret serve [--listen=127.0.0.1:3127]
       The page behind those links. Started on demand by `secret link`; exits by
@@ -71,6 +73,7 @@ cmd_secret() {
     serve)   _secret_serve "$@" ;;
     _peek)   _secret_drop_peek "$@" ;;
     _redeem) _secret_drop_redeem "$@" ;;
+    _prewarm) _secret_drop_prewarm "$@" ;;   # DIVE-5372: install.sh
     -h|--help|help) _secret_usage ;;
     *) fail "$E_USAGE" "unknown secret command: $sub (write|link|serve)" ;;
   esac
