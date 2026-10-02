@@ -98,15 +98,21 @@ grep -q '_ping_conn" == tools' src/task/answer.sh \
   && ok_t "S6 the gate-cleared ping for a tools key says \$KEY is in the environment" \
   || bad_t "S6 answer.sh ping" "no tools branch in the secret-gate ping"
 
-# --- S7: a reserved name is refused for tools.sh, and the file does not move ----
+# --- S7: only a credential name may go in tools.sh, and a refusal moves nothing -
 # tools.sh is every agent's BASH_ENV: `export PATH='<key>'` there leaves every
-# seat on the box unable to run a command, with no verb that undoes it. Each
-# refusal is graded on rc, reason AND an unchanged file (rc alone passes the
-# wrong refusal). Same value as S1, so only the NAME decides.
+# seat on the box unable to run a command, and `export HTTPS_PROXY='<key>'`
+# fails every curl/git/gh call the same way (NODE_TLS_REJECT_UNAUTHORIZED,
+# NPM_CONFIG_REGISTRY: silently). The rule is an allowlist (a _KEY/_TOKEN/
+# _SECRET/_PASSWORD name or a catalog variable), minus the per-seat prefixes.
+# Each refusal is graded on rc, reason AND an unchanged file (rc alone passes
+# the wrong refusal). Same value as S1, so only the NAME decides.
 before=$(cat "$F")
-for name in PATH LD_PRELOAD IFS HOME BASH_ENV PS4 LC_ALL ANTHROPIC_API_KEY OPENAI_API_KEY TELEGRAM_BOT_TOKEN OPENROUTER_API_KEY; do
+for name in PATH LD_PRELOAD IFS HOME BASH_ENV PS4 LC_ALL ANTHROPIC_API_KEY OPENAI_API_KEY TELEGRAM_BOT_TOKEN OPENROUTER_API_KEY \
+            HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS SSL_CERT_FILE \
+            CURL_CA_BUNDLE REQUESTS_CA_BUNDLE NPM_CONFIG_REGISTRY PIP_INDEX_URL JAVA_TOOL_OPTIONS FUNCNEST POSIXLY_CORRECT \
+            GIT_ASKPASS_TOKEN NODE_AUTH_TOKEN NPM_CONFIG__AUTH_TOKEN; do
   out=$(put sk_el_FAKE_123456 "$name" --connector=tools); rc=$?
-  [[ $rc -eq 3 && "$out" == *"$name is reserved"* && "$(cat "$F")" == "$before" ]] \
+  [[ $rc -eq 3 && "$out" == *"$name is not allowed for --connector=tools"* && "$(cat "$F")" == "$before" ]] \
     && ok_t "S7 $name is refused for --connector=tools and tools.sh is unchanged" \
     || bad_t "S7 must refuse $name" "rc=$rc out=$out"
 done
@@ -114,7 +120,23 @@ done
   && ok_t "S7 a fresh agent bash still finds its commands" || bad_t "S7 PATH broken" "$(cat "$F")"
 # The same names are fine in a plain connector: it is a 600 file nothing sources.
 out=$(put sk-FAKE-openai-02 OPENAI_API_KEY --connector=openai); rc=$?
-[[ $rc -eq 0 ]] && ok_t "S7 a reserved name still writes to a plain connector" || bad_t "S7 plain connector" "rc=$rc $out"
+[[ $rc -eq 0 ]] && ok_t "S7 a refused name still writes to a plain connector" || bad_t "S7 plain connector" "rc=$rc $out"
+# Credential names are accepted, and land where a fresh agent bash sees them.
+for name in ELEVENLABS_API_KEY GH_TOKEN STRIPE_API_KEY FAL_KEY CLOUDFLARE_API_TOKEN SENDGRID_API_KEY HF_API_SECRET SMTP_PASSWORD; do
+  out=$(put "sk_FAKE_${name}_1" "$name" --connector=tools); rc=$?
+  [[ $rc -eq 0 && "$(seen "$name")" == "sk_FAKE_${name}_1" ]] \
+    && ok_t "S7 $name is accepted for --connector=tools" || bad_t "S7 must accept $name" "rc=$rc out=$out"
+done
+# Every variable the tools catalog fills (cmd_tool.sh TOOL_ENV) is accepted, so
+# a new catalog entry whose name is not a credential suffix reds here until it
+# is added to TOOLS_VAR_CATALOG_EXTRA.
+for id in "${TOOL_IDS[@]}"; do
+  for name in ${TOOL_ENV[$id]}; do
+    _tools_var_reserved "$name" \
+      && bad_t "S7 catalog variable $name ($id) must be accepted" "refused by _tools_var_reserved" \
+      || ok_t "S7 catalog variable $name ($id) is accepted"
+  done
+done
 
 # S8 (the gate cannot be FILED with a reserved name for tools) lives in
 # tests/secret_gate_delivery_path_unit.sh N8/P8, which already pays for a task DB.

@@ -45,7 +45,8 @@
 #   P6  drop-target gate still gets its ✅ Provided button
 #   P7  out-of-band gate still gets its ✅ Provided button
 #   T8  the no-path gate's alert text names the missing path and offers no tap
-#   N8  a --connector=tools gate for a reserved name (PATH, LD_PRELOAD) is refused
+#   N8  a --connector=tools gate for a non-key name (PATH, LD_PRELOAD, HTTPS_PROXY,
+#       NODE_TLS_REJECT_UNAUTHORIZED) is refused
 #   P8  an ordinary tools key still files; the check is scoped to tools (DIVE-5370)
 # Isolation matches the sibling harnesses: source src/ libs, throwaway STATE_DIR —
 # the live shared tasks.db is NEVER touched.
@@ -332,17 +333,21 @@ got=$(cat "$PINGS")
   && ok_t "T10b an out-of-band gate's ping names no file it was never told" \
   || bad_t "T10b an out-of-band gate's ping names no file it was never told" "pings: $got"
 
-# --- N8/P8 (DIVE-5370): a tools gate cannot be FILED for a reserved name -------
+# --- N8/P8 (DIVE-5370): a tools gate cannot be FILED for a non-key name -------
 # --connector=tools writes the answer into tools.sh, every agent's BASH_ENV, so a
 # gate for PATH or LD_PRELOAD would leave every seat on the box unable to run a
 # command. `secret write` refuses it too (secret_tools_connector_unit S7); refusing
 # only there would send the owner a link whose answer the box then refuses.
-for k in PATH LD_PRELOAD; do
-  seed_task "DIVE-58${#k}"
-  out=$(cmd_task_need "DIVE-58${#k}" --type=secret --ask="the ElevenLabs key for voice notes" --secret-key="$k" --connector=tools 2>&1); rc=$?
-  [[ $rc -eq 3 && "$out" == *"--secret-key=$k is reserved"* && "$(field "DIVE-58${#k}" need_type)" == "∅" ]] \
+# HTTPS_PROXY / NODE_TLS_REJECT_UNAUTHORIZED: the network half of the same
+# outage (every seat's curl/git/npm), refused because they are not key names.
+i=0
+for k in PATH LD_PRELOAD HTTPS_PROXY NODE_TLS_REJECT_UNAUTHORIZED; do
+  i=$((i+1)); id="DIVE-583$i"
+  seed_task "$id"
+  out=$(cmd_task_need "$id" --type=secret --ask="the ElevenLabs key for voice notes" --secret-key="$k" --connector=tools 2>&1); rc=$?
+  [[ $rc -eq 3 && "$out" == *"--secret-key=$k is not allowed for --connector=tools"* && "$(field "$id" need_type)" == "∅" ]] \
     && ok_t "N8 --secret-key=$k --connector=tools is refused at filing, no gate written" \
-    || bad_t "N8 --secret-key=$k --connector=tools is refused at filing, no gate written" "rc=$rc need_type=$(field "DIVE-58${#k}" need_type) out=$out"
+    || bad_t "N8 --secret-key=$k --connector=tools is refused at filing, no gate written" "rc=$rc need_type=$(field "$id" need_type) out=$out"
 done
 seed_task DIVE-5801
 cmd_task_need DIVE-5801 --type=secret --ask="the ElevenLabs key for voice notes" --secret-key=ELEVENLABS_API_KEY --connector=tools >/dev/null 2>&1

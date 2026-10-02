@@ -87,31 +87,40 @@ is_known_type() {
   [[ -n "${TYPE_BIN[$1]+x}" ]]
 }
 
-# DIVE-5370: names a key pasted through a secret gate may NOT take in tools.sh.
+# DIVE-5370: names a key pasted through a secret gate may take in tools.sh.
 # That file is every agent's BASH_ENV, so `export PATH='<key>'` there breaks the
-# next command of every seat on the box (`git: command not found`), and nothing
-# undoes it short of a hand edit as root. Two kinds are refused:
-#   * the shell and loader's own vars (PATH, IFS, LD_PRELOAD, BASH_ENV, PS4, ...)
-#   * per-seat auth and identity: the unit's EnvironmentFiles give each seat its
-#     own ANTHROPIC_*/OPENAI_*/TELEGRAM_*/AGENT_* values, and a shared export
-#     would quietly override them for every seat's commands
-# Returns 0 when NAME is reserved. A plain connector file is not sourced by
-# bash, so the check applies to --connector=tools only.
+# next command of every seat on the box (`git: command not found`), and
+# `export HTTPS_PROXY='<key>'` or NODE_TLS_REJECT_UNAUTHORIZED takes out (or
+# silently weakens) curl, git, gh and npm the same way. Nothing undoes it short
+# of a hand edit as root. A denylist kept missing members of that class, so this
+# is an ALLOWLIST: a name is accepted only when it is
+#   * a credential name: it ends in _KEY, _TOKEN, _SECRET or _PASSWORD (which
+#     covers _API_KEY and _ACCESS_TOKEN), or
+#   * a tools-catalog variable that does not (cmd_tool.sh's TOOL_ENV; the
+#     catalog arm of tests/secret_tools_connector_unit.sh keeps the two in sync)
+# and it is refused even then under a prefix some program reads as its own
+# (GIT_*, SSH_*, NODE_*, NPM_CONFIG_*, ...) or one each seat gets from its own
+# EnvironmentFiles (ANTHROPIC_*/OPENAI_*/TELEGRAM_*/AGENT_*, the pi provider
+# keys): those also end in _KEY/_TOKEN, and a shared export would quietly
+# override every seat's own value.
+# Returns 0 when NAME is refused. A plain connector file is not sourced by bash,
+# so the check applies to --connector=tools only.
+TOOLS_VAR_CATALOG_EXTRA=(AD_ACCOUNT_ID)
 _tools_var_reserved() {
   local n="${1:-}" v
   case "$n" in
-    PATH|HOME|USER|LOGNAME|SHELL|IFS|ENV|CDPATH|GLOBIGNORE|SHELLOPTS|BASHOPTS| \
-    PS1|PS2|PS3|PS4|PROMPT_COMMAND|TERM|TMPDIR|LANG|LANGUAGE|TZ|PWD|OLDPWD|MAIL| \
-    HOSTNAME|UID|EUID|PPID|HISTFILE|EDITOR|VISUAL|PAGER| \
-    NODE_OPTIONS|NODE_PATH|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PERL5LIB|PERL5OPT| \
-    RUBYOPT|RUBYLIB|BUN_INSTALL|NPM_CONFIG_PREFIX) return 0 ;;
     BASH_*|LD_*|LC_*|GIT_*|SSH_*|SUDO_*|XDG_*|DBUS_*|SYSTEMD_*|GCONV_*) return 0 ;;
+    NODE_*|NPM_CONFIG_*|PIP_*|SSL_*|CURL_*|REQUESTS_*|JAVA_*|PYTHON*|PERL*|RUBY*) return 0 ;;
     ANTHROPIC_*|CLAUDE_*|OPENAI_*|GEMINI_*|GOOGLE_*|CODEX_*|HERMES_*|OPENCODE_*) return 0 ;;
     AGENT_*|TELEGRAM_*|DISCORD_*|FIVEDIVE_*|BUZZ_*) return 0 ;;
   esac
   # pi's provider keys sit in the shared pi.env and in a seat's auth profile.
   for v in "${PI_PROVIDER_VAR[@]}"; do [[ "$n" == "$v" ]] && return 0; done
-  return 1
+  case "$n" in
+    ?*_KEY|?*_TOKEN|?*_SECRET|?*_PASSWORD) return 1 ;;
+  esac
+  for v in "${TOOLS_VAR_CATALOG_EXTRA[@]}"; do [[ "$n" == "$v" ]] && return 1; done
+  return 0 # not a credential name: refused
 }
 
 valid_name() {

@@ -103,7 +103,7 @@ _secret_write() {
   _valid_connector "$connector" || fail "$E_USAGE" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]*\$)"
   # Before stdin is read: a refused name never asks for its value.
   if [[ "$connector" == tools ]] && _tools_var_reserved "$key"; then
-    fail "$E_VALIDATION" "$key is reserved: every agent loads tools.sh, so it would override $key for every seat on the box. Use the tool's own variable name (e.g. ELEVENLABS_API_KEY). Nothing was saved"
+    fail "$E_VALIDATION" "$key is not allowed for --connector=tools: every agent loads tools.sh, so it takes only a key name (ending _KEY, _TOKEN, _SECRET or _PASSWORD, and not a seat's own such as ANTHROPIC_API_KEY); anything else could override $key for every seat on the box. Use the tool's own variable name (e.g. ELEVENLABS_API_KEY). Nothing was saved"
   fi
 
   # Value on stdin ONLY, never argv. DIVE-5319: at a terminal (nothing piped) it

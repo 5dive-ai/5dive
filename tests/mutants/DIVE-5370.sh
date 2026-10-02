@@ -11,3 +11,6 @@ m1() { sed -i 's/&& _tools_var_reserved "\$key"; then/\&\& false; then/' src/cmd
 m2() { sed -i 's/&& _tools_var_reserved "\$secret_key"; then/\&\& false; then/' src/task/need.sh; }
 # m3: the reserved list is empty -> S7 and N8 both red.
 m3() { sed -i 's/^_tools_var_reserved() {$/_tools_var_reserved() { return 1;/' src/lib/validation.sh; }
+# m4: back to a denylist — a name that is not a credential name is accepted ->
+# S7 (HTTPS_PROXY, NODE_TLS_REJECT_UNAUTHORIZED, FUNCNEST, ...) and N8 red.
+m4() { sed -i 's/^  return 0 # not a credential name: refused$/  return 1/' src/lib/validation.sh; }

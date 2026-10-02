@@ -2718,7 +2718,7 @@ cmd_task_need() {
     # DIVE-5370: refuse at filing, not only at `secret write`, so the owner is
     # never sent a link whose answer the box would then refuse.
     if [[ "$connector" == tools ]] && _tools_var_reserved "$secret_key"; then
-      fail "$E_VALIDATION" "--secret-key=$secret_key is reserved for --connector=tools: every agent loads tools.sh, so it would override $secret_key for every seat on the box. Name the tool's own variable (e.g. ELEVENLABS_API_KEY)"
+      fail "$E_VALIDATION" "--secret-key=$secret_key is not allowed for --connector=tools: every agent loads tools.sh, so it takes only a key name (ending _KEY, _TOKEN, _SECRET or _PASSWORD, and not a seat's own such as ANTHROPIC_API_KEY); anything else could override $secret_key for every seat on the box. Name the tool's own variable (e.g. ELEVENLABS_API_KEY)"
     fi
   fi
   # DIVE-4416: --options=A|B was the shape the usage string taught for years, and
