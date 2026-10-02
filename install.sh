@@ -1633,20 +1633,60 @@ sync_managed_block() {
   cat "$out" > "$live"; rm -f "$out"
 }
 
+# DIVE-5416 — is <file> an UNEDITED copy of a projects-CLAUDE.md this repo has
+# shipped? Every agent loads that file on every turn, so a box left on an old,
+# longer copy pays for it on each message. The test is the text OUTSIDE the two
+# blocks this file owns (those are synced below anyway), blank lines dropped,
+# against the sum of every shipped version. Any other text — a host's own edit,
+# another tool's marked block — misses the list and the file is kept as is.
+# Changing the text outside the blocks? ADD its sum here (never remove one):
+# tests/projects_claudemd_lean_unit.sh reds until the current file is listed.
+projects_claudemd_is_stock() { # <file>
+  local sum
+  [[ -f "$1" ]] || return 1
+  sum="$(awk '/^<!-- 5dive:(task-lifecycle|hired-agents):begin/ { s = 1 }
+              !s { print }
+              /^<!-- 5dive:(task-lifecycle|hired-agents):end/ { s = 0 }' "$1" \
+         | grep -v '^[[:space:]]*$' | sha256sum)" || return 1
+  case "${sum%% *}" in
+    fdd8bb84c3a2f6c35e01b58696734a316d035e037eb99241f285eec76779a09d|\
+    67484672345293fadff5a975beca06b6626bb2ec7736568ae1f2db2ab9b1aa40|\
+    17324e6523d9ad8ce41c2b2ab34984adb65041dfaa12509731ab82624c6411f4|\
+    3094340c2abc6b8af6548caca2a6733d87b0ffbee9c4118ce0e4e8924a006ced|\
+    2859873dc0b263a76a42df8a38e42b7cf16f576b63ed18f3721369537b7a0e60|\
+    a43cd24e748c372a8d0fd8cf430446dc3b30860b84b0bb7b8d2da76e1186cf0c|\
+    f5c59ca93327572eeb40b504848bb86ba71d8148c02e8d1e01965d93e8331dbd|\
+    bf1882931ed305ea13fc8331f4007183ad7c2a841ed96ae7b5eb0eba4ded3d54|\
+    220c10d2d0c0e4050ac655d5ddbeffbb6eaaea38f75028fd48ff57410081a945)
+      return 0 ;;
+  esac
+  return 1
+}
+
   # Drop a slim projects-level CLAUDE.md so every agent spawned on this host
   # picks up baseline self-management guidance (project layout, sudo, where
-  # the agent's own settings live, the host CLI). Only on first install —
-  # never clobber a customised file. Symlink AGENTS.md so non-claude agent
-  # types (codex, …) see the same instructions.
+  # the agent's own settings live, the host CLI). Written on first install, and
+  # (DIVE-5416) over an unedited stock copy of an older version — never over a
+  # customised file. Fetched to a temp file first, so a failed fetch leaves the
+  # live one alone. Symlink AGENTS.md so non-claude agent types (codex, …) see
+  # the same instructions.
   install -d -m 755 -o claude -g claude /home/claude/projects
-  if [[ ! -f /home/claude/projects/CLAUDE.md ]]; then
-    curl -fsSL "$REPO/projects-CLAUDE.md" -o /home/claude/projects/CLAUDE.md
-    # DIVE-5396: the hired-agents block is for boxes 5dive built (see below).
-    [[ -f /etc/5dive/provisioning.env ]] \
-      || sed -i '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/d' /home/claude/projects/CLAUDE.md
-    chown claude:claude /home/claude/projects/CLAUDE.md
-    chmod 644 /home/claude/projects/CLAUDE.md
-    ok "projects/CLAUDE.md"
+  if [[ ! -f /home/claude/projects/CLAUDE.md ]] || projects_claudemd_is_stock /home/claude/projects/CLAUDE.md; then
+    _pcm_tmp="$(mktemp)"
+    if curl -fsSL "$REPO/projects-CLAUDE.md" -o "$_pcm_tmp" && [[ -s "$_pcm_tmp" ]]; then
+      # DIVE-5396: the hired-agents block is for boxes 5dive built (see below).
+      [[ -f /etc/5dive/provisioning.env ]] \
+        || sed -i '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/d' "$_pcm_tmp"
+      if cmp -s "$_pcm_tmp" /home/claude/projects/CLAUDE.md; then
+        ok "projects/CLAUDE.md (current)"
+      else
+        install -m 644 -o claude -g claude "$_pcm_tmp" /home/claude/projects/CLAUDE.md
+        ok "projects/CLAUDE.md"
+      fi
+    else
+      echo "warn: could not fetch projects-CLAUDE.md — projects/CLAUDE.md left as it was" >&2
+    fi
+    rm -f "$_pcm_tmp"
   else
     ok "projects/CLAUDE.md (kept existing)"
   fi
