@@ -396,6 +396,32 @@ mkdir -p "$LIB_DIR"
   chk "arm12 the previously staged payload survives a failed refresh" "$before" "$after"
 fi
 
+# ── arm 13: no HOME (systemd-run, `env -i` cron) — DIVE-5356 ─────────────────
+# `5dive update` started without HOME died at the top-level GUARD_HOME_USER line
+# under `set -u`, before the shared-home branch a root install takes anyway, and
+# the update still reported OK. PII_GUARD_HOME keeps the sync hermetic; the line
+# that died is top-level, so it still runs.
+NOHOME="$TMP/gh-nohome"
+env -i PATH="$PATH" PII_GUARD_HOME="$NOHOME" bash "$INSTALLER" --sync >/dev/null 2>&1
+chk "arm13 --sync with HOME unset exits 0" 0 "$?"
+[[ -x "$NOHOME/pre-push" ]] && ok_t "arm13 --sync with HOME unset populates the guard home" \
+  || fail_t "arm13 --sync with HOME unset populates the guard home"
+# The per-user fallback falls back to the passwd home, not to a path under "/".
+n13="$(grep -n '^GUARD_HOME_USER=' "$INSTALLER" | cut -d: -f1)"
+if [[ -z "$n13" ]]; then
+  fail_t "arm13 GUARD_HOME_USER line located — the fallback arms graded NOTHING"
+else
+  { head -n "$n13" "$INSTALLER"; echo 'printf %s "$GUARD_HOME_USER"'; } > "$TMP/head13.sh"
+  want="$(getent passwd "$(id -un)" | cut -d: -f6)/.local/share/5dive/pii-guard"
+  chk "arm13 with HOME unset the per-user guard home is the passwd home's" "$want" \
+      "$(env -i PATH="$PATH" bash "$TMP/head13.sh" 2>/dev/null)"
+  # MUTANT: the pre-fix line. Must die, or the arms above prove nothing.
+  sed "${n13}s#.*#GUARD_HOME_USER=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/5dive/pii-guard\"#" \
+    "$TMP/head13.sh" > "$TMP/head13-mut.sh"
+  env -i PATH="$PATH" bash "$TMP/head13-mut.sh" >/dev/null 2>&1
+  chk "arm13 MUTANT: the pre-fix line dies on an unset HOME" 1 "$?"
+fi
+
 echo
 echo "$PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]] || exit 1

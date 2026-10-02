@@ -72,7 +72,11 @@ SRC_REPO="$(cd -- "$SELF_DIR/.." && pwd)"
 # and sudo is unavailable — announced, never silent, because a per-user guard
 # home reintroduces exactly the drift the shared one exists to avoid.
 GUARD_HOME_SHARED="/usr/local/share/5dive/pii-guard"
-GUARD_HOME_USER="${XDG_DATA_HOME:-$HOME/.local/share}/5dive/pii-guard"
+# HOME is unset under systemd-run and `env -i` cron, and `set -u` would kill the
+# script here, before the shared-home branch a root install takes anyway. Fall
+# back to the passwd home (DIVE-5356).
+_USER_HOME="${HOME:-$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)}"
+GUARD_HOME_USER="${XDG_DATA_HOME:-${_USER_HOME:-/root}/.local/share}/5dive/pii-guard"
 
 MODE=install
 TARGET=""

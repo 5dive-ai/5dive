@@ -968,7 +968,9 @@ export NVM_DIR="/home/claude/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 export PATH="/home/claude/.local/bin:$PATH"
 cd "$HOME"
-timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes 2>&1 | tail -15
+# </dev/null: npx reads stdin to EOF, and stdin is this heredoc, so without it
+# nothing below this line ever runs (DIVE-5356).
+timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes </dev/null 2>&1 | tail -15
 DEFAULT_SKILL
   _skill_manifest_note "$user" "$home" "$install_dir" "$skill" "$source"
 }
