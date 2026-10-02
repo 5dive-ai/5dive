@@ -26,7 +26,11 @@
 #   - bound to one gate: the task, its KEY and its connector, copied at mint time.
 #     A redeem re-checks that the gate is still open and still names the same pair.
 #   - single use: a successful write burns every link for that gate. A rejected
-#     value (empty, multi-line) burns nothing, so a bad paste can be retried.
+#     value (empty) burns nothing, so a bad paste can be retried.
+#   - long and multi-line values (PEM keys, JSON, a block of labelled values) are
+#     taken whole in a textarea (DIVE-5384). `secret write` stores one of several
+#     lines in its own file and names it from the .env, so no line of the value
+#     ever becomes a line of the .env.
 #   - expires after --ttl minutes (default 30); an expired link is deleted on sight.
 #   - minting is ROOT-only. A link is the right to write one key into a root-owned
 #     connector file, so a standard agent seat must never hold one (it has no sudo
@@ -216,14 +220,14 @@ _secret_drop_redeem() {
   if [[ -z "$(_secret_drop_gate_open "$ident" "$key" "$connector")" ]]; then
     _secret_drop_burn_task "$ident"; fail "$E_CONFLICT" "gate no longer open"
   fi
-  # The write reads stdin and refuses an empty or multi-line value BEFORE it
-  # touches the file; a refusal leaves the link live for a corrected paste. Its
+  # The write reads stdin and refuses an empty value BEFORE it touches the file;
+  # a refusal leaves the link live for a corrected paste. Its
   # own output is discarded: nothing it says may reach the page but the outcome.
   local rc=0 id
   id=$(_secret_drop_gate_open "$ident" "$key" "$connector")
   ( _secret_write "$key" --connector="$connector" ) >/dev/null 2>&1 || rc=$?
   if (( rc != 0 )); then
-    fail "$E_VALIDATION" "value refused (empty, or more than one line)"
+    fail "$E_VALIDATION" "value refused (empty)"
   fi
   # Clear the gate with the link as the evidence, BEFORE the burn: task answer
   # reads the link back from the store (_gate_drop_link_ok). The page's unit has
@@ -337,7 +341,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST, PORT, BUNDLE, STORE, IDLE = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5])
 TOKEN = re.compile(r"^/([A-Za-z0-9_-]{43})$")
-MAX_BODY = 32768
+MAX_BODY = 65536
 WINDOW, PER_CLIENT, GLOBAL = 600, 10, 60
 fails, fails_lock = {}, threading.Lock()
 
@@ -357,12 +361,13 @@ def record_fail(client):
 CSS = ("body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#f6f6f4;color:#1b1b1a}"
        "main{max-width:30rem;margin:0 auto;padding:2rem 1rem}h1{font-size:1.25rem;margin:0 0 .75rem}"
        "p{margin:.5rem 0}.ask{background:#fff;border:1px solid #ddd;border-radius:8px;padding:.75rem;white-space:pre-wrap}"
-       "input{width:100%;box-sizing:border-box;font:inherit;padding:.7rem;border:1px solid #bbb;border-radius:8px;margin:.75rem 0}"
+       "textarea{display:block;width:100%;box-sizing:border-box;font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;"
+       "padding:.7rem;border:1px solid #bbb;border-radius:8px;margin:.75rem 0;min-height:9rem;resize:vertical}"
        ".secret{-webkit-text-security:disc}"
        "button{width:100%;font:inherit;font-weight:600;padding:.75rem;border:0;border-radius:8px;background:#1b1b1a;color:#fff}"
        "small{color:#666}code{font-size:.9em}"
        "@media (prefers-color-scheme:dark){body{background:#151514;color:#eee}.ask{background:#1f1f1e;border-color:#333}"
-       "input{background:#1f1f1e;color:#eee;border-color:#444}button{background:#eee;color:#151514}small{color:#aaa}}")
+       "textarea{background:#1f1f1e;color:#eee;border-color:#444}button{background:#eee;color:#151514}small{color:#aaa}}")
 
 def page(title, body):
     return ("<!doctype html><html lang=en><head><meta charset=utf-8>"
@@ -429,11 +434,14 @@ class Handler(BaseHTTPRequestHandler):
         body = ("<h1>%s needs %s</h1>" % (who, html.escape(d["key"])) +
                 ("<p class=ask>%s</p>" % html.escape(ask) if ask else "") +
                 "<form method=post autocomplete=off>"
-                # A plain text field masked by CSS, not type=password: browsers offer to save
-                # every password field, and this value is not the owner's login (lodar 10-02).
-                "<input type=text name=value class=secret autocomplete=off autocapitalize=off "
+                # A textarea masked by CSS, never type=password: browsers offer to save every
+                # password field, and this value is not the owner's login (lodar 10-02). A
+                # textarea because some values are long or span lines (a PEM key, JSON, the
+                # three labelled lines OVH shows), and a one-line input flattens newlines
+                # to spaces (DIVE-5384).
+                "<textarea name=value class=secret rows=6 autocomplete=off autocapitalize=off "
                 "autocorrect=off spellcheck=false data-1p-ignore data-lpignore=true data-bwignore "
-                "required autofocus aria-label='Paste the value'>"
+                "required autofocus aria-label='Paste the value'></textarea>"
                 "<button type=submit>Save on the server</button></form>"
                 "<p><small>This page is served by your own server. The value goes only there, "
                 "saved as <code>%s</code> in <code>%s.env</code>, and this link then stops working. "
@@ -452,10 +460,12 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(int(n))
         vals = urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True).get("value", [""])
         raw = None
-        value = vals[0].strip()
+        # A form sends every line break in a textarea as CRLF, whatever was pasted.
+        # Back to LF, so a pasted PEM or JSON lands as the owner copied it.
+        value = vals[0].replace("\r\n", "\n").replace("\r", "\n").strip()
         vals = None
-        if not value or "\n" in value or "\r" in value:
-            return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>Paste the value as one line, then try again. The link still works.</p>"))
+        if not value:
+            return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>Nothing was pasted. The link still works.</p>"))
         rc, out = run(["_peek", "--hash=" + h])
         if rc != 0:
             value = None

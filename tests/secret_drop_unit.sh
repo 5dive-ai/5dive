@@ -163,6 +163,49 @@ printf 'plain-value' | _secret_write OTHER_KEY --connector=misc >/dev/null 2>&1
 [[ ! -s "$MOCK5DIVE_LOG" ]] && ok_t "T6 plain secret write triggers no gate resolve" \
   || bad_t "T6 plain secret write triggers no gate resolve" "calls: $(cat "$MOCK5DIVE_LOG")"
 
+# --- T7: DIVE-5384 — a multi-line value lands whole, the .env stays one line ---
+# The value file holds the value plus one newline (so $(cat) reads it back
+# exactly); the .env gets a single KEY_FILE=<path> line and never a value line.
+ENVF="$CONNECTORS_DIR/ovh.env"; VF="$CONNECTORS_DIR/ovh.d/OVH_CREDS"
+printf 'OTHER=keep\n' > "$ENVF"
+OVH=$'Application key ak16charsxxxxxxx\nApplication secret as32charsxxxxxxxxxxxxxxxxxxxxxxxx\nConsumer Key ck32charsxxxxxxxxxxxxxxxxxxxxxxxx'
+printf '%s' "$OVH" | _secret_write OVH_CREDS --connector=ovh > "$TMP/t7.out" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && cmp -s "$VF" <(printf '%s\n' "$OVH") && [[ "$(cat "$VF")" == "$OVH" ]] \
+  && ok_t "T7a a 3-line value reads back byte-identical from <connector>.d/<KEY>" \
+  || bad_t "T7a a 3-line value reads back byte-identical from <connector>.d/<KEY>" "rc=$rc out=$(cat "$TMP/t7.out") file=$(od -c "$VF" 2>&1 | head -5)"
+[[ "$(cat "$ENVF")" == "OTHER=keep"$'\n'"OVH_CREDS_FILE=$VF" ]] \
+  && ok_t "T7b the .env carries the other keys plus ONE pointer line, no value line" \
+  || bad_t "T7b the .env carries the other keys plus ONE pointer line, no value line" "env=$(cat "$ENVF")"
+[[ "$(stat -c %a "$VF")" == 600 && "$(stat -c %a "$CONNECTORS_DIR/ovh.d")" == 750 ]] \
+  && ok_t "T7c value file 600, its dir 750 (as the .env and connectors dir)" \
+  || bad_t "T7c value file 600, its dir 750 (as the .env and connectors dir)" "$(stat -c '%a %n' "$VF" "$CONNECTORS_DIR/ovh.d")"
+! grep -qF 'ak16chars' "$TMP/t7.out" && ok_t "T7d the write's output never carries the value" \
+  || bad_t "T7d the write's output never carries the value" "$(cat "$TMP/t7.out")"
+# Injection: a value carrying "\nEVIL=1" cannot create a second key.
+printf 'innocent\nEVIL=1\nPATH=/tmp' | _secret_write OVH_CREDS --connector=ovh >/dev/null 2>&1; rc=$?
+[[ $rc -eq 0 ]] && ! grep -qE '^(EVIL|PATH)=' "$ENVF" && [[ "$(wc -l < "$ENVF")" == 2 ]] \
+  && [[ "$(cat "$VF")" == $'innocent\nEVIL=1\nPATH=/tmp' ]] \
+  && ok_t "T7e a value with \\nEVIL=1 creates no second key (it is bytes in the value file)" \
+  || bad_t "T7e a value with \\nEVIL=1 creates no second key (it is bytes in the value file)" "rc=$rc env=$(cat "$ENVF")"
+# Back to one line: the value line returns, the pointer and the file go.
+printf 'single-now' | _secret_write OVH_CREDS --connector=ovh >/dev/null 2>&1
+[[ "$(cat "$ENVF")" == $'OTHER=keep\nOVH_CREDS=single-now' && ! -e "$VF" ]] \
+  && ok_t "T7f a single-line write over a multi-line one drops the pointer and the file" \
+  || bad_t "T7f a single-line write over a multi-line one drops the pointer and the file" "env=$(cat "$ENVF") file=$(ls "$CONNECTORS_DIR/ovh.d" 2>&1)"
+# Single-line stays byte-identical to the pre-DIVE-5384 shape, and a key that
+# merely shares the <KEY>_FILE name (not our pointer) is left alone.
+printf 'A=1\nSOLO_FILE=/opt/mine.pem\n' > "$CONNECTORS_DIR/solo.env"
+printf 'v1' | _secret_write SOLO --connector=solo >/dev/null 2>&1
+printf 'v2' | _secret_write SOLO --connector=solo >/dev/null 2>&1
+[[ "$(cat "$CONNECTORS_DIR/solo.env")" == $'A=1\nSOLO_FILE=/opt/mine.pem\nSOLO=v2' && ! -e "$CONNECTORS_DIR/solo.d" ]] \
+  && ok_t "T7g single-line writes are unchanged: KEY=value replaced in place, no .d dir, foreign KEY_FILE kept" \
+  || bad_t "T7g single-line writes are unchanged: KEY=value replaced in place, no .d dir, foreign KEY_FILE kept" "env=$(cat "$CONNECTORS_DIR/solo.env")"
+# Multi-line over single-line: the old value line goes (no stale second reading).
+printf 'l1\nl2' | _secret_write SOLO --connector=solo >/dev/null 2>&1
+[[ "$(cat "$CONNECTORS_DIR/solo.env")" == "A=1"$'\n'"SOLO_FILE=$CONNECTORS_DIR/solo.d/SOLO" ]] \
+  && ok_t "T7h a multi-line write over a single-line one drops the old KEY= line" \
+  || bad_t "T7h a multi-line write over a single-line one drops the old KEY= line" "env=$(cat "$CONNECTORS_DIR/solo.env")"
+
 echo
 echo "secret-drop unit: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
