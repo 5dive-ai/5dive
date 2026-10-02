@@ -316,7 +316,8 @@ EOF
 }
 
 _secret_drop_has_base_url() {
-  [[ -r "$SECRET_DROP_CONF" ]] && grep -q '^SECRET_DROP_BASE_URL=.' "$SECRET_DROP_CONF"
+  [[ -r "$SECRET_DROP_CONF" ]] || return 1
+  grep -q '^SECRET_DROP_BASE_URL=.' "$SECRET_DROP_CONF"
 }
 
 # DIVE-5372: does https://secrets.<domain>/ answer as the owner will see it?
