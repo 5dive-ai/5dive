@@ -283,8 +283,9 @@ ERR=$(env -i HOME="$H" PATH=/usr/bin:/bin bash -c ". '$TMP/tool-env.sh'" 2>&1)
 
 # ── the instructions every seat on a 5dive-built box loads ───────────────────
 BLOCK=$(sed -n '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/p' projects-CLAUDE.md)
-for want in 'never create or import agents yourself' '5dive hire-link <slug>' '5dive pkg install' \
-            '5dive route add <name> --port=<port>' '5dive task add' 'npm i -g'; do
+for want in 'A standard-tier agent never creates agents' '5dive hire-link <slug>' '5dive pkg install' \
+            '5dive route add <name> --port=<port>' '5dive task add' 'npm i -g' \
+            'Creating a teammate yourself is for admin-tier agents' '--type=codex' '5dive agent auth start <type>'; do
   [[ "$BLOCK" == *"$want"* ]] && ok "hired-agents block says: $want" || bad "hired-agents block says: $want"
 done
 grep -q 'sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:hired-agents' install.sh \
