@@ -1697,10 +1697,21 @@ _apply_byo_claude() {
 # a --base-url endpoint has no row, and the direct vendors (deepseek, moonshot,
 # qwen, zai) resolve the Anthropic id on their own side. Moving them is a separate
 # decision.
+#
+# DIVE-5359: the same hole, reached through an EXISTING account instead of
+# --provider. `agent create|import --auth-profile=demo-ai` with no model (a
+# custom agent's pack carries none) skipped the branch above, the preseed pinned
+# claude-opus-5-5, and a my.5dive box's $1 demo key paid about $0.07 per turn
+# for real Opus. So with no --model and no --provider, a profile that maps the
+# tiers (its own base URL plus ANTHROPIC_DEFAULT_OPUS_MODEL) starts the agent on
+# its opus-tier id. An Anthropic profile has no map, so the default is unchanged.
 claude_create_start_model() {
-  local model="${1:-}" provider="${2:-}" base_url="${3:-}"
+  local model="${1:-}" provider="${2:-}" base_url="${3:-}" profile="${4:-}"
   if [[ -z "$model" && "$provider" == "openrouter" && -z "$base_url" ]]; then
     model="${CLAUDE_PROVIDER_OPUS_MODEL[openrouter]:-}"
+  fi
+  if [[ -z "$model" && -z "$provider" && -n "$profile" ]]; then
+    model=$(profile_alias_model "$profile" opus)
   fi
   printf '%s' "$model"
 }
@@ -3205,8 +3216,11 @@ cmd_create() {
     # preseeded settings.json model is the actual startup selection and used to
     # be hard-pinned to claude-opus-4-8, overriding that intent. Pass the model
     # through so this agent starts on the requested OpenRouter/vendor slug.
-    local _claude_create_model="$byo_model"
-    _claude_create_model=$(claude_create_start_model "$_claude_create_model" "$byo_provider" "$byo_base_url")
+    local _claude_create_model="$byo_model" _claude_create_family=""
+    _claude_create_model=$(claude_create_start_model "$_claude_create_model" "$byo_provider" "$byo_base_url" "$profile")
+    # DIVE-5359: an unpinned seat that took its account's opus id follows the
+    # opus family, so `agent set-account` onto a Claude account re-derives it.
+    [[ -z "$byo_model" && -z "$byo_provider" && -n "$_claude_create_model" ]] && _claude_create_family=opus
     # DIVE-5163: a family alias resolves against the account this agent is bound
     # to. On an alias-mapping account (OpenRouter, a direct vendor) that is the
     # account's own id for the family; on Anthropic it is the current claude-* id
@@ -3424,6 +3438,7 @@ cmd_create() {
   # so `agent set-account` can re-derive its model for another account.
   local _model_family=""
   [[ "$type" == "claude" ]] && model_latest "$byo_model" >/dev/null && _model_family="$byo_model"
+  [[ "$type" == "claude" && -z "$_model_family" ]] && _model_family="${_claude_create_family:-}"
   jq --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$workdir" --arg p "$profile" --arg bu "$bot_username" --arg ts "$(date -Iseconds)" --arg iso "$isolation" --arg oid "$openagent_id" --arg mf "$_model_family" \
     '.agents[$n] = (
       {type: $t, channels: $c, createdAt: $ts, isolation: $iso, openagentId: $oid}
