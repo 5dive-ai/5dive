@@ -67,7 +67,7 @@ pol_has "the self-audit"                "Self-audit before you close"
 pol_has "maker/verifier separation"     "Maker and verifier are separate seats"
 pol_has "the reject verdict is terminal" "FAIL verdict is a complete, terminal"
 pol_has "no human at the keyboard"      "Never open a chooser"
-pol_has "the knowledge/compile clause"  "compile it to \`community/wiki/\`"
+pol_has "the knowledge/compile clause"  "compile it to \`community/wiki/\`" "memory add --store=wiki"
 pol_has "the result field is read"      "one or two self-contained"
 
 # DIVE-4416 (#926) deleted the `--options=A|B` usage placeholder from all three
