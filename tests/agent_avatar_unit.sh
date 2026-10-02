@@ -317,6 +317,17 @@ grep -q '/openagent/able.png$' "$CURL_LOG" && grep -q '/openagent/ceo.png$' "$CU
   && cmp -s "$TMP/site/openagent/ceo.png" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" \
   && [[ "$BF6" == *"WARN: could not set 'able'"*"over the cap"* && "$BF6" == *"1 set, 1 unresolved"* ]] \
   && okk "a portrait over the cap is reported unresolved and does not stop the next agent" || bad "63 arm: $BF6 curl=[$(tr '\n' ';' <"$CURL_LOG")]"
+# A blip on the box's own site during the --once pass is not "done": the
+# marker stays unwritten and the agents are reported, so the next update
+# (site back up) still sets the portrait.
+rm -f "$TMP/state/avatar-backfill.v2.done" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png"; : >"$TMP/site-down"
+BF7=$(oa_backfill "$TMP/provisioning.env"); rm -f "$TMP/site-down"
+[[ ! -e "$TMP/state/avatar-backfill.v2.done" && "$BF7" == *"WARN: could not reach this box's own site"* \
+   && "$BF7" == *"0 set, 0 unresolved, 3 not checked"* ]] \
+  && okk 'an unreachable own site leaves the --once marker unwritten and says so' || bad "site-down marker arm: $BF7"
+BF8=$(oa_backfill "$TMP/provisioning.env")
+cmp -s "$TMP/site/openagent/ceo.png" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" && [[ -e "$TMP/state/avatar-backfill.v2.done" ]] \
+  && okk 'the next update, with the site back, sets the portrait and marks the pass' || bad "site-up retry arm: $BF8"
 printf 'FIVE_DOMAIN="evil.test/x?"\n' >"$TMP/bad.env"
 AGENT_AVATAR_PROVISIONING="$TMP/bad.env" _agent_avatar_openagent_url ceo >/dev/null \
   && bad 'a malformed FIVE_DOMAIN made a URL' || okk 'a malformed FIVE_DOMAIN makes no URL'

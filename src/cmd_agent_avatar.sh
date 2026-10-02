@@ -264,8 +264,9 @@ _agent_avatar_get() {
 # yaml with a resolvable face.ref gets that portrait; failing that, the portrait
 # its box serves at /openagent/<agent>.png (DIVE-5413). Never overwrites a
 # portrait that is already there, so it is safe to re-run; `--once` makes
-# `5dive update` run it a single time per box. The marker is v2 so a box that ran
-# the persona-only pass once runs this one too.
+# `5dive update` run it a single time per box (a pass that could not reach the
+# box's own site stays unmarked, so the next update retries). The marker is v2
+# so a box that ran the persona-only pass once runs this one too.
 _agent_avatar_backfill() {
   local once=0 dry=0 a
   for a in "$@"; do
@@ -284,6 +285,7 @@ _agent_avatar_backfill() {
   ensure_state_ro
   local names; names=$(registry_read | jq -r '.agents | keys[]')
   local set_list=() missing=() name home dst yaml ref src tmp why ytmp personas got="" oa_down=0 rc
+  local unchecked=()
   ytmp=$(mktemp) || fail "$E_GENERIC" "mktemp failed"
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
@@ -318,7 +320,7 @@ _agent_avatar_backfill() {
       # timeout, TLS) is asked once, not 20s per agent inside update's 180s
       # budget. Any other failure is the site ANSWERING for this one agent: a
       # portrait over the cap is reported as unresolved and the walk goes on.
-      (( oa_down )) && continue
+      (( oa_down )) && { unchecked+=("$name"); continue; }
       src=$(_agent_avatar_openagent_url "$name") || continue
       got=$(mktemp)
       _agent_avatar_fetch "$src" "$got"; rc=$?
@@ -326,7 +328,8 @@ _agent_avatar_backfill() {
         rm -f -- "$got"; got=""
         case "$rc" in
           0|22) ;;
-          5|6|7|28|35|52|56) oa_down=1 ;;
+          5|6|7|28|35|52|56) oa_down=1; unchecked+=("$name")
+             warn "could not reach this box's own site (${src%/openagent/*}, curl $rc): portraits not checked; the next update tries again" ;;
           63) missing+=("$name"); warn "could not set '$name' avatar from $src: portrait over the cap" ;;
           *)  missing+=("$name"); warn "could not set '$name' avatar from $src: fetch failed (curl $rc)" ;;
         esac
@@ -346,10 +349,16 @@ _agent_avatar_backfill() {
     rm -f -- "$tmp"; why=""; got=""
   done <<<"$names"
   rm -f -- "$ytmp"
-  (( once && !dry )) && { : >"$marker" 2>/dev/null || true; }
-  local sj mj
+  # The marker means "every agent was looked at". An unreachable own site is a
+  # blip (update runs this right after restarting services), so that pass is
+  # left unmarked and the next update asks again: one fetch, bounded by 20s.
+  (( once && !dry && !oa_down )) && { : >"$marker" 2>/dev/null || true; }
+  local sj mj uj summary
   sj=$(json_array "${set_list[@]+"${set_list[@]}"}")
   mj=$(json_array "${missing[@]+"${missing[@]}"}")
-  ok "avatar backfill: ${#set_list[@]} set, ${#missing[@]} unresolved" '{set:$s, missing:$m, dryRun:$d}' \
-    --argjson s "$sj" --argjson m "$mj" --argjson d "$( (( dry )) && echo true || echo false)"
+  uj=$(json_array "${unchecked[@]+"${unchecked[@]}"}")
+  summary="avatar backfill: ${#set_list[@]} set, ${#missing[@]} unresolved"
+  (( oa_down )) && summary+=", ${#unchecked[@]} not checked (own site unreachable; the next update tries again)"
+  ok "$summary" '{set:$s, missing:$m, notChecked:$u, dryRun:$d}' \
+    --argjson s "$sj" --argjson m "$mj" --argjson u "$uj" --argjson d "$( (( dry )) && echo true || echo false)"
 }
