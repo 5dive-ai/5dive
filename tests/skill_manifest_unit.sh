@@ -218,5 +218,90 @@ for term in SKILL_ADD_MANUAL SKILL_ADD_SANDBOXED; do
   fi
 done
 
+# --- DIVE-5356: npx must not drain the install heredoc ----------------------
+# Every arm above runs the fenced block DIRECTLY, so none of them could see that
+# in production the block never ran: the install heredoc is fed to `bash -s` on
+# stdin, `npx skills add` inherits that stdin and reads it to EOF, and bash then
+# has no script left. It exited with tail's 0, so every install "succeeded" and
+# no manifest was ever written on the npx path (DIVE-2678 measured zero).
+# This arm runs the WHOLE heredoc the way production does — script on stdin —
+# with a stub npx that drains stdin exactly like the real one. Three
+# substitutions keep it hermetic (stub npx, no nvm, no ls-remote); the line under
+# test, the redirect, is left as shipped.
+echo "== DIVE-5356: the npx install heredoc runs past npx when fed on stdin =="
+STUB="$TMP/npx-stub"
+cat > "$STUB" <<'STUB_NPX'
+#!/usr/bin/env bash
+cat >/dev/null   # what the real npx does to an inherited stdin
+mkdir -p "$HOME/$INSTALL_DIR/$SKILL"
+printf -- '---\nname: %s\n---\n%s\n' "$SKILL" "${STUB_BODY:-v1}" > "$HOME/$INSTALL_DIR/$SKILL/SKILL.md"
+STUB_NPX
+chmod +x "$STUB"
+
+heredoc_body() {  # $1 = file, $2 = heredoc terminator name
+  sed -n "/<<'$2'/,/^$2\$/p" "$1" | sed '1d;$d'
+}
+hermetic() {
+  sed -e "s#^timeout 180 npx #timeout 180 $STUB #" \
+      -e 's#^export NVM_DIR=.*#export NVM_DIR=/nonexistent#' \
+      -e 's#timeout 20 /usr/bin/git ls-remote#false#'
+}
+# run_stdin <script> <home> <result-file> <stub-body>
+run_stdin() {
+  rm -f "$3"; mkdir -p "$2"   # the heredoc cd's into $HOME, which exists on a real seat
+  env -u CLAUDE_CONFIG_DIR HOME="$2" SOURCE="$SOURCE" SKILL="$SKILL" AGENT_ID=claude-code \
+    INSTALL_DIR="$INSTALL_DIR" FORCE=1 RESULT_FILE="$3" STUB_BODY="$4" \
+    bash -s < "$1" >/dev/null 2>&1
+}
+
+for term in SKILL_ADD SKILL_ADD_SANDBOXED; do
+  body="$(heredoc_body "$SRC" "$term")"
+  herm="$(hermetic <<<"$body")"
+  if ! grep -qF "timeout 180 $STUB " <<<"$herm" || ! grep -qF -- '--yes </dev/null' <<<"$herm"; then
+    bad_t "$term: heredoc extracted with its npx line" "no npx line with </dev/null found — this arm graded NOTHING"
+    continue
+  fi
+  printf '%s\n' "$herm" > "$TMP/$term.sh"
+  H="$TMP/home-$term"; R1="$TMP/$term-r1.json"; R2="$TMP/$term-r2.json"
+  run_stdin "$TMP/$term.sh" "$H" "$R1" v1
+  if [[ -s "$R1" && -s "$H/$INSTALL_DIR/.skills-manifest.json" ]]; then
+    ok_t "$term on stdin: first install writes the result file and the manifest"
+  else bad_t "$term on stdin: first install writes the result file and the manifest" "nothing after npx ran"; fi
+  run_stdin "$TMP/$term.sh" "$H" "$R2" v2
+  eq "$term on stdin: a re-pull with a new body reports changed=true" "$(changed "$R2")" "true"
+  prev="$(res "$R1" .content_sha256)"
+  if [[ -n "$prev" && "$(res "$R2" .previous_content_sha256)" == "$prev" ]]; then
+    ok_t "$term on stdin: the re-pull reads the previous hash"
+  else bad_t "$term on stdin: the re-pull reads the previous hash" "first='$prev' prev='$(res "$R2" .previous_content_sha256)'"; fi
+
+  # MUTANT: the pre-fix line. The same run must now write NOTHING, or the stub
+  # is not draining and the arms above prove nothing about the redirect.
+  mut="$(sed 's# </dev/null 2>&1 | tail# 2>\&1 | tail#' <<<"$herm")"
+  if [[ "$mut" == "$herm" ]]; then
+    bad_t "$term MUTANT: redirect removed" "sed matched nothing — VACUOUS"
+  else
+    printf '%s\n' "$mut" > "$TMP/$term-mut.sh"
+    HM="$TMP/home-$term-mut"; RM="$TMP/$term-rm.json"
+    run_stdin "$TMP/$term-mut.sh" "$HM" "$RM" v1
+    if [[ -d "$HM/$INSTALL_DIR/$SKILL" && ! -e "$RM" && ! -e "$HM/$INSTALL_DIR/.skills-manifest.json" ]]; then
+      ok_t "$term MUTANT: without </dev/null npx eats the script (skill installed, no result, no manifest)"
+    else
+      bad_t "$term MUTANT: without </dev/null npx eats the script (skill installed, no result, no manifest)" \
+            "skill dir=$([[ -d "$HM/$INSTALL_DIR/$SKILL" ]] && echo yes || echo no) result=$([[ -e "$RM" ]] && echo yes || echo no)"
+    fi
+  fi
+done
+
+# The default-skill heredoc in lib/agent_setup.sh ends at its npx line today, so
+# nothing is lost yet; the redirect is required there too so a line appended
+# after it is not silently dead. Every install call site carries it.
+missing="$(grep -nE '^[^#]*npx -y skills add' "$SRC" "$ROOT/src/lib/agent_setup.sh" | grep -v '</dev/null' || true)"
+n_sites="$(grep -cE '^[^#]*npx -y skills add' "$SRC" "$ROOT/src/lib/agent_setup.sh" | awk -F: '{s+=$2} END{print s}')"
+if [[ "$n_sites" -ge 3 && -z "$missing" ]]; then
+  ok_t "every npx skills add call site ($n_sites) reads </dev/null"
+else
+  bad_t "every npx skills add call site reads </dev/null" "sites=$n_sites missing: $missing"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

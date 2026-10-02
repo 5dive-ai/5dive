@@ -239,7 +239,9 @@ cd "$HOME"
 # --force: drop the existing copy so a pinned/managed skill actually upgrades
 # rather than npx no-op'ing on an already-present dir (DIVE-698).
 [ "${FORCE:-0}" = 1 ] && rm -rf "$INSTALL_DIR/$SKILL"
-timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes 2>&1 | tail -25
+# </dev/null: npx reads stdin to EOF, and stdin is this heredoc, so without it
+# nothing below this line ever runs (DIVE-5356).
+timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes </dev/null 2>&1 | tail -25
 [ -d "$INSTALL_DIR/$SKILL" ] || { echo "ERROR: $INSTALL_DIR/$SKILL missing after install" >&2; exit 1; }
 # DIVE-2282 manifest write. No local clone on the npx path, so the commit is
 # best-effort over the network; an empty sha never fails the install. Absolute
@@ -283,7 +285,9 @@ cd "$HOME"
 # --force: drop the existing copy so a pinned/managed skill actually upgrades
 # rather than npx no-op'ing on an already-present dir (DIVE-698).
 [ "${FORCE:-0}" = 1 ] && rm -rf "$INSTALL_DIR/$SKILL"
-timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes 2>&1 | tail -25
+# </dev/null: npx reads stdin to EOF, and stdin is this heredoc, so without it
+# nothing below this line ever runs (DIVE-5356).
+timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes </dev/null 2>&1 | tail -25
 [ -d "$INSTALL_DIR/$SKILL" ] || { echo "ERROR: $INSTALL_DIR/$SKILL missing after install" >&2; exit 1; }
 # DIVE-2282 manifest write. No local clone on the npx path, so the commit is
 # best-effort over the network; an empty sha never fails the install. Absolute
