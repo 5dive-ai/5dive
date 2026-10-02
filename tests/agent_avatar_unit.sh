@@ -270,6 +270,7 @@ oa_backfill() { # <provisioning.env> -> the backfill's output, down the root bra
       while (( $# )); do case "$1" in -o) o="$2"; shift 2 ;; --) u="$2"; shift 2 ;; *) shift ;; esac; done
       echo "$u" >>"$CURL_LOG"
       [[ -e "$TMP/site-down" ]] && return 7 # couldn't connect
+      [[ -s "$TMP/site-fail" ]] && return "$(<"$TMP/site-fail")" # any other site-level curl failure
       if [[ "$u" == https://pale-plain.5dive.com/openagent/*.png && -f "$TMP/site/openagent/${u##*/}" ]]; then
         command cp "$TMP/site/openagent/${u##*/}" "$o"; return 0
       fi
@@ -328,6 +329,18 @@ BF7=$(oa_backfill "$TMP/provisioning.env"); rm -f "$TMP/site-down"
 BF8=$(oa_backfill "$TMP/provisioning.env")
 cmp -s "$TMP/site/openagent/ceo.png" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" && [[ -e "$TMP/state/avatar-backfill.v2.done" ]] \
   && okk 'the next update, with the site back, sets the portrait and marks the pass' || bad "site-up retry arm: $BF8"
+# A bad certificate on the box's own site (curl 60) is the site unreadable, not
+# a per-agent miss: no marker, and the run after the cert is fixed sets ceo.
+# Same for a code nobody listed (18, a cut transfer): only 0/22/63 mean "answered".
+for code in 60 18; do
+  rm -f "$TMP/state/avatar-backfill.v2.done" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png"; echo "$code" >"$TMP/site-fail"
+  BFC=$(oa_backfill "$TMP/provisioning.env"); rm -f "$TMP/site-fail"
+  BFU=$(oa_backfill "$TMP/provisioning.env")
+  [[ "$BFC" == *"curl $code"*"0 set, 0 unresolved, 3 not checked"* && "$BFU" != *"already ran"* ]] \
+    && cmp -s "$TMP/site/openagent/ceo.png" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" \
+    && okk "curl $code on the own site leaves the pass unmarked; the next update sets the portrait" \
+    || bad "curl $code arm: [$BFC] then [$BFU]"
+done
 printf 'FIVE_DOMAIN="evil.test/x?"\n' >"$TMP/bad.env"
 AGENT_AVATAR_PROVISIONING="$TMP/bad.env" _agent_avatar_openagent_url ceo >/dev/null \
   && bad 'a malformed FIVE_DOMAIN made a URL' || okk 'a malformed FIVE_DOMAIN makes no URL'

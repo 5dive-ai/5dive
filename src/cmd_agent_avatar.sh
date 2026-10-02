@@ -316,10 +316,12 @@ _agent_avatar_backfill() {
       # answers every path with its app returns HTML: only an image counts, and
       # a miss is not "unresolved" (nothing pointed here).
       # Fetched once, here, into root's own temp file; installed from that copy.
-      # A box that cannot reach its own site at all (curl: resolve, connect,
-      # timeout, TLS) is asked once, not 20s per agent inside update's 180s
-      # budget. Any other failure is the site ANSWERING for this one agent: a
-      # portrait over the cap is reported as unresolved and the walk goes on.
+      # Only three outcomes are the site ANSWERING for this one agent: a page
+      # (0, an image or the app's HTML), an HTTP error (22), or a portrait over
+      # the cap (63, reported as unresolved; the walk goes on). Anything else
+      # (resolve, connect, timeout, a bad certificate, a cut transfer) means
+      # the site could not be read at all: it is asked once, not 20s per agent
+      # inside update's 180s budget, and the pass is left for the next update.
       (( oa_down )) && { unchecked+=("$name"); continue; }
       src=$(_agent_avatar_openagent_url "$name") || continue
       got=$(mktemp)
@@ -328,10 +330,9 @@ _agent_avatar_backfill() {
         rm -f -- "$got"; got=""
         case "$rc" in
           0|22) ;;
-          5|6|7|28|35|52|56) oa_down=1; unchecked+=("$name")
-             warn "could not reach this box's own site (${src%/openagent/*}, curl $rc): portraits not checked; the next update tries again" ;;
           63) missing+=("$name"); warn "could not set '$name' avatar from $src: portrait over the cap" ;;
-          *)  missing+=("$name"); warn "could not set '$name' avatar from $src: fetch failed (curl $rc)" ;;
+          *)  oa_down=1; unchecked+=("$name")
+              warn "could not reach this box's own site (${src%/openagent/*}, curl $rc): portraits not checked; the next update tries again" ;;
         esac
         continue
       fi
