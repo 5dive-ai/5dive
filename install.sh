@@ -1095,6 +1095,27 @@ JOURNALD
   done <<< "$_hs_list"
   # <<< DIVE-4194 box-side scripts
 
+  # >>> DIVE-5373 tool-env shim
+  # The unit's BASH_ENV points HERE, not at the key file. The keys stay 640
+  # root:claude under /etc/5dive (750), which a sandboxed seat cannot even
+  # traverse, and bash prints "<file>: Permission denied" on every command whose
+  # BASH_ENV it cannot open (only a missing file is silent). This shim is
+  # readable by every seat and sources the keys only when this seat can read
+  # them, so a sandboxed seat gets no keys and no noise. Written inline (no
+  # fetch, so no pin dependency) and BEFORE the unit, so no unit ever points at
+  # a shim that is not there yet.
+  install -d -m 755 "$LIB_DIR"
+  _te_tmp="$(mktemp "${LIB_DIR}/.tool-env.sh.XXXXXX")"
+  cat > "$_te_tmp" <<'TOOLENV'
+# 5dive tool keys (DIVE-5366/DIVE-5373): every agent's BASH_ENV. Silent when
+# this seat cannot read the keys.
+if [ -r /etc/5dive/connectors/tools.sh ]; then . /etc/5dive/connectors/tools.sh; fi
+TOOLENV
+  chmod 644 "$_te_tmp"
+  mv -f "$_te_tmp" "$LIB_DIR/tool-env.sh"
+  ok "tool-env shim → $LIB_DIR/tool-env.sh"
+  # <<< DIVE-5373 tool-env shim
+
   curl -fsSL "$REPO/systemd/5dive-agent%40.service" -o "$SYSTEMD_DIR/5dive-agent@.service"
   ok "systemd template installed"
 

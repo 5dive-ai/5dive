@@ -10,10 +10,12 @@
 #
 #   /etc/5dive/connectors/tools.sh   640 root:claude, lines `export KEY='value'`
 #
-# 5dive-agent@.service points BASH_ENV at it, so each command an agent runs
-# (every Bash tool call is a fresh non-interactive bash) reads the CURRENT keys:
-# a save or a remove reaches a running agent on its next command, no restart.
-# Missing file = no keys (bash skips a BASH_ENV that does not exist).
+# 5dive-agent@.service points BASH_ENV at /usr/local/lib/5dive/tool-env.sh, a
+# 644 shim install.sh writes that sources this file when the seat can read it,
+# so each command an agent runs (every Bash tool call is a fresh non-interactive
+# bash) reads the CURRENT keys: a save or a remove reaches a running agent on
+# its next command, no restart. Missing file = no keys. A sandboxed seat (not in
+# group claude) reads neither the keys nor an error (DIVE-5373).
 #
 # The Mini App reaches the box over the exec tunnel (`sudo -n 5dive tool ...`,
 # the box key stays in the app, DIVE-462), the same way it saves an AI key.
