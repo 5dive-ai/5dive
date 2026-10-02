@@ -252,6 +252,114 @@ BF=$(
 [[ "$BF" != *"'theta'"* && "$BF" == *"would set 'iota'"* ]] \
   && okk 'backfill skips an avatar.png that is a symlink (and still sets a clean agent)' || bad "backfill link arm: $BF"
 
+# --- DIVE-5413: a portrait hosted only on the box's own OpenAgent page -------
+# ceo (lodar 10-02, a customer box): made his OpenAgent portrait in June, and
+# the box serves it at https://<domain>/openagent/ceo.png, but no persona
+# under his home names it. curl is stubbed: that one URL answers the image, every
+# other path answers the box app's HTML (what a box with no /openagent route does).
+printf 'FIVE_DOMAIN="pale-plain.5dive.com"\n' >"$TMP/provisioning.env"
+mkdir -p "$TMP/site/openagent" "$AGENT_HOME_ROOT/agent-able/.claude" "$AGENT_HOME_ROOT/agent-ceo/.claude" "$AGENT_HOME_ROOT/agent-rook/.claude" "$TMP/state"
+{ printf '\x89PNG\r\n\x1a\n'; head -c 3000 /dev/urandom; } >"$TMP/site/openagent/ceo.png"
+: >"$TMP/state/avatar-backfill.v1.done" # the box already ran the persona-only pass
+CURL_LOG="$TMP/curl.log"
+oa_backfill() { # <provisioning.env> -> the backfill's output, down the root branch
+  local prov="$1"
+  : >"$CURL_LOG"; : >"$AS_LOG"; : >"$ROOT_LOG"
+  (
+    curl() {
+      local o="" u=""
+      while (( $# )); do case "$1" in -o) o="$2"; shift 2 ;; --) u="$2"; shift 2 ;; *) shift ;; esac; done
+      echo "$u" >>"$CURL_LOG"
+      [[ -e "$TMP/site-down" ]] && return 7 # couldn't connect
+      [[ -s "$TMP/site-fail" ]] && return "$(<"$TMP/site-fail")" # any other site-level curl failure
+      if [[ "$u" == https://pale-plain.5dive.com/openagent/*.png && -f "$TMP/site/openagent/${u##*/}" ]]; then
+        command cp "$TMP/site/openagent/${u##*/}" "$o"; return 0
+      fi
+      [[ -e "$TMP/site-big" && "$u" == */able.png ]] && return 63 # able's portrait is over --max-filesize
+      [[ -e "$TMP/site-404" ]] && return 22 # a box whose site 404s an unknown path
+      printf '<!doctype html><title>5dive</title>' >"$o"
+    }
+    registry_read() { printf '{"agents":{"able":{},"ceo":{},"rook":{}}}\n'; }
+    ensure_state_ro() { :; }; step() { echo "STEP: $*"; }; warn() { echo "WARN: $*"; }
+    ok() { echo "OK: $1"; }; json_array() { :; }; fail() { echo "FAILCALL: $2"; exit 1; }
+    _agent_avatar_provisioning() { printf '%s\n' "$prov"; }
+    STATE_DIR="$TMP/state" as_root _agent_avatar_backfill --once 2>&1
+  )
+}
+BF=$(oa_backfill "$TMP/provisioning.env")
+cmp -s "$TMP/site/openagent/ceo.png" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" \
+  && grep -qx 'https://pale-plain.5dive.com/openagent/ceo.png' "$CURL_LOG" \
+  && okk "backfill copies a portrait served only at the box's /openagent/<agent>.png" \
+  || bad "openagent backfill: $BF curl=[$(tr '\n' ';' <"$CURL_LOG")]"
+[[ ! -s "$ROOT_LOG" ]] && grep -q '^agent-ceo dd$' "$AS_LOG" \
+  && okk 'the openagent portrait is written as the agent; root touches no agent path' \
+  || bad "openagent root write: root=[$(tr '\n' ';' <"$ROOT_LOG")] as=[$(tr '\n' ';' <"$AS_LOG")]"
+[[ ! -e "$AGENT_HOME_ROOT/agent-rook/.claude/avatar.png" && "$BF" != *rook* && "$BF" == *"1 set, 0 unresolved"* ]] \
+  && okk "a box page that answers HTML is no portrait, and not an 'unresolved' warning" || bad "rook arm: $BF"
+[[ -e "$TMP/state/avatar-backfill.v2.done" && "$BF" != *already-ran* && "$BF" != *"already ran"* ]] \
+  && okk 'a box that ran the persona-only pass (v1 marker) runs this one once, and marks v2' || bad "marker arm: $BF"
+BF2=$(oa_backfill "$TMP/provisioning.env")
+[[ "$BF2" == *"already ran"* && ! -s "$CURL_LOG" ]] && okk 'the v2 pass runs once per box' || bad "rerun: $BF2"
+rm -f "$TMP/state/avatar-backfill.v2.done" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png"
+BF3=$(oa_backfill "$TMP/nope.env")
+[[ ! -s "$CURL_LOG" && ! -e "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" ]] \
+  && okk 'no recorded domain, no fetch' || bad "no-domain arm: $BF3 curl=[$(tr '\n' ';' <"$CURL_LOG")]"
+rm -f "$TMP/state/avatar-backfill.v2.done"; : >"$TMP/site-down"
+BF4=$(oa_backfill "$TMP/provisioning.env"); rm -f "$TMP/site-down"
+[[ "$(wc -l <"$CURL_LOG")" -eq 1 && ! -e "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" ]] \
+  && okk "a box that cannot reach its own site is asked once, not once per agent" || bad "site-down arm: $BF4 curl=[$(tr '\n' ';' <"$CURL_LOG")]"
+rm -f "$TMP/state/avatar-backfill.v2.done"; : >"$TMP/site-404"
+BF5=$(oa_backfill "$TMP/provisioning.env"); rm -f "$TMP/site-404"
+grep -q '/openagent/able.png$' "$CURL_LOG" && cmp -s "$TMP/site/openagent/ceo.png" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" \
+  && [[ "$BF5" != *able* ]] && okk "a 404 for one agent does not stop the next agent's fetch" || bad "404 arm: $BF5 curl=[$(tr '\n' ';' <"$CURL_LOG")]"
+# An over-cap portrait is the site answering, not the site down: the earlier
+# agent (able) is reported, and the later one (ceo) still gets its portrait.
+rm -f "$TMP/state/avatar-backfill.v2.done" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png"; : >"$TMP/site-big"
+BF6=$(oa_backfill "$TMP/provisioning.env"); rm -f "$TMP/site-big"
+grep -q '/openagent/able.png$' "$CURL_LOG" && grep -q '/openagent/ceo.png$' "$CURL_LOG" \
+  && cmp -s "$TMP/site/openagent/ceo.png" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" \
+  && [[ "$BF6" == *"WARN: could not set 'able'"*"over the cap"* && "$BF6" == *"1 set, 1 unresolved"* ]] \
+  && okk "a portrait over the cap is reported unresolved and does not stop the next agent" || bad "63 arm: $BF6 curl=[$(tr '\n' ';' <"$CURL_LOG")]"
+# A blip on the box's own site during the --once pass is not "done": the
+# marker stays unwritten and the agents are reported, so the next update
+# (site back up) still sets the portrait.
+rm -f "$TMP/state/avatar-backfill.v2.done" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png"; : >"$TMP/site-down"
+BF7=$(oa_backfill "$TMP/provisioning.env"); rm -f "$TMP/site-down"
+[[ ! -e "$TMP/state/avatar-backfill.v2.done" && "$BF7" == *"WARN: could not reach this box's own site"* \
+   && "$BF7" == *"0 set, 0 unresolved, 3 not checked"* ]] \
+  && okk 'an unreachable own site leaves the --once marker unwritten and says so' || bad "site-down marker arm: $BF7"
+BF8=$(oa_backfill "$TMP/provisioning.env")
+cmp -s "$TMP/site/openagent/ceo.png" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" && [[ -e "$TMP/state/avatar-backfill.v2.done" ]] \
+  && okk 'the next update, with the site back, sets the portrait and marks the pass' || bad "site-up retry arm: $BF8"
+# A bad certificate on the box's own site (curl 60) is the site unreadable, not
+# a per-agent miss: no marker, and the run after the cert is fixed sets ceo.
+# Same for a code nobody listed (18, a cut transfer): only 0/22/63 mean "answered".
+for code in 60 18; do
+  rm -f "$TMP/state/avatar-backfill.v2.done" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png"; echo "$code" >"$TMP/site-fail"
+  BFC=$(oa_backfill "$TMP/provisioning.env"); rm -f "$TMP/site-fail"
+  BFU=$(oa_backfill "$TMP/provisioning.env")
+  [[ "$BFC" == *"curl $code"*"0 set, 0 unresolved, 3 not checked"* && "$BFU" != *"already ran"* ]] \
+    && cmp -s "$TMP/site/openagent/ceo.png" "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" \
+    && okk "curl $code on the own site leaves the pass unmarked; the next update sets the portrait" \
+    || bad "curl $code arm: [$BFC] then [$BFU]"
+done
+[[ "$(AGENT_AVATAR_PROVISIONING="$TMP/bad.env" as_root _agent_avatar_provisioning)" == /etc/5dive/provisioning.env ]] \
+  && okk "root reads the fixed provisioning file whatever the caller's environment says" || bad 'root honoured AGENT_AVATAR_PROVISIONING'
+printf 'FIVE_DOMAIN="evil.test/x?"\n' >"$TMP/bad.env"
+AGENT_AVATAR_PROVISIONING="$TMP/bad.env" _agent_avatar_openagent_url ceo >/dev/null \
+  && bad 'a malformed FIVE_DOMAIN made a URL' || okk 'a malformed FIVE_DOMAIN makes no URL'
+# What the row asks for, end to end: after the update's pass, `agent list --json`
+# reports the portrait at the one path, and `avatar get --data` serves its bytes.
+rm -f "$TMP/state/avatar-backfill.v2.done"; BF=$(oa_backfill "$TMP/provisioning.env")
+printf '{"agents":{"ceo":%s}}\n' "$row" >"$TMP/agents-oa.json"
+OUT=$(python3 "$PY" "$TMP/agents-oa.json" "$TMP/profiles" "$TMP/connectors" "$AGENT_HOME_ROOT" "$TMP/sudoers" /default 2>/dev/null)
+[[ "$(jq -r '.[0].avatar.path' <<<"$OUT")" == "$AGENT_HOME_ROOT/agent-ceo/.claude/avatar.png" \
+   && "$(jq -r '.[0].avatar.bytes' <<<"$OUT")" == "$(stat -c %s "$TMP/site/openagent/ceo.png")" ]] \
+  && okk 'agent list --json reports the OpenAgent portrait at avatar.png' || bad "list arm: $(jq -c '.[0].avatar' <<<"$OUT")"
+G=$(JSON_MODE=1 _agent_avatar_get ceo --data)
+[[ "$(jq -r '.data.avatar.dataUri' <<<"$G")" == "data:image/png;base64,$(base64 -w0 "$TMP/site/openagent/ceo.png")" ]] \
+  && okk 'avatar get --data serves the OpenAgent portrait' || bad "get arm: ${G:0:200}"
+
 # --- wiring ---------------------------------------------------------------
 grep -q '^  src/cmd_agent_avatar.sh$' "$ROOT/build.sh" && okk 'module is bundled' || bad 'module missing from build.sh'
 grep -q 'cmd_agent_avatar "\$@"' "$ROOT/src/main.sh" && okk '`agent avatar` is dispatched' || bad 'agent avatar not dispatched'

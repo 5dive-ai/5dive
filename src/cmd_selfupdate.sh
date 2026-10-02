@@ -1211,8 +1211,9 @@ cmd_self_update() {
   fi
 
   # DIVE-5104: one pass that copies each agent's OpenAgent portrait (face.ref in
-  # a *.persona.yaml under its home) into ~/.claude/avatar.png, the one path the
-  # dashboard's agent list reads. Runs from the freshly-installed binary in its
+  # a *.persona.yaml under its home, else the box's own /openagent/<agent>.png,
+  # DIVE-5413) into ~/.claude/avatar.png, the one path the dashboard's agent list
+  # and the Mini App's My team read. Runs from the freshly-installed binary in its
   # own process, once per box (`--once` marker), and never fails the update.
   # Same bin seam as the health gate, so a fixture run never reaches the live CLI.
   if (( EUID == 0 )) && [[ -x "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" ]]; then
