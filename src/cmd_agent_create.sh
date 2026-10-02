@@ -2588,7 +2588,7 @@ _create_human_link_do() {
 }
 
 cmd_create() {
-  local name="" type="" channels="none" channels_explicit=0 telegram_token="" discord_token="" workdir="" profile=""
+  local name="" type="" channels="none" telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
   local telegram_profile=""   # DIVE-5306: explicit --telegram-profile=lite|default
   local cos_owner_id=""
@@ -2608,7 +2608,7 @@ cmd_create() {
       --type=*)                    type="${1#--type=}" ;;
       --yolo)                      autonomy="yolo" ;;
       --autonomy=*)                autonomy="${1#--autonomy=}" ;;
-      --channels=*)                channels="${1#--channels=}"; channels_explicit=1 ;;
+      --channels=*)                channels="${1#--channels=}" ;;
       --telegram-token=*)          telegram_token="${1#--telegram-token=}" ;;
       --telegram-home-channel=*)   telegram_home_channel="${1#--telegram-home-channel=}" ;;
       --telegram-allowed-users=*)  telegram_allowed_users="${1#--telegram-allowed-users=}" ;;
@@ -2738,20 +2738,14 @@ cmd_create() {
     warn "managed-fleet arm marker present ($grok_arm_marker), bypassing the DIVE-1221 Grok exfiltration freeze. Owner risk acceptance (lodar 2026-08-10), NOT a patch — the xAI upload path is still unfixed and unpinnable."
   fi
   valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard|buzz, comma-separable)"
-  # DIVE-856: claude agents are chat-capable in the web dashboard by default.
-  # The dashboard channel needs no token (the plugin reads the box connectord
-  # bearer itself), so fold it into every claude create: unset --channels
-  # becomes "dashboard", and an explicit list gets ",dashboard" appended.
-  # An explicit --channels=none stays the opt-out. Gated on the connectord
-  # env existing so self-hosted boxes with no dashboard backend don't boot a
-  # plugin that can never authenticate.
-  if [[ "$type" == "claude" && -r /etc/5dive/connectord.env ]]; then
-    if [[ "$channels" == "none" ]]; then
-      (( channels_explicit )) || channels="dashboard"
-    elif ! channel_in_list dashboard "$channels"; then
-      channels="${channels},dashboard"
-    fi
-  fi
+  # DIVE-5406: dashboard chat is OPT-IN. DIVE-856 used to fold `dashboard`
+  # into every claude create on a box with connectord.env (unset --channels
+  # became "dashboard", an explicit list got ",dashboard" appended). Mini App
+  # owners never open the web dashboard, so that put a plugin nobody used on
+  # every new agent (lodar 2026-10-02). A new agent now runs exactly the
+  # channels --channels names; the owner turns chat on per agent through the
+  # one-tap `config set channels=<current>,dashboard` path (cmd_agent_config).
+  # Existing agents are untouched.
   # DIVE-1002: least-privilege by default. Absent an explicit --isolation, new
   # agents are 'standard'. Bootstrap exception: the FIRST agent on a fresh box
   # (empty registry) is auto-granted 'admin' so the box has a fleet-manager out
@@ -3563,9 +3557,9 @@ cmd_create() {
   # marketplace git clone inside the plugin install (ERR_STREAM_PREMATURE_CLOSE),
   # and the session should come up with the plugin already staged anyway.
   # _team_bot_do_shared's own restart at the end doubles as the first start.
-  # "Channel-less" here means no personal bot (telegram/discord) — the
-  # DIVE-856 default dashboard channel is not a bot and must not disqualify
-  # an agent from the shared team group.
+  # "Channel-less" here means no personal bot (telegram/discord) — a
+  # dashboard channel (opt-in since DIVE-5406) is not a bot and must not
+  # disqualify an agent from the shared team group.
   local team_bot_status="off"
   if (( ! no_team_bot )) \
       && ! channel_in_list telegram "$channels" \
