@@ -46,12 +46,17 @@ _secret_usage() {
       A value of several lines (a PEM key, JSON) is saved whole in
       /etc/5dive/connectors/<name>.d/<KEY>, and <name>.env gets KEY_FILE=<that path>.
       Run at a terminal with nothing piped, it asks for the value (hidden input).
+      --connector=tools is the one store every agent reads: the key lands in
+      /etc/5dive/connectors/tools.sh and agents see $KEY from their next command
+      (one line, no spaces or quotes). Every other connector file is root-only.
 
   5dive secret link <DIVE-N> [--ttl=<minutes>]
       Mint a one-time link for an open secret gate: https://secrets.<box>/<token>.
       The owner opens it, pastes, taps once; the value goes from their browser to
       this box only, lands as the gate's KEY, and clears the gate. Single use,
-      expires in 30 min by default. Root-only.
+      expires in 30 min by default. Root-only. Returns once the page answers over
+      a valid certificate (at most ~20s on a box's first link); --json carries
+      ready:false if it did not in time (the link still works a moment later).
 
   5dive secret serve [--listen=127.0.0.1:3127]
       The page behind those links. Started on demand by `secret link`; exits by
@@ -77,6 +82,7 @@ cmd_secret() {
     serve)   _secret_serve "$@" ;;
     _peek)   _secret_drop_peek "$@" ;;
     _redeem) _secret_drop_redeem "$@" ;;
+    _prewarm) _secret_drop_prewarm "$@" ;;   # DIVE-5372: install.sh
     -h|--help|help) _secret_usage ;;
     *) fail "$E_USAGE" "unknown secret command: $sub (write|link|serve)" ;;
   esac
@@ -104,6 +110,10 @@ _secret_write() {
   [[ -n "$connector" ]] || fail "$E_USAGE" "--connector=<name> is required"
   _valid_env_key "$key"       || fail "$E_USAGE" "invalid KEY '$key' (env-var name: ^[A-Z_][A-Z0-9_]*\$)"
   _valid_connector "$connector" || fail "$E_USAGE" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]*\$)"
+  # Before stdin is read: a refused name never asks for its value.
+  if [[ "$connector" == tools ]] && _tools_var_reserved "$key"; then
+    fail "$E_VALIDATION" "$key is not allowed for --connector=tools: every agent loads tools.sh, so it takes only a key name (ending _KEY, _TOKEN, _SECRET or _PASSWORD, and not a seat's own such as ANTHROPIC_API_KEY); anything else could override $key for every seat on the box. Use the tool's own variable name (e.g. ELEVENLABS_API_KEY). Nothing was saved"
+  fi
 
   # Value on stdin ONLY, never argv. DIVE-5319: at a terminal (nothing piped) it
   # asks with hidden input, the fallback for a box no owner's browser can reach.
@@ -125,6 +135,19 @@ _secret_write() {
   local multi=0
   [[ "$value" == *$'\n'* ]] && multi=1
 
+  # DIVE-5370: `--connector=tools` is the one store every agent reads: tools.sh,
+  # loaded by each agent command through BASH_ENV (DIVE-5366). Every other
+  # connector file below is 600 root, which no agent seat can read, so a key an
+  # agent asks its owner for through a secret gate's link goes here instead.
+  local action="created" where="${connector}.env"
+  if [[ "$connector" == tools ]]; then
+    [[ " $(_tool_set_vars | tr '\n' ' ') " == *" $key "* ]] && action="updated"
+    _tool_put_var "$key" "$value"
+    where="every agent's environment, as \$${key}"
+    _secret_write_done "$key" "$connector" "$action" "$TOOLS_ENV_FILE" "$where" "$task"
+    return 0
+  fi
+
   local target="${CONNECTORS_DIR}/${connector}.env"
   local vdir="${CONNECTORS_DIR}/${connector}.d"
   local vfile="${vdir}/${key}" pointer="${key}_FILE=${vdir}/${key}"
@@ -136,7 +159,6 @@ _secret_write() {
   exec 9>"$SECRET_WRITE_LOCK" || fail "$E_GENERIC" "cannot open secret-write lock"
   flock 9 || fail "$E_GENERIC" "cannot acquire secret-write lock"
 
-  local action="created"
   if [[ -f "$target" ]]; then
     grep -qE "^${key}=" "$target" && action="updated"
     grep -qxF "$pointer" "$target" && action="updated"
@@ -181,7 +203,17 @@ _secret_write() {
   # A single line replacing a multi-line value: the old file is no longer named.
   (( multi )) || rm -f "$vfile"
   exec 9>&-
+  if (( multi )); then
+    where="${connector}.d/${key}"
+    _secret_write_done "$key" "$connector" "$action" "$target" "$where" "$task" "$vfile"
+  else
+    _secret_write_done "$key" "$connector" "$action" "$target" "$where" "$task"
+  fi
+}
 
+# The tail both stores share: clear the gate, then report where the value is.
+_secret_write_done() {
+  local key="$1" connector="$2" action="$3" target="$4" where="$5" task="$6" vfile="${7:-}"
   # DIVE-931 gate auto-resolve: the credential is now safely on the box, so clear
   # the originating secret gate (equivalent to the human tapping "Provided"). We
   # are root here (require_root above) — a sanctioned human-equivalent path, so
@@ -194,15 +226,15 @@ _secret_write() {
   if [[ -n "$task" ]]; then
     local _ans_out _ans_rc=0
     _ans_out=$(5dive task answer "$task" --human --from=drop 2>&1 >/dev/null) || _ans_rc=$?
-    (( _ans_rc == 0 )) || warn "saved, but $task was not marked provided (${_ans_out:-rc $_ans_rc}); tell its agent the value is in ${connector}.env"
+    (( _ans_rc == 0 )) || warn "saved, but $task was not marked provided (${_ans_out:-rc $_ans_rc}); tell its agent the value is in ${where}"
   fi
 
-  if (( multi )); then
-    ok "secret $action: $key -> ${connector}.d/${key} (several lines; ${connector}.env names it as ${key}_FILE)" \
+  if [[ -n "$vfile" ]]; then
+    ok "secret $action: $key -> ${where} (several lines; ${connector}.env names it as ${key}_FILE)" \
        '{connector: $c, key: $k, action: $a, path: $p, value_file: $f}' \
        --arg c "$connector" --arg k "$key" --arg a "$action" --arg p "$target" --arg f "$vfile"
   else
-    ok "secret $action: $key -> ${connector}.env" \
+    ok "secret $action: $key -> ${where}" \
        '{connector: $c, key: $k, action: $a, path: $p}' \
        --arg c "$connector" --arg k "$key" --arg a "$action" --arg p "$target"
   fi

@@ -2103,7 +2103,10 @@ cmd_task_answer() {
       _ping_sk=$(db "SELECT COALESCE(secret_key,'') FROM tasks WHERE id=${id};")
       _ping_conn=$(db "SELECT COALESCE(connector,'') FROM tasks WHERE id=${id};")
       local _ping_dir="${CONNECTORS_DIR:-/etc/5dive/connectors}"
-      if [[ -n "$_ping_sk" && -n "$_ping_conn" ]] \
+      if [[ "$_ping_conn" == tools && -n "$_ping_sk" ]]; then
+        # DIVE-5370: the tools store is every agent's environment (BASH_ENV).
+        pingmsg="${ident} secret gate provided — \$${_ping_sk} is set in your environment from your next command. Resume the task and use it from there, NOT from the task."
+      elif [[ -n "$_ping_sk" && -n "$_ping_conn" ]] \
          && grep -qxF "${_ping_sk}_FILE=${_ping_dir}/${_ping_conn}.d/${_ping_sk}" "${_ping_dir}/${_ping_conn}.env" 2>/dev/null; then
         # DIVE-5384: a value of several lines is its own file, named from the .env.
         pingmsg="${ident} secret gate provided — ${_ping_sk} spans several lines, so it is the file ${_ping_dir}/${_ping_conn}.d/${_ping_sk} on this box (${_ping_conn}.env names it as ${_ping_sk}_FILE). Resume the task and load it from there, NOT from the task."
