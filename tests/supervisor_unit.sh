@@ -587,10 +587,15 @@ t "3856 predicate: does NOT match the LAUNCHER (the whole point — it is state 
      | grep -qE "$_PAT_C" && printf yes || printf no)"
 t "3856 predicate: is NOT the classifier's pattern (that one matches the launcher and misses the poller)" "differ" \
   "$( [[ "${_SUP_TRUE_POLLER_PAT[claude]}" == "${_SUP_POLLER_PAT[claude]}" ]] && printf same || printf differ )"
-t "3856 count: one poller process counts as one" "1" "$(tp '4242')"
+# A fixed fake pid is excluded whenever the harness shell itself got that pid:
+# main went red at 9e7a2adc on `got '0'` when a runner handed $$ or $PPID 4242
+# (DIVE-5376). Step past both so the arm grades the count, not the pid draw.
+_FAKE_PID=4242
+while [[ "$_FAKE_PID" == "$$" || "$_FAKE_PID" == "${PPID:-}" ]]; do _FAKE_PID=$((_FAKE_PID + 1)); done
+t "3856 count: one poller process counts as one" "1" "$(tp "$_FAKE_PID")"
 t "3856 count: the probe's OWN pid is excluded (pgrep -f matches our command line)" "0" "$(tp "$$")"
 t "3856 count: no poller is a real zero, not unknown" "0" "$(tp '')"
-t "3856 count: a type with no argv-stable poller is n/a, never zero (opencode is \`bun run … start\`)" "n/a" "$(tp '4242' unit-p opencode)"
+t "3856 count: a type with no argv-stable poller is n/a, never zero (opencode is \`bun run … start\`)" "n/a" "$(tp "$_FAKE_PID" unit-p opencode)"
 t "3856 count: opencode is absent from the table ON PURPOSE" "absent" \
   "$( [[ -n "${_SUP_TRUE_POLLER_PAT[opencode]:-}" ]] && printf present || printf absent )"
 # `sudo pgrep -u agent-<n>` FAILS OPEN on a 5dive-only sudo grant: "a password is
