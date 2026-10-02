@@ -156,10 +156,11 @@ sed -i "s/^expires=.*/expires=$(( $(date +%s) - 5 ))/" "$SECRET_DROP_DIR/$h"
 rm -rf "$SECRET_DROP_DIR"; : > "$MOCK5DIVE_LOG"
 out=$(mint DIVE-11); tok1=$(tok_of "$out")
 out=$(mint DIVE-11); tok2=$(tok_of "$out")
-printf 'line one\nline two' | ( _secret_drop_redeem --hash="$(hash_of "$tok1")" ) >/dev/null 2>&1; rc=$?
+# DIVE-5384: a multi-line value is no longer refused (L5j lands one); an empty one still is.
+printf '\n' | ( _secret_drop_redeem --hash="$(hash_of "$tok1")" ) >/dev/null 2>&1; rc=$?
 [[ $rc -eq $E_VALIDATION && -f "$SECRET_DROP_DIR/$(hash_of "$tok1")" && ! -s "$CONNECTORS_DIR/gmail.env" ]] \
-  && ok_t "L4a a multi-line value is refused, nothing written, the link still works" \
-  || bad_t "L4a a multi-line value is refused, nothing written, the link still works" "rc=$rc"
+  && ok_t "L4a an empty value is refused, nothing written, the link still works" \
+  || bad_t "L4a an empty value is refused, nothing written, the link still works" "rc=$rc"
 VALUE='abcd efgh ijkl mnop'
 printf '%s' "$VALUE" | ( _secret_drop_redeem --hash="$(hash_of "$tok1")" ) > "$TMP/redeem.out" 2>&1; rc=$?
 [[ $rc -eq 0 && "$(grep -cxF "GMAIL_APP_PASSWORD=$VALUE" "$CONNECTORS_DIR/gmail.env")" == 1 ]] \
@@ -216,9 +217,9 @@ rm -rf "$SECRET_DROP_DIR"; rm -f "$CONNECTORS_DIR/gmail.env"; : > "$MOCK5DIVE_LO
 out=$(mint DIVE-11); tok=$(tok_of "$out")
 B="http://127.0.0.1:$PORT"
 code=$(curl -s -o "$TMP/page.html" -D "$TMP/page.hdr" -w '%{http_code}' "$B/$tok")
-[[ "$code" == 200 ]] && grep -q 'type=password name=value' "$TMP/page.html" && grep -q 'mailer needs GMAIL_APP_PASSWORD' "$TMP/page.html" \
-  && ok_t "L5a GET shows a masked field and which seat FILED the ask (not the routed assignee) for which KEY" \
-  || bad_t "L5a GET shows a masked field and which seat FILED the ask (not the routed assignee) for which KEY" "code=$code $(head -c 400 "$TMP/page.html")"
+[[ "$code" == 200 ]] && grep -q '<textarea name=value class=secret' "$TMP/page.html" && ! grep -q '<input' "$TMP/page.html" && ! grep -q 'type=password' "$TMP/page.html" && grep -q '[.]secret{-webkit-text-security:disc}' "$TMP/page.html" && grep -q 'mailer needs GMAIL_APP_PASSWORD' "$TMP/page.html" \
+  && ok_t "L5a GET shows a CSS-masked textarea (never type=password, so no save-password prompt) and which seat FILED the ask (not the routed assignee) for which KEY" \
+  || bad_t "L5a GET shows a CSS-masked textarea (never type=password, so no save-password prompt) and which seat FILED the ask (not the routed assignee) for which KEY" "code=$code $(head -c 400 "$TMP/page.html")"
 grep -qi '^cache-control: no-store' "$TMP/page.hdr" && grep -qi '^referrer-policy: no-referrer' "$TMP/page.hdr" \
   && grep -qi "^content-security-policy: default-src 'none'" "$TMP/page.hdr" && grep -qi '^x-frame-options: DENY' "$TMP/page.hdr" \
   && ok_t "L5b no-store, no-referrer, CSP default-src none, no framing" \
@@ -253,6 +254,26 @@ code2=$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 192.0.2.7' "
 [[ "$codes" == *"404 "* && "$code" == 429 && "$code2" == 200 ]] \
   && ok_t "L5i ten failed lookups from one client -> 429 for it, others unaffected" \
   || bad_t "L5i ten failed lookups from one client -> 429 for it, others unaffected" "codes=$codes then=$code other=$code2"
+# L5j DIVE-5384: a pasted 3-line block lands whole. A browser submits a textarea's
+# line breaks as CRLF, so the POST sends CRLF and the box must hold LF.
+reopen DIVE-11; rm -rf "$SECRET_DROP_DIR"; rm -f "$CONNECTORS_DIR/gmail.env"
+out=$(mint DIVE-11); tok=$(tok_of "$out")
+ML=$'Application key ak16charsxxxxxxx\nApplication secret as32charsxxxxxxxxxxxxxxxxxxxxxxxx\nConsumer Key ck32charsxxxxxxxxxxxxxxxxxxxxxxxx'
+code=$(curl -s -o "$TMP/post-ml.html" -w '%{http_code}' --data-urlencode "value=${ML//$'\n'/$'\r\n'}" "$B/$tok")
+VF="$CONNECTORS_DIR/gmail.d/GMAIL_APP_PASSWORD"
+[[ "$code" == 200 ]] && cmp -s "$VF" <(printf '%s\n' "$ML") \
+  && [[ "$(cat "$CONNECTORS_DIR/gmail.env")" == "GMAIL_APP_PASSWORD_FILE=$VF" ]] \
+  && ok_t "L5j a 3-line paste (CRLF, as a browser sends it) reads back byte-identical on the box; the .env holds one pointer line" \
+  || bad_t "L5j a 3-line paste (CRLF, as a browser sends it) reads back byte-identical on the box; the .env holds one pointer line" "code=$code env=$(cat "$CONNECTORS_DIR/gmail.env" 2>/dev/null) file=$(od -c "$VF" 2>&1 | head -4) body=$(head -c 300 "$TMP/post-ml.html")"
+! grep -qF 'as32chars' "$TMP/post-ml.html" && ! grep -qF 'as32chars' "$TMP/server.log" \
+  && ok_t "L5k the multi-line value is in neither the response nor the server log" \
+  || bad_t "L5k the multi-line value is in neither the response nor the server log" "leaked"
+reopen DIVE-11
+out=$(mint DIVE-11); tok=$(tok_of "$out")
+code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode $'value=innocent\r\nEVIL=1' "$B/$tok")
+[[ "$code" == 200 ]] && ! grep -q '^EVIL=' "$CONNECTORS_DIR/gmail.env" && [[ "$(wc -l < "$CONNECTORS_DIR/gmail.env")" == 1 ]] \
+  && ok_t "L5l a paste of 'x<newline>EVIL=1' through the page creates no second key" \
+  || bad_t "L5l a paste of 'x<newline>EVIL=1' through the page creates no second key" "code=$code env=$(cat "$CONNECTORS_DIR/gmail.env")"
 kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
 
 # --- L6: idle exit ---------------------------------------------------------------
@@ -416,7 +437,8 @@ export GATE_PROOF_ENFORCE="$TMP/enforce"; unset SUDO_UID
 _gate_is_root() { return 0; }; _gate_caller_uid() { printf '0'; }
 _gate_sudo_uid_nonagent() { return 0; }
 _gate_caller_cgroup() { printf '%s' '/system.slice/5dive-secret-drop.service'; }
-task_need_notify() { :; }; cmd_send() { :; }; _task_send_owner() { :; }
+task_need_notify() { :; }; _task_send_owner() { :; }
+cmd_send() { printf '%s\n' "\$*" >> "$TMP/sends.log"; }
 # The audit fence withholds lines on a non-prod store; AUDIT_LOG is the harness's file.
 _task_store_audit_log() { audit_log "\$@"; }
 # Mutation seam: break the link between the redeem's checks and the answer.
@@ -455,6 +477,30 @@ grep -q 'task=DIVE-21.*evidence=drop-link' "$AUDIT_LOG_T" && grep -q 'enforce=on
 [[ ! -e "$SECRET_DROP_DIR/$h" && "$(grep -cxF "E2E_KEY=$VALUE" "$CONNECTORS_DIR/e2e5319.env")" == 1 ]] && ! grep -qF "$VALUE" "$AUDIT_LOG_T" \
   && ok_t "L10d the link is burned after the clear, the value is in the file once and never in the audit" \
   || bad_t "L10d the link is burned after the clear, the value is in the file once and never in the audit" "ls=$(ls "$SECRET_DROP_DIR")"
+
+# L10k DIVE-5384: a multi-line value lands as KEY_FILE + its file, and that counts
+# as "the value landed" for the evidence check, so the gate closes, and the ping to
+# the seat names the file. A pointer whose file is gone is NOT evidence.
+: > "$TMP/sends.log"
+seed_gate DIVE-25 E2E_PEM e2e25
+out=$(mint DIVE-25); h=$(hash_of "$(tok_of "$out")")
+PEM=$'-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----'
+out=$(redeem_real "$h" "$PEM" 2>&1); rc=$?
+ev=$(db "SELECT COALESCE(human_evidence,'') FROM tasks WHERE ident='DIVE-25';")
+[[ $rc -eq 0 && -n "$(ans_at DIVE-25)" && "$ev" == "drop-link" ]] && cmp -s "$CONNECTORS_DIR/e2e25.d/E2E_PEM" <(printf '%s\n' "$PEM") \
+  && ok_t "L10k a multi-line redeem through the real verb lands the file AND closes the gate (evidence=drop-link)" \
+  || bad_t "L10k a multi-line redeem through the real verb lands the file AND closes the gate (evidence=drop-link)" "rc=$rc at=$(ans_at DIVE-25) ev=$ev out=$out"
+grep -qF "E2E_PEM spans several lines, so it is the file $CONNECTORS_DIR/e2e25.d/E2E_PEM" "$TMP/sends.log" \
+  && ok_t "L10l the seat's 'provided' ping names the value file, not the .env" \
+  || bad_t "L10l the seat's 'provided' ping names the value file, not the .env" "sends: $(cat "$TMP/sends.log")"
+seed_gate DIVE-26 E2E_PEM e2e26
+out=$(mint DIVE-26); h=$(hash_of "$(tok_of "$out")")
+printf 'E2E_PEM_FILE=%s\n' "$CONNECTORS_DIR/e2e26.d/E2E_PEM" > "$CONNECTORS_DIR/e2e26.env"
+out=$(PATH="$REALBIN:$PATH" 5dive task answer DIVE-26 --human --from=drop --drop-link="$h" 2>&1); rc=$?
+[[ $rc -eq $E_AUTH_REQUIRED && -z "$(ans_at DIVE-26)" ]] \
+  && ok_t "L10m a KEY_FILE pointer with no value file behind it is not evidence (refused, gate open)" \
+  || bad_t "L10m a KEY_FILE pointer with no value file behind it is not evidence (refused, gate open)" "rc=$rc at=$(ans_at DIVE-26) out=$out"
+rm -f "$CONNECTORS_DIR/e2e26.env"
 
 # Mutation arms: the evidence is read from the STORE, so a link gone or re-bound
 # between the checks and the answer leaves the gate open, and redeem says so.

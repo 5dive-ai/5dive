@@ -75,6 +75,12 @@ for bad in "x';touch\${IFS}$TMP/pwned;'" 'has space'; do
   out=$(put "$bad" FAL_KEY --connector=tools); rc=$?
   [[ $rc -ne 0 && "$(cat "$F")" == "$before" ]] && ok_t "S3 refused: $bad" || bad_t "S3 must refuse: $bad" "rc=$rc"
 done
+# DIVE-5384: a value of several lines goes to its own file for a plain
+# connector, but tools keeps its one-line rule: the tools branch runs first.
+out=$(put $'sk_line_one\nEVIL_KEY=1' FAL_KEY --connector=tools); rc=$?
+[[ $rc -ne 0 && "$(cat "$F")" == "$before" && ! -e "$FIVEDIVE_CONNECTOR_DIR/tools.d" && ! -e "$FIVEDIVE_CONNECTOR_DIR/tools.env" ]] \
+  && ok_t "S3 a multi-line value is refused for --connector=tools; no tools.d file, no tools.env" \
+  || bad_t "S3 must refuse a multi-line tools value" "rc=$rc $(ls -A "$FIVEDIVE_CONNECTOR_DIR" 2>&1)"
 seen FAL_KEY >/dev/null
 [[ ! -e "$TMP/pwned" ]] && ok_t "S3 nothing executed on the next bash" || bad_t "S3 injection ran"
 

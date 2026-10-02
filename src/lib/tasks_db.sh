@@ -4138,7 +4138,7 @@ _gate_human_principal() {
 # caller's word: the caller is root, the gate is an open secret gate, a link with
 # this hash exists in the root-only store, is unexpired, is bound to this ident,
 # KEY and connector, and the KEY is already in that connector file (the value
-# landed). `_redeem` burns the link right after this answer, so it is single use.
+# landed; a multi-line one as KEY_FILE plus its file, DIVE-5384). `_redeem` burns the link right after this answer, so it is single use.
 # Residual, the same class as DIVE-916: a root-equivalent seat can mint and
 # redeem a link itself; a link is no weaker than the sudo that mints it.
 _gate_drop_link_ok() { # <task id> <link hash>
@@ -4156,7 +4156,12 @@ _gate_drop_link_ok() { # <task id> <link hash>
      && "$(sed -n 's/^connector=//p' "$f")" == "$conn" ]] || return 1
   local exp; exp=$(sed -n 's/^expires=//p' "$f")
   [[ "$exp" =~ ^[0-9]+$ ]] && (( exp > $(date +%s) )) || return 1
-  grep -q "^${key}=" "${CONNECTORS_DIR:-/etc/5dive/connectors}/${conn}.env" 2>/dev/null
+  local cdir="${CONNECTORS_DIR:-/etc/5dive/connectors}"
+  grep -q "^${key}=" "${cdir}/${conn}.env" 2>/dev/null && return 0
+  # DIVE-5384: a multi-line value landed as its own file, named by our exact
+  # pointer line. Both must hold: the line, and a non-empty regular file.
+  local vf="${cdir}/${conn}.d/${key}"
+  grep -qxF "${key}_FILE=${vf}" "${cdir}/${conn}.env" 2>/dev/null && [[ -f "$vf" && ! -L "$vf" && -s "$vf" ]]
 }
 
 # ── DIVE-756: persisted closure signature (tamper-evidence) ──────────────────
