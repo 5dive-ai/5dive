@@ -263,6 +263,7 @@ mkdir -p "$TMP/site/openagent" "$AGENT_HOME_ROOT/agent-able/.claude" "$AGENT_HOM
 : >"$TMP/state/avatar-backfill.v1.done" # the box already ran the persona-only pass
 CURL_LOG="$TMP/curl.log"
 oa_backfill() { # <provisioning.env> -> the backfill's output, down the root branch
+  local prov="$1"
   : >"$CURL_LOG"; : >"$AS_LOG"; : >"$ROOT_LOG"
   (
     curl() {
@@ -281,7 +282,8 @@ oa_backfill() { # <provisioning.env> -> the backfill's output, down the root bra
     registry_read() { printf '{"agents":{"able":{},"ceo":{},"rook":{}}}\n'; }
     ensure_state_ro() { :; }; step() { echo "STEP: $*"; }; warn() { echo "WARN: $*"; }
     ok() { echo "OK: $1"; }; json_array() { :; }; fail() { echo "FAILCALL: $2"; exit 1; }
-    AGENT_AVATAR_PROVISIONING="$1" STATE_DIR="$TMP/state" as_root _agent_avatar_backfill --once 2>&1
+    _agent_avatar_provisioning() { printf '%s\n' "$prov"; }
+    STATE_DIR="$TMP/state" as_root _agent_avatar_backfill --once 2>&1
   )
 }
 BF=$(oa_backfill "$TMP/provisioning.env")
@@ -341,6 +343,8 @@ for code in 60 18; do
     && okk "curl $code on the own site leaves the pass unmarked; the next update sets the portrait" \
     || bad "curl $code arm: [$BFC] then [$BFU]"
 done
+[[ "$(AGENT_AVATAR_PROVISIONING="$TMP/bad.env" as_root _agent_avatar_provisioning)" == /etc/5dive/provisioning.env ]] \
+  && okk "root reads the fixed provisioning file whatever the caller's environment says" || bad 'root honoured AGENT_AVATAR_PROVISIONING'
 printf 'FIVE_DOMAIN="evil.test/x?"\n' >"$TMP/bad.env"
 AGENT_AVATAR_PROVISIONING="$TMP/bad.env" _agent_avatar_openagent_url ceo >/dev/null \
   && bad 'a malformed FIVE_DOMAIN made a URL' || okk 'a malformed FIVE_DOMAIN makes no URL'

@@ -20,10 +20,13 @@
 # every consumer — the browser, Telegram's setMyProfilePhoto — sniffs the bytes.
 
 AGENT_AVATAR_MAX_BYTES="${AGENT_AVATAR_MAX_BYTES:-2097152}"
-# Where the box's public domain is recorded (FIVE_DOMAIN). Overridable for the
-# harness only: under sudo it is reset, so a caller cannot point root at a file.
-AGENT_AVATAR_PROVISIONING="${AGENT_AVATAR_PROVISIONING:-/etc/5dive/provisioning.env}"
-if (( EUID == 0 )) && [[ -n "${SUDO_UID:-}" ]]; then AGENT_AVATAR_PROVISIONING=/etc/5dive/provisioning.env; fi
+# Where the box's public domain is recorded (FIVE_DOMAIN). Root always reads the
+# one fixed file, so no caller can point root at another. The variable is honoured
+# only for a non-root caller (the harness); the harness stubs this for root.
+_agent_avatar_provisioning() {
+  if _agent_avatar_is_root; then printf '/etc/5dive/provisioning.env\n'
+  else printf '%s\n' "${AGENT_AVATAR_PROVISIONING:-/etc/5dive/provisioning.env}"; fi
+}
 
 _agent_avatar_path() { # <name>
   printf '%s/agent-%s/.claude/avatar.png\n' "${AGENT_HOME_ROOT:-/home}" "$1"
@@ -181,8 +184,8 @@ _agent_avatar_resolve_ref() { # <agent> <yaml> <ref>
 # public URL is the one place every such box agrees on, wherever the file sits on
 # disk, so the backfill asks for it. Echoes the URL, or fails with no domain.
 _agent_avatar_openagent_url() { # <agent>
-  local d=""
-  [[ -r "$AGENT_AVATAR_PROVISIONING" ]] && d=$(sed -n 's/^FIVE_DOMAIN=//p' "$AGENT_AVATAR_PROVISIONING" | tail -1)
+  local d="" pfile; pfile=$(_agent_avatar_provisioning)
+  [[ -r "$pfile" ]] && d=$(sed -n 's/^FIVE_DOMAIN=//p' "$pfile" | tail -1)
   d="${d%\"}"; d="${d#\"}"
   [[ "$d" =~ ^[a-z0-9_]([a-z0-9_.-]*[a-z0-9])?$ && "$d" == *.* ]] || return 1
   printf 'https://%s/openagent/%s.png\n' "$d" "$1"
