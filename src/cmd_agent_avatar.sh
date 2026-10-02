@@ -283,7 +283,7 @@ _agent_avatar_backfill() {
   _agent_avatar_is_root || (( dry )) || fail "$E_GENERIC" "avatar backfill writes into every agent's home: run with sudo"
   ensure_state_ro
   local names; names=$(registry_read | jq -r '.agents | keys[]')
-  local set_list=() missing=() name home dst yaml ref src tmp why ytmp personas got=""
+  local set_list=() missing=() name home dst yaml ref src tmp why ytmp personas got="" oa_down=0 rc
   ytmp=$(mktemp) || fail "$E_GENERIC" "mktemp failed"
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
@@ -314,9 +314,14 @@ _agent_avatar_backfill() {
       # answers every path with its app returns HTML: only an image counts, and
       # a miss is not "unresolved" (nothing pointed here).
       # Fetched once, here, into root's own temp file; installed from that copy.
+      # A box that cannot reach its own site at all (curl: anything but an HTTP
+      # error) is asked once, not 20s per agent inside update's 180s budget.
+      (( oa_down )) && continue
       src=$(_agent_avatar_openagent_url "$name") || continue
       got=$(mktemp)
-      if ! { _agent_avatar_fetch "$src" "$got" && _agent_avatar_sniff "$got" >/dev/null; }; then
+      _agent_avatar_fetch "$src" "$got"; rc=$?
+      if (( rc != 0 )) || ! _agent_avatar_sniff "$got" >/dev/null; then
+        (( rc == 0 || rc == 22 )) || oa_down=1
         rm -f -- "$got"; got=""; continue
       fi
     fi
