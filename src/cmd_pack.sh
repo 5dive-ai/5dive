@@ -3244,7 +3244,7 @@ cmd_import() {
     jq --arg n "$as" --arg f "$model_req" '.agents[$n].modelFamily = $f' <<<"$_mf_reg" | registry_write
   fi
 
-  local cdir="/home/agent-${as}/.claude"
+  local cdir="${AGENT_HOME_ROOT:-/home}/agent-${as}/.claude"
 
   # DIVE-2568: put distilled memory IN EFFECT for a harness that does not
   # auto-load 5dive's store. Must run BEFORE the install below, which routes this
@@ -3294,7 +3294,7 @@ cmd_import() {
   # 0600, both owned by the agent user. Then securely scrub the transient key file.
   # If there was no bundled key the agent simply runs sign-less, rarity preserved.
   if (( has_signing_key )) && [[ -s "$signing_keyfile" ]]; then
-    local kdir="/home/agent-${as}/.openagent"
+    local kdir="${AGENT_HOME_ROOT:-/home}/agent-${as}/.openagent"
     install -d -o "agent-${as}" -g "agent-${as}" -m 700 "$kdir" 2>/dev/null || true
     if install -o "agent-${as}" -g "agent-${as}" -m 600 "$signing_keyfile" "$kdir/agent.key" 2>/dev/null; then
       step "Adopted the persona's signing key into the keystore (~/.openagent/agent.key) — agent owns its identity"
@@ -3443,11 +3443,11 @@ cmd_import() {
   # own MEMORY.md there — the name a claude router would land on).
   local mem_target; mem_target=$(_pack_import_memory_target "$type" "$mem_shape_in")
   if [[ "$mem_inc" != "false" && -d "$stage/memory" && "$mem_target" == "native-codex" ]]; then
-    local codexdir="/home/agent-${as}/.codex/memories" cpacked clanded
+    local codexdir="${AGENT_HOME_ROOT:-/home}/agent-${as}/.codex/memories" cpacked clanded
     cpacked=$(find "$stage/memory" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
     install -d -o "agent-${as}" -g "agent-${as}" "$codexdir" 2>/dev/null || true
     cp "$stage"/memory/*.md "$codexdir/" 2>/dev/null || true
-    chown -R "agent-${as}:agent-${as}" "/home/agent-${as}/.codex" 2>/dev/null || true
+    chown -R "agent-${as}:agent-${as}" "${AGENT_HOME_ROOT:-/home}/agent-${as}/.codex" 2>/dev/null || true
     clanded=$(find "$codexdir" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l)
     if (( clanded > 0 )); then
       mem_seeded="$codexdir ($cpacked file(s) copied, $clanded present)"

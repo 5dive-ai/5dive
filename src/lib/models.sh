@@ -186,14 +186,22 @@ model_canonical() {
 # effortLevel: every family's current id — so a later `/model` switch keeps the
 # level — plus the seat's own canonical model when it is a claude-* id the
 # table does not list (a seat pinned to an older model).
+#
+# DIVE-5395: always returns 0 for a list it produced. Every caller reads this as
+# `ids=$(model_effort_ids_json …)` under `set -euo pipefail`, so the status of
+# the brace group IS the status of the assignment. The group used to end in
+# `[[ $own == claude-* ]] && printf`, which is 1 for an empty model or a vendor
+# id (`deepseek/…`, `anthropic/claude-…` — what an alias resolves to on an
+# OpenRouter account since DIVE-5163), and pipefail carried that 1 out: every
+# Mini App hire onto the demo-ai account died right after "persona installed".
 model_effort_ids_json() {
   local fam id own
   own=$(model_canonical "${1:-}")
   {
     while read -r fam; do
-      id=$(model_latest "$fam") && printf '%s\n' "$id"
+      if id=$(model_latest "$fam"); then printf '%s\n' "$id"; fi
     done < <(model_families)
-    [[ "$own" == claude-* ]] && printf '%s\n' "$own"
+    if [[ "$own" == claude-* ]]; then printf '%s\n' "$own"; fi
   } | jq -R . | jq -sc 'unique'
 }
 
