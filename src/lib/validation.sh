@@ -396,3 +396,56 @@ skill_target_within() {
   rtarget="$(readlink -m -- "$base/$id")" || return 1
   [[ "$rtarget" == "$rbase"/?* ]]
 }
+
+# -------- DIVE-5430: `caddy validate` with caddy.service's own environment --------
+#
+# A Caddyfile can read values the unit loads from its EnvironmentFile: a box that
+# gets certificates by DNS challenge writes `dns cloudflare {env.CF_API_TOKEN}`
+# and keeps the token in /etc/caddy/cf-dns.env. A bare `caddy validate` runs
+# without that file, so it fails even on the unmodified Caddyfile (`API token ''
+# appears invalid`) and every route this CLI adds is rolled back. These load the
+# unit's files first, in a subshell, as KEY=VALUE data: parsed, never sourced.
+
+# caddy_env_files — the EnvironmentFile paths systemd gives caddy.service, one a line.
+caddy_env_files() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  # `/etc/caddy/cf-dns.env (ignore_errors=no) /other.env (ignore_errors=yes)`
+  systemctl show -p EnvironmentFiles --value caddy 2>/dev/null | tr ' ' '\n' | grep '^/' || true
+}
+
+# _caddy_env_load <file> — export each KEY=VALUE line, the way systemd reads it.
+_caddy_env_load() {
+  local line k v
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    k="${BASH_REMATCH[1]}" v="${BASH_REMATCH[2]}"
+    v="${v%"${v##*[![:space:]]}"}"
+    if [[ "$v" =~ ^\"(.*)\"$ || "$v" =~ ^\'(.*)\'$ ]]; then v="${BASH_REMATCH[1]}"; fi
+    export "$k=$v"
+  done <"$1"
+}
+
+# caddy_validate <caddyfile> [<caddy-bin>] — validate as the running unit would
+# see the file. Returns validate's rc; validate's own output is passed through.
+caddy_validate() {
+  local cf="$1" bin="${2:-caddy}"
+  (
+    while IFS= read -r f; do
+      if [[ -r "$f" ]]; then _caddy_env_load "$f"; fi
+    done < <(caddy_env_files)
+    "$bin" validate --config "$cf" --adapter caddyfile
+  )
+}
+
+# caddy_validate_why <output> — the one line of validate's output that says why:
+# `Error: …` (older Caddy) or the error log line's msg (2.11 logs it as JSON),
+# kept to its last 300 characters, where the cause is.
+caddy_validate_why() {
+  local why
+  why=$(grep -E '^Error:' <<<"$1" | tail -n 1)
+  [[ -n "$why" ]] || why=$(grep -F '"level":"error"' <<<"$1" | tail -n 1 | sed -n 's/.*"msg":"\(\([^"\\]\|\\.\)*\)".*/\1/p')
+  [[ -n "$why" ]] || why=$(grep -v '^[[:space:]]*$' <<<"$1" | tail -n 1)
+  (( ${#why} <= 300 )) || why="…${why: -300}"
+  printf '%s' "$why"
+}

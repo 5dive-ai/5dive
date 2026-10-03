@@ -19,7 +19,8 @@
 # Root half: `_route_do`, one exact-path NOPASSWD line in every standard seat's
 # sudoers (render_standard_sudoers). The operation travels NUL-separated on
 # stdin and the seat is derived from SUDO_UID, so no argument names the owner.
-# The candidate file is validated with `caddy validate` before it replaces the
+# The candidate file is validated with `caddy validate` (caddy_validate: with the
+# unit's EnvironmentFiles loaded, DIVE-5430) before it replaces the
 # live one, and a failed reload restores the previous file.
 
 # Test seams. Under sudo (root, SUDO_UID set) they are ignored whatever the
@@ -111,9 +112,10 @@ _route_reload() {
 # file is left (or put back) exactly as it was.
 _route_apply() {
   local cand="$1" cf="$ROUTE_CADDYFILE" bak
-  if ! "$ROUTE_CADDY_BIN" validate --config "$cand" --adapter caddyfile >/dev/null 2>&1; then
+  local out
+  if ! out=$(caddy_validate "$cand" "$ROUTE_CADDY_BIN" 2>&1); then
     rm -f "$cand"
-    fail "$E_VALIDATION" "the new route did not pass caddy validate; nothing changed"
+    fail "$E_VALIDATION" "the new route did not pass caddy validate; nothing changed ($(caddy_validate_why "$out"))"
   fi
   bak=$(mktemp "${cf}.route.XXXXXX") || { rm -f "$cand"; fail "$E_GENERIC" "could not back up $cf"; }
   cp -p "$cf" "$bak"
