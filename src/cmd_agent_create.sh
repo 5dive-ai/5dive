@@ -2560,6 +2560,59 @@ seed_inherited_memory() {
   fi
 }
 
+# DIVE-5478 — a hired seat gets its OWN browser store at create, or it cannot browse.
+#
+# The browser plugin refuses every page verb (`shot`, `snapshot`, …) from a seat
+# with no store under $STATE_DIR/browser-profiles/<seat>, and only root can make
+# one (`5dive browser setup`, which derives the seat from SUDO_USER or
+# FIVEDIVE_BROWSER_SEAT). Nothing ran it for a new seat, so on chill-gorge a seat
+# hired onto a box with the plugin enabled box-wide failed its first job at
+# `5dive browser shot` until somebody ran setup for it by hand.
+#
+# Prints one status word on stdout — made | absent | sandboxed | failed — and says
+# what happened on stderr. Never fails the create: the agent is already provisioned
+# and a missing store is fixable with the one command the warning names.
+#
+# Gated on an ENABLED plugin claiming the `browser` verb, the same lookup dispatch
+# uses, so a box without the plugin gets no store, no timer and no sudoers file.
+# Must run AFTER the registry entry is written: setup refuses an `agent-*` account
+# that is not in the registry (DIVE-4730).
+#
+# FIVEDIVE_BROWSER_AGENT_GROUP is pinned to the shared group, deliberately. Setup
+# defaults the group to the seat's PRIMARY group and rewrites the box-wide
+# on-demand-serve grant (/etc/sudoers.d/5dive-browser) as one `%<group>` line. A
+# 5dive seat's primary group is its private `agent-<name>`, so the default would
+# re-point that grant at the newest hire on every create, taking it from every
+# other seat. The shared group is the one the plugin's own design names, and the
+# one create_agent_user puts admin and standard seats in.
+#
+# A SANDBOXED seat is skipped and told so. It is not in the shared group, and
+# either choice of group is wrong for it: its own group steals the box grant as
+# above, and the shared group would let the team reach logins it connects.
+seed_browser_store_for_seat() {  # <name> <isolation>
+  local name="$1" isolation="${2:-standard}"
+  local seat="agent-$1" group="${AGENT_SHARED_GROUP:-claude}" out rc=0
+  if ! declare -F _plugin_verb_claims >/dev/null 2>&1 \
+     || [[ -z "$(_plugin_verb_claims browser)" ]]; then
+    echo absent; return 0
+  fi
+  if [[ "$isolation" == "sandboxed" ]]; then
+    warn "no browser store made for sandboxed ${seat}: it cannot browse until it has one. Make it with: sudo env FIVEDIVE_BROWSER_SEAT=${seat} FIVEDIVE_BROWSER_AGENT_GROUP=${group} 5dive browser setup (this lets ${group} seats use the logins it connects)"
+    echo sandboxed; return 0
+  fi
+  out=$( JSON_MODE=0
+         export FIVEDIVE_BROWSER_SEAT="$seat" FIVEDIVE_BROWSER_AGENT_GROUP="$group"
+         _plugin_dispatch_verb browser setup 2>&1 ) || rc=$?
+  if (( rc == 0 )); then
+    step "browser store ready for ${seat} (DIVE-5478): it can browse public pages now"
+    echo made
+  else
+    warn "browser setup for ${seat} failed (exit $rc: $(tail -n 1 <<<"$out")). The agent is up but cannot browse. Retry: sudo env FIVEDIVE_BROWSER_SEAT=${seat} FIVEDIVE_BROWSER_AGENT_GROUP=${group} 5dive browser setup"
+    echo failed
+  fi
+  return 0
+}
+
 # DIVE-4698 — the two reads/writes `--human=` needs, kept local and TOLERANT.
 #
 # Not `_human_transport_id` / `cmd_human_link` directly: the first is fine but the
@@ -3466,6 +3519,11 @@ cmd_create() {
     loginctl enable-linger "agent-${name}" >/dev/null 2>&1 || true
   fi
 
+  # DIVE-5478: after the registry write (setup refuses an unregistered seat) and
+  # before the unit's first boot, so the agent's first turn can already browse.
+  local browser_store
+  browser_store=$(seed_browser_store_for_seat "$name" "$isolation")
+
   # Git reads hooksPath on each commit, so this covers every coding tool and
   # needs no service restart. Identity is stored before installation so a
   # partial hook write can be repaired idempotently by the upgrade reconciler.
@@ -3814,6 +3872,11 @@ cmd_create() {
   else
     _hc_issues+=("no heartbeat (agent is ASLEEP — won't self-act on board work): sudo 5dive heartbeat on $name")
   fi
+  # DIVE-5478: only on a box whose browser plugin is enabled; `absent` says nothing.
+  case "$browser_store" in
+    made)   _hc_ok+=("browser store ready") ;;
+    failed) _hc_issues+=("no browser store (agent CANNOT BROWSE): sudo env FIVEDIVE_BROWSER_SEAT=agent-${name} FIVEDIVE_BROWSER_AGENT_GROUP=${AGENT_SHARED_GROUP:-claude} 5dive browser setup") ;;
+  esac
   # auth: deferred login still pending, so the first turn will stall.
   if (( defer_auth )); then
     _hc_issues+=("auth was deferred (agent is UNAUTHED — can't think until you log in): sudo 5dive agent auth login $type${profile:+ --auth-profile=$profile}")
