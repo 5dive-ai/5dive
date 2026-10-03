@@ -93,6 +93,7 @@ SELF="$(basename "${BASH_SOURCE[0]}")"
 declare -A ALLOW=(
   [proof_identity_guard_unit.sh]='_proof_identity in cmd_proof.sh genuinely still reads `id -un`; this file is its test'
   [secret_drop_unit.sh]='_task_mint_drop_link in task/notify.sh genuinely still reads `id -un`, only to skip a sudo a non-admin seat would be refused (DIVE-5319); its T4 arms are its test, and nothing else in the file reads identity'
+  [secret_gate_now_and_loud_mint_unit.sh]='DIVE-5448: its B arms test _task_mint_drop_link (task/notify.sh), which genuinely still reads `id -un` to pick the seat whose tier decides the mint; nothing else the file exercises reads identity'
 )
 
 # _scan_identity_stubs <dir> — print one `<file>\t<reason>` line per violation.
