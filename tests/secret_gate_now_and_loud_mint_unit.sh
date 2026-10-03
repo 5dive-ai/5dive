@@ -41,7 +41,8 @@ LOG="$TMP/gate-notify.log"; FIVEDIVE_GATE_NOTIFY_LOG="$LOG"
 declare -F _task_gate_undo_window_secs >/dev/null 2>&1 || _task_gate_undo_window_secs DIVE-0 >/dev/null 2>&1
 unset _5DIVE_GATE_UNDO_WINDOW_SECS TASK_GATE_ROUTE_URGENT
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
+skip_t() { SKIP=$((SKIP+1)); printf 'skip - %s\n' "$1"; }
 ok_t()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 fail_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 check()  { if eval "$2"; then ok_t "$1"; else fail_t "$1" "${3:-}"; fi; }
@@ -122,11 +123,11 @@ if command -v setpriv >/dev/null 2>&1 && setpriv --no-new-privs true 2>/dev/null
   out=$(grep -v '^HARNESS-RC\|^ok \|^FAIL\|^   \|grading tree' "$TMP/nnp.out")
   check 'B6 a no_new_privs shell says so instead of spending a refused sudo' '[[ "$nrc" == 0 ]]' "$out"
 else
-  ok_t 'B6 SKIP: setpriv unavailable here (the arm needs real no_new_privs)'
+  skip_t 'B6 setpriv unavailable here (the arm needs real no_new_privs)'
 fi
 
 dl=$(_task_gate_deliveries DIVE-9501)
 check 'B7 the delivery parser never reads a gate-drop-link line as a send' '[[ -z "$dl" ]]' "deliveries: $dl"
 
-printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
+printf '\nPASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

@@ -1637,7 +1637,8 @@ _task_mint_drop_link() {
 # delivery parsers (which match `gate-delivery result=`) never count it as a
 # send. Same store-identity fence as _task_gate_delivery_log: a harness store
 # writes nowhere unless it names FIVEDIVE_GATE_NOTIFY_LOG. An error also goes to
-# the audit log and to stderr, so `task need` run by hand shows it too.
+# the audit log (through the store-fenced _task_store_audit_log, DIVE-2054) and
+# to stderr, so `task need` run by hand shows it too.
 _task_drop_link_log() {
   local result="$1" ident="$2" reason="${3//$'\n'/ }" logf="${FIVEDIVE_GATE_NOTIFY_LOG:-}" prod=0
   if _task_human_send_allowed 2>/dev/null \
@@ -1650,7 +1651,7 @@ _task_drop_link_log() {
       "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?')" "$result" "$ident" "$reason" >>"$logf" 2>/dev/null || true
   fi
   if [[ "$result" == error ]]; then
-    (( prod )) && { audit_log "gate drop link" error 1 -- "task=$ident" "detail=$reason" || true; }
+    (( prod )) && { _task_store_audit_log "gate drop link" error 1 -- "task=$ident" "detail=$reason" || true; }
     warn "$ident: no secure link in this alert — $reason"
   fi
   return 0
