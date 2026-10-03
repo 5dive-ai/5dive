@@ -89,10 +89,13 @@ cmd_tool() {
 _tool_known() { [[ -n "${1:-}" && -n "${TOOL_ENV[$1]+x}" ]]; }
 
 # The vars that have a non-empty line in the file. Names only: the value is
-# never read into a variable.
+# never read into a variable. A file with no key left in it (rm of the last
+# one keeps the header) is a grep no-match, exit 1, which pipefail would turn
+# into a reasonless `tool ls` failure — the Mini App's Tools screen then could
+# not list at all (divine-owl, 2026-10-03). No match means no keys, not an error.
 _tool_set_vars() {
   [[ -r "$TOOLS_ENV_FILE" ]] || return 0
-  grep -oE "^export [A-Z_][A-Z0-9_]*='[^']" "$TOOLS_ENV_FILE" 2>/dev/null \
+  { grep -oE "^export [A-Z_][A-Z0-9_]*='[^']" "$TOOLS_ENV_FILE" 2>/dev/null || true; } \
     | sed -E "s/^export ([A-Z0-9_]+)=.*/\1/"
 }
 
