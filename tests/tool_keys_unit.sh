@@ -138,5 +138,14 @@ outsider "$SH" 'echo ok' >"$TMP/out3" 2>"$TMP/err3"
 [[ ! -s "$TMP/err3" && "$(cat "$TMP/out3")" == ok ]] && ok_t "T9 untraversable keys dir: empty stderr, rc 0" || bad_t "T9 dir" "out=$(cat "$TMP/out3") err=$(cat "$TMP/err3")"
 chmod 755 "$FIVEDIVE_CONNECTOR_DIR"
 
+# --- T10: ls after the LAST key is removed, under the CLI's own errexit ----------
+# The harness runs `set +e`, which hides a pipefail exit; the real CLI does not.
+for t in elevenlabs meta; do run rm "$t" >/dev/null; done
+[[ -e "$F" ]] && ! grep -q '^export ' "$F" && ok_t "T10 precondition: key file exists with no key line left" || bad_t "T10 precondition" "$(cat "$F" 2>&1)"
+out=$( ( set -euo pipefail; cmd_tool ls ) 2>&1 ); rc=$?
+gh=$(jq -r '.data.tools[] | select(.id=="github") | .connected' <<<"$out" 2>/dev/null)
+n=$(jq -r '.data.tools | length' <<<"$out" 2>/dev/null)
+[[ $rc -eq 0 && "$gh" == false && "$n" == 8 ]] && ok_t "T10 ls with every key removed: rc 0, 8 tools, none connected" || bad_t "T10 ls after last rm" "rc=$rc $out"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
