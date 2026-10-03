@@ -32,6 +32,71 @@ doctor_add() {
   return 0
 }
 
+# doctor_check_needs_banner — DIVE-2041 + DIVE-5447.
+# DIVE-2041 (follow-up to the DIVE-2031 outage): the pinned "needs-you"
+# banner is single-pinner by design — only the resolved org coordinator
+# posts it (DIVE-1568), and every other agent unpins any banner it left
+# behind. When `task coordinator` resolves to NOBODY, "every other agent"
+# is ALL of them: the banner is unpinned in every paired DM and re-unpinned
+# on a 60s timer forever, while every component reports success. That is
+# how 12 pending human gates sat invisible for days.
+#
+# This check is the surface that names it. It computes the resolution HERE
+# rather than asking the plugin, deliberately: the plugin can only report
+# what it saw on its last tick, and a bot that is down reports nothing at
+# all — the state we most need to see. Severity is keyed to CONSEQUENCE,
+# not to the config: no coordinator with an empty gate queue is a latent
+# warn; no coordinator while human gates are pending is a live outage of a
+# human-safety surface, so it is an error and `summary.errors` carries it.
+doctor_check_needs_banner() {
+  [[ -f "${TASKS_DB:-}" ]] || return 0
+  # DIVE-5447: the banner is OFF unless a seat opts in (TELEGRAM_NEEDS_BANNER=1,
+  # lodar 2026-10-03: "too noisy"). With it off nobody pins, by design, so "no
+  # coordinator" is not an outage and must not read as an error on every box.
+  # Only grade the owner when some seat on this box has switched the banner on.
+  if ! _doctor_needs_banner_opted_in; then
+    doctor_add channels needs-banner-coordinator ok \
+      "the pinned needs-you banner is off on this box (DIVE-5447), so it needs no coordinator; a seat turns it back on with TELEGRAM_NEEDS_BANNER=1 in its telegram connector env"
+    return 0
+  fi
+  local coord roots pending fixhint
+  coord=$(_task_resolve_coordinator 2>/dev/null || true)
+  if [[ -n "$coord" ]]; then
+    doctor_add channels needs-banner-coordinator ok \
+      "task coordinator resolves to '$coord' — the pinned needs-you banner has an owner"
+  else
+    roots=$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);" 2>/dev/null || echo 0)
+    pending=$(db "SELECT COUNT(*) FROM tasks WHERE need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
+    fixhint="fix: give the chart ONE root (5dive org set <agent> --manager=<mgr>), or put 'coordinator' in one agent's role (5dive org set <agent> --role='<their prose> coordinator')"
+    if [[ "${roots:-0}" == "0" ]]; then
+      doctor_add channels needs-banner-coordinator warn \
+        "no org chart — no coordinator, so the pinned needs-you banner is suppressed in every paired DM (5dive org set …)" false false
+    elif [[ "${pending:-0}" -gt 0 ]]; then
+      doctor_add channels needs-banner-coordinator error \
+        "NO coordinator resolves (${roots} org roots, none tagged) and ${pending} human gate(s) are pending — the pinned needs-you banner is suppressed in EVERY paired DM and nothing else reports it (DIVE-2031/2041); ${fixhint}" false false
+    else
+      doctor_add channels needs-banner-coordinator warn \
+        "no coordinator resolves (${roots} org roots, none tagged) — the pinned needs-you banner is suppressed in every paired DM; harmless while 0 gates are pending, invisible the moment one opens (DIVE-2031/2041); ${fixhint}" false false
+    fi
+  fi
+}
+
+# _doctor_needs_banner_opted_in — does any seat on this box run the telegram
+# plugin with TELEGRAM_NEEDS_BANNER=1? The plugin reads it from its process env,
+# which systemd fills from the seat's telegram connector env and its agents.d
+# env, so those two places are the switch. (A seat's own channel .env can also
+# set it; root reads homes it may not own, so that one is not graded here.)
+_doctor_needs_banner_opted_in() {
+  local f
+  for f in "${CONNECTORS_DIR}"/telegram-*.env "${ENV_DIR}"/*.env; do
+    [[ -f "$f" ]] || continue
+    if grep -qE "^TELEGRAM_NEEDS_BANNER=[\"']?1[\"']?[[:space:]]*$" "$f" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # doctor_check_gate_owner_delivery — DIVE-4911: human gates that never REACHED
 # their owner.
 #
@@ -1909,43 +1974,7 @@ cmd_doctor() {
   #      is on a Teams org whose admin hasn't allowlisted us via remote
   #      managed-settings (remote overrides local). Linked from README.
   if (( run_channels )); then
-    # DIVE-2041 (follow-up to the DIVE-2031 outage): the pinned "needs-you"
-    # banner is single-pinner by design — only the resolved org coordinator
-    # posts it (DIVE-1568), and every other agent unpins any banner it left
-    # behind. When `task coordinator` resolves to NOBODY, "every other agent"
-    # is ALL of them: the banner is unpinned in every paired DM and re-unpinned
-    # on a 60s timer forever, while every component reports success. That is
-    # how 12 pending human gates sat invisible for days.
-    #
-    # This check is the surface that names it. It computes the resolution HERE
-    # rather than asking the plugin, deliberately: the plugin can only report
-    # what it saw on its last tick, and a bot that is down reports nothing at
-    # all — the state we most need to see. Severity is keyed to CONSEQUENCE,
-    # not to the config: no coordinator with an empty gate queue is a latent
-    # warn; no coordinator while human gates are pending is a live outage of a
-    # human-safety surface, so it is an error and `summary.errors` carries it.
-    if [[ -f "${TASKS_DB:-}" ]]; then
-      local coord roots pending fixhint
-      coord=$(_task_resolve_coordinator 2>/dev/null || true)
-      if [[ -n "$coord" ]]; then
-        doctor_add channels needs-banner-coordinator ok \
-          "task coordinator resolves to '$coord' — the pinned needs-you banner has an owner"
-      else
-        roots=$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);" 2>/dev/null || echo 0)
-        pending=$(db "SELECT COUNT(*) FROM tasks WHERE need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
-        fixhint="fix: give the chart ONE root (5dive org set <agent> --manager=<mgr>), or put 'coordinator' in one agent's role (5dive org set <agent> --role='<their prose> coordinator')"
-        if [[ "${roots:-0}" == "0" ]]; then
-          doctor_add channels needs-banner-coordinator warn \
-            "no org chart — no coordinator, so the pinned needs-you banner is suppressed in every paired DM (5dive org set …)" false false
-        elif [[ "${pending:-0}" -gt 0 ]]; then
-          doctor_add channels needs-banner-coordinator error \
-            "NO coordinator resolves (${roots} org roots, none tagged) and ${pending} human gate(s) are pending — the pinned needs-you banner is suppressed in EVERY paired DM and nothing else reports it (DIVE-2031/2041); ${fixhint}" false false
-        else
-          doctor_add channels needs-banner-coordinator warn \
-            "no coordinator resolves (${roots} org roots, none tagged) — the pinned needs-you banner is suppressed in every paired DM; harmless while 0 gates are pending, invisible the moment one opens (DIVE-2031/2041); ${fixhint}" false false
-        fi
-      fi
-    fi
+    doctor_check_needs_banner
 
     # --- DIVE-4551: can a fleet-health ALERT reach anybody? ---
     #
