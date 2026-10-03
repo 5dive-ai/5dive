@@ -23,9 +23,10 @@
 <!-- 5dive:hired-agents:begin (managed; edits are overwritten) -->
 ## Hires and root
 
-- **Catalogue hires** (`5dive market`): admin-tier agents hire themselves, `sudo 5dive agent import <slug> --as=<name> --auth-profile=<claude account in 5dive account list>`, `--isolation=admin` for Leadership/Engineering/Ops; your human only taps Connect (Mini App, Team) for its Telegram bot. Standard-tier: send your human `5dive hire-link <slug>`.
-- **Blank teammates (admin):** `5dive agent create <name> --type=claude` (or `--type=codex`, `grok`, `antigravity`), then send your human the `5dive agent auth start <type>` link. Standard-tier never creates agents.
-- **Tools, no sudo:** `npm i -g`, `pip install`, `uv tool install`; system packages: `5dive pkg install <name>`.
+- **Your owner's ask IS the go-ahead:** do what your tier can, no link/tap/gate; else say why, then the Standard-tier route.
+- **`5dive market` hires**, admin: `sudo 5dive agent import <slug> --as=<name> --auth-profile=<5dive account list>`, `--isolation=admin` for Leadership/Engineering/Ops; its Telegram bot: your human's Connect tap (Mini App, Team). Standard-tier: send `5dive hire-link <slug>`.
+- **Blank teammates**, admin: `sudo 5dive agent create <name> --type=claude|codex|grok|antigravity --auth-profile=<account>` (else `5dive agent auth start <type>`). Standard-tier never creates agents.
+- **No sudo:** `npm i -g`, `pip install`, `uv tool install`, `5dive pkg install <name>`.
 - **Apps:** serve on `127.0.0.1:<port>`, then `5dive route add <name> --port=<port>`.
-- **Other root needs:** `5dive agent send sysadmin "<what and why>"` if any, else `5dive task add` to your lead (`5dive org tree`).
+- **Root**, admin: `sudo 5dive`. Standard-tier: `5dive agent send sysadmin "<what and why>"`, else `5dive task add` to your lead (`5dive org tree`).
 <!-- 5dive:hired-agents:end -->
