@@ -283,11 +283,52 @@ ERR=$(env -i HOME="$H" PATH=/usr/bin:/bin bash -c ". '$TMP/tool-env.sh'" 2>&1)
 
 # ── the instructions every seat on a 5dive-built box loads ───────────────────
 BLOCK=$(sed -n '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/p' projects-CLAUDE.md)
-for want in 'A standard-tier agent never creates agents' '5dive hire-link <slug>' '5dive pkg install' \
-            '5dive route add <name> --port=<port>' '5dive task add' 'npm i -g' \
-            'Creating a teammate yourself is for admin-tier agents' '--type=codex' '5dive agent auth start <type>'; do
+for want in 'Standard-tier never creates agents' 'Standard-tier: send your human `5dive hire-link <slug>`' \
+            '5dive pkg install' '5dive route add <name> --port=<port>' '5dive task add' 'npm i -g' \
+            'Blank teammates (admin)' '--type=codex' '5dive agent auth start <type>' \
+            'admin-tier agents hire themselves' 'only taps Connect (Mini App, Team) for its Telegram bot'; do
   [[ "$BLOCK" == *"$want"* ]] && ok "hired-agents block says: $want" || bad "hired-agents block says: $want"
 done
+
+# DIVE-5449: an admin seat hires a catalogue pack itself, with the Mini App's own
+# argv (5dive-frontend hireCalls: agent import <slug> --as= --isolation= and the
+# owner's signed-in account). Olivia refused, citing billing: there is none on a
+# box that is up, so the block names none.
+grep -qiE 'bill|pay|stars|charge|cost' <<<"$BLOCK" \
+  && bad "the hired-agents block names no billing ($(grep -oiE 'bill|pay|stars|charge|cost' <<<"$BLOCK" | head -1))" \
+  || ok 'the hired-agents block names no billing'
+HIRE=$(grep -F '**Catalogue hires**' <<<"$BLOCK" | grep -oE '`sudo 5dive agent import [^`]*`' | tr -d '`')
+[[ "$HIRE" == 'sudo 5dive agent import <slug> --as=<name> --auth-profile=<claude account in 5dive account list>' ]] \
+  && ok 'the admin hire is one exact sudo agent import line' || bad "admin hire verb ($HIRE)"
+CAT=$(grep -F '**Catalogue hires**' <<<"$BLOCK")
+grep -qF '`--isolation=admin` for Leadership/Engineering/Ops' <<<"$CAT" \
+  && ok 'the admin hire names the Mini App seat rule' || bad 'the admin hire names the Mini App seat rule'
+# Drive the REAL cmd_import with that line (placeholders filled the way an agent
+# fills them) up to cmd_create, which records its argv and stops: nothing is made.
+L=${HIRE#sudo 5dive agent import }; L=${L//<slug>/dario}; L=${L//<name>/dario}
+L=${L//<claude account in 5dive account list>/mark}
+read -r -a HARGV <<<"$L"
+imp(){ ( source "$SRC/cmd_pack.sh"; set +e
+  printf '%s\n' '{"packFormat":1,"agentName":"dario","config":{"type":"claude"},"includes":{"memory":false}}' >"$TMP/m.json"
+  : >"$TMP/dario.tar.gz"
+  require_root(){ :; }; registry_read(){ printf '{"agents":{}}\n'; }; _agents_md_is(){ return 1; }
+  _marketplace_fetch_pack(){ [[ "$1" == dario ]] && printf '%s' "$TMP/dario.tar.gz"; }
+  _pack_safe_extract(){ cp "$TMP/m.json" "$2/manifest.json"; }
+  _pack_harness_targets(){ printf 'claude\n'; }; _pack_targets_declared(){ return 1; }
+  _pack_disclosure_json(){ printf '{}\n'; }; _pack_disclosure_print(){ :; }; _pack_rename_persona(){ :; }
+  resolve_model_alias(){ printf '%s' "$1"; }; is_known_type(){ [[ "$1" == claude ]]; }; step(){ :; }
+  cmd_create(){ printf '%s\n' "$@" >"$TMP/create.argv"; return 1; }
+  cmd_import "$@" ) >/dev/null 2>&1; }
+rm -f "$TMP/create.argv"; imp "${HARGV[@]}" --isolation=admin
+A=$(tr '\n' ' ' <"$TMP/create.argv" 2>/dev/null)
+[[ "$A" == 'dario --type=claude '* && " $A" == *' --isolation=admin '* && " $A" == *' --auth-profile=mark '* ]] \
+  && ok 'the block line imports pack dario as dario, admin seat, on the owner account' || bad "import argv ($A)"
+# Control: the same import without --auth-profile binds the new agent to its own
+# empty login, which never answers. That is why the line carries the flag.
+rm -f "$TMP/create.argv"; imp dario --as=dario
+A=$(tr '\n' ' ' <"$TMP/create.argv" 2>/dev/null)
+[[ " $A" == *' --auth-profile=dario '* ]] && ok 'control: no --auth-profile binds the agent to its own empty login' \
+  || bad "control argv ($A)"
 grep -q 'sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:hired-agents' install.sh \
   && ok 'install.sh syncs the block on every install' || bad 'install.sh syncs the block'
 

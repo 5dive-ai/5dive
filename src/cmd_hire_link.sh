@@ -1,11 +1,14 @@
 # ── DIVE-5396: `5dive hire-link <slug>` — the link a lead sends to hire someone ─
 #
-# Asked "hire Marcus", a lead must not run `agent create` / `agent import`: only
-# the owner's own hire (the Mini App or the dashboard) does everything a hire
-# needs — the agent's own Telegram bot, the demo-AI binding, the plan's agent
-# limit, payment — and create needs root besides. So the lead sends the owner a
-# link and the owner hires in one tap. This prints that link; the agent never
-# builds a URL by hand.
+# Asked "hire Marcus", a STANDARD-tier agent cannot run `agent import` (it needs
+# root), so it sends the owner a link and the owner hires in one tap. This
+# prints that link; the agent never builds a URL by hand. DIVE-5449: an
+# ADMIN-tier agent hires itself instead — on a box that is up, the Mini App's
+# Hire is exactly `agent import <slug> --as= --isolation= --auth-profile=`
+# (5dive-frontend hireCalls), so `sudo 5dive agent import` is the same hire; only
+# the new agent's own Telegram bot still needs the owner's tap (Connect on its
+# row in the Mini App). Neither path bills: Stars are sold only when there is
+# no box yet.
 #
 # Which link is the API's call (POST /server/telegram/hire-link, box-authed with
 # this box's connectord token): an owner who signs in with Telegram gets
@@ -45,7 +48,8 @@ cmd_hire_link() {
           "usage: 5dive hire-link <slug> [--json]" \
           "" \
           "  The link that hires catalogue agent <slug> in one tap, for this box's owner." \
-          "  Send it to your human instead of creating agents yourself. Slugs: 5dive market."
+          "  A standard-tier agent sends it to its human; an admin-tier agent hires itself" \
+          "  with sudo 5dive agent import <slug> --as=<name>. Slugs: 5dive market."
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $a" ;;
       *) [[ -z "$slug" ]] || fail "$E_USAGE" "one agent at a time"; slug="$a" ;;
