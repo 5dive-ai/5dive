@@ -642,6 +642,11 @@ _task_inbox_send() {
     # was a verbatim duplicate of what the human can already see and tap.
     _hs=""; _task_gate_high_stakes "$id" && _hs=1
     gate_text="$([[ -n "$_hs" ]] && printf '🔐' || printf '🗂') [${ident}] ${ntype} — $(_task_gate_ask_line "$ask") /task_${id}"
+    # DIVE-5465: the re-send carries the same quoted text as the first delivery,
+    # in the same place (under the ask, before /task_<n>). A gate that has SAT is
+    # the one most likely to be answered from this message, not the first.
+    local _gq; _gq=$(_task_gate_quote_block "$id")
+    [[ -n "$_gq" ]] && gate_text="$([[ -n "$_hs" ]] && printf '🔐' || printf '🗂') [${ident}] ${ntype} — $(_task_gate_ask_line "$ask")"$'\n\n'"${_gq}"$'\n'"/task_${id}"
     # DIVE-4412: the keyboard-less variant, composed alongside. _mirror_post
     # falls back to a text-only re-send when the Bot API rejects the keyboard,
     # and the two suppressions below are keyed on the markup this loop COMPUTED

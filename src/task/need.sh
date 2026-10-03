@@ -2150,6 +2150,8 @@ cmd_task_need() {
   local self_minted=0 escalate=0   # DIVE-4365 part 1
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local ask_src="" recommend_src=""
+  # DIVE-5465: the exact text this gate asks a person to approve (see --quote).
+  local quote="" quote_src="" quote_file=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2169,6 +2171,21 @@ cmd_task_need() {
       --recommend-file=*) _prose_flag_dupe --recommend-file "$recommend_src"
                           _read_prose_file --recommend-file "${1#*=}"
                           recommend="$_PROSE_FILE_VALUE"; recommend_src="--recommend-file" ;;
+      # DIVE-5465: THE TEXT BEING APPROVED, QUOTED IN THE PING. lodar, TG
+      # 2026-10-03: "how can i reply to this human gate notification if I dont see
+      # any details?" — the ask is one line, and the draft it was asking about sat
+      # in the row body. Stored on the gate record and rendered under the ask.
+      # --quote-file also PINS the draft: an approval tapped after the file changed
+      # is refused as stale in cmd_task_answer, so what was approved is what posts.
+      --quote=*)     _prose_flag_dupe --quote "$quote_src"; quote="${1#*=}"; quote_src="--quote"
+                     [[ -n "$quote" ]] || fail "$E_VALIDATION" "--quote is empty — pass the exact text being approved, or leave the flag off" ;;
+      --quote-file=*) _prose_flag_dupe --quote-file "$quote_src"
+                      _read_prose_file --quote-file "${1#*=}"
+                      quote="$_PROSE_FILE_VALUE"; quote_src="--quote-file"
+                      # stdin has nothing to re-read at answer time, so only a real
+                      # path is pinned; absolute, because the answer runs elsewhere.
+                      quote_file=""
+                      [[ "${1#*=}" == "-" ]] || quote_file=$(realpath -- "${1#*=}" 2>/dev/null || printf '%s' "${1#*=}") ;;
       --tier=*)      tier="${1#*=}" ;;
       --from=*)      from="${1#*=}" ;;
       # DIVE-1401: withdraw a still-pending gate the team ITSELF filed but that is
@@ -4143,6 +4160,11 @@ db "BEGIN IMMEDIATE;
             -- mode belonging to a gate it no longer carries.
             gate_mode=$(sqlq_or_null "$gate_mode"),
             need_expires_at=${expires_sql},
+            -- DIVE-5465: written on EVERY filing, NULL when absent, so a re-filed
+            -- gate never inherits the previous gate's quote or its pinned draft.
+            need_quote=$(sqlq_or_null "$quote"),
+            need_quote_file=$(sqlq_or_null "$quote_file"),
+            need_quote_sha=$(sqlq_or_null "$( [[ -n "$quote" ]] && printf '%s' "$quote" | sha256sum | cut -d' ' -f1 )"),
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             gate_filed_by=$(sqlq "$actor")
       WHERE id=${id};

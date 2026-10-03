@@ -614,6 +614,19 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- default behaviour is unchanged. A non-NULL value is a hard boundary read by
   -- ONE predicate (`_GATE_EXPIRED_SQL`) that every surface goes through.
   need_expires_at       TEXT,
+  -- DIVE-5465: THE EXACT TEXT THE GATE ASKS A PERSON TO APPROVE. lodar, TG
+  -- 2026-10-03, on a ping that said only "meets every rule. /task_5662": "how can
+  -- i reply to this human gate notification if I dont see any details?". The ask
+  -- is a one-line question; the thing being approved (a drafted reply, a post)
+  -- lived only in the row body or a scratch file the person never sees. Stored ON
+  -- THE GATE so every ping composer reads it from the row, and so what was
+  -- approved is a record rather than a file that can move underneath it.
+  -- need_quote_file/need_quote_sha pin a --quote-file draft: an approval tapped
+  -- after that file changed is refused as stale (cmd_task_answer). NULL on every
+  -- gate filed without --quote, so the migration is a no-op.
+  need_quote            TEXT,
+  need_quote_file       TEXT,
+  need_quote_sha        TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -2063,6 +2076,9 @@ _TASKS_ADDITIVE_COLUMNS=(
   # DIVE-4833: the approval action's deadline. NULL = no deadline, so this add is
   # a no-op for every existing gate. See the CREATE TABLE comment.
   'need_expires_at TEXT'
+  # DIVE-5465: the quoted text a gate asks a person to approve. NULL = no quote,
+  # so this add is a no-op for every existing gate. See the CREATE TABLE comment.
+  'need_quote TEXT' 'need_quote_file TEXT' 'need_quote_sha TEXT'
   # DIVE-3098: a verifier grade recorded by `task verify --no-done`. Structural on
   # purpose — the terminal-for-verifier predicate must not key on result TEXT,
   # which the MAKER's `task deliver --result=` also writes.

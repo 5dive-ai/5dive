@@ -162,6 +162,12 @@ _task_usage() {
                    pings at file time. It is NOT --recommend: "I think the answer
                    is X" and "this cannot wait" are separate claims (measured: 54
                    of 121 answered gates returned the filer's recommendation).
+      [--quote="<text>"|--quote-file=<path>]   DIVE-5465: the EXACT text being
+                   approved (a drafted reply, a post), quoted in the ping under the
+                   ask so the person can answer from the message alone. Over ~600
+                   characters the ping says so and /task_<n> shows it. With
+                   --quote-file, editing that file after filing makes the gate
+                   stale: an approval tapped afterwards is refused, so re-ask.
       [--mode=approve-to-send|confirm-after-send]   --type=approval: is the action
                                                     already DONE? (default: not yet)
       [--probe='<cmd>']                           --type=access: self-check the block
