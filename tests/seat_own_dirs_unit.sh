@@ -175,8 +175,12 @@ is "pinned: the hook landed in the directory root had opened, not the link's tar
 # real dir and a symlink into a root-owned decoy tree, while root runs the full
 # co-author sequence (dirs + hook file) ROUNDS times. Nothing may be created,
 # chowned, chmodded or written anywhere outside the home; the arm also requires
-# both outcomes to have occurred, so a race that never landed cannot pass. ──
+# both outcomes to have occurred, so a race that never landed cannot pass.
+# A swap lands in ~1% of rounds (1-13 of 400 across 56 CI runs), so 400 rounds
+# alone saw zero refusals ~2% of the time (DIVE-5439): past ROUNDS the loop keeps
+# going until both outcomes are seen, up to ROUNDS_MAX. ──
 ROUNDS=${SEAT_OWN_DIRS_RACE_ROUNDS:-400}
+ROUNDS_MAX=${SEAT_OWN_DIRS_RACE_ROUNDS_MAX:-$((ROUNDS * 5))}
 h=$(fresh_home race)
 decoy="$TMP/decoy"
 $SUDO install -d -m 755 "$decoy" "$decoy/5dive" "$decoy/5dive/git-hooks"
@@ -200,7 +204,7 @@ stop="$TMP/marker-dir/stop"
 swapper=$!
 counts=$($SUDO bash -c '
   cd "$1"; source src/lib/agent_setup.sh; ok=0 refused=0
-  for ((i = 0; i < $5; i++)); do
+  for ((i = 0; i < $5 || ((ok == 0 || refused == 0) && i < $6); i++)); do
     if seat_own_dirs "$2" "$3" .config/5dive/git-hooks 700 2>/dev/null \
        && seat_put_file "$2" "$3" .config/5dive/git-hooks prepare-commit-msg 755 "$4" 2>/dev/null; then
       ok=$((ok + 1))
@@ -208,10 +212,10 @@ counts=$($SUDO bash -c '
       refused=$((refused + 1))
     fi
   done
-  echo "$ok $refused"' _ "$PWD" "$SEAT" "$h" "$src" "$ROUNDS")
+  echo "$ok $refused"' _ "$PWD" "$SEAT" "$h" "$src" "$ROUNDS" "$ROUNDS_MAX")
 $SUDO touch "$stop"; wait "$swapper" 2>/dev/null
 read -r race_ok race_refused <<<"$counts"
-echo "     race: $ROUNDS rounds, ${race_ok:-?} completed, ${race_refused:-?} refused a swapped component"
+echo "     race: $(( ${race_ok:-0} + ${race_refused:-0} )) rounds (min $ROUNDS, max $ROUNDS_MAX), ${race_ok:-?} completed, ${race_refused:-?} refused a swapped component"
 (( ${race_ok:-0} > 0 && ${race_refused:-0} > 0 )) \
   && ok_t "race: the swap landed mid-pass (both outcomes seen), so the arm is live" \
   || bad_t "race: the swap never interleaved (ok=${race_ok:-?} refused=${race_refused:-?}) — the arm proved nothing"
