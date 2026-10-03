@@ -1589,18 +1589,71 @@ _task_close_notify() {
 # sudoers file at all. Any other seat gets nothing here, and the alert sends the
 # owner to the app, whose card mints the link through the box's own root path.
 _task_mint_drop_link() {
-  local ident="$1" out="" url ttl me
+  local ident="$1" out="" url ttl me tier errf rc=0
+  # DIVE-5448: every way this returns without a link is WRITTEN DOWN. On
+  # divine-owl an admin seat filed a secret gate, the alert went out with no
+  # link, and nothing anywhere said why: each early return below was a silent
+  # `return 0`, so "not allowed to mint", "sudo refused" and "secret link
+  # failed" all looked exactly like a box with no link support.
+  errf=$(mktemp "${TMPDIR:-/tmp}/5dive-mint.XXXXXX" 2>/dev/null) || errf=/dev/null
   if [[ $EUID -eq 0 ]]; then
-    out=$(5dive --json secret link "$ident" 2>/dev/null) || return 0
+    # Our own bundle, not whatever `5dive` PATH finds: a root cron sweep runs
+    # with PATH=/usr/bin:/bin, where a bare word is "command not found".
+    local five; five=$(five_self_bundle 2>/dev/null) || five=5dive
+    out=$("$five" --json secret link "$ident" 2>"$errf") || rc=$?
   else
     me=$(id -un 2>/dev/null)
-    [[ "$me" == agent-* && "$(agent_tier "${me#agent-}")" == admin ]] || return 0
-    out=$(sudo -n 5dive --json secret link "$ident" 2>/dev/null) || return 0
+    tier=$(agent_tier "${me#agent-}" 2>/dev/null)
+    if [[ "$me" != agent-* || "$tier" != admin ]]; then
+      # Not a failure: a standard seat's alert carries the app button instead.
+      _task_drop_link_log none "$ident" "seat ${me:-?} (tier ${tier:-?}) cannot mint; the alert sends the owner to the app"
+      rm -f "$errf" 2>/dev/null; return 0
+    fi
+    # A sandboxed agent shell runs with no_new_privs, and sudo cannot run there
+    # at all. Say so instead of spending a refused sudo on it.
+    if grep -qE '^NoNewPrivs:[[:space:]]*1' /proc/self/status 2>/dev/null; then
+      _task_drop_link_log error "$ident" "admin seat ${me} could not mint: its shell runs with no_new_privs (a sandboxed agent shell), so sudo cannot run; the alert sends the owner to the app. Mint by hand: sudo 5dive secret link ${ident}"
+      rm -f "$errf" 2>/dev/null; return 0
+    fi
+    out=$(sudo -n 5dive --json secret link "$ident" 2>"$errf") || rc=$?
   fi
   url=$(printf '%s' "$out" | jq -r '.data.url // empty' 2>/dev/null)
   ttl=$(printf '%s' "$out" | jq -r '.data.ttl_minutes // empty' 2>/dev/null)
-  [[ "$url" == https://* ]] || return 0
+  if [[ "$url" != https://* ]]; then
+    local why
+    why=$(printf '%s' "$out" | jq -r '.error.message // .message // empty' 2>/dev/null)
+    [[ -n "$why" ]] || why=$(head -c 300 "$errf" 2>/dev/null | tr '\n' ' ')
+    [[ -n "$url" ]] && why="not an https link: ${url}"
+    _task_drop_link_log error "$ident" "${me:-root} could not mint (rc=${rc}): ${why:-no output}. The alert sends the owner to the app. Mint by hand: sudo 5dive secret link ${ident}"
+    rm -f "$errf" 2>/dev/null; return 0
+  fi
+  rm -f "$errf" 2>/dev/null
+  _task_drop_link_log ok "$ident" "minted by ${me:-root}"
   echo "${url}|${ttl:-30}"
+}
+
+# _task_drop_link_log <ok|error|none> <ident> <reason> — DIVE-5448. One line in
+# gate-notify.log per mint attempt, under its own `gate-drop-link` key so the
+# delivery parsers (which match `gate-delivery result=`) never count it as a
+# send. Same store-identity fence as _task_gate_delivery_log: a harness store
+# writes nowhere unless it names FIVEDIVE_GATE_NOTIFY_LOG. An error also goes to
+# the audit log and to stderr, so `task need` run by hand shows it too.
+_task_drop_link_log() {
+  local result="$1" ident="$2" reason="${3//$'\n'/ }" logf="${FIVEDIVE_GATE_NOTIFY_LOG:-}" prod=0
+  if _task_human_send_allowed 2>/dev/null \
+     && [[ -z "${FIVEDIVE_NOTIFY_DRYRUN:-}" || "${FIVEDIVE_NOTIFY_DRYRUN}" == "0" ]]; then
+    prod=1
+  fi
+  [[ -n "$logf" ]] || { (( prod )) && logf=/var/log/5dive/notify/gate-notify.log; }
+  if [[ -n "$logf" ]] && ( umask 0002; : >>"$logf" ) 2>/dev/null; then
+    printf '%s gate-drop-link result=%s tasks=%s detail=%q\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?')" "$result" "$ident" "$reason" >>"$logf" 2>/dev/null || true
+  fi
+  if [[ "$result" == error ]]; then
+    (( prod )) && { audit_log "gate drop link" error 1 -- "task=$ident" "detail=$reason" || true; }
+    warn "$ident: no secure link in this alert — $reason"
+  fi
+  return 0
 }
 
 # Render the canonical tap keyboard for one gate. Kept separate from the alert
@@ -2457,6 +2510,16 @@ _task_gate_undo_window_secs() {
   # DIVE-4154 windows untouched — a lead-routed gate never rings a phone, so
   # holding it would delay a seat that is polling anyway for no saving at all.
   local _gtier; _gtier=$(db "SELECT COALESCE(tier,2) FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  # DIVE-5448: A HUMAN-BOUND SECRET GATE IS NOT HELD AT ALL. The lead review is
+  # there so a lead can catch a gate the human should never see — and a tier-2
+  # secret is the one gate a lead cannot do anything useful with: the value is
+  # the owner's (a key a lead could invent was filed --self-minted and is tier 1
+  # already), nobody but a human may answer it, and the owner is usually the one
+  # who just asked for the box. Measured on divine-owl 2026-10-03: lodar asked
+  # olivia for a secret box, she filed it correctly, and the alert sat 2.5 min
+  # behind a lead review while he wrote "I don't see it, is it a bug?". Holding
+  # it only delays the person it is for, so it pings now, like --urgent.
+  [[ "$_gtier" == "2" && "$_ntype" == "secret" ]] && { printf '0'; return 0; }
   [[ "$_gtier" == "2" ]] && _ceil="$_GATE_LEAD_REVIEW_HOLD_SECS"
   local secs="${_5DIVE_GATE_UNDO_WINDOW_SECS:-$_ceil}"
   # An explicit numeric override (harnesses, and the operator escape hatch) wins,
