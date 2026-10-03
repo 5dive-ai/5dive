@@ -492,7 +492,10 @@ declare -A TYPE_INSTALL=(
   # skipped the install and left us hoping the fallback could symlink something.
   # Gate on TYPE_BIN; the trailing `command -v agy` stays, because there the
   # question really is "where did the installer put it".
-  [antigravity]="[ -x /home/claude/.local/bin/agy ] || curl -fsSL https://antigravity.google/cli/install.sh | bash; [ -x /home/claude/.local/bin/agy ] || { mkdir -p /home/claude/.local/bin; p=\$(command -v agy 2>/dev/null || true); [ -n \"\$p\" ] && ln -sf \"\$p\" /home/claude/.local/bin/agy; }"
+  # DIVE-5424: antigravity.google's frontend cache answers gzip whether or not
+  # the client asked (9 of 12 plain fetches on 2026-10-03), so a bare
+  # `curl | bash` feeds bash compressed bytes. --compressed makes curl decode it.
+  [antigravity]="[ -x /home/claude/.local/bin/agy ] || curl -fsSL --compressed https://antigravity.google/cli/install.sh | bash; [ -x /home/claude/.local/bin/agy ] || { mkdir -p /home/claude/.local/bin; p=\$(command -v agy 2>/dev/null || true); [ -n \"\$p\" ] && ln -sf \"\$p\" /home/claude/.local/bin/agy; }"
   # grok's installer drops the binary at ~/.grok/bin/grok but only creates the
   # ~/.local/bin/grok symlink *opportunistically* (its line 328 requires
   # ~/.local/bin already on PATH and ~/.grok/bin not on PATH). On a fresh VM
