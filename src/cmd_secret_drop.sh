@@ -304,7 +304,8 @@ secrets.${domain} {
     reverse_proxy 127.0.0.1:${SECRET_DROP_PORT}
 }
 EOF
-  if caddy validate --config "$cf" --adapter caddyfile >/dev/null 2>&1; then
+  local out
+  if out=$(caddy_validate "$cf" 2>&1); then
     rm -f "$bak"
     if command -v systemd-run >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
       systemd-run --quiet --collect --unit="5dive-caddy-reload-dive5319-$$" --on-active=3 \
@@ -315,7 +316,7 @@ EOF
     return 0
   fi
   mv -f "$bak" "$cf"
-  warn "secret drop: Caddyfile failed validate with the secrets.${domain} block; restored the previous file"
+  warn "secret drop: Caddyfile failed validate with the secrets.${domain} block; restored the previous file ($(caddy_validate_why "$out"))"
   return 1
 }
 
