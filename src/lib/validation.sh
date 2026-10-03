@@ -443,9 +443,9 @@ caddy_validate() {
 # kept to its last 300 characters, where the cause is.
 caddy_validate_why() {
   local why
-  why=$(grep -E '^Error:' <<<"$1" | tail -n 1)
-  [[ -n "$why" ]] || why=$(grep -F '"level":"error"' <<<"$1" | tail -n 1 | sed -n 's/.*"msg":"\(\([^"\\]\|\\.\)*\)".*/\1/p')
-  [[ -n "$why" ]] || why=$(grep -v '^[[:space:]]*$' <<<"$1" | tail -n 1)
+  why=$(grep -E '^Error:' <<<"$1" | tail -n 1) || why=""
+  [[ -n "$why" ]] || why=$(grep -F '"level":"error"' <<<"$1" | tail -n 1 | sed -n 's/.*"msg":"\(\([^"\\]\|\\.\)*\)".*/\1/p') || why=""
+  [[ -n "$why" ]] || why=$(grep -v '^[[:space:]]*$' <<<"$1" | tail -n 1) || why=""
   (( ${#why} <= 300 )) || why="…${why: -300}"
   printf '%s' "$why"
 }
