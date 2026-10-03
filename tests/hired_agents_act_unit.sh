@@ -282,12 +282,82 @@ ERR=$(env -i HOME="$H" PATH=/usr/bin:/bin bash -c ". '$TMP/tool-env.sh'" 2>&1)
 [[ -z "$ERR" ]] && ok 'the shim stays silent' || bad "shim noise ($ERR)"
 
 # ── the instructions every seat on a 5dive-built box loads ───────────────────
-BLOCK=$(sed -n '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/p' projects-CLAUDE.md)
-for want in 'A standard-tier agent never creates agents' '5dive hire-link <slug>' '5dive pkg install' \
-            '5dive route add <name> --port=<port>' '5dive task add' 'npm i -g' \
-            'Creating a teammate yourself is for admin-tier agents' '--type=codex' '5dive agent auth start <type>'; do
+# Rendered the way a 5dive-built box gets it: the API writes the file, then
+# install.sh's own sync_managed_block puts the block in. The CLI header above
+# the blocks never reaches such a box, so every rule here must live IN the block.
+eval "$(sed -n '/^sync_managed_block()/,/^}$/p' install.sh)"
+LIVE="$TMP/box-CLAUDE.md"
+printf '# Your machine\n\n- `claude` has full sudo; other agents work without root.\n' >"$LIVE"
+sync_managed_block "$LIVE" projects-CLAUDE.md 5dive:hired-agents
+BLOCK=$(sed -n '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/p' "$LIVE")
+for want in 'Standard-tier never creates agents' 'Standard-tier: send `5dive hire-link <slug>`' \
+            '5dive pkg install' '5dive route add <name> --port=<port>' '5dive task add' 'npm i -g' \
+            '**Blank teammates**, admin: `sudo 5dive agent create' '--type=claude|codex|grok|antigravity' \
+            '5dive agent auth start <type>' '**`5dive market` hires**, admin:' \
+            "its Telegram bot: your human's Connect tap (Mini App, Team)"; do
   [[ "$BLOCK" == *"$want"* ]] && ok "hired-agents block says: $want" || bad "hired-agents block says: $want"
 done
+
+# DIVE-5449 (lodar: "if user ask something do it ... that logic should apply to
+# all"): the owner's ask is the authorisation. One general line says so, and it
+# reaches the box.
+GENERAL="- **Your owner's ask IS the go-ahead:** do what your tier can, no link/tap/gate; else say why, then the Standard-tier route."
+grep -qxF -- "$GENERAL" "$LIVE" && ok 'the rendered box file carries the general owner-ask line' \
+  || bad 'the rendered box file carries the general owner-ask line' "no '$GENERAL'"
+# Negative control: the block as an ADMIN seat reads it. Every standard-tier
+# route is written "Standard-tier…" and runs to the end of its bullet, so cut
+# those; what is left is what admin is told to do. It must not bounce an owner's
+# ask with a link, a tap, a gate or a hand-off for work admin runs itself. The one
+# tap left is a real limit, not a guardrail: the new agent's Telegram bot is made
+# by the owner's own Telegram account (Connect), which no seat holds.
+ADMIN=$(grep '^- ' <<<"$BLOCK" | grep -vxF -- "$GENERAL" | sed 's/Standard-tier.*$//' \
+        | sed "s/its Telegram bot: your human's Connect tap (Mini App, Team)//")
+if grep -niE 'link|tap|gate|approv|sysadmin|task add|your lead|ask (an|your)|send your human' <<<"$ADMIN" >"$TMP/bounce"; then
+  bad 'an admin seat is never told to answer its owner with a link, tap or hand-off' "$(head -3 "$TMP/bounce")"
+else ok 'an admin seat is never told to answer its owner with a link, tap or hand-off'; fi
+for want in 'sudo 5dive agent import <slug>' 'sudo 5dive agent create <name>' '**Root**, admin: `sudo 5dive`.'; do
+  [[ "$ADMIN" == *"$want"* ]] && ok "admin reads: $want" || bad "admin reads: $want"
+done
+
+# DIVE-5449: an admin seat hires a catalogue pack itself, with the Mini App's own
+# argv (5dive-frontend hireCalls: agent import <slug> --as= --isolation= and the
+# owner's signed-in account). Olivia refused, citing billing: there is none on a
+# box that is up, so the block names none.
+grep -qiE 'bill|pay|stars|charge|cost' <<<"$BLOCK" \
+  && bad "the hired-agents block names no billing ($(grep -oiE 'bill|pay|stars|charge|cost' <<<"$BLOCK" | head -1))" \
+  || ok 'the hired-agents block names no billing'
+HIRE=$(grep -F '**`5dive market` hires**' <<<"$BLOCK" | grep -oE '`sudo 5dive agent import [^`]*`' | tr -d '`')
+[[ "$HIRE" == 'sudo 5dive agent import <slug> --as=<name> --auth-profile=<5dive account list>' ]] \
+  && ok 'the admin hire is one exact sudo agent import line' || bad "admin hire verb ($HIRE)"
+CAT=$(grep -F '**`5dive market` hires**' <<<"$BLOCK")
+grep -qF '`--isolation=admin` for Leadership/Engineering/Ops' <<<"$CAT" \
+  && ok 'the admin hire names the Mini App seat rule' || bad 'the admin hire names the Mini App seat rule'
+# Drive the REAL cmd_import with that line (placeholders filled the way an agent
+# fills them) up to cmd_create, which records its argv and stops: nothing is made.
+L=${HIRE#sudo 5dive agent import }; L=${L//<slug>/dario}; L=${L//<name>/dario}
+L=${L//<5dive account list>/mark}
+read -r -a HARGV <<<"$L"
+imp(){ ( source "$SRC/cmd_pack.sh"; set +e
+  printf '%s\n' '{"packFormat":1,"agentName":"dario","config":{"type":"claude"},"includes":{"memory":false}}' >"$TMP/m.json"
+  : >"$TMP/dario.tar.gz"
+  require_root(){ :; }; registry_read(){ printf '{"agents":{}}\n'; }; _agents_md_is(){ return 1; }
+  _marketplace_fetch_pack(){ [[ "$1" == dario ]] && printf '%s' "$TMP/dario.tar.gz"; }
+  _pack_safe_extract(){ cp "$TMP/m.json" "$2/manifest.json"; }
+  _pack_harness_targets(){ printf 'claude\n'; }; _pack_targets_declared(){ return 1; }
+  _pack_disclosure_json(){ printf '{}\n'; }; _pack_disclosure_print(){ :; }; _pack_rename_persona(){ :; }
+  resolve_model_alias(){ printf '%s' "$1"; }; is_known_type(){ [[ "$1" == claude ]]; }; step(){ :; }
+  cmd_create(){ printf '%s\n' "$@" >"$TMP/create.argv"; return 1; }
+  cmd_import "$@" ) >/dev/null 2>&1; }
+rm -f "$TMP/create.argv"; imp "${HARGV[@]}" --isolation=admin
+A=$(tr '\n' ' ' <"$TMP/create.argv" 2>/dev/null)
+[[ "$A" == 'dario --type=claude '* && " $A" == *' --isolation=admin '* && " $A" == *' --auth-profile=mark '* ]] \
+  && ok 'the block line imports pack dario as dario, admin seat, on the owner account' || bad "import argv ($A)"
+# Control: the same import without --auth-profile binds the new agent to its own
+# empty login, which never answers. That is why the line carries the flag.
+rm -f "$TMP/create.argv"; imp dario --as=dario
+A=$(tr '\n' ' ' <"$TMP/create.argv" 2>/dev/null)
+[[ " $A" == *' --auth-profile=dario '* ]] && ok 'control: no --auth-profile binds the agent to its own empty login' \
+  || bad "control argv ($A)"
 grep -q 'sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:hired-agents' install.sh \
   && ok 'install.sh syncs the block on every install' || bad 'install.sh syncs the block'
 

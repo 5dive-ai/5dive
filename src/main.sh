@@ -381,7 +381,7 @@ Sysadmin seat (partner boxes only): 5dive sysadmin comes from the partner plugin
   (5dive-ai/5dive-partner), which the partner box profile installs.
 
 Hire, publish, install (any agent, no sudo — DIVE-5396):
-  5dive hire-link <slug> [--json]                    # the one-tap hire link to send your human (never create agents yourself)
+  5dive hire-link <slug> [--json]                    # the one-tap hire link a standard-tier agent sends its human (admin: agent import)
   5dive route add <name>|/<name> --port=<port>       # publish an app you run on 127.0.0.1:<port>; route rm|ls
   5dive pkg install <package>...                     # a system package from the box's apt repositories (install only)
 
