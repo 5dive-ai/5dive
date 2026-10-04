@@ -1,3 +1,30 @@
+# DIVE-5526: the wait is bounded. A bare `flock -x` waited forever, so a lock
+# that is never released (gold-rune.oinoa.com, 2026-10-04: a killed `account set`
+# left a child holding fd 200) hung every later create and import until the
+# caller's own cap killed it, with nothing printed. Past the wait the verb fails
+# and names who holds the lock. FIVEDIVE_REGISTRY_LOCK_WAIT (seconds) overrides
+# it; the default matches shelld's longest exec cap (300 s).
+REGISTRY_LOCK_WAIT_DEFAULT=300
+
+# The pids with the lock file open, but <self> and what it forked (root reads
+# every /proc/<pid>/fd). A waiter has it open too, so this names who to look at,
+# not one sure holder.
+registry_lock_holders() {
+  local self="${1:-}" fd pid lock up i
+  lock="$(readlink -f "$REGISTRY_LOCK" 2>/dev/null)" || return 0
+  for fd in /proc/[0-9]*/fd/*; do
+    [[ "$(readlink "$fd" 2>/dev/null)" == "$lock" ]] || continue
+    pid="${fd#/proc/}"; pid="${pid%%/*}"
+    up="$pid"
+    for i in 1 2 3 4; do
+      [[ "$up" == "$self" ]] && continue 2
+      up="$(awk '/^PPid:/ {print $2}' "/proc/$up/status" 2>/dev/null)"
+      [[ -n "$up" ]] || break
+    done
+    printf '%s(%s) ' "$pid" "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-80 | sed 's/ *$//')"
+  done | sed 's/ $//'
+}
+
 with_registry_lock() {
   local fn="$1"; shift
   if [[ "${IN_REGISTRY_LOCK:-0}" == "1" ]]; then
@@ -5,8 +32,14 @@ with_registry_lock() {
     return
   fi
   ensure_state
+  local wait="${FIVEDIVE_REGISTRY_LOCK_WAIT:-$REGISTRY_LOCK_WAIT_DEFAULT}"
+  [[ "$wait" =~ ^[0-9]+$ ]] || wait="$REGISTRY_LOCK_WAIT_DEFAULT"
   (
-    flock -x 200
+    _rl_self="$BASHPID"
+    if ! flock -x -w "$wait" 200; then
+      fail "$E_TIMEOUT" "the agent registry is locked by another 5dive command and was not released in ${wait}s (open in: $(registry_lock_holders "$_rl_self" || true)). Nothing was changed."
+      exit "$E_TIMEOUT"
+    fi
     IN_REGISTRY_LOCK=1
     "$fn" "$@"
   ) 200>"$REGISTRY_LOCK"

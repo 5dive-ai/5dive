@@ -973,8 +973,14 @@ cmd_account_set() {
   # key, and waits on this account; bind it now. Silent, never fatal.
   # DIVE-5247: the seat's code is the partner plugin's now, so ask it through
   # the verb, and only on a box that has the seat (a regular box spawns nothing).
+  # DIVE-5526: this verb holds the registry lock (main.sh), and the plugin's
+  # `agent config` takes it again in a NEW process, which cannot see the
+  # unexported IN_REGISTRY_LOCK and so waited on its own parent forever: the
+  # claim's key write on a partner spare hung, and the orphan kept the lock.
+  # Hand it down to this one child, which runs inside our critical section. Its
+  # stdin is closed: the key was read from it, and the child reads nothing.
   if jq -e '.agents.sysadmin != null' "$REGISTRY" >/dev/null 2>&1; then
-    "${FIVEDIVE_SELF_BIN:-/usr/local/bin/5dive}" sysadmin _bind-pending "$name" >/dev/null 2>&1 || true
+    IN_REGISTRY_LOCK="${IN_REGISTRY_LOCK:-0}" "${FIVEDIVE_SELF_BIN:-/usr/local/bin/5dive}" sysadmin _bind-pending "$name" </dev/null >/dev/null 2>&1 || true
   fi
 }
 
