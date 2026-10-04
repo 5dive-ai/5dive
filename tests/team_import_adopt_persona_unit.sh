@@ -13,8 +13,9 @@
 #              negative controls (different pack, no pack record, already in
 #              another team's org) still namespace, as DIVE-4822 ships
 #   section 2  the org read that decides "solo", and that it fails CLOSED
-#   section 3  the namespace rename now reaches prose: instructions and the
-#              installed pack CLAUDE.md name the namespaced teammates
+#   section 3  the namespace rename reaches every place instructions and the
+#              installed pack CLAUDE.md ADDRESS a teammate, and nothing else:
+#              members named with plain words ("partner outreach") keep their prose
 #   section 4  `team import` end to end with the provisioning verbs stubbed: the
 #              solo theo JOINS (org edge, role block), only the missing members
 #              are created, and no `<prefix>-theo` is provisioned
@@ -70,7 +71,7 @@ agents:
     pack: dude
     role: "Head of Community"
     reports_to: [theo]
-    instructions: "Ask theo before any post. Never touch agent-theo's files."
+    instructions: "Ask `theo` before any post. Never touch agent-theo's files."
 YAML
 SPEC="$(_compose_parse "$TMP/gtm.5dive.yaml")"
 [[ -n "$SPEC" ]] && ok_t 'P0 the fixture parses (the arms below are not vacuous)' \
@@ -118,9 +119,9 @@ rm -f "$REGISTRY"
 MAP="$(_compose_prefix_map "$SPEC" gtm)"
 eq_t 'R1 the prefix map covers every declared name' \
      '{"dude":"gtm-dude","olivia":"gtm-olivia","theo":"gtm-theo"}' "$(jq -cS . <<<"$MAP")"
-_in='Ask theo before any post; `5dive agent send dude x`. Never touch agent-theo or gtm-theo. Theo, theorem, theo.'
-_want='Ask gtm-theo before any post; `5dive agent send gtm-dude x`. Never touch agent-theo or gtm-theo. Theo, theorem, gtm-theo.'
-eq_t 'R2 standalone lowercase names are rewritten; paths, prefixed names, capitalised names and longer words are not' \
+_in='Ask `theo` before any post; `5dive agent send dude x`, @olivia. --to=theo --manager dude; task assign DIVE-1 theo. Never touch agent-theo, gtm-theo, theo.md or a@theo.com. Theo, theorem, ask theo.'
+_want='Ask `gtm-theo` before any post; `5dive agent send gtm-dude x`, @gtm-olivia. --to=gtm-theo --manager gtm-dude; task assign DIVE-1 gtm-theo. Never touch agent-theo, gtm-theo, theo.md or a@theo.com. Theo, theorem, ask theo.'
+eq_t 'R2 only addresses are rewritten (`name`, @name, agent send, --to/--manager, task assign); bare words, paths, prefixed and capitalised names are not' \
      "$_want" "$(printf '%s' "$_in" | _compose_rename_text "$MAP")"
 eq_t 'R3 the rewrite is idempotent (a re-run changes nothing)' \
      "$_want" "$(printf '%s' "$_want" | _compose_rename_text "$MAP")"
@@ -132,21 +133,35 @@ persona_append_block() { printf '%s' "$3" > "$TMP/block.$1"; }
 PSPEC="$(_compose_apply_name_prefix "$SPEC" gtm)"
 ( COMPOSE_NAME_MAP="$MAP"; _compose_write_role_md "$PSPEC" gtm-dude "$TMP" )
 _blk=$(cat "$TMP/block.gtm-dude" 2>/dev/null)
-[[ "$_blk" == *"Ask gtm-theo before any post"* && "$_blk" != *"Ask theo "* ]] \
+[[ "$_blk" == *'Ask `gtm-theo` before any post'* && "$_blk" != *'Ask `theo` '* ]] \
   && ok_t 'R5 under a namespace the written instructions name gtm-theo, not theo' \
   || bad_t 'R5 namespaced instructions' "block=${_blk:0:200}"
 ( COMPOSE_NAME_MAP=""; _compose_write_role_md "$SPEC" dude "$TMP" )
-[[ "$(cat "$TMP/block.dude")" == *"Ask theo before any post"* ]] \
+[[ "$(cat "$TMP/block.dude")" == *'Ask `theo` before any post'* ]] \
   && ok_t 'R6 CONTROL: with no namespace the instructions are written as declared' \
   || bad_t 'R6 un-namespaced instructions unchanged' "$(cat "$TMP/block.dude")"
 
 # The installed pack CLAUDE.md, rewritten in place.
 sudo() { shift 2; "$@"; }               # `sudo -u <user> cmd` -> cmd
 persona_target() { printf '%s/persona.%s.md' "$TMP" "$1"; }
-printf 'You are dude. Your lead is theo; olivia runs the company.\n' > "$TMP/persona.gtm-dude.md"
+printf 'You are dude. Your lead is theo: `5dive agent send theo`; @olivia runs the company.\n' > "$TMP/persona.gtm-dude.md"
 _compose_rename_persona_file gtm-dude claude "$MAP" >/dev/null 2>&1
-eq_t 'R7 the pack CLAUDE.md names the namespaced teammates' \
-     'You are gtm-dude. Your lead is gtm-theo; gtm-olivia runs the company.' "$(cat "$TMP/persona.gtm-dude.md")"
+eq_t 'R7 the pack CLAUDE.md addresses the namespaced teammates; its prose is untouched' \
+     'You are dude. Your lead is theo: `5dive agent send gtm-theo`; @gtm-olivia runs the company.' "$(cat "$TMP/persona.gtm-dude.md")"
+
+# R8: members named with plain words. The two lines are byte-for-byte from the
+# marketplace (teams/distribution.5dive.yaml, teams/startup.5dive.yaml); under a
+# cs- prefix they must survive, while an address to the same name moves.
+CMAP='{"outreach":"cs-outreach","creative":"cs-creative","scout":"cs-scout","editor":"cs-editor"}'
+_prose='      Draft maintainer, newsletter and partner outreach from verified derivatives.
+      directs: landing sections, ad creative, post art. Match the brand voice; ship
+      - "Create the brand kit + 3 launch-ready ad creatives."
+The scout reads; the editor cuts.'
+eq_t 'R8 plain-word member names in prose survive a prefix byte-for-byte' \
+     "$_prose" "$(printf '%s' "$_prose" | _compose_rename_text "$CMAP")"
+eq_t 'R9 the same names used as addresses are renamed' \
+     'agent send cs-outreach "draft"; `cs-creative`; @cs-scout; --to=cs-editor' \
+     "$(printf '%s' 'agent send outreach "draft"; `creative`; @scout; --to=editor' | _compose_rename_text "$CMAP")"
 
 # ============ 4. `team import` END TO END (provisioning verbs recorded) ======
 # A recorder stands in for every child `5dive <verb>` call. `agent create/import`

@@ -970,16 +970,21 @@ _compose_adoptable_solo() {
     | .key' <<<"$spec" 2>/dev/null
 }
 
-# Rewrite every standalone mention of a renamed agent in prose (stdin -> stdout)
-# through a {old:new} map. "Standalone" = not inside a longer name or path, so
-# `diveteam-theo` and `agent-theo` are left alone and a re-run is a no-op.
-# Lowercase only: an agent is addressed by its name (`agent send theo`), and the
-# capitalised "Theo" is the persona's name, which a namespace does not change.
+# Rewrite every place prose ADDRESSES a renamed agent (stdin -> stdout) through
+# a {old:new} map. Members are often named with plain words (outreach, creative,
+# scout, editor), so a bare word is never renamed: "partner outreach" and "ad
+# creative" are prose, not the agents. Only an address moves:
+#   `theo`   @theo   agent send theo   --to=theo / --manager theo (and --reports-to,
+#   --assignee, --agent)   task assign <id> theo / assign DIVE-1 theo
+# The name must end there (not inside `theo-bot`, `theo.md` or a@theo.com), so a namespaced
+# `p-theo` is not touched again and a re-run is a no-op.
 _compose_rename_text() {
   local map="$1"
   jq -Rjs --argjson m "$map" '
-    reduce ($m | to_entries[]) as $e (.;
-      gsub("(?<![A-Za-z0-9_-])" + $e.key + "(?![A-Za-z0-9_-])"; $e.value))'
+    "(?<pre>(?<![A-Za-z0-9_.])@|\\bagent\\s+send\\s+|--(?:to|manager|reports-to|assignee|agent)(?:=|\\s+)|\\btask\\s+assign\\s+(?:\\S+\\s+)?|\\bassign\\s+(?:[A-Z]+-[0-9]+|<[^>\\s]+>)\\s+)" as $addr
+    | reduce ($m | to_entries[]) as $e (.;
+        gsub("`" + $e.key + "`"; "`" + $e.value + "`")
+        | gsub($addr + $e.key + "(?![A-Za-z0-9_-]|\\.[A-Za-z0-9])"; "\(.pre)" + $e.value))'
 }
 
 # The {old:new} map a prefix applies to a roster (DIVE-5498: so the text
