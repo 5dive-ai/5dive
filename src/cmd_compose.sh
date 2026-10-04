@@ -414,6 +414,12 @@ _compose_write_role_md() {
       warn "[$name] instructions_file not found: $ipath"
     fi
   fi
+  # DIVE-5498: under a namespace, prose that names a teammate must name the
+  # namespaced one, or "hand it to theo" reaches a different agent than the
+  # org chart's `p-theo`. Set by cmd_compose_up through dynamic scope.
+  if [[ -n "$instructions" && -n "${COMPOSE_NAME_MAP:-}" ]]; then
+    instructions=$(printf '%s' "$instructions" | _compose_rename_text "$COMPOSE_NAME_MAP") || true
+  fi
 
   # Managers (reports_to) and direct reports (who lists $name as a manager).
   local -a mgrs=() reports=()
@@ -928,6 +934,79 @@ _compose_name_collisions() {
   jq -r --argjson reg "$reg" '.agents | keys[] | select($reg.agents[.] != null)' <<<"$spec" 2>/dev/null
 }
 
+# DIVE-5498 — ONE PERSONA IS ONE AGENT PER BOX.
+#
+# Names on the box that already sit in an org: they have a manager, a direct
+# report, or an org role. Newline-separated. Everything else is SOLO — a hire
+# from the Mini App or `agent import` writes no agents_org row at all.
+#
+# Fails CLOSED: an org read that errors reports every agent on the box as bound,
+# so nothing is adopted out of a chart this run could not see.
+_compose_org_bound() {
+  db "SELECT name FROM agents_org
+        WHERE COALESCE(reports_to,'')<>'' OR COALESCE(role,'')<>''
+      UNION SELECT reports_to FROM agents_org WHERE COALESCE(reports_to,'')<>'';" 2>/dev/null \
+    || registry_read 2>/dev/null | jq -r '.agents | keys[]' 2>/dev/null
+}
+
+# Declared names that are already on the box AS THE SAME PERSONA and SOLO, so the
+# team ADOPTS them instead of namespacing around them. "Same persona" is the
+# marketplace pack the agent was imported from (registry .pack.slug) matching
+# the spec's `pack:` — a bare name match is not enough, two different packs can
+# share a name. "Solo" is not in <org_bound>: an agent already in another team
+# is that team's, and taking it would steal a seat out of its chart (the reason
+# the DIVE-4822 adopt branch never re-wires).
+#
+# Before this, solo `theo` + a team that declares theo made `diveteam-theo` next
+# to him: two Theos, and every prose reference to "theo" pointed at the wrong one.
+_compose_adoptable_solo() {
+  local spec="$1" reg="$2" bound="${3:-}"
+  jq -r --argjson reg "$reg" --arg bound "$bound" '
+    ($bound | split("\n") | map(select(length > 0))) as $b
+    | .agents | to_entries[]
+    | select(.value.pack // "" | length > 0)
+    | select(($reg.agents[.key].pack.slug // "") == .value.pack)
+    | select(.key as $k | $b | index($k) | not)
+    | .key' <<<"$spec" 2>/dev/null
+}
+
+# Rewrite every place prose ADDRESSES a renamed agent (stdin -> stdout) through
+# a {old:new} map. Members are often named with plain words (outreach, creative,
+# scout, editor), so a bare word is never renamed: "partner outreach" and "ad
+# creative" are prose, not the agents. Only an address moves:
+#   `theo`   @theo   agent send theo   --to=theo / --manager theo (and --reports-to,
+#   --assignee, --agent)   task assign <id> theo / assign DIVE-1 theo
+# The name must end there (not inside `theo-bot`, `theo.md` or a@theo.com), so a namespaced
+# `p-theo` is not touched again and a re-run is a no-op.
+_compose_rename_text() {
+  local map="$1"
+  jq -Rjs --argjson m "$map" '
+    "(?<pre>(?<![A-Za-z0-9_.])@|\\bagent\\s+send\\s+|--(?:to|manager|reports-to|assignee|agent)(?:=|\\s+)|\\btask\\s+assign\\s+(?:\\S+\\s+)?|\\bassign\\s+(?:[A-Z]+-[0-9]+|<[^>\\s]+>)\\s+)" as $addr
+    | reduce ($m | to_entries[]) as $e (.;
+        gsub("`" + $e.key + "`"; "`" + $e.value + "`")
+        | gsub($addr + $e.key + "(?![A-Za-z0-9_-]|\\.[A-Za-z0-9])"; "\(.pre)" + $e.value))'
+}
+
+# The {old:new} map a prefix applies to a roster (DIVE-5498: so the text
+# instructions and pack CLAUDE.md say the names the org chart says).
+_compose_prefix_map() {
+  jq -c --arg p "$2" '[.agents | keys[] | {key: ., value: ($p + "-" + .)}] | from_entries' <<<"$1" 2>/dev/null
+}
+
+# Apply the rename map to an imported agent's instructions file in place. Read
+# and written AS the agent — the same posture persona_append_block takes.
+_compose_rename_persona_file() {
+  local name="$1" type="$2" map="$3" md old new
+  local user="agent-${name}"
+  md=$(persona_target "$name" "$type" 2>/dev/null) || return 0
+  old=$(sudo -u "$user" cat "$md" 2>/dev/null) || return 0
+  new=$(printf '%s' "$old" | _compose_rename_text "$map") || return 1
+  [[ "$new" == "$old" ]] && return 0
+  printf '%s\n' "$new" | sudo -u "$user" tee "$md" >/dev/null 2>&1 \
+    && step "[$name] teammate names in $md rewritten to this team's namespace" \
+    || warn "[$name] could not rewrite teammate names in $md — it may still name the un-namespaced agents"
+}
+
 _compose_type_override_pins() {
   local spec="$1" t="$2"
   [[ "$t" == "claude" ]] && { printf ''; return 0; }
@@ -1031,11 +1110,13 @@ HELP
   # rather than truncate: a truncated name is a DIFFERENT agent, and silently
   # provisioning one is the same class of defect as the silent adoption this row
   # exists to stop.
+  local COMPOSE_NAME_MAP=""
   if [[ -n "$name_prefix" ]]; then
     local _pfx_bad
     _pfx_bad=$(_compose_prefix_overflow "$spec" "$name_prefix")
     [[ -z "$_pfx_bad" ]] || fail "$E_VALIDATION" \
       "--prefix=$name_prefix does not fit this roster — an agent name is capped at 16 characters and these would overflow: ${_pfx_bad}. The longest prefix that fits this roster is $(_compose_prefix_budget "$spec") character(s)."
+    COMPOSE_NAME_MAP=$(_compose_prefix_map "$spec" "$name_prefix") || COMPOSE_NAME_MAP=""
     spec=$(_compose_apply_name_prefix "$spec" "$name_prefix") \
       || fail "$E_VALIDATION" "could not apply --prefix=$name_prefix to the spec"
     step "namespace: the whole roster comes up as ${name_prefix}-<name>, with its own org root"
@@ -1081,6 +1162,21 @@ HELP
     exists=$(jq --arg n "$name" '.agents[$n] != null' <<<"$reg")
     if [[ "$exists" == "true" ]]; then
       step "[$name] already exists — ensuring started"
+      # DIVE-5498: the SAME persona, solo on this box, JOINS this team — role,
+      # manager edge, reporting block and goals are applied as on create, and
+      # the agent keeps its home and memory. Chosen by `team import` (it holds
+      # the registry/org read); a bare `up` leaves this list empty and every
+      # existing agent takes the untouched-adopt path below, as before.
+      if [[ -n "${COMPOSE_ADOPT_REWIRE:-}" ]] && grep -qxF -- "$name" <<<"$COMPOSE_ADOPT_REWIRE"; then
+        step "[$name] is already on this box on its own — it joins this team (no second copy)"
+        _compose_wire_role "$spec" "$name" "$spec_dir" "$self" || true
+        if bash "$self" agent start "$name" >/dev/null 2>&1; then
+          ((started++)) || true
+        else
+          ((skipped++)) || true
+        fi
+        continue
+      fi
       # DIVE-4822: THIS `continue` IS THE SILENT MERGE. It skips the whole
       # provisioning block below, INCLUDING _compose_wire_role and therefore the
       # `org set` edge, so an adopted name keeps whatever manager it already had
@@ -1120,6 +1216,10 @@ HELP
       step "[$name] importing character pack '$pack_slug'"
       mapfile -t args < <(_compose_import_args "$agent_spec" "$name" "$pack_slug" "$spec_dir" "$type_override")
       bash "$self" agent import "${args[@]}" || brought_up=0
+      # DIVE-5498: the pack's own CLAUDE.md names teammates by their bare names.
+      if (( brought_up )) && [[ -n "$COMPOSE_NAME_MAP" ]]; then
+        _compose_rename_persona_file "$name" "$(jq -r '.type // "claude"' <<<"$agent_spec")" "$COMPOSE_NAME_MAP" || true
+      fi
     else
       step "[$name] creating"
       mapfile -t args < <(_compose_create_args "$agent_spec" "$name" "$spec_dir")
@@ -1925,6 +2025,9 @@ _team_tag_root_coordinator() {
 #               second copy
 #   free        no declared name is taken -> none. A VIRGIN BOX IS UNCHANGED,
 #               which is the load-bearing control of the whole row
+#   adopt-solo  every taken name is the SAME persona, solo on this box
+#               (DIVE-5498) -> none; those agents join this team, only the
+#               missing members are created. A namespace here would clone them
 #   adopt-all   every declared name is taken -> none. This is a re-run of this
 #               same roster from before DIVE-4822 (no project row yet), and
 #               renaming it would provision a second copy of a team that is
@@ -1937,8 +2040,8 @@ _team_tag_root_coordinator() {
 # of a team that came up prefixed would see its own agents as "all taken", read
 # that as an unprefixed re-run, and come up a second time under the bare names.
 _team_choose_prefix() {
-  local slug="$1" spec="$2" reg="$3" installed_lead="$4" root="$5"
-  local declared_n collide_n
+  local slug="$1" spec="$2" reg="$3" installed_lead="$4" root="$5" bound="${6:-}"
+  local declared_n collide_n adopt_n
 
   if [[ -n "$installed_lead" && -n "$root" ]]; then
     if [[ "$installed_lead" == "$root" ]]; then
@@ -1958,6 +2061,9 @@ _team_choose_prefix() {
   [[ "$collide_n"  =~ ^[0-9]+$ ]] || collide_n=0
 
   if (( collide_n == 0 )); then printf 'free|'; return 0; fi
+  adopt_n=$(_compose_adoptable_solo "$spec" "$reg" "$bound" | grep -c . || true)
+  [[ "$adopt_n" =~ ^[0-9]+$ ]] || adopt_n=0
+  if (( adopt_n == collide_n )); then printf 'adopt-solo|'; return 0; fi
   if (( declared_n > 0 && collide_n == declared_n )); then printf 'adopt-all|'; return 0; fi
 
   local p; p=$(_compose_default_prefix "$slug" "$spec")
@@ -2213,6 +2319,8 @@ HELP
   #   3. this template is already installed -> the prefix it was installed under,
   #                                            so a re-import is idempotent
   #   4. no declared name is taken          -> none; a virgin box is unchanged
+  #   4b. every taken name is the SAME      -> none; those agents JOIN this team
+  #       persona, solo (DIVE-5498)            (one persona = one agent per box)
   #   5. EVERY declared name is taken       -> none; this is a re-run of this same
   #                                            roster from before DIVE-4822, and
   #                                            renaming it would provision a
@@ -2244,19 +2352,30 @@ HELP
     local _choice _rc
     _choice=$(_team_choose_prefix "$slug_key" "$spec_for_prefix" \
                 "$(registry_read 2>/dev/null || echo '{}')" \
-                "$(_team_installed_lead "$slug_key")" "$root_name"); _rc=$?
+                "$(_team_installed_lead "$slug_key")" "$root_name" \
+                "$(_compose_org_bound)"); _rc=$?
     case "$_rc" in
       0) name_prefix="${_choice#*|}" ;;
       *) fail "$E_VALIDATION" "$_choice" ;;
     esac
     case "${_choice%%|*}" in
       installed) step "team '$slug_key' is already installed as '$(_team_installed_lead "$slug_key")' — re-importing into the same namespace" ;;
+      adopt-solo) step "$(_compose_name_collisions "$spec_for_prefix" "$(registry_read 2>/dev/null || echo '{}')" | paste -sd', ' -) already on this box on their own — they join this team instead of a second copy being made" ;;
       adopt-all) step "every agent this template declares is already on this box — adopting the existing roster rather than provisioning a second copy" ;;
       namespaced)
         local _clashes
         _clashes=$(_compose_name_collisions "$spec_for_prefix" "$(registry_read 2>/dev/null || echo '{}')" | paste -sd', ' -)
         warn "${_clashes} already exist(s) on this box and belong(s) to another team — importing '$slug_key' as '${name_prefix}-<name>' instead of merging into it. Pass --prefix=<p> to choose the namespace yourself, or --prefix='' to adopt the existing agents (which is what this used to do, silently)." ;;
     esac
+  fi
+
+  # DIVE-5498: with no namespace, a solo agent of the same persona JOINS the
+  # team (role, manager, goals re-applied by `up`). Under a namespace nothing is
+  # adopted — the roster comes up under new names and touches nobody.
+  local COMPOSE_ADOPT_REWIRE=""
+  if [[ -z "$name_prefix" && -n "$spec_for_prefix" ]]; then
+    COMPOSE_ADOPT_REWIRE=$(_compose_adoptable_solo "$spec_for_prefix" \
+                             "$(registry_read 2>/dev/null || echo '{}')" "$(_compose_org_bound)")
   fi
 
   step "importing team from $file"
