@@ -2260,6 +2260,91 @@ cmd_task_escalate() {
      --arg i "$id" --arg np "$new_pri" --arg op "$old_pri" --arg o "$owner" --arg p "$pinged" --arg h "$notified_human"
 }
 
+# DIVE-5507 (lodar 2026-10-04, on the Mini App task view: "send follow up or link
+# to chat with the task id"): the owner steers a running task from where he reads
+# it. One verb, because the exec tunnel carries `task` free text and refuses
+# `agent send`: the follow-up is appended to the body FIRST (so it survives a
+# fresh-context wake even when the message cannot land), then sent to the assignee
+# naming the row, with --wake, and with the owner's chat as the reply target when
+# the seat's pairing names exactly one, so the agent answers in its own chat.
+# The send is outside the a2a round cap (_5DIVE_A2A_NOTIFY): the owner talking to
+# his seat is not two agents trading rounds, and a short "ok go" must not be
+# refused as an acknowledgement. A failed send still exits 0 with delivered:false
+# and the reason — the note is on the row, which is the record that counts.
+cmd_task_followup() {
+  tasks_db_init
+  local from="" text="" text_set=0
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --text=*) text="${1#--text=}"; text_set=1 ;;
+      --from=*) from="${1#*=}" ;;
+      --)       shift; positional+=("$@"); break ;;
+      -*)       fail "$E_USAGE" "unknown flag: $1" ;;
+      *)        positional+=("$1") ;;
+    esac
+    shift
+  done
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task followup <id|DIVE-N> --text=\"<message>\" [--from=<who>]"
+  (( text_set )) || [[ ${#positional[@]} -lt 2 ]] || text="${positional[*]:1}"
+  # Trim; a blank follow-up is a mis-tap, not a message.
+  text="${text#"${text%%[![:space:]]*}"}"; text="${text%"${text##*[![:space:]]}"}"
+  [[ -n "$text" ]] || fail "$E_USAGE" "follow-up text is empty: 5dive task followup <id> --text=\"<message>\""
+  (( ${#text} <= 2000 )) || fail "$E_VALIDATION" "follow-up is ${#text} characters; keep it under 2000 (put a long brief in the body: task set-body --append)"
+  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+
+  local status assignee title
+  status=$(db "SELECT status FROM tasks WHERE id=${id};")
+  [[ "$status" != "done" && "$status" != "cancelled" ]] \
+    || fail "$E_VALIDATION" "$ident is $status — nothing to follow up. File a new task instead."
+  assignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+  [[ -n "$assignee" ]] \
+    || fail "$E_VALIDATION" "$ident has no assignee, so nobody would get the follow-up — assign it first: 5dive task assign $ident <agent>"
+  # A human or principal assignee has no session to type into; refuse before the
+  # body is touched rather than record a follow-up nobody can receive.
+  jq -e --arg n "$assignee" '.agents[$n] != null' <<<"$(registry_read 2>/dev/null || echo '{}')" >/dev/null 2>&1 \
+    || fail "$E_VALIDATION" "$ident is assigned to '$assignee', which is not an agent on this box — a follow-up goes to an agent's chat"
+  title=$(db "SELECT title FROM tasks WHERE id=${id};")
+
+  local actor; actor=$(task_actor "$from")
+  local stamp; stamp=$(date -u '+%Y-%m-%d %H:%MZ')
+  local body newbody
+  body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+  local note="--- Follow-up from the owner, ${stamp}:"$'\n'"${text}"
+  if [[ -n "$body" ]]; then newbody="${body}"$'\n\n'"${note}"; else newbody="$note"; fi
+  _task_body_size_guard "$newbody" "$ident" "task followup"
+  db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
+  _task_store_audit_log "task followup" "ok" 0 -- "task=$ident" "actor=$actor" "to=$assignee" 2>/dev/null || true
+
+  # The owner's chat on this seat's bot, when the pairing names exactly one.
+  local chat=""
+  if declare -F _owner_ask_route >/dev/null 2>&1 && _owner_ask_route "$assignee" >/dev/null 2>&1; then
+    [[ -n "$OA_OWNER_TG" && "$OA_OWNER_TG" != *$'\n'* ]] && chat="$OA_OWNER_TG"
+  fi
+  local msg="📝 Follow-up on ${ident} \"${title}\" from the owner: ${text}"$'\n\n'"It is recorded on the task (5dive task show ${ident}). Act on it and answer the owner in your Telegram chat."
+  local -a send=(--wake --message="$msg")
+  valid_sender_label "$actor" && send+=(--from="$actor")
+  [[ -n "$chat" ]] && send+=(--reply-to-chat="$chat")
+  local delivered=0 why=""
+  if why=$( ( _5DIVE_A2A_NOTIFY=1 cmd_send "$assignee" "${send[@]}" ) 2>&1 >/dev/null ); then
+    delivered=1; why=""
+  else
+    why=$(printf '%s' "$why" | tr '\n' ' ' | sed 's/[[:space:]]*$//' | cut -c1-300)
+    [[ -n "$why" ]] || why="the send failed"
+  fi
+
+  if (( delivered )); then
+    ok "$ident follow-up recorded and sent to $assignee" \
+       '{ident:$i, assignee:$a, recorded:true, delivered:true, reply_to_chat:(($c|select(length>0)) // null)}' \
+       --arg i "$ident" --arg a "$assignee" --arg c "$chat"
+  else
+    warn "$ident follow-up recorded, but $assignee did not get the message: $why"
+    ok "$ident follow-up recorded; $assignee will read it on the task" \
+       '{ident:$i, assignee:$a, recorded:true, delivered:false, why:$w}' \
+       --arg i "$ident" --arg a "$assignee" --arg w "$why"
+  fi
+}
+
 cmd_task_rm() {
   tasks_db_init
   [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task rm <id|DIVE-N>"
