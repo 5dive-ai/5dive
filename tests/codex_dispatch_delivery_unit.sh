@@ -82,7 +82,8 @@ fi
 # Extract the shipped delivery functions.
 # ---------------------------------------------------------------------------
 for fn in _agent_delivery_inbox _agent_delivery_mode _codex_dispatcher_enabled \
-          _agent_dispatch_is_tui_control _agent_dispatch_inbox_send; do
+          _agent_dispatch_is_tui_control _agent_dispatch_inbox_send \
+          _agent_dispatch_control_verb _agent_dispatch_supports_control; do
   eval "$(awk -v f="^${fn}\\\\(\\\\) \\\\{$" '$0 ~ f { on=1 } on { print } on && $0 == "}" { exit }' "$RT")"
   declare -F "$fn" >/dev/null \
     || { printf 'FATAL - could not extract %s from %s\n' "$fn" "$RT"; exit 1; }
@@ -240,6 +241,67 @@ for f in "$RT" "$HB"; do
       && ok_t "routing: $(basename "$f") routes before the pane credential guard" \
       || bad_t "routing: $(basename "$f") runs the pane guard on a seat with no chat pane"
   fi
+done
+
+# ---------------------------------------------------------------------------
+# Arm 7 — DIVE-5502: a dispatcher that ADVERTISES the verb takes /clear and
+# /compact as control messages (the bounded thread per task). One that does not
+# — an older bridge — still gets nothing, because it would run "/clear" as a turn.
+# ---------------------------------------------------------------------------
+eq_t "verb: /clear is a new session" "new-session" "$(_agent_dispatch_control_verb "/clear")"
+eq_t "verb: /compact is a compaction" "compact" "$(_agent_dispatch_control_verb " /compact ")"
+eq_t "verb: /goal clear has no dispatcher verb (still skipped)" "" "$(_agent_dispatch_control_verb "/goal clear")"
+
+seat ctlnew codex telegram dispatcher-inbox
+seat ctlold codex telegram dispatcher-inbox
+seat ctlnone codex telegram dispatcher-inbox
+_ctl_dir() { printf '%s\n' "$HOMES/agent-$1/.codex/channels/dispatcher"; }
+mkdir -p "$(_ctl_dir ctlnew)/inbox" "$(_ctl_dir ctlold)/inbox" "$(_ctl_dir ctlnone)/inbox"
+printf '{"schema":1,"controls":["compact","new-session"]}\n' > "$(_ctl_dir ctlnew)/health.json"
+printf '{"schema":1}\n' > "$(_ctl_dir ctlold)/health.json"
+_ctl_inbox() { printf '%s\n' "/home/agent-$1/.codex/channels/dispatcher/inbox"; }
+_agent_dispatch_supports_control ctlnew new-session "$(_ctl_inbox ctlnew)" \
+  && ok_t "supports: a bridge listing new-session runs it" \
+  || bad_t "supports: an advertised verb was read as unsupported — task wakes stay unbounded"
+_agent_dispatch_supports_control ctlnew rewind "$(_ctl_inbox ctlnew)" \
+  && bad_t "supports: a verb the bridge never listed was read as supported" \
+  || ok_t "supports: an unlisted verb is not supported"
+_agent_dispatch_supports_control ctlold new-session "$(_ctl_inbox ctlold)" \
+  && bad_t "supports: a pre-0.5.24 bridge was sent a control it would run as a user turn" \
+  || ok_t "supports: a bridge with no controls list is not sent one"
+_agent_dispatch_supports_control ctlnone new-session "$(_ctl_inbox ctlnone)" \
+  && bad_t "supports: an absent health file was read as support" \
+  || ok_t "supports: an absent health file means no"
+
+# The message itself: a control field beside the text, and only when asked.
+_ctl_drain() { # copy the first message in <inbox> to <out>, then unlink it (the receipt)
+  local in="$1" out="$2"
+  ( for _ in $(seq 1 100); do
+      f=$(ls "$in"/*.json 2>/dev/null | head -1) || true
+      [[ -n "${f:-}" ]] && { cp "$f" "$out"; rm -f "$f"; exit 0; }
+      sleep 0.03
+    done ) &
+}
+_ctl_drain "$(_ctl_dir ctlnew)/inbox" "$TMP/ctl-msg.json"; _d=$!
+FIVE_DISPATCH_CONFIRM_TRIES=60 FIVE_DISPATCH_CONFIRM_SLEEP=0.03 \
+  _agent_dispatch_inbox_send ctlnew "/clear" "$(_ctl_inbox ctlnew)" new-session; _rc=$?
+wait "$_d" 2>/dev/null || true
+eq_t "send: a drained control returns rc 0" "0" "$_rc"
+eq_t "send: the control field rides the message" "new-session|/clear|agent" \
+  "$(jq -r '"\(.control)|\(.text)|\(.route.source)"' "$TMP/ctl-msg.json" 2>/dev/null)"
+_ctl_drain "$(_ctl_dir ctlnew)/inbox" "$TMP/plain-msg.json"; _d=$!
+FIVE_DISPATCH_CONFIRM_TRIES=60 FIVE_DISPATCH_CONFIRM_SLEEP=0.03 \
+  _agent_dispatch_inbox_send ctlnew "continue" "$(_ctl_inbox ctlnew)"; _rc=$?
+wait "$_d" 2>/dev/null || true
+eq_t "send: an ordinary message carries no control field" "false" \
+  "$(jq -r 'has("control")' "$TMP/plain-msg.json" 2>/dev/null)"
+
+# Both send paths consult the advertisement before posting a control: a fix on
+# one of the two paths is the DIVE-4036 shape.
+for f in "$RT" "$HB"; do
+  grep -q '_agent_dispatch_supports_control "\$name"' "$f" \
+    && ok_t "routing: $(basename "$f") checks the bridge runs the verb before posting it" \
+    || bad_t "routing: $(basename "$f") posts or skips controls without asking the bridge"
 done
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
