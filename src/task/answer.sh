@@ -785,6 +785,36 @@ cmd_task_answer() {
   nt=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN need_type ELSE '' END FROM tasks WHERE id=${id};")
   [[ -n "$nt" ]] || fail "$E_CONFLICT" "$ident has no pending human gate (nothing to answer)"
 
+  # DIVE-5465 — WHAT WAS APPROVED IS WHAT POSTS. A gate filed with
+  # `--quote-file=<draft>` pinned the draft's sha256 at filing time, and the ping
+  # showed that text. If the draft was edited since, an approval now would
+  # authorise words the person never saw, so a YES is refused and the gate stays
+  # open for a re-ask with the new text. A NO is never refused: declining a text
+  # you did not see is always safe. Fails CLOSED on a draft that is gone or
+  # unreadable from here — "cannot show it is unchanged" is not "unchanged".
+  # Gates with no pinned file (no quote, or an inline --quote whose text IS the
+  # record) skip this entirely.
+  case "${value,,}" in
+    approve|approved|allow|allowed|yes|ok|provided|done)
+      local _qfile _qsha _qnow=""
+      _qfile=$(db "SELECT COALESCE(need_quote_file,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+      if [[ -n "$_qfile" ]]; then
+        _qsha=$(db "SELECT COALESCE(need_quote_sha,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+        if [[ -f "$_qfile" && -r "$_qfile" ]]; then
+          local _qtext=""
+          IFS= read -r -d '' _qtext < "$_qfile" || true
+          _qnow=$(printf '%s' "$_qtext" | sha256sum | cut -d' ' -f1)
+        fi
+        if [[ -z "$_qnow" || "$_qnow" != "$_qsha" ]]; then
+          _task_store_audit_log "gate.approval-stale-quote" refused 0 -- \
+            "id=${id}" "task=${ident}" "quote_file=${_qfile}" "filed_sha=${_qsha}" \
+            "now_sha=${_qnow:-unreadable}" 2>/dev/null || true
+          fail "$E_CONFLICT" "$ident: NOT approved — the text you were shown has been edited since this was asked, so approving now would sign off words you never saw (DIVE-5465). Nothing was authorised. The agent must re-ask with the new text: 5dive task need ${ident} --quote-file=${_qfile} ..."
+        fi
+      fi
+      ;;
+  esac
+
   # DIVE-2411: refuse to STAMP a secret gate that names no delivery path, before
   # any write. This is the same defect as the filing refusal in cmd_task_need, one
   # step later and strictly worse: the filing gap leaves a gate visibly stuck,

@@ -1918,6 +1918,43 @@ _task_gate_delivery_link_line() { # <row_id> -> "🔗 Review: <url>" or nothing
   esac
 }
 
+# DIVE-5465: THE TEXT BEING APPROVED, QUOTED UNDER THE ASK.
+#
+# lodar, TG 2026-10-03, on a ping that read in full "An outside project asked to
+# join your public self-hosted agents list and meets every rule. /task_5662":
+# "how can i reply to this human gate notification if I dont see any details?"
+# The drafted reply he was being asked to approve sat in the row body, which is
+# written for agents and one tap away. An attached .md was considered and turned
+# down: on a phone a file is one more tap, the same tap as /task_<n>.
+#
+# So the gate carries the exact text (need_quote, from `task need --quote`) and
+# the ping prints it as a quoted block between the ask and /task_<n>. Read from
+# the ROW, never from a parameter, so the first delivery and the /inbox re-send
+# cannot disagree about it (the DIVE-2090 reason the gate_mode read does too).
+#
+# ONE PHONE SCREEN, ~600 characters. Over that the block is NOT truncated — a cut
+# quote is a different text, and an approval of half a reply is not an approval of
+# the reply — the ping says how long it is and that /task_<n> carries it whole.
+# No quote on the row = NOTHING printed, so every other gate is byte-identical.
+_TASK_GATE_QUOTE_MAX=600
+_task_gate_quote_block() { # <row_id> -> the block (no leading newline) or nothing
+  local numid="${1:-}" q="" line out=""
+  [[ "$numid" =~ ^[0-9]+$ ]] || return 0
+  q=$(db "SELECT COALESCE(need_quote,'') FROM tasks WHERE id=${numid};" 2>/dev/null) || q=""
+  # Trailing newlines from a --quote-file would print as an empty quoted line.
+  while [[ "$q" == *$'\n' ]]; do q="${q%$'\n'}"; done
+  [[ -n "${q//[[:space:]]/}" ]] || return 0
+  if (( ${#q} > _TASK_GATE_QUOTE_MAX )); then
+    printf '%s' "📝 The text to approve is ${#q} characters, too long for this message. Open the link below and read it whole before answering."
+    return 0
+  fi
+  out="📝 You are approving this text:"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    out+=$'\n'"│ ${line}"
+  done <<<"$q"
+  printf '%s' "$out"
+}
+
 # DIVE-4412: append to BOTH variants of the gate message — the one that rides the
 # keyboard and the one _mirror_post falls back to when Telegram rejects it. Reads
 # the caller's `text` / `text_plain` by dynamic scope ON PURPOSE: the alternative
@@ -2968,7 +3005,15 @@ _task_need_notify_deliver_now() {
   # /inbox batch is only the re-send — so the one-line ask applies here too
   # (quinn's iteration-1 grade caught this path still emitting the full ask).
   # The full ask stays one tap away behind /task_<id>.
-  _task_gate_text_both $'\n\n'"$(_task_gate_ask_line "$ask") /task_${numid}"
+  # DIVE-5465: the quoted text sits UNDER the ask and BEFORE /task_<n>, so the
+  # message reads question, then the exact thing being approved, then the link.
+  # With no quote on the row the line is exactly what it was before.
+  local _gquote; _gquote=$(_task_gate_quote_block "$numid")
+  if [[ -n "$_gquote" ]]; then
+    _task_gate_text_both $'\n\n'"$(_task_gate_ask_line "$ask")"$'\n\n'"${_gquote}"$'\n'"/task_${numid}"
+  else
+    _task_gate_text_both $'\n\n'"$(_task_gate_ask_line "$ask") /task_${numid}"
+  fi
   # DIVE-4833 — SAY THE DEADLINE IN THE MESSAGE. An expiring action whose message
   # does not mention the expiry is a trap: the reader has no way to know the
   # button has a clock on it, and finds out only by tapping a dead one. The line
