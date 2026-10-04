@@ -99,6 +99,22 @@ profile_alias_model() {
   printf '%s' "$mapped"
 }
 
+# opencode_profile_model <profile> <alias-or-id> -> the OpenRouter slug an
+# opencode seat bound to <profile> runs, or "" (DIVE-5514). On a partner box in a
+# region Anthropic blocks, the seats run opencode on the SAME seeded OpenRouter
+# account; its claude tier map is the account's model (the included-model switch
+# moves it), so the seat takes the slug the map gives the pack's family — sonnet
+# when the pack names none. "" unless the profile holds an OpenRouter key for
+# opencode AND a claude map pointed at OpenRouter: any other account keeps
+# OpenCode's own choice, as an import always has.
+opencode_profile_model() {
+  local profile="${1:-}" want="${2:-}" fam
+  [[ -n "$profile" && -n "$(profile_env_value "$profile" OPENROUTER_API_KEY)" ]] || return 0
+  [[ "$(profile_env_value "$profile" ANTHROPIC_BASE_URL)" == https://openrouter.ai/* ]] || return 0
+  fam=$(model_family_of "$want")
+  profile_alias_model "$profile" "${fam:-sonnet}"
+}
+
 # resolve_model_for_profile <alias-or-id> <profile> -> the id to write for an
 # agent bound to <profile>: the account's mapped id for a family alias on an
 # alias-mapping account, else exactly resolve_model_alias.

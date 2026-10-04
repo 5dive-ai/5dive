@@ -3244,6 +3244,18 @@ cmd_import() {
     jq --arg n "$as" --arg f "$model_req" '.agents[$n].modelFamily = $f' <<<"$_mf_reg" | registry_write
   fi
 
+  # DIVE-5514: an opencode seat on an OpenRouter alias-mapping account (the seeded
+  # one, on a partner box in a region Anthropic blocks) is pinned to the account's
+  # model. Without a pin OpenCode picks its own default for the provider, which is
+  # not the model the account — and the box's spend cap — is set up for.
+  if [[ "$type" == "opencode" ]] && (( ! byo )); then
+    local _oc_model; _oc_model=$(opencode_profile_model "$profile" "$model_req")
+    if [[ -n "$_oc_model" ]]; then
+      opencode_apply_model_default "$as" openrouter "$_oc_model" \
+        || warn "could not pin '$as' to ${_oc_model} — it runs on OpenCode's default model"
+    fi
+  fi
+
   local cdir="${AGENT_HOME_ROOT:-/home}/agent-${as}/.claude"
 
   # DIVE-2568: put distilled memory IN EFFECT for a harness that does not
