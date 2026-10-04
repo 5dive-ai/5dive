@@ -3034,6 +3034,13 @@ cmd_create() {
     valid_api_key "$byo_api_key" \
       || fail "$E_VALIDATION" "api key looks wrong (expected >=10 printable non-space chars)"
   fi
+  # DIVE-5503: codex takes --model without --provider (it has no BYO path), so
+  # the shape check above never ran for it. Refuse before anything is created:
+  # the id is written into the seat's config.toml on first start.
+  if [[ "$type" == "codex" && -n "$byo_model" ]]; then
+    valid_model "$byo_model" \
+      || fail "$E_VALIDATION" "invalid --model '$byo_model' (allowed chars: letters/digits/._:/-)"
+  fi
 
   # DIVE-906: drain the channel-token stdin sentinels. The guard above
   # guarantees at most one `=-` sentinel across api-key/telegram/discord, so if
@@ -3382,6 +3389,13 @@ cmd_create() {
   if [[ "$type" == "codex" ]]; then
     step "Reconciling Codex operating baseline for agent-${name} (DIVE-3966)"
     preseed_codex_return_channel "$name" >/dev/null || true
+    # DIVE-5503: the model this seat starts on, the operator's --model or the
+    # current Sol default. Before this nothing pinned it, so a new seat ran on
+    # whatever the Codex CLI defaulted to (gpt-6-astra on poke-two).
+    local _codex_model="${byo_model:-$(codex_model_default)}"
+    step "Codex model for agent-${name}: ${_codex_model} (applied on first start)"
+    seed_codex_model "$name" "$_codex_model" \
+      || warn "could not seed the codex model for agent-${name} — it will start on the Codex CLI default (rerun: 5dive agent config ${name} set model=${_codex_model} after its first start)"
   fi
 
   # DIVE-990: memory-as-onboarding. Seed the new agent's recall store from
