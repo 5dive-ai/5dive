@@ -45,7 +45,9 @@ model_latest() {
 # silently: .github/workflows/codex-model-latest.yml checks OpenRouter's public
 # catalog daily (same ids, keyless) and opens an issue when a newer
 # `gpt-<n>-sol` ships. The bump is this one line. Existing agents keep the model
-# in their config.toml; only a new seat's FIRST start reads the seed.
+# in their config.toml; only a new seat's FIRST start reads the seed. `5dive
+# usage` prices Codex tokens at this id's rates (CODEX_RATES in cmd_usage.sh):
+# re-check them on a bump; tests/usage_codex_cache_estimate_unit.sh goes red until you do.
 codex_model_default() { printf '%s' "gpt-6.1-sol"; }
 
 # resolve_model_alias <alias-or-id> -> full resolved id on stdout.
