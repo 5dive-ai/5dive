@@ -1761,6 +1761,8 @@ _memory_consolidate() {
   fi
 
   local considered=0 processed=0 written=0 refused=0 dupes=0 skipped_live=0 skipped_done=0
+  # Distiller runs of our own, found among the sessions and never distilled.
+  local skipped_self=0
   local distill_failed=0
   # DIVE-4562: the subset of distill_failed that is an API-error refusal, i.e. a
   # seat that is NOT TRANSACTING. Counted separately because the two want
@@ -1788,6 +1790,17 @@ _memory_consolidate() {
     # (2) idempotence — same session at the same byte count is already distilled.
     if [ "$force" -ne 1 ] && grep -qF "$(printf '%s\t%s\t' "$sid" "$bytes")" "$ledger" 2>/dev/null; then
       skipped_done=$((skipped_done+1)); continue
+    fi
+    # (2b) never this command's own distiller runs. `claude --print` saves its
+    # session like any other, under the CALLER's cwd (the heartbeat lane runs
+    # from /root, so `-root/`), and newest-first then hands the next pass its
+    # own last output: the same facts come back under new names, and with
+    # --max-sessions=1 a real session loses the slot with no error. Matched on
+    # the prompt's first line, not the dir, so it holds from any cwd and covers
+    # the transcripts already on disk. Process substitution, not a pipe: under
+    # pipefail `head | grep -q` can lose to SIGPIPE and read as "no match".
+    if grep -qF -- "${_MEM_CONSOLIDATE_PROMPT%%$'\n'*}" < <(head -c 8192 -- "$t" 2>/dev/null); then
+      skipped_self=$((skipped_self+1)); continue
     fi
     # (3) continuation — the ledger is read per SESSION. A session with a row
     # at a smaller byte count grew after it was distilled: read it from that
@@ -1955,6 +1968,7 @@ _memory_consolidate() {
     jq -nc --argjson considered "$considered" --argjson processed "$processed" \
        --argjson written "$written" --argjson refused "$refused" --argjson dupes "$dupes" \
        --argjson live "$skipped_live" --argjson done "$skipped_done" \
+       --argjson self "$skipped_self" \
        --argjson dfail "$distill_failed" \
        --argjson dunauth "$distill_unauthed" \
        --argjson continued "$continued" \
@@ -1968,6 +1982,7 @@ _memory_consolidate() {
         processed:$processed, processed_continued:$continued,
         atoms_written:$written, atoms_refused:$refused,
         atoms_duplicate:$dupes, skipped_live:$live, skipped_consolidated:$done,
+        skipped_own_distiller_runs:$self,
         distiller_failed:$dfail, distiller_unauthed:$dunauth,
         index_bytes_before:$ibefore, index_bytes_after:$iafter,
         index_limit:$ilimit, index_router_budget:$ibudget,
@@ -1975,7 +1990,7 @@ _memory_consolidate() {
         index_still_over_limit:$istill}}'
   else
     echo "consolidate: $processed session(s) distilled → $written atom(s) into $dir"
-    echo "  skipped: $skipped_live live (touched < ${idle_min}m ago) · $skipped_done already consolidated · $dupes duplicate atom(s)"
+    echo "  skipped: $skipped_live live (touched < ${idle_min}m ago) · $skipped_done already consolidated · $skipped_self own distiller run(s) · $dupes duplicate atom(s)"
     [ "$continued" -gt 0 ] && echo "  continued: $continued regrown session(s) read from where the last pass stopped" || :
     # Trailing `[ x ] && echo` is the last command of the function under errexit
     # when the test is false — it would return 1 and abort the caller. `|| :`.

@@ -592,6 +592,39 @@ grep -q 'FIRSTHALF' "$CAPT" && ok "MUTANT: the whole-file re-read is caught" || 
 source "$SRC/cmd_memory.sh"
 export HOME="$OLDHOME"
 
+echo "── the distiller's own runs are never distilled, and never take a real session's slot ──"
+# `claude --print` saves the distiller's session under the CALLER's cwd (the
+# heartbeat lane runs from /root, so `-root/`). Newest-first used to hand the
+# next pass that file: with --max-sessions=1 the real, older session lost the
+# slot and the distiller re-read its own output. Own HOME: exact counts.
+OLDHOME="$HOME"; export HOME="$TMP/self"
+SPROJ="$HOME/.claude/projects/proj"; SSTORE="$SPROJ/memory"; SLEDGER="$SSTORE/.consolidated.tsv"
+mkdir -p "$SSTORE" "$HOME/.claude/projects/-root"; : > "$SSTORE/MEMORY.md"
+REAL="$SPROJ/rrrr-7777.jsonl"; OWN="$HOME/.claude/projects/-root/ssss-0000.jsonl"
+mk_transcript "$REAL" "REALSESSION the on-call rota is weekly" "Recorded."
+mk_transcript "$OWN" "$_MEM_CONSOLIDATE_PROMPT" '{"atoms":[]}'
+touch -d '3 hours ago' "$REAL"; touch -d '2 hours ago' "$OWN"
+rm -f "$CAPT"
+OUT=$(run --distiller="$CEMPTY" --max-sessions=1 2>&1)
+grep -q 'REALSESSION' "$CAPT" 2>/dev/null && ok "the real session got the one slot" || bad "the real session got the one slot"
+grep -q '^ssss-0000' "$SLEDGER" && bad "own distiller run stayed out of the ledger" || ok "own distiller run stayed out of the ledger"
+grep -q '1 own distiller run' <<<"$OUT" && ok "the skip is counted, not silent" || bad "the skip is counted, not silent (got: $OUT)"
+JOUT=$(JSON_MODE=1 run --distiller="$CEMPTY" --max-sessions=1 --force 2>/dev/null)
+check "JSON carries the count" "$(jq -r '.data.skipped_own_distiller_runs' <<<"$JOUT")" "1"
+
+echo "── MUTANT: without the skip, the own run takes the slot ──"
+rm -f "$SLEDGER" "$CAPT"
+# Mutate the CONDITION: `declare -f` reflows `; continue` onto its own line.
+check "BEFORE: the live function carries the skip" "$(declare -f _memory_consolidate | grep -c 'if grep -qF -- "${_MEM_CONSOLIDATE_PROMPT')" "1"
+eval "$(declare -f _memory_consolidate | sed 's/if grep -qF -- "${_MEM_CONSOLIDATE_PROMPT/if false \&\& grep -qF -- "${_MEM_CONSOLIDATE_PROMPT/')"
+check "AFTER: the mutation took" "$(declare -f _memory_consolidate | grep -c 'if grep -qF -- "${_MEM_CONSOLIDATE_PROMPT')" "0"
+run --distiller="$CEMPTY" --max-sessions=1 >/dev/null 2>&1
+grep -q 'REALSESSION' "$CAPT" 2>/dev/null && bad "MUTANT: the real session is starved" || ok "MUTANT: the real session is starved"
+grep -q '^ssss-0000' "$SLEDGER" && ok "MUTANT: the own run is distilled" || bad "MUTANT: the own run is distilled"
+# shellcheck source=/dev/null
+source "$SRC/cmd_memory.sh"
+export HOME="$OLDHOME"
+
 echo "── validation ──"
 run --distiller="$EMPTY" --max-sessions=x >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--max-sessions must be numeric" || bad "--max-sessions must be numeric"
 run --distiller="$EMPTY" --idle-min=-1 >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--idle-min must be numeric" || bad "--idle-min must be numeric"
