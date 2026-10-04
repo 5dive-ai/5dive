@@ -138,6 +138,8 @@ _task_usage() {
   park <id> --reason="..." --wake=<date|+Nd>    quiet timed wait; auto-unparks at --wake
   unpark <id>                                   clear a park early
   escalate <id> [--from=<who>]                  bump priority a tier, ping the owner
+  followup <id> --text="..." [--from=<who>]     the owner's follow-up: append it to the
+                                                body, send it to the assignee (--wake)
   rm <id>                                       delete (cascades subtasks + edges)
 
   need <id> --type=decision|secret|approval|manual|access --ask="..."|--ask-file=<path>
@@ -446,6 +448,7 @@ cmd_task() {
     park)            cmd_task_park "$@" ;;
     unpark)          cmd_task_unpark "$@" ;;
     escalate)        cmd_task_escalate "$@" ;;
+    followup)        cmd_task_followup "$@" ;;      # DIVE-5507 the Mini App's Follow up box
     need)            cmd_task_need "$@" ;;
     gate-escalate)   cmd_task_gate_escalate "$@" ;;   # DIVE-1927 internal, root-only
     queue)           cmd_task_queue "$@" ;;         # DIVE-3474 gates routed TO ME
