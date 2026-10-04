@@ -307,6 +307,33 @@ switch_codex_memory_to_atoms "$LC" "$LH/.claude/projects/p/memory" agent-lh "$LH
   && ok_t "L3 a memory dir reached through a symlinked parent is refused: nothing created there" \
   || bad_t "L3 symlinked parent" "rc=$rc $(ls -AR "$TMP/rootdir")"
 eval "$_pack_codex_to_atoms_real"
+
+# =========================================================== P: a parked agent
+# `5dive agent stop` records desiredState=stopped; the switch converts the seat
+# and must NOT start it (the GUARDED verdict in refresh_plugins_parked_agent_unit).
+jq '.agents.theo = {"type":"claude","channels":"telegram","authProfile":"claudeacct","isolation":"standard","desiredState":"stopped"}' \
+  "$TMP/reg" >"$TMP/reg.t" && mv "$TMP/reg.t" "$TMP/reg"
+rm -f "$TMP/active"
+rc=$(run cmd_agent_switch theo --to=codex --account=chatgpt)
+[[ "$rc" == 0 && "$(jq -r .agents.theo.type "$TMP/reg")" == codex && ! -f "$TMP/active" ]] \
+  && [[ "$(jq -r .agents.theo.desiredState "$TMP/reg")" == stopped ]] \
+  && jq -e '.data.running == false and .data.parked == true' "$TMP/out" >/dev/null \
+  && ok_t "P1 a parked agent is switched but left stopped (its park survives the switch)" \
+  || bad_t "P1 parked agent was started" "rc=$rc active=$([[ -f "$TMP/active" ]] && echo yes || echo no) err=$(tail -3 "$TMP/err") out=$(<"$TMP/out")"
+(JSON_MODE=0; cmd_agent_switch theo --to=claude --account=claudeacct) >"$TMP/out" 2>"$TMP/err"; rc=$?
+[[ "$rc" == 0 && ! -f "$TMP/active" ]] && grep -qF "switched; left stopped, start it with 5dive agent start theo" "$TMP/out" \
+  && ok_t "P2 the result tells the owner it was left stopped and how to start it" \
+  || bad_t "P2 parked wording" "rc=$rc out=$(<"$TMP/out") err=$(tail -3 "$TMP/err")"
+
+# An instructions file the type map does not know fails loudly before any write
+# (the optional-map contract), rather than dying on set -u or carrying to $home/.
+snap_reg=$(sha256sum <"$TMP/reg"); _pf_saved="${TYPE_PERSONA_FILE[codex]}"; unset 'TYPE_PERSONA_FILE[codex]'
+rc=$(run cmd_agent_switch theo --to=codex --account=chatgpt)
+TYPE_PERSONA_FILE[codex]="$_pf_saved"
+[[ "$rc" != 0 ]] && grep -q 'no instructions file is known' "$TMP/err" && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" ]] \
+  && ok_t "P3 a type with no instructions file in the map is refused with a message, registry unchanged" \
+  || bad_t "P3 empty persona map" "rc=$rc err=$(tail -3 "$TMP/err")"
+
 w=$(switch_harness_warning Theo claude codex)
 [[ "$w" == "Moving Theo to your ChatGPT plan switches it from Claude Code to Codex. Its memory and instructions are converted; this chat's history is not. You can switch back any time." ]] \
   && ok_t "C2 the warning sentence is the one every surface shows" || bad_t "C2 warning" "$w"

@@ -479,8 +479,11 @@ _agent_switch_apply() {
 
   # ---- 2-4. side files for the target harness ----
   local carry_from carry_to memidx="" tmpdoc mem_json='{}'
-  carry_from="$home/${TYPE_PERSONA_FILE[$from]}"
-  carry_to="$home/${TYPE_PERSONA_FILE[$to]}"
+  local pf_from="${TYPE_PERSONA_FILE[$from]:-}" pf_to="${TYPE_PERSONA_FILE[$to]:-}"
+  [[ -n "$pf_from" && -n "$pf_to" ]] \
+    || fail "$E_GENERIC" "no instructions file is known for $from or $to — nothing switched; the unit is stopped, start it with: 5dive agent start $name"
+  carry_from="$home/$pf_from"
+  carry_to="$home/$pf_to"
   local -a frags=()
   if [[ "$from" == claude ]]; then
     frags=("$TELEGRAM_AGENT_CLAUDE_MD" "$MODEL_TIERING_CLAUDE_MD" "$OPERATIONAL_COMMS_CLAUDE_MD")
@@ -578,22 +581,33 @@ _agent_switch_apply() {
   link_agent_profile "$name" "$account"
 
   # ---- 7. start and check ----
-  step "Starting $unit on $(_switch_label "$to")"
-  systemctl start "$unit" >&2 2>/dev/null || true
-  local up=false i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    systemctl is-active --quiet "$unit" 2>/dev/null && { up=true; break; }
-    sleep 2
-  done
+  # An operator park (desiredState=stopped, written only by `5dive agent stop`)
+  # outranks the switch: the switch converts the seat and leaves it down, like
+  # every other GUARDED restart path (tests/refresh_plugins_parked_agent_unit.sh).
+  local up=false i desired parked=false state_note=""
+  desired=$(jq -r --arg n "$name" '.agents[$n].desiredState // "running"' <<<"$reg" 2>/dev/null) || desired=running
+  if [[ "$desired" == stopped ]]; then
+    parked=true
+    state_note="switched; left stopped, start it with 5dive agent start $name"
+    step "$name is parked (desiredState=stopped) — $state_note"
+  else
+    step "Starting $unit on $(_switch_label "$to")"
+    systemctl start "$unit" >&2 2>/dev/null || true
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      systemctl is-active --quiet "$unit" 2>/dev/null && { up=true; break; }
+      sleep 2
+    done
+    state_note="unit active: $up"
+  fi
 
   local dropped_json
   dropped_json=$( { _switch_dropped_skills "$name" "$from" "$to"; if [[ -n "$tg_note" ]]; then printf '%s\n' "$tg_note"; fi; } \
     | jq -R . | jq -cs 'map(select(length > 0))')
-  ok "agent '$name' switched from $(_switch_label "$from") to $(_switch_label "$to") (account ${account:-default}); unit active: $up" \
-     '{name:$n, from:$f, to:$t, account:$a, warning:$w, handoff:$h, memory:$m, telegram:{tokenKept:($tk == 1), allowFrom:$al}, dropped:$d, running:$up}' \
+  ok "agent '$name' switched from $(_switch_label "$from") to $(_switch_label "$to") (account ${account:-default}); $state_note" \
+     '{name:$n, from:$f, to:$t, account:$a, warning:$w, handoff:$h, memory:$m, telegram:{tokenKept:($tk == 1), allowFrom:$al}, dropped:$d, running:$up, parked:$pk}' \
      --arg n "$name" --arg f "$from" --arg t "$to" --arg a "${account:-default}" --arg w "$warning" \
      --arg h "$handoff_state" --argjson m "$mem_json" --argjson tk "$([[ -n "$token" ]] && echo 1 || echo 0)" \
-     --argjson al "${allow_n:-0}" --argjson d "$dropped_json" --argjson up "$up"
+     --argjson al "${allow_n:-0}" --argjson d "$dropped_json" --argjson up "$up" --argjson pk "$parked"
 }
 
 # `agent config <n> set auth-profile=<p> --switch-harness` and

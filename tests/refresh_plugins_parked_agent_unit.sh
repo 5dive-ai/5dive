@@ -283,6 +283,11 @@ bounced katya && ok_t "U7 an explicit null desiredState restarts" \
 # restart the one unit the caller named in --unit: an OPERATOR-VERB site, not a
 # fan-out, so it can only reach a parked agent that someone named explicitly.
 #
+# `src/cmd_agent_switch.sh` (DIVE-5501) is GUARDED: `agent switch` names one
+# agent, but it stops and re-starts it as a side effect of a harness move, so a
+# park must survive it. Its one start (step 7) reads the registry desiredState and
+# leaves a stopped agent down — tests/agent_switch_harness_unit.sh P1/P2.
+#
 # A1 asserts the inventory is EXACT in both directions. A new restart path
 # anywhere in the repo turns it red — because what DIVE-4033 shipped was not a
 # wrong verdict, it was a file nobody looked at.
@@ -292,6 +297,7 @@ declare -A RESTART_PATHS=(
   [src/cmd_agent_runtime.sh]=GUARDED
   [src/cmd_heartbeat.sh]=GUARDED
   [src/cmd_host.sh]=GUARDED
+  [src/cmd_agent_switch.sh]=GUARDED
   [src/cmd_doctor.sh]=CANNOT-RESURRECT
   [src/cmd_agent_lifecycle.sh]=OPERATOR-VERB
   [src/cmd_agent_config.sh]=OPERATOR-VERB
