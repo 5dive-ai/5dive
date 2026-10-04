@@ -12,6 +12,10 @@
 #   E5  the basis block labels each figure; the 1.0x weight is "single observation"
 #   E6  the per-agent view prints each basis with its label, and no token count
 #       is presented as a percentage
+#   E7  the rate table prices codex_model_default, its dated snapshot, and no
+#       variant (-pro) of it; the id is read from models.sh, never spelled in
+#       cmd_usage.sh. E2 pins the id the rates were PUBLISHED for, so a models.sh
+#       bump turns E2 red until someone re-checks the rates.
 # Negative control: USAGE_SRC_DIR=<origin/main src> makes E1-E6 fail.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -41,9 +45,13 @@ rollout() { # <agent> <model> — the audit's own call: 145,871 in, 140,672 cach
 }
 rollout sol gpt-6.1-sol
 rollout odd gpt-9-unknown
-printf '{"agents":{"sol":{"type":"codex"},"odd":{"type":"codex"}}}' > "$TMP/reg.json"
-OUT="$(REGISTRY="$TMP/reg.json" TASK_DB="$TMP/none.db" USAGE_SINCE="$((NOW-3600))" \
-       USAGE_HOME_ROOT="$R" python3 "$TMP/collect.py" 2>"$TMP/err")"
+rollout pro gpt-6.1-sol-pro
+rollout snap gpt-6.1-sol-2026-09-30
+printf '{"agents":{"sol":{"type":"codex"},"odd":{"type":"codex"},"pro":{"type":"codex"},"snap":{"type":"codex"}}}' > "$TMP/reg.json"
+# shellcheck source=../src/lib/models.sh
+source src/lib/models.sh
+OUT="$(CODEX_RATES_MODEL="$(codex_model_default)" REGISTRY="$TMP/reg.json" TASK_DB="$TMP/none.db" \
+       USAGE_SINCE="$((NOW-3600))" USAGE_HOME_ROOT="$R" python3 "$TMP/collect.py" 2>"$TMP/err")"
 SOL="$(jq -c '.agents[] | select(.name=="sol")' <<<"$OUT" 2>/dev/null)"
 ODD="$(jq -c '.agents[] | select(.name=="odd")' <<<"$OUT" 2>/dev/null)"
 
@@ -91,6 +99,16 @@ VIEW_ODD="$(usage_render_agent "$OUT" odd 24h 2>&1)"
 grep -qF "no published rate for gpt-9-unknown" <<<"$VIEW_ODD" \
   && ok_t "E6b an unpriced model says so instead of printing a number" \
   || bad_t "E6b" "$VIEW_ODD"
+
+PRO="$(jq -c '.agents[] | select(.name=="pro") | .codexEstimate' <<<"$OUT" 2>/dev/null)"
+SNAP="$(jq -c '.agents[] | select(.name=="snap") | .codexEstimate' <<<"$OUT" 2>/dev/null)"
+if [[ "$(jq -r '[(.ratesFor|tostring), (.credits|tostring)] | @csv' <<<"$PRO")" == '"null","null"' \
+   && "$(jq -r '[.ratesFor, .credits] | @csv' <<<"$SNAP")" == '"gpt-6.1-sol",0.77' \
+   && "$(grep -cF 'CODEX_RATES_MODEL="$(codex_model_default' "$SRC_DIR/cmd_usage.sh")" == 1 ]]; then
+  ok_t "E7 rates key off codex_model_default: its dated snapshot priced, -pro left unpriced"
+else
+  bad_t "E7 rate key" "pro=$PRO snap=$SNAP"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

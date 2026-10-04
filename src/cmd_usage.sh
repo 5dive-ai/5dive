@@ -36,6 +36,9 @@ usage_window_secs() {
 usage_collect() {
   local since="$1" db
   db="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}"
+  # The Codex rate table prices codex_model_default (models.sh), read here so
+  # the id has one spelling (DIVE-5503's harness); empty = nothing priced.
+  CODEX_RATES_MODEL="$(codex_model_default 2>/dev/null)" \
   REGISTRY="$REGISTRY" TASK_DB="$db" USAGE_SINCE="$since" python3 - <<'PY'
 import os, sys, json, time, re, sqlite3, errno, bisect, datetime as dt   # no glob: DIVE-3419
 
@@ -50,18 +53,25 @@ task_db  = os.environ["TASK_DB"]
 # cache-write charge; the API bills a cache write at its own rate. These price
 # TOKENS; OpenAI says they do not determine how much of an included plan's
 # 5h/7d window a call uses, so nothing here is turned into a percentage.
+# The rates are the default Sol's (codex_model_default, passed in as
+# CODEX_RATES_MODEL): a bump in models.sh re-prices, and
+# tests/usage_codex_cache_estimate_unit.sh pins which id these numbers were
+# published for, so the bump goes red there until the rates are re-checked.
 CODEX_RATES_AS_OF = "2026-10-04"
-CODEX_RATES = {
-    "gpt-6.1-sol": {"credits": {"in": 50.0, "cached": 2.5, "out": 250.0},
-                    "apiUsd": {"in": 2.0, "cached": 0.10, "cacheWrite": 2.50, "out": 10.0}},
-}
+CODEX_RATES = {}
+if os.environ.get("CODEX_RATES_MODEL"):
+    CODEX_RATES[os.environ["CODEX_RATES_MODEL"].lower()] = {
+        "credits": {"in": 50.0, "cached": 2.5, "out": 250.0},
+        "apiUsd": {"in": 2.0, "cached": 0.10, "cacheWrite": 2.50, "out": 10.0}}
 
 def codex_rates_for(model):
+    # The id itself or a dated snapshot of it; a variant (-pro, -mini) is a
+    # different price, so it stays unpriced rather than guessed.
     if not isinstance(model, str):
         return None
     mdl = model.lower()
-    for key in sorted(CODEX_RATES, key=len, reverse=True):
-        if mdl == key or mdl.startswith(key + "-"):
+    for key in CODEX_RATES:
+        if mdl == key or re.fullmatch(re.escape(key) + r"-\d{4}-\d{2}-\d{2}", mdl):
             return key, CODEX_RATES[key]
     return None
 
