@@ -37,8 +37,10 @@ SWITCH_HANDOFF_FILE=".5dive-handoff.md"
 SWITCH_INDEX_BUDGET="${FIVEDIVE_SWITCH_INDEX_BUDGET:-8000}"
 # The carried instructions are cut too when the target is codex: codex reads at
 # most 32 KiB of AGENTS.md and drops the rest without a word (DIVE-4923), so
-# 16 KB of instructions + the 8 KB index + its own baseline stay inside it.
-SWITCH_INSTR_BUDGET="${FIVEDIVE_SWITCH_INSTR_BUDGET:-16000}"
+# 15000 bytes of instructions + the 8000-byte index + the block's own lines stay
+# under 24 KB, which leaves the target's own baseline room inside it. BYTES, not
+# characters: the limit is in bytes, and Cyrillic is two of them per character.
+SWITCH_INSTR_BUDGET="${FIVEDIVE_SWITCH_INSTR_BUDGET:-15000}"
 
 _switch_home() { printf '%s/agent-%s\n' "${SWITCH_HOME_ROOT:-/home}" "$1"; }
 
@@ -148,9 +150,16 @@ print("\n".join(out))
   printf 'first turn, read ~/%s (what was in flight). 5dive rewrites this block\n' "$SWITCH_HANDOFF_FILE"
   printf 'on every switch; put your own instructions outside it.\n'
   if [[ -n "$body" ]]; then
-    if [[ "$to" == codex ]] && (( ${#body} > SWITCH_INSTR_BUDGET )); then
-      body="${body:0:SWITCH_INSTR_BUDGET}"
-      body="${body%$'\n'*}"$'\n\n'"(cut at ${SWITCH_INSTR_BUDGET} characters for Codex's 32 KiB limit; the full text is in ~/.claude/CLAUDE.md)"
+    if [[ "$to" == codex ]] && (( $(printf '%s' "$body" | LC_ALL=C wc -c) > SWITCH_INSTR_BUDGET )); then
+      # Slice the bytes, then back off to the last whole line (never half a
+      # multibyte character).
+      body=$(printf '%s' "$body" | LC_ALL=C head -c "$SWITCH_INSTR_BUDGET" | python3 -c '
+import sys
+t = sys.stdin.buffer.read().decode("utf-8", "ignore")
+if "\n" in t:
+    t = t[: t.rfind("\n")]
+sys.stdout.write(t)')
+      body+=$'\n\n'"(cut at ${SWITCH_INSTR_BUDGET} bytes for Codex's 32 KiB limit; the full text is in ~/.claude/CLAUDE.md)"
     fi
     printf '\n## Standing instructions\n\n%s\n' "$body"
   fi
@@ -189,35 +198,49 @@ switch_claude_memdir() { # <name> <workdir>
 # codex -> claude: convert ~/.codex/memories into atoms in <memdir>, rewriting
 # only codex-* atoms that changed, removing ones no longer produced, and keeping
 # every claude-native atom. Prints "added updated removed unchanged".
-switch_codex_memory_to_atoms() { # <codex-memories-dir> <memdir>
-  local src="$1" mdir="$2" stage f base a=0 u=0 r=0 s=0
+# Runs as root inside a directory the seat owns: every write refuses a symlinked
+# target, and (given <home>) a symlinked directory between <home> and it, so an
+# agent cannot aim the conversion at a root file.
+switch_codex_memory_to_atoms() { # <codex-memories-dir> <memdir> [user] [home]
+  local src="$1" mdir="$2" user="${3:-}" home="${4:-}" stage insrc f nm base a=0 u=0 r=0 s=0
+  _switch_no_symlink "$mdir" "$home" || return 1
+  _switch_no_symlink "$src" "$home" || return 1
   stage=$(mktemp -d) || return 1
   if [[ -d "$src" ]]; then
-    _pack_codex_to_atoms "$src" "$stage" all >/dev/null || true
+    # Read through a private copy of the regular files only, so root never
+    # reads a linked file into atoms the seat then owns.
+    insrc="$stage/.src"; mkdir -p "$insrc"
+    for nm in MEMORY.md memory_summary.md raw_memories.md; do
+      [[ -f "$src/$nm" && ! -L "$src/$nm" ]] && cp "$src/$nm" "$insrc/$nm"
+    done
+    _pack_codex_to_atoms "$insrc" "$stage" all >/dev/null || true
   fi
   mkdir -p "$mdir"
   for f in "$stage"/codex-*.md; do
     [[ -f "$f" ]] || continue
     base=$(basename "$f")
-    if [[ ! -f "$mdir/$base" ]]; then cp "$f" "$mdir/$base"; a=$((a + 1))
-    elif ! cmp -s "$f" "$mdir/$base"; then cp "$f" "$mdir/$base"; u=$((u + 1))
+    if [[ -L "$mdir/$base" ]]; then warn "refusing to write through a symlink: $mdir/$base"
+    elif [[ ! -f "$mdir/$base" ]]; then _switch_install_file "$user" "$f" "$mdir/$base" 644 "$home" && a=$((a + 1))
+    elif ! cmp -s "$f" "$mdir/$base"; then _switch_install_file "$user" "$f" "$mdir/$base" 644 "$home" && u=$((u + 1))
     else s=$((s + 1)); fi
   done
   for f in "$mdir"/codex-tg-*.md "$mdir"/codex-profile-*.md "$mdir"/codex-thread-*.md; do
-    [[ -f "$f" ]] || continue
+    [[ -f "$f" && ! -L "$f" ]] || continue
     [[ -f "$stage/$(basename "$f")" ]] || { rm -f "$f"; r=$((r + 1)); }
   done
   rm -rf "$stage"
-  _switch_index_codex_atoms "$mdir"
+  _switch_index_codex_atoms "$mdir" "$user" "$home"
   printf '%s %s %s %s\n' "$a" "$u" "$r" "$s"
 }
 
 # Keep MEMORY.md's codex block in step with the codex-* atoms (budgeted; the
 # seat's own index outside the block is untouched).
-_switch_index_codex_atoms() { # <memdir>
-  local mdir="$1" idx="$1/MEMORY.md" tmp lines="" f nm d n=0 more=0
+_switch_index_codex_atoms() { # <memdir> [user] [home]
+  local mdir="$1" idx="$1/MEMORY.md" user="${2:-}" home="${3:-}" tmp lines="" f nm d n=0 more=0
+  # Checked before the READ too: root must not copy a linked file into the seat.
+  _switch_no_symlink "$idx" "$home" || return 0
   for f in "$mdir"/codex-tg-*.md "$mdir"/codex-profile-*.md "$mdir"/codex-thread-*.md; do
-    [[ -f "$f" ]] || continue
+    [[ -f "$f" && ! -L "$f" ]] || continue
     n=$((n + 1))
     nm=$(basename "$f" .md)
     d=$(sed -n 's/^description: *"\{0,1\}\(.*\)"\{0,1\}$/\1/p' "$f" | head -1 | sed 's/"$//')
@@ -234,7 +257,7 @@ _switch_index_codex_atoms() { # <memdir>
       printf '<!-- %s:end -->\n' "$SWITCH_CODEX_MEM_MARKER"
     } >>"$tmp"
   fi
-  cat "$tmp" >"$idx"; rm -f "$tmp"
+  _switch_install_file "$user" "$tmp" "$idx" 644 "$home"; rm -f "$tmp"
 }
 
 # All claude memory index text of a seat, for carrying into AGENTS.md.
@@ -244,6 +267,7 @@ _switch_claude_index_text() { # <name> <out-file>
   : >"$2"
   for d in "$home"/.claude/projects/*/memory; do
     [[ -f "$d/MEMORY.md" ]] || continue
+    _switch_no_symlink "$d/MEMORY.md" "$home" || continue
     _switch_strip_block "$SWITCH_CODEX_MEM_MARKER" <"$d/MEMORY.md" >>"$2"
   done
 }
@@ -303,12 +327,34 @@ _switch_tg_token() { # <home> <type>
   { sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$1/.$2/channels/telegram/.env" 2>/dev/null || true; } | head -1
 }
 
-# Write <content-file> to <path> owned by the seat, refusing a symlinked target.
-_switch_install_file() { # <user> <content-file> <path> [mode]
-  local user="$1" content="$2" path="$3" mode="${4:-644}"
-  [[ ! -L "$path" ]] || { warn "refusing to write through a symlink: $path"; return 1; }
-  install -d -o "$user" -g "$user" -m 700 "$(dirname "$path")" 2>/dev/null || true
-  install -o "$user" -g "$user" -m "$mode" "$content" "$path"
+# Refuse <path> when it, or any directory between <base> and it, is a symlink.
+# The switch runs as root and everything under the seat's home is the seat's to
+# plant, so following a link there writes (or reads) a root file for the agent.
+# Without <base> only <path> itself is checked.
+_switch_no_symlink() { # <path> [base]
+  local p="$1" base="${2:-}" cur rest
+  [[ ! -L "$p" ]] || { warn "refusing to follow a symlink: $p"; return 1; }
+  [[ -n "$base" ]] || return 0
+  case "$p" in "$base"/*) ;; *) warn "refusing a path outside $base: $p"; return 1 ;; esac
+  cur="$base"; rest="${p#"$base"/}"
+  while [[ "$rest" == */* ]]; do
+    cur+="/${rest%%/*}"; rest="${rest#*/}"
+    [[ ! -L "$cur" ]] || { warn "refusing to follow a symlink: $cur"; return 1; }
+  done
+}
+
+# Write <content-file> to <path> owned by the seat, refusing a symlinked target
+# or (given <base>, default the seat's home) a symlinked directory above it.
+# install(1) unlinks the target before it writes, so a link planted after the
+# check is replaced, not followed.
+_switch_install_file() { # <user> <content-file> <path> [mode] [base]
+  local user="$1" content="$2" path="$3" mode="${4:-644}" base="${5-}"
+  local -a own=()
+  [[ -n "$user" ]] && own=(-o "$user" -g "$user")
+  [[ $# -ge 5 || -z "$user" ]] || base=$(_switch_home "${user#agent-}")
+  _switch_no_symlink "$path" "$base" || return 1
+  install -d ${own[@]+"${own[@]}"} -m 700 "$(dirname "$path")" 2>/dev/null || true
+  install ${own[@]+"${own[@]}"} -m "$mode" "$content" "$path"
 }
 
 cmd_agent_switch() {
@@ -463,8 +509,12 @@ _agent_switch_apply() {
     else
       install_channel_for_agent "$to" telegram "$name" "$token" "" "$allow_csv"
     fi
-    allow_n=$(switch_merge_access "$sa" "$da")
-    chown "$user:$user" "$da" 2>/dev/null || true
+    if _switch_no_symlink "$sa" "$home" && _switch_no_symlink "$da" "$home"; then
+      allow_n=$(switch_merge_access "$sa" "$da")
+      chown -h "$user:$user" "$da" 2>/dev/null || true
+    else
+      warn "Telegram allowlist NOT merged: an access.json is reached through a symlink"
+    fi
     if [[ "$to" == codex ]] && grep -q '^TELEGRAM_PROFILE=lite' "$home/.claude/channels/telegram/.env" 2>/dev/null; then
       tg_note="telegram lite profile (Codex's bridge has no lite mode)"
     fi
@@ -495,7 +545,8 @@ _agent_switch_apply() {
   else
     local mdir counts _a _u _r _s
     mdir=$(switch_claude_memdir "$name" "$workdir")
-    counts=$(switch_codex_memory_to_atoms "$home/.codex/memories" "$mdir")
+    counts=$(switch_codex_memory_to_atoms "$home/.codex/memories" "$mdir" "$user" "$home") \
+      || warn "the Codex memory was NOT converted: $mdir is reached through a symlink"
     chown -R "$user:$user" "$home/.claude/projects" 2>/dev/null || true
     read -r _a _u _r _s <<<"$counts"
     mem_json=$(jq -cn --arg d "$mdir" --argjson a "${_a:-0}" --argjson u "${_u:-0}" --argjson r "${_r:-0}" --argjson s "${_s:-0}" \
@@ -504,9 +555,13 @@ _agent_switch_apply() {
 
   # Instructions, AFTER the channel install (claude's installer writes CLAUDE.md).
   tmpdoc=$(mktemp)
-  switch_carry_doc "$carry_from" "$carry_to" "$from" "$to" "$memidx" ${frags[@]+"${frags[@]}"} >"$tmpdoc"
-  _switch_install_file "$user" "$tmpdoc" "$carry_to" 644 \
-    || warn "could not write $carry_to"
+  if _switch_no_symlink "$carry_from" "$home" && _switch_no_symlink "$carry_to" "$home"; then
+    switch_carry_doc "$carry_from" "$carry_to" "$from" "$to" "$memidx" ${frags[@]+"${frags[@]}"} >"$tmpdoc"
+    _switch_install_file "$user" "$tmpdoc" "$carry_to" 644 "$home" \
+      || warn "could not write $carry_to"
+  else
+    warn "instructions NOT carried: $carry_from or $carry_to is reached through a symlink"
+  fi
   rm -f "$tmpdoc" ${memidx:+"$memidx"}
 
   # ---- 5. registry, env, account ----

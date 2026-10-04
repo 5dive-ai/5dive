@@ -265,12 +265,48 @@ out=$(switch_codex_memory_to_atoms "$H/.codex/memories" "$MEM")
   || bad_t "M2" "$out $(cat "$MEM/MEMORY.md")"
 { printf 'line\n%.0s' $(seq 1 6000); } >"$TMP/big.md"
 switch_carry_doc "$TMP/big.md" "$TMP/none.md" claude codex "" >"$TMP/c3"
-[[ $(wc -c <"$TMP/c3") -lt 18000 ]] && grep -q "cut at 16000 characters for Codex's 32 KiB limit" "$TMP/c3" \
+[[ $(wc -c <"$TMP/c3") -lt 17000 ]] && grep -q "cut at 15000 bytes for Codex's 32 KiB limit" "$TMP/c3" \
   && grep -q '5dive:carried-instructions:end' "$TMP/c3" \
   && ok_t "C3 carried instructions are cut for codex's 32 KiB AGENTS.md limit, and the block still closes" \
   || bad_t "C3 budget" "$(wc -c <"$TMP/c3")"
+# C5: the budget is BYTES. Cyrillic is two bytes a character, so a character
+# count let a 49 KB CLAUDE.md + an 8 KB index carry ~37 KB and push '## Memory'
+# past codex's 32 KiB read (quinn's repro, iteration 1).
+LANG=en_US.UTF-8 python3 -c "print(('Всегда отвечай владельцу по-русски, коротко и по делу.\n')*900)" >"$TMP/cyr.md"
+python3 -c "print(('- [some-atom](some-atom.md) — a one-line hook about a fact\n')*200)" >"$TMP/idx8k.md"
+( export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 2>/dev/null
+  switch_carry_doc "$TMP/cyr.md" "$TMP/none.md" claude codex "$TMP/idx8k.md" ) >"$TMP/c5"
+c5b=$(sed -n '/5dive:carried-instructions:begin/,/5dive:carried-instructions:end/p' "$TMP/c5" | LC_ALL=C wc -c)
+c5m=$(grep -bo '^## Memory' "$TMP/c5" | cut -d: -f1)
+[[ "$c5b" -lt 24576 && -n "$c5m" ]] && python3 -c 'import sys; open(sys.argv[1], encoding="utf-8").read()' "$TMP/c5" \
+  && grep -q '5dive:carried-instructions:end' "$TMP/c5" \
+  && ok_t "C5 multibyte instructions are cut by BYTES: block ${c5b} B < 24 KiB, '## Memory' at byte ${c5m}, valid UTF-8" \
+  || bad_t "C5 byte budget" "block=${c5b} memory-at=${c5m:-absent}"
 switch_carry_doc "$TMP/big.md" "$TMP/none.md" codex claude "" >"$TMP/c4"
 [[ $(wc -c <"$TMP/c4") -gt 30000 ]] && ok_t "C4 nothing is cut going to Claude (no such limit)" || bad_t "C4" "$(wc -c <"$TMP/c4")"
+# L1-L3: the conversion runs as root in a dir the seat owns. A link the agent
+# plants there must not carry root's write (quinn's repro, iteration 1).
+LH="$TMP/lh"; LM="$LH/.claude/projects/p/memory"; LC="$LH/.codex/memories"
+mkdir -p "$LM" "$LC" "$TMP/rootdir"
+printf -- '- [codex-tg-owner](x) — owner\n' >"$LC/MEMORY.md"
+echo "ROOT-OWNED ORIGINAL" >"$TMP/victim"; echo "ROOT-OWNED IDX" >"$TMP/victim2"
+v1=$(sha256sum <"$TMP/victim"); v2=$(sha256sum <"$TMP/victim2")
+ln -sf "$TMP/victim" "$LM/codex-tg-owner.md"; ln -sf "$TMP/victim2" "$LM/MEMORY.md"
+_pack_codex_to_atoms_real=$(declare -f _pack_codex_to_atoms)
+_pack_codex_to_atoms() { printf -- '---\nname: codex-tg-owner\ndescription: "x"\n---\nssh-ed25519 AAAAC3Nza-agent-controlled-line\n' >"$2/codex-tg-owner.md"; }
+switch_codex_memory_to_atoms "$LC" "$LM" agent-lh "$LH" >/dev/null
+[[ "$(sha256sum <"$TMP/victim")" == "$v1" && -L "$LM/codex-tg-owner.md" ]] \
+  && ok_t "L1 a codex atom planted as a symlink is refused: its target is unchanged" \
+  || bad_t "L1 wrote through the atom symlink" "$(cat "$TMP/victim")"
+[[ "$(sha256sum <"$TMP/victim2")" == "$v2" && -L "$LM/MEMORY.md" ]] \
+  && ok_t "L2 a MEMORY.md planted as a symlink is refused: its target is unchanged" \
+  || bad_t "L2 wrote through the MEMORY.md symlink" "$(cat "$TMP/victim2")"
+rm -rf "$LH/.claude/projects/p"; ln -s "$TMP/rootdir" "$LH/.claude/projects/p"
+switch_codex_memory_to_atoms "$LC" "$LH/.claude/projects/p/memory" agent-lh "$LH" >/dev/null; rc=$?
+[[ "$rc" != 0 && -z "$(ls -A "$TMP/rootdir")" ]] \
+  && ok_t "L3 a memory dir reached through a symlinked parent is refused: nothing created there" \
+  || bad_t "L3 symlinked parent" "rc=$rc $(ls -AR "$TMP/rootdir")"
+eval "$_pack_codex_to_atoms_real"
 w=$(switch_harness_warning Theo claude codex)
 [[ "$w" == "Moving Theo to your ChatGPT plan switches it from Claude Code to Codex. Its memory and instructions are converted; this chat's history is not. You can switch back any time." ]] \
   && ok_t "C2 the warning sentence is the one every surface shows" || bad_t "C2 warning" "$w"
