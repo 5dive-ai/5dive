@@ -105,7 +105,7 @@ is_known_type() {
 # override every seat's own value.
 # Returns 0 when NAME is refused. A plain connector file is not sourced by bash,
 # so the check applies to --connector=tools only.
-TOOLS_VAR_CATALOG_EXTRA=(AD_ACCOUNT_ID)
+TOOLS_VAR_CATALOG_EXTRA=(AD_ACCOUNT_ID BITRIX24_WEBHOOK_URL AMOCRM_DOMAIN YANDEX_LOGIN)
 _tools_var_reserved() {
   local n="${1:-}" v
   case "$n" in

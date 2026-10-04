@@ -345,7 +345,7 @@ Tasks (shared queue, sqlite — any agent, no sudo):
   # full surface: 5dive task --help
 
 Tool keys (every agent sees them as env vars; values on stdin):
-  5dive tool ls | sudo 5dive tool set <github|vercel|stripe|cloudflare|meta|elevenlabs|fal|higgsfield> | sudo 5dive tool rm <tool>
+  5dive tool ls | sudo 5dive tool set <github|vercel|stripe|...|bitrix24|amocrm|hubspot|...> (see 5dive tool help) | sudo 5dive tool rm <tool>
 
 Triggers (signed external event -> ordinary task):
   sudo 5dive trigger add github --name=<n> --event=issues.labeled --repo=owner/repo --assignee=<agent> --secret-from-stdin
