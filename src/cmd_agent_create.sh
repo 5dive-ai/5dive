@@ -590,6 +590,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _task_answer"*|\
         "/usr/local/bin/5dive _task_channel"*|\
         "/usr/local/bin/5dive _self_account"*|\
+        "/usr/local/bin/5dive browser _connect"|\
         "/usr/local/bin/5dive _merge_do"*|\
         "/usr/local/bin/5dive _route_do"|"/usr/local/bin/5dive _pkg_do"|\
         "/usr/local/bin/5dive sysadmin _broker"|"/usr/local/bin/5dive --json sysadmin _broker") has_a2a=1 ;;
@@ -748,6 +749,15 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_channel
 # _self_account, so there is no target to name and no other seat to reach. It
 # cannot add, sign in, rename or remove an account, and nothing box-wide.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _self_account
+# DIVE-5495: let this seat ask its paired owner, over Telegram, to get it past a
+# login or a captcha (browser connect-request), and let the owner's tap on that
+# button open the one-time viewer. EXACT path, NO args beyond the verb, NO
+# wildcard: the operation travels NUL-separated on stdin. The verb was built for
+# a non-root caller: root derives the seat from SUDO_UID, mints the one-time
+# code and keeps only its hash, and on the tap re-checks the code, that the tap
+# came through this same seat's bot and that the tapper is its paired owner. So
+# the seat cannot mint a code, read one or register a bind by itself.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive browser _connect
 # DIVE-3474: let a VERIFIER merge the pull request on a row IT ITSELF graded PASS.
 # EXACT path, NO args, NO wildcard: one task ident travels over stdin, the caller
 # is derived from SUDO_UID inside _merge_do, and the merge standing is re-derived
