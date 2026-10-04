@@ -115,6 +115,7 @@ LAZY_FILES=(
   src/cmd_agent_create.sh
   src/cmd_agent_lifecycle.sh
   src/cmd_agent_config.sh
+  src/cmd_agent_switch.sh
   src/cmd_agent_buzz.sh
   src/cmd_agent_buzz_join.sh
   src/cmd_agent_buzz_whois.sh

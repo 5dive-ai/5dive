@@ -1645,6 +1645,11 @@ _self_account_cross() {
 # here only picks the path). Any other target, and every root or admin caller,
 # stays on the root path, where a standard seat is refused.
 agent_set_account_dispatch() {
+  # DIVE-5501: the confirmed cross-harness form (root only; it runs `agent switch`).
+  if [[ " $* " == *" --switch-harness "* ]]; then
+    agent_account_move_switch set-account "$@"
+    return
+  fi
   if [[ $# -eq 2 && -n "$1" ]] && [[ "$1" == "$(_gate_uid_to_agent "$(_gate_caller_uid)")" ]] \
      && _self_account_eligible; then
     _self_account_cross set "$2"
