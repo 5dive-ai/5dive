@@ -938,6 +938,7 @@ def classify_sudo(text, measurable):
                   command.startswith("/usr/local/bin/5dive _task_answer") or
                   command.startswith("/usr/local/bin/5dive _task_channel") or
                   command.startswith("/usr/local/bin/5dive _self_account") or
+                  command == "/usr/local/bin/5dive browser _connect" or
                   command.startswith("/usr/local/bin/5dive _merge_do") or
                   command in ("/usr/local/bin/5dive _route_do", "/usr/local/bin/5dive _pkg_do") or
                   command in ("/usr/local/bin/5dive sysadmin _broker", "/usr/local/bin/5dive --json sysadmin _broker")):
