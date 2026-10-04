@@ -1148,9 +1148,10 @@ _codex_dispatcher_enabled() {
 # app-server thread and every inbox message is a user turn, so "/clear" would
 # arrive as the literal text "/clear" and burn a turn without resetting
 # anything. Submitting it is worse than skipping it — it puts a stray user
-# message in the customer's thread. RESIDUAL, named rather than papered over:
-# a fresh wake on a dispatcher seat is NOT fresh, because thread reset needs a
-# control verb the inbox schema does not have yet (follow-up on DIVE-4036).
+# message in the customer's thread. DIVE-5502 closed the DIVE-4036 residual: a
+# dispatcher that advertises the verb takes /clear and /compact as CONTROL
+# messages (_agent_dispatch_control_verb). Without the verb they are still
+# skipped, which is the old behaviour on an old bridge.
 _agent_dispatch_is_tui_control() {
   case "${1//[[:space:]]/}" in
     /clear|/goalclear|/compact) return 0 ;;
@@ -1158,19 +1159,41 @@ _agent_dispatch_is_tui_control() {
   return 1
 }
 
+# DIVE-5502: the dispatcher's own verb for a TUI control line, or nothing.
+# "/goal clear" has none: the dispatcher keeps no goal to clear, and a fresh
+# session is the reset a task boundary actually wants.
+_agent_dispatch_control_verb() {
+  case "${1//[[:space:]]/}" in
+    /clear) printf 'new-session\n' ;;
+    /compact) printf 'compact\n' ;;
+  esac
+}
+
+# Does the dispatcher behind <inbox> run <verb>? Read from its health.json
+# `controls` (telegram-codex 0.5.24+), next to the inbox the path was DERIVED to,
+# never from a path the seat chose. An older bridge does not list it and would
+# submit "/clear" as a user turn, so absent or unreadable means no.
+_agent_dispatch_supports_control() {
+  local name="$1" verb="$2" inbox="$3" health
+  health="$(sudo -u "agent-${name}" cat "${inbox%/inbox}/health.json" 2>/dev/null)" || return 1
+  printf '%s' "$health" | jq -e --arg v "$verb" '(.controls // []) | index($v) != null' >/dev/null 2>&1
+}
+
 # Post one message into the dispatcher inbox and CONFIRM it was drained.
 # rc 0 = the dispatcher consumed it (file unlinked). rc 1 = written but still
 # sitting there — same "maybe unsubmitted" meaning the pane path's rc 1 carries.
-# rc 2 = could not write it at all.
+# rc 2 = could not write it at all. An optional 4th argument posts the message
+# as that dispatcher CONTROL verb (DIVE-5502); the text rides along for logs.
 #
 # jq builds the JSON: the payload is arbitrary agent-authored text and must
 # never reach a printf format string or a shell word. Nothing here execs it.
 _agent_dispatch_inbox_send() {
-  local name="$1" payload="$2" inbox="$3"
+  local name="$1" payload="$2" inbox="$3" control="${4:-}"
   local id json tmp dst waited
   id="5dive-$(date +%s%N)-$$-${RANDOM}"
-  json="$(jq -cn --arg id "$id" --arg text "$payload" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{id:$id, text:$text, route:{source:"agent", chat_id:"5dive-cli"}, received_at:$at}')" || return 2
+  json="$(jq -cn --arg id "$id" --arg text "$payload" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg ctl "$control" \
+    '{id:$id, text:$text, route:{source:"agent", chat_id:"5dive-cli"}, received_at:$at}
+     + (if $ctl == "" then {} else {control:$ctl} end)')" || return 2
   # Dot-prefixed while partial: ingest() ignores anything not ending in .json,
   # and the rename into place is atomic within the directory, so the dispatcher
   # can never read a half-written message.
@@ -1641,7 +1664,13 @@ inject_and_submit() {
   local _inbox _drc=0
   if _inbox="$(_agent_delivery_inbox "$name")"; then
     if _agent_dispatch_is_tui_control "$payload"; then
-      step "skipping TUI control line '${payload}' — agent '${name}' takes work through the codex dispatcher, which has no thread-reset verb yet (DIVE-4036)"
+      local _verb; _verb="$(_agent_dispatch_control_verb "$payload")"
+      if [[ -n "$_verb" ]] && _agent_dispatch_supports_control "$name" "$_verb" "$_inbox"; then
+        step "sending '${payload}' to agent '${name}' as the codex dispatcher's ${_verb} control (DIVE-5502)"
+        _agent_dispatch_inbox_send "$name" "$payload" "$_inbox" "$_verb" || _drc=$?
+        return "$_drc"
+      fi
+      step "skipping TUI control line '${payload}' — agent '${name}' takes work through a codex dispatcher that does not run it (DIVE-4036)"
       return 0
     fi
     _agent_dispatch_inbox_send "$name" "$payload" "$_inbox" || _drc=$?
