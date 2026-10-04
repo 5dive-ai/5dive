@@ -36,6 +36,18 @@ model_latest() {
   esac
 }
 
+# codex_model_default -> the model a new codex agent starts on when its create
+# names none (DIVE-5503). THE ONE PLACE: `agent create`, `agent import` (pack and
+# team rosters), the Mini App / dashboard hire and the Stars hire all reach
+# cmd_create, which seeds this; the app and the api never pick a codex model.
+# Codex has no floating "latest Sol" alias (its model/list returns concrete ids
+# only, measured on codex 0.153.3), so this is a pinned id that must not rot
+# silently: .github/workflows/codex-model-latest.yml checks OpenRouter's public
+# catalog daily (same ids, keyless) and opens an issue when a newer
+# `gpt-<n>-sol` ships. The bump is this one line. Existing agents keep the model
+# in their config.toml; only a new seat's FIRST start reads the seed.
+codex_model_default() { printf '%s' "gpt-6.1-sol"; }
+
 # resolve_model_alias <alias-or-id> -> full resolved id on stdout.
 # A known family alias resolves to its current id; anything else (a full id, a
 # BYO/OpenRouter `vendor/model` string, or empty) passes through untouched.

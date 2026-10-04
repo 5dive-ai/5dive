@@ -2731,12 +2731,17 @@ _hb_send_line() {
   # payload being typed into an API-key field, and this path types nowhere.
   local _hb_inbox
   if _hb_inbox="$(_agent_delivery_inbox "$name")"; then
+    local _hb_drc=0 _hb_verb=""
     if _agent_dispatch_is_tui_control "$text"; then
-      _hb_log "skip control line '${text}' to ${name}: dispatcher delivery has no thread-reset verb yet (DIVE-4036)" 2>/dev/null || true
-      return 0
+      # DIVE-5502: a fresh wake resets the thread when the dispatcher runs the
+      # verb — the bounded thread per task. An older bridge still skips it.
+      _hb_verb="$(_agent_dispatch_control_verb "$text")"
+      if [[ -z "$_hb_verb" ]] || ! _agent_dispatch_supports_control "$name" "$_hb_verb" "$_hb_inbox"; then
+        _hb_log "skip control line '${text}' to ${name}: its codex dispatcher does not run it (DIVE-4036)" 2>/dev/null || true
+        return 0
+      fi
     fi
-    local _hb_drc=0
-    _agent_dispatch_inbox_send "$name" "$text" "$_hb_inbox" || _hb_drc=$?
+    _agent_dispatch_inbox_send "$name" "$text" "$_hb_inbox" "$_hb_verb" || _hb_drc=$?
     (( _hb_drc == 0 )) && return 0
     local _hb_drsn; _hb_drsn="$(_agent_submit_unconfirmed_reason "$name" "$_hb_drc" 2>/dev/null)"
     _HB_SEND_FAIL_REASON="dispatcher inbox (rc ${_hb_drc}): ${_hb_drsn:-<no reason reported>}"   # DIVE-4310

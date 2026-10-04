@@ -1,0 +1,67 @@
+name: codex-model-latest
+
+# DIVE-5503: a new codex agent starts on codex_model_default (src/lib/models.sh),
+# a pinned id because Codex has no floating "latest Sol" alias. This keeps it from
+# going stale silently: once a day, compare it with the newest plain
+# `gpt-<version>-sol` in OpenRouter's public catalog (same ids, keyless) and keep
+# ONE issue open while a newer one exists. Closes the issue once the pin is current.
+# A catalog that cannot be read fails the run instead of reading as "current".
+
+on:
+  schedule:
+    - cron: '41 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare codex_model_default with the newest GPT Sol
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          TITLE='Codex default model is behind the newest GPT Sol (DIVE-5503)'
+          rc=0
+          out="$(bash scripts/codex-model-latest.sh)" || rc=$?
+          echo "$out"
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::could not compare the codex default with the catalog — see the step log"
+            exit 1
+          fi
+          num="$(gh issue list --state open --limit 50 --json number,title \
+                 --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
+          if [ "$rc" -eq 0 ]; then
+            echo "The codex default is the newest Sol."
+            if [ -n "$num" ]; then
+              gh issue close "$num" --comment "Current again ($out). Closed by codex-model-latest."
+            fi
+            exit 0
+          fi
+          latest="${out##*latest=}"
+          {
+            echo "A newer GPT Sol is in OpenRouter's catalog, so new codex agents are starting on an older model."
+            echo
+            echo "\`$out\`"
+            echo
+            echo "**The bump is one line** in \`src/lib/models.sh\`:"
+            echo
+            echo '```sh'
+            echo "codex_model_default() { printf '%s' \"$latest\"; }"
+            echo '```'
+            echo
+            echo "Check first that a Codex seat can run it: \`5dive agent config <seat> set model=$latest\`, restart, and send one message."
+            echo "Existing agents keep their configured model; only new seats take the default."
+          } > body.md
+          if [ -n "$num" ]; then
+            gh issue edit "$num" --body-file body.md
+          else
+            gh issue create --title "$TITLE" --body-file body.md
+          fi
+          echo "::warning::$out — codex_model_default is behind"

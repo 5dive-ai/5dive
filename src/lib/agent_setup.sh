@@ -690,6 +690,23 @@ _codex_sync_operating_baseline_file() { # <file> <agent-name>
   fi
 }
 
+# seed_codex_model <name> <model> — leave the model a new codex seat starts on
+# for 5dive-agent-start (DIVE-5503). A one-shot file, not a config.toml write:
+# pre-creating config.toml would make agent-start skip its approval/sandbox
+# baseline (see write_runtime_model). agent-start writes it as the top-level
+# `model` only when config.toml names none, then deletes it. The filename is a
+# contract with 5dive-agent-start's apply_codex_model_seed.
+seed_codex_model() {
+  local name="$1" model="$2"
+  local dir="${AGENT_HOME_ROOT:-/home}/agent-${name}/.codex"
+  [[ -n "$model" ]] || return 1
+  mkdir -p "$dir" || return 1
+  printf '%s\n' "$model" > "$dir/.5dive-model-seed" || return 1
+  chmod 600 "$dir/.5dive-model-seed"
+  chown "agent-${name}:agent-${name}" "$dir" "$dir/.5dive-model-seed" 2>/dev/null || true
+  chmod 700 "$dir"
+}
+
 preseed_codex_return_channel() {
   local name="$1"
   local user="agent-${name}" root="${CODEX_AGENT_HOME_ROOT:-/home}"
