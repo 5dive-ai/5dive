@@ -117,6 +117,10 @@ if jq -e . "$TMP/out" >/dev/null 2>&1; then
   [[ "$disp" != "MISSING" ]] \
     && ok_t "the receipt reports the home disposition (DIVE-2138)" \
     || bad_t "receipt has no home disposition" "$(cat "$TMP/out")"
+  fdisp=$(jq -r '.data.files.disposition // "MISSING"' "$TMP/out")
+  [[ "$fdisp" != "MISSING" ]] \
+    && ok_t "the receipt reports the out-of-home files disposition (DIVE-5481: ${fdisp})" \
+    || bad_t "receipt has no files disposition" "$(cat "$TMP/out")"
 else
   bad_t "agent rm receipt is not valid JSON" \
         "stdout=[$(cat "$TMP/out")] stderr=[$(tail -2 "$TMP/err")]"

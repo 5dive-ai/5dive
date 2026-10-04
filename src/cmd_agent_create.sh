@@ -1301,10 +1301,18 @@ _rm_disable_seat_units() {
 #   - anything else is a shared file the seat happened to create: it stays put
 #     and is handed to root:<shared group>, so it keeps working for the others.
 #
-# Sets _RM_FILES_DISPOSITION: none / swept:<chowned>+<quarantined> / incomplete.
+# DIVE-5481: under --purge-home the seat-private paths are DELETED, not moved
+# into a `-files` quarantine. --purge-home is the operator's opt-in to an
+# irreversible delete; keeping a root-only copy of the dead seat's logged-in
+# browser sessions after it is the opposite of what was asked. Invisible until
+# DIVE-5478 gave every new seat a browser store at create. The shared-file
+# chown half is the same either way.
+#
+# Sets _RM_FILES_DISPOSITION: none / swept:<chowned>+<quarantined> /
+# purged:<chowned>+<deleted> (--purge-home) / incomplete.
 SEAT_SWEEP_ROOTS="${SEAT_SWEEP_ROOTS:-${STATE_DIR:-/var/lib/5dive} /var/log/5dive}"
 _rm_sweep_uid_files() {
-  local name="$1" uid="$2" group="${AGENT_SHARED_GROUP:-claude}"
+  local name="$1" uid="$2" purge="${3:-0}" group="${AGENT_SHARED_GROUP:-claude}"
   _RM_FILES_DISPOSITION="none"
   # A uid that is root, not a number, or that already resolves to an account is
   # not a freed uid, and everything below hands its files to someone else.
@@ -1320,7 +1328,7 @@ _rm_sweep_uid_files() {
   mapfile -d '' -t hits < <(find "${roots[@]}" -uid "$uid" -print0 2>/dev/null)
   (( ${#hits[@]} )) || return 0
 
-  local f rel top comp ts dest qroot="" moved=0 chowned=0 failed=0
+  local f rel top comp ts dest qroot="" moved=0 purged=0 chowned=0 failed=0
   local -A private=()
   for f in "${hits[@]}"; do
     for r in "${roots[@]}"; do
@@ -1336,7 +1344,19 @@ _rm_sweep_uid_files() {
       break
     done
   done
-  if (( ${#private[@]} )); then
+  if (( ${#private[@]} )) && [[ "$purge" == "1" ]]; then
+    local -a tops=()
+    mapfile -t tops < <(printf '%s\n' "${!private[@]}" | sort)
+    for top in "${tops[@]}"; do
+      [[ -e "$top" || -L "$top" ]] || continue   # inside a path already deleted
+      if rm -rf -- "$top" 2>/dev/null && [[ ! -e "$top" && ! -L "$top" ]]; then
+        purged=$((purged+1))
+      else
+        failed=$((failed+1))
+        warn "could not purge ${top} — a later agent recycling uid ${uid} would inherit it. Remove it by hand: sudo rm -rf ${top}"
+      fi
+    done
+  elif (( ${#private[@]} )); then
     ts=$(date +%Y%m%d%H%M%S)
     qroot="${REAPED_DIR}/${name}-${ts}-files"
     if mkdir -p "$qroot" 2>/dev/null; then
@@ -1361,7 +1381,7 @@ _rm_sweep_uid_files() {
     fi
   fi
   for f in "${hits[@]}"; do
-    [[ -e "$f" || -L "$f" ]] || continue   # moved with a seat-private path
+    [[ -e "$f" || -L "$f" ]] || continue   # moved or purged with a seat-private path
     [[ "$(stat -c %u -- "$f" 2>/dev/null)" == "$uid" ]] || continue
     if chown -h "root:${group}" -- "$f" 2>/dev/null; then
       chowned=$((chowned+1))
@@ -1373,9 +1393,12 @@ _rm_sweep_uid_files() {
     _RM_FILES_DISPOSITION="incomplete"
     _rm_audit_teardown_failure "agent-${name}" "uid ${uid}: ${failed} file(s) under ${SEAT_SWEEP_ROOTS} could not be handed back"
     warn "${failed} file(s) still owned by the freed uid ${uid} — a later agent on that uid inherits them. List them with: sudo find ${SEAT_SWEEP_ROOTS} -uid ${uid} (DIVE-5308)"
+  elif [[ "$purge" == "1" ]]; then
+    _RM_FILES_DISPOSITION="purged:${chowned}+${purged}"
   else
     _RM_FILES_DISPOSITION="swept:${chowned}+${moved}"
   fi
+  (( purged )) && step "purged ${purged} path(s) named for agent-${name} (--purge-home)"
   (( moved )) && step "quarantined ${moved} path(s) named for agent-${name} -> ${qroot}"
   (( chowned )) && step "handed ${chowned} shared file(s) of the freed uid ${uid} to root:${group}"
   return 0
@@ -1444,7 +1467,7 @@ delete_agent_user() {
   quarantine_agent_home "$name" "$home" "$purge_home"
   # Only a uid that is actually free: if the account survived deluser, its
   # files are still its own.
-  [[ "$_RM_USER_DISPOSITION" == "deleted" ]] && _rm_sweep_uid_files "$name" "$old_uid"
+  [[ "$_RM_USER_DISPOSITION" == "deleted" ]] && _rm_sweep_uid_files "$name" "$old_uid" "$purge_home"
   return 0
 }
 

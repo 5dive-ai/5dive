@@ -150,6 +150,7 @@ cmd_rm() {
   _RM_HOME_DISPOSITION="absent"
   _RM_USER_DISPOSITION="absent"
   _RM_GROUP_DISPOSITION="absent"
+  _RM_FILES_DISPOSITION="none"
   delete_agent_user "$name" "$purge_home"
   step "Updating registry"
   if [[ "${_RM_USER_DISPOSITION:-absent}" == "present" || "${_RM_GROUP_DISPOSITION:-absent}" == "present" ]]; then
@@ -190,10 +191,14 @@ cmd_rm() {
   # account. `absent` here means never a member; `present` means the membership
   # outlived the removal and the credentials it scopes are still reachable.
   local _group_state="${_RM_GROUP_DISPOSITION:-absent}"
+  # DIVE-5481: and the seat's files outside the home (DIVE-5308's sweep), so a
+  # --purge-home receipt says whether they were deleted or quarantined.
+  local _files_state="${_RM_FILES_DISPOSITION:-none}"
   ok "agent '$name' removed." \
-     '{name:$n, removed:true, user:{disposition:$us}, group:{name:$gn, disposition:$gs}, home:({disposition:$hs} + (if $hp == "" then {} else {path:$hp} end))}' \
+     '{name:$n, removed:true, user:{disposition:$us}, group:{name:$gn, disposition:$gs}, home:({disposition:$hs} + (if $hp == "" then {} else {path:$hp} end)), files:{disposition:$fs}}' \
      --arg n "$name" --arg us "$_user_state" --arg gs "$_group_state" \
-     --arg gn "${AGENT_SHARED_GROUP:-claude}" --arg hs "$_home_state" --arg hp "$_home_path"
+     --arg gn "${AGENT_SHARED_GROUP:-claude}" --arg hs "$_home_state" --arg hp "$_home_path" \
+     --arg fs "$_files_state"
 }
 
 # DIVE-345: move a path aside as <path>.disabled-<ts> (reversible) if present.
