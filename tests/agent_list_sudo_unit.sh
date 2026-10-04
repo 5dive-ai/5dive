@@ -101,7 +101,8 @@ EOF
 # ---------------------------------------------------------------------------
 REG=$(jq -nc '{agents: {
   legacyfull: {type:"claude", channels:"none", isolation:"admin",  createdAt:"2026-05-15"},
-  scoped:     {type:"claude", channels:"none", isolation:"admin",  createdAt:"2026-07-22"},
+  scoped:     {type:"claude", channels:"none", isolation:"admin",  createdAt:"2026-07-22",
+               pack:{source:"marketplace", slug:"theo"}},
   narrow:     {type:"claude", channels:"none", isolation:"admin",  createdAt:"2026-07-22"},
   drifted:    {type:"claude", channels:"none", isolation:"admin",  createdAt:"2026-07-22"},
   legacylabel:{type:"claude", channels:"none",                     createdAt:"2026-05-01"}
@@ -147,6 +148,11 @@ is "narrow: DIVERGES (label wider than grant)" "$(g narrow .sudo.diverges)" "tru
 
 is "drifted: widest class still reported"      "$(g drifted .sudo.grant)" "cli-root"
 is "drifted: extra entries NOT absorbed"       "$(g drifted .sudo.extraEntries)" "true"
+
+# DIVE-5498: the persona an agent was imported from rides the list, so a hire
+# surface knows "Theo is already here" by who he is, not by his name.
+is "scoped: carries its marketplace pack slug" "$(g scoped .pack)" "theo"
+is "legacylabel: no pack record -> null, not absent-and-guessed" "$(g legacylabel 'has("pack")'):$(g legacylabel .pack)" "true:null"
 
 # The whole point: two agents with an IDENTICAL stored label must be
 # distinguishable in list's own output.

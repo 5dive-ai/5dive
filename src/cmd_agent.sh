@@ -426,6 +426,10 @@ _cmd_list_legacy() {
     workdir: (.value.workdir // $default_wd),
     authProfile: (.value.authProfile // null),
     botUsername: (.value.botUsername // null),
+    # DIVE-5498: the marketplace persona this seat was imported from, so a hire
+    # surface can tell "Theo is already here" (even as diveteam-theo) by WHO the
+    # agent is, not by its name.
+    pack: (.value.pack.slug // null),
     isolation: (.value.isolation // "admin"),
     heartbeat: (.value.heartbeat // null),
     createdAt: .value.createdAt,
