@@ -539,6 +539,25 @@ trust_level = "trusted"
 TOML
     chmod 600 "$AGENT_CODEX_HOME/config.toml"
   fi
+  # DIVE-5503: the model a NEW seat starts on. `agent create` leaves it (the
+  # operator's --model, else the CLI's codex_model_default) in a one-shot seed.
+  # It lands as the top-level `model` only when config.toml names none, so a
+  # model someone already chose is never rewritten, and the seed is consumed
+  # either way. Prepending is TOML-safe: line 1 is always the preamble, never
+  # inside a [table] (the hazard the note above describes for appends).
+  apply_codex_model_seed() {   # apply_codex_model_seed <codex-home>
+    local home="$1" seed="$1/.5dive-model-seed" cfg="$1/config.toml" want tmp
+    [[ -f "$seed" ]] || return 0
+    want="$(head -1 "$seed" | tr -d '[:space:]')"
+    if [[ "$want" =~ ^[A-Za-z0-9._:/-]+$ && -f "$cfg" ]] \
+       && ! awk '/^[ \t]*\[/ { exit } /^[ \t]*model[ \t]*=/ { found = 1; exit } END { exit !found }' "$cfg"; then
+      tmp="$cfg.seed.$$"
+      { printf 'model = "%s"\n' "$want"; cat "$cfg"; } > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$cfg" \
+        || { rm -f "$tmp"; echo "warn: could not write the seeded codex model ($want)" >&2; }
+    fi
+    rm -f "$seed"
+  }
+  apply_codex_model_seed "$AGENT_CODEX_HOME"
   # Wire the telegram-codex MCP server + lifecycle hooks into config.toml when
   # this agent has the telegram channel. We append complete [sections] only
   # when [mcp_servers.telegram] isn't already present — appending whole tables
