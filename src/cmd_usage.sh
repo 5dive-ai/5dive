@@ -44,6 +44,46 @@ now   = int(time.time())
 registry = os.environ["REGISTRY"]
 task_db  = os.environ["TASK_DB"]
 
+# DIVE-5504: OpenAI's published per-million rates, by model (codex audit,
+# 2026-10-04: learn.chatgpt.com/docs/pricing and the GPT-6.1 Sol API page).
+# Codex credits charge cached input at 1/20 of uncached and have no separate
+# cache-write charge; the API bills a cache write at its own rate. These price
+# TOKENS; OpenAI says they do not determine how much of an included plan's
+# 5h/7d window a call uses, so nothing here is turned into a percentage.
+CODEX_RATES_AS_OF = "2026-10-04"
+CODEX_RATES = {
+    "gpt-6.1-sol": {"credits": {"in": 50.0, "cached": 2.5, "out": 250.0},
+                    "apiUsd": {"in": 2.0, "cached": 0.10, "cacheWrite": 2.50, "out": 10.0}},
+}
+
+def codex_rates_for(model):
+    if not isinstance(model, str):
+        return None
+    mdl = model.lower()
+    for key in sorted(CODEX_RATES, key=len, reverse=True):
+        if mdl == key or mdl.startswith(key + "-"):
+            return key, CODEX_RATES[key]
+    return None
+
+def codex_estimate(m):
+    uncached = m.get("in", 0) + m.get("cc", 0)
+    out = {
+        "model": m.get("model"),
+        "rawInput": m.get("rawIn", uncached + m.get("cr", 0)),
+        "uncachedInput": uncached, "cachedInput": m.get("cr", 0),
+        "cacheWrite": m.get("cc", 0), "output": m.get("out", 0),
+        "credits": None, "apiUsd": None, "ratesFor": None, "ratesAsOf": CODEX_RATES_AS_OF,
+    }
+    hit = codex_rates_for(m.get("model"))
+    if hit:
+        key, r = hit
+        c, a = r["credits"], r["apiUsd"]
+        out["ratesFor"] = key
+        out["credits"] = round((uncached * c["in"] + m.get("cr", 0) * c["cached"] + m.get("out", 0) * c["out"]) / 1e6, 2)
+        out["apiUsd"] = round((m.get("in", 0) * a["in"] + m.get("cc", 0) * a["cacheWrite"]
+                               + m.get("cr", 0) * a["cached"] + m.get("out", 0) * a["out"]) / 1e6, 4)
+    return out
+
 def to_epoch(s):
     if not s:
         return None
@@ -405,8 +445,21 @@ for name, meta in agents.items():
             last_rate_limits = None
             last_rl_ts = None
             token_events = 0
+            last_model = None
             with f:
                 for line in f:
+                    # DIVE-5504: the model the turns ran on, for the credit
+                    # estimate (rates are per model). The newest one wins.
+                    if '"turn_context"' in line:
+                        try:
+                            tc = json.loads(line)
+                            if tc.get("type") == "turn_context":
+                                mdl = (tc.get("payload") or {}).get("model")
+                                if isinstance(mdl, str) and mdl:
+                                    last_model = mdl
+                        except Exception:
+                            pass
+                        continue
                     if '"token_count"' not in line:
                         continue
                     try:
@@ -464,6 +517,11 @@ for name, meta in agents.items():
             m = models.setdefault("codex", {"in":0,"out":0,"cc":0,"cr":0,"turns":0})
             m["in"] += i; m["out"] += ot; m["cc"] += cc; m["cr"] += cr
             m["turns"] += token_events
+            # DIVE-5504: input as Codex reports it (cached is a SUBSET of it),
+            # and the newest model, so the estimate below prices each class.
+            m["rawIn"] = m.get("rawIn", 0) + raw_input
+            if last_model and last_ts is not None and last_ts >= m.get("_modelTs", -1):
+                m["model"] = last_model; m["_modelTs"] = last_ts
 
             if last_rate_limits is not None and last_rl_ts > newest_codex_rate_limit_ts:
                 newest_codex_rate_limit_ts = last_rl_ts
@@ -634,9 +692,16 @@ for name, meta in agents.items():
             seven_r = (rl.get("seven_day") or {}).get("resets_at")
         except Exception:
             pass
+    for _m in models.values():
+        _m.pop("_modelTs", None)
     agent_rows.append({
         "name": name, "account": meta.get("authProfile"),
         "models": models, "total": total, "quota": quota,
+        # DIVE-5504: Codex's input split three ways, priced at OpenAI's own
+        # published rates. An ESTIMATE of what the tokens would cost in credits
+        # or on the API, never a plan percentage (those are fiveHourPct /
+        # sevenDayPct, the provider's own figures, passed through untouched).
+        **({"codexEstimate": codex_estimate(models["codex"])} if "codex" in models else {}),
         "output": output, "cacheRead": cread,
         "fiveHourPct": five, "sevenDayPct": seven,
         # DIVE-4430: epoch seconds, or null when the source had none.
@@ -989,10 +1054,17 @@ print(json.dumps({
                   # different standing, and a consumer must be able to tell
                   # which figure rests on a measurement.
                   "providerWeights": {
-                      "codex": {"cacheRead": 1.0, "basis": "measured",
+                      # DIVE-5504: one observation, not a tariff. OpenAI's
+                      # own credit rate prices a cached token at 1/20 of an
+                      # uncached one; see basis.codexEstimate.
+                      "codex": {"cacheRead": 1.0, "basis": "single observation",
                                 "evidence": "DIVE-4028, n=1: 14,016,606 tokens "
                                             "(98.2% cache reads) = 9% of a "
-                                            "weekly pool"},
+                                            "weekly pool",
+                                "notATariff": "OpenAI's Codex credit rate charges "
+                                              "cached input at 1/20 of uncached; "
+                                              "this weight is a capacity proxy, "
+                                              "not a price"},
                       "claude": {"cacheRead": 1.0, "basis": "assumed",
                                  "evidence": "no first-party gauge-vs-token "
                                              "measurement; 1.0x is an upper "
@@ -1008,6 +1080,23 @@ print(json.dumps({
                       "codex": "agent-row only — cumulative rollout snapshots "
                                "cannot be assigned to a task window",
                   }},
+        # DIVE-5504: the percentages are the PROVIDER's, read from its own
+        # report, and nothing here ever stands in for one.
+        "providerPct": {"name": "provider-reported window use",
+                        "fields": "agents[].fiveHourPct / sevenDayPct",
+                        "source": "Codex rollout rate_limits / Claude statusline",
+                        "use": "how much of the plan's 5h / 7d window is used — "
+                               "the only percentage; never derived from tokens"},
+        "codexEstimate": {"name": "Codex token prices",
+                          "fields": "agents[].codexEstimate",
+                          "formula": "uncached input, cached input and output at "
+                                     "OpenAI's published per-million rates for "
+                                     "the turn's model",
+                          "ratesAsOf": CODEX_RATES_AS_OF,
+                          "use": "what the tokens cost in Codex credits / on the "
+                                 "API; null when the model has no rate here",
+                          "caveat": "OpenAI: credit rates do not determine "
+                                    "included-plan usage; not a plan percentage"},
     },
     "agents": agent_rows, "tasks": tasks, "untracked": untracked,
     # DIVE-4589: usage by AUTH PROFILE, attributed per turn to the binding that
@@ -1294,8 +1383,33 @@ usage_basis_legend() {
   printf '  %s\n' "QUOTA  = API-EQ + cache-read (what a flat-rate plan meters — use for capacity; this is the number that runs out)"
   [[ -n "$data" ]] || return 0
   if [[ "$(jq -r '[.agents[]?.models? // {} | keys[]] | any(. == "codex")' <<<"$data" 2>/dev/null)" == "true" ]]; then
-    printf '  %s\n' "QUOTA counts a cache read at 1.0x on BOTH providers: measured on Codex (DIVE-4028, n=1), ASSUMED on Claude — so Claude rows are an upper bound. Codex tokens are agent-row only, never per-task."
+    printf '  %s\n' "QUOTA counts a cache read at 1.0x on BOTH providers: one observation on Codex (DIVE-4028, n=1; not a price — OpenAI's credit rate charges a cached token 1/20 of an uncached one), ASSUMED on Claude — so both are upper bounds. Codex tokens are agent-row only, never per-task."
+    printf '  %s\n' "7D% is the provider's own figure; SHARE splits it by QUOTA, so SHARE is an estimate. \`5dive usage <agent>\` shows a Codex seat's cached/uncached split and credit estimate."
   fi
+}
+
+# DIVE-5504: the per-agent view's two further bases, each labelled. The
+# provider's own 5h/7d percentages (passed through, never computed), and for a
+# Codex seat its input split three ways and priced at OpenAI's published rates.
+# Token counts never become a percentage here.
+usage_render_provider_and_codex() {
+  local row="$1"
+  jq -r "$USAGE_JQ_HELPERS"'
+    def p($v): if $v == null then "unknown" else "\($v|floor)%" end;
+    "  Plan window used (provider-reported): 5h " + p(.fiveHourPct) + " · 7d " + p(.sevenDayPct)
+    , (.codexEstimate // empty |
+        "  Codex input: " + (.rawInput|htok) + " = " + (.uncachedInput|htok) + " uncached + "
+          + (.cachedInput|htok) + " cached"
+          + (if .rawInput > 0 then " (" + (((.cachedInput / .rawInput) * 100) | floor | tostring) + "% cached)" else "" end)
+          + " · output " + (.output|htok)
+      , (if .credits == null then
+           "  Codex credits / API cost (estimate): no published rate for " + ((.model // "an unknown model")|tostring) + " in this CLI"
+         else
+           "  Codex credits (estimate, OpenAI Standard rates for " + .ratesFor + ", " + .ratesAsOf + "): "
+             + (.credits|tostring) + " · API-equivalent: $" + (.apiUsd|tostring)
+         end)
+      , "  (Prices for these tokens, not plan use: OpenAI says credit rates do not set how much of a plan window a call takes.)")
+  ' <<<"$row"
 }
 
 # usage_render_board — top agents + top tasks, sorted by tokens descending.
@@ -1469,6 +1583,7 @@ usage_render_agent() {
          "  QUOTA / plan consumption (all four classes): " + ($q|htok)
          + (if .total > 0 then "   (" + (((($q / .total) * 10 | floor) / 10)|tostring) + "x the API-EQ figure)" else "" end)
        end)' <<<"$row"
+  usage_render_provider_and_codex "$row"
   echo
   echo "  tasks ($label):"
   jq -r "$USAGE_JQ_HELPERS"'

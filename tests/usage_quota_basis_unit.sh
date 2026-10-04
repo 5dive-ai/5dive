@@ -359,11 +359,14 @@ OUT="$(cmd_usage_budget set newbie --basis=bogus 2>&1)"; RC=$?
 # figure rests on a measurement and which on an upper bound, and it must not
 # have to read a source comment to find out.
 PW="$(jq -c '.basis.quota.providerWeights' <<<"$OUT_U")"
-[[ "$(jq -r '.codex.basis' <<<"$PW")" == "measured" \
+# DIVE-5504: the Codex weight is ONE observation, not a tariff — OpenAI's own
+# credit rate prices a cached token at 1/20 — so it is labelled as such.
+[[ "$(jq -r '.codex.basis' <<<"$PW")" == "single observation" \
+   && "$(jq -r '.codex.notATariff' <<<"$PW")" == *"1/20"* \
    && "$(jq -r '.claude.basis' <<<"$PW")" == "assumed" \
    && "$(jq -r '.codex.cacheRead' <<<"$PW")" == "1.0" \
    && "$(jq -r '.claude.cacheRead' <<<"$PW")" == "1.0" ]] \
-  && ok_t "collector: cache-read weight declared PER PROVIDER — codex measured, claude assumed" \
+  && ok_t "collector: cache-read weight declared PER PROVIDER — codex one observation (not a tariff), claude assumed" \
   || bad_t "the merge with DIVE-4034 left Codex's 1.0x weight unstated" "$PW"
 
 # --- C8. a CODEX seat lands in the agent row and in NO task row -------------
