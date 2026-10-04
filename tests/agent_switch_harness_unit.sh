@@ -235,6 +235,17 @@ rc=$(run agent_account_move_switch config theo set auth-profile=chatgpt model=x 
 [[ "$rc" != 0 ]] && grep -q 'exactly one key' "$TMP/err" \
   && ok_t "R3 --switch-harness refuses to ride along with other keys" || bad_t "R3" "rc=$rc err=$(<"$TMP/err")"
 
+# The UI sends `agent config <n> set auth-profile=<p> --switch-harness`. A box
+# whose CLI predates this change has no main.sh route for the flag, so the flag
+# reaches cmd_config's key loop: it must be refused there BEFORE any write — else
+# the UI would bind a Claude agent to a ChatGPT account on an old box.
+printf '%s' "$REG0" >"$TMP/reg"; snap_reg=$(sha256sum <"$TMP/reg"); : >"$TMP/restarts"
+rc=$(run cmd_config theo set auth-profile=claudeacct --switch-harness)
+[[ "$rc" != 0 ]] && grep -q 'unknown config key: --switch-harness' "$TMP/err" \
+  && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" && ! -s "$TMP/restarts" ]] \
+  && ok_t "R4 the flag reaching cmd_config unrouted (an old CLI) is refused before any write" \
+  || bad_t "R4" "rc=$rc err=$(<"$TMP/err")"
+
 # =========================================================== C/M: pure pieces
 printf 'own text\n' >"$TMP/dst.md"
 switch_carry_doc "$CM" "$TMP/dst.md" claude codex "" >"$TMP/c1"
