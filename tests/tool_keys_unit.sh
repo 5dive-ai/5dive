@@ -50,7 +50,7 @@ out=$(run ls)
 gh=$(jq -r '.data.tools[] | select(.id=="github") | .connected' <<<"$out")
 el=$(jq -r '.data.tools[] | select(.id=="elevenlabs") | .connected' <<<"$out")
 n=$(jq -r '.data.tools | length' <<<"$out")
-[[ "$gh" == true && "$el" == false && "$n" == 8 ]] && ok_t "T2 ls: github connected, elevenlabs not, 8 tools" || bad_t "T2 ls" "$out"
+[[ "$gh" == true && "$el" == false && "$n" == 20 ]] && ok_t "T2 ls: github connected, elevenlabs not, 20 tools" || bad_t "T2 ls" "$out"
 [[ "$out" != *ghp_FAKE* ]] && ok_t "T2 ls never prints a key" || bad_t "T2 ls leaks" "$out"
 
 # --- T3: replace is idempotent; another tool's line survives -------------------
@@ -145,7 +145,31 @@ for t in elevenlabs meta; do run rm "$t" >/dev/null; done
 out=$( ( set -euo pipefail; cmd_tool ls ) 2>&1 ); rc=$?
 gh=$(jq -r '.data.tools[] | select(.id=="github") | .connected' <<<"$out" 2>/dev/null)
 n=$(jq -r '.data.tools | length' <<<"$out" 2>/dev/null)
-[[ $rc -eq 0 && "$gh" == false && "$n" == 8 ]] && ok_t "T10 ls with every key removed: rc 0, 8 tools, none connected" || bad_t "T10 ls after last rm" "rc=$rc $out"
+[[ $rc -eq 0 && "$gh" == false && "$n" == 20 ]] && ok_t "T10 ls with every key removed: rc 0, 20 tools, none connected" || bad_t "T10 ls after last rm" "rc=$rc $out"
+
+# --- T11: the business apps (DIVE-5513, OINOA) ---------------------------------
+# The twelve ids, each with its vars in stdin order, after the first eight.
+out=$(run ls)
+want='bitrix24=BITRIX24_WEBHOOK_URL amocrm=AMOCRM_DOMAIN,AMOCRM_TOKEN moysklad=MOYSKLAD_TOKEN yandex-calendar=YANDEX_LOGIN,YANDEX_CALDAV_PASSWORD hubspot=HUBSPOT_TOKEN pipedrive=PIPEDRIVE_DOMAIN,PIPEDRIVE_TOKEN notion=NOTION_TOKEN asana=ASANA_TOKEN calendly=CALENDLY_TOKEN lexoffice=LEXOFFICE_API_KEY sevdesk=SEVDESK_API_TOKEN holded=HOLDED_API_KEY'
+got=$(jq -r '[.data.tools[8:][] | "\(.id)=\(.env | join(","))"] | join(" ")' <<<"$out")
+[[ "$got" == "$want" ]] && ok_t "T11 ls lists the 12 business apps after the 8, vars in stdin order" || bad_t "T11 business ids" "got: $got"
+url='https://acme.bitrix24.ru/rest/1/abc123def456/'
+out=$(printf '%s\n' "$url" | run set bitrix24); rc=$?
+[[ $rc -eq 0 && "$(grep -c "^export BITRIX24_WEBHOOK_URL='${url}'$" "$F")" == 1 && "$(seen BITRIX24_WEBHOOK_URL)" == "$url" ]] \
+  && ok_t "T11 bitrix24: the webhook URL is one export line a fresh bash sees" || bad_t "T11 bitrix24" "rc=$rc $out $(cat "$F")"
+c=$(run ls | jq -r '.data.tools[] | select(.id=="bitrix24") | .connected')
+[[ "$c" == true ]] && ok_t "T11 ls: bitrix24 connected" || bad_t "T11 bitrix24 ls" "$c"
+out=$(printf 'acme.amocrm.ru\nlongLivedFAKE.token-123\n' | run set amocrm); rc=$?
+[[ $rc -eq 0 && "$(seen AMOCRM_DOMAIN)" == acme.amocrm.ru && "$(seen AMOCRM_TOKEN)" == longLivedFAKE.token-123 ]] \
+  && ok_t "T11 amocrm: domain then token" || bad_t "T11 amocrm" "rc=$rc $out"
+out=$(printf 'ivan@yandex.ru\nappPassFAKE16chr\n' | run set yandex-calendar); rc=$?
+[[ $rc -eq 0 && "$(seen YANDEX_LOGIN)" == ivan@yandex.ru && "$(seen YANDEX_CALDAV_PASSWORD)" == appPassFAKE16chr ]] \
+  && ok_t "T11 yandex-calendar (a hyphenated id): login then app password" || bad_t "T11 yandex-calendar" "rc=$rc $out"
+out=$(printf 'only-one-line\n' | run set pipedrive); rc=$?
+[[ $rc -ne 0 && "$out" == *"takes 2 value"* ]] && ok_t "T11 pipedrive with one line refused" || bad_t "T11 pipedrive one line" "rc=$rc $out"
+out=$(run rm bitrix24); rc=$?
+[[ $rc -eq 0 && -z "$(seen BITRIX24_WEBHOOK_URL)" && "$(seen AMOCRM_TOKEN)" == longLivedFAKE.token-123 ]] \
+  && ok_t "T11 rm bitrix24 drops its line, amocrm kept" || bad_t "T11 rm bitrix24" "rc=$rc $(cat "$F")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
