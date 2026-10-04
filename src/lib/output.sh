@@ -375,6 +375,22 @@ _verb_surface_help() {
     { blk = 0 }'
 }
 
+# lazy_need <fn>... — parse the module that defines each <fn> into THIS shell
+# now. In the built bundle a lazy module loads on its first call (DIVE-4087),
+# and a first call inside `$( )` loads it into the subshell, which drops it on
+# return — so a loop of `x=$(fn …)` re-reads the module on every pass. Call this
+# before such a loop. The split tree has no stubs, so it is a no-op there.
+lazy_need() {
+  declare -F _load_module >/dev/null 2>&1 || return 0
+  local fn body
+  for fn in "$@"; do
+    body=$(declare -f "$fn" 2>/dev/null) || continue
+    [[ "$body" == *_lazy_autoload* ]] || continue
+    body="${body#*_lazy_autoload }"
+    _load_module "${body%% *}"
+  done
+}
+
 # _verb_own_usage <fn> <path> — the `usage: <path> …` literal <fn> prints itself
 # when its arguments are wrong. The token after <path> must be whitespace or the
 # end of the literal, so asking about `account list` cannot be answered with the

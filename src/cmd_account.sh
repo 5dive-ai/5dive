@@ -44,6 +44,10 @@ account_types_authed_arr() {
   local name="$1" type path
   local -a out=()
   local seen=" "   # " a b " — membership test without a subprocess
+  # profile_type_auth_path lives in cmd_auth and is first called inside `$( )`
+  # below, so without this the bundle re-reads cmd_auth once per (account, type):
+  # ~150ms each, ~7.5s for `account list` on five accounts — /account in Telegram.
+  lazy_need profile_type_auth_path
   for type in "${!TYPE_BIN[@]}"; do
     path=$(profile_type_auth_path "$name" "$type" 2>/dev/null) || continue
     [[ -n "$path" && -s "$path" ]] || continue
