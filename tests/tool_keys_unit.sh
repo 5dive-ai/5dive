@@ -150,7 +150,7 @@ n=$(jq -r '.data.tools | length' <<<"$out" 2>/dev/null)
 # --- T11: the business apps (DIVE-5513, OINOA) ---------------------------------
 # The twelve ids, each with its vars in stdin order, after the first eight.
 out=$(run ls)
-want='bitrix24=BITRIX24_WEBHOOK_URL amocrm=AMOCRM_DOMAIN,AMOCRM_TOKEN moysklad=MOYSKLAD_TOKEN yandex-calendar=YANDEX_LOGIN,YANDEX_CALDAV_PASSWORD hubspot=HUBSPOT_TOKEN pipedrive=PIPEDRIVE_DOMAIN,PIPEDRIVE_TOKEN notion=NOTION_TOKEN asana=ASANA_TOKEN calendly=CALENDLY_TOKEN lexoffice=LEXOFFICE_API_KEY sevdesk=SEVDESK_API_TOKEN holded=HOLDED_API_KEY'
+want='bitrix24=BITRIX24_WEBHOOK_URL amocrm=AMOCRM_DOMAIN,AMOCRM_TOKEN moysklad=MOYSKLAD_TOKEN yandex-calendar=YANDEX_LOGIN,YANDEX_CALDAV_PASSWORD hubspot=HUBSPOT_TOKEN pipedrive=PIPEDRIVE_TOKEN notion=NOTION_TOKEN asana=ASANA_TOKEN calendly=CALENDLY_TOKEN lexoffice=LEXOFFICE_API_KEY sevdesk=SEVDESK_API_TOKEN holded=HOLDED_API_KEY'
 got=$(jq -r '[.data.tools[8:][] | "\(.id)=\(.env | join(","))"] | join(" ")' <<<"$out")
 [[ "$got" == "$want" ]] && ok_t "T11 ls lists the 12 business apps after the 8, vars in stdin order" || bad_t "T11 business ids" "got: $got"
 url='https://acme.bitrix24.ru/rest/1/abc123def456/'
@@ -165,8 +165,11 @@ out=$(printf 'acme.amocrm.ru\nlongLivedFAKE.token-123\n' | run set amocrm); rc=$
 out=$(printf 'ivan@yandex.ru\nappPassFAKE16chr\n' | run set yandex-calendar); rc=$?
 [[ $rc -eq 0 && "$(seen YANDEX_LOGIN)" == ivan@yandex.ru && "$(seen YANDEX_CALDAV_PASSWORD)" == appPassFAKE16chr ]] \
   && ok_t "T11 yandex-calendar (a hyphenated id): login then app password" || bad_t "T11 yandex-calendar" "rc=$rc $out"
-out=$(printf 'only-one-line\n' | run set pipedrive); rc=$?
-[[ $rc -ne 0 && "$out" == *"takes 2 value"* ]] && ok_t "T11 pipedrive with one line refused" || bad_t "T11 pipedrive one line" "rc=$rc $out"
+out=$(printf 'only-one-line\n' | run set amocrm); rc=$?
+[[ $rc -ne 0 && "$out" == *"takes 2 value"* ]] && ok_t "T11 amocrm with one line refused" || bad_t "T11 amocrm one line" "rc=$rc $out"
+out=$(printf 'pdFAKEtoken0123456789\n' | run set pipedrive); rc=$?
+[[ $rc -eq 0 && "$(seen PIPEDRIVE_TOKEN)" == pdFAKEtoken0123456789 && -z "$(seen PIPEDRIVE_DOMAIN)" ]] \
+  && ok_t "T11 pipedrive: the token alone (no domain)" || bad_t "T11 pipedrive one value" "rc=$rc $out"
 out=$(run rm bitrix24); rc=$?
 [[ $rc -eq 0 && -z "$(seen BITRIX24_WEBHOOK_URL)" && "$(seen AMOCRM_TOKEN)" == longLivedFAKE.token-123 ]] \
   && ok_t "T11 rm bitrix24 drops its line, amocrm kept" || bad_t "T11 rm bitrix24" "rc=$rc $(cat "$F")"

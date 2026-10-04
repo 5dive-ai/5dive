@@ -40,14 +40,15 @@ declare -gA TOOL_ENV=(
   [higgsfield]="HF_API_KEY HF_API_SECRET"
   # Business apps (DIVE-5513, for OINOA): RU and EU CRMs, stock, calendars and
   # accounting. Bitrix24 is its whole inbound-webhook URL (portal, user and code
-  # in one), amoCRM and Pipedrive are the account's domain then its token, and
+  # in one), amoCRM is the account's domain then its token (Pipedrive is its token
+  # alone: api.pipedrive.com needs no company domain), and
   # Yandex Calendar is CalDAV: the login then an app password.
   [bitrix24]="BITRIX24_WEBHOOK_URL"
   [amocrm]="AMOCRM_DOMAIN AMOCRM_TOKEN"
   [moysklad]="MOYSKLAD_TOKEN"
   [yandex-calendar]="YANDEX_LOGIN YANDEX_CALDAV_PASSWORD"
   [hubspot]="HUBSPOT_TOKEN"
-  [pipedrive]="PIPEDRIVE_DOMAIN PIPEDRIVE_TOKEN"
+  [pipedrive]="PIPEDRIVE_TOKEN"
   [notion]="NOTION_TOKEN"
   [asana]="ASANA_TOKEN"
   [calendly]="CALENDLY_TOKEN"
@@ -84,7 +85,7 @@ _tool_usage() {
   Business apps:
     bitrix24 BITRIX24_WEBHOOK_URL · amocrm AMOCRM_DOMAIN AMOCRM_TOKEN
     moysklad MOYSKLAD_TOKEN · yandex-calendar YANDEX_LOGIN YANDEX_CALDAV_PASSWORD
-    hubspot HUBSPOT_TOKEN · pipedrive PIPEDRIVE_DOMAIN PIPEDRIVE_TOKEN
+    hubspot HUBSPOT_TOKEN · pipedrive PIPEDRIVE_TOKEN
     notion NOTION_TOKEN · asana ASANA_TOKEN · calendly CALENDLY_TOKEN
     lexoffice LEXOFFICE_API_KEY · sevdesk SEVDESK_API_TOKEN · holded HOLDED_API_KEY
 
