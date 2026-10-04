@@ -22,6 +22,8 @@
 #   - negative controls: an account that SURVIVES deluser keeps its files, a uid
 #     that already belongs to someone else is not swept, a unit-only orphan (no
 #     account) still loses its units
+#   - DIVE-5481: under --purge-home the seat-private paths are DELETED and
+#     nothing new appears under REAPED_DIR; without it they still quarantine
 # Rootless: find matches by the harness's OWN uid, standing in for the freed
 # one; chown is recorded, since only root can perform it.
 #
@@ -224,6 +226,55 @@ delete_agent_user gone 0 2>/dev/null
 [[ -z "$(grep -E "$SEAT_RX" "$UNITS")" ]] && ! grep -q -- "-h root:" "$CHOWN_LOG" \
   && ok_t "with no account left, the seat's units still go and no file is swept" \
   || bad_t "unit-only orphan" "$(cat "$UNITS")"
+
+# ==== 5. DIVE-5481: --purge-home DELETES the seat-private paths ==============
+# The v0.71.0 nightly smoke went red ("2 -> 3 dirs under .5dive-reaped") once
+# DIVE-5478 gave every new seat a browser store: the sweep moved it into a
+# `-files` quarantine under --purge-home too. Purge is the operator's opt-in to
+# an irreversible delete, so nothing new may appear under REAPED_DIR.
+seed_box
+mkdir -p "$REAPED_DIR"
+reaped_before=$(find "$REAPED_DIR" -mindepth 1 -maxdepth 1 | wc -l)
+delete_agent_user gone 1 2>"$TMP/stderr"
+reaped_after=$(find "$REAPED_DIR" -mindepth 1 -maxdepth 1 | wc -l)
+[[ "$reaped_before" == "$reaped_after" ]] && ! ls -d "$REAPED_DIR"/gone-*-files >/dev/null 2>&1 \
+  && ok_t "--purge-home leaves nothing new under REAPED_DIR (${reaped_before} before, ${reaped_after} after)" \
+  || bad_t "--purge-home quarantined instead of deleting" "${reaped_before} -> ${reaped_after}: $(ls -A "$REAPED_DIR")"
+[[ ! -e "$AGENT_HOME_ROOT/agent-gone" ]] \
+  && ok_t "--purge-home: the home itself is purged" \
+  || bad_t "home survived --purge-home" "$(ls -A "$AGENT_HOME_ROOT")"
+[[ ! -e "$LIB/browser-profiles/agent-gone" && ! -e "$LIB/tasks/gate-visibility/agent-gone.reading" ]] \
+  && ok_t "--purge-home: the seat's browser profile and seat-named file are deleted" \
+  || bad_t "seat-private path survived --purge-home" "$(ls -R "$LIB" 2>&1 | head -20)"
+! grep -q -- "-hR root:root" "$CHOWN_LOG" \
+  && ok_t "--purge-home: nothing is handed to root as a quarantine copy" \
+  || bad_t "a quarantine copy was made under --purge-home" "$(cat "$CHOWN_LOG")"
+[[ -e "$LIB/browser-profiles/agent-gone2/Default/Cookies" ]] \
+  && ok_t "--purge-home: a prefix-sharing seat's profile is NOT deleted" \
+  || bad_t "agent-gone2's profile was deleted" ""
+[[ -e "$LOG/notify/audit-drops.log" ]] && chowned_to_root "$LOG/notify/audit-drops.log" \
+  && ok_t "--purge-home: a shared log still stays in place and is handed to root:${AGENT_SHARED_GROUP}" \
+  || bad_t "shared log disposition wrong under --purge-home" "$(cat "$CHOWN_LOG")"
+residue=""
+while IFS= read -r -d '' f; do chowned_to_root "$f" || residue+="$f "; done \
+  < <(find "$LIB" "$LOG" -uid "$ME" -print0)
+[[ -z "$residue" ]] \
+  && ok_t "--purge-home: find <roots> -uid <old> names nothing the sweep did not hand to root" \
+  || bad_t "files of the freed uid were left with it under --purge-home" "$residue"
+[[ "${_RM_FILES_DISPOSITION:-}" == purged:*+2 ]] \
+  && ok_t "--purge-home: the disposition says purged, not swept (${_RM_FILES_DISPOSITION:-})" \
+  || bad_t "purge disposition" "files=${_RM_FILES_DISPOSITION:-unset}"
+grep -q "purged 2 path(s) named for agent-gone" "$TMP/stderr" \
+  && ok_t "--purge-home: the delete is said, not silent" \
+  || bad_t "no purge step line" "$(cat "$TMP/stderr")"
+
+# ==== 6. and the default (no flag) still quarantines =========================
+seed_box
+delete_agent_user gone 0 2>/dev/null
+q=$(ls -d "$REAPED_DIR"/gone-*-files 2>/dev/null | head -1)
+[[ -n "$q" && -s "$q$LIB/browser-profiles/agent-gone/Default/Cookies" && "$(stat -c %a "$q")" == 700 ]] \
+  && ok_t "without --purge-home the seat's profile is still quarantined root-only" \
+  || bad_t "default no longer quarantines" "q=$q"
 
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
