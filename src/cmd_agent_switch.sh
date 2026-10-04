@@ -35,6 +35,10 @@ SWITCH_HANDOFF_FILE=".5dive-handoff.md"
 # Carried memory index budget: AGENTS.md is loaded every turn, so the index is
 # cut at a byte budget and the rest is reached by search (DIVE-3821's lesson).
 SWITCH_INDEX_BUDGET="${FIVEDIVE_SWITCH_INDEX_BUDGET:-8000}"
+# The carried instructions are cut too when the target is codex: codex reads at
+# most 32 KiB of AGENTS.md and drops the rest without a word (DIVE-4923), so
+# 16 KB of instructions + the 8 KB index + its own baseline stay inside it.
+SWITCH_INSTR_BUDGET="${FIVEDIVE_SWITCH_INSTR_BUDGET:-16000}"
 
 _switch_home() { printf '%s/agent-%s\n' "${SWITCH_HOME_ROOT:-/home}" "$1"; }
 
@@ -144,6 +148,10 @@ print("\n".join(out))
   printf 'first turn, read ~/%s (what was in flight). 5dive rewrites this block\n' "$SWITCH_HANDOFF_FILE"
   printf 'on every switch; put your own instructions outside it.\n'
   if [[ -n "$body" ]]; then
+    if [[ "$to" == codex ]] && (( ${#body} > SWITCH_INSTR_BUDGET )); then
+      body="${body:0:SWITCH_INSTR_BUDGET}"
+      body="${body%$'\n'*}"$'\n\n'"(cut at ${SWITCH_INSTR_BUDGET} characters for Codex's 32 KiB limit; the full text is in ~/.claude/CLAUDE.md)"
+    fi
     printf '\n## Standing instructions\n\n%s\n' "$body"
   fi
   if [[ -n "$memidx" && -s "$memidx" ]]; then

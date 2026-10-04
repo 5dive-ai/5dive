@@ -263,6 +263,14 @@ out=$(switch_codex_memory_to_atoms "$H/.codex/memories" "$MEM")
 [[ "$out" == "0 0 1 0" ]] && ! grep -q 'codex-memory:begin' "$MEM/MEMORY.md" && [[ -f "$MEM/user_owner_likes_mornings.md" ]] \
   && ok_t "M2 a codex fact that is gone is removed with its index block; claude atoms untouched" \
   || bad_t "M2" "$out $(cat "$MEM/MEMORY.md")"
+{ printf 'line\n%.0s' $(seq 1 6000); } >"$TMP/big.md"
+switch_carry_doc "$TMP/big.md" "$TMP/none.md" claude codex "" >"$TMP/c3"
+[[ $(wc -c <"$TMP/c3") -lt 18000 ]] && grep -q "cut at 16000 characters for Codex's 32 KiB limit" "$TMP/c3" \
+  && grep -q '5dive:carried-instructions:end' "$TMP/c3" \
+  && ok_t "C3 carried instructions are cut for codex's 32 KiB AGENTS.md limit, and the block still closes" \
+  || bad_t "C3 budget" "$(wc -c <"$TMP/c3")"
+switch_carry_doc "$TMP/big.md" "$TMP/none.md" codex claude "" >"$TMP/c4"
+[[ $(wc -c <"$TMP/c4") -gt 30000 ]] && ok_t "C4 nothing is cut going to Claude (no such limit)" || bad_t "C4" "$(wc -c <"$TMP/c4")"
 w=$(switch_harness_warning Theo claude codex)
 [[ "$w" == "Moving Theo to your ChatGPT plan switches it from Claude Code to Codex. Its memory and instructions are converted; this chat's history is not. You can switch back any time." ]] \
   && ok_t "C2 the warning sentence is the one every surface shows" || bad_t "C2 warning" "$w"
