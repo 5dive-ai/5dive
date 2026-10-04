@@ -274,6 +274,15 @@ cmd_config() {
             || fail "$E_NOT_FOUND" "auth profile '$v' not configured — run: sudo 5dive agent auth set $type --api-key=... --auth-profile=$v"
           reg=$(jq --arg n "$name" --arg v "$v" '.agents[$n].authProfile = $v' <<<"$reg")
         fi
+        # DIVE-5501: an account signed in to the OTHER harness (Claude <-> ChatGPT)
+        # is a harness switch, not a rebind — refused here, before anything is
+        # written, with the sentence every surface shows. The confirmed form is
+        # --switch-harness (or `agent switch`), routed in main.sh.
+        local _sw_to=""
+        [[ -z "$v" || "$v" == default ]] || _sw_to=$(switch_target_for_account "$type" "$v")
+        if [[ -n "$_sw_to" ]]; then
+          fail "$E_VALIDATION" "$(switch_harness_warning "$name" "$type" "$_sw_to") Not changed — to do it, add --switch-harness (or run: 5dive agent switch $name --to=$_sw_to --account=${v:-default})."
+        fi
         env_dirty=1
         profile_dirty=1
         applied_keys+=("auth-profile")

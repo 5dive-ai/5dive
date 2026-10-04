@@ -284,7 +284,13 @@ Agents:
                                                      # stdin) is the form your shell cannot corrupt.
   5dive agent stats <name>                           # state, restart count, last exit
   5dive agent install <type> [--upgrade] [--detach|--status]  # install the CLI for a type if missing (--upgrade forces a reinstall; --detach runs it as a background job, --status reads that job)
-  5dive agent set-account <agent> <account|default>  # rebind to a named account; "default" clears
+  5dive agent set-account <agent> <account|default> [--switch-harness]  # rebind to a named account; "default" clears.
+                                                     # An account for the OTHER harness (Claude <-> ChatGPT) is refused
+                                                     # unless --switch-harness, which runs 'agent switch' below
+  5dive agent switch <name> --to=claude|codex [--account=<account|default>] [--no-handoff] [--handoff-wait=<s>]
+                                                     # move an agent between Claude Code and Codex IN PLACE: same name,
+                                                     # unix user, bot, tasks and grants; memory + instructions converted,
+                                                     # the old side's files kept so switching back is instant (DIVE-5501)
 
 Default workdir: ${DEFAULT_WORKDIR}
 
@@ -766,6 +772,9 @@ _agent_verb_dispatch() {
           with_registry_lock cmd_rm "$@" ;;
         config)
           AUDIT_CMD="agent config"; AUDIT_ARGS=("$@")
+          if [[ " $* " == *" --switch-harness "* ]]; then
+            agent_account_move_switch config "$@"; return
+          fi
           with_registry_lock cmd_config "$@" ;;
         pair)
           AUDIT_CMD="agent pair"; AUDIT_ARGS=("$@")
@@ -878,6 +887,9 @@ _agent_verb_dispatch() {
         install)
           AUDIT_CMD="agent install"; AUDIT_ARGS=("$@")
           cmd_install "$@" ;;   # no registry mutation; auditable install recipe
+        switch)
+          AUDIT_CMD="agent switch"; AUDIT_ARGS=("$@")
+          cmd_agent_switch "$@" ;;   # takes the registry lock itself, after the handoff wait
         set-account)
           AUDIT_CMD="agent set-account"; AUDIT_ARGS=("$@")
           # DIVE-5367: a standard seat switching ITSELF crosses its own grant.
