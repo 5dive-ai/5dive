@@ -58,7 +58,7 @@ GROUP_OK=1
 _host_companion_group_exists() { (( GROUP_OK )); }
 require_root() { :; }   # the harness is not root
 
-IP=203.0.113.7
+IP=192.0.2.7
 HOSTKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBmGfZcH4cZQ1i0X1s7k0r0Kq2bYy3m0bXvE6Q1c7Zl8"
 KEY=$'-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACAZhn2XB+HGUNYtF9bO5NK9CqtmGMt5tG17xOkNXO2ZfAAAAJgAAAAAAAAA\n-----END OPENSSH PRIVATE KEY-----'
 
@@ -78,7 +78,7 @@ refuses() {   # <desc> <stdin> <args...>
 
 # ---- refusals ---------------------------------------------------------------
 refuses "a hostname is not an IPv4"           "$KEY" set --host=ru.example.com --host-key="$HOSTKEY" --key-stdin
-refuses "an octet over 255"                   "$KEY" set --host=203.0.113.256 --host-key="$HOSTKEY" --key-stdin
+refuses "an octet over 255"                   "$KEY" set --host=192.0.2.256 --host-key="$HOSTKEY" --key-stdin
 refuses "an IPv4 with a trailing option"      "$KEY" set "--host=$IP -oProxyCommand=x" --host-key="$HOSTKEY" --key-stdin
 refuses "a host key with a newline"           "$KEY" set --host=$IP --host-key="$HOSTKEY"$'\n'"evil ssh-ed25519 AAAA" --key-stdin
 refuses "a host key with a shell metachar"    "$KEY" set --host=$IP --host-key='ssh-ed25519 AAAA$(id)' --key-stdin
@@ -123,15 +123,15 @@ grep -q 'socks5h://127.0.0.1:1080' <<<"$md" && grep -q 'ssh ru-box' <<<"$md" && 
 # a second set (a re-run after a rebuilt EU box) keeps ONE block
 reset_calls() { : > "$CALLS"; }
 reset_calls
-printf '%s' "$KEY" | cmd_host_companion set --host=198.51.100.9 --host-key="$HOSTKEY" --key-stdin >/dev/null 2>&1
+printf '%s' "$KEY" | cmd_host_companion set --host=192.0.2.9 --host-key="$HOSTKEY" --key-stdin >/dev/null 2>&1
 n=$(grep -c '^<!-- 5dive-companion:begin' "$FIVE_COMPANION_MD")
 [[ "$n" == 1 ]] && pass "second set: exactly one CLAUDE.md block" || bad "second set: $n blocks"
-grep -qx "  HostName 198.51.100.9" "$FIVE_COMPANION_SSH_CONF" && pass "second set: the new address replaces the old" || bad "second set: address not replaced"
+grep -qx "  HostName 192.0.2.9" "$FIVE_COMPANION_SSH_CONF" && pass "second set: the new address replaces the old" || bad "second set: address not replaced"
 grep -q "keep me" "$FIVE_COMPANION_MD" && pass "second set: CLAUDE.md content kept" || bad "second set: CLAUDE.md content lost"
 
 # status
 st=$( JSON_MODE=1; cmd_host_companion --json 2>/dev/null )
-[[ "$(jq -r '.data.host + " " + .data.proxyState' <<<"$st")" == "198.51.100.9 active" ]] && pass "status: host and proxy state" || bad "status: $st"
+[[ "$(jq -r '.data.host + " " + .data.proxyState' <<<"$st")" == "192.0.2.9 active" ]] && pass "status: host and proxy state" || bad "status: $st"
 
 # ---- remove ---------------------------------------------------------------------
 reset_calls
