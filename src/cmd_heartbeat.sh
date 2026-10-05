@@ -2021,12 +2021,17 @@ _hb_pane_is_usage_limit() {
 #
 # Only the TAIL is read (last 15 non-blank lines): an error that scrolled up
 # and was followed by real work is not the state the seat stopped in. A line
-# matches on a provider-error phrase, or on an HTTP error status NEXT TO an
-# error word, so a status number in ordinary output does not match alone.
+# matches on a provider-error SHAPE only: a provider's own error name or copy, or
+# a line that STARTS with an HTTP error status (after an optional pane gutter
+# and `Error:`) and carries an error word. Bare status phrases are NOT matched:
+# a seat's own tool output ("returned 500 Internal Server Error", curl's
+# `HTTP/1.1 404 Not Found`, "test for 401 unauthorized") sits in the tail of a
+# healthy idle seat all day, and parking it as "model calls failing" would put
+# the wrong cause on the row — the defect this exists to fix.
 _hb_pane_model_error() {
   local pane="$1" line
   line=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 15 \
-    | grep -iE 'API ?Error|AI_APICallError|ProviderError|ProviderModelNotFound|overloaded_error|Something went wrong on our side|Internal Server Error|Service Unavailable|Bad Gateway|(^|[^0-9])(401|403|404|429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|unauthori[sz]ed|forbidden|not found|too many requests|overloaded|timed? ?out)' \
+    | grep -iE 'API ?Error:|AI_APICallError|ProviderError|ProviderModelNotFound|overloaded_error|Something went wrong on our side|^[[:space:]]*(┃|│|✗)?[[:space:]]*(error[[:space:]]*:?[[:space:]]*)?(401|403|404|429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|unauthori[sz]ed|forbidden|not found|too many requests|overloaded|timed? ?out)' \
     | tail -n 1) || return 1
   [[ -n "$line" ]] || return 1
   line=$(sed -E 's/^[[:space:][:punct:]]*//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' <<<"$line")

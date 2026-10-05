@@ -90,6 +90,17 @@ done
 _hb_pane_model_error $'served 500 requests in 3s\n> done, 2 files changed' >/dev/null \
   && bad_t "A3 a bare status number in ordinary output matched" "served 500 requests" \
   || ok_t "A3 a status number with no error word is not a model error"
+# The seat's own TOOL output names HTTP errors all day on a fleet that works on
+# HTTP APIs; a healthy idle seat with one of these in its tail must still
+# requeue, not park under a false "model calls failing" (quinn, DIVE-5624 it1).
+for p in "Fixed: /api/foo returned 500 Internal Server Error, now 200" \
+         "HTTP/1.1 404 Not Found" \
+         "test for 401 unauthorized path added" \
+         "fixed the API error on the login route"; do
+  _hb_pane_model_error $'some work\n'"$p"$'\n> done' >/dev/null \
+    && bad_t "A3 tool output read as a model error" "$p" \
+    || ok_t "A3 tool output is not a model error: ${p:0:40}"
+done
 OLD=$'500 Something went wrong on our side'; for i in $(seq 1 20); do OLD+=$'\n'"working line $i"; done
 _hb_pane_model_error "$OLD" >/dev/null \
   && bad_t "A4 an error 20 lines above the seat's last output matched" "" \
