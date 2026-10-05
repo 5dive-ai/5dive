@@ -62,9 +62,9 @@ addt() { ( cmd_task_add "$@" ) 2>/dev/null | jq -r '.data.id'; }
 row()  { db "SELECT status||'|'||CASE WHEN parked_at IS NULL THEN 'unparked' ELSE 'parked' END||'|'||CASE WHEN wake_at IS NULL THEN 'nowake' ELSE 'wake' END FROM tasks WHERE id=$1;"; }
 reason() { db "SELECT COALESCE(park_reason,'') FROM tasks WHERE id=$1;"; }
 mk_idle_claimed() {
-  local id
-  id=$(addt --assignee=sysadmin -- "check the box")
-  _hb_claim_task sysadmin "$id" >/dev/null 2>&1
+  local id seat="${1:-sysadmin}"
+  id=$(addt --assignee="$seat" -- "check the box")
+  _hb_claim_task "$seat" "$id" >/dev/null 2>&1
   db "UPDATE tasks SET started_at=datetime('now','-40 minutes') WHERE id=${id};"
   printf '%s' "$id"
 }
@@ -156,6 +156,41 @@ for p in "Fixed: /api/foo returned 500 Internal Server Error, now 200" \
     && bad_t "A3 tool output read as a model error" "$p" \
     || ok_t "A3 tool output is not a model error: ${p:0:40}"
 done
+# A claude tool result: only its FIRST line carries ⎿, every later line is plain
+# indent, which looks exactly like opencode's bare lines. The seat type, not the
+# gutter, decides: kind=claude never runs the opencode arm.
+CL_CURL=$'● Bash(curl -si localhost:3001/health)\n  ⎿  HTTP/1.1 500 Internal Server Error\n     Error: 500 Internal Server Error\n● The endpoint still 500s; fixing next.\n> '
+CL_TEST=$'  ⎿  > test\n     API error: 503 Service Unavailable from mock upstream\n● Done.'
+for p in "$CL_CURL" "$CL_TEST"; do
+  _hb_pane_model_error "$p" claude >/dev/null \
+    && bad_t "A3 a claude seat's indented tool-result line read as a model error" "${p:0:60}" \
+    || ok_t "A3 kind=claude: an indented tool-result line is not a model error: ${p:2:22}"
+  _hb_pane_model_error "$p" opencode >/dev/null \
+    && ok_t "A6 kind=opencode: the same bare 'Error: 5xx' line still parks an opencode seat" \
+    || bad_t "A6 kind=opencode lost the bare-line arm" "${p:0:60}"
+done
+for p in "● API Error: Repeated 529 Overloaded errors" "  ⎿  API Error: Request timed out." \
+         "● API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited" \
+         '● API Error: 500 {"type":"error","error":{"type":"api_error"}}'; do
+  _hb_pane_model_error $'x\n'"$p"$'\n> ' claude >/dev/null \
+    && ok_t "A6 kind=claude still parks a claude transient: ${p:0:40}" \
+    || bad_t "A6 kind=claude missed a claude transient" "$p"
+done
+for p in "  ⎿  API Error: Request was aborted." "  ⎿  API error: 500 Internal Server Error"; do
+  _hb_pane_model_error $'x\n'"$p"$'\n> ' claude >/dev/null \
+    && bad_t "A6 kind=claude parked a non-transient or lowercase line" "$p" \
+    || ok_t "A6 kind=claude does not park: ${p:0:40}"
+done
+for p in "500 Something went wrong on our side" "  ┃  500 Something went wrong on our side" \
+         "  ┃  AI_APICallError: Bad Request" "  ┃  Error: 503 Service Unavailable"; do
+  _hb_pane_model_error $'x\n'"$p"$'\n  ctrl+p commands' opencode >/dev/null \
+    && ok_t "A6 kind=opencode parks a provider error: ${p:0:40}" \
+    || bad_t "A6 kind=opencode missed a provider error" "$p"
+done
+_hb_pane_model_error $'x\n● API Error: 529 overloaded\n> ' opencode >/dev/null \
+  && bad_t "A6 kind=opencode ran claude's arm" "● API Error: 529 overloaded" \
+  || ok_t "A6 kind=opencode never runs claude's 'API Error:' arm"
+
 OLD=$'500 Something went wrong on our side'; for i in $(seq 1 20); do OLD+=$'\n'"working line $i"; done
 _hb_pane_model_error "$OLD" >/dev/null \
   && bad_t "A4 an error 20 lines above the seat's last output matched" "" \
@@ -165,6 +200,8 @@ _hb_pane_model_error "" >/dev/null \
   || ok_t "A5 no reading is no evidence: an empty pane is not a model error"
 
 # ── B. rule (b) ──────────────────────────────────────────────────────────────
+# sysadmin is an opencode seat; the park site reads the type from the registry.
+printf '{"agents":{"sysadmin":{"type":"opencode"},"maya":{}}}' >"$REGISTRY"
 PANE="$OC500"
 T1=$(mk_idle_claimed)
 read -r RC1 _ < <(_hb_reclaim sysadmin 30)
@@ -196,6 +233,21 @@ unset -f cmd_task_park; source "$SRC/task/loops.sh" 2>/dev/null || source "$SRC/
 [[ "$(row "$T3")" == "todo|unparked|nowake" ]] && (( ${RC3:-0} == 1 )) \
   && ok_t "B4 a park that does not land falls back to the requeue, never a held claim" \
   || bad_t "B4 a failed park stranded the claim" "row=$(row "$T3") reclaimed=${RC3:-?}"
+
+# A legacy claude seat has NO .type in the registry. The park site must default
+# it to claude, or an empty kind would run the opencode arm on its tool output.
+PANE="$CL_CURL"
+T5=$(mk_idle_claimed maya)
+read -r RC5 _ < <(_hb_reclaim maya 30)
+[[ "$(row "$T5")" == "todo|unparked|nowake" ]] && (( ${RC5:-0} == 1 )) \
+  && ok_t "B5 a claude seat with an EMPTY registry .type skips the opencode arm: its 'Error: 500' tool line requeues, no park" \
+  || bad_t "B5 an untyped claude seat was parked on its own tool output" "row=$(row "$T5") reason=[$(reason "$T5")]"
+PANE=$'x\n● API Error: Repeated 529 Overloaded errors\n> '
+T6=$(mk_idle_claimed maya)
+read -r RC6 _ < <(_hb_reclaim maya 30)
+[[ "$(row "$T6")" == "blocked|parked|wake" && "$(reason "$T6")" == *"API Error: Repeated 529"* ]] \
+  && ok_t "B6 the same untyped claude seat still parks on a real claude transient" \
+  || bad_t "B6 an untyped claude seat missed its own model error" "row=$(row "$T6") reason=[$(reason "$T6")]"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

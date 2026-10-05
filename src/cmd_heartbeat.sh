@@ -2056,15 +2056,20 @@ _HB_CLAUDE_GUTTER='[[:space:]]*(●|⎿)[[:space:]]*'
 _HB_OC_GUTTER='[[:space:]]*(┃|│)?[[:space:]]*'
 _HB_CLAUDE_NOT_TRANSIENT="Request was aborted|400([^0-9]|$)|The model has reached its context window|Claude's response exceeded the [0-9]+ output token|Usage credits required|Could not load .*credentials|.*safeguards flagged|.*can.t help with this|.* could not be processed and was removed|this model does not accept PDF|Effort '[^']*' isn.t available"
 _hb_pane_model_error() {
-  local pane="$1" line tail15
+  local pane="$1" kind="${2:-}" line tail15
   tail15=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 15)
   # Two arms merged back into pane order: the opencode/provider shapes are
   # case-insensitive, claude's arm is case-SENSITIVE — claude only ever prints
   # 'API Error' (Ba in its binary), so a lowercase 'API error:' behind ●/⎿ is a
   # tool result or the seat's own prose, never a model failure. `|| true` on each
   # arm: a no-match grep must not fail the pipe under pipefail.
-  line=$( { grep -niE "^${_HB_OC_GUTTER}(AI_APICallError|ProviderError|ProviderModelNotFound[A-Za-z]*:|API ?Error:[[:space:]]*((401|403|404|408|413|429|5[0-9]{2})([^0-9]|$)|Repeated [0-9]{3}|Request (timed out|rejected)|Connection error|overloaded|rate.?limit|timed? ?out)|((401|403|404|429|5[0-9]{2})[[:space:]]+)?Something went wrong on our side|error[[:space:]]*:[[:space:]]*(429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|too many requests|overloaded|timed? ?out))" <<<"$tail15" || true
-            grep -nE "^${_HB_CLAUDE_GUTTER}API Error: " <<<"$tail15" || true; } \
+  # The arms are chosen by SEAT TYPE ($2), not by gutter: on a claude pane only
+  # the first line of a tool result carries ⎿ and every later line is plain
+  # indent, which looks exactly like opencode's bare lines, so a claude seat
+  # never runs the opencode arm and an opencode seat never runs claude's. An
+  # empty kind (a caller that does not know) runs both.
+  line=$( { [[ "$kind" == claude ]] || grep -niE "^${_HB_OC_GUTTER}(AI_APICallError|ProviderError|ProviderModelNotFound[A-Za-z]*:|API ?Error:[[:space:]]*((401|403|404|408|413|429|5[0-9]{2})([^0-9]|$)|Repeated [0-9]{3}|Request (timed out|rejected)|Connection error|overloaded|rate.?limit|timed? ?out)|((401|403|404|429|5[0-9]{2})[[:space:]]+)?Something went wrong on our side|error[[:space:]]*:[[:space:]]*(429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|too many requests|overloaded|timed? ?out))" <<<"$tail15" || true
+            { [[ -z "$kind" || "$kind" == claude ]] && grep -nE "^${_HB_CLAUDE_GUTTER}API Error: " <<<"$tail15"; } || true; } \
     | sort -t: -k1,1n -u | cut -d: -f2- \
     | grep -viE "^${_HB_GUTTER}API ?Error:[[:space:]]*(${_HB_CLAUDE_NOT_TRANSIENT})" \
     | tail -n 1) || return 1
@@ -4354,8 +4359,11 @@ ${_q_sql}" 2>/dev/null || true)
       # transient outage costs one hour and a persistent one re-parks with a
       # fresh reason each time instead of cycling silently. Placed after the
       # quota hold, so a usage wall keeps its own deadline-keyed park.
-      local _merr
-      if _merr=$(_hb_pane_model_error "$(_hb_pane_capture "$name" 2>/dev/null)"); then
+      # The seat type picks the matcher arm; a legacy claude seat has no .type
+      # in the registry, so it DEFAULTS to claude (an empty kind runs both arms).
+      local _merr _mkind
+      _mkind=$(registry_read 2>/dev/null | jq -r --arg n "$name" '.agents[$n].type // "claude"' 2>/dev/null)
+      if _merr=$(_hb_pane_model_error "$(_hb_pane_capture "$name" 2>/dev/null)" "${_mkind:-claude}"); then
         if ( cmd_task_park "$id" --reason="model calls failing on ${name}: idle ${age_min}m, last turn ended on \"${_merr}\" — auto-retries when the park wakes (DIVE-5624)" --wake=+1h ) >/dev/null 2>&1; then
           _hb_log "[$name] $(_hb_ident "$id") idle ${age_min}m on a model error (${_merr}) — PARKED +1h with the error as its reason, not requeued (DIVE-5624)"
           reclaimed=$((reclaimed + 1)); continue
