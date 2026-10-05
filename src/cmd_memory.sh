@@ -125,7 +125,9 @@ _memory_usage() {
         --max-chars     excerpt cap per transcript (default 20000)
         --distiller     command reading the excerpt on stdin, returning
                         {"atoms":[...]} (default: headless `claude --print
-                        --strict-mcp-config`, i.e. no MCP servers;
+                        --strict-mcp-config`, i.e. no MCP servers, plus
+                        --no-session-persistence when the CLI knows it, so
+                        the run leaves no transcript;
                         env FIVEDIVE_MEMORY_DISTILLER also sets it)
         --dry-run       print the atoms, write nothing, leave the ledger alone
         --force         re-distil a transcript the ledger already records
@@ -1758,6 +1760,16 @@ _memory_consolidate() {
     # 16 seats deaf on Telegram until 02:06Z. Clearing the cache after the fact
     # cannot win against a writer that runs on its own clock; not writing it can.
     distiller="$_cl --print --strict-mcp-config"
+    # LEAVE NO TRANSCRIPT. `claude --print` saves its session like any other, so
+    # every pass left one ~140 KB file under the caller's cwd (`-root/`, 87-180
+    # per seat by 2026-10-05). The prompt-line skip below keeps them out of the
+    # ledger; this keeps them off the disk. Probed, not assumed: a CLI too old to
+    # know the flag refuses the whole command line, and that would fail every
+    # pass on that box, so there the skip alone covers it. Process substitution,
+    # not a pipe, for the same SIGPIPE reason as the skip.
+    if grep -qF -- '--no-session-persistence' < <("$_cl" --help </dev/null 2>/dev/null); then
+      distiller+=" --no-session-persistence"
+    fi
   fi
 
   local considered=0 processed=0 written=0 refused=0 dupes=0 skipped_live=0 skipped_done=0
