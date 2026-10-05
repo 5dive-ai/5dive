@@ -79,7 +79,9 @@ m=$(_hb_pane_model_error "$OC500") \
 for p in "API Error: 529 {\"type\":\"overloaded_error\"}" \
          "AI_APICallError: Service Unavailable" \
          "Error: 429 Too Many Requests" \
-         "ProviderModelNotFoundError: openrouter/vendor/x"; do
+         "ProviderModelNotFoundError: openrouter/vendor/x" \
+         "  ┃  Error: 503 Service Unavailable" \
+         "│ API Error: 500 {\"type\":\"api_error\"}"; do
   _hb_pane_model_error $'some work\n'"$p" >/dev/null \
     && ok_t "A2 provider error reads as a model error: ${p:0:40}" \
     || bad_t "A2 provider error missed" "$p"
@@ -96,7 +98,17 @@ _hb_pane_model_error $'served 500 requests in 3s\n> done, 2 files changed' >/dev
 for p in "Fixed: /api/foo returned 500 Internal Server Error, now 200" \
          "HTTP/1.1 404 Not Found" \
          "test for 401 unauthorized path added" \
-         "fixed the API error on the login route"; do
+         "fixed the API error on the login route" \
+         "404 page not found" \
+         "500 Internal Server Error" \
+         "Root cause of the API error: missing auth header" \
+         '  console.error("API error:", err)' \
+         "│ 500 error rate dropped to zero" \
+         "  throw new ProviderError(\"upstream 500\")" \
+         "if (e instanceof AI_APICallError) retry()" \
+         "the relay said Something went wrong on our side, now fixed" \
+         "503 Service Unavailable" \
+         "- [x] handle 429 too many requests"; do
   _hb_pane_model_error $'some work\n'"$p"$'\n> done' >/dev/null \
     && bad_t "A3 tool output read as a model error" "$p" \
     || ok_t "A3 tool output is not a model error: ${p:0:40}"
