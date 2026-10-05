@@ -34,6 +34,21 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+# DIVE-5632 (quinn, iteration 1): `_merge_landed_probe` now falls back to the seat's
+# owner-scoped read token when the credential-free read does not answer, so every
+# UNKNOWN fixture in this file would otherwise reach the REAL gh-read-tokens.env —
+# through $HOME, or through the getent-passwd arm that ignores $HOME — and ask live
+# GitHub with a real token (quinn's seat read the merge-landed harnesses 35/1 and 33/5,
+# one fixture got a real MERGED record). Neutralise both arms, and refuse to run rather than
+# grade a seat that holds credentials: a silent leak is the failure being prevented.
+mkdir -p "$TMP/bin" "$TMP/home"; export PATH="$TMP/bin:$PATH" HOME="$TMP/home"
+# shellcheck source=tests/lib/isolate_read_tokens.sh
+. tests/lib/isolate_read_tokens.sh
+isolate_read_tokens "$TMP/bin" || exit 1
+[[ "$(read_tokens_stub_control)" == STUBBED && -z "$(read_tokens_isolated_probe)" \
+   && -z "$(_gate_read_tokens_file)" ]] \
+  || { printf 'read-token isolation FAILED (a real tokens file is reachable: %s) — refusing to run\n' \
+         "$(_gate_read_tokens_file)" >&2; exit 1; }
 
 STATE_DIR="$TMP"
 TASKS_DIR="$STATE_DIR/tasks"
