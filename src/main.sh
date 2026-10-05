@@ -555,6 +555,11 @@ Health:
     or an editor). Needs root for the mutating and journal/cron verbs — an admin
     agent reaches them through its existing \`/usr/local/bin/5dive *\` grant.
 
+  5dive machine add <name> <user@host[:port]> | rm <name> | ls
+    Attach any machine you can SSH into (DIVE-5622):
+    agents reach it as \`ssh <name>\`; add prints the
+    box's public key to put on it. Nothing provisioned.
+
   5dive doctor [--fix] [--dry-run] [--caps] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|mod|policy|plugins|caps|models]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
@@ -1325,6 +1330,12 @@ main() {
       # more than the noise it costs.
       AUDIT_CMD="host"; AUDIT_ARGS=("$@")
       cmd_host "$@" ;;
+    machine)
+      # DIVE-5622: attach any machine the user can SSH into; agents reach it as
+      # `ssh <name>`. add/rm write root-owned ssh config, so they require root
+      # (cmd_machine checks); ls is a read. Audited: who attached which machine.
+      AUDIT_CMD="machine"; AUDIT_ARGS=("$@")
+      cmd_machine "$@" ;;
     buzz)
       # DIVE-3592: pairing is per SERVER. Audited (it decides which handset
       # holds the box owner identity) and NOT wrapped in the registry lock —
