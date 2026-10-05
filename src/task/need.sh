@@ -2181,11 +2181,7 @@ cmd_task_need() {
                      [[ -n "$quote" ]] || fail "$E_VALIDATION" "--quote is empty — pass the exact text being approved, or leave the flag off" ;;
       --quote-file=*) _prose_flag_dupe --quote-file "$quote_src"
                       _read_prose_file --quote-file "${1#*=}"
-                      quote="$_PROSE_FILE_VALUE"; quote_src="--quote-file"
-                      # stdin has nothing to re-read at answer time, so only a real
-                      # path is pinned; absolute, because the answer runs elsewhere.
-                      quote_file=""
-                      [[ "${1#*=}" == "-" ]] || quote_file=$(realpath -- "${1#*=}" 2>/dev/null || printf '%s' "${1#*=}") ;;
+                      quote="$_PROSE_FILE_VALUE"; quote_src="--quote-file" ;;
       --tier=*)      tier="${1#*=}" ;;
       --from=*)      from="${1#*=}" ;;
       # DIVE-1401: withdraw a still-pending gate the team ITSELF filed but that is
@@ -4051,6 +4047,26 @@ Measured on this board, the 7 days to 2026-09-12: 35 gates reached the paired hu
     [[ "$(db "SELECT CASE WHEN $(sqlq "$_exp_ts") > datetime('now') THEN 1 ELSE 0 END;")" == "1" ]] \
       || fail "$E_VALIDATION" "--expires-in '$expires_in' resolves to ${_exp_ts}, which is not in the future — a gate filed already-expired could never be answered by anyone."
     expires_sql=$(sqlq "$_exp_ts")
+  fi
+  # DIVE-5572 — PIN A COPY THE GATE OWNS, NOT THE FILER'S DRAFT. DIVE-5465 pinned
+  # --quote-file's own path, and a filer's draft usually lives in its session
+  # scratchpad, which is deleted when the session ends — the normal case for a gate
+  # that waits on a person. lodar's Approve on DIVE-5556 was then refused as
+  # "edited" while the stored text still hashed to the pin. The draft's exact bytes
+  # (the same bytes need_quote_sha hashes) go to a durable path under the task
+  # store and THAT path is pinned; the agent posts from it. Written before the gate
+  # so a copy that cannot be kept refuses the filing instead of pinning a path that
+  # is about to vanish. Stdin is pinned too: the copy is the thing re-read.
+  if [[ "$quote_src" == "--quote-file" ]]; then
+    local _qdir="${TASKS_DIR}/gate-quotes" _qtmp=""
+    quote_file="${_qdir}/${ident//[^A-Za-z0-9._-]/_}.md"
+    [[ -d "$_qdir" ]] || mkdir -m 2770 "$_qdir" 2>/dev/null || true
+    _qtmp=$(mktemp "${_qdir}/.quote.XXXXXX" 2>/dev/null) \
+      && printf '%s' "$quote" >"$_qtmp" && chmod 0640 "$_qtmp" \
+      && mv -f "$_qtmp" "$quote_file" \
+      || { [[ -n "$_qtmp" ]] && rm -f "$_qtmp"
+           fail "$E_GENERIC" "$ident: could not keep a copy of the --quote-file draft at ${quote_file}, so no gate was filed (an approval pinned to a draft that can disappear becomes unanswerable). Check that ${_qdir} is writable and re-run."; }
+    printf '==> %s: the quoted draft is pinned at %s — post from that copy; editing it makes an approve refused.\n' "$ident" "$quote_file" >&2
   fi
 db "BEGIN IMMEDIATE;
       $(_gate_archive_and_clear_sql file "id=${id}")
