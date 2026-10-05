@@ -144,7 +144,10 @@ for p in "Fixed: /api/foo returned 500 Internal Server Error, now 200" \
          "● API Error: An image in the conversation could not be processed and was removed. Re-attach the file if you still need it." \
          "● API Error: Claude's response exceeded the 32000 output token maximum." \
          "● API Error: this model does not accept PDF documents, so a PDF was removed." \
-         "● API Error: Effort 'max' isn't available with thinking turned off"; do
+         "● API Error: Effort 'max' isn't available with thinking turned off" \
+         "  ⎿  API error: ECONNREFUSED 127.0.0.1:3001" \
+         "  ⎿  api error: invalid token" \
+         "● API error: the /login route returns 500 when the token is missing"; do
   _hb_pane_model_error $'some work\n'"$p"$'\n> done' >/dev/null \
     && bad_t "A3 tool output read as a model error" "$p" \
     || ok_t "A3 tool output is not a model error: ${p:0:40}"
