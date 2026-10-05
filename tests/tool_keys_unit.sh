@@ -203,9 +203,9 @@ out=$(printf 'v\n' | run set github --env=OTHER_TOKEN); rc=$?
 [[ "$(cat "$F")" == "$before" ]] && ok_t "T12 no refused set touched the key file" || bad_t "T12 file changed on refusal" "$(cat "$F")"
 out=$(printf 'ghp_THIRD123456789\n' | run set github --env=GH_TOKEN); rc=$?
 [[ $rc -eq 0 && "$(seen GH_TOKEN)" == ghp_THIRD123456789 ]] && ok_t "T12 --env naming a catalog id's own variable is accepted" || bad_t "T12 catalog same --env" "rc=$rc $out"
-out=$(run rm acme-cal --env="ACME_LOGIN ACME_CALDAV_PASSWORD"); rc=$?
+out=$(run rm acme-cal --env=ACME_LOGIN,ACME_CALDAV_PASSWORD); rc=$?
 [[ $rc -eq 0 && -z "$(seen ACME_LOGIN)" && -z "$(seen ACME_CALDAV_PASSWORD)" && "$(seen ACME_STOCK_TOKEN)" == stockFAKEtoken ]] \
-  && ok_t "T12 rm acme-cal --env drops both lines, acme-stock kept" || bad_t "T12 custom rm" "rc=$rc $(cat "$F")"
+  && ok_t "T12 rm acme-cal --env=A,B (commas) drops both lines, acme-stock kept" || bad_t "T12 custom rm" "rc=$rc $(cat "$F")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

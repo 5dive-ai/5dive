@@ -60,7 +60,7 @@ TOOL_IDS=(github vercel stripe cloudflare meta elevenlabs fal higgsfield
 
 # Any other app (DIVE-5627): the CALLER names its variables, so a partner keeps
 # its own app list in its own code and this catalog stays the shared one.
-#   tool set <id> --env="A_TOKEN B_LOGIN"   tool rm <id> --env="A_TOKEN B_LOGIN"
+#   tool set <id> --env="A_TOKEN B_LOGIN"   tool rm <id> --env=A_TOKEN,B_LOGIN
 #   tool ls --tool=<id>:A_TOKEN,B_LOGIN     (repeatable; listed after the catalog)
 # Nothing but the keys themselves is stored. A variable must be a credential name
 # or end in _LOGIN, _USER or _DOMAIN, under the same reserved prefixes as a
@@ -115,7 +115,8 @@ cmd_tool() {
   for a in "$@"; do
     case "$a" in
       --json) JSON_MODE=1 ;;
-      --env=*) _TOOL_ENV_ARG="${a#--env=}"; _TOOL_ENV_GIVEN=1 ;;
+      # Commas or spaces: a remote caller sends one argv word with no space in it.
+      --env=*) _TOOL_ENV_ARG="${a#--env=}"; _TOOL_ENV_ARG="${_TOOL_ENV_ARG//,/ }"; _TOOL_ENV_GIVEN=1 ;;
       --tool=*) _TOOL_LS_EXTRA+=("${a#--tool=}") ;;
       *) rest+=("$a") ;;
     esac
