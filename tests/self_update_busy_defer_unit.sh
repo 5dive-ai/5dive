@@ -125,6 +125,76 @@ else
   bad_t "an absent marker did not fail" "the sweep would process agents that owe nothing"
 fi
 
+# ------------------------------------------- DIVE-5547: a re-mark keeps its age
+# The nightly update re-marks every busy seat, including one that already owes a
+# restart. The shipped mark re-stamped `marked_at=now` each time, so `now - marked`
+# never reached the 24h ceiling: a seat owed its restart for 5 days while every
+# sweep logged "0 overdue". `rmk <unit-start-epoch|''> <name> <reason>` re-marks
+# with `systemctl show` stubbed to that start ('' = unreadable).
+rmk() { local _st="$1"; shift; ( eval "$block"
+  systemctl() { [[ "${1:-}" == show ]] && { [[ -n "$_st" ]] && printf '@%s\n' "$_st" || printf '\n'; }; return 0; }
+  _pending_restart_mark "$@" ); }
+DAY=$((24*3600)); T0=$(( $(date +%s) - 5*DAY ))       # first mark: 5 days ago
+UP=$(( T0 - DAY ))                                       # unit up since before it
+rm -rf "$PENDING_RESTART_DIR"; mkdir -p "$PENDING_RESTART_DIR"
+printf 'marked_at=%s\nreason=nightly box update\n' "$T0" > "$PENDING_RESTART_DIR/seata"
+rmk "$UP" seata "nightly box update" >/dev/null
+_kept="$(at seata)"
+if [[ "$_kept" == "$T0" ]]; then
+  ok_t "DIVE-5547: a re-mark on a unit not restarted since keeps the FIRST stamp (the debt keeps its age)"
+else
+  bad_t "a re-mark re-stamped an owed restart" "marked_at went $T0 -> $_kept — the 24h line can never fire"
+fi
+_v="$(rd "$_kept" "$UP" busy "$(date +%s)" "$DAY")"
+if [[ "$_v" == overdue ]]; then
+  ok_t "DIVE-5547: that re-marked seat decides OVERDUE once 24h have passed since the first mark"
+else
+  bad_t "a 5-day-owed restart did not read overdue after a re-mark" "verdict '$_v' — the report's '0 overdue' for 5 days"
+fi
+# RED CONTROL: the pre-fix mark (always `now`) on the same state decides `defer`.
+# (Replaced by `:`, not deleted: an empty then-body is a syntax error, the eval
+# would define nothing and the marker would be left untouched — a vacuous pass.)
+mut_mark="$(printf '%s\n' "$block" | sed 's/^    at="\$old"$/    :/')"
+if [[ "$mut_mark" != "$block" ]]; then
+  ok_t "MUTANT: the keep-the-stamp line is removable from the shipped block, so the strike-out below is real"
+else
+  bad_t "the keep-the-stamp mutation is a no-op" "the arm below would pass vacuously"
+fi
+printf 'marked_at=%s\nreason=nightly box update\n' "$T0" > "$PENDING_RESTART_DIR/seata"
+( eval "$mut_mark"; systemctl() { [[ "${1:-}" == show ]] && printf '@%s\n' "$UP"; return 0; }
+  _pending_restart_mark seata "nightly box update" ) >/dev/null
+_mv="$(rd "$(at seata)" "$UP" busy "$(date +%s)" "$DAY")"
+if [[ "$_mv" == defer ]]; then
+  ok_t "MUTANT: without it the re-mark resets the stamp and the seat reads 'defer' — the shipped defect, live"
+else
+  bad_t "mutant must reproduce the defect" "got '$_mv' — the arms above are vacuous"
+fi
+# A marker OLDER than the unit's last start is a paid debt: a payload update that
+# arrives after the restart must get a fresh stamp, or it would read overdue (or
+# already-bounced) on its first sweep.
+printf 'marked_at=%s\nreason=old\n' "$T0" > "$PENDING_RESTART_DIR/seatb"
+rmk "$(( T0 + DAY ))" seatb "payload changed" >/dev/null
+_fresh="$(at seatb)"
+if (( _fresh > T0 + DAY )); then
+  ok_t "DIVE-5547: a marker older than the unit's last start gets a FRESH stamp (a new debt, not the paid one)"
+else
+  bad_t "a paid marker's stamp was kept" "marked_at=$_fresh, unit started $(( T0 + DAY )) — the new update would read already-bounced"
+fi
+# Unreadable unit start reads 0 = no evidence of a restart => the debt is still owed.
+printf 'marked_at=%s\nreason=x\n' "$T0" > "$PENDING_RESTART_DIR/seatc"
+rmk '' seatc "payload changed" >/dev/null
+if [[ "$(at seatc)" == "$T0" ]]; then
+  ok_t "DIVE-5547: an unreadable unit start keeps the old stamp (no evidence of a restart)"
+else
+  bad_t "an unreadable unit start reset the stamp" "marked_at=$(at seatc)"
+fi
+# The reason still updates — only the age is kept.
+if [[ "$( ( eval "$block"; _pending_restart_reason seatc ) )" == "payload changed" ]]; then
+  ok_t "DIVE-5547: a re-mark still records the newest reason"
+else
+  bad_t "the re-mark dropped the new reason" "reason=$( ( eval "$block"; _pending_restart_reason seatc ) )"
+fi
+
 # ------------------------------------------------------------ busy-state arms
 # `db`/`sqlq` absent => unknown. This is the shape the block runs in when it is
 # reached from a context that never initialised the task store.
@@ -285,6 +355,16 @@ if [[ "$out" == "fired=0 deferred=1 cleared=0" ]] && [[ ! -s "$RESTARTS" ]] \
   ok_t "POSITIVE CONTROL 1/3: an agent parked mid-task is NOT restarted, and keeps its marker"
 else
   bad_t "a busy agent was restarted by the sweep" "sweep said '$out', restarts: $(tr '\n' ' ' < "$RESTARTS")"
+fi
+
+# DIVE-5547: a plain deferral names the seat. The pass summary only counts, so
+# before this a seat deferred for days was never named in the log at all.
+_dlog="$( ( eval "$block"; systemctl() { case "${1:-}" in is-active) return 0;; show) printf '\n';; esac; return 0; }
+  db(){ echo 1; }; sqlq(){ printf '%s' "$1"; }; _pending_restart_sweep ) 2>&1 >/dev/null )"
+if grep -q '\[carol\] restart deferred (busy) — owed 0h, overdue line at 24h (payload changed)' <<<"$_dlog"; then
+  ok_t "DIVE-5547: a plain deferral logs the seat's name, how long it is owed and its reason"
+else
+  bad_t "a plain deferral did not name the seat" "log: $_dlog"
 fi
 
 out="$(sweep_with 0 0 yes)"
