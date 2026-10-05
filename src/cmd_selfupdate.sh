@@ -335,6 +335,17 @@ _agent_busy_state() {
   if [[ "$n" =~ ^[0-9]+$ ]]; then
     if (( n > 0 )); then printf 'busy\n'; return 0; fi
     # Board idle. The session may still be mid-turn with nothing claimed.
+    # DIVE-5608: a dispatcher seat (codex with telegram/dashboard) answers for
+    # itself. It has no Claude session and its pane is a log stream, so the two
+    # probes below read it busy FOREVER and a bridge update never ran. Only a
+    # definite reading is taken; none falls through to the probes, which defer.
+    local disp=""
+    if declare -F _agent_dispatcher_turn_state >/dev/null 2>&1 \
+       && disp=$(_agent_dispatcher_turn_state "$name" 2>/dev/null); then
+      case "$disp" in
+        idle|busy) printf '%s\n' "$disp"; return 0 ;;
+      esac
+    fi
     local native="" nrc=1
     if declare -F _hb_agent_native_state >/dev/null 2>&1; then
       native=$(_hb_agent_native_state "$name" 2>/dev/null) && nrc=0 || nrc=$?
