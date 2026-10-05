@@ -147,7 +147,11 @@ for p in "Fixed: /api/foo returned 500 Internal Server Error, now 200" \
          "● API Error: Effort 'max' isn't available with thinking turned off" \
          "  ⎿  API error: ECONNREFUSED 127.0.0.1:3001" \
          "  ⎿  api error: invalid token" \
-         "● API error: the /login route returns 500 when the token is missing"; do
+         "● API error: the /login route returns 500 when the token is missing" \
+         "  ⎿  API error: 500 Internal Server Error" \
+         "  ⎿  api error: 503 from upstream" \
+         "● API error: 429 handling now retries with backoff" \
+         "  ⎿  Error: 500 Internal Server Error"; do
   _hb_pane_model_error $'some work\n'"$p"$'\n> done' >/dev/null \
     && bad_t "A3 tool output read as a model error" "$p" \
     || ok_t "A3 tool output is not a model error: ${p:0:40}"

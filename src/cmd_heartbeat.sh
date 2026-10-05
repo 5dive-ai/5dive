@@ -2048,9 +2048,12 @@ _hb_pane_is_usage_limit() {
 # output-token limits, `Usage credits required`, `Could not load … credentials`,
 # a safeguards flag or refusal, a removed attachment, an unsupported PDF or
 # effort setting. Those need a person or a new session, not a retry.
-# The opencode arm (┃/│ and a bare line) keeps the status/word list above.
+# The opencode arm (┃/│ and a bare line, never ●/⎿) keeps the status/word list above.
 _HB_GUTTER='[[:space:]]*(┃|│|●|⎿)?[[:space:]]*'
 _HB_CLAUDE_GUTTER='[[:space:]]*(●|⎿)[[:space:]]*'
+# The case-insensitive opencode arm sits behind opencode's own gutter only: on a
+# claude pane, ●/⎿ 'API error: 500 …' or 'Error: 500 …' is a tool result or prose.
+_HB_OC_GUTTER='[[:space:]]*(┃|│)?[[:space:]]*'
 _HB_CLAUDE_NOT_TRANSIENT="Request was aborted|400([^0-9]|$)|The model has reached its context window|Claude's response exceeded the [0-9]+ output token|Usage credits required|Could not load .*credentials|.*safeguards flagged|.*can.t help with this|.* could not be processed and was removed|this model does not accept PDF|Effort '[^']*' isn.t available"
 _hb_pane_model_error() {
   local pane="$1" line tail15
@@ -2060,7 +2063,7 @@ _hb_pane_model_error() {
   # 'API Error' (Ba in its binary), so a lowercase 'API error:' behind ●/⎿ is a
   # tool result or the seat's own prose, never a model failure. `|| true` on each
   # arm: a no-match grep must not fail the pipe under pipefail.
-  line=$( { grep -niE "^${_HB_GUTTER}(AI_APICallError|ProviderError|ProviderModelNotFound[A-Za-z]*:|API ?Error:[[:space:]]*((401|403|404|408|413|429|5[0-9]{2})([^0-9]|$)|Repeated [0-9]{3}|Request (timed out|rejected)|Connection error|overloaded|rate.?limit|timed? ?out)|((401|403|404|429|5[0-9]{2})[[:space:]]+)?Something went wrong on our side|error[[:space:]]*:[[:space:]]*(429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|too many requests|overloaded|timed? ?out))" <<<"$tail15" || true
+  line=$( { grep -niE "^${_HB_OC_GUTTER}(AI_APICallError|ProviderError|ProviderModelNotFound[A-Za-z]*:|API ?Error:[[:space:]]*((401|403|404|408|413|429|5[0-9]{2})([^0-9]|$)|Repeated [0-9]{3}|Request (timed out|rejected)|Connection error|overloaded|rate.?limit|timed? ?out)|((401|403|404|429|5[0-9]{2})[[:space:]]+)?Something went wrong on our side|error[[:space:]]*:[[:space:]]*(429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|too many requests|overloaded|timed? ?out))" <<<"$tail15" || true
             grep -nE "^${_HB_CLAUDE_GUTTER}API Error: " <<<"$tail15" || true; } \
     | sort -t: -k1,1n -u | cut -d: -f2- \
     | grep -viE "^${_HB_GUTTER}API ?Error:[[:space:]]*(${_HB_CLAUDE_NOT_TRANSIENT})" \
