@@ -3382,6 +3382,18 @@ cmd_create() {
     # than falling through to an unrelated last-used/default model. DIVE-1206.
     opencode_apply_model_default "$name" "$byo_provider" "$byo_model" "$byo_api_key"
   fi
+  # DIVE-5620: a non-BYO opencode seat bound to an OpenRouter alias-mapping
+  # account gets the account's model here, so every create path pins it, not only
+  # pack import (DIVE-5514). The partner sysadmin install is `agent create
+  # --type=opencode --auth-profile=<seeded>` and never pinned. An import re-pins
+  # afterwards to the pack's family; "" (any other account) writes nothing.
+  if [[ "$type" == "opencode" && -z "$byo_provider" && -n "$profile" ]]; then
+    local _oc_acct_model; _oc_acct_model=$(opencode_profile_model "$profile" "$byo_model")
+    if [[ -n "$_oc_acct_model" ]]; then
+      opencode_apply_model_default "$name" openrouter "$_oc_acct_model" \
+        || warn "could not pin '$name' to ${_oc_acct_model}, so it runs on OpenCode's default model"
+    fi
+  fi
 
   # DIVE-3966: give every new codex agent the managed operating baseline,
   # including the DIVE-1410 return channel. Marker-delimited reconciliation
