@@ -4219,19 +4219,36 @@ _merge_landed_probe() {
           --json state,mergedAt,mergeCommit \
           -q '[ (.state // "null"), (.mergeCommit.oid // "null"), (.mergedAt // "null") ] | join("|")' \
           2>/dev/null) || out=""
+  # DIVE-5632: the credential-free rails could not answer (a private repo on a
+  # seat with no bot rail), so ask the read-only token this seat already holds for
+  # the repo's OWNER — the arm `merge-gate-selftest` reaches through `_gate_gh`'s
+  # blind-token escalation, which an empty token never enters. Only an unanswered
+  # read gets here, so a read that answers today spends nothing extra.
+  if ! _merge_landed_record_ok "$out"; then
+    out=$(_gate_gh_owner_read 10 pr view "$ref" "${repo_arg[@]}" \
+            --json state,mergedAt,mergeCommit \
+            -q '[ (.state // "null"), (.mergeCommit.oid // "null"), (.mergedAt // "null") ] | join("|")' \
+            2>/dev/null) || out=""
+  fi
   # THREE fields or it is not an answer. A short record is a rail that returned
   # something other than what was asked for, and reading field 1 out of it as a
   # state would invent a verdict — the failure direction that matters here, since
   # UNKNOWN changes nothing and OPEN also changes nothing, but MERGED WRITES.
+  _merge_landed_record_ok "$out" || { printf 'UNKNOWN\x1f\n'; return 0; }
   st="${out%%|*}"; rest="${out#*|}"
   sha="${rest%%|*}"; at="${rest#*|}"
-  [[ -n "$out" && "$rest" != "$out" && "$at" != "$rest" ]] \
-    || { printf 'UNKNOWN\x1f\n'; return 0; }
   if [[ -n "$at" && "$at" != "null" ]]; then
     printf 'MERGED\x1f%s\x1f%s\n' "$sha" "$at"
     return 0
   fi
   printf 'OPEN\x1f%s\n' "${st:-unknown}"
+}
+
+# _merge_landed_record_ok <out> — 0 when <out> is a THREE-field `a|b|c` record.
+_merge_landed_record_ok() {
+  local out="${1:-}" rest
+  rest="${out#*|}"
+  [[ -n "$out" && "$rest" != "$out" && "${rest#*|}" != "$rest" ]]
 }
 
 # _merge_do_already_landed <pr-ref> — 0 when the pull request has ALREADY merged
