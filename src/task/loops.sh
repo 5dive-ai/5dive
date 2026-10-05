@@ -231,6 +231,8 @@ _task_cascade_unblock() {
     [[ -n "$who" ]] && ( cmd_send "$who" --from="task-engine" \
         --message="▶️ Unblocked: ${dident} — all its blockers are done. It's on your queue now: ${dtitle}" ) >/dev/null 2>&1 || true
   done < <(db "SELECT task_id FROM task_deps WHERE blocked_by=${closed_id};")
+  # DIVE-5564: a finished loop run asks for its score (no-op for every other row).
+  _loop_score_request "$closed_id" || true
   return 0
 }
 
@@ -427,14 +429,345 @@ cmd_task_loop_ls() {
   fi
 }
 
+# ───────────────── DIVE-5564 loop scores + weekly suggestion ─────────────────
+# lodar 2026-10-05, "keep it simple": a LOOP is a scheduled task (a kind='recurring'
+# template — DIVE-5563 made the dashboard list every scheduled task as a loop,
+# whether a loop pack, a 5dive.yaml or a person made it). Each finished run (an
+# instance stamped with from_template_id) gets a 0-100 score — from the team's
+# grader if there is one, else from the agent that ran it. The owner's thumbs
+# up/down on a run beats the score (up = 100, down = 0). Once a week the
+# lowest-scoring loop gets ONE suggested change to its instructions (the
+# template body, which every future run copies); the owner applies or dismisses
+# it, or a per-loop switch (off by default) applies it unasked. Revert puts the
+# body from before the last applied change back.
+#
+# No schema change: everything lives in task_prefs under a loop.* namespace —
+#   loop.score.<run ident>          {"score":N,"by":"<agent>","note":"…","at":"…"}
+#   loop.vote.<run ident>           up | down
+#   loop.auto.<template ident>      on   (absent = off)
+#   loop.suggest.<template ident>   {"status":"pending|applied|dismissed|reverted",
+#                                    "body","prev","reason","by","at","applied_at"}
+#   loop.review.last                when the weekly review last filed a suggestion ask
+# The weekly review has no timer of its own: every score and vote asks "is one
+# due?" — a loop that is not running has nothing new to suggest from anyway.
+# Dashboard: Tasks > Loops reads `task loop scores` and taps rate/apply/dismiss/
+# revert/auto over the exec tunnel (the api already allows any `task loop` verb).
+
+_LOOP_TPL_PRED="kind='recurring'"
+_LOOP_RUNS_SCORED=5      # a loop's score = mean over its last N finished runs
+_LOOP_REVIEW_DAYS=7
+_LOOP_REVIEW_BELOW=80    # a loop at or above this (the green band) needs no fix
+
+_loop_pref_get() { db "SELECT value FROM task_prefs WHERE key=$(sqlq "$1");" 2>/dev/null; }
+_loop_pref_set() {
+  db "INSERT INTO task_prefs(key,value,updated_at) VALUES ($(sqlq "$1"),$(sqlq "$2"),datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;"
+}
+_loop_pref_del() { db "DELETE FROM task_prefs WHERE key=$(sqlq "$1");"; }
+
+# Who scores a run: the team's grader, else a verifier, else the runner itself.
+_loop_scorer() {
+  local runner="$1" g
+  g=$(_org_role_holders grader 2>/dev/null | head -1)
+  [[ -n "$g" ]] || g=$(_org_role_holders verifier 2>/dev/null | head -1)
+  printf '%s' "${g:-$runner}"
+}
+
+# <ref> -> sets _LOOP_TID / _LOOP_TIDENT for a loop TEMPLATE, or fails. Sets
+# globals rather than printing so a refusal is not swallowed by a $( ) subshell.
+_loop_tpl_resolve() {
+  local ref="$1"
+  [[ -n "$ref" ]] || fail "$E_USAGE" "name the loop (its scheduled task, e.g. DIVE-12)"
+  resolve_task_id "$ref"
+  _LOOP_TIDENT=$(db "SELECT ident FROM tasks WHERE id=${RESOLVED_TASK_ID} AND ${_LOOP_TPL_PRED};")
+  [[ -n "$_LOOP_TIDENT" ]] || fail "$E_VALIDATION" "$ref is not a loop (a scheduled task)"
+  _LOOP_TID="$RESOLVED_TASK_ID"
+}
+
+# Called from _task_cascade_unblock on EVERY close; acts only when a run of a
+# loop just went done and nobody has scored it or been asked to. Best-effort.
+_loop_score_request() {
+  local id="$1" row rident runner tident ttitle scorer
+  row=$(db "SELECT t.ident||x'1f'||COALESCE(t.assignee,'')||x'1f'||p.ident||x'1f'||COALESCE(p.title,'')
+            FROM tasks t JOIN tasks p ON p.id=t.from_template_id
+            WHERE t.id=${id} AND t.status='done' AND p.${_LOOP_TPL_PRED//body/p.body};" 2>/dev/null)
+  [[ -n "$row" ]] || return 0
+  IFS=$'\x1f' read -r rident runner tident ttitle <<<"$row"
+  [[ -z "$(_loop_pref_get "loop.score.${rident}")" ]] || return 0
+  [[ "$(db "SELECT COUNT(*) FROM tasks WHERE title=$(sqlq "Score loop run ${rident}");")" == "0" ]] || return 0
+  scorer=$(_loop_scorer "$runner")
+  [[ -n "$scorer" ]] || return 0
+  ( JSON_MODE=1 cmd_task_add "Score loop run ${rident}" --materialized --review=none --fresh --from=loop \
+      --assignee="$scorer" --priority=medium \
+      --body="Loop ${tident} (\"${ttitle}\") just finished run ${rident}. Score it 0-100: did the run do the loop's job well?
+
+1. Read the run: 5dive task show ${rident}
+2. Record the score: 5dive task loop score ${rident} --score=<0-100> --note=\"<one line why>\"
+3. Close this row with task done." ) >/dev/null 2>&1 || true
+  return 0
+}
+
+# `task loop score <run> --score=<0-100> [--note=]`
+cmd_task_loop_score() {
+  tasks_db_init
+  local ref="" score="" note="" from=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --score=*) score="${1#*=}" ;;
+      --note=*)  note="${1#*=}" ;;
+      --from=*)  from="${1#*=}" ;;
+      -*)        fail "$E_USAGE" "unknown flag: $1" ;;
+      *)         [[ -z "$ref" ]] && ref="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive task loop score <run> --score=<0-100> [--note=\"…\"]"
+  [[ "$score" =~ ^[0-9]{1,3}$ ]] && (( 10#$score <= 100 )) || fail "$E_VALIDATION" "--score must be a whole number 0-100"
+  resolve_task_id "$ref"
+  local rident
+  rident=$(db "SELECT t.ident FROM tasks t JOIN tasks p ON p.id=t.from_template_id
+               WHERE t.id=${RESOLVED_TASK_ID} AND p.${_LOOP_TPL_PRED//body/p.body};")
+  [[ -n "$rident" ]] || fail "$E_VALIDATION" "$ref is not a run of a loop"
+  local by; by=$(task_actor "$from")
+  _loop_pref_set "loop.score.${rident}" "$(jq -cn --argjson s "$((10#$score))" --arg b "$by" --arg n "$note" \
+      '{score:$s, by:$b, note:$n, at:(now|todate)}')"
+  ( cmd_task_loop_review ) >/dev/null 2>&1 || true
+  ok "scored ${rident}: ${score}/100" '{run:$r, score:($s|tonumber), by:$b}' \
+     --arg r "$rident" --arg s "$((10#$score))" --arg b "$by"
+}
+
+# `task loop rate <run> up|down|clear` — the owner's thumbs; beats the score.
+cmd_task_loop_rate() {
+  tasks_db_init
+  local ref="${1:-}" vote="${2:-}"
+  [[ -n "$ref" && "$vote" =~ ^(up|down|clear)$ ]] || fail "$E_USAGE" "usage: 5dive task loop rate <run> up|down|clear"
+  resolve_task_id "$ref"
+  local rident
+  rident=$(db "SELECT t.ident FROM tasks t JOIN tasks p ON p.id=t.from_template_id
+               WHERE t.id=${RESOLVED_TASK_ID} AND p.${_LOOP_TPL_PRED//body/p.body};")
+  [[ -n "$rident" ]] || fail "$E_VALIDATION" "$ref is not a run of a loop"
+  if [[ "$vote" == "clear" ]]; then _loop_pref_del "loop.vote.${rident}"; else _loop_pref_set "loop.vote.${rident}" "$vote"; fi
+  ( cmd_task_loop_review ) >/dev/null 2>&1 || true
+  ok "rated ${rident}: ${vote}" '{run:$r, vote:$v}' --arg r "$rident" --arg v "$vote"
+}
+
+# The board as one JSON array: each loop with its last runs, score, switch and
+# suggestion. score = mean of the runs' effective scores (vote up=100, down=0,
+# else the agent's score); null until a run is scored or rated.
+_loop_board_json() {
+  local rows
+  rows=$(db "SELECT json_group_array(json_object(
+          'ident', p.ident, 'title', p.title, 'assignee', p.assignee, 'schedule', p.schedule,
+          'instructions', p.body,
+          'auto', (SELECT value='on' FROM task_prefs WHERE key='loop.auto.'||p.ident),
+          'suggestion', (SELECT json(value) FROM task_prefs WHERE key='loop.suggest.'||p.ident AND json_valid(value)),
+          'runs', (SELECT json_group_array(json_object('ident', r.ident, 'done_at', r.done_at,
+                     'score', (SELECT json(value) FROM task_prefs WHERE key='loop.score.'||r.ident AND json_valid(value)),
+                     'vote', (SELECT value FROM task_prefs WHERE key='loop.vote.'||r.ident)))
+                   FROM (SELECT ident, done_at FROM tasks WHERE from_template_id=p.id AND status='done'
+                         ORDER BY id DESC LIMIT ${_LOOP_RUNS_SCORED}) r)))
+         FROM (SELECT * FROM tasks WHERE ${_LOOP_TPL_PRED} AND status <> 'cancelled' ORDER BY id) p;")
+  [[ -n "$rows" ]] || rows="[]"
+  jq -c 'map(.auto = (.auto == 1)
+         | .runs = (.runs | map(.effective = (if .vote == "up" then 100 elif .vote == "down" then 0
+                                              else (.score.score // null) end)))
+         | .score = ([.runs[].effective | select(. != null)] | if length == 0 then null
+                                                              else (add / length | round) end))' <<<"$rows"
+}
+
+# `task loop scores` — the loops board.
+cmd_task_loop_scores() {
+  tasks_db_init
+  local board; board=$(_loop_board_json)
+  if (( JSON_MODE )); then
+    jq -c '{ok:true, data:{loops:.}}' <<<"$board"
+  else
+    jq -r 'if length == 0 then "no loops (a loop is a scheduled task: add one with --recurring=<cron>)" else
+      .[] | "\(.ident)  \(if .score == null then "unscored" else "\(.score)/100" end)  \(.title)  [\(.assignee // "-")]"
+        + (if .auto then "  self-improve:on" else "" end)
+        + (if .suggestion.status == "pending" then "  suggestion: pending" else "" end) end' <<<"$board"
+  fi
+}
+
+# `task loop review [--force]` — the weekly pass: ask for one change to the
+# lowest-scoring loop, if it scores under 80. Not due (under 7 days since the
+# last ask) is a no-op unless --force.
+cmd_task_loop_review() {
+  tasks_db_init
+  local force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1 ;;
+      *)       fail "$E_USAGE" "usage: 5dive task loop review [--force]" ;;
+    esac
+    shift
+  done
+  local last; last=$(_loop_pref_get loop.review.last)
+  if (( ! force )) && [[ -n "$last" ]] \
+     && [[ "$(db "SELECT julianday('now') - julianday($(sqlq "$last")) < ${_LOOP_REVIEW_DAYS};")" == "1" ]]; then
+    ok "weekly loop review not due (last: ${last})" '{filed:false, reason:"not due", last:$l}' --arg l "$last"
+    return 0
+  fi
+  local pick
+  pick=$(_loop_board_json | jq -c --argjson below "$_LOOP_REVIEW_BELOW" \
+    '[.[] | select(.score != null and .score < $below and .suggestion.status != "pending")]
+     | sort_by(.score) | .[0] // empty')
+  if [[ -z "$pick" ]]; then
+    ok "no loop scores under ${_LOOP_REVIEW_BELOW}, nothing to suggest" '{filed:false, reason:"no loop needs a fix"}'
+    return 0
+  fi
+  local tident ttitle tscore owner title runs
+  tident=$(jq -r .ident <<<"$pick"); ttitle=$(jq -r '.title // ""' <<<"$pick")
+  tscore=$(jq -r .score <<<"$pick"); owner=$(jq -r '.assignee // ""' <<<"$pick")
+  title="Suggest a change to loop ${tident}"
+  if [[ "$(db "SELECT COUNT(*) FROM tasks WHERE title=$(sqlq "$title") AND status NOT IN ('done','cancelled');")" != "0" ]]; then
+    ok "a suggestion for ${tident} is already being written" '{filed:false, reason:"already asked", loop:$t}' --arg t "$tident"
+    return 0
+  fi
+  runs=$(jq -r '.runs[] | "- \(.ident): \(.effective // "unscored")\(if .vote then " (owner: \(.vote))" else "" end)\(if (.score.note // "") != "" then " — \(.score.note)" else "" end)"' <<<"$pick")
+  local out ident
+  out=$(JSON_MODE=1 cmd_task_add "$title" --materialized --review=none --fresh --from=loop \
+      --assignee="$(_loop_scorer "$owner")" --priority=medium \
+      --body="Loop ${tident} (\"${ttitle}\") scores ${tscore}/100, the lowest of the loops this week. Suggest ONE change to its instructions that would raise the score.
+
+Recent runs:
+${runs}
+
+1. Read the current instructions (the body): 5dive task show ${tident}
+2. Write the full new instructions to a file, then record them:
+   5dive task loop suggest ${tident} --body-file=<path> --reason=\"<one line: what changes and why>\"
+3. Close this row with task done. The owner taps Apply or Dismiss on the dashboard (or it applies itself if the loop's self-improvement switch is on)." 2>/dev/null) || true
+  ident=$(jq -r '.data.ident // empty' <<<"$out" 2>/dev/null)
+  [[ -n "$ident" ]] || fail "$E_GENERIC" "could not file the suggestion ask for ${tident}"
+  _loop_pref_set loop.review.last "$(db "SELECT datetime('now');")"
+  ok "asked for a change to ${tident} (${tscore}/100) on ${ident}" '{filed:true, loop:$t, score:($s|tonumber), task:$i}' \
+     --arg t "$tident" --arg s "$tscore" --arg i "$ident"
+}
+
+# `task loop suggest <loop> --body=…|--body-file=<path> [--reason=]` — record the
+# suggested instructions. A loop pack's or 5dive.yaml's marker line is carried
+# over if the new text drops it (`loop uninstall` and `team import` find their
+# loops by it). With the switch on, applies.
+cmd_task_loop_suggest() {
+  tasks_db_init
+  local ref="" body="" body_file="" reason="" from="" have_body=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --body=*)      body="${1#*=}"; have_body=1 ;;
+      --body-file=*) body_file="${1#*=}" ;;
+      --reason=*)    reason="${1#*=}" ;;
+      --from=*)      from="${1#*=}" ;;
+      -*)            fail "$E_USAGE" "unknown flag: $1" ;;
+      *)             [[ -z "$ref" ]] && ref="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  if [[ -n "$body_file" ]]; then
+    [[ -r "$body_file" ]] || fail "$E_VALIDATION" "cannot read --body-file: $body_file"
+    body=$(cat "$body_file"); have_body=1
+  fi
+  (( have_body )) || fail "$E_USAGE" "usage: 5dive task loop suggest <loop> --body=\"…\"|--body-file=<path> [--reason=\"…\"]"
+  local tid tident cur markers
+  _loop_tpl_resolve "$ref"; tid="$_LOOP_TID"; tident="$_LOOP_TIDENT"
+  [[ -n "${body//[[:space:]]/}" ]] || fail "$E_VALIDATION" "the suggested instructions are empty"
+  cur=$(db "SELECT body FROM tasks WHERE id=${tid};")
+  markers=$(grep -E 'installed loop: |declared loop: ' <<<"$cur" || true)
+  if [[ -n "$markers" ]] && ! grep -qE 'installed loop: |declared loop: ' <<<"$body"; then
+    body="${body}
+
+${markers}"
+  fi
+  [[ "$body" != "$cur" ]] || fail "$E_VALIDATION" "the suggestion is the same as the current instructions"
+  local by; by=$(task_actor "$from")
+  _loop_pref_set "loop.suggest.${tident}" "$(jq -cn --arg b "$body" --arg r "$reason" --arg by "$by" \
+      '{status:"pending", body:$b, reason:$r, by:$by, at:(now|todate)}')"
+  if [[ "$(_loop_pref_get "loop.auto.${tident}")" == "on" ]]; then
+    _loop_apply "$tid" "$tident" "self-improvement"
+    ok "suggestion for ${tident} applied (self-improvement is on)" '{loop:$t, status:"applied", auto:true}' --arg t "$tident"
+  else
+    ok "suggestion for ${tident} is waiting for the owner" '{loop:$t, status:"pending", auto:false}' --arg t "$tident"
+  fi
+}
+
+# Apply the pending suggestion: keep the current body as `prev` for Revert.
+_loop_apply() {
+  local tid="$1" tident="$2" by="$3" sug cur
+  sug=$(_loop_pref_get "loop.suggest.${tident}")
+  [[ "$(jq -r '.status // ""' <<<"$sug" 2>/dev/null)" == "pending" ]] || fail "$E_VALIDATION" "no pending suggestion for ${tident}"
+  cur=$(db "SELECT body FROM tasks WHERE id=${tid};")
+  db "UPDATE tasks SET body=$(sqlq "$(jq -r .body <<<"$sug")") WHERE id=${tid};"
+  _loop_pref_set "loop.suggest.${tident}" "$(jq -c --arg p "$cur" --arg by "$by" \
+      '.status="applied" | .prev=$p | .applied_by=$by | .applied_at=(now|todate)' <<<"$sug")"
+}
+
+# `task loop apply|dismiss|revert <loop>` — the owner's three taps.
+cmd_task_loop_decide() {
+  tasks_db_init
+  local verb="$1" ref="${2:-}" tid tident sug st
+  _loop_tpl_resolve "$ref"; tid="$_LOOP_TID"; tident="$_LOOP_TIDENT"
+  sug=$(_loop_pref_get "loop.suggest.${tident}")
+  st=$(jq -r '.status // ""' <<<"$sug" 2>/dev/null)
+  case "$verb" in
+    apply)
+      _loop_apply "$tid" "$tident" "$(task_actor "")"
+      ok "applied the suggestion to ${tident}" '{loop:$t, status:"applied"}' --arg t "$tident" ;;
+    dismiss)
+      [[ "$st" == "pending" ]] || fail "$E_VALIDATION" "no pending suggestion for ${tident}"
+      _loop_pref_set "loop.suggest.${tident}" "$(jq -c '.status="dismissed" | .dismissed_at=(now|todate)' <<<"$sug")"
+      ok "dismissed the suggestion for ${tident}" '{loop:$t, status:"dismissed"}' --arg t "$tident" ;;
+    revert)
+      [[ "$st" == "applied" ]] || fail "$E_VALIDATION" "no applied change to revert on ${tident}"
+      db "UPDATE tasks SET body=$(sqlq "$(jq -r .prev <<<"$sug")") WHERE id=${tid};"
+      _loop_pref_set "loop.suggest.${tident}" "$(jq -c '.status="reverted" | .reverted_at=(now|todate)' <<<"$sug")"
+      ok "reverted ${tident} to its instructions before the last change" '{loop:$t, status:"reverted"}' --arg t "$tident" ;;
+  esac
+}
+
+# `task loop auto <loop> on|off` — the self-improvement switch (off by default).
+# Turning it on with a suggestion already waiting applies that one too.
+cmd_task_loop_auto() {
+  tasks_db_init
+  local ref="${1:-}" state="${2:-}" tid tident applied=false
+  [[ "$state" =~ ^(on|off)$ ]] || fail "$E_USAGE" "usage: 5dive task loop auto <loop> on|off"
+  _loop_tpl_resolve "$ref"; tid="$_LOOP_TID"; tident="$_LOOP_TIDENT"
+  if [[ "$state" == "on" ]]; then
+    _loop_pref_set "loop.auto.${tident}" on
+    if [[ "$(jq -r '.status // ""' <<<"$(_loop_pref_get "loop.suggest.${tident}")" 2>/dev/null)" == "pending" ]]; then
+      _loop_apply "$tid" "$tident" "self-improvement"; applied=true
+    fi
+  else
+    _loop_pref_del "loop.auto.${tident}"
+  fi
+  ok "self-improvement ${state} for ${tident}" '{loop:$t, auto:($s=="on"), applied:($a=="true")}' \
+     --arg t "$tident" --arg s "$state" --arg a "$applied"
+}
+
 cmd_task_loop() {
   [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task loop <start|ls> ..."
   local sub="$1"; shift
   case "$sub" in
     start)          cmd_task_loop_start "$@" ;;
     ls|list)        cmd_task_loop_ls "$@" ;;
-    -h|--help|help) echo "5dive task loop start --title=<name> --steps=<json>   |   loop ls [--all]" ;;
-    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls)" ;;
+    score)          cmd_task_loop_score "$@" ;;
+    rate)           cmd_task_loop_rate "$@" ;;
+    scores)         cmd_task_loop_scores "$@" ;;
+    review)         cmd_task_loop_review "$@" ;;
+    suggest)        cmd_task_loop_suggest "$@" ;;
+    apply|dismiss|revert) cmd_task_loop_decide "$sub" "$@" ;;
+    auto)           cmd_task_loop_auto "$@" ;;
+    -h|--help|help) cat <<'HELP'
+5dive task loop start --title=<name> --steps=<json>   |   loop ls [--all]
+DIVE-5564 loop scores (a loop = a scheduled task):
+  loop scores                                   the loops, each with its score and recent runs
+  loop score <run> --score=<0-100> [--note=]    score a finished run (grader, else the runner)
+  loop rate <run> up|down|clear                 the owner's thumbs; beats the score
+  loop review [--force]                         weekly: ask for one change to the lowest-scoring loop
+  loop suggest <loop> --body-file=<path> [--reason=]   record suggested instructions
+  loop apply|dismiss|revert <loop>              act on the suggestion; revert undoes the last apply
+  loop auto <loop> on|off                       self-improvement: apply suggestions unasked (off by default)
+HELP
+    ;;
+    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|rate|review|suggest|apply|dismiss|revert|auto)" ;;
   esac
 }
 
