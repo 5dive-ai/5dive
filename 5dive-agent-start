@@ -1260,8 +1260,16 @@ case "$TYPE" in
     # agents never need to. Verified on a live box: with both set, the per-user
     # copy never regenerates and the agent runs normally.
     STAGE_GUARD="export DISABLE_UPDATES=1 DISABLE_AUTOUPDATER=1; " ;;
-  codex|opencode)
+  codex)
     UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
+  opencode)
+    # DIVE-5620: XDG_CONFIG_HOME is dropped too. profile.d exports it as
+    # /home/claude/.config to every login shell, and OpenCode reads its global
+    # config from $XDG_CONFIG_HOME/opencode. Under that redirect the seat's own
+    # ~/.config/opencode (the model pin from agent create/import, the persona
+    # AGENTS.md) was never read, and the seat ran OpenCode's default model
+    # (measured on slate-clover: Gemini image preview, every call a 500).
+    UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY XDG_CONFIG_HOME" ;;
   hermes|openclaw)
     # OAuth via auth.json — no provider env vars belong here.
     UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
