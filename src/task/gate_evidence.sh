@@ -916,6 +916,29 @@ _gate_owner_from_args() {
   printf ''
 }
 
+# DIVE-5632: _gate_gh_owner_read <secs> <gh args...> — ask the read-only token this
+# seat holds for the OWNER the call names, and nothing else. Prints gh's answer and
+# returns 0 only on a non-empty answer; rc 1 otherwise (no owner in the call, no
+# token for it, or the token could not answer). The DIVE-3888 arm inside `_gate_gh`
+# is reached only from a TOKENED call that failed blind; a caller that deliberately
+# hands `_gate_gh` an EMPTY token (`_merge_landed_probe`) goes to the credential-free
+# rails and never got here, so `merge-landed` read a lodar/* companion as NOT READ
+# on the same seat where `merge-gate-selftest` read it MERGED. Same selection rule
+# (by the owner the query names), same read-only token, never sourced into this env.
+_gate_gh_owner_read() {
+  local secs="${1:-0}"; shift
+  local _own _otok _oout="" _orc=0
+  local -a _obound=()
+  _own="$(_gate_owner_from_args "$@")"
+  [[ -n "$_own" ]] || return 1
+  _otok="$(_gate_owner_read_token "$_own")" || return 1
+  [[ "$secs" != "0" ]] && _obound=(timeout "${secs}s")
+  _oout=$(GH_TOKEN="$_otok" GH_CONFIG_DIR="$(gh_config_dir)" "${_obound[@]}" gh "$@" 2>/dev/null) || _orc=$?
+  (( _orc == 0 )) && [[ -n "$_oout" ]] || return 1
+  _gate_tok_note "[5 owner read token GH_READ_TOKEN_${_own^^}] RESOLVED and ANSWERED (DIVE-5632, credential-free read declined)"
+  printf '%s' "$_oout"
+}
+
 _gate_gh_blind_err() {
   local f="${1:-}"
   [[ -s "$f" ]] || return 1
