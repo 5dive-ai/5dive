@@ -70,7 +70,7 @@ check "add prints the box's PUBLIC key and never the private one" \
   'grep -qF "$(cat "$FIVE_MACHINE_DIR/id_ed25519.pub")" "$TMP/out" && ! grep -q PRIVATE "$TMP/out"'
 check "ssh -G resolves test through the written config" '[[ $(resolves test) == 192.0.2.10 ]]'
 check "user, port, key and BatchMode land in the block" \
-  'ssh -F "$CONF" -G test 2>/dev/null | grep -qx "user deploy" && ssh -F "$CONF" -G test 2>/dev/null | grep -qx "port 2222" && ssh -F "$CONF" -G test 2>/dev/null | grep -qx "batchmode yes"'
+  'G=$(ssh -F "$CONF" -G test 2>/dev/null); grep -qx "user deploy" <<<"$G" && grep -qx "port 2222" <<<"$G" && grep -qx "batchmode yes" <<<"$G"'
 check "CLAUDE.md keeps the owner text and gains one machines line" \
   'grep -qx "keep me" "$MD" && [[ $(grep -c "5dive-machines" "$MD") == 1 ]] && grep -qF "\`ssh test\`" "$MD"'
 
@@ -81,7 +81,7 @@ check "re-adding a name replaces its block (one Host test, new address)" \
   '[[ $(grep -c "^Host test$" "$CONF") == 1 && $(resolves test) == 192.0.2.11 ]]'
 check "the keypair is reused, not regenerated" '[[ $(cat "$FIVE_MACHINE_DIR/id_ed25519.pub") == "$pub1" ]]'
 check "still ONE CLAUDE.md line, naming both machines" \
-  '[[ $(grep -c "5dive-machines" "$MD") == 1 ]] && grep "5dive-machines" "$MD" | grep -qF "\`ssh web\`"'
+  '[[ $(grep -c "5dive-machines" "$MD") == 1 ]] && L=$(grep "5dive-machines" "$MD"); grep -qF "\`ssh web\`" <<<"$L"'
 JSON_MODE=1 run ls
 check "ls --json lists both, port defaults to 22" \
   '[[ $(jq -c "[.data.machines[] | [.name,.port]]" "$TMP/out") == "[[\"web\",22],[\"test\",22]]" ]]'

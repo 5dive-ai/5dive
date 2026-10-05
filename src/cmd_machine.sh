@@ -73,9 +73,10 @@ $pub" '{name:$n, user:$u, host:$h, port:($p|tonumber), publicKey:$k}' \
       local name="${1:-}"
       (( $# == 1 )) || fail "$E_USAGE" "usage: 5dive machine rm <name>"
       require_root "machine rm $*"
-      _machine_names | grep -qxF -- "$name" || fail "$E_NOT_FOUND" "no machine named '${name:0:40}' (see: 5dive machine ls)"
+      local names others; names=$(_machine_names); others=$(grep -vxF -- "$name" <<<"$names" || true)
+      grep -qxF -- "$name" <<<"$names" || fail "$E_NOT_FOUND" "no machine named '${name:0:40}' (see: 5dive machine ls)"
       local rest; rest=$(_machine_conf_without "$name")
-      if _machine_names | grep -vxF -- "$name" | grep -q .; then _machine_write "$conf" "${rest}"$'\n'; else rm -f "$conf"; fi
+      if [[ -n "$others" ]]; then _machine_write "$conf" "${rest}"$'\n'; else rm -f "$conf"; fi
       _machine_sync_md
       ok "machine '$name' detached from this box (the machine itself is untouched)" '{name:$n, removed:true}' --arg n "$name" ;;
     ls|"")
