@@ -5,7 +5,8 @@
 # Asserts that removing an agent:
 #   - drops it from the registry (agents.json)
 #   - drops its agents_org row (the DIVE-1609 cascade — used to leak)
-#   - reparents its direct reports via ON DELETE SET NULL (no orphan pointer)
+#   - moves its direct reports up to its own manager (DIVE-5609), and a removed
+#     root's reports become roots (no orphan pointer either way)
 #   - clears the failed templated unit (systemctl reset-failed <unit>)
 # Run: bash tests/agent_rm_org_cascade_unit.sh
 set -uo pipefail
@@ -57,12 +58,13 @@ tasks_db_init
 
 # Seed registry with two agents (agy reports up to creative).
 cat > "$REGISTRY" <<'JSON'
-{"schemaVersion":2,"agents":{"agy":{"type":"claude"},"creative":{"type":"claude"},"kidreports":{"type":"claude"}}}
+{"schemaVersion":2,"agents":{"agy":{"type":"claude"},"creative":{"type":"claude"},"kidreports":{"type":"claude"},"kid2":{"type":"claude"},"peer":{"type":"claude"}}}
 JSON
-# Seed org chart: creative at top, agy + kidreports report to agy.
-db "INSERT OR IGNORE INTO agents_org (name) VALUES ('creative'),('agy'),('kidreports');"
-db "UPDATE agents_org SET reports_to='creative' WHERE name='agy';"
-db "UPDATE agents_org SET reports_to='agy' WHERE name='kidreports';"
+# Seed org chart: creative at top; agy and peer report to creative; kidreports
+# and kid2 report to agy.
+db "INSERT OR IGNORE INTO agents_org (name) VALUES ('creative'),('agy'),('kidreports'),('kid2'),('peer');"
+db "UPDATE agents_org SET reports_to='creative' WHERE name IN ('agy','peer');"
+db "UPDATE agents_org SET reports_to='agy' WHERE name IN ('kidreports','kid2');"
 
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
@@ -95,12 +97,18 @@ gone_org=$(db "SELECT COUNT(*) FROM agents_org WHERE name='agy';")
   && ok_t "agent rm cascades the agents_org row" \
   || bad_t "agents_org row orphaned" "count=$gone_org"
 
-# 3. direct report reparented (reports_to -> NULL), not left dangling at 'agy'
-child_mgr=$(db "SELECT COALESCE(reports_to,'(top)') FROM agents_org WHERE name='kidreports';")
-[[ "$child_mgr" == "(top)" ]] \
-  && ok_t "ON DELETE SET NULL reparents the removed agent's reports" \
-  || bad_t "child still points at removed manager" "reports_to=$child_mgr"
-
+# 3. DIVE-5609: direct reports move up to the removed agent's own manager —
+#    not left dangling at 'agy', and not cut loose as roots (ON DELETE SET NULL
+#    alone did that, so a team's middle manager took its reports off the team).
+child_mgr=$(db "SELECT name||'>'||COALESCE(reports_to,'(top)') FROM agents_org WHERE name IN ('kidreports','kid2') ORDER BY name;" | paste -sd,)
+[[ "$child_mgr" == "kid2>creative,kidreports>creative" ]] \
+  && ok_t "agent rm moves the removed agent's reports to its manager (DIVE-5609)" \
+  || bad_t "reports did not move to the removed agent's manager" "got: $child_mgr"
+# CONTROL — only agy's reports move: a sibling under the same manager stays put.
+peer_mgr=$(db "SELECT COALESCE(reports_to,'(top)') FROM agents_org WHERE name='peer';")
+[[ "$peer_mgr" == "creative" ]] \
+  && ok_t "CONTROL: an agent that did not report to the removed one is untouched" \
+  || bad_t "CONTROL: a non-report moved" "peer reports_to=$peer_mgr"
 # 4. failed unit cleared
 grep -q "reset-failed 5dive-agent@agy.service" "$SYSCTL_LOG" \
   && ok_t "agent rm reset-failed the templated unit" \
@@ -141,6 +149,14 @@ fi
 [[ -e "$STATE_DIR/memory-consolidate/creative.notx" ]] \
   && ok_t "CONTROL: another seat's counter is untouched" \
   || bad_t "CONTROL: agent rm wiped a seat it was not removing"
+
+# 7. DIVE-5609: a removed ROOT has no manager to hand its reports to: they become roots.
+#    Last, because it removes 'creative', the control seat of arm 6.
+cmd_rm creative >"$TMP/out-root" 2>"$TMP/err-root"
+root_kids=$(db "SELECT name||'>'||COALESCE(reports_to,'(top)') FROM agents_org ORDER BY name;" | paste -sd,)
+[[ "$root_kids" == "kid2>(top),kidreports>(top),peer>(top)" ]] \
+  && ok_t "removing a root leaves its reports as roots, none pointing at it" \
+  || bad_t "removing a root left a bad chart" "got: $root_kids :: $(tail -2 "$TMP/err-root")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

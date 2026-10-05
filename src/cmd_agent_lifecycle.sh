@@ -163,11 +163,18 @@ cmd_rm() {
   jq --arg n "$name" 'del(.agents[$n])' <<<"$reg" | registry_write
   # DIVE-1609: cascade the org-chart placement. The agents_org DELETE used to
   # live ONLY in `5dive org rm`, so `agent rm` orphaned the row and the agent
-  # kept showing up in the org chart. Idempotent (safe if absent); the
-  # ON DELETE SET NULL on reports_to already reparents any direct reports.
+  # kept showing up in the org chart. Idempotent (safe if absent).
+  # DIVE-5609: its direct reports move up to ITS manager first, so firing a
+  # team's middle manager keeps the people under it on the team. ON DELETE SET
+  # NULL alone made each of them a root of its own. A removed root has no
+  # manager, so its reports become roots, as before.
   step "Removing org-chart placement"
   tasks_db_init
-  db "DELETE FROM agents_org WHERE name=$(sqlq "$name");"
+  db "UPDATE agents_org
+        SET reports_to=(SELECT reports_to FROM agents_org WHERE name=$(sqlq "$name")),
+            updated_at=datetime('now')
+      WHERE reports_to=$(sqlq "$name");
+      DELETE FROM agents_org WHERE name=$(sqlq "$name");"
   # Drop any paperclip-shared symlinks pointing into this agent's profile
   # and re-seed from another agent of the same type if one remains. Best-
   # effort — never fails the remove.
