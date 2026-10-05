@@ -2057,7 +2057,7 @@ _HB_OC_GUTTER='[[:space:]]*(┃|│)?[[:space:]]*'
 _HB_CLAUDE_NOT_TRANSIENT="Request was aborted|400([^0-9]|$)|The model has reached its context window|Claude's response exceeded the [0-9]+ output token|Usage credits required|Could not load .*credentials|.*safeguards flagged|.*can.t help with this|.* could not be processed and was removed|this model does not accept PDF|Effort '[^']*' isn.t available"
 _hb_pane_model_error() {
   local pane="$1" kind="${2:-}" line tail15
-  tail15=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 15)
+  tail15=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 15) || tail15=""
   # Two arms merged back into pane order: the opencode/provider shapes are
   # case-insensitive, claude's arm is case-SENSITIVE — claude only ever prints
   # 'API Error' (Ba in its binary), so a lowercase 'API error:' behind ●/⎿ is a
