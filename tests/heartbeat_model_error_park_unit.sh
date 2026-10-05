@@ -75,13 +75,23 @@ m=$(_hb_pane_model_error "$OC500") \
   && [[ "$m" == "500 Something went wrong on our side" ]] \
   && ok_t "A1 the slate-clover pane (opencode, relay 500) reads as a model error, line trimmed" \
   || bad_t "A1 the slate-clover pane did not match" "got [$m]"
+# The reason the cabinet shows is the error, not claude's bullet, in any locale.
+m=$(LC_ALL=C _hb_pane_model_error $'some work\n● API Error: 529 overloaded') \
+  && [[ "$m" == "API Error: 529 overloaded" ]] \
+  && ok_t "A1b a claude ● error line is trimmed to the error itself" \
+  || bad_t "A1b the claude gutter leaked into the reason" "got [$m]"
 
 for p in "API Error: 529 {\"type\":\"overloaded_error\"}" \
          "AI_APICallError: Service Unavailable" \
          "Error: 429 Too Many Requests" \
          "ProviderModelNotFoundError: openrouter/vendor/x" \
          "  ┃  Error: 503 Service Unavailable" \
-         "│ API Error: 500 {\"type\":\"api_error\"}"; do
+         "│ API Error: 500 {\"type\":\"api_error\"}" \
+         "● API Error: 500 {\"type\":\"api_error\",\"message\":\"Internal server error\"}" \
+         "  ⎿  API Error: Request timed out." \
+         "● API Error: Request rejected (429) · rate limited" \
+         "● API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}" \
+         "  ⎿  API Error: Connection error."; do
   _hb_pane_model_error $'some work\n'"$p" >/dev/null \
     && ok_t "A2 provider error reads as a model error: ${p:0:40}" \
     || bad_t "A2 provider error missed" "$p"
@@ -108,7 +118,12 @@ for p in "Fixed: /api/foo returned 500 Internal Server Error, now 200" \
          "if (e instanceof AI_APICallError) retry()" \
          "the relay said Something went wrong on our side, now fixed" \
          "503 Service Unavailable" \
-         "- [x] handle 429 too many requests"; do
+         "- [x] handle 429 too many requests" \
+         "Error: 404 Not Found" \
+         "Error: 401 Unauthorized" \
+         "  ✗ API error: expected 200 got 500" \
+         "ApiError: something" \
+         "  ⎿  API error handling added to the client"; do
   _hb_pane_model_error $'some work\n'"$p"$'\n> done' >/dev/null \
     && bad_t "A3 tool output read as a model error" "$p" \
     || ok_t "A3 tool output is not a model error: ${p:0:40}"

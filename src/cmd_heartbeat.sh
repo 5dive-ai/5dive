@@ -2031,14 +2031,21 @@ _hb_pane_is_usage_limit() {
 # Every shape is anchored to the START of a line, after the TUI's optional
 # gutter: a provider error is printed as its own line, while the same words
 # mid-line are a seat's prose, a code line or a tool's output (quinn it1/it2).
-_HB_GUTTER='[[:space:]]*(┃|│|✗)?[[:space:]]*'
+# The gutter is opencode's ┃/│ and claude's ● bullet and ⎿ elbow, where claude
+# prints `API Error: …` (tests/supervisor_classify_unit.sh carries the real
+# line). No ✗: that is a test runner's fail mark, and `✗ API error: expected
+# 200 got 500` is a test, not a model (quinn it3). `API Error:` must be followed
+# by a status or claude's own failure word, so `ApiError: something` is not
+# one; a bare `Error:` line counts only for the transient provider statuses
+# 429/5xx, since `Error: 404 Not Found` at line start is a node throw.
+_HB_GUTTER='[[:space:]]*(┃|│|●|⎿)?[[:space:]]*'
 _hb_pane_model_error() {
   local pane="$1" line
   line=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 15 \
-    | grep -iE "^${_HB_GUTTER}(AI_APICallError|ProviderError|ProviderModelNotFound[A-Za-z]*:|API ?Error:|((401|403|404|429|5[0-9]{2})[[:space:]]+)?Something went wrong on our side|error[[:space:]]*:[[:space:]]*(401|403|404|429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|unauthori[sz]ed|forbidden|not found|too many requests|overloaded|timed? ?out))" \
+    | grep -iE "^${_HB_GUTTER}(AI_APICallError|ProviderError|ProviderModelNotFound[A-Za-z]*:|API ?Error:[[:space:]]*((401|403|404|408|413|429|5[0-9]{2})([^0-9]|$)|request|connection|overloaded|rate.?limit|timed? ?out)|((401|403|404|429|5[0-9]{2})[[:space:]]+)?Something went wrong on our side|error[[:space:]]*:[[:space:]]*(429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|too many requests|overloaded|timed? ?out))" \
     | tail -n 1) || return 1
   [[ -n "$line" ]] || return 1
-  line=$(sed -E 's/^[[:space:][:punct:]]*//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' <<<"$line")
+  line=$(sed -E "s/^${_HB_GUTTER}//"'; s/^[[:space:][:punct:]]*//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' <<<"$line")
   printf '%s' "${line:0:200}"
 }
 
