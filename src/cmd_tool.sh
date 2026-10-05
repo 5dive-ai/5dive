@@ -148,7 +148,7 @@ _tool_custom_var_ok() {
 # catalog id, else the caller's own list (validated). Fails with a usage error.
 _tool_resolve() {
   local id="${1:-}" given="${3:-0}" v seen=" " n=0 list
-  local -a words
+  local -a words=()
   read -ra words <<<"${2:-}"
   list="${words[*]}"
   if _tool_known "$id"; then
