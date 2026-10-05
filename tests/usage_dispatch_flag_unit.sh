@@ -105,13 +105,13 @@ T_C1=$(( NOW - 2*3600 )); T_C2=$(( NOW - 5400 )); T_C2_DONE=$(( T_C2 + 600 ))
 C="$PROJDIR/sC.jsonl"
 pin  "$C" sC "$T_C1" DIVE-90003
 turn "$C" sC $(( T_C1 + 60 ))  500
-pin  "$C" sC "$T_C2" OINOA-7                    # a customer board's prefix
+pin  "$C" sC "$T_C2" ACME-7                    # a customer board's prefix
 turn "$C" sC $(( T_C2 + 60 ))  600
-turn "$C" sC $(( T_C2_DONE + 60 )) 700          # after OINOA-7 closed -> unattributed
+turn "$C" sC $(( T_C2_DONE + 60 )) 700          # after ACME-7 closed -> unattributed
 db "INSERT INTO tasks (ident,title,status,assignee,created_by,started_at)
     VALUES ('DIVE-90003','first row in a shared session','in_progress','$AGENT','main','$(sqlts "$T_C1")');"
 db "INSERT INTO tasks (ident,title,status,assignee,created_by,started_at,done_at)
-    VALUES ('OINOA-7','customer-board row','done','$AGENT','main','$(sqlts "$T_C2")','$(sqlts "$T_C2_DONE")');"
+    VALUES ('ACME-7','customer-board row','done','$AGENT','main','$(sqlts "$T_C2")','$(sqlts "$T_C2_DONE")');"
 
 # --- D: a dispatch from before the window whose session is still working in it.
 T_D=$(( SINCE - 600 ))
@@ -190,7 +190,7 @@ eq_t "row iteration comes from the board" "2" \
 
 # Edge cases the span rule rests on.
 eq_t "a second nudge in the same session ends the first row's span" "600" "$(task_total DIVE-90003)"
-eq_t "a non-DIVE board prefix is a dispatch too, and its span ends at done_at" "700" "$(task_total OINOA-7)"
+eq_t "a non-DIVE board prefix is a dispatch too, and its span ends at done_at" "700" "$(task_total ACME-7)"
 eq_t "a dispatch before the window owns its session's in-window turns" "900" "$(task_total DIVE-90004)"
 eq_t "an echoed nudge inside a tool_result opens no span" "0" "$(task_total DIVE-90005)"
 eq_t "an answered gate does not end the span (work after an auto-clear stays on the row)" "1200" "$(task_total DIVE-90006)"

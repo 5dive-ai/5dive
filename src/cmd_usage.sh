@@ -602,7 +602,7 @@ for name, meta in agents.items():
                                 named = (re.findall(r"Task ([A-Z][A-Z0-9]*-\d+) shows status done or cancelled", pcontent)
                                          + re.findall(r"/goal ([A-Z][A-Z0-9]*-\d+)\s*\S?\s*your only row this turn", pcontent))
                                 # Any board prefix, not just DIVE: a customer
-                                # board's rows are OINOA-N, and once the pin IS
+                                # board's rows are ACME-N, and once the pin IS
                                 # the attribution a DIVE-only match sends a whole
                                 # seat's work to "unattributed" (DIVE-5090).
                                 if named:

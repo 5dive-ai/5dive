@@ -88,7 +88,7 @@ fixture() {
   # The seeded account exactly as _apply_byo_claude writes it for openrouter.
   mkprof openrouter https://openrouter.ai/api "$FLASH" "$FLASH" "$FLASH"
   mkprof client-claude "" "" "" ""
-  seat maya "$FLASH" openrouter sonnet                     # an OINOA pack import: follows
+  seat maya "$FLASH" openrouter sonnet                     # a partner pack import: follows
   seat old "$(model_latest sonnet)" openrouter              # pre-5163 import, no family: follows
   seat sys "$FLASH" openrouter                              # created with --provider, no family: follows
   seat pin z-ai/glm-4.6 openrouter                          # deliberate pin: left

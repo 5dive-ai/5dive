@@ -47,7 +47,7 @@ MAYA=$(unit maya); DARIA=$(unit daria); TRAVERSAL=$(unit ../x)
 CALLS="$TMP/calls"
 CUR_TZ="$TMP/tz"
 ZONES="$TMP/zones"
-printf '%s\n' UTC Europe/Moscow Europe/Berlin America/Argentina/Buenos_Aires Etc/GMT+3 > "$ZONES"
+printf '%s\n' UTC Asia/Tokyo Europe/Berlin America/Argentina/Buenos_Aires Etc/GMT+3 > "$ZONES"
 
 _host_timedatectl() {
   printf 'timedatectl %s\n' "$*" >> "$CALLS"
@@ -85,10 +85,10 @@ refuses_tz() {   # <desc> <zone>
 echo "== refusals: the zone never reaches timedatectl unless it is a known IANA name =="
 refuses_tz "an absolute path"                 "/etc/passwd"
 refuses_tz "a traversal"                      "../../etc/passwd"
-refuses_tz "a traversal inside a name"        "Europe/../Moscow"
-refuses_tz "a trailing newline + second line" $'Europe/Moscow\nUTC'
-refuses_tz "lower case (timedatectl is case-sensitive)" "europe/moscow"
-refuses_tz "a shell metacharacter"            'Europe/Moscow;id'
+refuses_tz "a traversal inside a name"        "Asia/../Tokyo"
+refuses_tz "a trailing newline + second line" $'Asia/Tokyo\nUTC'
+refuses_tz "lower case (timedatectl is case-sensitive)" "asia/tokyo"
+refuses_tz "a shell metacharacter"            'Asia/Tokyo;id'
 refuses_tz "an option-shaped value"           "--adjust-system-clock"
 refuses_tz "a well-shaped name the box does not know" "Mars/Olympus_Mons"
 refuses_tz "empty"                            ""
@@ -96,7 +96,7 @@ refuses_tz "empty"                            ""
 echo
 echo "== accepted shapes =="
 for z in UTC Europe/Berlin America/Argentina/Buenos_Aires Etc/GMT+3; do
-  reset Europe/Moscow
+  reset Asia/Tokyo
   out=$( cmd_host_timezone set "$z" --no-restart 2>&1 ); rc=$?
   if (( rc == 0 )) && grep -qx "timedatectl set-timezone $z" "$CALLS"; then
     pass "set $z"
@@ -107,9 +107,9 @@ done
 
 echo
 echo "== an unchanged zone is a no-op =="
-reset Europe/Moscow
+reset Asia/Tokyo
 UNITS_OUT="$MAYA loaded active running maya"$'\n'
-out=$( JSON_MODE=1; cmd_host_timezone set Europe/Moscow --json 2>&1 ); rc=$?
+out=$( JSON_MODE=1; cmd_host_timezone set Asia/Tokyo --json 2>&1 ); rc=$?
 if (( rc == 0 )) && ! grep -qE '^timedatectl set-timezone|^systemctl (restart|try-restart)' "$CALLS" \
    && [[ $(jq -c '.data | {changed, restarted}' <<<"$out") == '{"changed":false,"restarted":[]}' ]]; then
   pass "same zone: nothing set, nothing restarted, changed=false"
@@ -121,7 +121,7 @@ echo
 echo "== a changed zone restarts cron and exactly the active agent units =="
 reset UTC
 UNITS_OUT="$MAYA loaded active running maya"$'\n'"$DARIA loaded active running daria"$'\n'"evil.service loaded active running x"$'\n'"$TRAVERSAL loaded active running y"$'\n'
-out=$( JSON_MODE=1; cmd_host_timezone set Europe/Moscow --json 2>/dev/null ); rc=$?
+out=$( JSON_MODE=1; cmd_host_timezone set Asia/Tokyo --json 2>/dev/null ); rc=$?
 restarts=$(grep -E '^systemctl restart ' "$CALLS" | sed 's/^systemctl restart //' | tr '\n' ' ')
 if (( rc == 0 )) && [[ "$restarts" == "$MAYA $DARIA " ]]; then
   pass "restarted maya + daria, not the stray units"
@@ -129,13 +129,13 @@ else
   bad "restart set — rc=$rc restarts='$restarts'"
 fi
 grep -qx 'systemctl try-restart cron.service' "$CALLS" && pass "cron try-restarted" || bad "cron not restarted"
-want=$(jq -cn --arg m "$MAYA" --arg d "$DARIA" '{timezone:"Europe/Moscow",previous:"UTC",changed:true,restarted:[$m,$d]}')
+want=$(jq -cn --arg m "$MAYA" --arg d "$DARIA" '{timezone:"Asia/Tokyo",previous:"UTC",changed:true,restarted:[$m,$d]}')
 if [[ $(jq -c '.data' <<<"$out") == "$want" ]]; then
   pass "JSON reply names the zone, the previous one and what restarted"
 else
   bad "JSON reply — $out"
 fi
-[[ "$(cat "$CUR_TZ")" == "Europe/Moscow" ]] && pass "the zone is now Europe/Moscow" || bad "zone not set"
+[[ "$(cat "$CUR_TZ")" == "Asia/Tokyo" ]] && pass "the zone is now Asia/Tokyo" || bad "zone not set"
 
 echo
 echo "== a parked agent (desiredState=stopped) is never restarted =="
@@ -145,7 +145,7 @@ REGISTRY="$TMP/agents.json"
 jq -n '{agents:{maya:{}, daria:{desiredState:"stopped"}}}' > "$REGISTRY"
 reset UTC
 UNITS_OUT="$MAYA loaded active running maya"$'\n'"$DARIA loaded active running daria"$'\n'
-out=$( JSON_MODE=1; cmd_host_timezone set Europe/Moscow --json 2>"$TMP/err" ); rc=$?
+out=$( JSON_MODE=1; cmd_host_timezone set Asia/Tokyo --json 2>"$TMP/err" ); rc=$?
 restarts=$(grep -E '^systemctl restart ' "$CALLS" | sed 's/^systemctl restart //' | tr '\n' ' ')
 if (( rc == 0 )) && [[ "$restarts" == "$MAYA " ]] && grep -q "daria' is parked" "$TMP/err" \
    && [[ $(jq -c '.data.restarted' <<<"$out") == "[\"$MAYA\"]" ]]; then
@@ -155,7 +155,7 @@ else
 fi
 jq -n '{agents:{maya:{desiredState:"running"}, daria:{desiredState:"running"}}}' > "$REGISTRY"
 reset UTC
-out=$( cmd_host_timezone set Europe/Moscow 2>/dev/null )
+out=$( cmd_host_timezone set Asia/Tokyo 2>/dev/null )
 restarts=$(grep -E '^systemctl restart ' "$CALLS" | sed 's/^systemctl restart //' | tr '\n' ' ')
 [[ "$restarts" == "$MAYA $DARIA " ]] && pass "desiredState=running restarts both" || bad "running — restarts='$restarts'"
 unset REGISTRY
@@ -163,8 +163,8 @@ unset REGISTRY
 echo
 echo "== --no-restart =="
 reset UTC
-out=$( cmd_host_timezone set Europe/Moscow --no-restart 2>&1 ); rc=$?
-if (( rc == 0 )) && grep -qx 'timedatectl set-timezone Europe/Moscow' "$CALLS" \
+out=$( cmd_host_timezone set Asia/Tokyo --no-restart 2>&1 ); rc=$?
+if (( rc == 0 )) && grep -qx 'timedatectl set-timezone Asia/Tokyo' "$CALLS" \
    && ! grep -qE '^systemctl (restart|try-restart)' "$CALLS"; then
   pass "--no-restart sets the zone and restarts nothing"
 else
@@ -188,7 +188,7 @@ else
   # shellcheck source=/dev/null
   source "$SRC/lib/validation.sh"
   reset UTC
-  out=$( cmd_host_timezone set Europe/Moscow 2>&1 ); rc=$?
+  out=$( cmd_host_timezone set Asia/Tokyo 2>&1 ); rc=$?
   if (( rc != 0 )) && ! grep -q '^timedatectl set-timezone' "$CALLS"; then
     pass "non-root set refused before anything is set"
   else

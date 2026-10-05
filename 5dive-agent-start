@@ -1511,8 +1511,8 @@ fi
 #     if (s === gitRoot) return null; ... s = parent(s) } }
 #
 # so a workdir that is (or sits inside) its own git repo under
-# /home/claude/projects never reaches the root's entry. oinoa
-# (--workdir=/home/claude/projects/my-oinoa, a git repo) parked on the dialog
+# /home/claude/projects never reaches the root's entry. A partner seat
+# (--workdir=/home/claude/projects/<project>, a git repo) parked on the dialog
 # with "No, exit" selected for 6.6 h behind the old at-or-under-root skip. A
 # live control/treatment on 2.1.283: plain subdir of a trusted root → no dialog;
 # git-repo subdir of the same root → dialog; exact workdir key seeded → no

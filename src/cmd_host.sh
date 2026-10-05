@@ -620,8 +620,8 @@ cmd_host_cron() {
 }
 
 # --- host timezone (DIVE-5165) -----------------------------------------------
-# The box's system zone. A partner client's assistant keeps their calendar
-# (OINOA): on a UTC box, "remind me at 9" fires at 12:00 Moscow time and "today"
+# The box's system zone. A partner client's assistant keeps their calendar: on
+# a UTC box, "remind me at 9" fires at 12:00 for a client at UTC+3, and "today"
 # rolls over at 03:00. 5dive-api calls `set` over /shell/exec with the zone the
 # client's device reported; 5dive's own boxes are never sent it and stay UTC.
 #
@@ -647,7 +647,7 @@ _host_tz_current() {
 _host_validate_tz() {
   local tz="$1"
   [[ "$tz" =~ $HOST_TZ_RE ]] \
-    || fail "$E_VALIDATION" "not an IANA time zone name: '${tz:0:64}' (e.g. Europe/Moscow)"
+    || fail "$E_VALIDATION" "not an IANA time zone name: '${tz:0:64}' (e.g. Europe/Berlin)"
   _host_timedatectl list-timezones 2>/dev/null | grep -Fxq -- "$tz" \
     || fail "$E_VALIDATION" "time zone '$tz' is not in this box's zone list (timedatectl list-timezones)"
 }

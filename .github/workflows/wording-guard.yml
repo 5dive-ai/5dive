@@ -1,0 +1,58 @@
+name: wording-guard
+
+# DIVE-5627. Our public repos name no country, city, partner or region-only
+# service as a market or a place we run; a language is fine. Agents write most of
+# what lands in these repos, so the rule is this check and nothing else: it reads
+# every tracked file and, on a pull request, the title, body, branch name and the
+# PR's commit messages. A hit fails the job and names the word.
+#
+# ONE FILE, EVERY PUBLIC REPO. Every other public 5dive-ai repo calls this
+# workflow (`uses: 5dive-ai/5dive/.github/workflows/wording-guard.yml@main`), and
+# it runs scripts/wording-guard.py from this repo's main. On a PR to THIS repo it
+# runs the PR's own copy, so a change to the list is graded by itself.
+#
+# The self-test arm runs first: a hit must be red and a clean tree green, or the
+# scan's verdict is not trusted.
+on:
+  workflow_call:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  wording:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # The PR branch's own tip, so the commit range below is reachable even
+          # when GitHub is rebuilding the merge ref.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Fetch the guard
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$REPO" = "5dive-ai/5dive" ] && [ -f scripts/wording-guard.py ]; then
+            cp scripts/wording-guard.py "$RUNNER_TEMP/wording-guard.py"
+          else
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/wording-guard.py" \
+              https://raw.githubusercontent.com/5dive-ai/5dive/main/scripts/wording-guard.py
+          fi
+
+      - name: Self-test (a hit is red, a clean tree is green)
+        run: python3 "$RUNNER_TEMP/wording-guard.py" --self-test
+
+      - name: Scan the tree and the pull request
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 "$RUNNER_TEMP/wording-guard.py"

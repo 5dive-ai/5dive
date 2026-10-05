@@ -28,7 +28,7 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n       %s\n' "$1" "${2:-}"; }
 eq_t()  { [[ "$2" == "$3" ]] && ok_t "$1" || bad_t "$1" "expected [$2], got [$3]"; }
 
 TMP=$(mktemp -d)
-SIGNED='https://api.5dive.com/partner/packs/oinoa/maya.tar.gz?e=1790000000&sig=deadbeefcafe'
+SIGNED='https://api.5dive.com/partner/packs/acme/maya.tar.gz?e=1790000000&sig=deadbeefcafe'
 
 echo '== link host =='
 eq_t 'host of a signed link drops path and query' api.5dive.com "$(_pack_url_host "$SIGNED")"
