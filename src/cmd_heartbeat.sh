@@ -2009,6 +2009,75 @@ _hb_pane_is_usage_limit() {
   return 0
 }
 
+# DIVE-5624 — did the seat's last turn END ON A MODEL ERROR? Pure matcher over a
+# captured pane; prints the matching line (trimmed, capped) and returns 0, else 1.
+#
+# Measured on slate-clover (2026-10-05): every opencode call got the region
+# relay's 500, the pane showed `500 Something went wrong on our side`, and box
+# rows DIVE-1/DIVE-2 sat in_progress with result, gate and park reason all null.
+# Rule (b) below only ever requeued such a row to todo, the next nudge hit the
+# same 500, and nothing on the row said why. This is what lets rule (b) write
+# the cause down instead.
+#
+# Only the TAIL is read (last 15 non-blank lines): an error that scrolled up
+# and was followed by real work is not the state the seat stopped in. A line
+# matches on a provider-error SHAPE only: a provider's own error name or copy, or
+# a line that STARTS with `Error:` (after an optional pane gutter), then an HTTP
+# error status and an error word. Bare status phrases are NOT matched:
+# a seat's own tool output ("returned 500 Internal Server Error", curl's
+# `HTTP/1.1 404 Not Found`, "test for 401 unauthorized") sits in the tail of a
+# healthy idle seat all day, and parking it as "model calls failing" would put
+# the wrong cause on the row — the defect this exists to fix.
+# Every shape is anchored to the START of a line, after the TUI's optional
+# gutter: a provider error is printed as its own line, while the same words
+# mid-line are a seat's prose, a code line or a tool's output (quinn it1/it2).
+# The gutter is opencode's ┃/│ and claude's ● bullet and ⎿ elbow, where claude
+# prints `API Error: …` (tests/supervisor_classify_unit.sh carries the real
+# line). No ✗: that is a test runner's fail mark, and `✗ API error: expected
+# 200 got 500` is a test, not a model (quinn it3). `API Error:` must be followed
+# by a status or claude's own failure string, so `ApiError: something` is not
+# one; a bare `Error:` line counts only for the transient provider statuses
+# 429/5xx, since `Error: 404 Not Found` at line start is a node throw.
+# claude's arm is INVERTED (quinn it5): five rounds of word lists kept missing
+# its transient strings (`Server is temporarily limiting requests`, `Connection
+# to the API was lost`, `The response stalled …`), so ANY `API Error: ` line
+# behind claude's ●/⎿ gutter parks, minus a denylist of the non-transient ones
+# its binary prints (2.1.289): `Request was aborted` (an interrupted turn on a
+# healthy seat), a 400 (a broken conversation, e.g. `400 orphaned tool_result`,
+# which an hour's park and a re-wake cannot heal), the context-window and
+# output-token limits, `Usage credits required`, `Could not load … credentials`,
+# a safeguards flag or refusal, a removed attachment, an unsupported PDF or
+# effort setting. Those need a person or a new session, not a retry.
+# The opencode arm (┃/│ and a bare line, never ●/⎿) keeps the status/word list above.
+_HB_GUTTER='[[:space:]]*(┃|│|●|⎿)?[[:space:]]*'
+_HB_CLAUDE_GUTTER='[[:space:]]*(●|⎿)[[:space:]]*'
+# The case-insensitive opencode arm sits behind opencode's own gutter only: on a
+# claude pane, ●/⎿ 'API error: 500 …' or 'Error: 500 …' is a tool result or prose.
+_HB_OC_GUTTER='[[:space:]]*(┃|│)?[[:space:]]*'
+_HB_CLAUDE_NOT_TRANSIENT="Request was aborted|400([^0-9]|$)|The model has reached its context window|Claude's response exceeded the [0-9]+ output token|Usage credits required|Could not load .*credentials|.*safeguards flagged|.*can.t help with this|.* could not be processed and was removed|this model does not accept PDF|Effort '[^']*' isn.t available"
+_hb_pane_model_error() {
+  local pane="$1" kind="${2:-}" line tail15
+  tail15=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 15) || tail15=""
+  # Two arms merged back into pane order: the opencode/provider shapes are
+  # case-insensitive, claude's arm is case-SENSITIVE — claude only ever prints
+  # 'API Error' (Ba in its binary), so a lowercase 'API error:' behind ●/⎿ is a
+  # tool result or the seat's own prose, never a model failure. `|| true` on each
+  # arm: a no-match grep must not fail the pipe under pipefail.
+  # The arms are chosen by SEAT TYPE ($2), not by gutter: on a claude pane only
+  # the first line of a tool result carries ⎿ and every later line is plain
+  # indent, which looks exactly like opencode's bare lines, so a claude seat
+  # never runs the opencode arm and an opencode seat never runs claude's. An
+  # empty kind (a caller that does not know) runs both.
+  line=$( { [[ "$kind" == claude ]] || grep -niE "^${_HB_OC_GUTTER}(AI_APICallError|ProviderError|ProviderModelNotFound[A-Za-z]*:|API ?Error:[[:space:]]*((401|403|404|408|413|429|5[0-9]{2})([^0-9]|$)|Repeated [0-9]{3}|Request (timed out|rejected)|Connection error|overloaded|rate.?limit|timed? ?out)|((401|403|404|429|5[0-9]{2})[[:space:]]+)?Something went wrong on our side|error[[:space:]]*:[[:space:]]*(429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|too many requests|overloaded|timed? ?out))" <<<"$tail15" || true
+            { [[ -z "$kind" || "$kind" == claude ]] && grep -nE "^${_HB_CLAUDE_GUTTER}API Error: " <<<"$tail15"; } || true; } \
+    | sort -t: -k1,1n -u | cut -d: -f2- \
+    | grep -viE "^${_HB_GUTTER}API ?Error:[[:space:]]*(${_HB_CLAUDE_NOT_TRANSIENT})" \
+    | tail -n 1) || return 1
+  [[ -n "$line" ]] || return 1
+  line=$(sed -E "s/^${_HB_GUTTER}//"'; s/^[[:space:][:punct:]]*//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' <<<"$line")
+  printf '%s' "${line:0:200}"
+}
+
 # DIVE-1666 — is THIS agent's session frozen on the usage-limit dialog right now?
 # Scrapes the pane and applies the pure matcher above. Returns 0 (frozen on the
 # usage dialog) / 1 (any other dialog, or pane uncapturable → fail-safe: treat as
@@ -4282,6 +4351,24 @@ ${_q_sql}" 2>/dev/null || true)
       if _qpark=$(_hb_quota_parked "$name" "$everyMin"); then
         _hb_log "[$name] $(_hb_ident "$id") reads idle ${age_min}m but the supervisor classifies this seat (or a peer on its auth profile) quota-exhausted — claim PARKED, not reclaimed (~${_qpark}m of park left, DIVE-4104/DIVE-4206)"
         continue
+      fi
+      # DIVE-5624 — AN IDLE SEAT WHOSE TURN ENDED ON A MODEL ERROR IS NOT
+      # "WALKED AWAY", and requeueing it only re-nudges the seat into the same
+      # error with nothing on the row. PARK it with the error as the reason the
+      # cabinet shows, for an hour: the park auto-unparks to todo on wake_at, so a
+      # transient outage costs one hour and a persistent one re-parks with a
+      # fresh reason each time instead of cycling silently. Placed after the
+      # quota hold, so a usage wall keeps its own deadline-keyed park.
+      # The seat type picks the matcher arm; a legacy claude seat has no .type
+      # in the registry, so it DEFAULTS to claude (an empty kind runs both arms).
+      local _merr _mkind
+      _mkind=$(registry_read 2>/dev/null | jq -r --arg n "$name" '.agents[$n].type // "claude"' 2>/dev/null)
+      if _merr=$(_hb_pane_model_error "$(_hb_pane_capture "$name" 2>/dev/null)" "${_mkind:-claude}"); then
+        if ( cmd_task_park "$id" --reason="model calls failing on ${name}: idle ${age_min}m, last turn ended on \"${_merr}\" — auto-retries when the park wakes (DIVE-5624)" --wake=+1h ) >/dev/null 2>&1; then
+          _hb_log "[$name] $(_hb_ident "$id") idle ${age_min}m on a model error (${_merr}) — PARKED +1h with the error as its reason, not requeued (DIVE-5624)"
+          reclaimed=$((reclaimed + 1)); continue
+        fi
+        _hb_log "[$name] WARN: $(_hb_ident "$id") idle on a model error (${_merr}) but the park did not land — requeueing as before (DIVE-5624)"
       fi
       _hb_reclaim_to_todo "$name" "$id" "idle ${age_min}m with the task still open (claimed then went idle)"
       reclaimed=$((reclaimed + 1)); continue

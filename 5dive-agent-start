@@ -1269,7 +1269,16 @@ case "$TYPE" in
     # ~/.config/opencode (the model pin from agent create/import, the persona
     # AGENTS.md) was never read, and the seat ran OpenCode's default model
     # (measured on slate-clover: Gemini image preview, every call a 500).
-    UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY XDG_CONFIG_HOME" ;;
+    UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY XDG_CONFIG_HOME"
+    # DIVE-5624: the headless posture claude/devin/agy already get. OpenCode's
+    # built-in defaults ASK on external_directory (any path outside the
+    # worktree), doom_loop and *.env reads, and nobody is at a seat's pane to
+    # answer: measured on slate-clover, sysadmin sat on "Permission required ←
+    # Access external directory /home/claude/projects" with its row todo and
+    # nothing on it. OPENCODE_PERMISSION is merged over every config file, so
+    # this reaches seats that already exist on their next start. An operator
+    # value in the unit's environment wins (the :- keeps it).
+    STAGE_GUARD="export OPENCODE_PERMISSION=\${OPENCODE_PERMISSION:-$(printf %q '{"external_directory":"allow","doom_loop":"allow","read":"allow"}')}; " ;;
   hermes|openclaw)
     # OAuth via auth.json — no provider env vars belong here.
     UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
