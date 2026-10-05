@@ -2035,14 +2035,20 @@ _hb_pane_is_usage_limit() {
 # prints `API Error: …` (tests/supervisor_classify_unit.sh carries the real
 # line). No ✗: that is a test runner's fail mark, and `✗ API error: expected
 # 200 got 500` is a test, not a model (quinn it3). `API Error:` must be followed
-# by a status or claude's own failure word, so `ApiError: something` is not
+# by a status or claude's own failure string, so `ApiError: something` is not
 # one; a bare `Error:` line counts only for the transient provider statuses
 # 429/5xx, since `Error: 404 Not Found` at line start is a node throw.
+# claude's words are its binary's own strings (2.1.289, quinn it4): `Repeated
+# 529 Overloaded errors` (overload retries ran out), `Request timed out`,
+# `Request rejected (429)`, `Connection error`. Not `Request was aborted`: that
+# is an interrupted turn on a healthy seat. A 400 stays out: claude's 400s are
+# a broken conversation (`400 orphaned tool_result …`), which an hour's park
+# and a re-wake cannot heal, so it is not the transient failure this parks.
 _HB_GUTTER='[[:space:]]*(┃|│|●|⎿)?[[:space:]]*'
 _hb_pane_model_error() {
   local pane="$1" line
   line=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 15 \
-    | grep -iE "^${_HB_GUTTER}(AI_APICallError|ProviderError|ProviderModelNotFound[A-Za-z]*:|API ?Error:[[:space:]]*((401|403|404|408|413|429|5[0-9]{2})([^0-9]|$)|request|connection|overloaded|rate.?limit|timed? ?out)|((401|403|404|429|5[0-9]{2})[[:space:]]+)?Something went wrong on our side|error[[:space:]]*:[[:space:]]*(429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|too many requests|overloaded|timed? ?out))" \
+    | grep -iE "^${_HB_GUTTER}(AI_APICallError|ProviderError|ProviderModelNotFound[A-Za-z]*:|API ?Error:[[:space:]]*((401|403|404|408|413|429|5[0-9]{2})([^0-9]|$)|Repeated [0-9]{3}|Request (timed out|rejected)|Connection error|overloaded|rate.?limit|timed? ?out)|((401|403|404|429|5[0-9]{2})[[:space:]]+)?Something went wrong on our side|error[[:space:]]*:[[:space:]]*(429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|too many requests|overloaded|timed? ?out))" \
     | tail -n 1) || return 1
   [[ -n "$line" ]] || return 1
   line=$(sed -E "s/^${_HB_GUTTER}//"'; s/^[[:space:][:punct:]]*//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' <<<"$line")

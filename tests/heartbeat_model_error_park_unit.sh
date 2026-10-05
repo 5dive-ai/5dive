@@ -91,7 +91,9 @@ for p in "API Error: 529 {\"type\":\"overloaded_error\"}" \
          "  ⎿  API Error: Request timed out." \
          "● API Error: Request rejected (429) · rate limited" \
          "● API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}" \
-         "  ⎿  API Error: Connection error."; do
+         "  ⎿  API Error: Connection error." \
+         "● API Error: Repeated 529 Overloaded errors. The API is at capacity — this is usually temporary. Try again in a moment." \
+         "  ⎿  API Error: Repeated 529 Overloaded errors. The API is at capacity — this is usually temporary. Try again in a moment."; do
   _hb_pane_model_error $'some work\n'"$p" >/dev/null \
     && ok_t "A2 provider error reads as a model error: ${p:0:40}" \
     || bad_t "A2 provider error missed" "$p"
@@ -123,7 +125,9 @@ for p in "Fixed: /api/foo returned 500 Internal Server Error, now 200" \
          "Error: 401 Unauthorized" \
          "  ✗ API error: expected 200 got 500" \
          "ApiError: something" \
-         "  ⎿  API error handling added to the client"; do
+         "  ⎿  API error handling added to the client" \
+         "  ⎿  API Error: Request was aborted." \
+         "● API Error: Request was aborted."; do
   _hb_pane_model_error $'some work\n'"$p"$'\n> done' >/dev/null \
     && bad_t "A3 tool output read as a model error" "$p" \
     || ok_t "A3 tool output is not a model error: ${p:0:40}"
