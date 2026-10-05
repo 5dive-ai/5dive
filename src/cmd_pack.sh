@@ -2679,6 +2679,12 @@ cmd_export() {
     has_persona="true"
   fi
 
+  # DIVE-5559: WHICH marketplace persona this agent is (registry .pack.slug), so
+  # the agent it is imported as is still that persona. Without it the importer
+  # only had the new seat's name to go on, and a pack re-imported under any other
+  # name ("agent" from agent.tar.gz) lost its role in the Mini App.
+  local pack_slug; pack_slug=$(_pack_persona_slug_of "$name")
+
   # Build the manifest.
   jq -n \
     --argjson fmt "$PACK_FORMAT_VERSION" \
@@ -2690,6 +2696,7 @@ cmd_export() {
     --arg mem "$mem_inc" \
     --arg memshape "$mem_shape" \
     --argjson persona "$has_persona" \
+    --arg packslug "$pack_slug" \
     '{
       packFormat: $fmt,
       agentName: $name,
@@ -2702,7 +2709,7 @@ cmd_export() {
       plugins: $plugins,
       skills: $skills,
       hooks: $hooks
-    }' > "$stage/manifest.json"
+    } + (if $packslug == "" then {} else {pack: {slug: $packslug}} end)' > "$stage/manifest.json"
 
   # A pack NEVER contains a token/key/credential — assert over the WHOLE stage
   # (incl. any memory/) before we tar so a future change can't silently leak.
@@ -3568,6 +3575,11 @@ cmd_import() {
   local pk_src="file" pk_slug=""
   if [[ -n "$import_slug" ]]; then pk_src="marketplace"; pk_slug="$import_slug"
   elif [[ -n "$from_url" ]]; then pk_src="url"; pk_slug=$(_pack_url_slug "$from_url")
+  else
+    # DIVE-5559: a file pack keeps the persona its export recorded. The source
+    # stays "file", so pack-sync still never re-fetches it (it cannot know where
+    # these bytes came from); only WHO the agent is carries over.
+    pk_slug=$(_pack_manifest_persona_slug "$stage/manifest.json")
   fi
   [[ -f "$cdir/persona.yaml" ]] \
     && pk_members=$(jq -c --arg s "$(_pack_file_sha "$cdir/persona.yaml")" '.persona = $s' <<<"$pk_members")
@@ -3684,6 +3696,23 @@ _pack_skill_shas() {
     out=$(jq -c --arg k "$id" --arg v "$sha" '.[$k] = $v' <<<"$out")
   done
   printf '%s\n' "$out"
+}
+
+# DIVE-5559 — the marketplace persona a seat IS travels in its export.
+# _pack_persona_slug_of <agent>: the slug its registry record names, or empty.
+_pack_persona_slug_of() {
+  local s
+  s=$(registry_read 2>/dev/null | jq -r --arg n "$1" '.agents[$n].pack.slug // empty | strings' 2>/dev/null) || s=""
+  [[ "$s" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] && printf '%s' "$s"
+  return 0
+}
+# _pack_manifest_persona_slug <manifest.json>: the slug an export recorded, or
+# empty. Pack bytes are third-party, so anything but a plain slug is dropped.
+_pack_manifest_persona_slug() {
+  local s
+  s=$(jq -r '.pack.slug // empty | strings' "$1" 2>/dev/null) || s=""
+  [[ "$s" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] && printf '%s' "$s"
+  return 0
 }
 
 # _pack_record_write <agent> <source> <slug> <skills-json> [<members-json>] — merge
