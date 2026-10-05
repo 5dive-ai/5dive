@@ -2009,6 +2009,30 @@ _hb_pane_is_usage_limit() {
   return 0
 }
 
+# DIVE-5624 — did the seat's last turn END ON A MODEL ERROR? Pure matcher over a
+# captured pane; prints the matching line (trimmed, capped) and returns 0, else 1.
+#
+# Measured on slate-clover (2026-10-05): every opencode call got the region
+# relay's 500, the pane showed `500 Something went wrong on our side`, and box
+# rows DIVE-1/DIVE-2 sat in_progress with result, gate and park reason all null.
+# Rule (b) below only ever requeued such a row to todo, the next nudge hit the
+# same 500, and nothing on the row said why. This is what lets rule (b) write
+# the cause down instead.
+#
+# Only the TAIL is read (last 15 non-blank lines): an error that scrolled up
+# and was followed by real work is not the state the seat stopped in. A line
+# matches on a provider-error phrase, or on an HTTP error status NEXT TO an
+# error word, so a status number in ordinary output does not match alone.
+_hb_pane_model_error() {
+  local pane="$1" line
+  line=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 15 \
+    | grep -iE 'API ?Error|AI_APICallError|ProviderError|ProviderModelNotFound|overloaded_error|Something went wrong on our side|Internal Server Error|Service Unavailable|Bad Gateway|(^|[^0-9])(401|403|404|429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|unauthori[sz]ed|forbidden|not found|too many requests|overloaded|timed? ?out)' \
+    | tail -n 1) || return 1
+  [[ -n "$line" ]] || return 1
+  line=$(sed -E 's/^[[:space:][:punct:]]*//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' <<<"$line")
+  printf '%s' "${line:0:200}"
+}
+
 # DIVE-1666 — is THIS agent's session frozen on the usage-limit dialog right now?
 # Scrapes the pane and applies the pure matcher above. Returns 0 (frozen on the
 # usage dialog) / 1 (any other dialog, or pane uncapturable → fail-safe: treat as
@@ -4282,6 +4306,21 @@ ${_q_sql}" 2>/dev/null || true)
       if _qpark=$(_hb_quota_parked "$name" "$everyMin"); then
         _hb_log "[$name] $(_hb_ident "$id") reads idle ${age_min}m but the supervisor classifies this seat (or a peer on its auth profile) quota-exhausted — claim PARKED, not reclaimed (~${_qpark}m of park left, DIVE-4104/DIVE-4206)"
         continue
+      fi
+      # DIVE-5624 — AN IDLE SEAT WHOSE TURN ENDED ON A MODEL ERROR IS NOT
+      # "WALKED AWAY", and requeueing it only re-nudges the seat into the same
+      # error with nothing on the row. PARK it with the error as the reason the
+      # cabinet shows, for an hour: the park auto-unparks to todo on wake_at, so a
+      # transient outage costs one hour and a persistent one re-parks with a
+      # fresh reason each time instead of cycling silently. Placed after the
+      # quota hold, so a usage wall keeps its own deadline-keyed park.
+      local _merr
+      if _merr=$(_hb_pane_model_error "$(_hb_pane_capture "$name" 2>/dev/null)"); then
+        if ( cmd_task_park "$id" --reason="model calls failing on ${name}: idle ${age_min}m, last turn ended on \"${_merr}\" — auto-retries when the park wakes (DIVE-5624)" --wake=+1h ) >/dev/null 2>&1; then
+          _hb_log "[$name] $(_hb_ident "$id") idle ${age_min}m on a model error (${_merr}) — PARKED +1h with the error as its reason, not requeued (DIVE-5624)"
+          reclaimed=$((reclaimed + 1)); continue
+        fi
+        _hb_log "[$name] WARN: $(_hb_ident "$id") idle on a model error (${_merr}) but the park did not land — requeueing as before (DIVE-5624)"
       fi
       _hb_reclaim_to_todo "$name" "$id" "idle ${age_min}m with the task still open (claimed then went idle)"
       reclaimed=$((reclaimed + 1)); continue

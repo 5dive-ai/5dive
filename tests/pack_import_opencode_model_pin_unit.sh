@@ -23,6 +23,9 @@
 #   T9     the real opencode binary (SKIP when absent): the pin is invisible under
 #          the box's XDG redirect and resolves once the start script's unset runs.
 #   T10    agent create pins a non-BYO opencode seat too (the sysadmin install's path).
+#   T11    DIVE-5624: an opencode seat launches with OPENCODE_PERMISSION allowing what
+#          OpenCode would otherwise ASK about (external_directory, doom_loop, .env
+#          reads) — a headless pane has nobody to answer; an operator value wins.
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -108,6 +111,35 @@ if [[ -n "$user_at" && -n "$cguard" && -n "$cres" && -n "$cpin" ]] && (( user_at
   ok_t "T10 agent create pins a non-BYO opencode seat to the account's model"
 else
   bad_t "T10 agent create pins a non-BYO opencode seat to the account's model" "user=$user_at guard=$cguard resolve=$cres pin=$cpin"
+fi
+
+# T11: the permission posture, through the same INNER round trip the launch uses.
+perm_seen() { # <type> [operator value] -> OPENCODE_PERMISSION as the seat sees it
+  ( TYPE="$1"; eval "$cases"; inner="${STAGE_GUARD}"'printf %s "${OPENCODE_PERMISSION-UNSET}"'
+    if [[ -n "${2:-}" ]]; then OPENCODE_PERMISSION="$2" bash -c "bash -c $(printf %q "$inner")"
+    else env -u OPENCODE_PERMISSION bash -c "bash -c $(printf %q "$inner")"; fi )
+}
+eq_t "T11a opencode seat: headless permission posture" \
+  '{"external_directory":"allow","doom_loop":"allow","read":"allow"}' "$(perm_seen opencode)"
+eq_t "T11b an operator's OPENCODE_PERMISSION wins"  '{"edit":"deny"}' "$(perm_seen opencode '{"edit":"deny"}')"
+eq_t "T11c codex seat gets no OpenCode posture"      "UNSET" "$(perm_seen codex)"
+if grep -q 'INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}' 5dive-agent-start; then
+  ok_t "T11d the launch line applies STAGE_GUARD"
+else
+  bad_t "T11d the launch line applies STAGE_GUARD" "INNER no longer carries STAGE_GUARD"
+fi
+# T11e: what OpenCode resolves for the build agent. Rules are last-match-wins
+# (findLast), so the posture's allow must sit after the built-in asks.
+if [[ -x "$OC" ]]; then
+  P="$TMP/perm"; mkdir -p "$P/home" "$P/work"
+  ext_action() { (cd "$P/work" && env -u XDG_CONFIG_HOME HOME="$P/home" OPENCODE_DISABLE_AUTOUPDATE=1 "$@" \
+    timeout 60 "$OC" debug agent build 2>/dev/null | sed -n '/^{/,$p' \
+    | jq -r '[.permission[] | select(.permission=="external_directory" and .pattern=="*")] | last | .action' 2>/dev/null); }
+  eq_t "T11e unpatched OpenCode asks on an external directory" "ask" "$(ext_action)"
+  eq_t "T11f with the posture it is allowed"  "allow" \
+    "$(ext_action OPENCODE_PERMISSION="$(perm_seen opencode)")"
+else
+  printf 'SKIP - T11e/f no opencode binary at %s\n' "$OC"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
