@@ -48,6 +48,7 @@ and nothing for the next `agent create` to silently revert.** `5dive agent _svc`
 5dive host journal --unit=<unit> [--lines=N] [--since=<N>m|<N>h|<N>d]
 5dive host cron show|snapshot|diff --user=<user>
 5dive host timezone [set <IANA zone>] [--no-restart]
+5dive host companion [set --host=<ipv4> --host-key=<line> --key-stdin | remove]
 ```
 
 `unit list` and `unit show` need no root (systemd exposes them unprivileged); everything else does,

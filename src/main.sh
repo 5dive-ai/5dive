@@ -549,6 +549,10 @@ Health:
                                                      # read or set the system zone (DIVE-5165). The zone
                                                      # must be in the box's own timedatectl list; a change
                                                      # restarts cron and each running agent unit.
+  5dive host companion [set --host=<ipv4> --host-key=<line> --key-stdin | remove]
+                                                     # the Russian companion box (DIVE-5622): \`ssh ru-box\`
+                                                     # and a SOCKS proxy on 127.0.0.1:1080. 5dive-api runs
+                                                     # \`set\` with the private key on stdin.
     Host remediation for a privileged seat, delivered as scoped subcommands
     rather than raw systemctl/journalctl/crontab grants (DIVE-3221; DIVE-1088
     excluded those grants because each is a one-line root escape via the pager

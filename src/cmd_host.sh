@@ -48,6 +48,13 @@
 #                       systemctl restart <each ACTIVE 5dive-agent@<name>.service, names read
 #                       back from systemd and re-validated, never from the caller;
 #                       a parked agent (registry desiredState=stopped) is skipped>
+#   host companion      reads the files below; systemctl is-active <the FIXED proxy unit>
+#   host companion set  writes FIXED-path files whose only variable parts are a validated IPv4,
+#                       a validated host-key line and an OpenSSH private key read from stdin
+#                       (armor + base64 checked); systemctl daemon-reload ;
+#                       systemctl enable + restart <the FIXED proxy unit>, which runs
+#                       `ssh -N -D 127.0.0.1:1080` as nobody:claude, never as root
+#   host companion remove  systemctl disable --now <the FIXED proxy unit> ; rm -f <those files>
 #
 # There is no eval, no `sh -c`, no editor, no caller-supplied file path, no
 # caller-supplied unit-file content, and no pager anywhere in this file. Every
@@ -739,6 +746,214 @@ cmd_host_timezone() {
   esac
 }
 
+# --- host companion (DIVE-5622) -----------------------------------------------
+# A partner client who picks Russia gets a normal EU box plus the smallest
+# Russian box, its "companion". The agent stays here; the companion is only its
+# door to Russian-only websites (a SOCKS proxy through the companion's egress)
+# and the place it deploys Russia-facing services (plain `ssh ru-box`).
+# 5dive-api builds the companion, puts this box's public key on it, then calls
+# `set` over /shell/exec with the companion's address and host key, and the
+# private key on stdin (never on argv: argv is audited and visible in ps).
+#
+# Every path written is fixed. The only caller inputs are the IPv4, the host-key
+# line and the private key, each refused unless it has its exact shape. The
+# proxy is `ssh -N -D 127.0.0.1:1080`: no remote command, bound to loopback, run
+# as nobody with group claude (the group that reads the key), never as root. The
+# ssh config pins the host key (StrictHostKeyChecking yes), so a caller cannot
+# make the proxy trust a host it did not name.
+HOST_COMPANION_ALIAS="ru-box"
+HOST_COMPANION_SOCKS_PORT=1080
+HOST_COMPANION_UNIT="5dive-companion-proxy.service"
+HOST_COMPANION_GROUP="claude"
+HOST_COMPANION_MD_BEGIN="<!-- 5dive-companion:begin (DIVE-5622; written by 5dive host companion) -->"
+HOST_COMPANION_MD_END="<!-- 5dive-companion:end -->"
+HOST_IPV4_RE='^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
+HOST_HOSTKEY_RE='^(ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa) [A-Za-z0-9+/]+={0,2}$'
+HOST_PRIVKEY_BODY_RE='^[A-Za-z0-9+/=]+$'
+
+# Fixed paths. The FIVE_COMPANION_* overrides exist for the unit harness only.
+_host_companion_dir()  { printf '%s' "${FIVE_COMPANION_DIR:-/etc/5dive/companion}"; }
+_host_companion_ssh_conf() { printf '%s' "${FIVE_COMPANION_SSH_CONF:-/etc/ssh/ssh_config.d/50-5dive-companion.conf}"; }
+_host_companion_unit_path() { printf '%s/%s' "${FIVE_COMPANION_UNIT_DIR:-/etc/systemd/system}" "$HOST_COMPANION_UNIT"; }
+# Claude Code's managed memory: every seat on the box reads it, including seats
+# created after this ran (a per-seat ~/.claude/CLAUDE.md would miss those).
+_host_companion_md() { printf '%s' "${FIVE_COMPANION_MD:-/etc/claude-code/CLAUDE.md}"; }
+
+# Seams onto chgrp and the group lookup, so the harness runs without the group or root.
+_host_companion_chgrp() { chgrp "$@"; }
+_host_companion_group_exists() { getent group "$HOST_COMPANION_GROUP" >/dev/null 2>&1; }
+
+_host_companion_validate_key() {   # <key text>
+  local key="$1" line first="" last="" n=0
+  (( ${#key} <= 16384 )) || fail "$E_VALIDATION" "private key on stdin is over 16 KiB"
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    [[ -z "$line" ]] && continue
+    n=$((n+1))
+    if (( n == 1 )); then first="$line"; continue; fi
+    if [[ -n "$last" ]]; then
+      [[ "$last" =~ $HOST_PRIVKEY_BODY_RE ]] || fail "$E_VALIDATION" "private key on stdin is not an OpenSSH private key"
+    fi
+    last="$line"
+  done <<<"$key"
+  [[ "$first" == "-----BEGIN OPENSSH PRIVATE KEY-----" && "$last" == "-----END OPENSSH PRIVATE KEY-----" ]] \
+    || fail "$E_VALIDATION" "private key on stdin is not an OpenSSH private key (-----BEGIN OPENSSH PRIVATE KEY-----)"
+  (( n >= 3 )) || fail "$E_VALIDATION" "private key on stdin is empty"
+}
+
+_host_companion_render_ssh_conf() {   # <ipv4>
+  local d; d=$(_host_companion_dir)
+  printf '%s\n' \
+    "# Written by \`5dive host companion set\` (DIVE-5622). Rewritten on every set; do not edit." \
+    "Host ${HOST_COMPANION_ALIAS} $1" \
+    "  HostName $1" \
+    "  User root" \
+    "  Port 22" \
+    "  IdentityFile ${d}/id_ed25519" \
+    "  IdentitiesOnly yes" \
+    "  HostKeyAlias ${HOST_COMPANION_ALIAS}" \
+    "  UserKnownHostsFile ${d}/known_hosts" \
+    "  StrictHostKeyChecking yes" \
+    "  BatchMode yes" \
+    "  ServerAliveInterval 15" \
+    "  ServerAliveCountMax 3"
+}
+
+_host_companion_render_unit() {
+  printf '%s\n' \
+    "# Written by \`5dive host companion set\` (DIVE-5622)." \
+    "[Unit]" \
+    "Description=5dive: SOCKS proxy through the Russian companion box (127.0.0.1:${HOST_COMPANION_SOCKS_PORT})" \
+    "After=network-online.target" \
+    "Wants=network-online.target" \
+    "" \
+    "[Service]" \
+    "User=nobody" \
+    "Group=${HOST_COMPANION_GROUP}" \
+    "ExecStart=/usr/bin/ssh -F $(_host_companion_ssh_conf) -N -D 127.0.0.1:${HOST_COMPANION_SOCKS_PORT} -o ExitOnForwardFailure=yes ${HOST_COMPANION_ALIAS}" \
+    "Restart=always" \
+    "RestartSec=5" \
+    "" \
+    "[Install]" \
+    "WantedBy=multi-user.target"
+}
+
+_host_companion_render_md() {
+  printf '%s\n' \
+    "$HOST_COMPANION_MD_BEGIN" \
+    "## Russian companion server" \
+    "This server is in the EU. It has a companion server in Russia, reachable as \`ssh ru-box\` (root)." \
+    "- When a website refuses this server, or it is a Russian (.ru) service, go through the Russian proxy: \`curl --proxy socks5h://127.0.0.1:${HOST_COMPANION_SOCKS_PORT} <url>\` (a browser: \`--proxy-server=socks5://127.0.0.1:${HOST_COMPANION_SOCKS_PORT}\`)." \
+    "- Russia-facing services, and data that must stay in Russia, are deployed to ru-box over SSH. Everything else stays here." \
+    "$HOST_COMPANION_MD_END"
+}
+
+# The managed CLAUDE.md with our block removed (the rest of the file untouched).
+_host_companion_md_without_block() {
+  local f; f=$(_host_companion_md)
+  [[ -f "$f" ]] || return 0
+  awk -v b="$HOST_COMPANION_MD_BEGIN" -v e="$HOST_COMPANION_MD_END" \
+    '$0==b{skip=1; next} skip && $0==e{skip=0; next} !skip' "$f"
+}
+
+_host_companion_write() {   # <path> <mode> <content>  — atomic, same directory
+  local path="$1" mode="$2" tmp
+  mkdir -p "$(dirname "$path")" || fail "$E_GENERIC" "cannot create $(dirname "$path")"
+  tmp=$(mktemp "${path}.XXXXXX") || fail "$E_GENERIC" "cannot write $path"
+  printf '%s' "$3" > "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$path" \
+    || { rm -f "$tmp"; fail "$E_GENERIC" "cannot write $path"; }
+}
+
+_host_companion_configured_host() {
+  local f; f=$(_host_companion_ssh_conf)
+  [[ -f "$f" ]] || return 0
+  awk '$1=="HostName"{print $2; exit}' "$f"
+}
+
+cmd_host_companion() {
+  local action="" host="" hostkey="" key_stdin=0
+  while (( $# )); do
+    case "$1" in
+      --json) JSON_MODE=1 ;;
+      --host=*) host="${1#--host=}" ;;
+      --host-key=*) hostkey="${1#--host-key=}" ;;
+      --key-stdin) key_stdin=1 ;;
+      -h|--help) printf '%s\n' \
+        "usage: 5dive host companion                       # is a Russian companion box set up here?" \
+        "       5dive host companion set --host=<ipv4> --host-key='<type> <base64>' --key-stdin" \
+        "       5dive host companion remove" \
+        "  set     5dive-api runs this once the companion is built: the OpenSSH private key comes on" \
+        "          stdin. Writes \`ssh ${HOST_COMPANION_ALIAS}\`, the SOCKS proxy 127.0.0.1:${HOST_COMPANION_SOCKS_PORT} (unit ${HOST_COMPANION_UNIT})" \
+        "          and a short note in /etc/claude-code/CLAUDE.md telling the agents when to use them." \
+        "  remove  undoes all of it."
+        return 0 ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)
+        if [[ -z "$action" ]]; then action="$1"; else fail "$E_USAGE" "extra arg: $1"; fi ;;
+    esac
+    shift
+  done
+
+  local dir conf unit md
+  dir=$(_host_companion_dir); conf=$(_host_companion_ssh_conf); unit=$(_host_companion_unit_path); md=$(_host_companion_md)
+  case "$action" in
+    "")
+      local cur state="inactive"
+      cur=$(_host_companion_configured_host)
+      [[ -n "$cur" ]] && state=$(_host_systemctl is-active "$HOST_COMPANION_UNIT" 2>/dev/null || true)
+      [[ -n "$state" ]] || state="unknown"
+      if [[ -z "$cur" ]]; then
+        ok "no companion box set up on this box" '{configured:false, host:null, proxy:null}'
+      else
+        ok "companion box ${cur} (ssh ${HOST_COMPANION_ALIAS}); proxy socks5h://127.0.0.1:${HOST_COMPANION_SOCKS_PORT} is ${state}" \
+           '{configured:true, host:$h, alias:$a, proxy:$p, proxyState:$s}' \
+           --arg h "$cur" --arg a "$HOST_COMPANION_ALIAS" --arg p "socks5h://127.0.0.1:${HOST_COMPANION_SOCKS_PORT}" --arg s "$state"
+      fi
+      ;;
+    set)
+      require_root "host companion set"
+      [[ "$host" =~ $HOST_IPV4_RE ]] || fail "$E_VALIDATION" "--host must be an IPv4 address, got '${host:0:64}'"
+      [[ "$hostkey" =~ $HOST_HOSTKEY_RE ]] || fail "$E_VALIDATION" "--host-key must be '<key type> <base64>' (an ssh host public key)"
+      (( key_stdin )) || fail "$E_USAGE" "the private key comes on stdin: pass --key-stdin"
+      local key; key=$(cat)
+      _host_companion_validate_key "$key"
+      _host_companion_group_exists \
+        || fail "$E_GENERIC" "group '$HOST_COMPANION_GROUP' does not exist on this box"
+
+      mkdir -p "$dir" && chmod 0755 "$dir" || fail "$E_GENERIC" "cannot create $dir"
+      _host_companion_write "$dir/id_ed25519" 0640 "${key}"$'\n'
+      _host_companion_chgrp "$HOST_COMPANION_GROUP" "$dir/id_ed25519" \
+        || fail "$E_GENERIC" "cannot give group $HOST_COMPANION_GROUP the key at $dir/id_ed25519"
+      _host_companion_write "$dir/known_hosts" 0644 "${HOST_COMPANION_ALIAS} ${hostkey}"$'\n'
+      _host_companion_write "$conf" 0644 "$(_host_companion_render_ssh_conf "$host")"$'\n'
+      _host_companion_write "$unit" 0644 "$(_host_companion_render_unit)"$'\n'
+      local rest sep=$'\n\n'; rest=$(_host_companion_md_without_block)
+      [[ -n "${rest//[$'\n ']/}" ]] || { rest=""; sep=""; }
+      _host_companion_write "$md" 0644 "${rest}${sep}$(_host_companion_render_md)"$'\n'
+
+      _host_systemctl daemon-reload >/dev/null 2>&1 || fail "$E_GENERIC" "systemctl daemon-reload failed"
+      _host_systemctl enable "$HOST_COMPANION_UNIT" >/dev/null 2>&1 || fail "$E_GENERIC" "systemctl enable $HOST_COMPANION_UNIT failed"
+      _host_systemctl restart "$HOST_COMPANION_UNIT" >/dev/null 2>&1 || fail "$E_GENERIC" "systemctl restart $HOST_COMPANION_UNIT failed"
+      ok "companion box $host set up: ssh ${HOST_COMPANION_ALIAS}, proxy socks5h://127.0.0.1:${HOST_COMPANION_SOCKS_PORT} (${HOST_COMPANION_UNIT})" \
+         '{configured:true, host:$h, alias:$a, proxy:$p, unit:$u}' \
+         --arg h "$host" --arg a "$HOST_COMPANION_ALIAS" --arg p "socks5h://127.0.0.1:${HOST_COMPANION_SOCKS_PORT}" --arg u "$HOST_COMPANION_UNIT"
+      ;;
+    remove)
+      require_root "host companion remove"
+      _host_systemctl disable --now "$HOST_COMPANION_UNIT" >/dev/null 2>&1 || true
+      rm -f "$unit" "$conf" "$dir/id_ed25519" "$dir/known_hosts"
+      rmdir "$dir" 2>/dev/null || true
+      _host_systemctl daemon-reload >/dev/null 2>&1 || true
+      if [[ -f "$md" ]]; then
+        local rest; rest=$(_host_companion_md_without_block)
+        if [[ -n "${rest//[$'\n ']/}" ]]; then _host_companion_write "$md" 0644 "${rest}"$'\n'; else rm -f "$md"; fi
+      fi
+      ok "companion box removed from this box" '{configured:false}'
+      ;;
+    *) fail "$E_USAGE" "usage: 5dive host companion [set --host=<ipv4> --host-key=<line> --key-stdin | remove]" ;;
+  esac
+}
+
 cmd_host_unit() {
   local action="${1:-}"; shift || true
   case "$action" in
@@ -757,6 +972,7 @@ cmd_host() {
     journal) cmd_host_journal "$@" ;;
     cron)    cmd_host_cron "$@" ;;
     timezone) cmd_host_timezone "$@" ;;
-    *) fail "$E_USAGE" "usage: 5dive host <unit|journal|cron|timezone> ... (see: 5dive --help)" ;;
+    companion) cmd_host_companion "$@" ;;
+    *) fail "$E_USAGE" "usage: 5dive host <unit|journal|cron|timezone|companion> ... (see: 5dive --help)" ;;
   esac
 }
