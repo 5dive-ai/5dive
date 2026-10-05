@@ -355,12 +355,27 @@ _agent_busy_state() {
   return 0
 }
 
+# A RE-MARK KEEPS THE DEBT'S AGE (DIVE-5547). The nightly update calls this for
+# every busy seat, including one that already owes a restart. Re-stamping it to
+# `now` each night meant `now - marked` never reached the 24h ceiling: a seat
+# owed its restart for 5 days while every sweep logged "0 overdue". So the old
+# stamp is kept while the unit has not started since it was written (the same
+# `started > marked` test `_pending_restart_decide` uses for already-bounced).
+# A marker older than the unit's last start is a paid debt, so a payload update
+# arriving after that restart gets a fresh stamp. An unreadable start reads 0
+# and keeps the old stamp: no evidence of a restart means the debt is still owed.
 _pending_restart_mark() {
-  local name="${1:-}" reason="${2:-payload changed}" dir
+  local name="${1:-}" reason="${2:-payload changed}" dir at old started
   [[ -n "$name" ]] || return 1
   dir="$(_pending_restart_dir)"
   mkdir -p "$dir" 2>/dev/null || return 1
-  printf 'marked_at=%s\nreason=%s\n' "$(date +%s)" "$reason" > "$dir/$name" 2>/dev/null || return 1
+  at=$(date +%s)
+  if old="$(_pending_restart_marked_at "$name")" \
+     && started="$(_unit_active_enter_epoch "5dive-agent@${name}.service")" \
+     && [[ "$old" =~ ^[0-9]+$ && "$started" =~ ^[0-9]+$ ]] && (( started <= old && old <= at )); then
+    at="$old"
+  fi
+  printf 'marked_at=%s\nreason=%s\n' "$at" "$reason" > "$dir/$name" 2>/dev/null || return 1
   chmod 0644 "$dir/$name" 2>/dev/null || true
   return 0
 }
@@ -556,7 +571,10 @@ _pending_restart_sweep() {
         _PR_OVERDUE=$((_PR_OVERDUE + 1)); _PR_DEFERRED=$((_PR_DEFERRED + 1))
         _pr_log "[$name] restart owed since $(( (now - marked) / 3600 ))h and the agent is STILL not idle — not forcing it; check whether its row is genuinely in flight" ;;
       *)
-        _PR_DEFERRED=$((_PR_DEFERRED + 1)) ;;
+        # DIVE-5547: name the seat. The pass summary only counts, so a deferral
+        # that never turns overdue was invisible in the log for every seat.
+        _PR_DEFERRED=$((_PR_DEFERRED + 1))
+        _pr_log "[$name] restart deferred (${busy}) — owed $(( (now - marked) / 3600 ))h, overdue line at $(( _PENDING_RESTART_MAX_DEFER_SECS / 3600 ))h ($(_pending_restart_reason "$name"))" ;;
     esac
   done
   return 0
