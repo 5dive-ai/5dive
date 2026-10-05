@@ -93,7 +93,13 @@ for p in "API Error: 529 {\"type\":\"overloaded_error\"}" \
          "● API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}" \
          "  ⎿  API Error: Connection error." \
          "● API Error: Repeated 529 Overloaded errors. The API is at capacity — this is usually temporary. Try again in a moment." \
-         "  ⎿  API Error: Repeated 529 Overloaded errors. The API is at capacity — this is usually temporary. Try again in a moment."; do
+         "  ⎿  API Error: Repeated 529 Overloaded errors. The API is at capacity — this is usually temporary. Try again in a moment." \
+         "● API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited" \
+         "  ⎿  API Error: Connection to the API was lost (ECONNRESET). This is usually temporary — try again." \
+         "● API Error: Server error mid-response. The response above may be incomplete." \
+         "● API Error: Connection lost before a response was produced. Try again." \
+         "● API Error: The response stalled before a response was produced. Try again." \
+         "● API Error: Please wait a moment and try again."; do
   _hb_pane_model_error $'some work\n'"$p" >/dev/null \
     && ok_t "A2 provider error reads as a model error: ${p:0:40}" \
     || bad_t "A2 provider error missed" "$p"
@@ -127,7 +133,18 @@ for p in "Fixed: /api/foo returned 500 Internal Server Error, now 200" \
          "ApiError: something" \
          "  ⎿  API error handling added to the client" \
          "  ⎿  API Error: Request was aborted." \
-         "● API Error: Request was aborted."; do
+         "● API Error: Request was aborted." \
+         "● API Error: The model has reached its context window limit." \
+         "● API Error: 400 orphaned tool_result in conversation history" \
+         "  ⎿  API Error: 400 {\"type\":\"invalid_request_error\"}" \
+         "● API Error: Usage credits required for 1M context · run /extra-usage" \
+         "● API Error: Could not load Bedrock credentials · token expired. Check your settings." \
+         "● API Error: Claude Opus 5.5's safeguards flagged this message. Rephrase it." \
+         "● API Error: Claude can't help with this. Start a new session to continue." \
+         "● API Error: An image in the conversation could not be processed and was removed. Re-attach the file if you still need it." \
+         "● API Error: Claude's response exceeded the 32000 output token maximum." \
+         "● API Error: this model does not accept PDF documents, so a PDF was removed." \
+         "● API Error: Effort 'max' isn't available with thinking turned off"; do
   _hb_pane_model_error $'some work\n'"$p"$'\n> done' >/dev/null \
     && bad_t "A3 tool output read as a model error" "$p" \
     || ok_t "A3 tool output is not a model error: ${p:0:40}"

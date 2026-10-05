@@ -2038,17 +2038,25 @@ _hb_pane_is_usage_limit() {
 # by a status or claude's own failure string, so `ApiError: something` is not
 # one; a bare `Error:` line counts only for the transient provider statuses
 # 429/5xx, since `Error: 404 Not Found` at line start is a node throw.
-# claude's words are its binary's own strings (2.1.289, quinn it4): `Repeated
-# 529 Overloaded errors` (overload retries ran out), `Request timed out`,
-# `Request rejected (429)`, `Connection error`. Not `Request was aborted`: that
-# is an interrupted turn on a healthy seat. A 400 stays out: claude's 400s are
-# a broken conversation (`400 orphaned tool_result …`), which an hour's park
-# and a re-wake cannot heal, so it is not the transient failure this parks.
+# claude's arm is INVERTED (quinn it5): five rounds of word lists kept missing
+# its transient strings (`Server is temporarily limiting requests`, `Connection
+# to the API was lost`, `The response stalled …`), so ANY `API Error: ` line
+# behind claude's ●/⎿ gutter parks, minus a denylist of the non-transient ones
+# its binary prints (2.1.289): `Request was aborted` (an interrupted turn on a
+# healthy seat), a 400 (a broken conversation, e.g. `400 orphaned tool_result`,
+# which an hour's park and a re-wake cannot heal), the context-window and
+# output-token limits, `Usage credits required`, `Could not load … credentials`,
+# a safeguards flag or refusal, a removed attachment, an unsupported PDF or
+# effort setting. Those need a person or a new session, not a retry.
+# The opencode arm (┃/│ and a bare line) keeps the status/word list above.
 _HB_GUTTER='[[:space:]]*(┃|│|●|⎿)?[[:space:]]*'
+_HB_CLAUDE_GUTTER='[[:space:]]*(●|⎿)[[:space:]]*'
+_HB_CLAUDE_NOT_TRANSIENT="Request was aborted|400([^0-9]|$)|The model has reached its context window|Claude's response exceeded the [0-9]+ output token|Usage credits required|Could not load .*credentials|.*safeguards flagged|.*can.t help with this|.* could not be processed and was removed|this model does not accept PDF|Effort '[^']*' isn.t available"
 _hb_pane_model_error() {
   local pane="$1" line
   line=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 15 \
-    | grep -iE "^${_HB_GUTTER}(AI_APICallError|ProviderError|ProviderModelNotFound[A-Za-z]*:|API ?Error:[[:space:]]*((401|403|404|408|413|429|5[0-9]{2})([^0-9]|$)|Repeated [0-9]{3}|Request (timed out|rejected)|Connection error|overloaded|rate.?limit|timed? ?out)|((401|403|404|429|5[0-9]{2})[[:space:]]+)?Something went wrong on our side|error[[:space:]]*:[[:space:]]*(429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|too many requests|overloaded|timed? ?out))" \
+    | grep -iE "^${_HB_GUTTER}(AI_APICallError|ProviderError|ProviderModelNotFound[A-Za-z]*:|API ?Error:[[:space:]]*((401|403|404|408|413|429|5[0-9]{2})([^0-9]|$)|Repeated [0-9]{3}|Request (timed out|rejected)|Connection error|overloaded|rate.?limit|timed? ?out)|((401|403|404|429|5[0-9]{2})[[:space:]]+)?Something went wrong on our side|error[[:space:]]*:[[:space:]]*(429|5[0-9]{2})([^0-9]|$).*(error|went wrong|unavailable|too many requests|overloaded|timed? ?out))|^${_HB_CLAUDE_GUTTER}API Error: " \
+    | grep -viE "^${_HB_GUTTER}API ?Error:[[:space:]]*(${_HB_CLAUDE_NOT_TRANSIENT})" \
     | tail -n 1) || return 1
   [[ -n "$line" ]] || return 1
   line=$(sed -E "s/^${_HB_GUTTER}//"'; s/^[[:space:][:punct:]]*//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' <<<"$line")
