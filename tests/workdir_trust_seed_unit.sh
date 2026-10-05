@@ -123,7 +123,7 @@ check "standard: only the trusted root is listed" "$(jqf "$H" '.projects | lengt
 # 2.1.222 walked cwd's parents without limit, so $ROOT/5dive inherited $ROOT's
 # entry and this arm used to assert "no entry added". 2.1.283 stops the walk at
 # the git repository root containing cwd, so a workdir that is its own repo never
-# reaches $ROOT — oinoa (/home/claude/projects/my-oinoa, a git repo) parked on
+# reaches $ROOT — a partner seat (/home/claude/projects/<project>, a git repo) parked on
 # the dialog for 6.6 h. The seed must not reason about the walk at all.
 H=$(run underroot claude "$ROOT/5dive")
 check "under-root workdir: entry is TRUSTED" "$(trusted "$H" "$ROOT/5dive")" "true"
@@ -131,7 +131,7 @@ check "under-root workdir: root trust survives" "$(trusted "$H" "$ROOT")" "true"
 check "under-root workdir: announces the seed" \
   "$(grep -c "trusted workdir $ROOT/5dive" "$H/.stderr")" "1"
 
-# 4b. THE oinoa SHAPE: `--workdir=<root>/<project>` where the project is a git
+# 4b. THE PARTNER SHAPE: `--workdir=<root>/<project>` where the project is a git
 # repo. A real `git init`, so the arm is the exact tree the bounded walk trips on.
 REPO="$ROOT/my-project"; mkdir -p "$REPO"
 git -C "$REPO" init -q 2>/dev/null || mkdir -p "$REPO/.git"
@@ -274,9 +274,9 @@ mut_red "keyed on the sandboxed path shape, not on the workdir" "$M4" sandboxonl
   ".projects[\"$OUTSIDE\"].hasTrustDialogAccepted" "true"
 
 # M5 — THE PRE-DIVE-5089 SKIP restored: "at or under the root is covered by the
-# parent walk". It passes every arm outside the root and strands the oinoa shape.
+# parent walk". It passes every arm outside the root and strands the partner shape.
 M5=$(swap_guard "$BLOCK" '  if [[ "$_wtr_dir" != "$DEFAULT_WORKDIR" && "$_wtr_dir" != "$DEFAULT_WORKDIR"/* ]] && true \')
-mut_red "at-or-under-root skip restored (the oinoa stall)" "$M5" underskip "$REPO" "$(preseed)" \
+mut_red "at-or-under-root skip restored (the partner stall)" "$M5" underskip "$REPO" "$(preseed)" \
   ".projects[\"$REPO\"].hasTrustDialogAccepted" "true"
 
 # M7 — skip on the KEY existing instead of the FLAG being true. Claude Code

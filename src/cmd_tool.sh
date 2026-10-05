@@ -38,15 +38,13 @@ declare -gA TOOL_ENV=(
   [elevenlabs]="ELEVENLABS_API_KEY"
   [fal]="FAL_KEY"
   [higgsfield]="HF_API_KEY HF_API_SECRET"
-  # Business apps (DIVE-5513, for OINOA): RU and EU CRMs, stock, calendars and
-  # accounting. Bitrix24 is its whole inbound-webhook URL (portal, user and code
-  # in one), amoCRM is the account's domain then its token (Pipedrive is its token
-  # alone: api.pipedrive.com needs no company domain), and
-  # Yandex Calendar is CalDAV: the login then an app password.
+  # Business apps (DIVE-5513): CRMs, calendars and accounting a partner cabinet
+  # saves for its clients. Bitrix24 is its whole inbound-webhook URL (portal, user
+  # and code in one), amoCRM is the account's domain then its token, and Pipedrive
+  # is its token alone (api.pipedrive.com needs no company domain). An app outside
+  # this list goes through --env below, not into this table.
   [bitrix24]="BITRIX24_WEBHOOK_URL"
   [amocrm]="AMOCRM_DOMAIN AMOCRM_TOKEN"
-  [moysklad]="MOYSKLAD_TOKEN"
-  [yandex-calendar]="YANDEX_LOGIN YANDEX_CALDAV_PASSWORD"
   [hubspot]="HUBSPOT_TOKEN"
   [pipedrive]="PIPEDRIVE_TOKEN"
   [notion]="NOTION_TOKEN"
@@ -57,8 +55,20 @@ declare -gA TOOL_ENV=(
   [holded]="HOLDED_API_KEY"
 )
 TOOL_IDS=(github vercel stripe cloudflare meta elevenlabs fal higgsfield
-  bitrix24 amocrm moysklad yandex-calendar hubspot pipedrive notion asana
-  calendly lexoffice sevdesk holded)
+  bitrix24 amocrm hubspot pipedrive notion asana calendly lexoffice sevdesk
+  holded)
+
+# Any other app (DIVE-5627): the CALLER names its variables, so a partner keeps
+# its own app list in its own code and this catalog stays the shared one.
+#   tool set <id> --env="A_TOKEN B_LOGIN"   tool rm <id> --env=A_TOKEN,B_LOGIN
+#   tool ls --tool=<id>:A_TOKEN,B_LOGIN     (repeatable; listed after the catalog)
+# Nothing but the keys themselves is stored. A variable must be a credential name
+# or end in _LOGIN, _USER or _DOMAIN, under the same reserved prefixes as a
+# secret-gate key (_tools_var_reserved), and may not be a catalog tool's own
+# variable: a custom id must never overwrite GH_TOKEN. --env on a catalog id must
+# name exactly its catalog variables.
+TOOL_CUSTOM_ID_RE='^[a-z][a-z0-9-]{0,31}$'
+TOOL_CUSTOM_MAX_VARS=4
 
 # Printable ASCII with no space and no single quote: every real key and token
 # fits, and the value can then sit inside '...' in a file bash sources with no
@@ -84,10 +94,14 @@ _tool_usage() {
 
   Business apps:
     bitrix24 BITRIX24_WEBHOOK_URL · amocrm AMOCRM_DOMAIN AMOCRM_TOKEN
-    moysklad MOYSKLAD_TOKEN · yandex-calendar YANDEX_LOGIN YANDEX_CALDAV_PASSWORD
     hubspot HUBSPOT_TOKEN · pipedrive PIPEDRIVE_TOKEN
     notion NOTION_TOKEN · asana ASANA_TOKEN · calendly CALENDLY_TOKEN
     lexoffice LEXOFFICE_API_KEY · sevdesk SEVDESK_API_TOKEN · holded HOLDED_API_KEY
+
+  Any other app: name its variables (credential names, or *_LOGIN/_USER/_DOMAIN)
+    5dive tool set <id> --env="APP_LOGIN APP_TOKEN"
+    5dive tool rm <id> --env="APP_LOGIN APP_TOKEN"
+    5dive tool ls --tool=<id>:APP_LOGIN,APP_TOKEN    (repeatable)
 
   Every agent's commands see them as environment variables, from their next
   command on. set and rm are root-only.
@@ -97,9 +111,13 @@ EOF
 cmd_tool() {
   local sub="${1:-}"; shift || true
   local a rest=()
+  _TOOL_ENV_ARG="" _TOOL_ENV_GIVEN=0 _TOOL_LS_EXTRA=()
   for a in "$@"; do
     case "$a" in
       --json) JSON_MODE=1 ;;
+      # Commas or spaces: a remote caller sends one argv word with no space in it.
+      --env=*) _TOOL_ENV_ARG="${a#--env=}"; _TOOL_ENV_ARG="${_TOOL_ENV_ARG//,/ }"; _TOOL_ENV_GIVEN=1 ;;
+      --tool=*) _TOOL_LS_EXTRA+=("${a#--tool=}") ;;
       *) rest+=("$a") ;;
     esac
   done
@@ -114,6 +132,44 @@ cmd_tool() {
 
 _tool_known() { [[ -n "${1:-}" && -n "${TOOL_ENV[$1]+x}" ]]; }
 
+# A custom tool's variable (see TOOL_CUSTOM_ID_RE above). Returns 0 when usable.
+_tool_custom_var_ok() {
+  local n="$1" v
+  [[ "$n" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]] || return 1
+  for v in "${TOOL_ENV[@]}"; do [[ " $v " == *" $n "* ]] && return 1; done
+  case "$n" in
+    # The suffix stands in for a credential one; the prefix rules still apply.
+    ?*_LOGIN|?*_USER|?*_DOMAIN) ! _tools_var_reserved "${n}_KEY" ;;
+    *) ! _tools_var_reserved "$n" ;;
+  esac
+}
+
+# The variables of <id>, space-separated, into _TOOL_VARS: the catalog's for a
+# catalog id, else the caller's own list (validated). Fails with a usage error.
+_tool_resolve() {
+  local id="${1:-}" given="${3:-0}" v seen=" " n=0 list
+  local -a words=()
+  read -ra words <<<"${2:-}"
+  list="${words[*]}"
+  if _tool_known "$id"; then
+    if (( given )) && [[ "$list" != "${TOOL_ENV[$id]}" ]]; then
+      fail "$E_USAGE" "$id is a catalog tool; its variables are ${TOOL_ENV[$id]}"
+    fi
+    _TOOL_VARS="${TOOL_ENV[$id]}"
+    return 0
+  fi
+  (( given )) || fail "$E_USAGE" "unknown tool '${id}' (one of: ${TOOL_IDS[*]}; any other app takes --env=\"VAR ...\")"
+  [[ "$id" =~ $TOOL_CUSTOM_ID_RE ]] || fail "$E_USAGE" "tool id must be lower-case letters, digits and dashes: '${id:0:40}'"
+  for v in "${words[@]}"; do
+    _tool_custom_var_ok "$v" \
+      || fail "$E_VALIDATION" "$v cannot be a tool variable: use a credential name (*_KEY, *_TOKEN, *_SECRET, *_PASSWORD) or *_LOGIN/_USER/_DOMAIN, not one another tool or the box already uses"
+    [[ "$seen" == *" $v "* ]] && fail "$E_USAGE" "$v is named twice in --env"
+    seen+="$v "; n=$((n+1))
+  done
+  (( n >= 1 && n <= TOOL_CUSTOM_MAX_VARS )) || fail "$E_USAGE" "--env names 1 to $TOOL_CUSTOM_MAX_VARS variables, space-separated"
+  _TOOL_VARS="$list"
+}
+
 # The vars that have a non-empty line in the file. Names only: the value is
 # never read into a variable. A file with no key left in it (rm of the last
 # one keeps the header) is a grep no-match, exit 1, which pipefail would turn
@@ -126,12 +182,21 @@ _tool_set_vars() {
 }
 
 _tool_ls() {
-  local have id v connected out="[]"
+  local have id v connected out="[]" spec ids=() envs=() i
+  for id in "${TOOL_IDS[@]}"; do ids+=("$id"); envs+=("${TOOL_ENV[$id]}"); done
+  for spec in "${_TOOL_LS_EXTRA[@]}"; do
+    id="${spec%%:*}"
+    [[ "$spec" == *:* ]] || fail "$E_USAGE" "--tool takes <id>:VAR[,VAR...], got '${spec:0:60}'"
+    _tool_known "$id" && continue
+    v="${spec#*:}"
+    _tool_resolve "$id" "${v//,/ }" 1
+    ids+=("$id"); envs+=("$_TOOL_VARS")
+  done
   have=" $(_tool_set_vars | tr '\n' ' ') "
-  for id in "${TOOL_IDS[@]}"; do
+  for i in "${!ids[@]}"; do
     connected=true
-    for v in ${TOOL_ENV[$id]}; do [[ "$have" == *" $v "* ]] || connected=false; done
-    out=$(jq -c --arg id "$id" --arg env "${TOOL_ENV[$id]}" --argjson c "$connected" \
+    for v in ${envs[$i]}; do [[ "$have" == *" $v "* ]] || connected=false; done
+    out=$(jq -c --arg id "${ids[$i]}" --arg env "${envs[$i]}" --argjson c "$connected" \
       '. + [{id: $id, env: ($env | split(" ")), connected: $c}]' <<<"$out")
   done
   if (( JSON_MODE )); then
@@ -177,30 +242,31 @@ _tool_put_var() {
 _tool_set() {
   local id="${1:-}"
   require_root tool set
-  _tool_known "$id" || fail "$E_USAGE" "unknown tool '${id}' (one of: ${TOOL_IDS[*]})"
-  [[ -t 0 ]] && fail "$E_USAGE" "the key goes on stdin, one line per field: ${TOOL_ENV[$id]}"
-  local vars=(${TOOL_ENV[$id]}) vals=() line i add=""
+  _tool_resolve "$id" "$_TOOL_ENV_ARG" "$_TOOL_ENV_GIVEN"
+  local env="$_TOOL_VARS"
+  [[ -t 0 ]] && fail "$E_USAGE" "the key goes on stdin, one line per field: $env"
+  local vars=($env) vals=() line i add=""
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     vals+=("$line")
   done
   # One field per var, no more: an extra line is a paste gone wrong, not a key.
   (( ${#vals[@]} == ${#vars[@]} )) \
-    || fail "$E_VALIDATION" "$id takes ${#vars[@]} value(s) (${TOOL_ENV[$id]}), got ${#vals[@]}. Nothing was saved"
+    || fail "$E_VALIDATION" "$id takes ${#vars[@]} value(s) ($env), got ${#vals[@]}. Nothing was saved"
   for i in "${!vars[@]}"; do
     _tool_value_ok "${vals[$i]}" \
       || fail "$E_VALIDATION" "${vars[$i]} must be one line of printable characters, no spaces or quotes. Nothing was saved"
     add+="export ${vars[$i]}='${vals[$i]}'"$'\n'
   done
-  _tool_rewrite "${TOOL_ENV[$id]}" "$add"
-  ok "$id key saved; agents see ${TOOL_ENV[$id]} from their next command" \
-     '{tool: $t, env: ($e | split(" ")), connected: true}' --arg t "$id" --arg e "${TOOL_ENV[$id]}"
+  _tool_rewrite "$env" "$add"
+  ok "$id key saved; agents see $env from their next command" \
+     '{tool: $t, env: ($e | split(" ")), connected: true}' --arg t "$id" --arg e "$env"
 }
 
 _tool_rm() {
   local id="${1:-}"
   require_root tool rm
-  _tool_known "$id" || fail "$E_USAGE" "unknown tool '${id}' (one of: ${TOOL_IDS[*]})"
-  [[ -f "$TOOLS_ENV_FILE" ]] && _tool_rewrite "${TOOL_ENV[$id]}" ""
+  _tool_resolve "$id" "$_TOOL_ENV_ARG" "$_TOOL_ENV_GIVEN"
+  [[ -f "$TOOLS_ENV_FILE" ]] && _tool_rewrite "$_TOOL_VARS" ""
   ok "$id key removed" '{tool: $t, connected: false}' --arg t "$id"
 }

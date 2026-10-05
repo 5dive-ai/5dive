@@ -68,7 +68,7 @@ resolve_model_alias() {
 # answer to "sonnet". Claude Code applies that map to ALIASES only — a full
 # claude-* id goes out as-is, and OpenRouter serves claude-sonnet-5 as real
 # Claude Sonnet at API price. So resolve_model_alias above is wrong for these
-# accounts: an OINOA pack's "sonnet" became a Claude Sonnet bill on a box whose
+# accounts: a partner pack's "sonnet" became a Claude Sonnet bill on a box whose
 # account says sonnet = deepseek/deepseek-v4.1-flash.
 #
 # On such an account the family resolves to the account's MAPPED id instead. A

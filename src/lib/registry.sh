@@ -1,5 +1,5 @@
 # DIVE-5526: the wait is bounded. A bare `flock -x` waited forever, so a lock
-# that is never released (gold-rune.oinoa.com, 2026-10-04: a killed `account set`
+# that is never released (a partner box, 2026-10-04: a killed `account set`
 # left a child holding fd 200) hung every later create and import until the
 # caller's own cap killed it, with nothing printed. Past the wait the verb fails
 # and names who holds the lock. FIVEDIVE_REGISTRY_LOCK_WAIT (seconds) overrides

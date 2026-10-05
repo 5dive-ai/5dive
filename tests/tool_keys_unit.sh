@@ -50,7 +50,7 @@ out=$(run ls)
 gh=$(jq -r '.data.tools[] | select(.id=="github") | .connected' <<<"$out")
 el=$(jq -r '.data.tools[] | select(.id=="elevenlabs") | .connected' <<<"$out")
 n=$(jq -r '.data.tools | length' <<<"$out")
-[[ "$gh" == true && "$el" == false && "$n" == 20 ]] && ok_t "T2 ls: github connected, elevenlabs not, 20 tools" || bad_t "T2 ls" "$out"
+[[ "$gh" == true && "$el" == false && "$n" == 18 ]] && ok_t "T2 ls: github connected, elevenlabs not, 18 tools" || bad_t "T2 ls" "$out"
 [[ "$out" != *ghp_FAKE* ]] && ok_t "T2 ls never prints a key" || bad_t "T2 ls leaks" "$out"
 
 # --- T3: replace is idempotent; another tool's line survives -------------------
@@ -145,26 +145,23 @@ for t in elevenlabs meta; do run rm "$t" >/dev/null; done
 out=$( ( set -euo pipefail; cmd_tool ls ) 2>&1 ); rc=$?
 gh=$(jq -r '.data.tools[] | select(.id=="github") | .connected' <<<"$out" 2>/dev/null)
 n=$(jq -r '.data.tools | length' <<<"$out" 2>/dev/null)
-[[ $rc -eq 0 && "$gh" == false && "$n" == 20 ]] && ok_t "T10 ls with every key removed: rc 0, 20 tools, none connected" || bad_t "T10 ls after last rm" "rc=$rc $out"
+[[ $rc -eq 0 && "$gh" == false && "$n" == 18 ]] && ok_t "T10 ls with every key removed: rc 0, 18 tools, none connected" || bad_t "T10 ls after last rm" "rc=$rc $out"
 
-# --- T11: the business apps (DIVE-5513, OINOA) ---------------------------------
-# The twelve ids, each with its vars in stdin order, after the first eight.
+# --- T11: the business apps (DIVE-5513) -----------------------------------------
+# The ten ids, each with its vars in stdin order, after the first eight.
 out=$(run ls)
-want='bitrix24=BITRIX24_WEBHOOK_URL amocrm=AMOCRM_DOMAIN,AMOCRM_TOKEN moysklad=MOYSKLAD_TOKEN yandex-calendar=YANDEX_LOGIN,YANDEX_CALDAV_PASSWORD hubspot=HUBSPOT_TOKEN pipedrive=PIPEDRIVE_TOKEN notion=NOTION_TOKEN asana=ASANA_TOKEN calendly=CALENDLY_TOKEN lexoffice=LEXOFFICE_API_KEY sevdesk=SEVDESK_API_TOKEN holded=HOLDED_API_KEY'
+want='bitrix24=BITRIX24_WEBHOOK_URL amocrm=AMOCRM_DOMAIN,AMOCRM_TOKEN hubspot=HUBSPOT_TOKEN pipedrive=PIPEDRIVE_TOKEN notion=NOTION_TOKEN asana=ASANA_TOKEN calendly=CALENDLY_TOKEN lexoffice=LEXOFFICE_API_KEY sevdesk=SEVDESK_API_TOKEN holded=HOLDED_API_KEY'
 got=$(jq -r '[.data.tools[8:][] | "\(.id)=\(.env | join(","))"] | join(" ")' <<<"$out")
-[[ "$got" == "$want" ]] && ok_t "T11 ls lists the 12 business apps after the 8, vars in stdin order" || bad_t "T11 business ids" "got: $got"
-url='https://acme.bitrix24.ru/rest/1/abc123def456/'
+[[ "$got" == "$want" ]] && ok_t "T11 ls lists the 10 business apps after the 8, vars in stdin order" || bad_t "T11 business ids" "got: $got"
+url='https://acme.bitrix24.com/rest/1/abc123def456/'
 out=$(printf '%s\n' "$url" | run set bitrix24); rc=$?
 [[ $rc -eq 0 && "$(grep -c "^export BITRIX24_WEBHOOK_URL='${url}'$" "$F")" == 1 && "$(seen BITRIX24_WEBHOOK_URL)" == "$url" ]] \
   && ok_t "T11 bitrix24: the webhook URL is one export line a fresh bash sees" || bad_t "T11 bitrix24" "rc=$rc $out $(cat "$F")"
 c=$(run ls | jq -r '.data.tools[] | select(.id=="bitrix24") | .connected')
 [[ "$c" == true ]] && ok_t "T11 ls: bitrix24 connected" || bad_t "T11 bitrix24 ls" "$c"
-out=$(printf 'acme.amocrm.ru\nlongLivedFAKE.token-123\n' | run set amocrm); rc=$?
-[[ $rc -eq 0 && "$(seen AMOCRM_DOMAIN)" == acme.amocrm.ru && "$(seen AMOCRM_TOKEN)" == longLivedFAKE.token-123 ]] \
+out=$(printf 'acme.amocrm.com\nlongLivedFAKE.token-123\n' | run set amocrm); rc=$?
+[[ $rc -eq 0 && "$(seen AMOCRM_DOMAIN)" == acme.amocrm.com && "$(seen AMOCRM_TOKEN)" == longLivedFAKE.token-123 ]] \
   && ok_t "T11 amocrm: domain then token" || bad_t "T11 amocrm" "rc=$rc $out"
-out=$(printf 'ivan@yandex.ru\nappPassFAKE16chr\n' | run set yandex-calendar); rc=$?
-[[ $rc -eq 0 && "$(seen YANDEX_LOGIN)" == ivan@yandex.ru && "$(seen YANDEX_CALDAV_PASSWORD)" == appPassFAKE16chr ]] \
-  && ok_t "T11 yandex-calendar (a hyphenated id): login then app password" || bad_t "T11 yandex-calendar" "rc=$rc $out"
 out=$(printf 'only-one-line\n' | run set amocrm); rc=$?
 [[ $rc -ne 0 && "$out" == *"takes 2 value"* ]] && ok_t "T11 amocrm with one line refused" || bad_t "T11 amocrm one line" "rc=$rc $out"
 out=$(printf 'pdFAKEtoken0123456789\n' | run set pipedrive); rc=$?
@@ -173,6 +170,42 @@ out=$(printf 'pdFAKEtoken0123456789\n' | run set pipedrive); rc=$?
 out=$(run rm bitrix24); rc=$?
 [[ $rc -eq 0 && -z "$(seen BITRIX24_WEBHOOK_URL)" && "$(seen AMOCRM_TOKEN)" == longLivedFAKE.token-123 ]] \
   && ok_t "T11 rm bitrix24 drops its line, amocrm kept" || bad_t "T11 rm bitrix24" "rc=$rc $(cat "$F")"
+
+# --- T12: an app outside the catalog, its variables named by the caller (DIVE-5627)
+# A partner keeps its own app list; the box stores only the keys.
+out=$(printf 'user@example.com\nappPassFAKE16chr\n' | run set acme-cal --env="ACME_LOGIN ACME_CALDAV_PASSWORD"); rc=$?
+[[ $rc -eq 0 && "$(seen ACME_LOGIN)" == user@example.com && "$(seen ACME_CALDAV_PASSWORD)" == appPassFAKE16chr \
+   && "$(jq -r '.data.env | join(",")' <<<"$out")" == ACME_LOGIN,ACME_CALDAV_PASSWORD ]] \
+  && ok_t "T12 set acme-cal --env: login then password, in stdin order" || bad_t "T12 custom set" "rc=$rc $out"
+out=$(printf 'stockFAKEtoken\n' | run set acme-stock --env=ACME_STOCK_TOKEN); rc=$?
+[[ $rc -eq 0 && "$(seen ACME_STOCK_TOKEN)" == stockFAKEtoken ]] && ok_t "T12 a one-variable custom tool" || bad_t "T12 one var" "rc=$rc $out"
+out=$(run ls --tool=acme-cal:ACME_LOGIN,ACME_CALDAV_PASSWORD --tool=acme-stock:ACME_STOCK_TOKEN --tool=acme-crm:ACME_CRM_TOKEN)
+got=$(jq -r '[.data.tools[18:][] | "\(.id)=\(.env | join(","))=\(.connected)"] | join(" ")' <<<"$out")
+[[ "$got" == "acme-cal=ACME_LOGIN,ACME_CALDAV_PASSWORD=true acme-stock=ACME_STOCK_TOKEN=true acme-crm=ACME_CRM_TOKEN=false" ]] \
+  && ok_t "T12 ls --tool lists custom ids after the catalog, connected from the keys" || bad_t "T12 ls --tool" "got: $got"
+n=$(run ls | jq -r '.data.tools | length')
+[[ "$n" == 18 ]] && ok_t "T12 a plain ls lists the catalog only" || bad_t "T12 plain ls" "$n"
+n=$(run ls --tool=github:GH_TOKEN | jq -r '.data.tools | length')
+[[ "$n" == 18 ]] && ok_t "T12 --tool on a catalog id adds no second row" || bad_t "T12 catalog --tool" "$n"
+out=$(printf 'x\n' | run set acme-x); rc=$?
+[[ $rc -ne 0 && "$out" == *"unknown tool"* && "$out" == *"--env"* ]] && ok_t "T12 an unknown id without --env: refused, names --env" || bad_t "T12 no --env" "rc=$rc $out"
+before=$(cat "$F")
+for bad in "GH_TOKEN" "PATH" "HTTPS_PROXY" "NODE_AUTH_TOKEN" "ANTHROPIC_LOGIN" "acme_token" "AMOCRM_TOKEN"; do
+  out=$(printf 'v\n' | run set acme-bad --env="$bad"); rc=$?
+  [[ $rc -ne 0 ]] && ok_t "T12 --env=$bad refused" || bad_t "T12 --env=$bad accepted" "$out"
+done
+out=$(printf 'v\nw\n' | run set acme-bad --env="ACME_TOKEN ACME_TOKEN"); rc=$?
+[[ $rc -ne 0 ]] && ok_t "T12 a variable named twice refused" || bad_t "T12 twice" "$out"
+out=$(printf 'v\n' | run set Acme --env=ACME_TOKEN); rc=$?
+[[ $rc -ne 0 ]] && ok_t "T12 an upper-case id refused" || bad_t "T12 id shape" "$out"
+out=$(printf 'v\n' | run set github --env=OTHER_TOKEN); rc=$?
+[[ $rc -ne 0 && "$out" == *"catalog tool"* ]] && ok_t "T12 --env on a catalog id that disagrees: refused" || bad_t "T12 catalog --env" "rc=$rc $out"
+[[ "$(cat "$F")" == "$before" ]] && ok_t "T12 no refused set touched the key file" || bad_t "T12 file changed on refusal" "$(cat "$F")"
+out=$(printf 'ghp_THIRD123456789\n' | run set github --env=GH_TOKEN); rc=$?
+[[ $rc -eq 0 && "$(seen GH_TOKEN)" == ghp_THIRD123456789 ]] && ok_t "T12 --env naming a catalog id's own variable is accepted" || bad_t "T12 catalog same --env" "rc=$rc $out"
+out=$(run rm acme-cal --env=ACME_LOGIN,ACME_CALDAV_PASSWORD); rc=$?
+[[ $rc -eq 0 && -z "$(seen ACME_LOGIN)" && -z "$(seen ACME_CALDAV_PASSWORD)" && "$(seen ACME_STOCK_TOKEN)" == stockFAKEtoken ]] \
+  && ok_t "T12 rm acme-cal --env=A,B (commas) drops both lines, acme-stock kept" || bad_t "T12 custom rm" "rc=$rc $(cat "$F")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

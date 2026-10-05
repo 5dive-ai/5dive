@@ -53,7 +53,7 @@ ENVF="$CH/.env"
 TOKEN1='1:aaaaaaaaaaaaaaaaaaaaaaaa'
 printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN1" >"$ENVF"; chmod 600 "$ENVF"
 printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN1" >"$CONNECTORS_DIR/telegram-swan.env"
-URL='https://t.me/OinoaAppBot?startapp'
+URL='https://t.me/AcmeAppBot?startapp'
 
 _tg_access_state_dir() {
   case "$2" in

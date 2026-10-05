@@ -2,9 +2,9 @@
 # DIVE-5514 — an opencode seat imported onto the seeded OpenRouter account is
 # pinned to the account's model.
 #
-# THE BUG: Anthropic region-blocks Russia, so 5dive-api imports a Russian
-# partner box's agents onto opencode, bound to the box's seeded `openrouter`
-# account. A non-BYO import never wrote opencode.json, so the seat ran whatever
+# THE BUG: a partner box in a region Anthropic does not serve cannot run Claude
+# Code, so 5dive-api imports its agents onto opencode, bound to the box's seeded
+# `openrouter` account. A non-BYO import never wrote opencode.json, so the seat ran whatever
 # OpenCode picks by default for OpenRouter — not the account's model, and not
 # what the box's spend cap was set up for.
 #

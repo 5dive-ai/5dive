@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DIVE-5163 — a family alias resolves against the ACCOUNT the agent is bound to.
 #
-# THE BUG: every OINOA pack carries config.model "sonnet". The import path
+# THE BUG: every partner pack carries config.model "sonnet". The import path
 # resolved it with resolve_model_alias -> claude-sonnet-5 whatever the account,
 # and Claude Code sends a full id past the account's ANTHROPIC_DEFAULT_* map. On
 # a partner box bound to the seeded OpenRouter account (every tier mapped to
