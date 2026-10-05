@@ -970,6 +970,97 @@ _compose_adoptable_solo() {
     | .key' <<<"$spec" 2>/dev/null
 }
 
+# DIVE-5606 — ADOPT BY PERSONA, NOT BY NAME.
+#
+# _compose_adoptable_solo above only sees a solo agent whose NAME is the seat's
+# name. Curated templates name their seats by ROLE (startup's lead is `ceo:` with
+# `pack: olivia`, DIVE-5263), so solo `olivia` + `team import startup` made a
+# second Olivia called `ceo`, and the whole team reported to the clone.
+#
+# For each declared seat whose name is NOT on the box and that declares `pack: X`,
+# the candidates are the agents on the box whose registry pack slug is X, that are
+# solo (not in <bound>) and whose name is not itself a declared seat. Exactly one
+# candidate fills the seat under ITS OWN name; several fill nothing and are
+# reported, because picking one would be a guess. A pack declared by two seats is
+# skipped (one agent cannot fill both). Prints
+#   {"adopt": {"<seat>": "<agent>"}, "ambiguous": [{"seat","pack","agents"}]}
+_compose_seat_adoptions() {
+  local spec="$1" reg="$2" bound="${3:-}"
+  jq -c --argjson reg "$reg" --arg bound "$bound" '
+    ($bound | split("\n") | map(select(length > 0))) as $b
+    | (.agents | keys) as $decl
+    | [.agents | to_entries[] | .value.pack // empty | select(length > 0)] as $packs
+    | [ .agents | to_entries[]
+        | select((.value.pack // "") | length > 0)
+        | select($reg.agents[.key] == null)
+        | .value.pack as $p
+        | select([$packs[] | select(. == $p)] | length == 1)
+        | { seat: .key, pack: $p,
+            agents: [ ($reg.agents // {}) | to_entries[]
+                      | select((.value.pack.slug // "") == $p)
+                      | .key
+                      | select(. as $n | ($b | index($n) | not) and ($decl | index($n) | not)) ] }
+        | select(.agents | length > 0) ] as $c
+    | { adopt: ([$c[] | select(.agents | length == 1) | {key: .seat, value: .agents[0]}] | from_entries),
+        ambiguous: [$c[] | select(.agents | length > 1)] }' <<<"$spec" 2>/dev/null \
+    || printf '{"adopt":{},"ambiguous":[]}'
+}
+
+# Rename the seats a {seat:agent} map names, and every reports_to edge pointing
+# at them. Same two places _compose_apply_name_prefix rewrites, for the same
+# reason: `.agents` keys and `reports_to` are the only places a spec names an agent.
+_compose_apply_seat_map() {
+  local spec="$1" map="$2"
+  [[ -n "$map" && "$map" != "{}" ]] || { printf '%s' "$spec"; return 0; }
+  jq -c --argjson m "$map" '
+    def rn: ($m[.] // .);
+    .agents |= with_entries(
+        .value.reports_to = (
+          .value.reports_to
+          | if . == null then null elif type == "array" then map(rn) else rn end))
+    | .agents |= with_entries(.key |= rn)
+  ' <<<"$spec"
+}
+
+# An adopted agent keeps its OWN harness, model and effort: the seat's
+# `type:`/`model:`/`effort:` were written for a seat created from scratch, and
+# pinning `model: opus` onto a codex Olivia breaks her. Role, manager,
+# instructions and goals still apply.
+_compose_adopted_spec() {
+  jq -c --arg n "$2" '.agents[$n] |= del(.model, .effort)' <<<"$1"
+}
+
+# Where `team import` records which seats it filled with an agent of another
+# name, so a re-import, `team ps` and the lead lookup keep reading `ceo` as olivia.
+_team_seat_map_path() { printf '%s/teams/%s.seats.json' "${STATE_DIR:-/var/lib/5dive}" "$1"; }
+
+# Record the map after a successful `up`. Merged over what is there (an earlier
+# import's seat stays recorded); an empty map writes nothing. Best-effort, like
+# the project row: it may not turn an import that worked into a failure.
+_team_seat_map_write() {
+  local key="$1" map="$2" f cur
+  [[ -n "$key" && -n "$map" && "$map" != "{}" ]] || return 0
+  f=$(_team_seat_map_path "$key")
+  mkdir -p "${f%/*}" 2>/dev/null || return 0
+  cur=$(jq -c 'if type == "object" then . else {} end' "$f" 2>/dev/null) || cur='{}'
+  [[ -n "$cur" ]] || cur='{}'
+  jq -cn --argjson a "$cur" --argjson b "$map" '$a + $b' > "$f.tmp" 2>/dev/null \
+    && chmod 644 "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f" \
+    || { rm -f "$f.tmp"; warn "could not record which seats were filled by agents already on the box ($f) — a re-import may not find them"; }
+}
+
+# The recorded {seat:agent} map, narrowed to entries still true: the agent is on
+# the box and nothing has since taken the seat's own name. `{}` when none.
+_team_seat_map_read() {
+  local key="$1" reg="$2" f
+  f=$(_team_seat_map_path "$key")
+  [[ -n "$key" && -r "$f" ]] || { printf '{}'; return 0; }
+  jq -c --argjson reg "$reg" '
+    if type == "object" then with_entries(select(
+        (.value | type) == "string" and $reg.agents[.value] != null and $reg.agents[.key] == null))
+    else {} end' "$f" 2>/dev/null || printf '{}'
+}
+
 # Rewrite every place prose ADDRESSES a renamed agent (stdin -> stdout) through
 # a {old:new} map. Members are often named with plain words (outreach, creative,
 # scout, editor), so a bare word is never renamed: "partner outreach" and "ad
@@ -1110,7 +1201,18 @@ HELP
   # rather than truncate: a truncated name is a DIFFERENT agent, and silently
   # provisioning one is the same class of defect as the silent adoption this row
   # exists to stop.
-  local COMPOSE_NAME_MAP=""
+  local COMPOSE_NAME_MAP="" _seat_applied='{}'
+  # DIVE-5606: seats `team import` filled with an agent of ANOTHER name (startup's
+  # `ceo` seat -> solo olivia). Renamed here, before anything reads the spec, and
+  # the same map rewrites every teammate's ADDRESSES (instructions, pack
+  # CLAUDE.md), so nobody is told to `agent send ceo`. Never combined with a
+  # prefix: under a namespace nothing is adopted, and `team import` passes one or
+  # the other.
+  if [[ -z "$name_prefix" && -n "${COMPOSE_SEAT_MAP:-}" && "${COMPOSE_SEAT_MAP}" != "{}" ]]; then
+    spec=$(_compose_apply_seat_map "$spec" "$COMPOSE_SEAT_MAP") \
+      || fail "$E_VALIDATION" "could not apply the adopted seats to the spec"
+    COMPOSE_NAME_MAP="$COMPOSE_SEAT_MAP"; _seat_applied="$COMPOSE_SEAT_MAP"
+  fi
   if [[ -n "$name_prefix" ]]; then
     local _pfx_bad
     _pfx_bad=$(_compose_prefix_overflow "$spec" "$name_prefix")
@@ -1144,6 +1246,7 @@ HELP
   # child `agent create` output — that output is a clack render and parsing it would
   # break the moment the renderer changes.
   local -a _brought_up_names=()
+  local -a _adopted_names=()
   mapfile -t names < <(jq -r '.agents | keys[]' <<<"$spec")
   if (( ${#names[@]} == 0 )); then
     warn "spec has no agents declared"
@@ -1169,7 +1272,8 @@ HELP
       # existing agent takes the untouched-adopt path below, as before.
       if [[ -n "${COMPOSE_ADOPT_REWIRE:-}" ]] && grep -qxF -- "$name" <<<"$COMPOSE_ADOPT_REWIRE"; then
         step "[$name] is already on this box on its own — it joins this team (no second copy)"
-        _compose_wire_role "$spec" "$name" "$spec_dir" "$self" || true
+        _compose_wire_role "$(_compose_adopted_spec "$spec" "$name")" "$name" "$spec_dir" "$self" || true
+        _adopted_names+=("$name")
         if bash "$self" agent start "$name" >/dev/null 2>&1; then
           ((started++)) || true
         else
@@ -1342,7 +1446,15 @@ HELP
   done
 
   if (( JSON_MODE )); then
-    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d, no_channel:$nc, loops:{created:($lc|tonumber), existing:($le|tonumber), errors:($lerr|tonumber), retry:$lr}}' \
+    # DIVE-5606: `adopted` is what lets a hire screen say "Olivia is already on
+    # your box, she leads this team" instead of counting a new CEO. `seat` is the
+    # template's name for the role; `agent` is who fills it. `adopt_ambiguous`:
+    # seats whose persona is on the box more than once, so none was taken.
+    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d, no_channel:$nc, loops:{created:($lc|tonumber), existing:($le|tonumber), errors:($lerr|tonumber), retry:$lr}, adopted:$ad, adopt_ambiguous:$aa}' \
+      --argjson ad "$(printf '%s\n' "${_adopted_names[@]+"${_adopted_names[@]}"}" | jq -R 'select(length>0)' | jq -sc \
+          --argjson m "$_seat_applied" --argjson spec "$spec" \
+          'map(. as $n | {agent: $n, seat: (($m | to_entries | map(select(.value == $n)) | .[0].key) // $n), role: ($spec.agents[$n].role // null), pack: ($spec.agents[$n].pack // null)})')" \
+      --argjson aa "${COMPOSE_SEAT_AMBIGUOUS:-[]}" \
       --arg f "$file" --arg c "$created" --arg s "$started" --arg k "$skipped" --arg e "$errors" \
       --argjson a "$(printf '%s\n' "${_asleep[@]+"${_asleep[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')" \
       --arg sf "${#_degraded[@]}" \
@@ -2202,6 +2314,9 @@ HELP
         # template must not hide the ones that are.
         [[ "$(_team_schema_version "$ps_candidate")" -le "$TEAM_SCHEMA_MAX" ]] 2>/dev/null || continue
         ps_spec=$(TEAM_AUTH_PROFILE="${TEAM_AUTH_PROFILE:-__team_ps__}" _compose_parse "$ps_candidate" 2>/dev/null) || continue
+        # DIVE-5606: a seat filled by an agent of another name is present.
+        ps_spec=$(_compose_apply_seat_map "$ps_spec" \
+                    "$(_team_seat_map_read "$(_team_slug_key "$ps_slug")" "$ps_reg")") || continue
         if jq -e --argjson reg "$ps_reg" \
           '(.agents | length) > 0 and ([.agents | keys[] as $n | $reg.agents[$n] != null] | all)' \
           <<<"$ps_spec" >/dev/null; then
@@ -2345,6 +2460,34 @@ HELP
   fi
   [[ -n "$COMPOSE_TEAM_MANIFEST" ]] || warn "could not save this team's manifest to $(_team_manifest_path "${slug_key:-<key>}") — the roster still comes up, but no role is told where its policy (e.g. channel tiers) lives. Copy the template there by hand and tell each role its path."
   spec_for_prefix=$(_compose_parse "$file" 2>/dev/null) || spec_for_prefix=""
+  local spec_declared="$spec_for_prefix"
+
+  # ---- DIVE-5606: a seat named by ROLE is filled by the PERSONA on the box ----
+  # Before the ladder, so every rung reads the roster under the names it will
+  # actually have: solo olivia fills startup's `ceo` seat, the root IS olivia,
+  # and her name colliding with herself is the adopt-solo rung. The recorded map
+  # of an earlier import is read first, so a re-import finds the team where it
+  # left it instead of creating the `ceo` it once did not. Not under an explicit
+  # --prefix=<p>: a namespace adopts nobody.
+  local COMPOSE_SEAT_MAP="{}" COMPOSE_SEAT_AMBIGUOUS="[]"
+  if [[ -n "$spec_for_prefix" ]] && { (( ! prefix_set )) || [[ -z "$name_prefix" ]]; }; then
+    local _reg0 _fresh
+    _reg0=$(registry_read 2>/dev/null || echo '{}')
+    _fresh=$(_compose_seat_adoptions "$spec_for_prefix" "$_reg0" "$(_compose_org_bound)")
+    COMPOSE_SEAT_MAP=$(jq -cn --argjson f "$_fresh" --argjson r "$(_team_seat_map_read "$slug_key" "$_reg0")" \
+                         --argjson d "$spec_for_prefix" \
+                         '($f.adopt // {}) + $r | with_entries(select($d.agents[.key] != null))' 2>/dev/null) \
+      || COMPOSE_SEAT_MAP="{}"
+    COMPOSE_SEAT_AMBIGUOUS=$(jq -c '.ambiguous // []' <<<"$_fresh" 2>/dev/null) || COMPOSE_SEAT_AMBIGUOUS="[]"
+    if [[ "$COMPOSE_SEAT_MAP" != "{}" ]]; then
+      spec_for_prefix=$(_compose_apply_seat_map "$spec_for_prefix" "$COMPOSE_SEAT_MAP") || {
+        spec_for_prefix="$spec_declared"; COMPOSE_SEAT_MAP="{}"; }
+    fi
+    local _amb
+    while IFS= read -r _amb; do
+      [[ -n "$_amb" ]] && warn "$_amb"
+    done < <(jq -r '.[] | "the \(.seat) seat is \(.pack)'"'"'s, and \(.pack) is on this box more than once (\(.agents | join(", "))) — none of them was picked to fill it, so a new \(.seat) is created. Fold the extra copies into one, then re-import to have it lead this seat."' <<<"$COMPOSE_SEAT_AMBIGUOUS" 2>/dev/null)
+  fi
   root_name=""
   [[ -n "$spec_for_prefix" ]] && root_name=$(_compose_spec_root "$spec_for_prefix" 2>/dev/null) || root_name=""
 
@@ -2354,6 +2497,16 @@ HELP
                 "$(registry_read 2>/dev/null || echo '{}')" \
                 "$(_team_installed_lead "$slug_key")" "$root_name" \
                 "$(_compose_org_bound)"); _rc=$?
+    # A namespace means somebody else's roster is in the way: nothing is adopted,
+    # so the ladder is re-read under the template's own names.
+    if [[ "$COMPOSE_SEAT_MAP" != "{}" ]] && { (( _rc != 0 )) || [[ -n "${_choice#*|}" ]]; }; then
+      COMPOSE_SEAT_MAP="{}"; spec_for_prefix="$spec_declared"
+      root_name=$(_compose_spec_root "$spec_for_prefix" 2>/dev/null) || root_name=""
+      _choice=$(_team_choose_prefix "$slug_key" "$spec_for_prefix" \
+                  "$(registry_read 2>/dev/null || echo '{}')" \
+                  "$(_team_installed_lead "$slug_key")" "$root_name" \
+                  "$(_compose_org_bound)"); _rc=$?
+    fi
     case "$_rc" in
       0) name_prefix="${_choice#*|}" ;;
       *) fail "$E_VALIDATION" "$_choice" ;;
@@ -2378,11 +2531,17 @@ HELP
                              "$(registry_read 2>/dev/null || echo '{}')" "$(_compose_org_bound)")
   fi
 
+  local _seat _agent
+  while IFS=$'\t' read -r _seat _agent; do
+    [[ -n "$_seat" ]] && step "$_agent is already on this box with the persona the '$_seat' seat asks for — $_agent fills that seat under its own name (memory, channels and bot kept), and every teammate addresses $_agent"
+  done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<<"$COMPOSE_SEAT_MAP" 2>/dev/null)
+
   step "importing team from $file"
   local -a _up_args=(-f "$file")
   [[ -n "$type_override" ]] && _up_args+=("--type=$type_override")
   [[ -n "$name_prefix"   ]] && _up_args+=("--prefix=$name_prefix")
   cmd_compose_up "${_up_args[@]}" || return $?
+  _team_seat_map_write "$slug_key" "$COMPOSE_SEAT_MAP" || true
 
   # ---- DIVE-4822: an import now writes the TEAM, not just the roster ---------
   # Best-effort, and deliberately AFTER the roster is up: a team row over a
@@ -2441,6 +2600,13 @@ HELP
 
   local spec self browser_mode
   spec=$(_compose_parse "$file") || fail "$E_VALIDATION" "spec parse failed"
+  # DIVE-5606: under `team ps`, a seat `team import` filled with an agent of
+  # another name reports that agent, not a missing `ceo`.
+  if [[ -n "${COMPOSE_TEAM_MANIFEST:-}" ]]; then
+    local _ps_key="${COMPOSE_TEAM_MANIFEST##*/}"; _ps_key="${_ps_key%.5dive.yaml}"
+    spec=$(_compose_apply_seat_map "$spec" "$(_team_seat_map_read "$_ps_key" "$(registry_read 2>/dev/null || echo '{}')")") \
+      || fail "$E_VALIDATION" "could not apply this team's adopted seats to the spec"
+  fi
   if [[ -n "$type_override" ]]; then
     spec=$(_compose_apply_type_override "$spec" "$type_override") \
       || fail "$E_VALIDATION" "could not apply --type=$type_override to the spec"
