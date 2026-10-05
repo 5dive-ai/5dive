@@ -1179,6 +1179,64 @@ _agent_dispatch_supports_control() {
   printf '%s' "$health" | jq -e --arg v "$verb" '(.controls // []) | index($v) != null' >/dev/null 2>&1
 }
 
+# DIVE-5608: is a dispatcher seat mid-turn? Echoes idle | busy (rc 0) on a
+# definite reading, nothing (rc 1) when there is none.
+#
+# A dispatcher seat has no Claude session for `claude agents --json`, and its
+# pane is the dispatcher's own log stream, which never shows a composer. So the
+# restart busy check read every such seat as busy forever and the nightly bridge
+# update never ran (measured on divine-owl 2026-10-05: olivia on bridge 0.5.30
+# with 0.5.32 installed, "1 still deferred" every sweep since 03:01Z). The
+# dispatcher already says whether a turn is in flight: health.json carries the
+# active turn and the queue depth, refreshed every heartbeatMs.
+#
+# INBOX FIRST, THEN HEALTH. ingest() publishes health BEFORE it unlinks the inbox
+# file, so an inbox read as empty means every message already taken shows in the
+# health read that follows. The other order can miss a turn that started in
+# between.
+#
+# A record that is not a fresh schema-1 handshake is NO reading, never idle: a
+# stale `active: undefined` is exactly what a wedged bridge leaves behind. The
+# caller then falls back to the signals it had before, which defer.
+_agent_dispatcher_turn_state() {
+  local name="$1" inbox="" listing="" pending=0 raw=""
+  inbox="$(_agent_delivery_inbox "$name")" || return 1
+  listing="$(find "$inbox" -maxdepth 1 -type f -name '*.json' 2>/dev/null)" \
+    || listing="$(sudo -n -u "agent-${name}" find "$inbox" -maxdepth 1 -type f -name '*.json' 2>/dev/null)" \
+    || return 1
+  # Dot-prefixed files are a sender's partial write (_agent_dispatch_inbox_send).
+  pending="$(printf '%s\n' "$listing" | grep -c '/[^./][^/]*\.json$')" || pending=0
+  raw="$(cat "${inbox%/inbox}/health.json" 2>/dev/null)" \
+    || raw="$(sudo -n -u "agent-${name}" cat "${inbox%/inbox}/health.json" 2>/dev/null)" \
+    || return 1
+  _agent_dispatcher_turn_classify "$raw" "$pending"
+}
+
+# _agent_dispatcher_turn_classify <health-json> <inbox-pending> [now-epoch]
+# Pure: no files, no sudo, so the unit test drives it with real records. The
+# freshness window is the one _channel_health_classify (cmd_agent.sh) uses.
+_agent_dispatcher_turn_classify() {
+  local raw="${1:-}" pending="${2:-0}" now="${3:-}" out=""
+  [[ -n "$now" ]] || now=$(date +%s)
+  [[ "$pending" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "$raw" ]] || return 1
+  out="$(jq -rn --argjson now "$now" --argjson pending "$pending" --arg raw "$raw" '
+    ($raw | try fromjson catch null) as $h |
+    if ($h | type) != "object" then empty
+    elif ($h.schema // 0) != 1 then empty
+    else
+      ((($h.updatedAt // "") | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null)) as $upd |
+      ([60, (((($h.heartbeatMs // 15000) | tonumber? // 15000) / 1000) * 3)] | max | floor) as $win |
+      if $upd == null or ($now - $upd) > $win then empty
+      elif $pending > 0 or $h.active != null or (($h.queueDepth // 0) > 0) then "busy"
+      else "idle" end
+    end' 2>/dev/null)" || return 1
+  case "$out" in
+    idle|busy) printf '%s\n' "$out"; return 0 ;;
+  esac
+  return 1
+}
+
 # Post one message into the dispatcher inbox and CONFIRM it was drained.
 # rc 0 = the dispatcher consumed it (file unlinked). rc 1 = written but still
 # sitting there — same "maybe unsubmitted" meaning the pane path's rc 1 carries.

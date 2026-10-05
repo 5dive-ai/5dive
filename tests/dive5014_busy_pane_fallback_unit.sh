@@ -169,6 +169,9 @@ else
   bad_t "DIVE-3173 block missing" "fence markers not found"; echo; echo "$PASS passed, $FAIL failed"; exit 1
 fi
 BOARD_IDLE='db(){ echo 0; }; sqlq(){ printf "%s" "$1"; }'
+# Parts A/B grade a PANE seat. Pin that, so the DIVE-5608 dispatcher probe never
+# reaches the stubbed sudo (it would eat a pane fixture). Part C overrides it.
+_agent_delivery_inbox() { return 1; }
 # What main's native probe does under disableAgentView: prints nothing, rc 1.
 NATIVE_BLIND='_hb_agent_native_state(){ return 1; }'
 bsp() { ( eval "$BOARD_IDLE"; eval "$1"; eval "$2"; eval "$block"; _agent_busy_state main ); }
@@ -239,6 +242,123 @@ if [[ "$mut_block" != "$block" ]]; then
   fi
 else
   bad_t "the fallback mutation is a no-op" "the acceptance arm would pass vacuously"
+fi
+
+# ----------------------- Part C: a DISPATCHER seat answers for itself (DIVE-5608) --
+# A codex seat with telegram/dashboard has no Claude session and its pane is the
+# dispatcher's log stream (no composer), so native rc 1 + pane rc 1 read it busy
+# FOREVER: olivia on divine-owl sat "1 still deferred" on bridge 0.5.30 with
+# 0.5.32 installed. The dispatcher's own health.json says whether a turn runs.
+DISP="$WORK/disp"; mkdir -p "$DISP/inbox"
+_agent_delivery_inbox() { printf '%s\n' "$DISP/inbox"; }
+health() { # <active-json|null> <queueDepth> [updatedAt]
+  jq -cn --argjson a "$1" --argjson q "$2" --arg u "${3:-$(date -u +%Y-%m-%dT%H:%M:%S.123Z)}" \
+    '{schema:1, bridge:"codex-dispatcher", bridgeVersion:"0.5.30", pid:1568347, updatedAt:$u,
+      heartbeatMs:15000, declared:["telegram"], listening:["telegram"], bound:true, queueDepth:$q}
+     + (if $a == null then {} else {active:$a} end)' > "$DISP/health.json"
+}
+TURN='{"turnId":"t-1","source":"telegram","startedAt":"2026-10-05T09:00:00Z"}'
+# Board idle; native and pane both say busy, exactly as on the measured box.
+DISP_BLIND='_hb_agent_native_state(){ return 1; }; _hb_agent_pane_idle(){ return 1; }'
+dsp() { ( eval "$BOARD_IDLE"; eval "$DISP_BLIND"; eval "$block"; _agent_busy_state olivia ); }
+
+health null 0
+if [[ "$(dsp)" == idle ]]; then
+  ok_t "THE DEFECT'S CELL: codex seat, no row, dispatcher with no active turn and empty queue reads idle"
+else
+  bad_t "an idle dispatcher seat still read busy" "got '$(dsp)' — the bridge update never runs"
+fi
+health "$TURN" 0
+if [[ "$(dsp)" == busy ]]; then
+  ok_t "an active turn in health.json reads busy (a Telegram answer in flight is never cut)"
+else
+  bad_t "an active dispatcher turn read idle" "got '$(dsp)'"
+fi
+health null 2
+if [[ "$(dsp)" == busy ]]; then
+  ok_t "a non-empty queue reads busy"
+else
+  bad_t "queued turns read idle" "got '$(dsp)'"
+fi
+health null 0; printf '{}' > "$DISP/inbox/m1.json"
+if [[ "$(dsp)" == busy ]]; then
+  ok_t "a message still in the inbox (accepted, not yet taken) reads busy"
+else
+  bad_t "an undrained inbox read idle" "got '$(dsp)'"
+fi
+rm -f "$DISP/inbox/m1.json"; printf '{}' > "$DISP/inbox/.m2.json.part"
+if [[ "$(dsp)" == idle ]]; then
+  ok_t "a sender's dot-prefixed partial write is not a queued message"
+else
+  bad_t "a partial write read busy" "got '$(dsp)'"
+fi
+rm -f "$DISP/inbox/.m2.json.part"
+health null 0 "2026-10-05T01:40:46Z"
+if [[ "$(dsp)" == busy ]]; then
+  ok_t "a STALE handshake is no reading: falls through to the old probes (busy), never idle"
+else
+  bad_t "a stale health record was believed" "got '$(dsp)' — a wedged bridge's last word"
+fi
+printf '{"schema":2,"updatedAt":"%s","queueDepth":0}' "$(date -u +%FT%TZ)" > "$DISP/health.json"
+if [[ "$(dsp)" == busy ]]; then
+  ok_t "an unknown health schema is no reading (falls through, busy)"
+else
+  bad_t "an unknown schema was believed" "got '$(dsp)'"
+fi
+rm -f "$DISP/health.json"
+if [[ "$(dsp)" == busy ]]; then
+  ok_t "no health.json at all is no reading (falls through, busy)"
+else
+  bad_t "a missing handshake read idle" "got '$(dsp)'"
+fi
+health null 0
+PANE_CALLS="$WORK/disp.calls"; : > "$PANE_CALLS"
+st="$( eval "$BOARD_IDLE"; eval "$block"
+       _hb_agent_native_state(){ printf 1 >>"$PANE_CALLS"; return 1; }
+       _hb_agent_pane_idle(){ printf 2 >>"$PANE_CALLS"; return 1; }
+       _agent_busy_state olivia )"
+if [[ "$st" == idle && ! -s "$PANE_CALLS" ]]; then
+  ok_t "a definite dispatcher reading is final: neither the claude probe nor the pane is asked"
+else
+  bad_t "the dispatcher reading was second-guessed" "state=$st calls=[$(cat "$PANE_CALLS")]"
+fi
+st="$( db(){ echo 1; }; sqlq(){ printf "%s" "$1"; }; eval "$DISP_BLIND"; eval "$block"; _agent_busy_state olivia )"
+if [[ "$st" == busy ]]; then
+  ok_t "a seat holding an in_progress row stays busy whatever the dispatcher says"
+else
+  bad_t "the board's busy was overridden" "got '$st'"
+fi
+
+# ACCEPTANCE: the heartbeat sweep's decision for the measured marker. olivia was
+# marked 03:01Z, her unit started 01:40Z (before it), and she is idle -> fire.
+v="$( eval "$BOARD_IDLE"; eval "$DISP_BLIND"; eval "$block"
+      _pending_restart_decide 1791169283 1791164446 "$(_agent_busy_state olivia)" 1791170000 86400 )"
+if [[ "$v" == fire ]]; then
+  ok_t "ACCEPTANCE: olivia's measured marker + an idle dispatcher -> 'fire' (was 'defer' every sweep)"
+else
+  bad_t "the sweep still defers an idle dispatcher seat" "verdict=$v"
+fi
+health "$TURN" 0
+v="$( eval "$BOARD_IDLE"; eval "$DISP_BLIND"; eval "$block"
+      _pending_restart_decide 1791169283 1791164446 "$(_agent_busy_state olivia)" 1791170000 86400 )"
+if [[ "$v" == defer ]]; then
+  ok_t "the same marker with an active turn -> 'defer'"
+else
+  bad_t "an active dispatcher turn was restarted" "verdict=$v"
+fi
+
+# MUTANT: remove the dispatcher reading and the defect's cell is busy again.
+health null 0
+mut_block="$(printf '%s\n' "$block" | sed '/idle|busy) printf .%s\\n. "\$disp"; return 0 ;;/d')"
+if [[ "$mut_block" != "$block" ]]; then
+  mut_state="$( eval "$BOARD_IDLE"; eval "$DISP_BLIND"; eval "$mut_block"; _agent_busy_state olivia )"
+  if [[ "$mut_state" == busy ]]; then
+    ok_t "MUTANT: without the dispatcher reading, an idle codex seat reads busy — the divine-owl defer, live"
+  else
+    bad_t "mutant must reproduce the defect" "got '$mut_state' — the arms above are vacuous"
+  fi
+else
+  bad_t "the dispatcher mutation is a no-op" "the defect arm would pass vacuously"
 fi
 
 echo; echo "$PASS passed, $FAIL failed"
