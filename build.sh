@@ -133,6 +133,7 @@ LAZY_FILES=(
   src/cmd_init.sh
   src/cmd_doctor.sh
   src/cmd_host.sh
+  src/cmd_machine.sh
   src/cmd_watch.sh
   src/cmd_wall.sh
   src/cmd_compose.sh
