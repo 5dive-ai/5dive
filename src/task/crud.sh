@@ -1466,7 +1466,7 @@ cmd_task_show() {
                       CASE WHEN need_quote IS NOT NULL AND need_quote <> ''
                            THEN x'0a'||'quote (the exact text being approved):'||x'0a'||need_quote||
                                 CASE WHEN need_quote_file IS NOT NULL
-                                     THEN x'0a'||'quote pinned to: '||need_quote_file||' (edited after filing = stale, re-ask)' ELSE '' END
+                                     THEN x'0a'||'quote pinned to: '||need_quote_file||' (post from this copy; edited after filing = stale, re-ask)' ELSE '' END
                            ELSE '' END||
                       CASE WHEN need_answered_at IS NOT NULL
                            -- DIVE-2354: an answer on a confirm-after-send gate is a

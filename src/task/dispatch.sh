@@ -168,8 +168,9 @@ _task_usage() {
                    approved (a drafted reply, a post), quoted in the ping under the
                    ask so the person can answer from the message alone. Over ~600
                    characters the ping says so and /task_<n> shows it. With
-                   --quote-file, editing that file after filing makes the gate
-                   stale: an approval tapped afterwards is refused, so re-ask.
+                   --quote-file, the gate keeps its own copy (path printed at
+                   filing and in task show) and you post from that copy; editing
+                   it after filing makes an approval refused, so re-ask.
       [--mode=approve-to-send|confirm-after-send]   --type=approval: is the action
                                                     already DONE? (default: not yet)
       [--probe='<cmd>']                           --type=access: self-check the block

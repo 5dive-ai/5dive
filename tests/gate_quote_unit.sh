@@ -21,9 +21,12 @@
 #          W1 is the grader's named control: --quote="X" -> the rendered text holds
 #          X verbatim. W3 is its negative: no quote -> the ask line still ends in
 #          " /task_<n>" on ONE line and no quote marker appears anywhere.
-#   S1-S5  STALE. The approval is of THAT text: editing the pinned file after
+#   S1-S8  STALE. The approval is of THAT text: editing the pinned copy after
 #          filing makes an approve refused (gate stays open, audited), a deny still
-#          lands, an untouched file approves normally, a deleted file fails closed.
+#          lands, an untouched copy approves normally. DIVE-5572: the pin is a copy
+#          the gate owns, so deleting the FILER's draft dir no longer blocks the
+#          approve (S5); a pinned copy that is itself gone fails closed and says
+#          "gone", not "edited" (S7-S8).
 #   D1     /task_<n> (task show) carries the whole quote — the place the over-cap
 #          ping points to.
 #
@@ -90,9 +93,20 @@ DRAFT="$TMP/draft-reply.md"; printf '%s\n' "$QX" >"$DRAFT"
 FF=$(addt --assignee=dev -- "fixture quote-file gate")
 file_gate "$FF" --quote-file="$DRAFT"
 _want_sha=$(printf '%s\n' "$QX" | sha256sum | cut -d' ' -f1)
-[[ "$(col "$FF" need_quote_file)" == "$(realpath "$DRAFT")" && "$(col "$FF" need_quote_sha)" == "$_want_sha" ]] \
-  && ok_t "F2 --quote-file stores the text, the ABSOLUTE path and the sha256 of the draft" \
-  || bad_t "F2 --quote-file stores the text, the ABSOLUTE path and the sha256" "file=[$(col "$FF" need_quote_file)] sha=[$(col "$FF" need_quote_sha)] want=$_want_sha"
+_ffident=$(db "SELECT ident FROM tasks WHERE id=$FF;")
+_ffpin="$TASKS_DIR/gate-quotes/${_ffident}.md"
+[[ "$(col "$FF" need_quote_file)" == "$_ffpin" && "$(col "$FF" need_quote_sha)" == "$_want_sha" ]] \
+  && ok_t "F2 --quote-file pins a DURABLE copy under the task store (not the filer's path) and its sha256" \
+  || bad_t "F2 --quote-file pins a durable copy and its sha256" "file=[$(col "$FF" need_quote_file)] want=[$_ffpin] sha=[$(col "$FF" need_quote_sha)] want=$_want_sha"
+cmp -s "$DRAFT" "$_ffpin" \
+  && ok_t "F2b the pinned copy holds the draft's exact bytes (trailing newline included)" \
+  || bad_t "F2b the pinned copy differs from the draft" "$(ls -l "$_ffpin" 2>&1)"
+FS=$(addt --assignee=dev -- "fixture quote-file stdin")
+printf 'from stdin\n' | file_gate "$FS" --quote-file=-
+_fsident=$(db "SELECT ident FROM tasks WHERE id=$FS;")
+[[ "$(col "$FS" need_quote_file)" == "$TASKS_DIR/gate-quotes/${_fsident}.md" ]] && [[ "$(cat "$TASKS_DIR/gate-quotes/${_fsident}.md")" == "from stdin" ]] \
+  && ok_t "F2c --quote-file=- (stdin) is pinned too: the copy is what gets re-read" \
+  || bad_t "F2c a stdin draft was not pinned" "file=[$(col "$FS" need_quote_file)]"
 
 # F3: a re-filed gate without --quote must not inherit the previous ask's text.
 R=$(addt --assignee=dev -- "fixture refile")
@@ -197,11 +211,12 @@ _bn=$(run_batch "$(db "SELECT ident FROM tasks WHERE id=$N;")")
 S=$(addt --assignee=dev -- "fixture stale")
 SD="$TMP/stale-draft.md"; printf 'the reply as shown\n' >"$SD"
 file_gate "$S" --quote-file="$SD"
-printf 'the reply, edited after the ask\n' >"$SD"
+_spin=$(col "$S" need_quote_file)
+printf 'the reply, edited after the ask\n' >"$_spin"
 : >"$AUDIT"
 _o=$( cmd_task_answer "$S" --value=approved --human 2>&1 )
 [[ "$(col "$S" need_answered_at)" == "<NULL>" && "$_o" == *"edited since"* ]] \
-  && ok_t "S1 an APPROVE after the pinned draft changed is refused and the gate stays open" \
+  && ok_t "S1 an APPROVE after the PINNED COPY was edited is refused and the gate stays open" \
   || bad_t "S1 a stale approve was applied" "answered=$(col "$S" need_answered_at) out=${_o:0:300}"
 grep -q "gate.approval-stale-quote" "$AUDIT" \
   && ok_t "S2 ...and the refusal is audited as gate.approval-stale-quote" \
@@ -217,14 +232,27 @@ file_gate "$U" --quote-file="$UD"
 [[ "$(col "$U" need_answer)" == "approved" ]] \
   && ok_t "S4 CONTROL: an approve on an UNCHANGED draft lands normally" \
   || bad_t "S4 an approve on an unchanged draft was refused" "answer=$(col "$U" need_answer)"
-G=$(addt --assignee=dev -- "fixture gone")
-GD="$TMP/gone.md"; printf 'soon gone\n' >"$GD"
-file_gate "$G" --quote-file="$GD"
-rm -f "$GD"
+# S5 — DIVE-5572's PURPOSE. lodar's Approve on DIVE-5556 was refused because the
+# filer's draft sat in its session scratchpad, deleted when the session ended.
+G=$(addt --assignee=dev -- "fixture scratchpad gone")
+GDIR="$TMP/scratchpad-session"; mkdir -p "$GDIR"; printf 'drafted in a scratchpad\n' >"$GDIR/reply.md"
+file_gate "$G" --quote-file="$GDIR/reply.md"
+rm -rf "$GDIR"
 ( cmd_task_answer "$G" --value=approved --human ) >/dev/null 2>&1
-[[ "$(col "$G" need_answered_at)" == "<NULL>" ]] \
-  && ok_t "S5 a pinned draft that is GONE fails closed (cannot show unchanged is not unchanged)" \
-  || bad_t "S5 an approve over a deleted draft was applied" "answer=$(col "$G" need_answer)"
+[[ "$(col "$G" need_answer)" == "approved" ]] \
+  && ok_t "S5 the filer's draft dir is DELETED after filing: the approve still lands (the gate pinned its own copy)" \
+  || bad_t "S5 an approve was refused because the filer's draft dir is gone" "answer=$(col "$G" need_answer) file=$(col "$G" need_quote_file)"
+GP=$(addt --assignee=dev -- "fixture pinned copy gone")
+GPD="$TMP/pinned-gone.md"; printf 'soon gone\n' >"$GPD"
+file_gate "$GP" --quote-file="$GPD"
+rm -f "$(col "$GP" need_quote_file)"
+_o=$( cmd_task_answer "$GP" --value=approved --human 2>&1 )
+[[ "$(col "$GP" need_answered_at)" == "<NULL>" ]] \
+  && ok_t "S7 the PINNED COPY itself gone still fails closed (cannot show unchanged is not unchanged)" \
+  || bad_t "S7 an approve over a deleted pinned copy was applied" "answer=$(col "$GP" need_answer)"
+[[ "$_o" == *"is gone from"* && "$_o" != *"edited since"* ]] \
+  && ok_t "S8 ...and says the draft is GONE, not that it was edited" \
+  || bad_t "S8 a missing pinned copy is reported as edited" "out=${_o:0:300}"
 ( cmd_task_answer "$X1" --value=approved --human ) >/dev/null 2>&1
 [[ "$(col "$X1" need_answer)" == "approved" ]] \
   && ok_t "S6 an inline --quote gate (no pinned file) approves normally" \

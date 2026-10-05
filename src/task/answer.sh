@@ -800,16 +800,29 @@ cmd_task_answer() {
       _qfile=$(db "SELECT COALESCE(need_quote_file,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
       if [[ -n "$_qfile" ]]; then
         _qsha=$(db "SELECT COALESCE(need_quote_sha,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
-        if [[ -f "$_qfile" && -r "$_qfile" ]]; then
+        # DIVE-5572: a draft that is GONE is not a draft that was EDITED. Both
+        # still refuse (cannot show unchanged is not unchanged), but "edited" told
+        # lodar something false and pointed nobody at the real fix.
+        local _qwhy=""
+        if [[ ! -e "$_qfile" ]]; then
+          _qwhy=gone
+        elif [[ ! -f "$_qfile" || ! -r "$_qfile" ]]; then
+          _qwhy=unreadable
+        else
           local _qtext=""
           IFS= read -r -d '' _qtext < "$_qfile" || true
           _qnow=$(printf '%s' "$_qtext" | sha256sum | cut -d' ' -f1)
+          [[ "$_qnow" == "$_qsha" ]] || _qwhy=edited
         fi
-        if [[ -z "$_qnow" || "$_qnow" != "$_qsha" ]]; then
+        if [[ -n "$_qwhy" ]]; then
           _task_store_audit_log "gate.approval-stale-quote" refused 0 -- \
             "id=${id}" "task=${ident}" "quote_file=${_qfile}" "filed_sha=${_qsha}" \
-            "now_sha=${_qnow:-unreadable}" 2>/dev/null || true
-          fail "$E_CONFLICT" "$ident: NOT approved — the text you were shown has been edited since this was asked, so approving now would sign off words you never saw (DIVE-5465). Nothing was authorised. The agent must re-ask with the new text: 5dive task need ${ident} --quote-file=${_qfile} ..."
+            "now_sha=${_qnow:-$_qwhy}" "reason=${_qwhy}" 2>/dev/null || true
+          case "$_qwhy" in
+            gone) fail "$E_CONFLICT" "$ident: NOT approved — the draft this gate quoted is gone from ${_qfile} (it was deleted, not edited), so there is nothing here that can be shown to match what you saw (DIVE-5572). Nothing was authorised. The agent must re-ask: 5dive task need ${ident} --quote-file=<the draft> ..." ;;
+            unreadable) fail "$E_CONFLICT" "$ident: NOT approved — the draft this gate quoted at ${_qfile} cannot be read from here, so it cannot be shown to match what you saw (DIVE-5572). Nothing was authorised. The agent must re-ask: 5dive task need ${ident} --quote-file=<the draft> ..." ;;
+            *) fail "$E_CONFLICT" "$ident: NOT approved — the text you were shown has been edited since this was asked, so approving now would sign off words you never saw (DIVE-5465). Nothing was authorised. The agent must re-ask with the new text: 5dive task need ${ident} --quote-file=${_qfile} ..." ;;
+          esac
         fi
       fi
       ;;
