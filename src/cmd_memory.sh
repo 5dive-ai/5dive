@@ -1765,9 +1765,12 @@ _memory_consolidate() {
     # per seat by 2026-10-05). The prompt-line skip below keeps them out of the
     # ledger; this keeps them off the disk. Probed, not assumed: a CLI too old to
     # know the flag refuses the whole command line, and that would fail every
-    # pass on that box, so there the skip alone covers it. Process substitution,
-    # not a pipe, for the same SIGPIPE reason as the skip.
-    if grep -qF -- '--no-session-persistence' < <("$_cl" --help </dev/null 2>/dev/null); then
+    # pass on that box, so there the skip alone covers it. The help text is
+    # captured first, then matched: `grep -q` exits on the first hit, so a writer
+    # still streaming into it (a pipe or a process substitution) can die of SIGPIPE.
+    local _help
+    _help="$("$_cl" --help </dev/null 2>/dev/null)" || true
+    if grep -qF -- '--no-session-persistence' <<<"$_help"; then
       distiller+=" --no-session-persistence"
     fi
   fi

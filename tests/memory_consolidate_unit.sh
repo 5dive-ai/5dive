@@ -675,8 +675,8 @@ source "$SRC/cmd_memory.sh"
 
 echo "── MUTANT: the flag unprobed, an older CLI fails every pass ──"
 check "BEFORE: the live function probes --help" "$(declare -f _memory_consolidate | grep -c -- '--help < /dev/null')" "1"
-eval "$(declare -f _memory_consolidate | sed "s/if grep -qF -- '--no-session-persistence' </if true || grep -qF -- '--no-session-persistence' </")"
-check "AFTER: the mutation took" "$(declare -f _memory_consolidate | grep -c 'if true || grep')" "1"
+eval "$(declare -f _memory_consolidate | sed "s/if grep -qF -- '--no-session-persistence' <<< [^;]*;/if true;/")"
+check "AFTER: the mutation took" "$(declare -f _memory_consolidate | grep -c 'if true; then')" "1"
 rm -f "$NARGV" "$NLEDGER"
 np_run "$OLDBIN" --max-sessions=1 >/dev/null 2>&1
 [ "$?" -ne 0 ] && ok "MUTANT: the old-CLI pass fails" || bad "MUTANT: the old-CLI pass fails"
