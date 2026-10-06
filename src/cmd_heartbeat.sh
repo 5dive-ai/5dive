@@ -9175,6 +9175,12 @@ cmd_heartbeat_tick() {
   # (through `_grader_account_reading_json`) for exactly the accounts whose seats
   # are all idle, so a snapshot refreshed after the wake loop would be a snapshot
   # this tick paced without. Same isolation contract as every other sweep.
+  # DIVE-5690: re-assert who may read the box's keys. One writer is outside this
+  # repo (5dive-api's shelld rewrites connectord.env root:claude 640 on every
+  # token rotation), so install-time alone would leave that file open to every
+  # standard seat from the first rotation on. Costs one stat per key file.
+  local _hb_sp; _hb_sp=$(secrets_posture_reconcile --quiet "$reg" 2>&1) || _hb_log "[secrets-posture] pass errored (non-fatal): ${_hb_sp}"
+  [[ -z "$_hb_sp" ]] || _hb_log "[secrets-posture] ${_hb_sp}"
   _hb_quota_snapshot_sweep "$now" || _hb_log "[quota-snapshot] pass errored (non-fatal)"
   (( ${_HB_QSNAP_RAN:-0} || ${_HB_QSNAP_FAILED:-0} )) \
     && _hb_log "[quota-snapshot] account-usage snapshot ${_HB_QSNAP_RAN:-0} published, ${_HB_QSNAP_FAILED:-0} failed (cadence ${_HB_QUOTA_SNAPSHOT_EVERY_SEC:-120}s, consumer fence ${QUOTA_SNAPSHOT_MAX_AGE:-600}s)" || true

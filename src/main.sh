@@ -1155,6 +1155,12 @@ main() {
       # reason). Never advertised.
       cmd_self_account_delegated "$@"
       exit $? ;;
+    _secrets_posture)
+      # DIVE-5690: hidden, root-only installer/heartbeat pass. Moves the box's
+      # secret files from group claude (every standard seat) to claude-keys and
+      # keeps that group's membership to `claude` + admin seats. Idempotent.
+      AUDIT_CMD="_secrets_posture"; AUDIT_ARGS=("$@")
+      cmd_secrets_posture "$@" ;;
     _task_channel)
       # DIVE-4609: hidden, privileged Telegram human-action bridge. Standard
       # seats may reach only this exact path; operation + arguments travel over

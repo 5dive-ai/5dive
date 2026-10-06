@@ -936,6 +936,15 @@ refresh_managed_files() {
   if ! "$BIN_DIR/5dive" agent _reconcile_sudoers; then
     echo "warn: existing standard-seat sudoers were not reconciled; routed reviewers may be unable to use newly shipped narrow primitives" >&2
   fi
+  # DIVE-5690: the box's keys (connectors/*, connectord.env) leave group claude,
+  # which every standard seat is in, for claude-keys (claude + admin seats).
+  # Before the agent restart below, so an admin seat comes back up holding the
+  # new group. install.sh deploys on merge, ahead of the release carrying the
+  # verb, so a bundle that predates it is skipped rather than warned about.
+  if grep -q 'cmd_secrets_posture' "$BIN_DIR/5dive" 2>/dev/null \
+     && ! "$BIN_DIR/5dive" _secrets_posture; then
+    echo "warn: this box's key files were not moved off group claude; every standard seat can still read them until 'sudo 5dive _secrets_posture' succeeds" >&2
+  fi
   # DIVE-3966: new Codex seats get the managed AGENTS.md baseline at create
   # time; this pass backfills and updates existing seats on every upgrade.
   if ! "$BIN_DIR/5dive" agent _sync_codex_baseline; then
@@ -1982,7 +1991,8 @@ say "Installing 5dive CLI"
 # unattended-upgrades is running concurrently (common on freshly-provisioned
 # boxes).
 say "Installing system dependencies"
-APT_PKGS="jq tmux git curl python3-yaml unzip sqlite3"
+# acl: setfacl keeps `claude` reading the keys moved off group claude (DIVE-5690).
+APT_PKGS="jq tmux git curl python3-yaml unzip sqlite3 acl"
 apt_need=0
 for p in $APT_PKGS; do
   dpkg -s "$p" >/dev/null 2>&1 || { apt_need=1; break; }

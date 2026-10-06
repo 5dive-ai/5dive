@@ -40,6 +40,11 @@ create_agent_user() {
     fi
   fi
   usermod -aG "$groups" "$user"
+  # DIVE-5690: the box's keys are group claude-keys, not claude. Only an admin
+  # seat (which can already run the whole CLI as root) reads them directly; a
+  # re-create at a lower tier drops the membership.
+  secrets_member_sync "$user" "$isolation" \
+    || warn "could not set ${user}'s membership of ${SECRETS_GROUP} for tier ${isolation}; 'sudo 5dive _secrets_posture' retries (DIVE-5690)"
   # DIVE-1033: sandboxed agents are NOT in the claude group, so /home/claude
   # (0750) is unreachable — but the shared runtime lives there (claude at
   # ~/.local/bin, node at ~/.nvm). Without traverse access both the plugin
@@ -589,6 +594,8 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _gh_do"*|\
         "/usr/local/bin/5dive _task_answer"*|\
         "/usr/local/bin/5dive _task_channel"*|\
+        "/usr/local/bin/5dive partner hire *"|"/usr/local/bin/5dive hire-link *"|\
+        "/usr/local/lib/5dive/push-notify.sh *"|\
         "/usr/local/bin/5dive _self_account"*|\
         "/usr/local/bin/5dive browser _connect"|\
         "/usr/local/bin/5dive _merge_do"*|\
@@ -742,6 +749,18 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_answer
 # signed write. This is unconditional because every standard Telegram seat needs
 # working gate taps, while the primitive grants no authority without channel proof.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_channel
+# DIVE-5690: the box identity (connectord.env) is no longer readable by this
+# seat. The three things a standard seat did with it run as root instead, so the
+# token never reaches the seat: hire a colleague on a partner box, mint the
+# owner's one-tap hire link, and send a native push event. Each is a single API
+# call with a fixed URL. The verbs validate their own arguments (a pack slug, an
+# agent name) and write nothing on the box. push-notify.sh builds its body with
+# jq and posts to one endpoint. sudo resets the environment, so the caller cannot
+# redirect the API base. telegram-app link is deliberately NOT here: it signs a
+# Telegram user into the owner's account, and this seat controls its own allowlist.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive partner hire *
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive hire-link *
+${user} ALL=(root) NOPASSWD: /usr/local/lib/5dive/push-notify.sh *
 # DIVE-5367: let this seat read the account usage board and switch ITSELF
 # between accounts the box already holds, so the owner Telegram /account
 # picker and /usage work on a standard seat. EXACT path, NO args, NO wildcard:

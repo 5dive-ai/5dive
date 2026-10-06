@@ -1277,6 +1277,7 @@ TOML
       printf '%s\n' "$line" > "$target"
       chown root:claude "$target"
       chmod 0640 "$target"
+      secret_file_secure "$target"   # DIVE-5690
       # Restart paperclipai so the new env var lands in its process. CLIs
       # invoked per-call (codex/hermes/openclaw) pick up new symlinks
       # without a restart, so we only restart for claude's env-var path.

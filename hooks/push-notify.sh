@@ -18,9 +18,18 @@ message="${2:-}"
 agent="${3:-}"
 
 # The connectord token doubles as this box's identity to the control-plane.
-# File is 0640 root:claude, so the agent user (claude group) can read it.
+# DIVE-5690: the file is 0640 root:claude-keys, which only admin seats can read.
+# A standard seat re-runs this script as root through its exact-path sudoers
+# grant (`sudo -l` asks first, so a seat without the grant stays a silent
+# no-op). The token never reaches the seat. Root does not re-enter this branch.
 token_file="/etc/5dive/connectord.env"
-[ -r "$token_file" ] || exit 0
+if [ ! -r "$token_file" ]; then
+  if [ -e "$token_file" ] && [ "$(id -u)" != 0 ] \
+     && sudo -n -l /usr/local/lib/5dive/push-notify.sh "$event" "$message" "$agent" >/dev/null 2>&1; then
+    exec sudo -n /usr/local/lib/5dive/push-notify.sh "$event" "$message" "$agent"
+  fi
+  exit 0
+fi
 token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$token_file" 2>/dev/null | head -1)
 [ -n "$token" ] || exit 0
 
