@@ -341,6 +341,11 @@ heal_claude_shadow_creds() {
 # to keep correct at creation time. tests/profile_seed_perms_unit.sh asserts
 # both the bound (roots are never widened) and the dependency (a group-
 # traversable root is what makes the normalized file reachable).
+#
+# DIVE-5701: group claude is every seat on the box, so 0640 group claude let a
+# seat on no account (or another one) read this account's login. The file is
+# still made 0640, then moved to group claude-keys, with a per-seat read for
+# the seats that seed from it (profile_creds_secure, src/lib/validation.sh).
 normalize_profile_seed_perms() {
   local profile="${1:-}"
   [[ -n "$profile" ]] || return 0
@@ -356,6 +361,10 @@ normalize_profile_seed_perms() {
       dir=$(dirname "$dir")
     done
   done
+  # DIVE-5701: 0640 at group claude was every seat on the box. The login's
+  # readers are the seats that seed from it (profile_creds_secure, validation.sh).
+  ! declare -F profile_creds_secure >/dev/null || profile_creds_secure "$profile"
+  return 0
 }
 
 restart_profile_agents() {

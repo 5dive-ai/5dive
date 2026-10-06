@@ -1597,6 +1597,13 @@ link_agent_profile() {
   # DIVE-5690: a login's readers are its bound seats, so the one this seat
   # leaves stops being readable to it now, not on the next heartbeat tick.
   [[ -z "$old" ]] || ! declare -F secret_file_secure >/dev/null || secret_file_secure "$old"
+  # DIVE-5701: the same for the vendor logins inside the account it leaves, and
+  # for the canonical codex account, which an unbound codex seat reads directly
+  # (so binding or unbinding one changes who reads it).
+  if declare -F profile_creds_secure >/dev/null; then
+    [[ -z "$old" ]] || profile_creds_secure "$(basename "$(dirname "$old")")"
+    profile_creds_secure codex
+  fi
   [[ -n "$profile" ]] || return 0
   local target="${AUTH_PROFILES_DIR}/${profile}/combined.env"
   [[ -f "$target" ]] \

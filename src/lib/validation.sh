@@ -568,11 +568,17 @@ _sp_profile_seats() {
 }
 
 # _sp_profile_readers_sync <combined.env> — the seat readers of one login are
-# exactly its bound seats: add the missing, drop any agent-* that is no longer
-# bound. `claude` is secret_file_secure's to keep. Counts changes in SP_ACL.
+# exactly its bound seats. `claude` is secret_file_secure's to keep.
 _sp_profile_readers_sync() {
+  _sp_seat_readers_sync "$1" "$(_sp_profile_seats "$1")"
+}
+
+# _sp_seat_readers_sync <file> <seat names, one per line> — make the agent-*
+# readers of <file> exactly those seats: add the missing, drop any agent-* (or
+# bare uid) not listed. Other named users are left alone. Counts changes in SP_ACL.
+_sp_seat_readers_sync() {
   local f="$1" want have u
-  want=$(_sp_profile_seats "$f" | sed 's/^/agent-/')
+  want=$(sed '/^$/d; s/^/agent-/' <<<"$2")
   have=$(_sp_acl_users "$f")
   while IFS= read -r u; do
     [[ -n "$u" ]] && _sp_user_exists "$u" || continue
@@ -586,6 +592,109 @@ _sp_profile_readers_sync() {
     grep -qxF "$u" <<<"$want" && continue
     _sp_unsetfacl "u:${u}" "$f" && SP_ACL=$(( ${SP_ACL:-0} + 1 ))
   done <<<"$have"
+  return 0
+}
+
+# -------- vendor CLI logins inside an account (DIVE-5701) --------
+#
+# auth-profiles/<p>/<type>/ holds the codex/grok/hermes/openclaw/antigravity
+# login a seat copies into its own home at start (5dive-agent-start, running as
+# the seat). normalize_profile_seed_perms makes those files 0640 so a standard
+# seat can read them without sudo (DIVE-1188). Left at group claude, that is
+# EVERY seat, bound to the account or not. Here they move to SECRETS_GROUP like
+# combined.env, and the seat readers are the seats that seed from the file:
+#   * a seat whose agents.d/<x>.env says AGENT_TYPE=<type> and
+#     AGENT_AUTH_PROFILE=<p>, and
+#   * for the canonical codex account (auth-profiles/codex/codex/), every codex
+#     seat with no AGENT_AUTH_PROFILE: it reads that file directly (DIVE-1322).
+# The binding is read from agents.d/<x>.env, the file systemd hands the seat's
+# start script, not from the registry. `agent create` writes it before the
+# registry entry, so a seat created bound to an account can read the login on
+# its first boot.
+# A copy next to a seeded file (auth.json.bak-<ts>, a hand-made backup) is the
+# same key. It moves too, with no seat reader: no seat seeds from it.
+# The claude type is not here. Its token is in combined.env, and its
+# .claude.json is written 0600.
+
+SP_CRED_TYPES="codex grok hermes openclaw antigravity"
+SP_CANONICAL_CODEX_PROFILE=codex
+
+# _sp_cred_seeds <type> — the files 5dive-agent-start copies out of
+# auth-profiles/<p>/<type>/, relative to it. Keep in step with that script's
+# per-type seed blocks; tests/secrets_posture_unit.sh T13 checks each path
+# against it.
+_sp_cred_seeds() {
+  local oc=.openclaw/agents/main/agent
+  case "$1" in
+    codex)       printf '%s\n' auth.json ;;
+    hermes)      printf '%s\n' auth.json config.yaml ;;
+    grok)        printf '%s\n' .grok/auth.json ;;
+    antigravity) printf '%s\n' .gemini/antigravity-cli/antigravity-oauth-token ;;
+    openclaw)    printf '%s\n' "$oc/openclaw-agent.sqlite" "$oc/openclaw-agent.sqlite-wal" \
+                   "$oc/openclaw-agent.sqlite-shm" "$oc/auth-profiles.json" .openclaw/openclaw.json ;;
+  esac
+}
+
+# _sp_env_var <agents.d/<x>.env> <VAR> — one AGENT_* value, quotes stripped.
+_sp_env_var() {
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+# _sp_cred_seats <profile> <type> — the seats that seed <type> from this
+# account. Prints <x>, one per line.
+_sp_cred_seats() {
+  local p="$1" t="$2" e x st sp
+  for e in "$(_sp_env_dir)"/*.env; do
+    [[ -f "$e" && ! -L "$e" ]] || continue
+    x="${e##*/}"; x="${x%.env}"
+    st=$(_sp_env_var "$e" AGENT_TYPE)
+    [[ "$st" == "$t" ]] || continue
+    sp=$(_sp_env_var "$e" AGENT_AUTH_PROFILE)
+    if [[ "$sp" == "$p" ]] \
+       || [[ -z "$sp" && "$t" == codex && "$p" == "$SP_CANONICAL_CODEX_PROFILE" ]]; then
+      printf '%s\n' "$x"
+    fi
+  done
+}
+
+# _sp_cred_secure <file> <seats> — one vendor login file: off group claude if
+# it is still there, then its seat readers set to <seats>. A file that is not
+# group-readable moves but gains no reader: setfacl would raise its mask.
+_sp_cred_secure() {
+  local f="$1" seats="$2" g
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  g=$(secrets_group)
+  [[ "$g" != "$(_sp_shared_group)" ]] || return 0
+  if [[ "$(_sp_file_group "$f")" == "$(_sp_shared_group)" ]]; then
+    secret_file_secure "$f" && SP_MOVED=$(( ${SP_MOVED:-0} + 1 ))
+  fi
+  # A refused chgrp (not root) leaves the group as it was: the ACLs wait for
+  # the root heartbeat tick.
+  [[ "$(_sp_file_group "$f")" == "$g" ]] || return 0
+  _sp_group_readable "$(_sp_mode "$f")" || return 0
+  _sp_seat_readers_sync "$f" "$seats"
+}
+
+# profile_creds_secure <profile> — every vendor login inside one account.
+# Idempotent; called by normalize_profile_seed_perms, link_agent_profile and
+# the reconcile. Always returns 0.
+profile_creds_secure() {
+  local p="$1" d t seats seeds f c
+  [[ -n "$p" && "$p" != */* ]] || return 0
+  d="$(_sp_profiles_dir)/$p"
+  [[ -d "$d" ]] || return 0
+  for t in $SP_CRED_TYPES; do
+    [[ -d "$d/$t" ]] || continue
+    seats=$(_sp_cred_seats "$p" "$t")
+    seeds=$(_sp_cred_seeds "$t" | sed "s#^#$d/$t/#")
+    while IFS= read -r f; do
+      _sp_cred_secure "$f" "$seats"
+      for c in "$f".* "$f"-*; do
+        # openclaw's -wal/-shm are seeds in their own right.
+        grep -qxF "$c" <<<"$seeds" || _sp_cred_secure "$c" ""
+      done
+    done <<<"$seeds"
+  done
   return 0
 }
 
@@ -715,6 +824,13 @@ secrets_posture_reconcile() {
       "$(_sp_shared_group)") secret_file_secure "$f" && SP_MOVED=$((SP_MOVED + 1)) ;;
       "$g") _sp_group_readable "$(_sp_mode "$f")" && _sp_profile_readers_sync "$f" ;;
     esac
+  done
+  # Vendor CLI logins inside each account (DIVE-5701), re-read every tick for
+  # the same reason: a seat's binding or type changes without the file changing.
+  for d in "$(_sp_profiles_dir)"/*/; do
+    [[ -d "$d" && ! -L "${d%/}" ]] || continue
+    d="${d%/}"
+    profile_creds_secure "${d##*/}"
   done
 
   if (( ! quiet )) || (( SP_MOVED + SP_ADDED + SP_DROPPED + SP_ACL > 0 )); then
