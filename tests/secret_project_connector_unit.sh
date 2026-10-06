@@ -83,7 +83,9 @@ want=$'NEXT_PUBLIC_SITE=https://x.test\nDB_URL=postgres://a\nGOOGLE_MAPS_API=AIz
 put AIzaTHIRD GOOGLE_MAPS_API --connector=project-web >/dev/null
 [[ "$(grep -c '^GOOGLE_MAPS_API=' "$L")" == 1 && "$(grep '^GOOGLE_MAPS_API=' "$L")" == "GOOGLE_MAPS_API=AIzaTHIRD" ]] \
   && ok_t "J2 a second write replaces, never duplicates" || bad_t "J2 duplicate" "$(cat "$L")"
-ls "$TMP/projects/web" | grep -q '\.env\.local\.' && bad_t "J2 temp file left behind" "$(ls -A "$TMP/projects/web")" || ok_t "J2 no temp file left behind"
+# -A: the temp file is ".env.local.XXXXXX", a dotfile plain ls never lists.
+_left=$(ls -A "$TMP/projects/web")
+grep -q '\.env\.local\.' <<<"$_left" && bad_t "J2 temp file left behind" "$_left" || ok_t "J2 no temp file left behind"
 
 # --- J3: a value a .env line cannot hold as written is refused ----------------
 before=$(cat "$L")
