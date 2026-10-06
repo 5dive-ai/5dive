@@ -49,6 +49,9 @@ _secret_usage() {
       --connector=tools is the one store every agent reads: the key lands in
       /etc/5dive/connectors/tools.sh and agents see $KEY from their next command
       (one line, no spaces or quotes). Every other connector file is root-only.
+      --connector=project-<app> is for an app's own variable (any name): the
+      value lands as KEY=value in /home/claude/projects/<app>/.env.local when
+      that file exists, else .env, written as the project folder's owner.
 
   5dive secret link <DIVE-N> [--ttl=<minutes>]
       Mint a one-time link for an open secret gate: https://secrets.<box>/<token>.
@@ -71,6 +74,27 @@ _valid_env_key() { [[ "$1" =~ ^[A-Z_][A-Z0-9_]*$ ]]; }
 # connector filename stem: lower alnum + dashes; no dots/slashes -> no path
 # traversal, no hidden double-extension.
 _valid_connector() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
+
+# DIVE-5664: SECRET_PROJECTS_DIR and _secret_project_file live in lib/validation.sh
+# (core), because `task need` checks the folder at filing too.
+
+# _secret_project_put <file> <key> — value on stdin. Runs AS THE FOLDER OWNER, not
+# root (see _secret_write): a symlink the owner planted can then only reach what
+# the owner could already write. Keeps every other line and the file's mode; a
+# new file is 640 (the app's group reads it). Atomic: temp file + rename.
+_secret_project_put() {
+  local f="$1" key="$2" value tmp
+  value="$(cat)"
+  [[ -L "$f" ]] && { echo "$f is a symlink; nothing was saved" >&2; return 3; }
+  tmp="$(mktemp "${f}.XXXXXX")" || return 1
+  chmod 640 "$tmp"
+  if [[ -f "$f" ]]; then
+    chmod --reference="$f" "$tmp" 2>/dev/null || true
+    grep -vE "^(export[[:space:]]+)?${key}=" "$f" > "$tmp" || true
+  fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  mv -f "$tmp" "$f"
+}
 
 cmd_secret() {
   [[ $# -gt 0 ]] || { _secret_usage; mark_reported; exit "$E_USAGE"; }
@@ -112,7 +136,11 @@ _secret_write() {
   _valid_connector "$connector" || fail "$E_USAGE" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]*\$)"
   # Before stdin is read: a refused name never asks for its value.
   if [[ "$connector" == tools ]] && _tools_var_reserved "$key"; then
-    fail "$E_VALIDATION" "$key is not allowed for --connector=tools: every agent loads tools.sh, so it takes only a key name (ending _KEY, _TOKEN, _SECRET or _PASSWORD, and not a seat's own such as ANTHROPIC_API_KEY); anything else could override $key for every seat on the box. Use the tool's own variable name (e.g. ELEVENLABS_API_KEY). Nothing was saved"
+    fail "$E_VALIDATION" "$key is not allowed for --connector=tools: every agent loads tools.sh, so it takes only a key name (ending _KEY, _TOKEN, _SECRET or _PASSWORD, and not a seat's own such as ANTHROPIC_API_KEY); anything else could override $key for every seat on the box. Use the tool's own variable name (e.g. ELEVENLABS_API_KEY), or --connector=project-<app> for one app's variable. Nothing was saved"
+  fi
+  local pfile=""
+  if [[ "$connector" == project-* ]]; then
+    pfile="$(_secret_project_file "$connector")" || fail "$E_VALIDATION" "--connector=$connector: $pfile. Nothing was saved"
   fi
 
   # Value on stdin ONLY, never argv. DIVE-5319: at a terminal (nothing piped) it
@@ -145,6 +173,26 @@ _secret_write() {
     _tool_put_var "$key" "$value"
     where="every agent's environment, as \$${key}"
     _secret_write_done "$key" "$connector" "$action" "$TOOLS_ENV_FILE" "$where" "$task"
+    return 0
+  fi
+
+  # DIVE-5664: one app's env file. One line, bare KEY=value, so a value must be
+  # one that dotenv, Next's $-expansion and a shell `source` all read the same:
+  # no spaces, quotes, $, # or newline. Real API keys fit; anything else is refused
+  # rather than written in a form one of those readers would change.
+  if [[ -n "$pfile" ]]; then
+    [[ "$value" =~ ^[A-Za-z0-9_./:+=@,~-]+$ ]] \
+      || fail "$E_VALIDATION" "this value has a character a .env line cannot hold as written (space, quote, \$, # or a newline); nothing was saved — use --connector=<name> and set it in the app yourself"
+    [[ -f "$pfile" ]] && grep -qE "^(export[[:space:]]+)?${key}=" "$pfile" && action="updated"
+    local powner _prc=0
+    powner="$(stat -c %U "$(dirname "$pfile")")"
+    if [[ "$(id -un)" == "$powner" ]]; then
+      printf '%s' "$value" | _secret_project_put "$pfile" "$key" || _prc=$?
+    else
+      printf '%s' "$value" | runuser -u "$powner" -- bash -c "$(declare -f _secret_project_put); _secret_project_put \"\$@\"" _ "$pfile" "$key" || _prc=$?
+    fi
+    (( _prc == 0 )) || fail "$E_GENERIC" "could not write $pfile as $powner (rc $_prc); nothing was saved"
+    _secret_write_done "$key" "$connector" "$action" "$pfile" "$pfile" "$task"
     return 0
   fi
 
