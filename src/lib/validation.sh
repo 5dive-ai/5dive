@@ -545,7 +545,7 @@ _sp_unsetfacl()    { command -v setfacl >/dev/null 2>&1 && setfacl -x "$1" "$2" 
 # The named users on a file's ACL, one per line (not the owner entry).
 _sp_acl_users()    { command -v getfacl >/dev/null 2>&1 && getfacl -cp "$1" 2>/dev/null | sed -n 's/^user:\([^:][^:]*\):.*/\1/p'; }
 
-_sp_is_member() { _sp_members "$2" | grep -qxF "$1"; }
+_sp_is_member() { grep -qxF "$1" <<<"$(_sp_members "$2")"; }
 _sp_group_readable() { [[ "$1" =~ ^[0-7]+$ ]] && (( (8#$1 & 8#040) )); }
 
 # An account login: <profiles dir>/<p>/combined.env, one level deep.
@@ -612,6 +612,13 @@ secret_file_secure() {
   [[ "$base" != tools.sh ]] || return 0
   mode=$(_sp_mode "$f") || mode=600
   g=$(secrets_group)
+  # A host with neither group (a CI runner, a fresh container) keeps the file's
+  # group: there is no seat in a missing group to lock out, and a key write that
+  # worked before this posture must not start failing on it. World bits still go.
+  if ! _sp_group_exists "$g"; then
+    _sp_chmod o-rwx "$f" || return 1
+    return 0
+  fi
   _sp_chgrp "$g" "$f" || return 1
   _sp_chmod o-rwx "$f" || return 1
   [[ "$g" != "$(_sp_shared_group)" ]] || return 0

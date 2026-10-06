@@ -22,6 +22,7 @@
 #     links to it; moving a seat to another account moves its read on the next
 #     tick (or at once through link_agent_profile); the profile writer keeps
 #     that posture across its rename; agents.d/<x>.env (metadata) is untouched
+#   * a host with no claude group still writes a key (no chgrp, rc 0, o-rwx)
 #   * AS ROOT ONLY: the same reconcile on real files and a real group, and a
 #     real non-member uid in the workspace group is refused every key and still
 #     reads tools.sh (the row's acceptance shape)
@@ -136,7 +137,7 @@ for want in '/usr/local/bin/5dive partner hire \*' '/usr/local/bin/5dive hire-li
   grep -qE "^agent-seat_b ALL=\(root\) NOPASSWD: ${want}$" <<<"$sud" \
     && ok_t "T6 grant: ${want//\\/}" || bad_t "T6 missing grant ${want//\\/}"
 done
-grep -v '^#' <<<"$sud" | grep -q 'telegram-app' && bad_t "T6 telegram-app granted" || ok_t "T6 telegram-app link is not granted"
+grep -q 'telegram-app' <<<"$(grep -v '^#' <<<"$sud")" && bad_t "T6 telegram-app granted" || ok_t "T6 telegram-app link is not granted"
 [[ "$(classify_sudo_grant <<<"$sud")" == "cli-scoped|root|0" ]] \
   && ok_t "T6 template still classifies cli-scoped, no extra entries" || bad_t "T6 classify" "$(classify_sudo_grant <<<"$sud")"
 if command -v visudo >/dev/null 2>&1; then
@@ -271,6 +272,23 @@ printf 'k2' | profile_set_var p3 ANTHROPIC_API_KEY
 [[ "$(acl_of "$P/p3/combined.env")" == "u:agent-x:r u:claude:r " && "$(grep -c '^ANTHROPIC_API_KEY=k2$' "$P/p3/combined.env")" == 1 ]] \
   && ok_t "T10 profile_set_var rewrite: readers restored after the rename" || bad_t "T10 rewrite" "$(acl_of "$P/p3/combined.env")"
 unset -f chown require_root
+
+# --- T11: a host with no claude group (CI runner, fresh container) ------------
+# secrets_group falls back to `claude` when claude-keys cannot be created; with
+# THAT group missing too, a key write must still succeed (pre-DIVE-5690 it did),
+# keep the file's group, and still drop the world bits.
+mv "$OS/groups/claude-keys" "$OS/claude-keys.saved"
+C11="$TMP/c11"; mkdir -p "$C11"
+fg_before=$(wc -l < "$OS/fgroup")
+out=$(FAKE_GROUPADD_FAILS=1 CONNECTORS_DIR="$C11" _write_connector openrouter.env <<<'OPENROUTER_API_KEY=k' 2>&1); rc=$?
+[[ $rc -eq 0 && "$(cat "$C11/openrouter.env" 2>/dev/null)" == OPENROUTER_API_KEY=k ]] \
+  && ok_t "T11 no claude group: the connector write still succeeds" || bad_t "T11 write failed" "rc=$rc $out"
+[[ "$(wc -l < "$OS/fgroup")" == "$fg_before" ]] && ok_t "T11 no chgrp to a group that does not exist" || bad_t "T11 chgrp attempted" "$(tail -1 "$OS/fgroup")"
+[[ "$(stat -c %a "$C11/openrouter.env")" == 640 ]] && ok_t "T11 the key is still 640 (no world bits)" || bad_t "T11 mode" "$(stat -c %a "$C11/openrouter.env")"
+printf 'K=v\n' > "$C11/w.env"; chmod 644 "$C11/w.env"
+FAKE_GROUPADD_FAILS=1 secret_file_secure "$C11/w.env"; rc=$?
+[[ $rc -eq 0 && "$(stat -c %a "$C11/w.env")" == 640 ]] && ok_t "T11 secret_file_secure: rc 0 and o-rwx with no group to move to" || bad_t "T11 secure" "rc=$rc mode=$(stat -c %a "$C11/w.env")"
+mv "$OS/claude-keys.saved" "$OS/groups/claude-keys"
 
 # --- T9: AS ROOT, real files, a real group, a real non-member uid -------------
 if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev/null; then
