@@ -1451,12 +1451,26 @@ if [[ "$TYPE" == "claude" ]]; then
   _creds_re='^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)=.+'
   _deadline=$(( SECONDS + ${CLAUDE_AUTH_WAIT_SECS:-45} ))
   _waited=0
-  until grep -qE "$_creds_re" "$_primary_auth" 2>/dev/null; do
+  # DIVE-5690: the shared login file is group claude-keys, so a standard seat
+  # cannot read it, and a sandboxed seat cannot even reach its directory. There
+  # is nothing to wait on: systemd read the file as root at unit start and put
+  # the values in this environment. Grade that environment instead. Waiting would
+  # cost 45s on every boot and then write a false DEGRADED verdict.
+  if [[ ! -r "$_primary_auth" ]] \
+     && { [[ -e "$_primary_auth" ]] || [[ ! -x "$(dirname "$_primary_auth")" ]]; }; then
+    _deadline=$SECONDS
+    _creds_env_only=1
+  fi
+  until grep -qE "$_creds_re" "$_primary_auth" 2>/dev/null \
+        || { [[ -n "${_creds_env_only:-}" ]] \
+             && [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]]; }; do
     (( SECONDS >= _deadline )) && break
     _waited=1
     sleep 1
   done
-  if grep -qE "$_creds_re" "$_primary_auth" 2>/dev/null; then
+  if grep -qE "$_creds_re" "$_primary_auth" 2>/dev/null \
+     || { [[ -n "${_creds_env_only:-}" ]] \
+          && [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]]; }; then
     # Clear a prior degraded-start verdict only after this boot observed the
     # credential it will actually export.
     cred_seed_ok
@@ -1479,7 +1493,7 @@ if [[ "$TYPE" == "claude" ]]; then
     # veto process liveness instead of relying on short-lived journal history.
     cred_seed_failed "claude credential absent after ${CLAUDE_AUTH_WAIT_SECS:-45}s wait — launched DEGRADED and cannot reach its provider; supply a credential and restart"
   fi
-  unset _primary_auth _creds_re _deadline _waited _af _line 2>/dev/null || :
+  unset _primary_auth _creds_re _deadline _waited _af _line _creds_env_only 2>/dev/null || :
 fi
 
 # DIVE-2743: trust the agent's EFFECTIVE workdir before the first launch.

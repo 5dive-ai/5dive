@@ -437,7 +437,7 @@ _team_bot_relay_status() {
 }
 
 # Force a relay agent's connector env to the shared token + send-only, preserving
-# any unrelated keys. root:claude 640 (same as install_channel writes).
+# any unrelated keys. 640, group claude-keys (same as install_channel writes).
 _team_bot_write_sendonly_env() {
   local name="$1" token="$2" tmp
   local ef="${CONNECTORS_DIR}/telegram-${name}.env"   # separate stmt: ${name} aborts under set -u if same line
@@ -450,6 +450,7 @@ _team_bot_write_sendonly_env() {
   chown root:claude "$tmp" 2>/dev/null || true
   chmod 640 "$tmp"
   mv "$tmp" "$ef"
+  secret_file_secure "$ef"   # DIVE-5690: a bot token is not group-claude readable
 }
 
 # Persist channels=telegram + teamTopic for each relayed agent (under reg lock).

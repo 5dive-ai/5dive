@@ -76,6 +76,9 @@ cmd_hire_link() {
     _hire_link_answer unavailable "this box has no 5dive account, so there is no hire link: the owner adds agents with 5dive agent import $slug"
     return 0
   fi
+  # DIVE-5690: a standard seat cannot read the box identity; it re-runs as root
+  # through its exact-path grant. Returns here only for a seat with no grant.
+  [[ -r "$env_file" ]] || box_identity_elevate hire-link "$slug"
   [[ -r "$env_file" ]] || fail "$E_PERMISSION" "this seat cannot read the box identity ($env_file); ask your lead for the link"
   token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$env_file" | head -1)
   if [[ -z "$token" ]]; then

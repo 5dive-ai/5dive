@@ -13,10 +13,10 @@
 # API installs the pack back onto this box through the ordinary box channel.
 #
 # AUTHORITY. The request is authenticated with the BOX's identity — the
-# CONNECTORD_TOKEN in /etc/5dive/connectord.env (0640 root:claude). Standard and
-# admin seats are in group `claude` and read it directly; a sandboxed seat is not
-# and cannot, and that is the intended boundary: no sudo, no sudoers entry, no new
-# privilege class. The API decides whether the box is a partner box and what the
+# CONNECTORD_TOKEN in /etc/5dive/connectord.env (0640 root:claude-keys, DIVE-5690).
+# An admin seat reads it directly. A standard seat re-runs this verb as root
+# through the exact-path `5dive partner hire *` grant, so the token never reaches
+# it. A sandboxed seat holds no grant and is refused, which is the intended boundary. The API decides whether the box is a partner box and what the
 # partner's catalogue holds; this side only validates the shape of what it sends.
 #
 # THE TOKEN NEVER TOUCHES ARGV. The existing box->API callers pass it as
@@ -143,7 +143,10 @@ cmd_partner_hire() {
   token=$(_partner_box_token) || trc=$?
   case "$trc" in
     0) ;;
-    1) _partner_refuse "$E_PERMISSION" no_box_identity "" \
+    1) # DIVE-5690: a standard seat runs the hire as root through its exact-path
+       # grant; returns here only when it holds none (a sandboxed seat).
+       box_identity_elevate partner hire "$pack" ${name:+"--as=$name"}
+       _partner_refuse "$E_PERMISSION" no_box_identity "" \
          "this seat cannot reach the box's identity ($(_partner_connectord_env) is not readable by $(id -un 2>/dev/null || echo this user)) — hiring from chat needs a non-sandboxed seat on a partner box" ;;
     *) _partner_refuse "$E_NOT_FOUND" no_box_identity "" \
          "this seat cannot reach the box's identity (no CONNECTORD_TOKEN in $(_partner_connectord_env)) — hiring from chat needs a non-sandboxed seat on a partner box; on a self-hosted box use \`5dive hire\`" ;;

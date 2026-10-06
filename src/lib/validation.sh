@@ -272,14 +272,16 @@ prompt_secret() {
 }
 
 # Inline connector writer — replaces the suid 5dive-write-connector helper.
-# Writes var=value to /etc/5dive/connectors/<fname> with mode 640 root:claude.
+# Writes var=value to /etc/5dive/connectors/<fname> with mode 640, group
+# claude-keys (DIVE-5690: not `claude`, which every standard seat is in).
 _write_connector() {
   local fname="$1"
   [[ "$fname" =~ ^[a-zA-Z0-9_-]+\.env$ ]] || { echo "invalid connector filename: $fname" >&2; return 1; }
   local path="${CONNECTORS_DIR}/${fname}"
   cat > "$path"
   chmod 640 "$path"
-  chown root:claude "$path"
+  chown root "$path" 2>/dev/null || true   # refused to a non-root caller; the root reconcile re-tightens
+  secret_file_secure "$path"
 }
 
 # Write /etc/5dive/connectors/<kind>-<name>.env with correct perms.
@@ -473,4 +475,275 @@ _secret_project_file() {
   fi
   if [[ -e "$d/.env.local" || -L "$d/.env.local" ]]; then printf '%s/.env.local' "$d"
   else printf '%s/.env' "$d"; fi
+}
+
+# -------- who may read a key on this box (DIVE-5690) --------
+#
+# Group `claude` is the box's shared WORKSPACE group. Every standard and admin
+# seat is in it, because the registry, the a2a ledger, the audit log and the
+# shared checkouts are scoped to it. Until DIVE-5690 it was also the group of
+# every secret under /etc/5dive. So a standard seat, including a third-party
+# pack a customer hires from the marketplace, could `cat` the owner's Anthropic
+# login, the OpenRouter key, the box identity (connectord.env: CONNECTORD_TOKEN,
+# AUTOMATION_TOKEN) and every other agent's bot token.
+#
+# The secrets now carry their own group, SECRETS_GROUP (claude-keys):
+#   members  the `claude` user and every admin or beyond-admin seat. Both can
+#            already run the whole CLI as root, so the group gives them nothing
+#            new. Standard and sandboxed seats are never members.
+#   files    every regular file directly in the connectors dir except tools.sh,
+#            plus connectord.env. Only a file whose group is `claude` is moved;
+#            a root:root 600 file is already tighter and is left alone.
+#   ACLs     u:claude:r on each moved file that group claude could read. A
+#            process running as `claude` (the
+#            dashboard's shelld rotating its token, the prod API on our own
+#            host) took its groups when it started, and would lose the read
+#            until a restart if it relied on the new group alone.
+#            u:agent-<x>:r on telegram-<x>.env and discord-<x>.env, so a seat
+#            still reads its OWN channel token (the unit hands it that value
+#            anyway, through EnvironmentFile).
+# profiles every account login, auth-profiles/<p>/combined.env, under the same
+#            posture. Its seat readers are exactly the seats whose
+#            agents.d/<x>-auth.env links to it (systemd reads it as root either
+#            way), and the reconcile re-derives them every tick, so a seat moved
+#            to another account loses the read of the old one. agents.d/<x>.env
+#            carries only AGENT_* metadata and stays group claude.
+# tools.sh stays root:claude 640. It is every seat's BASH_ENV by design
+# (DIVE-5366), and a key an agent asks its owner for lands there (DIVE-5370).
+#
+# What this does NOT take away: the values the agent unit's EnvironmentFile
+# lines put in a seat's environment. systemd reads those files as root, so a
+# seat on the owner's Anthropic login holds that login in its own environment.
+#
+# Every writer that used to stamp root:claude on a secret now calls
+# secret_file_secure. The reconcile runs on install/upgrade and on every root
+# heartbeat tick, because one writer lives outside this repo: 5dive-api's shelld
+# rewrites connectord.env as root:claude 640 when it rotates its token.
+
+SECRETS_GROUP="${FIVEDIVE_SECRETS_GROUP:-claude-keys}"
+
+# The workspace group the keys are moving OFF (create_agent_user's seam).
+_sp_shared_group()   { printf '%s' "${AGENT_SHARED_GROUP:-claude}"; }
+_sp_connectord_env() { printf '%s' "${FIVEDIVE_CONNECTORD_ENV:-/etc/5dive/connectord.env}"; }
+_sp_connectors_dir() { printf '%s' "${CONNECTORS_DIR:-${FIVEDIVE_CONNECTOR_DIR:-/etc/5dive/connectors}}"; }
+_sp_profiles_dir()   { printf '%s' "${AUTH_PROFILES_DIR:-/var/lib/5dive/auth-profiles}"; }
+_sp_env_dir()        { printf '%s' "${ENV_DIR:-/var/lib/5dive/agents.d}"; }
+
+# OS seams. The harness redefines these; nothing on a box does.
+_sp_group_exists() { getent group "$1" >/dev/null 2>&1; }
+_sp_groupadd()     { groupadd --system "$1" >/dev/null 2>&1; }
+_sp_members()      { getent group "$1" 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n' | sed '/^$/d'; }
+_sp_member_add()   { gpasswd -a "$1" "$2" >/dev/null 2>&1; }
+_sp_member_del()   { gpasswd -d "$1" "$2" >/dev/null 2>&1; }
+_sp_user_exists()  { id -u "$1" >/dev/null 2>&1; }
+_sp_file_group()   { stat -c %G "$1" 2>/dev/null; }
+_sp_mode()         { stat -c %a "$1" 2>/dev/null; }
+_sp_chgrp()        { chgrp "$1" "$2"; }
+_sp_chmod()        { chmod "$1" "$2"; }
+_sp_setfacl()      { command -v setfacl >/dev/null 2>&1 && setfacl -m "$1" "$2" 2>/dev/null; }
+_sp_unsetfacl()    { command -v setfacl >/dev/null 2>&1 && setfacl -x "$1" "$2" 2>/dev/null; }
+# The named users on a file's ACL, one per line (not the owner entry).
+_sp_acl_users()    { command -v getfacl >/dev/null 2>&1 && getfacl -cp "$1" 2>/dev/null | sed -n 's/^user:\([^:][^:]*\):.*/\1/p'; }
+
+_sp_is_member() { grep -qxF "$1" <<<"$(_sp_members "$2")"; }
+_sp_group_readable() { [[ "$1" =~ ^[0-7]+$ ]] && (( (8#$1 & 8#040) )); }
+
+# An account login: <profiles dir>/<p>/combined.env, one level deep.
+_sp_is_profile_env() {
+  local d; d=$(_sp_profiles_dir)
+  [[ "$1" == "$d"/*/combined.env && "${1#"$d"/}" != */*/* ]]
+}
+
+# _sp_profile_seats <combined.env> — the seats bound to this login: each
+# agents.d/<x>-auth.env that is a symlink to it. Prints <x>, one per line.
+_sp_profile_seats() {
+  local f="$1" l t
+  for l in "$(_sp_env_dir)"/*-auth.env; do
+    [[ -L "$l" ]] || continue
+    t=$(readlink "$l") || continue
+    [[ "$t" == "$f" ]] || [[ "$(readlink -f "$l")" == "$(readlink -f "$f")" ]] || continue
+    l="${l##*/}"
+    printf '%s\n' "${l%-auth.env}"
+  done
+}
+
+# _sp_profile_readers_sync <combined.env> — the seat readers of one login are
+# exactly its bound seats: add the missing, drop any agent-* that is no longer
+# bound. `claude` is secret_file_secure's to keep. Counts changes in SP_ACL.
+_sp_profile_readers_sync() {
+  local f="$1" want have u
+  want=$(_sp_profile_seats "$f" | sed 's/^/agent-/')
+  have=$(_sp_acl_users "$f")
+  while IFS= read -r u; do
+    [[ -n "$u" ]] && _sp_user_exists "$u" || continue
+    grep -qxF "$u" <<<"$have" && continue
+    _sp_setfacl "u:${u}:r" "$f" && SP_ACL=$(( ${SP_ACL:-0} + 1 ))
+  done <<<"$want"
+  while IFS= read -r u; do
+    # A bare uid is a deleted seat's entry: a new account given that uid
+    # would inherit the read, so it goes too.
+    [[ "$u" == agent-* || "$u" =~ ^[0-9]+$ ]] || continue
+    grep -qxF "$u" <<<"$want" && continue
+    _sp_unsetfacl "u:${u}" "$f" && SP_ACL=$(( ${SP_ACL:-0} + 1 ))
+  done <<<"$have"
+  return 0
+}
+
+# The group a secret is written with: SECRETS_GROUP, created on first use. A box
+# where it cannot be created keeps the old group, so nobody who reads a key
+# today is locked out by a failed groupadd; the next reconcile retries.
+secrets_group() {
+  if _sp_group_exists "$SECRETS_GROUP" || { _sp_groupadd "$SECRETS_GROUP" && _sp_group_exists "$SECRETS_GROUP"; }; then
+    printf '%s' "$SECRETS_GROUP"
+  else
+    _sp_shared_group
+  fi
+}
+
+# secret_file_secure <path> — the posture for one secret file: root:SECRETS_GROUP,
+# no world bits, readable by `claude`, and by agent-<x> when it is x's own
+# channel token, or by the seats bound to it when it is an account login
+# (combined.env). Symlinks are never followed (chgrp would act on the target).
+# tools.sh is refused here so no caller can lock every seat out of BASH_ENV.
+secret_file_secure() {
+  local f="$1" g base u mode
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  base="${f##*/}"
+  [[ "$base" != tools.sh ]] || return 0
+  mode=$(_sp_mode "$f") || mode=600
+  g=$(secrets_group)
+  # A host with neither group (a CI runner, a fresh container) keeps the file's
+  # group: there is no seat in a missing group to lock out, and a key write that
+  # worked before this posture must not start failing on it. World bits still go.
+  if ! _sp_group_exists "$g"; then
+    _sp_chmod o-rwx "$f" || return 1
+    return 0
+  fi
+  # A non-root writer can only hand a file to a group it is in, so on a box with
+  # the group (an installed-host test leg, a seat writing its own file) chgrp is
+  # refused. That must not fail the write either: the file keeps the writer's
+  # group, loses its world bits, and the root heartbeat reconcile moves it on
+  # its next tick. The ACLs below need the owner or root, so they wait too.
+  if ! _sp_chgrp "$g" "$f" 2>/dev/null; then
+    _sp_chmod o-rwx "$f" || return 1
+    return 0
+  fi
+  _sp_chmod o-rwx "$f" || return 1
+  [[ "$g" != "$(_sp_shared_group)" ]] || return 0
+  # The ACLs only keep a read that group claude HAD. A 600 root:claude file
+  # (a key nobody but root reads) must not gain a reader by being moved.
+  _sp_group_readable "$mode" || return 0
+  _sp_user_exists claude && _sp_setfacl u:claude:r "$f"
+  if _sp_is_profile_env "$f"; then
+    _sp_profile_readers_sync "$f"
+    return 0
+  fi
+  if [[ "$base" =~ ^(telegram|discord)-([a-z0-9][a-z0-9_-]*)\.env$ ]]; then
+    u="agent-${BASH_REMATCH[2]}"
+    _sp_user_exists "$u" && _sp_setfacl "u:${u}:r" "$f"
+  fi
+  return 0
+}
+
+# secrets_member_sync <user> <isolation> — one seat's membership follows its
+# tier: admin and beyond-admin are members, everything else is not. Called by
+# create_agent_user (so a re-create at a new tier moves it) and the reconcile.
+secrets_member_sync() {
+  local user="$1" iso="$2" g
+  case "$iso" in
+    admin|beyond-admin)
+      g=$(secrets_group)
+      [[ "$g" != "$(_sp_shared_group)" ]] || return 0
+      _sp_is_member "$user" "$g" || _sp_member_add "$user" "$g" ;;
+    *)
+      _sp_group_exists "$SECRETS_GROUP" || return 0
+      _sp_is_member "$user" "$SECRETS_GROUP" || return 0
+      _sp_member_del "$user" "$SECRETS_GROUP" ;;
+  esac
+}
+
+# secrets_posture_reconcile [--quiet] [<registry json>] — idempotent, root.
+# Prints one summary line unless --quiet; with --quiet it prints only when it
+# changed something. Sets SP_MOVED / SP_ADDED / SP_DROPPED for callers.
+secrets_posture_reconcile() {
+  local quiet=0 reg="" g d f name iso
+  [[ "${1:-}" == --quiet ]] && { quiet=1; shift; }
+  reg="${1:-}"
+  SP_MOVED=0 SP_ADDED=0 SP_DROPPED=0 SP_ACL=0
+  g=$(secrets_group)
+  if [[ "$g" == "$(_sp_shared_group)" ]]; then
+    warn "could not create group ${SECRETS_GROUP}; every seat in group $(_sp_shared_group) can still read this box's keys (DIVE-5690)"
+    return 1
+  fi
+
+  # Members. The registry decides tier; an unreadable registry removes nobody.
+  if _sp_user_exists claude && ! _sp_is_member claude "$g"; then
+    _sp_member_add claude "$g" && SP_ADDED=$((SP_ADDED + 1))
+  fi
+  [[ -n "$reg" ]] || reg=$(registry_read 2>/dev/null) || reg=""
+  if [[ -n "$reg" ]]; then
+    while IFS=$'\t' read -r name iso; do
+      [[ -n "$name" ]] || continue
+      _sp_user_exists "agent-${name}" || continue
+      if [[ "$iso" == admin || "$iso" == beyond-admin ]]; then
+        _sp_is_member "agent-${name}" "$g" && continue
+        _sp_member_add "agent-${name}" "$g" && SP_ADDED=$((SP_ADDED + 1))
+      else
+        _sp_is_member "agent-${name}" "$g" || continue
+        _sp_member_del "agent-${name}" "$g" && SP_DROPPED=$((SP_DROPPED + 1))
+      fi
+    done < <(jq -r '.agents // {} | to_entries[] | [.key, (.value.isolation // "standard")] | @tsv' <<<"$reg" 2>/dev/null)
+  fi
+
+  command -v setfacl >/dev/null 2>&1 \
+    || (( quiet )) || warn "setfacl is not installed (package acl): a process already running as claude cannot read the moved keys until it restarts (DIVE-5690)"
+  # Files. Only what still carries group `claude` moves, so a tick with nothing
+  # to do costs one stat per file.
+  d=$(_sp_connectors_dir)
+  for f in "$d"/* "$(_sp_connectord_env)"; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    [[ "$f" != "$d/tools.sh" ]] || continue
+    [[ "$(_sp_file_group "$f")" == "$(_sp_shared_group)" ]] || continue
+    secret_file_secure "$f" && SP_MOVED=$((SP_MOVED + 1))
+  done
+  # Account logins. A moved one is re-read every tick: binding a seat to an
+  # account, or moving it off one, changes who may read it without touching
+  # the file.
+  for f in "$(_sp_profiles_dir)"/*/combined.env; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    case "$(_sp_file_group "$f")" in
+      "$(_sp_shared_group)") secret_file_secure "$f" && SP_MOVED=$((SP_MOVED + 1)) ;;
+      "$g") _sp_group_readable "$(_sp_mode "$f")" && _sp_profile_readers_sync "$f" ;;
+    esac
+  done
+
+  if (( ! quiet )) || (( SP_MOVED + SP_ADDED + SP_DROPPED + SP_ACL > 0 )); then
+    printf 'secrets posture (DIVE-5690): %d file(s) moved to group %s, %d member(s) added, %d dropped, %d login reader(s) changed\n' \
+      "$SP_MOVED" "$g" "$SP_ADDED" "$SP_DROPPED" "$SP_ACL"
+  fi
+  return 0
+}
+
+cmd_secrets_posture() {
+  require_root "_secrets_posture"
+  [[ $# -le 1 && ( $# -eq 0 || "$1" == --quiet ) ]] || fail "$E_USAGE" "usage: 5dive _secrets_posture [--quiet]"
+  secrets_posture_reconcile "$@"
+}
+
+# box_identity_elevate <verb> [args...] — the box-identity verbs a standard seat
+# still runs (partner hire, hire-link) re-run themselves as root through an
+# exact-path NOPASSWD grant once connectord.env is closed to the seat. The token
+# never reaches the seat. Returns (does nothing) when the seat can read the file,
+# when there is no file, when already root, or when sudo does not grant this
+# exact command (a sandboxed seat, a seat whose sudoers predate the grant): the
+# verb's own refusal then answers as before. `sudo -l` asks first, so a missing
+# grant never turns into a password prompt or a bare sudo error.
+box_identity_elevate() {
+  local f; f=$(_sp_connectord_env)
+  (( EUID != 0 )) || return 0
+  [[ -e "$f" && ! -r "$f" ]] || return 0
+  local -a cmd=(/usr/local/bin/5dive "$@")   # the exact path the grant names
+  (( ${JSON_MODE:-0} )) && cmd+=(--json)
+  sudo -n -l "${cmd[@]}" >/dev/null 2>&1 || return 0
+  exec sudo -n "${cmd[@]}"
 }
