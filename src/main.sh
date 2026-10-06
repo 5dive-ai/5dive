@@ -388,6 +388,8 @@ Sysadmin seat (partner boxes only): 5dive sysadmin comes from the partner plugin
 
 Hire, publish, install (any agent, no sudo — DIVE-5396):
   5dive hire-link <slug> [--json]                    # the one-tap hire link a standard-tier agent sends its human (admin: agent import)
+  5dive hire-link --create --name=<N> --description=<need>  # make a custom agent for a need no catalogue agent fits; prints its draft + card
+  5dive hire-link custom-<id> --hire                 # admin-tier, on the owner's yes: hire that made agent onto this box
   5dive route add <name>|/<name> --port=<port>       # publish an app you run on 127.0.0.1:<port>; route rm|ls
   5dive pkg install <package>...                     # a system package from the box's apt repositories (install only)
 
@@ -1424,7 +1426,13 @@ main() {
     hire-link)
       # DIVE-5396: the one-tap hire link a lead sends its owner instead of
       # creating agents. Read-shaped (no registry, no lock, nothing written).
+      # DIVE-5722: --create makes a custom agent's draft on 5dive and --hire
+      # hires it, so those two and the made agent's slug are audited (never the
+      # name or the owner's words in --description).
       AUDIT_CMD="hire-link"; AUDIT_ARGS=()
+      for _hl_a in "$@"; do
+        [[ "$_hl_a" == --create || "$_hl_a" == --hire || "$_hl_a" =~ ^custom-[a-z0-9]{12}$ ]] && AUDIT_ARGS+=("$_hl_a")
+      done
       cmd_hire_link "$@" ;;
     route)
       # DIVE-5396: publish an agent's app on the box's domain (one managed

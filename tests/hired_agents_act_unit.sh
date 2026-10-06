@@ -263,9 +263,142 @@ hl marcus --json; grep -qF '"status":"error"' "$TMP/out" && ok 'a link off t.me 
 HL_CODE=403; HL_BODY='{"error":"partner_box"}'
 hl marcus --json; grep -qF '"status":"partner_box"' "$TMP/out" && ok 'a partner box is told to hire in the partner app' || bad 'partner box'
 HL_CODE=200
-hl mycustombot --json; grep -qF '"status":"not_catalogue"' "$TMP/out" && grep -qi 'custom' "$TMP/out" \
-  && ok 'a non-catalogue slug says custom agents are made on the web' || bad "not catalogue ($(cat "$TMP/out"))"
+# The prose is the text answer (--json carries the status); the old arm grepped
+# 'custom' and matched the slug itself.
+hl mycustombot --json; grep -qF '"status":"not_catalogue"' "$TMP/out" \
+  && hl mycustombot && grep -qF 'hire-link --create' "$TMP/out" && ! grep -qiE 'web|dashboard' "$TMP/out" \
+  && ok 'a non-catalogue slug names --create, never the web dashboard (DIVE-5722)' || bad "not catalogue ($(cat "$TMP/out"))"
 ( cmd_hire_link 'a/b' ) >/dev/null 2>&1 && bad 'a malformed slug is refused' || ok 'a malformed slug is refused'
+
+# ── DIVE-5722: a lead makes a custom agent from chat ─────────────────────────
+# The API answers by path; every call is logged (method, path, body) and the
+# token must arrive on curl's stdin config, never argv.
+CID=abcdef123456
+CA_CODE=201
+CA_BODY='{"id":"abcdef123456","pack":"custom-abcdef123456","name":"Ivy","role":"Accounts manager","skills":["follow-up-ladder","copywriting"],"cardUrl":"https://api.example.com/custom-agent/abcdef123456/card.svg?v=0123456789"}'
+LK_CODE=200; LK_BODY='{"channel":"miniapp","url":"https://t.me/FiveDiveBot?startapp=agent-custom-abcdef123456"}'
+HR_CODE=202; HR_BODY='{"state":"hiring"}'
+POLLS=('{"state":"hiring"}' '{"state":"hired","name":"ivy"}')
+curl(){
+  local a method=POST url="" data="" cfg
+  cfg=$(cat)
+  while (( $# )); do case "$1" in -X) method="$2"; shift ;; --data-binary) data="$2"; shift ;; https://*) url="$1" ;; esac; shift; done
+  [[ "$cfg" == *'Bearer tok'* ]] || { printf 'NO-TOKEN %s\n' "$url" >>"$TMP/calls"; }
+  printf '%s %s %s\n' "$method" "${url#https://api.example.com}" "$data" >>"$TMP/calls"
+  case "$method ${url#https://api.example.com}" in
+    "POST /server/custom-agents") printf '%s\n%s' "$CA_BODY" "$CA_CODE" ;;
+    "POST /server/telegram/hire-link") printf '%s\n%s' "$LK_BODY" "$LK_CODE" ;;
+    "POST /server/custom-agents/$CID/hire") printf '%s\n%s' "$HR_BODY" "$HR_CODE" ;;
+    "GET /server/custom-agents/$CID/hire")
+      local n; n=$(grep -c "^GET " "$TMP/calls"); local i=$(( n - 1 ))
+      (( i < ${#POLLS[@]} )) || i=$(( ${#POLLS[@]} - 1 ))
+      printf '%s\n%s' "${POLLS[$i]}" "${POLL_CODE:-200}" ;;
+    *) printf 'nope\n404' ;;
+  esac
+}
+export HIRE_LINK_POLL_S=0
+hlc(){ : >"$TMP/calls"; hl "$@"; }
+
+hlc --create --name='Ivy Chase' '--description=Chases unpaid invoices, politely, every week.'
+OUT=$(cat "$TMP/out")
+[[ "$OUT" == *'Draft: Ivy — Accounts manager'* && "$OUT" == *'Skills: follow-up-ladder, copywriting'* \
+   && "$OUT" == *'Card: https://t.me/FiveDiveBot?startapp=agent-custom-abcdef123456'* ]] \
+  && ok '--create prints the draft: name, role, the skills picked for it, and its card link' || bad "create draft ($OUT)"
+[[ "$OUT" == *'Nothing is hired yet'* && "$OUT" == *'Standard-tier: they tap Hire on it'* \
+   && "$OUT" == *'only on their clear yes, run 5dive hire-link custom-abcdef123456 --hire'* ]] \
+  && ok '--create says nothing is hired, and how each tier gets the owner to a hire' || bad "create next ($OUT)"
+grep -qxF 'POST /server/custom-agents {"name":"Ivy Chase","description":"Chases unpaid invoices, politely, every week."}' "$TMP/calls" \
+  && ok '--create sends the name and the need as written, to the Mini App create' || bad "create body ($(cat "$TMP/calls"))"
+grep -qxF 'POST /server/telegram/hire-link {"slug":"custom-abcdef123456"}' "$TMP/calls" \
+  && ok 'the card link is the hire-link of custom-<id>' || bad "card lookup ($(cat "$TMP/calls"))"
+grep -qE '/hire( |$)' "$TMP/calls" && bad '--create hires nothing' "$(cat "$TMP/calls")" || ok '--create hires nothing'
+grep -q 'NO-TOKEN' "$TMP/calls" && bad 'every call carries the box token on stdin' || ok 'every call carries the box token on stdin'
+grep -qE 'skills' <(grep '^POST /server/custom-agents ' "$TMP/calls") \
+  && bad 'the agent never sends skills of its own' || ok 'the agent never sends skills of its own'
+
+hlc --create --name=Ivy '--description=Chases unpaid invoices, politely.' --json
+jq -e '.data.status == "made" and .data.slug == "custom-abcdef123456" and .data.role == "Accounts manager"
+       and (.data.skills | length) == 2 and .data.channel == "miniapp"
+       and (.data.url | endswith("startapp=agent-custom-abcdef123456"))' "$TMP/out" >/dev/null \
+  && ok '--create --json: status made, the slug, role, skills and card link' || bad "create json ($(cat "$TMP/out"))"
+
+LK_CODE=409; LK_BODY='{"error":"no_hire_card"}'
+hlc --create --name=Ivy '--description=Chases unpaid invoices, politely.'
+OUT=$(cat "$TMP/out")
+[[ "$OUT" == *'Card: none (your owner signs in to 5dive on the web'* && "$OUT" == *'--hire'* && "$OUT" != *'Standard-tier: they tap'* ]] \
+  && ok 'a web owner gets the draft with no card, and the admin route' || bad "web owner draft ($OUT)"
+LK_CODE=200; LK_BODY='{"channel":"miniapp","url":"https://t.me/FiveDiveBot?startapp=agent-custom-zzzzzz999999"}'
+hlc --create --name=Ivy '--description=Chases unpaid invoices, politely.'
+[[ "$(cat "$TMP/out")" == *'Card: none'* ]] && ok 'a card link for another agent is not passed on' || bad "foreign card ($(cat "$TMP/out"))"
+LK_BODY='{"channel":"web","url":"https://5dive.example/dashboard/agents/new"}'
+hlc --create --name=Ivy '--description=Chases unpaid invoices, politely.'
+[[ "$(cat "$TMP/out")" == *'Card: none'* ]] && ok 'a made agent is never sent to the web dashboard' || bad "web dashboard card ($(cat "$TMP/out"))"
+LK_BODY='{"channel":"miniapp","url":"https://t.me/FiveDiveBot?startapp=agent-custom-abcdef123456"}'
+
+CA_CODE=400; CA_BODY='{"error":"invalid_description"}'
+hlc --create --name=Ivy --description=short --json
+jq -e '.data.status == "invalid" and .data.error == "invalid_description"' "$TMP/out" >/dev/null \
+  && ok "the API's refusal of the words comes back as invalid, with the reason" || bad "invalid ($(cat "$TMP/out"))"
+CA_CODE=429; CA_BODY='{"error":"Too many requests"}'
+hlc --create --name=Ivy '--description=Chases unpaid invoices, politely.' --json
+jq -e '.data.status == "limit"' "$TMP/out" >/dev/null && ok "the owner's spent day reads as limit" || bad "limit ($(cat "$TMP/out"))"
+CA_CODE=403; CA_BODY='{"error":"partner_box"}'
+hlc --create --name=Ivy '--description=Chases unpaid invoices, politely.' --json
+jq -e '.data.status == "partner_box"' "$TMP/out" >/dev/null && ok 'a partner box makes nothing from chat' || bad "partner create ($(cat "$TMP/out"))"
+CA_CODE=201; CA_BODY='{"id":"../../etc","name":"x"}'
+hlc --create --name=Ivy '--description=Chases unpaid invoices, politely.' --json
+jq -e '.data.status == "error"' "$TMP/out" >/dev/null && ! grep -q 'hire-link {"slug"' "$TMP/calls" \
+  && ok 'an answer without a well-formed id is an error, and nothing is looked up by it' || bad "bad id ($(cat "$TMP/out"))"
+CA_BODY='{"id":"abcdef123456","pack":"custom-abcdef123456","name":"Ivy","role":"Accounts manager","skills":["follow-up-ladder"],"cardUrl":"https://api.example.com/c.svg"}'
+for args in "--create" "--create custom-abcdef123456 --name=a --description=bbbbbbbbbbb" "--create --name=a --description=bbbbbbbbbbbb --hire" "marcus --name=x"; do
+  # shellcheck disable=SC2086
+  ( cmd_hire_link $args ) >/dev/null 2>&1 && bad "usage refused: $args" || ok "usage refused: $args"
+done
+
+hlc custom-abcdef123456
+[[ "$(cat "$TMP/out")" == 'https://t.me/FiveDiveBot?startapp=agent-custom-abcdef123456' ]] && ! grep -q '^GET\|/hire ' "$TMP/calls" \
+  && ok 'hire-link custom-<id> prints its card link, skipping the catalogue' || bad "custom link ($(cat "$TMP/out"))"
+LK_CODE=404; LK_BODY='{"error":"not_found"}'
+hlc custom-abcdef123456 --json
+jq -e '.data.status == "not_found"' "$TMP/out" >/dev/null && ok "another owner's made agent is not_found" || bad "custom 404 ($(cat "$TMP/out"))"
+LK_CODE=200; LK_BODY='{"channel":"miniapp","url":"https://t.me/FiveDiveBot?startapp=agent-custom-abcdef123456"}'
+
+# --hire: the Mini App's Hire, only for an admin-tier seat. `id -un` and the
+# registry are stubbed; under root (CI) the asker is SUDO_USER.
+hlh(){ local tier="$1"; shift; : >"$TMP/calls"
+  ( ok(){ cli_ok "$@"; }; id(){ printf 'agent-lead\n'; }; export SUDO_USER=agent-lead
+    actor_registry_agent(){ ACTOR_AGENT=lead; ACTOR_TIER="$tier"; }
+    cmd_hire_link "$@" ) >"$TMP/out" 2>&1; }
+hlh admin custom-abcdef123456 --hire
+[[ "$(cat "$TMP/out")" == 'Hired: ivy is on the team.'* ]] \
+  && grep -qxF "POST /server/custom-agents/$CID/hire " "$TMP/calls" && [[ $(grep -c "^GET /server/custom-agents/$CID/hire" "$TMP/calls") == 2 ]] \
+  && ok 'admin --hire hires, waiting through the import the way the Mini App polls' || bad "admin hire ($(cat "$TMP/out") | $(cat "$TMP/calls"))"
+hlh beyond-admin custom-abcdef123456 --hire --json
+jq -e '.data.status == "hired" and .data.name == "ivy"' "$TMP/out" >/dev/null && ok 'beyond-admin hires too (--json)' || bad "beyond-admin ($(cat "$TMP/out"))"
+for t in standard unknown:no-tier unknown:registry-unreadable; do
+  hlh "$t" custom-abcdef123456 --hire --json
+  jq -e '.data.status == "tier"' "$TMP/out" >/dev/null && [[ ! -s "$TMP/calls" ]] \
+    && ok "a $t seat is refused --hire before any call, and told to send the card" || bad "tier $t ($(cat "$TMP/out") | $(cat "$TMP/calls"))"
+done
+( ok(){ cli_ok "$@"; }; id(){ printf 'agent-temp\n'; }; export SUDO_USER=agent-temp
+  actor_registry_agent(){ ACTOR_AGENT=""; ACTOR_TIER=unknown:unregistered; }
+  : >"$TMP/calls"; cmd_hire_link custom-abcdef123456 --hire --json ) >"$TMP/out" 2>&1
+jq -e '.data.status == "tier"' "$TMP/out" >/dev/null && ok 'an unregistered agent-* name is not trusted with a hire' || bad "unregistered agent ($(cat "$TMP/out"))"
+( cmd_hire_link marcus --hire ) >/dev/null 2>&1 && bad '--hire on a catalogue slug is refused (agent import hires those)' \
+  || ok '--hire on a catalogue slug is refused (agent import hires those)'
+POLLS=('{"state":"hiring"}'); HIRE_LINK_WAIT_S=0 hlh admin custom-abcdef123456 --hire --json
+jq -e '.data.status == "hiring"' "$TMP/out" >/dev/null && ok 'a hire still importing when the wait ends says hiring, run it again' || bad "hiring ($(cat "$TMP/out"))"
+POLLS=('{"state":"failed","error":"import_failed","message":"pack rejected"}'); POLL_CODE=502
+hlh admin custom-abcdef123456 --hire --json
+jq -e '.data.status == "error" and (.data.message | contains("pack rejected"))' "$TMP/out" >/dev/null \
+  && ok "the box's refusal reaches the agent" || bad "hire failed ($(cat "$TMP/out"))"
+POLL_CODE=200; HR_CODE=200; HR_BODY='{"state":"hired","name":"ivy"}'
+hlh admin custom-abcdef123456 --hire
+[[ "$(cat "$TMP/out")" == 'Hired: ivy'* ]] && ! grep -q '^GET' "$TMP/calls" && ok 'an already hired agent answers its name with no wait' || bad "already hired ($(cat "$TMP/out"))"
+HR_CODE=404; HR_BODY='{"error":"not found"}'
+hlh admin custom-abcdef123456 --hire --json
+jq -e '.data.status == "not_found"' "$TMP/out" >/dev/null && ok "--hire of another owner's agent is not_found" || bad "hire 404 ($(cat "$TMP/out"))"
+unset -f curl
 
 # ── the tool-env shim: user-level installs with no sudo ──────────────────────
 SHIM=$(sed -n "/cat > \"\$_te_tmp\" <<'TOOLENV'/,/^TOOLENV\$/p" install.sh | sed '1d;$d')
@@ -294,7 +427,8 @@ for want in 'Standard-tier never creates agents' 'Standard-tier: send `5dive hir
             '5dive pkg install' '5dive route add <name> --port=<port>' '5dive task add' 'npm i -g' \
             '**Blank teammates**, admin: `sudo 5dive agent create' '--type=claude|codex|grok|antigravity' \
             '5dive agent auth start <type>' '**`5dive market` hires**, admin:' \
-            "its Telegram bot: your human's Connect tap (Mini App, Team)"; do
+            "its Telegram bot: your human's Connect tap (Mini App, Team)" \
+            '**None fits:** `5dive hire-link --create --name=<Name> --description=<need>`'; do
   [[ "$BLOCK" == *"$want"* ]] && ok "hired-agents block says: $want" || bad "hired-agents block says: $want"
 done
 
@@ -310,8 +444,10 @@ grep -qxF -- "$GENERAL" "$LIVE" && ok 'the rendered box file carries the general
 # ask with a link, a tap, a gate or a hand-off for work admin runs itself. The one
 # tap left is a real limit, not a guardrail: the new agent's Telegram bot is made
 # by the owner's own Telegram account (Connect), which no seat holds.
+# DIVE-5722: the verb's own name (`5dive hire-link --create …`) is cut too: running
+# it is not answering the owner with a link, and what it prints is graded above.
 ADMIN=$(grep '^- ' <<<"$BLOCK" | grep -vxF -- "$GENERAL" | sed 's/Standard-tier.*$//' \
-        | sed "s/its Telegram bot: your human's Connect tap (Mini App, Team)//")
+        | sed "s/its Telegram bot: your human's Connect tap (Mini App, Team)//" | sed 's/`5dive hire-link --create [^`]*`//')
 if grep -niE 'link|tap|gate|approv|sysadmin|task add|your lead|ask (an|your)|send your human' <<<"$ADMIN" >"$TMP/bounce"; then
   bad 'an admin seat is never told to answer its owner with a link, tap or hand-off' "$(head -3 "$TMP/bounce")"
 else ok 'an admin seat is never told to answer its owner with a link, tap or hand-off'; fi
