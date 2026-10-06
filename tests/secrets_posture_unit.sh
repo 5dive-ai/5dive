@@ -57,9 +57,9 @@ acl_of() { awk -F'\t' -v f="$1" '$1==f {print $2}' "$OS/acl" | sort | tr '\n' ' 
 
 C="$TMP/connectors"; mkdir -p "$C"
 export CONNECTORS_DIR="$C" FIVEDIVE_CONNECTORD_ENV="$TMP/connectord.env"
-printf 'claude\nagent-olivia\nagent-dave\nagent-x\n' > "$OS/users"
+printf 'claude\nagent-seat_a\nagent-seat_b\nagent-x\n' > "$OS/users"
 : > "$OS/acl"
-for n in anthropic.env openrouter.env telegram-olivia.env telegram-dave.env tools.sh; do
+for n in anthropic.env openrouter.env telegram-seat_a.env telegram-seat_b.env tools.sh; do
   printf 'K=v\n' > "$C/$n"; chmod 640 "$C/$n"; printf '%s\tclaude\n' "$C/$n" >> "$OS/fgroup"
 done
 printf 'K=v\n' > "$C/github-app.env"; chmod 600 "$C/github-app.env"; printf '%s\troot\n' "$C/github-app.env" >> "$OS/fgroup"
@@ -67,7 +67,7 @@ printf 'K=v\n' > "$C/npm.env"; chmod 600 "$C/npm.env"; printf '%s\tclaude\n' "$C
 printf 'CONNECTORD_TOKEN=t\n' > "$FIVEDIVE_CONNECTORD_ENV"; chmod 644 "$FIVEDIVE_CONNECTORD_ENV"
 printf '%s\tclaude\n' "$FIVEDIVE_CONNECTORD_ENV" >> "$OS/fgroup"
 ln -s "$C/anthropic.env" "$C/link.env"; printf '%s\tclaude\n' "$C/link.env" >> "$OS/fgroup"
-REG='{"agents":{"olivia":{"isolation":"admin"},"dave":{"isolation":"standard"},"x":{"isolation":"sandboxed"},"gone":{"isolation":"admin"}}}'
+REG='{"agents":{"seat_a":{"isolation":"admin"},"seat_b":{"isolation":"standard"},"x":{"isolation":"sandboxed"},"gone":{"isolation":"admin"}}}'
 
 # --- T1: a failed groupadd changes no file and says so ------------------------
 out=$(FAKE_GROUPADD_FAILS=1 secrets_posture_reconcile "$REG" 2>&1); rc=$?
@@ -75,9 +75,9 @@ out=$(FAKE_GROUPADD_FAILS=1 secrets_posture_reconcile "$REG" 2>&1); rc=$?
   && ok_t "T1 no group -> rc!=0, named, files untouched" || bad_t "T1 failed groupadd" "rc=$rc $out"
 
 # --- T2: the reconcile moves the keys and nothing else -------------------------
-: > "$OS/groups/claude-keys"; printf 'agent-dave\n' > "$OS/groups/claude-keys"   # dave: stale member
+: > "$OS/groups/claude-keys"; printf 'agent-seat_b\n' > "$OS/groups/claude-keys"   # seat_b: stale member
 out=$(secrets_posture_reconcile "$REG" 2>&1); rc=$?
-for n in anthropic.env openrouter.env telegram-olivia.env telegram-dave.env; do
+for n in anthropic.env openrouter.env telegram-seat_a.env telegram-seat_b.env; do
   [[ "$(_sp_file_group "$C/$n")" == claude-keys ]] && ok_t "T2 $n -> claude-keys" || bad_t "T2 $n group" "$(_sp_file_group "$C/$n")"
 done
 [[ "$(_sp_file_group "$FIVEDIVE_CONNECTORD_ENV")" == claude-keys ]] && ok_t "T2 connectord.env -> claude-keys" || bad_t "T2 connectord.env"
@@ -88,10 +88,10 @@ done
 [[ "$(_sp_file_group "$C/npm.env")" == claude-keys && -z "$(acl_of "$C/npm.env")" ]] \
   && ok_t "T2 a 600 root:claude key moves group and gains NO reader" || bad_t "T2 600 widened" "$(acl_of "$C/npm.env")"
 [[ "$(acl_of "$C/anthropic.env")" == "u:claude:r " ]] && ok_t "T2 anthropic.env: only u:claude:r" || bad_t "T2 anthropic ACL" "$(acl_of "$C/anthropic.env")"
-[[ "$(acl_of "$C/telegram-olivia.env")" == "u:agent-olivia:r u:claude:r " ]] && ok_t "T2 telegram-olivia.env: olivia reads her own token, nobody else added" || bad_t "T2 olivia ACL" "$(acl_of "$C/telegram-olivia.env")"
-[[ "$(acl_of "$C/telegram-dave.env")" == "u:agent-dave:r u:claude:r " ]] && ok_t "T2 telegram-dave.env: dave reads only his own" || bad_t "T2 dave ACL" "$(acl_of "$C/telegram-dave.env")"
+[[ "$(acl_of "$C/telegram-seat_a.env")" == "u:agent-seat_a:r u:claude:r " ]] && ok_t "T2 telegram-seat_a.env: seat_a reads its own token, nobody else added" || bad_t "T2 seat_a ACL" "$(acl_of "$C/telegram-seat_a.env")"
+[[ "$(acl_of "$C/telegram-seat_b.env")" == "u:agent-seat_b:r u:claude:r " ]] && ok_t "T2 telegram-seat_b.env: seat_b reads only its own" || bad_t "T2 seat_b ACL" "$(acl_of "$C/telegram-seat_b.env")"
 mem=$(sort "$OS/groups/claude-keys" | tr '\n' ' ')
-[[ "$mem" == "agent-olivia claude " ]] && ok_t "T2 members: claude + admin olivia; standard dave dropped; no account -> not added" || bad_t "T2 members" "$mem"
+[[ "$mem" == "agent-seat_a claude " ]] && ok_t "T2 members: claude + admin seat_a; standard seat_b dropped; no account -> not added" || bad_t "T2 members" "$mem"
 [[ $rc -eq 0 && "$out" == *"6 file(s) moved"*"2 member(s) added, 1 dropped"* ]] && ok_t "T2 summary names the counts" || bad_t "T2 summary" "rc=$rc $out"
 
 # --- T3: idempotent, and --quiet says nothing when nothing changed ------------
@@ -103,11 +103,11 @@ out=$(secrets_posture_reconcile --quiet "$REG" 2>&1)
   && ok_t "T3 a rewrite back to group claude is re-tightened on the next tick" || bad_t "T3 re-tighten" "$out"
 
 # --- T4: an unreadable registry removes nobody --------------------------------
-printf 'agent-dave\n' >> "$OS/groups/claude-keys"
+printf 'agent-seat_b\n' >> "$OS/groups/claude-keys"
 registry_read() { return 1; }
 secrets_posture_reconcile --quiet "" >/dev/null 2>&1
-grep -qxF agent-dave "$OS/groups/claude-keys" && ok_t "T4 registry unreadable -> no member removed" || bad_t "T4 removed on a blind read"
-_sp_member_del agent-dave claude-keys
+grep -qxF agent-seat_b "$OS/groups/claude-keys" && ok_t "T4 registry unreadable -> no member removed" || bad_t "T4 removed on a blind read"
+_sp_member_del agent-seat_b claude-keys
 
 # --- T5: per-seat sync and the connector writer ------------------------------
 secrets_member_sync agent-x admin; grep -qxF agent-x "$OS/groups/claude-keys" && ok_t "T5 sync admin -> member" || bad_t "T5 sync admin"
@@ -122,9 +122,9 @@ secret_file_secure "$C/tools.sh"
 
 # --- T6: the standard sudoers template ---------------------------------------
 source src/cmd_agent_create.sh
-sud=$(render_standard_sudoers agent-dave 0 0)
+sud=$(render_standard_sudoers agent-seat_b 0 0)
 for want in '/usr/local/bin/5dive partner hire \*' '/usr/local/bin/5dive hire-link \*' '/usr/local/lib/5dive/push-notify.sh \*'; do
-  grep -qE "^agent-dave ALL=\(root\) NOPASSWD: ${want}$" <<<"$sud" \
+  grep -qE "^agent-seat_b ALL=\(root\) NOPASSWD: ${want}$" <<<"$sud" \
     && ok_t "T6 grant: ${want//\\/}" || bad_t "T6 missing grant ${want//\\/}"
 done
 grep -v '^#' <<<"$sud" | grep -q 'telegram-app' && bad_t "T6 telegram-app granted" || ok_t "T6 telegram-app link is not granted"
@@ -158,12 +158,12 @@ seat_env() { env PATH="$TMP/bin:$PATH" SUDO_LOG="$SUDO_LOG" "$@"; }
 printf 'CONNECTORD_TOKEN=t\n' > "$TMP/locked.env"
 if can_lock; then
   chmod 000 "$TMP/locked.env"
-  : > "$SUDO_LOG"; seat_env "${AS_SEAT[@]}" bash "$HOOK" "done" "hi there" dave; rc=$?
-  [[ $rc -eq 0 && "$(tail -1 "$SUDO_LOG")" == "-n /usr/local/lib/5dive/push-notify.sh done hi there dave" ]] \
+  : > "$SUDO_LOG"; seat_env "${AS_SEAT[@]}" bash "$HOOK" "done" "hi there" seat_b; rc=$?
+  [[ $rc -eq 0 && "$(tail -1 "$SUDO_LOG")" == "-n /usr/local/lib/5dive/push-notify.sh done hi there seat_b" ]] \
     && ok_t "T7 push-notify: unreadable token -> re-runs as root with the same args" || bad_t "T7 push elevate" "rc=$rc $(cat "$SUDO_LOG")"
-  : > "$SUDO_LOG"; seat_env SUDO_L_RC=1 "${AS_SEAT[@]}" bash "$HOOK" "done" x dave; rc=$?
+  : > "$SUDO_LOG"; seat_env SUDO_L_RC=1 "${AS_SEAT[@]}" bash "$HOOK" "done" x seat_b; rc=$?
   [[ $rc -eq 0 && "$(wc -l < "$SUDO_LOG")" == 1 ]] && ok_t "T7 push-notify: no grant -> silent no-op, only sudo -l asked" || bad_t "T7 push no grant" "rc=$rc $(cat "$SUDO_LOG")"
-  rm -f "$TMP/locked.env"; : > "$SUDO_LOG"; seat_env "${AS_SEAT[@]}" bash "$HOOK" "done" x dave
+  rm -f "$TMP/locked.env"; : > "$SUDO_LOG"; seat_env "${AS_SEAT[@]}" bash "$HOOK" "done" x seat_b
   [[ ! -s "$SUDO_LOG" ]] && ok_t "T7 push-notify: no token file (OSS box) -> sudo never asked" || bad_t "T7 push OSS" "$(cat "$SUDO_LOG")"
   printf 'CONNECTORD_TOKEN=t\n' > "$TMP/locked.env"; chmod 000 "$TMP/locked.env"
   : > "$SUDO_LOG"
@@ -191,7 +191,7 @@ BLOCK=$(awk '
 ' 5dive-agent-start)
 [[ "$BLOCK" == *_creds_env_only* ]] && ok_t "T8 extracted the real claude credential block" || bad_t "T8 extract" "${BLOCK:0:200}"
 mkdir -p "$TMP/auth"; chmod 755 "$TMP/auth"
-{ printf 'TYPE=claude PROFILE="" NAME=dave\n'
+{ printf 'TYPE=claude PROFILE="" NAME=seat_b\n'
   printf 'cred_seed_ok() { echo SEED_OK; }; cred_seed_failed() { echo SEED_FAILED; }\n'
   printf 'start=$SECONDS\n'
   printf '%s\n' "${BLOCK//\/etc\/5dive\/connectors\/anthropic.env/$TMP/auth/anthropic.env}"
@@ -220,7 +220,7 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
   suf=$$; WS="sp-ws-$suf"; KG="sp-keys-$suf"; REAL_GROUPS="$WS $KG"
   groupadd "$WS"; wsgid=$(getent group "$WS" | cut -d: -f3)
   R="$TMP/real"; mkdir -p "$R/connectors"; chgrp "$WS" "$R" "$R/connectors"; chmod 750 "$R" "$R/connectors"; chmod 755 "$TMP"
-  for n in anthropic.env openrouter.env telegram-olivia.env tools.sh; do
+  for n in anthropic.env openrouter.env telegram-seat_a.env tools.sh; do
     printf 'SECRET=%s\n' "$n" > "$R/connectors/$n"; chgrp "$WS" "$R/connectors/$n"; chmod 640 "$R/connectors/$n"
   done
   printf 'CONNECTORD_TOKEN=t\n' > "$R/connectord.env"; chgrp "$WS" "$R/connectord.env"; chmod 640 "$R/connectord.env"
@@ -228,7 +228,7 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
     bash -c 'source src/header.sh; source src/lib/error_codes.sh; source src/lib/output.sh; source src/lib/validation.sh
              secrets_posture_reconcile "{\"agents\":{}}"' >/dev/null 2>&1
   seat() { setpriv --reuid=65534 --regid="$wsgid" --clear-groups bash -c "$1" 2>&1; }
-  for f in connectors/anthropic.env connectors/openrouter.env connectors/telegram-olivia.env connectord.env; do
+  for f in connectors/anthropic.env connectors/openrouter.env connectors/telegram-seat_a.env connectord.env; do
     out=$(seat "cat '$R/$f'")
     [[ "$out" == *"Permission denied"* ]] && ok_t "T9 a workspace-group seat outside $KG: cat $f refused" || bad_t "T9 $f readable" "$out"
   done
