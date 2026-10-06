@@ -1591,13 +1591,18 @@ write_agent_env() {
 # /etc/5dive/connectors/*.env files, same as before profiles existed.
 link_agent_profile() {
   local name="$1" profile="${2:-}"
-  local link="${ENV_DIR}/${name}-auth.env"
+  local link="${ENV_DIR}/${name}-auth.env" old=""
+  [[ -L "$link" ]] && old=$(readlink "$link")
   rm -f "$link"
+  # DIVE-5690: a login's readers are its bound seats, so the one this seat
+  # leaves stops being readable to it now, not on the next heartbeat tick.
+  [[ -z "$old" ]] || ! declare -F secret_file_secure >/dev/null || secret_file_secure "$old"
   [[ -n "$profile" ]] || return 0
   local target="${AUTH_PROFILES_DIR}/${profile}/combined.env"
   [[ -f "$target" ]] \
     || fail "$E_NOT_FOUND" "auth profile '$profile' not configured — run: sudo 5dive agent auth set <type> --api-key=... --auth-profile=$profile"
   ln -s "$target" "$link"
+  ! declare -F secret_file_secure >/dev/null || secret_file_secure "$target"
   # DIVE-1188: a NEW agent bound to an EXISTING profile (no re-login in between)
   # must still be able to seed codex/grok auth.json without sudo, so normalize
   # the profile's file creds to 0640 group=claude at bind time. Guarded because

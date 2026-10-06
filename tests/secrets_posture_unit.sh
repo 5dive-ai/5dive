@@ -17,6 +17,11 @@
 #     grants the exact command, and stay silent otherwise
 #   * 5dive-agent-start's claude block does not wait 45s on a login file the
 #     seat cannot read: it grades the environment systemd injected
+#   * an account login (auth-profiles/<p>/combined.env) moves to claude-keys
+#     and its seat readers are exactly the seats whose agents.d/<x>-auth.env
+#     links to it; moving a seat to another account moves its read on the next
+#     tick (or at once through link_agent_profile); the profile writer keeps
+#     that posture across its rename; agents.d/<x>.env (metadata) is untouched
 #   * AS ROOT ONLY: the same reconcile on real files and a real group, and a
 #     real non-member uid in the workspace group is refused every key and still
 #     reads tools.sh (the row's acceptance shape)
@@ -27,7 +32,7 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; [[ -n "${REAL_GROUPS:-}" ]] && for g in $REAL_GROUPS; do groupdel "$g" 2>/dev/null; done; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
+trap 'rc=$?; [[ -n "${REAL_USERS:-}" ]] && for u in $REAL_USERS; do userdel "$u" 2>/dev/null; done; [[ -n "${REAL_GROUPS:-}" ]] && for g in $REAL_GROUPS; do groupdel "$g" 2>/dev/null; done; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 TMP="$(mktemp -d /tmp/secrets-posture-unit.XXXXXX)"
 chmod 755 "$TMP"
@@ -53,9 +58,13 @@ _sp_user_exists()  { grep -qxF "$1" "$OS/users"; }
 _sp_file_group()   { awk -F'\t' -v f="$1" '$1==f {g=$2} END {print g}' "$OS/fgroup"; }
 _sp_chgrp()        { printf '%s\t%s\n' "$2" "$1" >> "$OS/fgroup"; }
 _sp_setfacl()      { printf '%s\t%s\n' "$2" "$1" >> "$OS/acl"; }
-acl_of() { awk -F'\t' -v f="$1" '$1==f {print $2}' "$OS/acl" | sort | tr '\n' ' '; }
+_sp_unsetfacl()    { awk -F'\t' -v f="$2" -v e="$1:" '!($1==f && index($2, e)==1)' "$OS/acl" > "$OS/acl.tmp"; mv "$OS/acl.tmp" "$OS/acl"; }
+_sp_acl_users()    { awk -F'\t' -v f="$1" '$1==f {sub(/^u:/,"",$2); sub(/:r$/,"",$2); print $2}' "$OS/acl" | sort -u; }
+acl_of() { awk -F'\t' -v f="$1" '$1==f {print $2}' "$OS/acl" | sort -u | tr '\n' ' '; }
 
 C="$TMP/connectors"; mkdir -p "$C"
+# Account logins live under $TMP too, so no arm ever globs the box's own.
+AUTH_PROFILES_DIR="$TMP/auth-profiles" ENV_DIR="$TMP/agents.d"; mkdir -p "$AUTH_PROFILES_DIR" "$ENV_DIR"
 export CONNECTORS_DIR="$C" FIVEDIVE_CONNECTORD_ENV="$TMP/connectord.env"
 printf 'claude\nagent-seat_a\nagent-seat_b\nagent-x\n' > "$OS/users"
 : > "$OS/acl"
@@ -215,6 +224,54 @@ rm -f "$TMP/auth/anthropic.env"
 out=$(run_block CLAUDE_CODE_OAUTH_TOKEN=from-systemd CLAUDE_AUTH_WAIT_SECS=2)
 [[ "$out" == *SEED_FAILED* && "$out" =~ took=[23] ]] && ok_t "T8 absent login in a readable dir -> still waits for it (first-boot race kept)" || bad_t "T8 absent waits" "$out"
 
+# --- T10: account logins -----------------------------------------------------
+P="$AUTH_PROFILES_DIR"
+for p in p1 p2; do
+  mkdir -p "$P/$p"; printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$p" > "$P/$p/combined.env"
+  chmod 640 "$P/$p/combined.env"; printf '%s\tclaude\n' "$P/$p/combined.env" >> "$OS/fgroup"
+done
+ln -s "$P/p1/combined.env" "$ENV_DIR/seat_a-auth.env"
+ln -s "$P/p1/combined.env" "$ENV_DIR/seat_b-auth.env"
+ln -s "$P/p2/combined.env" "$ENV_DIR/x-auth.env"
+ln -s "$P/p1/combined.env" "$ENV_DIR/gone-auth.env"        # a seat with no account
+printf 'AGENT_NAME=seat_a\n' > "$ENV_DIR/seat_a.env"; printf '%s\tclaude\n' "$ENV_DIR/seat_a.env" >> "$OS/fgroup"
+printf 'u:agent-old:r\n' | sed "s#^#$P/p1/combined.env\t#" >> "$OS/acl"   # left by a seat that moved off
+printf '%s\t%s\n' "$P/p1/combined.env" "u:4242:r" >> "$OS/acl"            # left by a deleted seat
+out=$(secrets_posture_reconcile --quiet "$REG" 2>&1); rc=$?
+for p in p1 p2; do
+  [[ "$(_sp_file_group "$P/$p/combined.env")" == claude-keys ]] && ok_t "T10 $p/combined.env -> claude-keys" || bad_t "T10 $p group" "$(_sp_file_group "$P/$p/combined.env")"
+done
+[[ "$(acl_of "$P/p1/combined.env")" == "u:agent-seat_a:r u:agent-seat_b:r u:claude:r " ]] \
+  && ok_t "T10 p1: only its two bound seats + claude; stale and deleted-seat readers dropped" || bad_t "T10 p1 ACL" "$(acl_of "$P/p1/combined.env")"
+[[ "$(acl_of "$P/p2/combined.env")" == "u:agent-x:r u:claude:r " ]] \
+  && ok_t "T10 p2: only seat x + claude" || bad_t "T10 p2 ACL" "$(acl_of "$P/p2/combined.env")"
+[[ "$(_sp_file_group "$ENV_DIR/seat_a.env")" == claude && -z "$(acl_of "$ENV_DIR/seat_a.env")" ]] \
+  && ok_t "T10 agents.d/<x>.env (metadata, no key) is left alone" || bad_t "T10 agents.d touched"
+[[ $rc -eq 0 && "$out" == *"2 file(s) moved"*"login reader(s) changed"* ]] && ok_t "T10 summary names the move" || bad_t "T10 summary" "rc=$rc $out"
+out=$(secrets_posture_reconcile --quiet "$REG" 2>&1)
+[[ -z "$out" ]] && ok_t "T10 second --quiet pass: nothing to say" || bad_t "T10 idempotent" "$out"
+ln -sfn "$P/p2/combined.env" "$ENV_DIR/seat_b-auth.env"      # seat_b moved to p2 by hand
+out=$(secrets_posture_reconcile --quiet "$REG" 2>&1)
+[[ "$(acl_of "$P/p1/combined.env")" == "u:agent-seat_a:r u:claude:r " && "$(acl_of "$P/p2/combined.env")" == "u:agent-seat_b:r u:agent-x:r u:claude:r " \
+   && "$out" == *"2 login reader(s) changed"* ]] \
+  && ok_t "T10 a seat moved to another account: its read follows on the next tick" || bad_t "T10 rebind tick" "$out | p1=$(acl_of "$P/p1/combined.env") p2=$(acl_of "$P/p2/combined.env")"
+link_agent_profile seat_b p1
+[[ "$(acl_of "$P/p1/combined.env")" == "u:agent-seat_a:r u:agent-seat_b:r u:claude:r " && "$(acl_of "$P/p2/combined.env")" == "u:agent-x:r u:claude:r " ]] \
+  && ok_t "T10 link_agent_profile moves the read at once (old login dropped, new granted)" || bad_t "T10 link" "p1=$(acl_of "$P/p1/combined.env") p2=$(acl_of "$P/p2/combined.env")"
+# The profile writer: a fresh account and a rewrite (the rename drops ACLs).
+source src/cmd_auth.sh
+chown() { :; }; require_root() { :; }
+ln -s "$P/p3/combined.env" "$ENV_DIR/x-auth.env.new"; mv -T "$ENV_DIR/x-auth.env.new" "$ENV_DIR/x-auth.env"
+printf 'k1' | profile_set_var p3 ANTHROPIC_API_KEY
+[[ "$(_sp_file_group "$P/p3/combined.env")" == claude-keys && "$(stat -c %a "$P/p3/combined.env")" == 640 \
+   && "$(acl_of "$P/p3/combined.env")" == "u:agent-x:r u:claude:r " ]] \
+  && ok_t "T10 profile_set_var: a new login is 640 claude-keys, read by claude + its bound seat only" || bad_t "T10 writer" "$(_sp_file_group "$P/p3/combined.env") $(stat -c %a "$P/p3/combined.env") $(acl_of "$P/p3/combined.env")"
+grep -v "^$P/p3/combined.env"$'\t' "$OS/acl" > "$OS/acl.tmp"; mv "$OS/acl.tmp" "$OS/acl"   # a rename forgets the ACL
+printf 'k2' | profile_set_var p3 ANTHROPIC_API_KEY
+[[ "$(acl_of "$P/p3/combined.env")" == "u:agent-x:r u:claude:r " && "$(grep -c '^ANTHROPIC_API_KEY=k2$' "$P/p3/combined.env")" == 1 ]] \
+  && ok_t "T10 profile_set_var rewrite: readers restored after the rename" || bad_t "T10 rewrite" "$(acl_of "$P/p3/combined.env")"
+unset -f chown require_root
+
 # --- T9: AS ROOT, real files, a real group, a real non-member uid -------------
 if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev/null; then
   suf=$$; WS="sp-ws-$suf"; KG="sp-keys-$suf"; REAL_GROUPS="$WS $KG"
@@ -224,7 +281,14 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
     printf 'SECRET=%s\n' "$n" > "$R/connectors/$n"; chgrp "$WS" "$R/connectors/$n"; chmod 640 "$R/connectors/$n"
   done
   printf 'CONNECTORD_TOKEN=t\n' > "$R/connectord.env"; chgrp "$WS" "$R/connectord.env"; chmod 640 "$R/connectord.env"
-  AGENT_SHARED_GROUP="$WS" FIVEDIVE_SECRETS_GROUP="$KG" CONNECTORS_DIR="$R/connectors" FIVEDIVE_CONNECTORD_ENV="$R/connectord.env" \
+  # An account login bound to one real seat account; the 65534 seat is not bound.
+  BOUND="agent-sp$suf"; REAL_USERS="$BOUND"
+  useradd -r -M -N -g "$WS" -s /usr/sbin/nologin "$BOUND" 2>/dev/null
+  S="$R/state"; mkdir -p "$S/auth-profiles/acct" "$S/agents.d"
+  chgrp "$WS" "$S" "$S/auth-profiles" "$S/auth-profiles/acct" "$S/agents.d"; chmod 2750 "$S" "$S/auth-profiles" "$S/auth-profiles/acct" "$S/agents.d"
+  printf 'CLAUDE_CODE_OAUTH_TOKEN=login\n' > "$S/auth-profiles/acct/combined.env"; chgrp "$WS" "$S/auth-profiles/acct/combined.env"; chmod 640 "$S/auth-profiles/acct/combined.env"
+  ln -s "$S/auth-profiles/acct/combined.env" "$S/agents.d/${BOUND#agent-}-auth.env"
+  STATE_DIR="$S" AGENT_SHARED_GROUP="$WS" FIVEDIVE_SECRETS_GROUP="$KG" CONNECTORS_DIR="$R/connectors" FIVEDIVE_CONNECTORD_ENV="$R/connectord.env" \
     bash -c 'source src/header.sh; source src/lib/error_codes.sh; source src/lib/output.sh; source src/lib/validation.sh
              secrets_posture_reconcile "{\"agents\":{}}"' >/dev/null 2>&1
   seat() { setpriv --reuid=65534 --regid="$wsgid" --clear-groups bash -c "$1" 2>&1; }
@@ -236,6 +300,14 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
   [[ "$out" == "SECRET=tools.sh" ]] && ok_t "T9 the same seat still reads tools.sh" || bad_t "T9 tools.sh" "$out"
   out=$(setpriv --reuid=65534 --regid="$wsgid" --groups="$(getent group "$KG" | cut -d: -f3)" bash -c "cat '$R/connectord.env'" 2>/dev/null)
   [[ "$out" == "CONNECTORD_TOKEN=t" ]] && ok_t "T9 a $KG member (admin seat) still reads the box identity" || bad_t "T9 member read" "$out"
+  out=$(seat "cat '$S/auth-profiles/acct/combined.env'")
+  [[ "$out" == *"Permission denied"* ]] && ok_t "T9 an unbound workspace-group seat: cat of an account login refused" || bad_t "T9 login readable" "$out"
+  if id -u "$BOUND" >/dev/null 2>&1 && command -v setfacl >/dev/null; then
+    out=$(setpriv --reuid="$(id -u "$BOUND")" --regid="$wsgid" --clear-groups bash -c "cat '$S/agents.d/${BOUND#agent-}-auth.env'" 2>&1)
+    [[ "$out" == "CLAUDE_CODE_OAUTH_TOKEN=login" ]] && ok_t "T9 the seat bound to that login still reads it through its -auth.env link" || bad_t "T9 bound seat refused" "$out"
+  else
+    bad_t "T9 bound-seat arm could not run (useradd or setfacl missing)"
+  fi
   out=$(seat "sudo -n test -f /etc/passwd && echo ROOT")
   [[ "$out" != *ROOT* ]] && ok_t "T9 positive control: the seat uid has no root" || bad_t "T9 seat has root"
 else

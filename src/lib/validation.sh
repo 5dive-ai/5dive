@@ -502,6 +502,12 @@ _secret_project_file() {
 #            u:agent-<x>:r on telegram-<x>.env and discord-<x>.env, so a seat
 #            still reads its OWN channel token (the unit hands it that value
 #            anyway, through EnvironmentFile).
+# profiles every account login, auth-profiles/<p>/combined.env, under the same
+#            posture. Its seat readers are exactly the seats whose
+#            agents.d/<x>-auth.env links to it (systemd reads it as root either
+#            way), and the reconcile re-derives them every tick, so a seat moved
+#            to another account loses the read of the old one. agents.d/<x>.env
+#            carries only AGENT_* metadata and stays group claude.
 # tools.sh stays root:claude 640. It is every seat's BASH_ENV by design
 # (DIVE-5366), and a key an agent asks its owner for lands there (DIVE-5370).
 #
@@ -520,6 +526,8 @@ SECRETS_GROUP="${FIVEDIVE_SECRETS_GROUP:-claude-keys}"
 _sp_shared_group()   { printf '%s' "${AGENT_SHARED_GROUP:-claude}"; }
 _sp_connectord_env() { printf '%s' "${FIVEDIVE_CONNECTORD_ENV:-/etc/5dive/connectord.env}"; }
 _sp_connectors_dir() { printf '%s' "${CONNECTORS_DIR:-${FIVEDIVE_CONNECTOR_DIR:-/etc/5dive/connectors}}"; }
+_sp_profiles_dir()   { printf '%s' "${AUTH_PROFILES_DIR:-/var/lib/5dive/auth-profiles}"; }
+_sp_env_dir()        { printf '%s' "${ENV_DIR:-/var/lib/5dive/agents.d}"; }
 
 # OS seams. The harness redefines these; nothing on a box does.
 _sp_group_exists() { getent group "$1" >/dev/null 2>&1; }
@@ -533,8 +541,53 @@ _sp_mode()         { stat -c %a "$1" 2>/dev/null; }
 _sp_chgrp()        { chgrp "$1" "$2"; }
 _sp_chmod()        { chmod "$1" "$2"; }
 _sp_setfacl()      { command -v setfacl >/dev/null 2>&1 && setfacl -m "$1" "$2" 2>/dev/null; }
+_sp_unsetfacl()    { command -v setfacl >/dev/null 2>&1 && setfacl -x "$1" "$2" 2>/dev/null; }
+# The named users on a file's ACL, one per line (not the owner entry).
+_sp_acl_users()    { command -v getfacl >/dev/null 2>&1 && getfacl -cp "$1" 2>/dev/null | sed -n 's/^user:\([^:][^:]*\):.*/\1/p'; }
 
 _sp_is_member() { _sp_members "$2" | grep -qxF "$1"; }
+_sp_group_readable() { [[ "$1" =~ ^[0-7]+$ ]] && (( (8#$1 & 8#040) )); }
+
+# An account login: <profiles dir>/<p>/combined.env, one level deep.
+_sp_is_profile_env() {
+  local d; d=$(_sp_profiles_dir)
+  [[ "$1" == "$d"/*/combined.env && "${1#"$d"/}" != */*/* ]]
+}
+
+# _sp_profile_seats <combined.env> — the seats bound to this login: each
+# agents.d/<x>-auth.env that is a symlink to it. Prints <x>, one per line.
+_sp_profile_seats() {
+  local f="$1" l t
+  for l in "$(_sp_env_dir)"/*-auth.env; do
+    [[ -L "$l" ]] || continue
+    t=$(readlink "$l") || continue
+    [[ "$t" == "$f" ]] || [[ "$(readlink -f "$l")" == "$(readlink -f "$f")" ]] || continue
+    l="${l##*/}"
+    printf '%s\n' "${l%-auth.env}"
+  done
+}
+
+# _sp_profile_readers_sync <combined.env> — the seat readers of one login are
+# exactly its bound seats: add the missing, drop any agent-* that is no longer
+# bound. `claude` is secret_file_secure's to keep. Counts changes in SP_ACL.
+_sp_profile_readers_sync() {
+  local f="$1" want have u
+  want=$(_sp_profile_seats "$f" | sed 's/^/agent-/')
+  have=$(_sp_acl_users "$f")
+  while IFS= read -r u; do
+    [[ -n "$u" ]] && _sp_user_exists "$u" || continue
+    grep -qxF "$u" <<<"$have" && continue
+    _sp_setfacl "u:${u}:r" "$f" && SP_ACL=$(( ${SP_ACL:-0} + 1 ))
+  done <<<"$want"
+  while IFS= read -r u; do
+    # A bare uid is a deleted seat's entry: a new account given that uid
+    # would inherit the read, so it goes too.
+    [[ "$u" == agent-* || "$u" =~ ^[0-9]+$ ]] || continue
+    grep -qxF "$u" <<<"$want" && continue
+    _sp_unsetfacl "u:${u}" "$f" && SP_ACL=$(( ${SP_ACL:-0} + 1 ))
+  done <<<"$have"
+  return 0
+}
 
 # The group a secret is written with: SECRETS_GROUP, created on first use. A box
 # where it cannot be created keeps the old group, so nobody who reads a key
@@ -549,7 +602,8 @@ secrets_group() {
 
 # secret_file_secure <path> — the posture for one secret file: root:SECRETS_GROUP,
 # no world bits, readable by `claude`, and by agent-<x> when it is x's own
-# channel token. Symlinks are never followed (chgrp would act on the target).
+# channel token, or by the seats bound to it when it is an account login
+# (combined.env). Symlinks are never followed (chgrp would act on the target).
 # tools.sh is refused here so no caller can lock every seat out of BASH_ENV.
 secret_file_secure() {
   local f="$1" g base u mode
@@ -563,8 +617,12 @@ secret_file_secure() {
   [[ "$g" != "$(_sp_shared_group)" ]] || return 0
   # The ACLs only keep a read that group claude HAD. A 600 root:claude file
   # (a key nobody but root reads) must not gain a reader by being moved.
-  [[ "$mode" =~ ^[0-7]*$ ]] && (( (8#$mode & 8#040) )) || return 0
+  _sp_group_readable "$mode" || return 0
   _sp_user_exists claude && _sp_setfacl u:claude:r "$f"
+  if _sp_is_profile_env "$f"; then
+    _sp_profile_readers_sync "$f"
+    return 0
+  fi
   if [[ "$base" =~ ^(telegram|discord)-([a-z0-9][a-z0-9_-]*)\.env$ ]]; then
     u="agent-${BASH_REMATCH[2]}"
     _sp_user_exists "$u" && _sp_setfacl "u:${u}:r" "$f"
@@ -596,7 +654,7 @@ secrets_posture_reconcile() {
   local quiet=0 reg="" g d f name iso
   [[ "${1:-}" == --quiet ]] && { quiet=1; shift; }
   reg="${1:-}"
-  SP_MOVED=0 SP_ADDED=0 SP_DROPPED=0
+  SP_MOVED=0 SP_ADDED=0 SP_DROPPED=0 SP_ACL=0
   g=$(secrets_group)
   if [[ "$g" == "$(_sp_shared_group)" ]]; then
     warn "could not create group ${SECRETS_GROUP}; every seat in group $(_sp_shared_group) can still read this box's keys (DIVE-5690)"
@@ -633,10 +691,20 @@ secrets_posture_reconcile() {
     [[ "$(_sp_file_group "$f")" == "$(_sp_shared_group)" ]] || continue
     secret_file_secure "$f" && SP_MOVED=$((SP_MOVED + 1))
   done
+  # Account logins. A moved one is re-read every tick: binding a seat to an
+  # account, or moving it off one, changes who may read it without touching
+  # the file.
+  for f in "$(_sp_profiles_dir)"/*/combined.env; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    case "$(_sp_file_group "$f")" in
+      "$(_sp_shared_group)") secret_file_secure "$f" && SP_MOVED=$((SP_MOVED + 1)) ;;
+      "$g") _sp_group_readable "$(_sp_mode "$f")" && _sp_profile_readers_sync "$f" ;;
+    esac
+  done
 
-  if (( ! quiet )) || (( SP_MOVED + SP_ADDED + SP_DROPPED > 0 )); then
-    printf 'secrets posture (DIVE-5690): %d file(s) moved to group %s, %d member(s) added, %d dropped\n' \
-      "$SP_MOVED" "$g" "$SP_ADDED" "$SP_DROPPED"
+  if (( ! quiet )) || (( SP_MOVED + SP_ADDED + SP_DROPPED + SP_ACL > 0 )); then
+    printf 'secrets posture (DIVE-5690): %d file(s) moved to group %s, %d member(s) added, %d dropped, %d login reader(s) changed\n' \
+      "$SP_MOVED" "$g" "$SP_ADDED" "$SP_DROPPED" "$SP_ACL"
   fi
   return 0
 }

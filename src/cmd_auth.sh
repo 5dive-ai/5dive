@@ -816,7 +816,8 @@ LOCALBIN
 #   - combined.env      — key=value pairs merged into the agent's systemd env
 #                         (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY,
 #                         etc.). systemd EnvironmentFile reads it as root before
-#                         drop-priv, so mode 0600 root:root is fine.
+#                         drop-priv; 640 root:claude-keys plus a read for each
+#                         bound seat (DIVE-5690, secret_file_secure).
 #   - <type>/           — optional per-type CLI config dir (e.g. claude/ used as
 #                         CLAUDE_CONFIG_DIR) for profiles created via `auth login
 #                         --profile=<name>` or the device-code flow.
@@ -834,13 +835,12 @@ ensure_profile_dir() {
   chmod 2750 "${AUTH_PROFILES_DIR}" "$dir"
   local env_file="${dir}/combined.env"
   [[ -f "$env_file" ]] || : > "$env_file"
-  # 0640 root:claude so agent users (all in group `claude`) can read the
-  # file directly when systemd loads it via EnvironmentFile, AND so the live
-  # auth probe (running as user `claude`) can source it to validate creds.
-  # Same exposure as /etc/5dive/connectors/anthropic.env — if one profile's
-  # token leaks to another agent user, they already shared the box.
-  chown root:claude "$env_file"
+  # DIVE-5690: an account login is a key. Group claude-keys, readable by
+  # `claude` (the live auth probe sources it) and by the seats bound to it
+  # through agents.d/<x>-auth.env, never by every seat in group claude.
+  # systemd reads it as root for EnvironmentFile either way.
   chmod 640 "$env_file"
+  secret_file_secure "$env_file"
   echo "$dir"
 }
 
@@ -1414,9 +1414,10 @@ profile_set_var() {
   tmp=$(mktemp "${file}.XXXXXX")
   grep -v "^${var}=" "$file" 2>/dev/null > "$tmp" || true
   printf '%s=%s\n' "$var" "$value" >> "$tmp"
-  chown root:claude "$tmp"
+  chown "root:$(secrets_group)" "$tmp"
   chmod 640 "$tmp"
   mv "$tmp" "$file"
+  secret_file_secure "$file"   # DIVE-5690: the rename dropped the readers
 }
 
 # write_default_connector <filename.env> <VAR> <VALUE> — replaces any prior
