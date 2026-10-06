@@ -23,7 +23,8 @@
 #     tick (or at once through link_agent_profile); the profile writer keeps
 #     that posture across its rename; agents.d/<x>.env (metadata) is untouched
 #   * a host with no claude group still writes a key (no chgrp, rc 0, o-rwx)
-#   * AS ROOT ONLY: the same reconcile on real files and a real group, and a
+#   * AS ROOT ONLY (CI: the root-arms job, SP_REQUIRE_ROOT_ARM=1 makes a skip
+#     a failure): the same reconcile on real files and a real group, and a
 #     real non-member uid in the workspace group is refused every key and still
 #     reads tools.sh (the row's acceptance shape)
 # The posture lives in src/lib/validation.sh beside _write_connector, so no
@@ -328,8 +329,10 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
   fi
   out=$(seat "sudo -n test -f /etc/passwd && echo ROOT")
   [[ "$out" != *ROOT* ]] && ok_t "T9 positive control: the seat uid has no root" || bad_t "T9 seat has root"
+elif [[ "${SP_REQUIRE_ROOT_ARM:-}" == 1 ]]; then
+  bad_t "T9 required (SP_REQUIRE_ROOT_ARM=1) but could not run" "EUID=$EUID groupadd=$(command -v groupadd) setpriv=$(command -v setpriv)"
 else
-  printf 'skip - T9 real-uid arm needs root, groupadd and setpriv (CI runs it)\n'
+  printf 'skip - T9 real-uid arm needs root, groupadd and setpriv (unit-tests.yml root-arms runs it as root)\n'
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

@@ -584,6 +584,32 @@ jobs:
   # rail prover, which is ~10s and grades the shipped rails rather than the corpus.
   # The PR-shaped case the probe existed to catch (a harness added or edited in
   # THIS diff whose exit status is not wired) is caught by `changed-harnesses`.
+  # DIVE-5690: harness arms that only mean anything AS ROOT. secrets_posture_unit's
+  # T9 creates real groups and a real seat account, runs the reconcile on real
+  # files, then drops to a real non-member uid and is refused each key. Every other
+  # job runs harnesses unprivileged, where T9 prints a skip, so before this job no
+  # CI run had ever executed it. SP_REQUIRE_ROOT_ARM=1 turns that skip into a
+  # failure here, and the two greps below hold it from outside the harness too.
+  # The runner is disposable, so groupadd and useradd are safe here, and never on
+  # a shared box.
+  root-arms:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # DIVE-2229: full history, like every checkout here (baseline_pin_unit holds it).
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Build the bundle (harness precondition, not an accident of ordering)
+        run: ./build.sh
+      - name: secrets_posture_unit as root, T9 required (DIVE-5690)
+        run: |
+          command -v setfacl >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq acl; }
+          sudo -E env SP_REQUIRE_ROOT_ARM=1 bash tests/secrets_posture_unit.sh | tee root-arms.txt
+          if grep -q '^skip - T9' root-arms.txt; then echo "T9 was skipped under root"; exit 1; fi
+          n=$(grep -c '^ok   - T9' root-arms.txt) || n=0
+          echo "T9 ok lines: $n"
+          test "$n" -ge 9
+
   rails-pristine:
     runs-on: ubuntu-latest
     steps:
