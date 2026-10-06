@@ -1764,7 +1764,7 @@ _task_role_skew_note() {
 # distinct from `cron` makes each external delivery's provenance queryable.
 _TASK_PRINCIPAL_SENTINELS="cli council telegram dashboard lodar editor proof cron trigger"
 
-_TASK_ROSTER=""; _TASK_ROSTER_STATE=""
+_TASK_ROSTER=""; _TASK_ROSTER_STATE=""; _TASK_ROSTER_REG=""
 
 # _task_roster — SETS `_TASK_ROSTER` (newline-separated lane names) and
 # `_TASK_ROSTER_STATE` (`ok` or `unestablished:<why>`). Read the variables.
@@ -1815,6 +1815,9 @@ _task_roster() {
     # `|| true` on the grep: an all-blank union exits 1, and this file is cat into
     # a bundle that runs under `set -euo pipefail`.
     _TASK_ROSTER=$(printf '%s\n%s\n' "$reg" "$org" | grep -v '^[[:space:]]*$' | sort -u || true)
+    # DIVE-5664: the registry half alone, for the one check the chart must not
+    # widen (_task_require_grader_seat).
+    _TASK_ROSTER_REG="$reg"
     # `ok` requires the AUTHORITY to have answered with at least one agent. The
     # org chart widens the roster but cannot establish it.
     if [[ -n "$reg" ]]; then _TASK_ROSTER_STATE="ok"
@@ -1928,6 +1931,23 @@ _task_require_lane() {
   fi
   hint=$(_task_roster_nearmiss "$name")
   fail "$E_VALIDATION" "${flag}='${name}' is not a registered agent$([[ -n "$hint" ]] && printf -- " — did you mean '%s'?" "$hint") (nothing wakes an unregistered lane, so this row would never be dispatched; see: 5dive agent list)"
+}
+
+# _task_require_grader_seat <name> <flag> — _task_require_lane, minus the org
+# chart's widening. DIVE-5664 (exact-swallow, 2026-10-06): `--verifier=codex-iris`
+# was accepted because the chart named it, though no such agent existed; the row
+# was pinned review_mode=seat:codex-iris, the grader pool skips a pinned non-pool
+# seat by design, and the only way out was raw sqlite. An assignee on a lagging
+# registry is still picked up once the agent lands; a grader that is not an agent
+# is never spawned, so here the registry is the only authority. An unreadable
+# registry still refuses nothing (the _task_require_lane rule).
+_task_require_grader_seat() {
+  local name="$1" flag="$2"
+  [[ -n "$name" ]] || return 0
+  _task_require_lane "$name" "$flag"
+  [[ "$_TASK_ROSTER_STATE" == "ok" ]] || return 0
+  grep -Fxq -- "$name" <<<"$_TASK_ROSTER_REG" && return 0
+  fail "$E_VALIDATION" "${flag}='${name}' is on the org chart but is not a registered agent, so nothing can grade as it (the row would wait for that review forever). Name an agent from: 5dive agent list"
 }
 
 # _task_require_principal <name> <flag> — for created_by/--from. Lane OR sentinel.

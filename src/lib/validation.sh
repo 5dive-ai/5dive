@@ -449,3 +449,28 @@ caddy_validate_why() {
   (( ${#why} <= 300 )) || why="…${why: -300}"
   printf '%s' "$why"
 }
+
+# DIVE-5664: `--connector=project-<app>` puts one variable into an app's own env
+# file, so an agent never receives a key under a made-up tools name and copies it
+# into the app by hand (the exact-swallow maps key, 2026-10-06). Any KEY name is
+# fine: only that app reads the file, unlike tools.sh, which every seat sources.
+# Hardcoded like CONNECTORS_DIR: a caller must not move where a secret lands.
+SECRET_PROJECTS_DIR="/home/claude/projects"
+
+# _secret_project_file <connector> — print the env file a project-<app> connector
+# writes, or print why not and return 1. Read-only, so `task need` can refuse a
+# link whose answer would have nowhere to land. <app> is the connector's own
+# charset (no dots or slashes), so it cannot climb out of the projects folder.
+# .env.local when it exists (Next.js, Vite), else .env, which every loader reads.
+_secret_project_file() {
+  local app="${1#project-}" d
+  d="${SECRET_PROJECTS_DIR}/${app}"
+  if [[ -z "$app" || ! -d "$d" || -L "$d" ]]; then
+    printf 'no project folder %s (a real folder, not a link)' "$d"; return 1
+  fi
+  if [[ "$(stat -c %u "$d" 2>/dev/null)" == 0 ]]; then
+    printf '%s is owned by root; a project secret is written as the folder owner' "$d"; return 1
+  fi
+  if [[ -e "$d/.env.local" || -L "$d/.env.local" ]]; then printf '%s/.env.local' "$d"
+  else printf '%s/.env' "$d"; fi
+}

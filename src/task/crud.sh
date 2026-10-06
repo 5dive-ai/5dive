@@ -373,7 +373,7 @@ cmd_task_add() {
   # `task orphans` is what surfaces that case. See _task_require_lane (routing.sh)
   # for why `cli` is refused here and accepted two lines down.
   _task_require_lane "$assignee" "--assignee"
-  _task_require_lane "$verifier" "--verifier"
+  _task_require_grader_seat "$verifier" "--verifier"
   _task_require_principal "$from" "--from"
   # fresh: per-task clean-session pref (DIVE-138). Recurring templates default to
   # fresh=1 (clean each run — Mark's decision for the community/marketing jobs)
@@ -1830,7 +1830,7 @@ cmd_task_verifier() {
   # DIVE-3344: a verifier is a DISPATCH TARGET too — delivering writes
   # assignee=<verifier> — so a typo'd grader orphans the row at handoff, one step
   # further from anyone noticing than a typo'd assignee does.
-  _task_require_lane "$who" "<agent>"
+  _task_require_grader_seat "$who" "<agent>"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local st kind title asignee cur_accept cur_vfier maker delivered
   st=$(db "SELECT status FROM tasks WHERE id=${id};")
@@ -1894,7 +1894,11 @@ cmd_task_verifier() {
         -- retrofit stored a verifier that a 'verify=never' box then declined to
         -- route to — an attach that appears to work and grades nothing, which is
         -- the worst of the three possible outcomes.
-        verify_forced=1${move_sql}
+        verify_forced=1,
+        -- DIVE-5664: a row pinned to a standing reviewer (review_mode=seat:<x>)
+        -- follows the re-point. Left alone, the grader pool kept skipping the row
+        -- for the OLD seat, and no verb could move it.
+        review_mode=CASE WHEN review_mode LIKE 'seat:%' THEN $(sqlq "seat:${who}") ELSE review_mode END${move_sql}
       WHERE id=${id};"
   # DIVE-2812 — RECORD THE EDIT TO THE BAR THE ROW IS GRADED AGAINST.
   #
