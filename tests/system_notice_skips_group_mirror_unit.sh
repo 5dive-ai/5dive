@@ -16,7 +16,11 @@
 #      customer's group;
 #   T5 the shipped rebalance path: build.sh bundles cmd_heartbeat.sh, so rebalance.sh
 #      reaches the owner through _hb_escalate, not its own marked fallback. The REAL
-#      _hb_escalate, called as rebalance.sh calls it, must mirror nothing.
+#      _hb_escalate, called as rebalance.sh calls it, must mirror nothing;
+#   T6 the scoped path: a standard-isolation seat's cmd_send execs `sudo -n 5dive
+#      agent _deliver`, and sudo scrubs the environment. A fake sudo on PATH drops
+#      the env the way env_reset does and runs the real cmd_deliver; the marker must
+#      survive as --system-notice (mirrors none), and a plain send still mirrors buzz.
 # Boundaries only are stubbed (tmux, sudo, the idle probe, the two mirrors as
 # RECORDERS); cmd_send's mirror decision stays real.
 set -euo pipefail
@@ -140,6 +144,64 @@ reset_arm
 _hb_escalate "rebalance" "task-engine" "rebalance" "🔀 Rebalanced un-started rows" "seat_b"
 is "T5: the escalation reaches the lead's pane" "yes"  "$(typed_has 'Rebalanced un-started rows')"
 is "T5: the escalation mirrors to NO room"      "none" "$(mirrors)"
+
+# --- T6: the scoped path — the marker survives sudo's scrubbed environment -----
+# cmd_send EXECs sudo, so the in-process sudo() stub above cannot stand in for it:
+# a fake sudo on PATH plays sudo's part. It drops both rail markers (env_reset), then
+# re-sources the runtime plus this harness's stubs and runs the REAL cmd_deliver
+# with the argv cmd_send built. cmd_deliver's buzz mirror decision stays real.
+ARGVLOG="${TMPROOT}/argv.log"
+export TMPROOT TYPED MIRRORED ARGVLOG STATE_DIR A2A_URGENT_LEDGER FIVEDIVE_CONNECTOR_DIR
+mkdir -p "${TMPROOT}/bin"
+declare -f tmux agent_wake_for_send agent_prompt_detectable wait_agent_input_ready \
+  _agent_delivery_inbox _agent_pane_safe_to_type _hb_claude_pid _hb_verify_submit \
+  _hb_submit_settled _hb_composer_scrub _wedge_clear require_agent \
+  mirror_interagent_outbound _buzz_mirror_outbound _agent_send_row_hint \
+  _agent_body_shell_hint a2a_round_guard envelope_tier envelope_via \
+  envelope_provenance _envelope_caller gen_msg_id _agent_refuse_peer_forgery \
+  audit_log _hb_agent_idle _a2a_queue_dir >"${TMPROOT}/stubs.sh"
+cat >"${TMPROOT}/bin/sudo" <<SUDO
+#!/usr/bin/env bash
+# fake sudo: -n /usr/local/bin/5dive agent _deliver <args...>
+[[ "\$1" == "-n" ]] && shift
+[[ "\$1" == /usr/local/bin/5dive && "\$2" == agent && "\$3" == _deliver ]] || { echo "fake sudo: unexpected argv \$*" >&2; exit 97; }
+shift 3
+printf 'ARGV %s\n' "\$*" >>"\$ARGVLOG"
+exec env -u _5DIVE_SYSTEM_NOTICE -u _5DIVE_A2A_NOTIFY bash -c '
+  cd "$(pwd)"
+  source src/header.sh; source src/lib/error_codes.sh; source src/lib/output.sh
+  source src/lib/validation.sh; source src/cmd_agent_runtime.sh
+  source "\$TMPROOT/stubs.sh"
+  require_root() { :; }
+  a2a_needs_scoped() { return 1; }
+  sudo() { local -a a=("\$@"); [[ "\${a[0]:-}" == "-n" ]] && a=("\${a[@]:1}"); [[ "\${a[0]:-}" == "-u" ]] && a=("\${a[@]:2}"); "\${a[@]}"; }
+  cmd_deliver "\$@"' fake-sudo "\$@"
+SUDO
+chmod +x "${TMPROOT}/bin/sudo"
+# seat-b, not seat_b: cmd_deliver validates the target ([a-z0-9-]) and refuses an
+# underscore BEFORE the pane — an arm on seat_b would read mirrors=none vacuously.
+argv_has() { grep -qF -- "$1" "$ARGVLOG" && echo yes || echo no; }
+
+reset_arm; : >"$ARGVLOG"
+( unset -f sudo; a2a_needs_scoped() { return 0; }; PATH="${TMPROOT}/bin:$PATH"
+  _5DIVE_SYSTEM_NOTICE=1 cmd_send seat-b --message="$PING" ) >/dev/null 2>&1 || true
+is "T6: the scoped re-exec carries --system-notice" "yes"  "$(argv_has ' --system-notice seat-b')"
+is "T6: the scoped system notice reaches the pane"  "yes"  "$(typed_has 'secret gate provided')"
+is "T6: the scoped system notice mirrors to NO room" "none" "$(mirrors)"
+
+reset_arm; : >"$ARGVLOG"
+( unset -f sudo; a2a_needs_scoped() { return 0; }; PATH="${TMPROOT}/bin:$PATH"
+  cmd_send seat-b --message="scoped hello" ) >/dev/null 2>&1 || true
+is "T6: a plain scoped send goes through the fake sudo" "yes"  "$(argv_has ' seat-b scoped hello')"
+is "T6: a plain scoped send reaches the pane"           "yes"  "$(typed_has 'scoped hello')"
+is "T6: a plain scoped send still mirrors buzz"          "buzz seat-b" "$(mirrors)"
+
+reset_arm; : >"$ARGVLOG"
+( unset -f sudo; a2a_needs_scoped() { return 0; }; PATH="${TMPROOT}/bin:$PATH"
+  _5DIVE_SYSTEM_NOTICE=1 _5DIVE_A2A_NOTIFY=1 cmd_send seat-b --message="lead handoff" ) >/dev/null 2>&1 || true
+is "T6: a scoped notify+system send carries both flags" "yes"  "$(argv_has ' --system-notice --notify seat-b')"
+is "T6: a scoped notify+system send reaches the pane"  "yes"  "$(typed_has 'lead handoff')"
+is "T6: a scoped notify+system send mirrors to NO room" "none" "$(mirrors)"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

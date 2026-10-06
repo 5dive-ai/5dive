@@ -2241,6 +2241,11 @@ cmd_deliver() {
       # no more — any holder of the _deliver grant can pass it, and it buys a
       # budgeted queue bypass, not a privilege.
       --urgent) urgent=1 ;;
+      # DIVE-5689: set by cmd_send when a system-notice rail (task/heartbeat) re-execs
+      # into here. Same reason as --notify: sudo scrubs _5DIVE_SYSTEM_NOTICE. As
+      # forgeable as --notify and no more — it only hides the caller's own send from
+      # its own buzz room.
+      --system-notice) _5DIVE_SYSTEM_NOTICE=1 ;;
       --)     shift; _pos+=("$@"); break ;;
       *)      _pos+=("$1") ;;
     esac
@@ -2389,7 +2394,9 @@ cmd_deliver() {
   # Placed before the receipt and unconditional on `_delivered` in the same way
   # cmd_send's is: the mirror describes what was SENT, and it returns 0 on every
   # path, so it can never change this primitive's rc.
-  _buzz_mirror_outbound "$target" "$message"
+  # DIVE-5689: a system notice (--system-notice, carried from cmd_send) is not
+  # something the invoking seat said, so it is not mirrored — same gate as cmd_send's.
+  [[ "${_5DIVE_SYSTEM_NOTICE:-0}" == "1" ]] || _buzz_mirror_outbound "$target" "$message"
   if (( _delivered )); then
     # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
     # DIVE-4769: the urgent split, for the reason written out at cmd_send's
@@ -3016,6 +3023,21 @@ cmd_send() {
     # is the reason to keep it: on this rail a flag that is silently dropped is a
     # gate ping that gets refused, or an interrupt that quietly becomes an
     # ordinary queued message. Four lines that can be read is the control.
+    # DIVE-5689: the system-notice marker is scrubbed the same way, and a dropped
+    # one posts a machine notice into the seat's buzz room as if the seat said it.
+    # Carried as --system-notice, written out for the same reason.
+    if [[ "${_5DIVE_SYSTEM_NOTICE:-0}" == "1" ]]; then
+      if [[ "${_5DIVE_A2A_NOTIFY:-0}" == "1" ]]; then
+        if (( urgent )); then
+          exec sudo -n /usr/local/bin/5dive agent _deliver --system-notice --notify --urgent "$name" "$message"
+        fi
+        exec sudo -n /usr/local/bin/5dive agent _deliver --system-notice --notify "$name" "$message"
+      fi
+      if (( urgent )); then
+        exec sudo -n /usr/local/bin/5dive agent _deliver --system-notice --urgent "$name" "$message"
+      fi
+      exec sudo -n /usr/local/bin/5dive agent _deliver --system-notice "$name" "$message"
+    fi
     if [[ "${_5DIVE_A2A_NOTIFY:-0}" == "1" ]]; then
       if (( urgent )); then
         exec sudo -n /usr/local/bin/5dive agent _deliver --notify --urgent "$name" "$message"
