@@ -228,7 +228,7 @@ _task_cascade_unblock() {
     who=$(db    "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${dep};")
     dident=$(db "SELECT ident FROM tasks WHERE id=${dep};")
     dtitle=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${dep};")
-    [[ -n "$who" ]] && ( cmd_send "$who" --from="task-engine" \
+    [[ -n "$who" ]] && ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$who" --from="task-engine" \
         --message="▶️ Unblocked: ${dident} — all its blockers are done. It's on your queue now: ${dtitle}" ) >/dev/null 2>&1 || true
   done < <(db "SELECT task_id FROM task_deps WHERE blocked_by=${closed_id};")
   # DIVE-5564: a finished loop run asks for its score (no-op for every other row).
@@ -256,7 +256,7 @@ _task_loop_advance() {
         _task_cascade_unblock "$run" || true
         local owner; owner=$(db "SELECT COALESCE(assignee,created_by) FROM tasks WHERE id=${run};")
         local rident; rident=$(db "SELECT ident FROM tasks WHERE id=${run};")
-        [[ -n "$owner" ]] && ( cmd_send "$owner" --from="loop" \
+        [[ -n "$owner" ]] && ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" --from="loop" \
             --message="✅ Loop complete: ${rident} — all steps done." ) >/dev/null 2>&1 || true
       fi
     fi
@@ -296,7 +296,7 @@ _task_loop_advance() {
         who=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${nid};")
         lbl=$(db "SELECT title FROM tasks WHERE id=${nid};")
         rident=$(db "SELECT COALESCE((SELECT ident FROM tasks WHERE id=${run}),'') FROM tasks LIMIT 1;")
-        [[ -n "$who" ]] && ( cmd_send "$who" --from="loop" \
+        [[ -n "$who" ]] && ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$who" --from="loop" \
             --message="🔁 Your turn in loop ${rident}: ${lbl}" ) >/dev/null 2>&1 || true
         ;;
     esac
@@ -376,7 +376,7 @@ ${_LOOP_MARK}:run]]"
   # Kick off step 1 — ping its agent (heartbeat would wake it anyway).
   local who1; who1=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${first};")
   local lbl1; lbl1=$(db "SELECT title FROM tasks WHERE id=${first};")
-  [[ -n "$who1" ]] && ( cmd_send "$who1" --from="loop" \
+  [[ -n "$who1" ]] && ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$who1" --from="loop" \
       --message="🔁 Loop ${run_ident} started — your step: ${lbl1}" ) >/dev/null 2>&1 || true
 
   ok "loop ${run_ident} started — ${n} steps, first: ${who1:-?}" \

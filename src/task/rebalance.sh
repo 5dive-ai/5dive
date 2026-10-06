@@ -341,7 +341,7 @@ _rebal_apply() {
     if declare -F _hb_escalate >/dev/null 2>&1; then
       _hb_escalate "rebalance" "task-engine" "rebalance" "$msg" "$l"
     else
-      ( cmd_send "$l" --from="task-engine" --message="$msg" ) >/dev/null 2>&1 || true
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$l" --from="task-engine" --message="$msg" ) >/dev/null 2>&1 || true
     fi
   done
   return 0

@@ -2246,7 +2246,7 @@ _task_need_route_deliver() {
     # it is rather than claiming a verdict we cannot have.
     # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
     # a2a_round_guard. NOT a sender exemption; never set this by hand.
-    ( _5DIVE_A2A_NOTIFY=1 5dive agent send "$reviewer" "$msg" --from="$filer" >/dev/null 2>&1 & ) || true
+    ( _5DIVE_SYSTEM_NOTICE=1 _5DIVE_A2A_NOTIFY=1 5dive agent send "$reviewer" "$msg" --from="$filer" >/dev/null 2>&1 & ) || true
     TASK_GATE_ROUTE_STATE="inflight"
     _task_gate_delivery_log error "$ident" "agent:${reviewer}" "" \
       "lead-route handoff to ${reviewer} dispatched UNOBSERVED: no writable scratch dir for the send's exit status" \
@@ -2260,7 +2260,7 @@ _task_need_route_deliver() {
       local _crc=0 _cout=""
       # DIVE-3318: a one-way machine notice nobody replies to is not a round — see
       # a2a_round_guard. NOT a sender exemption; never set this by hand.
-      _cout=$(_5DIVE_A2A_NOTIFY=1 5dive agent send "$reviewer" "$msg" --from="$filer" 2>&1) || _crc=$?
+      _cout=$(_5DIVE_SYSTEM_NOTICE=1 _5DIVE_A2A_NOTIFY=1 5dive agent send "$reviewer" "$msg" --from="$filer" 2>&1) || _crc=$?
       if (( _crc == 0 )); then
         _task_gate_delivery_log ok "$ident" "agent:${reviewer}" "" \
           "lead-route handoff delivered to ${reviewer} (${role}) via 5dive agent send"

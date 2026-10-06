@@ -648,7 +648,7 @@ _hb_escalate() {  # <rail> <subject> <class> <message> [recipient]
     _hb_alert_undeliverable "$subject" "$class" no-recipient ""
     return 0
   fi
-  if ! ( cmd_send "$to" --from="task-engine" --message="$msg" ) >/dev/null 2>&1; then
+  if ! ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$to" --from="task-engine" --message="$msg" ) >/dev/null 2>&1; then
     _hb_log "[${subject}] ${rail}: 'cmd_send ${to}' FAILED — escalation lost (audited, not delivered) (DIVE-4554)"
     _hb_alert_undeliverable "$subject" "$class" send-failed "$to"
   fi
@@ -1714,9 +1714,9 @@ _hb_nudge_enforce() {
       fi
       _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): REASSIGNED ${asg:-unassigned} -> ${target} after ${nudge_n} heartbeat nudges (>= 2x the ${band} threshold of ${n}) produced no state change. Each of those nudges was a full fresh-context session that read this row and did not start it, so this is a hand-off, not a reprimand: whatever stopped ${asg:-the previous assignee} is not something another nudge to them can clear. ${target}: if you also decide NOT to start this, write WHY into this body before you exit — that sentence is the only memory the next seat has."
       with_registry_lock _hb_clear_nudge "$name" "$tid" >/dev/null 2>&1 || true
-      ( cmd_send "$target" --from="task-engine" \
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$target" --from="task-engine" \
           --message="🔁 ${tident} has been REASSIGNED to you by nudge enforcement: it was nudged ${nudge_n}x at '${asg:-unassigned}' with no state change (DIVE-3218). The reason is written into the row body — read it, then \`5dive task start ${tident}\`. If you decide not to start it, write why into the body rather than leaving it to be re-derived." ) >/dev/null 2>&1 || true
-      [[ -n "$asg" ]] && ( cmd_send "$asg" --from="task-engine" \
+      [[ -n "$asg" ]] && ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$asg" --from="task-engine" \
           --message="🔁 ${tident} has been moved OFF you to '${target}' — ${nudge_n} nudges, no state change (DIVE-3218). Nothing for you to do; if you were mid-thought on it, say so to ${target} rather than both starting it." ) >/dev/null 2>&1 || true
       ledger_emit "task.nudge_enforced" ident="$tident" task_id="$tid" \
         actor="task-engine" authority="heartbeat" \
@@ -1746,7 +1746,7 @@ _hb_nudge_enforce() {
       fi
       _hb_row_note "$tid" "[${today}] nudge-enforcement (DIVE-3218): PARKED for ${wake_days}d after ${nudge_n} heartbeat nudges (>= 2x the ${band} threshold of ${n}) produced no state change, and no free agent was available to hand it to. NOT cancelled and NOT unwanted — parking only stops the wakes, which were costing a full fresh-context session each and buying nothing. It auto-unparks to todo on its wake date. Whoever picks it up next: if you decide not to start it, write WHY into this body before you exit."
       with_registry_lock _hb_clear_nudge "$name" "$tid" >/dev/null 2>&1 || true
-      [[ -n "$asg" ]] && ( cmd_send "$asg" --from="task-engine" \
+      [[ -n "$asg" ]] && ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$asg" --from="task-engine" \
           --message="⏸ ${tident} has been PARKED for ${wake_days}d by nudge enforcement — ${nudge_n} nudges, no state change, no free agent to hand it to (DIVE-3218). It is not cancelled; it auto-unparks to todo on its wake date. The reason is in the row body. If it should come back sooner, \`5dive task start ${tident}\` unparks it." ) >/dev/null 2>&1 || true
       ledger_emit "task.nudge_enforced" ident="$tident" task_id="$tid" \
         actor="task-engine" authority="heartbeat" \
@@ -5540,7 +5540,7 @@ _hb_gate_ttl_sweep() {
       _ttl_busy=$(_gate_seat_busy_elsewhere "$gid" "$gowner") || _ttl_busy=""
     fi
     if [[ -z "$_ttl_esc" && -n "$gowner" && -z "$_ttl_busy" ]]; then
-      ( cmd_send "$gowner" --message="⏱ ${gident} tier-1 gate hit its 48h TTL — recommendation applied: ${grec}. Resume the task; run \`5dive task show ${gident}\`." ) >/dev/null 2>&1 || true
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$gowner" --message="⏱ ${gident} tier-1 gate hit its 48h TTL — recommendation applied: ${grec}. Resume the task; run \`5dive task show ${gident}\`." ) >/dev/null 2>&1 || true
     fi
     _hb_log "[gate-ttl] ${gident} T1 48h TTL -> applied rec${_ttl_esc}${_ttl_busy:+ (owner ${gowner} busy on ${_ttl_busy} — not pinged, DIVE-4896)}"
   done < <(db "SELECT id||x'1f'||need_type||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(assignee,'')
@@ -5617,7 +5617,7 @@ _hb_gate_ttl_sweep() {
                          AND COALESCE(need_asked_at, updated_at) <= datetime('now','-${_HB_GATE_ESCALATE_DAYS} days')
                        ORDER BY COALESCE(need_asked_at,updated_at);")
       if [[ -n "$_esc_lines" ]]; then
-        ( cmd_send "$_mgr" --message="⏫ Gate escalation — your report ${aname} has gate(s) unanswered ${_HB_GATE_ESCALATE_DAYS}d+, still stalling their lane:"$'\n'"${_esc_lines}"$'\n\n'"Help chase the answer or re-scope. Not auto-resolved — a human still clears it." ) >/dev/null 2>&1 || true
+        ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$_mgr" --message="⏫ Gate escalation — your report ${aname} has gate(s) unanswered ${_HB_GATE_ESCALATE_DAYS}d+, still stalling their lane:"$'\n'"${_esc_lines}"$'\n\n'"Help chase the answer or re-scope. Not auto-resolved — a human still clears it." ) >/dev/null 2>&1 || true
         _hb_log "[gate-ttl] escalated ${aname}'s stale gate(s) to org-parent ${_mgr}"
       fi
     fi
@@ -5812,7 +5812,7 @@ _hb_gate_renag_landed_rail() { # <assignee> <ids> -> 0 delivered, 1 = rows stay 
   text+=$'\n\n'"If a gate asked for that merge: 5dive task need <ident> --withdraw, then close the row. If it asks for something else, re-file it and the human reminder resumes."
   local out="" rc=0
   out=$(_A2A_GUARD="task:${idlist}:${seat}:gate_unanswered" \
-        cmd_send "$seat" --message="$text" 2>&1) || rc=$?
+        _5DIVE_SYSTEM_NOTICE=1 cmd_send "$seat" --message="$text" 2>&1) || rc=$?
   if (( rc != 0 )); then
     _hb_log "[gate-renag] landed rail to ${seat} FAILED rc=${rc} for rows ${idlist}; they stay in the human lanes: ${out//$'\n'/ }"
     return 1
@@ -6100,7 +6100,7 @@ _hb_gate_renag_agent_rail() { # <reviewer> <ids> -> 0 delivered, 1 = caller must
   # the direct inject and never touches this path — unchanged.
   local out="" rc=0
   out=$(_A2A_GUARD="task:${idlist}:${reviewer}:gate_unanswered" \
-        cmd_send "$reviewer" --message="$text" 2>&1) || rc=$?
+        _5DIVE_SYSTEM_NOTICE=1 cmd_send "$reviewer" --message="$text" 2>&1) || rc=$?
   if (( rc != 0 )); then
     _hb_log "[gate-renag] agent rail to ${reviewer} FAILED rc=${rc} for rows ${idlist}; falling back to the paired channel: ${out//$'\n'/ }"
     return 1
@@ -6317,7 +6317,7 @@ _hb_blocked_sweep() {
       who=$(db    "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${tid};")
       dident=$(db "SELECT ident FROM tasks WHERE id=${tid};")
       idlist+="${dident} "
-      [[ -n "$who" ]] && ( cmd_send "$who" --from="task-engine" \
+      [[ -n "$who" ]] && ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$who" --from="task-engine" \
           --message="▶️ Unblocked: ${dident} — all blockers done, now on your queue." ) >/dev/null 2>&1 || true
     done
     _hb_log "[blocked-sweep] auto-recovered: ${idlist}"
@@ -6424,7 +6424,7 @@ _hb_gate_shipped_sweep() {
         _task_store_audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "evidence=subject-pr" "subject=$_svd" || true
         _hb_log "[gate-shipped] ${gident} — the PR its ASK names is MERGED (${_svd}) -> flagged on SUBJECT state, not on the row's commits (DIVE-2414)"
         if [[ -n "$gowner" ]] && _task_agent_channel "$gowner"; then
-          ( cmd_send "$gowner" --message="🚢 ${gident} — the pull request this open ${gtype} gate ASKS ABOUT is now merged (${_svd}). Likely settled: verify and close with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off (DIVE-555), so it stays open until you clear it." ) >/dev/null 2>&1 || true
+          ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$gowner" --message="🚢 ${gident} — the pull request this open ${gtype} gate ASKS ABOUT is now merged (${_svd}). Likely settled: verify and close with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off (DIVE-555), so it stays open until you clear it." ) >/dev/null 2>&1 || true
         fi
         continue ;;
     esac
@@ -6483,7 +6483,7 @@ _hb_gate_shipped_sweep() {
       # named the ROW, and the ask names no PR to check instead — so on a row
       # carrying several items it may well be about a different one (DIVE-2382).
       # The old wording asserted "likely shipped" with no way to tell the two apart.
-      ( cmd_send "$gowner" --message="🚢 ${gident} — a commit referencing this open ${gtype} gate's ROW landed on ${_HB_GATE_SHIPPED_REF} (${hit}). This ask names no pull request, so the evidence is ROW-level: if the row carries several items, the commit may be about a different one — check before you clear. Verify with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off, so it stays open until you clear it." ) >/dev/null 2>&1 || true
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$gowner" --message="🚢 ${gident} — a commit referencing this open ${gtype} gate's ROW landed on ${_HB_GATE_SHIPPED_REF} (${hit}). This ask names no pull request, so the evidence is ROW-level: if the row carries several items, the commit may be about a different one — check before you clear. Verify with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off, so it stays open until you clear it." ) >/dev/null 2>&1 || true
     fi
   done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||need_type||x'1f'||COALESCE(assignee,'')
                FROM tasks
@@ -6656,7 +6656,7 @@ _hb_forge_merge_sweep() {
     # same reason — the landing is recorded, so this row is never seen again.
     local closer; closer=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
     if [[ -n "$closer" ]] && _task_agent_channel "$closer"; then
-      ( cmd_send "$closer" --message="🚢 ${ident} — the pull request bound to this row (${dref}) is MERGED ON THE FORGE (${sha:0:12}, ${at}). The heartbeat recorded the landing, retired the merge hold and took the row out of the merging stage, so what it is owed now is a CLOSE and nobody owes it a merge. Read the PASS verdict FIRST: a merged pull request is not automatically a finished row (DIVE-4520), so if the verdict left something owed, discharge that before you close. \`5dive task show ${ident}\`" ) >/dev/null 2>&1 || true
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$closer" --message="🚢 ${ident} — the pull request bound to this row (${dref}) is MERGED ON THE FORGE (${sha:0:12}, ${at}). The heartbeat recorded the landing, retired the merge hold and took the row out of the merging stage, so what it is owed now is a CLOSE and nobody owes it a merge. Read the PASS verdict FIRST: a merged pull request is not automatically a finished row (DIVE-4520), so if the verdict left something owed, discharge that before you close. \`5dive task show ${ident}\`" ) >/dev/null 2>&1 || true
     fi
   # THE POPULATION IS THE STAGE PREDICATE AND NOTHING ELSE, and that is where the
   # cost bound comes from rather than from a throttle written here.
@@ -6999,7 +6999,7 @@ _hb_stall_sweep() {
       rsupp_main="every slot since is suppressed by skip-if-open (DIVE-2693)"
     fi
     if [[ -n "$rasg" ]]; then
-      ( cmd_send "$rasg" --from="task-engine" \
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$rasg" --from="task-engine" \
           --message="⏳ ${rident} is a RECURRING instance you have never started — ${rhours}h old. ${rsupp} Work it or close it: \`5dive task start ${rident}\`, or \`5dive task cancel ${rident} --result=...\` to let the schedule re-fire." ) >/dev/null 2>&1 || true
     fi
     # DIVE-2853: NAME whether the addressee could even act, instead of leaving it to
@@ -7112,10 +7112,10 @@ _hb_stall_sweep() {
       db "UPDATE tasks SET assignee=$(sqlq "$etarget"), recurring_stall_escalated_at=datetime('now'),
                            updated_at=datetime('now')
           WHERE id=${eid} AND status='todo' AND started_at IS NULL;" 2>/dev/null || true
-      ( cmd_send "$etarget" --from="task-engine" \
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$etarget" --from="task-engine" \
           --message="🔁 ${eident} (recurring beat from template ${etmpl}) has been REASSIGNED to you: it sat never-started for ${ehours}h with '${easg:-unassigned}', who was surfaced once and could not take it. ${esupp^}. \`5dive task start ${eident}\`, or \`5dive task cancel ${eident} --result=...\` if it is genuinely not workable, which lets the schedule re-fire." ) >/dev/null 2>&1 || true
       if [[ -n "$easg" ]]; then
-        ( cmd_send "$easg" --from="task-engine" \
+        ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$easg" --from="task-engine" \
             --message="🔁 ${eident} has been moved OFF you to '${etarget}' — it was never started ${ehours}h after being flagged, and ${esupp}. Nothing for you to do; if you were about to start it, say so to ${etarget} rather than both starting it." ) >/dev/null 2>&1 || true
       fi
       _hb_escalate "recurring-escalate" "${eident}" "recurring-escalate" \
@@ -7132,7 +7132,7 @@ _hb_stall_sweep() {
           WHERE id=${eid} AND status='todo' AND started_at IS NULL;" 2>/dev/null || true
       emsg="🗑 ${eident} (recurring beat from template ${etmpl}) was AUTO-CANCELLED after sitting never-started ${ehours}h past its stall flag, with no free agent to hand it to. The reason is written into the row's result; the template re-fires on its next slot (${esupp})."
       if [[ -n "$easg" ]]; then
-        ( cmd_send "$easg" --from="task-engine" --message="$emsg If you still want this instance, the next materialization is yours to start on time — or reply to say the row should not be assigned to you." ) >/dev/null 2>&1 || true
+        ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$easg" --from="task-engine" --message="$emsg If you still want this instance, the next materialization is yours to start on time — or reply to say the row should not be assigned to you." ) >/dev/null 2>&1 || true
       fi
       _hb_escalate "recurring-escalate" "${eident}" "recurring-escalate" "$emsg No free agent existed at escalation time, so reassignment had nowhere to go (DIVE-2853)." \
         "$(_hb_ops_recipient)"
@@ -8016,7 +8016,7 @@ _hb_poller_liveness_sweep() {
     #
     # DIVE-818 / DIVE-1434 are provenance refs from code comments, NOT board
     # rows — say so, or the reader looks them up and hits "no such task".
-    ( cmd_send "$coord" --message="🔴 Telegram poller DEAD on: ${dead[*]}. Gate-ping tap buttons still SEND but the human's TAP won't land (getUpdates slot not held) — those gates can't be cleared from the phone. CONFIRM BEFORE ACTING, one seat at a time — do not blanket-restart the fleet. Count the poller for the named agent: pgrep -u agent-<name> -f 'bun (start|server)\.ts' (BOTH names — the plugin's launcher is start.ts since DIVE-3752, older caches and the non-claude variants still run server.ts; the beacon alone cannot separate 'never started' from 'genuinely dead'; the process table can). Zero —> restart THAT ONE agent (5dive agent restart <name>); a poller should appear within ~10s, measured at 9. ${rung4} (Canary provenance — code refs, not board rows: DIVE-1434 canary, DIVE-818 single-getUpdates-slot incident, DIVE-2384 restart grace, DIVE-3748 the three-state measurement, DIVE-3753 the rung-4 restart. Re-pings hourly until healthy.)" ) >/dev/null 2>&1 || true
+    ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$coord" --message="🔴 Telegram poller DEAD on: ${dead[*]}. Gate-ping tap buttons still SEND but the human's TAP won't land (getUpdates slot not held) — those gates can't be cleared from the phone. CONFIRM BEFORE ACTING, one seat at a time — do not blanket-restart the fleet. Count the poller for the named agent: pgrep -u agent-<name> -f 'bun (start|server)\.ts' (BOTH names — the plugin's launcher is start.ts since DIVE-3752, older caches and the non-claude variants still run server.ts; the beacon alone cannot separate 'never started' from 'genuinely dead'; the process table can). Zero —> restart THAT ONE agent (5dive agent restart <name>); a poller should appear within ~10s, measured at 9. ${rung4} (Canary provenance — code refs, not board rows: DIVE-1434 canary, DIVE-818 single-getUpdates-slot incident, DIVE-2384 restart grace, DIVE-3748 the three-state measurement, DIVE-3753 the rung-4 restart. Re-pings hourly until healthy.)" ) >/dev/null 2>&1 || true
   fi
   return 0
 }
@@ -8292,7 +8292,7 @@ _hb_stuck_q_plain_ask() { # <text>
 # A synthetic label that is not a registered agent passes the forgery guard
 # (envelope_peer_forgery: ok:synthetic-label) and is never matched as a nudge.
 _hb_stuck_q_agent_send() { # <lead> <seat> <text>
-  ( cmd_send "$1" --from="$_HB_STUCK_Q_SENDER" --message="${2} ended its turn waiting for an answer, and you are the nearest running agent above it. Its last words:"$'\n\n'"${3}"$'\n\n'"Answer with 5dive agent send ${2} '…'. If only a person can decide, ask your human." ) >/dev/null 2>&1
+  ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$1" --from="$_HB_STUCK_Q_SENDER" --message="${2} ended its turn waiting for an answer, and you are the nearest running agent above it. Its last words:"$'\n\n'"${3}"$'\n\n'"Answer with 5dive agent send ${2} '…'. If only a person can decide, ask your human." ) >/dev/null 2>&1
 }
 
 # The sweep's clock, a function so the harness can move time past a backoff.
@@ -8437,7 +8437,7 @@ _hb_objective_reconcile() {
           db "UPDATE objective_cycles SET outcome='planner_failed' WHERE id=${row_id};"
           _hb_log "[obj-reconcile] ${oname} #${cyc}: planner task ${tid} closed non-diff (prose/empty) — planner_failed (salvage: replan --diff)"
           local coord; coord=$(_task_resolve_coordinator 2>/dev/null)
-          [[ -n "$coord" ]] && ( cmd_send "$coord" --message="⚠️ objective '${oname}' cycle ${cyc}: planner loop ${lid:-?} finished but its close-result isn't a diff — no auto-materialize. Salvage: 5dive objective replan \"${oname}\" --diff='<json from task ${tid}>' (DIVE-1737 reconciler)." ) >/dev/null 2>&1 || true
+          [[ -n "$coord" ]] && ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$coord" --message="⚠️ objective '${oname}' cycle ${cyc}: planner loop ${lid:-?} finished but its close-result isn't a diff — no auto-materialize. Salvage: 5dive objective replan \"${oname}\" --diff='<json from task ${tid}>' (DIVE-1737 reconciler)." ) >/dev/null 2>&1 || true
           continue
         fi
         # Parseable diff: drop the marker so `replan --diff` reuses cycle ${cyc}

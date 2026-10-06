@@ -624,7 +624,7 @@ _grader_clone_wake() {  # <clone> <ident> <session_id>
   if [[ -n "$_GRADER_CLONE_WAKE_CMD" ]]; then eval "$_GRADER_CLONE_WAKE_CMD"; return $?; fi
   local msg; msg=$(_grader_process_goal "$ident" "$sid" "$clone")
   _A2A_GUARD="task:${ident}:${clone}:assignee_owns" \
-  "$_GRADER_TASK_CLI" agent send "$clone" "$msg" >/dev/null 2>&1
+  _5DIVE_SYSTEM_NOTICE=1 "$_GRADER_TASK_CLI" agent send "$clone" "$msg" >/dev/null 2>&1
 }
 
 # `_grader_clone_remove <clone>` — the seat goes away, its home is quarantined.
