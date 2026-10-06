@@ -128,7 +128,7 @@ is "T3: a raw send mirrors nothing"  "none" "$(mirrors)"
 # Every one must carry the marker on the same line.
 unmarked="$(grep -nE '(^ *|[(;&|] *|\$\( *)([A-Za-z0-9_]+=[^ ]+ +)*(cmd_send|5dive agent send|"\$_GRADER_TASK_CLI" agent send) "\$' src/task/*.sh src/cmd_heartbeat.sh \
   | grep -vE '^[^:]+:[0-9]+: *#' | grep -v '_5DIVE_SYSTEM_NOTICE=1' || true)"
-total="$(grep -cE '_5DIVE_SYSTEM_NOTICE=1 ([A-Za-z0-9_]+=[^ ]+ +)*(cmd_send|5dive agent send|"\$_GRADER_TASK_CLI" agent send) "\$' src/task/*.sh src/cmd_heartbeat.sh | awk -F: '{s+=$2} END{print s}')"
+total="$(grep -cE '_5DIVE_SYSTEM_NOTICE=1 ([A-Za-z0-9_]+=[^ ]+ +)*(cmd_send|5dive agent send|"\$_GRADER_TASK_CLI" agent send) "\$' src/task/*.sh src/cmd_heartbeat.sh | awk -F: '{s+=$2} END{print s}')" || total=0
 is "T4: no task-side send is left unmarked" "" "$unmarked"
 if (( total >= 33 )); then ok_t "T4: the pin sees the marked sends ($total)"; else bad_t "T4: the pin sees the marked sends" "only $total — the pattern stopped matching"; fi
 
