@@ -1669,7 +1669,8 @@ projects_claudemd_is_stock() { # <file>
     220c10d2d0c0e4050ac655d5ddbeffbb6eaaea38f75028fd48ff57410081a945|\
     bc542aafff4db66b5d917ba9b782fb0892e002addf26d16ad2cb539134ee489f|\
     cddfb0e1502ae9050efa83082db648e05ecd1f0e9708157d75773ff8b8bad703|\
-    8c47dab5990cb1bb1e0664c35e811b29b6bb4c461dee877cd273d7ee6a8a6b0a)
+    8c47dab5990cb1bb1e0664c35e811b29b6bb4c461dee877cd273d7ee6a8a6b0a|\
+    0e8345ebdd9ba6ec2bbbcfcc93be75ae0da7e0078015439900d95f64c2dff475)
       return 0 ;;
   esac
   return 1
