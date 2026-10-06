@@ -215,8 +215,43 @@ cmd_task_routing() {
       ok "builder-gate routing: OFF — this is the shipped default, not an opt-out from one. A tier<2 decision gate routes to the org lead BY KIND (DIVE-4415) and does not read this pref at all; off governs the classes that still do — an unbound tier<2 approval or manual gate, which reaches the paired human." \
          '{pref:"gate_builder_routing", value:"off", governs:"approval/manual", decision_routes_by_kind:true}'
       ;;
+    offbox)
+      # DIVE-5648: name the OFF-BOX seat that manages this box's org root. With it
+      # set, approval/decision gates below tier 2 do not ring the human's phone —
+      # they stay open in `task ls --gated` for that seat to answer through its own
+      # command path. secret, manual and every tier-2 gate still reach the human.
+      local seat="${2:-}"
+      case "$seat" in
+        ""|status)
+          local cur; cur=$(_gate_offbox_owner)
+          if [[ -n "$cur" ]]; then
+            ok "off-box gate owner: ${cur} — approval/decision gates below tier 2 are held off the human's phone for ${cur}; secret, manual and tier-2 gates still reach the human" \
+               '{pref:"gate_offbox_owner", value:$v}' --arg v "$cur"
+          else
+            ok "off-box gate owner: none (default) — every human-bound gate reaches the paired human" \
+               '{pref:"gate_offbox_owner", value:null}'
+          fi
+          ;;
+        off|none|disable)
+          db "DELETE FROM task_prefs WHERE key='gate_offbox_owner';"
+          _task_store_audit_log "task routing offbox" "off" 0 -- "pref=gate_offbox_owner" || true
+          ok "off-box gate owner: OFF — human-bound approval/decision gates reach the paired human again; open held gates re-nag on the next sweep" \
+             '{pref:"gate_offbox_owner", value:null}'
+          ;;
+        *)
+          [[ "$seat" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] \
+            || fail "$E_VALIDATION" "off-box gate owner must be a seat name (lowercase letters, digits, - or _): got '$seat'"
+          [[ -n "$(db "SELECT name FROM agents_org WHERE name=$(sqlq "$seat");" 2>/dev/null)" ]] \
+            && warn "'$seat' is a seat on THIS box — gates already route to an on-box seat through the org chart (5dive org set <agent> --manager=$seat). The off-box owner is for a manager on another box."
+          _task_pref_set gate_offbox_owner "$seat"
+          _task_store_audit_log "task routing offbox" "on" 0 -- "pref=gate_offbox_owner" "owner=$seat" || true
+          ok "off-box gate owner: ${seat} — approval/decision gates below tier 2 now stay off the human's phone and wait in task ls --gated for ${seat}; secret, manual and tier-2 gates still reach the human" \
+             '{pref:"gate_offbox_owner", value:$v}' --arg v "$seat"
+          ;;
+      esac
+      ;;
     *)
-      fail "$E_USAGE" "usage: 5dive task routing [on|off|status]"
+      fail "$E_USAGE" "usage: 5dive task routing [on|off|status|offbox [<seat>|off]]"
       ;;
   esac
 }
@@ -5354,6 +5389,13 @@ db "BEGIN IMMEDIATE;
   else                                                      _hp_why="unresolved"
   fi
   db "UPDATE tasks SET route_provenance=$(sqlq "human:${_hp_why}") WHERE id=${id};"
+  # DIVE-5648: an off-box gate owner holds this gate's phone ping (the deliverer
+  # decides that on the same predicate); the provenance says so, so a reader of
+  # the gate list (the off-box owner's own poll) can tell held from pinged.
+  local _offbox_owner=""
+  _offbox_owner=$(_gate_offbox_held "$ident") || _offbox_owner=""
+  [[ -n "$_offbox_owner" ]] \
+    && db "UPDATE tasks SET route_provenance=$(sqlq "offbox:${_offbox_owner}") WHERE id=${id};"
   # DIVE-2054: task-store state for $ident, no channel proof — fenced.
   _task_store_audit_log "task need human-route" ok 0 -- \
     "task=$ident" "type=$type" "tier=$tier" "filer=$actor" "route=human:${_hp_why}" || true
@@ -5613,7 +5655,7 @@ db "BEGIN IMMEDIATE;
     _plan=$(_task_legacy_owner_destinations "${TASK_CH_ACCESS:-}") || _plan=""
     [[ -n "$_plan" ]] && dest_note=" [ping not sent yet (held by the undo window) — it goes to ${_plan}]"
   fi
-  if (( _legacy )) && _task_deployment_has_channels; then
+  if (( _legacy )) && [[ -z "$_offbox_owner" ]] && _task_deployment_has_channels; then
     local _bcast="${_dest:-$_plan}"
     warn "no human accounts on this box (\`5dive human ls\` is empty), so this gate takes the legacy BROADCAST path${_bcast:+ — it goes to ${_bcast}}. Everyone on that chat or topic can read the ask and tap its buttons. Name the person instead: sudo 5dive human add <id> --telegram=<chat id>"
   fi
@@ -5658,6 +5700,10 @@ db "BEGIN IMMEDIATE;
     fi
   fi
   local _nr_note=" [NOT ROUTED — no lead was named, so this gate sits on the PAIRED HUMAN: ${_nr_reason}]"
+  if [[ -n "$_offbox_owner" ]]; then
+    dest_note=" [phone ping HELD — off-box gate owner '${_offbox_owner}' answers this box's approval/decision gates; nobody was paged]"
+    _nr_note=""
+  fi
   ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note}${unnotified_note}${dest_note}${_nr_note} — $ask" \
      '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), delivered_to:(($dt|select(length>0)) // null), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
      --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg dt "${TASK_SEND_TARGETS:-}" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"

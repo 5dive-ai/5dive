@@ -5568,6 +5568,7 @@ _hb_gate_ttl_sweep() {
                       OR (tier=1 AND need_type IN ${_GATE_HUMAN_CLASS_SQL}))
                  AND COALESCE(need_asked_at, updated_at) <= datetime('now','-72 hours')
                  AND (gate_pinged_at IS NULL OR gate_pinged_at <= datetime('now','-7 days'))
+                 AND NOT ${_GATE_OFFBOX_HELD_SQL:-0}
                  AND status NOT IN ('done','cancelled')"
   local aname
   while IFS= read -r aname; do
@@ -5714,6 +5715,9 @@ _HB_GATE_RENAG_NO_NATURAL_WAKE="CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) <
                                                          AND b.status NOT IN ('done','cancelled')) ) ))"
 _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
   AND status NOT IN ('done','cancelled') AND COALESCE(tier,2) != 0
+  -- DIVE-5648: a gate held for an OFF-BOX gate owner is not re-nagged to the
+  -- human; the predicate reads the pref live, so turning it off re-arms these.
+  AND NOT ${_GATE_OFFBOX_HELD_SQL:-0}
   AND ( COALESCE(routed_reviewer,'') = ''
         OR COALESCE(gate_urgent,0) = 1
         OR COALESCE(need_asked_at,updated_at,created_at)
@@ -7510,6 +7514,7 @@ _hb_stall_sweep() {
                       OR (tier=1 AND need_type IN ${_GATE_HUMAN_CLASS_SQL}))
                  AND COALESCE(need_asked_at, updated_at) <= datetime('now','-72 hours','-30 minutes')
                  AND (gate_pinged_at IS NULL OR gate_pinged_at <= datetime('now','-7 days'))
+                 AND NOT ${_GATE_OFFBOX_HELD_SQL:-0}
                  AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
   [[ "$eligible" =~ ^[0-9]+$ ]] || eligible=0
   if (( eligible == 0 )); then
