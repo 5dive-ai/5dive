@@ -2095,7 +2095,7 @@ cmd_task_answer() {
               UPDATE tasks SET status='blocked' WHERE id=${id} AND status NOT IN ('done','cancelled');
               UPDATE tasks SET status='todo', started_at=NULL WHERE id=${_prev};"
           local _pw _pl; _pw=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${_prev};"); _pl=$(db "SELECT title FROM tasks WHERE id=${_prev};")
-          [[ -n "$_pw" ]] && ( cmd_send "$_pw" --from="loop" --message="↩ Loop bounced back — redo: ${_pl}" ) >/dev/null 2>&1 || true
+          [[ -n "$_pw" ]] && ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$_pw" --from="loop" --message="↩ Loop bounced back — redo: ${_pl}" ) >/dev/null 2>&1 || true
         fi
       else
         # DIVE-2228: defence in depth, same as the close-as-done branch — a
@@ -2162,10 +2162,11 @@ cmd_task_answer() {
       pingmsg="${ident} gate cleared — your '${nt}' ask was answered. Resume the task; run \`5dive task show ${ident}\` for the value."
     fi
     local actor; actor=$(task_actor "$from")
+    # DIVE-5689: a system notice — the owner's pane gets it, its Telegram group does not.
     if valid_sender_label "$actor"; then
-      ( cmd_send "$owner" --from="$actor" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" --from="$actor" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
     else
-      ( cmd_send "$owner" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
     fi
   fi
 
@@ -2252,9 +2253,9 @@ cmd_task_escalate() {
   if [[ -n "$owner" && "$owner" != "$actor" ]]; then
     local pingmsg="🔺 ${ident} escalated by ${actor} — flagged as needing attention (priority ${pri_note}). Get eyes on it; run \`5dive task show ${ident}\`."
     if valid_sender_label "$actor"; then
-      ( cmd_send "$owner" --from="$actor" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" --from="$actor" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
     else
-      ( cmd_send "$owner" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
     fi
   fi
 
@@ -2339,7 +2340,7 @@ cmd_task_followup() {
   valid_sender_label "$actor" && send+=(--from="$actor")
   [[ -n "$chat" ]] && send+=(--reply-to-chat="$chat")
   local delivered=0 why=""
-  if why=$( ( _5DIVE_A2A_NOTIFY=1 cmd_send "$assignee" "${send[@]}" ) 2>&1 >/dev/null ); then
+  if why=$( ( _5DIVE_SYSTEM_NOTICE=1 _5DIVE_A2A_NOTIFY=1 cmd_send "$assignee" "${send[@]}" ) 2>&1 >/dev/null ); then
     delivered=1; why=""
   else
     why=$(printf '%s' "$why" | tr '\n' ' ' | sed 's/[[:space:]]*$//' | cut -c1-300)

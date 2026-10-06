@@ -1469,7 +1469,7 @@ _grader_spawn_session() {  # <seat> <ident>
   # sourced before that one and a harness may load either alone; a missing clause
   # degrades to the pre-DIVE-4576 wording rather than failing a spawn.
   local _gm=""; declare -F _grader_grade_method_clause >/dev/null 2>&1 && _gm=" $(_grader_grade_method_clause "$ident")"
-  5dive agent send "$seat" "Grade delivered task ${ident} from its bounded packet, then run 5dive task done or 5dive task reject. Checkpoint each verified arm to the row as you go.${_gm}" >/dev/null 2>&1
+  _5DIVE_SYSTEM_NOTICE=1 5dive agent send "$seat" "Grade delivered task ${ident} from its bounded packet, then run 5dive task done or 5dive task reject. Checkpoint each verified arm to the row as you go.${_gm}" >/dev/null 2>&1
 }
 
 # ══ DIVE-4430 — THE DISPATCHER'S FLOOR LIVES IN THIS FILE, NOT IN ITS OWN ════

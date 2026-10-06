@@ -3250,15 +3250,26 @@ cmd_send() {
     _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")"
   fi
 
+  # DIVE-5689: a SYSTEM NOTICE is not something the invoking seat said. The task
+  # rails (gate answered / secret provided, loop bounces, rebalance, grader and
+  # review handoffs) reach the owner through this verb, and the mirrors below post
+  # under the INVOKING seat's identity — so on a customer box "DIVE-1 secret gate
+  # provided — $X is set in your environment" landed in the customer's Telegram
+  # group as if the agent had written it. Those rails set _5DIVE_SYSTEM_NOTICE=1:
+  # the pane still gets the message, nothing is mirrored. It buys no privilege — it
+  # only hides the caller's own send from its own rooms, which --raw already can.
+  local _mirror=1
+  (( raw )) && _mirror=0
+  [[ "${_5DIVE_SYSTEM_NOTICE:-0}" == "1" ]] && _mirror=0
   # Mirror the outbound into the sender's group chat (best-effort). Gated on a
   # real envelope: a raw/anonymous send has no sender identity to mirror under.
-  (( raw )) || mirror_interagent_outbound "$name" "$message"
+  (( ! _mirror )) || mirror_interagent_outbound "$name" "$message"
   # DIVE-3573 (a): the same outbound, mirrored into the sender's buzz channel.
-  # Gated on the SAME (!raw) condition and for the same stated reason — a raw
-  # send has no sender identity to mirror under. Best-effort: _buzz_mirror_outbound
+  # Gated on the SAME condition and for the same stated reason — a raw send has
+  # no sender identity to mirror under. Best-effort: _buzz_mirror_outbound
   # returns 0 on every path, so a relay outage can never fail a send that already
   # reached the pane.
-  (( raw )) || _buzz_mirror_outbound "$name" "$message"
+  (( ! _mirror )) || _buzz_mirror_outbound "$name" "$message"
 
   # DIVE-4342: a send that NAMES A ROW ("do DIVE-200 first") is silently
   # outranked by the dispatcher's priority-then-age sort. The message lands, the
