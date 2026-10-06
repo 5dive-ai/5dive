@@ -82,18 +82,29 @@ _valid_connector() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
 # root (see _secret_write): a symlink the owner planted can then only reach what
 # the owner could already write. Keeps every other line and the file's mode; a
 # new file is 640 (the app's group reads it). Atomic: temp file + rename.
+# A file the owner cannot READ is refused, never replaced: the owner can still
+# rename over it (a root-owned 600 .env.local after a `sudo tee`), and doing so
+# would drop every other line in it (DIVE-5664, quinn).
 _secret_project_put() {
-  local f="$1" key="$2" value tmp
+  local f="$1" key="$2" value tmp rc=0
   value="$(cat)"
   [[ -L "$f" ]] && { echo "$f is a symlink; nothing was saved" >&2; return 3; }
+  [[ -e "$f" && ! ( -f "$f" && -r "$f" ) ]] \
+    && { echo "$f is not a file $(id -un) can read, so its other lines cannot be kept; nothing was saved" >&2; return 3; }
   tmp="$(mktemp "${f}.XXXXXX")" || return 1
-  chmod 640 "$tmp"
+  chmod 600 "$tmp"
+  # grep -v exits 1 when nothing is left (the file held only this key); 2 is a
+  # read error, and writing on would replace the file with the lines it lost.
   if [[ -f "$f" ]]; then
-    chmod --reference="$f" "$tmp" 2>/dev/null || true
-    grep -vE "^(export[[:space:]]+)?${key}=" "$f" > "$tmp" || true
+    grep -vE "^(export[[:space:]]+)?${key}=" "$f" > "$tmp" || rc=$?
+    (( rc <= 1 )) || { rm -f "$tmp"; echo "could not read $f (grep rc $rc); nothing was saved" >&2; return 1; }
   fi
-  printf '%s=%s\n' "$key" "$value" >> "$tmp"
-  mv -f "$tmp" "$f"
+  printf '%s=%s\n' "$key" "$value" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  # The mode last, once the content is in: a read-only mode copied first would
+  # stop the append itself.
+  if [[ -f "$f" ]]; then chmod --reference="$f" "$tmp"; else chmod 640 "$tmp"; fi \
+    || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
 }
 
 cmd_secret() {
@@ -183,7 +194,7 @@ _secret_write() {
   if [[ -n "$pfile" ]]; then
     [[ "$value" =~ ^[A-Za-z0-9_./:+=@,~-]+$ ]] \
       || fail "$E_VALIDATION" "this value has a character a .env line cannot hold as written (space, quote, \$, # or a newline); nothing was saved — use --connector=<name> and set it in the app yourself"
-    [[ -f "$pfile" ]] && grep -qE "^(export[[:space:]]+)?${key}=" "$pfile" && action="updated"
+    [[ -f "$pfile" ]] && grep -qE "^(export[[:space:]]+)?${key}=" "$pfile" 2>/dev/null && action="updated"
     local powner _prc=0
     powner="$(stat -c %U "$(dirname "$pfile")")"
     if [[ "$(id -un)" == "$powner" ]]; then

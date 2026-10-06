@@ -14,6 +14,8 @@
 #   J6  `task need` refuses to file a project gate for a folder that is not there,
 #       and files one for a folder that is
 #   J7  the --connector=tools refusal points at project-<app>
+#   J9  an existing env file the writer cannot READ (mode 200, 000) is refused:
+#       its bytes are unchanged and no temp file is left (quinn, DIVE-5664 it1)
 # Isolation: src/ sourced; a throwaway projects folder; `5dive` is a stub on PATH;
 # no root, no network. The folder is owned by the running user, so the write runs
 # directly; the runuser branch is graded only by J8 (source shape).
@@ -112,6 +114,27 @@ ln -s "$TMP/target.conf" "$TMP/projects/sneaky/.env.local"
 out=$(put AIzaX GOOGLE_MAPS_API --connector=project-sneaky); rc=$?
 [[ $rc -ne 0 && "$(cat "$TMP/target.conf")" == "ROOT_ONLY=1" && -L "$TMP/projects/sneaky/.env.local" ]] \
   && ok_t "J5 a symlinked .env.local is refused; the file it points at is unchanged" || bad_t "J5 symlink" "rc=$rc out=$out target=$(cat "$TMP/target.conf")"
+
+# --- J9: an env file the writer cannot read is refused, never replaced ---------
+# Root reads a mode-000 file, so this arm needs a non-root runner (the real
+# write always runs as the folder owner, and a root-owned folder is refused).
+if [[ $EUID -eq 0 ]]; then
+  ok_t "J9 skipped: running as root, which reads any mode"
+else
+  for m in 200 000; do
+    mkdir -p "$TMP/projects/locked$m"
+    L="$TMP/projects/locked$m/.env.local"
+    printf 'DATABASE_URL=postgres://x\nSTRIPE_SECRET_KEY=sk_test_1\n' > "$L"
+    before="$(sha256sum < "$L")"
+    chmod "$m" "$L"
+    out=$(put AIzaNEW GOOGLE_MAPS_API --connector=project-locked$m); rc=$?
+    mode="$(stat -c %a "$L")"; chmod 600 "$L"; after="$(sha256sum < "$L")"
+    [[ $rc -ne 0 && "$out" == *"nothing was saved"* && "$out" != *OK* && "$before" == "$after" && $((8#$mode)) -eq $((8#$m)) ]] \
+      && ok_t "J9 mode $m .env.local is refused; its bytes and mode are unchanged" || bad_t "J9 mode $m" "rc=$rc mode=$mode out=$out file=$(cat "$L")"
+    [[ "$(ls -A "$TMP/projects/locked$m")" == ".env.local" ]] \
+      && ok_t "J9 mode $m no temp file left behind" || bad_t "J9 mode $m temp left" "$(ls -A "$TMP/projects/locked$m")"
+  done
+fi
 
 # --- J6: task need checks the folder at filing --------------------------------
 for f in lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
