@@ -9,6 +9,11 @@ normalize_restart_profile_perms() {
   declare -F normalize_profile_seed_perms >/dev/null 2>&1 || return 0
   reg=$(registry_read 2>/dev/null) || return 0
   profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$reg" 2>/dev/null) || return 0
+  # DIVE-5701: an unbound codex seat seeds from the canonical codex account,
+  # whose readers are kept per seat now.
+  if [[ -z "$profile" && "$(jq -r --arg n "$name" '.agents[$n].type // empty' <<<"$reg" 2>/dev/null)" == codex ]]; then
+    profile=codex
+  fi
   [[ -n "$profile" ]] || return 0
   normalize_profile_seed_perms "$profile" || true
   return 0

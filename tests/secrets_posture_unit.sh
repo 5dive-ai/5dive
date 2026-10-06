@@ -23,6 +23,11 @@
 #     tick (or at once through link_agent_profile); the profile writer keeps
 #     that posture across its rename; agents.d/<x>.env (metadata) is untouched
 #   * a host with no claude group still writes a key (no chgrp, rc 0, o-rwx)
+#   * DIVE-5701: the vendor CLI logins inside an account (auth-profiles/<p>/
+#     <type>/) move to claude-keys; their seat readers are the seats of that
+#     type on that account, plus every unbound codex seat for the canonical
+#     codex account; a backup beside a login has no seat reader; a rebind moves
+#     the read; the seed list matches 5dive-agent-start (T13, T9 as root)
 #   * AS ROOT ONLY (CI: the root-arms job, SP_REQUIRE_ROOT_ARM=1 makes a skip
 #     a failure): the same reconcile on real files and a real group, and a
 #     real non-member uid in the workspace group is refused every key and still
@@ -312,6 +317,90 @@ printf 'K=v\n' > "$C12/w.env"; chmod 644 "$C12/w.env"
 FAKE_CHGRP_REFUSED=1 secret_file_secure "$C12/w.env" 2>/dev/null; rc=$?
 [[ $rc -eq 0 && "$(stat -c %a "$C12/w.env")" == 640 ]] && ok_t "T12 secret_file_secure: rc 0 and o-rwx when chgrp is refused" || bad_t "T12 secure" "rc=$rc mode=$(stat -c %a "$C12/w.env")"
 
+# --- T13: vendor CLI logins inside an account (DIVE-5701) ---------------------
+# acme/codex/auth.json is read by the codex seat bound to acme and nobody else:
+# not a claude seat on acme, not a codex seat on another account. The canonical
+# codex/codex/auth.json is read by the seat bound to it AND by every unbound
+# codex seat (DIVE-1322). A backup beside a login is a key with no seat reader.
+printf 'agent-cx_bound\nagent-cx_free\nagent-cx_canon\nagent-cx_other\nagent-cl_acme\nagent-hm\nagent-oc\nagent-cx_new\n' >> "$OS/users"
+cred() {   # cred <path> [mode]: a real file, group claude in the fake OS
+  mkdir -p "$(dirname "$1")"; printf 'TOKEN\n' > "$1"; chmod "${2:-640}" "$1"; printf '%s\tclaude\n' "$1" >> "$OS/fgroup"
+}
+seat_env() { printf 'AGENT_NAME=%s\nAGENT_TYPE=%s\n' "$1" "$2" > "$ENV_DIR/$1.env"; [[ -z "${3:-}" ]] || printf 'AGENT_AUTH_PROFILE=%s\n' "$3" >> "$ENV_DIR/$1.env"; }
+OC=.openclaw/agents/main/agent
+cred "$P/acme/codex/auth.json"; cred "$P/acme/codex/auth.json.bak-20260101T000000Z"
+cred "$P/codex/codex/auth.json"; cred "$P/p2/codex/auth.json"
+cred "$P/acme/hermes/auth.json"; cred "$P/acme/hermes/config.yaml"
+cred "$P/acme/openclaw/$OC/openclaw-agent.sqlite"; cred "$P/acme/openclaw/$OC/openclaw-agent.sqlite-wal"
+cred "$P/acme/grok/.grok/auth.json" 600                      # never normalized: gains no reader
+cred "$P/acme/claude/.claude.json"                           # the claude type is out of scope
+seat_env cx_bound codex acme; seat_env cx_free codex; seat_env cx_canon codex codex
+seat_env cx_other codex p2;   seat_env cl_acme claude acme; seat_env hm hermes acme; seat_env oc openclaw acme
+printf '%s\tu:agent-old:r\n' "$P/acme/codex/auth.json" >> "$OS/acl"   # left by a seat that moved off
+out=$(secrets_posture_reconcile --quiet "$REG" 2>&1); rc=$?
+[[ "$(_sp_file_group "$P/acme/codex/auth.json")" == claude-keys && "$(acl_of "$P/acme/codex/auth.json")" == "u:agent-cx_bound:r u:claude:r " ]] \
+  && ok_t "T13 acme/codex/auth.json: claude-keys, read by its bound codex seat + claude only (claude seat on acme, codex seat on p2, stale reader: none)" \
+  || bad_t "T13 acme codex" "$(_sp_file_group "$P/acme/codex/auth.json") $(acl_of "$P/acme/codex/auth.json")"
+[[ "$(_sp_file_group "$P/codex/codex/auth.json")" == claude-keys && "$(acl_of "$P/codex/codex/auth.json")" == "u:agent-cx_canon:r u:agent-cx_free:r u:claude:r " ]] \
+  && ok_t "T13 canonical codex/codex/auth.json: its bound seat + the UNBOUND codex seat (DIVE-1322), not cx_bound or cx_other" \
+  || bad_t "T13 canonical" "$(_sp_file_group "$P/codex/codex/auth.json") $(acl_of "$P/codex/codex/auth.json")"
+[[ "$(acl_of "$P/p2/codex/auth.json")" == "u:agent-cx_other:r u:claude:r " ]] && ok_t "T13 p2/codex/auth.json: only its own codex seat" || bad_t "T13 p2" "$(acl_of "$P/p2/codex/auth.json")"
+b="$P/acme/codex/auth.json.bak-20260101T000000Z"
+[[ "$(_sp_file_group "$b")" == claude-keys && "$(acl_of "$b")" == "u:claude:r " ]] \
+  && ok_t "T13 a hand-made auth.json.bak-<ts> beside the login: claude-keys, no seat reader" || bad_t "T13 backup" "$(_sp_file_group "$b") $(acl_of "$b")"
+for f in hermes/auth.json hermes/config.yaml; do
+  [[ "$(_sp_file_group "$P/acme/$f")" == claude-keys && "$(acl_of "$P/acme/$f")" == "u:agent-hm:r u:claude:r " ]] \
+    && ok_t "T13 acme/$f: the hermes seat on acme only" || bad_t "T13 $f" "$(_sp_file_group "$P/acme/$f") $(acl_of "$P/acme/$f")"
+done
+for f in openclaw-agent.sqlite openclaw-agent.sqlite-wal; do
+  [[ "$(_sp_file_group "$P/acme/openclaw/$OC/$f")" == claude-keys && "$(acl_of "$P/acme/openclaw/$OC/$f")" == "u:agent-oc:r u:claude:r " ]] \
+    && ok_t "T13 openclaw $f (a seed, not a backup): the openclaw seat on acme" || bad_t "T13 oc $f" "$(acl_of "$P/acme/openclaw/$OC/$f")"
+done
+[[ "$(_sp_file_group "$P/acme/grok/.grok/auth.json")" == claude-keys && -z "$(acl_of "$P/acme/grok/.grok/auth.json")" ]] \
+  && ok_t "T13 a 600 vendor login moves group and gains no reader" || bad_t "T13 grok 600" "$(acl_of "$P/acme/grok/.grok/auth.json")"
+[[ "$(_sp_file_group "$P/acme/claude/.claude.json")" == claude && -z "$(acl_of "$P/acme/claude/.claude.json")" ]] \
+  && ok_t "T13 the claude type's dir is not touched" || bad_t "T13 claude touched"
+[[ $rc -eq 0 && "$out" == *"file(s) moved"*"login reader(s) changed"* ]] && ok_t "T13 summary names the move" || bad_t "T13 summary" "rc=$rc $out"
+out=$(secrets_posture_reconcile --quiet "$REG" 2>&1)
+[[ -z "$out" ]] && ok_t "T13 second --quiet pass: nothing to say" || bad_t "T13 idempotent" "$out"
+seat_env cx_free codex acme                                  # the unbound seat is bound to acme
+out=$(secrets_posture_reconcile --quiet "$REG" 2>&1)
+[[ "$(acl_of "$P/codex/codex/auth.json")" == "u:agent-cx_canon:r u:claude:r " \
+   && "$(acl_of "$P/acme/codex/auth.json")" == "u:agent-cx_bound:r u:agent-cx_free:r u:claude:r " ]] \
+  && ok_t "T13 an unbound codex seat bound to acme: loses the canonical login, gains acme's, on the next tick" \
+  || bad_t "T13 rebind" "canon=$(acl_of "$P/codex/codex/auth.json") acme=$(acl_of "$P/acme/codex/auth.json")"
+seat_env cx_new codex
+link_agent_profile cx_new ""
+[[ "$(acl_of "$P/codex/codex/auth.json")" == "u:agent-cx_canon:r u:agent-cx_new:r u:claude:r " ]] \
+  && ok_t "T13 link_agent_profile for a new unbound codex seat grants the canonical login at once (first boot seeds)" \
+  || bad_t "T13 link unbound" "$(acl_of "$P/codex/codex/auth.json")"
+seat_env cx_new codex acme; cred "$P/acme/combined.env"
+link_agent_profile cx_new acme
+[[ "$(acl_of "$P/codex/codex/auth.json")" == "u:agent-cx_canon:r u:claude:r " && "$(acl_of "$P/acme/codex/auth.json")" == *u:agent-cx_new:r* ]] \
+  && ok_t "T13 link_agent_profile binding that seat to acme drops its canonical read at once and grants acme's" \
+  || bad_t "T13 link bind" "canon=$(acl_of "$P/codex/codex/auth.json") acme=$(acl_of "$P/acme/codex/auth.json")"
+# A re-login writes a fresh 0600 file in group claude (the setgid dir); the
+# normalizer that makes it 0640 must leave it closed, not open to every seat.
+source src/cmd_auth.sh
+f="$P/acme/codex/auth.json"; grep -v "^$f"$'\t' "$OS/acl" > "$OS/acl.tmp"; mv "$OS/acl.tmp" "$OS/acl"
+chmod 600 "$f"; printf '%s\tclaude\n' "$f" >> "$OS/fgroup"
+normalize_profile_seed_perms acme; rc=$?
+[[ $rc -eq 0 && "$(stat -c %a "$f")" == 640 && "$(_sp_file_group "$f")" == claude-keys \
+   && "$(acl_of "$f")" == "u:agent-cx_bound:r u:agent-cx_free:r u:agent-cx_new:r u:claude:r " ]] \
+  && ok_t "T13 normalize_profile_seed_perms after a re-login: 640, claude-keys, bound seats only" \
+  || bad_t "T13 normalize" "rc=$rc $(stat -c %a "$f") $(_sp_file_group "$f") $(acl_of "$f")"
+# Drift: every seed path is one 5dive-agent-start copies and, where cmd_auth
+# names a credential path for the type, that path is in the seed list.
+drift=""
+for t in $SP_CRED_TYPES; do
+  path=$(profile_type_auth_path acme "$t") && { grep -qxF "${path#"$P/acme/$t/"}" < <(_sp_cred_seeds "$t") || drift+=" $t:auth-path"; }
+  while IFS= read -r rel; do
+    grep -qF "${rel##*/}" 5dive-agent-start || drift+=" $t:$rel"
+  done < <(_sp_cred_seeds "$t")
+done
+[[ -z "$drift" ]] && ok_t "T13 the seed list matches profile_type_auth_path and 5dive-agent-start's seed blocks" || bad_t "T13 seed list drift" "$drift"
+rm -f "$ENV_DIR"/cx_*.env "$ENV_DIR"/cl_acme.env "$ENV_DIR"/hm.env "$ENV_DIR"/oc.env
+
 # --- T9: AS ROOT, real files, a real group, a real non-member uid -------------
 if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev/null; then
   suf=$$; WS="sp-ws-$suf"; KG="sp-keys-$suf"; REAL_GROUPS="$WS $KG"
@@ -328,6 +417,17 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
   chgrp "$WS" "$S" "$S/auth-profiles" "$S/auth-profiles/acct" "$S/agents.d"; chmod 2750 "$S" "$S/auth-profiles" "$S/auth-profiles/acct" "$S/agents.d"
   printf 'CLAUDE_CODE_OAUTH_TOKEN=login\n' > "$S/auth-profiles/acct/combined.env"; chgrp "$WS" "$S/auth-profiles/acct/combined.env"; chmod 640 "$S/auth-profiles/acct/combined.env"
   ln -s "$S/auth-profiles/acct/combined.env" "$S/agents.d/${BOUND#agent-}-auth.env"
+  # DIVE-5701: the same seat is a codex seat on acct; FREE is a codex seat on no
+  # account, which seeds from the canonical codex/codex/auth.json.
+  FREE="agent-spf$suf"; REAL_USERS="$BOUND $FREE"
+  useradd -r -M -N -g "$WS" -s /usr/sbin/nologin "$FREE" 2>/dev/null
+  printf 'AGENT_TYPE=codex\nAGENT_AUTH_PROFILE=acct\n' > "$S/agents.d/${BOUND#agent-}.env"
+  printf 'AGENT_TYPE=codex\n' > "$S/agents.d/${FREE#agent-}.env"
+  for a in acct codex; do
+    mkdir -p "$S/auth-profiles/$a/codex"; chgrp "$WS" "$S/auth-profiles/$a" "$S/auth-profiles/$a/codex"; chmod 2750 "$S/auth-profiles/$a" "$S/auth-profiles/$a/codex"
+    printf '{"auth_mode":"chatgpt","who":"%s"}\n' "$a" > "$S/auth-profiles/$a/codex/auth.json"
+    chgrp "$WS" "$S/auth-profiles/$a/codex/auth.json"; chmod 640 "$S/auth-profiles/$a/codex/auth.json"
+  done
   # FIVEDIVE_CONNECTOR_DIR, not CONNECTORS_DIR: header.sh derives CONNECTORS_DIR
   # from it, so a CONNECTORS_DIR passed in is overwritten and the reconcile walks
   # /etc/5dive/connectors instead (the first root-arms run did exactly that and
@@ -361,6 +461,40 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
     [[ "$out" == "CLAUDE_CODE_OAUTH_TOKEN=login" ]] && ok_t "T9 the seat bound to that login still reads it through its -auth.env link" || bad_t "T9 bound seat refused" "$out"
   else
     bad_t "T9 bound-seat arm could not run (useradd or setfacl missing)"
+  fi
+  # DIVE-5701, the row's acceptance shape: the codex login inside an account.
+  for a in acct codex; do
+    out=$(seat "cat '$S/auth-profiles/$a/codex/auth.json'")
+    [[ "$out" == *"Permission denied"* ]] && ok_t "T9 an unbound non-codex seat: cat $a/codex/auth.json refused" || bad_t "T9 $a codex login readable" "$out"
+  done
+  # The bound and the unbound codex seat seed through 5dive-agent-start's own
+  # codex block, run as their real uid with a plain read (no sudo).
+  CBLOCK=$(awk '/^  AGENT_CODEX_HOME="\$HOME\/.codex"$/ {on=1} /^  # Set <key> = true under \[features\]/ {exit} on' 5dive-agent-start)
+  CBLOCK=${CBLOCK//\/var\/lib\/5dive\/auth-profiles/$S/auth-profiles}
+  # The block's legacy fallback is /home/claude/.codex/auth.json, a symlink to
+  # the host's own canonical login: point it into the fixture, never the host.
+  CBLOCK=${CBLOCK//\/home\/claude\/.codex/$S/legacy-codex}
+  { printf 'cred_seed_ok() { echo SEED_OK; }; cred_seed_failed() { echo "SEED_FAILED $1"; }\n'
+    printf 'cred_src_readable() { [[ -r "$1" ]]; }; cred_seed_why() { echo why; }\n'
+    printf '%s\n' "$CBLOCK"
+    printf 'cat "$LOCAL_AUTH"\n'
+  } > "$TMP/codex-seed.sh"; chmod 644 "$TMP/codex-seed.sh"
+  seed_as() {   # seed_as <user> <PROFILE_STATE_DIR or empty>
+    local h="$TMP/home-$1"; install -d -m 700 -o "$1" -g "$WS" "$h"
+    HOME="$h" PROFILE_STATE_DIR="$2" setpriv --reuid="$(id -u "$1")" --regid="$wsgid" --clear-groups bash "$TMP/codex-seed.sh" 2>&1
+  }
+  if id -u "$BOUND" >/dev/null 2>&1 && id -u "$FREE" >/dev/null 2>&1 && command -v setfacl >/dev/null \
+     && [[ "$CBLOCK" == *SHARED_AUTH* && "$CBLOCK" != */home/claude/* && "$CBLOCK" != */var/lib/5dive/* ]]; then
+    out=$(seed_as "$BOUND" "$S/auth-profiles/acct/codex")
+    [[ "$out" == *SEED_OK*'"who":"acct"'* ]] && ok_t "T9 the codex seat bound to acct seeds its login through the real start block" || bad_t "T9 bound codex seed" "$out"
+    out=$(seed_as "$FREE" "")
+    [[ "$out" == *SEED_OK*'"who":"codex"'* ]] && ok_t "T9 an unbound codex seat seeds the canonical codex login (DIVE-1322)" || bad_t "T9 unbound codex seed" "$out"
+    out=$(setpriv --reuid="$(id -u "$FREE")" --regid="$wsgid" --clear-groups bash -c "cat '$S/auth-profiles/acct/codex/auth.json'" 2>&1)
+    [[ "$out" == *"Permission denied"* ]] && ok_t "T9 the unbound codex seat cannot read acct's codex login" || bad_t "T9 unbound reads acct" "$out"
+    out=$(setpriv --reuid="$(id -u "$BOUND")" --regid="$wsgid" --clear-groups bash -c "cat '$S/auth-profiles/codex/codex/auth.json'" 2>&1)
+    [[ "$out" == *"Permission denied"* ]] && ok_t "T9 the seat bound to acct cannot read the canonical codex login" || bad_t "T9 bound reads canonical" "$out"
+  else
+    bad_t "T9 codex seed arms could not run (useradd, setfacl or the codex block extract missing)" "${CBLOCK:0:120}"
   fi
   out=$(seat "sudo -n test -f /etc/passwd && echo ROOT")
   [[ "$out" != *ROOT* ]] && ok_t "T9 positive control: the seat uid has no root" || bad_t "T9 seat has root"
