@@ -11,8 +11,12 @@
 #   T1 negative control: an ordinary send still mirrors to BOTH rooms;
 #   T2 the fix: _5DIVE_SYSTEM_NOTICE=1 types the message into the pane and mirrors nothing;
 #   T3 --raw still mirrors nothing (the pre-existing gate, unchanged);
-#   T4 source pin: every task-side send in src/task/ carries the marker, so a new
-#      rail added without it goes red here rather than in a customer's group.
+#   T4 source pin: every task-side send in src/task/ AND src/cmd_heartbeat.sh carries
+#      the marker, so a new rail added without it goes red here rather than in a
+#      customer's group;
+#   T5 the shipped rebalance path: build.sh bundles cmd_heartbeat.sh, so rebalance.sh
+#      reaches the owner through _hb_escalate, not its own marked fallback. The REAL
+#      _hb_escalate, called as rebalance.sh calls it, must mirror nothing.
 # Boundaries only are stubbed (tmux, sudo, the idle probe, the two mirrors as
 # RECORDERS); cmd_send's mirror decision stays real.
 set -euo pipefail
@@ -118,11 +122,24 @@ is "T3: a raw send mirrors nothing"  "none" "$(mirrors)"
 # `5dive agent send "$x"` or `"$_GRADER_TASK_CLI" agent send "$x"` at statement
 # position, receiver a quoted variable (the prose mentions write `${x}` bare).
 # Every one must carry the marker on the same line.
-unmarked="$(grep -nE '(^ *|[(;&|] *|\$\( *)([A-Za-z0-9_]+=[^ ]+ +)*(cmd_send|5dive agent send|"\$_GRADER_TASK_CLI" agent send) "\$' src/task/*.sh \
+unmarked="$(grep -nE '(^ *|[(;&|] *|\$\( *)([A-Za-z0-9_]+=[^ ]+ +)*(cmd_send|5dive agent send|"\$_GRADER_TASK_CLI" agent send) "\$' src/task/*.sh src/cmd_heartbeat.sh \
   | grep -vE '^[^:]+:[0-9]+: *#' | grep -v '_5DIVE_SYSTEM_NOTICE=1' || true)"
-total="$(grep -cE '_5DIVE_SYSTEM_NOTICE=1 ([A-Za-z0-9_]+=[^ ]+ +)*(cmd_send|5dive agent send|"\$_GRADER_TASK_CLI" agent send) "\$' src/task/*.sh | awk -F: '{s+=$2} END{print s}')"
+total="$(grep -cE '_5DIVE_SYSTEM_NOTICE=1 ([A-Za-z0-9_]+=[^ ]+ +)*(cmd_send|5dive agent send|"\$_GRADER_TASK_CLI" agent send) "\$' src/task/*.sh src/cmd_heartbeat.sh | awk -F: '{s+=$2} END{print s}')"
 is "T4: no task-side send is left unmarked" "" "$unmarked"
-if (( total >= 15 )); then ok_t "T4: the pin sees the marked sends ($total)"; else bad_t "T4: the pin sees the marked sends" "only $total — the pattern stopped matching"; fi
+if (( total >= 33 )); then ok_t "T4: the pin sees the marked sends ($total)"; else bad_t "T4: the pin sees the marked sends" "only $total — the pattern stopped matching"; fi
+
+# --- T5: the real _hb_escalate, called exactly as rebalance.sh calls it --------
+# Extracted rather than sourcing all of cmd_heartbeat.sh (which defines the whole
+# tick); the function body is the shipped bytes. Its two collaborators are stubbed.
+_hb_log() { :; }
+_hb_alert_undeliverable() { printf 'UNDELIVERABLE %s\n' "$*" >>"$MIRRORED"; }
+eval "$(sed -n '/^_hb_escalate() {/,/^}/p' src/cmd_heartbeat.sh)"
+if declare -F _hb_escalate >/dev/null; then ok_t "T5: _hb_escalate extracted from src/cmd_heartbeat.sh"
+else bad_t "T5: _hb_escalate extracted from src/cmd_heartbeat.sh" "sed found no function body"; fi
+reset_arm
+_hb_escalate "rebalance" "task-engine" "rebalance" "🔀 Rebalanced un-started rows" "seat_b"
+is "T5: the escalation reaches the lead's pane" "yes"  "$(typed_has 'Rebalanced un-started rows')"
+is "T5: the escalation mirrors to NO room"      "none" "$(mirrors)"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
