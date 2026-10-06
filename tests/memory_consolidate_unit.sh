@@ -625,6 +625,66 @@ grep -q '^ssss-0000' "$SLEDGER" && ok "MUTANT: the own run is distilled" || bad 
 source "$SRC/cmd_memory.sh"
 export HOME="$OLDHOME"
 
+echo "── the default distiller leaves no transcript, and an older CLI still runs ──"
+# The skip above keeps the distiller's own transcripts out of the ledger; they
+# were still written, one per pass, ~140 KB each. --no-session-persistence keeps
+# them off the disk (real CLI 2.1.289: one .jsonl without it, none with it). A
+# CLI that predates the flag refuses the whole command line, so the flag is
+# probed from --help and the OLD stub below refuses it the way the real one does.
+OLDHOME="$HOME"; export HOME="$TMP/nopersist"
+NPROJ="$HOME/.claude/projects/proj"; NLEDGER="$NPROJ/memory/.consolidated.tsv"
+mkdir -p "$NPROJ/memory"; : > "$NPROJ/memory/MEMORY.md"
+mk_transcript "$NPROJ/nnnn-1111.jsonl" "a finished session" "Recorded."
+touch -d '2 hours ago' "$NPROJ/nnnn-1111.jsonl"
+NEWBIN="$TMP/newbin"; OLDBIN="$TMP/oldbin"; mkdir -p "$NEWBIN" "$OLDBIN"; NARGV="$TMP/nopersist.argv"
+for v in new old; do
+  if [ "$v" = new ]; then b="$NEWBIN"; help='  --no-session-persistence  Disable session persistence'; else b="$OLDBIN"; help='  --print  Print response and exit'; fi
+  cat > "$b/claude" <<EOF
+#!/usr/bin/env bash
+[ "\$1" = --help ] && { echo '$help'; exit 0; }
+cat >/dev/null
+printf '%s\n' "\$@" > "$NARGV"
+[ "$v" = old ] && for a in "\$@"; do [ "\$a" = --no-session-persistence ] && { echo "error: unknown option '\$a'" >&2; exit 1; }; done
+echo '{"atoms":[]}'
+EOF
+  chmod +x "$b/claude"
+done
+np_run() { ( unset FIVEDIVE_MEMORY_DISTILLER; PATH="$1:$PATH"; shift; _memory_consolidate "$@" ) ; }
+rm -f "$NARGV" "$NLEDGER"
+np_run "$NEWBIN" --max-sessions=1 >/dev/null 2>&1
+check "new CLI: the pass exits clean" "$?" "0"
+grep -qx -- '--no-session-persistence' "$NARGV" 2>/dev/null && ok "new CLI: the distiller passes --no-session-persistence" || bad "new CLI: the distiller passes --no-session-persistence"
+grep -qx -- '--strict-mcp-config' "$NARGV" 2>/dev/null && ok "new CLI: --strict-mcp-config is kept" || bad "new CLI: --strict-mcp-config is kept"
+check "new CLI: the session is ledgered" "$(grep -c '^nnnn-1111' "$NLEDGER" 2>/dev/null)" "1"
+rm -f "$NARGV" "$NLEDGER"
+np_run "$OLDBIN" --max-sessions=1 >/dev/null 2>&1
+check "old CLI: the pass exits clean" "$?" "0"
+grep -qx -- '--no-session-persistence' "$NARGV" 2>/dev/null && bad "old CLI: the unknown flag is not sent" || ok "old CLI: the unknown flag is not sent"
+check "old CLI: the session is still distilled and ledgered" "$(grep -c '^nnnn-1111' "$NLEDGER" 2>/dev/null)" "1"
+
+echo "── MUTANT: no flag at all, the new CLI leaves its transcript ──"
+check "BEFORE: the live function appends the flag" "$(declare -f _memory_consolidate | grep -c 'distiller+=" --no-session-persistence"')" "1"
+eval "$(declare -f _memory_consolidate | sed 's/distiller+=" --no-session-persistence"/:/')"
+check "AFTER: the mutation took" "$(declare -f _memory_consolidate | grep -c 'distiller+=" --no-session-persistence"')" "0"
+rm -f "$NARGV" "$NLEDGER"
+np_run "$NEWBIN" --max-sessions=1 >/dev/null 2>&1
+[ -s "$NARGV" ] && ok "MUTANT: the stub still ran" || bad "MUTANT: the stub still ran"
+grep -qx -- '--no-session-persistence' "$NARGV" 2>/dev/null && bad "MUTANT: the missing flag is caught" || ok "MUTANT: the missing flag is caught"
+# shellcheck source=/dev/null
+source "$SRC/cmd_memory.sh"
+
+echo "── MUTANT: the flag unprobed, an older CLI fails every pass ──"
+check "BEFORE: the live function probes --help" "$(declare -f _memory_consolidate | grep -c -- '--help < /dev/null')" "1"
+eval "$(declare -f _memory_consolidate | sed "s/if grep -qF -- '--no-session-persistence' <<< [^;]*;/if true;/")"
+check "AFTER: the mutation took" "$(declare -f _memory_consolidate | grep -c 'if true; then')" "1"
+rm -f "$NARGV" "$NLEDGER"
+np_run "$OLDBIN" --max-sessions=1 >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "MUTANT: the old-CLI pass fails" || bad "MUTANT: the old-CLI pass fails"
+[ -s "$NLEDGER" ] && bad "MUTANT: nothing is ledgered on the old CLI" || ok "MUTANT: nothing is ledgered on the old CLI"
+# shellcheck source=/dev/null
+source "$SRC/cmd_memory.sh"
+export HOME="$OLDHOME"
+
 echo "── validation ──"
 run --distiller="$EMPTY" --max-sessions=x >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--max-sessions must be numeric" || bad "--max-sessions must be numeric"
 run --distiller="$EMPTY" --idle-min=-1 >/dev/null 2>&1; [ "$?" -ne 0 ] && ok "--idle-min must be numeric" || bad "--idle-min must be numeric"
