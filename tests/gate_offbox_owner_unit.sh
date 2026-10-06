@@ -14,7 +14,8 @@
 #      ZERO times, the gate stays open and lists under task ls --gated;
 #   2. an answer through the restricted command path closes it and wakes the filer;
 #   3. NEGATIVE: the same gate with the setting OFF calls the notifier once;
-#   4. a secret gate with the setting ON still calls the notifier once;
+#   4. a tier-1 secret gate and a tier-1 manual gate with the setting ON still
+#      call the notifier once (only the TYPE clause keeps them unheld);
 #   5. a tier-2 approval with the setting ON still calls it once (an agent answer
 #      is refused on tier 2, so holding it would leave it answerable by nobody);
 #   6. the heartbeat re-nag selects a held gate only while the setting is OFF.
@@ -139,13 +140,30 @@ cmd_task_need DIVE-9502 --type=approval --ask="Run the launch post on the forum 
   && ok_t "3: provenance stays human:* when nothing is held" || fail_t "3: provenance=$(col DIVE-9502 route_provenance)"
 
 # ── 4. A SECRET GATE WITH THE SETTING ON still reaches the human ────────────
+# TIER 1 on purpose (quinn, iteration 1): a default secret is tier 2, so the
+# tier clause alone would keep it unheld and this arm would never grade the TYPE
+# clause. A self-minted secret defaults to tier 1, so only the type clause stops
+# it being held, and an agent cannot answer a secret, so held = stranded.
 cmd_task_routing offbox marketing >/dev/null 2>&1
 mkrow DIVE-9503
-out=$(cmd_task_need DIVE-9503 --type=secret --secret-key=FORUM_TOKEN --connector=forum --ask="Paste the forum API token" --from=head 2>&1)
+out=$(cmd_task_need DIVE-9503 --type=secret --self-minted --secret-key=FORUM_TOKEN --connector=forum --ask="Paste the forum API token" --from=head 2>&1)
 [[ -n "$(col DIVE-9503 need_type)" ]] || fail_t "4 precondition: the secret gate did not file: ${out:0:400}"
+[[ "$(col DIVE-9503 tier)" == "1" ]] \
+  && ok_t "4 precondition: the self-minted secret is TIER 1 (only the type clause can keep it unheld)" \
+  || fail_t "4 drifted: secret tier=$(col DIVE-9503 tier), expected 1"
 [[ "$(calls DIVE-9503)" == "1" ]] \
-  && ok_t "4: a secret gate with the setting ON still calls the notifier once" \
+  && ok_t "4: a tier-1 secret gate with the setting ON still calls the notifier once" \
   || fail_t "4: notifier called $(calls DIVE-9503) time(s), expected 1"
+
+# ── 4b. A TIER-1 MANUAL GATE WITH THE SETTING ON still reaches the human ────
+mkrow DIVE-9506
+out=$(cmd_task_need DIVE-9506 --type=manual --tier=1 --ask="Log the box browser into the forum account" --from=head 2>&1)
+[[ "$(col DIVE-9506 tier)" == "1" ]] \
+  && ok_t "4b precondition: the manual gate is TIER 1" \
+  || fail_t "4b drifted: manual tier=$(col DIVE-9506 tier), expected 1: ${out:0:300}"
+[[ "$(calls DIVE-9506)" == "1" ]] \
+  && ok_t "4b: a tier-1 manual gate with the setting ON still calls the notifier once" \
+  || fail_t "4b: notifier called $(calls DIVE-9506) time(s), expected 1"
 
 # ── 5. A TIER-2 APPROVAL WITH THE SETTING ON still reaches the human ────────
 mkrow DIVE-9504
