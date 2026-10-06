@@ -87,6 +87,14 @@ mark_reported() { : > "$FIVE_REPORTED_FLAG" 2>/dev/null || true; }
 declare -a _FIVE_EXIT_STACK=()
 push_exit_handler() { _FIVE_EXIT_STACK+=("$1"); }
 
+# DIVE-5644: the merge-gate's per-process crumb files (src/task/gate_evidence.sh)
+# are keyed by `$$` and were never removed — 46k piled up in /tmp on one host, and
+# a later process that drew a recycled pid read another seat's leftover trace.
+# Registered HERE, once, rather than where the files are written: every writer
+# runs inside `$( )`, so a registration there would die with the subshell. The
+# paths depend only on `$$`, which is the top-level pid inside `$( )` too.
+push_exit_handler 'rm -f "${TMPDIR:-/tmp}/.5dive-gate-tok-trace.$$" "${TMPDIR:-/tmp}/.5dive-anon-outcome.$$" 2>/dev/null'
+
 # Drained into a local copy and cleared BEFORE anything runs, so a handler that
 # exits (or a second trip through the trap) cannot re-run the chain. The local
 # declaration is also what keeps `${#…[@]}` resolvable inside this function —
