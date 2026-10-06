@@ -28,6 +28,9 @@
 #     type on that account, plus every unbound codex seat for the canonical
 #     codex account; a backup beside a login has no seat reader; a rebind moves
 #     the read; the seed list matches 5dive-agent-start (T13, T9 as root)
+#   * DIVE-5714: the same for the default (no-account) logins in /home/claude
+#     (.hermes/auth.json, config.yaml, ...): read by the seats of that type on
+#     no account; a non-seed file and the codex symlink are left alone (T14, T9)
 #   * AS ROOT ONLY (CI: the root-arms job, SP_REQUIRE_ROOT_ARM=1 makes a skip
 #     a failure): the same reconcile on real files and a real group, and a
 #     real non-member uid in the workspace group is refused every key and still
@@ -76,6 +79,8 @@ C="$TMP/connectors"; mkdir -p "$C"
 # Account logins live under $TMP too, so no arm ever globs the box's own.
 AUTH_PROFILES_DIR="$TMP/auth-profiles" ENV_DIR="$TMP/agents.d"; mkdir -p "$AUTH_PROFILES_DIR" "$ENV_DIR"
 export CONNECTORS_DIR="$C" FIVEDIVE_CONNECTORD_ENV="$TMP/connectord.env"
+# The default (no-account) vendor logins live in /home/claude on a box: a fixture here.
+export FIVEDIVE_DEFAULT_CRED_HOME="$TMP/home-claude"
 printf 'claude\nagent-seat_a\nagent-seat_b\nagent-x\n' > "$OS/users"
 : > "$OS/acl"
 for n in anthropic.env openrouter.env telegram-seat_a.env telegram-seat_b.env tools.sh; do
@@ -401,6 +406,59 @@ done
 [[ -z "$drift" ]] && ok_t "T13 the seed list matches profile_type_auth_path and 5dive-agent-start's seed blocks" || bad_t "T13 seed list drift" "$drift"
 rm -f "$ENV_DIR"/cx_*.env "$ENV_DIR"/cl_acme.env "$ENV_DIR"/hm.env "$ENV_DIR"/oc.env
 
+# --- T14: the default (no-account) vendor logins (DIVE-5714) ----------------
+# /home/claude/.hermes/auth.json and config.yaml are read by the hermes seats on
+# no account and nobody else. A file in that home that is not a seed is left
+# alone; the codex default is a symlink to the canonical account and is never
+# followed.
+H="$FIVEDIVE_DEFAULT_CRED_HOME"
+printf 'agent-hm_free\nagent-hm_acme\nagent-cx_free2\nagent-hm_new\n' >> "$OS/users"
+cred "$H/.hermes/auth.json"; cred "$H/.hermes/config.yaml"; cred "$H/.hermes/auth.json.bak-20260101T000000Z"
+cred "$H/.hermes/.env" 600; cred "$H/.hermes/memories/notes.md"
+cred "$H/.grok/auth.json"
+mkdir -p "$H/.codex"; ln -s "$P/codex/codex/auth.json" "$H/.codex/auth.json"
+seat_env hm_free hermes; seat_env hm_acme hermes acme; seat_env cx_free2 codex
+canon_before=$(acl_of "$P/codex/codex/auth.json")
+out=$(secrets_posture_reconcile --quiet "$REG" 2>&1); rc=$?
+for f in .hermes/auth.json .hermes/config.yaml; do
+  [[ "$(_sp_file_group "$H/$f")" == claude-keys && "$(acl_of "$H/$f")" == "u:agent-hm_free:r u:claude:r " ]] \
+    && ok_t "T14 /home/claude/$f: claude-keys, read by the hermes seat on no account + claude only" \
+    || bad_t "T14 $f" "$(_sp_file_group "$H/$f") $(acl_of "$H/$f")"
+done
+b="$H/.hermes/auth.json.bak-20260101T000000Z"
+[[ "$(_sp_file_group "$b")" == claude-keys && "$(acl_of "$b")" == "u:claude:r " ]] \
+  && ok_t "T14 a backup beside the default login: claude-keys, no seat reader" || bad_t "T14 backup" "$(_sp_file_group "$b") $(acl_of "$b")"
+[[ "$(_sp_file_group "$H/.hermes/.env")" == claude && -z "$(acl_of "$H/.hermes/.env")" \
+   && "$(_sp_file_group "$H/.hermes/memories/notes.md")" == claude ]] \
+  && ok_t "T14 files in the home that are not seeds are left alone" || bad_t "T14 non-seed touched"
+[[ "$(acl_of "$H/.grok/auth.json")" == "u:claude:r " ]] \
+  && ok_t "T14 the default grok login: no seat reader when no grok seat is on no account" || bad_t "T14 grok" "$(acl_of "$H/.grok/auth.json")"
+[[ -z "$(_sp_file_group "$H/.codex/auth.json")" && -z "$(acl_of "$H/.codex/auth.json")" \
+   && "$(acl_of "$P/codex/codex/auth.json")" == *u:agent-cx_free2:r* ]] \
+  && ok_t "T14 the codex default symlink is not followed; the canonical login it points at keeps its own readers" \
+  || bad_t "T14 codex symlink" "link=$(acl_of "$H/.codex/auth.json") canon=$(acl_of "$P/codex/codex/auth.json") before=$canon_before"
+[[ $rc -eq 0 && "$out" == *"file(s) moved"* ]] && ok_t "T14 summary names the move" || bad_t "T14 summary" "rc=$rc $out"
+out=$(secrets_posture_reconcile --quiet "$REG" 2>&1)
+[[ -z "$out" ]] && ok_t "T14 second --quiet pass: nothing to say" || bad_t "T14 idempotent" "$out"
+seat_env hm_free hermes acme
+out=$(secrets_posture_reconcile --quiet "$REG" 2>&1)
+[[ "$(acl_of "$H/.hermes/auth.json")" == "u:claude:r " ]] \
+  && ok_t "T14 the hermes seat bound to an account loses the default login on the next tick" || bad_t "T14 rebind" "$(acl_of "$H/.hermes/auth.json")"
+seat_env hm_new hermes
+link_agent_profile hm_new ""
+[[ "$(acl_of "$H/.hermes/auth.json")" == "u:agent-hm_new:r u:claude:r " ]] \
+  && ok_t "T14 link_agent_profile for a new hermes seat on no account grants the default login at once" || bad_t "T14 link" "$(acl_of "$H/.hermes/auth.json")"
+# Drift: each default sentinel cmd_auth names (TYPE_AUTH) is a seed under the
+# default dir, so the posture covers the file the box treats as the login.
+drift=""
+for t in $SP_CRED_TYPES; do
+  [[ -n "${TYPE_AUTH[$t]:-}" ]] || { drift+=" $t:no-TYPE_AUTH"; continue; }
+  sent="${TYPE_AUTH[$t]/#\/home\/claude/$H}"
+  grep -qxF "$sent" < <(_sp_cred_seeds "$t" | sed "s#^#$(_sp_default_cred_dir "$t")/#") || drift+=" $t:${TYPE_AUTH[$t]}"
+done
+[[ -z "$drift" ]] && ok_t "T14 every default login TYPE_AUTH names is in the default seed list" || bad_t "T14 default drift" "$drift"
+rm -f "$ENV_DIR"/hm_*.env "$ENV_DIR"/cx_free2.env "$ENV_DIR"/hm_new-auth.env
+
 # --- T9: AS ROOT, real files, a real group, a real non-member uid -------------
 if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev/null; then
   suf=$$; WS="sp-ws-$suf"; KG="sp-keys-$suf"; REAL_GROUPS="$WS $KG"
@@ -419,8 +477,15 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
   ln -s "$S/auth-profiles/acct/combined.env" "$S/agents.d/${BOUND#agent-}-auth.env"
   # DIVE-5701: the same seat is a codex seat on acct; FREE is a codex seat on no
   # account, which seeds from the canonical codex/codex/auth.json.
-  FREE="agent-spf$suf"; REAL_USERS="$BOUND $FREE"
+  FREE="agent-spf$suf"; HERM="agent-sph$suf"; REAL_USERS="$BOUND $FREE $HERM"
   useradd -r -M -N -g "$WS" -s /usr/sbin/nologin "$FREE" 2>/dev/null
+  # DIVE-5714: HERM is a hermes seat on no account; it seeds /home/claude/.hermes.
+  useradd -r -M -N -g "$WS" -s /usr/sbin/nologin "$HERM" 2>/dev/null
+  printf 'AGENT_TYPE=hermes\n' > "$S/agents.d/${HERM#agent-}.env"
+  HC="$R/home-claude"; mkdir -p "$HC/.hermes"; chgrp "$WS" "$HC" "$HC/.hermes"; chmod 750 "$HC"; chmod 2775 "$HC/.hermes"
+  for n in auth.json config.yaml; do
+    printf 'HERMES=%s\n' "$n" > "$HC/.hermes/$n"; chgrp "$WS" "$HC/.hermes/$n"; chmod 640 "$HC/.hermes/$n"
+  done
   printf 'AGENT_TYPE=codex\nAGENT_AUTH_PROFILE=acct\n' > "$S/agents.d/${BOUND#agent-}.env"
   printf 'AGENT_TYPE=codex\n' > "$S/agents.d/${FREE#agent-}.env"
   for a in acct codex; do
@@ -434,8 +499,9 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
   # read as three keys left readable). The guard refuses to reconcile unless every
   # path it would walk is inside this fixture, so T9 can never touch a real box.
   out=$(STATE_DIR="$S" AGENT_SHARED_GROUP="$WS" FIVEDIVE_SECRETS_GROUP="$KG" FIVEDIVE_CONNECTOR_DIR="$R/connectors" FIVEDIVE_CONNECTORD_ENV="$R/connectord.env" \
+    FIVEDIVE_DEFAULT_CRED_HOME="$HC" \
     bash -c 'source src/header.sh; source src/lib/error_codes.sh; source src/lib/output.sh; source src/lib/validation.sh
-             for p in "$(_sp_connectors_dir)" "$(_sp_connectord_env)" "$(_sp_profiles_dir)"; do
+             for p in "$(_sp_connectors_dir)" "$(_sp_connectord_env)" "$(_sp_profiles_dir)" "$(_sp_env_dir)" "$(_sp_default_home)"; do
                [[ "$p" == "$1"/* ]] || { echo "OUTSIDE-FIXTURE $p"; exit 3; }
              done
              secrets_posture_reconcile "{\"agents\":{}}" >/dev/null 2>&1; echo "RECONCILED rc=$?"' fixture "$R" 2>&1)
@@ -496,6 +562,17 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
   else
     bad_t "T9 codex seed arms could not run (useradd, setfacl or the codex block extract missing)" "${CBLOCK:0:120}"
   fi
+  # DIVE-5714: the default hermes login.
+  for n in auth.json config.yaml; do
+    out=$(seat "cat '$HC/.hermes/$n'")
+    [[ "$out" == *"Permission denied"* ]] && ok_t "T9 a seat that is not a hermes seat on no account: cat default .hermes/$n refused" || bad_t "T9 default hermes $n readable" "$out"
+    if id -u "$HERM" >/dev/null 2>&1; then
+      out=$(setpriv --reuid="$(id -u "$HERM")" --regid="$wsgid" --clear-groups bash -c "cat '$HC/.hermes/$n'" 2>&1)
+      [[ "$out" == "HERMES=$n" ]] && ok_t "T9 the hermes seat on no account still reads default .hermes/$n (its seed source)" || bad_t "T9 hermes seat refused $n" "$out"
+    else
+      bad_t "T9 hermes seat arm could not run (useradd)"
+    fi
+  done
   out=$(seat "sudo -n test -f /etc/passwd && echo ROOT")
   [[ "$out" != *ROOT* ]] && ok_t "T9 positive control: the seat uid has no root" || bad_t "T9 seat has root"
 elif [[ "${SP_REQUIRE_ROOT_ARM:-}" == 1 ]]; then
