@@ -598,5 +598,3 @@ Want a scoped first thing to build? The control plane on top of the runtime is e
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-Listed on [Open Source Alternatives](https://www.opensourcealternatives.to/).
