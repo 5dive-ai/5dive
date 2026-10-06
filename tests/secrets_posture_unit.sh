@@ -307,9 +307,23 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
   chgrp "$WS" "$S" "$S/auth-profiles" "$S/auth-profiles/acct" "$S/agents.d"; chmod 2750 "$S" "$S/auth-profiles" "$S/auth-profiles/acct" "$S/agents.d"
   printf 'CLAUDE_CODE_OAUTH_TOKEN=login\n' > "$S/auth-profiles/acct/combined.env"; chgrp "$WS" "$S/auth-profiles/acct/combined.env"; chmod 640 "$S/auth-profiles/acct/combined.env"
   ln -s "$S/auth-profiles/acct/combined.env" "$S/agents.d/${BOUND#agent-}-auth.env"
-  STATE_DIR="$S" AGENT_SHARED_GROUP="$WS" FIVEDIVE_SECRETS_GROUP="$KG" CONNECTORS_DIR="$R/connectors" FIVEDIVE_CONNECTORD_ENV="$R/connectord.env" \
+  # FIVEDIVE_CONNECTOR_DIR, not CONNECTORS_DIR: header.sh derives CONNECTORS_DIR
+  # from it, so a CONNECTORS_DIR passed in is overwritten and the reconcile walks
+  # /etc/5dive/connectors instead (the first root-arms run did exactly that and
+  # read as three keys left readable). The guard refuses to reconcile unless every
+  # path it would walk is inside this fixture, so T9 can never touch a real box.
+  out=$(STATE_DIR="$S" AGENT_SHARED_GROUP="$WS" FIVEDIVE_SECRETS_GROUP="$KG" FIVEDIVE_CONNECTOR_DIR="$R/connectors" FIVEDIVE_CONNECTORD_ENV="$R/connectord.env" \
     bash -c 'source src/header.sh; source src/lib/error_codes.sh; source src/lib/output.sh; source src/lib/validation.sh
-             secrets_posture_reconcile "{\"agents\":{}}"' >/dev/null 2>&1
+             for p in "$(_sp_connectors_dir)" "$(_sp_connectord_env)" "$(_sp_profiles_dir)"; do
+               [[ "$p" == "$1"/* ]] || { echo "OUTSIDE-FIXTURE $p"; exit 3; }
+             done
+             secrets_posture_reconcile "{\"agents\":{}}" >/dev/null 2>&1; echo "RECONCILED rc=$?"' fixture "$R" 2>&1)
+  [[ "$out" == "RECONCILED rc=0" ]] && ok_t "T9 the reconcile ran on the fixture's own paths, rc 0" || bad_t "T9 reconcile did not run on the fixture" "$out"
+  moved=""
+  for f in connectors/anthropic.env connectors/openrouter.env connectors/telegram-seat_a.env connectord.env; do
+    [[ "$(stat -c %G "$R/$f")" == "$KG" ]] || moved+=" $f:$(stat -c %G "$R/$f")"
+  done
+  [[ -z "$moved" ]] && ok_t "T9 every key file is in $KG on disk" || bad_t "T9 key files not moved" "$moved"
   seat() { setpriv --reuid=65534 --regid="$wsgid" --clear-groups bash -c "$1" 2>&1; }
   for f in connectors/anthropic.env connectors/openrouter.env connectors/telegram-seat_a.env connectord.env; do
     out=$(seat "cat '$R/$f'")

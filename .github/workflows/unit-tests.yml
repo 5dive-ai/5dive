@@ -603,12 +603,15 @@ jobs:
         run: ./build.sh
       - name: secrets_posture_unit as root, T9 required (DIVE-5690)
         run: |
+          # The default run shell is bash -e WITHOUT pipefail, so a harness failure
+          # before `| tee` would not fail this step on its own.
+          set -o pipefail
           command -v setfacl >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq acl; }
           sudo -E env SP_REQUIRE_ROOT_ARM=1 bash tests/secrets_posture_unit.sh | tee root-arms.txt
           if grep -q '^skip - T9' root-arms.txt; then echo "T9 was skipped under root"; exit 1; fi
           n=$(grep -c '^ok   - T9' root-arms.txt) || n=0
           echo "T9 ok lines: $n"
-          test "$n" -ge 9
+          test "$n" -ge 11
 
   rails-pristine:
     runs-on: ubuntu-latest
