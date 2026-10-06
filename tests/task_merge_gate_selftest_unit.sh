@@ -237,5 +237,37 @@ out=$(JSON_MODE=1 GH_TOKEN="tok" GH_STUB_STATE="MERGED" cmd_task_merge_gate_self
   || bad_t "T10c passing path" "rc=$rc out=$out"
 JSON_MODE=0
 
+# T11 (DIVE-5644): the per-process crumb files die WITH the process. They are keyed
+# by `$$` and nothing removed them — 46k sat in /tmp on one host, and a later process
+# that drew a recycled pid read another seat's trace. A CHILD process is the only
+# honest fixture: the cleanup is the product's EXIT trap, so it must actually exit.
+# The child also proves the cleanup does NOT fire when a `$( )` subshell exits —
+# the trace is written inside one and must still be readable by the parent.
+T11D="$TMP/t11tmp"; mkdir -p "$T11D"
+t11=$(TMPDIR="$T11D" GH_TOKEN="t11-tok" SRC="$SRC" bash -c '
+  set +e
+  for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
+           lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
+           lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_push.sh cmd_task.sh; do
+    source "$SRC/$f"
+  done
+  trap on_exit_audit EXIT
+  _t=$(_gate_gh_token)
+  printf "%s\n" "ratelimit|0" >"$_GATE_ANON_STATEF"
+  printf "PID=%s\n" "$$"
+  printf "WHY=%s\n" "$(_gate_tok_why)"
+  ls -A "$TMPDIR" | sed "s/^/LIVE=/"
+  exit 0' 2>&1)
+t11_pid=$(sed -n 's/^PID=//p' <<<"$t11")
+{ grep -q '^WHY=.*\[1 env.*RESOLVED' <<<"$t11" \
+  && grep -qx "LIVE=.5dive-gate-tok-trace.$t11_pid" <<<"$t11" \
+  && grep -qx "LIVE=.5dive-anon-outcome.$t11_pid" <<<"$t11"; } \
+  && ok_t "T11a control: both crumb files exist while the process runs, and the trace survives the \$( ) it was written in" \
+  || bad_t "T11a staging" "$t11"
+left=$(ls -A "$T11D")
+[[ -z "$left" ]] \
+  && ok_t "T11b both crumb files are removed when the process exits" \
+  || bad_t "T11b crumb files outlived their process" "left: $left"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
