@@ -2672,6 +2672,18 @@ _task_gate_still_live() {
 # unchanged pre-DIVE-4154 deliverer, either now or once the window closes.
 _task_need_notify_deliver() {
   local ident="$1"
+  # DIVE-5648: an off-box gate owner holds this ping (see _GATE_OFFBOX_HELD_SQL).
+  # Checked HERE, the one human-path deliverer, so filing, gate-escalate and the
+  # /inbox re-send all honour it; the routed path never reaches this function.
+  # The hold row keeps the delivery assertion quiet and is the audit witness.
+  TASK_GATE_OFFBOX_HELD=""
+  local _offbox
+  if _offbox=$(_gate_offbox_held "$ident"); then
+    TASK_GATE_OFFBOX_HELD="$_offbox"
+    _task_gate_delivery_log ok "$ident" "hold:offbox:${_offbox}" "" \
+      "phone ping HELD (DIVE-5648): this box's approval/decision gates below tier 2 belong to off-box gate owner '${_offbox}', who reads task ls --gated here and answers through its own command path. NOBODY was paged; turn it off with: 5dive task routing offbox off"
+    return 0
+  fi
   local _secs; _secs=$(_task_gate_undo_window_secs "$ident")
   if (( _secs <= 0 )); then
     _task_need_notify_deliver_now "$@"

@@ -3942,6 +3942,47 @@ _gate_human_class() { case "${1:-}" in approval|secret|manual|access) return 0 ;
 # SQL form of the same list, for the sweep predicates. Keep in lockstep above.
 _GATE_HUMAN_CLASS_SQL="('approval','secret','manual','access')"
 
+# ── DIVE-5648: an OFF-BOX gate owner holds the phone ping ─────────────────────
+# A box whose org root is managed from ANOTHER box (the distribution team on
+# chill-gorge, managed by `marketing` on poke-two) cannot route a gate to that
+# manager: a reviewer has to be a heartbeat-enrolled seat on this box
+# (community/wiki/a-gate-cannot-route-to-a-seat-on-another-box.md), so every gate
+# the root files falls to the human path and rings the founder's phone for a call
+# the manager owns. The manager already reads `task ls --gated` here and answers
+# through its restricted SSH command, so the fix is not a route — it is NOT
+# RINGING the phone for the gates that manager can answer.
+#
+# The box-level pref `gate_offbox_owner` names that seat (`5dive task routing
+# offbox <seat>`). With it set, an approval or decision gate below tier 2 is HELD:
+# it stays open and listed, no human ping at filing, no re-nag, no stale reminder.
+#
+# TIER 2 IS NOT HELD, and that is the rule that keeps the hold from swallowing a
+# gate. cmd_task_answer refuses a non-human answer on any tier-2 gate ("only a
+# human can clear it") — measured on chill-gorge DIVE-42 through the marketing
+# gate — so holding a tier-2 gate off the phone leaves it answerable by nobody.
+# secret and manual are not held at all: they are things only a person can do.
+#
+# ONE predicate, as SQL, so the filing-time hold and the heartbeat sweeps cannot
+# disagree on which gates are held: the bash form below evaluates this same
+# fragment against the row. It reads the pref LIVE, so turning the setting off
+# hands every open held gate back to the normal re-nag on the next sweep.
+_GATE_OFFBOX_HELD_SQL="(need_type IN ('approval','decision')
+      AND CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) < 2
+      AND EXISTS (SELECT 1 FROM task_prefs
+                   WHERE key='gate_offbox_owner' AND trim(COALESCE(value,''))<>''))"
+_gate_offbox_owner() {
+  local v; v=$(_task_pref_get gate_offbox_owner 2>/dev/null) || v=""
+  printf '%s' "${v//[[:space:]]/}"
+}
+# Prints the off-box owner and returns 0 when this gate's phone ping is held.
+_gate_offbox_held() { # <ident>
+  local o n; o=$(_gate_offbox_owner)
+  [[ -n "$o" && -n "${1:-}" ]] || return 1
+  n=$(db "SELECT COUNT(*) FROM tasks WHERE ident=$(sqlq "$1") AND ${_GATE_OFFBOX_HELD_SQL};" 2>/dev/null) || n=""
+  [[ "$n" == "1" ]] || return 1
+  printf '%s' "$o"
+}
+
 # ── DIVE-916: per-gate HUMAN nonce (close the sudo->--human forge) ────────────
 # Distinct from the DIVE-519 --proof token: that is a box-wide, TTL'd, HMAC proof
 # any trusted path can mint; this is a per-GATE secret bound to one task row. Its
