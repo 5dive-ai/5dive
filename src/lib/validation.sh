@@ -280,7 +280,7 @@ _write_connector() {
   local path="${CONNECTORS_DIR}/${fname}"
   cat > "$path"
   chmod 640 "$path"
-  chown root "$path"
+  chown root "$path" 2>/dev/null || true   # refused to a non-root caller; the root reconcile re-tightens
   secret_file_secure "$path"
 }
 
@@ -619,7 +619,15 @@ secret_file_secure() {
     _sp_chmod o-rwx "$f" || return 1
     return 0
   fi
-  _sp_chgrp "$g" "$f" || return 1
+  # A non-root writer can only hand a file to a group it is in, so on a box with
+  # the group (an installed-host test leg, a seat writing its own file) chgrp is
+  # refused. That must not fail the write either: the file keeps the writer's
+  # group, loses its world bits, and the root heartbeat reconcile moves it on
+  # its next tick. The ACLs below need the owner or root, so they wait too.
+  if ! _sp_chgrp "$g" "$f" 2>/dev/null; then
+    _sp_chmod o-rwx "$f" || return 1
+    return 0
+  fi
   _sp_chmod o-rwx "$f" || return 1
   [[ "$g" != "$(_sp_shared_group)" ]] || return 0
   # The ACLs only keep a read that group claude HAD. A 600 root:claude file

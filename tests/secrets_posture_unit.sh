@@ -58,7 +58,10 @@ _sp_member_add()   { printf '%s\n' "$1" >> "$OS/groups/$2"; }
 _sp_member_del()   { grep -vxF "$1" "$OS/groups/$2" > "$OS/tmp"; mv "$OS/tmp" "$OS/groups/$2"; }
 _sp_user_exists()  { grep -qxF "$1" "$OS/users"; }
 _sp_file_group()   { awk -F'\t' -v f="$1" '$1==f {g=$2} END {print g}' "$OS/fgroup"; }
-_sp_chgrp()        { printf '%s\t%s\n' "$2" "$1" >> "$OS/fgroup"; }
+_sp_chgrp()        {
+  # FAKE_CHGRP_REFUSED: what a non-root caller outside the group gets from chgrp.
+  [[ -z "${FAKE_CHGRP_REFUSED:-}" ]] || { echo "chgrp: changing group of '$2': Operation not permitted" >&2; return 1; }
+  printf '%s\t%s\n' "$2" "$1" >> "$OS/fgroup"; }
 _sp_setfacl()      { printf '%s\t%s\n' "$2" "$1" >> "$OS/acl"; }
 _sp_unsetfacl()    { awk -F'\t' -v f="$2" -v e="$1:" '!($1==f && index($2, e)==1)' "$OS/acl" > "$OS/acl.tmp"; mv "$OS/acl.tmp" "$OS/acl"; }
 _sp_acl_users()    { awk -F'\t' -v f="$1" '$1==f {sub(/^u:/,"",$2); sub(/:r$/,"",$2); print $2}' "$OS/acl" | sort -u; }
@@ -290,6 +293,22 @@ printf 'K=v\n' > "$C11/w.env"; chmod 644 "$C11/w.env"
 FAKE_GROUPADD_FAILS=1 secret_file_secure "$C11/w.env"; rc=$?
 [[ $rc -eq 0 && "$(stat -c %a "$C11/w.env")" == 640 ]] && ok_t "T11 secret_file_secure: rc 0 and o-rwx with no group to move to" || bad_t "T11 secure" "rc=$rc mode=$(stat -c %a "$C11/w.env")"
 mv "$OS/claude-keys.saved" "$OS/groups/claude-keys"
+
+# --- T12: the group exists but chgrp is refused (non-root, not a member) -----
+# An installed-host leg: claude-keys exists, the caller is not root and not in
+# it. The write must still succeed, quietly (a caller parses its --json), keep
+# the file's group for the root reconcile to move, and still drop world bits.
+C12="$TMP/c12"; mkdir -p "$C12"
+fg_before=$(wc -l < "$OS/fgroup")
+out=$(FAKE_CHGRP_REFUSED=1 CONNECTORS_DIR="$C12" _write_connector openrouter.env <<<'OPENROUTER_API_KEY=k' 2>&1); rc=$?
+[[ $rc -eq 0 && "$(cat "$C12/openrouter.env" 2>/dev/null)" == OPENROUTER_API_KEY=k ]] \
+  && ok_t "T12 group exists, chgrp refused: the connector write still succeeds" || bad_t "T12 write failed" "rc=$rc $out"
+[[ -z "$out" ]] && ok_t "T12 the refused chgrp prints nothing" || bad_t "T12 noise" "$out"
+[[ "$(wc -l < "$OS/fgroup")" == "$fg_before" && "$(stat -c %a "$C12/openrouter.env")" == 640 ]] \
+  && ok_t "T12 the key keeps its group and stays 640 (no world bits)" || bad_t "T12 state" "mode=$(stat -c %a "$C12/openrouter.env") $(tail -1 "$OS/fgroup")"
+printf 'K=v\n' > "$C12/w.env"; chmod 644 "$C12/w.env"
+FAKE_CHGRP_REFUSED=1 secret_file_secure "$C12/w.env" 2>/dev/null; rc=$?
+[[ $rc -eq 0 && "$(stat -c %a "$C12/w.env")" == 640 ]] && ok_t "T12 secret_file_secure: rc 0 and o-rwx when chgrp is refused" || bad_t "T12 secure" "rc=$rc mode=$(stat -c %a "$C12/w.env")"
 
 # --- T9: AS ROOT, real files, a real group, a real non-member uid -------------
 if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev/null; then
