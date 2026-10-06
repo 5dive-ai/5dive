@@ -1603,6 +1603,7 @@ link_agent_profile() {
   if declare -F profile_creds_secure >/dev/null; then
     [[ -z "$old" ]] || profile_creds_secure "$(basename "$(dirname "$old")")"
     profile_creds_secure codex
+    default_creds_secure   # DIVE-5714: the no-account logins, same reason
   fi
   [[ -n "$profile" ]] || return 0
   local target="${AUTH_PROFILES_DIR}/${profile}/combined.env"
@@ -3653,6 +3654,9 @@ cmd_create() {
         chmod 0640 "/home/claude/.hermes/${_hf}" 2>/dev/null || true
       fi
     done
+    # DIVE-5714: group claude is every seat. Hand the read to the hermes seats
+    # on no account only (this one included: its env file is written above).
+    ! declare -F default_creds_secure >/dev/null || default_creds_secure
   fi
 
   # Hermes onboarding finalization. The chat CLI's first-run check

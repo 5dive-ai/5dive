@@ -698,6 +698,51 @@ profile_creds_secure() {
   return 0
 }
 
+# -------- the default (no-account) vendor logins (DIVE-5714) --------
+#
+# A seat on no account seeds from the claude user's own home instead:
+# /home/claude/.hermes/auth.json and config.yaml, .grok/auth.json,
+# .gemini/antigravity-cli/antigravity-oauth-token, .openclaw/..., and
+# .codex/auth.json (today a symlink to the canonical codex account, which
+# profile_creds_secure covers). `agent create` makes the two hermes files 0640
+# group claude so a standard hermes seat can read them (DIVE-1394), and that is
+# every seat. Same posture as an account: claude-keys, and a per-seat read for
+# the seats of that type with no AGENT_AUTH_PROFILE. Only the named files move:
+# the home and its dirs are the claude user's, and a symlink is never followed.
+
+# The home the defaults live in (a seam: the harness points it at a fixture).
+_sp_default_home() { printf '%s' "${FIVEDIVE_DEFAULT_CRED_HOME:-/home/claude}"; }
+
+# _sp_default_cred_dir <type> — where _sp_cred_seeds' paths start for the
+# default login. codex and hermes keep theirs in a dot-dir; the HOME-redirect
+# types (grok, openclaw, antigravity) use the same paths as under an account.
+_sp_default_cred_dir() {
+  case "$1" in
+    codex|hermes) printf '%s/.%s' "$(_sp_default_home)" "$1" ;;
+    *)            _sp_default_home ;;
+  esac
+}
+
+# default_creds_secure — every default vendor login. Idempotent; called by
+# link_agent_profile, agent create (after its hermes chmod), agent restart and
+# the reconcile. Always returns 0.
+default_creds_secure() {
+  local t dir seats seeds f c
+  for t in $SP_CRED_TYPES; do
+    dir=$(_sp_default_cred_dir "$t")
+    [[ -d "$dir" ]] || continue
+    seats=$(_sp_cred_seats "" "$t")
+    seeds=$(_sp_cred_seeds "$t" | sed "s#^#$dir/#")
+    while IFS= read -r f; do
+      _sp_cred_secure "$f" "$seats"
+      for c in "$f".* "$f"-*; do
+        grep -qxF "$c" <<<"$seeds" || _sp_cred_secure "$c" ""
+      done
+    done <<<"$seeds"
+  done
+  return 0
+}
+
 # The group a secret is written with: SECRETS_GROUP, created on first use. A box
 # where it cannot be created keeps the old group, so nobody who reads a key
 # today is locked out by a failed groupadd; the next reconcile retries.
@@ -832,6 +877,7 @@ secrets_posture_reconcile() {
     d="${d%/}"
     profile_creds_secure "${d##*/}"
   done
+  default_creds_secure
 
   if (( ! quiet )) || (( SP_MOVED + SP_ADDED + SP_DROPPED + SP_ACL > 0 )); then
     printf 'secrets posture (DIVE-5690): %d file(s) moved to group %s, %d member(s) added, %d dropped, %d login reader(s) changed\n' \

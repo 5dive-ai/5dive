@@ -14,7 +14,11 @@ normalize_restart_profile_perms() {
   if [[ -z "$profile" && "$(jq -r --arg n "$name" '.agents[$n].type // empty' <<<"$reg" 2>/dev/null)" == codex ]]; then
     profile=codex
   fi
-  [[ -n "$profile" ]] || return 0
+  # DIVE-5714: a seat on no account seeds from the default logins.
+  if [[ -z "$profile" ]]; then
+    ! declare -F default_creds_secure >/dev/null || default_creds_secure
+    return 0
+  fi
   normalize_profile_seed_perms "$profile" || true
   return 0
 }
