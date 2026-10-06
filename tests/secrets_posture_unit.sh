@@ -213,18 +213,20 @@ mkdir -p "$TMP/auth"; chmod 755 "$TMP/auth"
 } > "$TMP/block.sh"; chmod 644 "$TMP/block.sh"
 run_block() { env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "$@" bash "$TMP/block.sh" 2>&1; }
 printf 'CLAUDE_CODE_OAUTH_TOKEN=x\n' > "$TMP/auth/anthropic.env"
+# $SECONDS is whole wall-clock seconds, so a no-wait run that crosses a second
+# boundary reads took=1 (a merge-queue flake). took=[01] still tells it from the 6s wait.
 if can_lock; then
   chmod 000 "$TMP/auth/anthropic.env"
   out=$(run_block CLAUDE_CODE_OAUTH_TOKEN=from-systemd CLAUDE_AUTH_WAIT_SECS=6 "${AS_SEAT[@]}")
-  [[ "$out" == *SEED_OK* && "$out" == *took=0* ]] && ok_t "T8 unreadable login + env token -> ok, no wait" || bad_t "T8 env ok" "$out"
+  [[ "$out" == *SEED_OK* && "$out" =~ took=[01]($|[^0-9]) ]] && ok_t "T8 unreadable login + env token -> ok, no wait" || bad_t "T8 env ok" "$out"
   out=$(run_block CLAUDE_AUTH_WAIT_SECS=6 "${AS_SEAT[@]}")
-  [[ "$out" == *SEED_FAILED* && "$out" == *took=0* ]] && ok_t "T8 unreadable login + no env token -> degraded at once, not after the wait" || bad_t "T8 env empty" "$out"
+  [[ "$out" == *SEED_FAILED* && "$out" =~ took=[01]($|[^0-9]) ]] && ok_t "T8 unreadable login + no env token -> degraded at once, not after the wait" || bad_t "T8 env empty" "$out"
   chmod 644 "$TMP/auth/anthropic.env"
 else
   printf 'skip - T8 unreadable arms need a non-root uid or setpriv\n'
 fi
 out=$(run_block CLAUDE_AUTH_WAIT_SECS=6)
-[[ "$out" == *SEED_OK* && "$out" == *took=0* ]] && ok_t "T8 readable login (admin seat) -> unchanged path" || bad_t "T8 readable" "$out"
+[[ "$out" == *SEED_OK* && "$out" =~ took=[01]($|[^0-9]) ]] && ok_t "T8 readable login (admin seat) -> unchanged path" || bad_t "T8 readable" "$out"
 rm -f "$TMP/auth/anthropic.env"
 out=$(run_block CLAUDE_CODE_OAUTH_TOKEN=from-systemd CLAUDE_AUTH_WAIT_SECS=2)
 [[ "$out" == *SEED_FAILED* && "$out" =~ took=[23] ]] && ok_t "T8 absent login in a readable dir -> still waits for it (first-boot race kept)" || bad_t "T8 absent waits" "$out"
