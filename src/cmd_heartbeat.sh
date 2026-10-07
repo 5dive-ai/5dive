@@ -6310,7 +6310,15 @@ _hb_blocked_sweep() {
                  AND EXISTS (SELECT 1 FROM task_deps d WHERE d.task_id=t.id)
                  AND NOT EXISTS (SELECT 1 FROM task_deps d JOIN tasks b ON b.id=d.blocked_by
                                  WHERE d.task_id=t.id AND b.status NOT IN ('done','cancelled'))
+                 AND NOT EXISTS (SELECT 1 FROM task_deps d JOIN tasks k ON k.id=d.blocked_by
+                                 WHERE d.task_id=t.id AND k.kind='standard'
+                                   AND k.body LIKE '%team kickoff: % (5dive.yaml)%')
                ORDER BY t.id;")
+  # DIVE-5729: the last NOT EXISTS keeps a hired team's held goals and loops
+  # held when their kickoff was closed by a stray writer (a manual-gate tap, a
+  # verify). Only `team start`/`team decline` release them, and they drop each
+  # edge first, so a released row is never behind a kickoff here. Same marker
+  # as _task_team_kickoff_holds (src/task/loops.sh).
   if [[ ${#rec[@]} -gt 0 ]]; then
     local idlist="" who dident
     for tid in "${rec[@]}"; do

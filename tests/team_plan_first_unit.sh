@@ -256,6 +256,15 @@ cli task add --assignee=lead --park="waiting" -- "no wake" >/dev/null 2>&1; rc=$
 # as the owner's no) or `task done` (the end-of-turn contract every seat runs
 # under) cascaded every held goal and loop to todo, starting the whole team.
 # ---------------------------------------------------------------------------
+sweep() {   # one heartbeat tick's blocked-sweep, the real function
+  (
+    cd "$ROOT/src" || exit 1
+    for f in header.sh lib/*.sh; do . "./$f"; done
+    . ./cmd_task.sh; . ./cmd_heartbeat.sh
+    tasks_db_init
+    _hb_blocked_sweep
+  ) >/dev/null 2>&1
+}
 cascade_close() {   # a close that goes around the verbs (a manual-gate tap, say)
   (
     cd "$ROOT/src" || exit 1
@@ -296,6 +305,17 @@ runs=$(q "SELECT COUNT(*) FROM tasks WHERE from_template_id IS NOT NULL;")
 [[ "$(q "SELECT status FROM tasks WHERE ident='$kick';")" == "done" && "$nottodo" == "4" && "$runs" == "0" ]] \
   && ok_t 'T24 a kickoff closed around the verbs (cascade runs) still holds all 4 and no loop fires' \
   || bad_t 'T24 cascade released work' "blocked=$nottodo runs=$runs"
+# The heartbeat's blocked-sweep frees any blocked row whose blockers are all
+# closed (it drops the edges itself), so after a stray close it must skip a row
+# still behind a team kickoff, or the team starts on the next tick.
+sweep
+nottodo=$(q "SELECT COUNT(*) FROM tasks WHERE ident<>'$kick' AND status='blocked';")
+edges=$(q "SELECT COUNT(*) FROM task_deps WHERE blocked_by=(SELECT id FROM tasks WHERE ident='$kick');")
+materialize
+runs=$(q "SELECT COUNT(*) FROM tasks WHERE from_template_id IS NOT NULL;")
+[[ "$nottodo" == "4" && "$edges" == "4" && "$runs" == "0" ]] \
+  && ok_t 'T27 a heartbeat blocked-sweep after that stray close keeps all 4 blocked, their edges, and no loop fires' \
+  || bad_t 'T27 the blocked-sweep released the held team' "blocked=$nottodo edges=$edges runs=$runs"
 rel=$(cli --json team start lead 2>/dev/null)
 materialize
 runs=$(q "SELECT COUNT(*) FROM tasks WHERE from_template_id IS NOT NULL;")
@@ -312,6 +332,16 @@ cli task done DIVE-1 --result="done" >/dev/null 2>&1; rc=$?
 (( rc == 0 )) && [[ "$(q "SELECT status FROM tasks WHERE ident='DIVE-2';")" == "todo" ]] \
   && ok_t 'T26 a non-kickoff blocker still closes and releases its dependent (guard is kickoff-only)' \
   || bad_t 'T26 the guard caught a plain row' "rc=$rc dep=$(q "SELECT status FROM tasks WHERE ident='DIVE-2';")"
+
+# The sweep's exclusion is kickoff-only: a plain row whose blocker was closed
+# without the cascade (edge left behind) is still freed on the next tick.
+cli task add --assignee=lead -- "plain anchor 2" >/dev/null 2>&1
+cli task add --assignee=lead --held-by=DIVE-3 -- "plain dependent 2" >/dev/null 2>&1
+q "UPDATE tasks SET status='done', done_at=datetime('now') WHERE ident='DIVE-3';"
+sweep
+[[ "$(q "SELECT status FROM tasks WHERE ident='DIVE-4';")" == "todo" ]] \
+  && ok_t 'T28 the blocked-sweep still frees a plain row whose blocker closed (exclusion is kickoff-only)' \
+  || bad_t 'T28 the sweep guard caught a plain row' "dep=$(q "SELECT status FROM tasks WHERE ident='DIVE-4';")"
 
 echo "-----"
 echo "pass=$pass fail=$fail"
