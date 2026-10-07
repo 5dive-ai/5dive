@@ -677,6 +677,24 @@ cmd_tui() {
         ;;
     esac
   fi
+  # DIVE-5820: with no session tmux prints a bare "no sessions", which reads as a
+  # broken socket. The socket is the agent user's default one (no PrivateTmp),
+  # so a miss means the session really is not there yet: a claude seat with no
+  # AI login waits up to 45s before it opens one, and a stopped seat has none.
+  if ! sudo -u "agent-${name}" tmux has-session -t "agent-${name}" >/dev/null 2>&1; then
+    local state health why
+    state=$(systemctl is-active "5dive-agent@${name}.service" 2>/dev/null || true)
+    health=$(_agent_startup_credential_health "$name" 2>/dev/null || true)
+    case "$state" in
+      active|activating|reloading)
+        why="it is still starting (a claude agent waits up to 45s for its AI login before it opens one). Try again in a minute" ;;
+      *)
+        why="the agent is not running (service: ${state:-unknown}). Start it: sudo 5dive agent start ${name}" ;;
+    esac
+    [[ "$health" == degraded\|* ]] \
+      && why+=". Its last start found no AI login: bind it to an account that has one (sudo 5dive agent set-account ${name} <account>)"
+    fail "$E_NOT_FOUND" "agent '${name}' has no terminal session yet: ${why}"
+  fi
   exec sudo -u "agent-${name}" tmux attach -t "agent-${name}"
 }
 

@@ -2859,6 +2859,30 @@ _import_create_passthru_ok() {
   return 1
 }
 
+# DIVE-5820: the account a fresh box holds its free demo key in (5dive-api
+# my5dive-profile.ts DEMO_AI_ACCOUNT; the Mini App's hireAccount reads the same).
+IMPORT_DEMO_AI_ACCOUNT="demo-ai"
+
+# _import_demo_ai_default <type> — rc 0 when an import with no --auth-profile
+# should bind demo-ai: a claude seat, demo-ai holds a claude credential, and no
+# other account and no shared login (connectors/anthropic.env) holds one. Any of
+# those means the owner has an AI of their own, and the per-agent sign-in stays.
+_import_demo_ai_default() {
+  [[ "${1:-}" == "claude" && -n "${AUTH_PROFILES_DIR:-}" ]] || return 1
+  [[ -d "${AUTH_PROFILES_DIR}/${IMPORT_DEMO_AI_ACCOUNT}" ]] || return 1
+  lazy_need auth_creds_present
+  auth_creds_present claude "$IMPORT_DEMO_AI_ACCOUNT" >/dev/null 2>&1 || return 1
+  auth_creds_present claude >/dev/null 2>&1 && return 1
+  local d p
+  for d in "${AUTH_PROFILES_DIR}"/*/; do
+    [[ -d "$d" ]] || continue
+    p=$(basename "$d")
+    [[ "$p" == "$IMPORT_DEMO_AI_ACCOUNT" ]] && continue
+    auth_creds_present claude "$p" >/dev/null 2>&1 && return 1
+  done
+  return 0
+}
+
 # DIVE-4414: an accepted --isolation value must either be applied or refused.
 # Keep this validation shared with hire's validate-only path so --dry-run and a
 # real import cannot disagree about whether a tier is valid.
@@ -3149,6 +3173,16 @@ cmd_import() {
   fi
   [[ -n "$workdir" ]] || workdir="$m_workdir"
   [[ -n "$profile" ]] || profile="$m_profile"
+  # DIVE-5820: a fresh box's only AI is the free demo-ai account. A hire that
+  # names no account (an older dashboard, a script) used to get the empty
+  # per-agent profile below and launch DEGRADED next to a working login. Bind
+  # demo-ai instead, but only when nothing else on the box could be meant: a
+  # claude seat, no BYO key, and no other account or shared login with claude.
+  if [[ -z "$profile" && -z "$p_provider" && -z "$p_api_key" ]] \
+     && _import_demo_ai_default "$type"; then
+    profile="$IMPORT_DEMO_AI_ACCOUNT"
+    step "No --auth-profile: using this box's free demo AI account '$profile' (connect your own AI to move it)"
+  fi
   # DIVE-620: a dashboard marketplace import passes no --auth-profile and packs
   # carry no profile, so $profile is empty here. Without a profile the agent is
   # created with no authProfile binding AND no agents.d/<name>-auth.env symlink,
