@@ -14,5 +14,5 @@ m3() { m1; m2; }
 m4() { sed -i "s/AND k.body LIKE '%team kickoff: % (5dive.yaml)%');/AND 0);/" src/task/loops.sh; }
 # m5: a closed kickoff is not resolvable -> the team cannot be answered after a stray close (T25 red).
 m5() { sed -i 's/\[\[ -n "\$rows" \]\] || rows=\$(_team_kickoff_closed_holding "\$lead")/:/' src/cmd_compose.sh; }
-# m6: the heartbeat blocked-sweep's kickoff exclusion is removed -> one tick after a stray close starts the team (T27 red).
+# m6: the heartbeat blocked-sweep's kickoff exclusion is removed -> one tick after a stray close starts the team (T27 red; T25 red too, the team already started).
 m6() { sed -i "/AND NOT EXISTS (SELECT 1 FROM task_deps d JOIN tasks k ON k.id=d.blocked_by/,+2d" src/cmd_heartbeat.sh; }
