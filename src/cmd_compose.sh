@@ -617,15 +617,15 @@ _compose_kickoff_open() {
 # The kickoff's body: what the lead reads when it is dispatched.
 _compose_kickoff_body() {
   local lead="$1"
-  cat <<EOF
-$(_compose_kickoff_marker "$lead")
+  _compose_kickoff_marker "$lead"
+  cat <<'EOF'
 
 Your team was just hired and none of its work has started. Every goal and recurring job it came with is HELD behind this row until your owner says yes. Your first job is to ask.
 
-1. Run \`5dive team plan\`. It lists what is held (each goal and recurring job, who owns it, how often a job runs) and the exact commands for the steps below.
+1. Run `5dive team plan`. It lists what is held (each goal and recurring job, who owns it, how often a job runs) and the exact commands for the steps below.
 2. Send your owner ONE message, where you normally talk to them. At most 60 words, plain words, no task numbers. Say what you understand they want from this team, which goals you mean to work and which recurring jobs you mean to switch on, then ask: yes, or what should I skip or change?
-3. Park this row while you wait (the park command \`team plan\` prints). Start nothing in the meantime.
-4. When they answer: a yes is \`5dive team start\`. To leave some out, \`5dive team start --skip=<the held rows they dropped>\`: a skipped goal is cancelled and a skipped job never switches on. If they want something else instead, skip what it replaces and file what they asked for as a task for the right teammate. A no to all of it is \`5dive team decline\`. Then tell them in one line what started.
+3. Park this row while you wait (the park command `team plan` prints). Start nothing in the meantime.
+4. When they answer: a yes is `5dive team start`. To leave some out, `5dive team start --skip=<the held rows they dropped>`: a skipped goal is cancelled and a skipped job never switches on. If they want something else instead, skip what it replaces and file what they asked for as a task for the right teammate. A no to all of it is `5dive team decline`. Then tell them in one line what started.
 5. If this row wakes and they have not answered, send the plan once more at most, then park again for a week.
 
 No chat with your owner yet? Park this row for a day and send the plan the first time they write to you.
@@ -1442,7 +1442,7 @@ HELP
         _compose_wire_role "$(_compose_adopted_spec "$spec" "$name")" "$name" "$spec_dir" "$self" || true
         _adopted_names+=("$name")
         if bash "$self" agent start "$name" >/dev/null 2>&1; then
-          ((started++)) || true
+          started=$((started+1))
         else
           ((skipped++)) || true
         fi
@@ -1533,8 +1533,10 @@ HELP
   if (( ! _hold_failed )); then
     for _hg in "${_COMPOSE_GOAL_LINES[@]+"${_COMPOSE_GOAL_LINES[@]}"}"; do
       IFS=$'\x1f' read -r _hg_name _hg_mgr _hg_goal <<<"$_hg"
-      _compose_seed_goal "$_hg_name" "$_hg_mgr" "$_hg_goal" "$self" "$_COMPOSE_KICKOFF" \
-        && [[ -n "$_COMPOSE_KICKOFF" ]] && ((_held_goals++)) || true
+      if _compose_seed_goal "$_hg_name" "$_hg_mgr" "$_hg_goal" "$self" "$_COMPOSE_KICKOFF" \
+        && [[ -n "$_COMPOSE_KICKOFF" ]]; then
+        _held_goals=$((_held_goals+1))
+      fi
     done
   fi
 
@@ -2871,22 +2873,28 @@ _team_release() {
   local -a held=() skip=() bad=()
   local ident _rest s
   while IFS=$'\x1f' read -r ident _rest; do [[ -n "$ident" ]] && held+=("$ident"); done <<<"$rows"
+  local held_list; held_list=$(printf '%s\n' "${held[@]+"${held[@]}"}")
   local IFS_save="$IFS"; IFS=','
   for s in $skip_csv; do
     s="${s// /}"; [[ -n "$s" ]] || continue
     s="${s^^}"
     [[ "$s" =~ ^[0-9]+$ ]] && s=$(db "SELECT ident FROM tasks WHERE id=${s};" 2>/dev/null)
-    if printf '%s\n' "${held[@]+"${held[@]}"}" | grep -qxF -- "$s"; then skip+=("$s"); else bad+=("$s"); fi
+    if grep -qxF -- "$s" <<<"$held_list"; then skip+=("$s"); else bad+=("$s"); fi
   done
   IFS="$IFS_save"
   (( ${#bad[@]} == 0 )) || fail "$E_VALIDATION" "not held behind $TP_KIDENT: ${bad[*]} — nothing was started. See what is held: 5dive team plan $TP_LEAD"
 
   local started=0 left=0 h
   local -a left_off=() failed=()
+  local skip_list; skip_list=$(printf '%s\n' "${skip[@]+"${skip[@]}"}")
+  local drop
   for h in "${held[@]+"${held[@]}"}"; do
-    if [[ "$mode" == "decline" ]] || printf '%s\n' "${skip[@]+"${skip[@]}"}" | grep -qxF -- "$h"; then
+    drop=0
+    if [[ "$mode" == "decline" ]]; then drop=1
+    elif grep -qxF -- "$h" <<<"$skip_list"; then drop=1; fi
+    if (( drop )); then
       if ( cmd_task_cancel "$h" --result="Left off: the owner did not approve it when $TP_LEAD sent the team's plan (DIVE-5729)." ) >/dev/null 2>&1; then
-        left_off+=("$h"); ((left++)) || true
+        left_off+=("$h"); left=$((left+1))
       else
         failed+=("$h")
       fi
