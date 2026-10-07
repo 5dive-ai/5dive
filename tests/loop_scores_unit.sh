@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DIVE-5564 isolated unit harness for loop scores + the weekly suggestion:
-# a finished run of a loop (a scheduled task) asks for its score (runner, or the team's
-# grader), `task loop score`/`rate` record it (the owner's vote beats the score),
+# a finished run of a loop (a scheduled task) is scored by the runtime (DIVE-5815; it used
+# to ask the runner or the grader), `task loop score`/`rate` record an override (the owner's vote beats the score),
 # `task loop review --force` asks for a change to the lowest-scoring loop, and
 # `suggest`/`apply`/`dismiss`/`revert`/`auto` move the loop's instructions.
 # Throwaway STATE_DIR — never touches the live tasks.db. Run: bash tests/loop_scores_unit.sh
@@ -45,26 +45,26 @@ mk_run() { db "INSERT INTO tasks (title, body, assignee, created_by, kind, from_
                SELECT title, body, assignee, created_by, 'standard', id, 'in_progress' FROM tasks WHERE ident=$(sqlq "$1");
                SELECT ident FROM tasks WHERE id=last_insert_rowid();"; }
 close_run() { ( AGENT_NAME=scout cmd_task_done "$1" --result="ran" ) >/dev/null 2>"$TMP/done.err"; }
-req_for() { db "SELECT COALESCE(assignee,'')||'|'||status FROM tasks WHERE title='Score loop run $1';"; }
 
-# T1 — a finished loop run asks the RUNNER for its score (no grader on the team).
+# T1 — DIVE-5815: a finished loop run is scored by the RUNTIME (a clean run is
+# 80) and nobody is asked: no "Score loop run" row (it used to go to the runner).
 R1=$(mk_run "$A"); close_run "$R1"
 t "T1 run closed done" "done" "$(db "SELECT status FROM tasks WHERE ident='$R1';")"
-t "T1 score request filed to the runner" "scout|todo" "$(req_for "$R1")"
-# Closing twice (any second close path) does not file a second ask.
+t "T1 runtime scored the clean run 80" "80|runtime|clean run" "$(_loop_pref_get "loop.score.$R1" | jq -r '"\(.score)|\(.by)|\(.note)"')"
+t "T1 no score request row" "0" "$(db "SELECT COUNT(*) FROM tasks WHERE title='Score loop run $R1';")"
+# Closing twice (any second close path) does not rescore it.
 _loop_score_request "$(db "SELECT id FROM tasks WHERE ident='$R1';")"
-t "T1 no duplicate score request" "1" "$(db "SELECT COUNT(*) FROM tasks WHERE title='Score loop run $R1';")"
-# An ordinary task asks for nothing; a hand-made scheduled task is a loop too.
+t "T1 second close changes nothing" "80" "$(_loop_pref_get "loop.score.$R1" | jq -r .score)"
+# An ordinary task gets no score; a hand-made scheduled task is a loop too.
 close_run "$P"
-t "T1 one-off task: no score request" "0" "$(db "SELECT COUNT(*) FROM tasks WHERE title='Score loop run $P';")"
+t "T1 one-off task: no score" "" "$(_loop_pref_get "loop.score.$P")"
 RC=$(mk_run "$C"); close_run "$RC"
-t "T1 hand-made scheduled task's run: score request" "scout|todo" "$(req_for "$RC")"
-t "T1 score request is a fresh one-turn row with no grader" "1|none" "$(db "SELECT fresh||'|'||COALESCE(review_mode,'none') FROM tasks WHERE title='Score loop run $RC';")"
+t "T1 hand-made scheduled task's run: scored by the runtime" "80" "$(_loop_pref_get "loop.score.$RC" | jq -r .score)"
 
-# T2 — with a grader on the team, the grader is asked instead.
+# T2 — with a grader on the team, still no row: the grader is not asked either.
 db "INSERT INTO agents_org(name, role) VALUES ('quinn','grader');"
 R2=$(mk_run "$B"); close_run "$R2"
-t "T2 score request filed to the grader" "quinn|todo" "$(req_for "$R2")"
+t "T2 no score request to the grader" "0" "$(db "SELECT COUNT(*) FROM tasks WHERE title LIKE 'Score loop run %';")"
 
 # T3 — score + rate; the vote beats the score; validation.
 out=$( cmd_task_loop_score "$R1" --score=40 --note="missed two sources" --from=scout 2>&1 )
