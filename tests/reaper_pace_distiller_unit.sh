@@ -352,7 +352,8 @@ is "MUTANT: child sources what it cannot read -> no credential" "$mutant_out" "N
 
 # WIRED, not merely defined.
 # DIVE-5805: the feed, piped — never `--preserve-env`, which sudo logs by value.
-if grep -q '_hb_distiller_env_feed \\$' src/cmd_heartbeat.sh && ! grep -v '^[[:space:]]*#' src/cmd_heartbeat.sh | grep -q -- '--preserve-env'; then
+_hb_src=$(grep -v '^[[:space:]]*#' src/cmd_heartbeat.sh)
+if grep -q '_hb_distiller_env_feed \\$' src/cmd_heartbeat.sh && ! grep -q -- '--preserve-env' <<<"$_hb_src"; then
   ok "call site: the consolidate lane pipes the feed and never passes --preserve-env"
 else
   bad "call site: the consolidate lane pipes the feed and never passes --preserve-env" "not found in src/cmd_heartbeat.sh"
