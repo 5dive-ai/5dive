@@ -2162,11 +2162,14 @@ cmd_task_answer() {
       pingmsg="${ident} gate cleared — your '${nt}' ask was answered. Resume the task; run \`5dive task show ${ident}\` for the value."
     fi
     local actor; actor=$(task_actor "$from")
+    # DIVE-5772: an owner who answered on the secure link's page has left the chat;
+    # wake the seat now rather than leave the ping waiting for its next turn.
+    local -a _wk=(); [[ "$from" == drop ]] && _wk=(--wake)
     # DIVE-5689: a system notice — the owner's pane gets it, its Telegram group does not.
     if valid_sender_label "$actor"; then
-      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" --from="$actor" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" "${_wk[@]}" --from="$actor" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
     else
-      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" "${_wk[@]}" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
     fi
   fi
 

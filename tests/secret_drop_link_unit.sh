@@ -22,7 +22,7 @@ cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 TMP="$(mktemp -d /tmp/secret-drop-link-unit.XXXXXX)"
 
-LIBS="header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh lib/tasks_db.sh lib/actor.sh lib/self.sh cmd_task.sh cmd_secret.sh cmd_secret_drop.sh"
+LIBS="header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh lib/tasks_db.sh lib/actor.sh lib/self.sh cmd_task.sh cmd_tool.sh cmd_secret.sh cmd_secret_drop.sh"
 for f in $LIBS; do
   # shellcheck source=/dev/null
   source "src/$f"
@@ -40,6 +40,10 @@ SECRET_DROP_PROVISIONING="$TMP/provisioning.env"
 SECRET_DROP_CADDYFILE="$TMP/Caddyfile"
 SECRET_DROP_LOCK="$TMP/drop.lock"
 SECRET_WRITE_LOCK="$TMP/write.lock"
+# DIVE-5772: the tools store and the project folders, in TMP too.
+TOOLS_ENV_FILE="$CONNECTORS_DIR/tools.sh"; TOOLS_WRITE_LOCK="$TMP/tools.lock"
+export SECRET_PROJECTS_DIR="$TMP/projects"; mkdir -p "$SECRET_PROJECTS_DIR"
+export JOURNAL_LOG="$TMP/journal.log"; : > "$JOURNAL_LOG"
 printf 'FIVE_DOMAIN=teal-fox.example.com\n' > "$SECRET_DROP_PROVISIONING"
 require_root() { :; }
 JSON_MODE=1
@@ -57,6 +61,8 @@ if [[ "${1:-} ${2:-}" == "task answer" ]]; then
 fi
 EOF
 chmod +x "$MOCKBIN/5dive"
+# `logger` is the journal (DIVE-5772): what the drop says about a clear that did not take.
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$JOURNAL_LOG"\n' > "$MOCKBIN/logger"; chmod +x "$MOCKBIN/logger"
 PATH="$MOCKBIN:$PATH"
 
 PASS=0; FAIL=0
@@ -202,6 +208,7 @@ cd "$REPO"
 for f in $LIBS; do source "src/\$f"; done
 STATE_DIR="$STATE_DIR"; TASKS_DIR="$TASKS_DIR"; TASKS_DB="$TASKS_DB"; CONNECTORS_DIR="$CONNECTORS_DIR"
 SECRET_DROP_DIR="$SECRET_DROP_DIR"; SECRET_DROP_LOCK="$SECRET_DROP_LOCK"; SECRET_WRITE_LOCK="$SECRET_WRITE_LOCK"
+TOOLS_ENV_FILE="$TOOLS_ENV_FILE"; TOOLS_WRITE_LOCK="$TOOLS_WRITE_LOCK"; SECRET_PROJECTS_DIR="$SECRET_PROJECTS_DIR"
 PATH="$MOCKBIN:\$PATH"; export MOCK5DIVE_LOG="$MOCK5DIVE_LOG"
 require_root() { :; }
 shift   # the page calls "<bundle> secret <sub> ..."
@@ -431,6 +438,14 @@ cat > "$REALBIN/5dive" <<EOF
 cd "$REPO"; for f in $LIBS; do source "src/\$f"; done
 STATE_DIR="$STATE_DIR"; TASKS_DIR="$TASKS_DIR"; TASKS_DB="$TASKS_DB"; CONNECTORS_DIR="$CONNECTORS_DIR"
 SECRET_DROP_DIR="$SECRET_DROP_DIR"; AUDIT_LOG="$AUDIT_LOG_T"
+TOOLS_ENV_FILE="$TOOLS_ENV_FILE"; TOOLS_WRITE_LOCK="$TOOLS_WRITE_LOCK"; SECRET_PROJECTS_DIR="$SECRET_PROJECTS_DIR"
+# DIVE-5772: the drop tells the agent itself when the clear does not take.
+if [[ "\${1:-}" == agent ]]; then printf '%s\n' "\$*" >> "$TMP/agent-sends.log"; exit 0; fi
+# Lock contention seam: the first N answers fail as a busy store would.
+if [[ -n "\${BUSY_FIRST:-}" ]]; then
+  n=\$(cat "$TMP/busy.n" 2>/dev/null || echo 0); echo \$((n+1)) > "$TMP/busy.n"
+  (( n < BUSY_FIRST )) && { echo "Error: database is locked (5)" >&2; exit 1; }
+fi
 export GATE_PROOF_ENFORCE="$TMP/enforce"; unset SUDO_UID
 # Root, as the page's unit is: euid 0 (no agent), no SUDO_UID, so the uid half of
 # the principal test passes and the STRUCTURAL half refuses, exactly as on the box.
@@ -450,6 +465,7 @@ esac
 cmd_task "\$@"
 EOF
 chmod +x "$REALBIN/5dive"
+cp "$MOCKBIN/logger" "$REALBIN/logger"
 ans_at() { db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE ident='$1';"; }
 # The page's own bundle, with the real verb on PATH instead of the mock.
 WRAP2="$TMP/5dive-bundle-real"; sed "s#$MOCKBIN#$REALBIN#" "$WRAP" > "$WRAP2"; chmod +x "$WRAP2"
@@ -511,6 +527,16 @@ out=$(redeem_real "$h" "v22" MUTATE_LINK=delete 2>&1); rc=$?
    && "$(grep -c '^E2E_KEY=v22$' "$CONNECTORS_DIR/e2e22.env")" == 1 ]] \
   && ok_t "L10e mutation: link deleted before the answer -> gate stays open, distinct rc, 'did not update' (value still saved)" \
   || bad_t "L10e mutation: link deleted before the answer -> gate stays open, distinct rc, 'did not update' (value still saved)" "rc=$rc at=$(ans_at DIVE-22) out=$out"
+# DIVE-5772: that failure is no longer thrown away. The refusal is in the journal
+# with what `task answer` said, it is NOT retried (it would refuse again), and the
+# agent that filed the gate is told directly, woken, where the value is.
+grep -q 'task answer DIVE-22 (attempt 1 of 4) did not clear the gate: rc=6 ' "$JOURNAL_LOG" \
+  && ! grep -q 'DIVE-22 (attempt 2' "$JOURNAL_LOG" \
+  && ok_t "L10e2 the refused clear is logged to the journal with task answer's reason, once (a refusal is not retried)" \
+  || bad_t "L10e2 the refused clear is logged to the journal with task answer's reason, once" "journal: $(cat "$JOURNAL_LOG")"
+grep -q '^agent send mailer --wake --message=DIVE-22: your owner saved E2E_KEY through the secure link' "$TMP/agent-sends.log" \
+  && ok_t "L10e3 …and the filing agent is told directly, with --wake, where E2E_KEY is" \
+  || bad_t "L10e3 the filing agent is told directly" "sends: $(cat "$TMP/agent-sends.log" 2>/dev/null)"
 out=$(mint DIVE-22 2>&1); rc=$?
 [[ $rc -eq 0 ]] || reopen DIVE-22
 out=$(mint DIVE-22); h=$(hash_of "$(tok_of "$out")")
@@ -541,11 +567,70 @@ for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT3/healthz" >/dev/null 
 seed_gate DIVE-23 E2E_KEY e2e23
 out=$(mint DIVE-23); tok=$(tok_of "$out")
 code=$(curl -s -o "$TMP/post3.html" -w '%{http_code}' --data-urlencode "value=v23" "http://127.0.0.1:$PORT3/$tok")
-[[ "$code" == 200 && -z "$(ans_at DIVE-23)" ]] && grep -q 'did not update' "$TMP/post3.html" \
-  && grep -q 'e2e23.env' "$TMP/post3.html" && ! grep -q 'has been told' "$TMP/post3.html" \
-  && ok_t "L10h page: the clear did not take -> it names the file and never says 'has been told'" \
-  || bad_t "L10h page: the clear did not take -> it names the file and never says 'has been told'" "code=$code at=$(ans_at DIVE-23) body=$(head -c 400 "$TMP/post3.html")"
+[[ "$code" == 200 && -z "$(ans_at DIVE-23)" ]] \
+  && ! grep -q 'DIVE-23 has been told\|did not update\|Tell your agent' "$TMP/post3.html" && grep -q 'your agent has been told it is there. Nothing else to do' "$TMP/post3.html" \
+  && ok_t "L10h page: the clear did not take -> 'saved', no claim the task moved, and nothing asked of the owner (DIVE-5772)" \
+  || bad_t "L10h page: the clear did not take -> saved, nothing asked of the owner" "code=$code at=$(ans_at DIVE-23) body=$(head -c 400 "$TMP/post3.html")"
 kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
+
+# --- L12: DIVE-5772 — the drop closes its own gate for EVERY connector ----------
+# DIVE-5771 (marketing's Telegram Ads key, 2026-10-07): a STANDARD seat files its
+# secret gate with --connector=tools, because tools.sh is the one store an agent
+# can read (DIVE-5370). The value landed in tools.sh as `export KEY='...'`, the
+# evidence check read tools.env, `task answer` refused, and lodar had to tap
+# Provided. Same REAL verb, same root/no-SUDO_UID/enforce-on unit as L10.
+seed_gate DIVE-571 TGADS_API_KEY tools
+db "UPDATE tasks SET gate_filed_by='marketing', assignee='marketing' WHERE ident='DIVE-571';"
+out=$(mint DIVE-571); h=$(hash_of "$(tok_of "$out")")
+out=$(redeem_real "$h" "tgads-value-5772" 2>&1); rc=$?
+by=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='DIVE-571';")
+[[ $rc -eq 0 && -n "$(ans_at DIVE-571)" && "$by" == "human:drop" ]] && grep -qxF "export TGADS_API_KEY='tgads-value-5772'" "$TOOLS_ENV_FILE" \
+  && ok_t "L12a ACCEPTANCE: a tools drop on a standard seat's gate closes it, answered_by=human:drop, no tap" \
+  || bad_t "L12a a tools drop closes its gate as human:drop" "rc=$rc at=$(ans_at DIVE-571) by=$by out=$out tools=$(grep -c TGADS "$TOOLS_ENV_FILE" 2>/dev/null)"
+grep -q 'TGADS_API_KEY is set in your environment' "$TMP/sends.log" && grep -q -- '--wake' "$TMP/sends.log" \
+  && ok_t "L12b the seat is pinged and woken at once (it is told the key is in its environment)" \
+  || bad_t "L12b seat pinged + woken" "sends: $(grep DIVE-571 "$TMP/sends.log")"
+# project-<app> (DIVE-5664) writes the app's own .env: the other connector that
+# never wrote <conn>.env.
+mkdir -p "$SECRET_PROJECTS_DIR/shop"
+seed_gate DIVE-572 SHOP_API_KEY project-shop
+out=$(mint DIVE-572); h=$(hash_of "$(tok_of "$out")")
+out=$(redeem_real "$h" "shop-value" 2>&1); rc=$?
+[[ $rc -eq 0 && -n "$(ans_at DIVE-572)" ]] && grep -qxF "SHOP_API_KEY=shop-value" "$SECRET_PROJECTS_DIR/shop/.env" \
+  && ok_t "L12c a project-<app> drop closes its gate too (the value is in the app's .env)" \
+  || bad_t "L12c project drop closes its gate" "rc=$rc at=$(ans_at DIVE-572) out=$out env=$(cat "$SECRET_PROJECTS_DIR/shop/.env" 2>/dev/null | sed 's/=.*/=…/')"
+# The evidence is still the store: a tools link whose KEY never reached tools.sh is not evidence.
+seed_gate DIVE-573 OTHER_API_KEY tools
+out=$(mint DIVE-573); h=$(hash_of "$(tok_of "$out")")
+out=$(PATH="$REALBIN:$PATH" 5dive task answer DIVE-573 --human --from=drop --drop-link="$h" 2>&1); rc=$?
+[[ $rc -eq $E_AUTH_REQUIRED && -z "$(ans_at DIVE-573)" ]] \
+  && ok_t "L12d NEG: a tools link whose key is not in tools.sh is not evidence (refused, gate open)" \
+  || bad_t "L12d tools link without the key" "rc=$rc at=$(ans_at DIVE-573) out=$out"
+# A busy store is retried, and each miss is in the journal.
+: > "$JOURNAL_LOG"; rm -f "$TMP/busy.n"
+seed_gate DIVE-574 BUSY_API_KEY tools
+out=$(mint DIVE-574); h=$(hash_of "$(tok_of "$out")")
+out=$(redeem_real "$h" "busy-value" BUSY_FIRST=2 2>&1); rc=$?
+[[ $rc -eq 0 && -n "$(ans_at DIVE-574)" ]] && grep -q 'DIVE-574 (attempt 2 of 4).*database is locked' "$JOURNAL_LOG" \
+  && ok_t "L12e a busy store is retried: locked twice, closed on the third try, both misses in the journal" \
+  || bad_t "L12e busy retry" "rc=$rc at=$(ans_at DIVE-574) journal=$(cat "$JOURNAL_LOG") out=$out"
+# The gate card the owner sees in Telegram after the drop: struck with no
+# buttons, and it says where the answer came from. editMessageText without a
+# reply_markup is what removes the keyboard; the stub records both.
+db "INSERT INTO gate_cards (task_id, ident, gate_epoch, chat_id, message_id, via, state)
+    SELECT id, ident, 1, '1234567890', '777', 'marketing', 'live' FROM tasks WHERE ident='DIVE-571';" 2>/dev/null
+(
+  _task_human_send_allowed() { return 0; }
+  _task_gate_bot_token() { printf 'TOKEN'; }
+  _mirror_delete_message() { printf '{"ok":false,"description":"x"}'; }
+  _mirror_edit_text() { printf '%s\x1f%s\x1f%s\x1fno-reply-markup\n' "$2" "$3" "$4" > "$TMP/edit.log"; printf '{"ok":true}'; }
+  _task_gate_card_apply DIVE-571 settle "answered by human:drop" human:drop
+) >/dev/null 2>&1
+IFS=$'\x1f' read -r e_chat e_mid e_text e_kb < <(tr '\n' ' ' < "$TMP/edit.log")
+[[ "$e_mid" == 777 && "$e_text" == *"TGADS_API_KEY saved via the secure link"* && "$e_text" == *"Nothing to tap"* && "$e_text" != *Provided* \
+   && "$(db "SELECT state FROM gate_cards WHERE message_id='777';")" == struck ]] \
+  && ok_t "L12f the Telegram card is edited to 'saved via the secure link', with no Provided button, and recorded struck" \
+  || bad_t "L12f gate card after the drop" "edit=[$(cat "$TMP/edit.log" 2>/dev/null)] state=$(db "SELECT state FROM gate_cards WHERE message_id='777';")"
 
 echo
 echo "secret-drop-link unit: $PASS passed, $FAIL failed"

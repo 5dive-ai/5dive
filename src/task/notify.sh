@@ -863,6 +863,15 @@ _task_gate_card_text() { # <ident> <kind: receipt|closed> <why> [answered_by]
   row=$(db "SELECT COALESCE(need_type,'')||x'1f'||COALESCE(need_answer,'')||x'1f'||COALESCE(need_answered_at,'')
              FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null) || row=""
   IFS=$'\x1f' read -r nt ans at <<<"$row"
+  if [[ "$kind" == "receipt" && "$by" == "human:drop" ]]; then
+    # DIVE-5772: the owner answered on the secure link's page, not here. Say that,
+    # and that there is nothing left to tap.
+    local sk; sk=$(db "SELECT COALESCE(secret_key,'') FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null) || sk=""
+    printf '\xe2\x9c\x85 [%s] %s saved via the secure link' "$ident" "${sk:-the value}"
+    [[ -n "$at" ]] && printf ' at %sZ' "$at"
+    printf '. Your agent has it.\n\nNothing to tap here.'
+    return 0
+  fi
   if [[ "$kind" == "receipt" ]]; then
     # human:y00212 -> y00212. The prefix is provenance for the record, not a name
     # to show the person who tapped the button.
