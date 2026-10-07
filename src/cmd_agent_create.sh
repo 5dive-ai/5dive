@@ -17,9 +17,15 @@ create_agent_user() {
   # is the single source of the group name so the membership line and the home group
   # cannot disagree.
   local shared_group="${AGENT_SHARED_GROUP:-claude}"
-  local groups="systemd-journal"
+  # DIVE-5805: NOT systemd-journal. That group reads the whole system journal,
+  # and sudo logs every argv and preserved variable into it with its value, so
+  # membership was a read of every key that ever crossed a sudo line. The seat
+  # still reads its OWN processes' output without it: journald's default
+  # SplitMode=uid writes them to user-<uid>.journal, which carries a read ACL
+  # for that uid (`journalctl -u 5dive-agent@<me>` / `5dive agent logs <me>`).
+  local groups=""
   if [[ "$isolation" != "sandboxed" ]]; then
-    groups="${shared_group},systemd-journal"
+    groups="${shared_group}"
     # DIVE-3294: adduser mints the home 0750 with a PRIVATE group of one (HOME_MODE in
     # /etc/login.defs + USERGROUPS=yes), so no sibling can traverse it. A worktree an
     # agent puts in its own home is then unstattable from every other seat, prints as
@@ -39,7 +45,10 @@ create_agent_user() {
         || warn "could not make ${home} traversable by group ${shared_group} — worktrees this agent creates there will be invisible to every other seat and a prune will destroy them (DIVE-3294)"
     fi
   fi
-  usermod -aG "$groups" "$user"
+  [[ -z "$groups" ]] || usermod -aG "$groups" "$user"
+  # A re-create of a seat minted before DIVE-5805 is still a member: drop it.
+  journal_member_drop "$user" \
+    || warn "could not remove ${user} from group ${JOURNAL_GROUP}; it can read every secret sudo has logged until 'sudo 5dive doctor --fix' removes it (DIVE-5805)"
   # DIVE-5690: the box's keys are group claude-keys, not claude. Only an admin
   # seat (which can already run the whole CLI as root) reads them directly; a
   # re-create at a lower tier drops the membership.
@@ -1828,7 +1837,9 @@ _apply_byo_hermes() {
   if [[ "$canonical" == "moonshot" ]]; then
     step "Writing hermes BYO credential for '$canonical' (KIMI_API_KEY → ${hermes_home}/.env)"
     install -d -m 0775 -o claude -g claude "$hermes_home"
-    if ! sudo -u claude -H env HERMES_HOME="$hermes_home" KEY="$api_key" bash -s >&2 <<'KIMI_ENV'
+    # DIVE-5805: the values ride STDIN ahead of the script, never argv —
+    # sudo logs argv (COMMAND=) into the system journal.
+    if ! { printf 'export HERMES_HOME=%q KEY=%q\n' "$hermes_home" "$api_key"; cat <<'KIMI_ENV'; } | sudo -u claude -H bash -s >&2
 set -euo pipefail
 ENV_FILE="$HERMES_HOME/.env"
 touch "$ENV_FILE"

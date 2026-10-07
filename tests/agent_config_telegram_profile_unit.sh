@@ -112,7 +112,7 @@ run_cfg swan set telegram.profile=lite "telegram.account-url=$URL" >/dev/null
 # ---------------- P7: a token rotation (the REAL writer) keeps the profile
 # The managed bot's token is rotated on teardown and re-pushed; the claude
 # installer's .env rewrite must strip only TELEGRAM_BOT_TOKEN.
-sed -n "/<<'CLAUDE_TELEGRAM_STATE'\$/,/^CLAUDE_TELEGRAM_STATE\$/p" "$SRC/lib/agent_setup.sh" \
+sed -n "/<<'CLAUDE_TELEGRAM_STATE'/,/^CLAUDE_TELEGRAM_STATE\$/p" "$SRC/lib/agent_setup.sh" \
   | sed '1d;$d' >"$TMP/token-writer.sh"
 TOKEN2='2:bbbbbbbbbbbbbbbbbbbbbbbb'
 if [[ -s "$TMP/token-writer.sh" ]] && HOME="$HOME_SWAN" TOKEN="$TOKEN2" bash "$TMP/token-writer.sh"; then

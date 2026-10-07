@@ -816,6 +816,45 @@ secrets_member_sync() {
   esac
 }
 
+# ── DIVE-5805: no seat reads the system journal ─────────────────────────────
+# sudo logs every argv and every preserved variable WITH ITS VALUE into the
+# system journal, and group systemd-journal reads all of it. Seats were minted
+# into that group, so any seat could read any key that crossed a sudo line
+# (measured on a customer box: six live credentials). Every agent-* user is
+# taken out, whether or not the registry still knows it: an orphaned seat is
+# exactly the identity nobody is watching. The `claude` user is not a seat and
+# stays. A seat keeps reading its OWN processes' output through journald's
+# per-uid file (user-<uid>.journal, read ACL for that uid).
+#
+# A running process keeps the groups it started with, so a seat that is up
+# keeps the read until its unit restarts; the nightly update restarts every seat.
+JOURNAL_GROUP="${FIVEDIVE_JOURNAL_GROUP:-systemd-journal}"
+
+# journal_seat_members — the agent-* members of the journal group, one per line.
+journal_seat_members() {
+  _sp_group_exists "$JOURNAL_GROUP" || return 0
+  _sp_members "$JOURNAL_GROUP" | grep -E '^agent-' || true
+}
+
+# journal_member_drop <user> — rc 0 when the user is (now) not a member.
+journal_member_drop() {
+  _sp_group_exists "$JOURNAL_GROUP" || return 0
+  _sp_is_member "$1" "$JOURNAL_GROUP" || return 0
+  _sp_member_del "$1" "$JOURNAL_GROUP"
+}
+
+# journal_seats_drop — take every agent-* member out. Sets JG_DROPPED; rc 1 if
+# any removal failed (the rest are still attempted).
+journal_seats_drop() {
+  local u rc=0
+  JG_DROPPED=0
+  while IFS= read -r u; do
+    [[ -n "$u" ]] || continue
+    if journal_member_drop "$u"; then JG_DROPPED=$((JG_DROPPED + 1)); else rc=1; fi
+  done < <(journal_seat_members)
+  return "$rc"
+}
+
 # secrets_posture_reconcile [--quiet] [<registry json>] — idempotent, root.
 # Prints one summary line unless --quiet; with --quiet it prints only when it
 # changed something. Sets SP_MOVED / SP_ADDED / SP_DROPPED for callers.
@@ -879,6 +918,13 @@ secrets_posture_reconcile() {
   done
   default_creds_secure
 
+  # DIVE-5805: here, so every root heartbeat tick and every install carries it
+  # to every box, not only a box someone runs doctor on.
+  JG_DROPPED=0
+  journal_seats_drop \
+    || warn "could not remove every seat from group ${JOURNAL_GROUP}: $(journal_seat_members | tr '\n' ' ')can still read every secret sudo has logged (DIVE-5805)"
+  (( JG_DROPPED == 0 )) \
+    || printf 'journal posture (DIVE-5805): %d seat(s) removed from group %s\n' "$JG_DROPPED" "$JOURNAL_GROUP"
   if (( ! quiet )) || (( SP_MOVED + SP_ADDED + SP_DROPPED + SP_ACL > 0 )); then
     printf 'secrets posture (DIVE-5690): %d file(s) moved to group %s, %d member(s) added, %d dropped, %d login reader(s) changed\n' \
       "$SP_MOVED" "$g" "$SP_ADDED" "$SP_DROPPED" "$SP_ACL"

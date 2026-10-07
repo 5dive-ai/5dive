@@ -297,7 +297,7 @@ extract_fn() { # <file> <fn-name>
 }
 { grep -E '^_HB_DISTILLER_ENV_VARS=' src/cmd_heartbeat.sh
   extract_fn src/cmd_heartbeat.sh _hb_distiller_seed_env
-  extract_fn src/cmd_heartbeat.sh _hb_distiller_preserve_list
+  extract_fn src/cmd_heartbeat.sh _hb_distiller_env_feed
 } > "$TMPD/hb_fns.sh"
 # shellcheck source=/dev/null
 . "$TMPD/hb_fns.sh"
@@ -309,15 +309,17 @@ printf 'CLAUDE_CODE_OAUTH_TOKEN=profile-token\nANTHROPIC_API_KEY=profile-key\n' 
 MISSING_A="$TMPD/does-not-exist-a.env"
 MISSING_B="$TMPD/does-not-exist-b.env"
 
-pl() { ( _hb_distiller_seed_env "$@" >/dev/null 2>&1; _hb_distiller_preserve_list ); }
-is "both files readable -> all four names preserved" \
+# DIVE-5805: the feed is `export NAME=<value>` lines for stdin; the arms read
+# back the NAMES it carries, in order.
+pl() { ( _hb_distiller_seed_env "$@" >/dev/null 2>&1; _hb_distiller_env_feed ) | sed -n 's/^export \([A-Z_]*\)=.*/\1/p' | paste -sd, -; }
+is "both files readable -> all four names fed" \
    "$(pl "$SHARED" "$PROFILE")" "ANTHROPIC_API_KEY,CLAUDE_CODE_OAUTH_TOKEN,ANTHROPIC_BASE_URL"
-is "shared only -> no OAuth token in the list" \
+is "shared only -> no OAuth token in the feed" \
    "$(pl "$SHARED" "$MISSING_B")" "ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL"
-# NEITHER readable is the sandboxed seat's state. Empty list -> sudo is invoked
-# with no --preserve-env at all, and `memory consolidate` reports
-# distiller_unauthed (DIVE-4562) instead of the child inventing a reason.
-is "neither readable -> empty list (the unauthed reason)" \
+# NEITHER readable is the sandboxed seat's state. Empty feed -> the child evals
+# nothing, and `memory consolidate` reports distiller_unauthed (DIVE-4562)
+# instead of the child inventing a reason.
+is "neither readable -> empty feed (the unauthed reason)" \
    "$(pl "$MISSING_A" "$MISSING_B")" ""
 # EnvironmentFile ORDER: shared first, the profile overlay last (DIVE-4648).
 is "profile overlay wins over the shared connector" \
@@ -327,17 +329,14 @@ is "profile overlay wins over the shared connector" \
 ( _hb_distiller_seed_env "$MISSING_A" "$MISSING_B" >/dev/null 2>&1 ) && ok "an absent file is skipped, rc 0" || bad "an absent file is skipped, rc 0" "returned non-zero"
 
 echo "== C: the property — a child that cannot read the files still gets the token =="
-# `sudo --preserve-env=<names>` emulated with `env -i` plus exactly those names,
-# and the child is handed paths that DO NOT EXIST — the same state a sandboxed
-# uid is in when it cannot read the real ones. No chmod, no root, no box path.
+# sudo's environment reset emulated with `env -i`; the feed crosses on STDIN
+# (DIVE-5805), and the child is handed paths that DO NOT EXIST — the same state
+# a sandboxed uid is in when it cannot read the real ones. No chmod, no root, no
+# box path.
 child_out() {
   ( _hb_distiller_seed_env "$@" >/dev/null 2>&1
-    pe=$(_hb_distiller_preserve_list)
-    declare -a kv=()
-    IFS=',' read -r -a names <<<"$pe"
-    for nm in "${names[@]}"; do [ -n "$nm" ] && kv+=("$nm=${!nm}"); done
-    env -i PATH="$PATH" "${kv[@]}" bash -c \
-      'set -a; [ -r "$1" ] && . "$1"; [ -r "$2" ] && . "$2"; set +a; printf "%s|%s" "${ANTHROPIC_API_KEY:-NONE}" "${CLAUDE_CODE_OAUTH_TOKEN:-NONE}"' \
+    _hb_distiller_env_feed | env -i PATH="$PATH" bash -c \
+      'eval "$(cat)"; set -a; [ -r "$1" ] && . "$1"; [ -r "$2" ] && . "$2"; set +a; printf "%s|%s" "${ANTHROPIC_API_KEY:-NONE}" "${CLAUDE_CODE_OAUTH_TOKEN:-NONE}"' \
       _ "$MISSING_A" "$MISSING_B" )
 }
 is "child with unreadable credential files still gets both" \
@@ -352,10 +351,12 @@ mutant_out=$( env -i PATH="$PATH" bash -c \
 is "MUTANT: child sources what it cannot read -> no credential" "$mutant_out" "NONE|NONE"
 
 # WIRED, not merely defined.
-if grep -q 'preserve-env="$_hb_pe"' src/cmd_heartbeat.sh; then
-  ok "call site: the consolidate lane passes --preserve-env"
+# DIVE-5805: the feed, piped — never `--preserve-env`, which sudo logs by value.
+_hb_src=$(grep -v '^[[:space:]]*#' src/cmd_heartbeat.sh)
+if grep -q '_hb_distiller_env_feed \\$' src/cmd_heartbeat.sh && ! grep -q -- '--preserve-env' <<<"$_hb_src"; then
+  ok "call site: the consolidate lane pipes the feed and never passes --preserve-env"
 else
-  bad "call site: the consolidate lane passes --preserve-env" "not found in src/cmd_heartbeat.sh"
+  bad "call site: the consolidate lane pipes the feed and never passes --preserve-env" "not found in src/cmd_heartbeat.sh"
 fi
 if grep -q '_hb_distiller_seed_env "$sharedenv" "$authenv"' src/cmd_heartbeat.sh; then
   ok "call site: the lane seeds as root before sudo"
@@ -382,7 +383,7 @@ done
   _reap_cgroup_in_ref "$CG_V2_SEAT" "$REF_V2_SEAT" || r=1
   _reap_cgroup_in_ref "$CG_CLAUDE"  "$REF_CLAUDE"  || r=1
   [[ "$(printf '%s' "$(reading 10800 "$FUTURE")" | _grader_reading_pair "$NOW")" == "${US}64" ]] || r=1
-  [[ -z "$(_hb_distiller_preserve_list)" ]] || r=1
+  [[ -z "$(_hb_distiller_env_feed)" ]] || r=1
   exit $r ) && ok "every predicate answers the same with no 5dive install present" \
             || bad "every predicate answers the same with no 5dive install present" "a box path is load-bearing"
 
