@@ -90,8 +90,10 @@ eq_t 'L2 NEG: a DIFFERENT persona named theo still gets a namespace (DIVE-4822 u
      'namespaced|gtm' "$(_team_choose_prefix gtm "$SPEC" "$REG_OTHER_THEO" "" olivia "")"
 eq_t 'L3 NEG: an agent with no pack record is not assumed to be the same persona' \
      'namespaced|gtm' "$(_team_choose_prefix gtm "$SPEC" "$REG_BARE_THEO" "" olivia "")"
-eq_t 'L4 NEG: same persona but already in ANOTHER team is not taken out of its chart' \
-     'namespaced|gtm' "$(_team_choose_prefix gtm "$SPEC" "$REG_SOLO_THEO" "" olivia $'theo\nceo')"
+# DIVE-5769 reversed this arm: theo in another team is SHARED into this one, never
+# cloned as gtm-theo (and never taken out of his chart: E9 below).
+eq_t 'L4 same persona already in ANOTHER team is shared, not namespaced around (DIVE-5769)' \
+     'adopt-shared|' "$(_team_choose_prefix gtm "$SPEC" "$REG_SOLO_THEO" "" olivia $'theo\nceo')"
 eq_t 'L5 CONTROL: a virgin box is still untouched' \
      'free|' "$(_team_choose_prefix gtm "$SPEC" '{"agents":{}}' "" olivia "")"
 eq_t 'L6 CONTROL: the installed rung still wins over adoption' \
@@ -212,8 +214,8 @@ db "INSERT OR REPLACE INTO agents_org (name, reports_to, role) VALUES ('theo','c
 printf '%s' '{"agents":{"ceo":{},"theo":{"pack":{"slug":"theo"}}}}' > "$REGISTRY"
 : > "$FAKE_LOG"
 cmd_team import "$TMP/gtm.5dive.yaml" >/dev/null 2>&1
-eq_t 'E8 NEG: theo in another team -> the roster comes up namespaced beside him' \
-     'ceo,gtm-dude,gtm-olivia,gtm-theo,theo' "$(jq -r '.agents | keys | join(",")' "$REGISTRY")"
+eq_t 'E8 theo in another team -> no gtm-theo clone, the roster comes up beside him (DIVE-5769)' \
+     'ceo,dude,olivia,theo' "$(jq -r '.agents | keys | join(",")' "$REGISTRY")"
 grep -qE '^org set theo ' "$FAKE_LOG" \
   && bad_t 'E9 NEG: the other team keeps its theo' "$(grep 'org set theo' "$FAKE_LOG")" \
   || ok_t 'E9 NEG: the other team keeps its theo (no org set on him)'
