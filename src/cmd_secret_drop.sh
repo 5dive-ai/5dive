@@ -52,6 +52,10 @@ SECRET_DROP_LOCK="/run/5dive-secret-drop.lock"
 SECRET_DROP_WAIT_S="${SECRET_DROP_WAIT_S:-20}"
 SECRET_DROP_POLL_S="${SECRET_DROP_POLL_S:-1}"
 SECRET_DROP_PROBE_ADDR="${SECRET_DROP_PROBE_ADDR:-127.0.0.1}"
+# DIVE-5806 (H2): where the kernel lists listening sockets, and how long a freshly
+# started page gets to bind before `secret link` looks at who holds the port.
+SECRET_DROP_PROC_NET="${SECRET_DROP_PROC_NET:-/proc/net}"
+SECRET_DROP_BIND_S="${SECRET_DROP_BIND_S:-5}"
 
 # The https base a link starts with, or nothing when this box has no name an
 # owner's browser can reach (the terminal path then).
@@ -175,10 +179,21 @@ _secret_link() {
   # ready:false, so the caller can say "getting your secure page ready".
   # "null" = not checked: --no-start, or a SECRET_DROP_BASE_URL (the owner's own
   # tunnel, which this box may not be able to reach by its public name).
-  local ready=null
+  local ready=null squat_uid="" srv_rc=0
   if (( start )); then
     _secret_drop_ensure_route || true
-    _secret_drop_ensure_server || true
+    squat_uid=$(_secret_drop_ensure_server) || srv_rc=$?
+  else
+    # --no-start still refuses a squatted port: the page it trusts to be
+    # supervised elsewhere must at least be root's.
+    squat_uid=$(_secret_drop_port_holder) || srv_rc=$?
+    (( srv_rc == 2 )) || srv_rc=0
+  fi
+  if (( srv_rc == 2 )); then
+    rm -f "$SECRET_DROP_DIR/$hash"
+    fail "$E_CONFLICT" "$(_secret_drop_squat_msg "$squat_uid")"
+  fi
+  if (( start )); then
     local domain
     if ! _secret_drop_has_base_url && domain=$(_secret_drop_domain); then
       _secret_drop_wait_ready "$domain" "$SECRET_DROP_WAIT_S" && ready=true || ready=false
@@ -405,21 +420,63 @@ _secret_drop_wait_ready() {
   done
 }
 
-# Start the page if nothing answers on its port. It exits by itself once no link
-# is live, so a box carries no listener between gates.
+# DIVE-5806 (H2): who holds the drop port. The page exits between gates, so
+# 127.0.0.1:3127 is free most of the time, and it is an unprivileged port: any
+# seat can bind it and answer /healthz. Probing /healthz alone (the old check)
+# then sent the owner's next link to that seat, on secrets.<box>'s valid
+# certificate. The kernel's own table says which uid owns each listening socket,
+# readable without root and without `ss -p`. Prints the distinct uids, one a line.
+_secret_drop_port_uids() {
+  local hex; hex=$(printf ':%04X' "$SECRET_DROP_PORT")
+  awk -v p="$hex" '$4 == "0A" && substr($2, length($2) - 4) == p { print $8 }' \
+    "$SECRET_DROP_PROC_NET/tcp" "$SECRET_DROP_PROC_NET/tcp6" 2>/dev/null | sort -u
+}
+# rc 0 = only root listens on the port, 1 = nobody does, 2 = someone else does
+# (their uid on stdout).
+_secret_drop_port_holder() {
+  local uids u; uids=$(_secret_drop_port_uids)
+  [[ -n "$uids" ]] || return 1
+  while read -r u; do
+    [[ "$u" == 0 ]] || { printf '%s' "$u"; return 2; }
+  done <<<"$uids"
+  return 0
+}
+_secret_drop_squat_msg() {   # <uid>
+  local who; who=$(getent passwd "$1" 2>/dev/null | cut -d: -f1)
+  printf 'the secure page'"'"'s port 127.0.0.1:%s is held by uid %s%s, not root, so a link would send your owner to that process instead of the real page. Nothing was minted. Stop that listener (sudo ss -tlnp "sport = :%s"), then ask again.' \
+    "$SECRET_DROP_PORT" "$1" "${who:+ ($who)}" "$SECRET_DROP_PORT"
+}
+
+# Start the page if nothing holds its port. It exits by itself once no link is
+# live, so a box carries no listener between gates. rc 2 (DIVE-5806): the port
+# is held by a uid other than root, before or after the start; the uid is on
+# stdout and no link may be handed out.
 _secret_drop_ensure_server() {
-  curl -fsS --max-time 2 "http://127.0.0.1:${SECRET_DROP_PORT}/healthz" >/dev/null 2>&1 && return 0
+  local held=0 uid
+  uid=$(_secret_drop_port_holder) || held=$?
+  (( held == 2 )) && { printf '%s' "$uid"; return 2; }
+  (( held == 0 )) && return 0
   command -v python3 >/dev/null 2>&1 || { warn "secret drop: python3 missing, the page cannot start"; return 1; }
   local self; self="$(five_self_bundle || true)"
   [[ -n "$self" ]] || { warn "secret drop: could not find the 5dive bundle"; return 1; }
+  local started=0
   if command -v systemd-run >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     systemctl reset-failed 5dive-secret-drop.service >/dev/null 2>&1 || true
     systemd-run --quiet --collect --unit=5dive-secret-drop \
       -p PrivateTmp=yes -p NoNewPrivileges=yes \
-      "$self" secret serve >/dev/null 2>&1 && return 0
+      "$self" secret serve >/dev/null 2>&1 && started=1
   fi
-  setsid nohup "$self" secret serve >/dev/null 2>&1 < /dev/null &
-  return 0
+  (( started )) || { setsid nohup "$self" secret serve >/dev/null 2>&1 < /dev/null & }
+  # A seat can still win the bind between our look and the page's start: look
+  # again once something listens (bounded; the page binds in well under a second).
+  local deadline=$(( $(date +%s) + SECRET_DROP_BIND_S ))
+  while :; do
+    held=0; uid=$(_secret_drop_port_holder) || held=$?
+    (( held == 2 )) && { printf '%s' "$uid"; return 2; }
+    (( held == 0 )) && return 0
+    (( $(date +%s) >= deadline )) && return 0
+    sleep "$SECRET_DROP_POLL_S"
+  done
 }
 
 # ---- secret serve ----------------------------------------------------------
