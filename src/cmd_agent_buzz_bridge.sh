@@ -92,9 +92,13 @@ _buzz_mirror_outbound() {
   # environment: the private key belongs to that uid and stays inside it. `env -i`
   # is deliberate — a mirror must not hand the relay the caller's environment.
   # Timeout because a hung relay must not hold up a delivered send.
-  timeout 20 sudo -u "$invoker" env -i \
+  # DIVE-5805: the key rides STDIN and is exported inside the seat's shell. As
+  # `BUZZ_PRIVATE_KEY=...` on the sudo line it was argv, which sudo logs as
+  # COMMAND= into the system journal.
+  printf '%s\n' "$key" | timeout 20 sudo -u "$invoker" env -i \
       HOME="/home/${invoker}" PATH=/usr/local/bin:/usr/bin:/bin \
-      BUZZ_RELAY_URL="$relay" BUZZ_PRIVATE_KEY="$key" \
+      BUZZ_RELAY_URL="$relay" \
+      bash -c 'IFS= read -r BUZZ_PRIVATE_KEY; export BUZZ_PRIVATE_KEY; exec "$@" </dev/null' _ \
       "$bin" messages send --channel "$chan" \
       --content "$(printf '@%s\n%s' "$receiver" "$trimmed")" \
     >/dev/null 2>&1 || true

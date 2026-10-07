@@ -8535,14 +8535,21 @@ _hb_consolidate_seat_user() {
 #
 # Both are split so a unit harness can grade them without root, sudo or a real
 # seat: `_hb_distiller_seed_env` is `set -a` + `.` over two paths, and
-# `_hb_distiller_preserve_list` is a pure inspection of the environment it
-# leaves behind. Call them in a SUBSHELL — `set -a` sourcing into a long-lived
-# process is how one seat's token reaches the next seat's child.
+# `_hb_distiller_env_feed` is a pure inspection of the environment it leaves
+# behind. Call them in a SUBSHELL — `set -a` sourcing into a long-lived process
+# is how one seat's token reaches the next seat's child.
+#
+# DIVE-5805: the values cross sudo on STDIN, never as environment or argv.
+# `sudo --preserve-env=<names>` (the DIVE-584 shape) made sudo log every
+# preserved variable WITH ITS VALUE — `ENV=CLAUDE_CODE_OAUTH_TOKEN=sk-ant-…` —
+# into the journal and auth.log on every pass, and every seat was in group
+# systemd-journal. argv is no better: sudo logs the whole COMMAND= line. sudo
+# logs neither stdin nor anything the child reads from it.
 
 # The credential variables the distiller needs, in the order `5dive-agent-start`
-# seeds them. Named explicitly rather than passing the whole environment: a
-# blanket `--preserve-env` would carry the heartbeat's own PATH, HOME and
-# TMPDIR into a seat's child and undo the `-H` this call is written with.
+# seeds them. Named explicitly rather than feeding the whole environment: the
+# heartbeat's own PATH, HOME and TMPDIR would reach a seat's child and undo the
+# `-H` this call is written with.
 _HB_DISTILLER_ENV_VARS="${_HB_DISTILLER_ENV_VARS:-ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL}"
 
 # `_hb_distiller_seed_env <shared-env> <profile-env>` — source what is readable,
@@ -8562,18 +8569,19 @@ _hb_distiller_seed_env() {  # <shared-env> <profile-env>
   return 0
 }
 
-# `_hb_distiller_preserve_list` — the comma-joined names of the credential
-# variables that are actually SET and non-empty, for `sudo --preserve-env=`.
-# EMPTY when none is: the caller then invokes sudo with no `--preserve-env` at
-# all, so a box where this read found nothing behaves exactly as it did before
-# this row, and `memory consolidate` reports `distiller_unauthed` (DIVE-4562)
-# rather than the child inventing a reason.
-_hb_distiller_preserve_list() {
-  local v out=""
+# `_hb_distiller_env_feed` — one `export NAME=<%q-quoted value>` line per
+# credential variable that is actually SET and non-empty, for the child to
+# `eval` from its stdin. EMPTY when none is: the child then evals nothing, so a
+# box where this read found nothing behaves exactly as before, and
+# `memory consolidate` reports `distiller_unauthed` (DIVE-4562) rather than the
+# child inventing a reason. %q is what makes the eval safe: the value is quoted
+# by the same shell that reads it back, whatever bytes it holds.
+_hb_distiller_env_feed() {
+  local v
   for v in $_HB_DISTILLER_ENV_VARS; do
-    if [ -n "${!v:-}" ]; then out="${out:+$out,}$v"; fi
+    if [ -n "${!v:-}" ]; then printf 'export %s=%q\n' "$v" "${!v}"; fi
   done
-  printf '%s' "$out"
+  return 0
 }
 
 _hb_memory_consolidate_sweep() {
@@ -8682,11 +8690,12 @@ _hb_memory_consolidate_sweep() {
     # and only this child was not. Measured on claude-lab: 20 consecutive passes.
     #
     # The heartbeat is root and CAN read both. So it sources them here and hands
-    # the variables to the child through the ENVIRONMENT (`--preserve-env`,
-    # never argv — a token in argv is in every `ps` line on the box). The
-    # in-child sourcing stays as the fallback for a seat that can read the files
-    # and a sudoers policy that refuses to preserve: it is now a second chance,
-    # not the only one.
+    # the variables to the child on its STDIN (DIVE-5805). Not argv — a token
+    # there is in every `ps` line and in sudo's COMMAND= log line. Not the
+    # environment either — `--preserve-env` made sudo log each value as
+    # `ENV=NAME=value` into a journal every seat could read. The child evals the
+    # feed, then closes stdin before it execs the CLI. The in-child sourcing
+    # stays as the second chance for a seat that can read the files.
     local sharedenv="${CONNECTORS_DIR:-/etc/5dive/connectors}/anthropic.env"
     local authenv="${ENV_DIR:-${STATE_DIR:-/var/lib/5dive}/agents.d}/${name}-auth.env"
     local out=""
@@ -8698,9 +8707,9 @@ _hb_memory_consolidate_sweep() {
     # the next seat's iteration, which is the credential cross-wiring this lane
     # exists to keep straight.
     out=$( _hb_distiller_seed_env "$sharedenv" "$authenv"
-           _hb_pe=$(_hb_distiller_preserve_list)
-           timeout "${_HB_CONSOLIDATE_TIMEOUT_S}" sudo -n ${_hb_pe:+--preserve-env="$_hb_pe"} -u "$user" -H bash -c \
-             'set -a; [ -r "$1" ] && . "$1"; [ -r "$2" ] && . "$2"; set +a; exec "$3" memory consolidate --max-sessions=1 --json' \
+           _hb_distiller_env_feed \
+           | timeout "${_HB_CONSOLIDATE_TIMEOUT_S}" sudo -n -u "$user" -H bash -c \
+             'eval "$(cat)"; set -a; [ -r "$1" ] && . "$1"; [ -r "$2" ] && . "$2"; set +a; exec "$3" memory consolidate --max-sessions=1 --json </dev/null' \
              _ "$sharedenv" "$authenv" "${SELF_BIN:-/usr/local/bin/5dive}" 2>/dev/null ) || out="${out:-}"
     local n_atoms n_proc n_dfail
     # `--slurp` and take the FIRST object that carries the field, because the

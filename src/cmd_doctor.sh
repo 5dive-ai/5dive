@@ -1087,6 +1087,30 @@ doctor_check_orphan_seats() {
     "$n agent-* seat(s) exist on the box with NO registry entry: ${names}${grp_clause}. 'agent rm' cannot reach them (the registry row is already gone); run with --fix to delete the accounts, clear the units and quarantine their homes (DIVE-4340)" true false
 }
 
+# doctor_check_journal_seats — DIVE-5805. Group systemd-journal reads the whole
+# system journal, which holds every argv and preserved variable sudo has ever
+# logged, values included. No agent-* seat may be a member. --fix takes them
+# out (the same helper the heartbeat's posture pass runs every tick); a seat
+# that is running keeps the read until its unit restarts, so the message says
+# so rather than reporting the box clean.
+doctor_check_journal_seats() {
+  local members
+  members=$(journal_seat_members | tr '\n' ' ' | sed 's/ $//')
+  if [[ -z "$members" ]]; then
+    doctor_add host journal-seats ok "no agent seat is in group ${JOURNAL_GROUP} — seats read only their own logs"
+    return 0
+  fi
+  if (( DOCTOR_REPAIR )); then
+    if journal_seats_drop; then
+      doctor_add host journal-seats ok "removed ${members} from group ${JOURNAL_GROUP}; a seat that is running keeps the read until its next restart" true true
+    else
+      doctor_add host journal-seats error "could not remove every seat from group ${JOURNAL_GROUP} (still: $(journal_seat_members | tr '\n' ' ')) — each can read every secret sudo has logged" true false
+    fi
+    return 0
+  fi
+  doctor_add host journal-seats error "${members} in group ${JOURNAL_GROUP}: each can read the whole system journal, including every key sudo has logged; fix: sudo 5dive doctor --fix" true false
+}
+
 # doctor_check_reaped_homes [dir]
 #
 # DIVE-2138 quarantines a removed agent's home under REAPED_DIR instead of
@@ -2337,6 +2361,9 @@ cmd_doctor() {
 
     # --- quarantined agent homes (report only, DIVE-2165) ---
     doctor_check_reaped_homes
+
+    # --- seats out of the system journal (DIVE-5805) ---
+    doctor_check_journal_seats
 
     if ! command -v needrestart >/dev/null 2>&1 && [[ ! -d /etc/needrestart ]]; then
       doctor_add host needrestart ok "needrestart not installed — no auto-restart cascade risk"

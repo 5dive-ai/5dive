@@ -1186,7 +1186,9 @@ AGENT_PLUGIN_INSTALL
   # cannot keep the newly credentialed channel disabled.
   if [[ "$plugin" == "telegram" ]]; then
     [[ -n "$token" ]] || fail "$E_VALIDATION" "telegram token missing for agent '$name'"
-    sudo -u "$user" -H env TOKEN="$token" bash -s <<'CLAUDE_TELEGRAM_STATE'
+    # DIVE-5805: the values ride STDIN ahead of the script, never argv —
+    # sudo logs argv (COMMAND=) into the system journal.
+    { printf 'export TOKEN=%q\n' "$token"; cat <<'CLAUDE_TELEGRAM_STATE'; } | sudo -u "$user" -H bash -s
 set -euo pipefail
 STATE="$HOME/.claude/channels/telegram"
 ENV_FILE="$STATE/.env"
@@ -1226,7 +1228,9 @@ set_claude_telegram_env_key() {
   local user="agent-${name}" state
   state=$(_tg_access_state_dir "$user" claude) \
     || fail "$E_GENERIC" "no telegram state dir for agent '$name'"
-  if ! sudo -u "$user" env STATE="$state" KEY="$key" VAL="$val" bash -s <<'CLAUDE_TELEGRAM_ENV_KEY' >&2; then
+  # DIVE-5805: the values ride STDIN ahead of the script, never argv —
+  # sudo logs argv (COMMAND=) into the system journal.
+  if ! { printf 'export STATE=%q KEY=%q VAL=%q\n' "$state" "$key" "$val"; cat <<'CLAUDE_TELEGRAM_ENV_KEY'; } | sudo -u "$user" bash -s >&2; then
 set -euo pipefail
 ENV_FILE="$STATE/.env"
 TMP="$STATE/.env.tmp.$$"
@@ -1430,12 +1434,9 @@ install_channel_for_openclaw_agent() {
   fi
 
   step "Registering $plugin channel with openclaw for $user"
-  if ! sudo -u "$user" -H env \
-      PLUGIN="$plugin" \
-      TOKEN="$token" \
-      ALLOW_FROM_JSON="$allow_from_json" \
-      OWNER_ALLOW_FROM_JSON="$owner_allow_from_json" \
-      bash -s >&2 <<'OPENCLAW_CHANNEL'
+  # DIVE-5805: the values ride STDIN ahead of the script, never argv —
+  # sudo logs argv (COMMAND=) into the system journal.
+  if ! { printf 'export PLUGIN=%q TOKEN=%q ALLOW_FROM_JSON=%q OWNER_ALLOW_FROM_JSON=%q\n' "$plugin" "$token" "$allow_from_json" "$owner_allow_from_json"; cat <<'OPENCLAW_CHANNEL'; } | sudo -u "$user" -H bash -s >&2
 set -euo pipefail
 export NVM_DIR="/home/claude/.nvm"
 # shellcheck disable=SC1091
@@ -1526,7 +1527,9 @@ install_channel_for_hermes_agent() {
   fi
 
   step "Writing $plugin credential into ~/.hermes/.env for $user"
-  if ! sudo -u "$user" -H env PAIRS="$(printf '%s\n' "${pairs[@]}")" bash -s >&2 <<'HERMES_ENV'
+  # DIVE-5805: the values ride STDIN ahead of the script, never argv —
+  # sudo logs argv (COMMAND=) into the system journal.
+  if ! { printf 'export PAIRS=%q\n' "$(printf '%s\n' "${pairs[@]}")"; cat <<'HERMES_ENV'; } | sudo -u "$user" -H bash -s >&2
 set -euo pipefail
 ENV_FILE="$HOME/.hermes/.env"
 mkdir -p "$HOME/.hermes"
@@ -1584,7 +1587,9 @@ seed_hermes_byo_env() {
   local name="$1" var="$2" value="$3"
   local user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
-  if ! sudo -u "$user" -H env PAIR="$var=$value" bash -s >&2 <<'HERMES_BYO_ENV'
+  # DIVE-5805: the values ride STDIN ahead of the script, never argv —
+  # sudo logs argv (COMMAND=) into the system journal.
+  if ! { printf 'export PAIR=%q\n' "$var=$value"; cat <<'HERMES_BYO_ENV'; } | sudo -u "$user" -H bash -s >&2
 set -euo pipefail
 ENV_FILE="$HOME/.hermes/.env"
 mkdir -p "$HOME/.hermes"
@@ -1667,7 +1672,9 @@ install_channel_for_codex_agent() {
   # the TELEGRAM_BOT_TOKEN line so a rotated token doesn't leave a stale value;
   # tmpfile + mv so a crash mid-write can't blank the file.
   step "Writing telegram token into ~/.codex/channels/telegram/.env for $user"
-  if ! sudo -u "$user" -H env TOKEN="$token" bash -s >&2 <<'CODEX_ENV'
+  # DIVE-5805: the values ride STDIN ahead of the script, never argv —
+  # sudo logs argv (COMMAND=) into the system journal.
+  if ! { printf 'export TOKEN=%q\n' "$token"; cat <<'CODEX_ENV'; } | sudo -u "$user" -H bash -s >&2
 set -euo pipefail
 mkdir -p "$HOME/.codex/channels/telegram"
 chmod 700 "$HOME/.codex" "$HOME/.codex/channels" "$HOME/.codex/channels/telegram" 2>/dev/null || true
@@ -1803,7 +1810,9 @@ install_channel_for_grok_agent() {
   fi
 
   step "Writing telegram token into ~/.grok/channels/telegram/.env for $user"
-  if ! sudo -u "$user" -H env TOKEN="$token" bash -s >&2 <<'GROK_ENV'
+  # DIVE-5805: the values ride STDIN ahead of the script, never argv —
+  # sudo logs argv (COMMAND=) into the system journal.
+  if ! { printf 'export TOKEN=%q\n' "$token"; cat <<'GROK_ENV'; } | sudo -u "$user" -H bash -s >&2
 set -euo pipefail
 mkdir -p "$HOME/.grok/channels/telegram"
 chmod 700 "$HOME/.grok" "$HOME/.grok/channels" "$HOME/.grok/channels/telegram" 2>/dev/null || true
@@ -1931,7 +1940,9 @@ install_channel_for_antigravity_agent() {
   fi
 
   step "Writing telegram token into ~/.gemini/channels/telegram/.env for $user"
-  if ! sudo -u "$user" -H env TOKEN="$token" bash -s >&2 <<'AGY_ENV'
+  # DIVE-5805: the values ride STDIN ahead of the script, never argv —
+  # sudo logs argv (COMMAND=) into the system journal.
+  if ! { printf 'export TOKEN=%q\n' "$token"; cat <<'AGY_ENV'; } | sudo -u "$user" -H bash -s >&2
 set -euo pipefail
 mkdir -p "$HOME/.gemini/channels/telegram"
 chmod 700 "$HOME/.gemini" "$HOME/.gemini/channels" "$HOME/.gemini/channels/telegram" 2>/dev/null || true
@@ -2061,7 +2072,9 @@ install_channel_for_opencode_agent() {
   fi
 
   step "Writing telegram token into ~/.opencode/channels/telegram/.env for $user"
-  if ! sudo -u "$user" -H env TOKEN="$token" bash -s >&2 <<'OPENCODE_ENV'
+  # DIVE-5805: the values ride STDIN ahead of the script, never argv —
+  # sudo logs argv (COMMAND=) into the system journal.
+  if ! { printf 'export TOKEN=%q\n' "$token"; cat <<'OPENCODE_ENV'; } | sudo -u "$user" -H bash -s >&2
 set -euo pipefail
 mkdir -p "$HOME/.opencode/channels/telegram"
 chmod 700 "$HOME/.opencode" "$HOME/.opencode/channels" "$HOME/.opencode/channels/telegram" 2>/dev/null || true
@@ -2195,7 +2208,9 @@ install_channel_for_pi_agent() {
   fi
 
   step "Writing telegram token into ~/.pi/channels/telegram/.env for $user"
-  if ! sudo -u "$user" -H env TOKEN="$token" bash -s >&2 <<'PI_ENV'
+  # DIVE-5805: the values ride STDIN ahead of the script, never argv —
+  # sudo logs argv (COMMAND=) into the system journal.
+  if ! { printf 'export TOKEN=%q\n' "$token"; cat <<'PI_ENV'; } | sudo -u "$user" -H bash -s >&2
 set -euo pipefail
 mkdir -p "$HOME/.pi/channels/telegram"
 chmod 700 "$HOME/.pi" "$HOME/.pi/channels" "$HOME/.pi/channels/telegram" 2>/dev/null || true
