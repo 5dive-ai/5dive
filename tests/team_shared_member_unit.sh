@@ -263,7 +263,8 @@ eq_t 'G2 and theo is in both' 'content,diveteam' "$(_team_member_teams theo | so
 _fresh_box '{"agents":{}}'
 cmd_team import "$TMP/diveteam.5dive.yaml" >/dev/null 2>&1; : > "$FAKE_LOG"
 cmd_team import "$TMP/content.5dive.yaml" --start-now >/dev/null 2>&1
-grep -E '^task add ' "$FAKE_LOG" | grep -F "Plan this month's content calendar" | grep -qF -- '--assignee=theo' \
+_s19b=$(grep -E '^task add ' "$FAKE_LOG" | grep -F "Plan this month's content calendar")
+grep -qF -- '--assignee=theo' <<<"$_s19b" \
   && ok_t "S19b with --start-now, B's goal is filed for theo" || bad_t 'S19b goal filed' "$(grep '^task add' "$FAKE_LOG")"
 
 # ============ 6. CONTROLS =====================================================
