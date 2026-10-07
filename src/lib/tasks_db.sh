@@ -4214,6 +4214,20 @@ _gate_drop_link_ok() { # <task id> <link hash>
   local exp; exp=$(sed -n 's/^expires=//p' "$f")
   [[ "$exp" =~ ^[0-9]+$ ]] && (( exp > $(date +%s) )) || return 1
   local cdir="${CONNECTORS_DIR:-/etc/5dive/connectors}"
+  # DIVE-5772: two connectors do not write `<conn>.env`, so reading only that file
+  # refused EVERY drop to them and the gate stayed open after the value landed
+  # (DIVE-5771, the first tools drop: lodar had to tap Provided). `tools` is the
+  # shared tools.sh, as `export KEY='value'` (DIVE-5370); `project-<app>` is that
+  # app's own .env/.env.local (DIVE-5664). Same question, the file the write used.
+  if [[ "$conn" == tools ]]; then
+    grep -qE "^export ${key}='[^']" "${cdir}/tools.sh" 2>/dev/null
+    return
+  fi
+  if [[ "$conn" == project-* ]]; then
+    local pf; pf=$(_secret_project_file "$conn" 2>/dev/null) || return 1
+    grep -qE "^(export[[:space:]]+)?${key}=." "$pf" 2>/dev/null
+    return
+  fi
   grep -q "^${key}=" "${cdir}/${conn}.env" 2>/dev/null && return 0
   # DIVE-5384: a multi-line value landed as its own file, named by our exact
   # pointer line. Both must hold: the line, and a non-empty regular file.

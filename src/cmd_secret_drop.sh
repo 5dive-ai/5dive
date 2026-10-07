@@ -234,6 +234,59 @@ _secret_drop_peek() {
      --arg i "$ident" --arg k "$key" --arg c "$connector" --arg a "$ask" --arg g "$agent" --arg x "$exp"
 }
 
+# ---- DIVE-5772: the drop closes its own gate, and says so when it cannot ----
+#
+# lodar, 2026-10-07: "i already click submit why i need to go back to chat and
+# press provided". The clear used to be one `task answer ... >/dev/null 2>&1 ||
+# true`: a refusal or a busy store was thrown away, the page said "did not
+# update", and the owner was told to go and tell the agent himself.
+
+# One line to the journal (`journalctl -t 5dive-secret-drop`). Never the value:
+# nothing here ever holds it.
+_secret_drop_log() {
+  local msg="5dive secret drop: $*"
+  printf '%s\n' "$msg" >&2
+  command -v logger >/dev/null 2>&1 && logger -t 5dive-secret-drop -- "$msg" 2>/dev/null || true
+}
+
+# Where the value now is, in words an agent can act on.
+_secret_drop_where() {
+  case "$2" in
+    tools) printf 'every agent'"'"'s environment, as $%s' "$1" ;;
+    project-*) printf 'the %s app'"'"'s env file' "${2#project-}" ;;
+    *) printf '%s/%s.env' "${CONNECTORS_DIR:-/etc/5dive/connectors}" "$2" ;;
+  esac
+}
+
+# Clear the gate with the redeemed link as evidence. A busy store is retried
+# (the store is shared by every seat and backed up while it runs); a refusal is
+# not, because it would refuse again. Every attempt that does not clear is
+# logged with what `task answer` said. 0 = the row reads answered.
+_secret_drop_clear() { # <ident> <hash> <id>
+  local ident="$1" hash="$2" id="$3" five out rc n
+  five=$(five_self_bundle 2>/dev/null) || five=5dive
+  for n in 1 2 3 4; do
+    rc=0
+    out=$("$five" task answer "$ident" --human --from=drop --drop-link="$hash" 2>&1 >/dev/null) || rc=$?
+    [[ -n "$id" && -n "$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};" 2>/dev/null)" ]] && return 0
+    _secret_drop_log "task answer $ident (attempt $n of 4) did not clear the gate: rc=$rc ${out//$'\n'/ | }"
+    case "$out" in *locked*|*busy*|*BUSY*) ;; *) (( rc == 0 )) || return 1 ;; esac
+    (( n < 4 )) && sleep "$n"
+  done
+  return 1
+}
+
+# The clear did not take: the owner has done his part, so the box tells the
+# agent directly (woken), and the owner is asked for nothing.
+_secret_drop_tell_agent() { # <ident> <id> <key> <connector>
+  local ident="$1" id="$2" key="$3" conn="$4" agent five
+  agent=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),assignee,'') FROM tasks WHERE id=${id};" 2>/dev/null)
+  [[ -n "$agent" ]] || { _secret_drop_log "$ident: no agent to tell that $key was saved"; return 0; }
+  five=$(five_self_bundle 2>/dev/null) || five=5dive
+  "$five" agent send "$agent" --wake --message="${ident}: your owner saved ${key} through the secure link — it is in $(_secret_drop_where "$key" "$conn"). The gate could not be closed on its own (journalctl -t 5dive-secret-drop says why). Use the value; do not ask for it again." >/dev/null 2>&1 \
+    || _secret_drop_log "$ident: could not tell $agent that $key was saved"
+}
+
 # _redeem --hash=<h>, value on stdin: write it, then burn every link for the gate.
 # One lock across check, write and burn, so two tabs posting at once write once.
 _secret_drop_redeem() {
@@ -268,14 +321,15 @@ _secret_drop_redeem() {
   # here, and `gate-proof enforce on` refuses a bare --human (main's on-box arm,
   # 2026-10-01: the value landed and the gate stayed open). Called through this
   # same bundle, so the evidence check is the one that minted the link.
-  local five; five=$(five_self_bundle 2>/dev/null) || five=5dive
-  "$five" task answer "$ident" --human --from=drop --drop-link="$hash" >/dev/null 2>&1 || true
+  _secret_drop_clear "$ident" "$hash" "$id" || true
   _secret_drop_burn_task "$ident"
   exec 8>&-
-  # Say "told" only when the row says so. A distinct code lets the page tell the
-  # owner where the value is instead of claiming a clear that did not happen.
+  # Say "told" only when the row says so. A distinct code lets the page say the
+  # value is saved without claiming a clear that did not happen. DIVE-5772: the
+  # owner is never asked to do anything about it — the box tells the agent.
   if [[ -n "$id" && -z "$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")" ]]; then
-    fail "$E_AUTH_REQUIRED" "saved $key in ${connector}.env, but $ident did not update; tell its agent the value is there"
+    _secret_drop_tell_agent "$ident" "$id" "$key" "$connector"
+    fail "$E_AUTH_REQUIRED" "saved $key ($(_secret_drop_where "$key" "$connector")), but $ident did not update; its agent was told directly"
   fi
   ok "saved $key for $ident" '{task: $i, key: $k, connector: $c}' \
      --arg i "$ident" --arg k "$key" --arg c "$connector"
@@ -541,10 +595,12 @@ class Handler(BaseHTTPRequestHandler):
         if rc == 3:
             return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>The server refused that value. The link still works.</p>"))
         if rc == 6:
-            # Saved, but the task row did not take the clear: never claim "told".
-            return self.send_page(200, page("Saved", "<h1>Saved on your server</h1><p>But the task did not update. "
-                "Tell your agent it is in <code>%s.env</code> as <code>%s</code>. You can close this tab.</p>"
-                % (html.escape(what.get("connector", "its connector")), html.escape(what.get("key", "the key")))))
+            # Saved, but the task row did not take the clear: never claim the task
+            # moved. DIVE-5772: never ask the owner to do anything either — the box
+            # has already told the agent itself.
+            return self.send_page(200, page("Saved", "<h1>Saved on your server</h1><p><code>%s</code> is saved, "
+                "and your agent has been told it is there. Nothing else to do. You can close this tab.</p>"
+                % html.escape(what.get("key", "The value"))))
         if rc != 0: return self.gone(rc)
         d = json.loads(out).get("data", {})
         return self.send_page(200, page("Saved", "<h1>Saved</h1><p>%s is on your server now, and %s has been told. "
