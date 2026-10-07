@@ -909,6 +909,9 @@ _gate_owner_from_args() {
         a="${a#*github.com/}"; printf '%s' "${a%%/*}"; return 0 ;;
       --repo=*)
         a="${a#--repo=}"; printf '%s' "${a%%/*}"; return 0 ;;
+      # DIVE-5758: a REST path (`gh api repos/<owner>/<repo>/…`), as a commit's landing read asks.
+      repos/*/*)
+        [[ "$prev" == "api" ]] && { a="${a#repos/}"; printf '%s' "${a%%/*}"; return 0; } ;;
     esac
     if [[ "$prev" == "--repo" && "$a" == */* ]]; then printf '%s' "${a%%/*}"; return 0; fi
     prev="$a"
@@ -2531,14 +2534,28 @@ _gate_notice_due() {
 # and `task show` share. The writers (_task_record_unbound, deliver, unbind-pr) stay
 # in delivery.sh.
 
-# _task_pr_url_key <url> — `owner/repo#N`, lowercased, or nothing if <url> is not
-# a GitHub pull URL. The comparison key: `…/pull/295/files`, a trailing `#issue…`
+# _task_pr_url_key <url> — `owner/repo#N` (or `owner/repo@sha` for a commit URL,
+# DIVE-5758), lowercased, or nothing if <url> is neither. The comparison key: `…/pull/295/files`, a trailing `#issue…`
 # anchor and a case difference in the owner all name the same pull request.
 _task_pr_url_key() {
   local u="${1:-}" re='^https?://(www\.)?github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([0-9]+)'
-  [[ "$u" =~ $re ]] || return 0
-  local k="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}#${BASH_REMATCH[4]}"
+  local cre='^https?://(www\.)?github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/commit/([0-9A-Fa-f]{7,40})([/?#].*)?$'
+  local k
+  if [[ "$u" =~ $re ]]; then
+    k="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}#${BASH_REMATCH[4]}"
+  elif [[ "$u" =~ $cre ]]; then
+    # DIVE-5758: a bound COMMIT (a direct-to-main repo has no pull request) keys as
+    # `owner/repo@sha`, so unbind-pr and the bound set's dedup can name it.
+    k="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}@${BASH_REMATCH[4]}"
+  else
+    return 0
+  fi
   printf '%s\n' "${k,,}"
+}
+
+# _task_is_commit_url <url> — 0 when <url> is a GitHub COMMIT URL (DIVE-5758).
+_task_is_commit_url() {
+  [[ "$(_task_pr_url_key "${1:-}")" == *@* ]]
 }
 
 # _task_companion_refs <id> — the row's companion pull URLs, one per line.

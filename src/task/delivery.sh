@@ -642,7 +642,7 @@ _task_grade_derive_repo() {  # <id> <ident>
   local num; num=$(printf '%s' "$ident" | tr '[:upper:]' '[:lower:]')
   here=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
   want=$(_task_pr_url_key "$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null)")
-  want="${want%%#*}"
+  want="${want%%#*}"; want="${want%%@*}"
   have=$(_task_grade_origin_slug "$here")
   if [[ -z "$want" || -z "$have" || "$have" == "$want" ]]; then printf '%s' "$here"; return 0; fi
   for d in "${here%/*}"/*/; do
@@ -1769,7 +1769,7 @@ cmd_task_deliver() {
   local _k; _k=$(_task_pr_url_key "$pr"); _seen_pr["${_k:-$pr}"]=1
   for _p in "${prs[@]:1}"; do
     _k=$(_task_pr_url_key "$_p")
-    [[ -n "$_k" ]] || fail "$E_VALIDATION" "a second --pr must be a full GitHub pull URL (https://github.com/<org>/<repo>/pull/<n>) — got '$_p'. Every bound pull request is checked for its merge before the row closes, and one that cannot be read can never be confirmed (DIVE-4899)."
+    [[ -n "$_k" ]] || fail "$E_VALIDATION" "a second --pr must be a full GitHub pull or commit URL (https://github.com/<org>/<repo>/pull/<n> or …/commit/<sha>) — got '$_p'. Every bound pull request is checked for its merge before the row closes, and one that cannot be read can never be confirmed (DIVE-4899)."
     [[ -n "${_seen_pr[$_k]:-}" ]] && continue
     _seen_pr["$_k"]=1
     companions+=("$_p")
@@ -3907,6 +3907,14 @@ cmd_task_merge_landed() {
 
   local _ml
   _ml=$(_merge_landed_read "$dref" "$(_gate_slug_from_url "$dref")") || _ml=""
+  # DIVE-5758: a bound COMMIT is refused with what the forge said about it.
+  if [[ -z "$_ml" ]] && _task_is_commit_url "$dref"; then
+    local _cp; _cp=$(_merge_landed_probe "$dref" "")
+    if [[ "${_cp%%$'\x1f'*}" == "OPEN" ]]; then
+      fail "$E_CONFLICT" "${dref} is a commit that is NOT on the repository's default branch — $(printf '%s' "${_cp#*$'\x1f'}" | tr -d '\n') — so nothing was recorded and ${ident} still holds at MERGING, owed by '${owner}'. A bound commit lands when its sha is an ancestor of the default branch on the forge; push it there and re-run this, or record that it will not land with \`5dive task merge-declined ${ident} --reason=\"<why>\"\`."
+    fi
+    fail "$E_CONFLICT" "${dref} is a commit whose landing could NOT be read (GitHub did not answer whether it is on the default branch), so nothing was recorded and ${ident} still holds at MERGING, owed by '${owner}'. Re-run it; this verb records only a landing the forge itself reports."
+  fi
   [[ -n "$_ml" ]] \
     || fail "$E_CONFLICT" "${dref} does NOT read as merged (no mergedAt came back), so nothing was recorded and ${ident} still holds at MERGING, owed by '${owner}'. That is the same answer for a pull request that is still open, one closed without merging, one the queue ejected, and a GitHub that could not be asked at all — this verb records only a landing the forge itself reports. If it IS merged and this still refuses, the read could not reach GitHub: re-run it, or check the binding with \`gh pr view ${dref} --json state,mergedAt\`."
   local _sha="${_ml%%|*}" _at="${_ml#*|}"
@@ -4104,7 +4112,7 @@ cmd_task_unbind_pr() {
       --reason=*) why="${a#--reason=}" ;;
       --json) json=1 ;;
       -h|--help)
-        printf 'usage: 5dive task unbind-pr <ident> <pull-url> --reason="<why it is no longer part of this delivery>" [--json]\n\n  Drop a pull request from the set a row must see merged before it closes\n  (DIVE-5348). Runnable by the seat that owes the merge, the assignee, the maker\n  or the grader. The reason is shown on the row and audited. Merges nothing.\n'
+        printf 'usage: 5dive task unbind-pr <ident> <pull-or-commit-url> --reason="<why it is no longer part of this delivery>" [--json]\n\n  Drop a pull request from the set a row must see merged before it closes\n  (DIVE-5348). Runnable by the seat that owes the merge, the assignee, the maker\n  or the grader. The reason is shown on the row and audited. Merges nothing.\n'
         return 0 ;;
       --*) fail "$E_VALIDATION" "task unbind-pr: unknown flag '$a' — usage: 5dive task unbind-pr <ident> <pull-url> --reason=\"<why>\"" ;;
       *) if [[ -z "$ident" ]]; then ident="$a"; elif [[ -z "$url" ]]; then url="$a"; else fail "$E_USAGE" "unexpected arg: $a"; fi ;;
@@ -4118,7 +4126,7 @@ cmd_task_unbind_pr() {
   [[ -n "$why" ]] \
     || fail "$E_VALIDATION" "task unbind-pr ${ident} needs --reason=\"<why this pull request is no longer part of the delivery>\" — the row closes without it on the strength of that sentence, so the sentence IS the record. Nothing was written."
   local key; key=$(_task_pr_url_key "$url")
-  [[ -n "$key" ]] || fail "$E_VALIDATION" "'${url}' is not a GitHub pull URL (https://github.com/<owner>/<repo>/pull/<n>). Nothing was written."
+  [[ -n "$key" ]] || fail "$E_VALIDATION" "'${url}' is not a GitHub pull or commit URL (https://github.com/<owner>/<repo>/pull/<n> or …/commit/<sha>). Nothing was written."
 
   local row
   row=$(db "SELECT id||x'1f'||COALESCE(delivery_ref,'')||x'1f'||COALESCE(status,'')||x'1f'||
@@ -4138,7 +4146,7 @@ cmd_task_unbind_pr() {
     done|cancelled) fail "$E_CONFLICT" "${ident} is ${st} — a terminal row holds nothing open, so there is nothing to unbind." ;;
   esac
   [[ "$(_task_pr_url_key "$dref")" != "$key" ]] \
-    || fail "$E_CONFLICT" "${url} is ${ident}'s PRIMARY delivery (delivery_ref). This verb drops the pull requests bound BESIDE it; for the primary, record that it will never land with \`5dive task merge-declined ${ident} --reason=\"<why>\"\`, or re-point it with \`5dive task deliver ${ident} --pr=<url>\`. Nothing was written."
+    || fail "$E_CONFLICT" "${url} is ${ident}'s PRIMARY delivery (delivery_ref). This verb drops the pull requests bound BESIDE it; for the primary$(_task_is_commit_url "$dref" && printf ' commit, record that it landed with `5dive task merge-landed %s` (it reads whether the sha is on the default branch) or' "$ident"), record that it will never land with \`5dive task merge-declined ${ident} --reason=\"<why>\"\`, or re-point it with \`5dive task deliver ${ident} --pr=<url>\`. Nothing was written."
   local b found="" bound
   bound=$(_task_bound_pr_refs "$id")
   while IFS= read -r b; do [[ "$(_task_pr_url_key "$b")" == "$key" ]] && found="$b"; done <<<"$bound"
@@ -4214,6 +4222,8 @@ _merge_landed_read() {
 _merge_landed_probe() {
   local ref="$1" slug="${2:-}" out="" st sha at rest
   local -a repo_arg=()
+  # DIVE-5758: a COMMIT URL is a landing question too — see _merge_landed_commit_probe.
+  if _task_is_commit_url "$ref"; then _merge_landed_commit_probe "$ref"; return 0; fi
   [[ "$ref" =~ ^[0-9]+$ ]] && repo_arg=(--repo "$slug")
   out=$(_gate_gh "" 10 pr view "$ref" "${repo_arg[@]}" \
           --json state,mergedAt,mergeCommit \
@@ -4242,6 +4252,58 @@ _merge_landed_probe() {
     return 0
   fi
   printf 'OPEN\x1f%s\n' "${st:-unknown}"
+}
+
+# ── DIVE-5758 — A COMMIT URL LANDS WHEN ITS SHA IS ON THE DEFAULT BRANCH ──────
+#
+# MEASURED 2026-10-07 on a customer box: on a repo whose agents push
+# straight to main, `task deliver --pr=<…/commit/<sha>>` is the only binding there
+# is (grade-context refuses a row with none, DIVE-4634). The verifier PASSed, and
+# every exit from the merging stage then refused it: `merge-landed` asked `gh pr
+# view` about a commit, got no mergedAt, and said "not merged" of code that was
+# live; `merge-declined` recorded a false "no landing" and handed the row back to
+# its maker, whose re-delivery PASSed again. Four deliveries, three passes, three
+# lead sessions, one accepted change.
+#
+# So a commit URL is read for what it IS: the forge's compare of the default
+# branch against the sha. `identical` or `behind` means the sha is an ancestor of
+# the default branch — it landed, and the commit's own committer date is when.
+# `ahead` or `diverged` is an answer that it did not (OPEN, with the status as its
+# state). Anything else is UNKNOWN, which writes nothing. Same rails as a pull
+# request: an EMPTY token first, then the seat's owner-scoped read token.
+#
+# Prints the same one record `_merge_landed_probe` does.
+_merge_landed_commit_probe() {
+  local ref="$1" slug sha def out st base at rest
+  local re='^https?://(www\.)?github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/commit/([0-9A-Fa-f]{7,40})([/?#].*)?$'
+  [[ "$ref" =~ $re ]] || { printf 'UNKNOWN\x1f\n'; return 0; }
+  slug="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"; sha="${BASH_REMATCH[4],,}"
+  def=$(_merge_landed_commit_gh api "repos/${slug}" -q '.default_branch')
+  [[ "$def" =~ ^[A-Za-z0-9._/-]+$ ]] || { printf 'UNKNOWN\x1f\n'; return 0; }
+  out=$(_merge_landed_commit_gh api "repos/${slug}/compare/${def}...${sha}" \
+          -q '[ (.status // "null"), (.merge_base_commit.sha // "null"), (.merge_base_commit.commit.committer.date // "null") ] | join("|")')
+  _merge_landed_record_ok "$out" || { printf 'UNKNOWN\x1f\n'; return 0; }
+  st="${out%%|*}"; rest="${out#*|}"
+  base="${rest%%|*}"; at="${rest#*|}"
+  case "$st" in
+    identical|behind)
+      # The sha IS the merge base when it is behind the branch; anything else is a
+      # compare that answered a different question, and MERGED is the answer that writes.
+      [[ "${base,,}" == "$sha"* && -n "$at" && "$at" != "null" ]] || { printf 'UNKNOWN\x1f\n'; return 0; }
+      printf 'MERGED\x1f%s\x1f%s\n' "${base,,}" "$at" ;;
+    ahead|diverged)
+      printf 'OPEN\x1fnot on %s (compare: %s)\n' "$def" "$st" ;;
+    *) printf 'UNKNOWN\x1f\n' ;;
+  esac
+}
+
+# _merge_landed_commit_gh <gh args...> — the pull-request probe's two rails for a REST
+# read: credential-free first, then the owner-scoped read token (DIVE-5632).
+_merge_landed_commit_gh() {
+  local out=""
+  out=$(_gate_gh "" 10 "$@" 2>/dev/null) || out=""
+  [[ -n "$out" ]] || out=$(_gate_gh_owner_read 10 "$@" 2>/dev/null) || out=""
+  printf '%s' "$out"
 }
 
 # _merge_landed_record_ok <out> — 0 when <out> is a THREE-field `a|b|c` record.
