@@ -206,6 +206,22 @@ _memory_usage() {
       deleting true facts. Checks run read-only, with a timeout (default 20s),
       one at a time, under your own uid.
 
+  5dive memory truth on|off|status|run [--log=<path>] [--timeout=SEC] [--dry-run] [--json]
+      MEMORY-TRUTH PILOT (DIVE-5816), per seat. `on` writes the switch file
+      ~/.config/5dive/memory-truth for THIS seat only; with it absent every
+      other verb behaves exactly as before. While it is on:
+        - `memory add` (own store) with no --check gets valid_to = today+60d,
+          and `consolidate` atoms get today+30d — every new fact either
+          re-derives itself or expires;
+        - search, get and the MEMORY.md router say "may be outdated" on an
+          expired or check-red atom (a pinned router line carries the flag).
+      `run` (nightly, as the seat): backfills valid_to = the atom's own date
+      +60d onto every atom with no check and no expiry (mtime kept, nothing
+      deleted), runs `memory check` on the seat's own stores (never the wiki),
+      re-flags MEMORY.md in place, and appends ONE line to --log (default
+      /var/lib/5dive/memory-truth/<seat>.log): fresh / stale / unknown /
+      expired / no_check counts. It refuses on a seat where the pilot is off.
+
   5dive memory doctor [--roots=a,b] [--agent=<name>] [--code-root=<dir>] [--json]
       Hygiene pass over the memory store(s): index drift (MEMORY.md vs files on
       disk), dangling [[wiki-links]], stale source refs (file:line no longer in
@@ -249,6 +265,26 @@ _memory_router_budget() {
   [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -gt 0 ] || v="$_MEM_ROUTER_BUDGET_DEFAULT"
   printf '%s\n' "$v"
 }
+
+# DIVE-5816 — the memory-truth PILOT, one seat at a time. Baseline on the pilot
+# seat (agent-marketing, 2026-10-07): 927 atoms, 2 with a `check:`, 0 with a
+# `valid_to`, so nothing in recall could ever say a fact had gone out of date.
+# With the switch ON for a seat:
+#   - `memory add` to the own store with no --check (and no --valid-to) gets
+#     valid_to = today + 60d — `--no-check` alone is not enough there;
+#   - `memory consolidate` atoms get valid_to = today + 30d;
+#   - search / get / the MEMORY.md router say "may be outdated" on an expired or
+#     check-red atom, where the seat actually reads it;
+#   - `memory truth run` (nightly) backfills, checks and logs one line.
+# The switch is a FILE in the seat's own home, not an env var, because the
+# heartbeat runs consolidate under `sudo -u <seat> -H` with a scrubbed
+# environment — an env var on the seat's unit would never reach it. With the
+# file absent every verb behaves byte-for-byte as before.
+_MEM_TRUTH_ADD_DAYS=60
+_MEM_TRUTH_CONSOLIDATE_DAYS=30
+_memory_truth_switch() { printf '%s\n' "$HOME/.config/5dive/memory-truth"; }
+_memory_truth_on() { [ -f "$(_memory_truth_switch)" ]; }
+_memory_date_plus() { date -u -d "$1 +$2 days" +%F; }
 
 # Root helpers (DIVE-897): own stores, another agent's stores, the shared wiki.
 # Each emits a comma-separated list (may be empty).
@@ -393,6 +429,7 @@ const MAX_TOKENS = Number(opt("max-tokens", 1500));
 const ROOTS = String(opt("roots", "")).split(",").filter(Boolean);
 const INDEX = String(opt("index", "0")) === "1";   // DIVE-3821 stage 1: rows, not bodies
 const TODAY = new Date().toISOString().slice(0, 10);   // DIVE-1024: expiry compare
+const TRUTH = String(opt("truth", "0")) === "1";   // DIVE-5816 pilot seat: say "may be outdated"
 const estTokens = (s) => Math.ceil(s.length / 4);
 const STOP = new Set("a an and are as at be but by for from has have if in into is it its of on or that the their then there these this to was were will with you your our we".split(" "));
 const tokenize = (s) => s.toLowerCase().replace(/`[^`]*`/g, " ").replace(/[^a-z0-9]+/g, " ").split(" ").filter((t) => t.length > 1 && !STOP.has(t));
@@ -445,14 +482,16 @@ const CONF_MULT = { low: 0.5, medium: 0.85, high: 1, "": 1 };
 function lifecycle(m) {
   let mult = 1; const flags = [];
   if (!m) return { mult, flags };
-  if (m.validTo && m.validTo < TODAY) { mult *= 0.3; flags.push(`⚠ expired ${m.validTo}`); }
+  // DIVE-5816: on a pilot seat the two flags that mean "this may no longer be
+  // true" say so in words; the ranking is unchanged.
+  if (m.validTo && m.validTo < TODAY) { mult *= 0.3; flags.push(TRUTH ? `⚠ may be outdated (expired ${m.validTo})` : `⚠ expired ${m.validTo}`); }
   if (superseded.has(m.name)) { mult *= 0.2; flags.push("⤴ superseded"); }
   const cm = CONF_MULT[m.confidence] ?? 1; if (cm < 1) { mult *= cm; flags.push(`confidence:${m.confidence}`); }
   // DIVE-3885: a fact whose authored check went RED. Demoted and flagged, never
   // hidden and never deleted — the check may be the thing that broke, not the
   // fact. `unknown` (the checker could not run) is flagged at full rank: an
   // instrument failure is not evidence about the claim.
-  if (m.checkStatus === "stale") { mult *= 0.4; flags.push(`⚠ check red${m.checkedAt ? ` ${m.checkedAt}` : ""}`); }
+  if (m.checkStatus === "stale") { mult *= 0.4; const r = `check red${m.checkedAt ? ` ${m.checkedAt}` : ""}`; flags.push(TRUTH ? `⚠ may be outdated (${r})` : `⚠ ${r}`); }
   else if (m.checkStatus === "unknown") { flags.push("? check did not run"); }
   return { mult, flags };
 }
@@ -541,7 +580,8 @@ for (const d of scored) {
 }
 console.log(`— shown ${shown}/${scored.length} hits, ~${used} tokens —`);
 MEMJS
-  node "$js" "$query" --limit="$limit" --max-tokens="$maxtok" --roots="$roots" --index="$index"
+  local truth=0; _memory_truth_on && truth=1
+  node "$js" "$query" --limit="$limit" --max-tokens="$maxtok" --roots="$roots" --index="$index" --truth="$truth"
 }
 
 # memory add — the write/compile path (DIVE-897, DIVE-726 Phase 1b).
@@ -760,6 +800,12 @@ _memory_add() {
   # and wiki pages are unchanged — widening this would just farm --no-check.
   if [ "$store" = "mine" ] && [ "$type" = "reference" ] && [ "$check_set" -eq 0 ] && [ "$no_check_set" -eq 0 ]; then
     fail "$E_USAGE" "a --type=reference fact needs --check='<cmd whose exit code re-derives it>', or --no-check=\"<why it cannot have one>\" to record the gap (DIVE-3885)"
+  fi
+  # DIVE-5816: on a pilot seat an unchecked own-store fact gets an EXPIRY, so it
+  # can later say "may be outdated" instead of reading as true forever. An
+  # explicit --valid-to wins; the wiki is shared and stays out of the pilot.
+  if [ "$store" = "mine" ] && [ "$check_set" -eq 0 ] && [ -z "$valid_to" ] && _memory_truth_on; then
+    valid_to=$(_memory_date_plus "$(date -u +%F)" "$_MEM_TRUTH_ADD_DAYS")
   fi
 
   [ -t 0 ] && fail "$E_USAGE" "memory add reads the body on stdin — pipe or heredoc it"
@@ -1788,6 +1834,10 @@ _memory_consolidate() {
   # Sessions read from their last ledgered byte rather than from the top.
   local continued=0
   local -a written_files=()
+  # DIVE-5816: an auto-written atom has no author to re-check it, so on a pilot
+  # seat it expires sooner than a hand-written one (30d against add's 60d).
+  local -a truth_vt=()
+  _memory_truth_on && truth_vt=(--valid-to="$(_memory_date_plus "$(date -u +%F)" "$_MEM_TRUTH_CONSOLIDATE_DAYS")")
   local now; now=$(date +%s)
   local t
   # Newest first: the most recent dead session is the one whose loss hurts most.
@@ -1885,7 +1935,7 @@ _memory_consolidate() {
           --name="$a_name" --type="$a_type" --description="$a_desc" \
           --confidence="$a_conf" \
           --provenance="distilled from session $sid ($(date -u +%F))" \
-          --evidence="run:$sid" \
+          --evidence="run:$sid" ${truth_vt+"${truth_vt[@]}"} \
           --no-check="auto-distilled by memory consolidate — no author present to write a check (DIVE-3885)" ) 2>&1) || addrc=$?
       if [ "$addrc" -eq 0 ]; then
         n_written=$((n_written+1))
@@ -2070,6 +2120,8 @@ const opt = (k, d) => { const h = argv.find((a) => a.startsWith(`--${k}=`)); ret
 const wanted = argv.filter((a) => !a.startsWith("--"));
 const MAX_TOKENS = Number(opt("max-tokens", 8000));
 const ROOTS = String(opt("roots", "")).split(",").filter(Boolean);
+const TRUTH = String(opt("truth", "0")) === "1";   // DIVE-5816 pilot seat
+const TODAY = new Date().toISOString().slice(0, 10);
 const estTokens = (s) => Math.ceil(s.length / 4);
 function mdFiles(root) {
   const out = [];
@@ -2078,6 +2130,17 @@ function mdFiles(root) {
     for (const e of ents) { const full = path.join(d, e.name); if (e.isDirectory()) walk(full); else if (e.isFile() && e.name.endsWith(".md")) out.push(full); }
   };
   walk(root); return out;
+}
+// DIVE-5816: the same two conditions recall demotes on — an expiry in the past,
+// or an authored check that went red. Empty when the fact is not flagged.
+function outdated(text) {
+  const fm = /^---\n([\s\S]*?)\n---\n?/.exec(text);
+  if (!fm) return "";
+  const f = (k) => { const m = new RegExp(`^\\s*${k}:\\s*["']?(.+?)["']?\\s*$`, "m").exec(fm[1]); return m ? m[1].trim() : ""; };
+  const r = [];
+  if (f("check_status").toLowerCase() === "stale") r.push(`check red${f("checked_at") ? ` ${f("checked_at")}` : ""}`);
+  const vt = f("valid_to"); if (vt && vt < TODAY) r.push(`expired ${vt}`);
+  return r.join(", ");
 }
 // Slug normalisation: a row prints the frontmatter `name` when there is one and
 // the basename otherwise, and the two differ by - vs _ often enough that an
@@ -2102,6 +2165,7 @@ for (const w of wanted) {
   const f = byKey.get(norm(w));
   if (!f) { missing.push(w); continue; }
   let body = ""; try { body = fs.readFileSync(f, "utf-8"); } catch { missing.push(w); continue; }
+  const od = TRUTH ? outdated(body) : "";   // before any truncation can cut the frontmatter
   const home = process.env.HOME || "";
   const rel = f.replace(`${home}/.claude/projects/`, "").replace(`${home}/projects/5dive/`, "").replace("/home/claude/projects/5dive/", "");
   let cost = estTokens(body);
@@ -2115,6 +2179,9 @@ for (const w of wanted) {
   }
   used += cost; found++;
   console.log(`\n══ ${w}  ›  ${rel} ══\n`);
+  // DIVE-5816: the warning goes ABOVE the body — a reader who acts on the first
+  // lines of a fact must meet it before the claim, not after.
+  if (od) console.log(`⚠ may be outdated (${od}) — re-verify before acting on it.\n`);
   console.log(body.trimEnd() + note);
 }
 if (missing.length) {
@@ -2132,7 +2199,8 @@ console.log(`\n— fetched ${found}/${wanted.length} slug(s), ~${used} tokens �
 // Every slug missing is a failed fetch; a partial fetch still delivered work.
 process.exit(found === 0 ? 4 : 0);
 MEMGETJS
-  node "$js" "${slugs[@]}" --max-tokens="$maxtok" --roots="$roots"
+  local truth=0; _memory_truth_on && truth=1
+  node "$js" "${slugs[@]}" --max-tokens="$maxtok" --roots="$roots" --truth="$truth"
 }
 
 # memory router — DIVE-3821: rebuild an always-loaded MEMORY.md as a ROUTER.
@@ -2144,9 +2212,10 @@ MEMGETJS
 # the newest atoms; the other N-hundred stay on disk, unchanged, reachable
 # through `memory search --index` + `memory get`. NOTHING is deleted.
 _memory_router() {
-  local root="" agent="" budget="" recent=20 write=0
+  local root="" agent="" budget="" recent=20 write=0 annotate_only=0
   while [ $# -gt 0 ]; do
     case "$1" in
+      --annotate-only) annotate_only=1; write=1 ;;
       --root=*)    root="${1#*=}" ;;
       --agent=*)   agent="${1#*=}" ;;
       --budget=*)  budget="${1#*=}" ;;
@@ -2189,6 +2258,9 @@ const ROOT = opt("root", "");
 const BUDGET = Number(opt("budget", 20000));
 const RECENT = Number(opt("recent", 20));
 const WRITE = String(opt("write", "0")) === "1";
+const TRUTH = String(opt("truth", "0")) === "1";            // DIVE-5816 pilot seat
+const ANNOTATE_ONLY = String(opt("annotate-only", "0")) === "1";
+const TODAY = new Date().toISOString().slice(0, 10);
 const INDEX = path.join(ROOT, "MEMORY.md");
 
 const STOP = new Set("a an and are as at be but by for from has have if in into is it its of on or that the than then there these this to was were will with you your our we not no never only own one two md the its it's about after against all also any because been before being both can cannot did do does doing done down during each few first for further had having here how i if into itself just more most must my nor now off once other out over own same should so some such take that's their them themselves they this those through too under until up very what when where which while who whom why will would".split(/\s+/));
@@ -2215,9 +2287,50 @@ for (const e of entries) {
   }
   let type = field("type") || (fm ? (/^\s*metadata:/m.test(fm[1]) && /type:\s*(\w+)/m.exec(fm[1]) || [])[1] : "") || "";
   if (!type) { const p = e.name.split("_")[0]; type = ["user", "feedback", "project", "reference"].includes(p) ? p : "other"; }
-  atoms.push({ slug: field("name") || e.name.replace(/\.md$/, ""), file: e.name, desc, type, mtime: st.mtimeMs, bytes: st.size });
+  atoms.push({ slug: field("name") || e.name.replace(/\.md$/, ""), file: e.name, desc, type, mtime: st.mtimeMs, bytes: st.size,
+    validTo: field("valid_to"), checkStatus: field("check_status").toLowerCase(), checkedAt: field("checked_at") });
 }
 atoms.sort((a, b) => b.mtime - a.mtime);
+
+// DIVE-5816 — "may be outdated" where the seat READS memory. This file is loaded
+// every turn, so a pinned line pointing at an expired or check-red atom is the
+// most-read copy of that fact; search and get flagging it is not enough. The
+// marker sits right after the link (or the newest-list slug) it is about, and it
+// is STRIPPED before anything else, so re-running is idempotent and a fact that
+// goes green again loses its marker. Stripping runs on every seat — a seat
+// without the pilot has no markers, so its output is unchanged.
+const MARK_RE = / ⚠ may be outdated \([^)]*\)/g;
+const OUTDATED = new Map();
+for (const a of atoms) {
+  const r = [];
+  if (a.checkStatus === "stale") r.push(`check red${a.checkedAt ? ` ${a.checkedAt}` : ""}`);
+  if (a.validTo && a.validTo < TODAY) r.push(`expired ${a.validTo}`);
+  if (r.length) { OUTDATED.set(a.file, r.join(", ")); OUTDATED.set(a.slug, r.join(", ")); }
+}
+let flagged = 0;
+function annotate(text) {
+  const t = text.replace(MARK_RE, "");
+  if (!TRUTH) return t;
+  const mark = (m, key) => { const r = OUTDATED.get(key); if (!r) return m; flagged++; return `${m} ⚠ may be outdated (${r})`; };
+  return t
+    .replace(/\]\(([^)\s]+?\.md)\)/g, (m, f) => mark(m, path.basename(f)))
+    .replace(/^- `([^`]+)`/gm, (m, slug) => mark(m, slug));
+}
+if (ANNOTATE_ONLY) {
+  // The nightly pass: re-flag the index as it stands, never regenerate it — a
+  // regeneration would back the file up every night and reorder what the seat
+  // reads. Only the markers move.
+  let cur;
+  try { cur = fs.readFileSync(INDEX, "utf-8"); } catch { console.log(`memory router: no ${INDEX} — nothing to flag`); process.exit(0); }
+  const next = annotate(cur);
+  if (next !== cur) {
+    const tmp = `${INDEX}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, next, { mode: fs.statSync(INDEX).mode & 0o777 });
+    fs.renameSync(tmp, INDEX);
+  }
+  console.log(`memory router: ${flagged} line(s) in ${INDEX} flagged "may be outdated"${next !== cur ? "" : " (unchanged)"}`);
+  process.exit(0);
+}
 
 // Carry a hand-written block over verbatim. Direction, standing orders, the one
 // or two lines an agent wants in EVERY context — a generated router that eats
@@ -2294,7 +2407,8 @@ function build(kTopics, nRecent) {
 // because a router that cannot say how to fetch is worse than no router.
 let out = "", kT = 14, nR = RECENT;
 for (;;) {
-  out = build(kT, nR);
+  flagged = 0;
+  out = annotate(build(kT, nR));
   if (Buffer.byteLength(out) <= BUDGET) break;
   if (nR > 0) { nR = Math.max(0, nR - 5); continue; }
   if (kT > 3) { kT -= 3; continue; }
@@ -2315,7 +2429,9 @@ if (WRITE) {
   console.error(`\n— dry run: ${atoms.length} atoms · ${oldBytes} B → ${newBytes} B (budget ${BUDGET}). Pass --write to replace MEMORY.md (the old one is backed up).`);
 }
 MEMROUTERJS
-  node "$js" --root="$root" --budget="$budget" --recent="$recent" --write="$write"
+  local truth=0; _memory_truth_on && truth=1
+  node "$js" --root="$root" --budget="$budget" --recent="$recent" --write="$write" \
+    --truth="$truth" --annotate-only="$annotate_only"
 }
 
 # memory size — DIVE-4284 item 3: the READ that makes the regrowth visible.
@@ -2466,6 +2582,192 @@ _memory_size() {
   return 0
 }
 
+# memory truth — DIVE-5816: the pilot's switch and its nightly pass.
+#
+# `run` does four things, in this order, on the seat's OWN stores only (never
+# the shared wiki — this is a one-seat pilot and the wiki is every seat's):
+#   1. BACKFILL. An atom with neither a `check:` nor a `valid_to` gets
+#      valid_to = its own date + 60d: compiled_at / created / updated when the
+#      frontmatter has one, else the file's mtime. Its OWN date, so a store's
+#      old facts honestly read "may be outdated" now instead of all expiring on
+#      one day two months out. Idempotent: an atom that has either is skipped,
+#      so the nightly re-run only reaches what was written since (including the
+#      files the harness writes directly, which never pass through `add`).
+#      mtime is PRESERVED — the router ranks "newest" by it, and a backfill that
+#      touched every file would make the whole store look written today.
+#      Nothing is deleted and no body is edited. A file with no frontmatter is
+#      counted, not rewritten: it has no description, and a frontmatter block
+#      with none would make recall show its first field as the description.
+#   2. CHECK. `memory check` over the same stores (stamps fresh/stale/unknown).
+#   3. FLAG. Re-flag each store's MEMORY.md in place (`router --annotate-only`).
+#   4. LOG. Append ONE line — the line the pilot is judged on.
+_memory_truth() {
+  local sub="${1:-status}"; [ $# -gt 0 ] && shift
+  local log="" dry=0 timeout_s=20
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --log=*)     log="${1#*=}" ;;
+      --timeout=*) timeout_s="${1#*=}" ;;
+      --dry-run)   dry=1 ;;
+      --json)      JSON_MODE=1 ;;
+      -h|--help)   _memory_usage; return 0 ;;
+      *)           fail "$E_USAGE" "memory truth: unknown argument: $1" ;;
+    esac
+    shift
+  done
+  # The STORE OWNER, not the invoker: under `sudo -u <seat>` SUDO_USER names
+  # whoever typed it, and the log line must name the seat whose memory it counts.
+  local seat; seat=$(id -un); seat="${seat#agent-}"
+  [ -n "$log" ] || log="${FIVEDIVE_MEMORY_TRUTH_LOG:-${STATE_DIR:-/var/lib/5dive}/memory-truth/${seat}.log}"
+  local sw; sw=$(_memory_truth_switch)
+  case "$sub" in
+    on)
+      mkdir -p "$(dirname "$sw")" || fail "$E_GENERIC" "cannot create $(dirname "$sw")"
+      printf '# DIVE-5816 memory-truth pilot: ON for %s since %s. `5dive memory truth off` (or deleting this file) turns it off.\n' "$seat" "$(date -u +%F)" > "$sw"
+      echo "memory truth: ON for $seat ($sw)"
+      echo "  new unchecked memories now expire (add +${_MEM_TRUTH_ADD_DAYS}d, consolidate +${_MEM_TRUTH_CONSOLIDATE_DAYS}d); recall says \"may be outdated\"."
+      echo "  backfill + nightly: 5dive memory truth run   (log: $log)"
+      return 0 ;;
+    off)
+      [ -f "$sw" ] && rm -f -- "$sw"
+      echo "memory truth: OFF for $seat — expiries already written stay in the files; recall stops saying \"may be outdated\"."
+      return 0 ;;
+    status)
+      if _memory_truth_on; then echo "memory truth: ON for $seat ($sw)"; else echo "memory truth: OFF for $seat (no $sw)"; fi
+      echo "  log: $log"
+      [ -r "$log" ] && echo "  last: $(tail -n 1 "$log")" || :
+      return 0 ;;
+    run) : ;;
+    *) fail "$E_USAGE" "memory truth: unknown subcommand '$sub' (on | off | status | run)" ;;
+  esac
+
+  _memory_truth_on || fail "$E_VALIDATION" "memory truth run: the pilot is OFF for $seat — turn it on with \`5dive memory truth on\` (it rewrites this seat's memory files, so it never runs on a seat that did not opt in)"
+  command -v python3 >/dev/null 2>&1 || fail "$E_GENERIC" "memory truth needs python3"
+  local roots; roots=$(_memory_own_roots)
+  [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory store found under ~/.claude/projects/*/memory"
+  # Refuse BEFORE touching anything if the line cannot be written: a pass that
+  # backfilled and lost its log line is the one outcome the pilot cannot read.
+  if [ "$dry" -eq 0 ] && ! { [ -w "$log" ] || { [ ! -e "$log" ] && [ -w "$(dirname "$log")" ]; }; }; then
+    fail "$E_PERMISSION" "memory truth: cannot append to $log — create its dir writable by $(id -un) (e.g. install -d -m 2775 -g claude $(dirname "$log")), or pass --log=<path>"
+  fi
+
+  local _py
+  read -r -d '' _py <<'TRUTHPY' || :
+import datetime, json, os, re, sys
+mode, roots, days, write = sys.argv[1], [r for r in sys.argv[2].split(",") if r], int(sys.argv[3]), sys.argv[4] == "1"
+today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+FM = re.compile(r"\A---\n(.*?)\n---\n", re.S)
+DATE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+def has(front, key):
+    return re.search(r"^[ \t]*%s:" % re.escape(key), front, re.M) is not None
+def val(front, key):
+    m = re.search(r'^[ \t]*%s:[ \t]*["\']?(.*?)["\']?[ \t]*$' % re.escape(key), front, re.M)
+    return m.group(1) if m else ""
+def files():
+    for root in roots:
+        for dirpath, dirnames, names in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for n in sorted(names):
+                if n.endswith(".md") and n not in ("MEMORY.md", "index.md"):
+                    yield os.path.join(dirpath, n)
+c = dict(atoms=0, no_frontmatter=0, with_check=0, no_check=0, expired=0, dated=0, swept=0, sweep_failed=0)
+for path in files():
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        continue
+    c["atoms"] += 1
+    m = FM.match(text)
+    if not m:
+        c["no_frontmatter"] += 1; c["no_check"] += 1
+        continue
+    front = m.group(1)
+    if has(front, "check"):
+        c["with_check"] += 1
+    else:
+        c["no_check"] += 1
+    vt = val(front, "valid_to")
+    if mode == "sweep" and not has(front, "check") and not has(front, "valid_to"):
+        base = ""
+        for k in ("compiled_at", "created", "updated"):
+            d = DATE.search(val(front, k))
+            if d:
+                base = d.group(1); break
+        st = os.stat(path)
+        if not base:
+            base = datetime.datetime.fromtimestamp(st.st_mtime, datetime.timezone.utc).strftime("%Y-%m-%d")
+        vt = (datetime.date.fromisoformat(base) + datetime.timedelta(days=days)).isoformat()
+        # Own-store layout nests the envelope under `metadata:` (the same place
+        # `memory add` writes it); a top-level frontmatter gets it top-level.
+        meta = re.search(r"^metadata:[ \t]*$", front, re.M)
+        if meta:
+            nxt = re.match(r"\n([ \t]+)", front[meta.end():])
+            ind = nxt.group(1) if nxt else "  "
+            new_front = front[:meta.end()] + "\n" + ind + "valid_to: " + vt + front[meta.end():]
+        else:
+            new_front = front + "\nvalid_to: " + vt
+        if write:
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("---\n" + new_front + "\n---\n" + text[m.end():])
+                os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            except OSError:
+                c["sweep_failed"] += 1; continue
+        c["swept"] += 1
+    if vt:
+        if vt < today: c["expired"] += 1
+        else: c["dated"] += 1
+print(json.dumps(c))
+TRUTHPY
+
+  local sweep
+  sweep=$(python3 -c "$_py" sweep "$roots" "$_MEM_TRUTH_ADD_DAYS" "$([ "$dry" -eq 1 ] && echo 0 || echo 1)") \
+    || fail "$E_GENERIC" "memory truth: the backfill pass failed to run"
+
+  # `memory check` exits 1 when a fact went stale — a RESULT here, not a crash —
+  # and can `fail`, so it runs in a subshell and only its JSON is read.
+  local chk="" fresh="?" stale="?" unknown="?"
+  chk=$( ( JSON_MODE=1 _memory_check --roots="$roots" --timeout="$timeout_s" $([ "$dry" -eq 1 ] && echo --dry-run) ) 2>/dev/null ) || :
+  if printf '%s' "$chk" | jq -e '.data.total' >/dev/null 2>&1; then
+    fresh=$(printf '%s' "$chk" | jq '.data.fresh'); stale=$(printf '%s' "$chk" | jq '.data.stale'); unknown=$(printf '%s' "$chk" | jq '.data.unknown')
+  else
+    echo "memory truth: the check pass did not report — fresh/stale/unknown logged as '?'" >&2
+  fi
+
+  # Counts AFTER the backfill and the check, so expired/no_check describe the
+  # store as it now stands. A dry run counts what the sweep WOULD leave.
+  local cnt
+  if [ "$dry" -eq 1 ]; then cnt="$sweep"
+  else cnt=$(python3 -c "$_py" count "$roots" "$_MEM_TRUTH_ADD_DAYS" 0) || fail "$E_GENERIC" "memory truth: the count pass failed to run"
+  fi
+
+  local flagged=0 r n
+  local -a rr=()
+  IFS=, read -r -a rr <<<"$roots"
+  if [ "$dry" -eq 0 ]; then
+    for r in "${rr[@]}"; do
+      [ -f "$r/MEMORY.md" ] || continue
+      n=$( ( _memory_router --root="$r" --annotate-only ) 2>&1 | grep -oE '[0-9]+ line\(s\)' | grep -oE '^[0-9]+' ) || n=""
+      if [ -n "$n" ]; then flagged=$((flagged + n)); else echo "memory truth: could not re-flag $r/MEMORY.md" >&2; fi
+    done
+  fi
+
+  local line
+  line="$(date -u +%FT%TZ) seat=$seat atoms=$(jq '.atoms' <<<"$cnt") fresh=$fresh stale=$stale unknown=$unknown expired=$(jq '.expired' <<<"$cnt") no_check=$(jq '.no_check' <<<"$cnt") dated=$(jq '.dated' <<<"$cnt") swept=$(jq '.swept' <<<"$sweep") no_frontmatter=$(jq '.no_frontmatter' <<<"$cnt") index_flagged=$flagged"
+  if [ "$dry" -eq 0 ]; then
+    printf '%s\n' "$line" >> "$log" || fail "$E_PERMISSION" "memory truth: could not append to $log"
+  fi
+  if (( JSON_MODE )); then
+    jq -nc --arg line "$line" --arg log "$log" --argjson dry "$([ "$dry" -eq 1 ] && echo true || echo false)" \
+      --argjson sweep "$sweep" --argjson counts "$cnt" \
+      '{ok:true, data:{dry_run:$dry, log:$log, line:$line, sweep:$sweep, counts:$counts}}'
+  else
+    echo "$line"
+    [ "$dry" -eq 1 ] && echo "  (dry run — nothing written, no line appended to $log)" || echo "  appended to $log"
+  fi
+  return 0
+}
+
 cmd_memory() {
   local sub="${1:-}"; shift 2>/dev/null || true
   case "$sub" in
@@ -2477,6 +2779,7 @@ cmd_memory() {
     doctor|hygiene) _memory_doctor "$@" ;;
     consolidate|distill) _memory_consolidate "$@" ;;
     size|index-size) _memory_size "$@" ;;
+    truth)       _memory_truth "$@" ;;
     ""|-h|--help) _memory_usage ;;
     *)           _memory_usage; fail "$E_USAGE" "memory: unknown subcommand: $sub" ;;
   esac
