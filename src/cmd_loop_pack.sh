@@ -38,7 +38,7 @@ _loop_pack_help() {
   cat <<'EOF'
 5dive loop install — install a marketplace loop pack (recurring agentic workflow)
 
-  loop install   <slug> --onto=<agent> [--cron="<5-field>"] [--ceiling=<tokens>] [--dry-run]
+  loop install   <slug> --onto=<agent> [--cron="<5-field>"] [--ceiling=<tokens>] [--held-by=<DIVE-N>] [--dry-run]
   loop uninstall <slug> --from=<agent> [--purge-skills]
   loop show      <slug>
 
@@ -77,12 +77,14 @@ cmd_loop_pack_show() {
 
 # loop install <slug> --onto=<agent> [...] — wire the pack onto an agent.
 cmd_loop_pack_install() {
-  local slug="" onto="" cron_override="" ceiling="" dry=0
+  local slug="" onto="" cron_override="" ceiling="" dry=0 held_by=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --onto=*)    onto="${1#*=}" ;;
       --cron=*)    cron_override="${1#*=}" ;;
       --ceiling=*) ceiling="${1#*=}" ;;
+      # DIVE-5729: install the job PAUSED behind that row (team import's kickoff).
+      --held-by=*) held_by="${1#*=}" ;;
       --dry-run)   dry=1 ;;
       --)          shift; [[ -z "$slug" && $# -gt 0 ]] && { slug="$1"; shift; }; break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
@@ -153,7 +155,9 @@ cmd_loop_pack_install() {
 — installed loop: $slug (5dive marketplace). runs on '$cron'."
   [[ -n "$ceiling" ]] && body="$body advisory budget: ${ceiling} tokens/run (bound hard with: 5dive usage budget $onto)."
   local out ident
-  out=$(cmd_task_add --materialized "$job" --body="$body" --recurring="$cron" --assignee="$onto" --project=dive 2>/dev/null) || true
+  local -a held_args=()
+  [[ -n "$held_by" ]] && held_args=("--held-by=$held_by")
+  out=$(cmd_task_add --materialized "$job" --body="$body" --recurring="$cron" --assignee="$onto" --project=dive "${held_args[@]}" 2>/dev/null) || true
   if (( JSON_MODE )); then
     ident=$(jq -r '.data.ident // empty' <<<"$out" 2>/dev/null)
   else

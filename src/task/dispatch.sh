@@ -63,6 +63,9 @@ _task_usage() {
                                grader session and says so. --verify beats it; --no-verify never beats
                                the opposite, delivery-time UPGRADE (DIVE-2730).
       [--customer] [--already-blocked=<what it blocked>]   escapes for the internal-filing cap
+      [--held-by=<id|DIVE-N>]                   born blocked behind that row, in the same write
+                                                (no tick can start it first); freed when it closes
+      [--park=<why> --park-wake=<+Nh|+Nd>]      born parked, same write (DIVE-5729)
   ls [--status=] [--assignee=] [--mine] [--all] [--recurring]   open rows, priority-ordered
   ls --gated[=human|agent]                      only rows holding a live gate. The 'gate' column is
                                                 on EVERY ls: HUMAN:<type> a person owes an answer,

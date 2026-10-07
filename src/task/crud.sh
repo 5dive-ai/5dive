@@ -15,6 +15,7 @@ cmd_task_add() {
   local on_overlap="" overlap_bound=""   # DIVE-2272: per-template overlap policy
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
   local force_verify=""   # DIVE-4251: bare --verify, the row's demand for a grade
+  local held_by="" park_reason="" park_wake=""   # DIVE-5729: born held
   # DIVE-4324: the one filing-time review field, and whether a SEAT was pinned
   # by hand (`--verifier=`) rather than derived by the DIVE-969 default.
   local review_flag="" verifier_pinned=0
@@ -104,6 +105,13 @@ cmd_task_add() {
       # filing cap, which is about what a title IS, not how many there are.
       --materialized)      materialized="1" ;;
       --already-blocked=*) already_blocked="${1#*=}" ;;
+      # DIVE-5729: born HELD, in the same transaction as the insert, so no tick
+      # can dispatch (or materialize) the row in the gap a follow-up `task block`
+      # or `task park` would leave. --held-by is a dependency edge (released when
+      # that row closes, or by `task unblock`); --park is a timed park.
+      --held-by=*)   held_by="${1#*=}" ;;
+      --park=*)      park_reason="${1#*=}" ;;
+      --park-wake=*) park_wake="${1#*=}" ;;
       # DIVE-824: per-run spend cap carried on the row (sibling to verify --timeout).
       # Value is either a bare token count or a "$cost" dollar figure.
       --task-budget=*) task_budget="${1#*=}" ;;
@@ -118,6 +126,25 @@ cmd_task_add() {
   done
   local title="${words[*]:-}"
   [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [flags: 5dive task --help]"
+  # DIVE-5729: resolve the hold BEFORE anything is written. A hold behind a row
+  # that is already closed would release nothing and never be released by the
+  # cascade either, so it is refused rather than stored.
+  local held_by_id="" held_by_ident="" park_wake_sql=""
+  if [[ -n "$held_by" ]]; then
+    resolve_task_id "$held_by"; held_by_id="$RESOLVED_TASK_ID"; held_by_ident="$RESOLVED_TASK_IDENT"
+    [[ "$(db "SELECT CASE WHEN status IN ('done','cancelled') THEN 1 ELSE 0 END FROM tasks WHERE id=${held_by_id};")" == "0" ]] \
+      || fail "$E_VALIDATION" "--held-by=${held_by_ident} is already closed — a hold behind it would never be released"
+  fi
+  if [[ -n "$park_reason" || -n "$park_wake" ]]; then
+    [[ -n "$park_reason" && -n "$park_wake" ]] \
+      || fail "$E_USAGE" "--park=<why> and --park-wake=<+Nh|+Nd> go together (a park with no revisit is the block graveyard DIVE-1357 forbids)"
+    [[ -z "$held_by" ]] || fail "$E_USAGE" "--park and --held-by are two different holds — pick one"
+    case "$park_wake" in
+      +*h) [[ "${park_wake:1:-1}" =~ ^[0-9]+$ ]] && park_wake_sql="datetime('now', '+${park_wake:1:-1} hours')" ;;
+      +*d) [[ "${park_wake:1:-1}" =~ ^[0-9]+$ ]] && park_wake_sql="datetime('now', '+${park_wake:1:-1} days')" ;;
+    esac
+    [[ -n "$park_wake_sql" ]] || fail "$E_VALIDATION" "bad --park-wake '$park_wake' (use +Nh or +Nd)"
+  fi
   # DIVE-3107: a flag written AFTER the `--` end-of-flags separator is not a flag
   # at all — it is positional title text, and the parser above accepts it in
   # silence. DIVE-3100 was filed with a 628-char title whose text began
@@ -630,7 +657,10 @@ There is no bypass flag. If it is serious enough to need one, it is serious enou
   # loudly — at that point the fleet is genuinely saturated and refusing a serious
   # finding is the worse of the two failures. That branch existing is precisely
   # what lets the rest of the rule be strict.
+  # DIVE-5729: a row born held is not actionable, and the cap counts actionable
+  # rows only, so it is not counted against the lane either.
   if [[ "$kind" == "standard" && -z "$materialized" && "$task_budget" != "none" \
+        && -z "$held_by_id" && -z "$park_reason" \
         && "${FIVE_WIP_CAP:-1}" != "0" && -n "$assignee" ]] && _task_filing_cap_store_is_prod; then
     local _wcap _wact
     _wcap=$(_task_wip_cap "$assignee") || _wcap=""
@@ -833,8 +863,19 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   # ident exists yet (the AFTER INSERT trigger stamps it), so the refusal names
   # the title instead.
   _task_body_size_guard "$body" "the new row (${title:0:60})" "task set-body"
+  # DIVE-5729: the hold is written in the SAME transaction as the row, after the
+  # id is read back (the task_deps insert moves last_insert_rowid()).
+  local hold_sql=""
+  if [[ -n "$held_by_id" ]]; then
+    hold_sql="UPDATE tasks SET status='blocked' WHERE id=last_insert_rowid();
+           INSERT INTO task_deps (task_id, blocked_by) VALUES (last_insert_rowid(), ${held_by_id});"
+  elif [[ -n "$park_reason" ]]; then
+    hold_sql="UPDATE tasks SET status='blocked', parked_at=datetime('now'), park_reason=$(sqlq "$park_reason"),
+             wake_at=${park_wake_sql} WHERE id=last_insert_rowid();"
+  fi
   local id
-  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
+  id=$(db "BEGIN IMMEDIATE;
+           INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable,
                               verify_optout, verify_forced, review_mode, mutant_command, on_overlap, overlap_bound)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
@@ -842,7 +883,9 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
                    $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL),
                    $([[ -n "$no_verify" ]] && echo 1 || echo NULL), $([[ -n "$force_verify" ]] && echo 1 || echo NULL), $(sqlq_or_null "$review_mode"), $(sqlq_or_null "$mutant_stored"), ${on_overlap_sql}, ${overlap_bound_sql});
-           SELECT last_insert_rowid();")
+           SELECT last_insert_rowid();
+           ${hold_sql}
+           COMMIT;")
   # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
   # read it back rather than assuming the DIVE- prefix (DIVE-484).
   local ident; ident=$(db "SELECT ident FROM tasks WHERE id=${id};")
@@ -861,8 +904,11 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     signals="$(jq -cn --arg p "$priority" --arg v "${verifier:-}" '{via:"add", priority:$p, has_verifier:($v!="")}' 2>/dev/null)" \
     effect="$(jq -cn --arg t "$ident" --arg to "${assignee:-}" '{task:$t, from:null, to:(if $to=="" then null else $to end)}' 2>/dev/null)" \
     2>/dev/null || true
+  local hold_note=""
+  [[ -n "$held_by_id"  ]] && hold_note=" · HELD until ${held_by_ident} closes (or: 5dive task unblock ${ident})"
+  [[ -n "$park_reason" ]] && hold_note=" · PARKED — ${park_reason}"
   if [[ "$kind" == "recurring" ]]; then
-    ok "created recurring ${ident} (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title" \
+    ok "created recurring ${ident} (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title${hold_note}" \
        '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
        --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg f "$fresh_sql"
   else
@@ -947,7 +993,7 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
       (( verify_unavailable )) && _rv_by="no distinct grader available in this org"
       review_note+=" — you asked for '${_rm_asked}'; ${_rv_by} overruled it. Buy a grade back for one row with --verify, or change the box with '5dive config verify=…'"
     fi
-    ok "created ${ident} — $title${coord_note}${review_note}${verify_note}" \
+    ok "created ${ident} — $title${hold_note}${coord_note}${review_note}${verify_note}" \
        '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, verifyPolicy:$vp, verifyOverride:$vo, verifyDeferred:($vdf=="1"), reviewMode:$rm, reviewModeChosen:($rc=="1"), parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
        --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg vs "$verify_skipped" --arg v "${verifier:-}" \
        --arg vp "$_vp_policy" --arg vo "$_vp_override" --arg vdf "$_vp_deferred" \
