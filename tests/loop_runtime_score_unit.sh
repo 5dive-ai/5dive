@@ -27,7 +27,9 @@ cmd_send() { :; }   # no agent bus in the harness
 RX_ON=false; RX_CHOICE=neutral; RX_CONF=0.9; RX_CALLS=0
 reflex_configured() { printf '%s' "$RX_ON"; }
 reflex_model_resolve() { _REFLEX_MODEL=stub/model; }
+RX_FAIL=0
 _reflex_endpoint_decide() { cat >"$TMP/rx.req"; echo $((RX_CALLS+1)) >"$TMP/rx.calls"
+  (( RX_FAIL )) && return 1
   jq -cn --arg c "$RX_CHOICE" --argjson f "$RX_CONF" '{choice:$c, confidence:$f}'; }
 set +e
 PASS=0; FAIL=0
@@ -80,7 +82,7 @@ t "S4 no Score loop run row" "0" "$(rows)"
 out=$(cmd_task_loop_feedback "$RC" --text="this is wrong, half the sources are missing" 2>&1)
 t "S5 keyword complaint lowers 80 -> 20" "true|keyword|20" "$(jq -r '"\(.data.lowered)|\(.data.by)|\(.data.score)"' <<<"$out")"
 t "S5 note names the complaint" "owner complained: this is wrong, half the sources are missing" "$(score "$RC" .note)"
-t "S5 no model call for a keyword hit" "" "$(cat "$TMP/rx.calls" 2>/dev/null)"
+t "S5 reflex off: the floor decides, no model call" "" "$(cat "$TMP/rx.calls" 2>/dev/null)"
 # The same reply again (same --at) is counted once.
 R=$(mk_run "$M"); close_run "$R"; RW=$R
 cmd_task_loop_feedback "$RW" --text="bad" --at="$(db "SELECT done_at FROM tasks WHERE ident='$RW';")" >/dev/null 2>&1
@@ -112,7 +114,40 @@ t "S6 confident complaint: lowered by the model" "true|model|20" "$(jq -r '"\(.d
 R=$(mk_run "$M"); close_run "$R"; RP=$R; RX_CHOICE=praise
 out=$(cmd_task_loop_feedback "$RP" --text="nice one, keep it like this" 2>&1)
 t "S6 praise does not raise or lower" "false|80" "$(jq -r .data.lowered <<<"$out")|$(score "$RP")"
+# Praise that SAYS a keyword (quinn, it1): with reflex on the model decides, so a
+# keyword never skips the call; with reflex off the floor ignores the negated or
+# praising phrase. Neither lowers an 80.
+PRAISE=("great, nothing missing this time" "didn't expect it to be this good, thanks" "спасибо, без ошибок")
+for p in "${PRAISE[@]}"; do
+  R=$(mk_run "$M"); close_run "$R"; : >"$TMP/rx.calls"
+  out=$(cmd_task_loop_feedback "$R" --text="$p" 2>&1)
+  t "S6 praise with a keyword, model on: asked, not lowered ($p)" "false|80|1" "$(jq -r .data.lowered <<<"$out")|$(score "$R")|$(cat "$TMP/rx.calls")"
+done
 RX_ON=false
+for p in "${PRAISE[@]}"; do
+  R=$(mk_run "$M"); close_run "$R"
+  out=$(cmd_task_loop_feedback "$R" --text="$p" 2>&1)
+  t "S6 praise with a keyword, floor only: not lowered ($p)" "false|80" "$(jq -r .data.lowered <<<"$out")|$(score "$R")"
+done
+# The guard is narrow: a complaint that starts with "no" is still one.
+R=$(mk_run "$M"); close_run "$R"
+out=$(cmd_task_loop_feedback "$R" --text="no, this is wrong" 2>&1)
+t "S6 floor: 'no, this is wrong' still lowers" "true|keyword|20" "$(jq -r '"\(.data.lowered)|\(.data.by)|\(.data.score)"' <<<"$out")"
+# The model has the last word when it answers: a keyword reply it calls praise stays 80.
+RX_ON=true; RX_CHOICE=praise; RX_CONF=0.9
+R=$(mk_run "$M"); close_run "$R"
+out=$(cmd_task_loop_feedback "$R" --text="this is wrong in the best way, keep it" 2>&1)
+t "S6 keyword hit, model says praise: not lowered" "false|80" "$(jq -r .data.lowered <<<"$out")|$(score "$R")"
+# No answer from the model (an error) or an unsure one: the floor decides.
+RX_FAIL=1
+R=$(mk_run "$M"); close_run "$R"
+out=$(cmd_task_loop_feedback "$R" --text="this is wrong" 2>&1)
+t "S6 model errors: the floor lowers a keyword complaint" "true|keyword|20" "$(jq -r '"\(.data.lowered)|\(.data.by)|\(.data.score)"' <<<"$out")"
+RX_FAIL=0; RX_CHOICE=complaint; RX_CONF=0.3
+R=$(mk_run "$M"); close_run "$R"
+out=$(cmd_task_loop_feedback "$R" --text="this is wrong" 2>&1)
+t "S6 model unsure: the floor lowers a keyword complaint" "true|keyword|20" "$(jq -r '"\(.data.lowered)|\(.data.by)|\(.data.score)"' <<<"$out")"
+RX_ON=false; RX_CHOICE=neutral; RX_CONF=0.9
 
 # S7 — a row that names the run, inside the window: by a person = complaint,
 # by an agent = rework; outside the window or a different ident = nothing.
@@ -136,11 +171,16 @@ printf 'not json' >"$TMP/bad.json"; REGISTRY="$TMP/bad.json"
 _loop_is_person lodar; t "S7 unreadable registry: not called a person" "1" "$?"
 REGISTRY="$REG_SAVED"
 
-# S8 — reopened inside the window: complaint.
+# S8 — there is no "reopened" signal (quinn, it1): no verb reopens a closed loop
+# run, so the runtime does not claim to read one. The real verb refuses it, and a
+# hand-edited reopen is not read as a complaint.
 R=$(mk_run "$N"); close_run "$R"
-db "UPDATE tasks SET status='todo' WHERE ident='$R';"
+( AGENT_NAME=lodar cmd_task_reject "$R" --feedback="not what I wanted" ) >/dev/null 2>&1; rc=$?
+t "S8 task reject refuses a loop run" "refused|done" "$( ((rc)) && echo refused || echo "rc=0")|$(db "SELECT status FROM tasks WHERE ident='$R';")"
+db "UPDATE tasks SET status='todo', done_at=NULL WHERE ident='$R';"
 cmd_task_loop_scores >/dev/null 2>&1
-t "S8 reopened run lowered" "20|owner complained: reopened it" "$(score "$R" '"\(.score)|\(.note)"')"
+t "S8 a hand-edited reopen is no signal" "80|clean run" "$(score "$R" '"\(.score)|\(.note)"')"
+t "S8 no code path claims 'reopened it'" "0" "$(grep -c 'reopened it' "$SRC/task/loops.sh")"
 
 # S9 — a run still open when the next run started did not end done.
 K=$(mk_tpl "Inbox"); R1=$(mk_run "$K"); db "UPDATE tasks SET status='blocked' WHERE ident='$R1';"; R2=$(mk_run "$K"); close_run "$R2"

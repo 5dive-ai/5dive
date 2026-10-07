@@ -537,9 +537,12 @@ _loop_score_request() {
 #   1. the run did not end done (cancelled, or still open when the next run
 #      started), or one of its attempts failed or stopped mid-run (the runs
 #      journal: status failed|abandoned, or a reclaim).
-#   2. a complaint inside the window: the run was reopened, a PERSON filed a row
-#      that names it, or the owner's reply about it reads as negative
-#      (`task loop feedback`, a keyword floor then one Decisions call).
+#   2. a complaint inside the window: a PERSON filed a row that names it, or the
+#      owner's reply about it reads as negative (`task loop feedback`: one
+#      Decisions call, the keyword floor when there is no model answer).
+#      Not "reopened": no verb reopens a closed loop run (`task reject` refuses a
+#      row with no verifier, `task start` refuses a closed one), so a reopen
+#      signal would only ever fire on a hand-edited row.
 #   3. rework: an AGENT filed a row that names it (a fix, a redo).
 #   4. none of these: 80. No news is weak evidence, not 100.
 # A complaint or rework only ever LOWERS a score, and only inside the window:
@@ -551,9 +554,13 @@ _LOOP_SCORE_ERROR=30
 _LOOP_SCORE_UNFINISHED=10
 _LOOP_SCORE_COMPLAINT=20
 _LOOP_SCORE_REWORK=40
-# The keyword floor: a reply that says any of these is a complaint without a
-# model call. English and Russian (the languages our owners write in).
+# The keyword floor: the fallback when the Decisions call has no answer. A reply
+# that says any of these is a complaint. English and Russian (the languages our
+# owners write in). _LOOP_PRAISE_SED first strips the phrases that NEGATE a
+# keyword or read as praise ("nothing missing", "didn't expect it to be this
+# good", "без ошибок", "неплохо"), so a thank-you is not a complaint.
 _LOOP_COMPLAINT_RE="(^|[^[:alpha:]])(wrong|bad|broken|useless|terrible|awful|garbage|not what|didn'?t|did not|doesn'?t work|not working|missing|mistake|redo|again\?|why did|stop doing|failed|error)([^[:alpha:]]|$)|плох|не то|не так|ошиб|переделай|исправь|не работает|ужасн|зачем"
+_LOOP_PRAISE_SED="s/(^|[^[:alpha:]])(no|nothing|none|never|without|zero|not a single|not one|not any)[[:space:]]+([^[:space:][:punct:]]+[[:space:]]+){0,1}(missing|wrong|broken|bad|mistakes?|errors?|failed|failures?|issues?|problems?)/ /gI;s/(didn'?t|did not|couldn'?t|could not|can'?t|cannot)[[:space:]]+(expect|think|imagine|believe|be better|complain|ask for more)/ /gI;s/not[[:space:]]+(bad|wrong)/ /gI;s/([бБ]ез|[нН]ет|[нН]и|[нН]икаких|[нН]и одной)[[:space:]]+([^[:space:][:punct:]]+[[:space:]]+){0,1}(ошиб|плох|ужасн)[^[:space:][:punct:]]*/ /g;s/[нН]е ?плох[^[:space:][:punct:]]*/ /g"
 
 # _loop_score_put <run ident> <score> <note> <by> [signals json array]
 _loop_score_put() {
@@ -620,15 +627,10 @@ _loop_is_person() {
 
 # _loop_complaints <run id> — signals 2 and 3 for a scored run, inside the window.
 _loop_complaints() {
-  local id="$1" rident st done_at within
-  IFS=$'\x1f' read -r rident st done_at < <(db "SELECT ident||x'1f'||status||x'1f'||COALESCE(done_at,'') FROM tasks WHERE id=${id};")
+  local id="$1" rident done_at within
+  IFS=$'\x1f' read -r rident done_at < <(db "SELECT ident||x'1f'||COALESCE(done_at,'') FROM tasks WHERE id=${id};")
   [[ -n "$done_at" ]] || return 0
   within="julianday($(sqlq "$done_at")) + ${_LOOP_SIGNAL_HOURS}/24.0"
-  # Reopened after it closed, while the window is still open.
-  if [[ "$st" != "done" && "$st" != "cancelled" ]] \
-     && [[ "$(db "SELECT julianday('now') <= ${within};")" == "1" ]]; then
-    _loop_score_lower "$rident" "$_LOOP_SCORE_COMPLAINT" "owner complained: reopened it" reopened
-  fi
   # A row filed inside the window that names the run (not its own steps, not the
   # runtime's rows). By a person: a complaint. By an agent: rework.
   local n nident ntitle nby
@@ -684,27 +686,42 @@ _loop_signals_sweep() {
   return 0
 }
 
-# _loop_reply_is_complaint <text> -> prints "keyword", "model" or nothing.
-# The keyword floor first (free); then ONE Decisions call (~$0.0005) when the
-# box has reflex configured. An error, a timeout or a low-confidence pick is
-# not a complaint: a score is lowered only on evidence.
+# _loop_reply_is_complaint <text> -> prints "model", "keyword" or nothing.
+# ONE Decisions call (~$0.0005) first when the box has reflex configured, for
+# every reply, keyword or not: a keyword is not a judgement ("great, nothing
+# missing this time" says "missing"). A confident answer decides. No answer (no
+# reflex, an error, a timeout) or a low-confidence one falls back to the keyword
+# floor, which ignores negated and praising phrases. A score is lowered only on
+# evidence.
 _loop_reply_is_complaint() {
-  local text="$1" req resp choice conf
-  if grep -qiE "$_LOOP_COMPLAINT_RE" <<<"$text"; then printf 'keyword'; return 0; fi
-  declare -F reflex_configured >/dev/null && declare -F _reflex_endpoint_decide >/dev/null || return 0
-  [[ "$(reflex_configured 2>/dev/null)" == true ]] || return 0
-  reflex_model_resolve 2>/dev/null || true
-  req=$(jq -cn --arg t "$text" '{policy:"loop-reply", version:1, type:"choice",
-     instructions:"The owner of a recurring agent job replied to one of its runs. Is the reply a complaint about the run?",
-     criteria:{complaint:"It says the run was wrong, poor, incomplete, unwanted or must be redone.",
-               neutral:"A question, an instruction for next time, or an acknowledgement; no judgement of the run.",
-               praise:"It says the run was good or useful."},
-     options:["complaint","neutral","praise"], state:{reply:$t}}') || return 0
-  resp=$(_reflex_endpoint_decide "${_REFLEX_MODEL:-typesafe/jev-1.13}" 10 <<<"$req" 2>/dev/null) || return 0
-  choice=$(jq -r '.choice // empty | strings' <<<"${resp%%$'\n'*}" 2>/dev/null)
-  conf=$(jq -r '.confidence // 1 | numbers' <<<"${resp%%$'\n'*}" 2>/dev/null)
-  [[ "$choice" == complaint ]] && jq -en --argjson c "${conf:-1}" '$c >= 0.6' >/dev/null 2>&1 && printf 'model'
+  local text="$1" req="" resp="" choice="" conf=""
+  if declare -F reflex_configured >/dev/null && declare -F _reflex_endpoint_decide >/dev/null \
+     && [[ "$(reflex_configured 2>/dev/null)" == true ]]; then
+    reflex_model_resolve 2>/dev/null || true
+    req=$(jq -cn --arg t "$text" '{policy:"loop-reply", version:1, type:"choice",
+       instructions:"The owner of a recurring agent job replied to one of its runs. Is the reply a complaint about the run?",
+       criteria:{complaint:"It says the run was wrong, poor, incomplete, unwanted or must be redone.",
+                 neutral:"A question, an instruction for next time, or an acknowledgement; no judgement of the run.",
+                 praise:"It says the run was good or useful."},
+       options:["complaint","neutral","praise"], state:{reply:$t}}') \
+      && resp=$(_reflex_endpoint_decide "${_REFLEX_MODEL:-typesafe/jev-1.13}" 10 <<<"$req" 2>/dev/null) \
+      && choice=$(jq -r '.choice // empty | strings' <<<"${resp%%$'\n'*}" 2>/dev/null) \
+      && conf=$(jq -r '.confidence // 1 | numbers' <<<"${resp%%$'\n'*}" 2>/dev/null)
+    case "$choice" in
+      complaint|neutral|praise)
+        if jq -en --argjson c "${conf:-1}" '$c >= 0.6' >/dev/null 2>&1; then
+          [[ "$choice" == complaint ]] && printf 'model'
+          return 0
+        fi ;;
+    esac
+  fi
+  _loop_reply_floor "$text" && printf 'keyword'
   return 0
+}
+
+# _loop_reply_floor <text> — rc 0 when the keyword floor reads it as a complaint.
+_loop_reply_floor() {
+  grep -qiE "$_LOOP_COMPLAINT_RE" < <(sed -E "$_LOOP_PRAISE_SED" <<<"$1")
 }
 
 # `task loop feedback <run> --text="<the owner's reply>" [--at=<UTC time>]` —
