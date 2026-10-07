@@ -18,7 +18,8 @@
 #              role block addresses `ceo`, olivia keeps her own model, the JSON
 #              says who filled which seat, and a re-import creates nothing
 #   section 3  negative controls: no olivia -> `ceo` is created as before; an
-#              olivia already in another team is left alone and `ceo` is created
+#              olivia already in another team leads this one too and is not
+#              re-wired out of her chart (DIVE-5769 reversed the old `ceo` clone)
 #
 # COVERAGE LIMIT, said plainly: section 2 replaces the child `agent create/import/
 # start/config/org set/task add` calls with a recorder (org set is mirrored into
@@ -96,8 +97,9 @@ REG_SOLO_OLIVIA='{"agents":{"olivia":{"type":"codex","pack":{"source":"marketpla
 # ============ 1. WHICH SEAT IS FILLED BY WHOM =================================
 eq_t 'A1 solo olivia (pack olivia) fills the ceo seat under her own name' \
      '{"adopt":{"ceo":"olivia"},"ambiguous":[]}' "$(_compose_seat_adoptions "$SPEC" "$REG_SOLO_OLIVIA" "")"
-eq_t 'A2 NEG: olivia already in another team is not taken out of its chart' \
-     '{}' "$(_compose_seat_adoptions "$SPEC" "$REG_SOLO_OLIVIA" $'olivia\nboss' | jq -c .adopt)"
+# DIVE-5769: olivia in another team fills the seat too — SHARED (no re-wire, N2b).
+eq_t 'A2 olivia already in another team fills the seat (shared, DIVE-5769)' \
+     '{"ceo":"olivia"}' "$(_compose_seat_adoptions "$SPEC" "$REG_SOLO_OLIVIA" $'olivia\nboss' | jq -c .adopt)"
 _two='{"agents":{"olivia":{"pack":{"slug":"olivia"}},"liv":{"pack":{"slug":"olivia"}}}}'
 eq_t 'A3 two solo Olivias: neither is picked' \
      '{}' "$(_compose_seat_adoptions "$SPEC" "$_two" "" | jq -c .adopt)"
@@ -177,7 +179,7 @@ grep -qE '^agent config cmo set model=' "$FAKE_LOG" \
   && ok_t 'E9b CONTROL: a new seat still gets its declared model' \
   || bad_t 'E9b cmo model set' "$(grep 'agent config' "$FAKE_LOG")"
 eq_t 'E10 the JSON result names who fills which seat' \
-     '[{"agent":"olivia","seat":"ceo","role":"CEO","pack":"olivia"}]' "$(jq -c '.data.adopted' <<<"$_imp_out" 2>/dev/null)"
+     '[{"agent":"olivia","seat":"ceo","role":"CEO","pack":"olivia","shared":false}]' "$(jq -c '.data.adopted' <<<"$_imp_out" 2>/dev/null)"
 eq_t 'E11 …and created counts only the new members' '4' "$(jq -r '.data.created' <<<"$_imp_out" 2>/dev/null)"
 [[ "$(cat "$TMP/imp.err")" == *"olivia fills that seat under its own name"* ]] \
   && ok_t 'E12 the import says olivia fills the ceo seat' \
@@ -216,8 +218,8 @@ _fresh_box '{"agents":{"boss":{},"olivia":{"pack":{"slug":"olivia"}}}}'
 db "INSERT INTO agents_org (name) VALUES ('boss');"
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('olivia','CMO','boss');"
 cmd_team import "$TMP/startup.5dive.yaml" >/dev/null 2>&1
-eq_t 'N2 NEG: olivia in another team -> ceo is created beside her' \
-     'boss,ceo,cmo,creative,devops,olivia,researcher' "$(jq -r '.agents | keys | join(",")' "$REGISTRY")"
+eq_t 'N2 olivia in another team -> she leads this one too, no ceo clone (DIVE-5769)' \
+     'boss,cmo,creative,devops,olivia,researcher' "$(jq -r '.agents | keys | join(",")' "$REGISTRY")"
 grep -qE '^org set olivia ' "$FAKE_LOG" \
   && bad_t 'N2b the other team keeps its olivia' "$(grep 'org set olivia' "$FAKE_LOG")" \
   || ok_t 'N2b the other team keeps its olivia (no org set on her)'

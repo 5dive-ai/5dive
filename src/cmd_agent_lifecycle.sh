@@ -184,6 +184,13 @@ cmd_rm() {
             updated_at=datetime('now')
       WHERE reports_to=$(sqlq "$name");
       DELETE FROM agents_org WHERE name=$(sqlq "$name");"
+  # DIVE-5769: firing is from EVERY team. Inside each team his reports move up to
+  # his manager there, as in the org chart above.
+  db "UPDATE team_members
+        SET reports_to=(SELECT x.reports_to FROM team_members x
+                         WHERE x.team=team_members.team AND x.agent=$(sqlq "$name"))
+      WHERE reports_to=$(sqlq "$name");
+      DELETE FROM team_members WHERE agent=$(sqlq "$name");" 2>/dev/null || true
   # Drop any paperclip-shared symlinks pointing into this agent's profile
   # and re-seed from another agent of the same type if one remains. Best-
   # effort — never fails the remove.

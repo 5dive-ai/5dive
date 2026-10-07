@@ -69,9 +69,18 @@ cmd_project_ls() {
   tasks_db_init
   if (( JSON_MODE )); then
     local rows
+    # DIVE-5769: `members` — a team's explicit members (team_members), lead first,
+    # then in the order they joined. [] for a project with none: a plain project,
+    # or a team imported before membership was recorded (surfaces then read its
+    # org subtree, as before).
+    local mem
     rows=$(dbfmt -json "SELECT key, prefix, counter, name, description, goal, folder, lead_agent, status, created_at FROM projects ORDER BY created_at;")
+    mem=$(dbfmt -json "SELECT m.team AS team, m.agent AS agent FROM team_members m JOIN projects p ON p.key = m.team
+                        ORDER BY m.team, (m.agent = COALESCE(p.lead_agent,'')) DESC, m.rowid;" 2>/dev/null)
     [[ -n "$rows" ]] || rows="[]"
-    printf '%s' "$rows" | jq -c '{ok:true, data:{projects:.}}'
+    [[ -n "$mem" ]] || mem="[]"
+    printf '%s' "$rows" | jq -c --argjson mem "$mem" '
+      map(.key as $k | .members = [$mem[] | select(.team == $k) | .agent]) | {ok:true, data:{projects:.}}'
     return
   fi
   dbfmt -box "SELECT key, prefix||'-' AS prefix, counter AS tasks,

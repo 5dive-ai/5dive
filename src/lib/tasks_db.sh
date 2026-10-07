@@ -200,7 +200,7 @@ require_sqlite() {
 # block, and a store stamped '3932-1' has never seen the triggers block, so
 # either literal skips one population's migration entirely. A THIRD value that
 # no store carries is the only resolution that re-migrates both.
-_TASKS_SCHEMA_EPOCH='4911-1'  # DIVE-4911: +tasks.gate_renag_failed_at/_via (on top of 4899-1)
+_TASKS_SCHEMA_EPOCH='5769-1'  # DIVE-5769: +team_members (on top of 4911-1: +tasks.gate_renag_failed_at/_via)
 
 # DIVE-3931: Event -> Task ingress lives in the task store because ingress ends
 # at the queue. One SQL emitter serves fresh stores and migrations so the two
@@ -1122,6 +1122,26 @@ CREATE TABLE IF NOT EXISTS human_agents (
   PRIMARY KEY (human_id, agent)
 );
 CREATE INDEX IF NOT EXISTS human_agents_agent_idx ON human_agents(agent);
+
+-- DIVE-5769: TEAM MEMBERSHIP, many-to-many. One character is one agent per box,
+-- and a team that needs a persona already here ADDS that agent instead of
+-- cloning it, so an agent can be in several teams. agents_org above stays ONE
+-- tree for reporting lines (one manager each); this table says which teams an
+-- agent works for. `team` is the team's projects.key (the template slug);
+-- `reports_to` is the agent's manager INSIDE that team (NULL for its lead).
+-- Written by `team import` for every member, read by `project ls --json`
+-- (`members`), cut by `team leave` / `team rm` / `agent rm`. Zero rows for a
+-- team means "imported before this table": surfaces fall back to the org
+-- subtree under its lead. Keep byte-identical to the copy in _tasks_db_migrate
+-- (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS team_members (
+  team       TEXT NOT NULL,
+  agent      TEXT NOT NULL,
+  reports_to TEXT,
+  added_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (team, agent)
+);
+CREATE INDEX IF NOT EXISTS team_members_agent_idx ON team_members(agent);
 
 CREATE INDEX IF NOT EXISTS tasks_status_idx   ON tasks(status);
 CREATE INDEX IF NOT EXISTS tasks_assignee_idx ON tasks(assignee, status);
@@ -3312,6 +3332,19 @@ CREATE TABLE IF NOT EXISTS human_agents (
 CREATE INDEX IF NOT EXISTS human_agents_agent_idx ON human_agents(agent);
 MIG
   fi
+  # DIVE-5769: team membership (see _tasks_schema). A brand-new table, never
+  # referenced by tasks/projects, and EMPTY on arrival — which is the signal every
+  # surface reads as "derive this team from the org tree, as before".
+  sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS team_members (
+  team       TEXT NOT NULL,
+  agent      TEXT NOT NULL,
+  reports_to TEXT,
+  added_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (team, agent)
+);
+CREATE INDEX IF NOT EXISTS team_members_agent_idx ON team_members(agent);
+MIG
   # DIVE-3931: additive Event -> Task ingress tables. This is the exact SQL
   # emitted for a fresh store above; IF NOT EXISTS makes the common path inert.
   _tasks_trigger_schema_sql | sqlite3 -cmd ".timeout 5000" "$TASKS_DB" >/dev/null \

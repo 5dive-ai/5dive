@@ -397,7 +397,7 @@ _compose_import_args() {
 # send` invocation. Runs on CREATE only (see cmd_compose_up), so re-running `up`
 # never double-appends.
 _compose_write_role_md() {
-  local spec="$1" name="$2" spec_dir="$3"
+  local spec="$1" name="$2" spec_dir="$3" share_team="${4:-}"
   local agent role instructions ifile
   agent=$(jq -c --arg n "$name" '.agents[$n]' <<<"$spec")
   role=$(jq         -r '.role              // empty' <<<"$agent")
@@ -434,14 +434,23 @@ _compose_write_role_md() {
   [[ -n "$role" || -n "$instructions" || -n "$manifest" || ${#mgrs[@]} -gt 0 || ${#reports[@]} -gt 0 ]] || return 0
 
   local block=$'\n\n'
-  if [[ -n "$role" ]]; then block+="## Role: ${role}"$'\n\n'; else block+="## Role"$'\n\n'; fi
+  # DIVE-5769: an agent already in another team keeps his own role and reporting
+  # block, and this one is ADDED under the team's name, so each team's work is
+  # read against its own role, manager and task list.
+  if [[ -n "$share_team" ]]; then
+    block+="$(_team_share_marker "$share_team")"$'\n'
+    block+="## Also on team ${share_team}${role:+ — role: ${role}}"$'\n\n'
+    block+="You are one agent in more than one team: one memory, one chat. This team's work is its own task list (\`5dive task ls --project=${share_team}\`). Work it in this team's role, and keep each team's work in its own place."$'\n\n'
+  elif [[ -n "$role" ]]; then block+="## Role: ${role}"$'\n\n'; else block+="## Role"$'\n\n'; fi
   [[ -n "$instructions" ]] && block+="${instructions}"$'\n\n'
-  block+="## Reporting"$'\n'
+  block+="## Reporting${share_team:+ in team ${share_team}}"$'\n'
   if [[ ${#mgrs[@]} -gt 0 ]]; then
     local m
     for m in "${mgrs[@]}"; do
       block+="- You report to **${m}**. Escalate or sync: \`5dive agent send ${m} '<message>'\`."$'\n'
     done
+  elif [[ -n "$share_team" ]]; then
+    block+="- You lead this team; you answer to the human owner for its work."$'\n'
   else
     block+="- You sit at the top of this org; you answer to the human owner."$'\n'
   fi
@@ -460,6 +469,8 @@ _compose_write_role_md() {
     block+=$'\n'"## Team manifest"$'\n'
     block+="- Your team's manifest is \`${manifest}\`. Anything your instructions tell you to read from the template (a policy block such as \`distribution.channels\`) is read from THIS file, at the time you act — the owner edits it after import, so never work from a remembered copy. If it is missing or unreadable, stop and escalate; do not guess a policy."$'\n'
   fi
+
+  [[ -n "$share_team" ]] && block+="$(_team_share_marker "$share_team" end)"$'\n'
 
   # DIVE-2223: land the block in the file THIS harness reads. It used to go to
   # ~/.claude/CLAUDE.md for every type, which on a codex/opencode/pi/antigravity
@@ -1117,8 +1128,10 @@ _compose_adoptable_solo() {
 # second Olivia called `ceo`, and the whole team reported to the clone.
 #
 # For each declared seat whose name is NOT on the box and that declares `pack: X`,
-# the candidates are the agents on the box whose registry pack slug is X, that are
-# solo (not in <bound>) and whose name is not itself a declared seat. Exactly one
+# the candidates are the agents on the box whose registry pack slug is X and whose
+# name is not itself a declared seat. DIVE-5769: solo OR already in another team —
+# a persona in a team is SHARED into this one, never cloned beside it. <bound> is
+# no longer a filter here; it is kept in the signature for callers. Exactly one
 # candidate fills the seat under ITS OWN name; several fill nothing and are
 # reported, because picking one would be a guess. A pack declared by two seats is
 # skipped (one agent cannot fill both). Prints
@@ -1138,7 +1151,7 @@ _compose_seat_adoptions() {
             agents: [ ($reg.agents // {}) | to_entries[]
                       | select((.value.pack.slug // "") == $p)
                       | .key
-                      | select(. as $n | ($b | index($n) | not) and ($decl | index($n) | not)) ] }
+                      | select(. as $n | $decl | index($n) | not) ] }
         | select(.agents | length > 0) ] as $c
     | { adopt: ([$c[] | select(.agents | length == 1) | {key: .seat, value: .agents[0]}] | from_entries),
         ambiguous: [$c[] | select(.agents | length > 1)] }' <<<"$spec" 2>/dev/null \
@@ -1198,6 +1211,231 @@ _team_seat_map_read() {
     if type == "object" then with_entries(select(
         (.value | type) == "string" and $reg.agents[.value] != null and $reg.agents[.key] == null))
     else {} end' "$f" 2>/dev/null || printf '{}'
+}
+
+# ---- DIVE-5769: ONE CHARACTER, ONCE PER BOX, IN EVERY TEAM THAT NEEDS HIM ---
+#
+# lodar, 2026-10-07: Theo in the 5dive team, then a content team that also has
+# Theo, made `content-theo` — same persona, same face, a second memory, and two
+# agents answering to one name. DIVE-5498/5606 adopted only a SOLO agent, because
+# an agent in a team was that team's. That was the clone.
+#
+# THE MODEL. Team membership is many-to-many and explicit (`team_members`, see
+# _tasks_schema). The org chart stays one tree: a shared agent keeps the manager
+# he already had and is NOT re-wired by the second team. In the second team he
+# works that team's tasks (its project, its folder) and answers to his manager
+# INSIDE that team (`team_members.reports_to`). If he LEADS the second team, its
+# members report to him in the org tree as well, and he still reports to his
+# first team's manager — the chart stays a tree, reporting flows up through him.
+
+# Declared names on the box AS THE SAME PERSONA (registry pack slug == the seat's
+# `pack:`), solo or in a team. The superset of _compose_adoptable_solo.
+_compose_same_persona() {
+  local spec="$1" reg="$2"
+  jq -r --argjson reg "$reg" '
+    .agents | to_entries[]
+    | select(.value.pack // "" | length > 0)
+    | select(($reg.agents[.key].pack.slug // "") == .value.pack)
+    | .key' <<<"$spec" 2>/dev/null
+}
+
+# The teams <agent> is a member of, one key per line.
+_team_member_teams() {
+  db "SELECT team FROM team_members WHERE agent=$(sqlq "$1") ORDER BY rowid;" 2>/dev/null
+}
+
+# Is <agent> already a member of <team>?
+_team_is_member() {
+  [[ "$(db "SELECT 1 FROM team_members WHERE team=$(sqlq "$1") AND agent=$(sqlq "$2");" 2>/dev/null)" == "1" ]]
+}
+
+# Freeze every team that has no membership rows yet into explicit rows, from the
+# rule every surface used until now: the org subtree under the team's lead, an
+# agent claimed by one team not claimed again, oldest team first. Run BEFORE an
+# import wires anybody, because sharing an agent changes what a subtree means: a
+# Theo in team A who comes to lead team B pulls B's members under A's lead, and a
+# team still derived from its subtree would swallow them. Only teams: a project
+# whose team manifest is on the box (every import since DIVE-5038 writes one), or
+# <current>, the team being imported now. Best-effort.
+_team_members_backfill() {
+  local current="${1:-}" reg key lead
+  declare -F db >/dev/null 2>&1 || return 0
+  tasks_db_init 2>/dev/null || return 0
+  reg=$(registry_read 2>/dev/null) || return 0
+  local claimed=$'\n'
+  # Agents already in an explicit team are claimed by it.
+  while IFS= read -r key; do [[ -n "$key" ]] && claimed+="$key"$'\n'; done \
+    < <(db "SELECT DISTINCT agent FROM team_members;" 2>/dev/null)
+  while IFS=$'\t' read -r key lead; do
+    [[ -n "$key" && -n "$lead" ]] || continue
+    [[ "$key" == "$current" || -e "$(_team_manifest_path "$key")" ]] || continue
+    [[ "$(jq --arg n "$lead" '.agents[$n] != null' <<<"$reg" 2>/dev/null)" == "true" ]] || continue
+    [[ -z "$(db "SELECT 1 FROM team_members WHERE team=$(sqlq "$key") LIMIT 1;" 2>/dev/null)" ]] || continue
+    local m mgr sql=""
+    while IFS=$'\t' read -r m mgr; do
+      [[ -n "$m" ]] || continue
+      [[ "$claimed" == *$'\n'"$m"$'\n'* ]] && continue
+      [[ "$(jq --arg n "$m" '.agents[$n] != null' <<<"$reg" 2>/dev/null)" == "true" ]] || continue
+      [[ "$m" == "$lead" ]] && mgr=""
+      sql+="INSERT OR IGNORE INTO team_members (team, agent, reports_to) VALUES ($(sqlq "$key"), $(sqlq "$m"), $(sqlq_or_null "$mgr"));"
+      claimed+="$m"$'\n'
+    done < <(db "WITH RECURSIVE sub(n, d) AS (
+                   SELECT $(sqlq "$lead"), 0
+                   UNION SELECT o.name, sub.d + 1 FROM agents_org o JOIN sub ON o.reports_to = sub.n
+                    WHERE sub.d < 64)
+                 SELECT s.n || char(9) || COALESCE(o.reports_to, '') FROM sub s
+                   LEFT JOIN agents_org o ON o.name = s.n
+                 GROUP BY s.n ORDER BY MIN(s.d), s.n;" 2>/dev/null)
+    [[ -n "$sql" ]] && { db "BEGIN; ${sql} COMMIT;" >/dev/null 2>&1 || true; }
+  done < <(db "SELECT key || char(9) || COALESCE(lead_agent,'') FROM projects
+               WHERE COALESCE(lead_agent,'') <> '' ORDER BY created_at, rowid;" 2>/dev/null)
+  return 0
+}
+
+# Record every member of <team> from the roster that is now up (final names), the
+# lead with no manager. Upsert: a re-import re-states the team-local manager.
+_team_members_write() {
+  local key="$1" spec="$2" reg n mgr sql=""
+  [[ -n "$key" && -n "$spec" ]] || return 0
+  declare -F db >/dev/null 2>&1 || return 0
+  tasks_db_init 2>/dev/null || return 0
+  reg=$(registry_read 2>/dev/null) || return 0
+  while IFS=$'\t' read -r n mgr; do
+    [[ -n "$n" ]] || continue
+    [[ "$(jq --arg n "$n" '.agents[$n] != null' <<<"$reg" 2>/dev/null)" == "true" ]] || continue
+    sql+="INSERT INTO team_members (team, agent, reports_to) VALUES ($(sqlq "$key"), $(sqlq "$n"), $(sqlq_or_null "$mgr"))
+          ON CONFLICT(team, agent) DO UPDATE SET reports_to=excluded.reports_to;"
+  done < <(jq -r '.agents | to_entries[]
+                  | "\(.key)\t\(.value.reports_to // "" | if type == "array" then (.[0] // "") else . end)"' <<<"$spec" 2>/dev/null)
+  [[ -n "$sql" ]] || return 0
+  db "BEGIN; ${sql} COMMIT;" >/dev/null 2>&1 \
+    || warn "team '$key' is up, but who is in it could not be recorded — surfaces fall back to its org chart"
+}
+
+# The lines that fence a shared agent's added team block, so `team leave` and
+# `team rm` take exactly that block back out of his instructions.
+_team_share_marker() {
+  if [[ "${2:-}" == end ]]; then printf '<!-- /5dive team: %s -->' "$1"; else printf '<!-- 5dive team: %s -->' "$1"; fi
+}
+
+# Remove <team>'s added block from <agent>'s instructions. Read and written AS the
+# agent, like _compose_rename_persona_file. Silent when there is none.
+_team_strip_share_block() {
+  local team="$1" name="$2" type md old new beg end
+  type=$(registry_read 2>/dev/null | jq -r --arg n "$name" '.agents[$n].type // "claude"' 2>/dev/null) || type=claude
+  md=$(persona_target "$name" "$type" 2>/dev/null) || return 0
+  old=$(sudo -u "agent-${name}" cat "$md" 2>/dev/null) || return 0
+  beg=$(_team_share_marker "$team"); end=$(_team_share_marker "$team" end)
+  [[ "$old" == *"$beg"* ]] || return 0
+  new=$(awk -v b="$beg" -v e="$end" '$0 == b {skip=1; next} skip && $0 == e {skip=0; next} !skip' <<<"$old")
+  printf '%s\n' "$new" | sudo -u "agent-${name}" tee "$md" >/dev/null 2>&1 \
+    && step "[$name] team '$team' taken out of his instructions" \
+    || warn "[$name] could not take team '$team' out of $md — his instructions still mention it"
+}
+
+# 5dive team leave <team> <agent> — "Remove from this team". He stays in every
+# other team, with his memory and chat. A team's lead leaves only with the team
+# (`team rm`): the team is read from its lead, and the lead holds its channel.
+_team_leave() {
+  local team="" agent="" a
+  for a in "$@"; do
+    case "$a" in
+      --json) ;;
+      -h|--help) printf 'usage: 5dive team leave <team> <agent>\n  Take <agent> out of one team; he stays in his other teams. Firing him everywhere is: 5dive agent rm <agent>\n' >&2; return 0 ;;
+      -*) fail "$E_USAGE" "unknown flag: $a (usage: 5dive team leave <team> <agent>)" ;;
+      *) if [[ -z "$team" ]]; then team="$a"; elif [[ -z "$agent" ]]; then agent="$a"; else fail "$E_USAGE" "usage: 5dive team leave <team> <agent>"; fi ;;
+    esac
+  done
+  [[ -n "$team" && -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive team leave <team> <agent>"
+  tasks_db_init
+  local lead tmgr omgr others
+  [[ -n "$(db "SELECT 1 FROM projects WHERE key=$(sqlq "$team");")" ]] || fail "$E_NOT_FOUND" "no team '$team' on this box"
+  _team_members_backfill "$team" || true
+  lead=$(db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key=$(sqlq "$team");" | head -1)
+  _team_is_member "$team" "$agent" || fail "$E_NOT_FOUND" "$agent is not in team '$team'"
+  [[ "$agent" != "$lead" ]] || fail "$E_CONFLICT" "$agent leads team '$team' — a lead leaves only with the team. Remove the team (5dive team rm $team); $agent stays in any other team he is in."
+  tmgr=$(db "SELECT COALESCE(reports_to,'') FROM team_members WHERE team=$(sqlq "$team") AND agent=$(sqlq "$agent");" | head -1)
+  omgr=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$agent");" | head -1)
+  others=$(db "SELECT team FROM team_members WHERE agent=$(sqlq "$agent") AND team<>$(sqlq "$team") ORDER BY rowid;" | paste -sd', ' -)
+  local sql=""
+  # His reports inside this team move up to his manager in it (DIVE-5609's rule).
+  sql+="UPDATE team_members SET reports_to=$(sqlq_or_null "$tmgr") WHERE team=$(sqlq "$team") AND reports_to=$(sqlq "$agent");"
+  if [[ -n "$tmgr" ]]; then
+    sql+="UPDATE agents_org SET reports_to=$(sqlq "$tmgr"), updated_at=datetime('now')
+           WHERE reports_to=$(sqlq "$agent")
+             AND name IN (SELECT agent FROM team_members WHERE team=$(sqlq "$team"))
+             AND name NOT IN (SELECT agent FROM team_members WHERE team<>$(sqlq "$team")
+                               AND reports_to=$(sqlq "$agent"));"
+  fi
+  # His own reporting line, if it ran through this team: to his manager in a team
+  # he is still in, else none (he is then on his own).
+  if [[ -n "$omgr" ]] && _team_is_member "$team" "$omgr"      && [[ -z "$(db "SELECT 1 FROM team_members WHERE agent=$(sqlq "$omgr") AND team IN
+                      (SELECT team FROM team_members WHERE agent=$(sqlq "$agent") AND team<>$(sqlq "$team")) LIMIT 1;")" ]]; then
+    local next
+    next=$(db "SELECT COALESCE(reports_to,'') FROM team_members WHERE agent=$(sqlq "$agent") AND team<>$(sqlq "$team") ORDER BY rowid LIMIT 1;" | head -1)
+    sql+="UPDATE agents_org SET reports_to=$(sqlq_or_null "$next"), updated_at=datetime('now') WHERE name=$(sqlq "$agent");"
+  fi
+  sql+="DELETE FROM team_members WHERE team=$(sqlq "$team") AND agent=$(sqlq "$agent");"
+  db "BEGIN; ${sql} COMMIT;" || fail "$E_GENERIC" "could not take $agent out of team '$team'"
+  _team_strip_share_block "$team" "$agent" || true
+  local _where=" — still in ${others}"
+  [[ -n "$others" ]] || _where=" — he is now on his own (fire him with: 5dive agent rm $agent)"
+  ok "$agent left team '$team'${_where}" \
+     '{team:$t, agent:$a, still_in:($o | split(", ") | map(select(length > 0)))}' \
+     --arg t "$team" --arg a "$agent" --arg o "$others"
+}
+
+# 5dive team rm <team> — "Remove team", the RECORD only: nobody is fired. Who is
+# in it is forgotten and the team's lead is cleared, so no surface shows the team
+# any more; its task list stays. The caller fires the members who are in no other
+# team first (`agent rm`); a member, or a lead, who is in another team stays.
+_team_rm() {
+  local team="" a
+  for a in "$@"; do
+    case "$a" in
+      --json) ;;
+      -h|--help) printf 'usage: 5dive team rm <team>\n  Forget a team (its members and lead). Fires nobody: fire members with 5dive agent rm <name>.\n' >&2; return 0 ;;
+      -*) fail "$E_USAGE" "unknown flag: $a (usage: 5dive team rm <team>)" ;;
+      *) [[ -z "$team" ]] && team="$a" || fail "$E_USAGE" "usage: 5dive team rm <team>" ;;
+    esac
+  done
+  [[ -n "$team" ]] || fail "$E_USAGE" "usage: 5dive team rm <team>"
+  tasks_db_init
+  [[ -n "$(db "SELECT 1 FROM projects WHERE key=$(sqlq "$team");")" ]] || fail "$E_NOT_FOUND" "no team '$team' on this box"
+  _team_members_backfill "$team" || true
+  local members m kept=""
+  members=$(db "SELECT agent FROM team_members WHERE team=$(sqlq "$team") ORDER BY rowid;")
+  db "BEGIN;
+      DELETE FROM team_members WHERE team=$(sqlq "$team");
+      UPDATE projects SET lead_agent=NULL WHERE key=$(sqlq "$team");
+      COMMIT;" || fail "$E_GENERIC" "could not remove team '$team'"
+  local reg; reg=$(registry_read 2>/dev/null || echo '{}')
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    [[ "$(jq --arg n "$m" '.agents[$n] != null' <<<"$reg")" == "true" ]] || continue
+    _team_strip_share_block "$team" "$m" || true
+    kept+="${kept:+, }$m"
+  done <<<"$members"
+  ok "team '$team' removed${kept:+ — still on this box: ${kept}}" \
+     '{team:$t, kept:($k | split(", ") | map(select(length > 0)))}' --arg t "$team" --arg k "$kept"
+}
+
+# An agent who is already in another team takes this team's ROLE as an added
+# block of his instructions, and this team's seeded goals. Nothing else: no
+# model/effort (his own harness stays), no org edge (his reporting line stays).
+_compose_share_role() {
+  local spec="$1" name="$2" spec_dir="$3" team="$4"
+  local mgr g
+  _compose_write_role_md "$spec" "$name" "$spec_dir" "$team"
+  mgr=$(jq -r --arg n "$name" '.agents[$n].reports_to // empty | if type=="array" then (.[0] // "") else . end' <<<"$spec")
+  while IFS= read -r g; do
+    [[ -n "$g" ]] || continue
+    if [[ "${_COMPOSE_QUEUE_GOALS:-0}" == "1" ]]; then
+      _COMPOSE_GOAL_LINES+=("${name}"$'\x1f'"${mgr}"$'\x1f'"${g}")
+    else
+      _compose_seed_goal "$name" "$mgr" "$g" "$(_compose_self)" ""
+    fi
+  done < <(jq -r --arg n "$name" '(.agents[$n].goals // [])[]' <<<"$spec")
 }
 
 # Rewrite every place prose ADDRESSES a renamed agent (stdin -> stdout) through
@@ -1401,6 +1639,7 @@ HELP
       tasks_db_init 2>/dev/null || true
       if [[ "$(jq --arg n "$_hold_lead" '.agents[$n] != null' <<<"$reg")" != "true" ]] \
          || { [[ -n "${COMPOSE_ADOPT_REWIRE:-}" ]] && grep -qxF -- "$_hold_lead" <<<"$COMPOSE_ADOPT_REWIRE"; } \
+         || { [[ -n "${COMPOSE_ADOPT_SHARE:-}" ]] && grep -qxF -- "$_hold_lead" <<<"$COMPOSE_ADOPT_SHARE"; } \
          || [[ -n "$(_compose_kickoff_open "$_hold_lead")" ]]; then
         _COMPOSE_HOLD=1
       fi
@@ -1413,7 +1652,7 @@ HELP
   # child `agent create` output — that output is a clack render and parsing it would
   # break the moment the renderer changes.
   local -a _brought_up_names=()
-  local -a _adopted_names=()
+  local -a _adopted_names=() _shared_names=()
   mapfile -t names < <(jq -r '.agents | keys[]' <<<"$spec")
   if (( ${#names[@]} == 0 )); then
     warn "spec has no agents declared"
@@ -1443,6 +1682,21 @@ HELP
         _adopted_names+=("$name")
         if bash "$self" agent start "$name" >/dev/null 2>&1; then
           started=$((started+1))
+        else
+          ((skipped++)) || true
+        fi
+        continue
+      fi
+      # DIVE-5769: the SAME persona, already in another team, is SHARED into this
+      # one: no second copy, no re-wire. Chosen by `team import`, which leaves out
+      # an agent already recorded in THIS team (a re-import changes nothing).
+      if [[ -n "${COMPOSE_ADOPT_SHARE:-}" ]] && grep -qxF -- "$name" <<<"$COMPOSE_ADOPT_SHARE"; then
+        local _also; _also=$(_team_member_teams "$name" | paste -sd', ' -)
+        step "[$name] is already on this box${_also:+ in ${_also}} — the same $name joins this team too (one agent, one memory, in every team); his reporting line stays, and this team's role is added to his instructions"
+        _compose_share_role "$spec" "$name" "$spec_dir" "${COMPOSE_TEAM_KEY:-this team}" || true
+        _adopted_names+=("$name"); _shared_names+=("$name")
+        if bash "$self" agent start "$name" >/dev/null 2>&1; then
+          ((started++)) || true
         else
           ((skipped++)) || true
         fi
@@ -1641,7 +1895,8 @@ HELP
       --arg hk "$_COMPOSE_KICKOFF" --arg hl "$_hold_lead" --arg hg "$_held_goals" \
       --argjson ad "$(printf '%s\n' "${_adopted_names[@]+"${_adopted_names[@]}"}" | jq -R 'select(length>0)' | jq -sc \
           --argjson m "$_seat_applied" --argjson spec "$spec" \
-          'map(. as $n | {agent: $n, seat: (($m | to_entries | map(select(.value == $n)) | .[0].key) // $n), role: ($spec.agents[$n].role // null), pack: ($spec.agents[$n].pack // null)})')" \
+          --argjson sh "$(printf '%s\n' "${_shared_names[@]+"${_shared_names[@]}"}" | jq -R 'select(length>0)' | jq -sc .)" \
+          'map(. as $n | {agent: $n, seat: (($m | to_entries | map(select(.value == $n)) | .[0].key) // $n), role: ($spec.agents[$n].role // null), pack: ($spec.agents[$n].pack // null), shared: ($sh | index($n) != null)})')" \
       --argjson aa "${COMPOSE_SEAT_AMBIGUOUS:-[]}" \
       --arg f "$file" --arg c "$created" --arg s "$started" --arg k "$skipped" --arg e "$errors" \
       --argjson a "$(printf '%s\n' "${_asleep[@]+"${_asleep[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')" \
@@ -2120,6 +2375,8 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
        5dive team plan    [<lead>]                    what is waiting for your yes
        5dive team start   [<lead>] [--skip=<DIVE-N>,...]   release it (minus what you skip)
        5dive team decline [<lead>]                    start none of it
+       5dive team leave <team> <agent>                take him out of one team (he stays in the others)
+       5dive team rm <team>                           forget a team; fires nobody (agent rm fires)
   Provision a whole company-structure template in one call (wraps 5dive up).
   <slug> resolves in the marketplace registry (<org>/5dive-marketplace, teams/),
   read live — a template published there works on this box with no update.
@@ -2144,6 +2401,10 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
                     is already there.
                     (Not the same thing as 'project add --prefix', which is a
                     task-ident prefix like DIVE-.)
+  One character is one agent per box: a seat whose persona (its pack) is
+  already here is filled by that agent — on his own, or already in another
+  team, in which case he is in both: one memory, one chat, this team's role
+  added to his instructions, his reporting line unchanged.
   --start-now       Start the team's seeded goals and loops at once. Without it
                     a team's FIRST start waits for you: its lead sends you its
                     plan, and nothing runs until you answer (team start, or
@@ -2344,6 +2605,9 @@ _team_tag_root_coordinator() {
 #   adopt-solo  every taken name is the SAME persona, solo on this box
 #               (DIVE-5498) -> none; those agents join this team, only the
 #               missing members are created. A namespace here would clone them
+#   adopt-shared  every taken name is the SAME persona, and at least one is
+#               already in another team (DIVE-5769) -> none; he is SHARED into
+#               this team (membership, no re-wire), never cloned
 #   adopt-all   every declared name is taken -> none. This is a re-run of this
 #               same roster from before DIVE-4822 (no project row yet), and
 #               renaming it would provision a second copy of a team that is
@@ -2377,9 +2641,15 @@ _team_choose_prefix() {
   [[ "$collide_n"  =~ ^[0-9]+$ ]] || collide_n=0
 
   if (( collide_n == 0 )); then printf 'free|'; return 0; fi
-  adopt_n=$(_compose_adoptable_solo "$spec" "$reg" "$bound" | grep -c . || true)
+  # DIVE-5769: every taken name is the SAME persona — solo (DIVE-5498) or already
+  # in another team, who is then shared into this one rather than cloned.
+  adopt_n=$(_compose_same_persona "$spec" "$reg" | grep -c . || true)
   [[ "$adopt_n" =~ ^[0-9]+$ ]] || adopt_n=0
-  if (( adopt_n == collide_n )); then printf 'adopt-solo|'; return 0; fi
+  if (( adopt_n == collide_n )); then
+    local solo_n; solo_n=$(_compose_adoptable_solo "$spec" "$reg" "$bound" | grep -c . || true)
+    if [[ "$solo_n" == "$adopt_n" ]]; then printf 'adopt-solo|'; else printf 'adopt-shared|'; fi
+    return 0
+  fi
   if (( declared_n > 0 && collide_n == declared_n )); then printf 'adopt-all|'; return 0; fi
 
   local p; p=$(_compose_default_prefix "$slug" "$spec")
@@ -2454,6 +2724,8 @@ cmd_team() {
     plan)    _team_plan "$@"; return $? ;;
     start)   _team_release start "$@"; return $? ;;
     decline) _team_release decline "$@"; return $? ;;
+    leave)   _team_leave "$@"; return $? ;;
+    rm|remove) _team_rm "$@"; return $? ;;
     ps)
       if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         cat >&2 <<'HELP'
@@ -2570,7 +2842,7 @@ HELP
     -h|--help|"" )
       _team_usage
       return 0 ;;
-    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ps, ls, plan, start, decline)" ;;
+    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ps, ls, plan, start, decline, leave, rm)" ;;
   esac
 
   local ref="" profile="" type_override="" tg_token="" tg_token_set=0
@@ -2722,6 +2994,7 @@ HELP
     case "${_choice%%|*}" in
       installed) step "team '$slug_key' is already installed as '$(_team_installed_lead "$slug_key")' — re-importing into the same namespace" ;;
       adopt-solo) step "$(_compose_name_collisions "$spec_for_prefix" "$(registry_read 2>/dev/null || echo '{}')" | paste -sd', ' -) already on this box on their own — they join this team instead of a second copy being made" ;;
+      adopt-shared) step "$(_compose_name_collisions "$spec_for_prefix" "$(registry_read 2>/dev/null || echo '{}')" | paste -sd', ' -) already on this box — the same agents join this team too (one character is one agent per box, in every team that needs it)" ;;
       adopt-all) step "every agent this template declares is already on this box — adopting the existing roster rather than provisioning a second copy" ;;
       namespaced)
         local _clashes
@@ -2733,10 +3006,23 @@ HELP
   # DIVE-5498: with no namespace, a solo agent of the same persona JOINS the
   # team (role, manager, goals re-applied by `up`). Under a namespace nothing is
   # adopted — the roster comes up under new names and touches nobody.
-  local COMPOSE_ADOPT_REWIRE=""
+  #
+  # DIVE-5769: the same persona already in ANOTHER team is shared, not re-wired:
+  # COMPOSE_ADOPT_SHARE. Every team on the box is frozen into explicit membership
+  # first (_team_members_backfill), so an agent already recorded in THIS team —
+  # a re-import — is neither re-wired nor shared again.
+  local COMPOSE_ADOPT_REWIRE="" COMPOSE_ADOPT_SHARE="" COMPOSE_TEAM_KEY="$slug_key"
+  _team_members_backfill "$slug_key" || true
   if [[ -z "$name_prefix" && -n "$spec_for_prefix" ]]; then
-    COMPOSE_ADOPT_REWIRE=$(_compose_adoptable_solo "$spec_for_prefix" \
-                             "$(registry_read 2>/dev/null || echo '{}')" "$(_compose_org_bound)")
+    local _reg1 _bound1 _sp
+    _reg1=$(registry_read 2>/dev/null || echo '{}'); _bound1=$(_compose_org_bound)
+    COMPOSE_ADOPT_REWIRE=$(_compose_adoptable_solo "$spec_for_prefix" "$_reg1" "$_bound1")
+    while IFS= read -r _sp; do
+      [[ -n "$_sp" ]] || continue
+      grep -qxF -- "$_sp" <<<"$COMPOSE_ADOPT_REWIRE" && continue
+      [[ -n "$slug_key" ]] && _team_is_member "$slug_key" "$_sp" && continue
+      COMPOSE_ADOPT_SHARE+="${COMPOSE_ADOPT_SHARE:+$'\n'}$_sp"
+    done < <(_compose_same_persona "$spec_for_prefix" "$_reg1")
   fi
 
   local _seat _agent
@@ -2751,6 +3037,12 @@ HELP
   (( start_now )) && _up_args+=(--start-now)
   cmd_compose_up "${_up_args[@]}" || return $?
   _team_seat_map_write "$slug_key" "$COMPOSE_SEAT_MAP" || true
+  # DIVE-5769: who is in this team, under the names the roster came up with.
+  if [[ -n "$slug_key" && -n "$spec_for_prefix" ]]; then
+    local _final="$spec_for_prefix"
+    [[ -n "$name_prefix" ]] && _final=$(_compose_apply_name_prefix "$spec_for_prefix" "$name_prefix")
+    _team_members_write "$slug_key" "$_final" || true
+  fi
 
   # ---- DIVE-4822: an import now writes the TEAM, not just the roster ---------
   # Best-effort, and deliberately AFTER the roster is up: a team row over a
