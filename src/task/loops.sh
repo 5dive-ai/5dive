@@ -515,6 +515,13 @@ _loop_score_request() {
   [[ -n "$row" ]] || return 0
   IFS=$'\x1f' read -r rident runner tident ttitle <<<"$row"
   [[ -z "$(_loop_pref_get "loop.score.${rident}")" ]] || return 0
+  # DIVE-5777: a loop with an outcome command is scored by that number, read by
+  # the runtime as the loop's seat; nobody is asked for an opinion.
+  if [[ -n "$(_loop_pref_get "loop.outcome.${tident}")" ]]; then
+    local tpl; tpl=$(db "SELECT id||x'1f'||COALESCE(assignee,'') FROM tasks WHERE ident=$(sqlq "$tident");")
+    _loop_outcome_tick "${tpl%%$'\x1f'*}" "$tident" "$rident" "${tpl#*$'\x1f'}" || true
+    return 0
+  fi
   [[ "$(db "SELECT COUNT(*) FROM tasks WHERE title=$(sqlq "Score loop run ${rident}");")" == "0" ]] || return 0
   scorer=$(_loop_scorer "$runner")
   [[ -n "$scorer" ]] || return 0
@@ -581,6 +588,8 @@ _loop_board_json() {
           'ident', p.ident, 'title', p.title, 'assignee', p.assignee, 'schedule', p.schedule,
           'instructions', p.body,
           'auto', (SELECT value='on' FROM task_prefs WHERE key='loop.auto.'||p.ident),
+          'outcome', (SELECT json(value) FROM task_prefs WHERE key='loop.outcome.'||p.ident AND json_valid(value)),
+          'paused', p.parked_at IS NOT NULL,
           'suggestion', (SELECT json(value) FROM task_prefs WHERE key='loop.suggest.'||p.ident AND json_valid(value)),
           'runs', (SELECT json_group_array(json_object('ident', r.ident, 'done_at', r.done_at,
                      'score', (SELECT json(value) FROM task_prefs WHERE key='loop.score.'||r.ident AND json_valid(value)),
@@ -589,11 +598,15 @@ _loop_board_json() {
                          ORDER BY id DESC LIMIT ${_LOOP_RUNS_SCORED}) r)))
          FROM (SELECT * FROM tasks WHERE ${_LOOP_TPL_PRED} AND status <> 'cancelled' ORDER BY id) p;")
   [[ -n "$rows" ]] || rows="[]"
-  jq -c 'map(.auto = (.auto == 1)
+  # DIVE-5777: an outcome loop has no opinion score. Paused by its outcome it
+  # scores 0, the lowest, so the weekly review asks for its new instructions;
+  # running, it scores nothing and the board shows its number instead.
+  jq -c 'map(.auto = (.auto == 1) | .paused = (.paused == 1)
          | .runs = (.runs | map(.effective = (if .vote == "up" then 100 elif .vote == "down" then 0
                                               else (.score.score // null) end)))
-         | .score = ([.runs[].effective | select(. != null)] | if length == 0 then null
-                                                              else (add / length | round) end))' <<<"$rows"
+         | .score = (if .outcome != null then (if .outcome.paused_at then 0 else null end)
+                     else ([.runs[].effective | select(. != null)] | if length == 0 then null
+                                                                     else (add / length | round) end) end))' <<<"$rows"
 }
 
 # `task loop scores` — the loops board.
@@ -604,7 +617,8 @@ cmd_task_loop_scores() {
     jq -c '{ok:true, data:{loops:.}}' <<<"$board"
   else
     jq -r 'if length == 0 then "no loops (a loop is a scheduled task: add one with --recurring=<cron>)" else
-      .[] | "\(.ident)  \(if .score == null then "unscored" else "\(.score)/100" end)  \(.title)  [\(.assignee // "-")]"
+      .[] | "\(.ident)  \(if .outcome != null then "outcome \(.outcome.last // "unread")\(if .outcome.paused_at then " PAUSED (no rise since \(.outcome.since))" else "" end)"
+                     elif .score == null then "unscored" else "\(.score)/100" end)  \(.title)  [\(.assignee // "-")]"
         + (if .auto then "  self-improve:on" else "" end)
         + (if .suggestion.status == "pending" then "  suggestion: pending" else "" end) end' <<<"$board"
   fi
@@ -645,11 +659,15 @@ cmd_task_loop_review() {
     ok "a suggestion for ${tident} is already being written" '{filed:false, reason:"already asked", loop:$t}' --arg t "$tident"
     return 0
   fi
-  runs=$(jq -r '.runs[] | "- \(.ident): \(.effective // "unscored")\(if .vote then " (owner: \(.vote))" else "" end)\(if (.score.note // "") != "" then " — \(.score.note)" else "" end)"' <<<"$pick")
+  local lead_line="Loop ${tident} (\"${ttitle}\") scores ${tscore}/100, the lowest of the loops this week. Suggest ONE change to its instructions that would raise the score."
+  if [[ "$(jq -r '.outcome.paused_at // ""' <<<"$pick")" != "" ]]; then
+    lead_line="Loop ${tident} (\"${ttitle}\") paused itself: the number it is measured by ($(jq -r .outcome.cmd <<<"$pick")) has stayed at $(jq -r '.outcome.last // "no reading"' <<<"$pick") since $(jq -r .outcome.since <<<"$pick") UTC. Suggest ONE change to its instructions that would make that number rise: a different lane, not more of the same work."
+  fi
+  runs=$(jq -r '.runs[] | "- \(.ident): \(.effective // .score.outcome // "unscored")\(if .vote then " (owner: \(.vote))" else "" end)\(if (.score.note // "") != "" then " — \(.score.note)" else "" end)"' <<<"$pick")
   local out ident
   out=$(JSON_MODE=1 cmd_task_add "$title" --materialized --review=none --fresh --from=loop \
       --assignee="$(_loop_scorer "$owner")" --priority=medium \
-      --body="Loop ${tident} (\"${ttitle}\") scores ${tscore}/100, the lowest of the loops this week. Suggest ONE change to its instructions that would raise the score.
+      --body="${lead_line}
 
 Recent runs:
 ${runs}
@@ -731,7 +749,13 @@ cmd_task_loop_decide() {
   case "$verb" in
     apply)
       _loop_apply "$tid" "$tident" "$(task_actor "")"
-      ok "applied the suggestion to ${tident}" '{loop:$t, status:"applied"}' --arg t "$tident" ;;
+      # DIVE-5777: new instructions on a loop its outcome paused are the
+      # redirect, so the owner's Apply also resumes it with a fresh 3 days.
+      if _loop_outcome_resume "$tid" "$tident"; then
+        ok "applied the suggestion to ${tident} and resumed it" '{loop:$t, status:"applied", resumed:true}' --arg t "$tident"
+      else
+        ok "applied the suggestion to ${tident}" '{loop:$t, status:"applied"}' --arg t "$tident"
+      fi ;;
     dismiss)
       [[ "$st" == "pending" ]] || fail "$E_VALIDATION" "no pending suggestion for ${tident}"
       _loop_pref_set "loop.suggest.${tident}" "$(jq -c '.status="dismissed" | .dismissed_at=(now|todate)' <<<"$sug")"
@@ -752,6 +776,8 @@ cmd_task_loop_auto() {
   [[ "$state" =~ ^(on|off)$ ]] || fail "$E_USAGE" "usage: 5dive task loop auto <loop> on|off"
   _loop_tpl_resolve "$ref"; tid="$_LOOP_TID"; tident="$_LOOP_TIDENT"
   if [[ "$state" == "on" ]]; then
+    [[ -z "$(_loop_pref_get "loop.outcome.${tident}")" ]] \
+      || fail "$E_VALIDATION" "${tident} is scored by its outcome, and its next lane is the owner's call: self-improvement stays off (DIVE-5777)"
     _loop_pref_set "loop.auto.${tident}" on
     if [[ "$(jq -r '.status // ""' <<<"$(_loop_pref_get "loop.suggest.${tident}")" 2>/dev/null)" == "pending" ]]; then
       _loop_apply "$tid" "$tident" "self-improvement"; applied=true
@@ -761,6 +787,197 @@ cmd_task_loop_auto() {
   fi
   ok "self-improvement ${state} for ${tident}" '{loop:$t, auto:($s=="on"), applied:($a=="true")}' \
      --arg t "$tident" --arg s "$state" --arg a "$applied"
+}
+
+# ───────────── DIVE-5777 an outcome command replaces the opinion score ─────────────
+# An opinion score grades ACTIVITY: the chill-gorge distribution team's runs did
+# their job every day for 8 days and its lane produced 0 sign-ups (wiki:
+# a-loop-scored-by-opinion-grades-activity). So a loop may carry ONE optional
+# outcome command that prints one number. When it is set:
+#   - after each run the runtime runs it, as the loop's own seat, in that seat's
+#     home, and records the number on the run. No agent is asked for a score;
+#   - the number has not risen for 3 days (the first reading is the baseline, so
+#     a lane that never moves pauses 3 days after the command was set): the loop
+#     pauses itself (its template is parked, which the materializer skips) and
+#     its lead is asked, once, to tell the owner;
+#   - a paused loop scores 0, the lowest, so the weekly review asks for new
+#     instructions for it; the owner's Apply on that suggestion resumes it with a
+#     fresh 3 days, as does `task loop resume` (or a plain `task unpark`);
+#   - self-improvement stays OFF: choosing the next lane is the owner's call.
+# State, beside the DIVE-5564 keys:
+#   loop.outcome.<template ident>  {"cmd","set_by","set_at","since","best","last",
+#                                   "last_at","paused_at"}
+# since = when the number last rose (or the command was set / the loop resumed).
+_LOOP_OUTCOME_FLAT_DAYS=3
+_LOOP_OUTCOME_TIMEOUT=60
+
+# The unix user a seat runs as (agent-<name>, or <name> for a seat with its own).
+_loop_seat_user() {
+  if id -u "agent-$1" >/dev/null 2>&1; then printf 'agent-%s' "$1"; return 0; fi
+  if id -u "$1" >/dev/null 2>&1; then printf '%s' "$1"; return 0; fi
+  return 1
+}
+
+# The command is stored on the shared board and run later by whatever closes a
+# run, so it only ever runs AS THE LOOP'S SEAT: root switches to that user, the
+# seat itself runs it directly, and any other process does not run it at all.
+# Otherwise one seat could plant a command that another seat, or root, runs.
+# <seat> <cmd> -> stdout of the command; rc 125 = could not run it as that seat.
+_loop_outcome_exec() {
+  local u
+  u=$(_loop_seat_user "$1") || return 125
+  if [[ "$EUID" == "0" && "$u" != "root" ]]; then
+    runuser -u "$u" -- timeout "$_LOOP_OUTCOME_TIMEOUT" bash -c 'cd ~ 2>/dev/null; eval "$1"' _ "$2" </dev/null 2>/dev/null
+  elif [[ "$(id -un)" == "$u" ]]; then
+    ( cd ~ 2>/dev/null; timeout "$_LOOP_OUTCOME_TIMEOUT" bash -c "$2" </dev/null 2>/dev/null )
+  else
+    return 125
+  fi
+}
+
+# <seat> <cmd> -> "<number>|0", or "|<rc>" when it failed or printed no number.
+_loop_outcome_read() {
+  local out rc first
+  out=$(_loop_outcome_exec "$1" "$2"); rc=$?
+  first=$(printf '%s\n' "$out" | head -n1)
+  first="${first#"${first%%[![:space:]]*}"}"; first="${first%"${first##*[![:space:]]}"}"
+  if (( rc == 0 )) && [[ "$first" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    printf '%s|0' "$(jq -n --arg v "$first" '$v | tonumber')"
+  else
+    (( rc == 0 )) && rc=1
+    printf '|%s' "$rc"
+  fi
+}
+
+# A loop whose outcome state says paused but whose template is no longer parked
+# was resumed by hand (`task unpark`): start a fresh window instead of pausing
+# it again on the next reading.
+_loop_outcome_resumed_sql() {  # <template id>
+  db "SELECT CASE WHEN parked_at IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END FROM tasks WHERE id=$1;"
+}
+
+# Called by _loop_score_request for a finished run of an outcome loop.
+_loop_outcome_tick() {  # <template id> <template ident> <run ident> <seat>
+  local tid="$1" tident="$2" rident="$3" seat="$4" st cmd reading val rc now
+  st=$(_loop_pref_get "loop.outcome.${tident}")
+  cmd=$(jq -r '.cmd // ""' <<<"$st" 2>/dev/null)
+  [[ -n "$cmd" ]] || return 0
+  now=$(db "SELECT datetime('now');")
+  if [[ -n "$(jq -r '.paused_at // ""' <<<"$st")" && "$(_loop_outcome_resumed_sql "$tid")" == "1" ]]; then
+    st=$(jq -c --arg n "$now" 'del(.paused_at) | .since=$n' <<<"$st")
+  fi
+  reading=$(_loop_outcome_read "$seat" "$cmd"); val="${reading%|*}"; rc="${reading##*|}"
+  if [[ -n "$val" ]]; then
+    _loop_pref_set "loop.score.${rident}" "$(jq -cn --argjson v "$val" \
+        '{outcome:$v, by:"outcome", note:"the outcome command printed \($v)", at:(now|todate)}')"
+    st=$(jq -c --argjson v "$val" --arg n "$now" \
+        'if .best == null then .best=$v elif $v > .best then .best=$v | .since=$n else . end
+         | .last=$v | .last_at=$n' <<<"$st")
+  else
+    local why="the outcome command failed (exit ${rc}) or printed no number"
+    (( rc == 125 )) && why="the outcome command could not run as ${seat}"
+    _loop_pref_set "loop.score.${rident}" "$(jq -cn --arg w "$why" '{outcome:null, by:"outcome", note:$w, at:(now|todate)}')"
+  fi
+  _loop_pref_set "loop.outcome.${tident}" "$st"
+  # The clock runs on readings that failed too: a broken command is not a rise.
+  [[ -z "$(jq -r '.paused_at // ""' <<<"$st")" ]] || return 0
+  [[ "$(db "SELECT julianday($(sqlq "$now")) - julianday($(sqlq "$(jq -r '.since // .set_at' <<<"$st")")) >= ${_LOOP_OUTCOME_FLAT_DAYS};")" == "1" ]] || return 0
+  _loop_outcome_pause "$tid" "$tident" "$st"
+}
+
+# Park the template (the materializer skips it; nothing else wakes it) and ask
+# the lead, once, to tell the owner.
+_loop_outcome_pause() {  # <template id> <template ident> <state json>
+  local tid="$1" tident="$2" st="$3" ttitle seat lead last since num title
+  db "UPDATE tasks SET status='blocked', parked_at=datetime('now'), wake_at=NULL,
+        park_reason=$(sqlq "paused by its outcome: the number has not risen in ${_LOOP_OUTCOME_FLAT_DAYS} days (DIVE-5777). Resume: 5dive task loop resume ${tident}")
+      WHERE id=${tid} AND status NOT IN ('done','cancelled')
+        AND (need_type IS NULL OR need_answered_at IS NOT NULL);"
+  [[ "$(db "SELECT CASE WHEN parked_at IS NULL THEN 0 ELSE 1 END FROM tasks WHERE id=${tid};")" == "1" ]] || return 0
+  _loop_pref_set "loop.outcome.${tident}" "$(jq -c '.paused_at=(now|todate)' <<<"$st")"
+  ttitle=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${tid};")
+  seat=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${tid};")
+  lead=$(_task_org_root_of "$seat" 2>/dev/null); lead="${lead:-$seat}"
+  [[ -n "$lead" ]] || return 0
+  last=$(jq -r '.last // "no reading"' <<<"$st"); since=$(jq -r '.since // .set_at' <<<"$st")
+  num=$(jq -r '.cmd' <<<"$st")
+  title="Tell your owner loop ${tident} paused itself"
+  [[ "$(db "SELECT COUNT(*) FROM tasks WHERE title=$(sqlq "$title") AND status NOT IN ('done','cancelled');")" == "0" ]] || return 0
+  ( JSON_MODE=1 cmd_task_add "$title" --materialized --review=none --fresh --from=loop \
+      --assignee="$lead" --priority=high \
+      --body="Loop ${tident} (\"${ttitle}\") paused itself: its number has not risen since ${since} UTC. Last reading: ${last}. The number comes from: ${num}
+
+1. Send your owner ONE message, where you normally talk to them. At most 60 words, plain words, no task numbers: what this loop was doing, that its number stayed at ${last} for ${_LOOP_OUTCOME_FLAT_DAYS} days so it stopped, and ask: try it again as it is, change what it does, or leave it stopped?
+2. Their answer: again as it is = 5dive task loop resume ${tident}. Change it = write what they want as its new instructions (5dive task loop suggest ${tident} --body-file=<path>), then 5dive task loop apply ${tident}, which also resumes it. Leave it stopped = nothing to do.
+3. Close this row with task done once the message is sent. Do not ask them again." ) >/dev/null 2>&1 || true
+  return 0
+}
+
+# `task loop outcome <loop> --cmd="<command>" | --clear | --check`
+cmd_task_loop_outcome() {
+  tasks_db_init
+  local ref="" cmd="" clear=0 check=0 have_cmd=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cmd=*)  cmd="${1#*=}"; have_cmd=1 ;;
+      --clear)  clear=1 ;;
+      --check)  check=1 ;;
+      -*)       fail "$E_USAGE" "unknown flag: $1" ;;
+      *)        [[ -z "$ref" ]] && ref="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  local usage='usage: 5dive task loop outcome <loop> --cmd="<command that prints one number>" | --clear | --check'
+  (( have_cmd + clear + check == 1 )) || fail "$E_USAGE" "$usage"
+  local tid tident seat st
+  _loop_tpl_resolve "$ref"; tid="$_LOOP_TID"; tident="$_LOOP_TIDENT"
+  seat=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${tid};")
+  st=$(_loop_pref_get "loop.outcome.${tident}")
+  if (( check )); then
+    [[ -n "$st" ]] || fail "$E_VALIDATION" "${tident} has no outcome command"
+    local reading; reading=$(_loop_outcome_read "$seat" "$(jq -r .cmd <<<"$st")")
+    [[ -n "${reading%|*}" ]] || fail "$E_VALIDATION" "the outcome command for ${tident} printed no number (exit ${reading##*|}; it runs as ${seat}, in that seat's home)"
+    ok "${tident} outcome now: ${reading%|*}" '{loop:$t, value:($v|tonumber)}' --arg t "$tident" --arg v "${reading%|*}"
+    return 0
+  fi
+  # Whoever sets the command picks code the loop's seat will run, so only that
+  # seat, or root, may set or clear it.
+  local u; u=$(_loop_seat_user "$seat" 2>/dev/null) || u=""
+  [[ "$EUID" == "0" || ( -n "$u" && "$(id -un)" == "$u" ) ]] \
+    || fail "$E_PERMISSION" "only ${seat:-its seat} or root may set ${tident}'s outcome command (it runs as that seat)"
+  if (( clear )); then
+    [[ -n "$st" ]] || fail "$E_VALIDATION" "${tident} has no outcome command"
+    _loop_pref_del "loop.outcome.${tident}"
+    ok "${tident} is scored by opinion again" '{loop:$t, outcome:null}' --arg t "$tident"
+    return 0
+  fi
+  [[ -n "${cmd//[[:space:]]/}" ]] || fail "$E_VALIDATION" "--cmd is empty"
+  local now; now=$(db "SELECT datetime('now');")
+  # A changed command is a new measure: a fresh baseline and a fresh 3 days.
+  _loop_pref_set "loop.outcome.${tident}" "$(jq -cn --arg c "$cmd" --arg b "$(task_actor "")" --arg n "$now" \
+      '{cmd:$c, set_by:$b, set_at:$n, since:$n, best:null}')"
+  _loop_pref_del "loop.auto.${tident}"
+  ok "${tident} is now scored by its outcome; it pauses if the number has not risen in ${_LOOP_OUTCOME_FLAT_DAYS} days (self-improvement is off)" \
+     '{loop:$t, outcome:{cmd:$c}, auto:false}' --arg t "$tident" --arg c "$cmd"
+}
+
+# `task loop resume <loop>` — the owner's tap on a paused outcome loop.
+_loop_outcome_resume() {  # <template id> <template ident> -> 0 resumed, 1 was not paused
+  local tid="$1" tident="$2" st
+  st=$(_loop_pref_get "loop.outcome.${tident}")
+  [[ -n "$(jq -r '.paused_at // ""' <<<"$st" 2>/dev/null)" ]] || return 1
+  db "UPDATE tasks SET parked_at=NULL, park_reason=NULL, wake_at=NULL,
+        status=CASE WHEN status='blocked' AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${tid})
+                    THEN 'todo' ELSE status END
+      WHERE id=${tid} AND status NOT IN ('done','cancelled');"
+  _loop_pref_set "loop.outcome.${tident}" "$(jq -c --arg n "$(db "SELECT datetime('now');")" 'del(.paused_at) | .since=$n' <<<"$st")"
+}
+cmd_task_loop_resume() {
+  tasks_db_init
+  local tid tident
+  _loop_tpl_resolve "${1:-}"; tid="$_LOOP_TID"; tident="$_LOOP_TIDENT"
+  _loop_outcome_resume "$tid" "$tident" || fail "$E_VALIDATION" "${tident} is not paused by its outcome"
+  ok "resumed ${tident}; it has ${_LOOP_OUTCOME_FLAT_DAYS} days for its number to rise" '{loop:$t, paused:false}' --arg t "$tident"
 }
 
 cmd_task_loop() {
@@ -776,6 +993,8 @@ cmd_task_loop() {
     suggest)        cmd_task_loop_suggest "$@" ;;
     apply|dismiss|revert) cmd_task_loop_decide "$sub" "$@" ;;
     auto)           cmd_task_loop_auto "$@" ;;
+    outcome)        cmd_task_loop_outcome "$@" ;;
+    resume)         cmd_task_loop_resume "$@" ;;
     -h|--help|help) cat <<'HELP'
 5dive task loop start --title=<name> --steps=<json>   |   loop ls [--all]
 DIVE-5564 loop scores (a loop = a scheduled task):
@@ -786,9 +1005,16 @@ DIVE-5564 loop scores (a loop = a scheduled task):
   loop suggest <loop> --body-file=<path> [--reason=]   record suggested instructions
   loop apply|dismiss|revert <loop>              act on the suggestion; revert undoes the last apply
   loop auto <loop> on|off                       self-improvement: apply suggestions unasked (off by default)
+DIVE-5777 outcome loops (score by a number, not an opinion):
+  loop outcome <loop> --cmd="<command>"         after each run, run it as the loop's seat (in its home);
+                                                the ONE number it prints is the run's score. No rise in
+                                                3 days: the loop pauses and its lead tells the owner once.
+                                                Self-improvement stays off.
+  loop outcome <loop> --check | --clear         read the number now | go back to opinion scores
+  loop resume <loop>                            restart a paused loop with a fresh 3 days (Apply does too)
 HELP
     ;;
-    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|rate|review|suggest|apply|dismiss|revert|auto)" ;;
+    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|rate|review|suggest|apply|dismiss|revert|auto|outcome|resume)" ;;
   esac
 }
 

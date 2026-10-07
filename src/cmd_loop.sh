@@ -84,6 +84,11 @@ _loop_help() {
               install a marketplace loop pack (recurring agentic workflow:
               persona + skills + cadence) onto an agent. loop show <slug> to peek.
 
+  An installed loop is a scheduled task. Score it by a number instead of an
+  opinion, and let it pause itself after 3 days without a rise (DIVE-5777):
+    5dive task loop outcome <loop> --cmd="<command that prints one number>"
+    5dive task loop resume <loop>      (more: 5dive task loop --help)
+
   Orchestration verbs: JSON in / JSON out, honor --ceiling (per-loop token budget;
   self-halt + escalate-with-proof at the limit). Humans watch + kill via
   `5dive task loops [--kill <loopId>]`; they never author a loop.
