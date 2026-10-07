@@ -156,8 +156,8 @@ out=$(cmd_task_loop_review --force 2>&1)
 t "S11 weekly review picks the lowest runtime-scored loop" "true $L" "$(jq -r '"\(.data.filed) \(.data.loop)"' <<<"$out")"
 t "S11 the ask carries the runtime's notes" "1" "$(db "SELECT body LIKE '%error: tool_error%' FROM tasks WHERE ident='$(jq -r .data.task <<<"$out")';")"
 ask=$(jq -r .data.task <<<"$out")
-# The ask lists the runs by ident, and on a box its created_by is whoever closed
-# the run (the derived actor), not 'loop': it must still not read as rework.
+# The ask lists the runs by ident. It is excluded by its TITLE, not only by
+# created_by='loop' (a hand-filed or re-attributed copy must still not read as rework).
 db "UPDATE tasks SET created_by='quinn' WHERE ident='$ask';"
 t "S11 (the ask names the errored run)" "1" "$(db "SELECT body LIKE '%${RE}%' FROM tasks WHERE ident='$ask';")"
 before=$(db "SELECT group_concat(value, '|') FROM task_prefs WHERE key LIKE 'loop.score.%' ORDER BY key;")
