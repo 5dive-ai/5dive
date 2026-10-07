@@ -920,6 +920,7 @@ doctor_registry_seat_names() {
 #   group   — membership in AGENT_SHARED_GROUP, the credential-scoping group;
 #             this is the security-relevant one, so its presence sets `error`
 #   units   — a lingering (often `failed`) 5dive-agent@<name>.service
+#   routes  — a `5dive route` block the seat published (DIVE-5807)
 #
 # Each is a function so the unit harness can replace it; none of them may be
 # allowed to turn a read failure into a green row (rule 1 of the marketplace
@@ -934,6 +935,14 @@ doctor_orphan_group_members() {
 doctor_orphan_units() {
   systemctl list-units --all --no-legend --plain '5dive-agent@*.service' 2>/dev/null \
     | awk '{print $1" "$4}'
+}
+# DIVE-5807: a fourth source. A `5dive route` block names the seat that added it
+# (by=<name>), and a removal that never reached it left the seat's app public
+# after the seat was gone (divine-owl, hello.<box>). root and claude are the
+# privileged publishers, not seats.
+doctor_orphan_routes() {
+  declare -F _route_list_lines >/dev/null 2>&1 || return 0
+  _route_list_lines 2>/dev/null | awk '$3 != "" && $3 != "root" && $3 != "claude" {print $3}' | sort -u
 }
 
 # doctor_collect_orphan_seats <known-names>
@@ -978,6 +987,12 @@ doctor_collect_orphan_seats() {
     _is_known "$nm" && continue
     orphan["$nm"]="${orphan[$nm]:+${orphan[$nm]},}unit:${state}"
   done < <(doctor_orphan_units)
+
+  while IFS= read -r nm || [[ -n "$nm" ]]; do
+    [[ -n "$nm" ]] || continue
+    _is_known "$nm" && continue
+    orphan["$nm"]="${orphan[$nm]:+${orphan[$nm]},}route"
+  done < <(doctor_orphan_routes)
 
   unset -f _is_known
   (( ${#orphan[@]} == 0 )) && return 0
@@ -1062,7 +1077,7 @@ doctor_check_orphan_seats() {
     mapfile -t left < <(doctor_collect_orphan_seats "$known")
     if (( ${#left[@]} == 0 )); then
       doctor_add registry orphan-seats ok \
-        "reaped $n orphan seat(s): $names — re-read of passwd, group ${AGENT_SHARED_GROUP:-claude} and the 5dive-agent@ units finds none of them left; homes quarantined under ${REAPED_DIR:-/home/.5dive-reaped}" true true
+        "reaped $n orphan seat(s): $names — re-read of passwd, group ${AGENT_SHARED_GROUP:-claude}, the 5dive-agent@ units and the routes finds none of them left; homes quarantined under ${REAPED_DIR:-/home/.5dive-reaped}" true true
       return 0
     fi
     local left_names left_grp=0

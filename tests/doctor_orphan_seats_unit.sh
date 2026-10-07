@@ -224,6 +224,42 @@ jq -e '.severity == "ok" and .repaired == true and (.message | test("re-read"))'
   || bad_t "a cleared unit reports repaired" "$row"
 set_sources $'agent-ceo:/home/agent-ceo' 'agent-ceo' ''
 
+# 6e. DIVE-5807: ROUTE-ONLY orphan — divine-owl's `hello` route, published by a
+#     seat whose account and home were already gone. The real source reads the
+#     route blocks; root and claude publish routes and are not seats.
+_route_list_lines() { printf '%s\n' "hello 4411 devops2" "admin-app 5000 root" "site 5001 claude" "mine 5002 ceo"; }
+src=$(doctor_orphan_routes)
+[[ "$src" == $'ceo\ndevops2' ]] \
+  && ok_t "the route source names the seats that published a route, never root or claude (the collector grades them)" \
+  || bad_t "the route source names publishing seats only" "$src"
+ROUTE_LINES="devops2"; REAP_LEAVE_ROUTE=""
+doctor_orphan_routes() { printf '%s' "$ROUTE_LINES"; }
+delete_agent_user() {
+  local nm="$1"
+  printf '%s\n' "$nm" >>"$REAP_LOG"
+  [[ "$nm" == "$REAP_REFUSE" ]] && return 1
+  _drop_matching PASSWD_LINES "agent-${nm}:*"
+  [[ "$nm" == "$REAP_LEAVE_GROUP" ]] || _drop_matching GROUP_LINES "agent-${nm}"
+  [[ "$nm" == "$REAP_LEAVE_ROUTE" ]] || _drop_matching ROUTE_LINES "${nm}"
+  return 0
+}
+set_sources '' '' ''
+row=$(run_check 0)
+jq -e '.severity != "ok" and (.message | test("devops2\\(route"))' <<<"$row" >/dev/null \
+  && ok_t "a route whose seat is gone is an orphan, named with its route marker" \
+  || bad_t "a route-only orphan is reported" "$row"
+REAP_LEAVE_ROUTE="devops2"
+row=$(run_check 1)
+jq -e '.severity == "error" and .repaired == false and (.message | test("devops2"))' <<<"$row" >/dev/null \
+  && ok_t "a route that survives --fix keeps the row red" \
+  || bad_t "a surviving route keeps the row red" "$row"
+REAP_LEAVE_ROUTE=""
+row=$(run_check 1)
+jq -e '.severity == "ok" and .repaired == true and (.message | test("routes"))' <<<"$row" >/dev/null \
+  && ok_t "a route that --fix removes reports repaired, from the re-read of the routes" \
+  || bad_t "a removed route reports repaired" "$row"
+ROUTE_LINES=""
+
 # 7. The marketplace enumeration grades registry seats, not /home directories.
 HOMES="$TMP/homes"
 mkdir -p "$HOMES/agent-ceo/.claude/plugins/marketplaces/5dive-plugins" \
