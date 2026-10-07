@@ -536,15 +536,151 @@ _compose_wire_role() {
   _compose_write_role_md "$spec" "$name" "$spec_dir"
 
   # Seed goals into the shared task queue, assigned to the role, from its manager.
+  # DIVE-5729: inside `up` they are NOT filed here but queued, and filed once the
+  # whole roster exists. Two reasons. Under a first-start hold they must be born
+  # behind the lead's kickoff, which cannot exist before the lead does. And even
+  # live, a role created before its manager (names come up in sorted order) had
+  # its goals refused, because `--from=<manager>` named an agent not yet on the
+  # box — every goal of such a role was lost with one warn line.
   local -a goals=()
   mapfile -t goals < <(jq -r '(.goals // [])[]' <<<"$agent")
   local g
   for g in "${goals[@]}"; do
     [[ -n "$g" ]] || continue
-    local -a targs=(task add "$g" "--assignee=$name")
-    [[ -n "$primary_mgr" ]] && targs+=("--from=$primary_mgr")
-    bash "$self" "${targs[@]}" >/dev/null 2>&1 || warn "[$name] seed goal failed: $g"
+    if [[ "${_COMPOSE_QUEUE_GOALS:-0}" == "1" ]]; then
+      _COMPOSE_GOAL_LINES+=("${name}"$'\x1f'"${primary_mgr}"$'\x1f'"${g}")   # \x1f, not a tab: IFS collapses an empty field between tabs
+      continue
+    fi
+    _compose_seed_goal "$name" "$primary_mgr" "$g" "$self" ""
   done
+}
+
+# File one seeded goal. <held_by> empty = live (the pre-DIVE-5729 behaviour, kept
+# for `--start-now` and for a team that is already running).
+_compose_seed_goal() {
+  local name="$1" mgr="$2" g="$3" self="$4" held_by="${5:-}"
+  local -a targs=(task add "$g" "--assignee=$name")
+  [[ -n "$mgr"     ]] && targs+=("--from=$mgr")
+  [[ -n "$held_by" ]] && targs+=("--held-by=$held_by")
+  bash "$self" "${targs[@]}" </dev/null >/dev/null 2>&1 || { warn "[$name] seed goal failed: $g"; return 1; }
+}
+
+# -------- DIVE-5729: the lead asks first --------------------------------------
+#
+# lodar, 2026-10-06: "some marketplace hired teams autostart with loops without
+# asking a human if the lead's assumption is correct … maybe lead first says
+# what's his plan?" Before this, `goals:` were filed live and `loops:` installed
+# live, so a hire started spending the owner's AI on work nobody confirmed.
+#
+# THE SHAPE. On a team's FIRST start, every seeded goal and every declared loop
+# is born BLOCKED behind one row, the kickoff, assigned to the lead. The kickoff
+# tells the lead to send its owner one short plan and wait. `team start`
+# releases what the owner approved and cancels what they dropped; `team decline`
+# cancels all of it. Nothing here is a recurring gate: once released, loops run
+# on their cadence and are never asked about again (lodar, 23:58Z: "only
+# initial work").
+#
+# WHY A DEPENDENCY EDGE AND NOT A NEW STATE. A row blocked behind an open row is
+# skipped by the dispatcher (it starts todo rows) and by the recurring
+# materializer (it fires todo templates only), and the DIVE-1355 sweeps leave a
+# blocked row with a live blocker alone. So the hold needs no new column, no
+# scheduler change, and reads on every existing surface as "blocked by DIVE-K".
+# The edge is written in the same transaction as the row (`task add --held-by`),
+# so no tick can start a goal in the gap a follow-up `task block` would leave.
+#
+# WHY THE KICKOFF IS BORN PARKED. It is filed after the lead exists (an
+# assignee must be a registered agent) but before the goals and loops are, and a
+# lead dispatched in that window would plan from half a list. It is parked for
+# the length of the import and unparked at the end; the wake is the safety net
+# if the import dies in between.
+
+_COMPOSE_KICKOFF_IMPORT_REASON="team import is still bringing the team up"
+
+_compose_kickoff_marker() { printf 'team kickoff: %s (5dive.yaml)' "$1"; }
+
+# Does this spec seed any work at all? No goals and no loops = nothing to hold.
+_compose_spec_seeds_work() {
+  [[ "$(jq -r '[.agents[] | ((.goals // []) | length) + ((.loops // []) | length)] | add // 0' <<<"$1" 2>/dev/null || echo 0)" != "0" ]]
+}
+
+# The lead's open kickoff, as "<id> <ident>", or nothing. Matched on the marker
+# AND the assignee, so a kickoff can only ever be found by the lead it was for.
+_compose_kickoff_open() {
+  local lead="$1"
+  db "SELECT id || ' ' || ident FROM tasks
+      WHERE kind='standard' AND assignee=$(sqlq "$lead")
+        AND status NOT IN ('done','cancelled')
+        AND body LIKE '%'||$(sqlq "$(_compose_kickoff_marker "$lead")")||'%'
+      ORDER BY id DESC LIMIT 1;" 2>/dev/null | head -1
+}
+
+# The kickoff's body: what the lead reads when it is dispatched.
+_compose_kickoff_body() {
+  local lead="$1"
+  _compose_kickoff_marker "$lead"
+  cat <<'EOF'
+
+Your team was just hired and none of its work has started. Every goal and recurring job it came with is HELD behind this row until your owner says yes. Your first job is to ask.
+
+1. Run `5dive team plan`. It lists what is held (each goal and recurring job, who owns it, how often a job runs) and the exact commands for the steps below.
+2. Send your owner ONE message, where you normally talk to them. At most 60 words, plain words, no task numbers. Say what you understand they want from this team, which goals you mean to work and which recurring jobs you mean to switch on, then ask: yes, or what should I skip or change?
+3. Park this row while you wait (the park command `team plan` prints). Start nothing in the meantime.
+4. When they answer: a yes is `5dive team start`. To leave some out, `5dive team start --skip=<the held rows they dropped>`: a skipped goal is cancelled and a skipped job never switches on. If they want something else instead, skip what it replaces and file what they asked for as a task for the right teammate. A no to all of it is `5dive team decline`. Then tell them in one line what started.
+5. If this row wakes and they have not answered, send the plan once more at most, then park again for a week.
+
+No chat with your owner yet? Park this row for a day and send the plan the first time they write to you.
+
+This covers the team's FIRST start only. Once released, recurring jobs run on their schedule without asking again.
+EOF
+}
+
+# Open (or find) the lead's kickoff. Sets _COMPOSE_KICKOFF (ident) and
+# _COMPOSE_KICKOFF_NEW (1 if this run filed it). Returns 1 if the lead is not on
+# the box, in which case NOTHING may be seeded live in its place.
+_compose_hold_open() {
+  local lead="$1" self="$2" row out
+  _COMPOSE_KICKOFF="" _COMPOSE_KICKOFF_NEW=0
+  tasks_db_init 2>/dev/null || true
+  row=$(_compose_kickoff_open "$lead")
+  if [[ -n "$row" ]]; then
+    _COMPOSE_KICKOFF="${row#* }"
+    return 0
+  fi
+  [[ "$(registry_read 2>/dev/null | jq --arg n "$lead" '.agents[$n] != null' 2>/dev/null)" == "true" ]] || return 1
+  out=$(bash "$self" --json task add --materialized --no-verify --priority=high           "--assignee=$lead" "--body=$(_compose_kickoff_body "$lead")"           "--park=$_COMPOSE_KICKOFF_IMPORT_REASON" --park-wake=+6h           -- "Tell your owner your plan before the team starts any work" </dev/null 2>/dev/null) || true
+  _COMPOSE_KICKOFF=$(jq -r '.data.ident // empty' <<<"$out" 2>/dev/null)
+  [[ -n "$_COMPOSE_KICKOFF" ]] || return 1
+  _COMPOSE_KICKOFF_NEW=1
+  # A fresh session must still know what an owner's "yes" is answering, so the
+  # lead's standing instructions say it too, not only this one row.
+  local _ltype; _ltype=$(registry_read 2>/dev/null | jq -r --arg n "$lead" '.agents[$n].type // "claude"' 2>/dev/null)
+  persona_append_block "$lead" "${_ltype:-claude}" $'
+
+## First start (added by team import)
+
+Your team's seeded goals and recurring jobs wait for your owner's yes. While `5dive team plan` lists held work, start none of it. When your owner answers your plan, release what they approved with `5dive team start` (`--skip=<DIVE-N>,...` for what they dropped) or `5dive team decline` for a no.
+' >/dev/null 2>&1 || true
+  return 0
+}
+
+# End of the import: the kickoff becomes dispatchable, or is withdrawn if
+# nothing ended up behind it. Only OUR park is lifted — a kickoff the lead parked
+# while waiting for the owner's answer stays parked on a re-run.
+_compose_hold_close() {
+  local k="$1"
+  [[ -n "$k" ]] || return 0
+  local kid held
+  kid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$k");" 2>/dev/null | head -1)
+  [[ "$kid" =~ ^[0-9]+$ ]] || return 0
+  held=$(db "SELECT COUNT(*) FROM task_deps WHERE blocked_by=${kid};" 2>/dev/null | head -1)
+  if [[ "${held:-0}" == "0" ]]; then
+    ( cmd_task_cancel "$k" --result="Nothing was held behind it: the import seeded no goals and no recurring jobs." ) >/dev/null 2>&1 || true
+    _COMPOSE_KICKOFF=""
+    return 0
+  fi
+  if [[ "$(db "SELECT COALESCE(park_reason,'') FROM tasks WHERE id=${kid};" 2>/dev/null)" == "$_COMPOSE_KICKOFF_IMPORT_REASON" ]]; then
+    ( cmd_task_unpark "$k" ) >/dev/null 2>&1 || warn "could not hand $k to the lead — run: 5dive task unpark $k"
+  fi
 }
 
 # -------- DIVE-4103: `team.requires:` — capability preflight --------------
@@ -713,7 +849,9 @@ _compose_loop_present() {
 # same way _compose_wire_role's are: a loop that will not install must not undo a
 # roster that came up.
 _compose_apply_loops() {
-  local spec="$1" name="$2" self="$3"
+  local spec="$1" name="$2" self="$3" held_by="${4:-}"
+  local -a hargs=()
+  [[ -n "$held_by" ]] && hargs=("--held-by=$held_by")
   local created=0 existing=0 errors=0 loops
   loops=$(jq -c --arg n "$name" '(.agents[$n].loops // [])[]' <<<"$spec" 2>/dev/null || true)
   [[ -n "$loops" ]] || { printf 'COUNTS 0 0 0\n'; return 0; }
@@ -741,7 +879,8 @@ _compose_apply_loops() {
       local -a largs=(loop install "$pack" "--onto=$name")
       [[ -n "$cron"    ]] && largs+=("--cron=$cron")
       [[ -n "$ceiling" ]] && largs+=("--ceiling=$ceiling")
-      step "[$name] installing loop pack '$pack'"
+      largs+=("${hargs[@]}")
+      step "[$name] installing loop pack '$pack'${held_by:+ (paused until the owner approves the plan)}"
       # </dev/null: the loop list is fed to this while via a here-string, and a
       # child that reads stdin would swallow the remaining loops — they would
       # vanish with no error, which is the silent half-provisioning this pass
@@ -761,9 +900,9 @@ _compose_apply_loops() {
     [[ -n "$body" ]] && body+=$'\n\n'
     body+="— $(_compose_loop_marker "$lid") runs on '${cron}'."
     [[ -n "$ceiling" ]] && body+=" advisory budget: ${ceiling} tokens/run (bound hard with: 5dive usage budget $name)."
-    step "[$name] creating loop '$lid' on '$cron'"
+    step "[$name] creating loop '$lid' on '$cron'${held_by:+ (paused until the owner approves the plan)}"
     if bash "$self" task add --materialized "--body=$body" "--recurring=$cron" \
-         "--assignee=$name" --project=dive -- "$title" </dev/null >/dev/null 2>&1; then
+         "--assignee=$name" --project=dive "${hargs[@]}" -- "$title" </dev/null >/dev/null 2>&1; then
       ((created++)) || true
     else
       warn "[$name] loop '$lid' failed to register — no recurring row was created for '$title' on '$cron'"
@@ -1127,7 +1266,7 @@ _compose_browser_mode() {
 }
 
 cmd_compose_up() {
-  local file="" type_override="" name_prefix=""
+  local file="" type_override="" name_prefix="" start_now=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--file)    file="$2"; shift ;;
@@ -1139,9 +1278,11 @@ cmd_compose_up() {
       # the default). Omit it and nothing changes -- the same posture --type takes.
       --prefix=*)   name_prefix="${1#--prefix=}" ;;
       --prefix)     name_prefix="$2"; shift ;;
+      # DIVE-5729: skip the lead's plan-first hold and start seeded work at once.
+      --start-now)  start_now=1 ;;
       -h|--help)
         cat >&2 <<HELP
-usage: 5dive up [-f file] [--type=<harness>] [--prefix=<p>]
+usage: 5dive up [-f file] [--type=<harness>] [--prefix=<p>] [--start-now]
   Bring up agents declared in 5dive.yaml. Idempotent — existing agents are
   left alone, missing ones are created and started.
   Default file: 5dive.yaml or 5dive.yml in the current directory.
@@ -1152,6 +1293,11 @@ usage: 5dive up [-f file] [--type=<harness>] [--prefix=<p>]
                     and gets its own org root. Agent names are capped at 16
                     characters, so a prefix that would overflow one is refused
                     rather than truncated.
+
+  --start-now       On a team's first start, seeded goals and loops normally
+                    wait behind the lead's plan until the owner says yes
+                    (5dive team plan / start / decline). This starts them at
+                    once instead, as before.
 
   --type=<harness>  Create the WHOLE roster on this harness, overriding the
                     spec's type:/defaults.type:. Known: ${!TYPE_BIN[*]}.
@@ -1240,6 +1386,27 @@ HELP
   local reg
   reg=$(registry_read)
 
+  # DIVE-5729: does this run hold the team's seeded work for the lead's plan?
+  # Only on a FIRST start: the lead is new to the box, or joins it now (DIVE-5498
+  # adoption), or its kickoff is still open from an earlier, unanswered run. A
+  # re-import of a team that is already running reconciles live, as before.
+  local _COMPOSE_HOLD=0 _hold_lead="" _COMPOSE_KICKOFF="" _COMPOSE_KICKOFF_NEW=0
+  local _COMPOSE_QUEUE_GOALS=1
+  local -a _COMPOSE_GOAL_LINES=()
+  if (( ! start_now )) && _compose_spec_seeds_work "$spec"; then
+    _hold_lead=$(_compose_spec_root "$spec" 2>/dev/null) || _hold_lead=""
+    if [[ -z "$_hold_lead" ]]; then
+      warn "this spec has no single lead (one agent that reports to nobody), so nobody can ask the owner first — its goals and loops start at once"
+    else
+      tasks_db_init 2>/dev/null || true
+      if [[ "$(jq --arg n "$_hold_lead" '.agents[$n] != null' <<<"$reg")" != "true" ]] \
+         || { [[ -n "${COMPOSE_ADOPT_REWIRE:-}" ]] && grep -qxF -- "$_hold_lead" <<<"$COMPOSE_ADOPT_REWIRE"; } \
+         || [[ -n "$(_compose_kickoff_open "$_hold_lead")" ]]; then
+        _COMPOSE_HOLD=1
+      fi
+    fi
+  fi
+
   local names created=0 started=0 skipped=0 errors=0
   # DIVE-2341: names of agents this run brought up, so the end-of-run block can
   # re-derive their self-check state. Collected here rather than parsed out of the
@@ -1275,7 +1442,7 @@ HELP
         _compose_wire_role "$(_compose_adopted_spec "$spec" "$name")" "$name" "$spec_dir" "$self" || true
         _adopted_names+=("$name")
         if bash "$self" agent start "$name" >/dev/null 2>&1; then
-          ((started++)) || true
+          started=$((started+1))
         else
           ((skipped++)) || true
         fi
@@ -1354,10 +1521,29 @@ HELP
   #
   # Ordering matters twice: after the create loop, because a loop needs its owner
   # to exist; before the summary, because the counts belong on the summary line.
+  # DIVE-5729: the roster is up, so file the goals the create loop queued. Under a
+  # hold, open the kickoff first and file each goal born blocked behind it. A
+  # lead that is not on the box cannot ask anyone, so its team's work is NOT
+  # started in its place.
+  local _hold_failed=0 _held_goals=0 _hg _hg_name _hg_mgr _hg_goal
+  if (( _COMPOSE_HOLD )) && ! _compose_hold_open "$_hold_lead" "$self"; then
+    _hold_failed=1
+    warn "the lead '$_hold_lead' is not on this box, so it cannot ask the owner first — ${#_COMPOSE_GOAL_LINES[@]} seeded goal(s) and every declared loop were NOT filed, and nothing started. Re-run the import once '$_hold_lead' is up."
+  fi
+  if (( ! _hold_failed )); then
+    for _hg in "${_COMPOSE_GOAL_LINES[@]+"${_COMPOSE_GOAL_LINES[@]}"}"; do
+      IFS=$'\x1f' read -r _hg_name _hg_mgr _hg_goal <<<"$_hg"
+      if _compose_seed_goal "$_hg_name" "$_hg_mgr" "$_hg_goal" "$self" "$_COMPOSE_KICKOFF" \
+        && [[ -n "$_COMPOSE_KICKOFF" ]]; then
+        _held_goals=$((_held_goals+1))
+      fi
+    done
+  fi
+
   local loops_created=0 loops_existing=0 loops_errors=0
   local _lc _le _lerr _line _
   local -a _COMPOSE_LOOP_RETRY=()
-  if [[ "$(jq -r '[.agents[] | (.loops // []) | length] | add // 0' <<<"$spec" 2>/dev/null || echo 0)" != "0" ]]; then
+  if (( ! _hold_failed )) && [[ "$(jq -r '[.agents[] | (.loops // []) | length] | add // 0' <<<"$spec" 2>/dev/null || echo 0)" != "0" ]]; then
     tasks_db_init 2>/dev/null || true
     # Re-read: `reg` above is the PRE-run registry, so every agent this run just
     # created would read as absent and its loops would be skipped.
@@ -1376,9 +1562,10 @@ HELP
             loops_errors=$((loops_errors + _lerr)) ;;
           "RETRY "*) _COMPOSE_LOOP_RETRY+=("${_line#RETRY }") ;;
         esac
-      done < <(_compose_apply_loops "$spec" "$name" "$self")
+      done < <(_compose_apply_loops "$spec" "$name" "$self" "$_COMPOSE_KICKOFF")
     done
   fi
+  (( _COMPOSE_HOLD && ! _hold_failed )) && _compose_hold_close "$_COMPOSE_KICKOFF"
   # A loop that would not install must NOT fail the import — same rule, and the
   # same reason, as DIVE-3994's unset bot token and DIVE-2347's failed skill: the
   # roster is up and useful, and a marketplace fetch needs the network, which the
@@ -1450,7 +1637,8 @@ HELP
     # your box, she leads this team" instead of counting a new CEO. `seat` is the
     # template's name for the role; `agent` is who fills it. `adopt_ambiguous`:
     # seats whose persona is on the box more than once, so none was taken.
-    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d, no_channel:$nc, loops:{created:($lc|tonumber), existing:($le|tonumber), errors:($lerr|tonumber), retry:$lr}, adopted:$ad, adopt_ambiguous:$aa}' \
+    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d, no_channel:$nc, loops:{created:($lc|tonumber), existing:($le|tonumber), errors:($lerr|tonumber), retry:$lr}, adopted:$ad, adopt_ambiguous:$aa, held:(if $hk == "" then null else {lead:$hl, kickoff:$hk, goals:($hg|tonumber)} end)}' \
+      --arg hk "$_COMPOSE_KICKOFF" --arg hl "$_hold_lead" --arg hg "$_held_goals" \
       --argjson ad "$(printf '%s\n' "${_adopted_names[@]+"${_adopted_names[@]}"}" | jq -R 'select(length>0)' | jq -sc \
           --argjson m "$_seat_applied" --argjson spec "$spec" \
           'map(. as $n | {agent: $n, seat: (($m | to_entries | map(select(.value == $n)) | .[0].key) // $n), role: ($spec.agents[$n].role // null), pack: ($spec.agents[$n].pack // null)})')" \
@@ -1464,6 +1652,14 @@ HELP
       --argjson lr "$(printf '%s\n' "${_COMPOSE_LOOP_RETRY[@]+"${_COMPOSE_LOOP_RETRY[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')"
   else
     echo "OK — applied $file: created=$created started=$started skipped=$skipped errors=$errors asleep=${#_asleep[@]} skills_failed=${#_degraded[@]} loops=${loops_created}(+${loops_existing} already there)"
+    # DIVE-5729: said FIRST, because it is the thing a person who just hired a
+    # team most needs to know — the team is up and is not working yet, on purpose.
+    if [[ -n "$_COMPOSE_KICKOFF" ]]; then
+      echo ""
+      echo "── nothing has started yet: $_hold_lead sends you its plan first, and the team's goals and loops wait for your yes."
+      echo "     see what is waiting:   sudo 5dive team plan $_hold_lead"
+      echo "     start it all now:      sudo 5dive team start $_hold_lead"
+    fi
     if (( ${#_asleep[@]} > 0 )); then
       echo ""
       echo "── ${#_asleep[@]} agent(s) are ASLEEP — created, but they will not self-act on board work:"
@@ -1918,8 +2114,12 @@ _team_usage() {
   cat >&2 <<HELP
 usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
                                    [--telegram-token=<bot-token>|-] [--prefix=<p>]
+                                   [--start-now]
        5dive team ps [<slug|path>] [--type=<harness>]
        5dive team ls
+       5dive team plan    [<lead>]                    what is waiting for your yes
+       5dive team start   [<lead>] [--skip=<DIVE-N>,...]   release it (minus what you skip)
+       5dive team decline [<lead>]                    start none of it
   Provision a whole company-structure template in one call (wraps 5dive up).
   <slug> resolves in the marketplace registry (<org>/5dive-marketplace, teams/),
   read live — a template published there works on this box with no update.
@@ -1944,6 +2144,10 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
                     is already there.
                     (Not the same thing as 'project add --prefix', which is a
                     task-ident prefix like DIVE-.)
+  --start-now       Start the team's seeded goals and loops at once. Without it
+                    a team's FIRST start waits for you: its lead sends you its
+                    plan, and nothing runs until you answer (team start, or
+                    team decline). Later re-imports never ask again.
 HELP
 }
 
@@ -2247,6 +2451,9 @@ cmd_team() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     import) : ;;
+    plan)    _team_plan "$@"; return $? ;;
+    start)   _team_release start "$@"; return $? ;;
+    decline) _team_release decline "$@"; return $? ;;
     ps)
       if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         cat >&2 <<'HELP'
@@ -2363,13 +2570,14 @@ HELP
     -h|--help|"" )
       _team_usage
       return 0 ;;
-    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ps, ls)" ;;
+    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ps, ls, plan, start, decline)" ;;
   esac
 
   local ref="" profile="" type_override="" tg_token="" tg_token_set=0
-  local name_prefix="" prefix_set=0
+  local name_prefix="" prefix_set=0 start_now=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --start-now)      start_now=1 ;;   # DIVE-5729: skip the lead's plan-first hold
       --auth-profile=*) profile="${1#--auth-profile=}" ;;
       --auth-profile)   profile="$2"; shift ;;
       --telegram-token=*) tg_token="${1#--telegram-token=}"; tg_token_set=1 ;;
@@ -2540,6 +2748,7 @@ HELP
   local -a _up_args=(-f "$file")
   [[ -n "$type_override" ]] && _up_args+=("--type=$type_override")
   [[ -n "$name_prefix"   ]] && _up_args+=("--prefix=$name_prefix")
+  (( start_now )) && _up_args+=(--start-now)
   cmd_compose_up "${_up_args[@]}" || return $?
   _team_seat_map_write "$slug_key" "$COMPOSE_SEAT_MAP" || true
 
@@ -2552,6 +2761,174 @@ HELP
   [[ -n "$root_name" ]] && _lead="${name_prefix:+${name_prefix}-}${root_name}"
   _team_record_team "$slug_key" "$_lead" "$ref" || true
   _team_tag_root_coordinator "$_lead" || true
+}
+
+# -------- DIVE-5729: team plan / start / decline -------------------------------
+#
+# The release half of the lead's plan-first hold (see _compose_hold_open). Each
+# verb names a lead, or none when the box has exactly one team waiting.
+
+# A closed kickoff of <lead> that still holds open rows, as "<id> <ident>".
+_team_kickoff_closed_holding() {
+  db "SELECT k.id || ' ' || k.ident FROM tasks k
+      WHERE k.kind='standard' AND k.assignee=$(sqlq "$1")
+        AND k.status IN ('done','cancelled')
+        AND k.body LIKE '%'||$(sqlq "$(_compose_kickoff_marker "$1")")||'%'
+        AND EXISTS (SELECT 1 FROM task_deps d JOIN tasks t ON t.id=d.task_id
+                    WHERE d.blocked_by=k.id AND t.status NOT IN ('done','cancelled'))
+      ORDER BY k.id DESC LIMIT 1;" 2>/dev/null | head -1
+}
+
+# Resolve <lead> to its open kickoff. Sets TP_LEAD, TP_KID, TP_KIDENT, or fails.
+_team_kickoff_resolve() {
+  local lead="${1:-}" rows n
+  tasks_db_init
+  if [[ -n "$lead" ]]; then
+    rows=$(_compose_kickoff_open "$lead")
+    # A kickoff some other path closed (a gate tap, say) still holds its rows —
+    # the cascade refuses to release them — so it is still answerable here.
+    [[ -n "$rows" ]] || rows=$(_team_kickoff_closed_holding "$lead")
+    [[ -n "$rows" ]] || fail "$E_NOT_FOUND" "nothing of $lead's team is waiting for a yes (no open kickoff for $lead) — its work has already been started or declined, or it was imported with --start-now"
+    TP_LEAD="$lead"
+  else
+    rows=$(db "SELECT assignee || ' ' || id || ' ' || ident FROM tasks
+               WHERE kind='standard' AND status NOT IN ('done','cancelled')
+                 AND body LIKE 'team kickoff: %(5dive.yaml)%'
+               ORDER BY id;" 2>/dev/null)
+    n=$(grep -c . <<<"$rows" || true)
+    (( n > 0 )) || fail "$E_NOT_FOUND" "no team on this box is waiting for a yes"
+    (( n == 1 )) || fail "$E_USAGE" "$n teams are waiting for a yes — name the lead: $(awk '{print $1}' <<<"$rows" | paste -sd' ' -)"
+    TP_LEAD="${rows%% *}"; rows="${rows#* }"
+  fi
+  TP_KID="${rows%% *}"; TP_KIDENT="${rows#* }"
+}
+
+# The held rows behind a kickoff, one per line: ident kind assignee schedule title,
+# split on \x1f (a goal has no schedule, and IFS collapses an empty field between tabs).
+_team_held_rows() {
+  db "SELECT t.ident || x'1f' || CASE WHEN t.kind='recurring' THEN 'loop' ELSE 'goal' END
+          || x'1f' || COALESCE(t.assignee,'') || x'1f' || COALESCE(t.schedule,'')
+          || x'1f' || replace(replace(t.title, x'1f', ' '), x'0a', ' ')
+      FROM task_deps d JOIN tasks t ON t.id=d.task_id
+      WHERE d.blocked_by=${1} AND t.status NOT IN ('done','cancelled')
+      ORDER BY t.kind, t.assignee, t.id;" 2>/dev/null
+}
+
+_team_plan() {
+  local lead=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) _team_usage; return 0 ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  [[ -z "$lead" ]] && lead="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  local TP_LEAD TP_KID TP_KIDENT
+  _team_kickoff_resolve "$lead"
+  local rows; rows=$(_team_held_rows "$TP_KID")
+  if (( JSON_MODE )); then
+    ok "" '{lead:$l, kickoff:$k, held:$h}' --arg l "$TP_LEAD" --arg k "$TP_KIDENT" \
+      --argjson h "$(jq -Rc 'select(length>0) | split("\u001f") | {ident:.[0], kind:.[1], assignee:.[2], schedule:(if .[3]=="" then null else .[3] end), title:.[4]}' <<<"$rows" | jq -sc .)"
+    return 0
+  fi
+  echo "${TP_LEAD}'s team is waiting for the owner's yes (kickoff ${TP_KIDENT}). Nothing below has started:"
+  local ident kind who sched title
+  while IFS=$'\x1f' read -r ident kind who sched title; do
+    [[ -n "$ident" ]] || continue
+    printf '  %-10s %-4s  %-14s %s%s\n' "$ident" "$kind" "$who" "$title" "${sched:+   (runs on '$sched')}"
+  done <<<"$rows"
+  [[ -n "$rows" ]] || echo "  (nothing is held)"
+  echo ""
+  echo "  start all of it:        5dive team start $TP_LEAD"
+  echo "  start all but some:     5dive team start $TP_LEAD --skip=<DIVE-N>,<DIVE-N>"
+  echo "  start none of it:       5dive team decline $TP_LEAD"
+  echo "  wait for the answer:    5dive task park $TP_KIDENT --reason=\"waiting for my owner's answer to the plan\" --wake=+3d"
+}
+
+# _team_release start|decline [<lead>] [--skip=<DIVE-N>,...]
+#
+# ORDER: every --skip is checked against the held set BEFORE anything changes. A
+# typo'd ident must not start the job the owner just said no to, and a partial
+# release on a refusal would be exactly that. Skipped rows are CANCELLED, which
+# for a loop means its template never fires (the materializer fires todo
+# templates only) and a re-import does not re-create it (the reconcile counts a
+# cancelled template as present), so the owner's no stays a no.
+_team_release() {
+  local mode="$1"; shift
+  local lead="" skip_csv=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --skip=*)  skip_csv+="${skip_csv:+,}${1#*=}" ;;
+      -h|--help) _team_usage; return 0 ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  [[ -z "$lead" ]] && lead="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ "$mode" == "start" || -z "$skip_csv" ]] || fail "$E_USAGE" "--skip is for 'team start'; 'team decline' already starts none of it"
+  local TP_LEAD TP_KID TP_KIDENT
+  _team_kickoff_resolve "$lead"
+  local rows; rows=$(_team_held_rows "$TP_KID")
+  local -a held=() skip=() bad=()
+  local ident _rest s
+  while IFS=$'\x1f' read -r ident _rest; do [[ -n "$ident" ]] && held+=("$ident"); done <<<"$rows"
+  local held_list; held_list=$(printf '%s\n' "${held[@]+"${held[@]}"}")
+  local IFS_save="$IFS"; IFS=','
+  for s in $skip_csv; do
+    s="${s// /}"; [[ -n "$s" ]] || continue
+    s="${s^^}"
+    [[ "$s" =~ ^[0-9]+$ ]] && s=$(db "SELECT ident FROM tasks WHERE id=${s};" 2>/dev/null)
+    if grep -qxF -- "$s" <<<"$held_list"; then skip+=("$s"); else bad+=("$s"); fi
+  done
+  IFS="$IFS_save"
+  (( ${#bad[@]} == 0 )) || fail "$E_VALIDATION" "not held behind $TP_KIDENT: ${bad[*]} — nothing was started. See what is held: 5dive team plan $TP_LEAD"
+
+  local started=0 left=0 h
+  local -a left_off=() failed=()
+  local skip_list; skip_list=$(printf '%s\n' "${skip[@]+"${skip[@]}"}")
+  local drop
+  for h in "${held[@]+"${held[@]}"}"; do
+    drop=0
+    if [[ "$mode" == "decline" ]]; then drop=1
+    elif grep -qxF -- "$h" <<<"$skip_list"; then drop=1; fi
+    if (( drop )); then
+      if ( cmd_task_cancel "$h" --result="Left off: the owner did not approve it when $TP_LEAD sent the team's plan (DIVE-5729)." ) >/dev/null 2>&1; then
+        left_off+=("$h"); left=$((left+1))
+      else
+        failed+=("$h")
+      fi
+    else
+      if ( cmd_task_unblock "$h" --by="$TP_KIDENT" ) >/dev/null 2>&1; then
+        ((started++)) || true
+      else
+        failed+=("$h")
+      fi
+    fi
+  done
+  # The kickoff closes LAST, so a release cut short leaves it open and re-runnable
+  # (the rows already released are no longer behind it, so a second run only
+  # touches what is left).
+  local result
+  if [[ "$mode" == "decline" ]]; then
+    result="The owner declined the team's plan; none of its ${left} held goal(s) and job(s) were started."
+  else
+    result="The owner approved the team's plan: ${started} goal(s) and job(s) started${left_off[*]:+, left off: ${left_off[*]}}."
+  fi
+  if (( ${#failed[@]} == 0 )) && [[ "$(db "SELECT status FROM tasks WHERE id=${TP_KID};")" =~ ^(done|cancelled)$ ]]; then
+    :   # closed earlier by another path; its rows are now answered
+  elif (( ${#failed[@]} == 0 )); then
+    ( cmd_task_done "$TP_KIDENT" --result="$result" ) >/dev/null 2>&1 \
+      || ( cmd_task_cancel "$TP_KIDENT" --result="$result" ) >/dev/null 2>&1 \
+      || warn "could not close $TP_KIDENT — close it by hand: 5dive task done $TP_KIDENT --result=\"$result\""
+  else
+    warn "could not release ${failed[*]} — $TP_KIDENT stays open; re-run: 5dive team $mode $TP_LEAD${skip_csv:+ --skip=$skip_csv}"
+  fi
+  ok "$result" '{lead:$l, kickoff:$k, mode:$m, started:($s|tonumber), left_off:$lo, failed:$f}' \
+    --arg l "$TP_LEAD" --arg k "$TP_KIDENT" --arg m "$mode" --arg s "$started" \
+    --argjson lo "$(printf '%s\n' "${left_off[@]+"${left_off[@]}"}" | jq -R 'select(length>0)' | jq -sc .)" \
+    --argjson f "$(printf '%s\n' "${failed[@]+"${failed[@]}"}" | jq -R 'select(length>0)' | jq -sc .)"
+  (( ${#failed[@]} == 0 )) || return "$E_GENERIC"
 }
 
 cmd_compose_ps() {

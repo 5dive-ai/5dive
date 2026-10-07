@@ -208,8 +208,29 @@ _loop_kind() {
 # Best-effort + isolated by the caller (|| true): a cascade hiccup must never
 # fail the close that already committed. Runs on done AND cancel — a cancelled
 # blocker is as "cleared" as a done one for its dependents.
+# DIVE-5729: how many open rows a hired team's KICKOFF still holds (0 for any
+# other row). The kickoff is a plain row on the lead, so every generic close
+# path — `task done`, `task cancel`, a manual-gate tap, `task verify` — would
+# otherwise release the team through the cascade below the moment the lead
+# closes it, and the owner's yes or no would never have been asked. Only
+# `team start` / `team decline` may empty it: they unblock or cancel each held
+# row FIRST, so by the time they close the kickoff this count is 0.
+_task_team_kickoff_holds() {
+  db "SELECT COUNT(*) FROM task_deps d JOIN tasks t ON t.id=d.task_id
+      WHERE d.blocked_by=${1} AND t.status NOT IN ('done','cancelled')
+        AND EXISTS (SELECT 1 FROM tasks k WHERE k.id=${1} AND k.kind='standard'
+                      AND k.body LIKE '%team kickoff: % (5dive.yaml)%');" 2>/dev/null || echo 0
+}
+
 _task_cascade_unblock() {
   local closed_id="$1" dep
+  # DIVE-5729: a team kickoff closed by anything but `team start`/`team decline`
+  # releases nothing — what is still behind it stays held (edge kept), and
+  # `team plan|start|decline <lead>` still finds it to answer properly.
+  if [[ "$(_task_team_kickoff_holds "$closed_id")" != "0" ]]; then
+    _loop_score_request "$closed_id" || true
+    return 0
+  fi
   while IFS= read -r dep; do
     [[ -n "$dep" ]] || continue
     # This blocker is now done/cancelled — drop its (satisfied) edge.
