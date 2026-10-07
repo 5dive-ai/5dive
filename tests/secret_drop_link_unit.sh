@@ -40,6 +40,22 @@ SECRET_DROP_PROVISIONING="$TMP/provisioning.env"
 SECRET_DROP_CADDYFILE="$TMP/Caddyfile"
 SECRET_DROP_LOCK="$TMP/drop.lock"
 SECRET_WRITE_LOCK="$TMP/write.lock"
+# DIVE-5806: the kernel's listening-socket table, in TMP. Empty = nothing on the port.
+SECRET_DROP_PROC_NET="$TMP/procnet"; mkdir -p "$SECRET_DROP_PROC_NET"
+procnet_reset() {
+  printf '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n' > "$SECRET_DROP_PROC_NET/tcp"
+  printf '  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n' > "$SECRET_DROP_PROC_NET/tcp6"
+}
+# listen_as <uid> [tcp|tcp6] [port-hex] [state-hex]: a socket row, as the kernel prints it.
+listen_as() {
+  local uid="$1" fam="${2:-tcp}" port="${3:-0C37}" st="${4:-0A}"
+  if [[ "$fam" == tcp6 ]]; then
+    printf '   0: 00000000000000000000000000000000:%s 00000000000000000000000000000000:0000 %s 00000000:00000000 00:00000000 00000000 %5s        0 4242 1 0000000000000000 100 0 0 10 0\n' "$port" "$st" "$uid" >> "$SECRET_DROP_PROC_NET/tcp6"
+  else
+    printf '   0: 0100007F:%s 00000000:0000 %s 00000000:00000000 00:00000000 00000000 %5s        0 4242 1 0000000000000000 100 0 0 10 0\n' "$port" "$st" "$uid" >> "$SECRET_DROP_PROC_NET/tcp"
+  fi
+}
+procnet_reset
 # DIVE-5772: the tools store and the project folders, in TMP too.
 TOOLS_ENV_FILE="$CONNECTORS_DIR/tools.sh"; TOOLS_WRITE_LOCK="$TMP/tools.lock"
 export SECRET_PROJECTS_DIR="$TMP/projects"; mkdir -p "$SECRET_PROJECTS_DIR"
@@ -340,6 +356,8 @@ fresh_box() { printf 'teal-fox.example.com {\n    handle /shell/* {\n        rev
 probes() { cat "$PROBE_COUNT" 2>/dev/null || echo 0; }
 export SECRET_DROP_POLL_S=0.1
 
+# The page is root's here (DIVE-5806 looks at who holds the port before it trusts /healthz).
+listen_as 0
 seed_gate DIVE-31 READY_KEY ready31
 fresh_box; probe_reset
 out=$(PROBE_READY_AFTER=3 mint_live DIVE-31); rc=$?
@@ -401,7 +419,60 @@ n=$(grep -c '5dive" secret _prewarm >/dev/null 2>&1 || true\|^5dive secret _prew
 [[ "$n" == 2 ]] \
   && ok_t "L11i install.sh pre-warms on both the fresh-install and the --upgrade path, best-effort" \
   || bad_t "L11i install.sh pre-warms on both the fresh-install and the --upgrade path, best-effort" "matches=$n"
+unset -f systemd-run systemctl five_self_bundle; rm -f "$MOCKBIN/curl"; hash -r
+procnet_reset
+
+# --- L13: DIVE-5806 (H2) — a seat squatting the page's port gets no link ------
+# divine-owl audit 2026-10-07: 3127 is unprivileged and free between gates, and
+# _secret_drop_ensure_server took ANY /healthz 200 as the real page, so a seat that
+# bound it first got the owner's next secret over secrets.<box>'s valid certificate.
+# Now `secret link` reads the kernel's socket table and refuses unless root holds it.
+cat > "$MOCKBIN/curl" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$PROBE_LOG"; echo '{"ok":true}'
+EOF
+chmod +x "$MOCKBIN/curl"; hash -r
+export SERVE_LOG="$TMP/serve.log"
+systemd-run() { echo "systemd-run $*" >> "$SERVE_LOG"; [[ -n "${RACE_UID:-}" && " $* " == *" secret serve "* ]] && listen_as "$RACE_UID"; return 0; }
+systemctl() { :; }
+five_self_bundle() { printf '%s' "$MOCKBIN/5dive"; }   # the page's start is systemd-run's mock above
+export SECRET_DROP_BIND_S=1 SECRET_DROP_POLL_S=0.1
+links_for() { grep -l "^task=$1\$" "$SECRET_DROP_DIR"/* 2>/dev/null | wc -l; }
+squat_case() {   # <label> <ident> <want-uid> <mint args...>
+  local label="$1" ident="$2" want="$3"; shift 3
+  : > "$PROBE_LOG"; : > "$SERVE_LOG"
+  local before; before=$(links_for "$ident")
+  out=$( (JSON_MODE=0; _secret_link "$ident" "$@") 2>&1 ); rc=$?
+  [[ $rc -eq 5 && "$out" == *"held by uid ${want}"*"not root"* && "$out" != *"https://secrets."* \
+     && "$(links_for "$ident")" == "$before" && ! -s "$PROBE_LOG" ]] \
+    && ok_t "$label" || bad_t "$label" "rc=$rc links=$before->$(links_for "$ident") probes=$(wc -l < "$PROBE_LOG") out=$out"
+}
+seed_gate DIVE-41 SQUAT_KEY squat41
+fresh_box
+procnet_reset; listen_as 1001
+squat_case "L13a a non-root listener on 127.0.0.1:3127: secret link refuses (rc 5, names uid 1001), mints nothing, never probes" DIVE-41 1001
+! grep -q 'secret serve' "$SERVE_LOG" \
+  && ok_t "L13b ...and does not try to start the page behind the squatter" \
+  || bad_t "L13b ...and does not try to start the page behind the squatter" "serve=$(cat "$SERVE_LOG")"
+squat_case "L13c --no-start refuses the same squatted port" DIVE-41 1001 --no-start
+procnet_reset; listen_as 1002 tcp6
+squat_case "L13d a non-root listener on [::]:3127 (tcp6) is a squat too" DIVE-41 1002
+procnet_reset; listen_as 0; listen_as 1003
+squat_case "L13e root AND a seat on the port: refused (any non-root holder)" DIVE-41 1003
+procnet_reset; RACE_UID=1004
+squat_case "L13f the seat wins the bind between the look and the page's start: refused after the start" DIVE-41 1004
+unset RACE_UID
+grep -q 'secret serve' "$SERVE_LOG" \
+  && ok_t "L13g ...the page WAS started there (the second look is what caught it)" \
+  || bad_t "L13g ...the page WAS started there (the second look is what caught it)" "serve=$(cat "$SERVE_LOG")"
+procnet_reset; listen_as 1001 tcp 0C38; listen_as 1001 tcp 0C37 01; listen_as 0
+: > "$PROBE_LOG"
+out=$(mint_live DIVE-41); rc=$?
+[[ $rc -eq 0 && "$(printf '%s' "$out" | jq -r '.data.url')" =~ ^https://secrets\.teal-fox\.example\.com/[A-Za-z0-9_-]{43}$ ]] \
+  && ok_t "L13h root's page on 3127 mints as before; a seat on 3128, or a non-listening 3127 socket, is not a squat" \
+  || bad_t "L13h root's page on 3127 mints as before; a seat on 3128, or a non-listening 3127 socket, is not a squat" "rc=$rc out=$out"
 unset -f systemd-run systemctl; rm -f "$MOCKBIN/curl"; hash -r
+procnet_reset
 
 # --- L8: serve refuses a routable plain-HTTP bind --------------------------------
 out=$( ( _secret_serve --listen=0.0.0.0:3127 ) 2>&1 ); rc=$?

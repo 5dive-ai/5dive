@@ -2225,6 +2225,37 @@ sys.stdout.write("\n".join(out))
 # become an agent->root vector: the worst a caller can do is inject text into a
 # peer's pane, which is precisely the sanctioned capability. Sender + tier are
 # derived from the REAL sudo caller (SUDO_USER), never a spoofable flag.
+# DIVE-5806 (L4): the record that lets a scoped caller read a reply window.
+# `_capture` used to take ANY --after-id from any holder of the grant, and the
+# slice anchors on the first pane line CONTAINING `id=<after-id>` — so a standard
+# seat could pick a short id (`1`, `a`) and read another seat's pane after any line
+# like `task_id=1…` (divine-owl, 2026-10-07: dave ran `_capture olivia` 73 times;
+# an admin seat's pane can hold secrets). Now `_deliver --id` writes
+# <dir>/<caller uid>.<target>.<id> and `_capture` from a sudo caller needs that
+# file, and anchors on the envelope `_deliver` itself stamped (`from=<caller>
+# id=<id>`), so a seat reads only the reply to a question IT put in that pane.
+# Direct root (no SUDO_UID, or 0) keeps the old read: it can tmux any pane anyway.
+_capture_mint_dir() { printf '%s' "${FIVE_CAPTURE_MINT_DIR:-/var/lib/5dive/capture-mint}"; }
+# _capture_scoped_uid — the sudo caller's uid when this is a scoped call, else rc 1.
+# Root-guarded (DIVE-2538): below EUID 0 SUDO_UID is a plain env var, so it is read
+# only where sudo stamped it. Both callers already require_root; the guard keeps the
+# read sound if a future caller does not.
+_capture_scoped_uid() {
+  _gate_is_root || return 1
+  local u="${SUDO_UID:-}"
+  [[ "$u" =~ ^[0-9]{1,10}$ && "$u" != 0 ]] || return 1
+  printf '%s' "$u"
+}
+_capture_mint_record() {   # <target> <id>
+  local uid dir; uid=$(_capture_scoped_uid) || return 0
+  dir=$(_capture_mint_dir)
+  ( umask 077; mkdir -p "$dir" ) 2>/dev/null && chmod 700 "$dir" 2>/dev/null || return 1
+  # Same bound as the capture transcripts: untouched for an hour = abandoned.
+  # `_capture` touches its record on every read, so a long ask keeps its own.
+  find "$dir" -maxdepth 1 -type f -mmin +60 -delete 2>/dev/null || true
+  ( umask 077; : > "${dir}/${uid}.${1}.${2}" ) 2>/dev/null
+}
+
 cmd_deliver() {
   require_root "agent _deliver"
   local msgid=""
@@ -2328,6 +2359,8 @@ cmd_deliver() {
   header+="]"
   local payload="${header} ${message}"
   if (( urgent_eff )); then payload="$(a2a_urgent_prefix)${payload}"; fi
+  # DIVE-5806: the right to read this question's reply window, and only it.
+  [[ -n "$msgid" ]] && { _capture_mint_record "$target" "$msgid" || true; }
 
   # DIVE-2797: the row for the SCOPED delivery path. `s` here is already derived
   # from the real sudo caller — _deliver accepts no --from — so from_claimed and
@@ -2466,6 +2499,16 @@ cmd_capture() {
     || fail "$E_VALIDATION" "invalid --after-id (expected [A-Za-z0-9], <=32 chars)"
   [[ "$buf_lines" =~ ^[0-9]{1,6}$ ]] \
     || fail "$E_VALIDATION" "--buffer-lines must be a positive integer"
+  # DIVE-5806 (L4): a sudo caller reads only a reply to its OWN delivered question.
+  local scoped_uid="" mint="" anchor_from=""
+  if scoped_uid=$(_capture_scoped_uid); then
+    mint="$(_capture_mint_dir)/${scoped_uid}.${target}.${after_id}"
+    [[ -f "$mint" ]] \
+      || fail "$E_PERMISSION" "refused: agent _capture reads only the reply to a question you delivered to '${target}' (no \`agent _deliver --id=${after_id}\` from you on record). Use: 5dive agent ask ${target} \"<question>\""
+    touch "$mint" 2>/dev/null || true
+    anchor_from=$(actor_routing_agent) || anchor_from=""
+    [[ -n "$anchor_from" ]] || anchor_from="human"
+  fi
   require_agent "$target"
   sudo -u "agent-${target}" tmux has-session -t "agent-${target}" 2>/dev/null \
     || fail "$E_NOT_RUNNING" "tmux session 'agent-${target}' not found (is the agent running?)"
@@ -2531,10 +2574,20 @@ cmd_capture() {
   # the next [5dive-msg marker (bounds the read to a single reply window). Empty
   # output if the marker has not been seen yet — the caller (`ask`) polls until the
   # reply appears and stabilises.
-  awk -v id="id=${after_id}" '
+  # DIVE-5806: a scoped caller's anchor is the envelope _deliver stamped for it —
+  # `from=<caller> id=<id>` then a space or `]` — never a bare substring.
+  awk -v id="id=${after_id}" -v from="$anchor_from" '
+    function anchored(l,   e, i, c) {
+      if (from == "") return index(l, id) > 0
+      e = "from=" from " " id
+      i = index(l, e)
+      if (i == 0) return 0
+      c = substr(l, i + length(e), 1)
+      return c == "" || c == " " || c == "]"
+    }
     found && index($0, "[5dive-msg") { exit }
     found                           { print }
-    index($0, id)                   { found=1 }
+    anchored($0)                    { found=1 }
   ' <<<"$capture"
 }
 
