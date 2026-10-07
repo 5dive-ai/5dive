@@ -141,10 +141,11 @@ fi
 _loop_pref_set "loop.outcome.$S" "$(jq -cn --arg n "$(days_ago 4)" '{cmd:"echo 1", set_at:$n, since:$n, best:null}')"
 t "O10 a command is never run as a seat it cannot become" "125" "$(_loop_outcome_read nosuchseat-5777 'echo 1' | cut -d'|' -f2)"
 
-# O11 — --clear goes back to opinion scores.
+# O11 — --clear goes back to signal scores (DIVE-5815: the runtime scores the
+# run itself; before, this asked for an opinion on a "Score loop run" row).
 ( cmd_task_loop_outcome "$H" --clear ) >/dev/null 2>&1
 R=$(run_once "$H")
-t "O11 cleared: the next run asks for an opinion score again" "1" "$(db "SELECT COUNT(*) FROM tasks WHERE title='Score loop run $R';")"
+t "O11 cleared: the next run is scored by the runtime, no row" "runtime|0" "$(_loop_pref_get "loop.score.$R" | jq -r .by)|$(db "SELECT COUNT(*) FROM tasks WHERE title='Score loop run $R';")"
 
 # O12 — help names the field (task loop --help, and 5dive loop help).
 t "O12 task loop help names outcome and resume" "1|1" "$(cmd_task_loop --help | grep -c 'loop outcome <loop> --cmd=')|$(cmd_task_loop --help | grep -c 'loop resume <loop>')"

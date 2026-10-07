@@ -506,33 +506,244 @@ _loop_tpl_resolve() {
 }
 
 # Called from _task_cascade_unblock on EVERY close; acts only when a run of a
-# loop just went done and nobody has scored it or been asked to. Best-effort.
+# loop just closed. Best-effort.
+#   - an outcome loop (DIVE-5777): a run that went done is scored by its number;
+#   - every other loop (DIVE-5815): the RUNTIME scores the run from signals it
+#     can read, and nobody is asked for an opinion. It used to file a "Score
+#     loop run" row, and on lodar's box every run of a week stayed unscored.
 _loop_score_request() {
-  local id="$1" row rident runner tident ttitle scorer
-  row=$(db "SELECT t.ident||x'1f'||COALESCE(t.assignee,'')||x'1f'||p.ident||x'1f'||COALESCE(p.title,'')
+  local id="$1" row rident st tid tident
+  row=$(db "SELECT t.ident||x'1f'||t.status||x'1f'||p.id||x'1f'||p.ident
             FROM tasks t JOIN tasks p ON p.id=t.from_template_id
-            WHERE t.id=${id} AND t.status='done' AND p.${_LOOP_TPL_PRED//body/p.body};" 2>/dev/null)
+            WHERE t.id=${id} AND t.status IN ('done','cancelled') AND p.${_LOOP_TPL_PRED//body/p.body};" 2>/dev/null)
   [[ -n "$row" ]] || return 0
-  IFS=$'\x1f' read -r rident runner tident ttitle <<<"$row"
-  [[ -z "$(_loop_pref_get "loop.score.${rident}")" ]] || return 0
-  # DIVE-5777: a loop with an outcome command is scored by that number, read by
-  # the runtime as the loop's seat; nobody is asked for an opinion.
+  IFS=$'\x1f' read -r rident st tid tident <<<"$row"
   if [[ -n "$(_loop_pref_get "loop.outcome.${tident}")" ]]; then
+    [[ "$st" == "done" && -z "$(_loop_pref_get "loop.score.${rident}")" ]] || return 0
     local tpl; tpl=$(db "SELECT id||x'1f'||COALESCE(assignee,'') FROM tasks WHERE ident=$(sqlq "$tident");")
     _loop_outcome_tick "${tpl%%$'\x1f'*}" "$tident" "$rident" "${tpl#*$'\x1f'}" || true
     return 0
   fi
-  [[ "$(db "SELECT COUNT(*) FROM tasks WHERE title=$(sqlq "Score loop run ${rident}");")" == "0" ]] || return 0
-  scorer=$(_loop_scorer "$runner")
-  [[ -n "$scorer" ]] || return 0
-  ( JSON_MODE=1 cmd_task_add "Score loop run ${rident}" --materialized --review=none --fresh --from=loop \
-      --assignee="$scorer" --priority=medium \
-      --body="Loop ${tident} (\"${ttitle}\") just finished run ${rident}. Score it 0-100: did the run do the loop's job well?
-
-1. Read the run: 5dive task show ${rident}
-2. Record the score: 5dive task loop score ${rident} --score=<0-100> --note=\"<one line why>\"
-3. Close this row with task done." ) >/dev/null 2>&1 || true
+  _loop_signals_sweep "$tid" || true
+  ( cmd_task_loop_review ) >/dev/null 2>&1 || true
   return 0
+}
+
+# ───────────── DIVE-5815 the runtime scores a run from signals ─────────────
+# lodar 2026-10-07: "human will never score by hand - agent should know if it
+# didnt go well (errors, human complain, etc)". For a loop with no outcome
+# command the runtime writes each run's score (by=runtime), and the note names
+# the signal. The bad ones first:
+#   1. the run did not end done (cancelled, or still open when the next run
+#      started), or one of its attempts failed or stopped mid-run (the runs
+#      journal: status failed|abandoned, or a reclaim).
+#   2. a complaint inside the window: the run was reopened, a PERSON filed a row
+#      that names it, or the owner's reply about it reads as negative
+#      (`task loop feedback`, a keyword floor then one Decisions call).
+#   3. rework: an AGENT filed a row that names it (a fix, a redo).
+#   4. none of these: 80. No news is weak evidence, not 100.
+# A complaint or rework only ever LOWERS a score, and only inside the window:
+# nothing filed or said after it is read. The weekly review reads these scores
+# exactly as it read the opinion ones.
+_LOOP_SIGNAL_HOURS=24
+_LOOP_SCORE_CLEAN=80
+_LOOP_SCORE_ERROR=30
+_LOOP_SCORE_UNFINISHED=10
+_LOOP_SCORE_COMPLAINT=20
+_LOOP_SCORE_REWORK=40
+# The keyword floor: a reply that says any of these is a complaint without a
+# model call. English and Russian (lodar's and the OINOA boxes' languages).
+_LOOP_COMPLAINT_RE="(^|[^[:alpha:]])(wrong|bad|broken|useless|terrible|awful|garbage|not what|didn'?t|did not|doesn'?t work|not working|missing|mistake|redo|again\?|why did|stop doing|failed|error)([^[:alpha:]]|$)|плох|не то|не так|ошиб|переделай|исправь|не работает|ужасн|зачем"
+
+# _loop_score_put <run ident> <score> <note> <by> [signals json array]
+_loop_score_put() {
+  _loop_pref_set "loop.score.${1}" "$(jq -cn --argjson s "$2" --arg n "$3" --arg b "$4" --argjson g "${5:-[]}" \
+      '{score:$s, by:$b, note:$n, at:(now|todate)} + (if ($g|length) > 0 then {signals:$g} else {} end)')"
+}
+
+# _loop_score_lower <run ident> <score> <note> <signal key> — a complaint or
+# rework. Never raises: the score becomes min(current, score). A signal already
+# counted (same key) is a no-op, so a sweep that runs again changes nothing.
+_loop_score_lower() {
+  local rident="$1" s="$2" note="$3" key="$4" cur
+  cur=$(_loop_pref_get "loop.score.${rident}"); [[ -n "$cur" ]] || cur='{}'
+  if jq -e --arg k "$key" '(.signals // []) | index([$k]) != null' <<<"$cur" >/dev/null 2>&1; then return 0; fi
+  _loop_pref_set "loop.score.${rident}" "$(jq -c --argjson s "$s" --arg n "$note" --arg k "$key" '
+      .score = ([.score // $s, $s] | min) | .by = "runtime" | .lowered_at = (now|todate)
+      | .note = (if (.note // "") == "" or .note == "clean run" then $n else .note + "; " + $n end)
+      | .signals = ((.signals // []) + [$k])' <<<"$cur")"
+}
+
+# _loop_first_score <run id> — the score a closed run gets from signal 1, or 80.
+_loop_first_score() {
+  local id="$1" rident st res bad
+  IFS=$'\x1f' read -r rident st res < <(db "SELECT ident||x'1f'||status||x'1f'||COALESCE(result,'') FROM tasks WHERE id=${id};")
+  if [[ "$st" == "cancelled" ]]; then
+    _loop_score_put "$rident" "$_LOOP_SCORE_UNFINISHED" "did not finish: cancelled${res:+ ($(_loop_clip "$res"))}" runtime '["cancelled"]'
+    return 0
+  fi
+  bad=$(db "SELECT status||x'1f'||COALESCE(outcome,'')||x'1f'||COALESCE(error_class,'')||x'1f'||COALESCE(error_summary,'')
+            FROM runs WHERE task_id=${id} AND status IN ('failed','abandoned')
+            ORDER BY started_at DESC, rowid DESC LIMIT 1;" 2>/dev/null)
+  if [[ -n "$bad" ]]; then
+    local rs out ec es; IFS=$'\x1f' read -r rs out ec es <<<"$bad"
+    if [[ "$rs" == "failed" ]]; then
+      _loop_score_put "$rident" "$_LOOP_SCORE_ERROR" "error: $(_loop_clip "${ec:-failed}${es:+: $es}")" runtime '["error"]'
+    else
+      _loop_score_put "$rident" "$_LOOP_SCORE_ERROR" "error: stopped mid-run ($(_loop_clip "${out:-abandoned}${ec:+, $ec}"))" runtime '["error"]'
+    fi
+    return 0
+  fi
+  if [[ "$(db "SELECT COUNT(*) FROM lifecycle_events WHERE kind='task.reclaimed' AND task_id=${id};" 2>/dev/null)" =~ ^[1-9] ]]; then
+    _loop_score_put "$rident" "$_LOOP_SCORE_ERROR" "error: reclaimed (its seat stopped mid-run)" runtime '["error"]'
+    return 0
+  fi
+  _loop_score_put "$rident" "$_LOOP_SCORE_CLEAN" "clean run" runtime
+}
+
+_loop_clip() { local t="${1//$'\n'/ }"; (( ${#t} > 120 )) && t="${t:0:117}..."; printf '%s' "$t"; }
+
+# _loop_is_person <name> — rc 0 when a row's creator is a person, not an agent:
+# not on the team, not a registered seat, and not the runtime itself.
+_loop_is_person() {
+  local who="$1"
+  [[ -n "$who" && "$who" != loop && "$who" != task-engine && "$who" != heartbeat ]] || return 1
+  [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE name=$(sqlq "$who");" 2>/dev/null)" == "0" ]] || return 1
+  declare -F agent_tier >/dev/null || return 0
+  [[ "$(agent_tier "$who" 2>/dev/null)" == unknown:unregistered ]]
+}
+
+# _loop_complaints <run id> — signals 2 and 3 for a scored run, inside the window.
+_loop_complaints() {
+  local id="$1" rident st done_at within
+  IFS=$'\x1f' read -r rident st done_at < <(db "SELECT ident||x'1f'||status||x'1f'||COALESCE(done_at,'') FROM tasks WHERE id=${id};")
+  [[ -n "$done_at" ]] || return 0
+  within="julianday($(sqlq "$done_at")) + ${_LOOP_SIGNAL_HOURS}/24.0"
+  # Reopened after it closed, while the window is still open.
+  if [[ "$st" != "done" && "$st" != "cancelled" ]] \
+     && [[ "$(db "SELECT julianday('now') <= ${within};")" == "1" ]]; then
+    _loop_score_lower "$rident" "$_LOOP_SCORE_COMPLAINT" "owner complained: reopened it" reopened
+  fi
+  # A row filed inside the window that names the run (not its own steps, not the
+  # runtime's rows). By a person: a complaint. By an agent: rework.
+  local n nident ntitle nby
+  while IFS=$'\x1f' read -r n nident ntitle nby; do
+    [[ -n "$n" ]] || continue
+    if _loop_is_person "$nby"; then
+      _loop_score_lower "$rident" "$_LOOP_SCORE_COMPLAINT" "owner complained: filed ${nident} ($(_loop_clip "$ntitle"))" "row:${nident}"
+    else
+      _loop_score_lower "$rident" "$_LOOP_SCORE_REWORK" "rework: ${nident} redoes it ($(_loop_clip "$ntitle"))" "row:${nident}"
+    fi
+  done < <(db "SELECT id||x'1f'||ident||x'1f'||COALESCE(title,'')||x'1f'||COALESCE(created_by,'')
+               FROM tasks
+               WHERE id<>${id} AND COALESCE(parent_id,0)<>${id}
+                 AND COALESCE(created_by,'') <> 'loop'
+                 AND title NOT LIKE 'Score loop run %' AND title NOT LIKE 'Suggest a change to loop %'
+                 AND julianday(created_at) >= julianday($(sqlq "$done_at"))
+                 AND julianday(created_at) <= ${within}
+                 AND (' '||COALESCE(title,'')||' '||COALESCE(body,'')||' ') GLOB $(sqlq "*[^0-9A-Za-z]${rident}[^0-9]*")
+               ORDER BY id;" 2>/dev/null)
+}
+
+# _loop_signals_sweep [<template id>] — the runtime's pass over the last runs of
+# every loop with no outcome command (or one loop): score what closed unscored,
+# score a run still open when the next one started, read complaints inside the
+# window, and close any "Score loop run" row the old path filed and nobody has
+# started (with a result, not empty). Pure SQL: the one model call lives in
+# `task loop feedback`, at the moment a reply arrives.
+_loop_signals_sweep() {
+  local only="${1:-}" tid tident rid rident st scored nxt
+  while IFS=$'\x1f' read -r tid tident; do
+    [[ -n "$tid" ]] || continue
+    [[ -z "$(_loop_pref_get "loop.outcome.${tident}")" ]] || continue
+    while IFS=$'\x1f' read -r rid rident st scored nxt; do
+      [[ -n "$rid" ]] || continue
+      if [[ "$scored" == "0" ]]; then
+        case "$st" in
+          done|cancelled) _loop_first_score "$rid" ;;
+          *) [[ -n "$nxt" ]] || continue
+             _loop_score_put "$rident" "$_LOOP_SCORE_UNFINISHED" "did not finish: still ${st} when ${nxt} started" runtime '["unfinished"]' ;;
+        esac
+      fi
+      _loop_complaints "$rid"
+      local sc; sc=$(_loop_pref_get "loop.score.${rident}")
+      [[ -n "$sc" ]] && db "UPDATE tasks SET status='done', done_at=datetime('now'),
+            result=$(sqlq "Scored by the runtime from signals instead (DIVE-5815): $(jq -r '"\(.score)/100, \(.note)"' <<<"$sc"). No opinion needed.")
+          WHERE title=$(sqlq "Score loop run ${rident}") AND status='todo' AND COALESCE(created_by,'')='loop';" 2>/dev/null
+    done < <(db "SELECT r.id||x'1f'||r.ident||x'1f'||r.status||x'1f'||
+                        (SELECT COUNT(*) FROM task_prefs WHERE key='loop.score.'||r.ident)||x'1f'||
+                        COALESCE((SELECT n.ident FROM tasks n WHERE n.from_template_id=r.from_template_id AND n.id>r.id ORDER BY n.id LIMIT 1),'')
+                 FROM tasks r WHERE r.from_template_id=${tid}
+                 ORDER BY r.id DESC LIMIT ${_LOOP_RUNS_SCORED};")
+  done < <(db "SELECT id||x'1f'||ident FROM tasks WHERE ${_LOOP_TPL_PRED} ${only:+AND id=${only}} ORDER BY id;")
+  return 0
+}
+
+# _loop_reply_is_complaint <text> -> prints "keyword", "model" or nothing.
+# The keyword floor first (free); then ONE Decisions call (~$0.0005) when the
+# box has reflex configured. An error, a timeout or a low-confidence pick is
+# not a complaint: a score is lowered only on evidence.
+_loop_reply_is_complaint() {
+  local text="$1" req resp choice conf
+  if grep -qiE "$_LOOP_COMPLAINT_RE" <<<"$text"; then printf 'keyword'; return 0; fi
+  declare -F reflex_configured >/dev/null && declare -F _reflex_endpoint_decide >/dev/null || return 0
+  [[ "$(reflex_configured 2>/dev/null)" == true ]] || return 0
+  reflex_model_resolve 2>/dev/null || true
+  req=$(jq -cn --arg t "$text" '{policy:"loop-reply", version:1, type:"choice",
+     instructions:"The owner of a recurring agent job replied to one of its runs. Is the reply a complaint about the run?",
+     criteria:{complaint:"It says the run was wrong, poor, incomplete, unwanted or must be redone.",
+               neutral:"A question, an instruction for next time, or an acknowledgement; no judgement of the run.",
+               praise:"It says the run was good or useful."},
+     options:["complaint","neutral","praise"], state:{reply:$t}}') || return 0
+  resp=$(_reflex_endpoint_decide "${_REFLEX_MODEL:-typesafe/jev-1.13}" 10 <<<"$req" 2>/dev/null) || return 0
+  choice=$(jq -r '.choice // empty | strings' <<<"${resp%%$'\n'*}" 2>/dev/null)
+  conf=$(jq -r '.confidence // 1 | numbers' <<<"${resp%%$'\n'*}" 2>/dev/null)
+  [[ "$choice" == complaint ]] && jq -en --argjson c "${conf:-1}" '$c >= 0.6' >/dev/null 2>&1 && printf 'model'
+  return 0
+}
+
+# `task loop feedback <run> --text="<the owner's reply>" [--at=<UTC time>]` —
+# the owner said something about a run (a reply in its channel). Called by the
+# channel bridge or the seat that received it. Inside the window a complaint
+# LOWERS the run's score; outside it, or not a complaint, nothing changes.
+cmd_task_loop_feedback() {
+  tasks_db_init
+  local ref="" text="" at=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --text=*) text="${1#*=}" ;;
+      --at=*)   at="${1#*=}" ;;
+      --from=*) ;;
+      -*)       fail "$E_USAGE" "unknown flag: $1" ;;
+      *)        [[ -z "$ref" ]] && ref="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$ref" && -n "${text//[[:space:]]/}" ]] || fail "$E_USAGE" "usage: 5dive task loop feedback <run> --text=\"<the owner's reply>\" [--at=<UTC time>]"
+  resolve_task_id "$ref"
+  local id="$RESOLVED_TASK_ID" row rident done_at tident
+  row=$(db "SELECT t.ident||x'1f'||COALESCE(t.done_at,'')||x'1f'||p.ident FROM tasks t JOIN tasks p ON p.id=t.from_template_id
+            WHERE t.id=${id} AND p.${_LOOP_TPL_PRED//body/p.body};")
+  [[ -n "$row" ]] || fail "$E_VALIDATION" "$ref is not a run of a loop"
+  IFS=$'\x1f' read -r rident done_at tident <<<"$row"
+  [[ -n "$at" ]] || at=$(db "SELECT datetime('now');")
+  [[ "$(db "SELECT julianday($(sqlq "$at")) IS NOT NULL;")" == "1" ]] || fail "$E_VALIDATION" "--at is not a time: $at"
+  if [[ -z "$done_at" ]] \
+     || [[ "$(db "SELECT julianday($(sqlq "$at")) BETWEEN julianday($(sqlq "$done_at")) AND julianday($(sqlq "$done_at")) + ${_LOOP_SIGNAL_HOURS}/24.0;")" != "1" ]]; then
+    ok "${rident}: reply is outside its ${_LOOP_SIGNAL_HOURS}h window, score unchanged" '{run:$r, lowered:false, reason:"outside window"}' --arg r "$rident"
+    return 0
+  fi
+  local how; how=$(_loop_reply_is_complaint "$text")
+  if [[ -z "$how" ]]; then
+    ok "${rident}: reply is not a complaint, score unchanged" '{run:$r, lowered:false, reason:"not a complaint"}' --arg r "$rident"
+    return 0
+  fi
+  [[ -n "$(_loop_pref_get "loop.score.${rident}")" ]] || _loop_first_score "$id"
+  _loop_score_lower "$rident" "$_LOOP_SCORE_COMPLAINT" "owner complained: $(_loop_clip "$text")" "reply:${at}"
+  ( cmd_task_loop_review ) >/dev/null 2>&1 || true
+  ok "${rident}: owner complaint, score lowered to $(_loop_pref_get "loop.score.${rident}" | jq -r .score)/100" \
+     '{run:$r, lowered:true, by:$h, score:($s|tonumber)}' --arg r "$rident" --arg h "$how" \
+     --arg s "$(_loop_pref_get "loop.score.${rident}" | jq -r .score)"
 }
 
 # `task loop score <run> --score=<0-100> [--note=]`
@@ -594,7 +805,8 @@ _loop_board_json() {
           'runs', (SELECT json_group_array(json_object('ident', r.ident, 'done_at', r.done_at,
                      'score', (SELECT json(value) FROM task_prefs WHERE key='loop.score.'||r.ident AND json_valid(value)),
                      'vote', (SELECT value FROM task_prefs WHERE key='loop.vote.'||r.ident)))
-                   FROM (SELECT ident, done_at FROM tasks WHERE from_template_id=p.id AND status='done'
+                   FROM (SELECT ident, done_at FROM tasks WHERE from_template_id=p.id
+                           AND (status IN ('done','cancelled') OR ident IN (SELECT substr(key,12) FROM task_prefs WHERE key LIKE 'loop.score.%'))
                          ORDER BY id DESC LIMIT ${_LOOP_RUNS_SCORED}) r)))
          FROM (SELECT * FROM tasks WHERE ${_LOOP_TPL_PRED} AND status <> 'cancelled' ORDER BY id) p;")
   [[ -n "$rows" ]] || rows="[]"
@@ -612,6 +824,9 @@ _loop_board_json() {
 # `task loop scores` — the loops board.
 cmd_task_loop_scores() {
   tasks_db_init
+  # DIVE-5815: the board is what the dashboard polls, so it is where the runtime
+  # catches up: score what closed unscored, read complaints inside the window.
+  ( _loop_signals_sweep ) >/dev/null 2>&1 || true
   local board; board=$(_loop_board_json)
   if (( JSON_MODE )); then
     jq -c '{ok:true, data:{loops:.}}' <<<"$board"
@@ -987,6 +1202,7 @@ cmd_task_loop() {
     start)          cmd_task_loop_start "$@" ;;
     ls|list)        cmd_task_loop_ls "$@" ;;
     score)          cmd_task_loop_score "$@" ;;
+    feedback)       cmd_task_loop_feedback "$@" ;;
     rate)           cmd_task_loop_rate "$@" ;;
     scores)         cmd_task_loop_scores "$@" ;;
     review)         cmd_task_loop_review "$@" ;;
@@ -999,7 +1215,11 @@ cmd_task_loop() {
 5dive task loop start --title=<name> --steps=<json>   |   loop ls [--all]
 DIVE-5564 loop scores (a loop = a scheduled task):
   loop scores                                   the loops, each with its score and recent runs
-  loop score <run> --score=<0-100> [--note=]    score a finished run (grader, else the runner)
+  loop score <run> --score=<0-100> [--note=]    override a run's score (the runtime scores every run
+                                                itself from signals: errors, unfinished, complaints,
+                                                rework; a clean run is 80. DIVE-5815)
+  loop feedback <run> --text="<reply>" [--at=]  the owner's reply about a run: a complaint inside 24h
+                                                of the run lowers its score, never raises it
   loop rate <run> up|down|clear                 the owner's thumbs; beats the score
   loop review [--force]                         weekly: ask for one change to the lowest-scoring loop
   loop suggest <loop> --body-file=<path> [--reason=]   record suggested instructions
@@ -1010,11 +1230,11 @@ DIVE-5777 outcome loops (score by a number, not an opinion):
                                                 the ONE number it prints is the run's score. No rise in
                                                 3 days: the loop pauses and its lead tells the owner once.
                                                 Self-improvement stays off.
-  loop outcome <loop> --check | --clear         read the number now | go back to opinion scores
+  loop outcome <loop> --check | --clear         read the number now | go back to signal scores
   loop resume <loop>                            restart a paused loop with a fresh 3 days (Apply does too)
 HELP
     ;;
-    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|rate|review|suggest|apply|dismiss|revert|auto|outcome|resume)" ;;
+    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|feedback|rate|review|suggest|apply|dismiss|revert|auto|outcome|resume)" ;;
   esac
 }
 
