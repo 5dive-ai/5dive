@@ -2237,7 +2237,11 @@ sys.stdout.write("\n".join(out))
 # Direct root (no SUDO_UID, or 0) keeps the old read: it can tmux any pane anyway.
 _capture_mint_dir() { printf '%s' "${FIVE_CAPTURE_MINT_DIR:-/var/lib/5dive/capture-mint}"; }
 # _capture_scoped_uid — the sudo caller's uid when this is a scoped call, else rc 1.
+# Root-guarded (DIVE-2538): below EUID 0 SUDO_UID is a plain env var, so it is read
+# only where sudo stamped it. Both callers already require_root; the guard keeps the
+# read sound if a future caller does not.
 _capture_scoped_uid() {
+  _gate_is_root || return 1
   local u="${SUDO_UID:-}"
   [[ "$u" =~ ^[0-9]{1,10}$ && "$u" != 0 ]] || return 1
   printf '%s' "$u"

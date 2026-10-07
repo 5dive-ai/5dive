@@ -35,6 +35,7 @@ WORK="$(mktemp -d)"
 export FIVE_CAPTURE_ACC_DIR="$WORK/acc" FIVE_CAPTURE_MINT_DIR="$WORK/mint"
 
 require_root()  { :; }
+_gate_is_root() { return 0; }
 require_agent() { :; }
 PANE="$WORK/pane"
 sudo() {
