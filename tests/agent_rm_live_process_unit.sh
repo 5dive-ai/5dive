@@ -254,7 +254,8 @@ else
     && ok_t "R1 no process runs as the removed uid" || bad_t "R1 a process survived" "$(pgrep -a -u "$ruid")"
   ! command id -u "$REAL_USER" >/dev/null 2>&1 \
     && ok_t "R1 the account is gone" || bad_t "R1 the account survived" "$(cat "$TMP/stderr")"
-  ! getent group "$REAL_GROUP" | cut -d: -f4 | tr ',' '\n' | grep -qx "$REAL_USER" \
+  r1_members=$(getent group "$REAL_GROUP" | cut -d: -f4 | tr ',' '\n')
+  ! grep -qx "$REAL_USER" <<<"$r1_members" \
     && ok_t "R1 no group membership is left" || bad_t "R1 group membership survived" "$(getent group "$REAL_GROUP")"
   ! grep -q lpapp "$ROUTE_CADDYFILE" \
     && ok_t "R1 the seat's route is gone" || bad_t "R1 the route survived" "$(cat "$ROUTE_CADDYFILE")"
