@@ -1433,6 +1433,53 @@ _rm_sweep_uid_files() {
   return 0
 }
 
+# DIVE-5807: stop everything the seat still runs, BEFORE deluser. `userdel`
+# refuses a user with a live process (exit 8), and on divine-owl that is how a
+# removed seat survived: the removal ran in the same second as the seat's own
+# cron job, so the account, its groups, the process (a public server on
+# 0.0.0.0, reparented to PID 1 inside cron.service, its launching script
+# already deleted) all stayed. Stopping the agent unit does not reach a process
+# cron or a login session started, so: drop the crontab first (no new job), end
+# its logind sessions, then signal by uid until none is left — TERM once, then
+# KILL. Real and effective uid both, so a setuid child is not missed.
+#
+# Kills by uid ONLY when that uid resolves to exactly this seat's account: an
+# empty, root, or someone-else's uid here would be a box-wide kill.
+#
+# Sets _RM_PROCS_DISPOSITION: none / stopped:<n> / survived:<n>.
+RM_PROC_WAIT_TRIES="${RM_PROC_WAIT_TRIES:-20}"
+_rm_seat_pids() { { pgrep -U "$1"; pgrep -u "$1"; } 2>/dev/null | sort -un; }
+_rm_stop_seat_processes() {
+  local user="$1" uid="$2" i sig=TERM p
+  local -a pids=()
+  local -A seen=()
+  _RM_PROCS_DISPOSITION="none"
+  [[ "$uid" =~ ^[0-9]+$ ]] && (( uid > 0 )) || return 0
+  [[ "$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)" == "$user" ]] || return 0
+  crontab -u "$user" -r >/dev/null 2>&1 || true
+  if command -v loginctl >/dev/null 2>&1; then
+    loginctl terminate-user "$user" >/dev/null 2>&1 || true
+  fi
+  for (( i = 0; i < RM_PROC_WAIT_TRIES; i++ )); do
+    mapfile -t pids < <(_rm_seat_pids "$uid")
+    (( ${#pids[@]} )) || break
+    for p in "${pids[@]}"; do seen["$p"]=1; done
+    kill -"$sig" "${pids[@]}" 2>/dev/null || true
+    sig=KILL
+    sleep 0.25
+  done
+  mapfile -t pids < <(_rm_seat_pids "$uid")
+  if (( ${#pids[@]} )); then
+    _RM_PROCS_DISPOSITION="survived:${#pids[@]}"
+    _rm_audit_teardown_failure "$user" "uid ${uid}: ${#pids[@]} process(es) survived SIGKILL: ${pids[*]}"
+    warn "${#pids[@]} process(es) of ${user} survived SIGKILL (pids ${pids[*]}) — deluser will refuse the account while they run. Check: ps -o pid,user,args -u ${uid} (DIVE-5807)"
+  elif (( ${#seen[@]} )); then
+    _RM_PROCS_DISPOSITION="stopped:${#seen[@]}"
+    step "stopped ${#seen[@]} process(es) still running as ${user}"
+  fi
+  return 0
+}
+
 delete_agent_user() {
   local name="$1" purge_home="${2:-0}"
   local user="agent-${name}"
@@ -1440,9 +1487,13 @@ delete_agent_user() {
   _RM_USER_DISPOSITION="absent"
   _RM_GROUP_DISPOSITION="absent"
   _RM_FILES_DISPOSITION="none"
+  _RM_PROCS_DISPOSITION="none"
+  _RM_ROUTES_DISPOSITION="none"
   # DIVE-5308: units are matched by name, so this runs with or without an
   # account — a unit can outlive the passwd entry it was started for.
   _rm_disable_seat_units "$name"
+  # DIVE-5807: so are the seat's public routes (route_remove_seat, cmd_route.sh).
+  declare -F route_remove_seat >/dev/null 2>&1 && route_remove_seat "$name"
   if ! id -u "$user" &>/dev/null; then
     # No passwd entry is NOT the same as nothing left to do.
     _rm_drop_group_membership "$name"
@@ -1469,8 +1520,17 @@ delete_agent_user() {
   # but whether the account is STILL THERE afterwards — the two disagree (a
   # non-root caller, a busy uid, a deluser that half-ran), and only the second
   # one is the thing an operator cares about.
+  #
+  # DIVE-5807: nothing of the seat may still run when deluser looks, and a cron
+  # job can start in the gap — so a refusal gets one more stop and one retry.
+  _rm_stop_seat_processes "$user" "$old_uid"
   local du_err="" du_rc=0
   du_err=$(deluser --quiet "$user" 2>&1) || du_rc=$?
+  if id -u "$user" &>/dev/null; then
+    _rm_stop_seat_processes "$user" "$old_uid"
+    du_rc=0
+    du_err=$(deluser --quiet "$user" 2>&1) || du_rc=$?
+  fi
   if id -u "$user" &>/dev/null; then
     _RM_USER_DISPOSITION="present"
     local reason group

@@ -612,6 +612,14 @@ jobs:
           n=$(grep -c '^ok   - T9' root-arms.txt) || n=0
           echo "T9 ok lines: $n"
           test "$n" -ge 11
+      - name: agent_rm_live_process_unit as root, R1 required (DIVE-5807)
+        run: |
+          set -o pipefail
+          sudo -E env LP_REQUIRE_ROOT_ARM=1 bash tests/agent_rm_live_process_unit.sh | tee root-arms-lp.txt
+          if grep -q '^skip - R1' root-arms-lp.txt; then echo "R1 was skipped under root"; exit 1; fi
+          n=$(grep -c '^ok   - R1' root-arms-lp.txt) || n=0
+          echo "R1 ok lines: $n"
+          test "$n" -ge 5
 
   rails-pristine:
     runs-on: ubuntu-latest

@@ -160,6 +160,8 @@ cmd_rm() {
   _RM_USER_DISPOSITION="absent"
   _RM_GROUP_DISPOSITION="absent"
   _RM_FILES_DISPOSITION="none"
+  _RM_PROCS_DISPOSITION="none"
+  _RM_ROUTES_DISPOSITION="none"
   delete_agent_user "$name" "$purge_home"
   step "Updating registry"
   if [[ "${_RM_USER_DISPOSITION:-absent}" == "present" || "${_RM_GROUP_DISPOSITION:-absent}" == "present" ]]; then
@@ -217,11 +219,13 @@ cmd_rm() {
   # DIVE-5481: and the seat's files outside the home (DIVE-5308's sweep), so a
   # --purge-home receipt says whether they were deleted or quarantined.
   local _files_state="${_RM_FILES_DISPOSITION:-none}"
+  # DIVE-5807: what the seat still ran when it was removed, and its routes.
+  local _procs_state="${_RM_PROCS_DISPOSITION:-none}" _routes_state="${_RM_ROUTES_DISPOSITION:-none}"
   ok "agent '$name' removed." \
-     '{name:$n, removed:true, user:{disposition:$us}, group:{name:$gn, disposition:$gs}, home:({disposition:$hs} + (if $hp == "" then {} else {path:$hp} end)), files:{disposition:$fs}}' \
+     '{name:$n, removed:true, user:{disposition:$us}, group:{name:$gn, disposition:$gs}, home:({disposition:$hs} + (if $hp == "" then {} else {path:$hp} end)), files:{disposition:$fs}, processes:{disposition:$ps}, routes:{disposition:$rs}}' \
      --arg n "$name" --arg us "$_user_state" --arg gs "$_group_state" \
      --arg gn "${AGENT_SHARED_GROUP:-claude}" --arg hs "$_home_state" --arg hp "$_home_path" \
-     --arg fs "$_files_state"
+     --arg fs "$_files_state" --arg ps "$_procs_state" --arg rs "$_routes_state"
 }
 
 # DIVE-345: move a path aside as <path>.disabled-<ts> (reversible) if present.

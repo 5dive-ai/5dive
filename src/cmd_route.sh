@@ -108,24 +108,92 @@ _route_reload() {
   systemctl reload caddy >/dev/null 2>&1
 }
 
-# _route_apply <candidate> — validate, swap in, reload; on any failure the live
-# file is left (or put back) exactly as it was.
-_route_apply() {
-  local cand="$1" cf="$ROUTE_CADDYFILE" bak
-  local out
+# _route_try_apply <candidate> — validate, swap in, reload; on any failure the
+# live file is left (or put back) exactly as it was. Returns 0 applied, 1 did
+# not validate (the reason in _ROUTE_APPLY_WHY), 2 no backup, 3 reload failed.
+# It never exits: `agent rm` calls it mid-teardown (DIVE-5807).
+_route_try_apply() {
+  local cand="$1" cf="$ROUTE_CADDYFILE" bak out
+  _ROUTE_APPLY_WHY=""
   if ! out=$(caddy_validate "$cand" "$ROUTE_CADDY_BIN" 2>&1); then
     rm -f "$cand"
-    fail "$E_VALIDATION" "the new route did not pass caddy validate; nothing changed ($(caddy_validate_why "$out"))"
+    _ROUTE_APPLY_WHY=$(caddy_validate_why "$out")
+    return 1
   fi
-  bak=$(mktemp "${cf}.route.XXXXXX") || { rm -f "$cand"; fail "$E_GENERIC" "could not back up $cf"; }
+  bak=$(mktemp "${cf}.route.XXXXXX") || { rm -f "$cand"; return 2; }
   cp -p "$cf" "$bak"
   chmod 644 "$cand"; chown --reference="$cf" "$cand" 2>/dev/null || true
   mv -f "$cand" "$cf"
   if ! _route_reload; then
     mv -f "$bak" "$cf"; _route_reload || true
-    fail "$E_GENERIC" "caddy did not reload with the new route; the previous Caddyfile is back"
+    return 3
   fi
   rm -f "$bak"
+}
+
+# _route_apply <candidate> — the verb's form: the same, and any failure fails.
+_route_apply() {
+  local rc=0
+  _route_try_apply "$1" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) fail "$E_VALIDATION" "the new route did not pass caddy validate; nothing changed (${_ROUTE_APPLY_WHY})" ;;
+    2) fail "$E_GENERIC" "could not back up $ROUTE_CADDYFILE" ;;
+    *) fail "$E_GENERIC" "caddy did not reload with the new route; the previous Caddyfile is back" ;;
+  esac
+}
+
+# _route_strip <caddyfile> <name>... — the file without the managed blocks of
+# those names. The blank line add put above a block goes with it, so add then
+# rm leaves the file byte for byte as it was.
+_route_strip() {
+  local cf="$1"; shift
+  awk -v names=" $* " '
+    { line = $0; sub(/^[ \t]+/, "", line) }
+    line ~ "^# 5dive-route:begin " && index(names, " " $3 " ") { skip = 1; n = $3; held = 0; next }
+    skip { if (line == "# 5dive-route:end " n) skip = 0; next }
+    held { print ""; held = 0 }
+    $0 == "" { held = 1; next }
+    { print }
+    END { if (held) print "" }' "$cf"
+}
+
+# DIVE-5807: a removed seat's routes go with it. On divine-owl a removed seat's
+# app stayed public on its subdomain after the seat was gone, because nothing in
+# the removal knew routes existed. Called by delete_agent_user (so `agent rm`
+# and `doctor --fix` both run it), as root, with or without an account: a route
+# is keyed by seat NAME, and outlives the passwd entry exactly like a unit does.
+# Never exits. Sets _RM_ROUTES_DISPOSITION: none / removed:<names> / failed:<names>.
+route_remove_seat() {
+  local seat="$1" cf n p by
+  _RM_ROUTES_DISPOSITION="none"
+  _route_trust_env
+  cf="$ROUTE_CADDYFILE"
+  [[ -n "$seat" && "$seat" != root && "$seat" != claude && -f "$cf" ]] || return 0
+  { exec 9>"$ROUTE_LOCK"; } 2>/dev/null && flock -w 30 9 2>/dev/null || true
+  local -a names=()
+  while read -r n p by; do
+    [[ -n "$n" && "$by" == "$seat" ]] && names+=("$n")
+  done < <(_route_list_lines "$cf")
+  (( ${#names[@]} )) || { exec 9>&-; return 0; }
+  local cand rc=0
+  cand=$(mktemp "${cf}.new.XXXXXX" 2>/dev/null) || rc=2
+  if (( rc == 0 )); then
+    _route_strip "$cf" "${names[@]}" > "$cand"
+    _route_try_apply "$cand" || rc=$?
+  fi
+  if (( rc == 0 )); then
+    _RM_ROUTES_DISPOSITION="removed:${names[*]}"
+    declare -F audit_log >/dev/null 2>&1 && audit_log "agent rm" "route-removed" 0 -- "by=${seat}" "${names[@]}"
+    step "removed route(s) ${names[*]} published by ${seat}"
+  else
+    _RM_ROUTES_DISPOSITION="failed:${names[*]}"
+    declare -F _rm_audit_teardown_failure >/dev/null 2>&1 \
+      && _rm_audit_teardown_failure "agent-${seat}" "route(s) ${names[*]}: apply rc ${rc} ${_ROUTE_APPLY_WHY:-}"
+    warn "route(s) ${names[*]} published by ${seat} are STILL public (caddy apply rc ${rc}${_ROUTE_APPLY_WHY:+: ${_ROUTE_APPLY_WHY}}). Remove them with: sudo 5dive route rm <name> (DIVE-5807)"
+  fi
+  exec 9>&-
+  return 0
 }
 
 _route_usage() {
@@ -249,16 +317,7 @@ _route_exec() {
     (( privileged )) || [[ "$found" == "$by" ]] \
       || fail "$E_PERMISSION" "route '$name' belongs to ${found}; only it (or the claude seat) can remove it"
     local cand; cand=$(mktemp "${cf}.new.XXXXXX") || fail "$E_GENERIC" "could not stage $cf"
-    # The blank line add put above the block goes with it, so add then rm
-    # leaves the file byte for byte as it was.
-    awk -v n="$name" '
-      { line = $0; sub(/^[ \t]+/, "", line) }
-      line ~ "^# 5dive-route:begin " && $3 == n { skip = 1; held = 0; next }
-      skip { if (line == "# 5dive-route:end " n) skip = 0; next }
-      held { print ""; held = 0 }
-      $0 == "" { held = 1; next }
-      { print }
-      END { if (held) print "" }' "$cf" > "$cand"
+    _route_strip "$cf" "$name" > "$cand"
     _route_apply "$cand"
     audit_log "_route_do rm" ok 0 -- "by=$by" "$name"
     ok "removed route $name" '{name:$n, removed:true}' --arg n "$name"
