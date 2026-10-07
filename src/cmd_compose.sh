@@ -2766,12 +2766,26 @@ HELP
 # The release half of the lead's plan-first hold (see _compose_hold_open). Each
 # verb names a lead, or none when the box has exactly one team waiting.
 
+# A closed kickoff of <lead> that still holds open rows, as "<id> <ident>".
+_team_kickoff_closed_holding() {
+  db "SELECT k.id || ' ' || k.ident FROM tasks k
+      WHERE k.kind='standard' AND k.assignee=$(sqlq "$1")
+        AND k.status IN ('done','cancelled')
+        AND k.body LIKE '%'||$(sqlq "$(_compose_kickoff_marker "$1")")||'%'
+        AND EXISTS (SELECT 1 FROM task_deps d JOIN tasks t ON t.id=d.task_id
+                    WHERE d.blocked_by=k.id AND t.status NOT IN ('done','cancelled'))
+      ORDER BY k.id DESC LIMIT 1;" 2>/dev/null | head -1
+}
+
 # Resolve <lead> to its open kickoff. Sets TP_LEAD, TP_KID, TP_KIDENT, or fails.
 _team_kickoff_resolve() {
   local lead="${1:-}" rows n
   tasks_db_init
   if [[ -n "$lead" ]]; then
     rows=$(_compose_kickoff_open "$lead")
+    # A kickoff some other path closed (a gate tap, say) still holds its rows —
+    # the cascade refuses to release them — so it is still answerable here.
+    [[ -n "$rows" ]] || rows=$(_team_kickoff_closed_holding "$lead")
     [[ -n "$rows" ]] || fail "$E_NOT_FOUND" "nothing of $lead's team is waiting for a yes (no open kickoff for $lead) — its work has already been started or declined, or it was imported with --start-now"
     TP_LEAD="$lead"
   else
@@ -2893,7 +2907,9 @@ _team_release() {
   else
     result="The owner approved the team's plan: ${started} goal(s) and job(s) started${left_off[*]:+, left off: ${left_off[*]}}."
   fi
-  if (( ${#failed[@]} == 0 )); then
+  if (( ${#failed[@]} == 0 )) && [[ "$(db "SELECT status FROM tasks WHERE id=${TP_KID};")" =~ ^(done|cancelled)$ ]]; then
+    :   # closed earlier by another path; its rows are now answered
+  elif (( ${#failed[@]} == 0 )); then
     ( cmd_task_done "$TP_KIDENT" --result="$result" ) >/dev/null 2>&1 \
       || ( cmd_task_cancel "$TP_KIDENT" --result="$result" ) >/dev/null 2>&1 \
       || warn "could not close $TP_KIDENT — close it by hand: 5dive task done $TP_KIDENT --result=\"$result\""

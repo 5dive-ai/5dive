@@ -632,6 +632,17 @@ _task_status_cmd() {
   # invoking actor of the earlier write — the tasks row does not store that. The
   # actor lives in the audit trail, so the message sends the reader to `5dive
   # trace` for it rather than implying the row knows.
+  # DIVE-5729: a hired team's kickoff is answered with the owner's yes or no, not
+  # closed. Closing it here would release every held goal and loop through the
+  # cascade (a `cancel` meant as "no" would START the team), so it is refused
+  # while it still holds rows. `team start`/`team decline` empty it first.
+  if [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
+    local _ko_held; _ko_held=$(_task_team_kickoff_holds "$id")
+    if [[ "$_ko_held" != "0" ]]; then
+      local _ko_lead; _ko_lead=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+      fail "$E_VALIDATION" "$ident is a team kickoff still holding ${_ko_held} goal(s)/job(s) for the owner's answer — 'task ${verb}' would start them all. Answer it instead: 5dive team start ${_ko_lead} [--skip=<DIVE-N>,...] (owner said yes), 5dive team decline ${_ko_lead} (owner said no), or wait: 5dive task park $ident --wake=+3d"
+    fi
+  fi
   if [[ "$verb" == "done" || "$verb" == "cancel" ]] && (( want_result )); then
     _task_guard_result_over_closed "$id" "$ident" "$verb" "$result" "$append_result" "$force_result"
     result="$_TASK_GUARDED_RESULT"

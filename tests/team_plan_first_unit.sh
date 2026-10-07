@@ -250,6 +250,69 @@ cli task add --assignee=lead --park="waiting" -- "no wake" >/dev/null 2>&1; rc=$
 (( rc != 0 )) && ok_t 'T20 --park without --park-wake is refused (DIVE-1357: a hold needs a revisit)' \
   || bad_t 'T20 --park with no wake accepted' "rc=$rc"
 
+# ---------------------------------------------------------------------------
+# Arm 7 — the kickoff closed by a GENERIC verb releases nothing (quinn, iter 1).
+# The kickoff is a plain row on the lead; before this guard `task cancel` (meant
+# as the owner's no) or `task done` (the end-of-turn contract every seat runs
+# under) cascaded every held goal and loop to todo, starting the whole team.
+# ---------------------------------------------------------------------------
+cascade_close() {   # a close that goes around the verbs (a manual-gate tap, say)
+  (
+    cd "$ROOT/src" || exit 1
+    for f in header.sh lib/*.sh; do . "./$f"; done
+    . ./cmd_task.sh; . ./cmd_heartbeat.sh
+    tasks_db_init
+    db "UPDATE tasks SET status='done', done_at=datetime('now') WHERE ident='$1';"
+    _task_cascade_unblock "$(db "SELECT id FROM tasks WHERE ident='$1';")"
+  ) >/dev/null 2>&1
+}
+reset_box
+out=$(run_up); kick=$(jq -r '.data.held.kickoff // empty' <<<"$out")
+cli task cancel "$kick" --result="owner said no" >/dev/null 2>"$TMP/v.err"; rc=$?
+nottodo=$(q "SELECT COUNT(*) FROM tasks WHERE ident<>'$kick' AND status='blocked';")
+materialize
+runs=$(q "SELECT COUNT(*) FROM tasks WHERE from_template_id IS NOT NULL;")
+[[ -n "$kick" ]] && (( rc != 0 )) && [[ "$nottodo" == "4" && "$runs" == "0" \
+   && "$(q "SELECT status FROM tasks WHERE ident='$kick';")" != "cancelled" ]] \
+  && ok_t 'T21 task cancel KICKOFF is refused: all 4 stay blocked and no loop fires on the real materializer' \
+  || bad_t 'T21 task cancel on the kickoff released work' "kick=$kick rc=$rc blocked=$nottodo runs=$runs"
+grep -q 'team start lead' "$TMP/v.err" && grep -q 'team decline lead' "$TMP/v.err" \
+  && ok_t 'T22 the refusal names team start / team decline for that lead' \
+  || bad_t 'T22 refusal text' "$(cat "$TMP/v.err")"
+cli task done "$kick" --result="sent the plan" >/dev/null 2>&1; rc=$?
+nottodo=$(q "SELECT COUNT(*) FROM tasks WHERE ident<>'$kick' AND status='blocked';")
+materialize
+runs=$(q "SELECT COUNT(*) FROM tasks WHERE from_template_id IS NOT NULL;")
+(( rc != 0 )) && [[ "$nottodo" == "4" && "$runs" == "0" && "$(q "SELECT status FROM tasks WHERE ident='$kick';")" != "done" ]] \
+  && ok_t 'T23 task done KICKOFF with rows still held is refused and leaves them held' \
+  || bad_t 'T23 task done on the kickoff released work' "rc=$rc blocked=$nottodo runs=$runs"
+
+# Around the verbs: a close through another writer still releases nothing, and
+# the team stays answerable.
+cascade_close "$kick"
+nottodo=$(q "SELECT COUNT(*) FROM tasks WHERE ident<>'$kick' AND status='blocked';")
+materialize
+runs=$(q "SELECT COUNT(*) FROM tasks WHERE from_template_id IS NOT NULL;")
+[[ "$(q "SELECT status FROM tasks WHERE ident='$kick';")" == "done" && "$nottodo" == "4" && "$runs" == "0" ]] \
+  && ok_t 'T24 a kickoff closed around the verbs (cascade runs) still holds all 4 and no loop fires' \
+  || bad_t 'T24 cascade released work' "blocked=$nottodo runs=$runs"
+rel=$(cli --json team start lead 2>/dev/null)
+materialize
+runs=$(q "SELECT COUNT(*) FROM tasks WHERE from_template_id IS NOT NULL;")
+[[ "$(jq -r '.data.started' <<<"$rel")" == "4" && "$(q "SELECT COUNT(*) FROM tasks WHERE kind='standard' AND from_template_id IS NULL AND ident<>'$kick' AND status='todo';")" == "2" && "$runs" -ge 1 ]] \
+  && ok_t 'T25 team start still finds that closed kickoff and starts the team on the owner'"'"'s yes' \
+  || bad_t 'T25 recovery after a stray close' "rel=$rel runs=$runs"
+
+# A plain row with dependents is untouched by the guard (the cascade still runs).
+reset_box
+printf '{"schemaVersion":2,"agents":{"lead":{"type":"claude"}}}\n' > "$REGISTRY"
+cli task add --assignee=lead -- "plain anchor" >/dev/null 2>&1
+cli task add --assignee=lead --held-by=DIVE-1 -- "plain dependent" >/dev/null 2>&1
+cli task done DIVE-1 --result="done" >/dev/null 2>&1; rc=$?
+(( rc == 0 )) && [[ "$(q "SELECT status FROM tasks WHERE ident='DIVE-2';")" == "todo" ]] \
+  && ok_t 'T26 a non-kickoff blocker still closes and releases its dependent (guard is kickoff-only)' \
+  || bad_t 'T26 the guard caught a plain row' "rc=$rc dep=$(q "SELECT status FROM tasks WHERE ident='DIVE-2';")"
+
 echo "-----"
 echo "pass=$pass fail=$fail"
 (( fail == 0 ))
