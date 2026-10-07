@@ -552,7 +552,7 @@ _LOOP_SCORE_UNFINISHED=10
 _LOOP_SCORE_COMPLAINT=20
 _LOOP_SCORE_REWORK=40
 # The keyword floor: a reply that says any of these is a complaint without a
-# model call. English and Russian (lodar's and the OINOA boxes' languages).
+# model call. English and Russian (the languages our owners write in).
 _LOOP_COMPLAINT_RE="(^|[^[:alpha:]])(wrong|bad|broken|useless|terrible|awful|garbage|not what|didn'?t|did not|doesn'?t work|not working|missing|mistake|redo|again\?|why did|stop doing|failed|error)([^[:alpha:]]|$)|плох|не то|не так|ошиб|переделай|исправь|не работает|ужасн|зачем"
 
 # _loop_score_put <run ident> <score> <note> <by> [signals json array]
@@ -604,13 +604,18 @@ _loop_first_score() {
 _loop_clip() { local t="${1//$'\n'/ }"; (( ${#t} > 120 )) && t="${t:0:117}..."; printf '%s' "$t"; }
 
 # _loop_is_person <name> — rc 0 when a row's creator is a person, not an agent:
-# not on the team, not a registered seat, and not the runtime itself.
+# not on the team, not a registered seat, and not the runtime itself. No registry
+# file at all is a measurement too (nobody is registered); an unreadable one is
+# not, so it falls to rework, the milder reading.
 _loop_is_person() {
   local who="$1"
   [[ -n "$who" && "$who" != loop && "$who" != task-engine && "$who" != heartbeat ]] || return 1
   [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE name=$(sqlq "$who");" 2>/dev/null)" == "0" ]] || return 1
   declare -F agent_tier >/dev/null || return 0
-  [[ "$(agent_tier "$who" 2>/dev/null)" == unknown:unregistered ]]
+  case "$(agent_tier "$who" 2>/dev/null)" in
+    unknown:unregistered|unknown:no-registry) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # _loop_complaints <run id> — signals 2 and 3 for a scored run, inside the window.

@@ -18,6 +18,10 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"; JSON_MODE=1
 mkdir -p "$TASKS_DIR"
+# The harness's own registry: quinn is a seat, lodar is not. Without this the
+# host's registry (or CI's lack of one) decides who is a person.
+REGISTRY="$TMP/registry.json"
+printf '{"agents":{"quinn":{"isolation":"user"}}}' >"$REGISTRY"
 cmd_send() { :; }   # no agent bus in the harness
 # The Decisions call, stubbed: the harness never spends. RX_CHOICE/RX_CONF set the answer.
 RX_ON=false; RX_CHOICE=neutral; RX_CONF=0.9; RX_CALLS=0
@@ -124,6 +128,13 @@ t "S7 rework note names the row" "1" "$(score "$R2" '.note|startswith("rework: "
 t "S7 row outside the window / other ident: nothing" "80" "$(score "$R3")"
 cmd_task_loop_scores >/dev/null 2>&1
 t "S7 a second sweep counts each row once" "1" "$(score "$R1" '.signals|length')"
+# No registry file on the box: nobody is registered, so a name not on the team is
+# still a person (CI runs with none). An unreadable registry is not a measurement.
+REG_SAVED="$REGISTRY"; REGISTRY="$TMP/absent.json"
+_loop_is_person lodar; t "S7 no registry file: a person is still a person" "0" "$?"
+printf 'not json' >"$TMP/bad.json"; REGISTRY="$TMP/bad.json"
+_loop_is_person lodar; t "S7 unreadable registry: not called a person" "1" "$?"
+REGISTRY="$REG_SAVED"
 
 # S8 — reopened inside the window: complaint.
 R=$(mk_run "$N"); close_run "$R"
