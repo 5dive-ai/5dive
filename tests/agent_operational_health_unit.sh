@@ -75,8 +75,8 @@ E_GENERIC=1; E_USAGE=2; E_NOT_FOUND=4; E_CONFLICT=5
 fail() { printf 'REFUSED[%s]: %s\n' "$1" "$2" >&2; exit "$1"; }
 push_exit_handler() { trap "$1" EXIT; }
 mkdir -p "$TMP/bin"
-printf '#!/usr/bin/env bash\nprintf "ATTACH:%%s\\n" "$*"\n[[ "${FAKE_TUI_FAIL:-0}" == 1 ]] && exit 9\nexit 0\n' > "$TMP/bin/sudo"
-printf '#!/usr/bin/env bash\nprintf "SYSTEMCTL:%%s\\n" "$*"\n[[ "$1" == start && "${FAKE_RESTORE_FAIL:-0}" == 1 ]] && exit 8\nexit 0\n' > "$TMP/bin/systemctl"
+printf '#!/usr/bin/env bash\n[[ "$*" == *has-session* ]] && { [[ "${FAKE_NO_SESSION:-0}" == 1 ]] && exit 1; exit 0; }\nprintf "ATTACH:%%s\\n" "$*"\n[[ "${FAKE_TUI_FAIL:-0}" == 1 ]] && exit 9\nexit 0\n' > "$TMP/bin/sudo"
+printf '#!/usr/bin/env bash\n[[ "$1" == is-active ]] && { printf "%%s\\n" "${FAKE_STATE:-active}"; exit 0; }\nprintf "SYSTEMCTL:%%s\\n" "$*"\n[[ "$1" == start && "${FAKE_RESTORE_FAIL:-0}" == 1 ]] && exit 8\nexit 0\n' > "$TMP/bin/systemctl"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/logger"
 chmod +x "$TMP/bin/sudo"
 chmod +x "$TMP/bin/systemctl" "$TMP/bin/logger"
@@ -104,6 +104,24 @@ is "plain Codex still reaches interactive attach" "$(run_tui plain)" \
   "ATTACH:-u agent-plain tmux attach -t agent-plain"
 is "Claude dashboard still reaches its native TUI" "$(run_tui claude)" \
   "ATTACH:-u agent-claude tmux attach -t agent-claude"
+
+# DIVE-5820: lodar's `agent marcus tui` printed tmux's bare "no sessions" while
+# the seat sat in its 45s no-login wait, before it opens a session at all. Say
+# why instead of handing over tmux's words.
+rc=0; out=$(FAKE_NO_SESSION=1 run_tui claude) || rc=$?
+is "no session yet is a product refusal, not tmux's" "$rc" "$E_NOT_FOUND"
+has "a starting seat says it is still starting" "$out" "still starting"
+[[ "$out" != *ATTACH:* ]] && { PASS=$((PASS+1)); echo "ok: no attach is attempted with no session"; } \
+  || { FAIL=$((FAIL+1)); echo "FAIL: attached with no session ($out)"; }
+rc=0; out=$(FAKE_NO_SESSION=1 FAKE_STATE=inactive run_tui claude) || rc=$?
+has "a stopped seat says so and how to start it" "$out" "sudo 5dive agent start claude"
+mkdir -p "$AGENT_HOME_ROOT/agent-claude"
+printf '%s\n' 'claude credential absent after 45s wait — launched DEGRADED' \
+  > "$AGENT_HOME_ROOT/agent-claude/.5dive-cred-seed-failed"
+rc=0; out=$(FAKE_NO_SESSION=1 run_tui claude) || rc=$?
+has "a seat whose last boot had no login names the missing AI" "$out" "found no AI login"
+has "and the command that binds one" "$out" "sudo 5dive agent set-account claude <account>"
+rm -f "$AGENT_HOME_ROOT/agent-claude/.5dive-cred-seed-failed"
 
 # Wiring guards: the two user-facing surfaces must consume, not merely define,
 # the operational verdict and the documented auth command must exist verbatim.
