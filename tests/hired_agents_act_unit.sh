@@ -423,10 +423,14 @@ LIVE="$TMP/box-CLAUDE.md"
 printf '# Your machine\n\n- `claude` has full sudo; other agents work without root.\n' >"$LIVE"
 sync_managed_block "$LIVE" projects-CLAUDE.md 5dive:hired-agents
 BLOCK=$(sed -n '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/p' "$LIVE")
+# DIVE-5823: on exact-swallow an admin lead told "I need someone to chase unpaid
+# invoices" imported a catalogue pack on the need alone. The owner's ask is the
+# go-ahead, but a need is not a yes to a pack the lead picked: the market line
+# itself says the hire waits for it (the custom path's --create output already did).
 for want in 'Standard-tier never creates agents' 'Standard-tier: send `5dive hire-link <slug>`' \
             '5dive pkg install' '5dive route add <name> --port=<port>' '5dive task add' 'npm i -g' \
             '**Blank teammates**, admin: `sudo 5dive agent create' '--type=claude|codex|grok|antigravity' \
-            '5dive agent auth start <type>' '**`5dive market` hires**, admin:' \
+            '5dive agent auth start <type>' '**`5dive market` hires** on their yes, admin:' \
             "its Telegram bot: your human's Connect tap (Mini App, Team)" \
             '**None fits:** `5dive hire-link --create --name=<Name> --description=<need>`'; do
   [[ "$BLOCK" == *"$want"* ]] && ok "hired-agents block says: $want" || bad "hired-agents block says: $want"
@@ -496,6 +500,23 @@ A=$(tr '\n' ' ' <"$TMP/create.argv" 2>/dev/null)
   || bad "control argv ($A)"
 grep -q 'sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:hired-agents' install.sh \
   && ok 'install.sh syncs the block on every install' || bad 'install.sh syncs the block'
+
+# DIVE-5823: the pick is made reading `5dive market`, so the yes rule is printed
+# there too, by the real cmd_market / cmd_market_show over a stubbed index.
+mkt(){ ( source "$SRC/cmd_pack.sh"; set +e; JSON_MODE=0
+  _marketplace_index(){ printf '%s' '{"packs":[{"slug":"tally","name":"Tally","rarity":"rare","character":"Accountant","tagline":"sends and chases invoices","tags":["invoices"],"skills":["emails"],"path":"packs/tally"}]}'; }
+  _marketplace_slug(){ echo test/registry; }; _marketplace_base(){ echo https://example.invalid; }
+  _pack_targets_from(){ echo claude; }; resolve_model_alias(){ printf '%s' "$1"; }; curl(){ return 22; }
+  "$@" ) 2>&1; }
+YES="your owner's need is not a yes: name your pick to them; hire it once they say yes (or named it)"
+for v in "cmd_market invoice" "cmd_market_show tally"; do
+  o=$(mkt $v)
+  grep -q 'tally' <<<"$o" && grep -qxF "  $YES" <<<"$o" && ok "$v lists the pack and says a need is not a yes" \
+    || bad "$v lists the pack and says a need is not a yes ($(tail -2 <<<"$o" | tr '\n' ' '))"
+done
+# Control: a search that matches nothing names no pick, so it prints no yes line.
+o=$(mkt cmd_market vegetable)
+grep -qF 'not a yes' <<<"$o" && bad 'control: an empty search prints no yes line' || ok 'control: an empty search prints no yes line'
 
 printf '\n%d passed, %d failed\n' "$P" "$F"
 (( F == 0 ))

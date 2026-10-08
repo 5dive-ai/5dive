@@ -825,6 +825,9 @@ cmd_market() {
   (( _narrowed > 0 )) && echo "  ${_narrowed} pack(s) here narrow that set — see 5dive market show <slug>"
   echo
   echo "  preview: 5dive market show <slug>    ·    hire: 5dive hire <role> --from-market --dry-run"
+  # DIVE-5823: an admin lead searched this on its owner's need and imported the
+  # pack it picked with no yes. Say it where the pick is made.
+  echo "  your owner's need is not a yes: name your pick to them; hire it once they say yes (or named it)"
 }
 
 # `5dive market show <slug>` — preview a single persona without downloading the
@@ -884,6 +887,7 @@ cmd_market_show() {
   echo "  clone this one:   5dive agent import ${slug} --as=<name>            (defaults to the harness it was packed as)"
   echo "  onto a codex/opencode seat:  5dive agent import ${slug} --as=<name> --type=codex"
   echo "  hire by role:     5dive hire <role> --from-market --dry-run"
+  echo "  your owner's need is not a yes: name your pick to them; hire it once they say yes (or named it)"
 }
 
 # DIVE-995 pack trust layer. Enumerate the EXECUTABLE surface a pack would grant
