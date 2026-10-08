@@ -75,7 +75,8 @@ _first_job_state() { printf '%s/%s.json' "$FIRST_JOB_DIR" "$1"; }
 _first_job_state_merge() { # <token> <expr> [jq args...]
   local f; f=$(_first_job_state "$1"); local expr="$2"; shift 2
   [[ -f "$f" ]] || return 1
-  jq -c "$@" ". + ($expr)" "$f" >"$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+  jq -c "$@" ". + ($expr)" "$f" >"$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f" || return 1
+  return 0
 }
 
 # The static prompt (contract text, English; the agent answers in the owner's
@@ -206,7 +207,7 @@ _first_job_ask() {
 _FJ_HTTP=""
 _first_job_post() { # <path> <body> → 0 2xx · 2 refused (4xx) · 1 not reached
   local path="$1" body="$2" tok="" trc=0 url http="" i=0
-  local -a pauses
+  local -a pauses=()
   read -r -a pauses <<<"${FIRST_JOB_POST_BACKOFF:-5 20}"
   tok=$(_partner_box_token) || trc=$?
   (( trc == 0 )) || { _FJ_HTTP="no-token"; return 1; }

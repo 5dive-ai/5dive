@@ -173,8 +173,9 @@ rec=$(cat "$(STATE_F)" 2>/dev/null)
 mapfile -t A < <(sed '/^---$/,$d' "$TMP/sdrun.argv")
 want_tail=("--" "$TMP/bin/five" agent _first_job_run ada "$TOKEN")
 tail_ok=1; for i in 0 1 2 3 4 5; do [[ "${A[$(( ${#A[@]} - 6 + i ))]}" == "${want_tail[$i]}" ]] || tail_ok=0; done
-{ printf '%s\n' "${A[@]}" | grep -qx -- "--unit=5dive-first-job-${TOKEN:0:12}" \
-  && printf '%s\n' "${A[@]}" | grep -qx -- --collect && printf '%s\n' "${A[@]}" | grep -qx -- --quiet && (( tail_ok )); } \
+argv_lines=$(printf '%s\n' "${A[@]}")
+{ grep -qx -- "--unit=5dive-first-job-${TOKEN:0:12}" <<<"$argv_lines" \
+  && grep -qx -- --collect <<<"$argv_lines" && grep -qx -- --quiet <<<"$argv_lines" && (( tail_ok )); } \
   && ok_t "S1d systemd-run --unit=5dive-first-job-<12> --collect --quiet -- <5dive> agent _first_job_run ada <token>" \
   || bad_t "S1d systemd-run argv" "${A[*]}"
 
@@ -336,7 +337,8 @@ arm=$(awk '/^_agent_verb_dispatch\(\) \{/{f=1} f&&/^\}/{exit} f' src/main.sh)
   && grep -qE '^        _first_job_run\)' <<<"$arm" && grep -q 'cmd_agent_first_job_run "\$@"' <<<"$arm"; } \
   && ok_t "W1 _agent_verb_dispatch routes first-job and _first_job_run" || bad_t "W1 dispatch arms" ""
 grep -q '^  5dive agent first-job <name> --token=' src/main.sh && ok_t "W2 the agent usage documents first-job" || bad_t "W2 usage" ""
-sed -n '/^LAZY_FILES=(/,/^)/p' build.sh | grep -qx '  src/cmd_agent_first_job.sh' && ok_t "W3 build.sh loads the module" || bad_t "W3 build.sh" ""
+lazy_files=$(sed -n '/^LAZY_FILES=(/,/^)/p' build.sh)
+grep -qx '  src/cmd_agent_first_job.sh' <<<"$lazy_files" && ok_t "W3 build.sh loads the module" || bad_t "W3 build.sh" ""
 
 # ── NC1: the idempotency check can go red ────────────────────────────────────
 sed 's/set -o noclobber; //' src/cmd_agent_first_job.sh >"$TMP/mutant.sh"
