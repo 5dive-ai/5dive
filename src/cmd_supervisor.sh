@@ -95,7 +95,15 @@ _SUP_T_NO_OUTPUT_IDLE_MIN="${SUPERVISOR_T_NO_OUTPUT_IDLE_MIN:-1440}"
 _SUP_QUOTA_PANE_LINES="${SUPERVISOR_QUOTA_PANE_LINES:-40}"
 [[ "$_SUP_QUOTA_PANE_LINES" =~ ^[0-9]+$ ]] || _SUP_QUOTA_PANE_LINES=40
 _SUP_QUOTA_PAT="${SUPERVISOR_QUOTA_PAT:-}"
-[[ -n "$_SUP_QUOTA_PAT" ]] || _SUP_QUOTA_PAT='(api[[:space:]]+error|request[[:space:]]+rejected)[^|]{0,60}429|quota[[:space:]]+(has[[:space:]]+been[[:space:]]+)?exhausted|exhausted[[:space:]]+your[[:space:]]+(token|weekly|monthly)|hit[[:space:]]+your[[:space:]]+([^[:space:]]+[[:space:]]+)?((monthly|weekly|daily)[[:space:]]+spend|session|usage|5[[:space:]-]?hour)[[:space:]]+limit|usage[[:space:]]+limit[[:space:]]+reached|insufficient_quota|credit[[:space:]]+balance[[:space:]]+is[[:space:]]+too[[:space:]]+low'
+[[ -n "$_SUP_QUOTA_PAT" ]] || _SUP_QUOTA_PAT='(api[[:space:]]+error|request[[:space:]]+rejected)[^|]{0,60}429|quota[[:space:]]+(has[[:space:]]+been[[:space:]]+)?exhausted|exhausted[[:space:]]+your[[:space:]]+(token|weekly|monthly)|hit[[:space:]]+your[[:space:]]+([^[:space:]]+[[:space:]]+)?((monthly|weekly|daily)([[:space:]]+spend)?|session|usage|5[[:space:]-]?hour)[[:space:]]+limit|usage[[:space:]]+limit[[:space:]]+reached|insufficient_quota|credit[[:space:]]+balance[[:space:]]+is[[:space:]]+too[[:space:]]+low'
+# DIVE-5837 made `spend` OPTIONAL after the window noun. Claude Code's weekly
+# wall is `You've hit your weekly limit · resets Oct 9, 4pm (UTC)` (measured on a
+# customer box, 2026-10-07), with no `spend`, so it matched no arm here: the
+# hourly quota-probe logged every refusal as COULD-NOT-DETERMINE and the
+# supervisor never wrote quota-exhausted. The pane matcher got the same widening
+# in DIVE-3465. Still anchored on `hit your` + window noun + `limit`, so `the
+# weekly limit is 100 requests` and `I hit your weekly report limit` stay out.
+#
 # DIVE-4401 widened the SAME arm again with one optional qualifier word between
 # `your` and the window noun. A Claude Team seat prints the possessive form
 #   `You've hit your org's monthly spend limit · ... · your session limit resets 9am (UTC)`
@@ -1127,6 +1135,18 @@ _sup_quota_deadline() {  # <text> [now_epoch]
     _sup_clock_state "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]:-00}" "${BASH_REMATCH[4]:-}" "$now"
     return 0
   fi
+  # DIVE-5837 — the DATED phrasing of the weekly wall, `... limit · resets Oct 9,
+  # 4pm (UTC)`. It names a day, so it is read as a date and never put through the
+  # nearest-day arithmetic below: that arithmetic would read a reset two days out
+  # as "today, 4pm". The year is not printed, so it is the one of last, this or
+  # next year that lands nearest to `now`. A trailing `(UTC)` is honoured; any
+  # other zone falls back to the host's, the same residual as the arm below.
+  local re3='resets?[[:space:]]+([A-Za-z]{3})[A-Za-z]*\.?[[:space:]]+([0-9]{1,2}),?[[:space:]]+(at[[:space:]]+)?([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*([AaPp])\.?[Mm]\.?'
+  if [[ "$text" =~ $re3 ]]; then
+    _sup_date_state "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[6]:-00}" "${BASH_REMATCH[7]}" "$now" \
+      "$([[ "$text" =~ \(UTC\) ]] && printf utc)"
+    return 0
+  fi
   # DIVE-4206 — the SECOND recognised phrasing, `... limit · resets 4am (UTC)`.
   # DIVE-3970 split _sup_clock_state out of the arm above expressly so this one
   # could reuse the identical meridiem + nearest-day arithmetic instead of a
@@ -1181,6 +1201,38 @@ _sup_clock_state() {  # <hh> <mm> <a|p|""> <now_epoch>
     local dist=$(( d > now ? d - now : now - d ))
     if (( bestd < 0 || dist < bestd )); then bestd="$dist"; best="$d"; fi
   done
+  if (( best > now )); then printf 'live\x1f%s\n' "$best"
+  else printf 'lapsed\x1f%s\n' "$best"; fi
+}
+
+# DIVE-5837: the dated sibling of _sup_clock_state, for `resets Oct 9, 4pm`.
+# Same contract: echoes "<live|lapsed|unknown>\x1f<epoch|>", `now` is an argument.
+_sup_date_state() {  # <mon> <day> <hh> <mm> <a|p> <now_epoch> [utc]
+  local mon="${1:-}" dd="${2:-}" hh="${3:-}" mm="${4:-00}" ap="${5:-}" now="${6:-}" zone="${7:-}"
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  local m
+  case "${mon,,}" in
+    jan) m=1;; feb) m=2;; mar) m=3;; apr) m=4;; may) m=5;; jun) m=6;;
+    jul) m=7;; aug) m=8;; sep) m=9;; oct) m=10;; nov) m=11;; dec) m=12;;
+    *) printf 'unknown\x1f\n'; return 0 ;;
+  esac
+  [[ "$dd" =~ ^[0-9]{1,2}$ && "$hh" =~ ^[0-9]{1,2}$ && "$mm" =~ ^[0-9]{1,2}$ ]] || { printf 'unknown\x1f\n'; return 0; }
+  dd=$((10#$dd)); hh=$((10#$hh)); mm=$((10#$mm))
+  (( dd >= 1 && dd <= 31 && hh >= 1 && hh <= 12 && mm <= 59 )) || { printf 'unknown\x1f\n'; return 0; }
+  case "${ap,,}" in
+    a) if (( hh == 12 )); then hh=0; fi ;;
+    p) if (( hh != 12 )); then hh=$(( hh + 12 )); fi ;;
+    *) printf 'unknown\x1f\n'; return 0 ;;
+  esac
+  local -a tz=(); [[ "$zone" == utc ]] && tz=(-u)
+  local y yr best="" bestd=-1 e dist
+  yr=$(date "${tz[@]}" -d "@${now}" +%Y 2>/dev/null) || { printf 'unknown\x1f\n'; return 0; }
+  for y in $(( yr - 1 )) "$yr" $(( yr + 1 )); do
+    e=$(date "${tz[@]}" -d "$(printf '%04d-%02d-%02d %02d:%02d' "$y" "$m" "$dd" "$hh" "$mm")" +%s 2>/dev/null) || continue
+    dist=$(( e > now ? e - now : now - e ))
+    if (( bestd < 0 || dist < bestd )); then bestd="$dist"; best="$e"; fi
+  done
+  [[ -n "$best" ]] || { printf 'unknown\x1f\n'; return 0; }
   if (( best > now )); then printf 'live\x1f%s\n' "$best"
   else printf 'lapsed\x1f%s\n' "$best"; fi
 }
