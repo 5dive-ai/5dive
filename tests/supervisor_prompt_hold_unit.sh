@@ -127,7 +127,7 @@ t "(c) mutant applied (exactly one hold branch disarmed)" "1" \
   "$(diff src/cmd_supervisor.sh "$TMP/mutant_first_sight.sh" | grep -c '^>')"
 P0=$PASS F0=$FAIL
 arm_a "$TMP/mutant_first_sight.sh" " [MUTANT]" >/dev/null
-mut_fail=$((FAIL - F0)); PASS=$P0; FAIL=$F0
+mut_fail=$((FAIL - F0)); PASS=$P0; FAIL=$((FAIL-mut_fail))
 t "(c) the page-on-first-sight mutant FAILS arm (a)" "yes" "$( (( mut_fail > 0 )) && echo yes || echo no)"
 
 echo "PASS=$PASS FAIL=$FAIL"
