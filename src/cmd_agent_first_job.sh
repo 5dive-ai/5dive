@@ -127,25 +127,48 @@ cmd_agent_first_job() {
   local rec
   rec=$(jq -cn --arg t "$token" --arg n "$name" --arg j "$job" --arg s "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{token:$t, name:$n, job:$j, status:"running", createdAt:$s}')
+  local unit="5dive-first-job-${token:0:12}"
   if ! ( umask 077; set -o noclobber; printf '%s\n' "$rec" >"$st" ) 2>/dev/null; then
     [[ -e "$st" ]] || fail "$E_GENERIC" "could not write $st"
+    # A record still "running" with no live unit lost its run (a reboot, an OOM
+    # kill): start it again rather than answer "already" until the API's 48h
+    # give-up. done/failed, or a live unit, are the real "already".
+    local prev; prev=$(jq -r '.status // empty' "$st" 2>/dev/null) || prev=""
+    if [[ "$prev" == running ]] && ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+      local rname; rname=$(jq -r '.name // empty' "$st" 2>/dev/null) || rname=""
+      valid_name "$rname" || rname="$name"
+      if ! _first_job_spawn "$unit" "$rname" "$token"; then
+        # Two racing restarts: systemd refuses the second unit of that name.
+        systemctl is-active --quiet "$unit" 2>/dev/null && { printf '{"ok":true,"already":true}\n'; return 0; }
+        fail "$E_GENERIC" "could not restart the first-job unit ($unit) — systemd-run refused it"
+      fi
+      _first_job_state_merge "$token" '{restartedAt:$r}' --arg r "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+      printf '{"ok":true,"restarted":true}\n'
+      return 0
+    fi
     printf '{"ok":true,"already":true}\n'
     return 0
   fi
 
-  local unit="5dive-first-job-${token:0:12}"
-  systemctl reset-failed "$unit" >/dev/null 2>&1 || true
-  # A system unit without User= gets no HOME; the CLI's `set -u` paths expect one.
-  local -a env=(--setenv=PATH="$PATH" --setenv=HOME=/root)
-  [[ -n "${FIVE_API_BASE:-}" ]] && env+=(--setenv=FIVE_API_BASE="$FIVE_API_BASE")
-  if ! systemd-run --quiet --collect --unit="$unit" \
-         --property=RuntimeMaxSec="$FIRST_JOB_MAX_SEC" "${env[@]}" \
-         -- "$(_first_job_self)" agent _first_job_run "$name" "$token" >/dev/null 2>&1; then
+  if ! _first_job_spawn "$unit" "$name" "$token"; then
     # Nothing ran: drop the record so the API's retry can start it.
     rm -f "$st"
     fail "$E_GENERIC" "could not start the first-job unit ($unit) — systemd-run refused it"
   fi
   printf '{"ok":true}\n'
+}
+
+# _first_job_spawn <unit> <name> <token> — the transient unit (DIVE-4973's
+# pattern: systemd-run hands it to PID 1, out of shelld's cgroup).
+_first_job_spawn() {
+  local unit="$1" name="$2" token="$3"
+  systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  # A system unit without User= gets no HOME; the CLI's `set -u` paths expect one.
+  local -a env=(--setenv=PATH="$PATH" --setenv=HOME=/root)
+  [[ -n "${FIVE_API_BASE:-}" ]] && env+=(--setenv=FIVE_API_BASE="$FIVE_API_BASE")
+  systemd-run --quiet --collect --unit="$unit" \
+    --property=RuntimeMaxSec="$FIRST_JOB_MAX_SEC" "${env[@]}" \
+    -- "$(_first_job_self)" agent _first_job_run "$name" "$token" >/dev/null 2>&1
 }
 
 # _first_job_ask <name> <prompt-file> — the reply on stdout, rc 0; or the reason

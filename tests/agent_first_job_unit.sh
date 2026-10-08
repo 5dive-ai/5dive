@@ -11,7 +11,9 @@
 #           name from the token, the internal verb), url-safe base64, and a
 #           refused systemd-run drops the record so the API's retry can start it.
 #   I1      idempotency: a second call on the same token prints already:true and
-#           starts nothing.
+#           starts nothing while its unit is live.
+#   I2-I4   a "running" record with no live unit is restarted (restarted:true);
+#           done/failed are not; a refused restart keeps the record.
 #   R1-R6   the run: the prompt template, the ask argv, first-reply.json (shape,
 #           0600, no temp left behind), the done POST (url, body with and without
 #           botUsername, bearer on STDIN not argv), the failure body, the ask
@@ -60,7 +62,8 @@ cat >"$TMP/bin/systemd-run" <<'EOF'
 { printf '%s\n' "$@"; echo ---; } >>"$STUB_DIR/sdrun.argv"
 exit "${STUB_SDRUN_RC:-0}"
 EOF
-printf '#!/usr/bin/env bash\nexit 0\n' >"$TMP/bin/systemctl"
+# systemctl: `is-active` answers STUB_ACTIVE_RC (0 = a live unit, the default).
+printf '#!/usr/bin/env bash\n[[ "$1" == is-active ]] && exit "${STUB_ACTIVE_RC:-0}"\nexit 0\n' >"$TMP/bin/systemctl"
 # curl: argv, stdin, body per call; the status comes from the next line of
 # $STUB_DIR/http.seq (default 200).
 cat >"$TMP/bin/curl" <<'EOF'
@@ -156,6 +159,26 @@ i1_arm() {  # the second call on the same token
 }
 i1_arm && ok_t "I1 a repeat on the same token prints already:true, starts no second unit, keeps the record" \
        || bad_t "I1 idempotency" "rc=$RC out=$OUT sd=$(sd_calls) job=$(jq -r .job "$(STATE_F)" 2>/dev/null)"
+
+# ── I2-I4: a stale "running" record (no live unit) is restarted ─────────────
+STUB_ACTIVE_RC=3 run cmd_agent_first_job ada --token="$TOKEN" --job-b64="$(b64 'Something else')"
+{ [[ $RC -eq 0 && "$OUT" == '{"ok":true,"restarted":true}' && "$(sd_calls)" == 2 ]] \
+  && [[ "$(jq -r '[.job,.status]|join("|")' "$(STATE_F)")" == "Plan my week|running" && "$(jq -r .restartedAt "$(STATE_F)")" =~ Z$ ]] \
+  && [[ "$(sed -n '/^---$/,$p' "$TMP/sdrun.argv" | tail -2 | head -1)" == "$TOKEN" ]]; } \
+  && ok_t "I2 running + no live unit: restarted:true, a second unit for the RECORDED job, restartedAt stamped" \
+  || bad_t "I2 stale restart" "rc=$RC out=$OUT sd=$(sd_calls) rec=$(cat "$(STATE_F)")"
+i3=()
+for st in done failed; do
+  jq -c --arg s "$st" '.status = $s' "$(STATE_F)" >"$TMP/r" && mv "$TMP/r" "$(STATE_F)"
+  before=$(sd_calls)
+  STUB_ACTIVE_RC=3 run cmd_agent_first_job ada --token="$TOKEN" --job-b64="$(b64 hi)"
+  [[ $RC -eq 0 && "$OUT" == '{"ok":true,"already":true}' && "$(sd_calls)" == "$before" ]] || i3+=("$st: rc=$RC out=$OUT")
+done
+(( ${#i3[@]} == 0 )) && ok_t "I3 done / failed with no live unit still answer already:true and start nothing" || bad_t "I3 finished states" "${i3[*]}"
+jq -c '.status = "running"' "$(STATE_F)" >"$TMP/r" && mv "$TMP/r" "$(STATE_F)"
+before=$(sd_calls); STUB_ACTIVE_RC=3 STUB_SDRUN_RC=1 run cmd_agent_first_job ada --token="$TOKEN" --job-b64="$(b64 hi)"
+[[ $RC -eq $E_GENERIC && -e "$(STATE_F)" && "$(jq -r .status "$(STATE_F)")" == running ]] \
+  && ok_t "I4 a refused restart fails but keeps the record, so the next retry restarts it" || bad_t "I4 refused restart" "rc=$RC out=$OUT"
 
 # ── S2: url-safe, unpadded base64 ────────────────────────────────────────────
 reset; j='??> ok'; u=$(b64 "$j" | tr '+/' '-_' | tr -d '=')
