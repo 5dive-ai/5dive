@@ -45,7 +45,7 @@ and nothing for the next `agent create` to silently revert.** `5dive agent _svc`
 5dive host unit show --unit=<unit>
 5dive host unit repoint --unit=<u>.service --workdir=<abs-path> [--no-restart]
 5dive host unit revert  --unit=<u>.service [--no-restart]
-5dive host journal --unit=<unit> [--lines=N] [--since=<N>m|<N>h|<N>d]
+5dive host journal (--unit=<unit> | --comm=<process> | --grep=<text>)... [--lines=N] [--since=<N>m|<N>h|<N>d] [--count-secrets]
 5dive host cron show|snapshot|diff --user=<user>
 5dive host timezone [set <IANA zone>] [--no-restart]
 ```
@@ -82,7 +82,7 @@ can exec:
 | `unit show` | `systemctl show <validated-unit> -p <fixed property list>` | — |
 | `unit repoint` | `systemctl show`, `systemctl daemon-reload`, `systemctl restart <validated-unit>` | one file: `<unit>.d/50-5dive-workdir.conf`, one `[Service]` section, one `WorkingDirectory=` line |
 | `unit revert` | same three | removes exactly that basename; `rmdir` (never `rm -r`) the `.d` |
-| `journal` | `journalctl -u <validated-unit> -n <int> [--since "<int> <one of three words> ago"]` | — |
+| `journal` | `journalctl [-u <validated-unit> \| _COMM=<validated name>] [-n <int>] [--since "<int> <one of three words> ago"]`; output masked, `--grep` matched in-process | — |
 | `cron show/snapshot` | `crontab -l -u <validated-user>` | `$STATE_DIR/host-cron/<user>.cron` (0600) |
 | `cron diff` | `diff -u` over two CLI-owned files | — |
 | `timezone set` | `timedatectl list-timezones`, `timedatectl set-timezone <zone in that list>`, `systemctl try-restart cron.service`, `systemctl restart` of each active `5dive-agent@<name>.service` systemd reports | the system zone (`/etc/localtime`, through timedatectl) |
@@ -108,6 +108,19 @@ needs its own design pass and its own gate.
 **`--since` does not accept `journalctl` time syntax.** `journalctl` understands `yesterday`,
 `@<epoch>` and a good deal more; that is caller text landing in a root process's argv. The flag takes
 `<N>m`, `<N>h` or `<N>d` and is mapped here to one of three literal phrases.
+
+**Every journal line is masked, and `--grep` matches the masked text** (DIVE-5842). No seat is in
+`systemd-journal` (DIVE-5805), because that group reads every key that ever crossed a sudo line. So
+this verb is the admin seat's whole-box log reader, and it never prints a value: `sk-ant-…`,
+`sk-or-…`, `ghp_…`, `github_pat_…`, Telegram bot tokens, `Bearer …` and any `NAME=value` whose name
+contains TOKEN, KEY, SECRET or PASSWORD come back as `[masked]`, in unit mode too. The needle is
+matched after masking; matched before, it would be an oracle that spells a key one character at a
+time. To retest for leaks without printing one:
+
+```console
+$ sudo 5dive host journal --comm=sudo --since=2d --count-secrets
+0
+```
 
 ### What this does not close
 

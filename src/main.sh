@@ -540,9 +540,13 @@ Health:
                                                      # exec caller-chosen content as root.
   5dive host unit revert --unit=<u>.service [--no-restart]
                                                      # remove exactly that drop-in, reload, restart
-  5dive host journal --unit=<unit> [--lines=N] [--since=<N>m|<N>h|<N>d]
+  5dive host journal (--unit=<unit> | --comm=<process> | --grep=<text>)... [--lines=N]
+                    [--since=<N>m|<N>h|<N>d] [--count-secrets]
                                                      # journalctl --no-pager; --since is structured,
-                                                     # free-form time strings are refused
+                                                     # free-form time strings are refused. EVERY line is
+                                                     # secret-masked (DIVE-5842); --grep is a fixed string
+                                                     # matched after masking; --count-secrets prints only
+                                                     # how many lines held a secret
   5dive host cron show|snapshot|diff --user=<user>   # READ-ONLY. \`crontab -l -u\` only; there is no
                                                      # write/edit path (crontab -e is an EDITOR escape).
                                                      # diff compares against the CLI's own snapshot,
