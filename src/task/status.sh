@@ -2401,6 +2401,12 @@ $_body"
     _open_gate=$(db "SELECT 1 FROM tasks WHERE id=${id} AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || echo "")
     [[ -n "$_open_gate" ]] && { _task_gate_card_apply "$ident" die "task ${verb} with the gate still open" || true; }
   fi
+  # DIVE-5852: the FILER's opt-in wake (`task add --tell-me` / `task watch`),
+  # independent of --notify: that flag is the CLOSER's choice to ping a human,
+  # this one is the filer's promise. A no-op on every row that never asked.
+  if [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
+    _task_tell_filer "$id" "$verb" || true
+  fi
   if (( notify )) && [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
     local from_tmpl
     from_tmpl=$(db "SELECT COALESCE(from_template_id,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")

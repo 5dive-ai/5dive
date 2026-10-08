@@ -1572,6 +1572,100 @@ _task_close_notify() {
   return 0
 }
 
+# _task_tell_filer <id> <done|cancel> — DIVE-5852. Wake, ONCE, the seat that
+# asked to be told when this row closed (`task add --tell-me` / `task watch`).
+#
+# It wakes the FILER, never the owner directly: the filer made the promise, so
+# the voice and the "is it actually live yet" check stay with it (a CLI fix is
+# done at merge and live only after the release and the box update).
+#
+# OPT-IN ONLY. A row with tell_me_by NULL returns before any write or send, so
+# an unflagged close produces zero wakes and zero owner messages (lodar
+# 2026-10-08: "its gonna be noisy as hell if they ping every time").
+#
+# One-shot by told_at: the claim is a conditional UPDATE, so a reopen and a
+# second close, or two closers racing, wake nobody a second time. A send that
+# FAILS releases the claim and says so on the closer's stderr, because a
+# promise that silently did not arrive is the defect this exists to end.
+# Best-effort: every path returns 0; the close it follows already committed.
+_task_tell_filer() {
+  local id="$1" verb="$2" row who ident status result closer msg errf
+  [[ "$id" =~ ^[0-9]+$ ]] || return 0
+  row=$(db "UPDATE tasks SET told_at=datetime('now')
+              WHERE id=${id} AND tell_me_by IS NOT NULL AND told_at IS NULL
+                AND status IN ('done','cancelled');
+            SELECT CASE WHEN changes()=1 THEN tell_me_by ELSE '' END FROM tasks WHERE id=${id};" 2>/dev/null) || return 0
+  who="${row##*$'\n'}"
+  [[ -n "$who" ]] || return 0
+  ident=$(db "SELECT ident FROM tasks WHERE id=${id};" 2>/dev/null)
+  status=$(db "SELECT status FROM tasks WHERE id=${id};" 2>/dev/null)
+  result=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};" 2>/dev/null)
+  result="${result//$'\n'/ }"
+  (( ${#result} > 400 )) && result="${result:0:400}…"
+  closer=$(task_actor 2>/dev/null)
+  if [[ "$closer" == "$who" ]]; then
+    # Closing your own watched row: you are mid-turn already, so a wake into
+    # your own pane would only interrupt you. The reminder rides the close.
+    printf '%s\n' "note: you asked to be told when ${ident} closed (--tell-me) — you closed it yourself. Check it is live, then send your owner one plain line." >&2
+    ledger_emit task.tell_filer ident="$ident" task_id="$id" actor="$closer" detail="self-close; reminder printed to ${who}" 2>/dev/null || true
+    return 0
+  fi
+  msg="🔔 ${ident} is ${status} (closed by ${closer:-?}). Result: ${result:-<none>}"
+  msg+=$'\n\n'"You asked to be told (--tell-me), so you promised your owner a ping. Check it is actually LIVE (merged, released, deployed, on the box) and then send your owner one plain line. Not live yet: arm an 'at' timer to check again, do not file a row."
+  errf=$(mktemp "${TMPDIR:-/tmp}/5dive-tell.XXXXXX" 2>/dev/null) || errf=/dev/null
+  if ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$who" --from="task-engine" --message="$msg" ) >/dev/null 2>"$errf"; then
+    ledger_emit task.tell_filer ident="$ident" task_id="$id" actor="$closer" detail="woke ${who} on ${status}" 2>/dev/null || true
+  else
+    db "UPDATE tasks SET told_at=NULL WHERE id=${id};" 2>/dev/null || true
+    printf '%s\n' "warning: ${who} asked to be told when ${ident} closed (--tell-me) and the wake did not deliver: $(head -c 300 "$errf" 2>/dev/null | tr '\n' ' ')— tell them yourself: 5dive agent send ${who} \"${ident} is ${status}\"" >&2
+    ledger_emit task.tell_filer ident="$ident" task_id="$id" actor="$closer" detail="FAILED to wake ${who} on ${status}" 2>/dev/null || true
+  fi
+  [[ "$errf" == /dev/null ]] || rm -f "$errf" 2>/dev/null
+  return 0
+}
+
+# cmd_task_watch <id|DIVE-N> [--off] — DIVE-5852. The `--tell-me` of a row that
+# is already filed: the calling seat is woken once when it closes. Same opt-in
+# and same one-shot as the add flag. --off withdraws the caller's own watch.
+cmd_task_watch() {
+  tasks_db_init
+  local off=0 me cur st
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --off) off=1 ;;
+      --)    shift; positional+=("$@"); break ;;
+      -*)    fail "$E_USAGE" "unknown flag: $1" ;;
+      *)     positional+=("$1") ;;
+    esac
+    shift
+  done
+  [[ ${#positional[@]} -eq 1 ]] || fail "$E_USAGE" "usage: 5dive task watch <id|DIVE-N> [--off]"
+  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  task_actor_claim ""
+  me="$ACTOR_BOARD"
+  [[ -n "$me" && "$me" != "cli" ]] || fail "$E_VALIDATION" \
+    "task watch needs an agent seat to wake, and this shell is not one (${ACTOR_BOARD_SOURCE:-unknown}) (DIVE-5852)"
+  cur=$(db "SELECT COALESCE(tell_me_by,'') FROM tasks WHERE id=${id};")
+  if (( off )); then
+    [[ "$cur" == "$me" ]] || fail "$E_CONFLICT" "${ident}: no watch of yours to withdraw (watched by: ${cur:-nobody})"
+    db "UPDATE tasks SET tell_me_by=NULL, told_at=NULL WHERE id=${id};"
+    _task_store_audit_log "task watch" ok 0 -- ident="$ident" off=1 2>/dev/null || true
+    ok "${ident}: ${me} will no longer be woken when it closes" '{ident:$id, tellMeBy:null}' --arg id "$ident"
+    return 0
+  fi
+  st=$(db "SELECT status FROM tasks WHERE id=${id};")
+  [[ "$st" == "done" || "$st" == "cancelled" ]] && fail "$E_CONFLICT" \
+    "${ident} is already ${st} — there is no close left to be told about"
+  # One watcher per row. Replacing another seat's watch would silently drop the
+  # promise THEY made, so it is refused, not overwritten.
+  [[ -z "$cur" || "$cur" == "$me" ]] || fail "$E_CONFLICT" \
+    "${ident} is already watched by ${cur}; ask them to pass it on, or rely on theirs"
+  db "UPDATE tasks SET tell_me_by=$(sqlq "$me"), told_at=NULL WHERE id=${id};"
+  _task_store_audit_log "task watch" ok 0 -- ident="$ident" 2>/dev/null || true
+  ok "${ident}: ${me} is woken once when it closes (done or cancelled)" '{ident:$id, tellMeBy:$m}' --arg id "$ident" --arg m "$me"
+}
+
 # task_need_notify — DIVE-105: the instant a human gate is filed, DM the paired
 # human ONE alert so it doesn't sit unseen until someone opens the dashboard.
 # Best-effort + self-gating in the shape of mirror_interagent_outbound, and

@@ -66,6 +66,9 @@ _task_usage() {
       [--held-by=<id|DIVE-N>]                   born blocked behind that row, in the same write
                                                 (no tick can start it first); freed when it closes
       [--park=<why> --park-wake=<+Nh|+Nd>]      born parked, same write (DIVE-5729)
+      [--tell-me]                               you promised your owner a ping: you are woken ONCE
+                                                when this row is done or cancelled, whoever closes
+                                                it. Opt-in only; no flag, no wake (DIVE-5852)
   ls [--status=] [--assignee=] [--mine] [--all] [--recurring]   open rows, priority-ordered
   ls --gated[=human|agent]                      only rows holding a live gate. The 'gate' column is
                                                 on EVERY ls: HUMAN:<type> a person owes an answer,
@@ -135,6 +138,8 @@ _task_usage() {
   cancel <id> [--result=<text>]                 -> cancelled
   done|cancel [--keep-worktree]                 keep node_modules in that row's worktrees
   done|cancel|deliver [--append-result|--force-result]   close a row that already has a result
+  watch <id> [--off]                            wake me once when this row is done or cancelled
+                                                (the --tell-me of a row already filed, DIVE-5852)
 
   block <id> --by=<id>                          add a blocks edge
   unblock <id> [--by=<id>]                      drop edge(s); back to todo if clear
@@ -447,6 +452,7 @@ cmd_task() {
     loop)            cmd_task_loop "$@" ;;
     loops)           cmd_task_loops "$@" ;;
     cancel)          cmd_task_cancel "$@" ;;
+    watch)           cmd_task_watch "$@" ;;         # DIVE-5852 wake me once when it closes
     block)           cmd_task_block "$@" ;;
     unblock)         cmd_task_unblock "$@" ;;
     park)            cmd_task_park "$@" ;;

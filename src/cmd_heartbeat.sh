@@ -7175,6 +7175,8 @@ _hb_stall_sweep() {
       db "UPDATE tasks SET status='cancelled', done_at=datetime('now'), updated_at=datetime('now'),
                            result=$(sqlq "$ecancel_reason"), recurring_stall_escalated_at=datetime('now')
           WHERE id=${eid} AND status='todo' AND started_at IS NULL;" 2>/dev/null || true
+      # DIVE-5852: a watched instance (`task watch`) closed by this ladder still wakes its watcher.
+      declare -F _task_tell_filer >/dev/null && { _task_tell_filer "$eid" cancel || true; }
       emsg="🗑 ${eident} (recurring beat from template ${etmpl}) was AUTO-CANCELLED after sitting never-started ${ehours}h past its stall flag, with no free agent to hand it to. The reason is written into the row's result; the template re-fires on its next slot (${esupp})."
       if [[ -n "$easg" ]]; then
         ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$easg" --from="task-engine" --message="$emsg If you still want this instance, the next materialization is yours to start on time — or reply to say the row should not be assigned to you." ) >/dev/null 2>&1 || true

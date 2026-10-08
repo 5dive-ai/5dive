@@ -275,6 +275,7 @@ _task_loop_advance() {
         # DIVE-1415: a closed loop RUN can itself be a blocker of other tasks —
         # release its dependents on this terminal close too.
         _task_cascade_unblock "$run" || true
+        _task_tell_filer "$run" done || true   # DIVE-5852: a watched run closes here
         local owner; owner=$(db "SELECT COALESCE(assignee,created_by) FROM tasks WHERE id=${run};")
         local rident; rident=$(db "SELECT ident FROM tasks WHERE id=${run};")
         [[ -n "$owner" ]] && ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" --from="loop" \
@@ -677,6 +678,10 @@ _loop_signals_sweep() {
       [[ -n "$sc" ]] && db "UPDATE tasks SET status='done', done_at=datetime('now'),
             result=$(sqlq "Scored by the runtime from signals instead (DIVE-5815): $(jq -r '"\(.score)/100, \(.note)"' <<<"$sc"). No opinion needed.")
           WHERE title=$(sqlq "Score loop run ${rident}") AND status='todo' AND COALESCE(created_by,'')='loop';" 2>/dev/null
+      # DIVE-5852: a watched score row closed by this raw write still wakes its watcher.
+      [[ -n "$sc" ]] && while read -r _tw; do [[ -n "$_tw" ]] && { _task_tell_filer "$_tw" done || true; }; done \
+        < <(db "SELECT id FROM tasks WHERE title=$(sqlq "Score loop run ${rident}") AND status='done'
+                  AND tell_me_by IS NOT NULL AND told_at IS NULL;" 2>/dev/null)
     done < <(db "SELECT r.id||x'1f'||r.ident||x'1f'||r.status||x'1f'||
                         (SELECT COUNT(*) FROM task_prefs WHERE key='loop.score.'||r.ident)||x'1f'||
                         COALESCE((SELECT n.ident FROM tasks n WHERE n.from_template_id=r.from_template_id AND n.id>r.id ORDER BY n.id LIMIT 1),'')
@@ -1655,6 +1660,9 @@ cmd_task_verify() {
     # a satisfied edge — the exact stall that froze OSS-32/33 behind OSS-27
     # overnight (OSS-27 closed via `task verify`, cascade never ran).
     _task_cascade_unblock "$id" || true
+    # DIVE-5852: same lesson, one hook over — a verifier PASS lands here, not in
+    # `task done`, so the filer's --tell-me wake must be wired here too.
+    _task_tell_filer "$id" done || true
   else
     # DIVE-3098: --no-done records a VERIFIER GRADE. Stamp it structurally as well
     # as in prose, because the predicate that exempts this row from the goal hook
