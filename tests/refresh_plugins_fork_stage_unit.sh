@@ -58,6 +58,9 @@ echo 'lock-v1'               > "$UP/plugins/telegram-fake1/bun.lock"
 echo 'hook-v1'               > "$UP/plugins/telegram-fake1/hooks/h.ts"
 echo 'export const V = "v1"' > "$UP/plugins/telegram-fake2/server.ts"
 echo 'CLAUDE-LINEAGE'        > "$UP/plugins/telegram/server.ts"
+# DIVE-5867: a FILE whose name matches the fork pattern (upstream carries
+# plugins/telegram-opencode-SPIKE.md) is not a fork. S1b.
+echo '# spike notes'         > "$UP/plugins/telegram-spike-NOTES.md"
 git -C "$UP" add -A; git -C "$UP" commit -qm one
 git -C "$UP" branch -M main
 
@@ -78,6 +81,10 @@ out="$(run_stage)"
 grep -q 'changed: telegram-fake1' <<<"$out" && grep -q 'changed: telegram-fake2' <<<"$out" \
   && ok_t "S1 a first run stages every fork in the ref and says which changed" \
   || bad_t "S1 first stage" "out: $(tr '\n' '|' <<<"$out")"
+{ ! grep -q 'telegram-spike-NOTES' <<<"$out" && ! grep -q 'telegram-spike-NOTES' "$TMP/err.log" \
+    && [[ ! -e "$FORK_STAGE_ROOT/telegram-spike-NOTES.md" ]]; } \
+  && ok_t "S1c a markdown file beside the forks is not staged, warned about, or reported (DIVE-5867)" \
+  || bad_t "S1c markdown file treated as a fork" "out: $(tr '\n' '|' <<<"$out") err: $(tr '\n' '|' <"$TMP/err.log")"
 
 [[ "$(staged telegram-fake1)" == 'export const V = "v1"' ]] \
   && ok_t "S1b …and the bytes landed" || bad_t "S1b bytes" "got: $(staged telegram-fake1)"

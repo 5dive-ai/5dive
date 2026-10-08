@@ -84,10 +84,12 @@ fork_mirror_sync() {
 
 # Which forks does the ref carry? Enumerated from the ref itself, so a fork added
 # upstream is staged without editing this list, and `telegram` (the claude-lineage
-# base, delivered by the marketplace above) is excluded.
+# base, delivered by the marketplace above) is excluded. DIRECTORIES only
+# (DIVE-5867): `plugins/telegram-opencode-SPIKE.md` matched the name and printed
+# a "no server.ts" WARN on every box, every night.
 fork_list() {
-  git -C "$FORK_MIRROR" ls-tree --name-only "refs/heads/${FORK_REF}:plugins" 2>/dev/null \
-    | grep '^telegram-' || true
+  git -C "$FORK_MIRROR" ls-tree "refs/heads/${FORK_REF}:plugins" 2>/dev/null \
+    | awk -F'\t' '$1 ~ / tree / && $2 ~ /^telegram-/ { print $2 }' || true
 }
 
 # Stage one fork. Echoes "changed" when the tracked files moved.
