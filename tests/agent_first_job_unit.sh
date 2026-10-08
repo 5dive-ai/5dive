@@ -12,14 +12,18 @@
 #           refused systemd-run drops the record so the API's retry can start it.
 #   I1      idempotency: a second call on the same token prints already:true and
 #           starts nothing while its unit is live.
-#   I2-I4   a "running" record with no live unit is restarted (restarted:true);
+#   I2-I4   a "running" (or "watching") record with no live unit is restarted;
 #           done/failed are not; a refused restart keeps the record.
 #   R1-R6   the run: the prompt template, the ask argv, first-reply.json (shape,
 #           0600, no temp left behind), the done POST (url, body with and without
 #           botUsername, bearer on STDIN not argv), the failure body, the ask
 #           retry on a not-running agent, the POST retry/back-off and its stop on
 #           a 4xx, FIVE_API_BASE.
-#   T1-T4   status: {} with no file, the stamps, garbage and a malformed token.
+#   J0-J7   the watcher after done (fake clock, stubbed sleep that plays the
+#           plugin): start/second reported once each, then exit; 72h expiry;
+#           a restarted unit resumes without resending or re-asking; a 4xx stops
+#           that event; a transient failure is retried next tick; a wrong token
+#           or garbage stamps report nothing; a failed job does not watch.
 #   W1-W3   wiring: the dispatch arms, the usage entry, build.sh loads the module.
 #   NC1     NEGATIVE CONTROL: a copy of the module with the noclobber create
 #           removed must be CAUGHT by I1's "started nothing" check.
@@ -71,7 +75,7 @@ cat >"$TMP/bin/curl" <<'EOF'
 n=$(( $(cat "$STUB_DIR/curl.n" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$STUB_DIR/curl.n"
 printf '%s\n' "$@" >"$STUB_DIR/curl.argv"
 cat >"$STUB_DIR/curl.stdin"
-prev=""; for a in "$@"; do [[ "$prev" == "--data-binary" ]] && printf '%s' "$a" >"$STUB_DIR/curl.body"; prev="$a"; done
+prev=""; for a in "$@"; do [[ "$prev" == "--data-binary" ]] && { printf '%s' "$a" >"$STUB_DIR/curl.body"; printf '%s\n' "$a" >>"$STUB_DIR/curl.bodies"; }; prev="$a"; done
 code=$(sed -n "${n}p" "$STUB_DIR/http.seq" 2>/dev/null); printf '%s' "${code:-200}"
 EOF
 # the fake 5dive: only `--json agent ask` is expected. Mode from STUB_ASK:
@@ -92,10 +96,33 @@ EOF
 chmod +x "$TMP/bin/"*
 export PATH="$TMP/bin:$PATH" FIVE_FIRST_JOB_SELF="$TMP/bin/five"
 export FIRST_JOB_POST_BACKOFF="0 0" FIRST_JOB_ASK_RETRY_SLEEP=0
+# The watcher: a fake clock that `sleep` advances, and a short default window
+# (2 ticks) so every run arm ends. A watcher tick (sleep 60) also plays the
+# plugin: at tick STUB_START_TICK it stamps startAt, at STUB_SECOND_TICK
+# secondAt. Past 200 ticks it kills the run, so a loop that never ends is a red
+# arm, not a hung harness.
+export FIRST_JOB_WATCH_SECS=120 FIRST_JOB_WATCH_SLEEP=60 TOKEN
+export SF="$AGENT_HOME_ROOT/agent-ada/.claude/channels/telegram/first-reply.state.json"
+_first_job_now() { cat "$TMP/clock"; }
+cat >"$TMP/bin/sleep" <<'STUB'
+#!/usr/bin/env bash
+c=$(cat "$STUB_DIR/clock"); echo $(( c + ${1:-0} )) >"$STUB_DIR/clock"
+[[ "${1:-}" == 60 ]] || exit 0
+n=$(( $(cat "$STUB_DIR/ticks" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$STUB_DIR/ticks"
+(( n > 200 )) && kill "$PPID"
+mkdir -p "$(dirname "$SF")"
+if [[ -n "${STUB_GARBAGE:-}" ]]; then printf 'garbage{' >"$SF"; exit 0; fi
+t="${STUB_STAMP_TOKEN:-$TOKEN}" s=null d=null
+(( ${STUB_START_TICK:-0} > 0 && n >= STUB_START_TICK )) && s='"2026-10-08T10:00:00.000Z"'
+(( ${STUB_SECOND_TICK:-0} > 0 && n >= STUB_SECOND_TICK )) && d='"2026-10-08T10:05:00.000Z"'
+[[ $s == null && $d == null ]] || printf '{"token":"%s","startAt":%s,"secondAt":%s}' "$t" "$s" "$d" >"$SF"
+exit 0
+STUB
+chmod +x "$TMP/bin/sleep"
 
 b64() { printf '%s' "$1" | base64 -w0; }
-reset() { rm -rf "$STATE_DIR/first-jobs" "$TMP"/sdrun.argv "$TMP"/curl.* "$TMP"/ask.* "$TMP/http.seq" \
-          "$AGENT_HOME_ROOT"/agent-*/.claude; }
+reset() { rm -rf "$STATE_DIR/first-jobs" "$TMP"/sdrun.argv "$TMP"/curl.* "$TMP"/ask.* "$TMP/http.seq" "$TMP/ticks" \
+          "$AGENT_HOME_ROOT"/agent-*/.claude; echo 1000000 >"$TMP/clock"; }
 # run <fn> <args...> in a subshell (fail() exits). Sets OUT, ERR, RC.
 run() { local fn="$1"; shift; ( JSON_MODE=0; "$fn" "$@" ) >"$TMP/out" 2>"$TMP/err"; RC=$?; OUT=$(cat "$TMP/out"); ERR=$(cat "$TMP/err"); }
 sd_calls() { grep -c '^---$' "$TMP/sdrun.argv" 2>/dev/null || echo 0; }
@@ -174,6 +201,9 @@ for st in done failed; do
   STUB_ACTIVE_RC=3 run cmd_agent_first_job ada --token="$TOKEN" --job-b64="$(b64 hi)"
   [[ $RC -eq 0 && "$OUT" == '{"ok":true,"already":true}' && "$(sd_calls)" == "$before" ]] || i3+=("$st: rc=$RC out=$OUT")
 done
+jq -c '.status = "watching"' "$(STATE_F)" >"$TMP/r" && mv "$TMP/r" "$(STATE_F)"
+STUB_ACTIVE_RC=3 run cmd_agent_first_job ada --token="$TOKEN" --job-b64="$(b64 hi)"
+[[ $RC -eq 0 && "$OUT" == '{"ok":true,"restarted":true}' ]] && ok_t "I2b a watching record with no live unit is restarted too" || bad_t "I2b watching restart" "rc=$RC out=$OUT"
 (( ${#i3[@]} == 0 )) && ok_t "I3 done / failed with no live unit still answer already:true and start nothing" || bad_t "I3 finished states" "${i3[*]}"
 jq -c '.status = "running"' "$(STATE_F)" >"$TMP/r" && mv "$TMP/r" "$(STATE_F)"
 before=$(sd_calls); STUB_ACTIVE_RC=3 STUB_SDRUN_RC=1 run cmd_agent_first_job ada --token="$TOKEN" --job-b64="$(b64 hi)"
@@ -249,19 +279,56 @@ grep -qx 'https://api.example.test/server/first-jobs/done' "$TMP/curl.argv" \
 reset; run cmd_agent_first_job_run ada "$TOKEN"
 [[ $RC -eq $E_NOT_FOUND && ! -e "$TMP/ask.n" ]] && ok_t "R6b a run with no record asks nothing" || bad_t "R6b no record" "rc=$RC"
 
-# ── T: status ────────────────────────────────────────────────────────────────
-SF="$AGENT_HOME_ROOT/agent-ada/.claude/channels/telegram/first-reply.state.json"
-reset; run cmd_agent_first_job status ada --json
-[[ $RC -eq 0 && "$OUT" == '{}' ]] && ok_t "T1 no state file prints {}" || bad_t "T1 empty" "rc=$RC out=$OUT"
-mkdir -p "$(dirname "$SF")"
-printf '{"token":"%s","startAt":"2026-10-08T10:00:00.000Z","extra":1}' "$TOKEN" >"$SF"
-run cmd_agent_first_job status ada --json
-[[ "$OUT" == "{\"token\":\"$TOKEN\",\"startAt\":\"2026-10-08T10:00:00.000Z\",\"secondAt\":null}" ]] \
-  && ok_t "T2 the plugin's stamps come back as {token,startAt,secondAt}" || bad_t "T2 stamps" "$OUT"
-printf 'not json' >"$SF"; run cmd_agent_first_job status ada
-[[ $RC -eq 0 && "$OUT" == '{}' ]] && ok_t "T3 garbage reads as {}" || bad_t "T3 garbage" "rc=$RC out=$OUT"
-printf '{"token":"../x","startAt":"2026-10-08T10:00:00Z"}' >"$SF"; run cmd_agent_first_job status ada
-[[ "$OUT" == '{}' ]] && ok_t "T4 a malformed token reads as {}" || bad_t "T4 bad token" "$OUT"
+# ── J: the watcher after done ────────────────────────────────────────────────
+ticks() { cat "$TMP/ticks" 2>/dev/null || echo 0; }
+ev()    { jq -r --arg e "$1" '.events[$e] | if . == null then "none" else "\(.ok)|\(.http)" end' "$(STATE_F)"; }
+start_job ada 'Plan my week'
+grep -qx -- '--property=RuntimeMaxSec=262800' "$TMP/sdrun.argv" \
+  && ok_t "J0 the unit's hard limit is 73h (the ask, then 72h of watching)" || bad_t "J0 RuntimeMaxSec" "$(tr '\n' ' ' <"$TMP/sdrun.argv")"
+STUB_START_TICK=1 STUB_SECOND_TICK=2 FIRST_JOB_WATCH_SECS=259200 run cmd_agent_first_job_run ada "$TOKEN"
+want=$(printf '%s\n' "{\"token\":\"$TOKEN\",\"ok\":true,\"botUsername\":\"ada_helper_bot\"}" "{\"token\":\"$TOKEN\",\"event\":\"start\"}" "{\"token\":\"$TOKEN\",\"event\":\"second\"}")
+{ [[ $RC -eq 0 && "$(cat "$TMP/curl.bodies")" == "$want" && "$(ticks)" == 2 ]] \
+  && grep -qx 'https://api.5dive.com/server/first-jobs/event' "$TMP/curl.argv" && ! grep -qF "$SECRET" "$TMP/curl.argv"; } \
+  && ok_t "J1 done, then {token,event:start} and {token,event:second} to /server/first-jobs/event (bearer on stdin), then exit — 2 ticks, not 72h" \
+  || bad_t "J1 events" "rc=$RC ticks=$(ticks) bodies=$(cat "$TMP/curl.bodies" 2>/dev/null)"
+[[ "$(jq -r '[.status,.watchEnded]|join("|")' "$(STATE_F)")|$(ev start)|$(ev second)" == "done|reported|true|200|true|200" ]] \
+  && ok_t "J1b the record: done, watch ended 'reported', both events recorded ok" || bad_t "J1b record" "$(cat "$(STATE_F)")"
+
+start_job ada 'Plan my week'; FIRST_JOB_WATCH_SECS=300 run cmd_agent_first_job_run ada "$TOKEN"
+[[ $RC -eq 0 && "$(ticks)" == 5 && "$(cat "$TMP/curl.n")" == 1 && "$(jq -r '[.status,.watchEnded]|join("|")' "$(STATE_F)")" == "done|expired" ]] \
+  && ok_t "J2 no stamps: the watch ends at the window (300s / 60s = 5 ticks), nothing reported" \
+  || bad_t "J2 expiry" "rc=$RC ticks=$(ticks) curls=$(cat "$TMP/curl.n") $(cat "$(STATE_F)")"
+
+start_job ada 'Plan my week'
+jq -c '.status = "watching" | .doneEpoch = 1000000 | .events = {start:{ok:true,http:"200"}}' "$(STATE_F)" >"$TMP/r" && mv "$TMP/r" "$(STATE_F)"
+mkdir -p "$(dirname "$SF")"; printf '{"token":"%s","startAt":"2026-10-08T10:00:00Z","secondAt":"2026-10-08T10:05:00Z"}' "$TOKEN" >"$SF"
+run cmd_agent_first_job_run ada "$TOKEN"
+{ [[ $RC -eq 0 && ! -e "$TMP/ask.n" && "$(cat "$TMP/curl.n")" == 1 ]] \
+  && [[ "$(cat "$TMP/curl.bodies")" == "{\"token\":\"$TOKEN\",\"event\":\"second\"}" && "$(jq -r .watchEnded "$(STATE_F)")" == reported ]]; } \
+  && ok_t "J3 a restarted watching unit asks nothing, does not resend start, sends second, ends" \
+  || bad_t "J3 resume" "rc=$RC asks=$(cat "$TMP/ask.n" 2>/dev/null) bodies=$(cat "$TMP/curl.bodies" 2>/dev/null)"
+
+start_job ada 'Plan my week'; printf '200\n404\n200\n' >"$TMP/http.seq"
+STUB_START_TICK=1 STUB_SECOND_TICK=2 FIRST_JOB_WATCH_SECS=259200 run cmd_agent_first_job_run ada "$TOKEN"
+[[ $RC -eq 0 && "$(cat "$TMP/curl.n")" == 3 && "$(ev start)" == "false|404" && "$(ev second)" == "true|200" ]] \
+  && ok_t "J4 a 404 on start is recorded and not retried; second still goes" \
+  || bad_t "J4 4xx" "curls=$(cat "$TMP/curl.n") start=$(ev start) second=$(ev second)"
+
+start_job ada 'Plan my week'; printf '200\n503\n503\n503\n200\n' >"$TMP/http.seq"
+STUB_START_TICK=1 FIRST_JOB_WATCH_SECS=180 run cmd_agent_first_job_run ada "$TOKEN"
+[[ $RC -eq 0 && "$(cat "$TMP/curl.n")" == 5 && "$(ev start)" == "true|200" && "$(ev second)" == none ]] \
+  && ok_t "J5 three 503s leave start unrecorded; the next tick sends it" \
+  || bad_t "J5 transient" "curls=$(cat "$TMP/curl.n") start=$(ev start)"
+
+start_job ada 'Plan my week'; STUB_START_TICK=1 STUB_SECOND_TICK=1 STUB_STAMP_TOKEN="ZZZZZZZZZZZZZZZZZZZZZZ" run cmd_agent_first_job_run ada "$TOKEN"
+j6a="$(cat "$TMP/curl.n")|$(ev start)"
+start_job ada 'Plan my week'; STUB_GARBAGE=1 run cmd_agent_first_job_run ada "$TOKEN"
+[[ "$j6a" == "1|none" && "$(cat "$TMP/curl.n")|$(ev start)" == "1|none" ]] \
+  && ok_t "J6 stamps for another token, or a garbage state file, report nothing" || bad_t "J6 foreign stamps" "$j6a / $(cat "$TMP/curl.n")|$(ev start)"
+
+start_job ada 'Plan my week'; STUB_ASK=auth run cmd_agent_first_job_run ada "$TOKEN"
+[[ $RC -ne 0 && "$(ticks)" == 0 && "$(jq -r .status "$(STATE_F)")" == failed ]] \
+  && ok_t "J7 a failed job does not watch" || bad_t "J7 failed job" "rc=$RC ticks=$(ticks)"
 
 # ── W: wiring ────────────────────────────────────────────────────────────────
 arm=$(awk '/^_agent_verb_dispatch\(\) \{/{f=1} f&&/^\}/{exit} f' src/main.sh)

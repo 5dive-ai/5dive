@@ -285,8 +285,8 @@ Agents:
   5dive agent first-job <name> --token=<token> --job-b64=<base64>
                                                      # root: run the owner's first job at hire in a
                                                      # background unit and leave the reply for the
-                                                     # agent's Telegram bot (DIVE-5874). Idempotent per token.
-  5dive agent first-job status <name> --json         # root: when the owner opened that reply ({token,startAt,secondAt} or {})
+                                                     # agent's Telegram bot (DIVE-5874). Idempotent per token;
+                                                     # the unit then reports when the owner opens it (72h max).
   5dive agent stats <name>                           # state, restart count, last exit
   5dive agent install <type> [--upgrade] [--detach|--status]  # install the CLI for a type if missing (--upgrade forces a reinstall; --detach runs it as a background job, --status reads that job)
   5dive agent set-account <agent> <account|default> [--switch-harness]  # rebind to a named account; "default" clears.
@@ -670,15 +670,10 @@ _agent_verb_dispatch() {
         # DIVE-5874: the owner's first job at hire. The API execs it as root over
         # shelld; it records the job and starts a transient unit, so it returns
         # at once. AUDIT_ARGS carries the name only: the token is the Telegram
-        # start payload and the job is the customer's own words. `status` is a
-        # read-only probe the API polls — no audit row.
+        # start payload and the job is the customer's own words.
         first-job)
-          if [[ "${1:-}" == "status" && $# -ge 2 ]]; then
-            cmd_agent_first_job "$@"
-          else
-            AUDIT_CMD="agent first-job"; AUDIT_ARGS=("${1:-}")
-            cmd_agent_first_job "$@"
-          fi ;;
+          AUDIT_CMD="agent first-job"; AUDIT_ARGS=("${1:-}")
+          cmd_agent_first_job "$@" ;;
         # DIVE-5874: hidden root primitive — the first-job unit's body.
         _first_job_run)
           AUDIT_CMD="agent _first_job_run"; AUDIT_ARGS=("${1:-}")

@@ -18,18 +18,25 @@
 # below and the job runs on the agent's own AI, on the customer's box.
 #
 #   agent first-job <name> --token=<t> --job-b64=<b64>   record + start; idempotent per token
-#   agent first-job status <name> --json                  the plugin's /start + second-message stamps
 #   agent _first_job_run <name> <token>                   (internal) the unit's body
+#
+# The API never polls the box for how the reply landed (owner's rule): after the
+# done report the same unit stays up as a light watcher on the plugin's
+# first-reply.state.json and reports `start` (the owner opened the reply) and
+# `second` (the owner wrote again) itself, for at most 72h after done.
 
 FIRST_JOB_DIR="${FIRST_JOB_DIR:-$STATE_DIR/first-jobs}"
-# The ask's own bound (contract: 1200s) plus the done POST's retries. A hung ask
-# ends the unit rather than leaving a job "running" forever.
+# The ask's own bound (contract: 1200s), then the 72h watch after done. The hard
+# limit is the two plus slack: a hung ask or watcher ends with the unit.
 FIRST_JOB_ASK_TIMEOUT="${FIRST_JOB_ASK_TIMEOUT:-1200}"
-FIRST_JOB_MAX_SEC="${FIRST_JOB_MAX_SEC:-1800}"
+FIRST_JOB_WATCH_SECS="${FIRST_JOB_WATCH_SECS:-259200}"
+FIRST_JOB_WATCH_SLEEP="${FIRST_JOB_WATCH_SLEEP:-60}"
+FIRST_JOB_MAX_SEC="${FIRST_JOB_MAX_SEC:-262800}"
 
 # Harness seams. Nothing on a box sets these.
 _first_job_self()   { printf '%s' "${FIVE_FIRST_JOB_SELF:-/usr/local/bin/5dive}"; }
 _first_job_is_root() { (( EUID == 0 )); }
+_first_job_now()    { date +%s; }
 
 _first_job_valid_token() { [[ "${1:-}" =~ ^[A-Za-z0-9_-]{22}$ ]]; }
 
@@ -78,10 +85,7 @@ _first_job_prompt() { # <job>
 }
 
 cmd_agent_first_job() {
-  if [[ "${1:-}" == "status" && $# -ge 2 && "${2:-}" != -* ]]; then
-    shift; cmd_agent_first_job_status "$@"; return
-  fi
-  local usage="usage: 5dive agent first-job <name> --token=<token> --job-b64=<base64>  |  first-job status <name> --json"
+  local usage="usage: 5dive agent first-job <name> --token=<token> --job-b64=<base64>"
   local name="" token="" b64=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -130,11 +134,12 @@ cmd_agent_first_job() {
   local unit="5dive-first-job-${token:0:12}"
   if ! ( umask 077; set -o noclobber; printf '%s\n' "$rec" >"$st" ) 2>/dev/null; then
     [[ -e "$st" ]] || fail "$E_GENERIC" "could not write $st"
-    # A record still "running" with no live unit lost its run (a reboot, an OOM
-    # kill): start it again rather than answer "already" until the API's 48h
-    # give-up. done/failed, or a live unit, are the real "already".
+    # A record still "running" (or "watching") with no live unit lost its run
+    # (a reboot, an OOM kill): start it again rather than answer "already" until
+    # the API's 48h give-up. A watching record resumes the watch only — the run
+    # skips the ask. done/failed, or a live unit, are the real "already".
     local prev; prev=$(jq -r '.status // empty' "$st" 2>/dev/null) || prev=""
-    if [[ "$prev" == running ]] && ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+    if [[ "$prev" == running || "$prev" == watching ]] && ! systemctl is-active --quiet "$unit" 2>/dev/null; then
       local rname; rname=$(jq -r '.name // empty' "$st" 2>/dev/null) || rname=""
       valid_name "$rname" || rname="$name"
       if ! _first_job_spawn "$unit" "$rname" "$token"; then
@@ -199,13 +204,13 @@ _first_job_ask() {
 # 3 attempts with back-off; a 4xx other than 408/429 is an answer, not a blip.
 # Sets _FJ_HTTP to the last status seen.
 _FJ_HTTP=""
-_first_job_post_done() {
-  local body="$1" tok="" trc=0 url http="" i=0
+_first_job_post() { # <path> <body> → 0 2xx · 2 refused (4xx) · 1 not reached
+  local path="$1" body="$2" tok="" trc=0 url http="" i=0
   local -a pauses
   read -r -a pauses <<<"${FIRST_JOB_POST_BACKOFF:-5 20}"
   tok=$(_partner_box_token) || trc=$?
   (( trc == 0 )) || { _FJ_HTTP="no-token"; return 1; }
-  url="$(_partner_api_base)/server/first-jobs/done"
+  url="$(_partner_api_base)$path"
   while :; do
     # The bearer goes in on STDIN (`-H @-`), never argv — DIVE-5168's rule.
     http=$(printf 'Authorization: Bearer %s\n' "$tok" \
@@ -216,11 +221,59 @@ _first_job_post_done() {
     case "$_FJ_HTTP" in
       2??) return 0 ;;
       408|429) ;;
-      4??) return 1 ;;
+      4??) return 2 ;;
     esac
     (( i < ${#pauses[@]} )) || return 1
     sleep "${pauses[$i]}"; i=$((i + 1))
   done
+}
+
+# _first_job_stamps <name> — the plugin's {token,startAt,secondAt}, or {}.
+# Read as the agent and bounded: the file is agent-written. Slurped, so an empty
+# file or several documents read as {} rather than as nothing.
+_first_job_stamps() {
+  local f raw=""
+  f="$(_first_job_tg_dir "$1")/first-reply.state.json"
+  raw=$(_first_job_as "$1" head -c 4096 -- "$f" 2>/dev/null) || raw=""
+  jq -cs 'def ts: if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+(Z|[+-][0-9:]+)$") then . else null end;
+         (if length == 1 then .[0] else null end) |
+         if type == "object" and (.token | type) == "string" and (.token | test("^[A-Za-z0-9_-]{22}$"))
+         then {token, startAt: (.startAt | ts), secondAt: (.secondAt | ts)} else {} end' \
+    <<<"$raw" 2>/dev/null || printf '{}\n'
+}
+
+# _first_job_watch <name> <token> — after done: report `start` when the plugin
+# stamps startAt and `second` when it stamps secondAt, once each. Every report
+# (sent, or refused with a 4xx) is recorded in the state file, so a restarted
+# unit resumes without resending; one that did not reach the API is retried on
+# the next tick. Ends when both are recorded or 72h after done.
+_first_job_watch() {
+  local name="$1" token="$2" st stamps ev key at rc body deadline why=""
+  st=$(_first_job_state "$token")
+  local done_epoch; done_epoch=$(jq -r '.doneEpoch // empty' "$st" 2>/dev/null) || done_epoch=""
+  [[ "$done_epoch" =~ ^[0-9]+$ ]] || done_epoch=$(_first_job_now)
+  deadline=$(( done_epoch + FIRST_JOB_WATCH_SECS ))
+  while :; do
+    stamps=$(_first_job_stamps "$name")
+    for ev in start second; do
+      key="${ev}At"
+      [[ -z "$(jq -r --arg e "$ev" '.events[$e] // empty' "$st" 2>/dev/null)" ]] || continue
+      at=$(jq -r --arg t "$token" --arg k "$key" 'if .token == $t then (.[$k] // empty) else empty end' <<<"$stamps" 2>/dev/null) || at=""
+      [[ -n "$at" ]] || continue
+      body=$(jq -cn --arg t "$token" --arg e "$ev" '{token:$t, event:$e}')
+      rc=0; _first_job_post /server/first-jobs/event "$body" || rc=$?
+      (( rc == 1 )) && continue
+      _first_job_state_merge "$token" '{events: ((.events // {}) + {($e): {stampedAt:$a, reportedAt:$r, http:$h, ok:($k == "0")}})}' \
+        --arg e "$ev" --arg a "$at" --arg r "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg h "$_FJ_HTTP" --arg k "$rc" || true
+    done
+    if [[ "$(jq -r '((.events.start // null) != null and (.events.second // null) != null)' "$st" 2>/dev/null)" == true ]]; then
+      why=reported; break
+    fi
+    (( $(_first_job_now) < deadline )) || { why=expired; break; }
+    sleep "$FIRST_JOB_WATCH_SLEEP"
+  done
+  _first_job_state_merge "$token" '{status:"done", watchEnded:$w, watchEndedAt:$f}' \
+    --arg w "$why" --arg f "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
 }
 
 cmd_agent_first_job_run() {
@@ -233,6 +286,10 @@ cmd_agent_first_job_run() {
   _first_job_valid_token "$token" || fail "$E_VALIDATION" "invalid first-job token"
   local st; st=$(_first_job_state "$token")
   [[ -f "$st" ]] || fail "$E_NOT_FOUND" "no first job recorded for this token"
+  # A restart after done resumes the watch; the job is never asked twice.
+  if [[ "$(jq -r '.status // empty' "$st" 2>/dev/null)" == watching ]]; then
+    _first_job_watch "$name" "$token"; return 0
+  fi
   local job; job=$(jq -r '.job // empty' "$st" 2>/dev/null) || job=""
   [[ -n "$job" ]] || fail "$E_GENERIC" "the first-job record has no job"
 
@@ -267,45 +324,18 @@ cmd_agent_first_job_run() {
     body=$(jq -cn --arg t "$token" --arg e "$err" '{token:$t, ok:false, error:$e}')
   fi
 
-  local posted=false
-  _first_job_post_done "$body" && posted=true
+  local posted=false status
+  _first_job_post /server/first-jobs/done "$body" && posted=true
+  if (( ! ok )); then status=failed
+  elif [[ "$posted" == true ]]; then status=watching
+  else status=done; fi
   _first_job_state_merge "$token" \
-    '{status:(if $ok == "1" then "done" else "failed" end), finishedAt:$f, posted:$p, http:$h}
+    '{status:$s, finishedAt:$f, doneEpoch:($d | tonumber), posted:$p, http:$h}
      + (if $e == "" then {} else {error:$e} end)' \
-    --arg ok "$ok" --arg f "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson p "$posted" \
+    --arg s "$status" --arg f "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg d "$(_first_job_now)" --argjson p "$posted" \
     --arg h "$_FJ_HTTP" --arg e "$err" || true
   [[ "$posted" == true ]] || fail "$E_GENERIC" "first job ${token:0:12}: the done report did not reach the 5dive API (last HTTP ${_FJ_HTTP})"
   (( ok )) || fail "$E_GENERIC" "first job ${token:0:12} failed: $err"
+  _first_job_watch "$name" "$token"
   return 0
-}
-
-# `first-job status <name> --json` — what the plugin stamped: {token,startAt,
-# secondAt}, or {} when it has stamped nothing. The API matches the token
-# against its own row, so a stale file from an earlier job is harmless.
-cmd_agent_first_job_status() {
-  local usage="usage: 5dive agent first-job status <name> --json"
-  local name=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -h|--help) printf '%s\n' "$usage"; return 0 ;;
-      --json) JSON_MODE=1 ;;
-      -*) fail "$E_USAGE" "unknown flag: $1 ($usage)" ;;
-      *)  [[ -z "$name" ]] || fail "$E_USAGE" "unexpected argument: $1 ($usage)"; name="$1" ;;
-    esac
-    shift
-  done
-  [[ -n "$name" ]] || fail "$E_USAGE" "$usage"
-  require_root
-  valid_name "$name" || fail "$E_VALIDATION" "invalid agent name '$name'"
-  _first_job_agent_known "$name" || fail "$E_NOT_FOUND" "no agent named '$name'"
-  local f raw=""
-  f="$(_first_job_tg_dir "$name")/first-reply.state.json"
-  # Read as the agent and bounded: the file is agent-written.
-  raw=$(_first_job_as "$name" head -c 4096 -- "$f" 2>/dev/null) || raw=""
-  # Slurped, so empty or several documents read as {} rather than as nothing.
-  jq -cs 'def ts: if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+(Z|[+-][0-9:]+)$") then . else null end;
-         (if length == 1 then .[0] else null end) |
-         if type == "object" and (.token | type) == "string" and (.token | test("^[A-Za-z0-9_-]{22}$"))
-         then {token, startAt: (.startAt | ts), secondAt: (.secondAt | ts)} else {} end' \
-    <<<"$raw" 2>/dev/null || printf '{}\n'
 }
