@@ -188,6 +188,13 @@ _agent_restart_needed() {
 #
 # The path is hashed alongside the bytes, so a file APPEARING or being REMOVED
 # moves the fingerprint too — a deleted skill is a payload change.
+#
+# NOT HASHED: .skills-manifest.json (DIVE-5866). The same trap as mtime, one level
+# down: a timestamp INSIDE a hashed file. Every manifest writer stamped a fresh
+# installed_at on every re-pull, so from 2026-09-29 an OSS box restarted its agent
+# every night with "0 changed" skills and an unchanged build. The writers now keep
+# the stamp on an unchanged entry too; the exclusion is what makes the fingerprint
+# not depend on that.
 _agent_payload_fingerprint() {
   local home="${1:-}" lib="${2:-${LIB_DIR:-/usr/local/lib/5dive}}"
   [[ -n "$home" ]] || return 0
@@ -222,7 +229,11 @@ _agent_payload_fingerprint() {
       if [[ -d "$p" ]]; then
         # -print0/-z/-0 throughout: a path with a space or newline in it must
         # not split into two hashed entries.
-        find "$p" -type f -print0 2>/dev/null | LC_ALL=C sort -z \
+        # DIVE-5866: .skills-manifest.json is provenance that no agent loads, and
+        # the nightly skills re-pull rewrote its installed_at stamps every run, so
+        # hashing it made every night read "payload changed" and restarted every
+        # agent. Excluded by name; a skill BODY change still moves the hash.
+        find "$p" -type f ! -name .skills-manifest.json -print0 2>/dev/null | LC_ALL=C sort -z \
           | xargs -0 -r sha256sum 2>/dev/null
       else
         sha256sum "$p" 2>/dev/null
