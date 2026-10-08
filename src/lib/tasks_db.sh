@@ -523,6 +523,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- the next confirmed send. Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS.
   gate_renag_failed_at  TEXT,
   gate_renag_failed_via TEXT,
+  -- DIVE-5852: the seat that asked to be told when this row closes
+  -- (`task add --tell-me`, `task watch`), and when it was told. OPT-IN ONLY:
+  -- NULL is "nobody asked", and nothing ever sets it from a heuristic. told_at
+  -- makes the wake one-shot, so a reopen and a second close wake nobody.
+  -- Declared HERE as well as in _TASKS_ADDITIVE_COLUMNS.
+  tell_me_by  TEXT,
+  told_at     TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -2132,6 +2139,9 @@ _TASKS_ADDITIVE_COLUMNS=(
   'human_owner TEXT'
   # DIVE-4911: the re-nag's negative receipt. See the CREATE TABLE comment.
   'gate_renag_failed_at TEXT' 'gate_renag_failed_via TEXT'
+  # DIVE-5852: who asked to be woken on close, and when they were. See the
+  # CREATE TABLE comment. NULL on every existing row, which is the truth.
+  'tell_me_by TEXT' 'told_at TEXT'
 )
 
 # DIVE-3098 - TERMINAL FOR THE VERIFIER, as ONE SQL boolean expression.

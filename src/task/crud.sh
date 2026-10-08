@@ -32,6 +32,7 @@ cmd_task_add() {
   # is an existing, separately-tested control and this row does not touch it.
   local review_demand="" _rm_asked=""
   local customer_facing="" already_blocked="" materialized=""
+  local tell_me=""   # DIVE-5852: wake the filing seat once when this row closes
   # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
   local body_src="" accept_src=""
   local -a words=()
@@ -105,6 +106,9 @@ cmd_task_add() {
       # filing cap, which is about what a title IS, not how many there are.
       --materialized)      materialized="1" ;;
       --already-blocked=*) already_blocked="${1#*=}" ;;
+      # DIVE-5852: the filer promised its owner a ping. OPT-IN ONLY (lodar
+      # 2026-10-08: "only goes when they promised"), never defaulted on.
+      --tell-me)     tell_me="1" ;;
       # DIVE-5729: born HELD, in the same transaction as the insert, so no tick
       # can dispatch (or materialize) the row in the gap a follow-up `task block`
       # or `task park` would leave. --held-by is a dependency edge (released when
@@ -857,6 +861,18 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   # positive record that the uid was measured and corroborated the claim, which is
   # not something a NULL can ever say.
   local derived_actor="$ACTOR_BOARD"
+  # DIVE-5852: the seat woken on close is the one that RAN this command, never
+  # the `--from` claim: a relay principal (telegram, council) has no session to
+  # wake. Refuse rather than store a name nothing can deliver to, because a
+  # stored-but-undeliverable promise is the defect this flag exists to end.
+  local tell_me_by=""
+  if [[ -n "$tell_me" ]]; then
+    [[ "$kind" == "recurring" ]] && fail "$E_VALIDATION" \
+      "--tell-me is for one promised result; a recurring template closes never (DIVE-5852)"
+    [[ -n "$derived_actor" && "$derived_actor" != "cli" ]] || fail "$E_VALIDATION" \
+      "--tell-me needs an agent seat to wake, and this shell is not one (${ACTOR_BOARD_SOURCE:-unknown}) (DIVE-5852)"
+    tell_me_by="$derived_actor"
+  fi
   # DIVE-4419: a row can be born oversized too — `task add --body-file=` reads a
   # file verbatim — so the cap belongs on the creation path as well as on the
   # append path, or the guard is one `--body-file` away from irrelevant. No
@@ -877,12 +893,12 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   id=$(db "BEGIN IMMEDIATE;
            INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable,
-                              verify_optout, verify_forced, review_mode, mutant_command, on_overlap, overlap_bound)
+                              verify_optout, verify_forced, review_mode, mutant_command, on_overlap, overlap_bound, tell_me_by)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), $(sqlq_or_null "$derived_actor"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
                    $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL),
-                   $([[ -n "$no_verify" ]] && echo 1 || echo NULL), $([[ -n "$force_verify" ]] && echo 1 || echo NULL), $(sqlq_or_null "$review_mode"), $(sqlq_or_null "$mutant_stored"), ${on_overlap_sql}, ${overlap_bound_sql});
+                   $([[ -n "$no_verify" ]] && echo 1 || echo NULL), $([[ -n "$force_verify" ]] && echo 1 || echo NULL), $(sqlq_or_null "$review_mode"), $(sqlq_or_null "$mutant_stored"), ${on_overlap_sql}, ${overlap_bound_sql}, $(sqlq_or_null "$tell_me_by"));
            SELECT last_insert_rowid();
            ${hold_sql}
            COMMIT;")
@@ -993,12 +1009,15 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
       (( verify_unavailable )) && _rv_by="no distinct grader available in this org"
       review_note+=" — you asked for '${_rm_asked}'; ${_rv_by} overruled it. Buy a grade back for one row with --verify, or change the box with '5dive config verify=…'"
     fi
-    ok "created ${ident} — $title${hold_note}${coord_note}${review_note}${verify_note}" \
-       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, verifyPolicy:$vp, verifyOverride:$vo, verifyDeferred:($vdf=="1"), reviewMode:$rm, reviewModeChosen:($rc=="1"), parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
+    local tell_note=""
+    [[ -n "$tell_me_by" ]] && tell_note=" · ${tell_me_by} is woken once when it closes (--tell-me)"
+    ok "created ${ident} — $title${hold_note}${coord_note}${review_note}${verify_note}${tell_note}" \
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", tellMeBy:(if $tm=="" then null else $tm end), autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, verifyPolicy:$vp, verifyOverride:$vo, verifyDeferred:($vdf=="1"), reviewMode:$rm, reviewModeChosen:($rc=="1"), parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
        --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg vs "$verify_skipped" --arg v "${verifier:-}" \
        --arg vp "$_vp_policy" --arg vo "$_vp_override" --arg vdf "$_vp_deferred" \
        --arg rm "$review_mode" --arg rc "$([[ -n "$review_flag" ]] && echo 1 || echo 0)" \
-       --arg wi "$followup_warn_ident" --arg wk "$followup_warn_kind" --arg wn "$followup_warn_number" --arg wm "$followup_warn_matches"
+       --arg wi "$followup_warn_ident" --arg wk "$followup_warn_kind" --arg wn "$followup_warn_number" --arg wm "$followup_warn_matches" \
+       --arg tm "$tell_me_by"
   fi
 }
 

@@ -2004,6 +2004,7 @@ cmd_task_answer() {
     # DIVE-1415: a manual-gate answer that closes the task DONE is terminal — its
     # dependents must release just as they would on `task done`.
     _task_cascade_unblock "$id" || true
+    _task_tell_filer "$id" done || true   # DIVE-5852: the filer's opt-in wake
   else
     # Clearing the gate ≠ unblocking. `status='blocked'` is overloaded (human
     # gate AND task-task `block` edges), so RECOMPUTE rather than hardcode todo:
