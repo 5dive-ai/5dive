@@ -195,9 +195,15 @@ PREV_SHA=$(/usr/bin/jq -r --arg k "$SKILL" '.[$k].content_sha256 // ""' "$MANIFE
 CONTENT_SHA=$(cd "$HOME/$INSTALL_DIR/$SKILL" && find . -type f -print0 | sort -z | xargs -0 -r /usr/bin/sha256sum | /usr/bin/sha256sum | cut -d' ' -f1) || CONTENT_SHA=""
 CHANGED=false
 if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$CONTENT_SHA" ]; then CHANGED=true; fi
+# DIVE-5866: an unchanged entry keeps its installed_at. The nightly re-pull lands here
+# every night, and a fresh stamp on an unchanged skill made this file the one payload
+# byte that always moved, so the self-update restart check could never skip.
 if /usr/bin/jq --arg k "$SKILL" --arg s "$SOURCE" --arg r "$RESOLVED_SHA" --arg c "$CONTENT_SHA" \
      --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-     '.[$k] = {source:$s, resolved_sha:$r, content_sha256:$c, installed_at:$t}' \
+     '(.[$k] | if type == "object" then . else {} end) as $o
+      | .[$k] = {source:$s, resolved_sha:$r, content_sha256:$c,
+                 installed_at: (if $o.source == $s and $o.resolved_sha == $r and $o.content_sha256 == $c
+                                   and ($o.installed_at // "") != "" then $o.installed_at else $t end)}' \
      "$MANIFEST" > "$MANIFEST.tmp" 2>/dev/null; then
   mv "$MANIFEST.tmp" "$MANIFEST"
 else
@@ -254,9 +260,15 @@ PREV_SHA=$(/usr/bin/jq -r --arg k "$SKILL" '.[$k].content_sha256 // ""' "$MANIFE
 CONTENT_SHA=$(cd "$HOME/$INSTALL_DIR/$SKILL" && find . -type f -print0 | sort -z | xargs -0 -r /usr/bin/sha256sum | /usr/bin/sha256sum | cut -d' ' -f1) || CONTENT_SHA=""
 CHANGED=false
 if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$CONTENT_SHA" ]; then CHANGED=true; fi
+# DIVE-5866: an unchanged entry keeps its installed_at. The nightly re-pull lands here
+# every night, and a fresh stamp on an unchanged skill made this file the one payload
+# byte that always moved, so the self-update restart check could never skip.
 if /usr/bin/jq --arg k "$SKILL" --arg s "$SOURCE" --arg r "$RESOLVED_SHA" --arg c "$CONTENT_SHA" \
      --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-     '.[$k] = {source:$s, resolved_sha:$r, content_sha256:$c, installed_at:$t}' \
+     '(.[$k] | if type == "object" then . else {} end) as $o
+      | .[$k] = {source:$s, resolved_sha:$r, content_sha256:$c,
+                 installed_at: (if $o.source == $s and $o.resolved_sha == $r and $o.content_sha256 == $c
+                                   and ($o.installed_at // "") != "" then $o.installed_at else $t end)}' \
      "$MANIFEST" > "$MANIFEST.tmp" 2>/dev/null; then
   mv "$MANIFEST.tmp" "$MANIFEST"
 else
@@ -301,9 +313,15 @@ PREV_SHA=$(/usr/bin/jq -r --arg k "$SKILL" '.[$k].content_sha256 // ""' "$MANIFE
 CONTENT_SHA=$(cd "$HOME/$INSTALL_DIR/$SKILL" && find . -type f -print0 | sort -z | xargs -0 -r /usr/bin/sha256sum | /usr/bin/sha256sum | cut -d' ' -f1) || CONTENT_SHA=""
 CHANGED=false
 if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$CONTENT_SHA" ]; then CHANGED=true; fi
+# DIVE-5866: an unchanged entry keeps its installed_at. The nightly re-pull lands here
+# every night, and a fresh stamp on an unchanged skill made this file the one payload
+# byte that always moved, so the self-update restart check could never skip.
 if /usr/bin/jq --arg k "$SKILL" --arg s "$SOURCE" --arg r "$RESOLVED_SHA" --arg c "$CONTENT_SHA" \
      --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-     '.[$k] = {source:$s, resolved_sha:$r, content_sha256:$c, installed_at:$t}' \
+     '(.[$k] | if type == "object" then . else {} end) as $o
+      | .[$k] = {source:$s, resolved_sha:$r, content_sha256:$c,
+                 installed_at: (if $o.source == $s and $o.resolved_sha == $r and $o.content_sha256 == $c
+                                   and ($o.installed_at // "") != "" then $o.installed_at else $t end)}' \
      "$MANIFEST" > "$MANIFEST.tmp" 2>/dev/null; then
   mv "$MANIFEST.tmp" "$MANIFEST"
 else

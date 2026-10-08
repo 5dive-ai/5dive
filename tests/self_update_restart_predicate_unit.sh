@@ -379,6 +379,73 @@ else
   bad_t "an unreadable fingerprint was treated as unchanged" "this is the FALSE SAME failure the harness header names"
 fi
 
+# ---- DIVE-5866: a nightly skills re-pull with NO upstream change -------------
+# On an OSS box every night from 2026-09-29 printed "skills refresh done: 0 changed"
+# and "build identity unchanged", then "restarted guru (payload changed)". The
+# re-pull runs the manifest block below for every default skill, every night, and
+# it stamped a fresh installed_at into .skills-manifest.json, which sits inside a
+# hashed skills dir. So the fingerprint could never match. This replays that night:
+# the SHIPPED DIVE-2282 manifest block from src/cmd_skill.sh, run twice over the same
+# skill body with the clock moved, a fingerprint taken around the second run.
+mblock="$(sed -n '/# >>> DIVE-2282 skill manifest block/,/# <<< DIVE-2282 skill manifest block/p' \
+  src/cmd_skill.sh | sed '1d;$d')"
+if grep -q 'installed_at' <<<"$mblock" && grep -q '.skills-manifest.json' <<<"$mblock"; then
+  ok_t "DIVE-5866: the skill manifest block is extractable from src/cmd_skill.sh"
+else
+  bad_t "DIVE-5866: skill manifest block missing" "fence '# >>> DIVE-2282 skill manifest block' not found; the re-pull arms below would grade nothing"
+fi
+# A `date` shim so the second run is a later night without sleeping. The block calls
+# a bare `date`, which is what this shadows.
+mkdir -p "$WORK/clock"
+printf '#!/bin/sh\necho "$FAKE_NOW"\n' > "$WORK/clock/date"; chmod +x "$WORK/clock/date"
+repull() {  # repull <home> <skill> <now>
+  env HOME="$1" INSTALL_DIR=".claude/skills" SKILL="$2" SOURCE="5dive-ai/skills" \
+      RESOLVED_SHA="1111111111111111111111111111111111111111" RESULT_FILE="" \
+      FAKE_NOW="$3" PATH="$WORK/clock:$PATH" \
+      bash -c "set -euo pipefail
+$mblock" >/dev/null 2>&1
+}
+R="$WORK/home/agent-repull"
+mkdir -p "$R/.claude/skills/compile-knowledge" "$R/.claude/skills/5dive-cli"
+printf 'compile body\n' > "$R/.claude/skills/compile-knowledge/SKILL.md"
+printf 'cli body\n'     > "$R/.claude/skills/5dive-cli/SKILL.md"
+repull "$R" compile-knowledge 2026-10-07T00:30:50Z
+repull "$R" 5dive-cli         2026-10-07T00:30:45Z
+r_before="$(fp "$R" "$L")"
+m_before="$(cat "$R/.claude/skills/.skills-manifest.json" 2>/dev/null)"
+repull "$R" compile-knowledge 2026-10-08T00:30:50Z
+repull "$R" 5dive-cli         2026-10-08T00:30:45Z
+r_after="$(fp "$R" "$L")"
+m_after="$(cat "$R/.claude/skills/.skills-manifest.json" 2>/dev/null)"
+if [[ -n "$r_before" && "$r_before" == "$r_after" ]]; then
+  ok_t "DIVE-5866 ACCEPTANCE — two skills re-pulls with no upstream change leave the fingerprint equal (agent skipped)"
+else
+  bad_t "DIVE-5866: an unchanged skills re-pull moved the fingerprint" \
+        "before='$r_before' after='$r_after' — every nightly self-update restarts every agent"
+fi
+if [[ -n "$m_before" && "$m_before" == "$m_after" ]]; then
+  ok_t "DIVE-5866: an unchanged re-pull leaves .skills-manifest.json byte-identical (installed_at kept)"
+else
+  bad_t "DIVE-5866: an unchanged re-pull rewrote the manifest" "$(diff <(printf '%s\n' "$m_before") <(printf '%s\n' "$m_after") | head -6)"
+fi
+# The exclusion on its own, independent of the writers: ANY manifest-only rewrite
+# (a writer that still stamps, a pack sync, an older CLI) must not read as a change.
+printf '{"compile-knowledge":{"installed_at":"2099-01-01T00:00:00Z"}}\n' > "$R/.claude/skills/.skills-manifest.json"
+if [[ "$(fp "$R" "$L")" == "$r_before" ]]; then
+  ok_t "DIVE-5866: a manifest-only rewrite does not move the fingerprint"
+else
+  bad_t "DIVE-5866: the fingerprint still hashes .skills-manifest.json" "provenance a restart cannot change is driving restarts"
+fi
+# Positive control: the same re-pull with a CHANGED skill body must still restart.
+printf 'compile body v2\n' > "$R/.claude/skills/compile-knowledge/SKILL.md"
+repull "$R" compile-knowledge 2026-10-09T00:30:50Z
+if [[ "$(fp "$R" "$L")" != "$r_before" ]] \
+   && [[ "$(jq -r '."compile-knowledge".installed_at' "$R/.claude/skills/.skills-manifest.json" 2>/dev/null)" == 2026-10-09T00:30:50Z ]]; then
+  ok_t "DIVE-5866 POSITIVE CONTROL — a re-pull that changes a skill body moves the fingerprint and re-stamps installed_at"
+else
+  bad_t "DIVE-5866: a changed skill body was missed" "fingerprint or installed_at did not move on a real change (FALSE SAME)"
+fi
+
 # The caller must USE the helper rather than re-deciding inline, or the arms above
 # grade a function nothing calls.
 if grep -q '_agent_restart_needed "$before" "$after" "$atype"' src/cmd_selfupdate.sh \

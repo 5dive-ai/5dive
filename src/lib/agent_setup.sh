@@ -906,9 +906,13 @@ if ! /usr/bin/jq -e . "$MANIFEST" >/dev/null 2>&1; then echo '{}' > "$MANIFEST" 
 # Same hash recipe as cmd_skill_add: relative paths + sorted, so a tree installed by
 # either path hashes identically and `skill add --force` change-detection stays honest.
 CONTENT_SHA=$(cd "$HOME/$INSTALL_DIR/$SKILL" && find . -type f -print0 | sort -z | xargs -0 -r /usr/bin/sha256sum | /usr/bin/sha256sum | cut -d' ' -f1) || CONTENT_SHA=""
+# DIVE-5866: an unchanged entry keeps its installed_at (same rule as cmd_skill_add).
 if /usr/bin/jq --arg k "$SKILL" --arg s "$SOURCE" --arg c "$CONTENT_SHA" \
      --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-     '.[$k] = {source:$s, resolved_sha:"", content_sha256:$c, installed_at:$t}' \
+     '(.[$k] | if type == "object" then . else {} end) as $o
+      | .[$k] = {source:$s, resolved_sha:"", content_sha256:$c,
+                 installed_at: (if $o.source == $s and $o.resolved_sha == "" and $o.content_sha256 == $c
+                                   and ($o.installed_at // "") != "" then $o.installed_at else $t end)}' \
      "$MANIFEST" > "$MANIFEST.tmp" 2>/dev/null; then
   mv "$MANIFEST.tmp" "$MANIFEST"
 else

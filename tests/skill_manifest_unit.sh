@@ -303,5 +303,34 @@ else
   bad_t "every npx skills add call site reads </dev/null" "sites=$n_sites missing: $missing"
 fi
 
+# --- DIVE-5866: the default-skill writer keeps installed_at on an unchanged entry ---
+# _skill_manifest_note (src/lib/agent_setup.sh) is the fourth manifest writer. It
+# stamped a fresh installed_at on every call, which made the manifest change every
+# night. Its heredoc body is run here as shipped, twice with the clock moved.
+echo "== DIVE-5866: _skill_manifest_note keeps installed_at when nothing changed =="
+NOTE="$(sed -n "/<<'MANIFEST_NOTE'/,/^MANIFEST_NOTE\$/p" "$ROOT/src/lib/agent_setup.sh" | sed '1d;$d')"
+if grep -q 'installed_at' <<<"$NOTE"; then
+  mkdir -p "$TMP/clock"
+  printf '#!/bin/sh\necho "$FAKE_NOW"\n' > "$TMP/clock/date"; chmod +x "$TMP/clock/date"
+  note() {  # note <home> <now>
+    env HOME="$1" INSTALL_DIR="$INSTALL_DIR" SKILL="$SKILL" SOURCE="$SOURCE" FAKE_NOW="$2" \
+        PATH="$TMP/clock:$PATH" bash -c "$NOTE" >/dev/null 2>&1
+  }
+  HN="$TMP/homeN"; mkdir -p "$HN/$INSTALL_DIR/$SKILL"
+  printf 'body\n' > "$HN/$INSTALL_DIR/$SKILL/SKILL.md"
+  note "$HN" 2026-10-07T00:30:00Z
+  note "$HN" 2026-10-08T00:30:00Z
+  eq "note: unchanged entry keeps its first installed_at" \
+     "$(jq -r --arg k "$SKILL" '.[$k].installed_at // empty' "$HN/$INSTALL_DIR/.skills-manifest.json" 2>/dev/null)" \
+     "2026-10-07T00:30:00Z"
+  printf 'body v2\n' > "$HN/$INSTALL_DIR/$SKILL/SKILL.md"
+  note "$HN" 2026-10-09T00:30:00Z
+  eq "note: a changed body re-stamps installed_at" \
+     "$(jq -r --arg k "$SKILL" '.[$k].installed_at // empty' "$HN/$INSTALL_DIR/.skills-manifest.json" 2>/dev/null)" \
+     "2026-10-09T00:30:00Z"
+else
+  bad_t "note: _skill_manifest_note heredoc extractable" "MANIFEST_NOTE body not found in src/lib/agent_setup.sh; graded NOTHING"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
