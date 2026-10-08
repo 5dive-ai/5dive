@@ -1771,6 +1771,9 @@ _SUP_ALERTS_UNDELIVERABLE=0
 # DIVE-4666: capacity pages withheld this tick because the seat is on a known,
 # self-healing wall. Counted, so "quiet" is a number and not an absence.
 _SUP_ALERTS_QUIETED=0
+# DIVE-5844: blocked-on-prompt pages held this tick because the tool-permission
+# confirm was first seen inside its decline window. Same reason it is counted.
+_SUP_PROMPT_PAGES_HELD=0
 _sup_alert_undeliverable() {  # <name> <class> <leg> <reason> [recipient]
   local name="$1" class="$2" leg="$3" reason="$4" to="${5:-}" sig
   _SUP_ALERTS_UNDELIVERABLE=$(( _SUP_ALERTS_UNDELIVERABLE + 1 ))
@@ -2119,7 +2122,11 @@ _sup_capacity_notify_machine() {  # <class> [quota_alerts_on] [wall_state] -> tr
 _sup_prompt_alert() {  # <name> <detail> [cause]
   local name="$1" detail="$2" cause="${3:-blocked-on-prompt}" msg
   if [[ "$cause" == "dangerous-confirm" ]]; then
-    msg="[FLEET-HEALTH blocked-on-prompt] agent '${name}' is UP and REACHABLE and is WAITING ON A KEYPRESS: ${detail}. This is claude's built-in tool-permission confirm (it fires even under bypassPermissions and is not an AskUserQuestion, so no hook sees it). The watchdog answers this one itself by pressing Escape — the safe option — so you are reading this because the keypress could not be sent, automatic actions are off, or the seat has stood on a confirm repeatedly inside one hour, which means the model keeps re-issuing a flagged command and a keypress is not the fix. Read the pane (tmux attach -t agent-${name})."
+    # DIVE-5844: this page is only ever sent for a confirm that OUTLASTED the
+    # ${_SUP_T_CONFIRM_DWELL_MIN}m decline window — one that went away on its
+    # own inside it was held (audited, counted, never sent). So the text says
+    # the seat STOOD on it, and the detail says whether the Escape landed.
+    msg="[FLEET-HEALTH blocked-on-prompt] agent '${name}' is UP and REACHABLE and STOOD ON A TOOL-PERMISSION CONFIRM for ${_SUP_T_CONFIRM_DWELL_MIN}m+ with no transcript progress: ${detail}. This is claude's built-in confirm (it fires even under bypassPermissions and is not an AskUserQuestion, so no hook sees it). A confirm that clears itself inside ${_SUP_T_CONFIRM_DWELL_MIN}m never pages; this one did not clear, so the watchdog pressed Escape — the safe option, the flagged command did NOT run — unless the detail says the keypress could not be sent or automatic actions are off. If it says the seat keeps re-issuing a flagged command, a keypress is not the fix. Read the pane (tmux attach -t agent-${name})."
   else
     msg="[FLEET-HEALTH blocked-on-prompt] agent '${name}' is UP and REACHABLE and is WAITING ON A KEYPRESS: ${detail}. It called AskUserQuestion or ExitPlanMode and the picker is rendering into a tmux pane nobody is reading; the seat will sit there until someone answers it. The highlighted option is NOT marked (Recommended), so this watchdog will not choose for it. Read the pane (tmux attach -t agent-${name}), pick the option, and if the choice genuinely needed a person it belongs on a task gate, not a picker."
   fi
@@ -2765,8 +2772,9 @@ _sup_agent_record() {
       # tick it stands is a tick the seat is parked for nothing.
       limit-picker:*) ;;
       # DIVE-4536: the DWELL is applied HERE, where the transcript clock lives,
-      # and it gates the KEYSTROKE only — the class, the alert and the audited
-      # event all fire on the first tick that sees the confirm. act_age is
+      # and it gates the KEYSTROKE and (DIVE-5844) the PAGE — the class and the
+      # audited event fire on the first tick that sees the confirm, the page
+      # only once it has outlasted the window. act_age is
       # computed a few lines above; -1 means the transcript mtime was
       # unreadable, and an unknown age never presses a key (the same
       # false-negative bias every threshold in this file carries).
@@ -3744,6 +3752,8 @@ cmd_supervisor_tick() {
   _SUP_ALERTS_UNDELIVERABLE=0
   # DIVE-4666: same per-tick reset, same reason.
   _SUP_ALERTS_QUIETED=0
+  # DIVE-5844: same again.
+  _SUP_PROMPT_PAGES_HELD=0
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     # DIVE-3272: the same always-live, deduped alert path carries the capacity
@@ -3774,6 +3784,26 @@ cmd_supervisor_tick() {
     # page below, which is the whole point of the row: a person chooses.
     if [[ "$cls" == "blocked-on-prompt" ]]; then
       local prompt_mark_s; prompt_mark_s=$(jq -r '.signals.promptMark // ""' <<<"$row")
+      # DIVE-5844: a confirm seen INSIDE its decline window is HELD, not paged.
+      # claude's own confirm times itself out (the 2026-10-08 03:43Z page about
+      # main fired for one that had cleared a minute later, before anyone read
+      # it), so first sight is not evidence that anything is stuck — standing
+      # past the window is, and that tick (mark `confirm`, below) is the one
+      # that pages. Held is not absent: the audited row is written (DIVE-4052 —
+      # muting a page must never cost the record) under its own event, so the
+      # per-class dedup below, which counts event='alert', does not let a held
+      # sighting swallow the page a confirm that sticks still owes; and the
+      # held page is COUNTED on the tick summary and the heartbeat row, the
+      # DIVE-4666 shape, so "held" never reads the same as "never saw it".
+      if [[ "$prompt_mark_s" == "confirm-fresh" ]]; then
+        _SUP_PROMPT_PAGES_HELD=$(( _SUP_PROMPT_PAGES_HELD + 1 ))
+        db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+            VALUES ($(sqlq "$name"), 'alert-held', 'blocked-on-prompt', 'dangerous-confirm', $(sqlq "$row"));" 2>/dev/null \
+          && events=$((events + 1)) \
+          || warn "supervisor: alert-held insert failed for $name"
+        warn "supervisor: HELD ${name} — blocked-on-prompt: tool-permission confirm seen this tick; pages only if it is still standing after ${_SUP_T_CONFIRM_DWELL_MIN}m"
+        continue
+      fi
       # DIVE-4536: the declinable confirm, handled before the answerable picker
       # because the two marks are disjoint and this one must never reach a
       # branch whose remedy is Enter. Not deduped, for the same reason
@@ -3801,14 +3831,24 @@ cmd_supervisor_tick() {
           # THIRD one inside the window stops being quiet and falls through to
           # the page below. The audited row for THIS decline is already
           # inserted, so the count includes it.
+          #
+          # DIVE-5844: a declined confirm no longer ends the row quietly. The
+          # page that used to fire on FIRST SIGHT is now held until the confirm
+          # outlasts the window, and this is that tick — so it falls through to
+          # the page (once per alert window, the dedup below) whether or not
+          # the Escape landed. A sticky confirm pages exactly once, as before;
+          # a transient one never does.
           local recent_dec
           recent_dec=$(db "SELECT COUNT(*) FROM supervisor_events
                            WHERE agent=$(sqlq "$name") AND event='action'
                              AND cause='dangerous-confirm'
                              AND ts >= datetime('now', '-1 hours');" 2>/dev/null || echo 0)
           [[ "$recent_dec" =~ ^[0-9]+$ ]] || recent_dec=0
-          if (( recent_dec < 3 )); then continue; fi
-          excerpt="${excerpt}; DECLINED ${recent_dec}x in the last hour — this seat keeps re-issuing a flagged command and a keypress is not the fix"
+          if (( recent_dec < 3 )); then
+            excerpt="${excerpt}; outlasted the ${_SUP_T_CONFIRM_DWELL_MIN}m window — DECLINED (Escape), the seat is free again"
+          else
+            excerpt="${excerpt}; DECLINED ${recent_dec}x in the last hour — this seat keeps re-issuing a flagged command and a keypress is not the fix"
+          fi
         else
           excerpt="${excerpt}; auto-decline failed to reach the pane"
         fi
@@ -4231,10 +4271,12 @@ cmd_supervisor_tick() {
           --argjson ot "$other" --argjson ev "$events" \
           --argjson ua "${_SUP_ALERTS_UNDELIVERABLE:-0}" \
           --argjson qw "${_SUP_ALERTS_QUIETED:-0}" \
+          --argjson ph "${_SUP_PROMPT_PAGES_HELD:-0}" \
           '{total:$t, healthy:$h, slow:$sl, drift:$dr, stuck:$st, stalled:$sa,
             verifyChallenge:$vc, noOutput:$no, updatePending:$up,
             quotaExhausted:$qe, unprobed:$un, unclassified:$ot, anomalyRows:$ev,
-            alertsUndeliverable:$ua, capacityPagesWithheld:$qw}')
+            alertsUndeliverable:$ua, capacityPagesWithheld:$qw,
+            promptPagesHeld:$ph}')
   db "INSERT INTO supervisor_events (agent, event, classification, signals)
       VALUES ('(fleet)', 'heartbeat', $(sqlq "$fleet_class"), $(sqlq "$sig"));" \
     2>/dev/null && events=$((events + 1)) || warn "supervisor: heartbeat insert failed"
@@ -4258,18 +4300,22 @@ cmd_supervisor_tick() {
   local quiet_note=""
   (( ${_SUP_ALERTS_QUIETED:-0} > 0 )) \
     && quiet_note=" · ${_SUP_ALERTS_QUIETED} capacity page(s) withheld (seat on a known wall, reset still ahead)"
+  # DIVE-5844: same rule for a held confirm page.
+  (( ${_SUP_PROMPT_PAGES_HELD:-0} > 0 )) \
+    && quiet_note="${quiet_note} · ${_SUP_PROMPT_PAGES_HELD} prompt page(s) held (confirm seen inside its ${_SUP_T_CONFIRM_DWELL_MIN}m decline window)"
   # DIVE-3667: the four original buckets keep their exact position so anything
   # already parsing this line still parses; the rest appear only when non-zero,
   # so a clean fleet's line does not grow.
   local extra
   extra=$(_sup_rollup_extra "$stalled" "$nooutput" "$updpend" "$quota" "$other")
   ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${drift} drift / ${stuck} stuck${extra} · ${events} audit row(s)${act_note}${vchal_note}${undeliv_note}${quiet_note}" \
-     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), drift:($dr|tonumber), stuck:($st|tonumber), stalled:($sa|tonumber), noOutput:($no|tonumber), updatePending:($up|tonumber), quotaExhausted:($qe|tonumber), unclassified:($ot|tonumber), verifyChallenge:($vc|tonumber), alerted:($al|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber), alertsUndeliverable:($ua|tonumber), capacityPagesWithheld:($qw|tonumber)}' \
+     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), drift:($dr|tonumber), stuck:($st|tonumber), stalled:($sa|tonumber), noOutput:($no|tonumber), updatePending:($up|tonumber), quotaExhausted:($qe|tonumber), unclassified:($ot|tonumber), verifyChallenge:($vc|tonumber), alerted:($al|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber), alertsUndeliverable:($ua|tonumber), capacityPagesWithheld:($qw|tonumber), promptPagesHeld:($ph|tonumber)}' \
      --arg t "$total" --arg h "$healthy" --arg sl "$slow" --arg dr "$drift" --arg st "$stuck" --arg e "$events" \
      --arg sa "$stalled" --arg no "$nooutput" --arg up "$updpend" --arg qe "$quota" --arg ot "$other" \
      --arg vc "$vchal" --arg al "$alerted" \
      --arg ae "$actions_on" --arg ac "$acted" --arg pl "$planned" --arg es "$escalated" \
-     --arg ua "${_SUP_ALERTS_UNDELIVERABLE:-0}" --arg qw "${_SUP_ALERTS_QUIETED:-0}"
+     --arg ua "${_SUP_ALERTS_UNDELIVERABLE:-0}" --arg qw "${_SUP_ALERTS_QUIETED:-0}" \
+     --arg ph "${_SUP_PROMPT_PAGES_HELD:-0}"
 }
 
 cmd_supervisor() {
