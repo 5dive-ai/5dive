@@ -1233,6 +1233,13 @@ _sup_date_state() {  # <mon> <day> <hh> <mm> <a|p> <now_epoch> [utc]
     if (( bestd < 0 || dist < bestd )); then bestd="$dist"; best="$e"; fi
   done
   [[ -n "$best" ]] || { printf 'unknown\x1f\n'; return 0; }
+  # No weekly or session wall resets more than 7 days out, so a date further
+  # ahead than 8 days is not this wall's reset: it is a stale or quoted line
+  # (a fixture in a diff on screen, last year's banner read as next year's).
+  # Read as live it parked a row for months (quinn, DIVE-5837 it1: `resets Mar
+  # 1, 9am` read on 2026-10-08 -> wake 2027-03-01). `unknown` sends every
+  # consumer to its own fallback (+1h on the reclaim park).
+  (( best - now > 8 * 86400 )) && { printf 'unknown\x1f\n'; return 0; }
   if (( best > now )); then printf 'live\x1f%s\n' "$best"
   else printf 'lapsed\x1f%s\n' "$best"; fi
 }

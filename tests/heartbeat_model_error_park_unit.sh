@@ -300,6 +300,20 @@ IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "resets Jan 2, 9am (UTC)" "$
 [[ "$DL" == live && "$EP" == "$(date -u -d '2027-01-02 09:00' +%s)" ]] \
   && ok_t "C7c across New Year the nearest year wins (Jan 2 read on Dec 30 is next year)" \
   || bad_t "C7c year rollover" "state=$DL epoch=$EP"
+# The bound (quinn, DIVE-5837 it1): no weekly wall resets more than 7 days out,
+# so a dated reset further ahead than 8 days is unknown, never a months-long park.
+IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "You've hit your weekly limit · resets Mar 1, 9am (UTC)" "$NOW")"
+[[ "$DL" == unknown && -z "$EP" ]] \
+  && ok_t "C7d 'resets Mar 1, 9am (UTC)' read on 2026-10-08 is unknown, not live until 2027-03-01" \
+  || bad_t "C7d a far-dated reset was read as this wall's reset" "state=$DL epoch=$EP"
+IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "resets Oct 16, 2am (UTC)" "$NOW")"
+[[ "$DL" == live && "$EP" == "$(date -u -d '2026-10-16 02:00' +%s)" ]] \
+  && ok_t "C7e [control] a reset just under 8 days out (Oct 16, 2am) is still live" \
+  || bad_t "C7e the bound cut a real 7-day reset" "state=$DL epoch=$EP"
+IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "resets Oct 17, 4am (UTC)" "$NOW")"
+[[ "$DL" == unknown ]] \
+  && ok_t "C7f just over 8 days out (Oct 17, 4am) is unknown" \
+  || bad_t "C7f the bound let 8d+ through" "state=$DL epoch=$EP"
 
 # Rule (b) on the wall. maya is a claude seat; the reset is two days out from the
 # REAL clock, because the park arm reads the clock itself.
@@ -322,6 +336,17 @@ W8=$(db "SELECT CAST(ROUND((julianday(wake_at)-julianday('now'))*24) AS INTEGER)
 [[ "$(row "$T8")" == "blocked|parked|wake" && "$W8" == 1 ]] \
   && ok_t "C9 a wall that printed no reset parks +1h" \
   || bad_t "C9 no-reset wall" "row=$(row "$T8") hours=$W8"
+# A far-dated reset (quinn's probe pane, and this PR's own fixture as a grader
+# sees it in a diff) parks +1h, never months.
+for far in "You've hit your weekly limit · resets Mar 1, 9am (UTC)" "+WK1=\"You've hit your weekly limit · resets Mar 1, 4pm (UTC)\""; do
+  PANE=$'x\n  ⎿  '"$far"$'\n     '"$WK2"$'\n> '
+  T11=$(mk_idle_claimed maya)
+  read -r RC11 _ < <(_hb_reclaim maya 30)
+  W11=$(db "SELECT CAST(ROUND((julianday(wake_at)-julianday('now'))*24) AS INTEGER) FROM tasks WHERE id=${T11};")
+  [[ "$(row "$T11")" == "blocked|parked|wake" && "$W11" == 1 ]] \
+    && ok_t "C9b a far-dated reset parks +1h, not months: '$far'" \
+    || bad_t "C9b a far-dated reset parked past +1h" "row=$(row "$T11") hours=$W11 pane=[$far]"
+done
 # A wall whose reset already passed is scrollback, not a wall in force: requeue.
 PAST_D=$(date -u -d '-2 days' '+%b %-d')
 PANE=$'x\n  ⎿  You\'ve hit your weekly limit · resets '"$PAST_D"$', 4pm (UTC)\n     '"$WK2"$'\n> '
