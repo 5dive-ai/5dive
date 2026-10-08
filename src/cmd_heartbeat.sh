@@ -4371,7 +4371,7 @@ ${_q_sql}" 2>/dev/null || true)
       local _wpane _wline _wdl _wep _wwake
       _wpane=$(_hb_pane_capture "$name" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 15) || _wpane=""
       if [[ -n "$_wpane" ]] && _hb_pane_is_usage_limit "$_wpane"; then
-        _wline=$(grep -iE 'hit your [^·]*limit|usage limit reached|limit reached|reached your .* limit' <<<"$_wpane" | tail -n 1)
+        _wline=$(grep -iE 'hit your [^·]*limit|usage limit reached|limit reached|reached your .* limit' <<<"$_wpane" | tail -n 1) || _wline=""
         _wline=$(sed -E 's/^[[:space:][:punct:]●⎿⚠]*//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' <<<"${_wline:-usage limit}")
         _wdl=unknown; _wep=""
         if declare -F _sup_quota_deadline >/dev/null 2>&1; then
