@@ -134,6 +134,41 @@ as filer cmd_task_done "$T7" --result="x" >/dev/null
   && ok_t "self-close: no wake into your own pane, a reminder on stderr" \
   || bad_t "self-close behaved wrong" "sends=$(cat "$SENDS") err=$(cat "$TMP"/err)"
 
+# ── 9. the VERIFIER's close: a PASS lands through task verify's own raw write ───
+# quinn, DIVE-5852 iteration 1: a flagged row closed by `task verify --cmd=true`
+# went done with sends=0, and `task watch` then refused the closed row, so the
+# promise dropped silently. Every row with a verifier closes this way.
+: >"$SENDS"; : >"$OWNER"
+T9=$(add filer "graded thing" --assignee=maker --verifier=grader --tell-me)
+as grader cmd_task_verify "$T9" --cmd=true >/dev/null
+[[ "$(col "$T9" status)" == done ]] || bad_t "precondition: verify did not close $T9" "status=$(col "$T9" status) err=$(cat "$TMP"/err)"
+[[ "$(sends)" == 1 ]] && grep -q "^filer|.*${T9} is done (closed by grader)" "$SENDS" \
+  && ok_t "a verifier's task verify close wakes the filer exactly once" \
+  || bad_t "task verify close did not wake the filer once" "sends=$(sends): $(cat "$SENDS") err=$(cat "$TMP"/err)"
+: >"$SENDS"
+T9b=$(add filer "graded routine" --assignee=maker --verifier=grader)
+as grader cmd_task_verify "$T9b" --cmd=true >/dev/null
+[[ "$(col "$T9b" status)" == done && "$(sends)" == 0 && "$(owner_msgs)" == 0 ]] \
+  && ok_t "NEGATIVE CONTROL: an unflagged verify close wakes nobody" \
+  || bad_t "an unflagged verify close sent something" "status=$(col "$T9b" status) sends=$(cat "$SENDS") owner=$(cat "$OWNER")"
+
+# ── 10. a loop GATE step answered "Approve →" closes by answer.sh's raw write ───
+: >"$SENDS"
+LR=$(add filer "loop run" --assignee=main --no-verify)
+LP=$(add filer "loop work" --assignee=maker --no-verify)
+LG=$(add filer "loop gate" --assignee=gatekeeper --no-verify)
+db "UPDATE tasks SET body='[[5dive-loop:run]]' WHERE ident=$(sqlq "$LR");
+    UPDATE tasks SET parent_id=(SELECT id FROM tasks WHERE ident=$(sqlq "$LR")), body='[[5dive-loop:work]]',
+      status='done', done_at=datetime('now') WHERE ident=$(sqlq "$LP");
+    UPDATE tasks SET parent_id=(SELECT id FROM tasks WHERE ident=$(sqlq "$LR")), body='[[5dive-loop:gate:decision]]',
+      status='blocked', need_type='decision', ask='approve or redo?', tier=1, need_asked_at=datetime('now'),
+      tell_me_by='filer' WHERE ident=$(sqlq "$LG");"
+as gatekeeper cmd_task_answer "$LG" --value="Approve →" >/dev/null
+[[ "$(col "$LG" status)" == done ]] || bad_t "precondition: the gate step did not close" "status=$(col "$LG" status) err=$(cat "$TMP"/err)"
+grep -q "^filer|.*${LG} is done" "$SENDS" && [[ "$(grep -c "^filer|.*${LG} is" "$SENDS")" == 1 ]] \
+  && ok_t "a loop gate step closed by its answer wakes the filer once" \
+  || bad_t "gate-step close did not wake the filer once" "sends=$(cat "$SENDS") err=$(cat "$TMP"/err)"
+
 # ── 8. surface: help line, and the column reaches existing stores ───────────────
 _task_usage | grep -q -- "--tell-me" && _task_usage | grep -q "watch <id>" \
   && ok_t "task --help documents --tell-me and watch" || bad_t "help line missing"
