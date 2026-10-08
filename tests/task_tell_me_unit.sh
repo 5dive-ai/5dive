@@ -170,10 +170,12 @@ grep -q "^filer|.*${LG} is done" "$SENDS" && [[ "$(grep -c "^filer|.*${LG} is" "
   || bad_t "gate-step close did not wake the filer once" "sends=$(cat "$SENDS") err=$(cat "$TMP"/err)"
 
 # ── 8. surface: help line, and the column reaches existing stores ───────────────
-_task_usage | grep -q -- "--tell-me" && _task_usage | grep -q "watch <id>" \
+# Captured first, then grepped from a here-string: no writer process to SIGPIPE
+# (DIVE-4811, tests/epipe_corpus_guard_unit.sh ratchets `… | grep -q`).
+_usage=$(_task_usage); _cols=$(printf '%s\n' "${_TASKS_ADDITIVE_COLUMNS[@]}")
+grep -q -- "--tell-me" <<<"$_usage" && grep -q "watch <id>" <<<"$_usage" \
   && ok_t "task --help documents --tell-me and watch" || bad_t "help line missing"
-printf '%s\n' "${_TASKS_ADDITIVE_COLUMNS[@]}" | grep -qx 'tell_me_by TEXT' \
-  && printf '%s\n' "${_TASKS_ADDITIVE_COLUMNS[@]}" | grep -qx 'told_at TEXT' \
+grep -qx 'tell_me_by TEXT' <<<"$_cols" && grep -qx 'told_at TEXT' <<<"$_cols" \
   && ok_t "tell_me_by/told_at are additive columns (migrated onto existing boards)" \
   || bad_t "columns missing from _TASKS_ADDITIVE_COLUMNS — existing boards would fail 'no such column'"
 
