@@ -1974,7 +1974,10 @@ _hb_clear_done_shells() {
 # which the supervisor's deadline parser has always read and which the action
 # arm here nonetheless did not match, so `⚠ Usage limit reached · continuing
 # automatically at 4pm` failed the two-signature test on its second line.
-_HB_RESET_TIME_RE='resets? (at |in )|resets? [0-9]{1,2}([:.][0-9]{2})? ?[ap]\.?m|continuing automatically at '
+# DIVE-5837 added the DATED form the weekly wall prints, `resets Oct 9, 4pm`:
+# with only the clock forms, `You've hit your weekly limit · resets Oct 9, 4pm
+# (UTC)` matched the header and no action line, so a walled seat read as idle.
+_HB_RESET_TIME_RE='resets? (at |in )|resets? [0-9]{1,2}([:.][0-9]{2})? ?[ap]\.?m|resets? [a-z]{3}[a-z]*\.? [0-9]{1,2},? (at )?[0-9]{1,2}([:.][0-9]{2})? ?[ap]\.?m|continuing automatically at '
 
 _hb_pane_is_usage_limit() {
   local pane="$1"
@@ -2005,7 +2008,9 @@ _hb_pane_is_usage_limit() {
   # pattern matched the same line -- two instruments disagreeing about one pane.
   # Two-signature discipline is unchanged: this is still the action arm, and a
   # header line alone still does not match (asserted in tests/heartbeat_codex_wall_unit.sh).
-  grep -qiE "upgrade your plan|upgrade to pro|wait for .*limit to reset|limit will reset|${_HB_RESET_TIME_RE}" <<<"$pane" || return 1
+  # DIVE-5837 added `/upgrade to increase your usage limit`, the second line of
+  # Claude Code's weekly wall; the header line above it carries the dated reset.
+  grep -qiE "upgrade your plan|upgrade to pro|/upgrade to increase your usage limit|wait for .*limit to reset|limit will reset|${_HB_RESET_TIME_RE}" <<<"$pane" || return 1
   return 0
 }
 
@@ -4351,6 +4356,38 @@ ${_q_sql}" 2>/dev/null || true)
       if _qpark=$(_hb_quota_parked "$name" "$everyMin"); then
         _hb_log "[$name] $(_hb_ident "$id") reads idle ${age_min}m but the supervisor classifies this seat (or a peer on its auth profile) quota-exhausted — claim PARKED, not reclaimed (~${_qpark}m of park left, DIVE-4104/DIVE-4206)"
         continue
+      fi
+      # DIVE-5837 — THE SEAT'S OWN SCREEN SAYS IT IS WALLED. The park above reads
+      # only the newest supervisor_events row, and a box that never schedules
+      # `supervisor --tick` has a weeks-old one, so a seat on `You've hit your
+      # weekly limit · resets Oct 9, 4pm (UTC)` fell through to the requeue below:
+      # measured on a customer box 2026-10-07/08, 40 wake/requeue cycles in 24h,
+      # every turn refused in ~0.5s, and DIVE-3218 escalating the row with a note
+      # that each wake "decided not to start it". Park the row until the reset the
+      # wall printed (+1h when it printed none) with the banner as the reason; a
+      # parked row is not nudged, so the false nudge note is never written. Read
+      # on the pane TAIL only, so a wall that scrolled up behind real work does
+      # not count, and a reset already in the past is not a wall in force.
+      local _wpane _wline _wdl _wep _wwake
+      _wpane=$(_hb_pane_capture "$name" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 15) || _wpane=""
+      if [[ -n "$_wpane" ]] && _hb_pane_is_usage_limit "$_wpane"; then
+        _wline=$(grep -iE 'hit your [^·]*limit|usage limit reached|limit reached|reached your .* limit' <<<"$_wpane" | tail -n 1) || _wline=""
+        _wline=$(sed -E 's/^[[:space:][:punct:]●⎿⚠]*//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' <<<"${_wline:-usage limit}")
+        _wdl=unknown; _wep=""
+        if declare -F _sup_quota_deadline >/dev/null 2>&1; then
+          IFS=$'\x1f' read -r _wdl _wep <<<"$(_sup_quota_deadline "$_wpane")"
+        fi
+        if [[ "$_wdl" != lapsed ]]; then
+          _wwake="+1h"
+          if [[ "$_wdl" == live && "$_wep" =~ ^[0-9]+$ ]]; then
+            _wwake=$(date -u -d "@${_wep}" '+%Y-%m-%d %H:%M' 2>/dev/null) || _wwake="+1h"
+          fi
+          if ( cmd_task_park "$id" --reason="usage limit on ${name}: idle ${age_min}m, last turn ended on \"${_wline:0:160}\" — resumes when the limit resets (DIVE-5837)" --wake="$_wwake" ) >/dev/null 2>&1; then
+            _hb_log "[$name] $(_hb_ident "$id") idle ${age_min}m on a usage wall (${_wline:0:160}) — PARKED until ${_wwake}, not requeued (DIVE-5837)"
+            reclaimed=$((reclaimed + 1)); continue
+          fi
+          _hb_log "[$name] WARN: $(_hb_ident "$id") idle on a usage wall but the park did not land — requeueing as before (DIVE-5837)"
+        fi
       fi
       # DIVE-5624 — AN IDLE SEAT WHOSE TURN ENDED ON A MODEL ERROR IS NOT
       # "WALKED AWAY", and requeueing it only re-nudges the seat into the same
@@ -8968,7 +9005,7 @@ _hb_quota_probe_classify() {
   local sentinel="${1:-$_HB_QUOTA_PROBE_SENTINEL}" out pat
   out=$(cat)
   [[ -n "${out//[[:space:]]/}" ]] || { printf 'unknown\n'; return 0; }
-  pat="${_SUP_QUOTA_PAT:-usage[[:space:]]+limit[[:space:]]+reached|hit[[:space:]]+your[[:space:]]+([^[:space:]]+[[:space:]]+)?((monthly|weekly|daily)[[:space:]]+spend|session|usage|5[[:space:]-]?hour)[[:space:]]+limit|quota[[:space:]]+exhausted|insufficient_quota}"
+  pat="${_SUP_QUOTA_PAT:-usage[[:space:]]+limit[[:space:]]+reached|hit[[:space:]]+your[[:space:]]+([^[:space:]]+[[:space:]]+)?((monthly|weekly|daily)([[:space:]]+spend)?|session|usage|5[[:space:]-]?hour)[[:space:]]+limit|quota[[:space:]]+exhausted|insufficient_quota}"
   grep -qiE "$pat" <<<"$out" 2>/dev/null && { printf 'walled\n'; return 0; }
   grep -qF "$sentinel" <<<"$out" 2>/dev/null && { printf 'live\n'; return 0; }
   printf 'unknown\n'

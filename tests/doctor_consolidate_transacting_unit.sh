@@ -78,6 +78,15 @@ printf '63\n' > "$DIR/alice.notx"
 assert_check "a seat past the threshold is an ERROR"       error "NOT TRANSACTING"
 assert_check "and the seat is named, with its streak"      error "alice \(63 passes\)"
 assert_check "and the message says retrying will not fix it" error "Retrying will not clear it"
+# DIVE-5837: the remedy is a command that RUNS (there is no top-level `5dive
+#    auth`) and, with one seat failing, it names that seat.
+assert_check "DIVE-5837 the remedy is agent auth status, filled with the one seat" error '`5dive agent auth status --agent=alice --probe`'
+row=$(run_check 4)
+if jq -e '.message | test("`5dive auth status") | not' <<<"$row" >/dev/null; then
+  ok_t "DIVE-5837 the remedy no longer names the non-existent '5dive auth status'"
+else
+  bad_t "DIVE-5837 the remedy no longer names the non-existent '5dive auth status'" "$row"
+fi
 
 # 4b. EXACTLY at the threshold. Iteration 1 shipped fixtures of 2, 63, 10 and a
 #     non-number — never 4 — so the comparison could be relaxed from `>=` to `>`
@@ -102,6 +111,8 @@ if jq -e '.message | test("alice") and test("bob")' <<<"$row" >/dev/null; then
 else
   bad_t "every failing seat is named, not just the first" "$row"
 fi
+# DIVE-5837: two seats, so the remedy keeps the placeholder instead of picking one.
+assert_check "DIVE-5837 with two seats the remedy says --agent=<seat>" error '`5dive agent auth status --agent=<seat> --probe`'
 
 # 7. CONTROL — the counter files are the ONLY input, so a cleared seat clears the
 #    check. Without this the error is sticky and an operator who fixed the box

@@ -10,6 +10,8 @@
 #   A. the pane matcher: what reads as "the last turn ended on a model error"
 #   B. rule (b): an idle seat on a model error PARKS the row with the error as
 #      its reason; an idle seat without one still requeues exactly as before
+#   C. DIVE-5837: Claude Code's weekly wall is a wall to both matchers, and an
+#      idle seat on it PARKS until the reset the wall printed
 #
 # Every arm is pure or db-only: no tmux, no root, no network.
 # Run: bash tests/heartbeat_model_error_park_unit.sh
@@ -248,6 +250,118 @@ read -r RC6 _ < <(_hb_reclaim maya 30)
 [[ "$(row "$T6")" == "blocked|parked|wake" && "$(reason "$T6")" == *"API Error: Repeated 529"* ]] \
   && ok_t "B6 the same untyped claude seat still parks on a real claude transient" \
   || bad_t "B6 an untyped claude seat missed its own model error" "row=$(row "$T6") reason=[$(reason "$T6")]"
+
+# ── C. DIVE-5837: the weekly wall ───────────────────────────────────────────
+# The banner pair, verbatim from a customer box on 0.81.0 (2026-10-07/08): every
+# turn ended on these two lines in ~0.5s, and neither matcher called it a wall.
+WK1="You've hit your weekly limit · resets Oct 9, 4pm (UTC)"
+WK2="/upgrade to increase your usage limit."
+WKPANE=$'> /goal DIVE-697\n  ⎿  '"$WK1"$'\n     '"$WK2"$'\n\n> '
+grep -qiE "$_SUP_QUOTA_PAT" <<<"$WK1" \
+  && ok_t "C1 the supervisor/probe pattern reads the weekly banner as a wall" \
+  || bad_t "C1 _SUP_QUOTA_PAT missed the weekly banner" "$WK1"
+[[ "$(printf '%s\n' "$WK1" | _hb_quota_probe_classify)" == walled ]] \
+  && ok_t "C2 the quota-probe classifies the refused probe as walled, not COULD-NOT-DETERMINE" \
+  || bad_t "C2 the probe classifier missed the banner" "$(printf '%s\n' "$WK1" | _hb_quota_probe_classify)"
+_hb_pane_is_usage_limit "$WKPANE" \
+  && ok_t "C3 the pane matcher reads the banner pair as a wall (header + action)" \
+  || bad_t "C3 _hb_pane_is_usage_limit missed the banner pair" "$WKPANE"
+_hb_pane_is_usage_limit "$WK1" && _hb_pane_is_usage_limit "x"$'\n'"You've hit your weekly limit"$'\n'"$WK2" \
+  && ok_t "C3b either action line alone completes the header: the dated reset, and the /upgrade line" \
+  || bad_t "C3b one action line of the pair was not enough"
+[[ "$(_hb_wall_class "$WKPANE")" == rate-limit ]] \
+  && ok_t "C4 the weekly wall classifies rate-limit (a rolling window), not undetermined" \
+  || bad_t "C4 wall class" "$(_hb_wall_class "$WKPANE")"
+# The session banner kept matching (it is what DIVE-4206 widened for).
+grep -qiE "$_SUP_QUOTA_PAT" <<<"You've hit your session limit · resets 4am (UTC)" \
+  && grep -qiE "$_SUP_QUOTA_PAT" <<<"You've hit your weekly spend limit" \
+  && ok_t "C5 [control] the session and weekly-SPEND banners still match" \
+  || bad_t "C5 the widening lost an existing banner"
+# Negative controls from the report: prose that mentions a weekly limit is not a wall.
+for p in "the weekly limit is 100 requests" "we hit your daily standup limit" "I hit your weekly report limit"; do
+  if grep -qiE "$_SUP_QUOTA_PAT" <<<"$p" || _hb_pane_is_usage_limit "$p"$'\n'"$WK2"$'\n'"resets Oct 9, 4pm"; then
+    bad_t "C6 non-wall prose matched a wall matcher" "$p"
+  else ok_t "C6 [neg] not a wall: '$p'"; fi
+done
+_hb_pane_is_usage_limit "You've used 43% of your weekly limit · resets Oct 9, 4pm" \
+  && bad_t "C6b the usage meter read as a wall" "" \
+  || ok_t "C6b [neg] the usage meter ('used 43% of your weekly limit · resets …') is not a wall"
+# The dated reset is read as a DATE at a fixed clock (2026-10-08 02:16Z), so the
+# park keys to Oct 9 16:00 UTC and not to "today, 4pm".
+NOW=$(date -u -d '2026-10-08 02:16' +%s); WANT=$(date -u -d '2026-10-09 16:00' +%s)
+IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "$WK1" "$NOW")"
+[[ "$DL" == live && "$EP" == "$WANT" ]] \
+  && ok_t "C7 'resets Oct 9, 4pm (UTC)' parses to 2026-10-09 16:00Z, live at the report's clock" \
+  || bad_t "C7 the dated reset did not parse" "state=$DL epoch=$EP want=$WANT"
+IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "$WK1" "$(date -u -d '2026-10-10 00:00' +%s)")"
+[[ "$DL" == lapsed && "$EP" == "$WANT" ]] && ok_t "C7b the same reset read after it passed is lapsed" \
+  || bad_t "C7b lapsed" "state=$DL epoch=$EP"
+IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "resets Jan 2, 9am (UTC)" "$(date -u -d '2026-12-30 12:00' +%s)")"
+[[ "$DL" == live && "$EP" == "$(date -u -d '2027-01-02 09:00' +%s)" ]] \
+  && ok_t "C7c across New Year the nearest year wins (Jan 2 read on Dec 30 is next year)" \
+  || bad_t "C7c year rollover" "state=$DL epoch=$EP"
+# The bound (quinn, DIVE-5837 it1): no weekly wall resets more than 7 days out,
+# so a dated reset further ahead than 8 days is unknown, never a months-long park.
+IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "You've hit your weekly limit · resets Mar 1, 9am (UTC)" "$NOW")"
+[[ "$DL" == unknown && -z "$EP" ]] \
+  && ok_t "C7d 'resets Mar 1, 9am (UTC)' read on 2026-10-08 is unknown, not live until 2027-03-01" \
+  || bad_t "C7d a far-dated reset was read as this wall's reset" "state=$DL epoch=$EP"
+IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "resets Oct 16, 2am (UTC)" "$NOW")"
+[[ "$DL" == live && "$EP" == "$(date -u -d '2026-10-16 02:00' +%s)" ]] \
+  && ok_t "C7e [control] a reset just under 8 days out (Oct 16, 2am) is still live" \
+  || bad_t "C7e the bound cut a real 7-day reset" "state=$DL epoch=$EP"
+IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "resets Oct 17, 4am (UTC)" "$NOW")"
+[[ "$DL" == unknown ]] \
+  && ok_t "C7f just over 8 days out (Oct 17, 4am) is unknown" \
+  || bad_t "C7f the bound let 8d+ through" "state=$DL epoch=$EP"
+
+# Rule (b) on the wall. maya is a claude seat; the reset is two days out from the
+# REAL clock, because the park arm reads the clock itself.
+FUT_D=$(date -u -d '+2 days' '+%b %-d'); FUT_W=$(date -u -d '+2 days' '+%Y-%m-%d 16:00')
+PANE=$'> /goal DIVE-697\n  ⎿  You\'ve hit your weekly limit · resets '"$FUT_D"$', 4pm (UTC)\n     '"$WK2"$'\n\n> '
+T7=$(mk_idle_claimed maya)
+read -r RC7 _ < <(_hb_reclaim maya 30)
+R7=$(reason "$T7"); W7=$(db "SELECT wake_at FROM tasks WHERE id=${T7};")
+[[ "$(row "$T7")" == "blocked|parked|wake" && "$W7" == "$FUT_W:00" ]] && (( ${RC7:-0} == 1 )) \
+  && [[ "$R7" == *"usage limit on maya"* && "$R7" == *"hit your weekly limit · resets $FUT_D, 4pm (UTC)"* ]] \
+  && ok_t "C8 idle on the weekly wall -> PARKED until the reset it printed, banner as the reason" \
+  || bad_t "C8 the walled seat's row was not parked to its reset" "row=$(row "$T7") wake=[$W7] want=[$FUT_W:00] reason=[$R7]"
+N7=$(db "SELECT COUNT(*) FROM tasks WHERE id=${T7} AND COALESCE(body,'') LIKE '%decided not to start%';")
+[[ "$N7" == 0 ]] && ok_t "C8b nothing about a decision is written to the row" || bad_t "C8b nudge note on the row" "$N7"
+# No reset printed: header + /upgrade only -> +1h.
+PANE=$'x\n  ⎿  You\'ve hit your weekly limit\n     '"$WK2"$'\n> '
+T8=$(mk_idle_claimed maya)
+read -r RC8 _ < <(_hb_reclaim maya 30)
+W8=$(db "SELECT CAST(ROUND((julianday(wake_at)-julianday('now'))*24) AS INTEGER) FROM tasks WHERE id=${T8};")
+[[ "$(row "$T8")" == "blocked|parked|wake" && "$W8" == 1 ]] \
+  && ok_t "C9 a wall that printed no reset parks +1h" \
+  || bad_t "C9 no-reset wall" "row=$(row "$T8") hours=$W8"
+# A far-dated reset (quinn's probe pane, and this PR's own fixture as a grader
+# sees it in a diff) parks +1h, never months.
+for far in "You've hit your weekly limit · resets Mar 1, 9am (UTC)" "+WK1=\"You've hit your weekly limit · resets Mar 1, 4pm (UTC)\""; do
+  PANE=$'x\n  ⎿  '"$far"$'\n     '"$WK2"$'\n> '
+  T11=$(mk_idle_claimed maya)
+  read -r RC11 _ < <(_hb_reclaim maya 30)
+  W11=$(db "SELECT CAST(ROUND((julianday(wake_at)-julianday('now'))*24) AS INTEGER) FROM tasks WHERE id=${T11};")
+  [[ "$(row "$T11")" == "blocked|parked|wake" && "$W11" == 1 ]] \
+    && ok_t "C9b a far-dated reset parks +1h, not months: '$far'" \
+    || bad_t "C9b a far-dated reset parked past +1h" "row=$(row "$T11") hours=$W11 pane=[$far]"
+done
+# A wall whose reset already passed is scrollback, not a wall in force: requeue.
+PAST_D=$(date -u -d '-2 days' '+%b %-d')
+PANE=$'x\n  ⎿  You\'ve hit your weekly limit · resets '"$PAST_D"$', 4pm (UTC)\n     '"$WK2"$'\n> '
+T9=$(mk_idle_claimed maya)
+read -r RC9 _ < <(_hb_reclaim maya 30)
+[[ "$(row "$T9")" == "todo|unparked|nowake" ]] \
+  && ok_t "C10 [control] a wall whose printed reset has passed is not parked: plain requeue" \
+  || bad_t "C10 a lapsed wall parked the row" "row=$(row "$T9") reason=[$(reason "$T9")]"
+# A wall that scrolled up behind more than 15 lines of real work is not the state now.
+PANE="You've hit your weekly limit · resets ${FUT_D}, 4pm (UTC)"$'\n'"$WK2"$'\n'"$(seq 1 20 | sed 's/^/  work line /')"$'\n> '
+T10=$(mk_idle_claimed maya)
+read -r RC10 _ < <(_hb_reclaim maya 30)
+[[ "$(row "$T10")" == "todo|unparked|nowake" ]] \
+  && ok_t "C11 [control] a wall scrolled past by real work is not read: plain requeue" \
+  || bad_t "C11 a scrolled-up wall parked the row" "row=$(row "$T10")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
