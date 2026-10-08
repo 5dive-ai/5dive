@@ -38,7 +38,9 @@
 #                       + writes ONE file of FIXED shape (see _host_render_workdir_dropin)
 #   host unit revert    rm -f <that one fixed path> ; systemctl daemon-reload ;
 #                       systemctl restart <validated-unit>
-#   host journal        journalctl -u <validated-unit> -n <int> [--since "<int> <fixed word> ago"]
+#   host journal        journalctl [-u <validated-unit> | _COMM=<validated name>] [-n <int>]
+#                       [--since "<int> <fixed word> ago"], every line through the
+#                       secret mask; --grep is a fixed string matched in-process (awk index)
 #   host cron show      crontab -l -u <validated-user>
 #   host cron snapshot  crontab -l -u <validated-user>   (output stored under $STATE_DIR)
 #   host cron diff      diff -u <two CLI-owned files>
@@ -516,37 +518,162 @@ cmd_host_unit_revert() {
      --arg u "$unit" --arg p "$path" --arg e "$existed" --arg a "$after" --arg r "$restarted"
 }
 
+# --- journal: whole-log search, every line masked (DIVE-5842) ----------------
+#
+# DIVE-5805 took every seat out of systemd-journal, because that group reads
+# every secret that ever crossed a sudo line (`ENV=NAME=value`, `COMMAND=` argv).
+# An admin seat still has to diagnose the whole box, and it reaches root only
+# through this CLI. So the whole-journal read lives here, and NOTHING it prints
+# is unmasked: unit mode included, since an old leaked line is still on disk and
+# a `--unit` read of the right unit would hand it back in clear.
+#
+# Each rule is one sed substitution. The SAME list drives the printer and the
+# count (`--count-secrets`), so "what is masked" and "what is counted" cannot
+# drift apart. A rule never matches its own output (the value class excludes
+# `[`), so a line that already reads `TOKEN=[masked]` is not counted again.
+# Over-masking is the safe direction: the name rule is a SUBSTRING match, so a
+# `MONKEY=banana` loses its value and counts as one line. That is the price of
+# never missing a `GHTOKEN=` or an `OAUTHTOKEN=` that a segment match would skip.
+HOST_MASK_RULES=(
+  -e 's/sk-ant-[A-Za-z0-9_-]{8,}/sk-ant-[masked]/g'
+  -e 's/sk-or-[A-Za-z0-9_-]{8,}/sk-or-[masked]/g'
+  -e 's/github_pat_[A-Za-z0-9_]{20,}/github_pat_[masked]/g'
+  -e 's/(gh[pousr])_[A-Za-z0-9]{20,}/\1_[masked]/g'
+  -e 's/([0-9]{6,12}):[A-Za-z0-9_-]{35,}/\1:[masked]/g'
+  -e 's/([Bb]earer[[:space:]]+)[A-Za-z0-9._~+\/=-]{16,}/\1[masked]/g'
+  -e 's/(^|[^A-Za-z0-9_-])([A-Za-z0-9_-]*(TOKEN|KEY|SECRET|PASSWORD|PASSWD)[A-Za-z0-9_-]*)=[^][:space:];[][^[:space:];]*/\1\2=[masked]/gI'
+)
+
+# _host_mask_tagged — stdin -> stdout, every line masked and prefixed with
+# `1<TAB>` if any rule fired on it, else `0<TAB>`. One pass, one rule list; the
+# printer strips the tag, the count mode sums it. `t` is GNU sed's "a
+# substitution fired since this line was read", so the tag cannot disagree with
+# the masking it describes. LC_ALL=C: journal lines are bytes, not UTF-8.
+_host_mask_tagged() {
+  LC_ALL=C sed -E "${HOST_MASK_RULES[@]}" \
+    -e 't hit' -e 's/^/0\t/' -e 'b' -e ':hit' -e 's/^/1\t/'
+}
+
+# _host_mask_secrets — stdin -> stdout, masked, untagged. For any other printer.
+_host_mask_secrets() { _host_mask_tagged | LC_ALL=C cut -c3-; }
+
+# _host_validate_comm <name> — a process name for journalctl's `_COMM=` match.
+# The kernel's comm is at most 15 bytes. No leading '-' (an option), no '='
+# (a second match field), no '+' (journalctl's OR operator between matches).
+_host_validate_comm() {
+  local c="${1:-}"
+  [[ "$c" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,14}$ ]] \
+    || fail "$E_VALIDATION" "refusing --comm '$c': expected a process name (letters, digits, . _ -; at most 15)"
+  return 0
+}
+
+# _host_validate_grep <text> — a FIXED string, never a pattern. It is not handed
+# to journalctl (whose -g is a PCRE) and not to grep: awk's index() reads it from
+# the environment, so no byte of it is parsed as regex, option or escape.
+# Control bytes are refused so a newline cannot split it into two needles.
+_host_validate_grep() {
+  local g="${1:-}"
+  [[ -n "$g" ]] || fail "$E_VALIDATION" "refusing an empty --grep"
+  (( ${#g} <= 256 )) || fail "$E_VALIDATION" "refusing --grep: longer than 256 characters"
+  if [[ "$g" =~ [[:cntrl:]] ]]; then
+    fail "$E_VALIDATION" "refusing --grep: control characters (a newline, a tab) are not accepted"
+  fi
+  return 0
+}
+
+# _host_journal_filter <needle> <lines|""> <mode: print|count|json>
+# stdin is the raw journal; this is the whole post-processing path.
+#
+# The needle is matched AFTER masking, on purpose. Matching the raw text and
+# printing it masked would make --grep an oracle: grep `sk-ant-api03-a`, then
+# `-ab`, and the hit count spells the key out one character at a time.
+_host_journal_filter() {
+  local needle="$1" lines="$2" mode="$3"
+  _host_mask_tagged \
+    | if [[ -n "$needle" ]]; then
+        HOST_NEEDLE="$needle" LC_ALL=C awk 'index(substr($0, 3), ENVIRON["HOST_NEEDLE"]) > 0'
+      else
+        cat
+      fi \
+    | if [[ -n "$lines" ]]; then tail -n "$lines"; else cat; fi \
+    | case "$mode" in
+        count) LC_ALL=C awk 'substr($0, 1, 1) == "1" { n++ } END { print n + 0 }' ;;
+        *)     LC_ALL=C cut -c3- ;;
+      esac
+}
+
 cmd_host_journal() {
   require_root "host journal"
-  local unit="" lines="200" since=""
+  local usage="usage: 5dive host journal (--unit=<unit> | --comm=<process> | --grep=<text>)... [--lines=N] [--since=<N>m|<N>h|<N>d] [--count-secrets]"
+  local unit="" comm="" needle="" lines="" since="" count=0 have_grep=0
   while (( $# )); do
     case "$1" in
       --unit=*)  unit="${1#*=}" ;;
+      --comm=*)  comm="${1#*=}" ;;
+      --grep=*)  needle="${1#*=}"; have_grep=1 ;;
       --lines=*) lines="${1#*=}" ;;
       --since=*) since="${1#*=}" ;;
+      --count-secrets) count=1 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
-      *)  fail "$E_USAGE" "usage: 5dive host journal --unit=<unit> [--lines=N] [--since=<N>m|<N>h|<N>d]" ;;
+      *)  fail "$E_USAGE" "$usage" ;;
     esac
     shift
   done
-  _host_validate_unit "$unit" any
-  _host_validate_lines "$lines"
+  [[ -n "$unit" || -n "$comm" || $have_grep -eq 1 ]] \
+    || fail "$E_USAGE" "$usage (name at least one of --unit, --comm, --grep)"
+  [[ -n "$unit" && -n "$comm" ]] \
+    && fail "$E_USAGE" "--unit and --comm are two selectors; pick one (--grep combines with either)"
+  [[ -n "$unit" ]] && _host_validate_unit "$unit" any
+  [[ -n "$comm" ]] && _host_validate_comm "$comm"
+  (( have_grep )) && _host_validate_grep "$needle"
+  # --lines: the default 200 caps a READ. A count is a retest ("did any secret
+  # line land since the update?"), so it covers the whole window unless the
+  # caller bounds it explicitly.
+  if [[ -n "$lines" ]]; then
+    _host_validate_lines "$lines"
+  elif (( ! count )); then
+    lines=200
+  fi
+  # A search reads the window, not the last N lines (the needle is applied after
+  # journalctl, so `-n` there would cut before the match). An unbounded window is
+  # the whole journal, so a search or a count with no --since reads one day.
+  if [[ -z "$since" ]] && (( have_grep || count )); then
+    since="1d"
+  fi
   # NOTE the explicit `||`: _host_since_phrase's refusal is a `fail`, which exits
   # the COMMAND SUBSTITUTION's subshell, not this one. Relying on errexit to
   # notice would be relying on an assignment's exit-status subtlety to enforce a
   # security boundary; the refusal is re-raised here in the caller's own shell.
-  local -a since_args=()
+  local -a jargs=()
   if [[ -n "$since" ]]; then
     local phrase
     phrase=$(_host_since_phrase "$since") \
       || fail "$E_VALIDATION" "refusing --since '$since': expected <N>m, <N>h or <N>d (free-form journalctl time strings are not accepted)"
-    since_args=(--since "$phrase")
+    jargs+=(--since "$phrase")
   fi
+  [[ -n "$unit" ]] && jargs+=(-u "$unit")
+  [[ -n "$comm" ]] && jargs+=("_COMM=$comm")
+  if [[ -n "$lines" ]] && (( ! have_grep )); then
+    jargs+=(-n "$lines")
+  fi
+
+  if (( count )); then
+    local n
+    n=$(_host_journalctl "${jargs[@]}" 2>&1 | _host_journal_filter "$needle" "$lines" count) || true
+    if (( JSON_MODE )); then
+      ok "" '{unit:$u, comm:$c, grep:$g, since:$s, secret_lines:($n|tonumber)}' \
+         --arg u "$unit" --arg c "$comm" --arg g "$needle" --arg s "$since" --arg n "${n:-0}"
+    else
+      printf '%s\n' "${n:-0}"
+    fi
+    return 0
+  fi
+
   local out
-  out=$(_host_journalctl -u "$unit" -n "$lines" ${since_args[@]+"${since_args[@]}"} 2>&1) || true
+  out=$(_host_journalctl "${jargs[@]}" 2>&1 | _host_journal_filter "$needle" "$lines" print) || true
   if (( JSON_MODE )); then
-    ok "" '{unit:$u, lines:($l|tonumber), since:$s, log:$o}' \
-       --arg u "$unit" --arg l "$lines" --arg s "$since" --arg o "$out"
+    ok "" '{unit:$u, comm:$c, grep:$g, lines:($l|tonumber), since:$s, log:$o}' \
+       --arg u "$unit" --arg c "$comm" --arg g "$needle" --arg l "$lines" --arg s "$since" --arg o "$out"
   else
     printf '%s\n' "$out"
   fi
