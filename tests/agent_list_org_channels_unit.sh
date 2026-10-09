@@ -22,6 +22,8 @@ mkdir -p "$TMP/profiles" "$TMP/connectors" "$TMP/sudoers" "$E"
 remote() { mkdir -p "$H/agent-$1/.claude"; printf '%s\n' "$2" >"$H/agent-$1/.claude/remote-settings.json"; }
 TG='{"marketplace":"5dive-plugins","plugin":"telegram"}'
 DB='{"marketplace":"5dive-plugins","plugin":"dashboard"}'
+BZ='{"marketplace":"5dive-plugins","plugin":"buzz"}'
+UP='{"marketplace":"claude-plugins-official","plugin":"telegram"}'
 mkdir -p "$H/agent-nofile/.claude"
 remote personal '{}'
 remote allowed "{\"allowedChannelPlugins\":[$TG,$DB]}"
@@ -59,10 +61,10 @@ flag() { jq -c --arg n "$1" '.[] | select(.name==$n) | .orgBlocksChannels' <<<"$
 [[ "$(flag nofile)" == null ]] && okk 'no remote-settings.json: no flag' || bad "nofile: $(flag nofile)"
 [[ "$(flag personal)" == null ]] && okk 'a personal account ({}): no flag' || bad "personal: $(flag personal)"
 [[ "$(flag allowed)" == null ]] && okk 'an org list that includes dashboard: no flag' || bad "allowed: $(flag allowed)"
-[[ "$(flag mp)" == '["dashboard","buzz"]' ]] && okk 'an org list without dashboard flags dashboard and buzz, not the allowed telegram' || bad "mp: $(flag mp)"
-[[ "$(flag off)" == '["telegram","dashboard"]' ]] && okk 'channelsEnabled false flags every channel the seat has' || bad "off: $(flag off)"
+[[ "$(flag mp)" == "[$DB,$BZ]" ]] && okk 'an org list without dashboard flags dashboard and buzz, not the allowed telegram' || bad "mp: $(flag mp)"
+[[ "$(flag off)" == "[$TG,$DB]" ]] && okk 'channelsEnabled false flags every channel the seat has' || bad "off: $(flag off)"
 [[ "$(flag tgonly)" == null ]] && okk 'a telegram seat on our marketplace with telegram allowed: no flag' || bad "tgonly: $(flag tgonly)"
-[[ "$(flag upstream)" == '["telegram"]' ]] && okk 'a telegram seat on the upstream marketplace is matched by marketplace too' || bad "upstream: $(flag upstream)"
+[[ "$(flag upstream)" == "[$UP]" ]] && okk 'a telegram seat on the upstream marketplace is flagged with THAT marketplace, the entry the admin must add' || bad "upstream: $(flag upstream)"
 [[ "$(flag nochan)" == null ]] && okk 'a seat with no channels: no flag' || bad "nochan: $(flag nochan)"
 [[ "$(flag codex)" == null ]] && okk 'a non-claude seat: no flag' || bad "codex: $(flag codex)"
 [[ "$(flag garbled)" == null ]] && okk 'an unreadable policy is no evidence: no flag' || bad "garbled: $(flag garbled)"

@@ -1038,7 +1038,8 @@ def avatar_info(name):
 # org's server-managed settings at ~/.claude/remote-settings.json (0600 to the
 # seat, so only the root read sees it), and that list wins over the box's own
 # managed-settings.json. Returns the seat's own channel plugins the policy
-# leaves out, or None. A personal account caches {} and a missing or garbled
+# leaves out, each as {"marketplace","plugin"} (the exact entry the admin must
+# add: a pre-fork telegram seat runs the upstream plugin), or None. A personal account caches {} and a missing or garbled
 # file is no evidence, so neither is ever flagged: that is the "never shown to
 # normal accounts" rule. Plugin names mirror 5dive-agent-start's --channels.
 AGENT_ENV_DIR = os.environ.get("AGENT_ENV_DIR") or "/var/lib/5dive/agents.d"
@@ -1075,7 +1076,7 @@ def org_blocked_channels(name, agent_type, channels):
         blocked = [p for p in plugins if p not in allowed]
     else:
         return None
-    return [plugin for _, plugin in blocked] or None
+    return [{"marketplace": market, "plugin": plugin} for market, plugin in blocked] or None
 
 def iso_time(epoch):
     if epoch is None:
