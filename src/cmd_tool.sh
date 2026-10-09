@@ -520,7 +520,7 @@ _tool_google_poll_install() {
     _tg_meta "$dir" '.state = "error" | .error = "failed to start the Google sign-in"'
     return 0
   fi
-  [[ -s "${dir}/install.log" ]] && last=$(grep -v '^[[:space:]]*$' "${dir}/install.log" | tail -1 | cut -c1-300)
+  [[ -s "${dir}/install.log" ]] && last=$(grep -v '^[[:space:]]*$' "${dir}/install.log" | tail -1 | cut -c1-300) || last=""
   _tg_meta "$dir" '.state = "error" | .error = $e' \
     --arg e "the Google Cloud CLI did not install (exit ${rc:-?})${last:+: $last}"
   return 0
