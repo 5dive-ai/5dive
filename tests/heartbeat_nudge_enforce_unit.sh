@@ -577,6 +577,21 @@ _hb_nudge_enforce dev 26 DIVE-9026 16 >/dev/null 2>&1
   && ok_t "the hold is RUNG 2 ONLY — rung 1 still escalates and writes its note for a busy seat" \
   || bad_t "rung 1 is unaffected by the seat-advance hold" "esc=[$(col 26 nudge_escalated_at)] notes=[$(notes 26)]"
 
+# 12i — DIVE-5896. A recurring TEMPLATE on the same seat is not seat work. The
+# scheduler stamps last_skipped_at on the stalled instance's template every
+# morning ("open instance"), tasks_touch_au turns that into updated_at, and the
+# template held rung 2 for 39 nudges on a customer box with a walled seat.
+mk_row 31 'DIVE-9031' high 32
+stamp_rung1 31 16
+busy creative; busy dev2; busy main
+db "INSERT INTO tasks (ident,title,status,kind,schedule,assignee,created_at,updated_at,last_skipped_at)
+    VALUES ('DIVE-9031-tpl','the daily template of DIVE-9031','todo','recurring','0 6 * * *','dev',
+            datetime('now','-30 days'),datetime('now'),datetime('now'));"
+_hb_nudge_enforce dev 31 DIVE-9031 32 >/dev/null 2>&1
+[[ "$(held 31)" == "0" ]] \
+  && ok_t "a recurring TEMPLATE whose skip stamp moved updated_at past rung 1 does not hold rung 2 — rung 2 acts" \
+  || bad_t "a recurring template held rung 2" "status=[$(col 31 status)] parked=[$(col 31 nudge_parked_at)] assignee=[$(col 31 assignee)]"
+
 # 12h — WIRING, same posture as arm 11: the helper existing proves nothing about
 # rung 2 consulting it. Assert the call sits inside rung 2 and AFTER the gate
 # hold, so the two holds cannot be reordered into one that shadows the other.

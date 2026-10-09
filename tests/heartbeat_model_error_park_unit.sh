@@ -12,6 +12,8 @@
 #      its reason; an idle seat without one still requeues exactly as before
 #   C. DIVE-5837: Claude Code's weekly wall is a wall to both matchers, and an
 #      idle seat on it PARKS until the reset the wall printed
+#   D. DIVE-5896: a clock-only reset resolves FORWARD from the claim, a dated
+#      reset beats the `continuing automatically` line, and a skip logs why
 #
 # Every arm is pure or db-only: no tmux, no root, no network.
 # Run: bash tests/heartbeat_model_error_park_unit.sh
@@ -362,6 +364,68 @@ read -r RC10 _ < <(_hb_reclaim maya 30)
 [[ "$(row "$T10")" == "todo|unparked|nowake" ]] \
   && ok_t "C11 [control] a wall scrolled past by real work is not read: plain requeue" \
   || bad_t "C11 a scrolled-up wall parked the row" "row=$(row "$T10")"
+
+# ── D. DIVE-5896: a clock-only reset more than 12h out, and the silent skip ──
+# The pane from the 0.83.0 retest (customer box, 2026-10-09). The banner prints a
+# CLOCK, not a date; the reclaim ran at 01:11Z, 24m after the claim, and the reset
+# is 16:00Z that day. Read nearest-day it was yesterday's 4pm (`lapsed`) and the
+# park never fired; anchored on the claim it is today's 4pm.
+export TZ=UTC
+CK1="You've hit your weekly limit · resets 4pm (UTC)"
+CK2="Usage limit reached · continuing automatically at 4pm"
+RESET=$(date -u -d '2026-10-09 16:00' +%s)
+for hm in 01:11 10:00 15:59; do
+  NOW=$(date -u -d "2026-10-09 $hm" +%s); ANC=$(( NOW - 24 * 60 ))
+  for pane in "$CK1"$'\n'"$CK2" "$CK1" "$CK2"; do
+    IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "$pane" "$NOW" "$ANC")"
+    [[ "$DL" == live && "$EP" == "$RESET" ]] \
+      && ok_t "D1 clock-only reset at ${hm}Z, claimed 24m earlier -> live until 16:00Z that day [$(tr '\n' '|' <<<"$pane")]" \
+      || bad_t "D1 clock-only reset at ${hm}Z did not resolve forward" "state=$DL epoch=$EP want=$RESET pane=[$pane]"
+  done
+done
+# A reset that passed since the claim is still lapsed: a stale banner still requeues.
+NOW=$(date -u -d '2026-10-09 16:20' +%s)
+IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "$CK1"$'\n'"$CK2" "$NOW" "$(( NOW - 24 * 60 ))")"
+[[ "$DL" == lapsed && "$EP" == "$RESET" ]] \
+  && ok_t "D2 [control] the reset passed since the claim (claimed 15:56Z, read 16:20Z) -> lapsed, not tomorrow" \
+  || bad_t "D2 a passed reset was rolled forward" "state=$DL epoch=$EP"
+# Callers with no anchor (the supervisor) keep the nearest-day reading.
+IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "$CK1" "$(date -u -d '2026-10-09 01:11' +%s)")"
+[[ "$DL" == lapsed && "$EP" == "$(date -u -d '2026-10-08 16:00' +%s)" ]] \
+  && ok_t "D3 [control] no anchor -> nearest day, unchanged for every other caller" \
+  || bad_t "D3 the anchor-less reading moved" "state=$DL epoch=$EP"
+# The DATED banner wins over the continuing line beside it, at any hour.
+DWANT=$(date -u -d '2026-10-09 16:00' +%s)
+for at in '2026-10-08 22:16' '2026-10-08 10:00' '2026-10-09 15:59'; do
+  NOW=$(date -u -d "$at" +%s)
+  for pane in "$WK1"$'\n'"$CK2" "$WK1"; do
+    IFS=$'\x1f' read -r DL EP <<<"$(_sup_quota_deadline "$pane" "$NOW" "$(( NOW - 24 * 60 ))")"
+    [[ "$DL" == live && "$EP" == "$DWANT" ]] \
+      && ok_t "D4 'resets Oct 9, 4pm' read at ${at}Z -> Oct 9 16:00Z [$(tr '\n' '|' <<<"$pane")]" \
+      || bad_t "D4 the dated reset lost to the continuing line" "at=$at state=$DL epoch=$EP want=$DWANT pane=[$pane]"
+  done
+done
+# Rule (b) end to end, on the REAL clock: a clock-only reset 13-14h out from now
+# (more than 12h, the exact gap the nearest-day read got wrong). Claimed 40m ago.
+FAR_H=$(date -u -d '+14 hours' '+%-I%P'); FAR_W=$(date -u -d '+14 hours' '+%Y-%m-%d %H:00')
+PANE=$'x\n  ⎿  You\'ve hit your weekly limit · resets '"$FAR_H"$' (UTC)\n     Usage limit reached · continuing automatically at '"$FAR_H"$'\n> '
+T12=$(mk_idle_claimed maya)
+read -r RC12 _ < <(_hb_reclaim maya 30)
+W12=$(db "SELECT wake_at FROM tasks WHERE id=${T12};")
+[[ "$(row "$T12")" == "blocked|parked|wake" && "$W12" == "$FAR_W:00" ]] \
+  && ok_t "D5 idle on a clock-only wall 13-14h before its reset -> PARKED until it ($FAR_H), not requeued" \
+  || bad_t "D5 a clock-only wall >12h out was not parked to its reset" "row=$(row "$T12") wake=[$W12] want=[$FAR_W:00] pane=[$PANE]"
+# The skip is never silent: a wall whose reset passed since the claim logs why.
+PAST_HM=$(date -u -d '-10 minutes' '+%-I:%M%P')
+PANE=$'x\n  ⎿  You\'ve hit your weekly limit · resets '"$PAST_HM"$' (UTC)\n     '"$WK2"$'\n> '
+T13=$(mk_idle_claimed maya)
+_D_LOG="$TMP/d6.log"; : >"$_D_LOG"
+_hb_log() { printf '%s\n' "$*" >>"$_D_LOG"; }
+read -r RC13 _ < <(_hb_reclaim maya 30)
+_hb_log() { printf '%s [heartbeat] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
+[[ "$(row "$T13")" == "todo|unparked|nowake" ]] && grep -q 'has PASSED since the claim — stale banner, not parked; requeueing (DIVE-5896)' "$_D_LOG" \
+  && ok_t "D6 a wall whose reset passed since the claim requeues AND says so (no silent else)" \
+  || bad_t "D6 the park arm skipped silently" "row=$(row "$T13") log=[$(cat "$_D_LOG")]"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

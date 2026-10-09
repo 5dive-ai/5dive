@@ -1127,26 +1127,42 @@ _sup_quota_match() {  # <pane-text-on-stdin> [now_epoch]
 # read `live` when it lapsed a day ago. Bounded by the pane window
 # (_SUP_QUOTA_PANE_LINES) at the tick, and by _SUP_INFO_TICK_STALE on the `info`
 # side; a dated deadline in the text would remove it and no runtime prints one.
-_sup_quota_deadline() {  # <text> [now_epoch]
-  local text="$1" now="${2:-}"
+#
+# DIVE-5896 — [anchor_epoch], optional: a caller that KNOWS the banner was printed
+# after a given moment (the reclaim arm: the seat's turn began at the claim, so
+# its wall is no older than that) passes it, and a clock-only reset resolves
+# FORWARD to its first occurrence after the anchor instead of to the nearest
+# day. Without it a `resets 4pm` read at 01:11Z was yesterday's 4pm, `lapsed`,
+# for the whole 12h before the reset. Every other caller omits it and keeps the
+# nearest-day reading: only a caller with a fresh banner may assume forward.
+_sup_quota_deadline() {  # <text> [now_epoch] [anchor_epoch]
+  local text="$1" now="${2:-}" anchor="${3:-}" st="" ep=""
   [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
-  local re='[Cc]ontinuing[[:space:]]+automatically[[:space:]]+at[[:space:]]+([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*([AaPp])?\.?[Mm]?\.?'
-  if [[ "$text" =~ $re ]]; then
-    _sup_clock_state "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]:-00}" "${BASH_REMATCH[4]:-}" "$now"
-    return 0
-  fi
   # DIVE-5837 — the DATED phrasing of the weekly wall, `... limit · resets Oct 9,
   # 4pm (UTC)`. It names a day, so it is read as a date and never put through the
   # nearest-day arithmetic below: that arithmetic would read a reset two days out
   # as "today, 4pm". The year is not printed, so it is the one of last, this or
   # next year that lands nearest to `now`. A trailing `(UTC)` is honoured; any
   # other zone falls back to the host's, the same residual as the arm below.
+  #
+  # DIVE-5896: tried FIRST. Claude Code prints `continuing automatically at 4pm`
+  # under the dated banner, and with that arm first the date was ignored and the
+  # reset read a day early or lapsed. A date is the more precise reading, so it
+  # wins whenever it parses; one that does not (`unknown`) falls through.
   local re3='resets?[[:space:]]+([A-Za-z]{3})[A-Za-z]*\.?[[:space:]]+([0-9]{1,2}),?[[:space:]]+(at[[:space:]]+)?([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*([AaPp])\.?[Mm]\.?'
   if [[ "$text" =~ $re3 ]]; then
-    _sup_date_state "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[6]:-00}" "${BASH_REMATCH[7]}" "$now" \
-      "$([[ "$text" =~ \(UTC\) ]] && printf utc)"
+    IFS=$'\x1f' read -r st ep <<<"$(_sup_date_state "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[6]:-00}" "${BASH_REMATCH[7]}" "$now" \
+      "$([[ "$text" =~ \(UTC\) ]] && printf utc)")"
+    if [[ "$st" != unknown ]]; then printf '%s\x1f%s\n' "$st" "$ep"; return 0; fi
+  fi
+  local re='[Cc]ontinuing[[:space:]]+automatically[[:space:]]+at[[:space:]]+([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*([AaPp])?\.?[Mm]?\.?'
+  if [[ "$text" =~ $re ]]; then
+    _sup_clock_state "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]:-00}" "${BASH_REMATCH[4]:-}" "$now" "$anchor"
     return 0
   fi
+  # A dated reset that parsed to nothing usable (past the 8-day bound) with no
+  # clock line beside it: the dated arm's `unknown` stands, as before.
+  [[ "$st" == unknown ]] && { printf 'unknown\x1f\n'; return 0; }
   # DIVE-4206 — the SECOND recognised phrasing, `... limit · resets 4am (UTC)`.
   # DIVE-3970 split _sup_clock_state out of the arm above expressly so this one
   # could reuse the identical meridiem + nearest-day arithmetic instead of a
@@ -1165,7 +1181,7 @@ _sup_quota_deadline() {  # <text> [now_epoch]
   # this phrasing) is still what an unparseable clock returns.
   local re2='limit[^0-9]{0,20}resets?[[:space:]]+(at[[:space:]]+)?([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*([AaPp])?\.?[Mm]?\.?'
   if [[ "$text" =~ $re2 ]]; then
-    _sup_clock_state "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]:-00}" "${BASH_REMATCH[5]:-}" "$now"
+    _sup_clock_state "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]:-00}" "${BASH_REMATCH[5]:-}" "$now" "$anchor"
     return 0
   fi
   printf 'unknown\x1f\n'
@@ -1178,9 +1194,15 @@ _sup_quota_deadline() {  # <text> [now_epoch]
 # the caller's job, exactly as choosing which pane LINE is _sup_quota_match's.
 # Echoes "<live|lapsed|unknown>\x1f<epoch|>"; `now` is an ARGUMENT, never read
 # internally, so every arm stays assertable at a fixed clock.
-_sup_clock_state() {  # <hh> <mm> <a|p|""> <now_epoch>
-  local hh="${1:-}" mm="${2:-00}" ap="${3:-}" now="${4:-}"
+#
+# DIVE-5896: [anchor_epoch] resolves FORWARD, to the first occurrence after the
+# anchor, instead of to the nearest day. See _sup_quota_deadline for who may.
+_sup_clock_state() {  # <hh> <mm> <a|p|""> <now_epoch> [anchor_epoch]
+  local hh="${1:-}" mm="${2:-00}" ap="${3:-}" now="${4:-}" anchor="${5:-}"
   [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  [[ "$anchor" =~ ^[0-9]+$ ]] || anchor=""
+  # An anchor after `now` is a skewed clock, not a later banner: clamp it.
+  if [[ -n "$anchor" ]] && (( anchor > now )); then anchor="$now"; fi
   [[ "$hh" =~ ^[0-9]{1,2}$ && "$mm" =~ ^[0-9]{1,2}$ ]] || { printf 'unknown\x1f\n'; return 0; }
   hh=$((10#$hh)); mm=$((10#$mm))
   case "${ap,,}" in
@@ -1195,12 +1217,16 @@ _sup_clock_state() {  # <hh> <mm> <a|p|""> <now_epoch>
   esac
   (( mm >= 0 && mm <= 59 )) || { printf 'unknown\x1f\n'; return 0; }
   local day base best="" bestd=-1 d
-  day=$(date -d "@${now}" +%Y-%m-%d 2>/dev/null) || { printf 'unknown\x1f\n'; return 0; }
+  day=$(date -d "@${anchor:-$now}" +%Y-%m-%d 2>/dev/null) || { printf 'unknown\x1f\n'; return 0; }
   base=$(date -d "${day} $(printf '%02d:%02d' "$hh" "$mm")" +%s 2>/dev/null)     || { printf 'unknown\x1f\n'; return 0; }
-  for d in $(( base - 86400 )) "$base" $(( base + 86400 )); do
-    local dist=$(( d > now ? d - now : now - d ))
-    if (( bestd < 0 || dist < bestd )); then bestd="$dist"; best="$d"; fi
-  done
+  if [[ -n "$anchor" ]]; then
+    best="$base"; (( best > anchor )) || best=$(( base + 86400 ))
+  else
+    for d in $(( base - 86400 )) "$base" $(( base + 86400 )); do
+      local dist=$(( d > now ? d - now : now - d ))
+      if (( bestd < 0 || dist < bestd )); then bestd="$dist"; best="$d"; fi
+    done
+  fi
   if (( best > now )); then printf 'live\x1f%s\n' "$best"
   else printf 'lapsed\x1f%s\n' "$best"; fi
 }
