@@ -661,6 +661,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- instance" when there is no instance to close. NULL on every row that
   -- predates it, which is the truth: nobody recorded a reason.
   last_skip_reason TEXT,
+  -- DIVE-5913. The zone a recurring template's cron is read in (an IANA name,
+  -- e.g. Asia/Bangkok). NULL means UTC: every template written before this
+  -- column, so none of them moves. A new template takes the box's zone when it
+  -- is filed (`task add --tz=` overrides; `task set-tz` moves an old one). See
+  -- _cron_tz_window for the DST rules.
+  schedule_tz      TEXT,
   -- DIVE-2272 (decision DIVE-2270). The PER-TEMPLATE overlap policy. NULL means
   -- 'skip' -- every template that predates this column keeps today's behaviour
   -- byte for byte, which is why this is a nullable add and not a NOT NULL
@@ -2066,6 +2072,9 @@ _TASKS_ADDITIVE_COLUMNS=(
   'verify_unavailable INTEGER' 'last_skipped_at TEXT'
   # DIVE-5364: why the last skip happened (see the CREATE TABLE comment).
   'last_skip_reason TEXT'
+  # DIVE-5913: a template's zone. Nullable, NULL = UTC, so every existing
+  # template keeps firing at the same instants. See the CREATE TABLE comment.
+  'schedule_tz TEXT'
   # DIVE-2730: the add-time `--no-verify`, persisted. Nullable — NULL is "the
   # filer did not opt out", which is the truth for every pre-existing row, so the
   # backfill is a no-op. See the CREATE TABLE comment for why an unpersisted
@@ -3671,8 +3680,18 @@ _cron_dow_match() {
 # day-of-week are restricted (neither is '*'), the row fires if EITHER matches;
 # otherwise every field ANDs. Backs the DIVE-138 heartbeat materializer.
 # Returns 0 if due at that minute, 1 otherwise.
+# DIVE-5913: an optional third argument is the template's zone (schedule_tz);
+# empty or a UTC name keeps the old `date -u` reading exactly. A local zone goes
+# through _cron_tz_window, so this answers with the same DST rules the
+# materializer uses.
 _cron_matches() {
-  local fields
+  local fields tz="${3:-}"
+  if ! _task_tz_is_utc "$tz"; then
+    local _ep _rep _f _ex
+    IFS=$'\x1f' read -r _ep _rep _f _ex < <(_cron_tz_window "$tz" "$2") || return 1
+    _cron_matches_slot "$1" "$_rep" "$_f" "$_ex"
+    return
+  fi
   fields=$(date -u -d "@${2}" +'%M %H %d %m %w' 2>/dev/null) || return 1
   _cron_matches_fields "$1" "$fields"
 }
@@ -3698,6 +3717,121 @@ _cron_matches_fields() {
     _cron_dow_match  "${cm[4]}" "$edow" || return 1
   fi
   return 0
+}
+
+# ── DIVE-5913: a recurring template fires in ITS OWN time zone ─────────────
+#
+# Until this row every template matched its cron against `date -u`. DIVE-5909
+# moved the BOX's clock to the owner's zone, so an agent that read `date` (08:00
+# Asia/Bangkok) and filed "0 8 * * *" for "every morning at 8" got 15:00 Bangkok,
+# while the box's own crontab, which follows the system zone, said 08:00. The
+# zone now lives on the template (tasks.schedule_tz). NULL means UTC, which is
+# every template written before this column: they keep firing at the same
+# instants. A NEW template takes the box's zone when it is filed (or --tz=).
+#
+# DST follows system cron (Debian/Vixie cron, what the boxes run), not a plain
+# per-minute match, so the two schedulers keep agreeing:
+#   - clock jumps FORWARD (Europe/Berlin 02:00 -> 03:00): a FIXED-time template
+#     whose time fell in the skipped hour ("30 2 * * *") fires ONCE, at the first
+#     minute after the jump (03:00 local). A wildcard one (minute or hour field
+#     starting with '*') just follows the new time.
+#   - clock jumps BACK (03:00 -> 02:00): the repeated wall-clock minutes do not
+#     fire a fixed-time template a second time; wildcard ones keep running.
+# Cron calls a job "wildcard" when its minute OR hour field starts with '*'.
+
+# Is <tz> UTC for scheduling purposes? Empty is UTC (a pre-DIVE-5913 template).
+_task_tz_is_utc() {
+  case "${1:-}" in
+    ''|UTC|Etc/UTC|UCT|Etc/UCT|Universal|Etc/Universal|Zulu|Etc/Zulu|GMT|Etc/GMT|GMT0|Etc/GMT0|GMT+0|GMT-0|Etc/GMT+0|Etc/GMT-0|Greenwich|Etc/Greenwich) return 0 ;;
+  esac
+  return 1
+}
+
+# Is <tz> a zone this box can evaluate? GNU date silently reads an UNKNOWN zone
+# as UTC, so an unchecked typo would quietly become a UTC template.
+_task_tz_valid() {
+  local tz="${1:-}" dir="${TZDIR:-/usr/share/zoneinfo}"
+  [[ "$tz" =~ ^[A-Za-z][A-Za-z0-9._+/-]*$ && "$tz" != *..* ]] || return 1
+  _task_tz_is_utc "$tz" && return 0
+  [[ -f "$dir/$tz" ]]
+}
+
+# The box's system zone, which a new template takes. The /etc/localtime link
+# first (no D-Bus needed), then timedatectl, then /etc/timezone, else UTC.
+# FIVE_BOX_TZ overrides it for tests.
+_task_box_tz() {
+  local tz=""
+  if [[ -n "${FIVE_BOX_TZ:-}" ]]; then
+    tz="$FIVE_BOX_TZ"
+  else
+    tz=$(readlink -f /etc/localtime 2>/dev/null || true)
+    [[ "$tz" == */zoneinfo/* ]] && tz="${tz##*/zoneinfo/}" || tz=""
+    [[ -n "$tz" ]] || tz=$(timeout 3 timedatectl show -p Timezone --value 2>/dev/null || true)
+    [[ -n "$tz" ]] || tz=$(head -n1 /etc/timezone 2>/dev/null || true)
+  fi
+  _task_tz_valid "$tz" || tz="UTC"
+  printf '%s\n' "$tz"
+}
+
+# +HHMM / -HHMM (date %z) -> seconds east of UTC.
+_cron_tz_off() {
+  local z="$1" s
+  s=$(( 10#${z:1:2} * 3600 + 10#${z:3:2} * 60 ))
+  [[ "${z:0:1}" == "-" ]] && s=$(( -s ))
+  printf '%s' "$s"
+}
+
+# <tz> <epoch>... -> one line per epoch (minute-aligned), in the order given:
+#   <epoch> x1f <R|-> x1f <MM HH dd mm w in tz> x1f <extra fields>[;<extra fields>...]
+# R = the minute repeats a wall-clock minute after a backward jump; extras = the
+# wall-clock minutes a forward jump skipped, which a fixed-time template still
+# fires for at this minute. One `date` fork for the whole window, plus one more
+# only at a minute where the clock jumped forward.
+_cron_tz_window() {
+  local tz="$1"; shift
+  local -a eps=("$@")
+  (( ${#eps[@]} )) || return 1
+  local -A off=() fld=()
+  local e q line _e _z _f
+  while IFS=' ' read -r _e _z _f; do
+    [[ -n "$_z" ]] || continue
+    off[$_e]=$(_cron_tz_off "$_z"); fld[$_e]="$_f"
+  done < <(for e in "${eps[@]}"; do for q in 0 60 1800 3600; do printf '@%s\n' "$(( e - q ))"; done; done \
+             | TZ="$tz" date -f - +'%s %z %M %H %d %m %w' 2>/dev/null)
+  for e in "${eps[@]}"; do
+    [[ -n "${fld[$e]:-}" ]] || return 1
+    local rep="-" extras="" d w k
+    if (( ${off[$((e-1800))]} - ${off[$e]} == 1800 || ${off[$((e-3600))]} - ${off[$e]} == 3600 )); then
+      rep="R"
+    fi
+    d=$(( ${off[$e]} - ${off[$((e-60))]} ))
+    if (( d > 0 && d < 3 * 3600 )); then
+      w=$(( e - 60 + ${off[$((e-60))]} ))
+      extras=$(for (( k = 60; k <= d; k += 60 )); do printf '@%s\n' "$(( w + k ))"; done \
+                 | date -u -f - +'%M %H %d %m %w' 2>/dev/null | paste -sd';' -)
+    fi
+    printf '%s\x1f%s\x1f%s\x1f%s\n' "$e" "$rep" "${fld[$e]}" "$extras"
+  done
+}
+
+# Does <expr> fire at one minute of a _cron_tz_window line? Cron's own rules: a
+# wildcard template runs on the plain wall clock, repeated minutes included; a
+# fixed-time one skips a repeated minute and also fires for a skipped one.
+_cron_matches_slot() {
+  local expr="$1" rep="$2" fields="$3" extras="$4" wild=0 x
+  local -a cm=(); read -r -a cm <<<"$expr"
+  [[ ${#cm[@]} -eq 5 ]] || return 1
+  [[ "${cm[0]}" == \** || "${cm[1]}" == \** ]] && wild=1
+  if [[ "$rep" == "R" ]] && (( ! wild )); then
+    return 1
+  fi
+  _cron_matches_fields "$expr" "$fields" && return 0
+  (( wild )) && return 1
+  local -a xs=(); IFS=';' read -r -a xs <<<"$extras"
+  for x in "${xs[@]}"; do
+    _cron_matches_fields "$expr" "$x" && return 0
+  done
+  return 1
 }
 
 # Indent every line of stdin by two spaces. Used for the nested lists in
