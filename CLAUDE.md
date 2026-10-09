@@ -152,6 +152,16 @@ only *"This run likely failed because of a workflow file issue"*.
   and harmless. Full write-up:
   `community/wiki/an-actions-expression-is-parsed-inside-shell-comments.md`.
 
+## PR titles: name the change, not a feature (lodar 2026-10-09)
+
+`feat` bumps the minor version and headlines the public CHANGELOG. Use it only
+when a user or an agent can now do something it could not do before, and name
+that capability. A changed text an agent reads, a default, a message, a guard or
+a fix to an existing flow is `fix`, `docs` or `chore`. The title says what
+changed in plain words and is no bigger than the diff:
+`fix(identity): name the OpenAgent card's path in the identity doc`, not
+`feat(identity): the identity doc tells an agent where its OpenAgent card is`.
+
 ## Hard rule: no real PII in public artifacts (DIVE-1774)
 
 Never put real user ids, emails, phone numbers, or customer PII in anything that
