@@ -18,7 +18,10 @@ _task_usage() {
   add <title...> [--body=<text>|--body-file=<path>] [--from=<who>] [--parent=<DIVE-N>]
       [--priority=low|medium|high|urgent] [--branch=<name>]
       [--assignee=<agent|role:<r>|charter:<kw>>]
-      [--recurring="<5-field cron>"] [--accept=<criteria>|--accept-file=<path>] [--verify=<cmd>]
+      [--recurring="<5-field cron>" [--tz=<zone>]] [--accept=<criteria>|--accept-file=<path>] [--verify=<cmd>]
+                                          a schedule runs in the BOX'S time zone (the one
+                                          'date' prints), stamped on the template when filed;
+                                          --tz=<zone> picks another (Asia/Bangkok, UTC, ...)
       [--verifier=<agent>] [--max-iters=<n>] [--no-verify] [--verify] [--task-budget=<tokens|\$cost>]
       [--review=none|check|rubric|temp|<seat>] [--mutant=<cmd>|--no-mutant=<reason>]
                                           WHO GRADES THIS ROW — pick it when you file it:
@@ -118,6 +121,7 @@ _task_usage() {
                                                 row; the \$cost form is still advisory and belongs to the
                                                 per-agent cost budget
   set-overlap <tmpl> <skip|spawn> [bound]       recurring template: does an open instance suppress the next slot?
+  set-tz <tmpl> <zone|box>                      recurring template: the zone its schedule is read in (box = this box's zone)
 
   start <id>                                    -> in_progress
   done <id> [--result=<text>|--result-file=<path>] [--no-graded-sha]
@@ -430,6 +434,7 @@ cmd_task() {
     set-parent)      cmd_task_set_parent "$@" ;;   # DIVE-3275 re-parent a filed row
     set-budget)      cmd_task_set_budget "$@" ;;
     set-overlap)     cmd_task_set_overlap "$@" ;;
+    set-tz)          cmd_task_set_tz "$@" ;;
     wip-cap-install) cmd_task_wip_cap_install "$@" ;;
     orphans)         cmd_task_orphans "$@" ;;       # DIVE-3344 undispatchable rows
     doctor)          cmd_task_doctor "$@" ;;        # DIVE-3784 every undispatchable class
@@ -881,6 +886,42 @@ cmd_task_set_overlap() {
   ok "$ident on-overlap ${prior} → ${pol} (bound ${eff_bound}).${note}" \
      '{ident:$i, on_overlap:$p, prior:$pr, bound:($b|tonumber), open_instances:$o}' \
      --arg i "$ident" --arg p "$pol" --arg pr "$prior" --arg b "$eff_bound" --arg o "$open_now"
+}
+
+# DIVE-5913. Move an EXISTING recurring template to another zone. Templates
+# filed before the zone column read NULL, which is UTC; this is how an owner
+# moves one to their own clock without deleting it (which would lose its ident,
+# history and last_fired_at, the same reason set-overlap is a verb).
+cmd_task_set_tz() {
+  tasks_db_init
+  local task="" zone=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  if [[ -z "$task" ]]; then task="$1"
+          elif [[ -z "$zone" ]]; then zone="$1"
+          else fail "$E_USAGE" "unexpected extra argument '$1'"; fi ;;
+    esac
+    shift
+  done
+  [[ -n "$task" && -n "$zone" ]] \
+    || fail "$E_USAGE" "usage: 5dive task set-tz <template|DIVE-N> <zone|box>  (an IANA zone such as Asia/Bangkok or UTC; 'box' = this box's zone, $(_task_box_tz))"
+  [[ "$zone" == "box" ]] && zone=$(_task_box_tz)
+  _task_tz_valid "$zone" \
+    || fail "$E_VALIDATION" "bad zone '$zone' (an IANA zone this box knows, e.g. Asia/Bangkok, Europe/Berlin or UTC — see 'timedatectl list-timezones')"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local kind; kind=$(db "SELECT kind FROM tasks WHERE id=${id};")
+  [[ "$kind" == "recurring" ]] \
+    || fail "$E_VALIDATION" "$ident is kind='$kind', not a recurring TEMPLATE — only a template has a schedule to read in a zone. Did you mean the template this instance came from? (5dive task show $ident)"
+  local prior sched
+  prior=$(db "SELECT COALESCE(NULLIF(schedule_tz,''),'UTC') FROM tasks WHERE id=${id};")
+  sched=$(db "SELECT COALESCE(schedule,'') FROM tasks WHERE id=${id};")
+  db "UPDATE tasks SET schedule_tz=$(sqlq "$zone"), updated_at=datetime('now') WHERE id=${id};"
+  ledger_emit "task.schedule_tz_set" ident="$ident" task_id="$id" \
+    actor="$(task_actor)" detail="schedule_tz ${prior} -> ${zone}" || true
+  ok "$ident schedule '${sched}' now reads in ${zone} (was ${prior})." \
+     '{ident:$i, schedule:$s, schedule_tz:$z, prior:$p}' \
+     --arg i "$ident" --arg s "$sched" --arg z "$zone" --arg p "$prior"
 }
 
 cmd_task_set_budget() {

@@ -5320,13 +5320,31 @@ _hb_materialize_recurring() {
   # the materializer silently stopped firing anything. x'1f' is not IFS
   # whitespace, so empty fields survive. Same separator the stall sweeps below
   # already use, for the same reason.
-  while IFS=$'\x1f' read -r tid sched last_fired policy bound assignee; do
+  # DIVE-5913: a template in a local zone is matched against that zone's wall
+  # clock for the same window minutes, built once per zone per pass (one `date`
+  # fork) and cached here. UTC and NULL keep the win_f fast path above.
+  local -A tzwin=()
+  local sched_tz _t_ep _t_rep _t_f _t_ex
+  while IFS=$'\x1f' read -r tid sched last_fired policy bound assignee sched_tz; do
     [[ -n "$tid" ]] || continue
     # DIVE-5218: the latest minute in the window this template is due in.
     slot_ep=""
-    for _wi in "${!win_ep[@]}"; do
-      _cron_matches_fields "$sched" "${win_f[$_wi]}" && { slot_ep="${win_ep[$_wi]}"; break; }
-    done
+    if _task_tz_is_utc "$sched_tz"; then
+      for _wi in "${!win_ep[@]}"; do
+        _cron_matches_fields "$sched" "${win_f[$_wi]}" && { slot_ep="${win_ep[$_wi]}"; break; }
+      done
+    elif _task_tz_valid "$sched_tz"; then
+      [[ -n "${tzwin[$sched_tz]+x}" ]] || tzwin[$sched_tz]=$(_cron_tz_window "$sched_tz" "${win_ep[@]}")
+      while IFS=$'\x1f' read -r _t_ep _t_rep _t_f _t_ex; do
+        [[ -n "$_t_f" ]] || continue
+        _cron_matches_slot "$sched" "$_t_rep" "$_t_f" "$_t_ex" && { slot_ep="$_t_ep"; break; }
+      done <<<"${tzwin[$sched_tz]}"
+    else
+      # A zone this box cannot read is not silently UTC: say so every pass and
+      # fire nothing, so the owner sees it instead of a run at the wrong hour.
+      _hb_log "[materializer] $(_hb_ident "$tid") schedule zone '${sched_tz}' is not a zone this box knows — NOT evaluated; fix it with '5dive task set-tz $(_hb_ident "$tid") <zone>' (DIVE-5913)"
+      continue
+    fi
     [[ -n "$slot_ep" ]] || continue
     minute_start=$(date -u -d "@${slot_ep}" +'%Y-%m-%d %H:%M:00')
     slot_tag=""
@@ -5468,7 +5486,7 @@ _hb_materialize_recurring() {
     else
       _hb_log "[materializer] $(_hb_ident "$tid") insert failed"
     fi
-  done < <(db "SELECT id||x'1f'||schedule||x'1f'||COALESCE(last_fired_at,'')||x'1f'||COALESCE(on_overlap,'skip')||x'1f'||COALESCE(overlap_bound,'')||x'1f'||COALESCE(assignee,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL AND status='todo';" 2>/dev/null)
+  done < <(db "SELECT id||x'1f'||schedule||x'1f'||COALESCE(last_fired_at,'')||x'1f'||COALESCE(on_overlap,'skip')||x'1f'||COALESCE(overlap_bound,'')||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(schedule_tz,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL AND status='todo';" 2>/dev/null)
   # DIVE-5218: record this pass's minute for the next pass's catch-up window.
   # Written AFTER the loop: a pass that dies midway leaves the old minute, and
   # the next pass re-asks those slots (the last_fired_at guard stops a re-fire).

@@ -13,6 +13,7 @@ cmd_task_add() {
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
   local on_overlap="" overlap_bound=""   # DIVE-2272: per-template overlap policy
+  local sched_tz=""   # DIVE-5913: the zone a template's cron is read in
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
   local force_verify=""   # DIVE-4251: bare --verify, the row's demand for a grade
   local held_by="" park_reason="" park_wake=""   # DIVE-5729: born held
@@ -52,6 +53,7 @@ cmd_task_add() {
       --from=*)      from="${1#*=}" ;;
       --recurring=*) recurring="${1#*=}" ;;
       --schedule=*)  recurring="${1#*=}" ;;
+      --tz=*)        sched_tz="${1#*=}" ;;
       # DIVE-2272 (decision DIVE-2270): the per-template overlap policy.
       --on-overlap=*)    on_overlap="${1#*=}" ;;
       --overlap-bound=*) overlap_bound="${1#*=}" ;;
@@ -275,11 +277,22 @@ cmd_task_add() {
   # task — the step-2 materializer clones it into a standard todo on schedule.
   # A template + an explicit --parent is nonsensical (instances are top-level),
   # so reject the combo rather than store a confusing row.
-  local kind="standard" schedule_sql="NULL"
+  local kind="standard" schedule_sql="NULL" sched_tz_sql="NULL"
   if [[ -n "$recurring" ]]; then
     valid_cron_expr "$recurring" || fail "$E_VALIDATION" "bad --recurring '$recurring' (need a 5-field cron expr, e.g. \"0 2 * * *\")"
     [[ -z "$parent" ]] || fail "$E_VALIDATION" "--recurring can't be combined with --parent (a template has no parent)"
     kind="recurring"; schedule_sql=$(sqlq "$recurring")
+    # DIVE-5913: the schedule is read in the box's zone (the one `date` prints),
+    # stamped on the row now so a later zone change does not move this template.
+    if [[ -n "$sched_tz" ]]; then
+      _task_tz_valid "$sched_tz" \
+        || fail "$E_VALIDATION" "bad --tz '$sched_tz' (an IANA zone this box knows, e.g. Asia/Bangkok, Europe/Berlin or UTC — see 'timedatectl list-timezones')"
+    else
+      sched_tz=$(_task_box_tz)
+    fi
+    sched_tz_sql=$(sqlq "$sched_tz")
+  elif [[ -n "$sched_tz" ]]; then
+    fail "$E_VALIDATION" "--tz only applies to a recurring TEMPLATE (add --recurring=<cron>); a one-off task has no schedule to read in a zone"
   fi
   # ── DIVE-4430: the maker<->verifier loop is BOUNDED BY DEFAULT ──────────────
   #
@@ -891,12 +904,12 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   fi
   local id
   id=$(db "BEGIN IMMEDIATE;
-           INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
+           INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, schedule_tz, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable,
                               verify_optout, verify_forced, review_mode, mutant_command, on_overlap, overlap_bound, tell_me_by)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), $(sqlq_or_null "$derived_actor"), ${parent_sql}, $(sqlq "$project"),
-                   $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
+                   $(sqlq "$kind"), ${schedule_sql}, ${sched_tz_sql}, ${fresh_sql},
                    $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL),
                    $([[ -n "$no_verify" ]] && echo 1 || echo NULL), $([[ -n "$force_verify" ]] && echo 1 || echo NULL), $(sqlq_or_null "$review_mode"), $(sqlq_or_null "$mutant_stored"), ${on_overlap_sql}, ${overlap_bound_sql}, $(sqlq_or_null "$tell_me_by"));
            SELECT last_insert_rowid();
@@ -924,9 +937,9 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   [[ -n "$held_by_id"  ]] && hold_note=" · HELD until ${held_by_ident} closes (or: 5dive task unblock ${ident})"
   [[ -n "$park_reason" ]] && hold_note=" · PARKED — ${park_reason}"
   if [[ "$kind" == "recurring" ]]; then
-    ok "created recurring ${ident} (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title${hold_note}" \
-       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
-       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg f "$fresh_sql"
+    ok "created recurring ${ident} (${recurring} ${sched_tz}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title${hold_note}" \
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, schedule_tz:$z, fresh:($f=="1")}' \
+       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg z "$sched_tz" --arg f "$fresh_sql"
   else
     if [[ -n "$followup_warn_ident" ]]; then
       local _followup_match_note=""
@@ -1195,7 +1208,7 @@ cmd_task_ls() {
     # surfaces cannot disagree. Still absent on a NULL row, like every column here.
     # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, need_expires_at, need_quote, need_quote_file, gate_pinged_at, tier, gate_mode, kind, schedule, last_fired_at, last_skipped_at, last_skip_reason, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier, review_mode,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, need_expires_at, need_quote, need_quote_file, gate_pinged_at, tier, gate_mode, kind, schedule, schedule_tz, last_fired_at, last_skipped_at, last_skip_reason, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier, review_mode,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
@@ -1262,7 +1275,7 @@ cmd_task_ls() {
     # no instance blocks and the latest skip (newer than the latest fire) was a
     # pace hold, blocked_by prints that hold — `pace soft on mark` — instead of
     # '-'. Before this a team held for a whole day read as healthy here.
-    dbfmt -box "SELECT ident, status, COALESCE(schedule,'-') AS schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, COALESCE(last_skipped_at,'-') AS last_skipped, COALESCE(CASE WHEN kind='recurring' THEN CASE WHEN COALESCE(on_overlap,'skip')='spawn' THEN (SELECT CASE WHEN COUNT(*) >= COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) THEN 'bound '||COUNT(*)||'/'||COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) ELSE NULL END FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled')) ELSE (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) END ELSE NULL END,CASE WHEN kind='recurring' AND last_skip_reason LIKE 'pace %' AND last_skipped_at >= COALESCE(last_fired_at,'') THEN CASE WHEN instr(last_skip_reason,' | ') > 0 THEN substr(last_skip_reason,1,instr(last_skip_reason,' | ')-1) ELSE last_skip_reason END END,'-') AS blocked_by, COALESCE(on_overlap,'skip') AS on_overlap, title FROM tasks WHERE ${where} ${order};"
+    dbfmt -box "SELECT ident, status, CASE WHEN schedule IS NULL THEN '-' ELSE schedule||' ('||COALESCE(NULLIF(schedule_tz,''),'UTC')||')' END AS schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, COALESCE(last_skipped_at,'-') AS last_skipped, COALESCE(CASE WHEN kind='recurring' THEN CASE WHEN COALESCE(on_overlap,'skip')='spawn' THEN (SELECT CASE WHEN COUNT(*) >= COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) THEN 'bound '||COUNT(*)||'/'||COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) ELSE NULL END FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled')) ELSE (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) END ELSE NULL END,CASE WHEN kind='recurring' AND last_skip_reason LIKE 'pace %' AND last_skipped_at >= COALESCE(last_fired_at,'') THEN CASE WHEN instr(last_skip_reason,' | ') > 0 THEN substr(last_skip_reason,1,instr(last_skip_reason,' | ')-1) ELSE last_skip_reason END END,'-') AS blocked_by, COALESCE(on_overlap,'skip') AS on_overlap, title FROM tasks WHERE ${where} ${order};"
   else
     # DIVE-2316: the binding audit is a list question — "which closed rows have
     # no pointer?"  Show the column whenever closed rows were requested, and
@@ -1422,6 +1435,11 @@ cmd_task_show() {
     else
       dbfmt -line "SELECT ident, title, status, ${_gate_hdr} AS gate, priority, assignee, created_by, parent_id, created_at, first_started_at, started_at, done_at, COALESCE(NULLIF(delivery_ref,''),'absent') AS delivery_ref, CASE WHEN (${_TASKS_MERGE_LANDED_SQL}) THEN 'none — MERGED ON THE FORGE as '||substr(COALESCE(NULLIF(merge_landed_sha,''),'an unrecorded sha'),1,12)||', recorded '||merge_landed_at||' by '||COALESCE(NULLIF(merge_landed_by,''),'?')||'; this row is owed a CLOSE' WHEN (${_TASKS_MERGE_DECLINED_SQL}) THEN 'none — MERGE DECLINED '||merge_declined_at||' by '||COALESCE(NULLIF(merge_declined_by,''),'?')||': '||COALESCE(NULLIF(merge_declined_reason,''),'no reason recorded')||'; NO LANDING WAS ASSERTED — this pull request is not the one that will land, and re-pointing the binding puts the row back in the merging stage' WHEN COALESCE(merge_owner,'')='' THEN '-' ELSE merge_owner||' ('||COALESCE(NULLIF(merge_hold_reason,''),'no reason recorded')||')' END AS merge_owner, body, result FROM tasks WHERE id=${id};"
     fi
+    # DIVE-5913: a recurring template's schedule and the zone it fires in. A
+    # template with no zone (filed before the column) prints UTC, which is what
+    # it fires in. Standard rows print nothing, so their output is unchanged.
+    local _show_sched; _show_sched=$(db "SELECT CASE WHEN kind='recurring' AND schedule IS NOT NULL THEN schedule||' ('||COALESCE(NULLIF(schedule_tz,''),'UTC')||')' ELSE '' END FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    [[ -n "$_show_sched" ]] && printf '%16s = %s\n' schedule "$_show_sched"
     # DIVE-4899: the companions bound beside delivery_ref, printed only when a
     # row has some — a single-PR row's show output is unchanged byte for byte.
     # DIVE-5348: the DERIVED set (companions + pull URLs in the result and the
