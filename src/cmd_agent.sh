@@ -450,7 +450,8 @@ _cmd_list_legacy() {
                                  measured: false, extraEntries: false}) as $s
            | $s + {diverges: ($s.measured and $s.impliedIsolation != (.value.isolation // "admin"))}),
     health: ($live[.key].health // null),
-    avatar: ($live[.key].avatar // null)
+    avatar: ($live[.key].avatar // null),
+    orgBlocksChannels: ($live[.key].orgBlocksChannels // null)
   })' <<<"$reg")
   if (( JSON_MODE )); then
     _agent_list_hb_json "$merged" | jq -c '{ok:true, data: .}'
@@ -510,6 +511,7 @@ _agent_list_snapshot_python() {
   QUOTA_SNAPSHOT_FILE="$QUOTA_SNAPSHOT_FILE" \
   QUOTA_WALL_PCT="$QUOTA_WALL_PCT" \
   QUOTA_SNAPSHOT_MAX_AGE="$QUOTA_SNAPSHOT_MAX_AGE" \
+  AGENT_ENV_DIR="${ENV_DIR:-/var/lib/5dive/agents.d}" \
   /usr/bin/python3 - "$REGISTRY" "$AUTH_PROFILES_DIR" "$CONNECTORS_DIR" \
     "${AGENT_HOME_ROOT:-/home}" "${SUDOERS_D:-/etc/sudoers.d}" "$DEFAULT_WORKDIR" <<'PY'
 # __5DIVE_AGENT_LIST_PY_BEGIN__
@@ -1031,6 +1033,50 @@ def avatar_info(name):
         return None
     return {"path": path, "bytes": st.st_size, "mtime": int(st.st_mtime)}
 
+# DIVE-5925: a seat signed into a Claude Team/Enterprise org whose admin set a
+# channel policy gets its messages and never answers. Claude Code caches the
+# org's server-managed settings at ~/.claude/remote-settings.json (0600 to the
+# seat, so only the root read sees it), and that list wins over the box's own
+# managed-settings.json. Returns the seat's own channel plugins the policy
+# leaves out, or None. A personal account caches {} and a missing or garbled
+# file is no evidence, so neither is ever flagged: that is the "never shown to
+# normal accounts" rule. Plugin names mirror 5dive-agent-start's --channels.
+AGENT_ENV_DIR = os.environ.get("AGENT_ENV_DIR") or "/var/lib/5dive/agents.d"
+
+def channel_plugins(name, channels):
+    out = []
+    for ch in str(channels or "").split(","):
+        if ch == "telegram":
+            market = "claude-plugins-official"
+            for line in (read_text(os.path.join(AGENT_ENV_DIR, f"{name}.env")) or "").splitlines():
+                if line.startswith("AGENT_CHANNEL_MARKETPLACE="):
+                    market = line.split("=", 1)[1].strip().strip("'\"") or market
+            out.append((market, "telegram"))
+        elif ch == "discord":
+            out.append(("claude-plugins-official", "discord"))
+        elif ch in ("dashboard", "buzz"):
+            out.append(("5dive-plugins", ch))
+    return out
+
+def org_blocked_channels(name, agent_type, channels):
+    if agent_type != "claude":
+        return None
+    plugins = channel_plugins(name, channels)
+    if not plugins:
+        return None
+    remote = read_json(os.path.join(home_root, f"agent-{name}", ".claude", "remote-settings.json"))
+    if not isinstance(remote, dict):
+        return None
+    if remote.get("channelsEnabled") is False:
+        blocked = plugins
+    elif isinstance(remote.get("allowedChannelPlugins"), list):
+        allowed = {(e.get("marketplace"), e.get("plugin"))
+                   for e in remote["allowedChannelPlugins"] if isinstance(e, dict)}
+        blocked = [p for p in plugins if p not in allowed]
+    else:
+        return None
+    return [plugin for _, plugin in blocked] or None
+
 def iso_time(epoch):
     if epoch is None:
         return None
@@ -1104,6 +1150,7 @@ for name, value in agents.items():
         "effort": effort,
         "sudo": sudo,
         "avatar": avatar_info(name),
+        "orgBlocksChannels": org_blocked_channels(name, agent_type, channels),
         "health": {"deaf": deaf, "asleep": asleep,
                    "auth": {"state": auth_state, "expiresAt": iso_time(auth_exp), "refreshable": auth_refresh},
                    "quota": quota,
