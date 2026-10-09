@@ -3,7 +3,7 @@
 # caller as that tool's status, with that tool's message, and WITHOUT the
 # silent-exit backstop's "this is a bug in the CLI ... its effect is UNKNOWN"
 # banner. And `5dive bug --file` must not lose the report when its own route out
-# (gh) is the thing that is down.
+# (the API, since DIVE-5926) is the thing that is down.
 #
 # Graded END TO END, through the BUILT BUNDLE, with a stub that reports the argv
 # it received — the DIVE-3135 lesson: the stripper is correct in isolation and
@@ -114,21 +114,25 @@ grep -qF 'exited $code without reporting a reason' "$BUNDLE" \
   && ok "A6: the backstop's own emitter template is still in the bundle" \
   || bad "A6: the emitter is gone, so every no-banner arm above proves nothing"
 
-echo "== B. 5dive bug --file spools locally when the gh route is down =="
-# gh present but failing — the exact case the verb is invoked from.
+echo "== B. 5dive bug --file spools locally when its route out is down =="
+# DIVE-5926 moved the route from gh to 5dive's own API, so "down" is now a port
+# nothing listens on. The arms are unchanged in kind: non-zero, the path named,
+# one 0600 file in a 0700 dir carrying the report. The happy path and the drain
+# live in tests/bug_report_file_to_api_unit.sh, against a mock endpoint.
 spooldir="$TMP/home/.local/state/5dive/bug-spool"
-out=$(PATH="$TMP/stub:$PATH" XDG_STATE_HOME="$TMP/home/.local/state" \
-      GH_STUB_RC=1 GH_STUB_MSG="gh refused" \
-      "$BUNDLE" bug --what="DIVE-2792 harness probe" --verb=gh --exit=4 --no-probes --file </dev/null 2>&1); got=$?
+out=$(PATH="$TMP/stub:$PATH" XDG_STATE_HOME="$TMP/home/.local/state" STATE_DIR="$TMP/state" \
+      CONNECTORD_TOKEN="fake-box-token" FIVE_API_BASE="http://127.0.0.1:9" FIVE_BUG_POST_TIMEOUT=3 \
+      "$BUNDLE" bug --what="DIVE-2792 harness probe" --verb=gh --exit=4 --no-probes \
+        --file --owner-approved </dev/null 2>&1); got=$?
 [[ "$got" -ne 0 ]] \
-  && ok "B1: --file that could not file exits non-zero" \
+  && ok "B1: --file that could not send exits non-zero" \
   || bad "B1: reported success for a report that never left the box"
-[[ "$out" == *"it is saved locally at"* ]] \
+[[ "$out" == *"it is saved at"* ]] \
   && ok "B2: the caller is told the report was saved, and where" \
-  || bad "B2: no spool path in the failure text"
-n=$(find "$spooldir" -type f -name '*.md' 2>/dev/null | wc -l)
+  || bad "B2: no spool path in the failure text: ${out:0:300}"
+n=$(find "$spooldir" -type f -name '*.json' 2>/dev/null | wc -l)
 check "$n" "1" "B3: exactly one spool file was written"
-f=$(find "$spooldir" -type f -name '*.md' 2>/dev/null | head -1)
+f=$(find "$spooldir" -type f -name '*.json' 2>/dev/null | head -1)
 if [[ -n "$f" ]]; then
   grep -q "DIVE-2792 harness probe" "$f" \
     && ok "B4: the spooled file carries the report's own --what text" \
@@ -136,22 +140,9 @@ if [[ -n "$f" ]]; then
   check "$(stat -c %a "$f")" "600" "B5: spool file is 0600"
   check "$(stat -c %a "$spooldir")" "700" "B6: spool dir is 0700"
 fi
-
-echo "== B7. control: a report that DOES file spools nothing =="
-rm -rf "$spooldir"
-PATH="$TMP/stub:$PATH" XDG_STATE_HOME="$TMP/home/.local/state" \
-  GH_STUB_RC=0 SUDO_STUB_GH_DO_RC=0 SUDO_STUB_LIST_RC=0 \
-  "$BUNDLE" bug --what="DIVE-2792 happy path" --verb=gh --exit=0 --no-probes --file </dev/null >/dev/null 2>&1
-n=$(find "$spooldir" -type f -name '*.md' 2>/dev/null | wc -l)
-check "${n:-0}" "0" "B7: nothing is spooled when the issue actually files"
-
-echo "== B8. the harness never reached the real write path =="
-# Without this, B1-B6 would pass identically whether the route was stubbed or
-# whether it went out over the network and really filed — which is how #693/#694
-# happened. Assert the sudo route was ATTEMPTED and REFUSED by the stub.
-grep -q 'SUDO-STUB: -n /usr/local/bin/5dive _gh_do' "$SUDO_STUB_LOG" \
-  && ok "B8: the bot-routed write went to the stub, not to GitHub" \
-  || bad "B8: the write path was NOT severed — this harness may have filed a real issue"
+[[ "$out" != *"GH-STUB-ARGV"* ]] \
+  && ok "B7: no gh call on the --file path (the GitHub route is gone)" \
+  || bad "B7: --file still reached gh: ${out:0:300}"
 
 echo "== C. 5dive agent logs: the passthrough the SWEEP found, not the one the row named =="
 # WHY THIS BLOCK EXISTS (DIVE-2792 iteration 2, quinn). The first draft of this

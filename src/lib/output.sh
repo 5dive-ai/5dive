@@ -121,7 +121,7 @@ _report_silent_exit() {
   # by design.
   (( code == 130 || code == 143 )) && return 0
   local verb="${CURRENT_VERB:-}"
-  local msg="5dive${verb:+ $verb} exited $code without reporting a reason. This is a bug in the CLI, not a refusal: a command failed under \`set -euo pipefail\` and ended the run before any error path could print. The command did NOT run to completion and its effect is UNKNOWN — re-read the object (\`5dive task show\`, \`5dive agent list\`) before retrying. To locate it: \`bash -x \$(command -v 5dive) ${verb:-<verb>} ...\` and read the last line before the exit. Please file it: \`5dive bug\`."
+  local msg="5dive${verb:+ $verb} exited $code without reporting a reason. This is a bug in the CLI, not a refusal: a command failed under \`set -euo pipefail\` and ended the run before any error path could print. The command did NOT run to completion and its effect is UNKNOWN — re-read the object (\`5dive task show\`, \`5dive agent list\`) before retrying. To locate it: \`bash -x \$(command -v 5dive) ${verb:-<verb>} ...\` and read the last line before the exit. Preview a report with \`5dive bug\` (it sends nothing); send it only after your owner agrees."
   if (( JSON_MODE )); then
     jq -cn --argjson c "$code" --arg m "$msg" \
       '{ok:false, error:{code:$c, class:"generic", message:$m}}' 2>/dev/null || true
@@ -205,7 +205,7 @@ fail() {
     hint_what="${hint_what//\`/}"     # `...` expands inside "..." too
     hint_what="${hint_what//\\/}"     # a trailing \ escapes the closing quote
     hint_what="${hint_what:0:160}"
-    echo "hint: run '5dive bug --verb=\"${CURRENT_VERB:-unknown}\" --exit=$code --what=\"${hint_what}\"' to preview a diagnostic bug report (allowlisted fields plus the text you pass; nothing is filed until you add --file)" >&2
+    echo "hint: run '5dive bug --verb=\"${CURRENT_VERB:-unknown}\" --exit=$code --what=\"${hint_what}\"' to preview a diagnostic bug report (allowlisted fields plus the text you pass; nothing is sent). Send it with --file --owner-approved only after your owner says yes" >&2
   fi
   # DIVE-2598: this exit carries a reason, so the EXIT-trap backstop stays quiet
   # for it. Set AFTER the message is emitted, never before — the flag asserts "the
