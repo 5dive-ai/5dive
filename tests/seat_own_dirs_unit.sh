@@ -176,7 +176,8 @@ is "pinned: the hook landed in the directory root had opened, not the link's tar
 # co-author sequence (dirs + hook file) ROUNDS times. Nothing may be created,
 # chowned, chmodded or written anywhere outside the home; the arm also requires
 # both outcomes to have occurred, so a race that never landed cannot pass.
-# The swap lands in roughly 1 round in 100 (1 to 13 of 400 across CI runs), so a
+# The swap landed in roughly 1 round in 100 (1 to 13 of 400 across CI runs) — a
+# wedged swapper, not timing (DIVE-5578, below: ~300 of 400 once fixed) — so a
 # fixed 400 rounds came up 0-refused on its own (DIVE-5438: main red at 592f4218,
 # green at the same sha in the merge queue). The loop runs ROUNDS, then keeps
 # going until BOTH outcomes are seen, up to MAX_ROUNDS: the requirement is
@@ -190,24 +191,52 @@ $SUDO bash -c "printf decoy >'$decoy/5dive/git-hooks/prepare-commit-msg'"
 $SUDO install -d -m 755 "$TMP/marker-dir"; marker="$TMP/marker-dir/m"; $SUDO touch "$marker"
 decoy_before=$($SUDO find "$decoy" -printf '%p %U %G %m %s\n' | sort)
 stop="$TMP/marker-dir/stop"
+half="$TMP/marker-dir/half"   # root touches it at ROUNDS/2: plants after it are "late"
+swaps="$h/.swaps"   # inside the home: the no-inode-outside check prunes it
 (
   cd "$h" || exit 1
+  # Root re-creates a component whenever its pass lands between this loop's mv
+  # and its ln. The old loop then wedged for good: `ln -s` nested the link INSIDE
+  # root's fresh dir, the restore mv refused the non-empty target, the next
+  # rename refused the leftover .cfg-real, and the swap never landed again
+  # (DIVE-5578: main red at b61394ec with 2000 completed, 0 refused). So `ln -T`
+  # never nests, and a leftover rename target drops root's copy and restores.
+  # The swapper counts its plants, so a dead swapper reads as dead, not as luck.
+  # It still wedged on CI after DIVE-5578 was written, because that fix never
+  # merged (DIVE-5949: main red at c8a3ef3c, 2000 completed, 0 refused), so the
+  # arm now also REQUIRES plants in the second half of root's run: a swapper
+  # that wedges at any point fails as a dead swapper, not as "0 refused".
+  heal() {
+    if [[ -e .cfg-real ]]; then
+      rm -rf .config 2>/dev/null; mv -T .cfg-real .config 2>/dev/null && unwedged=$((unwedged + 1))
+    fi
+    if [[ -d .config && ! -L .config && -e .config/.5d-real ]]; then
+      rm -rf .config/5dive 2>/dev/null; mv -T .config/.5d-real .config/5dive 2>/dev/null && unwedged=$((unwedged + 1))
+    fi
+  }
+  planted=0 late=0 unwedged=0
   while [[ ! -e "$stop" ]]; do
-    mv -T .config .cfg-real 2>/dev/null && ln -s "$decoy" .config 2>/dev/null
-    [[ -L .config ]] && rm -f .config
+    heal
+    p0=$planted
+    mv -T .config .cfg-real 2>/dev/null && ln -sT "$decoy" .config 2>/dev/null
+    [[ -L .config ]] && planted=$((planted + 1)) && rm -f .config
     mv -T .cfg-real .config 2>/dev/null
     if [[ -d .config && ! -L .config ]]; then
-      mv -T .config/5dive .config/.5d-real 2>/dev/null && ln -s "$decoy/5dive" .config/5dive 2>/dev/null
-      [[ -L .config/5dive ]] && rm -f .config/5dive
+      mv -T .config/5dive .config/.5d-real 2>/dev/null && ln -sT "$decoy/5dive" .config/5dive 2>/dev/null
+      [[ -L .config/5dive ]] && planted=$((planted + 1)) && rm -f .config/5dive
       mv -T .config/.5d-real .config/5dive 2>/dev/null
     fi
+    [[ -e "$half" ]] && late=$((late + planted - p0))
   done
+  heal   # a restore root raced on the last round: leave nothing stranded
+  stranded=0; [[ -e .cfg-real || -e .config/.5d-real ]] && stranded=1
+  echo "$planted $late $unwedged $stranded" >"$swaps"
 ) &
 swapper=$!
 counts=$($SUDO bash -c '
   cd "$1"; source src/lib/agent_setup.sh; ok=0 refused=0 n=0
   while (( n < $6 )) && { (( n < $5 )) || (( ok == 0 || refused == 0 )); }; do
-    n=$((n + 1))
+    n=$((n + 1)); (( n == ($5 + 1) / 2 )) && : >"$7"
     if seat_own_dirs "$2" "$3" .config/5dive/git-hooks 700 2>/dev/null \
        && seat_put_file "$2" "$3" .config/5dive/git-hooks prepare-commit-msg 755 "$4" 2>/dev/null; then
       ok=$((ok + 1))
@@ -215,10 +244,16 @@ counts=$($SUDO bash -c '
       refused=$((refused + 1))
     fi
   done
-  echo "$ok $refused $n"' _ "$PWD" "$SEAT" "$h" "$src" "$ROUNDS" "$MAX_ROUNDS")
+  echo "$ok $refused $n"' _ "$PWD" "$SEAT" "$h" "$src" "$ROUNDS" "$MAX_ROUNDS" "$half")
 $SUDO touch "$stop"; wait "$swapper" 2>/dev/null
 read -r race_ok race_refused race_n <<<"$counts"
+read -r race_planted race_late race_unwedged race_stranded <"$swaps" 2>/dev/null
 echo "     race: ${race_n:-?} rounds (min $ROUNDS, max $MAX_ROUNDS), ${race_ok:-?} completed, ${race_refused:-?} refused a swapped component"
+echo "     race: the swapper planted ${race_planted:-?} links (${race_late:-?} in root's second half) and un-wedged ${race_unwedged:-?} times"
+(( ${race_late:-0} > 0 )) \
+  && ok_t "race: the swapper was still planting links in the second half of root's run" \
+  || bad_t "race: the swapper died (planted=${race_planted:-?} late=${race_late:-?}) — a wedged adversary, not a race that never landed"
+is "race: the swapper left no stranded .cfg-real / .5d-real behind" "0" "${race_stranded:-?}"
 (( ${race_ok:-0} > 0 && ${race_refused:-0} > 0 )) \
   && ok_t "race: the swap landed mid-pass (both outcomes seen), so the arm is live" \
   || bad_t "race: the swap never interleaved (ok=${race_ok:-?} refused=${race_refused:-?}) — the arm proved nothing"
