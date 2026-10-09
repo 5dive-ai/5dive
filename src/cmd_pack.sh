@@ -364,6 +364,61 @@ PY
 # done in python (pyyaml) since the persona is YAML; we keep the schema's
 # required-field contract as a structural gate (full validation lives in the
 # openagent CLI / skill — run it before provisioning).
+
+# DIVE-5900: the "Your card" section of an agent's identity doc. An agent asked
+# "show me your card" guessed an A2A card, because nothing told it it HAS one.
+# Both paths are where cmd_import installs them for every type (persona.yaml
+# below; avatar.png, DIVE-5104). The tier is printed only when the persona names
+# one. Args: <persona-file>. Prints the section; never fails.
+_persona_card_section() {
+  local tier
+  tier=$(PERSONA_FILE="$1" python3 - 2>/dev/null <<'PY'
+import os, yaml
+try:
+    p = yaml.safe_load(open(os.environ["PERSONA_FILE"])) or {}
+    t = (p.get("rarity") or p.get("tier")) if isinstance(p, dict) else None
+    print(t if isinstance(t, str) else "")
+except Exception:
+    pass
+PY
+  ) || tier=""
+  tier="${tier//[^A-Za-z -]/}"
+  printf '%s\n' "## Your card" \
+    "Your card is your OpenAgent persona, \`~/.claude/persona.yaml\`. When your owner asks for your card, read it and show your name, role, tier${tier:+ ($tier)}, voice and behavior, plus your portrait (\`~/.claude/avatar.png\`, or \`5dive agent avatar get <your agent name>\`)." \
+    '"Card" never means an A2A agent card unless they say A2A.'
+}
+
+# _persona_card_prefix_bytes <stage> — the size of the staged CLAUDE.md BEFORE the
+# section _persona_card_ensure appended, or nothing when it ends some other way.
+# pack-sync uses it to recognise an agent hired before DIVE-5900 with no record.
+_persona_card_prefix_bytes() {
+  local doc="$1/CLAUDE.md" persona="$1/persona.yaml" block size
+  [[ -f "$persona" ]] || persona="$1/${REGISTRY_PERSONA:-registry-persona.yaml}"
+  [[ -f "$doc" && -f "$persona" ]] || return 0
+  block=$'\n'"$(_persona_card_section "$persona")"$'\n'
+  size=$(wc -c <"$doc" | tr -d ' ')
+  local LC_ALL=C; (( size > ${#block} )) || return 0
+  [[ "$(tail -c "${#block}" "$doc")"$'\n' == "$block" ]] && echo $(( size - ${#block} ))
+  return 0
+}
+
+# _persona_card_ensure <stage> — a pack that ships its OWN CLAUDE.md (every
+# marketplace, partner and made agent: their persona rides as REGISTRY_PERSONA
+# and is never rendered) still gets the card section, appended once. A doc that
+# already has it (rendered from persona.yaml) is left alone. Called by cmd_import
+# and the pack-sync re-render at the same step (last), so a sync compares like
+# with like.
+_persona_card_ensure() {
+  local stage="$1" persona=""
+  [[ -f "$stage/CLAUDE.md" ]] || return 0
+  grep -qxF "## Your card" "$stage/CLAUDE.md" && return 0
+  if [[ -f "$stage/persona.yaml" ]]; then persona="$stage/persona.yaml"
+  elif [[ -f "$stage/${REGISTRY_PERSONA:-registry-persona.yaml}" ]]; then persona="$stage/${REGISTRY_PERSONA:-registry-persona.yaml}"
+  else return 0; fi
+  [[ -z "$(tail -c1 "$stage/CLAUDE.md")" ]] || printf '\n' >>"$stage/CLAUDE.md"
+  { printf '\n'; _persona_card_section "$persona"; } >>"$stage/CLAUDE.md"
+}
+
 # Render an OpenAgent persona file into a CLAUDE.md identity doc. SINGLE source of
 # truth for persona -> identity rendering (DIVE-656), shared by `agent import
 # --from-persona`, the synth path above, and `agent import <pack>` when the pack
@@ -371,7 +426,7 @@ PY
 # invalid/unreadable persona so callers can fall back.
 _persona_render_claudemd() {
   local persona="$1" out="$2"
-  PERSONA_FILE="$persona" OUT_FILE="$out" python3 - <<'PY'
+  PERSONA_FILE="$persona" OUT_FILE="$out" CARD_MD="$(_persona_card_section "$persona")" python3 - <<'PY'
 import os, sys
 try:
     import yaml
@@ -412,6 +467,9 @@ if posts:
 links = p.get("links") or {}
 if isinstance(links, dict) and links:
     lines += ["## Links"] + ["- %s: %s" % (k, v) for k, v in links.items()] + [""]
+card = os.environ.get("CARD_MD", "").strip()
+if card:
+    lines += [card, ""]
 lines += ["---",
           "Provisioned from an OpenAgent persona (id: `%s`, spec %s). "
           "Identity standard: github.com/5dive-ai/openagent" % (p.get("id", ""), p.get("openagent", "0.1"))]
@@ -3314,6 +3372,9 @@ cmd_import() {
       mem_effect="inlined into the persona doc"
     fi
   fi
+  # DIVE-5900: a pack's own CLAUDE.md names the card too. Last, after the memory
+  # inline, so the appended section is always the doc's final block.
+  _persona_card_ensure "$stage"
 
   # Layer the identity doc into the file THIS harness actually reads (DIVE-2223).
   # persona.yaml / avatar.png / settings.json below stay under ~/.claude because
@@ -3870,6 +3931,7 @@ _pack_sync_render_identity() {
   [[ -f "$stage/persona.yaml.registry" ]] && mv "$stage/persona.yaml.registry" "$stage/persona.yaml"
   mem_inc=$(jq -r '.includes.memory // false' "$stage/manifest.json" 2>/dev/null)
   _pack_inline_memory_into_doc "$stage" "$type" "$mem_inc" >/dev/null 2>&1 || true
+  _persona_card_ensure "$stage"   # DIVE-5900, last, as cmd_import does
   return 0
 }
 
@@ -3918,6 +3980,13 @@ _pack_sync_claudemd() {
   new=$(_pack_file_sha "$stage/CLAUDE.md"); nb=$(wc -c <"$stage/CLAUDE.md" | tr -d ' ')
   osha=$(jq -r '.claudeMd.sha // ""' <<<"$rec"); ob=$(jq -r '.claudeMd.bytes // ""' <<<"$rec")
   _pack_live_ok "$md" || { echo "drift-link - -"; return 0; }   # a link or a non-file: never written through
+  # DIVE-5900: no record, and the head is exactly this pack's section as it was
+  # installed before the card section existed -> unedited, so update it in.
+  local pb; pb=$(_persona_card_prefix_bytes "$stage")
+  if [[ -z "$osha" && -n "$pb" ]] && ! _pack_head_is "$name" "$md" "$nb" "$new" \
+     && _pack_head_is "$name" "$md" "$pb" "$(head -c "$pb" "$stage/CLAUDE.md" | sha256sum | cut -d' ' -f1)"; then
+    osha=$(head -c "$pb" "$stage/CLAUDE.md" | sha256sum | cut -d' ' -f1); ob=$pb
+  fi
   if [[ -n "$osha" ]] && _pack_head_is "$name" "$md" "$ob" "$osha"; then
     if [[ "$osha" == "$new" ]]; then echo "unchanged $new $nb"; return 0; fi
     (( dry )) && { echo "updated - -"; return 0; }
