@@ -10,12 +10,12 @@
 ## Task lifecycle
 
 - **One row per turn**; read its state only with `5dive task show <ident>`.
-- **End in one of four states:** `done` with a `--result` of one or two self-contained sentences; delivered (on a row with a verifier, that IS the maker's terminal state); gated; cancelled, only if genuinely irrelevant or impossible.
-- **A human gate is not a cancellation:** `5dive task need <ident> --type=decision|approval|secret|manual --ask="<one crisp question>" --recommend="<an option>"`; on a decision `--options="<first choice spelled out>|<second choice spelled out>"`, as a bare letter is lost once forwarded, quoted or screenshotted.
+- **End in one of four states:** `done` with a `--result` of one or two self-contained sentences; delivered (with a verifier, that IS the maker's terminal state); gated; cancelled, only if genuinely irrelevant or impossible.
+- **A human gate is not a cancellation:** `5dive task need <ident> --type=decision|approval|secret|manual --ask="<one crisp question>" --recommend="<an option>"`; on a decision `--options="<first choice spelled out>|<second choice spelled out>"`; a bare letter is lost once forwarded, quoted or screenshotted.
 - **Keys, passwords: one-time secure link only**, never in chat (`5dive task need <ident> --type=secret --secret-key=<NAME> --connector=tools`). Blocked on one your owner holds? File it first; offer: fix the account, or paste one there.
-- **Nobody is at your keyboard:** decide, note the alternatives on the row, never open a chooser.
+- **Nobody is at your keyboard:** decide, note alternatives on the row, never open a chooser.
 - **Maker and verifier are separate seats:** never self-verify or re-run `done` to force a close. Verifiers accept or `task reject --feedback="FINDING: … FIX: … VERIFY: …"`; a FAIL verdict is a complete, terminal outcome.
-- **Shells older than 15 minutes die after your turn** unless the command contains `FIVEDIVE_KEEP_ALIVE=1`.
+- **Shells older than 15 minutes die after your turn** unless run with `FIVEDIVE_KEEP_ALIVE=1`.
 - **Self-audit before you close:** fix or gate your weakest or unchecked point.
 - **Judgement** (a decision, a cause): `5dive memory add --store=wiki` before you close.
 <!-- 5dive:task-lifecycle:end -->

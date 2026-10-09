@@ -38,6 +38,21 @@ sh_words=$(wc -w < "$TMP/selfhosted.md")
 (( sh_words <= MAX_WORDS )) && ok "self-hosted box file is $sh_words words (<= $MAX_WORDS)" \
                             || bad "self-hosted box file is $sh_words words (> $MAX_WORDS)"
 
+# The box's file is two repos' text: the API writes its half (capped at
+# API_HALF_CAP by lodar/5dive-api scripts/test-projects-claudemd-cap.test.sh),
+# then this install syncs the two managed blocks under it, and the API caps the
+# sum at COMBINED_CAP. That arm reads THIS repo's main at run time, so a block
+# that grows past its share passes here and reds the API's main on its next,
+# unrelated push (DIVE-5904: #1286 took the blocks 370 -> 386, combined 604).
+# The blocks' share is the difference, graded here so this PR goes red itself.
+# Both numbers mirror the API test; change them only together with it.
+API_HALF_CAP=220
+COMBINED_CAP=600
+blk_words=$(sed -n '/^<!-- 5dive:task-lifecycle:begin/,/^<!-- 5dive:task-lifecycle:end/p; /^<!-- 5dive:hired-agents:begin/,/^<!-- 5dive:hired-agents:end/p' "$POLICY" | wc -w)
+blk_cap=$((COMBINED_CAP - API_HALF_CAP))
+(( blk_words <= blk_cap )) && ok "the two synced blocks are $blk_words words (<= $blk_cap, the box file's share after the API half)" \
+  || bad "the two synced blocks are $blk_words words (> $blk_cap)" "the API repo's combined cap ($COMBINED_CAP) reds on its next push; cut words, never raise a cap to fit"
+
 if grep -nE 'DIVE-[0-9]+' "$POLICY" >"$TMP/idents"; then
   bad "no internal row idents in the box file" "$(head -3 "$TMP/idents")"
 else ok "no internal row idents in the box file"; fi
