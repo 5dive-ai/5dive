@@ -178,8 +178,10 @@ mk_idpack() {
   printf '# Idpack\nYou are Idpack, the office manager.\n%s\n' "$2" >"$1/CLAUDE.md"
   printf 'name: Idpack\nvoice:\n  audio: %s\n' "$3" >"$1/registry-persona.yaml"
 }
-# What import would have left on disk: the renamed section, "\n", the tail.
-installed() { printf '# Olga\nYou are Olga, the office manager.\n%s\n\n%s' "$1" "$TAIL"; }
+# What import would have left on disk: the renamed section (its own CLAUDE.md,
+# then DIVE-5900's card section), "\n", the tail.
+SEC=$(_persona_card_section /dev/null)
+installed() { printf '# Olga\nYou are Olga, the office manager.\n%s\n\n%s\n\n%s' "$1" "$SEC" "$TAIL"; }
 sha() { sha256sum <"$1" | cut -d' ' -f1; }
 markers() { ls "$PENDING_RESTART_DIR" 2>/dev/null | wc -l | tr -d ' '; }
 mkdir -p "$IH"
@@ -201,6 +203,19 @@ is "10g the record holds the section's size" "$(rec .claudeMd.bytes olga)" "$(in
 is "10h the record holds the persona's sha" "$(rec .persona olga)" "\"$(sha "$IH/persona.yaml")\""
 is "10i one restart marker (the persona changed)" "$(markers)" 1
 is "10j status changed" "$(jq -r .status <<<"$out")" changed
+
+echo "== 10x. hired before DIVE-5900 (no record, no card section): the section is updated in =="
+VH="$AGENT_HOME_ROOT/agent-vera/.claude"; mkdir -p "$VH"
+printf '# Vera\nYou are Vera, the office manager.\nAnswer mail within a day.\n\n%s' "$TAIL" >"$VH/CLAUDE.md"
+printf 'Owner note.\n' >>"$VH/CLAUDE.md"
+jq '.agents.vera = {type:"claude", pack:{source:"marketplace", slug:"idpack"}}' "$REGISTRY" >"$TMP/r" && mv "$TMP/r" "$REGISTRY"
+out=$(_pack_sync_one vera "" 0 0)
+is "10xa updated, not drift" "$(jq -r .claudeMd.status <<<"$out")" updated
+grep -qxF '## Your card' "$VH/CLAUDE.md" && ok_ "10xb the card section landed" || bad_ "10xb card section missing"
+is "10xc the head is now the pack's section, byte for byte" "$(head -c "$(rec .claudeMd.bytes vera)" "$VH/CLAUDE.md" | sha256sum | cut -d' ' -f1)" "$(rec .claudeMd.sha vera | tr -d '"')"
+is "10xd the tail (CLI blocks + owner note) is kept" "$(tail -c "$(( ${#TAIL} + 12 ))" "$VH/CLAUDE.md")" "$(printf '%sOwner note.' "$TAIL")"
+out=$(_pack_sync_one vera "" 0 0)
+is "10xe and the next sync is unchanged" "$(jq -r .claudeMd.status <<<"$out")" unchanged
 
 echo "== 11. same pack again: unchanged, no restart =="
 rm -rf "$PENDING_RESTART_DIR"
@@ -309,7 +324,7 @@ grep -rq SECRETKEY "$REGISTRY" "$AGENT_HOME_ROOT" && bad_ "18d the key was writt
 echo "== 19. a codex seat: the section at the head of AGENTS.md, the return-channel doc kept =="
 CH="$AGENT_HOME_ROOT/agent-cody/.codex"; mkdir -p "$CH"
 CODEX_TAIL=$'# Return channel (DIVE-1410)\nReply with 5dive agent send.\n'
-printf '# Cody\nYou are Cody, the office manager.\nAnswer mail within a day.\n\n%s' "$CODEX_TAIL" >"$CH/AGENTS.md"
+printf '# Cody\nYou are Cody, the office manager.\nAnswer mail within a day.\n\n%s\n\n%s' "$SEC" "$CODEX_TAIL" >"$CH/AGENTS.md"
 jq '.agents.cody = {type:"codex", pack:{source:"marketplace", slug:"idpack"}}' "$REGISTRY" >"$TMP/r" && mv "$TMP/r" "$REGISTRY"
 FIX_PACK="$TMP/i1"; out=$(_pack_sync_one cody "" 0 0)
 is "19a baselined on AGENTS.md" "$(jq -r .claudeMd.status <<<"$out")" baselined
