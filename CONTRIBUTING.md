@@ -175,6 +175,12 @@ caught.
   | any type with `!:`, or a `BREAKING CHANGE` trailer | a **major** |
   | `fix` `test` `chore` `docs` `refactor` `ci` `perf` | a **patch** (`0.x.x`) |
 
+  **`feat` is for a new capability only** (lodar 2026-10-09: "we name features
+  too optimistic and broad"): something a user or an agent can do now that it
+  could not before, named by that capability. A changed agent-facing text, a
+  default, a message, a guard or a fix to an existing flow is `fix`, `docs` or
+  `chore`, and the title is no bigger than the diff.
+
   So `feat` is a release decision rather than a label — nobody passes a version
   level by hand any more (DIVE-4086). Do NOT copy the older prefixes still
   visible in `git log` (`cli:`, `ui:`, `install:`, `build:`, or a bare
