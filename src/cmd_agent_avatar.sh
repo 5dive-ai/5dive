@@ -45,7 +45,12 @@ _agent_avatar_as() { # <agent> <cmd...>
   local agent="$1"; shift
   if _agent_avatar_is_root; then
     command -v runuser >/dev/null 2>&1 || { printf 'runuser not found; refusing to touch agent-%s as root\n' "$agent" >&2; return 1; }
-    runuser -u "agent-${agent}" -- "$@"
+    # From /, not root's cwd: run as the agent from /root, `find` cannot restore
+    # its starting directory and exits 1 (a live box, 2026-10-09).
+    (
+      cd / || exit 1
+      runuser -u "agent-${agent}" -- "$@"
+    )
   else
     "$@"
   fi
@@ -303,8 +308,11 @@ _agent_avatar_backfill() {
     # agent (_agent_avatar_as): root reads nothing whose path the agent controls.
     # Captured whole before the loop reads it (no procsub: an interrupted one
     # would truncate the walk silently, the epipe census guard's shape).
-    personas=$(_agent_avatar_as "$name" find "$home" -maxdepth 4 \( -name node_modules -o -name .git -o -name .cache \) -prune \
-                 -o -type f \( -name '*.persona.yaml' -o -name 'persona.yaml' \) -printf '%T@ %p\n' 2>/dev/null \
+    # `|| true`: find exits 1 on any directory the agent cannot read, with what it
+    # DID find on stdout. Under the CLI's errexit + pipefail that ended the whole
+    # pass on the first agent; a partial walk is still the answer.
+    personas=$({ _agent_avatar_as "$name" find "$home" -maxdepth 4 \( -name node_modules -o -name .git -o -name .cache \) -prune \
+                 -o -type f \( -name '*.persona.yaml' -o -name 'persona.yaml' \) -printf '%T@ %p\n' 2>/dev/null || true; } \
                | sort -rn | cut -d' ' -f2-)
     while IFS= read -r yaml; do
       [[ -n "$yaml" ]] || continue
@@ -328,7 +336,8 @@ _agent_avatar_backfill() {
       (( oa_down )) && { unchecked+=("$name"); continue; }
       src=$(_agent_avatar_openagent_url "$name") || continue
       got=$(mktemp)
-      _agent_avatar_fetch "$src" "$got"; rc=$?
+      # `|| rc=$?`, never `; rc=$?`: under errexit a 404 (22) ended the pass here.
+      rc=0; _agent_avatar_fetch "$src" "$got" || rc=$?
       if (( rc != 0 )) || ! _agent_avatar_sniff "$got" >/dev/null; then
         rm -f -- "$got"; got=""
         case "$rc" in

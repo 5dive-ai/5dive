@@ -252,6 +252,27 @@ BF=$(
 [[ "$BF" != *"'theta'"* && "$BF" == *"would set 'iota'"* ]] \
   && okk 'backfill skips an avatar.png that is a symlink (and still sets a clean agent)' || bad "backfill link arm: $BF"
 
+# Under errexit, as the CLI runs it: `find` exits 1 when it meets a directory the
+# agent cannot read (or, run from root's cwd, cannot return to /root), with the
+# personas it DID find on stdout. That partial walk is the answer, not a crash
+# (a live box, 2026-10-09: every `backfill` died on the first agent).
+if (( EUID != 0 )); then
+  h="$AGENT_HOME_ROOT/agent-lambda"; : >"$AS_LOG"; : >"$ROOT_LOG"; rm -f "$h/.claude/avatar.png"
+  mkdir -p "$h/locked"; chmod 000 "$h/locked"
+  BF=$(
+    registry_read() { printf '{"agents":{"lambda":{}}}\n'; }
+    ensure_state_ro() { :; }; step() { echo "STEP: $*"; }; warn() { echo "WARN: $*"; }
+    ok() { echo "OK: $1"; }; json_array() { :; }; fail() { echo "FAILCALL: $2"; exit 1; }
+    set -euo pipefail
+    STATE_DIR="$TMP" as_root _agent_avatar_backfill 2>&1
+  ); rc=$?
+  chmod 755 "$h/locked"
+  (( rc == 0 )) && cmp -s "$TMP/a.gif" "$h/.claude/avatar.png" \
+    && okk 'a walk that meets an unreadable directory still sets the portrait it found (errexit, as the CLI runs it)' \
+    || bad "partial-walk arm: rc=$rc $BF"
+else
+  echo "skip: partial-walk arm (root reads a 000 directory)"
+fi
 # --- DIVE-5413: a portrait hosted only on the box's own OpenAgent page -------
 # ceo (lodar 10-02, a customer box): made his OpenAgent portrait in June, and
 # the box serves it at https://<domain>/openagent/ceo.png, but no persona
@@ -283,6 +304,10 @@ oa_backfill() { # <provisioning.env> -> the backfill's output, down the root bra
     ensure_state_ro() { :; }; step() { echo "STEP: $*"; }; warn() { echo "WARN: $*"; }
     ok() { echo "OK: $1"; }; json_array() { :; }; fail() { echo "FAILCALL: $2"; exit 1; }
     _agent_avatar_provisioning() { printf '%s\n' "$prov"; }
+    # The CLI runs every verb under errexit + pipefail; this harness does not, so
+    # without this line a failure that kills the real pass reads as a pass here
+    # (a live box, 2026-10-09: a 404 for one agent ended `backfill` with exit 22).
+    set -euo pipefail
     STATE_DIR="$TMP/state" as_root _agent_avatar_backfill --once 2>&1
   )
 }
