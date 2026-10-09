@@ -1168,6 +1168,15 @@ main() {
       # no flags, --no-remove; src/cmd_pkg.sh). Audited root-side. Never advertised.
       cmd_pkg_delegated "$@"
       exit $? ;;
+    _dashboard_relay)
+      # DIVE-5894: hidden, privileged, self-scoped rail for a standard seat's
+      # dashboard chat adapter, which can no longer read the box token. Reachable
+      # ONLY via the exact-path NOPASSWD line render_standard_sudoers writes; the
+      # operation travels on stdin, the seat is derived from SUDO_UID
+      # (src/cmd_dashboard_relay.sh). Not audited: it is a five-minute poll.
+      # Never advertised.
+      cmd_dashboard_relay "$@"
+      exit $? ;;
     _self_account)
       # DIVE-5367: hidden, privileged, self-scoped account rail for a standard
       # seat. Reachable ONLY via the exact-path NOPASSWD line render_standard_sudoers

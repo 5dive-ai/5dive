@@ -609,6 +609,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive browser _connect"|\
         "/usr/local/bin/5dive _merge_do"*|\
         "/usr/local/bin/5dive _route_do"|"/usr/local/bin/5dive _pkg_do"|\
+        "/usr/local/bin/5dive _dashboard_relay"|\
         "/usr/local/bin/5dive sysadmin _broker"|"/usr/local/bin/5dive --json sysadmin _broker") has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
@@ -770,6 +771,12 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _task_channel
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive partner hire *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive hire-link *
 ${user} ALL=(root) NOPASSWD: /usr/local/lib/5dive/push-notify.sh *
+# DIVE-5894: the fourth thing, missed by DIVE-5690 - this seat's dashboard chat
+# adapter polls, acks and replies with the box identity. EXACT path, NO args, NO
+# wildcard: the operation travels on stdin, the seat is derived from SUDO_UID
+# and is the agent of every call, so it reads and replies as ITSELF only. The
+# root side builds each body itself and posts to one of three fixed URLs.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _dashboard_relay
 # DIVE-5367: let this seat read the account usage board and switch ITSELF
 # between accounts the box already holds, so the owner Telegram /account
 # picker and /usage work on a standard seat. EXACT path, NO args, NO wildcard:
