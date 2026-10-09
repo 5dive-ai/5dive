@@ -86,8 +86,10 @@ _bug_spool() {
 }
 
 # _bug_post <payload-json> — POST /server/bug-reports with the box token.
-# 0 accepted · 2 refused (a 4xx other than 408/429 is an answer, not a blip) ·
-# 1 not reached (no readable box token, network, 5xx, 408, 429). Sets _BUG_HTTP
+# 0 accepted · 2 refused (a 4xx other than 404/408/429 is an answer, not a blip) ·
+# 1 not reached (no readable box token, network, 5xx, 404, 408, 429). 404 is
+# "not reached" because a CLI released before the API that serves this route
+# must keep its reports, not drop them. Sets _BUG_HTTP
 # to the status seen and _BUG_ID to the API's report id. The bearer goes in on
 # STDIN (`-H @-`), never argv — DIVE-5168's rule.
 _BUG_HTTP=""; _BUG_ID=""
@@ -106,7 +108,7 @@ _bug_post() {
   _BUG_ID=$(jq -r '.id // empty' <<<"${out%$'\n'*}" 2>/dev/null) || _BUG_ID=""
   case "$_BUG_HTTP" in
     2??) return 0 ;;
-    408|429) return 1 ;;
+    404|408|429) return 1 ;;
     4??) return 2 ;;
   esac
   return 1

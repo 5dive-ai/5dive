@@ -132,7 +132,11 @@ chk "...and is not spooled" 0 "$(find "$SPOOL" -name '*.json' | wc -l)"
 echo 401 > "$TMP/status"
 ( cmd_bug --verb=task --exit=1 --what="key refused" --no-probes --file --owner-approved </dev/null ) >/dev/null 2>&1
 chk "a 401 exits E_AUTH_REQUIRED" "$E_AUTH_REQUIRED" "$?"
-rm -f "$TMP/status"
+echo 404 > "$TMP/status"
+( cmd_bug --verb=task --exit=1 --what="endpoint not deployed yet" --no-probes --file --owner-approved </dev/null ) >/dev/null 2>&1
+chk "a 404 (CLI released before the API route) exits E_TIMEOUT" "$E_TIMEOUT" "$?"
+chk "...and IS spooled for the next approved call" 1 "$(find "$SPOOL" -name '*.json' | wc -l)"
+rm -f "$TMP/status" "$SPOOL"/*.json
 
 # ── 5. no readable box key: spooled, and the reason is named ──────────────────
 err=$(CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/none.env" cmd_bug --verb=task --exit=1 --what="no key" --no-probes --file --owner-approved </dev/null 2>&1)
