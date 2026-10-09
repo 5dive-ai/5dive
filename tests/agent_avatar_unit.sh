@@ -142,7 +142,7 @@ cmp -s "$TMP/a.gif" "$h/.claude/avatar.png" && [[ ! -s "$ROOT_LOG" ]] \
 # can see): inside _agent_avatar_install every write command is behind the drop,
 # and the drop itself is runuser as agent-<agent>.
 body=$(awk '/^_agent_avatar_install\(\)/{e=1} e{print} e&&/^}/{exit}' "$ROOT/src/cmd_agent_avatar.sh")
-bare=$(grep -nE '(^|[;&|{(!]|&&|\|\|)[[:space:]]*(mkdir|rm|dd|chmod|chown|mv|install|cp|ln|touch)[[:space:]]' <<<"$body" | grep -v '^[0-9]*:[[:space:]]*#')
+bare=$(grep -nE '(^|[;&|{(!]|&&|\|\|)[[:space:]]*(mkdir|rm|dd|chmod|chown|mv|install|cp|ln|touch)[[:space:]]' <<<"$body" | grep -v '^[0-9]*:[[:space:]]*#') || bare=""
 [[ -z "$bare" ]] && okk 'no write in _agent_avatar_install runs outside _agent_avatar_as' || bad "bare write in install: $bare"
 grep -qE '^\s*runuser -u "agent-\$\{agent\}" -- "\$@"' "$ROOT/src/cmd_agent_avatar.sh" \
   && okk '_agent_avatar_as drops to agent-<agent> with runuser' || bad '_agent_avatar_as does not runuser to the agent'
