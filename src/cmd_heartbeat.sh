@@ -1593,9 +1593,13 @@ _hb_seat_advanced() {
   # (A) TASKS — "closed, delivered, rejected or updated any row in that window".
   # `updated_at` is the broad one and the only one that catches a body note, so it
   # is what we read; the engine-stamp exclusion is what keeps it honest.
+  # DIVE-5896: a recurring TEMPLATE is never work a seat did. The scheduler's
+  # skip stamp (last_skipped_at, "open instance") bumps its updated_at through
+  # tasks_touch_au, so a stalled instance's own template held rung 2 forever.
   hit=$(db "SELECT 1 FROM tasks
              WHERE assignee IN (${seats})
                AND id <> ${tid}
+               AND COALESCE(kind,'') <> 'recurring'
                AND COALESCE(updated_at,'') > $(sqlq "$since")
                AND NOT (COALESCE(nudge_escalated_at,'') > $(sqlq "$since")
                      OR COALESCE(nudge_parked_at,'')    > $(sqlq "$since"))
@@ -4374,10 +4378,24 @@ ${_q_sql}" 2>/dev/null || true)
         _wline=$(grep -iE 'hit your [^·]*limit|usage limit reached|limit reached|reached your .* limit' <<<"$_wpane" | tail -n 1) || _wline=""
         _wline=$(sed -E 's/^[[:space:][:punct:]●⎿⚠]*//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' <<<"${_wline:-usage limit}")
         _wdl=unknown; _wep=""
+        # DIVE-5896 — anchor the reset on the CLAIM. The turn that printed this
+        # banner began at the claim, so a clock-only `resets 4pm` is the first
+        # 4pm after it, not the nearest 4pm to now: read nearest, a weekly wall
+        # more than 12h from its reset was yesterday's, `lapsed`, and the park
+        # never fired (a customer box, 2026-10-09: requeued every 30 min from
+        # 16:00Z to 04:00Z). A reset that has passed since the claim still reads
+        # lapsed, so a stale banner still requeues.
+        local _wnow _wanchor; _wnow=$(date +%s)
+        if [[ "${started_epoch:-}" =~ ^[0-9]+$ ]]; then _wanchor="$started_epoch"
+        else _wanchor=$(( _wnow - ${age_min:-0} * 60 )); fi
         if declare -F _sup_quota_deadline >/dev/null 2>&1; then
-          IFS=$'\x1f' read -r _wdl _wep <<<"$(_sup_quota_deadline "$_wpane")"
+          IFS=$'\x1f' read -r _wdl _wep <<<"$(_sup_quota_deadline "$_wpane" "$_wnow" "$_wanchor")"
         fi
-        if [[ "$_wdl" != lapsed ]]; then
+        if [[ "$_wdl" == lapsed ]]; then
+          # DIVE-5896 — never a silent skip: the reader of a requeue loop has to
+          # be able to tell "no wall" from "a wall whose reset already passed".
+          _hb_log "[$name] $(_hb_ident "$id") idle ${age_min}m on a usage wall (${_wline:0:160}) whose printed reset $(date -u -d "@${_wep:-0}" '+%Y-%m-%d %H:%MZ' 2>/dev/null || printf '?') has PASSED since the claim — stale banner, not parked; requeueing (DIVE-5896)"
+        else
           _wwake="+1h"
           if [[ "$_wdl" == live && "$_wep" =~ ^[0-9]+$ ]]; then
             _wwake=$(date -u -d "@${_wep}" '+%Y-%m-%d %H:%M' 2>/dev/null) || _wwake="+1h"
