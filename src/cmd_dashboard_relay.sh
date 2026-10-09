@@ -24,9 +24,15 @@
 #   * An ack names only ids this seat's own pending poll returned. The control
 #     plane scopes a DM ack by owner, not by agent, so without this one seat
 #     could mark another agent's messages collected and hold them back.
-#   * A reply attachment must be a copy in the shared chat-downloads outbox
-#     (the adapter already copies there). A path anywhere else is refused, so the
-#     rail cannot be used to point the owner's download at a root-only file.
+#   * A reply attachment must be a regular file directly in the shared
+#     chat-downloads outbox (the adapter already copies there). This is checked
+#     when the reply is POSTED only: the outbox is group-writable, and the
+#     download is served later by shelld, which runs as `claude`, checks the path
+#     lexically against /home and follows symlinks. So a seat can still swap the
+#     file for a symlink after the post. What that reaches is what `claude` can
+#     read, and it goes to the OWNER's download, never back to the seat; the
+#     owner's own Files browser already reaches the same set. Closing it is
+#     shelld's job (5dive-api), not this rail's.
 #
 # Output is the control plane's answer: the HTTP status on the first line, the
 # body after it. The adapter rebuilds a Response from it, so its retry, ack and
@@ -39,8 +45,6 @@
 _dash_relay_api_base() { local b="${FIVE_API_BASE:-https://api.5dive.com}"; printf '%s' "${b%/}"; }
 _dash_relay_outbox()   { local d="${DASHBOARD_OUTBOX:-/home/claude/chat-downloads}"; printf '%s' "${d%/}"; }
 _dash_relay_seen_dir() { printf '%s' "${FIVEDIVE_DASHBOARD_RELAY_DIR:-/var/lib/5dive/dashboard-relay}"; }
-# Seam: the harness replaces the network call.
-_dash_relay_curl()     { curl -sS --max-time 30 "$@"; }
 
 # The box token, read as root. Empty when there is none.
 _dash_relay_token() {
@@ -52,13 +56,25 @@ _dash_relay_token() {
   printf '%s' "$t"
 }
 
-# _dash_relay_call <method> <url> [json-body] — print "<status>\n<body>".
+# _dash_relay_call <method> <url> <json-body|""> <token> — print "<status>\n<body>".
+#
+# THE TOKEN NEVER TOUCHES ARGV (the DIVE-5168 rule, src/cmd_partner.sh). /proc is
+# not mounted hidepid on our boxes, so a root curl's command line is readable by
+# the very seat this rail keeps the token from: the bearer goes in on curl's
+# STDIN (`-H @-`), and the body, which carries the owner's messages, from a
+# root-only temp file (`--data-binary @file`). `ps` shows neither.
 _dash_relay_call() {
-  local method="$1" url="$2" body="${3:-}" tok="$4" out code rc=0
+  local method="$1" url="$2" body="${3:-}" tok="$4" out bodyf="" code rc=0
   out=$(mktemp) || fail "$E_GENERIC" "_dashboard_relay: cannot create a temp file."
-  local -a args=(-o "$out" -w '%{http_code}' -X "$method" -H "Authorization: Bearer ${tok}")
-  [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' --data-binary "$body")
-  code=$(_dash_relay_curl "${args[@]}" "$url") || rc=$?
+  local -a args=(-sS --max-time 30 -o "$out" -w '%{http_code}' -X "$method" -H @-)
+  if [[ -n "$body" ]]; then
+    bodyf=$(mktemp) || { rm -f "$out"; fail "$E_GENERIC" "_dashboard_relay: cannot create a temp file."; }
+    printf '%s' "$body" >"$bodyf"
+    args+=(-H 'Content-Type: application/json' --data-binary "@${bodyf}")
+  fi
+  code=$(printf 'Authorization: Bearer %s\n' "$tok" | curl "${args[@]}" "$url") || rc=$?
+  tok=""
+  [[ -n "$bodyf" ]] && rm -f "$bodyf"
   if (( rc != 0 )) || [[ ! "$code" =~ ^[1-5][0-9][0-9]$ ]]; then
     rm -f "$out"
     fail "$E_GENERIC" "_dashboard_relay: the control plane did not answer (curl rc=${rc})."
