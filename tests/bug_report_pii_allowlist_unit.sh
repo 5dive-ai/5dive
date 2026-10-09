@@ -12,16 +12,19 @@
 #
 # Hermetic: _sc_dispatch is overridden with a fixture table (same technique as
 # tests/selfcheck_unit.sh), so this never shells out, never hits the network and
-# never touches the live task store. GH_ORG is pinned so cmd_bug.sh's gh_org()
-# calls never probe github.com.
+# never touches the live task store. The transport (_bug_post) is stubbed in
+# every arm that files; tests/bug_report_file_to_api_unit.sh drives the real one
+# against a mock endpoint. The asked-ledger and spool live in a temp dir.
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
+trap 'rc=$?; [[ -n "${BUG_TMP:-}" ]] && rm -rf "$BUG_TMP"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 SRC=src
 export GH_ORG="5dive-ai"
+BUG_TMP=$(mktemp -d)
+export XDG_STATE_HOME="$BUG_TMP/state" FIVE_BUG_ASKED_LEDGER="$BUG_TMP/box-asked.tsv"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/self.sh cmd_selfcheck.sh cmd_bug.sh; do
   source "$SRC/$f"
@@ -91,12 +94,6 @@ else
   ok_t "the marker does not reach the rendered payload"
 fi
 
-body=$(_bug_body_markdown "$payload2")
-if grep -q "$MARKER" <<<"$body"; then
-  fail_t "MARKER LEAKED into the rendered issue body: $body"
-else
-  ok_t "the marker does not reach the rendered issue body (the body is built from the payload only)"
-fi
 
 # ── 4. shape guard: a NEW emitter referencing .reason/.detail/.asserts fails here
 #      too, in CI, rather than in a filed issue (same rationale as
@@ -117,13 +114,13 @@ else
   ok_t "newlines are stripped from --verb"
 fi
 
-# ── 6. NEVER auto-files: the default (preview) path never calls cmd_gh ─────────
-cmd_gh() { fail_t "cmd_gh was invoked WITHOUT --file — this is the auto-file bug the ticket forbids"; echo "unreachable"; }
+# ── 6. NEVER auto-files: the default (preview) path never calls _bug_post ──────
+_bug_post() { fail_t "_bug_post was invoked WITHOUT --file — this is the auto-file bug the ticket forbids"; return 0; }
 _sc_dispatch() { printf '%s\n' "pass||clean"; }
 out=$(cmd_bug --verb=doctor --exit=1 2>/tmp/bug_unit_err.$$)
 rc=$?
 chk "bare '5dive bug' (no --file) exits 0 without filing" 0 "$rc"
-if grep -q "Nothing filed" /tmp/bug_unit_err.$$; then
+if grep -q "Nothing sent" /tmp/bug_unit_err.$$; then
   ok_t "bare '5dive bug' says nothing was filed"
 else
   fail_t "no 'nothing filed' notice printed: $(cat /tmp/bug_unit_err.$$)"
@@ -154,11 +151,10 @@ fi
 # the rendered body, and the source itself.
 _sc_dispatch() { printf '%s\n' "pass||clean"; }
 p_nowhat=$(_bug_render_payload "gh" "4" 1)
-body_nowhat=$(_bug_body_markdown "$p_nowhat")
-if grep -qF '<!--' <<<"$body_nowhat"; then
-  fail_t "the rendered body still carries an HTML comment placeholder: $body_nowhat"
+if grep -qF '<!--' <<<"$p_nowhat"; then
+  fail_t "the rendered payload still carries an HTML comment placeholder: $p_nowhat"
 else
-  ok_t "a description-less body carries NO html-comment placeholder (the #526/#553 shape)"
+  ok_t "a description-less payload carries NO html-comment placeholder (the #526/#553 shape)"
 fi
 if grep -qF '<!--' "$SRC/cmd_bug.sh"; then
   fail_t "cmd_bug.sh still contains an html comment it could emit into an issue body"
@@ -169,17 +165,8 @@ fi
 WHAT='ran gh pr view and it died before reaching gh'
 p_what=$(_bug_render_payload "gh" "4" 1 "$WHAT" 'gh pr view 51 --json state')
 chk "--what reaches the payload verbatim" "\"$WHAT\"" "$(jq -c '.what' <<<"$p_what")"
-body_what=$(_bug_body_markdown "$p_what")
-if grep -qF "$WHAT" <<<"$body_what"; then
-  ok_t "--what is rendered under '## What happened' in the issue body"
-else
-  fail_t "--what never reached the issue body: $body_what"
-fi
-if grep -qF 'gh pr view 51 --json state' <<<"$body_what"; then
-  ok_t "--argv is rendered as the failing invocation"
-else
-  fail_t "--argv never reached the issue body: $body_what"
-fi
+chk "--argv reaches the payload as the failing invocation" '"gh pr view 51 --json state"' \
+  "$(jq -c '.invocation' <<<"$p_what")"
 
 # ── 9. --argv redaction + the secret backstop ─────────────────────────────────
 # Reserved-fake secret shapes only — never a real credential in a fixture.
@@ -212,14 +199,16 @@ fi
 # with the subshell and leave "nothing was filed" asserting nothing at all.
 FILEMARK=$(mktemp); BODYMARK=$(mktemp)
 : > "$FILEMARK"; : > "$BODYMARK"
-cmd_gh() {
+_bug_post() {
   echo filed >> "$FILEMARK"
-  while [[ $# -gt 0 ]]; do [[ "$1" == "--body-file" ]] && cat "$2" > "$BODYMARK"; shift; done
-  echo "https://github.com/5dive-ai/5dive/issues/999"
+  printf '%s\n' "$1" > "$BODYMARK"
+  _BUG_HTTP=201; _BUG_ID=999
+  return 0
 }
+_bug_drain() { printf '0'; }
 # sanity: the marker file mechanism actually records a call (else every
 # "nothing was filed" arm below is vacuous — the exact trap this replaced).
-cmd_gh --body-file /dev/null >/dev/null
+_bug_post '{}' >/dev/null
 chk "sanity: the stub records a filing through the marker file" 1 "$(wc -l < "$FILEMARK")"
 : > "$FILEMARK"
 
@@ -238,12 +227,12 @@ chk "--what of pure whitespace is refused too" "$E_USAGE" "$?"
 
 # ...and the positive arm, so the refusal is not just "filing is broken now".
 : > "$FILEMARK"; : > "$BODYMARK"
-cmd_bug --verb=gh --exit=4 --what="$WHAT" --file </dev/null >/dev/null 2>&1
+cmd_bug --verb=gh --exit=4 --what="$WHAT" --file --owner-approved </dev/null >/dev/null 2>&1
 chk "--file WITH --what still files (the guard did not just break the verb)" 1 "$(wc -l < "$FILEMARK")"
 # End to end: the bytes gh was actually handed carry the description. This is
 # the whole ticket — #526/#553 reached exactly this point with a placeholder.
 if grep -qF "$WHAT" "$BODYMARK"; then
-  ok_t "the body handed to 'gh issue create' carries the description"
+  ok_t "the payload handed to the API carries the description"
 else
   fail_t "the FILED body does not carry --what: $(cat "$BODYMARK")"
 fi
@@ -260,7 +249,7 @@ fi
 # through the built bundle, not by any arm above, which is why this one exists.
 : > "$FILEMARK"; : > "$BODYMARK"
 cmd_bug --verb=gh --exit=4 --what="$WHAT" \
-  --argv='gh pr view 51 --token=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' --file </dev/null >/dev/null 2>&1
+  --argv='gh pr view 51 --token=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' --file --owner-approved </dev/null >/dev/null 2>&1
 chk "a token behind a known flag is REDACTED, not refused — the report still files" 1 "$(wc -l < "$FILEMARK")"
 if grep -qF 'ghp_AAAA' "$BODYMARK"; then
   fail_t "the token reached the FILED body: $(cat "$BODYMARK")"
@@ -270,7 +259,7 @@ fi
 
 # A token-shaped string in the description is refused, not silently published.
 : > "$FILEMARK"
-err_sec=$(cmd_bug --verb=agent --exit=1 --what="broke while using ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" --file </dev/null 2>&1)
+err_sec=$(cmd_bug --verb=agent --exit=1 --what="broke while using ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" --file --owner-approved </dev/null 2>&1)
 chk "--file refuses a token-shaped string in --what" "$E_USAGE" "$?"
 chk "...and files nothing" 0 "$(wc -l < "$FILEMARK")"
 rm -f "$FILEMARK" "$BODYMARK"

@@ -511,18 +511,20 @@ Health:
     skipped everywhere.
 
   5dive bug --what=<text> [--verb=<name>] [--exit=<code>] [--argv=<line>]
-            [--no-probes] [--file]
-    Preview (default) or file a diagnostic bug report against 5dive-ai/5dive.
+            [--no-probes] [--file [--owner-approved]]
+    Preview (default) or send a diagnostic bug report to 5dive's own API, with
+    this box's key — never to GitHub or any public page (DIVE-5926).
     Payload is a fixed ALLOWLIST — version, OS, bash version, install method,
     the verb that failed + its exit code, selfcheck probe name+verdict pairs
     (never the free-text reason/detail fields underneath them), and the two
     fields you supply: --what and --argv. --what is REQUIRED to --file: a TTY
-    is prompted for it, and with no TTY an empty report is REFUSED rather than
-    opened against a public repo (DIVE-3136). Bare \`5dive bug\` only builds and
-    prints the payload; NEVER auto-files. --file re-prints the identical
-    payload and then opens it (via \`5dive gh issue create\`, so it lands as
-    5dive-bot); a TTY also gets an interactive y/N. Agents take the same --file
-    flag a human does — no separate unattended path.
+    is prompted for it, and with no TTY an empty report is REFUSED (DIVE-3136).
+    Bare \`5dive bug\` only builds and prints the payload; NEVER auto-files.
+    Preview freely; send only after your owner agrees: --file re-prints the
+    identical payload, asks y/N on a TTY, and with no TTY (an agent) requires
+    --owner-approved. The preview says when the owner was already asked about
+    this defect, or about another one today — then don't ask again. An
+    unreachable API spools the report; the next approved --file sends it.
 
   5dive acp
     Speak ACP (Agent Client Protocol) over stdin/stdout so an ACP client — Buzz
