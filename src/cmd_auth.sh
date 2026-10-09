@@ -2243,6 +2243,34 @@ cmd_auth_reap() {
      --argjson e "$expired" --argjson r "$removed" --argjson k "$kept" --arg d "$dry"
 }
 
+# Spawn <login_cmd> for session <dir> as user `claude`: a tmux server on the
+# session's private socket hosting `script -q -f -c "<login_cmd>" login.log`, then
+# record the PTY child's pid in meta.json so teardown can still reach it if the
+# tmux server dies first and the login CLI gets reparented to init (DIVE-1884).
+# Shared by `agent auth start` and `tool google start` (DIVE-5934). <extra_env> is
+# VAR=value words for env(1); <preseed> runs in the login shell before tmux.
+# Returns non-zero when tmux could not be started.
+auth_spawn_pty() {
+  local dir="$1" login_cmd="$2" pane_width="${3:-200}" extra_env="${4:-}" preseed="${5:-}"
+  local sid session sock log pane_pid
+  sid=$(basename "$dir")
+  session="auth-${sid}"
+  sock="${dir}/tmux.sock"
+  log="${dir}/login.log"
+  sudo -u claude -H bash -lc "
+    ${preseed}
+    tmux -S '$sock' new-session -d -s '$session' -x $pane_width -y 50 \
+      'env $extra_env script -q -f -c \"$login_cmd\" $log'
+  " >&2 || return 1
+
+  pane_pid=$(sudo -u claude tmux -S "$sock" list-panes -a -F '#{pane_pid}' 2>/dev/null | head -1)
+  if [[ "$pane_pid" =~ ^[0-9]+$ ]]; then
+    jq --argjson pp "$pane_pid" '.panePid = $pp' "${dir}/meta.json" \
+      > "${dir}/meta.json.tmp" && mv "${dir}/meta.json.tmp" "${dir}/meta.json"
+  fi
+  return 0
+}
+
 # Best-effort reap from the `auth start` path — never let a sweep failure block
 # someone from logging in.
 auth_reap_quiet() {
@@ -2593,20 +2621,8 @@ cmd_auth_start() {
   # line. Other types print the URL to $log, where pane width is irrelevant.
   local pane_width=200
   [[ "$type" == "antigravity" ]] && pane_width=700
-  sudo -u claude -H bash -lc "
-    ${preseed}
-    tmux -S '$sock' new-session -d -s '$session' -x $pane_width -y 50 \
-      'env $extra_env script -q -f -c \"$login_cmd\" $log'
-  " >&2 || fail "$E_GENERIC" "failed to spawn tmux session"
-
-  # Record the PTY child's pid so teardown can still reach it if the tmux
-  # server dies first and the login CLI gets reparented to init (DIVE-1884).
-  local pane_pid
-  pane_pid=$(sudo -u claude tmux -S "$sock" list-panes -a -F '#{pane_pid}' 2>/dev/null | head -1)
-  if [[ "$pane_pid" =~ ^[0-9]+$ ]]; then
-    jq --argjson pp "$pane_pid" '.panePid = $pp' "${dir}/meta.json" \
-      > "${dir}/meta.json.tmp" && mv "${dir}/meta.json.tmp" "${dir}/meta.json"
-  fi
+  auth_spawn_pty "$dir" "$login_cmd" "$pane_width" "$extra_env" "$preseed" \
+    || fail "$E_GENERIC" "failed to spawn tmux session"
 
   ok "device-code session started" \
      '{sessionId:$s, type:$t, profile:$p, state:"pending_url"}' \

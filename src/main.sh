@@ -351,6 +351,7 @@ Tasks (shared queue, sqlite — any agent, no sudo):
 
 Tool keys (every agent sees them as env vars; values on stdin):
   5dive tool ls | sudo 5dive tool set <github|vercel|stripe|...|bitrix24|amocrm|hubspot|...> (see 5dive tool help) | sudo 5dive tool rm <tool>
+  sudo 5dive tool google start|poll <session>|submit <session>|cancel <session>   # Google sign-in shared by every agent; rm google signs out
 
 Triggers (signed external event -> ordinary task):
   sudo 5dive trigger add github --name=<n> --event=issues.labeled --repo=owner/repo --assignee=<agent> --secret-from-stdin
@@ -1478,7 +1479,12 @@ main() {
     tool|tools)
       # DIVE-5366: keys for the tools agents use (GitHub, Vercel, Stripe, ...),
       # pasted in the Mini App. Values arrive on STDIN, so argv is safe to audit.
-      case "${1:-}" in set|rm|remove) AUDIT_CMD="tool ${1}"; AUDIT_ARGS=("${@:2}") ;; esac
+      # DIVE-5934: a Google sign-in's start/submit/cancel are audited too; its code
+      # also arrives on STDIN. poll is not (the Mini App calls it every few seconds).
+      case "${1:-}" in
+        set|rm|remove) AUDIT_CMD="tool ${1}"; AUDIT_ARGS=("${@:2}") ;;
+        google) case "${2:-}" in start|submit|cancel) AUDIT_CMD="tool google ${2}"; AUDIT_ARGS=("${@:3}") ;; esac ;;
+      esac
       cmd_tool "$@" ;;
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
