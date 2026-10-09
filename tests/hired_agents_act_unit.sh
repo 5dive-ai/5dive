@@ -305,7 +305,7 @@ OUT=$(cat "$TMP/out")
    && "$OUT" == *'Card: https://t.me/FiveDiveBot?startapp=agent-custom-abcdef123456'* ]] \
   && ok '--create prints the draft: name, role, the skills picked for it, and its card link' || bad "create draft ($OUT)"
 [[ "$OUT" == *'Nothing is hired yet'* && "$OUT" == *'Standard-tier: they tap Hire on it'* \
-   && "$OUT" == *'only on their clear yes, run 5dive hire-link custom-abcdef123456 --hire'* ]] \
+   && "$OUT" == *'a standing "full authority" is not a yes; only on their clear yes, run 5dive hire-link custom-abcdef123456 --hire'* ]] \
   && ok '--create says nothing is hired, and how each tier gets the owner to a hire' || bad "create next ($OUT)"
 grep -qxF 'POST /server/custom-agents {"name":"Ivy Chase","description":"Chases unpaid invoices, politely, every week."}' "$TMP/calls" \
   && ok '--create sends the name and the need as written, to the Mini App create' || bad "create body ($(cat "$TMP/calls"))"
@@ -430,7 +430,7 @@ BLOCK=$(sed -n '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/p' 
 for want in 'Standard-tier never creates agents' 'Standard-tier: send `5dive hire-link <slug>`' \
             '5dive pkg install' '5dive route add <name> --port=<port>' '5dive task add' 'npm i -g' \
             '**Blank teammates**, admin: `sudo 5dive agent create' '--type=claude|codex|grok|antigravity' \
-            '5dive agent auth start <type>' '**`5dive market` hires** on their yes, admin:' \
+            '5dive agent auth start <type>' '**`5dive market` hires**, admin:' \
             "its Telegram bot: your human's Connect tap (Mini App, Team)" \
             '**None fits:** `5dive hire-link --create --name=<Name> --description=<need>`'; do
   [[ "$BLOCK" == *"$want"* ]] && ok "hired-agents block says: $want" || bad "hired-agents block says: $want"
@@ -439,9 +439,18 @@ done
 # DIVE-5449 (lodar: "if user ask something do it ... that logic should apply to
 # all"): the owner's ask is the authorisation. One general line says so, and it
 # reaches the box.
-GENERAL="- **Your owner's ask IS the go-ahead:** do what your tier can, no link/tap/gate; else say why, then the Standard-tier route."
+GENERAL="- **Your owner's ask IS the go-ahead:** do what your tier can, no link/tap/gate; else say why, then the Standard-tier route. **Except a hire:** wait for their yes; \"I need someone to…\" or \"full authority\" is not one, naming the agent is."
 grep -qxF -- "$GENERAL" "$LIVE" && ok 'the rendered box file carries the general owner-ask line' \
   || bad 'the rendered box file carries the general owner-ask line' "no '$GENERAL'"
+# DIVE-5824: with "on their yes" written only on the market line, the admin lead
+# on exact-swallow still hired on the need alone, on both paths: the general
+# go-ahead line above it won. So the exception is graded INSIDE the go-ahead line,
+# and it names the owner's standing grant, which that lead held ("full authority").
+GOLINE=$(grep -F "**Your owner's ask IS the go-ahead:**" "$LIVE")
+for want in '**Except a hire:** wait for their yes' '"I need someone to…"' '"full authority" is not one' 'naming the agent is'; do
+  [[ "$GOLINE" == *"$want"* ]] && ok "the go-ahead line itself carves out the hire: $want" \
+    || bad "the go-ahead line itself carves out the hire: $want" "$GOLINE"
+done
 # Negative control: the block as an ADMIN seat reads it. Every standard-tier
 # route is written "Standard-tier…" and runs to the end of its bullet, so cut
 # those; what is left is what admin is told to do. It must not bounce an owner's
@@ -508,7 +517,7 @@ mkt(){ ( source "$SRC/cmd_pack.sh"; set +e; JSON_MODE=0
   _marketplace_slug(){ echo test/registry; }; _marketplace_base(){ echo https://example.invalid; }
   _pack_targets_from(){ echo claude; }; resolve_model_alias(){ printf '%s' "$1"; }; curl(){ return 22; }
   "$@" ) 2>&1; }
-YES="your owner's need is not a yes: name your pick to them; hire it once they say yes (or named it)"
+YES="your owner's need is not a yes, nor is a standing \"full authority\": name your pick to them; hire it once they say yes (or named it)"
 for v in "cmd_market invoice" "cmd_market_show tally"; do
   o=$(mkt $v)
   grep -q 'tally' <<<"$o" && grep -qxF "  $YES" <<<"$o" && ok "$v lists the pack and says a need is not a yes" \

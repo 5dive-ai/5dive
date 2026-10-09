@@ -239,10 +239,10 @@ _hire_link_create() {
   skills=$(jq -r '(.skills // []) | join(", ")' <<<"$made")
   if [[ "$HIRE_LINK_STATUS" == ready ]]; then
     card="Card: $HIRE_LINK_URL"
-    next="Nothing is hired yet. Show your owner this draft and the card. Standard-tier: they tap Hire on it. Admin-tier: only on their clear yes, run 5dive hire-link $HIRE_LINK_SLUG --hire"
+    next="Nothing is hired yet. Show your owner this draft and the card. Standard-tier: they tap Hire on it. Admin-tier: a standing \"full authority\" is not a yes; only on their clear yes, run 5dive hire-link $HIRE_LINK_SLUG --hire"
   else
     card="Card: none ($HIRE_LINK_PROSE)"
-    next="Nothing is hired yet. Show your owner this draft. Admin-tier: only on their clear yes, run 5dive hire-link $HIRE_LINK_SLUG --hire"
+    next="Nothing is hired yet. Show your owner this draft. Admin-tier: a standing \"full authority\" is not a yes; only on their clear yes, run 5dive hire-link $HIRE_LINK_SLUG --hire"
   fi
   if (( ${JSON_MODE:-0} )); then
     ok "made $HIRE_LINK_SLUG" \
