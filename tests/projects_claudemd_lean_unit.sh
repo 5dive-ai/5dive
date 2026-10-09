@@ -5,7 +5,7 @@
 # actually REACHES boxes that already have an older one.
 #
 #   PART 1 — the file a 5dive-built box writes stays under the cap: <= 40 lines,
-#            <= 450 words, no incident idents or dates, every header rule kept.
+#            <= 470 words, no incident idents or dates, every header rule kept.
 #   PART 2 — install.sh replaces an UNEDITED older copy and keeps an edited one
 #            (projects_claudemd_is_stock, read out of the shipped install.sh).
 set -uo pipefail
@@ -19,7 +19,10 @@ bad(){ F=$((F+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}" >&2; }
 
 POLICY=projects-CLAUDE.md
 MAX_LINES=40
-MAX_WORDS=450
+# 450 -> 470 (DIVE-5824): the hire exception had to go INTO the go-ahead line (a
+# live lead read past it one line lower). The block cut 5 words to pay for it
+# (the market line's "on their yes", "follow it"); net +16, every rule kept.
+MAX_WORDS=470
 
 # ── PART 1: the cap ──────────────────────────────────────────────────────────
 # A 5dive-built box (provisioning.env present) keeps every block, so the whole
