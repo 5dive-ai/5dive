@@ -20,6 +20,12 @@
 #   agent first-job <name> --token=<t> --job-b64=<b64>   record + start; idempotent per token
 #   agent _first_job_run <name> <token>                   (internal) the unit's body
 #
+# DIVE-5946 (lodar 2026-10-09: "why not keep first task as task. we already save
+# task results outputs"): the answered job is also an ordinary task on this box,
+# assigned to the agent, done, its result the reply. The app's Tasks screen shows
+# it like any other task's result, so an owner who never made the agent's bot
+# still sees it; the done report names the task and the notice's button opens it.
+#
 # The API never polls the box for how the reply landed (owner's rule): after the
 # done report the same unit stays up as a light watcher on the plugin's
 # first-reply.state.json and reports `start` (the owner opened the reply) and
@@ -277,6 +283,28 @@ _first_job_watch() {
     --arg w "$why" --arg f "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
 }
 
+# _first_job_task <token> <name> <job> <reply> — the job as a done task assigned
+# to the agent, its result the reply; the ident on stdout. Written BORN DONE, in
+# one insert once the reply is in: an open row assigned to the agent is one the
+# heartbeat would dispatch, and the agent would do the job a second time. The
+# ident is kept on the record, so a restarted run never files it twice.
+_first_job_task() {
+  local token="$1" name="$2" job="$3" reply="$4" st ident="" at=""
+  st=$(_first_job_state "$token")
+  ident=$(jq -r '.task // empty' "$st" 2>/dev/null) || ident=""
+  [[ -n "$ident" ]] && { printf '%s' "$ident"; return 0; }
+  at=$(jq -r '.createdAt // empty' "$st" 2>/dev/null) || at=""
+  ( tasks_db_init ) >/dev/null 2>&1 || return 1
+  ident=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, status, result, started_at, first_started_at, done_at)
+              VALUES ($(sqlq "$job"), $(sqlq "Your first job for ${name}, picked when you hired it."), 'medium',
+                      $(sqlq "$name"), 'telegram', 'done', $(sqlq "$reply"),
+                      COALESCE(datetime($(sqlq "$at")), datetime('now')), COALESCE(datetime($(sqlq "$at")), datetime('now')), datetime('now'));
+            SELECT ident FROM tasks WHERE id = last_insert_rowid();" 2>/dev/null) || return 1
+  [[ "$ident" =~ ^[A-Z][A-Z0-9]{0,15}-[0-9]{1,9}$ ]] || return 1
+  _first_job_state_merge "$token" '{task:$i}' --arg i "$ident" || true
+  printf '%s' "$ident"
+}
+
 cmd_agent_first_job_run() {
   local usage="usage: 5dive agent _first_job_run <name> <token>"
   [[ "${1:-}" == -h || "${1:-}" == --help ]] && { printf '%s\n' "$usage"; return 0; }
@@ -313,13 +341,17 @@ cmd_agent_first_job_run() {
     fi
   fi
 
-  local body bot=""
+  local body bot="" task=""
   if (( ok )); then
+    # The task is the record; a store that would not take it costs only the
+    # Tasks entry, never the job (the reply above is already where it was).
+    task=$(_first_job_task "$token" "$name" "$job" "$reply") || task=""
     bot=$(jq -r --arg n "$name" '.agents[$n].botUsername // empty' "$REGISTRY" 2>/dev/null) || bot=""
     # Omitted rather than sent empty or malformed: with no bot the API's notice
     # opens the Mini App instead.
     [[ "$bot" =~ ^[A-Za-z0-9_]{5,32}$ ]] || bot=""
-    body=$(jq -cn --arg t "$token" --arg b "$bot" '{token:$t, ok:true} + (if $b == "" then {} else {botUsername:$b} end)')
+    body=$(jq -cn --arg t "$token" --arg b "$bot" --arg k "$task" '{token:$t, ok:true}
+      + (if $b == "" then {} else {botUsername:$b} end) + (if $k == "" then {} else {task:$k} end)')
   else
     err="${err:0:300}"
     body=$(jq -cn --arg t "$token" --arg e "$err" '{token:$t, ok:false, error:$e}')

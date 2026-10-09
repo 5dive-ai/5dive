@@ -24,9 +24,15 @@
 #           a restarted unit resumes without resending or re-asking; a 4xx stops
 #           that event; a transient failure is retried next tick; a wrong token
 #           or garbage stamps report nothing; a failed job does not watch.
+#   T1-T4   DIVE-5946: the answered job is a done task assigned to the agent,
+#           its result the reply, named in the done body; a restarted run never
+#           files it twice; a failed ask files none; a store that refuses the
+#           insert costs only the task, never the done report.
 #   W1-W3   wiring: the dispatch arms, the usage entry, build.sh loads the module.
 #   NC1     NEGATIVE CONTROL: a copy of the module with the noclobber create
 #           removed must be CAUGHT by I1's "started nothing" check.
+#   NC2     NEGATIVE CONTROL: a copy without the record's task check must be
+#           CAUGHT by T2 (a restarted run files a second task).
 # Run: bash tests/agent_first_job_unit.sh   (no root, no network)
 set -uo pipefail
 
@@ -37,9 +43,11 @@ cd "$(dirname "$0")/.." || exit 2
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/first-job-unit.XXXXXX")"
 
 export STATE_DIR="$TMP/state" AGENT_HOME_ROOT="$TMP/home"
-mkdir -p "$STATE_DIR" "$AGENT_HOME_ROOT/agent-ada" "$AGENT_HOME_ROOT/agent-bob" "$TMP/bin"
+# DIVE-5946: a throwaway task board, so the store fence never sees prod.
+export TASKS_DIR="$TMP/state/tasks" TASKS_DB="$TMP/state/tasks/tasks.db"
+mkdir -p "$STATE_DIR" "$TASKS_DIR" "$AGENT_HOME_ROOT/agent-ada" "$AGENT_HOME_ROOT/agent-bob" "$TMP/bin"
 # shellcheck disable=SC1090
-for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh cmd_partner.sh cmd_agent_first_job.sh; do
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/tasks_db.sh cmd_partner.sh cmd_agent_first_job.sh; do
   # shellcheck source=/dev/null
   source "src/$f"
 done
@@ -121,7 +129,7 @@ STUB
 chmod +x "$TMP/bin/sleep"
 
 b64() { printf '%s' "$1" | base64 -w0; }
-reset() { rm -rf "$STATE_DIR/first-jobs" "$TMP"/sdrun.argv "$TMP"/curl.* "$TMP"/ask.* "$TMP/http.seq" "$TMP/ticks" \
+reset() { rm -rf "$TASKS_DIR"; mkdir -p "$TASKS_DIR"; rm -rf "$STATE_DIR/first-jobs" "$TMP"/sdrun.argv "$TMP"/curl.* "$TMP"/ask.* "$TMP/http.seq" "$TMP/ticks" \
           "$AGENT_HOME_ROOT"/agent-*/.claude; echo 1000000 >"$TMP/clock"; }
 # run <fn> <args...> in a subshell (fail() exits). Sets OUT, ERR, RC.
 run() { local fn="$1"; shift; ( JSON_MODE=0; "$fn" "$@" ) >"$TMP/out" 2>"$TMP/err"; RC=$?; OUT=$(cat "$TMP/out"); ERR=$(cat "$TMP/err"); }
@@ -237,8 +245,9 @@ mapfile -t Q <"$TMP/ask.argv"
   && ok_t "R1d first-reply.json is {token,text,at} with the reply verbatim" || bad_t "R1d reply file" "$(cat "$REPLY_F" 2>/dev/null)"
 [[ "$(stat -c %a "$REPLY_F")" == 600 && -z "$(find "$(dirname "$REPLY_F")" -name '.first-reply.*')" ]] \
   && ok_t "R1e ... 0600, and no temp file left behind" || bad_t "R1e reply mode/tmp" "$(ls -la "$(dirname "$REPLY_F")")"
-[[ "$(cat "$TMP/curl.body")" == "{\"token\":\"$TOKEN\",\"ok\":true,\"botUsername\":\"ada_helper_bot\"}" ]] \
-  && ok_t "R1f done body is {token, ok:true, botUsername} from the registry" || bad_t "R1f body" "$(cat "$TMP/curl.body")"
+TASK1=$(sqlite3 "$TASKS_DB" "SELECT ident FROM tasks;" 2>/dev/null)
+[[ "$(cat "$TMP/curl.body")" == "{\"token\":\"$TOKEN\",\"ok\":true,\"botUsername\":\"ada_helper_bot\",\"task\":\"$TASK1\"}" && -n "$TASK1" ]] \
+  && ok_t "R1f done body is {token, ok:true, botUsername, task} (botUsername from the registry)" || bad_t "R1f body" "$(cat "$TMP/curl.body")"
 { grep -qx 'https://api.5dive.com/server/first-jobs/done' "$TMP/curl.argv" && grep -qx -- '@-' "$TMP/curl.argv" \
   && ! grep -qF "$SECRET" "$TMP/curl.argv" && grep -qx "Authorization: Bearer $SECRET" "$TMP/curl.stdin"; } \
   && ok_t "R1g POSTs <api>/server/first-jobs/done; the box token on STDIN, absent from argv" \
@@ -246,9 +255,26 @@ mapfile -t Q <"$TMP/ask.argv"
 [[ "$(jq -r '[.status,(.posted|tostring),.http]|join("|")' "$(STATE_F)")" == "done|true|200" ]] \
   && ok_t "R1h the record ends done, posted, http 200" || bad_t "R1h record" "$(cat "$(STATE_F)")"
 
+# ── T1: the answered job is a done task for the agent (DIVE-5946) ────────────
+row=$(sqlite3 -separator '|' "$TASKS_DB" "SELECT COUNT(*), title, assignee, status, created_by, (done_at IS NOT NULL), (started_at IS NOT NULL) FROM tasks;")
+res=$(sqlite3 "$TASKS_DB" "SELECT result FROM tasks;")
+[[ "$row" == "1|Plan my week|ada|done|telegram|1|1" && "$res" == "$REPLY_TXT" && "$TASK1" =~ ^DIVE-[0-9]+$ ]] \
+  && ok_t "T1 one done task: title = the job, assignee = the agent, result = the reply verbatim, started and done stamped" \
+  || bad_t "T1 task row" "row=$row ident=$TASK1 result=$res"
+[[ "$(jq -r .task "$(STATE_F)")" == "$TASK1" ]] && ok_t "T1b the record keeps the task's ident" || bad_t "T1b record" "$(cat "$(STATE_F)")"
+
+# ── T2: a restarted run files no second task ─────────────────────────────────
+t2_arm() {
+  jq -c '.status = "running"' "$(STATE_F)" >"$(STATE_F).x" && mv "$(STATE_F).x" "$(STATE_F)"
+  STUB_REPLY="$REPLY_TXT" run cmd_agent_first_job_run ada "$TOKEN"
+  [[ $RC -eq 0 && "$(sqlite3 "$TASKS_DB" "SELECT COUNT(*) FROM tasks;")" == 1 && "$(jq -r .task "$TMP/curl.body")" == "$TASK1" ]]
+}
+t2_arm && ok_t "T2 a run restarted after the task was filed reports the same task and files none" \
+  || bad_t "T2 restart" "rc=$RC tasks=$(sqlite3 "$TASKS_DB" "SELECT group_concat(ident) FROM tasks;") body=$(cat "$TMP/curl.body")"
+
 # ── R2: no bot username → the key is omitted ─────────────────────────────────
 start_job bob 'Hi'; run cmd_agent_first_job_run bob "$TOKEN"
-[[ $RC -eq 0 && "$(cat "$TMP/curl.body")" == "{\"token\":\"$TOKEN\",\"ok\":true}" ]] \
+[[ $RC -eq 0 && "$(jq -c 'del(.task)' "$TMP/curl.body")" == "{\"token\":\"$TOKEN\",\"ok\":true}" ]] \
   && ok_t "R2 with no botUsername in the registry the body carries none" || bad_t "R2 body" "rc=$RC $(cat "$TMP/curl.body")"
 
 # ── R3: the ask fails → ok:false, no reply file ──────────────────────────────
@@ -258,6 +284,15 @@ start_job ada 'Plan my week'; STUB_ASK=auth run cmd_agent_first_job_run ada "$TO
   && [[ "$(jq -r .status "$(STATE_F)")" == failed ]]; } \
   && ok_t "R3 a failed ask posts {token, ok:false, error}, writes no reply, is not retried, record failed" \
   || bad_t "R3 failure" "rc=$RC asks=$(cat "$TMP/ask.n") body=$(cat "$TMP/curl.body" 2>/dev/null)"
+[[ "$(sqlite3 "$TASKS_DB" "SELECT COUNT(*) FROM tasks;" 2>/dev/null || echo 0)" == 0 ]] \
+  && ok_t "T3 a failed ask files no task" || bad_t "T3 failed ask filed a task" "$(sqlite3 "$TASKS_DB" "SELECT ident,status FROM tasks;")"
+
+# ── T4: a board that refuses the insert costs the task, never the report ────
+start_job ada 'Plan my week'; ( tasks_db_init ) >/dev/null 2>&1; sqlite3 "$TASKS_DB" "CREATE TRIGGER t4_refuse BEFORE INSERT ON tasks BEGIN SELECT RAISE(ABORT, 'refused'); END;"
+STUB_REPLY="$REPLY_TXT" run cmd_agent_first_job_run ada "$TOKEN"
+[[ $RC -eq 0 && "$(cat "$TMP/curl.body")" == "{\"token\":\"$TOKEN\",\"ok\":true,\"botUsername\":\"ada_helper_bot\"}" && "$(jq -r '.task // "none"' "$(STATE_F)")" == none ]] \
+  && ok_t "T4 a refused insert: the run still succeeds and reports done, with no task key" \
+  || bad_t "T4 refused insert" "rc=$RC body=$(cat "$TMP/curl.body" 2>/dev/null) err=$ERR"
 
 # ── R4: a not-yet-running agent is retried ───────────────────────────────────
 start_job ada 'Plan my week'; STUB_ASK=down1 run cmd_agent_first_job_run ada "$TOKEN"
@@ -287,7 +322,7 @@ start_job ada 'Plan my week'
 grep -qx -- '--property=RuntimeMaxSec=262800' "$TMP/sdrun.argv" \
   && ok_t "J0 the unit's hard limit is 73h (the ask, then 72h of watching)" || bad_t "J0 RuntimeMaxSec" "$(tr '\n' ' ' <"$TMP/sdrun.argv")"
 STUB_START_TICK=1 STUB_SECOND_TICK=2 FIRST_JOB_WATCH_SECS=259200 run cmd_agent_first_job_run ada "$TOKEN"
-want=$(printf '%s\n' "{\"token\":\"$TOKEN\",\"ok\":true,\"botUsername\":\"ada_helper_bot\"}" "{\"token\":\"$TOKEN\",\"event\":\"start\"}" "{\"token\":\"$TOKEN\",\"event\":\"second\"}")
+want=$(printf '%s\n' "{\"token\":\"$TOKEN\",\"ok\":true,\"botUsername\":\"ada_helper_bot\",\"task\":\"DIVE-1\"}" "{\"token\":\"$TOKEN\",\"event\":\"start\"}" "{\"token\":\"$TOKEN\",\"event\":\"second\"}")
 { [[ $RC -eq 0 && "$(cat "$TMP/curl.bodies")" == "$want" && "$(ticks)" == 2 ]] \
   && grep -qx 'https://api.5dive.com/server/first-jobs/event' "$TMP/curl.argv" && ! grep -qF "$SECRET" "$TMP/curl.argv"; } \
   && ok_t "J1 done, then {token,event:start} and {token,event:second} to /server/first-jobs/event (bearer on stdin), then exit — 2 ticks, not 72h" \
@@ -348,6 +383,17 @@ else
     reset; run cmd_agent_first_job ada --token="$TOKEN" --job-b64="$(b64 'Plan my week')"
     i1_arm ) && bad_t "NC1 a create without noclobber passes I1 — the check cannot go red" "" \
              || ok_t "NC1 a create without noclobber is CAUGHT by I1 (a second unit started)"
+fi
+
+# ── NC2: the task's restart check can go red ─────────────────────────────────
+grep -v '^  \[\[ -n "\$ident" \]\] && { printf' src/cmd_agent_first_job.sh >"$TMP/mutant2.sh"
+if cmp -s src/cmd_agent_first_job.sh "$TMP/mutant2.sh"; then bad_t "NC2 mutation did not apply" ""
+else
+  ( source "$TMP/mutant2.sh"; _first_job_is_root() { return 1; }
+    start_job ada 'Plan my week'; STUB_REPLY="$REPLY_TXT" run cmd_agent_first_job_run ada "$TOKEN"
+    TASK1=$(sqlite3 "$TASKS_DB" "SELECT ident FROM tasks;"); t2_arm ) >/dev/null \
+    && bad_t "NC2 a run without the record's task check passes T2 — the check cannot go red" "" \
+    || ok_t "NC2 a run without the record's task check is CAUGHT by T2 (a second task filed)"
 fi
 
 echo "-----"
