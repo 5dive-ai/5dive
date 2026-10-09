@@ -10,7 +10,8 @@
 #   * membership follows the registry tier: admin in, standard out (a stale
 #     member is dropped), and a second pass changes nothing and says nothing
 #   * a failed groupadd changes no file and says so
-#   * the standard sudoers template carries the three box-identity grants and
+#   * the standard sudoers template carries the four box-identity grants (the
+#     fourth, DIVE-5894: the dashboard chat adapter's relay, which DIVE-5690 missed) and
 #     still classifies cli-scoped with no extra entries (so the installer's
 #     reconcile keeps re-rendering existing seats)
 #   * push-notify.sh and box_identity_elevate re-run as root only when sudo
@@ -147,7 +148,8 @@ secret_file_secure "$C/tools.sh"
 # --- T6: the standard sudoers template ---------------------------------------
 source src/cmd_agent_create.sh
 sud=$(render_standard_sudoers agent-seat_b 0 0)
-for want in '/usr/local/bin/5dive partner hire \*' '/usr/local/bin/5dive hire-link \*' '/usr/local/lib/5dive/push-notify.sh \*'; do
+for want in '/usr/local/bin/5dive partner hire \*' '/usr/local/bin/5dive hire-link \*' '/usr/local/lib/5dive/push-notify.sh \*' \
+    '/usr/local/bin/5dive _dashboard_relay'; do
   grep -qE "^agent-seat_b ALL=\(root\) NOPASSWD: ${want}$" <<<"$sud" \
     && ok_t "T6 grant: ${want//\\/}" || bad_t "T6 missing grant ${want//\\/}"
 done

@@ -201,6 +201,7 @@ LAZY_FILES=(
   src/cmd_hire_link.sh
   src/cmd_route.sh
   src/cmd_pkg.sh
+  src/cmd_dashboard_relay.sh
   src/cmd_selfupdate.sh
 )
 
