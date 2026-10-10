@@ -28,7 +28,7 @@
 # voice and gender, exactly as in the Mini App. It hires nothing. It prints the
 # draft and its card link (5dive hire-link custom-<id>, the Mini App opened on
 # its Hire card), and the hire is the owner's: a Hire tap on the card, or, by an
-# admin-tier seat on the owner's clear yes in chat (DIVE-5449's rule),
+# admin-tier seat as soon as the owner asks in chat (DIVE-5974: the ask is the go-ahead),
 #   5dive hire-link custom-<id> --hire
 # the Mini App's Hire onto this box. A standard seat is refused --hire: it holds
 # the root grant for this verb only to reach the box identity. These verbs live
@@ -76,15 +76,15 @@ cmd_hire_link() {
         printf '%s\n' \
           "usage: 5dive hire-link <slug> [--json]" \
           "       5dive hire-link --create --name=<Name> --description=<what they need> [--json]" \
-          "       5dive hire-link custom-<id> --hire [--json]   (admin-tier, on the owner's yes)" \
+          "       5dive hire-link custom-<id> --hire [--json]   (admin-tier, on the owner's ask)" \
           "" \
           "  The link that hires catalogue agent <slug> in one tap, for this box's owner." \
           "  A standard-tier agent sends it to its human; an admin-tier agent hires itself" \
           "  with sudo 5dive agent import <slug> --as=<name>. Slugs: 5dive market." \
           "  --create makes a custom agent for a need no catalogue agent fits, as the Mini" \
           "  App does (its skills are picked for you), and prints the draft and its card." \
-          "  Nothing is hired until the owner taps Hire on the card, or says yes to an" \
-          "  admin-tier agent, which then runs --hire."
+          "  --create hires nothing: the owner taps Hire on the card, or an admin-tier" \
+          "  agent their ask is for runs --hire."
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $a" ;;
       *) [[ -z "$slug" ]] || fail "$E_USAGE" "one agent at a time"; slug="$a" ;;
@@ -92,7 +92,7 @@ cmd_hire_link() {
   done
   if (( create )); then
     [[ -z "$slug" ]] || fail "$E_USAGE" "--create makes a new agent; it takes --name= and --description=, not a slug"
-    (( ! hire )) || fail "$E_USAGE" "--create hires nothing: show your owner the draft, then --hire on their yes"
+    (( ! hire )) || fail "$E_USAGE" "--create hires nothing: run --create, then --hire on the custom-<id> it prints"
     (( have_name && have_desc )) || fail "$E_USAGE" "usage: 5dive hire-link --create --name=<Name> --description=<what they need>"
     HIRE_LINK_SLUG=""
     _hire_link_create "$name" "$desc" "$@"
@@ -185,7 +185,7 @@ _hire_link_lookup() {
     404) HIRE_LINK_STATUS=not_found; HIRE_LINK_PROSE="'$slug' is not an agent this box's owner made (5dive hire-link --create makes one)" ;;
     409) if [[ "$err" == no_hire_card ]]; then
            HIRE_LINK_STATUS=no_hire_card
-           HIRE_LINK_PROSE="your owner signs in to 5dive on the web, which has no Hire card for a made agent; an admin-tier agent hires it on their yes (5dive hire-link $slug --hire)"
+           HIRE_LINK_PROSE="your owner signs in to 5dive on the web, which has no Hire card for a made agent; an admin-tier agent hires it on their ask (5dive hire-link $slug --hire)"
          else
            HIRE_LINK_STATUS=error; HIRE_LINK_PROSE="5dive refused the link (${err:-409})"
          fi ;;
@@ -239,10 +239,10 @@ _hire_link_create() {
   skills=$(jq -r '(.skills // []) | join(", ")' <<<"$made")
   if [[ "$HIRE_LINK_STATUS" == ready ]]; then
     card="Card: $HIRE_LINK_URL"
-    next="Nothing is hired yet. Show your owner this draft and the card. Standard-tier: they tap Hire on it. Admin-tier: a standing \"full authority\" is not a yes; only on their clear yes, run 5dive hire-link $HIRE_LINK_SLUG --hire"
+    next="Nothing is hired yet. Admin-tier: your owner's ask is the go-ahead, so run 5dive hire-link $HIRE_LINK_SLUG --hire now, then tell them who you hired. Standard-tier: show your owner this draft and the card; they tap Hire on it."
   else
     card="Card: none ($HIRE_LINK_PROSE)"
-    next="Nothing is hired yet. Show your owner this draft. Admin-tier: a standing \"full authority\" is not a yes; only on their clear yes, run 5dive hire-link $HIRE_LINK_SLUG --hire"
+    next="Nothing is hired yet. Admin-tier: your owner's ask is the go-ahead, so run 5dive hire-link $HIRE_LINK_SLUG --hire now, then tell them who you hired. Standard-tier: show your owner this draft."
   fi
   if (( ${JSON_MODE:-0} )); then
     ok "made $HIRE_LINK_SLUG" \
