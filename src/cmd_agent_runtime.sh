@@ -1925,6 +1925,87 @@ sys.stdout.write("\n".join(out))
 ' "$f"
 }
 
+# _ask_transcript_reply <agent> <msg-id> — the fenced reply to <msg-id>, read
+# from the seat's OWN session transcript instead of from pane frames; rc 1 when
+# the transcript does not (yet) hold a completed fence for that id.
+#
+# DIVE-5964. A Claude seat runs on tmux's alternate screen, which has NO
+# scrollback (`#{history_size}` is 0), and it paints a finished answer in one go
+# at the end of its turn. An answer taller than the pane therefore puts its
+# opening marker above the top row in the very first frame that shows it, so no
+# 2s poll ever sees the opener and _ask_accumulate has nothing to fold — the
+# rail waits out the whole --timeout while the seat has answered (measured: a
+# 26-row first-job roast on a 24-row pane, closer visible, opener never). A
+# bigger pane is not a fix: answers have no fixed length.
+#
+# The transcript has the answer as the seat wrote it, unwrapped and whole. The
+# id is a fresh gen_msg_id per ask, so a transcript that carries a COMPLETED
+# fence for it can only be this ask's reply; the echoed instruction holds the
+# two markers adjacent, and _ask_reply_window's fence pass already refuses a
+# pair that encloses nothing. FENCE-ONLY by construction (allow_unfenced=0), so
+# this can never return scraped text. A seat with no Claude transcript (codex,
+# grok, …) simply yields nothing and the pane path is unchanged.
+#
+# Read AS the seat (the transcript is 0600) and bounded: only the newest two
+# session files, only their last 4 MiB, and a cheap byte test for the opener
+# before any JSON is parsed — this runs once per poll while a reply is missing.
+# FIVE_ASK_TRANSCRIPT_ROOT overrides the projects dir (tests only).
+_ask_transcript_reply() { # <agent> <msg-id>
+  local name="$1" mid="$2" text reply
+  [[ "$mid" =~ ^[A-Za-z0-9]{1,32}$ ]] || return 1
+  text=$(sudo -n -u "agent-${name}" python3 -c '
+import sys, os, pwd, glob, json
+root, mid = sys.argv[1], sys.argv[2]
+if not root:
+    root = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".claude", "projects")
+op = ("<5dive-r:" + mid + ">").encode()
+files = []
+for f in glob.glob(os.path.join(root, "*", "*.jsonl")):
+    try:
+        files.append((os.path.getmtime(f), f))
+    except OSError:
+        pass
+for _, f in sorted(files, reverse=True)[:2]:
+    try:
+        with open(f, "rb") as h:
+            h.seek(0, 2)
+            n = h.tell()
+            h.seek(max(0, n - 4 * 1024 * 1024))
+            raw = h.read()
+    except OSError:
+        continue
+    if op not in raw:
+        continue
+    out, seen = [], False
+    for line in raw.split(b"\n"):
+        if b"\"assistant\"" not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue                       # the cut first line, or a half-written last one
+        if rec.get("type") != "assistant":
+            continue
+        content = (rec.get("message") or {}).get("content") or []
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for blk in content:
+            if isinstance(blk, dict) and blk.get("type") == "text":
+                t = blk.get("text") or ""
+                if op.decode() in t:
+                    seen = True
+                if seen:
+                    out.append(t)
+    if out:
+        sys.stdout.write("\n".join(out))
+        break
+' "${FIVE_ASK_TRANSCRIPT_ROOT:-}" "$mid" 2>/dev/null) || return 1
+  [[ -n "$text" ]] || return 1
+  reply=$(_ask_reply_window /dev/null /dev/null "$mid" 0 0 <<<"$text") || return 1
+  [[ -n "$reply" ]] || return 1
+  printf '%s' "$reply"
+}
+
 # _ask_reply_window <baseline-file> <sent-message-file> <msg-id> — turn the
 # accumulated transcript on stdin into JUST what the seat said. Three subtractions,
 # in order, none of which needs a per-harness signature list:
@@ -2576,7 +2657,8 @@ cmd_capture() {
   # reply appears and stabilises.
   # DIVE-5806: a scoped caller's anchor is the envelope _deliver stamped for it —
   # `from=<caller> id=<id>` then a space or `]` — never a bare substring.
-  awk -v id="id=${after_id}" -v from="$anchor_from" '
+  local slice
+  slice=$(awk -v id="id=${after_id}" -v from="$anchor_from" '
     function anchored(l,   e, i, c) {
       if (from == "") return index(l, id) > 0
       e = "from=" from " " id
@@ -2588,7 +2670,19 @@ cmd_capture() {
     found && index($0, "[5dive-msg") { exit }
     found                           { print }
     anchored($0)                    { found=1 }
-  ' <<<"$capture"
+  ' <<<"$capture")
+  if [[ -n "$slice" ]]; then printf '%s\n' "$slice"; fi
+  # DIVE-5964: same transcript read as the direct path in cmd_ask, done here
+  # because only this side of the sudo boundary can read the seat's transcript.
+  # It returns nothing but the fenced reply to <after-id> — a marker this caller
+  # minted (the DIVE-5806 check above) — so it does not widen what a scoped
+  # caller can read. Emitted as a fence block after the slice, only when the
+  # pane slice holds no whole fence, so the caller's extractor takes it.
+  local treply
+  if [[ -z "$(_ask_reply_window /dev/null /dev/null "$after_id" 0 0 <<<"$slice")" ]] \
+     && treply=$(_ask_transcript_reply "$target" "$after_id"); then
+    printf '<5dive-r:%s>\n%s\n</5dive-r:%s>\n' "$after_id" "$treply" "$after_id"
+  fi
 }
 
 # DIVE-1088: hidden privileged service-lifecycle primitive — the sanctioned
@@ -3753,6 +3847,14 @@ cmd_ask() {
       capture=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S "-${buf_lines}" 2>/dev/null) || true
       slice=$(_ask_accumulate "$acc_file" <<<"$capture")
       slice=$(_ask_reply_window "$baseline_file" "$msg_file" "$msg_id" 1 "$allow_unfenced" <<<"$slice")
+      # DIVE-5964: the pane never showed a whole fence — on an alt-screen seat an
+      # answer taller than the pane loses its OPENING marker above the top row
+      # before any poll can see it. The seat's own transcript has the answer
+      # whole; read the fence from there. (The scoped path gets the same read
+      # privileged-side, inside `_capture`.)
+      if [[ -z "$slice" ]]; then
+        slice=$(_ask_transcript_reply "$name" "$msg_id") || slice=""
+      fi
     fi
 
     if [[ "$slice" != "$prev_slice" ]]; then
