@@ -147,18 +147,118 @@ doctor_check_gate_owner_delivery() {
   fi
 }
 
-# _doctor_registry_types — space-separated harness types at least one REGISTERED
-# seat runs on. Empty (so nothing is scoped in) when the registry cannot be read:
-# an unreadable registry must not silence a real credential error, so the caller
-# treats "not in the list" as in-use-unknown only for the soft branches and keeps
-# the hard error whenever we positively know a seat is bound.
-_doctor_registry_types() {
+# _doctor_registry_auth_pairs — one line per distinct (type, authProfile) pair
+# that at least one REGISTERED seat is bound to: `<type>|<profile>|<seats>`,
+# profile empty for a seat on the type's default credential, seats a comma list.
+# `|`, not a tab: tab is IFS whitespace, so `read` collapses the empty profile
+# field and the default seats' names land in it.
+# Prints UNREADABLE when the registry cannot be read: an unreadable registry
+# must not silence a real credential error, so the caller keeps the hard error
+# on the default path (DIVE-4342) and never reads absence as health.
+_doctor_registry_auth_pairs() {
   local reg out
   reg=$(registry_read 2>/dev/null) || { printf 'UNREADABLE\n'; return 0; }
   [[ -n "$reg" ]] || { printf 'UNREADABLE\n'; return 0; }
-  out=$(jq -r '[.agents // {} | .[] | .type // empty] | unique | join(" ")' <<<"$reg" 2>/dev/null) \
+  out=$(jq -r '[.agents // {} | to_entries[]
+                 | select((.value.type // "") != "")
+                 | {t: .value.type, p: (.value.authProfile // ""), n: .key}]
+               | group_by([.t, .p])[]
+               | [.[0].t, .[0].p, (map(.n) | join(","))] | join("|")' <<<"$reg" 2>/dev/null) \
     || { printf 'UNREADABLE\n'; return 0; }
   printf '%s\n' "$out"
+}
+
+# doctor_check_auth — live credential probe for every installed harness.
+#
+# DIVE-4342: SCOPED TO THE HARNESSES THIS BOX ACTUALLY EMPLOYS. Every type
+# whose binary happens to be installed used to raise a hard ERROR for having
+# no credentials, whether or not a single registered seat ran on it — 5 of the
+# 5 errors in a 69-check run on a customer box were that, and an error list
+# that is entirely noise is an error list nobody reads. An unused harness with
+# no credential is not a defect, it is an unused harness; it stays in the
+# report (silence would be its own absence-reads-as-health bug) as `ok` with
+# the reason named. A harness a seat is BOUND to keeps the full error.
+#
+# DIVE-5957: scoped to the CREDENTIALS seats run on, not just the type. The
+# loop used to probe only the type's default connector credential, so a box
+# whose seats all sit on named auth profiles got a red re-auth for a token no
+# seat reads, and a seat whose PROFILE token was dead read green whenever the
+# default worked. Now each distinct (type, profile) pair a seat is bound to is
+# probed once — every probe is a real provider call with a 5s cap, so N seats
+# on 2 profiles cost 2 probes — and reported as auth/<type>:<profile>. The
+# default path (auth/<type>) is probed only when some seat of that type has no
+# authProfile; when none does it is reported ok, unprobed, with the reason.
+doctor_check_auth() {
+  local pairs type status in_use line t p seats
+  pairs=$(_doctor_registry_auth_pairs)
+  for type in "${!TYPE_BIN[@]}"; do
+    [[ -x "${TYPE_BIN[$type]}" ]] || continue
+    if [[ "$pairs" == "UNREADABLE" ]]; then
+      # A registry we could not READ is not evidence that nothing uses this
+      # harness, or that nothing uses its default credential. Keep the hard
+      # error on the default path, exactly as before DIVE-5957.
+      _doctor_auth_report "$type" "" true ""
+      continue
+    fi
+    local -a profiles=() profile_seats=()
+    local default_seats="" type_used=false
+    while IFS='|' read -r t p seats; do
+      [[ "$t" == "$type" ]] || continue
+      type_used=true
+      if [[ -z "$p" ]]; then
+        default_seats="$seats"
+      else
+        profiles+=("$p"); profile_seats+=("$seats")
+      fi
+    done <<<"$pairs"
+    if [[ "$type_used" != "true" ]]; then
+      _doctor_auth_report "$type" "" false ""
+      continue
+    fi
+    local i
+    for i in "${!profiles[@]}"; do
+      _doctor_auth_report "$type" "${profiles[$i]}" true "${profile_seats[$i]}"
+    done
+    if [[ -n "$default_seats" ]]; then
+      _doctor_auth_report "$type" "" true "$default_seats"
+    else
+      doctor_add auth "$type" ok "not probed: no registered seat runs on the default $type credential (every $type seat is on an auth profile: ${profiles[*]})" false false
+    fi
+  done
+}
+
+# _doctor_auth_report <type> <profile|""> <in_use> <seats|""> — probe ONE
+# credential and file its verdict. An empty profile is the type's default
+# connector credential, reported as auth/<type> (the name it has always had);
+# a profile is reported as auth/<type>:<profile>.
+_doctor_auth_report() {
+  local type="$1" profile="$2" in_use="$3" seats="$4" name status login on=""
+  name="$type"; login="sudo 5dive agent auth login $type"
+  if [[ -n "$profile" ]]; then
+    name="$type:$profile"; login+=" --auth-profile=$profile"
+  fi
+  [[ -n "$seats" ]] && on=" (seats: $seats)"
+  status=$(auth_status_one "$type" "" "$profile")
+  case "$status" in
+    ok)
+      doctor_add auth "$name" ok "live probe succeeded$on" ;;
+    needs_login)
+      if [[ "$in_use" == "true" ]]; then
+        doctor_add auth "$name" error "no credentials on file$on — run: $login" false false
+      else
+        doctor_add auth "$name" ok "no credentials on file, and no registered seat runs on $type — not a defect on this box" false false
+      fi ;;
+    stale)
+      if [[ "$in_use" == "true" ]]; then
+        doctor_add auth "$name" error "credentials rejected by provider$on — re-auth required: $login" false false
+      else
+        doctor_add auth "$name" warn "credentials rejected by provider, but no registered seat runs on $type" false false
+      fi ;;
+    not_installed)
+      : ;;  # already flagged by types/
+    *)
+      doctor_add auth "$name" warn "status=$status" false false ;;
+  esac
 }
 
 # doctor_check_cmd <name> <executable> [apt-repair-package]
@@ -1832,48 +1932,8 @@ cmd_doctor() {
   fi
 
   # --- auth (live probe for installed types) ---
-  #
-  # DIVE-4342: SCOPED TO THE HARNESSES THIS BOX ACTUALLY EMPLOYS. Every type
-  # whose binary happens to be installed used to raise a hard ERROR for having
-  # no credentials, whether or not a single registered seat ran on it — 5 of the
-  # 5 errors in a 69-check run on a customer box were that, and an error list
-  # that is entirely noise is an error list nobody reads. An unused harness with
-  # no credential is not a defect, it is an unused harness; it stays in the
-  # report (silence would be its own absence-reads-as-health bug) as `ok` with
-  # the reason named. A harness a seat is BOUND to keeps the full error.
   if (( run_auth )); then
-    local type status in_use
-    local reg_types; reg_types=$(_doctor_registry_types)
-    for type in "${!TYPE_BIN[@]}"; do
-      [[ -x "${TYPE_BIN[$type]}" ]] || continue
-      # A registry we could not READ is not evidence that nothing uses this
-      # harness. It keeps the hard error — the soft branch is only ever reached
-      # on a positive read that positively lacks this type.
-      in_use=false
-      [[ "$reg_types" == "UNREADABLE" ]] && in_use=true
-      [[ " ${reg_types} " == *" ${type} "* ]] && in_use=true
-      status=$(auth_status_one "$type")
-      case "$status" in
-        ok)
-          doctor_add auth "$type" ok "live probe succeeded" ;;
-        needs_login)
-          if [[ "$in_use" == "true" ]]; then
-            doctor_add auth "$type" error "no credentials on file — run: sudo 5dive agent auth login $type" false false
-          else
-            doctor_add auth "$type" ok "no credentials on file, and no registered seat runs on $type — not a defect on this box" false false
-          fi ;;
-        stale)
-          if [[ "$in_use" == "true" ]]; then
-            doctor_add auth "$type" error "credentials rejected by provider — re-auth required" false false
-          else
-            doctor_add auth "$type" warn "credentials rejected by provider, but no registered seat runs on $type" false false
-          fi ;;
-        not_installed)
-          : ;;  # already flagged by types/
-        *)
-          doctor_add auth "$type" warn "status=$status" false false ;;
-      esac
-    done
+    doctor_check_auth
   fi
 
   # --- claude shadow-credential heal (DIVE-329) ---
