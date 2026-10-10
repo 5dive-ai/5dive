@@ -1939,14 +1939,21 @@ _hb_clear_active_defer() {
 # Deliberately NOT the active-defer counter: that one only advances on the
 # active-defer branch, which a seat holding an in_progress row never reaches
 # (the busy-guard `continue`s above it). Must run under with_registry_lock.
+#
+# DIVE-5960: a seat with NO heartbeat block (swept by the pending-restart pass)
+# keeps its counter at .agents[<name>].doneShells instead. Writing it under
+# .heartbeat would create that block, and every `heartbeat != null` reader
+# (`heartbeat ls`, the fleet activity probe) would then list the seat as one.
 _hb_mark_done_shells() {
   local name="$1" reg prev n
   reg=$(registry_read)
-  prev=$(jq -r --arg n "$name" '.agents[$n].heartbeat.doneShells.n // 0' <<<"$reg")
+  prev=$(jq -r --arg n "$name" '(.agents[$n].heartbeat.doneShells.n // .agents[$n].doneShells.n) // 0' <<<"$reg")
   [[ "$prev" =~ ^[0-9]+$ ]] || prev=0
   n=$(( prev + 1 ))
   reg=$(echo "$reg" | jq --arg n "$name" --argjson c "$n" \
-        '.agents[$n].heartbeat.doneShells = ((.agents[$n].heartbeat.doneShells // {}) + {n:$c})')
+        'if .agents[$n].heartbeat then .agents[$n].heartbeat.doneShells = ((.agents[$n].heartbeat.doneShells // {}) + {n:$c})
+         elif .agents[$n] then .agents[$n].doneShells = {n:$c}
+         else . end')
   echo "$reg" | registry_write
   printf '%s' "$n"
 }
@@ -1955,7 +1962,8 @@ _hb_mark_done_shells() {
 _hb_clear_done_shells() {
   local name="$1" reg
   reg=$(registry_read)
-  reg=$(echo "$reg" | jq --arg n "$name" 'if .agents[$n].heartbeat then del(.agents[$n].heartbeat.doneShells) else . end')
+  reg=$(echo "$reg" | jq --arg n "$name" 'if .agents[$n].heartbeat then del(.agents[$n].heartbeat.doneShells) else . end
+                                          | if .agents[$n].doneShells then del(.agents[$n].doneShells) else . end')
   echo "$reg" | registry_write
 }
 
@@ -2152,6 +2160,46 @@ _hb_bg_shell_sweep() {
   fi
   _hb_log "[$name] turn ended with ${n} background shell(s) still running for ${cnt} ticks -- reaped ${reaped:-0} stale agent shell(s) by PID (DIVE-4298)"
   with_registry_lock _hb_clear_done_shells "$name" >/dev/null 2>&1 || true
+}
+
+# DIVE-5960: the tick's pending-restart reap. Claude Code reports native "busy"
+# while any background shell lives, and the reaper above ran only inside the
+# heartbeat roster loop, so a seat with no heartbeat block and one forgotten
+# shell read busy to _pending_restart_sweep forever: on teal-fox the restart was
+# owed for 120h and the overdue line logged 290 times a day. So the tick hands
+# each seat that owes a restart to the reaper FIRST, then the sweep reads busy.
+#
+# The reap lives HERE and not inside _pending_restart_sweep on purpose: that
+# sweep's module is loaded by every command, and a reference to this module from
+# it pulled heartbeat (and its own deps) into every `whoami` / `task ls`.
+#
+# Same seat filter as the sweep: a marker, a live unit, not parked. Every other
+# branch there `continue`s before the busy read, so a seat it skips needs no
+# reap from this pass. Native busy is still never read as idle: a row-less
+# Telegram turn is mid-turn on the pane and is neither reaped nor bounced. The
+# restart itself fires on a later sweep, once the busy read has seen the shell
+# gone. _PR_BG_SWEPT keeps the roster loop from sweeping the seat a second time
+# in the same tick (two done ticks in one would halve the grace).
+_PR_BG_SWEPT=""
+_hb_pending_restart_reap() {
+  local dir f name
+  _PR_BG_SWEPT=""
+  declare -F _pending_restart_dir >/dev/null 2>&1 || return 0
+  dir="$(_pending_restart_dir)"
+  [[ -d "$dir" ]] || return 0
+  for f in "$dir"/*; do
+    [[ -f "$f" ]] || continue
+    name="${f##*/}"
+    _pending_restart_marked_at "$name" >/dev/null || continue
+    if command -v systemctl >/dev/null 2>&1 \
+       && ! systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null; then
+      continue
+    fi
+    _agent_is_parked "$name" && continue
+    _hb_bg_shell_sweep "$name" || true
+    _PR_BG_SWEPT+=" ${name} "
+  done
+  return 0
 }
 
 # --- DIVE-3465: a retryable rate limit and a hard spend cap are two states -----
@@ -8015,16 +8063,24 @@ _hb_poller_liveness_sweep() {
     # unreachable, unparseable stamp, or a stamp in the future) — the verdict
     # reads empty as "not in grace" and alarms, so a broken probe never mutes a
     # real death.
-    local aet aet_epoch
+    #
+    # DIVE-5960: the clock is read PER SEAT, after the stamp. The sweep's `now` is
+    # read once before a loop that took ~7s over 39 seats, so a seat the nightly
+    # update restarted mid-sweep had a stamp AFTER `now`, the future-stamp guard
+    # left uptime empty, and a 2s-old unit with its beacon unlinked alarmed "no
+    # beacon". Read after the stamp, `seat_now >= aet` holds for any unit that is
+    # already active, so the guard is left catching only real clock skew.
+    local aet="" aet_epoch seat_now
     uptime=""
     if [[ "$type" == "claude" ]] && (( supposed )); then
       aet=$(systemctl show -p ActiveEnterTimestamp --value "5dive-agent@${name}.service" 2>/dev/null)
-      if [[ -n "$aet" ]] && aet_epoch=$(date -d "$aet" +%s 2>/dev/null) \
-         && [[ "$aet_epoch" =~ ^[0-9]+$ ]] && (( aet_epoch <= now )); then
-        uptime=$(( now - aet_epoch ))
-      fi
     fi
-    verdict=$(_hb_poller_verdict "$type" "$mtime" "$now" "$allowfrom" "$thresh" "$supposed" "$uptime")
+    seat_now=$(date +%s)
+    if [[ -n "$aet" ]] && aet_epoch=$(date -d "$aet" +%s 2>/dev/null) \
+       && [[ "$aet_epoch" =~ ^[0-9]+$ ]] && (( aet_epoch <= seat_now )); then
+      uptime=$(( seat_now - aet_epoch ))
+    fi
+    verdict=$(_hb_poller_verdict "$type" "$mtime" "$seat_now" "$allowfrom" "$thresh" "$supposed" "$uptime")
     [[ -n "$verdict" ]] || continue
     dead+=("${name}: ${verdict}")
     # Kept per seat for the no-coordinator-channel fallback below: the seat's OWN
@@ -9350,6 +9406,8 @@ cmd_heartbeat_tick() {
   # that just went to sleep is seen as stopped (nothing to bounce, marker
   # cleared) instead of being restarted awake. Same isolation contract as every
   # other sweep: a failure here must NEVER abort the wake loop.
+  # DIVE-5960: each owed seat's stray shell is reaped BEFORE the sweep reads busy.
+  _hb_pending_restart_reap || true
   _pending_restart_sweep || _hb_log "[pending-restart] pass errored (non-fatal)"
   # `${...:-0}` on every counter, and it is not defensive noise: ~10 harnesses
   # drive this tick with only src/cmd_heartbeat.sh sourced, so the counters (which
@@ -9493,7 +9551,9 @@ cmd_heartbeat_tick() {
     # DIVE-4298 -- above the busy-guard on purpose: a seat holding an in_progress
     # row `continue`s below and would never be swept, which is the exact shape
     # that left an orphaned browser tree alive for 1h20m on quinn.
-    _hb_bg_shell_sweep "$name" || true
+    # DIVE-5960: skipped for a seat the pending-restart pass already swept this
+    # tick — a second call would count two done ticks in one and halve the grace.
+    [[ " ${_PR_BG_SWEPT:-} " == *" ${name} "* ]] || _hb_bg_shell_sweep "$name" || true
 
     # DIVE-4261 — A GRADE THIS SEAT CANNOT MERGE IS NOT WORK IN PROGRESS.
     # After `task verify` PASS the row stays status=in_progress with
