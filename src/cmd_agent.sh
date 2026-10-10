@@ -451,7 +451,8 @@ _cmd_list_legacy() {
            | $s + {diverges: ($s.measured and $s.impliedIsolation != (.value.isolation // "admin"))}),
     health: ($live[.key].health // null),
     avatar: ($live[.key].avatar // null),
-    orgBlocksChannels: ($live[.key].orgBlocksChannels // null)
+    orgBlocksChannels: ($live[.key].orgBlocksChannels // null),
+    orgChannelsOff: ($live[.key].orgChannelsOff // null)
   })' <<<"$reg")
   if (( JSON_MODE )); then
     _agent_list_hb_json "$merged" | jq -c '{ok:true, data: .}'
@@ -1059,24 +1060,54 @@ def channel_plugins(name, channels):
             out.append(("5dive-plugins", ch))
     return out
 
-def org_blocked_channels(name, agent_type, channels):
+# DIVE-5993: on a Team/Enterprise login Claude Code keeps channels OFF unless
+# the org's managed settings say `channelsEnabled: true` (read from the 2.1.296
+# gate: a claude.ai subscriber is skipped "channels not enabled by org policy"
+# when its plan is team or enterprise and the policy lacks it). The managed
+# tier does not merge: the org's server-managed settings, when they hold any
+# key, replace the box's /etc/claude-code/managed-settings.json outright (Claude
+# Code docs, "Settings precedence"). So an org that set ANY policy without
+# channelsEnabled silences every channel, while an org with none falls back to
+# the box file, which turns channels on.
+BOX_MANAGED_SETTINGS = os.environ.get("CLAUDE_MANAGED_SETTINGS") or "/etc/claude-code/managed-settings.json"
+
+def claude_plan(name, profile):
+    paths = [os.path.join(profiles_dir, profile, "claude", ".credentials.json")] if profile else []
+    paths.append(os.path.join(home_root, f"agent-{name}", ".claude", ".credentials.json"))
+    for path in paths:
+        creds = read_json(path)
+        if isinstance(creds, dict) and isinstance(creds.get("claudeAiOauth"), dict):
+            return creds["claudeAiOauth"].get("subscriptionType")
+    return None
+
+def org_channel_policy(name, agent_type, channels, profile=""):
+    """(blocked, off): the seat's channel plugins the org policy leaves out, and
+    whether the org has channels switched off altogether (DIVE-5993)."""
     if agent_type != "claude":
-        return None
+        return None, None
     plugins = channel_plugins(name, channels)
     if not plugins:
-        return None
+        return None, None
     remote = read_json(os.path.join(home_root, f"agent-{name}", ".claude", "remote-settings.json"))
     if not isinstance(remote, dict):
-        return None
-    if remote.get("channelsEnabled") is False:
+        remote = None
+    off = remote is not None and remote.get("channelsEnabled") is False
+    if not off and claude_plan(name, profile) in ("team", "enterprise"):
+        policy = remote if remote else read_json(BOX_MANAGED_SETTINGS)
+        # An unreadable box file is no evidence: never flag on a guess.
+        off = isinstance(policy, dict) and policy.get("channelsEnabled") is not True
+    if off:
         blocked = plugins
-    elif isinstance(remote.get("allowedChannelPlugins"), list):
+    elif remote is not None and isinstance(remote.get("allowedChannelPlugins"), list):
         allowed = {(e.get("marketplace"), e.get("plugin"))
                    for e in remote["allowedChannelPlugins"] if isinstance(e, dict)}
         blocked = [p for p in plugins if p not in allowed]
     else:
-        return None
-    return [{"marketplace": market, "plugin": plugin} for market, plugin in blocked] or None
+        return None, None
+    return ([{"marketplace": market, "plugin": plugin} for market, plugin in blocked] or None), (True if off else None)
+
+def org_blocked_channels(name, agent_type, channels, profile=""):
+    return org_channel_policy(name, agent_type, channels, profile)[0]
 
 def iso_time(epoch):
     if epoch is None:
@@ -1133,6 +1164,7 @@ for name, value in agents.items():
     sudo = sudo_measure(name)
     isolation = value.get("isolation") or "admin"
     sudo["diverges"] = bool(sudo["measured"] and sudo["impliedIsolation"] != isolation)
+    org_blocks, org_off = org_channel_policy(name, agent_type, channels, profile)
     rows.append({
         "name": name,
         "type": agent_type,
@@ -1151,7 +1183,8 @@ for name, value in agents.items():
         "effort": effort,
         "sudo": sudo,
         "avatar": avatar_info(name),
-        "orgBlocksChannels": org_blocked_channels(name, agent_type, channels),
+        "orgBlocksChannels": org_blocks,
+        "orgChannelsOff": org_off,
         "health": {"deaf": deaf, "asleep": asleep,
                    "auth": {"state": auth_state, "expiresAt": iso_time(auth_exp), "refreshable": auth_refresh},
                    "quota": quota,
