@@ -199,9 +199,9 @@ BARE=$(awk '/^cmd_heartbeat_tick\(\) \{/,/^\}/' "$SRC/cmd_heartbeat.sh" | grep -
   || bad_t "A4b: per-seat loop guard" "guarded='$LOOPLINE' unguarded=$BARE"
 
 # --- A5: the reap stays out of the module every command loads -----------------
+_a5=$(grep -A1 -E '^  _hb_pending_restart_reap \|\| true$' "$SRC/cmd_heartbeat.sh" || true)
 ! grep -nE '_hb_bg_shell_sweep|_HB_DONE_SHELL_REAP_TICKS|_PR_BG_SWEPT' "$SRC/cmd_selfupdate.sh" >/dev/null \
-  && grep -A1 -E '^  _hb_pending_restart_reap \|\| true$' "$SRC/cmd_heartbeat.sh" \
-       | grep -qE '^  _pending_restart_sweep \|\| _hb_log ' \
+  && grep -qE '^  _pending_restart_sweep \|\| _hb_log ' <<<"$_a5" \
   && ok_t "A5: cmd_selfupdate.sh names no reaper token, and the tick reaps on the line before its sweep" \
   || bad_t "A5: reaper reference in cmd_selfupdate.sh, or the tick does not reap right before the sweep" \
        "$(grep -nE '_hb_bg_shell_sweep|_HB_DONE_SHELL_REAP_TICKS|_PR_BG_SWEPT' "$SRC/cmd_selfupdate.sh")"
