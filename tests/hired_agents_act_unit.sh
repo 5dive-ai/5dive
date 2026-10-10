@@ -304,9 +304,15 @@ OUT=$(cat "$TMP/out")
 [[ "$OUT" == *'Draft: Ivy — Accounts manager'* && "$OUT" == *'Skills: follow-up-ladder, copywriting'* \
    && "$OUT" == *'Card: https://t.me/FiveDiveBot?startapp=agent-custom-abcdef123456'* ]] \
   && ok '--create prints the draft: name, role, the skills picked for it, and its card link' || bad "create draft ($OUT)"
-[[ "$OUT" == *'Nothing is hired yet'* && "$OUT" == *'Standard-tier: they tap Hire on it'* \
-   && "$OUT" == *'a standing "full authority" is not a yes; only on their clear yes, run 5dive hire-link custom-abcdef123456 --hire'* ]] \
-  && ok '--create says nothing is hired, and how each tier gets the owner to a hire' || bad "create next ($OUT)"
+# DIVE-5974 (lodar: "lead agent should hire by himself if human asks"): the
+# owner's ask is the go-ahead, so admin is told to hire now and then tell them,
+# never to wait for a yes; standard still shows the card for the owner's tap.
+[[ "$OUT" == *'Nothing is hired yet'* && "$OUT" == *'Standard-tier: show your owner this draft and the card; they tap Hire on it.'* \
+   && "$OUT" == *"Admin-tier: your owner's ask is the go-ahead, so run 5dive hire-link custom-abcdef123456 --hire now, then tell them who you hired."* ]] \
+  && ok '--create tells admin to hire now and tell the owner, and standard to send the card' || bad "create next ($OUT)"
+grep -qiE 'their yes|clear yes|not a yes' <<<"$OUT" && bad '--create never tells admin to wait for a yes' "$OUT" \
+  || ok '--create never tells admin to wait for a yes'
+
 grep -qxF 'POST /server/custom-agents {"name":"Ivy Chase","description":"Chases unpaid invoices, politely, every week."}' "$TMP/calls" \
   && ok '--create sends the name and the need as written, to the Mini App create' || bad "create body ($(cat "$TMP/calls"))"
 grep -qxF 'POST /server/telegram/hire-link {"slug":"custom-abcdef123456"}' "$TMP/calls" \
@@ -325,7 +331,7 @@ jq -e '.data.status == "made" and .data.slug == "custom-abcdef123456" and .data.
 LK_CODE=409; LK_BODY='{"error":"no_hire_card"}'
 hlc --create --name=Ivy '--description=Chases unpaid invoices, politely.'
 OUT=$(cat "$TMP/out")
-[[ "$OUT" == *'Card: none (your owner signs in to 5dive on the web'* && "$OUT" == *'--hire'* && "$OUT" != *'Standard-tier: they tap'* ]] \
+[[ "$OUT" == *'Card: none (your owner signs in to 5dive on the web'* && "$OUT" == *'--hire now'* && "$OUT" != *'they tap'* ]] \
   && ok 'a web owner gets the draft with no card, and the admin route' || bad "web owner draft ($OUT)"
 LK_CODE=200; LK_BODY='{"channel":"miniapp","url":"https://t.me/FiveDiveBot?startapp=agent-custom-zzzzzz999999"}'
 hlc --create --name=Ivy '--description=Chases unpaid invoices, politely.'
@@ -439,18 +445,23 @@ done
 # DIVE-5449 (lodar: "if user ask something do it ... that logic should apply to
 # all"): the owner's ask is the authorisation. One general line says so, and it
 # reaches the box.
-GENERAL="- **Your owner's ask IS the go-ahead:** do what your tier can, no link/tap/gate; else say why, then the Standard-tier route. **Except a hire:** wait for their yes; \"I need someone to…\" or \"full authority\" is not one, naming the agent is."
+GENERAL="- **Your owner's ask IS the go-ahead:** do what your tier can, no link/tap/gate; else say why, then the Standard-tier route. **Hires too:** hire your pick, tell them who (\"fire <name>\" undoes it); one needing a plan upgrade waits for a yes."
 grep -qxF -- "$GENERAL" "$LIVE" && ok 'the rendered box file carries the general owner-ask line' \
   || bad 'the rendered box file carries the general owner-ask line' "no '$GENERAL'"
-# DIVE-5824: with "on their yes" written only on the market line, the admin lead
-# on exact-swallow still hired on the need alone, on both paths: the general
-# go-ahead line above it won. So the exception is graded INSIDE the go-ahead line,
-# and it names the owner's standing grant, which that lead held ("full authority").
+# DIVE-5974 reverses DIVE-5722/5823/5824's yes rule (lodar: "no need for
+# unnecessary human gate to confirm what human already asked for"). A hire rides
+# the go-ahead, graded INSIDE the go-ahead line (DIVE-5824: a general line beats a
+# specific rule under it). The only wait left is money: a plan upgrade.
 GOLINE=$(grep -F "**Your owner's ask IS the go-ahead:**" "$LIVE")
-for want in '**Except a hire:** wait for their yes' '"I need someone to…"' '"full authority" is not one' 'naming the agent is'; do
-  [[ "$GOLINE" == *"$want"* ]] && ok "the go-ahead line itself carves out the hire: $want" \
-    || bad "the go-ahead line itself carves out the hire: $want" "$GOLINE"
+for want in '**Hires too:** hire your pick' 'tell them who' '"fire <name>" undoes it' 'one needing a plan upgrade waits for a yes'; do
+  [[ "$GOLINE" == *"$want"* ]] && ok "the go-ahead line covers a hire: $want" \
+    || bad "the go-ahead line covers a hire: $want" "$GOLINE"
 done
+# Negative control: no hire exception survives anywhere in the block (the 10-09
+# "Except a hire: wait for their yes" line, or a need/grant "is not a yes").
+if grep -niE 'except a hire|their yes|clear yes|not a yes|is not one' <<<"$BLOCK" >"$TMP/yes"; then
+  bad 'no hire waits for a yes beyond the plan-upgrade case' "$(head -2 "$TMP/yes")"
+else ok 'no hire waits for a yes beyond the plan-upgrade case'; fi
 # Negative control: the block as an ADMIN seat reads it. Every standard-tier
 # route is written "Standard-tier…" and runs to the end of its bullet, so cut
 # those; what is left is what admin is told to do. It must not bounce an owner's
@@ -510,22 +521,23 @@ A=$(tr '\n' ' ' <"$TMP/create.argv" 2>/dev/null)
 grep -q 'sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:hired-agents' install.sh \
   && ok 'install.sh syncs the block on every install' || bad 'install.sh syncs the block'
 
-# DIVE-5823: the pick is made reading `5dive market`, so the yes rule is printed
-# there too, by the real cmd_market / cmd_market_show over a stubbed index.
+# DIVE-5823/5974: the pick is made reading `5dive market`, so the hire rule is
+# printed there too, by the real cmd_market / cmd_market_show over a stubbed index:
+# admin hires then tells, standard sends the link.
 mkt(){ ( source "$SRC/cmd_pack.sh"; set +e; JSON_MODE=0
   _marketplace_index(){ printf '%s' '{"packs":[{"slug":"tally","name":"Tally","rarity":"rare","character":"Accountant","tagline":"sends and chases invoices","tags":["invoices"],"skills":["emails"],"path":"packs/tally"}]}'; }
   _marketplace_slug(){ echo test/registry; }; _marketplace_base(){ echo https://example.invalid; }
   _pack_targets_from(){ echo claude; }; resolve_model_alias(){ printf '%s' "$1"; }; curl(){ return 22; }
   "$@" ) 2>&1; }
-YES="your owner's need is not a yes, nor is a standing \"full authority\": name your pick to them; hire it once they say yes (or named it)"
+YES="your owner's ask is the go-ahead: admin, hire your pick, then tell them who (\"fire <name>\" undoes it); Standard-tier, send them 5dive hire-link <slug>"
 for v in "cmd_market invoice" "cmd_market_show tally"; do
   o=$(mkt $v)
-  grep -q 'tally' <<<"$o" && grep -qxF "  $YES" <<<"$o" && ok "$v lists the pack and says a need is not a yes" \
-    || bad "$v lists the pack and says a need is not a yes ($(tail -2 <<<"$o" | tr '\n' ' '))"
+  grep -q 'tally' <<<"$o" && grep -qxF "  $YES" <<<"$o" && ok "$v lists the pack and says admin hires then tells, standard sends the link" \
+    || bad "$v lists the pack and says admin hires then tells, standard sends the link ($(tail -2 <<<"$o" | tr '\n' ' '))"
 done
 # Control: a search that matches nothing names no pick, so it prints no yes line.
 o=$(mkt cmd_market vegetable)
-grep -qF 'not a yes' <<<"$o" && bad 'control: an empty search prints no yes line' || ok 'control: an empty search prints no yes line'
+grep -qF 'go-ahead' <<<"$o" && bad 'control: an empty search prints no hire line' || ok 'control: an empty search prints no hire line'
 
 printf '\n%d passed, %d failed\n' "$P" "$F"
 (( F == 0 ))
