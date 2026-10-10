@@ -507,9 +507,13 @@ _parked_override_note() {
 # contract — a failure here must never abort its caller's pass. Counters are
 # globals so the caller can put them in its own summary.
 _PR_FIRED=0; _PR_DEFERRED=0; _PR_OVERDUE=0; _PR_CLEARED=0; _PR_FAILED=0; _PR_PARKED=0
+# DIVE-5960: the seats this pass already handed to the stray-shell reaper, so the
+# tick's per-seat loop does not sweep them a second time in the same tick.
+_PR_BG_SWEPT=""
 _pending_restart_sweep() {
   local dir f name marked started busy verdict now unit why
   _PR_FIRED=0; _PR_DEFERRED=0; _PR_OVERDUE=0; _PR_CLEARED=0; _PR_FAILED=0; _PR_PARKED=0
+  _PR_BG_SWEPT=""
   dir="$(_pending_restart_dir)"
   [[ -d "$dir" ]] || return 0
   now=$(date +%s)
@@ -561,6 +565,21 @@ _pending_restart_sweep() {
       _PR_PARKED=$((_PR_PARKED + 1))
       _pr_log "[$name] $(_parked_override_note "$name")"
       continue
+    fi
+    # DIVE-5960: give the stray-shell reaper its turn BEFORE the busy read. Claude
+    # Code reports native "busy" while any background shell lives, and the
+    # DIVE-4298 reaper ran only inside the heartbeat roster loop, so a seat with
+    # no heartbeat block and one forgotten shell read busy forever: on teal-fox
+    # the restart was owed for 120h and the overdue line logged 290 times a day.
+    # This only chooses WHEN to ask. The pane must read done + "N shells still
+    # running" for _HB_DONE_SHELL_REAP_TICKS ticks, and _reap_stale_shells still
+    # decides WHAT dies (grace age, FIVEDIVE_KEEP_ALIVE, kill by PID). Native busy
+    # is still never read as idle: a row-less Telegram turn is mid-turn on the
+    # pane and is neither reaped nor bounced. The restart itself fires on a later
+    # sweep, once the busy read below has seen the shell gone.
+    if declare -F _hb_bg_shell_sweep >/dev/null 2>&1; then
+      _hb_bg_shell_sweep "$name" || true
+      _PR_BG_SWEPT+=" ${name} "
     fi
     started="$(_unit_active_enter_epoch "$unit")"
     busy="$(_agent_busy_state "$name")"
