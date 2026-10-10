@@ -6,8 +6,10 @@
 #    only inside the heartbeat roster loop, so a seat with no heartbeat block and
 #    one forgotten shell read busy to `_pending_restart_sweep` forever (teal-fox
 #    seat-c: owed 120h, an 11-day-old `diff <(pandoc …)` shell, the overdue line
-#    290 times a day). The sweep now hands each owed seat to `_hb_bg_shell_sweep`
-#    before its busy read.
+#    290 times a day). The tick's pending-restart pass now hands each owed seat
+#    to `_hb_bg_shell_sweep` before `_pending_restart_sweep` reads busy. The reap
+#    lives in cmd_heartbeat, NOT in the sweep: cmd_selfupdate is loaded by every
+#    command, and a heartbeat reference from it pulled 4 modules into `whoami`.
 # B. THE POLLER SWEEP FALSE-ALARMED A SEAT RESTARTED MID-SWEEP. `now` was read
 #    once before a ~7s loop, so a unit that entered active after it had a
 #    "future" stamp, no uptime, no restart grace, and its unlinked beacon read
@@ -24,7 +26,9 @@
 #   A3  NEGATIVE: a mid-turn pane (spinner) is not reaped and not restarted
 #   A4  a roster seat swept by the pending-restart pass is not swept again by
 #       the per-seat loop in the same tick
-#   AM  MUTANT: the pre-fix sweep (no reaper call) leaves A1's seat unrestarted
+#   A5  cmd_selfupdate.sh names neither the reaper nor its tick threshold, so the
+#       lazy loader's dep scan adds no edge from it into cmd_heartbeat
+#   AM  MUTANT: the pre-fix pass (no reaper call) leaves A1's seat unrestarted
 #   B4  AET 2s after the sweep's start, no beacon: no alarm (inside 120s grace)
 #   B5  NEGATIVE: AET genuinely in the future of the per-seat clock still alarms
 #   B6  NEGATIVE: active for 300s with no beacon still alarms "no beacon"
@@ -32,7 +36,7 @@
 #
 # Stubs: the pane, `claude agents --json` (via _hb_agent_native_state), the seat's
 # process table, cgroups, kill, systemctl, the board (db), date for B. The real
-# _pending_restart_sweep, _hb_bg_shell_sweep, _reap_stale_shells, _hb_agent_idle,
+# _hb_pending_restart_reap, _pending_restart_sweep, _hb_bg_shell_sweep, _reap_stale_shells, _hb_agent_idle,
 # registry and _hb_poller_liveness_sweep run. No root, no network, no tmux.
 #
 #   bash tests/update_night_restart_unit.sh
@@ -133,7 +137,7 @@ scenario() {
   printf 'marked_at=%s\nreason=telegram plugin 0.5.92\n' "$(( $(command date +%s) - 120*3600 ))" \
     > "$PENDING_RESTART_DIR/$SEAT"
 }
-sweep() { _pending_restart_sweep; }
+sweep() { _hb_pending_restart_reap; _pending_restart_sweep; }   # the tick's order (A5 pins it)
 restarted() { grep -qxF "$UNIT" "$TMP/restarts" 2>/dev/null; }
 reaped()    { grep -qx 5151 "$TMP/killed" 2>/dev/null; }
 hblog()     { cat "$TMP/hb.log" 2>/dev/null; }
@@ -189,23 +193,31 @@ has "${_PR_BG_SWEPT:-}" " cee " && [[ "$(jq -r '.agents.cee.heartbeat.doneShells
   && ok_t "A4a: a roster seat's tick is counted under its heartbeat block, and the pass records it as swept" \
   || bad_t "A4a: roster seat" "swept='${_PR_BG_SWEPT:-}' reg=$(cat "$REGISTRY")"
 LOOPLINE=$(grep -nE '^ +\[\[ " \$\{_PR_BG_SWEPT:-\} " == \*" \$\{name\} "\* \]\] \|\| _hb_bg_shell_sweep "\$name" \|\| true$' "$SRC/cmd_heartbeat.sh")
-BARE=$(grep -cE '^ +_hb_bg_shell_sweep "\$name" \|\| true$' "$SRC/cmd_heartbeat.sh")
+BARE=$(awk '/^cmd_heartbeat_tick\(\) \{/,/^\}/' "$SRC/cmd_heartbeat.sh" | grep -cE '^ +_hb_bg_shell_sweep "\$name" \|\| true$')
 [[ -n "$LOOPLINE" && "$BARE" == 0 ]] \
   && ok_t "A4b: the per-seat loop skips a seat the pending-restart pass already swept (no double tick)" \
   || bad_t "A4b: per-seat loop guard" "guarded='$LOOPLINE' unguarded=$BARE"
 
-# --- AM: MUTANT — the pre-fix sweep ------------------------------------------
-eval "$(awk '/^_pending_restart_sweep\(\) \{/,/^\}/' "$SRC/cmd_selfupdate.sh" \
-  | sed -e 's/^      _hb_bg_shell_sweep "\$name" || true$/      :/')"
-has "$(declare -f _pending_restart_sweep)" '_hb_bg_shell_sweep "$name"' \
-  && bad_t "AM0: (anchor) the mutation did not land" "the sed pattern no longer matches src/cmd_selfupdate.sh" \
-  || ok_t "AM0: (anchor) the reaper call is gone from the evaluated sweep"
+# --- A5: the reap stays out of the module every command loads -----------------
+! grep -nE '_hb_bg_shell_sweep|_HB_DONE_SHELL_REAP_TICKS|_PR_BG_SWEPT' "$SRC/cmd_selfupdate.sh" >/dev/null \
+  && grep -A1 -E '^  _hb_pending_restart_reap \|\| true$' "$SRC/cmd_heartbeat.sh" \
+       | grep -qE '^  _pending_restart_sweep \|\| _hb_log ' \
+  && ok_t "A5: cmd_selfupdate.sh names no reaper token, and the tick reaps on the line before its sweep" \
+  || bad_t "A5: reaper reference in cmd_selfupdate.sh, or the tick does not reap right before the sweep" \
+       "$(grep -nE '_hb_bg_shell_sweep|_HB_DONE_SHELL_REAP_TICKS|_PR_BG_SWEPT' "$SRC/cmd_selfupdate.sh")"
+
+# --- AM: MUTANT — the pre-fix pass -------------------------------------------
+eval "$(awk '/^_hb_pending_restart_reap\(\) \{/,/^\}/' "$SRC/cmd_heartbeat.sh" \
+  | sed -e 's/^    _hb_bg_shell_sweep "\$name" || true$/    :/')"
+has "$(declare -f _hb_pending_restart_reap)" '_hb_bg_shell_sweep "$name"' \
+  && bad_t "AM0: (anchor) the mutation did not land" "the sed pattern no longer matches src/cmd_heartbeat.sh" \
+  || ok_t "AM0: (anchor) the reaper call is gone from the evaluated pass"
 scenario "$OFF_ROSTER" "$STRAY" "$ELEVEN_DAYS" "$PANE_DONE"
 sweep; sweep; sweep
 ! reaped && ! restarted \
   && ok_t "AM1: MUTANT (pre-fix): A1's seat keeps its shell and is never restarted — A1 goes red" \
   || bad_t "AM1: mutant must strand the seat" "reaped=$(reaped && echo y) restarted=$(restarted && echo y)"
-eval "$(awk '/^_pending_restart_sweep\(\) \{/,/^\}/' "$SRC/cmd_selfupdate.sh")"
+eval "$(awk '/^_hb_pending_restart_reap\(\) \{/,/^\}/' "$SRC/cmd_heartbeat.sh")"
 
 # ===================== B. the poller sweep's per-seat clock ==================
 unset -f systemctl kill sleep

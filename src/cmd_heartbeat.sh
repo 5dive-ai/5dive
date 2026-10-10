@@ -2162,6 +2162,46 @@ _hb_bg_shell_sweep() {
   with_registry_lock _hb_clear_done_shells "$name" >/dev/null 2>&1 || true
 }
 
+# DIVE-5960: the tick's pending-restart reap. Claude Code reports native "busy"
+# while any background shell lives, and the reaper above ran only inside the
+# heartbeat roster loop, so a seat with no heartbeat block and one forgotten
+# shell read busy to _pending_restart_sweep forever: on teal-fox the restart was
+# owed for 120h and the overdue line logged 290 times a day. So the tick hands
+# each seat that owes a restart to the reaper FIRST, then the sweep reads busy.
+#
+# The reap lives HERE and not inside _pending_restart_sweep on purpose: that
+# sweep's module is loaded by every command, and a reference to this module from
+# it pulled heartbeat (and its own deps) into every `whoami` / `task ls`.
+#
+# Same seat filter as the sweep: a marker, a live unit, not parked. Every other
+# branch there `continue`s before the busy read, so a seat it skips needs no
+# reap from this pass. Native busy is still never read as idle: a row-less
+# Telegram turn is mid-turn on the pane and is neither reaped nor bounced. The
+# restart itself fires on a later sweep, once the busy read has seen the shell
+# gone. _PR_BG_SWEPT keeps the roster loop from sweeping the seat a second time
+# in the same tick (two done ticks in one would halve the grace).
+_PR_BG_SWEPT=""
+_hb_pending_restart_reap() {
+  local dir f name
+  _PR_BG_SWEPT=""
+  declare -F _pending_restart_dir >/dev/null 2>&1 || return 0
+  dir="$(_pending_restart_dir)"
+  [[ -d "$dir" ]] || return 0
+  for f in "$dir"/*; do
+    [[ -f "$f" ]] || continue
+    name="${f##*/}"
+    _pending_restart_marked_at "$name" >/dev/null || continue
+    if command -v systemctl >/dev/null 2>&1 \
+       && ! systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null; then
+      continue
+    fi
+    _agent_is_parked "$name" && continue
+    _hb_bg_shell_sweep "$name" || true
+    _PR_BG_SWEPT+=" ${name} "
+  done
+  return 0
+}
+
 # --- DIVE-3465: a retryable rate limit and a hard spend cap are two states -----
 # _hb_pane_is_usage_limit above answers ONE question — "is this session parked on
 # a wall dialog" — and it matches BOTH variants on purpose ("tolerant of CC copy
@@ -9366,6 +9406,8 @@ cmd_heartbeat_tick() {
   # that just went to sleep is seen as stopped (nothing to bounce, marker
   # cleared) instead of being restarted awake. Same isolation contract as every
   # other sweep: a failure here must NEVER abort the wake loop.
+  # DIVE-5960: each owed seat's stray shell is reaped BEFORE the sweep reads busy.
+  _hb_pending_restart_reap || true
   _pending_restart_sweep || _hb_log "[pending-restart] pass errored (non-fatal)"
   # `${...:-0}` on every counter, and it is not defensive noise: ~10 harnesses
   # drive this tick with only src/cmd_heartbeat.sh sourced, so the counters (which
