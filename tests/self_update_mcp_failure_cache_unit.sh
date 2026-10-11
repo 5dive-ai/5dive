@@ -331,7 +331,10 @@ _drops_cache() { grep -E '^[^#]*\brm\b[^#]*mcp-needs-auth-cache\.json' <<<"${1:-
 # the poisoned cache and no clear. A2 above cannot see that: the string was present
 # the whole time it was wrong (the same reason DIVE-4399's A2 could not clear
 # cmd_heartbeat.sh). So assert the unconditional drop sits in the install shell.
-setup_install_block="$(sed -n "/^  if ! sudo -u \"\$user\" -H env PLUGIN=/,/^AGENT_PLUGIN_INSTALL\$/p" "$ROOT/src/lib/agent_setup.sh")"
+# Anchored on the seat invocation itself, not on a leading `if !`: DIVE-6005 pipes
+# marketplace_checkout_settled into the same `sudo -u "$user" ... bash -s`, so the
+# line now opens with `|`. The range still ends at the heredoc terminator.
+setup_install_block="$(sed -n "/sudo -u \"\$user\" -H env PLUGIN=/,/^AGENT_PLUGIN_INSTALL\$/p" "$ROOT/src/lib/agent_setup.sh")"
 if grep -q 'plugin install' <<<"$setup_install_block" && _drops_cache "$setup_install_block"; then
   ok_t "A3 agent-create drops the cache in the SAME seat shell that runs the install, for every plugin - not only telegram"
 else
