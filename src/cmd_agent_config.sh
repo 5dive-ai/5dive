@@ -446,7 +446,7 @@ cmd_config() {
       write_channel_secret telegram "$name" TELEGRAM_BOT_TOKEN "$new_telegram_token"
     fi
     step "Installing telegram channel for agent '$name' (type=$type)"
-    install_channel_for_agent "$type" telegram "$name" \
+    _config_install_channel "$prev_channels" "$type" telegram "$name" \
       "$token_for_install" "$new_home_channel" "$new_allowed_users"
     # DIVE-4413: install_channel_for_agent hands home_channel to the hermes and
     # openclaw installers ONLY (agent_setup.sh) — every other type took the value
@@ -520,7 +520,7 @@ cmd_config() {
       write_channel_secret discord "$name" DISCORD_BOT_TOKEN "$new_discord_token"
     fi
     step "Installing discord channel for agent '$name' (type=$type)"
-    install_channel_for_agent "$type" discord "$name" \
+    _config_install_channel "$prev_channels" "$type" discord "$name" \
       "$discord_token_for_install" "$new_home_channel" "$new_allowed_users"
     if [[ "$type" == "hermes" ]]; then
       ensure_hermes_gateway "$name"
@@ -533,7 +533,7 @@ cmd_config() {
   # telegram/discord dispatches above.
   if [[ -n "$channels_changed_to" ]] && channel_in_list dashboard "$channels_changed_to"; then
     step "Installing dashboard channel for agent '$name' (type=$type)"
-    install_channel_for_agent "$type" dashboard "$name" ""
+    _config_install_channel "$prev_channels" "$type" dashboard "$name" ""
   fi
   # DIVE-3333 buzz attach. Same token-free shape as dashboard above: the buzz
   # plugin carries no per-agent secret, so the dispatch is gated purely on
@@ -544,7 +544,7 @@ cmd_config() {
   # channels=<same>") re-entered the identical path and failed identically.
   if [[ -n "$channels_changed_to" ]] && channel_in_list buzz "$channels_changed_to"; then
     step "Installing buzz channel for agent '$name' (type=$type)"
-    install_channel_for_agent "$type" buzz "$name" ""
+    _config_install_channel "$prev_channels" "$type" buzz "$name" ""
   fi
   if [[ -n "$new_model" ]]; then
     step "Writing model=$new_model into $type runtime config"
@@ -596,15 +596,7 @@ cmd_config() {
         # with no plugin staged — exactly the deaf session this gate exists to
         # prevent, just deferred. Rolling back keeps the refusal honest: the
         # call fails and changes nothing.
-        local rb_reg
-        rb_reg=$(registry_read)
-        rb_reg=$(jq --arg n "$name" --arg v "$prev_channels" \
-          '.agents[$n].channels = $v' <<<"$rb_reg")
-        printf '%s\n' "$rb_reg" | registry_write
-        local rb_workdir rb_profile
-        rb_workdir=$(jq -r --arg n "$name" '.agents[$n].workdir // empty' <<<"$rb_reg")
-        rb_profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$rb_reg")
-        write_agent_env "$name" "$type" "$prev_channels" "$rb_workdir" "$rb_profile"
+        _config_rollback_channels "$name" "$type" "$prev_channels"
         fail "$E_GENERIC" \
           "$gate_ch plugin not staged for agent '$name' ($gate_dir missing) — refusing to restart into a session with no $gate_ch tool. No restart fired and channels was rolled back to '$prev_channels'. NOTE: only channels is rolled back — any model=/effort=/workdir=/autonomy= in the same call stayed applied and take effect on the next restart. Re-running the same command will fail the same way — check that the $gate_marketplace marketplace is reachable for user agent-$name (\`sudo -u agent-$name ls ~/.claude/plugins/cache/$gate_marketplace\`) and see the install output above for why staging did not complete."
       fi
@@ -624,6 +616,44 @@ cmd_config() {
   ok "config applied." \
      '{name:$n, applied:$a}' \
      --arg n "$name" --argjson a "$applied_json"
+}
+
+# DIVE-6005: put the declared channel list back to its pre-call value, registry
+# AND agents.d env (5dive-agent-start reads the env). A no-op when nothing moved.
+_config_rollback_channels() { # <name> <type> <prev_channels>
+  local name="$1" type="$2" prev="$3" rb_reg rb_workdir rb_profile
+  rb_reg=$(registry_read)
+  [[ "$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$rb_reg")" == "$prev" ]] && return 0
+  rb_reg=$(jq --arg n "$name" --arg v "$prev" '.agents[$n].channels = $v' <<<"$rb_reg")
+  printf '%s\n' "$rb_reg" | registry_write
+  rb_workdir=$(jq -r --arg n "$name" '.agents[$n].workdir // empty' <<<"$rb_reg")
+  rb_profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$rb_reg")
+  write_agent_env "$name" "$type" "$prev" "$rb_workdir" "$rb_profile"
+}
+
+# DIVE-6005: install_channel_for_agent, but a failure rolls the channel list back
+# before the call fails. The registry write commits long before this dispatch, and
+# the installer's own `fail` exits on the spot, so without this a failed install
+# (the marketplace clone racing a just-hired seat's first boot, DIVE-6000's live
+# arm) left channels=dashboard declared with no plugin: the dashboard reads that
+# value alone, showed chat as ready and stopped offering Enable chat. The install
+# runs in a subshell with JSON_MODE=0 so its error is one stderr line and the
+# envelope below stays the call's only one. The subshell is NOT run as a
+# condition (`( … ) || rc=$?`): that exempts every command inside it from
+# set -e, so an installer step that fails without calling `fail` would carry on
+# and report success. errexit is set inside and the caller's restored after.
+_config_install_channel() { # <prev_channels> <type> <plugin> <name> [<token> <home> <allowed>]
+  local prev="$1" type="$2" plugin="$3" name="$4" rc=0 had_errexit=0
+  shift
+  [[ $- == *e* ]] && had_errexit=1
+  set +e
+  ( set -e; JSON_MODE=0; install_channel_for_agent "$@" ) >&2
+  rc=$?
+  (( had_errexit )) && set -e
+  (( rc == 0 )) && return 0
+  _config_rollback_channels "$name" "$type" "$prev"
+  fail "$rc" \
+    "$plugin channel install failed for agent '$name' (rc=$rc; the install output above names the cause). No restart fired and channels was rolled back to '$prev', so the seat is not recorded as having $plugin. NOTE: only channels is rolled back — any model=/effort=/workdir=/autonomy= in the same call stayed applied. Re-running the same command retries the install."
 }
 
 # Attach the invoker's terminal to the agent's tmux session. The systemd unit
