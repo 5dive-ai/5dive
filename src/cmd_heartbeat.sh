@@ -8286,6 +8286,17 @@ _hb_stuck_base_asks() { # <text>
   grep -qiE "$_HB_STUCK_Q_ASK_RE" <<<"$para"
 }
 
+# `_hb_stuck_fenced_reply <text>` — rc 0 when the turn carries an `agent ask`
+# reply fence (`<5dive-r:<id>>`, the marker cmd_agent_ask asks for). That text
+# is the answer a synchronous caller is still polling the pane for, so a "?" in
+# it is a question to THAT caller, not one a lead or a person should answer for
+# the seat (DIVE-6015: amir's first-job reply, ending "Want me to rewrite the
+# hero copy first?", reached ceo as "waiting for an answer" while the ask that
+# owned it was still polling).
+_hb_stuck_fenced_reply() { # <text>
+  grep -qE '<5dive-r:[A-Za-z0-9]{1,32}>' <<<"$1"
+}
+
 # `_hb_stuck_reflex <seat> <text> <model>` — the reflex tier's one call. Prints
 # `forward` or `hold` and writes the receipt either way. A timeout, an error or
 # an invalid pick is `forward`: the base already said yes, and a reflex that
@@ -8487,6 +8498,12 @@ _hb_stuck_question_sweep() {
     if ! _hb_stuck_base_asks "$text"; then           # terminal: nothing asked
       printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true
       rm -f "$dir/${name}.retry"; continue
+    fi
+    if _hb_stuck_fenced_reply "$text"; then          # terminal: an `agent ask` caller owns it
+      printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true
+      rm -f "$dir/${name}.retry"
+      _hb_log "[stuck-question] ${name}: its last turn is a fenced agent-ask reply; the asking caller reads it, nothing forwarded"
+      continue
     fi
     full="$text"
     (( ${#text} > _HB_STUCK_Q_TEXT_MAX )) && text="…${text: -_HB_STUCK_Q_TEXT_MAX}"   # the reflex model's input only

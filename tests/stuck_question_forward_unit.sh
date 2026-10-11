@@ -56,6 +56,12 @@
 #      UNSTUBBED stale-nudge predicate with the named row on another seat and on a
 #      done row, is delivered; a from=task-engine control of it is dropped
 #
+# DIVE-6015 arms.
+#   Y  a final turn holding a fenced `agent ask` reply (`<5dive-r:id>…</5dive-r:id>`)
+#      ending in "?" is terminal: `.last` written, nothing sent to a lead or a
+#      person. CONTROL: the same text without the fence still forwards.
+#      MUTANT: the sweep without the fence check forwards the fenced one (Y red)
+#
 # Stubs: systemctl (per unit), cmd_send (the a2a rail), _tg_access_state_dir (channel dirs into the temp tree),
 # _gate_channel_api (the Bot API seam), _reflex_endpoint_decide (the model),
 # _hb_log. No root, no network, no box path written.
@@ -576,6 +582,30 @@ X3=$(_hb_stuck_q_tail "$ONE_PARA" "$_HB_STUCK_Q_TEXT_MAX")
   && ok_t "X3: one paragraph over the cap is cut at a sentence start (${#X3} chars)" \
   || bad_t "X3: sentence cut" "starts: $(head -c 80 <<<"$X3")"
 
+# --- Y) DIVE-6015: a fenced agent-ask reply is the waiting caller's, not a stuck question ---------------
+# amir's first-job reply, the shape that reached ceo on exact-swallow 2026-10-10.
+FENCE_BODY="Your hero says what 5dive does, not why it matters. The pricing table is fine.
+
+Want me to rewrite the hero copy first?"
+FENCED_Q="<5dive-r:e78392d6>
+${FENCE_BODY}
+</5dive-r:e78392d6>"
+_hb_stuck_base_asks "$FENCED_Q" \
+  && ok_t "Y0: (precondition) the base tier alone reads the fenced reply as an ask" \
+  || bad_t "Y0: the fixture must end on a question" "$FENCED_Q"
+opt_out; fresh; DOWN="boss"; tx quiet "$FENCED_Q"; tick; DOWN="lead boss"
+Y_A2A=$(a2as) Y_API=$(sends)
+fresh; tx quiet "$FENCED_Q"; tick
+Y_API2=$(sends)
+[[ "$Y_A2A" == 0 && "$Y_API" == 0 && "$Y_API2" == 0 ]] && [[ -s "$STATE_DIR/stuck-question/quiet.last" ]] \
+  && has "$(cat "$TMP/hb.log")" "fenced agent-ask reply" \
+  && ok_t "Y1: a fenced reply ending in '?' goes to no lead and no person, and is marked judged" \
+  || bad_t "Y1: fenced reply forwarded" "a2a(lead up)=$Y_A2A api(lead up)=$Y_API api(lead down)=$Y_API2 last=$(cat "$STATE_DIR/stuck-question/quiet.last" 2>/dev/null) log=$(cat "$TMP/hb.log")"
+fresh; DOWN="boss"; tx quiet "$FENCE_BODY"; tick; DOWN="lead boss"
+[[ "$(a2as)" == 1 ]] \
+  && ok_t "Y2: CONTROL: the same text WITHOUT the fence still reaches the lead — the sweep is not silenced" \
+  || bad_t "Y2: unfenced control" "a2a=$(a2as) api=$(sends)"
+
 # --- M) MUTANTS -------------------------------------------------------------------------------------------
 # M1 re-introduces the defect in-process: the sweep looks only at seats a person
 # already sees, i.e. the channel-less seat is as unread as before this change.
@@ -673,6 +703,16 @@ fresh; tx quiet "$OPS_Q"; tick
 [[ "$(ASK_OF)" == …* ]] && has "$(ASK_OF)" "**" \
   && ok_t "V2: MUTANT (old text): the phone gets a '…'-prefixed markdown tail — Q1 and X2 go red" \
   || bad_t "V2: mutant must send the raw tail" "$(ASK_OF | head -c 120)"
+eval "$SWEEP_SRC"
+# Y3: the pre-6015 sweep, which never looks for a reply fence.
+eval "$(sed 's/if _hb_stuck_fenced_reply "\$text"; then/if false; then/' <<<"$SWEEP_SRC")"
+has "$(declare -f _hb_stuck_question_sweep)" 'if false; then' \
+  && ok_t "Y0b: (anchor) the no-fence-check mutation landed" \
+  || bad_t "Y0b: fence mutation anchor" "the sed pattern no longer matches src/cmd_heartbeat.sh"
+opt_out; fresh; DOWN="boss"; tx quiet "$FENCED_Q"; tick; DOWN="lead boss"
+[[ "$(a2as)" == 1 ]] && has "$(cat "$TMP/a2a.last")" "e78392d6" \
+  && ok_t "Y3: MUTANT (no fence check): the fenced reply is sent to the lead as a stuck question — Y1 goes red" \
+  || bad_t "Y3: mutant must forward the fenced reply" "a2a=$(a2as)"
 eval "$SWEEP_SRC"
 # V3: iteration 1's envelope. The same sweep, the same text, sent as task-engine.
 SEND_SRC=$(declare -f _hb_stuck_q_agent_send)
