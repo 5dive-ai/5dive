@@ -87,7 +87,9 @@ seat() {
 # run [GH_ORG] — the whole shipped script for seat `s1`; stdout+stderr.
 run() {
   : > "$WORK/claude.log"
-  env PATH="$WORK/bin:$PATH" SEAT_HOME="$WORK/home" CLAUDE_BIN="$WORK/bin/claude" \
+  # -u BASH_ENV (DIVE-6021): the id stub is a bash script; an older box shim's bare
+  # `id -u` would re-enter it without bound.
+  env -u BASH_ENV PATH="$WORK/bin:$PATH" SEAT_HOME="$WORK/home" CLAUDE_BIN="$WORK/bin/claude" \
       CLAUDE_LOG="$WORK/claude.log" GH_ORG="${1:-5dive-ai}" FORK_STAGE_SH="$WORK/bin/fork-stage" \
       AGENTS_REGISTRY="$WORK/no-registry.json" \
       MP_OUT="${MP_OUT:-}" MP_RC="${MP_RC:-0}" PL_OUT="${PL_OUT:-}" PL_RC="${PL_RC:-0}" \

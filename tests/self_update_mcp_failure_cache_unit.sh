@@ -204,6 +204,9 @@ run_refresh_agent() { # <seat-home> -> $WORK/order.log
     # control and not an assumption. Dropping the function is safe here precisely
     # because nothing below may reach a real sudo: the stub is the only one wanted.
     unset -f sudo getent rm id 2>/dev/null || true
+    # DIVE-6021: every stub above is a bash script, and a box's BASH_ENV shim from
+    # before that fix ran a bare `id -u` — the id stub re-entered it without bound.
+    unset BASH_ENV
     export PATH="$WORK/obin:$PATH"
     export ORDER_LOG="$WORK/order.log" SEAT_HOME="$home" SEAT_CACHE="$home/$CACHE_REL"
     # GH_ORG=5dive-com short-circuits migrate_marketplace_org (no network probe).
