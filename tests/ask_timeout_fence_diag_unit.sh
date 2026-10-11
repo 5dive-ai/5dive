@@ -13,8 +13,9 @@
 #   D1  delivered, nothing printed (echo on one row) → DELIVERED, not OPENED
 #   D2  the echo WRAPPED between the markers, the closer leading the next row
 #       behind the TUI's box glyph → DELIVERED
-#   D3  the echo wrapped INSIDE the closer (`…</5dive-r:` | `ID> — …`), right
-#       border glyph on the first row → DELIVERED
+#   D3  the echo wrapped at EVERY break position from right after the opener
+#       to right before the closer's last `>` (19 shapes, e.g. `<|/5dive-r:`,
+#       `</5dive|-r:`, `…ID|>`), right border glyph on the first row → DELIVERED
 #   D4  the echo wrapped so the opener sits ALONE on its row, closer leading the
 #       next → DELIVERED (the shape that looks most like a real opener)
 #   O1  echo + the seat's own opener on a line of its own, answer half written,
@@ -82,10 +83,23 @@ F_D2=$(pane d2 "> ${Q} [reply-format] Put your answer between these two marker l
 ${FOOTER}")
 expect D2 DELIVERED "$F_D2" "echo wrapped between the markers, box glyph before the closer"
 
-F_D3=$(pane d3 "│ > ${Q} [reply-format] Put your answer between these two marker lines: <5dive-r:${ID}></5dive-r:  │
-│ ${ID}> — the opening marker alone on one line, your answer next, the closing marker alone on the last line. │
+# D3: every place the wrap can land, from right after the opener to right before
+# the closer's last `>` — the break can leave `/`, `-`, `:` or `>` leading the
+# next row, and those belong to the closer, not to the TUI's padding.
+PAIR="<5dive-r:${ID}></5dive-r:${ID}>"
+OPENER="<5dive-r:${ID}>"
+D3_BAD=""; D3_N=0
+for (( k = ${#OPENER}; k < ${#PAIR}; k++ )); do
+  F_D3=$(pane "d3_$k" "│ > ${Q} [reply-format] Put your answer between these two marker lines: ${PAIR:0:k}  │
+│ ${PAIR:k} — the opening marker alone on one line, your answer next, the closing marker alone on the last line. │
 ${FOOTER}")
-expect D3 DELIVERED "$F_D3" "echo wrapped inside the closer, right border glyph"
+  D3_N=$((D3_N+1))
+  got=$(kind "$(_ask_timeout_diag "$ID" "$F_D3")")
+  [[ "$got" == DELIVERED ]] || D3_BAD+=" @$k(${PAIR:0:k}|${PAIR:k}→$got)"
+done
+[[ -z "$D3_BAD" && "$D3_N" -eq $(( ${#PAIR} - ${#OPENER} )) ]] \
+  && ok_t "D3 echo wrapped at each of the $D3_N break positions after the opener, right border glyph → DELIVERED" \
+  || bad_t "D3 wrapped echo reported as a seat-opened fence" "of $D3_N:$D3_BAD"
 
 F_D4=$(pane d4 "> ${Q} [reply-format] Put your answer between these two marker lines:
   <5dive-r:${ID}>

@@ -606,6 +606,32 @@ fresh; DOWN="boss"; tx quiet "$FENCE_BODY"; tick; DOWN="lead boss"
   && ok_t "Y2: CONTROL: the same text WITHOUT the fence still reaches the lead — the sweep is not silenced" \
   || bad_t "Y2: unfenced control" "a2a=$(a2as) api=$(sends)"
 
+# Y4: only a COMPLETE fence (opener, non-blank answer, closer, same id) is the
+# caller's. A seat quoting a bare marker while it debugs `agent ask` and ending
+# on a real question to its lead is still forwarded.
+QUOTED_Q="The ask timed out and the pane shows <5dive-r:e78392d6> but I cannot find its closer.
+
+Should I re-run the first job with a smaller --poll-secs?"
+fresh; DOWN="boss"; tx quiet "$QUOTED_Q"; tick; DOWN="lead boss"
+[[ "$(a2as)" == 1 ]] \
+  && ok_t "Y4: a turn that only QUOTES an opener and asks its lead something is still forwarded" \
+  || bad_t "Y4: quoted marker silenced the sweep" "a2a=$(a2as) log=$(cat "$TMP/hb.log")"
+Y5_BAD=""
+_hb_stuck_fenced_reply "$FENCED_Q" || Y5_BAD+=" complete-fence:no"
+_hb_stuck_fenced_reply "echo: <5dive-r:e78392d6></5dive-r:e78392d6>
+Should I?" && Y5_BAD+=" empty-echoed-pair:yes"
+_hb_stuck_fenced_reply "<5dive-r:e78392d6>
+an answer
+</5dive-r:aaaa1111>" && Y5_BAD+=" mismatched-ids:yes"
+_hb_stuck_fenced_reply "hint: <5dive-r:e78392d6></5dive-r:e78392d6>
+<5dive-r:e78392d6>
+the answer?
+</5dive-r:e78392d6>" || Y5_BAD+=" echo-then-real-fence:no"
+_hb_stuck_fenced_reply "a stray </5dive-r:e78392d6> closer only?" && Y5_BAD+=" closer-only:yes"
+[[ -z "$Y5_BAD" ]] \
+  && ok_t "Y5: complete fence and echo-then-real-fence are the caller's; empty echoed pair, mismatched ids and a bare closer are not" \
+  || bad_t "Y5: fence shape rule" "$Y5_BAD"
+
 # --- M) MUTANTS -------------------------------------------------------------------------------------------
 # M1 re-introduces the defect in-process: the sweep looks only at seats a person
 # already sees, i.e. the channel-less seat is as unread as before this change.

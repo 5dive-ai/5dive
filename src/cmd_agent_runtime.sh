@@ -1936,9 +1936,10 @@ sys.stdout.write("\n".join(out))
 # operator to tune --poll-secs (amir's first job, 2026-10-10: 1200s burned).
 # An opener is the echo when the closer follows it with nothing in between:
 # on the same row, or on the next row when the composer wraps the pair, the
-# break landing anywhere up to the closer's own `>` (the TUI's leading box
-# glyphs on that next row are skipped, the same shape rule as the extractor's
-# is_marker). Anything else beside an opener means the seat opened a fence.
+# break landing anywhere up to the closer's own `>` (only whitespace and the
+# TUI's box glyphs are skipped at the head of that next row: the closer's own
+# `/`, `-`, `:` or `>` can lead it). Anything else beside an opener means the
+# seat opened a fence.
 _ask_fence_opened() { # <msg-id> <pane-file>
   local mid="$1" f="$2"
   [[ "$mid" =~ ^[A-Za-z0-9]{1,32}$ && -r "$f" ]] || return 1
@@ -1957,7 +1958,9 @@ for i, l in enumerate(lines):
             # A wrap leaves the rest of this row blank or a cut-off head of the
             # closer, then the TUI pads the row: drop that padding and join on.
             tail = re.sub(r"[\s\u2500-\u259f]+$", "", rest).lstrip()
-            nxt = re.sub(r"^[^\w<]+", "", lines[i + 1].strip()) if i + 1 < len(lines) else ""
+            # Strip only padding and box glyphs: `/`, `-`, `:` and `>` belong
+            # to the closer itself and a wrap may lead the next row with any.
+            nxt = re.sub(r"^[\s\u2500-\u259f]+", "", lines[i + 1]) if i + 1 < len(lines) else ""
             if not (cl.startswith(tail) and (tail + nxt).startswith(cl)):
                 sys.exit(0)
         at = l.find(op, at + 1)
