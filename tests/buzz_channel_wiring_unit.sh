@@ -91,7 +91,9 @@ fi
 # looked fine) and cmd_config did not, so the gate refused forever and its own
 # "Re-run: …" advice re-entered the identical path. Grade the dispatch that
 # SATISFIES the gate, not only the gate that reads the list.
-if grep -qE 'install_channel_for_agent "\$type" buzz "\$name"' "$SRC/cmd_agent_config.sh"; then
+# DIVE-6005: the dispatch now goes through _config_install_channel, which rolls
+# the channel list back when the install fails; either spelling satisfies.
+if grep -qE '(install_channel_for_agent|_config_install_channel "\$prev_channels") "\$type" buzz "\$name"' "$SRC/cmd_agent_config.sh"; then
   ok_t "cmd_agent_config DISPATCHES the buzz install (satisfies the gate)"
 else
   bad_t "cmd_agent_config DISPATCHES the buzz install (satisfies the gate)" \

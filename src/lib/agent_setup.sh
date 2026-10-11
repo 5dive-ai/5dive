@@ -1019,6 +1019,51 @@ ensure_bun_for_agent() {
   sudo -u "$user" -i bash -lc 'command -v bun' >/dev/null 2>&1
 }
 
+# DIVE-6005: put a marketplace's git checkout at <dir>, safely against a second
+# fetcher of the SAME directory. A seat hired seconds ago runs one: its Claude Code
+# clones every known marketplace at first boot, into exactly this path. The old
+# `rm -rf <dir>; git clone <repo> <dir>` raced it and git aborted ("BUG:
+# refs/files-backend.c: initial ref transaction called with existing refs"), which
+# is how the dashboard's Enable chat failed 10 s after a hire (DIVE-6000's live arm).
+# So this never clones INTO the shared path: it clones into a private sibling and
+# renames that into place, and when another fetcher holds the path it waits for
+# that clone to finish instead of racing it. A `.git` dir is not "finished" — git
+# creates it first — so finished means a resolvable HEAD plus the marketplace
+# manifest. Runs as the agent user: it is shipped into the install heredoc with
+# `declare -f`. Returns non-zero once its tries are spent.
+marketplace_checkout_settled() { # <repo-url> <dir> [tries]
+  local repo="$1" dir="$2" tries="${3:-4}" n=0 tmp
+  _mkt_ready() {
+    [ -d "$1/.git" ] && git -C "$1" rev-parse -q --verify HEAD >/dev/null 2>&1 \
+      && [ -f "$1/.claude-plugin/marketplace.json" ]
+  }
+  mkdir -p "$(dirname "$dir")" || return 1
+  until _mkt_ready "$dir"; do
+    n=$((n + 1))
+    if [ "$n" -gt "$tries" ]; then
+      echo "    ERROR: marketplace checkout $dir not ready after $tries tries ($repo)" >&2
+      return 1
+    fi
+    # Someone else's clone is in this path: give it time. Only the last try
+    # treats what is there as debris (an aborted clone never finishes on its own).
+    if [ -e "$dir" ] && [ "$n" -lt "$tries" ]; then
+      sleep 3
+      continue
+    fi
+    rm -rf "$dir"
+    tmp="$dir.5dive-clone.$$"
+    rm -rf "$tmp"
+    if git clone -q --depth 1 "$repo" "$tmp"; then
+      # rename(2) refuses a non-empty target: if another fetcher created the
+      # path meanwhile, ours is dropped and the loop waits on theirs.
+      mv -T "$tmp" "$dir" 2>/dev/null || rm -rf "$tmp"
+    else
+      rm -rf "$tmp"
+      sleep 2
+    fi
+  done
+}
+
 install_channel_plugin_for_agent() {
   local plugin="$1" name="$2" allowed_users="${3:-}" token="${4:-}"
   local user="agent-${name}"
@@ -1060,7 +1105,9 @@ install_channel_plugin_for_agent() {
   # set -e + pipefail: without pipefail, `npm install | tail -5` masked
   # npm's exit code with tail's zero-exit and the agent would ship with
   # half-installed deps; surface the failure so the frontend can show it.
-  if ! sudo -u "$user" -H env PLUGIN="$plugin" MARKETPLACE="$marketplace" MKT_REPO="$mkt_repo" bash -s >&2 <<'AGENT_PLUGIN_INSTALL'
+  # `declare -f` ships marketplace_checkout_settled (above) ahead of the script.
+  if ! { declare -f marketplace_checkout_settled; cat <<'AGENT_PLUGIN_INSTALL'; } \
+      | sudo -u "$user" -H env PLUGIN="$plugin" MARKETPLACE="$marketplace" MKT_REPO="$mkt_repo" bash -s >&2
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
 export NVM_DIR="/home/claude/.nvm"
@@ -1076,11 +1123,9 @@ CLAUDE=/home/claude/.local/bin/claude
 # (clone + known_marketplaces.json entry) and let `update` take it from there;
 # `add` stays only as the fallback for an unforeseen registration shape.
 MKT_DIR="$HOME/.claude/plugins/marketplaces/$MARKETPLACE"
-if [ ! -d "$MKT_DIR/.git" ]; then
-  mkdir -p "$HOME/.claude/plugins/marketplaces"
-  rm -rf "$MKT_DIR"
-  git clone -q --depth 1 "$MKT_REPO" "$MKT_DIR"
-fi
+# DIVE-6005: never `rm -rf; git clone` into this path — the seat's own Claude Code
+# may be cloning into it right now (see marketplace_checkout_settled).
+marketplace_checkout_settled "$MKT_REPO" "$MKT_DIR"
 MKT_SLUG=$(printf '%s' "$MKT_REPO" | sed -e 's#^https://github.com/##' -e 's#\.git$##')
 KM_FILE="$HOME/.claude/plugins/known_marketplaces.json" \
   MKT_NAME="$MARKETPLACE" MKT_SLUG="$MKT_SLUG" MKT_DIR="$MKT_DIR" python3 <<'PREREG'
@@ -1100,7 +1145,10 @@ d.setdefault(os.environ["MKT_NAME"], {
 json.dump(d, open(km, "w"), indent=2)
 PREREG
 
+# DIVE-6005: one retry, because the seat's own first-boot fetch can hold the
+# checkout's git lock for the moment our `update` runs.
 "$CLAUDE" plugin marketplace update "$MARKETPLACE" 2>/dev/null \
+  || { sleep 3; "$CLAUDE" plugin marketplace update "$MARKETPLACE" 2>/dev/null; } \
   || "$CLAUDE" plugin marketplace add "$MKT_REPO"
 
 yes | "$CLAUDE" plugin install "${PLUGIN}@${MARKETPLACE}" >/dev/null || true
