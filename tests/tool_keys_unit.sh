@@ -172,7 +172,9 @@ got=$(t13_run "$old_shim")
 [[ "$got" == *"deep=1"* ]] \
   && ok_t "T13 control: the pre-fix shim re-enters itself past 20 levels" \
   || bad_t "T13 control (the arm cannot see the recursion)" "$got"
-! grep -vE '^[[:space:]]*#' <<<"$shim" | grep -qE '\$\((id|whoami|getent|stat|readlink|uname)\b' \
+# Captured first, not piped: a pipe into `grep -q` is an EPIPE site (B3's census).
+t13_body=$(grep -vE '^[[:space:]]*#' <<<"$shim")
+! grep -qE '\$\((id|whoami|getent|stat|readlink|uname)\b' <<<"$t13_body" \
   && ok_t "T13 no PATH-resolved command substitution left in the shim" \
   || bad_t "T13 shim calls a stubbable command" "$(grep -nE '\$\(' <<<"$shim")"
 
