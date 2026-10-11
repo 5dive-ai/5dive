@@ -1925,6 +1925,64 @@ sys.stdout.write("\n".join(out))
 ' "$f"
 }
 
+# _ask_fence_opened <msg-id> <pane-file> — rc 0 when the pane holds an opening
+# reply marker for <msg-id> that the SEAT wrote; the question's own echo does
+# not count.
+#
+# DIVE-6015. The [reply-format] hint writes both markers ADJACENT, and the pane
+# echoes the question, so a bare `grep -F "<5dive-r:ID>"` is true the moment the
+# question lands. The timeout diagnosis then said "the reply fence was OPENED"
+# for every delivered ask, including a seat that printed nothing, and sent the
+# operator to tune --poll-secs (amir's first job, 2026-10-10: 1200s burned).
+# An opener is the echo when the closer follows it with nothing in between:
+# on the same row, or on the next row when the composer wraps the pair, the
+# break landing anywhere up to the closer's own `>` (only whitespace and the
+# TUI's box glyphs are skipped at the head of that next row: the closer's own
+# `/`, `-`, `:` or `>` can lead it). Anything else beside an opener means the
+# seat opened a fence.
+_ask_fence_opened() { # <msg-id> <pane-file>
+  local mid="$1" f="$2"
+  [[ "$mid" =~ ^[A-Za-z0-9]{1,32}$ && -r "$f" ]] || return 1
+  grep -qF "<5dive-r:${mid}>" "$f" 2>/dev/null || return 1
+  python3 -c '
+import re, sys
+mid, path = sys.argv[1], sys.argv[2]
+op, cl = "<5dive-r:" + mid + ">", "</5dive-r:" + mid + ">"
+with open(path, encoding="utf-8", errors="replace") as fh:
+    lines = fh.read().split("\n")
+for i, l in enumerate(lines):
+    at = l.find(op)
+    while at != -1:
+        rest = l[at + len(op):]
+        if not rest.lstrip().startswith(cl):
+            # A wrap leaves the rest of this row blank or a cut-off head of the
+            # closer, then the TUI pads the row: drop that padding and join on.
+            tail = re.sub(r"[\s\u2500-\u259f]+$", "", rest).lstrip()
+            # Strip only padding and box glyphs: `/`, `-`, `:` and `>` belong
+            # to the closer itself and a wrap may lead the next row with any.
+            nxt = re.sub(r"^[\s\u2500-\u259f]+", "", lines[i + 1]) if i + 1 < len(lines) else ""
+            if not (cl.startswith(tail) and (tail + nxt).startswith(cl)):
+                sys.exit(0)
+        at = l.find(op, at + 1)
+sys.exit(1)
+' "$mid" "$f"
+}
+
+# _ask_timeout_diag <msg-id> <pane-file> — the clause a timed-out ask appends to
+# its error: what the pane showed (DIVE-1901 iteration 2). A fence the seat
+# opened, a question delivered with no fence after it, and a question never
+# delivered are three faults with three different fixes.
+_ask_timeout_diag() { # <msg-id> <pane-file>
+  local mid="$1" f="$2"
+  if _ask_fence_opened "$mid" "$f"; then
+    printf '%s' " — the reply fence was OPENED but never completed, so nothing was returned rather than returning the pane's furniture; the seat may still be writing, or its reply scrolled past between polls (try a smaller --poll-secs)"
+  elif grep -qF "id=${mid}" "$f" 2>/dev/null; then
+    printf '%s' " — the question was DELIVERED (marker seen in the pane) but the seat never emitted the reply fence; it may have ignored or reformatted the [reply-format] instruction"
+  else
+    printf '%s' " — the question marker was never seen in the pane at all, so this is a DELIVERY failure, not a capture one (check the submit race / input-prompt warning above)"
+  fi
+}
+
 # _ask_transcript_reply <agent> <msg-id> — the fenced reply to <msg-id>, read
 # from the seat's OWN session transcript instead of from pane frames; rc 1 when
 # the transcript does not (yet) hold a completed fence for that id.
@@ -3880,14 +3938,8 @@ cmd_ask() {
       # A timeout with the fence half-written is a different fault from a timeout
       # with no marker at all (seat ignored the format, or never got the message),
       # and the two need different fixes. Guessing between them cost a round trip.
-      local diag=""
-      if grep -qF "<5dive-r:${msg_id}>" "$acc_file" 2>/dev/null; then
-        diag=" — the reply fence was OPENED but never completed, so nothing was returned rather than returning the pane's furniture; the seat may still be writing, or its reply scrolled past between polls (try a smaller --poll-secs)"
-      elif grep -qF "id=${msg_id}" "$acc_file" 2>/dev/null; then
-        diag=" — the question was DELIVERED (marker seen in the pane) but the seat never emitted the reply fence; it may have ignored or reformatted the [reply-format] instruction"
-      else
-        diag=" — the question marker was never seen in the pane at all, so this is a DELIVERY failure, not a capture one (check the submit race / input-prompt warning above)"
-      fi
+      local diag
+      diag=$(_ask_timeout_diag "$msg_id" "$acc_file")
       if [[ -n "${FIVE_ASK_DEBUG_DIR:-}" ]] && mkdir -p "$FIVE_ASK_DEBUG_DIR" 2>/dev/null; then
         cp -f "$baseline_file" "${FIVE_ASK_DEBUG_DIR}/${msg_id}.baseline" 2>/dev/null || true
         cp -f "$acc_file"      "${FIVE_ASK_DEBUG_DIR}/${msg_id}.transcript" 2>/dev/null || true
