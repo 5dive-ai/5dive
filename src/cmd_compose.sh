@@ -416,7 +416,10 @@ _compose_import_args() {
 # records exactly the provenance a single partner hire records.
 # Prints the refusal and returns 1; prints nothing on success.
 _compose_preflight_pack_urls() {
-  local spec="$1" seat url host tmp listing
+  local spec="$1" seat url host tmp listing pairs
+  # Captured first, not `done < <(jq …)`: the procsub census in
+  # tests/epipe_corpus_guard_unit.sh holds the tree at its baseline.
+  pairs=$(jq -r '.agents | to_entries[] | select((.value.pack_url // "") != "") | "\(.key)\t\(.value.pack_url)"' <<<"$spec" 2>/dev/null) || pairs=""
   while IFS=$'\t' read -r seat url; do
     [[ -n "$seat" && -n "$url" ]] || continue
     host="${url#*://}"; host="${host%%[/?#]*}"
@@ -433,7 +436,7 @@ _compose_preflight_pack_urls() {
       printf "the '%s' seat's link from %s is not a character pack (no manifest.json)" "$seat" "$host"
       return 1
     fi
-  done < <(jq -r '.agents | to_entries[] | select((.value.pack_url // "") != "") | "\(.key)\t\(.value.pack_url)"' <<<"$spec" 2>/dev/null)
+  done <<<"$pairs"
   return 0
 }
 

@@ -102,39 +102,39 @@ registry_read()   { printf '%s' '{"agents":{}}'; }
 PERSONA="$TMP/persona"; mkdir -p "$PERSONA"
 persona_append_block() { printf '%s' "$3" >> "$PERSONA/$1.md"; }
 
-API="https://api.example.test/partner/packs/oinoa"
-template() {  # <artem's sig>
+API="https://api.example.test/partner/packs/acme"
+template() {  # <member's sig>
   cat <<YAML
-# OINOA test team (DIVE-6088 fixture)
+# Partner test team (DIVE-6088 fixture)
 version: "2"
 team:
-  name: "OINOA test team"
-  slug: oinoa-test
+  name: "Partner test team"
+  slug: partner-test
 defaults:
   type: claude
   channels: none
   auth_profile: "\${TEAM_AUTH_PROFILE}"
 agents:
-  kostya:
+  lead:
     role: "Lead"
-    pack: kostya
-    pack_url: ${API}/kostya.tar.gz?e=9999999999&sig=good
-  artem:
+    pack: lead
+    pack_url: ${API}/lead.tar.gz?e=9999999999&sig=good
+  member:
     role: "Analyst"
-    reports_to: kostya   # the org chart edge
-    pack: artem
-    pack_url: ${API}/artem.tar.gz?e=9999999999&sig=$1
+    reports_to: lead   # the org chart edge
+    pack: member
+    pack_url: ${API}/member.tar.gz?e=9999999999&sig=$1
 YAML
 }
 template good >"$TMP/good.yaml"
 template bad >"$TMP/bad.yaml"
 template notpack >"$TMP/notpack.yaml"
-WANT="$STATE_DIR/teams/oinoa-test.5dive.yaml"
-project_row() { db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key='oinoa-test';" 2>/dev/null; }
+WANT="$STATE_DIR/teams/partner-test.5dive.yaml"
+project_row() { db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key='partner-test';" 2>/dev/null; }
 
 # ============ 0. PRECONDITIONS ================================================
 spec=$(_compose_parse "$TMP/good.yaml" 2>"$TMP/parse.err"); rc=$?
-if (( rc == 0 )) && [[ "$(jq -r '.agents.artem.pack_url' <<<"$spec")" == *sig=good ]] && ! grep -q 'unknown key' "$TMP/parse.err"; then
+if (( rc == 0 )) && [[ "$(jq -r '.agents.member.pack_url' <<<"$spec")" == *sig=good ]] && ! grep -q 'unknown key' "$TMP/parse.err"; then
   ok_t 'T0 the parser keeps pack_url per seat, with no unknown-key warning'
 else
   bad_t 'T0 pack_url did not parse as a known key' "rc=$rc $(cat "$TMP/parse.err")"
@@ -142,8 +142,8 @@ fi
 
 # ============ N1. a refused signature refuses the WHOLE team ==================
 : >"$REC"; : >"$FETCHED"
-( cmd_team import oinoa-test --template="$TMP/bad.yaml" ) >"$TMP/n1.out" 2>&1; rc=$?
-if (( rc != 0 )) && grep -q "'artem' seat's pack was refused by api.example.test" "$TMP/n1.out" \
+( cmd_team import partner-test --template="$TMP/bad.yaml" ) >"$TMP/n1.out" 2>&1; rc=$?
+if (( rc != 0 )) && grep -q "'member' seat's pack was refused by api.example.test" "$TMP/n1.out" \
    && grep -q 'no agent was created' "$TMP/n1.out"; then
   ok_t 'N1 a member link that does not verify fails the import, naming the seat and the host'
 else
@@ -156,7 +156,7 @@ if ! grep -q 'sig=' "$TMP/n1.out"; then ok_t 'N1e the refusal never prints the l
 
 # ============ N2. a link that is not a pack ===================================
 : >"$REC"
-( cmd_team import oinoa-test --template="$TMP/notpack.yaml" ) >"$TMP/n2.out" 2>&1; rc=$?
+( cmd_team import partner-test --template="$TMP/notpack.yaml" ) >"$TMP/n2.out" 2>&1; rc=$?
 if (( rc != 0 )) && grep -q "is not a character pack" "$TMP/n2.out" && [[ ! -s "$REC" ]]; then
   ok_t 'N2 a link that answers with no manifest.json is refused, and nothing is created'
 else
@@ -174,23 +174,23 @@ fi
 
 # ============ T1. the good team, from a file ==================================
 : >"$REC"; : >"$FETCHED"
-( cmd_team import oinoa-test --template="$TMP/good.yaml" ) >"$TMP/t1.out" 2>&1; rc=$?
+( cmd_team import partner-test --template="$TMP/good.yaml" ) >"$TMP/t1.out" 2>&1; rc=$?
 eq_t 'T1 the import succeeds' '0' "$rc"
 imports=$(grep '^agent import ' "$REC")
-if grep -q "^agent import --from-url=${API}/kostya.tar.gz?e=9999999999&sig=good --as=kostya" <<<"$imports" \
-   && grep -q "^agent import --from-url=${API}/artem.tar.gz?e=9999999999&sig=good --as=artem" <<<"$imports"; then
+if grep -q "^agent import --from-url=${API}/lead.tar.gz?e=9999999999&sig=good --as=lead" <<<"$imports" \
+   && grep -q "^agent import --from-url=${API}/member.tar.gz?e=9999999999&sig=good --as=member" <<<"$imports"; then
   ok_t 'T1b both seats are imported BY LINK'
 else
   bad_t 'T1b the seats were not imported from their links' "$imports"
 fi
-eq_t 'T1c and never by slug (the public registry resolves a bare slug)' '' "$(grep -E '^agent import (kostya|artem)( |$)' "$REC")"
+eq_t 'T1c and never by slug (the public registry resolves a bare slug)' '' "$(grep -E '^agent import (lead|member)( |$)' "$REC")"
 eq_t 'T1d the public team registry was never asked' '' "$(grep '^REGISTRY' "$FETCHED")"
 eq_t 'T1e each link fetched once by the preflight (the import re-fetches it on the box)' '2' "$(grep -c 'sig=good' "$FETCHED")"
-eq_t 'T1f the team is recorded, led by its root' 'kostya' "$(project_row)"
-if grep -q 'org set artem.*kostya\|org.*artem.*--reports-to=kostya\|reports.*artem.*kostya' "$REC"; then
-  ok_t 'T1g the org chart edge artem -> kostya is wired'
+eq_t 'T1f the team is recorded, led by its root' 'lead' "$(project_row)"
+if grep -q 'org set member.*lead\|org.*member.*--reports-to=lead\|reports.*member.*lead' "$REC"; then
+  ok_t 'T1g the org chart edge member -> lead is wired'
 else
-  bad_t 'T1g no org wiring for artem -> kostya was issued' "$(grep -i org "$REC" | head -3)"
+  bad_t 'T1g no org wiring for member -> lead was issued' "$(grep -i org "$REC" | head -3)"
 fi
 
 # ============ T2. the saved manifest: org chart yes, links no =================
@@ -199,12 +199,12 @@ if [[ -f "$WANT" ]] && ! grep -q 'pack_url\|sig=' "$WANT"; then
 else
   bad_t 'T2 the manifest is missing or still carries a link' "$(grep -n 'pack_url\|sig=' "$WANT" 2>&1 | head -3)"
 fi
-if grep -q '^# OINOA test team' "$WANT" && grep -q 'reports_to: kostya   # the org chart edge' "$WANT"; then
+if grep -q '^# Partner test team' "$WANT" && grep -q 'reports_to: lead   # the org chart edge' "$WANT"; then
   ok_t 'T2b comments and the org chart survive the strip'
 else
   bad_t 'T2b the strip lost comments or the org chart' "$(head -5 "$WANT")"
 fi
-eq_t 'T2c the stripped manifest still parses to the same two seats' 'artem kostya' \
+eq_t 'T2c the stripped manifest still parses to the same two seats' 'lead member' \
      "$(_compose_parse "$WANT" 2>/dev/null | jq -r '.agents | keys | join(" ")')"
 eq_t 'T2d no staged copy of the template (with its links) is left in TMPDIR' '' \
      "$(grep -rl 'sig=good' "$TMP/tmpd" 2>/dev/null)"
@@ -213,9 +213,9 @@ eq_t 'T2d no staged copy of the template (with its links) is left in TMPDIR' '' 
 if ! grep -q 'sig=' "$TMP/t1.out"; then ok_t 'T3 the import output never prints a link'; else bad_t 'T3 a link leaked into the output' "$(grep 'sig=' "$TMP/t1.out" | head -2)"; fi
 
 # ============ T4. stdin, the form 5dive-api uses ==============================
-rm -rf "$STATE_DIR/teams"; db "DELETE FROM projects WHERE key='oinoa-test';" >/dev/null 2>&1
+rm -rf "$STATE_DIR/teams"; db "DELETE FROM projects WHERE key='partner-test';" >/dev/null 2>&1
 : >"$REC"
-( cmd_team import oinoa-test --template=- <"$TMP/good.yaml" ) >"$TMP/t4.out" 2>&1; rc=$?
+( cmd_team import partner-test --template=- <"$TMP/good.yaml" ) >"$TMP/t4.out" 2>&1; rc=$?
 if (( rc == 0 )) && [[ "$(grep -c '^agent import --from-url=' "$REC")" == 2 ]] && [[ -f "$WANT" ]]; then
   ok_t 'T4 --template=- reads the template from stdin and brings up the same team'
 else
@@ -245,7 +245,7 @@ if (( rc != 0 )) && grep -q "must be the team's slug" "$TMP/n5.out"; then
 else
   bad_t 'N5a a path ref was accepted with --template' "rc=$rc $(tail -2 "$TMP/n5.out")"
 fi
-( cmd_team import oinoa-test --template=- --telegram-token=- </dev/null ) >"$TMP/n5b.out" 2>&1; rc=$?
+( cmd_team import partner-test --template=- --telegram-token=- </dev/null ) >"$TMP/n5b.out" 2>&1; rc=$?
 if (( rc != 0 )) && grep -q 'both read stdin' "$TMP/n5b.out"; then
   ok_t 'N5b --template=- with --telegram-token=- is refused (one stdin)'
 else
