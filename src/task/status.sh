@@ -2035,7 +2035,18 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       # `no-gh-token` and which this ticket did not change. A new label belongs only
       # on the new situation; widening it to an old one is churn wearing a fix's
       # clothes.
-      if [[ $_sc_total -gt 0 && $_sc_ok -eq 0 && -z "$_ghtok2" ]] && ! _gate_gh_bot_ok; then
+      #
+      # DIVE-6051: PRESENT, not merely permitted — the same correction DIVE-585 made
+      # to the rail SELECTION in `_gate_gh_nocred`, left behind at this one site. A
+      # seat holding a blanket `NOPASSWD: /usr/local/bin/5dive *` passes
+      # `_gate_gh_bot_ok` with no connector file behind it, so the bot rail was never
+      # taken, the anonymous rail declined the listing, and this line still refused
+      # the relabel: the scan fell through to `partial-repo-scan-0-of-N`, whose
+      # `no gh rail:` reason matches no visibility marker, and the close told the
+      # operator "often transient; the credential is not implicated" about a
+      # credential that was missing. 13 closes on one seat said so before a report
+      # caught it.
+      if [[ $_sc_total -gt 0 && $_sc_ok -eq 0 && -z "$_ghtok2" ]] && ! _gate_gh_bot_present; then
         _scan_why="no-gh-rail-for-listing"
       fi
       # DIVE-1935 iteration 2: the audited-unverified close is the ONLY surface on
