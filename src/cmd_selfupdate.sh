@@ -1627,7 +1627,7 @@ _published_cli_probe() {
   if [[ -n "$ref" ]]; then
     # DIVE-4366: a single-tag rung has no next-best candidate, so a held target
     # is a REFUSAL — the installer keeps the CLI this box has, never falls back.
-    if [[ -n "$hold_list" ]] && printf '%s\n' "$hold_list" | grep -qxF "$ref"; then
+    if [[ -n "$hold_list" ]] && grep -qxF -- "$ref" <<<"$hold_list"; then
       _pcp_out unavailable "" "the target $ref ($rung) is HELD on main — the installer refuses it and keeps this box on the CLI it has"
       return 0
     fi
