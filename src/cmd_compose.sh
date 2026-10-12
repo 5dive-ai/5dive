@@ -25,6 +25,10 @@
 #       pack:           <slug>             # import a character pack instead of a
 #                                          # bare create — supplies persona+skills
 #                                          # +model/effort (5dive agent import)
+#       pack_url:       https://…          # DIVE-6088: where THIS seat's pack is
+#                                          # fetched from (a signed link 5dive-api
+#                                          # mints for a partner's private pack);
+#                                          # needs pack:, which stays the persona
 #       loops:                             # DIVE-4022 — recurring work this role owns
 #         - id: weekly-brief               #   stable key (a-z0-9-), the reconcile key
 #           title: "Ship the weekly brief" #   the recurring task's title
@@ -100,7 +104,11 @@ KNOWN = {
              # the spec instead of fetched from the marketplace registry.
     "pack",  # DIVE-536: import a character pack (5dive agent import <slug>) instead
              # of a bare create — the pack supplies persona+skills+model/effort.
+    "pack_url", # DIVE-6088: the seat's pack by link (agent import --from-url), for
+             # a partner's private pack. `pack:` still names the persona.
 }
+if "pack_url" in defaults:
+    print("error: 'pack_url' is one seat's pack link — it cannot be a default", file=sys.stderr); sys.exit(3)
 
 agents = data["agents"]
 # Merge defaults under each agent (agent keys win). None spec → empty map.
@@ -116,6 +124,12 @@ for name, spec in agents.items():
     for k in spec:
         if k not in KNOWN:
             print(f"warning: agent '{name}': unknown key '{k}' (ignored)", file=sys.stderr)
+    pu = m.get("pack_url")
+    if pu is not None:
+        if not m.get("pack"):
+            print(f"error: agent '{name}': pack_url needs pack: (the persona it imports)", file=sys.stderr); sys.exit(3)
+        if not isinstance(pu, str) or not re.fullmatch(r"https://\S+", pu):
+            print(f"error: agent '{name}': pack_url must be an https link", file=sys.stderr); sys.exit(3)
 data["agents"] = merged
 
 # reports_to: normalise to a list, validate targets resolve + no self-edge.
@@ -359,7 +373,15 @@ _compose_create_args() {
 # Echoed one arg per line for mapfile-slurp, same contract as _compose_create_args.
 _compose_import_args() {
   local spec="$1" name="$2" pack="$3" spec_dir="$4" type_override="${5:-}"
-  printf '%s\n' "$pack"
+  # DIVE-6088: a seat with a pack link imports from it, as a single partner hire
+  # does; `pack:` (the persona) is what adoption and pack-sync key on, and the
+  # import records that same slug off the link's <slug>.tar.gz.
+  local pack_url; pack_url=$(jq -r '.pack_url // empty' <<<"$spec")
+  if [[ -n "$pack_url" ]]; then
+    printf '%s\n' "--from-url=${pack_url}"
+  else
+    printf '%s\n' "$pack"
+  fi
   printf '%s\n' "--as=${name}"
   # DIVE-3998: a pack normally supplies its own harness, so `type:` is NOT
   # forwarded here — that is today's behaviour and it stays. `--type=` on
@@ -383,6 +405,36 @@ _compose_import_args() {
     local wd_abs; wd_abs=$(_compose_resolve_path "$workdir" "$spec_dir")
     printf '%s\n' "--workdir=${wd_abs}"
   fi
+}
+
+# DIVE-6088: every seat's pack link is fetched BEFORE any seat is created. A
+# partner team whose member link is refused (a signature that does not verify,
+# or an expired link: 5dive-api answers 403) or is not a pack comes up as
+# nothing, not as whichever members happened to come first. The link is a live
+# capability, so a message names the seat and the host, never the link. The
+# import fetches it again through `agent import --from-url`, so each agent
+# records exactly the provenance a single partner hire records.
+# Prints the refusal and returns 1; prints nothing on success.
+_compose_preflight_pack_urls() {
+  local spec="$1" seat url host tmp listing
+  while IFS=$'\t' read -r seat url; do
+    [[ -n "$seat" && -n "$url" ]] || continue
+    host="${url#*://}"; host="${host%%[/?#]*}"
+    tmp=$(mktemp --suffix=.tar.gz) || { printf 'could not stage a pack download'; return 1; }
+    if ! curl -fsSL --proto '=https' --proto-redir '=https' --max-time 120 \
+         --max-filesize $((64 * 1024 * 1024)) -o "$tmp" "$url" 2>/dev/null || [[ ! -s "$tmp" ]]; then
+      rm -f "$tmp"
+      printf "the '%s' seat's pack was refused by %s (a signature that does not verify, an expired link, or the host is down)" "$seat" "$host"
+      return 1
+    fi
+    listing=$(tar -tzf "$tmp" 2>/dev/null) || listing=""
+    rm -f "$tmp"
+    if [[ $'\n'"$listing"$'\n' != *$'\n'manifest.json$'\n'* && $'\n'"$listing"$'\n' != *$'\n'./manifest.json$'\n'* ]]; then
+      printf "the '%s' seat's link from %s is not a character pack (no manifest.json)" "$seat" "$host"
+      return 1
+    fi
+  done < <(jq -r '.agents | to_entries[] | select((.value.pack_url // "") != "") | "\(.key)\t\(.value.pack_url)"' <<<"$spec" 2>/dev/null)
+  return 0
 }
 
 # Build the "## Role" + "## Reporting" markdown for one agent and append it to
@@ -1579,6 +1631,12 @@ HELP
       warn "dropped Claude-only model/effort pins (not valid on '$type_override'): $_pins — the harness default applies; set one later with: 5dive agent config <name> set model=<id>"
     fi
   fi
+  # DIVE-6088: all pack links answer, or nothing is created. `team import` has
+  # already checked them before its own first write, and says so.
+  if [[ "${_COMPOSE_PACK_URLS_CHECKED:-0}" != 1 ]]; then
+    local _pf
+    _pf=$(_compose_preflight_pack_urls "$spec") || fail "$E_VALIDATION" "${_pf} — no agent was created"
+  fi
   # DIVE-4822: namespace the roster BEFORE anything reads it — the preflight, the
   # create loop and the loops pass must all see ONE set of names, or half the run
   # provisions `ceo` and the other half looks for `start-ceo`. Refuse on overflow
@@ -2369,7 +2427,7 @@ _team_usage() {
   cat >&2 <<HELP
 usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
                                    [--telegram-token=<bot-token>|-] [--prefix=<p>]
-                                   [--start-now]
+                                   [--start-now] [--template=<path>|-]
        5dive team ps [<slug|path>] [--type=<harness>]
        5dive team ls
        5dive team plan    [<lead>]                    what is waiting for your yes
@@ -2409,6 +2467,13 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
                     a team's FIRST start waits for you: its lead sends you its
                     plan, and nothing runs until you answer (team start, or
                     team decline). Later re-imports never ask again.
+  --template=<path>|-  Take the template from this file ('-' = stdin) instead of
+                    the registry; <slug> then only NAMES the team. This is how
+                    5dive-api brings up a partner's team from its own private
+                    registry: a seat may carry pack_url: (a signed link to its
+                    pack), and every link is fetched before any agent is
+                    created, so a refused one leaves nothing half-made. The
+                    links are not kept in the saved manifest.
 HELP
 }
 
@@ -2689,11 +2754,20 @@ _team_manifest_path() { printf '%s/teams/%s.5dive.yaml' "${STATE_DIR:-/var/lib/5
 _team_persist_manifest() {
   local key="$1" src="$2" dest dir
   [[ -n "$key" && -f "$src" ]] || return 1
+  # DIVE-6088: a seat's pack_url is a signed, live link. The manifest is
+  # world-readable and kept, so it is saved without them (comments kept when
+  # the links sit one per line, as 5dive-api writes them). No clean copy, no save.
+  local clean=""
+  if grep -q 'pack_url' "$src" 2>/dev/null; then
+    clean=$(mktemp) || return 1
+    _team_strip_pack_urls "$src" "$clean" || { rm -f "$clean"; return 1; }
+    src="$clean"
+  fi
   dest=$(_team_manifest_path "$key"); dir="${dest%/*}"
-  mkdir -p "$dir" 2>/dev/null || return 1
+  mkdir -p "$dir" 2>/dev/null || { [[ -n "$clean" ]] && rm -f "$clean"; return 1; }
   chmod a+rx "$dir" 2>/dev/null || true
   if [[ ! -e "$dest" ]]; then
-    install -m 644 "$src" "$dest" 2>/dev/null || return 1
+    install -m 644 "$src" "$dest" 2>/dev/null || { [[ -n "$clean" ]] && rm -f "$clean"; return 1; }
     step "team manifest saved: $dest"
   elif cmp -s "$src" "$dest"; then
     :
@@ -2701,7 +2775,29 @@ _team_persist_manifest() {
     install -m 644 "$src" "${dest}.incoming" 2>/dev/null || true
     warn "team '$key' already has a manifest at $dest and it differs from the template you just imported — kept yours (it may carry your edits, e.g. channel tiers). The imported template is at ${dest}.incoming; copy across what you want."
   fi
+  [[ -n "$clean" ]] && rm -f "$clean"
   printf '%s' "$dest"
+}
+
+# <src> <dest>: <src> with every agent's pack_url removed. Line-wise when that
+# gives the same document as removing the keys (comments survive), else a dump.
+_team_strip_pack_urls() {
+  python3 - "$1" "$2" <<'PY'
+import re, sys, yaml
+src, dest = sys.argv[1], sys.argv[2]
+text = open(src).read()
+data = yaml.safe_load(text)
+for spec in ((data or {}).get("agents") or {}).values():
+    if isinstance(spec, dict):
+        spec.pop("pack_url", None)
+lined = re.sub(r"(?m)^[ \t]*pack_url:[^\n]*\n?", "", text)
+try:
+    same = yaml.safe_load(lined) == data
+except yaml.YAMLError:
+    same = False
+out = lined if same else yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+open(dest, "w").write(out)
+PY
 }
 
 # The message a caller shows when _team_resolve_template did not produce a file.
@@ -2846,10 +2942,11 @@ HELP
   esac
 
   local ref="" profile="" type_override="" tg_token="" tg_token_set=0
-  local name_prefix="" prefix_set=0 start_now=0
+  local name_prefix="" prefix_set=0 start_now=0 template_src=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --start-now)      start_now=1 ;;   # DIVE-5729: skip the lead's plan-first hold
+      --template=*)     template_src="${1#--template=}" ;;   # DIVE-6088
       --auth-profile=*) profile="${1#--auth-profile=}" ;;
       --auth-profile)   profile="$2"; shift ;;
       --telegram-token=*) tg_token="${1#--telegram-token=}"; tg_token_set=1 ;;
@@ -2872,8 +2969,29 @@ HELP
   done
   [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive team import <slug|path>"
 
-  local file="" resolve_rc=0
-  file=$(_team_resolve_template "$ref") || { resolve_rc=$?; _team_resolve_fail "$ref" "$resolve_rc"; }
+  local file="" resolve_rc=0 template_dir=""
+  if [[ -n "$template_src" ]]; then
+    # DIVE-6088: the template is handed in (5dive-api reads it from a partner's
+    # private registry, which this box has no credential for). The registry is
+    # never consulted, so a slug that is only in the public one cannot stand in
+    # for it. <slug> names the team: its manifest, its project row, its key.
+    [[ "$ref" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
+      || fail "$E_USAGE" "with --template, '$ref' must be the team's slug (lowercase letters, digits, dashes)"
+    [[ "$template_src" == "-" && "$tg_token" == "-" ]] \
+      && fail "$E_USAGE" "--template=- and --telegram-token=- both read stdin; pass only one of them that way"
+    template_dir=$(mktemp -d) || fail "$E_GENERIC" "could not stage the template"
+    file="$template_dir/${ref}.5dive.yaml"
+    if [[ "$template_src" == "-" ]]; then
+      cat >"$file"
+    elif [[ -f "$template_src" ]]; then
+      cat -- "$template_src" >"$file"
+    else
+      rm -rf "$template_dir"; fail "$E_NOT_FOUND" "template file not found: $template_src"
+    fi
+    [[ -s "$file" ]] || { rm -rf "$template_dir"; fail "$E_USAGE" "the template is empty"; }
+  else
+    file=$(_team_resolve_template "$ref") || { resolve_rc=$?; _team_resolve_fail "$ref" "$resolve_rc"; }
+  fi
   # Refuse a template this binary cannot read BEFORE the parser sees it. A
   # half-parsed newer schema comes up as a roster missing whatever the new keys
   # wired, which is worse than not importing at all.
@@ -2902,6 +3020,19 @@ HELP
       IFS= read -r tg_token || true
     fi
     [[ -n "$tg_token" ]] && export TEAM_TG_TOKEN="$tg_token"
+  fi
+
+  # DIVE-6088: every seat's pack link answers with a pack, before the first write
+  # below (the manifest) and long before the first agent. `up` reads the flag and
+  # does not fetch them a second time. A template that does not parse is left to
+  # `up`, which refuses it before creating anything.
+  local _COMPOSE_PACK_URLS_CHECKED=0 _pf_spec _pf
+  if _pf_spec=$(_compose_parse "$file" 2>/dev/null); then
+    _pf=$(_compose_preflight_pack_urls "$_pf_spec") || {
+      [[ -n "$template_dir" ]] && rm -rf "$template_dir"
+      fail "$E_VALIDATION" "${_pf} — team '$ref' was not imported and no agent was created"
+    }
+    _COMPOSE_PACK_URLS_CHECKED=1
   fi
 
   # ---- DIVE-4822: which NAMESPACE does this team come up in? -----------------
@@ -3035,7 +3166,11 @@ HELP
   [[ -n "$type_override" ]] && _up_args+=("--type=$type_override")
   [[ -n "$name_prefix"   ]] && _up_args+=("--prefix=$name_prefix")
   (( start_now )) && _up_args+=(--start-now)
-  cmd_compose_up "${_up_args[@]}" || return $?
+  local _up_rc=0
+  cmd_compose_up "${_up_args[@]}" || _up_rc=$?
+  # The staged template may hold pack links; they are live for minutes, not kept.
+  [[ -n "$template_dir" ]] && rm -rf "$template_dir"
+  (( _up_rc == 0 )) || return "$_up_rc"
   _team_seat_map_write "$slug_key" "$COMPOSE_SEAT_MAP" || true
   # DIVE-5769: who is in this team, under the names the roster came up with.
   if [[ -n "$slug_key" && -n "$spec_for_prefix" ]]; then
