@@ -148,7 +148,13 @@ esac
 if [[ -n "\$out" ]]; then printf '%s\n' "\$body" > "\$out"; else printf '%s\n' "\$body"; fi
 CURLEOF
   chmod +x "$stubs/curl"
-  out="$(env -i PATH="$stubs:/usr/bin:/bin" bash -c "set -uo pipefail
+  # DIVE-6049: pin the installer rung inside the stub dir. At the defaults the
+  # probe reads THIS HOST's /etc/5dive/cli-canary (present on poke-two, absent on
+  # CI), so the verdict would grade the machine. Arms 1-7 drive the canary rung.
+  : > "$stubs/canary"
+  out="$(env -i PATH="$stubs:/usr/bin:/bin" CLI_VERSION_OVERRIDE_FILE="$stubs/override-absent" \
+    CLI_CANARY_FILE="$stubs/canary" CLI_VERSION_KNOWN_FILE="$stubs/known-absent" \
+    CLI_VERSION_URL="https://route.invalid/cli-version" bash -c "set -uo pipefail
 gh_org() { printf 'testorg\n'; }
 $prb
 _published_cli_probe" 2>&1)"

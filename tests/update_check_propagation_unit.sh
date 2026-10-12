@@ -117,7 +117,15 @@ run_probe() { # $1=git stub body ('' = git ABSENT)  $2=curl stub body
   printf '#!/usr/bin/env bash\n%s\n' "$2" > "$stubs/curl"; chmod +x "$stubs/curl"
   # gh_org is stubbed rather than extracted: it lives in header.sh and does its
   # own network probe, which is not what this harness is grading.
-  env -i PATH="$stubs:$TOOLS" HOME="$stubs" bash -c "set -euo pipefail
+  # DIVE-6049: pin the installer rung inside the stub dir. At the defaults the
+  # probe reads THIS HOST's /etc/5dive/cli-canary (present on poke-two, absent on
+  # CI), so the verdict would grade the machine. These arms drive the canary
+  # (tag-list) rung; the route rung is graded in cli_probe_route_target_unit.sh.
+  : > "$stubs/canary"
+  env -i PATH="$stubs:$TOOLS" HOME="$stubs" CLI_VERSION_OVERRIDE_FILE="$stubs/override-absent" \
+    CLI_CANARY_FILE="$stubs/canary" CLI_VERSION_KNOWN_FILE="$stubs/known-absent" \
+    CLI_TARGET_RECEIPT_FILE="$stubs/receipt-absent" \
+    CLI_VERSION_URL="https://route.invalid/cli-version" bash -c "set -euo pipefail
 gh_org() { printf 'testorg\n'; }
 $block
 _published_cli_probe"
@@ -276,7 +284,15 @@ render_check() { # $1=local version  $2=bundle file  $3=sha256 file -> prints ou
   printf '#!/usr/bin/env bash\n%s\n' "$(mk_curl "$2" "$3" "$TAG_NEW")" > "$stubs/curl"; chmod +x "$stubs/curl"
   # Shims for the three helpers cmd_update_check takes from elsewhere in the
   # bundle; everything else is the shipped body, extracted verbatim.
-  env -i PATH="$stubs:$TOOLS" HOME="$stubs" bash -c "set -euo pipefail
+  # DIVE-6049: pin the installer rung inside the stub dir. At the defaults the
+  # probe reads THIS HOST's /etc/5dive/cli-canary (present on poke-two, absent on
+  # CI), so the verdict would grade the machine. These arms drive the canary
+  # (tag-list) rung; the route rung is graded in cli_probe_route_target_unit.sh.
+  : > "$stubs/canary"
+  env -i PATH="$stubs:$TOOLS" HOME="$stubs" CLI_VERSION_OVERRIDE_FILE="$stubs/override-absent" \
+    CLI_CANARY_FILE="$stubs/canary" CLI_VERSION_KNOWN_FILE="$stubs/known-absent" \
+    CLI_TARGET_RECEIPT_FILE="$stubs/receipt-absent" \
+    CLI_VERSION_URL="https://route.invalid/cli-version" bash -c "set -euo pipefail
 E_USAGE=2; E_GENERIC=1; E_NOT_FOUND=4; FIVE_VERSION='$1'
 STATE_DIR='$stubs'
 readonly UPDATE_STALE_AFTER_SECS=\$((36 * 3600))
