@@ -29,6 +29,13 @@
 #   A5  cmd_selfupdate.sh names neither the reaper nor its tick threshold, so the
 #       lazy loader's dep scan adds no edge from it into cmd_heartbeat
 #   AM  MUTANT: the pre-fix pass (no reaper call) leaves A1's seat unrestarted
+#   C1  DIVE-6050: the teal-fox /clear-hint capture parses as done + 1 shell
+#   C2  that seat through the tick: tick 1 logs the wait, tick 2 reaps, restart fires
+#   C3  a hook-error line in the status slot: the pane-free pass reaps by PID on
+#       tick 1, logs it, restart fires
+#   C4  NEGATIVE: open row / shell under the 24h pane-free grace / keep-alive /
+#       mid-turn spinner — none reaped, each reason logged, one line per tick
+#   CM  MUTANTS: pane-only gating re-reds C3; the walk without the skip re-reds C1
 #   B4  AET 2s after the sweep's start, no beacon: no alarm (inside 120s grace)
 #   B5  NEGATIVE: AET genuinely in the future of the per-seat clock still alarms
 #   B6  NEGATIVE: active for 300s with no beacon still alarms "no beacon"
@@ -208,8 +215,8 @@ _a5=$(grep -A1 -E '^  _hb_pending_restart_reap \|\| true$' "$SRC/cmd_heartbeat.s
 
 # --- AM: MUTANT — the pre-fix pass -------------------------------------------
 eval "$(awk '/^_hb_pending_restart_reap\(\) \{/,/^\}/' "$SRC/cmd_heartbeat.sh" \
-  | sed -e 's/^    _hb_bg_shell_sweep "\$name" || true$/    :/')"
-has "$(declare -f _hb_pending_restart_reap)" '_hb_bg_shell_sweep "$name"' \
+  | sed -e 's/^    _hb_owed_seat_reap "\$name" || true$/    :/')"
+has "$(declare -f _hb_pending_restart_reap)" '_hb_owed_seat_reap "$name"' \
   && bad_t "AM0: (anchor) the mutation did not land" "the sed pattern no longer matches src/cmd_heartbeat.sh" \
   || ok_t "AM0: (anchor) the reaper call is gone from the evaluated pass"
 scenario "$OFF_ROSTER" "$STRAY" "$ELEVEN_DAYS" "$PANE_DONE"
@@ -218,6 +225,112 @@ sweep; sweep; sweep
   && ok_t "AM1: MUTANT (pre-fix): A1's seat keeps its shell and is never restarted — A1 goes red" \
   || bad_t "AM1: mutant must strand the seat" "reaped=$(reaped && echo y) restarted=$(restarted && echo y)"
 eval "$(awk '/^_hb_pending_restart_reap\(\) \{/,/^\}/' "$SRC/cmd_heartbeat.sh")"
+
+# ============ C. DIVE-6050: the owed reap does not hang on pane text ===========
+# The teal-fox capture (main, 2026-10-12 04:25Z, agent-claude-snow), verbatim
+# apart from the rule width: Claude Code 2.1.296's /clear hint sits between the
+# status line and the composer rule.
+PANE_CLEAR_HINT=$(cat <<'PANE'
+✻ Cooked for 23s · done 11:40 AM · 1 shell still running
+                                        new task? /clear to save 310.1k tokens
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────
+PANE
+)
+# Any OTHER line in the status slot: a Stop-hook error. No parser fix covers the
+# next unknown line, which is why the owed reap has a pane-free pass.
+PANE_HOOK_ERR=$(cat <<'PANE'
+✻ Cooked for 23s · done 11:40 AM · 1 shell still running
+  Stop hook error: /home/agent-cee/.claude/plugins/cache/5dive-plugins/telegram/0.5.66/hooks/stop.sh: No such file or directory
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────
+PANE
+)
+THIRTEEN_DAYS=1123200
+c1_parse() {
+  [[ "$(_hb_pane_status_line "$PANE_CLEAR_HINT")" == "✻ Cooked for 23s · done 11:40 AM · 1 shell still running" ]] \
+    && _hb_pane_turn_ended "$PANE_CLEAR_HINT" && [[ "$(_hb_pane_bg_shells "$PANE_CLEAR_HINT")" == 1 ]]
+}
+c1_parse \
+  && ok_t "C1: the /clear hint is skipped: status line is the done line, turn ended, 1 shell (DIVE-4298 and both reaps read it again)" \
+  || bad_t "C1: /clear hint still read as the status line" "status=[$(_hb_pane_status_line "$PANE_CLEAR_HINT")]"
+
+# C2: the teal-fox seat itself, through the tick: the pane path counts, reaps, bounces.
+scenario "$OFF_ROSTER" "$STRAY" "$THIRTEEN_DAYS" "$PANE_CLEAR_HINT"
+sweep
+! reaped && has "$(hblog)" "done-shell tick 1 of ${_HB_DONE_SHELL_REAP_TICKS} before they are reaped" \
+  && ok_t "C2a: /clear-hint pane, tick 1: the wait is LOGGED with its reason (done-shell tick 1 of ${_HB_DONE_SHELL_REAP_TICKS})" \
+  || bad_t "C2a: tick 1" "reaped=$(reaped && echo y) log: $(hblog)"
+sweep; sweep
+reaped && restarted \
+  && ok_t "C2b: /clear-hint pane: the 13-day shell is reaped by PID on tick 2 and the owed restart fires" \
+  || bad_t "C2b: /clear-hint seat stranded" "reaped=$(reaped && echo y) restarted=$(restarted && echo y) log: $(hblog)"
+
+# C3: a hook-error line in the status slot: the pane gives nothing, so the
+# pane-free pass reaps by PID on tick 1 and says so. Claude Code's native state
+# goes idle once the shell is gone; the turn ended long ago.
+_native_saved=$(declare -f _hb_agent_native_state)
+_hb_agent_native_state() { if shell_alive; then printf busy; else printf idle; fi; }
+c3_reaps() {
+  scenario "$OFF_ROSTER" "$STRAY" "$THIRTEEN_DAYS" "$PANE_HOOK_ERR"
+  sweep
+  reaped && has "$(hblog)" "reaped 1 agent shell(s) older than $(( _HB_OWED_SHELL_MIN_AGE / 3600 ))h in the seat's own cgroup by PID, without the pane"
+}
+if c3_reaps; then
+  sweep
+  restarted \
+    && ok_t "C3: hook-error pane: tick 1 reaps the 13-day shell by PID WITHOUT the pane, logs it, and the restart fires" \
+    || bad_t "C3: reaped but the restart never fired" "log: $(hblog)"
+else bad_t "C3: hook-error pane stranded the seat" "reaped=$(reaped && echo y) log: $(hblog)"; fi
+
+# C4: NEGATIVES on the same pane, each with its reason logged, one line per tick.
+scenario "$OFF_ROSTER" "$STRAY" "$THIRTEEN_DAYS" "$PANE_HOOK_ERR"
+db() { echo 1; }
+sweep; sweep; sweep
+db() { echo 0; }
+! reaped && ! restarted && has "$(hblog)" "1 in_progress row(s) own the session" \
+  && [[ "$(grep -c '^\[cee\] restart owed.*(DIVE-6050)$' "$TMP/hb.log")" == 3 ]] \
+  && ok_t "C4a: NEGATIVE — an open row: nothing reaped, the reason logged exactly once per tick (3 ticks, 3 lines)" \
+  || bad_t "C4a: open row" "reaped=$(reaped && echo y) restarted=$(restarted && echo y) log: $(hblog)"
+scenario "$OFF_ROSTER" "$STRAY" $(( _HB_OWED_SHELL_MIN_AGE - 3600 )) "$PANE_HOOK_ERR"
+sweep; sweep
+! reaped && ! restarted && has "$(hblog)" "no agent shell older than $(( _HB_OWED_SHELL_MIN_AGE / 3600 ))h to reap" \
+  && ok_t "C4b: NEGATIVE — a shell younger than the $(( _HB_OWED_SHELL_MIN_AGE / 3600 ))h pane-free grace is not reaped, and that is logged" \
+  || bad_t "C4b: young shell" "reaped=$(reaped && echo y) log: $(hblog)"
+scenario "$OFF_ROSTER" '/bin/bash -c FIVEDIVE_KEEP_ALIVE=1 npm run watch' "$THIRTEEN_DAYS" "$PANE_HOOK_ERR"
+sweep; sweep
+! reaped && ! restarted \
+  && ok_t "C4c: NEGATIVE — a FIVEDIVE_KEEP_ALIVE=1 shell is not reaped by the pane-free pass" \
+  || bad_t "C4c: keep-alive shell reaped" "log: $(hblog)"
+eval "$_native_saved"
+scenario "$OFF_ROSTER" "$STRAY" "$THIRTEEN_DAYS" "$PANE_BUSY"
+sweep
+! reaped && has "$(hblog)" "a turn is running on the pane with no row" \
+  && ok_t "C4d: NEGATIVE — a row-less mid-turn seat (spinner) with a 13-day shell: not reaped, the reason logged" \
+  || bad_t "C4d: mid-turn seat" "reaped=$(reaped && echo y) log: $(hblog)"
+
+# CM1: MUTANT — restore pane-only gating (the pane-free pass returns before it
+# reaps). C3 must go red.
+_owed_real=$(declare -f _hb_owed_seat_reap)
+eval "$(declare -f _hb_owed_seat_reap | sed -e 's/^ *pane=\$(_hb_pane_capture "\$name" 2> \/dev\/null) || pane="";$/    return 0;/')"
+[[ "$(declare -f _hb_owed_seat_reap)" != "$_owed_real" ]] \
+  && ok_t "CM0: (anchor) the pane-free pass is cut from the evaluated reap" \
+  || bad_t "CM0: (anchor) mutation did not land" "the sed pattern no longer matches _hb_owed_seat_reap"
+_hb_agent_native_state() { if shell_alive; then printf busy; else printf idle; fi; }
+c3_reaps \
+  && bad_t "CM1: MUTANT (pane-only) still reaps the hook-error seat" "C3 cannot detect the defect" \
+  || ok_t "CM1: MUTANT (pane-only gating): the hook-error seat keeps its shell — C3 goes red"
+eval "$_native_saved"; eval "$_owed_real"
+
+# CM2: MUTANT — the status-line walk without the /clear skip. C1 must go red.
+_sl_real=$(declare -f _hb_pane_status_line)
+eval "$(declare -f _hb_pane_status_line | grep -v 'clear to save')"
+[[ "$(declare -f _hb_pane_status_line)" != "$_sl_real" ]] && ! c1_parse \
+  && ok_t "CM2: MUTANT (no /clear skip): the teal-fox capture parses as mid-turn again — C1 goes red" \
+  || bad_t "CM2: mutant did not land or C1 still passes" "status=[$(_hb_pane_status_line "$PANE_CLEAR_HINT")]"
+eval "$_sl_real"
 
 # ===================== B. the poller sweep's per-seat clock ==================
 unset -f systemctl kill sleep
