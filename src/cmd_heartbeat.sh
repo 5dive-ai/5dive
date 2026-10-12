@@ -2144,22 +2144,34 @@ _hb_pane_capture() {
 # kill-by-PID-never-pkill -f.
 _HB_DONE_SHELL_REAP_TICKS="${HEARTBEAT_DONE_SHELL_REAP_TICKS:-2}"
 [[ "$_HB_DONE_SHELL_REAP_TICKS" =~ ^[0-9]+$ ]] || _HB_DONE_SHELL_REAP_TICKS=2
+# DIVE-6050: every return names its reason in _HB_SWEEP_WHY (`reaped`,
+# `counting:<n>`, or a `pane:` reason) so the owed-restart pass can say why
+# nothing died. The sweep itself stays quiet on those returns, as before: the
+# roster loop calls it for every seat on every tick.
+_HB_SWEEP_WHY=""
 _hb_bg_shell_sweep() {
-  local name="$1" pane n cnt reaped
+  local name="$1" pane n cnt reaped st
+  _HB_SWEEP_WHY="pane: could not be captured"
   pane=$(_hb_pane_capture "$name") || return 0
-  [[ -n "$pane" ]] || return 0
+  [[ -n "$pane" ]] || { _HB_SWEEP_WHY="pane: empty capture"; return 0; }
   if ! _hb_pane_turn_ended "$pane"; then
+    st=$(_hb_pane_status_line "$pane") || st=""
+    _HB_SWEEP_WHY="pane: no finished turn on the status line (read: ${st:0:80})"
+    [[ -n "$st" ]] || _HB_SWEEP_WHY="pane: no status line above the composer"
     with_registry_lock _hb_clear_done_shells "$name" >/dev/null 2>&1 || true
     return 0
   fi
   n=$(_hb_pane_bg_shells "$pane")
   if [[ -z "$n" ]]; then
+    _HB_SWEEP_WHY="pane: the done line names no running shell"
     with_registry_lock _hb_clear_done_shells "$name" >/dev/null 2>&1 || true
     return 0
   fi
   cnt=$(with_registry_lock _hb_mark_done_shells "$name")
-  [[ "${cnt:-0}" =~ ^[0-9]+$ ]] || return 0
+  [[ "${cnt:-0}" =~ ^[0-9]+$ ]] || { _HB_SWEEP_WHY="pane: the done-shell tick counter could not be read"; return 0; }
+  _HB_SWEEP_WHY="counting:${n}:${cnt}"
   (( cnt >= _HB_DONE_SHELL_REAP_TICKS )) || return 0
+  _HB_SWEEP_WHY="reaped"
   reaped=0
   if declare -F _reap_stale_shells >/dev/null 2>&1; then
     reaped=$(_reap_stale_shells "$name" --reason="the turn ended but ${n} background shell(s) outlived it across ${cnt} heartbeat ticks (DIVE-4298)" || echo 0)
@@ -2202,9 +2214,82 @@ _hb_pending_restart_reap() {
       continue
     fi
     _agent_is_parked "$name" && continue
-    _hb_bg_shell_sweep "$name" || true
+    _hb_owed_seat_reap "$name" || true
     _PR_BG_SWEPT+=" ${name} "
   done
+  return 0
+}
+
+# DIVE-6050: the owed seat's reap must not hang on PANE TEXT. DIVE-5960 handed
+# each owed seat to _hb_bg_shell_sweep, which reaps only when the line above the
+# composer parses as "done … N shells still running". On teal-fox a line Claude
+# Code 2.1.296 prints between that status line and the composer rule
+# ("new task? /clear to save 310.1k tokens") broke the parse, the sweep returned
+# without a word, and a 13-day-old shell held the restart for 7 days: 16
+# "STILL not idle" lines per hour, and no line saying why. The status-line walk
+# now skips that hint, but the next unknown line in that slot would do the same.
+#
+# So when the pane does not lead to a reap, an owed seat with NO open row takes a
+# pane-free pass: _reap_stale_shells with a much longer grace
+# (_HB_OWED_SHELL_MIN_AGE, default 24h). Every other guard still applies there:
+# an agent-written `bash -c` only, inside the seat's own unit cgroup, never
+# FIVEDIVE_KEEP_ALIVE, killed by PID. No turn's foreground command lives 24h.
+# A pane that POSITIVELY shows a running turn (the spinner) still blocks it, so
+# a row-less Telegram turn is never touched. A pane that shows nothing readable
+# does not block it.
+#
+# One line per seat per tick, whichever way it goes, so a held restart always
+# says why it is held.
+_HB_OWED_SHELL_MIN_AGE="${HEARTBEAT_OWED_SHELL_MIN_AGE:-86400}"
+[[ "$_HB_OWED_SHELL_MIN_AGE" =~ ^[0-9]+$ ]] || _HB_OWED_SHELL_MIN_AGE=86400
+
+# A turn is visibly RUNNING: the spinner line ("✶ Spelunking… (1m 55s · …)", or
+# an older build's "esc to interrupt") -- the two shapes _hb_agent_pane_idle
+# (DIVE-5014) reads as busy. Positive evidence only; pure.
+_hb_pane_turn_running() {
+  local st; st=$(_hb_pane_status_line "$1") || return 1
+  [[ "$st" == *"esc to interrupt"* ]] && return 0
+  grep -qE '…[[:space:]]*\([0-9]+[smh]' <<<"$st"
+}
+
+_hb_owed_seat_reap() {
+  local name="$1" rows pane hrs reaped
+  hrs=$(( _HB_OWED_SHELL_MIN_AGE / 3600 ))
+  _hb_bg_shell_sweep "$name" || true
+  case "$_HB_SWEEP_WHY" in
+    reaped) return 0 ;;   # the sweep logged its own line
+    counting:*)
+      local c="${_HB_SWEEP_WHY#counting:}"
+      _hb_log "[$name] restart owed: the done line names ${c%%:*} running shell(s), done-shell tick ${c#*:} of ${_HB_DONE_SHELL_REAP_TICKS} before they are reaped (DIVE-6050)"
+      return 0 ;;
+  esac
+  rows=""
+  if declare -F db >/dev/null 2>&1 && declare -F sqlq >/dev/null 2>&1; then
+    rows=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null) || rows=""
+  fi
+  if [[ ! "$rows" =~ ^[0-9]+$ ]]; then
+    _hb_log "[$name] restart owed, shells NOT reaped: the board could not be read, so an open row cannot be ruled out (${_HB_SWEEP_WHY}) (DIVE-6050)"
+    return 0
+  fi
+  if (( rows > 0 )); then
+    _hb_log "[$name] restart owed, shells NOT reaped: ${rows} in_progress row(s) own the session (${_HB_SWEEP_WHY}) (DIVE-6050)"
+    return 0
+  fi
+  pane=$(_hb_pane_capture "$name" 2>/dev/null) || pane=""
+  if [[ -n "$pane" ]] && _hb_pane_turn_running "$pane"; then
+    _hb_log "[$name] restart owed, shells NOT reaped: a turn is running on the pane with no row (a Telegram turn?) (DIVE-6050)"
+    return 0
+  fi
+  reaped=0
+  if declare -F _reap_stale_shells >/dev/null 2>&1; then
+    reaped=$(_reap_stale_shells "$name" --min-age="$_HB_OWED_SHELL_MIN_AGE" \
+      --reason="restart owed, no open row, the pane gave no reap (${_HB_SWEEP_WHY}) (DIVE-6050)" || echo 0)
+  fi
+  if [[ "${reaped:-0}" =~ ^[1-9][0-9]*$ ]]; then
+    _hb_log "[$name] restart owed, no open row: reaped ${reaped} agent shell(s) older than ${hrs}h in the seat's own cgroup by PID, without the pane (${_HB_SWEEP_WHY}) (DIVE-6050)"
+  else
+    _hb_log "[$name] restart owed, no open row: no agent shell older than ${hrs}h to reap in the seat's own cgroup (${_HB_SWEEP_WHY}) (DIVE-6050)"
+  fi
   return 0
 }
 
@@ -3206,6 +3291,12 @@ _hb_pane_status_line() {
         # mid-turn forever (fail-safe, but the fix would be inert for it).
         if (index(s, "─") == 1) continue
         if (index(s, "⎿") == 1) continue          # a continuation row under the status line
+        # DIVE-6050: Claude Code 2.1.296 right-aligns "new task? /clear to save
+        # 310.1k tokens" between the status line and the composer rule once the
+        # context is large. Read as the status line it made every such seat look
+        # mid-turn: the owed-restart reap, the roster reap and DIVE-4298 all
+        # stopped firing on it (teal-fox, 7 days).
+        if (s ~ /\/clear to save [0-9][0-9.,]*[kKmM]? tokens$/) continue
         print s; exit 0
       }
       exit 1
