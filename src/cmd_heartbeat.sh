@@ -195,6 +195,12 @@ _HB_PROC_SKEW_SEC=20
 # rule above can't see it). Reclaim to 'todo' once the task has sat in_progress
 # past this grace AND the agent is idle right now.
 _HB_STALL_MIN_MINUTES=20
+# DIVE-6040: a verifier-held delivery with NO verdict is exempt from (b) and (c)
+# (DIVE-2560, verifier think-time). Past this many minutes with the seat at rest
+# that think-time is over: the grading session ended without a verdict, and the
+# row goes back to the same verifier's queue. Env-overridable.
+_HB_GRADE_ORPHAN_MIN="${HEARTBEAT_GRADE_ORPHAN_MIN:-60}"
+[[ "$_HB_GRADE_ORPHAN_MIN" =~ ^[1-9][0-9]*$ ]] || _HB_GRADE_ORPHAN_MIN=60
 # DIVE-1486 active-defer reconciliation. The no-clobber guard defers a nudge on a
 # confident "active" (rc 1) reading so it never /clears an agent mid-turn. But an
 # attached-but-idle session can read "active" indefinitely (a blinking
@@ -4277,6 +4283,35 @@ ${_q_sql}" 2>/dev/null || true)
       # run receipt (DIVE-3932) that a wiped grading session left open.
       if (( verdict_recorded && age_min >= budget )); then
         _hb_log "[$name] $(_hb_ident "$id") carries a recorded verdict but no hand-back and the claim is ${age_min}m past the ${budget}m budget — the verifier-latency skip does NOT hold (claim outlived its verdict, DIVE-4724); the ordinary rules take it"
+      elif (( ! verdict_recorded && age_min >= _HB_GRADE_ORPHAN_MIN )) && _hb_agent_idle "$name"; then
+        # DIVE-6040 -- A GRADE WHOSE SESSION ENDED WITHOUT A VERDICT. The skip
+        # above has no exit of its own: no verdict means DIVE-4724 never fires,
+        # the claiming process is unchanged so rule (a) never fires, and the
+        # busy-guard counts the row so the seat is never dispatched again.
+        # Measured on quinn, DIVE-6013, 2026-10-11 09:04Z: the grader checked
+        # every claim, left a background CI watch to wake it, the turn ended and
+        # the shell died with it. 749 ticks of busy -- 1 in_progress, skip over
+        # 17h with every bound PR green, until lodar asked on Telegram.
+        #
+        # Past _HB_GRADE_ORPHAN_MIN with the seat at rest (a confident rc 0 --
+        # a mid-turn or blocked seat is still grading and keeps its claim), the
+        # row goes back to the SAME verifier's queue with the delivery intact,
+        # so the next pick re-presents the grade to the seat that owes it. No
+        # verdict is a precondition: a recorded one is DIVE-4724's hand-back,
+        # never a re-grade. A walled seat reads idle too, so the quota park
+        # holds the claim exactly as it does for rule (b).
+        local _gpark
+        if _gpark=$(_hb_quota_parked "$name" "$everyMin"); then
+          _hb_log "[$name] $(_hb_ident "$id") grade has no verdict ${age_min}m in and the seat reads idle, but the supervisor classifies it quota-exhausted — claim HELD (~${_gpark}m of park left, DIVE-6040)"
+          continue
+        fi
+        local _gwhy="grade orphaned: no verdict ${age_min}m after the claim and the seat is at rest — its grading session ended (DIVE-6040)"
+        if (( delivered_live )); then
+          _hb_reclaim_to_verifier "$name" "$id" "$_gwhy"
+        else
+          _hb_reclaim_to_todo "$name" "$id" "$_gwhy"
+        fi
+        reclaimed=$((reclaimed + 1)); continue
       else
         continue
       fi

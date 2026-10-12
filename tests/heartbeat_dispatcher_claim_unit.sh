@@ -564,5 +564,69 @@ cmd_heartbeat_tick >/dev/null 2>&1
   && ok_t "[4261] with only that row the seat is idle, not busy (no wake, no busy line)" \
   || bad_t "[4261] seat must read idle, not busy" "wakes=$WAKE_CALLS log=[$(cat "$HB_LOG")]"
 
+# --- [6040] a grade whose session ended without a verdict --------------------
+# DIVE-6013, quinn, 2026-10-11 09:04Z: the grader left a background CI watch to
+# wake it, the turn ended, the shell died, and the row stayed in_progress with no
+# verdict. 749 ticks of `busy — 1 in_progress, skip` over 17h. The REAL tick runs
+# here: the claim is the verifier's (dev), delivered by a maker and unacked.
+db "UPDATE tasks SET status='cancelled' WHERE status NOT IN ('done','cancelled');"
+mk_grade() {  # a delivery routed through the real verb, claimed by the verifier dev
+  local id
+  id=$( ( cmd_task_add --assignee=maker1 --verifier=dev --verify -- "grade me" ) 2>/dev/null | jq -r '.data.id')
+  ( cmd_task_done "$id" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
+  _hb_claim_task dev "$id" >/dev/null 2>&1
+  db "UPDATE tasks SET started_at=datetime('now','-$2 minutes') WHERE id=${id};"
+  printf '%s' "$id"
+}
+grow() { db "SELECT status||'|'||COALESCE(assignee,'')||'|'||COALESCE(handoff_delivered_at,'NULL') FROM tasks WHERE id=$1;"; }
+
+# Arm G1 — session gone (seat at rest), no verdict, past N: the tick dispatches it
+# back to the grader on that same tick, and the delivery is still bound.
+GO1=$(mk_grade x 70)
+[[ "$(grow "$GO1")" == in_progress\|dev\|* ]] \
+  && ok_t "[6040] fixture: verifier-held, delivered, in_progress" \
+  || bad_t "[6040] fixture did not land" "got $(grow "$GO1")"
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+G1_AGE=$(db "SELECT CAST((julianday('now') - julianday(started_at)) * 1440 AS INTEGER) FROM tasks WHERE id=${GO1};")
+(( WAKE_CALLS == 1 )) && [[ "$(grow "$GO1")" == in_progress\|dev\|2* ]] && (( ${G1_AGE:-99} < 5 )) \
+  && ok_t "[6040] G1 no verdict, seat at rest, 70m in: the tick re-dispatches the grade to its grader (fresh claim, delivery kept)" \
+  || bad_t "[6040] G1 the orphaned grade was not re-dispatched" "wakes=$WAKE_CALLS row=$(grow "$GO1") age=${G1_AGE:-?} log=[$(cat "$HB_LOG")]"
+grep -q "busy —" "$HB_LOG" \
+  && bad_t "[6040] G1b the seat must not busy-skip on the orphaned claim" "log=[$(cat "$HB_LOG")]" \
+  || ok_t "[6040] G1b no busy-skip on the orphaned claim"
+
+# Arm G2 — CONTROL: same row, but the seat is mid-turn (a live session). Busy.
+db "UPDATE tasks SET status='cancelled' WHERE id=${GO1};"
+GO2=$(mk_grade x 70)
+_hb_agent_idle() { return 1; }
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+_hb_agent_idle() { return 0; }
+G2_AGE=$(db "SELECT CAST((julianday('now') - julianday(started_at)) * 1440 AS INTEGER) FROM tasks WHERE id=${GO2};")
+(( WAKE_CALLS == 0 )) && [[ "$(grow "$GO2")" == in_progress\|dev\|* ]] && (( ${G2_AGE:-0} >= 69 )) \
+  && ok_t "[6040] G2 CONTROL: a grader with a live session keeps its claim — no wake, clock untouched" \
+  || bad_t "[6040] G2 a live grading session was reclaimed" "wakes=$WAKE_CALLS row=$(grow "$GO2") age=${G2_AGE:-?}"
+
+# Arm G3 — CONTROL: inside N (seat at rest) the grader keeps its think-time.
+db "UPDATE tasks SET status='cancelled' WHERE id=${GO2};"
+GO3=$(mk_grade x 40)
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) && [[ "$(grow "$GO3")" == in_progress\|dev\|* ]] \
+  && ok_t "[6040] G3 CONTROL: 40m in, under N=${_HB_GRADE_ORPHAN_MIN:-60}m — not reclaimed, not woken" \
+  || bad_t "[6040] G3 the grade was raced inside N" "wakes=$WAKE_CALLS row=$(grow "$GO3")"
+
+# Arm G4 — CONTROL: a verdict is already recorded for this iteration. Past N but
+# inside the DIVE-4724 budget: never re-graded, never re-dispatched.
+db "UPDATE tasks SET status='cancelled' WHERE id=${GO3};"
+GO4=$(mk_grade x 70)
+db "UPDATE tasks SET graded_at=datetime('now'), graded_verdict='pass', graded_verdict_at=datetime('now'), graded_by='dev' WHERE id=${GO4};"
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) && [[ "$(grow "$GO4")" == in_progress\|dev\|* ]] \
+  && ok_t "[6040] G4 CONTROL: a recorded verdict is not an orphaned grade — not reclaimed, not re-dispatched" \
+  || bad_t "[6040] G4 a graded row was re-dispatched" "wakes=$WAKE_CALLS row=$(grow "$GO4")"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
