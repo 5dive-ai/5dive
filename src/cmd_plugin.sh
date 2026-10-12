@@ -1213,11 +1213,23 @@ _plugin_node_deps_missing() {  # <dir> -> the declared dependencies that are abs
   return 0
 }
 
-_plugin_node_deps_notice() {  # <key> <dir>
-  local key="${1:-}" d="${2:-}" missing list
+# DIVE-6112: a plugin whose manifest declares a host setup step installs its
+# packages THERE (browser: `sudo 5dive browser setup` puts Node 22 and the pinned
+# playwright-core on the box; on a fresh box the npm line would fail anyway, there
+# is no npm yet). So that step is the one next step. On `add` it was printed just
+# above and this stays quiet; on a re-add or an upgrade (which wiped the packages)
+# this names that step instead of npm.
+_plugin_node_deps_notice() {  # <key> <dir> [<setup-command> [shown]]
+  local key="${1:-}" d="${2:-}" setup_cmd="${3:-}" shown="${4:-}" missing list
   missing=$(_plugin_node_deps_missing "$d")
   [[ -n "$missing" ]] || return 0
   list=$(tr '\n' ' ' <<<"$missing"); list="${list% }"
+  if [[ -n "$setup_cmd" ]]; then
+    [[ -n "$shown" ]] && return 0
+    echo >&2
+    echo "  $key's packages are not on this box yet ($list). Its setup step installs them: $setup_cmd" >&2
+    return 0
+  fi
   echo >&2
   echo "  $key declares node packages that are NOT installed on this box: $list" >&2
   echo "  Installing a plugin copies its files; it does not fetch its packages, so" >&2
@@ -1327,7 +1339,7 @@ cmd_plugin_add() {
     _plugin_seat_reregister "$key" "$plugin" "$mkt" "$caps" "$dest"
     # DIVE-4751: nothing was fetched, but the packages can still be missing —
     # this is the branch a second `add` lands on after the first one told you.
-    _plugin_node_deps_notice "$key" "$dest"
+    _plugin_node_deps_notice "$key" "$dest" "$(jq -r '.fivedive.setup.command // ""' <<<"$j")"
     ok "$key already at $version" '{plugin:$p, marketplace:$m, version:$v, changed:false}' \
        --arg p "$plugin" --arg m "$mkt" --arg v "$version"
     return 0
@@ -1405,7 +1417,7 @@ cmd_plugin_add() {
 
   # DIVE-4751, and deliberately AFTER the setup hint: the hint is the publisher's
   # sentence about the host, this is 5dive's own sentence about the box.
-  _plugin_node_deps_notice "$key" "$dest"
+  _plugin_node_deps_notice "$key" "$dest" "$setup_cmd" shown
   # DIVE-4522. Enabling the plugin for the BOX is half of "installed": a `skill`
   # or `mcp` plugin is only real once the seat's harness loads it, and until this
   # line existed nothing here ever touched a seat. Measured on lodar's canary:
@@ -1645,7 +1657,7 @@ cmd_plugin_upgrade() {
   # copy of the tree, so an upgrade DELETES a node_modules the converge had
   # already installed under the old version and puts the box straight back into
   # the state this notice exists to name.
-  _plugin_node_deps_notice "$key" "$dest"
+  _plugin_node_deps_notice "$key" "$dest" "$(jq -r '.fivedive.setup.command // ""' <<<"$nj")"
 
   ok "$key upgraded $cur -> $new (roll back: 5dive plugin rollback $key)" \
      '{plugin:$k, from:$f, to:$t, changed:true}' --arg k "$key" --arg f "$cur" --arg t "$new"

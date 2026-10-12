@@ -513,6 +513,39 @@ t  "T9j upgrading a plugin with declared packages succeeds"          "0" "$RC"
 tc "T9j2 ...and names the install line again, because the upgrade wiped the packages" \
    "npm install --prefix $STATE_DIR/plugins/enabled/needsdeps@fixture --omit=dev --ignore-scripts" "$OUT$ERR"
 
+# T9p (DIVE-6112): a plugin that declares a host setup step owns its packages
+# there, so `add` prints that ONE next step and no npm line (on a fresh box npm is
+# not even installed yet). The browser plugin is the live instance: its
+# `sudo 5dive browser setup` installs Node 22 and the pinned playwright-core.
+mkplugin setupdeps "$(manifest setupdeps 1.0.0 official '["channel"]' '[]' \
+  '{"setup":{"hint":"setupdeps needs a host engine.","command":"sudo 5dive setupdeps setup"}}')"
+printf '%s\n' '{"name":"setupdeps","private":true,"dependencies":{"playwright-core":"1.63.0"}}' \
+  > "$MKT/setupdeps/package.json"
+mkindex
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
+run cmd_plugin_add setupdeps@fixture --yes
+t  "T9p a plugin with a setup step and absent packages installs"      "0" "$RC"
+tc "T9p2 ...and prints its setup command"                             "Run it yourself when you are ready:  sudo 5dive setupdeps setup" "$OUT$ERR"
+tn "T9p3 ...and NO npm line (the setup step is the one next step)"    "npm install --prefix" "$OUT$ERR"
+tn "T9p4 ...and no second notice about the packages"                  "declares node packages" "$OUT$ERR"
+t  "T9p5 ...and it ran nothing: no node_modules"                      "no" \
+   "$([[ -e "$STATE_DIR/plugins/enabled/setupdeps@fixture/node_modules" ]] && echo yes || echo no)"
+run cmd_plugin_add setupdeps@fixture --yes
+tc "T9p6 a re-add (no hint printed this time) names the setup step for the packages" \
+   "packages are not on this box yet (playwright-core). Its setup step installs them: sudo 5dive setupdeps setup" "$OUT$ERR"
+tn "T9p7 ...not npm"                                                  "npm install --prefix" "$OUT$ERR"
+mkplugin setupdeps "$(manifest setupdeps 1.1.0 official '["channel"]' '[]' \
+  '{"setup":{"hint":"setupdeps needs a host engine.","command":"sudo 5dive setupdeps setup"}}')"
+printf '%s\n' '{"name":"setupdeps","private":true,"dependencies":{"playwright-core":"1.63.0"}}' \
+  > "$MKT/setupdeps/package.json"
+mkindex
+gh_fixture_publish "$MKT"; run _plugin_mkt_upgrade fixture
+run cmd_plugin_upgrade setupdeps@fixture
+t  "T9p8 upgrading it succeeds"                                       "0" "$RC"
+tc "T9p9 ...and names the setup step, because the upgrade wiped the packages" \
+   "Its setup step installs them: sudo 5dive setupdeps setup" "$OUT$ERR"
+tn "T9p10 ...not npm"                                                 "npm install --prefix" "$OUT$ERR"
+
 # T9k: the live manifest, not only the fixture. If the browser plugin ever stops
 # pinning a package this arm goes quiet on its own; if the pin moves out of
 # `dependencies` where the driver resolves it, this reds.
