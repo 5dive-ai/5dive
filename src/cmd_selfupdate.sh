@@ -1493,7 +1493,7 @@ _cli_freeze_observe() {
 # version is not installable. Unresolvable tags => `unavailable`, which is honest
 # and is also what the installer does (it fails CLOSED on the same condition).
 #
-# Prints exactly four lines (never fails the caller):
+# Prints exactly five lines (never fails the caller):
 #   1  state    consistent | indeterminate | unavailable
 #   2  version  the published FIVE_VERSION — empty unless state is consistent
 #   3  detail   the ref the answer came from (consistent), else the reason.
@@ -1506,31 +1506,85 @@ _cli_freeze_observe() {
 #               that claim into provenance, so the one resolver that already
 #               fetched and checksum-verified the published bundle hands its
 #               digest out rather than making a second fetch drift from this one.
+#   5  rung     DIVE-6049: which rung of the installer's ladder named the
+#               target (override / canary / fleet stable route / last known),
+#               empty unless consistent. A caller must not render a last-known
+#               fall-through as a fresh read of the route.
 _published_cli_probe() {
   local state version detail
-  _pcp_out() { printf '%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${4:-}"; }
+  _pcp_out() { printf '%s\n%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${4:-}" "${5:-}"; }
 
   command -v curl >/dev/null 2>&1 \
     || { _pcp_out unavailable "" "curl is not installed"; return 0; }
   command -v sha256sum >/dev/null 2>&1 \
     || { _pcp_out unavailable "" "sha256sum is not installed"; return 0; }
 
-  local org tags="" ref=""
+  local org tags="" ref="" rung=""
   org=$(gh_org)
+
+  # >>> DIVE-6049 installer target ladder
+  # DIVE-6049 — WHICH RUNG DEFINES "LATEST". Since DIVE-4140 the installer does
+  # NOT install the newest tag: a customer box follows the fleet stable route
+  # (api.5dive.com/cli-version), and only a canary opt-in takes the newest tag.
+  # This probe kept reading the newest tag, so in the window between a tag cut
+  # and the route promoting it EVERY box on the route target was told it was
+  # STALE, with `sudo 5dive update` as the fix — a fix that reinstalls the same
+  # version and restarts seats. The ladder below is install.sh's
+  # resolve_cli_target, rung for rung and file for file, with the same env
+  # overrides so one harness can point both at the same stubs:
+  #   local override > canary opt-in > fleet stable route > last known stable.
+  # Only the canary rung falls through to the tag list below (ref still empty).
+  # Read-only: the probe never WRITES last-known — that is the installer's
+  # record of a route answer, and an unprivileged reader must not mint one. The
+  # installed-version floor is not applied here: a box above its target is
+  # reported AHEAD by every caller, which is the floor's refusal said out loud.
+  local override_file="${CLI_VERSION_OVERRIDE_FILE:-/etc/5dive/cli-version}"
+  local canary_file="${CLI_CANARY_FILE:-/etc/5dive/cli-canary}"
+  local known_file="${CLI_VERSION_KNOWN_FILE:-/var/lib/5dive/cli-version.last-known}"
+  local route="${CLI_VERSION_URL:-https://api.5dive.com/cli-version}"
+  if [[ -e "$override_file" ]]; then
+    ref=$(tr -d '[:space:]' < "$override_file" 2>/dev/null) || ref=""
+    rung="local override $override_file"
+    if [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      _pcp_out unavailable "" "the local override $override_file holds no valid vMAJOR.MINOR.PATCH tag — the installer refuses on the same file"
+      return 0
+    fi
+  elif [[ -e "$canary_file" ]]; then
+    rung="canary opt-in $canary_file (newest released tag, ahead of the fleet pin)"
+  else
+    ref=$(curl -fsSL --max-time 5 "$route" 2>/dev/null | tr -d '[:space:]') || ref=""
+    if [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      rung="fleet stable route $route"
+    else
+      # The installer's own fall-through, NAMED as one: it is the last tag the
+      # route gave this box, not an answer from the route now, and a caller must
+      # be able to say so rather than render it as a fresh read.
+      ref=""
+      if [[ -r "$known_file" ]]; then ref=$(tr -d '[:space:]' < "$known_file" 2>/dev/null) || ref=""; fi
+      rung="last known stable $known_file (the fleet stable route $route did not answer with a tag)"
+      if [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        _pcp_out unavailable "" "the fleet stable route $route did not answer with a tag and $known_file holds no usable last-known tag — the installer could not upgrade this box either"
+        return 0
+      fi
+    fi
+  fi
+  # <<< DIVE-6049 installer target ladder
+
+  # Canary rung only (ref still empty): the newest unheld release tag.
   # Rung 1: git ls-remote — exact, no API rate limit.
-  if command -v git >/dev/null 2>&1; then
+  if [[ -z "$ref" ]] && command -v git >/dev/null 2>&1; then
     tags=$(GIT_TERMINAL_PROMPT=0 timeout 10 git ls-remote --tags --refs \
       "https://github.com/$org/5dive" 'v*' 2>/dev/null | sed -n 's#.*refs/tags/##p') || tags=""
   fi
   # Rung 2: the tags atom feed — unauthenticated, not subject to the 60/hr
   # api.github.com limit a NAT'd fleet shares. Parse <id>, NOT <title>: the
   # title carries a human release headline after the tag and matches nothing.
-  if [[ -z "$tags" ]]; then
+  if [[ -z "$ref" && -z "$tags" ]]; then
     tags=$(curl -fsSL --max-time 10 "https://github.com/$org/5dive/tags.atom" 2>/dev/null \
       | sed -n 's#.*<id>tag:github.com,[0-9]*:Repository/[0-9]*/\([^<]*\)</id>.*#\1#p') || tags=""
   fi
   # Rung 3: the tags API, last before giving up.
-  if [[ -z "$tags" ]]; then
+  if [[ -z "$ref" && -z "$tags" ]]; then
     tags=$(curl -fsSL --max-time 10 "https://api.github.com/repos/$org/5dive/tags?per_page=100" 2>/dev/null \
       | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\(v[0-9][^"]*\)".*/\1/p') || tags=""
   fi
@@ -1540,7 +1594,7 @@ _published_cli_probe() {
   local candidates=""
   [[ -n "$tags" ]] && candidates=$(printf '%s\n' "$tags" \
     | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V) || candidates=""
-  if [[ -z "$candidates" ]]; then
+  if [[ -z "$ref" && -z "$candidates" ]]; then
     _pcp_out unavailable "" "no release tag resolves — the installer could not upgrade this box either"
     return 0
   fi
@@ -1570,13 +1624,22 @@ _published_cli_probe() {
   hold_list=$(printf '%s\n' "$hold_body" \
     | sed -n 's/^\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)\([[:space:]].*\)\{0,1\}$/\1/p')
 
-  if [[ -n "$hold_list" ]]; then
-    candidates=$(printf '%s\n' "$candidates" | grep -vxF "$hold_list") || candidates=""
-  fi
-  ref=$(printf '%s\n' "$candidates" | tail -1)
-  if [[ -z "$ref" ]]; then
-    _pcp_out unavailable "" "every release tag is held on main — the installer would refuse to upgrade this box too"
-    return 0
+  if [[ -n "$ref" ]]; then
+    # DIVE-4366: a single-tag rung has no next-best candidate, so a held target
+    # is a REFUSAL — the installer keeps the CLI this box has, never falls back.
+    if [[ -n "$hold_list" ]] && printf '%s\n' "$hold_list" | grep -qxF "$ref"; then
+      _pcp_out unavailable "" "the target $ref ($rung) is HELD on main — the installer refuses it and keeps this box on the CLI it has"
+      return 0
+    fi
+  else
+    if [[ -n "$hold_list" ]]; then
+      candidates=$(printf '%s\n' "$candidates" | grep -vxF "$hold_list") || candidates=""
+    fi
+    ref=$(printf '%s\n' "$candidates" | tail -1)
+    if [[ -z "$ref" ]]; then
+      _pcp_out unavailable "" "every release tag is held on main — the installer would refuse to upgrade this box too"
+      return 0
+    fi
   fi
 
   local tmp
@@ -1611,7 +1674,7 @@ _published_cli_probe() {
     _pcp_out indeterminate "" "the published bundle carries no FIVE_VERSION"
     return 0
   fi
-  _pcp_out consistent "$version" "$ref" "$served"
+  _pcp_out consistent "$version" "$ref" "$served" "$rung"
 }
 # <<< DIVE-2042 published-version probe
 

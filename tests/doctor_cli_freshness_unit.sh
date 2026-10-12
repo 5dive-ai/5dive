@@ -63,8 +63,10 @@ mkbundle 0.18.6 'HAND-BUILT — same version string, different bytes' "$TMP/bund
 printf '#!/usr/bin/env bash\n# a bundle that declares no version\n'   > "$TMP/bundle-nover"
 SHA_NEW="$(sha256sum "$TMP/bundle-new" | awk '{print $1}')"
 
-# The probe's four-line contract, substituted so no arm needs the network.
-probe_ok()    { printf 'consistent\n0.18.6\nv0.18.6\n%s\n' "$SHA_NEW"; }
+# The probe's five-line contract, substituted so no arm needs the network.
+# Line 5 (DIVE-6049) names the installer rung that chose the target.
+probe_ok()    { printf 'consistent\n0.18.6\nv0.18.6\n%s\nfleet stable route https://route.invalid/cli-version\n' "$SHA_NEW"; }
+probe_known() { printf 'consistent\n0.18.6\nv0.18.6\n%s\nlast known stable /var/lib/5dive/cli-version.last-known (the fleet stable route https://route.invalid/cli-version did not answer with a tag)\n' "$SHA_NEW"; }
 probe_unavail(){ printf 'unavailable\n\nno release tag resolves — the installer could not upgrade this box either\n\n'; }
 probe_indet() { printf 'indeterminate\n\nthe bundle published at v0.18.6 does not match its own checksum\n\n'; }
 
@@ -126,7 +128,7 @@ assert_row "a stale bundle still reports what it is" \
 # 2. NON-VACUITY CONTROL (never the result): a genuinely current, byte-identical
 #    install is the only shape allowed to read ok on all three rows.
 rows="$(run_check "$TMP/bundle-new" "$(probe_ok)")"
-assert_row "current install is ok" "$rows" cli-freshness ok 'matches the newest published release 0\.18\.6 \(from v0\.18\.6\)'
+assert_row "current install is ok, and names the rung" "$rows" cli-freshness ok 'matches the release target 0\.18\.6 \(from v0\.18\.6 via fleet stable route'
 assert_row "byte-identical install is identified against the published tag" \
   "$rows" cli-provenance ok 'byte-identical to the bundle published at v0\.18\.6'
 assert_row "current install reports version and mtime" "$rows" cli-installed ok '0\.18\.6.*mtime.*sha256'
@@ -138,14 +140,25 @@ rows="$(run_check "$TMP/bundle-stamped" "$(probe_ok)")"
 assert_row "a bundle wearing a release number it did not earn is an ERROR" \
   "$rows" cli-provenance error 'bytes differ from the bundle published at v0\.18\.6'
 assert_row "...and freshness alone cannot see it — version comparison says current" \
-  "$rows" cli-freshness ok 'matches the newest published release'
+  "$rows" cli-freshness ok 'matches the release target'
 
 # 4. AHEAD is its own state (DIVE-2287), not "up to date": the monotonicity
 #    guard refuses every upgrade from here, so it never self-corrects.
 mkbundle 0.19.0 '' "$TMP/bundle-ahead"
 rows="$(run_check "$TMP/bundle-ahead" "$(probe_ok)")"
 assert_row "a box above the newest release reads AHEAD, not ok" \
-  "$rows" cli-freshness warn 'AHEAD.*0\.19\.0.*above the newest published 0\.18\.6'
+  "$rows" cli-freshness warn 'AHEAD.*0\.19\.0.*above its install target 0\.18\.6'
+
+# 4b. DIVE-6049: the route did not answer and the target is the installer's
+#     LAST-KNOWN fall-through. Equal to it is UNCONFIRMED (warn), never a green
+#     minted from the read we could not make; behind it is still STALE, because
+#     `sudo 5dive update` really would install it.
+rows="$(run_check "$TMP/bundle-new" "$(probe_known)")"
+assert_row "equal to the last-known fall-through is UNCONFIRMED, not ok" \
+  "$rows" cli-freshness warn 'UNCONFIRMED.*0\.18\.6.*last-known target.*not a statement that 0\.18\.6 is current'
+rows="$(run_check "$TMP/bundle-old" "$(probe_known)")"
+assert_row "behind the last-known fall-through is still STALE and names the rung" \
+  "$rows" cli-freshness error 'STALE.*0\.18\.4.*0\.18\.6.*via last known stable'
 
 # =========================== the cannot-run arms =========================
 # Each of these defaults to the empty, reassuring answer if written naively.
@@ -232,6 +245,12 @@ if [[ -z "$block" ]] || ! grep -q '_published_cli_probe()' <<<"$block"; then
   bad_t "probe block is extractable" "markers not found in src/cmd_selfupdate.sh"
 else
   STUBS="$TMP/stubs"; mkdir -p "$STUBS"
+  # DIVE-6049: pin the installer rung inside $STUBS. Left at the defaults the
+  # probe reads THIS HOST's /etc/5dive/cli-canary and last-known file. The
+  # canary rung is the tag-list rung these stubs serve; the route rung is graded
+  # in cli_probe_route_target_unit.sh.
+  : > "$STUBS/canary"
+  RUNG_ENV="CLI_VERSION_OVERRIDE_FILE=$STUBS/override-absent CLI_CANARY_FILE=$STUBS/canary CLI_VERSION_KNOWN_FILE=$STUBS/known-absent CLI_VERSION_URL=https://route.invalid/cli-version"
   TOOLS="$(dirname "$(command -v sha256sum)")"
   cat >"$STUBS/git" <<'EOF'
 #!/usr/bin/env bash
@@ -257,7 +276,7 @@ case "\${!#}" in
 esac
 EOF
   chmod +x "$STUBS/git" "$STUBS/curl"
-  out="$(env -i PATH="$STUBS:$TOOLS" HOME="$STUBS" bash -c "set -uo pipefail
+  out="$(env -i PATH="$STUBS:$TOOLS" HOME="$STUBS" $RUNG_ENV bash -c "set -uo pipefail
 gh_org() { printf 'testorg\n'; }
 $block
 _published_cli_probe" 2>/dev/null)"
@@ -278,7 +297,7 @@ EOF
 exit 1
 EOF
   chmod +x "$STUBS/git" "$STUBS/curl"
-  out="$(env -i PATH="$STUBS:$TOOLS" HOME="$STUBS" bash -c "set -uo pipefail
+  out="$(env -i PATH="$STUBS:$TOOLS" HOME="$STUBS" $RUNG_ENV bash -c "set -uo pipefail
 gh_org() { printf 'testorg\n'; }
 $block
 _published_cli_probe" 2>/dev/null)"

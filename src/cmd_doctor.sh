@@ -458,7 +458,7 @@ doctor_check_gate_repo_visibility() {
 # the strong one gets read off the weak one:
 #
 #   cli-installed    what the binary IS   — path, the version it declares, mtime
-#   cli-freshness    is it BEHIND         — declared version vs the newest tag
+#   cli-freshness    is it BEHIND         — declared version vs the install target (DIVE-6049)
 #                                           the installer would actually resolve
 #   cli-provenance   is that version TRUE — sha256 of the installed bytes vs the
 #                                           bundle published at that tag
@@ -540,36 +540,48 @@ doctor_check_cli_freshness() {
   # Never from a local checkout: a reference that shares a failure mode with the
   # population makes staleness self-cancelling, and the check is then most
   # confidently green exactly when the box is most stale. _published_cli_probe
-  # mirrors install.sh's own tag resolution and fails CLOSED, which is why it is
+  # mirrors install.sh's own target ladder and fails CLOSED, which is why it is
   # reused here instead of a second resolver that would drift from it.
+  # DIVE-6049: the reference is what `5dive update` would INSTALL — on a
+  # customer box the fleet stable route, not the newest tag. Grading against
+  # the newest tag called every box on the route target STALE between a tag cut
+  # and its promotion, with a fix that reinstalls the same version.
   [[ -n "$probe" ]] || probe=$(_published_cli_probe)
   local -a p=()
   mapfile -t p <<<"$probe"
   local state="${p[0]:-unavailable}" latest="${p[1]:-}" detail="${p[2]:-no detail}" pubsha="${p[3]:-}"
+  local rung="${p[4]:-}"
 
   if [[ "$state" != "consistent" || -z "$latest" ]]; then
     doctor_add host cli-freshness warn \
-      "UNKNOWN — installed $installed_ver, but the newest published release could not be resolved ($state: $detail); this is not a statement that $installed_ver is current"
+      "UNKNOWN — installed $installed_ver, but the release this box's installer targets could not be resolved ($state: $detail); this is not a statement that $installed_ver is current"
     doctor_add host cli-provenance warn \
       "UNKNOWN — no published bundle to identify $bin against ($state: $detail)"
     return 0
   fi
 
   # --- row 2: is it BEHIND ------------------------------------------------
-  local age=""
+  local age="" via=""
   [[ "$mtime" != "unknown" ]] && age=", installed bundle dated $mtime"
+  [[ -n "$rung" ]] && via=" via $rung"
   if version_lt "$installed_ver" "$latest"; then
     doctor_add host cli-freshness error \
-      "STALE — this host runs $installed_ver but $latest is published$age; anything merged after $installed_ver is NOT running here, whatever the board says. Fix: sudo 5dive update"
+      "STALE — this host runs $installed_ver but $latest is the release \`5dive update\` installs ($detail$via)$age; anything merged after $installed_ver is NOT running here, whatever the board says. Fix: sudo 5dive update"
   elif version_lt "$latest" "$installed_ver"; then
     # DIVE-2287: above the newest release is its own state, and it is the state
     # DIVE-2243's monotonicity guard REFUSES every subsequent upgrade from — so
     # this box will never self-correct back onto the release line.
     doctor_add host cli-freshness warn \
-      "AHEAD — this host runs $installed_ver, above the newest published $latest$age; self-update refuses to move a box that is ahead, so it will not return to the release line on its own"
+      "AHEAD — this host runs $installed_ver, above its install target $latest ($detail$via)$age; self-update refuses to move a box that is ahead, so it will not return to the release line on its own"
+  elif [[ "$rung" == "last known stable"* ]]; then
+    # DIVE-6049: equal to the installer's FALLBACK is not "current". The route
+    # did not answer, so this is the tag it last gave this box — a green here
+    # would be minted from the one read we could not make.
+    doctor_add host cli-freshness warn \
+      "UNCONFIRMED — installed $installed_ver matches the installer's last-known target $latest ($detail$via)$age; the fleet route did not answer, so this is not a statement that $installed_ver is current"
   else
     doctor_add host cli-freshness ok \
-      "installed $installed_ver matches the newest published release $latest (from $detail)$age"
+      "installed $installed_ver matches the release target $latest (from $detail$via)$age"
   fi
 
   # --- row 3: is that version TRUE ----------------------------------------
@@ -600,13 +612,13 @@ doctor_check_cli_freshness() {
     # rather than an ordinary lag: the bundle CLAIMS the published version and is
     # not the published object.
     doctor_add host cli-provenance error \
-      "$bin declares $installed_ver — the newest published version — but its bytes differ from the bundle published at $detail (installed ${sha:0:12}, published ${pubsha:0:12}). This is a hand-built or locally-staged bundle wearing a release number; its version string corresponds to no published commit and reading it as 'we are on $latest' is exactly the substitution DIVE-2621 is about"
+      "$bin declares $installed_ver — the version its installer targets — but its bytes differ from the bundle published at $detail (installed ${sha:0:12}, published ${pubsha:0:12}). This is a hand-built or locally-staged bundle wearing a release number; its version string corresponds to no published commit and reading it as 'we are on $latest' is exactly the substitution DIVE-2621 is about"
   else
     # Stale or ahead: differing bytes are EXPECTED, and the only published object
-    # we hold is the newest tag's. Say plainly that we cannot tell, rather than
+    # we hold is the install target's. Say plainly that we cannot tell, rather than
     # inferring ancestry from a version string.
     doctor_add host cli-provenance warn \
-      "CANNOT TELL — $bin declares $installed_ver, which is not the newest published $latest, so its bytes have nothing to be compared against here. This identity is a POSITIVE-ONLY oracle: a match proves the installed build is what we merged, a non-match proves NOTHING, because a squash merge rewrites the sha and this check holds only the newest tag's bundle anyway. Read this as UNPROVEN, never as 'not merged' — a row that printed 'not merged' here would manufacture alarms about healthy boxes"
+      "CANNOT TELL — $bin declares $installed_ver, which is not the install target $latest, so its bytes have nothing to be compared against here. This identity is a POSITIVE-ONLY oracle: a match proves the installed build is what we merged, a non-match proves NOTHING, because a squash merge rewrites the sha and this check holds only the install target's bundle anyway. Read this as UNPROVEN, never as 'not merged' — a row that printed 'not merged' here would manufacture alarms about healthy boxes"
   fi
 }
 
