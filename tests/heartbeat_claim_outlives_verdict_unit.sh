@@ -47,7 +47,8 @@
 #   B2  the same row INSIDE the budget is NOT reclaimed — the verifier gets its
 #       ordinary window to run the hand-back itself;
 #   B3  CONTROL — no verdict, past the budget: DIVE-2560's skip still holds
-#       (this is the arm the fix must not widen);
+#       (this is the arm the fix must not widen) — for a grader that is
+#       mid-turn; at rest it is DIVE-6040's orphaned grade (B6);
 #   B5  past the idle-stall grace but INSIDE the budget: neither arm takes the
 #       row — the fall-through is bounded by the same budget as everything else;
 #   B4  CONTROL — a verdict OLDER than the delivery in front of it graded a
@@ -315,7 +316,9 @@ read -r RCB5 _ < <(_hb_reclaim olivia 30)
 reset_all
 TB3=$(mk_delivered_unacked)
 db "UPDATE tasks SET started_at=datetime('now','-200 minutes') WHERE id=${TB3};"
+_hb_agent_idle() { return 1; }   # DIVE-6040: a grader at rest past N is an orphaned grade; this arm is the live one
 read -r RCB3 _ < <(_hb_reclaim olivia 30)
+_hb_agent_idle() { return 0; }
 [[ "$(rowa "$TB3")" == in_progress\|olivia\|* ]] && (( ${RCB3:-1} == 0 )) \
   && ok_t "B3 [control] no verdict yet — DIVE-2560's verifier-latency skip still holds" \
   || bad_t "B3 the fix widened DIVE-2560's skip" "reclaimed=${RCB3:-?} row=$(rowa "$TB3")"
@@ -325,10 +328,22 @@ TB4=$(mk_delivered_unacked)
 db "UPDATE tasks SET graded_at=datetime('now','-300 minutes'), graded_verdict='pass',
        graded_verdict_at=datetime('now','-300 minutes'), graded_by='olivia',
        started_at=datetime('now','-200 minutes') WHERE id=${TB4};"
+_hb_agent_idle() { return 1; }   # DIVE-6040: a grader at rest past N is an orphaned grade; this arm is the live one
 read -r RCB4 _ < <(_hb_reclaim olivia 30)
+_hb_agent_idle() { return 0; }
 [[ "$(rowa "$TB4")" == in_progress\|olivia\|* ]] && (( ${RCB4:-1} == 0 )) \
   && ok_t "B4 [control] a verdict older than the delivery graded another iteration — not a hand-back" \
   || bad_t "B4 a stale verdict was read as this iteration's" "reclaimed=${RCB4:-?} row=$(rowa "$TB4")"
+
+# B6 DIVE-6040: no verdict, past N, the grader AT REST — its session ended. The
+# row goes back to the verifier's queue (same seat, delivery kept).
+reset_all
+TB6=$(mk_delivered_unacked)
+db "UPDATE tasks SET started_at=datetime('now','-70 minutes') WHERE id=${TB6};"
+read -r RCB6 _ < <(_hb_reclaim olivia 30)
+[[ "$(rowa "$TB6")" == "todo|olivia|NULL" ]] && (( ${RCB6:-0} == 1 )) \
+  && ok_t "B6 an orphaned grade (no verdict, 70m, seat at rest) returns to todo on its verifier" \
+  || bad_t "B6 the orphaned grade was not returned" "reclaimed=${RCB6:-?} row=$(rowa "$TB6")"
 
 # =============================================================================
 # C) the class the board can name

@@ -16,6 +16,9 @@
 #      read as idle, is NOT reclaimed (rule b suppressed);
 #   2  the same row, aged past the hard-cap budget, is NOT reclaimed either
 #      (rule c suppressed) — neither arm fires just because the other didn't;
+#      DIVE-6040 scoped this to a grader that is mid-turn: at rest, past
+#      _HB_GRADE_ORPHAN_MIN, with no verdict, the row goes back to the
+#      verifier's own queue with the delivery intact (2b);
 #   3  CONTROL — once the verifier explicitly ACKs (handoff_ack_at set), the
 #      SAME row aged the SAME way IS reclaimed normally: the guard is scoped to
 #      the unacked state, not a blanket exemption for verifier-owned rows;
@@ -139,13 +142,29 @@ read -r RC1_N _ < <(_hb_reclaim olivia 30)
 # =============================================================================
 # 2) hard cap (c) suppressed on the same state, aged well past the budget
 # =============================================================================
+# DIVE-6040 narrowed this arm to a LIVE grading session (the seat reads
+# mid-turn): past the budget with the seat at rest and no verdict, the grade is
+# orphaned and goes back to the verifier's own queue — arm 2b.
 reset_all
 T2=$(mk_delivered_unacked)
 db "UPDATE tasks SET started_at=datetime('now','-200 minutes') WHERE id=${T2};"
+_hb_agent_idle() { return 1; }
 read -r RC2_N _ < <(_hb_reclaim olivia 30)
+_hb_agent_idle() { return 0; }
 [[ "$(row "$T2")" == in_progress\|* ]] && (( ${RC2_N:-1} == 0 )) \
-  && ok_t "unacked verifier delivery, past the hard-cap budget -> NOT reclaimed" \
+  && ok_t "unacked verifier delivery, past the hard-cap budget, grader mid-turn -> NOT reclaimed" \
   || bad_t "hard-cap arm reclaimed an unacked delivery" "reclaimed=${RC2_N:-?} row=$(row "$T2")"
+
+# 2b) DIVE-6040: the same row with the grader at rest — its session ended with
+# no verdict. Back to todo on the VERIFIER, never handed to the maker.
+reset_all
+T2B=$(mk_delivered_unacked)
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes') WHERE id=${T2B};"
+read -r RC2B_N _ < <(_hb_reclaim olivia 30)
+[[ "$(rowa "$T2B")" == "todo|olivia" ]] && (( ${RC2B_N:-0} == 1 )) \
+  && [[ -n "$(db "SELECT handoff_delivered_at FROM tasks WHERE id=${T2B};")" ]] \
+  && ok_t "orphaned grade (no verdict, seat at rest, past N) -> todo on the verifier, delivery kept (DIVE-6040)" \
+  || bad_t "orphaned grade was not returned to the verifier's queue" "reclaimed=${RC2B_N:-?} row=$(rowa "$T2B")"
 
 # =============================================================================
 # 3) CONTROL — once ACKed, the same aging reclaims normally (guard is narrow)

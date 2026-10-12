@@ -445,10 +445,12 @@ sites=$(grep -c "_hb_reclaim_to_todo \"\$name\"" src/cmd_heartbeat.sh)
 #   3. rule (c) budget overrun, repeat-offender requeue  (DIVE-4111)
 #   4. rule (c) budget overrun, first escalation
 #   5. rule (b) idle stall
-# Three RULES still, as before: the two additions are new ENTRY POINTS into them,
-# not new rules, which is why the per-rule arms above remain a complete grade.
-[[ "$sites" == "5" ]] \
-  && ok_t "structural: all FIVE reclaim call sites route through _hb_reclaim_to_todo (3 rules, 5 entry points)" \
+#   6. orphaned grade, no maker on the row                (DIVE-6040)
+# The sixth is the verifier-latency skip's own exit: graded by
+# tests/heartbeat_dispatcher_claim_unit.sh [6040] and
+# tests/heartbeat_claim_outlives_verdict_unit.sh B6.
+[[ "$sites" == "6" ]] \
+  && ok_t "structural: all SIX reclaim call sites route through _hb_reclaim_to_todo" \
   || bad_t "structural: reclaim call sites changed — re-grade the per-rule arms" "sites=[$sites]"
 # The escalation pause is a real, findable site, not a number talked up in a
 # comment: if it stops erasing the clock, `inline` reads 0 here and this guard goes
