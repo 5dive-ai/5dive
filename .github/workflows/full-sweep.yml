@@ -210,6 +210,16 @@ on:
 # The group is keyed on the ref, so a PR-triggered sweep (the tiering-machinery paths
 # above) is never cancelled by a merge to main.
 #
+# DIVE-6041: AND ON THE EVENT, so the nightly never cancels a push sweep. Keyed on the
+# ref alone, the 03:17Z schedule run joined the push run's group and cancelled it — on
+# the SAME sha, so the "strict ancestor graded later" argument above does not hold: the
+# cancelled run's check runs stay on the commit and GitHub's rollup for main reads
+# FAILURE although the survivor passed. Measured: 85c4c835 (2026-10-11, push run
+# 38129100920 cancelled by schedule 38130677493) sat red ~16h because no later push
+# landed to replace it; 5530a7ae on 10-10 was the same shape. Per-event lanes keep the
+# burst collapse (push cancels push, i.e. an OLDER sha) and let the nightly run beside
+# a push sweep instead of through it — at most one extra sweep a day.
+#
 # This block LIVES BELOW `on:` and that placement is load-bearing, not cosmetic. Put
 # it between two `on:` children and `pull_request:` becomes a child of `concurrency:`;
 # yaml.safe_load accepts that file, this repo's own tier harness passes on it, and
@@ -217,7 +227,7 @@ on:
 # Measured here on 2026-08-04, which is the second time that gap has been paid
 # (DIVE-2539/2540): community/wiki/an-actions-expression-is-parsed-inside-shell-comments.md
 concurrency:
-  group: full-sweep-${{ github.ref }}
+  group: full-sweep-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:

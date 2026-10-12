@@ -997,6 +997,43 @@ then
   ok "the push trigger is cost-bounded: concurrency cancels in progress, grouped per REF so a PR sweep is not cancelled by a merge"
 else bad "the push trigger is cost-bounded: concurrency cancels in progress, grouped per REF so a PR sweep is not cancelled by a merge" \
        "$(grep -A3 '^concurrency:' "$SWEEP" 2>&1)"; fi
+# DIVE-6041 REPLAY: a push run followed by the nightly schedule run on the SAME sha.
+# GitHub cancels an in-progress run only when the newcomer resolves to the same group,
+# so evaluate the group for both events: different groups mean the push run completes,
+# no cancelled check run is left on the commit, and main's rollup reads SUCCESS (the
+# 85c4c835 incident: schedule 38130677493 cancelled push 38129100920 and main sat red
+# ~16h). The burst collapse must survive: two pushes to main still share one group.
+# A group carrying any expression this evaluator cannot resolve is a FAIL, never a pass.
+_sweep_group() {  # <workflow file> <event_name> <ref>
+  python3 - "$1" "$2" "$3" <<'PY2'
+import re, sys, yaml
+g = str(((yaml.safe_load(open(sys.argv[1])) or {}).get('concurrency') or {}).get('group', ''))
+g = re.sub(r'\$\{\{\s*github\.event_name\s*\}\}', sys.argv[2], g)
+g = re.sub(r'\$\{\{\s*github\.ref\s*\}\}', sys.argv[3], g)
+if not g or '${{' in g:
+    sys.exit(1)
+print(g)
+PY2
+}
+_replay_6041() {  # <workflow file> -> exit 0 when the replay holds
+  local push sched push2 pr
+  push=$(_sweep_group "$1" push refs/heads/main) || return 1
+  sched=$(_sweep_group "$1" schedule refs/heads/main) || return 1
+  push2=$(_sweep_group "$1" push refs/heads/main) || return 1
+  pr=$(_sweep_group "$1" pull_request refs/pull/1/merge) || return 1
+  [[ "$push" != "$sched" && "$push" == "$push2" && "$pr" != "$push" ]]
+}
+if _replay_6041 "$SWEEP"; then
+  ok "DIVE-6041 replay: a schedule run on main's sha cannot cancel the push run (separate groups), pushes still collapse"
+else bad "DIVE-6041 replay: a schedule run on main's sha cannot cancel the push run (separate groups), pushes still collapse" \
+       "$(grep -A2 '^concurrency:' "$SWEEP" 2>&1)"; fi
+# Control: the pre-fix group (ref only) must FAIL the same replay, or the arm grades nothing.
+_m6041="$(mktemp)"
+sed 's/^  group: full-sweep-.*$/  group: full-sweep-${{ github.ref }}/' "$SWEEP" > "$_m6041"
+if ! cmp -s "$_m6041" "$SWEEP" && ! _replay_6041 "$_m6041"; then
+  ok "DIVE-6041 control: the pre-fix ref-only group FAILS the replay (schedule shares the push run's group)"
+else bad "DIVE-6041 control: the pre-fix ref-only group FAILS the replay" "$(grep -A2 '^concurrency:' "$_m6041" 2>&1)"; fi
+rm -f "$_m6041"
 # Anchor: the neighbour workflow must NOT satisfy the same assertion, or "full-sweep
 # has push: main" is a claim about every workflow in the directory and grades nothing.
 if ! grep -qx 'schedule' <<<"$(_wf_on .github/workflows/unit-tests.yml)"; then
