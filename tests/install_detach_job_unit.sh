@@ -33,10 +33,18 @@ check() { # check <label> <condition-rc> [detail]
 
 mkdir -p "$TMP/stubs"
 # systemctl: is-active reads the marker the fake unit holds; reset-failed is a no-op.
+# RACE_FINISH=1 makes the job finish INSIDE the is-active call — the exit record
+# lands and the unit is reported gone — which is the window DIVE-6078 measured.
 cat >"$TMP/stubs/systemctl" <<STUB
 #!/usr/bin/env bash
 case "\$1" in
-  is-active) for u in "\$@"; do :; done; [[ -f "$TMP/active-\$u" ]] ;;
+  is-active)
+    if [[ "\${RACE_FINISH:-}" == 1 ]]; then
+      mkdir -p "$TMP/bin" && printf '#!/bin/sh\\n' >"$TMP/bin/hermes" && chmod +x "$TMP/bin/hermes"
+      echo '{"type":"hermes","state":"installed","exitCode":0,"finishedAt":"now"}' >"$TMP/jobs/hermes.status"
+      exit 3
+    fi
+    for u in "\$@"; do :; done; [[ -f "$TMP/active-\$u" ]] ;;
   *) exit 0 ;;
 esac
 STUB
@@ -153,6 +161,18 @@ echo '{"type":"hermes","state":"running","exitCode":null}' >"$TMP/jobs/hermes.st
 install hermes --status
 check "status: 'running' with no live unit reads as failed/interrupted" \
   "$([[ "$(j .data.state)" == failed ]] && grep -q interrupted <<<"$(j .data.message)"; echo $?)" "$OUT"
+
+# --- 5b. a job finishing between the two reads is installed, not interrupted --
+# The record says running when --status starts; the job writes "installed" and
+# its unit goes inactive before --status is done. Reading the record before the
+# unit paired the stale "running" with the dead unit (DIVE-6078: v0.86.3's smoke
+# failed install-pi at 12s, inside pi's normal 12-23s).
+reset
+mkdir -p "$TMP/jobs"
+echo '{"type":"hermes","state":"running","exitCode":null}' >"$TMP/jobs/hermes.status"
+RACE_FINISH=1 install hermes --status
+check "status: a job finishing mid-read reads installed, never interrupted" \
+  "$([[ "$(j .data.state)" == installed && "$(j .data.exitCode)" == 0 ]] && ! grep -q interrupted <<<"$(j .data.message)"; echo $?)" "$OUT"
 
 # --- 6. nothing ran: idle; already installed: short-circuit ------------------
 reset

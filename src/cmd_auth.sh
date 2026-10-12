@@ -668,8 +668,13 @@ _install_status() {
   local unit; unit=$(_install_job_unit "$type")
   local log="$INSTALL_JOB_DIR/$type.log" st="$INSTALL_JOB_DIR/$type.status"
   local rec='{}' state rc="null" msg active=0
-  [[ -f "$st" ]] && rec=$(jq -c '.' "$st" 2>/dev/null || echo '{}')
+  # The unit first, the record after it: the job's wrapper writes its exit
+  # record BEFORE the unit goes inactive, so an inactive unit means the record
+  # is already final. Read the other way round, a job finishing between the two
+  # reads paired a stale "running" with an inactive unit and a clean install
+  # read as interrupted (DIVE-6078, a red v0.86.3 smoke).
   systemctl is-active --quiet "$unit" 2>/dev/null && active=1
+  [[ -f "$st" ]] && rec=$(jq -c '.' "$st" 2>/dev/null || echo '{}')
   state=$(jq -r '.state // ""' <<<"$rec")
   rc=$(jq -c '.exitCode // null' <<<"$rec")
   if (( active )); then
