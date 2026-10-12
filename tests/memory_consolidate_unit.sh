@@ -592,6 +592,83 @@ grep -q 'FIRSTHALF' "$CAPT" && ok "MUTANT: the whole-file re-read is caught" || 
 source "$SRC/cmd_memory.sh"
 export HOME="$OLDHOME"
 
+echo "── atoms the live session wrote ITSELF reach the prompt (DIVE-712) ──"
+# The measured defect: a live session saves a fact by hand (Claude Code's own
+# memory writer, or `cat >`/`echo >>` on the file, or `memory add`), then a
+# later pass distils that same session and writes the fact again under a new
+# slug, usually in English beside a Russian original. The lookup only knew
+# `run:<session>`, which only consolidate writes. Own HOME: exact counts.
+OLDHOME="$HOME"; export HOME="$TMP/hand"
+HPROJ="$HOME/.claude/projects/proj"; HSTORE="$HPROJ/memory"
+mkdir -p "$HSTORE"; : > "$HSTORE/MEMORY.md"
+mk_atom() { # <file> <slug> <description> [<extra frontmatter line>]
+  printf -- '---\nname: %s\ndescription: "%s"\nmetadata:\n  type: feedback\n%s---\n\nbody\n' "$2" "$3" "${4:+$4
+}" > "$HSTORE/$1"
+}
+mk_atom feedback_check_role.md check-role "check the role card before advising" "  originSessionId: hhhh-7777"
+mk_atom feedback_stamp_other.md stamp-other "stamped by a session whose id extends this one" "  originSessionId: hhhh-77770"
+mk_atom project_cat_written.md cat-written "written with cat into the store"
+mk_atom project_write_tool.md write-tool "written with the Write tool"
+mk_atom reference_added.md added-by-name "written with memory add"
+mk_atom reference_untouched.md untouched "never named by this session"
+mk_atom reference_named_elsewhere.md named-elsewhere "a --name= that is not a memory add"
+HT="$HPROJ/hhhh-7777.jsonl"
+python3 - "$HT" "$HSTORE" <<'PY3'
+import json, sys
+p, store = sys.argv[1], sys.argv[2]
+def tu(name, inp):
+    return {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":name,"input":inp}]}}
+recs = [
+  {"type":"user","message":{"role":"user","content":"HANDPART the qa agent is a layout gate, not code review"}},
+  tu("Bash", {"command": "cd %s && cat > project_cat_written.md <<'EOF'\n---\nEOF" % store}),
+  tu("Write", {"file_path": store + "/project_write_tool.md", "content": "x"}),
+  tu("Bash", {"command": "5dive memory add --name=added-by-name --type=reference <<<'x'"}),
+  tu("Bash", {"command": "5dive hire-link --create --name=named-elsewhere"}),
+  {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Saved."}]}},
+]
+with open(p, "w") as fh:
+    for r in recs: fh.write(json.dumps(r) + "\n")
+PY3
+touch -d '3 hours ago' "$HT"
+
+P=$(_memory_consolidate_prior_atoms "$HSTORE" hhhh-7777 "$HT")
+grep -qx -- '- check-role — check the role card before advising' <<<"$P" && ok "originSessionId stamp: found" || bad "originSessionId stamp: found"
+grep -q 'stamp-other' <<<"$P" && bad "  ...and an id that merely STARTS with it is not" || ok "  ...and an id that merely STARTS with it is not"
+grep -qx -- '- cat-written — written with cat into the store' <<<"$P" && ok "transcript: a file the session wrote with cat is found" || bad "transcript: a file the session wrote with cat is found"
+grep -qx -- '- write-tool — written with the Write tool' <<<"$P" && ok "transcript: a Write tool file_path is found" || bad "transcript: a Write tool file_path is found"
+grep -qx -- '- added-by-name — written with memory add' <<<"$P" && ok "transcript: a memory add --name= is found" || bad "transcript: a memory add --name= is found"
+grep -q 'named-elsewhere' <<<"$P" && bad "  ...a --name= on another verb is not" || ok "  ...a --name= on another verb is not"
+grep -q 'untouched' <<<"$P" && bad "  ...an atom the session never named is not" || ok "  ...an atom the session never named is not"
+check "  ...stamped atoms come first" "$(head -1 <<<"$P")" "- check-role — check the role card before advising"
+P=$(_memory_consolidate_prior_atoms "$HSTORE" hhhh-7777)
+check "no transcript: only the stamped atom, as before" "$P" "- check-role — check the role card before advising"
+P=$(_memory_consolidate_prior_atoms "$HSTORE" hhhh-7777 "$HPROJ/no-such.jsonl")
+check "an unreadable transcript is not an error" "$P" "- check-role — check the role card before advising"
+
+rm -f "$CAPT"
+run --distiller="$CEMPTY" --max-sessions=1 >/dev/null 2>&1
+grep -q 'HANDPART' "$CAPT" && ok "a FIRST pass over the session reached the distiller" || bad "a FIRST pass over the session reached the distiller"
+grep -q '^ATOMS ALREADY WRITTEN FROM THIS SESSION, by an earlier pass or by the session itself' "$CAPT" \
+  && ok "  ...and it is told the session already wrote atoms" || bad "  ...and it is told the session already wrote atoms"
+for want in '- check-role — check the role card before advising' '- cat-written — written with cat into the store' \
+            '- write-tool — written with the Write tool' '- added-by-name — written with memory add'; do
+  grep -qxF -- "$want" "$CAPT" && ok "  ...prompt names: ${want#- }" || bad "  ...prompt names: ${want#- }"
+done
+grep -q 'untouched' "$CAPT" && bad "  ...and not an atom the session never named" || ok "  ...and not an atom the session never named"
+grep -q 'in this language or another' "$CAPT" && ok "  ...and that a translation is the same fact" || bad "  ...and that a translation is the same fact"
+
+echo "── MUTANT: the pre-fix lookup (run:<session> only) must go red ──"
+check "BEFORE: the live function hands the transcript to the lookup" "$(declare -f _memory_consolidate | grep -c '_memory_consolidate_prior_atoms "$dir" "$sid" "$t"')" "1"
+eval "$(declare -f _memory_consolidate | sed 's/_memory_consolidate_prior_atoms "$dir" "$sid" "$t"/_memory_consolidate_prior_atoms "$dir" "$sid"/')"
+check "AFTER: the mutation took" "$(declare -f _memory_consolidate | grep -c '_memory_consolidate_prior_atoms "$dir" "$sid" "$t"')" "0"
+rm -f "$CAPT"
+run --distiller="$CEMPTY" --max-sessions=1 --force >/dev/null 2>&1
+grep -q 'HANDPART' "$CAPT" && ok "MUTANT: the stub still ran" || bad "MUTANT: the stub still ran"
+grep -q 'cat-written' "$CAPT" && bad "MUTANT: the hand-written atom goes missing" || ok "MUTANT: the hand-written atom goes missing"
+# shellcheck source=/dev/null
+source "$SRC/cmd_memory.sh"
+export HOME="$OLDHOME"
+
 echo "── the distiller's own runs are never distilled, and never take a real session's slot ──"
 # `claude --print` saves the distiller's session under the CALLER's cwd (the
 # heartbeat lane runs from /root, so `-root/`). Newest-first used to hand the
