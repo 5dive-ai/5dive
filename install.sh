@@ -1123,7 +1123,11 @@ if [ -r /etc/5dive/connectors/tools.sh ]; then . /etc/5dive/connectors/tools.sh;
 # go to ~/.local (bins in ~/.local/bin). npm's default prefix is root-owned /usr,
 # and Ubuntu marks the system python externally managed, which refuses even
 # --user installs; a seat's own ~/.local cannot break the system's packages.
-if [ "$(id -u)" != 0 ] && [ -n "${HOME:-}" ]; then
+# DIVE-6021: no PATH-resolved command in this file. Every bash script sources it,
+# so a test's `#!/bin/bash` stub of a command called here re-enters it without
+# bound (a fork bomb on the seat). EUID is a bash builtin, and only bash reads
+# BASH_ENV; the absolute /usr/bin/id is the fallback no PATH stub can shadow.
+if [ "${EUID:-$(/usr/bin/id -u)}" != 0 ] && [ -n "${HOME:-}" ]; then
   case ":${PATH:-}:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:${PATH:-/usr/bin:/bin}"; export PATH ;; esac
   if [ -z "${NPM_CONFIG_PREFIX:-}${npm_config_prefix:-}" ] && [ ! -s "$HOME/.nvm/nvm.sh" ]; then
     NPM_CONFIG_PREFIX="$HOME/.local"; export NPM_CONFIG_PREFIX

@@ -140,6 +140,44 @@ outsider "$SH" 'echo ok' >"$TMP/out3" 2>"$TMP/err3"
 [[ ! -s "$TMP/err3" && "$(cat "$TMP/out3")" == ok ]] && ok_t "T9 untraversable keys dir: empty stderr, rc 0" || bad_t "T9 dir" "out=$(cat "$TMP/out3") err=$(cat "$TMP/err3")"
 chmod 755 "$FIVEDIVE_CONNECTOR_DIR"
 
+# --- T13: a PATH stub of a command the shim calls must not re-enter it (DIVE-6021)
+# Only bash reads BASH_ENV, and it reads it in every bash script, a test's
+# `#!/bin/bash` stubs included. The 0.x shim ran a bare `$(id -u)`: with an id stub
+# first on PATH each level sourced the shim, which ran the stub, which sourced the
+# shim... unbounded, and the stub body never ran (a seat hit TasksMax). The depth
+# guard prepended below stops a recursing shim at 20 levels instead of letting the
+# control fork thousands of processes on the host; a timeout bounds the whole arm.
+mkdir -p "$TMP/t13/bin"
+printf '#!/bin/bash\nprintf ran >> "$T13_LOG"\necho 4242\n' > "$TMP/t13/bin/id"
+chmod +x "$TMP/t13/bin/id"
+t13_guard='T13_D=$((${T13_D:-0}+1)); export T13_D; if [ "$T13_D" -gt 20 ]; then printf deep > "$T13_DEEP"; exit 97; fi'
+t13_run() { # <shim text> -> "rc=<rc> ran=<stub bodies run> deep=<0|1>"
+  printf '%s\n%s\n' "$t13_guard" "$1" > "$TMP/t13/env.sh"
+  : > "$TMP/t13/log"; rm -f "$TMP/t13/deep"
+  timeout 5 env -u T13_D BASH_ENV="$TMP/t13/env.sh" PATH="$TMP/t13/bin:$PATH" \
+    T13_LOG="$TMP/t13/log" T13_DEEP="$TMP/t13/deep" /bin/bash -c 'id -u' >/dev/null 2>&1
+  local rc=$?
+  printf 'rc=%s ran=%s deep=%s' "$rc" "$(wc -c < "$TMP/t13/log" | tr -d ' ')" "$([[ -e "$TMP/t13/deep" ]] && echo 1 || echo 0)"
+}
+got=$(t13_run "$shim")
+[[ "$got" == "rc=0 ran=3 deep=0" ]] \
+  && ok_t "T13 the shipped shim with a bash id stub first on PATH: rc 0, stub body ran once, no recursion" \
+  || bad_t "T13 shipped shim recursed or failed" "$got (want rc=0 ran=3 deep=0)"
+old_shim="${shim//\$\{EUID:-\$(\/usr\/bin\/id -u)\}/\$(id -u)}"
+[[ "$old_shim" != "$shim" && "$old_shim" == *'"$(id -u)"'* ]] \
+  && ok_t "T13 control shim: the pre-fix bare \$(id -u) text" || bad_t "T13 control rewrite (shim no longer carries the EUID line)" "$old_shim"
+got=$(t13_run "$old_shim")
+# (The guard's exit unwinds the chain, so stub bodies do run on the way back up
+# here; without it none would: each level blocks on the next.)
+[[ "$got" == *"deep=1"* ]] \
+  && ok_t "T13 control: the pre-fix shim re-enters itself past 20 levels" \
+  || bad_t "T13 control (the arm cannot see the recursion)" "$got"
+# Captured first, not piped: a pipe into `grep -q` is an EPIPE site (B3's census).
+t13_body=$(grep -vE '^[[:space:]]*#' <<<"$shim")
+! grep -qE '\$\((id|whoami|getent|stat|readlink|uname)\b' <<<"$t13_body" \
+  && ok_t "T13 no PATH-resolved command substitution left in the shim" \
+  || bad_t "T13 shim calls a stubbable command" "$(grep -nE '\$\(' <<<"$shim")"
+
 # --- T10: ls after the LAST key is removed, under the CLI's own errexit ----------
 # The harness runs `set +e`, which hides a pipefail exit; the real CLI does not.
 for t in elevenlabs meta; do run rm "$t" >/dev/null; done
