@@ -62,10 +62,21 @@ cat >"$TMP/bin/sudo" <<'STUB'
 #!/usr/bin/env bash
 printf 'BOT %s\n' "$*" >>"${BOT_LOG:-/dev/null}"
 for a in "$@"; do [[ "$a" == "-l" ]] && exit "${SUDO_LIST_RC:-0}"; done
-printf 'error: machine-account credential missing (/etc/5dive/connectors/github-bot.env) — 5dive secret write GH_BOT_TOKEN --connector=github-bot\n' >&2
+printf '%s\n' "${BOT_ERR:-error: machine-account credential missing (/etc/5dive/connectors/github-bot.env) — 5dive secret write GH_BOT_TOKEN --connector=github-bot}" >&2
 exit 1
 STUB
 chmod +x "$TMP/bin/sudo"
+
+# --- stub gh (DIVE-6051 arms): `auth token` resolves nothing, so the only token
+#     is the one an arm puts in GH_TOKEN; `pr list` fails with GH_LIST_ERR. The
+#     host's real gh login must never reach the scan these arms grade.
+cat >"$TMP/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" == "auth" && "$2" == "token" ]] && exit 1
+printf '%s\n' "${GH_LIST_ERR:-gh stub: no fixture}" >&2
+exit 1
+STUB
+chmod +x "$TMP/bin/gh"
 PATH="$TMP/bin:$PATH"; export PATH
 
 # shellcheck disable=SC1090
@@ -85,6 +96,7 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 tasks_db_init
+_tasks_db_migrate
 task_need_notify() { :; }
 audit_log() { :; }
 unset GH_TOKEN GITHUB_TOKEN
@@ -206,6 +218,67 @@ if declare -F _merge_landed_probe >/dev/null 2>&1; then
 else
   bad_t "T7 _merge_landed_probe not loaded" "the symptom arm cannot be graded; check the source list above"
 fi
+
+# --- T8-T11 (DIVE-6051): the UNVERIFIED-close CLASS, on the same crossing. -----
+# The rail selection above was moved to availability by DIVE-585; the relabel in
+# the repo scan (`cmd_task_done`, status.sh) was left on permission. On a seat with
+# the grant and no connector, a 0-of-N scan was therefore classed `scan-failed` —
+# "often transient; the credential is not implicated" — about a missing credential.
+# Graded at the verb: a real `task done` on an unbound row, the scan's own audit
+# row and the persisted reading that `doctor --category=creds` prints.
+#
+# MUTATION GRADE — RUN against this worktree (2026-10-12): restore
+# `! _gate_gh_bot_ok` at the relabel -> T8's three arms red, T9-T11 green.
+export FIVE_GATE_REPOS="o/r1 o/r2"
+export SUDO_USER=""
+seed()    { db "INSERT INTO tasks (ident, title, body, status, created_by, assignee)
+                  VALUES ('$1','t','','in_progress','main','main');"; }
+reading() { _gate_vis_field "$(_gate_vis_dir)/$(_gate_vis_slugify "$(_gate_vis_seat)").reading" "$1"; }
+close_unbound() {  # <ident> -> OUT, RC
+  rm -rf "$(_gate_vis_dir)" 2>/dev/null
+  seed "$1"; OUT=$(cmd_task_done "$1" --result='research note' 2>&1); RC=$?
+}
+
+# T8 — THE FIX: grant present, credential ABSENT, no token, anon declines.
+set_rails 0 1 1; unset GH_TOKEN BOT_ERR GH_LIST_ERR
+close_unbound N-8
+if [[ $RC -eq 0 && "$OUT" == *"no-gh-rail-for-listing"* && "$OUT" == *"the box owner provisions one"* ]]; then
+  ok_t "T8 grant without credential: the close says no rail, and who provisions one"
+else
+  bad_t "T8 THE FIX: classed as something other than no-rail" "rc=$RC out=$OUT"
+fi
+[[ "$OUT" != *"often transient"* ]] \
+  && ok_t "T8 and it no longer calls a missing credential transient" \
+  || bad_t "T8 still says transient" "out=$OUT"
+[[ "$(reading class)" == "no-rail" && "$(reading reason)" == "no-gh-rail-for-listing" ]] \
+  && ok_t "T8 the standing reading doctor prints records class=no-rail" \
+  || bad_t "T8 recorded reading" "class=$(reading class) reason=$(reading reason)"
+
+# T9 — CONTROL: no grant at all is still no-rail (the pre-fix behaviour, kept).
+set_rails 1 1 1
+close_unbound N-9
+[[ "$(reading class)" == "no-rail" ]] \
+  && ok_t "T9 no grant, no credential: still no-rail (unchanged)" \
+  || bad_t "T9 control moved" "class=$(reading class) out=$OUT"
+
+# T10 — NO OVER-CORRECTION: credential PRESENT and the bot rail fails on something
+# that is not visibility. That one IS a scan failure and must stay one.
+set_rails 0 0 1; export BOT_ERR='HTTP 502: Bad Gateway (https://api.github.com/graphql)'
+close_unbound N-10
+[[ "$(reading class)" == "scan-failed" && "$(reading reason)" == "partial-repo-scan-0-of-2" ]] \
+  && ok_t "T10 credential present + a non-visibility error: still scan-failed" \
+  || bad_t "T10 over-corrected" "class=$(reading class) reason=$(reading reason) out=$OUT"
+unset BOT_ERR
+
+# T11 — NO OVER-CORRECTION: a token that cannot see the repos is credential-blind,
+# not no-rail — the token arm of the relabel's guard, independent of the bot.
+set_rails 0 1 1
+export GH_TOKEN=tok-6051 GH_LIST_ERR="GraphQL: Could not resolve to a Repository with the name 'o/r1'. (repository)"
+close_unbound N-11
+[[ "$(reading class)" == "credential-blind" ]] \
+  && ok_t "T11 a resolved token blind to every repo: still credential-blind" \
+  || bad_t "T11 over-corrected" "class=$(reading class) reason=$(reading reason) out=$OUT"
+unset GH_TOKEN GH_LIST_ERR FIVE_GATE_REPOS
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1
