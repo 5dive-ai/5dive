@@ -148,8 +148,11 @@ Agents:
   5dive agent rotation get <agent>                   # DIVE-4416: the seat's login pool — which accounts it
                                                      # may rotate through, which one is current, and any
                                                      # cooldowns. Read-only, no lock.
-  5dive agent rotation set <agent> [--enabled=true|false] [--accounts=a,b,c]
-                                                     # enable/disable rotation for the seat and set the pool
+  5dive agent rotation set <agent> [--enabled=true|false] [--balance=true|false] [--accounts=a,b,c]
+                                                     # enable/disable rotation for the seat and set the pool;
+                                                     # --balance=true also moves the seat at a fresh task
+                                                     # boundary when its account's 7d is 15+ points above the
+                                                     # least-used one, so the pool drains evenly (DIVE-6106)
   5dive agent rotation rotate <agent> [--cooldown-current=<epoch>] [--require-live-headroom]
                                      [--if-current-near-wall]
                                                      # move the seat onto the next account in its pool;

@@ -99,6 +99,19 @@ account_binding_latest() {
   return 0
 }
 
+# account_binding_since <agent> — epoch of the agent's newest binding event, or
+# empty when it has none. DIVE-6106: a statusline cache older than this was
+# rendered on the seat's PREVIOUS account and must not be read as this one's.
+account_binding_since() {
+  local agent="${1:-}" db
+  [[ -n "$agent" ]] || return 0
+  _account_history_readable || return 0
+  db=$(account_history_db)
+  sqlite3 -cmd ".timeout 5000" "$db" \
+    "SELECT MAX(ts) FROM account_binding_events WHERE agent=$(sqlq "$agent");" 2>/dev/null || true
+  return 0
+}
+
 # account_binding_at <agent> <epoch> — the account that was live for <agent> at
 # <epoch>: the newest event at or before it. EMPTY means "no event that old" —
 # the caller must then say so (`current-binding-fallback` / `unknown`) rather

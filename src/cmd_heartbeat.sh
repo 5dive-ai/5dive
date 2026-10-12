@@ -1493,14 +1493,30 @@ _hb_row_note() {
 # was actually changed; 1 is a measured/no-op result and 2 is an execution or
 # envelope failure.  The caller defers the wake on 0 so cmd_config's scheduled
 # bounce completes before any task text reaches the seat.
+#
+# DIVE-6106 — BALANCE MODE rides the same hook and nothing else. When the
+# near-wall check says the current account is clear and the seat has
+# rotation.balance on, `rotation_balance_rotate` may still move it so the pool
+# drains evenly. The caller hands in the boundary facts only it knows (idle with
+# no live shell, fresh wake, row never started); a two-argument call carries
+# none of them and therefore can never balance-move. One balance move per tick,
+# fleet-wide (_HB_BALANCE_TICK_MOVED, reset by cmd_heartbeat_tick). A balance
+# failure is never rc 2: the near-wall answer already stood, so dispatch goes on.
 _HB_BOUNDARY_ROTATION_REASON=""
 _HB_BOUNDARY_ROTATION_FROM=""
 _HB_BOUNDARY_ROTATION_TO=""
-_hb_rotate_at_dispatch_boundary() { # <agent> <registry-snapshot>
-  local name="$1" reg="${2:-}" out enabled
+_HB_BOUNDARY_ROTATION_KIND=""
+_HB_BOUNDARY_ROTATION_FROM7=""
+_HB_BOUNDARY_ROTATION_TO7=""
+_HB_BALANCE_TICK_MOVED=0
+_hb_rotate_at_dispatch_boundary() { # <agent> <registry-snapshot> [<fresh> <idle> <new-task>]
+  local name="$1" reg="${2:-}" fresh="${3:-false}" idle="${4:-false}" newtask="${5:-false}" out enabled
   _HB_BOUNDARY_ROTATION_REASON=""
   _HB_BOUNDARY_ROTATION_FROM=""
   _HB_BOUNDARY_ROTATION_TO=""
+  _HB_BOUNDARY_ROTATION_KIND=""
+  _HB_BOUNDARY_ROTATION_FROM7=""
+  _HB_BOUNDARY_ROTATION_TO7=""
   enabled=$(jq -r --arg n "$name" '.agents[$n].rotation.enabled // false' <<<"$reg" 2>/dev/null) || enabled=false
   [[ "$enabled" == "true" ]] || return 1
   if ! out=$(JSON_MODE=1 with_registry_lock cmd_agent_rotation_rotate "$name" \
@@ -1513,11 +1529,35 @@ _hb_rotate_at_dispatch_boundary() { # <agent> <registry-snapshot>
   _HB_BOUNDARY_ROTATION_TO=$(jq -r '.data.to // ""' <<<"$out" 2>/dev/null) || return 2
   if jq -e '.ok == true and .data.rotated == true and (.data.to | type == "string") and (.data.to | length > 0)' \
       <<<"$out" >/dev/null 2>&1; then
+    _HB_BOUNDARY_ROTATION_KIND="near-wall"
     return 0
   fi
-  jq -e '.ok == true and .data.rotated == false' <<<"$out" >/dev/null 2>&1 && return 1
-  _HB_BOUNDARY_ROTATION_REASON="rotation returned an unreadable envelope"
-  return 2
+  jq -e '.ok == true and .data.rotated == false' <<<"$out" >/dev/null 2>&1 || {
+    _HB_BOUNDARY_ROTATION_REASON="rotation returned an unreadable envelope"
+    return 2
+  }
+  # Near-wall said no. Balance is considered only when the account is CLEAR —
+  # unmeasured stays a no-op, and a near-wall seat with no destination is the
+  # capacity alert's, not a rebalance.
+  [[ "$_HB_BOUNDARY_ROTATION_REASON" == "current account is not near its wall" ]] || return 1
+  [[ "$(jq -r --arg n "$name" '.agents[$n].rotation.balance // false' <<<"$reg" 2>/dev/null)" == "true" ]] || return 1
+  local fleet=false
+  (( ${_HB_BALANCE_TICK_MOVED:-0} )) && fleet=true
+  out=$(JSON_MODE=1 with_registry_lock rotation_balance_rotate "$name" \
+      --idle="$idle" --fresh="$fresh" --new-task="$newtask" --fleet-moved="$fleet" 2>/dev/null) || return 1
+  if jq -e '.ok == true and .data.rotated == true and (.data.to | type == "string") and (.data.to | length > 0)' \
+      <<<"$out" >/dev/null 2>&1; then
+    _HB_BOUNDARY_ROTATION_KIND="balance"
+    _HB_BOUNDARY_ROTATION_REASON=$(jq -r '.data.reason // ""' <<<"$out")
+    _HB_BOUNDARY_ROTATION_FROM=$(jq -r '.data.from // ""' <<<"$out")
+    _HB_BOUNDARY_ROTATION_TO=$(jq -r '.data.to // ""' <<<"$out")
+    _HB_BOUNDARY_ROTATION_FROM7=$(jq -r '.data.fromSeven // "?"' <<<"$out")
+    _HB_BOUNDARY_ROTATION_TO7=$(jq -r '.data.toSeven // "?"' <<<"$out")
+    _HB_BALANCE_TICK_MOVED=1
+    return 0
+  fi
+  _HB_BOUNDARY_ROTATION_REASON="current account is not near its wall; balance: $(jq -r '.data.reason // "no verdict"' <<<"$out" 2>/dev/null)"
+  return 1
 }
 
 # DIVE-3218 — consume the nudge count. Called once per delivered nudge, straight
@@ -9472,6 +9512,7 @@ _hb_quota_probe_sweep() {
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
+  _HB_BALANCE_TICK_MOVED=0   # DIVE-6106: one balance move fleet-wide per tick
   local reg now; reg=$(registry_read); now=$(date +%s)
   local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0 sk_capped=0 sk_parked=0 sk_pace=0
   local today; today=$(date +%F)   # DIVE-1858 wake-budget day key (YYYY-MM-DD)
@@ -10288,9 +10329,21 @@ cmd_heartbeat_tick() {
     # account clear/unmeasured, or no measured destination) preserves the old
     # dispatch behavior; if that account really is walled, the supervisor will
     # checkpoint the row and use the existing deduped capacity alert fallback.
+    # DIVE-6106: the balance half needs three facts only this loop holds. Idle
+    # means the idle probe said idle with NO live background shell — the
+    # active-defer escalation path reaches here with idle_rc=1 and a restart
+    # there would kill a turn. New-task means the row was never started: a
+    # 45-minute reclaim puts a started row back to todo while its seat works.
+    local _bal_idle=false _bal_new=false
+    (( idle_rc == 0 )) && [[ -z "${_HB_IDLE_BG_SHELLS:-}" ]] && _bal_idle=true
+    [[ "$(db "SELECT CASE WHEN first_started_at IS NULL AND started_at IS NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${task_id};" 2>/dev/null)" == "1" ]] && _bal_new=true
     local _boundary_rot_rc=0
-    if _hb_rotate_at_dispatch_boundary "$name" "$reg"; then
-      _hb_log "[$name] dispatch-boundary rotation ${_HB_BOUNDARY_ROTATION_FROM:--} -> ${_HB_BOUNDARY_ROTATION_TO:--} before ${task_ident}; row remains todo until the post-bounce tick (DIVE-4055)"
+    if _hb_rotate_at_dispatch_boundary "$name" "$reg" "$eff_fresh" "$_bal_idle" "$_bal_new"; then
+      if [[ "$_HB_BOUNDARY_ROTATION_KIND" == "balance" ]]; then
+        _hb_log "[$name] balance rotation ${_HB_BOUNDARY_ROTATION_FROM:--} (7d ${_HB_BOUNDARY_ROTATION_FROM7}%) -> ${_HB_BOUNDARY_ROTATION_TO:--} (7d ${_HB_BOUNDARY_ROTATION_TO7}%) before ${task_ident}: ${_HB_BOUNDARY_ROTATION_REASON}; row remains todo until the post-bounce tick (DIVE-6106)"
+      else
+        _hb_log "[$name] dispatch-boundary rotation ${_HB_BOUNDARY_ROTATION_FROM:--} -> ${_HB_BOUNDARY_ROTATION_TO:--} before ${task_ident}; row remains todo until the post-bounce tick (DIVE-4055)"
+      fi
       continue
     else
       _boundary_rot_rc=$?
