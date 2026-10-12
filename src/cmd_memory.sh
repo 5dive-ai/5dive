@@ -152,8 +152,12 @@ _memory_usage() {
       re-run is a no-op even if the ledger is lost.
       A session that GREW after it was distilled is read from where the last
       pass stopped, not from the top, and the distiller is handed the atoms
-      already written from that session (found by their `run:<session>`
-      evidence) with the instruction not to restate them. Before this, a session
+      already written from that session with the instruction not to restate
+      them. "Already written" counts the session's OWN atoms too, not only this
+      pass's: ones stamped `run:<session>` or `originSessionId: <session>`, and
+      ones the transcript's tool calls wrote (a file name or a `memory add
+      --name=`). Before DIVE-712 an atom the live session saved by hand was
+      invisible here and came back under a new slug. Before this, a session
       that grew by 1 KB was re-distilled whole and the model picked a new slug
       for the same fact, which `add` cannot catch. --force still reads the
       whole transcript. --json counts these as `processed_continued`.
@@ -1710,18 +1714,32 @@ for a in atoms[:5]:
 PYEOF
 }
 
-# _memory_consolidate_prior_atoms <store-dir> <session-id>
+# _memory_consolidate_prior_atoms <store-dir> <session-id> [<transcript>]
 # The atoms this store already holds from one session, one "- slug — description"
-# line each. Found by the `run:<session>` evidence every distilled atom carries,
-# so it holds even when the ledger was lost: the store is the record of what was
-# written, the ledger only of how far a transcript was read. Exact-id match —
-# `run:ab` must not claim the atoms of `run:abc`. Capped: this goes into a prompt.
+# line each. The store is the record of what was written, the ledger only of how
+# far a transcript was read, so this holds even when the ledger was lost.
+#
+# Two ways an atom belongs to a session, because two kinds of writer exist:
+#   - STAMPED. A distilled atom carries `run:<session>` evidence; Claude Code's
+#     own memory writer stamps `originSessionId: <session>`. Exact-id match —
+#     `run:ab` must not claim the atoms of `run:abc`.
+#   - WRITTEN BY THE SESSION ITSELF, unstamped: `cat > atom.md`, `echo >>`,
+#     `sed -i`, a Write/Edit on the file, `memory add --name=<slug>`. Found by
+#     the transcript's tool calls naming the atom's file or slug. DIVE-712: the
+#     live session saves a fact by hand, consolidate later distils the same
+#     session, and without this the hand atom is not on the list — 9 of 9
+#     duplicate pairs on claude-konst's 2026-10-12 lint were a hand atom plus
+#     the same fact under a new slug, usually in another language.
+# A tool call that only READS an atom also names it; listing that one is a cost
+# of a few prompt lines, not a wrong answer, since a fact the session took from
+# the store is not new either. Stamped atoms first; capped: this goes into a prompt.
 _memory_consolidate_prior_atoms() {
-  python3 - "$1" "$2" <<'PYEOF'
-import glob, os, re, sys
-store, sid = sys.argv[1], sys.argv[2]
-ref = re.compile(r"run:" + re.escape(sid) + r"(?![A-Za-z0-9_-])")
-rows = []
+  python3 - "$1" "$2" "${3:-}" <<'PYEOF'
+import glob, json, os, re, sys
+store, sid, transcript = sys.argv[1], sys.argv[2], sys.argv[3]
+tail = r"(?![A-Za-z0-9_-])"
+stamp = re.compile(r"(?:run:|^\s*originSessionId:\s*[\"']?)" + re.escape(sid) + tail, re.M)
+atoms = []
 for f in sorted(glob.glob(os.path.join(store, "*.md"))):
     if os.path.basename(f) == "MEMORY.md":
         continue
@@ -1729,15 +1747,54 @@ for f in sorted(glob.glob(os.path.join(store, "*.md"))):
         text = open(f, encoding="utf-8", errors="replace").read()
     except OSError:
         continue
-    if not ref.search(text):
-        continue
     def field(k):
         m = re.search(r"^\s*" + k + r":\s*(.*)$", text, re.M)
         return m.group(1).strip().strip('"').strip("'") if m else ""
     name = field("name")
     if name:
-        rows.append("- %s — %s" % (name, field("description")))
-sys.stdout.write("\n".join(rows[:25]))
+        atoms.append((os.path.basename(f), name, field("description"), bool(stamp.search(text))))
+touched = set()
+if transcript and atoms:
+    by_file = {a[0]: a[1] for a in atoms}
+    names = {a[1] for a in atoms}
+    file_re = re.compile(r"(?<![A-Za-z0-9_.-])(" + "|".join(re.escape(k) for k in by_file) + r")(?![A-Za-z0-9_.-])")
+    name_re = re.compile(r"--name[= ][\"']?([a-z0-9][a-z0-9-]*)")
+    def strings(v):
+        if isinstance(v, str):
+            yield v
+        elif isinstance(v, dict):
+            for x in v.values():
+                yield from strings(x)
+        elif isinstance(v, list):
+            for x in v:
+                yield from strings(x)
+    try:
+        fh = open(transcript, encoding="utf-8", errors="replace")
+    except OSError:
+        fh = None
+    if fh is not None:
+        with fh:
+            for line in fh:
+                if '"tool_use"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                content = (rec.get("message") or {}).get("content")
+                if not isinstance(content, list):
+                    continue
+                for blk in content:
+                    if not isinstance(blk, dict) or blk.get("type") != "tool_use":
+                        continue
+                    for s in strings(blk.get("input")):
+                        for m in file_re.finditer(s):
+                            touched.add(by_file[m.group(1)])
+                        if "memory add" in s:
+                            touched.update(n for n in name_re.findall(s) if n in names)
+rows = ["- %s — %s" % (a[1], a[2]) for a in atoms if a[3]]
+rows += ["- %s — %s" % (a[1], a[2]) for a in atoms if not a[3] and a[1] in touched]
+sys.stdout.write("\n".join(rows[:40]))
 PYEOF
 }
 
@@ -1882,16 +1939,18 @@ _memory_consolidate() {
     fi
     processed=$((processed+1))
     [ "$from" -gt 0 ] && continued=$((continued+1)) || :
-    # What this session already produced, whether or not the ledger survived.
-    # `add` refuses a repeated slug but not a repeated fact under a new one;
-    # only the distiller can tell those apart, so it is told.
+    # What this session already produced, whether or not the ledger survived —
+    # by an earlier pass or by the session's own hand (DIVE-712), which is why
+    # the transcript goes in too. `add` refuses a repeated slug but not a
+    # repeated fact under a new one; only the distiller can tell those apart,
+    # so it is told.
     local prior="" preface=""
-    prior=$(_memory_consolidate_prior_atoms "$dir" "$sid") || prior=""
+    prior=$(_memory_consolidate_prior_atoms "$dir" "$sid" "$t") || prior=""
     if [ "$from" -gt 0 ]; then
       preface="CONTINUATION: this session was already distilled up to an earlier point. The transcript below is ONLY what was written after that point."$'\n'
     fi
     if [ -n "$prior" ]; then
-      preface+="ATOMS ALREADY WRITTEN FROM THIS SESSION. Do not return any of these facts again, under the same name or a new one. Return an atom only for a durable fact none of them states; if there is none, return {\"atoms\":[]}."$'\n'"$prior"$'\n'
+      preface+="ATOMS ALREADY WRITTEN FROM THIS SESSION, by an earlier pass or by the session itself. Do not return any of these facts again, under the same name or a new one, in this language or another. Return an atom only for a durable fact none of them states; if there is none, return {\"atoms\":[]}."$'\n'"$prior"$'\n'
     fi
     [ -n "$preface" ] && preface+=$'\n' || :
     local rawf; rawf=$(mktemp "${TMPDIR:-/tmp}/5dive-mem-distill.XXXXXX") || continue
