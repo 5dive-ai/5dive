@@ -59,7 +59,7 @@ week() {
     {name:"community",acct:"chemmonitor",rate:0.21,fresh:true,seed:17},
     {name:"creative",acct:"mark",rate:0.21,fresh:true,seed:18},
     {name:"olivia",acct:"chemmonitor",rate:0.14,fresh:true,seed:19},
-    {name:"oinoa",acct:"mp",rate:0.28,fresh:true,seed:20},
+    {name:"seat12",acct:"mp",rate:0.28,fresh:true,seed:20},
     {name:"ads",acct:"mp",rate:0.14,fresh:true,seed:21},
     {name:"pinned",acct:"mp-team",rate:0.17,fresh:true,seed:22,pinBusy:true}
    ]}' | jq -c "${ROTATION_BALANCE_JQ} $(cat tests/lib/rotation_balance_sim.jq)"
