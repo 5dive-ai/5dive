@@ -499,6 +499,354 @@ rotation_live_headroom_candidates() {
   printf '%s' "$measured"
 }
 
+# ---------------------------------------------------------------------------
+# DIVE-6106 — BALANCE MODE. The near-wall path above moves a seat only once its
+# account reads >= HEADROOM_MAX_PCT, so accounts drain one after another: one is
+# walled while another sits at 20% weekly, and every seat leaving the walled one
+# lands on the same first-measured destination and bursts its 5h window.
+#
+# Balance mode moves a seat at a task boundary when its account's 7d% is more
+# than ROTATION_BALANCE_GAP_PCT above the least-used account that still has 5h
+# room. Weekly is the budget that runs out; 5h is the burst guard. It runs from
+# the heartbeat's dispatch boundary and nowhere else, and only when the boundary
+# facts the heartbeat hands in say the restart costs nothing: the seat is idle
+# with no live shell, the wake is fresh (a /clear anyway), and the row has never
+# been started (a 45-minute reclaim puts a row back to todo while its seat keeps
+# working — that is not a boundary). A non-fresh seat (main, marketing) is
+# therefore never balance-moved; it keeps the near-wall path only.
+#
+# The numbers, written down (the row asked for N to be picked and stated):
+#   GAP 15     — 7d points above the least-used account before a move. Below
+#                ~10 a seat's own week of work flips the order and it thrashes.
+#   FIVE_FLOOR 60 — never move onto an account whose 5h reads >= this. Leaves
+#                room for the arriving seat's burst (2026-08-30: two seats onto
+#                one destination read 102% 5h within 90 minutes).
+#   TIE 5      — destinations within 5 points of the lowest 7d count as tied and
+#                the one with the fewest ACTIVE seats (an in_progress row) wins.
+#                An exact-equality tie almost never happens on real readings, so
+#                an exact tie-break would never spread a stampede.
+#   SEAT_MIN 3h — at most one balance move per seat per 3h.
+#   One balance move fleet-wide per heartbeat tick (the caller enforces it).
+ROTATION_BALANCE_GAP_PCT="${ROTATION_BALANCE_GAP_PCT:-15}"
+ROTATION_BALANCE_FIVE_FLOOR_PCT="${ROTATION_BALANCE_FIVE_FLOOR_PCT:-60}"
+ROTATION_BALANCE_TIE_PCT="${ROTATION_BALANCE_TIE_PCT:-5}"
+ROTATION_BALANCE_SEAT_MIN_SECS="${ROTATION_BALANCE_SEAT_MIN_SECS:-10800}"
+ROTATION_PROBE_MODEL="${ROTATION_PROBE_MODEL:-claude-haiku-4-5}"
+
+# The decision, as jq defs, so the production call and the week-long simulation
+# harness (tests/rotation_balance_unit.sh) run the SAME text — a simulator with
+# its own copy of the rule would grade the copy.
+#
+# rank: input an array of {name, sevenPct, activeSeats}; output it ordered by
+#   preference — tied band (within tie of the lowest 7d) first, fewest active
+#   seats inside the band, then lowest 7d, then name for determinism.
+# decide: input {current, now, seatLastMoveAt, fleetMoved, boundary:{idle,fresh,
+#   newTask}, accounts:[{name, fivePct, sevenPct, asOf, activeSeats}], knobs:{gap,
+#   fiveFloor, tie, seatMinSecs, freshSecs, maxPct}}; output {move, from, to,
+#   fromSeven, toSeven, reason}.
+ROTATION_BALANCE_JQ='
+def balance_rank($tie):
+  map(. + {_s: (if (.sevenPct | type) == "number" then .sevenPct else 1000 end)})
+  | (map(._s) | min) as $lo
+  | sort_by([ (if ._s <= ($lo + $tie) then 0 else 1 end),
+              (if ._s <= ($lo + $tie) then (.activeSeats // 0) else 0 end),
+              ._s, .name ])
+  | map(del(._s));
+def balance_gate:
+  . as $in | $in.knobs as $k
+  | if ($in.boundary.idle != true) then
+      {move:false, reason:"not at a boundary: the seat is mid-turn or still has a live shell"}
+    elif ($in.boundary.fresh != true) then
+      {move:false, reason:"non-fresh wake: the restart would drop the seat'"'"'s accumulated context"}
+    elif ($in.boundary.newTask != true) then
+      {move:false, reason:"the row was already started: a reclaim is not a task boundary"}
+    elif ($in.fleetMoved == true) then
+      {move:false, reason:"fleet damping: this tick already made its one balance move"}
+    elif ((($in.seatLastMoveAt | type) == "number") and (($in.now - $in.seatLastMoveAt) < $k.seatMinSecs)) then
+      {move:false, reason:"seat damping: last balance move \($in.now - $in.seatLastMoveAt)s ago (< \($k.seatMinSecs)s)"}
+    else null end;
+def balance_pick:
+  . as $in | $in.knobs as $k
+  | ($in.accounts | map(. + {fresh: (((.asOf | type) == "number") and (($in.now - .asOf) <= $k.freshSecs)
+                                     and ((.sevenPct | type) == "number") and ((.fivePct | type) == "number"))})) as $acc
+  | ([ $acc[] | select(.name == $in.current) ] | first) as $cur
+  | if ($cur == null) or ($cur.fresh | not) then
+      {move:false, reason:"current account reading is unmeasured or stale"}
+    else
+      ([ $acc[] | select(.name != $in.current and .fresh
+                         and .fivePct < $k.fiveFloor and .sevenPct < $k.maxPct) ]) as $dest
+      | if ($dest | length) == 0 then
+          {move:false, fromSeven:$cur.sevenPct,
+           reason:"no other account has a fresh reading under the \($k.fiveFloor)% 5h burst floor"}
+        else
+          ($dest | balance_rank($k.tie) | first) as $best
+          | ([ $dest[] | .sevenPct ] | min) as $lo
+          | if ($cur.sevenPct - $lo) > $k.gap then
+              {move:true, to:$best.name, fromSeven:$cur.sevenPct, toSeven:$best.sevenPct,
+               reason:"7d gap \($cur.sevenPct - $lo) > \($k.gap) (least-used under the 5h floor reads \($lo)%); destination has \($best.activeSeats // 0) active seat(s)"}
+            else
+              {move:false, fromSeven:$cur.sevenPct, toSeven:$best.sevenPct,
+               reason:"within gap: 7d \($cur.sevenPct)% vs least-used \($lo)% (<= \($k.gap))"}
+            end
+        end
+    end;
+def balance_decide:
+  . as $in
+  | (balance_gate // balance_pick)
+  | . + {from: $in.current} | .to = (.to // null);
+'
+
+# rotation_balance_decide <input-json> — run the pure decision. Prints the
+# {move, from, to, fromSeven, toSeven, reason} object.
+rotation_balance_decide() {
+  jq -c "${ROTATION_BALANCE_JQ} balance_decide" <<<"$1"
+}
+
+# rotation_balance_rank_names <accounts-json> — names in balance preference order.
+rotation_balance_rank_names() {
+  jq -c --argjson tie "$ROTATION_BALANCE_TIE_PCT" \
+    "${ROTATION_BALANCE_JQ} if length == 0 then [] else balance_rank(\$tie) | map(.name) end" <<<"$1"
+}
+
+# account_trusted_ratelimits <account> — the account's freshest reading that
+# was actually rendered UNDER this account. account_best_ratelimits takes any
+# bound seat's statusline cache, and a seat that just moved still holds the
+# cache it rendered on its previous account until its next turn — 2026-10-03,
+# mark's 98%/7d with identical resetsAt landed on a 0% chemmonitor and held the
+# pacer. So a cache older than the seat's newest binding event is skipped. A
+# reading from the live-header probe (account_live_ratelimits, source=probe in
+# the account's usage.json) competes on asOf like any seat's.
+account_trusted_ratelimits() {
+  local account="$1" agents agent rl at since best="" best_at=-1 rec
+  agents=$(account_agents_bound "$account" 2>/dev/null) || agents="[]"
+  while IFS= read -r agent; do
+    [[ -n "$agent" ]] || continue
+    rl=$(usage_read_ratelimits "$agent" 2>/dev/null) || continue
+    [[ -n "$rl" ]] || continue
+    at=$(jq -r '.asOf // -1' <<<"$rl")
+    [[ "$at" =~ ^[0-9]+$ ]] || continue
+    since=""
+    declare -F account_binding_since >/dev/null 2>&1 && since=$(account_binding_since "$agent")
+    if [[ "$since" =~ ^[0-9]+$ ]] && (( at < since )); then
+      continue   # rendered on the seat's PREVIOUS account
+    fi
+    if (( at > best_at )); then best_at=$at; best="$rl"; fi
+  done < <(jq -r '.[]' <<<"$agents")
+  rec=$(account_usage_record_path "$account")
+  if [[ -r "$rec" ]]; then
+    rl=$(jq -c 'select(.source == "probe") | {
+          asOf, fiveHourPct: (.fiveHour.pct // null), fiveResetsAt: (.fiveHour.resetsAt // null),
+          sevenDayPct: (.sevenDay.pct // null), sevenResetsAt: (.sevenDay.resetsAt // null)}' "$rec" 2>/dev/null) || rl=""
+    if [[ -n "$rl" ]]; then
+      at=$(jq -r '.asOf // -1' <<<"$rl")
+      [[ "$at" =~ ^[0-9]+$ ]] && (( at > best_at )) && { best_at=$at; best="$rl"; }
+    fi
+  fi
+  printf '%s' "$best"
+}
+
+# account_live_ratelimits <account> — ask the provider directly: one 1-token
+# Haiku call on the account's own token, reading the
+# anthropic-ratelimit-unified-5h/7d-utilization (+ -reset) headers. Prints the
+# usage_read_ratelimits shape, or nothing on any failure (no token, no headers):
+# an absent reading is unmeasured, never 0%. The status code is NOT the test: a
+# walled account answers 429 WITH both utilization headers (5h 1.0, measured on
+# mp-team 2026-10-12) and that is a real 100% reading; the bare-call 429 carries
+# no headers at all and stays unmeasured.
+#
+# The call MUST carry the Claude Code system prompt and the oauth beta header —
+# a bare call with an OAuth token returns 429 "Error" with no headers on every
+# account, healthy ones included (main, 2026-10-12). The token goes to curl on
+# stdin (-K -), never argv. The seam _ROTATION_PROBE_CMD prints raw response
+# headers for a harness; it is never set in production.
+account_live_ratelimits() {
+  local account="$1" hdrs env tok body now
+  now=$(date +%s)
+  if [[ -n "${_ROTATION_PROBE_CMD:-}" ]]; then
+    hdrs=$("${_ROTATION_PROBE_CMD}" "$account" 2>/dev/null) || return 0
+  else
+    env="${AUTH_PROFILES_DIR}/${account}/combined.env"
+    [[ -r "$env" ]] || return 0
+    tok=$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' "$env" 2>/dev/null | head -1)
+    tok="${tok%\"}"; tok="${tok#\"}"; tok="${tok%\'}"; tok="${tok#\'}"
+    [[ -n "$tok" ]] || return 0
+    body=$(mktemp 2>/dev/null) || return 0
+    jq -cn --arg m "$ROTATION_PROBE_MODEL" \
+      '{model:$m, max_tokens:1,
+        system:"You are Claude Code, Anthropic'"'"'s official CLI for Claude.",
+        messages:[{role:"user", content:"hi"}]}' >"$body"
+    hdrs=$(printf 'header = "authorization: Bearer %s"\n' "$tok" \
+      | curl -sS -m 20 -o /dev/null -D - -K - \
+          -H "anthropic-version: 2023-06-01" \
+          -H "anthropic-beta: oauth-2025-04-20" \
+          -H "content-type: application/json" \
+          --data-binary @"$body" https://api.anthropic.com/v1/messages 2>/dev/null) || hdrs=""
+    rm -f "$body"
+    tok=""
+  fi
+  [[ -n "$hdrs" ]] || return 0
+  awk -v now="$now" '
+    { sub(/\r$/, "") }
+    tolower($1) == "anthropic-ratelimit-unified-5h-utilization:" { f = $2 }
+    tolower($1) == "anthropic-ratelimit-unified-7d-utilization:" { s = $2 }
+    tolower($1) == "anthropic-ratelimit-unified-5h-reset:"       { fr = $2 }
+    tolower($1) == "anthropic-ratelimit-unified-7d-reset:"       { sr = $2 }
+    END {
+      if (f == "" || s == "") exit 0
+      printf "{\"asOf\":%d,\"fiveHourPct\":%d,\"fiveResetsAt\":%s,\"sevenDayPct\":%d,\"sevenResetsAt\":%s}\n",
+        now, f * 100 + 0.5, (fr == "" ? "null" : fr), s * 100 + 0.5, (sr == "" ? "null" : sr)
+    }' <<<"$hdrs"
+}
+
+# account_balance_reading <account> — the trusted reading, refreshed from the
+# live headers when it is missing or older than HEADROOM_FRESH_SECS. A probed
+# reading is remembered on the account (usage.json, source=probe) so the next
+# boundary inside the freshness window does not pay for another call.
+account_balance_reading() {
+  local account="$1" rl at now live
+  now=$(date +%s)
+  rl=$(account_trusted_ratelimits "$account")
+  at=-1
+  [[ -n "$rl" ]] && { at=$(jq -r '.asOf // -1' <<<"$rl" 2>/dev/null) || at=-1; }
+  if [[ ! "$at" =~ ^[0-9]+$ ]] || (( now - at > HEADROOM_FRESH_SECS )); then
+    live=$(account_live_ratelimits "$account")
+    if [[ -n "$live" ]]; then
+      rl="$live"
+      account_usage_remember "$account" "$(jq -c '{
+        fiveHour: {pct: .fiveHourPct, resetsAt: .fiveResetsAt},
+        sevenDay: {pct: .sevenDayPct, resetsAt: .sevenResetsAt},
+        asOf, source: "probe", remembered: false}' <<<"$live")"
+    fi
+  fi
+  printf '%s' "$rl"
+}
+
+# rotation_active_seats_json — {account: <seats bound to it with an in_progress
+# row>}. "Active" is a seat that is spending now, not merely bound.
+rotation_active_seats_json() {
+  local reg="$1" busy
+  busy=$(db "SELECT DISTINCT assignee FROM tasks WHERE status='in_progress' AND assignee IS NOT NULL;" 2>/dev/null) || busy=""
+  jq -c --arg busy "$busy" '
+    ($busy | split("\n") | map(select(length > 0))) as $b
+    | reduce (.agents | to_entries[] | select(.value.authProfile != null)
+              | select(.key as $k | $b | index($k))) as $e
+        ({}; .[$e.value.authProfile] += 1)' <<<"$reg"
+}
+
+# rotation_balance_accounts_json <reg> <current> <pool-json> — the decision's
+# accounts array: the current account plus the pool, each with its balance
+# reading and active-seat count.
+rotation_balance_accounts_json() {
+  local reg="$1" current="$2" pool="$3" active out="[]" acct rl
+  active=$(rotation_active_seats_json "$reg") || active="{}"
+  [[ -n "$active" ]] || active="{}"
+  while IFS= read -r acct; do
+    [[ -n "$acct" ]] || continue
+    rl=$(account_balance_reading "$acct")
+    out=$(jq -c --arg n "$acct" --argjson rl "${rl:-null}" --argjson act "$active" '
+      . + [{name: $n,
+            fivePct: ($rl.fiveHourPct // null), sevenPct: ($rl.sevenDayPct // null),
+            asOf: ($rl.asOf // null), activeSeats: ($act[$n] // 0)}]' <<<"$out")
+  done < <(jq -r --arg cur "$current" '([$cur] + .) | unique[] | select(length > 0)' <<<"$pool")
+  printf '%s' "$out"
+}
+
+rotation_balance_knobs_json() {
+  jq -cn --argjson gap "$ROTATION_BALANCE_GAP_PCT" --argjson ff "$ROTATION_BALANCE_FIVE_FLOOR_PCT" \
+    --argjson tie "$ROTATION_BALANCE_TIE_PCT" --argjson sm "$ROTATION_BALANCE_SEAT_MIN_SECS" \
+    --argjson fr "$HEADROOM_FRESH_SECS" --argjson mx "$HEADROOM_MAX_PCT" \
+    '{gap:$gap, fiveFloor:$ff, tie:$tie, seatMinSecs:$sm, freshSecs:$fr, maxPct:$mx}'
+}
+
+# rotation_pool_json <reg> <agent> — the seat's pool minus accounts still cooling.
+rotation_pool_json() {
+  local reg="$1" name="$2" pool now
+  if [[ "$(jq -r --arg n "$name" '.agents[$n].rotation.allAccounts // false' <<<"$reg")" == "true" ]]; then
+    pool=$(rotation_eligible_accounts "$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")")
+  else
+    pool=$(jq -c --arg n "$name" '.agents[$n].rotation.accounts // []' <<<"$reg")
+  fi
+  now=$(date +%s)
+  jq -c --arg n "$name" --argjson now "$now" --argjson p "$pool" \
+    '(.agents[$n].rotation.cooldowns // {}) as $cd | [ $p[] | select(($cd[.] // 0) <= $now) ]' <<<"$reg"
+}
+
+# rotation_balance_order_candidates <reg> <candidates-json> — the near-wall
+# path's destination order when the seat has balance on: accounts under the 5h
+# burst floor first, each half in balance_rank order (lowest 7d, ties broken by
+# fewest active seats). Fixes the stampede onto the first measured account.
+rotation_balance_order_candidates() {
+  local reg="$1" candidates="$2" accts
+  accts=$(rotation_balance_accounts_json "$reg" "" "$candidates") || { printf '%s' "$candidates"; return 0; }
+  jq -c --argjson tie "$ROTATION_BALANCE_TIE_PCT" --argjson ff "$ROTATION_BALANCE_FIVE_FLOOR_PCT" \
+    "${ROTATION_BALANCE_JQ}"'
+    def under: (.fivePct | type) == "number" and .fivePct < $ff;
+    ([ .[] | select(under) ] | if length == 0 then [] else balance_rank($tie) end)
+    + ([ .[] | select(under | not) ] | if length == 0 then [] else balance_rank($tie) end)
+    | map(.name)' <<<"$accts"
+}
+
+# rotation_balance_rotate <agent> --idle=<bool> --fresh=<bool> --new-task=<bool>
+#   [--fleet-moved=<bool>]
+#
+# Internal (no CLI verb): called by the heartbeat's dispatch-boundary hook, which
+# owns the boundary facts and holds the registry lock. The boundary/damping gate
+# runs BEFORE any reading is taken, so a seat that is not at a boundary never
+# costs a probe. On a move it stamps rotation.lastBalanceAt and re-points the
+# profile through cmd_config (one binding emitter, reason rotation-balance), which
+# schedules the deferred bounce exactly as the near-wall path does.
+rotation_balance_rotate() {
+  local name="${1:-}"; shift || true
+  local idle=false fresh=false newtask=false fleet=false a
+  for a in "$@"; do
+    case "$a" in
+      --idle=*) idle="${a#--idle=}" ;;
+      --fresh=*) fresh="${a#--fresh=}" ;;
+      --new-task=*) newtask="${a#--new-task=}" ;;
+      --fleet-moved=*) fleet="${a#--fleet-moved=}" ;;
+      *) fail "$E_USAGE" "unknown flag: $a" ;;
+    esac
+  done
+  local b; for b in "$idle" "$fresh" "$newtask" "$fleet"; do
+    [[ "$b" == true || "$b" == false ]] || fail "$E_VALIDATION" "boundary flags take true|false"
+  done
+  local reg current last now input verdict pool accts
+  reg=$(rotation_require_agent "$name")
+  [[ "$(jq -r --arg n "$name" '.agents[$n].rotation.enabled // false' <<<"$reg")" == "true" \
+     && "$(jq -r --arg n "$name" '.agents[$n].rotation.balance // false' <<<"$reg")" == "true" ]] || {
+    ok "" '{rotated:false, kind:"balance", from:null, to:null, reason:"balance mode is off for this seat"}'
+    return 0
+  }
+  current=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
+  last=$(jq -c --arg n "$name" '.agents[$n].rotation.lastBalanceAt // null' <<<"$reg")
+  now=$(date +%s)
+  input=$(jq -cn --arg cur "$current" --argjson now "$now" --argjson last "$last" \
+    --argjson idle "$idle" --argjson fresh "$fresh" --argjson nt "$newtask" --argjson fm "$fleet" \
+    --argjson k "$(rotation_balance_knobs_json)" \
+    '{current:$cur, now:$now, seatLastMoveAt:$last, fleetMoved:$fm,
+      boundary:{idle:$idle, fresh:$fresh, newTask:$nt}, accounts:[], knobs:$k}')
+  verdict=$(jq -c "${ROTATION_BALANCE_JQ} balance_gate // empty" <<<"$input")
+  if [[ -z "$verdict" ]]; then
+    pool=$(rotation_pool_json "$reg" "$name")
+    accts=$(rotation_balance_accounts_json "$reg" "$current" "$pool")
+    verdict=$(rotation_balance_decide "$(jq -c --argjson a "$accts" '.accounts = $a' <<<"$input")")
+  else
+    verdict=$(jq -c --arg cur "$current" '. + {from:$cur, to:null}' <<<"$verdict")
+  fi
+  [[ -n "$verdict" ]] || fail "$E_GENERIC" "balance decision produced no verdict"
+  if [[ "$(jq -r '.move' <<<"$verdict")" != "true" ]]; then
+    ok "" '$v + {rotated:false, kind:"balance"} | del(.move)' --argjson v "$verdict"
+    return 0
+  fi
+  local target
+  target=$(jq -r '.to' <<<"$verdict")
+  reg=$(jq --arg n "$name" --argjson now "$now" '.agents[$n].rotation.lastBalanceAt = $now' <<<"$reg")
+  echo "$reg" | registry_write
+  _5D_BINDING_REASON=rotation-balance cmd_config "$name" set "auth-profile=${target}" >/dev/null
+  ok "balance-rotated '$name': ${current:--} -> ${target}" \
+     '$v + {rotated:true, kind:"balance"} | del(.move)' --argjson v "$verdict"
+}
+
 # `account usage` — per-account snapshot of Anthropic 5h / 7d limit usage,
 # backing the dashboard Switch-account modal dots and Telegram /account +
 # /usage. For each account we read the FRESHEST statusline cache across its
@@ -1154,6 +1502,8 @@ cmd_agent_rotation_get() {
     jq -cn --arg a "$active" --argjson r "$rot" '{ok:true, data:{
       active:$a,
       enabled:($r.enabled // false),
+      balance:($r.balance // false),
+      lastBalanceAt:($r.lastBalanceAt // null),
       allAccounts:($r.allAccounts // false),
       accounts:($r.accounts // []),
       cooldowns:($r.cooldowns // {}),
@@ -1164,6 +1514,7 @@ cmd_agent_rotation_get() {
     echo "agent:    $name"
     echo "active:   ${active:--}"
     echo "rotation: $(jq -r '.enabled // false' <<<"$rot")"
+    echo "balance:  $(jq -r '.balance // false' <<<"$rot")$(jq -r '(.lastBalanceAt // empty) | " (last move \(todate))"' <<<"$rot" 2>/dev/null)"
     # allAccounts is the "use every eligible profile" sentinel — show it as the
     # pool rather than the (empty) explicit list.
     if [[ "$(jq -r '.allAccounts // false' <<<"$rot")" == "true" ]]; then
@@ -1183,19 +1534,23 @@ cmd_agent_rotation_get() {
 cmd_agent_rotation_set() {
   local name="${1:-}"; shift || true
   [[ -n "$name" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent rotation set <agent> [--enabled=true|false] [--accounts=a,b,c]"
+    || fail "$E_USAGE" "usage: 5dive agent rotation set <agent> [--enabled=true|false] [--balance=true|false] [--accounts=a,b,c]"
   require_root
   ensure_state
-  local set_enabled="" set_accounts="" accounts_provided=0 a
+  local set_enabled="" set_accounts="" set_balance="" accounts_provided=0 a
   for a in "$@"; do
     case "$a" in
       --enabled=*)  set_enabled="${a#--enabled=}" ;;
       --accounts=*) set_accounts="${a#--accounts=}"; accounts_provided=1 ;;
+      --balance=*)  set_balance="${a#--balance=}" ;;
       *) fail "$E_USAGE" "unknown flag: $a" ;;
     esac
   done
-  [[ -n "$set_enabled" || $accounts_provided -eq 1 ]] \
-    || fail "$E_USAGE" "nothing to set — pass --enabled= and/or --accounts="
+  [[ -n "$set_enabled" || -n "$set_balance" || $accounts_provided -eq 1 ]] \
+    || fail "$E_USAGE" "nothing to set — pass --enabled=, --balance= and/or --accounts="
+  if [[ -n "$set_balance" ]]; then
+    case "$set_balance" in true|false) ;; *) fail "$E_VALIDATION" "--balance must be true or false" ;; esac
+  fi
   local reg type
   reg=$(rotation_require_agent "$name")
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
@@ -1244,6 +1599,9 @@ cmd_agent_rotation_set() {
   if [[ -n "$set_enabled" ]]; then
     reg=$(jq --arg n "$name" --argjson e "$set_enabled" '.agents[$n].rotation.enabled = $e' <<<"$reg")
   fi
+  if [[ -n "$set_balance" ]]; then
+    reg=$(jq --arg n "$name" --argjson b "$set_balance" '.agents[$n].rotation.balance = $b' <<<"$reg")
+  fi
   if (( accounts_provided )); then
     reg=$(jq --arg n "$name" --argjson a "$accounts_json" --argjson all "$all_accounts" \
       '.agents[$n].rotation.accounts = $a | .agents[$n].rotation.allAccounts = $all' <<<"$reg")
@@ -1269,13 +1627,15 @@ cmd_agent_rotation_set() {
        toEnabled: (.agents[$n].rotation.enabled // false)
      }' <<<"$reg")
   echo "$reg" | registry_write
-  local out_enabled out_accounts out_all
+  local out_enabled out_accounts out_all out_balance
   out_enabled=$(jq -c --arg n "$name" '.agents[$n].rotation.enabled' <<<"$reg")
   out_accounts=$(jq -c --arg n "$name" '.agents[$n].rotation.accounts' <<<"$reg")
   out_all=$(jq -c --arg n "$name" '.agents[$n].rotation.allAccounts // false' <<<"$reg")
+  out_balance=$(jq -c --arg n "$name" '.agents[$n].rotation.balance // false' <<<"$reg")
   ok "rotation config updated for '$name'" \
-     '{name:$n, enabled:$e, allAccounts:$all, accounts:$a}' \
-     --arg n "$name" --argjson e "$out_enabled" --argjson all "$out_all" --argjson a "$out_accounts"
+     '{name:$n, enabled:$e, balance:$b, allAccounts:$all, accounts:$a}' \
+     --arg n "$name" --argjson e "$out_enabled" --argjson b "$out_balance" \
+     --argjson all "$out_all" --argjson a "$out_accounts"
 }
 
 # rotation_eligible_accounts <type> — JSON array of every configured profile
@@ -1382,6 +1742,14 @@ cmd_agent_rotation_rotate() {
   # is opt-in so manual/StopFailure rotations keep their existing tiers.
   if (( require_live_headroom )); then
     candidates=$(rotation_live_headroom_candidates "$candidates")
+    # DIVE-6106: with balance on, the walled seat's destination is the
+    # least-drained account with 5h room and the fewest active seats, not the
+    # first one alphabetically — every seat leaving a wall used to land on one
+    # destination and burst its 5h window. Balance off: order unchanged.
+    if [[ "$(jq -r --arg n "$name" '.agents[$n].rotation.balance // false' <<<"$reg")" == "true" \
+          && "$candidates" != "[]" ]]; then
+      candidates=$(rotation_balance_order_candidates "$reg" "$candidates")
+    fi
   fi
 
   # Tier 1 — a candidate that isn't cooling. The common case; preference order wins.
