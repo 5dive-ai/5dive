@@ -644,7 +644,10 @@ skill_default_source() {
 # for any input — which is exactly why "a harness with no skills directory"
 # describes nothing here.
 skills_install_dir() {
-  printf '%s\n' "${SKILLS_INSTALL_DIR[${1:-}]:-.claude/skills}"
+  # `${1:-_}`, not `${1:-}`: an EMPTY assoc subscript is "bad array subscript"
+  # and printed nothing, so an agent with no type recorded got no answer at all
+  # (DIVE-6148). `_` is never a type, so it takes the fallback like any unknown.
+  printf '%s\n' "${SKILLS_INSTALL_DIR[${1:-_}]:-.claude/skills}"
 }
 
 # skills_install_dirs_all -> every distinct skills dir, one per line, sorted.
