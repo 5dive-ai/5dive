@@ -575,10 +575,11 @@ Health:
     or an editor). Needs root for the mutating and journal/cron verbs — an admin
     agent reaches them through its existing \`/usr/local/bin/5dive *\` grant.
 
-  5dive machine add <name> <user@host[:port]> | rm <name> | ls
+  5dive machine add <name> <user@host[:port]> [--note="<what it is for>"] | rm <name> | ls
     Attach any machine you can SSH into (DIVE-5622):
     agents reach it as \`ssh <name>\`; add prints the
     box's public key to put on it. Nothing provisioned.
+    --note tells Claude Code seats when to use it (DIVE-6143).
 
   5dive doctor [--fix] [--dry-run] [--caps] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|mod|policy|plugins|caps|models]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
