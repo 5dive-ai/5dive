@@ -946,6 +946,9 @@ def classify_sudo(text, measurable):
                   command.startswith("/usr/local/bin/5dive _task_channel") or
                   command in ("/usr/local/bin/5dive partner hire *", "/usr/local/bin/5dive hire-link *",
                               "/usr/local/lib/5dive/push-notify.sh *") or
+                  command in ("/usr/local/bin/5dive reflex status", "/usr/local/bin/5dive reflex status *",
+                              "/usr/local/bin/5dive reflex pick-ref", "/usr/local/bin/5dive reflex pick-ref *",
+                              "/usr/local/bin/5dive reflex login-marker", "/usr/local/bin/5dive reflex login-marker *") or
                   command.startswith("/usr/local/bin/5dive _self_account") or
                   command == "/usr/local/bin/5dive browser _connect" or
                   command.startswith("/usr/local/bin/5dive _merge_do") or

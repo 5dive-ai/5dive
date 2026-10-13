@@ -99,12 +99,13 @@ cmd_reflex() {
   local sub="${1:-help}"; shift || true
   case "$sub" in
     log)    _reflex_log "$@" ;;
-    status) _reflex_status "$@" ;;
+    status) reflex_status_elevate "$@"; _reflex_status "$@" ;;
     replay) _reflex_replay "$@" ;;
     fake)   _reflex_fake "$@" ;;
     report) _reflex_report "$@" ;;
-    login-marker) _reflex_login_marker "$@" ;;
-    pick-ref) _reflex_pick_ref "$@" ;;
+    # DIVE-6115: through a standard seat's root grant these two run narrowed.
+    login-marker) reflex_scoped_args "$sub" "$@"; _reflex_login_marker "${REFLEX_ARGS[@]+"${REFLEX_ARGS[@]}"}" ;;
+    pick-ref) reflex_scoped_args "$sub" "$@"; _reflex_pick_ref "${REFLEX_ARGS[@]+"${REFLEX_ARGS[@]}"}" ;;
     help|-h|--help)
       cat <<'EOF'
 5dive reflex — decision receipts (phase 0: receipts + offline replay, no model)

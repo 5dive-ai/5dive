@@ -113,7 +113,7 @@ reflex_model_resolve() {
 #   connector  else OPENROUTER_API_KEY (or OPENROUTER_KEY, first match — what voice
 #              reads) in the connector store, set by `5dive config openrouter-key=-`.
 # Nothing is moved or re-permissioned: a box with the root-only file keeps using
-# it, and the connector's 640 root:claude is unchanged. An override that exists
+# it, and the connector keeps its 640 root:claude-keys (DIVE-5690). An override that exists
 # but this process cannot read is still the source (the connector is not a silent
 # second choice for a caller that merely lacks root).
 _reflex_connector_key_file() { printf '%s/openrouter.env' "${CONNECTORS_DIR:-${FIVEDIVE_CONNECTOR_DIR:-/etc/5dive/connectors}}"; }
@@ -261,6 +261,94 @@ reflex_configured() {
   reflex_endpoint_resolve
   if (( _REFLEX_CUSTOM )); then printf 'true'; return 0; fi
   case "$(reflex_key_status)" in set) printf 'true' ;; unset) printf 'false' ;; *) printf 'unknown' ;; esac
+}
+
+# ── DIVE-6115: a standard seat reaches reflex through root, never the key ────
+# The box OpenRouter key is 640 root:claude-keys (DIVE-5690), and a standard
+# seat is not in claude-keys, so a seat's own `reflex status` read "unknown" and
+# the browser's broken-step retry fell back to the name match. The seat template
+# now grants three verbs (render_standard_sudoers): `reflex status`, `reflex
+# pick-ref` and `reflex login-marker`, each bare and with arguments. The key
+# is read root-side and only the decision comes back, so no seat reads it.
+#
+# Those two verbs take file paths, a --backend command and an --out file, and a
+# wildcard grant hands all of them to root. So a root process a SCOPED caller
+# started (sudo, a non-root SUDO_UID, and a caller who does not already hold the
+# whole CLI as root) has them narrowed first, by reflex_scoped_args:
+#   --backend   builtin or fake:first only; a command would run as root.
+#   --out       refused; root would write wherever the seat says.
+#   input files read AS THE CALLER (runuser) into a root-only copy, so the seat
+#               names only files it could already read.
+# A caller who holds the whole CLI (an admin seat, the owner) is unchanged.
+
+_REFLEX_SCOPED_MAX_BYTES=$((16 * 1024 * 1024))
+
+# _reflex_caller_holds_cli -> rc 0 when SUDO_USER may run any 5dive verb as root.
+# The probe verb exists in no grant, so only a whole-CLI or ALL entry matches it.
+# A failed probe (no sudo, an unknown user) is scoped: the narrowing fails closed.
+_reflex_caller_holds_cli() {
+  sudo -n -l -U "$SUDO_USER" /usr/local/bin/5dive _reflex_scope_probe >/dev/null 2>&1
+}
+# _reflex_as_caller <cmd...> — run as the sudo caller, at most 20s (a seam for the harness).
+_reflex_as_caller() { timeout 20 runuser -u "$SUDO_USER" -- "$@"; }
+
+_reflex_is_root() { (( EUID == 0 )); }
+
+# reflex_sudo_scoped -> rc 0 in a root process a scoped caller started through sudo.
+reflex_sudo_scoped() {
+  _reflex_is_root || return 1
+  [[ "${SUDO_UID:-}" =~ ^[0-9]+$ && "$SUDO_UID" != 0 && -n "${SUDO_USER:-}" ]] || return 1
+  ! _reflex_caller_holds_cli
+}
+
+# reflex_scoped_args <verb> [args...] -> REFLEX_ARGS, the args the verb may run
+# with. Unchanged for an unscoped caller. Fails (nothing runs) on a refused flag
+# or an input the caller cannot read.
+reflex_scoped_args() {
+  local verb="$1" a v d="" n=0; shift
+  REFLEX_ARGS=("$@")
+  reflex_sudo_scoped || return 0
+  REFLEX_ARGS=()
+  for a in "$@"; do
+    case "$a" in
+      --backend=*)
+        v="${a#*=}"
+        [[ "$v" == builtin || "$v" == fake:first ]] \
+          || fail "$E_PERMISSION" "reflex ${verb} through the seat's root grant runs only the built-in backend or fake:first; --backend=<command> would run that command as root. Nothing ran"
+        REFLEX_ARGS+=("$a") ;;
+      --out=*)
+        fail "$E_PERMISSION" "reflex ${verb} through the seat's root grant does not take --out: root would write the file. Drop --out and keep the printed report. Nothing ran" ;;
+      --tree=*|--logged-out=*|--logged-in=*|--compare=*)
+        v="${a#*=}"
+        if [[ -z "$d" ]]; then
+          d=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/5dive-reflex-in.XXXXXX") \
+            || fail "$E_GENERIC" "reflex ${verb}: could not stage the inputs. Nothing ran"
+          push_exit_handler "rm -rf -- '$d'"
+        fi
+        n=$((n + 1))
+        # Capped and timed: /dev/zero or a fifo the seat never writes must not
+        # fill root's disk or hold the root process.
+        _reflex_as_caller head -c "$_REFLEX_SCOPED_MAX_BYTES" -- "$v" >"$d/in.$n" 2>/dev/null \
+          || fail "$E_NOT_FOUND" "reflex ${verb}: ${SUDO_USER} cannot read ${v}. Nothing ran"
+        REFLEX_ARGS+=("${a%%=*}=$d/in.$n") ;;
+      *) REFLEX_ARGS+=("$a") ;;
+    esac
+  done
+  return 0
+}
+
+# reflex_status_elevate [args...] — a seat that cannot see the key file re-runs
+# `reflex status` as root through its grant, so it reads what reflex can do FOR
+# it, not "unknown". Returns (does nothing) when root, when status can already
+# answer, or when sudo grants no such command; `sudo -l` asks first, so a missing
+# grant never prompts. The same shape as box_identity_elevate.
+reflex_status_elevate() {
+  (( EUID != 0 )) || return 0
+  [[ "$(reflex_configured)" == unknown ]] || return 0
+  local -a cmd=(/usr/local/bin/5dive reflex status "$@")
+  (( ${JSON_MODE:-0} )) && [[ " $* " != *" --json "* ]] && cmd+=(--json)
+  sudo -n -l "${cmd[@]}" >/dev/null 2>&1 || return 0
+  exec sudo -n "${cmd[@]}"
 }
 
 # reflex_adapter_name -> openrouter | endpoint, the receipt's backend.adapter.

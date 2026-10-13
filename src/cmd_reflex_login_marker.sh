@@ -51,7 +51,7 @@
 #
 # THE KEY. The built-in backend reads the box's OpenRouter key (DIVE-5043: the
 # root-only /etc/5dive/reflex-openrouter.key when present, else the connector
-# store's, root:claude), so a real run is `sudo 5dive reflex login-marker ...`. --backend=fake:first picks the heuristic's top candidate and
+# store's, root:claude-keys), so a real run is `sudo 5dive reflex login-marker ...`. --backend=fake:first picks the heuristic's top candidate and
 # needs no key: it is the "today's code" baseline the model is compared against.
 
 # The browser's own default challenge marker (bin/browser _site_challenge_marker),
