@@ -39,6 +39,9 @@ with_registry_lock() { "$@"; }
 account_near_wall_state() { printf '%s' "$SOURCE_STATE"; }
 account_has_live_headroom() { [[ "$DEST_ROOMY" == 1 && "$1" == roomy ]]; }
 cmd_config() { printf '%s\n' "$*" >>"$CONFIG_CALLS"; }
+# DIVE-6149: no host account records or seat caches reach the remembered-room proof.
+AUTH_PROFILES_DIR="$TMP/profiles"
+usage_agent_home() { printf '%s/agent-%s\n' "$TMP/home" "$1"; }
 
 # Model the production call-site rule with the production helper: success means
 # return before first-turn delivery; every no-op keeps the existing wake path.

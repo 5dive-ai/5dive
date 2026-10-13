@@ -35,7 +35,12 @@ rc_of() { if "$@"; then printf '0'; else printf '%s' "$?"; fi; }
 
 NOW=$(date +%s)
 RATELIMIT_FIXTURE=''
-account_best_ratelimits() { printf '%s' "$RATELIMIT_FIXTURE"; }
+# DIVE-6149: the headroom readers take the TRUSTED reading (a moved seat's cache
+# from its previous account is skipped); the fixture stands in for it, and no
+# account record on this host is read.
+account_trusted_ratelimits() { printf '%s' "$RATELIMIT_FIXTURE"; }
+AUTH_PROFILES_DIR="/nonexistent/dive-6149"
+
 
 RATELIMIT_FIXTURE=$(jq -cn --argjson now "$NOW" \
   '{asOf:$now,fiveHourPct:18,sevenDayPct:34}')

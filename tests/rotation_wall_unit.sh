@@ -54,6 +54,11 @@ cmd_config() {   # <name> set auth-profile=<target>
   registry_read | jq --arg n "$n" --arg v "$v" '.agents[$n].authProfile = $v' | registry_write
 }
 with_registry_lock() { local fn="$1"; shift; "$fn" "$@"; }
+# DIVE-6149: an account nobody is fresh on is a destination when its REMEMBERED
+# reading proves room. Those records and seat caches live on the host; this
+# fixture names real account names, so point both at empty dirs.
+AUTH_PROFILES_DIR="$TMP/profiles"
+usage_agent_home() { printf '%s/agent-%s\n' "$TMP/home" "$1"; }
 # Headroom is measured by another live seat's statusline; the fixture names the
 # accounts that measure under the threshold right now.
 HEADROOM=""
