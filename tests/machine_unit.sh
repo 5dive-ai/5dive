@@ -10,6 +10,10 @@
 # replacing its block rather than duplicating it, exactly ONE CLAUDE.md line
 # that keeps the rest of the file, and `rm` leaving `ssh -G` unable to resolve.
 #
+# DIVE-6143 adds --note: a one-line purpose kept as a comment in the machine's
+# Host block and given its own CLAUDE.md line, while a box with no notes keeps
+# the DIVE-5622 line byte for byte (the negative control).
+#
 # chgrp is a seam; every path is redirected into a temp dir. No root, no network.
 #
 # Run: bash tests/machine_unit.sh
@@ -58,6 +62,12 @@ refuse a 'ro ot@h'
 refuse a 'root@-oProxyCommand=x'
 refuse a root@h extra
 refuse a
+refuse a root@h --note=$'one\ntwo'
+refuse a root@h '--note=has `ssh x` in it'
+refuse a root@h '--note=closes --> the marker'
+refuse a root@h "--note=$(printf 'x%.0s' {1..301})"
+refuse a root@h $'--note=\xff\xfe not utf-8'
+refuse a root@h $'--note=tab\there'
 run rm nope;  check "rm of an unknown name refuses (E_NOT_FOUND)" '[[ $(rc) == "$E_NOT_FOUND" ]]'
 
 # --- add ------------------------------------------------------------------------
@@ -96,6 +106,36 @@ run rm web
 check "removing the last machine drops the config and the line, keeps the owner text" \
   '[[ ! -e "$CONF" ]] && ! grep -q "5dive-machines" "$MD" && grep -qx "keep me" "$MD"'
 check "the box keypair survives rm (other machines may still trust it)" '[[ -f "$FIVE_MACHINE_DIR/id_ed25519" ]]'
+
+# --- note (DIVE-6143) ------------------------------------------------------------
+MARK='<!-- 5dive-machines (DIVE-5622; written by 5dive machine) -->'
+run add plain root@192.0.2.20
+check "negative control: with no note anywhere the CLAUDE.md line is the DIVE-5622 one, byte for byte" \
+  '[[ $(grep -F "$MARK" "$MD") == "Machines you can use from this box: \`ssh plain\` $MARK" ]]'
+check "a machine without a note lists note:null" \
+  'JSON_MODE=1 run ls; [[ $(jq -c ".data.machines" "$TMP/out") == "[{\"name\":\"plain\",\"user\":\"root\",\"host\":\"192.0.2.20\",\"port\":22,\"note\":null}]" ]]'
+NOTE='Remote IP: use for sites and tools that only work from that country'
+run add rx root@192.0.2.30 "--note=$NOTE"
+check "add with --note succeeds and answers the note" '[[ $(rc) == 0 ]] && grep -qF "$NOTE" "$TMP/out"'
+check "ssh -G still resolves the noted machine (the note is an ssh comment)" '[[ $(resolves rx) == 192.0.2.30 ]]'
+check "the noted machine gets its own CLAUDE.md line naming ssh rx and the note" \
+  'grep -qxF "Machine you can use from this box: \`ssh rx\` — $NOTE $MARK" "$MD"'
+check "the un-noted machine keeps the DIVE-5622 line; owner text kept" \
+  'grep -qxF "Machines you can use from this box: \`ssh plain\` $MARK" "$MD" && grep -qx "keep me" "$MD" && [[ $(grep -cF "$MARK" "$MD") == 2 ]]'
+check "ls shows the note (human and --json)" \
+  'run ls; grep -qF "$NOTE" "$TMP/out" && JSON_MODE=1 run ls && [[ $(jq -r ".data.machines[] | select(.name==\"rx\") | .note" "$TMP/out") == "$NOTE" ]]'
+RU='Сервер в другой стране: для сайтов и сервисов, которые открываются только оттуда'
+run add rx root@192.0.2.30 "--note=$RU"
+check "a Cyrillic note is accepted and replaces the old one (one Host rx, one note)" \
+  '[[ $(rc) == 0 && $(grep -c "^Host rx$" "$CONF") == 1 && $(grep -c "# note:" "$CONF") == 1 ]] && grep -qF "$RU" "$MD" && ! grep -qF "$NOTE" "$MD"'
+run add rx root@192.0.2.30
+check "re-adding without --note drops the note; the box is back to the DIVE-5622 line" \
+  '! grep -q "# note:" "$CONF" && [[ $(grep -F "$MARK" "$MD") == "Machines you can use from this box: \`ssh plain\` \`ssh rx\` $MARK" ]]'
+run add rx root@192.0.2.30 "--note=$NOTE"
+run rm rx
+check "rm of a noted machine drops its block, its note and its line" \
+  '[[ $(rc) == 0 ]] && ! grep -q "# note:" "$CONF" && ! grep -qF "ssh rx" "$MD" && [[ $(grep -F "$MARK" "$MD") == "Machines you can use from this box: \`ssh plain\` $MARK" ]]'
+run rm plain
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 (( FAILED == 0 ))

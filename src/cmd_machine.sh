@@ -8,11 +8,19 @@
 # a file every seat's ssh reads, plus ONE line in Claude Code's managed CLAUDE.md
 # naming them. The box keypair is root:claude 0640 so agent seats (group claude)
 # can use it; no password is ever taken and no secret leaves the box.
+# A machine may carry a NOTE saying what it is for (DIVE-6143): an agent that
+# only knows `ssh <name>` exists has no reason to reach for it. The note lives in
+# the machine's own Host block as a `# note:` comment (ssh ignores it), so `ls`
+# shows it, re-adding replaces it and `rm` drops it with the block. With no
+# notes anywhere the CLAUDE.md line is the DIVE-5622 one, byte for byte; a noted
+# machine gets a line of its own. Only Claude Code reads that file: other seat
+# types find their machines with `5dive machine ls` (stated in --help).
 # The FIVE_MACHINE_* overrides exist for the unit harness only.
 MACHINE_MD_MARK="<!-- 5dive-machines (DIVE-5622; written by 5dive machine) -->"
 MACHINE_NAME_RE='^[a-z0-9][a-z0-9-]{0,31}$'
 MACHINE_USER_RE='^[a-z_][a-z0-9_.-]{0,31}$'
 MACHINE_HOST_RE='^[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$'
+MACHINE_NOTE_MAX=300   # BYTES, so a Cyrillic note gets ~150 letters; same cap as the API
 _machine_dir()  { printf '%s' "${FIVE_MACHINE_DIR:-/etc/5dive/machines}"; }
 _machine_conf() { printf '%s' "${FIVE_MACHINE_SSH_CONF:-/etc/ssh/ssh_config.d/50-5dive-machines.conf}"; }
 _machine_md()   { printf '%s' "${FIVE_MACHINE_MD:-/etc/claude-code/CLAUDE.md}"; }
@@ -27,11 +35,30 @@ _machine_conf_without() {   # <name> — the config minus that machine's block
   local f; f=$(_machine_conf); [[ -f "$f" ]] || return 0
   awk -v n="$1" '$1=="Host"{skip=($2==n)} !skip' "$f"
 }
-# Rewrite the one CLAUDE.md line from the config, keeping the rest of the file.
+# "<name>\t<note>" per machine, note empty when it has none.
+_machine_notes() {
+  local f; f=$(_machine_conf); [[ -f "$f" ]] || return 0
+  awk '$1=="Host"{if(n)print n"\t"t; n=$2;t=""} $1=="#"&&$2=="note:"{t=$0; sub(/^[ \t]*# note: /,"",t)} END{if(n)print n"\t"t}' "$f"
+}
+# One line per printable, single-line note; the `<>` and backtick bans keep it
+# from closing the marker comment or the `ssh` code span in CLAUDE.md.
+_machine_note_ok() {
+  local n="$1"
+  [[ -n "$n" ]] && (( $(printf '%s' "$n" | wc -c) <= MACHINE_NOTE_MAX )) || return 1
+  [[ "$n" != *[[:cntrl:]\`\<\>]* && "$n" == "${n#[[:space:]]}" ]] || return 1
+  printf '%s' "$n" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1
+}
+# Rewrite the CLAUDE.md machine lines from the config, keeping the rest of the file.
 _machine_sync_md() {
-  local md rest names line=""; md=$(_machine_md)
-  rest=$( [[ -f "$md" ]] && grep -vF -- "$MACHINE_MD_MARK" "$md" || true ); names=$(_machine_names)
-  [[ -n "$names" ]] && line="Machines you can use from this box: $(printf '`ssh %s` ' $names)${MACHINE_MD_MARK}"
+  local md rest line="" n t plain=() noted=""; md=$(_machine_md)
+  rest=$( [[ -f "$md" ]] && grep -vF -- "$MACHINE_MD_MARK" "$md" || true )
+  while IFS=$'\t' read -r n t; do
+    [[ -z "$n" ]] && continue
+    if [[ -n "$t" ]]; then noted+="Machine you can use from this box: \`ssh $n\` — $t ${MACHINE_MD_MARK}"$'\n'
+    else plain+=("$n"); fi
+  done <<<"$(_machine_notes)"
+  (( ${#plain[@]} )) && line="Machines you can use from this box: $(printf '`ssh %s` ' "${plain[@]}")${MACHINE_MD_MARK}"
+  [[ -n "$noted" ]] && line="${line:+$line$'\n'}${noted%$'\n'}"
   if [[ -n "${rest//[$'\n ']/}" ]]; then _machine_write "$md" "${rest}${line:+$'\n'$line}"$'\n'
   elif [[ -n "$line" ]]; then _machine_write "$md" "${line}"$'\n'
   else rm -f "$md"; fi
@@ -43,8 +70,12 @@ cmd_machine() {
   [[ "${1:-}" == "--json" ]] && { JSON_MODE=1; shift; }
   case "$action" in
     add)
-      local name="${1:-}" target="${2:-}" user host port=22
-      (( $# == 2 )) || fail "$E_USAGE" "usage: 5dive machine add <name> <user@host[:port]>"
+      local note="" pos=() a user host port=22
+      for a in "$@"; do
+        case "$a" in --note=*) note="${a#--note=}" ;; --json) JSON_MODE=1 ;; *) pos+=("$a") ;; esac
+      done
+      local name="${pos[0]:-}" target="${pos[1]:-}"
+      (( ${#pos[@]} == 2 )) || fail "$E_USAGE" "usage: 5dive machine add <name> <user@host[:port]> [--note=\"<what it is for>\"]"
       require_root "machine add $*"
       [[ "$name" =~ $MACHINE_NAME_RE ]] || fail "$E_VALIDATION" "name must be lowercase letters, digits and dashes (max 32), got '${name:0:40}'"
       [[ "$target" == *@* ]] || fail "$E_VALIDATION" "target must be user@host[:port], got '${target:0:80}'"
@@ -53,22 +84,25 @@ cmd_machine() {
       [[ "$user" =~ $MACHINE_USER_RE ]] || fail "$E_VALIDATION" "bad user '${user:0:40}'"
       [[ "$host" =~ $MACHINE_HOST_RE ]] || fail "$E_VALIDATION" "bad host '${host:0:80}' (a hostname or IPv4)"
       [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( port >= 1 && port <= 65535 )) || fail "$E_VALIDATION" "bad port '${port:0:8}'"
+      [[ -z "$note" ]] || _machine_note_ok "$note" \
+        || fail "$E_VALIDATION" "note must be one line of up to $MACHINE_NOTE_MAX bytes, without backticks, < or >"
       if [[ ! -f "$dir/id_ed25519" ]]; then
         mkdir -p "$dir" && chmod 0755 "$dir" || fail "$E_GENERIC" "cannot create $dir"
         ssh-keygen -q -t ed25519 -N '' -C "5dive-box@$(hostname)" -f "$dir/id_ed25519" </dev/null >/dev/null \
           || fail "$E_GENERIC" "ssh-keygen failed"
       fi
       _machine_chgrp "$dir/id_ed25519" && chmod 0640 "$dir/id_ed25519" || fail "$E_GENERIC" "cannot give group claude the box key"
-      local block; block=$(printf '%s\n' "Host $name" "  HostName $host" "  User $user" "  Port $port" \
+      local block; block=$(printf '%s\n' "Host $name" ${note:+"  # note: $note"} "  HostName $host" "  User $user" "  Port $port" \
         "  IdentityFile $dir/id_ed25519" "  IdentitiesOnly yes" "  BatchMode yes" "  StrictHostKeyChecking accept-new")
       local rest; rest=$(_machine_conf_without "$name" | grep -v '^# Written by' || true)
       _machine_write "$conf" "# Written by \`5dive machine\` (DIVE-5622). Edit with 5dive machine add|rm."$'\n'"${rest:+$rest$'\n'}${block}"$'\n'
       _machine_sync_md
       local pub; pub=$(cat "$dir/id_ed25519.pub")
-      ok "machine '$name' added: agents reach it as \`ssh $name\` ($user@$host:$port).
+      ok "machine '$name' added: agents reach it as \`ssh $name\` ($user@$host:$port).${note:+
+Agents are told what it is for: $note}
 Put this box's public key in ~$user/.ssh/authorized_keys on that machine:
-$pub" '{name:$n, user:$u, host:$h, port:($p|tonumber), publicKey:$k}' \
-        --arg n "$name" --arg u "$user" --arg h "$host" --arg p "$port" --arg k "$pub" ;;
+$pub" '{name:$n, user:$u, host:$h, port:($p|tonumber), note:(if $t == "" then null else $t end), publicKey:$k}' \
+        --arg n "$name" --arg u "$user" --arg h "$host" --arg p "$port" --arg t "$note" --arg k "$pub" ;;
     rm)
       local name="${1:-}"
       (( $# == 1 )) || fail "$E_USAGE" "usage: 5dive machine rm <name>"
@@ -81,14 +115,19 @@ $pub" '{name:$n, user:$u, host:$h, port:($p|tonumber), publicKey:$k}' \
       ok "machine '$name' detached from this box (the machine itself is untouched)" '{name:$n, removed:true}' --arg n "$name" ;;
     ls|"")
       local rows="[]" human=""
-      [[ -f "$conf" ]] && rows=$(awk '$1=="Host"{if(n)print n"\t"u"\t"h"\t"p; n=$2;u="";h="";p=22} $1=="HostName"{h=$2} $1=="User"{u=$2} $1=="Port"{p=$2} END{if(n)print n"\t"u"\t"h"\t"p}' "$conf" \
-        | jq -Rn '[inputs | split("\t") | {name:.[0], user:.[1], host:.[2], port:(.[3]|tonumber)}]')
-      human=$(jq -r '.[] | "\(.name)\t\(.user)@\(.host):\(.port)"' <<<"$rows")
+      [[ -f "$conf" ]] && rows=$(awk '$1=="Host"{if(n)print n"\t"u"\t"h"\t"p"\t"t; n=$2;u="";h="";p=22;t=""} $1=="HostName"{h=$2} $1=="User"{u=$2} $1=="Port"{p=$2} $1=="#"&&$2=="note:"{t=$0; sub(/^[ \t]*# note: /,"",t)} END{if(n)print n"\t"u"\t"h"\t"p"\t"t}' "$conf" \
+        | jq -Rn '[inputs | split("\t") | {name:.[0], user:.[1], host:.[2], port:(.[3]|tonumber), note:(if (.[4] // "") == "" then null else .[4] end)}]')
+      human=$(jq -r '.[] | "\(.name)\t\(.user)@\(.host):\(.port)\(if .note then "\t\(.note)" else "" end)"' <<<"$rows")
       ok "${human:-no machines attached (add one: sudo 5dive machine add <name> <user@host[:port]>)}" '{machines:$m}' --argjson m "$rows" ;;
     -h|--help|help) printf '%s\n' \
-      "usage: 5dive machine add <name> <user@host[:port]>   # agents reach it as \`ssh <name>\`; prints the key to install" \
+      "usage: 5dive machine add <name> <user@host[:port]> [--note=\"<what it is for>\"]" \
+      "                                                     # agents reach it as \`ssh <name>\`; prints the key to install." \
+      "                                                     # --note (one line, max $MACHINE_NOTE_MAX bytes) tells agents when to use it;" \
+      "                                                     # re-adding without --note drops the old one." \
       "       5dive machine rm <name>                       # forget it here; the machine itself is untouched" \
-      "       5dive machine ls" ;;
+      "       5dive machine ls                              # name, user@host:port, note" \
+      "Claude Code seats are told through /etc/claude-code/CLAUDE.md; other seat types (codex, hermes, ...)" \
+      "are not, and find their machines with \`5dive machine ls\`." ;;
     *) fail "$E_USAGE" "usage: 5dive machine <add|rm|ls> (see: 5dive machine --help)" ;;
   esac
 }
