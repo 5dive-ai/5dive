@@ -283,7 +283,6 @@ check "H config --help says 640 root:claude-keys for openrouter-key, not root:cl
   "$(grep -qF 'written 640 root:claude-keys to' <<<"$HELP" && ! grep -qE 'written 640 root:claude( |$)' <<<"$HELP"; echo $?)" "$(grep -n 'written 640' <<<"$HELP")"
 # The write's posture with the OS faked: the group it lands in and its mode.
 (
-  declare -A G=()
   _sp_group_exists() { return 0; }
   _sp_chgrp()        { printf '%s' "$1" >"$2.grp"; }
   _sp_setfacl()      { return 0; }
