@@ -15,11 +15,20 @@
 # ever reached brand-new agents; --force drops the existing dir and re-pulls the
 # current pinned version so upgrades actually land on existing boxes too.
 #
-# NEVER-BOOTED GOTCHA: `npx skills add` writes to the agent user's ~/.claude,
-# which only exists after the agent's service has booted at least once. On a
-# never-booted user the install errors and can leave a half-written tree, so we
-# skip any agent whose ~/.claude is absent — it'll get the skill from the
-# create-path seed or the next refresh after it first boots.
+# NEVER-BOOTED GOTCHA: on a claude seat `npx skills add` writes to the agent
+# user's ~/.claude, which only exists after the agent's service has booted at
+# least once. On a never-booted user the install errors and can leave a
+# half-written tree, so we skip a seat whose skills dir is under ~/.claude while
+# ~/.claude is absent — it'll get the skill from the create-path seed or the next
+# refresh after it first boots.
+#
+# ONLY those seats (DIVE-6148). A codex/opencode/pi seat installs to
+# ~/.agents/skills, which the add creates itself, and may never grow a ~/.claude
+# at all: codex-elm ran 22 days with no default skills while every nightly
+# summary counted it "awaiting first boot", so nobody looked. Every other type
+# is attempted from its first night and lands in changed / first-install /
+# failed. The dir comes from `5dive agent _skills_install_dir <name>` (the CLI's
+# own resolver); a bundle too old to answer keeps the old guard for every seat.
 #
 # Called by the daily host/customer update cron (install.sh --upgrade path)
 # right after 5dive-refresh-plugins.sh, before agents restart.
@@ -108,8 +117,12 @@ for ag in $agents; do
   home=$(getent passwd "$user" | cut -d: -f6)
   [[ -n "$home" && -d "$home" ]] || continue
 
-  # Never-booted guard: ~/.claude is created on first boot; skip until then.
-  if [[ ! -d "$home/.claude" ]]; then
+  # Never-booted guard: ~/.claude is created on first boot; skip until then —
+  # but only where the skills land under it (see the header, DIVE-6148). An
+  # empty answer (old bundle, unreadable registry) keeps the guard.
+  skills_dir=$("$FIVE_BIN" agent _skills_install_dir "$ag" 2>/dev/null) || skills_dir=""
+  if [[ ( -z "$skills_dir" || "$skills_dir" == .claude || "$skills_dir" == .claude/* ) \
+        && ! -d "$home/.claude" ]]; then
     echo "· $ag — not booted yet (~/.claude absent), skipping"
     booting=$((booting+1))
     continue
