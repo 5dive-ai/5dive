@@ -68,6 +68,9 @@ seed DIVE-3 todo ""
 seed DIVE-4 todo lodar
 seed DIVE-5 cancelled dev
 seed DIVE-6 todo ops
+# The seeds name their idents, so move the project counter past them: a child
+# filed through `task add` takes its ident from the counter (DIVE-6157).
+db "UPDATE projects SET counter=100 WHERE key='dive';"
 
 # --- A. an open, assigned row: recorded AND sent ------------------------------
 rc=$(run DIVE-1 --text="  use the staging database, not prod  " --from=telegram)
@@ -118,15 +121,49 @@ has_t "C2: ... the note is on the row" "$(body DIVE-6)" "are you there"
 eq_t  "C3: ... and delivered is false" "$(jq -r '(.data // .) | .delivered' "$TMP/out" 2>/dev/null)" "false"
 has_t "C4: ... with the reason" "$(cat "$TMP/out")" "not found"
 
-# --- D. refusals, and nothing is written ---------------------------------------
+# --- F. a finished row: a new child row, never a reopen (DIVE-6157) ----------
+# lodar 2026-10-13: "even finished tasks should have a follow-up option". The
+# finished row stays exactly as it was; the follow-up becomes a child row for
+# the same assignee, carrying the text and citing the row it follows.
+db "UPDATE tasks SET result='Login page fixed and deployed.' WHERE ident='DIVE-2';"
+kids() { db "SELECT COUNT(*) FROM tasks WHERE parent_id=(SELECT id FROM tasks WHERE ident='$1');"; }
 for spec in "DIVE-2:done" "DIVE-5:cancelled"; do
   i=${spec%%:*} st=${spec#*:}
   before=$(body "$i")
-  rc=$(run "$i" --text="hello")
-  [[ "$rc" != "0" ]] && ok_t "D: a $st row is refused" || bad_t "D: a $st row is refused" "rc=$rc"
-  eq_t  "D: ... and its body is untouched ($st)" "$(body "$i")" "$before"
-  eq_t  "D: ... and nothing is sent ($st)" "$(cat "$SENT")" ""
+  JSON_MODE=1; rc=$(run "$i" --text="now do the same for the signup page" --from=telegram); JSON_MODE=0
+  [[ "$rc" == 0 ]] || { cat "$TMP/out" "$TMP/err"; }
+  eq_t  "F: a $st row exits 0" "$rc" "0"
+  eq_t  "F: ... and gets exactly one child ($st)" "$(kids "$i")" "1"
+  kid=$(jq -r '(.data // .) | .child' "$TMP/out" 2>/dev/null)
+  eq_t  "F: ... the JSON names the child the store holds ($st)" "$kid" \
+        "$(db "SELECT ident FROM tasks WHERE parent_id=(SELECT id FROM tasks WHERE ident='$i');")"
+  eq_t  "F: ... the JSON says delivered ($st)" "$(jq -r '(.data // .) | .delivered' "$TMP/out" 2>/dev/null)" "true"
+  eq_t  "F: ... the child goes to the same assignee ($st)" "$(db "SELECT assignee FROM tasks WHERE ident='$kid';")" "dev"
+  eq_t  "F: ... the child is open ($st)" "$(db "SELECT status FROM tasks WHERE ident='$kid';")" "todo"
+  has_t "F: ... the child's title names the follow-up ($st)" "$(db "SELECT title FROM tasks WHERE ident='$kid';")" "Follow-up: now do the same for the signup page"
+  has_t "F: ... the child's body carries the text ($st)" "$(body "$kid")" "now do the same for the signup page"
+  has_t "F: ... and cites the row it follows ($st)" "$(body "$kid")" "Follows $i: Fix the login page"
+  eq_t  "F: ... the finished row's body is untouched ($st)" "$(body "$i")" "$before"
+  eq_t  "F: ... and it stays $st" "$(db "SELECT status FROM tasks WHERE ident='$i';")" "$st"
+  has_t "F: ... the assignee is woken ($st)" "$(cat "$SENT")" "--wake"
+  has_t "F: ... and told the new ident ($st)" "$(cat "$SENT")" "filed as a new task, $kid"
+  has_t "F: ... with the owner's chat as the reply target ($st)" "$(cat "$SENT")" "--reply-to-chat=1234567890"
 done
+has_t "F1: the done row's result is carried to the child" "$(body "$(db "SELECT ident FROM tasks WHERE parent_id=(SELECT id FROM tasks WHERE ident='DIVE-2');")")" "Its result: Login page fixed and deployed."
+long=$(printf 'y%.0s' {1..80})
+run DIVE-2 --text="$long" >/dev/null
+has_t "F2: a long text is cut to ~60 chars in the child title" "$(db "SELECT title FROM tasks WHERE parent_id=(SELECT id FROM tasks WHERE ident='DIVE-2') ORDER BY id DESC LIMIT 1;")" "Follow-up: $(printf 'y%.0s' {1..60})…"
+SEND_RC=1; JSON_MODE=1; rc=$(run DIVE-5 --text="still there?"); JSON_MODE=0; SEND_RC=0
+eq_t  "F3: a failed send on a finished row still files the child and exits 0" "$rc" "0"
+eq_t  "F4: ... delivered is false" "$(jq -r '(.data // .) | .delivered' "$TMP/out" 2>/dev/null)" "false"
+eq_t  "F5: ... and the child is there" "$(kids DIVE-5)" "2"
+db "UPDATE tasks SET status='done' WHERE ident='DIVE-3';"
+rc=$(run DIVE-3 --text="hello")
+[[ "$rc" != "0" ]] && ok_t "F6: a finished row with no assignee is still refused" || bad_t "F6: a finished row with no assignee is still refused" "rc=$rc"
+eq_t  "F7: ... and files nothing" "$(kids DIVE-3)" "0"
+db "UPDATE tasks SET status='todo' WHERE ident='DIVE-3';"
+
+# --- D. refusals, and nothing is written ---------------------------------------
 rc=$(run DIVE-3 --text="hello")
 [[ "$rc" != "0" ]] && ok_t "D1: a row with no assignee is refused" || bad_t "D1: a row with no assignee is refused" "rc=$rc"
 has_t "D2: ... naming the fix" "$(cat "$TMP/err")" "assign it first"
