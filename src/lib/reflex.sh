@@ -292,11 +292,10 @@ _reflex_caller_holds_cli() {
 # _reflex_as_caller <cmd...> — run as the sudo caller, at most 20s (a seam for the harness).
 _reflex_as_caller() { timeout 20 runuser -u "$SUDO_USER" -- "$@"; }
 
-_reflex_is_root() { (( EUID == 0 )); }
-
 # reflex_sudo_scoped -> rc 0 in a root process a scoped caller started through sudo.
+# The real-root check comes first: below EUID 0 SUDO_UID is a plain env var.
 reflex_sudo_scoped() {
-  _reflex_is_root || return 1
+  _gate_is_root || return 1
   [[ "${SUDO_UID:-}" =~ ^[0-9]+$ && "$SUDO_UID" != 0 && -n "${SUDO_USER:-}" ]] || return 1
   ! _reflex_caller_holds_cli
 }

@@ -82,7 +82,7 @@ cd "$ROOT" || exit 2
 for f in $(printf '%s ' $SRCS); do source "src/\$f"; done
 set +e
 trap _five_run_exit_handlers EXIT
-_reflex_is_root()          { [[ -n "\${FAKE_ROOT:-}" ]]; }
+_gate_is_root()            { [[ -n "\${FAKE_ROOT:-}" ]]; }
 _reflex_caller_holds_cli() { [[ -n "\${FAKE_HOLDS_CLI:-}" ]]; }
 # The caller cannot read anything under rootonly/, as a seat cannot read root's files.
 _reflex_as_caller() { local a; for a in "\$@"; do [[ "\$a" == "$TMP/rootonly/"* ]] && return 1; done; "\$@"; }
