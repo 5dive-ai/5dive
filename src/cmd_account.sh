@@ -443,6 +443,11 @@ account_best_ratelimits() {
 # missing/old/high cache → non-zero (don't override — fail safe to the cooldown).
 HEADROOM_FRESH_SECS="${HEADROOM_FRESH_SECS:-600}"   # 10 min
 HEADROOM_MAX_PCT="${HEADROOM_MAX_PCT:-90}"
+# DIVE-6121: a seat that moved for a usage wall does not move for another one
+# inside this window — the second wall means the destination was not what it
+# measured, and chaining only bounces the seat across the pool.
+ROTATION_WALL_CHAIN_SECS="${ROTATION_WALL_CHAIN_SECS:-1800}"
+[[ "$ROTATION_WALL_CHAIN_SECS" =~ ^[0-9]+$ ]] || ROTATION_WALL_CHAIN_SECS=1800
 account_has_live_headroom() {
   local account="$1" rl now
   rl=$(account_best_ratelimits "$account")
@@ -1656,18 +1661,29 @@ rotation_eligible_accounts() {
 cmd_agent_rotation_rotate() {
   local name="${1:-}"; shift || true
   [[ -n "$name" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent rotation rotate <agent> [--cooldown-current=<epoch>] [--require-live-headroom] [--if-current-near-wall]"
+    || fail "$E_USAGE" "usage: 5dive agent rotation rotate <agent> [--cooldown-current=<epoch>] [--require-live-headroom] [--if-current-near-wall] [--wall=<reset-epoch>]"
   require_root
   ensure_state
-  local cooldown_current="" require_live_headroom=0 if_current_near_wall=0 a
+  local cooldown_current="" require_live_headroom=0 if_current_near_wall=0 wall=0 a
   for a in "$@"; do
     case "$a" in
       --cooldown-current=*) cooldown_current="${a#--cooldown-current=}" ;;
       --require-live-headroom) require_live_headroom=1 ;;
       --if-current-near-wall) if_current_near_wall=1 ;;
+      # DIVE-6121: the seat itself SAW the wall (its StopFailure hook fired on a
+      # usage limit), so there is nothing to measure about the account it is
+      # leaving. Park that account until its reset, move only to a destination
+      # with measured live headroom, and never chain: see the guard below.
+      --wall=*) wall=1; require_live_headroom=1; cooldown_current="${a#--wall=}" ;;
       *) fail "$E_USAGE" "unknown flag: $a" ;;
     esac
   done
+  if (( wall )); then
+    [[ "$cooldown_current" =~ ^[0-9]+$ ]] \
+      || fail "$E_VALIDATION" "--wall must be the walled account's reset epoch (seconds)"
+    (( if_current_near_wall == 0 )) \
+      || fail "$E_USAGE" "--wall and --if-current-near-wall are different triggers; pass one"
+  fi
   local reg enabled current
   reg=$(rotation_require_agent "$name")
   enabled=$(jq -r --arg n "$name" '.agents[$n].rotation.enabled // false' <<<"$reg")
@@ -1713,6 +1729,27 @@ cmd_agent_rotation_rotate() {
       .agents[$n].rotation = (.agents[$n].rotation // {enabled:false, accounts:[], cooldowns:{}})
       | .agents[$n].rotation.cooldowns[$c] = $u' <<<"$reg")
     echo "$reg" | registry_write
+  fi
+  # DIVE-6121: NO WALL CHAIN. A wall move is trusted to land on headroom because
+  # another seat measured it there. If the seat walls AGAIN inside this window,
+  # that measurement was wrong (or the destination drained in minutes), and a
+  # second hop would only bounce the seat — and restart it — across the pool.
+  # The walled account is parked above either way; the seat waits for a reset.
+  if (( wall )); then
+    local last_wall now_w
+    last_wall=$(jq -r --arg n "$name" '.agents[$n].rotation.lastWallRotateAt // 0' <<<"$reg")
+    [[ "$last_wall" =~ ^[0-9]+$ ]] || last_wall=0
+    now_w=$(date +%s)
+    if (( last_wall > 0 && now_w - last_wall < ROTATION_WALL_CHAIN_SECS )); then
+      if (( JSON_MODE )); then
+        ok "" '{rotated:false, from:$f, to:null, wall:true, chainGuard:true,
+                reason:"this seat already moved for a usage wall within the chain window; waiting for the reset"}' \
+           --arg f "$current"
+      else
+        echo "OK — '$name' already moved for a usage wall $(( (now_w - last_wall) / 60 ))m ago; not chaining a second move — waiting for the reset"
+      fi
+      return 0
+    fi
   fi
   # Resolve the pool: under allAccounts it's every eligible same-type profile
   # (computed live so newly-added accounts join automatically), otherwise the
@@ -1815,6 +1852,12 @@ cmd_agent_rotation_rotate() {
   # DIVE-4589: name the PATH that moved the binding. The event itself is emitted
   # inside cmd_config (one emitter); only the reason is per-caller.
   _5D_BINDING_REASON=rotation cmd_config "$name" set "auth-profile=${target}" >/dev/null
+  # DIVE-6121: stamp the wall move AFTER cmd_config wrote the new binding (it
+  # rewrote the registry), so the chain guard above sees it on the next wall.
+  if (( wall )); then
+    registry_read | jq --arg n "$name" --argjson t "$(date +%s)" \
+      '.agents[$n].rotation.lastWallRotateAt = $t' | registry_write
+  fi
 
   # DIVE-3856: STOP OVER-CLAIMING. What this verb knows is that it re-pointed
   # the profile and that `cmd_config` SCHEDULED a bounce — `systemd-run
@@ -1843,8 +1886,9 @@ cmd_agent_rotation_rotate() {
     human+=" — channel bounce SCHEDULED (deferred ~1s), poller check OWED (channels=${chans}); NOT verified by this command"
   fi
   ok "$human" \
-     '{rotated:true, from:$f, to:$t, tier:$tier, coolingTarget:$ct,
+     '{rotated:true, from:$f, to:$t, tier:$tier, coolingTarget:$ct, wall:$w,
        channelBounceScheduled:$cbs, channelVerified:$cv, currentNearWall:$nw}' \
+     --argjson w "$( ((wall)) && echo true || echo false )" \
      --arg f "$current" --arg t "$target" --argjson tier "$tier" \
      --argjson ct "$( ((cooling_target)) && echo true || echo false )" \
      --argjson cbs "$channel_bounce" --argjson cv "$channel_verified" \
@@ -2035,6 +2079,24 @@ agent_set_account_dispatch() {
   with_registry_lock cmd_agent_set_account "$@"
 }
 
+# `agent rotation rotate <agent> ...`. DIVE-6121: the one form a seat may run
+# on ITSELF is the wall move — `rotate <self> --wall=<reset-epoch>`, which its
+# telegram plugin's StopFailure hook fires the moment the seat hits a usage
+# limit. A standard seat's grant never held `agent rotation rotate`, so on
+# 2026-10-13 that hook's sudo was refused and a chat seat with rotation ON and a
+# 4% account in its pool waited 1h47m for the reset. It crosses the same rail as
+# set-account: the seat is re-derived root-side, and a wall move is strictly
+# narrower than the `set` the rail already allows (the CLI picks the account,
+# and only one with measured headroom). Every other form stays on the root path.
+agent_rotation_rotate_dispatch() {
+  if [[ $# -eq 2 && -n "$1" && "$2" == --wall=* ]] \
+     && [[ "$1" == "$(_gate_uid_to_agent "$(_gate_caller_uid)")" ]] \
+     && _self_account_eligible; then
+    _self_account_cross rotate "${2#--wall=}"
+  fi
+  with_registry_lock cmd_agent_rotation_rotate "$@"
+}
+
 # Root half. Reached ONLY through the exact-path NOPASSWD grant (or by root).
 cmd_self_account_delegated() {
   _gate_is_root || fail "$E_PERMISSION" "_self_account is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
@@ -2068,7 +2130,14 @@ cmd_self_account_delegated() {
       [[ "$account" == "default" ]] || valid_profile_name "$account" \
         || fail "$E_VALIDATION" "_self_account set: invalid account name."
       with_registry_lock cmd_agent_set_account "$seat" "$account" ;;
+    rotate)
+      # DIVE-6121: the seat hit a usage wall. The reset epoch is the only
+      # caller-chosen value; cmd_agent_rotation_rotate re-checks it, refuses a
+      # seat whose rotation is off, and picks the destination itself.
+      (( ${#wire[@]} == 3 )) || fail "$E_VALIDATION" "_self_account rotate takes exactly one reset epoch."
+      [[ "${wire[2]}" =~ ^[0-9]{1,12}$ ]] || fail "$E_VALIDATION" "_self_account rotate: the reset must be an epoch."
+      with_registry_lock cmd_agent_rotation_rotate "$seat" "--wall=${wire[2]}" ;;
     *)
-      fail "$E_VALIDATION" "_self_account allows only usage or set." ;;
+      fail "$E_VALIDATION" "_self_account allows only usage, set or rotate." ;;
   esac
 }
