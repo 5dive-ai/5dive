@@ -24,6 +24,7 @@ trap 'rc=$?; rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
 source src/lib/error_codes.sh
 source src/lib/output.sh
 source src/header.sh
+source src/lib/actor.sh
 if [[ "${WALL_MUTANT:-0}" == 1 ]]; then
   # The mutation: the verb no longer knows the wall trigger.
   source <(sed '/--wall=\*) wall=1;/d' src/cmd_account.sh)
@@ -141,7 +142,12 @@ t "5 plain rotate keeps its preference-order pick" "true:mark" "$(J "$OUT" '.dat
 
 # ── 1s: a standard seat runs the wall move on ITSELF, and only on itself ─────
 CALLS="$TMP/calls"; WIRE="$TMP/wire"; SUDOS="$TMP/sudos"
-_gate_uid_to_agent() { [[ "$1" == 1010 ]] && printf 'chatseat' || printf ''; }
+# Identity through the REAL resolver (lib/actor.sh), pinned at its seams: uid 1010
+# is agent-chatseat, uid 1000 is a non-seat. A pin that silently yields '' would
+# make every refusal below pass for the wrong reason, so assert it first.
+_gate_passwd_stream() { printf 'agent-chatseat:x:1010:1010:::\nrunner:x:1000:1000:::\n'; }
+t "1s pin: uid 1010 resolves to chatseat through the real resolver" "chatseat" "$(_gate_uid_to_agent 1010)"
+t "1s pin: uid 1000 resolves to no seat" "" "$(_gate_uid_to_agent 1000)"
 # root half: the executor re-derives the seat from SUDO_UID
 cmd_agent_rotation_rotate() { printf 'rotate %s\n' "$*" >>"$CALLS"; }
 _gate_is_root() { return 0; }
