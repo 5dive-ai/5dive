@@ -159,7 +159,7 @@ Agents:
                                                      # --cooldown-current parks the one it left until <epoch>;
                                                      # --wall is the seat's own usage-limit move: headroom-only,
                                                      # parks the walled account, never chains within 30m. A
-                                                     # seat may run `rotate <itself> --wall=<epoch>` (DIVE-6121)
+                                                     # seat may run 'rotate <itself> --wall=<epoch>' (DIVE-6121)
   5dive agent rotation cooldown <agent> <account> --until=<epoch>
                                                      # park one account for this seat until <epoch>
   5dive agent rotation clear-cooldown <agent> [<account>]
