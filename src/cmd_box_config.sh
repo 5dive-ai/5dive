@@ -88,8 +88,12 @@ cmd_box_config() {
         "  reflex-endpoint-key  an optional bearer for the custom endpoint, from stdin," \
         "             root-only 600 at $(declare -F _reflex_endpoint_key_file >/dev/null && _reflex_endpoint_key_file || printf /etc/5dive/reflex-endpoint.key)." \
         "  openrouter-key  the box's OpenRouter key, used by reflex and voice," \
-        "             written 640 root:claude to" \
+        "             written 640 root:claude-keys to" \
         "             ${CONNECTORS_DIR:-/etc/5dive/connectors}/openrouter.env as OPENROUTER_API_KEY." \
+        "             Admin seats read it. A standard seat never does: it reaches reflex" \
+        "             through its sudo grant (reflex status, pick-ref, login-marker)," \
+        "             which reads the key as root, so setting it before or after a hire" \
+        "             ends the same." \
         "             Read from a pipe only: a terminal on stdin is refused." \
         "             Write-only: 'config' shows set or unset, never the key." \
         "  openrouter-key.<plugin>  that plugin's OWN OpenRouter key (e.g." \
@@ -401,8 +405,9 @@ _reflex_key_write() {
 # DIVE-5026: the OpenRouter key in the connector store — the file voice reads
 # (`voice_openrouter_key`: OPENROUTER_API_KEY or OPENROUTER_KEY, first match),
 # which the dashboard used to fill by opening a server terminal. Reflex keeps its
-# own root-only file above; this one is 640 root:claude because the seats that
-# run voice read it.
+# own root-only file above; this one is 640 root:claude-keys since DIVE-5690
+# (admin seats read it; a standard seat reaches reflex through its sudo grant,
+# DIVE-6115).
 # DIVE-5043: with a plugin name, that plugin's OWN key file (openrouter-<plugin>.env).
 _openrouter_connector_file() { printf '%s/openrouter%s.env' "${CONNECTORS_DIR:-/etc/5dive/connectors}" "${1:+-$1}"; }
 

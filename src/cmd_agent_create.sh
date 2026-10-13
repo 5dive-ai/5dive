@@ -605,6 +605,9 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _task_channel"*|\
         "/usr/local/bin/5dive partner hire *"|"/usr/local/bin/5dive hire-link *"|\
         "/usr/local/lib/5dive/push-notify.sh *"|\
+        "/usr/local/bin/5dive reflex status"|"/usr/local/bin/5dive reflex status *"|\
+        "/usr/local/bin/5dive reflex pick-ref"|"/usr/local/bin/5dive reflex pick-ref *"|\
+        "/usr/local/bin/5dive reflex login-marker"|"/usr/local/bin/5dive reflex login-marker *"|\
         "/usr/local/bin/5dive _self_account"*|\
         "/usr/local/bin/5dive browser _connect"|\
         "/usr/local/bin/5dive _merge_do"*|\
@@ -816,6 +819,22 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _merge_do
 # box's configured repositories. Both audit root-side.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _route_do
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _pkg_do
+# DIVE-6115: let this seat use reflex without reading the box OpenRouter key,
+# which is group claude-keys (DIVE-5690) and stays closed to it. The browser's
+# broken-step retry and its new-site login drafts ask reflex through exactly
+# these lines, and status is how they see that reflex is set up. The key is
+# read root-side and only the decision comes back. A wildcard reaches root with
+# the seat's arguments, so a call from a seat that does not hold the whole CLI
+# is narrowed before it runs (lib/reflex.sh, reflex_scoped_args): the built-in
+# backend only, no output file, and every input file read as this seat.
+# Each verb twice because a sudoers wildcard does not match zero arguments, and
+# the browser asks sudo -l about the bare verb before it calls it with arguments.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive reflex status
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive reflex status *
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive reflex pick-ref
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive reflex pick-ref *
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive reflex login-marker
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive reflex login-marker *
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
     cat <<SUDOERS
