@@ -137,6 +137,8 @@ for spec in "DIVE-2:done" "DIVE-5:cancelled"; do
   kid=$(jq -r '(.data // .) | .child' "$TMP/out" 2>/dev/null)
   eq_t  "F: ... the JSON names the child the store holds ($st)" "$kid" \
         "$(db "SELECT ident FROM tasks WHERE parent_id=(SELECT id FROM tasks WHERE ident='$i');")"
+  eq_t  "F: ... the JSON carries the child's id ($st)" "$(jq -r '(.data // .) | .child_id' "$TMP/out" 2>/dev/null)" "$(db "SELECT id FROM tasks WHERE ident='$kid';")"
+  eq_t  "F: ... and its title ($st)" "$(jq -r '(.data // .) | .child_title' "$TMP/out" 2>/dev/null)" "$(db "SELECT title FROM tasks WHERE ident='$kid';")"
   eq_t  "F: ... the JSON says delivered ($st)" "$(jq -r '(.data // .) | .delivered' "$TMP/out" 2>/dev/null)" "true"
   eq_t  "F: ... the child goes to the same assignee ($st)" "$(db "SELECT assignee FROM tasks WHERE ident='$kid';")" "dev"
   eq_t  "F: ... the child is open ($st)" "$(db "SELECT status FROM tasks WHERE ident='$kid';")" "todo"

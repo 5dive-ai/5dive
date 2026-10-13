@@ -2330,9 +2330,9 @@ cmd_task_followup() {
   # scramble its verifier, landing and result history. The child is an ordinary
   # `task add` — same assignee, the owner's text as its brief, the finished row
   # and its result cited — so every filing guard still applies to it.
-  local child=""
+  local child="" child_id="" ctitle=""
   if [[ "$status" == "done" || "$status" == "cancelled" ]]; then
-    local oneline="${text//[$'\n\r\t']/ }" ctitle cbody presult prio out rc
+    local oneline="${text//[$'\n\r\t']/ }" cbody presult prio out rc
     ctitle="Follow-up: ${oneline:0:60}"
     (( ${#oneline} > 60 )) && ctitle+="…"
     presult=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
@@ -2342,6 +2342,7 @@ cmd_task_followup() {
     out=$( ( JSON_MODE=1 cmd_task_add --parent="$ident" --assignee="$assignee" --priority="$prio" \
              ${from:+--from="$from"} --body="$cbody" -- "$ctitle" ) 2>/dev/null ); rc=$?
     child=$(jq -r '.data.ident // empty' <<<"$out" 2>/dev/null | tail -n1)
+    child_id=$(jq -r '.data.id // empty' <<<"$out" 2>/dev/null | tail -n1)
     if (( rc != 0 )) || [[ -z "$child" ]]; then
       local why; why=$(jq -r '.error.message // empty' <<<"$out" 2>/dev/null | tail -n1)
       fail "$E_VALIDATION" "$ident is $status, and its follow-up could not be filed as a new task: ${why:-task add failed}"
@@ -2379,8 +2380,8 @@ cmd_task_followup() {
   if [[ -n "$child" ]]; then
     (( delivered )) || warn "$child filed, but $assignee did not get the message: $why"
     ok "$ident is $status — follow-up filed as $child for $assignee" \
-       '{ident:$i, child:$k, assignee:$a, recorded:true, delivered:($d=="1"), why:(($w|select(length>0)) // null), reply_to_chat:(($c|select(length>0)) // null)}' \
-       --arg i "$ident" --arg k "$child" --arg a "$assignee" --arg d "$delivered" --arg w "$why" --arg c "$chat"
+       '{ident:$i, child:$k, child_id:($ki|tonumber? // null), child_title:$kt, assignee:$a, recorded:true, delivered:($d=="1"), why:(($w|select(length>0)) // null), reply_to_chat:(($c|select(length>0)) // null)}' \
+       --arg i "$ident" --arg k "$child" --arg ki "$child_id" --arg kt "$ctitle" --arg a "$assignee" --arg d "$delivered" --arg w "$why" --arg c "$chat"
   elif (( delivered )); then
     ok "$ident follow-up recorded and sent to $assignee" \
        '{ident:$i, assignee:$a, recorded:true, delivered:true, reply_to_chat:(($c|select(length>0)) // null)}' \
