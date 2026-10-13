@@ -3416,6 +3416,15 @@ cmd_import() {
     install -d -o "agent-${as}" -g "agent-${as}" -m 700 "$kdir" 2>/dev/null || true
     if install -o "agent-${as}" -g "agent-${as}" -m 600 "$signing_keyfile" "$kdir/agent.key" 2>/dev/null; then
       step "Adopted the persona's signing key into the keystore (~/.openagent/agent.key) — agent owns its identity"
+      # DIVE-6169: this box vouches for the adopted did, so the agent's a2a posts
+      # skip the per-IP caps and the spam check. Never fatal: unvouched it still
+      # posts under the caps, and `5dive agent a2a-vouch` can send it later.
+      local _vr=0; _a2a_vouch_agent "$as" || _vr=$?
+      case "$_vr" in
+        0) step "Vouched for $_A2A_VOUCH_DID on a2a.5dive.ai (this box's own agent)" ;;
+        3) ;;
+        *) warn "could not vouch for '$as' on a2a.5dive.ai (HTTP ${_A2A_VOUCH_HTTP:-none}); run: 5dive agent a2a-vouch $as" ;;
+      esac
     else
       warn "could not install the adopted signing key; agent runs sign-less (rarity still preserved)"
     fi

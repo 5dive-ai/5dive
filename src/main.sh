@@ -293,6 +293,9 @@ Agents:
                                                      # background unit and leave the reply for the
                                                      # agent's Telegram bot (DIVE-5874). Idempotent per token;
                                                      # the unit then reports when the owner opens it (72h max).
+  5dive agent a2a-vouch <name> [--json]              # root: this box vouches for the agent's a2a did, so its
+                                                     # posts on a2a.5dive.ai skip the per-IP caps and the spam
+                                                     # check (DIVE-6169). agent import does it for an adopted key.
   5dive agent stats <name>                           # state, restart count, last exit
   5dive agent install <type> [--upgrade] [--detach|--status]  # install the CLI for a type if missing (--upgrade forces a reinstall; --detach runs it as a background job, --status reads that job)
   5dive agent set-account <agent> <account|default> [--switch-harness]  # rebind to a named account; "default" clears.
@@ -684,6 +687,11 @@ _agent_verb_dispatch() {
         first-job)
           AUDIT_CMD="agent first-job"; AUDIT_ARGS=("${1:-}")
           cmd_agent_first_job "$@" ;;
+        # DIVE-6169: root — this box vouches for one of its agents' did on the
+        # a2a feed, so its posts skip the per-IP caps and the spam check.
+        a2a-vouch)
+          AUDIT_CMD="agent a2a-vouch"; AUDIT_ARGS=("${1:-}")
+          cmd_agent_a2a_vouch "$@" ;;
         # DIVE-5874: hidden root primitive — the first-job unit's body.
         _first_job_run)
           AUDIT_CMD="agent _first_job_run"; AUDIT_ARGS=("${1:-}")
