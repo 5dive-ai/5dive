@@ -257,6 +257,19 @@ cmd_agent_default_skills() {
   default_agent_skill_specs
 }
 
+# Hidden read-only primitive behind `5dive agent _skills_install_dir <name>`
+# (main.sh, DIVE-6148). Prints the $HOME-relative dir that agent's skills land in
+# — the type comes from the registry, the dir from skills_install_dir, so the
+# standalone refresh script asks the resolver instead of restating the type map.
+# The refresh keeps its never-booted guard only where this starts with .claude/:
+# a codex seat installs to .agents/skills and may never grow a ~/.claude, so the
+# old guard on ~/.claude alone counted it "awaiting first boot" for weeks.
+# An unrecorded type resolves to the .claude/skills fallback, which keeps the guard.
+cmd_agent_skills_install_dir() {
+  [[ $# -eq 1 && -n "$1" ]] || fail "$E_USAGE" "usage: 5dive agent _skills_install_dir <name>"
+  skills_install_dir "$(agent_type "$1")"
+}
+
 # Seed every default skill onto one agent, for one harness type. Best-effort per
 # skill (`|| true`): if npx isn't reachable yet (cold box, no network) the agent
 # still boots and the operator can re-trigger from the dashboard's Skills block,

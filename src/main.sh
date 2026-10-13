@@ -726,6 +726,11 @@ _agent_verb_dispatch() {
         # the bundle with no way to source src/, reads the same list the provisioner
         # seeds instead of carrying a second copy that drifts. No root, no state.
         _default_skills) cmd_agent_default_skills "$@" ;;
+        # DIVE-6148: hidden read-only primitive — the $HOME-relative skills dir for
+        # one agent (registry type -> skills_install_dir). 5dive-refresh-skills.sh
+        # reads it to apply the never-booted ~/.claude guard only to seats whose
+        # skills live under ~/.claude.
+        _skills_install_dir) cmd_agent_skills_install_dir "$@" ;;
         # DIVE-3966: hidden installer migration for existing Codex seats.
         _sync_codex_baseline) cmd_agent_sync_codex_baseline "$@" ;;
         # DIVE-4667: hidden installer migration for stable OpenAgent ids and
