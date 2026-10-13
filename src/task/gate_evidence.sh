@@ -2232,6 +2232,17 @@ _gate_pr_shas() {
       2>/dev/null || true
 }
 
+# DIVE-6147: _gate_pr_base_oid <ref> <tok> [slug] — the PR's `baseRefOid`, the
+# commit its own diff is taken against. Same shape and fail-open contract as
+# _gate_pr_shas: EMPTY when the forge could not be asked, never a guess.
+_gate_pr_base_oid() {
+  local ref="$1" tok="$2" slug="${3:-}"
+  local -a repo_arg=()
+  [[ "$ref" =~ ^[0-9]+$ ]] && repo_arg=(--repo "$slug")
+  _gate_gh "$tok" 10 pr view "$ref" "${repo_arg[@]}" \
+      --json baseRefOid -q '.baseRefOid // ""' 2>/dev/null || true
+}
+
 # DIVE-2101: _gate_branch_ancestry <slug> <branch> <tok> — is <branch>'s tip an
 # ANCESTOR of that repo's main? Prints "1" (yes: every commit on the branch is
 # already on main), "0" (demonstrably not) or EMPTY when the question could not be

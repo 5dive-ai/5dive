@@ -1166,6 +1166,66 @@ _task_grade_pr_shas() {  # <id>
   printf '%s' "$pair"
 }
 
+# `_task_grade_pr_base <id>` prints the DELIVERY PR's baseRefOid, or EMPTY when
+# the forge could not be asked (DIVE-6147). Same fail-open contract as above.
+_task_grade_pr_base() {  # <id>
+  local id="$1" dref tok slug oid
+  declare -F _gate_pr_base_oid >/dev/null 2>&1 || return 1
+  declare -F _gate_gh_token >/dev/null 2>&1 || return 1
+  dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  [[ -n "$dref" ]] || return 1
+  slug=$(_gate_slug_from_url "$dref" 2>/dev/null || printf '')
+  tok=$(_gate_gh_token 2>/dev/null) || tok=""
+  oid=$(_gate_pr_base_oid "$dref" "$tok" "$slug" 2>/dev/null) || oid=""
+  [[ "$oid" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s' "$oid"
+}
+
+# `_task_grade_diff_base <id> <repo> <sha> <pr-state>` prints `<base>\x1f<source>`
+# — the commit the packet's diff is taken from, and where it came from.
+#
+# DIVE-6147. The base used to be `merge-base <sha> origin/main` in the DELIVERY
+# repo, whose `origin/main` nothing fetches. Measured on DIVE-712 (2026-10-12):
+# that ref was 64 commits behind PR #1311's base, so base..sha spanned 221 files
+# and 1.48 MB while the PR changed 3, and the byte cap cut two of the three out.
+# The grader is told to judge ONLY the packet, so that packet graded commits the
+# maker never wrote and none of the code they did.
+#
+# So when the PR was read, the base is the PR's own: merge-base of the served sha
+# and the PR's baseRefOid, which is the three-dot diff `gh pr diff` shows. An
+# absent baseRefOid is fetched into the checkout as OBJECTS ONLY
+# (--no-write-fetch-head, no refspec): reading is fine, moving another seat's
+# refs is not. The local merge-base stays as the fallback for an unbound or
+# unreadable row, and the source is always printed so a fallback cannot pass
+# for the PR's diff.
+_task_grade_diff_base() {  # <id> <repo> <sha> <pr-state>
+  local id="$1" repo="$2" sha="$3" state="$4" prb="" base="" src
+  case "$state" in
+    match|superseded|superseded-absent) prb=$(_task_grade_pr_base "$id" 2>/dev/null) || prb="" ;;
+  esac
+  if [[ -n "$prb" ]]; then
+    git --git-dir="$repo" cat-file -e "${prb}^{commit}" 2>/dev/null \
+      || timeout 60 git --git-dir="$repo" fetch -q --no-tags --no-write-fetch-head origin "$prb" >/dev/null 2>&1 \
+      || true
+    if git --git-dir="$repo" cat-file -e "${prb}^{commit}" 2>/dev/null; then
+      base=$(git --git-dir="$repo" merge-base "$sha" "$prb" 2>/dev/null || printf '')
+    fi
+    [[ -n "$base" ]] && { printf '%s\x1f%s' "$base" "pr-base (pull-request base ${prb:0:12})"; return 0; }
+  fi
+  if base=$(git --git-dir="$repo" merge-base "$sha" origin/main 2>/dev/null) && [[ -n "$base" ]]; then
+    src="merge-base-local (this checkout's origin/main, which nothing fetches"
+  else
+    base=$(git --git-dir="$repo" rev-parse "${sha}^" 2>/dev/null || printf '')
+    src="parent-commit (no merge-base with this checkout's origin/main"
+  fi
+  if [[ -n "$prb" ]]; then
+    src+="; the pull request's base ${prb:0:12} could not be fetched here, so this diff MAY CARRY COMMITS THE MAKER DID NOT WRITE — grade from \`gh pr diff\`)"
+  else
+    src+="; no pull-request base was readable)"
+  fi
+  printf '%s\x1f%s' "$base" "$src"
+}
+
 # `_task_grade_table_sha <table>` — the sha the stored computed table was produced
 # at, read off its own `GRADE <ident> @ <sha12> (base <base12>)` header. Prints
 # empty for a NOT COMPUTED table, which has no `@ <sha>` at all.
@@ -1323,7 +1383,9 @@ cmd_task_grade_context() {
     printf '%s' "$digest" >"$seal"; chmod 600 "$seal" 2>/dev/null || true
   fi
   _task_grade_tree_assert "$id" "$ident" "$tree" 1
-  base=$(git --git-dir="$repo" merge-base "$sha" origin/main 2>/dev/null || git --git-dir="$repo" rev-parse "${sha}^" 2>/dev/null || printf '')
+  local _base_src
+  _res=$(_task_grade_diff_base "$id" "$repo" "$sha" "$_sha_state")
+  base="${_res%%$'\x1f'*}"; _base_src="${_res#*$'\x1f'}"
   [[ -n "$base" ]] || fail "$E_CONFLICT" "$ident cannot resolve a diff base for $sha — REJECT (DIVE-4634)"
   diff=$(git -C "$tree" diff --no-ext-diff --unified=3 "$base" "$sha" -- | head -c "${FIVEDIVE_GRADE_DIFF_MAX_BYTES:-131072}" || true)
   claim=$(printf '%s\n' "$result" | _task_grade_claim_block)
@@ -1381,6 +1443,7 @@ MODE: ${mode}
 GRADE_TREE: ${tree}
 DELIVERED_SHA: ${sha}
 BASE_SHA: ${base}
+BASE_SOURCE: ${_base_src}
 PR_HEAD_CHECK: ${_sha_state}${_pr_head:+ (pull-request head ${_pr_head:0:12})}${_sha_note:+
 ⚠️  ${_sha_note}}
 ${_gc_comp}
