@@ -154,9 +154,12 @@ Agents:
                                                      # boundary when its account's 7d is 15+ points above the
                                                      # least-used one, so the pool drains evenly (DIVE-6106)
   5dive agent rotation rotate <agent> [--cooldown-current=<epoch>] [--require-live-headroom]
-                                     [--if-current-near-wall]
+                                     [--if-current-near-wall] [--wall=<reset-epoch>]
                                                      # move the seat onto the next account in its pool;
-                                                     # --cooldown-current parks the one it left until <epoch>
+                                                     # --cooldown-current parks the one it left until <epoch>;
+                                                     # --wall is the seat's own usage-limit move: headroom-only,
+                                                     # parks the walled account, never chains within 30m. A
+                                                     # seat may run `rotate <itself> --wall=<epoch>` (DIVE-6121)
   5dive agent rotation cooldown <agent> <account> --until=<epoch>
                                                      # park one account for this seat until <epoch>
   5dive agent rotation clear-cooldown <agent> [<account>]
@@ -937,7 +940,7 @@ _agent_verb_dispatch() {
               with_registry_lock cmd_agent_rotation_set "$@" ;;
             rotate)
               AUDIT_CMD="agent rotation rotate"; AUDIT_ARGS=("$@")
-              with_registry_lock cmd_agent_rotation_rotate "$@" ;;
+              agent_rotation_rotate_dispatch "$@" ;;
             cooldown)
               AUDIT_CMD="agent rotation cooldown"; AUDIT_ARGS=("$@")
               with_registry_lock cmd_agent_rotation_cooldown "$@" ;;
