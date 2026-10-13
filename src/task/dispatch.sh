@@ -151,7 +151,9 @@ _task_usage() {
   unpark <id>                                   clear a park early
   escalate <id> [--from=<who>]                  bump priority a tier, ping the owner
   followup <id> --text="..." [--from=<who>]     the owner's follow-up: append it to the
-                                                body, send it to the assignee (--wake)
+                                                body, send it to the assignee (--wake);
+                                                on a done/cancelled row it files a child
+                                                task for the assignee instead
   rm <id>                                       delete (cascades subtasks + edges)
 
   need <id> --type=decision|secret|approval|manual|access --ask="..."|--ask-file=<path>

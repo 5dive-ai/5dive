@@ -2314,8 +2314,6 @@ cmd_task_followup() {
 
   local status assignee title
   status=$(db "SELECT status FROM tasks WHERE id=${id};")
-  [[ "$status" != "done" && "$status" != "cancelled" ]] \
-    || fail "$E_VALIDATION" "$ident is $status — nothing to follow up. File a new task instead."
   assignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
   [[ -n "$assignee" ]] \
     || fail "$E_VALIDATION" "$ident has no assignee, so nobody would get the follow-up — assign it first: 5dive task assign $ident <agent>"
@@ -2326,14 +2324,40 @@ cmd_task_followup() {
   title=$(db "SELECT title FROM tasks WHERE id=${id};")
 
   local actor; actor=$(task_actor "$from")
-  local stamp; stamp=$(date -u '+%Y-%m-%d %H:%MZ')
-  local body newbody
-  body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
-  local note="--- Follow-up from the owner, ${stamp}:"$'\n'"${text}"
-  if [[ -n "$body" ]]; then newbody="${body}"$'\n\n'"${note}"; else newbody="$note"; fi
-  _task_body_size_guard "$newbody" "$ident" "task followup"
-  db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
-  _task_store_audit_log "task followup" "ok" 0 -- "task=$ident" "actor=$actor" "to=$assignee" 2>/dev/null || true
+  # DIVE-6157: a follow-up on a FINISHED row files a new child row instead of
+  # refusing (lodar 2026-10-13: "even finished tasks should have a follow-up
+  # option"). It never reopens the row: done is terminal, and a reopen would
+  # scramble its verifier, landing and result history. The child is an ordinary
+  # `task add` — same assignee, the owner's text as its brief, the finished row
+  # and its result cited — so every filing guard still applies to it.
+  local child="" child_id="" ctitle=""
+  if [[ "$status" == "done" || "$status" == "cancelled" ]]; then
+    local oneline="${text//[$'\n\r\t']/ }" cbody presult prio out rc
+    ctitle="Follow-up: ${oneline:0:60}"
+    (( ${#oneline} > 60 )) && ctitle+="…"
+    presult=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+    prio=$(db "SELECT COALESCE(priority,'medium') FROM tasks WHERE id=${id};")
+    cbody="${text}"$'\n\n'"Follows ${ident}: ${title}"
+    [[ -n "$presult" ]] && cbody+=$'\n'"Its result: ${presult}"
+    out=$( ( JSON_MODE=1 cmd_task_add --parent="$ident" --assignee="$assignee" --priority="$prio" \
+             ${from:+--from="$from"} --body="$cbody" -- "$ctitle" ) 2>/dev/null ); rc=$?
+    child=$(jq -r '.data.ident // empty' <<<"$out" 2>/dev/null | tail -n1)
+    child_id=$(jq -r '.data.id // empty' <<<"$out" 2>/dev/null | tail -n1)
+    if (( rc != 0 )) || [[ -z "$child" ]]; then
+      local why; why=$(jq -r '.error.message // empty' <<<"$out" 2>/dev/null | tail -n1)
+      fail "$E_VALIDATION" "$ident is $status, and its follow-up could not be filed as a new task: ${why:-task add failed}"
+    fi
+    _task_store_audit_log "task followup" "ok" 0 -- "task=$ident" "child=$child" "actor=$actor" "to=$assignee" 2>/dev/null || true
+  else
+    local stamp; stamp=$(date -u '+%Y-%m-%d %H:%MZ')
+    local body newbody
+    body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+    local note="--- Follow-up from the owner, ${stamp}:"$'\n'"${text}"
+    if [[ -n "$body" ]]; then newbody="${body}"$'\n\n'"${note}"; else newbody="$note"; fi
+    _task_body_size_guard "$newbody" "$ident" "task followup"
+    db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
+    _task_store_audit_log "task followup" "ok" 0 -- "task=$ident" "actor=$actor" "to=$assignee" 2>/dev/null || true
+  fi
 
   # The owner's chat on this seat's bot, when the pairing names exactly one.
   local chat=""
@@ -2341,6 +2365,7 @@ cmd_task_followup() {
     [[ -n "$OA_OWNER_TG" && "$OA_OWNER_TG" != *$'\n'* ]] && chat="$OA_OWNER_TG"
   fi
   local msg="📝 Follow-up on ${ident} \"${title}\" from the owner: ${text}"$'\n\n'"It is recorded on the task (5dive task show ${ident}). Act on it and answer the owner in your Telegram chat."
+  [[ -n "$child" ]] && msg="📝 Follow-up on ${ident} \"${title}\" (${status}) from the owner: ${text}"$'\n\n'"It is filed as a new task, ${child} (5dive task show ${child}). Work it there and answer the owner in your Telegram chat."
   local -a send=(--wake --message="$msg")
   valid_sender_label "$actor" && send+=(--from="$actor")
   [[ -n "$chat" ]] && send+=(--reply-to-chat="$chat")
@@ -2352,7 +2377,12 @@ cmd_task_followup() {
     [[ -n "$why" ]] || why="the send failed"
   fi
 
-  if (( delivered )); then
+  if [[ -n "$child" ]]; then
+    (( delivered )) || warn "$child filed, but $assignee did not get the message: $why"
+    ok "$ident is $status — follow-up filed as $child for $assignee" \
+       '{ident:$i, child:$k, child_id:($ki|tonumber? // null), child_title:$kt, assignee:$a, recorded:true, delivered:($d=="1"), why:(($w|select(length>0)) // null), reply_to_chat:(($c|select(length>0)) // null)}' \
+       --arg i "$ident" --arg k "$child" --arg ki "$child_id" --arg kt "$ctitle" --arg a "$assignee" --arg d "$delivered" --arg w "$why" --arg c "$chat"
+  elif (( delivered )); then
     ok "$ident follow-up recorded and sent to $assignee" \
        '{ident:$i, assignee:$a, recorded:true, delivered:true, reply_to_chat:(($c|select(length>0)) // null)}' \
        --arg i "$ident" --arg a "$assignee" --arg c "$chat"
