@@ -3562,18 +3562,74 @@ _sup_act_exec() {  # <name> <verb> <cause>
 # caller can distinguish a completed profile flip from the normal, successful
 # "no eligible target" result. The latter must alert a person once rather than
 # falling back into the stalled-seat nudge ladder.
+#
+# DIVE-6149: the move RESUMES the walled turn. The restart cmd_config schedules
+# used to bring the seat up fresh, so a chat or timer turn that hit the wall was
+# lost (two seats, 2026-10-13 06:30Z) — only board rows get the
+# checkpoint/requeue above. So the one-shot resume marker is armed first, exactly
+# as the telegram plugin's own wall rotate does (DIVE-6121), and dropped again
+# when no move happens.
 _sup_quota_rotate() {  # <name>; 0=rotated, 1=no measured target, 2=failed
-  local name="$1" out
+  local name="$1" out armed=""
+  armed=$(_sup_arm_wall_resume "$name") || armed=""
   if ! out=$(JSON_MODE=1 with_registry_lock cmd_agent_rotation_rotate "$name" --require-live-headroom 2>/dev/null); then
+    [[ -n "$armed" ]] && rm -f "$armed"
     return 2
   fi
   if jq -e '.ok == true and .data.rotated == true' <<<"$out" >/dev/null 2>&1; then
     return 0
   fi
+  [[ -n "$armed" ]] && rm -f "$armed"
   if jq -e '.ok == true and .data.rotated == false' <<<"$out" >/dev/null 2>&1; then
     return 1
   fi
   return 2
+}
+
+# _sup_arm_wall_resume <name> — write the launcher's one-shot resume marker
+# (5dive-agent-start: line 1 the session id it adds as `--resume`, line 2 the
+# first prompt) for a claude seat, and print its path. Prints nothing and arms
+# nothing when the seat is not claude, has no transcript, or already holds a
+# marker (its own plugin armed one; that one is left alone, and not ours to
+# remove). Line 2 mirrors the plugin's resumePrompt(): reply to the latest
+# message only when an inbound is unanswered, else a bare "continue".
+# _SUP_RESUME_HOME_ROOT is a harness seam (homes at <root>/agent-<name>); in
+# production the home is the seat user's passwd entry (agent-<name>, or the
+# bare name for the `claude` seat, as _sup_true_poller_count resolves it).
+_sup_arm_wall_resume() {
+  local name="$1" type home="" dir marker tx sid prompt="continue" owner tmp
+  type=$(registry_read 2>/dev/null | jq -r --arg n "$name" '.agents[$n].type // "claude"' 2>/dev/null) || return 1
+  [[ "$type" == "claude" ]] || return 1
+  if [[ -n "${_SUP_RESUME_HOME_ROOT:-}" ]]; then
+    home="${_SUP_RESUME_HOME_ROOT}/agent-${name}"
+  else
+    home=$(getent passwd "agent-${name}" 2>/dev/null | cut -d: -f6)
+    [[ -n "$home" ]] || home=$(getent passwd "$name" 2>/dev/null | cut -d: -f6)
+  fi
+  [[ -n "$home" ]] || return 1
+  [[ -d "$home/.claude/projects" ]] || return 1
+  # The session's own transcript sits at projects/<proj>/<sid>.jsonl; subagent
+  # transcripts are one level deeper and are not resumable sessions.
+  tx=$( { find "$home/.claude/projects" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' \
+            -printf '%T@ %p\n' 2>/dev/null || true; } | sort -rn | head -1 | cut -d' ' -f2-)
+  sid=$(basename "${tx:-x}" .jsonl)
+  [[ "$sid" =~ ^[0-9a-fA-F-]{36}$ ]] || return 1
+  dir="$home/.claude/channels/telegram"
+  marker="$dir/resume-next"
+  [[ -e "$marker" ]] && return 1
+  if jq -e '(.lastInboundAt // 0) > (.lastReplyAt // 0)' "$dir/silence.json" >/dev/null 2>&1; then
+    prompt="continue and reply to the latest message"
+  fi
+  owner=$(stat -c '%U:%G' "$home/.claude" 2>/dev/null) || return 1
+  if [[ ! -d "$dir" ]]; then
+    install -d -m 700 -o "${owner%%:*}" -g "${owner##*:}" "$dir" 2>/dev/null || return 1
+  fi
+  tmp="${marker}.tmp.$$"
+  printf '%s\n%s\n' "$sid" "$prompt" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null
+  chown "$owner" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$marker" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  printf '%s' "$marker"
 }
 
 # DIVE-4055: a wall observed while a seat owns live work is a checkpoint

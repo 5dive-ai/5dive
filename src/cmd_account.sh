@@ -448,9 +448,14 @@ HEADROOM_MAX_PCT="${HEADROOM_MAX_PCT:-90}"
 # measured, and chaining only bounces the seat across the pool.
 ROTATION_WALL_CHAIN_SECS="${ROTATION_WALL_CHAIN_SECS:-1800}"
 [[ "$ROTATION_WALL_CHAIN_SECS" =~ ^[0-9]+$ ]] || ROTATION_WALL_CHAIN_SECS=1800
+#
+# DIVE-6149: both readers below take the TRUSTED reading. A seat that just moved
+# for a wall still holds the 100% cache it rendered on the account it left, and
+# read through account_best_ratelimits that cache — fresh by mtime — made its NEW
+# account look walled to every seat after it in the same tick.
 account_has_live_headroom() {
   local account="$1" rl now
-  rl=$(account_best_ratelimits "$account")
+  rl=$(account_trusted_ratelimits "$account")
   [[ -n "$rl" ]] || return 1
   now=$(date +%s)
   jq -e --argjson now "$now" --argjson fresh "$HEADROOM_FRESH_SECS" \
@@ -473,7 +478,7 @@ account_has_live_headroom() {
 # near its wall when either observed window is at/above HEADROOM_MAX_PCT.
 account_near_wall_state() {
   local account="$1" rl now
-  rl=$(account_best_ratelimits "$account")
+  rl=$(account_trusted_ratelimits "$account")
   [[ -n "$rl" ]] || { printf 'unmeasured'; return 0; }
   now=$(date +%s)
   jq -r --argjson now "$now" --argjson fresh "$HEADROOM_FRESH_SECS" \
@@ -490,18 +495,95 @@ account_near_wall_state() {
   ' <<<"$rl" 2>/dev/null || printf 'unmeasured'
 }
 
+# DIVE-6149: an account NOBODY is on has no fresh statusline, so the live fence
+# above never passes it, and evacuating an account made it dark until something
+# unmeasured landed a seat there. Measured 2026-10-13: mp's 5h window reset at
+# 03:00Z and sat empty for 3h20m while nine walled seats piled onto mark.
+#
+# account_remembered_reading <account> — the newest reading ever taken of the
+# account, at any age: the trusted bound-seat caches (a seat's cache from its
+# PREVIOUS account is skipped) and the reading remembered on the account itself
+# (usage.json, written by the usage publisher and the balance probe).
+account_remembered_reading() {
+  local account="$1" best rec rl at best_at=-1
+  best=$(account_trusted_ratelimits "$account" 2>/dev/null) || best=""
+  [[ -n "$best" ]] && { best_at=$(jq -r '.asOf // -1' <<<"$best" 2>/dev/null) || best_at=-1; }
+  [[ "$best_at" =~ ^[0-9]+$ ]] || best_at=-1
+  rec=$(account_usage_record_path "$account")
+  if [[ -r "$rec" ]]; then
+    rl=$(jq -c '{asOf, fiveHourPct: (.fiveHour.pct // null), fiveResetsAt: (.fiveHour.resetsAt // null),
+                 sevenDayPct: (.sevenDay.pct // null), sevenResetsAt: (.sevenDay.resetsAt // null)}' \
+           "$rec" 2>/dev/null) || rl=""
+    if [[ -n "$rl" ]]; then
+      at=$(jq -r '.asOf // -1' <<<"$rl" 2>/dev/null) || at=-1
+      [[ "$at" =~ ^[0-9]+$ ]] && (( at > best_at )) && best="$rl"
+    fi
+  fi
+  printf '%s' "${best:-}"
+}
+
+# account_remembered_room <account> — exit 0 when that remembered reading PROVES
+# room now, whatever its age: its 5h window has reset since it was taken (so 5h
+# is known to be ~0), and its 7d window has either reset too or read under
+# HEADROOM_MAX_PCT with its reset still ahead (7d only grows inside a window, so
+# an old reading under the bar is a floor, and the reset ahead pins the window).
+# A reading with either reset unknown proves nothing.
+#
+# account_remembered_room_reading <account> prints what that proof implies NOW,
+# in the usage_read_ratelimits shape (5h 0, 7d 0 if its window reset too, else
+# the remembered floor; asOf now, remembered:true), or nothing when there is no
+# proof. Balance mode ranks a dark account on it when the live probe is down.
+account_remembered_room_reading() {
+  local account="$1" rl now
+  rl=$(account_remembered_reading "$account")
+  [[ -n "$rl" ]] || return 0
+  now=$(date +%s)
+  jq -c --argjson now "$now" --argjson max "$HEADROOM_MAX_PCT" '
+    select(((.fiveResetsAt | type) == "number") and (.fiveResetsAt <= $now)
+           and ((.sevenResetsAt | type) == "number")
+           and ((.sevenResetsAt <= $now)
+                or (((.sevenDayPct | type) == "number") and (.sevenDayPct < $max))))
+    | {asOf: $now, fiveHourPct: 0, fiveResetsAt: null,
+       sevenDayPct: (if .sevenResetsAt <= $now then 0 else .sevenDayPct end),
+       sevenResetsAt: (if .sevenResetsAt <= $now then null else .sevenResetsAt end),
+       remembered: true, rememberedAt: .asOf}
+  ' <<<"$rl" 2>/dev/null
+}
+account_remembered_room() {
+  [[ -n "$(account_remembered_room_reading "$1")" ]]
+}
+
 # rotation_live_headroom_candidates <json-array> — preserve candidate order but
-# keep only profiles with a fresh, measured capacity verdict. Split out so the
-# DIVE-3822 destination fence is testable without mutating a real registry.
+# keep only profiles with a capacity verdict: a fresh measurement under the bar,
+# or (DIVE-6149) no fresh measurement at all and a remembered reading that
+# proves room. A FRESH reading always decides — an account measured at its wall
+# is never a destination, whatever it remembers.
 rotation_live_headroom_candidates() {
   local candidates="$1" measured="[]" cand
   while IFS= read -r cand; do
     [[ -n "$cand" ]] || continue
-    if account_has_live_headroom "$cand"; then
+    if account_has_live_headroom "$cand" \
+       || { [[ "$(account_near_wall_state "$cand")" == "unmeasured" ]] \
+            && account_remembered_room "$cand"; }; then
       measured=$(jq -cn --argjson acc "$measured" --arg a "$cand" '$acc + [$a]')
     fi
   done < <(jq -r '.[]' <<<"$candidates")
   printf '%s' "$measured"
+}
+
+# rotation_spread_candidates <reg> <candidates-json> — DIVE-6149 stampede
+# damping. Every seat leaving a wall in the same window reads the same numbers
+# and picked the same first destination: nine seats burned mark's 5h in ~20
+# minutes. Each move re-points the binding in the registry under the registry
+# lock, so the NEXT seat's read already counts the ones moved before it this
+# tick. Stable sort by seats bound to each destination, fewest first; the
+# incoming order (pool preference, or the balance order) breaks ties.
+rotation_spread_candidates() {
+  local reg="$1" candidates="$2"
+  jq -c --argjson c "$candidates" '
+    (reduce (.agents // {} | to_entries[] | .value.authProfile // empty) as $p ({}; .[$p] += 1)) as $bound
+    | [ $c | to_entries[] | {name: .value, i: .key, n: ($bound[.value] // 0)} ]
+    | sort_by([.n, .i]) | map(.name)' <<<"$reg" 2>/dev/null || printf '%s' "$candidates"
 }
 
 # ---------------------------------------------------------------------------
@@ -721,6 +803,11 @@ account_balance_reading() {
         fiveHour: {pct: .fiveHourPct, resetsAt: .fiveResetsAt},
         sevenDay: {pct: .sevenDayPct, resetsAt: .sevenResetsAt},
         asOf, source: "probe", remembered: false}' <<<"$live")"
+    else
+      # DIVE-6149: no fresh reading and no probe — an account whose remembered
+      # reading proves room still ranks, on what that proof implies now.
+      live=$(account_remembered_room_reading "$account")
+      [[ -n "$live" ]] && rl="$live"
     fi
   fi
   printf '%s' "$rl"
@@ -780,15 +867,23 @@ rotation_pool_json() {
 # path's destination order when the seat has balance on: accounts under the 5h
 # burst floor first, each half in balance_rank order (lowest 7d, ties broken by
 # fewest active seats). Fixes the stampede onto the first measured account.
+#
+# DIVE-6149: inside each half the balance order is then spread by seats bound
+# (rotation_spread_candidates), so a stampede fans out across the accounts with
+# 5h room instead of all reading the same lowest 7d.
 rotation_balance_order_candidates() {
-  local reg="$1" candidates="$2" accts
+  local reg="$1" candidates="$2" accts under over
   accts=$(rotation_balance_accounts_json "$reg" "" "$candidates") || { printf '%s' "$candidates"; return 0; }
-  jq -c --argjson tie "$ROTATION_BALANCE_TIE_PCT" --argjson ff "$ROTATION_BALANCE_FIVE_FLOOR_PCT" \
+  under=$(jq -c --argjson tie "$ROTATION_BALANCE_TIE_PCT" --argjson ff "$ROTATION_BALANCE_FIVE_FLOOR_PCT" \
     "${ROTATION_BALANCE_JQ}"'
-    def under: (.fivePct | type) == "number" and .fivePct < $ff;
-    ([ .[] | select(under) ] | if length == 0 then [] else balance_rank($tie) end)
-    + ([ .[] | select(under | not) ] | if length == 0 then [] else balance_rank($tie) end)
-    | map(.name)' <<<"$accts"
+    [ .[] | select((.fivePct | type) == "number" and .fivePct < $ff) ]
+    | if length == 0 then [] else balance_rank($tie) | map(.name) end' <<<"$accts")
+  over=$(jq -c --argjson tie "$ROTATION_BALANCE_TIE_PCT" --argjson ff "$ROTATION_BALANCE_FIVE_FLOOR_PCT" \
+    "${ROTATION_BALANCE_JQ}"'
+    [ .[] | select(((.fivePct | type) == "number" and .fivePct < $ff) | not) ]
+    | if length == 0 then [] else balance_rank($tie) | map(.name) end' <<<"$accts")
+  jq -cn --argjson u "$(rotation_spread_candidates "$reg" "$under")" \
+         --argjson o "$(rotation_spread_candidates "$reg" "$over")" '$u + $o'
 }
 
 # rotation_balance_rotate <agent> --idle=<bool> --fresh=<bool> --new-task=<bool>
@@ -1786,6 +1881,9 @@ cmd_agent_rotation_rotate() {
     if [[ "$(jq -r --arg n "$name" '.agents[$n].rotation.balance // false' <<<"$reg")" == "true" \
           && "$candidates" != "[]" ]]; then
       candidates=$(rotation_balance_order_candidates "$reg" "$candidates")
+    else
+      # DIVE-6149: balance off still spreads — fewest seats bound first.
+      candidates=$(rotation_spread_candidates "$reg" "$candidates")
     fi
   fi
 
