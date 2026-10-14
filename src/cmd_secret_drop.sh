@@ -100,6 +100,28 @@ _secret_drop_gc() {
   done
 }
 
+# DIVE-6205: the latest expiry among this task's live links, or nothing. The
+# gate's alert mints one, and an agent that cannot see that mints a second: two
+# live links reach the owner, and using either burns both.
+_secret_drop_live_for() {
+  local ident="$1" now f exp best=""
+  now=$(date +%s)
+  for f in "$SECRET_DROP_DIR"/*; do
+    [[ -f "$f" ]] || continue
+    [[ "$(sed -n 's/^task=//p' "$f")" == "$ident" ]] || continue
+    exp=$(sed -n 's/^expires=//p' "$f")
+    [[ "$exp" =~ ^[0-9]+$ ]] && (( exp > now )) || continue
+    if [[ -z "$best" ]] || (( exp > best )); then best="$exp"; fi
+  done
+  [[ -n "$best" ]] || return 1
+  printf '%s' "$best"
+}
+
+# Who is asking for the link: an agent seat (directly or through sudo), or
+# nothing for a person or the box itself (the app's card, a root login). Its own
+# function so a harness can say who is calling.
+_secret_link_agent_caller() { _gate_authenticated_actor 2>/dev/null; }
+
 # Echo "<ident>\x1f<key>\x1f<connector>\x1f<expires>" for one stored link.
 _secret_drop_read() {
   local f="$1"
@@ -130,10 +152,11 @@ _secret_drop_burn_task() {
 # ---- secret link -----------------------------------------------------------
 
 _secret_link() {
-  local ref="" ttl="$SECRET_DROP_TTL_MIN" start=1
+  local ref="" ttl="$SECRET_DROP_TTL_MIN" start=1 again=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ttl=*)     ttl="${1#*=}" ;;
+      --again)     again=1 ;;   # DIVE-6205: mint although a link for the gate is live
       --no-start)  start=0 ;;   # tests / a box whose page is supervised elsewhere
       --*)         fail "$E_USAGE" "unknown flag: $1" ;;
       *)           [[ -z "$ref" ]] && ref="$1" || fail "$E_USAGE" "unexpected argument: $1" ;;
@@ -141,7 +164,7 @@ _secret_link() {
     shift
   done
   require_root secret link
-  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive secret link <DIVE-N> [--ttl=<minutes>] [--json]"
+  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive secret link <DIVE-N> [--ttl=<minutes>] [--again] [--json]"
   [[ "$ttl" =~ ^[0-9]+$ ]] && (( ttl >= 1 && ttl <= 60 )) || fail "$E_VALIDATION" "--ttl must be 1-60 minutes"
 
   resolve_task_id "$ref"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
@@ -154,6 +177,15 @@ _secret_link() {
     || fail "$E_CONFLICT" "$ident names no place on this box for the value (it was filed --out-of-band), so a link has nowhere to write it"
   _valid_env_key "$key" && _valid_connector "$connector" \
     || fail "$E_VALIDATION" "$ident drop target is malformed (${key} -> ${connector})"
+
+  # DIVE-6205: an AGENT asking while a link for this gate is live gets told so,
+  # not a second link. The owner already has one (the gate's alert carries it);
+  # a second one in chat is a link that dies the moment the first is used. The
+  # app's card asks as the box, not as an agent, and keeps minting its own.
+  local _live
+  if (( ! again )) && [[ -n "$(_secret_link_agent_caller)" ]] && _live=$(_secret_drop_live_for "$ident"); then
+    fail "$E_VALIDATION" "a one-time link for $ident is already live (sent with the gate's alert), until $(date -u -d "@$_live" '+%H:%M' 2>/dev/null || date -u -r "$_live" '+%H:%M') UTC. Do not send another: the owner has it, and using either link burns both. If the owner says theirs is lost, mint a new one with: sudo 5dive secret link ${ident} --again"
+  fi
 
   local base
   base=$(_secret_drop_base_url) \
@@ -362,15 +394,38 @@ _secret_drop_ensure_route() {
   [[ -f "$cf" ]] && command -v caddy >/dev/null 2>&1 || return 0
   _secret_drop_has_base_url && return 0
   domain=$(_secret_drop_domain) || return 0
-  grep -qE "^secrets\.${domain//./\\.}[[:space:]]*\{" "$cf" && return 0
+  local had=0
+  grep -qE "^secrets\.${domain//./\\.}[[:space:]]*\{" "$cf" && had=1
+  # DIVE-6205: a block from before the closed page is replaced, once.
+  if (( had )) && _secret_drop_route_current "$cf" "secrets.${domain}"; then
+    return 0
+  fi
   local bak; bak=$(mktemp "${cf}.dive5319.XXXXXX") || return 1
   cp -p "$cf" "$bak" || { rm -f "$bak"; return 1; }
+  if (( had )); then
+    _secret_drop_route_strip "$cf" "secrets.${domain}" || { mv -f "$bak" "$cf"; return 1; }
+  fi
+  # DIVE-6205: the page exits once no link is live, and a link opened after that
+  # (a spent one, or a chat app's link preview) got Caddy's bare, empty 502,
+  # which the owner read as a fake link. With the page down no link is live, so
+  # Caddy says so itself, in the page's own words (GONE[5]). Built before the
+  # heredoc: an unquoted heredoc carries no command substitution.
+  local closed_html; closed_html=$(_secret_drop_closed_html)
   cat >> "$cf" <<EOF
 
 # DIVE-5319: one-time secret drop links (5dive secret link). Its own name, so TLS
 # ends on this box: the root name is proxied by Cloudflare, *.<domain> is not.
 secrets.${domain} {
     reverse_proxy 127.0.0.1:${SECRET_DROP_PORT}
+    # DIVE-6205: the page is not running, so no link is live.
+    handle_errors {
+        @closed expression \`{err.status_code} in [502, 503, 504]\`
+        handle @closed {
+            header Content-Type "text/html; charset=utf-8"
+            header Cache-Control no-store
+            respond \`${closed_html}\` 410
+        }
+    }
 }
 EOF
   local out
@@ -387,6 +442,43 @@ EOF
   mv -f "$bak" "$cf"
   warn "secret drop: Caddyfile failed validate with the secrets.${domain} block; restored the previous file ($(caddy_validate_why "$out"))"
   return 1
+}
+
+# The page Caddy serves for a link while the page is not running. No backtick
+# and no newline: it sits inside one backtick-quoted Caddyfile token.
+_secret_drop_closed_html() {
+  printf '%s' "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=robots content=noindex><title>This request is closed</title></head><body style='font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem'><h1>This request is closed</h1><p>The agent no longer needs this, or it was already provided.</p></body></html>"
+}
+
+# The Caddyfile's site blocks named <name>: a line "<name> {" to the brace that
+# closes it. The name is compared as a string, never used as a regex.
+# rc 0 = such a block already carries handle_errors (the DIVE-6205 shape).
+_secret_drop_route_current() { # <caddyfile> <name>
+  SITE="$2" awk '
+    { l = $0; sub(/[[:space:]]*\{[[:space:]]*$/, "", l) }
+    !inb && l == ENVIRON["SITE"] && $0 ~ /\{[[:space:]]*$/ { inb = 1; depth = 0 }
+    inb { if ($0 ~ /handle_errors/) found = 1
+          depth += gsub(/\{/, "{"); depth -= gsub(/\}/, "}")
+          if (depth <= 0) inb = 0 }
+    END { exit found ? 0 : 1 }' "$1"
+}
+
+# Remove those blocks, and the DIVE-5319 comment right above each, in place.
+_secret_drop_route_strip() { # <caddyfile> <name>
+  local tmp; tmp=$(mktemp "${1}.dive6205.XXXXXX") || return 1
+  SITE="$2" awk '
+    { l = $0; sub(/[[:space:]]*\{[[:space:]]*$/, "", l) }
+    inb { depth += gsub(/\{/, "{"); depth -= gsub(/\}/, "}"); if (depth <= 0) inb = 0; next }
+    l == ENVIRON["SITE"] && $0 ~ /\{[[:space:]]*$/ {
+      n = 0; inb = 1; depth = gsub(/\{/, "{") - gsub(/\}/, "}"); if (depth <= 0) inb = 0; next }
+    { buf[++n] = $0 }
+    # Hold the DIVE-5319 comment (and blank lines) until we know what follows.
+    /^# DIVE-5319: one-time secret drop links/ || /^# ends on this box: the root name/ || /^[[:space:]]*$/ { next }
+    { for (i = 1; i <= n; i++) print buf[i]; n = 0 }
+    END { for (i = 1; i <= n; i++) print buf[i] }' "$1" > "$tmp" || { rm -f "$tmp"; return 1; }
+  if ! cat "$tmp" > "$1"; then rm -f "$tmp"; return 1; fi
+  rm -f "$tmp"
+  return 0
 }
 
 _secret_drop_has_base_url() {
@@ -557,13 +649,18 @@ GONE = {
     5: (410, "This request is closed", "The agent no longer needs this, or it was already provided."),
 }
 
+# DIVE-6205: a call that outlives this is NOT "nothing was saved". RAN_LONG is the
+# page's own code for it, outside any exit status the CLI returns.
+RUN_TIMEOUT = int(os.environ.get("FIVE_SECRET_DROP_RUN_TIMEOUT", "60"))
+RAN_LONG = -1
+
 def run(args, stdin=None):
     try:
         p = subprocess.run([BUNDLE, "secret"] + args + ["--json"], input=stdin,
-                           capture_output=True, timeout=60)
+                           capture_output=True, timeout=RUN_TIMEOUT)
         return p.returncode, p.stdout
     except subprocess.TimeoutExpired:
-        return 1, b""
+        return RAN_LONG, b""
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "5dive"
@@ -658,6 +755,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_page(200, page("Saved", "<h1>Saved on your server</h1><p><code>%s</code> is saved, "
                 "and your agent has been told it is there. Nothing else to do. You can close this tab.</p>"
                 % html.escape(what.get("key", "The value"))))
+        if rc == RAN_LONG:
+            # The value may well be on the server by now: the write comes first and
+            # the link may already be burned, so "try the link again" would be wrong.
+            return self.send_page(504, page("Not sure yet", "<h1>Not sure it saved</h1><p>Your server is still "
+                "working on it. It may have been saved. Ask your agent before trying again.</p>"))
         if rc != 0: return self.gone(rc)
         d = json.loads(out).get("data", {})
         return self.send_page(200, page("Saved", "<h1>Saved</h1><p>%s is on your server now, and %s has been told. "

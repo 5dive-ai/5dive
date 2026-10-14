@@ -112,9 +112,11 @@ got=$(_task_mint_drop_link DIVE-901)
 [[ "$got" == "https://secrets.box.example.com/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCd|30" ]] \
   && ok_t "T4a an admin seat (grant already covers 5dive) mints on the box -> url|ttl" \
   || bad_t "T4a an admin seat (grant already covers 5dive) mints on the box -> url|ttl" "got: $got"
-[[ "$(cat "$SUDO_LOG")" == "-n 5dive --json secret link DIVE-901" ]] \
-  && ok_t "T4b the mint is \`5dive secret link\` on this box, one sudo call, no probe" \
-  || bad_t "T4b the mint is \`5dive secret link\` on this box, one sudo call, no probe" "sudo calls: $(cat "$SUDO_LOG")"
+# --again (DIVE-6205): the alert IS the delivery, so the refusal meant for an
+# agent's second link never blocks it, a re-sent alert included.
+[[ "$(cat "$SUDO_LOG")" == "-n 5dive --json secret link DIVE-901 --again" ]] \
+  && ok_t "T4b the mint is \`5dive secret link --again\` on this box, one sudo call, no probe" \
+  || bad_t "T4b the mint is \`5dive secret link --again\` on this box, one sudo call, no probe" "sudo calls: $(cat "$SUDO_LOG")"
 
 for SEAT_TIER in standard sandboxed unknown:unregistered; do
   : > "$SUDO_LOG"
@@ -205,6 +207,29 @@ printf 'l1\nl2' | _secret_write SOLO --connector=solo >/dev/null 2>&1
 [[ "$(cat "$CONNECTORS_DIR/solo.env")" == "A=1"$'\n'"SOLO_FILE=$CONNECTORS_DIR/solo.d/SOLO" ]] \
   && ok_t "T7h a multi-line write over a single-line one drops the old KEY= line" \
   || bad_t "T7h a multi-line write over a single-line one drops the old KEY= line" "env=$(cat "$CONNECTORS_DIR/solo.env")"
+
+# --- T8: DIVE-6205 — task need's OK line says the alert carried a link ----------
+# teal-fox 2026-10-13: "[delivered to chat …]" read as the ask alone, and the
+# filer minted a second link by hand. The deliverer reports the link's ttl.
+task_need_notify() { TASK_SEND_TARGETS="1234567890"; TASK_GATE_DROP_LINK_TTL="${T8_TTL:-}"; return 0; }
+seed_task DIVE-908
+out=$(JSON_MODE=0; T8_TTL=30 cmd_task_need DIVE-908 --type=secret --ask="pypi token" --secret-key=PYPI_TOKEN --connector=pypi 2>&1); rc=$?
+exp_hm=$(date -u -d "+30 min" '+%H:%M')
+[[ $rc -eq 0 && "$out" == *"delivered to chat 1234567890 (no topic); one-time link sent to that chat, expires "*" UTC, so do not mint another"* ]] \
+  && [[ "$out" == *"expires ${exp_hm} UTC"* || "$out" == *"expires $(date -u -d "+29 min" '+%H:%M') UTC"* ]] \
+  && ok_t "T8a a secret gate whose alert carried a link says so: sent to whom, expiring when, do not mint another" \
+  || bad_t "T8a the OK line names the link" "rc=$rc out=$out"
+seed_task DIVE-909
+out=$(JSON_MODE=0; T8_TTL="" cmd_task_need DIVE-909 --type=secret --ask="pypi token" --secret-key=PYPI_TOKEN --connector=pypi 2>&1); rc=$?
+[[ $rc -eq 0 && "$out" == *"[delivered to chat 1234567890 (no topic)]"* && "$out" != *"one-time link"* ]] \
+  && ok_t "T8b control: an alert with no link keeps the plain 'delivered to' note" \
+  || bad_t "T8b no link, no link note" "rc=$rc out=$out"
+seed_task DIVE-910
+dle=$(T8_TTL=30 cmd_task_need DIVE-910 --type=secret --ask="pypi token" --secret-key=PYPI_TOKEN --connector=pypi 2>/dev/null | jq -r '.data.drop_link_expires_at // empty')
+[[ "$dle" =~ ^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]] \
+  && ok_t "T8c --json carries drop_link_expires_at for a caller that reads JSON" \
+  || bad_t "T8c JSON drop_link_expires_at" "got: $dle"
+task_need_notify() { :; }
 
 echo
 echo "secret-drop unit: $PASS passed, $FAIL failed"

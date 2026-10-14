@@ -82,6 +82,11 @@ got=$(mint)
 check 'B1 an admin seat mints: url|ttl, and one ok line' \
   '[[ "$got" == https://secrets.box.example.com/*"|30" && "$(lastline)" == *"gate-drop-link result=ok tasks=DIVE-9501"* ]]' \
   "got=$got log=$(lastline)"
+# DIVE-6205: the alert is the delivery; secret link refuses an agent's SECOND link
+# unless --again, and an admin seat's alert asks through sudo as that agent.
+mint >/dev/null
+check 'B1b the alert mints with --again (a re-sent alert is never refused as a second link)' \
+  '[[ "$(cat "$SUDO_LOG")" == "-n 5dive --json secret link DIVE-9501 --again" ]]' "sudo: $(cat "$SUDO_LOG")"
 
 SUDO_OUT=''; SUDO_RC=1; SUDO_ERR='sudo: a password is required'
 got=$(mint)

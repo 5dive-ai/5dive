@@ -5564,6 +5564,7 @@ db "BEGIN IMMEDIATE;
   # neither the window nor any reader — see the note at _task_gate_undo_window_secs.
   db "UPDATE tasks SET gate_urgent=${urgent} WHERE id=${id};" 2>/dev/null || true
   local _nrc=0
+  TASK_GATE_DROP_LINK_TTL=""   # DIVE-6205: set by the deliverer when the alert carries a link
   TASK_GATE_FILER="$actor" \
     task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" "$human_nonce" "$precedent_cite" || _nrc=$?
   # DIVE-2010: this used to also require $EUID to be root before auditing — the
@@ -5653,7 +5654,16 @@ db "BEGIN IMMEDIATE;
   # access.json the send will walk, resolved through the deliverer's own channel
   # resolver so the two cannot disagree.
   _dest=$(_task_send_targets_note) || _dest=""
-  if [[ -n "$_dest" ]]; then
+  local _lk_iso=""
+  if [[ -n "$_dest" && "${TASK_GATE_DROP_LINK_TTL:-}" =~ ^[0-9]+$ ]]; then
+    # DIVE-6205: "delivered to chat …" read as the ask alone, and the filer minted
+    # a second link by hand. Say a link went out, to whom, and until when.
+    local _lk_to _lk_exp
+    _lk_to=$(db "SELECT COALESCE(human_owner,'') FROM tasks WHERE id=${id};" 2>/dev/null) || _lk_to=""
+    _lk_exp=$(date -u -d "+${TASK_GATE_DROP_LINK_TTL} min" '+%H:%M UTC' 2>/dev/null) || _lk_exp="in ${TASK_GATE_DROP_LINK_TTL} min"
+    _lk_iso=$(date -u -d "+${TASK_GATE_DROP_LINK_TTL} min" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || _lk_iso=""
+    dest_note=" [delivered to ${_dest}; one-time link sent to ${_lk_to:-that chat}, expires ${_lk_exp}, so do not mint another]"
+  elif [[ -n "$_dest" ]]; then
     dest_note=" [delivered to ${_dest}]"
   elif (( _legacy )) && [[ "$notified" == "1" ]] && _task_gate_preview_channel "$actor" 2>/dev/null; then
     # NOT in a command substitution: _task_gate_preview_channel resolves TASK_CH_*
@@ -5711,6 +5721,6 @@ db "BEGIN IMMEDIATE;
     _nr_note=""
   fi
   ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note}${unnotified_note}${dest_note}${_nr_note} — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), delivered_to:(($dt|select(length>0)) // null), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg dt "${TASK_SEND_TARGETS:-}" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), delivered_to:(($dt|select(length>0)) // null), drop_link_expires_at:(($dle|select(length>0)) // null), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg dt "${TASK_SEND_TARGETS:-}" --arg dle "$_lk_iso" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }

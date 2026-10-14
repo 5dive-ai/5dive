@@ -2164,14 +2164,19 @@ cmd_task_answer() {
       pingmsg="${ident} gate cleared — your '${nt}' ask was answered. Resume the task; run \`5dive task show ${ident}\` for the value."
     fi
     local actor; actor=$(task_actor "$from")
-    # DIVE-5772: an owner who answered on the secure link's page has left the chat;
-    # wake the seat now rather than leave the ping waiting for its next turn.
-    local -a _wk=(); [[ "$from" == drop ]] && _wk=(--wake)
-    # DIVE-5689: a system notice — the owner's pane gets it, its Telegram group does not.
-    if valid_sender_label "$actor"; then
-      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" "${_wk[@]}" --from="$actor" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+    local -a _from=(); valid_sender_label "$actor" && _from=(--from="$actor")
+    if [[ "$from" == drop ]]; then
+      # DIVE-5772: an owner who answered on the secure link's page has left the chat;
+      # wake the seat now rather than leave the ping waiting for its next turn.
+      # DIVE-6205: but NOT while the page waits. A seat that is mid-turn holds the
+      # wake for up to AGENT_WAKE_BUDGET_SECS (105s), the page gives up on this verb
+      # at 60s, and the owner was told "Nothing was saved" about a value that was
+      # saved and a gate that was closed. The gate is recorded above; the wake
+      # runs detached, and the ping counts as sent once it is handed off.
+      _task_answer_ping_detached "$owner" --wake "${_from[@]}" --message="$pingmsg" && pinged=1 || true
     else
-      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" "${_wk[@]}" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+      # DIVE-5689: a system notice — the owner's pane gets it, its Telegram group does not.
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$owner" "${_from[@]}" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
     fi
   fi
 
@@ -2200,6 +2205,34 @@ cmd_task_answer() {
      '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1"), owner_busy_on:(($bo|select(length>0)) // null), option_account_frame:(if $af=="1" then {filer:$gf, answerer:$ga, second_person_refers_to:$ga} else null end)}' \
      --arg i "$id" --arg st "$newstatus" --arg nt "$nt" --arg v "$value" --arg o "$owner" --arg p "$pinged" --arg bo "$_busy_on" \
      --arg af "$_account_frame" --arg gf "$_frame_filer" --arg ga "$_frame_answerer"
+}
+
+# _task_answer_ping_detached <cmd_send args...> — DIVE-6205. The gate-answer ping,
+# run so that the caller does not wait for it: the secure link's page waits on
+# `task answer --from=drop`, and a wake into a mid-turn seat outlasts the page.
+# A transient systemd unit when this box has systemd and we are root (the page's
+# own unit stops, and kills what it started, once the page idles out, which can
+# come before a 105s wake ends); else a child with every inherited descriptor
+# closed (_task_detach_inherited_fds: a kept pipe would hold the caller's
+# command substitution open for the whole wake). rc 0 = handed off.
+_task_answer_ping_unit_ok() {
+  _gate_is_root || return 1
+  command -v systemd-run >/dev/null 2>&1 || return 1
+  [[ -d /run/systemd/system ]] || return 1
+  return 0
+}
+_task_answer_ping_detached() {
+  local self
+  if _task_answer_ping_unit_ok && self=$(five_self_bundle 2>/dev/null) && [[ -n "$self" ]]; then
+    systemd-run --quiet --collect --setenv=_5DIVE_SYSTEM_NOTICE=1 \
+      "$self" agent send "$@" >/dev/null 2>&1 && return 0
+  fi
+  ( {
+      exec 0</dev/null >/dev/null 2>&1
+      _task_detach_inherited_fds
+      _5DIVE_SYSTEM_NOTICE=1 cmd_send "$@"
+    } & ) || return 1
+  return 0
 }
 
 # cmd_task_escalate — DIVE-449: the /task_<id> Telegram "Escalate" button (and a

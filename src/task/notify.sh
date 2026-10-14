@@ -1703,7 +1703,9 @@ _task_mint_drop_link() {
     # Our own bundle, not whatever `5dive` PATH finds: a root cron sweep runs
     # with PATH=/usr/bin:/bin, where a bare word is "command not found".
     local five; five=$(five_self_bundle 2>/dev/null) || five=5dive
-    out=$("$five" --json secret link "$ident" 2>"$errf") || rc=$?
+    # --again (DIVE-6205): this IS the delivery, a re-sent alert included, so the
+    # live-link refusal meant for an agent's second link does not apply to it.
+    out=$("$five" --json secret link "$ident" --again 2>"$errf") || rc=$?
   else
     me=$(id -un 2>/dev/null)
     tier=$(agent_tier "${me#agent-}" 2>/dev/null)
@@ -1718,7 +1720,7 @@ _task_mint_drop_link() {
       _task_drop_link_log error "$ident" "admin seat ${me} could not mint: its shell runs with no_new_privs (a sandboxed agent shell), so sudo cannot run; the alert sends the owner to the app. Mint by hand: sudo 5dive secret link ${ident}"
       rm -f "$errf" 2>/dev/null; return 0
     fi
-    out=$(sudo -n 5dive --json secret link "$ident" 2>"$errf") || rc=$?
+    out=$(sudo -n 5dive --json secret link "$ident" --again 2>"$errf") || rc=$?
   fi
   url=$(printf '%s' "$out" | jq -r '.data.url // empty' 2>/dev/null)
   ttl=$(printf '%s' "$out" | jq -r '.data.ttl_minutes // empty' 2>/dev/null)
@@ -3165,6 +3167,10 @@ _task_need_notify_deliver_now() {
       if [[ -n "$secret_key" && -n "$connector" ]]; then
         _drop=$(_task_mint_drop_link "$ident" "$secret_key" "$connector")
       fi
+      # DIVE-6205: tell `task need`'s OK line that this alert carries a link, so
+      # the filer does not mint a second one. "<ttl minutes>", or unset.
+      # shellcheck disable=SC2034  # read by cmd_task_need (need.sh) after this returns
+      if [[ -n "$_drop" && "$_drop" != ONBOX ]]; then TASK_GATE_DROP_LINK_TTL="${_drop##*|}"; fi
       # DIVE-2411: the CTA text is a FUNCTION (_task_secret_gate_cta) rather than
       # four inline branches, so the prose can be graded. The remedy half of a fix
       # normally ships with the zero coverage that let the bug in — and here the
