@@ -135,6 +135,44 @@ nk=$(_hb_nudge_text dev "$K" "DIVE-$K")
 has "$nk" "COMPILE it to the team wiki" && ok_t "a knowledge-shaped row still gets the compile clause" \
                                         || bad_t "a knowledge-shaped row still gets the compile clause" "[$nk]"
 
+# DIVE-6205 (exact-swallow, 2026-10-14): the GATED line taught one shape with
+# --recommend for all four types, and `task need` refuses --recommend on a secret
+# or manual gate (and a secret gate needs a place for the value), so the command
+# an agent copies out of its own wake failed on 3 of 4 types. Here the line is
+# read OUT OF THE NUDGE and run, so the text and the validator cannot drift.
+db "DELETE FROM tasks;"; G=$(mk "a row that needs a human" dev)
+ng=$(_hb_nudge_text dev "$G" "DIVE-$G")
+gated="${ng#*GATED — \'}"; base="${gated%%\'*}"; extra="${gated#*\' if it needs a human (}"; extra="${extra%%)*}"
+sec="${extra#*secret: }"; sec="${sec%%;*}"; sec="${sec//<KEY>/PYPI_TOKEN}"
+# Split as a shell would (xargs honours the double quotes, and runs nothing);
+# every flag is kept as written, only the ask's placeholder is filled in.
+mapfile -t base_argv < <(xargs -n1 printf '%s\n' <<<"$base")
+need_try() { # <type> [extra flags...] — the nudge's own command, the type picked, the ask filled in
+  local ty="$1" a; shift; local -a argv=()
+  for a in "${base_argv[@]:4}"; do
+    case "$a" in
+      --type=*)    argv+=(--type="$ty") ;;
+      --ask=*)     argv+=(--ask="Can I ship it?") ;;
+      *)           argv+=("$a") ;;
+    esac
+  done
+  db "UPDATE tasks SET need_type=NULL, need_answered_at=NULL, status='todo' WHERE id=${G};"
+  ( task_need_notify() { :; }; cmd_task_need "${base_argv[3]}" "${argv[@]}" "$@" ) >"$TMP/need_try.out" 2>&1
+}
+[[ " ${base_argv[*]} " == *" --ask=<one crisp question> "* ]] || bad_t "the GATED line carries the ask placeholder" "[$base]"
+[[ "${base_argv[0]} ${base_argv[1]} ${base_argv[2]}" == "5dive task need" && "${base_argv[3]}" == "DIVE-$G" ]] \
+  || bad_t "the GATED line parses as a task need command" "[$base]"
+need_try manual; rc_m=$?
+read -r -a sec_argv <<<"$sec"
+need_try secret "${sec_argv[@]}"; rc_s=$?
+(( rc_m == 0 )) && ok_t "the nudge's GATED command passes for --type=manual as written" \
+                || bad_t "the nudge's GATED command must pass for --type=manual" "rc=$rc_m [$base] $(grep -m1 -i 'error\|only applies' "$TMP/need_try.out")"
+(( rc_s == 0 )) && ok_t "the nudge's GATED command plus its secret: flags passes for --type=secret" \
+                || bad_t "the nudge's GATED command must pass for --type=secret" "rc=$rc_s [$base] [$sec]"
+grep -qE -- '--type=decision\|approval\|secret\|manual[^;]*--recommend' src/cmd_heartbeat.sh "$POLICY" \
+  && bad_t "no surface teaches --recommend on all four gate types" "$(grep -nE -- '--type=decision\|approval\|secret\|manual[^;]*--recommend' src/cmd_heartbeat.sh "$POLICY" | cut -c1-160)" \
+  || ok_t "no surface teaches --recommend on all four gate types"
+
 # =============================================================================
 # PART 3 — the budget. This is the arm that reds when prose creeps back in.
 # =============================================================================

@@ -53,13 +53,15 @@ _secret_usage() {
       value lands as KEY=value in /home/claude/projects/<app>/.env.local when
       that file exists, else .env, written as the project folder's owner.
 
-  5dive secret link <DIVE-N> [--ttl=<minutes>]
+  5dive secret link <DIVE-N> [--ttl=<minutes>] [--again]
       Mint a one-time link for an open secret gate: https://secrets.<box>/<token>.
       The owner opens it, pastes, taps once; the value goes from their browser to
       this box only, lands as the gate's KEY, and clears the gate. Single use,
       expires in 30 min by default. Root-only. Returns once the page answers over
       a valid certificate (at most ~20s on a box's first link); --json carries
       ready:false if it did not in time (the link still works a moment later).
+      An agent asking while a link for the gate is live (the gate's alert
+      carries one) is refused, exit 3; --again mints another anyway.
 
   5dive secret serve [--listen=127.0.0.1:3127]
       The page behind those links. Started on demand by `secret link`; exits by

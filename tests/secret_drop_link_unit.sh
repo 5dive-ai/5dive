@@ -62,6 +62,9 @@ export SECRET_PROJECTS_DIR="$TMP/projects"; mkdir -p "$SECRET_PROJECTS_DIR"
 export JOURNAL_LOG="$TMP/journal.log"; : > "$JOURNAL_LOG"
 printf 'FIVE_DOMAIN=teal-fox.example.com\n' > "$SECRET_DROP_PROVISIONING"
 require_root() { :; }
+# DIVE-6205: who asks for a link. Empty = the box or a person (the app's card);
+# an agent name = an agent seat. The harness user is whatever CI runs as.
+_secret_link_agent_caller() { printf '%s' "${LINK_CALLER:-}"; }
 JSON_MODE=1
 set +e
 
@@ -327,6 +330,40 @@ CADDY_VALIDATE_FAIL=1 _secret_drop_ensure_route 2>/dev/null
 cmp -s "$SECRET_DROP_CADDYFILE" "$TMP/cf.before" && ! ls "$TMP"/Caddyfile.dive5319.* >/dev/null 2>&1 \
   && ok_t "L7b a failed validate restores the previous Caddyfile byte for byte" \
   || bad_t "L7b a failed validate restores the previous Caddyfile byte for byte" "$(diff "$TMP/cf.before" "$SECRET_DROP_CADDYFILE")"
+# DIVE-6205: with the page gone, Caddy serves the closed page (410), not a bare 502.
+printf 'teal-fox.example.com {\n}\n' > "$SECRET_DROP_CADDYFILE"
+_secret_drop_ensure_route
+blk=$(sed -n '/^secrets\.teal-fox\.example\.com {/,/^}/p' "$SECRET_DROP_CADDYFILE")
+[[ "$blk" == *"handle_errors"* && "$blk" == *'{err.status_code} in [502, 503, 504]'* && "$blk" == *'` 410'* \
+   && "$blk" == *"<h1>This request is closed</h1><p>The agent no longer needs this, or it was already provided.</p>"* ]] \
+  && ok_t "L7c the route serves the page's own 410 'This request is closed' when the page is down" \
+  || bad_t "L7c closed page on the route" "$blk"
+# A box routed before this change carries the old block: replaced once, the rest
+# of the Caddyfile untouched, and a second run changes nothing.
+cat > "$SECRET_DROP_CADDYFILE" <<EOF
+teal-fox.example.com {
+    handle /shell/* {
+        reverse_proxy localhost:3101
+    }
+}
+
+# DIVE-5319: one-time secret drop links (5dive secret link). Its own name, so TLS
+# ends on this box: the root name is proxied by Cloudflare, *.<domain> is not.
+secrets.teal-fox.example.com {
+    reverse_proxy 127.0.0.1:${SECRET_DROP_PORT}
+}
+
+owner.example.com {
+    respond "mine"
+}
+EOF
+_secret_drop_ensure_route; cp "$SECRET_DROP_CADDYFILE" "$TMP/cf.once"; _secret_drop_ensure_route
+[[ "$(grep -c '^secrets\.teal-fox\.example\.com {' "$SECRET_DROP_CADDYFILE")" == 1 && "$(grep -c 'handle_errors' "$SECRET_DROP_CADDYFILE")" == 1 \
+   && "$(grep -c '^# DIVE-5319: one-time' "$SECRET_DROP_CADDYFILE")" == 1 ]] \
+   && grep -q 'reverse_proxy localhost:3101' "$SECRET_DROP_CADDYFILE" && grep -q 'respond "mine"' "$SECRET_DROP_CADDYFILE" \
+   && cmp -s "$SECRET_DROP_CADDYFILE" "$TMP/cf.once" \
+  && ok_t "L7d an old secrets block is upgraded in place once; the other sites are kept; a second run is a no-op" \
+  || bad_t "L7d old block upgrade" "$(cat "$SECRET_DROP_CADDYFILE")"
 unset -f systemd-run systemctl
 
 # --- L11: DIVE-5372 — the link waits for its page over valid TLS ---------------
@@ -517,6 +554,7 @@ if [[ -n "\${BUSY_FIRST:-}" ]]; then
   n=\$(cat "$TMP/busy.n" 2>/dev/null || echo 0); echo \$((n+1)) > "$TMP/busy.n"
   (( n < BUSY_FIRST )) && { echo "Error: database is locked (5)" >&2; exit 1; }
 fi
+[[ -n "\${SLOW_ANSWER:-}" && "\${1:-} \${2:-}" == "task answer" ]] && sleep "\$SLOW_ANSWER"
 export GATE_PROOF_ENFORCE="$TMP/enforce"; unset SUDO_UID
 # Root, as the page's unit is: euid 0 (no agent), no SUDO_UID, so the uid half of
 # the principal test passes and the STRUCTURAL half refuses, exactly as on the box.
@@ -524,7 +562,10 @@ _gate_is_root() { return 0; }; _gate_caller_uid() { printf '0'; }
 _gate_sudo_uid_nonagent() { return 0; }
 _gate_caller_cgroup() { printf '%s' '/system.slice/5dive-secret-drop.service'; }
 task_need_notify() { :; }; _task_send_owner() { :; }
-cmd_send() { printf '%s\n' "\$*" >> "$TMP/sends.log"; }
+# DIVE-6205: the drop's ping is detached; here always the in-process child, and
+# SLOW_SEND holds it as a mid-turn seat's wake would.
+_task_answer_ping_unit_ok() { return 1; }
+cmd_send() { [[ -n "\${SLOW_SEND:-}" ]] && { printf 'start %s\n' "\$(date +%s)" >> "$TMP/slow-send.log"; sleep "\$SLOW_SEND"; }; printf '%s\n' "\$*" >> "$TMP/sends.log"; }
 # The audit fence withholds lines on a non-prod store; AUDIT_LOG is the harness's file.
 _task_store_audit_log() { audit_log "\$@"; }
 # Mutation seam: break the link between the redeem's checks and the answer.
@@ -538,6 +579,8 @@ EOF
 chmod +x "$REALBIN/5dive"
 cp "$MOCKBIN/logger" "$REALBIN/logger"
 ans_at() { db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE ident='$1';"; }
+# The drop's ping runs detached (DIVE-6205): wait, bounded, for its line.
+wait_for_line() { local i; for i in $(seq 1 ${3:-50}); do grep -qF -- "$1" "$2" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 # The page's own bundle, with the real verb on PATH instead of the mock.
 WRAP2="$TMP/5dive-bundle-real"; sed "s#$MOCKBIN#$REALBIN#" "$WRAP" > "$WRAP2"; chmod +x "$WRAP2"
 redeem_real() {   # <hash> <value> [VAR=val...]
@@ -577,6 +620,7 @@ ev=$(db "SELECT COALESCE(human_evidence,'') FROM tasks WHERE ident='DIVE-25';")
 [[ $rc -eq 0 && -n "$(ans_at DIVE-25)" && "$ev" == "drop-link" ]] && cmp -s "$CONNECTORS_DIR/e2e25.d/E2E_PEM" <(printf '%s\n' "$PEM") \
   && ok_t "L10k a multi-line redeem through the real verb lands the file AND closes the gate (evidence=drop-link)" \
   || bad_t "L10k a multi-line redeem through the real verb lands the file AND closes the gate (evidence=drop-link)" "rc=$rc at=$(ans_at DIVE-25) ev=$ev out=$out"
+wait_for_line "E2E_PEM spans several lines" "$TMP/sends.log"
 grep -qF "E2E_PEM spans several lines, so it is the file $CONNECTORS_DIR/e2e25.d/E2E_PEM" "$TMP/sends.log" \
   && ok_t "L10l the seat's 'provided' ping names the value file, not the .env" \
   || bad_t "L10l the seat's 'provided' ping names the value file, not the .env" "sends: $(cat "$TMP/sends.log")"
@@ -658,6 +702,7 @@ by=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='DIVE-571';
 [[ $rc -eq 0 && -n "$(ans_at DIVE-571)" && "$by" == "human:drop" ]] && grep -qxF "export TGADS_API_KEY='tgads-value-5772'" "$TOOLS_ENV_FILE" \
   && ok_t "L12a ACCEPTANCE: a tools drop on a standard seat's gate closes it, answered_by=human:drop, no tap" \
   || bad_t "L12a a tools drop closes its gate as human:drop" "rc=$rc at=$(ans_at DIVE-571) by=$by out=$out tools=$(grep -c TGADS "$TOOLS_ENV_FILE" 2>/dev/null)"
+wait_for_line "TGADS_API_KEY is set in your environment" "$TMP/sends.log"
 grep -q 'TGADS_API_KEY is set in your environment' "$TMP/sends.log" && grep -q -- '--wake' "$TMP/sends.log" \
   && ok_t "L12b the seat is pinged and woken at once (it is told the key is in its environment)" \
   || bad_t "L12b seat pinged + woken" "sends: $(grep DIVE-571 "$TMP/sends.log")"
@@ -702,6 +747,89 @@ IFS=$'\x1f' read -r e_chat e_mid e_text e_kb < <(tr '\n' ' ' < "$TMP/edit.log")
    && "$(db "SELECT state FROM gate_cards WHERE message_id='777';")" == struck ]] \
   && ok_t "L12f the Telegram card is edited to 'saved via the secure link', with no Provided button, and recorded struck" \
   || bad_t "L12f gate card after the drop" "edit=[$(cat "$TMP/edit.log" 2>/dev/null)] state=$(db "SELECT state FROM gate_cards WHERE message_id='777';")"
+
+# --- L14: DIVE-6205 — the page's verdict, the second link, the closed page -------
+# A (teal-fox, 2026-10-13): the owner saved, the gate closed, and the page said
+# "Nothing was saved. Try the link again": `task answer --from=drop` waited on a
+# wake into a mid-turn seat (up to 105s) and the page gives up at 60s. Here the
+# wake is held for HOLD seconds and the page's budget is PAGE seconds, HOLD > PAGE,
+# the same shape at a scale a PR can run (box: 90 and 60; run it so with
+# DIVE6205_HOLD_S=90 DIVE6205_PAGE_S=60).
+HOLD="${DIVE6205_HOLD_S:-6}"; PAGE_S="${DIVE6205_PAGE_S:-4}"
+PORT4=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+FIVE_SECRET_DROP_RUN_TIMEOUT="$PAGE_S" SLOW_SEND="$HOLD" \
+  python3 "$TMP/server.py" 127.0.0.1 "$PORT4" "$WRAP2" "$SECRET_DROP_DIR" 0 2> "$TMP/server4.log" & SRV_PID=$!
+for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT4/healthz" >/dev/null 2>&1 && break; sleep 0.1; done
+: > "$TMP/sends.log"; : > "$TMP/slow-send.log"
+seed_gate DIVE-61 HELD_API_KEY e2e61
+out=$(mint DIVE-61); tok=$(tok_of "$out")
+t0=$(date +%s%N)
+code=$(curl -s -o "$TMP/post4.html" -w '%{http_code}' --data-urlencode "value=held-value" "http://127.0.0.1:$PORT4/$tok")
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[[ "$code" == 200 && -n "$(ans_at DIVE-61)" ]] && (( ms < PAGE_S * 1000 )) \
+   && grep -q '<h1>Saved</h1>' "$TMP/post4.html" && ! grep -q 'Nothing was saved' "$TMP/post4.html" \
+  && ok_t "L14a ACCEPTANCE: the filer seat held mid-turn (wake ${HOLD}s > page ${PAGE_S}s) -> 200 Saved in ${ms}ms, gate answered" \
+  || bad_t "L14a held seat -> 200 Saved, fast, gate answered" "code=$code ms=$ms at=$(ans_at DIVE-61) body=$(head -c 300 "$TMP/post4.html")"
+[[ -s "$TMP/slow-send.log" && ! -s "$TMP/sends.log" ]] \
+  && ok_t "L14b the wake was handed off and is still running when the page answers" \
+  || bad_t "L14b wake handed off, still running" "slow=$(cat "$TMP/slow-send.log") sends=$(cat "$TMP/sends.log")"
+wait_for_line "HELD_API_KEY is in" "$TMP/sends.log" $(( (HOLD + 5) * 10 ))
+grep -q -- "--wake" "$TMP/sends.log" && grep -q "DIVE-61 secret gate provided" "$TMP/sends.log" \
+  && ok_t "L14c ...and the seat is still pinged and woken afterwards" \
+  || bad_t "L14c the wake still happens" "sends=$(cat "$TMP/sends.log")"
+# The page's own budget runs out (here: the gate clear itself is slow). The value
+# may be saved, so the page never says it was not.
+seed_gate DIVE-62 SLOW_API_KEY e2e62
+out=$(mint DIVE-62); tok=$(tok_of "$out")
+kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null
+FIVE_SECRET_DROP_RUN_TIMEOUT=1 SLOW_ANSWER=3 \
+  python3 "$TMP/server.py" 127.0.0.1 "$PORT4" "$WRAP2" "$SECRET_DROP_DIR" 0 2> "$TMP/server4.log" & SRV_PID=$!
+for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT4/healthz" >/dev/null 2>&1 && break; sleep 0.1; done
+code=$(curl -s -o "$TMP/post5.html" -w '%{http_code}' --data-urlencode "value=slow-value" "http://127.0.0.1:$PORT4/$tok")
+[[ "$code" == 504 ]] && grep -q 'It may have been saved. Ask your agent before trying again' "$TMP/post5.html" \
+   && ! grep -q 'Nothing was saved\|Try the link again' "$TMP/post5.html" \
+  && ok_t "L14d a page timeout says 'it may have been saved, ask your agent', never 'Nothing was saved'" \
+  || bad_t "L14d page timeout wording" "code=$code body=$(head -c 300 "$TMP/post5.html")"
+kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
+
+# The detached ping goes to its own systemd unit when it can (the page's unit
+# stops, killing its children, once the page idles out).
+(
+  _task_answer_ping_unit_ok() { return 0; }
+  five_self_bundle() { printf '/opt/5dive/bin/5dive'; }
+  systemd-run() { printf '%s\n' "$*" > "$TMP/sdrun.log"; }
+  _task_answer_ping_detached mailer --wake --from=human --message='DIVE-1 provided'
+) ; rc=$?
+[[ $rc -eq 0 && "$(cat "$TMP/sdrun.log" 2>/dev/null)" == "--quiet --collect --setenv=_5DIVE_SYSTEM_NOTICE=1 /opt/5dive/bin/5dive agent send mailer --wake --from=human --message=DIVE-1 provided" ]] \
+  && ok_t "L14e with systemd and root, the ping is its own transient unit: agent send, a system notice, --wake kept" \
+  || bad_t "L14e systemd-run ping" "rc=$rc argv=$(cat "$TMP/sdrun.log" 2>/dev/null)"
+
+# B: an agent asking for a link while the gate's link is live is told so.
+seed_gate DIVE-63 SECOND_API_KEY e2e63
+LINK_CALLER="" mint DIVE-63 >/dev/null   # the gate's alert (it passes --again; the box caller is never refused)
+n0=$(ls "$SECRET_DROP_DIR" | wc -l)
+out=$(LINK_CALLER=mailer mint DIVE-63); rc=$?
+[[ $rc -eq 3 && "$(ls "$SECRET_DROP_DIR" | wc -l)" == "$n0" && "$out" == *"already live"* && "$out" == *"--again"* && "$out" == *UTC* ]] \
+  && ok_t "L14f an agent's second 'secret link' while one is live exits 3, names the expiry and --again, mints nothing" \
+  || bad_t "L14f second link refused" "rc=$rc n=$n0->$(ls "$SECRET_DROP_DIR" | wc -l) out=$out"
+out=$(LINK_CALLER=mailer mint DIVE-63 --again); rc=$?
+[[ $rc -eq 0 && -n "$(tok_of "$out")" && "$(ls "$SECRET_DROP_DIR" | wc -l)" == $((n0 + 1)) ]] \
+  && ok_t "L14g ...and with --again it mints one" \
+  || bad_t "L14g --again mints" "rc=$rc out=$out"
+out=$(LINK_CALLER="" mint DIVE-63); rc=$?
+[[ $rc -eq 0 && -n "$(tok_of "$out")" ]] \
+  && ok_t "L14h control: the app's card (the box, not an agent) still gets a fresh link while one is live" \
+  || bad_t "L14h the card keeps minting" "rc=$rc out=$out"
+seed_gate DIVE-64 FIRST_API_KEY e2e64
+out=$(LINK_CALLER=mailer mint DIVE-64); rc=$?
+[[ $rc -eq 0 && -n "$(tok_of "$out")" ]] \
+  && ok_t "L14i control: an agent's FIRST link (none live) is minted as before" \
+  || bad_t "L14i first link" "rc=$rc out=$out"
+for f in "$SECRET_DROP_DIR"/*; do grep -q '^task=DIVE-64$' "$f" && sed -i "s/^expires=.*/expires=$(( $(date +%s) - 5 ))/" "$f"; done
+out=$(LINK_CALLER=mailer mint DIVE-64); rc=$?
+[[ $rc -eq 0 && -n "$(tok_of "$out")" ]] \
+  && ok_t "L14j control: an expired link does not count as live" \
+  || bad_t "L14j expired is not live" "rc=$rc out=$out"
 
 echo
 echo "secret-drop-link unit: $PASS passed, $FAIL failed"
