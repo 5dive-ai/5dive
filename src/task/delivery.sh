@@ -63,8 +63,13 @@ _task_deliver_reach_probe() {
   _probef="${TMPDIR:-/tmp}/.5dive-deliver-reach.$$"
   # `.files // []`: the anonymous rail's answer has no file list, so there it
   # yields the state alone, the same as before this field was asked for.
-  _gate_gh "$_tok" 15 pr view "$pr" --json state,files \
-    -q '.state, ((.files // [])[] | "\(.path)\t\((.additions // 0) + (.deletions // 0))")' >"$_probef" 2>/dev/null || true
+  # A CUT-OFF LIST IS UNKNOWN, NOT SMALL (quinn, iteration 3): gh returns at most
+  # 100 files with no error (measured: changedFiles=156, files=100), and a list
+  # that stops early can read as docs-only or under the size limit when the PR is
+  # neither. So the files are handed over only when their count equals
+  # changedFiles; a short list, or no count at all, yields the state alone.
+  _gate_gh "$_tok" 15 pr view "$pr" --json state,files,changedFiles \
+    -q '.state, (if ((.files // []) | length) == (.changedFiles // -1) then (.files[] | "\(.path)\t\((.additions // 0) + (.deletions // 0))") else empty end)' >"$_probef" 2>/dev/null || true
   _state="$(head -n1 "$_probef" 2>/dev/null || printf '')"
   [[ -n "$_state" ]] && _TASK_DELIVER_FILES="$(tail -n +2 "$_probef" 2>/dev/null || printf '')"
   rm -f "$_probef" 2>/dev/null || true

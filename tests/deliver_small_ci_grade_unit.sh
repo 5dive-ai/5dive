@@ -51,15 +51,25 @@ _task_verify_skip_reason() { printf ''; }
 _merge_hold_seat() { printf 'ops'; }
 _task_companion_refs() { [[ "${COMP:-}" == 1 ]] && printf 'https://github.com/o/ops/pull/9\n'; return 0; }
 # The diff reaches the rail the way it does in production: through the reach
-# probe's ONE read (quinn, iteration 2). gh is stubbed to answer that query with
-# the state then `path<TAB>lines`; every request is logged so the budget arm can
-# count them.
+# probe's ONE read (quinn, iteration 2). Every request is logged so the budget
+# arm can count them.
 mkdir -p "$TMP/bin"
+# The stub answers with a JSON pull request and applies the CALLER's own -q, so
+# the probe's jq (the changedFiles comparison included) is what runs, not a copy
+# of it. EXTRA_DOCS=N puts N one-line docs files ahead of FILES_PATH; CHANGED
+# overrides changedFiles (gh's real count when it cuts the list at 100);
+# GH_NOFILES=1 answers in the anonymous rail's shape, a state and nothing else.
 cat >"$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 printf 'GH %s\n' "$*" >>"$GH_ARGS_LOG"
-[[ "$*" == *"--json state,files"* ]] || exit 1
-printf 'OPEN\n%s\t%s\n' "${FILES_PATH:-README.md}" "${FILES_LINES:-76}"
+[[ "$*" == *"--json state,files,changedFiles"* ]] || exit 1
+q=.; while (( $# )); do [[ "$1" == -q ]] && { q="$2"; break; }; shift; done
+if [[ "${GH_NOFILES:-0}" == 1 ]]; then printf '{"state":"OPEN"}' | jq -r "$q"; exit; fi
+jq -nr --arg p "${FILES_PATH:-README.md}" --argjson n "${FILES_LINES:-76}" \
+       --argjson x "${EXTRA_DOCS:-0}" --arg c "${CHANGED:-}" '
+  ([range($x) | {path: "docs/f\(.).md", additions: 1, deletions: 0}] + [{path: $p, additions: $n, deletions: 0}]) as $f
+  | {state: "OPEN", files: $f, changedFiles: (if $c == "" then ($f | length) else ($c | tonumber) end)}' \
+  | jq -r "$q"
 STUB
 chmod +x "$TMP/bin/gh"
 export PATH="$TMP/bin:$PATH" GH_ARGS_LOG="$TMP/gh.args"; : >"$GH_ARGS_LOG"
@@ -118,22 +128,25 @@ _n=$(grep -c '^GH ' "$GH_ARGS_LOG")
   || bad_t "one request" "graded_by='$(col "$id_one" graded_by)' requests=$_n: $(cat "$GH_ARGS_LOG")"
 # Unknown is graded: an answer with no file list (the anonymous rail's shape),
 # and a probe that is switched off, both leave the row on its grader.
-cat >"$TMP/bin/gh" <<'STUB'
-#!/usr/bin/env bash
-printf 'GH %s\n' "$*" >>"$GH_ARGS_LOG"
-printf 'OPEN\n'
-STUB
-id_nof=$(FILES_PATH=README.md FILES_LINES=5 deliver_row)
+id_nof=$(GH_NOFILES=1 FILES_PATH=README.md FILES_LINES=5 deliver_row)
 landed "$id_nof" id_nof
 [[ "$(col "$id_nof" assignee)" == "grader" && -z "$(col "$id_nof" graded_by)" ]] \
   && ok_t "a readable PR with no file list in the answer is graded (unknown is not small)" \
   || bad_t "no file list graded" "assignee='$(col "$id_nof" assignee)' graded_by='$(col "$id_nof" graded_by)'"
-cat >"$TMP/bin/gh" <<'STUB'
-#!/usr/bin/env bash
-printf 'GH %s\n' "$*" >>"$GH_ARGS_LOG"
-[[ "$*" == *"--json state,files"* ]] || exit 1
-printf 'OPEN\n%s\t%s\n' "${FILES_PATH:-README.md}" "${FILES_LINES:-76}"
-STUB
+# quinn, iteration 3: gh cuts the file list at 100 with no error. 100 docs files
+# listed out of 101 changed would read as docs-only if the list were taken as
+# whole; the probe hands over nothing, so the row is graded.
+id_cut=$(EXTRA_DOCS=99 CHANGED=101 FILES_PATH=README.md FILES_LINES=1 deliver_row)
+landed "$id_cut" id_cut
+[[ "$(col "$id_cut" assignee)" == "grader" && "$(col "$id_cut" graded_by)" != ci:* ]] \
+  && ok_t "a list gh cut off (100 docs files of 101 changed) is graded, not read as docs-only" \
+  || bad_t "cut-off list graded" "assignee='$(col "$id_cut" assignee)' graded_by='$(col "$id_cut" graded_by)'"
+# CONTROL: the same 100 docs files with nothing cut off still skip the grader.
+id_full=$(EXTRA_DOCS=99 FILES_PATH=README.md FILES_LINES=1 deliver_row)
+landed "$id_full" id_full
+[[ "$(col "$id_full" graded_by)" == "ci:docs-only" ]] \
+  && ok_t "CONTROL: 100 docs files, all listed, are still CI-graded" \
+  || bad_t "full list control" "assignee='$(col "$id_full" assignee)' graded_by='$(col "$id_full" graded_by)'"
 id_poff=$(FIVE_DELIVER_NO_REACH_PROBE=1 FILES_PATH=README.md FILES_LINES=5 deliver_row)
 landed "$id_poff" id_poff
 [[ "$(col "$id_poff" assignee)" == "grader" && -z "$(col "$id_poff" graded_by)" ]] \

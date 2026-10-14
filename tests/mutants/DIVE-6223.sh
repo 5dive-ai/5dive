@@ -23,3 +23,6 @@ m7() { sed -i '/^_task_delivery_grader_skip()/,/^}/ s/\[\[ "\$forced" == "1" \]\
 # m8: the reach probe stops handing its file list to the rail (quinn, iteration 2)
 # -> every delivery reads as unknown and the README/small/one-request arms red.
 m8() { sed -i 's/\[\[ -n "\$_state" \]\] \&\& _TASK_DELIVER_FILES=.*/:/' src/task/delivery.sh; }
+# m9: the probe hands over a file list gh cut off (quinn, iteration 3) -> the
+# cut-off arm reds.
+m9() { sed -i 's/if ((\.files \/\/ \[\]) | length) == (\.changedFiles \/\/ -1) then/if true then/' src/task/delivery.sh; }
