@@ -241,24 +241,32 @@ chmod +x "$STUB"
 heredoc_body() {  # $1 = file, $2 = heredoc terminator name
   sed -n "/<<'$2'/,/^$2\$/p" "$1" | sed '1d;$d'
 }
+# DIVE-6206: the npx line moved into _skills_npx_add (lib/agent_setup.sh), which
+# every heredoc evals from $SKILLS_NPX_FN. Ship the shipped function bytes in the
+# same way production does, with the same stub substitution applied to them.
+npx_fn() {
+  sed -n -e '/^_npx_cache_heal() {$/,/^}$/p' -e '/^_skills_npx_add() {$/,/^}$/p' "$ROOT/src/lib/agent_setup.sh"
+}
+NPX_FN="$(npx_fn | sed -e "s#timeout 180 npx #timeout 180 $STUB #")"
 hermetic() {
   sed -e "s#^timeout 180 npx #timeout 180 $STUB #" \
       -e 's#^export NVM_DIR=.*#export NVM_DIR=/nonexistent#' \
       -e 's#timeout 20 /usr/bin/git ls-remote#false#'
 }
-# run_stdin <script> <home> <result-file> <stub-body>
+# run_stdin <script> <home> <result-file> <stub-body> [<npx-fn>]
 run_stdin() {
   rm -f "$3"; mkdir -p "$2"   # the heredoc cd's into $HOME, which exists on a real seat
   env -u CLAUDE_CONFIG_DIR HOME="$2" SOURCE="$SOURCE" SKILL="$SKILL" AGENT_ID=claude-code \
-    INSTALL_DIR="$INSTALL_DIR" FORCE=1 RESULT_FILE="$3" STUB_BODY="$4" \
+    INSTALL_DIR="$INSTALL_DIR" FORCE=1 RESULT_FILE="$3" STUB_BODY="$4" SKILLS_NPX_FN="${5:-$NPX_FN}" \
     bash -s < "$1" >/dev/null 2>&1
 }
 
 for term in SKILL_ADD SKILL_ADD_SANDBOXED; do
   body="$(heredoc_body "$SRC" "$term")"
   herm="$(hermetic <<<"$body")"
-  if ! grep -qF "timeout 180 $STUB " <<<"$herm" || ! grep -qF -- '--yes </dev/null' <<<"$herm"; then
-    bad_t "$term: heredoc extracted with its npx line" "no npx line with </dev/null found — this arm graded NOTHING"
+  if ! grep -qF 'eval "${SKILLS_NPX_FN' <<<"$herm" || ! grep -qE '^_skills_npx_add .*--yes$' <<<"$herm" \
+     || ! grep -qF "timeout 180 $STUB " <<<"$NPX_FN" || ! grep -qF '"$@" </dev/null' <<<"$NPX_FN"; then
+    bad_t "$term: heredoc extracted with its npx line" "no _skills_npx_add call, or no npx line with </dev/null in it — this arm graded NOTHING"
     continue
   fi
   printf '%s\n' "$herm" > "$TMP/$term.sh"
@@ -276,13 +284,12 @@ for term in SKILL_ADD SKILL_ADD_SANDBOXED; do
 
   # MUTANT: the pre-fix line. The same run must now write NOTHING, or the stub
   # is not draining and the arms above prove nothing about the redirect.
-  mut="$(sed 's# </dev/null 2>&1 | tail# 2>\&1 | tail#' <<<"$herm")"
-  if [[ "$mut" == "$herm" ]]; then
+  mut="$(sed 's#"$@" </dev/null >#"$@" >#' <<<"$NPX_FN")"
+  if [[ "$mut" == "$NPX_FN" ]]; then
     bad_t "$term MUTANT: redirect removed" "sed matched nothing — VACUOUS"
   else
-    printf '%s\n' "$mut" > "$TMP/$term-mut.sh"
     HM="$TMP/home-$term-mut"; RM="$TMP/$term-rm.json"
-    run_stdin "$TMP/$term-mut.sh" "$HM" "$RM" v1
+    run_stdin "$TMP/$term.sh" "$HM" "$RM" v1 "$mut"
     if [[ -d "$HM/$INSTALL_DIR/$SKILL" && ! -e "$RM" && ! -e "$HM/$INSTALL_DIR/.skills-manifest.json" ]]; then
       ok_t "$term MUTANT: without </dev/null npx eats the script (skill installed, no result, no manifest)"
     else
@@ -292,15 +299,19 @@ for term in SKILL_ADD SKILL_ADD_SANDBOXED; do
   fi
 done
 
-# The default-skill heredoc in lib/agent_setup.sh ends at its npx line today, so
-# nothing is lost yet; the redirect is required there too so a line appended
-# after it is not silently dead. Every install call site carries it.
+# DIVE-6206: there is ONE npx skills add line now, inside _skills_npx_add, and all
+# three install heredocs (SKILL_ADD, SKILL_ADD_SANDBOXED, DEFAULT_SKILL) call it.
+# A heredoc that grows its own npx line again would skip both the redirect and the
+# cache heal, so a direct call anywhere else is a failure here.
 missing="$(grep -nE '^[^#]*npx -y skills add' "$SRC" "$ROOT/src/lib/agent_setup.sh" | grep -v '</dev/null' || true)"
 n_sites="$(grep -cE '^[^#]*npx -y skills add' "$SRC" "$ROOT/src/lib/agent_setup.sh" | awk -F: '{s+=$2} END{print s}')"
-if [[ "$n_sites" -ge 3 && -z "$missing" ]]; then
-  ok_t "every npx skills add call site ($n_sites) reads </dev/null"
+n_calls="$( { heredoc_body "$SRC" SKILL_ADD; heredoc_body "$SRC" SKILL_ADD_SANDBOXED
+             heredoc_body "$ROOT/src/lib/agent_setup.sh" DEFAULT_SKILL; } | grep -cE '^_skills_npx_add ' )"
+if [[ "$n_sites" -eq 1 && -z "$missing" && "$n_calls" -eq 3 ]]; then
+  ok_t "the one npx skills add line reads </dev/null and all 3 install heredocs call it"
 else
-  bad_t "every npx skills add call site reads </dev/null" "sites=$n_sites missing: $missing"
+  bad_t "the one npx skills add line reads </dev/null and all 3 install heredocs call it" \
+        "npx sites=$n_sites (want 1) heredoc calls=$n_calls (want 3) missing: $missing"
 fi
 
 # --- DIVE-5866: the default-skill writer keeps installed_at on an unchanged entry ---

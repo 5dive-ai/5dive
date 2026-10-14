@@ -233,7 +233,7 @@ SKILL_ADD_MANUAL
   if [[ "$isolation" == "sandboxed" ]]; then
     if ! HOME="$home" \
          SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" INSTALL_DIR="$install_dir" FORCE="$force" \
-         RESULT_FILE="$result_file" \
+         RESULT_FILE="$result_file" SKILLS_NPX_FN="$(declare -f _npx_cache_heal _skills_npx_add)" \
          bash -s >&2 <<'SKILL_ADD_SANDBOXED'
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
@@ -245,9 +245,10 @@ cd "$HOME"
 # --force: drop the existing copy so a pinned/managed skill actually upgrades
 # rather than npx no-op'ing on an already-present dir (DIVE-698).
 [ "${FORCE:-0}" = 1 ] && rm -rf "$INSTALL_DIR/$SKILL"
-# </dev/null: npx reads stdin to EOF, and stdin is this heredoc, so without it
-# nothing below this line ever runs (DIVE-5356).
-timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes </dev/null 2>&1 | tail -25
+# DIVE-6206: $SKILLS_NPX_FN carries _skills_npx_add's own source (180s, </dev/null
+# per DIVE-5356, and one retry after clearing a half-extracted npx cache dir).
+eval "${SKILLS_NPX_FN:?npx install helper not supplied — refusing to install}"
+_skills_npx_add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes
 [ -d "$INSTALL_DIR/$SKILL" ] || { echo "ERROR: $INSTALL_DIR/$SKILL missing after install" >&2; exit 1; }
 # DIVE-2282 manifest write. No local clone on the npx path, so the commit is
 # best-effort over the network; an empty sha never fails the install. Absolute
@@ -286,7 +287,8 @@ SKILL_ADD_SANDBOXED
     fi
     chown -R "${user}:${user}" "$home/$install_dir/$skill" "$home/$install_dir/.skills-manifest.json" 2>/dev/null || true
   else
-    if ! sudo -u "$user" -H env SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" INSTALL_DIR="$install_dir" FORCE="$force" RESULT_FILE="$result_file" bash -s >&2 <<'SKILL_ADD'
+    if ! sudo -u "$user" -H env SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" INSTALL_DIR="$install_dir" FORCE="$force" RESULT_FILE="$result_file" \
+         SKILLS_NPX_FN="$(declare -f _npx_cache_heal _skills_npx_add)" bash -s >&2 <<'SKILL_ADD'
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
 export NVM_DIR="/home/claude/.nvm"
@@ -297,9 +299,10 @@ cd "$HOME"
 # --force: drop the existing copy so a pinned/managed skill actually upgrades
 # rather than npx no-op'ing on an already-present dir (DIVE-698).
 [ "${FORCE:-0}" = 1 ] && rm -rf "$INSTALL_DIR/$SKILL"
-# </dev/null: npx reads stdin to EOF, and stdin is this heredoc, so without it
-# nothing below this line ever runs (DIVE-5356).
-timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes </dev/null 2>&1 | tail -25
+# DIVE-6206: $SKILLS_NPX_FN carries _skills_npx_add's own source (180s, </dev/null
+# per DIVE-5356, and one retry after clearing a half-extracted npx cache dir).
+eval "${SKILLS_NPX_FN:?npx install helper not supplied — refusing to install}"
+_skills_npx_add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes
 [ -d "$INSTALL_DIR/$SKILL" ] || { echo "ERROR: $INSTALL_DIR/$SKILL missing after install" >&2; exit 1; }
 # DIVE-2282 manifest write. No local clone on the npx path, so the commit is
 # best-effort over the network; an empty sha never fails the install. Absolute

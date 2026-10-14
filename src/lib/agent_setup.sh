@@ -934,6 +934,50 @@ fi
 MANIFEST_NOTE
 }
 
+# DIVE-6206: npx reuses ~/.npm/_npx/<hash> whenever that dir exists, so a first
+# `npx skills add` killed mid-extract (the 180s timeout at seat creation) leaves a
+# partial tree — yaml/dist with .d.ts and no index.js — and every later run fails
+# ERR_MODULE_NOT_FOUND, forever: the nightly refresh never self-recovers.
+# _npx_cache_heal <log>: when the log names a missing module/package under THIS
+# user's $HOME/.npm/_npx/<16-hex>/, remove exactly that dir and return 0 so the
+# caller retries; anything else (a bad --skill, a network error, a path under some
+# other home) returns 1 and deletes nothing.
+_npx_cache_heal() {
+  local log="$1" errs h dir
+  errs=$(grep -E "ERR_MODULE_NOT_FOUND|Cannot find (module|package)" "$log" 2>/dev/null) || return 1
+  for h in $(grep -oE "/\.npm/_npx/[0-9a-f]{16}/" <<<"$errs" | cut -d/ -f4 | sort -u); do
+    dir="$HOME/.npm/_npx/$h"
+    # Never through a symlink: the sandboxed strategy runs this as root with HOME
+    # set to the agent's own home, which the agent controls.
+    [[ "$errs" == *"$dir/"* && -d "$dir" && ! -L "$dir" \
+       && ! -L "$HOME/.npm" && ! -L "$HOME/.npm/_npx" ]] || continue
+    echo "skills: npx cache $dir is half-extracted — removing it (DIVE-6206)"
+    rm -rf -- "$dir"
+    return 0
+  done
+  return 1
+}
+
+# _skills_npx_add <npx skills add args...>: the one `npx skills add` every install
+# heredoc runs, shipped in via `declare -f` (SKILLS_NPX_FN) like CONTAINMENT_FN
+# below, so all three call sites run the same bytes. 180s per attempt, last 25
+# lines echoed, and ONE retry only when _npx_cache_heal removed a broken dir.
+_skills_npx_add() {
+  local log rc tries=0
+  log=$(mktemp -t skills-npx-XXXXXX) || return 1
+  while :; do
+    rc=0
+    timeout 180 npx -y skills add "$@" </dev/null >"$log" 2>&1 || rc=$?
+    tail -25 "$log"
+    [[ "$rc" -eq 0 || "$tries" -gt 0 ]] && break
+    _npx_cache_heal "$log" || break
+    tries=1
+    echo "skills: retrying 'skills add' once after clearing the npx cache (DIVE-6206)"
+  done
+  rm -f "$log"
+  return "$rc"
+}
+
 # Install one skill into an agent user's per-type skills dir. Routes through
 # `npx skills add --agent <id>` for upstream-supported types, and falls back
 # to a direct git-clone + cp -r for types upstream rejects (see
@@ -993,7 +1037,8 @@ MANUAL_SKILL
     _skill_manifest_note "$user" "$home" "$install_dir" "$skill" "$source"
     return 0
   fi
-  sudo -u "$user" -H env SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" bash -s >&2 <<'DEFAULT_SKILL' \
+  sudo -u "$user" -H env SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" \
+    SKILLS_NPX_FN="$(declare -f _npx_cache_heal _skills_npx_add)" bash -s >&2 <<'DEFAULT_SKILL' \
     || { warn "default skill '$skill' install failed for agent '$name' (continuing)"; return 1; }
 set -uo pipefail
 unset CLAUDE_CONFIG_DIR
@@ -1002,9 +1047,10 @@ export NVM_DIR="/home/claude/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 export PATH="/home/claude/.local/bin:$PATH"
 cd "$HOME"
-# </dev/null: npx reads stdin to EOF, and stdin is this heredoc, so without it
-# nothing below this line ever runs (DIVE-5356).
-timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes </dev/null 2>&1 | tail -15
+# DIVE-6206: $SKILLS_NPX_FN carries _skills_npx_add's own source (180s, </dev/null
+# per DIVE-5356, and one retry after clearing a half-extracted npx cache dir).
+eval "${SKILLS_NPX_FN:?npx install helper not supplied — refusing to install}"
+_skills_npx_add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes
 DEFAULT_SKILL
   _skill_manifest_note "$user" "$home" "$install_dir" "$skill" "$source"
 }
