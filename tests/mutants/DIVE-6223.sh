@@ -12,7 +12,7 @@ m2() { sed -i 's/AND (handoff_rejected_at IS NOT NULL/AND (0/' src/task/routing.
 # m3: only the verdict clause is dropped -> the seat-FAIL-verdict arm reds.
 m3() { sed -i "s/graded_verdict='fail' AND COALESCE(graded_by,'') NOT LIKE 'ci:%'/0/" src/task/routing.sh; }
 # m4: task deliver no longer asks the rails -> the README/small arms red.
-m4() { sed -i 's/_skip=\$(_task_delivery_grader_skip "\$id")/_skip=""/' src/task/delivery.sh; }
+m4() { sed -i 's/_skip=\$(_task_delivery_grader_skip "\$id" "\${_TASK_DELIVER_FILES:-}")/_skip=""/' src/task/delivery.sh; }
 # m5: merge standing is not widened to the merge owner of a ci:* row -> the
 # standing and restamp arms red.
 m5() { sed -i "s/ OR (graded_by LIKE 'ci:%' AND merge_owner = \$(sqlq \"\${1:-}\"))//" src/task/delivery.sh; }
@@ -20,3 +20,6 @@ m5() { sed -i "s/ OR (graded_by LIKE 'ci:%' AND merge_owner = \$(sqlq \"\${1:-}\
 m6() { sed -i 's/if \[\[ -n "\$_cg_mk" && "\$_cg_gb" == "\$_cg_mk" \]\]; then/if false; then/' src/task/delivery.sh; }
 # m7: --verify no longer beats the rails at deliver -> the --verify arm reds.
 m7() { sed -i '/^_task_delivery_grader_skip()/,/^}/ s/\[\[ "\$forced" == "1" \]\] && return 0/:/' src/task/routing.sh; }
+# m8: the reach probe stops handing its file list to the rail (quinn, iteration 2)
+# -> every delivery reads as unknown and the README/small/one-request arms red.
+m8() { sed -i 's/\[\[ -n "\$_state" \]\] \&\& _TASK_DELIVER_FILES=.*/:/' src/task/delivery.sh; }

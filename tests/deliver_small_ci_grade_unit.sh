@@ -50,9 +50,21 @@ _task_default_verifier() { printf 'grader'; }
 _task_verify_skip_reason() { printf ''; }
 _merge_hold_seat() { printf 'ops'; }
 _task_companion_refs() { [[ "${COMP:-}" == 1 ]] && printf 'https://github.com/o/ops/pull/9\n'; return 0; }
-_task_delivery_paths() { printf '%s\n' "${FILES_PATH:-README.md}"; }
-_task_delivery_file_lines() { printf '%s\t%s\n' "${FILES_PATH:-README.md}" "${FILES_LINES:-76}"; }
-FIVE_DELIVER_NO_REACH_PROBE=1
+# The diff reaches the rail the way it does in production: through the reach
+# probe's ONE read (quinn, iteration 2). gh is stubbed to answer that query with
+# the state then `path<TAB>lines`; every request is logged so the budget arm can
+# count them.
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf 'GH %s\n' "$*" >>"$GH_ARGS_LOG"
+[[ "$*" == *"--json state,files"* ]] || exit 1
+printf 'OPEN\n%s\t%s\n' "${FILES_PATH:-README.md}" "${FILES_LINES:-76}"
+STUB
+chmod +x "$TMP/bin/gh"
+export PATH="$TMP/bin:$PATH" GH_ARGS_LOG="$TMP/gh.args"; : >"$GH_ARGS_LOG"
+_gate_gh_token() { printf 'tok'; }
+files_tsv() { printf '%s\t%s' "${FILES_PATH:-README.md}" "${FILES_LINES:-76}"; }
 
 col() { db "SELECT COALESCE($2,'') FROM tasks WHERE id=$1;"; }
 HEAD_SHA=$(git rev-parse HEAD 2>/dev/null)
@@ -93,6 +105,40 @@ grep -q 'CHANGED: x' <<<"$(col "$id_doc" result)" \
   && ok_t "the maker's result is kept above the CI line" || bad_t "result kept" "$(col "$id_doc" result)"
 grep -q 'DIVE-6223' "$TMP/out.$id_doc" \
   && ok_t "the skip names itself on stderr" || bad_t "silent skip" "$(head -c 300 "$TMP/out.$id_doc")"
+
+# quinn, iteration 2: the rail spends no request of its own. The reach probe's
+# one read is the whole GitHub cost of a delivery, skipped or not
+# (tests/task_deliver_reach_probe_unit.sh R7a pins the same budget).
+: >"$GH_ARGS_LOG"
+id_one=$(FILES_PATH=README.md FILES_LINES=76 deliver_row)
+landed "$id_one" id_one
+_n=$(grep -c '^GH ' "$GH_ARGS_LOG")
+[[ "$(col "$id_one" graded_by)" == "ci:docs-only" && "$_n" == "1" ]] \
+  && ok_t "a CI-graded delivery spends ONE GitHub request, the reach probe's" \
+  || bad_t "one request" "graded_by='$(col "$id_one" graded_by)' requests=$_n: $(cat "$GH_ARGS_LOG")"
+# Unknown is graded: an answer with no file list (the anonymous rail's shape),
+# and a probe that is switched off, both leave the row on its grader.
+cat >"$TMP/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf 'GH %s\n' "$*" >>"$GH_ARGS_LOG"
+printf 'OPEN\n'
+STUB
+id_nof=$(FILES_PATH=README.md FILES_LINES=5 deliver_row)
+landed "$id_nof" id_nof
+[[ "$(col "$id_nof" assignee)" == "grader" && -z "$(col "$id_nof" graded_by)" ]] \
+  && ok_t "a readable PR with no file list in the answer is graded (unknown is not small)" \
+  || bad_t "no file list graded" "assignee='$(col "$id_nof" assignee)' graded_by='$(col "$id_nof" graded_by)'"
+cat >"$TMP/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf 'GH %s\n' "$*" >>"$GH_ARGS_LOG"
+[[ "$*" == *"--json state,files"* ]] || exit 1
+printf 'OPEN\n%s\t%s\n' "${FILES_PATH:-README.md}" "${FILES_LINES:-76}"
+STUB
+id_poff=$(FIVE_DELIVER_NO_REACH_PROBE=1 FILES_PATH=README.md FILES_LINES=5 deliver_row)
+landed "$id_poff" id_poff
+[[ "$(col "$id_poff" assignee)" == "grader" && -z "$(col "$id_poff" graded_by)" ]] \
+  && ok_t "with the reach probe off the row is graded, and nothing is fetched to decide" \
+  || bad_t "probe off graded" "assignee='$(col "$id_poff" assignee)' graded_by='$(col "$id_poff" graded_by)'"
 
 id_big=$(FILES_PATH=src/cmd_agent.sh FILES_LINES=290 deliver_row)
 landed "$id_big" id_big
@@ -174,13 +220,13 @@ id_vf=$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 deliver_row)
 landed "$id_vf" id_vf
 db "UPDATE tasks SET graded_by='quinn', graded_verdict='fail', graded_at=datetime('now'),
        graded_verdict_at=datetime('now') WHERE id=${id_vf};"
-[[ -z "$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 _task_delivery_grader_skip "$id_vf")" ]] \
+[[ -z "$(_task_delivery_grader_skip "$id_vf" "$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 files_tsv)")" ]] \
   && ok_t "a seat-recorded FAIL verdict keeps the grader on a small re-delivery" \
-  || bad_t "seat fail verdict" "skip='$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 _task_delivery_grader_skip "$id_vf")'"
+  || bad_t "seat fail verdict" "skip='$(_task_delivery_grader_skip "$id_vf" "$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 files_tsv)")'"
 db "UPDATE tasks SET graded_by='ci:small' WHERE id=${id_vf};"
-[[ "$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 _task_delivery_grader_skip "$id_vf")" == small\|* ]] \
+[[ "$(_task_delivery_grader_skip "$id_vf" "$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 files_tsv)")" == small\|* ]] \
   && ok_t "CONTROL: the same FAIL stamped ci:* does not block the size rail" \
-  || bad_t "ci fail control" "skip='$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 _task_delivery_grader_skip "$id_vf")'"
+  || bad_t "ci fail control" "skip='$(_task_delivery_grader_skip "$id_vf" "$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 files_tsv)")'"
 
 echo "── merge standing on a CI-graded row ──"
 stand() { db "SELECT COUNT(*) FROM tasks WHERE id=$1 AND $(_task_merge_standing_sql "$2");"; }

@@ -522,8 +522,16 @@ _task_delivery_small_reason() {  # <task-id>
 # cutoff. Read before route_to_verifier spends the reject token
 # (handoff_rejected_at=NULL), which is why it is a skip-rail input and not a
 # post-hoc check. A ci:* fail is not a seat's and does not count.
-_task_delivery_grader_skip() {  # <task-id>
-  local id="$1" forced mode comp="" depth small seat_fail
+#
+# NO REQUEST OF ITS OWN (quinn, iteration 2). <files-tsv> is `path<TAB>lines`
+# per file, the answer `_task_deliver_reach_probe` already fetched in its one
+# read. `task deliver`'s quiet path is pinned at one query
+# (tests/task_deliver_reach_probe_unit.sh R6b/R7a), so this rail never fetches:
+# empty (probe off, PR unreadable, the anonymous rail with no file list) reads as
+# unknown, and unknown is graded.
+_task_delivery_grader_skip() {  # <task-id> <files-tsv>
+  local id="$1" tsv="${2:-}" forced mode comp="" depth small seat_fail thr
+  [[ -n "$tsv" ]] || return 0
   forced=$(db "SELECT COALESCE(verify_forced,0) FROM tasks WHERE id=${id};" 2>/dev/null || printf 0)
   [[ "$forced" == "1" ]] && return 0
   seat_fail=$(db "SELECT COUNT(*) FROM tasks WHERE id=${id}
@@ -539,13 +547,14 @@ _task_delivery_grader_skip() {  # <task-id>
   fi
   declare -F _task_companion_refs >/dev/null 2>&1 && comp=$(_task_companion_refs "$id")
   [[ -z "$comp" ]] || return 0
-  depth=$(_task_delivery_paths "$id" | _task_delivery_depth)
+  depth=$(cut -f1 <<<"$tsv" | _task_delivery_depth)
   if [[ "$depth" == "shallow" ]]; then
     printf 'docs-only|the delivered diff touches only tests/docs/changelog (DIVE-2719)'
     return 0
   fi
   [[ "$depth" == "deep" ]] && return 0
-  small=$(_task_delivery_small_reason "$id")
+  thr=$(box_verify_small)
+  small=$(_task_delivery_small "$thr" <<<"$tsv")
   [[ -n "$small" ]] && printf 'small|%s (DIVE-4559)' "$small"
   return 0
 }

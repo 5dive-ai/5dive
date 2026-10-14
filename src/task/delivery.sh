@@ -40,6 +40,11 @@
 # from this function is 0.
 _task_deliver_reach_probe() {
   local ident="$1" pr="$2"
+  # DIVE-6223 (quinn, iteration 2): the same read also answers the deliver-time
+  # skip rail's question, which files moved and how many lines each, so that rail
+  # spends no request of its own. Emptied first: a probe that is off or blind
+  # leaves it empty, and the rail reads empty as unknown, which is graded.
+  _TASK_DELIVER_FILES=""
   # Escape hatch for harnesses and offline runs. Not a policy knob: the gate still
   # does its own read at close, so silencing this cannot let anything through.
   [[ "${FIVE_DELIVER_NO_REACH_PROBE:-0}" == "1" ]] && return 0
@@ -56,8 +61,12 @@ _task_deliver_reach_probe() {
   # the same technique the gate harnesses use, for the same reason.
   local _state="" _probef
   _probef="${TMPDIR:-/tmp}/.5dive-deliver-reach.$$"
-  _gate_gh "$_tok" 15 pr view "$pr" --json state -q '.state' >"$_probef" 2>/dev/null || true
-  _state="$(cat "$_probef" 2>/dev/null || printf '')"
+  # `.files // []`: the anonymous rail's answer has no file list, so there it
+  # yields the state alone, the same as before this field was asked for.
+  _gate_gh "$_tok" 15 pr view "$pr" --json state,files \
+    -q '.state, ((.files // [])[] | "\(.path)\t\((.additions // 0) + (.deletions // 0))")' >"$_probef" 2>/dev/null || true
+  _state="$(head -n1 "$_probef" 2>/dev/null || printf '')"
+  [[ -n "$_state" ]] && _TASK_DELIVER_FILES="$(tail -n +2 "$_probef" 2>/dev/null || printf '')"
   rm -f "$_probef" 2>/dev/null || true
   # A state — ANY state, including OPEN — means the credential can SEE the ref.
   # This probe is not asking whether the PR merged; that is the gate's question at
@@ -2074,7 +2083,7 @@ cmd_task_deliver() {
   # one it will not use, and only when the box would otherwise grant one: a
   # verify=never box keeps its own declined arm below.
   if [[ -z "$_vfier" || "$_vfier" != "$_asignee" ]] && _task_verify_grants "$id"; then
-    local _skip; _skip=$(_task_delivery_grader_skip "$id")
+    local _skip; _skip=$(_task_delivery_grader_skip "$id" "${_TASK_DELIVER_FILES:-}")
     if [[ -n "$_skip" ]]; then
       _task_deliver_ci_grade "$id" "$ident" "$pr" "$_skip" "$result" "$want_result"
       return 0
