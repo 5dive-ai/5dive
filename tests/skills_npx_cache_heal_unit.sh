@@ -38,6 +38,9 @@ cat > "$STUB" <<'STUB_NPX'
 # Models the npx cache: an existing dir is reused as-is; a missing one is extracted.
 cat >/dev/null   # the real npx drains an inherited stdin
 echo call >> "$HOME/calls"
+# A cap, so an unbounded retry fails the arm instead of hanging the harness: past it
+# the stub answers with an error the heal does not match, which ends any loop.
+[ "$(wc -l < "$HOME/calls")" -gt 5 ] && { echo "npx-stub: call cap hit (retry not bounded)" >&2; exit 1; }
 d="$HOME/.npm/_npx/$NPX_HASH"
 skill=""; while [ $# -gt 0 ]; do [ "$1" = --skill ] && skill="$2"; shift; done
 case "${STUB_MODE:-}" in
@@ -160,6 +163,14 @@ H="$(fixture always)"
 add "$H" "$HFN" always
 eq "still broken after the heal: fails" "$RC" 1
 eq "still broken after the heal: exactly 2 calls" "$(calls "$H")" 2
+# MUTANT: the one-retry bound removed. The stub's cap stops it, and the count goes red.
+MUT="$(sed 's#\[\[ "\$rc" -eq 0 || "\$tries" -gt 0 \]\] \&\& break#[[ "$rc" -eq 0 ]] \&\& break#' <<<"$HFN")"
+if [[ "$MUT" == "$HFN" ]]; then bad_t "MUTANT: retry bound removed" "sed matched nothing — VACUOUS"
+else
+  H="$(fixture unbounded)"; add "$H" "$MUT" always
+  [[ "$(calls "$H")" -gt 2 ]] && ok_t "MUTANT (unbounded retry): red, $(calls "$H") calls, the harness still finishes" \
+    || bad_t "MUTANT (unbounded retry) is caught" "calls=$(calls "$H")"
+fi
 
 echo "== the shipped SKILL_ADD heredoc, fed on stdin, heals and writes its manifest =="
 body="$(sed -n "/<<'SKILL_ADD'/,/^SKILL_ADD\$/p" "$ROOT/src/cmd_skill.sh" | sed '1d;$d' \
