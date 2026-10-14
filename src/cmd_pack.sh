@@ -315,7 +315,8 @@ _pack_bundle_manifest() {   # _pack_bundle_manifest <stage> <has-persona:true|fa
      --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson hp "$has_persona" --argjson files "$files" \
      '. + {bundle_version: $bv, openagent: $oa, source_harness: "5dive", created_at: $at}
         + (if $hp then {persona: "persona.yaml"} else {} end) + {files: $files}' \
-     "$stage/manifest.json" > "$stage/manifest.json.$$" && mv "$stage/manifest.json.$$" "$stage/manifest.json"
+     "$stage/manifest.json" > "$stage/manifest.json.$$" || { rm -f "$stage/manifest.json.$$"; return 1; }
+  mv "$stage/manifest.json.$$" "$stage/manifest.json"
 }
 
 # DIVE-6202: an OpenAgent bundle written by `openagent export` carries the bundle
@@ -346,7 +347,8 @@ _pack_adopt_openagent_bundle() {   # _pack_adopt_openagent_bundle <stage>
      '. + {packFormat: 1, agentName: (if $id == "" then null else $id end),
            includes: {memory: (if $mem == "false" then false else $mem end), memoryShape: "atoms", persona: true},
            config: (.config // {}), plugins: (.plugins // []), skills: $skills, hooks: {}}' \
-     "$mf" > "$mf.$$" && mv "$mf.$$" "$mf"
+     "$mf" > "$mf.$$" || { rm -f "$mf.$$"; return 1; }
+  mv "$mf.$$" "$mf"
 }
 
 # DIVE-6202: the import's secret check. rc 1 = refuse. The transient signing-key
