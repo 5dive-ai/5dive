@@ -983,6 +983,32 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
   out=$(cd "${_TASK_GRADE_DERIVED_REPO:-.}" && cmd_task_verify "$ident" --no-done --cmd="$stored" --result="$ctl_note" 2>&1) || rc=$?
   printf '%s\n' "$out" >&2
   if (( rc == 0 )); then
+    # DIVE-6223: THE PASS NOBODY COULD MERGE. `task verify` stamps graded_by with
+    # the seat that ran the command, which here is the MAKER's. On a row that has
+    # already recorded that maker (DIVE-6210: delivered once to a temp grader,
+    # then re-delivered with --verify), writer != grader in `_TASKS_TFV_SQL`
+    # strips merge standing from every seat: the maker's `task merge` was
+    # refused, and the row went back to quinn by hand. The command, not the
+    # seat, graded it — so record it that way and hand it to the merge seat,
+    # exactly like a CI-graded small delivery. A row whose maker is not
+    # recorded keeps today's shape (its grader seat holds standing already).
+    local _cg_gb _cg_mk
+    _cg_gb=$(db "SELECT COALESCE(graded_by,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    _cg_mk=$(db "SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    if [[ -n "$_cg_mk" && "$_cg_gb" == "$_cg_mk" ]]; then
+      local _cg_pr _cg_owner
+      _cg_pr=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+      _cg_owner=$(_merge_hold_seat "$(_gate_slug_from_url "$_cg_pr" 2>/dev/null || printf '')" 2>/dev/null) || _cg_owner=""
+      [[ -n "$_cg_owner" ]] || _cg_owner="$_cg_mk"
+      db "UPDATE tasks SET graded_by='ci:command', verifier=NULL,
+             merge_owner=$(sqlq "$_cg_owner"),
+             merge_hold_reason=COALESCE(merge_hold_reason,'ci-graded: merge once required checks are green at the graded sha'),
+             assignee=$(sqlq "$_cg_owner"), status='todo', started_at=NULL,
+             updated_at=datetime('now')
+           WHERE id=${id} AND status NOT IN ('done','cancelled');"
+      _task_store_audit_log "task.ci-graded" ok 0 -- "$ident" "kind=command" "ref=${_cg_pr}" "was_graded_by=${_cg_gb}" "merge_owner=${_cg_owner}" 2>/dev/null || true
+      warn "$ident: the command's PASS is recorded as graded by the command (ci:command), not by '${_cg_gb}' — '${_cg_gb}' is also this row's maker, and a maker's grade gives no seat merge standing. Merge owner '${_cg_owner}' merges it once the required checks are green (DIVE-6223)."
+    fi
     local _ok_ctl="with a PROVEN negative control (the check goes red on the mutated tree, DIVE-4623)"
     (( ctl_rc == 2 )) && _ok_ctl="control NOT RUN — see the row"
     [[ -z "$control" ]] && _ok_ctl="with NO negative control on the row"
@@ -994,6 +1020,61 @@ _task_deliver_command_grade() {  # <id> <ident> <cmd-given-at-delivery> <result>
   fi
   policy_refuse "$E_CONFLICT" deliver-command-grade-failed DIVE-4576 "$ident" \
     "$ident: the command that grades this row FAILED at delivery (exit ${rc}) — '$stored'. The delivery ref is recorded and the FAIL verdict is on the row, but it was NOT handed off: no grader session was spawned to discover a red that a command had already found, and no handoff clock is running, so there is no reject to undo. The output tail is in the row's result ('5dive task show $ident'). Fix it and deliver again."
+}
+
+# DIVE-6223: a delivery the size or docs-only rule exempts from a grader session
+# is GRADED BY CI and handed straight to the seat that merges.
+#
+# WHY A RECORDED GRADE AND NOT A PLAIN "NO GRADER". The `task done` fork can
+# afford to fall through to an ordinary close; a `task deliver` cannot, because
+# the pull request is still open and every merge rail in this file keys on a
+# grade (`_task_merge_standing_sql`). An ungraded row is a row nobody may merge,
+# which is the DIVE-6210 dead end one step earlier. So the row records what is
+# actually true: no seat judged this diff, the forge's required checks will.
+#   graded_by      = 'ci:<kind>' — not a seat name (the colon keeps it out of
+#                    the agent namespace), so no seat gains standing by name
+#   graded-sha     = the delivered head, appended to the result as the line
+#                    `_gate_graded_sha` reads; the merge disposition then holds
+#                    unless that exact sha is the PR head with required checks
+#                    green, which is the "merge on green CI" this row asks for
+#   verifier       = NULL — the grader it would have booked is not booked
+#   merge_owner    = the box's merge seat, which is the one seat
+#                    `_task_merge_standing_sql` lets merge a ci-graded row
+# The row lands at todo on that seat, so the heartbeat's merge-owner arm wakes
+# it to run `task merge`; quinn is never in the path.
+_task_deliver_ci_grade() {  # <id> <ident> <pr> <kind|reason> <result> <want_result>
+  local id="$1" ident="$2" pr="$3" skip="$4" result="${5:-}" want_result="${6:-0}"
+  local kind="${skip%%|*}" why="${skip#*|}" sha owner slug
+  sha=$(db "SELECT COALESCE(delivered_sha,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  slug=$(_gate_slug_from_url "$pr" 2>/dev/null || printf '')
+  owner=$(_merge_hold_seat "$slug" 2>/dev/null) || owner=""
+  [[ -n "$owner" ]] || owner=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+  local line="CI-GRADED (DIVE-6223, no grader session): ${why}. Merges when the forge's required checks are green at"
+  if [[ -n "$sha" ]]; then line+=$'\n'"graded-sha: ${sha} (the delivered head; CI grades it, no seat did)"
+  else line+=" the delivered head, which this delivery did not record — the merge disposition holds until a seat names it"; fi
+  local res_sql=""
+  if (( want_result )); then res_sql="result=$(sqlq "${result}"$'\n'"${line}"),"
+  else res_sql="result=COALESCE(result,'')||$(sqlq $'\n'"${line}"),"; fi
+  db "UPDATE tasks SET ${res_sql}
+         verifier=NULL,
+         graded_at=CASE WHEN graded_at IS NULL
+                          OR (handoff_rejected_at IS NOT NULL AND handoff_rejected_at >= graded_at)
+                        THEN datetime('now') ELSE graded_at END,
+         graded_by=$(sqlq "ci:${kind}"),
+         graded_verdict='pass',
+         graded_verdict_at=datetime('now'),
+         merge_owner=$(sqlq_or_null "$owner"),
+         merge_hold_reason='ci-graded: merge once required checks are green at the graded sha',
+         assignee=$(sqlq_or_null "$owner"),
+         status='todo', started_at=NULL,
+         updated_at=datetime('now')
+       WHERE id=${id};"
+  _five_flush_write_notes
+  _task_store_audit_log "task.ci-graded" ok 0 -- "$ident" "kind=${kind}" "ref=${pr}" "sha=${sha:-none}" "merge_owner=${owner:-none}" 2>/dev/null || true
+  warn "$ident: no grader session booked (DIVE-6223) — ${why}. Recorded as graded by CI at ${sha:0:12}; merge owner '${owner:-nobody}' merges it once the required checks are green. File the row with --verify to buy a grader round back."
+  ok "$ident delivered ($pr) — CI-graded, no grader session; merge owner: ${owner:-none}" \
+     '{id:($i|tonumber), ident:$id, deliveryRef:$p, delivered:true, routedTo:null, gradedBy:$g, graderSession:false, mergeOwner:$o, status:"todo"}' \
+     --arg i "$id" --arg id "$ident" --arg p "$pr" --arg g "ci:${kind}" --arg o "$owner"
 }
 
 # DIVE-4634: rubric is the cheap lane, never the unsafe lane. Any explicit
@@ -1988,6 +2069,17 @@ cmd_task_deliver() {
   local _vfier _asignee
   _vfier=$(db "SELECT COALESCE(verifier,'')  FROM tasks WHERE id=${id};")
   _asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+  # DIVE-6223: a docs-only or small delivery books NO grader session, here as
+  # in `task done`. Asked before the grader is attached, so the row never gains
+  # one it will not use, and only when the box would otherwise grant one: a
+  # verify=never box keeps its own declined arm below.
+  if [[ -z "$_vfier" || "$_vfier" != "$_asignee" ]] && _task_verify_grants "$id"; then
+    local _skip; _skip=$(_task_delivery_grader_skip "$id")
+    if [[ -n "$_skip" ]]; then
+      _task_deliver_ci_grade "$id" "$ident" "$pr" "$_skip" "$result" "$want_result"
+      return 0
+    fi
+  fi
   # DIVE-4251: `verify=delivered-only` — THIS is the moment the box said a grader
   # is warranted. The row was filed without one because at `task add` there was no
   # delivery to judge; binding a PR is what makes it "code that ships". Attaching
@@ -3298,8 +3390,17 @@ cmd_task_reject() {
 # _task_merge_standing_sql <actor> — the WHERE that decides this rail, as one
 # string, so the verb and the root executor grade the identical rule. PURE: no
 # I/O, no root, unit-testable without a box.
+#
+# DIVE-6223: ONE MORE SHAPE, and it is not a seat's grade. A row graded by CI
+# (`graded_by` = 'ci:<kind>', written only by `_task_deliver_ci_grade` and the
+# command-grade arm) names no seat, so no seat could ever match the first arm and
+# the row was mergeable by nobody. Its standing goes to the seat recorded as its
+# MERGE OWNER, and to nobody else. That widens who may press the button on
+# exactly those rows and no other; what it does not do is let anyone merge on
+# CI's word alone — `cmd_task_merge_do` re-reads the disposition for a ci row
+# and refuses unless the head is the graded sha with required checks green.
 _task_merge_standing_sql() {
-  printf '%s' "${_TASKS_TFV_SQL} AND graded_by = $(sqlq "${1:-}")"
+  printf '%s' "${_TASKS_TFV_SQL} AND (graded_by = $(sqlq "${1:-}") OR (graded_by LIKE 'ci:%' AND merge_owner = $(sqlq "${1:-}")))"
 }
 
 # ── DIVE-4137 — the DISPOSITION of a graded pull request at the verifier's close ─
@@ -3758,9 +3859,10 @@ cmd_task_merge() {
 # the negative case (a row this seat did NOT grade) has a message a reader can act
 # on instead of a bare permission error.
 _task_merge_preflight() {
-  local ident="$1" actor="$2" row
+  local ident="$1" actor="$2" row mo
   row=$(db "SELECT COALESCE(graded_by,'')||x'1f'||COALESCE(graded_verdict,'')||x'1f'||COALESCE(delivery_ref,'')||x'1f'||COALESCE(handoff_rejected_at,'')||x'1f'||COALESCE(graded_at,'')||x'1f'||status
             FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
+  mo=$(db "SELECT COALESCE(merge_owner,'') FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
   [[ -n "$row" ]] || fail "$E_VALIDATION" "no task ${ident}."
   local gb gv dr hr ga st rest
   gb="${row%%$'\x1f'*}";   rest="${row#*$'\x1f'}"
@@ -3774,7 +3876,9 @@ _task_merge_preflight() {
   # THE NEGATIVE, asserted by name. Without this arm the grant is unbounded in the
   # one direction nobody would notice: a verifier merging a row someone ELSE graded
   # is indistinguishable, at the GitHub end, from a legitimate merge.
-  [[ "$gb" == "$actor" ]] \
+  # DIVE-6223: a CI-graded row is merged by its merge owner (see
+  # _task_merge_standing_sql); every other row only by the seat that graded it.
+  [[ "$gb" == "$actor" || ( "$gb" == ci:* && -n "$mo" && "$mo" == "$actor" ) ]] \
     || fail "$E_AUTH_REQUIRED" "${ident} was graded by '${gb:-<nobody>}', not by '${actor}' — REFUSED. This rail removes one ask only: the verifier asking a second seat to press the button on a pull request IT ITSELF passed. It is not a merge capability, so it does not extend to a row this seat did not grade. If '${gb:-the grader}' should merge it, that seat runs this verb; otherwise it stays a normal merge."
   [[ -n "$dr" ]] \
     || fail "$E_CONFLICT" "${ident} is graded but carries no delivery_ref, so no pull request is bound to it and there is nothing to merge. Bind it: 5dive task deliver ${ident} --pr=<url>."
@@ -4524,6 +4628,21 @@ cmd_task_merge_do() {
   pr=$(db "SELECT delivery_ref FROM tasks WHERE ident=$(sqlq "$ident") AND $(_task_merge_standing_sql "$actor") LIMIT 1;" 2>/dev/null || printf '')
   [[ -n "$pr" ]] \
     || fail "$E_AUTH_REQUIRED" "_merge_do: ${actor} holds no merge standing on ${ident} — the row must be graded PASS BY ${actor}, still carry the delivery_ref that grade was recorded against, and not have been rejected since. Re-derived here as root from the row; the caller's view of it is not consulted. \`5dive task show ${ident}\` prints the fields this predicate reads."
+
+  # DIVE-6223: a CI-graded row's standing is the merge owner's, and its grade is
+  # a promise that CI WILL pass, not a reading that it did. So the merge waits
+  # for the reading: the disposition must say `merge` — the PR head is the
+  # graded sha, GitHub reads CLEAN (required checks green), and no path needs a
+  # person's look. Anything else, including a read that failed, refuses here and
+  # merges nothing. A seat-graded row is untouched: its grader read CI already.
+  local _mdo_gb; _mdo_gb=$(db "SELECT COALESCE(graded_by,'') FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
+  if [[ "$_mdo_gb" == ci:* ]]; then
+    local _mdo_gsha _mdo_disp
+    _mdo_gsha=$(_gate_graded_sha "$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;")")
+    _mdo_disp=$(_merge_disp_probe "$pr" "$_mdo_gsha" 2>/dev/null) || _mdo_disp=""
+    [[ "$_mdo_disp" == "merge" ]] \
+      || fail "$E_CONFLICT" "_merge_do: ${ident} was graded by CI (${_mdo_gb}), not by a seat, so it merges only once CI has passed at the graded sha ${_mdo_gsha:-<none recorded>} — the disposition reads '${_mdo_disp:-unreadable}'. NOTHING MERGED. Wait for the required checks, or, if the head moved, have the maker re-deliver (DIVE-6223)."
+  fi
 
   # A READ NEEDS NO MACHINE ACCOUNT; ONLY A MERGE DOES — so ask what
   # the pull request IS before demanding the credential to change it.

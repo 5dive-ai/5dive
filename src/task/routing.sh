@@ -495,6 +495,49 @@ _task_delivery_small_reason() {  # <task-id>
   return 0
 }
 
+# DIVE-6223: the same two downgrades, asked at `task deliver` instead of
+# `task done`. Prints `<kind>|<reason>` (kind: docs-only | small) when the
+# delivery should book no grader session, nothing otherwise; always returns 0.
+#
+# THE DEFECT. DIVE-2719 and DIVE-4559 were written into `task done`'s routing
+# fork, and the fleet delivers PRs through `task deliver`, which routed to the
+# grader without asking either of them. Measured 2026-10-14: DIVE-6212 (one
+# README file, 76 changed lines, under verify-small=150) and every other
+# sub-150 delivery went to quinn's queue.
+#
+# Narrower than the `task done` fork in two places, both towards grading:
+#   * `--verify` (verify_forced) beats docs-only here too. A row that demanded a
+#     grade at filing gets one, whatever the diff touched (the copy-review rows
+#     in community/wiki/a-file-delivery-keeps-its-grader-only-with-verify-at-filing.md
+#     depend on exactly this).
+#   * a row pinned to a NAMED grader (`--review=<seat>`) keeps it: the filer
+#     chose that seat's judgement, not a session of whoever is free.
+# Companions still disqualify both rails (DIVE-4899): the measurement read the
+# primary PR only.
+_task_delivery_grader_skip() {  # <task-id>
+  local id="$1" forced mode comp="" depth small
+  forced=$(db "SELECT COALESCE(verify_forced,0) FROM tasks WHERE id=${id};" 2>/dev/null || printf 0)
+  [[ "$forced" == "1" ]] && return 0
+  mode=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  if [[ -n "$mode" ]]; then
+    case "$(review_mode_kind "$mode" 2>/dev/null || printf invalid)" in
+      temp|rubric) ;;
+      *) return 0 ;;
+    esac
+  fi
+  declare -F _task_companion_refs >/dev/null 2>&1 && comp=$(_task_companion_refs "$id")
+  [[ -z "$comp" ]] || return 0
+  depth=$(_task_delivery_paths "$id" | _task_delivery_depth)
+  if [[ "$depth" == "shallow" ]]; then
+    printf 'docs-only|the delivered diff touches only tests/docs/changelog (DIVE-2719)'
+    return 0
+  fi
+  [[ "$depth" == "deep" ]] && return 0
+  small=$(_task_delivery_small_reason "$id")
+  [[ -n "$small" ]] && printf 'small|%s (DIVE-4559)' "$small"
+  return 0
+}
+
 # Boolean form, kept for readability at the call site.
 _task_is_trivial() {
   [[ -n "$(_task_verify_skip_reason "$1" "$2" "$3")" ]]
