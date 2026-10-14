@@ -19,6 +19,13 @@
 # re-add on import) rather than inventing a format.
 
 PACK_FORMAT_VERSION=1
+# DIVE-6202: a --format=pack export IS an OpenAgent agent bundle (openagent
+# SPEC.md, "Agent bundle"): the same manifest.json also carries bundle_version,
+# openagent, source_harness, created_at, persona and a sha256 per member, and
+# skill BODIES travel under skills/<id>/. `openagent import` reads it; an
+# `openagent export` reads back in here. 5dive's own keys stay on top.
+OPENAGENT_BUNDLE_VERSION=1
+OPENAGENT_BUNDLE_SPEC="0.51.0"
 
 # -------- character-pack git registry (DIVE-473/509) -----------------------
 # The marketplace is a curated GitHub repo (<org>/5dive-marketplace) that the CLI
@@ -275,6 +282,106 @@ _pack_skill_refs() {
             | (($m[$id].source // $d[$id] // "") | tostring) as $s
             | if ($s == "" or $s == $def) then $id else ($s + ":" + $id) end)' 2>/dev/null \
     || echo '[]'
+}
+
+# DIVE-6202: copy each skill's body into <stage>/skills/<id>/. A skill dir is
+# often a symlink into a shared tree, so the top level is followed (find -H) and
+# nothing below it is: a symlink inside a skill would carry a file from outside
+# it. .git and node_modules stay behind, and so does any file over 10 MB.
+_pack_stage_skill_bodies() {   # _pack_stage_skill_bodies <skills-dir> <stage>
+  local sdir="$1" stage="$2" d id f rel
+  [[ -d "$sdir" ]] || return 0
+  while IFS= read -r d; do
+    id=$(basename "$d")
+    valid_skill_id "$id" || continue
+    [[ -f "$d/SKILL.md" ]] || continue
+    while IFS= read -r -d '' f; do
+      rel="${f#"$d"/}"
+      install -D -m 644 "$f" "$stage/skills/$id/$rel" 2>/dev/null || true
+    done < <(find -H "$d" \( -name .git -o -name node_modules \) -prune -o -type f -size -10M -print0 2>/dev/null)
+  done < <(find "$sdir" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) ! -name '.*' 2>/dev/null | sort)
+}
+
+# DIVE-6202: add the OpenAgent bundle keys to a staged manifest.json. `files`
+# lists every staged member but the manifest itself, each with its sha256, so it
+# runs LAST, after everything is staged. No persona, no `persona` key: openagent
+# then refuses the file by name rather than guessing an identity.
+_pack_bundle_manifest() {   # _pack_bundle_manifest <stage> <has-persona:true|false>
+  local stage="$1" has_persona="$2" files f
+  files=$(cd "$stage" && find . -type f ! -path ./manifest.json -print0 | sort -z \
+    | while IFS= read -r -d '' f; do printf '%s\t%s\n' "${f#./}" "$(sha256sum <"$f" | cut -d' ' -f1)"; done \
+    | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}') || return 1
+  jq --argjson bv "$OPENAGENT_BUNDLE_VERSION" --arg oa "$OPENAGENT_BUNDLE_SPEC" \
+     --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson hp "$has_persona" --argjson files "$files" \
+     '. + {bundle_version: $bv, openagent: $oa, source_harness: "5dive", created_at: $at}
+        + (if $hp then {persona: "persona.yaml"} else {} end) + {files: $files}' \
+     "$stage/manifest.json" > "$stage/manifest.json.$$" || { rm -f "$stage/manifest.json.$$"; return 1; }
+  mv "$stage/manifest.json.$$" "$stage/manifest.json"
+}
+
+# DIVE-6202: an OpenAgent bundle written by `openagent export` carries the bundle
+# keys and none of 5dive's. Give its stage what the rest of cmd_import reads:
+# packFormat 1, the persona at persona.yaml, agentName = the persona's id, the
+# skill ids from skills/*/SKILL.md, and its memory as `raw` (a plain copy of a
+# harness's memory files, which nothing has distilled). A 5dive pack is left as it
+# is. Non-zero, with a reason on stderr, when the bundle is not one.
+_pack_adopt_openagent_bundle() {   # _pack_adopt_openagent_bundle <stage>
+  local stage="$1" mf="$1/manifest.json" bv pname id mem skills
+  bv=$(jq -r '.bundle_version // empty' "$mf" 2>/dev/null)
+  [[ "$bv" =~ ^[0-9]+$ ]] || { echo "pack manifest missing packFormat" >&2; return 1; }
+  (( bv <= OPENAGENT_BUNDLE_VERSION )) \
+    || { echo "agent bundle version $bv is newer than this CLI reads ($OPENAGENT_BUNDLE_VERSION) — upgrade 5dive" >&2; return 1; }
+  pname=$(jq -r '.persona // empty' "$mf")
+  [[ -n "$pname" && "$pname" != */* && "$pname" != .* && -f "$stage/$pname" ]] \
+    || { echo "agent bundle names no persona file it carries" >&2; return 1; }
+  if [[ "$pname" != "persona.yaml" ]]; then
+    [[ -e "$stage/persona.yaml" ]] && { echo "agent bundle carries both $pname and persona.yaml" >&2; return 1; }
+    mv "$stage/$pname" "$stage/persona.yaml"
+  fi
+  id=$(sed -n "s/^id:[[:space:]]*[\"']\{0,1\}\([A-Za-z0-9._-]*\).*/\1/p" "$stage/persona.yaml" | head -1)
+  mem=false
+  grep -q . < <(find "$stage/memory" -maxdepth 1 -type f -name '*.md' 2>/dev/null) && mem=raw
+  skills=$(find "$stage/skills" -mindepth 2 -maxdepth 2 -type f -name SKILL.md -printf '%h\n' 2>/dev/null \
+    | xargs -r -n1 basename | sort | jq -R . | jq -cs .)
+  jq --arg id "$id" --arg mem "$mem" --argjson skills "${skills:-[]}" \
+     '. + {packFormat: 1, agentName: (if $id == "" then null else $id end),
+           includes: {memory: (if $mem == "false" then false else $mem end), memoryShape: "atoms", persona: true},
+           config: (.config // {}), plugins: (.plugins // []), skills: $skills, hooks: {}}' \
+     "$mf" > "$mf.$$" || { rm -f "$mf.$$"; return 1; }
+  mv "$mf.$$" "$mf"
+}
+
+# DIVE-6202: the import's secret check. rc 1 = refuse. The transient signing-key
+# file (the one sanctioned secret, already stripped out of persona.yaml) is set
+# aside for the scan and put back. A 5dive RAW memory pack warns instead (see
+# cmd_import); an adopted openagent bundle never does.
+_pack_import_secret_gate() {   # _pack_import_secret_gate <stage> <mem_inc> <adopted:0|1> [<signing-keyfile>]
+  local stage="$1" mem_inc="$2" adopted="$3" skf="${4:-}" aside="" rc=0
+  if [[ -n "$skf" && -f "$skf" ]]; then aside=$(mktemp); mv "$skf" "$aside"; fi
+  _pack_secret_tripwire "$stage" || rc=1
+  [[ -n "$aside" ]] && mv "$aside" "$skf"
+  (( rc == 0 )) && return 0
+  if [[ "$mem_inc" == "raw" ]] && (( ! adopted )); then
+    warn "RAW IMPORT: the lines above look like credentials and are in this backup. Rotate anything real that appears there."
+    return 0
+  fi
+  return 1
+}
+
+# DIVE-6202: check a bundle's per-member sha256s. A mismatch WARNS rather than
+# refuses: 5dive-api rewrites members of a partner pack after export (the brand
+# scrub, partner-pack.ts), so a changed byte is not by itself a forged pack. The
+# secret tripwire, not this, is the import's hard control.
+_pack_bundle_verify() {   # _pack_bundle_verify <stage>
+  local stage="$1" p want bad=()
+  jq -e '.files | type == "object"' "$stage/manifest.json" >/dev/null 2>&1 || return 0
+  while IFS=$'\t' read -r p want; do
+    [[ -n "$p" ]] || continue
+    if [[ "$p" == */../* || "$p" == ../* || "$p" == /* || ! -f "$stage/$p" ]]; then bad+=("$p (missing)")
+    elif [[ "$(sha256sum <"$stage/$p" | cut -d' ' -f1)" != "$want" ]]; then bad+=("$p (changed)"); fi
+  done < <(jq -r '.files | to_entries[] | "\(.key)\t\(.value)"' "$stage/manifest.json")
+  (( ${#bad[@]} == 0 )) || warn "this bundle's members do not match its manifest: ${bad[*]} — it was changed after export"
+  return 0
 }
 
 # Install a bundled skill (a local <dir>/SKILL.md) directly into the agent's
@@ -1266,6 +1373,11 @@ _pack_usage() {
                                   # It gates BOTH containers: the scan runs before the
                                   # format branch, so the tarball and the single-file
                                   # AGENTS.md are covered by construction, not by two rules.
+                                  # --format=pack (the default) is an OpenAgent agent
+                                  # bundle (openagent SPEC.md, "Agent bundle"): persona,
+                                  # skill BODIES under skills/<id>/, memory/, a sha256 per
+                                  # file. 'openagent import <pack> --to=hermes|openclaw|
+                                  # claude-code|codex' reads it in another harness.
                                   # --with-memory is a TWO-PHASE deny-by-default flow:
                                   #   1) export <name> --with-memory  -> writes a scoped persona
                                   #      DRAFT (only reference/project knowledge facts; private
@@ -1289,7 +1401,8 @@ _pack_usage() {
                                   # --allow-hooks (default OFF): keep the pack's hooks. Without
                                   # it, a pack's arbitrary-shell hooks are STRIPPED on import.
                                   # recreate an agent from a pack into a FRESH name.
-                                  # <pack> = a .tar.gz file OR a bare registry slug
+                                  # <pack> = a .tar.gz file (a 5dive pack, or an agent
+                                  # bundle from 'openagent export') OR a bare registry slug
                                   # (e.g. 'import lilbro --as=...') pulled from the git registry.
                                   # --from-url=<https-url> (DIVE-5114) in place of <pack>: fetch
                                   # the .tar.gz from that link (5dive-api's short-lived link to a
@@ -1301,6 +1414,7 @@ _pack_usage() {
                                   # token/auth-profile here. Skills are re-added from their
                                   # recorded refs (skills not in a published repo are skipped
                                   # + reported). Memory is never in a config pack.
+                                  # A pack holding a secret-shaped string is refused.
   5dive agent pack-sync <name> [--from-url=<https-url>|--marketplace=<slug>] [--dry-run] [--no-restart]
   5dive agent pack-sync --all [--dry-run] [--no-restart]
                                   # DIVE-5205: bring a hired agent's pack SKILLS up to the
@@ -2704,6 +2818,11 @@ cmd_export() {
   # is NOT the default repo, and keep the short bare form when it is — so an
   # AGENTS.md stays readable and the common case is unchanged.
   local skills; skills=$(_pack_skill_refs "$cdir/skills")
+  # DIVE-6202: and the BODIES, for the pack container only (a single-file export
+  # still carries names). A bundle is read by harnesses with no skill registry to
+  # re-resolve a ref from, so the body is what makes the skill arrive. The secret
+  # tripwire below runs over these too.
+  [[ "$format" == "pack" ]] && _pack_stage_skill_bodies "$cdir/skills" "$stage"
   # Hooks subset from settings (structure only; if a hook command embeds a
   # secret that is on the operator — we copy the hooks block verbatim from
   # settings, which by convention holds no tokens).
@@ -2772,6 +2891,7 @@ cmd_export() {
       skills: $skills,
       hooks: $hooks
     } + (if $packslug == "" then {} else {pack: {slug: $packslug}} end)' > "$stage/manifest.json"
+  [[ "$format" == "pack" ]] && _pack_bundle_manifest "$stage" "$has_persona"
 
   # A pack NEVER contains a token/key/credential — assert over the WHOLE stage
   # (incl. any memory/) before we tar so a future change can't silently leak.
@@ -3120,6 +3240,18 @@ cmd_import() {
     || { rm -rf "$stage"; fail "$E_VALIDATION" "pack has no manifest.json — not a 5dive agent pack"; }
 
   local pf; pf=$(jq -r '.packFormat // empty' "$stage/manifest.json" 2>/dev/null)
+  # DIVE-6202: an `openagent export` bundle has no packFormat; adopt it.
+  # Before the adopt below, which moves the persona to persona.yaml.
+  _pack_bundle_verify "$stage"
+  local adopted=0
+  if [[ -z "$pf" ]]; then
+    adopted=1
+    local adopt_err
+    adopt_err=$(_pack_adopt_openagent_bundle "$stage" 2>&1) \
+      || { rm -rf "$stage"; fail "$E_VALIDATION" "${adopt_err:-not a 5dive agent pack or OpenAgent bundle}"; }
+    step "Reading an OpenAgent agent bundle (from $(jq -r '.source_harness // "?"' "$stage/manifest.json"))"
+    pf=$(jq -r '.packFormat // empty' "$stage/manifest.json" 2>/dev/null)
+  fi
   [[ "$pf" =~ ^[0-9]+$ ]] \
     || { rm -rf "$stage"; fail "$E_VALIDATION" "pack manifest missing packFormat"; }
   (( pf <= PACK_FORMAT_VERSION )) \
@@ -3160,6 +3292,19 @@ cmd_import() {
       rm -f "$signing_keyfile"; rm -rf "$stage"
       fail "$E_GENERIC" "could not process the persona's signing key (rc=$_srk) — aborting import to avoid leaking a private key"
     fi
+  fi
+
+  # DIVE-6202: a pack carries no secrets, and that is now checked on the way IN
+  # as well as out, because a bundle can come from `openagent export` or a hand,
+  # not only from this CLI's own tripwired export. After the signing-key strip
+  # above (that key is the one sanctioned secret, and it is out of the stage now);
+  # the transient key file is set aside for the scan. A RAW memory pack is the
+  # owner's own 5dive backup, which export already let through with a warning, so
+  # it warns here too instead of refusing the restore. An adopted openagent bundle
+  # is not one: its writer refuses secrets, so one found here was put in by hand.
+  if ! _pack_import_secret_gate "$stage" "$mem_inc" "$adopted" "$signing_keyfile"; then
+    rm -rf "$stage"
+    fail "$E_VALIDATION" "refusing to import: a file in the pack looks like it holds a secret (file:line: rule above). A pack never carries one — remove it and re-export."
   fi
 
   # DIVE-656: if the pack carries an OpenAgent persona.yaml it is the CANONICAL
