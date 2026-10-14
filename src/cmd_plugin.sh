@@ -1239,6 +1239,15 @@ _plugin_node_deps_notice() {  # <key> <dir> [<setup-command> [shown]]
   return 0
 }
 
+# <plugin> -> the repo a bare `plugin add <plugin>` installs from, or nothing.
+_plugin_bare_add_repo() {
+  local p
+  for p in ${FIVEDIVE_BARE_ADD_REPO:-}; do
+    [[ "${p%%:*}" == "$1" ]] && { printf '%s\n' "${p#*:}"; return 0; }
+  done
+  return 0
+}
+
 cmd_plugin_add() {
   local ref="" as_name="" assume_yes=0 official_only=0 a
   for a in "$@"; do
@@ -1264,6 +1273,19 @@ cmd_plugin_add() {
   fi
   [[ -z "$as_name" ]] || fail "$E_USAGE" "--as applies only to a repository source (<owner>/<repo> or URL)"
   _plugin_ensure_store
+
+  # A BARE NAME FOR A PLUGIN THAT LEFT THE REGISTRY (DIVE-6241): its own repo,
+  # the current release, not the registry's hand-synced mirror. Only when no
+  # copy of it is installed: a box on the mirror upgrades the mirror, and the
+  # move is the two commands the registry entry names.
+  if [[ "$ref" != *@* ]]; then
+    local _repo; _repo=$(_plugin_bare_add_repo "$ref")
+    if [[ -n "$_repo" ]] && ! jq -e --arg p "$ref" 'any(.[]; .plugin == $p)' "$(_plugin_installed_json)" >/dev/null 2>&1; then
+      echo "  '$ref' is published from its own repository: installing $(gh_org)/$_repo. (The copy in $(_plugin_registry_name) is kept for boxes that already run it: $ref@$(_plugin_registry_name).)" >&2
+      _plugin_add_foreign "$(gh_org)/$_repo" "" "$assume_yes" "$official_only"
+      return
+    fi
+  fi
 
   # BEFORE resolution, deliberately. quinn measured that on a fresh box this hint
   # never fired: `plugin add telegram` died at "no plugin telegram in any

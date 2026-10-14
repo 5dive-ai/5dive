@@ -294,6 +294,16 @@ readonly FIVEDIVE_STANDALONE_PLUGIN_REPOS="5dive-council 5dive-voice 5dive-a2a"
 # card and one-click allowlist in the app still install browser@5dive-plugins.
 readonly FIVEDIVE_MOVED_PLUGINS="voice:5dive-voice"
 
+# DIVE-6241: what a BARE `plugin add <name>` installs, as `<plugin>:<repo>`, for a
+# plugin that left the registry. `plugin add browser` on a fresh box installed the
+# registry's browser mirror, 1.32.0 while the release was 1.39.0 (round 2 of the
+# Claude in Chrome head-to-head): the mirror is synced by hand and fell 7 releases
+# behind. A bare name now means the repo copy. The qualified `browser@5dive-plugins`
+# still installs the mirror, and a box that already runs it keeps it (the CLI
+# refuses two plugins claiming one verb). Separate from FIVEDIVE_MOVED_PLUGINS on
+# purpose: that one is the app's catalogue, which still offers the mirror.
+readonly FIVEDIVE_BARE_ADD_REPO="browser:5dive-browser"
+
 # DIVE-4697: claude.ai ACCOUNT-level sync of skills and plugins — the keys that
 # turn it OFF, as one constant for the same reason the channel list above is one
 # (a fixer and the check that gates it drifted, and the check read [ok] either
