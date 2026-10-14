@@ -408,7 +408,9 @@ _secret_drop_ensure_route() {
   # DIVE-6205: the page exits once no link is live, and a link opened after that
   # (a spent one, or a chat app's link preview) got Caddy's bare, empty 502,
   # which the owner read as a fake link. With the page down no link is live, so
-  # Caddy says so itself, in the page's own words (GONE[5]).
+  # Caddy says so itself, in the page's own words (GONE[5]). Built before the
+  # heredoc: an unquoted heredoc carries no command substitution.
+  local closed_html; closed_html=$(_secret_drop_closed_html)
   cat >> "$cf" <<EOF
 
 # DIVE-5319: one-time secret drop links (5dive secret link). Its own name, so TLS
@@ -421,7 +423,7 @@ secrets.${domain} {
         handle @closed {
             header Content-Type "text/html; charset=utf-8"
             header Cache-Control no-store
-            respond \`$(_secret_drop_closed_html)\` 410
+            respond \`${closed_html}\` 410
         }
     }
 }
