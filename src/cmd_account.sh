@@ -553,18 +553,50 @@ account_remembered_room() {
   [[ -n "$(account_remembered_room_reading "$1")" ]]
 }
 
+# DIVE-6210: a statusline can carry seven_day and NO five_hour block, and every
+# reader above needs a 5h number, so a seat-bound account rendering that shape
+# is unmeasured forever. Measured 2026-10-14 04:42Z: mp-team's freshest cache
+# (ads) read 7d 69% and no 5h; four walled seats on mark were told "no measured
+# destination has headroom" from 04:39Z until lodar moved them by hand at 04:55Z,
+# and they ran on mp-team. The live probe was wired to balance mode only.
+#
+# account_probed_headroom <account> — ask the provider (account_live_ratelimits),
+# remember the reading on the account (source=probe, so the next boundary within
+# HEADROOM_FRESH_SECS reads it instead of paying again), and exit 0 when both
+# windows read under HEADROOM_MAX_PCT. No answer is no verdict, never 0%.
+account_probed_reading() {
+  local account="$1" live
+  live=$(account_live_ratelimits "$account")
+  [[ -n "$live" ]] || return 0
+  account_usage_remember "$account" "$(jq -c '{
+    fiveHour: {pct: .fiveHourPct, resetsAt: .fiveResetsAt},
+    sevenDay: {pct: .sevenDayPct, resetsAt: .sevenResetsAt},
+    asOf, source: "probe", remembered: false}' <<<"$live")"
+  printf '%s' "$live"
+}
+account_probed_headroom() {
+  local rl
+  rl=$(account_probed_reading "$1")
+  [[ -n "$rl" ]] || return 1
+  jq -e --argjson max "$HEADROOM_MAX_PCT" '
+    ((.fiveHourPct | type) == "number") and (.fiveHourPct < $max)
+    and ((.sevenDayPct | type) == "number") and (.sevenDayPct < $max)
+  ' <<<"$rl" >/dev/null 2>&1
+}
+
 # rotation_live_headroom_candidates <json-array> — preserve candidate order but
 # keep only profiles with a capacity verdict: a fresh measurement under the bar,
 # or (DIVE-6149) no fresh measurement at all and a remembered reading that
-# proves room. A FRESH reading always decides — an account measured at its wall
-# is never a destination, whatever it remembers.
+# proves room, or (DIVE-6210) no fresh measurement and a live probe under the
+# bar. A FRESH reading always decides — an account measured at its wall is
+# never a destination, whatever it remembers.
 rotation_live_headroom_candidates() {
   local candidates="$1" measured="[]" cand
   while IFS= read -r cand; do
     [[ -n "$cand" ]] || continue
     if account_has_live_headroom "$cand" \
        || { [[ "$(account_near_wall_state "$cand")" == "unmeasured" ]] \
-            && account_remembered_room "$cand"; }; then
+            && { account_remembered_room "$cand" || account_probed_headroom "$cand"; }; }; then
       measured=$(jq -cn --argjson acc "$measured" --arg a "$cand" '$acc + [$a]')
     fi
   done < <(jq -r '.[]' <<<"$candidates")
@@ -796,13 +828,9 @@ account_balance_reading() {
   at=-1
   [[ -n "$rl" ]] && { at=$(jq -r '.asOf // -1' <<<"$rl" 2>/dev/null) || at=-1; }
   if [[ ! "$at" =~ ^[0-9]+$ ]] || (( now - at > HEADROOM_FRESH_SECS )); then
-    live=$(account_live_ratelimits "$account")
+    live=$(account_probed_reading "$account")
     if [[ -n "$live" ]]; then
       rl="$live"
-      account_usage_remember "$account" "$(jq -c '{
-        fiveHour: {pct: .fiveHourPct, resetsAt: .fiveResetsAt},
-        sevenDay: {pct: .sevenDayPct, resetsAt: .sevenResetsAt},
-        asOf, source: "probe", remembered: false}' <<<"$live")"
     else
       # DIVE-6149: no fresh reading and no probe — an account whose remembered
       # reading proves room still ranks, on what that proof implies now.

@@ -18,6 +18,9 @@
 #      cache walls its new account); arm 2 goes red.
 #   5  the supervisor's wall move arms the launcher's resume marker (WANT 4),
 #      and drops it when no move happens.
+#   6  DIVE-6210: the 2026-10-14 04:4x replay — a destination whose fresh cache
+#      has 7d and no 5h is probed live and taken; probe down or at the wall
+#      admits nothing. NEGATIVE CONTROL: PROBE_MUTANT=1; red.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
@@ -32,9 +35,14 @@ source src/lib/actor.sh
 ACCT_SRC=$(cat src/cmd_account.sh)
 if [[ "${DARK_MUTANT:-0}" == 1 ]]; then
   # The mutation: the candidate fence is the pre-fix one (fresh measurement only).
-  ACCT_SRC=$(sed 's/&& account_remembered_room "$cand"; }; then$/\&\& false; }; then/' <<<"$ACCT_SRC")
-  grep -q '&& false; }; then$' <<<"$ACCT_SRC" || { echo "MUTANT DID NOT APPLY" >&2; exit 3; }
+  ACCT_SRC=$(sed 's/&& { account_remembered_room "$cand" || /\&\& { false || /' <<<"$ACCT_SRC")
+  grep -q '&& { false || account_probed_headroom' <<<"$ACCT_SRC" || { echo "MUTANT DID NOT APPLY" >&2; exit 3; }
   echo "MUTANT: remembered-reading branch removed from rotation_live_headroom_candidates"
+fi
+if [[ "${PROBE_MUTANT:-0}" == 1 ]]; then
+  ACCT_SRC=$(sed 's/ || account_probed_headroom "$cand"; }; }; then$/; }; }; then/' <<<"$ACCT_SRC")
+  grep -q 'account_remembered_room "$cand"; }; }; then$' <<<"$ACCT_SRC" || { echo "MUTANT DID NOT APPLY" >&2; exit 3; }
+  echo "MUTANT: live-probe branch removed from rotation_live_headroom_candidates (pre-DIVE-6210)"
 fi
 if [[ "${SPREAD_MUTANT:-0}" == 1 ]]; then
   ACCT_SRC=$(sed 's/^      candidates=$(rotation_spread_candidates "$reg" "$candidates")$/      :/' <<<"$ACCT_SRC")
@@ -217,6 +225,72 @@ t "5 a plugin-armed marker is never overwritten or removed" "ffffffff-ffff-ffff-
 rm -f "$(MK chat)"
 seed '{"chat":{"authProfile":"A", "type":"codex"}}'
 t "5 a codex seat: nothing armed" "" "$(_sup_arm_wall_resume chat)"
+
+# ── 6: DIVE-6210 — a destination whose fresh cache has 7d and NO 5h ─────────
+# Replay of 2026-10-14 04:43-04:53Z: mark (A) walled, its seats measured at 100%
+# 5h; mp-team (B) had seats on it whose freshest cache (ads, 04:42:27Z) carried
+# seven_day 69% and no five_hour block, the rest null or 40 minutes old;
+# chemmonitor (C) dark, remembered at 100% 7d. The heartbeat's call is
+# --if-current-near-wall --require-live-headroom. Pre-fix: "no eligible
+# account", and lodar moved the seats by hand. NEGATIVE CONTROL: PROBE_MUTANT=1
+# drops the probe branch and the move arms go red.
+cache7() {   # <seat> <7d%> <7d reset> <age> — the shape ads rendered: no five_hour
+  local d="$HOMES/agent-$1/.claude"; mkdir -p "$d"
+  jq -cn --argjson s "$2" --argjson sr "$3" '{rate_limits:{seven_day:{used_percentage:$s, resets_at:$sr}}}' \
+    >"$d/statusline-last.json"
+  touch -d "@$((NOW - $4))" "$d/statusline-last.json"
+}
+PROBES="$TMP/probes"
+probe_up() {   # the provider's answer, per account; every call is counted
+  echo "$1" >>"$PROBES"
+  case "$1" in
+    A) printf 'HTTP/2 429\r\nanthropic-ratelimit-unified-5h-utilization: 1.0\r\nanthropic-ratelimit-unified-7d-utilization: 0.34\r\nanthropic-ratelimit-unified-5h-reset: %s\r\nanthropic-ratelimit-unified-7d-reset: %s\r\n' "$RESET" "$AHEAD" ;;
+    B) printf 'HTTP/2 200\r\nanthropic-ratelimit-unified-5h-utilization: %s\r\nanthropic-ratelimit-unified-7d-utilization: 0.69\r\nanthropic-ratelimit-unified-5h-reset: %s\r\nanthropic-ratelimit-unified-7d-reset: %s\r\n' "${B5H:-0.12}" "$RESET" "$AHEAD" ;;
+    C) printf 'HTTP/2 429\r\nanthropic-ratelimit-unified-5h-utilization: 0.0\r\nanthropic-ratelimit-unified-7d-utilization: 1.0\r\nanthropic-ratelimit-unified-5h-reset: %s\r\nanthropic-ratelimit-unified-7d-reset: %s\r\n' "$RESET" "$AHEAD" ;;
+  esac
+}
+replay_0443() {
+  fresh_fixture; : >"$PROBES"; mkdir -p "$AUTH_PROFILES_DIR"/{A,B,C}   # every real profile has its dir
+  for s in seat1 seat2 seat3 seat4; do cache "$s" 100 "$RESET" 34 "$AHEAD" 120; done
+  cache7 ads 69 "$AHEAD" 60
+  cache7 marketing 68 "$AHEAD" 2600
+  mkdir -p "$HOMES/agent-creative/.claude"; echo '{"rate_limits":null}' >"$HOMES/agent-creative/.claude/statusline-last.json"
+  remember C 0 "$PAST" 100 "$AHEAD" $((NOW - 20000))
+  seed '{"seat1":{"authProfile":"A"}, "seat2":{"authProfile":"A"}, "seat3":{"authProfile":"A"},
+         "seat4":{"authProfile":"A"}, "ads":{"authProfile":"B"}, "marketing":{"authProfile":"B"},
+         "creative":{"authProfile":"B"}}'
+}
+boundary() ( JSON_MODE=1 cmd_agent_rotation_rotate "$1" --if-current-near-wall --require-live-headroom 2>/dev/null )
+
+replay_0443
+t "6 the replayed snapshot: B reads 7d-only, so it is unmeasured" "unmeasured" "$(account_near_wall_state B)"
+_ROTATION_PROBE_CMD=probe_up
+OUT=$(boundary seat1)
+t "6 a walled seat at its boundary rotates" "true" "$(J "$OUT" '.data.rotated')"
+t "6 it lands on mp-team (B), which the probe says has 5h room" "B" "$(bound seat1)"
+t "6 the probe reading is remembered on B (source=probe)" "probe:12" \
+  "$(jq -r '"\(.source):\(.fiveHour.pct)"' "$AUTH_PROFILES_DIR/B/usage.json" 2>/dev/null)"
+for s in seat2 seat3 seat4; do boundary "$s" >/dev/null; done
+t "6 every walled seat left A" "B,B,B,B" \
+  "$(jq -r '[.agents.seat1, .agents.seat2, .agents.seat3, .agents.seat4 | .authProfile] | join(",")' "$REG")"
+t "6 B was probed once; the next three read the remembered probe" "1" "$(grep -c '^B$' "$PROBES")"
+t "6 C (7d at 100%) is probed and never a destination" "true" "$(grep -q '^C$' "$PROBES" && echo true)"
+t "6 A, the account being left, is never probed" "0" "$(grep -c '^A$' "$PROBES")"
+
+# keep: no answer is no verdict, and a probe at the wall admits nothing
+replay_0443; _ROTATION_PROBE_CMD=false
+OUT=$(boundary seat1)
+t "6 probe down: unmeasured stays no destination (never 0%)" "false:A" "$(J "$OUT" '.data.rotated'):$(bound seat1)"
+replay_0443; _ROTATION_PROBE_CMD=probe_up; B5H=0.95
+OUT=$(boundary seat1)
+t "6 the probe says B is at its 5h wall: no move" "false:A" "$(J "$OUT" '.data.rotated'):$(bound seat1)"
+unset B5H
+# keep: a fresh numeric 5h reading decides without a probe
+replay_0443; _ROTATION_PROBE_CMD=probe_up
+cache ads 10 "$RESET" 69 "$AHEAD" 60
+boundary seat1 >/dev/null
+t "6 B measured fresh at 10% 5h: moves with no probe of B" "B:0" "$(bound seat1):$(grep -c '^B$' "$PROBES")"
+_ROTATION_PROBE_CMD=false
 
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))
