@@ -495,6 +495,70 @@ _task_delivery_small_reason() {  # <task-id>
   return 0
 }
 
+# DIVE-6223: the same two downgrades, asked at `task deliver` instead of
+# `task done`. Prints `<kind>|<reason>` (kind: docs-only | small) when the
+# delivery should book no grader session, nothing otherwise; always returns 0.
+#
+# THE DEFECT. DIVE-2719 and DIVE-4559 were written into `task done`'s routing
+# fork, and the fleet delivers PRs through `task deliver`, which routed to the
+# grader without asking either of them. Measured 2026-10-14: DIVE-6212 (one
+# README file, 76 changed lines, under verify-small=150) and every other
+# sub-150 delivery went to quinn's queue.
+#
+# Narrower than the `task done` fork in two places, both towards grading:
+#   * `--verify` (verify_forced) beats docs-only here too. A row that demanded a
+#     grade at filing gets one, whatever the diff touched (the copy-review rows
+#     in community/wiki/a-file-delivery-keeps-its-grader-only-with-verify-at-filing.md
+#     depend on exactly this).
+#   * a row pinned to a NAMED grader (`--review=<seat>`) keeps it: the filer
+#     chose that seat's judgement, not a session of whoever is free.
+# Companions still disqualify both rails (DIVE-4899): the measurement read the
+# primary PR only.
+#
+# A SEAT'S FAIL IS NOT OVERRULED BY A SMALLER DIFF (quinn, iteration 1). A row a
+# grader rejected, or whose grader recorded a FAIL verdict, goes back to that
+# grader: the reject's VERIFY line is the grader's to re-run, and the realistic
+# shape is a FIX of "drop the extra files" that shrinks the diff under the
+# cutoff. Read before route_to_verifier spends the reject token
+# (handoff_rejected_at=NULL), which is why it is a skip-rail input and not a
+# post-hoc check. A ci:* fail is not a seat's and does not count.
+#
+# NO REQUEST OF ITS OWN (quinn, iteration 2). <files-tsv> is `path<TAB>lines`
+# per file, the answer `_task_deliver_reach_probe` already fetched in its one
+# read. `task deliver`'s quiet path is pinned at one query
+# (tests/task_deliver_reach_probe_unit.sh R6b/R7a), so this rail never fetches:
+# empty (probe off, PR unreadable, the anonymous rail with no file list) reads as
+# unknown, and unknown is graded.
+_task_delivery_grader_skip() {  # <task-id> <files-tsv>
+  local id="$1" tsv="${2:-}" forced mode comp="" depth small seat_fail thr
+  [[ -n "$tsv" ]] || return 0
+  forced=$(db "SELECT COALESCE(verify_forced,0) FROM tasks WHERE id=${id};" 2>/dev/null || printf 0)
+  [[ "$forced" == "1" ]] && return 0
+  seat_fail=$(db "SELECT COUNT(*) FROM tasks WHERE id=${id}
+                    AND (handoff_rejected_at IS NOT NULL
+                         OR (graded_verdict='fail' AND COALESCE(graded_by,'') NOT LIKE 'ci:%'));" 2>/dev/null || printf 1)
+  [[ "$seat_fail" == "0" ]] || return 0
+  mode=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  if [[ -n "$mode" ]]; then
+    case "$(review_mode_kind "$mode" 2>/dev/null || printf invalid)" in
+      temp|rubric) ;;
+      *) return 0 ;;
+    esac
+  fi
+  declare -F _task_companion_refs >/dev/null 2>&1 && comp=$(_task_companion_refs "$id")
+  [[ -z "$comp" ]] || return 0
+  depth=$(cut -f1 <<<"$tsv" | _task_delivery_depth)
+  if [[ "$depth" == "shallow" ]]; then
+    printf 'docs-only|the delivered diff touches only tests/docs/changelog (DIVE-2719)'
+    return 0
+  fi
+  [[ "$depth" == "deep" ]] && return 0
+  thr=$(box_verify_small)
+  small=$(_task_delivery_small "$thr" <<<"$tsv")
+  [[ -n "$small" ]] && printf 'small|%s (DIVE-4559)' "$small"
+  return 0
+}
+
 # Boolean form, kept for readability at the call site.
 _task_is_trivial() {
   [[ -n "$(_task_verify_skip_reason "$1" "$2" "$3")" ]]

@@ -46,7 +46,8 @@ cmd_box_config() {
         "" \
         "  verify-small  how SMALL a delivery has to be to close without a grader." \
         "             <lines>  a delivery under this many changed lines (additions +" \
-        "                      deletions, across the whole PR) closes outright" \
+        "                      deletions, across the whole PR) books no grader:" \
+        "                      CI grades it and the merge seat merges it on green" \
         "             off      every delivery is graded on its own merits (default)" \
         "           Paths override the number: anything touching the scheduler, the task" \
         "           store, credentials, deploy, a shared lib, sudo policy, systemd, the" \
