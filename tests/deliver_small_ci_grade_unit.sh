@@ -149,6 +149,39 @@ landed "$id_never" id_never
 fixture_box_verify_policy delivered-only || true
 fixture_box_verify_small 150 || true
 
+echo "── a seat's FAIL is not overruled by a smaller diff (quinn, iteration 1) ──"
+# The realistic shape: the reject says "drop the extra files", the fix shrinks
+# the PR under the cutoff. The re-delivery goes back to the grader that
+# rejected it; CI does not stamp 'pass' over a seat's verdict.
+id_rj=$(FILES_PATH=src/cmd_agent.sh FILES_LINES=290 deliver_row)
+landed "$id_rj" id_rj
+[[ "$(col "$id_rj" assignee)" == "grader" ]] || bad_t "reject fixture" "first delivery not on grader: '$(col "$id_rj" assignee)'"
+( actor_seam_as grader
+  cmd_task_reject "$id_rj" --feedback="FINDING: too wide. FIX: drop the extra files. VERIFY: re-run the harness." ) >"$TMP/out.rj" 2>&1
+[[ -n "$(col "$id_rj" handoff_rejected_at)" && "$(col "$id_rj" assignee)" == "dev2" ]] \
+  || bad_t "reject fixture" "the reject did not land: $(head -c 400 "$TMP/out.rj")"
+( actor_seam_as dev2
+  FILES_PATH=src/cmd_agent.sh FILES_LINES=40 cmd_task_deliver "$id_rj" --pr="https://github.com/o/r/pull/$id_rj" \
+    --result=$'CHANGED: dropped the extra files\nCHECKED: y2\nDELIVERED-SHA: '"$HEAD_SHA"$'\nCI: not finished at delivery\nCRITERIA: z' ) >"$TMP/out.rj2" 2>&1
+[[ "$(col "$id_rj" assignee)" == "grader" && "$(col "$id_rj" verifier)" == "grader" \
+   && "$(col "$id_rj" graded_by)" != ci:* && "$(col "$id_rj" graded_verdict)" != "pass" ]] \
+  && ok_t "reject, then a +40 re-delivery: back on its grader, not CI-graded" \
+  || bad_t "reject-then-shrink" "assignee='$(col "$id_rj" assignee)' verifier='$(col "$id_rj" verifier)' graded_by='$(col "$id_rj" graded_by)' verdict='$(col "$id_rj" graded_verdict)' out=$(head -c 400 "$TMP/out.rj2")"
+
+# A recorded seat FAIL verdict (task verify, rc!=0) holds the same way; a ci:*
+# fail is the rail's own and is not a seat's.
+id_vf=$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 deliver_row)
+landed "$id_vf" id_vf
+db "UPDATE tasks SET graded_by='quinn', graded_verdict='fail', graded_at=datetime('now'),
+       graded_verdict_at=datetime('now') WHERE id=${id_vf};"
+[[ -z "$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 _task_delivery_grader_skip "$id_vf")" ]] \
+  && ok_t "a seat-recorded FAIL verdict keeps the grader on a small re-delivery" \
+  || bad_t "seat fail verdict" "skip='$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 _task_delivery_grader_skip "$id_vf")'"
+db "UPDATE tasks SET graded_by='ci:small' WHERE id=${id_vf};"
+[[ "$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 _task_delivery_grader_skip "$id_vf")" == small\|* ]] \
+  && ok_t "CONTROL: the same FAIL stamped ci:* does not block the size rail" \
+  || bad_t "ci fail control" "skip='$(FILES_PATH=src/cmd_agent.sh FILES_LINES=40 _task_delivery_grader_skip "$id_vf")'"
+
 echo "── merge standing on a CI-graded row ──"
 stand() { db "SELECT COUNT(*) FROM tasks WHERE id=$1 AND $(_task_merge_standing_sql "$2");"; }
 [[ "$(stand "$id_doc" ops)" == "1" ]] \
