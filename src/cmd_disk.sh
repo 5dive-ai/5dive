@@ -265,6 +265,11 @@ _disk_codex_current() {
   return 0
 }
 
+# A release dir's name: a version, optionally followed by a build suffix. The
+# real dirs carry the target triple, `0.162.1-x86_64-unknown-linux-musl`, and the
+# `_` in it is why the suffix class has one (DIVE-6329, chill-gorge box arm).
+DISK_CODEX_VER_RE='^v?[0-9]+(\.[0-9]+)+([-+.][0-9A-Za-z._-]+)?$'
+
 # _disk_sweep_codex_releases <dry> — DIVE-6329. Old Codex release dirs under
 # ~/.codex/packages/<pkg>/releases. Deletes by path, so every keep is checked.
 _disk_sweep_codex_releases() {
@@ -283,7 +288,7 @@ _disk_sweep_codex_releases() {
       pkgs=$((pkgs + 1))
       cur=$(_disk_codex_current "$pkg")
       newest=$(find "$pkg/releases" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
-                 | grep -E '^v?[0-9]+(\.[0-9]+)+([-+.][0-9A-Za-z.-]+)?$' | sort -V | tail -1) || newest=""
+                 | grep -E "$DISK_CODEX_VER_RE" | sort -V | tail -1) || newest=""
       if [[ -z "$cur" ]] || ! _disk_scan_holders "$pkg/releases" || [[ -z "$uid" || -n "${_DISK_BLIND[$uid]:-}" ]]; then
         unknown=$((unknown + $(find "$pkg/releases" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)))
         _disk_log "disk-sweep class=codex-releases kept-package=$pkg reason=$([[ -z "$cur" ]] && echo no-current || echo holders-unreadable)"
@@ -292,7 +297,7 @@ _disk_sweep_codex_releases() {
       while IFS= read -r -d '' e; do
         name="${e##*/}"
         if [[ "$e" == "$cur" ]]; then current=$((current + 1)); continue; fi
-        if ! [[ "$name" =~ ^v?[0-9]+(\.[0-9]+)+([-+.][0-9A-Za-z.-]+)?$ ]]; then other=$((other + 1)); continue; fi
+        if ! [[ "$name" =~ $DISK_CODEX_VER_RE ]]; then other=$((other + 1)); continue; fi
         if [[ "$name" == "$newest" ]]; then newest_n=$((newest_n + 1)); continue; fi
         if _disk_held "$e"; then live=$((live + 1)); continue; fi
         if ! _disk_old "$e"; then young=$((young + 1)); continue; fi
