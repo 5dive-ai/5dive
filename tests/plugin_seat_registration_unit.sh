@@ -591,5 +591,135 @@ if [[ "$m8ran" == yes ]]; then PASS=$((PASS+1)); else
 fi
 : > "$SEAT_SCRIPTS"
 
+# ---------------------------------------------------------------------------
+# T17 — DIVE-6304: a seat already carrying an OLD version is moved to the box's
+# ---------------------------------------------------------------------------
+# Measured on cic-arm-a 2026-10-15: box browser 1.41.0, agent-clicker's
+# installed_plugins.json pinned 1.39.0, `5dive plugin upgrade` printed
+# "clicker (claude): … registered", and the pin was still 1.39.0 afterwards.
+# `claude plugin install` is a NO-OP over any installed version; only
+# `claude plugin update` moves a pin.
+#
+# The install-mode stub above writes the file whatever the script says, so it
+# cannot see which verb ran. These arms RUN the shipping seat heredoc, with
+# HOME at the seat's temp home and CLAUDE_BIN at a fake that behaves as the
+# measured Claude Code does: install is a no-op when the key is present, update
+# moves the pin to the marketplace's version (FAKE_UPDATE_BROKEN: it does not).
+FAKE="$TMP/fakebin"; mkdir -p "$FAKE"
+cat > "$FAKE/claude" <<'FAKECLAUDE'
+#!/bin/bash
+f="$HOME/.claude/plugins/installed_plugins.json"
+mkdir -p "$(dirname "$f")"; [ -f "$f" ] || echo '{"version":2,"plugins":{}}' > "$f"
+printf '%s\n' "$*" >> "$HOME/claude-argv.log"
+case "$1 $2" in
+  "plugin install")
+    jq -e --arg k "$3" '.plugins[$k]' "$f" >/dev/null 2>&1 && exit 0 ;;
+  "plugin update")
+    [ "${FAKE_UPDATE_BROKEN:-0}" = 1 ] && exit 0
+    jq -e --arg k "$3" '.plugins[$k]' "$f" >/dev/null 2>&1 || exit 1 ;;
+  *) exit 0 ;;
+esac
+tmp=$(mktemp)
+jq --arg k "$3" --arg v "$FAKE_MKT_VERSION" \
+   '.plugins[$k] = [{scope:"user",version:$v,installPath:("/cache/" + $v)}]' "$f" > "$tmp" && mv "$tmp" "$f"
+FAKECLAUDE
+chmod +x "$FAKE/claude"
+
+CLK_HOME="$PERSONA_HOME_ROOT/agent-clicker"
+CLK_JSON="$CLK_HOME/.claude/plugins/installed_plugins.json"
+# pin_seat <version> — agent-clicker carrying browser at <version>, and a
+# marketplace clone already on disk so the heredoc's `git clone` is skipped.
+pin_seat() {
+  rm -rf "$CLK_HOME"; mkdir -p "$CLK_HOME/.claude/plugins/marketplaces/5dive-plugins/.git"
+  jq -n --arg v "$1" '{version:2,plugins:{"browser@5dive-plugins":[{scope:"user",version:$v,installPath:("/cache/" + $v)}]}}' > "$CLK_JSON"
+}
+seat_pin() { jq -r '.plugins["browser@5dive-plugins"][0].version // "none"' "$CLK_JSON" 2>/dev/null; }
+exec_run_as() {
+  local user="$1"; shift
+  env -u BASH_ENV HOME="$PERSONA_HOME_ROOT/$user" CLAUDE_BIN="$FAKE/claude" \
+      FAKE_MKT_VERSION="${FAKE_MKT_VERSION:-1.41.0}" FAKE_UPDATE_BROKEN="${FAKE_UPDATE_BROKEN:-0}" \
+      "$@" bash -s
+}
+clicker_only() { jq -n '{agents:{clicker:{type:"claude"}}}'; }
+IJ_SAVED="$TMP/installed.json.saved"; cp "$(_plugin_installed_json)" "$IJ_SAVED"
+set_box_version() {
+  local tmpf; tmpf=$(mktemp)
+  jq --arg v "$1" '.["browser@5dive-plugins"].version = $v' "$(_plugin_installed_json)" > "$tmpf" \
+    && mv "$tmpf" "$(_plugin_installed_json)"
+}
+# walk17 — the register walk for clicker alone, with the exec drop; stderr out.
+walk17() {
+  ( registry_read() { clicker_only; }
+    plugin_seat_run_as() { exec_run_as "$@"; }
+    plugin_seat_session_pid() { [[ -n "${SESSION_PID:-}" ]] && echo "$SESSION_PID"; return 0; }
+    plugin_seat_apply browser 5dive-plugins "skill" register "$PDIR" 2>&1; echo "WALK-RC=$?" )
+}
+
+set_box_version 1.41.0
+pin_seat 1.39.0
+out17=$(SESSION_PID=4242 walk17)
+t  "T17a THE FIX: a seat pinned 1.39.0 is pinned at the box's 1.41.0 after the walk" "1.41.0" "$(seat_pin)"
+tc "T17b ...because the seat ran \`claude plugin update\`, not the no-op install" \
+   "plugin update browser@5dive-plugins" "$(cat "$CLK_HOME/claude-argv.log")"
+tc "T17c the line names the ACTUAL move, read back from the seat" \
+   "clicker (claude): browser@5dive-plugins re-pinned 1.39.0 -> 1.41.0" "$out17"
+tc "T17d a seat with a running session is told it still runs the old version until it restarts" \
+   "its running session still has 1.39.0 loaded until it restarts" "$out17"
+tc "T17e ...with the one command that loads it" "clicker still runs the old browser@5dive-plugins until it restarts: sudo 5dive agent restart clicker" "$out17"
+
+pin_seat 1.39.0
+out17=$(walk17)
+tc "T17f a seat with no running session loads it at its next start, and is not told to restart" \
+   "re-pinned 1.39.0 -> 1.41.0 (loads at its next start)" "$out17"
+tnc "T17g ...no restart line for it" "sudo 5dive agent restart" "$out17"
+
+pin_seat 1.41.0
+out17=$(walk17)
+tc  "T17h a seat already at the box's version reads 'registered at' its version" \
+    "clicker (claude): browser@5dive-plugins registered at 1.41.0" "$out17"
+tnc "T17i ...and is not updated for nothing" "plugin update" "$(cat "$CLK_HOME/claude-argv.log")"
+
+# The honest failure: update ran and the pin did not move.
+pin_seat 1.39.0
+out17=$(FAKE_UPDATE_BROKEN=1 walk17)
+t   "T17j (setup) the broken update left the pin where it was" "1.39.0" "$(seat_pin)"
+tc  "T17k a seat that did NOT move says so, with both versions" \
+    "browser@5dive-plugins is still pinned at 1.39.0 — the box has 1.41.0; the seat did NOT move" "$out17"
+tnc "T17l ...and never prints 'registered' over the stale pin" "registered" "$out17"
+tc  "T17m ...the tally counts it failed" "0 ok, 1 failed" "$out17"
+tc  "T17n ...and the walk returns non-zero" "WALK-RC=1" "$out17"
+
+# The accept criterion end to end: `plugin upgrade` 1.39.0 -> 1.41.0 on the box.
+set_box_version 1.39.0
+jq '.version = "1.41.0"' "$MKTSRC/.claude-plugin/plugin.json" > "$TMP/pj" && mv "$TMP/pj" "$MKTSRC/.claude-plugin/plugin.json"
+pin_seat 1.39.0
+upout17=$( registry_read() { clicker_only; }
+           plugin_seat_run_as() { exec_run_as "$@"; }
+           plugin_seat_session_pid() { return 0; }
+           cmd_plugin_upgrade browser@5dive-plugins 2>&1 )
+tc "T17o \`plugin upgrade\` moved the box 1.39.0 -> 1.41.0" "upgraded 1.39.0 -> 1.41.0" "$upout17"
+t  "T17p ...and the seat's pin with it, with no hand \`claude plugin update\`" "1.41.0" "$(seat_pin)"
+tc "T17q ...and the upgrade's output names the seat's version" \
+   "clicker (claude): browser@5dive-plugins re-pinned 1.39.0 -> 1.41.0" "$upout17"
+
+# A brand-new seat (agent create's backfill) reports the version it got.
+rm -rf "$CLK_HOME"; mkdir -p "$CLK_HOME/.claude/plugins/marketplaces/5dive-plugins/.git"
+bfout=$( plugin_seat_run_as() { exec_run_as "$@"; }
+         plugin_seat_backfill clicker claude 2>&1 )
+tc "T17r a new seat's backfill names the version it is pinned at" "clicker: browser@5dive-plugins registered at 1.41.0" "$bfout"
+
+# M9: put back the pre-fix verb choice — the drop never asks for an update — and
+# prove T17a/T17k see it: the pin stays, and the walk refuses to call it registered.
+m9=$(declare -f plugin_seat_register_claude | sed 's/UPDATE="\$update"/UPDATE=0/')
+t "M9a the mutation landed (the update request is gone)" "0" "$(grep -c 'UPDATE="\$update"' <<<"$m9")"
+set_box_version 1.41.0; pin_seat 1.39.0
+m9out=$( eval "$m9"; walk17 )
+if [[ "$(seat_pin)" == 1.39.0 && "$m9out" == *"is still pinned at 1.39.0"* && "$m9out" != *"registered"* ]]; then
+  PASS=$((PASS+1))
+else
+  FAIL=$((FAIL+1)); printf 'FAIL: M9b with install-only the seat moved or the walk claimed registered (pin %s) — T17a/T17k are vacuous\n   %s\n' "$(seat_pin)" "$m9out"
+fi
+cp "$IJ_SAVED" "$(_plugin_installed_json)"
+
 printf 'plugin_seat_registration_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 && "$PASS" -ge 60 ]]
