@@ -77,6 +77,41 @@ echo "npm $*" >>"$HOME/npm-calls"
 exit 0
 NPM
   chmod +x "$TMP/home/.nvm/versions/node/v20.0.0/bin/npm"
+  # DIVE-6329 codex-releases: the layout ops cleared by hand on chill-gorge.
+  # 0.160.0 is CURRENT but not newest, so the two keeps are graded apart; the
+  # HELD release runs a real process from its own binary (exe + map), the way
+  # the live daemon holds its release. `standalone` has no current pointer.
+  CR="$TMP/home/.codex/packages/app-server-daemon/releases"
+  mkdir -p "$CR"/{0.157.1,0.158.0,0.159.0,0.160.0,0.162.1,.tmp-staging}
+  for v in 0.157.1 0.158.0 0.159.0 0.160.0 0.162.1 .tmp-staging; do head -c 65536 /dev/zero >"$CR/$v/codex"; done
+  cp /bin/sleep "$CR/0.158.0/codex-held"
+  ln -s releases/0.160.0 "$TMP/home/.codex/packages/app-server-daemon/current"
+  mkdir -p "$TMP/home/.codex/packages/standalone/releases"/{0.1.0,0.2.0}
+  echo x >"$TMP/home/.codex/packages/standalone/releases/0.1.0/codex"
+  find "$TMP/home/.codex" -mindepth 1 -not -path "$CR/0.159.0*" -exec touch -h -d '3 hours ago' {} +
+  ( exec -a codex-daemon "$CR/0.158.0/codex-held" 300 ) & HOLDERS+=($!)
+  # DIVE-6329 chrome-cache: what a pre-1.42.1 browser plugin left in ~/.cache.
+  CC="$TMP/home/.cache"
+  for d in tmp.DEADAAAAAA playwright_chromiumdev_profile-DEADBB tmp.HELDAAAAAA tmp.YOUNGAAAAA tmp.COOKIEAAAA tmp.ROOTFILEAA; do
+    mkdir -p "$CC/$d/Default/Cache/Cache_Data" "$CC/$d/Default/Code Cache/js"
+    head -c 65536 /dev/zero >"$CC/$d/Default/Cache/Cache_Data/data_1"
+  done
+  echo cookie >"$CC/tmp.COOKIEAAAA/Default/Cookies"
+  echo '{}' >"$CC/tmp.ROOTFILEAA/Local State"
+  mkdir -p "$TMP/home/victim2/Default/Cache"; echo precious >"$TMP/home/victim2/Default/Cache/data"
+  ln -s "$TMP/home/victim2" "$CC/tmp.SYMLINKAAA"
+  mkdir -p "$CC/tmp.notmatch"; echo keep >"$CC/tmp.notmatch/f"
+  find "$CC" -mindepth 1 -not -path "$CC/tmp.YOUNGAAAAA*" -exec touch -h -d '3 hours ago' {} +
+  ( cd "$CC/tmp.HELDAAAAAA/Default/Cache" && exec sleep 300 ) & HOLDERS+=($!)
+  # DIVE-6329 pip: the stub records argv and purges the way `pip cache purge` does.
+  mkdir -p "$CC/pip/http-v2" "$TMP/home/.local/bin"; head -c 65536 /dev/zero >"$CC/pip/http-v2/blob"
+  cat >"$TMP/home/.local/bin/pip3" <<'PIP'
+#!/usr/bin/env bash
+echo "pip $*" >>"$HOME/pip-calls"
+[[ "$*" == "cache purge" ]] && rm -rf "$HOME/.cache/pip/"*
+exit 0
+PIP
+  chmod +x "$TMP/home/.local/bin/pip3"
   # Chrome's real modes (mkstemp 0600, mkdtemp 0700). An unprivileged run keeps a
   # group/other-readable entry as UNKNOWN while other uids' processes are unreadable.
   chmod 600 "$T"/.com.google.Chrome.* "$T"/.org.chromium.Chromium.*
@@ -124,17 +159,37 @@ check "a scoped_dir SYMLINK is not followed (target kept)" '[[ -e $TMP/home/vict
 check "a planted file under the user's home survives"     '[[ -e $TMP/home/project/important.txt ]]'
 check "npm cache is cleaned through npm itself"           'grep -qx "npm cache clean --force" "$TMP/home/npm-calls" 2>/dev/null && [[ ! -e $TMP/home/.npm/_cacache ]]'
 check "npm's _npx dir (not the download cache) survives"  '[[ -e $TMP/home/.npm/_npx/keep ]]'
+check "codex: an old, unheld, non-current release is removed"   '[[ ! -e $CR/0.157.1 ]]'
+check "codex: the CURRENT release is kept (negative control)"     '[[ -e $CR/0.160.0/codex ]]'
+check "codex: the NEWEST release is kept"                         '[[ -e $CR/0.162.1/codex ]]'
+check "codex: a release a process runs from is kept"              '[[ -e $CR/0.158.0/codex-held ]]'
+check "codex: a release touched in the last hour is kept"         '[[ -e $CR/0.159.0/codex ]]'
+check "codex: a non-version name is never touched"                '[[ -e $CR/.tmp-staging/codex ]]'
+check "codex: a package with no current pointer is kept whole"    '[[ -e $TMP/home/.codex/packages/standalone/releases/0.1.0/codex ]]'
+check "codex: the log line counts every state"                    'grep -qE "class=codex-releases freed_kb=[1-9][0-9]* removed=1 kept_current=1 kept_newest=1 kept_live=1 kept_young=1 kept_unknown=2 kept_other=1 failed=0" "$FIVEDIVE_DISK_SWEEP_LOG"' "$(grep codex "$FIVEDIVE_DISK_SWEEP_LOG")"
+check "chrome-cache: old unheld cache-only tmp.* dir is removed"  '[[ ! -e $CC/tmp.DEADAAAAAA ]]'
+check "chrome-cache: old unheld playwright profile cache is removed" '[[ ! -e $CC/playwright_chromiumdev_profile-DEADBB ]]'
+check "chrome-cache: a dir a process holds is kept (negative control)" '[[ -e $CC/tmp.HELDAAAAAA/Default/Cache/Cache_Data/data_1 ]]'
+check "chrome-cache: a young dir is kept"                         '[[ -e $CC/tmp.YOUNGAAAAA ]]'
+check "chrome-cache: a dir holding Cookies is not cache — kept"   '[[ -e $CC/tmp.COOKIEAAAA/Default/Cookies ]]'
+check "chrome-cache: a dir with a top-level file is not cache — kept" '[[ -e "$CC/tmp.ROOTFILEAA/Local State" ]]'
+check "chrome-cache: a symlink is not followed (target kept)"     '[[ -e $TMP/home/victim2/Default/Cache/data && -L $CC/tmp.SYMLINKAAA ]]'
+check "chrome-cache: a name off the pattern is never touched"     '[[ -e $CC/tmp.notmatch/f ]]'
+check "chrome-cache: the log line counts every state"             'grep -qE "class=chrome-cache freed_kb=[1-9][0-9]* removed=2 kept_live=1 kept_young=1 kept_unknown=0 kept_not_cache=2 failed=0" "$FIVEDIVE_DISK_SWEEP_LOG"' "$(grep chrome-cache "$FIVEDIVE_DISK_SWEEP_LOG")"
+check "pip cache is purged through pip itself"                    'grep -qx "pip cache purge" "$TMP/home/pip-calls" 2>/dev/null && [[ ! -e $CC/pip/http-v2 ]] && grep -qE "class=pip freed_kb=[1-9][0-9]* users_cleaned=1 " "$FIVEDIVE_DISK_SWEEP_LOG"' "$(grep class=pip "$FIVEDIVE_DISK_SWEEP_LOG")"
 check "the log names what it freed, per class"            'grep -qE "class=chrome-tmp freed_kb=[1-9][0-9]* removed=3 kept_live=3 kept_young=2 kept_unknown=0 failed=0" "$FIVEDIVE_DISK_SWEEP_LOG" && grep -qE "class=npm freed_kb=[1-9]" "$FIVEDIVE_DISK_SWEEP_LOG" && grep -q "disk-sweep total freed_kb=" "$FIVEDIVE_DISK_SWEEP_LOG"' "$(cat "$FIVEDIVE_DISK_SWEEP_LOG" 2>/dev/null)"
 
 echo "== blindness: a process the scan cannot read keeps what it could be holding"
 plant; mkproc "$(id -u)"; : >"$FIVEDIVE_DISK_SWEEP_LOG"
 run_sweep "$SRC/cmd_disk.sh"
-check "an unreadable process of the OWNER's uid -> old entries kept as UNKNOWN" '[[ -e $T/.com.google.Chrome.DEAD01 && -e $T/scoped_dirDEAD03 ]] && grep -qE "kept_unknown=[1-9]" "$FIVEDIVE_DISK_SWEEP_LOG"' "$(cat "$FIVEDIVE_DISK_SWEEP_LOG")"
+check "an unreadable process of the OWNER's uid -> old entries kept as UNKNOWN" '[[ -e $T/.com.google.Chrome.DEAD01 && -e $T/scoped_dirDEAD03 ]] && grep -qE "class=chrome-tmp .*kept_unknown=[1-9]" "$FIVEDIVE_DISK_SWEEP_LOG"' "$(cat "$FIVEDIVE_DISK_SWEEP_LOG")"
+check "an unreadable process of the OWNER's uid -> chrome-cache keeps its dead dir as UNKNOWN" '[[ -e $CC/tmp.DEADAAAAAA ]] && grep -qE "class=chrome-cache .*kept_unknown=[1-9]" "$FIVEDIVE_DISK_SWEEP_LOG"'
+check "an unreadable process of the OWNER's uid -> codex keeps every release" '[[ -e $CR/0.157.1 ]] && grep -q "kept-package=.*app-server-daemon reason=holders-unreadable" "$FIVEDIVE_DISK_SWEEP_LOG"'
 plant; mkproc 4242; : >"$FIVEDIVE_DISK_SWEEP_LOG"
 echo shared >"$T/.com.google.Chrome.WORLDREAD"; chmod 644 "$T/.com.google.Chrome.WORLDREAD"; old "$T/.com.google.Chrome.WORLDREAD"
 run_sweep "$SRC/cmd_disk.sh"
 check "another uid unreadable: a 0600 entry is still swept"              '[[ ! -e $T/.com.google.Chrome.DEAD01 ]]'
-check "another uid unreadable: a world-readable entry is kept (UNKNOWN)" '[[ -e $T/.com.google.Chrome.WORLDREAD ]] && grep -q "kept_unknown=1 " "$FIVEDIVE_DISK_SWEEP_LOG"' "$(cat "$FIVEDIVE_DISK_SWEEP_LOG")"
+check "another uid unreadable: a world-readable entry is kept (UNKNOWN)" '[[ -e $T/.com.google.Chrome.WORLDREAD ]] && grep -qE "class=chrome-tmp .*kept_unknown=1 " "$FIVEDIVE_DISK_SWEEP_LOG"' "$(cat "$FIVEDIVE_DISK_SWEEP_LOG")"
 if mutant 's/if \[\[ -n "\$\{_DISK_BLIND\[\$owner\]:-\}" \]\] \|\|/if false ||/'; then
   plant; mkproc "$(id -u)"; run_sweep "$TMP/mut.sh"
   check "MUTANT no-blind-owner-check deletes under blindness (guard is load-bearing)" '[[ ! -e $T/.com.google.Chrome.DEAD01 ]]'
@@ -145,6 +200,9 @@ plant; : >"$FIVEDIVE_DISK_SWEEP_LOG"
 run_sweep "$SRC/cmd_disk.sh" --dry-run
 check "--dry-run removes no Chrome entry"                 '[[ -e $T/.com.google.Chrome.DEAD01 && -e $T/scoped_dirDEAD03 ]]'
 check "--dry-run runs no npm"                             '[[ ! -e $TMP/home/npm-calls && -e $TMP/home/.npm/_cacache/content/blob ]]'
+check "--dry-run removes no codex release and no cache dir"  '[[ -e $CR/0.157.1 && -e $CC/tmp.DEADAAAAAA ]]'
+check "--dry-run runs no pip"                                 '[[ ! -e $TMP/home/pip-calls && -e $CC/pip/http-v2/blob ]]'
+check "--dry-run lists the new classes' candidates"           'grep -qE "class=codex-releases freed_kb=[1-9][0-9]* removed=1 .*dry_run=1" "$FIVEDIVE_DISK_SWEEP_LOG" && grep -qE "class=chrome-cache freed_kb=[1-9][0-9]* removed=2 .*dry_run=1" "$FIVEDIVE_DISK_SWEEP_LOG" && grep -qE "class=pip freed_kb=[1-9][0-9]* users_cleaned=1 .*dry_run=1" "$FIVEDIVE_DISK_SWEEP_LOG"' "$(grep -E 'codex|cache|pip' "$FIVEDIVE_DISK_SWEEP_LOG")"
 check "--dry-run still reports what it would free"        'grep -qE "class=chrome-tmp freed_kb=[1-9][0-9]* removed=3 .*dry_run=1" "$FIVEDIVE_DISK_SWEEP_LOG"'
 
 echo "== mutation arms: each guard removed must let its case go wrong"
@@ -163,6 +221,34 @@ fi
 if mutant 's/\\\( -type f -o -type d \\\) //'; then
   plant; run_sweep "$TMP/mut.sh"
   check "MUTANT no-type-filter follows the symlink (type filter is load-bearing)" '[[ ! -e $TMP/home/victim/data || ! -L $T/scoped_dirSYMLINK ]]'
+fi
+
+echo "== pip busy: a running pip keeps the cache"
+plant; : >"$FIVEDIVE_DISK_SWEEP_LOG"
+( exec -a pip3 sleep 300 ) & HOLDERS+=($!); sleep 0.3
+run_sweep "$SRC/cmd_disk.sh"
+check "a user with a pip running is skipped, cache untouched"  '[[ ! -e $TMP/home/pip-calls && -e $CC/pip/http-v2/blob ]] && grep -qE "class=pip freed_kb=0 users_cleaned=0 users_busy=1" "$FIVEDIVE_DISK_SWEEP_LOG"' "$(grep class=pip "$FIVEDIVE_DISK_SWEEP_LOG")"
+
+echo "== DIVE-6329 mutation arms"
+if mutant '/if \[\[ "\$e" == "\$cur" \]\]; then current=/d'; then
+  plant; run_sweep "$TMP/mut.sh"
+  check "MUTANT no-current-keep deletes the current release (guard is load-bearing)" '[[ ! -e $CR/0.160.0 ]]'
+fi
+if mutant '/if \[\[ "\$name" == "\$newest" \]\]; then newest_n=/d'; then
+  plant; run_sweep "$TMP/mut.sh"
+  check "MUTANT no-newest-keep deletes the newest release (guard is load-bearing)" '[[ ! -e $CR/0.162.1 ]]'
+fi
+if mutant 's/if \[\[ -z "\$cur" \]\] \|\| /if /'; then
+  plant; run_sweep "$TMP/mut.sh"
+  check "MUTANT no-current-skip deletes in a package with no pointer (guard is load-bearing)" '[[ ! -e $TMP/home/.codex/packages/standalone/releases/0.1.0 ]]'
+fi
+if mutant '/^ {6,}if _disk_held "\$e"; then live=/d'; then
+  plant; run_sweep "$TMP/mut.sh"
+  check "MUTANT no-holder-check deletes the running codex release and the held cache dir" '[[ ! -e $CR/0.158.0 && ! -e $CC/tmp.HELDAAAAAA ]]'
+fi
+if mutant 's/if ! _disk_chrome_cache_shape "\$e"; then shape=\$\(\(shape \+ 1\)\); continue; fi//'; then
+  plant; run_sweep "$TMP/mut.sh"
+  check "MUTANT no-shape-check deletes the dir holding Cookies (shape test is load-bearing)" '[[ ! -e $CC/tmp.COOKIEAAAA ]]'
 fi
 
 echo "== alarm: once per low episode, re-armed on recovery, retried if undelivered"
