@@ -150,6 +150,8 @@ cmd_rm() {
   # re-created seat of the same name starts on a clean cadence rather than
   # inheriting a stranger's clock.
   rm -f "${STATE_DIR}/memory-consolidate/${name}.notx" \
+        "${STATE_DIR}/memory-consolidate/${name}.norun" \
+        "${STATE_DIR}/memory-consolidate/${name}.nostore" \
         "${STATE_DIR}/memory-consolidate/${name}.stamp"
   remove_channel_secret telegram "$name"
   remove_channel_secret discord  "$name"

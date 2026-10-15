@@ -8934,6 +8934,11 @@ _hb_memory_consolidate_sweep() {
   # tick (a token rotating, a limit resetting at the top of the hour) and the
   # second is the standing condition that went unseen for sixteen days.
   _HB_CONS_UNAUTH=0; _HB_CONS_NOTX=0
+  # DIVE-6287 — NOSTORE is a seat that answered "no memory store" (a codex or
+  # opencode seat, or a Claude seat that has never booted). It has nothing to
+  # distil, so it is NOT a could-not-run: counting it there pinned that number
+  # at 1 on a box for 24 days, and a real lapse on a Claude seat read as 1→2.
+  _HB_CONS_NOSTORE=0
   [[ "${MEMORY_CONSOLIDATE:-on}" == "off" ]] && return 0
   local every="${MEMORY_CONSOLIDATE_EVERY_MIN:-${_HB_CONSOLIDATE_EVERY_MIN}}"
   [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) || every="$_HB_CONSOLIDATE_EVERY_MIN"
@@ -8956,15 +8961,22 @@ _hb_memory_consolidate_sweep() {
   # that reads but does not parse is UNKNOWN — not empty. Reaping on unknown
   # would delete the fleet's counters, i.e. erase the standing condition this row
   # exists to make visible, on a transient read error.
-  local _known_seats _rf _rn
+  local _known_seats _rf _rn _rk
   if _known_seats=$(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); then
-    for _rf in "$stampdir"/*.notx; do
+    # DIVE-6287: the could-not-run (.norun) and no-store (.nostore) markers
+    # are cleared the same way, by a later pass, so they are reaped the same way.
+    for _rf in "$stampdir"/*.notx "$stampdir"/*.norun "$stampdir"/*.nostore; do
       [[ -e "$_rf" ]] || continue
-      _rn=$(basename "$_rf" .notx)
+      _rn=$(basename "$_rf"); _rn="${_rn%.*}"
       grep -qxF -- "$_rn" <<<"$_known_seats" \
         && _hb_consolidate_seat_user "$_rn" >/dev/null && continue
       rm -f "$_rf" "$stampdir/${_rn}.stamp" 2>/dev/null || true
-      _hb_log "[memory-consolidate] reaped a stale not-transacting counter for '${_rn}' (no such seat on this box any more) — it could never have been cleared by a passing run."
+      case "$_rf" in
+        *.notx)  _rk="not-transacting counter" ;;
+        *.norun) _rk="could-not-run marker" ;;
+        *)       _rk="no-store marker" ;;
+      esac
+      _hb_log "[memory-consolidate] reaped a stale ${_rk} for '${_rn}' (no such seat on this box any more) — it could never have been cleared by a passing run."
     done
   fi
   for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
@@ -9026,7 +9038,7 @@ _hb_memory_consolidate_sweep() {
     # stays as the second chance for a seat that can read the files.
     local sharedenv="${CONNECTORS_DIR:-/etc/5dive/connectors}/anthropic.env"
     local authenv="${ENV_DIR:-${STATE_DIR:-/var/lib/5dive}/agents.d}/${name}-auth.env"
-    local out=""
+    local out="" rc=0
     # One line, deliberately: a multi-line -c payload carries newlines into every
     # log, `ps` line and test recorder that echoes the argv back.
     #
@@ -9038,7 +9050,7 @@ _hb_memory_consolidate_sweep() {
            _hb_distiller_env_feed \
            | timeout "${_HB_CONSOLIDATE_TIMEOUT_S}" sudo -n -u "$user" -H bash -c \
              'eval "$(cat)"; set -a; [ -r "$1" ] && . "$1"; [ -r "$2" ] && . "$2"; set +a; exec "$3" memory consolidate --max-sessions=1 --json </dev/null' \
-             _ "$sharedenv" "$authenv" "${SELF_BIN:-/usr/local/bin/5dive}" 2>/dev/null ) || out="${out:-}"
+             _ "$sharedenv" "$authenv" "${SELF_BIN:-/usr/local/bin/5dive}" 2>/dev/null ) || rc=$?
     local n_atoms n_proc n_dfail
     # `--slurp` and take the FIRST object that carries the field, because the
     # stream can hold TWO envelopes: on a non-zero exit the CLI's EXIT-trap
@@ -9050,12 +9062,43 @@ _hb_memory_consolidate_sweep() {
     n_atoms=$(jq -s -r "$jf pick(\"atoms_written\")"    <<<"$out" 2>/dev/null) || n_atoms=""
     n_proc=$(jq  -s -r "$jf pick(\"processed\")"        <<<"$out" 2>/dev/null) || n_proc=""
     n_dfail=$(jq -s -r "$jf pick(\"distiller_failed\")" <<<"$out" 2>/dev/null) || n_dfail=""
+    local norunf="$stampdir/${name}.norun" nostoref="$stampdir/${name}.nostore"
     if [[ ! "$n_atoms" =~ ^[0-9]+$ ]]; then
+      # DIVE-6287 — a seat with NO memory store answers this, and it is not a
+      # failure: there is nothing to distil. Matched on the class AND the
+      # message, because `not_found` is also what the verb says when the claude
+      # CLI is missing ("no distiller"), and that one IS a could-not-run.
+      local e_class e_msg
+      e_class=$(jq -s -r '[.[] | .error? | select(type=="object") | .class | select(. != null)] | first // empty' <<<"$out" 2>/dev/null) || e_class=""
+      e_msg=$(jq -s -r '[.[] | .error? | select(type=="object") | .message | select(. != null)] | first // empty' <<<"$out" 2>/dev/null) || e_msg=""
+      if [[ "$e_class" == "not_found" && "$e_msg" == "no memory store found"* ]]; then
+        _HB_CONS_NOSTORE=$((_HB_CONS_NOSTORE + 1))
+        printf '%s\n' "$now" > "$nostoref" 2>/dev/null || true
+        rm -f "$norunf" 2>/dev/null || true
+        continue
+      fi
       # Nothing parseable came back: no sudo grant, a timeout, or the verb died.
       # Non-fatal and COUNTED, never silent — a fleet-wide auth lapse or a missing
       # sudo grant has to show up as failures in the log, not as a quiet box.
+      # DIVE-6287: and NAMED, every pass, with the reason. A bare count is what
+      # hid a codex seat in this bucket for 24 days. The .norun marker beside the
+      # stamp is what `5dive doctor` reads; the next parseable pass deletes it.
+      local reason
+      if [[ -n "$e_msg" ]]; then reason="${e_class:-error}: ${e_msg}"
+      elif (( rc == 124 )); then reason="timed out after ${_HB_CONSOLIDATE_TIMEOUT_S}s"
+      elif [[ -z "$out" ]]; then reason="no output, exit ${rc} — no sudo grant for ${user}, or the verb died before answering"
+      else reason="unparseable output, exit ${rc}"
+      fi
+      reason=$(printf '%s' "$reason" | tr '\n\t' '  ' | cut -c1-200)
+      local norun=0
+      norun=$(head -n1 "$norunf" 2>/dev/null) || norun=0
+      [[ "$norun" =~ ^[0-9]+$ ]] || norun=0
+      printf '%s\n%s\n' "$((norun + 1))" "$reason" > "$norunf" 2>/dev/null || true
+      rm -f "$nostoref" 2>/dev/null || true
+      _hb_log "[memory-consolidate] could not run: ${name} (${reason})"
       _HB_CONS_FAILED=$((_HB_CONS_FAILED + 1)); continue
     fi
+    rm -f "$norunf" "$nostoref" 2>/dev/null || true
     [[ "$n_dfail" =~ ^[0-9]+$ ]] || n_dfail=0
     [[ "$n_proc"  =~ ^[0-9]+$ ]] || n_proc=0
     # DIVE-4284 index regrowth, read from the same envelope. Booleans, so the
@@ -9678,8 +9721,8 @@ cmd_heartbeat_tick() {
   # be zero when the pipeline is dead. Every other field is an attempt count.
   # DIVE-4284: ROUTED/OVER join the guard so an index event alone still logs —
   # a seat with nothing to distil can still be the seat whose index is truncated.
-  (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} || ${_HB_CONS_DFAIL:-0} || ${_HB_CONS_IDLE:-0} || ${_HB_CONS_ROUTED:-0} || ${_HB_CONS_OVER:-0} )) \
-    && _hb_log "[memory-consolidate] ${_HB_CONS_ATOMS:-0} atom(s) from ${_HB_CONS_RAN:-0} seat(s), ${_HB_CONS_DFAIL:-0} distiller-failed (${_HB_CONS_UNAUTH:-0} API-refused, ${_HB_CONS_NOTX:-0} NOT TRANSACTING), ${_HB_CONS_FAILED:-0} could not run, ${_HB_CONS_IDLE:-0} nothing to distil, ${_HB_CONS_SKIPPED:-0} not due; index: ${_HB_CONS_ROUTED:-0} re-routed under limit, ${_HB_CONS_OVER:-0} STILL OVER" || true
+  (( ${_HB_CONS_RAN:-0} || ${_HB_CONS_FAILED:-0} || ${_HB_CONS_NOSTORE:-0} || ${_HB_CONS_DFAIL:-0} || ${_HB_CONS_IDLE:-0} || ${_HB_CONS_ROUTED:-0} || ${_HB_CONS_OVER:-0} )) \
+    && _hb_log "[memory-consolidate] ${_HB_CONS_ATOMS:-0} atom(s) from ${_HB_CONS_RAN:-0} seat(s), ${_HB_CONS_DFAIL:-0} distiller-failed (${_HB_CONS_UNAUTH:-0} API-refused, ${_HB_CONS_NOTX:-0} NOT TRANSACTING), ${_HB_CONS_FAILED:-0} could not run, ${_HB_CONS_NOSTORE:-0} no store, ${_HB_CONS_IDLE:-0} nothing to distil, ${_HB_CONS_SKIPPED:-0} not due; index: ${_HB_CONS_ROUTED:-0} re-routed under limit, ${_HB_CONS_OVER:-0} STILL OVER" || true
   # DIVE-3343: there is NO per-TASK budget sweep here any more, and its absence
   # is deliberate — see the block above _hb_loop_ceiling_sweep's neighbours in
   # this file for why the figure it enforced could not be attributed to a row.

@@ -1734,6 +1734,34 @@ doctor_check_consolidate_transacting() {
         _notx_watch=$((_notx_watch + 1))
       fi
     done
+    # DIVE-6287 — a pass that dies BEFORE the API (sudo grant gone, timeout, the
+    # verb crashed) never writes a .notx, so this check used to read ok while
+    # the heartbeat logged "could not run" every six hours. The sweep now
+    # leaves a .norun marker (line 1: consecutive passes, line 2: the reason)
+    # and a .nostore marker for a seat with no memory store to distil. The
+    # first is a WARN naming the seat; the second is not a failure and is only
+    # named so the ok claims no more than was measured.
+    local _nr_f _nr_name _nr_n _nr_why _norun_bad="" _nostore=""
+    for _nr_f in "$_cons_stampdir"/*.norun; do
+      [[ -e "$_nr_f" ]] || continue
+      _nr_name=$(basename "$_nr_f" .norun)
+      if (( _known_ok )) && ! grep -qxF -- "$_nr_name" <<<"$_known"; then
+        _notx_ghost=$((_notx_ghost + 1)); continue
+      fi
+      _nr_n=$(sed -n 1p "$_nr_f" 2>/dev/null); [[ "$_nr_n" =~ ^[0-9]+$ ]] || _nr_n=1
+      _nr_why=$(sed -n 2p "$_nr_f" 2>/dev/null)
+      _norun_bad+="${_norun_bad:+; }${_nr_name} (${_nr_n} pass(es)${_nr_why:+: ${_nr_why}})"
+    done
+    for _nr_f in "$_cons_stampdir"/*.nostore; do
+      [[ -e "$_nr_f" ]] || continue
+      _nr_name=$(basename "$_nr_f" .nostore)
+      if (( _known_ok )) && ! grep -qxF -- "$_nr_name" <<<"$_known"; then continue; fi
+      _nostore+="${_nostore:+, }${_nr_name}"
+    done
+    local _norun_msg=""
+    [[ -n "$_norun_bad" ]] && _norun_msg="COULD NOT RUN — the last consolidation pass never reached the model for: ${_norun_bad}. Their memory is not consolidating. Check the seat's sudo grant for \`5dive memory consolidate\` and the heartbeat log ('could not run: <seat>')."
+    local _nostore_note=""
+    [[ -n "$_nostore" ]] && _nostore_note=" (skipped, no memory store to distil: ${_nostore})"
     local _notx_gh=""
     (( _notx_ghost > 0 )) && _notx_gh=" (${_notx_ghost} stale counter(s) for seat(s) the registry no longer knows were ignored; the scheduler reaps them on its next sweep)"
     if [[ -n "$_notx_bad" ]]; then
@@ -1741,9 +1769,15 @@ doctor_check_consolidate_transacting() {
       # status`, and it needs the seat. Named outright when exactly one is listed.
       local _notx_probe="5dive agent auth status --agent=<seat> --probe"
       (( ${#_notx_seats[@]} == 1 )) && _notx_probe="5dive agent auth status --agent=${_notx_seats[0]} --probe"
-      doctor_add memory consolidate error "NOT TRANSACTING — the distiller has been refused by the API on every consecutive pass for: ${_notx_bad}. Their memory has not consolidated since. Retrying will not clear it. Check the credential first (\`${_notx_probe}\`): if it reports HEALTHY the refusal is the ACCOUNT's limit, not the credential — raise the limit or move the seat to another auth profile. Only a probe that reports unhealthy means the seat's auth needs restoring.${_notx_gh}"
+      doctor_add memory consolidate error "NOT TRANSACTING — the distiller has been refused by the API on every consecutive pass for: ${_notx_bad}. Their memory has not consolidated since. Retrying will not clear it. Check the credential first (\`${_notx_probe}\`): if it reports HEALTHY the refusal is the ACCOUNT's limit, not the credential — raise the limit or move the seat to another auth profile. Only a probe that reports unhealthy means the seat's auth needs restoring.${_norun_msg:+ Also: ${_norun_msg}}${_notx_gh}"
+    elif [[ -n "$_norun_msg" ]]; then
+      local _nr_watch=""
+      (( _notx_watch > 0 )) && _nr_watch=" Also ${_notx_watch} seat(s) had a distiller refused by the API on their last pass, under the ${_notx_after}-pass threshold."
+      doctor_add memory consolidate warn "${_norun_msg}${_nr_watch}${_notx_gh}"
     elif (( _notx_watch > 0 )); then
       doctor_add memory consolidate warn "${_notx_watch} seat(s) had a distiller refused by the API on their last pass but are under the ${_notx_after}-pass threshold — transient limit or a rotating token; re-check if it persists${_notx_gh}"
+    elif [[ -n "$_nostore" ]]; then
+      doctor_add memory consolidate ok "every enrolled seat with a memory store reached the model on its last consolidation pass${_nostore_note}${_notx_gh}"
     else
       doctor_add memory consolidate ok "every enrolled seat's last consolidation pass reached the model${_notx_gh}"
     fi

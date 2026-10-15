@@ -181,6 +181,38 @@ printf '63\n' > "$DIR/carol.notx"
 assert_check "with no registry function defined, a failing seat is still named" error "carol \(63 passes\)"
 rm -f "$DIR"/*.notx
 
+# 15. DIVE-6287 — a pass that died BEFORE the API leaves a .norun marker (line 1:
+#     consecutive passes, line 2: why). The ok used to claim every seat "reached
+#     the model" while the heartbeat logged could-not-run every six hours.
+printf '3\nno output, exit 1\n' > "$DIR/bob.norun"
+assert_check "DIVE-6287 a could-not-run seat is a WARN, never the ok"  warn "COULD NOT RUN"
+assert_check "DIVE-6287 and it names the seat, its streak and the reason" warn 'bob \(3 pass\(es\): no output, exit 1\)'
+# 16. A no-store seat (codex/opencode/never booted) alone is ok — and the ok
+#     names it as skipped rather than claiming it reached the model.
+rm -f "$DIR"/*.norun
+printf '1\n' > "$DIR/codex-elm.nostore"
+doctor_consolidate_known_seats() { printf 'alice\nbob\ncodex-elm\n'; }
+assert_check "DIVE-6287 a no-store seat alone leaves doctor ok"        ok "no memory store to distil: codex-elm"
+row=$(run_check 4)
+if jq -e '.message | test("every enrolled seat.s last") | not' <<<"$row" >/dev/null; then
+  ok_t "DIVE-6287 and the ok no longer claims EVERY seat reached the model"
+else
+  bad_t "DIVE-6287 and the ok no longer claims EVERY seat reached the model" "$row"
+fi
+# 17. CONTROL: no-store does not mask a real could-not-run beside it.
+printf '1\nnot_found: no distiller\n' > "$DIR/bob.norun"
+assert_check "DIVE-6287 CONTROL: a could-not-run beside a no-store seat still warns" warn "bob \(1 pass"
+# 18. A NOT TRANSACTING error still wins, and still mentions the could-not-run.
+printf '63\n' > "$DIR/alice.notx"
+assert_check "DIVE-6287 the API-refused error still wins and carries the could-not-run" error "alice \(63 passes\).*Also: COULD NOT RUN.*bob"
+rm -f "$DIR"/*.notx
+# 19. A ghost .norun (seat removed) is filtered like a ghost .notx.
+rm -f "$DIR"/*.norun "$DIR"/*.nostore
+printf '5\nno output, exit 1\n' > "$DIR/ghost-seat.norun"
+assert_check "DIVE-6287 a .norun for a seat the registry no longer knows raises nothing" ok "stale counter"
+rm -f "$DIR"/*.norun
+source src/cmd_doctor.sh
+
 # 10. The check is WIRED, not merely defined — a function nothing calls is the
 #     same invisibility this row is about.
 grep -q 'doctor_check_consolidate_transacting' src/cmd_doctor.sh \
