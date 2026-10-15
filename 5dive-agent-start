@@ -1385,6 +1385,23 @@ case "${AUTONOMY,,}" in
   *) echo "[5dive] unknown AGENT_AUTONOMY='$AUTONOMY' — treating as standard" >&2 ;;
 esac
 
+# DIVE-6345: Claude in Chrome for this agent (`5dive agent config <name> set
+# chrome=on`). Claude Code switches Chrome off on a setup token: the token's scope
+# is user:inference only. So an opted-in agent starts on its OWN claude.ai login
+# (~/.claude/.credentials.json, written by `5dive browser claude connect`) with
+# the env tokens unset in the inner shell, and with --chrome. No login yet: it
+# stays on its token with Chrome off, exactly as before, and says how to connect.
+if [[ "${AGENT_CHROME:-}" == 1 && "$TYPE" == claude ]]; then
+  _cic_home="${HOME:-$(getent passwd "$(id -un)" | cut -d: -f6)}"
+  if [[ -s "${_cic_home}/.claude/.credentials.json" ]]; then
+    UNSET_CREDS+=" CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN"
+    ARGS+=(--chrome)
+    echo "[5dive] agent=${NAME} chrome=on: its own claude.ai login, with Claude in Chrome" >&2
+  else
+    echo "[5dive] agent=${NAME} chrome=on, but it has no claude.ai login of its own yet; it stays on its token with Chrome off until it runs: 5dive browser claude connect" >&2
+  fi
+fi
+
 # DIVE-1087: propagate TELEGRAM_SEND_ONLY into the poll-fork bridges' OWN env file.
 # A shared team bot (`5dive agent team-bot shared`) writes TELEGRAM_SEND_ONLY=1 into
 # /etc/5dive/connectors/telegram-<name>.env (loaded into THIS script's env by systemd

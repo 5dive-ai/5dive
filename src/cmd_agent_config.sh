@@ -35,6 +35,12 @@ cmd_config() {
   #                                approved "act on your recs, still honor hard
   #                                gates" directive to the system prompt so it
   #                                survives /clear. 'son-of-anton' == yolo. DIVE-499)
+  #     chrome                    (claude only — on|off. on = Claude in Chrome for
+  #                                this agent: the box's Chrome gets the extension
+  #                                (5dive browser claude enable), and once the agent
+  #                                has its own claude.ai login (5dive browser claude
+  #                                connect) it starts on that login with --chrome
+  #                                instead of the shared token. DIVE-6345)
   #
   # When channels=<plugin> is being set (or a <plugin>.token is being rotated),
   # the matching install_channel_for_agent dispatch is also re-run so each
@@ -93,6 +99,8 @@ cmd_config() {
   # it preserves the file's current value (so a non-autonomy set won't drop it).
   local _AUTONOMY_OVERRIDE=""
   local autonomy_changed=0
+  # DIVE-6345: same preserve-unless-overridden discipline, stamped as AGENT_CHROME.
+  local _CHROME_OVERRIDE=""
   # applied_keys: names of keys that were actually changed, for the JSON payload.
   local -a applied_keys=()
   for kv in "$@"; do
@@ -298,6 +306,24 @@ cmd_config() {
         autonomy_changed=1
         env_dirty=1
         applied_keys+=("autonomy")
+        ;;
+      chrome|--chrome)
+        [[ "$type" == "claude" ]] \
+          || fail "$E_VALIDATION" "type '$type' does not support 'chrome' (Claude in Chrome is a Claude Code feature)"
+        case "$v" in
+          on|1|true)   _CHROME_OVERRIDE=1 ;;
+          off|0|false) _CHROME_OVERRIDE=0 ;;
+          *) fail "$E_VALIDATION" "invalid chrome '$v' (on|off)" ;;
+        esac
+        # The extension is a box-wide Chrome policy (root, which this verb is).
+        # Fail soft: no browser plugin, or a plugin before 1.44.0, says so and
+        # the per-agent setting still lands.
+        if [[ "$_CHROME_OVERRIDE" == 1 ]]; then
+          "$0" browser claude enable >&2 \
+            || warn "chrome=on for '$name', but the box's Chrome could not get the extension (5dive browser claude enable failed above; it needs the browser plugin 1.44.0 or later)."
+        fi
+        env_dirty=1
+        applied_keys+=("chrome")
         ;;
       *) fail "$E_USAGE" "unknown config key: $k" ;;
     esac
