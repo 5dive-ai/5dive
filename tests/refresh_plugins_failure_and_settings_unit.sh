@@ -61,6 +61,12 @@ cat > "$WORK/bin/claude" <<'STUB'
 #!/bin/bash
 printf '%s\n' "$*" >> "${CLAUDE_LOG:?}"
 if [[ "$1 $2" == "plugin marketplace" ]]; then printf '%b' "${MP_OUT:-}"; exit "${MP_RC:-0}"; fi
+# PL_SETVER (DIVE-6304): `plugin update <key>` moves the seat's pin to it, as the
+# real verb does; unset, the pin stays where it was.
+if [[ "$1 $2" == "plugin update" && -n "${PL_SETVER:-}" ]]; then
+  f="${SEAT_HOME:?}/.claude/plugins/installed_plugins.json"; t=$(mktemp)
+  jq --arg k "$3" --arg v "$PL_SETVER" '.plugins[$k][0].version = $v' "$f" > "$t" && mv "$t" "$f"
+fi
 printf '%b' "${PL_OUT:-}"; exit "${PL_RC:-0}"
 STUB
 printf '#!/bin/bash\nexit 0\n' > "$WORK/bin/fork-stage"
@@ -91,7 +97,8 @@ run() {
   # `id -u` would re-enter it without bound.
   env -u BASH_ENV PATH="$WORK/bin:$PATH" SEAT_HOME="$WORK/home" CLAUDE_BIN="$WORK/bin/claude" \
       CLAUDE_LOG="$WORK/claude.log" GH_ORG="${1:-5dive-ai}" FORK_STAGE_SH="$WORK/bin/fork-stage" \
-      AGENTS_REGISTRY="$WORK/no-registry.json" \
+      AGENTS_REGISTRY="$WORK/no-registry.json" BOX_PLUGINS_JSON="${BOX_PLUGINS_JSON:-$WORK/no-box.json}" \
+      PL_SETVER="${PL_SETVER:-}" \
       MP_OUT="${MP_OUT:-}" MP_RC="${MP_RC:-0}" PL_OUT="${PL_OUT:-}" PL_RC="${PL_RC:-0}" \
       REFRESH_FAIL_LINES="${REFRESH_FAIL_LINES:-20}" \
       bash "$SCRIPT" s1 2>&1
@@ -225,6 +232,36 @@ if cmp -s "$WORK/home/.claude/settings.json" "$WORK/corrupt.orig" && grep -q 'no
   ok_t "S9 a corrupt settings.json is left byte-identical and named in the log"
 else
   bad_t "S9 corrupt settings.json rewritten or silent" "out: $(flat "$out")"
+fi
+
+# ================================================================================
+# P — DIVE-6304: a pin that moved is named, a seat still below the box is a failure
+# ================================================================================
+# cic-arm-a, 2026-10-15: the box's record said browser 1.41.0, agent-clicker was
+# pinned 1.39.0 eleven hours after the release, and nothing in any log said so.
+printf '%s\n' '{"telegram@5dive-plugins":{"plugin":"telegram","version":"0.5.59","enabled":true}}' > "$WORK/box.json"
+seat "$ST_GIT_COM" "$KM_GIT_AI"
+out="$(BOX_PLUGINS_JSON="$WORK/box.json" PL_SETVER=0.5.59 MP_OUT="$OK_MP" PL_OUT="$OK_PL" run)"
+if grep -q '^    repin telegram@5dive-plugins: 0.5.49 -> 0.5.59$' <<<"$out" && grep -q '^  refresh_failed_count: 0$' <<<"$out"; then
+  ok_t "P1 a seat the refresh moved logs one repin line with both versions, and is not a failure"
+else
+  bad_t "P1 no repin line for a moved pin" "out: $(flat "$out")"
+fi
+seat "$ST_GIT_COM" "$KM_GIT_AI"
+out="$(BOX_PLUGINS_JSON="$WORK/box.json" MP_OUT="$OK_MP" PL_OUT="$OK_PL" run)"
+if grep -qF 'STALE telegram@5dive-plugins: pinned 0.5.49, box has 0.5.59' <<<"$out" \
+   && grep -q '^  refresh_failed_count: 1$' <<<"$out" && grep -q '^  refresh_failed: s1$' <<<"$out"; then
+  ok_t "P2 a seat still below the box's version after the update is named STALE and counted as a failed seat"
+else
+  bad_t "P2 a seat left below the box reads as a clean run" "out: $(flat "$out")"
+fi
+printf '%s\n' '{"telegram@5dive-plugins":{"plugin":"telegram","version":"0.5.10","enabled":true}}' > "$WORK/box-old.json"
+seat "$ST_GIT_COM" "$KM_GIT_AI"
+out="$(BOX_PLUGINS_JSON="$WORK/box-old.json" MP_OUT="$OK_MP" PL_OUT="$OK_PL" run)"
+if ! grep -q 'STALE\|repin' <<<"$out" && grep -q '^  refresh_failed_count: 0$' <<<"$out"; then
+  ok_t "P3 NEGATIVE CONTROL — a seat AHEAD of the box's record (poke-two: box browser 1.9.2, seats 1.41.0) is neither stale nor a repin"
+else
+  bad_t "P3 a seat ahead of the box is flagged" "out: $(flat "$out")"
 fi
 
 echo

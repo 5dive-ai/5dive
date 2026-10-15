@@ -358,6 +358,38 @@ _warn_foreign_owned_marketplace_files() {
   return 0
 }
 
+# >>> DIVE-6304 name every pin that moved, and a seat still below the box
+# The before/after snapshots above list every key, so a seat that did NOT move
+# reads the same as one with nothing to move. Two lines make it gradeable:
+#   repin <key>: <from> -> <to>         — the seat's pin moved this run
+#   STALE <key>: pinned <v>, box has <b> — the box's own record (`5dive plugin
+#                                          upgrade` writes it) is ahead of the
+#                                          seat after the update; counted as a
+#                                          failed seat, because that is a seat
+#                                          running old plugin code with nothing
+#                                          left in this run that would move it.
+# Measured 2026-10-15 on cic-arm-a: box browser 1.41.0, agent-clicker pinned
+# 1.39.0 11h after the release, and no log line anywhere said so.
+BOX_PLUGINS_JSON="${BOX_PLUGINS_JSON:-${STATE_DIR:-/var/lib/5dive}/plugins/installed.json}"
+# _report_pin_moves <before-snapshot> <after-snapshot> — returns 1 on a STALE seat.
+_report_pin_moves() {
+  local before="${1:-}" after="${2:-}" key bv av _ box rc=0
+  while read -r key av _; do
+    [[ -n "$key" ]] || continue
+    bv=$(awk -v k="$key" '$1 == k {print $2; exit}' <<<"$before")
+    [[ -n "$bv" && "$bv" != "$av" ]] && echo "    repin $key: $bv -> $av"
+    [[ -r "$BOX_PLUGINS_JSON" ]] || continue
+    box=$(jq -r --arg k "$key" '.[$k] | select(.enabled != false) | .version // empty' "$BOX_PLUGINS_JSON" 2>/dev/null)
+    [[ -n "$box" && "$av" != "$box" ]] || continue
+    if [[ "$(printf '%s\n%s\n' "$av" "$box" | sort -V | head -1)" == "$av" ]]; then
+      echo "    STALE $key: pinned $av, box has $box — this seat did not move to the box's version"
+      rc=1
+    fi
+  done <<<"$after"
+  return "$rc"
+}
+# <<< DIVE-6304 name every pin that moved, and a seat still below the box
+
 _refresh_summary() {
   local n=0 ag
   for ag in $FAILED_AGENTS; do n=$((n + 1)); done
@@ -433,6 +465,9 @@ refresh_agent() {
   if [[ -n "$after" ]]; then
     echo "  $user: after:"
     while IFS= read -r line; do echo "    $line"; done <<<"$after"
+  fi
+  if ! _report_pin_moves "$before" "$after" && [[ " $FAILED_AGENTS " != *" $ag "* ]]; then
+    FAILED_AGENTS="${FAILED_AGENTS:+$FAILED_AGENTS }$ag"
   fi
 
   # Record whether the plugin set actually moved (version/commit changed, or a

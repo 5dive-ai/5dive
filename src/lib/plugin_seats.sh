@@ -66,6 +66,32 @@ plugin_seat_rows() {
   jq -r '(.agents // {}) | to_entries[] | [.key, (.value.type // "claude")] | @tsv' <<<"$reg" 2>/dev/null || true
 }
 
+# plugin_seat_version <name> <plugin> <marketplace> -> the version that seat's
+# claude has PINNED in its installed_plugins.json, empty when it has none. This
+# is the version the seat's next session LOADS — not the box's record, and not
+# whatever sits in the seat's plugin cache (DIVE-6304: 1.41.0 was in the cache
+# while the pin, and so the skill text the agent ran, stayed 1.39.0).
+plugin_seat_version() {
+  local f; f=$(_plugin_seat_installed_json "${1:-}")
+  [[ -f "$f" ]] || return 0
+  jq -r --arg k "${2:-}@${3:-}" '((.plugins // {})[$k] // [])[0].version // empty' "$f" 2>/dev/null || true
+}
+
+# _plugin_seat_version_ge <a> <b> -> 0 when version a >= b (sort -V order).
+_plugin_seat_version_ge() {
+  [[ "${1:-}" == "${2:-}" ]] && return 0
+  [[ "$(printf '%s\n%s\n' "${1:-}" "${2:-}" | sort -V | head -1)" == "${2:-}" ]]
+}
+
+# plugin_seat_session_pid <name> -> the pid of the seat's running claude
+# session, empty when none can be located. doctor's own locator (DIVE-3958:
+# unit cgroup + executable, never a per-UID grep) when it is in the bundle; a
+# function so the unit suite can stand in for systemd.
+plugin_seat_session_pid() {
+  declare -F doctor_seat_claude_pid >/dev/null 2>&1 || return 0
+  doctor_seat_claude_pid "${1:-}" "agent-${1:-}" 2>/dev/null || true
+}
+
 # plugin_seat_registered <name> <plugin> <marketplace> -> 0 when that seat's
 # claude already carries the plugin. This is the state that was invisible: it
 # reads the SEAT's file, never the box's installed.json.
@@ -100,15 +126,32 @@ plugin_seat_run_as() { # plugin_seat_run_as <user> [VAR=VAL ...]  (script on std
   sudo -u "$user" -H env "$@" bash -s
 }
 
-# Register one plugin with one CLAUDE seat. Idempotent; 0 = registered (now or
-# already), non-zero = it is not registered and the caller must say so.
-plugin_seat_register_claude() { # <name> <plugin> <marketplace>
-  local name="${1:-}" plugin="${2:-}" mkt="${3:-}" user="agent-${1:-}" repo
+# Register one plugin with one CLAUDE seat, AT the box's version. Idempotent.
+#   0 = registered, pinned at >= <want> (or no <want> given)
+#   3 = registered, but still pinned BELOW <want> — the seat did not move
+#   1 = not registered;  2 = no marketplace URL a seat can clone
+# PLUGIN_SEAT_FROM / PLUGIN_SEAT_AT carry the pin before and after, read back
+# from the seat's own installed_plugins.json, so the caller reports what the
+# seat ACTUALLY has rather than what it asked for.
+#
+# DIVE-6304: `claude plugin install` is a NO-OP when any version is already
+# installed. This function used to run only that, so on `plugin upgrade` every
+# seat that had the plugin kept its old pin and the walk still printed
+# "registered" (cic-arm-a, 2026-10-15: box 1.41.0, agent-clicker pinned 1.39.0,
+# running the old SKILL.md). A seat that is behind gets `claude plugin update`.
+PLUGIN_SEAT_FROM=""; PLUGIN_SEAT_AT=""
+plugin_seat_register_claude() { # <name> <plugin> <marketplace> [want-version]
+  local name="${1:-}" plugin="${2:-}" mkt="${3:-}" want="${4:-}" user="agent-${1:-}" repo
+  local update=0
+  PLUGIN_SEAT_FROM=$(plugin_seat_version "$name" "$plugin" "$mkt"); PLUGIN_SEAT_AT=""
   if ! repo=$(_plugin_seat_mkt_repo "$mkt"); then
     warn "[$name] marketplace '$mkt' has no URL a seat can clone (local source?) — $plugin NOT registered for this seat"
     return 2
   fi
-  plugin_seat_run_as "$user" PLUGIN="$plugin" MARKETPLACE="$mkt" MKT_REPO="$repo" \
+  if [[ -n "$PLUGIN_SEAT_FROM" && -n "$want" ]] && ! _plugin_seat_version_ge "$PLUGIN_SEAT_FROM" "$want"; then
+    update=1
+  fi
+  plugin_seat_run_as "$user" PLUGIN="$plugin" MARKETPLACE="$mkt" MKT_REPO="$repo" UPDATE="$update" \
     >&2 <<'SEAT_PLUGIN_REGISTER' || true
 set -uo pipefail
 # NOT a login shell, and this unset is the whole reason (see the header).
@@ -151,7 +194,14 @@ PREREG
 
 "$CLAUDE" plugin marketplace update "$MARKETPLACE" >/dev/null 2>&1 \
   || "$CLAUDE" plugin marketplace add "$MKT_REPO" >/dev/null 2>&1 || true
-yes | "$CLAUDE" plugin install "${PLUGIN}@${MARKETPLACE}" >/dev/null 2>&1 || true
+# DIVE-6304: install is a no-op over ANY installed version, so a seat that is
+# behind the box is moved with `update` (after the marketplace refresh above,
+# which is what gives update a newer version to find).
+if [ "${UPDATE:-0}" = 1 ]; then
+  yes | "$CLAUDE" plugin update "${PLUGIN}@${MARKETPLACE}" >/dev/null 2>&1 || true
+else
+  yes | "$CLAUDE" plugin install "${PLUGIN}@${MARKETPLACE}" >/dev/null 2>&1 || true
+fi
 # DIVE-4852: `plugin install` STARTS the plugin's MCP server, and this shell has no
 # channel secret (the unit launcher injects it; `sudo -u` does not). Claude Code
 # caches that failure in mcp-needs-auth-cache.json and SKIPS the server for 15
@@ -161,7 +211,50 @@ yes | "$CLAUDE" plugin install "${PLUGIN}@${MARKETPLACE}" >/dev/null 2>&1 || tru
 # not an edit, is the safe verb here.
 rm -f "$HOME/.claude/mcp-needs-auth-cache.json" 2>/dev/null || true
 SEAT_PLUGIN_REGISTER
-  plugin_seat_registered "$name" "$plugin" "$mkt"
+  plugin_seat_registered "$name" "$plugin" "$mkt" || return 1
+  PLUGIN_SEAT_AT=$(plugin_seat_version "$name" "$plugin" "$mkt")
+  if [[ -n "$want" && -n "$PLUGIN_SEAT_AT" ]] && ! _plugin_seat_version_ge "$PLUGIN_SEAT_AT" "$want"; then
+    return 3
+  fi
+  return 0
+}
+
+# _plugin_seat_box_version <key> -> the version the BOX has recorded for key.
+_plugin_seat_box_version() {
+  jq -r --arg k "${1:-}" '.[$k].version // empty' "$(_plugin_installed_json)" 2>/dev/null || true
+}
+
+# One claude seat's register, and its one report line. The line names the
+# version the seat is PINNED at after the call, read back — never the version it
+# was asked for. A seat whose pin moved while its session runs is still on the
+# old code until it restarts (Claude Code loads plugins once, at launch); it is
+# appended to PLUGIN_SEAT_RESTART so the walk can say so in one line.
+# Returns 0 ok, 1 failed.
+PLUGIN_SEAT_RESTART=""
+_plugin_seat_register_claude_report() { # <name> <plugin> <marketplace> <want> <label>
+  local name="${1:-}" plugin="${2:-}" mkt="${3:-}" want="${4:-}" label="${5:-}" key="${2:-}@${3:-}" rc=0
+  plugin_seat_register_claude "$name" "$plugin" "$mkt" "$want" || rc=$?
+  local from="$PLUGIN_SEAT_FROM" at="$PLUGIN_SEAT_AT"
+  case "$rc" in
+    0)
+      if [[ -n "$from" && -n "$at" && "$from" != "$at" ]]; then
+        if [[ -n "$(plugin_seat_session_pid "$name")" ]]; then
+          echo "  $label: $key re-pinned $from -> $at — its running session still has $from loaded until it restarts" >&2
+          PLUGIN_SEAT_RESTART="${PLUGIN_SEAT_RESTART:+$PLUGIN_SEAT_RESTART }$name"
+        else
+          echo "  $label: $key re-pinned $from -> $at (loads at its next start)" >&2
+        fi
+      else
+        echo "  $label: $key registered${at:+ at $at}" >&2
+      fi
+      return 0 ;;
+    3)
+      echo "  $label: $key is still pinned at $at — the box has $want; the seat did NOT move. Fix: sudo -u agent-$name claude plugin update $key" >&2
+      return 1 ;;
+    *)
+      echo "  $label: $key NOT registered — run 'sudo 5dive doctor' " >&2
+      return 1 ;;
+  esac
 }
 
 # Reverse. `claude plugin uninstall` is the verb; the seat's own cache dir goes
@@ -310,8 +403,10 @@ plugin_seat_doc_installed() { # <name> <type> <plugin>
 plugin_seat_apply() {
   local plugin="${1:-}" mkt="${2:-}" caps="${3:-}" action="${4:-register}" dir="${5:-}"
   plugin_seat_is_seat_facing "$caps" || return 0
-  local key="${plugin}@${mkt}" name type n_ok=0 n_skip=0 n_fail=0
+  local key="${plugin}@${mkt}" name type n_ok=0 n_skip=0 n_fail=0 want
   [[ -n "$dir" ]] || dir="$(_plugin_enabled_dir)/$key"
+  want=$(_plugin_seat_box_version "$key")
+  PLUGIN_SEAT_RESTART=""
 
   while IFS=$'\t' read -r name type; do
     [[ -n "$name" ]] || continue
@@ -319,10 +414,10 @@ plugin_seat_apply() {
     case "$type" in
       claude)
         if [[ "$action" == register ]]; then
-          if plugin_seat_register_claude "$name" "$plugin" "$mkt"; then
-            echo "  $name (claude): $key registered" >&2; n_ok=$((n_ok+1))
+          if _plugin_seat_register_claude_report "$name" "$plugin" "$mkt" "$want" "$name (claude)"; then
+            n_ok=$((n_ok+1))
           else
-            echo "  $name (claude): $key NOT registered — run 'sudo 5dive doctor' " >&2; n_fail=$((n_fail+1))
+            n_fail=$((n_fail+1))
           fi
         else
           if plugin_seat_unregister_claude "$name" "$plugin" "$mkt"; then
@@ -356,6 +451,12 @@ plugin_seat_apply() {
   if (( n_ok || n_fail )); then
     echo "  seats: $n_ok ok, $n_fail failed, $n_skip skipped" >&2
   fi
+  # Not restarted from here: a restart drops the seat's in-flight turn
+  # (DIVE-3172). Named instead, with the one command that loads the new pin.
+  local r
+  for r in $PLUGIN_SEAT_RESTART; do
+    echo "  $r still runs the old $key until it restarts: sudo 5dive agent restart $r" >&2
+  done
   (( n_fail == 0 ))
 }
 
@@ -371,9 +472,8 @@ plugin_seat_backfill() { # <name> <type>
     [[ -n "$key" ]] || continue
     plugin_seat_is_seat_facing "$caps" || continue
     if [[ "$type" == claude ]]; then
-      plugin_seat_register_claude "$name" "$plugin" "$mkt" \
-        && echo "  $name: $key registered" >&2 \
-        || echo "  $name: $key NOT registered" >&2
+      _plugin_seat_register_claude_report "$name" "$plugin" "$mkt" \
+        "$(_plugin_seat_box_version "$key")" "$name" || true
     else
       local dir; dir="$(_plugin_enabled_dir)/$key"
       plugin_seat_doc_block "$plugin" "$dir" >/dev/null 2>&1 || continue
