@@ -1815,12 +1815,30 @@ cmd_update_check() {
   # The same sentence a human running `5dive update --check` reads. It names the
   # target, not `latest`, and it names the rung — on a pinned box those two
   # clauses are the entire answer to "why did it skip the update?".
+  #
+  # DIVE-6288: the receipt is a PAST resolution, so it is said in the past tense
+  # with its `.at`. It printed "this box installs v0.91.0 (… newest released
+  # tag …)" 78 minutes after v0.91.1 was published, while doctor — which
+  # resolves live — said `update` installs 0.91.1. A seat trusting the first
+  # sentence skips the update. We still do NOT re-run the resolver here
+  # (DIVE-4294); we say how old the answer is, and on the canary rung, whose
+  # whole meaning is "the newest tag", we say when a newer one has since been
+  # published. On a fleet-pinned rung (override / route / last-known) a receipt
+  # below the newest tag is the pin doing its job, so it is never marked.
+  local rstale_json=null
   if [[ "$rt_json" != null ]]; then
-    local rt_p rr_p
+    local rt_p rr_p ra_p
     rt_p="$(jq -r . <<<"$rt_json")"
     rr_p="$(jq -r . <<<"$rd_json" 2>/dev/null)"; [[ "$rd_json" == null ]] && rr_p=""
-    prose+=" · this box installs $rt_p"
+    ra_p="$(jq -r . <<<"$ra_json" 2>/dev/null)"; [[ "$ra_json" == null ]] && ra_p=""
+    prose+=" · last resolved $rt_p"
+    [[ -n "$ra_p" ]] && prose+=" at $ra_p"
     [[ -n "$rr_p" ]] && prose+=" (from $rr_p)"
+    rstale_json=false
+    if [[ "$rr_json" == '"canary"' ]] && version_lt "${rt_p#v}" "$latest"; then
+      rstale_json=true
+      prose+=" (stale: v$latest published since)"
+    fi
   fi
   [[ "$frozen_state" == frozen ]] && prose+=" · ⚠ $frozen_detail"
   # An unarmed alarm never says "frozen", so this line is the only thing that
@@ -1838,9 +1856,11 @@ cmd_update_check() {
   # they always did. `frozen` is a THREE-state string, not a boolean: an absent
   # or unwritable record is "unknown", and a caller must not be able to read a
   # green out of an observation we never made.
+  # `resolvedStale` (DIVE-6288) is null with no readable receipt, else true only
+  # when a canary-rung receipt names a tag older than `latest`.
   ok "$prose" \
-     '{current:$cur, latest:$lat, behind:$beh, ahead:$ahd, stale:$stl, frozen:$fz, frozenAgeSec:$fza, frozenDetail:$fzd, frozenArmed:$fzarm, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src, resolvedTarget:$rtg, resolvedRung:$rrg, resolvedRungDetail:$rrd, resolvedAt:$rat}' \
-     --argjson rtg "$rt_json" --argjson rrg "$rr_json" \
+     '{current:$cur, latest:$lat, behind:$beh, ahead:$ahd, stale:$stl, frozen:$fz, frozenAgeSec:$fza, frozenDetail:$fzd, frozenArmed:$fzarm, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src, resolvedTarget:$rtg, resolvedRung:$rrg, resolvedRungDetail:$rrd, resolvedAt:$rat, resolvedStale:$rst}' \
+     --argjson rst "$rstale_json" --argjson rtg "$rt_json" --argjson rrg "$rr_json" \
      --argjson rrd "$rd_json" --argjson rat "$ra_json" \
      --arg cur "$current" --arg lat "$latest" --arg src "$detail" \
      --arg fz "$frozen_state" --arg fzd "$frozen_detail" \
