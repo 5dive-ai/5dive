@@ -22,6 +22,9 @@
 #   3  installer and probe pick the same tag on every rung; doctor and
 #      `update --check` name the same target
 #   4  mutation: the probe reverted to newest-tag turns arm 1 red
+#   5  DIVE-6288: `update --check` says the receipt in the past tense with its
+#      time; a canary receipt older than latest carries "(stale: vX published
+#      since)"; a pinned-rung receipt below latest carries none
 #
 # Run: bash tests/cli_probe_route_target_unit.sh   (no root, no network)
 set -uo pipefail
@@ -123,19 +126,21 @@ run_doctor() {
 row() { jq -r --arg n "$2" 'map(select(.name == $n)) | .[0] | "\(.severity)|\(.message)"' <<<"$1"; }
 # `update --check --json` on the same stubs. `ok` renders the JSON the real one
 # would; the receipt it reads back is the one run_installer just wrote.
-run_update_check() { # $1 = installed version
+run_update_check() { # $1 = installed version  [$2 = prose: print the sentence, not the JSON]  [$3 = check_src override]
   local -a e; mapfile -t e < <(ladder_env)
+  local okfn='ok() { shift; local f="$1"; shift; jq -nc "$@" "$f"; }'
+  [[ "${2:-}" == prose ]] && okfn='ok() { printf "%s\n" "$1"; }'
   env -i "${e[@]}" HOME="$TD" bash -c "set -euo pipefail
 E_USAGE=2; E_GENERIC=1; E_NOT_FOUND=4; FIVE_VERSION='$1'
 STATE_DIR='$TD/state'
 readonly UPDATE_STALE_AFTER_SECS=\$((36 * 3600))
 gh_org() { printf 'testorg\n'; }
 fail() { local c=\"\$1\"; shift; printf 'error: %s\n' \"\$*\"; exit \"\$c\"; }
-ok() { shift; local f=\"\$1\"; shift; jq -nc \"\$@\" \"\$f\"; }
+$okfn
 version_lt() { [[ \"\$1\" != \"\$2\" && \"\$(printf '%s\n%s\n' \"\$1\" \"\$2\" | sort -V | head -n1)\" == \"\$1\" ]]; }
 $probe_block
 $freeze_src
-$check_src
+${3:-$check_src}
 cmd_update_check" 2>/dev/null
 }
 reset_ladder() { rm -f "$TD/etc/override" "$TD/etc/canary" "$TD/state/known" "$TD/state/cli-target.json"; ROUTE=""; HOLD=""; }
@@ -221,6 +226,61 @@ else
   if [[ "$got" == error\|STALE*0.86.2* ]]; then
     ok_t "mutation 'probe reads the newest tag' turns arm 1 red with the reported symptom (STALE naming 0.86.2)"
   else bad_t "mutation red, but not with the reported symptom" "$got"; fi
+fi
+
+# 5. DIVE-6288 — `update --check` read the install receipt back in the PRESENT
+#    tense ("this box installs v0.91.0 (… newest released tag …)") 78 minutes
+#    after v0.91.1 was published, while doctor said `update` installs 0.91.1.
+#    The receipt is a past resolution: say so, with its time, and on the canary
+#    rung say when a newer tag has been published since. The receipt here is a
+#    REAL one: the installer resolves while v0.86.2 is held, then the hold lifts
+#    — the "tag published after the last install" sequence, on the same stubs.
+canary_receipt_then_new_tag() {
+  reset_ladder; : > "$TD/etc/canary"; HOLD=v0.86.2; run_installer >/dev/null; HOLD=""
+}
+canary_receipt_then_new_tag
+rat="$(jq -r '.at // empty' "$TD/state/cli-target.json" 2>/dev/null)"
+pr="$(run_update_check 0.86.1 prose)"; uc="$(run_update_check 0.86.1)"
+if [[ "$(jq -r '.rung' "$TD/state/cli-target.json" 2>/dev/null)" == canary && -n "$rat" \
+      && "$pr" == *"last resolved v0.86.1 at $rat (from canary opt-in"* \
+      && "$pr" == *"(stale: v0.86.2 published since)"* && "$pr" != *"this box installs"* ]]; then
+  ok_t "canary receipt v0.86.1, v0.86.2 published since: prose says 'last resolved v0.86.1 at <at>' + '(stale: v0.86.2 published since)'"
+else bad_t "canary receipt read back in the present tense or without the stale marker" "receipt=$(cat "$TD/state/cli-target.json" 2>/dev/null) prose=$pr"; fi
+if [[ "$(jq -r '[.behind, .resolvedTarget, .resolvedRung, .resolvedAt, .resolvedStale] | map(tostring) | join("|")' <<<"$uc" 2>/dev/null)" \
+      == "true|v0.86.1|canary|$rat|true" ]]; then
+  ok_t "--json keeps behind/resolvedTarget/resolvedRung/resolvedAt as they were; the one new field resolvedStale is true"
+else bad_t "--json fields moved or resolvedStale missing" "$uc"; fi
+# 5b. A fleet-pinned rung below the newest tag is the pin working: past tense,
+#     no stale marker, resolvedStale false — even with latest ahead of the receipt.
+reset_ladder; ROUTE=v0.86.0; run_installer >/dev/null; ROUTE=v0.86.1
+pr="$(run_update_check 0.86.0 prose)"; uc="$(run_update_check 0.86.0)"
+if [[ "$(jq -r '.rung' "$TD/state/cli-target.json" 2>/dev/null)" == route && "$(jq -r .latest <<<"$uc")" == 0.86.1 \
+      && "$pr" == *"last resolved v0.86.0 at "*"(from fleet stable route"* && "$pr" != *stale:* \
+      && "$(jq -r .resolvedStale <<<"$uc")" == false ]]; then
+  ok_t "route-rung receipt v0.86.0 with latest 0.86.1: past tense, no stale marker, resolvedStale false"
+else bad_t "pinned-rung receipt was flagged stale or kept the present tense" "prose=$pr json=$uc"; fi
+# 5c. Canary receipt AT the newest tag: nothing to flag.
+reset_ladder; : > "$TD/etc/canary"; run_installer >/dev/null
+pr="$(run_update_check 0.86.2 prose)"; uc="$(run_update_check 0.86.2)"
+if [[ "$pr" == *"last resolved v0.86.2 at "* && "$pr" != *stale:* && "$(jq -r .resolvedStale <<<"$uc")" == false ]]; then
+  ok_t "canary receipt v0.86.2 == latest: no stale marker, resolvedStale false"
+else bad_t "a current canary receipt was flagged" "prose=$pr json=$uc"; fi
+# 5d. No receipt: no clause, and resolvedStale is null (not observed), never false.
+reset_ladder; ROUTE=v0.86.1
+pr="$(run_update_check 0.86.1 prose)"; uc="$(run_update_check 0.86.1)"
+if [[ "$pr" != *"last resolved"* && "$pr" != *"this box installs"* && "$(jq -r .resolvedStale <<<"$uc")" == null ]]; then
+  ok_t "no receipt: no receipt clause, resolvedStale null"
+else bad_t "an absent receipt produced a clause or a resolvedStale verdict" "prose=$pr json=$uc"; fi
+# 5e. MUTATION. Drop the canary stale check and arm 5 must go red. Asserted to
+#     APPLY first, like arm 4.
+mut="$(sed 's/if \[\[ "\$rr_json" == '"'"'"canary"'"'"' \]\] \&\& version_lt/if false \&\& version_lt/' <<<"$check_src")"
+if [[ "$mut" == "$check_src" ]]; then
+  bad_t "mutation 'no stale marker' did not apply" "sed changed nothing — the arm is vacuous"
+else
+  canary_receipt_then_new_tag; pr="$(run_update_check 0.86.1 prose "$mut")"
+  if [[ "$pr" != *"(stale: v0.86.2 published since)"* ]]; then
+    ok_t "mutation 'no stale marker' turns arm 5 red (prose loses '(stale: v0.86.2 published since)')"
+  else bad_t "mutation 'no stale marker' still prints the marker" "$pr"; fi
 fi
 
 echo
