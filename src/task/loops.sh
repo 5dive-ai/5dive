@@ -1693,6 +1693,22 @@ cmd_task_verify() {
     # earlier FAIL and a legitimately re-graded row would be permanently unmergeable.
     # graded_verdict_at carries the current verdict's own clock so the skew from a
     # frozen graded_at is readable rather than silent.
+    #
+    # DIVE-6248: and NEVER over a closed row's result. The DIVE-2483 rail above only
+    # guards the OPEN cell and DIVE-2067's preserve lives in the close branch, so a
+    # `--no-done` grade (or any FAIL) on a done/cancelled row replaced the recorded
+    # result outright — reported from a customer box: MAKER-ORIGINAL was gone after
+    # `verify --cmd=true --result=VERIFIER-TEXT --no-done`. Keep the prior text FIRST
+    # and the grade under it, the DIVE-2464 append order, so a `graded-sha:` the
+    # grade carries is still the LAST occurrence the gate reads.
+    if [[ "$_v_guard_st" == "done" || "$_v_guard_st" == "cancelled" ]]; then
+      local _ng_prev
+      _ng_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+      if [[ -n "$_ng_prev" && "$_ng_prev" != "$result_txt" ]]; then
+        result_txt="${_ng_prev}"$'\n\n'"--- appended $(date -u '+%Y-%m-%d %H:%M:%SZ') by a later verify on a ${_v_guard_st} row (DIVE-6248); the text above was already on the row ---"$'\n'"${result_txt}"
+        defer_write_note "$ident: this row is ${_v_guard_st} and already carried a result, so your verify grade was APPENDED under it, not written over it — ${#_ng_prev} bytes kept above your text (DIVE-6248). Run '5dive task show $ident' to read both."
+      fi
+    fi
     db "UPDATE tasks SET result=$(sqlq "$result_txt"),
            graded_at=COALESCE(graded_at, datetime('now')),
            graded_by=COALESCE(graded_by, $(sqlq "$(task_actor "")")),
