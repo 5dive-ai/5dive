@@ -86,6 +86,11 @@ export TOKEN_SEEN="$TMP/token-seen"
 cat > "$SELF_BIN" <<'BINEOF'
 #!/usr/bin/env bash
 printf '%s\n' "${CLAUDE_CODE_OAUTH_TOKEN:-<absent>}" >> "$TOKEN_SEEN"
+# DIVE-6287: one seat can be given its own answer (STUB_OUT_BOB/STUB_RC_BOB) so
+# a codex seat and a broken Claude seat can sit in the same sweep.
+if [ "${STUB_USER:-}" = agent-bob ] && [ -n "${STUB_OUT_BOB+x}" ]; then
+  printf '%s' "$STUB_OUT_BOB"; exit "${STUB_RC_BOB:-0}"
+fi
 printf '%s' "${STUB_OUT:-}"
 exit "${STUB_RC:-0}"
 BINEOF
@@ -113,7 +118,7 @@ timeout() { shift; "$@"; }
 # at the far end, which is where the CLI would be.
 sudo()    { local u=""; while [ $# -gt 0 ]; do case "$1" in -u) u="$2"; shift 2;; -n|-H) shift;; *) break;; esac; done
             printf '%s\t%s\n' "$u" "$*" >> "$CALLS"
-            "$@"; }
+            STUB_USER="$u" "$@"; }
 id()      { case "${2:-}" in agent-alice|agent-bob) return 0;; *) return 1;; esac; }
 
 REG='{"agents":{"alice":{},"bob":{}}}'
@@ -167,7 +172,7 @@ reset
 STUB_RC=1; STUB_OUT=""
 _hb_memory_consolidate_sweep "$NOW"
 check "a FAILING pass is counted, not swallowed"                "$_HB_CONS_FAILED" "2"
-check "and still stamped (a failure must not re-run every 5m)"  "$(ls "$STATE_DIR/memory-consolidate" 2>/dev/null | wc -l | tr -d ' ')" "2"
+check "and still stamped (a failure must not re-run every 5m)"  "$(ls "$STATE_DIR/memory-consolidate"/*.stamp 2>/dev/null | wc -l | tr -d ' ')" "2"
 STUB_RC=0; STUB_OUT="$_STUB_OK"
 _hb_memory_consolidate_sweep "$NOW"
 check "so the very next tick invokes nothing"                   "$(ncalls)" "2"
@@ -501,6 +506,88 @@ check "no connector and no profile: both seats run credential-less" \
 check "and both refusals are counted, not swallowed" "$_HB_CONS_UNAUTH" "2"
 check "the standing not-transacting counter is written for alice" \
   "$(cat "$STATE_DIR/memory-consolidate/alice.notx" 2>/dev/null)" "1"
+
+echo "== DIVE-6287: a seat with no memory store is its own bucket, not could-not-run =="
+LOG="$TMP/hb6287.log"
+_hb_log() { printf '%s\n' "$*" >> "$LOG"; }
+CDIR="$STATE_DIR/memory-consolidate"
+# What a codex seat really answers (exact-swallow, 2026-10-15), plus the EXIT-trap
+# backstop's second envelope the CLI appends on a non-zero exit.
+_NOSTORE='{"ok":false,"error":{"code":4,"class":"not_found","message":"no memory store found under ~/.claude/projects/*/memory"}}'
+reset; : > "$LOG"
+STUB_RC=4; STUB_OUT="$_NOSTORE
+$_NOSTORE"
+_hb_memory_consolidate_sweep "$NOW"
+check "a no-store answer lands in the no-store bucket"            "${_HB_CONS_NOSTORE:-unset}" "2"
+check "and NOT in could-not-run"                                  "$_HB_CONS_FAILED" "0"
+check "it leaves a .nostore marker for doctor"                    "$(ls "$CDIR"/*.nostore 2>/dev/null | wc -l | tr -d ' ')" "2"
+check "and no could-not-run marker"                               "$(ls "$CDIR"/*.norun 2>/dev/null | wc -l | tr -d ' ')" "0"
+grep -q 'could not run' "$LOG" && bad "a no-store seat is logged as could-not-run" \
+  || ok "a no-store seat is never logged as could-not-run"
+
+# NEGATIVE CONTROL: `not_found` is ALSO what a seat with no claude CLI answers.
+# That seat cannot distil and IS a could-not-run; the class alone must not hide it.
+reset; : > "$LOG"
+STUB_RC=4; STUB_OUT='{"ok":false,"error":{"code":4,"class":"not_found","message":"no distiller: pass --distiller=<cmd> or install the claude CLI"}}'
+_hb_memory_consolidate_sweep "$NOW"
+check "CONTROL: a not_found that is NOT 'no store' is still could-not-run" "$_HB_CONS_FAILED" "2"
+check "CONTROL: and is not counted as no store"                    "${_HB_CONS_NOSTORE:-unset}" "0"
+grep -q 'could not run: alice (not_found: no distiller' "$LOG" \
+  && ok "the could-not-run line names the seat AND the verb's reason" \
+  || bad "the could-not-run line does not name alice with its reason: $(cat "$LOG")"
+
+echo "== DIVE-6287: every could-not-run names its seat; doctor reads the marker =="
+# The reporter's shape: one codex seat with no store (alice) beside one Claude seat
+# whose sudo call dies with nothing on stdout (bob) — the lost-grant case.
+reset; : > "$LOG"
+STUB_RC=4; STUB_OUT="$_NOSTORE"
+export STUB_OUT_BOB="" STUB_RC_BOB=1
+_hb_memory_consolidate_sweep "$NOW"
+check "the codex seat is no-store"                                "${_HB_CONS_NOSTORE:-unset}" "1"
+check "the broken Claude seat is could-not-run"                   "$_HB_CONS_FAILED" "1"
+grep -q '^\[memory-consolidate\] could not run: bob (no output, exit 1' "$LOG" \
+  && ok "the log names bob and why (no output, exit 1)" \
+  || bad "the log does not name bob: $(cat "$LOG")"
+grep -q 'could not run: alice' "$LOG" && bad "alice (no store) is named as could-not-run" \
+  || ok "and does not name the no-store seat"
+check "bob's .norun marker starts its streak at 1"               "$(sed -n 1p "$CDIR/bob.norun" 2>/dev/null)" "1"
+# doctor, over the SAME directory the sweep just wrote. Run in a subshell so the
+# doctor module's globals never leak into the rest of this harness.
+doctor_row() {
+  ( . src/header.sh; . src/lib/error_codes.sh; . src/lib/output.sh; . src/cmd_doctor.sh; set +e
+    doctor_consolidate_known_seats() { printf 'alice\nbob\n'; }
+    DOCTOR_CHECKS='[]'; doctor_check_consolidate_transacting "$CDIR" 4
+    jq -c '.[0]' <<<"$DOCTOR_CHECKS" ) 2>/dev/null
+}
+ROW=$(doctor_row)
+jq -e '.severity == "warn" and (.message | test("bob")) and (.message | test("every enrolled seat") | not)' <<<"$ROW" >/dev/null \
+  && ok "doctor WARNS and names bob after a could-not-run (red on the pre-fix tree: it said ok)" \
+  || bad "doctor did not warn naming bob: $ROW"
+# A second failed pass grows the streak; a pass that parses clears it.
+_hb_memory_consolidate_sweep "$((NOW + 360*60))"
+check "a second could-not-run grows bob's streak to 2"            "$(sed -n 1p "$CDIR/bob.norun" 2>/dev/null)" "2"
+unset STUB_OUT_BOB STUB_RC_BOB
+STUB_RC=0; STUB_OUT="$_STUB_OK"
+_hb_memory_consolidate_sweep "$((NOW + 2*360*60))"
+check "a parseable pass deletes the .norun marker"                "$(ls "$CDIR"/*.norun 2>/dev/null | wc -l | tr -d ' ')" "0"
+check "and the .nostore marker of a seat that now has a store"    "$(ls "$CDIR"/*.nostore 2>/dev/null | wc -l | tr -d ' ')" "0"
+# CONTROL: the codex seat ALONE leaves doctor ok — and the ok says what it skipped.
+reset; : > "$LOG"
+STUB_RC=4; STUB_OUT="$_NOSTORE"
+export STUB_OUT_BOB="$_STUB_OK" STUB_RC_BOB=0
+_hb_memory_consolidate_sweep "$NOW"
+ROW=$(doctor_row)
+jq -e '.severity == "ok" and (.message | test("no memory store to distil: alice"))' <<<"$ROW" >/dev/null \
+  && ok "CONTROL: a codex seat with no store alone leaves doctor ok, and names it as skipped" \
+  || bad "a no-store seat alone did not leave doctor ok: $ROW"
+unset STUB_OUT_BOB STUB_RC_BOB
+LOGLINE=$(grep 'memory-consolidate\] ${_HB_CONS_ATOMS' "$SRC/cmd_heartbeat.sh")
+case "$LOGLINE" in
+  *'${_HB_CONS_NOSTORE:-0} no store'*) ok "the tick summary carries the no-store count" ;;
+  *) bad "the tick summary does not carry the no-store count" ;;
+esac
+_hb_log() { :; }
+STUB_RC=0; STUB_OUT="$_STUB_OK"
 
 echo "== the log line reports the ARTIFACT, not the attempt =="
 LOGLINE=$(grep -n 'memory-consolidate\]' "$SRC/cmd_heartbeat.sh" | grep _hb_log)
