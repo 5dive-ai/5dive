@@ -111,5 +111,34 @@ id=$(seed done "" "prior")
 out=$( FIVE_SENDER=dev2 as_agent dev2 cmd_task_verify "$id" --cmd=true 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && ok "D1 a task with no recorded verifier is not blocked" || no "D1 no-verifier task not blocked" "rc=$rc $out"
 
+# --- E. DIVE-6248: the grade-only branch on a done row (customer report 473) ----
+# The repro verbatim: a done row with the maker's result and no verifier, then
+# `verify --cmd=true --result=VERIFIER-TEXT --no-done`. It printed PASS and the
+# maker's text was gone, because the --no-done write skipped both preserve guards.
+id=$(seed done "" "MAKER-ORIGINAL")
+out=$( FIVE_SENDER=quinn as_agent quinn cmd_task_verify "$id" --cmd=true --result=VERIFIER-TEXT --no-done 2>&1 ); rc=$?
+res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
+st=$(db "SELECT status FROM tasks WHERE id=$id;")
+[ "$rc" -eq 0 ] && ok "E1 the --no-done grade on a done row is still recorded (rc=0)" || no "E1 --no-done grade recorded" "rc=$rc $out"
+grep -q 'MAKER-ORIGINAL' <<<"$res" && ok "E2 MAKER-ORIGINAL survives the --no-done grade" || no "E2 MAKER-ORIGINAL survives" "$res"
+grep -q 'VERIFIER-TEXT' <<<"$res" && ok "E3 the verifier's text is recorded too" || no "E3 verifier text recorded" "$res"
+[ "$(head -n1 <<<"$res")" = "MAKER-ORIGINAL" ] && ok "E4 the prior text comes FIRST (graded-sha stays the last occurrence)" || no "E4 prior text first" "$res"
+grep -q 'DIVE-6248' <<<"$out" && ok "E5 the append is SAID, not silent" || no "E5 append said" "$out"
+[ "$st" = done ] && ok "E6 status is unchanged" || no "E6 status unchanged" "st=$st"
+
+# --- F. a FAIL on a done row reaches the same write, and must preserve too ------
+id=$(seed done olivia "$ACK")
+out=$( FIVE_SENDER=olivia as_agent olivia cmd_task_verify "$id" --cmd=false 2>&1 ); rc=$?
+res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
+grep -q 'ALREADY merged with a version bump' <<<"$res" && grep -q 'verify FAIL' <<<"$res" \
+  && ok "F1 a FAIL on a done row appends under the ACK instead of replacing it" || no "F1 FAIL preserves ACK" "$res"
+
+# --- G. cancelled is closed too -----------------------------------------------
+id=$(seed cancelled "" "CANCEL-REASON")
+out=$( FIVE_SENDER=quinn as_agent quinn cmd_task_verify "$id" --cmd=true --result=LATE-GRADE --no-done 2>&1 ); rc=$?
+res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
+grep -q 'CANCEL-REASON' <<<"$res" && grep -q 'LATE-GRADE' <<<"$res" \
+  && ok "G1 a grade on a cancelled row keeps the cancel reason" || no "G1 cancelled row preserves" "$res"
+
 echo; echo "DIVE-2067 verify-over-closed guard: passed: $P  failed: $F  skipped: $S"
 [ "$F" -eq 0 ]
