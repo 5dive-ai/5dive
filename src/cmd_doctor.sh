@@ -1017,6 +1017,36 @@ doctor_registry_seat_names() {
   jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null | tr '\n' ' '
 }
 
+# DIVE-6382 — a seat the registry says is parked (desiredState=stopped) while
+# its unit is active. The pending-restart sweep HOLDS every owed restart for
+# such a seat (DIVE-4033) and says so only in the heartbeat log, and with the
+# supervisor off nothing else reconciles it: on a customer box one seat ran a
+# deleted Claude Code build through every release for 19 days while `agent
+# list` said ready and doctor said nothing. Only a person knows which side is
+# stale, so this WARNs and names both exits; it never picks one.
+# A seat at `stopped` whose unit is down is a real park and is not reported.
+doctor_check_parked_running() {
+  local reg="$1" n unit marked age owed found=0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    unit="5dive-agent@${n}.service"
+    systemctl is-active --quiet "$unit" 2>/dev/null || continue
+    found=$((found + 1))
+    owed="no restart owed"
+    if declare -F _pending_restart_marked_at >/dev/null 2>&1 \
+       && marked=$(_pending_restart_marked_at "$n" 2>/dev/null); then
+      age=$(( $(date +%s) - marked )); (( age < 0 )) && age=0
+      owed="an update restart has been owed for $(( age / 86400 ))d $(( age % 86400 / 3600 ))h and is HELD"
+    fi
+    doctor_add registry parked-running warn \
+      "agent '$n' is RUNNING but the registry says desiredState=stopped — ${owed}, so it misses every release until reconciled. Reconcile: '5dive agent stop $n' if the park is real, '5dive agent start $n' if the park is stale (the next sweep then bounces it onto the new payload)" false false
+  done < <(jq -r '.agents | to_entries[] | select(.value.desiredState == "stopped") | .key' <<<"$reg" 2>/dev/null)
+  (( found == 0 )) && doctor_add registry parked-running ok \
+    "no seat is parked in the registry while its unit is running"
+  return 0
+}
+
 # DIVE-4340 — the converse check: an `agent-*` account with no registry entry.
 #
 # `doctor`'s registry section asserted one direction only — every registry entry
@@ -2110,6 +2140,7 @@ cmd_doctor() {
       # registry entry still have a user?"; nothing asked "does this user still
       # have a registry entry?", which is the direction the orphans were in.
       doctor_check_orphan_seats "$want_fix"
+      doctor_check_parked_running "$reg"
     fi
   fi
 
