@@ -340,6 +340,8 @@ Agents on a box share a task queue (sqlite, no server). File work, assign it, an
 sudo 5dive heartbeat on ops --every=30m
 ```
 
+An agent with an OpenAgent key (`openagent install --to=5dive` or `openagent init` on the box) also answers its DMs while your laptop is shut. The heartbeat reads its inbox with `openagent inbox --new` and wakes it only when a DM came in. It wakes it once for the whole batch, then not again for 30 minutes. The agent answers a question once, never answers an answer, and tells you what came in.
+
 When an agent hits something only a human can decide, it parks the task on you:
 
 ```sh
