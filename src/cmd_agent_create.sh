@@ -1656,6 +1656,12 @@ write_agent_env() {
   if [[ -z "$can_deploy" && -r "$env_file" ]]; then
     can_deploy=$(sed -n 's/^AGENT_CAN_DEPLOY=//p' "$env_file" | head -1)
   fi
+  # DIVE-6345: Claude in Chrome for this agent (`agent config set chrome=on|off`),
+  # same discipline. '1' = on; anything else = no line.
+  local chrome="${_CHROME_OVERRIDE:-}"
+  if [[ -z "$chrome" && -r "$env_file" ]]; then
+    chrome=$(sed -n 's/^AGENT_CHROME=//p' "$env_file" | head -1)
+  fi
   {
     printf 'AGENT_NAME=%s\n' "$name"
     printf 'AGENT_TYPE=%s\n' "$type"
@@ -1666,6 +1672,7 @@ write_agent_env() {
     [[ -n "$autonomy" && "$autonomy" != "standard" ]] && printf 'AGENT_AUTONOMY=%s\n' "$autonomy"
     [[ "$can_push" == "1" ]] && printf 'AGENT_CAN_PUSH=1\n'
     [[ "$can_deploy" == "1" ]] && printf 'AGENT_CAN_DEPLOY=1\n'
+    [[ "$chrome" == "1" ]] && printf 'AGENT_CHROME=1\n'
     # New telegram agents flow through our 5dive-plugins fork (bundled
     # hooks, richer slash commands). 5dive-agent-start reads this var to
     # build the runtime --channels arg, defaulting to claude-plugins-official

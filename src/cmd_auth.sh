@@ -255,6 +255,10 @@ heal_claude_shadow_creds() {
       fi
     done
     (( has_token )) || continue   # no fallback → leave the creds file alone
+    # DIVE-6345: a Claude in Chrome agent (chrome=on) RUNS on this file — the
+    # launcher unsets its env token — and its access token refreshes itself, so
+    # an expiresAt in the past is a stopped agent, not a dead login. Never rename.
+    grep -qx 'AGENT_CHROME=1' "${ENV_DIR}/${name}.env" 2>/dev/null && continue
 
     # Stale? expiresAt is epoch milliseconds. Treat expired / missing field /
     # unparseable as stale.
