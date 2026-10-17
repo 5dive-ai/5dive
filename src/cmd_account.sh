@@ -308,8 +308,12 @@ account_each() {
 # Per-account spawns left: account_signin_detail's, and only for authed types.
 # DIVE-3088.
 cmd_account_list() {
-  ensure_state_ro
   [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account list"
+  # DIVE-6430: a standard seat cannot read the other profiles' credential files,
+  # so its own run lists every account but its current one with types:[] and the
+  # telegram /account picker drops them all. It reads the list over its grant.
+  _self_account_eligible && _self_account_cross list
+  ensure_state_ro
   local rows name t detail rec csv
   local -a recs=() fields=() atypes=()
   while IFS= read -r name; do
@@ -1156,10 +1160,12 @@ cmd_account_usage() {
     cmd_account_usage_history "$@"
     return
   fi
-  ensure_state
   [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account usage [--history [--7d] [--account=<name>]]"
   # DIVE-5367: a standard seat reads the board over its own exact-path grant.
+  # Before ensure_state, which requires root (DIVE-6430: behind it the cross
+  # was unreachable and the seat got "must run as root").
   _self_account_eligible && _self_account_cross usage
+  ensure_state
   require_root
   local rows; rows=$(account_usage_rows)
   # Publish for the unprivileged health surfaces (liveness, supervisor,
@@ -2161,7 +2167,8 @@ cmd_account_set_active_provider() {
 #     so no global flag in front of the verb can fall outside the grant.
 #   * The seat is derived from SUDO_UID, never from the caller. There is no
 #     target argument to pass, so this cannot switch or read ANOTHER seat.
-#   * Two operations: `usage` (the every-account 5h/1w board, a read) and
+#   * Two reads, `usage` (the every-account 5h/1w board) and `list` (the
+#     accounts with their signed-in types, DIVE-6430), and
 #     `set <account|default>` (bind THIS seat to an account the box already
 #     holds). Nothing that adds, signs in, renames or removes an account, and
 #     nothing box-wide.
@@ -2248,6 +2255,12 @@ cmd_self_account_delegated() {
     usage)
       (( ${#wire[@]} == 2 )) || fail "$E_VALIDATION" "_self_account usage takes no arguments."
       cmd_account_usage ;;
+    list)
+      # DIVE-6430: the accounts with their signed-in types, read as root. Names,
+      # types, bound seats and sign-in metadata (provider, model, when), never a
+      # credential's contents.
+      (( ${#wire[@]} == 2 )) || fail "$E_VALIDATION" "_self_account list takes no arguments."
+      cmd_account_list ;;
     set)
       (( ${#wire[@]} == 3 )) || fail "$E_VALIDATION" "_self_account set takes exactly one account name."
       local account="${wire[2]}"
@@ -2264,6 +2277,6 @@ cmd_self_account_delegated() {
       [[ "${wire[2]}" =~ ^[0-9]{1,12}$ ]] || fail "$E_VALIDATION" "_self_account rotate: the reset must be an epoch."
       with_registry_lock cmd_agent_rotation_rotate "$seat" "--wall=${wire[2]}" ;;
     *)
-      fail "$E_VALIDATION" "_self_account allows only usage, set or rotate." ;;
+      fail "$E_VALIDATION" "_self_account allows only usage, list, set or rotate." ;;
   esac
 }

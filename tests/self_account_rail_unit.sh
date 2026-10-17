@@ -39,6 +39,7 @@ grep -qF 'command.startswith("/usr/local/bin/5dive _self_account")' "$SRC/cmd_ag
 # ── the root half ────────────────────────────────────────────────────────────
 CALLS="$TMP/calls"
 cmd_account_usage(){ printf 'usage json=%s\n' "$JSON_MODE" >>"$CALLS"; }
+cmd_account_list(){ printf 'list json=%s\n' "$JSON_MODE" >>"$CALLS"; }
 cmd_agent_set_account(){ printf 'set %s\n' "$*" >>"$CALLS"; }
 with_registry_lock(){ local fn="$1"; shift; "$fn" "$@"; }
 _gate_uid_to_agent(){ [[ "$1" == 1042 ]] && printf 'tap' || printf ''; }
@@ -52,6 +53,8 @@ run_root(){
 run_root 1042 json usage;       rc=$?
 [[ $rc == 0 && "$(cat "$CALLS")" == 'usage json=1' ]] && ok 'usage reads the board in json' || bad "usage reads the board in json (rc=$rc, $(cat "$CALLS"))"
 run_root 1042 text usage;       [[ "$(cat "$CALLS")" == 'usage json=0' ]] && ok 'text mode is honoured' || bad 'text mode is honoured'
+run_root 1042 json list;        rc=$?
+[[ $rc == 0 && "$(cat "$CALLS")" == 'list json=1' ]] && ok 'list reads the accounts as root (DIVE-6430)' || bad "list reads the accounts as root (rc=$rc, $(cat "$CALLS"))"
 run_root 1042 json set mark;    rc=$?
 [[ $rc == 0 && "$(cat "$CALLS")" == 'set tap mark' ]] && ok 'set binds the CALLER seat, derived from SUDO_UID' || bad "set binds the caller seat (rc=$rc, $(cat "$CALLS"))"
 run_root 1042 json set default; [[ "$(cat "$CALLS")" == 'set tap default' ]] && ok 'set default clears to the box default' || bad 'set default'
@@ -63,6 +66,7 @@ neg 'an operation outside usage/set'              1042 json add evil
 neg 'set-model is not an operation'               1042 json set-model mark opus
 neg 'an account name that is not a profile name'  1042 json set '../../etc'
 neg 'usage with an argument'                      1042 json usage --history
+neg 'list with an argument'                       1042 json list mark
 neg 'a mode other than json/text'                 1042 yaml usage
 neg 'an empty wire'                               1042
 neg 'SUDO_UID 0 (root itself, not a seat)'        0    json set mark
@@ -115,9 +119,11 @@ GRANTED=1
 : >"$CALLS"; ( CROSS_RC=7; agent_set_account_dispatch tap mark ) >/dev/null 2>&1; rc=$?
 [[ $rc == 7 && ! -s "$CALLS" ]] && ok 'a root-side refusal is returned, never retried on the root path' || bad "root-side refusal (rc=$rc, $(cat "$CALLS"))"
 
-# account usage on a granted seat crosses before require_root
-require_root(){ printf 'require_root\n' >>"$CALLS"; return 1; }
-ensure_state(){ :; }
+# account usage on a granted seat crosses before require_root. DIVE-6430: the
+# real ensure_state requires root, so it is stubbed to — a no-op stub here is
+# what let the cross sit behind it and never run.
+require_root(){ printf 'require_root\n' >>"$CALLS"; exit 10; }
+ensure_state(){ require_root; }
 unset -f cmd_account_usage; source <(sed -n '/^cmd_account_usage()/,/^}/p' "$SRC/cmd_account.sh")
 : >"$CALLS"; : >"$WIRE"
 ( JSON_MODE=1; cmd_account_usage ) >/dev/null 2>&1; rc=$?
@@ -125,6 +131,24 @@ unset -f cmd_account_usage; source <(sed -n '/^cmd_account_usage()/,/^}/p' "$SRC
 GRANTED=0; : >"$CALLS"; : >"$WIRE"
 ( cmd_account_usage ) >/dev/null 2>&1
 [[ "$(cat "$CALLS")" == 'require_root' && ! -s "$WIRE" ]] && ok 'account usage on an ungranted seat still requires root' || bad 'account usage on an ungranted seat still requires root'
+
+# DIVE-6430: account list on a granted seat reads over the rail (its own run
+# cannot read the other profiles' credential files, so every account but its own
+# came back types:[]); an ungranted seat keeps the local read.
+ensure_state_ro(){ printf 'local\n' >>"$CALLS"; exit 0; }
+unset -f cmd_account_list; source <(sed -n '/^cmd_account_list()/,/^}/p' "$SRC/cmd_account.sh")
+GRANTED=1; : >"$CALLS"; : >"$WIRE"
+( JSON_MODE=1; cmd_account_list ) >/dev/null 2>&1; rc=$?
+[[ $rc == 0 && "$(cat "$WIRE")" == 'json|list|' && ! -s "$CALLS" ]] && ok 'account list crosses on a granted seat' || bad "account list crosses (rc=$rc, wire=$(cat "$WIRE"), $(cat "$CALLS"))"
+: >"$CALLS"; : >"$WIRE"
+( JSON_MODE=0; cmd_account_list ) >/dev/null 2>&1
+[[ "$(cat "$WIRE")" == 'text|list|' ]] && ok 'account list keeps text mode over the rail' || bad "account list text mode (wire=$(cat "$WIRE"))"
+GRANTED=0; : >"$CALLS"; : >"$WIRE"
+( cmd_account_list ) >/dev/null 2>&1
+[[ "$(cat "$CALLS")" == 'local' && ! -s "$WIRE" ]] && ok 'account list on an ungranted seat keeps the local read' || bad "account list ungranted ($(cat "$CALLS"))"
+GRANTED=1; : >"$CALLS"; : >"$WIRE"
+( cmd_account_list extra ) >/dev/null 2>&1; rc=$?
+[[ $rc != 0 && ! -s "$WIRE" ]] && ok 'account list with an argument is refused before the rail' || bad 'account list with an argument'
 
 # the dispatcher reaches the executor, with argv, so it can refuse argv
 grep -q 'cmd_self_account_delegated "\$@"' <<<"$(grep -A8 '^    _self_account)' "$SRC/main.sh")" \
