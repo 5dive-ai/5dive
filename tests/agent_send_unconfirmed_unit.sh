@@ -56,7 +56,9 @@ sudo() {
   # assertion, so a source mutation can reach it and fail exactly there.
   if [[ "$*" == *"agent _deliver"* ]]; then
     printf '%s\n' "$*" >"$SCOPED_DELIVER_ARGV"
-    if [[ "${INJECT_RC:-0}" == 1 ]]; then
+    if [[ "${INJECT_RC:-0}" == 4 ]]; then
+      printf '%s\n' '{"ok":true,"data":{"delivered":false,"queued":true,"reason":"target is mid-attempt — queued, delivers at its next idle or wake (DIVE-4214)"}}'
+    elif [[ "${INJECT_RC:-0}" == 1 ]]; then
       printf '%s\n' '{"ok":true,"data":{"delivered":false,"reason":"the composer still holds unsent text after two Enters — the payload was typed but the submit could not be verified (DIVE-4246; was the DIVE-147 paste-placeholder poll)"}}'
     else
       printf '%s\n' '{"ok":true,"data":{"delivered":true}}'
@@ -72,6 +74,7 @@ inject_and_submit() {
   [[ "${SET_READY:-0}" == 1 ]] && AGENT_WAKE_READY=proven
   return "${INJECT_RC:-0}"
 }
+_a2a_queue_depth()           { printf '2\n'; }
 auto_sender_from_sudo()      { printf 'maker\n'; }
 _envelope_caller()           { printf 'maker\n'; }
 gen_msg_id()                 { printf 'feed2362\n'; }
@@ -212,6 +215,55 @@ if grep -Fq "'{name:\$n, delivered:true, from:\$s, tier:(\$t|select(length>0))}'
   ok_t 'T21 confirmed scoped delivery keeps the pre-DIVE-2362 renderer byte-for-byte'
 else
   bad_t 'T21 confirmed scoped delivery renderer changed' 'rc=0 must stay on the original expression'
+fi
+
+# DIVE-6414 (B): a SPOOLED message (inject rc 4) must say so on its AUDIT ROW.
+# The rc stays 0 and the receipt was already honest; the row was not — it read
+# `result=ok code=0` exactly like a typed delivery. Run in THIS shell (not $(…))
+# so AUDIT_ARGS, which main.sh's EXIT trap writes, is still readable.
+for site in cmd_deliver cmd_send; do
+  AUDIT_ARGS=()
+  if [[ "$site" == cmd_deliver ]]; then
+    JSON_MODE=1 INJECT_RC=4 cmd_deliver ada ping >/dev/null 2>&1 || true
+  else
+    JSON_MODE=1 INJECT_RC=4 cmd_send ada ping --raw >/dev/null 2>&1 || true
+  fi
+  a=" ${AUDIT_ARGS[*]:-} "
+  [[ "$a" == *" queued=1 "* && "$a" == *" spool_depth=2 "* ]] \
+    && ok_t "T22 $site: a spooled message's audit row carries queued=1 spool_depth=2" \
+    || bad_t "T22 $site: audit row cannot tell queued from delivered" "$a"
+  AUDIT_ARGS=()
+  if [[ "$site" == cmd_deliver ]]; then
+    JSON_MODE=1 INJECT_RC=0 cmd_deliver ada ping >/dev/null 2>&1 || true
+  else
+    JSON_MODE=1 INJECT_RC=0 cmd_send ada ping --raw >/dev/null 2>&1 || true
+  fi
+  a=" ${AUDIT_ARGS[*]:-} "
+  [[ "$a" != *"queued="* ]] \
+    && ok_t "T23 $site: a typed delivery's audit row has no queued field (control)" \
+    || bad_t "T23 $site: typed delivery marked queued" "$a"
+done
+
+# DIVE-6414: a scoped ask whose QUESTION was spooled says queued, not "unconfirmed".
+out=$(run_ask_json 4 1)
+is 'T24 scoped ask, question spooled: queued:true' true "$(jq -r '.data.queued' <<<"$out")"
+is 'T24 scoped ask, question spooled: sent:false' false "$(jq -r '.data.sent' <<<"$out")"
+out=$(run_ask_text 4 1)
+[[ "$out" == *"OK — question to agent 'ada' is queued, not asked"* ]] \
+  && ok_t 'T25 scoped ask, question spooled: prose says queued' \
+  || bad_t 'T25 scoped ask, question spooled: prose' "$out"
+out=$(run_ask_json 1 1)
+is 'T25b an unconfirmed (not spooled) scoped ask has no queued key' false "$(jq -r '.data|has("queued")|tostring' <<<"$out")"
+
+# DIVE-6414 (A), end to end through cmd_ask: a scoped ask that was DELIVERED
+# (receipt delivered:true) and then saw an empty reply window must time out
+# WITHOUT asserting a delivery failure or pointing at a warning nobody printed.
+err=$( (JSON_MODE=0 INJECT_RC=0 USE_SCOPED=1 cmd_ask ada ping --from=maker --timeout=1 --poll-secs=1) 2>&1 >/dev/null || true)
+if [[ "$err" == *"no idle reply from 'ada' within 1s"* && "$err" == *"not observable on the scoped path"* \
+      && "$err" != *"DELIVERY failure"* && "$err" != *"warning above"* ]]; then
+  ok_t 'T26 scoped ask timeout says delivery is unobservable, not a DELIVERY failure'
+else
+  bad_t 'T26 scoped ask timeout still asserts a delivery failure' "$err"
 fi
 
 printf 'agent_send_unconfirmed_unit: %d passed, %d failed, %d not reached\n' "$PASS" "$FAIL" "$NOT_REACHED"

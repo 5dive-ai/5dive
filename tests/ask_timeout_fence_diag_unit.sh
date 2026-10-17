@@ -24,6 +24,16 @@
 #   O3  echo + a seat-opened fence for ANOTHER ask id → DELIVERED (id-scoped)
 #   U1  no question marker at all → DELIVERY failure
 #   W1  the timeout path in cmd_ask calls _ask_timeout_diag (wiring)
+#   DIVE-6414 — the SCOPED path, where the file holds only `_capture`'s window
+#   AFTER the marker, so the marker itself is never in it:
+#   S1  scoped, empty window → UNOBSERVABLE: no "DELIVERY failure", no pointer
+#       at a warning this path never prints
+#   S2  scoped, window holds anything (furniture after the marker) → DELIVERED
+#   S3  scoped, the seat opened the fence → OPENED
+#   P1  direct, undelivered, warning printed → points at the warning above
+#   P2  direct, undelivered, no warning printed → does NOT point at one
+#   W2  cmd_ask passes the scoped flag and the warned flag (wiring)
+#   NC2 NEGATIVE CONTROL: the pre-6414 two-arg call on S1's fixture → UNDELIVERED
 #   NC  NEGATIVE CONTROL: _ask_timeout_diag with the pre-fix check (bare grep for
 #       the opener) reports OPENED on D1's fixture — D1 goes red on that tree
 #
@@ -64,6 +74,7 @@ kind() { # <diag> -> OPENED | DELIVERED | UNDELIVERED | ?
     *"reply fence was OPENED"*) echo OPENED ;;
     *"question was DELIVERED"*) echo DELIVERED ;;
     *"never seen in the pane"*) echo UNDELIVERED ;;
+    *"not observable on the scoped path"*) echo UNOBSERVABLE ;;
     *) echo "?" ;;
   esac
 }
@@ -131,6 +142,37 @@ expect O3 DELIVERED "$F_O3" "an opener for ANOTHER ask id does not count"
 F_U1=$(pane u1 "$FOOTER")
 expect U1 UNDELIVERED "$F_U1" "nothing of the question in the pane"
 
+# --- DIVE-6414: the scoped path -------------------------------------------
+expect_s() { # <arm> <want> <file> <label>  (scoped=1, warned=0)
+  local got; got=$(kind "$(_ask_timeout_diag "$ID" "$3" 1 0)")
+  [[ "$got" == "$2" ]] && ok_t "$1 $4 → $2" || bad_t "$1 $4" "want $2, got $got"
+}
+F_S1=$(pane s1 "")
+expect_s S1 UNOBSERVABLE "$F_S1" "scoped, _capture returned nothing"
+s1=$(_ask_timeout_diag "$ID" "$F_S1" 1 0)
+[[ "$s1" != *"DELIVERY failure"* && "$s1" != *"warning above"* && "$s1" == *"msg_id=${ID}"* ]] \
+  && ok_t "S1 scoped clause asserts no delivery failure, names no unprinted warning, names the audit msg_id" \
+  || bad_t "S1 scoped clause" "$s1"
+F_S2=$(pane s2 "$FOOTER")
+expect_s S2 DELIVERED "$F_S2" "scoped, the window opened (furniture after the marker)"
+F_S3=$(pane s3 "● <5dive-r:${ID}>
+  half an answer
+${FOOTER}")
+expect_s S3 OPENED "$F_S3" "scoped, the seat opened the fence"
+p1=$(_ask_timeout_diag "$ID" "$F_U1" 0 1); p2=$(_ask_timeout_diag "$ID" "$F_U1" 0 0)
+[[ "$p1" == *"warning above"* ]] && ok_t "P1 direct, warning printed → the clause points at it" \
+  || bad_t "P1 direct warned" "$p1"
+[[ "$(kind "$p2")" == UNDELIVERED && "$p2" != *"warning above"* ]] \
+  && ok_t "P2 direct, no warning printed → still UNDELIVERED, but no pointer at a warning" \
+  || bad_t "P2 direct unwarned" "$p2"
+TO_SRC=$(awk '/DIVE-1901 iteration 2: say WHAT was seen/,/fail "\$E_TIMEOUT" "no idle reply/' src/cmd_agent_runtime.sh)
+[[ "$TO_SRC" == *'_ask_timeout_diag "$msg_id" "$acc_file" "$use_scoped" "$ready_warned"'* ]] \
+  && ok_t "W2 cmd_ask passes the scoped and warned flags" || bad_t "W2 wiring" "$(head -c 400 <<<"$TO_SRC")"
+nc2=$(kind "$(_ask_timeout_diag "$ID" "$F_S1")")
+[[ "$nc2" == UNDELIVERED ]] \
+  && ok_t "NC2 NEGATIVE CONTROL: the pre-6414 call (no scoped flag) calls S1's window a DELIVERY failure — S1 is red there" \
+  || bad_t "NC2 the unflagged call must misreport S1" "got $nc2"
+
 # W1: the real timeout branch must use this function, not a local copy of the grep.
 TIMEOUT_SRC=$(awk '/DIVE-1901 iteration 2: say WHAT was seen/,/fail "\$E_TIMEOUT" "no idle reply/' src/cmd_agent_runtime.sh)
 if [[ "$TIMEOUT_SRC" == *'_ask_timeout_diag "$msg_id" "$acc_file"'* && "$TIMEOUT_SRC" != *'grep -qF "<5dive-r:'* ]]; then
@@ -154,5 +196,5 @@ fi
 eval "$DIAG_SRC"
 
 echo
-echo "PASS=${PASS} FAIL=${FAIL} (DIVE-6015 ask timeout fence diagnosis)"
+echo "PASS=${PASS} FAIL=${FAIL} (DIVE-6015 / DIVE-6414 ask timeout diagnosis)"
 (( FAIL == 0 ))
