@@ -1,3 +1,15 @@
+# DIVE-1002 + DIVE-6410: the tier of a new seat whose create names no
+# --isolation. $1 = how many agents the registry holds before this one.
+_create_default_isolation() {
+  if declare -F box_seat_isolation >/dev/null 2>&1 && [[ "$(box_seat_isolation)" == admin ]]; then
+    printf 'admin'
+  elif [[ "$1" == "0" ]]; then
+    printf 'admin'
+  else
+    printf 'standard'
+  fi
+}
+
 create_agent_user() {
   # DIVE-1002: least-privilege by default — callers pass an explicitly resolved
   # tier (cmd_create resolves standard-by-default + bootstrap-admin). The
@@ -237,18 +249,25 @@ cmd_agent_reconcile_coauthors() {
 #
 # The file is `visudo -c` validated before install so a malformed entry can never
 # lock the box out; on failure we remove it and fail loudly.
-write_admin_sudoers() {
+# DIVE-6410: the exact text write_admin_sudoers installs, so `agent grant <name>
+# admin` can compare byte-for-byte (the render_root_sudoers pattern).
+render_admin_sudoers() {
   local user="$1"
-  local f="/etc/sudoers.d/${user}"
-  local tmp
-  tmp=$(mktemp)
   # Only bare-trailing-`*` (any-args) forms — the single wildcard shape sudo-rs
   # accepts (DIVE-1088). The CLI-as-root grant covers all fleet + service ops.
-  cat > "$tmp" <<SUDOERS
+  cat <<SUDOERS
 # Managed by 5dive (DIVE-1002/1088). Fleet-management scope for admin agent ${user}.
 # Do not edit by hand; regenerated on agent create/provision.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive, /usr/local/bin/5dive *
 SUDOERS
+}
+
+write_admin_sudoers() {
+  local user="$1"
+  local f="${SUDOERS_D:-/etc/sudoers.d}/${user}"
+  local tmp
+  tmp=$(mktemp)
+  render_admin_sudoers "$user" > "$tmp"
   chmod 440 "$tmp"
   if visudo -cf "$tmp" >/dev/null 2>&1; then
     chown root:root "$tmp"
@@ -1062,6 +1081,69 @@ _agent_grant_root_plan() {
   printf 'update|%s enforces a %s grant — widening it to unrestricted root\n' "$user" "$cls"
 }
 
+# DIVE-6410: the decision half of `agent grant <name> admin` — re-isolate ONE
+# existing seat to admin, rendered exactly as `agent create --isolation=admin`
+# renders it. Pure, through the SUDOERS_D seam, like _agent_grant_root_plan.
+# Prints `<state>|<detail>`:
+#   update   the seat holds a managed policy that is not the admin one (standard's
+#            scoped grants, or managed root) or no policy at all.
+#   current  the managed admin policy is already installed, byte for byte.
+#   refuse   a file this CLI did not write. Replacing it could narrow a hand-made
+#            root grant or delete an operator's own lines; they move it aside first.
+_agent_grant_admin_plan() {
+  local user="$1" d="${SUDOERS_D:-/etc/sudoers.d}" f current grant cls
+  f="${d}/${user}"
+  if [[ ! -r "$f" ]]; then
+    printf 'update|%s holds no sudoers policy — minting the managed admin policy at %s\n' "$user" "$f"
+    return 0
+  fi
+  current=$(cat "$f")
+  if [[ "$current" == "$(render_admin_sudoers "$user")" ]]; then
+    printf 'current|%s already enforces the managed admin policy — nothing to do\n' "$user"
+    return 0
+  fi
+  grant=$(printf '%s\n' "$current" | classify_sudo_grant)
+  cls="${grant%%|*}"
+  if [[ "$current" != '# Managed by 5dive '* ]]; then
+    printf 'refuse|%s is not a 5dive-managed policy (no managed header; it enforces a %s grant) — refusing to replace a policy this CLI did not write. Move %s aside first, then re-run\n' "$f" "$cls" "$f"
+    return 0
+  fi
+  printf 'update|%s enforces a %s grant — re-rendering it as the admin policy (the 5dive CLI as root)\n' "$user" "$cls"
+}
+
+# DIVE-6410: the write half. The same three steps create runs for an admin seat
+# (write_admin_sudoers, the label on both sources, the claude-keys membership),
+# in that order: a label is never stamped over a failed write (DIVE-2079).
+# A sandboxed seat is refused: it sits outside the shared group and holds ACLs
+# instead, which only a re-create re-derives.
+_cmd_agent_grant_admin() {
+  local name="$1" user="$2" iso="$3"
+  local plan state detail
+  [[ "$iso" != "sandboxed" ]] \
+    || fail "$E_USAGE" "agent '${name}' is sandboxed — it is outside the shared group and holds no sudoers, so re-isolating it needs a re-create (\`5dive agent create ${name} --isolation=admin\` after removing it), not a re-render"
+  plan=$(_agent_grant_admin_plan "$user")
+  state="${plan%%|*}"; detail="${plan#*|}"
+  case "$state" in
+    refuse) fail "$E_USAGE" "$detail" ;;
+    update) write_admin_sudoers "$user" ;;
+  esac
+  local label_changed=false
+  if [[ "$iso" != "admin" ]]; then
+    _agent_stamp_isolation "$name" "admin"
+    label_changed=true
+  fi
+  secrets_member_sync "$user" "admin" \
+    || warn "could not add ${user} to ${SECRETS_GROUP}; 'sudo 5dive _secrets_posture' retries (DIVE-5690)"
+  if [[ "$state" == "current" && "$label_changed" == false ]]; then
+    ok "${name}: already admin (managed policy and label both in place)" \
+       '{agent:$a, capability:"admin", changed:false, labelChanged:false, isolation:"admin"}' --arg a "$name"
+    return 0
+  fi
+  ok "${name}: isolation is now admin (was ${iso}) — the 5dive CLI as root; a running seat gets the claude-keys group at its next restart" \
+     '{agent:$a, capability:"admin", changed:($s=="update"), labelChanged:($l=="true"), isolation:"admin", previousIsolation:$i}' \
+     --arg a "$name" --arg i "$iso" --arg s "$state" --arg l "$label_changed"
+}
+
 # DIVE-4557: stamp the isolation LABEL on both sources of truth at once.
 #
 # There are two, they are independent, and nothing reconciles them (DIVE-2218):
@@ -1136,7 +1218,7 @@ _cmd_agent_grant_root() {
   if [[ "$state" == "adopt" ]]; then
     warn "${name} ALREADY held unrestricted root through a hand-written drop-in — this did not widen the seat, it put an existing grant under management and made the label honest. ${detail}"
   else
-    warn "${name} NOW HAS UNRESTRICTED ROOT on this box: any command, as any user, no password. That includes becoming \`claude\`, whose GitHub credential is the human operator's identity. This is wider than \`admin\`, which is the 5dive CLI as root and nothing else. If what this seat actually needed was host remediation, \`5dive host\` (units, journals, crontabs) already reaches it from inside the admin boundary with no sudoers change. THERE IS NO REVOKE VERB YET (DIVE-4557 ships the conferral only): narrowing this seat again means removing /etc/sudoers.d/${user} by hand and re-running \`agent create\`, or waiting for \`agent grant <name> admin\`."
+    warn "${name} NOW HAS UNRESTRICTED ROOT on this box: any command, as any user, no password. That includes becoming \`claude\`, whose GitHub credential is the human operator's identity. This is wider than \`admin\`, which is the 5dive CLI as root and nothing else. If what this seat actually needed was host remediation, \`5dive host\` (units, journals, crontabs) already reaches it from inside the admin boundary with no sudoers change. Narrowing it again: \`5dive agent grant ${name} admin\` (DIVE-6410)."
   fi
   ok "${name}: $(if [[ "$state" == "adopt" ]]; then printf 'existing root policy brought under management'; else printf 'unrestricted root granted'; fi) — isolation label is now beyond-admin (was ${iso})" \
      '{agent:$a, capability:"root", changed:true, labelChanged:true, isolation:"beyond-admin", previousIsolation:$i, adopted:($s=="adopt")}' \
@@ -1147,10 +1229,10 @@ cmd_agent_grant() {
   require_root "agent grant"
   local name="${1:-}" cap="${2:-}"
   [[ $# -eq 2 && -n "$name" && -n "$cap" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent grant <name> <merge|push|deploy|root>"
+    || fail "$E_USAGE" "usage: 5dive agent grant <name> <merge|push|deploy|admin|root>"
   case "$cap" in
-    merge|push|deploy|root) ;;
-    *) fail "$E_USAGE" "unknown capability '${cap}' — one of: merge, push, deploy, root" ;;
+    merge|push|deploy|admin|root) ;;
+    *) fail "$E_USAGE" "unknown capability '${cap}' — one of: merge, push, deploy, admin, root" ;;
   esac
   local user="agent-${name}" reg iso
   reg=$(registry_read)
@@ -1162,6 +1244,12 @@ cmd_agent_grant() {
   # standard-template re-render and is unchanged.
   if [[ "$cap" == "root" ]]; then
     _cmd_agent_grant_root "$name" "$user" "$iso"
+    return $?
+  fi
+  # DIVE-6410: `admin` re-isolates the seat to the admin tier, from standard or
+  # from managed root. Its own path for the same reason as root.
+  if [[ "$cap" == "admin" ]]; then
+    _cmd_agent_grant_admin "$name" "$user" "$iso"
     return $?
   fi
   [[ "$iso" == "standard" ]] \
@@ -2985,12 +3073,10 @@ cmd_create() {
   # registry below — admin is never re-derived from create-order (which would
   # break if that agent is later deleted or a worker is created first). An
   # explicit --isolation always wins in either direction.
+  # DIVE-6410: a box set to `5dive config seat-isolation=admin` (a partner whose
+  # every seat is admin) gives admin here instead, first seat or not.
   if (( ! isolation_explicit )); then
-    if [[ "$(registry_read | jq -r '(.agents // {}) | length')" == "0" ]]; then
-      isolation="admin"
-    else
-      isolation="standard"
-    fi
+    isolation=$(_create_default_isolation "$(registry_read | jq -r '(.agents // {}) | length')")
   fi
   valid_isolation "$isolation" || fail "$E_VALIDATION" "invalid --isolation (admin|standard|sandboxed)"
   # DIVE-5306: same values and the same claude-only rule as
