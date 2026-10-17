@@ -14,6 +14,14 @@ _box_config_read() {
   [[ -r "$f" ]] && cat "$f" 2>/dev/null || printf '{}'
 }
 
+# DIVE-6410: the box's tier for a new seat that names none — "admin" or empty
+# (the built-in rule). Anything else in the file reads as empty, so a hand-edited
+# value can never widen a seat beyond what the setter accepts.
+box_seat_isolation() {
+  local v; v=$(jq -r '.seat_isolation // empty' <<<"$(_box_config_read)" 2>/dev/null || true)
+  [[ "$v" == admin ]] && printf 'admin' || true
+}
+
 cmd_box_config() {
   local -a sets=()
   while (( $# )); do
@@ -36,6 +44,7 @@ cmd_box_config() {
         "       5dive config openrouter-key=- < keyfile | clear" \
         "       5dive config mod-seat=on|off|default" \
         "       5dive config telegram-app=on|off|default" \
+        "       5dive config seat-isolation=admin|default" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
         "             always          every standard row is graded" \
@@ -107,11 +116,16 @@ cmd_box_config() {
         "             Default off: the plugin's hooks are an early-access Claude Code API." \
         "  telegram-app whether this box's agent bots answer /app with a button that opens" \
         "             5dive inside Telegram, signed into the box owner's account (DIVE-5185)." \
-        "             Default on; off hides nothing else and changes no other command."
+        "             Default on; off hides nothing else and changes no other command." \
+        "  seat-isolation  the tier a NEW agent gets when its create or import names no" \
+        "             --isolation (DIVE-6410). admin = every new seat is admin, including" \
+        "             a pack whose manifest names a tier; an explicit --isolation still wins." \
+        "             Default: the first seat on an empty box is admin, later seats standard." \
+        "             Existing seats are not changed: 'agent grant <name> admin' does that."
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
-      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app)" ;;
+      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation)" ;;
     esac
     shift
   done
@@ -163,6 +177,8 @@ cmd_box_config() {
     # DIVE-5185: the /app button; anything but "off" is on.
     local ta; ta=$(jq -r '.telegram_app // "on"' <<<"$(_box_config_read)" 2>/dev/null || printf on)
     [[ "$ta" == off ]] || ta=on
+    # DIVE-6410: the tier a new seat gets when nothing names one.
+    local si; si=$(box_seat_isolation); [[ -n "$si" ]] || si=default
     ok "verify = ${policy} (${src})
 verify-small = ${small} (${ssrc})
 coauthor = ${coauthor} (box-wide, default on)
@@ -179,12 +195,13 @@ reflex-configured = ${rc}
 openrouter-key = ${ok_k}
 openrouter-keys = $(jq -r '"reflex: \(.reflex) · " + (if (.plugins | length) == 0 then "every plugin: shared" else ((.plugins | keys | map(. + ": own") | join(" · ")) + " · any other plugin: shared") end)' <<<"$okeys")
 mod-seat = ${ms} (box-wide, default off)
-telegram-app = ${ta} (box-wide, default on)" \
+telegram-app = ${ta} (box-wide, default on)
+seat-isolation = ${si} (box-wide; default = first seat admin, later seats standard)" \
        '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s,
          reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk, reflex_key_source:$rks,
          reflex_endpoint:$re, reflex_endpoint_source:$res, reflex_api:$ra, reflex_api_source:$ras, reflex_endpoint_key:$rek,
-         reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, openrouter_keys:$oks, mod_seat:$ms, telegram_app:$ta, path:$p}' \
-       --arg ms "$ms" --arg ok "$ok_k" --arg ta "$ta" --argjson oks "$okeys" \
+         reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, openrouter_keys:$oks, mod_seat:$ms, telegram_app:$ta, seat_isolation:$si, path:$p}' \
+       --arg ms "$ms" --arg ok "$ok_k" --arg ta "$ta" --arg si "$si" --argjson oks "$okeys" \
        --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" \
        --arg pw "$pw" --arg pws "$pws" --arg p5 "$p5" --arg p5s "$p5s" \
        --arg rr "$rr" --arg rrs "$rrs" --arg rm "$rm" --arg rms "$rms" --arg re "$re" --arg res "$res" \
@@ -299,13 +316,17 @@ telegram-app = ${ta} (box-wide, default on)" \
       # DIVE-5185. Stored as .telegram_app; `default` clears it (= on).
       telegram-app|telegram_app) [[ "$v" == on || "$v" == off || "$v" == default ]] \
                 || fail "$E_VALIDATION" "telegram-app takes one of: on, off, default — got '$v'" ;;
+      # DIVE-6410. Stored as .seat_isolation; `default` clears it. Only admin is
+      # offered: the built-in default already gives standard to every later seat.
+      seat-isolation|seat_isolation) [[ "$v" == admin || "$v" == default ]] \
+                || fail "$E_VALIDATION" "seat-isolation takes one of: admin, default — got '$v'" ;;
       # DIVE-4890. Validated in full before anything is written, like every key
       # above: one bad value in a multi-key call writes none of them.
       pace-week|pace_week) _pace_week_valid "$v" \
                 || fail "$E_VALIDATION" "pace-week takes <soft>/<hard> (integers, soft <= hard <= 100, e.g. 85/95), off, or default — got '$v'" ;;
       pace-5h|pace_5h) _pace_5h_valid "$v" \
                 || fail "$E_VALIDATION" "pace-5h takes a percentage (an integer 0-100, e.g. 85), off, or default — got '$v'" ;;
-      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app)" ;;
+      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation)" ;;
     esac
   done
   require_root
@@ -330,7 +351,8 @@ telegram-app = ${ta} (box-wide, default on)" \
     if [[ "$v" == default && ( "$k" == pace-week || "$k" == pace_week || "$k" == pace-5h || "$k" == pace_5h \
           || "$k" == reflex-receipts || "$k" == reflex_receipts || "$k" == reflex-model || "$k" == reflex_model \
           || "$k" == reflex-endpoint || "$k" == reflex_endpoint || "$k" == reflex-api || "$k" == reflex_api \
-          || "$k" == mod-seat || "$k" == mod_seat || "$k" == telegram-app || "$k" == telegram_app ) ]]; then
+          || "$k" == mod-seat || "$k" == mod_seat || "$k" == telegram-app || "$k" == telegram_app \
+          || "$k" == seat-isolation || "$k" == seat_isolation ) ]]; then
       json=$(jq --arg k "${k//-/_}" 'del(.[$k])' <<<"$json")
     else
       json=$(jq --arg k "${k//-/_}" --arg v "$v" '.[$k] = $v' <<<"$json")

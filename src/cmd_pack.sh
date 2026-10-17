@@ -3075,10 +3075,14 @@ _import_validate_isolation() {
 
 # Resolve the pack's tier without letting import's persona-only default replace
 # a manifest value. The caller's value wins only when the flag was explicit.
+# DIVE-6410: a box set to `seat-isolation=admin` outranks the manifest (a pack's
+# tier is its author's guess; the box owner's setting is a decision), never the flag.
 _import_resolve_isolation() {
   local manifest_value="$1" requested_value="$2" requested_set="$3"
   if (( requested_set )); then
     printf '%s' "$requested_value"
+  elif declare -F box_seat_isolation >/dev/null 2>&1 && [[ "$(box_seat_isolation)" == admin ]]; then
+    printf 'admin'
   else
     printf '%s' "$manifest_value"
   fi

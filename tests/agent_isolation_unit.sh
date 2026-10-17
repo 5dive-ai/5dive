@@ -132,7 +132,8 @@ SUD
   fi
   # DIVE-1002 (Marcus review): the three indirect root escapes must be ABSENT.
   # Assert against the REAL generated body in src/cmd_agent_create.sh, not just SFILE.
-  BODY=$(sed -n '/^write_admin_sudoers()/,/^}/p' src/cmd_agent_create.sh)
+  # DIVE-6410: the policy text lives in render_admin_sudoers, which the writer installs.
+  BODY=$(sed -n '/^render_admin_sudoers()/,/^}/p;/^write_admin_sudoers()/,/^}/p' src/cmd_agent_create.sh)
   for esc in 'systemd-run' 'journalctl' 'systemctl status'; do
     if grep -qF "$esc" <<<"$BODY"; then
       bad_t "admin allowlist must NOT contain '$esc' (root-escapable)" ""
