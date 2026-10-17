@@ -1401,7 +1401,7 @@ _a2a_queued_reason() {
   if [[ "$depth" =~ ^[0-9]+$ ]] && (( depth > 0 )); then
     base="${base}; it is #${depth} in that seat's spool"
     if (( depth > 1 )); then base="${base} ($(( depth - 1 )) ahead of it)"; fi
-    base="${base}. The heartbeat drains the spool as the seat goes idle, about one message per turn; to jump the queue, force the seat onto the row with '5dive heartbeat wake-task <agent> <task_id>'"
+    base="${base}. The heartbeat drains the spool on its own tick (minutes apart, DIVE-6414), not the moment the seat goes idle, so a reply can wait out a short ask --timeout; to jump the queue, force the seat onto the row with '5dive heartbeat wake-task <agent> <task_id>'"
   fi
   printf '%s\n' "$base"
 }
@@ -1845,8 +1845,16 @@ _agent_submit_unconfirmed_reason() {
 # `ask` has no successful reply to return when its initial submit cannot be
 # confirmed. Use the same non-fatal receipt as `send`: the payload may actually
 # have landed, but neither a caller nor a person should mistake that for proof.
+# A 5th arg of 1 marks a SPOOLED question (DIVE-6414): queued:true is additive,
+# and the prose says this call returns without the answer.
 _agent_ask_unconfirmed() {
-  local name="$1" sender="$2" msg_id="$3" reason="$4"
+  local name="$1" sender="$2" msg_id="$3" reason="$4" queued="${5:-0}"
+  if [[ "$queued" == 1 ]]; then
+    ok "question to agent '$name' is queued, not asked — ${reason}. This ask returns now: the answer cannot be collected on this call once the spool types the question." \
+       '{name:$n, sent:false, queued:true, from:$s, msg_id:$i, reason:$r}' \
+       --arg n "$name" --arg s "$sender" --arg i "$msg_id" --arg r "$reason"
+    return 0
+  fi
   ok "question to agent '$name' is unconfirmed — ${reason}." \
      '{name:$n, sent:false, from:$s, msg_id:$i, reason:$r}' \
      --arg n "$name" --arg s "$sender" --arg i "$msg_id" --arg r "$reason"
@@ -1968,18 +1976,38 @@ sys.exit(1)
 ' "$mid" "$f"
 }
 
-# _ask_timeout_diag <msg-id> <pane-file> — the clause a timed-out ask appends to
-# its error: what the pane showed (DIVE-1901 iteration 2). A fence the seat
-# opened, a question delivered with no fence after it, and a question never
-# delivered are three faults with three different fixes.
-_ask_timeout_diag() { # <msg-id> <pane-file>
-  local mid="$1" f="$2"
+# _ask_timeout_diag <msg-id> <pane-file> [scoped] [warned] — the clause a
+# timed-out ask appends to its error: what the pane showed (DIVE-1901 iteration
+# 2). A fence the seat opened, a question delivered with no fence after it, and a
+# question never delivered are three faults with three different fixes.
+#
+# DIVE-6414: the third verdict is only MEASURABLE on the direct path. On the
+# scoped path <pane-file> holds what `_capture` returned, which is only the
+# window AFTER the question's marker — the marker itself is never in it. So the
+# old grep for `id=<msg-id>` read false on every scoped timeout and asserted a
+# DELIVERY failure whether or not the question landed (measured on a box
+# 2026-10-17: two scoped asks to a seat that had received both). On that path a
+# non-empty window IS the delivery proof (`_capture` prints nothing until it has
+# seen the marker); an empty one proves nothing, and the clause now says so.
+# [warned] is 1 only when THIS process printed the input-prompt warning; the
+# hint used to point at it unconditionally, and a target with a delivery inbox,
+# or any scoped ask (the warning is _deliver's stderr), never prints one.
+_ask_timeout_diag() { # <msg-id> <pane-file> [scoped] [warned]
+  local mid="$1" f="$2" scoped="${3:-0}" warned="${4:-0}"
   if _ask_fence_opened "$mid" "$f"; then
     printf '%s' " — the reply fence was OPENED but never completed, so nothing was returned rather than returning the pane's furniture; the seat may still be writing, or its reply scrolled past between polls (try a smaller --poll-secs)"
+  elif [[ "$scoped" == 1 ]]; then
+    if grep -q '[^[:space:]]' "$f" 2>/dev/null; then
+      printf '%s' " — the question was DELIVERED (the scoped reply window opened, which needs its marker in the pane) but the seat never emitted the reply fence; it may have ignored or reformatted the [reply-format] instruction (a seat that does not fence: retry with --allow-unfenced)"
+    else
+      printf '%s' " — delivery is not observable on the scoped path: the reply window starts after the question's marker, so an empty window cannot tell an undelivered question from one that scrolled off or was never answered. The send's own receipt said delivered (audit row 'agent _deliver' msg_id=${mid}); an answer sent back with 'agent send' reaches your session when your spool drains, not here. A seat that does not fence: retry with --allow-unfenced"
+    fi
   elif grep -qF "id=${mid}" "$f" 2>/dev/null; then
     printf '%s' " — the question was DELIVERED (marker seen in the pane) but the seat never emitted the reply fence; it may have ignored or reformatted the [reply-format] instruction"
-  else
+  elif [[ "$warned" == 1 ]]; then
     printf '%s' " — the question marker was never seen in the pane at all, so this is a DELIVERY failure, not a capture one (check the submit race / input-prompt warning above)"
+  else
+    printf '%s' " — the question marker was never seen in the pane at all, so this is a DELIVERY failure, not a capture one (no input-prompt warning was printed, so suspect the submit race; check the seat is up and at a prompt)"
   fi
 }
 
@@ -2547,7 +2575,13 @@ cmd_deliver() {
     # as an unconfirmed submit (see cmd_send) plus the additive queued:true.
     _delivered=0
     _queued=1
-    _reason="$(_a2a_queued_reason "$(_a2a_queue_depth "$target")")"
+    local _depth; _depth="$(_a2a_queue_depth "$target")"; _depth="${_depth//[^0-9]/}"
+    _reason="$(_a2a_queued_reason "$_depth")"
+    # DIVE-6414: the audit row said `result=ok code=0` for a spooled message
+    # exactly as for a typed one, so a reader of agent-audit.log took "queued"
+    # for "delivered" (measured on a box 2026-10-17). The rc stays 0 — the
+    # receipt is honest and callers depend on it — so the row carries the fact.
+    AUDIT_ARGS+=("queued=1" "spool_depth=${_depth:-0}")
   elif (( _rc != 0 )); then
     _delivered=0
     _reason="$(_agent_submit_unconfirmed_reason "$target" "$_rc")"
@@ -3471,7 +3505,9 @@ cmd_send() {
     # the two apart, and it is additive.
     _sent=0
     _queued=1
-    _reason="$(_a2a_queued_reason "$(_a2a_queue_depth "$name")")"
+    local _depth; _depth="$(_a2a_queue_depth "$name")"; _depth="${_depth//[^0-9]/}"
+    _reason="$(_a2a_queued_reason "$_depth")"
+    AUDIT_ARGS+=("queued=1" "spool_depth=${_depth:-0}")   # DIVE-6414, as in cmd_deliver
   elif (( _rc != 0 )); then
     _sent=0
     _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")"
@@ -3743,7 +3779,7 @@ cmd_ask() {
   # transcript gets rebuilt frame by frame because an alternate-screen pane has
   # no scrollback to read back. Both live in a per-ask temp dir so concurrent
   # asks — a convene dispatches ballots in parallel — cannot share state.
-  local ask_tmp baseline_file acc_file msg_file
+  local ask_tmp baseline_file acc_file msg_file ready_warned=0
   ask_tmp="$(mktemp -d)" || fail "$E_GENERIC" "ask: could not create a work dir"
   # shellcheck disable=SC2064
   trap "rm -rf '$ask_tmp'" RETURN
@@ -3795,7 +3831,15 @@ cmd_ask() {
     if [[ "$(jq -r '.data.delivered' <<<"$_dout")" == false ]]; then
       local _reason; _reason=$(jq -r '.data.reason // empty' <<<"$_dout")
       [[ -n "$_reason" ]] || _reason="$(_agent_submit_unconfirmed_reason "$name")"
-      _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
+      # DIVE-6414: a scoped question can be SPOOLED (the direct path interrupts;
+      # `_deliver` cannot tell an ask from a send). Say queued, on the receipt
+      # and the audit row, rather than the generic "unconfirmed".
+      if [[ "$(jq -r '.data.queued // false' <<<"$_dout")" == true ]]; then
+        AUDIT_ARGS+=("queued=1")
+        _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason" 1
+      else
+        _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
+      fi
       return 0
     fi
   else
@@ -3826,6 +3870,7 @@ cmd_ask() {
     # so a freshly-(re)started target doesn't silently drop the question.
     if ! _agent_delivery_inbox "$name" >/dev/null 2>&1 && ! wait_agent_input_ready "$name"; then
       step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
+      ready_warned=1
     fi
     local _rc=0
     # DIVE-4214: `ask` is member 2 of the enumerated interrupting class. It is a
@@ -3939,7 +3984,7 @@ cmd_ask() {
       # with no marker at all (seat ignored the format, or never got the message),
       # and the two need different fixes. Guessing between them cost a round trip.
       local diag
-      diag=$(_ask_timeout_diag "$msg_id" "$acc_file")
+      diag=$(_ask_timeout_diag "$msg_id" "$acc_file" "$use_scoped" "$ready_warned")
       if [[ -n "${FIVE_ASK_DEBUG_DIR:-}" ]] && mkdir -p "$FIVE_ASK_DEBUG_DIR" 2>/dev/null; then
         cp -f "$baseline_file" "${FIVE_ASK_DEBUG_DIR}/${msg_id}.baseline" 2>/dev/null || true
         cp -f "$acc_file"      "${FIVE_ASK_DEBUG_DIR}/${msg_id}.transcript" 2>/dev/null || true
