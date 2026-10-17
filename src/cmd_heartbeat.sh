@@ -5203,6 +5203,12 @@ _hb_nudge_text() { # <agent> <task_id> <task_ident>
       && _hb_read="you are GRADING it: run '5dive task grade-context ${task_ident}' and grade from that bounded packet (acceptance criteria, the delivery's claim block, the diff at the delivered sha, the checks to re-run) — do not '5dive task show ${task_ident}' unless the packet says a field is missing"
   fi
   local nudge="/goal ${task_ident} — your only row this turn; ${_hb_read}. TERMINAL, then stop: DONE — '5dive task done ${task_ident} --result=\"<1-2 self-contained sentences; the creator and the dashboard read this field>\"' (on a row that carries a verifier the same verb DELIVERS instead, and delivered is terminal for you); GATED — '5dive task need ${task_ident} --type=decision|approval|secret|manual --ask=\"<one crisp question>\"' if it needs a human (decision: --options=\"<first choice>|<second choice>\"; decision/approval: --recommend=\"<answer>\"; secret: --secret-key=<KEY> --connector=tools); CANCELLED — '5dive task cancel ${task_ident} --result=\"<why>\"' only if the row is genuinely impossible. Self-audit before you close. The rest of the contract (gate vs cancel, the ask's shape, single-row scope, maker/verifier separation, the knowledge clause) is in /home/claude/projects/CLAUDE.md under \"Task lifecycle\" — read it ONCE per session, it is not repeated here. Stop after ${_hb_turns} turns."
+  # DIVE-6433: the gate's chrome follows the owner's language (_gate_t), but the
+  # ask and options are this agent's own words. On a box whose owner writes in
+  # Russian, say so here, where the agent reads the gate verb, rather than
+  # machine-translating the ask at send time. An English owner adds nothing.
+  declare -F _seat_owner_lang >/dev/null 2>&1 && [[ "$(_seat_owner_lang "$name")" == ru ]] \
+    && nudge+=" Your owner reads Russian: write a gate's --ask and --options in Russian (the gate's header and buttons are translated for you)."
 
   # DIVE-2063: a task carrying a maker→verifier loop can NEVER reach any of the
   # three terminal states above by the MAKER's own hand. A correct 'task done'
@@ -6405,16 +6411,16 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
     fi
   fi
 
-  local text="🔁 Gate reminder — unanswered gates (${route_label}):"
+  local text; text=$(_gate_t renag_head "$route_label")
   [[ -n "$_escalated_from" ]] \
-    && text+=$'\n'"↑ filed by ${_escalated_from} (no channel of its own) — escalated to you"
+    && text+=$'\n'"$(_gate_t escalated "$_escalated_from")"
   local rows='[]' row id ident ntype options recommend gtier ask nonce="" markup="" _mint_n=0 _dlink=""
   local -a nonce_ids=() nonce_hashes=()
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     IFS=$'\x1f' read -r id ident ntype options recommend gtier ask <<<"$row"
     [[ -n "$id" && -n "$ident" ]] || continue
-    text+=$'\n\n'"• [${ident}] ${ntype} — ${ask} /task_${id}"
+    text+=$'\n\n'"• [${ident}] $(_gate_t type "$ntype") — ${ask} /task_${id}"
     # DIVE-4381 iteration 2: the THIRD human-facing gate composer, and the one
     # that best matches this row's motivation — the re-nag is the message a
     # founder reads when a gate has SAT for an hour or a day, which is exactly
@@ -6428,8 +6434,8 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
     # bullet, not to the batch. Appends nothing when the row carries no URL.
     _dlink=$(_task_gate_delivery_link_line "$id")
     [[ -n "$_dlink" ]] && text+=$'\n'"  ${_dlink}"
-    [[ -n "$recommend" ]] && text+=$'\n'"  ✅ Recommended: ${recommend}"
-    [[ -n "$options" ]] && text+=$'\n'"  Options: ${options}"
+    [[ -n "$recommend" ]] && text+=$'\n'"  $(_gate_t rec "$recommend")"
+    [[ -n "$options" ]] && text+=$'\n'"  $(_gate_t opts_inline "$options")"
 
     # DIVE-2356: hard-human TYPE **or** tier>=2 (matches the cmd_task_need mint).
     # This sweep is the rescue path for gates filed BEFORE the widened mint — a
@@ -6456,7 +6462,7 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
 
   local reply_markup=""
   [[ "$rows" != "[]" ]] && reply_markup=$(jq -cn --argjson rows "$rows" '{inline_keyboard:$rows}' 2>/dev/null) || true
-  text+=$'\n\n'"Tap a button, open /task links, or answer from the dashboard. First reminder is after 1h; later reminders are batched every 24h until answered."
+  text+=$'\n\n'"$(_gate_t renag_foot)"
   # DIVE-2073: mark the rail so the delivery row can say which path it is on.
   # This sweep runs as root from cron with no invoking user, so `user` on the row
   # is root and names no agent; without this every :NN:02 delivery is

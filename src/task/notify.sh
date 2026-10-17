@@ -1780,9 +1780,7 @@ _task_drop_link_log() {
 # carries no link. The dashboard's task card and the Telegram Mini App both open
 # a one-time page served by THIS box, so the value never passes through 5dive or
 # a chat. This chat is the one place it must not go: said in the same line.
-_task_secret_gate_app_line() {
-  printf '%s' "Open this task in the 5dive app (its card on 5dive.ai/dashboard/tasks, or My team in the 5dive app on Telegram) and tap Open secure link. You paste it on a page served by this server, never through 5dive or this chat. Never paste it here."
-}
+# (DIVE-6433: the line now lives in _gate_t's `secret_app`, in both languages.)
 
 # _task_secret_gate_app_button <access_file> — DIVE-5370. A seat that cannot
 # mint a drop link (a standard seat) sends its owner to the Mini App, whose Team
@@ -1804,23 +1802,23 @@ _task_secret_gate_app_button() {
   [[ "$(jq -r '.data.status // empty' <<<"$out" 2>/dev/null)" == ready ]] || return 0
   url=$(jq -r '.data.url // empty' <<<"$out" 2>/dev/null)
   [[ "$url" =~ ^https://t\.me/[A-Za-z0-9_]+\?startapp=link_[A-Za-z0-9_-]+$ ]] || return 0
-  jq -nc --arg u "$url" '{text: "🔑 Open secure link", url: $u}'
+  jq -nc --arg u "$url" --arg t "$(_gate_t secret_button)" '{text: $t, url: $u}'
 }
 
 # The terminal path, for a box no owner's browser can reach: asks, hidden input.
 _task_secret_gate_box_line() {
-  printf '%s' "On the box instead: sudo 5dive secret write $1 --connector=$2 --task=$3 (it asks for the value, hidden)."
+  _gate_t secret_box "$1" "$2" "$3"
 }
 
 _task_secret_gate_cta() {
   local ident="$1" numid="$2" secret_key="$3" connector="$4" _drop="$5"
   if [[ -n "$_drop" && "$_drop" != "ONBOX" ]]; then
     local _url="${_drop%%|*}" _ttl="${_drop##*|}"
-    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. Open this one-time link and paste it there (single use, expires in ${_ttl}m):"$'\n'"${_url}"$'\n'"It goes straight to this server, never through 5dive or this chat. Never paste it here. Link expired? The task's card in the 5dive app makes a fresh one. $(_task_secret_gate_box_line "$secret_key" "$connector" "$ident")"
+    printf '%s' "$(_gate_t secret_link "$ident" "$secret_key" "$_ttl" "$_url") $(_task_secret_gate_box_line "$secret_key" "$connector" "$ident")"
   elif [[ -n "$secret_key" && -n "$connector" ]]; then
     # Target named, no link minted here (a standard seat cannot mint one, or
     # this box has no reachable name): the app's card mints it, the box takes it.
-    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. $(_task_secret_gate_app_line)"$'\n'"$(_task_secret_gate_box_line "$secret_key" "$connector" "$ident")"$'\n'"Either one writes it and clears this gate. Or tap ✅ Provided once it is done."
+    printf '%s' "$(_gate_t secret_app "$ident" "$secret_key")"$'\n'"$(_task_secret_gate_box_line "$secret_key" "$connector" "$ident")"$'\n'"$(_gate_t secret_either)"
   else
     local _oob; _oob=$(db "SELECT COALESCE(secret_oob,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
     if [[ -n "$_oob" ]]; then
@@ -1933,8 +1931,8 @@ _task_gate_reply_cta() { # <ident> <need_type> <options> <recommend> <has_tap>
   # copied reply carries exactly `<ident> <value>`. Attestation mechanics belong
   # to the RECORD, not the chat; the 3600s reply ceiling is unchanged and still
   # graded by tests/gate_reply_to_clear_unit.sh R4.
-  _out="🔐 High-stakes — if the button fails, reply:"$'\n'"    ${_id} ${_ex}"
-  [[ -n "$_alt" ]] && _out+=$'\n'"(or:  ${_id} ${_alt})"
+  _out="$(_gate_t hs_reply)"$'\n'"    ${_id} ${_ex}"
+  [[ -n "$_alt" ]] && _out+=$'\n'"$(_gate_t hs_or "${_id} ${_alt}")"
   printf '%s' "$_out"
 }
 
@@ -2018,7 +2016,7 @@ _task_gate_delivery_link_line() { # <row_id> -> "🔗 Review: <url>" or nothing
   # all-whitespace ref is still nothing.
   _ref="${_ref#"${_ref%%[![:space:]]*}"}"; _ref="${_ref%"${_ref##*[![:space:]]}"}"
   case "$_ref" in
-    https://*|http://*) printf '%s' "🔗 Review: ${_ref}" ;;
+    https://*|http://*) _gate_t review "$_ref" ;;
     *) return 0 ;;
   esac
 }
@@ -2050,14 +2048,134 @@ _task_gate_quote_block() { # <row_id> -> the block (no leading newline) or nothi
   while [[ "$q" == *$'\n' ]]; do q="${q%$'\n'}"; done
   [[ -n "${q//[[:space:]]/}" ]] || return 0
   if (( ${#q} > _TASK_GATE_QUOTE_MAX )); then
-    printf '%s' "📝 The text to approve is ${#q} characters, too long for this message. Open the link below and read it whole before answering."
+    _gate_t quote_long "${#q}"
     return 0
   fi
-  out="📝 You are approving this text:"
+  out="$(_gate_t quote_head)"
   while IFS= read -r line || [[ -n "$line" ]]; do
     out+=$'\n'"│ ${line}"
   done <<<"$q"
   printf '%s' "$out"
+}
+
+# DIVE-6433: THE GATE SPEAKS THE OWNER'S LANGUAGE.
+#
+# lodar, 2026-10-17: a partner's owners mostly write in Russian, and every human gate
+# reached them in English. The language comes from a source that already exists:
+# the `lite-lang` file the telegram plugin writes beside the channel's
+# access.json on every inbound message (DIVE-5306), from the sender's Telegram
+# language_code. So the precedence is: that channel's lite-lang, else English.
+# A box whose owner writes from an English Telegram never has `ru` in that file,
+# so every 5dive-owned box renders byte-identically to before.
+#
+# Only the CHROME is translated: the header, the Recommended line, the buttons,
+# the CTAs. callback_data, `--value`s and command lines stay English, so a tap on
+# a Russian button answers the gate exactly as the English one does. The ask and
+# options are the filing agent's words; the dispatch tells it which language to
+# write them in (_seat_owner_lang in cmd_heartbeat.sh, `task need`'s warning).
+_gate_lang_of_dir() { # <channel state dir> -> ru|en
+  local v=""
+  [[ -n "${1:-}" && -r "$1/lite-lang" ]] && v=$(head -c 16 "$1/lite-lang" 2>/dev/null)
+  case "${v,,}" in ru*) printf ru ;; *) printf en ;; esac
+}
+# The language of the channel this send resolved (TASK_CH_ACCESS), else en.
+_task_gate_lang() {
+  [[ -n "${TASK_CH_ACCESS:-}" ]] || { printf en; return 0; }
+  _gate_lang_of_dir "$(dirname "$TASK_CH_ACCESS")"
+}
+# The language of <seat>'s paired owner, by name (no TASK_CH_* side effects).
+_seat_owner_lang() { # <seat>
+  local t d
+  [[ -n "${1:-}" ]] || { printf en; return 0; }
+  for t in claude codex grok antigravity; do
+    d=$(_tg_access_state_dir "agent-${1}" "$t" 2>/dev/null) || continue
+    [[ -r "${d}/access.json" ]] && { _gate_lang_of_dir "$d"; return 0; }
+  done
+  printf en
+}
+# Does <text> carry any Cyrillic? UTF-8 Cyrillic (U+0400–U+04FF) always leads
+# with byte 0xD0 or 0xD1; a byte test needs no installed locale.
+_text_has_cyrillic() { # <text>
+  local LC_ALL=C
+  [[ "${1:-}" == *[$'\xd0\xd1']* ]]
+}
+# <key> [args…] -> the string in the resolved channel's language. The `en` arm of
+# every key is the literal this file printed before DIVE-6433.
+_gate_t() {
+  local k="$1"; shift
+  if [[ "$(_task_gate_lang)" == ru ]]; then
+    case "$k" in
+      head)          printf '%s' "🙋 [$1] ждёт вашего ответа" ;;
+      ratify_head)   printf '%s' "↩︎ [$1] просит ПОДТВЕРДИТЬ УЖЕ СДЕЛАННОЕ ДЕЙСТВИЕ" ;;
+      ratify_body)   printf '%s' "Это подтверждение задним числом, а не разрешение заранее: действие уже выполнено. «Подтвердить» записывает, что вы одобрили его после факта; «Не разрешал» записывает, что нет." ;;
+      escalated)     printf '%s' "↑ вопрос от агента $1 (у него нет своего канала) — переслан вам" ;;
+      rec)           local r="$1"
+                     case "${r,,}" in approve|approved) r="одобрить" ;; deny|denied) r="отклонить" ;; esac
+                     printf '%s' "✅ Рекомендую: ${r}" ;;
+      expires)       printf '%s' "⏳ Срок до $1Z. После него ответ считается «не одобрено», и кнопки перестают работать." ;;
+      opts_head)     printf '%s' "Варианты:" ;;
+      opts_inline)   printf '%s' "Варианты: $1" ;;
+      manual_cta)    printf '%s' "✋ Когда сделаете, нажмите ✅ Готово ниже, и вопрос закроется. Или на сервере: sudo 5dive task answer $1 --value=done" ;;
+      access_cta)    printf '%s' "🔓 Это запрос доступа, который пришёл напрямую вам. Ответьте на сервере: sudo 5dive task answer $1 --value=\"granted\" (или denied)" ;;
+      onbox_decision) printf '%s' "Ответ на сервере: sudo 5dive task answer $1 --value=\"<вариант>\"" ;;
+      onbox_approval) printf '%s' "Ответ на сервере: sudo 5dive task answer $1 --value=approved (или denied)" ;;
+      hs_reply)      printf '%s' "🔐 Важный вопрос. Если кнопка не сработает, ответьте:" ;;
+      hs_or)         printf '%s' "(или:  $1)" ;;
+      review)        printf '%s' "🔗 Посмотреть: $1" ;;
+      quote_long)    printf '%s' "📝 Текст на одобрение длиной $1 символов не помещается в сообщение. Откройте ссылку ниже и прочитайте его целиком, прежде чем отвечать." ;;
+      quote_head)    printf '%s' "📝 Вы одобряете этот текст:" ;;
+      approve)       printf '%s' "✅ Одобрить" ;;
+      deny)          printf '%s' "🚫 Отклонить" ;;
+      confirm_after) printf '%s' "✅ Подтвердить (уже сделано)" ;;
+      not_auth)      printf '%s' "🚫 Не разрешал" ;;
+      provided)      printf '%s' "✅ Передал" ;;
+      done)          printf '%s' "✅ Готово" ;;
+      type)          case "$1" in decision) printf 'решение' ;; approval) printf 'одобрение' ;; secret) printf 'ключ' ;; manual) printf 'действие' ;; access) printf 'доступ' ;; *) printf '%s' "$1" ;; esac ;;
+      renag_head)    printf '%s' "🔁 Напоминание: вопросы без ответа ($1):" ;;
+      renag_foot)    printf '%s' "Нажмите кнопку, откройте ссылку /task или ответьте в панели управления. Первое напоминание приходит через час, дальше раз в сутки, пока вы не ответите." ;;
+      secret_link)   printf '%s' "🔑 [$1] нужен ключ $2. Откройте эту одноразовую ссылку и вставьте его там (один раз, ссылка действует $3 мин):"$'\n'"$4"$'\n'"Ключ попадёт прямо на этот сервер, не через 5dive и не через этот чат. Не вставляйте его сюда. Ссылка истекла? Карточка задачи в приложении 5dive создаст новую." ;;
+      secret_app)    printf '%s' "🔑 [$1] нужен ключ $2. Откройте эту задачу в приложении 5dive (карточка на 5dive.ai/dashboard/tasks или «Моя команда» в приложении 5dive в Telegram) и нажмите «Открыть защищённую ссылку». Ключ вставляется на странице этого сервера, не через 5dive и не через этот чат. Не вставляйте его сюда." ;;
+      secret_box)    printf '%s' "Или на сервере: sudo 5dive secret write $1 --connector=$2 --task=$3 (значение спросит скрыто)." ;;
+      secret_either) printf '%s' "Любой из способов запишет ключ и закроет вопрос. Или нажмите ✅ Передал, когда всё сделано." ;;
+      secret_button) printf '%s' "🔑 Открыть защищённую ссылку" ;;
+      *)             return 1 ;;
+    esac
+    return 0
+  fi
+  case "$k" in
+    head)          printf '%s' "🙋 [$1] needs you" ;;
+    ratify_head)   printf '%s' "↩︎ [$1] needs you to CONFIRM AN ACTION ALREADY TAKEN" ;;
+    ratify_body)   printf '%s' "This is a RATIFICATION, not a prior approval — the action has already happened. Confirming records that you signed it off after the fact; denying records that you did not." ;;
+    escalated)     printf '%s' "↑ filed by $1 (no channel of its own) — escalated to you" ;;
+    rec)           printf '%s' "✅ Recommended: $1" ;;
+    expires)       printf '%s' "⏳ Expires $1Z — after that this is resolved as NOT approved and tapping does nothing (DIVE-4833)." ;;
+    opts_head)     printf '%s' "Options:" ;;
+    opts_inline)   printf '%s' "Options: $1" ;;
+    manual_cta)    printf '%s' "✋ Tap ✅ Done below once it is handled, which closes this out. Or on the box: sudo 5dive task answer $1 --value=done" ;;
+    access_cta)    printf '%s' "🔓 This is a grant request that reached you directly (human-territory, or no lead available). Clear it on the box: sudo 5dive task answer $1 --value=\"granted\" (or denied)" ;;
+    onbox_decision) printf '%s' "Answer on the box: sudo 5dive task answer $1 --value=\"<option>\"" ;;
+    onbox_approval) printf '%s' "Answer on the box: sudo 5dive task answer $1 --value=approved (or denied)" ;;
+    hs_reply)      printf '%s' "🔐 High-stakes — if the button fails, reply:" ;;
+    hs_or)         printf '%s' "(or:  $1)" ;;
+    review)        printf '%s' "🔗 Review: $1" ;;
+    quote_long)    printf '%s' "📝 The text to approve is $1 characters, too long for this message. Open the link below and read it whole before answering." ;;
+    quote_head)    printf '%s' "📝 You are approving this text:" ;;
+    approve)       printf '%s' "✅ Approve" ;;
+    deny)          printf '%s' "🚫 Deny" ;;
+    confirm_after) printf '%s' "✅ Confirm (after the fact)" ;;
+    not_auth)      printf '%s' "🚫 Not authorised" ;;
+    provided)      printf '%s' "✅ Provided" ;;
+    done)          printf '%s' "✅ Done" ;;
+    type)          printf '%s' "$1" ;;
+    renag_head)    printf '%s' "🔁 Gate reminder — unanswered gates ($1):" ;;
+    renag_foot)    printf '%s' "Tap a button, open /task links, or answer from the dashboard. First reminder is after 1h; later reminders are batched every 24h until answered." ;;
+    secret_link)   printf '%s' "🔑 [$1] needs the $2 credential. Open this one-time link and paste it there (single use, expires in $3m):"$'\n'"$4"$'\n'"It goes straight to this server, never through 5dive or this chat. Never paste it here. Link expired? The task's card in the 5dive app makes a fresh one." ;;
+    secret_app)    printf '%s' "🔑 [$1] needs the $2 credential. Open this task in the 5dive app (its card on 5dive.ai/dashboard/tasks, or My team in the 5dive app on Telegram) and tap Open secure link. You paste it on a page served by this server, never through 5dive or this chat. Never paste it here." ;;
+    secret_box)    printf '%s' "On the box instead: sudo 5dive secret write $1 --connector=$2 --task=$3 (it asks for the value, hidden)." ;;
+    secret_either) printf '%s' "Either one writes it and clears this gate. Or tap ✅ Provided once it is done." ;;
+    secret_button) printf '%s' "🔑 Open secure link" ;;
+    *)             return 1 ;;
+  esac
 }
 
 # DIVE-4412: append to BOTH variants of the gate message — the one that rides the
@@ -2110,8 +2228,9 @@ _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <cha
       # out. Only the LABELS change; callback_data stays byte-identical
       # (tna:<id>:approved|denied), so every shipped plugin handler is untouched.
       local _bm; _bm=$(db "SELECT COALESCE(gate_mode,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
-      local _yes="✅ Approve" _no="🚫 Deny"
-      if [[ "$_bm" == "confirm-after-send" ]]; then _yes="✅ Confirm (after the fact)"; _no="🚫 Not authorised"; fi
+      local _yes _no
+      _yes=$(_gate_t approve); _no=$(_gate_t deny)
+      if [[ "$_bm" == "confirm-after-send" ]]; then _yes=$(_gate_t confirm_after); _no=$(_gate_t not_auth); fi
       local appr='{"text":"'"${label}${_yes}"'","callback_data":"tna:'"${numid}"':approved'"${np}"'"}'
       local deny='{"text":"'"${label}${_no}"'","callback_data":"tna:'"${numid}"':denied'"${np}"'"}'
       case "$rl" in
@@ -2144,12 +2263,12 @@ _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <cha
       _sk_row=$(db "SELECT COALESCE(secret_key,'')||COALESCE(connector,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
       _oob_row=$(db "SELECT COALESCE(secret_oob,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
       if [[ -n "$_sk_row" || -n "$_oob_row" ]]; then
-        reply_markup='{"inline_keyboard":[[{"text":"'"${label}"'✅ Provided","callback_data":"tna:'"${numid}"':provided'"${np}"'"}]]}'
+        reply_markup='{"inline_keyboard":[[{"text":"'"${label}$(_gate_t provided)"'","callback_data":"tna:'"${numid}"':provided'"${np}"'"}]]}'
       else
         reply_markup=""
       fi
     elif [[ "$need_type" == "manual" ]]; then
-      reply_markup='{"inline_keyboard":[[{"text":"'"${label}"'✅ Done","callback_data":"tna:'"${numid}"':done'"${np}"'"}]]}'
+      reply_markup='{"inline_keyboard":[[{"text":"'"${label}$(_gate_t done)"'","callback_data":"tna:'"${numid}"':done'"${np}"'"}]]}'
     fi
   fi
   printf '%s' "$reply_markup"
@@ -3082,16 +3201,16 @@ _task_need_notify_deliver_now() {
   # every line the renderer suppresses BECAUSE a keyboard was computed. The two
   # are byte-identical whenever no keyboard was computed in the first place.
   local text="" text_plain=""
-  _task_gate_text_both "🙋 [${ident}] needs you"
+  _task_gate_text_both "$(_gate_t head "$ident")"
   if [[ "$_gmode" == "confirm-after-send" ]]; then
-    text="↩︎ [${ident}] needs you to CONFIRM AN ACTION ALREADY TAKEN"; text_plain="$text"
-    _task_gate_text_both $'\n'"This is a RATIFICATION, not a prior approval — the action has already happened. Confirming records that you signed it off after the fact; denying records that you did not."
+    text="$(_gate_t ratify_head "$ident")"; text_plain="$text"
+    _task_gate_text_both $'\n'"$(_gate_t ratify_body)"
   fi
   # DIVE-1927: when the ask was escalated off an unpaired filer, NAME the filer.
   # The recipient's bot is not the asker's bot, so without this the alert reads as
   # the manager's own gate and there is no way to tell whose ask it is.
   [[ -n "${TASK_NOTIFY_ESCALATED_FROM:-}" ]] \
-    && _task_gate_text_both $'\n'"↑ filed by ${TASK_NOTIFY_ESCALATED_FROM} (no channel of its own) — escalated to you"
+    && _task_gate_text_both $'\n'"$(_gate_t escalated "$TASK_NOTIFY_ESCALATED_FROM")"
   # DIVE-3661 iteration 3: print the line ONLY when the recommendation is not
   # already readable off a button. A DECISION gate's ⭐ first button carries the
   # recommended value verbatim (the line was the same words twice, one apart);
@@ -3103,7 +3222,7 @@ _task_need_notify_deliver_now() {
   # is not the same fact as the markup the human RECEIVED. The plain variant
   # therefore always carries the line — on that path no button says it.
   if [[ -n "$recommend" ]]; then
-    local _rec_block=$'\n\n'"✅ Recommended: ${recommend}"
+    local _rec_block=$'\n\n'"$(_gate_t rec "$recommend")"
     # OSS-11 (DIVE-976): cite the precedent that sourced the recommendation so the
     # human sees WHY this choice is advised and can catch a wrong recall. Rides
     # the Recommended line: a ⭐ button carries the choice, but a citation line
@@ -3138,7 +3257,7 @@ _task_need_notify_deliver_now() {
   # exactly as it did before.
   local _gexp; _gexp=$(db "SELECT COALESCE(need_expires_at,'') FROM tasks WHERE id=${numid};" 2>/dev/null || printf '')
   [[ -n "$_gexp" ]] \
-    && _task_gate_text_both $'\n'"⏳ Expires ${_gexp}Z — after that this is resolved as NOT approved and tapping does nothing (DIVE-4833)."
+    && _task_gate_text_both $'\n'"$(_gate_t expires "$_gexp")"
 
   # DIVE-4381: the bound PR, right under the ask and above the type CTA — the
   # human reads "what am I deciding", then "here is the thing to look at", then
@@ -3193,13 +3312,13 @@ _task_need_notify_deliver_now() {
         fi
       fi
       ;;
-    manual) _task_gate_text_both $'\n\n'"✋ Tap ✅ Done below once it is handled, which closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
+    manual) _task_gate_text_both $'\n\n'"$(_gate_t manual_cta "$ident")" ;;
     # DIVE-1243: an `access` gate normally clears via the org lead; it only reaches
     # a human when it's genuinely human-territory (money/secrets/destructive) or no
     # lead was available. No tap button (the plugin `tna:` handler has no access
     # resolution — see the DIVE-118 no-dead-taps allowlist below); give the on-box
     # CLI line instead.
-    access) _task_gate_text_both $'\n\n'"🔓 This is a grant request that reached you directly (human-territory, or no lead available). Clear it on the box: sudo 5dive task answer ${ident} --value=\"granted\" (or denied)" ;;
+    access) _task_gate_text_both $'\n\n'"$(_gate_t access_cta "$ident")" ;;
   esac
 
   # DIVE-117/118 tap-to-answer buttons. GATED to the plugin types whose `tna:`
@@ -3242,7 +3361,7 @@ _task_need_notify_deliver_now() {
       | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
       | to_entries | map("  \(.key + 1). \(.value)\(if .value == $rr and ($rr|length)>0 then " ⭐" else "" end)") | join("\n")' 2>/dev/null) || opts_list=""
     if [[ -n "$opts_list" ]]; then
-      local _opts_block=$'\n\n'"Options:"$'\n'"${opts_list}"
+      local _opts_block=$'\n\n'"$(_gate_t opts_head)"$'\n'"${opts_list}"
       text_plain+="$_opts_block"
       [[ -z "$reply_markup" ]] && text+="$_opts_block"
     fi
@@ -3282,8 +3401,8 @@ _task_need_notify_deliver_now() {
   # always carries the on-box line — that is the whole point of the fallback.
   local _onbox=""
   case "$need_type" in
-    decision) _onbox=$'\n\n'"Answer on the box: sudo 5dive task answer ${ident} --value=\"<option>\"" ;;
-    approval) _onbox=$'\n\n'"Answer on the box: sudo 5dive task answer ${ident} --value=approved (or denied)" ;;
+    decision) _onbox=$'\n\n'"$(_gate_t onbox_decision "$ident")" ;;
+    approval) _onbox=$'\n\n'"$(_gate_t onbox_approval "$ident")" ;;
   esac
   if [[ -n "$_onbox" ]]; then
     text_plain+="$_onbox"

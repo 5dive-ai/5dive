@@ -641,12 +641,12 @@ _task_inbox_send() {
     # Options line prints only when NO keyboard landed, because with buttons it
     # was a verbatim duplicate of what the human can already see and tap.
     _hs=""; _task_gate_high_stakes "$id" && _hs=1
-    gate_text="$([[ -n "$_hs" ]] && printf '🔐' || printf '🗂') [${ident}] ${ntype} — $(_task_gate_ask_line "$ask") /task_${id}"
+    gate_text="$([[ -n "$_hs" ]] && printf '🔐' || printf '🗂') [${ident}] $(_gate_t type "$ntype") — $(_task_gate_ask_line "$ask") /task_${id}"
     # DIVE-5465: the re-send carries the same quoted text as the first delivery,
     # in the same place (under the ask, before /task_<n>). A gate that has SAT is
     # the one most likely to be answered from this message, not the first.
     local _gq; _gq=$(_task_gate_quote_block "$id")
-    [[ -n "$_gq" ]] && gate_text="$([[ -n "$_hs" ]] && printf '🔐' || printf '🗂') [${ident}] ${ntype} — $(_task_gate_ask_line "$ask")"$'\n\n'"${_gq}"$'\n'"/task_${id}"
+    [[ -n "$_gq" ]] && gate_text="$([[ -n "$_hs" ]] && printf '🔐' || printf '🗂') [${ident}] $(_gate_t type "$ntype") — $(_task_gate_ask_line "$ask")"$'\n\n'"${_gq}"$'\n'"/task_${id}"
     # DIVE-4412: the keyboard-less variant, composed alongside. _mirror_post
     # falls back to a text-only re-send when the Bot API rejects the keyboard,
     # and the two suppressions below are keyed on the markup this loop COMPUTED
@@ -679,12 +679,13 @@ _task_inbox_send() {
     local _dl; _dl=$(_task_gate_delivery_link_line "$id")
     [[ -n "$_dl" ]] && { gate_text+=$'\n'"$_dl"; gate_text_plain+=$'\n'"$_dl"; }
     if [[ -n "$recommend" ]]; then
-      gate_text_plain+=$'\n'"✅ Recommended: ${recommend}"
-      [[ "$markup" != *"$recommend"* ]] && gate_text+=$'\n'"✅ Recommended: ${recommend}"
+      local _rl; _rl=$(_gate_t rec "$recommend")
+      gate_text_plain+=$'\n'"$_rl"
+      [[ "$markup" != *"$recommend"* ]] && gate_text+=$'\n'"$_rl"
     fi
     if [[ -n "$options" ]]; then
-      gate_text_plain+=$'\n'"Options: ${options}"
-      [[ -z "$markup" ]] && gate_text+=$'\n'"Options: ${options}"
+      gate_text_plain+=$'\n'"$(_gate_t opts_inline "$options")"
+      [[ -z "$markup" ]] && gate_text+=$'\n'"$(_gate_t opts_inline "$options")"
     fi
     # DIVE-2818: the high-stakes reply-to-clear prompt reaches the BATCH re-send
     # too. DIVE-1490's rule applies unchanged — the initial alert and every re-nag
