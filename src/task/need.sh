@@ -2583,6 +2583,16 @@ cmd_task_need() {
       && warn "the ask overflows the gate message's ~15-word budget and will render cut: \"${_ask_render}\" — lead with the decision in one short sentence; detail belongs in the task body."
   fi
 
+  # DIVE-6433: the gate's header and buttons follow the owner's language, but the
+  # ask and options are the filer's words. On a box whose owner writes in Russian
+  # an ask with no Cyrillic at all lands as one English sentence inside a Russian
+  # message. Warn, never refuse, for the DIVE-3661 reason above.
+  if type _seat_owner_lang >/dev/null 2>&1 \
+     && ! _text_has_cyrillic "${ask}${options}" \
+     && [[ "$(_seat_owner_lang "$(actor_routing_agent 2>/dev/null)")" == ru ]]; then
+    warn "your owner reads Russian and this ask has no Russian in it: the gate's header and buttons will be Russian, your ask and options English. Write --ask and --options in Russian."
+  fi
+
   # DIVE-2089: --discusses is a DECISION-only appeal. approval / manual / secret /
   # access declare an ACTION by construction, so "I'm only discussing it" is not a
   # coherent claim on them — refuse rather than accept-and-ignore, so a filer can
