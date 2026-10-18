@@ -664,6 +664,42 @@ _COMPOSE_KICKOFF_IMPORT_REASON="team import is still bringing the team up"
 
 _compose_kickoff_marker() { printf 'team kickoff: %s (5dive.yaml)' "$1"; }
 
+# DIVE-6484: the kickoff is the first thing a new team shows its OWNER (the app's
+# Tasks tab), so its title is in the owner's language and written to them. The
+# body stays the lead's English instructions, plus which language to write in.
+# Every lookup keys on the marker above, never the title, so a kickoff filed in
+# one language is still found by a re-run in another.
+#
+# lodar, 2026-10-18: "we ship a team on oinoa with initial task ? but its in
+# English even if user speaks Russian". Order: --lang, the template's lang
+# (top-level or team.lang), the lead's paired channel, then English.
+_compose_kickoff_lang_norm() { # <value> -> ru|en|zh, or nothing
+  case "${1,,}" in
+    ru|ru[-_]*) printf ru ;;
+    en|en[-_]*) printf en ;;
+    zh|zh[-_]*) printf zh ;;
+  esac
+}
+_compose_kickoff_lang() { # <spec-json> <lead>
+  local l
+  l=$(_compose_kickoff_lang_norm "${_COMPOSE_LANG:-}")
+  [[ -n "$l" ]] || l=$(_compose_kickoff_lang_norm "$(jq -r '.lang // .team.lang // empty' <<<"$1" 2>/dev/null)")
+  if [[ -z "$l" ]] && declare -F _seat_owner_lang >/dev/null 2>&1; then
+    l=$(_compose_kickoff_lang_norm "$(_seat_owner_lang "$2" 2>/dev/null)")
+  fi
+  printf '%s' "${l:-en}"
+}
+_compose_kickoff_title() { # <lang>
+  case "$1" in
+    ru) printf '%s' "Согласовать с вами план команды до начала работы" ;;
+    zh) printf '%s' "开始工作前与你确认团队计划" ;;
+    *)  printf '%s' "Agree the team's plan with you before work starts" ;;
+  esac
+}
+_compose_kickoff_lang_name() { # <lang>
+  case "$1" in ru) printf Russian ;; zh) printf Chinese ;; *) printf English ;; esac
+}
+
 # Does this spec seed any work at all? No goals and no loops = nothing to hold.
 _compose_spec_seeds_work() {
   [[ "$(jq -r '[.agents[] | ((.goals // []) | length) + ((.loops // []) | length)] | add // 0' <<<"$1" 2>/dev/null || echo 0)" != "0" ]]
@@ -682,16 +718,17 @@ _compose_kickoff_open() {
 
 # The kickoff's body: what the lead reads when it is dispatched.
 _compose_kickoff_body() {
-  local lead="$1"
+  local lead="$1" lname
+  lname=$(_compose_kickoff_lang_name "${2:-en}")
   _compose_kickoff_marker "$lead"
-  cat <<'EOF'
+  cat <<EOF
 
 Your team was just hired and none of its work has started. Every goal and recurring job it came with is HELD behind this row until your owner says yes. Your first job is to ask.
 
-1. Run `5dive team plan`. It lists what is held (each goal and recurring job, who owns it, how often a job runs) and the exact commands for the steps below.
-2. Send your owner ONE message, where you normally talk to them. At most 60 words, plain words, no task numbers. Say what you understand they want from this team, which goals you mean to work and which recurring jobs you mean to switch on, then ask: yes, or what should I skip or change?
-3. Park this row while you wait (the park command `team plan` prints). Start nothing in the meantime.
-4. When they answer: a yes is `5dive team start`. To leave some out, `5dive team start --skip=<the held rows they dropped>`: a skipped goal is cancelled and a skipped job never switches on. If they want something else instead, skip what it replaces and file what they asked for as a task for the right teammate. A no to all of it is `5dive team decline`. Then tell them in one line what started.
+1. Run \`5dive team plan\`. It lists what is held (each goal and recurring job, who owns it, how often a job runs) and the exact commands for the steps below.
+2. Send your owner ONE message, where you normally talk to them. At most 60 words, plain words, no task numbers. Say what you understand they want from this team, which goals you mean to work and which recurring jobs you mean to switch on, then ask: yes, or what should I skip or change? Write to your owner in ${lname}, the language they use.
+3. Park this row while you wait (the park command \`team plan\` prints). Start nothing in the meantime.
+4. When they answer: a yes is \`5dive team start\`. To leave some out, \`5dive team start --skip=<the held rows they dropped>\`: a skipped goal is cancelled and a skipped job never switches on. If they want something else instead, skip what it replaces and file what they asked for as a task for the right teammate. A no to all of it is \`5dive team decline\`. Then tell them in one line what started.
 5. If this row wakes and they have not answered, send the plan once more at most, then park again for a week.
 
 No chat with your owner yet? Park this row for a day and send the plan the first time they write to you.
@@ -704,7 +741,7 @@ EOF
 # _COMPOSE_KICKOFF_NEW (1 if this run filed it). Returns 1 if the lead is not on
 # the box, in which case NOTHING may be seeded live in its place.
 _compose_hold_open() {
-  local lead="$1" self="$2" row out
+  local lead="$1" self="$2" lang="${3:-en}" row out
   _COMPOSE_KICKOFF="" _COMPOSE_KICKOFF_NEW=0
   tasks_db_init 2>/dev/null || true
   row=$(_compose_kickoff_open "$lead")
@@ -713,7 +750,7 @@ _compose_hold_open() {
     return 0
   fi
   [[ "$(registry_read 2>/dev/null | jq --arg n "$lead" '.agents[$n] != null' 2>/dev/null)" == "true" ]] || return 1
-  out=$(bash "$self" --json task add --materialized --no-verify --priority=high           "--assignee=$lead" "--body=$(_compose_kickoff_body "$lead")"           "--park=$_COMPOSE_KICKOFF_IMPORT_REASON" --park-wake=+6h           -- "Tell your owner your plan before the team starts any work" </dev/null 2>/dev/null) || true
+  out=$(bash "$self" --json task add --materialized --no-verify --priority=high           "--assignee=$lead" "--body=$(_compose_kickoff_body "$lead" "$lang")"           "--park=$_COMPOSE_KICKOFF_IMPORT_REASON" --park-wake=+6h           -- "$(_compose_kickoff_title "$lang")" </dev/null 2>/dev/null) || true
   _COMPOSE_KICKOFF=$(jq -r '.data.ident // empty' <<<"$out" 2>/dev/null)
   [[ -n "$_COMPOSE_KICKOFF" ]] || return 1
   _COMPOSE_KICKOFF_NEW=1
@@ -724,7 +761,7 @@ _compose_hold_open() {
 
 ## First start (added by team import)
 
-Your team's seeded goals and recurring jobs wait for your owner's yes. While `5dive team plan` lists held work, start none of it. When your owner answers your plan, release what they approved with `5dive team start` (`--skip=<DIVE-N>,...` for what they dropped) or `5dive team decline` for a no.
+Your team\'s seeded goals and recurring jobs wait for your owner\'s yes. While `5dive team plan` lists held work, start none of it. When your owner answers your plan, release what they approved with `5dive team start` (`--skip=<DIVE-N>,...` for what they dropped) or `5dive team decline` for a no. Write to your owner in '"$(_compose_kickoff_lang_name "$lang")"$', the language they use.
 ' >/dev/null 2>&1 || true
   return 0
 }
@@ -1559,7 +1596,7 @@ _compose_browser_mode() {
 }
 
 cmd_compose_up() {
-  local file="" type_override="" name_prefix="" start_now=0
+  local file="" type_override="" name_prefix="" start_now=0 _COMPOSE_LANG=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--file)    file="$2"; shift ;;
@@ -1573,9 +1610,13 @@ cmd_compose_up() {
       --prefix)     name_prefix="$2"; shift ;;
       # DIVE-5729: skip the lead's plan-first hold and start seeded work at once.
       --start-now)  start_now=1 ;;
+      # DIVE-6484: the owner's language, for the kickoff the owner sees.
+      --lang=*)     _COMPOSE_LANG="${1#--lang=}" ;;
+      --lang)       _COMPOSE_LANG="$2"; shift ;;
       -h|--help)
         cat >&2 <<HELP
 usage: 5dive up [-f file] [--type=<harness>] [--prefix=<p>] [--start-now]
+                [--lang=ru|en|zh]
   Bring up agents declared in 5dive.yaml. Idempotent — existing agents are
   left alone, missing ones are created and started.
   Default file: 5dive.yaml or 5dive.yml in the current directory.
@@ -1592,6 +1633,10 @@ usage: 5dive up [-f file] [--type=<harness>] [--prefix=<p>] [--start-now]
                     (5dive team plan / start / decline). This starts them at
                     once instead, as before.
 
+  --lang=ru|en|zh   The owner's language: the kickoff they see is titled in
+                    it, and the lead is told to write to them in it. Without
+                    it: the spec's lang:, else the lead's paired chat, else en.
+
   --type=<harness>  Create the WHOLE roster on this harness, overriding the
                     spec's type:/defaults.type:. Known: ${!TYPE_BIN[*]}.
                     Claude-only model/effort pins are dropped when the target
@@ -1602,6 +1647,9 @@ HELP
     esac
     shift
   done
+  if [[ -n "$_COMPOSE_LANG" && -z "$(_compose_kickoff_lang_norm "$_COMPOSE_LANG")" ]]; then
+    fail "$E_USAGE" "unknown --lang: $_COMPOSE_LANG (known: ru, en, zh)"
+  fi
   # DIVE-3998: reject an unknown harness HERE — before the spec is read and
   # before ensure_state touches anything. Left to `agent create`, a typo'd
   # --type fails once per agent, midway through a partly-provisioned roster.
@@ -1841,7 +1889,7 @@ HELP
   # lead that is not on the box cannot ask anyone, so its team's work is NOT
   # started in its place.
   local _hold_failed=0 _held_goals=0 _hg _hg_name _hg_mgr _hg_goal
-  if (( _COMPOSE_HOLD )) && ! _compose_hold_open "$_hold_lead" "$self"; then
+  if (( _COMPOSE_HOLD )) && ! _compose_hold_open "$_hold_lead" "$self" "$(_compose_kickoff_lang "$spec" "$_hold_lead")"; then
     _hold_failed=1
     warn "the lead '$_hold_lead' is not on this box, so it cannot ask the owner first — ${#_COMPOSE_GOAL_LINES[@]} seeded goal(s) and every declared loop were NOT filed, and nothing started. Re-run the import once '$_hold_lead' is up."
   fi
@@ -2431,6 +2479,7 @@ _team_usage() {
 usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
                                    [--telegram-token=<bot-token>|-] [--prefix=<p>]
                                    [--start-now] [--template=<path>|-]
+                                   [--lang=ru|en|zh]
        5dive team ps [<slug|path>] [--type=<harness>]
        5dive team ls
        5dive team plan    [<lead>]                    what is waiting for your yes
@@ -2477,6 +2526,10 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
                     pack), and every link is fetched before any agent is
                     created, so a refused one leaves nothing half-made. The
                     links are not kept in the saved manifest.
+  --lang=ru|en|zh   Your language. The first task you see (the lead asking for
+                    your yes) is titled in it, and the lead writes to you in it.
+                    Without it: the template's lang:, else the lead's chat with
+                    you once paired, else English.
 HELP
 }
 
@@ -2945,10 +2998,12 @@ HELP
   esac
 
   local ref="" profile="" type_override="" tg_token="" tg_token_set=0
-  local name_prefix="" prefix_set=0 start_now=0 template_src=""
+  local name_prefix="" prefix_set=0 start_now=0 template_src="" lang=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --start-now)      start_now=1 ;;   # DIVE-5729: skip the lead's plan-first hold
+      --lang=*)         lang="${1#--lang=}" ;;   # DIVE-6484: the owner's language
+      --lang)           lang="$2"; shift ;;
       --template=*)     template_src="${1#--template=}" ;;   # DIVE-6088
       --auth-profile=*) profile="${1#--auth-profile=}" ;;
       --auth-profile)   profile="$2"; shift ;;
@@ -2971,6 +3026,8 @@ HELP
     shift
   done
   [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive team import <slug|path>"
+  [[ -z "$lang" || -n "$(_compose_kickoff_lang_norm "$lang")" ]] \
+    || fail "$E_USAGE" "unknown --lang: $lang (known: ru, en, zh)"
 
   local file="" resolve_rc=0 template_dir=""
   if [[ -n "$template_src" ]]; then
@@ -3169,6 +3226,7 @@ HELP
   [[ -n "$type_override" ]] && _up_args+=("--type=$type_override")
   [[ -n "$name_prefix"   ]] && _up_args+=("--prefix=$name_prefix")
   (( start_now )) && _up_args+=(--start-now)
+  [[ -n "$lang"          ]] && _up_args+=("--lang=$lang")
   local _up_rc=0
   cmd_compose_up "${_up_args[@]}" || _up_rc=$?
   # The staged template may hold pack links; they are live for minutes, not kept.
