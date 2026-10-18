@@ -670,8 +670,8 @@ _compose_kickoff_marker() { printf 'team kickoff: %s (5dive.yaml)' "$1"; }
 # Every lookup keys on the marker above, never the title, so a kickoff filed in
 # one language is still found by a re-run in another.
 #
-# lodar, 2026-10-18: "we ship a team on oinoa with initial task ? but its in
-# English even if user speaks Russian". Order: --lang, the template's lang
+# A partner's Russian-speaking owner saw this first row in English (2026-10-18).
+# Order: --lang, the template's lang
 # (top-level or team.lang), the lead's paired channel, then English.
 _compose_kickoff_lang_norm() { # <value> -> ru|en|zh, or nothing
   case "${1,,}" in

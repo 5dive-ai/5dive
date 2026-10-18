@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # DIVE-6484 — a new team's kickoff in the owner's language.
 #
-# lodar, 2026-10-18: "we ship a team on oinoa with initial task ? but its in
-# English even if user speaks Russian". The kickoff is the first row the OWNER
+# A partner's Russian-speaking owner saw this first row in English (2026-10-18).
+# The kickoff is the first row the OWNER
 # sees in the app's Tasks tab, so its title is in their language and written to
 # them; the body stays the lead's English instructions plus which language to
 # write in. Order: --lang, the template's lang:, the lead's paired chat, en.
