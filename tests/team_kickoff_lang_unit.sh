@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DIVE-6484 — a new team's kickoff in the owner's language.
 #
-# A partner's Russian-speaking owner saw this first row in English (2026-10-18).
+# A partner's owner who writes in Russian saw this first row in English.
 # The kickoff is the first row the OWNER
 # sees in the app's Tasks tab, so its title is in their language and written to
 # them; the body stays the lead's English instructions plus which language to
