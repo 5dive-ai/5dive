@@ -4747,7 +4747,11 @@ cmd_task_merge_do() {
   done
   _MDO_COMPANIONS_OPEN=0
   if _merge_do_already_landed "$pr"; then return 0; fi
-  _merge_do_at_github "$ident" "$pr" "$actor" "$tok" "$_ghcfg"
+  # DIVE-6543: the PRIMARY carries the graded sha; a companion's head is a
+  # different commit, so it is pinned only to its own head as read.
+  local _mdo_graded
+  _mdo_graded=$(_gate_graded_sha "$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')")
+  _merge_do_at_github "$ident" "$pr" "$actor" "$tok" "$_ghcfg" "$_mdo_graded"
 }
 
 # _merge_do_at_github <ident> <pr> <actor> <token> <gh-config-dir> — the GitHub
@@ -4756,8 +4760,8 @@ cmd_task_merge_do() {
 # base branch's governance says a merge is performed, performs it, and names the
 # disposition it actually achieved.
 _merge_do_at_github() {
-  local ident="$1" pr="$2" actor="$3" tok="$4" _ghcfg="$5"
-
+  local ident="$1" pr="$2" actor="$3" tok="$4" _ghcfg="$5" graded="${6:-}"
+  graded="${graded,,}"
 
   # STEP 1 — ask GitHub how this base branch is governed, in ONE round trip that
   # also yields the two values an enqueue needs. `mergeQueue` non-null IS the
@@ -4778,6 +4782,38 @@ _merge_do_at_github() {
   fi
 
   local rc=0 out=""
+
+  # STEP 1b — DIVE-6543: THE MERGE IS PINNED TO THE GRADED COMMIT, not to
+  # whatever the head is when the call lands. The disposition (DIVE-4137) and
+  # `task done` (DIVE-2656) compare graded and head BEFORE and AFTER; neither
+  # closes the gap between this read and the merge, where a push lands
+  # ungraded. So: a head that is not the graded sha refuses here, and the head
+  # that is goes to GitHub as the pin (`expectedHeadOid` / `--match-head-commit`),
+  # so a push after this read fails server-side instead of merging. Prefix
+  # compare, as DIVE-2656 does: a grader routinely states an abbreviated sha.
+  # No graded sha (a companion PR, or a seat merge whose result states none):
+  # the head read above is still pinned, which closes the read-to-merge window.
+  local _pin="$_head_oid"
+  if [[ -n "$graded" ]]; then
+    if [[ -n "$_head_oid" && "${_head_oid,,}" != "$graded"* && "$graded" != "${_head_oid,,}"* ]]; then
+      mark_reported
+      printf '_merge_do: NOTHING MERGED — %s head is %s but %s graded %s. The head moved after the grade, so what would merge is not what was graded (DIVE-6543). Re-grade the head, or have the maker re-deliver.
+' \
+        "$pr" "$_head_oid" "$actor" "$graded" >&2
+      return 1
+    fi
+    if [[ -z "$_head_oid" ]]; then
+      if (( ${#graded} == 40 )); then
+        _pin="$graded"
+      else
+        mark_reported
+        printf '_merge_do: NOTHING MERGED — %s head could not be read (gh api graphql exited %s) and the graded sha %s is abbreviated, so there is no full commit to pin the merge to (DIVE-6543). Re-run; if it persists, state the full 40-char graded-sha.
+' \
+          "$pr" "$_rc_meta" "$graded" >&2
+        return 1
+      fi
+    fi
+  fi
 
   # STEP 2 — a queue-governed branch is ENQUEUED, never merged with an explicit
   # strategy. `gh pr merge --squash` names a strategy the queue owns; GitHub
@@ -4803,7 +4839,7 @@ _merge_do_at_github() {
     local _enq_mutation _enq_state=""
     _enq_mutation='mutation($pr:ID!,$oid:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$pr,expectedHeadOid:$oid}){mergeQueueEntry{state position}}}'
     out=$(GH_TOKEN="$tok" GITHUB_TOKEN="" GH_CONFIG_DIR="$_ghcfg" \
-            gh api graphql -f query="$_enq_mutation" -f pr="$_pr_id" -f oid="$_head_oid" 2>&1) || rc=$?
+            gh api graphql -f query="$_enq_mutation" -f pr="$_pr_id" -f oid="$_pin" 2>&1) || rc=$?
     (( rc == 0 )) && _enq_state=$(jq -r '.data.enqueuePullRequest.mergeQueueEntry.state // empty' <<<"$out" 2>/dev/null || printf '')
     if (( rc != 0 )) || [[ -z "$_enq_state" ]]; then
       mark_reported
@@ -4826,7 +4862,9 @@ _merge_do_at_github() {
   # except that gh's own message is CAPTURED and reprinted, so a refusal arrives
   # with its reason instead of a pointer to output that a caller capturing our
   # stderr may never have shown.
-  out=$(GH_TOKEN="$tok" GITHUB_TOKEN="" GH_CONFIG_DIR="$_ghcfg" gh pr merge "$pr" --squash 2>&1) || rc=$?
+  local -a _pin_args=()
+  [[ -n "$_pin" ]] && _pin_args=(--match-head-commit "$_pin")
+  out=$(GH_TOKEN="$tok" GITHUB_TOKEN="" GH_CONFIG_DIR="$_ghcfg" gh pr merge "$pr" --squash "${_pin_args[@]}" 2>&1) || rc=$?
   [[ -n "$out" ]] && printf '%s\n' "$out" >&2
   if (( rc != 0 )); then
     mark_reported
