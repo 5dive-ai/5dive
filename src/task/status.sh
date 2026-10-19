@@ -1529,6 +1529,25 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
             # Claiming ancestry in this sentence described a shape that cannot occur.
             warn "$ident: $_dref is NOT merged (state=$_state, measured) but a commit on ${FIVE_GATE_MAIN_BRANCH:-main} in $_cu_slug names $ident in its SUBJECT — the work LANDED BY ANOTHER ROUTE (DIVE-3458/3534). done=merged-to-main satisfied on ATTRIBUTION, not on the PR's merge flag.$_cu_diag$(_gate_merged_not_deployed "$_cu_slug")"
             _mg_foreign="[delivery: $_dref is CLOSED/UNMERGED (state=$_state), and the work is nonetheless ON ${FIVE_GATE_MAIN_BRANCH:-main} in $_cu_slug — a commit subject on main names $ident. Closed on ATTRIBUTION, NOT on the pull request's merge flag and NOT on the PR head's ancestry.$_cu_diag (DIVE-3458/3534)]"
+          elif [[ "$_state" == "CLOSED" && -z "$_cu_attr" ]] \
+               && _gate_merge_proof_ok "$_mg_proof_at" "$_mg_proof_ref" "$_dref"; then
+            # DIVE-6562: THE STATE WAS READABLE AND MAIN WAS NOT. Measured on
+            # DIVE-6554: #715 landed as 76edbd7da (direct commit, PR CLOSED,
+            # mergedAt null) — the shape a merge now produces (DIVE-6543, "a merge
+            # lands only the graded commit"). From quinn's seat `pr view` answers
+            # CLOSED, so the DIVE-3823 rail above is skipped as ANSWERABLE, while
+            # the subject scan of main 404s, so attribution is EMPTY and nothing
+            # accepted. `--force-merge-gate` does not reach this branch, so no seat
+            # could close a row whose work is on main.
+            #
+            # The recorded proof fills ONLY the operand that could not be read. A
+            # measured 0 or bound:* is an answer and still refuses; an OPEN PR is
+            # an answer that contradicts the proof, and the API wins. Same binding
+            # rule as DIVE-3823: a proof stamped on a re-pointed ref is inert.
+            _task_store_audit_log "task.merge-proof-close" ok 0 -- \
+              "$ident" "ref=$_mg_proof_ref" "proved_by=$_mg_proof_by" "at=$_mg_proof_at" "cmd=$_mg_proof_cmd" "state=$_state" "attribution=unread"
+            warn "$ident: $_dref is NOT merged (state=$_state, measured), and whether any commit subject on ${FIVE_GATE_MAIN_BRANCH:-main} in ${_cu_slug:-its repo} names $ident COULD NOT BE READ from this seat. So it is closing on RECORDED MACHINE EVIDENCE instead (DIVE-6562/3823, audited): '$_mg_proof_by' ran \`$_mg_proof_cmd\` against $_mg_proof_ref at $_mg_proof_at and it exited 0. That is an attestation by a named seat, not an API answer — if the two ever disagree, the API is right.$_cu_diag"
+            _mg_foreign="[delivery: $_dref is CLOSED/UNMERGED (state=$_state); the main-branch subject scan could not be read, so this closed on a MERGE PROOF recorded by '$_mg_proof_by' at $_mg_proof_at against this binding — NOT on the pull request's merge flag and NOT on attribution. (DIVE-6562)]"
           else
             # Name what was MEASURED and why, so the refusal cannot print advice the
             # reader is unable to follow. A CLOSED PR gets the remedy that exists.

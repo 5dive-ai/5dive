@@ -365,6 +365,71 @@ run_done LND-4 --result='unknown'
   && ok_t 'and the refusal says unresolved, not ruled out' \
   || bad_t 'refusal must distinguish unread from absent' "out=$OUT"
 
+# ── B5. DIVE-6562: the PR state is READABLE (CLOSED) but main is NOT — the seat
+# the DIVE-3823 rail cannot rescue, because that rail runs only when the state is
+# unanswerable. Measured on DIVE-6554: #715 landed as 76edbd7da, PR CLOSED, and the
+# grader's subject scan of main 404'd. A proof stamped on THIS binding fills the
+# unread operand; a measured answer, a stale proof or an OPEN PR still refuses.
+#
+# MUTATION GRADE: delete the DIVE-6562 elif in status.sh -> B5a fails;
+# drop its `-z "$_cu_attr"` -> B5c fails; drop its CLOSED test -> B5f fails.
+proof() { db "UPDATE tasks SET merge_proof_at='2026-10-19 19:00:00', merge_proof_by='quinn',
+                 merge_proof_ref=$(sqlq "$2"), merge_proof_cmd='git merge-base --is-ancestor 76edbd7da origin/main'
+               WHERE ident='$1';"; }
+clear_fx; export GH_STUB_PR_https___github_com_5dive_ai_5dive_pull_629="CLOSED|"
+# no COMMITS fixture => the subject scan of main is UNREADABLE (empty)
+seed PRF-1 "$OURS_PR"; proof PRF-1 "$OURS_PR"; : >"$AUDIT_CALLS"
+run_done PRF-1 --result='landed as a direct commit'
+[[ $RC -eq 0 && "$(statusof PRF-1)" == "done" && "$(refusals PRF-1)" == "0" ]] \
+  && ok_t 'B5a CLOSED + unreadable scan + proof on the current binding CLOSES' \
+  || bad_t 'B5a closed+unread+proof must close' "rc=$RC status=$(statusof PRF-1) out=$OUT"
+[[ "$OUT" == *"COULD NOT BE READ"* && "$OUT" == *"RECORDED MACHINE EVIDENCE"* && "$OUT" == *"'quinn'"* ]] \
+  && ok_t 'B5a and it warns that the scan was unread and whose proof closed it' \
+  || bad_t 'B5a warn must name the unread scan and the prover' "out=$OUT"
+grep -q 'task.merge-proof-close.*attribution=unread' "$AUDIT_CALLS" \
+  && ok_t 'B5a audited as a merge-proof close' \
+  || bad_t 'B5a expected a task.merge-proof-close audit row' "$(cat "$AUDIT_CALLS")"
+R=$(resultof PRF-1)
+[[ "$R" == *"MERGE PROOF"* && "$R" == *"NOT on attribution"* ]] \
+  && ok_t 'B5a the record says a proof closed it, not attribution' \
+  || bad_t 'B5a result must name the proof' "result=$R"
+
+seed PRF-2 "$OURS_PR"
+run_done PRF-2 --result='no proof'
+[[ $RC -ne 0 && "$(statusof PRF-2)" == "in_progress" && "$OUT" == *"COULD NOT BE READ"* ]] \
+  && ok_t 'B5b the same shape with NO proof still refuses' \
+  || bad_t 'B5b no proof must refuse' "rc=$RC out=$OUT"
+
+export GH_STUB_COMMITS_5dive_main="$(commits 'chore: something else entirely')"
+seed PRF-3 "$OURS_PR"; proof PRF-3 "$OURS_PR"
+run_done PRF-3 --result='proof but measured 0'
+[[ $RC -ne 0 && "$(statusof PRF-3)" == "in_progress" && "$OUT" == *"NO commit subject on main names"* ]] \
+  && ok_t 'B5c a MEASURED 0 with a proof still refuses (an answer beats an attestation)' \
+  || bad_t 'B5c measured 0 must refuse' "rc=$RC out=$OUT"
+unset GH_STUB_COMMITS_5dive_main
+
+eval "_orig_ident_on_main() $(declare -f _gate_branch_ident_on_main | tail -n +2)"
+_gate_branch_ident_on_main() { printf 'bound:500'; }
+seed PRF-4 "$OURS_PR"; proof PRF-4 "$OURS_PR"
+run_done PRF-4 --result='proof but scan bound'
+[[ $RC -ne 0 && "$(statusof PRF-4)" == "in_progress" && "$OUT" == *"COMMITS WALKED"* ]] \
+  && ok_t 'B5d a bound:* scan with a proof still refuses' \
+  || bad_t 'B5d bound must refuse' "rc=$RC out=$OUT"
+eval "_gate_branch_ident_on_main() $(declare -f _orig_ident_on_main | tail -n +2)"
+
+seed PRF-5 "$OURS_PR"; proof PRF-5 "https://github.com/5dive-ai/5dive/pull/1"
+run_done PRF-5 --result='stale proof'
+[[ $RC -ne 0 && "$(statusof PRF-5)" == "in_progress" ]] \
+  && ok_t 'B5e a proof stamped on a DIFFERENT binding is inert' \
+  || bad_t 'B5e stale proof must refuse' "rc=$RC out=$OUT"
+
+export GH_STUB_PR_https___github_com_5dive_ai_5dive_pull_629="OPEN|"
+seed PRF-6 "$OURS_PR"; proof PRF-6 "$OURS_PR"
+run_done PRF-6 --result='open pr with proof'
+[[ $RC -ne 0 && "$(statusof PRF-6)" == "in_progress" ]] \
+  && ok_t 'B5f an OPEN PR with a proof still refuses (the API answer wins)' \
+  || bad_t 'B5f open+proof must refuse' "rc=$RC out=$OUT"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 # Verdict shape is load-bearing: tests/meta/harness-verdict-probe.sh proves a
 # harness is WIRED by injecting FAIL=$((FAIL+1)) and asserting the exit flips, and
