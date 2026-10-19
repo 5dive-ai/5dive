@@ -19,6 +19,10 @@
 #       no_skills:      true               # opt out of inherited skills
 #       defer_auth:     true               # create without auth gate
 #       isolation:      admin|standard|sandboxed
+#       can_push:       true|false         # DIVE-6543: who may push. Once ANY seat
+#                                          # declares it, every seat that does not
+#                                          # is false: no push grant, and a standard
+#                                          # seat (an admin seat's sudo reaches push)
 #       auth_profile:   <named-account>
 #       provider:       <byo-id>           # hermes/openclaw (any), claude (anthropic-skin: deepseek moonshot openrouter qwen zai)
 #       api_key:        "<key>"            # paired with provider; claude also needs auth_profile
@@ -106,6 +110,7 @@ KNOWN = {
              # of a bare create — the pack supplies persona+skills+model/effort.
     "pack_url", # DIVE-6088: the seat's pack by link (agent import --from-url), for
              # a partner's private pack. `pack:` still names the persona.
+    "can_push", # DIVE-6543: the push grant is the seat's, not the box's.
 }
 if "pack_url" in defaults:
     print("error: 'pack_url' is one seat's pack link — it cannot be a default", file=sys.stderr); sys.exit(3)
@@ -131,6 +136,19 @@ for name, spec in agents.items():
         if not isinstance(pu, str) or not re.fullmatch(r"https://\S+", pu):
             print(f"error: agent '{name}': pack_url must be an https link", file=sys.stderr); sys.exit(3)
 data["agents"] = merged
+
+# DIVE-6543: push is per seat. A team that names its pushers means everyone
+# else is not one — a grader that can push is not separated from the maker by
+# its role text. An admin seat reaches push through its sudo, so a non-pusher
+# is pinned standard, and an explicit admin non-pusher is a contradiction.
+if any("can_push" in m for m in merged.values()):
+    for name, m in merged.items():
+        cp = m.get("can_push", False)
+        if not isinstance(cp, bool):
+            print(f"error: agent '{name}': can_push must be true or false", file=sys.stderr); sys.exit(3)
+        m["can_push"] = cp
+        if not cp and m.get("isolation") == "admin":
+            print(f"error: agent '{name}': can_push: false needs a standard or sandboxed seat — an admin seat can push through its sudo", file=sys.stderr); sys.exit(3)
 
 # reports_to: normalise to a list, validate targets resolve + no self-edge.
 names = set(merged)
@@ -341,6 +359,7 @@ _compose_create_args() {
   fi
   [[ -n "$profile"   ]] && printf '%s\n' "--auth-profile=${profile}"
   [[ -n "$isolation" ]] && printf '%s\n' "--isolation=${isolation}"
+  _compose_push_args "$spec" "$isolation"
   [[ -n "$provider"  ]] && printf '%s\n' "--provider=${provider}"
   [[ -n "$api_key"   ]] && printf '%s\n' "--api-key=${api_key}"
   # DIVE-2757: a self-hosted endpoint has no catalog row, so `agent create`
@@ -365,6 +384,22 @@ _compose_create_args() {
     printf '%s\n' "--with-skills=${skills_csv}"
   fi
   [[ "$defer_auth" == "true" ]] && printf '%s\n' "--defer-auth"
+}
+
+# DIVE-6543: the push half of a seat's argv, shared by create and import.
+# `can_push: true` is the delegated-push grant; `false` (set by the parser on
+# every seat of a team that names its pushers) pins the seat's tier — standard
+# unless the spec chose one (the parser refuses admin) — so neither a box's
+# admin default nor a pack's manifest hands a non-pusher the sudo that reaches
+# push. Absent: nothing, as before.
+# <emitted>: the --isolation the caller already printed; <pin>: the tier to pin.
+_compose_push_args() {
+  local spec="$1" emitted="${2:-}" pin="${3:-}" cp
+  cp=$(jq -r 'if has("can_push") then (.can_push|tostring) else "" end' <<<"$spec")
+  case "$cp" in
+    true)  printf '%s\n' "--can-push" ;;
+    false) [[ -n "$emitted" ]] || printf '%s\n' "--isolation=${pin:-standard}" ;;
+  esac
 }
 
 # DIVE-536: build argv for `5dive agent import <pack> --as=<name> ...` when an
@@ -405,6 +440,9 @@ _compose_import_args() {
     local wd_abs; wd_abs=$(_compose_resolve_path "$workdir" "$spec_dir")
     printf '%s\n' "--workdir=${wd_abs}"
   fi
+  # A pack seat's tier is otherwise the manifest's (or the box's); a non-pusher's
+  # is pinned here, to the spec's tier when it names one.
+  _compose_push_args "$spec" "" "$(jq -r '.isolation // empty' <<<"$spec")"
 }
 
 # DIVE-6088: every seat's pack link is fetched BEFORE any seat is created. A

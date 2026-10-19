@@ -298,6 +298,11 @@ cat >"$TMP/bin/gh" <<'STUB'
 printf 'GH %s\n' "$*" >>"$GH_ARGS_LOG"
 _all="$*"
 if [[ "$_all" == *"pr merge"* ]]; then
+  # DIVE-6543: GitHub's own rule for --match-head-commit — a pin that is not the
+  # head NOW (MOVED_HEAD: a push landed after the rail read the head) refuses.
+  if [[ "$_all" =~ --match-head-commit\ ([0-9a-f]+) && "${BASH_REMATCH[1]}" != "${MOVED_HEAD:-$HEAD_OID}" ]]; then
+    printf 'GraphQL: Head branch was modified. Review and try the merge again. (mergePullRequest)\n' >&2; exit 1
+  fi
   case "${SQUASH_MODE:-ok}" in
     ok)   printf 'Squashed and merged pull request #658\n'; exit 0 ;;
     fail) printf '! The merge strategy for main is set by the merge queue\nGraphQL: Something went wrong while executing your query\n' >&2; exit 1 ;;
@@ -334,7 +339,7 @@ XPR=https://github.com/5dive-ai/5dive/pull/658
 # In a SUBSHELL: the stubs are the surface under test, not this shell's state.
 run_rail() {
   : >"$GH_ARGS_LOG"; : >"$AUDIT_LOG"
-  RERR=$( ( _merge_do_at_github DIVE-100 "$XPR" quinn faketoken "$TMP/ghcfg" >"$TMP/rail.out" 2>"$TMP/rail.err"; printf '%s' "$?" >"$TMP/rail.rc" ) ; cat "$TMP/rail.err" )
+  RERR=$( ( _merge_do_at_github DIVE-100 "$XPR" quinn faketoken "$TMP/ghcfg" "${GRADED:-}" >"$TMP/rail.out" 2>"$TMP/rail.err"; printf '%s' "$?" >"$TMP/rail.rc" ) ; cat "$TMP/rail.err" )
   RRC=$(cat "$TMP/rail.rc"); RLOG=$(cat "$GH_ARGS_LOG"); RAUD=$(cat "$AUDIT_LOG")
 }
 eq_t()   { if [[ "$2" == "$3" ]]; then ok_t "$1"; else bad_t "$1" "want '$3', got '$2'"; fi; }
@@ -414,6 +419,65 @@ run_rail
 eq_t   "E7 a refused squash merge returns non-zero"                  "$((RRC != 0))" "1"
 has_t  "E7 ...with gh's own line reprinted"                          "$RERR" "The merge strategy for main is set by the merge queue"
 export SQUASH_MODE=ok
+
+# --- 6b. DIVE-6543: THE MERGE IS PINNED TO THE GRADED COMMIT ------------------
+# The disposition compares graded and head before the merge and `task done`
+# compares them after; between the two a push merged ungraded, because the
+# merge itself was a bare `gh pr merge --squash`. Each arm RUNS the rail.
+export PROBE_MODE=noqueue SQUASH_MODE=ok GRADED="${HEAD_OID:0:12}"
+run_rail
+eq_t   "P1 graded = head (abbreviated): the merge lands"             "$RRC" "0"
+has_t  "P1 ...pinned to the FULL head sha the grade names"           "$RLOG" "--squash --match-head-commit $HEAD_OID"
+
+# P2 — THE ROW'S VERIFY: the head moves after grading (between the rail's read
+# and the merge). GitHub refuses the pin, so nothing lands.
+export MOVED_HEAD=ffff0000ffff0000ffff0000ffff0000ffff0000
+run_rail
+eq_t   "P2 head moved after the grade: the merge FAILS"              "$((RRC != 0))" "1"
+has_t  "P2 ...on GitHub's own refusal of the pin"                    "$RERR" "Head branch was modified"
+hasnt_t "P2 ...and nothing is audited as merged"                     "$RAUD" "disposition=merged"
+unset MOVED_HEAD
+
+# P3 — the head already differs from the graded sha when the rail reads it:
+# refused before any merge call.
+export GRADED=abc1234abc1234
+run_rail
+eq_t    "P3 head is not the graded sha: refused"                     "$((RRC != 0))" "1"
+has_t   "P3 ...naming the moved head"                                "$RERR" "NOTHING MERGED"
+hasnt_t "P3 ...with no merge call at all"                            "$RLOG" "pr merge"
+export PROBE_MODE=queue
+run_rail
+eq_t    "P3 ...and on a queue-governed branch too"                   "$((RRC != 0))" "1"
+hasnt_t "P3 ...which enqueues nothing"                               "$RLOG" "enqueuePullRequest"
+
+# P4 — the enqueue pins the graded head.
+export GRADED="${HEAD_OID:0:8}"
+run_rail
+eq_t   "P4 queue-governed, graded = head: enqueued"                  "$RRC" "0"
+has_t  "P4 ...with the graded head as expectedHeadOid"               "$RLOG" "-f oid=$HEAD_OID"
+
+# P5 — head unreadable: a full graded sha is the pin; an abbreviated one cannot
+# be, so it refuses rather than merge unpinned.
+export PROBE_MODE=unreadable GRADED="$HEAD_OID"
+run_rail
+eq_t   "P5 unreadable head + full graded sha: merges"                "$RRC" "0"
+has_t  "P5 ...pinned to the graded sha"                              "$RLOG" "--match-head-commit $HEAD_OID"
+export GRADED="${HEAD_OID:0:12}"
+run_rail
+eq_t    "P5 unreadable head + abbreviated graded sha: refused"       "$((RRC != 0))" "1"
+hasnt_t "P5 ...with no merge call"                                   "$RLOG" "pr merge"
+
+# P6 — no graded sha (a companion PR): still pinned to the head as read.
+export PROBE_MODE=noqueue GRADED=""
+run_rail
+eq_t   "P6 no graded sha: merges"                                    "$RRC" "0"
+has_t  "P6 ...pinned to the head it read"                            "$RLOG" "--match-head-commit $HEAD_OID"
+unset GRADED
+
+# P7 — the primary is handed the row's graded sha; a companion is not.
+grep -q '_merge_do_at_github "$ident" "$pr" "$actor" "$tok" "$_ghcfg" "$_mdo_graded"' <<<"$(declare -f cmd_task_merge_do)" \
+  && ok_t "P7 the primary merge is called with the row's graded sha" \
+  || bad_t "P7 graded sha passed to the primary" ""
 
 # --- 7. THE DISPOSITION CONTRACT THE CLOSE-TIME RAIL DEPENDS ON --------------
 # DIVE-4428 iteration 1's product defect: `src/task/status.sh` calls the SAME
