@@ -8602,11 +8602,24 @@ _hb_seat_ended_turn_text() { # <agent>
   return 1
 }
 
+# `_hb_stuck_q_unquoted <text>` — the text with the words the seat QUOTED cut
+# out: fenced code (to one word, so a fence that is the final paragraph stays
+# one), inline code, and "…"/“…” spans. A '?' in there is a label, a command or
+# someone else's words, not the seat asking (DIVE-6515: clicker's finished
+# report quoted Chrome's "Restore pages?" bubble and reached its lead as
+# waiting for an answer, 3 times; with no reflex model the base alone decides).
+# A jq failure prints the text unchanged: the base then reads as before.
+_hb_stuck_q_unquoted() { # <text>
+  printf '%s' "$1" | jq -rRs 'gsub("```[\\s\\S]*?```"; "code") | gsub("`[^`\n]*`"; "")
+    | gsub("\"[^\"\n]*\""; "") | gsub("“[^”\n]*”"; "")' 2>/dev/null || printf '%s\n' "$1"
+}
+
 # `_hb_stuck_base_asks <text>` — the base tier. rc 0 when the final paragraph
-# (the text after its last blank line) asks a person something.
+# (the text after its last blank line) asks a person something, in the seat's
+# own words (_hb_stuck_q_unquoted).
 _hb_stuck_base_asks() { # <text>
   local para
-  para=$(printf '%s\n' "$1" | awk 'BEGIN { RS = "" } { p = $0 } END { print p }')
+  para=$(_hb_stuck_q_unquoted "$1" | awk 'BEGIN { RS = "" } { p = $0 } END { print p }')
   [[ -n "$para" ]] || return 1
   grep -qE "$_HB_STUCK_Q_QMARK_RE" <<<"$para" && return 0
   grep -qiE "$_HB_STUCK_Q_ASK_RE" <<<"$para"
@@ -8735,7 +8748,7 @@ _hb_stuck_q_tail() { # <text> <max>
 # whole sentences while they fit; a single asking sentence longer than that is
 # cut at a word with a trailing "…". Never from the front mid-word.
 _hb_stuck_q_plain_ask() { # <text>
-  local para s out="" w=0 sw started=0 i
+  local para s sq out="" w=0 sw started=0 i
   local -a sents=()
   para=$(printf '%s\n' "$1" | awk 'BEGIN { RS = "" } { p = $0 } END { print p }' \
     | sed -E 's/\[([^]]*)\]\([^)]*\)/\1/g; s/^[[:space:]]*(#+|[-*+>]|[0-9]+[.)])[[:space:]]+//; s/\*\*|__|[*`]//g' \
@@ -8746,7 +8759,8 @@ _hb_stuck_q_plain_ask() { # <text>
   for s in "${sents[@]}"; do
     [[ -n "$s" ]] || continue
     if (( ! started )); then
-      grep -qE "$_HB_STUCK_Q_QMARK_RE" <<<"$s" || grep -qiE "$_HB_STUCK_Q_ASK_RE" <<<"$s" || continue
+      sq=$(_hb_stuck_q_unquoted "$s")
+      grep -qE "$_HB_STUCK_Q_QMARK_RE" <<<"$sq" || grep -qiE "$_HB_STUCK_Q_ASK_RE" <<<"$sq" || continue
       started=1
     fi
     sw=$(wc -w <<<"$s")

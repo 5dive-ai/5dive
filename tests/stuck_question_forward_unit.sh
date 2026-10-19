@@ -62,6 +62,14 @@
 #      person. CONTROL: the same text without the fence still forwards.
 #      MUTANT: the sweep without the fence check forwards the fenced one (Y red)
 #
+# DIVE-6515 arms.
+#   O  a final paragraph whose only '?' is inside a quote ("…", “…”), inline code
+#      or a fenced block is terminal: `.last` written, nothing sent to a lead or a
+#      person (clicker's finished report quoting Chrome's "Restore pages?"
+#      bubble). CONTROL: an unquoted question next to a quoted '?' label, and
+#      `Ship it as "v2"?`, still forward. MUTANT: the base tier that reads the
+#      raw paragraph (the pre-6515 tree) forwards the clicker text (O1 red)
+#
 # Stubs: systemctl (per unit), cmd_send (the a2a rail), _tg_access_state_dir (channel dirs into the temp tree),
 # _gate_channel_api (the Bot API seam), _reflex_endpoint_decide (the model),
 # _hb_log. No root, no network, no box path written.
@@ -115,7 +123,9 @@ has()    { [[ "$1" == *"$2"* ]]; }
 # (be3e7e0a…, 2026-09-26T01:16:44.073Z). RHETORICAL is the final paragraph of a
 # real marcus turn that asks nobody anything but quotes a question; REPORT is a
 # real marcus turn with no ask. ASK_BURIED is the phrase-only ask the row quotes
-# from the reflex model test.
+# from the reflex model test. RHETORICAL's only '?' is inside quotes, so since
+# DIVE-6515 the base tier no longer reads it as an ask; BARE_RHETORICAL is the
+# false positive the base still accepts and the reflex tier is there to catch.
 MARCUS_Q="I haven't restarted anything. The Telegram poller really is down on all 16 seats: none of them has a Telegram process, only the dashboard one. After the 01:12 fleet restart, the Telegram plugin never started on any seat. It updated to 0.5.64 at 01:01, and that version builds without errors.
 
 Should I restart claude-swan on its own as a test? If Telegram still doesn't start there, the problem is the plugin, and restarting the other 15 won't help."
@@ -124,6 +134,7 @@ REPORT="I haven't started DIVE-613 and won't in this session. This turn's goal w
 
 DIVE-613 is assigned to me as \`todo\` and gets picked up when its own goal dispatches. I sent claude-luca a message saying so, along with DIVE-611's delivery (PR #1141 at \`dd030369\`, now waiting on claude-qa)."
 ASK_BURIED="Before I do the same on prod I need you to confirm the maintenance window."
+BARE_RHETORICAL="Why did the upload fail twice? The CDN was cold on the first try. It is fixed, the row is delivered, and nothing is needed from anyone."
 
 # --- The fleet ------------------------------------------------------------------
 # boss (root, paired) > lead (the tagged gate notifier, paired) > quiet (NO channel,
@@ -211,11 +222,11 @@ tx quiet "$MARCUS_Q"
 _hb_stuck_base_asks "$MARCUS_Q" && ! _hb_stuck_base_asks "$REPORT" \
   && ok_t "P2: the base tier reads an ask in MARCUS_Q and none in a plain report" \
   || bad_t "P2: base tier on MARCUS_Q / REPORT"
-_hb_stuck_base_asks "$ASK_BURIED" && _hb_stuck_base_asks "$RHETORICAL" \
+_hb_stuck_base_asks "$ASK_BURIED" && _hb_stuck_base_asks "$BARE_RHETORICAL" && ! _hb_stuck_base_asks "$RHETORICAL" \
   && ! _hb_stuck_base_asks "Should I restart it? I did.
 
 Restarted; nothing needed from you." \
-  && ok_t "P3: a phrase-only ask and a quoted '?' both read as asks; a question in an EARLIER paragraph does not" \
+  && ok_t "P3: a phrase-only ask and a bare rhetorical '?' read as asks; a '?' only inside quotes, or in an EARLIER paragraph, does not" \
   || bad_t "P3: base tier phrase / final-paragraph scope"
 
 # --- G) [g] no reflex configured: the base forwards -------------------------------
@@ -285,11 +296,11 @@ fresh; RX_RESP='{"choice":"asks_human","confidence":0.6}'; tx quiet "$MARCUS_Q";
   || bad_t "C1: below 0.9" "calls=$(calls) sends=$(sends) receipt=$(last_receipt)"
 
 # --- H) [h] the rhetorical '?' ------------------------------------------------------------
-opt_out; fresh; tx quiet "$RHETORICAL"; tick
+opt_out; fresh; tx quiet "$BARE_RHETORICAL"; tick
 [[ "$(sends)" == 1 ]] \
-  && ok_t "H1: base tier alone forwards the quoted-question report (its accepted false positive)" \
+  && ok_t "H1: base tier alone forwards the rhetorical-question report (its accepted false positive)" \
   || bad_t "H1: base forwards the rhetorical text" "sends=$(sends)"
-opt_in; fresh; RX_RESP='{"choice":"report","confidence":0.93}'; tx quiet "$RHETORICAL"; tick
+opt_in; fresh; RX_RESP='{"choice":"report","confidence":0.93}'; tx quiet "$BARE_RHETORICAL"; tick
 [[ "$(calls)" == 1 && "$(sends)" == 0 ]] && [[ "$(last_receipt | jq -r .result)" == report ]] \
   && ok_t "H2: the reflex tier reads it as a report and suppresses the forward" \
   || bad_t "H2: reflex suppresses" "calls=$(calls) sends=$(sends)"
@@ -543,7 +554,7 @@ T7_LOG=$(cat "$TMP/hb.log"); tick; T7_N=$(a2as); tick
 [[ "$T7_LOG" == *"agent send to lead FAILED, try 1"* && "$T7_N" == 1 && "$(a2as)" == 0 && "$(sends)" == 0 ]] \
   && ok_t "T7: a failed agent send is retried on the next tick, lands, and is not sent a third time" \
   || bad_t "T7: agent-route retry" "log=$T7_LOG second=$T7_N third=$(a2as)"
-opt_in; fresh; RX_RESP='{"choice":"report","confidence":0.93}'; tx quiet "$RHETORICAL"; tick
+opt_in; fresh; RX_RESP='{"choice":"report","confidence":0.93}'; tx quiet "$BARE_RHETORICAL"; tick
 [[ "$(calls)" == 1 && "$(a2as)" == 0 && "$(sends)" == 0 ]] \
   && ok_t "T8: reflex holding a report still suppresses the agent route" \
   || bad_t "T8: reflex before the route" "calls=$(calls) a2a=$(a2as)"
@@ -631,6 +642,42 @@ _hb_stuck_fenced_reply "a stray </5dive-r:e78392d6> closer only?" && Y5_BAD+=" c
 [[ -z "$Y5_BAD" ]] \
   && ok_t "Y5: complete fence and echo-then-real-fence are the caller's; empty echoed pair, mismatched ids and a bare closer are not" \
   || bad_t "Y5: fence shape rule" "$Y5_BAD"
+
+# --- O) DIVE-6515: a '?' the seat only QUOTED is not an ask ------------------------------------------
+# clicker's finished report on chill-gorge (relayed to head 2026-10-18 08:35Z,
+# 11:06Z and 10-19 02:05Z, box with reflex_model null): its only '?' is in
+# Chrome's quoted "Restore pages?" bubble.
+CLICKER_DONE='DIVE-665 is closed as done: the listing is posted and its receipt is on the row.
+
+Nothing new this slot. The Chrome "Restore pages?" bubble sat off to the side and never covered the form.'
+QUOTED_LABEL_Q='The "Restore pages?" bubble is back on the form. Should I dismiss it for good?'
+OUTSIDE_Q='The release notes are written and the tag is cut. Ship it as "v2"?'
+O0_BAD=""
+_hb_stuck_base_asks "$CLICKER_DONE" && O0_BAD+=" clicker:ask"
+_hb_stuck_base_asks 'Done. The Chrome “Restore pages?” bubble sat off to the side.' && O0_BAD+=" curly:ask"
+_hb_stuck_base_asks 'Done. I ran `ls build/*.js?` and it listed both bundles.' && O0_BAD+=" inline-code:ask"
+_hb_stuck_base_asks $'Done, the parser now reads:\n```\nx = ok ? a : b\nwhat?\n```' && O0_BAD+=" fenced:ask"
+_hb_stuck_base_asks "$QUOTED_LABEL_Q" || O0_BAD+=" quoted-label+real-question:no"
+_hb_stuck_base_asks "$OUTSIDE_Q" || O0_BAD+=" outside-the-quotes:no"
+[[ -z "$O0_BAD" ]] \
+  && ok_t "O0: a '?' only inside \"…\", “…”, \`…\` or a fence is no ask; a real question beside a quoted label, and 'Ship it as \"v2\"?', still are" \
+  || bad_t "O0: base tier on quoted '?'" "$O0_BAD"
+opt_out; fresh; DOWN="boss"; tx quiet "$CLICKER_DONE"; tick; DOWN="lead boss"
+O_A2A=$(a2as) O_API=$(sends) O_LAST=$(cat "$STATE_DIR/stuck-question/quiet.last" 2>/dev/null)
+fresh; tx quiet "$CLICKER_DONE"; tick
+[[ "$O_A2A" == 0 && "$O_API" == 0 && "$(sends)" == 0 && -s "$STATE_DIR/stuck-question/quiet.last" && -n "$O_LAST" ]] \
+  && ok_t "O1: clicker's finished report goes to no lead and no person, and is marked judged" \
+  || bad_t "O1: quoted '?' forwarded" "a2a(lead up)=$O_A2A api(lead up)=$O_API api(lead down)=$(sends) last=$O_LAST log=$(cat "$TMP/hb.log")"
+O2_BAD=""
+fresh; DOWN="boss"; tx quiet "$QUOTED_LABEL_Q"; tick
+[[ "$(a2as)" == 1 ]] && has "$(cat "$TMP/a2a.last")" "Should I dismiss it for good?" || O2_BAD+=" quoted-label+real-question:a2a=$(a2as)"
+fresh; tx quiet "$OUTSIDE_Q"; tick; DOWN="lead boss"
+[[ "$(a2as)" == 1 ]] || O2_BAD+=" outside-the-quotes:a2a=$(a2as)"
+fresh; tx quiet "$QUOTED_LABEL_Q"; tick
+[[ "$(sends)" == 1 && "$(ASK_OF)" == "$QUOTED_LABEL_Q" ]] || O2_BAD+=" person-route:sends=$(sends) ask=$(ASK_OF)"
+[[ -z "$O2_BAD" ]] \
+  && ok_t "O2: CONTROL: an unquoted question still reaches the lead (and, with nobody running, the person) even beside a quoted '?'" \
+  || bad_t "O2: real question silenced" "$O2_BAD"
 
 # --- M) MUTANTS -------------------------------------------------------------------------------------------
 # M1 re-introduces the defect in-process: the sweep looks only at seats a person
@@ -740,6 +787,17 @@ opt_out; fresh; DOWN="boss"; tx quiet "$FENCED_Q"; tick; DOWN="lead boss"
   && ok_t "Y3: MUTANT (no fence check): the fenced reply is sent to the lead as a stuck question — Y1 goes red" \
   || bad_t "Y3: mutant must forward the fenced reply" "a2a=$(a2as)"
 eval "$SWEEP_SRC"
+# O3: the pre-6515 base tier, which reads the raw final paragraph.
+BASE_SRC=$(declare -f _hb_stuck_base_asks)
+eval "$(sed 's/_hb_stuck_q_unquoted "\$1"/printf "%s\\n" "$1"/' <<<"$BASE_SRC")"
+! has "$(declare -f _hb_stuck_base_asks)" '_hb_stuck_q_unquoted' \
+  && ok_t "O3a: (anchor) the raw-paragraph mutation landed" \
+  || bad_t "O3a: base mutation anchor" "the sed pattern no longer matches src/cmd_heartbeat.sh"
+opt_out; fresh; DOWN="boss"; tx quiet "$CLICKER_DONE"; tick; DOWN="lead boss"
+[[ "$(a2as)" == 1 ]] && has "$(cat "$TMP/a2a.last")" "Restore pages?" \
+  && ok_t "O3: MUTANT (raw paragraph): clicker's report reaches the lead as waiting for an answer — O1 goes red" \
+  || bad_t "O3: mutant must forward the clicker text" "a2a=$(a2as)"
+eval "$BASE_SRC"
 # V3: iteration 1's envelope. The same sweep, the same text, sent as task-engine.
 SEND_SRC=$(declare -f _hb_stuck_q_agent_send)
 eval "$(sed 's/--from="\$_HB_STUCK_Q_SENDER"/--from="task-engine"/' <<<"$SEND_SRC")"
