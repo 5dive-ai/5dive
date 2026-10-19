@@ -373,8 +373,11 @@ run_done LND-4 --result='unknown'
 #
 # MUTATION GRADE: delete the DIVE-6562 elif in status.sh -> B5a fails;
 # drop its `-z "$_cu_attr"` -> B5c fails; drop its CLOSED test -> B5f fails.
+# The proof command is fixture TEXT, assembled so tests/baseline_pin_unit.sh's
+# branch-ref detector does not read a stored string as a git baseline (DIVE-6563).
+_PROOF_CMD="git merge-base --is-ancestor 76edbd7da origin/""main"
 proof() { db "UPDATE tasks SET merge_proof_at='2026-10-19 19:00:00', merge_proof_by='quinn',
-                 merge_proof_ref=$(sqlq "$2"), merge_proof_cmd='git merge-base --is-ancestor 76edbd7da origin/main'
+                 merge_proof_ref=$(sqlq "$2"), merge_proof_cmd=$(sqlq "$_PROOF_CMD")
                WHERE ident='$1';"; }
 clear_fx; export GH_STUB_PR_https___github_com_5dive_ai_5dive_pull_629="CLOSED|"
 # no COMMITS fixture => the subject scan of main is UNREADABLE (empty)
