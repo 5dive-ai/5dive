@@ -1922,6 +1922,24 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   say "Upgrading 5dive CLI (skipping apt / nvm / bun / state setup)"
   refresh_managed_files
 
+  # >>> DIVE-6618 host plugins (extracted verbatim by tests/plugin_host_auto_upgrade_unit.sh)
+  # Box-wide plugins (/var/lib/5dive/plugins) were install-once on a self-installed
+  # box: nothing refreshed their marketplace or upgraded them, so a fix shipped in
+  # voice never arrived. The freshly-installed CLI moves the official ones to what
+  # their marketplace offers and names the community ones that are behind. Before
+  # the seat refresh below, so seats are re-pinned at the new versions. Its own
+  # exit and its own reason: a plugin that cannot move never fails the upgrade.
+  # Read whole, never piped into `grep -q`: under pipefail an early-exiting grep
+  # can SIGPIPE the CLI and read as "not supported". An older pinned CLI lacks
+  # the verb, and then this step is skipped rather than failed.
+  _hp_help="$("$BIN_DIR/5dive" plugin --help 2>/dev/null || true)"
+  if [[ "$_hp_help" == *"plugin auto-upgrade"* ]]; then
+    say "Upgrading box plugins"
+    "$BIN_DIR/5dive" plugin auto-upgrade 2>&1 | sed 's/^/  /' \
+      || echo "warn: box plugins: some did not upgrade (the reason is on the lines above); the CLI upgrade went ahead" >&2
+  fi
+  # <<< DIVE-6618 host plugins
+
   # Plugins are SHA-pinned per-user in installed_plugins.json, so CLI
   # upgrade alone doesn't refresh them. Run the helper best-effort: if
   # no agents are registered yet (fresh box) it's a no-op; if claude

@@ -200,6 +200,8 @@ _plugin_usage() {
   5dive plugin enable|disable <plugin>[@<marketplace>]    # a flag flip; the code stays on disk
   5dive plugin rollback <plugin>[@<marketplace>] [<version>]
   5dive plugin setup <plugin>[@<marketplace>] [--yes]     # run the publisher's one-time host setup
+  5dive plugin auto-upgrade                       # what self-update runs: official plugins to the newest
+                                                  # version, community ones reported, never moved
 
   5dive plugin marketplace add <source> [--as=<name>]
   5dive plugin marketplace list [--json]
@@ -962,6 +964,30 @@ _plugin_mkt_list() {
   } | column -t -s $'\t' | sed 's/^/  /'
 }
 
+# _plugin_mkt_refresh_one <name> [<marketplaces-json>] — re-read ONE source
+# into its materialised dir. rc 0 when it was refreshed. Shared by
+# `marketplace upgrade` and the self-update pass (DIVE-6618), so both read a
+# source the same way.
+_plugin_mkt_refresh_one() {
+  local n="$1" j="${2:-}" kind src dir
+  [[ -n "$j" ]] || j=$(cat "$(_plugin_mkt_json)")
+  kind=$(jq -r --arg n "$n" '.[$n].kind // ""' <<<"$j")
+  src=$(jq -r --arg n "$n" '.[$n].source // ""' <<<"$j")
+  dir="$(_plugin_mkt_dir)/$n"
+  if [[ "$kind" == "git" ]]; then
+    if git -C "$dir" fetch --quiet --depth 1 origin 2>/dev/null \
+       && git -C "$dir" reset --quiet --hard FETCH_HEAD 2>/dev/null; then
+      step "refreshed $n"; return 0
+    fi
+    warn "could not refresh '$n' from $src"; return 1
+  fi
+  if [[ -d "$src" ]]; then
+    rm -rf "$dir" && cp -a "$src" "$dir" && { step "refreshed $n"; return 0; }
+    return 1
+  fi
+  warn "local source $src for '$n' no longer exists"; return 1
+}
+
 _plugin_mkt_upgrade() {
   _plugin_ensure_store
   local want="${1:-}" j; j=$(cat "$(_plugin_mkt_json)")
@@ -972,23 +998,9 @@ _plugin_mkt_upgrade() {
   else
     names=$(jq -r 'keys[]' <<<"$j")
   fi
-  local n kind src dir done_n=0
+  local n done_n=0
   for n in $names; do
-    kind=$(jq -r --arg n "$n" '.[$n].kind' <<<"$j")
-    src=$(jq -r --arg n "$n" '.[$n].source' <<<"$j")
-    dir="$(_plugin_mkt_dir)/$n"
-    if [[ "$kind" == "git" ]]; then
-      git -C "$dir" fetch --quiet --depth 1 origin 2>/dev/null \
-        && git -C "$dir" reset --quiet --hard FETCH_HEAD 2>/dev/null \
-        && { step "refreshed $n"; done_n=$((done_n+1)); } \
-        || warn "could not refresh '$n' from $src"
-    else
-      if [[ -d "$src" ]]; then
-        rm -rf "$dir" && cp -a "$src" "$dir" && { step "refreshed $n"; done_n=$((done_n+1)); }
-      else
-        warn "local source $src for '$n' no longer exists"
-      fi
-    fi
+    _plugin_mkt_refresh_one "$n" "$j" && done_n=$((done_n+1))
   done
   # Refreshing a SOURCE installs nothing. Saying so is the difference between a
   # user who runs `plugin upgrade` next and one who wonders why nothing changed.
@@ -2350,6 +2362,182 @@ cmd_plugin_setup() {
      '{plugin:$k, command:$c, rc:0, changed:true}' --arg k "$key" --arg c "$setup_cmd"
 }
 
+# ---- host plugins follow their official marketplace (DIVE-6618) ------------
+#
+# A box-wide plugin was install-once on a self-installed box: nothing refreshed
+# its marketplace clone and nothing ran `plugin upgrade`, so voice sat on 1.8.0
+# for twelve nightlies while 1.10.0 carried the edge-tts fix every `5dive-speak`
+# needed (a curl box, reported 2026-10-20). Managed boxes were moved by
+# 5dive-api's plugin floors (DIVE-5645: official plugins track the NEWEST
+# version every night, lodar: "not shipping is a bug"). This is that same
+# policy, run by `install.sh --upgrade`, so every box that self-updates gets it:
+#
+#   * official: refreshed and upgraded to what its marketplace offers now.
+#   * community / unreviewed: refreshed and REPORTED, never upgraded — new code
+#     from a source 5dive does not own waits for its owner (the consent screen,
+#     DIVE-4955).
+#   * disabled: left alone. `plugin upgrade` re-points the enabled link, so
+#     upgrading a plugin the owner turned off would turn it back on.
+#   * never downwards: a marketplace offering a LOWER version is left alone.
+#
+# A new version can also change what the plugin's host setup step installs
+# (voice 1.9.1 floored edge-tts at 7.3.1 inside its setup), and a plugin at the
+# new version with the old engine is the same bug. So when the setup inputs
+# moved, the step runs again if this box ran it through `plugin setup` before,
+# and is named as owed otherwise — a setup step nobody on this box asked for is
+# not ours to start at 00:30.
+
+# _plugin_host_offer <marketplace> <plugin> [<git-ref>] — what the marketplace
+# offers for <plugin>, read from its working tree, or from <git-ref> inside it
+# (`update --check` reads a fresh FETCH_HEAD without resetting the tree). Sets
+# _PH_OFFERED, _PH_TIER and _PH_MANIFEST; rc 1 when it is not offered at all.
+_plugin_host_offer() {
+  local mkt="$1" plugin="$2" ref="${3:-}" dir srcdir mf nj=""
+  _PH_OFFERED=""; _PH_TIER=""; _PH_MANIFEST=""
+  dir="$(_plugin_mkt_dir)/$mkt"
+  srcdir=$(_plugin_source_dir "$mkt" "$plugin" 2>/dev/null) || return 1
+  mf=$(_plugin_manifest_path "$srcdir") || return 1
+  [[ -n "$ref" ]] && nj=$(git -C "$dir" show "$ref:${mf#"$dir"/}" 2>/dev/null | jq -c . 2>/dev/null)
+  [[ -n "$nj" ]] || nj=$(jq -c . "$mf" 2>/dev/null) || return 1
+  _PH_OFFERED=$(jq -r '.version // ""' <<<"$nj")
+  [[ -n "$_PH_OFFERED" ]] || return 1
+  _PH_TIER=$(_plugin_effective_review "$mkt" "$(jq -r '.fivedive.trust.review // "unreviewed"' <<<"$nj")")
+  _PH_MANIFEST="$nj"
+}
+
+# _plugin_host_entries — "<key>\t<plugin>\t<marketplace>\t<version>\t<enabled>"
+# per installed plugin. Empty when the registry is absent or unreadable.
+_plugin_host_entries() {
+  jq -r 'to_entries[] | [.key, (.value.plugin // ""), (.value.marketplace // ""), (.value.version // ""),
+           (if .value.enabled == false then "false" else "true" end)] | @tsv' \
+    "$(_plugin_installed_json)" 2>/dev/null || true
+}
+
+# _plugin_host_behind — for `update --check`: no root and no write to the store.
+# One "<key>\t<installed>\t<offered>\t<tier>" line per ENABLED plugin whose
+# marketplace offers a newer version. A git marketplace is fetched into
+# FETCH_HEAD first, so a clone that nothing has refreshed still answers with
+# what is published; where that fetch is not possible (an unprivileged caller,
+# no network) the clone on disk answers instead.
+_plugin_host_behind() {
+  local key plugin mkt had enabled ref kind
+  local -A peeked=()
+  while IFS=$'\t' read -r key plugin mkt had enabled; do
+    [[ -n "$key" && -n "$mkt" && "$enabled" != false ]] || continue
+    if [[ -z "${peeked[$mkt]+x}" ]]; then
+      peeked[$mkt]=""
+      kind=$(jq -r --arg n "$mkt" '.[$n].kind // ""' "$(_plugin_mkt_json)" 2>/dev/null)
+      [[ "$kind" == git ]] \
+        && GIT_TERMINAL_PROMPT=0 timeout "${PLUGIN_PEEK_TIMEOUT_SECS:-10}" \
+             git -C "$(_plugin_mkt_dir)/$mkt" fetch --quiet --depth 1 origin >/dev/null 2>&1 \
+        && peeked[$mkt]=FETCH_HEAD
+    fi
+    ref="${peeked[$mkt]}"
+    _plugin_host_offer "$mkt" "$plugin" "$ref" || continue
+    version_lt "$had" "$_PH_OFFERED" || continue
+    printf '%s\t%s\t%s\t%s\n' "$key" "$had" "$_PH_OFFERED" "$_PH_TIER"
+  done < <(_plugin_host_entries)
+}
+
+# _plugin_setup_inputs_changed <old-version-dir> <new-version-dir> — rc 0 when
+# the new version's host setup may install something the old one did not: the
+# setup block itself moved, any shipped file outside the manifest moved (voice's
+# installer lives in bin/, its engine in lib/), or the new copy is missing node
+# packages the old one had installed. No old copy to compare is a change.
+_plugin_setup_inputs_changed() {
+  local old="$1" new="$2" omf nmf
+  [[ -d "$old" ]] || return 0
+  omf=$(_plugin_manifest_path "$old") || return 0
+  nmf=$(_plugin_manifest_path "$new") || return 0
+  [[ "$(jq -cS '.fivedive.setup // null' "$omf" 2>/dev/null)" \
+     == "$(jq -cS '.fivedive.setup // null' "$nmf" 2>/dev/null)" ]] || return 0
+  [[ -z "$(_plugin_node_deps_missing "$new")" ]] || return 0
+  ! diff -rq --exclude=.claude-plugin --exclude=.5dive-plugin --exclude=.codex-plugin \
+      --exclude=node_modules --exclude=.git --exclude='*.md' "$old" "$new" >/dev/null 2>&1
+}
+
+# `5dive plugin auto-upgrade` — the self-update pass. Every outcome is said per
+# plugin, and a plugin that could not be moved is this verb's OWN non-zero exit
+# with its own reason, so the caller never has to explain a bare exit 1.
+cmd_plugin_auto_upgrade() {
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive plugin auto-upgrade   (no arguments; self-update runs it)"
+  _plugin_ensure_store
+  local reg; reg="$(_plugin_installed_json)"
+  if [[ "$(jq -r 'length' "$reg" 2>/dev/null)" == 0 ]]; then
+    ok "no host plugins installed — nothing to upgrade" \
+       '{upgraded:[], behind:[], failed:[], setup_ran:[], setup_owed:[]}'
+    return 0
+  fi
+
+  # Each source once, before any plugin is compared against it.
+  local m mj; mj=$(cat "$(_plugin_mkt_json)")
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    jq -e --arg n "$m" 'has($n)' <<<"$mj" >/dev/null 2>&1 || continue
+    _plugin_mkt_refresh_one "$m" "$mj" >&2 \
+      || warn "comparing the plugins from '$m' against the copy already on this box"
+  done < <(jq -r '[.[] | select(.enabled != false) | .marketplace // empty] | unique[]' "$reg" 2>/dev/null)
+
+  local up="[]" behind="[]" failed="[]" sran="[]" sowed="[]"
+  local key plugin mkt had enabled now errf scmd rc
+  errf=$(mktemp)
+  while IFS=$'\t' read -r key plugin mkt had enabled; do
+    [[ -n "$key" && -n "$mkt" ]] || continue
+    _plugin_host_offer "$mkt" "$plugin" || continue
+    version_lt "$had" "$_PH_OFFERED" || continue
+    if [[ "$enabled" == false ]]; then
+      step "left $key at $had (disabled; the marketplace offers $_PH_OFFERED)"
+      continue
+    fi
+    if [[ "$_PH_TIER" != official ]]; then
+      echo "  $key at $had, the marketplace offers $_PH_OFFERED — a $_PH_TIER plugin moves only when you run: sudo 5dive plugin upgrade $key" >&2
+      behind=$(jq -c --arg k "$key" --arg f "$had" --arg t "$_PH_OFFERED" --arg r "$_PH_TIER" \
+        '. + [{plugin:$k, installed:$f, offered:$t, tier:$r}]' <<<"$behind")
+      continue
+    fi
+    rc=0; ( JSON_MODE=0; cmd_plugin_upgrade "$key" ) >/dev/null 2>"$errf" || rc=$?
+    now=$(jq -r --arg k "$key" '.[$k].version // ""' "$reg" 2>/dev/null)
+    if [[ "$now" != "$_PH_OFFERED" ]]; then
+      warn "could not upgrade $key $had -> $_PH_OFFERED (exit $rc): $(tail -n 3 "$errf" | tr '\n' ' ')"
+      failed=$(jq -c --arg k "$key" --arg f "$had" --arg t "$_PH_OFFERED" \
+        '. + [{plugin:$k, installed:$f, offered:$t}]' <<<"$failed")
+      continue
+    fi
+    step "upgraded $key $had -> $now"
+    up=$(jq -c --arg k "$key" --arg f "$had" --arg t "$now" '. + [{plugin:$k, from:$f, to:$t}]' <<<"$up")
+
+    scmd=$(jq -r '.fivedive.setup.command // ""' <<<"$_PH_MANIFEST")
+    [[ -n "$scmd" ]] || continue
+    _plugin_setup_inputs_changed "$(_plugin_cache_dir)/$mkt/$plugin/$had" \
+      "$(_plugin_cache_dir)/$mkt/$plugin/$now" || continue
+    if [[ "$(jq -r --arg k "$key" '.[$k].setup.ok // false' "$reg" 2>/dev/null)" == true ]]; then
+      rc=0; ( JSON_MODE=0; cmd_plugin_setup "$key" --yes ) >/dev/null 2>"$errf" || rc=$?
+      if (( rc == 0 )); then
+        step "re-ran $key's host setup ($scmd) — $now changed what it installs"
+        sran=$(jq -c --arg k "$key" '. + [$k]' <<<"$sran")
+      else
+        warn "$key $now changed its host setup and re-running it failed (exit $rc): $(tail -n 3 "$errf" | tr '\n' ' ') — run it yourself: $scmd"
+        failed=$(jq -c --arg k "$key" --arg c "$scmd" '. + [{plugin:$k, setup:$c}]' <<<"$failed")
+      fi
+    else
+      warn "$key $now changed its host setup, and this box still has what $had's setup installed. Run: $scmd"
+      sowed=$(jq -c --arg k "$key" --arg c "$scmd" '. + [{plugin:$k, command:$c}]' <<<"$sowed")
+    fi
+  done < <(_plugin_host_entries)
+  rm -f "$errf"
+
+  local nu nb nf prose
+  nu=$(jq 'length' <<<"$up"); nb=$(jq 'length' <<<"$behind"); nf=$(jq 'length' <<<"$failed")
+  prose="host plugins: $nu upgraded"
+  (( nb )) && prose+=", $nb behind and left for you to upgrade ($(jq -r 'map(.plugin) | join(", ")' <<<"$behind"))"
+  [[ "$sowed" != "[]" ]] && prose+=", setup owed: $(jq -r 'map(.command) | join("; ")' <<<"$sowed")"
+  if (( nf )); then
+    fail "$E_GENERIC" "$prose, $nf FAILED ($(jq -r 'map(.plugin) | unique | join(", ")' <<<"$failed")) — each one's reason is printed above"
+  fi
+  ok "$prose" '{upgraded:$u, behind:$b, failed:[], setup_ran:$sr, setup_owed:$so}' \
+     --argjson u "$up" --argjson b "$behind" --argjson sr "$sran" --argjson so "$sowed"
+}
+
 cmd_plugin() {
   local sub="${1:-list}"; [[ $# -gt 0 ]] && shift
   case "$sub" in
@@ -2363,6 +2551,7 @@ cmd_plugin() {
     disable)         cmd_plugin_disable "$@" ;;
     rollback)        cmd_plugin_rollback "$@" ;;
     setup)           cmd_plugin_setup "$@" ;;
+    auto-upgrade)    cmd_plugin_auto_upgrade "$@" ;;
     *) fail "$E_USAGE" "unknown: 5dive plugin $sub (see: 5dive plugin --help)" ;;
   esac
 }

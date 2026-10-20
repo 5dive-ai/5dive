@@ -1845,6 +1845,27 @@ cmd_update_check() {
   # distinguishes a fleet that is moving from one nobody is watching.
   [[ "$frozen_armed_json" == false ]] && prose+=" · ⚠ freeze alarm UNARMED: $frozen_detail"
 
+  # >>> DIVE-6618 host plugins behind
+  # The CLI is not the only thing a box runs. A box-wide plugin its marketplace
+  # has moved past was invisible here, so an owner whose voice sat on 1.8.0 under
+  # a published 1.10.0 read "up to date" (2026-10-20). Official ones are moved by
+  # the nightly self-update; anything else waits for the owner, so the line says
+  # which, and how.
+  local hp_json="[]" hk hi ho ht hp_prose=""
+  while IFS=$'\t' read -r hk hi ho ht; do
+    [[ -n "$hk" ]] || continue
+    hp_json=$(jq -c --arg k "$hk" --arg i "$hi" --arg o "$ho" --arg t "$ht" \
+      '. + [{plugin:$k, installed:$i, offered:$o, tier:$t}]' <<<"$hp_json")
+    hp_prose+="${hp_prose:+, }$hk $hi -> $ho"
+    if [[ "$ht" == official ]]; then
+      hp_prose+=" (official: sudo 5dive self-update moves it)"
+    else
+      hp_prose+=" ($ht: sudo 5dive plugin upgrade $hk)"
+    fi
+  done < <(_plugin_host_behind 2>/dev/null)
+  [[ -n "$hp_prose" ]] && prose+=" · host plugins behind: $hp_prose"
+  # <<< DIVE-6618 host plugins behind
+
   # `behind`/`stale` keep their existing meaning and are only ever emitted on
   # the consistent path — the indeterminate branch above exits before here, so
   # a false `stale:false` can no longer be minted from a stale read.
@@ -1858,8 +1879,10 @@ cmd_update_check() {
   # green out of an observation we never made.
   # `resolvedStale` (DIVE-6288) is null with no readable receipt, else true only
   # when a canary-rung receipt names a tag older than `latest`.
+  # `hostPluginsBehind` (DIVE-6618) is additive: [] when nothing is behind.
   ok "$prose" \
-     '{current:$cur, latest:$lat, behind:$beh, ahead:$ahd, stale:$stl, frozen:$fz, frozenAgeSec:$fza, frozenDetail:$fzd, frozenArmed:$fzarm, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src, resolvedTarget:$rtg, resolvedRung:$rrg, resolvedRungDetail:$rrd, resolvedAt:$rat, resolvedStale:$rst}' \
+     '{current:$cur, latest:$lat, behind:$beh, ahead:$ahd, stale:$stl, frozen:$fz, frozenAgeSec:$fza, frozenDetail:$fzd, frozenArmed:$fzarm, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src, resolvedTarget:$rtg, resolvedRung:$rrg, resolvedRungDetail:$rrd, resolvedAt:$rat, resolvedStale:$rst, hostPluginsBehind:$hpb}' \
+     --argjson hpb "$hp_json" \
      --argjson rst "$rstale_json" --argjson rtg "$rt_json" --argjson rrg "$rr_json" \
      --argjson rrd "$rd_json" --argjson rat "$ra_json" \
      --arg cur "$current" --arg lat "$latest" --arg src "$detail" \
