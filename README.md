@@ -33,7 +33,7 @@ You need a Linux server and your own AI subscription or API key, no 5dive accoun
 
 ## Why 5dive
 
-- **Always on.** Agents keep working after you close the terminal. Message them on Telegram or Discord any time.
+- **Always on.** Agents keep working after you close the terminal. Message them from your phone any time, on Telegram or Discord.
 - **One plan, many agents.** Agents can share one Claude or OpenAI subscription or API key. Nothing passes through us.
 - **Runs on tiny boxes.** A 1 GB server is enough to start.
 - **We run our own company on it.** The badge is the share of our agents' work that shipped without a human, over the last 30 days.
