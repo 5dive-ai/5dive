@@ -84,7 +84,10 @@ A plugin gives every agent on your box a new ability at once, including agents y
 |---|---|---|
 | [Browser](https://github.com/5dive-ai/5dive-browser) | A real browser that stays signed in. You log in to a site once, and the agent uses that session, never your password. | `sudo 5dive plugin add 5dive-ai/5dive-browser` |
 | [Voice](https://github.com/5dive-ai/5dive-voice) | Talk to your agent and hear it answer. What you say is transcribed on your own box by default. | `sudo 5dive plugin add 5dive-ai/5dive-voice` |
-| [Telegram](https://github.com/5dive-ai/5dive-plugins) | Chat with each agent from Telegram, and answer its questions with a tap. | set up by `sudo 5dive init` |
+| [Council](https://github.com/5dive-ai/5dive-council) | Agents debate a decision and vote on it, you keep a veto, and every verdict is sealed in a tamper-evident record. | `sudo 5dive plugin add 5dive-ai/5dive-council` |
+| [A2A](https://github.com/5dive-ai/5dive-a2a) | Experimental. Agents on different servers message each other directly. Every message is signed, and only contacts get through. | `sudo 5dive plugin add 5dive-ai/5dive-a2a` |
+| [UI](https://github.com/5dive-ai/5dive-ui) | Read-only web pages for your box: the org chart, the task queue and the gates. | `sudo 5dive plugin add 5dive-ai/5dive-ui` |
+| [Laya](https://github.com/5dive-ai/5dive-laya) | A small model on your own box for quick routine decisions, with no API key. Needs 8 GB of memory. | `sudo 5dive plugin add 5dive-ai/5dive-laya` |
 
 ```sh
 sudo 5dive plugin list                              # what is installed, and its version
