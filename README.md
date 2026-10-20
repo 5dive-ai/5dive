@@ -34,7 +34,8 @@ You need a Linux server (Ubuntu 22.04 or newer recommended) and your own AI subs
 ## Why 5dive
 
 - **Always on.** Agents keep working after you close the terminal. Message them from your phone any time.
-- **One plan, many agents.** Agents can share one subscription or API key from Claude, ChatGPT, Google, Grok, OpenRouter, DeepSeek, Kimi, Qwen or GLM, or run on your own local model. Nothing passes through us.
+- **One plan, many agents.** Agents can share one plan or API key, from Claude and ChatGPT to Google and Grok. Nothing passes through us.
+- **Claude Code on any model.** Bring your own key and run Claude Code on Kimi, DeepSeek, GLM, Qwen, any OpenRouter model or a model on your own machine.
 - **Runs on tiny boxes.** A 1 GB server is enough to start.
 - **We run our own company on it.** The badge is the share of our agents' work that shipped without a human, over the last 30 days.
 
@@ -57,21 +58,34 @@ Any harness, on the plan or API key you already have:
 sudo 5dive account add work && sudo 5dive account login work --type=claude   # Claude plan
 sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex      # ChatGPT plan
 sudo 5dive account add kimi
-printf '%s' "$KIMI_API_KEY" | sudo 5dive account set kimi --type=hermes --provider=moonshot --api-key=-
+printf '%s' "$KIMI_API_KEY" | sudo 5dive account set kimi --type=claude --provider=moonshot --api-key=-
 
 # 2. Agents: any harness, on any account
-sudo 5dive hire cto --role="CTO" --auth-profile=work       # Claude Code
-sudo 5dive hire scout --type=codex --auth-profile=gpt      # Codex
-sudo 5dive hire analyst --type=hermes --auth-profile=kimi  # Hermes, on Kimi
+sudo 5dive hire cto --role="CTO" --auth-profile=work       # Claude Code, on your Claude plan
+sudo 5dive hire analyst --auth-profile=kimi                # Claude Code, on Kimi
+sudo 5dive hire scout --type=codex --auth-profile=gpt      # Codex, on your ChatGPT plan
 sudo 5dive hire designer --type=antigravity                # Antigravity, on your Google account
 sudo 5dive hire writer --type=grok                         # Grok, on your xAI account
-sudo 5dive hire ops --type=openclaw --provider=openrouter --api-key=-   # OpenClaw, any OpenRouter model
+sudo 5dive hire ops --type=openclaw --provider=openrouter --api-key=-     # OpenClaw, any OpenRouter model
+sudo 5dive hire researcher --type=hermes --provider=deepseek --api-key=-  # Hermes, on DeepSeek
 
 # 3. Channels: each agent gets its own
 sudo 5dive hire support --channels=telegram --telegram-token=-   # its own Telegram bot
 ```
 
-Keys go in on stdin (`--api-key=-`), never on the command line. `sudo 5dive fire <name>` removes an agent. More providers, local models and one shared bot: [full guide](docs/guide.md).
+### Claude Code on any model
+
+Bring your own key and Claude Code runs on Kimi, DeepSeek, GLM, Qwen, any OpenRouter model, or a model on your own machine. Same Claude Code, same tools and skills, a different model behind it.
+
+```sh
+sudo 5dive hire coder --provider=deepseek --api-key=- --auth-profile=deepseek   # DeepSeek
+sudo 5dive hire builder --provider=zai --api-key=- --auth-profile=glm           # GLM
+sudo 5dive hire helper --provider=qwen --api-key=- --auth-profile=qwen          # Qwen
+sudo 5dive hire any --provider=openrouter --api-key=- --auth-profile=or --model=<slug>   # any OpenRouter model
+sudo 5dive hire local --base-url=http://127.0.0.1:8000 --model=<slug> --api-key=- --auth-profile=local   # your own machine
+```
+
+Keys go in on stdin (`--api-key=-`), never on the command line. `sudo 5dive fire <name>` removes an agent. More providers and one shared bot: [full guide](docs/guide.md).
 
 ## Hire agents and teams
 
