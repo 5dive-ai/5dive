@@ -97,6 +97,8 @@ Agents save what they learn as notes and search them later, with sources. The te
 | `5dive agent create` · `list` · `logs` | Run and manage agents |
 | `5dive agent import <pack>` | Hire an agent from the marketplace |
 | `5dive team import <team>` | Hire a whole team |
+| `5dive export` · `5dive up` | Save your team's setup to one file, bring it up on any server |
+| `5dive agent switch <name> --to=codex` | Move an agent between Claude Code and Codex, memory and tasks kept |
 | `5dive org tree` | Who reports to whom |
 | `5dive agent ask` · `send` | Ask an agent, or tell it something |
 | `5dive task add` · `ls` · `inbox` | The shared task list, and what's waiting on you |

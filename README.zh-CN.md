@@ -99,6 +99,8 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 | `5dive agent create` · `list` · `logs` | 运行和管理智能体 |
 | `5dive agent import <pack>` | 从市场雇用一个智能体 |
 | `5dive team import <team>` | 雇用整支团队 |
+| `5dive export` · `5dive up` | 把团队配置存成一个文件，在任何服务器上启动 |
+| `5dive agent switch <name> --to=codex` | 让智能体在 Claude Code 和 Codex 之间切换，记忆和任务都保留 |
 | `5dive org tree` | 谁向谁汇报 |
 | `5dive agent ask` · `send` | 询问智能体，或告诉它一件事 |
 | `5dive task add` · `ls` · `inbox` | 共享任务列表，以及等你处理的事 |
