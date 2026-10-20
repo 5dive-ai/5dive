@@ -1851,7 +1851,8 @@ cmd_update_check() {
   # a published 1.10.0 read "up to date" (2026-10-20). Official ones are moved by
   # the nightly self-update; anything else waits for the owner, so the line says
   # which, and how.
-  local hp_json="[]" hk hi ho ht hp_prose=""
+  local hp_json="[]" hk hi ho ht hp_prose="" hp_body
+  hp_body=$(_plugin_host_behind 2>/dev/null) || hp_body=""
   while IFS=$'\t' read -r hk hi ho ht; do
     [[ -n "$hk" ]] || continue
     hp_json=$(jq -c --arg k "$hk" --arg i "$hi" --arg o "$ho" --arg t "$ht" \
@@ -1862,7 +1863,7 @@ cmd_update_check() {
     else
       hp_prose+=" ($ht: sudo 5dive plugin upgrade $hk)"
     fi
-  done < <(_plugin_host_behind 2>/dev/null)
+  done <<<"$hp_body"
   [[ -n "$hp_prose" ]] && prose+=" · host plugins behind: $hp_prose"
   # <<< DIVE-6618 host plugins behind
 

@@ -2420,8 +2420,9 @@ _plugin_host_entries() {
 # what is published; where that fetch is not possible (an unprivileged caller,
 # no network) the clone on disk answers instead.
 _plugin_host_behind() {
-  local key plugin mkt had enabled ref kind
+  local key plugin mkt had enabled ref kind entries
   local -A peeked=()
+  entries=$(_plugin_host_entries)
   while IFS=$'\t' read -r key plugin mkt had enabled; do
     [[ -n "$key" && -n "$mkt" && "$enabled" != false ]] || continue
     if [[ -z "${peeked[$mkt]+x}" ]]; then
@@ -2436,7 +2437,7 @@ _plugin_host_behind() {
     _plugin_host_offer "$mkt" "$plugin" "$ref" || continue
     version_lt "$had" "$_PH_OFFERED" || continue
     printf '%s\t%s\t%s\t%s\n' "$key" "$had" "$_PH_OFFERED" "$_PH_TIER"
-  done < <(_plugin_host_entries)
+  done <<<"$entries"
 }
 
 # _plugin_setup_inputs_changed <old-version-dir> <new-version-dir> — rc 0 when
@@ -2470,16 +2471,19 @@ cmd_plugin_auto_upgrade() {
   fi
 
   # Each source once, before any plugin is compared against it.
-  local m mj; mj=$(cat "$(_plugin_mkt_json)")
+  local m mj mkts; mj=$(cat "$(_plugin_mkt_json)")
+  mkts=$(jq -r '[.[] | select(.enabled != false) | .marketplace // empty] | unique[]' "$reg" 2>/dev/null) || mkts=""
   while IFS= read -r m; do
     [[ -n "$m" ]] || continue
     jq -e --arg n "$m" 'has($n)' <<<"$mj" >/dev/null 2>&1 || continue
     _plugin_mkt_refresh_one "$m" "$mj" >&2 \
       || warn "comparing the plugins from '$m' against the copy already on this box"
-  done < <(jq -r '[.[] | select(.enabled != false) | .marketplace // empty] | unique[]' "$reg" 2>/dev/null)
+  done <<<"$mkts"
 
   local up="[]" behind="[]" failed="[]" sran="[]" sowed="[]"
-  local key plugin mkt had enabled now errf scmd rc
+  local key plugin mkt had enabled now errf scmd rc entries
+  # Read the registry once, up front: the loop upgrades plugins and so rewrites it.
+  entries=$(_plugin_host_entries)
   errf=$(mktemp)
   while IFS=$'\t' read -r key plugin mkt had enabled; do
     [[ -n "$key" && -n "$mkt" ]] || continue
@@ -2523,7 +2527,7 @@ cmd_plugin_auto_upgrade() {
       warn "$key $now changed its host setup, and this box still has what $had's setup installed. Run: $scmd"
       sowed=$(jq -c --arg k "$key" --arg c "$scmd" '. + [{plugin:$k, command:$c}]' <<<"$sowed")
     fi
-  done < <(_plugin_host_entries)
+  done <<<"$entries"
   rm -f "$errf"
 
   local nu nb nf prose
