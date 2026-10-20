@@ -50,6 +50,31 @@ sudo 5dive init
 然后问我先创建哪个智能体。
 ```
 
+## 创建智能体
+
+任何类型的智能体，用你已有的套餐或 API key：
+
+```sh
+# 1. 账号：登录一次套餐，或保存一个 API key
+sudo 5dive account add work && sudo 5dive account login work --type=claude   # Claude 套餐
+sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex      # ChatGPT 套餐
+sudo 5dive account add kimi
+printf '%s' "$KIMI_API_KEY" | sudo 5dive account set kimi --type=hermes --provider=moonshot --api-key=-
+
+# 2. 智能体：任何类型，用任何账号
+sudo 5dive hire cto --role="CTO" --auth-profile=work       # Claude Code
+sudo 5dive hire scout --type=codex --auth-profile=gpt      # Codex
+sudo 5dive hire analyst --type=hermes --auth-profile=kimi  # Hermes，用 Kimi
+sudo 5dive hire designer --type=antigravity                # Antigravity，用你的 Google 账号
+sudo 5dive hire writer --type=grok                         # Grok，用你的 xAI 账号
+sudo 5dive hire ops --type=openclaw --provider=openrouter --api-key=-   # OpenClaw，任意 OpenRouter 模型
+
+# 3. 渠道：每个智能体有自己的
+sudo 5dive hire support --channels=telegram --telegram-token=-   # 它自己的 Telegram 机器人
+```
+
+key 通过标准输入传入（`--api-key=-`），不写在命令行里。`sudo 5dive fire <name>` 移除一个智能体。更多服务商、本地模型和团队共用机器人：[完整指南](docs/guide.md)。
+
 ## 雇用智能体和团队
 
 [市场](https://5dive.ai/marketplace?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh)里有 36 个现成的智能体，从 CEO、CTO 到法律顾问、客服和会计，每个都有自己的人设、模型和技能。也可以用一条命令雇用整支团队，自带角色、组织架构和初始任务清单。
@@ -96,6 +121,8 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 
 | 命令 | 作用 |
 |---|---|
+| `5dive hire <name>` · `fire <name>` | 添加一个带角色的智能体，或移除一个 |
+| `5dive account add` · `login` · `set` | 登录套餐或保存 API key，一次设置，多个智能体共用 |
 | `5dive agent create` · `list` · `logs` | 运行和管理智能体 |
 | `5dive market` · `agent import <pack>` | 浏览市场，雇用一个智能体 |
 | `5dive team import <team>` | 雇用整支团队 |

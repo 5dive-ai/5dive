@@ -48,6 +48,31 @@ Then add the 5dive-cli skill: npx -y skills add https://github.com/5dive-ai/skil
 Then ask me which agent to create first.
 ```
 
+## Create agents
+
+Any harness, on the plan or API key you already have:
+
+```sh
+# 1. Accounts: sign in to a plan once, or save an API key
+sudo 5dive account add work && sudo 5dive account login work --type=claude   # Claude plan
+sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex      # ChatGPT plan
+sudo 5dive account add kimi
+printf '%s' "$KIMI_API_KEY" | sudo 5dive account set kimi --type=hermes --provider=moonshot --api-key=-
+
+# 2. Agents: any harness, on any account
+sudo 5dive hire cto --role="CTO" --auth-profile=work       # Claude Code
+sudo 5dive hire scout --type=codex --auth-profile=gpt      # Codex
+sudo 5dive hire analyst --type=hermes --auth-profile=kimi  # Hermes, on Kimi
+sudo 5dive hire designer --type=antigravity                # Antigravity, on your Google account
+sudo 5dive hire writer --type=grok                         # Grok, on your xAI account
+sudo 5dive hire ops --type=openclaw --provider=openrouter --api-key=-   # OpenClaw, any OpenRouter model
+
+# 3. Channels: each agent gets its own
+sudo 5dive hire support --channels=telegram --telegram-token=-   # its own Telegram bot
+```
+
+Keys go in on stdin (`--api-key=-`), never on the command line. `sudo 5dive fire <name>` removes an agent. More providers, local models and one shared bot: [full guide](docs/guide.md).
+
 ## Hire agents and teams
 
 The [marketplace](https://5dive.ai/marketplace?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) has 36 ready-made agents, from a CEO and a CTO to legal counsel, support and an accountant, each with its own persona, model and skills. Or hire a whole team in one command, with roles, an org chart and a starting backlog.
@@ -94,6 +119,8 @@ Agents save what they learn as notes and search them later, with sources. The te
 
 | Command | What it does |
 |---|---|
+| `5dive hire <name>` · `fire <name>` | Add an agent with a role, or remove one |
+| `5dive account add` · `login` · `set` | Sign in to a plan or save an API key, once for many agents |
 | `5dive agent create` · `list` · `logs` | Run and manage agents |
 | `5dive market` · `agent import <pack>` | Browse the marketplace, hire an agent |
 | `5dive team import <team>` | Hire a whole team |
