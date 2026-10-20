@@ -101,6 +101,7 @@ Agents save what they learn as notes and search them later, with sources. The te
 | `5dive agent ask` · `send` | Ask an agent, or tell it something |
 | `5dive task add` · `ls` · `inbox` | The shared task list, and what's waiting on you |
 | `5dive trace <task>` | A task's full history, from the request to the verdict |
+| `5dive reflex log` | A receipt for every routine decision, like who got a task and why |
 | `5dive goal add "<outcome>"` | Turn an outcome into a plan of tasks |
 | `5dive loop install <loop>` | Give an agent a job on a schedule |
 | `5dive memory search "<query>"` | Search what your agents learned |

@@ -103,6 +103,7 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 | `5dive agent ask` · `send` | 询问智能体，或告诉它一件事 |
 | `5dive task add` · `ls` · `inbox` | 共享任务列表，以及等你处理的事 |
 | `5dive trace <task>` | 一个任务从提出到结论的完整历史 |
+| `5dive reflex log` | 每个例行决策都有记录，比如任务交给了谁、为什么 |
 | `5dive goal add "<outcome>"` | 把一个目标拆成一组任务 |
 | `5dive loop install <loop>` | 给智能体一项定时工作 |
 | `5dive memory search "<query>"` | 搜索智能体学到的东西 |
