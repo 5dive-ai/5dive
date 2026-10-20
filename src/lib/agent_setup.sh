@@ -302,6 +302,12 @@ MODEL_TIERING_CLAUDE_MD="/usr/local/lib/5dive/model-tiering-CLAUDE.md"
 # voice" so a character's expressive register survives. Character packs inherit
 # it here at provision time, so pack CLAUDE.md files stay craft-voice only.
 OPERATIONAL_COMMS_CLAUDE_MD="/usr/local/lib/5dive/operational-comms-CLAUDE.md"
+# DIVE-6635: how to reach a teammate, whose role is whose, and the owner-facing
+# rules (no terminal commands, rules on request, a "can't" checked twice before it
+# is remembered). Appended to EVERY claude agent's per-agent CLAUDE.md; a lead
+# with no such line used Claude Code's own ListAgents/SendMessage, saw nobody, and
+# worked alone. A managed block, so install.sh refreshes it on existing seats.
+TEAM_CLAUDE_MD="/usr/local/lib/5dive/team-CLAUDE.md"
 # DIVE-1210: project-subagent override that shadows the harness's built-in
 # Explore agent and pins it to haiku. Every claude agent's settings.json pins
 # the current opus id (below, from src/lib/models.sh), and CC >=2.1.198 has
@@ -558,6 +564,13 @@ JSON
   # fragments above; a missing source never fails create.
   if [[ -f "$OPERATIONAL_COMMS_CLAUDE_MD" ]]; then
     { [[ -s "$home/.claude/CLAUDE.md" ]] && printf '\n'; cat "$OPERATIONAL_COMMS_CLAUDE_MD"; } \
+      | sudo -u "$user" tee -a "$home/.claude/CLAUDE.md" >/dev/null
+    chmod 644 "$home/.claude/CLAUDE.md"
+  fi
+
+  # DIVE-6635: the team block (see TEAM_CLAUDE_MD). Best-effort like the rest.
+  if [[ -f "$TEAM_CLAUDE_MD" ]]; then
+    { [[ -s "$home/.claude/CLAUDE.md" ]] && printf '\n'; cat "$TEAM_CLAUDE_MD"; } \
       | sudo -u "$user" tee -a "$home/.claude/CLAUDE.md" >/dev/null
     chmod 644 "$home/.claude/CLAUDE.md"
   fi

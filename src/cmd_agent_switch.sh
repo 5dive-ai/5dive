@@ -119,6 +119,7 @@ switch_carry_doc() { # <src> <dst> <from> <to> <memidx|""> [frag...]
       | _switch_strip_block "$SWITCH_CARRY_MARKER" \
       | _switch_strip_block "$CODEX_BASELINE_MARKER" \
       | _switch_strip_block "$SWITCH_CODEX_MEM_MARKER" \
+      | _switch_strip_block 5dive:team \
       | python3 -c '
 import sys
 text = sys.stdin.read()
