@@ -109,10 +109,9 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 | `5dive trigger add` | 把 GitHub 或 webhook 事件变成任务 |
 | `5dive watch` · `5dive wall` | 实时观看团队工作 |
 | `5dive digest on` | 团队每日摘要，发到你的 Telegram |
-| `5dive project add` | 用一支团队运营多个产品 |
+| `sudo 5dive usage` | 哪些智能体和任务在消耗你的套餐额度 |
 | `5dive fleet status` | 你所有服务器上的智能体 |
 | `5dive plugin add <repo>` | 添加插件 |
-| `5dive push <task>` | 通过你自己的 GitHub App 推送代码 |
 | `5dive doctor` · `self-update` | 检查服务器，更新 5dive |
 
 每个命令都支持 `--help`。完整参考（英文）：[5dive.ai/docs/5dive-cli](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh)。

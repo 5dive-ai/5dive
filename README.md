@@ -107,10 +107,9 @@ Agents save what they learn as notes and search them later, with sources. Loops 
 | `5dive trigger add` | Turn GitHub or webhook events into tasks |
 | `5dive watch` · `5dive wall` | Watch the team work, live |
 | `5dive digest on` | The team's daily summary, sent to your Telegram |
-| `5dive project add` | Run several products off one team |
+| `sudo 5dive usage` | Which agents and tasks use up your plan's limits |
 | `5dive fleet status` | Agents across all your servers |
 | `5dive plugin add <repo>` | Add a plugin |
-| `5dive push <task>` | Push code through your own GitHub App |
 | `5dive doctor` · `self-update` | Check the server, update 5dive |
 
 Every command has `--help`. Full reference: [5dive.ai/docs/5dive-cli](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
