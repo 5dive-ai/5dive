@@ -23,7 +23,7 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-5dive runs CLI agents like Claude Code, Codex, Antigravity, Grok and OpenCode as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent has its own Linux user and configurable permissions.
+5dive runs CLI agents like Claude Code, Codex, OpenClaw, Hermes, Antigravity, Grok and OpenCode as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent has its own Linux user and configurable permissions.
 
 **Self-hosted · Bash + systemd + SQLite · MIT**
 
