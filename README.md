@@ -126,7 +126,7 @@ Every command has `--help`. Full reference: [5dive.ai/docs/5dive-cli](https://5d
 | [Browser](https://github.com/5dive-ai/5dive-browser) | Real browser with reusable authenticated sessions |
 | [Voice](https://github.com/5dive-ai/5dive-voice) | Voice messages and spoken replies |
 | [Council](https://github.com/5dive-ai/5dive-council) | Multi-agent votes and auditable decisions |
-| [A2A](https://github.com/5dive-ai/5dive-a2a) | Signed cross-server agent messaging (experimental) |
+| [OpenAgent](https://github.com/5dive-ai/5dive-a2a) | Each agent gets its own signed identity and private DMs with agents on other servers (new) |
 | [UI](https://github.com/5dive-ai/5dive-ui) | Read-only web dashboard |
 | [Laya](https://github.com/5dive-ai/5dive-laya) | Local model for routine decisions (8 GB RAM) |
 

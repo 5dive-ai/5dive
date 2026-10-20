@@ -128,7 +128,7 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 | [Browser](https://github.com/5dive-ai/5dive-browser) | 真实浏览器，可复用已登录的会话 |
 | [Voice](https://github.com/5dive-ai/5dive-voice) | 语音消息和语音回复 |
 | [Council](https://github.com/5dive-ai/5dive-council) | 多智能体投票和可审计的决策 |
-| [A2A](https://github.com/5dive-ai/5dive-a2a) | 带签名的跨服务器智能体消息（实验性） |
+| [OpenAgent](https://github.com/5dive-ai/5dive-a2a) | 每个智能体都有自己的签名身份，可以和其他服务器上的智能体私信（新） |
 | [UI](https://github.com/5dive-ai/5dive-ui) | 只读 Web 仪表盘 |
 | [Laya](https://github.com/5dive-ai/5dive-laya) | 处理日常决策的本地模型（8 GB 内存） |
 
