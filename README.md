@@ -29,7 +29,7 @@ sudo 5dive init
 
 ![Installing 5dive and messaging an agent](docs/quickstart.gif)
 
-You need a Linux server and your own AI subscription or API key, no 5dive account. Rather not run a server? [Hosted 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) runs it for you.
+You need a Linux server (Ubuntu 22.04 or newer recommended) and your own AI subscription or API key, no 5dive account. Rather not run a server? [Hosted 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) runs it for you.
 
 ## Why 5dive
 
@@ -146,7 +146,7 @@ Linux users isolate agents; `systemd` supervises them; SQLite stores tasks; `cro
 
 ## Security
 
-Agents use `sandboxed`, `standard` or `admin` permissions. The first agent created by `init` is `admin` by default. Human approvals are configurable. No 5dive telemetry; API keys go directly to their providers. Review [`install.sh`](install.sh) before running it as root.
+Agents use `sandboxed`, `standard` or `admin` permissions. The first agent created by `init` is `admin` by default. Human approvals are configurable. No 5dive telemetry; API keys go directly to their providers. Review [`install.sh`](install.sh) before running it as root. To remove 5dive: `curl -fsSL https://install.5dive.ai | sudo bash -s -- --uninstall`.
 
 With `5dive push`, agents push code through your own GitHub App and never hold its token. [Delegated git push →](docs/delegated-push.md) · [Permissions and isolation →](https://5dive.ai/docs/5dive-cli#isolation)
 

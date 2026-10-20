@@ -31,7 +31,7 @@ sudo 5dive init
 
 ![安装 5dive 并给智能体发消息](docs/quickstart.gif)
 
-你只需要一台 Linux 服务器，以及你自己的 AI 订阅或 API key，无需 5dive 账号。不想自己运维服务器？[托管版 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) 替你运行。
+你只需要一台 Linux 服务器（推荐 Ubuntu 22.04 或更新版本），以及你自己的 AI 订阅或 API key，无需 5dive 账号。不想自己运维服务器？[托管版 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) 替你运行。
 
 ## 为什么选 5dive
 
@@ -148,7 +148,7 @@ Linux 用户隔离智能体；`systemd` 负责进程守护；SQLite 存储任务
 
 ## 安全
 
-智能体使用 `sandboxed`、`standard` 或 `admin` 权限。`init` 创建的第一个智能体默认是 `admin`。人工审批可以配置。5dive 不收集遥测数据；API key 直接发给各自的模型提供商。以 root 运行 [`install.sh`](install.sh) 之前，请先审阅它。
+智能体使用 `sandboxed`、`standard` 或 `admin` 权限。`init` 创建的第一个智能体默认是 `admin`。人工审批可以配置。5dive 不收集遥测数据；API key 直接发给各自的模型提供商。以 root 运行 [`install.sh`](install.sh) 之前，请先审阅它。卸载 5dive：`curl -fsSL https://install.5dive.ai | sudo bash -s -- --uninstall`。
 
 使用 `5dive push` 时，智能体通过你自己的 GitHub App 推送代码，从不持有它的 token。[委托 git push →](docs/delegated-push.md) · [权限与隔离 →](https://5dive.ai/docs/5dive-cli#isolation)
 
