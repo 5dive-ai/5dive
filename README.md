@@ -26,6 +26,7 @@
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
+  <a href="#plugins">Plugins</a> ·
   <a href="#why-5dive">Why 5dive</a> ·
   <a href="#things-to-try">Things to try</a> ·
   <a href="docs/zero-human.md">Zero-human proof</a> ·
@@ -72,6 +73,25 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 **Requirements:** a Linux box with `systemd` and your own agent-CLI subscription or API key (Claude Pro/Max, OpenAI, …), no account with us.
 
 > **“`curl | sudo bash`, and agents with `sudo`?”** Fair question. The installer only apt-installs deps and drops the CLI + systemd units (every file it fetches is listed at the top of [`install.sh`](install.sh)). Each agent is then its own Linux user, and you choose its blast radius, a `sandboxed` agent gets its own home, no sudo, and resource limits. Details: [Security & isolation ↓](#security--isolation).
+
+---
+
+## Plugins
+
+A plugin gives every agent on your box a new ability at once, including agents you create later.
+
+| Plugin | What your agents get | Install |
+|---|---|---|
+| [Browser](https://github.com/5dive-ai/5dive-browser) | A real browser that stays signed in. You log in to a site once, and the agent uses that session, never your password. | `sudo 5dive plugin add 5dive-ai/5dive-browser` |
+| [Voice](https://github.com/5dive-ai/5dive-voice) | Talk to your agent and hear it answer. What you say is transcribed on your own box by default. | `sudo 5dive plugin add 5dive-ai/5dive-voice` |
+| [Telegram](https://github.com/5dive-ai/5dive-plugins) | Chat with each agent from Telegram, and answer its questions with a tap. | set up by `sudo 5dive init` |
+
+```sh
+sudo 5dive plugin list                              # what is installed, and its version
+sudo 5dive plugin upgrade browser@5dive-browser     # move one to its newest release
+```
+
+Anyone can publish one: start from [5dive-plugin-template](https://github.com/5dive-ai/5dive-plugin-template). Trust, consent and the plugin standard are in [Managing plugins](#managing-plugins).
 
 ---
 
@@ -315,6 +335,29 @@ read, not something you infer from a tier name.
 
 ---
 
+## Managing plugins
+
+A plugin adds something to every seat on the box at once: a channel (Telegram, Discord), a verb (a new top-level `5dive <verb>`), or a capability such as a shared browser or voice. It is a directory with a Claude Code plugin manifest (`.claude-plugin/plugin.json`). 5dive installs it box-level and registers it with every existing agent and every agent created later: Claude Code seats through their own plugin install, other harnesses through the plugin's `AGENTS.md` section.
+
+```sh
+sudo 5dive plugin add 5dive-ai/5dive-browser       # from its own repository
+sudo 5dive plugin add 5dive-ai/5dive-voice         # from any GitHub repo that carries a marketplace.json
+sudo 5dive plugin list                             # version, tier, enabled, what it registers
+sudo 5dive plugin upgrade browser@5dive-browser
+sudo 5dive plugin disable browser@5dive-browser    # a flag flip; the code stays on disk
+sudo 5dive plugin rollback browser@5dive-browser 1.1.0
+```
+
+`add` shows where the plugin comes from and exactly what it will be handed, then waits for you to agree: a plugin is code that runs with your agents' access. `5dive market --kind=plugin` is the catalog, and the same list is on the dashboard under **Plugins**.
+
+**Official and community.** A plugin from [github.com/5dive-ai](https://github.com/5dive-ai) is `official`. A plugin from any other repository is `community`, whatever its own manifest says. Community plugins install from the command line after a consent screen that shows the repository and commit and says: *Not from 5dive. It runs with your agents' access; there is no sandbox.* The dashboard's one-click install takes official plugins only.
+
+> **There is no remote kill switch.** Plugins are not signed yet and 5dive cannot revoke one, so if a community plugin turns out to be bad, the off switch is on your server: `sudo 5dive plugin disable <plugin>@<marketplace>` (or `remove`). Install community plugins from publishers you would trust with your agents' credentials.
+
+**Develop your own.** Start from [5dive-plugin-template](https://github.com/5dive-ai/5dive-plugin-template), the smallest plugin that installs: one verb, one skill and one setting. Any repository that follows the [5dive plugin standard](docs/plugin-contract.md) installs with `sudo 5dive plugin add <owner>/<repo>`: a `.claude-plugin/marketplace.json` naming its plugins, and a `plugin.json` that carries a `fivedive` block. A plain Claude Code plugin with no `fivedive` block is refused. [5dive-browser](https://github.com/5dive-ai/5dive-browser) and [5dive-voice](https://github.com/5dive-ai/5dive-voice) are two we ship that way; [5dive-plugins](https://github.com/5dive-ai/5dive-plugins) is the marketplace with the rest (telegram, dashboard, buzz). A plugin declares what it registers (`channel`, `verb`, `skill`, `mcp`). A verb plugin ships `bin/<verb>` and is reached only after every builtin command, so it can never take `5dive task` from you; a manifest naming a builtin, or a verb another plugin already claims, is refused at install.
+
+---
+
 <details>
 <summary><b>More team ops: accounts, a shared bot, commands, characters</b></summary>
 
@@ -407,27 +450,6 @@ sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 ```
 
 `--as` is the agent's name on your box; the pack supplies the persona, model, and skills. Add `--channels=telegram` to wire a bot at import time. Packs live in the [`5dive-ai/5dive-marketplace`](https://github.com/5dive-ai/5dive-marketplace) registry, and a `5dive.yaml` can reference one with `pack: <slug>`.
-
-### Plugins
-
-A plugin adds something to every seat on the box at once: a channel (Telegram, Discord), a verb (a new top-level `5dive <verb>`), or a capability such as a shared browser or voice. It is a directory with a Claude Code plugin manifest (`.claude-plugin/plugin.json`). 5dive installs it box-level and registers it with every existing agent and every agent created later: Claude Code seats through their own plugin install, other harnesses through the plugin's `AGENTS.md` section.
-
-```sh
-sudo 5dive plugin add 5dive-ai/5dive-browser       # from its own repository
-sudo 5dive plugin add 5dive-ai/5dive-voice         # from any GitHub repo that carries a marketplace.json
-sudo 5dive plugin list                             # version, tier, enabled, what it registers
-sudo 5dive plugin upgrade browser@5dive-browser
-sudo 5dive plugin disable browser@5dive-browser    # a flag flip; the code stays on disk
-sudo 5dive plugin rollback browser@5dive-browser 1.1.0
-```
-
-`add` shows where the plugin comes from and exactly what it will be handed, then waits for you to agree: a plugin is code that runs with your agents' access. `5dive market --kind=plugin` is the catalog, and the same list is on the dashboard under **Plugins**.
-
-**Official and community.** A plugin from [github.com/5dive-ai](https://github.com/5dive-ai) is `official`. A plugin from any other repository is `community`, whatever its own manifest says. Community plugins install from the command line after a consent screen that shows the repository and commit and says: *Not from 5dive. It runs with your agents' access; there is no sandbox.* The dashboard's one-click install takes official plugins only.
-
-> **There is no remote kill switch.** Plugins are not signed yet and 5dive cannot revoke one, so if a community plugin turns out to be bad, the off switch is on your server: `sudo 5dive plugin disable <plugin>@<marketplace>` (or `remove`). Install community plugins from publishers you would trust with your agents' credentials.
-
-**Develop your own.** Start from [5dive-plugin-template](https://github.com/5dive-ai/5dive-plugin-template), the smallest plugin that installs: one verb, one skill and one setting. Any repository that follows the [5dive plugin standard](docs/plugin-contract.md) installs with `sudo 5dive plugin add <owner>/<repo>`: a `.claude-plugin/marketplace.json` naming its plugins, and a `plugin.json` that carries a `fivedive` block. A plain Claude Code plugin with no `fivedive` block is refused. [5dive-browser](https://github.com/5dive-ai/5dive-browser) and [5dive-voice](https://github.com/5dive-ai/5dive-voice) are two we ship that way; [5dive-plugins](https://github.com/5dive-ai/5dive-plugins) is the marketplace with the rest (telegram, dashboard, buzz). A plugin declares what it registers (`channel`, `verb`, `skill`, `mcp`). A verb plugin ships `bin/<verb>` and is reached only after every builtin command, so it can never take `5dive task` from you; a manifest naming a builtin, or a verb another plugin already claims, is refused at install.
 
 ### See the org layer: `5dive ui`
 
