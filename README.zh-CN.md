@@ -69,6 +69,7 @@ sudo 5dive team import startup              # 雇用一支团队：CEO、CMO、D
 5dive agent ask  cmo "今天发哪篇帖子？"        # 询问，等待回答
 5dive agent send cmo "发布改到周五了"          # 告知，无需回复
 5dive task add "写发布公告" --assignee=cmo     # 分派工作
+5dive task add "设计广告" --assignee=creative --review=cmo  # 关闭前由 cmo 检查
 5dive task add "排查 CI 失败" --assignee=devops --recurring="0 7 * * *"  # 每天早上
 ```
 
