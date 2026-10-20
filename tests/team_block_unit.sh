@@ -70,7 +70,7 @@ echo "# (c) the seat sync"
 [[ $(grep -c '^<!-- 5dive:team:begin' "$SEAT") == 1 ]] && grep -qF "$(cat "$TEAM")" "$SEAT" \
   && ok "c1 the block is appended once, whole" || bad "c1 block not appended" "$(tail -3 "$SEAT")"
 grep -qx 'agent-maya' "$SUDO_LOG" && ok "c2 the write goes through the seat's own user" || bad "c2 write not via sudo -u agent-maya" "$(cat "$SUDO_LOG")"
-head -3 "$SEAT" | grep -qF 'Reply every turn.' && grep -qF 'Lead with the answer.' "$SEAT" \
+grep -qF 'Reply every turn.' <<<"$(head -3 "$SEAT")" && grep -qF 'Lead with the answer.' "$SEAT" \
   && ok "c3 text outside the block is kept" || bad "c3 outside text lost"
 cp "$SEAT" "$TMP/once"; : > "$SUDO_LOG"
 sync_seat_claudemd "$SEAT" agent-maya "$TEAM"
@@ -79,7 +79,7 @@ cmp -s "$SEAT" "$TMP/once" && [[ ! -s "$SUDO_LOG" ]] && ok "c4 a second run chan
 sed -i 's/only after a second, different check/whenever you like/' "$SEAT"; printf 'Own note after.\n' >> "$SEAT"
 sync_seat_claudemd "$SEAT" agent-maya "$TEAM"
 grep -qF 'only after a second, different check' "$SEAT" && ! grep -qF 'whenever you like' "$SEAT" \
-  && [[ $(grep -c '^<!-- 5dive:team:begin' "$SEAT") == 1 ]] && tail -1 "$SEAT" | grep -qx 'Own note after.' \
+  && [[ $(grep -c '^<!-- 5dive:team:begin' "$SEAT") == 1 ]] && grep -qx 'Own note after.' <<<"$(tail -1 "$SEAT")" \
   && ok "c5 a drifted block is replaced in place; a seat's own line after it is kept" || bad "c5 drift" "$(tail -4 "$SEAT")"
 printf 'precious\n' > "$TMP/target"; ln -s "$TMP/target" "$TMP/link.md"
 sync_seat_claudemd "$TMP/link.md" agent-maya "$TEAM" && bad "c6 a symlinked seat file must be refused" \
