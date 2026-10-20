@@ -26,8 +26,8 @@
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
-  <a href="#plugins">Plugins</a> ·
   <a href="#why-5dive">Why 5dive</a> ·
+  <a href="#plugins">Plugins</a> ·
   <a href="#things-to-try">Things to try</a> ·
   <a href="docs/zero-human.md">Zero-human proof</a> ·
   <a href="#for-your-ai-agent">Use from your AI agent</a> ·
@@ -76,6 +76,24 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 ---
 
+## Why 5dive
+
+**They escalate, you decide.** Agents work autonomously, and the calls you reserved come to your phone as tap-to-answer buttons: spend, publishing, anything destructive.
+
+**A company that runs itself.** Named agents on one host, reporting up an org chart, handing each other work off a shared backlog.
+
+**A subscription that's yours.** Official CLIs on your own Pro/Max or keys. No middleman, no OAuth proxy.
+
+**Runs as a service, not a session.** Agents stay alive when you close the terminal. Message them from Telegram any time.
+
+**Runs on tiny boxes.** 5dive adds no heavy runtime around your coding CLI: just Bash, SQLite, and systemd. A single-agent setup can comfortably run on a 1 GB VM.
+
+**Every major agent CLI.** `claude`, `codex`, `antigravity`, `grok`, `openclaw`, `hermes`, `opencode`, `pi`, all under one team.
+
+**Safe by default.** Each agent is its own Linux user under one of three isolation tiers. MIT, no open-core split.
+
+---
+
 ## Plugins
 
 A plugin gives every agent on your box a new ability at once, including agents you create later.
@@ -95,24 +113,6 @@ sudo 5dive plugin upgrade browser@5dive-browser     # move one to its newest rel
 ```
 
 Anyone can publish one: start from [5dive-plugin-template](https://github.com/5dive-ai/5dive-plugin-template). Trust, consent and the plugin standard are in [Managing plugins](#managing-plugins).
-
----
-
-## Why 5dive
-
-**They escalate, you decide.** Agents work autonomously, and the calls you reserved come to your phone as tap-to-answer buttons: spend, publishing, anything destructive.
-
-**A company that runs itself.** Named agents on one host, reporting up an org chart, handing each other work off a shared backlog.
-
-**A subscription that's yours.** Official CLIs on your own Pro/Max or keys. No middleman, no OAuth proxy.
-
-**Runs as a service, not a session.** Agents stay alive when you close the terminal. Message them from Telegram any time.
-
-**Runs on tiny boxes.** 5dive adds no heavy runtime around your coding CLI: just Bash, SQLite, and systemd. A single-agent setup can comfortably run on a 1 GB VM.
-
-**Every major agent CLI.** `claude`, `codex`, `antigravity`, `grok`, `openclaw`, `hermes`, `opencode`, `pi`, all under one team.
-
-**Safe by default.** Each agent is its own Linux user under one of three isolation tiers. MIT, no open-core split.
 
 ---
 
