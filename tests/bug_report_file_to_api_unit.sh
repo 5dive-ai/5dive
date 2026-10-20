@@ -12,7 +12,9 @@
 # next approved call drains it; a 4xx is an answer, not spooled; the asked-ledger
 # (same defect -> "already asked on <date>", another defect the same day -> "today");
 # a token-shaped --what is refused; and the negative control that no GitHub route
-# is left in cmd_bug.sh.
+# is left in cmd_bug.sh. DIVE-6616 (arm 5): no key file -> the open /bug-reports
+# route and its spool drain; an unreadable key -> the access message; a readable
+# one -> the keyed route, unchanged.
 set -uo pipefail
 
 TMP=""; SRV_PID=""
@@ -138,10 +140,68 @@ chk "a 404 (CLI released before the API route) exits E_TIMEOUT" "$E_TIMEOUT" "$?
 chk "...and IS spooled for the next approved call" 1 "$(find "$SPOOL" -name '*.json' | wc -l)"
 rm -f "$TMP/status" "$SPOOL"/*.json
 
-# ── 5. no readable box key: spooled, and the reason is named ──────────────────
-err=$(CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/none.env" cmd_bug --verb=task --exit=1 --what="no key" --no-probes --file --owner-approved </dev/null 2>&1)
-chk "no key exits E_TIMEOUT (spooled for a retry)" "$E_TIMEOUT" "$?"
-[[ "$err" == *"cannot read the box's key"* ]] && ok_t "the missing key is named" || fail_t "no-key text: $err"
+# ── 5. DIVE-6616: which key the box has decides the route ────────────────────
+# 5a. the key file is ABSENT (a self-installed box): sent anyway, to the open
+# route, with no Authorization header — never spooled for a key that cannot come.
+rm -f "$TMP"/reqs/*
+out=$(CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/none.env" cmd_bug --verb=task --exit=1 --what="no key" --no-probes --file --owner-approved </dev/null 2>&1)
+chk "5a no key file: exits 0 (sent)" 0 "$?"
+chk "5a one request reached the endpoint" 1 "$(nreq)"
+chk "5a it went to the open route /bug-reports" "/bug-reports" "$(req 0 .path)"
+chk "5a with no Authorization header" "null" "$(req 0 .auth)"
+chk "5a the body is the same allowlist" \
+  '["bash_version","exit_code","install_method","invocation","os","probes","verb","version","what"]' \
+  "$(req 0 .body | jq -cS keys)"
+[[ "$out" == *"bug report sent to 5dive"* ]] && ok_t "5a says sent" || fail_t "5a text: $out"
+chk "5a nothing spooled" 0 "$(find "$SPOOL" -name '*.json' 2>/dev/null | wc -l)"
+
+# 5b. no key file AND the open route is not there yet (an API older than this
+# CLI): spooled, and the reason names the self-installed case, not access.
+rm -f "$TMP"/reqs/*; echo 404 > "$TMP/status"
+err=$(CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/none.env" cmd_bug --verb=task --exit=1 --what="no key, old api" --no-probes --file --owner-approved </dev/null 2>&1)
+chk "5b no key file + 404: exits E_TIMEOUT (spooled)" "$E_TIMEOUT" "$?"
+[[ "$err" == *"this box has no 5dive key (self-installed)"* ]] && ok_t "5b the self-installed case is named" || fail_t "5b text: $err"
+[[ "$err" != *"cannot read"* ]] && ok_t "5b ...and it does not blame access" || fail_t "5b blames access: $err"
+chk "5b one spool file" 1 "$(find "$SPOOL" -name '*.json' | wc -l)"
+
+# 5c. the spool drains over the open route too, on the next approved send.
+rm -f "$TMP/status" "$TMP"/reqs/*
+out=$(CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/none.env" cmd_bug --verb=task --exit=1 --what="no key, api back" --no-probes --file --owner-approved </dev/null 2>&1)
+chk "5c next approved send exits 0" 0 "$?"
+chk "5c it sent itself plus the spooled one" 2 "$(nreq)"
+chk "5c both over the open route" "/bug-reports|/bug-reports|" "$(for i in 0 1; do req "$i" .path; done | tr '\n' '|')"
+chk "5c the spool is empty" 0 "$(find "$SPOOL" -name '*.json' | wc -l)"
+[[ "$out" == *"also sent 1 saved earlier"* ]] && ok_t "5c the drain is reported" || fail_t "5c text: $out"
+
+# 5d. the key file EXISTS but this seat cannot read it: the access message, spooled,
+# nothing sent anywhere (that box is ours; its report belongs on the keyed route).
+rm -f "$TMP"/reqs/*
+printf 'CONNECTORD_TOKEN=fake-file-token-1111\n' > "$TMP/locked.env"; chmod 000 "$TMP/locked.env"
+if [[ -r "$TMP/locked.env" ]]; then
+  ok_t "5d SKIP: running as root, a 000 file is still readable"
+else
+  err=$(CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/locked.env" cmd_bug --verb=task --exit=1 --what="locked key" --no-probes --file --owner-approved </dev/null 2>&1)
+  chk "5d unreadable key: exits E_TIMEOUT (spooled)" "$E_TIMEOUT" "$?"
+  [[ "$err" == *"this seat cannot read the box's key ($TMP/locked.env)"* ]] && ok_t "5d the access message names the file" || fail_t "5d text: $err"
+  chk "5d nothing reached the endpoint" 0 "$(nreq)"
+fi
+chmod 600 "$TMP/locked.env"; rm -f "$SPOOL"/*.json
+
+# 5e. the key file is readable: today's keyed route, unchanged.
+rm -f "$TMP"/reqs/*
+printf 'CONNECTORD_TOKEN="fake-file-token-2222"\n' > "$TMP/box.env"
+( CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/box.env" cmd_bug --verb=task --exit=1 --what="readable key" --no-probes --file --owner-approved </dev/null ) >/dev/null 2>&1
+chk "5e readable key: exits 0" 0 "$?"
+chk "5e to /server/bug-reports" "/server/bug-reports" "$(req 0 .path)"
+chk "5e with the file's key" "Bearer fake-file-token-2222" "$(req 0 .auth)"
+
+# 5f. a key file that is there but holds no key: still not the open route.
+rm -f "$TMP"/reqs/*
+printf 'OTHER=1\n' > "$TMP/empty.env"
+err=$(CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/empty.env" cmd_bug --verb=task --exit=1 --what="empty key file" --no-probes --file --owner-approved </dev/null 2>&1)
+chk "5f key file with no key: exits E_TIMEOUT (spooled)" "$E_TIMEOUT" "$?"
+[[ "$err" == *"holds no 5dive key"* ]] && ok_t "5f says the file holds no key" || fail_t "5f text: $err"
+chk "5f nothing reached the endpoint" 0 "$(nreq)"
 rm -f "$SPOOL"/*.json
 
 # ── 6. never ask twice about one defect; at most one ask a day ────────────────

@@ -92,14 +92,28 @@ _bug_spool() {
 # must keep its reports, not drop them. Sets _BUG_HTTP
 # to the status seen and _BUG_ID to the API's report id. The bearer goes in on
 # STDIN (`-H @-`), never argv — DIVE-5168's rule.
-_BUG_HTTP=""; _BUG_ID=""
+#
+# DIVE-6616: a self-installed box (the curl install) has no key file at all —
+# only boxes on our control plane get one — so every report it filed spooled
+# forever. When the file is ABSENT the same payload goes, unauthenticated, to
+# POST /bug-reports (capped per IP by the API). A file that is there but this
+# seat cannot read, or that holds no key, is still "no-token": that box is ours,
+# and its report belongs on the authenticated route.
+_BUG_HTTP=""; _BUG_ID=""; _BUG_KEYLESS=0
 _bug_post() {
-  local payload="$1" tok="" trc=0 out="" url
-  _BUG_HTTP=""; _BUG_ID=""
+  local payload="$1" tok="" trc=0 out="" url auth
+  _BUG_HTTP=""; _BUG_ID=""; _BUG_KEYLESS=0
   tok=$(_partner_box_token) || trc=$?
-  (( trc == 0 )) || { _BUG_HTTP="no-token"; return 1; }
-  url="$(_partner_api_base)/server/bug-reports"
-  out=$(printf 'Authorization: Bearer %s\n' "$tok" \
+  if (( trc == 0 )); then
+    url="$(_partner_api_base)/server/bug-reports"
+    auth=$(printf 'Authorization: Bearer %s' "$tok")
+  elif (( trc == 2 )) && [[ ! -e "$(_partner_connectord_env)" ]]; then
+    url="$(_partner_api_base)/bug-reports"
+    auth=""; _BUG_KEYLESS=1
+  else
+    _BUG_HTTP="no-token"; return 1
+  fi
+  out=$(printf '%s\n' "$auth" \
           | curl -sS --max-time "${FIVE_BUG_POST_TIMEOUT:-20}" -X POST "$url" -H @- \
               -H 'Content-Type: application/json' --data-binary "$payload" \
               -w '\n%{http_code}' 2>/dev/null) || true
@@ -223,7 +237,8 @@ Preview freely; send it only after your owner agrees.
                   fields underneath them)
 
   --file          re-print the SAME payload, then send it to 5dive's API with
-                  this box's own key. Nothing goes to GitHub or anywhere public.
+                  this box's own key (a self-installed box has none and sends
+                  it without one). Nothing goes to GitHub or anywhere public.
   --owner-approved
                   required with --file when there is no TTY (an agent): ask
                   your owner in one line, naming what failed, and pass this
@@ -483,8 +498,16 @@ cmd_bug() {
         "5dive's API refused the report (HTTP ${_BUG_HTTP}) — nothing was sent, and it is not saved for retry. The payload printed above is the only copy."
       ;;
     *)
-      local why="could not reach 5dive's API (HTTP ${_BUG_HTTP})"
-      [[ "$_BUG_HTTP" == "no-token" ]] && why="this seat cannot read the box's key ($(_partner_connectord_env))"
+      local why="could not reach 5dive's API (HTTP ${_BUG_HTTP})" envf
+      envf=$(_partner_connectord_env)
+      # DIVE-6616: only a file that is there and unreadable is an access problem.
+      if [[ "$_BUG_HTTP" == "no-token" && -e "$envf" && ! -r "$envf" ]]; then
+        why="this seat cannot read the box's key ($envf)"
+      elif [[ "$_BUG_HTTP" == "no-token" ]]; then
+        why="the box's key file ($envf) holds no 5dive key"
+      elif (( _BUG_KEYLESS )); then
+        why="this box has no 5dive key (self-installed), and 5dive's API could not take the report without one (HTTP ${_BUG_HTTP})"
+      fi
       spooled=$(_bug_spool "$payload") || spooled=""
       if [[ -n "$spooled" ]]; then
         fail "$E_TIMEOUT" "${why} — the report was NOT sent, but it is saved at ${spooled}; the next approved '5dive bug --file' sends it. Your owner already said yes, so don't ask them again."
