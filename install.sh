@@ -1464,6 +1464,16 @@ TOOLENV
     echo "warn: failed to stage operational-comms-CLAUDE.md — terse-comms default won't apply until the next refresh" >&2
   fi
 
+  # DIVE-6635: the team block appended to every claude-type agent's
+  # $HOME/.claude/CLAUDE.md at create, and refreshed on existing seats below
+  # (sync_seat_claudemd). Fail-soft like the fragments above.
+  if curl -fsSL "$REPO/team-CLAUDE.md" -o "$LIB_DIR/team-CLAUDE.md"; then
+    chmod 644 "$LIB_DIR/team-CLAUDE.md"
+    ok "team-CLAUDE.md"
+  else
+    echo "warn: failed to stage team-CLAUDE.md — agents keep their current team instructions until the next refresh" >&2
+  fi
+
   # DIVE-1210: project subagent that overrides the harness's built-in Explore
   # agent, pinning it to haiku instead of inheriting the session's model. CC
   # >=2.1.198 has Explore inherit the main conversation's model (capped at
@@ -1646,6 +1656,30 @@ sync_managed_block() {
   cat "$out" > "$live"; rm -f "$out"
 }
 
+# DIVE-6635 — bring one existing claude seat's own CLAUDE.md up to date:
+#   sync_seat_claudemd <seat CLAUDE.md> <seat user> <team block file>
+# That file is written once, at create, so without this only seats created after
+# a release would learn how to reach a teammate (a lead that never learned it used
+# Claude Code's own ListAgents, saw nobody, and worked alone for days). It also
+# renames the old model-tiering heading, which a lead on another model read as
+# "orchestrator mode is off, I work alone"; the new text is the old one with only
+# those two lines changed, so a migrated seat matches a new one byte for byte.
+# Written through the seat's own user, so a symlink the seat planted reaches only
+# what the seat itself could write. Returns 1 and changes nothing on any failure.
+sync_seat_claudemd() {
+  local live="$1" user="$2" team="$3" tmp
+  [[ -f "$live" && ! -L "$live" ]] || return 1
+  tmp="$(mktemp)" || return 1
+  cp "$live" "$tmp" || { rm -f "$tmp"; return 1; }
+  sed -i -e 's/^# Model tiering (orchestrator + minions)$/# Subagent model choice (Fable sessions only)/' \
+         -e 's/^Fable acts as the orchestrator: plan, decide/On Fable, plan, decide/' "$tmp" \
+    && sync_managed_block "$tmp" "$team" 5dive:team || { rm -f "$tmp"; return 1; }
+  if ! cmp -s "$tmp" "$live"; then
+    sudo -u "$user" tee "$live" < "$tmp" >/dev/null || { rm -f "$tmp"; return 1; }
+  fi
+  rm -f "$tmp"
+}
+
 # DIVE-5416 — is <file> an UNEDITED copy of a projects-CLAUDE.md this repo has
 # shipped? Every agent loads that file on every turn, so a box left on an old,
 # longer copy pays for it on each message. The test is the text OUTSIDE the two
@@ -1727,6 +1761,17 @@ projects_claudemd_is_stock() { # <file>
     sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:hired-agents \
       && ok "projects/CLAUDE.md (hired-agents block synced)" \
       || echo "warn: could not sync the hired-agents block into projects/CLAUDE.md" >&2
+  fi
+  # DIVE-6635: every registered claude seat gets the current team block.
+  if [[ -s "$LIB_DIR/team-CLAUDE.md" && -f "$STATE_DIR/agents.json" ]]; then
+    _team_n=0
+    while IFS=$'\t' read -r _team_seat _team_type; do
+      [[ "$_team_type" == claude && "$_team_seat" =~ ^[a-z0-9][a-z0-9-]*$ ]] || continue
+      id "agent-${_team_seat}" >/dev/null 2>&1 || continue
+      sync_seat_claudemd "/home/agent-${_team_seat}/.claude/CLAUDE.md" "agent-${_team_seat}" "$LIB_DIR/team-CLAUDE.md" \
+        && _team_n=$((_team_n + 1))
+    done < <(jq -r '.agents | to_entries[] | [.key, (.value.type // "claude")] | @tsv' "$STATE_DIR/agents.json" 2>/dev/null)
+    ok "team block current on ${_team_n} claude seat(s)"
   fi
   if [[ ! -e /home/claude/projects/AGENTS.md ]]; then
     ln -sfn CLAUDE.md /home/claude/projects/AGENTS.md

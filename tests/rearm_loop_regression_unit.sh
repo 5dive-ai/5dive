@@ -54,6 +54,7 @@ MODEL_FACING=(
   operational-comms-CLAUDE.md
   projects-CLAUDE.md
   model-tiering-CLAUDE.md
+  team-CLAUDE.md
 )
 
 echo "== 1. STATIC: no recursive-loop instruction in model-facing text =="
