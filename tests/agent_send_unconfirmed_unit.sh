@@ -14,8 +14,11 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 # shellcheck disable=SC2154
-trap 'rc=$?; [[ -n "${SCOPED_DELIVER_ARGV:-}" ]] && rm -f "$SCOPED_DELIVER_ARGV"; echo "HARNESS-RC=$rc"' EXIT
+trap 'rc=$?; [[ -n "${SCOPED_DELIVER_ARGV:-}" ]] && rm -f "$SCOPED_DELIVER_ARGV"; [[ -n "${A2A_ROUND_LEDGER:-}" ]] && rm -f "$A2A_ROUND_LEDGER"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
+# The verbs count a2a rounds; keep this harness's maker->ada sends off the
+# host's real ledger (DIVE-6586 found 16 of them there).
+A2A_ROUND_LEDGER=$(mktemp); export A2A_ROUND_LEDGER
 
 # shellcheck disable=SC1091
 source src/header.sh
@@ -265,6 +268,56 @@ if [[ "$err" == *"no idle reply from 'ada' within 1s"* && "$err" == *"not observ
 else
   bad_t 'T26 scoped ask timeout still asserts a delivery failure' "$err"
 fi
+
+# DIVE-6586: a RECEIPT read that fails after the message was spooled must not
+# turn the send into rc 1. On a box (2026-10-19) the depth read failed under
+# errexit: rc 1, empty stdout and stderr, an audit row with no queued=1, and
+# the sender re-sent a message that was already in the spool, six times.
+# Every arm above runs the verbs inside `$(…)` or behind `|| true`, and bash
+# clears errexit in both, so none of them could see this. These run in a plain
+# `( set -e; … )` with errexit in force, and the subshell's EXIT trap writes
+# AUDIT_ARGS the way main.sh's does, so the row is graded as written.
+_a2a_queue_depth() { printf '0\n'; return 1; }   # find/sudo non-zero, as on the box
+d6586=$(mktemp -d)
+for site in cmd_send cmd_deliver; do
+  : >"$d6586/out"; : >"$d6586/err"; : >"$d6586/audit"
+  set +e
+  (
+    set -e
+    trap 'printf "%s\n" "${AUDIT_ARGS[*]:-}" >"$d6586/audit"' EXIT
+    # Boundaries the lax arms above never reach: under errexit an unstubbed
+    # lookup is rc 127 before the branch under test.
+    envelope_provenance() { printf 'unclaimed\n'; }
+    actor_routing_agent() { return 1; }
+    _buzz_mirror_outbound() { :; }
+    AUDIT_ARGS=()
+    if [[ "$site" == cmd_send ]]; then
+      JSON_MODE=1 INJECT_RC=4 cmd_send ada ping --raw
+    else
+      JSON_MODE=1 INJECT_RC=4 cmd_deliver ada ping
+    fi
+  ) >"$d6586/out" 2>"$d6586/err"
+  rc=$?
+  set -e
+  out=$(<"$d6586/out"); a=" $(<"$d6586/audit") "
+  if [[ "$rc" == 0 ]]; then
+    ok_t "T27 $site: spooled + failing depth read exits 0"
+  else
+    bad_t "T27 $site: spooled + failing depth read exits $rc" \
+      "stdout=[$out] stderr=[$(<"$d6586/err")] audit=[$a]"
+  fi
+  if [[ "$site" == cmd_send ]]; then
+    is "T28 $site: receipt says sent:false" false "$(jq -r '.data.sent' <<<"$out" 2>/dev/null)"
+  else
+    is "T28 $site: receipt says delivered:false" false "$(jq -r '.data.delivered' <<<"$out" 2>/dev/null)"
+  fi
+  is "T29 $site: receipt says queued:true" true "$(jq -r '.data.queued' <<<"$out" 2>/dev/null)"
+  [[ "$a" == *" queued=1 "* && "$a" == *" spool_depth=unknown "* ]] \
+    && ok_t "T30 $site: audit row carries queued=1 spool_depth=unknown" \
+    || bad_t "T30 $site: audit row lost the queued fact" "$a"
+done
+rm -rf "$d6586"
+_a2a_queue_depth() { printf '2\n'; }
 
 printf 'agent_send_unconfirmed_unit: %d passed, %d failed, %d not reached\n' "$PASS" "$FAIL" "$NOT_REACHED"
 [[ "$FAIL" -eq 0 ]]

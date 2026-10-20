@@ -2575,16 +2575,23 @@ cmd_deliver() {
     # as an unconfirmed submit (see cmd_send) plus the additive queued:true.
     _delivered=0
     _queued=1
-    local _depth; _depth="$(_a2a_queue_depth "$target")"; _depth="${_depth//[^0-9]/}"
-    _reason="$(_a2a_queued_reason "$_depth")"
+    # DIVE-6586: every read after inject_and_submit is a RECEIPT step, and a
+    # receipt step must never turn a spooled message into a failed send. The
+    # depth read is a sudo+find pipeline under pipefail; its non-zero status in
+    # `x="$(f)"` was errexit, so the send exited 1 with nothing printed AFTER the
+    # message was already in the spool, and the sender re-sent it (6 copies on a
+    # box, 2026-10-19). A failed read is an unknown depth, not a failed send.
+    local _depth=""; _depth="$(_a2a_queue_depth "$target")" || _depth=""; _depth="${_depth//[^0-9]/}"
+    _reason="$(_a2a_queued_reason "$_depth")" || _reason="$(_a2a_queued_reason)" || true
     # DIVE-6414: the audit row said `result=ok code=0` for a spooled message
     # exactly as for a typed one, so a reader of agent-audit.log took "queued"
     # for "delivered" (measured on a box 2026-10-17). The rc stays 0 — the
     # receipt is honest and callers depend on it — so the row carries the fact.
-    AUDIT_ARGS+=("queued=1" "spool_depth=${_depth:-0}")
+    AUDIT_ARGS+=("queued=1" "spool_depth=${_depth:-unknown}")
   elif (( _rc != 0 )); then
     _delivered=0
-    _reason="$(_agent_submit_unconfirmed_reason "$target" "$_rc")"
+    _reason="$(_agent_submit_unconfirmed_reason "$target" "$_rc")" \
+      || _reason="the payload was typed but the submit could not be verified"   # DIVE-6586
   fi
   # DIVE-3573 (a): mirror the outbound into the sender's buzz channel.
   #
@@ -3505,12 +3512,14 @@ cmd_send() {
     # the two apart, and it is additive.
     _sent=0
     _queued=1
-    local _depth; _depth="$(_a2a_queue_depth "$name")"; _depth="${_depth//[^0-9]/}"
-    _reason="$(_a2a_queued_reason "$_depth")"
-    AUDIT_ARGS+=("queued=1" "spool_depth=${_depth:-0}")   # DIVE-6414, as in cmd_deliver
+    # DIVE-6586: non-fatal receipt reads, as in cmd_deliver (the comment is there).
+    local _depth=""; _depth="$(_a2a_queue_depth "$name")" || _depth=""; _depth="${_depth//[^0-9]/}"
+    _reason="$(_a2a_queued_reason "$_depth")" || _reason="$(_a2a_queued_reason)" || true
+    AUDIT_ARGS+=("queued=1" "spool_depth=${_depth:-unknown}")   # DIVE-6414, as in cmd_deliver
   elif (( _rc != 0 )); then
     _sent=0
-    _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")"
+    _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")" \
+      || _reason="the payload was typed but the submit could not be verified"   # DIVE-6586
   fi
 
   # DIVE-5689: a SYSTEM NOTICE is not something the invoking seat said. The task
@@ -3884,7 +3893,8 @@ cmd_ask() {
     if (( _rc == 3 )); then
       fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
     elif (( _rc != 0 )); then
-      local _reason; _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")"
+      local _reason; _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")" \
+        || _reason="the payload was typed but the submit could not be verified"   # DIVE-6586
       _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
       return 0
     fi
