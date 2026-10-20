@@ -77,8 +77,11 @@ Put the plugin in its own directory, not at the repository root. `.5dive-plugin/
   `browser-profiles`. These appear in plain English on the consent screen. If you
   leave this out, the plugin gets nothing beyond its own directory.
 - **`fivedive.setup`** (optional, `{"hint": "…", "command": "…"}`) is a one-time
-  host step. 5dive prints it after install and never runs it by itself. The user
-  runs `sudo 5dive plugin setup <plugin>`.
+  host step. 5dive prints it after install and never runs it first. The user
+  runs `sudo 5dive plugin setup <plugin>`. When a newer version of an official
+  plugin changes the files its setup installs, the nightly update runs that step
+  again if the owner ran it with `plugin setup` before, and otherwise prints that
+  it is owed.
 
 ## Official and community
 
@@ -125,3 +128,10 @@ sudo 5dive plugin rollback <plugin>@<marketplace>    # flips back
 sudo 5dive plugin enable|disable <plugin>@<marketplace>
 sudo 5dive plugin remove <plugin>@<marketplace>
 ```
+
+Official plugins are kept current by `sudo 5dive self-update` (the nightly update on
+a self-installed server): it refreshes each plugin's marketplace and upgrades the
+plugin to the newest version there. It never upgrades a disabled plugin and never
+moves one to a lower version. Community plugins are not moved: the update prints
+`<plugin> at 1.0.0, the marketplace offers 1.1.0` and leaves the upgrade to you.
+`5dive update --check` lists every box plugin that is behind.

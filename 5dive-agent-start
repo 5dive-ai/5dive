@@ -38,8 +38,16 @@ fi
 # Agents run as agent-<name> but shared configs point to /home/claude, so we
 # source claude's nvm.sh (the agent user has no nvm of its own).
 export NVM_DIR="/home/claude/.nvm"
+# DIVE-6618: the seat's tool-env shim (BASH_ENV) sets NPM_CONFIG_PREFIX=~/.local
+# so `npm -g` stays in the seat's home, and nvm.sh refuses to load beside it,
+# printing "nvm is not compatible with the NPM_CONFIG_PREFIX environment
+# variable" on every agent start. Load nvm without it, then put it back.
+_npm_prefix="${NPM_CONFIG_PREFIX-}"
+unset NPM_CONFIG_PREFIX
 # shellcheck disable=SC1091
 [[ -s "$NVM_DIR/nvm.sh" ]] && . "$NVM_DIR/nvm.sh" || true
+if [[ -n "$_npm_prefix" ]]; then export NPM_CONFIG_PREFIX="$_npm_prefix"; fi
+unset _npm_prefix
 
 # DIVE-1263: the opencode/pi telegram bridges are launched via `bun`, but our
 # installers drop bun in DIFFERENT places depending on the path taken:
