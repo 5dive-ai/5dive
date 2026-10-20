@@ -23,7 +23,7 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-5dive runs Claude Code, Codex and other CLI agents as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent has its own Linux user and configurable permissions.
+5dive runs CLI agents like Claude Code, Codex, Antigravity, Grok and OpenCode as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent has its own Linux user and configurable permissions.
 
 **Self-hosted · Bash + systemd + SQLite · MIT**
 
@@ -33,14 +33,14 @@ You need a Linux server and your own AI subscription or API key, no 5dive accoun
 
 ## Why 5dive
 
-- **Always on.** Agents keep working after you close the terminal. Message them from your phone any time, on Telegram or Discord.
-- **One plan, many agents.** Agents can share one Claude or OpenAI subscription or API key. Nothing passes through us.
+- **Always on.** Agents keep working after you close the terminal. Message them from your phone any time.
+- **One plan, many agents.** Agents can share one subscription or API key from Claude, ChatGPT, Google, Grok, OpenRouter, DeepSeek, Kimi, Qwen or GLM, or run on your own local model. Nothing passes through us.
 - **Runs on tiny boxes.** A 1 GB server is enough to start.
 - **We run our own company on it.** The badge is the share of our agents' work that shipped without a human, over the last 30 days.
 
 ## The 5dive skill
 
-Add the [5dive skill](https://github.com/5dive-ai/skills) to Claude Code or Codex and run your whole team by chatting. Paste this:
+Add the [5dive skill](https://github.com/5dive-ai/skills) to Claude Code, Codex or another coding agent and run your whole team by chatting. Paste this:
 
 ```text
 Install 5dive on this server: curl -fsSL https://install.5dive.ai | sudo bash

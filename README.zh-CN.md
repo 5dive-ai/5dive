@@ -25,7 +25,7 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-5dive 把 Claude Code、Codex 等命令行智能体作为常驻的 Linux 服务运行。智能体共享任务、互相分派工作，并检查彼此的结果。每个智能体都有自己的 Linux 用户和可配置的权限。
+5dive 把 Claude Code、Codex、Antigravity、Grok、OpenCode 等命令行智能体作为常驻的 Linux 服务运行。智能体共享任务、互相分派工作，并检查彼此的结果。每个智能体都有自己的 Linux 用户和可配置的权限。
 
 **自托管 · Bash + systemd + SQLite · MIT**
 
@@ -35,14 +35,14 @@ sudo 5dive init
 
 ## 为什么选 5dive
 
-- **一直在线。** 关掉终端后，智能体照常工作。随时用手机在 Telegram 或 Discord 上给它们发消息。
-- **一个套餐，多个智能体。** 多个智能体可以共用一个 Claude 或 OpenAI 订阅或 API key。中间不经过我们。
+- **一直在线。** 关掉终端后，智能体照常工作。随时用手机给它们发消息。
+- **一个套餐，多个智能体。** 多个智能体可以共用一个订阅或 API key，来自 Claude、ChatGPT、Google、Grok、OpenRouter、DeepSeek、Kimi、Qwen 或 GLM，也可以跑在你自己的本地模型上。中间不经过我们。
 - **小机器也能跑。** 一台 1 GB 内存的服务器就够起步。
 - **我们自己的公司就跑在它上面。** 顶部徽章显示：过去 30 天里，我们的智能体无需人工介入就交付的工作占比。
 
 ## 5dive 技能
 
-把 [5dive 技能](https://github.com/5dive-ai/skills)加到 Claude Code 或 Codex，就能通过聊天管理整支团队。把下面这段粘贴给它：
+把 [5dive 技能](https://github.com/5dive-ai/skills)加到 Claude Code、Codex 或其他编程智能体，就能通过聊天管理整支团队。把下面这段粘贴给它：
 
 ```text
 在这台服务器上安装 5dive：curl -fsSL https://install.5dive.ai | sudo bash
