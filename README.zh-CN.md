@@ -97,22 +97,24 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 | 命令 | 作用 |
 |---|---|
 | `5dive agent create` · `list` · `logs` | 运行和管理智能体 |
-| `5dive agent import <pack>` | 从市场雇用一个智能体 |
+| `5dive market` · `agent import <pack>` | 浏览市场，雇用一个智能体 |
 | `5dive team import <team>` | 雇用整支团队 |
 | `5dive export` · `5dive up` | 把团队配置存成一个文件，在任何服务器上启动 |
 | `5dive agent switch <name> --to=codex` | 让智能体在 Claude Code 和 Codex 之间切换，记忆和任务都保留 |
 | `5dive org tree` | 谁向谁汇报 |
+| `5dive human add` | 把一个人加进团队，其智能体的审批会发给这个人 |
 | `5dive agent ask` · `send` | 询问智能体，或告诉它一件事 |
 | `5dive task add` · `ls` · `inbox` | 共享任务列表，以及等你处理的事 |
 | `5dive trace <task>` | 一个任务从提出到结论的完整历史 |
 | `5dive reflex log` | 每个例行决策都有记录，比如任务交给了谁、为什么 |
+| `5dive company` · `objective add` | 给团队一个目标数字，规划者会不断重新规划，直到达成 |
 | `5dive goal add "<outcome>"` | 把一个目标拆成一组任务 |
 | `5dive loop install <loop>` | 给智能体一项定时工作 |
 | `5dive memory search "<query>"` | 搜索智能体学到的东西 |
 | `5dive trigger add` | 把 GitHub 或 webhook 事件变成任务 |
 | `5dive watch` · `5dive wall` | 实时观看团队工作 |
 | `5dive digest on` | 团队每日摘要，发到你的 Telegram |
-| `sudo 5dive usage` | 哪些智能体和任务在消耗你的套餐额度 |
+| `sudo 5dive usage` · `activity <agent>` | 谁在消耗你的套餐额度，以及每个智能体实际做了什么 |
 | `5dive fleet status` | 你所有服务器上的智能体 |
 | `5dive plugin add <repo>` | 添加插件 |
 | `5dive doctor` · `self-update` | 检查服务器，更新 5dive |
@@ -150,7 +152,7 @@ Linux 用户隔离智能体；`systemd` 负责进程守护；SQLite 存储任务
 
 ## 安全
 
-智能体使用 `sandboxed`、`standard` 或 `admin` 权限。`init` 创建的第一个智能体默认是 `admin`。人工审批可以配置。5dive 不收集遥测数据；API key 直接发给各自的模型提供商。以 root 运行 [`install.sh`](install.sh) 之前，请先审阅它。卸载 5dive：`curl -fsSL https://install.5dive.ai | sudo bash -s -- --uninstall`。
+智能体使用 `sandboxed`、`standard` 或 `admin` 权限。`init` 创建的第一个智能体默认是 `admin`。人工审批可以配置。5dive 不收集遥测数据；API key 直接发给各自的模型提供商。以 root 运行 [`install.sh`](install.sh) 之前，请先审阅它。卸载 5dive：`sudo 5dive uninstall`。
 
 使用 `5dive push` 时，智能体通过你自己的 GitHub App 推送代码，从不持有它的 token。[委托 git push →](docs/delegated-push.md) · [权限与隔离 →](https://5dive.ai/docs/5dive-cli#isolation)
 

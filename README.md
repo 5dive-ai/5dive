@@ -95,22 +95,24 @@ Agents save what they learn as notes and search them later, with sources. The te
 | Command | What it does |
 |---|---|
 | `5dive agent create` · `list` · `logs` | Run and manage agents |
-| `5dive agent import <pack>` | Hire an agent from the marketplace |
+| `5dive market` · `agent import <pack>` | Browse the marketplace, hire an agent |
 | `5dive team import <team>` | Hire a whole team |
 | `5dive export` · `5dive up` | Save your team's setup to one file, bring it up on any server |
 | `5dive agent switch <name> --to=codex` | Move an agent between Claude Code and Codex, memory and tasks kept |
 | `5dive org tree` | Who reports to whom |
+| `5dive human add` | Add a person to the team; their agents' approvals go to them |
 | `5dive agent ask` · `send` | Ask an agent, or tell it something |
 | `5dive task add` · `ls` · `inbox` | The shared task list, and what's waiting on you |
 | `5dive trace <task>` | A task's full history, from the request to the verdict |
 | `5dive reflex log` | A receipt for every routine decision, like who got a task and why |
+| `5dive company` · `objective add` | Give the team a target number; a planner keeps re-planning until it's hit |
 | `5dive goal add "<outcome>"` | Turn an outcome into a plan of tasks |
 | `5dive loop install <loop>` | Give an agent a job on a schedule |
 | `5dive memory search "<query>"` | Search what your agents learned |
 | `5dive trigger add` | Turn GitHub or webhook events into tasks |
 | `5dive watch` · `5dive wall` | Watch the team work, live |
 | `5dive digest on` | The team's daily summary, sent to your Telegram |
-| `sudo 5dive usage` | Which agents and tasks use up your plan's limits |
+| `sudo 5dive usage` · `activity <agent>` | Who used your plan's limits, and what each agent actually did |
 | `5dive fleet status` | Agents across all your servers |
 | `5dive plugin add <repo>` | Add a plugin |
 | `5dive doctor` · `self-update` | Check the server, update 5dive |
@@ -148,7 +150,7 @@ Linux users isolate agents; `systemd` supervises them; SQLite stores tasks; `cro
 
 ## Security
 
-Agents use `sandboxed`, `standard` or `admin` permissions. The first agent created by `init` is `admin` by default. Human approvals are configurable. No 5dive telemetry; API keys go directly to their providers. Review [`install.sh`](install.sh) before running it as root. To remove 5dive: `curl -fsSL https://install.5dive.ai | sudo bash -s -- --uninstall`.
+Agents use `sandboxed`, `standard` or `admin` permissions. The first agent created by `init` is `admin` by default. Human approvals are configurable. No 5dive telemetry; API keys go directly to their providers. Review [`install.sh`](install.sh) before running it as root. To remove 5dive: `sudo 5dive uninstall`.
 
 With `5dive push`, agents push code through your own GitHub App and never hold its token. [Delegated git push →](docs/delegated-push.md) · [Permissions and isolation →](https://5dive.ai/docs/5dive-cli#isolation)
 
