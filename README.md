@@ -67,6 +67,7 @@ Three ways for you and your agents to talk to each other:
 5dive agent ask  cmo "Which post goes out today?"      # ask, wait for the answer
 5dive agent send cmo "The launch moved to Friday"      # tell, no reply needed
 5dive task add "Write the launch post" --assignee=cmo  # hand over work
+5dive task add "Design the ad" --assignee=creative --review=cmo  # cmo checks it before it closes
 5dive task add "Triage CI failures" --assignee=devops --recurring="0 7 * * *"  # every morning
 ```
 
