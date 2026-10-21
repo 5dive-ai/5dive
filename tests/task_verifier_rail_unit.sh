@@ -379,8 +379,10 @@ has "$(cat "$TMP"/err)" "--priority=high" \
 # rows: 15% flagged against a ~67% human read, so the window sat at 3/20 under a
 # 5/20 threshold and the cap never fired once in the five days after it went
 # live. Each title below was a real MISS. They are the arm, not an example.
+# DIVE-6652 narrowed one of them: the bare "gate" is now a compound ("merge
+# gate"), because on a customer box a bare gate is the customer's own (T11r).
 _t11j_missed=(
-  "the gate is unsatisfiable once a branch tip moves"
+  "the merge gate is unsatisfiable once a branch tip moves"
   "the verifier never picks the row back up"
   "PII guard scans no content on a direct push to main"
   "council verify --json double-reports on a RED verdict"
@@ -449,6 +451,67 @@ nb2_out=$(run add --assignee=alice --priority=medium -- "w review gate harness s
 (( nb2_rc != 0 )) && has "$(cat "$TMP"/err)$nb2_out" "filing cap" \
   && ok_t "T11n restoring the prod declaration restores the refusal (T11m was the store, not a broken cap)" \
   || bad_t "T11n restoring the prod declaration restores the refusal (T11m was the store, not a broken cap)" "rc=$nb2_rc $nb2_out $(cat "$TMP"/err)"
+
+# T11r-T11u: DIVE-6652. On teal-fox (a customer box) the cap refused a customer's
+# "commit the digest CSS" row on a 6/20 window whose 6 hits were ALL customer
+# product rows: gate x3, digest, unit, board. The real machinery count was 0.
+# _t11_seed fills the window with plain SQL rows (only titles feed the ratio),
+# then each arm files one row through the real `task add`.
+_t11_seed() { # <title>... — clears the board, then inserts these titles oldest-first
+  db "DELETE FROM tasks;"
+  local _s
+  for _s in "$@"; do db "INSERT INTO tasks (title, created_by) VALUES ($(sqlq "$_s"), 'alice');"; done
+}
+_t11_neutral=()
+for i in $(seq 1 14); do _t11_neutral+=("acme storefront: product page copy pass ${i}"); done
+
+# T11r (accept 1): the six teal-fox shapes plus 14 neutral rows. Pre-fix this
+# reads 6/20 and the digest title makes it 7/21 — refused.
+_t11_seed "${_t11_neutral[@]}" \
+  "acme news: hold the morning post until the feed-publish gate passes" \
+  "acme news: the leak-scan gate blocks the RU edition" \
+  "acme news: gate the weekend issue on the editor's sign-off" \
+  "acme bonds: weekly bond-digest page adds the yield table" \
+  "acme trade: customs unit values in EUR" \
+  "acme review: write critic-board-passed into the JSON"
+r_json=$(run add --assignee=alice --priority=medium -- "acme.example: commit the 42 digest CSS to acme/news (ru)")
+r_id=$(printf '%s' "$r_json" | jf '.data.id')
+[[ -n "$r_id" && "$r_id" != "null" ]] \
+  && ok_t "T11r a customer's digest row files without --customer on a board of customer gate/digest/unit/board rows" \
+  || bad_t "T11r a customer's digest row files without --customer on a board of customer gate/digest/unit/board rows" "$r_json $(cat "$TMP"/err)"
+
+# T11s (accept 2, the negative control): genuine machinery still trips it.
+_t11_seed "${_t11_neutral[@]:0:14}" \
+  "verifier rail skips the recurring row" "heartbeat drops a wake on a parked row" \
+  "harness reds on a fresh store" "verifier rail double-books a grader" \
+  "heartbeat tick misses the coordinator" "harness reds under set -e"
+s_out=$(run add --assignee=alice --priority=medium -- "heartbeat drops the second wake"); s_rc=$?
+(( s_rc != 0 )) && has "$(cat "$TMP"/err)$s_out" "filing cap" \
+  && ok_t "T11s a medium machinery row is still refused on a 6/20 machinery board" \
+  || bad_t "T11s a medium machinery row is still refused on a 6/20 machinery board" "rc=$s_rc $s_out $(cat "$TMP"/err)"
+
+# T11t (accept 3): rows filed WITH --customer stay in the window but are never a
+# hit. Six machinery-sounding customer rows go in through the real verb, so the
+# flag has to be stored; pre-fix they counted 6/20 and refused the next filer.
+_t11_seed "${_t11_neutral[@]}"
+for i in 1 2 3 4 5 6; do
+  run add --assignee=alice --priority=medium --customer -- "acme checkout: harness for the cart flow ${i}" >/dev/null
+done
+read -r t_hits t_win < <(_task_internal_recent_ratio 20)
+t_out=$(run add --assignee=alice --priority=medium -- "the release-cut harness is red"); t_rc=$?
+[[ "$t_hits $t_win" == "0 20" ]] && (( t_rc == 0 )) \
+  && ok_t "T11t --customer rows are stored and never counted as machinery (window 0/20, next internal row files)" \
+  || bad_t "T11t --customer rows are stored and never counted as machinery" "window=$t_hits/$t_win rc=$t_rc $(cat "$TMP"/err)"
+
+# T11u: and the same six titles filed WITHOUT the flag are hits — T11t moved on
+# the stored flag, not on a classifier that stopped matching them.
+_t11_cart=()
+for i in 1 2 3 4 5 6; do _t11_cart+=("acme checkout: harness for the cart flow ${i}"); done
+_t11_seed "${_t11_neutral[@]}" "${_t11_cart[@]}"
+read -r u_hits u_win < <(_task_internal_recent_ratio 20)
+[[ "$u_hits $u_win" == "6 20" ]] \
+  && ok_t "T11u control: the same titles without --customer count 6/20" \
+  || bad_t "T11u control: the same titles without --customer count 6/20" "window=$u_hits/$u_win"
 _TASK_FILING_DAILY_CAP="$_t11_daily_cap"
 
 # --- T12: THE CAP PATH SURVIVES `set -e`, which is how it ships -------------

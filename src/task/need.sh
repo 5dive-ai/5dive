@@ -2829,8 +2829,11 @@ cmd_task_need() {
     esac
   fi
   local cur; cur=$(db "SELECT status FROM tasks WHERE id=${id};")
+  # DIVE-6652: name a step that exists. There is no reopen verb, and `task start`
+  # refuses a CLOSED row on purpose (DIVE-2113), so the old "reopen it" advice
+  # sent a seat through three dead calls before it filed the follow-up by hand.
   [[ "$cur" == "done" || "$cur" == "cancelled" ]] \
-    && fail "$E_CONFLICT" "$ident is $cur — reopen it before gating on a human"
+    && fail "$E_CONFLICT" "$ident is $cur — a closed row takes no new gate; file a follow-up (5dive task add \"<the next step>\" --parent=$ident) and gate that one"
 
   # DIVE-891: resolve the gate's risk tier (adopted DIVE-861 design).
   #   0 = auto-clear: the recommendation applies immediately, no ping, digest line

@@ -926,6 +926,10 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     parent="$(db "SELECT COALESCE(p.ident,'') FROM tasks t LEFT JOIN tasks p ON p.id=t.parent_id WHERE t.id=${id};" 2>/dev/null)" \
     actor="$creator" claimed_by="$derived_actor" in="$title" \
     detail="${priority} → ${assignee:-unassigned}${verifier:+ (verifier ${verifier})}"
+  # DIVE-6652: --customer is stored, so the filing cap's recent-rows window
+  # (_task_internal_recent_ratio) stops counting this row as internal machinery.
+  # A ledger event rather than a column: no schema epoch bump for one bit.
+  [[ -n "$customer_facing" ]] && ledger_emit task.customer ident="$ident" task_id="$id" actor="$creator"
   # DIVE-4866: the routing decision's receipt (task-route). Additive only; see
   # src/lib/reflex.sh. The `|| true` covers a harness with no reflex.sh sourced.
   reflex_receipt policy=task-route ident="$ident" task_id="$id" actor="$creator" \

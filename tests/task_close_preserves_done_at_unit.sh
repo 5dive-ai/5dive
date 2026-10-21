@@ -204,7 +204,7 @@ f2_at=$(doneat_of "$F")
 # Same verb, different branch: it does not bounce, it files a gate. Symmetry says
 # "clear done_at here too"; measurement says otherwise, and this arm is why the
 # source does not. On a row that was CLOSED, `task need` REFUSES (rc=5, "is done —
-# reopen it before gating on a human"), so the status stays 'done' — clearing
+# a closed row takes no new gate"), so the status stays 'done' — clearing
 # done_at would leave a done row with no close clock, a new contradiction rather
 # than a fix. So the invariant graded here is PRESERVED, same as B/C/E.
 #
@@ -230,6 +230,23 @@ g_st=$(status_of "$G"); g_at=$(doneat_of "$G")
 [[ "$g_at" == "$SENTINEL" && "$g_st" == "done" ]] \
   && ok_t "G: reject-at-max_iterations PRESERVES done_at — it does not reopen, so the close clock stands" \
   || bad_t "G: reject-at-max_iterations moved or cleared done_at" "got '$g_at' (want '$SENTINEL') on status=$g_st"
+
+# ── H: DIVE-6652 — the refusal names a step that EXISTS ─────────────────────────
+# `task need` on a closed row said "reopen it", and there is no reopen verb and
+# `task start` refuses a CLOSED row on purpose (DIVE-2113). A seat on teal-fox
+# spent three calls on that advice. The refusal now names the follow-up row.
+for h_close in done cancelled; do
+  H=$(add "H gate on a $h_close row" --assignee=dev)
+  if [[ "$h_close" == done ]]; then as dev cmd_task_done "$H" --result="closed" >/dev/null
+  else as dev cmd_task_cancel "$H" --result="not needed" >/dev/null; fi
+  as dev cmd_task_need "$H" --type=approval --ask="Should I publish the follow-up page now?" --recommend=yes >/dev/null; h_rc=$?
+  h_err=$(cat "$TMP"/err)
+  [[ "$(status_of "$H")" == "$h_close" ]] \
+    || bad_t "H/REACHABILITY: $h_close fixture not closed" "status=$(status_of "$H")"
+  (( h_rc != 0 )) && [[ "$h_err" == *"--parent=$H"* && "$h_err" != *reopen* ]] \
+    && ok_t "H: task need on a $h_close row refuses with a follow-up row (--parent=$H), never 'reopen'" \
+    || bad_t "H: task need on a $h_close row names a step that does not exist" "rc=$h_rc $(head -c 300 <<<"$h_err")"
+done
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

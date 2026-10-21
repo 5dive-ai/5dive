@@ -3249,7 +3249,7 @@ cmd_task_reject() {
   # DIVE-2477 considered clearing done_at here too, by symmetry with the
   # bounce-back below, and MEASURED that it would be wrong: this branch does not
   # reopen the row, it files a gate — and on a row that was CLOSED, `task need`
-  # refuses (rc=5, "is done — reopen it before gating on a human"), so the status
+  # refuses (rc=5, "is done — a closed row takes no new gate; file a follow-up"), so the status
   # stays 'done'. Clearing done_at would leave a done row with no close clock: a
   # NEW contradiction, not a fix. That refusal also means a reject at
   # max_iterations over a closed row cannot escalate at all (it writes the
