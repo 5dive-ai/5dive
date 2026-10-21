@@ -22,7 +22,7 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-5dive runs Claude Code, Codex and other CLI agents as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent has its own Linux user and configurable permissions.
+5dive runs Claude Code, Codex and other CLI agents as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent runs as its own Linux user, with permissions you choose.
 
 **Self-hosted · Bash + systemd + SQLite · MIT**
 
