@@ -97,7 +97,7 @@ out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Liv"]' ]] \
 out=$(run olivia --names=) && [[ "$(jq -c .data.names <<<"$out")" == '[]' && "$(jq 'has("groupsCallNames")' "$STATE/access.json")" == false ]] \
   && okk 'an empty --names= clears the list' || bad "clear: $out"
 cp "$STATE/access.json" "$TMP/keep"
-for badnames in '.*' 'a' 'Liv2' 'Оля|Ольга' "$(printf 'x%.0s' {1..33})" 'A1,B2' "$(seq -s, -f 'Name%g' 1 11 | tr 0-9 a-j)"; do
+for badnames in '.*' 'a' 'a -' '- a' 'Liv a' 'Liv-' 'Liv2' 'Оля|Ольга' "$(printf 'x%.0s' {1..33})" 'A1,B2' "$(seq -s, -f 'Name%g' 1 11 | tr 0-9 a-j)"; do
   run olivia --names="$badnames" >/dev/null && bad "accepted --names=$badnames" \
     || { grep -q 'names: ' "$TMP/err" && cmp -s "$TMP/keep" "$STATE/access.json" || bad "bad names wrote or said nothing: $badnames $(cat "$TMP/err")"; }
 done

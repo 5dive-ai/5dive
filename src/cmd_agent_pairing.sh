@@ -215,11 +215,12 @@ PY
 # DIVE-6684: `--names=` is the app's "Also answers to": extra names that call
 # the agent in a group, in any language, stored as `groupsCallNames` (telegram
 # plugin 0.5.105+ matches each like her display name). Comma-separated, at most
-# 10, each 2-32 letters, marks, spaces or hyphens: a name, never a pattern. An
-# empty value clears the list. A bad list is refused before anything is written.
+# 10, each 2-32 letters, marks, spaces or hyphens, 2+ letters a word: a name,
+# never a pattern. An empty value clears the list. A bad list is refused before
+# anything is written.
 _tg_group_answer_py() {
   cat <<'PY'
-import json, os, sys, tempfile, unicodedata
+import json, os, re, sys, tempfile, unicodedata
 
 state = os.environ['STATE']
 want = os.environ.get('ANSWER', '')
@@ -228,7 +229,8 @@ names_set = os.environ.get('NAMES_SET') == '1'
 def call_name(n):
     return (isinstance(n, str) and n == n.strip() and 2 <= len(n) <= 32
             and all(c in ' -' or unicodedata.category(c)[0] in 'LM' for c in n)
-            and any(unicodedata.category(c)[0] == 'L' for c in n))
+            and all(sum(unicodedata.category(c)[0] == 'L' for c in w) >= 2
+                    for w in re.split(r'[ -]+', n)))
 
 names = []
 if names_set:
@@ -237,7 +239,7 @@ if names_set:
         if not n:
             continue
         if not call_name(n):
-            print(f"names: '{n}' is not a name (2-32 letters, spaces or hyphens)", file=sys.stderr); sys.exit(3)
+            print(f"names: '{n}' is not a name (2-32 letters, spaces or hyphens, 2+ letters a word)", file=sys.stderr); sys.exit(3)
         if n.casefold() not in [m.casefold() for m in names]:
             names.append(n)
     if len(names) > 10:
