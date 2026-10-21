@@ -30,7 +30,7 @@ sudo 5dive init
 
 ![安装 5dive 并给智能体发消息](docs/quickstart.gif)
 
-你只需要一台 Linux 服务器，以及你自己的 AI 订阅或 API key，无需 5dive 账号。也可以省去运维，直接在 [5dive Cloud](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) 上运行。
+你只需要一台 Linux 服务器，以及你自己的 AI 订阅或 API key，无需 5dive 账号。也可以省去运维，直接在 [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) 上运行。
 
 ## 为什么选 5dive
 
@@ -154,4 +154,4 @@ Linux 用户隔离智能体；`systemd` 负责进程守护；SQLite 存储任务
 
 [文档（英文）](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [完整指南（英文）](docs/guide.md) · [人工审批](docs/human-gates.md) · [触发器](docs/triggers.md) · [Docker](docker/README.md) · [参与贡献](CONTRIBUTING.md) · [报告安全漏洞](https://github.com/5dive-ai/5dive/security/advisories/new)
 
-[5dive Cloud](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [Telegram 应用](https://t.me/FiveDiveBot?startapp) · [Telegram 社区](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)
+[5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [Telegram 应用](https://t.me/FiveDiveBot?startapp) · [Telegram 社区](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)

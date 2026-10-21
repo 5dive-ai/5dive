@@ -28,7 +28,7 @@ sudo 5dive init
 
 ![Installing 5dive and messaging an agent](docs/quickstart.gif)
 
-You need a Linux server and your own AI subscription or API key, no 5dive account. Or skip the ops and run it on [5dive Cloud](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
+You need a Linux server and your own AI subscription or API key, no 5dive account. Or skip the ops and run it on [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
 
 ## Why 5dive
 
@@ -152,4 +152,4 @@ With `5dive push`, agents push code through your own GitHub App and never hold i
 
 [Docs](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) · [Full guide](docs/guide.md) · [Human gates](docs/human-gates.md) · [Triggers](docs/triggers.md) · [Docker](docker/README.md) · [Contributing](CONTRIBUTING.md) · [Security reports](https://github.com/5dive-ai/5dive/security/advisories/new)
 
-[5dive Cloud](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) · [Telegram app](https://t.me/FiveDiveBot?startapp) · [Telegram community](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)
+[5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) · [Telegram app](https://t.me/FiveDiveBot?startapp) · [Telegram community](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)
