@@ -30,7 +30,7 @@ sudo 5dive init
 
 ![安装 5dive 并给智能体发消息](docs/quickstart.gif)
 
-你只需要一台 Linux 服务器，以及你自己的 AI 订阅或 API key，无需 5dive 账号。不想自己运维服务器？[托管版 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) 替你运行。
+你只需要一台 Linux 服务器，以及你自己的 AI 订阅或 API key，无需 5dive 账号。也可以省去运维，直接在[托管版 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh)上运行。
 
 ## 为什么选 5dive
 

@@ -28,7 +28,7 @@ sudo 5dive init
 
 ![Installing 5dive and messaging an agent](docs/quickstart.gif)
 
-You need a Linux server and your own AI subscription or API key, no 5dive account. Rather not run a server? [Hosted 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) runs it for you.
+You need a Linux server and your own AI subscription or API key, no 5dive account. Or skip the ops and run it on [Hosted 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
 
 ## Why 5dive
 
