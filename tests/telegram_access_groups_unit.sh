@@ -87,6 +87,14 @@ printf 'not json' >"$STATE/access.json"
 run olivia --answer=every >/dev/null && bad 'wrote over a broken access.json' || okk 'a broken access.json is refused, not overwritten'
 [[ "$(cat "$STATE/access.json")" == 'not json' ]] && okk 'the broken file is left as it was' || bad 'broken file replaced'
 
+# --- a failure with no message names what failed: read or write -----------
+sudo() { return 1; }
+run olivia >/dev/null; grep -qF "telegram access.json read failed for agent 'olivia'" "$TMP/err" \
+  && okk 'a silent read failure says "read failed"' || bad "read failure msg: $(cat "$TMP/err")"
+run olivia --answer=every >/dev/null; grep -qF "telegram access.json write failed for agent 'olivia'" "$TMP/err" \
+  && okk 'a silent write failure says "write failed", not "writeevery"' || bad "write failure msg: $(cat "$TMP/err")"
+sudo() { [[ "$1" == -u ]] && shift 2; "$@"; }
+
 # --- dispatch ---------------------------------------------------------------
 grep -q 'groups)' "$ROOT/src/main.sh" && grep -q 'cmd_telegram_access_groups "\$@"' "$ROOT/src/main.sh" \
   && okk 'main.sh routes telegram-access groups' || bad 'main.sh does not route groups'

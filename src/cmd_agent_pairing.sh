@@ -280,10 +280,12 @@ cmd_telegram_access_groups() {
   state_dir=$(_tg_access_state_dir "$user" "$type") \
     || fail "$E_VALIDATION" "telegram-access supports claude, codex, grok, pi and antigravity agents (got type=$type)"
 
+  local verb=read
+  [[ -n "$answer" ]] && verb=write
   [[ -n "$answer" ]] && step "Setting how '$name' answers in groups: $answer"
   local out
   if ! out=$(sudo -u "$user" env STATE="$state_dir" ANSWER="$answer" python3 -c "$(_tg_group_answer_py)" 2>&1); then
-    fail "$E_VALIDATION" "${out:-telegram access.json ${answer:+write}${answer:-read} failed for agent '$name'}"
+    fail "$E_VALIDATION" "${out:-telegram access.json ${verb} failed for agent '$name'}"
   fi
   local said
   said=$(jq -r '"\(if .answer == "name" then "when called by name" else "every message" end) (\(.groups) group(s)\(if .mixed then ", some set apart" else "" end))"' <<<"$out")
