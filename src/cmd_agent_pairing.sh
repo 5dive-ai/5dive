@@ -191,6 +191,105 @@ PY
      --arg n "$name"
 }
 
+# DIVE-6675: "In groups, answer: when called by name · every message", the
+# app's one setting for how an agent answers in its groups. It is
+# requireMention on EVERY group in access.json (true = called by name, the
+# plugin's default; false = every message), plus `groupsRequireMention`, the
+# value the telegram plugin (0.5.103+) gives a group an owner adds later and
+# the one its hello line reads. Without that key a box with no group yet would
+# forget the choice, and the next group would come back "by name".
+#
+#   5dive agent telegram-access groups <name>                 # read
+#   5dive agent telegram-access groups <name> --answer=name   # when called by name
+#   5dive agent telegram-access groups <name> --answer=every  # every message
+#
+# data: {name, answer: "name"|"every", groups: <approved groups>, mixed: bool}.
+# `answer` is the stored key, else "every" when every group already answers
+# every message, else "name". `mixed` = some group differs from `answer` (one
+# was flipped on its own in Who can talk to); a write clears it. The plugin
+# re-reads access.json per message, so no restart.
+_tg_group_answer_py() {
+  cat <<'PY'
+import json, os, sys, tempfile
+
+state = os.environ['STATE']
+want = os.environ.get('ANSWER', '')
+path = os.path.join(state, 'access.json')
+try:
+    with open(path) as f:
+        access = json.load(f)
+except FileNotFoundError:
+    access = {}
+except json.JSONDecodeError as e:
+    print(f"access.json is not valid JSON: {e}", file=sys.stderr); sys.exit(2)
+if not isinstance(access, dict):
+    print("access.json is not an object", file=sys.stderr); sys.exit(2)
+groups = access.get('groups')
+if not isinstance(groups, dict):
+    groups = {}
+cfgs = [g for g in groups.values() if isinstance(g, dict)]
+
+if want:
+    on = want == 'name'
+    for g in cfgs:
+        g['requireMention'] = on
+    access['groups'] = groups
+    access['groupsRequireMention'] = on
+    os.makedirs(state, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
+    with os.fdopen(fd, 'w') as f:
+        json.dump(access, f, indent=2)
+    os.replace(tmp, path)
+
+stored = access.get('groupsRequireMention')
+if isinstance(stored, bool):
+    on = stored
+else:
+    on = not (cfgs and all(g.get('requireMention') is False for g in cfgs))
+mixed = any((g.get('requireMention') is not False) != on for g in cfgs)
+print(json.dumps({'answer': 'name' if on else 'every', 'groups': len(cfgs), 'mixed': mixed}))
+PY
+}
+
+cmd_telegram_access_groups() {
+  local name="" answer=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --answer=*) answer="${1#*=}" ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-access groups <name> [--answer=name|every]"
+  case "$answer" in
+    ""|name|every) ;;
+    *) fail "$E_USAGE" "--answer must be name (when called by name) or every (every message), got '$answer'" ;;
+  esac
+  ensure_state
+  local reg type channels
+  reg=$(registry_read)
+  jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \
+    || fail "$E_NOT_FOUND" "no agent named '$name'"
+  type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
+  channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
+  [[ ",$channels," == *",telegram,"* ]] \
+    || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-access only applies to telegram"
+  local user="agent-${name}"
+  local state_dir
+  state_dir=$(_tg_access_state_dir "$user" "$type") \
+    || fail "$E_VALIDATION" "telegram-access supports claude, codex, grok, pi and antigravity agents (got type=$type)"
+
+  [[ -n "$answer" ]] && step "Setting how '$name' answers in groups: $answer"
+  local out
+  if ! out=$(sudo -u "$user" env STATE="$state_dir" ANSWER="$answer" python3 -c "$(_tg_group_answer_py)" 2>&1); then
+    fail "$E_VALIDATION" "${out:-telegram access.json ${answer:+write}${answer:-read} failed for agent '$name'}"
+  fi
+  local said
+  said=$(jq -r '"\(if .answer == "name" then "when called by name" else "every message" end) (\(.groups) group(s)\(if .mixed then ", some set apart" else "" end))"' <<<"$out")
+  ok "in groups, '$name' answers: $said" '{name:$n} + $r' --arg n "$name" --argjson r "$out"
+}
+
 # Drop a pending pairing entry without approving it. The dashboard's inbox
 # UI calls this when the operator clicks "Ignore" on a stranger's DM —
 # removes the code from access.json's pending map so it stops showing in

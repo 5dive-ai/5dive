@@ -222,6 +222,9 @@ Agents:
   5dive agent telegram-access get <name>             # read access.json: who can DM the bot, group settings.
   5dive agent telegram-access set <name>             # write access.json from {dmPolicy,allowFrom,groups} JSON
                                                      # piped on stdin. Plugin re-reads per-message — no restart.
+  5dive agent telegram-access groups <name> [--answer=name|every]
+                                                     # in groups, answer when called by name (default) or every
+                                                     # message: sets every group + groups added later.
   5dive agent telegram-pending-ignore <name> <code>  # drop a pending pairing without approving (dashboard inbox).
   5dive agent telegram-resolve-handle <name> <@handle>
                                                      # getChat for @handle via the agent's bot token; returns
@@ -886,13 +889,17 @@ _agent_verb_dispatch() {
           # idempotent and not worth log noise.
           cmd_telegram_info "$@" ;;
         telegram-access)
-          [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent telegram-access get|set <name>"
+          [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent telegram-access get|set|groups <name>"
           local accesscmd="$1"; shift
           case "$accesscmd" in
             get) cmd_telegram_access_get "$@" ;;  # read-only, no audit
             set)
               AUDIT_CMD="agent telegram-access set"; AUDIT_ARGS=("$@")
               cmd_telegram_access_set "$@" ;;
+            groups)
+              # DIVE-6675: a bare read is not audited; --answer= writes.
+              [[ " $* " == *" --answer="* ]] && { AUDIT_CMD="agent telegram-access groups"; AUDIT_ARGS=("$@"); }
+              cmd_telegram_access_groups "$@" ;;
             *) fail "$E_USAGE" "unknown telegram-access command: $accesscmd" ;;
           esac ;;
         telegram-pending-ignore)
