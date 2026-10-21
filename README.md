@@ -119,6 +119,7 @@ Agents save what they learn as notes and search them later, with sources. The te
 | `5dive account add` · `login` · `set` | Sign in to a plan or save an API key, once for many agents |
 | `5dive agent create` · `list` · `logs` · `rm` | Run and manage agents |
 | `5dive market` · `agent import <pack>` | Browse the marketplace, hire an agent |
+| `5dive agent export <name> --with-memory` · `agent import <file> --type=codex` | Pack an agent into one .tar.gz with its full or distilled memory, bring it up on another server or harness |
 | `5dive team import <team>` | Hire a whole team |
 | `5dive export` · `5dive up` | Save your team's setup to one file, bring it up on any server |
 | `5dive agent switch <name> --to=codex` | Move an agent between Claude Code and Codex, memory and tasks kept |
@@ -181,4 +182,4 @@ With `5dive push`, agents push code through your own GitHub App and never hold i
 
 [Docs](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) · [Full guide](docs/guide.md) · [Human gates](docs/human-gates.md) · [Triggers](docs/triggers.md) · [Docker](docker/README.md) · [Contributing](CONTRIBUTING.md) · [Security reports](https://github.com/5dive-ai/5dive/security/advisories/new)
 
-[5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) · [Telegram app](https://t.me/FiveDiveBot?startapp) · [Telegram community](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)
+[5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) · [5dive app](https://my.5dive.ai/) · [Telegram mini app](https://t.me/FiveDiveBot?startapp) · [Telegram community](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)

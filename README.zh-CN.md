@@ -121,6 +121,7 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 | `5dive account add` · `login` · `set` | 登录套餐或保存 API key，一次设置，多个智能体共用 |
 | `5dive agent create` · `list` · `logs` · `rm` | 运行和管理智能体 |
 | `5dive market` · `agent import <pack>` | 浏览市场，雇用一个智能体 |
+| `5dive agent export <name> --with-memory` · `agent import <file> --type=codex` | 把一个智能体连同完整或提炼后的记忆打包成一个 .tar.gz，在另一台服务器或另一个运行框架上启动 |
 | `5dive team import <team>` | 雇用整支团队 |
 | `5dive export` · `5dive up` | 把团队配置存成一个文件，在任何服务器上启动 |
 | `5dive agent switch <name> --to=codex` | 让智能体在 Claude Code 和 Codex 之间切换，记忆和任务都保留 |
@@ -183,4 +184,4 @@ Linux 用户隔离智能体；`systemd` 负责进程守护；SQLite 存储任务
 
 [文档（英文）](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [完整指南（英文）](docs/guide.md) · [人工审批](docs/human-gates.md) · [触发器](docs/triggers.md) · [Docker](docker/README.md) · [参与贡献](CONTRIBUTING.md) · [报告安全漏洞](https://github.com/5dive-ai/5dive/security/advisories/new)
 
-[5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [Telegram 应用](https://t.me/FiveDiveBot?startapp) · [Telegram 社区](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)
+[5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [5dive 应用](https://my.5dive.ai/) · [Telegram 小程序](https://t.me/FiveDiveBot?startapp) · [Telegram 社区](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)
