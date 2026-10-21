@@ -1583,6 +1583,68 @@ cmd_plugin_remove() {
   ok "$key removed — every version, its pointer and its grants are gone" '{plugin:$k}' --arg k "$key"
 }
 
+# DIVE-6650: how many version dirs one plugin keeps after an upgrade. Three is
+# the current version plus two rollback targets: `rollback` with no version takes
+# the newest OTHER one, and two steps back covers a bad release that was itself
+# rolled over by a second bad one inside the nightly cadence (DIVE-6618). Every
+# kept dir is a full copy (~17 MB for browser), so this bounds the store at three
+# copies per plugin instead of one per release forever.
+PLUGIN_KEEP_VERSIONS="${FIVEDIVE_PLUGIN_KEEP_VERSIONS:-3}"
+
+# _plugin_seat_pinned_versions <plugin> <marketplace> -> every version any seat's
+# installed_plugins.json pins for the key, one per line. Globs every home rather
+# than walking the registry: a pin in a home the registry has forgotten is still
+# a pin, and this list only ever SPARES a dir. Returns 1 when a pin file exists
+# but cannot be read — the caller then deletes nothing, because "I could not
+# tell what is pinned" must not read as "nothing is pinned".
+_plugin_seat_pinned_versions() {
+  local key="${1:-}@${2:-}" f
+  local _ng; _ng=$(shopt -p nullglob) || true
+  shopt -s nullglob
+  local files=("${PERSONA_HOME_ROOT:-/home}"/*/.claude/plugins/installed_plugins.json)
+  eval "$_ng"
+  for f in "${files[@]}"; do
+    jq -r --arg k "$key" '((.plugins // {})[$k] // [])[] | .version // empty' "$f" 2>/dev/null || return 1
+  done
+}
+
+# _plugin_prune_versions <key> <plugin> <marketplace> -> delete version dirs of
+# one plugin older than the newest $PLUGIN_KEEP_VERSIONS. Never deleted: the
+# enabled pointer's target, the version installed.json records (a DISABLED
+# plugin has no pointer, so this is what keeps its 'enable' a flip), and any
+# version a seat pins (the DIVE-4522 re-pin path). Not a `disk sweep` class on
+# purpose: an old version may no longer be fetchable, so these are not a cache —
+# only the upgrade, which knows what it just installed, decides what goes.
+_plugin_prune_versions() {
+  local key="$1" plugin="$2" mkt="$3"
+  [[ -n "$plugin" && -n "$mkt" && "$plugin" != "null" && "$mkt" != "null" ]] || return 0
+  local keep_n="$PLUGIN_KEEP_VERSIONS"
+  [[ "$keep_n" =~ ^[0-9]+$ ]] && (( keep_n >= 1 )) || keep_n=3
+  local base; base="$(_plugin_cache_dir)/$mkt/$plugin"
+  [[ -d "$base" ]] || return 0
+
+  # Each read states its empty post-condition: under header.sh's errexit a bare
+  # failing `$( )` in an assignment kills the upgrade AFTER the pointer flip.
+  local newest pointed recorded pins v
+  newest=$(ls "$base" 2>/dev/null | sort -V | tail -n "$keep_n") || newest=""
+  pointed=$(readlink "$(_plugin_enabled_dir)/$key" 2>/dev/null) || pointed=""
+  recorded=$(jq -r --arg k "$key" '.[$k].version // empty' "$(_plugin_installed_json)" 2>/dev/null) || recorded=""
+  if ! pins=$(_plugin_seat_pinned_versions "$plugin" "$mkt"); then
+    echo "  old versions of $key kept: a seat's installed_plugins.json could not be read" >&2
+    return 0
+  fi
+  local spare; spare=$(printf '%s\n' "$newest" "${pointed##*/}" "$recorded" "$pins")
+
+  local gone=()
+  while IFS= read -r v; do
+    [[ -n "$v" && -d "$base/$v" ]] || continue
+    grep -qFx -- "$v" <<<"$spare" && continue
+    rm -rf "${base:?}/$v" && gone+=("$v")
+  done < <(ls "$base" 2>/dev/null)
+  (( ${#gone[@]} )) && echo "  removed ${#gone[@]} old version(s) of $key: ${gone[*]}" >&2
+  return 0
+}
+
 cmd_plugin_upgrade() {
   local ref="${1:-}"
   [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive plugin upgrade <plugin>[@<marketplace>]"
@@ -1618,6 +1680,9 @@ cmd_plugin_upgrade() {
     local _same_caps; _same_caps=$(jq -r '((.fivedive.capabilities // []) | join(" "))' <<<"$nj")
     _plugin_seat_reregister "$key" "$plugin" "$mkt" "$_same_caps" \
       "$(_plugin_cache_dir)/$mkt/$plugin/$cur"
+    # DIVE-6650: also here, so a box that already holds a pile of versions
+    # reclaims on its next nightly run even when no new release arrived.
+    _plugin_prune_versions "$key" "$plugin" "$mkt"
     ok "$key already at $cur" '{plugin:$k, version:$v, changed:false}' --arg k "$key" --arg v "$cur"
     return 0
   fi
@@ -1658,7 +1723,7 @@ cmd_plugin_upgrade() {
   fi
   # §4: install ALONGSIDE, then flip the pointer. The old version dir stays, so
   # rollback is a flip and not a re-fetch from a marketplace that may since have
-  # moved on.
+  # moved on. Only the newest $PLUGIN_KEEP_VERSIONS stay (DIVE-6650, below).
   ln -sfn "$dest" "$(_plugin_enabled_dir)/$key"
   local tmp; tmp=$(mktemp)
   jq --arg k "$key" --arg v "$new" --arg t "$(date -u +%FT%TZ)" \
@@ -1692,6 +1757,10 @@ cmd_plugin_upgrade() {
   # already installed under the old version and puts the box straight back into
   # the state this notice exists to name.
   _plugin_node_deps_notice "$key" "$dest" "$(jq -r '.fivedive.setup.command // ""' <<<"$nj")"
+
+  # DIVE-6650: after the seat walk, so a seat that could not be re-pinned still
+  # pins its old version and that version is spared.
+  _plugin_prune_versions "$key" "$plugin" "$mkt"
 
   ok "$key upgraded $cur -> $new (roll back: 5dive plugin rollback $key)" \
      '{plugin:$k, from:$f, to:$t, changed:true}' --arg k "$key" --arg f "$cur" --arg t "$new"
