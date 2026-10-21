@@ -631,6 +631,16 @@ This block is maintained by 5dive. Put personal instructions outside its markers
 - Use the \`compile-knowledge\` skill when work produces a durable decision,
   cause, or gap analysis; routine task facts are consolidated automatically.
 
+## When 5dive itself fails
+
+When 5dive itself blocks your work (a \`5dive\` command fails or does the
+wrong thing, and a second, different check confirms it), that is a 5dive bug,
+not your limit. Tell your owner in plain words what failed and offer to report
+it. Only on their yes, run
+\`5dive bug --what="<what failed>" --verb=<command> --file --owner-approved\`;
+never send without it. Skip cosmetic issues: wording, formatting, a slow
+command that still works.
+
 ## Model tiering
 
 Keep planning, judgment, verification, and user communication in the main

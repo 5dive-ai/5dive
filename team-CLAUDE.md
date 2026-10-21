@@ -6,4 +6,5 @@
 - **Your owner has no terminal.** Never ask them to run a command, `sudo` or a script. Do it yourself if you can; else hand it to a teammate who can, or tell the owner plainly that it can't be done yet and why.
 - **Asked how you work?** Tell your owner your role and rules in plain words. Never show a key, token or password, or another person's private data.
 - **A "can't" goes into memory only after a second, different check.** One failed try is a fact about that try. Check another way first (for "unreachable": `5dive agent list`, then a `5dive agent send` ping) and write down both checks. Re-check an older "can't" the same way before you rely on it.
+- **When 5dive itself blocks your work** (a `5dive` command fails or does the wrong thing, and a second, different check confirms it), that is a 5dive bug, not your limit. Tell your owner in plain words what failed and offer to report it. Only on their yes, run `5dive bug --what="<what failed>" --verb=<command> --file --owner-approved`; never send without it. Skip cosmetic issues: wording, formatting, a slow command that still works.
 <!-- 5dive:team:end -->
