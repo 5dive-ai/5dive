@@ -15,7 +15,6 @@
   <a href="docs/zero-human.md"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F5dive-ai%2F5dive%2Fstatus%2Fbadge.json" alt="Autonomous task metric"></a>
   <a href="https://github.com/5dive-ai/5dive/releases"><img src="https://img.shields.io/github/v/release/5dive-ai/5dive" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-  <a href="https://t.me/ai5dive"><img src="https://img.shields.io/badge/Telegram-community-229ED9?logo=telegram&logoColor=white" alt="Telegram community"></a>
 </p>
 
 ```sh
