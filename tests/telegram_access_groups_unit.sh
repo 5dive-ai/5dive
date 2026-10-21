@@ -75,6 +75,35 @@ printf '{"dmPolicy":"pairing","allowFrom":[],"groups":{}}' >"$STATE/access.json"
 run olivia --answer=every >/dev/null && out=$(run olivia) && [[ "$(field answer)" == every && "$(field groups)" == 0 ]] \
   && okk '"every" on a box with no group yet reads back "every"' || bad "no-group every: $out"
 
+# --- DIVE-6684: --names, the names it also answers to ---------------------
+cat >"$STATE/access.json" <<'J'
+{"dmPolicy":"pairing","allowFrom":[],"groups":{"-100":{"requireMention":true}},"groupsRequireMention":true,"owners":["1"]}
+J
+before=$(jq -c 'del(.groupsCallNames)' "$STATE/access.json")
+out=$(run olivia --names='Оля, Liv ,奥利维亚,оля,Mary  Ann') && [[ "$(jq -c .data.names <<<"$out")" == '["Оля","Liv","奥利维亚","Mary Ann"]' ]] \
+  && okk '--names writes the list: trimmed, any script, a repeat dropped' || bad "write names: $out"
+[[ "$(jq -c .groupsCallNames "$STATE/access.json")" == '["Оля","Liv","奥利维亚","Mary Ann"]' ]] \
+  && okk 'groupsCallNames stored as the names, unescaped' || bad "stored: $(jq -c .groupsCallNames "$STATE/access.json")"
+grep -q '奥利维亚' "$STATE/access.json" && okk 'non-Latin names are kept as text, not \u escapes' || bad 'names escaped in access.json'
+[[ "$(jq -c 'del(.groupsCallNames)' "$STATE/access.json")" == "$before" ]] \
+  && okk '--names alone leaves the answer and the groups as they were' || bad "names touched other keys: $(jq -c . "$STATE/access.json")"
+out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Оля","Liv","奥利维亚","Mary Ann"]' && "$(field answer)" == name ]] \
+  && okk 'the read returns names beside answer, groups and mixed' || bad "read names: $out"
+out=$(run olivia --answer=every --names=Liv) && [[ "$(field answer)" == every && "$(jq -c .data.names <<<"$out")" == '["Liv"]' ]] \
+  && okk '--answer and --names in one write' || bad "both: $out"
+jq '.groupsCallNames += [".*", 7]' "$STATE/access.json" >"$TMP/a" && cp "$TMP/a" "$STATE/access.json"
+out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Liv"]' ]] \
+  && okk 'a hand-edited pattern on the list is not read back as a name' || bad "read filter: $out"
+out=$(run olivia --names=) && [[ "$(jq -c .data.names <<<"$out")" == '[]' && "$(jq 'has("groupsCallNames")' "$STATE/access.json")" == false ]] \
+  && okk 'an empty --names= clears the list' || bad "clear: $out"
+cp "$STATE/access.json" "$TMP/keep"
+for badnames in '.*' 'a' 'Liv2' 'Оля|Ольга' "$(printf 'x%.0s' {1..33})" 'A1,B2' "$(seq -s, -f 'Name%g' 1 11 | tr 0-9 a-j)"; do
+  run olivia --names="$badnames" >/dev/null && bad "accepted --names=$badnames" \
+    || { grep -q 'names: ' "$TMP/err" && cmp -s "$TMP/keep" "$STATE/access.json" || bad "bad names wrote or said nothing: $badnames $(cat "$TMP/err")"; }
+done
+cmp -s "$TMP/keep" "$STATE/access.json" && okk 'a bad name, a pattern or 11 names are refused and nothing is written' || bad 'refused names changed the file'
+run olivia --names='Liv' --answer=all >/dev/null; cmp -s "$TMP/keep" "$STATE/access.json" && okk 'a bad --answer with --names writes nothing' || bad 'bad answer + names wrote'
+
 # --- refusals ---------------------------------------------------------------
 cp "$STATE/access.json" "$TMP/keep"
 run olivia --answer=all >/dev/null && bad 'accepted --answer=all' \
@@ -100,6 +129,9 @@ grep -q 'groups)' "$ROOT/src/main.sh" && grep -q 'cmd_telegram_access_groups "\$
   && okk 'main.sh routes telegram-access groups' || bad 'main.sh does not route groups'
 grep -q 'telegram-access groups <name> \[--answer=name|every\]' "$ROOT/src/main.sh" \
   && okk 'agent usage documents the verb' || bad 'usage line missing'
+grep -q 'telegram-access groups <name> \[--answer=name|every\] \[--names=' "$ROOT/src/main.sh" \
+  && okk 'agent usage documents --names' || bad 'usage line lacks --names'
+grep -qF '" $* " == *" --names="*' "$ROOT/src/main.sh" && okk 'a --names write is audited' || bad '--names write not audited'
 
 echo "pass=$pass fail=$fail"
 (( fail == 0 ))

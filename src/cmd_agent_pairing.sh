@@ -202,21 +202,49 @@ PY
 #   5dive agent telegram-access groups <name>                 # read
 #   5dive agent telegram-access groups <name> --answer=name   # when called by name
 #   5dive agent telegram-access groups <name> --answer=every  # every message
+#   5dive agent telegram-access groups <name> --names="Оля,Liv,奥利维亚"  # also answers to
+#   5dive agent telegram-access groups <name> --names=          # clear them
 #
-# data: {name, answer: "name"|"every", groups: <approved groups>, mixed: bool}.
+# data: {name, answer: "name"|"every", groups: <approved groups>, mixed: bool,
+#        names: [...]}.
 # `answer` is the stored key, else "every" when every group already answers
 # every message, else "name". `mixed` = some group differs from `answer` (one
 # was flipped on its own in Who can talk to); a write clears it. The plugin
 # re-reads access.json per message, so no restart.
+#
+# DIVE-6684: `--names=` is the app's "Also answers to": extra names that call
+# the agent in a group, in any language, stored as `groupsCallNames` (telegram
+# plugin 0.5.105+ matches each like her display name). Comma-separated, at most
+# 10, each 2-32 letters, marks, spaces or hyphens: a name, never a pattern. An
+# empty value clears the list. A bad list is refused before anything is written.
 _tg_group_answer_py() {
   cat <<'PY'
-import json, os, sys, tempfile
+import json, os, sys, tempfile, unicodedata
 
 state = os.environ['STATE']
 want = os.environ.get('ANSWER', '')
+names_set = os.environ.get('NAMES_SET') == '1'
+
+def call_name(n):
+    return (isinstance(n, str) and n == n.strip() and 2 <= len(n) <= 32
+            and all(c in ' -' or unicodedata.category(c)[0] in 'LM' for c in n)
+            and any(unicodedata.category(c)[0] == 'L' for c in n))
+
+names = []
+if names_set:
+    for n in os.environ.get('NAMES', '').split(','):
+        n = unicodedata.normalize('NFC', ' '.join(n.split()))
+        if not n:
+            continue
+        if not call_name(n):
+            print(f"names: '{n}' is not a name (2-32 letters, spaces or hyphens)", file=sys.stderr); sys.exit(3)
+        if n.casefold() not in [m.casefold() for m in names]:
+            names.append(n)
+    if len(names) > 10:
+        print("names: at most 10", file=sys.stderr); sys.exit(3)
 path = os.path.join(state, 'access.json')
 try:
-    with open(path) as f:
+    with open(path, encoding='utf-8') as f:
         access = json.load(f)
 except FileNotFoundError:
     access = {}
@@ -229,16 +257,22 @@ if not isinstance(groups, dict):
     groups = {}
 cfgs = [g for g in groups.values() if isinstance(g, dict)]
 
-if want:
-    on = want == 'name'
-    for g in cfgs:
-        g['requireMention'] = on
-    access['groups'] = groups
-    access['groupsRequireMention'] = on
+if want or names_set:
+    if want:
+        on = want == 'name'
+        for g in cfgs:
+            g['requireMention'] = on
+        access['groups'] = groups
+        access['groupsRequireMention'] = on
+    if names_set:
+        if names:
+            access['groupsCallNames'] = names
+        else:
+            access.pop('groupsCallNames', None)
     os.makedirs(state, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
-    with os.fdopen(fd, 'w') as f:
-        json.dump(access, f, indent=2)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(access, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
 
 stored = access.get('groupsRequireMention')
@@ -247,21 +281,24 @@ if isinstance(stored, bool):
 else:
     on = not (cfgs and all(g.get('requireMention') is False for g in cfgs))
 mixed = any((g.get('requireMention') is not False) != on for g in cfgs)
-print(json.dumps({'answer': 'name' if on else 'every', 'groups': len(cfgs), 'mixed': mixed}))
+stored_names = access.get('groupsCallNames')
+names = [n for n in stored_names if call_name(n)][:10] if isinstance(stored_names, list) else []
+print(json.dumps({'answer': 'name' if on else 'every', 'groups': len(cfgs), 'mixed': mixed, 'names': names}))
 PY
 }
 
 cmd_telegram_access_groups() {
-  local name="" answer=""
+  local name="" answer="" names="" names_set=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --answer=*) answer="${1#*=}" ;;
+      --names=*) names="${1#*=}"; names_set=1 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-access groups <name> [--answer=name|every]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-access groups <name> [--answer=name|every] [--names=<a,b,...>]"
   case "$answer" in
     ""|name|every) ;;
     *) fail "$E_USAGE" "--answer must be name (when called by name) or every (every message), got '$answer'" ;;
@@ -281,14 +318,15 @@ cmd_telegram_access_groups() {
     || fail "$E_VALIDATION" "telegram-access supports claude, codex, grok, pi and antigravity agents (got type=$type)"
 
   local verb=read
-  [[ -n "$answer" ]] && verb=write
+  [[ -n "$answer" || "$names_set" == 1 ]] && verb=write
   [[ -n "$answer" ]] && step "Setting how '$name' answers in groups: $answer"
+  [[ "$names_set" == 1 ]] && step "Setting the names '$name' also answers to in groups"
   local out
-  if ! out=$(sudo -u "$user" env STATE="$state_dir" ANSWER="$answer" python3 -c "$(_tg_group_answer_py)" 2>&1); then
+  if ! out=$(sudo -u "$user" env STATE="$state_dir" ANSWER="$answer" NAMES="$names" NAMES_SET="$names_set" python3 -c "$(_tg_group_answer_py)" 2>&1); then
     fail "$E_VALIDATION" "${out:-telegram access.json ${verb} failed for agent '$name'}"
   fi
   local said
-  said=$(jq -r '"\(if .answer == "name" then "when called by name" else "every message" end) (\(.groups) group(s)\(if .mixed then ", some set apart" else "" end))"' <<<"$out")
+  said=$(jq -r '"\(if .answer == "name" then "when called by name" else "every message" end) (\(.groups) group(s)\(if .mixed then ", some set apart" else "" end))\(if (.names // []) != [] then "; also answers to: \(.names | join(", "))" else "" end)"' <<<"$out")
   ok "in groups, '$name' answers: $said" '{name:$n} + $r' --arg n "$name" --argjson r "$out"
 }
 
