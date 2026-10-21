@@ -46,6 +46,13 @@ check "doc names compile-knowledge"    'grep -q "compile-knowledge" <<<"$doc"'
 check "doc carries channel etiquette"  'grep -q "Telegram-paired seat" <<<"$doc"'
 check "doc carries model tiering"      'grep -q "## Model tiering" <<<"$doc"'
 check "doc carries resume guidance"    'grep -q "## Resuming work" <<<"$doc"'
+# DIVE-6639: a codex seat is told to offer its owner a 5dive bug report, and the
+# send line is the one the claude team block carries, owner approval included.
+check "doc offers a 5dive bug report"   'grep -q "## When 5dive itself fails" <<<"$doc"'
+check "doc sends only owner-approved"  'grep -qF -- "--file --owner-approved" <<<"$doc" && grep -qF "never send without it" <<<"$doc"'
+check "doc skips cosmetic issues"      'grep -qF "Skip cosmetic issues" <<<"$doc"'
+bug_line='`5dive bug --what="<what failed>" --verb=<command> --file --owner-approved`'
+check "doc send line matches team block" 'grep -qF -- "$bug_line" <<<"$doc" && grep -qF -- "$bug_line" team-CLAUDE.md'
 # A different agent name interpolates through, not a hardcoded "andy".
 doc2=$(_codex_operating_baseline_doc worker7)
 check "doc interpolates any name"      '[[ "$doc2" == *"You (worker7)"* ]]'

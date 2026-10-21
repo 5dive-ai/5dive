@@ -5,7 +5,9 @@
 # remembered. A lead with none of this used Claude Code's own ListAgents, saw
 # nobody, saved "a teammate with no channel is unreachable" and worked alone.
 #
-#   (a) team-CLAUDE.md is one managed block and keeps each rule;
+#   (a) team-CLAUDE.md is one managed block and keeps each rule, including
+#       DIVE-6639's: a 5dive failure that blocks work is offered to the owner
+#       as a bug report, sent only on their yes;
 #   (b) the reworded model-tiering file is the old one with exactly the two lines
 #       the migration rewrites, so a migrated seat matches a new one;
 #   (c) sync_seat_claudemd (read out of install.sh) appends the block once,
@@ -36,6 +38,9 @@ has "...so never hand them sudo"              '`sudo`'
 has "rules are told on request"               'Asked how you work?'
 has "...secrets never"                        'Never show a key, token or password'
 has "a can't is checked twice"                'only after a second, different check'
+has "a blocking 5dive failure is a bug"     'When 5dive itself blocks your work'
+has "...offered, sent only on a yes"        '--file --owner-approved`; never send without it'
+has "...never for cosmetic issues"          'Skip cosmetic issues'
 if grep -nE 'DIVE-[0-9]+|\b20[0-9]{2}-[0-9]{2}-[0-9]{2}\b' "$TEAM" >"$TMP/x"; then bad "a3 no idents or dates in model-facing text" "$(head -2 "$TMP/x")"
 else ok "a3 no idents or dates in model-facing text"; fi
 
