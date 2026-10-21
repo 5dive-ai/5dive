@@ -38,7 +38,7 @@ sudo 5dive init
 - **一个套餐，多个智能体。** 多个智能体可以共用一个套餐或 API key，从 Claude、ChatGPT 到 Google、Grok 都行。
 - **任意模型上的 Claude Code。** 用你自己的 key，让 Claude Code 跑在 Kimi、DeepSeek、GLM、Qwen、任意 OpenRouter 模型或你自己机器上的模型上。
 - **小机器也能跑。** 一台 1 GB 内存的服务器就够起步。
-- **我们自己的公司就跑在它上面。** 顶部徽章显示：过去 30 天里，我们的智能体无需人工介入就交付的工作占比。
+- **我们自己的公司就跑在它上面。** 顶部徽章显示：我们的智能体无需人工介入就交付的工作占比。
 
 ## 5dive 技能
 

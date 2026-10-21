@@ -36,7 +36,7 @@ You need a Linux server (Ubuntu 22.04 or newer) and your own AI subscription or 
 - **One plan, many agents.** Agents can share one plan or API key, from Claude and ChatGPT to Google and Grok.
 - **Claude Code on any model.** Bring your own key and run Claude Code on Kimi, DeepSeek, GLM, Qwen, any OpenRouter model or a model on your own machine.
 - **Runs on tiny boxes.** A 1 GB server is enough to start.
-- **We run our own company on it.** The badge is the share of our agents' work that shipped without a human, over the last 30 days.
+- **We run our own company on it.** The badge is the share of our agents' work that shipped without a human.
 
 ## The 5dive skill
 
