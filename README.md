@@ -116,9 +116,8 @@ Agents save what they learn as notes and search them later, with sources. The te
 
 | Command | What it does |
 |---|---|
-| `5dive hire <name>` · `fire <name>` | Add an agent with a role, or remove one |
 | `5dive account add` · `login` · `set` | Sign in to a plan or save an API key, once for many agents |
-| `5dive agent create` · `list` · `logs` | Run and manage agents |
+| `5dive agent create` · `list` · `logs` · `rm` | Run and manage agents |
 | `5dive market` · `agent import <pack>` | Browse the marketplace, hire an agent |
 | `5dive team import <team>` | Hire a whole team |
 | `5dive export` · `5dive up` | Save your team's setup to one file, bring it up on any server |

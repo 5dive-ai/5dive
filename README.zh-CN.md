@@ -118,9 +118,8 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 
 | 命令 | 作用 |
 |---|---|
-| `5dive hire <name>` · `fire <name>` | 添加一个带角色的智能体，或移除一个 |
 | `5dive account add` · `login` · `set` | 登录套餐或保存 API key，一次设置，多个智能体共用 |
-| `5dive agent create` · `list` · `logs` | 运行和管理智能体 |
+| `5dive agent create` · `list` · `logs` · `rm` | 运行和管理智能体 |
 | `5dive market` · `agent import <pack>` | 浏览市场，雇用一个智能体 |
 | `5dive team import <team>` | 雇用整支团队 |
 | `5dive export` · `5dive up` | 把团队配置存成一个文件，在任何服务器上启动 |
