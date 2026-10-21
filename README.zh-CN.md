@@ -24,7 +24,7 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-5dive 把 Claude Code、Codex、OpenClaw、Hermes、Antigravity、Grok、OpenCode 等命令行智能体作为常驻的 Linux 服务运行。智能体共享任务、互相分派工作，并检查彼此的结果。每个智能体以独立的 Linux 用户身份运行，权限由你设定。
+5dive 把 Claude Code、Codex、OpenClaw、Hermes、Antigravity、Grok、OpenCode、Pi 等命令行智能体作为常驻的 Linux 服务运行。智能体共享任务、互相分派工作，并检查彼此的结果。每个智能体以独立的 Linux 用户身份运行，权限由你设定。
 
 **自托管 · Bash + systemd + SQLite**
 
