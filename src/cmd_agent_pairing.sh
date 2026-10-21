@@ -259,6 +259,21 @@ if not isinstance(groups, dict):
     groups = {}
 cfgs = [g for g in groups.values() if isinstance(g, dict)]
 
+# DIVE-6701: NAMES_ADD appends to the names already kept (the hire's card name),
+# skipping one already there in any case and stopping at 10. Nothing to add
+# writes nothing.
+seed = os.environ.get('NAMES_ADD', '')
+added = []
+if seed and not names_set:
+    stored_names = access.get('groupsCallNames')
+    names = [n for n in stored_names if call_name(n)] if isinstance(stored_names, list) else []
+    for n in seed.split(','):
+        n = unicodedata.normalize('NFC', ' '.join(n.split()))
+        if call_name(n) and len(names) < 10 and n.casefold() not in [m.casefold() for m in names]:
+            names.append(n)
+            added.append(n)
+    names_set = bool(added)
+
 if want or names_set:
     if want:
         on = want == 'name'
@@ -285,7 +300,10 @@ else:
 mixed = any((g.get('requireMention') is not False) != on for g in cfgs)
 stored_names = access.get('groupsCallNames')
 names = [n for n in stored_names if call_name(n)][:10] if isinstance(stored_names, list) else []
-print(json.dumps({'answer': 'name' if on else 'every', 'groups': len(cfgs), 'mixed': mixed, 'names': names}))
+out = {'answer': 'name' if on else 'every', 'groups': len(cfgs), 'mixed': mixed, 'names': names}
+if seed:
+    out['added'] = added
+print(json.dumps(out))
 PY
 }
 
@@ -330,6 +348,98 @@ cmd_telegram_access_groups() {
   local said
   said=$(jq -r '"\(if .answer == "name" then "when called by name" else "every message" end) (\(.groups) group(s)\(if .mixed then ", some set apart" else "" end))\(if (.names // []) != [] then "; also answers to: \(.names | join(", "))" else "" end)"' <<<"$out")
   ok "in groups, '$name' answers: $said" '{name:$n} + $r' --arg n "$name" --argjson r "$out"
+}
+
+# DIVE-6701 (lodar 2026-10-21: "need to preseed names from openagent or
+# marketplace ... not just tg name"): an agent also answers to its card name in
+# its groups, with no hand edit. The card name is `name:` in the OpenAgent
+# persona at ~/.claude/persona.yaml (a marketplace or team pack installs its
+# persona there under the pack's own name, so a "ceo" seat keeps "Tencha"). It
+# is added to "Also answers to" ONCE: a root-owned marker remembers every name
+# offered, so a name the owner removed in the app never comes back. (The marker
+# is not in access.json: the plugin rewrites that file with only the keys it
+# knows.) The seat id is not a name and is never offered. No translations: the
+# plugin already matches Latin and Cyrillic spellings and Russian case forms.
+# An everyday word ("Max", "Sage") is offered like any other name; the app
+# shows it under "Also answers to", where the owner removes it.
+_tg_call_names_marker() { printf '%s/call-names-seeded/%s' "$STATE_DIR" "$1"; }
+
+# _tg_call_names_candidate <name> — the card name to offer, or nothing: none on
+# the persona, not a name, the seat id, or offered before.
+_tg_call_names_candidate() {
+  local name="$1"
+  PERSONA="${AGENT_HOME_ROOT:-/home}/agent-${name}/.claude/persona.yaml" \
+  MARKER="$(_tg_call_names_marker "$name")" SEAT="$name" python3 - 2>/dev/null <<'PY' || true
+import os, re, unicodedata
+try:
+    text = open(os.environ['PERSONA'], encoding='utf-8').read()
+except OSError:
+    raise SystemExit
+name = None
+try:
+    import yaml
+    p = yaml.safe_load(text)
+    name = p.get('name') if isinstance(p, dict) else None
+except Exception:
+    m = re.search(r'^name:\s*["\']?(.+?)["\']?\s*$', text, re.M)
+    name = m.group(1) if m else None
+if not isinstance(name, str):
+    raise SystemExit
+name = unicodedata.normalize('NFC', ' '.join(name.split()))
+if not name or name.casefold() == os.environ['SEAT'].casefold():
+    raise SystemExit
+try:
+    offered = open(os.environ['MARKER'], encoding='utf-8').read().splitlines()
+except OSError:
+    offered = []
+if name.casefold() not in [o.casefold() for o in offered]:
+    print(name)
+PY
+}
+
+# _tg_call_names_seed <name> <type> — offer the card name once. Prints the name
+# when it was added (an owner's own copy of it, in any case, is kept as is).
+_tg_call_names_seed() {
+  local name="$1" type="$2" state_dir card out marker
+  state_dir=$(_tg_access_state_dir "agent-${name}" "$type") || return 0
+  card=$(_tg_call_names_candidate "$name")
+  [[ -n "$card" ]] || return 0
+  out=$(sudo -u "agent-${name}" env STATE="$state_dir" NAMES_ADD="$card" python3 -c "$(_tg_group_answer_py)" 2>/dev/null) || return 1
+  marker=$(_tg_call_names_marker "$name")
+  mkdir -p "${marker%/*}" && printf '%s\n' "$card" >>"$marker"
+  jq -r '.added[]?' <<<"$out"
+}
+
+#   5dive agent telegram-access seed-names [<name>]
+# Offers each Telegram agent's card name (or just <name>'s) once. Self-update
+# runs it, so agents hired before DIVE-6701 get theirs.
+cmd_telegram_access_seed_names() {
+  local only=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  [[ -z "$only" ]] && only="$1" || fail "$E_USAGE" "extra arg: $1" ;;
+    esac
+    shift
+  done
+  ensure_state
+  local reg; reg=$(registry_read)
+  if [[ -n "$only" ]]; then
+    jq -e --arg n "$only" '.agents[$n] != null' <<<"$reg" >/dev/null \
+      || fail "$E_NOT_FOUND" "no agent named '$only'"
+  fi
+  local seeded='[]' checked=0 name type got
+  while IFS=$'\t' read -r name type; do
+    [[ -n "$name" ]] || continue
+    checked=$((checked+1))
+    got=$(_tg_call_names_seed "$name" "$type") || { warn "could not seed the names '$name' answers to"; continue; }
+    [[ -n "$got" ]] && seeded=$(jq -c --arg n "$name" --arg c "$got" '. + [{name:$n, added:$c}]' <<<"$seeded")
+  done < <(jq -r --arg o "$only" '.agents | to_entries[]
+      | select($o == "" or .key == $o)
+      | select((",\(.value.channels // "none"),") | contains(",telegram,"))
+      | "\(.key)\t\(.value.type // "claude")"' <<<"$reg")
+  ok "card names seeded: $(jq -r 'if length == 0 then "none new" else map("\(.name) also answers to \(.added)") | join("; ") end' <<<"$seeded") ($checked Telegram agent(s) checked)" \
+     '{seeded:$s, checked:$c}' --argjson s "$seeded" --argjson c "$checked"
 }
 
 # Drop a pending pairing entry without approving it. The dashboard's inbox

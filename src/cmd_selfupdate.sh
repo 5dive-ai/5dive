@@ -1259,6 +1259,10 @@ cmd_self_update() {
   if (( EUID == 0 )) && [[ -x "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" ]]; then
     timeout 180 "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" agent avatar backfill --once >/dev/null 2>&1 \
       || warn "avatar backfill did not finish (re-run: sudo 5dive agent avatar backfill)"
+    # DIVE-6701: agents hired before their card name was seeded get it now. Once
+    # per name (its own marker), so a name the owner removed stays removed.
+    timeout 60 "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" agent telegram-access seed-names >/dev/null 2>&1 \
+      || warn "card-name seeding did not finish (re-run: sudo 5dive agent telegram-access seed-names)"
   fi
 
   local r f s d pk prose

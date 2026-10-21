@@ -3843,6 +3843,14 @@ cmd_import() {
   _pack_record_write "$as" "$pk_src" "$pk_slug" "$(_pack_skill_shas "$as" "${added[@]+"${added[@]}"}")" "$pk_members" \
     || warn "could not record the pack source for '$as' — 'agent pack-sync' will need the pack named explicitly"
 
+  # DIVE-6701: in its Telegram groups the agent also answers to its card name.
+  # A marker left by an agent of the same name that was removed is not this one's.
+  local call_seeded=""
+  if channel_in_list telegram "$(jq -r --arg n "$as" '.agents[$n].channels // "none"' <<<"$(registry_read)")"; then
+    rm -f "$(_tg_call_names_marker "$as")"
+    call_seeded=$(_tg_call_names_seed "$as" "$type" 2>/dev/null) || call_seeded=""
+  fi
+
   rm -rf "$stage"
 
   # DIVE-644: fire opt-in import telemetry AFTER a fully successful import. Only
@@ -3881,9 +3889,9 @@ cmd_import() {
   # agent that answers is not a green import, and the summary line says so.
   local think_note=""
   [[ "$can_think" == "no" ]] && think_note=" INERT: no credential and no model on this '$type' seat — see the warning above."
-  ok "imported '$as' from pack onto a '$type' seat ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated; avatar: $avatar_note; hooks: $hooks_note.${think_note}" \
-     '{name:$n, type:$t, persona:$pa, landsOn:$lands, notApplied:$nap, canThink:$ct, thinkFix:$tf, memory:$mem, memorySeeded:$ms, memoryInEffect:$me, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri, hooks:$hk, disclosure:$disc}' \
-     --arg ct "$can_think" --arg tf "$think_fix" \
+  ok "imported '$as' from pack onto a '$type' seat ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated; avatar: $avatar_note; hooks: $hooks_note.${call_seeded:+ In groups it also answers to $call_seeded.}${think_note}" \
+     '{name:$n, type:$t, callNameSeeded:$cs, persona:$pa, landsOn:$lands, notApplied:$nap, canThink:$ct, thinkFix:$tf, memory:$mem, memorySeeded:$ms, memoryInEffect:$me, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri, hooks:$hk, disclosure:$disc}' \
+     --arg ct "$can_think" --arg tf "$think_fix" --arg cs "$call_seeded" \
      --arg n "$as" --arg t "$type" --arg pa "$persona_at" --argjson lands "$lands_j" --argjson nap "$cross_dropped" \
      --arg mem "$mem_inc" --arg ms "$mem_seeded" --arg me "$mem_effect" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported" --arg hk "$hooks_note" --argjson disc "$disclosure"
 }

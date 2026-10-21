@@ -474,6 +474,8 @@ cmd_config() {
     step "Installing telegram channel for agent '$name' (type=$type)"
     _config_install_channel "$prev_channels" "$type" telegram "$name" \
       "$token_for_install" "$new_home_channel" "$new_allowed_users"
+    # DIVE-6701: a bot attached after the hire answers to the card name too.
+    _tg_call_names_seed "$name" "$type" >/dev/null 2>&1 || true
     # DIVE-4413: install_channel_for_agent hands home_channel to the hermes and
     # openclaw installers ONLY (agent_setup.sh) — every other type took the value
     # and discarded it. The access.json types have a real lever for the same
