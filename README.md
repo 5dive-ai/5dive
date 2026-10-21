@@ -15,7 +15,6 @@
   <a href="docs/zero-human.md"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F5dive-ai%2F5dive%2Fstatus%2Fbadge.json" alt="Autonomous task metric"></a>
   <a href="https://github.com/5dive-ai/5dive/releases"><img src="https://img.shields.io/github/v/release/5dive-ai/5dive" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-  <a href="https://t.me/ai5dive"><img src="https://img.shields.io/badge/Telegram-community-229ED9?logo=telegram&logoColor=white" alt="Telegram community"></a>
 </p>
 
 ```sh
@@ -23,13 +22,13 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-5dive runs CLI agents like Claude Code, Codex, OpenClaw, Hermes, Antigravity, Grok and OpenCode as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent has its own Linux user and configurable permissions.
+5dive runs CLI agents like Claude Code, Codex, OpenClaw, Hermes, Antigravity, Grok and OpenCode as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent runs as its own Linux user, with permissions you choose.
 
-**Self-hosted · Bash + systemd + SQLite · MIT**
+**Self-hosted · Bash + systemd + SQLite**
 
 ![Installing 5dive and messaging an agent](docs/quickstart.gif)
 
-You need a Linux server (Ubuntu 22.04 or newer recommended) and your own AI subscription or API key, no 5dive account. Rather not run a server? [Hosted 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) runs it for you.
+You need a Linux server (Ubuntu 22.04 or newer recommended) and your own AI subscription or API key, no 5dive account. Or skip the ops and run it on [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme). Same open-source CLI.
 
 ## Why 5dive
 
@@ -199,4 +198,4 @@ With `5dive push`, agents push code through your own GitHub App and never hold i
 
 [Docs](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) · [Full guide](docs/guide.md) · [Human gates](docs/human-gates.md) · [Triggers](docs/triggers.md) · [Docker](docker/README.md) · [Contributing](CONTRIBUTING.md) · [Security reports](https://github.com/5dive-ai/5dive/security/advisories/new)
 
-[Hosted 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) · [Telegram app](https://t.me/FiveDiveBot?startapp) · [Telegram community](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)
+[5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) · [Telegram app](https://t.me/FiveDiveBot?startapp) · [Telegram community](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)

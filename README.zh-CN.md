@@ -17,7 +17,6 @@
   <a href="docs/zero-human.md"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F5dive-ai%2F5dive%2Fstatus%2Fbadge.json" alt="自主完成的任务占比"></a>
   <a href="https://github.com/5dive-ai/5dive/releases"><img src="https://img.shields.io/github/v/release/5dive-ai/5dive" alt="最新版本"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="许可证：MIT"></a>
-  <a href="https://t.me/ai5dive"><img src="https://img.shields.io/badge/Telegram-community-229ED9?logo=telegram&logoColor=white" alt="Telegram 社区"></a>
 </p>
 
 ```sh
@@ -25,13 +24,13 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-5dive 把 Claude Code、Codex、OpenClaw、Hermes、Antigravity、Grok、OpenCode 等命令行智能体作为常驻的 Linux 服务运行。智能体共享任务、互相分派工作，并检查彼此的结果。每个智能体都有自己的 Linux 用户和可配置的权限。
+5dive 把 Claude Code、Codex、OpenClaw、Hermes、Antigravity、Grok、OpenCode 等命令行智能体作为常驻的 Linux 服务运行。智能体共享任务、互相分派工作，并检查彼此的结果。每个智能体以独立的 Linux 用户身份运行，权限由你设定。
 
-**自托管 · Bash + systemd + SQLite · MIT**
+**自托管 · Bash + systemd + SQLite**
 
 ![安装 5dive 并给智能体发消息](docs/quickstart.gif)
 
-你只需要一台 Linux 服务器（推荐 Ubuntu 22.04 或更新版本），以及你自己的 AI 订阅或 API key，无需 5dive 账号。不想自己运维服务器？[托管版 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) 替你运行。
+你只需要一台 Linux 服务器（推荐 Ubuntu 22.04 或更新版本），以及你自己的 AI 订阅或 API key，无需 5dive 账号。也可以省去运维，直接在 [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) 上运行。同一套开源 CLI。
 
 ## 为什么选 5dive
 
@@ -201,4 +200,4 @@ Linux 用户隔离智能体；`systemd` 负责进程守护；SQLite 存储任务
 
 [文档（英文）](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [完整指南（英文）](docs/guide.md) · [人工审批](docs/human-gates.md) · [触发器](docs/triggers.md) · [Docker](docker/README.md) · [参与贡献](CONTRIBUTING.md) · [报告安全漏洞](https://github.com/5dive-ai/5dive/security/advisories/new)
 
-[托管版 5dive](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [Telegram 应用](https://t.me/FiveDiveBot?startapp) · [Telegram 社区](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)
+[5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [Telegram 应用](https://t.me/FiveDiveBot?startapp) · [Telegram 社区](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)
