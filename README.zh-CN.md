@@ -26,7 +26,7 @@ sudo 5dive init
 
 5dive 把 Claude Code、Codex 等命令行智能体作为常驻的 Linux 服务运行。智能体共享任务、互相分派工作，并检查彼此的结果。每个智能体以独立的 Linux 用户身份运行，权限由你设定。
 
-**自托管 · Bash + systemd + SQLite · MIT**
+**自托管 · Bash + systemd + SQLite**
 
 ![安装 5dive 并给智能体发消息](docs/quickstart.gif)
 
