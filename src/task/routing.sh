@@ -816,7 +816,17 @@ _task_internal_subject_reason() {
   # Our own machinery: the task engine, gates, verifier rails, CI, the release
   # cut, harnesses, the board, agent plumbing. Still a candidate set, never an
   # action set — see the two declared escapes above.
-  [[ "$t" =~ (^|[^a-z])(harness|harnesses|smoke|full[-_ ]sweep|pipefail|shellcheck|actionlint|lint|verifier|verifiers|rail|rails|gate|gates|gating|task[[:space:]](add|done|need|ls)|taskboard|worktree|worktrees|heartbeat|release[-_ ]cut|version[-_ ]bump|changelog|pre[-_ ]push|hook|hooks|guard|guards|council|probe|probes|ci|nightly|budget[-_ ]report|backlog|board|cron|crontab|digest|recurring|maker|regression|flaky|unit|test|tests)([^a-z]|$) ]] \
+  [[ "$t" =~ (^|[^a-z])(harness|harnesses|smoke|full[-_ ]sweep|pipefail|shellcheck|actionlint|lint|verifier|verifiers|rail|rails|task[[:space:]](add|done|need|ls)|taskboard|worktree|worktrees|heartbeat|release[-_ ]cut|version[-_ ]bump|changelog|pre[-_ ]push|guard|guards|council|ci|nightly|budget[-_ ]report|backlog|crontab|recurring|maker|regression|flaky|test|tests)([^a-z]|$) ]] \
+    && { printf 'internal machinery'; return 0; }
+  # DIVE-6652: gate, board, digest, unit, cron, hook and probe are OURS only in
+  # a compound. Bare, they are a customer's own work just as often: on teal-fox
+  # all 6 hits in a 20-row window were customer product rows (a feed-publish
+  # gate, a leak-scan gate, a bond-digest page, "customs unit values", a
+  # `critic-board-passed` key), the real machinery count was 0, and the cap
+  # refused a customer's "commit the digest CSS" row. Over our own last 1500
+  # rows the compounds keep 272 of the bare set's 332 hits; most of the 60 it
+  # drops are product rows too (a LinkedIn hook, a checkout probe, a cron line).
+  [[ "$t" =~ (^|[^a-z])((human|merge|push|secret|approval|decision|manual|done|spend|smoke|task|verify|ship)[-_ ]gates?|gates?[-_ ](digest|ping|card|cards|history|rail|rails|tier|routing|answer|evidence|re[-_ ]?nag)|(task|team)[-_ ]board|unit[-_ ]tests?|systemd[-_ ]units?|(git|claude|stop|session[-_ ]?start|pre[-_ ]?commit|pre[-_ ]?tool[-_ ]?use|post[-_ ]?tool[-_ ]?use)[-_ ]hooks?|pretooluse|posttooluse|selfcheck[-_ ]probes?)([^a-z]|$) ]] \
     && { printf 'internal machinery'; return 0; }
   return 0
 }
@@ -878,19 +888,29 @@ _TASK_FILING_DAILY_CAP=15
 # running the SAME classifier over recent titles rather than storing a column —
 # no schema change, and the count can never disagree with the rule that gates
 # the next add. Prints "<internal> <total>".
+#
+# DIVE-6652: a row filed with --customer stays in the window but is never a hit.
+# The filer already told us the scan was wrong about it; re-scanning its title
+# here made every such row raise the count the NEXT filer is refused on. The
+# flag is read back from its task.customer ledger event (task add writes it),
+# keyed on ident so the lookup rides lifecycle_events_ident_idx.
 _task_internal_recent_ratio() {
   local window="${1:-20}" n=0 hits=0 line
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     n=$((n + 1))
+    [[ "$line" == C* ]] && continue
     # `if`, not `[[ ]] && ...`: as the LAST command in a loop body a false
     # `&&` list makes the body — and so the loop — exit 1, which `set -e`
     # takes as a failure. Same family as the defect this whole ticket exists
     # to stop generating.
-    if [[ -n "$(_task_internal_subject_reason "$line")" ]]; then
+    if [[ -n "$(_task_internal_subject_reason "${line:2}")" ]]; then
       hits=$((hits + 1))
     fi
-  done < <(db "SELECT REPLACE(title, char(10), ' ') FROM tasks WHERE kind='standard' ORDER BY id DESC LIMIT ${window};")
+  done < <(db "SELECT CASE WHEN EXISTS (SELECT 1 FROM lifecycle_events e
+                                         WHERE e.ident=t.ident AND e.kind='task.customer')
+                           THEN 'C ' ELSE '- ' END || REPLACE(t.title, char(10), ' ')
+               FROM tasks t WHERE t.kind='standard' ORDER BY t.id DESC LIMIT ${window};")
   # THE TRAILING NEWLINE IS LOAD-BEARING. `read` returns 1 when it hits EOF
   # without a delimiter, so a bare "%s %s" makes the CALLER's `read` fail, and
   # under src/header.sh's `set -euo pipefail` that killed `task add` outright
