@@ -55,38 +55,20 @@ sudo 5dive init
 任何类型的智能体，用你已有的套餐或 API key：
 
 ```sh
-# 1. 账号：登录一次套餐，或保存一个 API key
-sudo 5dive account add work && sudo 5dive account login work --type=claude   # Claude 套餐
-sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex      # ChatGPT 套餐
-sudo 5dive account add kimi
-printf '%s' "$KIMI_API_KEY" | sudo 5dive account set kimi --type=claude --provider=moonshot --api-key=-
+# Claude Code，用你的 Claude 套餐
+sudo 5dive account add work && sudo 5dive account login work --type=claude
+sudo 5dive hire cto --role="CTO" --auth-profile=work
 
-# 2. 智能体：任何类型，用任何账号
-sudo 5dive hire cto --role="CTO" --auth-profile=work       # Claude Code，用你的 Claude 套餐
-sudo 5dive hire analyst --auth-profile=kimi                # Claude Code，用 Kimi
-sudo 5dive hire scout --type=codex --auth-profile=gpt      # Codex，用你的 ChatGPT 套餐
-sudo 5dive hire designer --type=antigravity                # Antigravity，用你的 Google 账号
-sudo 5dive hire writer --type=grok                         # Grok，用你的 xAI 账号
-sudo 5dive hire ops --type=openclaw --provider=openrouter --api-key=-     # OpenClaw，任意 OpenRouter 模型
-sudo 5dive hire researcher --type=hermes --provider=deepseek --api-key=-  # Hermes，用 DeepSeek
+# 任意模型上的 Claude Code，用你自己的 key
+sudo 5dive hire coder --provider=deepseek --api-key=- --auth-profile=deepseek
+sudo 5dive hire any --provider=openrouter --api-key=- --auth-profile=or --model=<slug>
 
-# 3. 渠道：每个智能体有自己的
-sudo 5dive hire support --channels=telegram --telegram-token=-   # 它自己的 Telegram 机器人
+# Codex，用你的 ChatGPT 套餐
+sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex
+sudo 5dive hire scout --type=codex --auth-profile=gpt
 ```
 
-### 任意模型上的 Claude Code
-
-用你自己的 key，Claude Code 就能跑在 Kimi、DeepSeek、GLM、Qwen、任意 OpenRouter 模型，或你自己机器上的模型上。还是同一个 Claude Code，同样的工具和技能，只是背后换了模型。
-
-```sh
-sudo 5dive hire coder --provider=deepseek --api-key=- --auth-profile=deepseek   # DeepSeek
-sudo 5dive hire builder --provider=zai --api-key=- --auth-profile=glm           # GLM
-sudo 5dive hire helper --provider=qwen --api-key=- --auth-profile=qwen          # Qwen
-sudo 5dive hire any --provider=openrouter --api-key=- --auth-profile=or --model=<slug>   # 任意 OpenRouter 模型
-sudo 5dive hire local --base-url=http://127.0.0.1:8000 --model=<slug> --api-key=- --auth-profile=local   # 你自己的机器
-```
-
-key 通过标准输入传入（`--api-key=-`），不写在命令行里。`sudo 5dive fire <name>` 移除一个智能体。更多服务商和团队共用机器人：[完整指南](docs/guide.md)。
+也支持 Antigravity、Grok、OpenClaw、Hermes 和 Pi，每个智能体可以有自己的 Telegram 机器人，Claude Code 还能跑在 Kimi、GLM、Qwen 或你自己的机器上：[完整指南](docs/guide.md#agent-types)。key 通过标准输入传入（`--api-key=-`），不写在命令行里。`sudo 5dive fire <name>` 移除一个智能体。
 
 ## 雇用智能体和团队
 

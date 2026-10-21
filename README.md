@@ -53,38 +53,20 @@ Then ask me which agent to create first.
 Any harness, on the plan or API key you already have:
 
 ```sh
-# 1. Accounts: sign in to a plan once, or save an API key
-sudo 5dive account add work && sudo 5dive account login work --type=claude   # Claude plan
-sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex      # ChatGPT plan
-sudo 5dive account add kimi
-printf '%s' "$KIMI_API_KEY" | sudo 5dive account set kimi --type=claude --provider=moonshot --api-key=-
+# Claude Code, on your Claude plan
+sudo 5dive account add work && sudo 5dive account login work --type=claude
+sudo 5dive hire cto --role="CTO" --auth-profile=work
 
-# 2. Agents: any harness, on any account
-sudo 5dive hire cto --role="CTO" --auth-profile=work       # Claude Code, on your Claude plan
-sudo 5dive hire analyst --auth-profile=kimi                # Claude Code, on Kimi
-sudo 5dive hire scout --type=codex --auth-profile=gpt      # Codex, on your ChatGPT plan
-sudo 5dive hire designer --type=antigravity                # Antigravity, on your Google account
-sudo 5dive hire writer --type=grok                         # Grok, on your xAI account
-sudo 5dive hire ops --type=openclaw --provider=openrouter --api-key=-     # OpenClaw, any OpenRouter model
-sudo 5dive hire researcher --type=hermes --provider=deepseek --api-key=-  # Hermes, on DeepSeek
+# Claude Code on any model, with your own key
+sudo 5dive hire coder --provider=deepseek --api-key=- --auth-profile=deepseek
+sudo 5dive hire any --provider=openrouter --api-key=- --auth-profile=or --model=<slug>
 
-# 3. Channels: each agent gets its own
-sudo 5dive hire support --channels=telegram --telegram-token=-   # its own Telegram bot
+# Codex, on your ChatGPT plan
+sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex
+sudo 5dive hire scout --type=codex --auth-profile=gpt
 ```
 
-### Claude Code on any model
-
-Bring your own key and Claude Code runs on Kimi, DeepSeek, GLM, Qwen, any OpenRouter model, or a model on your own machine. Same Claude Code, same tools and skills, a different model behind it.
-
-```sh
-sudo 5dive hire coder --provider=deepseek --api-key=- --auth-profile=deepseek   # DeepSeek
-sudo 5dive hire builder --provider=zai --api-key=- --auth-profile=glm           # GLM
-sudo 5dive hire helper --provider=qwen --api-key=- --auth-profile=qwen          # Qwen
-sudo 5dive hire any --provider=openrouter --api-key=- --auth-profile=or --model=<slug>   # any OpenRouter model
-sudo 5dive hire local --base-url=http://127.0.0.1:8000 --model=<slug> --api-key=- --auth-profile=local   # your own machine
-```
-
-Keys go in on stdin (`--api-key=-`), never on the command line. `sudo 5dive fire <name>` removes an agent. More providers and one shared bot: [full guide](docs/guide.md).
+Also Antigravity, Grok, OpenClaw, Hermes and Pi, a Telegram bot per agent, and Claude Code on Kimi, GLM, Qwen or your own machine: [full guide](docs/guide.md#agent-types). Keys go in on stdin (`--api-key=-`), never on the command line. `sudo 5dive fire <name>` removes an agent.
 
 ## Hire agents and teams
 
