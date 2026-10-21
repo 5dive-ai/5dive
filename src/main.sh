@@ -227,6 +227,8 @@ Agents:
                                                      # message: sets every group + groups added later.
                                                      # --names="Оля,Liv,奥利维亚": names it also answers to
                                                      # in groups (empty clears).
+  5dive agent telegram-access seed-names [<name>]    # add each Telegram agent's card name (persona.yaml) to
+                                                     # those names once; never re-adds one the owner removed.
   5dive agent telegram-pending-ignore <name> <code>  # drop a pending pairing without approving (dashboard inbox).
   5dive agent telegram-resolve-handle <name> <@handle>
                                                      # getChat for @handle via the agent's bot token; returns
@@ -891,7 +893,7 @@ _agent_verb_dispatch() {
           # idempotent and not worth log noise.
           cmd_telegram_info "$@" ;;
         telegram-access)
-          [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent telegram-access get|set|groups <name>"
+          [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent telegram-access get|set|groups|seed-names <name>"
           local accesscmd="$1"; shift
           case "$accesscmd" in
             get) cmd_telegram_access_get "$@" ;;  # read-only, no audit
@@ -902,6 +904,10 @@ _agent_verb_dispatch() {
               # DIVE-6675: a bare read is not audited; --answer= writes.
               [[ " $* " == *" --answer="* || " $* " == *" --names="* ]] && { AUDIT_CMD="agent telegram-access groups"; AUDIT_ARGS=("$@"); }
               cmd_telegram_access_groups "$@" ;;
+            seed-names)
+              # DIVE-6701: writes the card name into a group setting, so audited.
+              AUDIT_CMD="agent telegram-access seed-names"; AUDIT_ARGS=("$@")
+              cmd_telegram_access_seed_names "$@" ;;
             *) fail "$E_USAGE" "unknown telegram-access command: $accesscmd" ;;
           esac ;;
         telegram-pending-ignore)
