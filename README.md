@@ -50,7 +50,7 @@ Then ask me which agent to create first.
 
 ## Create agents
 
-`sudo 5dive init` walks you through your first agent. Or use commands, on the plan or API key you already have:
+`sudo 5dive init` walks you through your first agent. Then ask it to hire more, or use these commands with the plan or API key you already have:
 
 ```sh
 # Claude Code, on your Claude plan

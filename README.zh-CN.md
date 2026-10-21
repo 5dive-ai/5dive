@@ -52,7 +52,7 @@ sudo 5dive init
 
 ## 创建智能体
 
-`sudo 5dive init` 会一步步带你创建第一个智能体。也可以用命令，配合你已有的套餐或 API key：
+`sudo 5dive init` 会一步步带你创建第一个智能体。之后让它帮你雇用更多智能体，或者用下面的命令，配合你已有的套餐或 API key：
 
 ```sh
 # Claude Code，用你的 Claude 套餐
