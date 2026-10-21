@@ -58,16 +58,16 @@ sudo 5dive init
 # 登录一次你的 Claude 套餐，所有智能体都可以共用
 sudo 5dive account add work && sudo 5dive account login work --type=claude
 
-# 雇用一个用这个套餐的 Claude Code 智能体
-sudo 5dive hire cto --auth-profile=work
+# 创建一个用这个套餐的 Claude Code 智能体
+sudo 5dive agent create cto --type=claude --auth-profile=work
 
 # 或者用你自己的 key，让 Claude Code 跑在别的模型上：DeepSeek，或任意 OpenRouter 模型
-sudo 5dive hire coder --provider=deepseek --api-key=- --auth-profile=deepseek
-sudo 5dive hire any --provider=openrouter --api-key=- --auth-profile=or --model=<slug>
+sudo 5dive agent create coder --type=claude --provider=deepseek --api-key=- --auth-profile=deepseek
+sudo 5dive agent create any --type=claude --provider=openrouter --api-key=- --auth-profile=or --model=<slug>
 
 # Codex 也一样，用你的 ChatGPT 套餐
 sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex
-sudo 5dive hire scout --type=codex --auth-profile=gpt
+sudo 5dive agent create scout --type=codex --auth-profile=gpt
 ```
 
 `--api-key=-` 从标准输入读取 key，不会留在 shell 历史里。[更多智能体类型、模型和 Telegram 机器人 →](docs/guide.md#agent-types)

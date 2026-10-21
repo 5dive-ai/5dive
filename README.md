@@ -56,16 +56,16 @@ Then ask me which agent to create first.
 # Sign in to your Claude plan once. Every agent can share it.
 sudo 5dive account add work && sudo 5dive account login work --type=claude
 
-# Hire a Claude Code agent on that plan
-sudo 5dive hire cto --auth-profile=work
+# Create a Claude Code agent on that plan
+sudo 5dive agent create cto --type=claude --auth-profile=work
 
 # Or run Claude Code on another model with your own key: DeepSeek, or any OpenRouter model
-sudo 5dive hire coder --provider=deepseek --api-key=- --auth-profile=deepseek
-sudo 5dive hire any --provider=openrouter --api-key=- --auth-profile=or --model=<slug>
+sudo 5dive agent create coder --type=claude --provider=deepseek --api-key=- --auth-profile=deepseek
+sudo 5dive agent create any --type=claude --provider=openrouter --api-key=- --auth-profile=or --model=<slug>
 
 # Codex works the same way, on your ChatGPT plan
 sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex
-sudo 5dive hire scout --type=codex --auth-profile=gpt
+sudo 5dive agent create scout --type=codex --auth-profile=gpt
 ```
 
 `--api-key=-` reads the key from stdin, so it never lands in your shell history. [More agent types, models and Telegram bots →](docs/guide.md#agent-types)
