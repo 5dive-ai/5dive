@@ -50,23 +50,25 @@ Then ask me which agent to create first.
 
 ## Create agents
 
-`sudo 5dive init` walks you through your first agent. Then ask it to hire more, or use these commands with the plan or API key you already have:
+Your first agent comes from `sudo 5dive init`. After that, ask it to hire more, or do it yourself:
 
 ```sh
-# Claude Code, on your Claude plan
+# Sign in to your Claude plan once. Every agent can share it.
 sudo 5dive account add work && sudo 5dive account login work --type=claude
-sudo 5dive hire cto --role="CTO" --auth-profile=work
 
-# Claude Code on any model, with your own key
+# Hire a Claude Code agent on that plan
+sudo 5dive hire cto --auth-profile=work
+
+# Or run Claude Code on another model with your own key: DeepSeek, or any OpenRouter model
 sudo 5dive hire coder --provider=deepseek --api-key=- --auth-profile=deepseek
 sudo 5dive hire any --provider=openrouter --api-key=- --auth-profile=or --model=<slug>
 
-# Codex, on your ChatGPT plan
+# Codex works the same way, on your ChatGPT plan
 sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex
 sudo 5dive hire scout --type=codex --auth-profile=gpt
 ```
 
-Also Antigravity, Grok, OpenClaw, Hermes and Pi, a Telegram bot per agent, and Claude Code on Kimi, GLM, Qwen or your own machine: [full guide](docs/guide.md#agent-types). Keys go in on stdin (`--api-key=-`), never on the command line. `sudo 5dive fire <name>` removes an agent.
+`--api-key=-` reads the key from stdin, so it never lands in your shell history. [More agent types, models and Telegram bots →](docs/guide.md#agent-types)
 
 ## Hire agents and teams
 

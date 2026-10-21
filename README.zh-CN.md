@@ -52,23 +52,25 @@ sudo 5dive init
 
 ## 创建智能体
 
-`sudo 5dive init` 会一步步带你创建第一个智能体。之后让它帮你雇用更多智能体，或者用下面的命令，配合你已有的套餐或 API key：
+第一个智能体由 `sudo 5dive init` 创建。之后让它帮你雇用更多，或者自己来：
 
 ```sh
-# Claude Code，用你的 Claude 套餐
+# 登录一次你的 Claude 套餐，所有智能体都可以共用
 sudo 5dive account add work && sudo 5dive account login work --type=claude
-sudo 5dive hire cto --role="CTO" --auth-profile=work
 
-# 任意模型上的 Claude Code，用你自己的 key
+# 雇用一个用这个套餐的 Claude Code 智能体
+sudo 5dive hire cto --auth-profile=work
+
+# 或者用你自己的 key，让 Claude Code 跑在别的模型上：DeepSeek，或任意 OpenRouter 模型
 sudo 5dive hire coder --provider=deepseek --api-key=- --auth-profile=deepseek
 sudo 5dive hire any --provider=openrouter --api-key=- --auth-profile=or --model=<slug>
 
-# Codex，用你的 ChatGPT 套餐
+# Codex 也一样，用你的 ChatGPT 套餐
 sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex
 sudo 5dive hire scout --type=codex --auth-profile=gpt
 ```
 
-也支持 Antigravity、Grok、OpenClaw、Hermes 和 Pi，每个智能体可以有自己的 Telegram 机器人，Claude Code 还能跑在 Kimi、GLM、Qwen 或你自己的机器上：[完整指南](docs/guide.md#agent-types)。key 通过标准输入传入（`--api-key=-`），不写在命令行里。`sudo 5dive fire <name>` 移除一个智能体。
+`--api-key=-` 从标准输入读取 key，不会留在 shell 历史里。[更多智能体类型、模型和 Telegram 机器人 →](docs/guide.md#agent-types)
 
 ## 雇用智能体和团队
 
