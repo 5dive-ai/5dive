@@ -50,7 +50,7 @@ Then ask me which agent to create first.
 
 ## Create agents
 
-Your first agent comes from `sudo 5dive init`. After that, ask it to hire more, or do it yourself:
+`sudo 5dive init` walks you through creating an agent. Run it again for each new one, ask your agent to hire more, or use commands:
 
 ```sh
 # Sign in to your Claude plan once. Every agent can share it.
