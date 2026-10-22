@@ -140,6 +140,8 @@ _task_usage() {
   reject <id> --feedback="FINDING/FIX/VERIFY"    verifier FAIL: bounce back to the maker
                                                 (DIVE-4144: the feedback must name a
                                                 FIX, or --no-fix=<why>)
+         [--merge-conflict]                     the merger's bounce of a PASSED delivery that only
+                                                conflicts: not counted toward max_iterations (DIVE-6753)
   cancel <id> [--result=<text>]                 -> cancelled
   done|cancel [--keep-worktree]                 keep node_modules in that row's worktrees
   done|cancel|deliver [--append-result|--force-result]   close a row that already has a result
