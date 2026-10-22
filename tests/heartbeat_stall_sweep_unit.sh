@@ -5,6 +5,7 @@
 # host samples: 39.4 / 39.0 / 37.3s. The CI runner reads it lower (26.7s and 28.8s on
 # full-pristine(1) and full-installed-host(1) of run 34491480280), so the host number is the one that
 # keeps both runners under the claim. Does not fit the 300s PR core; the nightly sweep runs it.
+# DIVE-6726 added 8 more full sweeps (B12-B16): 60.5s on the host (one sample, loaded box).
 # DIVE-1416 isolated unit harness for _hb_stall_sweep (cmd_heartbeat.sh) —
 # fleet-stall self-heal gaps #2 and #3 (gap #1 is _hb_blocked_sweep, covered by
 # tests/task_cascade_unblock_unit.sh):
@@ -436,6 +437,71 @@ _alert=$(grep $'^ops\t' "$SEND_LOG" | grep 'fleet-stall' | head -1)
 [[ "$_alert" == *"2 stranded actionable item(s)"* ]] \
   && ok_t "B11 parked gates do NOT feed total_stranded (2, not 5)" \
   || bad_t "B11 parked gates leaked into total_stranded" "$_alert"
+
+# --- B12..B16 DIVE-6726: tier<=1 is not "an agent can clear it" for a HUMAN-CLASS
+#     gate with no routed_reviewer — cmd_task_answer refuses every agent on it. Live
+#     on teal-fox 2026-10-21: one un-routed, pinged tier-1 approval re-alarmed the
+#     lead 3x in ~70 min. gate_alert runs the sweep past the persistence window and
+#     prints the alert line ("" = no alert); the gate row is the only work present.
+gate_alert() {  # $1 need_type  $2 tier  $3 routed_reviewer ('' = none)  $4 surfaced (1|0)
+  reset_all
+  local g asked=NULL pinged=NULL
+  [[ "$4" == 1 ]] && { asked="datetime('now','-2 days')"; pinged="datetime('now','-1 days')"; }
+  g=$(addt --assignee=dev -- "gate $1 t$2 r=${3:-none} s=$4")
+  db "UPDATE tasks SET status='blocked', need_type='$1', tier=$2, routed_reviewer=NULLIF('$3',''),
+         need_asked_at=${asked}, gate_pinged_at=${pinged} WHERE id=${g};"
+  db "INSERT INTO task_prefs (key,value) VALUES ('stall_first_seen_at', datetime('now','-${_HB_STALL_MIN_MINUTES} minutes','-1 minutes'));"
+  : >"$SEND_LOG"; : >"$DIGEST_SPOOL"
+  _hb_stall_sweep >/dev/null 2>&1
+  grep $'^ops\t' "$SEND_LOG" | grep 'fleet-stall' | head -1
+}
+
+# --- B12: THE REPORTED ROW. Un-routed, pinged, tier-1 approval, nothing else on the
+#     board. Pre-fix: "1 fleet-actionable gate(s)" and an alert. Post-fix: parked.
+_alert=$(gate_alert approval 1 '' 1)
+[[ -z "$_alert" ]] \
+  && ok_t "B12 an un-routed, pinged tier-1 approval alone does NOT raise the stall alert (a human holds it)" \
+  || bad_t "B12 human-held tier-1 approval still counted as fleet-actionable" "$_alert"
+[[ -z "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")" ]] \
+  && ok_t "B12 ...and the stall clock is cleared, not left running on it" \
+  || bad_t "B12 stall clock still set" "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")"
+
+# --- B13: the same gate is rendered as PARKED. It cannot be read from a silent
+#     sweep, so one assigned-but-unstarted todo makes the alert fire; the gate must
+#     then land in the parked term, not the actionable one.
+reset_all
+_t=$(addt --assignee=bob -- "unstarted beside a human-held gate")
+_g=$(addt --assignee=dev -- "human-held tier-1 approval")
+db "UPDATE tasks SET status='blocked', need_type='approval', tier=1, routed_reviewer=NULL,
+       need_asked_at=datetime('now','-2 days'), gate_pinged_at=datetime('now','-1 days') WHERE id=${_g};"
+db "INSERT INTO task_prefs (key,value) VALUES ('stall_first_seen_at', datetime('now','-${_HB_STALL_MIN_MINUTES} minutes','-1 minutes'));"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
+_hb_stall_sweep >/dev/null 2>&1
+_alert=$(grep $'^ops\t' "$SEND_LOG" | grep 'fleet-stall' | head -1)
+[[ "$_alert" == *"1 stranded actionable item(s) (1 assigned-but-unstarted, 0 fleet-actionable gate(s))"* \
+   && "$_alert" == *"1 parked on the human"* ]] \
+  && ok_t "B13 the human-held tier-1 approval is counted as parked (parked_gates=1), not actionable" \
+  || bad_t "B13 wrong split for a human-held tier-1 gate" "${_alert:-<no alert>}"
+
+# --- B14..B16: what must STILL count as fleet-actionable.
+_alert=$(gate_alert approval 1 main 1)
+[[ "$_alert" == *"(0 assigned-but-unstarted, 1 fleet-actionable gate(s))"* && "$_alert" == *"0 parked on the human"* ]] \
+  && ok_t "B14 a tier-1 approval WITH routed_reviewer still counts (the routed lead may clear it)" \
+  || bad_t "B14 routed tier-1 approval dropped from open_gates" "${_alert:-<no alert>}"
+_alert=$(gate_alert decision 1 '' 1)
+[[ "$_alert" == *"(0 assigned-but-unstarted, 1 fleet-actionable gate(s))"* && "$_alert" == *"0 parked on the human"* ]] \
+  && ok_t "B15 an un-routed, pinged tier-1 DECISION still counts (decision is not a human class)" \
+  || bad_t "B15 tier-1 decision dropped from open_gates" "${_alert:-<no alert>}"
+_alert=$(gate_alert approval 1 '' 0)
+[[ "$_alert" == *"(0 assigned-but-unstarted, 1 fleet-actionable gate(s))"* && "$_alert" == *"0 parked on the human"* ]] \
+  && ok_t "B16 a NEVER-surfaced un-routed tier-1 approval still counts (nobody was told)" \
+  || bad_t "B16 never-surfaced human-class gate dropped" "${_alert:-<no alert>}"
+for _ty in secret manual access; do
+  _alert=$(gate_alert "$_ty" 1 '' 1)
+  [[ -z "$_alert" ]] \
+    && ok_t "B12 an un-routed, pinged tier-1 ${_ty} gate is parked too (whole human class)" \
+    || bad_t "B12 tier-1 ${_ty} still counted" "$_alert"
+done
 
 # =============================================================================
 # (c) gap#3 canary — pinger liveness

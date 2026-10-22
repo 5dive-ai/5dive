@@ -7869,10 +7869,17 @@ _hb_stall_sweep() {
     # human (e.g. overnight) is PARKED, not stranded — main flagged that
     # counting it here re-alarms every _HB_STALL_MIN_MINUTES on a legitimately
     # idle night, exactly the alert-fatigue class already killed once.
+    # DIVE-6726: tier<=1 is NOT "an agent can clear it" for a human-class gate
+    # (approval/secret/manual/access) with no routed_reviewer — cmd_task_answer
+    # refuses every agent on it, and the pinger canary below already reads that
+    # shape as human-awaiting. Once surfaced it is PARKED like a pinged tier-2
+    # gate; counted here it re-alarmed the lead 3x in ~70 min on one row
+    # (teal-fox, 2026-10-21). A ROUTED one stays here: its lead may clear it.
+    local _human_held="(need_type IN ${_GATE_HUMAN_CLASS_SQL} AND COALESCE(routed_reviewer,'') = '')"
     open_gates=$(db "SELECT COUNT(*) FROM tasks
                      WHERE need_type IS NOT NULL AND need_answered_at IS NULL
                        AND status NOT IN ('done','cancelled')
-                       AND (COALESCE(tier,2) <= 1
+                       AND ((COALESCE(tier,2) <= 1 AND NOT ${_human_held})
                             OR (need_asked_at IS NULL AND gate_pinged_at IS NULL));" 2>/dev/null || echo 0)
     # DIVE-2207: the PARKED count — context, never alarm input. Deliberately NOT
     # folded into total_stranded below: these are the rows open_gates excludes on
@@ -7883,7 +7890,7 @@ _hb_stall_sweep() {
     parked_gates=$(db "SELECT COUNT(*) FROM tasks
                        WHERE need_type IS NOT NULL AND need_answered_at IS NULL
                          AND status NOT IN ('done','cancelled')
-                         AND COALESCE(tier,2) >= 2
+                         AND (COALESCE(tier,2) >= 2 OR ${_human_held})
                          AND (need_asked_at IS NOT NULL OR gate_pinged_at IS NOT NULL);" 2>/dev/null || echo 0)
     [[ "$stranded_todo" =~ ^[0-9]+$ ]] || stranded_todo=0
     [[ "$open_gates"    =~ ^[0-9]+$ ]] || open_gates=0
