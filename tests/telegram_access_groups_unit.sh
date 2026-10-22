@@ -122,8 +122,8 @@ _tg_bot_first_name() { printf '🤖 X'; }
 out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Matcha","janis"]' && "$(field namesComplete)" == true ]] \
   && okk 'a bot name with no word of 2+ letters adds nothing' || bad "no word: $out"
 _tg_bot_first_name() { return 1; }
-out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Matcha","janis"]' && "$(field namesComplete)" == false ]] \
-  && okk 'getMe down and the list never saved: namesComplete false, extras only' || bad "getMe down: $out"
+out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == null && "$(field namesComplete)" == false ]] \
+  && okk 'getMe down and the list never saved: names null, so no caller saves it without the bot word' || bad "getMe down: $out"
 _tg_bot_first_name() { printf "Janis's matcha assistant"; }
 out=$(run olivia --names='Matcha') && [[ "$(jq -c .data.names <<<"$out")" == '["Matcha"]' && "$(field namesComplete)" == true ]] \
   && okk 'a write without the bot word answers the list as written' || bad "write without bot word: $out"

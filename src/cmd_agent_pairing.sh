@@ -225,9 +225,10 @@ PY
 # `groupsCallNamesComplete`, which tells the plugin (0.5.107+) not to add that
 # word on its own, so the owner can remove it. An empty list is allowed: then
 # only an @mention or a reply wakes it. `namesComplete: true` on a read means
-# "names is the whole list and --names= replaces it". It is false only when
-# the bot's name could not be read and the list was never saved, so a caller
-# keeps the old "Also answers to" field instead of saving a list without it.
+# "names is the whole list and --names= replaces it". When the bot's name
+# could not be read and the list was never saved, `names` is null and
+# `namesComplete` false: a caller hides the field (as for a CLI older than it)
+# rather than save a list that silently drops the bot's name.
 _tg_group_answer_py() {
   cat <<'PY'
 import json, os, re, sys, tempfile, unicodedata
@@ -323,7 +324,9 @@ def bot_word(first):
     return run if len(run) >= 2 and call_name(run) else None
 complete = access.get('groupsCallNamesComplete') is True
 known = complete or os.environ.get('BOT_KNOWN') == '1'
-if not complete:
+if not known:
+    names = None
+elif not complete:
     own = bot_word(os.environ.get('BOT_FIRST', ''))
     if own:
         names = [own] + [n for n in names if n.casefold() != own.casefold()]
