@@ -757,7 +757,7 @@ account_trusted_ratelimits() {
   done < <(jq -r '.[]' <<<"$agents")
   rec=$(account_usage_record_path "$account")
   if [[ -r "$rec" ]]; then
-    rl=$(jq -c 'select(.source == "probe") | {
+    rl=$(jq -c 'select(.source == "probe" or (.source == "poll" and .pollError == null)) | {
           asOf, fiveHourPct: (.fiveHour.pct // null), fiveResetsAt: (.fiveHour.resetsAt // null),
           sevenDayPct: (.sevenDay.pct // null), sevenResetsAt: (.sevenDay.resetsAt // null)}' "$rec" 2>/dev/null) || rl=""
     if [[ -n "$rl" ]]; then
@@ -782,31 +782,52 @@ account_trusted_ratelimits() {
 # account, healthy ones included (main, 2026-10-12). The token goes to curl on
 # stdin (-K -), never argv. The seam _ROTATION_PROBE_CMD prints raw response
 # headers for a harness; it is never set in production.
+#
+# DIVE-6713: max_tokens is 0. The provider answers 200 with an empty content
+# and the same utilization headers (measured on 4 accounts 2026-10-22), so the
+# probe produces no output token at all; ~22 input tokens remain.
 account_live_ratelimits() {
-  local account="$1" hdrs env tok body now
+  local account="$1" hdrs now
   now=$(date +%s)
+  hdrs=$(account_probe_headers "$account")
+  account_ratelimits_from_headers "$now" <<<"$hdrs"
+}
+
+# account_probe_headers <account> — the raw response headers of that probe, the
+# status line included, or nothing when the account has no Claude login token
+# or the call got no answer. The token never leaves this function.
+account_probe_headers() {
+  local account="$1" hdrs env tok body
   if [[ -n "${_ROTATION_PROBE_CMD:-}" ]]; then
-    hdrs=$("${_ROTATION_PROBE_CMD}" "$account" 2>/dev/null) || return 0
-  else
-    env="${AUTH_PROFILES_DIR}/${account}/combined.env"
-    [[ -r "$env" ]] || return 0
-    tok=$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' "$env" 2>/dev/null | head -1)
-    tok="${tok%\"}"; tok="${tok#\"}"; tok="${tok%\'}"; tok="${tok#\'}"
-    [[ -n "$tok" ]] || return 0
-    body=$(mktemp 2>/dev/null) || return 0
-    jq -cn --arg m "$ROTATION_PROBE_MODEL" \
-      '{model:$m, max_tokens:1,
-        system:"You are Claude Code, Anthropic'"'"'s official CLI for Claude.",
-        messages:[{role:"user", content:"hi"}]}' >"$body"
-    hdrs=$(printf 'header = "authorization: Bearer %s"\n' "$tok" \
-      | curl -sS -m 20 -o /dev/null -D - -K - \
-          -H "anthropic-version: 2023-06-01" \
-          -H "anthropic-beta: oauth-2025-04-20" \
-          -H "content-type: application/json" \
-          --data-binary @"$body" https://api.anthropic.com/v1/messages 2>/dev/null) || hdrs=""
-    rm -f "$body"
-    tok=""
+    "${_ROTATION_PROBE_CMD}" "$account" 2>/dev/null || true
+    return 0
   fi
+  env="${AUTH_PROFILES_DIR}/${account}/combined.env"
+  [[ -r "$env" ]] || return 0
+  tok=$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' "$env" 2>/dev/null | head -1)
+  tok="${tok%\"}"; tok="${tok#\"}"; tok="${tok%\'}"; tok="${tok#\'}"
+  [[ -n "$tok" ]] || return 0
+  body=$(mktemp 2>/dev/null) || return 0
+  jq -cn --arg m "$ROTATION_PROBE_MODEL" \
+    '{model:$m, max_tokens:0,
+      system:"You are Claude Code, Anthropic'"'"'s official CLI for Claude.",
+      messages:[{role:"user", content:"hi"}]}' >"$body"
+  hdrs=$(printf 'header = "authorization: Bearer %s"\n' "$tok" \
+    | curl -sS -m 20 -o /dev/null -D - -K - \
+        -H "anthropic-version: 2023-06-01" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "content-type: application/json" \
+        --data-binary @"$body" https://api.anthropic.com/v1/messages 2>/dev/null) || hdrs=""
+  rm -f "$body"
+  tok=""
+  printf '%s' "$hdrs"
+}
+
+# account_ratelimits_from_headers <now> — stdin: probe headers. Prints the
+# usage_read_ratelimits shape, or nothing when either utilization is missing.
+account_ratelimits_from_headers() {
+  local now="$1" hdrs
+  hdrs=$(cat)
   [[ -n "$hdrs" ]] || return 0
   awk -v now="$now" '
     { sub(/\r$/, "") }
@@ -819,6 +840,105 @@ account_live_ratelimits() {
       printf "{\"asOf\":%d,\"fiveHourPct\":%d,\"fiveResetsAt\":%s,\"sevenDayPct\":%d,\"sevenResetsAt\":%s}\n",
         now, f * 100 + 0.5, (fr == "" ? "null" : fr), s * 100 + 0.5, (sr == "" ? "null" : sr)
     }' <<<"$hdrs"
+}
+
+# ---------------------------------------------------------------------------
+# DIVE-6713 — POLL EVERY CLAUDE ACCOUNT, NOT ONLY THE BUSY ONES.
+#
+# `account usage` takes the freshest statusline a bound seat rendered, and a
+# seat renders only when it takes a turn, so an account with no busy seat had
+# no current number (2026-10-22 02:10Z: konst and mp read `- (remembered)`).
+#
+# The usage panel's own endpoint (GET /api/oauth/usage) reads zero tokens, but
+# it needs the `user:profile` scope and every account here is signed in with a
+# long-lived `CLAUDE_CODE_OAUTH_TOKEN`, which carries `user:inference` only:
+# 403 oauth_scope_insufficient, measured on konst. So the poll is the header
+# probe above: no seat, no session file, no output token, ~22 input tokens.
+# On an account nobody has used for 5h that call opens the 5h window, the same
+# thing a seat's first turn would do; it moves the percentage by nothing the
+# provider prints (two decimals).
+#
+# Those tokens cannot be refreshed, so constraint 1 of the row (never refresh
+# outside Claude Code) holds by construction: there is nothing to refresh. A
+# rejected token is shown STALE with its age and the reason, never 0%.
+#
+# account_poll_targets — the accounts with a Claude login token.
+account_poll_targets() {
+  local name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    grep -q '^CLAUDE_CODE_OAUTH_TOKEN=.' "${AUTH_PROFILES_DIR}/${name}/combined.env" 2>/dev/null \
+      && printf '%s\n' "$name"
+  done < <(account_each)
+}
+
+# account_poll_one <account> — one poll. Writes the reading onto the account
+# (usage.json, source=poll) and appends it to the history; on a failure keeps
+# the last numbers and records why. Prints one log line, never a token.
+account_poll_one() {
+  local account="$1" hdrs code rl now rec why
+  now=$(date +%s)
+  hdrs=$(account_probe_headers "$account")
+  rl=$(account_ratelimits_from_headers "$now" <<<"$hdrs")
+  if [[ -n "$rl" ]]; then
+    account_usage_remember "$account" "$(jq -c '{
+      fiveHour: {pct: .fiveHourPct, resetsAt: .fiveResetsAt},
+      sevenDay: {pct: .sevenDayPct, resetsAt: .sevenResetsAt},
+      asOf, source: "poll", remembered: false}' <<<"$rl")"
+    if declare -F account_usage_sample_record >/dev/null 2>&1; then
+      account_usage_sample_record "$account" "$now" \
+        "$(jq -r '.fiveHourPct // empty' <<<"$rl")" "$(jq -r '.fiveResetsAt // empty' <<<"$rl")" \
+        "$(jq -r '.sevenDayPct // empty' <<<"$rl")" "$(jq -r '.sevenResetsAt // empty' <<<"$rl")" \
+        poll || true
+    fi
+    jq -r --arg a "$account" '"\($a) 5h \(.fiveHourPct)% 7d \(.sevenDayPct)%"' <<<"$rl"
+    return 0
+  fi
+  code=$(awk '{ sub(/\r$/, "") } /^HTTP\// { c = $2 } END { print c }' <<<"$hdrs")
+  case "$code" in
+    "")  why="no answer" ;;
+    401) why="login rejected" ;;
+    403) why="provider refuses this login" ;;
+    *)   why="HTTP ${code}, no usage headers" ;;
+  esac
+  rec=$(account_usage_record_path "$account")
+  if [[ -d "$(dirname "$rec")" ]]; then
+    account_usage_remember "$account" "$(jq -c --arg w "$why" --argjson now "$now" \
+      '. + {pollError: $w, pollFailedAt: $now}' "$rec" 2>/dev/null \
+      || jq -cn --arg w "$why" --argjson now "$now" '{pollError: $w, pollFailedAt: $now}')"
+  fi
+  printf '%s STALE: %s\n' "$account" "$why"
+}
+
+# account_poll_all — poll every target. Prints one line per account.
+account_poll_all() {
+  local name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    account_poll_one "$name"
+  done < <(account_poll_targets)
+}
+
+# account_usage_burn_json <now> — {account: 5h points per hour over the last
+# hour}, from the appended samples. Measured inside ONE window: the anchor
+# restarts whenever the percentage falls or the reset stamp moves. Under ten
+# minutes between the anchor and the newest sample is too short to call a rate
+# and reads null.
+account_usage_burn_json() {
+  local now="$1"
+  account_usage_samples_json "$(( now - 3600 ))" 2>/dev/null | jq -c '
+    [ .[] | select(.fivePct != null) ] | group_by(.account)
+    | map( sort_by(.asOf)
+         | reduce .[] as $s ({a: null, l: null};
+             if .l == null
+                or $s.fivePct < .l.fivePct
+                or ((($s.fiveResetsAt // "0") | tonumber? // 0)
+                    - ((.l.fiveResetsAt // "0") | tonumber? // 0) | fabs) > 900
+             then {a: $s, l: $s} else .l = $s end)
+         | {key: .a.account,
+            value: (if (.l.asOf - .a.asOf) < 600 then null
+                    else ((.l.fivePct - .a.fivePct) * 3600 / (.l.asOf - .a.asOf) * 10 | round) / 10 end)} )
+    | from_entries' 2>/dev/null || printf '{}'
 }
 
 # account_balance_reading <account> — the trusted reading, refreshed from the
@@ -1035,7 +1155,9 @@ account_usage_recall() {
 # caches. Callers enforce that; this function does not, so a harness can drive
 # it with fixture accounts.
 account_usage_rows() {
-  local rows="[]" name agents agent rl at best best_at src usage
+  local rows="[]" name agents agent rl at best best_at src usage polled burn
+  burn=$(account_usage_burn_json "$(date +%s)")
+  [[ -n "$burn" ]] || burn='{}'
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     agents=$(account_agents_bound "$name")
@@ -1049,7 +1171,15 @@ account_usage_rows() {
         best_at=$at; best="$rl"; src="$agent"
       fi
     done < <(jq -r '.[]' <<<"$agents")
-    if [[ -n "$best" ]]; then
+    # DIVE-6713: a reading the poll took competes on asOf like any seat's. A
+    # poll that failed since is not a reading; it falls to the recall below,
+    # which carries the reason.
+    polled=$(jq -c --argjson at "$best_at" \
+      'select(.source == "poll" and .pollError == null and (.asOf // -1) > $at)' \
+      "$(account_usage_record_path "$name")" 2>/dev/null) || polled=""
+    if [[ -n "$polled" ]]; then
+      usage="$polled"
+    elif [[ -n "$best" ]]; then
       usage=$(jq -c --arg src "$src" '{
         fiveHour: (if .fiveHourPct == null then null
                    else {pct: .fiveHourPct, resetsAt: .fiveResetsAt} end),
@@ -1078,8 +1208,8 @@ account_usage_rows() {
       # reported. A profile with zero bound seats still prints its 5H/7D.
       usage=$(account_usage_recall "$name")
     fi
-    rows=$(jq -c --arg n "$name" --argjson a "$agents" --argjson u "$usage" \
-      '. + [{name:$n, agents:$a, usage:$u}]' <<<"$rows")
+    rows=$(jq -c --arg n "$name" --argjson a "$agents" --argjson u "$usage" --argjson b "$burn" \
+      '. + [{name:$n, agents:$a, usage:$u, burn5hPerHour: ($b[$n] // null)}]' <<<"$rows")
   done < <(account_each)
   printf '%s' "$rows"
 }
@@ -1177,15 +1307,39 @@ cmd_account_usage() {
   if (( JSON_MODE )); then
     echo "$rows" | jq -c '{ok:true, data: .}'
   else
-    echo "$rows" | jq -r '
+    # DIVE-6713: SOURCE carries the reading's age, BURN/H is 5h points per hour
+    # over the last hour, SEATS the seats bound to the account.
+    echo "$rows" | jq -r --argjson now "$(date +%s)" '
       def p(x): if x == null then "-" else ((x.pct | floor | tostring) + "%") end;
+      def age(t): if t == null then "?" else ($now - t) as $d
+        | if $d < 3600 then "\(($d / 60) | floor)m"
+          elif $d < 172800 then "\(($d / 3600) | floor)h"
+          else "\(($d / 86400) | floor)d" end end;
+      def b(x): if x == null then "-" elif x > 0 then "+\(x)" else "\(x)" end;
       if length == 0 then "no accounts" else
-        (["ACCOUNT","5H","7D","SOURCE"] | @tsv),
-        (.[] | [.name, p(.usage.fiveHour), p(.usage.sevenDay),
+        (["ACCOUNT","5H","7D","BURN/H","SEATS","SOURCE"] | @tsv),
+        (.[] | [.name, p(.usage.fiveHour), p(.usage.sevenDay), b(.burn5hPerHour),
+                (if (.agents | length) == 0 then "-" else (.agents | join(",")) end),
                 (if .usage == null then "-"
-                 elif .usage.remembered then "- (remembered)"
-                 else (.usage.source // "-") end)] | @tsv)
+                 elif .usage.pollError != null then "stale\(if .usage.asOf == null then "" else " \(age(.usage.asOf))" end) (\(.usage.pollError))"
+                 elif .usage.remembered then "- (remembered \(age(.usage.asOf)))"
+                 else "\(.usage.source // "-") \(age(.usage.asOf))" end)] | @tsv)
       end' | column -t -s $'\t'
+  fi
+}
+
+# `account poll` — DIVE-6713. Poll every Claude account now (account_poll_one)
+# and republish the snapshot, so the dashboard dots and /usage see it at once.
+cmd_account_poll() {
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account poll"
+  ensure_state
+  require_root
+  local out; out=$(account_poll_all)
+  account_usage_publish
+  if (( JSON_MODE )); then
+    jq -Rsc 'split("\n") | map(select(length > 0)) | {ok:true, data:{polled: .}}' <<<"$out"
+  else
+    [[ -n "$out" ]] && printf '%s\n' "$out" || echo "no Claude accounts to poll"
   fi
 }
 

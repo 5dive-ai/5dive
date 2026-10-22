@@ -121,11 +121,13 @@ cmd_box_config() {
         "             --isolation (DIVE-6410). admin = every new seat is admin, including" \
         "             a pack whose manifest names a tier; an explicit --isolation still wins." \
         "             Default: the first seat on an empty box is admin, later seats standard." \
-        "             Existing seats are not changed: 'agent grant <name> admin' does that."
+        "             Existing seats are not changed: 'agent grant <name> admin' does that." \
+        "  account-poll  on = the heartbeat reads every Claude account's 5h/7d usage from" \
+        "             the provider every 10 min, busy or not (DIVE-6713). Off by default."
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
-      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation)" ;;
+      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll)" ;;
     esac
     shift
   done
@@ -320,13 +322,17 @@ seat-isolation = ${si} (box-wide; default = first seat admin, later seats standa
       # offered: the built-in default already gives standard to every later seat.
       seat-isolation|seat_isolation) [[ "$v" == admin || "$v" == default ]] \
                 || fail "$E_VALIDATION" "seat-isolation takes one of: admin, default — got '$v'" ;;
+      # DIVE-6713. Stored as .account_poll; `default` clears it (= off). Our
+      # own boxes only for now: it polls every Claude account every 10 min.
+      account-poll|account_poll) [[ "$v" == on || "$v" == off || "$v" == default ]] \
+                || fail "$E_VALIDATION" "account-poll takes one of: on, off, default — got '$v'" ;;
       # DIVE-4890. Validated in full before anything is written, like every key
       # above: one bad value in a multi-key call writes none of them.
       pace-week|pace_week) _pace_week_valid "$v" \
                 || fail "$E_VALIDATION" "pace-week takes <soft>/<hard> (integers, soft <= hard <= 100, e.g. 85/95), off, or default — got '$v'" ;;
       pace-5h|pace_5h) _pace_5h_valid "$v" \
                 || fail "$E_VALIDATION" "pace-5h takes a percentage (an integer 0-100, e.g. 85), off, or default — got '$v'" ;;
-      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation)" ;;
+      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll)" ;;
     esac
   done
   require_root
@@ -352,7 +358,8 @@ seat-isolation = ${si} (box-wide; default = first seat admin, later seats standa
           || "$k" == reflex-receipts || "$k" == reflex_receipts || "$k" == reflex-model || "$k" == reflex_model \
           || "$k" == reflex-endpoint || "$k" == reflex_endpoint || "$k" == reflex-api || "$k" == reflex_api \
           || "$k" == mod-seat || "$k" == mod_seat || "$k" == telegram-app || "$k" == telegram_app \
-          || "$k" == seat-isolation || "$k" == seat_isolation ) ]]; then
+          || "$k" == seat-isolation || "$k" == seat_isolation \
+          || "$k" == account-poll || "$k" == account_poll ) ]]; then
       json=$(jq --arg k "${k//-/_}" 'del(.[$k])' <<<"$json")
     else
       json=$(jq --arg k "${k//-/_}" --arg v "$v" '.[$k] = $v' <<<"$json")

@@ -9397,9 +9397,10 @@ _hb_quota_snapshot_sweep() {
   # the publisher until real time caught up — the one failure mode that looks
   # identical to "it is working".
   (( last > now )) && last=0
-  if (( now - last < every )); then
+  if (( now - last < every )) && [[ "${_HB_QSNAP_FORCE:-0}" != 1 ]]; then
     _HB_QSNAP_SKIPPED=1; return 0
   fi
+  _HB_QSNAP_FORCE=0
   # Stamp BEFORE the pass, like the consolidate sweep: the tick fires every
   # minute, and a pass wedged on a slow filesystem read would otherwise be
   # re-entered by every subsequent tick. A crashed pass just waits one cadence.
@@ -9409,6 +9410,54 @@ _hb_quota_snapshot_sweep() {
   else
     _HB_QSNAP_FAILED=1
   fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# DIVE-6713 — POLL EVERY CLAUDE ACCOUNT, BUSY OR NOT.
+#
+# The snapshot above republishes what seats rendered; an account with no busy
+# seat has nothing to republish. This asks the provider for each account's 5h/7d
+# (account_poll_one, src/cmd_account.sh: no seat, no output token) and writes it
+# where `account usage` reads, so the CLI, the dashboard dots and /usage all see
+# it. Off unless the box opts in (`5dive config account-poll=on`) — our own
+# boxes only for now (lodar, 2026-10-22).
+#
+# CADENCE 540s, not 600: the tick fires once a minute, so a 600s cadence lands a
+# poll every 10-11 min and the oldest reading reaches 11 min. 540s keeps every
+# reading under 10 min. It never auto-switches, alerts or pings anyone.
+_HB_ACCOUNT_POLL_EVERY_SEC="${_HB_ACCOUNT_POLL_EVERY_SEC:-540}"
+
+_hb_account_poll_enabled() {
+  [[ "${ACCOUNT_POLL:-}" == on ]] && return 0
+  [[ "${ACCOUNT_POLL:-}" == off ]] && return 1
+  local f; f=$(_box_config_path 2>/dev/null) || return 1
+  [[ "$(jq -r '.account_poll // empty' "$f" 2>/dev/null)" == on ]]
+}
+
+# _hb_account_poll_sweep <now> — poll when due. Never aborts the wake loop.
+_hb_account_poll_sweep() {
+  local now="$1"
+  _HB_APOLL_RAN=0
+  _hb_account_poll_enabled || return 0
+  declare -F account_poll_all >/dev/null 2>&1 || {
+    _hb_log "[account-poll] PACKAGING DEFECT: account_poll_all is not defined in this process — src/cmd_account.sh is missing from the bundle (DIVE-6713)"
+    return 0
+  }
+  local every="${ACCOUNT_POLL_EVERY_SEC:-${_HB_ACCOUNT_POLL_EVERY_SEC}}"
+  [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) || every="$_HB_ACCOUNT_POLL_EVERY_SEC"
+  local stamp="${STATE_DIR:-/var/lib/5dive}/account-poll.stamp" last line
+  last=$(cat "$stamp" 2>/dev/null) || last=0
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  (( last > now )) && last=0
+  (( now - last < every )) && return 0
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && _hb_log "[account-poll] ${line}"
+  done < <(account_poll_all 2>/dev/null)
+  _HB_APOLL_RAN=1
+  # Publish now rather than up to a snapshot cadence later.
+  _HB_QSNAP_FORCE=1
   return 0
 }
 
@@ -9744,6 +9793,7 @@ cmd_heartbeat_tick() {
   # standard seat from the first rotation on. Costs one stat per key file.
   local _hb_sp; _hb_sp=$(secrets_posture_reconcile --quiet "$reg" 2>&1) || _hb_log "[secrets-posture] pass errored (non-fatal): ${_hb_sp}"
   [[ -z "$_hb_sp" ]] || _hb_log "[secrets-posture] ${_hb_sp}"
+  _hb_account_poll_sweep "$now" || _hb_log "[account-poll] pass errored (non-fatal)"
   _hb_quota_snapshot_sweep "$now" || _hb_log "[quota-snapshot] pass errored (non-fatal)"
   (( ${_HB_QSNAP_RAN:-0} || ${_HB_QSNAP_FAILED:-0} )) \
     && _hb_log "[quota-snapshot] account-usage snapshot ${_HB_QSNAP_RAN:-0} published, ${_HB_QSNAP_FAILED:-0} failed (cadence ${_HB_QUOTA_SNAPSHOT_EVERY_SEC:-120}s, consumer fence ${QUOTA_SNAPSHOT_MAX_AGE:-600}s)" || true
