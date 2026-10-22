@@ -831,6 +831,69 @@ out=$(LINK_CALLER=mailer mint DIVE-64); rc=$?
   && ok_t "L14j control: an expired link does not count as live" \
   || bad_t "L14j expired is not live" "rc=$rc out=$out"
 
+# --- L15: DIVE-6727 — a refused paste names the rule, and the agent is told -----
+# teal-fox, 2026-10-21: four pastes of a one-line key into a tools link, each
+# answered "The server refused that value", while the agent re-filed the gate.
+# The page's bundle with two seams: the agent send is a log line (detached, as on
+# the box), and a break-write flag file makes a named connector's write fail (its lock path
+# cannot be opened), the one way a value-agnostic write refuses.
+WRAP3="$TMP/5dive-bundle-6727"; SENDS6727="$TMP/sends-6727.log"; : > "$SENDS6727"
+sed "s#^shift   \# the page calls#_gate_is_root() { return 1; }; cmd_send() { printf '%s\\\\n' \"\\\$*\" >> \"$SENDS6727\"; }\n[[ -f \"$TMP/break-write\" ]] \&\& SECRET_WRITE_LOCK=\"$TMP/no-such-dir/write.lock\"\nshift   \# the page calls#" "$WRAP" > "$WRAP3"; chmod +x "$WRAP3"
+PORT5=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+python3 "$TMP/server.py" 127.0.0.1 "$PORT5" "$WRAP3" "$SECRET_DROP_DIR" 0 2> "$TMP/server5.log" & SRV_PID=$!
+for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT5/healthz" >/dev/null 2>&1 && break; sleep 0.1; done
+B5="http://127.0.0.1:$PORT5"
+body_of() { sed -n 's#.*<main>\(.*\)</main>.*#\1#p' "$1"; }   # the page's words, not its CSS
+seed_gate DIVE-671 DEMO_API_KEY tools
+out=$(mint DIVE-671); tok=$(tok_of "$out")
+code=$(curl -s -o "$TMP/r1.html" -w '%{http_code}' --data-urlencode "value=a b" "$B5/$tok")
+r1=$(body_of "$TMP/r1.html")
+[[ "$code" == 400 && "$r1" == *"with no spaces and no"* && "$r1" == *"The link still works"* && "$r1" != *"The server refused that value"* \
+   && -f "$SECRET_DROP_DIR/$(hash_of "$tok")" ]] \
+  && ok_t "L15a ACCEPTANCE: 'a b' into a tools link -> the page names the tools rule (one line, no spaces or ' mark), the link still works" \
+  || bad_t "L15a the refusal names the tools rule" "code=$code body=$r1"
+wait_for_line "DIVE-671: your owner's paste for DEMO_API_KEY" "$SENDS6727"
+msg=$(grep -F 'DIVE-671:' "$SENDS6727")
+[[ "$msg" == "mailer --wake --message=DIVE-671: your owner's paste for DEMO_API_KEY on the secure link was refused at "*" UTC; nothing was saved and the link still works. The rule the page showed them: It must be one line, with no spaces"*"Do not file a new gate"* ]] \
+  && ok_t "L15b the seat that filed the gate is told, woken: refused at <time>, the same rule, do not re-file" \
+  || bad_t "L15b the filer is told of the refusal" "sends: $(cat "$SENDS6727")"
+! grep -qF 'a b' <<<"$r1" && ! grep -qF 'a b' "$SENDS6727" && ! grep -qF 'a b' "$TMP/server5.log" \
+  && ok_t "L15c the pasted value is in neither the page body, the agent message nor the server log" \
+  || bad_t "L15c the value leaked" "body=$r1 sends=$(cat "$SENDS6727")"
+code=$(curl -s -o "$TMP/r2.html" -w '%{http_code}' --data-urlencode "value=x'y" "$B5/$tok")
+sleep 1
+[[ "$code" == 400 && "$(grep -c 'DIVE-671:' "$SENDS6727")" == 1 ]] \
+  && ok_t "L15d a second refusal on the same link inside ${SECRET_DROP_REFUSED_TELL_S:-600}s does not tell the agent again" \
+  || bad_t "L15d the tell is rate-limited" "code=$code sends=$(cat "$SENDS6727")"
+sed -i "s/^refused_told=.*/refused_told=$(( $(date +%s) - ${SECRET_DROP_REFUSED_TELL_S:-600} - 1 ))/" "$SECRET_DROP_DIR/$(hash_of "$tok")"
+curl -s -o /dev/null --data-urlencode "value=a b" "$B5/$tok"
+for _ in $(seq 1 50); do [[ "$(grep -c 'DIVE-671:' "$SENDS6727")" == 2 ]] && break; sleep 0.1; done
+[[ "$(grep -c 'DIVE-671:' "$SENDS6727")" == 2 ]] \
+  && ok_t "L15e ...and past the window a refusal tells it again" \
+  || bad_t "L15e the window reopens" "sends=$(cat "$SENDS6727")"
+code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode "value=demo-key-6727" "$B5/$tok")
+[[ "$code" == 200 ]] && grep -qxF "export DEMO_API_KEY='demo-key-6727'" "$TOOLS_ENV_FILE" \
+  && ok_t "L15f control: the corrected paste on the same link saves" \
+  || bad_t "L15f the corrected paste saves" "code=$code"
+mkdir -p "$SECRET_PROJECTS_DIR/shop6727"
+seed_gate DIVE-672 SHOP_API_KEY project-shop6727
+out=$(mint DIVE-672); tok=$(tok_of "$out")
+code=$(curl -s -o "$TMP/r3.html" -w '%{http_code}' --data-urlencode 'value=sk$1#x' "$B5/$tok")
+r3=$(body_of "$TMP/r3.html")
+[[ "$code" == 400 && "$r3" == *"only letters, digits and these marks: _ . / : + = @ , ~ -"* && "$r3" != *'sk$1#x'* ]] \
+  && ok_t "L15g a project-<app> link names the characters an app's .env line can hold" \
+  || bad_t "L15g the project rule" "code=$code body=$r3"
+seed_gate DIVE-673 OVH_KEYS ovh6727
+out=$(mint DIVE-673); tok=$(tok_of "$out"); : > "$TMP/break-write"
+code=$(curl -s -o "$TMP/r4.html" -w '%{http_code}' --data-urlencode "value=Zq7 multi-line ok" "$B5/$tok"); rm -f "$TMP/break-write"
+r4=$(body_of "$TMP/r4.html")
+[[ "$code" == 400 && "$r4" == *"takes any value, line breaks included"* && "$r4" != *Zq7* ]] \
+  && ok_t "L15h a named connector's refusal says the value was not the problem (it takes multi-line values)" \
+  || bad_t "L15h the named-connector rule" "code=$code body=$r4"
+printf '%s\n' "$r1" "$r3" "$r4" > "$TMP/rc3-pages.txt"
+[[ -n "${DIVE6727_PAGES_OUT:-}" ]] && cp "$TMP/rc3-pages.txt" "$DIVE6727_PAGES_OUT"
+kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
+
 echo
 echo "secret-drop-link unit: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

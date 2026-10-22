@@ -45,6 +45,9 @@ SECRET_DROP_CADDYFILE="/etc/caddy/Caddyfile"
 SECRET_DROP_PORT=3127
 SECRET_DROP_TTL_MIN=30
 SECRET_DROP_LOCK="/run/5dive-secret-drop.lock"
+# DIVE-6727: a refused paste tells the agent at most once per link in this many
+# seconds (an owner retries a few times a minute).
+SECRET_DROP_REFUSED_TELL_S=600
 # DIVE-5372: how long `secret link` waits for its page to answer over valid TLS
 # before it hands the URL out. Under the 30s the dashboard's exec call allows
 # (shelld's default), so a slow first certificate degrades to ready:false
@@ -277,8 +280,20 @@ _secret_drop_peek() {
   # The seat that filed the gate is the one asking; the assignee can differ (a
   # box's routing may move the row), which made the page name the wrong agent.
   agent=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),assignee,'') FROM tasks WHERE id=${id};")
-  ok "$ident $key" '{task: $i, key: $k, connector: $c, ask: $a, agent: $g, expires: ($x|tonumber)}' \
-     --arg i "$ident" --arg k "$key" --arg c "$connector" --arg a "$ask" --arg g "$agent" --arg x "$exp"
+  ok "$ident $key" '{task: $i, key: $k, connector: $c, ask: $a, agent: $g, expires: ($x|tonumber), rule: $r}' \
+     --arg i "$ident" --arg k "$key" --arg c "$connector" --arg a "$ask" --arg g "$agent" --arg x "$exp" \
+     --arg r "$(_secret_drop_rule "$connector")"
+}
+
+# DIVE-6727: the rule a refused paste broke, in the owner's words, by the gate's
+# connector class. Static text: it names the rule and never carries a byte of the
+# value. The page shows it on a refusal (from _peek), and the agent is told it.
+_secret_drop_rule() { # <connector>
+  case "$1" in
+    tools) printf '%s' "It must be one line, with no spaces and no ' mark: only plain keyboard letters, digits and symbols, at most 1024 of them." ;;
+    project-*) printf '%s' 'It may hold only letters, digits and these marks: _ . / : + = @ , ~ - (no spaces, quotes, $, # or line breaks).' ;;
+    *) printf '%s' 'This one takes any value, line breaks included, so the value was not the problem. Try again in a minute.' ;;
+  esac
 }
 
 # ---- DIVE-5772: the drop closes its own gate, and says so when it cannot ----
@@ -334,6 +349,22 @@ _secret_drop_tell_agent() { # <ident> <id> <key> <connector>
     || _secret_drop_log "$ident: could not tell $agent that $key was saved"
 }
 
+# DIVE-6727: a refused paste used to tell nobody, so the agent re-filed the gate
+# while the owner was still retrying the live link. The agent is told the time and
+# the rule, never the value; at most once per link per SECRET_DROP_REFUSED_TELL_S,
+# stamped in the link file, and detached so a mid-turn wake cannot hold the page.
+_secret_drop_tell_refused() { # <ident> <id> <key> <connector> <link file>
+  local ident="$1" id="$2" key="$3" conn="$4" f="$5" agent now last
+  now=$(date +%s)
+  last=$(sed -n 's/^refused_told=//p' "$f" | tail -n 1)
+  [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < SECRET_DROP_REFUSED_TELL_S )) && return 0
+  agent=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),assignee,'') FROM tasks WHERE id=${id};" 2>/dev/null)
+  [[ -n "$agent" ]] || { _secret_drop_log "$ident: no agent to tell that a paste for $key was refused"; return 0; }
+  printf 'refused_told=%s\n' "$now" >> "$f"
+  _task_answer_ping_detached "$agent" --wake --message="${ident}: your owner's paste for ${key} on the secure link was refused at $(date -u -d "@$now" +%H:%M) UTC; nothing was saved and the link still works. The rule the page showed them: $(_secret_drop_rule "$conn") Do not file a new gate or ask for the value in chat." \
+    || _secret_drop_log "$ident: could not tell $agent that a paste for $key was refused"
+}
+
 # _redeem --hash=<h>, value on stdin: write it, then burn every link for the gate.
 # One lock across check, write and burn, so two tabs posting at once write once.
 _secret_drop_redeem() {
@@ -360,7 +391,8 @@ _secret_drop_redeem() {
   id=$(_secret_drop_gate_open "$ident" "$key" "$connector")
   ( _secret_write "$key" --connector="$connector" ) >/dev/null 2>&1 || rc=$?
   if (( rc != 0 )); then
-    fail "$E_VALIDATION" "value refused (empty, or a newline, space or quote in a tools key)"
+    _secret_drop_tell_refused "$ident" "$id" "$key" "$connector" "$f"
+    fail "$E_VALIDATION" "value refused: $(_secret_drop_rule "$connector")"
   fi
   # Clear the gate with the link as the evidence, BEFORE the burn: task answer
   # reads the link back from the store (_gate_drop_link_ok). The page's unit has
@@ -747,7 +779,11 @@ class Handler(BaseHTTPRequestHandler):
         rc, out = run(["_redeem", "--hash=" + h], stdin=value.encode())
         value = None
         if rc == 3:
-            return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>The server refused that value. The link still works.</p>"))
+            # DIVE-6727: name the rule the paste broke (static, from _peek, by the
+            # gate's connector), never the value and never what the write said.
+            rule = what.get("rule") or "The server refused that value."
+            return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>%s</p>"
+                "<p>The link still works.</p>" % html.escape(rule)))
         if rc == 6:
             # Saved, but the task row did not take the clear: never claim the task
             # moved. DIVE-5772: never ask the owner to do anything either — the box
