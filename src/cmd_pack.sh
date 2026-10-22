@@ -3407,7 +3407,9 @@ cmd_import() {
   # Build the create argv. Skills are re-added afterwards (best-effort) so one
   # unresolvable ref can't abort the import. Channels default to none unless the
   # importer supplies a token (a pack never carries secrets).
-  local -a cargs=("$as" "--type=$type" "--no-skills")
+  # `--with-skills=` (empty), not --no-skills: that opts out of the default
+  # skills too since DIVE-6751, and an imported agent keeps those.
+  local -a cargs=("$as" "--type=$type" "--with-skills=")
   [[ -n "$isolation" ]] && cargs+=("--isolation=$isolation")
   [[ -n "$workdir" ]]   && cargs+=("--workdir=$workdir")
   # DIVE-620: bind the profile AND defer auth. These are NOT mutually exclusive —

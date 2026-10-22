@@ -3284,9 +3284,12 @@ cmd_create() {
   # supported type, since the skills CLI handles per-type install paths via
   # --agent (see SKILLS_AGENT_ID above). Humans creating from the dashboard
   # get no skills by default — they typically don't need the recursion story
-  # and the skill is just context noise. --no-skills opts out of the default;
-  # --with-skills="" also opts out.
+  # and the skill is just context noise. --no-skills opts out of the default
+  # and of DEFAULT_AGENT_SKILLS (lib/agent_setup.sh); --with-skills="" opts out
+  # of the 5dive-cli extra only.
   local -a skills_specs=()
+  # DIVE-6751: and out of the default list every preseed branch seeds.
+  NO_DEFAULT_SKILLS=$no_skills
   if (( no_skills )); then
     :
   elif (( skills_set )); then
@@ -3785,9 +3788,10 @@ cmd_create() {
   local _model_family=""
   [[ "$type" == "claude" ]] && model_latest "$byo_model" >/dev/null && _model_family="$byo_model"
   [[ "$type" == "claude" && -z "$_model_family" ]] && _model_family="${_claude_create_family:-}"
-  jq --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$workdir" --arg p "$profile" --arg bu "$bot_username" --arg ts "$(date -Iseconds)" --arg iso "$isolation" --arg oid "$openagent_id" --arg mf "$_model_family" \
+  jq --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$workdir" --arg p "$profile" --arg bu "$bot_username" --arg ts "$(date -Iseconds)" --arg iso "$isolation" --arg oid "$openagent_id" --arg mf "$_model_family" --argjson ns "$no_skills" \
     '.agents[$n] = (
       {type: $t, channels: $c, createdAt: $ts, isolation: $iso, openagentId: $oid}
+      + (if $ns == 1 then {noSkills: true} else {} end)
       + (if $w == "" then {} else {workdir: $w} end)
       + (if $p == "" then {} else {authProfile: $p} end)
       + (if $bu == "" then {} else {botUsername: $bu} end)

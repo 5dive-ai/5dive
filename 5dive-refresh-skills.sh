@@ -41,6 +41,7 @@
 set -uo pipefail
 
 FIVE_BIN="${FIVE_BIN:-/usr/local/bin/5dive}"
+AGENTS_JSON="${FIVE_AGENTS_JSON:-/var/lib/5dive/agents.json}"
 
 # THE DEFAULT-SKILLS LIST LIVES IN ONE PLACE, AND IT IS NOT HERE (DIVE-4203).
 # It is DEFAULT_AGENT_SKILLS in the CLI's src/lib/agent_setup.sh, read back below
@@ -104,8 +105,8 @@ retire_core_notify_user() {
 # 5dive-refresh-plugins.sh).
 if [[ $# -gt 0 ]]; then
   agents="$1"
-elif [[ -r /var/lib/5dive/agents.json ]] && command -v jq >/dev/null 2>&1; then
-  agents=$(jq -r '.agents | keys[]?' /var/lib/5dive/agents.json 2>/dev/null || true)
+elif [[ -r "$AGENTS_JSON" ]] && command -v jq >/dev/null 2>&1; then
+  agents=$(jq -r '.agents | keys[]?' "$AGENTS_JSON" 2>/dev/null || true)
 else
   agents=$(for d in /home/agent-*; do [[ -d "$d" ]] && basename "$d" | sed 's/^agent-//'; done)
 fi
@@ -116,6 +117,13 @@ for ag in $agents; do
   user="agent-$ag"
   home=$(getent passwd "$user" | cut -d: -f6)
   [[ -n "$home" && -d "$home" ]] || continue
+
+  # DIVE-6751: a seat created with --no-skills (registry noSkills) has opted out
+  # of the defaults; re-pulling them nightly would undo the flag.
+  if jq -e --arg n "$ag" '.agents[$n].noSkills == true' "$AGENTS_JSON" >/dev/null 2>&1; then
+    echo "· $ag — created with --no-skills, skipping"
+    continue
+  fi
 
   # Never-booted guard: ~/.claude is created on first boot; skip until then —
   # but only where the skills land under it (see the header, DIVE-6148). An
