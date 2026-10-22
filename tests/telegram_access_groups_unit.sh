@@ -29,6 +29,8 @@ STATE="$TMP/state"
 _tg_access_state_dir() { case "$2" in claude) printf '%s' "$STATE" ;; *) return 1 ;; esac; }
 # The fixture agent is not a real user: run the write as the caller.
 sudo() { [[ "$1" == -u ]] && shift 2; "$@"; }
+# No bot token in the fixture: getMe is stubbed, and fails until DIVE-6729's arms.
+_tg_bot_first_name() { return 1; }
 
 run() { ( cmd_telegram_access_groups "$@" ) 2>"$TMP/err"; }
 field() { jq -r ".data.$1" <<<"$out"; }
@@ -85,7 +87,7 @@ out=$(run olivia --names='Оля, Liv ,奥利维亚,оля,Mary  Ann') && [[ "$(
 [[ "$(jq -c .groupsCallNames "$STATE/access.json")" == '["Оля","Liv","奥利维亚","Mary Ann"]' ]] \
   && okk 'groupsCallNames stored as the names, unescaped' || bad "stored: $(jq -c .groupsCallNames "$STATE/access.json")"
 grep -q '奥利维亚' "$STATE/access.json" && okk 'non-Latin names are kept as text, not \u escapes' || bad 'names escaped in access.json'
-[[ "$(jq -c 'del(.groupsCallNames)' "$STATE/access.json")" == "$before" ]] \
+[[ "$(jq -c 'del(.groupsCallNames, .groupsCallNamesComplete)' "$STATE/access.json")" == "$before" ]] \
   && okk '--names alone leaves the answer and the groups as they were' || bad "names touched other keys: $(jq -c . "$STATE/access.json")"
 out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Оля","Liv","奥利维亚","Mary Ann"]' && "$(field answer)" == name ]] \
   && okk 'the read returns names beside answer, groups and mixed' || bad "read names: $out"
@@ -94,8 +96,8 @@ out=$(run olivia --answer=every --names=Liv) && [[ "$(field answer)" == every &&
 jq '.groupsCallNames += [".*", 7]' "$STATE/access.json" >"$TMP/a" && cp "$TMP/a" "$STATE/access.json"
 out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Liv"]' ]] \
   && okk 'a hand-edited pattern on the list is not read back as a name' || bad "read filter: $out"
-out=$(run olivia --names=) && [[ "$(jq -c .data.names <<<"$out")" == '[]' && "$(jq 'has("groupsCallNames")' "$STATE/access.json")" == false ]] \
-  && okk 'an empty --names= clears the list' || bad "clear: $out"
+out=$(run olivia --names=) && [[ "$(jq -c .data.names <<<"$out")" == '[]' && "$(jq -c .groupsCallNames "$STATE/access.json")" == '[]' ]] \
+  && okk 'an empty --names= stores an empty list' || bad "clear: $out"
 cp "$STATE/access.json" "$TMP/keep"
 for badnames in '.*' 'a' 'a -' '- a' 'Liv a' 'Liv-' 'Liv2' 'Оля|Ольга' "$(printf 'x%.0s' {1..33})" 'A1,B2' "$(seq -s, -f 'Name%g' 1 11 | tr 0-9 a-j)"; do
   run olivia --names="$badnames" >/dev/null && bad "accepted --names=$badnames" \
@@ -103,6 +105,45 @@ for badnames in '.*' 'a' 'a -' '- a' 'Liv a' 'Liv-' 'Liv2' 'Оля|Ольга' "
 done
 cmp -s "$TMP/keep" "$STATE/access.json" && okk 'a bad name, a pattern or 11 names are refused and nothing is written' || bad 'refused names changed the file'
 run olivia --names='Liv' --answer=all >/dev/null; cmp -s "$TMP/keep" "$STATE/access.json" && okk 'a bad --answer with --names writes nothing' || bad 'bad answer + names wrote'
+
+# --- DIVE-6729: "Answers to" is every name, the bot-name word too -----------
+cat >"$STATE/access.json" <<'J'
+{"dmPolicy":"pairing","allowFrom":[],"groups":{"-100":{"requireMention":true}},"groupsRequireMention":true,"groupsCallNames":["Matcha","janis"]}
+J
+_tg_bot_first_name() { printf "Janis's matcha assistant"; }
+before=$(cat "$STATE/access.json")
+out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Janis","Matcha"]' && "$(field namesComplete)" == true ]] \
+  && okk 'a read lists the bot-name word first, then the extras, a repeat of it dropped' || bad "read with bot word: $out"
+[[ "$(cat "$STATE/access.json")" == "$before" ]] && okk 'that read writes nothing' || bad 'read with bot word wrote'
+_tg_bot_first_name() { printf '🤖 Оливия | Sales'; }
+out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Оливия","Matcha","janis"]' ]] \
+  && okk "the bot word is the plugin's: the first run of letters" || bad "first run: $out"
+_tg_bot_first_name() { printf '🤖 X'; }
+out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Matcha","janis"]' && "$(field namesComplete)" == true ]] \
+  && okk 'a bot name with no word of 2+ letters adds nothing' || bad "no word: $out"
+_tg_bot_first_name() { return 1; }
+out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Matcha","janis"]' && "$(field namesComplete)" == false ]] \
+  && okk 'getMe down and the list never saved: namesComplete false, extras only' || bad "getMe down: $out"
+_tg_bot_first_name() { printf "Janis's matcha assistant"; }
+out=$(run olivia --names='Matcha') && [[ "$(jq -c .data.names <<<"$out")" == '["Matcha"]' && "$(field namesComplete)" == true ]] \
+  && okk 'a write without the bot word answers the list as written' || bad "write without bot word: $out"
+[[ "$(jq -c '[.groupsCallNames, .groupsCallNamesComplete]' "$STATE/access.json")" == '[["Matcha"],true]' ]] \
+  && okk 'access.json holds the whole list and groupsCallNamesComplete' || bad "stored: $(jq -c . "$STATE/access.json")"
+out=$(run olivia) && [[ "$(jq -c .data.names <<<"$out")" == '["Matcha"]' ]] \
+  && okk 'once saved, a read no longer adds the bot word' || bad "read after save: $out"
+_tg_bot_first_name() { return 1; }
+out=$(run olivia) && [[ "$(field namesComplete)" == true ]] \
+  && okk 'once saved, the list is whole even with getMe down' || bad "saved + getMe down: $out"
+out=$(run olivia --answer=every) && [[ "$(jq -c .groupsCallNames "$STATE/access.json")" == '["Matcha"]' && "$(jq .groupsCallNamesComplete "$STATE/access.json")" == true ]] \
+  && okk '--answer alone keeps the saved list and its flag' || bad "answer kept list: $(jq -c . "$STATE/access.json")"
+out=$(run olivia --names=) && [[ "$(jq -c .data.names <<<"$out")" == '[]' && "$(field namesComplete)" == true ]] \
+  && said=$( JSON_MODE=0; run olivia ) && [[ "$said" == *'answers to no name, only an @mention or a reply'* ]] \
+  && okk 'an empty list is allowed and says only an @mention or a reply wakes it' || bad "empty list: $out $(cat "$TMP/err")"
+printf '{"groups":{},"groupsCallNames":["Liv"]}' >"$STATE/access.json"
+NAMES_ADD=Tencha STATE="$STATE" python3 -c "$(_tg_group_answer_py)" >/dev/null
+[[ "$(jq -c '[.groupsCallNames, has("groupsCallNamesComplete")]' "$STATE/access.json")" == '[["Liv","Tencha"],false]' ]] \
+  && okk 'the card-name seed adds to the extras and does not mark the list whole' || bad "seed: $(jq -c . "$STATE/access.json")"
+_tg_bot_first_name() { return 1; }
 
 # --- refusals ---------------------------------------------------------------
 cp "$STATE/access.json" "$TMP/keep"

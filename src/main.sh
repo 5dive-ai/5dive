@@ -225,8 +225,8 @@ Agents:
   5dive agent telegram-access groups <name> [--answer=name|every] [--names=<a,b,...>]
                                                      # in groups, answer when called by name (default) or every
                                                      # message: sets every group + groups added later.
-                                                     # --names="Оля,Liv,奥利维亚": names it also answers to
-                                                     # in groups (empty clears).
+                                                     # --names="Оля,Liv,奥利维亚": EVERY name it answers to
+                                                     # in groups, bot name too (empty: only @mention/reply).
   5dive agent telegram-access seed-names [<name>]    # add each Telegram agent's card name (persona.yaml) to
                                                      # those names once; never re-adds one the owner removed.
   5dive agent telegram-pending-ignore <name> <code>  # drop a pending pairing without approving (dashboard inbox).
