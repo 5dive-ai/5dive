@@ -18,6 +18,10 @@
 #   * negative controls: non-root, an argument, uid 0, a non-seat uid, an unknown
 #     op, a bad id, an id not offered to this seat, a bad chat id, an empty text, a reply file outside the
 #     outbox (or a symlink in it), no token file: none reaches the network
+#   * DIVE-6715: status <chat_id> <0|1> [label] and ask <chat_id> <text>
+#     <question_id> (<label> <description>){2,10} post jq-built bodies as the
+#     caller seat, the bearer on stdin, the text and labels off argv; every
+#     malformed wire is refused with its own reason before the network
 # Isolation: src/ sourced, the network call is a seam. Run: bash tests/dashboard_relay_unit.sh
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" || true
@@ -143,6 +147,49 @@ grep -qF 'no files' "$CALLS" && bad 'the reply text stays off argv' || ok 'the r
 token_safe tok-two && ok 'event: bearer on stdin, not argv' || bad 'event bearer placement'
 ls "$TMP/tmpd"/tmp.* >/dev/null 2>&1 && bad 'no temp file is left behind' || ok 'no temp file is left behind'
 
+# ── DIVE-6715: status and ask ────────────────────────────────────────────────
+run_root 1042 status dashboard 1 'Running the tests'; rc=$?
+body=$(cat "$BODY" 2>/dev/null)
+[[ $rc == 0 && "$body" == '{"agent":"tap","chat_id":"dashboard","active":true,"label":"Running the tests"}' ]] \
+  && ok 'status posts the caller seat, a JSON boolean and the label' || bad "status body (rc=$rc, $body, $(cat "$TMP/err"))"
+grep -qx 'https://cp.example.test/server/messages/status' "$CALLS" && ok 'status hits the fixed URL' || bad "status URL ($(cat "$CALLS"))"
+token_safe tok-two && ok 'status: bearer on stdin, not argv' || bad 'status bearer placement'
+(( $(called) == 1 )) && ! grep -qF 'Running the tests' "$CALLS" && ok 'status: the label stays off argv' || bad 'status: the label stays off argv'
+[[ "$(head -1 "$TMP/out")" == 200 ]] && ok 'status prints the control plane status' || bad "status output ($(cat "$TMP/out"))"
+run_root 1042 status dashboard 0; rc=$?; body=$(cat "$BODY" 2>/dev/null)
+[[ $rc == 0 && "$body" == '{"agent":"tap","chat_id":"dashboard","active":false,"label":null}' ]] \
+  && ok 'status 0 with no label sends active false, label null' || bad "status off body (rc=$rc, $body)"
+run_root 1042 status dashboard 1 ''; rc=$?; body=$(cat "$BODY" 2>/dev/null)
+[[ $rc == 0 && "$body" == '{"agent":"tap","chat_id":"dashboard","active":true,"label":null}' ]] \
+  && ok 'status with an empty label sends label null' || bad "status empty label body (rc=$rc, $body)"
+run_root 1042 status dashboard 1 '","agent":"other'; rc=$?; body=$(cat "$BODY" 2>/dev/null)
+[[ $rc == 0 && "$(jq -r .agent <<<"$body")" == tap && "$(jq -r .label <<<"$body")" == '","agent":"other' ]] \
+  && ok 'status: a label cannot inject another agent (jq-built)' || bad "status injection (rc=$rc, $body)"
+L120=$(printf 'L%.0s' {1..120})
+run_root 1042 status dashboard 1 "$L120"; rc=$?
+[[ $rc == 0 && "$(jq -r .label "$BODY" 2>/dev/null)" == "$L120" ]] && ok 'status accepts a 120-character label' || bad "status 120 label (rc=$rc)"
+
+run_root 1042 ask dashboard 'Ship "it"?' q-1.a 'Yes' 'Merge now' 'No' ''; rc=$?
+body=$(cat "$BODY" 2>/dev/null)
+want='{"agent":"tap","body":"Ship \"it\"?","metadata":{"chat_id":"dashboard","question":{"id":"q-1.a","options":[{"label":"Yes","description":"Merge now"},{"label":"No"}]}}}'
+[[ $rc == 0 && "$body" == "$want" ]] \
+  && ok 'ask posts the question as the caller seat, an empty description left out' || bad "ask body (rc=$rc, $body, $(cat "$TMP/err"))"
+grep -qx 'https://cp.example.test/server/messages/event' "$CALLS" && ok 'ask hits the fixed event URL' || bad "ask URL ($(cat "$CALLS"))"
+token_safe tok-two && ok 'ask: bearer on stdin, not argv' || bad 'ask bearer placement'
+(( $(called) == 1 )) && ! grep -qF -e 'Ship' -e 'Merge now' "$CALLS" && ok 'ask: the text and options stay off argv' || bad 'ask: the text and options stay off argv'
+[[ "$(head -1 "$TMP/out")" == 200 ]] && ok 'ask prints the control plane status' || bad "ask output ($(cat "$TMP/out"))"
+D200=$(printf 'D%.0s' {1..200}); Q64=$(printf 'q%.0s' {1..64})
+opts=(); for i in 1 2 3 4 5 6 7 8 9; do opts+=("opt$i" "desc$i"); done; opts+=("$L120" "$D200")
+run_root 1042 ask dashboard 'Pick one' "$Q64" "${opts[@]}"; rc=$?
+[[ $rc == 0 && "$(jq -r '.metadata.question.options | length' "$BODY" 2>/dev/null)" == 10 \
+   && "$(jq -r '.metadata.question.options[9].description' "$BODY" 2>/dev/null)" == "$D200" \
+   && "$(jq -r '.metadata.question.id' "$BODY" 2>/dev/null)" == "$Q64" ]] \
+  && ok 'ask accepts 10 options, a 120/200-character option and a 64-character id' || bad "ask boundaries (rc=$rc, $(cat "$TMP/err"))"
+run_root 1042 ask dashboard 'Pick' q1 'A","agent":"other' '' 'B' ''; rc=$?; body=$(cat "$BODY" 2>/dev/null)
+[[ $rc == 0 && "$(jq -r .agent <<<"$body")" == tap && "$(jq -r '.metadata.question.options[0].label' <<<"$body")" == 'A","agent":"other' ]] \
+  && ok 'ask: an option cannot inject another agent (jq-built)' || bad "ask injection (rc=$rc, $body)"
+[[ -s "$BODY" ]] && ! ls "$TMP/tmpd"/tmp.* >/dev/null 2>&1 && ok 'status/ask leave no temp file behind' || bad 'status/ask leave no temp file behind'
+
 # ── control: the SAME arm reds on the shape first delivered (eebe2ee8 line 59) ──
 MUT="$TMP/mutant.sh"
 sed -e 's|-X "$method" -H @-)|-X "$method" -H "Authorization: Bearer ${tok}")|' \
@@ -185,6 +232,32 @@ ln -s "$FIVEDIVE_CONNECTORD_ENV" "$DASHBOARD_OUTBOX/tap-2-link.txt"
 neg 'event with a symlink in the outbox' run_root 1042 event dashboard hi "$DASHBOARD_OUTBOX/tap-2-link.txt"
 mkdir -p "$DASHBOARD_OUTBOX/sub"; printf 'x' > "$DASHBOARD_OUTBOX/sub/f"
 neg 'event with a file below the outbox' run_root 1042 event dashboard hi "$DASHBOARD_OUTBOX/sub/f"
+# DIVE-6715 refusals: each names ITS reason, so an op that does not exist (the
+# catch-all refusal) cannot pass them.
+negm(){ local label="$1" want="$2"; shift 2; "$@"; local r=$?
+  [[ $r != 0 && "$(called)" == 0 ]] && grep -qF -- "$want" "$TMP/err" \
+    && ok "refused: $label" || bad "refused: $label (rc=$r, $(cat "$CALLS" "$TMP/err"))"; }
+negm 'status with no flag'           'status takes a chat id' run_root 1042 status dashboard
+negm 'status with 5 wire args'       'status takes a chat id' run_root 1042 status dashboard 1 lbl extra
+negm 'status with a bad chat id'     'status: invalid chat id' run_root 1042 status '../x' 1
+negm 'status with flag 2'            'status: the flag is 0 or 1' run_root 1042 status dashboard 2
+negm 'status with flag true'         'status: the flag is 0 or 1' run_root 1042 status dashboard true
+negm 'status with a 121-char label'  'status: the label is over 120' run_root 1042 status dashboard 1 "${L120}x"
+negm 'status with a newline label'   'status: the label has a control' run_root 1042 status dashboard 1 $'two\nlines'
+negm 'status with a tab label'       'status: the label has a control' run_root 1042 status dashboard 1 $'a\tb'
+negm 'ask with one option'           'ask takes a chat id' run_root 1042 ask dashboard hi q1 A ''
+negm 'ask with 11 options'           'ask takes a chat id' run_root 1042 ask dashboard hi q1 "${opts[@]}" K ''
+negm 'ask with a label and no description slot' 'ask takes a chat id' run_root 1042 ask dashboard hi q1 A '' B
+negm 'ask with no question id'       'ask takes a chat id' run_root 1042 ask dashboard hi
+negm 'ask with a bad chat id'        'ask: invalid chat id' run_root 1042 ask '../x' hi q1 A '' B ''
+negm 'ask with empty text'           'ask: the text is empty' run_root 1042 ask dashboard '  ' q1 A '' B ''
+negm 'ask with text over 64 KiB'     'ask: the text is over 64 KiB' run_root 1042 ask dashboard "$(printf 'x%.0s' {1..65537})" q1 A '' B ''
+negm 'ask with a question id starting with a dash' 'ask: invalid question id' run_root 1042 ask dashboard hi -q1 A '' B ''
+negm 'ask with a question id with a slash' 'ask: invalid question id' run_root 1042 ask dashboard hi q/1 A '' B ''
+negm 'ask with a 65-char question id' 'ask: invalid question id' run_root 1042 ask dashboard hi "${Q64}q" A '' B ''
+negm 'ask with an empty label'       'ask: an option label is empty' run_root 1042 ask dashboard hi q1 A '' ' ' ''
+negm 'ask with a 121-char label'     'ask: an option label is over 120' run_root 1042 ask dashboard hi q1 A '' "${L120}x" ''
+negm 'ask with a 201-char description' 'ask: an option description is over 200' run_root 1042 ask dashboard hi q1 A "${D200}x" B ''
 rm -f "$FIVEDIVE_CONNECTORD_ENV"
 neg 'no token file'       run_root 1042 pending
 
