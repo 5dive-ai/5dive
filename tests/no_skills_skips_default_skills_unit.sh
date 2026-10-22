@@ -27,6 +27,9 @@ set -uo pipefail
 # shellcheck source=/dev/null
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+# DIVE-2229: pinned-commit baseline for the mutation arm, fail-closed.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/pinned_baseline.sh" \
+  || printf 'pinned baseline helper: UNRESOLVED (tests/lib/pinned_baseline.sh not reachable)\n' >&2
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 SRC=src
@@ -110,18 +113,25 @@ grep -q -- '--with-skills=")' <<<"$cargs" && ! grep -q -- '--no-skills' <<<"$car
   || t_bad "import's create argv: $cargs"
 
 echo "== 6. MUTATION: the pre-fix provisioner seeds under the flag =="
-if git show origin/main:src/lib/agent_setup.sh >"$TMP/agent_setup_main.sh" 2>/dev/null \
-   && ! grep -q agent_skips_default_skills "$TMP/agent_setup_main.sh"; then
-  got=$(bash -c '
-    set -uo pipefail
-    for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh; do source "src/$f"; done
-    source "$1"
-    install_default_skill_for_agent() { printf "%s:%s\n" "$3" "$4"; }
-    NO_DEFAULT_SKILLS=1 preseed_default_skills_for_type fresh claude' _ "$TMP/agent_setup_main.sh")
-  [[ -n "$got" ]] && t_ok "origin/main seeds $(wc -l <<<"$got") default skill(s) despite the flag (arm 1 reds on it)" \
-    || t_bad "origin/main seeded nothing under the flag; arm 1 would be vacuous"
+# PINNED TO A COMMIT, NOT TO origin/main (DIVE-6755). Read from origin/main this
+# arm went vacuous the moment DIVE-6751 merged: main carries the fix, so it
+# skipped forever. deba606 is main immediately before DIVE-6751.
+PRE_FIX_REF="deba60628ea0440756b91ceadfcee484ee7b4f88"   # main immediately before DIVE-6751
+if pinned_blob "$PRE_FIX_REF" src/lib/agent_setup.sh "$TMP/agent_setup_prefix.sh"; then
+  if grep -q agent_skips_default_skills "$TMP/agent_setup_prefix.sh"; then
+    t_bad "the pin $PRE_FIX_REF already carries the fix; the mutation arm would be vacuous"
+  else
+    got=$(bash -c '
+      set -uo pipefail
+      for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh; do source "src/$f"; done
+      source "$1"
+      install_default_skill_for_agent() { printf "%s:%s\n" "$3" "$4"; }
+      NO_DEFAULT_SKILLS=1 preseed_default_skills_for_type fresh claude' _ "$TMP/agent_setup_prefix.sh")
+    [[ -n "$got" ]] && t_ok "pre-fix ${PRE_FIX_REF:0:8} seeds $(wc -l <<<"$got") default skill(s) despite the flag (arm 1 reds on it)" \
+      || t_bad "pre-fix ${PRE_FIX_REF:0:8} seeded nothing under the flag; arm 1 would be vacuous"
+  fi
 else
-  echo "  skip: origin/main already carries the fix (or is unreadable); mutation arm not applicable"
+  t_bad "mutation arm NOT measured: $(pinned_unavailable_msg "$PRE_FIX_REF")"
 fi
 
 echo
