@@ -279,7 +279,8 @@ cmd_agent_skills_install_dir() {
 NO_DEFAULT_SKILLS=0
 agent_skips_default_skills() {
   (( NO_DEFAULT_SKILLS )) && return 0
-  [[ -r "$REGISTRY" ]] && jq -e --arg n "$1" '.agents[$n].noSkills == true' "$REGISTRY" >/dev/null 2>&1
+  [[ -r "$REGISTRY" ]] || return 1
+  jq -e --arg n "$1" '.agents[$n].noSkills == true' "$REGISTRY" >/dev/null 2>&1
 }
 
 # Seed every default skill onto one agent, for one harness type. Best-effort per
