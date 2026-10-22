@@ -216,8 +216,19 @@ PY
 # the agent in a group, in any language, stored as `groupsCallNames` (telegram
 # plugin 0.5.105+ matches each like her display name). Comma-separated, at most
 # 10, each 2-32 letters, marks, spaces or hyphens, 2+ letters a word: a name,
-# never a pattern. An empty value clears the list. A bad list is refused before
-# anything is written.
+# never a pattern. A bad list is refused before anything is written.
+#
+# DIVE-6729: the app's field is now "Answers to", EVERY name that calls the
+# agent. `names` on a read is that whole list: before the owner first saves it,
+# the word the plugin takes from the bot's Telegram name (getMe first_name)
+# comes first, then the stored extras. `--names=` writes the whole list and sets
+# `groupsCallNamesComplete`, which tells the plugin (0.5.107+) not to add that
+# word on its own, so the owner can remove it. An empty list is allowed: then
+# only an @mention or a reply wakes it. `namesComplete: true` on a read means
+# "names is the whole list and --names= replaces it". When the bot's name
+# could not be read and the list was never saved, `names` is null and
+# `namesComplete` false: a caller hides the field (as for a CLI older than it)
+# rather than save a list that silently drops the bot's name.
 _tg_group_answer_py() {
   cat <<'PY'
 import json, os, re, sys, tempfile, unicodedata
@@ -225,6 +236,7 @@ import json, os, re, sys, tempfile, unicodedata
 state = os.environ['STATE']
 want = os.environ.get('ANSWER', '')
 names_set = os.environ.get('NAMES_SET') == '1'
+replace = names_set
 
 def call_name(n):
     return (isinstance(n, str) and n == n.strip() and 2 <= len(n) <= 32
@@ -281,11 +293,11 @@ if want or names_set:
             g['requireMention'] = on
         access['groups'] = groups
         access['groupsRequireMention'] = on
-    if names_set:
-        if names:
-            access['groupsCallNames'] = names
-        else:
-            access.pop('groupsCallNames', None)
+    if replace:
+        access['groupsCallNames'] = names
+        access['groupsCallNamesComplete'] = True
+    elif names_set:
+        access['groupsCallNames'] = names
     os.makedirs(state, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -300,11 +312,42 @@ else:
 mixed = any((g.get('requireMention') is not False) != on for g in cfgs)
 stored_names = access.get('groupsCallNames')
 names = [n for n in stored_names if call_name(n)][:10] if isinstance(stored_names, list) else []
-out = {'answer': 'name' if on else 'every', 'groups': len(cfgs), 'mixed': mixed, 'names': names}
+# The plugin's callName(): the first run of letters and marks in the bot's
+# first_name, 2+ of them.
+def bot_word(first):
+    run = ''
+    for c in first:
+        if unicodedata.category(c)[0] in 'LM':
+            run += c
+        elif run:
+            break
+    return run if len(run) >= 2 and call_name(run) else None
+complete = access.get('groupsCallNamesComplete') is True
+known = complete or os.environ.get('BOT_KNOWN') == '1'
+if not known:
+    names = None
+elif not complete:
+    own = bot_word(os.environ.get('BOT_FIRST', ''))
+    if own:
+        names = [own] + [n for n in names if n.casefold() != own.casefold()]
+out = {'answer': 'name' if on else 'every', 'groups': len(cfgs), 'mixed': mixed, 'names': names,
+       'namesComplete': known}
 if seed:
     out['added'] = added
 print(json.dumps(out))
 PY
+}
+
+# _tg_bot_first_name <name> — the agent's bot display name (getMe first_name),
+# or exit 1 when there is no token or Telegram does not answer. The token stays
+# on the box.
+_tg_bot_first_name() {
+  local token resp
+  token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "${CONNECTORS_DIR}/telegram-${1}.env" 2>/dev/null | head -1 || true)
+  [[ -n "$token" ]] || return 1
+  resp=$(curl -sS -m 5 "https://api.telegram.org/bot${token}/getMe" 2>/dev/null) || return 1
+  jq -e '.ok == true' >/dev/null 2>&1 <<<"$resp" || return 1
+  jq -r '.result.first_name // ""' <<<"$resp"
 }
 
 cmd_telegram_access_groups() {
@@ -340,13 +383,20 @@ cmd_telegram_access_groups() {
   local verb=read
   [[ -n "$answer" || "$names_set" == 1 ]] && verb=write
   [[ -n "$answer" ]] && step "Setting how '$name' answers in groups: $answer"
-  [[ "$names_set" == 1 ]] && step "Setting the names '$name' also answers to in groups"
+  [[ "$names_set" == 1 ]] && step "Setting the names '$name' answers to in groups"
+  # DIVE-6729: the reply lists the bot-name word too, so it needs the bot's
+  # name, unless this write replaces the list.
+  local bot_first="" bot_known=0
+  if [[ "$names_set" != 1 ]] && bot_first=$(_tg_bot_first_name "$name"); then
+    bot_known=1
+  fi
   local out
-  if ! out=$(sudo -u "$user" env STATE="$state_dir" ANSWER="$answer" NAMES="$names" NAMES_SET="$names_set" python3 -c "$(_tg_group_answer_py)" 2>&1); then
+  if ! out=$(sudo -u "$user" env STATE="$state_dir" ANSWER="$answer" NAMES="$names" NAMES_SET="$names_set" \
+      BOT_FIRST="$bot_first" BOT_KNOWN="$bot_known" python3 -c "$(_tg_group_answer_py)" 2>&1); then
     fail "$E_VALIDATION" "${out:-telegram access.json ${verb} failed for agent '$name'}"
   fi
   local said
-  said=$(jq -r '"\(if .answer == "name" then "when called by name" else "every message" end) (\(.groups) group(s)\(if .mixed then ", some set apart" else "" end))\(if (.names // []) != [] then "; also answers to: \(.names | join(", "))" else "" end)"' <<<"$out")
+  said=$(jq -r '"\(if .answer == "name" then "when called by name" else "every message" end) (\(.groups) group(s)\(if .mixed then ", some set apart" else "" end))\(if (.names // []) != [] then "; answers to: \(.names | join(", "))" elif .namesComplete then "; answers to no name, only an @mention or a reply" else "" end)"' <<<"$out")
   ok "in groups, '$name' answers: $said" '{name:$n} + $r' --arg n "$name" --argjson r "$out"
 }
 
