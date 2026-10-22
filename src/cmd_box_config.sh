@@ -121,11 +121,13 @@ cmd_box_config() {
         "             --isolation (DIVE-6410). admin = every new seat is admin, including" \
         "             a pack whose manifest names a tier; an explicit --isolation still wins." \
         "             Default: the first seat on an empty box is admin, later seats standard." \
-        "             Existing seats are not changed: 'agent grant <name> admin' does that."
+        "             Existing seats are not changed: 'agent grant <name> admin' does that." \
+        "  account-poll  on = the heartbeat reads every Claude account's 5h/7d usage from" \
+        "             the provider every 10 min, busy or not (DIVE-6713). Off by default."
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
-      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation)" ;;
+      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll)" ;;
     esac
     shift
   done
@@ -179,6 +181,10 @@ cmd_box_config() {
     [[ "$ta" == off ]] || ta=on
     # DIVE-6410: the tier a new seat gets when nothing names one.
     local si; si=$(box_seat_isolation); [[ -n "$si" ]] || si=default
+    # DIVE-6713: the account-usage poll; anything but "on" is off. The
+    # dashboard reads this field's PRESENCE to know the box can take the toggle.
+    local ap; ap=$(jq -r '.account_poll // "off"' <<<"$(_box_config_read)" 2>/dev/null || printf off)
+    [[ "$ap" == on ]] || ap=off
     ok "verify = ${policy} (${src})
 verify-small = ${small} (${ssrc})
 coauthor = ${coauthor} (box-wide, default on)
@@ -196,12 +202,13 @@ openrouter-key = ${ok_k}
 openrouter-keys = $(jq -r '"reflex: \(.reflex) · " + (if (.plugins | length) == 0 then "every plugin: shared" else ((.plugins | keys | map(. + ": own") | join(" · ")) + " · any other plugin: shared") end)' <<<"$okeys")
 mod-seat = ${ms} (box-wide, default off)
 telegram-app = ${ta} (box-wide, default on)
-seat-isolation = ${si} (box-wide; default = first seat admin, later seats standard)" \
+seat-isolation = ${si} (box-wide; default = first seat admin, later seats standard)
+account-poll = ${ap} (box-wide, default off)" \
        '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s,
          reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk, reflex_key_source:$rks,
          reflex_endpoint:$re, reflex_endpoint_source:$res, reflex_api:$ra, reflex_api_source:$ras, reflex_endpoint_key:$rek,
-         reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, openrouter_keys:$oks, mod_seat:$ms, telegram_app:$ta, seat_isolation:$si, path:$p}' \
-       --arg ms "$ms" --arg ok "$ok_k" --arg ta "$ta" --arg si "$si" --argjson oks "$okeys" \
+         reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, openrouter_keys:$oks, mod_seat:$ms, telegram_app:$ta, seat_isolation:$si, account_poll:$ap, path:$p}' \
+       --arg ms "$ms" --arg ok "$ok_k" --arg ta "$ta" --arg si "$si" --arg ap "$ap" --argjson oks "$okeys" \
        --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" \
        --arg pw "$pw" --arg pws "$pws" --arg p5 "$p5" --arg p5s "$p5s" \
        --arg rr "$rr" --arg rrs "$rrs" --arg rm "$rm" --arg rms "$rms" --arg re "$re" --arg res "$res" \
@@ -320,13 +327,17 @@ seat-isolation = ${si} (box-wide; default = first seat admin, later seats standa
       # offered: the built-in default already gives standard to every later seat.
       seat-isolation|seat_isolation) [[ "$v" == admin || "$v" == default ]] \
                 || fail "$E_VALIDATION" "seat-isolation takes one of: admin, default — got '$v'" ;;
+      # DIVE-6713. Stored as .account_poll; `default` clears it (= off). Our
+      # own boxes only for now: it polls every Claude account every 10 min.
+      account-poll|account_poll) [[ "$v" == on || "$v" == off || "$v" == default ]] \
+                || fail "$E_VALIDATION" "account-poll takes one of: on, off, default — got '$v'" ;;
       # DIVE-4890. Validated in full before anything is written, like every key
       # above: one bad value in a multi-key call writes none of them.
       pace-week|pace_week) _pace_week_valid "$v" \
                 || fail "$E_VALIDATION" "pace-week takes <soft>/<hard> (integers, soft <= hard <= 100, e.g. 85/95), off, or default — got '$v'" ;;
       pace-5h|pace_5h) _pace_5h_valid "$v" \
                 || fail "$E_VALIDATION" "pace-5h takes a percentage (an integer 0-100, e.g. 85), off, or default — got '$v'" ;;
-      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation)" ;;
+      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll)" ;;
     esac
   done
   require_root
@@ -352,7 +363,8 @@ seat-isolation = ${si} (box-wide; default = first seat admin, later seats standa
           || "$k" == reflex-receipts || "$k" == reflex_receipts || "$k" == reflex-model || "$k" == reflex_model \
           || "$k" == reflex-endpoint || "$k" == reflex_endpoint || "$k" == reflex-api || "$k" == reflex_api \
           || "$k" == mod-seat || "$k" == mod_seat || "$k" == telegram-app || "$k" == telegram_app \
-          || "$k" == seat-isolation || "$k" == seat_isolation ) ]]; then
+          || "$k" == seat-isolation || "$k" == seat_isolation \
+          || "$k" == account-poll || "$k" == account_poll ) ]]; then
       json=$(jq --arg k "${k//-/_}" 'del(.[$k])' <<<"$json")
     else
       json=$(jq --arg k "${k//-/_}" --arg v "$v" '.[$k] = $v' <<<"$json")
@@ -385,7 +397,8 @@ seat-isolation = ${si} (box-wide; default = first seat admin, later seats standa
   ok "box config updated (${applied[*]}) — verify = ${policy}, verify-small = ${small}${pw:+, pace-week = ${pw}, pace-5h = ${p5}}${rr:+, reflex-receipts = ${rr}, reflex-model = ${rm}, reflex-key = ${rk}, reflex-endpoint = ${re}, reflex-api = ${ra}, reflex-configured = ${rc}}, openrouter-key = ${okst}" \
      '{verify:$v, verify_small:$sm, pace_week:$pw, pace_5h:$p5, reflex_receipts:$rr, reflex_model:$rm, reflex_key:$rk, reflex_key_source:$rks,
        reflex_endpoint:$re, reflex_api:$ra, reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end),
-       openrouter_key:$ok, openrouter_keys:$oks, applied:($a|split(",")), path:$p}' \
+       openrouter_key:$ok, openrouter_keys:$oks, account_poll:$ap, applied:($a|split(",")), path:$p}' \
+     --arg ap "$(jq -r 'if .account_poll == "on" then "on" else "off" end' <<<"$json" 2>/dev/null || printf off)" \
      --arg ok "$okst" --argjson oks "$okeys" --arg v "$policy" --arg sm "$small" --arg pw "$pw" --arg p5 "$p5" --arg rr "$rr" --arg rm "$rm" --arg rk "$rk" --arg rks "$rks" \
      --arg re "$re" --arg ra "$ra" --arg rc "$rc" \
      --arg a "$(IFS=,; printf '%s' "${applied[*]}")" --arg p "$cfg"
