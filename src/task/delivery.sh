@@ -3064,7 +3064,7 @@ _task_escalation_ask() { # <row id> <iterations> [feedback text]
 
 cmd_task_reject() {
   tasks_db_init
-  local task="" feedback="" no_fix=""
+  local task="" feedback="" no_fix="" merge_conflict=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --feedback=*) feedback="${1#*=}" ;;
@@ -3078,12 +3078,15 @@ cmd_task_reject() {
       # and it is what the maker reads instead of a fix.
       --no-fix=*)   no_fix="${1#*=}" ;;
       --no-fix)     fail "$E_USAGE" "--no-fix needs a reason: --no-fix=\"<why you cannot name the fix>\" (DIVE-4144)" ;;
+      # DIVE-6753: the merger's bounce for a PASSED delivery that only stopped
+      # being mergeable. Checked against the row below, never taken on trust.
+      --merge-conflict) merge_conflict=1 ;;
       -*)           fail "$E_USAGE" "unknown flag: $1" ;;
       *)            [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task reject <id|DIVE-N> [--feedback=\"FINDING: … FIX: … VERIFY: …\"]"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task reject <id|DIVE-N> [--feedback=\"FINDING: … FIX: … VERIFY: …\"] [--merge-conflict]"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local maker iter maxi vfier
   maker=$(db "SELECT COALESCE(maker_agent,'')    FROM tasks WHERE id=${id};")
@@ -3130,8 +3133,43 @@ cmd_task_reject() {
         "$ident: this reject names no FIX, so it costs the maker a full round to find out what you want. Measured on DIVE-4113: the fix that closed it was already in the iteration-1 reject, and iteration 2 changed nothing because the feedback was not actionable. NOTHING WAS WRITTEN — the row still carries the maker's delivered result and the iteration counter has not moved; re-run this verb with the fix named. TEMPLATE: --feedback=\"${_REJECT_TEMPLATE_HINT}\". A fix is 'named' when the feedback carries a FIX label with something after it; the wording is yours. If you genuinely cannot prescribe one, say why and it proceeds (audited): '5dive task reject $ident --feedback=\"...\" --no-fix=\"<why>\"'."
     fi
   fi
+  # DIVE-6753: A MERGE-CONFLICT BOUNCE AFTER A PASS IS NOT AN ITERATION. On
+  # 2026-10-22 three rows (DIVE-6716, -6729, -6717) each graded PASS at the
+  # delivered head, then went CONFLICTING because a sibling merged first; the
+  # merger's reject spent the last of max_iterations=2 and filed a keep-going /
+  # drop-it gate for work nobody had found a defect in. The cap counts quality
+  # rounds, and a rebase is not one. So --merge-conflict bounces WITHOUT spending
+  # one: the bounce below raises max_iterations by one, which is exactly what the
+  # re-delivery's iteration bump then takes back, and the cap branch is skipped.
+  #
+  # The flag is a CLAIM about the row, so it is checked against the row, before
+  # any write: a quality reject must not be able to wear it. Three facts, all
+  # structural columns (never result text, which the maker writes):
+  #   - the latest verdict is a PASS, recorded at or after the current delivery
+  #     and not followed by a reject — a PASS on an older head grades nothing here;
+  #   - the caller is the seat that owes the merge, or the seat that graded it.
+  if (( merge_conflict )); then
+    local _mc_row _mc_verdict _mc_fresh _mc_owner _mc_grader
+    _mc_row=$(db "SELECT COALESCE(graded_verdict,'')||x'1f'||
+        CASE WHEN graded_verdict_at IS NOT NULL AND handoff_delivered_at IS NOT NULL
+              AND graded_verdict_at >= handoff_delivered_at
+              AND (handoff_rejected_at IS NULL OR handoff_rejected_at < graded_verdict_at)
+             THEN 1 ELSE 0 END||x'1f'||
+        COALESCE(merge_owner,'')||x'1f'||COALESCE(graded_by,'')
+      FROM tasks WHERE id=${id};")
+    IFS=$'\x1f' read -r _mc_verdict _mc_fresh _mc_owner _mc_grader <<<"$_mc_row"
+    if [[ "$_mc_verdict" != 'pass' || "$_mc_fresh" != '1' ]]; then
+      policy_refuse "$E_CONFLICT" reject-merge-conflict-without-pass DIVE-6753 "$ident" \
+        "$ident: --merge-conflict says the work PASSED and only the merge is blocked, but this row's current delivery carries no PASS (verdict '${_mc_verdict:-none}'$([[ "$_mc_verdict" == pass ]] && printf ', recorded before the current delivery or since rejected')). NOTHING WAS WRITTEN. If the work has a defect, reject it without --merge-conflict; that bounce counts toward the iteration cap."
+    fi
+    if [[ "$_rj_actor" != "$_mc_owner" && "$_rj_actor" != "$_mc_grader" && "$_rj_actor" != "$vfier" ]]; then
+      policy_refuse "$E_CONFLICT" reject-merge-conflict-not-merger DIVE-6753 "$ident" \
+        "$ident: --merge-conflict is the merger's bounce, and you ('${_rj_actor}') neither owe this merge ('${_mc_owner:-nobody}') nor graded it ('${_mc_grader:-nobody}'). NOTHING WAS WRITTEN. Tell the merge owner the branch conflicts and let them bounce it."
+    fi
+  fi
   # (3) attribute to the REAL actor, never to the recorded verifier by assumption.
   local fb_txt="❌ ${_rj_actor} rejected (iteration ${iter}): ${feedback:-no feedback given}"
+  (( merge_conflict )) && fb_txt="❌ ${_rj_actor} rejected for a MERGE CONFLICT after a PASS (iteration ${iter}, not counted toward the cap): ${feedback:-no feedback given}"
   # (4) never silently discard a landed record — VIA THE SHARED GUARD, not a
   # private copy of it.
   #
@@ -3256,7 +3294,7 @@ cmd_task_reject() {
   # feedback, then fails) — a separate pre-existing defect, deliberately not
   # ridden along here; graded as a documented control in
   # tests/task_close_preserves_done_at_unit.sh (arm G).
-  if (( maxi > 0 && iter >= maxi )); then
+  if (( maxi > 0 && iter >= maxi && ! merge_conflict )); then
     db "UPDATE tasks SET result=$(sqlq "$fb_txt") WHERE id=${id};"
     _five_flush_write_notes
     # DIVE-2777: THE SECOND WRITE SITE GETS THE EVENT TOO, and this branch is the
@@ -3307,9 +3345,16 @@ cmd_task_reject() {
   # counter had to bump on every delivery and so counted restores as rework. It is a
   # dedicated clock for the same reason handoff_delivered_at is one: updated_at moves
   # on any row touch and cannot answer "was there a reject since the last delivery".
+  # DIVE-6753: a merge-conflict bounce raises the cap by the one iteration the
+  # re-delivery will add, so the counter moves and the headroom does not.
+  local _rj_cap_sql="" _rj_disp="bounced back to maker ${maker}"
+  if (( merge_conflict )); then
+    (( maxi > 0 )) && { _rj_cap_sql=", max_iterations=COALESCE(max_iterations,0)+1"; maxi=$((maxi + 1)); }
+    _rj_disp="bounced back to maker ${maker} for a merge conflict after a PASS (not counted toward the cap)"
+  fi
   db "UPDATE tasks SET status='todo', assignee=$(sqlq "$maker"), started_at=NULL, handoff_ack_at=NULL,
         handoff_rejected_at=datetime('now'),
-        done_at=NULL, result=$(sqlq "$fb_txt") WHERE id=${id};"
+        done_at=NULL, result=$(sqlq "$fb_txt")${_rj_cap_sql} WHERE id=${id};"
   # DIVE-2777: THE BOUNCE IS A LIFECYCLE EVENT. Until now `reject` emitted nothing
   # — the distinct kinds in the table were gate.answered, gate.filed,
   # policy.refused, ship, task.cancelled, task.created, task.delivered, task.done,
@@ -3339,7 +3384,7 @@ cmd_task_reject() {
   # are indistinguishable by hash across the 278 existing task.delivered events
   # (270 mismatch — essentially the whole population). The census starts here.
   _task_reject_emit_event "$ident" "$id" "$_rj_actor" "$_rj_prev" "$iter" "$maxi" \
-    "bounced back to maker ${maker}"
+    "$_rj_disp"
   ok "$ident rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
      '{id:($i|tonumber), ident:$id, status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
      --arg i "$id" --arg id "$ident" --arg m "$maker" --arg n "$iter"
