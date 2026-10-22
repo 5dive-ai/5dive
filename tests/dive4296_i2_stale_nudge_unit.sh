@@ -53,6 +53,8 @@ source src/lib/output.sh
 # shellcheck disable=SC1091
 source src/lib/validation.sh
 # shellcheck disable=SC1091
+source src/lib/tasks_db.sh   # _GATE_HUMAN_CLASS_SQL: the stall sweep's gate counts expand it (DIVE-6726)
+# shellcheck disable=SC1091
 source src/cmd_agent_runtime.sh
 # shellcheck disable=SC1091
 source src/cmd_heartbeat.sh
