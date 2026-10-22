@@ -87,8 +87,10 @@ Agents:
                             # exclusive with --defer-auth.
                             # When called by another agent on a claude-typed agent,
                             # defaults to --with-skills=5dive-cli so the new agent
-                            # inherits inter-agent comms knowledge. Use --no-skills
-                            # to opt out. --defer-auth skips the auth gate so the
+                            # inherits inter-agent comms knowledge. --no-skills
+                            # installs no skills at all, the defaults
+                            # (5dive-cli, compile-knowledge) included, and the
+                            # nightly refresh leaves the agent alone. --defer-auth skips the auth gate so the
                             # agent can be created before credentials exist; useful
                             # when the agent's own first-run UI handles sign-in.
   5dive agent clone <src> <dst> [--channels=...] [--telegram-token=...]

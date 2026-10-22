@@ -270,12 +270,26 @@ cmd_agent_skills_install_dir() {
   skills_install_dir "$(agent_type "$1")"
 }
 
+# DIVE-6751: `agent create --no-skills` opts the seat out of THIS list too, not
+# only out of the --with-skills extras. Every preseed branch below seeded the
+# defaults unconditionally, so a --no-skills agent still got 5dive-cli and
+# compile-knowledge. cmd_create sets NO_DEFAULT_SKILLS for its own run (the
+# registry is written after the preseed), and records `noSkills: true` so a later
+# channel attach and the nightly refresh (5dive-refresh-skills.sh) leave it too.
+NO_DEFAULT_SKILLS=0
+agent_skips_default_skills() {
+  (( NO_DEFAULT_SKILLS )) && return 0
+  [[ -r "$REGISTRY" ]] || return 1
+  jq -e --arg n "$1" '.agents[$n].noSkills == true' "$REGISTRY" >/dev/null 2>&1
+}
+
 # Seed every default skill onto one agent, for one harness type. Best-effort per
 # skill (`|| true`): if npx isn't reachable yet (cold box, no network) the agent
 # still boots and the operator can re-trigger from the dashboard's Skills block,
 # and the nightly refresh backfills whatever did not land.
 preseed_default_skills_for_type() {
   local name="$1" type="$2" spec source skill
+  agent_skips_default_skills "$name" && return 0
   while IFS= read -r spec; do
     [[ -n "$spec" ]] || continue
     source="${spec%%:*}"
