@@ -14,6 +14,8 @@
 #   6  the token reaches curl on stdin only, and no output, record or log line
 #      carries it.
 #   7  the heartbeat polls only on a box that opted in (account-poll=on).
+#   8  `5dive config` stores account-poll and reports it, off by default, so
+#      the dashboard can show its toggle.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
@@ -173,5 +175,27 @@ t "7 not again inside the cadence" '0' "${_HB_APOLL_RAN}"
 _hb_account_poll_sweep "$((NOW + 540))"
 t "7 again at 540s, so no reading passes 10 min" '1' "${_HB_APOLL_RAN}"
 
-printf '%d passed, %d failed\n' "$PASS" "$FAIL"
+# --- 8 -----------------------------------------------------------------------
+CFG8=$(
+  export STATE_DIR="$TMP/state8" BOX_CONFIG="$TMP/box8.json" CONNECTORS_DIR="$TMP/connectors"
+  mkdir -p "$STATE_DIR"
+  for f in lib/validation.sh lib/state.sh lib/audit.sh lib/registry.sh cmd_box_config.sh; do source "src/$f"; done
+  set +e
+  require_root() { return 0; }
+  JSON_MODE=1 cmd_box_config 2>/dev/null | jq -r '"read=\(.data.account_poll)"'
+  JSON_MODE=1 cmd_box_config account-poll=on 2>/dev/null | jq -r '"set=\(.data.account_poll)"'
+  printf 'stored=%s\n' "$(jq -r .account_poll "$BOX_CONFIG")"
+  JSON_MODE=1 cmd_box_config 2>/dev/null | jq -r '"reread=\(.data.account_poll)"'
+  ( JSON_MODE=0 cmd_box_config account-poll=yes ) >/dev/null 2>&1; printf 'bad=%s\n' "$?"
+  JSON_MODE=0 cmd_box_config account-poll=default >/dev/null 2>&1
+  printf 'cleared=%s\n' "$(jq -r '.account_poll // "absent"' "$BOX_CONFIG")"
+)
+t "8 config reads off on a box that never chose" 'read=off'      "$(grep '^read=' <<<"$CFG8")"
+t "8 account-poll=on answers on"                 'set=on'        "$(grep '^set=' <<<"$CFG8")"
+t "8 and is stored"                              'stored=on'     "$(grep '^stored=' <<<"$CFG8")"
+t "8 and is read back"                           'reread=on'     "$(grep '^reread=' <<<"$CFG8")"
+t "8 a value that is not on/off/default is refused" 'bad=1'      "$(grep '^bad=' <<<"$CFG8" | sed 's/=[1-9][0-9]*$/=1/')"
+t "8 default clears it"                          'cleared=absent' "$(grep '^cleared=' <<<"$CFG8")"
+
+printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
