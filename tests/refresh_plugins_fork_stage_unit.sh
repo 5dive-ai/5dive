@@ -69,6 +69,15 @@ export FORK_MIRROR="$TMP/mirror.git"
 export FORK_STAGE_ROOT="$TMP/stage"
 mkdir -p "$FORK_STAGE_ROOT"
 
+# DIVE-6742: the stager runs `bun install` after a stage whenever bun is on PATH.
+# This file grades staging, not bun, so a no-op stub shadows whatever bun the host
+# has. Real bun 1.4.4 DELETES fake1's dependency-free fixture bun.lock, and the
+# next run then reads the missing file as an upstream change: S4 went red on
+# main with no stager change, only a newer bun on the runner.
+mkdir -p "$TMP/bin"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/bun"; chmod +x "$TMP/bin/bun"
+export PATH="$TMP/bin:$PATH"
+
 run_stage()  { "$STAGE_SH" 2>"$TMP/err.log"; }
 run_status() { "$STAGE_SH" --status 2>"$TMP/err.log"; }
 staged()     { cat "$FORK_STAGE_ROOT/$1/server.ts" 2>/dev/null; }
