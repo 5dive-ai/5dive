@@ -17,8 +17,11 @@
 #   * The seat is derived from SUDO_UID, never from the caller, and it is the
 #     `agent` of every call. So a seat reads, acks and replies as ITSELF only:
 #     narrower than the token, which speaks for every agent on the box.
-#   * Four operations, each a fixed URL: ping (no network, says the rail and the
-#     token are there), pending, ack <id>..., event <chat_id> <text> [file]...
+#   * Six operations, each a fixed URL: ping (no network, says the rail and the
+#     token are there), pending, ack <id>..., event <chat_id> <text> [file]...,
+#     status <chat_id> <0|1> [label] (the live step the chat shows, DIVE-6715)
+#     and ask <chat_id> <text> <question_id> (<label> <description>){2,10} (a
+#     question with buttons, DIVE-6715; an empty description is left out).
 #     The root side builds every body with jq. sudo resets the environment, so
 #     the caller cannot redirect the API base.
 #   * An ack names only ids this seat's own pending poll returned. The control
@@ -171,7 +174,42 @@ cmd_dashboard_relay() {
           --args "${files[@]}") \
         || fail "$E_GENERIC" "_dashboard_relay: could not build the reply."
       _dash_relay_call POST "${base}/server/messages/event" "$body" "$tok" ;;
+    status)
+      (( ${#wire[@]} >= 3 && ${#wire[@]} <= 4 )) \
+        || fail "$E_VALIDATION" "_dashboard_relay status takes a chat id, 0 or 1, and at most one label."
+      local chat="${wire[1]}" flag="${wire[2]}" label="${wire[3]:-}" body
+      [[ "$chat" =~ ^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,127}$ ]] \
+        || fail "$E_VALIDATION" "_dashboard_relay status: invalid chat id."
+      [[ "$flag" == 0 || "$flag" == 1 ]] || fail "$E_VALIDATION" "_dashboard_relay status: the flag is 0 or 1."
+      (( ${#label} <= 120 )) || fail "$E_VALIDATION" "_dashboard_relay status: the label is over 120 characters."
+      [[ "$label" != *[[:cntrl:]]* ]] || fail "$E_VALIDATION" "_dashboard_relay status: the label has a control character."
+      body=$(jq -nc --arg a "$seat" --arg c "$chat" --arg f "$flag" --arg l "$label" \
+          '{agent:$a, chat_id:$c, active:($f == "1"), label:(if $l == "" then null else $l end)}') \
+        || fail "$E_GENERIC" "_dashboard_relay: could not build the status."
+      _dash_relay_call POST "${base}/server/messages/status" "$body" "$tok" ;;
+    ask)
+      local n=$(( ${#wire[@]} - 4 )) i
+      (( n >= 4 && n <= 20 && n % 2 == 0 )) \
+        || fail "$E_VALIDATION" "_dashboard_relay ask takes a chat id, the text, a question id and 2 to 10 label/description pairs."
+      local chat="${wire[1]}" text="${wire[2]}" qid="${wire[3]}" body
+      [[ "$chat" =~ ^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,127}$ ]] \
+        || fail "$E_VALIDATION" "_dashboard_relay ask: invalid chat id."
+      [[ -n "${text//[[:space:]]/}" ]] || fail "$E_VALIDATION" "_dashboard_relay ask: the text is empty."
+      (( ${#text} <= 65536 )) || fail "$E_VALIDATION" "_dashboard_relay ask: the text is over 64 KiB."
+      [[ "$qid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
+        || fail "$E_VALIDATION" "_dashboard_relay ask: invalid question id."
+      for (( i = 4; i < ${#wire[@]}; i += 2 )); do
+        [[ -n "${wire[i]//[[:space:]]/}" ]] || fail "$E_VALIDATION" "_dashboard_relay ask: an option label is empty."
+        (( ${#wire[i]} <= 120 )) || fail "$E_VALIDATION" "_dashboard_relay ask: an option label is over 120 characters."
+        (( ${#wire[i+1]} <= 200 )) || fail "$E_VALIDATION" "_dashboard_relay ask: an option description is over 200 characters."
+      done
+      body=$(jq -nc --arg a "$seat" --arg b "$text" --arg c "$chat" --arg q "$qid" '$ARGS.positional as $o
+          | {agent:$a, body:$b, metadata:{chat_id:$c, question:{id:$q, options:[range(0; $o|length; 2) as $i
+              | {label:$o[$i]} + (if $o[$i+1] == "" then {} else {description:$o[$i+1]} end)]}}}' \
+          --args "${wire[@]:4}") \
+        || fail "$E_GENERIC" "_dashboard_relay: could not build the question."
+      _dash_relay_call POST "${base}/server/messages/event" "$body" "$tok" ;;
     *)
-      fail "$E_VALIDATION" "_dashboard_relay allows only ping, pending, ack or event." ;;
+      fail "$E_VALIDATION" "_dashboard_relay allows only ping, pending, ack, event, status or ask." ;;
   esac
 }
