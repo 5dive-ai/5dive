@@ -595,6 +595,17 @@ else
         bad_t "T6f a SECOND seat searches the wiki and finds what the first published" \
               "rc=$src out=$(tr '\n' ' ' <<<"$sout" | cut -c1-300)"
       fi
+      # DIVE-6798: projects/CLAUDE.md now tells every seat "every colleague's
+      # memory search finds it" — the PLAIN search, no --store, which is what a
+      # colleague actually types. Pin that one too.
+      pout=$(as_seat wikiseat_b "$FIVE memory search 'install-contract probe seat A publishes'" 2>&1)
+      prc=$?
+      if (( prc == 0 )) && grep -q 'contract-probe-seat-a' <<<"$pout"; then
+        ok_t "T6f a second seat's PLAIN memory search (no --store) finds it too"
+      else
+        bad_t "T6f a second seat's PLAIN memory search (no --store) finds it too" \
+              "rc=$prc out=$(tr '\n' ' ' <<<"$pout" | cut -c1-300)"
+      fi
 
       # (3) The second writer. A shared wiki that is write-once per author is a
       # set of private pages in one directory: seat B must be able to append the

@@ -9,15 +9,15 @@
 <!-- 5dive:task-lifecycle:begin (managed; edits are overwritten) -->
 ## Task lifecycle
 
-- **One row per turn**; read its state only with `5dive task show <ident>`.
-- **End in one of four states:** `done` with a `--result` of one or two self-contained sentences; delivered (with a verifier, that IS the maker's terminal state); gated; cancelled, only if genuinely irrelevant or impossible.
+- **One row per turn**; read it only with `5dive task show <ident>`.
+- **End in one of four states:** `done` with `--result`: one or two self-contained sentences; delivered (with a verifier, that IS the maker's terminal state); gated; cancelled, only if genuinely irrelevant or impossible.
 - **A human gate is not a cancellation:** `5dive task need <ident> --type=decision|approval|secret|manual --ask="<one crisp question>"`; decision: `--options="<first choice spelled out>|<second choice spelled out>" --recommend="<one>"`; approval: `--recommend="<answer>"`; a bare letter is lost once forwarded, quoted or screenshotted.
 - **Keys, passwords: one-time secure link only**, never in chat (`5dive task need <ident> --type=secret --secret-key=<NAME> --connector=tools`). Blocked on one your owner holds? File it first; offer: fix the account, or paste one there.
-- **Nobody is at your keyboard:** decide, note alternatives on the row, never open a chooser.
-- **Maker and verifier are separate seats:** never self-verify or re-run `done` to force a close. Verifiers accept or `task reject --feedback="FINDING: … FIX: … VERIFY: …"`; a FAIL verdict is a complete, terminal outcome.
-- **Shells older than 15 minutes die after your turn** unless run with `FIVEDIVE_KEEP_ALIVE=1`.
+- **Nobody is at your keyboard:** decide, note alternatives, never open a chooser.
+- **Maker and verifier are separate seats:** never self-verify or force a close. Verifiers accept or `task reject --feedback="FINDING: … FIX: … VERIFY: …"`; a FAIL verdict is a complete, terminal outcome.
+- **Shells past 15 minutes die after your turn** without `FIVEDIVE_KEEP_ALIVE=1`.
 - **Self-audit before you close:** fix or gate your weakest or unchecked point.
-- **Judgement** (a decision, a cause): `5dive memory add --store=wiki` before you close.
+- What the whole team should know about the owner's business goes to the team wiki: `5dive memory add --store=wiki`; every colleague's memory search finds it.
 <!-- 5dive:task-lifecycle:end -->
 
 <!-- 5dive:hired-agents:begin (managed; edits are overwritten) -->
