@@ -248,8 +248,8 @@ _task_chain_paired() {
 # real delivery. The raw human nonce goes over STDIN (the DIVE-880 `-` sentinel),
 # never argv, so it can't leak through ps/audit. Returns the child's status:
 # 0 delivered, non-zero not delivered (the caller then fails loudly).
-_task_gate_escalate_via_sudo() {
-  local ident="$1" nonce="${2:-}"
+_task_gate_escalate_via_sudo() { # <ident> [nonce] [not-via agent, DIVE-6760]
+  local ident="$1" nonce="${2:-}" not_via="${3:-}"
   command -v sudo >/dev/null 2>&1 || return 1
   # MUST be the installed path: agents' sudoers grants NOPASSWD for exactly
   # `/usr/local/bin/5dive` (and `/usr/local/bin/5dive *`). A `command -v` result
@@ -267,7 +267,7 @@ _task_gate_escalate_via_sudo() {
   # in its warn and its audit row. Truncated because it rides a log line.
   TASK_GATE_ESCALATE_ERR=""
   local _err _rc=0
-  _err=$(printf '%s' "$nonce" | sudo -n "$cli" task gate-escalate "$ident" --nonce=- 2>&1 >/dev/null) || _rc=$?
+  _err=$(printf '%s' "$nonce" | sudo -n "$cli" task gate-escalate "$ident" --nonce=- ${not_via:+"--not-via=${not_via}"} 2>&1 >/dev/null) || _rc=$?
   TASK_GATE_ESCALATE_ERR="${_err//$'\n'/ }"
   TASK_GATE_ESCALATE_ERR="${TASK_GATE_ESCALATE_ERR:0:300}"
   return $_rc
@@ -283,11 +283,15 @@ _task_gate_escalate_via_sudo() {
 # recovery. Exit 0 = delivered, non-zero = not delivered.
 cmd_task_gate_escalate() {
   tasks_db_init
-  local ident_arg="" nonce=""
+  local ident_arg="" nonce="" not_via=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --nonce=-) IFS= read -r nonce || true ;;
       --nonce=*) fail "$E_USAGE" "--nonce accepts only '-' (read from stdin)" ;;
+      # DIVE-6760: the bot that already failed to reach anyone; send from the
+      # gate notifier's instead. A name, never a path or a flag.
+      --not-via=*) not_via="${1#--not-via=}"
+                   [[ "$not_via" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || fail "$E_USAGE" "--not-via takes an agent name" ;;
       -*)        fail "$E_USAGE" "unknown flag: $1" ;;
       *)         [[ -z "$ident_arg" ]] && ident_arg="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
@@ -327,7 +331,7 @@ cmd_task_gate_escalate() {
   # miss here must fall through to the loud failure, never re-sudo itself.
   local rc=0
   TASK_SEND_DELIVERED=0
-  TASK_GATE_ESCALATING=1 TASK_GATE_FILER="$filer" \
+  TASK_GATE_ESCALATING=1 TASK_GATE_FILER="$filer" TASK_GATE_NOT_VIA="$not_via" \
     task_need_notify "$ident" "$nt" "$ask" "$opts" "$rec" "$skey" "$conn" "$nonce" "" || rc=$?
   # A resolved channel is NOT a delivery. task_need_notify is best-effort about
   # the actual Bot API call, so this verb — whose entire contract is "the ask
@@ -1354,7 +1358,7 @@ _task_send_owner() {
   # through untouched so the Bot-API-rejected-keyboard retry is the one that uses it.
   local text="$1" reply_markup="${2:-}" task_ids="${3:-}" text_plain="${4:-}"
   local token="$TASK_CH_TOKEN" access_file="$TASK_CH_ACCESS"
-  TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0 TASK_SEND_TARGETS=""
+  TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0 TASK_SEND_TARGETS="" TASK_SEND_NO_TARGET=0
   # DIVE-1506: fail-closed chokepoint. EVERY real human-facing task send (gate-notify + /inbox
   # digest) funnels here. Refuse unless the active task DB is the prod DB — an isolated e2e/fixture
   # DB (council_gate_e2e's `task need`, a replayed fixture digest) must never reach a paired human.
@@ -1422,6 +1426,9 @@ _task_send_owner() {
   fi
   if (( ! attempted )) && [[ "$TASK_SEND_DELIVERED" != "1" && -n "$task_ids" ]]; then
     TASK_SEND_FAILED=1
+    # DIVE-6760: THIS bot reaches nobody, which says nothing about another bot.
+    # The file-time gate send reads it to try the gate notifier's bot at once.
+    TASK_SEND_NO_TARGET=1
     _task_gate_delivery_log error "$task_ids" "" "" "no allowlisted DM or deliverable group topic"
   fi
   _task_stamp_confirmed_delivery "$task_ids"
@@ -1463,7 +1470,7 @@ _task_send_gate_owner() {
     _task_send_owner "$text" "$reply_markup" "$task_ids" "$text_plain"
     return 0
   fi
-  TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0 TASK_SEND_TARGETS=""
+  TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0 TASK_SEND_TARGETS="" TASK_SEND_NO_TARGET=0
   local token="$TASK_CH_TOKEN" access_file="$TASK_CH_ACCESS"
   # DIVE-1506 fail-closed chokepoint, same as _task_send_owner: a fixture/e2e DB
   # must never reach a paired human. Checked here too because this function is a
@@ -1519,7 +1526,7 @@ _task_send_gate_owner() {
   fi
   # The narrowing invariant: on record is not the same as reachable on THIS bot.
   if ! jq -e --arg c "$chat" '(.allowFrom // []) | index($c) != null' "$access_file" >/dev/null 2>&1; then
-    TASK_SEND_FAILED=1
+    TASK_SEND_FAILED=1 TASK_SEND_NO_TARGET=1   # DIVE-6760: another bot may reach them
     _task_gate_delivery_log error "$task_ids" "" "" \
       "gate owner ${hid} is not paired to this bot (chat ${chat} absent from access.json allowFrom) — held on the agent rail rather than sent to whoever is (DIVE-3342)" \
       "have ${hid} /start this agent's bot, or route the gate to an agent ${hid} owns"
@@ -2109,6 +2116,7 @@ _gate_t() {
       ratify_head)   printf '%s' "↩︎ [$1] просит ПОДТВЕРДИТЬ УЖЕ СДЕЛАННОЕ ДЕЙСТВИЕ" ;;
       ratify_body)   printf '%s' "Это подтверждение задним числом, а не разрешение заранее: действие уже выполнено. «Подтвердить» записывает, что вы одобрили его после факта; «Не разрешал» записывает, что нет." ;;
       escalated)     printf '%s' "↑ вопрос от агента $1 (у него нет своего канала) — переслан вам" ;;
+      via_other)     printf '%s' "↑ вопрос от агента $1 (его бот не может вам написать)" ;;
       rec)           local r="$1"
                      case "${r,,}" in approve|approved) r="одобрить" ;; deny|denied) r="отклонить" ;; esac
                      printf '%s' "✅ Рекомендую: ${r}" ;;
@@ -2133,6 +2141,8 @@ _gate_t() {
       type)          case "$1" in decision) printf 'решение' ;; approval) printf 'одобрение' ;; secret) printf 'ключ' ;; manual) printf 'действие' ;; access) printf 'доступ' ;; *) printf '%s' "$1" ;; esac ;;
       renag_head)    printf '%s' "🔁 Напоминание: вопросы без ответа ($1):" ;;
       renag_foot)    printf '%s' "Нажмите кнопку, откройте ссылку /task или ответьте в панели управления. Первое напоминание приходит через час, дальше раз в сутки, пока вы не ответите." ;;
+      first_head)    printf '%s' "🙋 Ждут вашего ответа ($1):" ;;
+      first_foot)    printf '%s' "Нажмите кнопку, откройте ссылку /task или ответьте в панели управления." ;;
       secret_link)   printf '%s' "🔑 [$1] нужен ключ $2. Откройте эту одноразовую ссылку и вставьте его там (один раз, ссылка действует $3 мин):"$'\n'"$4"$'\n'"Ключ попадёт прямо на этот сервер, не через 5dive и не через этот чат. Не вставляйте его сюда. Ссылка истекла? Карточка задачи в приложении 5dive создаст новую." ;;
       secret_app)    printf '%s' "🔑 [$1] нужен ключ $2. Откройте эту задачу в приложении 5dive (карточка на 5dive.ai/dashboard/tasks или «Моя команда» в приложении 5dive в Telegram) и нажмите «Открыть защищённую ссылку». Ключ вставляется на странице этого сервера, не через 5dive и не через этот чат. Не вставляйте его сюда." ;;
       secret_box)    printf '%s' "Или на сервере: sudo 5dive secret write $1 --connector=$2 --task=$3 (значение спросит скрыто)." ;;
@@ -2147,6 +2157,7 @@ _gate_t() {
     ratify_head)   printf '%s' "↩︎ [$1] needs you to CONFIRM AN ACTION ALREADY TAKEN" ;;
     ratify_body)   printf '%s' "This is a RATIFICATION, not a prior approval — the action has already happened. Confirming records that you signed it off after the fact; denying records that you did not." ;;
     escalated)     printf '%s' "↑ filed by $1 (no channel of its own) — escalated to you" ;;
+    via_other)     printf '%s' "↑ asked by $1 (its bot cannot message you)" ;;
     rec)           printf '%s' "✅ Recommended: $1" ;;
     expires)       printf '%s' "⏳ Expires $1Z — after that this is resolved as NOT approved and tapping does nothing (DIVE-4833)." ;;
     opts_head)     printf '%s' "Options:" ;;
@@ -2169,6 +2180,8 @@ _gate_t() {
     type)          printf '%s' "$1" ;;
     renag_head)    printf '%s' "🔁 Gate reminder — unanswered gates ($1):" ;;
     renag_foot)    printf '%s' "Tap a button, open /task links, or answer from the dashboard. First reminder is after 1h; later reminders are batched every 24h until answered." ;;
+    first_head)    printf '%s' "🙋 $1 gates need you:" ;;
+    first_foot)    printf '%s' "Tap a button, open /task links, or answer from the dashboard." ;;
     secret_link)   printf '%s' "🔑 [$1] needs the $2 credential. Open this one-time link and paste it there (single use, expires in $3m):"$'\n'"$4"$'\n'"It goes straight to this server, never through 5dive or this chat. Never paste it here. Link expired? The task's card in the 5dive app makes a fresh one." ;;
     secret_app)    printf '%s' "🔑 [$1] needs the $2 credential. Open this task in the 5dive app (its card on 5dive.ai/dashboard/tasks, or My team in the 5dive app on Telegram) and tap Open secure link. You paste it on a page served by this server, never through 5dive or this chat. Never paste it here." ;;
     secret_box)    printf '%s' "On the box instead: sudo 5dive secret write $1 --connector=$2 --task=$3 (it asks for the value, hidden)." ;;
@@ -3093,7 +3106,17 @@ _task_need_notify_deliver_now() {
   # byte-identical to today's. An unpaired or unresolvable notifier falls straight
   # through to the filer-first chain — the notifier is a PREFERENCE about which
   # paired bot sends, never a new way for a gate to reach nobody.
-  if ! _task_gate_preview_channel "$_self"; then
+  # DIVE-6760: the retry from _task_gate_first_ask_via_notifier. The filer's bot
+  # was tried and reaches nobody, so it is not asked again: the gate notifier's
+  # bot sends, or nothing does and the caller's re-nag remains the net.
+  if [[ -n "${TASK_GATE_NOT_VIA:-}" ]]; then
+    local _nv_to; _nv_to=$(_task_resolve_gate_notifier 2>/dev/null) || _nv_to=""
+    if [[ -z "$_nv_to" || "$_nv_to" == "$TASK_GATE_NOT_VIA" ]] || ! _task_agent_channel "$_nv_to"; then
+      _task_gate_delivery_log error "$numid" "" "" \
+        "${TASK_GATE_NOT_VIA}'s bot reaches no one and the gate notifier (${_nv_to:-none resolved}) has no readable channel; the re-nag will retry"
+      return 3
+    fi
+  elif ! _task_gate_preview_channel "$_self"; then
     warn "$ident: filing agent (${_self:-?}) has no paired channel — escalating up the org chart for the gate alert"
     local _fb=""
     _task_chain_channel "$_self" && _fb="$TASK_CH_AGENT"
@@ -3209,8 +3232,11 @@ _task_need_notify_deliver_now() {
   # DIVE-1927: when the ask was escalated off an unpaired filer, NAME the filer.
   # The recipient's bot is not the asker's bot, so without this the alert reads as
   # the manager's own gate and there is no way to tell whose ask it is.
-  [[ -n "${TASK_NOTIFY_ESCALATED_FROM:-}" ]] \
-    && _task_gate_text_both $'\n'"$(_gate_t escalated "$TASK_NOTIFY_ESCALATED_FROM")"
+  if [[ -n "${TASK_GATE_NOT_VIA:-}" ]]; then
+    _task_gate_text_both $'\n'"$(_gate_t via_other "$TASK_GATE_NOT_VIA")"
+  elif [[ -n "${TASK_NOTIFY_ESCALATED_FROM:-}" ]]; then
+    _task_gate_text_both $'\n'"$(_gate_t escalated "$TASK_NOTIFY_ESCALATED_FROM")"
+  fi
   # DIVE-3661 iteration 3: print the line ONLY when the recommendation is not
   # already readable off a button. A DECISION gate's ⭐ first button carries the
   # recommended value verbatim (the line was the same words twice, one apart);
@@ -3410,6 +3436,39 @@ _task_need_notify_deliver_now() {
   fi
 
   _task_send_gate_owner "$text" "$reply_markup" "$numid" "" "$text_plain"
+  [[ "${TASK_SEND_DELIVERED:-0}" != 1 && "${TASK_SEND_NO_TARGET:-0}" == 1 ]] \
+    && _task_gate_first_ask_via_notifier "$@"
+  return 0
+}
+
+# DIVE-6760: the filer's bot is paired but has no chat with the person (dev's bot
+# had never been /started by its owner). That send was the only one carrying the
+# secret gate's link, and the re-nag's never-pinged net found the gate ~15 min
+# later as a "reminder" with no link. So try the gate notifier's bot now, in the
+# same call. Readable here (root, or the notifier's own shell): re-render on its
+# channel, which mints a fresh link. Not readable (another seat's 0600
+# access.json): the privileged re-send DIVE-1927 already uses, told which bot to
+# skip. A miss leaves gate_pinged_at NULL, so the re-nag is still the net.
+_task_gate_first_ask_via_notifier() { # <the _task_need_notify_deliver_now args>
+  local ident="$1" nonce="${8:-}" from="${TASK_CH_AGENT:-}" to=""
+  [[ -z "${TASK_GATE_NOT_VIA:-}" && -n "$from" ]] || return 0
+  to=$(_task_resolve_gate_notifier 2>/dev/null) || to=""
+  [[ -n "$to" && "$to" != "$from" ]] || return 0
+  if _task_agent_channel "$to"; then
+    TASK_GATE_NOT_VIA="$from" _task_need_notify_deliver_now "$@"
+    return 0
+  fi
+  [[ $EUID -ne 0 && -z "${TASK_GATE_ESCALATING:-}" ]] || return 0
+  local _p=0; _task_agent_paired "$to" || _p=$?
+  (( _p != 1 )) || return 0
+  if _task_gate_escalate_via_sudo "$ident" "$nonce" "$from"; then
+    # The child wrote the delivery row; count it here, as the DIVE-1927 path does.
+    TASK_SEND_DELIVERED=1
+    TASK_GATE_DELIVERY_ROWS=$(( ${TASK_GATE_DELIVERY_ROWS:-0} + 1 ))
+    warn "$ident: ${from}'s bot reaches no one; the gate alert went out from ${to}'s bot instead"
+  else
+    warn "$ident: ${from}'s bot reaches no one and the send from ${to}'s bot failed${TASK_GATE_ESCALATE_ERR:+ — ${TASK_GATE_ESCALATE_ERR}}; the re-nag retries"
+  fi
   return 0
 }
 
