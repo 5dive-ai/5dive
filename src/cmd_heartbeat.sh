@@ -5675,6 +5675,27 @@ _hb_mz_window() {
   done
 }
 
+# DIVE-6804: WHO OWNS AN INSTANCE OF AN UNASSIGNED TEMPLATE. crud.sh used to
+# leave templates unassigned on the promise that "the instance gets coordinated
+# when it's cloned", but the clone below is raw SQL, so nothing ever coordinated
+# it: the instance inherited the empty assignee and nothing woke it. Measured on
+# even-branch 2026-10-23: galina's owner reminder (DIVE-18) fired at 18:50Z into
+# DIVE-20 with no assignee and was never delivered.
+#
+# The filer is the agent that promised the reminder, so it owns the instance. A
+# filer that is not a seat (cli, telegram, council) falls to the coordinator of
+# the filer's team, the same tier crud.sh gives an unassigned standard row.
+# Prints nothing when neither resolves; the caller logs that.
+_hb_mz_owner() {
+  local _cb
+  _cb=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${1};" 2>/dev/null) || _cb=""
+  if [[ -n "$_cb" ]] && _task_roster_has "$_cb"; then
+    printf '%s' "$_cb"
+    return 0
+  fi
+  _task_resolve_coordinator "$_cb" 2>/dev/null || true
+}
+
 _hb_materialize_recurring() {
   local now="$1" minute_start slot_ep slot_tag _wi tid sched last_fired policy bound assignee open open_read open_rc stamp_err n_made=0
   local -a win_ep=() win_f=()
@@ -5730,6 +5751,13 @@ _hb_materialize_recurring() {
     # that already fired must never be stamped as skipped.
     if [[ -n "$last_fired" ]] && ! [[ "$last_fired" < "$minute_start" ]]; then
       continue
+    fi
+    # DIVE-6804: an unassigned template gets its owner HERE, before the pace
+    # meter reads the account and before the clone. See _hb_mz_owner.
+    if [[ -z "$assignee" ]]; then
+      assignee=$(_hb_mz_owner "$tid")
+      [[ -n "$assignee" ]] \
+        || _hb_log "[materializer] $(_hb_ident "$tid") has no assignee, and neither its filer nor a coordinator resolves to a seat — the instance will be UNOWNED and nothing wakes it. Fix the template: 5dive task assign $(_hb_ident "$tid") <agent> (DIVE-6804)${slot_tag}"
     fi
     # DIVE-4430 — A PACED WEEK GIVES UP THE BEATS FIRST.
     #
@@ -5854,7 +5882,7 @@ _hb_materialize_recurring() {
       continue
     fi
     if db "INSERT INTO tasks (title, body, priority, assignee, created_by, kind, from_template_id, fresh)
-           SELECT title, body, priority, assignee, created_by, 'standard', id, fresh FROM tasks WHERE id=${tid};
+           SELECT title, body, priority, $(sqlq_or_null "$assignee"), created_by, 'standard', id, fresh FROM tasks WHERE id=${tid};
            UPDATE tasks SET last_fired_at=datetime('now') WHERE id=${tid};" >/dev/null 2>&1; then
       n_made=$((n_made + 1)); _hb_log "[materializer] $(_hb_ident "$tid") fired -> new standard todo${slot_tag}"
     else
