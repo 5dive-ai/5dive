@@ -429,8 +429,8 @@ cmd_task_add() {
   elif [[ "$kind" == "recurring" ]]; then fresh_sql="1"; fi
   # DIVE-333: an unassigned STANDARD task stalls — the heartbeat only wakes an
   # assignee. Default it to the org's coordinator so it always has an owner.
-  # Recurring TEMPLATES stay unassigned (they're inert until materialized; the
-  # instance gets coordinated when it's cloned as a standard task).
+  # Recurring TEMPLATES are owned by their filer instead (DIVE-6804, below the
+  # creator line), and the materializer resolves the owner of any that are not.
   # DIVE-333 + DIVE-484: default an unassigned standard task to a coordinator so
   # the heartbeat can wake an owner. Prefer the PROJECT's own lead_agent; fall
   # back to the org-wide coordinator when the project has none.
@@ -860,6 +860,14 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
   [[ "$_rm_asked" == "rubric" && "$review_mode" == "temp" ]] && review_mode="rubric"
   task_actor_claim "$from"
   local creator="${from:-$ACTOR_BOARD}"
+  # DIVE-6804: a recurring template filed with no --assignee belongs to the seat
+  # that filed it. That is the agent that promised the reminder, and stamping it
+  # here makes `task ls --recurring` show an owner. A filer that is not a seat
+  # (cli, telegram, council) stays unassigned, and _hb_mz_owner falls back to
+  # the coordinator when the template fires.
+  if [[ "$kind" == "recurring" && -z "$assignee" ]] && _task_roster_has "$creator"; then
+    assignee="$creator"
+  fi
   # RECORD BOTH, with the columns the right way round. `created_by` keeps its
   # meaning — who this row is attributed to, which for a uid-less relay principal
   # (`council`, `telegram`) can only ever be the claim. `derived_actor` carries the
