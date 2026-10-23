@@ -2253,3 +2253,7 @@ echo "  0 4 * * * /usr/local/bin/5dive self-update >> /var/log/5dive-self-update
 echo "Fallback: curl -fsSL $REPO/install.sh | sudo bash -s -- --upgrade"
 echo "Full CLI docs: https://5dive.ai/docs/5dive-cli"
 echo "Source: https://github.com/$GH_ORG/5dive"
+
+# DIVE-6781: last thing on screen, so an open-source user finds the phone app.
+# The CLI owns the words (and stays quiet on a 5dive-built or linked box).
+5dive _app_hint 2>/dev/null || true

@@ -46,6 +46,33 @@ _init_note() {
   printf '  %s%s%s\n' "$dim" "$*" "$reset" >&2
 }
 
+# DIVE-6781: the open-source install never told its users the app exists. One
+# block, printed after install.sh and at the end of `5dive init`, in the words of
+# the own-server onboarding mockup (onboarding-selfhost.5dive.ai): "Paste this on
+# your server" → "Your server shows a code" → "Type the code". Commands are the
+# connector repo's own Connect section. Silent where it would be noise: a box
+# 5dive built (provisioning.env, already linked to its owner's account) or a box
+# whose connector is already linked. FIVEDIVE_APP_HINT=0 turns it off.
+cmd_app_hint() {
+  local prov="${APP_HINT_PROVISIONING_ENV:-/etc/5dive/provisioning.env}"
+  local tok="${APP_HINT_CONNECTOR_TOKEN:-/etc/5dive/connectord.env}"
+  [[ "${FIVEDIVE_APP_HINT:-1}" == "0" ]] && return 0
+  [[ -f "$prov" ]] && return 0
+  if [[ -s "$tok" ]] && grep -q '^CONNECTORD_TOKEN=.' "$tok" 2>/dev/null; then
+    return 0
+  fi
+  cat <<'HINT'
+
+Talk to your agents from your phone, free:
+  1. Paste this on your server:
+       curl -4 -sSL https://api.5dive.com/connector/install.sh | sudo bash
+       sudo 5dive-connector connect
+  2. Your server shows a code.
+  3. Type the code at https://5dive.app
+
+HINT
+}
+
 _init_warn() {
   local amber="" reset=""
   _init_color_enabled && { amber=$'\033[38;5;214m'; reset=$'\033[0m'; }
@@ -726,4 +753,6 @@ TEAMS
     5dive doctor
 
 MANAGE
+
+  cmd_app_hint >&2
 }

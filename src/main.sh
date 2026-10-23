@@ -1703,6 +1703,10 @@ main() {
       # → "send hello". Calls back into the same CLI for each step.
       AUDIT_CMD="init"; AUDIT_ARGS=("$@")
       cmd_init "$@" ;;
+    _app_hint)
+      # DIVE-6781: hidden, read-only. install.sh prints the phone-app block
+      # through this, so the installer and `init` share one copy of the words.
+      cmd_app_hint ;;
     company)
       # OSS-34: onboarding-wizard sugar for a self-steering company. Thin macro
       # over project + objective (+ goal) — shells back into those commands; no
