@@ -22,8 +22,6 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-<img src="docs/readme-app.png" alt="Chatting with an agent in the 5dive app" width="220" align="right">
-
 **Talk to your agents from your phone, free.** Paste this on your server:
 
 ```sh
@@ -33,7 +31,7 @@ sudo 5dive-connector connect
 
 Your server shows a code. Type it at **[5dive.app](https://5dive.app)**. `5dive-connector about` shows what it can and can't do on your server.
 
-<br clear="right">
+<p align="center"><img src="docs/readme-app.png" alt="Chatting with an agent in the 5dive app" width="260"></p>
 
 5dive runs CLI agents like Claude Code, Codex, OpenClaw, Hermes, Antigravity, Grok, OpenCode and Pi as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent runs as its own Linux user, with permissions you choose.
 
