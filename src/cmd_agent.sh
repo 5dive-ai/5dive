@@ -1646,9 +1646,11 @@ cmd_agent_heal_effort() {
 cmd_agent_float_models() {
   [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _float_models takes no arguments"
   require_root
-  local reg name rec profile home file cur model fam ids out own tmp a moved=0 failed=0
+  local reg rows name rec profile home file cur model fam ids out own tmp a moved=0 failed=0
   reg=$(registry_read)
   a=$(models_json)
+  rows=$(jq -r '.agents // {} | to_entries[] | select((.value.type // "claude") == "claude")
+                | [.key, (.value.modelFamily // ""), (.value.authProfile // "")] | join("|")' <<<"$reg")
   while IFS='|' read -r name rec profile; do
     [[ -n "$name" ]] || continue
     home="${AGENT_HOME_ROOT:-/home}/agent-${name}"
@@ -1671,8 +1673,7 @@ cmd_agent_float_models() {
     chmod 600 "$tmp"
     mv -f "$tmp" "$file"
     moved=$((moved + 1))
-  done < <(jq -r '.agents // {} | to_entries[] | select((.value.type // "claude") == "claude")
-                  | [.key, (.value.modelFamily // ""), (.value.authProfile // "")] | join("|")' <<<"$reg")
+  done <<<"$rows"
   (( failed == 0 )) || { warn "model float failed for $failed agent(s)"; return 1; }
   ok "moved $moved agent(s) onto their model family alias"
 }

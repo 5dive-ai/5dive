@@ -66,13 +66,15 @@ model_previous() {
 # id is exactly <model>; empty otherwise (a bare alias, a vendor slug, an id
 # nobody here ever pinned).
 model_default_family() {
-  local m="${1:-}" fam
+  local m="${1:-}" fam fams ids
   [[ "$m" == claude-* ]] || return 0
+  fams=$(model_families)
   while read -r fam; do
-    if [[ "$m" == "$(model_latest "$fam")" ]] || model_previous "$fam" | grep -qxF -- "$m"; then
+    ids=$(model_latest "$fam")$'\n'$(model_previous "$fam")
+    if grep -qxF -- "$m" <<<"$ids"; then
       printf '%s' "$fam"; return 0
     fi
-  done < <(model_families)
+  done <<<"$fams"
 }
 
 # The BYO `anthropic` default pins (src/header.sh, DIVE-1103) follow the

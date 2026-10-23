@@ -94,9 +94,11 @@ is "a chosen id is not a default" "$(model_default_family claude-sonnet-4-5)"  "
 is "a bare alias is not a default" "$(model_default_family sonnet)"            ""
 is "a vendor slug is not a default" "$(model_default_family anthropic/claude-sonnet-5.5)" ""
 both=""
+fams=$(model_families)
 while read -r fam; do
-  model_previous "$fam" | grep -qxF -- "$(model_latest "$fam")" && both+="$fam "
-done < <(model_families)
+  ids=$(model_previous "$fam")
+  grep -qxF -- "$(model_latest "$fam")" <<<"$ids" && both+="$fam "
+done <<<"$fams"
 is "no current id is also listed as previous" "$both" ""
 declare -A HERMES_PROVIDER_MODEL=() OPENCLAW_PROVIDER_MODEL=()
 # shellcheck disable=SC1091
