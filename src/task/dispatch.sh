@@ -69,7 +69,10 @@ _task_usage() {
       [--customer] [--already-blocked=<what it blocked>]   escapes for the internal-filing cap
       [--held-by=<id|DIVE-N>]                   born blocked behind that row, in the same write
                                                 (no tick can start it first); freed when it closes
-      [--park=<why> --park-wake=<+Nh|+Nd>]      born parked, same write (DIVE-5729)
+      [--park=<why> --park-wake=<when> [--tz=<zone>]]   born parked, same write (DIVE-5729);
+                                                unparks at <when>: +Nm, +Nh, +Nd, or 'YYYY-MM-DD HH:MM'
+                                                read in --tz (default the box's zone). A one-off
+                                                reminder is this, never a --recurring (DIVE-6807)
       [--tell-me]                               you promised your owner a ping: you are woken ONCE
                                                 when this row is done or cancelled, whoever closes
                                                 it. Opt-in only; no flag, no wake (DIVE-5852)
@@ -150,7 +153,7 @@ _task_usage() {
 
   block <id> --by=<id>                          add a blocks edge
   unblock <id> [--by=<id>]                      drop edge(s); back to todo if clear
-  park <id> --reason="..." --wake=<date|+Nd>    quiet timed wait; auto-unparks at --wake
+  park <id> --reason="..." --wake=<date|+Nm|+Nh|+Nd>   quiet timed wait; auto-unparks at --wake (a date is UTC)
   unpark <id>                                   clear a park early
   escalate <id> [--from=<who>]                  bump priority a tier, ping the owner
   followup <id> --text="..." [--from=<who>]     the owner's follow-up: append it to the

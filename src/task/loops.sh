@@ -2176,7 +2176,7 @@ cmd_task_park() {
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task park <id|DIVE-N> --reason=<why / what unblocks it> --wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh>"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task park <id|DIVE-N> --reason=<why / what unblocks it> --wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh|+Nm>"
   # DIVE-1357: a park is anchor #3 for a 'blocked' task, and an anchor MUST carry
   # a revisit or it silently becomes the block graveyard DIVE-1355 has to sweep.
   # Require BOTH a --reason (why it's held / what unblocks it) and a --wake (when
@@ -2207,16 +2207,9 @@ cmd_task_park() {
   local wake_sql="NULL"
   if [[ -n "$wake" ]]; then
     local wake_ts=""
-    case "$wake" in
-      +*d) local _n="${wake#+}"; _n="${_n%d}"
-           [[ "$_n" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "bad --wake '$wake' (use +Nd, +Nh, or 'YYYY-MM-DD[ HH:MM]')"
-           wake_ts=$(db "SELECT datetime('now', '+${_n} days');") ;;
-      +*h) local _n="${wake#+}"; _n="${_n%h}"
-           [[ "$_n" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "bad --wake '$wake' (use +Nd, +Nh, or 'YYYY-MM-DD[ HH:MM]')"
-           wake_ts=$(db "SELECT datetime('now', '+${_n} hours');") ;;
-      *)   wake_ts=$(db "SELECT datetime($(sqlq "$wake"));")
-           [[ -n "$wake_ts" ]] || fail "$E_VALIDATION" "bad --wake '$wake' (use +Nd, +Nh, or 'YYYY-MM-DD[ HH:MM]')" ;;
-    esac
+    # DIVE-6807: the shared grammar, which adds +Nm; a date stays UTC here.
+    wake_ts=$(_task_wake_resolve "$wake" "") || wake_ts=""
+    [[ -n "$wake_ts" ]] || fail "$E_VALIDATION" "bad --wake '$wake' (use +Nm, +Nh, +Nd, or 'YYYY-MM-DD[ HH:MM]' UTC)"
     wake_sql=$(sqlq "$wake_ts")
   fi
   # DIVE-2119: park retires a gate too (an ANSWERED one — a live gate is refused
