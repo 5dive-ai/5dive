@@ -3,7 +3,7 @@
 #
 # Every hire asking for "sonnet" or "haiku" was pinned at birth to the id
 # model_latest held that day, and the catalogue missed the 5.5 releases for a
-# week: OINOA seats were still on claude-sonnet-5. Two halves are graded here:
+# week: a partner's seats were still on claude-sonnet-5. Two halves are graded here:
 #   1. the create path lands on the current id with the effort it asked for
 #      (the REAL preseed_claude_agent, stubbed at its writes);
 #   2. `agent _float_models` (run by every self-update) moves a booted seat on a
@@ -74,7 +74,7 @@ seat() {  # seat <name> <booted 0|1> <settings json>
 }
 S() { cat "$AGENT_HOME_ROOT/agent-$1/.claude/settings.json"; }
 same() { cmp -s "$TMP/$1.before" "$AGENT_HOME_ROOT/agent-$1/.claude/settings.json" && echo same || echo changed; }
-seat oinoa   1 '{"model":"claude-sonnet-5","effortLevel":"high","x":1}'
+seat pinned   1 '{"model":"claude-sonnet-5","effortLevel":"high","x":1}'
 seat acct    1 '{"model":"claude-sonnet-5","effortLevel":"high"}'
 seat orseat  1 '{"model":"claude-sonnet-5","effortLevel":"high"}'
 seat fresh   0 "{\"model\":\"$SONNET\",\"effortLevel\":\"high\"}"
@@ -85,7 +85,7 @@ seat famdiff 1 '{"model":"claude-sonnet-5","effortLevel":"high"}'
 seat floats  1 '{"model":"sonnet","effortLevel":"high"}'
 seat codex   1 '{"model":"claude-sonnet-5"}'
 registry_read() { jq -n '{agents:{
-  oinoa:{type:"claude"}, acct:{type:"claude",authProfile:"claude-acct",modelFamily:"sonnet"},
+  pinned:{type:"claude"}, acct:{type:"claude",authProfile:"claude-acct",modelFamily:"sonnet"},
   orseat:{type:"claude",authProfile:"or-acct"}, fresh:{type:"claude"}, chosen:{type:"claude"},
   haiku:{type:"claude"}, newhire:{type:"claude",modelFamily:"sonnet"},
   famdiff:{type:"claude",modelFamily:"opus"}, floats:{type:"claude"}, codex:{type:"codex"}}}'; }
@@ -94,11 +94,11 @@ first=$msg
 ok()  { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
 is "exits 0"                         "$rc" "0"
 is "count reported"                  "$first" "moved 4 agent(s) onto their model family alias"
-is "sonnet-5 seat floats"            "$(S oinoa | jq -r .model)" "sonnet"
-is "...at the level it ran at (id key)"    "$(S oinoa | jq -r --arg s "$SONNET" '.modelSettings[$s].effortLevel')" "high"
-is "...and under the alias key"      "$(S oinoa | jq -r '.modelSettings.sonnet.effortLevel')" "high"
-is "...top-level and other keys kept" "$(S oinoa | jq -c '[.effortLevel, .x]')" '["high",1]'
-is "...and what Claude Code reads is high" "$(S oinoa | jq -r --argjson a "$(models_json)" "$MODEL_EFFORT_JQ"'effective_effort($a)')" "high"
+is "sonnet-5 seat floats"            "$(S pinned | jq -r .model)" "sonnet"
+is "...at the level it ran at (id key)"    "$(S pinned | jq -r --arg s "$SONNET" '.modelSettings[$s].effortLevel')" "high"
+is "...and under the alias key"      "$(S pinned | jq -r '.modelSettings.sonnet.effortLevel')" "high"
+is "...top-level and other keys kept" "$(S pinned | jq -c '[.effortLevel, .x]')" '["high",1]'
+is "...and what Claude Code reads is high" "$(S pinned | jq -r --argjson a "$(models_json)" "$MODEL_EFFORT_JQ"'effective_effort($a)')" "high"
 is "Anthropic profile seat floats"   "$(S acct | jq -r .model)" "sonnet"
 is "OpenRouter-mapped seat untouched" "$(same orseat)" "same"
 is "never-booted config dir untouched" "$(same fresh)" "same"
@@ -110,14 +110,14 @@ is "...its /effort choice carried to the alias key" "$(S newhire | jq -r '.model
 is "recorded family disagrees: untouched" "$(same famdiff)" "same"
 is "already on the alias: untouched" "$(same floats)" "same"
 is "codex seat untouched"            "$(same codex)" "same"
-is "mode 600 kept"                   "$(stat -c %a "$AGENT_HOME_ROOT/agent-oinoa/.claude/settings.json")" "600"
-for n in oinoa haiku; do cp "$AGENT_HOME_ROOT/agent-$n/.claude/settings.json" "$TMP/$n.before"; done
+is "mode 600 kept"                   "$(stat -c %a "$AGENT_HOME_ROOT/agent-pinned/.claude/settings.json")" "600"
+for n in pinned haiku; do cp "$AGENT_HOME_ROOT/agent-$n/.claude/settings.json" "$TMP/$n.before"; done
 ok() { msg="$*"; }
 cmd_agent_float_models
 second=$msg
 ok()  { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
 is "second pass moves nothing"       "$second" "moved 0 agent(s) onto their model family alias"
-is "second pass does not rewrite"    "$(same oinoa)/$(same haiku)" "same/same"
+is "second pass does not rewrite"    "$(same pinned)/$(same haiku)" "same/same"
 
 echo "== 3. wiring =="
 grep -q '_float_models)' "$ROOT/src/main.sh" && grep -q 'cmd_agent_float_models "\$@"' "$ROOT/src/main.sh" \
