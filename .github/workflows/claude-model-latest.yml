@@ -1,0 +1,70 @@
+name: claude-model-latest
+
+# DIVE-6788: model_latest (src/lib/models.sh) missed the Sonnet 5.5 and Haiku 5.5
+# releases for a week, so every new seat that asked for "sonnet" started on Sonnet 5.
+# Nothing watched it; codex-model-latest.yml watched only the codex id. Once a day,
+# compare each family with the newest plain anthropic/claude-<family>-<version> in
+# OpenRouter's public catalog (keyless), and flag a claude-<name>-<version> whose
+# name is no family of ours. Keep ONE issue open while anything is behind; close it
+# once the table is current. A catalog that cannot be read fails the run instead of
+# reading as "current". "Behind" is an issue and a warning, never a red run: a red
+# check-run on main's tip stops release-cut.yml, which grades every check-run on the
+# sha, so a vendor release would freeze every unrelated release until the bump.
+
+on:
+  schedule:
+    - cron: '47 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare model_latest with the newest Claude per family
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          TITLE='Claude model catalogue is behind the newest release (DIVE-6788)'
+          rc=0
+          out="$(bash scripts/claude-model-latest.sh)" || rc=$?
+          echo "$out"
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::could not compare model_latest with the catalog — see the step log"
+            exit 1
+          fi
+          num="$(gh issue list --state open --limit 50 --json number,title \
+                 --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
+          if [ "$rc" -eq 0 ]; then
+            echo "model_latest is the newest Claude in every family."
+            if [ -n "$num" ]; then
+              gh issue close "$num" --comment "Current again. Closed by claude-model-latest."
+            fi
+            exit 0
+          fi
+          {
+            echo "OpenRouter's catalog lists a newer Claude than \`model_latest\` in \`src/lib/models.sh\`."
+            echo
+            echo '```'
+            echo "$out"
+            echo '```'
+            echo
+            echo "**The bump** is the family's line in \`model_latest()\`, with the old id appended to \`model_previous()\`."
+            echo "OpenRouter's dotted slug is the dashed Anthropic id: anthropic/claude-sonnet-5.5 is claude-sonnet-5-5."
+            echo "A \`new-family\` line needs a new family in \`model_families()\` instead."
+            echo
+            echo "Seats already on the bare alias follow the release without this bump. It matters for a new seat's first boot,"
+            echo "the per-model effort keys, and the BYO anthropic pins. Also bump the API's model setting (lodar/5dive-api src/lib/claude-models.ts)."
+          } > body.md
+          if [ -n "$num" ]; then
+            gh issue edit "$num" --body-file body.md
+          else
+            gh issue create --title "$TITLE" --body-file body.md
+          fi
+          echo "::warning::model_latest is behind the newest Claude"

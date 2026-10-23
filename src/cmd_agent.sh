@@ -885,12 +885,13 @@ def claude_effective_effort(obj):
         v = ms.get(key)
         return v.get("effortLevel") if isinstance(v, dict) and isinstance(v.get("effortLevel"), str) else None
     per_model = None
-    if model:
+    if model and re.fullmatch(r"[a-z]+", model):
+        # Claude Code's own order (DIVE-6788): the resolved id's key, then the
+        # key written under the alias itself.
+        keys = [k for k in ms if k.startswith(f"claude-{model}-") and level(k)]
+        per_model = level(max(keys, key=_model_version_key)) if keys else level(model)
+    elif model:
         per_model = level(model)
-        if per_model is None and re.fullmatch(r"[a-z]+", model):
-            keys = [k for k in ms if k.startswith(f"claude-{model}-") and level(k)]
-            if keys:
-                per_model = level(max(keys, key=_model_version_key))
     return per_model or obj.get("effortLevel") or None
 
 def model_and_effort(name, agent_type):
@@ -1628,6 +1629,52 @@ cmd_agent_heal_effort() {
   done < <(registry_read | jq -r '.agents // {} | to_entries[] | select((.value.type // "claude") == "claude") | .key')
   (( failed == 0 )) || { warn "per-model effort heal failed for $failed agent(s)"; return 1; }
   ok "per-model effort healed on $healed_n agent(s)"
+}
+
+# DIVE-6788: hidden installer migration. A claude seat whose model is one WE
+# pinned (a family's current or previous default, model_default_family) moves to
+# the bare family alias, so it follows every Claude release with no catalogue
+# bump and no per-release heal. Claude Code needs the full id only on a FRESH
+# config dir (DIVE-506, models.sh header), so a seat that has never booted, which
+# Claude Code marks by writing migrationVersion into ~/.claude.json, is skipped
+# until the next pass. Left alone: a full id that is not a known default (its
+# owner chose it), a seat on an alias-mapping account (the account's map decides,
+# DIVE-5163), and a seat whose recorded modelFamily names another family. The
+# level the seat ran at is written under the new keys, or a seat moving off a
+# legacy model would drop to the default effort (DIVE-4863). Idempotent; the
+# self-update fingerprint restarts idle seats onto it.
+cmd_agent_float_models() {
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _float_models takes no arguments"
+  require_root
+  local reg name rec profile home file cur model fam ids out own tmp a moved=0 failed=0
+  reg=$(registry_read)
+  a=$(models_json)
+  while IFS='|' read -r name rec profile; do
+    [[ -n "$name" ]] || continue
+    home="${AGENT_HOME_ROOT:-/home}/agent-${name}"
+    file="$home/.claude/settings.json"
+    [[ -f "$file" ]] || continue
+    jq -e '(.migrationVersion // null) != null' "$home/.claude.json" >/dev/null 2>&1 || continue
+    [[ -z "$profile" || -z "$(profile_env_value "$profile" ANTHROPIC_BASE_URL)" ]] || continue
+    cur=$(cat "$file" 2>/dev/null) || { failed=$((failed + 1)); continue; }
+    model=$(jq -r 'if type == "object" and (.model | type) == "string" then .model else "" end' <<<"$cur" 2>/dev/null) || continue
+    fam=$(model_default_family "$model")
+    [[ -n "$fam" ]] || continue
+    [[ -z "$rec" || "$rec" == "$fam" ]] || continue
+    ids=$(jq -cn --arg id "$(model_latest "$fam")" --arg f "$fam" '[$id, $f]')
+    out=$(jq --arg f "$fam" --argjson ids "$ids" --argjson a "$a" "$MODEL_EFFORT_JQ"'float_model($f; $ids; $a)' <<<"$cur" 2>/dev/null) \
+      || { failed=$((failed + 1)); continue; }
+    own=$(stat -c '%U:%G' "$file")
+    tmp=$(mktemp -p "$(dirname "$file")" .model.XXXXXX) || { failed=$((failed + 1)); continue; }
+    printf '%s\n' "$out" >"$tmp"
+    chown "$own" "$tmp" 2>/dev/null || true
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$file"
+    moved=$((moved + 1))
+  done < <(jq -r '.agents // {} | to_entries[] | select((.value.type // "claude") == "claude")
+                  | [.key, (.value.modelFamily // ""), (.value.authProfile // "")] | join("|")' <<<"$reg")
+  (( failed == 0 )) || { warn "model float failed for $failed agent(s)"; return 1; }
+  ok "moved $moved agent(s) onto their model family alias"
 }
 
 # Atomically replace one document-root Codex TOML string key while preserving

@@ -443,11 +443,14 @@ JSON
   if [[ -x /usr/local/lib/5dive/statusline.sh ]]; then
     status_line_obj='{statusLine: {type: "command", command: "bash /usr/local/lib/5dive/statusline.sh"}}'
   fi
-  # model: the FULL resolved id, NOT the bare "opus" alias. CC v2.1.181 ships a
+  # model: the FULL resolved id, NOT the bare "opus" alias. CC v2.1.181 shipped a
   # one-time startup migration (migrationVersion 13, fires on ANY launch — not
-  # just /config) that STRIPS a bare alias model:"opus" from a FRESH config dir,
+  # just /config) that STRIPPED a bare alias model:"opus" from a FRESH config dir,
   # so a new agent would lose its pin on first boot and fall back to the default
   # model. Valid full ids (claude-opus-5) are left untouched. See DIVE-506.
+  # 2.1.309 no longer strips (DIVE-6788), but the box floor predates the fix, so
+  # the id stays here and `agent _float_models` moves the booted seat to the
+  # alias at the next self-update (models.sh header).
   # DIVE-1883: which id "opus" resolves to lives in src/lib/models.sh — never
   # re-inline a literal here.
   # DIVE-4863: effort goes in BOTH the top-level key and modelSettings.<model> —

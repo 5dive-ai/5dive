@@ -654,7 +654,9 @@ ROTATION_BALANCE_GAP_PCT="${ROTATION_BALANCE_GAP_PCT:-15}"
 ROTATION_BALANCE_FIVE_FLOOR_PCT="${ROTATION_BALANCE_FIVE_FLOOR_PCT:-60}"
 ROTATION_BALANCE_TIE_PCT="${ROTATION_BALANCE_TIE_PCT:-5}"
 ROTATION_BALANCE_SEAT_MIN_SECS="${ROTATION_BALANCE_SEAT_MIN_SECS:-10800}"
-ROTATION_PROBE_MODEL="${ROTATION_PROBE_MODEL:-claude-haiku-4-5}"
+# The probe's model: the current haiku from src/lib/models.sh unless overridden
+# (DIVE-6788). Read when the probe runs, so this file still sources on its own.
+ROTATION_PROBE_MODEL="${ROTATION_PROBE_MODEL:-}"
 
 # The decision, as jq defs, so the production call and the week-long simulation
 # harness (tests/rotation_balance_unit.sh) run the SAME text — a simulator with
@@ -808,7 +810,7 @@ account_probe_headers() {
   tok="${tok%\"}"; tok="${tok#\"}"; tok="${tok%\'}"; tok="${tok#\'}"
   [[ -n "$tok" ]] || return 0
   body=$(mktemp 2>/dev/null) || return 0
-  jq -cn --arg m "$ROTATION_PROBE_MODEL" \
+  jq -cn --arg m "${ROTATION_PROBE_MODEL:-$(model_latest haiku)}" \
     '{model:$m, max_tokens:0,
       system:"You are Claude Code, Anthropic'"'"'s official CLI for Claude.",
       messages:[{role:"user", content:"hi"}]}' >"$body"
