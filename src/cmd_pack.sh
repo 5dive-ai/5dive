@@ -536,7 +536,8 @@ _pack_as_agent() { local u="$1"; shift; runuser -u "$u" -- "$@"; }
 # only reads the stage. +x when the pack ships it executable. Prints the
 # relative paths it restored.
 _pack_skill_backfill() {
-  local name="$1" stage="$2" live="$3" user="agent-$1" rel
+  local name="$1" stage="$2" live="$3" user="agent-$1" rel missing
+  missing=$(_pack_skill_missing "$stage" "$live")
   while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
     _pack_skill_relpath_ok "$rel" || continue
@@ -546,7 +547,7 @@ _pack_skill_backfill() {
          _ "$live/$rel" "$mode" <"$stage/$rel" 2>/dev/null; then
       printf '%s\n' "$rel"
     fi
-  done < <(_pack_skill_missing "$stage" "$live")
+  done <<<"$missing"
 }
 
 # When the importer renames a pack (--as differs from the pack's own name), the
