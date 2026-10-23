@@ -141,15 +141,33 @@ cmd_task_add() {
     [[ "$(db "SELECT CASE WHEN status IN ('done','cancelled') THEN 1 ELSE 0 END FROM tasks WHERE id=${held_by_id};")" == "0" ]] \
       || fail "$E_VALIDATION" "--held-by=${held_by_ident} is already closed — a hold behind it would never be released"
   fi
+  # DIVE-6807: a one-off reminder is ONE parked row that unparks at its minute:
+  # --park-wake=+Nm, or a wall-clock 'YYYY-MM-DD HH:MM' read in --tz (default
+  # the box's zone, the same rule --recurring follows). It used to take only
+  # +Nh|+Nd, so a 10-minute reminder became a once-a-year cron template.
+  local park_wake_ts="" park_wake_tz=""
   if [[ -n "$park_reason" || -n "$park_wake" ]]; then
     [[ -n "$park_reason" && -n "$park_wake" ]] \
-      || fail "$E_USAGE" "--park=<why> and --park-wake=<+Nh|+Nd> go together (a park with no revisit is the block graveyard DIVE-1357 forbids)"
+      || fail "$E_USAGE" "--park=<why> and --park-wake=<when> go together (a park with no revisit is the block graveyard DIVE-1357 forbids)"
     [[ -z "$held_by" ]] || fail "$E_USAGE" "--park and --held-by are two different holds — pick one"
-    case "$park_wake" in
-      +*h) [[ "${park_wake:1:-1}" =~ ^[0-9]+$ ]] && park_wake_sql="datetime('now', '+${park_wake:1:-1} hours')" ;;
-      +*d) [[ "${park_wake:1:-1}" =~ ^[0-9]+$ ]] && park_wake_sql="datetime('now', '+${park_wake:1:-1} days')" ;;
-    esac
-    [[ -n "$park_wake_sql" ]] || fail "$E_VALIDATION" "bad --park-wake '$park_wake' (use +Nh or +Nd)"
+    [[ -z "$recurring" ]] || fail "$E_USAGE" "--park-wake and --recurring are two different clocks — a one-off reminder is --park-wake alone, a repeating one is --recurring alone"
+    if [[ "$park_wake" != +* ]]; then
+      if [[ -n "$sched_tz" ]]; then
+        _task_tz_valid "$sched_tz" \
+          || fail "$E_VALIDATION" "bad --tz '$sched_tz' (an IANA zone this box knows, e.g. Asia/Bangkok, Europe/Berlin or UTC — see 'timedatectl list-timezones')"
+        park_wake_tz="$sched_tz"
+      else
+        park_wake_tz=$(_task_box_tz)
+      fi
+    elif [[ -n "$sched_tz" ]]; then
+      fail "$E_USAGE" "--tz reads a wall-clock --park-wake ('YYYY-MM-DD HH:MM'); '$park_wake' counts from now and has no zone"
+    fi
+    park_wake_ts=$(_task_wake_resolve "$park_wake" "$park_wake_tz") || park_wake_ts=""
+    [[ -n "$park_wake_ts" ]] \
+      || fail "$E_VALIDATION" "bad --park-wake '$park_wake' (use +Nm, +Nh, +Nd, or 'YYYY-MM-DD HH:MM' read in --tz)"
+    [[ "$(db "SELECT CASE WHEN $(sqlq "$park_wake_ts") > datetime('now') THEN 1 ELSE 0 END;")" == "1" ]] \
+      || fail "$E_VALIDATION" "--park-wake '$park_wake'${park_wake_tz:+ (${park_wake_tz})} is ${park_wake_ts} UTC, which is not in the future — check the date and the zone"
+    park_wake_sql=$(sqlq "$park_wake_ts")
   fi
   # DIVE-3107: a flag written AFTER the `--` end-of-flags separator is not a flag
   # at all — it is positional title text, and the parser above accepts it in
@@ -291,8 +309,8 @@ cmd_task_add() {
       sched_tz=$(_task_box_tz)
     fi
     sched_tz_sql=$(sqlq "$sched_tz")
-  elif [[ -n "$sched_tz" ]]; then
-    fail "$E_VALIDATION" "--tz only applies to a recurring TEMPLATE (add --recurring=<cron>); a one-off task has no schedule to read in a zone"
+  elif [[ -n "$sched_tz" && -z "$park_wake_tz" ]]; then
+    fail "$E_VALIDATION" "--tz only applies to a recurring TEMPLATE (add --recurring=<cron>) or a wall-clock --park-wake ('YYYY-MM-DD HH:MM'); this task has no time to read in a zone"
   fi
   # ── DIVE-4430: the maker<->verifier loop is BOUNDED BY DEFAULT ──────────────
   #
@@ -947,7 +965,13 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     2>/dev/null || true
   local hold_note=""
   [[ -n "$held_by_id"  ]] && hold_note=" · HELD until ${held_by_ident} closes (or: 5dive task unblock ${ident})"
-  [[ -n "$park_reason" ]] && hold_note=" · PARKED — ${park_reason}"
+  if [[ -n "$park_reason" ]]; then
+    local _pw_local=""
+    [[ -n "$park_wake_tz" ]] && ! _task_tz_is_utc "$park_wake_tz" \
+      && _pw_local=$(TZ="$park_wake_tz" date -d "${park_wake_ts} UTC" +'%Y-%m-%d %H:%M' 2>/dev/null) \
+      && _pw_local=" = ${_pw_local} ${park_wake_tz}"
+    hold_note=" · PARKED until ${park_wake_ts%:*} UTC${_pw_local} — ${park_reason}"
+  fi
   if [[ "$kind" == "recurring" ]]; then
     ok "created recurring ${ident} (${recurring} ${sched_tz}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title${hold_note}" \
        '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, schedule_tz:$z, fresh:($f=="1")}' \

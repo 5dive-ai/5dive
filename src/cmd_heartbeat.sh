@@ -5696,6 +5696,39 @@ _hb_mz_owner() {
   _task_resolve_coordinator "$_cb" 2>/dev/null || true
 }
 
+# DIVE-6807: does <sched> in <tz> match any minute in (<slot>, <slot> + 1 day]?
+# A template whose days are all '*' always does, without a scan. Otherwise one
+# `date` fork for the 25 local hours the day touches; minutes are tried only in
+# an hour whose day and hour fields match. The zone's offset at each hour start
+# is used for its minutes, so a DST jump inside the day can move the answer by
+# that hour, which a "more than about a day away" rule can afford.
+_hb_mz_matches_within_day() {
+  local sched="$1" tz="$2" slot="$3" k H d m w M lo hi
+  local -a cm=(); read -r -a cm <<<"$sched"
+  (( ${#cm[@]} == 5 )) || return 0
+  [[ "${cm[2]}" == "*" && "${cm[3]}" == "*" && "${cm[4]}" == "*" ]] && return 0
+  _task_tz_is_utc "$tz" && tz="UTC"
+  local slot_min h0
+  slot_min=$(TZ="$tz" date -d "@${slot}" +%M 2>/dev/null) || return 0
+  slot_min=$((10#$slot_min)); h0=$(( slot - slot_min * 60 ))
+  local hour_expr="* ${cm[1]} ${cm[2]} ${cm[3]} ${cm[4]}"
+  k=0
+  while read -r H d m w; do
+    [[ -n "$w" ]] || continue
+    if _cron_matches_fields "$hour_expr" "00 $H $d $m $w"; then
+      lo=0; hi=59
+      (( k == 0 )) && lo=$(( slot_min + 1 ))
+      (( k == 24 )) && hi=$slot_min
+      for (( M = lo; M <= hi; M++ )); do
+        _cron_field_match "${cm[0]}" "$M" && return 0
+      done
+    fi
+    k=$(( k + 1 ))
+  done < <(for (( k = 0; k <= 24; k++ )); do printf '@%s\n' "$(( h0 + k * 3600 ))"; done \
+             | TZ="$tz" date -f - +'%H %d %m %w' 2>/dev/null)
+  return 1
+}
+
 _hb_materialize_recurring() {
   local now="$1" minute_start slot_ep slot_tag _wi tid sched last_fired policy bound assignee open open_read open_rc stamp_err n_made=0
   local -a win_ep=() win_f=()
@@ -5720,7 +5753,8 @@ _hb_materialize_recurring() {
   # fork) and cached here. UTC and NULL keep the win_f fast path above.
   local -A tzwin=()
   local sched_tz _t_ep _t_rep _t_f _t_ex
-  while IFS=$'\x1f' read -r tid sched last_fired policy bound assignee sched_tz; do
+  local last_skipped skip_reason late_slot
+  while IFS=$'\x1f' read -r tid sched last_fired policy bound assignee sched_tz last_skipped skip_reason; do
     [[ -n "$tid" ]] || continue
     # DIVE-5218: the latest minute in the window this template is due in.
     slot_ep=""
@@ -5740,10 +5774,25 @@ _hb_materialize_recurring() {
       _hb_log "[materializer] $(_hb_ident "$tid") schedule zone '${sched_tz}' is not a zone this box knows — NOT evaluated; fix it with '5dive task set-tz $(_hb_ident "$tid") <zone>' (DIVE-5913)"
       continue
     fi
+    # DIVE-6807 — A HELD SLOT WITH NO NEXT SLOT FOR A DAY IS OWED, NOT DROPPED.
+    # DIVE-4430 gives up a held beat because the next one is close. A yearly
+    # reminder's next one is a year away (galina's DIVE-14, 2026-10-23: held at
+    # 13:40Z, the owner never got it), so the hold below writes ", owed <slot>"
+    # into its reason when nothing else matches within a day, and any later
+    # pass the meter admits fires that slot late. Firing (last_fired_at) or any
+    # other stamp clears it; a slot due now always goes first.
+    late_slot=""
+    if [[ -z "$slot_ep" && "$skip_reason" == pace\ * && "$skip_reason" == *", owed "*" UTC"* \
+          && ! "$last_skipped" < "${last_fired:-}" ]]; then
+      late_slot="${skip_reason#*, owed }"; late_slot="${late_slot%% UTC*}"
+      slot_ep=$(date -u -d "${late_slot} UTC" +%s 2>/dev/null) || slot_ep=""
+      [[ -n "$slot_ep" ]] || late_slot=""
+    fi
     [[ -n "$slot_ep" ]] || continue
     minute_start=$(date -u -d "@${slot_ep}" +'%Y-%m-%d %H:%M:00')
     slot_tag=""
     (( slot_ep < now / 60 * 60 )) && slot_tag=" (catch-up: slot ${minute_start%:00} UTC, no pass ran in that minute — DIVE-5218)"
+    [[ -n "$late_slot" ]] && slot_tag=" (late: slot ${late_slot} UTC was held by the pacing floor and no other slot comes within a day — DIVE-6807)"
     # Already fired this slot? (string compare on ISO 'YYYY-MM-DD HH:MM:SS';
     # last_fired >= minute_start means a pass already materialized it at or after
     # the slot's minute -- on time, or by an earlier catch-up.) Asked BEFORE the
@@ -5782,14 +5831,18 @@ _hb_materialize_recurring() {
       _mz_acct=$(jq -r --arg n "${assignee:-}" '.agents[$n].authProfile // ("@self:" + $n)' <<<"$(registry_read)" 2>/dev/null) || _mz_acct=""
       _mz_verdict=$(printf '%s' "${_HB_PACE_USAGE-}" | _pace_band "$_mz_acct" "$now") || _mz_rc=$?
       if (( _mz_rc != 0 )) && ! _pace_admits "$_mz_rc" urgent recurring; then
+        # Still held, still owed: the stamp already says so, nothing to add.
+        [[ -n "$late_slot" ]] && continue
+        local _mz_owed=""
+        _hb_mz_matches_within_day "$sched" "$sched_tz" "$slot_ep" || _mz_owed=", owed ${minute_start%:00} UTC"
         # Best-effort, like the other two stamps: a failed write never changes
         # whether the pass fires anything. The reason is `pace <band> on
         # <account> | <verdict>`: `task ls --recurring` prints the part before
         # ` | ` (an account can itself contain a colon, `@self:<seat>`).
-        stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now'), last_skip_reason=$(sqlq "pace $(_pace_band_name "$_mz_rc") on ${_mz_acct:-<no account>} | ${_mz_verdict#pace: }") WHERE id=${tid};" 2>&1) \
+        stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now'), last_skip_reason=$(sqlq "pace $(_pace_band_name "$_mz_rc") on ${_mz_acct:-<no account>}${_mz_owed} | ${_mz_verdict#pace: }") WHERE id=${tid};" 2>&1) \
           || _hb_log "[materializer] $(_hb_ident "$tid") last_skipped_at stamp FAILED: ${stamp_err//$'\n'/ }" \
           || true
-        _hb_log "[materializer] $(_hb_ident "$tid") slot at ${minute_start} NOT fired — pacing floor $(_pace_band_name "$_mz_rc") on ${_mz_acct:-<no account>} (assignee ${assignee:-<none>}): ${_mz_verdict}. Stamped last_skipped with the pace reason; the next matching slot re-asks the meter (DIVE-4430, DIVE-5364)${slot_tag}"
+        _hb_log "[materializer] $(_hb_ident "$tid") slot at ${minute_start} NOT fired — pacing floor $(_pace_band_name "$_mz_rc") on ${_mz_acct:-<no account>} (assignee ${assignee:-<none>}): ${_mz_verdict}. Stamped last_skipped with the pace reason; $([[ -n "$_mz_owed" ]] && printf 'no other slot comes within a day, so it fires late once the meter allows (DIVE-6807)' || printf 'the next matching slot re-asks the meter (DIVE-4430, DIVE-5364)')${slot_tag}"
         continue
       fi
     fi
@@ -5881,14 +5934,19 @@ _hb_materialize_recurring() {
       _hb_log "[materializer] $(_hb_ident "$tid") due but an open instance exists — skip"
       continue
     fi
+    # DIVE-6807: a fire pays the owed slot, so the marker goes with it (a hold
+    # and a fire can share a second, and the stamps alone cannot order them).
+    local owed_clear_sql=""
+    [[ "$skip_reason" == *", owed "*" UTC"* ]] \
+      && owed_clear_sql=", last_skip_reason=$(sqlq "${skip_reason%%, owed *}${skip_reason#*, owed * UTC}")"
     if db "INSERT INTO tasks (title, body, priority, assignee, created_by, kind, from_template_id, fresh)
            SELECT title, body, priority, $(sqlq_or_null "$assignee"), created_by, 'standard', id, fresh FROM tasks WHERE id=${tid};
-           UPDATE tasks SET last_fired_at=datetime('now') WHERE id=${tid};" >/dev/null 2>&1; then
+           UPDATE tasks SET last_fired_at=datetime('now')${owed_clear_sql} WHERE id=${tid};" >/dev/null 2>&1; then
       n_made=$((n_made + 1)); _hb_log "[materializer] $(_hb_ident "$tid") fired -> new standard todo${slot_tag}"
     else
       _hb_log "[materializer] $(_hb_ident "$tid") insert failed"
     fi
-  done < <(db "SELECT id||x'1f'||schedule||x'1f'||COALESCE(last_fired_at,'')||x'1f'||COALESCE(on_overlap,'skip')||x'1f'||COALESCE(overlap_bound,'')||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(schedule_tz,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL AND status='todo';" 2>/dev/null)
+  done < <(db "SELECT id||x'1f'||schedule||x'1f'||COALESCE(last_fired_at,'')||x'1f'||COALESCE(on_overlap,'skip')||x'1f'||COALESCE(overlap_bound,'')||x'1f'||COALESCE(assignee,'')||x'1f'||COALESCE(schedule_tz,'')||x'1f'||COALESCE(last_skipped_at,'')||x'1f'||COALESCE(last_skip_reason,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL AND status='todo';" 2>/dev/null)
   # DIVE-5218: record this pass's minute for the next pass's catch-up window.
   # Written AFTER the loop: a pass that dies midway leaves the old minute, and
   # the next pass re-asks those slots (the last_fired_at guard stops a re-fire).

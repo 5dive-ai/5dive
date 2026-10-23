@@ -3773,6 +3773,36 @@ _task_box_tz() {
   printf '%s\n' "$tz"
 }
 
+# DIVE-6807: <when> [<tz>] -> the UTC 'YYYY-MM-DD HH:MM:SS' a park wakes at, in
+# the store's own text form. +Nm / +Nh / +Nd count from now. A wall-clock time
+# with a <tz> is read in that zone, so "remind me at 20:38" filed from a Bangkok
+# box wakes at 20:38 Bangkok; with no zone it goes to sqlite as-is (UTC), which
+# is what `task park --wake` has always done. Prints nothing on a bad value.
+_task_wake_resolve() {
+  local when="${1:-}" tz="${2:-}" n="" unit=""
+  case "$when" in
+    +*m) n="${when:1:-1}"; unit=minutes ;;
+    +*h) n="${when:1:-1}"; unit=hours ;;
+    +*d) n="${when:1:-1}"; unit=days ;;
+  esac
+  if [[ -n "$unit" ]]; then
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    db "SELECT datetime('now', '+${n} ${unit}');"
+    return 0
+  fi
+  if [[ -n "$tz" ]] && ! _task_tz_is_utc "$tz"; then
+    # Strict shape first: GNU date reads almost anything ("tomorrow", "20:38"),
+    # and a wake time that parsed as something the filer did not mean is worse
+    # than a refusal.
+    [[ "$when" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[\ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?$ ]] || return 1
+    date -u -d "TZ=\"${tz}\" ${when/T/ }" +'%Y-%m-%d %H:%M:%S' 2>/dev/null
+    return
+  fi
+  local ts; ts=$(db "SELECT datetime($(sqlq "$when"));" 2>/dev/null) || return 1
+  [[ -n "$ts" ]] || return 1
+  printf '%s\n' "$ts"
+}
+
 # +HHMM / -HHMM (date %z) -> seconds east of UTC.
 _cron_tz_off() {
   local z="$1" s

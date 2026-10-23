@@ -682,7 +682,9 @@ printf '%s\n' "$((B + 18000 - 60))" >"$LP"; : >"$LOG"
   _hb_materialize_recurring "$((B + 18065))" )
 k4_lf=$(last_fired_of "$k4"); k4_ls=$(last_skipped_of "$k4")
 k4_why=$(db "SELECT COALESCE(last_skip_reason,'') FROM tasks WHERE id=${k4};")
-if [[ "$(instances_of "$k4")" == "0" && -z "$k4_lf" && -n "$k4_ls" && "$k4_why" == "pace soft on @self:main | acct blind (stub)" ]] \
+k4_slot=$(date -u -d "@$((B + 18000))" +'%Y-%m-%d %H:%M')
+# Its cron is a fixed date, so since DIVE-6807 the hold also says the slot is owed.
+if [[ "$(instances_of "$k4")" == "0" && -z "$k4_lf" && -n "$k4_ls" && "$k4_why" == "pace soft on @self:main, owed ${k4_slot} UTC | acct blind (stub)" ]] \
    && grep -q "NOT fired — pacing floor soft.*Stamped last_skipped with the pace reason.*(catch-up: slot" "$LOG"; then
   ok_t "5364 K4: a paced catch-up slot logs NOT fired, leaves last_fired alone, and stamps last_skipped with the pace reason"
 else
@@ -742,6 +744,103 @@ if [[ "$(instances_of "$k6")" == "1" ]]; then
   ok_t "5218 K6: a multi-minute window fires a template at most once per pass"
 else
   bad_t "5218 K6: a multi-minute window fires a template at most once per pass" "instances=$(instances_of "$k6")"
+fi
+
+# ---------------------------------------------------------------------------
+# K7 — DIVE-6807: A HELD SLOT WITH NO NEXT SLOT FOR A DAY FIRES LATE. galina's
+# yearly owner reminder (DIVE-14, "38 20 23 10 *") had its only slot held by
+# the pacing floor on 2026-10-23 and "the next matching slot" was 2027. Such a
+# hold is now stamped owed, stays quiet while the floor still holds, and fires
+# once on the first pass the meter admits. A daily template keeps DIVE-4430's
+# rule: skip, and the next slot re-asks the meter.
+held_pass() {  # held_pass <now> — one pass with the floor holding every account
+  ( _HB_PACE_USAGE='{}'
+    _pace_band()      { printf 'pace: held (stub)'; return 3; }
+    _pace_admits()    { return 1; }
+    _pace_band_name() { printf 'hard'; }
+    registry_read()   { printf '{"agents":{}}'; }
+    _hb_materialize_recurring "$1" )
+}
+why_of() { db "SELECT COALESCE(last_skip_reason,'') FROM tasks WHERE id=${1};"; }
+S7=$((B + 30000)); s7_hm=$(date -u -d "@${S7}" +'%Y-%m-%d %H:%M')
+k7=$(mk_at "6807 yearly reminder" "$(cron_at "$S7")")
+printf '%s\n' "$((S7 - 60))" >"$LP"; : >"$LOG"
+held_pass "$((S7 + 5))"
+if [[ "$(instances_of "$k7")" == "0" && -z "$(last_fired_of "$k7")" \
+      && "$(why_of "$k7")" == "pace hard on @self:main, owed ${s7_hm} UTC | held (stub)" ]] \
+   && grep -q "fires late once the meter allows (DIVE-6807)" "$LOG"; then
+  ok_t "6807 K7: a held fixed-date slot is not fired and is stamped owed, with its slot"
+else
+  bad_t "6807 K7: a held fixed-date slot is not fired and is stamped owed, with its slot" \
+        "instances=$(instances_of "$k7") reason='$(why_of "$k7")' log=$(cat "$LOG")"
+fi
+k7_row=$(JSON_MODE=0 cmd_task_ls --recurring --all 2>&1 | grep "6807 yearly reminder")
+if [[ "$k7_row" == *"owed ${s7_hm} UTC"* ]]; then
+  ok_t "6807 K7: task ls --recurring shows the owed slot under blocked_by"
+else
+  bad_t "6807 K7: task ls --recurring shows the owed slot under blocked_by" "row=[${k7_row}]"
+fi
+# Still held an hour later: nothing fires and nothing is re-stamped or logged.
+: >"$LOG"
+held_pass "$((S7 + 3600))"
+if [[ "$(instances_of "$k7")" == "0" && "$(why_of "$k7")" == *"owed ${s7_hm} UTC"* ]] && ! grep -q "$(_hb_ident "$k7")" "$LOG"; then
+  ok_t "6807 K7: while the floor still holds, an owed slot stays owed and quiet"
+else
+  bad_t "6807 K7: while the floor still holds, an owed slot stays owed and quiet" "instances=$(instances_of "$k7") log=$(cat "$LOG")"
+fi
+# The band clears two hours after the slot: the owed slot fires, late, once.
+: >"$LOG"
+_hb_materialize_recurring "$((S7 + 7200))"
+if [[ "$(instances_of "$k7")" == "1" && -n "$(last_fired_of "$k7")" && "$(why_of "$k7")" == "pace hard on @self:main | held (stub)" ]] \
+   && grep -q "$(_hb_ident "$k7") fired -> new standard todo (late: slot ${s7_hm} UTC was held by the pacing floor" "$LOG"; then
+  ok_t "6807 K7: once the meter admits, the owed slot fires late and the owed marker is cleared"
+else
+  bad_t "6807 K7: once the meter admits, the owed slot fires late and the owed marker is cleared" \
+        "instances=$(instances_of "$k7") reason='$(why_of "$k7")' log=$(cat "$LOG")"
+fi
+db "UPDATE tasks SET status='done' WHERE from_template_id=${k7};"
+_hb_materialize_recurring "$((S7 + 7260))"
+if [[ "$(instances_of "$k7")" == "1" ]]; then
+  ok_t "6807 K7: a paid owed slot never fires a second time"
+else
+  bad_t "6807 K7: a paid owed slot never fires a second time" "instances=$(instances_of "$k7")"
+fi
+# A DAILY template keeps today's rule: held, not owed, and nothing fires late.
+S7d=$((B + 36000))
+read -r _dM _dH < <(date -u -d "@${S7d}" +'%M %H')
+k7d=$(mk_at "6807 daily beat" "$((10#$_dM)) $((10#$_dH)) * * *")
+printf '%s\n' "$((S7d - 60))" >"$LP"
+held_pass "$((S7d + 5))"
+_hb_materialize_recurring "$((S7d + 7200))"
+if [[ "$(instances_of "$k7d")" == "0" && "$(why_of "$k7d")" == "pace hard on @self:main | held (stub)" ]]; then
+  ok_t "6807 K7: a held daily slot is not owed and does not fire late (the next slot re-asks the meter)"
+else
+  bad_t "6807 K7: a held daily slot is not owed and does not fire late" "instances=$(instances_of "$k7d") reason='$(why_of "$k7d")'"
+fi
+# A fixed date that repeats within the day (twice an hour on it) is not owed:
+# the scan finds its next slot.
+S7r=$((B + 43200))
+read -r _rH _rd _rm < <(date -u -d "@${S7r}" +'%H %d %m')
+k7r=$(mk_at "6807 twice an hour on one date" "0,30 $((10#$_rH)) $((10#$_rd)) $((10#$_rm)) *")
+printf '%s\n' "$((S7r - 60))" >"$LP"
+held_pass "$((S7r + 5))"
+if [[ "$(why_of "$k7r")" == "pace hard on @self:main | held (stub)" ]]; then
+  ok_t "6807 K7: a fixed-date template with another slot within the day is not owed"
+else
+  bad_t "6807 K7: a fixed-date template with another slot within the day is not owed" "reason='$(why_of "$k7r")' sched=$(db "SELECT schedule FROM tasks WHERE id=${k7r};")"
+fi
+# A local-zone yearly reminder (the row's own shape) is owed the same way.
+S7z=$((B + 50400))
+read -r _zM _zH _zd _zm < <(TZ=Asia/Bangkok date -d "@${S7z}" +'%M %H %d %m')
+k7z=$(mk_at "6807 Bangkok yearly reminder" "$((10#$_zM)) $((10#$_zH)) $((10#$_zd)) $((10#$_zm)) *")
+db "UPDATE tasks SET schedule_tz='Asia/Bangkok' WHERE id=${k7z};"
+printf '%s\n' "$((S7z - 60))" >"$LP"
+held_pass "$((S7z + 5))"
+_hb_materialize_recurring "$((S7z + 600))"
+if [[ "$(instances_of "$k7z")" == "1" ]]; then
+  ok_t "6807 K7: a held yearly reminder in a local zone fires late once the floor clears"
+else
+  bad_t "6807 K7: a held yearly reminder in a local zone fires late once the floor clears" "instances=$(instances_of "$k7z") reason='$(why_of "$k7z")'"
 fi
 
 echo "-- ${PASS} passed, ${FAIL} failed --"
