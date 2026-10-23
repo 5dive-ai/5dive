@@ -1710,6 +1710,10 @@ main() {
       # DIVE-6781: hidden, read-only. install.sh prints the phone-app block
       # through this, so the installer and `init` share one copy of the words.
       cmd_app_hint ;;
+    _self_update_hint)
+      # DIVE-6799: hidden, read-only. The last line install.sh prints: nightly
+      # updates are off and recommended. Silent on a managed box or when on.
+      _su_nightly_hint ;;
     company)
       # OSS-34: onboarding-wizard sugar for a self-steering company. Thin macro
       # over project + objective (+ goal) — shells back into those commands; no
@@ -1767,10 +1771,27 @@ main() {
       if _verb_help_wanted "$@"; then
         # Before the root check: asking what a verb does must not need root.
         printf '%s\n' "usage: 5dive self-update     # update the CLI + plugins, then restart agents (root; alias: 5dive update)" \
-                       "       5dive update --check   # read-only: is the CLI behind/stale? (no root)"
+                       "       5dive update --check   # read-only: is the CLI behind/stale? (no root)" \
+                       "       5dive self-update --on|--off   # nightly updates on a self-hosted box (root; off by default)" \
+                       "       5dive self-update --status     # are nightly updates on, and what did the last run do (no root)"
       elif [[ "${1:-}" == "--check" ]]; then
         shift
         cmd_update_check "$@"
+      elif [[ "${1:-}" == "--status" ]]; then
+        # DIVE-6799: read-only, like --check.
+        [[ $# -eq 1 ]] || fail "$E_USAGE" "self-update --status takes no other arguments"
+        _su_nightly_status
+      elif [[ "${1:-}" == "--on" || "${1:-}" == "--off" || "${1:-}" == "--nightly" ]]; then
+        # DIVE-6799: --on/--off install/remove the timer; --nightly is what the
+        # timer runs (no-op unless a tag has run on 5dive's own servers for 24h).
+        [[ $# -eq 1 ]] || fail "$E_USAGE" "self-update $1 takes no other arguments"
+        [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "self-update $1 must run as root (sudo 5dive self-update $1)"
+        AUDIT_CMD="self-update"; AUDIT_ARGS=("$@")
+        case "$1" in
+          --on)  _su_nightly_on ;;
+          --off) _su_nightly_off ;;
+          *)     _su_nightly_run ;;
+        esac
       else
         # On-demand "update everything + reload" for OSS self-hosters with no
         # scheduler: runs install.sh --upgrade (CLI + plugins) then restarts

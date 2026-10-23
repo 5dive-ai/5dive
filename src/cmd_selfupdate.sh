@@ -976,6 +976,221 @@ _hg_rollback_note() {
 }
 # <<< DIVE-4068 post-install health gate
 
+# >>> DIVE-6799 nightly self-update switch
+#     (tests/self_update_nightly_switch_unit.sh extracts this block VERBATIM
+#      between these markers and runs the shipped bytes — keep them.)
+#
+# A self-hosted box gets fixes only when its owner runs `5dive self-update`.
+# lodar 2026-10-23: keep it that way by default, and SAY that nightly updates
+# are recommended. So install.sh installs no timer; `--on` installs one and
+# `--off` removes it. Managed boxes are updated by 5dive-api's update.sh, which
+# runs this same installer, so `--on` refuses there: two schedulers would
+# double-run the upgrade.
+#
+# With it on, two guards hold (main 10-23, both required):
+#   - ONE DAY BEHIND MANAGED. The route serves the managed fleet's tag. A box
+#     takes a tag only after it has seen the route serve that same tag for 24h.
+#     A bad release reaches our boxes first, where we can roll it back; the
+#     rollback moves the route, which resets the clock here. The clock is this
+#     box's own sighting, never the release date: a tag can sit unreleased to
+#     the fleet for days, and the route is the only fleet signal the box can read.
+#   - NO NEW VERSION, NO RESTART. A restart opens a new session and the agent
+#     loses its live chat context, so a run with nothing eligible installs
+#     nothing and restarts nothing. The one exception is a restart an EARLIER
+#     install already owes (a busy agent deferred, DIVE-3173): that is the same
+#     update finishing at the agent's next idle moment, not a new one.
+#
+# The timer fires hourly so the 24h sighting can be measured to the hour, but
+# installs only inside the night window. Restarts go through cmd_self_update's
+# own predicates: only agents whose payload moved, and a busy one is deferred.
+_su_nightly_unit_dir()  { printf '%s\n' "${SELF_UPDATE_UNIT_DIR:-/etc/systemd/system}"; }
+_su_nightly_state_dir() { printf '%s\n' "${SELF_UPDATE_STATE_DIR:-${STATE_DIR:-/var/lib/5dive}/self-update}"; }
+_su_nightly_managed()   { [[ -f "${SELF_UPDATE_PROVISIONING:-/etc/5dive/provisioning.env}" ]]; }
+_su_nightly_is_on()     { [[ -f "$(_su_nightly_unit_dir)/5dive-self-update.timer" ]]; }
+SU_NIGHTLY_LAG_SECS="${SELF_UPDATE_LAG_SECS:-86400}"
+SU_NIGHTLY_WINDOW="${SELF_UPDATE_WINDOW:-1-6}"   # local hours, start inclusive, end exclusive
+SU_NIGHTLY_HINT="Recommended: turn on nightly updates with 5dive self-update --on"
+
+# _su_nightly_kv <file> <key> — one value from a key=value state file.
+_su_nightly_kv() { [[ -r "${1:-}" ]] && sed -n "s/^${2}=//p" "$1" 2>/dev/null | head -n1; return 0; }
+
+# _su_nightly_write <file> <key=value>... — whole-file replace, atomically.
+_su_nightly_write() {
+  local f="$1" tmp; shift
+  mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
+  tmp="${f}.tmp.$$"
+  printf '%s\n' "$@" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null && return 0
+  rm -f "$tmp" 2>/dev/null; return 1
+}
+
+# _su_nightly_decide <route-tag> <installed> <seen-tag> <seen-at> <tried-tag>
+#                    <tried-at> <now> <hour>
+# Pure. Prints one verdict: no-route | current | waiting | outside-window |
+# retry-tomorrow | install. Every reading that is not a clear yes is a no.
+_su_nightly_decide() {
+  local tag="$1" inst="$2" seen="$3" seen_at="$4" tried="$5" tried_at="$6" now="$7" hour="$8"
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'no-route\n'; return 0; }
+  # An unreadable installed version is "unknown", not "older": installing on
+  # it is a guess, and a guess that restarts agents is what this row forbids.
+  [[ "$inst" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || { printf 'current\n'; return 0; }
+  version_lt "${inst%%[-+]*}" "${tag#v}" || { printf 'current\n'; return 0; }
+  [[ "$seen" == "$tag" && "$seen_at" =~ ^[0-9]+$ ]] || { printf 'waiting\n'; return 0; }
+  (( now - seen_at >= SU_NIGHTLY_LAG_SECS )) || { printf 'waiting\n'; return 0; }
+  local ws="${SU_NIGHTLY_WINDOW%-*}" we="${SU_NIGHTLY_WINDOW#*-}"
+  hour=$((10#${hour:-0}))
+  (( hour >= ws && hour < we )) || { printf 'outside-window\n'; return 0; }
+  # One attempt per tag per night: a release that failed here is not retried
+  # every hour until morning.
+  if [[ "$tried" == "$tag" && "$tried_at" =~ ^[0-9]+$ ]] && (( now - tried_at < 12 * 3600 )); then
+    printf 'retry-tomorrow\n'; return 0
+  fi
+  printf 'install\n'
+}
+
+# _su_nightly_hint — the one visible line, printed where updates are off.
+_su_nightly_hint() {
+  [[ "${FIVEDIVE_SELF_UPDATE_HINT:-1}" == "0" ]] && return 0
+  _su_nightly_managed && return 0
+  _su_nightly_is_on && return 0
+  printf '\n%s\n' "$SU_NIGHTLY_HINT"
+}
+
+_su_nightly_on() {
+  if _su_nightly_managed; then
+    fail "$E_CONFLICT" "this box is run by 5dive (it has /etc/5dive/provisioning.env) and already updates every night from 5dive's side — a second schedule here would run every update twice. Nothing changed."
+  fi
+  command -v systemctl >/dev/null 2>&1 || fail "$E_NOT_FOUND" "nightly updates need systemd (systemctl not found)"
+  local d; d="$(_su_nightly_unit_dir)"
+  cat > "$d/5dive-self-update.service" <<'UNIT' || fail "$E_GENERIC" "could not write $d/5dive-self-update.service"
+[Unit]
+Description=5dive nightly self-update (turn off: 5dive self-update --off)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/5dive self-update --nightly
+TimeoutStartSec=3600
+UNIT
+  cat > "$d/5dive-self-update.timer" <<'UNIT' || fail "$E_GENERIC" "could not write $d/5dive-self-update.timer"
+[Unit]
+Description=5dive nightly self-update (turn off: 5dive self-update --off)
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now 5dive-self-update.timer >/dev/null 2>&1 \
+    || warn "the timer was written but systemd would not start it — check 'systemctl status 5dive-self-update.timer'"
+  ok "Nightly updates are on: 5dive updates itself at night, one day after 5dive's own servers, and restarts only agents that are idle. To turn it off: 5dive self-update --off" \
+     '{nightly:"on"}'
+}
+
+_su_nightly_off() {
+  local d; d="$(_su_nightly_unit_dir)"
+  if ! _su_nightly_is_on; then
+    ok "Nightly updates are already off." '{nightly:"off", changed:false}'; return 0
+  fi
+  systemctl disable --now 5dive-self-update.timer >/dev/null 2>&1 || true
+  rm -f "$d/5dive-self-update.timer" "$d/5dive-self-update.service"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  ok "Nightly updates are off. Update by hand with: sudo 5dive self-update" '{nightly:"off", changed:true}'
+}
+
+_su_nightly_status() {
+  local st on=off managed=false last at outcome tag detail seen seen_at
+  st="$(_su_nightly_state_dir)"; last="$st/last"
+  _su_nightly_is_on && on=on
+  _su_nightly_managed && managed=true
+  at="$(_su_nightly_kv "$last" at)"; outcome="$(_su_nightly_kv "$last" outcome)"
+  tag="$(_su_nightly_kv "$last" tag)"; detail="$(_su_nightly_kv "$last" detail)"
+  seen="$(_su_nightly_kv "$st/seen" tag)"; seen_at="$(_su_nightly_kv "$st/seen" at)"
+  local prose
+  if [[ "$managed" == true ]]; then
+    prose="this box is run by 5dive and is updated from 5dive's side"
+  elif [[ "$on" == on ]]; then
+    prose="nightly updates are on"
+  else
+    prose="nightly updates are off ($SU_NIGHTLY_HINT)"
+  fi
+  if [[ -n "$outcome" ]]; then
+    prose+="; last run $(date -u -d "@${at:-0}" +%Y-%m-%dT%H:%MZ 2>/dev/null || printf '%s' "$at"): $outcome${tag:+ $tag}${detail:+ — $detail}"
+  elif [[ "$on" == on ]]; then
+    prose+="; no run yet"
+  fi
+  ok "$prose" \
+     '{nightly:$on, managed:$m, last:(if $o == "" then null else {at:($at|tonumber? // null), outcome:$o, tag:(if $t == "" then null else $t end), detail:(if $d == "" then null else $d end)} end), seen:(if $s == "" then null else {tag:$s, at:($sa|tonumber? // null)} end)}' \
+     --arg on "$on" --argjson m "$managed" --arg o "$outcome" --arg at "$at" --arg t "$tag" --arg d "$detail" --arg s "$seen" --arg sa "$seen_at"
+}
+
+# _su_nightly_run — what the timer runs. Records its verdict for --status
+# whatever it decides, so "it never updated" always has a reason on disk.
+_su_nightly_run() {
+  local st now hour route tag inst seen seen_at tried tried_at verdict
+  st="$(_su_nightly_state_dir)"
+  now="${SELF_UPDATE_NOW:-$(date +%s)}"; hour="${SELF_UPDATE_HOUR:-$(date +%H)}"
+  _su_nightly_record() { _su_nightly_write "$st/last" "at=$now" "outcome=$1" "tag=${2:-}" "detail=${3:-}" || true; }
+  if _su_nightly_managed; then
+    _su_nightly_record managed "" "updated from 5dive's side; this timer does nothing here"
+    ok "managed box — nothing to do" '{verdict:"managed"}'; return 0
+  fi
+  route="${CLI_VERSION_URL:-https://api.5dive.com/cli-version}"
+  tag="$(curl -fsSL --max-time 10 "$route" 2>/dev/null | tr -d '[:space:]')" || tag=""
+  inst="${SELF_UPDATE_INSTALLED:-$FIVE_VERSION}"
+  if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    seen="$(_su_nightly_kv "$st/seen" tag)"; seen_at="$(_su_nightly_kv "$st/seen" at)"
+    if [[ "$seen" != "$tag" ]]; then
+      seen="$tag"; seen_at="$now"
+      _su_nightly_write "$st/seen" "tag=$tag" "at=$now" || warn "could not record the tag sighting in $st — the 24h wait cannot start until it can"
+    fi
+  fi
+  tried="$(_su_nightly_kv "$st/tried" tag)"; tried_at="$(_su_nightly_kv "$st/tried" at)"
+  verdict="$(_su_nightly_decide "$tag" "$inst" "$seen" "$seen_at" "$tried" "$tried_at" "$now" "$hour")"
+
+  # Owed restarts from an earlier install are paid on every run, at the agent's
+  # next idle moment. Nothing new is installed by this, and with no owed
+  # marker it touches nobody.
+  if [[ "$verdict" != install ]]; then
+    _pending_restart_sweep || true
+    local why=""
+    case "$verdict" in
+      no-route)       why="could not read the fleet version from $route" ;;
+      current)        why="already on the newest version 5dive's servers run" ;;
+      waiting)        why="$tag is new on 5dive's servers; this box takes it once it has run there for a day" ;;
+      outside-window) why="$tag is due; it installs during the night" ;;
+      retry-tomorrow) why="installing $tag failed earlier tonight; the box stays on $inst and tries again tomorrow night" ;;
+    esac
+    _su_nightly_record "$verdict" "$tag" "$why"
+    local paid=""
+    (( ${_PR_FIRED:-0} > 0 )) && paid=" (paid ${_PR_FIRED} restart(s) owed by an earlier update)"
+    ok "nothing installed: $why$paid" \
+       '{verdict:$v, tag:(if $t == "" then null else $t end), installed:$i}' --arg v "$verdict" --arg t "$tag" --arg i "$inst"
+    return 0
+  fi
+
+  _su_nightly_write "$st/tried" "tag=$tag" "at=$now" || true
+  # Pin the installer to the tag that passed the 24h test, so a route that
+  # moves mid-run cannot hand this box a tag nobody has run for a day.
+  local pin; pin="$(mktemp)" || { _su_nightly_record failed "$tag" "no temp file"; fail "$E_GENERIC" "failed to create temp file"; }
+  printf '%s\n' "$tag" > "$pin"
+  local rc=0
+  ( CLI_VERSION_URL="file://$pin" cmd_self_update ) || rc=$?
+  rm -f "$pin"
+  if (( rc == 0 )); then
+    _su_nightly_record installed "$tag" "was $inst"
+  else
+    _su_nightly_record failed "$tag" "the update stopped (exit $rc); the box stays on the version it had — see journalctl -u 5dive-self-update"
+    fail "$E_GENERIC" "nightly update to $tag failed (exit $rc); the box keeps the version it had"
+  fi
+}
+# <<< DIVE-6799 nightly self-update switch
+
+
 cmd_self_update() {
   [[ $# -eq 0 ]] || fail "$E_USAGE" "self-update takes no arguments"
   command -v curl >/dev/null 2>&1 || fail "$E_NOT_FOUND" "curl is required for 5dive self-update"
@@ -1305,6 +1520,10 @@ cmd_self_update() {
      '{restarted:$r, restarted_count:($r|length), skipped:$s, skipped_count:($s|length), deferred:$d, deferred_count:($d|length), parked:$pk, parked_count:($pk|length), failed:$f, listener_refreshed:$lr, health_gate:{verdict:$hgv, agent:(if $hgc == "" then null else $hgc end), reason:(if $hgw == "" then null else $hgw end), rollback_point:$hgcap}}' \
      --argjson r "$r" --argjson f "$f" --argjson s "$s" --argjson d "$d" --argjson pk "$pk" --argjson lr "$listener_refreshed" \
      --arg hgv "$hg_verdict" --arg hgc "$hg_canary" --arg hgw "$hg_why" --arg hgcap "$hg_capture"
+  # DIVE-6799: a manual run on a box where nightly updates are off ends with
+  # the same one line the installer ends with. stderr, so JSON stdout parses.
+  # Guarded: harnesses that extract this function alone must still exit 0.
+  ! declare -F _su_nightly_hint >/dev/null || _su_nightly_hint >&2
 }
 
 # version_lt A B — true when semver A is strictly older than B (sort -V).

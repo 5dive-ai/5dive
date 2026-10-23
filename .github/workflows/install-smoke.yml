@@ -196,6 +196,14 @@ jobs:
       - name: Verify CLI is on PATH and reports the expected version
         run: |
           docker run --rm --entrypoint /usr/local/bin/5dive 5dive-smoke --version
+      - name: A fresh install leaves nightly updates OFF and says so (DIVE-6799)
+        run: |
+          if docker run --rm --entrypoint /bin/sh 5dive-smoke -c 'test -e /etc/systemd/system/5dive-self-update.timer'; then
+            echo "ERROR: a fresh install left a nightly self-update timer behind (it must be off by default)"; exit 1
+          fi
+          hint=$(docker run --rm --entrypoint /usr/local/bin/5dive 5dive-smoke _self_update_hint)
+          echo "$hint" | grep -qF 'Recommended: turn on nightly updates with 5dive self-update --on' \
+            || { echo "ERROR: the installer's last line is missing: '$hint'"; exit 1; }
       - name: Verify the bundled version matches src/header.sh
         run: |
           expected=$(grep -oE '^readonly FIVE_VERSION="[^"]+"' src/header.sh | cut -d'"' -f2)
