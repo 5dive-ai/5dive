@@ -323,7 +323,7 @@ out=$(GH_TOKEN="resolved-tok-4282" \
 seed DIVE-912
 unset GH_STUB_FAIL
 out=$(SUDO_STUB_MODE=refused SUDO_USER="" GH_STUB_AUTH_TOKEN="" \
-      cmd_task_done DIVE-912 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
+      cmd_task_done DIVE-912 --result="close under test, on branch dive-912-fix (DIVE-6808: a close naming nothing prints no gate line)" 2>&1); rc=$?
 { [[ $rc -eq 0 ]] && [[ "$out" == *"could not query GitHub"* ]] && [[ "$out" == *"no-gh-token"* ]]; } \
   && ok_t "T12 control: a seat holding NO rail still reads 'could not query GitHub (no-gh-token)'" \
   || bad_t "T12 no-rail wording preserved" "rc=$rc out=$out"
