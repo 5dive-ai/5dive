@@ -196,10 +196,11 @@ fi
 # ------------------------------------------------------------- install.sh arms
 # NEGATIVE CONTROL for the grader: a fresh install must leave no timer. The only
 # place install.sh may NAME the timer is its uninstall block, which removes it.
-if ! grep -nE 'OnCalendar|enable --now 5dive-self-update|self-update --on' install.sh | grep -vE '^[0-9]+:\s*#' | grep -q .; then
+hits="$(grep -nE 'OnCalendar|enable --now 5dive-self-update|self-update --on' install.sh | grep -vE '^[0-9]+:\s*#')"
+if [[ -z $hits ]]; then
   ok_t "install.sh installs no nightly timer (off by default)"
 else
-  bad_t "install.sh creates or enables the nightly timer" "$(grep -nE 'OnCalendar|enable --now 5dive-self-update|self-update --on' install.sh)"
+  bad_t "install.sh creates or enables the nightly timer" "$hits"
 fi
 lastcmd="$(grep -vE '^\s*(#|$)' install.sh | tail -n1)"
 [[ "$lastcmd" == '5dive _self_update_hint 2>/dev/null || true' ]] \
