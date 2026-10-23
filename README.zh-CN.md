@@ -24,6 +24,19 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
+<img src="docs/readme-app.png" alt="在 5dive 应用里和智能体聊天" width="220" align="right">
+
+**在手机上和你的智能体对话，免费。** 在你的服务器上粘贴：
+
+```sh
+curl -4 -sSL https://api.5dive.com/connector/install.sh | sudo bash
+sudo 5dive-connector connect
+```
+
+服务器会显示一个代码，在 **[5dive.app](https://5dive.app)** 输入它即可。 运行 `5dive-connector about` 查看它在你的服务器上能做什么、不能做什么。
+
+<br clear="right">
+
 5dive 把 Claude Code、Codex、OpenClaw、Hermes、Antigravity、Grok、OpenCode、Pi 等命令行智能体作为常驻的 Linux 服务运行。智能体共享任务、互相分派工作，并检查彼此的结果。每个智能体以独立的 Linux 用户身份运行，权限由你设定。
 
 **自托管 · Bash + systemd + SQLite**
