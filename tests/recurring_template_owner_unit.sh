@@ -43,8 +43,8 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 eq_t()  { if [[ "$2" == "$3" ]]; then ok_t "$1"; else bad_t "$1" "want [$3] got [$2]"; fi; }
 has_t() { if [[ "$2" == *"$3"* ]]; then ok_t "$1"; else bad_t "$1" "[$2] lacks [$3]"; fi; }
 
-# The box: three seats, two org roots and no coordinator, like an OINOA client
-# box where several hired agents sit side by side.
+# The box: three seats, two org roots and no coordinator, like a client box
+# where several hired agents sit side by side.
 printf '%s\n' '{"agents":{"galina":{},"maya":{},"main":{}}}' >"$STATE_DIR/agents.json"
 db "INSERT INTO agents_org (name, reports_to, role) VALUES ('galina', NULL, 'assistant'), ('maya', NULL, 'assistant');"
 
