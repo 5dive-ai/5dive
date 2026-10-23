@@ -6411,16 +6411,34 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
     fi
   fi
 
-  local text; text=$(_gate_t renag_head "$route_label")
+  # DIVE-6760: a gate never confirmed delivered (gate_pinged_at NULL) has not been
+  # asked yet — the never-pinged net is its FIRST contact, not a reminder. When
+  # every row is new the message reads as the ask itself; in a mixed batch the
+  # new rows are marked 🆕 so "reminder" is never said about an unasked gate.
+  local _n_new _n_all _all_new=0 _first_ident
+  _n_new=$(db "SELECT COUNT(*) FROM tasks WHERE id IN (${idlist}) AND gate_pinged_at IS NULL;" 2>/dev/null)
+  _n_all=$(db "SELECT COUNT(*) FROM tasks WHERE id IN (${idlist});" 2>/dev/null)
+  [[ "${_n_new:-0}" -gt 0 && "$_n_new" == "$_n_all" ]] && _all_new=1
+  local text
+  if (( _all_new )) && [[ "$_n_all" == 1 ]]; then
+    _first_ident=$(db "SELECT ident FROM tasks WHERE id IN (${idlist});" 2>/dev/null)
+    text=$(_gate_t head "$_first_ident")
+  elif (( _all_new )); then
+    text=$(_gate_t first_head "$_n_all")
+  else
+    text=$(_gate_t renag_head "$route_label")
+  fi
   [[ -n "$_escalated_from" ]] \
     && text+=$'\n'"$(_gate_t escalated "$_escalated_from")"
   local rows='[]' row id ident ntype options recommend gtier ask nonce="" markup="" _mint_n=0 _dlink=""
+  local isnew skey sconn _drop _new_mark
   local -a nonce_ids=() nonce_hashes=()
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
-    IFS=$'\x1f' read -r id ident ntype options recommend gtier ask <<<"$row"
+    IFS=$'\x1f' read -r id ident ntype options recommend gtier isnew skey sconn ask <<<"$row"
     [[ -n "$id" && -n "$ident" ]] || continue
-    text+=$'\n\n'"• [${ident}] $(_gate_t type "$ntype") — ${ask} /task_${id}"
+    _new_mark=""; [[ "$isnew" == 1 ]] && (( ! _all_new )) && _new_mark="🆕 "
+    text+=$'\n\n'"• ${_new_mark}[${ident}] $(_gate_t type "$ntype") — ${ask} /task_${id}"
     # DIVE-4381 iteration 2: the THIRD human-facing gate composer, and the one
     # that best matches this row's motivation — the re-nag is the message a
     # founder reads when a gate has SAT for an hour or a day, which is exactly
@@ -6436,6 +6454,19 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
     [[ -n "$_dlink" ]] && text+=$'\n'"  ${_dlink}"
     [[ -n "$recommend" ]] && text+=$'\n'"  $(_gate_t rec "$recommend")"
     [[ -n "$options" ]] && text+=$'\n'"  $(_gate_t opts_inline "$options")"
+    # DIVE-6760: a secret gate is answered through its one-time link, so the
+    # message that reaches the person must carry one. First contact always mints
+    # (the file-time link reached nobody); a reminder mints only when no link for
+    # the gate is still live, so a link the owner holds is not shadowed by a second.
+    if [[ "$ntype" == secret && -n "$skey" && -n "$sconn" ]] \
+       && { [[ "$isnew" == 1 ]] || ! _secret_drop_live_for "$ident" >/dev/null 2>&1; }; then
+      _drop=$(_task_mint_drop_link "$ident" "$skey" "$sconn")
+      if [[ -n "$_drop" && "$_drop" != ONBOX ]]; then
+        text+=$'\n'"  $(_gate_t secret_link "$ident" "$skey" "${_drop##*|}" "${_drop%%|*}")"
+      else
+        text+=$'\n'"  $(_gate_t secret_app "$ident" "$skey")"
+      fi
+    fi
 
     # DIVE-2356: hard-human TYPE **or** tier>=2 (matches the cmd_task_need mint).
     # This sweep is the rescue path for gates filed BEFORE the widened mint — a
@@ -6457,12 +6488,13 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
     fi
     # `ask` stays LAST so it remains the greedy tail of the `read`; tier is
     # spliced in ahead of it rather than appended after it.
-  done < <(db "SELECT id||x'1f'||ident||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(tier,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
+  done < <(db "SELECT id||x'1f'||ident||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(tier,'')||x'1f'||(gate_pinged_at IS NULL)||x'1f'||COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
                FROM tasks WHERE id IN (${idlist}) ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
 
   local reply_markup=""
   [[ "$rows" != "[]" ]] && reply_markup=$(jq -cn --argjson rows "$rows" '{inline_keyboard:$rows}' 2>/dev/null) || true
-  text+=$'\n\n'"$(_gate_t renag_foot)"
+  if (( _all_new )); then text+=$'\n\n'"$(_gate_t first_foot)"
+  else text+=$'\n\n'"$(_gate_t renag_foot)"; fi
   # DIVE-2073: mark the rail so the delivery row can say which path it is on.
   # This sweep runs as root from cron with no invoking user, so `user` on the row
   # is root and names no agent; without this every :NN:02 delivery is
