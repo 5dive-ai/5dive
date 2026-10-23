@@ -518,16 +518,19 @@ docker exec -it 5dive-demo bash
 
 **Offline / air-gapped.** `install.sh` reads from `$REPO` (default GitHub raw). Override with `REPO=file:///path/to/local/tree` and pre-install apt deps. The fetched files are listed at the top of `install.sh`.
 
-**Updating.** 5dive doesn't auto-update, you stay in control of when code changes land:
+**Updating.** 5dive doesn't auto-update by default, you stay in control of when code changes land:
 ```sh
 sudo 5dive self-update
 ```
-This refreshes the CLI, hooks, skills, and plugins, then restarts each running agent so the new versions load. Want it on a schedule?
-```cron
-0 4 * * * /usr/local/bin/5dive self-update >/dev/null 2>&1
+This refreshes the CLI, hooks, skills, and plugins, then restarts the agents whose plugins, skills or instructions changed (a busy agent waits for its next idle moment). We recommend nightly updates:
+```sh
+sudo 5dive self-update --on       # nightly, off by default
+sudo 5dive self-update --off
+5dive self-update --status        # on or off, and what the last run did
 ```
+With it on, the box takes a version only after 5dive's own servers have run it for a day, installs at night, and restarts nobody on a night with nothing new. Boxes 5dive runs for you are updated from 5dive's side, so `--on` refuses there.
 
-**Context rot.** Long sessions degrade, the daily `self-update` above also restarts agents, giving each a fresh session. Claude-runtime agents keep project memory under `~/.claude/projects/<dir>/memory/` across restarts. Session resets, knowledge stays.
+**Context rot.** Long sessions degrade; a restart gives an agent a fresh session. Claude-runtime agents keep project memory under `~/.claude/projects/<dir>/memory/` across restarts. Session resets, knowledge stays.
 
 ### Requirements
 

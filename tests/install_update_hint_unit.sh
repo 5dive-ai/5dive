@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DIVE-1380: post-install output promotes the supported self-update command,
-# distinguishes managed nightly updates from self-hosted opt-in scheduling,
+# no longer offers a root crontab (DIVE-6799: `self-update --on` replaces it),
 # and preserves the raw installer upgrade as a fallback.
 set -uo pipefail
 
@@ -36,15 +36,13 @@ if grep -Fq 'To upgrade later: sudo 5dive self-update' <<<"$output"; then
 else
   bad_t "primary self-update hint" "$output"
 fi
-if grep -Fq 'Managed hosts already update nightly.' <<<"$output"; then
-  ok_t "managed hosts are told not to duplicate the schedule"
+# DIVE-6799: the pasted-crontab advice is gone — it scheduled a nightly run that
+# restarted agents with no 24h lag. `5dive self-update --on` replaces it, and the
+# installer's last line (5dive _self_update_hint) recommends it.
+if ! grep -Fq '0 4 * * * /usr/local/bin/5dive self-update' <<<"$output"; then
+  ok_t "the root-crontab example is no longer offered"
 else
-  bad_t "managed nightly notice" "$output"
-fi
-if grep -Fq '0 4 * * * /usr/local/bin/5dive self-update' <<<"$output"; then
-  ok_t "self-hosted root-crontab example is offered"
-else
-  bad_t "self-hosted cron hint" "$output"
+  bad_t "crontab advice still printed" "$output"
 fi
 if grep -Fq 'Fallback: curl -fsSL https://example.invalid/5dive/install.sh | sudo bash -s -- --upgrade' <<<"$output"; then
   ok_t "curl installer upgrade remains as fallback"

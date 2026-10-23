@@ -1916,6 +1916,12 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     rm -f "$SYSTEMD_DIR/5dive-agent@.service"
     ok "removed systemd template"
   fi
+  # DIVE-6799: the opt-in nightly update (`5dive self-update --on`).
+  if [[ -f "$SYSTEMD_DIR/5dive-self-update.timer" ]]; then
+    systemctl disable --now 5dive-self-update.timer >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_DIR/5dive-self-update.timer" "$SYSTEMD_DIR/5dive-self-update.service"
+    ok "removed nightly self-update timer"
+  fi
   rm -f /etc/sudoers.d/5dive-agent-list
   systemctl daemon-reload || true
 
@@ -2256,8 +2262,6 @@ echo "  5dive doctor --repair                     # auto-install agent type bina
 echo "  5dive agent create my-agent --type=claude # create your first agent"
 echo
 echo "To upgrade later: sudo 5dive self-update"
-echo "Managed hosts already update nightly. Self-hosted opt-in (root crontab):"
-echo "  0 4 * * * /usr/local/bin/5dive self-update >> /var/log/5dive-self-update.log 2>&1"
 echo "Fallback: curl -fsSL $REPO/install.sh | sudo bash -s -- --upgrade"
 echo "Full CLI docs: https://5dive.ai/docs/5dive-cli"
 echo "Source: https://github.com/$GH_ORG/5dive"
@@ -2265,3 +2269,8 @@ echo "Source: https://github.com/$GH_ORG/5dive"
 # DIVE-6781: last thing on screen, so an open-source user finds the phone app.
 # The CLI owns the words (and stays quiet on a 5dive-built or linked box).
 5dive _app_hint 2>/dev/null || true
+
+# DIVE-6799: and after it, the one line that says updates are off. Auto-update
+# stays OFF on a self-hosted box (lodar 2026-10-23); `--on` turns it on. The CLI
+# owns the words and stays quiet on a 5dive-built box or one already on.
+5dive _self_update_hint 2>/dev/null || true
