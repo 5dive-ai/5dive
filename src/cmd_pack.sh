@@ -151,7 +151,7 @@ _marketplace_fetch_pack() {
   fi
   # Bundled skill bodies (manifest.skills[] names → skills/<id>/SKILL.md), so a
   # pack imports self-contained even if a skill isn't in a published repo.
-  local id
+  local id tree=""
   while IFS= read -r id; do
     [[ -z "$id" ]] && continue
     id="${id##*#}"; id="${id##*/}"
@@ -165,6 +165,10 @@ _marketplace_fetch_pack() {
     skill_target_within "$dl/skills" "$id" || continue
     if curl -fsSL --max-time 20 "$base/$path/skills/$id/SKILL.md" -o "$dl/.probe" 2>/dev/null; then
       mkdir -p "$dl/skills/$id"; mv "$dl/.probe" "$dl/skills/$id/SKILL.md"
+      # DIVE-6796: the rest of the skill — scripts, references/, evals/. Only
+      # SKILL.md used to travel, so mail/mail.py never reached an agent.
+      [[ -n "$tree" ]] || tree=$(_marketplace_tree) || tree="-"
+      [[ "$tree" == "-" ]] || _marketplace_fetch_skill_files "$base" "$path" "$id" "$dl/skills/$id" <<<"$tree"
     fi
   done < <(jq -r '.skills[]? // empty' "$dl/manifest.json" 2>/dev/null)
   rm -f "$dl/.probe"
@@ -184,6 +188,63 @@ _marketplace_fetch_pack() {
   local out; out=$(mktemp --suffix=.tar.gz)
   tar -czf "$out" -C "$dl" . 2>/dev/null || { rm -rf "$dl" "$out"; return 11; }
   rm -rf "$dl"; echo "$out"
+}
+
+# DIVE-6796: a pack skill is a DIRECTORY (SKILL.md + scripts + references/),
+# and raw.githubusercontent cannot list one. The registry's git tree can: one
+# call lists every file with its mode, so nothing has to be named twice in the
+# manifest. Prints "<mode> <path>" per blob; fails (and the fetch falls back to
+# SKILL.md alone, as before) when the tree cannot be read — a rate-limited
+# listing must never fail an import.
+_marketplace_tree_url() {
+  printf 'https://api.github.com/repos/%s/%s/git/trees/main?recursive=1' "$(gh_org)" "$FIVE_MARKETPLACE_REPO"
+}
+_marketplace_tree() {
+  local raw
+  raw=$(curl -fsSL --max-time 20 -H 'Accept: application/vnd.github+json' "$(_marketplace_tree_url)" 2>/dev/null) || return 1
+  jq -er '.tree | type == "array"' >/dev/null 2>&1 <<<"$raw" || return 1
+  jq -r '.tree[] | select(.type == "blob") | "\(.mode) \(.path)"' <<<"$raw"
+}
+
+# Caps on what one skill may bring: the listing is third-party input.
+PACK_SKILL_MAX_FILES=200
+PACK_SKILL_MAX_BYTES=$((5 * 1024 * 1024))
+
+# A path INSIDE a skill dir, from a third-party listing: relative, every segment
+# a plain name (the valid_skill_id class), no dot-only segment, at most 8 deep.
+_pack_skill_relpath_ok() {
+  local rel="$1" seg n=0
+  [[ -n "$rel" && "$rel" != /* && "$rel" != */ ]] || return 1
+  local IFS=/
+  for seg in $rel; do
+    valid_skill_id "$seg" || return 1
+    n=$((n + 1))
+  done
+  (( n <= 8 ))
+}
+
+# _marketplace_fetch_skill_files <base> <pack-path> <id> <dest-dir>  (tree on stdin)
+# Fetch every file of skills/<id>/ but SKILL.md into <dest-dir>, mode 755 for an
+# executable blob. A file that fails a guard or a fetch is skipped, never fatal.
+_marketplace_fetch_skill_files() {
+  local base="$1" path="$2" id="$3" dest="$4" mode p rel n=0
+  local pre="$path/skills/$id/"
+  while read -r mode p; do
+    [[ "$p" == "$pre"* ]] || continue
+    rel="${p#"$pre"}"
+    [[ "$rel" == SKILL.md ]] && continue
+    _pack_skill_relpath_ok "$rel" || continue
+    [[ "$mode" == 100644 || "$mode" == 100755 ]] || continue   # never a link
+    (( ++n > PACK_SKILL_MAX_FILES )) && break
+    skill_target_within "$dest" "$rel" || continue
+    mkdir -p "$(dirname "$dest/$rel")" || continue
+    if curl -fsSL --max-time 20 --max-filesize "$PACK_SKILL_MAX_BYTES" "$base/$p" -o "$dest/$rel" 2>/dev/null; then
+      [[ "$mode" == 100755 ]] && chmod 755 "$dest/$rel" || chmod 644 "$dest/$rel"
+    else
+      rm -f "$dest/$rel"
+    fi
+  done
+  return 0
 }
 
 # DIVE-5114: `agent import --from-url` — download one pack tarball. The link is
@@ -384,6 +445,33 @@ _pack_bundle_verify() {   # _pack_bundle_verify <stage>
   return 0
 }
 
+# DIVE-6796: <srcdir> plus every file <dest> has that <srcdir> lacks, built in a
+# fresh root-owned dir (printed). A reinstall used to `rm -rf` + copy, wiping a
+# script pushed by hand or one a SKILL.md-only pack never had, on every
+# re-import and refresh. Built outside the agent's own dir; only REGULAR files
+# are carried (find does not follow links), each READ AS THE AGENT, so a link
+# swapped in under us can never make root copy out a file the agent could not
+# read itself.
+_pack_skill_merged() {
+  local srcdir="$1" dest="$2" user="$3" merged rel
+  merged=$(mktemp -d) && chmod 755 "$merged" || return 1
+  cp -r "$srcdir/." "$merged/" || { rm -rf "$merged"; return 1; }
+  if [[ -d "$dest" && ! -L "$dest" ]]; then
+    while IFS= read -r -d '' rel; do
+      rel="${rel#./}"
+      _pack_skill_relpath_ok "$rel" || continue
+      [[ -e "$merged/$rel" || -L "$merged/$rel" ]] && continue
+      mkdir -p "$merged/$(dirname "$rel")" || continue
+      if _pack_as_agent "$user" cat "$dest/$rel" >"$merged/$rel" 2>/dev/null; then
+        [[ -x "$dest/$rel" ]] && chmod 755 "$merged/$rel" || chmod 644 "$merged/$rel"
+      else
+        rm -f "$merged/$rel"
+      fi
+    done < <(cd "$dest" && find . -type f -print0 2>/dev/null)
+  fi
+  printf '%s' "$merged"
+}
+
 # Install a bundled skill (a local <dir>/SKILL.md) directly into the agent's
 # skills dir — used on import when the pack carries the skill body.
 _install_bundled_skill() {
@@ -406,10 +494,60 @@ _install_bundled_skill() {
   skill_target_within "$home/$install_dir" "$id" \
     || { warn "refusing bundled skill id '$id' — escapes $install_dir (DIVE-2370)"; return 1; }
   local dest="$home/$install_dir/$id"
-  rm -rf "$dest"; mkdir -p "$home/$install_dir" || return 1
-  cp -r "$srcdir" "$dest" || return 1
+  # DIVE-6796: a reinstall KEEPS a file the bundle lacks (see _pack_skill_merged).
+  local merged; merged=$(_pack_skill_merged "$srcdir" "$dest" "$user") || return 1
+  rm -rf "$dest"; mkdir -p "$home/$install_dir" || { rm -rf "$merged"; return 1; }
+  cp -r "$merged" "$dest" || { rm -rf "$merged"; return 1; }
+  rm -rf "$merged"
   chown -R "${user}:${user}" "$dest" 2>/dev/null || true
   return 0
+}
+
+# DIVE-6796: <live> lacks a file <stage> carries -> those relative paths, one per line.
+_pack_skill_missing() {
+  local stage="$1" live="$2" rel
+  while IFS= read -r -d '' rel; do
+    rel="${rel#./}"
+    [[ -e "$live/$rel" || -L "$live/$rel" ]] || printf '%s\n' "$rel"
+  done < <(cd "$stage" && find . -type f -print0 2>/dev/null)
+  return 0
+}
+
+# 0 when every file <stage> carries that <live> also has is byte-identical —
+# i.e. <live> differs from the pack only by MISSING files (or by extras).
+_pack_skill_same_where_present() {
+  local stage="$1" live="$2" rel
+  while IFS= read -r -d '' rel; do
+    rel="${rel#./}"
+    [[ -e "$live/$rel" || -L "$live/$rel" ]] || continue
+    [[ -f "$live/$rel" && ! -L "$live/$rel" ]] || return 1
+    cmp -s "$stage/$rel" "$live/$rel" || return 1
+  done < <(cd "$stage" && find . -type f -print0 2>/dev/null)
+  return 0
+}
+
+# Run a command as the agent (stub seam for the harnesses).
+_pack_as_agent() { local u="$1"; shift; runuser -u "$u" -- "$@"; }
+
+# _pack_skill_backfill <agent> <stage-skill-dir> <live-skill-dir>
+# Copy-if-missing: write each file <live> lacks, never touch one it has (an
+# owner's edit included). The WRITE runs as the agent, so a link the agent
+# planted in its own skill dir can never steer a root write outside it; root
+# only reads the stage. +x when the pack ships it executable. Prints the
+# relative paths it restored.
+_pack_skill_backfill() {
+  local name="$1" stage="$2" live="$3" user="agent-$1" rel missing
+  missing=$(_pack_skill_missing "$stage" "$live")
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    _pack_skill_relpath_ok "$rel" || continue
+    local mode=644; [[ -x "$stage/$rel" ]] && mode=755
+    # shellcheck disable=SC2016
+    if _pack_as_agent "$user" sh -c 'set -e; if [ -e "$1" ] || [ -L "$1" ]; then exit 3; fi; mkdir -p "$(dirname "$1")"; cat > "$1"; chmod "$2" "$1"' \
+         _ "$live/$rel" "$mode" <"$stage/$rel" 2>/dev/null; then
+      printf '%s\n' "$rel"
+    fi
+  done <<<"$missing"
 }
 
 # When the importer renames a pack (--as differs from the pack's own name), the
@@ -4231,7 +4369,7 @@ _pack_sync_one() {
 
   local type dir; type=$(agent_type "$name" 2>/dev/null) || type=""
   dir="${AGENT_HOME_ROOT:-/home}/agent-${name}/$(skills_install_dir "${type:-claude}")"
-  local -a added=() updated=() unchanged=() drift=() failed=() managed=()
+  local -a added=() updated=() unchanged=() drift=() failed=() managed=() backfilled=()
   local sk pair ssrc id live_sha rec_sha new_sha shas='{}'
   while IFS= read -r sk; do
     [[ -n "$sk" ]] || continue
@@ -4247,12 +4385,32 @@ _pack_sync_one() {
       new_sha=$(_pack_tree_sha "$stage/skills/$id")
       if [[ "$live_sha" == "$new_sha" ]]; then
         unchanged+=("$id"); shas=$(jq -c --arg k "$id" --arg v "$new_sha" '.[$k] = $v' <<<"$shas")
+      elif [[ -n "$live_sha" ]] && _pack_skill_same_where_present "$stage/skills/$id" "$dir/$id"; then
+        # DIVE-6796: every file the agent has matches the pack; it only LACKS
+        # some (agents imported when only SKILL.md travelled). Copy-if-missing,
+        # and no restart: a skill's files are read per call.
+        if [[ -z "$(_pack_skill_missing "$stage/skills/$id" "$dir/$id")" ]]; then
+          unchanged+=("$id")
+        elif (( dry )); then
+          backfilled+=("$id")
+        else
+          _pack_skill_backfill "$name" "$stage/skills/$id" "$dir/$id" >/dev/null
+          [[ -z "$(_pack_skill_missing "$stage/skills/$id" "$dir/$id")" ]] && backfilled+=("$id") || failed+=("$id")
+        fi
+        live_sha=$(_pack_tree_sha "$dir/$id" 2>/dev/null) \
+          && shas=$(jq -c --arg k "$id" --arg v "$live_sha" '.[$k] = $v' <<<"$shas")
       elif [[ -n "$live_sha" && -n "$rec_sha" && "$live_sha" != "$rec_sha" ]]; then
         drift+=("$id")   # edited since the pack installed it — not ours to clobber
+        # DIVE-6796: ...but a file it LACKS is restored; the edit is never touched.
+        if (( ! dry )) && [[ -n "$(_pack_skill_backfill "$name" "$stage/skills/$id" "$dir/$id")" ]]; then
+          backfilled+=("$id")
+        fi
       elif (( dry )); then
         [[ -z "$live_sha" ]] && added+=("$id") || updated+=("$id")
       elif _install_bundled_skill "$name" "$id" "$stage/skills/$id"; then
         [[ -z "$live_sha" ]] && added+=("$id") || updated+=("$id")
+        # The live tree, not the pack's: a reinstall keeps files the pack lacks.
+        new_sha=$(_pack_tree_sha "$dir/$id" 2>/dev/null) || new_sha=""
         shas=$(jq -c --arg k "$id" --arg v "$new_sha" '.[$k] = $v' <<<"$shas")
       else
         failed+=("$id")
@@ -4302,10 +4460,11 @@ _pack_sync_one() {
   res=$(jq -c --argjson a "$(_j "${added[@]+"${added[@]}"}")" --argjson u "$(_j "${updated[@]+"${updated[@]}"}")" \
       --argjson c "$(_j "${unchanged[@]+"${unchanged[@]}"}")" --argjson d "$(_j "${drift[@]+"${drift[@]}"}")" \
       --argjson f "$(_j "${failed[@]+"${failed[@]}"}")" --argjson m "$(_j "${managed[@]+"${managed[@]}"}")" \
+      --argjson b "$(_j "${backfilled[@]+"${backfilled[@]}"}")" \
       --arg r "$restart_note" --argjson dry "$dry" \
       --arg ps "$p_st" --arg cs "$c_st" --argjson mc "$mchanged" \
-      '.status = (if ($f|length) > 0 then "partial" elif (($a|length)+($u|length)+$mc) > 0 then (if $dry == 1 then "would-change" else "changed" end) else "unchanged" end)
-       | .added = $a | .updated = $u | .unchanged = $c | .drift = $d | .failed = $f | .managedElsewhere = $m | .restart = $r
+      '.status = (if ($f|length) > 0 then "partial" elif (($a|length)+($u|length)+($b|length)+$mc) > 0 then (if $dry == 1 then "would-change" else "changed" end) else "unchanged" end)
+       | .added = $a | .updated = $u | .backfilled = $b | .unchanged = $c | .drift = $d | .failed = $f | .managedElsewhere = $m | .restart = $r
        | .persona = {status:$ps}
        | .claudeMd = ({status:(if $cs == "drift-unrecorded" or $cs == "drift-link" then "drift" else $cs end)}
            + (if $cs == "drift" then {reason:"edited since the pack installed it — left alone"}
@@ -4350,6 +4509,7 @@ cmd_pack_sync() {
     (( JSON_MODE )) || step "$(jq -r '"\(.name): \(.status)" + (if .reason then " — \(.reason)" else "" end)
       + (if (.added|length? // 0) > 0 then "; added \(.added|join(","))" else "" end)
       + (if (.updated|length? // 0) > 0 then "; updated \(.updated|join(","))" else "" end)
+      + (if (.backfilled|length? // 0) > 0 then "; restored missing files in \(.backfilled|join(","))" else "" end)
       + (if (.drift|length? // 0) > 0 then "; LEFT (edited since install) \(.drift|join(","))" else "" end)
       + (if (.persona.status // "") | test("^(added|updated|drift)$") then "; persona.yaml \(.persona.status)" else "" end)
       + (if (.claudeMd.status // "") | test("^(updated|baselined|drift)$") then "; CLAUDE.md section \(.claudeMd.status)" + (if .claudeMd.reason then " (\(.claudeMd.reason))" else "" end) else "" end)
