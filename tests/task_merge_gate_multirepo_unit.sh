@@ -384,9 +384,11 @@ clear_fx; unset GH_STUB_AUTH_TOKEN
 seed NOSUBJ-1
 run_done NOSUBJ-1 --result='all good'
 res4=$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='NOSUBJ-1';")
-if [[ $RC -eq 0 && "$res4" == 'all good' && "$OUT" == *UNVERIFIED* ]] \
+# DIVE-6808: and with no rail it does not print the gate either — the audit row is
+# the whole record, and the line was being relayed to box owners as a fault.
+if [[ $RC -eq 0 && "$res4" == 'all good' && "$OUT" != *UNVERIFIED* ]] \
    && grep -q 'reason=no-gh-token' "$AUDIT_CALLS"; then
-  ok_t 'a close that names NO PR is not stamped — nothing was pending verification'
+  ok_t 'a close that names NO PR is not stamped and not announced — nothing was pending verification'
 else
   bad_t 'no-subject close must not be stamped' "rc=$RC result=[$res4] out=$OUT"
 fi

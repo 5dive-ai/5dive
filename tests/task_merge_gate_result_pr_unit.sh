@@ -311,7 +311,9 @@ grep -q "scan_err=" "$AUDIT_CALLS" \
   || bad_t "scan_err on the audit row" "audit=$(cat "$AUDIT_CALLS")"
 : >"$AUDIT_CALLS"
 seed LOUD-2
-GH_STUB_AUTH_TOKEN="" run_done LOUD-2 --result='no pr named'
+# DIVE-6808: the result names a branch, so something IS pending verification —
+# a close naming nothing is quiet on a rail-less seat and would grade nothing here.
+GH_STUB_AUTH_TOKEN="" run_done LOUD-2 --result='work is on branch loud-2-fix'
 [[ "$OUT" == *"no-gh-token"* ]] \
   && ok_t "a missing gh token is named as the reason (the DIVE-1935 root cause)" \
   || bad_t "no-token reason must be named" "out=$OUT"

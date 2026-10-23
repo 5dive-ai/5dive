@@ -2114,7 +2114,23 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       # A timeout on repo A and a rate limit on repo A both read
       # `partial-repo-scan-0-of-11` and are not the same report, which is why the
       # class and the failing repo are in the key and not just the reason.
-      if _gate_notice_due "unverified-scan|$_scan_class|$_scan_why|$_sc_err_slug"; then
+      # DIVE-6808: NOTHING TO VERIFY, NOTHING TO SAY. A seat with no GitHub rail
+      # closing a row that names no repo, no PR and no branch of its own — the
+      # whole of a partner or customer box, whose agents never open a PR — had
+      # this line on every close, and the agents relayed it to the owner as a
+      # fault. The audit row and the standing reading `doctor` prints are
+      # untouched below and above; only the terminal line goes. A row that names
+      # something to verify still prints it, and so does every other class.
+      local _uv_quiet=0 _uv_brs=""
+      if [[ "$_scan_class" == "no-rail" && -z "$_task_slug" ]] && ! _gate_text_names_a_ref "$result
+$_body"; then
+        _uv_brs=$(_gate_branch_refs_from_text "$result
+$_body" "$ident") || _uv_brs=""
+        [[ -n "$_uv_brs" ]] || _uv_quiet=1
+      fi
+      if (( _uv_quiet )); then
+        :
+      elif _gate_notice_due "unverified-scan|$_scan_class|$_scan_why|$_sc_err_slug"; then
         warn "$ident: ${_uv_head} — this close is UNVERIFIED, not verified-clean (DIVE-1935). Instrument: ${_uv_why}. ${_class_says} Grade it with \`5dive task merge-gate-selftest\`; this is a standing condition of the box, so \`5dive doctor --category=creds\` carries it as one finding and further closes with this same reason collapse to one line (DIVE-4619)."
       else
         warn "$ident: close UNVERIFIED (${_scan_why}) — standing condition on this box, unchanged since the notice above; \`5dive doctor --category=creds\` names it (DIVE-4619)."
@@ -2127,6 +2143,7 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       local -a _uv_fields=("$ident" "reason=$_scan_why" "class=$_scan_class" "seat=$(id -un 2>/dev/null || printf '?')")
       [[ -n "$_sc_bad" ]] && _uv_fields+=("invisible=$_sc_bad")
       [[ -n "$_sc_err" ]] && _uv_fields+=("scan_err=${_sc_err_slug}: ${_sc_err}")
+      (( _uv_quiet )) && _uv_fields+=("shown=no-subject")
       _task_store_audit_log "task.merge-gate-unverified" ok 0 -- "${_uv_fields[@]}"
       _mg_unverified="${_mg_unverified:+$_mg_unverified; }repo scan did not complete ($_scan_why)"
     fi

@@ -234,14 +234,16 @@ export SUDO_USER=""
 seed()    { db "INSERT INTO tasks (ident, title, body, status, created_by, assignee)
                   VALUES ('$1','t','','in_progress','main','main');"; }
 reading() { _gate_vis_field "$(_gate_vis_dir)/$(_gate_vis_slugify "$(_gate_vis_seat)").reading" "$1"; }
-close_unbound() {  # <ident> -> OUT, RC
+close_unbound() {  # <ident> [result] -> OUT, RC
   rm -rf "$(_gate_vis_dir)" 2>/dev/null
-  seed "$1"; OUT=$(cmd_task_done "$1" --result='research note' 2>&1); RC=$?
+  seed "$1"; OUT=$(cmd_task_done "$1" --result="${2:-research note}" 2>&1); RC=$?
 }
 
 # T8 — THE FIX: grant present, credential ABSENT, no token, anon declines.
+# DIVE-6808: the close names a branch of its own, so there is something to verify
+# and the warning is owed; T8q below is the same seat closing a row naming nothing.
 set_rails 0 1 1; unset GH_TOKEN BOT_ERR GH_LIST_ERR
-close_unbound N-8
+close_unbound N-8 'work is on branch n-8-fix'
 if [[ $RC -eq 0 && "$OUT" == *"no-gh-rail-for-listing"* && "$OUT" == *"the box owner provisions one"* ]]; then
   ok_t "T8 grant without credential: the close says no rail, and who provisions one"
 else
@@ -253,6 +255,26 @@ fi
 [[ "$(reading class)" == "no-rail" && "$(reading reason)" == "no-gh-rail-for-listing" ]] \
   && ok_t "T8 the standing reading doctor prints records class=no-rail" \
   || bad_t "T8 recorded reading" "class=$(reading class) reason=$(reading reason)"
+
+# T8q (DIVE-6808) — the partner-box shape: no rail, and the row names no PR, repo
+# or branch. Nothing was pending verification, so the close prints nothing about
+# the gate — the agents were relaying that line to the owner as a fault. The
+# standing reading `doctor --category=creds` prints is still written.
+set_rails 0 1 1
+close_unbound N-81
+[[ $RC -eq 0 && "$OUT" != *"UNVERIFIED"* && "$OUT" != *"merge-gate"* ]] \
+  && ok_t "T8q no rail + nothing named: the close says nothing about the merge gate" \
+  || bad_t "T8q a no-subject close still printed the gate" "rc=$RC out=$OUT"
+[[ "$(reading class)" == "no-rail" && "$(reading reason)" == "no-gh-rail-for-listing" ]] \
+  && ok_t "T8q and doctor's standing reading is still recorded" \
+  || bad_t "T8q reading lost" "class=$(reading class) reason=$(reading reason)"
+# T8b (DIVE-6808) — a close that names a PR (here reported on, `--no-pr`) on the
+# same rail-less seat: something was pending verification, so the warning stays.
+rm -rf "$(_gate_vis_dir)" 2>/dev/null; seed N-82
+OUT=$(cmd_task_done N-82 --no-pr --result='reviewed PR #7 and left comments' 2>&1); RC=$?
+[[ $RC -eq 0 && "$OUT" == *"UNVERIFIED"* && "$OUT" == *"no-gh-rail-for-listing"* ]] \
+  && ok_t "T8b no rail + a named PR: the warning is still printed" \
+  || bad_t "T8b a PR-naming close went quiet" "rc=$RC out=$OUT"
 
 # T9 — CONTROL: no grant at all is still no-rail (the pre-fix behaviour, kept).
 set_rails 1 1 1

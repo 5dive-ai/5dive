@@ -328,17 +328,34 @@ grep -q 'dive-2556-handoff.md' <<<"$OUT" \
 
 # 6b: the DIVE-1830 DECLARED-`Branch:` path is a DIFFERENT reader and must be
 # untouched by this change. Asserted structurally rather than inferred from the
-# sibling harness staying green: `_gate_branch_refs_from_text` has exactly TWO
-# callers, both on the unbound auto-detect path, so the bound gate cannot have
-# been widened. If a third caller ever appears, this arm is the tripwire.
+# sibling harness staying green: `_gate_branch_refs_from_text` has exactly THREE
+# callers, none of them the bound gate, so the bound gate cannot have been widened.
+# If a fourth caller ever appears, this arm is the tripwire.
+#   1. status.sh, the auto-detect gate's branch scan   — REFUSE vs accept.
+#   2. loops.sh `_task_verify_merge_binding`           — what a verifier is told to read.
+#   3. status.sh, the DIVE-6808 no-rail quiet test     — PRINT vs stay quiet.
+# THE BIAS, RE-ARGUED FOR CALLER 3. The filter drops artifact-looking refs, and for
+# callers 1-2 that biases toward "no branch here", argued above as the cheaper error.
+# For caller 3 the same drop biases toward QUIET: a no-rail close whose only own-ident
+# token is `dive-N-notes.md` prints no UNVERIFIED line. That is acceptable, and the
+# direction is the same one: (a) a file is not something the merge gate could ever
+# verify (DIVE-3265), so a warning about it would ask for a check that cannot exist;
+# (b) the quiet path drops ONE terminal line only — the audit row (now with
+# `shown=no-subject`), doctor's standing reading and the gate's own unverified note
+# are written exactly as before, so a miss is still on the record; (c) the filter
+# drops a TOKEN, not the close — a real `<ident>-<slug>` branch beside the .md still
+# makes the close loud, the 6a property on the new caller; (d) a PR ref or a repo
+# slug on the row makes it loud before the extractor is ever read. What a miss costs:
+# an extension-less artifact (named under DIVE-3265's uncovered line) reads as a
+# branch and makes the close LOUD, the old behaviour — never quieter than intended.
 # `|| _callers=0` because `grep -c` exits 1 on a zero count — the same unguarded-probe
 # shape this very ticket is about, caught by scripts/unguarded-probe-scan.sh in CI. A
 # bare substitution here would make the arm report "0 call sites" as a crash instead of
 # as the answer it is.
 _callers=$(cat "$SRC/cmd_task.sh" "$SRC"/task/*.sh | grep -cE '^[^#]*_gate_branch_refs_from_text "') || _callers=0
-[[ "$_callers" == "2" ]] \
-  && ok_t 'DIVE-3265 6b: the extractor still has exactly 2 call sites — the declared-`Branch:` gate does not read it and was not widened' \
-  || bad_t 'DIVE-3265 6b: extractor call-site count' "found $_callers call sites, expected 2 — a new caller inherits this filter; re-argue the bias before shipping it"
+[[ "$_callers" == "3" ]] \
+  && ok_t 'DIVE-3265 6b: the extractor still has exactly 3 call sites (auto-detect gate, verify binding, DIVE-6808 quiet test) — the declared-`Branch:` gate does not read it and was not widened' \
+  || bad_t 'DIVE-3265 6b: extractor call-site count' "found $_callers call sites, expected 3 — a new caller inherits this filter; re-argue the bias before shipping it"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

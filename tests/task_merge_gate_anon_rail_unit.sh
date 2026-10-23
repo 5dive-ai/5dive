@@ -329,8 +329,9 @@ run_done A-7 --result='landed'
 # T7 — THE DELIBERATE OMISSION. The fail-OPEN auto-detect scan lists OPEN PRs and
 # reads an empty list as coverage. The anon rail does not serve that listing (it
 # would page differently and turn "I did not see it" into "there is none"), so an
-# unbound close must still report UNVERIFIED — and must say WHY in the language of
-# a missing rail, not of partial coverage.
+# unbound close that names something to verify must still report UNVERIFIED — and
+# must say WHY in the language of a missing rail, not of partial coverage.
+# DIVE-6808: one that names NOTHING (no PR, repo or branch) prints nothing about it.
 # ---------------------------------------------------------------------------
 clear_fx; no_token
 seed A-8
@@ -338,6 +339,11 @@ run_done A-8 --result='research note, nothing shipped'
 [[ $RC -eq 0 && "$(statusof A-8)" == "done" ]] \
   && ok_t 'T7 an unbound close still proceeds (the auto-detect gate stays fail-open)' \
   || bad_t 'T7 fail-open' "rc=$RC out=$OUT"
+[[ "$OUT" != *"UNVERIFIED"* ]] \
+  && ok_t 'T7 DIVE-6808: a close that names nothing to verify says nothing about the gate' \
+  || bad_t 'T7 no-subject close went loud' "out=$OUT"
+seed A-81
+run_done A-81 --result='work is on branch a-81-fix'
 [[ "$OUT" == *"UNVERIFIED"* && "$OUT" == *"no-gh-rail-for-listing"* ]] \
   && ok_t 'T7 and it is labelled a missing rail, not "partial-repo-scan-0-of-N"' \
   || bad_t 'T7 scan label' "out=$OUT"
