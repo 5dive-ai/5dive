@@ -35,7 +35,9 @@ is "[1m] suffix dropped"       "$(model_canonical 'opus[1m]')"      "$OPUS"
 is "full id [1m] dropped"      "$(model_canonical 'claude-opus-5[1m]')" "claude-opus-5"
 is "BYO slug passes through"   "$(model_canonical google/gemini-2.5-pro)" "google/gemini-2.5-pro"
 ids=$(model_effort_ids_json opus)
-is "every family's id is written" "$(jq -c --arg o "$OPUS" --arg s "$SONNET" '[index($o) != null, index($s) != null, length]' <<<"$ids")" "[true,true,$(model_families | wc -l)]"
+is "every family's id is written, plus the alias key" "$(jq -c --arg o "$OPUS" --arg s "$SONNET" '[index($o) != null, index($s) != null, index("opus") != null, length]' <<<"$ids")" "[true,true,true,$(( $(model_families | wc -l) + 1 ))]"
+is "a seat on a full id gets no alias key" "$(model_effort_ids_json "$OPUS" | jq 'index("opus")')" "null"
+is "opus[1m] gets the alias key too" "$(model_effort_ids_json 'opus[1m]' | jq 'index("opus") != null')" "true"
 is "a pinned older claude id is added" "$(model_effort_ids_json claude-opus-5 | jq 'index("claude-opus-5") != null')" "true"
 is "a BYO slug is not a key"   "$(model_effort_ids_json google/gemini-2.5-pro | jq 'map(select(startswith("google"))) | length')" "0"
 
@@ -68,6 +70,8 @@ is "per-model wins"            "$(jq -r --argjson a "$A" "$MODEL_EFFORT_JQ"'effe
 is "falls back to top-level"   "$(jq -r --argjson a "$A" "$MODEL_EFFORT_JQ"'effective_effort($a)' <<<'{"model":"opus","effortLevel":"low"}')" "low"
 is "another model's key ignored" "$(jq -r --argjson a "$A" "$MODEL_EFFORT_JQ"'effective_effort($a)' <<<'{"model":"opus","effortLevel":"low","modelSettings":{"'"$SONNET"'":{"effortLevel":"xhigh"}}}')" "low"
 is "nothing set -> empty"      "$(jq -r --argjson a "$A" "$MODEL_EFFORT_JQ"'effective_effort($a)' <<<'{}')" ""
+is "alias seat: the alias key is read when the id key is absent (DIVE-6788)" "$(jq -r --argjson a "$A" "$MODEL_EFFORT_JQ"'effective_effort($a)' <<<'{"model":"sonnet","effortLevel":"low","modelSettings":{"sonnet":{"effortLevel":"xhigh"}}}')" "xhigh"
+is "alias seat: the id key still wins over the alias key" "$(jq -r --argjson a "$A" "$MODEL_EFFORT_JQ"'effective_effort($a)' <<<'{"model":"sonnet","modelSettings":{"sonnet":{"effortLevel":"xhigh"},"'"$SONNET"'":{"effortLevel":"low"}}}')" "low"
 
 echo "== 5. agent-list shaper (python, env-less helper) =="
 awk '/^def _model_version_key/,/^def model_and_effort/' "$ROOT/src/cmd_agent.sh" | sed '$d' >"$TMP/shaper.py"
@@ -78,6 +82,8 @@ print(claude_effective_effort(json.loads(sys.argv[1])))" "$1"; }
 is "bare alias -> highest-versioned key" "$(py '{"model":"opus","effortLevel":"high","modelSettings":{"claude-opus-5":{"effortLevel":"low"},"claude-opus-5-5":{"effortLevel":"xhigh"}}}')" "xhigh"
 is "exact full id wins"        "$(py '{"model":"claude-opus-5[1m]","effortLevel":"high","modelSettings":{"claude-opus-5":{"effortLevel":"low"},"claude-opus-5-5":{"effortLevel":"xhigh"}}}')" "low"
 is "falls back to top-level"   "$(py '{"model":"opus","effortLevel":"high"}')" "high"
+is "alias key read when no claude-<fam>-* key (DIVE-6788)" "$(py '{"model":"sonnet","effortLevel":"low","modelSettings":{"sonnet":{"effortLevel":"xhigh"}}}')" "xhigh"
+is "an id key wins over the alias key" "$(py '{"model":"sonnet","modelSettings":{"sonnet":{"effortLevel":"xhigh"},"claude-sonnet-5-5":{"effortLevel":"low"}}}')" "low"
 is "malformed modelSettings -> top-level" "$(py '{"model":"opus","effortLevel":"high","modelSettings":"x"}')" "high"
 is "nothing set -> None"       "$(py '{}')" "None"
 

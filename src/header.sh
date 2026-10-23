@@ -936,7 +936,9 @@ declare -A HERMES_PROVIDER_MODEL=(
   # chosen from the INTERSECTION of live and static: the pin then resolves
   # whichever catalog wins at runtime, including with the network down.
   # See DIVE-2628 and community/wiki/a-byo-model-pin-can-only-be-graded-off-ci.md.
-  [anthropic]="claude-sonnet-5"
+  # [anthropic] is set in src/lib/models.sh from model_latest sonnet (DIVE-6788):
+  # hermes resolves it against Anthropic's LIVE list, so the current id is
+  # always there, and a literal here is one more copy of a release to forget.
   [google]="gemini-3.5-flash"
   [deepseek]="deepseek-chat"
   [moonshot]="kimi-k2-turbo-preview"
@@ -987,7 +989,9 @@ declare -A OPENCLAW_PROVIDER_MODEL=(
   # guess. They keep refusing at create until the operator passes --model
   # (DIVE-3130); the wizard's model field for them is DIVE-3183, not this table.
   [openai]="openai/gpt-5.6"
-  [anthropic]="anthropic/claude-sonnet-5"
+  # [anthropic] is "anthropic/<model_latest sonnet>", set in src/lib/models.sh
+  # (DIVE-6788). openclaw spells Anthropic ids with dashes, not OpenRouter's
+  # dots: anthropic/claude-sonnet-5-5 is in 2026.10.6's catalogue.
   [google]="google/gemini-3.5-flash"
   [deepseek]="deepseek/deepseek-chat"
   [moonshot]="moonshot/kimi-k2.6"

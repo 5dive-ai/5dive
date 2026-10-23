@@ -8,16 +8,27 @@
 # A model release should now touch ONE line in model_latest() below.
 #
 # Why the create path resolves aliases to FULL ids instead of writing the bare
-# alias: Claude Code >= 2.1.181 ships a startup migration (migrationVersion 13,
-# fires on ANY launch) that STRIPS a bare `model: "opus"` from a FRESH config
-# dir, so a newly created agent silently loses its pin on first boot and falls
-# back to the default. Full resolved ids are left untouched. See DIVE-506/536.
+# alias: Claude Code >= 2.1.181 shipped a startup migration (migrationVersion 13)
+# that STRIPPED a bare `model: "opus"` from a FRESH config dir, so a newly
+# created agent lost its pin on first boot and fell back to the default
+# (DIVE-506/536). Re-measured 2026-10-23 on 2.1.309 (DIVE-6788): no migration
+# strips a bare alias any more, and Claude Code's own migrations now rewrite old
+# full ids TO the alias (claude-fable-5 -> fable, sonnet-4-5 -> sonnet). The
+# create path keeps the full id anyway: the box floor is 2.1.163, below the
+# version that stripped, and a lost pin falls back to the most expensive model.
 #
-# Note the asymmetry, and preserve it: the nightly heal in 5dive-api
-# scripts/update.sh writes the BARE alias to EXISTING agents on purpose. Their
-# config dir is not fresh, so the migration does not strip it and they float
-# forward to whatever the runtime calls "opus" today. Only the create path needs
-# a resolved id. Do not "unify" the two.
+# The full id does not stay. After a seat's first boot its config dir is no
+# longer fresh, and `agent _float_models` (run by every self-update) rewrites a
+# model that equals a known default, current or previous (model_previous below),
+# to the bare family alias. From then on the seat follows each Claude release
+# with no catalogue bump and no heal (DIVE-6788). A full id that is not a known
+# default was chosen by someone and is left alone, and so is a seat on an
+# alias-mapping account (DIVE-5163, below), whose map already decides.
+#
+# So the catalogue below matters for exactly three things: the first boot of a
+# new seat, the per-model effort keys, and recognising old defaults. A daily
+# check (.github/workflows/claude-model-latest.yml) opens an issue when
+# OpenRouter's catalogue lists a newer Claude than model_latest.
 # ---------------------------------------------------------------------------
 
 # The families we map. Order is display order (`5dive models`).
@@ -29,12 +40,55 @@ model_families() { printf 'opus\nsonnet\nfable\nhaiku\n'; }
 model_latest() {
   case "${1:-}" in
     opus)   printf '%s' "claude-opus-5-5" ;;
-    sonnet) printf '%s' "claude-sonnet-5" ;;
+    sonnet) printf '%s' "claude-sonnet-5-5" ;;
     fable)  printf '%s' "claude-fable-5-1" ;;
-    haiku)  printf '%s' "claude-haiku-4-5-20251001" ;;
+    haiku)  printf '%s' "claude-haiku-5-5" ;;
     *)      return 1 ;;
   esac
 }
+
+# model_previous <family> -> every id model_latest (or the create path before
+# it existed) has pinned for <family>, newest first, one per line. A seat
+# still on one of these was pinned by us, not chosen by its owner, so
+# `agent _float_models` may move it to the family alias. A release that bumps
+# model_latest appends the old id here.
+model_previous() {
+  case "${1:-}" in
+    opus)   printf '%s\n' claude-opus-5 claude-opus-4-8 claude-opus-4-7 ;;
+    sonnet) printf '%s\n' claude-sonnet-5 claude-sonnet-4-6 ;;
+    fable)  printf '%s\n' claude-fable-5 ;;
+    haiku)  printf '%s\n' claude-haiku-4-5-20251001 ;;
+    *)      return 1 ;;
+  esac
+}
+
+# model_default_family <model> -> the family whose current or previous default
+# id is exactly <model>; empty otherwise (a bare alias, a vendor slug, an id
+# nobody here ever pinned).
+model_default_family() {
+  local m="${1:-}" fam fams ids
+  [[ "$m" == claude-* ]] || return 0
+  fams=$(model_families)
+  while read -r fam; do
+    ids=$(model_latest "$fam")$'\n'$(model_previous "$fam")
+    if grep -qxF -- "$m" <<<"$ids"; then
+      printf '%s' "$fam"; return 0
+    fi
+  done <<<"$fams"
+}
+
+# The BYO `anthropic` default pins (src/header.sh, DIVE-1103) follow the
+# catalogue instead of naming a release (DIVE-6788). Both vendor tools take the
+# Anthropic id: hermes reads Anthropic's live model list, and openclaw's own
+# catalogue spells it anthropic/<id> with dashes (claude-sonnet-5-5 measured
+# in openclaw 2026.10.6). header.sh declares the arrays; it is bundled before
+# this file, so the entries are filled here.
+if declare -p HERMES_PROVIDER_MODEL >/dev/null 2>&1; then
+  HERMES_PROVIDER_MODEL["anthropic"]="$(model_latest sonnet)"
+fi
+if declare -p OPENCLAW_PROVIDER_MODEL >/dev/null 2>&1; then
+  OPENCLAW_PROVIDER_MODEL["anthropic"]="anthropic/$(model_latest sonnet)"
+fi
 
 # codex_model_default -> the model a new codex agent starts on when its create
 # names none (DIVE-5503). THE ONE PLACE: `agent create`, `agent import` (pack and
@@ -215,7 +269,11 @@ model_canonical() {
 # model_effort_ids_json [model] -> JSON array of the ids that get a per-model
 # effortLevel: every family's current id — so a later `/model` switch keeps the
 # level — plus the seat's own canonical model when it is a claude-* id the
-# table does not list (a seat pinned to an older model).
+# table does not list (a seat pinned to an older model), plus the seat's bare
+# family alias when that is its model. Claude Code resolves a modelSettings key
+# through its own alias table (an exact id key wins), so the alias key is what
+# carries the level onto the next release before this table knows its id
+# (DIVE-6788, read in the 2.1.309 binary).
 #
 # DIVE-5395: always returns 0 for a list it produced. Every caller reads this as
 # `ids=$(model_effort_ids_json …)` under `set -euo pipefail`, so the status of
@@ -225,13 +283,14 @@ model_canonical() {
 # OpenRouter account since DIVE-5163), and pipefail carried that 1 out: every
 # Mini App hire onto the demo-ai account died right after "persona installed".
 model_effort_ids_json() {
-  local fam id own
-  own=$(model_canonical "${1:-}")
+  local fam id own raw="${1:-}"
+  own=$(model_canonical "$raw")
   {
     while read -r fam; do
       if id=$(model_latest "$fam"); then printf '%s\n' "$id"; fi
     done < <(model_families)
     if [[ "$own" == claude-* ]]; then printf '%s\n' "$own"; fi
+    if model_latest "${raw%%\[*}" >/dev/null; then printf '%s\n' "${raw%%\[*}"; fi
   } | jq -R . | jq -sc 'unique'
 }
 
@@ -241,8 +300,14 @@ model_effort_ids_json() {
 #   heal_effort($ids)       fill ONLY the per-model keys that are missing, from
 #                           the top-level value — never overwrite one, since a
 #                           per-model value is what `/effort` chose last.
+#   float_model($fam; $ids; $a)  set .model to the bare family alias and set
+#                           the per-model keys in $ids to the level the seat
+#                           ran at before the move (DIVE-6788). Overwrites: a
+#                           key for the new id was filled by heal_effort from
+#                           the top-level value, not chosen on that model.
 #   effective_effort($a)    what Claude Code runs: the per-model key for the
-#                           seat's model ($a = models_json), else top-level.
+#                           seat's model ($a = models_json), else the key under
+#                           its bare alias, else top-level.
 # shellcheck disable=SC2016
 MODEL_EFFORT_JQ='
 def _pm_effort: if . == "max" then "xhigh" else . end;
@@ -266,5 +331,15 @@ def _canon_model($a):
   | ($a[$s] // $s);
 def effective_effort($a):
   _canon_model($a) as $k
-  | ((_ms[$k] | if type == "object" then .effortLevel else null end) // .effortLevel // empty);
+  | ((if (.model | type) == "string" then .model else "" end) | sub("\\[[^\\]]*\\]$"; "")) as $s
+  | ((_ms[$k] | if type == "object" then .effortLevel else null end)
+     // (_ms[$s] | if type == "object" then .effortLevel else null end)
+     // .effortLevel // empty);
+def float_model($fam; $ids; $a):
+  ([effective_effort($a)] | first) as $e
+  | .model = $fam
+  | if $e == null then .
+    else .modelSettings = (reduce $ids[] as $id (_ms;
+        .[$id] = ((if (.[$id] | type) == "object" then .[$id] else {} end) + {effortLevel: ($e | _pm_effort)})))
+    end;
 '

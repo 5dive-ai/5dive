@@ -766,6 +766,9 @@ _agent_verb_dispatch() {
         _heal_effort)
           AUDIT_CMD="agent _heal_effort"; AUDIT_ARGS=()
           cmd_agent_heal_effort "$@" ;;
+        _float_models)
+          AUDIT_CMD="agent _float_models"; AUDIT_ARGS=()
+          cmd_agent_float_models "$@" ;;
         # DIVE-4081: hidden installer migration. Refresh managed standard-seat
         # sudoers after a bundle upgrade so existing routed reviewers gain the
         # narrow _task_answer path already rendered for newly-created seats.

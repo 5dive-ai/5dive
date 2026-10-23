@@ -961,6 +961,14 @@ refresh_managed_files() {
      && ! "$BIN_DIR/5dive" agent _heal_effort >/dev/null 2>&1; then
     echo "warn: per-model effort was not healed on every claude seat; those seats run Opus 5.5 at medium until 'sudo 5dive agent _heal_effort' succeeds" >&2
   fi
+  # DIVE-6788: a seat still pinned to a model we pinned (a current or previous
+  # default id) moves to the bare family alias and follows each Claude release
+  # from then on. After the effort heal, so the level it carries is the healed
+  # one. Same guard and same fingerprint restart as the heal above.
+  if grep -q 'cmd_agent_float_models' "$BIN_DIR/5dive" 2>/dev/null \
+     && ! "$BIN_DIR/5dive" agent _float_models >/dev/null 2>&1; then
+    echo "warn: some claude seats are still pinned to an old default model; they move at the next update, or now with 'sudo 5dive agent _float_models'" >&2
+  fi
   # DIVE-4667: mint stable ids for old seats and install the hook immediately;
   # no agent restart is needed because git reads hooksPath on every commit.
   if ! "$BIN_DIR/5dive" agent _reconcile_coauthors; then

@@ -29,7 +29,9 @@ trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
 SRC=src
-for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh cmd_account.sh; do
+# lib/models.sh fills the [anthropic] pin from the catalogue (DIVE-6788); the
+# bundle loads it right after header.sh, so this does too.
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/models.sh cmd_account.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f" 2>/dev/null || { echo "source FAIL: $f"; exit 7; }
 done

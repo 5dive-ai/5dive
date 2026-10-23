@@ -89,7 +89,7 @@ render_model() {                     # mirrors the cmd_pack.sh market-show block
   printf '%s' "$_mdisp"
 }
 is "alias shows both"     "$(render_model opus)"   "opus (currently claude-opus-5-5)"
-is "ward's sonnet"        "$(render_model sonnet)" "sonnet (currently claude-sonnet-5)"
+is "ward's sonnet"        "$(render_model sonnet)" "sonnet (currently claude-sonnet-5-5)"
 is "a pin shows bare"     "$(render_model claude-opus-4-8)" "claude-opus-4-8"
 is "empty renders dash"   "$(render_model '')"     "-"
 grep -q 'resolve_model_alias "$_m"' "$ROOT/src/cmd_pack.sh" \

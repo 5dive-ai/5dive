@@ -489,7 +489,7 @@ USAGE
         # model, so require one here and pin it at create via --model.
         if [[ "$provider" == "openrouter" ]]; then
           _init_note "OpenRouter routes many models; enter the exact model slug."
-          _init_text pi_model "Model (for example anthropic/claude-sonnet-4)"
+          _init_text pi_model "Model (for example deepseek/deepseek-v4.1-flash)"
           [[ -n "$pi_model" ]] || fail "$E_VALIDATION" "openrouter needs a model (none given)"
         fi
         # Defer the key to `agent create` (below) so it takes the SAME wiring
