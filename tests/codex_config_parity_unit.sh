@@ -19,6 +19,7 @@ chmod 640 "$AGENT_HOME_ROOT/agent-seat/.codex/config.toml"
 extract_fn() { awk -v fn="$1" '$0 ~ "^" fn "\\(\\)" {on=1} on {print} on && $0 == "}" {exit}' src/cmd_agent.sh; }
 source <(extract_fn resolve_agent_effort)
 source <(extract_fn resolve_codex_setting)
+source <(extract_fn resolve_codex_live_model)
 source <(extract_fn write_runtime_codex_setting)
 source <(extract_fn write_runtime_effort)
 priv_read() { local _f=$1; shift; "$@"; }
@@ -38,6 +39,19 @@ is table-preserved "$(sed -n '/^\[projects/,/trusted/p' "$AGENT_HOME_ROOT/agent-
 is effort-singleton "$(grep -c '^model_reasoning_effort' "$AGENT_HOME_ROOT/agent-seat/.codex/config.toml")" 1
 is approval-singleton "$(grep -c '^approval_policy' "$AGENT_HOME_ROOT/agent-seat/.codex/config.toml")" 1
 is mode-preserved "$(stat -c %a "$AGENT_HOME_ROOT/agent-seat/.codex/config.toml")" 600
+
+# DIVE-6888: with no model in config.toml, the dispatcher's live thread names it.
+H="$AGENT_HOME_ROOT/agent-seat/.codex/channels/dispatcher/health.json"
+is live-no-dispatcher "$(resolve_codex_live_model seat)" ""
+mkdir -p "$(dirname "$H")"
+printf '%s' '{"threadModel":null,"threadEffort":null,"configuredModel":null}' > "$H"
+is live-no-thread-yet "$(resolve_codex_live_model seat)" ""
+printf '%s' '{"threadModel":"gpt-6-sol","threadEffort":"medium","configuredModel":null}' > "$H"
+is live-model-effort "$(resolve_codex_live_model seat)" "gpt-6-sol|medium"
+printf '%s' '{"threadModel":"gpt-6-sol"}' > "$H"
+is live-model-only "$(resolve_codex_live_model seat)" "gpt-6-sol|"
+printf '%s' 'not json' > "$H"
+is live-garbage "$(resolve_codex_live_model seat)" ""
 
 printf 'codex_config_parity_unit: %d passed, %d failed\n' "$P" "$F"
 (( F == 0 ))
