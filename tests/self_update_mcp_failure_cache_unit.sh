@@ -278,7 +278,7 @@ fi
 # line naming the command carries a backtick or an apostrophe around it, and a
 # real invocation carries neither.
 declare -A PLUGIN_CALLERS=(
-  [5dive-refresh-plugins.sh]=CLEARS
+  [bin/5dive-refresh-plugins.sh]=CLEARS
   [src/lib/plugin_seats.sh]=CLEARS
   [src/lib/agent_setup.sh]=CLEARS
 )
