@@ -2933,23 +2933,26 @@ _create_caller_is_agent() {
   return 0
 }
 
-# _create_demo_ai_key — the demo-ai account's key, or empty. It lives in the
-# account's combined.env (an OpenRouter key in the Anthropic token slot).
+# _create_demo_ai_key [account] — the account's key, or empty; demo-ai's by
+# default. It lives in combined.env (the demo is an OpenRouter key in the
+# Anthropic token slot).
 _create_demo_ai_key() {
-  local f="${AUTH_PROFILES_DIR:-}/${CREATE_DEMO_AI_ACCOUNT}/combined.env"
+  local f="${AUTH_PROFILES_DIR:-}/${1:-$CREATE_DEMO_AI_ACCOUNT}/combined.env"
   [[ -r "$f" ]] || return 0
   grep -E '^(ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENROUTER_API_KEY)=.' "$f" 2>/dev/null | head -n 1 \
     | sed -E 's/^[A-Z_]+=//; s/^["'"'"'](.*)["'"'"']$/\1/' | tr -d ' \r\n'
 }
 
 # _create_uses_demo_ai <profile> <api_key> — rc 0 when the create would run on
-# the demo AI: by naming its account, or by passing its key under another name.
+# the demo AI: by naming its account, by passing its key, or by naming another
+# account the key was saved into first (`agent auth set ... --api-key=-`).
 _create_uses_demo_ai() {
   local profile="${1:-}" key="${2:-}" demo
   [[ "$profile" == "$CREATE_DEMO_AI_ACCOUNT" ]] && return 0
-  [[ -n "$key" ]] || return 1
   demo=$(_create_demo_ai_key)
-  [[ -n "$demo" && "$key" == "$demo" ]]
+  [[ -n "$demo" ]] || return 1
+  [[ -n "$key" && "$key" == "$demo" ]] && return 0
+  [[ -n "$profile" && "$(_create_demo_ai_key "$profile")" == "$demo" ]]
 }
 
 cmd_create() {
