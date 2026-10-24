@@ -894,6 +894,80 @@ printf '%s\n' "$r1" "$r3" "$r4" > "$TMP/rc3-pages.txt"
 [[ -n "${DIVE6727_PAGES_OUT:-}" ]] && cp "$TMP/rc3-pages.txt" "$DIVE6727_PAGES_OUT"
 kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
 
+# --- L16: DIVE-6844 — a saved login: a link with no task, listed by name --------
+# lodar 2026-10-24: "user can see what he saved and remove or set new or rewrite".
+# A saved value is one more secret, in a root-only store no agent reads, added and
+# rewritten only through the one-time link, listed by NAME, removed by name.
+SAVED="$CONNECTORS_DIR/saved.env"
+rm -f "$SAVED"
+out=$(mint --save=linkedin-password); rc=$?; tok=$(tok_of "$out"); h=$(hash_of "$tok")
+[[ $rc -eq 0 && -n "$tok" && "$(jq -r '.data.save' <<<"$out")" == linkedin-password ]] \
+  && grep -qx 'task=' "$SECRET_DROP_DIR/$h" && grep -qx 'save=linkedin-password' "$SECRET_DROP_DIR/$h" \
+  && grep -qx 'key=LINKEDIN_PASSWORD' "$SECRET_DROP_DIR/$h" && grep -qx 'connector=saved' "$SECRET_DROP_DIR/$h" \
+  && ok_t "L16a secret link --save=<name> mints a link bound to no task, writing <NAME> into the saved store" \
+  || bad_t "L16a a task-less save link" "rc=$rc out=$out entry=$(cat "$SECRET_DROP_DIR/$h" 2>/dev/null)"
+bad=""
+for n in LinkedIn 1password a--b trail- 'a b' "$(printf 'x%.0s' $(seq 1 41))"; do
+  mint --save="$n" >/dev/null 2>&1 && bad+="[$n] "
+done
+mint DIVE-11 --save=x >/dev/null 2>&1 && bad+="[task+save] "
+[[ -z "$bad" ]] && ok_t "L16b a name must be lowercase letters, digits and dashes from a letter, <=40; a gate and a save never share a link" \
+  || bad_t "L16b bad names refused" "accepted: $bad"
+PORT6=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+python3 "$TMP/server.py" 127.0.0.1 "$PORT6" "$WRAP" "$SECRET_DROP_DIR" 0 2> "$TMP/server6.log" & SRV_PID=$!
+for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT6/healthz" >/dev/null 2>&1 && break; sleep 0.1; done
+B6="http://127.0.0.1:$PORT6"
+code=$(curl -s -o "$TMP/s1.html" -w '%{http_code}' "$B6/$tok")
+[[ "$code" == 200 ]] && grep -q 'Save <b>linkedin-password</b>' "$TMP/s1.html" && grep -q '<textarea name=value class=secret' "$TMP/s1.html" \
+  && ! grep -q 'needs\|the task' "$TMP/s1.html" \
+  && ok_t "L16c the page says what is saved, by name, with the masked field and no task or agent" \
+  || bad_t "L16c the save page" "code=$code $(sed -n 's#.*<main>\(.*\)</main>.*#\1#p' "$TMP/s1.html" | head -c 400)"
+V1='Pa55-word one'
+code=$(curl -s -o "$TMP/s2.html" -w '%{http_code}' --data-urlencode "value=$V1" "$B6/$tok")
+[[ "$code" == 200 && "$(grep -cxF "LINKEDIN_PASSWORD=$V1" "$SAVED")" == 1 && "$(stat -c %a "$SAVED")" == 600 ]] \
+  && grep -q '<b>linkedin-password</b> is on your server now' "$TMP/s2.html" \
+  && ! grep -qF "$V1" "$TMP/s2.html" && ! grep -qF "$V1" "$TMP/server6.log" \
+  && ok_t "L16d POST saves it once in saved.env (600), and the value is in neither the page nor the log" \
+  || bad_t "L16d the save" "code=$code env=$(cat "$SAVED" 2>/dev/null) body=$(head -c 300 "$TMP/s2.html")"
+code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode "value=again" "$B6/$tok")
+[[ "$code" == 404 ]] && ok_t "L16e the save link is dead after one use" || bad_t "L16e single use" "code=$code"
+# Rewrite: a fresh link for the same name replaces the value; two live links for
+# one name, and using one burns the other.
+printf 'LINKEDIN_PASSWORD=linkedin.com\nGITHUB_TOKEN=github.com\n' > "$CONNECTORS_DIR/saved.hosts"
+o1=$(mint --save=linkedin-password); t1=$(tok_of "$o1")
+o2=$(mint --save=linkedin-password); t2=$(tok_of "$o2")
+V2='new-Pa55'
+code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode "value=$V2" "$B6/$t2")
+[[ "$code" == 200 && "$(grep -c '^LINKEDIN_PASSWORD=' "$SAVED")" == 1 ]] && grep -qxF "LINKEDIN_PASSWORD=$V2" "$SAVED" \
+  && ! grep -qF "$V1" "$SAVED" && [[ ! -f "$SECRET_DROP_DIR/$(hash_of "$t1")" ]] \
+  && [[ "$(cat "$CONNECTORS_DIR/saved.hosts")" == 'GITHUB_TOKEN=github.com' ]] \
+  && ok_t "L16f rewrite: a new link for the name replaces the value (one line), burns the name's other link, and frees it from its old site" \
+  || bad_t "L16f rewrite" "code=$code env=$(cat "$SAVED")"
+o3=$(mint --save=github-token); t3=$(tok_of "$o3")
+code=$(curl -s -o "$TMP/s3.html" -w '%{http_code}' --data-urlencode $'value=line one\r\nline two' "$B6/$t3")
+[[ "$code" == 400 ]] && grep -q 'typed into one field' "$TMP/s3.html" && ! grep -q '^GITHUB_TOKEN' "$SAVED" \
+  && [[ -f "$SECRET_DROP_DIR/$(hash_of "$t3")" ]] \
+  && ok_t "L16g a value of two lines is refused with the one-line rule, and the link still works" \
+  || bad_t "L16g multi-line refused" "code=$code env=$(cat "$SAVED")"
+curl -s -o /dev/null --data-urlencode "value=ghp-fixture-6844" "$B6/$t3"
+kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
+ls_out=$( (JSON_MODE=1; _secret_saved ls) 2>&1 )
+[[ "$(jq -c '.data.names' <<<"$ls_out")" == '["github-token","linkedin-password"]' ]] \
+  && ! grep -qF "$V2" <<<"$ls_out" && ! grep -qF 'ghp-fixture' <<<"$ls_out" \
+  && ok_t "L16h secret saved ls lists the names, never a value" \
+  || bad_t "L16h names only" "$ls_out"
+! grep -qF "$V2" "$TOOLS_ENV_FILE" 2>/dev/null && ! grep -qF 'ghp-fixture' "$TOOLS_ENV_FILE" 2>/dev/null \
+  && ok_t "L16i a saved value never lands in tools.sh (the file every agent loads)" \
+  || bad_t "L16i not in tools.sh" "$(cat "$TOOLS_ENV_FILE")"
+rm_out=$( (JSON_MODE=1; _secret_saved rm linkedin-password) 2>&1 ); rc=$?
+rm2=$( (_secret_saved rm linkedin-password) 2>&1 ); rc2=$?
+[[ $rc -eq 0 && $rc2 -ne 0 && "$(jq -c '.data.names' <<<"$( (JSON_MODE=1; _secret_saved ls) 2>&1 )")" == '["github-token"]' ]] \
+  && grep -qx 'GITHUB_TOKEN=ghp-fixture-6844' "$SAVED" \
+  && printf 'GITHUB_TOKEN=github.com\n' > "$CONNECTORS_DIR/saved.hosts" && ( _secret_saved rm github-token ) >/dev/null 2>&1 \
+  && [[ ! -s "$CONNECTORS_DIR/saved.hosts" ]] \
+  && ok_t "L16j saved rm <name> forgets that one (and its site) and keeps the rest; a second rm says nothing is saved" \
+  || bad_t "L16j remove" "rc=$rc out=$rm_out rc2=$rc2 out2=$rm2 env=$(cat "$SAVED")"
+
 echo
 echo "secret-drop-link unit: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

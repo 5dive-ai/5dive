@@ -63,6 +63,16 @@ _secret_usage() {
       An agent asking while a link for the gate is live (the gate's alert
       carries one) is refused, exit 3; --again mints another anyway.
 
+  5dive secret link --save=<name> [--ttl=<minutes>]
+      A one-time link for a SAVED value with no task: a login or a detail the
+      owner keeps on this box for agents to type into a site (DIVE-6844). The
+      name is lowercase letters, digits and dashes (linkedin-password). It lands
+      in the root-only saved store; a link for a name already saved replaces it
+      and never shows the old value.
+  5dive secret saved [ls] [--json]      the saved names, never a value. Root-only.
+  5dive secret saved rm <name>          forget one. Root-only.
+      An agent uses one in the browser by name, without seeing it:
+      5dive browser act <url> --steps='[{"op":"fill","selector":"…","saved":"<name>"}]'
   5dive secret serve [--listen=127.0.0.1:3127]
       The page behind those links. Started on demand by `secret link`; exits by
       itself once no link is live. Root-only.
@@ -116,12 +126,80 @@ cmd_secret() {
     write) _secret_write "$@" ;;
     # DIVE-5319: the box-served drop link (src/cmd_secret_drop.sh).
     link)    _secret_link "$@" ;;
+    saved)   _secret_saved "$@" ;;   # DIVE-6844
     serve)   _secret_serve "$@" ;;
     _peek)   _secret_drop_peek "$@" ;;
     _redeem) _secret_drop_redeem "$@" ;;
     _prewarm) _secret_drop_prewarm "$@" ;;   # DIVE-5372: install.sh
     -h|--help|help) _secret_usage ;;
-    *) fail "$E_USAGE" "unknown secret command: $sub (write|link|serve)" ;;
+    *) fail "$E_USAGE" "unknown secret command: $sub (write|link|saved|serve)" ;;
+  esac
+}
+
+# ---- DIVE-6844: saved logins and details -----------------------------------
+#
+# A login or a detail the owner saves once for agents to type into a site. It is
+# one more secret in the store, no new kind: one line per name in
+# /etc/5dive/connectors/saved.env, 600 root, which no agent seat can read (unlike
+# tools.sh, which every agent loads). The owner adds or rewrites one through the
+# one-time link (`secret link --save=<name>`, value phone -> box, never through
+# the API), the app lists the NAMES (`secret saved ls`) and removes one (`saved
+# rm`). Nothing here ever prints a value. An agent uses one by name in a browser
+# act; the browser reads it as root and types it in (5dive-browser, DIVE-6844).
+SECRET_SAVED_CONNECTOR="saved"
+_saved_name_ok() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,39}$ && "$1" != *- && "$1" != *--* ]]; }
+_saved_key() { local k="${1^^}"; printf '%s' "${k//-/_}"; }
+_saved_name_of() { local n="${1,,}"; printf '%s' "${n//_/-}"; }
+_saved_file() { printf '%s/%s.env' "$CONNECTORS_DIR" "$SECRET_SAVED_CONNECTOR"; }
+# Which site each saved value is for: the browser binds one on first use
+# (5dive-browser, 600 root). A new value or a remove frees it for its next site.
+_saved_hosts_file() { printf '%s/%s.hosts' "$CONNECTORS_DIR" "$SECRET_SAVED_CONNECTOR"; }
+_saved_unbind() {  # <KEY>
+  local f tmp; f=$(_saved_hosts_file)
+  [[ -f "$f" ]] && grep -qE "^${1}=" "$f" || return 0
+  tmp="$(mktemp "${f}.XXXXXX")" || return 1
+  chmod 600 "$tmp"
+  grep -vE "^${1}=" "$f" > "$tmp" || true
+  mv -f "$tmp" "$f"
+}
+
+_saved_names() {
+  local f; f=$(_saved_file)
+  [[ -r "$f" ]] || return 0
+  local line
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*)= ]] || continue
+    _saved_name_of "${BASH_REMATCH[1]}"; printf '\n'
+  done < "$f" | sort -u
+}
+
+_secret_saved() {
+  local sub="${1:-ls}"; [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    ls|list)
+      [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive secret saved ls [--json]"
+      require_root secret saved
+      local names; names=$(_saved_names)
+      ok "${names:-(nothing saved)}" '{names: ($n | split("\n") | map(select(length > 0)))}' --arg n "$names" ;;
+    rm|remove)
+      local name="${1:-}"
+      [[ $# -eq 1 ]] || fail "$E_USAGE" "usage: 5dive secret saved rm <name>"
+      _saved_name_ok "$name" || fail "$E_VALIDATION" "'$name' is not a saved name (lowercase letters, digits and dashes, starting with a letter)"
+      require_root secret saved
+      local f key tmp; f=$(_saved_file); key=$(_saved_key "$name")
+      exec 9>"$SECRET_WRITE_LOCK" || fail "$E_GENERIC" "cannot open secret-write lock"
+      flock 9 || fail "$E_GENERIC" "cannot acquire secret-write lock"
+      [[ -f "$f" ]] && grep -qE "^${key}=" "$f" || fail "$E_NOT_FOUND" "nothing is saved as $name"
+      tmp="$(mktemp "${f}.XXXXXX")" || fail "$E_GENERIC" "mktemp failed"
+      chmod 600 "$tmp"
+      grep -vE "^${key}=" "$f" > "$tmp" || true
+      chown root:claude "$tmp" 2>/dev/null || true
+      chmod 600 "$tmp"
+      mv -f "$tmp" "$f"
+      _saved_unbind "$key" || true
+      exec 9>&-
+      ok "removed $name" '{removed: $n}' --arg n "$name" ;;
+    *) fail "$E_USAGE" "usage: 5dive secret saved [ls] | rm <name>" ;;
   esac
 }
 
@@ -175,6 +253,9 @@ _secret_write() {
   # the .env names it with one line whose every byte we chose.
   local multi=0
   [[ "$value" == *$'\n'* ]] && multi=1
+  # DIVE-6844: a saved value is typed into one field of a page, so it is one line.
+  (( multi )) && [[ "$connector" == "$SECRET_SAVED_CONNECTOR" ]] \
+    && fail "$E_VALIDATION" "a saved value is typed into one field, so it must be one line; nothing was saved"
 
   # DIVE-5370: `--connector=tools` is the one store every agent reads: tools.sh,
   # loaded by each agent command through BASH_ENV (DIVE-5366). Every other
