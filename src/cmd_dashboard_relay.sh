@@ -23,7 +23,9 @@
 #     and ask <chat_id> <text> <question_id> (<label> <description>){2,10} (a
 #     question with buttons, DIVE-6715; an empty description is left out).
 #     The root side builds every body with jq. sudo resets the environment, so
-#     the caller cannot redirect the API base.
+#     the caller cannot redirect the API base. DIVE-6816 adds `pending [wait]`
+#     (a long poll, wait clamped to 25 s) and, for a chat-only box, `fetch
+#     <path>` and `put <path>` (see the block above the root half).
 #   * An ack names only ids this seat's own pending poll returned. The control
 #     plane scopes a DM ack by owner, not by agent, so without this one seat
 #     could mark another agent's messages collected and hold them back.
@@ -41,8 +43,9 @@
 # body after it. The adapter rebuilds a Response from it, so its retry, ack and
 # lifecycle logic is the same on both paths. A transport failure exits non-zero.
 #
-# Not audited: the adapter polls every five minutes per seat, and the control
-# plane records every message it stores. The token is re-read on every call, so
+# Not audited: the adapter polls every five minutes per seat (on a chat-only
+# box, one held long poll at a time), and the control plane records every
+# message it stores. The token is re-read on every call, so
 # a rotation by shelld is picked up with no reload.
 
 _dash_relay_api_base() { local b="${FIVE_API_BASE:-https://api.5dive.com}"; printf '%s' "${b%/}"; }
@@ -67,15 +70,15 @@ _dash_relay_token() {
 # STDIN (`-H @-`), and the body, which carries the owner's messages, from a
 # root-only temp file (`--data-binary @file`). `ps` shows neither.
 _dash_relay_call() {
-  local method="$1" url="$2" body="${3:-}" tok="$4" out bodyf="" code rc=0
+  local method="$1" url="$2" body="${3:-}" tok="$4" maxt="${5:-30}" out bodyf="" code rc=0
   out=$(mktemp) || fail "$E_GENERIC" "_dashboard_relay: cannot create a temp file."
-  local -a args=(-sS --max-time 30 -o "$out" -w '%{http_code}' -X "$method" -H @-)
+  local -a extra=()
   if [[ -n "$body" ]]; then
     bodyf=$(mktemp) || { rm -f "$out"; fail "$E_GENERIC" "_dashboard_relay: cannot create a temp file."; }
     printf '%s' "$body" >"$bodyf"
-    args+=(-H 'Content-Type: application/json' --data-binary "@${bodyf}")
+    extra=(-H 'Content-Type: application/json' --data-binary "@${bodyf}")
   fi
-  code=$(printf 'Authorization: Bearer %s\n' "$tok" | curl "${args[@]}" "$url") || rc=$?
+  code=$(_dash_relay_curl "$method" "$url" "$tok" "$out" "$maxt" "${extra[@]}") || rc=$?
   tok=""
   [[ -n "$bodyf" ]] && rm -f "$bodyf"
   if (( rc != 0 )) || [[ ! "$code" =~ ^[1-5][0-9][0-9]$ ]]; then
@@ -85,6 +88,19 @@ _dash_relay_call() {
   printf '%s\n' "$code"
   cat "$out"
   rm -f "$out"
+}
+
+# _dash_relay_curl <method> <url> <token> <out-file> <max-time> [curl args...]
+# — the ONE curl line of this rail: print the HTTP code, return curl's rc. The
+# bearer rides curl's stdin (-H @-), never argv; every op goes through here.
+_dash_relay_curl() {
+  local method="$1" url="$2" tok="$3" out="$4" maxt="$5" code rc=0
+  shift 5
+  local -a args=(-sS --max-time "$maxt" -o "$out" -w '%{http_code}' "$@" -X "$method" -H @-)
+  code=$(printf 'Authorization: Bearer %s\n' "$tok" | curl "${args[@]}" "$url") || rc=$?
+  tok=""
+  printf '%s' "$code"
+  return "$rc"
 }
 
 # _dash_relay_remember <seat> <body> — keep the ids a 200 pending answer
@@ -110,6 +126,135 @@ _dash_relay_file_ok() {
   real=$(realpath -e -- "$f" 2>/dev/null) || return 1
   [[ "$real" == "$(realpath -e -- "$box" 2>/dev/null)"/* ]] || return 1
   printf '%s' "$real"
+}
+
+# --- DIVE-6816: a chat-only box (no shelld, nothing listens) -----------------
+# The API cannot drop an upload on the box or read a reply file back, so the
+# adapter moves the bytes itself: `fetch <path>` pulls an upload the owner sent
+# (GET /server/selfhost/files) and writes it where the message says it is,
+# `put <path>` sends a reply file (POST /server/selfhost/files). Each names ONE
+# path, in ITS dir and this seat's own corner of it only:
+#   fetch  <uploads>/<seat>/<name>      written root-side, atomically, as the
+#          files API writes it (claude:claude 0644, dirs 0755), so the seat
+#          reads it and cannot swap the dir: it is not the seat's to write.
+#   put    <outbox>/<seat>-<name>       a regular file the SEAT owns, read from
+#          ONE descriptor opened without following a link, then
+#          copied root-only before curl sees it. The outbox is group-writable,
+#          so a path check alone would let a seat swap in a symlink to a
+#          root-only file between the check and the read; an O_NOFOLLOW open
+#          closes that, and the owner check keeps it to this seat's own copies.
+# Both are capped at 20 MB, the API's own cap.
+_dash_relay_uploads()    { local d="${FIVEDIVE_CHAT_UPLOADS:-/home/claude/chat-uploads}"; printf '%s' "${d%/}"; }
+_dash_relay_file_owner() { printf '%s' "${FIVEDIVE_CHAT_FILE_OWNER:-claude:claude}"; }
+_dash_relay_file_max()   { printf '%s' "${FIVEDIVE_CHAT_FILE_MAX:-20971520}"; }
+_dash_relay_uri()        { jq -rn --arg p "$1" '$p|@uri'; }
+
+# _dash_relay_upload_ok <seat> <path> — a file name directly in this seat's own
+# chat-uploads dir: one component, no leading dot, no slash, nothing to resolve.
+_dash_relay_upload_ok() {
+  local seat="$1" p="$2" root name
+  root=$(_dash_relay_uploads)
+  [[ "$p" == "$root/$seat/"* ]] || return 1
+  name="${p#"$root/$seat/"}"
+  [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,199}$ ]]
+}
+
+# _dash_relay_seat_dir <seat> — make <uploads>/<seat> as the files API does and
+# print it, only when it is a real dir (no symlink) right where it is named.
+_dash_relay_seat_dir() {
+  local seat="$1" root dir own
+  root=$(_dash_relay_uploads); dir="$root/$seat"; own=$(_dash_relay_file_owner)
+  [[ -d "$root" ]] || install -d -m 0755 -o "${own%%:*}" -g "${own#*:}" -- "$root" 2>/dev/null || return 1
+  [[ -e "$dir" || -L "$dir" ]] || install -d -m 0755 -o "${own%%:*}" -g "${own#*:}" -- "$dir" 2>/dev/null || return 1
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
+  [[ "$(realpath -e -- "$dir" 2>/dev/null)" == "$(realpath -e -- "$root" 2>/dev/null)/$seat" ]] || return 1
+  printf '%s' "$dir"
+}
+
+# _dash_relay_fetch <url> <token> <dir> <dest> — download into a root-only temp
+# file in <dir>, then hand it to the files owner and rename it over <dest>.
+_dash_relay_fetch() {
+  local url="$1" tok="$2" dir="$3" dest="$4" tmp code rc=0 size max own
+  max=$(_dash_relay_file_max); own=$(_dash_relay_file_owner)
+  tmp=$(mktemp -p "$dir" .fetch.XXXXXX) || fail "$E_GENERIC" "_dashboard_relay fetch: cannot create a temp file in ${dir}."
+  code=$(_dash_relay_curl GET "$url" "$tok" "$tmp" 90 --max-filesize "$max") || rc=$?
+  tok=""
+  if (( rc == 63 )); then
+    rm -f "$tmp"; printf '413\n{"error":"the file is over %s bytes"}' "$max"; return 0
+  fi
+  if (( rc != 0 )) || [[ ! "$code" =~ ^[1-5][0-9][0-9]$ ]]; then
+    rm -f "$tmp"
+    fail "$E_GENERIC" "_dashboard_relay: the control plane did not answer (curl rc=${rc})."
+  fi
+  if [[ "$code" != 200 ]]; then
+    printf '%s\n' "$code"; head -c 2000 -- "$tmp"; rm -f "$tmp"; return 0
+  fi
+  size=$(stat -c %s -- "$tmp" 2>/dev/null) || size=-1
+  if (( size < 0 || size > max )); then
+    rm -f "$tmp"; printf '413\n{"error":"the file is over %s bytes"}' "$max"; return 0
+  fi
+  if ! { chown -- "$own" "$tmp" && chmod 0644 -- "$tmp" && mv -fT -- "$tmp" "$dest"; } 2>/dev/null; then
+    rm -f "$tmp"
+    fail "$E_GENERIC" "_dashboard_relay fetch: could not write ${dest}."
+  fi
+  printf '200\n'
+  jq -nc --arg p "$dest" --argjson b "$size" '{ok:true, path:$p, bytes:$b}'
+}
+
+# _dash_relay_put <url> <token> <path> <uid> — post one reply file. It is read
+# ONCE, through a descriptor opened with O_NOFOLLOW|O_NONBLOCK (a symlink or a
+# FIFO swapped in after the path check is refused, never followed or waited
+# on), and must be a regular file owned by <uid>, at most the cap. The bytes
+# go to a root-only copy, and curl posts the copy.
+_dash_relay_put() {
+  local url="$1" tok="$2" f="$3" uid="$4" max copy out code rc=0 why
+  max=$(_dash_relay_file_max)
+  copy=$(mktemp) || fail "$E_GENERIC" "_dashboard_relay: cannot create a temp file."
+  python3 -I -c '
+import os, stat, sys
+path, uid, cap, dest = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+except OSError:
+    sys.exit(3)
+st = os.fstat(fd)
+if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+    sys.exit(4)
+if st.st_size > cap:
+    sys.exit(5)
+n = 0
+with open(dest, "wb") as out:
+    while True:
+        b = os.read(fd, 1 << 20)
+        if not b:
+            break
+        n += len(b)
+        if n > cap:
+            sys.exit(5)
+        out.write(b)
+' "$f" "$uid" "$max" "$copy" || rc=$?
+  if (( rc != 0 )); then
+    rm -f "$copy"
+    case "$rc" in
+      3) why="cannot be opened (or is a symlink)" ;;
+      4) why="is not a regular file of this seat" ;;
+      5) why="is over ${max} bytes" ;;
+      *) why="could not be read (rc=${rc})" ;;
+    esac
+    fail "$E_VALIDATION" "_dashboard_relay put: ${f} ${why}."
+  fi
+  out=$(mktemp) || { rm -f "$copy"; fail "$E_GENERIC" "_dashboard_relay: cannot create a temp file."; }
+  code=$(_dash_relay_curl POST "$url" "$tok" "$out" 90 \
+    -H 'Content-Type: application/octet-stream' --data-binary "@${copy}") || rc=$?
+  tok=""
+  rm -f "$copy"
+  if (( rc != 0 )) || [[ ! "$code" =~ ^[1-5][0-9][0-9]$ ]]; then
+    rm -f "$out"
+    fail "$E_GENERIC" "_dashboard_relay: the control plane did not answer (curl rc=${rc})."
+  fi
+  printf '%s\n' "$code"
+  cat "$out"
+  rm -f "$out"
 }
 
 # Root half. Reached ONLY through the exact-path NOPASSWD grant (or by root).
@@ -138,9 +283,14 @@ cmd_dashboard_relay() {
       (( ${#wire[@]} == 1 )) || fail "$E_VALIDATION" "_dashboard_relay ping takes no arguments."
       printf '200\n{"ok":true,"agent":"%s"}' "$seat" ;;
     pending)
-      (( ${#wire[@]} == 1 )) || fail "$E_VALIDATION" "_dashboard_relay pending takes no arguments."
-      local ans
-      ans=$(_dash_relay_call GET "${base}/server/messages/pending?agent=${seat}" "" "$tok") || exit $?
+      # DIVE-6816: an optional wait (seconds, clamped to 25) holds the poll on
+      # the control plane until a message lands; curl waits longer than that.
+      (( ${#wire[@]} <= 2 )) || fail "$E_VALIDATION" "_dashboard_relay pending takes at most a wait in seconds."
+      local ans wait="${wire[1]:-0}" q=""
+      [[ "$wait" =~ ^[0-9]{1,3}$ ]] || fail "$E_VALIDATION" "_dashboard_relay pending: the wait is a number of seconds."
+      wait=$((10#$wait)); (( wait > 25 )) && wait=25
+      (( wait > 0 )) && q="&wait=${wait}"
+      ans=$(_dash_relay_call GET "${base}/server/messages/pending?agent=${seat}${q}" "" "$tok" $((wait + 15 > 30 ? wait + 15 : 30))) || exit $?
       [[ "${ans%%$'\n'*}" == 200 ]] && _dash_relay_remember "$seat" "${ans#*$'\n'}"
       printf '%s' "$ans" ;;
     ack)
@@ -209,7 +359,21 @@ cmd_dashboard_relay() {
           --args "${wire[@]:4}") \
         || fail "$E_GENERIC" "_dashboard_relay: could not build the question."
       _dash_relay_call POST "${base}/server/messages/event" "$body" "$tok" ;;
+    fetch)
+      (( ${#wire[@]} == 2 )) || fail "$E_VALIDATION" "_dashboard_relay fetch takes one path."
+      local p="${wire[1]}" dir
+      _dash_relay_upload_ok "$seat" "$p" \
+        || fail "$E_VALIDATION" "_dashboard_relay fetch: the path must name a file in $(_dash_relay_uploads)/${seat}/ ($p)."
+      dir=$(_dash_relay_seat_dir "$seat") \
+        || fail "$E_VALIDATION" "_dashboard_relay fetch: $(_dash_relay_uploads)/${seat} is not a plain directory."
+      _dash_relay_fetch "${base}/server/selfhost/files?path=$(_dash_relay_uri "$p")" "$tok" "$dir" "$p" ;;
+    put)
+      (( ${#wire[@]} == 2 )) || fail "$E_VALIDATION" "_dashboard_relay put takes one path."
+      local p="${wire[1]}" real
+      real=$(_dash_relay_file_ok "$p") && [[ "${real##*/}" == "${seat}-"?* ]] \
+        || fail "$E_VALIDATION" "_dashboard_relay put: the path must be this seat's file in $(_dash_relay_outbox) (${seat}-...): $p"
+      _dash_relay_put "${base}/server/selfhost/files?path=$(_dash_relay_uri "$real")" "$tok" "$real" "$ruid" ;;
     *)
-      fail "$E_VALIDATION" "_dashboard_relay allows only ping, pending, ack, event, status or ask." ;;
+      fail "$E_VALIDATION" "_dashboard_relay allows only ping, pending, ack, event, status, ask, fetch or put." ;;
   esac
 }
