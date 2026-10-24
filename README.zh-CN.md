@@ -24,14 +24,7 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-**在手机上和你的智能体对话，免费。** 在你的服务器上粘贴：
-
-```sh
-curl -4 -sSL https://api.5dive.com/connector/install.sh | sudo bash
-sudo 5dive-connector connect
-```
-
-服务器会显示一个代码，在 **[5dive.app](https://5dive.app)** 输入它即可。 运行 `5dive-connector about` 查看它在你的服务器上能做什么、不能做什么。
+**可选：** 在手机上和你的智能体聊天，免费：[5dive.app/self-host](https://5dive.app/self-host)
 
 <p align="center"><img src="docs/readme-app.png" alt="在 5dive 应用里和智能体聊天" width="260"></p>
 
