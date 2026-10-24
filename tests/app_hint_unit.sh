@@ -59,23 +59,35 @@ grep -qE '^\s+_app_hint\)$' src/main.sh && ok "main dispatches _app_hint" || bad
 # and none of the retired connector steps (lodar 10-24: «link is wrong»).
 for f in README.md README.zh-CN.md; do
   top="$(sed -n '1,/^## /p' "$f")"
-  for needle in "https://5dive.app/self-host" "docs/readme-self-host.gif"; do
+  for needle in "https://5dive.app/self-host" "docs/readme-demo.png"; do
     [[ "$top" == *"$needle"* ]] && ok "$f top has: $needle" || bad "$f top is missing: $needle"
   done
   for gone in "$install_cmd" "$connect_cmd" "5dive-connector"; do
     [[ "$top" != *"$gone"* ]] && ok "$f top no longer has: $gone" || bad "$f top still has: $gone"
   done
-  # DIVE-6842: the app line is the next step after the install, with no paid
-  # pitch between them (lodar 10-24: «remove paid pitch at all»).
+  # DIVE-6889: the demo (team, chat, voice) comes right after the install; the
+  # app link is an optional mention lower down, not the headline (lodar 10-24
+  # 16:07Z: «in readme is totally optional - dont put this as main feature»).
   next="$(awk 'seen && /^```$/ {fence=1; next} fence && NF {print; exit} /^sudo 5dive init$/ {seen=1}' "$f")"
-  [[ "$next" == *"https://5dive.app/self-host"* ]] && ok "$f: the app line comes right after the install" \
-    || bad "$f: the line after the install is not the app line: $next"
+  [[ "$next" == *"docs/readme-demo.png"* ]] && ok "$f: the demo comes right after the install" \
+    || bad "$f: the line after the install is not the demo: $next"
+  [[ "$next" != *"https://5dive.app/self-host"* ]] && ok "$f: the app link is not the headline" \
+    || bad "$f: the app link is still the line after the install"
   for gone in "5dive cloud" "my.5dive.ai/sign-up"; do
     [[ "$top" != *"$gone"* ]] && ok "$f top has no paid pitch: $gone" || bad "$f top still pitches: $gone"
   done
 done
 # DIVE-6881: the still became a short real recording of the link and a reply.
+# DIVE-6889: no README shows it any more, but outside links point at it.
 [[ -s docs/readme-self-host.gif ]] && ok "docs/readme-self-host.gif exists" || bad "docs/readme-self-host.gif missing"
+[[ -s docs/readme-demo.png ]] && ok "docs/readme-demo.png exists" || bad "docs/readme-demo.png missing"
+# lodar 16:10Z: «3 screenshot in a phone mock side by side in a row - static». A
+# real PNG, and the README top no longer shows the old phone GIF.
+[[ "$(head -c 8 docs/readme-demo.png 2>/dev/null | od -An -tx1 | tr -d ' \n')" == 89504e470d0a1a0a ]] \
+  && ok "docs/readme-demo.png is a PNG" || bad "docs/readme-demo.png is not a PNG"
+for f in README.md README.zh-CN.md; do
+  [[ "$(sed -n '1,/^## /p' "$f")" != *"readme-self-host.gif"* ]] && ok "$f top drops the old GIF" || bad "$f top still shows readme-self-host.gif"
+done
 
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]
