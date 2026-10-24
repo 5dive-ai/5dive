@@ -220,7 +220,7 @@ hasnt "$out" "ok:openclaw seat has its own credential" \
 # ---------- 4. the boot-time verdict must leave a breadcrumb ----------
 # assert_cred_seeded already printed an ERROR for a present-but-unreadable
 # source — to journald, which neither the health rail nor selfcheck reads.
-extract_fn() { awk -v m="$1() {" 'substr($0,1,length(m))==m { on=1 } on { print } on && $0 == "}" { exit }' 5dive-agent-start; }
+extract_fn() { awk -v m="$1() {" 'substr($0,1,length(m))==m { on=1 } on { print } on && $0 == "}" { exit }' bin/5dive-agent-start; }
 HELPER=""
 for _fn in assert_cred_seeded cred_seed_breadcrumb_path cred_seed_breadcrumb_write cred_seed_failed cred_seed_ok cred_src_readable cred_seed_why; do
   _def="$(extract_fn "$_fn")"

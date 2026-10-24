@@ -35,7 +35,7 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
-STAGE_SH="$PWD/5dive-stage-fork-plugins.sh"
+STAGE_SH="$PWD/bin/5dive-stage-fork-plugins.sh"
 TMP="$(mktemp -d /tmp/fork-stage-unit.XXXXXX)"
 SUMMARY_PRINTED=0
 exec 8>&2

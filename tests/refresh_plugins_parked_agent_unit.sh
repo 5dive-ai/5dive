@@ -45,7 +45,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT" || exit 1
 PASS=0; FAIL=0
 ok_t(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t(){ FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
-SCRIPT="$ROOT/5dive-refresh-plugins.sh"
+SCRIPT="$ROOT/bin/5dive-refresh-plugins.sh"
 
 FENCE='DIVE-4399 an operator-parked agent stays parked (the plugin-refresh bounce)'
 block="$(sed -n "/^# >>> ${FENCE//\//\\/}\$/,/^# <<< ${FENCE//\//\\/}\$/p" "$SCRIPT")"
@@ -292,7 +292,7 @@ bounced katya && ok_t "U7 an explicit null desiredState restarts" \
 # anywhere in the repo turns it red — because what DIVE-4033 shipped was not a
 # wrong verdict, it was a file nobody looked at.
 declare -A RESTART_PATHS=(
-  [5dive-refresh-plugins.sh]=GUARDED
+  [bin/5dive-refresh-plugins.sh]=GUARDED
   [src/cmd_selfupdate.sh]=GUARDED
   [src/cmd_agent_runtime.sh]=GUARDED
   [src/cmd_heartbeat.sh]=GUARDED

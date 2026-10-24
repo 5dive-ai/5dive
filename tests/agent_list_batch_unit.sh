@@ -67,8 +67,8 @@ retired_private="/usr/local/bin/5dive agent _list"'_private'
   && ok 'retired privileged command name has zero source consumers' \
   || bad 'retired privileged command name still survives in a source consumer'
 
-grep -q '^bundle=/usr/local/bin/5dive$' "$ROOT/5dive-agent-list-snapshot" \
-  && ! grep -q '\$@\|\${[1-9]' "$ROOT/5dive-agent-list-snapshot" \
+grep -q '^bundle=/usr/local/bin/5dive$' "$ROOT/bin/5dive-agent-list-snapshot" \
+  && ! grep -q '\$@\|\${[1-9]' "$ROOT/bin/5dive-agent-list-snapshot" \
   && ok 'privileged helper uses fixed paths and no caller arguments' || bad 'privileged helper accepts caller-controlled paths'
 grep -q "printf '%%claude ALL=(root) NOPASSWD: %s/agent-list-snapshot" "$ROOT/install.sh" \
   && ok 'installer backfills one exact fleet-reader grant' || bad 'installer does not backfill the fleet-reader grant'

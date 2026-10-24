@@ -23,7 +23,7 @@ trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
-START=5dive-agent-start
+START=bin/5dive-agent-start
 TMP="$(mktemp -d /tmp/byo-apikey-seed-unit.XXXXXX)"
 
 fail=0

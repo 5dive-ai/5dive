@@ -101,7 +101,7 @@ esac
 SH
 chmod +x "$TMP/bin/getent" "$TMP/fake-5dive"
 : >"$TMP/attempted"
-PATH="$TMP/bin:$PATH" FIVE_BIN="$TMP/fake-5dive" FIVE_AGENTS_JSON="$REGISTRY" bash ./5dive-refresh-skills.sh >"$TMP/refresh.out" 2>&1
+PATH="$TMP/bin:$PATH" FIVE_BIN="$TMP/fake-5dive" FIVE_AGENTS_JSON="$REGISTRY" bash ./bin/5dive-refresh-skills.sh >"$TMP/refresh.out" 2>&1
 t_eq "refresh re-pulled only the seat without noSkills" "$(sort -u "$TMP/attempted")" "plain"
 grep -q 'bare — created with --no-skills, skipping' "$TMP/refresh.out" && t_ok "and says why it skipped the other" \
   || t_bad "no skip line for the noSkills seat: $(cat "$TMP/refresh.out")"

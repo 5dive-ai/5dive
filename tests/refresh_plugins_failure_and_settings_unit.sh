@@ -37,7 +37,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT" || exit 1
 PASS=0; FAIL=0
 ok_t(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t(){ FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
-SCRIPT="${REFRESH_PLUGINS_SH:-$ROOT/5dive-refresh-plugins.sh}"
+SCRIPT="${REFRESH_PLUGINS_SH:-$ROOT/bin/5dive-refresh-plugins.sh}"
 command -v jq >/dev/null 2>&1 || { echo "jq required"; SUMMARY_PRINTED=1; exit 1; }
 
 WORK="$(mktemp -d)"

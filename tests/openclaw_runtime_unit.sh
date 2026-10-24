@@ -51,7 +51,7 @@ fi
 node_bin=$(command -v node)
 [[ "$(env -i PATH="$tmp/empty-path" "$node_bin" "$tmp/openclaw")" == "openclaw-ok" ]]
 
-start_src=$(<5dive-agent-start)
+start_src=$(<bin/5dive-agent-start)
 [[ "$start_src" == *'resolve_openclaw_node()'* ]]
 [[ "$start_src" == *'OPENCLAW_NODE_BIN="$(resolve_openclaw_node)"'* ]]
 [[ "$start_src" == *'OPENCLAW_PATH_OVERRIDE="export PATH='* ]]
@@ -60,7 +60,7 @@ start_src=$(<5dive-agent-start)
 
 # The runtime prelude must not invoke the interactive configure command. Match
 # executable interpolation + command so the explanatory comment is harmless.
-if grep -q '${BIN_Q} configure' 5dive-agent-start; then
+if grep -q '${BIN_Q} configure' bin/5dive-agent-start; then
   echo 'FAIL: OpenClaw first boot still invokes the interactive configure wizard' >&2
   exit 1
 fi

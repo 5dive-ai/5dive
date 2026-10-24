@@ -39,10 +39,10 @@ else
 fi
 
 echo "# the writes that running processes execute go through it"
-grep -qF 'replace_by_rename "$BIN_DIR/5dive-agent-start" curl -fsSL "$REPO/5dive-agent-start"' install.sh \
+grep -qF 'replace_by_rename "$BIN_DIR/5dive-agent-start" curl -fsSL "$REPO/${PIN_BIN}5dive-agent-start"' install.sh \
   && ok_t "the launcher is replaced by rename" \
   || bad_t "the launcher is replaced by rename" "install.sh no longer routes 5dive-agent-start through replace_by_rename"
-grep -qF 'replace_by_rename "$BIN_DIR/$_hs_name" curl -fsSL "$REPO/$_hs_name"' install.sh \
+grep -qF 'replace_by_rename "$BIN_DIR/$_hs_name" curl -fsSL "$REPO/${PIN_BIN}$_hs_name"' install.sh \
   && ok_t "the host scripts are replaced by rename" \
   || bad_t "the host scripts are replaced by rename" "the host-scripts.manifest loop no longer routes through replace_by_rename"
 inplace="$(grep -nE -- '-o[[:space:]]+"?\$\{?BIN_DIR\}?/' install.sh || true)"

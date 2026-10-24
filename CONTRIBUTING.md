@@ -53,6 +53,8 @@ src/              # CLI source — split for readability
 5dive             # built bundle — committed, kept in sync with src/ by CI
 tests/            # unit harnesses — run by the unit-tests CI job (see Testing)
 install.sh        # one-liner installer fetched by curl
+bin/              # box-side scripts install.sh puts in /usr/local/bin (host-scripts.manifest lists them)
+prompts/          # CLAUDE.md templates install.sh stages in /usr/local/lib/5dive
 systemd/          # unit files installed for agents
 hooks/            # shell hooks the CLI drops into the user's $HOME
 docker/           # demo container for tire-kickers
@@ -61,11 +63,12 @@ docs/             # design notes and the quickstart assets
 .github/workflows # CI
 ```
 
-A few files sit loose at the repo root (`5dive-agent-start`, the
-`5dive-refresh-*.sh` helpers, `*-CLAUDE.md` templates, `cos-*.ts`) because
-`install.sh` and the CLI fetch them by raw URL at install/update time —
-they're install-time assets, not leftovers. Don't move them without
-updating every fetch path.
+`bin/` and `prompts/` are install-time assets: `install.sh` and the
+control plane's nightly fetch them by path out of the release tag. A tag cut
+before DIVE-6849 ships them at the repo root, so `install.sh` reads the layout
+off the pin first (`${PIN_BIN}` / `${PIN_PROMPTS}`). Don't move them again
+without updating every fetch path, including 5dive-api's
+`scripts/control-plane/5dive-host-updates.sh`.
 
 See the README's **Contributing** section for the rationale behind the
 single-file bundle and `./build.sh`.

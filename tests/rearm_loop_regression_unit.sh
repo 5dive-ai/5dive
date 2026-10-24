@@ -28,7 +28,7 @@ set -uo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
 SRC="${SRC:-$(cd "$(dirname "$0")/.." && pwd)}"
-START="$SRC/5dive-agent-start"
+START="$SRC/bin/5dive-agent-start"
 pass=0; fail=0
 ok(){ printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
 no(){ printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
@@ -49,12 +49,12 @@ BANNED=( 'again immediately' 'idle polling is cheap' 'keep looping' )
 # straight into the agent's composer; the CLAUDE.md/AGENTS templates are read by
 # every seat the CLI creates.
 MODEL_FACING=(
-  5dive-agent-start
-  telegram-agent-CLAUDE.md
-  operational-comms-CLAUDE.md
-  projects-CLAUDE.md
-  model-tiering-CLAUDE.md
-  team-CLAUDE.md
+  bin/5dive-agent-start
+  prompts/telegram-agent-CLAUDE.md
+  prompts/operational-comms-CLAUDE.md
+  prompts/projects-CLAUDE.md
+  prompts/model-tiering-CLAUDE.md
+  prompts/team-CLAUDE.md
 )
 
 echo "== 1. STATIC: no recursive-loop instruction in model-facing text =="

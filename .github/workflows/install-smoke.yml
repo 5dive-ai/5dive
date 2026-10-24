@@ -34,7 +34,7 @@ on:
     paths:
       - 'install.sh'
       - '5dive'
-      - '5dive-agent-start'
+      - 'bin/**'
       - 'src/**'
       - 'hooks/**'
       - 'skills/**'
@@ -43,8 +43,7 @@ on:
       - 'plugins/**'
       - 'tests/fixtures/team-templates/**'
       - 'scripts/install-contract.sh'
-      - 'projects-CLAUDE.md'
-      - 'telegram-agent-CLAUDE.md'
+      - 'prompts/**'
       - '.github/workflows/install-smoke.yml'
 
 jobs:
@@ -101,9 +100,9 @@ jobs:
           # linted by nothing — the same gap DIVE-2125 closed for scripts/, one
           # directory out. Two of the four SC2318 findings below lived in the
           # stage-fork script, so the omission was load-bearing, not cosmetic.
-          SHEBANG_FILES=(install.sh 5dive-agent-start build.sh
-                         5dive-stage-fork-plugins.sh
-                         5dive-refresh-plugins.sh 5dive-refresh-skills.sh
+          SHEBANG_FILES=(install.sh bin/5dive-agent-start build.sh
+                         bin/5dive-stage-fork-plugins.sh
+                         bin/5dive-refresh-plugins.sh bin/5dive-refresh-skills.sh
                          scripts/*.sh)
           # These carry a bash shebang; let shellcheck read it.
           for f in "${SHEBANG_FILES[@]}"; do

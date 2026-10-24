@@ -214,7 +214,7 @@ BLOCK=$(awk '
   $0 == "if [[ \"$TYPE\" == \"claude\" ]]; then" { on=1; b="" }
   on { b = b $0 ORS }
   on && $0 == "fi" { if (b ~ /_creds_re=/) { printf "%s", b; exit } on=0 }
-' 5dive-agent-start)
+' bin/5dive-agent-start)
 [[ "$BLOCK" == *_creds_env_only* ]] && ok_t "T8 extracted the real claude credential block" || bad_t "T8 extract" "${BLOCK:0:200}"
 mkdir -p "$TMP/auth"; chmod 755 "$TMP/auth"
 { printf 'TYPE=claude PROFILE="" NAME=seat_b\n'
@@ -402,7 +402,7 @@ drift=""
 for t in $SP_CRED_TYPES; do
   path=$(profile_type_auth_path acme "$t") && { grep -qxF "${path#"$P/acme/$t/"}" < <(_sp_cred_seeds "$t") || drift+=" $t:auth-path"; }
   while IFS= read -r rel; do
-    grep -qF "${rel##*/}" 5dive-agent-start || drift+=" $t:$rel"
+    grep -qF "${rel##*/}" bin/5dive-agent-start || drift+=" $t:$rel"
   done < <(_sp_cred_seeds "$t")
 done
 [[ -z "$drift" ]] && ok_t "T13 the seed list matches profile_type_auth_path and 5dive-agent-start's seed blocks" || bad_t "T13 seed list drift" "$drift"
@@ -537,7 +537,7 @@ if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev
   done
   # The bound and the unbound codex seat seed through 5dive-agent-start's own
   # codex block, run as their real uid with a plain read (no sudo).
-  CBLOCK=$(awk '/^  AGENT_CODEX_HOME="\$HOME\/.codex"$/ {on=1} /^  # Set <key> = true under \[features\]/ {exit} on' 5dive-agent-start)
+  CBLOCK=$(awk '/^  AGENT_CODEX_HOME="\$HOME\/.codex"$/ {on=1} /^  # Set <key> = true under \[features\]/ {exit} on' bin/5dive-agent-start)
   CBLOCK=${CBLOCK//\/var\/lib\/5dive\/auth-profiles/$S/auth-profiles}
   # The block's legacy fallback is /home/claude/.codex/auth.json, a symlink to
   # the host's own canonical login: point it into the fixture, never the host.

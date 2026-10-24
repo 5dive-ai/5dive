@@ -205,8 +205,8 @@ fi
 
 # The path read above is the path the seat runs on: 5dive-agent-start points
 # CODEX_HOME at $HOME/.codex. Read off the shipped launcher, not restated.
-if grep -qF 'AGENT_CODEX_HOME="$HOME/.codex"' 5dive-agent-start \
-   && grep -qF 'export CODEX_HOME=$(printf %q "$AGENT_CODEX_HOME")' 5dive-agent-start; then
+if grep -qF 'AGENT_CODEX_HOME="$HOME/.codex"' bin/5dive-agent-start \
+   && grep -qF 'export CODEX_HOME=$(printf %q "$AGENT_CODEX_HOME")' bin/5dive-agent-start; then
   echo "ok: 5dive-agent-start runs codex on \$HOME/.codex (the file graded above)"
 else
   echo "FAIL: 5dive-agent-start no longer exports CODEX_HOME=\$HOME/.codex — the seat path above is stale"; fail=1

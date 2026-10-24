@@ -6,7 +6,7 @@ set -euo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-START="$ROOT/5dive-agent-start"
+START="$ROOT/bin/5dive-agent-start"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 check() { "$@" || fail "$*"; }

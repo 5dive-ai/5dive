@@ -98,7 +98,7 @@ else
     || t_bad "_skills_install_dir usage line missing: $(cat "$TMP/usage.err")"
 fi
 
-S=./5dive-refresh-skills.sh
+S=./bin/5dive-refresh-skills.sh
 SUM_ATTEMPTED="skills refresh done: 0 changed, 0 unchanged, 1 first-install, 0 failed, 0 awaiting first boot"
 SUM_SKIPPED="skills refresh done: 0 changed, 0 unchanged, 0 first-install, 0 failed, 1 awaiting first boot"
 

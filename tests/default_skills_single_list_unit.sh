@@ -97,14 +97,14 @@ fi
 echo "fake-5dive: unexpected args: \$*" >&2; exit 64
 SH
 chmod +x "$TMP/fake-5dive"
-refresh_plan=$(FIVE_BIN="$TMP/fake-5dive" REFRESH_SKILLS_PRINT_PLAN=1 bash ./5dive-refresh-skills.sh 2>"$TMP/refresh.err")
+refresh_plan=$(FIVE_BIN="$TMP/fake-5dive" REFRESH_SKILLS_PRINT_PLAN=1 bash ./bin/5dive-refresh-skills.sh 2>"$TMP/refresh.err")
 t_eq "refresh plan" "$refresh_plan" "$list_now"
 
 # ...and it must not have a private list to fall back on.
-if grep -qE '^DEFAULT_SKILLS=\(' 5dive-refresh-skills.sh; then
-  t_bad "5dive-refresh-skills.sh carries its own DEFAULT_SKILLS array again (that IS the drift)"
+if grep -qE '^DEFAULT_SKILLS=\(' bin/5dive-refresh-skills.sh; then
+  t_bad "bin/5dive-refresh-skills.sh carries its own DEFAULT_SKILLS array again (that IS the drift)"
 else
-  t_ok "5dive-refresh-skills.sh holds no second list"
+  t_ok "bin/5dive-refresh-skills.sh holds no second list"
 fi
 
 echo "== 4. negative arm: one edit reaches both consumers =="
@@ -138,7 +138,7 @@ fi
 exit 64
 SH
 chmod +x "$TMP/fake-5dive-plus"
-refresh_plus=$(FIVE_BIN="$TMP/fake-5dive-plus" REFRESH_SKILLS_PRINT_PLAN=1 bash ./5dive-refresh-skills.sh 2>/dev/null)
+refresh_plus=$(FIVE_BIN="$TMP/fake-5dive-plus" REFRESH_SKILLS_PRINT_PLAN=1 bash ./bin/5dive-refresh-skills.sh 2>/dev/null)
 t_eq "refresh picks up the added skill" "$refresh_plus" "$list_plus"
 
 echo "== 5. no preseed branch bypasses the helper =="
