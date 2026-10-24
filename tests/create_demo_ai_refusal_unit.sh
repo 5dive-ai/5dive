@@ -93,6 +93,16 @@ fi
 echo '== 5. built binary =='
 SUDO=""; [[ $EUID -eq 0 ]] || { sudo -n true 2>/dev/null && SUDO="sudo -n"; }
 CG=$(_gate_cgroup_pick_line </proc/self/cgroup 2>/dev/null || true)
+# ensure_state's `chown root:claude` aborts under `set -e` before the guard runs
+# on a pristine runner, which has no claude group. Replicate the install
+# invariant (same as grok_freeze_guard_unit.sh); on CI a missing group is a red,
+# never a skip, or the binary arm runs nowhere.
+if [[ -x ./5dive && -n "$SUDO$([[ $EUID -eq 0 ]] && echo root)" ]]; then
+  getent group claude >/dev/null 2>&1 || $SUDO groupadd claude 2>/dev/null || true
+fi
+if [[ -n "${GITHUB_ACTIONS:-}" ]] && ! getent group claude >/dev/null 2>&1; then
+  bad_t 'binary: fixture could not create the claude group' "$(id)"
+fi
 if [[ -x ./5dive && -n "$SUDO" ]] && ! _gate_cgroup_human_capable; then
   # This harness runs as a sudo caller outside shelld and a login session, so it
   # IS an agent to the guard. A bad codex --model is the barrier right after it:
