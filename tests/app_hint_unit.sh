@@ -59,7 +59,7 @@ grep -qE '^\s+_app_hint\)$' src/main.sh && ok "main dispatches _app_hint" || bad
 # and none of the retired connector steps (lodar 10-24: «link is wrong»).
 for f in README.md README.zh-CN.md; do
   top="$(sed -n '1,/^## /p' "$f")"
-  for needle in "https://5dive.app/self-host" "docs/readme-app.png"; do
+  for needle in "https://5dive.app/self-host" "docs/readme-self-host.gif"; do
     [[ "$top" == *"$needle"* ]] && ok "$f top has: $needle" || bad "$f top is missing: $needle"
   done
   for gone in "$install_cmd" "$connect_cmd" "5dive-connector"; do
@@ -74,7 +74,8 @@ for f in README.md README.zh-CN.md; do
     [[ "$top" != *"$gone"* ]] && ok "$f top has no paid pitch: $gone" || bad "$f top still pitches: $gone"
   done
 done
-[[ -s docs/readme-app.png ]] && ok "docs/readme-app.png exists" || bad "docs/readme-app.png missing"
+# DIVE-6881: the still became a short real recording of the link and a reply.
+[[ -s docs/readme-self-host.gif ]] && ok "docs/readme-self-host.gif exists" || bad "docs/readme-self-host.gif missing"
 
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]

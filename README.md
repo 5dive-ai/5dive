@@ -24,7 +24,7 @@ sudo 5dive init
 
 **Then** chat with your agents from your phone, free: [5dive.app/self-host](https://5dive.app/self-host)
 
-<p align="center"><img src="docs/readme-app.png" alt="Chatting with an agent in the 5dive app" width="260"></p>
+<p align="center"><img src="docs/readme-self-host.gif" alt="One line on the server links it, then an agent answers in the 5dive app on a phone" width="280"></p>
 
 5dive runs CLI agents like Claude Code, Codex, OpenClaw, Hermes, Antigravity, Grok, OpenCode and Pi as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent runs as its own Linux user, with permissions you choose.
 

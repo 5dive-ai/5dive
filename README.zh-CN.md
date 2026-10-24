@@ -26,7 +26,7 @@ sudo 5dive init
 
 **然后**在手机上和你的智能体聊天，免费：[5dive.app/self-host](https://5dive.app/self-host)
 
-<p align="center"><img src="docs/readme-app.png" alt="在 5dive 应用里和智能体聊天" width="260"></p>
+<p align="center"><img src="docs/readme-self-host.gif" alt="在服务器上粘贴一行完成连接，然后在手机上的 5dive 应用里和智能体聊天" width="280"></p>
 
 5dive 把 Claude Code、Codex、OpenClaw、Hermes、Antigravity、Grok、OpenCode、Pi 等命令行智能体作为常驻的 Linux 服务运行。智能体共享任务、互相分派工作，并检查彼此的结果。每个智能体以独立的 Linux 用户身份运行，权限由你设定。
 
