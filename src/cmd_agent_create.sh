@@ -2907,6 +2907,51 @@ _create_human_link_do() {
   return 0
 }
 
+# DIVE-6843: the box's free demo AI is the OWNER's trial, not a budget a lead
+# agent may hand to a new agent. On a fresh box Olivia built a Grok trend agent
+# on it (`--auth-profile=demo-ai`, with the demo key read from the connector
+# store and piped to --api-key=-); one research run of 45 turns used the whole
+# allowance, her own chat died on the same key, and the owner heard nothing.
+#
+# WHO is refused: an agent seat. The owner's own surfaces still hire on it — the
+# Mini App and dashboard reach this CLI through shelld (/system.slice/
+# shelld.service), and a person who logs in and sudo's lands in a login session;
+# _gate_cgroup_human_capable accepts exactly those two. Root itself (no SUDO_UID:
+# provisioning, cloud-init, a root timer) is not an agent either. Everything else
+# that came through sudo is: an agent unit, the primary claude session, and the
+# cron or at jobs an agent schedules.
+#
+# A SPEED BUMP, NOT A SECURITY BOUNDARY, like the grok marker above: an agent
+# with sudo can strip SUDO_UID or wrap the call in systemd-run. What it buys is
+# that the ordinary path, the one a lead takes, refuses with the right next
+# step — create it with --defer-auth and send the owner the sign-in link.
+CREATE_DEMO_AI_ACCOUNT="demo-ai"
+
+_create_caller_is_agent() {
+  [[ -n "${SUDO_UID:-}" ]] || return 1
+  _gate_cgroup_human_capable && return 1
+  return 0
+}
+
+# _create_demo_ai_key — the demo-ai account's key, or empty. It lives in the
+# account's combined.env (an OpenRouter key in the Anthropic token slot).
+_create_demo_ai_key() {
+  local f="${AUTH_PROFILES_DIR:-}/${CREATE_DEMO_AI_ACCOUNT}/combined.env"
+  [[ -r "$f" ]] || return 0
+  grep -E '^(ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENROUTER_API_KEY)=.' "$f" 2>/dev/null | head -n 1 \
+    | sed -E 's/^[A-Z_]+=//; s/^["'"'"'](.*)["'"'"']$/\1/' | tr -d ' \r\n'
+}
+
+# _create_uses_demo_ai <profile> <api_key> — rc 0 when the create would run on
+# the demo AI: by naming its account, or by passing its key under another name.
+_create_uses_demo_ai() {
+  local profile="${1:-}" key="${2:-}" demo
+  [[ "$profile" == "$CREATE_DEMO_AI_ACCOUNT" ]] && return 0
+  [[ -n "$key" ]] || return 1
+  demo=$(_create_demo_ai_key)
+  [[ -n "$demo" && "$key" == "$demo" ]]
+}
+
 cmd_create() {
   local name="" type="" channels="none" telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
@@ -3255,6 +3300,12 @@ cmd_create() {
     fi
     valid_api_key "$byo_api_key" \
       || fail "$E_VALIDATION" "api key looks wrong (expected >=10 printable non-space chars)"
+  fi
+  # DIVE-6843: an agent never builds an agent on the demo AI (see
+  # _create_caller_is_agent). Here, after stdin is drained so a piped demo key is
+  # caught too, and before anything is created.
+  if _create_uses_demo_ai "$profile" "$byo_api_key" && _create_caller_is_agent; then
+    fail "$E_VALIDATION" "the box's free demo AI is the owner's trial and cannot run a new agent (one research run uses all of it). Create it with --defer-auth --auth-profile=$name instead, then send the owner the sign-in link from: sudo 5dive agent auth start $type --auth-profile=$name"
   fi
   # DIVE-5503: codex takes --model without --provider (it has no BYO path), so
   # the shape check above never ran for it. Refuse before anything is created:

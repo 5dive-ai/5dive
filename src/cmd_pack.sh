@@ -3187,8 +3187,12 @@ IMPORT_DEMO_AI_ACCOUNT="demo-ai"
 # should bind demo-ai: a claude seat, demo-ai holds a claude credential, and no
 # other account and no shared login (connectors/anthropic.env) holds one. Any of
 # those means the owner has an AI of their own, and the per-agent sign-in stays.
+# DIVE-6843: never for an import an AGENT runs (cmd_agent_create.sh
+# _create_caller_is_agent) — the demo AI is the owner's trial, and a lead's
+# import keeps the per-agent sign-in so the owner is sent a link instead.
 _import_demo_ai_default() {
   [[ "${1:-}" == "claude" && -n "${AUTH_PROFILES_DIR:-}" ]] || return 1
+  declare -F _create_caller_is_agent >/dev/null && _create_caller_is_agent && return 1
   [[ -d "${AUTH_PROFILES_DIR}/${IMPORT_DEMO_AI_ACCOUNT}" ]] || return 1
   lazy_need auth_creds_present
   auth_creds_present claude "$IMPORT_DEMO_AI_ACCOUNT" >/dev/null 2>&1 || return 1
