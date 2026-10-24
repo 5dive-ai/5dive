@@ -2090,6 +2090,23 @@ _task_gate_lang() {
   [[ -n "${TASK_CH_ACCESS:-}" ]] || { printf en; return 0; }
   _gate_lang_of_dir "$(dirname "$TASK_CH_ACCESS")"
 }
+# DIVE-6856: THE PARTNER'S APP, or nothing. A partner box's owner has the
+# partner's own Mini App, never a 5dive one, no terminal, and the partner's rule is
+# that 5dive is never named to a client. The API writes the partner's app link
+# into every seat's channel .env as TELEGRAM_ACCOUNT_URL with each token push
+# (telegramProfileArgs, DIVE-5133), and sends it for no 5dive-owned box, so the
+# line IS the partner marker and the link at once, from the partner's own config.
+# Prints the link for the resolved channel (TASK_CH_ACCESS), else nothing.
+_task_partner_app_url() {
+  local f v
+  [[ -n "${TASK_CH_ACCESS:-}" ]] || return 0
+  f="$(dirname "$TASK_CH_ACCESS")/.env"
+  [[ -r "$f" ]] || return 0
+  v=$(sed -n 's/^TELEGRAM_ACCOUNT_URL=//p' "$f" 2>/dev/null | tail -1)
+  # The shape the API and `agent config` accept (isTelegramAccountUrl).
+  (( ${#v} <= 512 )) && [[ "$v" =~ ^(https|tg)://[^[:space:]\"\'\`]+$ ]] && printf '%s' "$v"
+  return 0
+}
 # The language of <seat>'s paired owner, by name (no TASK_CH_* side effects).
 _seat_owner_lang() { # <seat>
   local t d
@@ -2110,6 +2127,16 @@ _text_has_cyrillic() { # <text>
 # every key is the literal this file printed before DIVE-6433.
 _gate_t() {
   local k="$1"; shift
+  # DIVE-6856: a partner box's owner has no terminal and must never read "5dive",
+  # so the lines that carry a `sudo 5dive` command or send the owner to the 5dive
+  # app read from the partner set. Asked only for those keys, so every other
+  # string costs no extra read.
+  case "$k" in
+    manual_cta|access_cta|onbox_decision|onbox_approval|p_*)
+      if [[ "$k" == p_* || -n "$(_task_partner_app_url)" ]]; then
+        _gate_t_partner "$k" "$@"; return
+      fi ;;
+  esac
   if [[ "$(_task_gate_lang)" == ru ]]; then
     case "$k" in
       head)          printf '%s' "🙋 [$1] ждёт вашего ответа" ;;
@@ -2146,7 +2173,7 @@ _gate_t() {
       secret_link)   printf '%s' "🔑 [$1] нужен ключ $2. Откройте эту одноразовую ссылку и вставьте его там (один раз, ссылка действует $3 мин):"$'\n'"$4"$'\n'"Ключ попадёт прямо на этот сервер, не через 5dive и не через этот чат. Не вставляйте его сюда. Ссылка истекла? Карточка задачи в приложении 5dive создаст новую." ;;
       secret_app)    printf '%s' "🔑 [$1] нужен ключ $2. Откройте эту задачу в приложении 5dive (карточка на 5dive.ai/dashboard/tasks или «Моя команда» в приложении 5dive в Telegram) и нажмите «Открыть защищённую ссылку». Ключ вставляется на странице этого сервера, не через 5dive и не через этот чат. Не вставляйте его сюда." ;;
       secret_box)    printf '%s' "Или на сервере: sudo 5dive secret write $1 --connector=$2 --task=$3 (значение спросит скрыто)." ;;
-      secret_either) printf '%s' "Любой из способов запишет ключ и закроет вопрос. Или нажмите ✅ Передал, когда всё сделано." ;;
+      secret_either) printf '%s' "Любой из способов запишет ключ и сам закроет вопрос." ;;
       secret_button) printf '%s' "🔑 Открыть защищённую ссылку" ;;
       *)             return 1 ;;
     esac
@@ -2185,9 +2212,36 @@ _gate_t() {
     secret_link)   printf '%s' "🔑 [$1] needs the $2 credential. Open this one-time link and paste it there (single use, expires in $3m):"$'\n'"$4"$'\n'"It goes straight to this server, never through 5dive or this chat. Never paste it here. Link expired? The task's card in the 5dive app makes a fresh one." ;;
     secret_app)    printf '%s' "🔑 [$1] needs the $2 credential. Open this task in the 5dive app (its card on 5dive.ai/dashboard/tasks, or My team in the 5dive app on Telegram) and tap Open secure link. You paste it on a page served by this server, never through 5dive or this chat. Never paste it here." ;;
     secret_box)    printf '%s' "On the box instead: sudo 5dive secret write $1 --connector=$2 --task=$3 (it asks for the value, hidden)." ;;
-    secret_either) printf '%s' "Either one writes it and clears this gate. Or tap ✅ Provided once it is done." ;;
+    secret_either) printf '%s' "Either one writes it and clears this gate by itself." ;;
     secret_button) printf '%s' "🔑 Open secure link" ;;
     *)             return 1 ;;
+  esac
+}
+
+# DIVE-6856: the partner-box strings. No "5dive", no command, no task id: the
+# owner answers with a button or in the partner's app.
+_gate_t_partner() {
+  local k="$1"; shift
+  if [[ "$(_task_gate_lang)" == ru ]]; then
+    case "$k" in
+      manual_cta)     printf '%s' "✋ Когда сделаете, нажмите ✅ Готово ниже, и вопрос закроется." ;;
+      access_cta)     printf '%s' "🔓 Это запрос доступа. Ответьте в приложении." ;;
+      onbox_decision|onbox_approval) printf '%s' "Ответьте в приложении." ;;
+      p_secret_link)  printf '%s' "🔑 Ключ $1 вставьте по этой ссылке, не в этот чат:" ;;
+      p_secret_app)   printf '%s' "🔑 Ключ $1 вставьте в приложении: кнопка ниже → «Ждут вашего ответа» → «Открыть защищённую ссылку». Не в этот чат." ;;
+      p_app_button)   printf '%s' "🔑 Открыть приложение" ;;
+      *)              return 1 ;;
+    esac
+    return 0
+  fi
+  case "$k" in
+    manual_cta)     printf '%s' "✋ Tap ✅ Done below once it is handled, which closes this out." ;;
+    access_cta)     printf '%s' "🔓 This is an access request. Answer it in the app." ;;
+    onbox_decision|onbox_approval) printf '%s' "Answer it in the app." ;;
+    p_secret_link)  printf '%s' "🔑 Paste the $1 key at this link, not in this chat:" ;;
+    p_secret_app)   printf '%s' "🔑 Paste the $1 key in the app: button below → Waiting for your answer → Open secure link. Not in this chat." ;;
+    p_app_button)   printf '%s' "🔑 Open the app" ;;
+    *)              return 1 ;;
   esac
 }
 
@@ -2272,10 +2326,17 @@ _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <cha
       #
       # Read from the ROW, not from a parameter: the state that decides is the
       # persisted gate, not what a caller happens to be holding (DIVE-2090).
-      local _sk_row _oob_row
-      _sk_row=$(db "SELECT COALESCE(secret_key,'')||COALESCE(connector,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
+      #
+      # DIVE-6856: and NOT on a drop-target gate either (KEY + connector). There the
+      # write closes the gate itself — the secure link, the app's card and `secret
+      # write --task` all do — so the button could only ever claim a key that is not
+      # there. A partner box's owner tapped it on a key they had never been given, and the
+      # seat was told the key was set. `task answer` refuses that tap now for the
+      # buttons already in chat; this stops new ones. Out-of-band keeps it: the
+      # value goes somewhere this box cannot read, so the tap is the only signal.
+      local _oob_row
       _oob_row=$(db "SELECT COALESCE(secret_oob,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
-      if [[ -n "$_sk_row" || -n "$_oob_row" ]]; then
+      if [[ -n "$_oob_row" ]]; then
         reply_markup='{"inline_keyboard":[[{"text":"'"${label}$(_gate_t provided)"'","callback_data":"tna:'"${numid}"':provided'"${np}"'"}]]}'
       else
         reply_markup=""
@@ -3216,6 +3277,37 @@ _task_need_notify_deliver_now() {
   # the DIVE-117/118 block further down.
   local reply_markup
   reply_markup=$(_task_gate_reply_markup "$numid" "$need_type" "$options" "$recommend" "$human_nonce" "$TASK_CH_TYPE")
+
+  # DIVE-6856: A PARTNER BOX'S SECRET ASK IS THE ASK, ONE PLAIN LINE, AND A BUTTON.
+  # lodar, 2026-10-24, on what a partner box's owner received: no task id, no /task_N, no
+  # command, no 5dive name — header and fallback hint included. The owner has no
+  # terminal and no 5dive app, so everything below that sends them to either is
+  # left out: a minted link is the line plus the link (and a button that opens it);
+  # no link sends them to the partner's own app, whose card mints one.
+  local _papp=""
+  [[ "$need_type" == secret && -n "$secret_key" && -n "$connector" ]] && _papp=$(_task_partner_app_url)
+  if [[ -n "$_papp" ]]; then
+    local _pdrop _purl _pbtn _ptext
+    _pdrop=$(_task_mint_drop_link "$ident" "$secret_key" "$connector")
+    # shellcheck disable=SC2034  # read by cmd_task_need (need.sh) after this returns
+    if [[ -n "$_pdrop" && "$_pdrop" != ONBOX ]]; then TASK_GATE_DROP_LINK_TTL="${_pdrop##*|}"; fi
+    _ptext="$(_task_gate_ask_line "$ask")"
+    [[ -n "$_ptext" ]] && _ptext+=$'\n\n'
+    if [[ -n "$_pdrop" && "$_pdrop" != ONBOX ]]; then
+      _purl="${_pdrop%%|*}"
+      _ptext+="$(_gate_t p_secret_link "$secret_key")"$'\n'"${_purl}"
+      _pbtn=$(jq -nc --arg t "$(_gate_t secret_button)" --arg u "$_purl" '{inline_keyboard: [[{text: $t, url: $u}]]}')
+      _task_send_gate_owner "$_ptext" "$_pbtn" "$numid" "" "$_ptext"
+    else
+      _ptext+="$(_gate_t p_secret_app "$secret_key")"
+      _pbtn=$(jq -nc --arg t "$(_gate_t p_app_button)" --arg u "$_papp" '{inline_keyboard: [[{text: $t, url: $u}]]}')
+      # The plain fallback has no button, so it carries the app's link itself.
+      _task_send_gate_owner "$_ptext" "$_pbtn" "$numid" "" "$_ptext"$'\n'"$_papp"
+    fi
+    [[ "${TASK_SEND_DELIVERED:-0}" != 1 && "${TASK_SEND_NO_TARGET:-0}" == 1 ]] \
+      && _task_gate_first_ask_via_notifier "$@"
+    return 0
+  fi
 
   local _gmode
   _gmode=$(db "SELECT COALESCE(gate_mode,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")

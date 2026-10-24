@@ -855,6 +855,29 @@ cmd_task_answer() {
   if [[ "$nt" == "secret" ]]; then
     local _paths; _paths=$(db "SELECT COALESCE(secret_key,'')||COALESCE(connector,'')||COALESCE(secret_oob,'') FROM tasks WHERE id=${id};")
     [[ -n "$_paths" ]] || fail "$E_CONFLICT" "$ident is a secret gate that names NO delivery path, so nothing can have landed — re-file it with one: --secret-key=<ENV> --connector=<stem>, or --out-of-band=\"<where>\""
+    # DIVE-6856: the same false record one step on, on a gate that DID name a
+    # store. A partner box's owner tapped ✅ Provided on a key they had never been given;
+    # the gate closed and the seat was told "$KEY is set in your environment", found
+    # nothing, and blamed the platform. A drop-target gate (KEY + connector) now
+    # closes only when KEY is in that store, read by the check the secure link's
+    # own close uses. The drop and `secret write --task` write first, so they pass.
+    # A store this process cannot read refuses too: unread is not saved.
+    local _sk _sc _landed=0
+    _sk=$(db "SELECT COALESCE(secret_key,'') FROM tasks WHERE id=${id};")
+    _sc=$(db "SELECT COALESCE(connector,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_sk" && -n "$_sc" ]]; then
+      _secret_key_landed "$_sk" "$_sc" || _landed=$?
+      if (( _landed )); then
+        local _nl _who; _who=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+        _nl=$(_seat_owner_lang "$_who" 2>/dev/null || printf en)
+        _task_store_audit_log "gate.secret-not-landed" refused 0 -- \
+          "id=${id}" "task=${ident}" "key=${_sk}" "connector=${_sc}" "store=$([[ $_landed == 2 ]] && echo unreadable || echo absent)" 2>/dev/null || true
+        if [[ "$_nl" == ru ]]; then
+          fail "$E_CONFLICT" "Ключ ещё не сохранён: откройте защищённую ссылку. ($ident: ${_sk} нет в хранилище ${_sc}$([[ $_landed == 2 ]] && echo ', или его не прочитать отсюда'); вопрос остаётся открытым.)"
+        fi
+        fail "$E_CONFLICT" "The key isn't saved yet: open the secure link. ($ident: ${_sk} is not in the ${_sc} store$([[ $_landed == 2 ]] && echo ', or it cannot be read from here'), so the gate stays open and its seat is not told it is set.)"
+      fi
+    fi
   fi
 
   # DIVE-1117: resolve the gate's stored risk tier now — the human-only + evidence

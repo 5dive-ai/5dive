@@ -142,6 +142,47 @@ rm -f "$CH/lite-lang"; n_none=$(_hb_nudge_text marketing "$id1" DIVE-9101 2>/dev
 check "6a: a ru seat's dispatch says to write the ask in Russian" '[[ "$n_ru" == *"Your owner reads Russian"* ]]' "$n_ru"
 check "6b: an en seat's dispatch is unchanged" '[[ -n "$n_en" && "$n_en" == "$n_none" && "$n_en" != *"Russian"* ]]'
 
+# ---------------------------------------------------------------------------
+# 7. DIVE-6856: a partner box (TELEGRAM_ACCOUNT_URL in the channel .env). The
+#    secret ask is the ask, one plain line and a button: no "5dive", no task id,
+#    no /task_N, no command — first alert and reminder alike. Control: the same
+#    gate on a box with no partner link still renders the 5dive copy.
+# ---------------------------------------------------------------------------
+APP="https://t.me/ExampleAppBot?startapp"
+set_partner() { if [[ -n "$1" ]]; then printf 'TELEGRAM_BOT_TOKEN=t\nTELEGRAM_ACCOUNT_URL=%s\n' "$1" >"$CH/.env"; else rm -f "$CH/.env"; fi; }
+MINT=""; _task_mint_drop_link() { printf '%s' "$MINT"; }
+_secret_drop_live_for() { return 1; }
+clean() { [[ "$1" != *5dive* && "$1" != *DIVE-* && "$1" != */task* && "$1" != *sudo* && "$1" != *tna:* ]]; }
+set_lang ru; seed DIVE-9121; seed DIVE-9122
+cmd_task_need DIVE-9121 --type=secret --from=marketing --ask="Нужен ключ HeyGen для видео." --secret-key=HEYGEN_API_KEY --connector=tools >/dev/null 2>&1
+cmd_task_need DIVE-9122 --type=manual --from=marketing --ask="Подключите домен." >/dev/null 2>&1
+id21=$(db "SELECT id FROM tasks WHERE ident='DIVE-9121';")
+set_partner "$APP"; MINT="";                                 P_APP=$(: >"$SENT"; _task_need_notify_deliver DIVE-9121 secret "Нужен ключ HeyGen для видео." "" "" HEYGEN_API_KEY tools >/dev/null 2>&1; cat "$SENT")
+MINT="https://secrets.example.test/tok123|30";               P_LNK=$(: >"$SENT"; _task_need_notify_deliver DIVE-9121 secret "Нужен ключ HeyGen для видео." "" "" HEYGEN_API_KEY tools >/dev/null 2>&1; cat "$SENT")
+set_partner "";  MINT="";                                    C_APP=$(: >"$SENT"; _task_need_notify_deliver DIVE-9121 secret "Нужен ключ HeyGen для видео." "" "" HEYGEN_API_KEY tools >/dev/null 2>&1; cat "$SENT")
+check "7a: partner, no link: the ask + one plain line, nothing that names 5dive, a task or a command" \
+  'clean "$P_APP" && [[ "$P_APP" == "Нужен ключ HeyGen для видео."* && "$P_APP" == *"HEYGEN_API_KEY"*"Открыть защищённую ссылку"* ]]' "$P_APP"
+check "7b: partner, no link: the one button opens the partner's app (from its config), the plain fallback carries the link" \
+  '[[ $(jq -r ".inline_keyboard[0][0].url" <<<"$(sed -n "/^--MARKUP--$/{n;p;}" <<<"$P_APP")") == "$APP" && "$(sed -n "/^--PLAIN--$/,\$p" <<<"$P_APP")" == *"$APP"* ]]' "$P_APP"
+check "7c: partner, link minted: the line, the link and a button that opens it, still clean" \
+  'clean "$P_LNK" && [[ "$P_LNK" == *"https://secrets.example.test/tok123"* && $(jq -r ".inline_keyboard[0][0].url" <<<"$(sed -n "/^--MARKUP--$/{n;p;}" <<<"$P_LNK")") == "https://secrets.example.test/tok123" ]]' "$P_LNK"
+check "7d: control — the same gate with no partner link keeps the 5dive copy" '[[ "$C_APP" == *"5dive"* && "$C_APP" == *"DIVE-9121"* ]]' "$C_APP"
+set_partner "$APP"
+check "7e: partner manual CTA has no command" '[[ "$(TASK_CH_ACCESS="$CH/access.json" _gate_t manual_cta DIVE-9122)" != *sudo* ]]'
+check "7f: a malformed partner link is not a partner link" \
+  '[[ "$(set_partner "https://x.test/a\"b"; TASK_CH_ACCESS="$CH/access.json" _task_partner_app_url)" == "" ]]'
+set_partner "$APP"   # 7f wrote a malformed one to disk
+_task_agent_channel() { TASK_CH_TOKEN="t"; TASK_CH_ACCESS="$CH/access.json"; TASK_CH_TYPE="claude"; TASK_CH_AGENT="$1"; return 0; }
+db "UPDATE tasks SET gate_pinged_at=NULL WHERE id=${id21};"
+MINT="";  : >"$SENT"; _hb_gate_renag_batch_one marketing "$id21" "marketing" >/dev/null 2>&1; R_APP=$(cat "$SENT")
+db "UPDATE tasks SET gate_pinged_at=datetime('now') WHERE id=${id21};"
+MINT="https://secrets.example.test/tok456|30"; : >"$SENT"; _hb_gate_renag_batch_one marketing "$id21" "marketing" >/dev/null 2>&1; R_LNK=$(cat "$SENT")
+check "7g: partner first contact via the reminder path: clean, and the app button rides it" \
+  'clean "$R_APP" && [[ "$R_APP" == *"Нужен ключ HeyGen"* && "$R_APP" == *"$APP"* ]] && grep -qF "\"url\":\"$APP\"" <<<"$R_APP"' "$R_APP"
+check "7h: partner reminder with a fresh link: clean, and the link is in it" \
+  'clean "$R_LNK" && [[ "$R_LNK" == *"https://secrets.example.test/tok456"* ]]' "$R_LNK"
+set_partner ""
+
 echo "---"
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))
