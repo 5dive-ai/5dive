@@ -18,6 +18,13 @@
 #   * negative controls: non-root, an argument, uid 0, a non-seat uid, an unknown
 #     op, a bad id, an id not offered to this seat, a bad chat id, an empty text, a reply file outside the
 #     outbox (or a symlink in it), no token file: none reaches the network
+#   * DIVE-6816 (chat-only box): pending takes an optional wait (clamped to 25,
+#     curl waits longer); fetch <path> writes an upload only into the caller's
+#     own chat-uploads dir (atomic, 0644, files owner), put <path> posts only the
+#     caller's own outbox copy (seat-owned regular file, O_NOFOLLOW read), both
+#     capped; traversal, another seat's dir, a symlinked seat dir, a symlink or
+#     FIFO swapped in are refused before the network; mutant controls red the
+#     scope and the O_NOFOLLOW arms
 #   * DIVE-6715: status <chat_id> <0|1> [label] and ask <chat_id> <text>
 #     <question_id> (<label> <description>){2,10} post jq-built bodies as the
 #     caller seat, the bearer on stdin, the text and labels off argv; every
@@ -85,6 +92,7 @@ done
 printf '%s\n' "$@" >>"$STUB_CALLS"; printf -- '--\n' >>"$STUB_CALLS"
 cat >>"$STUB_STDINS"; printf -- '--\n' >>"$STUB_STDINS"
 [[ -n "${CURL_FAILS:-}" ]] && exit 7
+[[ -n "${CURL_RC:-}" ]] && exit "$CURL_RC"
 printf '%s' "${CURL_BODY:-{\"pending\":[]\}}" >"$out"
 printf '%s' "${CURL_CODE:-200}"
 STUB
@@ -258,6 +266,131 @@ negm 'ask with a 65-char question id' 'ask: invalid question id' run_root 1042 a
 negm 'ask with an empty label'       'ask: an option label is empty' run_root 1042 ask dashboard hi q1 A '' ' ' ''
 negm 'ask with a 121-char label'     'ask: an option label is over 120' run_root 1042 ask dashboard hi q1 A '' "${L120}x" ''
 negm 'ask with a 201-char description' 'ask: an option description is over 200' run_root 1042 ask dashboard hi q1 A "${D200}x" B ''
+# ── DIVE-6816: long poll, fetch and put (a chat-only box) ────────────────────
+maxt(){ awk 'p=="--max-time"{print; exit} {p=$0}' "$CALLS"; }
+run_root 1042 pending 25; rc=$?
+[[ $rc == 0 ]] && grep -qx 'https://cp.example.test/server/messages/pending?agent=tap&wait=25' "$CALLS" \
+  && ok 'pending 25 asks for a 25 s hold for the caller seat' || bad "pending wait URL (rc=$rc, $(cat "$CALLS" "$TMP/err"))"
+[[ "$(maxt)" == 40 ]] && ok 'pending 25: curl waits longer than the hold (40 s)' || bad "pending wait max-time ($(maxt))"
+run_root 1042 pending 99; rc=$?
+[[ $rc == 0 ]] && grep -qx 'https://cp.example.test/server/messages/pending?agent=tap&wait=25' "$CALLS" \
+  && ok 'pending 99 is clamped to 25' || bad "pending clamp ($(cat "$CALLS"))"
+run_root 1042 pending 0; rc=$?
+[[ $rc == 0 && "$(maxt)" == 30 ]] && grep -qx 'https://cp.example.test/server/messages/pending?agent=tap' "$CALLS" \
+  && ok 'pending 0 is the plain poll' || bad "pending 0 ($(cat "$CALLS"))"
+run_root 1042 pending 007; rc=$?
+[[ $rc == 0 ]] && grep -qx 'https://cp.example.test/server/messages/pending?agent=tap&wait=7' "$CALLS" \
+  && ok 'pending 007 is read as decimal 7' || bad "pending 007 ($(cat "$CALLS"))"
+token_safe tok-two && ok 'pending wait: bearer on stdin, not argv' || bad 'pending wait bearer placement'
+
+ME=$(id -u)
+_gate_uid_to_agent(){ case "$1" in 1042|"$ME") printf 'tap' ;; 1043) printf 'Bad_Name' ;; *) printf '' ;; esac; }
+FIVEDIVE_CHAT_FILE_OWNER="$(id -un):$(id -gn)"
+export FIVEDIVE_CHAT_UPLOADS="$TMP/uploads" FIVEDIVE_CHAT_FILE_OWNER
+UP="$FIVEDIVE_CHAT_UPLOADS"; F1="$UP/tap/1760000000000-photo.png"
+CURL_BODY='PNG bytes' run_root 1042 fetch "$F1"; rc=$?
+[[ $rc == 0 && "$(head -1 "$TMP/out")" == 200 && "$(cat "$F1" 2>/dev/null)" == 'PNG bytes' ]] \
+  && ok 'fetch writes the upload where the message names it' || bad "fetch (rc=$rc, $(cat "$TMP/out" "$TMP/err"))"
+[[ "$(sed -n 2p "$TMP/out" | jq -r '.path, .bytes' 2>/dev/null | paste -sd' ')" == "$F1 9" ]] \
+  && ok 'fetch answers {ok, path, bytes}' || bad "fetch answer ($(cat "$TMP/out"))"
+[[ "$(stat -c %a "$F1")" == 644 && "$(stat -c %a "$UP")" == 755 && "$(stat -c %a "$UP/tap")" == 755 \
+   && "$(stat -c %U:%G "$F1")" == "$FIVEDIVE_CHAT_FILE_OWNER" ]] \
+  && ok 'fetch: 0644 file, 0755 dirs, owned like the files API writes them' || bad "fetch posture ($(ls -la "$UP" "$UP/tap"))"
+grep -qx "https://cp.example.test/server/selfhost/files?path=$(jq -rn --arg p "$F1" '$p|@uri')" "$CALLS" \
+  && ok 'fetch GETs the fixed URL with the path encoded' || bad "fetch URL ($(cat "$CALLS"))"
+grep -qx -- '--max-filesize' "$CALLS" && grep -qx 20971520 "$CALLS" \
+  && ok 'fetch caps the download at 20 MB' || bad "fetch cap ($(cat "$CALLS"))"
+token_safe tok-two && ok 'fetch: bearer on stdin, not argv' || bad 'fetch bearer placement'
+[[ -z "$(find "$UP/tap" -mindepth 1 ! -name 1760000000000-photo.png)" ]] && ok 'fetch leaves no temp file' || bad 'fetch leaves no temp file'
+F2="$UP/tap/1760000000001-gone.webm"
+CURL_CODE=404 CURL_BODY='{"error":"not held"}' run_root 1042 fetch "$F2"; rc=$?
+[[ $rc == 0 && "$(head -1 "$TMP/out")" == 404 && ! -e "$F2" ]] && ok 'fetch passes a 404 through and writes nothing' || bad "fetch 404 (rc=$rc)"
+FIVEDIVE_CHAT_FILE_MAX=4 CURL_BODY='12345' run_root 1042 fetch "$F2"; rc=$?
+[[ $rc == 0 && "$(head -1 "$TMP/out")" == 413 && ! -e "$F2" ]] && ok 'fetch over the cap is 413 and writes nothing' || bad "fetch cap 413 (rc=$rc, $(cat "$TMP/out"))"
+CURL_RC=63 run_root 1042 fetch "$F2"; rc=$?
+[[ $rc == 0 && "$(head -1 "$TMP/out")" == 413 && ! -e "$F2" ]] && ok "curl's max-filesize stop is 413" || bad "fetch rc 63 (rc=$rc)"
+[[ -z "$(find "$UP/tap" -mindepth 1 ! -name 1760000000000-photo.png)" ]] && ok 'a refused fetch leaves no temp file' || bad 'a refused fetch leaves no temp file'
+
+mkdir -p "$UP/other" "$TMP/elsewhere"
+negm 'fetch into another seat dir'      'fetch: the path must name' run_root 1042 fetch "$UP/other/1760000000000-x.png"
+negm 'fetch with a traversal'           'fetch: the path must name' run_root 1042 fetch "$UP/tap/../other/1760000000000-x.png"
+negm 'fetch climbing out of uploads'    'fetch: the path must name' run_root 1042 fetch "$UP/tap/../../connectord.env"
+negm 'fetch below the seat dir'         'fetch: the path must name' run_root 1042 fetch "$UP/tap/sub/x.png"
+negm 'fetch of a dot name'              'fetch: the path must name' run_root 1042 fetch "$UP/tap/.bashrc"
+negm 'fetch of the seat dir itself'     'fetch: the path must name' run_root 1042 fetch "$UP/tap/"
+negm 'fetch outside uploads'            'fetch: the path must name' run_root 1042 fetch "$TMP/elsewhere/x.png"
+negm 'fetch into a seat-name prefix'    'fetch: the path must name' run_root 1042 fetch "$UP/tap-evil/x.png"
+negm 'fetch with no path'               'fetch takes one path' run_root 1042 fetch
+negm 'fetch with two paths'             'fetch takes one path' run_root 1042 fetch "$F1" "$F2"
+mv "$UP/tap" "$UP/tap.real"; ln -s "$TMP/elsewhere" "$UP/tap"
+negm 'fetch through a symlinked seat dir' 'is not a plain directory' run_root 1042 fetch "$UP/tap/1760000000000-x.png"
+[[ -z "$(ls -A "$TMP/elsewhere")" ]] && ok 'nothing was written through the symlink' || bad 'nothing was written through the symlink'
+rm -f "$UP/tap"; mv "$UP/tap.real" "$UP/tap"
+
+P1="$DASHBOARD_OUTBOX/tap-1700000000000-voice.len-3.2s.mp3"
+printf 'ID3\0\1binary' > "$P1"
+CURL_BODY='{"ok":true}' run_root "$ME" put "$P1"; rc=$?
+[[ $rc == 0 && "$(head -1 "$TMP/out")" == 200 ]] && cmp -s "$BODY" "$P1" \
+  && ok 'put posts the seat outbox file byte for byte' || bad "put (rc=$rc, $(cat "$TMP/out" "$TMP/err"))"
+grep -qx "https://cp.example.test/server/selfhost/files?path=$(jq -rn --arg p "$(realpath "$P1")" '$p|@uri')" "$CALLS" \
+  && grep -qx 'Content-Type: application/octet-stream' "$CALLS" \
+  && ok 'put POSTs raw bytes to the fixed URL with the path encoded' || bad "put URL ($(cat "$CALLS"))"
+token_safe tok-two && ok 'put: bearer on stdin, not argv' || bad 'put bearer placement'
+grep -qxF "@$P1" "$CALLS" && bad 'put posts a root-only copy, not the path' || ok 'put posts a root-only copy, not the seat path'
+ls "$TMP/tmpd"/tmp.* >/dev/null 2>&1 && bad 'put leaves no temp file' || ok 'put leaves no temp file'
+printf 'x' > "$DASHBOARD_OUTBOX/other-1-report.txt"; printf 'x' > "$DASHBOARD_OUTBOX/report.txt"; printf 'x' > "$DASHBOARD_OUTBOX/tap-"
+negm 'put of another seat outbox file'  "put: the path must be this seat's" run_root "$ME" put "$DASHBOARD_OUTBOX/other-1-report.txt"
+negm 'put of an unprefixed outbox file' "put: the path must be this seat's" run_root "$ME" put "$DASHBOARD_OUTBOX/report.txt"
+negm 'put of a bare seat prefix'        "put: the path must be this seat's" run_root "$ME" put "$DASHBOARD_OUTBOX/tap-"
+negm 'put of a symlink in the outbox'   "put: the path must be this seat's" run_root "$ME" put "$DASHBOARD_OUTBOX/tap-2-link.txt"
+negm 'put outside the outbox'           "put: the path must be this seat's" run_root "$ME" put "$FIVEDIVE_CONNECTORD_ENV"
+negm 'put with a traversal'             "put: the path must be this seat's" run_root "$ME" put "$DASHBOARD_OUTBOX/../connectord.env"
+negm 'put below the outbox'             "put: the path must be this seat's" run_root "$ME" put "$DASHBOARD_OUTBOX/sub/f"
+negm 'put with no path'                 'put takes one path' run_root "$ME" put
+negm 'put of a file this seat does not own' 'is not a regular file of this seat' run_root 1042 put "$P1"
+FIVEDIVE_CHAT_FILE_MAX=4 negm 'put over the cap' 'is over 4 bytes' run_root "$ME" put "$P1"
+# The swap the path check cannot see: _dash_relay_file_ok passed, then the seat
+# replaced the file with a symlink to a root-only file, or with a FIFO.
+: >"$CALLS"
+( _dash_relay_put https://cp.example.test/x tok "$DASHBOARD_OUTBOX/tap-2-link.txt" "$ME" ) >/dev/null 2>"$TMP/err"; r=$?
+[[ $r != 0 && "$(called)" == 0 ]] && grep -qF 'is a symlink' "$TMP/err" \
+  && ok 'put reader: a symlink swapped in after the check is not followed' || bad "put symlink swap (rc=$r, $(cat "$TMP/err"))"
+mkfifo "$DASHBOARD_OUTBOX/tap-3-fifo"
+: >"$CALLS"
+( timeout 10 bash -c "$(declare -f _dash_relay_put _dash_relay_file_max fail); E_VALIDATION=2; E_GENERIC=1; _dash_relay_put https://cp.example.test/x tok '$DASHBOARD_OUTBOX/tap-3-fifo' '$ME'" ) >/dev/null 2>"$TMP/err"; r=$?
+[[ $r != 0 && $r != 124 && "$(called)" == 0 ]] && grep -qF 'is not a regular file of this seat' "$TMP/err" \
+  && ok 'put reader: a FIFO swapped in is refused, not waited on' || bad "put fifo swap (rc=$r, $(cat "$TMP/err"))"
+
+# ── controls: break each guard, the arm above goes red ───────────────────────
+MUT="$TMP/mutant-scope.sh"
+sed 's|\[\[ "\$p" == "\$root/\$seat/"\* \]\] \|\| return 1|[[ "$p" == "$root/"* ]] \|\| return 1|; s|name="\${p#"\$root/\$seat/"}"|name="${p##*/}"|' \
+  "$SRC/cmd_dashboard_relay.sh" >"$MUT"
+if ! cmp -s "$MUT" "$SRC/cmd_dashboard_relay.sh"; then
+  : >"$CALLS"
+  # shellcheck source=/dev/null
+  ( source "$MUT"; export SUDO_UID=1042; printf '%s\0' fetch "$UP/other/1760000000000-x.png" | cmd_dashboard_relay ) >/dev/null 2>&1; r=$?
+  [[ $r == 0 && "$(called)" == 1 ]] \
+    && ok 'control: with the seat scope dropped, the other-seat fetch arm would go red' \
+    || bad "control: the scope mutant was still refused (rc=$r)"
+else
+  bad 'control: could not build the scope mutant'
+fi
+rm -rf "$UP/other"/*
+MUT="$TMP/mutant-nofollow.sh"
+sed 's/os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK/os.O_RDONLY | os.O_NONBLOCK/' "$SRC/cmd_dashboard_relay.sh" >"$MUT"
+if ! cmp -s "$MUT" "$SRC/cmd_dashboard_relay.sh"; then
+  : >"$CALLS"
+  ln -s "$P1" "$DASHBOARD_OUTBOX/tap-4-link.mp3"
+  # shellcheck source=/dev/null
+  ( source "$MUT"; _dash_relay_put https://cp.example.test/x tok "$DASHBOARD_OUTBOX/tap-4-link.mp3" "$ME" ) >/dev/null 2>&1; r=$?
+  [[ $r == 0 && "$(called)" == 1 ]] \
+    && ok 'control: without O_NOFOLLOW, the symlink-swap arm would go red' \
+    || bad "control: the no-follow mutant still refused the symlink (rc=$r)"
+  rm -f "$DASHBOARD_OUTBOX/tap-4-link.mp3"
+else
+  bad 'control: could not build the no-follow mutant'
+fi
+
 rm -f "$FIVEDIVE_CONNECTORD_ENV"
 neg 'no token file'       run_root 1042 pending
 
