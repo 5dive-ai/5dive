@@ -151,6 +151,17 @@ _saved_name_ok() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,39}$ && "$1" != *- && "$1" != *-
 _saved_key() { local k="${1^^}"; printf '%s' "${k//-/_}"; }
 _saved_name_of() { local n="${1,,}"; printf '%s' "${n//_/-}"; }
 _saved_file() { printf '%s/%s.env' "$CONNECTORS_DIR" "$SECRET_SAVED_CONNECTOR"; }
+# Which site each saved value is for: the browser binds one on first use
+# (5dive-browser, 600 root). A new value or a remove frees it for its next site.
+_saved_hosts_file() { printf '%s/%s.hosts' "$CONNECTORS_DIR" "$SECRET_SAVED_CONNECTOR"; }
+_saved_unbind() {  # <KEY>
+  local f tmp; f=$(_saved_hosts_file)
+  [[ -f "$f" ]] && grep -qE "^${1}=" "$f" || return 0
+  tmp="$(mktemp "${f}.XXXXXX")" || return 1
+  chmod 600 "$tmp"
+  grep -vE "^${1}=" "$f" > "$tmp" || true
+  mv -f "$tmp" "$f"
+}
 
 _saved_names() {
   local f; f=$(_saved_file)
@@ -185,6 +196,7 @@ _secret_saved() {
       chown root:claude "$tmp" 2>/dev/null || true
       chmod 600 "$tmp"
       mv -f "$tmp" "$f"
+      _saved_unbind "$key" || true
       exec 9>&-
       ok "removed $name" '{removed: $n}' --arg n "$name" ;;
     *) fail "$E_USAGE" "usage: 5dive secret saved [ls] | rm <name>" ;;

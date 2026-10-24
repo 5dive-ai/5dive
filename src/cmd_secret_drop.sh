@@ -437,6 +437,7 @@ _secret_drop_redeem() {
       || { rm -f "$f"; fail "$E_CONFLICT" "link is malformed"; }
     ( _secret_write "$key" --connector="$connector" ) >/dev/null 2>&1 \
       || fail "$E_VALIDATION" "value refused: $(_secret_drop_rule "$connector")"
+    _saved_unbind "$key" || true
     _secret_drop_burn_save "$save"
     exec 8>&-
     ok "saved $save" '{task: "", save: $s, key: $k, connector: $c}' --arg s "$save" --arg k "$key" --arg c "$connector"

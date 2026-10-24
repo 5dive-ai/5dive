@@ -933,13 +933,15 @@ code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode "value=again" "$B
 [[ "$code" == 404 ]] && ok_t "L16e the save link is dead after one use" || bad_t "L16e single use" "code=$code"
 # Rewrite: a fresh link for the same name replaces the value; two live links for
 # one name, and using one burns the other.
+printf 'LINKEDIN_PASSWORD=linkedin.com\nGITHUB_TOKEN=github.com\n' > "$CONNECTORS_DIR/saved.hosts"
 o1=$(mint --save=linkedin-password); t1=$(tok_of "$o1")
 o2=$(mint --save=linkedin-password); t2=$(tok_of "$o2")
 V2='new-Pa55'
 code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode "value=$V2" "$B6/$t2")
 [[ "$code" == 200 && "$(grep -c '^LINKEDIN_PASSWORD=' "$SAVED")" == 1 ]] && grep -qxF "LINKEDIN_PASSWORD=$V2" "$SAVED" \
   && ! grep -qF "$V1" "$SAVED" && [[ ! -f "$SECRET_DROP_DIR/$(hash_of "$t1")" ]] \
-  && ok_t "L16f rewrite: a new link for the name replaces the value (one line), and burns the name's other link" \
+  && [[ "$(cat "$CONNECTORS_DIR/saved.hosts")" == 'GITHUB_TOKEN=github.com' ]] \
+  && ok_t "L16f rewrite: a new link for the name replaces the value (one line), burns the name's other link, and frees it from its old site" \
   || bad_t "L16f rewrite" "code=$code env=$(cat "$SAVED")"
 o3=$(mint --save=github-token); t3=$(tok_of "$o3")
 code=$(curl -s -o "$TMP/s3.html" -w '%{http_code}' --data-urlencode $'value=line one\r\nline two' "$B6/$t3")
@@ -961,7 +963,9 @@ rm_out=$( (JSON_MODE=1; _secret_saved rm linkedin-password) 2>&1 ); rc=$?
 rm2=$( (_secret_saved rm linkedin-password) 2>&1 ); rc2=$?
 [[ $rc -eq 0 && $rc2 -ne 0 && "$(jq -c '.data.names' <<<"$( (JSON_MODE=1; _secret_saved ls) 2>&1 )")" == '["github-token"]' ]] \
   && grep -qx 'GITHUB_TOKEN=ghp-fixture-6844' "$SAVED" \
-  && ok_t "L16j saved rm <name> forgets that one and keeps the rest; a second rm says nothing is saved" \
+  && printf 'GITHUB_TOKEN=github.com\n' > "$CONNECTORS_DIR/saved.hosts" && ( _secret_saved rm github-token ) >/dev/null 2>&1 \
+  && [[ ! -s "$CONNECTORS_DIR/saved.hosts" ]] \
+  && ok_t "L16j saved rm <name> forgets that one (and its site) and keeps the rest; a second rm says nothing is saved" \
   || bad_t "L16j remove" "rc=$rc out=$rm_out rc2=$rc2 out2=$rm2 env=$(cat "$SAVED")"
 
 echo
