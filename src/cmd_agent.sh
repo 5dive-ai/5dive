@@ -306,7 +306,7 @@ _cmd_list_legacy() {
     # Same best-effort reads `info` uses; empty -> null (model unset / non-claude
     # effort). Two extra per-agent file reads, in line with the systemctl + b2b
     # reads this loop already does.
-    local amodel aeffort aapproval="" asandbox="" aconfig_source=""
+    local amodel aeffort aapproval="" asandbox="" aconfig_source="" alive=""
     # `|| true`: belt-and-suspenders with the resolvers' own exit-0 contract so a
     # best-effort per-agent config read can never abort the whole list under
     # `set -e` (DIVE-230).
@@ -316,6 +316,8 @@ _cmd_list_legacy() {
       aapproval=$(resolve_codex_setting "$name" approval_policy || true)
       asandbox=$(resolve_codex_setting "$name" sandbox_mode || true)
       aconfig_source="/home/agent-${name}/.codex/config.toml"
+      # DIVE-6888: only an unset model needs the live one (one read per such agent).
+      [[ -n "$amodel" ]] || alive=$(resolve_codex_live_model "$name" || true)
     fi
     # DIVE-1219: surface reachability/autonomy health so the dashboard can badge
     # agents that look up-and-running but are silently broken. Mirrors the
@@ -393,6 +395,7 @@ _cmd_list_legacy() {
     enriched=$(jq -c --arg n "$name" --arg a "$active" --arg e "$sub" --argjson b2b "$b2b" \
       --arg model "$amodel" --arg effort "$aeffort" \
       --arg approval "$aapproval" --arg sandbox "$asandbox" --arg configSource "$aconfig_source" \
+      --arg live "$alive" \
       --argjson hdeaf "$hdeaf" --argjson hasleep "$hasleep" \
       --arg haState "$_ha_state" --arg haExp "$_ha_exp" --arg haRefresh "$_ha_refresh" \
       --arg hsState "$_hs_state" --arg hsReason "$_hs_reason" --arg opState "$_op_state" \
@@ -405,6 +408,8 @@ _cmd_list_legacy() {
                 approvalPolicy: (if $approval == "" then null else $approval end),
                 sandboxMode: (if $sandbox == "" then null else $sandbox end),
                 configSource: (if $configSource == "" then null else $configSource end),
+                liveModel: (if $live == "" then null else ($live | split("|")[0]) end),
+                liveEffort: (if $live == "" then null else ($live | split("|")[1] | if . == "" then null else . end) end),
                 sudo: {grant: $sgClass, runas: $sgRunas, impliedIsolation: $sgImplied,
                        measured: ($sgClass != "unknown"),
                        extraEntries: ($sgExtra == "1")},
@@ -442,6 +447,8 @@ _cmd_list_legacy() {
     approvalPolicy: ($live[.key].approvalPolicy // null),
     sandboxMode: ($live[.key].sandboxMode // null),
     configSource: ($live[.key].configSource // null),
+    liveModel: ($live[.key].liveModel // null),
+    liveEffort: ($live[.key].liveEffort // null),
     # DIVE-2088: same shape `agent info` reports, so one schema serves both
     # readers. `isolation` above is the stored LABEL; `sudo` here is the MEASURED
     # grant; `diverges` is true only when a REAL measurement contradicts the
@@ -903,16 +910,30 @@ def model_and_effort(name, agent_type):
         return obj.get("model") or None, claude_effective_effort(obj)
     if agent_type in ("codex", "grok"):
         text = read_text(os.path.join(home, f".{agent_type}/config.toml")) or ""
+        model = effort = None
         for line in text.splitlines():
             match = re.match(r'^\s*model\s*=\s*"?([^"#]*[^"# ])"?', line)
-            if match:
-                return match.group(1), None
-        return None, None
+            if match and model is None:
+                model = match.group(1)
+            # DIVE-6888: codex's effort, as the shell resolver reads it (the app names "gpt-5.5 · high").
+            match = re.match(r'^\s*model_reasoning_effort\s*=\s*"?([^"#]*[^"# ])"?', line)
+            if match and effort is None and agent_type == "codex":
+                effort = match.group(1)
+        return model, effort
     if agent_type == "antigravity":
         obj = read_json(os.path.join(home, ".gemini/antigravity-cli/settings.json"))
         if isinstance(obj, dict):
             return obj.get("model") or obj.get("selectedModel") or None, None
     return None, None
+
+def codex_live_model(name):
+    # DIVE-6888: with no model in config.toml, codex runs its own pick; the
+    # dispatcher's health names the live thread's model, as `/status` does.
+    obj = read_json(os.path.join(home_root, f"agent-{name}", ".codex/channels/dispatcher/health.json"))
+    if not isinstance(obj, dict) or not isinstance(obj.get("threadModel"), str) or not obj["threadModel"]:
+        return None, None
+    effort = obj.get("threadEffort")
+    return obj["threadModel"], effort if isinstance(effort, str) and effort else None
 
 def classify_sudo(text, measurable):
     if not measurable:
@@ -1126,6 +1147,7 @@ for name, value in agents.items():
     channels = value.get("channels")
     profile = value.get("authProfile") or ""
     model, effort = model_and_effort(name, agent_type)
+    live_model, live_effort = codex_live_model(name) if agent_type == "codex" and not model else (None, None)
     b2b = False
     if channels == "telegram":
         state = access_dir(name, agent_type)
@@ -1185,6 +1207,8 @@ for name, value in agents.items():
         "botToBotEnabled": b2b,
         "model": model,
         "effort": effort,
+        "liveModel": live_model,
+        "liveEffort": live_effort,
         "sudo": sudo,
         "avatar": avatar_info(name),
         "orgBlocksChannels": org_blocks,
@@ -1482,6 +1506,18 @@ resolve_agent_effort() {
       { priv_read "$f" sed -nE 's/^[[:space:]]*model_reasoning_effort[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' "$f" | head -1; } || true ;;
     *) printf '' ;;
   esac
+}
+
+# DIVE-6888: what a codex agent is actually running when its config.toml names
+# no model: its dispatcher's live thread, as telegram-codex's `/status` reads it
+# ("model: <live> (default)"). The app's chat menu shows it, so "what model is
+# it on" is never a blank. Prints "model|effort", or "" with no dispatcher, no
+# thread yet, or an unreadable file. Exit-0 for the same `set -e` reason as above.
+resolve_codex_live_model() {
+  local name="$1" f
+  f="${AGENT_HOME_ROOT:-/home}/agent-${name}/.codex/channels/dispatcher/health.json"
+  { priv_read "$f" jq -r 'select(type == "object" and (.threadModel | type) == "string" and .threadModel != "")
+    | "\(.threadModel)|\(.threadEffort // "")"' "$f"; } || true
 }
 
 resolve_codex_setting() {

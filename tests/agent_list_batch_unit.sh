@@ -62,6 +62,18 @@ PY_CLASS="$(jq -r '.[0].sudo.grant' <<<"$SCOPED")|$(jq -r '.[0].sudo.runas' <<<"
   && ok 'shell and Python sudo classifiers agree on the generated scoped grant' \
   || bad "sudo classifier twins disagree: shell=$SHELL_CLASS python=$PY_CLASS"
 
+# DIVE-6888: codex's model and effort. config.toml's values when set; with no
+# model there, the dispatcher's live thread as liveModel/liveEffort (the app's
+# chat names it, never a blank). A set model never reads the live file.
+mkdir -p "$TMP/home/agent-cx/.codex/channels/dispatcher" "$TMP/home/agent-cy/.codex/channels/dispatcher"
+printf '%s\n' '{"agents":{"cx":{"type":"codex","channels":"none"},"cy":{"type":"codex","channels":"none"}}}' >"$TMP/cx.json"
+printf 'model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n' >"$TMP/home/agent-cx/.codex/config.toml"
+printf 'approval_policy = "never"\n' >"$TMP/home/agent-cy/.codex/config.toml"
+for a in cx cy; do printf '%s' '{"threadModel":"gpt-6-sol","threadEffort":"medium"}' >"$TMP/home/agent-$a/.codex/channels/dispatcher/health.json"; done
+CX=$(python3 "$PY" "$TMP/cx.json" "$TMP/profiles" "$TMP/connectors" "$TMP/home" "$TMP/sudoers" /default 2>/dev/null)
+[[ "$(jq -c '[.[] | [.name, .model, .effort, .liveModel, .liveEffort]]' <<<"$CX")" == '[["cx","gpt-6-astra","high",null,null],["cy",null,null,"gpt-6-sol","medium"]]' ]] \
+  && ok 'codex: config model+effort, else the live thread' || bad "codex model/effort/live: $(jq -c '[.[] | [.name, .model, .effort, .liveModel, .liveEffort]]' <<<"$CX")"
+
 retired_private="/usr/local/bin/5dive agent _list"'_private'
 ! grep -R -Fq "$retired_private" "$ROOT/src" \
   && ok 'retired privileged command name has zero source consumers' \
