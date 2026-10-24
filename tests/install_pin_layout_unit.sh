@@ -24,7 +24,7 @@ bad_t(){ FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 BLOCK=$(sed -n '/^# >>> DIVE-6849 pin layout$/,/^# <<< DIVE-6849 pin layout$/p' install.sh)
 [[ "$BLOCK" == *"resolve_pin_layout"* ]] || { bad_t "extract the DIVE-6849 block from install.sh" "markers not found"; echo "PASS=$PASS FAIL=$FAIL"; exit 1; }
 
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"; rc=$?; echo "HARNESS-RC=$rc"' EXIT
+TMP=$(mktemp -d); trap 'rc=$?; rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
 mkdir -p "$TMP/new/bin" "$TMP/old"
 : > "$TMP/new/bin/host-scripts.manifest"
 
