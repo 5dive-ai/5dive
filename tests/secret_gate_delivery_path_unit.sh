@@ -331,6 +331,7 @@ _gate_seat_busy_elsewhere() { return 1; }
 seed_task DIVE-2411; db "UPDATE tasks SET assignee='dev' WHERE ident='DIVE-2411';"
 NONCE=""
 cmd_task_need DIVE-2411 --type=secret --ask="drop the gmail app password" --secret-key=GMAIL_APP_PASSWORD --connector=gmail >/dev/null 2>&1
+printf 'GMAIL_APP_PASSWORD=x\n' >"$CONNECTORS_DIR/gmail.env"   # it landed (DIVE-6856 refuses a clear with no key)
 cmd_task_answer DIVE-2411 --from=main --human --human-proof="$NONCE" >/dev/null 2>&1
 got=$(cat "$PINGS")
 [[ "$got" == *"GMAIL_APP_PASSWORD is in ${CONNECTORS_DIR}/gmail.env"* && "$got" == *"NOT from the task"* ]] \

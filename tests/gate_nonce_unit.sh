@@ -46,6 +46,7 @@ GATE_SEAM_INPROCESS=1
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
   || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+CONNECTORS_DIR="$TMP/connectors"; mkdir -p "$CONNECTORS_DIR"   # DIVE-6856: a secret answer reads the store
 GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
 GATE_PROOF_ENFORCE="$STATE_DIR/gate-proof.enforce"
 JSON_MODE=1
@@ -212,6 +213,8 @@ _gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }
 
 # --- T5: (c) non-agent SUDO_UID clears with NO proof (drop / human-on-box) ----
 seed_task DIVE-500; cmd_task_need DIVE-500 --type=secret --ask="drop key" --secret-key=FIXTURE_TOKEN --connector=fixture >/dev/null 2>&1
+# The drop writes the value before it clears (DIVE-6856 refuses a clear with no key).
+printf 'FIXTURE_TOKEN=x\n' >"$CONNECTORS_DIR/fixture.env"
 SUDO_UID=0 cmd_task_answer DIVE-500 --human --from=drop >/dev/null 2>&1
 [[ "$(answered DIVE-500)" == "closed" ]] && ok_t "T5 non-agent SUDO_UID (root) clears, no proof (drop path)" \
   || bad_t "T5 non-agent SUDO_UID clears" "still $(answered DIVE-500)"

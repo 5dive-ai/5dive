@@ -53,6 +53,7 @@ done
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
   || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+CONNECTORS_DIR="$TMP/connectors"; mkdir -p "$CONNECTORS_DIR"   # DIVE-6856: a secret answer reads the store
 GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
 GATE_PROOF_ENFORCE="$STATE_DIR/gate-proof.enforce"
 JSON_MODE=1
@@ -175,6 +176,7 @@ _gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }
 # T-DROP: the DIVE-931 drop context (root, SUDO_UID=claude, --from=drop) still clears.
 IS_ROOT=1; REAL_UID="0"; REAL_UN="root"
 seed_gate DIVE-9602 secret
+printf 'FIXTURE_TOKEN=x\n' >"$CONNECTORS_DIR/fixture.env"   # the drop writes before it clears (DIVE-6856)
 SUDO_UID="$CLAUDE_UID" cmd_task_answer DIVE-9602 --human --from=drop >/dev/null 2>&1
 [[ "$(answered DIVE-9602)" == "closed" ]] \
   && ok_t "T-DROP root secret-drop (SUDO_UID=claude) still clears end-to-end" \
