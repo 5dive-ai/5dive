@@ -1024,6 +1024,20 @@ DISKCRON
     fi
   fi
 
+  # DIVE-6853: the heartbeat tick driver. Managed boxes get it from provisioning;
+  # an OSS box got none, so an imported team's board rows never started. The verb
+  # owns the logic: it leaves any existing driver alone (cron.d, a timer, root's
+  # crontab), respects a `heartbeat uninstall` opt-out, and otherwise writes
+  # /etc/cron.d/5dive-heartbeat. Skipped when the installed bundle predates it.
+  if grep -q 'cmd_heartbeat_install' "$BIN_DIR/5dive" 2>/dev/null \
+     && [[ ! -e "${STATE_DIR:-/var/lib/5dive}/heartbeat-driver.off" ]]; then
+    if _hb_out=$("$BIN_DIR/5dive" heartbeat install 2>&1); then
+      ok "heartbeat driver: ${_hb_out#OK — }"
+    else
+      echo "warn: no heartbeat driver on this box, so board work will not start by itself; run 'sudo 5dive heartbeat install' (${_hb_out})" >&2
+    fi
+  fi
+
   # DIVE-948: cap systemd journal growth. With no explicit limit journald drifts
   # to the distro default (~10% of disk, up to 4G); on the small cx plans that's
   # wasteful (boxes were reaching ~500M+/month). Idempotent drop-in, rewritten
@@ -1929,6 +1943,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   rm -f "$BIN_DIR/5dive" "$BIN_DIR/5dive-agent-start" "$BIN_DIR/5dive-agent-stop-notify"
   ok "removed CLI binaries"
   rm -f /etc/cron.d/5dive-disk   # DIVE-5190: its target is the binary just removed
+  rm -f /etc/cron.d/5dive-heartbeat   # DIVE-6853: same
   if [[ -d "$LIB_DIR" ]]; then
     rm -rf "$LIB_DIR"
     ok "removed $LIB_DIR (hooks, skills, ui)"
@@ -2074,7 +2089,9 @@ say "Installing 5dive CLI"
 # boxes).
 say "Installing system dependencies"
 # acl: setfacl keeps `claude` reading the keys moved off group claude (DIVE-5690).
-APT_PKGS="jq tmux git curl python3-yaml unzip sqlite3 acl"
+# cron: runs the heartbeat driver that starts board work (DIVE-6853); a minimal
+# image ships without it.
+APT_PKGS="jq tmux git curl python3-yaml unzip sqlite3 acl cron"
 apt_need=0
 for p in $APT_PKGS; do
   dpkg -s "$p" >/dev/null 2>&1 || { apt_need=1; break; }

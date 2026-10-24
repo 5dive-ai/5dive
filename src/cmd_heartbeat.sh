@@ -951,8 +951,14 @@ _hb_usage() {
         the running conversation across tasks — cheaper, and what main/
         marketing already ran manually before this became the default.
 
-Wire the driver into cron (root), e.g. every 5 minutes:
-  */5 * * * * /usr/local/bin/5dive heartbeat tick >> /var/log/5dive-heartbeat.log 2>&1
+  5dive heartbeat install                 # root: put the tick driver in cron (every 5 min), unless
+                                          # this box already runs one. install.sh and \`agent create\`
+                                          # do this for you; this is the by-hand way back in.
+  5dive heartbeat uninstall               # root: remove the driver this CLI wrote and remember the
+                                          # opt-out, so updates and new agents leave it off
+
+The driver is one cron line:
+  */5 * * * * root /usr/local/bin/5dive heartbeat tick >> /var/log/5dive-heartbeat.log 2>&1
 
 Add --json to any subcommand for machine output.
 USAGE
@@ -969,6 +975,8 @@ cmd_heartbeat() {
     wake-task)       cmd_heartbeat_wake_task "$@" ;;
     held)            cmd_heartbeat_held "$@" ;;
     wake-mode)       cmd_heartbeat_wake_mode "$@" ;;
+    install)         cmd_heartbeat_install "$@" ;;
+    uninstall)       cmd_heartbeat_uninstall "$@" ;;
     -h|--help|help)  _hb_usage ;;
     *) fail "$E_USAGE" "unknown heartbeat command: $sub (try: 5dive heartbeat --help)" ;;
   esac
@@ -1349,6 +1357,79 @@ cmd_heartbeat_off() {
     '.agents[$n].heartbeat = ((.agents[$n].heartbeat // {everyMin: '"$_HB_DEFAULT_EVERY"', fresh: false, lastRunAt: 0}) + {enabled: false})' \
     | registry_write
   ok "heartbeat off for '$name'" '{name:$n, enabled:false}' --arg n "$name"
+}
+
+# -------- DIVE-6853: the tick DRIVER, not just the tick config --------
+#
+# Managed boxes get /etc/cron.d/5dive-heartbeat from provisioning. An OSS box got
+# nothing: install.sh wrote the digest and disk crons and never this one, while
+# `agent create` printed "the tick will hand it board work". Measured on a fresh
+# Ubuntu 24.04 install + `team import startup` (DIVE-6833): every board row sat
+# untouched until someone ran `5dive heartbeat tick` by hand.
+#
+# `_hb_driver_ensure` is the one writer, called by install.sh (every install and
+# update), by `agent create`, and by `heartbeat install`. It answers with one line:
+#   installed:<where>  a driver already exists — /etc/cron.d, a timer, or root's
+#                      crontab (`_routing_receipt_dispatcher`, the same probe the
+#                      routing receipt reads). It is left alone: a second driver
+#                      would double the tick on a box that drives it its own way.
+#   made:<path>        there was none and we wrote one.
+#   off:<why>          the owner removed it with `heartbeat uninstall`; respected.
+#   failed:<why>       there was none and we could not write one.
+_hb_driver_dir()        { printf '%s' "${FIVEDIVE_HB_CRON_DIR:-/etc/cron.d}"; }
+_hb_driver_file()       { printf '%s/5dive-heartbeat' "$(_hb_driver_dir)"; }
+_hb_driver_optout()     { printf '%s/heartbeat-driver.off' "$STATE_DIR"; }
+
+_hb_driver_ensure() {
+  local disp dir file tmp
+  disp=$(_routing_receipt_dispatcher 2>/dev/null) || disp=""
+  case "$disp" in installed:*) printf '%s\n' "$disp"; return 0 ;; esac
+  [[ -e "$(_hb_driver_optout)" ]] && { printf 'off:removed by sudo 5dive heartbeat uninstall\n'; return 0; }
+  dir=$(_hb_driver_dir); file=$(_hb_driver_file)
+  # An unreadable root crontab (not root) is not "absent": writing here would be
+  # a guess, and the dir is root-owned anyway.
+  case "$disp" in unknown:*) printf 'failed:%s\n' "${disp#unknown:}"; return 0 ;; esac
+  [[ -d "$dir" && -w "$dir" ]] || { printf 'failed:%s is missing or not writable\n' "$dir"; return 0; }
+  tmp=$(mktemp "$dir/.5dive-heartbeat.XXXXXX" 2>/dev/null) || { printf 'failed:could not write in %s\n' "$dir"; return 0; }
+  cat > "$tmp" <<'HBCRON'
+# 5dive heartbeat driver (DIVE-6853): every 5 minutes, wake each enrolled agent
+# that has a board row. A no-op until an agent is enrolled ('sudo 5dive heartbeat on').
+# Remove with 'sudo 5dive heartbeat uninstall'. Log: /var/log/5dive-heartbeat.log
+*/5 * * * * root /usr/local/bin/5dive heartbeat tick >> /var/log/5dive-heartbeat.log 2>&1
+HBCRON
+  chmod 644 "$tmp" && mv -f "$tmp" "$file" || { rm -f "$tmp"; printf 'failed:could not write %s\n' "$file"; return 0; }
+  printf 'made:%s\n' "$file"
+}
+
+cmd_heartbeat_install() {
+  require_root "heartbeat install"
+  rm -f "$(_hb_driver_optout)"
+  local r; r=$(_hb_driver_ensure)
+  case "$r" in
+    installed:*) ok "heartbeat driver already running on this box (${r#installed:}) — left as it is" \
+                    '{state:"installed", where:$w}' --arg w "${r#installed:}" ;;
+    made:*)      ok "heartbeat driver installed: ${r#made:} (every 5 min)" \
+                    '{state:"made", where:$w}' --arg w "${r#made:}" ;;
+    *)           fail "$E_GENERIC" "could not install the heartbeat driver: ${r#*:}" ;;
+  esac
+}
+
+cmd_heartbeat_uninstall() {
+  require_root "heartbeat uninstall"
+  local file; file=$(_hb_driver_file)
+  mkdir -p "$STATE_DIR" && : > "$(_hb_driver_optout)"
+  if [[ -f "$file" ]]; then
+    rm -f "$file"
+    ok "heartbeat driver removed ($file) — board rows no longer start by themselves; turn it back on with: sudo 5dive heartbeat install" \
+       '{removed:$f}' --arg f "$file"
+  else
+    local disp; disp=$(_routing_receipt_dispatcher 2>/dev/null) || disp=""
+    case "$disp" in
+      installed:*) ok "no $file to remove, but a driver this CLI did not write still runs: ${disp#installed:} — remove that one by hand" \
+                      '{removed:null, other:$w}' --arg w "${disp#installed:}" ;;
+      *)           ok "no heartbeat driver on this box; it stays off" '{removed:null}' ;;
+    esac
+  fi
 }
 
 # DIVE-1858 Stage 1: get/set an agent's wake mode + wake-budget cap. A read (no
