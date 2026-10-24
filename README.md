@@ -24,14 +24,7 @@ sudo 5dive init
 
 Or let us run it: **5dive cloud**, your own server, set up for you. Full control. [Try it](https://my.5dive.ai/sign-up?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme)
 
-**Talk to your agents from your phone, free.** Paste this on your server:
-
-```sh
-curl -4 -sSL https://api.5dive.com/connector/install.sh | sudo bash
-sudo 5dive-connector connect
-```
-
-Your server shows a code. Type it at **[5dive.app](https://5dive.app)**. `5dive-connector about` shows what it can and can't do on your server.
+**Optional:** chat with your agents from your phone, free: [5dive.app/self-host](https://5dive.app/self-host)
 
 <p align="center"><img src="docs/readme-app.png" alt="Chatting with an agent in the 5dive app" width="260"></p>
 

@@ -2,7 +2,7 @@
 # DIVE-6781: the open-source install tells its users the phone app exists. One
 # block (cmd_app_hint), printed at the end of install.sh and of `5dive init`,
 # silent on a 5dive-built box and on a box whose connector is already linked.
-# The README carries the same two commands, so the three never drift apart.
+# DIVE-6815: the block is the one /self-host link, not the three pairing steps.
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -24,12 +24,15 @@ connect_cmd='sudo 5dive-connector connect'
 export APP_HINT_PROVISIONING_ENV="$tmp/provisioning.env"
 export APP_HINT_CONNECTOR_TOKEN="$tmp/connectord.env"
 
-# 1. A self-hosted, unlinked box gets the block, in the mockup's three steps.
+# 1. A self-hosted, unlinked box gets the block: one line and the full link.
 out="$(cmd_app_hint)"
-for needle in "Talk to your agents from your phone" "Paste this on your server" \
-              "$install_cmd" "$connect_cmd" "Your server shows a code" \
-              "Type the code at https://5dive.app"; do
+for needle in "Optional: chat with your agents from your phone, free:" "https://5dive.app/self-host"; do
   [[ "$out" == *"$needle"* ]] && ok "block names: $needle" || bad "block is missing: $needle"
+done
+# The old pairing-code steps are gone: one way in, not two.
+for gone in "Paste this on your server" "$install_cmd" "$connect_cmd" \
+            "Your server shows a code" "Type the code" "my.5dive.ai"; do
+  [[ "$out" != *"$gone"* ]] && ok "block no longer has: $gone" || bad "block still has: $gone"
 done
 
 # 2. A box 5dive built is already linked to its owner's account: no block.
@@ -52,11 +55,15 @@ grep -q '^5dive _app_hint 2>/dev/null || true$' install.sh && ok "install.sh pri
 [[ "$(declare -f cmd_init)" == *"cmd_app_hint"* ]] && ok "init prints it" || bad "cmd_init does not call cmd_app_hint"
 grep -qE '^\s+_app_hint\)$' src/main.sh && ok "main dispatches _app_hint" || bad "main.sh has no _app_hint verb"
 
-# 6. Both READMEs carry the same commands and the app, above the first section.
+# 6. Both READMEs carry the same one link and the app, above the first section,
+# and none of the retired connector steps (lodar 10-24: «link is wrong»).
 for f in README.md README.zh-CN.md; do
   top="$(sed -n '1,/^## /p' "$f")"
-  for needle in "$install_cmd" "$connect_cmd" "5dive.app" "docs/readme-app.png"; do
+  for needle in "https://5dive.app/self-host" "docs/readme-app.png"; do
     [[ "$top" == *"$needle"* ]] && ok "$f top has: $needle" || bad "$f top is missing: $needle"
+  done
+  for gone in "$install_cmd" "$connect_cmd" "5dive-connector"; do
+    [[ "$top" != *"$gone"* ]] && ok "$f top no longer has: $gone" || bad "$f top still has: $gone"
   done
 done
 [[ -s docs/readme-app.png ]] && ok "docs/readme-app.png exists" || bad "docs/readme-app.png missing"

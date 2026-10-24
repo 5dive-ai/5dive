@@ -47,10 +47,10 @@ _init_note() {
 }
 
 # DIVE-6781: the open-source install never told its users the app exists. One
-# block, printed after install.sh and at the end of `5dive init`, in the words of
-# the own-server onboarding mockup (onboarding-selfhost.5dive.ai): "Paste this on
-# your server" → "Your server shows a code" → "Type the code". Commands are the
-# connector repo's own Connect section. Silent where it would be noise: a box
+# block, printed after install.sh and at the end of `5dive init`. DIVE-6815: the
+# block is one link, 5dive.app/self-host, which signs you in and hands you the
+# one command that links the server, so the old three pairing-code steps are gone
+# (two ways in, in one block, was the wall). Silent where it would be noise: a box
 # 5dive built (provisioning.env, already linked to its owner's account) or a box
 # whose connector is already linked. FIVEDIVE_APP_HINT=0 turns it off.
 cmd_app_hint() {
@@ -63,12 +63,8 @@ cmd_app_hint() {
   fi
   cat <<'HINT'
 
-Talk to your agents from your phone, free:
-  1. Paste this on your server:
-       curl -4 -sSL https://api.5dive.com/connector/install.sh | sudo bash
-       sudo 5dive-connector connect
-  2. Your server shows a code.
-  3. Type the code at https://5dive.app
+Optional: chat with your agents from your phone, free:
+  https://5dive.app/self-host
 
 HINT
 }
