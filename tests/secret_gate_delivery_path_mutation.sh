@@ -127,8 +127,14 @@ grade "M5-answer-refusal" "N6 answering a no-path secret gate is refused" \
 
 # ── the affordance ───────────────────────────────────────────────────────────
 grade "M6-affordance-withheld" "N7 no ✅ Provided affordance" \
-  '      if [[ -n "$_sk_row" || -n "$_oob_row" ]]; then' \
+  '      if [[ -n "$_oob_row" ]]; then' \
   '      if true; then'
+
+# DIVE-6856: the store check. Without it a tap on an empty drop-target gate
+# closes it and tells the seat the key is set.
+grade "M9-store-check" "N9 a drop-target gate with no KEY in its store refuses" \
+  '      if (( _landed )); then' \
+  '      if false; then'
 
 # ── the acceptance direction ─────────────────────────────────────────────────
 # A re-file carries the delivery path forward. src/council/engine.mjs re-files an

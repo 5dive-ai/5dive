@@ -4420,6 +4420,15 @@ _gate_drop_link_ok() { # <task id> <link hash>
      && "$(sed -n 's/^connector=//p' "$f")" == "$conn" ]] || return 1
   local exp; exp=$(sed -n 's/^expires=//p' "$f")
   [[ "$exp" =~ ^[0-9]+$ ]] && (( exp > $(date +%s) )) || return 1
+  _secret_key_landed "$key" "$conn"
+}
+
+# _secret_key_landed <KEY> <connector> — is KEY in the store the drop write uses
+# for that connector? 0 = it is, 1 = it is not, 2 = this process cannot read the
+# store, so it cannot tell. Shared by the redeemed-link check above and by
+# `task answer` (DIVE-6856), so a ✅ Provided tap and the page ask the same file.
+_secret_key_landed() { # <KEY> <connector>
+  local key="$1" conn="$2"
   local cdir="${CONNECTORS_DIR:-/etc/5dive/connectors}"
   # DIVE-5772: two connectors do not write `<conn>.env`, so reading only that file
   # refused EVERY drop to them and the gate stayed open after the value landed
@@ -4427,19 +4436,23 @@ _gate_drop_link_ok() { # <task id> <link hash>
   # shared tools.sh, as `export KEY='value'` (DIVE-5370); `project-<app>` is that
   # app's own .env/.env.local (DIVE-5664). Same question, the file the write used.
   if [[ "$conn" == tools ]]; then
+    [[ -e "${cdir}/tools.sh" && ! -r "${cdir}/tools.sh" ]] && return 2
     grep -qE "^export ${key}='[^']" "${cdir}/tools.sh" 2>/dev/null
     return
   fi
   if [[ "$conn" == project-* ]]; then
     local pf; pf=$(_secret_project_file "$conn" 2>/dev/null) || return 1
+    [[ -e "$pf" && ! -r "$pf" ]] && return 2
     grep -qE "^(export[[:space:]]+)?${key}=." "$pf" 2>/dev/null
     return
   fi
-  grep -q "^${key}=" "${cdir}/${conn}.env" 2>/dev/null && return 0
+  local ef="${cdir}/${conn}.env"
+  [[ -e "$ef" && ! -r "$ef" ]] && return 2
+  grep -q "^${key}=" "$ef" 2>/dev/null && return 0
   # DIVE-5384: a multi-line value landed as its own file, named by our exact
   # pointer line. Both must hold: the line, and a non-empty regular file.
   local vf="${cdir}/${conn}.d/${key}"
-  grep -qxF "${key}_FILE=${vf}" "${cdir}/${conn}.env" 2>/dev/null && [[ -f "$vf" && ! -L "$vf" && -s "$vf" ]]
+  grep -qxF "${key}_FILE=${vf}" "$ef" 2>/dev/null && [[ -f "$vf" && ! -L "$vf" && -s "$vf" ]]
 }
 
 # ── DIVE-756: persisted closure signature (tamper-evidence) ──────────────────

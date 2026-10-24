@@ -1704,6 +1704,34 @@ cmd_task_answer() {
   fi
   local _uidsql="NULL"; [[ -n "$_uid" ]] && _uidsql="$_uid"
 
+  # DIVE-6856: the DIVE-2411 false record one step on, on a gate that DID name a
+  # store. A partner box's owner tapped ✅ Provided on a key they had never been
+  # given; the gate closed and the seat was told "$KEY is set in your environment",
+  # found nothing, and blamed the platform. A drop-target gate (KEY + connector)
+  # now closes only when KEY is in that store, read by the check the secure link's
+  # own close uses. The drop and `secret write --task` write first, so they pass.
+  # A store this process cannot read refuses too: unread is not saved. Placed
+  # after every provenance check and before the write: who may answer is decided
+  # first, and a refused answer never moves the row.
+  if [[ "$nt" == "secret" ]]; then
+    local _sk _sc _landed=0
+    _sk=$(db "SELECT COALESCE(secret_key,'') FROM tasks WHERE id=${id};")
+    _sc=$(db "SELECT COALESCE(connector,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_sk" && -n "$_sc" ]]; then
+      _secret_key_landed "$_sk" "$_sc" || _landed=$?
+      if (( _landed )); then
+        local _nl _who; _who=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+        _nl=$(_seat_owner_lang "$_who" 2>/dev/null || printf en)
+        _task_store_audit_log "gate.secret-not-landed" refused 0 -- \
+          "id=${id}" "task=${ident}" "key=${_sk}" "connector=${_sc}" "store=$([[ $_landed == 2 ]] && echo unreadable || echo absent)" 2>/dev/null || true
+        if [[ "$_nl" == ru ]]; then
+          fail "$E_CONFLICT" "Ключ ещё не сохранён: откройте защищённую ссылку. ($ident: ${_sk} нет в хранилище ${_sc}$([[ $_landed == 2 ]] && echo ', или его не прочитать отсюда'); вопрос остаётся открытым. Агенту: скажите владельцу, что ключ не дошёл, и заново подайте запрос ключа — придёт новая ссылка.)"
+        fi
+        fail "$E_CONFLICT" "The key isn't saved yet: open the secure link. ($ident: ${_sk} is not in the ${_sc} store$([[ $_landed == 2 ]] && echo ', or it cannot be read from here'), so the gate stays open and its seat is not told it is set. Agent: tell the owner the key has not arrived and re-file the secret gate, which sends a fresh link.)"
+      fi
+    fi
+  fi
+
   # Record the answer. A `secret` gate NEVER stores its value — writing a raw
   # key into this group-claude-readable db is a plaintext-secret-at-rest leak.
   # We only stamp need_answered_at (the "provided" signal); the agent loads the

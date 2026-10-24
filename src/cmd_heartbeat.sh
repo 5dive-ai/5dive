@@ -6506,7 +6506,10 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
   _n_all=$(db "SELECT COUNT(*) FROM tasks WHERE id IN (${idlist});" 2>/dev/null)
   [[ "${_n_new:-0}" -gt 0 && "$_n_new" == "$_n_all" ]] && _all_new=1
   local text
-  if (( _all_new )) && [[ "$_n_all" == 1 ]]; then
+  # DIVE-6856: a partner box's owner never reads a task id, a command or "5dive"
+  # in a secret ask (the first alert's rule, _task_need_notify_deliver_now).
+  local _papp; _papp=$(_task_partner_app_url)
+  if (( _all_new )) && [[ "$_n_all" == 1 && -z "$_papp" ]]; then
     _first_ident=$(db "SELECT ident FROM tasks WHERE id IN (${idlist});" 2>/dev/null)
     text=$(_gate_t head "$_first_ident")
   elif (( _all_new )); then
@@ -6524,7 +6527,11 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
     IFS=$'\x1f' read -r id ident ntype options recommend gtier isnew skey sconn ask <<<"$row"
     [[ -n "$id" && -n "$ident" ]] || continue
     _new_mark=""; [[ "$isnew" == 1 ]] && (( ! _all_new )) && _new_mark="🆕 "
-    text+=$'\n\n'"• ${_new_mark}[${ident}] $(_gate_t type "$ntype") — ${ask} /task_${id}"
+    if [[ -n "$_papp" && "$ntype" == secret && -n "$skey" && -n "$sconn" ]]; then
+      text+=$'\n\n'"• ${_new_mark}${ask}"
+    else
+      text+=$'\n\n'"• ${_new_mark}[${ident}] $(_gate_t type "$ntype") — ${ask} /task_${id}"
+    fi
     # DIVE-4381 iteration 2: the THIRD human-facing gate composer, and the one
     # that best matches this row's motivation — the re-nag is the message a
     # founder reads when a gate has SAT for an hour or a day, which is exactly
@@ -6547,7 +6554,15 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
     if [[ "$ntype" == secret && -n "$skey" && -n "$sconn" ]] \
        && { [[ "$isnew" == 1 ]] || ! _secret_drop_live_for "$ident" >/dev/null 2>&1; }; then
       _drop=$(_task_mint_drop_link "$ident" "$skey" "$sconn")
-      if [[ -n "$_drop" && "$_drop" != ONBOX ]]; then
+      if [[ -n "$_papp" && -n "$_drop" && "$_drop" != ONBOX ]]; then
+        text+=$'\n'"  $(_gate_t p_secret_link "$skey")"$'\n'"  ${_drop%%|*}"
+      elif [[ -n "$_papp" ]]; then
+        # The text says "the button below": give it one; the link stays in the
+        # text for the keyboard-less fallback.
+        text+=$'\n'"  $(_gate_t p_secret_app "$skey")"$'\n'"  ${_papp}"
+        rows=$(jq -cn --argjson a "$rows" --arg t "$(_gate_t p_app_button)" --arg u "$_papp" \
+          'if any($a[][]; .url? == $u) then $a else $a + [[{text: $t, url: $u}]] end' 2>/dev/null) || rows='[]'
+      elif [[ -n "$_drop" && "$_drop" != ONBOX ]]; then
         text+=$'\n'"  $(_gate_t secret_link "$ident" "$skey" "${_drop##*|}" "${_drop%%|*}")"
       else
         text+=$'\n'"  $(_gate_t secret_app "$ident" "$skey")"
@@ -6579,7 +6594,10 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
 
   local reply_markup=""
   [[ "$rows" != "[]" ]] && reply_markup=$(jq -cn --argjson rows "$rows" '{inline_keyboard:$rows}' 2>/dev/null) || true
-  if (( _all_new )); then text+=$'\n\n'"$(_gate_t first_foot)"
+  # DIVE-6856: the foot points at /task links and a dashboard a partner box's
+  # owner does not have; the buttons above are the whole answer there.
+  if [[ -n "$_papp" ]]; then :
+  elif (( _all_new )); then text+=$'\n\n'"$(_gate_t first_foot)"
   else text+=$'\n\n'"$(_gate_t renag_foot)"; fi
   # DIVE-2073: mark the rail so the delivery row can say which path it is on.
   # This sweep runs as root from cron with no invoking user, so `user` on the row

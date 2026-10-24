@@ -40,9 +40,12 @@
 #   P1  drop target files and is stored
 #   P2  explicit --out-of-band files and is stored
 #   P3  a re-file inherits the drop target (the council-escalation shape)
-#   P4  a drop-target gate still ANSWERS (the legitimate `secret write` case)
+#   P4  a drop-target gate still ANSWERS once the KEY is in its store (the
+#       legitimate `secret write` case)
+#   N9  a drop-target gate whose KEY is NOT in its store refuses the answer, the
+#       row does not move, and the reason says the key is not saved (DIVE-6856)
 #   P5  an out-of-band gate still ANSWERS
-#   P6  drop-target gate still gets its ✅ Provided button
+#   N9b no ✅ Provided button on a drop-target gate: the write closes it (DIVE-6856)
 #   P7  out-of-band gate still gets its ✅ Provided button
 #   T8  the no-path gate's alert text names the missing path and offers no tap
 #   N8  a --connector=tools gate for a non-key name (PATH, LD_PRELOAD, HTTPS_PROXY,
@@ -83,6 +86,7 @@ GATE_SEAM_INPROCESS=1
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
   || printf 'gate seam: UNRESOLVED (tests/lib/gate_seam.sh not reachable); a refusal inside cmd_task_need will abort this harness\n' >&2
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+CONNECTORS_DIR="$TMP/connectors"; mkdir -p "$CONNECTORS_DIR"   # DIVE-6856: answers read the store
 JSON_MODE=1
 mkdir -p "$TASKS_DIR"; set +e
 
@@ -222,16 +226,25 @@ got="$(field DIVE-2408 need_answered_at)|$(field DIVE-2408 need_answered_by)|$(f
   && ok_t "N6b the refused answer left no provenance (answered_at/by/sig NULL, still blocked)" \
   || bad_t "N6b the refused answer left no provenance (answered_at/by/sig NULL, still blocked)" "got: $got"
 
-# --- P4: a drop-target gate still ANSWERS (do not brick `secret write`) ------
-# This is the legitimate case the affordance exists for: "I already ran
-# `5dive secret write` on the box myself" — true on a gate that named a target.
+# --- N9: a drop-target gate with NOTHING in its store cannot be stamped -------
+# DIVE-6856, measured on a partner box: the owner tapped ✅ Provided on a key they
+# had never been given, the gate closed, and the seat was told the key was set.
 seed_task DIVE-2409
 NONCE=""
 cmd_task_need DIVE-2409 --type=secret --ask="drop the GH_BOT_TOKEN" --secret-key=GH_BOT_TOKEN --connector=github-bot >/dev/null 2>&1
 out=$(cmd_task_answer DIVE-2409 --from=main --human --human-proof="$NONCE" 2>&1); rc=$?
+[[ $rc -ne 0 && "$out" == *"The key isn't saved yet: open the secure link"* && "$(field DIVE-2409 need_answered_at)" == "∅" && "$(field DIVE-2409 status)" == "blocked" ]] \
+  && ok_t "N9 a drop-target gate with no KEY in its store refuses 'provided' and stays open" \
+  || bad_t "N9 a drop-target gate with no KEY in its store refuses 'provided' and stays open" "rc=$rc answered_at=$(field DIVE-2409 need_answered_at) out=$out"
+
+# --- P4: a drop-target gate still ANSWERS (do not brick `secret write`) ------
+# This is the legitimate case: "I already ran `5dive secret write` on the box
+# myself" — the KEY is in the store the gate named, so the answer lands.
+printf 'GH_BOT_TOKEN=x\n' > "$CONNECTORS_DIR/github-bot.env"
+out=$(cmd_task_answer DIVE-2409 --from=main --human --human-proof="$NONCE" 2>&1); rc=$?
 [[ $rc -eq 0 && "$(field DIVE-2409 need_answered_at)" != "∅" ]] \
-  && ok_t "P4 a drop-target secret gate still accepts a human 'provided' answer" \
-  || bad_t "P4 a drop-target secret gate still accepts a human 'provided' answer" "rc=$rc answered_at=$(field DIVE-2409 need_answered_at) out=$out"
+  && ok_t "P4 a drop-target secret gate still accepts a human 'provided' answer once the KEY is saved" \
+  || bad_t "P4 a drop-target secret gate still accepts a human 'provided' answer once the KEY is saved" "rc=$rc answered_at=$(field DIVE-2409 need_answered_at) out=$out"
 
 # --- P5: an explicitly out-of-band gate still ANSWERS ------------------------
 # Its ask NAMED where the value goes, so "I put it there" is a coherent claim.
@@ -254,11 +267,11 @@ got=$(kb DIVE-2408)
   && ok_t "N7 no ✅ Provided affordance is offered on a no-path secret gate" \
   || bad_t "N7 no ✅ Provided affordance is offered on a no-path secret gate" "markup: $got"
 
-# --- P6/P7: the button survives where it MEANS something ---------------------
+# --- N9b: no button on a drop-target gate; P7: it survives on out-of-band ------
 got=$(kb DIVE-2405)
-[[ "$got" == *'"tna:'*':provided'* ]] \
-  && ok_t "P6 a drop-target secret gate still gets its ✅ Provided button" \
-  || bad_t "P6 a drop-target secret gate still gets its ✅ Provided button" "markup: $got"
+[[ "$got" != *"provided"* ]] \
+  && ok_t "N9b no ✅ Provided button on a drop-target secret gate (its write closes it)" \
+  || bad_t "N9b no ✅ Provided button on a drop-target secret gate (its write closes it)" "markup: $got"
 got=$(kb DIVE-2406)
 [[ "$got" == *'"tna:'*':provided'* ]] \
   && ok_t "P7 an out-of-band secret gate still gets its ✅ Provided button" \
@@ -318,6 +331,7 @@ _gate_seat_busy_elsewhere() { return 1; }
 seed_task DIVE-2411; db "UPDATE tasks SET assignee='dev' WHERE ident='DIVE-2411';"
 NONCE=""
 cmd_task_need DIVE-2411 --type=secret --ask="drop the gmail app password" --secret-key=GMAIL_APP_PASSWORD --connector=gmail >/dev/null 2>&1
+printf 'GMAIL_APP_PASSWORD=x\n' >"$CONNECTORS_DIR/gmail.env"   # it landed (DIVE-6856 refuses a clear with no key)
 cmd_task_answer DIVE-2411 --from=main --human --human-proof="$NONCE" >/dev/null 2>&1
 got=$(cat "$PINGS")
 [[ "$got" == *"GMAIL_APP_PASSWORD is in ${CONNECTORS_DIR}/gmail.env"* && "$got" == *"NOT from the task"* ]] \
