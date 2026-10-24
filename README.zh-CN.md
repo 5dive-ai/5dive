@@ -24,7 +24,7 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-**可选：** 在手机上和你的智能体聊天，免费：[5dive.app/self-host](https://5dive.app/self-host)
+**然后**在手机上和你的智能体聊天，免费：[5dive.app/self-host](https://5dive.app/self-host)
 
 <p align="center"><img src="docs/readme-app.png" alt="在 5dive 应用里和智能体聊天" width="260"></p>
 

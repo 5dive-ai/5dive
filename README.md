@@ -22,9 +22,7 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-Or let us run it: **5dive cloud**, your own server, set up for you. Full control. [Try it](https://my.5dive.ai/sign-up?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme)
-
-**Optional:** chat with your agents from your phone, free: [5dive.app/self-host](https://5dive.app/self-host)
+**Then** chat with your agents from your phone, free: [5dive.app/self-host](https://5dive.app/self-host)
 
 <p align="center"><img src="docs/readme-app.png" alt="Chatting with an agent in the 5dive app" width="260"></p>
 
