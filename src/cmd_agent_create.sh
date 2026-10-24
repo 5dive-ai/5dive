@@ -2968,7 +2968,7 @@ cmd_create() {
   local isolation="" isolation_explicit=0 no_team_bot=0
   # DIVE-4269: a created seat is ENROLLED in the heartbeat by default. See the
   # enrolment block near the self-check for why the default flipped.
-  local no_heartbeat=0 heartbeat_every=""
+  local no_heartbeat=0 heartbeat_every="" _hb_driver=""
   local autonomy="standard"   # DIVE-499
   local can_push=0            # DIVE-1462/STEER-4: delegated-push (builder) capability
   local can_deploy=0          # INST-5: delegated-deploy (production ship) capability
@@ -4198,7 +4198,17 @@ cmd_create() {
     # which is the only behaviour that is safe here: the agent is already up, so
     # nothing about enrolment may fail the create.
     if ( with_registry_lock cmd_heartbeat_on "${_hb_args[@]}" ) >/dev/null 2>&1; then
-      step "heartbeat enrolled for '$name'${heartbeat_every:+ (every $heartbeat_every)} — the tick will hand it board work (opt out at create with --no-heartbeat; turn it off later with: sudo 5dive heartbeat off $name)"
+      # DIVE-6853: enrolment is config; the cron that runs the tick is the driver.
+      # An OSS box had none, so the create promised a tick that never ran there.
+      # Make sure one exists, and only promise the tick when it does.
+      _hb_driver=$(_hb_driver_ensure 2>/dev/null) || _hb_driver="failed:driver check did not run"
+      case "$_hb_driver" in
+        installed:*|made:*)
+          [[ "$_hb_driver" == made:* ]] && step "heartbeat driver installed: ${_hb_driver#made:} (every 5 min; remove with: sudo 5dive heartbeat uninstall)"
+          step "heartbeat enrolled for '$name'${heartbeat_every:+ (every $heartbeat_every)} — the tick will hand it board work (opt out at create with --no-heartbeat; turn it off later with: sudo 5dive heartbeat off $name)" ;;
+        *)
+          warn "heartbeat enrolled for '$name', but there is no heartbeat driver on this box (${_hb_driver#*:}): board work will not start by itself; run: sudo 5dive heartbeat install" ;;
+      esac
     else
       warn "heartbeat enrolment FAILED for '$name' — the agent is up but nothing will wake it. Enrol it by hand: sudo 5dive heartbeat on $name"
     fi
@@ -4211,7 +4221,10 @@ cmd_create() {
   local _hb
   _hb=$(jq -r --arg n "$name" '.agents[$n].heartbeat.enabled // false' <<<"$(registry_read)" 2>/dev/null || echo false)
   if [[ "$_hb" == "true" ]]; then
-    _hc_ok+=("heartbeat on")
+    case "$_hb_driver" in
+      installed:*|made:*) _hc_ok+=("heartbeat on") ;;
+      *) _hc_issues+=("heartbeat on but NO DRIVER on this box (board rows will not start by themselves): sudo 5dive heartbeat install") ;;
+    esac
   elif (( no_heartbeat )); then
     _hc_ok+=("heartbeat off by request (--no-heartbeat) — human-driven seat, board rows assigned here are not auto-dispatched")
   else
