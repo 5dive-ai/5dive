@@ -48,7 +48,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT" || exit 1
 PASS=0; FAIL=0
 ok_t(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t(){ FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
-SCRIPT="$ROOT/5dive-refresh-plugins.sh"
+SCRIPT="$ROOT/bin/5dive-refresh-plugins.sh"
 CACHE_REL=".claude/mcp-needs-auth-cache.json"
 
 # ==============================================================================

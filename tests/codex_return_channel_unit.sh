@@ -52,7 +52,7 @@ check "doc offers a 5dive bug report"   'grep -q "## When 5dive itself fails" <<
 check "doc sends only owner-approved"  'grep -qF -- "--file --owner-approved" <<<"$doc" && grep -qF "never send without it" <<<"$doc"'
 check "doc skips cosmetic issues"      'grep -qF "Skip cosmetic issues" <<<"$doc"'
 bug_line='`5dive bug --what="<what failed>" --verb=<command> --file --owner-approved`'
-check "doc send line matches team block" 'grep -qF -- "$bug_line" <<<"$doc" && grep -qF -- "$bug_line" team-CLAUDE.md'
+check "doc send line matches team block" 'grep -qF -- "$bug_line" <<<"$doc" && grep -qF -- "$bug_line" prompts/team-CLAUDE.md'
 # A different agent name interpolates through, not a hardcoded "andy".
 doc2=$(_codex_operating_baseline_doc worker7)
 check "doc interpolates any name"      '[[ "$doc2" == *"You (worker7)"* ]]'

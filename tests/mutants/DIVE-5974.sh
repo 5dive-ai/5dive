@@ -6,9 +6,9 @@ set -uo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 # m1: the 10-09 "Except a hire" clause comes back on the go-ahead line -> the
 # go-ahead-line arms and the no-yes negative control red.
-m1() { sed -i 's/\*\*Hires too:\*\* hire your pick, tell them who ("fire <name>" undoes it); one needing a plan upgrade waits for a yes\./**Except a hire:** wait for their yes; "I need someone to…" or "full authority" is not one, naming the agent is./' projects-CLAUDE.md; }
+m1() { sed -i 's/\*\*Hires too:\*\* hire your pick, tell them who ("fire <name>" undoes it); one needing a plan upgrade waits for a yes\./**Except a hire:** wait for their yes; "I need someone to…" or "full authority" is not one, naming the agent is./' prompts/projects-CLAUDE.md; }
 # m2: the money case is dropped -> the plan-upgrade arm reds.
-m2() { sed -i 's/; one needing a plan upgrade waits for a yes\././' projects-CLAUDE.md; }
+m2() { sed -i 's/; one needing a plan upgrade waits for a yes\././' prompts/projects-CLAUDE.md; }
 # m3: the market pick goes back to "a need is not a yes" -> the market arms red.
 m3() { sed -i 's/your owner.s ask is the go-ahead: admin, hire your pick, then tell them who (\\"fire <name>\\" undoes it); Standard-tier, send them 5dive hire-link <slug>/your owner'"'"'s need is not a yes, nor is a standing \\"full authority\\": name your pick to them; hire it once they say yes (or named it)/' src/cmd_pack.sh; }
 # m4: the custom draft goes back to "only on their clear yes" -> the --create arms red.

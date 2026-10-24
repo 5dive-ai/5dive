@@ -19,7 +19,7 @@
 #   G  `agent import --human=` is forwarded to create.
 #   M  mutants: each restores one 0.51.0 behaviour and a named arm goes red.
 #
-# Run against another tree (e.g. pre-fix main): NCIM_SRC=<dir>/src NCIM_START=<dir>/5dive-agent-start
+# Run against another tree (e.g. pre-fix main): NCIM_SRC=<dir>/src NCIM_START=<dir>/bin/5dive-agent-start
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -27,7 +27,7 @@ set -uo pipefail
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 SRC="${NCIM_SRC:-src}"
-START="${NCIM_START:-5dive-agent-start}"
+START="${NCIM_START:-bin/5dive-agent-start}"
 
 TMP="$(mktemp -d /tmp/codex-import-mem-unit.XXXXXX)"
 

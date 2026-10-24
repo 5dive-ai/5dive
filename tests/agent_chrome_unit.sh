@@ -45,7 +45,7 @@ t 'W1 chrome=off removes the line' 0 "$(grep -c 'AGENT_CHROME' "$ENV_DIR/swan.en
 t 'W1 the config verb knows the key' 1 "$(grep -c '^      chrome|--chrome)$' src/cmd_agent_config.sh)"
 
 # --- L*: the launcher block, run as written -------------------------------------
-blk=$(awk '/^# DIVE-6345: Claude in Chrome for this agent/,/^fi$/' 5dive-agent-start)
+blk=$(awk '/^# DIVE-6345: Claude in Chrome for this agent/,/^fi$/' bin/5dive-agent-start)
 [[ -n "$blk" ]] || { echo "FAIL - launcher block not found"; exit 1; }
 launch() {  # launch <AGENT_CHROME> <home> -> "ARGS|UNSET_CREDS|stderr"
   ( TYPE=claude NAME=swan AGENT_CHROME="$1" HOME="$2"
@@ -65,7 +65,7 @@ t 'L2 ...and it says how to connect' yes "$([[ "$out" == *"5dive browser claude 
 out=$(launch "" "$H")
 t 'L3 not opted in, even with a login file on disk: unchanged' "--dangerously-skip-permissions|OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" "${out#*$'\n'}"
 t 'L3 the block sits before the inner shell is built from UNSET_CREDS' yes \
-  "$( (( $(grep -n '^# DIVE-6345: Claude in Chrome for this agent' 5dive-agent-start | cut -d: -f1) < $(grep -n '^INNER="unset CLAUDE_CONFIG_DIR' 5dive-agent-start | cut -d: -f1) )) && echo yes || echo no)"
+  "$( (( $(grep -n '^# DIVE-6345: Claude in Chrome for this agent' bin/5dive-agent-start | cut -d: -f1) < $(grep -n '^INNER="unset CLAUDE_CONFIG_DIR' bin/5dive-agent-start | cut -d: -f1) )) && echo yes || echo no)"
 
 # --- H1: the creds heal ---------------------------------------------------------
 fn=$(awk '/^heal_claude_shadow_creds\(\) \{/,/^}/' src/cmd_auth.sh)

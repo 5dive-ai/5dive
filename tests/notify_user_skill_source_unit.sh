@@ -131,7 +131,7 @@ for pair in codex:codex_plugin_dir grok:grok_plugin_dir antigravity:antigravity_
 done
 
 echo "== 4. the upgrade path retires the stale copy =="
-REFRESH=5dive-refresh-skills.sh
+REFRESH=bin/5dive-refresh-skills.sh
 extract_fn() { awk -v n="$1()" '$1 == n {on=1} on {print} on && $0 == "}" {exit}' "$2"; }
 RETIRE="$(extract_fn retire_core_notify_user "$REFRESH")"
 t_eq "retire_core_notify_user extracted (non-vacuity)" \

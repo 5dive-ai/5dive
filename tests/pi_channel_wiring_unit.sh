@@ -77,8 +77,8 @@ done
 
 # --- dispatcher + agent-start static wiring (grep the sources) ----------------
 grep -q 'pi)          install_channel_for_pi_agent' "$SRC/lib/agent_setup.sh" && ok_t "dispatcher routes pi" || bad_t "dispatcher pi route missing"
-grep -q 'PI_PROJECT_DIR' 5dive-agent-start && ok_t "agent-start PI_OVERRIDE wired" || bad_t "PI_OVERRIDE missing"
-grep -q '${PI_OVERRIDE}' 5dive-agent-start && ok_t "PI_OVERRIDE injected into INNER" || bad_t "PI_OVERRIDE not in INNER"
+grep -q 'PI_PROJECT_DIR' bin/5dive-agent-start && ok_t "agent-start PI_OVERRIDE wired" || bad_t "PI_OVERRIDE missing"
+grep -q '${PI_OVERRIDE}' bin/5dive-agent-start && ok_t "PI_OVERRIDE injected into INNER" || bad_t "PI_OVERRIDE not in INNER"
 grep -q 'telegram-pi' install.sh && ok_t "install.sh stages telegram-pi" || bad_t "install.sh telegram-pi staging missing"
 
 echo

@@ -22,7 +22,7 @@ trap 'rc=$?; rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
 P=0; F=0
 ok(){ P=$((P+1)); printf 'ok   %s\n' "$1"; }
 bad(){ F=$((F+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}" >&2; }
-TEAM=team-CLAUDE.md
+TEAM=prompts/team-CLAUDE.md
 
 echo "# (a) the block"
 [[ $(grep -c '^<!-- 5dive:team:begin' "$TEAM") == 1 && $(grep -c '^<!-- 5dive:team:end -->' "$TEAM") == 1 ]] \
@@ -47,7 +47,7 @@ else ok "a3 no idents or dates in model-facing text"; fi
 echo "# (b) model tiering"
 OLD_HEAD='# Model tiering (orchestrator + minions)'
 OLD_LINE='Fable acts as the orchestrator: plan, decide'
-grep -qF "orchestrator" model-tiering-CLAUDE.md && bad "b1 the new text never says orchestrator" "$(grep -n orchestrator model-tiering-CLAUDE.md)" \
+grep -qF "orchestrator" prompts/model-tiering-CLAUDE.md && bad "b1 the new text never says orchestrator" "$(grep -n orchestrator prompts/model-tiering-CLAUDE.md)" \
   || ok "b1 the new text never says orchestrator"
 
 eval "$(sed -n '/^sync_managed_block()/,/^}$/p; /^sync_seat_claudemd()/,/^}$/p' install.sh)" 2>/dev/null
@@ -59,7 +59,7 @@ sudo(){ [[ "$1" == -u ]] || return 9; printf '%s\n' "$2" >> "$SUDO_LOG"; shift 2
 # An old seat file: the telegram fragment, the OLD model-tiering text, comms.
 OLDMT="$TMP/old-mt.md"
 sed -e "s/^# Subagent model choice (Fable sessions only)\$/$OLD_HEAD/" \
-    -e "s/^On Fable, plan, decide/$OLD_LINE/" model-tiering-CLAUDE.md > "$OLDMT"
+    -e "s/^On Fable, plan, decide/$OLD_LINE/" prompts/model-tiering-CLAUDE.md > "$OLDMT"
 grep -qxF "$OLD_HEAD" "$OLDMT" && grep -qF "$OLD_LINE" "$OLDMT" \
   || bad "b2 fixture" "the current file no longer carries the two lines the migration targets"
 SEAT="$TMP/seat.md"
@@ -67,7 +67,7 @@ SEAT="$TMP/seat.md"
 cp "$SEAT" "$TMP/seat.orig"
 sync_seat_claudemd "$SEAT" agent-maya "$TEAM"; rc=$?
 (( rc == 0 )) && ok "b2 the sync succeeds on an old seat file" || bad "b2 sync rc=$rc"
-grep -qF "$(cat model-tiering-CLAUDE.md)" "$SEAT" && ! grep -qF "orchestrator" "$SEAT" \
+grep -qF "$(cat prompts/model-tiering-CLAUDE.md)" "$SEAT" && ! grep -qF "orchestrator" "$SEAT" \
   && ok "b3 the migrated text equals the new model-tiering file byte for byte" \
   || bad "b3 migrated text differs from model-tiering-CLAUDE.md" "$(grep -n 'Model\|orchestrator\|Fable' "$SEAT" | head -4)"
 
@@ -98,7 +98,7 @@ sync_seat_claudemd "$TMP/s2.md" agent-maya "$TMP/no-such-source" && bad "c8 an u
 echo "# (d) wiring"
 grep -qF 'cat "$TEAM_CLAUDE_MD"; } \' src/lib/agent_setup.sh && grep -qF 'TEAM_CLAUDE_MD="/usr/local/lib/5dive/team-CLAUDE.md"' src/lib/agent_setup.sh \
   && ok "d1 create appends the team block" || bad "d1 agent_setup.sh does not append TEAM_CLAUDE_MD"
-grep -qF 'curl -fsSL "$REPO/team-CLAUDE.md" -o "$LIB_DIR/team-CLAUDE.md"' install.sh \
+grep -qF 'curl -fsSL "$REPO/${PIN_PROMPTS}team-CLAUDE.md" -o "$LIB_DIR/team-CLAUDE.md"' install.sh \
   && grep -qF 'sync_seat_claudemd "/home/agent-${_team_seat}/.claude/CLAUDE.md" "agent-${_team_seat}" "$LIB_DIR/team-CLAUDE.md"' install.sh \
   && ok "d2 install stages the block and syncs it over claude seats" || bad "d2 install wiring missing"
 grep -qF '_switch_strip_block 5dive:team' src/cmd_agent_switch.sh \

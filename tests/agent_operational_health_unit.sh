@@ -145,9 +145,9 @@ if grep -Fq '"auth:        \($authLine)"' src/cmd_agent.sh; then
 else
   echo 'FAIL: info human render does not consume the disambiguated auth line'; FAIL=$((FAIL+1))
 fi
-if grep -q 'cred_seed_failed "claude credential absent' 5dive-agent-start \
-   && grep -q 'supply a credential and restart' 5dive-agent-start \
-   && ! grep -q 'self-heals on next restart' 5dive-agent-start; then
+if grep -q 'cred_seed_failed "claude credential absent' bin/5dive-agent-start \
+   && grep -q 'supply a credential and restart' bin/5dive-agent-start \
+   && ! grep -q 'self-heals on next restart' bin/5dive-agent-start; then
   PASS=$((PASS+1))
 else
   echo 'FAIL: Claude timeout does not persist an actionable degraded verdict'; FAIL=$((FAIL+1))

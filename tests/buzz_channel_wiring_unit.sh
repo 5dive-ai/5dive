@@ -185,7 +185,7 @@ JSON
   [[ "$rb_env" == "telegram" ]] \
     && ok_t "gate refusal ROLLS BACK the agents.d env file too" \
     || bad_t "gate refusal ROLLS BACK the agents.d env file" \
-             "env left at '$rb_env' (expected 'telegram') — 5dive-agent-start reads THIS file"
+             "env left at '$rb_env' (expected 'telegram') — bin/5dive-agent-start reads THIS file"
   grep -q 'rolled back' "$RB_TMP/out" \
     && ok_t "the refusal message tells the operator the change was rolled back" \
     || bad_t "the refusal message tells the operator the change was rolled back" \
@@ -242,13 +242,13 @@ else
 fi
 
 # --- 5. 5dive-agent-start emits the channel arg, claude-only ----------------
-if grep -qE 'ARGS\+=\(--channels "plugin:buzz@5dive-plugins"\)' 5dive-agent-start; then
+if grep -qE 'ARGS\+=\(--channels "plugin:buzz@5dive-plugins"\)' bin/5dive-agent-start; then
   ok_t "5dive-agent-start emits --channels plugin:buzz@5dive-plugins"
 else
   bad_t "5dive-agent-start emits --channels plugin:buzz@5dive-plugins" \
         "channels=buzz would hit the 'unknown channels' arm and exit 2"
 fi
-if grep -qE 'channels=buzz is claude-only' 5dive-agent-start; then
+if grep -qE 'channels=buzz is claude-only' bin/5dive-agent-start; then
   ok_t "5dive-agent-start refuses buzz on non-claude types"
 else
   bad_t "5dive-agent-start refuses buzz on non-claude types"

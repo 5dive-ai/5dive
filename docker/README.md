@@ -10,7 +10,7 @@ docker build -f docker/Dockerfile -t 5dive .
 ```
 
 Build from the **repo root**, not from inside `docker/` — the Dockerfile
-`COPY`s the CLI bundle (`5dive`, `5dive-agent-start`, `install.sh`, …) plus
+`COPY`s the CLI bundle (`5dive`, `install.sh`, `bin/`, `prompts/`) plus
 `hooks/`, `skills/`, and `systemd/` from the working tree.
 
 ## Run

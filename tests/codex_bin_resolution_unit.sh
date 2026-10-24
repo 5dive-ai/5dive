@@ -17,7 +17,7 @@ set -euo pipefail
 
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-START="$ROOT/5dive-agent-start"
+START="$ROOT/bin/5dive-agent-start"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 

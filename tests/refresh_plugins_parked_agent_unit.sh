@@ -45,7 +45,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT" || exit 1
 PASS=0; FAIL=0
 ok_t(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t(){ FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
-SCRIPT="$ROOT/5dive-refresh-plugins.sh"
+SCRIPT="$ROOT/bin/5dive-refresh-plugins.sh"
 
 FENCE='DIVE-4399 an operator-parked agent stays parked (the plugin-refresh bounce)'
 block="$(sed -n "/^# >>> ${FENCE//\//\\/}\$/,/^# <<< ${FENCE//\//\\/}\$/p" "$SCRIPT")"

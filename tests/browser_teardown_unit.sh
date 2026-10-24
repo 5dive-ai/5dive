@@ -27,7 +27,7 @@ trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
 HOOK="$ROOT/hooks/stop-browser-teardown.sh"
-START="$ROOT/5dive-agent-start"
+START="$ROOT/bin/5dive-agent-start"
 TMP="$(mktemp -d)"
 
 PASS=0; FAIL=0

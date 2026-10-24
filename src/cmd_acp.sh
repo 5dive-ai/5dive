@@ -12,7 +12,7 @@
 # interleaves server-initiated `session/update` notifications with a still-open
 # `session/prompt`, which is concurrent framing in a language with no JSON parser.
 # Same embedding pattern as cmd_cos.sh — and the heredoc below is the ONLY copy of
-# the server, deliberately: cos keeps a root-level cos-lib.ts beside its heredoc with
+# the server, deliberately: cos keeps a scripts/cos-lib.ts copy beside its heredoc with
 # nothing guarding the two against drift, and one loader per filename is enough.
 ACP_RUN_DIR_DEFAULT="/opt/5dive"
 

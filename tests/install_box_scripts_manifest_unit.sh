@@ -27,7 +27,7 @@ PASS=0; FAIL=0
 ok_t(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t(){ FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
-MANIFEST=host-scripts.manifest
+MANIFEST=bin/host-scripts.manifest
 [[ -f $MANIFEST ]] || { bad_t "$MANIFEST exists" "not found"; echo "PASS=$PASS FAIL=$FAIL"; exit 1; }
 
 names=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$MANIFEST" \
@@ -38,7 +38,7 @@ names=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$MANIFES
 echo "# every name in the manifest is a file this repo actually ships"
 while IFS= read -r n; do
   [[ -n "$n" ]] || continue
-  [[ -f "$n" ]] && ok_t "ships $n" || bad_t "ships $n" "$MANIFEST names it, the repo root does not have it"
+  [[ -f "bin/$n" ]] && ok_t "ships bin/$n" || bad_t "ships bin/$n" "$MANIFEST names it, bin/ does not have it"
 done <<< "$names"
 
 echo "# THE GUARD: no literal *.sh is written into \$BIN_DIR outside the manifest"
@@ -67,12 +67,13 @@ run_block() {  # MANIFEST_TEXT -> populates $BIN_DIR, prints the block's output
   local manifest_text=$1
   BIN_DIR=$(mktemp -d)
   REPO=stub
+  PIN_BIN=bin/   # the DIVE-6849 layout this tree has
   # shellcheck disable=SC2317
   curl() {
     local out="" url=""
     while [[ $# -gt 0 ]]; do case "$1" in -o) out=$2; shift 2;; -*) shift;; *) url=$1; shift;; esac; done
     local f=${url#stub/}
-    if [[ "$f" == host-scripts.manifest ]]; then
+    if [[ "$f" == bin/host-scripts.manifest ]]; then
       [[ "$manifest_text" == __FETCH_FAILS__ ]] && return 1
       if [[ -n "$out" ]]; then printf '%s\n' "$manifest_text" > "$out"; else printf '%s\n' "$manifest_text"; fi
       return 0

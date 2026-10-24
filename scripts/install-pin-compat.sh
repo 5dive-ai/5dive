@@ -105,7 +105,10 @@ fi
 # The helper's OWN body is excluded: `curl "$REPO/$_path"` inside
 # fetch_optional_at_pin is the tolerant mechanism, not a download site, and
 # grading it would report the mechanism as an ungradeable blind spot forever.
-LOGICAL="$(sed -e '/>>> DIVE-4350 optional-at-pin download contract/,/<<< DIVE-4350 optional-at-pin download contract/d' "$INSTALL_SH" \
+# DIVE-6849's layout probe is excluded for the same reason: it is the mechanism
+# that resolves ${PIN_BIN}, and it fails closed on anything but 200/404.
+LOGICAL="$(sed -e '/>>> DIVE-4350 optional-at-pin download contract/,/<<< DIVE-4350 optional-at-pin download contract/d' \
+               -e '/>>> DIVE-6849 pin layout/,/<<< DIVE-6849 pin layout/d' "$INSTALL_SH" \
            | sed -e :a -e '/\\$/N; s/\\\n//; ta')"
 
 # ---------------------------------------------------------------- THE CLASSIFIER
@@ -148,8 +151,16 @@ LOGICAL="$(sed -e '/>>> DIVE-4350 optional-at-pin download contract/,/<<< DIVE-4
 # Bias is unchanged and now actually holds: every residual ambiguity resolves
 # toward *grading* the path. A false positive costs one PR comment; a false
 # negative cost the fleet on 2026-09-12.
+# DIVE-6849: install.sh reads the repo layout off the pin (bin/ + prompts/, or
+# the root for a tag cut before the move) and names those downloads
+# `${PIN_BIN}<file>` / `${PIN_PROMPTS}<file>`. Resolve them the same way here —
+# same probe file — so the moved downloads are graded, not listed as runtime.
+PIN_BIN=""; PIN_PROMPTS=""
+if git cat-file -e "${PIN_COMMIT}:bin/host-scripts.manifest" 2>/dev/null; then
+  PIN_BIN="bin/"; PIN_PROMPTS="prompts/"
+fi
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-printf '%s\n' "$LOGICAL" | awk '
+printf '%s\n' "$LOGICAL" | awk -v pinbin="$PIN_BIN" -v pinprompts="$PIN_PROMPTS" '
   function ind(s,   x){ match(s, /^[ \t]*/); return RLENGTH }
   # end of the if/elif construct opened at line i: the next line at the SAME
   # indentation whose first token is `fi`. Returns 0 if the structure does not
@@ -266,6 +277,8 @@ printf '%s\n' "$LOGICAL" | awk '
         rest = substr(rest, RSTART + RLENGTH)
         path = site
         sub(/^\$\{?REPO\}?\//, "", path)
+        gsub(/\$\{PIN_BIN\}/, pinbin, path)
+        gsub(/\$\{PIN_PROMPTS\}/, pinprompts, path)
         if (path ~ /\$/) {
           # one resolvable shape: a for-loop variable whose list we just recorded
           resolved = 0
