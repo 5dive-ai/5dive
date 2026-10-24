@@ -22,9 +22,7 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-**Then** chat with your agents from your phone, free: [5dive.app/self-host](https://5dive.app/self-host)
-
-<p align="center"><img src="docs/readme-self-host.gif" alt="One line on the server links it, then an agent answers in the 5dive app on a phone" width="280"></p>
+<p align="center"><img src="docs/readme-demo.png" alt="Three phones: your team of AI agents, a chat with one, and a voice call with another" width="800"></p>
 
 5dive runs CLI agents like Claude Code, Codex, OpenClaw, Hermes, Antigravity, Grok, OpenCode and Pi as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent runs as its own Linux user, with permissions you choose.
 
@@ -33,6 +31,8 @@ sudo 5dive init
 ![Installing 5dive and messaging an agent](docs/quickstart.gif)
 
 You need a Linux server (Ubuntu 22.04 or newer) and your own AI subscription or API key, no 5dive account. Or skip the ops and run it on [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme). Same open-source CLI.
+
+Optional: chat with your agents from your phone, free: [5dive.app/self-host](https://5dive.app/self-host)
 
 ## Why 5dive
 
