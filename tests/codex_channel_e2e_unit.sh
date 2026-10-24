@@ -50,7 +50,7 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 eq_t()  { if [[ "$2" == "$3" ]]; then ok_t "$1"; else bad_t "$1" "expected '$2', got '$3'"; fi; }
 
 RT=src/cmd_agent_runtime.sh
-START=5dive-agent-start
+START=bin/5dive-agent-start
 
 # ---------------------------------------------------------------------------
 # Resolve the other half of the seam. Same order 5dive-agent-start uses, plus

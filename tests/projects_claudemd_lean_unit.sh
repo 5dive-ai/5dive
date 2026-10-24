@@ -17,7 +17,7 @@ P=0; F=0
 ok(){ P=$((P+1)); printf 'ok   %s\n' "$1"; }
 bad(){ F=$((F+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}" >&2; }
 
-POLICY=projects-CLAUDE.md
+POLICY=prompts/projects-CLAUDE.md
 MAX_LINES=40
 # 450 -> 470 (DIVE-5824): the hire exception had to go INTO the go-ahead line (a
 # live lead read past it one line lower). The block cut 5 words to pay for it
@@ -133,7 +133,7 @@ fi
 grep -qF 'if [[ ! -f /home/claude/projects/CLAUDE.md ]] || projects_claudemd_is_stock /home/claude/projects/CLAUDE.md; then' install.sh \
   && ok "install.sh rewrites a missing OR stock projects/CLAUDE.md" \
   || bad "install.sh must rewrite a stock projects/CLAUDE.md" "first-install-only leaves every existing box on the old copy"
-if grep -qF 'curl -fsSL "$REPO/projects-CLAUDE.md" -o /home/claude/projects/CLAUDE.md' install.sh; then
+if grep -qF 'curl -fsSL "$REPO/${PIN_PROMPTS}projects-CLAUDE.md" -o /home/claude/projects/CLAUDE.md' install.sh; then
   bad "install.sh must not fetch straight over the live file" "a failed fetch would truncate it"
 else ok "install.sh fetches to a temp file, not over the live one"; fi
 

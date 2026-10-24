@@ -53,7 +53,12 @@ RUN systemctl mask \
 # `curl: (37) Couldn't open file` — this list and install.sh's fetches are two
 # copies of one set, and only the docker-install job notices when they disagree.
 # (DIVE-3269 added 5dive-stage-fork-plugins.sh and this line went red first.)
-COPY 5dive 5dive-agent-list-snapshot 5dive-agent-start 5dive-agent-stop-notify 5dive-refresh-plugins.sh 5dive-stage-fork-plugins.sh 5dive-refresh-skills.sh install.sh projects-CLAUDE.md telegram-agent-CLAUDE.md model-tiering-CLAUDE.md operational-comms-CLAUDE.md /opt/5dive-bundle/
+# DIVE-6849: the box-side scripts live in bin/ and the prompt files in prompts/,
+# so both are COPYed whole. install.sh reads the layout off
+# bin/host-scripts.manifest, so bin/ must keep that file.
+COPY 5dive install.sh /opt/5dive-bundle/
+COPY bin /opt/5dive-bundle/bin/
+COPY prompts /opt/5dive-bundle/prompts/
 COPY hooks /opt/5dive-bundle/hooks/
 COPY systemd /opt/5dive-bundle/systemd/
 # NOTHING template- or plugin-shaped is COPYed into the bundle any more.

@@ -13,4 +13,4 @@ m3() { sed -i 's/startapp=agent-\${slug}\$ \]\]/startapp=agent-[a-z0-9_-]+$ ]]/'
 # m4: the stale prose comes back -> the not-catalogue arm reds.
 m4() { sed -i 's/For a need no catalogue agent fits, make one: 5dive hire-link --create --name=<Name> --description=<what they need>/A custom agent has no Mini App tile: your human makes it on the web dashboard, Agents, New agent, Custom./' src/cmd_hire_link.sh; }
 # m5: the block loses its custom-agent line -> the block arm reds.
-m5() { sed -i '/^- \*\*None fits:\*\*/d' projects-CLAUDE.md; }
+m5() { sed -i '/^- \*\*None fits:\*\*/d' prompts/projects-CLAUDE.md; }

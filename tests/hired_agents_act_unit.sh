@@ -427,7 +427,7 @@ ERR=$(env -i HOME="$H" PATH=/usr/bin:/bin bash -c ". '$TMP/tool-env.sh'" 2>&1)
 eval "$(sed -n '/^sync_managed_block()/,/^}$/p' install.sh)"
 LIVE="$TMP/box-CLAUDE.md"
 printf '# Your machine\n\n- `claude` has full sudo; other agents work without root.\n' >"$LIVE"
-sync_managed_block "$LIVE" projects-CLAUDE.md 5dive:hired-agents
+sync_managed_block "$LIVE" prompts/projects-CLAUDE.md 5dive:hired-agents
 BLOCK=$(sed -n '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/p' "$LIVE")
 # DIVE-5823: on exact-swallow an admin lead told "I need someone to chase unpaid
 # invoices" imported a catalogue pack on the need alone. The owner's ask is the
@@ -518,7 +518,7 @@ rm -f "$TMP/create.argv"; imp dario --as=dario
 A=$(tr '\n' ' ' <"$TMP/create.argv" 2>/dev/null)
 [[ " $A" == *' --auth-profile=dario '* ]] && ok 'control: no --auth-profile binds the agent to its own empty login' \
   || bad "control argv ($A)"
-grep -q 'sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:hired-agents' install.sh \
+grep -q 'sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/${PIN_PROMPTS}projects-CLAUDE.md" 5dive:hired-agents' install.sh \
   && ok 'install.sh syncs the block on every install' || bad 'install.sh syncs the block'
 
 # DIVE-5823/5974: the pick is made reading `5dive market`, so the hire rule is

@@ -24,7 +24,7 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
 eq_t()  { if [[ "$2" == "$3" ]]; then ok_t "$1"; else bad_t "$1 (expected '$2', got '$3')"; fi; }
 
-START=5dive-agent-start
+START=bin/5dive-agent-start
 CREATE=src/cmd_agent_create.sh
 SETUP=src/lib/agent_setup.sh
 
@@ -40,7 +40,7 @@ _def="$(codex_model_default)"
   || bad_t "default: '$_def' is not a gpt-<version>-sol id"
 [[ "$_def" != *astra* ]] && ok_t "default: not Astra" || bad_t "default: still Astra"
 # ONE place: no other CLI source or launcher spells a Sol/Astra id as a default.
-_dupes="$(grep -rnE '"gpt-[0-9.]+-(sol|astra)"' src 5dive-agent-start 2>/dev/null | grep -v '^src/lib/models.sh:' || true)"
+_dupes="$(grep -rnE '"gpt-[0-9.]+-(sol|astra)"' src bin/5dive-agent-start 2>/dev/null | grep -v '^src/lib/models.sh:' || true)"
 eq_t "default: the id is spelled in models.sh only" "" "$_dupes"
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ _bl=$(grep -n 'if \[\[ ! -f "\$AGENT_CODEX_HOME/config.toml" \]\]; then' "$START
   && ok_t "start: applied AFTER the baseline config.toml is written" \
   || bad_t "start: applied before the baseline exists — a fresh seat would get no model"
 
-baseline() { # the 5dive-agent-start baseline shape, optionally with a model line
+baseline() { # the bin/5dive-agent-start baseline shape, optionally with a model line
   printf '%sapproval_policy = "never"\nsandbox_mode = "danger-full-access"\n\n[projects."/w"]\ntrust_level = "trusted"\n' "${1:-}"
 }
 mk() { mkdir -p "$TMP/$1"; baseline "${2:-}" > "$TMP/$1/config.toml"; [[ -n "${3:-}" ]] && printf '%s\n' "$3" > "$TMP/$1/.5dive-model-seed"; true; }

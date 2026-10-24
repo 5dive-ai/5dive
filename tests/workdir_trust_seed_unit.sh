@@ -18,7 +18,7 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
-START=5dive-agent-start
+START=bin/5dive-agent-start
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/workdir-trust-seed-unit.XXXXXX")"
 trap 'rc=$?; rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-3247: the corpus contract requires HARNESS-RC on every exit path, and bash keeps only the LAST trap per signal -- so the tempdir cleanup is FOLDED IN here rather than left in a second EXIT trap that would clobber this one.
 

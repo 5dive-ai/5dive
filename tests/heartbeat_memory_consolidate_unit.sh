@@ -662,11 +662,11 @@ surf() {
 surf "$SRC/cmd_heartbeat.sh"     "the knowledge-task nudge (cmd_heartbeat.sh)"
 surf "$SRC/cmd_agent_create.sh"  "the seeded per-seat MEMORY.md (cmd_agent_create.sh)"
 surf "$SRC/task/crud.sh"         "the filing-cap guidance (task/crud.sh)"
-surf "telegram-agent-CLAUDE.md"  "the shipped per-seat CLAUDE.md template"
+surf "prompts/telegram-agent-CLAUDE.md"  "the shipped per-seat CLAUDE.md template"
 # ...and STILL tell agents to hand-compile judgement. lodar: "It must NOT tell
 # agents to stop compiling." A surface that only announced the pipeline would
 # pass the arm above and fail the intent.
-for f in "$SRC/cmd_heartbeat.sh" "$SRC/cmd_agent_create.sh" "telegram-agent-CLAUDE.md"; do
+for f in "$SRC/cmd_heartbeat.sh" "$SRC/cmd_agent_create.sh" "prompts/telegram-agent-CLAUDE.md"; do
   grep -qi "compile" "$f" && ok "$(basename "$f") still instructs hand-compiling" \
     || bad "$(basename "$f") dropped the hand-compile instruction"
 done

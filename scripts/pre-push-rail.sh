@@ -296,7 +296,7 @@ shellcheck_stage() {
   for f in "${files[@]}"; do
     [[ -f "$TOP/$f" ]] || continue
     case "$f" in
-      install.sh|5dive-agent-start|build.sh|5dive-stage-fork-plugins.sh|5dive-refresh-plugins.sh|5dive-refresh-skills.sh|scripts/*.sh)
+      install.sh|bin/5dive-agent-start|build.sh|bin/5dive-stage-fork-plugins.sh|bin/5dive-refresh-plugins.sh|bin/5dive-refresh-skills.sh|scripts/*.sh)
         shebang+=("$f") ;;
       src/*.sh|src/task/*.sh)
         nosheb+=("$f") ;;

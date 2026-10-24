@@ -74,7 +74,7 @@ else
 fi
 
 # T8: run the start script's own type case, then its unset, under the box's export.
-cases=$(awk '/^STAGE_GUARD=""$/{f=1} f{print} f&&/^esac$/{exit}' 5dive-agent-start)
+cases=$(awk '/^STAGE_GUARD=""$/{f=1} f{print} f&&/^esac$/{exit}' bin/5dive-agent-start)
 after_unset() { # <type> -> XDG_CONFIG_HOME as the seat's process sees it
   ( TYPE="$1"; eval "$cases"
     XDG_CONFIG_HOME=/home/claude/.config bash -c "unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; printf %s \"\${XDG_CONFIG_HOME-UNSET}\"" )
@@ -82,7 +82,7 @@ after_unset() { # <type> -> XDG_CONFIG_HOME as the seat's process sees it
 eq_t "T8a opencode seat: XDG_CONFIG_HOME dropped"   "UNSET"                "$(after_unset opencode)"
 eq_t "T8b codex seat keeps the shared config home"  "/home/claude/.config" "$(after_unset codex)"
 eq_t "T8c claude seat keeps the shared config home" "/home/claude/.config" "$(after_unset claude)"
-if grep -q 'INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ' 5dive-agent-start; then
+if grep -q 'INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ' bin/5dive-agent-start; then
   ok_t "T8d the launch line applies UNSET_CREDS"
 else
   bad_t "T8d the launch line applies UNSET_CREDS" "INNER no longer starts with the unset"
@@ -123,7 +123,7 @@ eq_t "T11a opencode seat: headless permission posture" \
   '{"external_directory":"allow","doom_loop":"allow","read":"allow"}' "$(perm_seen opencode)"
 eq_t "T11b an operator's OPENCODE_PERMISSION wins"  '{"edit":"deny"}' "$(perm_seen opencode '{"edit":"deny"}')"
 eq_t "T11c codex seat gets no OpenCode posture"      "UNSET" "$(perm_seen codex)"
-if grep -q 'INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}' 5dive-agent-start; then
+if grep -q 'INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}' bin/5dive-agent-start; then
   ok_t "T11d the launch line applies STAGE_GUARD"
 else
   bad_t "T11d the launch line applies STAGE_GUARD" "INNER no longer carries STAGE_GUARD"

@@ -72,7 +72,7 @@ fi
 # four findings. Narrowing this list back is a silent re-opening of the gap, and it
 # reads in review as tidying a long line.
 # ---------------------------------------------------------------------------
-for f in 5dive-stage-fork-plugins.sh 5dive-refresh-plugins.sh 5dive-refresh-skills.sh; do
+for f in bin/5dive-stage-fork-plugins.sh bin/5dive-refresh-plugins.sh bin/5dive-refresh-skills.sh; do
   if grep -q -- "$f" "$WF"; then
     ok "the shellcheck file set still covers $f"
   else bad "the shellcheck file set still covers $f" "not named anywhere in install-smoke.yml"; fi
@@ -82,8 +82,8 @@ done
 # ARM 4 — THE INCIDENT LINE ITSELF, named rather than inferred, so a future reader
 # of a red does not have to reconstruct which function it was.
 # ---------------------------------------------------------------------------
-if [[ -r 5dive-agent-start ]]; then
-  if grep -q 'local dir="\$HOME/\.5dive" f=' 5dive-agent-start; then
+if [[ -r bin/5dive-agent-start ]]; then
+  if grep -q 'local dir="\$HOME/\.5dive" f=' bin/5dive-agent-start; then
     bad "write_delivery_declaration() declares dir and f in separate statements" \
         "the DIVE-4067 fleet outage, reintroduced verbatim"
   else
@@ -91,7 +91,7 @@ if [[ -r 5dive-agent-start ]]; then
   fi
 else
   skip "write_delivery_declaration() declares dir and f in separate statements" \
-       "5dive-agent-start not present in this tree"
+       "bin/5dive-agent-start not present in this tree"
 fi
 
 # ---------------------------------------------------------------------------

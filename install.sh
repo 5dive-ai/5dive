@@ -485,6 +485,38 @@ NODE_VERSION="22"
 die() { echo "error: $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
 
+# >>> DIVE-6849 pin layout
+# The box-side scripts moved into bin/ and the prompt files into prompts/
+# (DIVE-6849), so the GitHub page shows the README sooner. install.sh is fetched
+# live from main, but $REPO is the PINNED tag, and every tag cut before the move
+# ships those files at the repo root. So the layout is read off the pin ONCE,
+# here, and every such download names `${PIN_BIN}<file>` / `${PIN_PROMPTS}<file>`.
+# A root-layout tag stays installable forever (rollbacks, GH_SHA, a held pin).
+#
+# The probe is bin/host-scripts.manifest: 200 = moved, 404 = root layout.
+# Anything else fails closed, like fetch_optional_at_pin — guessing "root" on a
+# blip would 404 the next required download and blame the wrong file.
+# scripts/install-pin-compat.sh resolves the two prefixes against the pin the
+# same way, so the moved downloads are still graded.
+PIN_BIN=""
+PIN_PROMPTS=""
+resolve_pin_layout() {
+  local _code _rc=0
+  [[ -n "${REPO:-}" ]] || return 0
+  if [[ "$REPO" == file://* ]]; then
+    [[ -e "${REPO#file://}/bin/host-scripts.manifest" ]] && { PIN_BIN="bin/"; PIN_PROMPTS="prompts/"; }
+    return 0
+  fi
+  _code="$(curl -sSL --max-time 30 -o /dev/null -w '%{http_code}' "$REPO/bin/host-scripts.manifest" 2>/dev/null)" || _rc=$?
+  case "$_rc:$_code" in
+    0:200) PIN_BIN="bin/"; PIN_PROMPTS="prompts/" ;;
+    0:404) ;;
+    *) die "could not read the repo layout at $REPO (http ${_code:-000}, curl rc $_rc) — refusing to guess where the box-side scripts are (DIVE-6849)" ;;
+  esac
+}
+resolve_pin_layout
+# <<< DIVE-6849 pin layout
+
 # >>> DIVE-4350 optional-at-pin download contract
 # ONE helper for every download that main's install.sh may name BEFORE the fleet
 # pin's tree carries it. install.sh is fetched live from `main`, but every
@@ -909,7 +941,7 @@ refresh_managed_files() {
   install -d -m 755 "$LIB_DIR"
   local _list_helper_tmp
   _list_helper_tmp="$(mktemp "${LIB_DIR}/.agent-list-snapshot.XXXXXX")"
-  curl -fsSL "$REPO/5dive-agent-list-snapshot" -o "$_list_helper_tmp" \
+  curl -fsSL "$REPO/${PIN_BIN}5dive-agent-list-snapshot" -o "$_list_helper_tmp" \
     || { rm -f "$_list_helper_tmp"; die "failed to download agent-list snapshot helper"; }
   chmod 755 "$_list_helper_tmp"
   mv -f "$_list_helper_tmp" "$LIB_DIR/agent-list-snapshot"
@@ -1060,7 +1092,7 @@ JOURNALD
   fi
 
   # By rename: every running seat is executing this file (see replace_by_rename).
-  replace_by_rename "$BIN_DIR/5dive-agent-start" curl -fsSL "$REPO/5dive-agent-start"
+  replace_by_rename "$BIN_DIR/5dive-agent-start" curl -fsSL "$REPO/${PIN_BIN}5dive-agent-start"
   ok "5dive-agent-start → $BIN_DIR/5dive-agent-start"
 
   # DIVE-3965: the unit's ExecStopPost notifier. Installed next to the launcher
@@ -1079,7 +1111,7 @@ JOURNALD
   # MOVE IT UP into the fail-closed set only once the fleet pin is at or past
   # the tag that ships it; install-pin-compat grades that on every PR touching
   # this file, so "the pin has caught up" stays a check result, not a memory.
-  if fetch_optional_at_pin "5dive-agent-stop-notify" "$BIN_DIR/5dive-agent-stop-notify"; then
+  if fetch_optional_at_pin "${PIN_BIN}5dive-agent-stop-notify" "$BIN_DIR/5dive-agent-stop-notify"; then
     chmod 755 "$BIN_DIR/5dive-agent-stop-notify"
     ok "5dive-agent-stop-notify → $BIN_DIR/5dive-agent-stop-notify"
   else
@@ -1105,7 +1137,7 @@ JOURNALD
   # tests/install_box_scripts_manifest_unit.sh refuses a $BIN_DIR write here that
   # the manifest does not name.
   local _hs_manifest _hs_list _hs_name
-  _hs_manifest="$(curl -fsSL "$REPO/host-scripts.manifest" 2>/dev/null || true)"
+  _hs_manifest="$(curl -fsSL "$REPO/${PIN_BIN}host-scripts.manifest" 2>/dev/null || true)"
   # An entry becomes an install destination under $BIN_DIR as root: reject a
   # slash, a leading dot or anything outside [A-Za-z0-9._-] rather than sanitise
   # it. Comments and blank lines are dropped; leading/trailing space is trimmed,
@@ -1121,7 +1153,7 @@ JOURNALD
   fi
   while IFS= read -r _hs_name; do
     [[ -n "$_hs_name" ]] || continue
-    replace_by_rename "$BIN_DIR/$_hs_name" curl -fsSL "$REPO/$_hs_name"
+    replace_by_rename "$BIN_DIR/$_hs_name" curl -fsSL "$REPO/${PIN_BIN}$_hs_name"
     ok "$_hs_name → $BIN_DIR/$_hs_name"
   done <<< "$_hs_list"
   # <<< DIVE-4194 box-side scripts
@@ -1455,7 +1487,7 @@ TOOLENV
   # agent's $HOME/.claude/ so the per-turn reply mandate + AskUserQuestion /
   # ExitPlanMode warning ride with the agents that actually need them — not
   # the shared projects-level file every agent reads.
-  curl -fsSL "$REPO/telegram-agent-CLAUDE.md" -o "$LIB_DIR/telegram-agent-CLAUDE.md"
+  curl -fsSL "$REPO/${PIN_PROMPTS}telegram-agent-CLAUDE.md" -o "$LIB_DIR/telegram-agent-CLAUDE.md"
   chmod 644 "$LIB_DIR/telegram-agent-CLAUDE.md"
   ok "telegram-agent-CLAUDE.md"
 
@@ -1466,7 +1498,7 @@ TOOLENV
   # the whole install (curl -f exits 37 on a file:// bundle that omits it, which
   # is what reddened install-smoke — DIVE-938). The file is inert unless the
   # session model is Fable (DIVE-899).
-  if curl -fsSL "$REPO/model-tiering-CLAUDE.md" -o "$LIB_DIR/model-tiering-CLAUDE.md"; then
+  if curl -fsSL "$REPO/${PIN_PROMPTS}model-tiering-CLAUDE.md" -o "$LIB_DIR/model-tiering-CLAUDE.md"; then
     chmod 644 "$LIB_DIR/model-tiering-CLAUDE.md"
     ok "model-tiering-CLAUDE.md"
   else
@@ -1479,7 +1511,7 @@ TOOLENV
   # terse operational chat, so this ships a separate universal rule. Fail-soft
   # like the fragments above — a missing fragment just means the rule applies at
   # the next refresh, not a broken agent.
-  if curl -fsSL "$REPO/operational-comms-CLAUDE.md" -o "$LIB_DIR/operational-comms-CLAUDE.md"; then
+  if curl -fsSL "$REPO/${PIN_PROMPTS}operational-comms-CLAUDE.md" -o "$LIB_DIR/operational-comms-CLAUDE.md"; then
     chmod 644 "$LIB_DIR/operational-comms-CLAUDE.md"
     ok "operational-comms-CLAUDE.md"
   else
@@ -1489,7 +1521,7 @@ TOOLENV
   # DIVE-6635: the team block appended to every claude-type agent's
   # $HOME/.claude/CLAUDE.md at create, and refreshed on existing seats below
   # (sync_seat_claudemd). Fail-soft like the fragments above.
-  if curl -fsSL "$REPO/team-CLAUDE.md" -o "$LIB_DIR/team-CLAUDE.md"; then
+  if curl -fsSL "$REPO/${PIN_PROMPTS}team-CLAUDE.md" -o "$LIB_DIR/team-CLAUDE.md"; then
     chmod 644 "$LIB_DIR/team-CLAUDE.md"
     ok "team-CLAUDE.md"
   else
@@ -1505,7 +1537,7 @@ TOOLENV
   # $HOME/.claude/agents/explore.md at create. Fail-soft like the CLAUDE.md
   # fragments above — a missing fragment just means Explore stays on the
   # session's inherited model until the next refresh, not a broken agent.
-  if curl -fsSL "$REPO/explore-agent.md" -o "$LIB_DIR/explore-agent.md"; then
+  if curl -fsSL "$REPO/${PIN_PROMPTS}explore-agent.md" -o "$LIB_DIR/explore-agent.md"; then
     chmod 644 "$LIB_DIR/explore-agent.md"
     ok "explore-agent.md"
   else
@@ -1746,7 +1778,7 @@ projects_claudemd_is_stock() { # <file>
   install -d -m 755 -o claude -g claude /home/claude/projects
   if [[ ! -f /home/claude/projects/CLAUDE.md ]] || projects_claudemd_is_stock /home/claude/projects/CLAUDE.md; then
     _pcm_tmp="$(mktemp)"
-    if curl -fsSL "$REPO/projects-CLAUDE.md" -o "$_pcm_tmp" && [[ -s "$_pcm_tmp" ]]; then
+    if curl -fsSL "$REPO/${PIN_PROMPTS}projects-CLAUDE.md" -o "$_pcm_tmp" && [[ -s "$_pcm_tmp" ]]; then
       # DIVE-5396: the hired-agents block is for boxes 5dive built (see below).
       [[ -f /etc/5dive/provisioning.env ]] \
         || sed -i '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/d' "$_pcm_tmp"
@@ -1771,7 +1803,7 @@ projects_claudemd_is_stock() { # <file>
   # the two markers is reconciled on EVERY install: replaced if present, appended
   # if absent, and everything outside the markers (a host's customisation) is
   # left exactly as it was.
-  sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:task-lifecycle \
+  sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/${PIN_PROMPTS}projects-CLAUDE.md" 5dive:task-lifecycle \
     && ok "projects/CLAUDE.md (task-lifecycle block synced)" \
     || echo "warn: could not sync the task-lifecycle block into projects/CLAUDE.md — the heartbeat dispatch cites it" >&2
   # DIVE-5396: what a hired agent can do without root (hire by link, install a
@@ -1780,7 +1812,7 @@ projects_claudemd_is_stock() { # <file>
   # Synced by the CLI that ships the verbs, so the text never names a verb the
   # box does not have.
   if [[ -f /etc/5dive/provisioning.env ]]; then
-    sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/projects-CLAUDE.md" 5dive:hired-agents \
+    sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/${PIN_PROMPTS}projects-CLAUDE.md" 5dive:hired-agents \
       && ok "projects/CLAUDE.md (hired-agents block synced)" \
       || echo "warn: could not sync the hired-agents block into projects/CLAUDE.md" >&2
   fi

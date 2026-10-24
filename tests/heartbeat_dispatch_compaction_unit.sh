@@ -44,7 +44,7 @@ has()   { [[ "$1" == *"$2"* ]]; }
 _hb_recall_cite()      { printf ''; }
 _hb_carryover_clause() { printf ''; }
 
-POLICY=projects-CLAUDE.md
+POLICY=prompts/projects-CLAUDE.md
 
 # =============================================================================
 # PART 1 — the contract is IN the one surface that replaced the repetition
@@ -208,7 +208,7 @@ eval "$(sed -n '/^sync_managed_block()/,/^}$/p' install.sh)" 2>/dev/null
 if declare -F sync_managed_block >/dev/null; then
   F="$TMP/blk"; mkdir -p "$F"
   printf '# a host CLAUDE.md\ncustom line A\n' > "$F/live.md"
-  cp projects-CLAUDE.md "$F/src.md"
+  cp prompts/projects-CLAUDE.md "$F/src.md"
   sync_managed_block "$F/live.md" "$F/src.md" 5dive:task-lifecycle
   grep -qF "Task lifecycle" "$F/live.md" && grep -qF "custom line A" "$F/live.md" \
     && ok_t "install sync APPENDS the block to an existing CLAUDE.md, keeping its content" \
