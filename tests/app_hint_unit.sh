@@ -65,6 +65,14 @@ for f in README.md README.zh-CN.md; do
   for gone in "$install_cmd" "$connect_cmd" "5dive-connector"; do
     [[ "$top" != *"$gone"* ]] && ok "$f top no longer has: $gone" || bad "$f top still has: $gone"
   done
+  # DIVE-6842: the app line is the next step after the install, with no paid
+  # pitch between them (lodar 10-24: «remove paid pitch at all»).
+  next="$(awk 'seen && /^```$/ {fence=1; next} fence && NF {print; exit} /^sudo 5dive init$/ {seen=1}' "$f")"
+  [[ "$next" == *"https://5dive.app/self-host"* ]] && ok "$f: the app line comes right after the install" \
+    || bad "$f: the line after the install is not the app line: $next"
+  for gone in "5dive cloud" "my.5dive.ai/sign-up"; do
+    [[ "$top" != *"$gone"* ]] && ok "$f top has no paid pitch: $gone" || bad "$f top still pitches: $gone"
+  done
 done
 [[ -s docs/readme-app.png ]] && ok "docs/readme-app.png exists" || bad "docs/readme-app.png missing"
 
