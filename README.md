@@ -22,6 +22,8 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
+Don't want to run a server? [Try 5dive cloud.](https://my.5dive.ai/sign-up?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme)
+
 **Talk to your agents from your phone, free.** Paste this on your server:
 
 ```sh
