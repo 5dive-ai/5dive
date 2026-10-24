@@ -2928,6 +2928,9 @@ _create_human_link_do() {
 CREATE_DEMO_AI_ACCOUNT="demo-ai"
 
 _create_caller_is_agent() {
+  # Below root SUDO_UID is a plain env var (DIVE-1413); create is require_root
+  # anyway, so only a value sudo stamped is read.
+  _gate_is_root || return 1
   [[ -n "${SUDO_UID:-}" ]] || return 1
   _gate_cgroup_human_capable && return 1
   return 0

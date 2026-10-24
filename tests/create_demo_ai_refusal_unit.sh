@@ -38,6 +38,7 @@ AT='@'; AGENT_UNIT="/system.slice/system-5dive\\x2dagent.slice/5dive-agent${AT}o
 echo '== 1. who is an agent =='
 CG=""
 _gate_caller_cgroup() { printf '%s' "$CG"; }
+_gate_is_root() { return 0; }   # the arms model a real `sudo 5dive` (euid 0)
 who() { CG="$2"; if [[ -n "$1" ]]; then SUDO_UID="$1" _create_caller_is_agent; else (unset SUDO_UID; _create_caller_is_agent); fi && echo agent || echo owner; }
 eq_t 'an agent unit through sudo is an agent' agent "$(who 1001 "$AGENT_UNIT")"
 eq_t 'the primary claude session through sudo is an agent' agent "$(who 1000 /system.slice/claude-session.service)"
