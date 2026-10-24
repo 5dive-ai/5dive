@@ -155,10 +155,11 @@ _secret_drop_burn_task() {
 # ---- secret link -----------------------------------------------------------
 
 _secret_link() {
-  local ref="" ttl="$SECRET_DROP_TTL_MIN" start=1 again=0
+  local ref="" ttl="$SECRET_DROP_TTL_MIN" start=1 again=0 save=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ttl=*)     ttl="${1#*=}" ;;
+      --save=*)    save="${1#*=}" ;;   # DIVE-6844: a saved value, no task
       --again)     again=1 ;;   # DIVE-6205: mint although a link for the gate is live
       --no-start)  start=0 ;;   # tests / a box whose page is supervised elsewhere
       --*)         fail "$E_USAGE" "unknown flag: $1" ;;
@@ -167,11 +168,26 @@ _secret_link() {
     shift
   done
   require_root secret link
-  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive secret link <DIVE-N> [--ttl=<minutes>] [--again] [--json]"
+  [[ -n "$ref" || -n "$save" ]] || fail "$E_USAGE" "usage: 5dive secret link <DIVE-N> [--ttl=<minutes>] [--again] [--json] | --save=<name>"
+  [[ -z "$ref" || -z "$save" ]] || fail "$E_USAGE" "a link is for a task's gate OR a saved value (--save), not both"
   [[ "$ttl" =~ ^[0-9]+$ ]] && (( ttl >= 1 && ttl <= 60 )) || fail "$E_VALIDATION" "--ttl must be 1-60 minutes"
+  local ident="" key="" connector=""
+  if [[ -n "$save" ]]; then
+    _saved_name_ok "$save" \
+      || fail "$E_VALIDATION" "'$save' is not a usable name: lowercase letters, digits and dashes, starting with a letter, up to 40 (linkedin-password)"
+    key=$(_saved_key "$save"); connector="$SECRET_SAVED_CONNECTOR"
+  else
+    _secret_link_gate "$ref" "$again"
+  fi
+  _secret_link_mint "$ttl" "$start" "$ident" "$key" "$connector" "$save"
+}
 
-  resolve_task_id "$ref"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
-  local row nt answered key connector
+# The task's open secret gate, checked. Sets ident, key and connector in the
+# caller (_secret_link) through bash's dynamic scope.
+_secret_link_gate() {
+  local ref="$1" again="$2"
+  resolve_task_id "$ref"; local id="$RESOLVED_TASK_ID"; ident="$RESOLVED_TASK_IDENT"
+  local row nt answered
   row=$(db "SELECT COALESCE(need_type,'')||x'1f'||COALESCE(need_answered_at,'')||x'1f'||COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'') FROM tasks WHERE id=${id};")
   IFS=$'\x1f' read -r nt answered key connector <<<"$row"
   [[ "$nt" == "secret" ]] || fail "$E_CONFLICT" "$ident has no secret gate open"
@@ -189,10 +205,16 @@ _secret_link() {
   if (( ! again )) && [[ -n "$(_secret_link_agent_caller)" ]] && _live=$(_secret_drop_live_for "$ident"); then
     fail "$E_VALIDATION" "a one-time link for $ident is already live (sent with the gate's alert), until $(date -u -d "@$_live" '+%H:%M' 2>/dev/null || date -u -r "$_live" '+%H:%M') UTC. Do not send another: the owner has it, and using either link burns both. If the owner says theirs is lost, mint a new one with: sudo 5dive secret link ${ident} --again"
   fi
+  return 0
+}
 
-  local base
+# Mint and serve one link: for a gate (ident set) or a saved name (save set).
+_secret_link_mint() {
+  local ttl="$1" start="$2" ident="$3" key="$4" connector="$5" save="${6:-}"
+  local base terminal="sudo 5dive secret write ${key} --connector=${connector} --task=${ident}"
+  [[ -n "$save" ]] && terminal="sudo 5dive secret write ${key} --connector=${connector}"
   base=$(_secret_drop_base_url) \
-    || fail "$E_NOT_INSTALLED" "this box has no https name an owner's browser can reach (no FIVE_DOMAIN in $SECRET_DROP_PROVISIONING, no SECRET_DROP_BASE_URL in $SECRET_DROP_CONF). Use the terminal instead: sudo 5dive secret write ${key} --connector=${connector} --task=${ident}"
+    || fail "$E_NOT_INSTALLED" "this box has no https name an owner's browser can reach (no FIVE_DOMAIN in $SECRET_DROP_PROVISIONING, no SECRET_DROP_BASE_URL in $SECRET_DROP_CONF). Use the terminal instead: ${terminal}"
 
   ( umask 077; mkdir -p "$SECRET_DROP_DIR" ) || fail "$E_GENERIC" "cannot create $SECRET_DROP_DIR"
   chmod 700 "$SECRET_DROP_DIR" 2>/dev/null || true
@@ -203,7 +225,8 @@ _secret_link() {
   [[ ${#token} -ge 43 ]] || fail "$E_GENERIC" "could not read 32 random bytes"
   hash=$(_secret_drop_hash "$token")
   exp=$(( $(date +%s) + ttl * 60 ))
-  ( umask 077; printf 'task=%s\nkey=%s\nconnector=%s\nexpires=%s\n' "$ident" "$key" "$connector" "$exp" > "$SECRET_DROP_DIR/$hash" ) \
+  ( umask 077; printf 'task=%s\nkey=%s\nconnector=%s\nexpires=%s\n' "$ident" "$key" "$connector" "$exp" > "$SECRET_DROP_DIR/$hash"
+    [[ -z "$save" ]] || printf 'save=%s\n' "$save" >> "$SECRET_DROP_DIR/$hash" ) \
     || fail "$E_GENERIC" "cannot store the link"
 
   # DIVE-5372: the first link on a box appends the secrets.<domain> route and
@@ -239,10 +262,28 @@ _secret_link() {
   exp_iso=$(date -u -d "@$exp" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -r "$exp" '+%Y-%m-%dT%H:%M:%SZ')
   [[ "$ready" == false ]] && note="
 not ready yet: the secure page is still getting its certificate. If the link does not open, wait a minute and open it again (it stays valid)."
+  local lands="the value lands as ${key} in ${connector}.env and clears ${ident}"
+  [[ -n "$save" ]] && lands="the value is saved as ${save}, for agents to type into a site"
   ok "$url
-single use, expires ${exp_iso} (${ttl} min); the value lands as ${key} in ${connector}.env and clears ${ident}${note}" \
-     '{url: $u, expires_at: $e, ttl_minutes: ($t|tonumber), task: $i, key: $k, connector: $c, ready: ($r|fromjson)}' \
-     --arg u "$url" --arg e "$exp_iso" --arg t "$ttl" --arg i "$ident" --arg k "$key" --arg c "$connector" --arg r "$ready"
+single use, expires ${exp_iso} (${ttl} min); ${lands}${note}" \
+     '{url: $u, expires_at: $e, ttl_minutes: ($t|tonumber), task: $i, key: $k, connector: $c, ready: ($r|fromjson)}
+      + (if $s == "" then {} else {save: $s} end)' \
+     --arg u "$url" --arg e "$exp_iso" --arg t "$ttl" --arg i "$ident" --arg k "$key" --arg c "$connector" --arg r "$ready" \
+     --arg s "$save"
+}
+
+# DIVE-6844: the saved name a link writes, or empty for a gate's link.
+_secret_drop_save_of() { sed -n 's/^save=//p' "$1" | head -n 1; }
+
+# Burn every live link for one saved name: a value saved through one makes the
+# others stale, as a gate's links are.
+_secret_drop_burn_save() {
+  local name="$1" f
+  for f in "$SECRET_DROP_DIR"/*; do
+    [[ -f "$f" ]] || continue
+    [[ "$(_secret_drop_save_of "$f")" == "$name" ]] && rm -f "$f"
+  done
+  return 0
 }
 
 # `secret _prewarm` (root; install.sh, every install and --upgrade): route
@@ -271,6 +312,12 @@ _secret_drop_peek() {
   if ! [[ "$exp" =~ ^[0-9]+$ ]] || (( exp <= $(date +%s) )); then
     rm -f "$f"; fail "$E_TIMEOUT" "link expired"
   fi
+  local save; save=$(_secret_drop_save_of "$f")
+  if [[ -n "$save" ]]; then
+    ok "save $save" '{task: "", save: $s, key: $k, connector: $c, ask: "", agent: "", expires: ($x|tonumber), rule: $r}' \
+       --arg s "$save" --arg k "$key" --arg c "$connector" --arg x "$exp" --arg r "$(_secret_drop_rule "$connector")"
+    return 0
+  fi
   local id; id=$(_secret_drop_gate_open "$ident" "$key" "$connector")
   if [[ -z "$id" ]]; then
     _secret_drop_burn_task "$ident"; fail "$E_CONFLICT" "gate no longer open"
@@ -291,6 +338,7 @@ _secret_drop_peek() {
 _secret_drop_rule() { # <connector>
   case "$1" in
     tools) printf '%s' "It must be one line, with no spaces and no ' mark: only plain keyboard letters, digits and symbols, at most 1024 of them." ;;
+    saved) printf '%s' "It must be one line: it is typed into one field of a page." ;;
     project-*) printf '%s' 'It may hold only letters, digits and these marks: _ . / : + = @ , ~ - (no spaces, quotes, $, # or line breaks).' ;;
     *) printf '%s' 'This one takes any value, line breaks included, so the value was not the problem. Try again in a minute.' ;;
   esac
@@ -380,6 +428,19 @@ _secret_drop_redeem() {
   IFS=$'\x1f' read -r ident key connector exp <<<"$(_secret_drop_read "$f")"
   if ! [[ "$exp" =~ ^[0-9]+$ ]] || (( exp <= $(date +%s) )); then
     rm -f "$f"; fail "$E_TIMEOUT" "link expired"
+  fi
+  # DIVE-6844: a saved value has no gate to re-check, clear or tell. Write it
+  # (replacing one saved under the same name), then burn the name's links.
+  local save; save=$(_secret_drop_save_of "$f")
+  if [[ -n "$save" ]]; then
+    [[ "$connector" == "$SECRET_SAVED_CONNECTOR" && "$key" == "$(_saved_key "$save")" ]] \
+      || { rm -f "$f"; fail "$E_CONFLICT" "link is malformed"; }
+    ( _secret_write "$key" --connector="$connector" ) >/dev/null 2>&1 \
+      || fail "$E_VALIDATION" "value refused: $(_secret_drop_rule "$connector")"
+    _secret_drop_burn_save "$save"
+    exec 8>&-
+    ok "saved $save" '{task: "", save: $s, key: $k, connector: $c}' --arg s "$save" --arg k "$key" --arg c "$connector"
+    return 0
   fi
   if [[ -z "$(_secret_drop_gate_open "$ident" "$key" "$connector")" ]]; then
     _secret_drop_burn_task "$ident"; fail "$E_CONFLICT" "gate no longer open"
@@ -694,6 +755,19 @@ def run(args, stdin=None):
     except subprocess.TimeoutExpired:
         return RAN_LONG, b""
 
+# DIVE-6844: the page for a saved login or detail. One field, no task, no agent.
+def save_form(d):
+    return ("<h1>Save <b>%s</b></h1>" % html.escape(d["save"]) +
+            "<p>Your agents can type it into a site for you. They never see it, and it is never shown again.</p>"
+            "<form method=post autocomplete=off>"
+            "<textarea name=value class=secret rows=2 autocomplete=off autocapitalize=off "
+            "autocorrect=off spellcheck=false data-1p-ignore data-lpignore=true data-bwignore "
+            "required autofocus aria-label='Paste the value'></textarea>"
+            "<button type=submit>Save</button></form>"
+            "<p><small>This page is served by your own server. The value goes only there, and this "
+            "link then stops working. Expires at %s UTC.</small></p>"
+            % time.strftime("%H:%M", time.gmtime(int(d["expires"]))))
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "5dive"
     sys_version = ""
@@ -734,6 +808,8 @@ class Handler(BaseHTTPRequestHandler):
         rc, out = run(["_peek", "--hash=" + h])
         if rc != 0: return self.gone(rc)
         d = json.loads(out).get("data", {})
+        if d.get("save"):
+            return self.send_page(200, page("Save %s" % d["save"], save_form(d)))
         who = html.escape(d.get("agent") or "Your agent")
         ask = d.get("ask") or ""
         body = ("<h1>%s needs %s</h1>" % (who, html.escape(d["key"])) +
@@ -798,6 +874,10 @@ class Handler(BaseHTTPRequestHandler):
                 "working on it. It may have been saved. Ask your agent before trying again.</p>"))
         if rc != 0: return self.gone(rc)
         d = json.loads(out).get("data", {})
+        if d.get("save"):
+            return self.send_page(200, page("Saved", "<h1>Saved</h1><p><b>%s</b> is on your server now. "
+                "Your agents can type it into a site; nobody can see it. You can close this tab.</p>"
+                % html.escape(d["save"])))
         return self.send_page(200, page("Saved", "<h1>Saved</h1><p>%s is on your server now, and %s has been told. "
             "You can close this tab.</p>" % (html.escape(d.get("key", "The value")), html.escape(d.get("task", "the task")))))
     def other(self):
