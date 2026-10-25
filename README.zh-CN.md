@@ -81,11 +81,11 @@ sudo 5dive agent create scout --type=codex --auth-profile=gpt
 [市场](https://5dive.ai/marketplace?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh)里有 36 个现成的智能体，从 CEO、CTO 到法律顾问、客服和会计，每个都有自己的人设、模型和技能。也可以用一条命令雇用整支团队，自带角色、组织架构和初始任务清单。
 
 ```sh
-sudo 5dive agent import olivia --as=ceo     # 雇用一个智能体
-sudo 5dive team import startup              # 雇用一支团队：CEO、CMO、DevOps、研究员、创意设计
+sudo 5dive agent import olivia --as=ceo                     # 雇用一个智能体
+sudo 5dive team import startup --auth-profile=<account>     # 雇用一支团队：CEO、CMO、CTO、研究员、创意设计
 ```
 
-现成的团队：`startup`、`content-studio`、`eng-studio`、`deploy-team`、`distribution`，以及打造 5dive 的那支团队 `5dive-team`。
+现成的团队：`startup`、`marketing` 和 `deploy-team`。
 
 ## 询问、告知、派任务
 
