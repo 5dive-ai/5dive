@@ -28,7 +28,7 @@ sudo 5dive init
 
 5dive 把 Claude Code、Codex、OpenClaw、Hermes、Antigravity、Grok、OpenCode、Pi 等命令行智能体作为常驻的 Linux 服务运行。智能体共享任务、互相分派工作，并检查彼此的结果。每个智能体以独立的 Linux 用户身份运行，权限由你设定。
 
-**自托管 · Bash + systemd + SQLite**
+**自托管 · Bash + systemd + SQLite** · [路线图（英文）](ROADMAP.md)
 
 ![安装 5dive 并给智能体发消息](docs/quickstart.gif)
 
@@ -186,6 +186,6 @@ Linux 用户隔离智能体；`systemd` 负责进程守护；SQLite 存储任务
 
 ## 资源
 
-[文档（英文）](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [完整指南（英文）](docs/guide.md) · [人工审批](docs/human-gates.md) · [触发器](docs/triggers.md) · [Docker](docker/README.md) · [参与贡献](CONTRIBUTING.md) · [报告安全漏洞](https://github.com/5dive-ai/5dive/security/advisories/new)
+[文档（英文）](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [完整指南（英文）](docs/guide.md) · [路线图（英文）](ROADMAP.md) · [人工审批](docs/human-gates.md) · [触发器](docs/triggers.md) · [Docker](docker/README.md) · [参与贡献](CONTRIBUTING.md) · [报告安全漏洞](https://github.com/5dive-ai/5dive/security/advisories/new)
 
 [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh) · [5dive 应用](https://my.5dive.ai/) · [Telegram 小程序](https://t.me/FiveDiveBot?startapp) · [Telegram 社区](https://t.me/ai5dive) · [Discord](https://discord.gg/aU2UQC9Myy)
