@@ -1842,4 +1842,9 @@ main() {
 # every code path (including fail/exit) passes through it.
 trap on_exit_audit EXIT
 
+# DIVE-6935: which dev-team modules the devteam plugin supplies on this box.
+# Before main, so the first module load already sees it; on a box without the
+# plugin it is one stat.
+_devteam_init
+
 main "$@"
