@@ -493,13 +493,6 @@ _load_module() {
   [[ -z "${FIVE_LAZY_TRACE:-}" ]] \
     || printf '5dive[lazy] load %s\n' "${__lz_pending[*]}" >&2
   eval "$__lz_txt"
-  # DIVE-6935: the devteam plugin's copy of a module is read straight after the
-  # core's, so its definitions win (src/lib/devteam.sh says who may do this).
-  # An `if`, not `&&`: a false test as this function's last word would return 1
-  # into the stub, and the stub runs under errexit.
-  if declare -F _devteam_overlay >/dev/null; then
-    _devteam_overlay "${__lz_pending[@]}"
-  fi
 }
 
 # The stub's own backstop. If the module has already been loaded and we are

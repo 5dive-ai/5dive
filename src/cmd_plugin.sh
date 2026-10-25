@@ -80,7 +80,7 @@ _plugin_publish_json() {
 # (refuse an unknown value), the consent screen (render a grant in English), and
 # registration (an undeclared surface is inert). A fourth copy in a test is fine;
 # a fourth copy in the code is how they drift.
-readonly PLUGIN_CAPABILITIES="channel mcp skill verb hook core"
+readonly PLUGIN_CAPABILITIES="channel mcp skill verb hook"
 readonly PLUGIN_GRANTS="telegram-token audio-io agent-credentials fs-home network browser-profiles"
 readonly PLUGIN_REVIEW_TIERS="official community unreviewed"
 
@@ -552,20 +552,6 @@ _plugin_source_label() {
   src="${src#https://github.com/}"; src="${src%.git}"
   [[ "$kind" == git ]] && sha=$(git -C "$(_plugin_mkt_dir)/$mkt" rev-parse --short=12 HEAD 2>/dev/null)
   printf '%s%s' "${src:-$mkt}" "${sha:+@$sha}"
-}
-
-# DIVE-6935 — `core` is code 5dive reads into ITSELF, with 5dive's own rights
-# (root, under a sudo grant). src/lib/devteam.sh loads it from one key only, so
-# anywhere else the capability would be inert; refuse it here instead, so the
-# consent screen never offers something that would silently do nothing, and a
-# lookalike cannot sit installed waiting for the loader's pin to slip.
-_plugin_core_cap_gate() {  # <key> <review> <capabilities, space separated>
-  [[ " ${3:-} " == *" core "* ]] || return 0
-  # Defaulted, not bare: a harness that sources this file without
-  # src/lib/devteam.sh must still refuse, not die on set -u.
-  local only="${DEVTEAM_PLUGIN_KEY:-devteam@5dive-plugins}"
-  [[ "$1" == "$only" && "$2" == official ]] && return 0
-  fail "$E_VALIDATION" "$1 declares the 'core' capability, which only 5dive's own $only may use (it runs inside 5dive itself). Remove it from plugin.json."
 }
 
 _plugin_trust_gate() {  # <name> <review> <claimed> <follows-standard 0|1> <official-only 0|1> <ref>
@@ -1352,7 +1338,6 @@ cmd_plugin_add() {
 
   local standard=0; _plugin_follows_standard "$j" && standard=1
   _plugin_trust_gate "$plugin" "$review" "$claimed" "$standard" "$official_only" "${plugin}@${mkt}"
-  _plugin_core_cap_gate "${plugin}@${mkt}" "$review" "$caps"
 
   local key="${plugin}@${mkt}"
 
@@ -1710,7 +1695,6 @@ cmd_plugin_upgrade() {
   review=$(_plugin_effective_review "$mkt" "$claimed")
   _plugin_follows_standard "$nj" && standard=1
   _plugin_trust_gate "$plugin" "$review" "$claimed" "$standard" 0 "$key"
-  _plugin_core_cap_gate "$key" "$review" "$(jq -r '((.fivedive.capabilities // []) | join(" "))' <<<"$nj")"
   # Consent was given at `add`, to this source. An upgrade is new code from the
   # same place, so it is not re-asked — but it is not silent either, and a record
   # written before DIVE-4955 that said `official` on the manifest's word is told
