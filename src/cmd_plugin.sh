@@ -561,8 +561,11 @@ _plugin_source_label() {
 # lookalike cannot sit installed waiting for the loader's pin to slip.
 _plugin_core_cap_gate() {  # <key> <review> <capabilities, space separated>
   [[ " ${3:-} " == *" core "* ]] || return 0
-  [[ "$1" == "$DEVTEAM_PLUGIN_KEY" && "$2" == official ]] && return 0
-  fail "$E_VALIDATION" "$1 declares the 'core' capability, which only 5dive's own $DEVTEAM_PLUGIN_KEY may use (it runs inside 5dive itself). Remove it from plugin.json."
+  # Defaulted, not bare: a harness that sources this file without
+  # src/lib/devteam.sh must still refuse, not die on set -u.
+  local only="${DEVTEAM_PLUGIN_KEY:-devteam@5dive-plugins}"
+  [[ "$1" == "$only" && "$2" == official ]] && return 0
+  fail "$E_VALIDATION" "$1 declares the 'core' capability, which only 5dive's own $only may use (it runs inside 5dive itself). Remove it from plugin.json."
 }
 
 _plugin_trust_gate() {  # <name> <review> <claimed> <follows-standard 0|1> <official-only 0|1> <ref>
