@@ -289,7 +289,6 @@ for site in cmd_send cmd_deliver; do
     # lookup is rc 127 before the branch under test.
     envelope_provenance() { printf 'unclaimed\n'; }
     actor_routing_agent() { return 1; }
-    _buzz_mirror_outbound() { :; }
     AUDIT_ARGS=()
     if [[ "$site" == cmd_send ]]; then
       JSON_MODE=1 INJECT_RC=4 cmd_send ada ping --raw

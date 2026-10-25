@@ -4558,6 +4558,21 @@ _plugin_market_base() { echo "https://raw.githubusercontent.com/$(gh_org)/5dive-
 # --arg m (the marketplace) and --argjson c (the channel constant).
 _PLUGIN_INSTALLS_JQ='installs:(if (.name as $n | any($c[]; .plugin==$n and .marketplace==$m)) then "agent" else "box" end)'
 
+# DIVE-6934: a channel row whose manifest ALSO ships a box verb installs into the
+# box (buzz, since its verbs left core), and `plugin add` agrees through the same
+# _plugin_channel_ships_verb. Read from the registered clone only; a box with no
+# clone keeps "agent", which is the unit `plugin add` would pick there too.
+_market_channel_verb_rows() { # <rows-json>
+  local rows="$1" n m
+  while IFS=$'\t' read -r n m; do
+    [[ -n "$n" ]] || continue
+    _plugin_channel_ships_verb "$n" "$m" || continue
+    rows=$(jq -c --arg n "$n" --arg m "$m" \
+      'map(if .name == $n and .marketplace == $m then .installs = "box" else . end)' <<<"$rows")
+  done < <(jq -r '.[] | select(.installs == "agent") | [.name, .marketplace] | @tsv' <<<"$rows" 2>/dev/null)
+  printf '%s\n' "$rows"
+}
+
 # DIVE-4900: every row also carries `install` — the exact source `plugin add`
 # takes for it. For a registry row that is `<name>@<marketplace>`, which is what
 # consumers already build; for a standalone first-party repo it is `<org>/<repo>`,
@@ -4653,6 +4668,7 @@ cmd_market_plugins() {
   # DIVE-4900: and the first-party plugins that live in their own repo (council,
   # and voice, whose repo row replaces its registry row — DIVE-4964).
   rows=$(_market_standalone_rows "$rows")
+  rows=$(_market_channel_verb_rows "$rows")
 
   # With one registry there is no offline half-list to degrade to: either the
   # registered clone is on disk or the manifest fetch worked. Say which is
@@ -4702,8 +4718,7 @@ cmd_market_plugins() {
   # dashboard and buzz predate the plugin contract: they are wired per AGENT by
   # `agent create --channels=`, not per box by `plugin add`, and `plugin add`
   # says so rather than installing a second copy under a second mechanism.
-  local _builtin; _builtin=$(jq -r --argjson c "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
-    '[.[] | . as $x | select([$c[].plugin] | index($x.name)) | $x.name] | join(", ")' <<<"$filtered")
+  local _builtin; _builtin=$(jq -r '[.[] | select(.installs == "agent") | .name] | join(", ")' <<<"$filtered")
   [[ -n "$_builtin" ]] && \
     echo "  $_builtin ship with 5dive and attach to ONE agent, not the box:  5dive agent create <name> --channels=<channel>"
   echo "  Installing a plugin installs code that runs with your agent's access —"

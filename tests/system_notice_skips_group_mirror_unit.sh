@@ -78,7 +78,6 @@ _wedge_clear()            { :; }
 require_agent()           { :; }
 # The two mirrors are RECORDERS: the question is whether cmd_send calls them.
 mirror_interagent_outbound() { printf 'telegram %s\n' "$1" >>"$MIRRORED"; }
-_buzz_mirror_outbound()      { printf 'buzz %s\n' "$1" >>"$MIRRORED"; }
 _agent_send_row_hint()    { :; }
 _agent_body_shell_hint()  { :; }
 a2a_needs_scoped()        { return 1; }
@@ -102,7 +101,8 @@ PING='DIVE-1 secret gate provided — $EXAMPLE_API_KEY is set in your environmen
 reset_arm
 ( cmd_send seat_b --message="hello from a peer" ) >/dev/null 2>&1 || true
 is "T1: an ordinary send reaches the pane"           "yes"                     "$(typed_has 'hello from a peer')"
-is "T1: an ordinary send mirrors to group AND buzz"  "buzz seat_b,telegram seat_b" "$(mirrors)"
+# DIVE-6934: the buzz mirror left core with the buzz verbs; the group mirror is the one left.
+is "T1: an ordinary send mirrors to the group"       "telegram seat_b" "$(mirrors)"
 
 # --- T2: the fix — a system notice reaches the pane and mirrors nothing ---------
 reset_arm
@@ -113,7 +113,7 @@ is "T2: the system notice mirrors to NO room"        "none" "$(mirrors)"
 # --- T2b: the marker is per-call — the next ordinary send mirrors again --------
 reset_arm
 ( cmd_send seat_b --message="after the notice" ) >/dev/null 2>&1 || true
-is "T2b: the marker does not leak into the next send" "buzz seat_b,telegram seat_b" "$(mirrors)"
+is "T2b: the marker does not leak into the next send" "telegram seat_b" "$(mirrors)"
 
 # --- T3: --raw keeps its pre-existing no-mirror behaviour ----------------------
 reset_arm
@@ -156,7 +156,7 @@ mkdir -p "${TMPROOT}/bin"
 declare -f tmux agent_wake_for_send agent_prompt_detectable wait_agent_input_ready \
   _agent_delivery_inbox _agent_pane_safe_to_type _hb_claude_pid _hb_verify_submit \
   _hb_submit_settled _hb_composer_scrub _wedge_clear require_agent \
-  mirror_interagent_outbound _buzz_mirror_outbound _agent_send_row_hint \
+  mirror_interagent_outbound _agent_send_row_hint \
   _agent_body_shell_hint a2a_round_guard envelope_tier envelope_via \
   envelope_provenance _envelope_caller gen_msg_id _agent_refuse_peer_forgery \
   audit_log _hb_agent_idle _a2a_queue_dir >"${TMPROOT}/stubs.sh"
@@ -194,7 +194,9 @@ reset_arm; : >"$ARGVLOG"
   cmd_send seat-b --message="scoped hello" ) >/dev/null 2>&1 || true
 is "T6: a plain scoped send goes through the fake sudo" "yes"  "$(argv_has ' seat-b scoped hello')"
 is "T6: a plain scoped send reaches the pane"           "yes"  "$(typed_has 'scoped hello')"
-is "T6: a plain scoped send still mirrors buzz"          "buzz seat-b" "$(mirrors)"
+# DIVE-6934: cmd_deliver's only mirror was buzz's, and it left core, so the scoped
+# path mirrors nothing at all now and T6's "mirrors to NO room" arm holds trivially.
+is "T6: a plain scoped send mirrors nothing (no buzz mirror in core)" "none" "$(mirrors)"
 
 reset_arm; : >"$ARGVLOG"
 ( unset -f sudo; a2a_needs_scoped() { return 0; }; PATH="${TMPROOT}/bin:$PATH"

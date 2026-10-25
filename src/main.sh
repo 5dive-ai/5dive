@@ -112,29 +112,8 @@ Agents:
                                                      # comma-separable; dashboard (claude/codex, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat
                                                      # path. New claude creates include it by default.
-  5dive agent buzz enable <name> --relay=<https://…> # DIVE-3509: install the buzz plugin, mint the agent's
-                                                     # own nostr identity and write its config (0600).
-                                                     # --channels=<csv> --poll-ms=<n> --buzz-path=<path>
-                                                     # --rotate-key mints a NEW key (the handset must re-pair)
-  5dive agent buzz inbound --pubkey=<k> --message-file=<p>  # DIVE-3573: the bridge's inbound router. Classifies
-                                                     # the signing key and routes it: a known teammate's key
-                                                     # onto the a2a rail, the paired owner's like a human
-                                                     # message, anything else untrusted (unchanged). Delivers
-                                                     # to the CALLING seat only — no target argument.
-  5dive agent buzz whois <pubkey|npub1…> [--role]    # DIVE-3572: pubkey -> which seat, from the registry.
-                                                     # rc 0 name on stdout · 4 MEASURED unknown · 5 ambiguous
-                                                     # · 3 not a key · 1 registry unreadable (NOT measured).
-                                                     # Read-only, no root: the buzz plugin shells to it.
-  5dive agent buzz status <name>                     # is buzz actually wired? plugin/config/binary, not
-                                                     # the agent unit's liveness. rc 3 = declared, not usable
-  5dive agent buzz pair <name> [--timeout=<secs>]    # DIVE-3551: run the NIP-AB pairing session (QR + SAS);
-                                                     # emits BUZZ-PAIR-* marker lines the dashboard panel parses
-  5dive buzz pair [--timeout=<secs>] [--agent=<n>]   # DIVE-3592: ONE QR per SERVER — pairs the phone as the
-                                                     # OWNER of this box, wiring that identity into every buzz
-                                                     # agent's channels first. Prefer this over the per-agent
-                                                     # form; who talks in team chat is \`agent buzz enable\`.
-  5dive buzz owner [--envelope]                      # the box's handset identity (public half; --envelope is
-                                                     # the DIVE-3300 payload and carries a PRIVATE key)
+  5dive agent buzz <sub> …  ·  5dive buzz <sub> …   # DIVE-6934: moved to the buzz plugin —
+                                                     # 5dive plugin install buzz
   5dive agent grant <name> <merge|push|deploy>       # root: re-render an existing STANDARD seat's managed
                                                      # sudoers from the current template so it gains a
                                                      # capability added after it was created. Idempotent;
@@ -847,43 +826,21 @@ _agent_verb_dispatch() {
         pair)
           AUDIT_CMD="agent pair"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_pair "$@" ;;
-        # DIVE-3509: buzz onboarding. `enable` mints a key and writes the
-        # agent's config (registry write via cmd_config, so take the lock);
-        # `status` is a read-only probe — no lock, no audit, same treatment as
-        # telegram-getme below.
+        # DIVE-6934: the per-agent buzz verbs moved to the buzz plugin. A box
+        # with it runs them there as `5dive buzz agent <sub>` (the plugin keeps
+        # the lock and audit policy this arm used to apply). The seat sudoers
+        # grant for `agent buzz inbound` still names THIS spelling, which is why
+        # it is handed over rather than released.
         #
-        # DIVE-3572: `whois` joins `status` on the lock-free side, and that is a
-        # requirement rather than an optimisation. Its caller is the buzz plugin,
-        # which runs AS the agent user; with_registry_lock calls ensure_state,
-        # which is require_root, so routing it through the mutating arm would make
-        # the one lookup the trust model depends on unusable by the only process
-        # that needs it. It reads the group-readable registry and writes nothing.
-        #
-        # DIVE-3573: `inbound` is AUDITED (it is the bridge's trust decision, and
-        # a decision nobody can read afterwards is not a control) but takes NO
-        # registry lock. It reads the registry and writes nothing, and its tail is
-        # a real `agent send` that waits for a pane to be ready — holding the
-        # fleet-wide registry lock across a tmux readiness wait would stall every
-        # other seat's writes behind one inbound chat message. Its args are safe to
-        # log: a public key and a file PATH, never the body (see the verb's own
-        # --message-file refusal to take prose in argv).
+        # ONLY the official plugin. Every standard seat holds a root sudo grant
+        # for `agent buzz inbound *`, so whichever plugin answers `buzz` runs as
+        # root with seat-chosen arguments. Before the move that code was core's;
+        # it must not become any plugin that happens to claim the verb.
         buzz)
-          # DIVE-3592: `pair` is a LIVE SESSION (600s by default, waiting on a
-          # human with a phone). It writes no registry field of its own, and
-          # holding the fleet-wide registry lock for the width of a pairing
-          # session would stall every other seat's writes behind one customer
-          # scanning a QR. It joins `status`/`whois` on the lock-free side. The
-          # server-level `5dive buzz pair` takes the lock per join instead,
-          # around the wire-up only.
-          if [[ "${1:-}" == "status" || "${1:-}" == "whois" ]]; then
-            cmd_agent_buzz "$@"
-          elif [[ "${1:-}" == "inbound" || "${1:-}" == "pair" ]]; then
-            AUDIT_CMD="agent buzz"; AUDIT_ARGS=("$@")
-            cmd_agent_buzz "$@"
-          else
-            AUDIT_CMD="agent buzz"; AUDIT_ARGS=("$@")
-            with_registry_lock cmd_agent_buzz "$@"
-          fi ;;
+          if [[ "$(_plugin_verb_claims buzz 2>/dev/null)" == "buzz@5dive-plugins" ]]; then
+            _plugin_dispatch_verb buzz agent "$@" || true
+          fi
+          _buzz_moved_refusal ;;
         telegram-discover)
           # Read-only Telegram getUpdates poll — no registry mutation, no
           # state changes. Bot token would clutter the audit log if it were
@@ -1111,11 +1068,20 @@ _moved_verb_repo() {
   esac
 }
 
+# DIVE-6934 — buzz is the one moved verb that is not a repo of its own: it is
+# `buzz@5dive-plugins`, the channel plugin, which now also declares the verb. So
+# it gets its own line, the same for `5dive buzz` and `5dive agent buzz`, and the
+# exit stays E_USAGE like every other moved verb.
+_buzz_moved_refusal() {
+  fail "$E_USAGE" "Buzz is a plugin now: 5dive plugin install buzz"
+}
+
 # Printed on the way to `unknown command`, never instead of it: the exit stays
 # non-zero and the classifier keeps reading E_USAGE, because from a script's
 # point of view this box genuinely does not answer that verb. What changes is
 # that a human is told WHERE it went rather than being told it never existed.
 _moved_verb_notice() {
+  [[ "$1" == buzz ]] && _buzz_moved_refusal
   local repo; repo="$(_moved_verb_repo "$1")" || return 0
   # DIVE-5247: sysadmin is a partner-box feature, not something to offer every
   # box. Its seat, broker grant and approvals only work where 5dive-api routes a
@@ -1428,13 +1394,6 @@ main() {
       # (cmd_machine checks); ls is a read. Audited: who attached which machine.
       AUDIT_CMD="machine"; AUDIT_ARGS=("$@")
       cmd_machine "$@" ;;
-    buzz)
-      # DIVE-3592: pairing is per SERVER. Audited (it decides which handset
-      # holds the box owner identity) and NOT wrapped in the registry lock —
-      # `pair` blocks on a human with a phone, and its wire-up takes the lock
-      # per join instead.
-      AUDIT_CMD="buzz"; AUDIT_ARGS=("$@")
-      cmd_buzz "$@" ;;
     doctor)
       # Only audit when a mutating run is requested (--fix/--repair); read-only
       # runs (and --dry-run previews) would spam the log.

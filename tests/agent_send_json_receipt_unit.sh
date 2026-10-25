@@ -120,7 +120,6 @@ _hb_composer_scrub()      { return 0; }
 _wedge_clear()            { :; }
 require_agent()           { :; }
 mirror_interagent_outbound() { :; }
-_buzz_mirror_outbound()   { :; }
 _agent_send_row_hint()    { :; }
 _agent_body_shell_hint()  { :; }
 a2a_needs_scoped()        { return 1; }

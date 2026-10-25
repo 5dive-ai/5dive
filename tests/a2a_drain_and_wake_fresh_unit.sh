@@ -134,7 +134,6 @@ _hb_verify_submit()       { return 0; }
 wait_agent_input_ready()  { return 0; }
 require_agent()           { :; }
 mirror_interagent_outbound() { :; }
-_buzz_mirror_outbound()   { :; }
 a2a_needs_scoped()        { return 1; }
 a2a_round_guard()         { return 0; }
 envelope_tier()           { printf 'admin\n'; }

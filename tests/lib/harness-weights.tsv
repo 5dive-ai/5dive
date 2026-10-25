@@ -87,15 +87,7 @@ tests/bug_report_pii_allowlist_unit.sh	1074	949
 tests/build_bundle_self_order_unit.sh	5556	7859
 tests/builder_gh_rail_unit.sh	240	312
 tests/burn_leaks_no_body_ask_fastfail_unit.sh	5908	6165
-tests/buzz_bridge_unit.sh	211	295
-tests/buzz_by_design_rc3_not_a_panic_unit.sh	3530	5698
 tests/buzz_channel_wiring_unit.sh	300	367
-tests/buzz_identity_registry_unit.sh	995	1151
-tests/buzz_last_mile_unit.sh	21736	21478
-tests/buzz_pair_unit.sh	1284	1232
-tests/buzz_preseed_dm_live.sh	25	27
-tests/buzz_preseed_dm_unit.sh	12481	12445
-tests/buzz_server_pairing_unit.sh	1050	1048
 tests/byo_api_key_approval_seed_unit.sh	240	338
 tests/byo_model_create_unit.sh	397	369
 tests/caddy_validate_env_unit.sh	163	177
@@ -374,7 +366,6 @@ tests/init_pick_drain_unit.sh	647	651
 tests/init_run_unit.sh	239	242
 tests/init_ux_unit.sh	45	70
 tests/install_box_scripts_manifest_unit.sh	79	111
-tests/install_buzz_binaries_unit.sh	243	244
 tests/install_checksum_unit.sh	103	106
 tests/install_detach_job_unit.sh	3050	3237
 tests/install_first_run_clean_unit.sh	79	82

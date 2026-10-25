@@ -443,6 +443,22 @@ _plugin_builtin_channel_refusal() {
   fail "$E_USAGE" "'$p' is one of 5dive's built-in channel plugins — it is installed per AGENT, not per box, so 'plugin add' is not the path. Use: 5dive agent create <name> --channels=$p  (or, for an existing agent, 5dive agent config <name> --channels=$p). It predates the plugin contract and carries no 5dive manifest block, which is why it would otherwise read as unreviewed."
 }
 
+# DIVE-6934 — a channel plugin that ALSO ships a box verb is installed box-wide.
+#
+# The refusal above exists because a box-wide copy of a per-agent channel is dead
+# code (DIVE-4466). That stops being true the day the channel's manifest declares
+# a `verb`: buzz@5dive-plugins carries `5dive buzz …` since the verbs left core,
+# and the box-wide install is the only thing that makes them exist. The answer
+# comes from the manifest in OUR registry checkout (the same copy `add` would
+# install), never from the name. Unresolvable -> rc 1 -> the refusal stands.
+_plugin_channel_ships_verb() {  # <plugin> [<marketplace>]
+  local p="$1" m="${2:-}" dir mf
+  [[ -n "$m" ]] || m="$(_plugin_registry_name)"
+  dir=$(_plugin_source_dir "$m" "$p" 2>/dev/null) || return 1
+  mf=$(_plugin_manifest_path "$dir" 2>/dev/null) || return 1
+  jq -e '(.fivedive.capabilities // []) | index("verb")' "$mf" >/dev/null 2>&1
+}
+
 # ---- who decides `official` (DIVE-4955) -------------------------------------
 #
 # The tier used to be read straight out of the plugin's own plugin.json, so any
@@ -1325,7 +1341,8 @@ cmd_plugin_add() {
   # the one caller that could reach it from a browser.
   local _bare="${ref%@*}" _refmkt=""
   [[ "$ref" == *@* ]] && _refmkt="${ref#*@}"
-  if _plugin_is_builtin_channel_ref "$_bare" "$_refmkt"; then
+  if _plugin_is_builtin_channel_ref "$_bare" "$_refmkt" \
+     && ! _plugin_channel_ships_verb "$_bare" "$_refmkt"; then
     _plugin_builtin_channel_refusal "$_bare"
   fi
 
@@ -1957,7 +1974,7 @@ readonly PLUGIN_VERB_BINDIR="bin"
 # re-extracts the case labels from src/main.sh and asserts set equality, so a new
 # builtin verb that forgets this line reds the suite rather than silently
 # becoming claimable by a plugin.
-readonly FIVEDIVE_BUILTIN_VERBS="account acp activity agent _app_hint _audit_append board bug buzz company config constitution cost crew _dashboard_relay deploy _deploy_do digest disk doctor down export fire fleet gate-proof gh _gh_do goal -h heartbeat --help help hire hire-link host human humans init liveness loop machine market memory _merge_do models objective objectives org owner-ask paperclip-seed partner pkg _pkg_do plugin plugins project projects proof ps push _push_do reflex route _route_do run runs secret _secrets_posture _self_account _self_update_hint selfcheck self-update self_update supervisor task _task_answer _task_channel team telegram-app tool tools trace trigger triggers uninstall up update usage -v --version version wall watch whoami"
+readonly FIVEDIVE_BUILTIN_VERBS="account acp activity agent _app_hint _audit_append board bug company config constitution cost crew _dashboard_relay deploy _deploy_do digest disk doctor down export fire fleet gate-proof gh _gh_do goal -h heartbeat --help help hire hire-link host human humans init liveness loop machine market memory _merge_do models objective objectives org owner-ask paperclip-seed partner pkg _pkg_do plugin plugins project projects proof ps push _push_do reflex route _route_do run runs secret _secrets_posture _self_account _self_update_hint selfcheck self-update self_update supervisor task _task_answer _task_channel team telegram-app tool tools trace trigger triggers uninstall up update usage -v --version version wall watch whoami"
 
 _plugin_verb_name_ok()   { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; }
 _plugin_verb_is_builtin(){ [[ " $FIVEDIVE_BUILTIN_VERBS " == *" $1 "* ]]; }

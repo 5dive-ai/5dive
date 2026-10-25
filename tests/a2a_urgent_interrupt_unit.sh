@@ -83,7 +83,6 @@ _wedge_clear()            { :; }
 wait_agent_input_ready()  { return 0; }
 require_agent()           { :; }
 mirror_interagent_outbound() { :; }
-_buzz_mirror_outbound()   { :; }
 _agent_send_row_hint()    { :; }
 _agent_body_shell_hint()  { :; }
 a2a_needs_scoped()        { return 1; }
