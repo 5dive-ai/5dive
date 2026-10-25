@@ -34,7 +34,7 @@ sudo 5dive init
 
 你只需要一台 Linux 服务器（Ubuntu 22.04 或更新版本），以及你自己的 AI 订阅或 API key，无需 5dive 账号。
 
-也想在手机上和你的智能体聊天？在 [5dive.app/self-host](https://5dive.app/self-host) 免费连接你的服务器。
+整个团队一个应用，无需 bot token：在 [5dive.app/self-host](https://5dive.app/self-host) 免费连接你的服务器。
 
 ## 为什么选 5dive
 
