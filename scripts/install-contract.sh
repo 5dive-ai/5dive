@@ -99,8 +99,10 @@ DENY='uninstall self-update self_update update paperclip-seed fire hire'
 # what required it to come off here in the same PR — which is the point of a
 # self-retiring waiver. `push` came off on 2026-09-26 the same way: its flag loop
 # gained a --help arm. `doctor` came off on 2026-09-30: it answers --help before
-# its root check.
-WAIVED='activity buzz cost deploy gate-proof host objective objectives project projects trace usage'
+# its root check. `buzz` came off on 2026-10-25 for the other reason T5 names:
+# DIVE-6934 moved the verb out of core into buzz@5dive-plugins, so it is no
+# longer in the dispatch table at all.
+WAIVED='activity cost deploy gate-proof host objective objectives project projects trace usage'
 
 in_list() { local n="$1"; shift; local x; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
 
@@ -210,13 +212,50 @@ else
   # before the per-plugin arms read out of the clone.
   timeout 120 "$FIVE" plugin marketplace list </dev/null >/dev/null 2>&1
   # T1c — the filtered-out members, graded on the refusal rather than skipped.
+  #
+  # DIVE-6934: a channel whose PUBLISHER manifest declares the `verb` capability
+  # is the one exception `plugin add` makes (buzz, once its verbs left core): the
+  # box-wide install is the only thing that makes `5dive <verb>` exist, so the
+  # expected outcome flips from refused to installed-and-dispatching. Which one
+  # is expected is read from the publisher, like T1d's tier, never from the name
+  # — so this arm grades refusal today and install the day the manifest ships
+  # the verb, with no edit here. A manifest it cannot read is a FAIL, not a skip.
+  PUB_RAW="${FIVE_PLUGIN_MANIFEST_BASE:-https://raw.githubusercontent.com/${FIVE_GH_ORG:-5dive-ai}/5dive-plugins/main}"
   for p in "${CHANNEL_MEMBERS[@]}"; do
-    out=$(timeout 120 "$FIVE" plugin add "$p" --yes </dev/null 2>&1); rc=$?
-    if (( rc != 0 )) && grep -qi "built-in channel" <<<"$out"; then
-      ok_t "T1c $p: 'plugin add' refuses a built-in channel plugin, per agent not per box (rc=$rc)"
-    else
-      bad_t "T1c $p: 'plugin add' refuses a built-in channel plugin" "rc=$rc — $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+    csrc=$(jq -r --arg p "$p" '.plugins[] | select(.name==$p) | .source // ""' "$MARKET" 2>/dev/null)
+    csrc="${csrc#./}"; [[ -n "$csrc" ]] || csrc="plugins/$p"
+    cpj=$(mktemp)
+    if ! curl -fsSL --max-time 30 "$PUB_RAW/$csrc/.claude-plugin/plugin.json" -o "$cpj" 2>/dev/null \
+       || ! jq -e . "$cpj" >/dev/null 2>&1; then
+      bad_t "T1c $p: read the publisher's own manifest for whether it ships a box verb" \
+        "could not fetch or parse $PUB_RAW/$csrc/.claude-plugin/plugin.json — NOT a skip: without it this arm cannot say whether 'plugin add $p' should refuse or install"
+      rm -f "$cpj"; continue
     fi
+    if jq -e '(.fivedive.capabilities // []) | index("verb")' "$cpj" >/dev/null 2>&1; then
+      mapfile -t cverbs < <(jq -r '.fivedive.verbs[]?.name // empty' "$cpj")
+      out=$(timeout 120 "$FIVE" plugin add "$p" --yes </dev/null 2>&1); rc=$?
+      if (( rc == 0 )); then
+        ok_t "T1c $p: a channel plugin that ships a box verb installs box-wide (DIVE-6934)"
+        for v in "${cverbs[@]}"; do
+          vrc=$(verb_help_rc "$v")
+          if [[ "$vrc" == "0" ]]; then
+            ok_t "T2 $p: 5dive $v --help dispatches (rc 0)"
+          else
+            bad_t "T2 $p: 5dive $v --help dispatches" "rc=$vrc — the plugin installed but its declared verb does not run. $(help_err_tail)"
+          fi
+        done
+      else
+        bad_t "T1c $p: a channel plugin that ships a box verb installs box-wide (DIVE-6934)" "rc=$rc — $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+      fi
+    else
+      out=$(timeout 120 "$FIVE" plugin add "$p" --yes </dev/null 2>&1); rc=$?
+      if (( rc != 0 )) && grep -qi "built-in channel" <<<"$out"; then
+        ok_t "T1c $p: 'plugin add' refuses a built-in channel plugin, per agent not per box (rc=$rc)"
+      else
+        bad_t "T1c $p: 'plugin add' refuses a built-in channel plugin" "rc=$rc — $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+      fi
+    fi
+    rm -f "$cpj"
   done
 
   # ------------------------------------------------------------------------
@@ -255,7 +294,7 @@ else
   # reason a fetch failure there is a FAIL and never a skip. That also buys a
   # third fact for free: a box whose clone is stale relative to the publisher
   # now reads as a red on T1b/T1e rather than as agreement with itself.
-  PUB_RAW="${FIVE_PLUGIN_MANIFEST_BASE:-https://raw.githubusercontent.com/${FIVE_GH_ORG:-5dive-ai}/5dive-plugins/main}"
+  # PUB_RAW is set above T1c, which reads the same publisher.
 
   # <plugin> -> the directory its PUBLISHER declares it lives in. The index is
   # the only thing that says where a plugin is; $REGISTRY/plugins/<name> is a

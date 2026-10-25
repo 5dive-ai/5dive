@@ -17,6 +17,9 @@
 #   G    NEGATIVE: a different plugin claiming `buzz` is never handed `agent buzz`
 #   H    `plugin add buzz` is allowed box-wide only when the manifest ships a verb
 #   I    the seat grant and capability for `agent buzz inbound` are still rendered
+#   J    Classic's People-page save still exits 0: the dashboard passes --buzz= on
+#        EVERY save (lodar 13:09Z: "not to break our 5dive classic dashboard")
+#   K    install-contract's --help waiver no longer names buzz (T5 reds on it)
 #
 # Run: bash tests/buzz_moved_to_plugin_unit.sh   (no root, no network)
 set -uo pipefail
@@ -180,6 +183,58 @@ grep -q '^I2 yes$' "$WORK/i" && ok_t "I classify_sudo_grant still reads the poli
   || bad_t "I classify_sudo_grant still reads the policy as cli-scoped" "$(cat "$WORK/i")"
 grep -q '^I3 yes$' "$WORK/i" && ok_t "I the capability registry still names buzz_inbound" \
   || bad_t "I the capability registry still names buzz_inbound" "$(cat "$WORK/i")"
+
+# --- J. Classic's People page still saves -----------------------------------
+# lodar/5dive-frontend src/app/dashboard/humans/page.tsx save() runs this argv
+# on every save, with every flag present and the empty ones empty (an empty
+# value CLEARS that transport). Classic is one Vercel build in front of boxes on
+# every CLI version, so if core ever stops parsing --buzz= every People save on
+# an updated box fails "unknown flag". The argv below is the page's, verbatim;
+# the frontend's cli-contract.test.ts pins the same array from its side.
+(
+  set +e
+  # shellcheck source=/dev/null
+  for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/state.sh \
+           lib/audit.sh lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_human.sh; do
+    source "$SRC/$f" 2>/dev/null
+  done
+  set +e
+  require_root() { :; }      # the write is root-only; the parse is what is graded
+  audit_log() { :; }
+  STATE_DIR="$WORK/j"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"; JSON_MODE=0
+  mkdir -p "$TASKS_DIR"; tasks_db_init >/dev/null 2>&1
+  # A new person, Buzz left empty: exactly what the form sends.
+  ( cmd_human add alice --name="Alice Example" --telegram=1234567890 --buzz= --discord= ) >/dev/null 2>&1
+  echo "J1 rc=$?"
+  echo "J2 $(db "SELECT COALESCE(telegram_id,'-')||'|'||COALESCE(buzz_npub,'-')||'|'||COALESCE(discord_id,'-') FROM humans WHERE id='alice';")"
+  # An edit of someone who HAS a buzz id, saved with the field emptied: clears it.
+  db "INSERT INTO humans (id, buzz_npub) VALUES ('bob','npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqq');"
+  ( cmd_human add bob --name="Bob Example" --telegram= --buzz= --discord= ) >/dev/null 2>&1
+  echo "J3 rc=$? $(db "SELECT COALESCE(buzz_npub,'-') FROM humans WHERE id='bob';")"
+  # NEGATIVE CONTROL: the same harness sees a rejected flag, so J1 is not rc 0 by construction.
+  ( cmd_human add carol --name=Carol --slack= ) >/dev/null 2>&1
+  echo "J4 rc=$?"
+) >"$WORK/jout" 2>&1
+grep -q '^J1 rc=0$' "$WORK/jout" \
+  && ok_t "J Classic's People-page save with an empty Buzz field exits 0" \
+  || bad_t "J Classic's People-page save with an empty Buzz field exits 0" "$(cat "$WORK/jout")"
+grep -q '^J2 1234567890|-|-$' "$WORK/jout" \
+  && ok_t "J ...and records the person, with no buzz id" \
+  || bad_t "J ...and records the person, with no buzz id" "$(cat "$WORK/jout")"
+grep -q '^J3 rc=0 -$' "$WORK/jout" \
+  && ok_t "J an emptied Buzz field on an edit still clears it, as before" \
+  || bad_t "J an emptied Buzz field on an edit still clears it, as before" "$(cat "$WORK/jout")"
+grep -qE '^J4 rc=[1-9]' "$WORK/jout" \
+  && ok_t "J NEGATIVE: an unknown flag is refused by the same harness" \
+  || bad_t "J NEGATIVE: an unknown flag is refused by the same harness" "$(cat "$WORK/jout")"
+
+# --- K. the install-contract waiver lets go of buzz ---------------------------
+# T5 there reds on a waived verb that is no longer in the dispatch table — the
+# iteration-1 delivery missed it (quinn, 2026-10-25). Graded here so the next
+# move of a verb sees it before CI's container job does.
+grep -qE "^WAIVED='[^']*\bbuzz\b" scripts/install-contract.sh \
+  && bad_t "K install-contract WAIVED no longer names buzz" "$(grep -n '^WAIVED=' scripts/install-contract.sh)" \
+  || ok_t "K install-contract WAIVED no longer names buzz"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
