@@ -143,6 +143,10 @@ out=$(run buzz owner); rc=$?
   _plugin_channel_ships_verb buzz 5dive-plugins && echo "H2 yes" || echo "H2 no"
   _plugin_channel_ships_verb telegram "" && echo "H3 yes" || echo "H3 no"
   _plugin_channel_ships_verb dashboard "" && echo "H4 yes" || echo "H4 no"
+  # shellcheck source=/dev/null
+  source "$SRC/cmd_pack.sh" 2>/dev/null; set +e
+  _market_channel_verb_rows '[{"name":"buzz","marketplace":"5dive-plugins","installs":"agent"},{"name":"telegram","marketplace":"5dive-plugins","installs":"agent"},{"name":"voice","marketplace":"5dive-plugins","installs":"box"}]' \
+    | jq -r '"H5 " + (map(.name + "=" + .installs) | join(","))'
 ) >"$WORK/h" 2>&1
 grep -q '^H1 yes$' "$WORK/h" && grep -q '^H2 yes$' "$WORK/h" \
   && ok_t "H a channel whose registry manifest declares a verb installs box-wide" \
@@ -150,6 +154,9 @@ grep -q '^H1 yes$' "$WORK/h" && grep -q '^H2 yes$' "$WORK/h" \
 grep -q '^H3 no$' "$WORK/h" && grep -q '^H4 no$' "$WORK/h" \
   && ok_t "H NEGATIVE: a verb-less or unresolvable channel keeps the per-agent refusal" \
   || bad_t "H NEGATIVE: a verb-less or unresolvable channel keeps the per-agent refusal" "$(cat "$WORK/h")"
+grep -q '^H5 buzz=box,telegram=agent,voice=box$' "$WORK/h" \
+  && ok_t "H the plugin listing marks that channel a box install, and only that one" \
+  || bad_t "H the plugin listing marks that channel a box install, and only that one" "$(cat "$WORK/h")"
 grep -qE '_plugin_is_builtin_channel_ref "\$_bare" "\$_refmkt" \\$' "$SRC/cmd_plugin.sh" \
   && grep -qE '&& ! _plugin_channel_ships_verb "\$_bare" "\$_refmkt"; then' "$SRC/cmd_plugin.sh" \
   && ok_t "H plugin add consults it before refusing a channel" \
