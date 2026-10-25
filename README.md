@@ -83,7 +83,7 @@ sudo 5dive agent import olivia --as=ceo                     # hire one agent
 sudo 5dive team import startup --auth-profile=<account>     # hire a team: CEO, CMO, CTO, researcher, creative
 ```
 
-Ready-made teams: `startup`, `marketing` and `deploy-team`.
+Ready-made teams: `startup`, `marketing`, `deploy-team` and `trading-desk` (paper trading research: no exchange keys, no live orders).
 
 ## Ask, tell, task
 
