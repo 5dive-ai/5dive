@@ -402,6 +402,37 @@ _compose_push_args() {
   esac
 }
 
+# DIVE-6900: a pack seat's `skills:` go ON TOP of the pack's own. The import
+# above forwards none of them (the pack path pins `--with-skills=` so the pack's
+# set stays exact), so before this an extra a template named on a pack seat was
+# never even attempted: content-studio's dude/deep-research landed DEGRADED on
+# every hire. Same resolution as `agent create --with-skills`: a bare id is
+# <org>/skills, `owner/repo:id` names its repo. Best-effort like that path too —
+# a failed install leaves the agent up, and the degraded block names it.
+_compose_pack_extra_skills() {
+  local spec="$1" name="$2" self="$3" entry pair src sk have
+  [[ "$(jq -r '.no_skills // false' <<<"$spec")" == "true" ]] && return 0
+  gh_org >/dev/null 2>&1 || true   # resolve once here, not once per $(parse_skill_spec)
+  have=$(_skill_list_json "$name" 2>/dev/null | jq -r '.[].name' 2>/dev/null || true)
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    pair=$(parse_skill_spec "$entry"); src="${pair% *}"; sk="${pair#* }"
+    grep -qxF -- "$sk" <<<"$have" && continue
+    if ! valid_skill_source "$src" || ! valid_skill_id "$sk"; then
+      warn "[$name] skill '$entry' is not a valid id or owner/repo:id — skipped"
+      continue
+    fi
+    bash "$self" agent skill "$name" add --source="$src" --skill="$sk" >/dev/null \
+      || warn "[$name] skill '$sk' from '$src' did not install — the agent is up; the summary below names the retry"
+  done < <(jq -r '(.skills // [])[]' <<<"$spec" 2>/dev/null)
+}
+
+# DIVE-6900: the retry the degraded block prints. `agent skill add` refuses
+# without --source, so the hint carries the source the spec entry resolved to.
+_compose_skill_hint() {
+  printf 'sudo 5dive agent skill %s add --source=%s --skill=%s\n' "$1" "$3" "$2"
+}
+
 # DIVE-536: build argv for `5dive agent import <pack> --as=<name> ...` when an
 # agent spec carries `pack:`. The pack manifest supplies type/persona/skills/
 # model/effort; here we only thread the runtime wiring (channels/auth/workdir).
@@ -1888,6 +1919,7 @@ HELP
       step "[$name] importing character pack '$pack_slug'"
       mapfile -t args < <(_compose_import_args "$agent_spec" "$name" "$pack_slug" "$spec_dir" "$type_override")
       bash "$self" agent import "${args[@]}" || brought_up=0
+      (( brought_up )) && _compose_pack_extra_skills "$agent_spec" "$name" "$self"
       # DIVE-5498: the pack's own CLAUDE.md names teammates by their bare names.
       if (( brought_up )) && [[ -n "$COMPOSE_NAME_MAP" ]]; then
         _compose_rename_persona_file "$name" "$(jq -r '.type // "claude"' <<<"$agent_spec")" "$COMPOSE_NAME_MAP" || true
@@ -2011,14 +2043,17 @@ HELP
   # Display only — it cannot regress the create path it describes.
   # >>> DIVE-2347 degraded-skill derivation (extracted verbatim by tests/compose_skill_degraded_unit.sh)
   local -a _degraded=()
-  local _want _have _miss
+  local _want _have _miss _pair _a _s _src
+  gh_org >/dev/null 2>&1 || true
   for _n in "${_brought_up_names[@]+"${_brought_up_names[@]}"}"; do
-    _want=$(jq -r --arg n "$_n" '(.agents[$n].skills // [])[] | sub("^.*:";"")' <<<"$spec" 2>/dev/null || true)
+    _want=$(jq -r --arg n "$_n" '(.agents[$n].skills // [])[]' <<<"$spec" 2>/dev/null || true)
     [[ -n "$_want" ]] || continue
     _have=$(_skill_list_json "$_n" 2>/dev/null | jq -r '.[].name' 2>/dev/null || true)
     while IFS= read -r _miss; do
       [[ -n "$_miss" ]] || continue
-      grep -qxF -- "$_miss" <<<"$_have" || _degraded+=("$_n $_miss")
+      # DIVE-6900: keep the source the entry resolves to — the retry needs it.
+      _pair=$(parse_skill_spec "$_miss")
+      grep -qxF -- "${_pair#* }" <<<"$_have" || _degraded+=("$_n ${_pair#* } ${_pair% *}")
     done <<<"$_want"
   done
   # <<< DIVE-2347 degraded-skill derivation
@@ -2048,7 +2083,7 @@ HELP
       --arg f "$file" --arg c "$created" --arg s "$started" --arg k "$skipped" --arg e "$errors" \
       --argjson a "$(printf '%s\n' "${_asleep[@]+"${_asleep[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')" \
       --arg sf "${#_degraded[@]}" \
-      --argjson d "$(printf '%s\n' "${_degraded[@]+"${_degraded[@]}"}" | jq -R 'select(length>0) | split(" ") | {agent:.[0], skill:.[1]}' | jq -sc .)" \
+      --argjson d "$(printf '%s\n' "${_degraded[@]+"${_degraded[@]}"}" | jq -R 'select(length>0) | split(" ") | {agent:.[0], skill:.[1], source:.[2]}' | jq -sc .)" \
       --argjson nc "$(printf '%s\n' $_no_channel_names | jq -R . | jq -sc 'map(select(length>0))')" \
       --arg lc "$loops_created" --arg le "$loops_existing" --arg lerr "$loops_errors" \
       --argjson lr "$(printf '%s\n' "${_COMPOSE_LOOP_RETRY[@]+"${_COMPOSE_LOOP_RETRY[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')"
@@ -2074,7 +2109,8 @@ HELP
       echo ""
       echo "── ${#_degraded[@]} skill(s) FAILED to install — those agents are up but DEGRADED:"
       for _n in "${_degraded[@]}"; do
-        echo "     sudo 5dive agent skill ${_n%% *} add --skill=${_n##* }"
+        read -r _a _s _src <<<"$_n"
+        echo "     $(_compose_skill_hint "$_a" "$_s" "$_src")"
       done
       echo "   (if a skill is missing from its source repo, the spec is wrong — not your box)"
     fi
