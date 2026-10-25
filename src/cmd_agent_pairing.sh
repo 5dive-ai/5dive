@@ -565,6 +565,88 @@ PY
 # load-time name enrichment (turn cryptic ids in allowFrom into "Mark ·
 # @lodar"). Token stays server-side. Returned id can then be written into
 # allowFrom by the regular telegram-access set path — no schema change.
+# ---- DIVE-6930: lift Telegram's owner-only lock on THIS seat's own bot ----
+#
+# The owner lets someone talk to the agent from chat: the agent proposes
+# (the telegram plugin's access_request tool), the owner taps «Разрешить», and
+# only that tap, checked in plugin code, adds the person to access.json. A bot
+# 5dive's manager (or a partner's) made for a hire is restricted to its owner
+# at creation, so a new person cannot reach it at all until that lock is
+# lifted, and only the manager's token can lift it (5dive-api). The plugin runs
+# this after the tap; it is the box's twin of the Mini App's Invite tap.
+#
+#   sudo 5dive agent _telegram_open          (from a seat: its own agent)
+#   5dive agent _telegram_open <name>        (as root)
+#
+# A standard seat reaches it through one EXACT-path, NO-args NOPASSWD line, so
+# the agent is derived from SUDO_UID and a seat can open only its own bot. It
+# reads the box identity as root, makes one POST to a fixed URL, and writes
+# nothing on the box. Opening is not letting in: access.json stays the gate,
+# and a stranger who reaches an open bot lands in pending, as on any BotFather
+# bot. data.state:
+#   open         the lock was lifted
+#   not_managed  no manager made this bot (BotFather, CoS): there is no lock
+#   no_account   a self-hosted box with no 5dive account: no managed bot
+cmd_agent_telegram_open() {
+  local name=""
+  _gate_is_root || fail "$E_PERMISSION" "_telegram_open runs as root (a seat reaches it with: sudo 5dive agent _telegram_open)"
+  if (( $# > 0 )); then
+    # Only a root caller can pass a name: a seat's grant names no arguments.
+    [[ -z "${SUDO_UID:-}" || "${SUDO_UID}" == 0 ]] \
+      || fail "$E_USAGE" "_telegram_open takes no arguments from a seat (it opens the caller's own bot)"
+    (( $# == 1 )) || fail "$E_USAGE" "usage: 5dive agent _telegram_open [<name>]"
+    name="$1"
+  else
+    local ruid="${SUDO_UID:-}" who=""
+    [[ "$ruid" =~ ^[0-9]+$ && "$ruid" != 0 ]] \
+      || fail "$E_USAGE" "usage: 5dive agent _telegram_open <name>   (as root; a seat runs it with no name, through sudo)"
+    who=$(actor_uid_to_name "$ruid")
+    case "$who" in
+      agent-*) name="${who#agent-}" ;;
+      claude) name=claude ;;
+      *) fail "$E_AUTH_REQUIRED" "_telegram_open caller uid ${ruid} is not an agent seat" ;;
+    esac
+  fi
+  [[ "$name" =~ ^[a-z][a-z0-9-]{1,15}$ ]] || fail "$E_VALIDATION" "invalid agent name"
+  ensure_state
+  local reg channels
+  reg=$(registry_read)
+  jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \
+    || fail "$E_NOT_FOUND" "no agent named '$name'"
+  channels=$(jq -r --arg n "$name" '.agents[$n].channels // ""' <<<"$reg")
+  [[ ",$channels," == *",telegram,"* ]] \
+    || fail "$E_VALIDATION" "agent '$name' has channels=$channels — _telegram_open only applies to telegram"
+
+  local env_file token
+  env_file=$(_tg_app_env_file)
+  token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$env_file" 2>/dev/null | head -1 || true)
+  if [[ -z "$token" ]]; then
+    ok "this box has no 5dive account, so its bot has no owner-only lock" \
+      '{agent:$a, state:"no_account"}' --arg a "$name"
+    return 0
+  fi
+  local out code body err
+  out=$(printf 'header = "authorization: Bearer %s"\n' "$token" \
+    | curl -sS --max-time 20 -K - -X POST -w '\n%{http_code}' \
+        "$(_tg_app_api)/server/telegram/agents/${name}/open" 2>/dev/null) || out=""
+  code="${out##*$'\n'}"; body="${out%$'\n'*}"
+  [[ "$code" =~ ^[0-9]{3}$ ]] || fail "$E_GENERIC" "5dive could not be reached to open ${name}'s bot"
+  if [[ "$code" == 200 ]]; then
+    if jq -e '.open == true' >/dev/null 2>&1 <<<"$body"; then
+      ok "${name}'s bot is open: anyone can reach it, and access.json still decides who is answered" \
+        '{agent:$a, state:"open"}' --arg a "$name"
+      return 0
+    fi
+    if jq -e '.reason == "not_managed"' >/dev/null 2>&1 <<<"$body"; then
+      ok "${name}'s bot was not made by a manager bot, so it has no owner-only lock" \
+        '{agent:$a, state:"not_managed"}' --arg a "$name"
+      return 0
+    fi
+  fi
+  err=$(jq -r '.error // empty' <<<"$body" 2>/dev/null || true)
+  fail "$E_GENERIC" "5dive could not open ${name}'s bot (HTTP ${code}${err:+, $err})"
+}
+
 cmd_telegram_resolve_handle() {
   local name="" handle=""
   while [[ $# -gt 0 ]]; do
