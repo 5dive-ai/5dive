@@ -30,9 +30,9 @@ sudo 5dive init
 
 ![Installing 5dive and messaging an agent](docs/quickstart.gif)
 
-You need a Linux server (Ubuntu 22.04 or newer) and your own AI subscription or API key, no 5dive account. Or skip the ops and run it on [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme). Same open-source CLI.
+You need a Linux server (Ubuntu 22.04 or newer) and your own AI subscription or API key, no 5dive account.
 
-Optional: chat with your agents from your phone, free: [5dive.app/self-host](https://5dive.app/self-host)
+Want your agents on your phone too? Link your server free at [5dive.app/self-host](https://5dive.app/self-host).
 
 ## Why 5dive
 
