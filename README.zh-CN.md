@@ -82,10 +82,10 @@ sudo 5dive agent create scout --type=codex --auth-profile=gpt
 
 ```sh
 sudo 5dive agent import olivia --as=ceo     # 雇用一个智能体
-sudo 5dive team import startup              # 雇用一支团队：CEO、CMO、DevOps、研究员、创意设计
+sudo 5dive team import startup              # 雇用一支团队：CEO、CMO、CTO、研究员、创意设计
 ```
 
-现成的团队：`startup`、`content-studio`、`eng-studio`、`deploy-team`、`distribution`，以及打造 5dive 的那支团队 `5dive-team`。
+现成的团队：`startup`、`marketing` 和 `deploy-team`。
 
 ## 询问、告知、派任务
 

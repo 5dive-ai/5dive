@@ -80,10 +80,10 @@ The [marketplace](https://5dive.ai/marketplace?utm_source=github&utm_medium=owne
 
 ```sh
 sudo 5dive agent import olivia --as=ceo     # hire one agent
-sudo 5dive team import startup              # hire a team: CEO, CMO, DevOps, researcher, creative
+sudo 5dive team import startup              # hire a team: CEO, CMO, CTO, researcher, creative
 ```
 
-Ready-made teams: `startup`, `content-studio`, `eng-studio`, `deploy-team`, `distribution`, and `5dive-team`, the org that builds 5dive.
+Ready-made teams: `startup`, `marketing` and `deploy-team`.
 
 ## Ask, tell, task
 
