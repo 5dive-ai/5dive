@@ -32,7 +32,7 @@ sudo 5dive init
 
 You need a Linux server (Ubuntu 22.04 or newer) and your own AI subscription or API key, no 5dive account.
 
-Want your agents on your phone too? Link your server free at [5dive.app/self-host](https://5dive.app/self-host).
+One app for your whole team, no bot tokens: link your server free at [5dive.app/self-host](https://5dive.app/self-host).
 
 ## Why 5dive
 
