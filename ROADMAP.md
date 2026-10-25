@@ -1,80 +1,36 @@
-# Roadmap
+# Where 5dive is going
 
-5dive's north star: **run a company of AI agents with humans only where humans are
-genuinely needed.** Agents do the work; you appear for rare, well-formed, auditable
-decisions on your phone. Every item below is judged by one metric: fewer human touches
-per unit of shipped work, without losing auditability.
+**Close your laptop. Your AI team keeps working.**
 
-Most of the first wave is now live. Checked items ship in the CLI today; open boxes link
-to a tracked issue, so you can see what is coming and shape it. No dates, no promises of
-order: things ship when they're solid. Comment on an issue to pull it forward, or open a
-new one; real usage reports move items up the list.
+Own it. Run it from your phone.
 
-## Reliability first
+**Vision:** every small business has an AI team working for it, one it owns, not rents.
 
-- [x] Unit test suite runs in CI on every PR
-- [x] Coverage expansion: task queue verbs, agent lifecycle, gates, heartbeat, digest
-- [x] `CONTRIBUTING.md` + contributor docs (build flow, bundle rule, test harness pattern)
-- [x] Modularize core internals so contributions land on clean seams
+**Mission:** hiring an AI team is as easy as hiring one person.
 
-## The company plans itself
+## 1. A team you hire and talk to
 
-- [x] `5dive goal add "<outcome>"`: a planner agent decomposes a goal into tasks with
-      dependencies, routes them through the org chart, and re-plans on failure
-- [x] Dependency-aware scheduling: the heartbeat wakes the critical path first
-- [x] Tasks without an assignee route by role, not to whoever filed them
-- [x] `5dive project show` renders the dependency graph at a glance
+Each agent has a name, a face, a voice and a job. Hire a ready-made team in one tap and talk to it from your phone.
 
-## Human gates 2.0
+## 2. Yours, built your way
 
-- [x] Decision memory: past answers become precedent, so you are never asked the same
-      question twice
-- [x] Gate SLAs: an unanswered gate escalates instead of silently blocking a lane
-- [ ] One inbox for every open gate across all your boxes (#15)
-- [x] The zero-human KPI: human-touches-per-week in the daily digest, trending down
-- [x] Weekly autonomy report: "your company ran 7 days, shipped N tasks, asked you twice"
-- [x] Public proof: the zero-human badge on the README, republished daily from the box
-      that runs our company ([what it claims and what it does not](docs/zero-human.md))
+Mix Claude, Codex and other agents in one team, on the plans you already pay for. Add skills, plugins and whole teams like building blocks. Your server or ours. MIT, no lock-in.
 
-## Work that proves itself done
+## 3. Work you can see done
 
-- [x] Verifier-graded acceptance as the default for non-trivial tasks (maker never grades
-      their own work)
-- [x] Auto-recovery: stuck agents restart, nudge, or escalate on their own, every action
-      logged
-- [x] Self-healing for every runtime, not just Claude (#16)
-- [ ] Enforceable per-loop token budgets (#17)
-
-## Memory that compounds
-
-- [x] New agents inherit team memory on first boot: hire someone who already knows the company
-- [x] Memory hygiene in `5dive doctor`: stale facts, broken links, duplicates
-- [ ] Opt-in, human-reviewed memory sharing for published agent packs, never automatic (#18)
-
-## An open ecosystem
-
-- [x] Agent packs: export a whole agent (skills, hooks, prompt) as a portable, versioned
-      archive; import someone else's
-- [x] `5dive hire <role>` from the public character registry: open market to employed
-      teammate in one command
-- [ ] One company across many boxes: tasks, org chart, and gates span your whole fleet (#19)
-- [x] Every agent carries a portable identity card and a verifiable work history
-
-## The next horizon
-
-The first wave above is mostly shipped, so this is what we aim at next. Same razor:
-fewer human touches per unit of shipped work, without losing auditability.
-
-- [ ] Repeat gates clear themselves from your own precedent, promotion gated on a
-      measured acceptance record (#20)
-- [ ] Publish your own zero-human badge from your own box, one command, same
-      methodology as ours (#21)
-- [ ] Autonomy earned by track record: agents whose work keeps proving itself done get
-      wider defaults, logged and reversible (#22)
-- [ ] Give the company an outcome and a number, not a backlog: a standing goal the
-      planner keeps steering toward (#23)
+Agents share tasks, use websites, check each other's work and show you the result: a lead list, a published post, a fixed website.
 
 ---
 
-The CLI stays one MIT binary with no open-core split. Everything here ships to
-self-hosters the same day it ships to the managed platform.
+## Next, for builders
+
+1. End-to-end encrypted chat in the 5dive app, for your own server (#1407)
+2. A simpler start: fewer steps from sign-up to a team at work (#1408)
+3. The 5dive app on Google Play (#1409)
+4. One-click install from hosting marketplaces, DigitalOcean and Linode first (#1410)
+5. A faster browser for your agents (#1411)
+6. [OpenAgent](https://github.com/5dive-ai/openagent): your agent talks to your friends' agents (#1412)
+
+**Works today:** one MIT CLI on any Linux server · Claude Code, Codex, OpenClaw, Hermes and more side by side · ready-made teams from the [marketplace](https://github.com/5dive-ai/5dive-marketplace) · voice · a real [browser](https://github.com/5dive-ai/5dive-browser) · shared memory.
+
+Want something sooner? Comment on its issue, or open one.
