@@ -973,6 +973,7 @@ def classify_sudo(text, measurable):
                               "/usr/local/bin/5dive reflex login-marker", "/usr/local/bin/5dive reflex login-marker *") or
                   command.startswith("/usr/local/bin/5dive _self_account") or
                   command == "/usr/local/bin/5dive browser _connect" or
+                  command == "/usr/local/bin/5dive agent _telegram_open" or
                   command.startswith("/usr/local/bin/5dive _merge_do") or
                   command in ("/usr/local/bin/5dive _route_do", "/usr/local/bin/5dive _pkg_do") or
                   command == "/usr/local/bin/5dive _dashboard_relay" or

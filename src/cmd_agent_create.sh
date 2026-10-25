@@ -629,6 +629,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive reflex login-marker"|"/usr/local/bin/5dive reflex login-marker *"|\
         "/usr/local/bin/5dive _self_account"*|\
         "/usr/local/bin/5dive browser _connect"|\
+        "/usr/local/bin/5dive agent _telegram_open"|\
         "/usr/local/bin/5dive _merge_do"*|\
         "/usr/local/bin/5dive _route_do"|"/usr/local/bin/5dive _pkg_do"|\
         "/usr/local/bin/5dive _dashboard_relay"|\
@@ -815,6 +816,15 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _self_account
 # came through this same seat's bot and that the tapper is its paired owner. So
 # the seat cannot mint a code, read one or register a bind by itself.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive browser _connect
+# DIVE-6930: let this seat's telegram plugin lift Telegram's owner-only lock on
+# ITS OWN bot after the owner taps Allow on a request to let someone in.
+# EXACT path, NO args, NO wildcard: the agent is derived from SUDO_UID, so the
+# only bot this seat can open is its own. One POST to a fixed URL with the box
+# identity, read as root; nothing is written on the box. Opening is not letting
+# in: access.json stays the gate, and the plugin adds the person only on the tap.
+# The seat can run it untapped too; all that does is let strangers reach pending,
+# which is what the owner's Invite tap in the Mini App already does.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _telegram_open
 # DIVE-3474: let a VERIFIER merge the pull request on a row IT ITSELF graded PASS.
 # EXACT path, NO args, NO wildcard: one task ident travels over stdin, the caller
 # is derived from SUDO_UID inside _merge_do, and the merge standing is re-derived

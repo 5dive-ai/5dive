@@ -920,6 +920,11 @@ _agent_verb_dispatch() {
         telegram-pending-ignore)
           AUDIT_CMD="agent telegram-pending-ignore"; AUDIT_ARGS=("$@")
           cmd_telegram_pending_ignore "$@" ;;
+        _telegram_open)
+          # DIVE-6930: lift Telegram's owner-only lock on the caller's own bot,
+          # after its owner's tap in the telegram plugin (cmd_agent_pairing.sh).
+          AUDIT_CMD="agent _telegram_open"; AUDIT_ARGS=("$@")
+          cmd_agent_telegram_open "$@" ;;
         telegram-resolve-handle)
           # Read-only getChat lookup against Telegram. Bot token stays
           # server-side; skip audit so handle probes don't spam the log.
