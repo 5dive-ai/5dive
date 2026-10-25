@@ -14,7 +14,7 @@ Each agent has a name, a face, a voice and a job. Hire a ready-made team in one 
 
 ## 2. Yours, built your way
 
-Mix Claude, Codex and other agents in one team, on the plans you already pay for. A small bash core. Agent CLIs, skills, plugins and whole teams snap on like building blocks. Your server or ours. MIT, no lock-in.
+Mix Claude, Codex and other agents in one team, on the plans you already pay for. A small bash core. Agent CLIs, tools, skills, plugins and whole teams snap on like building blocks. Your server or ours. MIT, no lock-in.
 
 ## 3. Work you can see done
 
