@@ -113,7 +113,7 @@ grep -qx SURVIVED <<<"$res" \
   || bad_t 'T5 a failed skill install aborts the import' ''
 
 # --- T6 the pack branch calls it, after a successful import only ------------
-after_import=$(grep -A1 'bash "$self" agent import "${args\[@\]}" || brought_up=0' "$SRC")
+after_import=$(grep -A1 'bash "$self" agent import "${args\[@\]}" || brought_up=0' "$SRC") || after_import=""
 grep -q '(( brought_up )) && _compose_pack_extra_skills "$agent_spec" "$name" "$self"' <<<"$after_import" \
   && ok_t 'T6 the pack branch installs the extras right after a successful import' \
   || bad_t 'T6 _compose_pack_extra_skills is not called after agent import' "$(grep -n '_compose_pack_extra_skills' "$SRC")"
