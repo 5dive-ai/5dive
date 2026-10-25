@@ -96,7 +96,7 @@ out=$(INSTALLED="" run_extra '{"pack":"x","no_skills":true,"skills":["deep-resea
 
 # --- T5 an install that fails does not fail the import ----------------------
 printf '#!/usr/bin/env bash\nexit 7\n' >"$TMP/self-red"; chmod +x "$TMP/self-red"
-bash -uo pipefail -c '
+res=$(bash -uo pipefail -c '
   set -e
   gh_org() { printf 5dive-ai; }
   warn() { :; }
@@ -107,13 +107,14 @@ bash -uo pipefail -c '
   '"$EXTRA_FN"'
   _compose_pack_extra_skills "{\"skills\":[\"deep-research\"]}" dude "$1"
   echo SURVIVED
-' _ "$TMP/self-red" 2>/dev/null | grep -qx SURVIVED \
+' _ "$TMP/self-red" 2>/dev/null) || true
+grep -qx SURVIVED <<<"$res" \
   && ok_t 'T5 a failed install leaves the run going under set -e (best-effort, like agent create)' \
   || bad_t 'T5 a failed skill install aborts the import' ''
 
 # --- T6 the pack branch calls it, after a successful import only ------------
-grep -A1 'bash "$self" agent import "${args\[@\]}" || brought_up=0' "$SRC" \
-  | grep -q '(( brought_up )) && _compose_pack_extra_skills "$agent_spec" "$name" "$self"' \
+after_import=$(grep -A1 'bash "$self" agent import "${args\[@\]}" || brought_up=0' "$SRC")
+grep -q '(( brought_up )) && _compose_pack_extra_skills "$agent_spec" "$name" "$self"' <<<"$after_import" \
   && ok_t 'T6 the pack branch installs the extras right after a successful import' \
   || bad_t 'T6 _compose_pack_extra_skills is not called after agent import' "$(grep -n '_compose_pack_extra_skills' "$SRC")"
 
