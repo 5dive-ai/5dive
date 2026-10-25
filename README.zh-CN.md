@@ -118,6 +118,23 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 5dive task loop auto DIVE-12 on            # 让循环自动应用自己的改进
 ```
 
+## 插件
+
+| 插件 | 功能 |
+|---|---|
+| [Browser](https://github.com/5dive-ai/5dive-browser) | 真实浏览器，可复用已登录的会话 |
+| [Voice](https://github.com/5dive-ai/5dive-voice) | 语音消息和语音回复 |
+| [Council](https://github.com/5dive-ai/5dive-council) | 多智能体投票和可审计的决策 |
+| [OpenAgent](https://github.com/5dive-ai/5dive-a2a) | 每个智能体都有自己的签名身份，可以和其他服务器上的智能体私信（新） |
+| [UI](https://github.com/5dive-ai/5dive-ui) | 只读 Web 仪表盘 |
+| [Laya](https://github.com/5dive-ai/5dive-laya) | 处理日常决策的本地模型（8 GB 内存） |
+
+```sh
+sudo 5dive plugin add 5dive-ai/5dive-browser
+```
+
+[开发一个插件 →](https://github.com/5dive-ai/5dive-plugin-template)
+
 ## 核心命令
 
 | 命令 | 作用 |
@@ -148,23 +165,6 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 | `5dive doctor` · `self-update` | 检查服务器，更新 5dive |
 
 每个命令都支持 `--help`。完整参考（英文）：[5dive.ai/docs/5dive-cli](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh)。
-
-## 插件
-
-| 插件 | 功能 |
-|---|---|
-| [Browser](https://github.com/5dive-ai/5dive-browser) | 真实浏览器，可复用已登录的会话 |
-| [Voice](https://github.com/5dive-ai/5dive-voice) | 语音消息和语音回复 |
-| [Council](https://github.com/5dive-ai/5dive-council) | 多智能体投票和可审计的决策 |
-| [OpenAgent](https://github.com/5dive-ai/5dive-a2a) | 每个智能体都有自己的签名身份，可以和其他服务器上的智能体私信（新） |
-| [UI](https://github.com/5dive-ai/5dive-ui) | 只读 Web 仪表盘 |
-| [Laya](https://github.com/5dive-ai/5dive-laya) | 处理日常决策的本地模型（8 GB 内存） |
-
-```sh
-sudo 5dive plugin add 5dive-ai/5dive-browser
-```
-
-[开发一个插件 →](https://github.com/5dive-ai/5dive-plugin-template)
 
 ## 架构
 

@@ -116,6 +116,23 @@ Agents save what they learn as notes and search them later, with sources. The te
 5dive task loop auto DIVE-12 on            # let a loop apply its own fixes
 ```
 
+## Plugins
+
+| Plugin | Function |
+|---|---|
+| [Browser](https://github.com/5dive-ai/5dive-browser) | Real browser with reusable authenticated sessions |
+| [Voice](https://github.com/5dive-ai/5dive-voice) | Voice messages and spoken replies |
+| [Council](https://github.com/5dive-ai/5dive-council) | Multi-agent votes and auditable decisions |
+| [OpenAgent](https://github.com/5dive-ai/5dive-a2a) | Each agent gets its own signed identity and private DMs with agents on other servers (new) |
+| [UI](https://github.com/5dive-ai/5dive-ui) | Read-only web dashboard |
+| [Laya](https://github.com/5dive-ai/5dive-laya) | Local model for routine decisions (8 GB RAM) |
+
+```sh
+sudo 5dive plugin add 5dive-ai/5dive-browser
+```
+
+[Build a plugin →](https://github.com/5dive-ai/5dive-plugin-template)
+
 ## Core commands
 
 | Command | What it does |
@@ -146,23 +163,6 @@ Agents save what they learn as notes and search them later, with sources. The te
 | `5dive doctor` · `self-update` | Check the server, update 5dive |
 
 Every command has `--help`. Full reference: [5dive.ai/docs/5dive-cli](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
-
-## Plugins
-
-| Plugin | Function |
-|---|---|
-| [Browser](https://github.com/5dive-ai/5dive-browser) | Real browser with reusable authenticated sessions |
-| [Voice](https://github.com/5dive-ai/5dive-voice) | Voice messages and spoken replies |
-| [Council](https://github.com/5dive-ai/5dive-council) | Multi-agent votes and auditable decisions |
-| [OpenAgent](https://github.com/5dive-ai/5dive-a2a) | Each agent gets its own signed identity and private DMs with agents on other servers (new) |
-| [UI](https://github.com/5dive-ai/5dive-ui) | Read-only web dashboard |
-| [Laya](https://github.com/5dive-ai/5dive-laya) | Local model for routine decisions (8 GB RAM) |
-
-```sh
-sudo 5dive plugin add 5dive-ai/5dive-browser
-```
-
-[Build a plugin →](https://github.com/5dive-ai/5dive-plugin-template)
 
 ## Architecture
 
