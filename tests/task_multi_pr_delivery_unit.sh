@@ -19,6 +19,9 @@
 #   L*  `task merge-landed` refuses, naming the open companion.
 #   G*  `task done`: one open companion -> refused naming it; both merged ->
 #       closes; a result naming an unbound pull URL -> refused.
+#   C*  (DIVE-6922) `_merge_do` reads the same derived set: a companion named
+#       only in the result is merged through `_merge_do_at_github`, and the
+#       primary's landing no longer short-circuits as already-merged.
 #   M*  MUTATION: the companion guard removed -> P1 goes red, so the negative
 #       control is one something can break (DIVE-4623).
 #   DIVE-5348 (the bound set is every PR the row claims, and only an unbind with
@@ -239,6 +242,52 @@ PRSTATE=(["$API"]=MERGED ["$FE"]=OPEN)
 [[ $rc -eq 0 ]] \
   && ok_t "X1a ...and with no companion open it reads the primary's landing exactly as before" \
   || bad_t "X1a single-PR already-landed unchanged" "rc=$rc"
+
+# ── C: DIVE-6922 — the merge reads the SAME bound set as the close gate ───────
+# DIVE-6920: primary merged, fe#803 bound through the RESULT only, stored
+# companions NULL. The merge read the stored column, saw no companion, returned
+# already-merged; the gate still demanded fe#803, so nothing could close it.
+db "INSERT INTO tasks (ident, title, priority, assignee, created_by, kind, status,
+                       maker_agent, verifier, graded_by, graded_verdict, graded_at,
+                       delivery_ref, delivery_companions, result)
+    VALUES ('DIVE-940', 'graded two-repo row', 'high', 'dev', 'main', 'standard', 'in_progress',
+            'dev', 'quinn', 'quinn', 'pass', datetime('now','-2 hours'),
+            $(sqlq "$API"), NULL, $(sqlq "$EV — frontend half: $FE"));"
+C_ID=$(db "SELECT id FROM tasks WHERE ident='DIVE-940';")
+PRSTATE=(["$API"]=MERGED ["$FE"]=OPEN)
+[[ -z "$(_task_companion_refs "$C_ID")" ]] \
+  && ok_t "C1 the fixture is the incident's shape: the stored companion column names nothing" \
+  || bad_t "C1 fixture" "stored='$(_task_companion_refs "$C_ID")'"
+c_open=$(_merge_do_open_companions "$C_ID")
+[[ "$c_open" == "$FE" ]] \
+  && ok_t "C2 the merge's companion read finds the PR bound through the result alone" \
+  || bad_t "C2 result-bound companion" "got '$c_open'"
+c_n=$(grep -c . <<<"$c_open")
+out=$( _MDO_COMPANIONS_OPEN=$c_n; _merge_do_already_landed "$API" 2>&1 ); rc=$?
+[[ $rc -eq 1 && "$out" != *"disposition=already-merged"* ]] \
+  && ok_t "C3 ...so the primary's landing no longer short-circuits the call as already-merged" \
+  || bad_t "C3 already-merged short-circuit" "rc=$rc out=$out"
+c_log="$TMP/c-github.log"; : >"$c_log"
+out=$( _merge_do_at_github() { printf '%s\n' "$2" >>"$c_log"; printf '_merge_do: disposition=merged\n' >&2; }
+       _merge_do_companions DIVE-940 "$API" quinn tok "$TMP" "${c_open}" 2>&1 ); rc=$?
+[[ $rc -eq 0 && "$(cat "$c_log")" == "$FE" && "$out" == *"companion-disposition=merged"* && "$out" != *"_merge_do: disposition="* ]] \
+  && ok_t "C4 the companion goes through _merge_do_at_github, its disposition renamed so it is never read as the row's" \
+  || bad_t "C4 companion merged at GitHub" "rc=$rc log=$(cat "$c_log") out=$out"
+PRSTATE=(["$API"]=MERGED ["$FE"]=MERGED)
+[[ -z "$(_merge_do_open_companions "$C_ID")" ]] \
+  && ok_t "C5 a companion that has merged is not merged again" \
+  || bad_t "C5 merged companion" "got '$(_merge_do_open_companions "$C_ID")'"
+DO=$(declare -f cmd_task_merge_do)
+grep -q '_merge_do_open_companions' <<<"$DO" && grep -q '_merge_do_companions' <<<"$DO" && ! grep -q '_task_companion_refs' <<<"$DO" \
+  && ok_t "C6 cmd_task_merge_do selects its companions through that read and merges them through that loop" \
+  || bad_t "C6 merge_do wiring" "$(grep -n 'companion' <<<"$DO")"
+PRSTATE=(["$API"]=MERGED ["$FE"]=OPEN)
+out=$( eval "$(declare -f _merge_do_open_companions | sed 's/_task_bound_pr_refs/_task_companion_refs/')"
+       c_n=$(_merge_do_open_companions "$C_ID" | grep -c .)
+       _MDO_COMPANIONS_OPEN=$c_n; _merge_do_already_landed "$API" 2>&1 )
+[[ "$out" == *"disposition=already-merged"* ]] \
+  && ok_t "M4 MUTATION: reading the stored companions only reproduces DIVE-6920 (already-merged, companion untouched) — C2/C3 can fail" \
+  || bad_t "M4 mutation did not bite" "out=$out"
 
 # ── M: mutation — the guard removed, P1 must go red ───────────────────────────
 mk_merging DIVE-930

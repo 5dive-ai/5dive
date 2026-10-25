@@ -4652,6 +4652,49 @@ _merge_push_probe() {
   fi
 }
 
+# _merge_do_open_companions <id> — every pull request bound beside the row's
+# primary that has not merged, one URL per line: the companions `_merge_do`
+# still has to merge.
+#
+# DIVE-6922: this read ONLY the stored `delivery_companions` column while the
+# close gate reads the DIVE-5348 derived set (stored companions + pull URLs in
+# the result + the body's "Delivered as"). DIVE-6920 bound fe#803 through its
+# result alone, so the merge saw no companion, returned already-merged on the
+# primary, and the gate still demanded fe#803 — neither could happen. The merge
+# now reads the one set the gate reads.
+_merge_do_open_companions() {
+  local bound c
+  bound=$(_task_bound_pr_refs "$1")
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    [[ -n "$(_merge_landed_read "$c" "$(_gate_slug_from_url "$c")")" ]] && continue
+    printf '%s\n' "$c"
+  done <<<"$bound"
+  return 0
+}
+
+# _merge_do_companions <ident> <primary> <actor> <token> <gh-config-dir> <url>...
+# — DIVE-4899: each companion goes through the SAME GitHub half as the primary,
+# called only from `cmd_task_merge_do` after standing is re-derived as root. Its
+# disposition line is RENAMED so the caller's `_merge_disp_read` reads the
+# primary's alone — a companion's `merged` must never be read as the row's. A
+# companion that fails stops the call before the primary is touched.
+_merge_do_companions() {
+  local ident="$1" pr="$2" actor="$3" tok="$4" _ghcfg="$5" c
+  shift 5
+  for c in "$@"; do
+    local rc=0 out=""
+    out=$(_merge_do_at_github "$ident" "$c" "$actor" "$tok" "$_ghcfg" 2>&1) || rc=$?
+    [[ -n "$out" ]] && printf '%s\n' "${out//_merge_do: disposition=/_merge_do: companion-disposition=}" >&2
+    if (( rc != 0 )); then
+      mark_reported
+      printf '_merge_do: companion %s of %s did not merge, so the primary %s was NOT attempted — a row lands only when every bound pull request has (DIVE-4899).\n' "$c" "$ident" "$pr" >&2
+      return "$rc"
+    fi
+  done
+  return 0
+}
+
 # cmd_task_merge_do — ROOT-ONLY (`_merge_do`). Re-derives everything: the caller
 # from SUDO_UID, the standing from the row, and the pull request from the row's
 # own delivery_ref. Accepts an IDENT and nothing else, so there is no argument
@@ -4744,15 +4787,12 @@ cmd_task_merge_do() {
   # companion is still open. The companions are read from the SAME row that
   # passed the standing query above — like the primary, never from the caller.
   local -a _mdo_comp=()
-  local _mdo_c _mdo_id
+  local _mdo_c _mdo_id _mdo_open=""
   _mdo_id=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
-  if [[ -n "$_mdo_id" ]]; then
-    while IFS= read -r _mdo_c; do
-      [[ -n "$_mdo_c" ]] || continue
-      _merge_landed_read "$_mdo_c" "$(_gate_slug_from_url "$_mdo_c")" | grep -q . && continue
-      _mdo_comp+=("$_mdo_c")
-    done < <(_task_companion_refs "$_mdo_id")
-  fi
+  [[ -n "$_mdo_id" ]] && _mdo_open=$(_merge_do_open_companions "$_mdo_id")
+  while IFS= read -r _mdo_c; do
+    [[ -n "$_mdo_c" ]] && _mdo_comp+=("$_mdo_c")
+  done <<<"$_mdo_open"
   # The companion count rides into `_merge_do_already_landed` by dynamic scope:
   # an open companion IS a merge still to perform, so the primary's landing must
   # not short-circuit this call before the credential is read.
@@ -4776,20 +4816,9 @@ cmd_task_merge_do() {
   # those strings intact survived the whole suite). The split moves no check and
   # widens nothing: the authority half is still re-derived here, as root, and
   # `_merge_do_at_github` is unreachable except through it.
-  # DIVE-4899: each companion goes through the SAME GitHub half as the primary.
-  # Its disposition line is RENAMED so the caller's `_merge_disp_read` reads the
-  # primary's alone — a companion's `merged` must never be read as the row's.
-  # A companion that fails stops the call before the primary is touched.
-  for _mdo_c in "${_mdo_comp[@]}"; do
-    local _mdo_rc=0 _mdo_out=""
-    _mdo_out=$(_merge_do_at_github "$ident" "$_mdo_c" "$actor" "$tok" "$_ghcfg" 2>&1) || _mdo_rc=$?
-    [[ -n "$_mdo_out" ]] && printf '%s\n' "${_mdo_out//_merge_do: disposition=/_merge_do: companion-disposition=}" >&2
-    if (( _mdo_rc != 0 )); then
-      mark_reported
-      printf '_merge_do: companion %s of %s did not merge, so the primary %s was NOT attempted — a row lands only when every bound pull request has (DIVE-4899).\n' "$_mdo_c" "$ident" "$pr" >&2
-      return "$_mdo_rc"
-    fi
-  done
+  # DIVE-4899: the companions first, through the same GitHub half (see
+  # `_merge_do_companions`); one that fails stops the call before the primary.
+  _merge_do_companions "$ident" "$pr" "$actor" "$tok" "$_ghcfg" "${_mdo_comp[@]}" || return $?
   _MDO_COMPANIONS_OPEN=0
   if _merge_do_already_landed "$pr"; then return 0; fi
   # DIVE-6543: the PRIMARY carries the graded sha; a companion's head is a
