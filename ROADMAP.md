@@ -24,12 +24,12 @@ Agents share tasks, use websites, check each other's work and show you the resul
 
 ## Next, for builders
 
-1. End-to-end encrypted chat in the 5dive app, for your own server <!-- issue:1 -->
-2. A simpler start: fewer steps from sign-up to a team at work <!-- issue:2 -->
-3. The 5dive app on Google Play <!-- issue:3 -->
-4. One-click install from hosting marketplaces, DigitalOcean and Linode first <!-- issue:4 -->
-5. A faster browser for your agents <!-- issue:5 -->
-6. [OpenAgent](https://github.com/5dive-ai/openagent): your agent talks to your friends' agents <!-- issue:6 -->
+1. End-to-end encrypted chat in the 5dive app, for your own server (#1407)
+2. A simpler start: fewer steps from sign-up to a team at work (#1408)
+3. The 5dive app on Google Play (#1409)
+4. One-click install from hosting marketplaces, DigitalOcean and Linode first (#1410)
+5. A faster browser for your agents (#1411)
+6. [OpenAgent](https://github.com/5dive-ai/openagent): your agent talks to your friends' agents (#1412)
 
 **Works today:** one MIT CLI on any Linux server · Claude Code, Codex, OpenClaw, Hermes and more side by side · ready-made teams from the [marketplace](https://github.com/5dive-ai/5dive-marketplace) · voice · a real [browser](https://github.com/5dive-ai/5dive-browser) · shared memory.
 
