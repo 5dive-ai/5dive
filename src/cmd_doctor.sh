@@ -2608,6 +2608,14 @@ cmd_doctor() {
     # DIVE-4709: and the layer under it — a seat that cannot READ the record at
     # all, whose every plugin verb therefore dies as "unknown command".
     doctor_check_plugin_record_visibility
+    # DIVE-6935: where the dev-team tools come from. Not installed is the
+    # normal customer box, so ok; installed but refused is a warn, because
+    # then this box runs the core's copy while its owner thinks it runs the
+    # plugin's.
+    local _dt_line _dt_sev=ok
+    _dt_line=$(devteam_status_line 2>/dev/null) || _dt_line="status unreadable"
+    [[ "$_dt_line" == *"loaded from"* || "$_dt_line" == *"not installed"* ]] || _dt_sev=warn
+    doctor_add plugins devteam "$_dt_sev" "$_dt_line"
 
     # DIVE-4697: the plugin path that arrives from OUTSIDE the box. Claude Code
     # 2.1.275 syncs the skills and plugins enabled on the claude.ai ACCOUNT into
