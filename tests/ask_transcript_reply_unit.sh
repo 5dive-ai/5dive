@@ -110,7 +110,6 @@ require_agent()             { :; }
 wait_agent_input_ready()    { return 0; }
 inject_and_submit()         { return 0; }
 mirror_interagent_outbound(){ :; }
-_buzz_mirror_outbound()     { :; }
 _envelope_caller()          { echo first-job; }
 envelope_tier()             { echo admin; }
 envelope_via()              { :; }

@@ -748,7 +748,9 @@ render_standard_sudoers() {
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
 ${user} ALL=(root) NOPASSWD: /usr/local/lib/5dive/agent-list-snapshot
-# DIVE-3573: the buzz bridge's inbound router. The buzz plugin runs AS this agent
+# DIVE-3573: the buzz bridge's inbound router. Since DIVE-6934 core hands this
+# spelling to the buzz plugin's verb (official buzz@5dive-plugins only), and on a
+# box without that plugin it refuses. The buzz plugin runs AS this agent
 # and cannot inject into a pane, so the trust decision and the delivery both have
 # to happen root-side. This grant confers no authority over any OTHER seat: the
 # verb has NO target argument and derives the pane it drives from SUDO_USER, so
@@ -4124,38 +4126,8 @@ cmd_create() {
       _hc_issues+=("$_ch is DEAF (allowlist empty) — pair it: 5dive agent pair $name --user-id=<$_idlabel>")
     fi
   done
-  # DIVE-3509 buzz: "poller up" above reads the AGENT's systemd unit, which is
-  # active whether or not the buzz channel has any of its three prerequisites.
-  # A create-time check that says "poller up" while the plugin it named was
-  # never fetched is worse than no check, because it is the thing an operator
-  # looks at. Assert the real predicate instead — plugin dir, config, binary —
-  # and name the one command that fixes it.
-  if channel_in_list buzz "$channels"; then
-    local _bz_home="/home/agent-${name}" _bz_gaps=() _bz_cfg _bz_path
-    _bz_cfg="${_bz_home}/.claude/channels/buzz/config.json"
-    if ! grep -q . < <(find "${_bz_home}/.claude/plugins/cache" -maxdepth 3 -type d -name buzz \
-         -print -quit 2>/dev/null); then
-      _bz_gaps+=("plugin not installed")
-    fi
-    if [[ ! -f "$_bz_cfg" ]]; then
-      _bz_gaps+=("no config.json")
-    elif ! jq -e '.relay_url and .private_key' "$_bz_cfg" >/dev/null 2>&1; then
-      _bz_gaps+=("config.json missing relay_url/private_key")
-    else
-      _bz_path=$(jq -r '.buzz_path // "buzz"' "$_bz_cfg" 2>/dev/null)
-      # An absolute buzz_path must exist; a bare name must resolve on PATH.
-      if [[ "$_bz_path" == /* ]]; then
-        [[ -x "$_bz_path" ]] || _bz_gaps+=("buzz binary missing at $_bz_path")
-      else
-        command -v "$_bz_path" >/dev/null 2>&1 || _bz_gaps+=("buzz binary '$_bz_path' not on PATH")
-      fi
-    fi
-    if (( ${#_bz_gaps[@]} == 0 )); then
-      _hc_ok+=("buzz configured")
-    else
-      _hc_issues+=("buzz is UNCONFIGURED ($(IFS=', '; echo "${_bz_gaps[*]}")) — the channel is enabled but connected to NOTHING. Finish it: sudo 5dive agent buzz enable $name --relay=<https://relay.example.com>")
-    fi
-  fi
+  # DIVE-6934: the create-time buzz wiring check (DIVE-3509) left core with the
+  # buzz verbs; the buzz plugin's `5dive agent buzz status <name>` is that check.
   # reachability: telegram getMe (the token actually resolves a live bot).
   # bot_username is only populated above for an exact channels==telegram create,
   # so re-probe here when telegram is present in a multi-channel set.

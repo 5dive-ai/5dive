@@ -2593,23 +2593,8 @@ cmd_deliver() {
     _reason="$(_agent_submit_unconfirmed_reason "$target" "$_rc")" \
       || _reason="the payload was typed but the submit could not be verified"   # DIVE-6586
   fi
-  # DIVE-3573 (a): mirror the outbound into the sender's buzz channel.
-  #
-  # AND YES, THIS IS ONE SITE MORE THAN THE TELEGRAM MIRROR HAS — deliberately,
-  # and it is the difference worth reading. mirror_interagent_outbound is called
-  # from cmd_send and cmd_ask only, and cmd_send EXECS into this primitive for
-  # every scoped-sudo caller, so its mirror is unreachable for exactly the
-  # population that reaches a2a through `_deliver`: standard-isolation agents,
-  # which on an OSS box is most of the fleet. Matching that gap byte for byte
-  # would have shipped the row's headline feature invisible for those seats.
-  # The Telegram side of it is a real defect and NOT fixed here — a change to a
-  # live notification rail belongs in its own row, not smuggled into a buzz one.
-  # Placed before the receipt and unconditional on `_delivered` in the same way
-  # cmd_send's is: the mirror describes what was SENT, and it returns 0 on every
-  # path, so it can never change this primitive's rc.
-  # DIVE-5689: a system notice (--system-notice, carried from cmd_send) is not
-  # something the invoking seat said, so it is not mirrored — same gate as cmd_send's.
-  [[ "${_5DIVE_SYSTEM_NOTICE:-0}" == "1" ]] || _buzz_mirror_outbound "$target" "$message"
+  # DIVE-6934: the buzz outbound mirror (DIVE-3573 (a)) stood here; it left core
+  # with the buzz verbs and was not carried into the buzz plugin.
   if (( _delivered )); then
     # Byte-for-byte rc=0 compatibility: this is the pre-DIVE-2362 receipt.
     # DIVE-4769: the urgent split, for the reason written out at cmd_send's
@@ -3536,12 +3521,6 @@ cmd_send() {
   # Mirror the outbound into the sender's group chat (best-effort). Gated on a
   # real envelope: a raw/anonymous send has no sender identity to mirror under.
   (( ! _mirror )) || mirror_interagent_outbound "$name" "$message"
-  # DIVE-3573 (a): the same outbound, mirrored into the sender's buzz channel.
-  # Gated on the SAME condition and for the same stated reason — a raw send has
-  # no sender identity to mirror under. Best-effort: _buzz_mirror_outbound
-  # returns 0 on every path, so a relay outage can never fail a send that already
-  # reached the pane.
-  (( ! _mirror )) || _buzz_mirror_outbound "$name" "$message"
 
   # DIVE-4342: a send that NAMES A ROW ("do DIVE-200 first") is silently
   # outranked by the dispatcher's priority-then-age sort. The message lands, the
@@ -3903,10 +3882,6 @@ cmd_ask() {
   # Mirror the outbound into the sender's group chat (best-effort). Unprivileged
   # (runs as the caller), so it's safe on both paths.
   mirror_interagent_outbound "$name" "$message"
-  # DIVE-3573 (a): `ask` mirrors into buzz too. An a2a conversation that is only
-  # half visible in the room is worse than one that is not there at all — the
-  # answer would appear with no question above it.
-  _buzz_mirror_outbound "$name" "$message"
 
   local start now last_change reply="" prev_slice="" capture slice
   start=$(date +%s)

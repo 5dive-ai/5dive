@@ -99,7 +99,6 @@ envelope_peer_forgery()     { :; }
 gen_msg_id()                { echo "$MID"; }
 step()                      { :; }
 a2a_round_guard()           { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$ROUND_F"; }
-_buzz_mirror_outbound()     { :; }
 
 # --- the crash that shipped -------------------------------------------------
 a2a_needs_scoped() { return 1; }   # DIRECT branch — where it died
