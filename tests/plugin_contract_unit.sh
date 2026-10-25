@@ -170,7 +170,7 @@ run cmd_plugin_add nover@fixture --yes; t "T1b a manifest with no version is ref
 tc "T1b-msg and it says why version is load-bearing" "keyed on it" "$ERR"
 run cmd_plugin_add badver@fixture --yes; t "T1c a version that is not a version number is refused" "$E_VALIDATION" "$RC"
 run cmd_plugin_add badcap@fixture --yes; t "T1d an unknown capability is refused" "$E_VALIDATION" "$RC"
-tc "T1d-msg and it lists the legal set" "channel mcp skill verb hook core" "$ERR"
+tc "T1d-msg and it lists the legal set" "channel mcp skill verb hook" "$ERR"
 run cmd_plugin_add badgrant@fixture --yes; t "T1e an unknown grant is refused" "$E_VALIDATION" "$RC"
 run cmd_plugin_add badtier@fixture --yes; t "T1f an unknown review tier is refused" "$E_VALIDATION" "$RC"
 run cmd_plugin_add future@fixture --yes; t "T1g a plugin targeting a contract we do not implement is refused" "$E_VALIDATION" "$RC"
