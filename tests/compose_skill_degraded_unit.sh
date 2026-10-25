@@ -52,6 +52,12 @@ else
         "markers present? $(grep -c 'DIVE-2347 degraded-skill derivation' "$SRC")"
 fi
 
+# DIVE-6900: the block resolves each entry with the REAL parse_skill_spec (so a
+# bare id carries the source the retry hint needs); gh_org is pinned so no arm
+# reaches the network.
+PARSE_FN=$(awk '/^parse_skill_spec\(\)/,/^}/' "$ROOT/src/cmd_skill.sh")
+[[ -n "$PARSE_FN" ]] || bad_t 'T1b parse_skill_spec not found in src/cmd_skill.sh — the arms below cannot resolve sources' ''
+
 # Harness: run the extracted block with a stubbed installed-set. `spec`,
 # `_brought_up_names` and `_skill_list_json` are exactly what cmd_compose_up
 # has in scope at that point.
@@ -73,6 +79,8 @@ run_block() {
       done
       echo "[]"
     }
+    gh_org() { printf 5dive-ai; }
+    '"$PARSE_FN"'
     _n=""
     block() {
       '"$BLOCK"'
@@ -87,8 +95,8 @@ SPEC_TWO='{"agents":{"writer":{"skills":["5dive-cli","deep-research"]},"editor":
 # --- T2 a missing skill is DETECTED -----------------------------------------
 # The measured case: writer asked for deep-research, only 5dive-cli landed.
 out=$(run_block "$SPEC_TWO" "writer editor" "writer:5dive-cli" "editor:5dive-cli")
-if [[ "$(grep -c . <<<"$out")" == 1 ]] && grep -qx 'writer deep-research' <<<"$out"; then
-  ok_t 'T2 a skill that failed to install is detected (writer/deep-research), and only that one'
+if [[ "$(grep -c . <<<"$out")" == 1 ]] && grep -qx 'writer deep-research 5dive-ai/skills' <<<"$out"; then
+  ok_t 'T2 a skill that failed to install is detected (writer/deep-research, source 5dive-ai/skills), and only that one'
 else
   bad_t 'T2 the missing skill was not detected — the summary would still read errors=0' \
         "got: $(tr '\n' '|' <<<"$out")"
