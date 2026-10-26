@@ -55,7 +55,7 @@ env:
   # devteam-harnesses job reads it, so moving it never moves the plugins tree the
   # core harnesses grade against (a shared bump turned codex_channel_e2e and
   # plugin_contract red on telegram-codex changes unrelated to devteam).
-  DEVTEAM_PLUGINS_REF: cedbfe577609543d2d3a332428500d0c72c3c352
+  DEVTEAM_PLUGINS_REF: ca30c6a6df0de971ca2d461f5e3ab4c04d616839
 
 jobs:
   # DIVE-3315: INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s

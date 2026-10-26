@@ -117,9 +117,9 @@ rc="$(ask loop --help)"
 # Since DIVE-6938 these are the delivery, grading and merge verbs: their files are
 # the devteam plugin's, which a split tree never has. Each answers `--help` with
 # the plugin's one line instead (arm G3, against the bundle).
-DEVTEAM_SUBS="deliver grade-context grader-replay grader-tick merge merge-audit merge-declined merge-gate-selftest merge-landed merge-unverified reject unbind-pr"
+DEVTEAM_SUBS="deliver grade-context grader-replay grader-tick merge merge-audit merge-declined merge-gate-selftest merge-landed merge-unverified unbind-pr"
 [[ "$(printf '%s\n' "${UNDEFINED[@]}" | sort | tr '\n' ' ' | sed 's/ $//')" == "$DEVTEAM_SUBS" ]] \
-  && ok_t "B1: exactly the 12 devteam-plugin verbs are undefined here — graded in G" \
+  && ok_t "B1: exactly the 11 devteam-plugin verbs are undefined here — graded in G" \
   || bad_t "B1: the split-tree exception list is unchanged" "got: '${UNDEFINED[*]}' (expected '$DEVTEAM_SUBS')"
 ! declare -F cmd_task_grader_tick >/dev/null 2>&1 \
   && ok_t "B2: ... and that gap is the plugin, not this change (the verb is undefined, not unhelped)" \

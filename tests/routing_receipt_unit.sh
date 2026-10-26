@@ -101,9 +101,22 @@ has_all_three() {
 
 echo "── A/B: the receipt exists, on stdout, on each routing verb ─────────────"
 
-# --- reject: the devteam plugin's verb since DIVE-6938; 5dive-plugins runs this
-# whole harness, reject included, against this tree with the plugin in place.
+# --- reject ------------------------------------------------------------------
 reg dev2 false 30 0
+R1=$(mk "receipt on reject" quinn high)
+db "UPDATE tasks SET maker_agent='dev2', verifier='quinn', iteration=1,
+      handoff_delivered_at=datetime('now'), status='todo' WHERE id=${R1};"
+I1=$(ident_of "$R1")
+ACTOR_OVERRIDE=quinn TASK_ACTOR=quinn \
+  OUT=$(cmd_task_reject "$I1" --feedback="needs another pass FIX: name the concrete change" 2>/dev/null)
+if has_all_three "$OUT" dev2; then
+  ok_t "reject prints a receipt naming owner + queue position + next wake on stdout"
+else
+  bad_t "reject receipt missing a fact (or landed on stderr)" "$OUT"
+fi
+[[ "$(assignee_of "$R1")" == "dev2" ]] \
+  && ok_t "reject still bounced the row to the maker" \
+  || bad_t "reject did not bounce the row" "assignee=$(assignee_of "$R1")"
 
 # --- assign ------------------------------------------------------------------
 R2=$(mk "receipt on assign" main medium)
@@ -349,9 +362,7 @@ grep -qE '^[[:space:]]+src/lib/routing_receipt\.sh$' build.sh \
   && ok_t "build.sh manifest ships src/lib/routing_receipt.sh" \
   || bad_t "routing_receipt.sh is not in the build manifest — the shipped CLI would not have it"
 
-# (the reject verb's file, task/delivery.sh, is in the devteam plugin since
-# DIVE-6938; 5dive-plugins runs this harness whole with it in place.)
-for pair in "src/task/crud.sh:assign" "src/task/dispatch.sh:set-body"; do
+for pair in "src/task/status.sh:reject" "src/task/crud.sh:assign" "src/task/dispatch.sh:set-body"; do
   f="${pair%%:*}"; v="${pair##*:}"
   grep -q 'routing_receipt "' "$f" \
     && ok_t "the $v verb's file calls routing_receipt" \
