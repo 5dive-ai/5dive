@@ -2948,6 +2948,31 @@ _create_caller_is_agent() {
   return 0
 }
 
+# DIVE-7028: _create_sole_account <type> — the box's one signed-in Claude
+# account, printed, rc 0. rc 1 for any other type, for none or several, or when
+# the shared login holds a credential (a seat with no account uses that, as
+# before). The demo AI never counts: it is the owner's trial (DIVE-6843).
+_create_sole_account() {
+  local type="${1:-}" d p found=""
+  [[ "$type" == "claude" && -n "${AUTH_PROFILES_DIR:-}" && -d "${AUTH_PROFILES_DIR:-}" ]] || return 1
+  lazy_need auth_creds_present
+  auth_creds_present "$type" >/dev/null 2>&1 && return 1
+  for d in "${AUTH_PROFILES_DIR}"/*/; do
+    [[ -d "$d" ]] || continue
+    p=$(basename "$d")
+    _create_uses_demo_ai "$p" "" && continue
+    auth_creds_present "$type" "$p" >/dev/null 2>&1 || continue
+    [[ -z "$found" ]] || return 1
+    found="$p"
+  done
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+
+# DIVE-7028: the marker self-host-link.sh (5dive-api) writes when it links this
+# box to 5dive.app for chat.
+_create_chat_only_mark() { printf '%s' "${FIVEDIVE_CHAT_ONLY_MARK:-/etc/5dive/chat-only}"; }
+
 # _create_demo_ai_key [account] — the account's key, or empty; demo-ai's by
 # default. It lives in combined.env (the demo is an OpenRouter key in the
 # Anthropic token slot).
@@ -2971,7 +2996,7 @@ _create_uses_demo_ai() {
 }
 
 cmd_create() {
-  local name="" type="" channels="none" telegram_token="" discord_token="" workdir="" profile=""
+  local name="" type="" channels="none" channels_set=0 telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
   local telegram_profile=""   # DIVE-5306: explicit --telegram-profile=lite|default
   local cos_owner_id=""
@@ -2991,7 +3016,7 @@ cmd_create() {
       --type=*)                    type="${1#--type=}" ;;
       --yolo)                      autonomy="yolo" ;;
       --autonomy=*)                autonomy="${1#--autonomy=}" ;;
-      --channels=*)                channels="${1#--channels=}" ;;
+      --channels=*)                channels="${1#--channels=}"; channels_set=1 ;;
       --telegram-token=*)          telegram_token="${1#--telegram-token=}" ;;
       --telegram-home-channel=*)   telegram_home_channel="${1#--telegram-home-channel=}" ;;
       --telegram-allowed-users=*)  telegram_allowed_users="${1#--telegram-allowed-users=}" ;;
@@ -3182,6 +3207,33 @@ cmd_create() {
   if [[ -n "$workdir" ]]; then
     valid_workdir "$workdir" \
       || fail "$E_VALIDATION" "invalid --workdir (absolute path, allowed chars: letters/digits/._-/)"
+  fi
+  # DIVE-7028: on a box with one Claude login, that login is the self-hoster's
+  # whole AI. A seat that names no account uses it, even under --defer-auth (a
+  # team template defers because a fresh box has no login, not to refuse the one
+  # it has). A named account that is already signed in is used, never deferred.
+  # A second account, the shared login or a BYO key leave both as they were.
+  if [[ -z "$profile" && -z "$byo_provider" && -z "$byo_api_key" && -z "$byo_base_url" ]]; then
+    local _sole_account
+    if _sole_account=$(_create_sole_account "$type"); then
+      profile="$_sole_account"
+      step "No --auth-profile: using this box's one signed-in AI account '$profile'"
+    fi
+  fi
+  if (( defer_auth )) && [[ -n "$profile" && -z "$byo_provider" && -z "$byo_api_key" ]]; then
+    lazy_need auth_creds_present
+    if auth_creds_present "$type" "$profile" >/dev/null 2>&1; then
+      defer_auth=0
+      step "Account '$profile' is already signed in: using it instead of deferring auth"
+    fi
+  fi
+  # DIVE-7028: a box linked to 5dive.app chat gave every agent there the app's
+  # chat; a seat added later with no --channels gets it too, at create, not a
+  # minute later from the box's reporter.
+  if (( ! channels_set )) && [[ "$type" == "claude" || "$type" == "codex" ]] \
+     && [[ -f "$(_create_chat_only_mark)" ]]; then
+    channels="dashboard"
+    step "This box is linked to 5dive.app chat: turning chat on for '$name'"
   fi
   if [[ -n "$profile" ]]; then
     valid_profile_name "$profile" \

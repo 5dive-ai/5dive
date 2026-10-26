@@ -109,9 +109,14 @@ eq_t 'a codex hire keeps the per-agent profile' \
   '--auth-profile=marcus' "$(import_profile codex --as=marcus --type=codex)"
 eq_t 'a BYO key keeps the per-agent profile' \
   '--auth-profile=marcus' "$(import_profile byo --as=marcus --provider=openrouter --api-key=sk-or-v1-x)"
+# DIVE-7028: the owner's one Claude account is then the seat's, not an empty
+# per-agent profile to sign in again (create_sole_account_default_unit.sh).
+fn() { awk -v n="$2" '$0 ~ "^"n"\\(\\) \\{" { on = 1 } on { print } on && $0 == "}" { exit }' "$1"; }
+for f in _create_sole_account _create_uses_demo_ai _create_demo_ai_key; do eval "$(fn src/cmd_agent_create.sh "$f")"; done
+eval "$(grep -m1 '^CREATE_DEMO_AI_ACCOUNT=' src/cmd_agent_create.sh)"
 box "$DEMO" 'mark:CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture'
-eq_t "with the owner's own Claude account, the DIVE-620 per-agent profile stays" \
-  '--auth-profile=marcus' "$(import_profile own --as=marcus)"
+eq_t "with the owner's own Claude account, the hire is signed in on it" \
+  '--auth-profile=mark' "$(import_profile own --as=marcus)"
 
 echo
 printf 'DIVE-5820 import binds demo-ai on a demo-only box: %d passed, %d failed\n' "$PASS" "$FAIL"

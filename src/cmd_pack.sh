@@ -3544,6 +3544,16 @@ cmd_import() {
   # profile to the new agent's name and still defer auth (below) — create
   # pre-makes the empty profile dir + symlink, a harmless no-op until first
   # sign-in, and re-auth then targets authProfile=<name> correctly.
+  # DIVE-7028: ...and a box with one signed-in Claude account of the owner's uses
+  # it (the self-hoster's only AI), not an empty per-agent profile to sign in again.
+  if [[ -z "$profile" && -z "$p_provider" && -z "$p_api_key" ]] \
+     && declare -F _create_sole_account >/dev/null; then
+    local _sole_account
+    if _sole_account=$(_create_sole_account "$type"); then
+      profile="$_sole_account"
+      step "No --auth-profile: using this box's one signed-in AI account '$profile'"
+    fi
+  fi
   [[ -n "$profile" ]] || profile="$as"
 
   # Build the create argv. Skills are re-added afterwards (best-effort) so one
@@ -3605,9 +3615,9 @@ cmd_import() {
     cargs+=("--channels=telegram")
   elif [[ -n "$dc_token" ]]; then
     cargs+=("--channels=discord")
-  else
-    cargs+=("--channels=none")
   fi
+  # DIVE-7028: no channel named -> none, chosen by cmd_create (which gives a seat
+  # on a box linked to 5dive.app chat that chat).
   [[ -n "$tg_token" ]] && cargs+=("--telegram-token=$tg_token")
   [[ -n "$dc_token" ]] && cargs+=("--discord-token=$dc_token")
   # DIVE-4416: create-only flags the caller forwarded (--heartbeat-every,
