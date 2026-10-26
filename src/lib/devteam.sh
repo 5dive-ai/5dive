@@ -42,7 +42,7 @@
 # A BOX WITHOUT THE PLUGIN defines none of these functions, and that IS the
 # answer: every core call into them asks `devteam_loaded` or `declare -F` first
 # and has its own no-plugin answer next to it. The verbs (`proof`, `gh`, `push`,
-# `deploy`, `task deliver|reject|merge…`) print one line instead:
+# `deploy`, `task deliver|merge…`) print one line instead:
 #   <verb> is in the devteam plugin: 5dive plugin install devteam
 #
 # FIVEDIVE_DEVTEAM=0 skips the plugin for one run (a way out if a bad plugin

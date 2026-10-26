@@ -464,10 +464,12 @@ _sc_probe_audit_nonroot() {
 #
 # The full sweep is ~150 harnesses x (clean run + mutated run) and does not belong in
 # an interactive verb, so the default is a NAMED sample and the sample is PRINTED —
-# never a silent cap. heartbeat_gate_shipped_unit.sh is in it by name because it is
-# the harness that actually shipped unwired for three releases. `--full` runs the
-# corpus; CI runs `--full` and unions the reports.
-SELFCHECK_HARNESS_SAMPLE="heartbeat_gate_shipped_unit.sh,gate_delivery_assertion_unit.sh,audit_nonroot_unit.sh"
+# never a silent cap. heartbeat_gate_shipped_unit.sh, the harness that actually
+# shipped unwired for three releases, was in it by name until it left with the
+# gate-shipped sweep for the devteam plugin (DIVE-6938); handoff_ack_unit.sh, the
+# core's verifier hand-off, holds its place. `--full` runs the corpus; CI runs
+# `--full` and unions the reports.
+SELFCHECK_HARNESS_SAMPLE="handoff_ack_unit.sh,gate_delivery_assertion_unit.sh,audit_nonroot_unit.sh"
 
 # --full costs ~10min (164 harnesses, --assume-clean, measured on an idle box; double
 # bare). That cost is inherent and DOCUMENTED rather than discovered by whoever runs it

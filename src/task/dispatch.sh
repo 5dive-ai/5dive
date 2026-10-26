@@ -425,7 +425,7 @@ _task_help_intercept() {
 # DIVE-6938: the delivery, grading and merge verbs live in the devteam plugin.
 # Without it each answers with the one line, `--help` included, instead of
 # `command not found` (or a "no usage text" for the two the surface never lists).
-_TASK_DEVTEAM_SUBVERBS="deliver reject merge merge-landed merge-declined unbind-pr merge-audit merge-unverified merge-gate-selftest grade-context grader-tick grader-replay"
+_TASK_DEVTEAM_SUBVERBS="deliver merge merge-landed merge-declined unbind-pr merge-audit merge-unverified merge-gate-selftest grade-context grader-tick grader-replay"
 _task_devteam() {
   [[ " $_TASK_DEVTEAM_SUBVERBS " == *" $1 "* ]] || return 0
   devteam_loaded || devteam_refuse "task $1"

@@ -227,7 +227,9 @@ awk '/^ok\(\) \{/{i=1} i&&/_five_flush_write_notes/{found=1} i&&/^\}/{i=0} END{e
   && bad_t "C2b ok() must not flush — a harness that redefines ok() would silence the announcement" "" \
   || ok_t "C2b ...confirmed by reading ok()'s own body: the flush is not in it"
 nsites=$(grep -rc '_five_flush_write_notes' "$ROOT/src/task/" | awk -F: '{n+=$2} END{print n}')
-[[ "$nsites" -ge 8 ]] \
+# DIVE-6938: 5 of the 12 sites are the core's (status.sh 1, loops.sh 4); the other 7
+# left with task/delivery.sh for the devteam plugin, whose runner puts it back here.
+[[ "$nsites" -ge 5 ]] \
   && ok_t "C2c the flush is called at the WRITE SITES instead ($nsites of them), which fire both in-process and in a real process" \
   || bad_t "C2c write-site coverage" "sites=$nsites"
 [[ "$(grep -c 'defer_write_note' "$BIN")" -ge 2 ]] \

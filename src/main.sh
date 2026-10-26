@@ -470,7 +470,7 @@ Dev-team tools (the devteam plugin — sudo 5dive plugin install devteam; DIVE-6
   5dive deploy <id|DIVE-N> [--target=<project@ref>]  # deploy ONLY what the task declares, ONLY after its gate clears
   5dive gh <gh args...>                              # actor-routed gh: writes go out as the machine account
   5dive gh whoami                                    # resolve both identities a gh write could go out as
-  5dive task deliver|reject|merge|merge-landed ...   # PR delivery, grading and the merge gate (5dive task --help)
+  5dive task deliver|merge|merge-landed ...          # PR delivery, grading and the merge gate (5dive task --help)
   # Without the plugin each of these answers: <verb> is in the devteam plugin: 5dive plugin install devteam
 
 Identity:

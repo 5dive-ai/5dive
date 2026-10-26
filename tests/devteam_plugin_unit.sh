@@ -57,7 +57,7 @@ for v in proof gh push deploy _gh_do _push_do _deploy_do _merge_do; do
   t  "D1 '5dive $v' without the plugin exits E_USAGE" 2 "$RC"
   tc "D1b and says where it went" "$v $LINE" "$ERR"
 done
-for v in deliver reject merge merge-landed merge-declined unbind-pr merge-audit merge-unverified merge-gate-selftest grade-context grader-tick grader-replay; do
+for v in deliver merge merge-landed merge-declined unbind-pr merge-audit merge-unverified merge-gate-selftest grade-context grader-tick grader-replay; do
   dv task "$v" DIVE-1
   t  "D2 'task $v' without the plugin exits E_USAGE" 2 "$RC"
   tc "D2b and says where it went" "task $v $LINE" "$ERR"
@@ -76,6 +76,15 @@ t  "D4 a row with a bound PR refuses on done" 2 "$RC"
 tc "D4b with the one line, naming the PR" "pull/1), $LINE" "$ERR"
 t  "D4c and stays open" in_progress "$(sqlite3 "$TASKS_DB" "SELECT status FROM tasks WHERE id=2;")"
 t  "D4d with its result unwritten" "" "$(sqlite3 "$TASKS_DB" "SELECT COALESCE(result,'') FROM tasks WHERE id=2;")"
+# The maker->verifier loop is the core's, not the plugin's: a verifier row with no
+# bound PR is handed to its verifier on done, and `task reject` is there to bounce it.
+dv task add "verifier row" --assignee=dev --verifier=quinn --verify
+dv task start DIVE-3; dv task done DIVE-3 --result="ready for review"
+t  "D8 a verifier row with no bound PR is handed over on done" 0 "$RC"
+t  "D8b to its verifier, as a delivery and not a close" "todo|quinn" "$(sqlite3 "$TASKS_DB" "SELECT status||'|'||assignee FROM tasks WHERE id=3;")"
+dv task reject --help
+t  "D8c task reject answers --help without the plugin" 0 "$RC"
+tn "D8d and is not sent to the plugin" "$LINE" "$ERR"
 dv heartbeat --help
 t  "D5 heartbeat --help runs (nothing in it sources a moved file)" 0 "$RC"
 dv loop --help
@@ -220,7 +229,7 @@ tn "C5 mutant: no task-verb guard -> D2 would print 'command not found' instead 
 BIN=$(mutant boundpr 's/^  if \[\[ "\$verb" == "done" \]\] \&\& ! devteam_loaded; then$/  if false; then/')
 sqlite3 "$TASKS_DB" "UPDATE tasks SET status='in_progress', result=NULL WHERE id=2;"
 FIVEDIVE_DEVTEAM=0 dv task done DIVE-2 --result="tries to close a bound PR"
-t  "C6 mutant: no bound-PR refusal -> D4 would close a row whose PR nobody checked" done "$(sqlite3 "$TASKS_DB" "SELECT status FROM tasks WHERE id=2;")"
+t  "C6 mutant: no bound-PR refusal -> D4 would hand on a row whose PR nobody checked" "todo|quinn" "$(sqlite3 "$TASKS_DB" "SELECT status||'|'||assignee FROM tasks WHERE id=2;")"
 BIN="$BUNDLE"
 for _m in perms review clash both taskline boundpr; do
   cmp -s "$BUNDLE" "$TMP/5dive.$_m"

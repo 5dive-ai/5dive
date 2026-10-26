@@ -27,7 +27,7 @@ _task_src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # `task add`, `task deliver`, `task done` and the grader lane all call into it, so
 # it is loaded here rather than added to sixty source lists.
 declare -F verify_grants_grader >/dev/null 2>&1 || . "$_task_src_dir/lib/verify_policy.sh"
-# DIVE-6938: devteam_require (answer.sh) and the rest of the devteam loader.
+# DIVE-6938: the devteam loader (devteam_require and the moved-verb fallthrough).
 declare -F devteam_require >/dev/null 2>&1 || . "$_task_src_dir/lib/devteam.sh"
 declare -F cmd_task >/dev/null 2>&1 || . "$_task_src_dir/task/dispatch.sh"
 declare -F _task_resolve_coordinator >/dev/null 2>&1 || . "$_task_src_dir/task/routing.sh"

@@ -3,7 +3,7 @@
 # isolation contract as task_core_unit.sh: source src/ directly, point STATE_DIR
 # at a throwaway temp dir so the live shared tasks.db is NEVER touched. The key
 # guarantee: what set-branch/--branch WRITES is exactly what delegated push READS,
-# so we assert against cmd_push.sh's own _push_branch_from_body parser (DIVE-1462).
+# so we assert against the push's own _push_branch_from_body parser (src/lib/broker.sh) (DIVE-1462).
 # Run: bash tests/task_set_branch_unit.sh   (no root, no network).
 set -uo pipefail
 

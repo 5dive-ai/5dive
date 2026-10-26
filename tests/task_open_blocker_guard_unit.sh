@@ -99,33 +99,9 @@ out=$(cmd_task_start DIVE-908 --no-preflight 2>&1); rc=$?
   && ok_t "T4 a non-blocked row is outside this narrowly scoped refusal" \
   || bad_t "T4 guard is not an edge-only blanket refusal" "rc=$rc status=$(st DIVE-908)"
 
-# T5: deliver was the sibling hole named for inspection in the ticket. Refuse
-# before writing either the delivery binding or the verifier handoff.
-seed DIVE-910 blocked verifier
-seed DIVE-911 todo
-edge DIVE-910 DIVE-911
-out=$(cmd_task_deliver DIVE-910 --pr=https://github.com/5dive-ai/5dive/pull/999 --result=work 2>&1); rc=$?
-[[ "$rc" == "$E_CONFLICT" ]] \
-  && ok_t "T5a deliver on a blocked row with an open blocker exits E_CONFLICT" \
-  || bad_t "T5a deliver refusal code" "rc=$rc want=$E_CONFLICT :: $out"
-[[ "$(st DIVE-910)" == blocked && "$(field DIVE-910 delivery_ref)" == NULL && "$(field DIVE-910 delivered_at)" == NULL && "$(field DIVE-910 result)" == NULL ]] \
-  && ok_t "T5b refused deliver writes no status, binding, timestamp, or result" \
-  || bad_t "T5b refused deliver is non-mutating" "status=$(st DIVE-910) ref=$(field DIVE-910 delivery_ref) at=$(field DIVE-910 delivered_at) result=$(field DIVE-910 result)"
-[[ "$out" == *"DIVE-911"* && "$out" == *"status='todo'"* && "$out" == *"DIVE-2317"* ]] \
-  && ok_t "T5c deliver refusal names the live blocker and policy ticket" \
-  || bad_t "T5c deliver refusal evidence" "$out"
-
-# T6: stale blocked delivery still works and routes to the distinct verifier.
-seed DIVE-912 blocked verifier
-seed DIVE-913 'done'
-edge DIVE-912 DIVE-913
-# DIVE-4576: a delivery whose result names no evidence is refused, so the fixture
-# result carries the five labels; this harness's subject (the blocker guard) is
-# unchanged by that rail.
-out=$(cmd_task_deliver DIVE-912 --pr=https://github.com/5dive-ai/5dive/pull/998 --result="work. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass DELIVERED-SHA: 1f2e3d4c5b6a79880123456789abcdef01234567 CI: green CRITERIA: (1) -> the run above" 2>&1); rc=$?
-[[ "$rc" == 0 && "$(st DIVE-912)" == todo && "$(field DIVE-912 delivery_ref)" == https://github.com/5dive-ai/5dive/pull/998 ]] \
-  && ok_t "T6 stale blocked delivery remains allowed and routes normally" \
-  || bad_t "T6 terminal blocker does not refuse delivery" "rc=$rc status=$(st DIVE-912) ref=$(field DIVE-912 delivery_ref)"
+# T5-T6 (`task deliver` on a blocked row) left with `task deliver` for the devteam
+# plugin (DIVE-6938); 5dive-plugins runs this whole harness, T5-T6 included,
+# against this tree.
 
 # T7: park is the other sibling named for inspection. It preserves blocked
 # status and the dependency edge, so it does not share the status/edge hole.

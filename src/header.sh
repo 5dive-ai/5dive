@@ -49,7 +49,6 @@ readonly FIVE_BUILD_SHA="unbuilt"
 # split-tree harness sources this file and the core asks this at ~20 call sites.
 devteam_loaded() {
   declare -F cmd_task_deliver >/dev/null 2>&1 \
-    || declare -F _task_route_to_verifier >/dev/null 2>&1 \
     || declare -F _gate_task_repo_slug >/dev/null 2>&1
 }
 

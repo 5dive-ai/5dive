@@ -2694,9 +2694,7 @@ cmd_task_need() {
   if [[ "$type" == "decision" ]]; then
     local _need_body _need_branch
     _need_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
-    _need_branch=""
-    # DIVE-6938: a `Branch:` binding means a delegated push, which is the devteam plugin's.
-    if declare -F _push_branch_from_body >/dev/null 2>&1; then _need_branch=$(_push_branch_from_body "$_need_body"); fi
+    _need_branch=$(_push_branch_from_body "$_need_body")
     if [[ -n "$_need_branch" ]]; then
       warn "$ident is branch-bound (Branch: ${_need_branch}) — a --type=decision gate only authorizes 'push' when answered by ITS OWN routed reviewer; a lead clearing it on someone else's behalf will NOT satisfy push (DIVE-2073). If this gate is meant to unblock a delegated push, file --type=approval instead."
     fi
@@ -4408,9 +4406,7 @@ db "BEGIN IMMEDIATE;
     # Split from the test, not `[[ … ]] && v=$(f)`: an assignment's rc is its last
     # command substitution's, so the helper's non-zero on "no binding" would leak into
     # the compound (the DIVE-2751 shape, absorbed here the same way DIVE-3266 does).
-    if declare -F _push_branch_from_body >/dev/null 2>&1; then
-      _pfr_branch=$(_push_branch_from_body "$_pfr_body" 2>/dev/null) || _pfr_branch=""
-    fi
+    _pfr_branch=$(_push_branch_from_body "$_pfr_body" 2>/dev/null) || _pfr_branch=""
     if [[ -n "$_pfr_branch" ]] && ! _gate_pfr_protected_ref "$_pfr_branch"; then
       local _pfr_ts; _pfr_ts=$(date -u '+%Y-%m-%d %H:%M:%S')
       local _pfr_sig=""
@@ -4905,9 +4901,7 @@ db "BEGIN IMMEDIATE;
     # Split rather than `[[ … ]] && v=$(f)`: an assignment's rc is its last command
     # substitution's, so the helper's non-zero on "no binding" would leak into the
     # compound (the DIVE-2751 shape). Absorbed here instead of argued about.
-    if declare -F _push_branch_from_body >/dev/null 2>&1; then
-      _rowship_branch=$(_push_branch_from_body "$_rowship_body" 2>/dev/null) || _rowship_branch=""
-    fi
+    _rowship_branch=$(_push_branch_from_body "$_rowship_body" 2>/dev/null) || _rowship_branch=""
     # DIVE-3228 / DIVE-3525 — THE SECOND BINDING, and this is the headline DIVE-3228
     # shipped zero lines of.
     #

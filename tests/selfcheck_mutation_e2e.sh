@@ -150,7 +150,13 @@ fi
 # verbatim. The harness still prints its failures; CI and `task verify --cmd` both
 # grade on $? and both go blind.
 mut_harness() {
-  local h="$WORK/tests/heartbeat_gate_shipped_unit.sh"
+  # The first harness in the bundle's own sample, read from the bundle under test
+  # like rail 3b below: DIVE-6938 changed it (heartbeat_gate_shipped_unit.sh left
+  # for the devteam plugin), and a hand-copied name would mutate a harness the
+  # probe no longer runs.
+  local first h
+  first=$(grep -m1 -oP '(?<=^SELFCHECK_HARNESS_SAMPLE=")[^",]+' "$WORK/5dive") || return 1
+  h="$WORK/tests/$first"
   [[ -r "$h" ]] || return 1
   printf '\nexit 0\n' >> "$h"
 }
