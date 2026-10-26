@@ -5,10 +5,11 @@
 # Part A grades the install gate: the `core` capability installs only as
 # devteam@5dive-plugins from a 5dive-owned source. Part B builds a real bundle
 # and runs it against a throwaway STATE_DIR: the plugin's copy of a lazy module
-# is read after the core's while it is byte-identical to it, and every pin (key,
+# is in use while it is byte-identical to the core's, and every pin (key,
 # review, capability, enabled, ownership and write bits, the identity check,
-# FIVEDIVE_DEVTEAM=0) stops it. Part C runs four mutants of the built bundle and
-# requires each to turn an arm red.
+# FIVEDIVE_DEVTEAM=0) stops it. An identical copy is not read a second time:
+# B12 runs the five modules that declare `readonly` (DIVE-6959). Part C runs
+# five mutants of the built bundle and requires each to turn an arm red.
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -60,7 +61,7 @@ proof() {  # run `5dive proof` from the bundle under test; OUT/ERR
   local b="${BIN:-$BUNDLE}"
   OUT=$(FIVE_LAZY_TRACE=1 bash "$b" proof 2>"$TMP/.e"); ERR=$(cat "$TMP/.e")
 }
-LOADED="overlay cmd_proof from $CURRENT"
+LOADED="overlay cmd_proof in use from $CURRENT"
 drift()   { printf '%s\n' "$DRIFTED_TEXT" > "$CURRENT"; chmod 644 "$CURRENT"; }
 undrift() { cp "$ROOT/src/cmd_proof.sh" "$CURRENT"; chmod 644 "$CURRENT"; }
 
@@ -70,7 +71,8 @@ t  "B0 negative control: the bundle recorded the sha of the core's own cmd_proof
    "__DEVTEAM_CORE_SHA[cmd_proof]=$(sha256sum <"$ROOT/src/cmd_proof.sh" | cut -d' ' -f1)" \
    "$(grep -m1 '^__DEVTEAM_CORE_SHA\[cmd_proof\]=' "$BUNDLE")"
 proof
-tc "B1 official, enabled, core capability, safe files, same bytes: the plugin's copy is read" "$LOADED" "$ERR"
+tc "B1 official, enabled, core capability, safe files, same bytes: the plugin's copy is in use" "$LOADED" "$ERR"
+tn "B1a and those bytes are not read a second time" "overlay cmd_proof from" "$ERR"
 tc "B1b and the verb answers as it always did" "usage: 5dive proof" "$OUT$ERR"
 drift; proof
 tn "B1c a plugin copy that differs from this core is NOT read (a core fix must not be undone)" "DEVTEAM-OVERLAY" "$OUT"
@@ -114,6 +116,45 @@ ln -s "$VDIR" "$PL/enabled/devteam@5dive-plugins"
 proof
 tc "B11 positive control after every negative above: it loads again" "$LOADED" "$ERR"
 
+# DIVE-6959: the real plugin ships all eight modules, and five of them declare a
+# top-level readonly, which dies if the same file is read twice. cmd_proof has
+# none, which is why B1 could not see it. Each verb below loads at least one of
+# them; `task deliver` stops at the empty task store, past the module load.
+DT_MODS="task/delivery.sh task/gate_evidence.sh task/grader_pool.sh task/grader_process.sh cmd_proof.sh cmd_gh.sh cmd_push.sh cmd_deploy.sh"
+allmods() { local r; mkdir -p "$VDIR/core/task"; for r in $DT_MODS; do cp "$ROOT/src/$r" "$VDIR/core/$r"; chmod 644 "$VDIR/core/$r"; done; }
+nomods()  { local r; for r in $DT_MODS; do [[ "$r" == cmd_proof.sh ]] || rm -f "$VDIR/core/$r"; done; undrift; }
+RO_RC=""
+ro_verbs() {  # every verb under ${BIN:-$BUNDLE}; RO_OUT = all stderr, RO_RC = rcs
+  local b="${BIN:-$BUNDLE}" v; RO_OUT=""; RO_RC=""
+  for v in "gh --help" "push --help" "deploy --help" "team ps --help" "task deliver NOPE-1"; do
+    # shellcheck disable=SC2086
+    FIVE_LAZY_TRACE=1 bash "$b" $v >/dev/null 2>"$TMP/.e"; RO_RC+="$v=$? "
+    RO_OUT+=$(cat "$TMP/.e")$'\n'
+  done
+}
+allmods; FIVEDIVE_DEVTEAM=0 ro_verbs; RO_BASE="$RO_RC"
+tn "B12-base negative control: the verbs ran the core copies" "overlay" "$RO_OUT"
+ro_verbs
+tc "B12-pre all five readonly modules were offered by the plugin and accepted" \
+   "overlay cmd_gh in use from $VDIR/core/cmd_gh.sh" "$RO_OUT"
+for _m in cmd_push cmd_deploy task__delivery task__gate_evidence; do
+  tc "B12-pre $_m is in use too" "overlay $_m in use from" "$RO_OUT"
+done
+tn "B12 a module that declares readonly survives the plugin standing in for it" "readonly variable" "$RO_OUT"
+t  "B12b and every verb exits as it does without the plugin" "$RO_BASE" "$RO_RC"
+tc "B12b2 and that baseline is real (gh --help answers)" "gh --help=0 " "$RO_BASE"
+tc "B12c task deliver got past the module load to its own refusal" "tasks store not initialised" "$RO_OUT"
+nomods
+
+# Phase 2's shape: no recorded sha for a module means the core no longer carries
+# it, and the plugin's copy is read as the code.
+BIN="$TMP/5dive.phase2"
+grep -v '^__DEVTEAM_CORE_SHA\[cmd_proof\]=' "$BUNDLE" > "$BIN"
+drift; proof; undrift
+tc "B13 no recorded sha (phase 2): the plugin's copy is read as the code" "DEVTEAM-OVERLAY core-kept" "$OUT"
+tc "B13b and the trace says it was read" "overlay cmd_proof from $CURRENT" "$ERR"
+BIN="$BUNDLE"
+
 # =============================================================================
 # Part C — mutants. Each removes one pin; the arm it guards must go red.
 # =============================================================================
@@ -136,8 +177,12 @@ BIN=$(mutant same 's/^_devteam_copy_current() {$/_devteam_copy_current() { retur
 drift; proof; undrift
 tc "C4 mutant: no identity check -> B1c would run the drifted copy" "DEVTEAM-OVERLAY" "$OUT"
 tc "C4b and that proves the plugin's file is really sourced, keeping core-only functions" "core-kept" "$OUT"
+BIN=$(mutant reread '/^_devteam_copy_current() {$/,/^}$/ s/^  return 2$/  return 0/')
+allmods; ro_verbs; nomods
+tc "C5-pre the mutant still put the modules in use" "overlay cmd_gh from" "$RO_OUT"
+tc "C5 mutant: an identical copy is read again (the DIVE-6939 overlay) -> B12 would die on readonly" "readonly variable" "$RO_OUT"
 BIN="$BUNDLE"
-for _m in perms review hook same; do
+for _m in perms review hook same reread; do
   cmp -s "$BUNDLE" "$TMP/5dive.$_m"
   t "C0-$_m the mutant really changed the bundle" "1" "$?"
 done
