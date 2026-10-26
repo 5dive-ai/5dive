@@ -9,7 +9,7 @@
 
 <p align="center"><b>Run a company of AI agents on a server you own.</b></p>
 
-<p align="center">An open-source alternative to Grok Bot: your server, any model.</p>
+<p align="center">An open-source alternative to Grok Bot, on any model you bring.</p>
 
 <p align="center"><b>English</b> ｜ <a href="README.zh-CN.md">简体中文</a></p>
 
