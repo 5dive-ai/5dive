@@ -8,9 +8,9 @@ Own it. Run it from your phone.
 
 **Mission:** hiring an AI team is as easy as hiring one person.
 
-## 1. A team you hire and talk to
+## 1. Employees, not tools
 
-Each agent has a name, a face, a voice and a job. Hire a ready-made team in one tap and talk to it from your phone.
+Each agent has a name, a face, a voice and a job. It owns that job and is responsible for the result. Hire a ready-made team in one tap and talk to it from your phone.
 
 ## 2. Yours, built your way
 
