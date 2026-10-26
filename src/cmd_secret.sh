@@ -297,7 +297,7 @@ _saved_2fa_seed() {
   local s="$1"
   [[ "$s" == otpauth://* && "$s" =~ [?\&]secret=([^\&]+) ]] && s="${BASH_REMATCH[1]}"
   s="${s^^}"; s="${s//[[:space:]-]/}"; s="${s//=/}"
-  [[ "$s" =~ ^[A-Z2-7]{16,128}$ ]] && printf '%s' "$s"
+  if [[ "$s" =~ ^[A-Z2-7]{16,128}$ ]]; then printf '%s' "$s"; fi
 }
 
 # DIVE-6973: a pair item from the save page, on stdin: login, password and the
