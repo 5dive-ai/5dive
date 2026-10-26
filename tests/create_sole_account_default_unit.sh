@@ -52,6 +52,15 @@ AUTH_PROFILES_DIR="$TMP/auth-profiles"
 CONNECTORS_DIR="$TMP/connectors"
 # The shared login lives in the fixture, never in the host's /etc/5dive.
 TYPE_AUTH[claude]="$CONNECTORS_DIR/anthropic.env:CLAUDE_CODE_OAUTH_TOKEN"
+# The agent CLIs are fixtures too: the CI runner has no ~claude/.local/bin/claude,
+# so cmd_create's install-on-demand ran a real install and every create arm
+# came back refused there (green on poke-two, red in CI).
+mkdir -p "$TMP/bin"
+for _t in claude codex; do
+  printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/$_t"; chmod +x "$TMP/bin/$_t"
+  TYPE_BIN[$_t]="$TMP/bin/$_t"
+done
+cmd_install() { printf 'INSTALL-ATTEMPTED %s\n' "$*"; return 1; }
 export FIVEDIVE_CHAT_ONLY_MARK="$TMP/chat-only"
 MP='mp:CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture-mp'
 KONST='konst:CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture-konst'
