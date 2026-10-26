@@ -60,9 +60,11 @@ Put the plugin in its own directory, not at the repository root. `.5dive-plugin/
   `fivedive` block, or an empty one, is refused.** That is the standard. A plain Claude Code
   plugin has declared nothing for 5dive to show or register.
 - **`fivedive.capabilities`** lists every surface the plugin adds: `channel`, `mcp`,
-  `skill`, `verb`, `hook`. **An undeclared surface is inert.** If you ship an MCP
+  `skill`, `verb`, `hook`, `core`. **An undeclared surface is inert.** If you ship an MCP
   server or skills without declaring them, 5dive does not register them, and says so
-  at install.
+  at install. `core` is reserved: it is code 5dive reads into itself, and only
+  5dive's own `devteam@5dive-plugins` may declare it. Any other plugin declaring it
+  is refused at install.
 - **`fivedive.verbs`**: with the `verb` capability, each name becomes a top-level
   `5dive <name>` command. 5dive runs `<plugin>/bin/<name>` with the user's arguments
   and nothing else. The manifest names the verb and never supplies a command line.
