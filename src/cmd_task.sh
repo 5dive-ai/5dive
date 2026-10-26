@@ -27,12 +27,12 @@ _task_src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # `task add`, `task deliver`, `task done` and the grader lane all call into it, so
 # it is loaded here rather than added to sixty source lists.
 declare -F verify_grants_grader >/dev/null 2>&1 || . "$_task_src_dir/lib/verify_policy.sh"
+# DIVE-6938: the devteam loader (devteam_require and the moved-verb fallthrough).
+declare -F devteam_require >/dev/null 2>&1 || . "$_task_src_dir/lib/devteam.sh"
 declare -F cmd_task >/dev/null 2>&1 || . "$_task_src_dir/task/dispatch.sh"
 declare -F _task_resolve_coordinator >/dev/null 2>&1 || . "$_task_src_dir/task/routing.sh"
 declare -F cmd_task_add >/dev/null 2>&1 || . "$_task_src_dir/task/crud.sh"
-declare -F _gate_tok_note >/dev/null 2>&1 || . "$_task_src_dir/task/gate_evidence.sh"
 declare -F _task_guard_result_over_closed >/dev/null 2>&1 || . "$_task_src_dir/task/status.sh"
-declare -F cmd_task_deliver >/dev/null 2>&1 || . "$_task_src_dir/task/delivery.sh"
 declare -F cmd_task_loops >/dev/null 2>&1 || . "$_task_src_dir/task/loops.sh"
 declare -F cmd_task_precedent >/dev/null 2>&1 || . "$_task_src_dir/task/need.sh"
 declare -F _task_agent_channel >/dev/null 2>&1 || . "$_task_src_dir/task/notify.sh"

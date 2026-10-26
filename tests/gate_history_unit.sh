@@ -56,7 +56,7 @@ TMP="$(mktemp -d /tmp/gate-history.XXXXXX)"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh cmd_proof.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh ; do
   source "$SRC/$f"
 done
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \
@@ -272,35 +272,8 @@ else
   bad_t "the archive must carry the nonce hash"
 fi
 
-# --- 7. _proof_ledger: guarded by-arm, deliberately unguarded nonce arm ------
-# Both cases are done+standard, the ledger's own partition.
-led_asks() { _proof_ledger | jq -r '.asks'; }
-t7=$(addt --assignee=dev -- "fixture: re-file residue on a done task")
-db "UPDATE tasks SET status='done', kind='standard', need_type='approval',
-      need_answered_by='human:lodar', need_answered_at=NULL WHERE id=${t7};"
-BEFORE=$(led_asks)
-if [[ "$BEFORE" == "0" ]]; then
-  ok_t "re-file residue (human:* answerer, NULL answered_at) counts as ZERO asks"
-else
-  bad_t "the by-arm must require need_answered_at" "asks=$BEFORE"
-fi
-# Same row, now genuinely answered: the arm must still FIRE, or the guard has
-# simply disabled the metric rather than corrected it.
-db "UPDATE tasks SET need_answered_at=datetime('now') WHERE id=${t7};"
-if [[ "$(led_asks)" == "1" ]]; then
-  ok_t "a genuinely human-answered gate still counts (the guard corrects, not disables)"
-else
-  bad_t "an answered human gate must count as an ask" "asks=$(led_asks)"
-fi
-# The nonce arm keeps its 'delivered to a human' semantics: an unanswered gate
-# carrying a nonce still counts. Changing this would move a published number.
-db "UPDATE tasks SET need_answered_by=NULL, need_answered_at=NULL,
-      human_nonce_hash='deadbeef' WHERE id=${t7};"
-if [[ "$(led_asks)" == "1" ]]; then
-  ok_t "the nonce arm still counts a delivered-but-unanswered gate (conservative)"
-else
-  bad_t "the nonce arm must keep its delivered semantics" "asks=$(led_asks)"
-fi
+# --- 7. _proof_ledger moved to the devteam plugin with cmd_proof.sh (DIVE-6938);
+# 5dive-plugins runs this whole harness, section 7 included, against this tree.
 
 # --- 8. reader: detailed rows + compact task-show summary --------------------
 JSON_MODE=1

@@ -48,7 +48,7 @@ trap 'rc=$?; rm -rf "${TMP:-}"; [[ "${SUMMARY_PRINTED:-0}" == 1 ]] || printf "AB
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh lib/runs.sh lib/broker.sh cmd_push.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh lib/runs.sh lib/broker.sh  cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

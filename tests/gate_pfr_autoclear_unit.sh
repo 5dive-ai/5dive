@@ -39,7 +39,7 @@ done
 # the branch with the same parser, and a harness that reimplemented it would stop
 # grading that.
 # shellcheck source=/dev/null
-source "$SRC/cmd_push.sh"
+# DIVE-6938: _push_branch_from_body is lib/broker.sh's now (sourced above).
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 FIXTURE_ACTOR=fixture-runner

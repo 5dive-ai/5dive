@@ -153,20 +153,9 @@ i_out=$("$CLI" task verify "$G" --no-done --result-file="$TMP/nope.txt" 2>&1); i
   && ok_t "G NEGATIVE: a missing file is refused by NAME (E_USAGE)" \
   || bad_t "G NEGATIVE: a missing file must be refused" "rc=$i_rc out=$(head -c 120 <<<"$i_out")"
 
-# The other verb the ticket names. deliver needs a --pr= URL to run at all.
-J=$(mk "prose J")
-"$CLI" task deliver "$J" --pr=https://github.com/5dive-ai/5dive/pull/1 --result-file="$TMP/verdict.txt" >/dev/null 2>&1
-j_rc=$?
-[[ "$j_rc" -eq 0 ]] \
-  && ok_t "J: task deliver --result-file works too (the second verb the ticket names)" \
-  || bad_t "J: task deliver --result-file exits 0" "got rc=$j_rc"
-res "$J" | grep -q 'a `backtick`' \
-  && ok_t "J: and deliver's file text survives verbatim" \
-  || bad_t "J: deliver's file text survives verbatim"
-k_out=$("$CLI" task deliver "$J" --pr=https://github.com/5dive-ai/5dive/pull/1 --result=x --result-file="$TMP/verdict.txt" 2>&1); k_rc=$?
-[[ "$k_rc" -eq 2 ]] && grep -q "conflicts with" <<<"$k_out" \
-  && ok_t "J NEGATIVE: deliver refuses inline+file too — one answer per question" \
-  || bad_t "J NEGATIVE: deliver must refuse inline+file" "rc=$k_rc out=$(head -c 120 <<<"$k_out")"
+# J (the other verb the ticket names, `task deliver --result-file`) left with
+# `task deliver` for the devteam plugin (DIVE-6938); 5dive-plugins runs this whole
+# harness, J included, against this tree.
 
 E=$(mk "prose E")
 "$CLI" task verify "$E" --no-done --cmd=true --result="both given" >/dev/null 2>&1

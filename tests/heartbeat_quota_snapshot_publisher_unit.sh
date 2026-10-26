@@ -131,18 +131,18 @@ fi
 echo "== ONE fence, two spellings, proved to move together =="
 # DIVE-4585's second item. Two names for one predicate agree until an operator
 # moves one, and the disagreement is silent.
-NLINES=$(grep -cE '^_GRADER_READING_MAX_AGE=' "$SRC/task/grader_pool.sh")
+NLINES=$(grep -cE '^_GRADER_READING_MAX_AGE=' "$SRC/lib/pace.sh")
 check "grader_pool.sh defines the fence exactly once" "$NLINES" "1"
 ALIAS=$( ( set +u; QUOTA_SNAPSHOT_MAX_AGE=999
-           eval "$(grep -E '^_GRADER_READING_MAX_AGE=' "$SRC/task/grader_pool.sh")"
+           eval "$(grep -E '^_GRADER_READING_MAX_AGE=' "$SRC/lib/pace.sh")"
            printf '%s' "$_GRADER_READING_MAX_AGE" ) )
 check "moving QUOTA_SNAPSHOT_MAX_AGE moves the pacing floor's fence too" "$ALIAS" "999"
 DEFLT=$( ( set +u; unset QUOTA_SNAPSHOT_MAX_AGE
-           eval "$(grep -E '^_GRADER_READING_MAX_AGE=' "$SRC/task/grader_pool.sh")"
+           eval "$(grep -E '^_GRADER_READING_MAX_AGE=' "$SRC/lib/pace.sh")"
            printf '%s' "$_GRADER_READING_MAX_AGE" ) )
 check "with no quota_wall.sh in the process it still falls back to the fence default" "$DEFLT" "600"
 OVERRIDE=$( ( set +u; QUOTA_SNAPSHOT_MAX_AGE=999; _GRADER_READING_MAX_AGE=42
-              eval "$(grep -E '^_GRADER_READING_MAX_AGE=' "$SRC/task/grader_pool.sh")"
+              eval "$(grep -E '^_GRADER_READING_MAX_AGE=' "$SRC/lib/pace.sh")"
               printf '%s' "$_GRADER_READING_MAX_AGE" ) )
 check "an explicit harness override of the old name still wins" "$OVERRIDE" "42"
 grep -qE 'QUOTA_SNAPSHOT_MAX_AGE="\$\{QUOTA_SNAPSHOT_MAX_AGE:-600\}"' "$SRC/cmd_digest.sh" \

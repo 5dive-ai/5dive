@@ -919,7 +919,8 @@ _compose_spec_pins_auth_profile() {
 # lie the unknown-key arm exists to prevent. (quinn, DIVE-4103 iteration 1.)
 _team_capability_present() {
   case "$1" in
-    github_push) command -v gh >/dev/null 2>&1 && GH_CONFIG_DIR="$(gh_config_dir)" gh auth token >/dev/null 2>&1 || return 1 ;;
+    # DIVE-6938: a push is the devteam plugin's, and so is the gh config it reads.
+    github_push) devteam_loaded && command -v gh >/dev/null 2>&1 && GH_CONFIG_DIR="$(gh_config_dir)" gh auth token >/dev/null 2>&1 || return 1 ;;
     browser)     "$(_compose_self)" browser --help >/dev/null 2>&1 || return 1 ;;
     *)           return 2 ;;
   esac

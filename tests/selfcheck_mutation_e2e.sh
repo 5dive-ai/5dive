@@ -150,7 +150,13 @@ fi
 # verbatim. The harness still prints its failures; CI and `task verify --cmd` both
 # grade on $? and both go blind.
 mut_harness() {
-  local h="$WORK/tests/heartbeat_gate_shipped_unit.sh"
+  # The first harness in the bundle's own sample, read from the bundle under test
+  # like rail 3b below: DIVE-6938 changed it (heartbeat_gate_shipped_unit.sh left
+  # for the devteam plugin), and a hand-copied name would mutate a harness the
+  # probe no longer runs.
+  local first h
+  first=$(grep -m1 -oP '(?<=^SELFCHECK_HARNESS_SAMPLE=")[^",]+' "$WORK/5dive") || return 1
+  h="$WORK/tests/$first"
   [[ -r "$h" ]] || return 1
   printf '\nexit 0\n' >> "$h"
 }
@@ -314,32 +320,11 @@ else
 fi
 
 # ── rail 6: scorecard honesty ────────────────────────────────────────────────
-# THE ONE THAT WAS BLIND (found by main against 93f2ca9, and the reason this section
-# exists). Render every metric as a constant instead of its NO DATA marker: the
-# scorecard then reports 0.42 for dimensions with NO SOURCE AT ALL — autonomous
-# rollback rate has none, DIVE-1923 is open for exactly that — and the published
-# autonomy badge is computed from these rows. The probe reported ok through it,
-# because it shelled out to `command -v 5dive` and graded the healthy INSTALLED
-# binary rather than the mutated bundle it was part of. Invisible in CI, where no
-# 5dive is installed and `$0` won. This case is the regression test for that.
-mut_scorecard() {
-  local ln
-  ln=$(grep -n "NO DATA — {m\['nodata'\]}" "$WORK/src/cmd_proof.sh" | head -1 | cut -d: -f1)
-  [[ -n "$ln" ]] || return 1
-  sed -i "${ln}s|NO DATA — {m\['nodata'\]}|0.42|" "$WORK/src/cmd_proof.sh"
-  rebuild
-}
-assert_mutation scorecard-honesty "every metric renders a constant instead of NO DATA" \
-  mut_scorecard "rendering as results"
-
-# The same defect stated directly, so a future refactor of the resolver reds HERE and
-# not only through the mutation above: the probe must grade the bundle it is part of.
-probe scorecard-honesty
-if grep -q "graded $WORK/5dive" <<<"$OUT"; then
-  ok_t "[scorecard-honesty] grades the bundle under test, not whatever \`5dive\` is on PATH"
-else
-  fail_t "[scorecard-honesty] graded the wrong artifact: $(grep -o 'graded [^]]*' <<<"$OUT")"
-fi
+# DIVE-6938: `proof scorecard` is the devteam plugin's (cmd_proof.sh), so this
+# rail's mutation is made there: 5dive-plugins runs this harness whole against
+# this tree with the plugin's files in place
+# (tests/devteam/selfcheck_mutation_e2e.sh). Without the plugin the probe reports
+# not-reached, which tests/devteam_plugin_unit.sh grades.
 
 # ── rail 7: snapshot rails ───────────────────────────────────────────────────
 # Against a FIXTURE ops repo, never the live one — the real crontab-snapshot commits
@@ -453,7 +438,7 @@ rm -rf "$SC_LC"
 # This is the arm that makes the fix gradeable. Restoring the build and leaving the
 # prover silent — an early exit, a copy that builds but produces no bundle, a rail
 # that stops being invoked — passes `$FAIL -eq 0` and fails here.
-for _r in gate-delivery harness-verdicts bundle-integrity scorecard-honesty lead-clear-seal; do
+for _r in gate-delivery harness-verdicts bundle-integrity lead-clear-seal; do
   case "$RAILS_SEEN" in
     *"[$_r]"*) ;;
     *) fail_t "[corpus] rail '$_r' produced NO arm at all — the prover was SILENT on it, which is indistinguishable from a pass on \$FAIL alone" ;;

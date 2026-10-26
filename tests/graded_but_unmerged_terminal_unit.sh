@@ -142,20 +142,9 @@ G=$(mkrow graded_and_bound)
   && ok_t "task verify --no-done --result= stamps graded_at" || bad_t "graded_at stamped"
 [[ "$(db "SELECT COALESCE(graded_by,'') FROM tasks WHERE id=${G};")" == "$ME" ]] \
   && ok_t "graded_by records the ACTOR who graded ($ME)" || bad_t "graded_by is the actor" "got $(db "SELECT graded_by FROM tasks WHERE id=${G};")"
-D=$(mkrow ref_no_grade)
-# DIVE-4576: a delivery's result must name its evidence or the delivery is
-# refused — the five labels here keep this arm's subject (that a MAKER cannot
-# stamp graded_at by writing grade-shaped prose) reachable.
-( cmd_task_deliver "$D" --pr=https://github.com/5dive-ai/5dive/pull/2 --result="the maker typing a grade-shaped sentence. CHANGED: src/x.sh CHECKED: bash tests/x.sh 3/3 pass DELIVERED-SHA: 1f2e3d4c5b6a79880123456789abcdef01234567 CI: green CRITERIA: (1) -> the run above" ) >/dev/null 2>&1
-# The absence below is only meaningful if the row EXISTS and deliver actually wrote
-# to it — otherwise this arm passes on a missing fixture, which is the same defect
-# the positive control in (b) exists to prevent.
-[[ "$(db "SELECT COALESCE(result,'') LIKE '%grade-shaped%' FROM tasks WHERE id=${D};")" == "1" ]] \
-  && ok_t "PRECONDITION: deliver did write the maker's prose to this row" \
-  || bad_t "PRECONDITION: deliver wrote the row" "the absence arm below would be vacuous"
-[[ -z "$(db "SELECT COALESCE(graded_at,'') FROM tasks WHERE id=${D};")" ]] \
-  && ok_t "the MAKER's task deliver --result= does NOT stamp graded_at (not forgeable in prose)" \
-  || bad_t "deliver must not stamp graded_at" "a maker could buy the exemption by typing"
+# That a MAKER's `task deliver --result=` cannot stamp graded_at is the devteam
+# plugin's arm now (`task deliver` moved with task/delivery.sh, DIVE-6938);
+# 5dive-plugins runs this whole harness, that arm included, against this tree.
 
 echo "── (a) the predicate, and the goal hook it answers ──"
 _task_terminal_for_verifier "$G" && ok_t "A: predicate TRUE for grade + bound delivery_ref" || bad_t "A: predicate true"

@@ -68,11 +68,10 @@ grep -qx 'ls' <<<"$(printf '%s\n' "${LABELS[@]}")" && grep -qx 'list' <<<"$(prin
   || bad_t "precondition: aliases are in the corpus" "ls/list missing from ${#LABELS[@]} labels"
 
 # --- A) EVERY label answers --help, with ITS OWN usage -----------------------
-# Split-tree caveat, stated rather than hidden: src/cmd_task.sh's loader does not
-# source task/grader_pool.sh, so `grader-replay`/`grader-tick` are not defined
-# HERE at all (they are in the bundle, which cats every src/task/*.sh). They are
-# graded through the built bundle in arm G. Arm B pins that exception list so it
-# cannot quietly grow.
+# Split-tree caveat, stated rather than hidden: the devteam plugin's verbs are not
+# defined HERE at all (DIVE-6938: their files left the core). They are graded
+# through the built bundle in arm G. Arm B pins that exception list so it cannot
+# quietly grow.
 ANSWERED=0; ASKED=0; UNDEFINED=(); BAD_RC=(); BAD_LINE=()
 for lab in "${LABELS[@]}"; do
   [[ -n "$lab" ]] || continue
@@ -114,12 +113,16 @@ rc="$(ask loop --help)"
   && ok_t "A4b: ... and 'loop' really is absent from the surface (A4 is not vacuous)" \
   || bad_t "A4b: loop is absent from the surface usage" "it is documented there, so A4 proves nothing"
 
-# --- B) The two labels this tree cannot define, pinned by name --------------
-[[ "${UNDEFINED[*]}" == "grader-replay grader-tick" ]] \
-  && ok_t "B1: exactly the 2 known split-tree gaps are undefined here (${UNDEFINED[*]}) — graded in G" \
-  || bad_t "B1: the split-tree exception list is unchanged" "got: '${UNDEFINED[*]}' (expected 'grader-replay grader-tick')"
+# --- B) The labels this tree cannot define, pinned by name -----------------
+# Since DIVE-6938 these are the delivery, grading and merge verbs: their files are
+# the devteam plugin's, which a split tree never has. Each answers `--help` with
+# the plugin's one line instead (arm G3, against the bundle).
+DEVTEAM_SUBS="deliver grade-context grader-replay grader-tick merge merge-audit merge-declined merge-gate-selftest merge-landed merge-unverified unbind-pr"
+[[ "$(printf '%s\n' "${UNDEFINED[@]}" | sort | tr '\n' ' ' | sed 's/ $//')" == "$DEVTEAM_SUBS" ]] \
+  && ok_t "B1: exactly the 11 devteam-plugin verbs are undefined here — graded in G" \
+  || bad_t "B1: the split-tree exception list is unchanged" "got: '${UNDEFINED[*]}' (expected '$DEVTEAM_SUBS')"
 ! declare -F cmd_task_grader_tick >/dev/null 2>&1 \
-  && ok_t "B2: ... and that gap is src/cmd_task.sh's loader, not this change (the verb is undefined, not unhelped)" \
+  && ok_t "B2: ... and that gap is the plugin, not this change (the verb is undefined, not unhelped)" \
   || bad_t "B2: grader-tick is genuinely undefined in the split tree" "it is defined, so B1 is wrong"
 
 # --- C) The spellings, and where help STOPS being a question ----------------
@@ -159,13 +162,15 @@ done
   || bad_t "D1: aliases resolve to the verb they run" "${D_BAD[*]}"
 
 # --- E) The verbs that ALREADY answered --help still answer ------------------
+# (merge, merge-audit, merge-unverified and merge-gate-selftest were four of these;
+# they are the devteam plugin's since DIVE-6938, and arm B pins that.)
 E_BAD=()
-for v in merge merge-audit merge-unverified merge-gate-selftest queue; do
+for v in queue; do
   rc="$(ask "$v" --help)"
   { [[ "$rc" == "0" ]] && has "$(first)" "usage: 5dive task $v"; } || E_BAD+=("$v(rc=$rc)")
 done
 (( ${#E_BAD[@]} == 0 )) \
-  && ok_t "E1: the 5 verbs that answered --help themselves still answer (now through the one place)" \
+  && ok_t "E1: the verb that answered --help itself still answers (now through the one place)" \
   || bad_t "E1: no regression on the verbs that already answered" "${E_BAD[*]}"
 
 # --- F) MUTANT: take the intercept out and the defect comes back ------------
@@ -204,16 +209,27 @@ BUNDLE="$TMP/5dive"
 if BUILD_OUT="$BUNDLE" ./build.sh >"$TMP/build.log" 2>&1; then
   ok_t "G0: a bundle builds (the artifact the fix actually ships in)"
   G_BAD=()
-  for spec in "ls|usage: 5dive task ls" "list|usage: 5dive task ls" "park|usage: 5dive task park" \
-              "grader-tick|usage: 5dive task grader-tick" "grader-replay|usage: 5dive task grader-replay"; do
+  for spec in "ls|usage: 5dive task ls" "list|usage: 5dive task ls" "park|usage: 5dive task park"; do
     v="${spec%%|*}"; want="${spec#*|}"
     bout="$(HOME="$TMP" "$BUNDLE" task "$v" --help 2>"$TMP/berr")"; brc=$?
     { [[ "$brc" == "0" ]] && has "$bout" "$want"; } \
       || G_BAD+=("$v(rc=$brc: $(printf '%s' "${bout:-$(head -1 "$TMP/berr")}" | head -1))")
   done
   (( ${#G_BAD[@]} == 0 )) \
-    && ok_t "G1: the bundle answers --help for a surface verb, an alias and both lazy-only verbs" \
+    && ok_t "G1: the bundle answers --help for a surface verb and an alias" \
     || bad_t "G1: the bundle answers --help" "${G_BAD[*]}"
+  # G3 (DIVE-6938): on a box without the devteam plugin its verbs answer --help with
+  # the one line, never "no usage text". grader-tick and grader-replay are the two
+  # the surface does not list, so only the plugin's own usage could answer them.
+  G3_BAD=()
+  for v in grader-tick grader-replay deliver; do
+    HOME="$TMP" "$BUNDLE" task "$v" --help >/dev/null 2>"$TMP/berr"; brc=$?
+    { [[ "$brc" == "2" ]] && has "$(cat "$TMP/berr")" "task $v is in the devteam plugin: 5dive plugin install devteam"; } \
+      || G3_BAD+=("$v(rc=$brc: $(head -1 "$TMP/berr"))")
+  done
+  (( ${#G3_BAD[@]} == 0 )) \
+    && ok_t "G3: without the plugin, its verbs answer --help with where they went" \
+    || bad_t "G3: the devteam verbs answer --help with the plugin's line" "${G3_BAD[*]}"
   # G2 proves G1's last two are not passing by accident: in the bundle those two
   # verbs have no surface entry, so only the module-loading fallback can answer.
   ! HOME="$TMP" "$BUNDLE" task --help 2>/dev/null | grep -qE '^  grader-tick[ |]' \

@@ -235,13 +235,13 @@ _gate_route_reviewer() { printf ''; }
 # Sections A-D grade the composer. This grades that `task reject` at the cap
 # actually calls it, with these flags — the seam a later edit is most likely to
 # break silently, because nothing else reads it.
-CALL=$(grep -A3 'cmd_task_need "\$id" --type=decision --from=' "$SRC/task/delivery.sh")
+CALL=$(grep -A3 'cmd_task_need "\$id" --type=decision --from=' "$SRC/task/status.sh")
 has_t "E1: the iteration-cap escalation files a DECISION" "$CALL" '--type=decision'
 has_t "E2: ... with the two options this harness graded" "$CALL" '--options="$_ESCALATION_OPTIONS"'
 has_t "E3: ... and the recommendation" "$CALL" '--recommend="$_ESCALATION_RECOMMEND"'
 has_t "E4: ... and the ask comes from the composer, not a literal" "$CALL" '_task_escalation_ask "$id"'
 no_t  "E5: no --type=manual survives on the escalation path" \
-      "$(grep -c 'cmd_task_need "\$id" --type=manual' "$SRC/task/delivery.sh")" "1"
+      "$(grep -c 'cmd_task_need "\$id" --type=manual' "$SRC/task/status.sh")" "1"
 
 # ============ F. THE INPUT THE PRODUCT ACTUALLY GIVES THE COMPOSER ===========
 # Sections A-C feed the composer a BARE rejection string. The call site does not.

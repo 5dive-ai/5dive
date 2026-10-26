@@ -362,7 +362,7 @@ grep -qE '^[[:space:]]+src/lib/routing_receipt\.sh$' build.sh \
   && ok_t "build.sh manifest ships src/lib/routing_receipt.sh" \
   || bad_t "routing_receipt.sh is not in the build manifest — the shipped CLI would not have it"
 
-for pair in "src/task/delivery.sh:reject" "src/task/crud.sh:assign" "src/task/dispatch.sh:set-body"; do
+for pair in "src/task/status.sh:reject" "src/task/crud.sh:assign" "src/task/dispatch.sh:set-body"; do
   f="${pair%%:*}"; v="${pair##*:}"
   grep -q 'routing_receipt "' "$f" \
     && ok_t "the $v verb's file calls routing_receipt" \

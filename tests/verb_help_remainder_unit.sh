@@ -64,18 +64,8 @@ err() { cat "$TMP/err"; }
   || bad_t "P1: sandbox has no task store" "found $TMP/state/tasks/tasks.db"
 
 # --- H) the three verbs answer --help ------------------------------------------
-rc=$(run "$BUNDLE" push --help)
-[[ "$rc" == 0 ]] && has "$(head -1 "$TMP/out")" "usage: 5dive push <id|DIVE-N>" \
-  && ok_t "H1: 5dive push --help -> rc 0, its usage on stdout, with no task store" \
-  || bad_t "H1: push --help" "rc=$rc out=$(out) err=$(err)"
-rc=$(run "$BUNDLE" push DIVE-1 -h)
-[[ "$rc" == 0 ]] && has "$(out)" "usage: 5dive push" \
-  && ok_t "H1b: ...and -h after a task id asks the same question" \
-  || bad_t "H1b: push DIVE-1 -h" "rc=$rc out=$(out) err=$(err)"
-rc=$(run "$BUNDLE" push --pr-title=--help)
-[[ "$rc" != 0 ]] && ! has "$(out)" "usage: 5dive push" \
-  && ok_t "H1c: CONTROL: '--help' as a flag VALUE is not a question (rc $rc, no usage)" \
-  || bad_t "H1c: --pr-title=--help must not answer help" "rc=$rc out=$(out)"
+# H1-H1c (push --help) and their mutant M left with `push` for the devteam
+# plugin (DIVE-6938); 5dive-plugins runs this whole harness against this tree.
 
 rc=$(run "$BUNDLE" plugin add --help)
 [[ "$rc" == 0 ]] && has "$(out)" "5dive plugin add <plugin>" \
@@ -150,20 +140,6 @@ rc=$(setbody DIVE-7 --body-file="$TMP/body.txt" some inline words)
 [[ "$rc" == "$E_USAGE" ]] && has "$(err)" "--body-file conflicts with the positional text" \
   && ok_t "S4: --body-file= plus inline text is refused (rc $rc), naming the flag used" \
   || bad_t "S4: --body-file plus inline text refused" "rc=$rc err=$(err)"
-
-# --- M) MUTANT: the bundle without push's help intercept -------------------------
-# Re-introduce the defect in a copy of the built bundle; H1 must go red on it.
-MUT="$TMP/5dive.mut"
-awk '/# Asking what the verb does needs no task store and no broker: answer first\./{skip=1}
-     skip && /^  fi$/ {skip=0; next}
-     !skip' "$BUNDLE" > "$MUT"; chmod +x "$MUT"
-! grep -q 'Asking what the verb does needs no task store' "$MUT" && bash -n "$MUT" \
-  && ok_t "M0: (anchor) the mutation removed push's help intercept and the bundle still parses" \
-  || bad_t "M0: mutation anchor" "the intercept comment no longer matches, or the cut broke the bundle"
-rc=$(run "$MUT" push --help)
-[[ "$rc" != 0 ]] \
-  && ok_t "M1: MUTANT: without the intercept push --help fails again (rc $rc) — H1 goes red" \
-  || bad_t "M1: mutant must fail push --help" "rc=$rc out=$(out)"
 
 echo "-----"
 printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"

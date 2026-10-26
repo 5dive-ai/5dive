@@ -371,6 +371,9 @@ _task_delivery_file_lines() {  # <task-id>
 # PR is this row" the first time one of them learned about a new binding shape.
 _task_delivery_pr_url() {
   local _id="$1" _dref _body _branch="" _slug _tok _n
+  # DIVE-6938: the delivery is read through the devteam plugin's gh rail. Without
+  # it the answer is UNKNOWN, which every caller already treats as "change nothing".
+  devteam_loaded || return 0
   _dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${_id};")
   _body=$(db "SELECT COALESCE(body,'')         FROM tasks WHERE id=${_id};")
   [[ -n "$_dref" ]] || _branch=$(_push_branch_from_body "$_body")

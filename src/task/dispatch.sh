@@ -422,11 +422,21 @@ _task_help_intercept() {
   _verb_help_intercept "5dive task" _task_usage cmd_task "" "$verb" "$@"
 }
 
+# DIVE-6938: the delivery, grading and merge verbs live in the devteam plugin.
+# Without it each answers with the one line, `--help` included, instead of
+# `command not found` (or a "no usage text" for the two the surface never lists).
+_TASK_DEVTEAM_SUBVERBS="deliver merge merge-landed merge-declined unbind-pr merge-audit merge-unverified merge-gate-selftest grade-context grader-tick grader-replay"
+_task_devteam() {
+  [[ " $_TASK_DEVTEAM_SUBVERBS " == *" $1 "* ]] || return 0
+  devteam_loaded || devteam_refuse "task $1"
+}
+
 cmd_task() {
   [[ $# -gt 0 ]] || { _task_usage; mark_reported; exit "$E_USAGE"; }
   local sub="$1"; shift
   # `--help` after a subverb is a question about THAT verb, not an unknown
   # flag. Answered before the dispatch; see the block above.
+  _task_devteam "$sub"
   if _task_help_intercept "$sub" "$@"; then return 0; fi
   case "$sub" in
     init)            cmd_task_init "$@" ;;

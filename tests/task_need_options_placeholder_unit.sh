@@ -73,7 +73,7 @@ fi
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh lib/runs.sh lib/broker.sh cmd_push.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
+         lib/tasks_db.sh lib/actor.sh lib/runs.sh lib/broker.sh  cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
 . "$(dirname "${BASH_SOURCE[0]}")/lib/gate_seam.sh" \

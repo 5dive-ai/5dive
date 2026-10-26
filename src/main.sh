@@ -460,30 +460,18 @@ Trace (causal timeline for one task, goal → ship —):
 Memory (queryable team memory — read-path,):
   5dive memory search "<query>" [--limit=N] [--max-tokens=T]  # BM25-ranked snippets from the agent's memory stores + wiki, with provenance
 
-Zero-human proof (publish your own badge —):
-  5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]  # push badge/datapoint/history, computed verbatim from digest
-  5dive proof on --repo=<url> [--branch=status] [--at=<0-23>]    # save config + install daily root cron
-  5dive proof off | status [--json]                             # remove cron (config kept) | report + staleness
+Box disk:
   5dive disk sweep [--dry-run] | alarm | tick                   # SAFE box-disk sweep (rebuildable caches only) + low-disk alarm
-  # methodology + self-publish guide: docs/zero-human.md
 
-Delegated push (bring your own GitHub App —):
-  5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author enforced
-  5dive push <id|DIVE-N> --open-pr[=<base>]          # ...and open its pull request on the same root-side rail, as 5dive-bot (DIVE-2605)
-  5dive deploy <id|DIVE-N> [--target=<project@ref>] [--env=production|preview] [--dry-run]
-                                                     # deploy ONLY the project@ref the task declares, ONLY after its gate clears
-  5dive push setup                                   # scaffold + check the GitHub App credential (bring-your-own; root)
-  # Branch comes from --branch or a 'Branch: <name>' line in the task body. The credential is YOUR GitHub App
-  # (contents:write, installed on your ship repos), held root-side in /etc/5dive/connectors — never a human token.
-  # Full setup walkthrough: docs/delegated-push.md
-
-Actor-routed gh:
-  5dive gh <gh args...>                    # writes go out as the machine account; admin + reads stay on your credential
-  5dive gh --as=bot|caller <gh args...>    # force one identity | --explain prints the decision and runs nothing
-  5dive gh --as=reviewer pr review <n> ... # sign the installer CODEOWNERS attestation as 5dive-reviewer (DIVE-4334)
-  5dive gh whoami                          # resolve BOTH identities, so "who did that write go out as" is measurable
-  # An agent gh write authenticates as the HUMAN account, so the audit trail cannot tell agent from human
-  #. The PAT stays root-side in /etc/5dive/connectors/github-bot.env — the agent never holds it.
+Dev-team tools (the devteam plugin — sudo 5dive plugin install devteam; DIVE-6938):
+  5dive proof publish|on|off|status|scorecard        # zero-human proof badge, computed from digest (docs/zero-human.md)
+  5dive push <id|DIVE-N> [--open-pr[=<base>]]        # push ONLY the task's branch, ONLY after its gate clears (docs/delegated-push.md)
+  5dive push setup                                   # scaffold + check the GitHub App credential (root)
+  5dive deploy <id|DIVE-N> [--target=<project@ref>]  # deploy ONLY what the task declares, ONLY after its gate clears
+  5dive gh <gh args...>                              # actor-routed gh: writes go out as the machine account
+  5dive gh whoami                                    # resolve both identities a gh write could go out as
+  5dive task deliver|merge|merge-landed ...          # PR delivery, grading and the merge gate (5dive task --help)
+  # Without the plugin each of these answers: <verb> is in the devteam plugin: 5dive plugin install devteam
 
 Identity:
   5dive whoami [--json]                    # the CURRENT process: actor, authority, tier + the SOURCE of each; exit 6 if unmeasurable
@@ -1243,64 +1231,6 @@ main() {
         >> "$AUDIT_LOG" 2>/dev/null || true
       exit 0
       ;;
-    gh)
-      # DIVE-2448 (last mile of DIVE-2232): actor-routed `gh`. A WRITE goes out as
-      # the machine account so the actor field means something; admin-class and
-      # read operations stay on the caller's own credential (the bot is
-      # admin=false everywhere, and a read has no actor field to attribute). The
-      # decision is printed on every call. Credential-bearing → audited; the
-      # token is read root-side in _gh_do and never lands in argv.
-      # DIVE-2792: `exit $?`, like every sibling passthrough arm above. Today the
-      # status still reaches the caller without it — this case is main()'s last
-      # statement and `main "$@"` is the script's — so the fix is not a live
-      # bug-fix but the removal of a load-bearing coincidence: the moment anyone
-      # appends a statement after `esac`, gh's exit status (4 = not logged in,
-      # 8 = checks pending, 1 = failing checks) is silently replaced by that
-      # statement's. A wrapper whose exit-code fidelity depends on where it sits
-      # in the file is one refactor away from lying again.
-      AUDIT_CMD="gh"; AUDIT_ARGS=("$@")
-      cmd_gh "$@"; exit $? ;;
-    _merge_do)
-      # DIVE-3474 arm 1: hidden, privileged. Reachable ONLY via NOPASSWD sudo (the
-      # UNCONDITIONAL render_standard_sudoers line — it confers no authority of its
-      # own, exactly like _task_answer). Reads ONE task ident on STDIN and nothing
-      # else, re-derives the caller from SUDO_UID and its merge standing from the
-      # ROW as root (graded_by = this seat, over the shared graded-awaiting-merge
-      # predicate), and merges the pull request the ROW names — never one the
-      # caller does. Not audited here; the parent `task merge` verb is, and the
-      # primitive writes its own store-audit row naming the grader.
-      cmd_task_merge_do
-      exit $? ;;
-    _gh_do)
-      # DIVE-2448: hidden, privileged. Reachable ONLY via NOPASSWD sudo. Reads the
-      # gh argv NUL-separated on STDIN (never argv, so the grant stays exact-path
-      # / sudo-rs safe), re-derives the routing class authoritatively, reads the
-      # machine account's PAT from the root-only connector and execs gh with it as
-      # an environment prefix. The agent process never holds the token. Not
-      # audited itself (the parent `gh` verb is) and never advertised.
-      cmd_gh_do "$@"
-      exit $? ;;
-    _deploy_do)
-      # INST-5: hidden, privileged, ATOMIC delegated deploy — the capability
-      # broker's SECOND surface, same template as _push_do. Reachable ONLY via
-      # NOPASSWD sudo. Reads <ident> <project> <ref> <env> on STDIN (never argv,
-      # so the grant stays exact-path / sudo-rs safe), re-verifies the cleared
-      # gate under signature, re-binds the target to the task's own Deploy line,
-      # reads VERCEL_TOKEN root-only and fires ONE deployment of the repo the
-      # project is ALREADY linked to. The agent process never holds the token.
-      # Not audited itself (the parent `deploy` verb is) and never advertised.
-      cmd_deploy_do "$@"
-      exit $? ;;
-    _push_do)
-      # DIVE-1376/1460: hidden, privileged, ATOMIC delegated push. Reachable ONLY
-      # via NOPASSWD sudo. Reads <ident> <repo-path> <branch> <repo-url> on STDIN
-      # (never argv, so the grant stays exact-path / sudo-rs safe), re-verifies the
-      # human gate + author scan authoritatively, mints a repo-SCOPED installation
-      # token, pushes the one branch, and discards the token — all as root. The
-      # agent process never holds a token. Not audited itself (the parent `push`
-      # verb is) and never advertised.
-      cmd_push_do "$@"
-      exit $? ;;
     plugin|plugins)
       # DIVE-4020: the plugin lifecycle verb. Until this existed there was no
       # `5dive plugin` at all — plugins installed only as side effects of
@@ -1608,37 +1538,6 @@ main() {
       # driver. No registry mutation/lock; no audit line — it logs what it freed
       # to its own log, same posture as digest.
       cmd_disk "$@" ;;
-    push)
-      # DIVE-1376/1460 (Bobby gripe #1): delegated push. Pushes ONLY the task's
-      # branch, ONLY after the task gate clears, with a fail-closed author scan
-      # (config-only committer). The privileged gate+author+mint+push runs atomically in the root-only
-      # _push_do helper (repo-scoped token, agent never holds a credential).
-      # Mutating + credential-bearing → audited (no token ever lands in argv).
-      # `push setup` (DIVE-1461) is the BYO-GitHub-App onboarding sub-verb —
-      # intercepted before cmd_push so "setup" isn't parsed as a task id.
-      if [[ "${1:-}" == "setup" ]]; then
-        shift
-        AUDIT_CMD="push setup"; AUDIT_ARGS=("$@")
-        cmd_push_setup "$@"
-      else
-        AUDIT_CMD="push"; AUDIT_ARGS=("$@")
-        cmd_push "$@"
-      fi ;;
-    deploy)
-      # INST-5: delegated PRODUCTION deploy — the capability broker generalized
-      # off delegated push. Deploys ONLY the project@ref the task declares, ONLY
-      # after that task's gate clears, and only into the repo the Vercel project
-      # is already linked to. The privileged gate+bind+credential+deploy runs
-      # atomically in the root-only _deploy_do helper; the agent never holds the
-      # token. Mutating + credential-bearing -> audited.
-      AUDIT_CMD="deploy"; AUDIT_ARGS=("$@")
-      cmd_deploy "$@" ;;
-    proof)
-      # OSS-17: publish this box's zero-human proof (badge.json/zero-human.json/
-      # history.jsonl) to a git status branch, computed verbatim from `digest`.
-      # publish/status are read-mostly; on/off manage a root cron + pref, tick is
-      # the root cron driver. No registry mutation/lock, no audit (like digest).
-      cmd_proof "$@" ;;
     run|runs)
       # DIVE-3932: execution attempts beneath tasks. Read-mostly over the same
       # group-writable store as tasks (`run retry` only ever APPENDS an attempt);
@@ -1789,6 +1688,16 @@ main() {
       # errexit — deliberate, because every refusal inside it goes through
       # fail(), which exits on its own, and every other non-zero (no jq, no
       # store, unreadable json) is meant to fall through to "unknown command".
+      # DIVE-6938: the dev-team verbs first, and never past this line. Four of
+      # them are reached through exact NOPASSWD root grants, so they may run only
+      # from the pinned devteam plugin (src/lib/devteam.sh), never from whichever
+      # plugin claims the name; without it, one line says where they went.
+      # Called bare, not under `||`: that would switch errexit off inside every
+      # one of these verbs.
+      if _devteam_is_verb "$top"; then
+        _devteam_verb "$top" "$@"
+        exit $?
+      fi
       if ! _plugin_dispatch_verb "$top" "$@"; then
         _moved_verb_notice "$top"
         fail "$E_USAGE" "unknown command: $top"

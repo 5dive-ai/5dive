@@ -379,6 +379,25 @@ broker_strip_md_quotes() {
   printf '%s' "$v"
 }
 
+# _push_branch_from_body <body> — pull a "Branch: <name>" line out of a task
+# body (case-insensitive, first match). Empty if absent.
+#
+# DIVE-3081: strips a markdown/quote wrapper via broker_strip_md_quotes, and MUST
+# keep doing so in lockstep with broker_task_target's use of the same helper — the
+# DIVE-1462 refusal compares this function's value against the broker's, so a
+# strip applied to only one side still refuses, just with a different pair of
+# look-alike names. Same reason the helper is shared rather than inlined.
+# DIVE-6938: it stayed in the core when cmd_push.sh moved to the devteam plugin.
+# task/need.sh routes a gate on a `Branch:`-bound row by it, and `task set-branch`
+# writes the line it reads; only the push that consumes the binding is the plugin's.
+_push_branch_from_body() {
+  local raw
+  # `|| true` so a no-match grep can't trip `set -euo pipefail` when this runs
+  # inside a command substitution (branch=$(...)).
+  raw=$(printf '%s\n' "$1" | grep -ioP '^\s*branch:\s*\K\S+' | head -1 || true)
+  broker_strip_md_quotes "$raw"
+}
+
 # broker_task_target <surface> <id> — the target a task AUTHORITATIVELY declares
 # via a "<Key>: <value>" line in its body. Empty if the task names none. This is
 # the server-side value a cleared gate binds to, read fresh from the DB.

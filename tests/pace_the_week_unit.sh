@@ -69,7 +69,7 @@ export FIVE_PACE_7D_SOFT=60 FIVE_PACE_7D_HARD=90 FIVE_PACE_BLIND=soft
 
 # ── A/B/C: the floor itself ────────────────────────────────────────────────
 # shellcheck source=/dev/null
-source src/task/grader_pool.sh
+source src/lib/pace.sh
 NOW=1789294364                       # a fixed clock; every reset below is relative to it
 FAR=$(( NOW + 6*86400 ))             # 6 days out — the soft floor binds
 NEAR=$(( NOW + 2*86400 ))            # 2 days out — inside the reset window
@@ -127,7 +127,7 @@ got=$(band 70 "$(( NOW - 86400 ))")
   || bad_ "B: lapsed reset" "expected 2, got ${got}"
 
 # B — the knobs are knobs.
-( FIVE_PACE_7D_SOFT=40; source src/task/grader_pool.sh
+( FIVE_PACE_7D_SOFT=40; source src/lib/pace.sh
   rc=0; printf '%s' "$(printf '{"agents":[{"account":"acct","sevenDayPct":45,"sevenDayResetsAt":%s}]}' "$FAR")" \
     | _pace_band acct "$NOW" >/dev/null || rc=$?
   [[ "$rc" == "2" ]] && exit 0 || exit 1 ) \
@@ -492,7 +492,7 @@ else
   SEATDOC=$(printf '{"agents":[{"name":"s1","account":"m","sevenDayPct":70,"sevenDayResetsAt":%s}]}' "$RFAR")
   ACCTF="$TMPD/acct-built.json"
   ( set -uo pipefail
-    source src/task/grader_pool.sh
+    source src/lib/pace.sh
     # LIVE, per registry-bound seat — fresh, and it says the account has room.
     # `q` is the quiet account the snapshot has never heard of: it exists only
     # as a profile on disk, which is exactly the account this row is about.
@@ -534,7 +534,7 @@ else
   # 3. THE AGREEMENT. Same fixture, both predicates.
   frc=0
   ( set -uo pipefail
-    source src/task/grader_pool.sh
+    source src/lib/pace.sh
     account_best_ratelimits() {
       case "$1" in m) printf '{"asOf":%s,"fiveHourPct":5,"fiveResetsAt":%s,"sevenDayPct":20,"sevenResetsAt":%s}' "$(( NOWR - 60 ))" "$(( NOWR + 3600 ))" "$RFAR" ;; *) printf '' ;; esac
     }
@@ -543,7 +543,7 @@ else
     }
     printf '%s' "$SEATDOC" | _pace_band m "$NOWR" >/dev/null
   ) || frc=$?
-  fband=$(source src/task/grader_pool.sh; _pace_band_name "$frc")
+  fband=$(source src/lib/pace.sh; _pace_band_name "$frc")
   DPROBE2="$TMPD/dpace2.py"
   cat > "$DPROBE2" <<'PY2EOF'
 import os, time, sys, json, datetime as dt
@@ -571,7 +571,7 @@ PY2EOF
   #     snapshot row was 431s old, and the floor read the ACTIVITY document.
   SHADOW="$TMPD/acct-shadow.json"
   ( set -uo pipefail
-    source src/task/grader_pool.sh
+    source src/lib/pace.sh
     account_best_ratelimits() {   # exists, and is OLDER than the fence
       printf '{"asOf":%s,"fiveHourPct":9,"fiveResetsAt":%s,"sevenDayPct":95,"sevenResetsAt":%s}' \
              "$(( NOWR - 7200 ))" "$(( NOWR + 3600 ))" "$RFAR"
@@ -588,12 +588,12 @@ PY2EOF
   shres=$(ACCTF="$SHADOW" SEATDOC="$SEATDOC" timeout 120 python3 "$DPROBE2" 2>&1 | tail -1)
   shrc=0
   ( set -uo pipefail
-    source src/task/grader_pool.sh
+    source src/lib/pace.sh
     account_best_ratelimits() { printf '{"asOf":%s,"fiveHourPct":9,"fiveResetsAt":%s,"sevenDayPct":95,"sevenResetsAt":%s}' "$(( NOWR - 7200 ))" "$(( NOWR + 3600 ))" "$RFAR"; }
     quota_snapshot_read() { printf '{"accounts":[{"name":"m","usage":{"asOf":%s,"sevenDay":{"pct":20,"resetsAt":%s}}}]}' "$(( NOWR - 120 ))" "$RFAR"; }
     printf '%s' "$SEATDOC" | _pace_band m "$NOWR" >/dev/null
   ) || shrc=$?
-  shband=$(source src/task/grader_pool.sh; _pace_band_name "$shrc")
+  shband=$(source src/lib/pace.sh; _pace_band_name "$shrc")
   [[ "$shres" == "open account" && "$shband" == "open" ]] \
     && ok_ "H2: a STALE live cache does not shadow a FRESH snapshot — both readers take the fresher carrier and land on open [account reading]" \
     || bad_ "H2: shadowing" "digest='${shres}', floor='${shband}' — expected 'open account'/'open'; a two-hour-old cache is hiding a two-minute-old snapshot and the account reads blind"
@@ -604,7 +604,7 @@ PY2EOF
   #     discriminating and the ok above means nothing.
   SNAPONLY="$TMPD/acct-snaponly.json"
   ( set -uo pipefail
-    source src/task/grader_pool.sh
+    source src/lib/pace.sh
     quota_snapshot_read() {
       printf '{"writtenAt":%s,"accounts":[{"name":"m","usage":{"asOf":%s,"fiveHour":null,"sevenDay":{"pct":95,"resetsAt":%s}}}]}' \
              "$(( NOWR - 4000 ))" "$(( NOWR - 4000 ))" "$RFAR"
@@ -632,7 +632,7 @@ fi
 # read never overwrites a good cache with nothing.
 CF="$TMPD/pace-cache.json"
 ( FIVE_PACE_CACHE_FILE="$CF" FIVE_PACE_CACHE_SEC=300
-  source src/task/grader_pool.sh
+  source src/lib/pace.sh
   live_a(){ printf '{"agents":[{"account":"acct","sevenDayPct":11}]}'; }
   live_b(){ printf '{"agents":[{"account":"acct","sevenDayPct":22}]}'; }
   live_dead(){ printf ''; return 1; }
@@ -683,7 +683,7 @@ jarm(){ # <snapshot-json> <usage-doc-or-empty> -> "<rc> <verdict>"
   # arm N+1 would be served arm N's snapshot and this whole section would grade
   # the cache instead of the floor. The cache's own behaviour is section N.
   rm -rf "$PACE_RCD" 2>/dev/null
-  ( source src/task/grader_pool.sh
+  ( source src/lib/pace.sh
     quota_snapshot_read(){ printf '%s' "$1"; }
     # shellcheck disable=SC2317
     quota_snapshot_read(){ printf '%s' "$SNAP"; }
@@ -797,7 +797,7 @@ kcase "K: no snapshot at all is still blind, not a bound" \
 # returned. Under FIVE_PACE_BLIND=refuse the blind answer is already the
 # tightest there is, so the bound must not be consulted — it could only loosen.
 kbarm(){ # <blind-policy> <snapshot> -> "<rc> <verdict>"
-  ( source src/task/grader_pool.sh
+  ( source src/lib/pace.sh
     # shellcheck disable=SC2317
     quota_snapshot_read(){ printf '%s' "$SNAP"; }
     SNAP="$2"; _PACE_BLIND="$1"
@@ -903,7 +903,7 @@ lcase "L6: both open             -> open" 0 20 "$FAR" 10 "$F5"
   || bad_ "L7: refuse still wins" "expected 1"
 
 # L8 — the knob is a knob.
-( FIVE_PACE_5H=50; source src/task/grader_pool.sh
+( FIVE_PACE_5H=50; source src/lib/pace.sh
   rc=0; printf '%s' "$(printf '{"agents":[{"account":"acct","sevenDayPct":20,"sevenDayResetsAt":%s,"fiveHourPct":60,"fiveHourResetsAt":%s}]}' "$FAR" "$F5")" \
     | _pace_band acct "$NOW" >/dev/null || rc=$?
   [[ "$rc" == "3" ]] && exit 0 || exit 1 ) \
@@ -987,12 +987,12 @@ fi
 # Every L arm above is paired here with a mutation that reverts the fix, so a
 # green L section cannot be green vacuously.
 MUT="$TMPD/mut.sh"
-grep -q '_pace_band_5h' src/task/grader_pool.sh && grep -q '_PACE_FLOOR_5H' src/task/grader_pool.sh \
+grep -q '_pace_band_5h' src/lib/pace.sh && grep -q '_PACE_FLOOR_5H' src/lib/pace.sh \
   && ok_ "M0: the session floor is IN the shipped source (the mutants below are not vacuous)" \
   || bad_ "M0: the session floor is in the shipped source" "not found"
 mutant(){ # <sed-expr> ; writes $MUT, returns 1 if the sed did not change anything
-  sed "$1" src/task/grader_pool.sh > "$MUT"
-  ! cmp -s "$MUT" src/task/grader_pool.sh
+  sed "$1" src/lib/pace.sh > "$MUT"
+  ! cmp -s "$MUT" src/lib/pace.sh
 }
 mband(){ # <7d> <7dr> <5h> <5hr> -> rc, against the MUTANT
   ( source "$MUT"
@@ -1055,7 +1055,7 @@ else bad_ "M5: the mutation took" "the sed matched nothing — this mutant is va
 # The mutants ran in subshells against $MUT; this process still holds the real
 # source. Re-source it so nothing below grades a mutant.
 # shellcheck source=/dev/null
-source src/task/grader_pool.sh
+source src/lib/pace.sh
 [[ "$(band5 20 "$FAR" 101 "$F5")" == "3" ]] \
   && ok_ "M6: RESTORE — the shipping source is back in this process (later arms grade the product)" \
   || bad_ "M6: RESTORE" "the process is still holding a mutant"
@@ -1093,7 +1093,7 @@ cat > "$MREG" <<'JSON'
   "selfie":  {"type": "codex"}
 }}
 JSON
-mtypes(){ ( REGISTRY="$MREG"; source src/task/grader_pool.sh; _pace_seat_types "$1" | sort | tr '\n' ' ' ); }
+mtypes(){ ( REGISTRY="$MREG"; source src/lib/pace.sh; _pace_seat_types "$1" | sort | tr '\n' ' ' ); }
 [[ "$(mtypes codex)" == "codex codex " ]] \
   && ok_ "M1: _pace_seat_types reads the registry binding" \
   || bad_ "M1: _pace_seat_types" "got '$(mtypes codex)'"
@@ -1105,7 +1105,7 @@ mtypes(){ ( REGISTRY="$MREG"; source src/task/grader_pool.sh; _pace_seat_types "
   || bad_ "M1: untyped seat" "got '$(mtypes partial)'"
 
 # M2 — the classifier's three answers. 1 is the only one that is evidence.
-mcap(){ ( REGISTRY="${2-$MREG}"; source src/task/grader_pool.sh
+mcap(){ ( REGISTRY="${2-$MREG}"; source src/lib/pace.sh
           local rc=0; _pace_window_capable "$1" || rc=$?; printf '%s' "$rc" ); }
 for probe in "codex 1" "mark 0" "mixed 0" "partial 2" "@self:selfie 1" "nosuchaccount 2"; do
   read -r acct want <<<"$probe"
@@ -1121,7 +1121,7 @@ got=$(mcap codex "$TMPD/no-such-registry.json")
 # the caller can set FIVE_PACE_* before the file is sourced.
 marm(){ # <types|""> <usage-json|""> <snapshot-json|""> -> "<rc> <verdict>"
   rm -rf "$PACE_RCD" 2>/dev/null   # DIVE-4731: one reading per arm (see jarm)
-  ( source src/task/grader_pool.sh
+  ( source src/lib/pace.sh
     MTYPES="$1"; MSNAP="$3"
     # shellcheck disable=SC2317
     _m_types(){ local t; for t in $MTYPES; do printf '%s\n' "$t"; done; }
@@ -1207,7 +1207,7 @@ done
 # flicker must not make the floor looser, fresher, or inventive.
 narm(){ # <body...> -> runs in a cold-cache subshell with the real functions
   rm -rf "$PACE_RCD" 2>/dev/null
-  ( source src/task/grader_pool.sh
+  ( source src/lib/pace.sh
     # A CARRIER MUST EXIST for the cache to be consulted at all (N9 grades that
     # gate). These arms are about what the cache does once there IS one, so the
     # cheapest possible carrier is declared here; every arm that cares about the
@@ -1347,11 +1347,11 @@ done
 # is also what keeps every arm above section N — which runs against the top-level
 # source with no carrier at all — grading the floor instead of this cache.
 got=$( rm -rf "$PACE_RCD" 2>/dev/null
-  ( source src/task/grader_pool.sh
+  ( source src/lib/pace.sh
     quota_snapshot_read(){ printf ''; }
     _grader_account_reading_json(){ printf '{"asOf":1,"sevenDayPct":20}'; }
     _pace_account_reading_cached acct >/dev/null )
-  ( source src/task/grader_pool.sh          # same cache dir, NO carrier declared
+  ( source src/lib/pace.sh          # same cache dir, NO carrier declared
     declare -F _pace_account_reading_cached >/dev/null 2>&1 \
       || { printf 'NO-SUCH-FUNCTION'; exit 0; }
     _grader_account_reading_json(){ printf '{"asOf":1,"sevenDayPct":99}'; }

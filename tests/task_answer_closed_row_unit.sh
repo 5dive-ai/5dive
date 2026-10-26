@@ -58,7 +58,7 @@ TMP="$(mktemp -d /tmp/task-answer-closed-unit.XXXXXX)"
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
          lib/registry.sh lib/disk.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh \
-         cmd_push.sh cmd_org.sh cmd_project.sh; do
+          cmd_org.sh cmd_project.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

@@ -43,6 +43,20 @@ readonly FIVE_VERSION="0.0.0-dev"
 # ancestry install.sh can verify (DIVE-2603).
 readonly FIVE_BUILD_SHA="unbuilt"
 
+# DIVE-6938: the dev-team tools (src/lib/devteam.sh) are the devteam plugin's.
+# rc 0 iff they are callable in this run: the plugin's stubs are defined, or a
+# harness sourced or stubbed its files. Here, not in devteam.sh, because every
+# split-tree harness sources this file and the core asks this at ~20 call sites.
+devteam_loaded() {
+  declare -F cmd_task_deliver >/dev/null 2>&1 \
+    || declare -F _gate_task_repo_slug >/dev/null 2>&1
+}
+
+# The one line every moved verb prints on a box without the plugin.
+devteam_refuse() {  # <verb as the caller typed it>
+  fail "$E_USAGE" "$1 is in the devteam plugin: 5dive plugin install devteam"
+}
+
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
 # rename, so probe the new org once per process and fall back to the old

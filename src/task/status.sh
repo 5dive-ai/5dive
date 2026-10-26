@@ -652,7 +652,19 @@ _task_status_cmd() {
   # routing below on purpose: a maker's `task done` that delivers rather than
   # closes carries exactly the same claim, and the moment to check it is the
   # moment it is written, not the moment someone later re-reads it.
-  [[ "$verb" == "done" ]] && _gate_version_vs_installed "$ident" done "$result"
+  [[ "$verb" == "done" ]] && devteam_loaded && _gate_version_vs_installed "$ident" done "$result"
+  # DIVE-6938: grading, PR delivery and the merge gate below are the devteam
+  # plugin's. On a box without it a row with no bound pull request closes as an
+  # ordinary close (no verifier round, no merge gate), and a row WITH one refuses:
+  # closing it means answering whether that PR merged, which nothing here can.
+  if [[ "$verb" == "done" ]] && ! devteam_loaded; then
+    local _nd_st _nd_dref
+    _nd_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+    _nd_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_nd_dref" && "$_nd_st" != "done" && "$_nd_st" != "cancelled" ]]; then
+      devteam_refuse "closing $ident, which has a bound pull request ($_nd_dref),"
+    fi
+  fi
   # DIVE-477: maker→verifier routing. A `task done` on a task that carries a
   # `verifier` distinct from its current assignee is NOT a close — it's a handoff.
   # The maker is claiming the work is ready; the verifier must grade it before the
@@ -1017,7 +1029,7 @@ _task_status_cmd() {
   #   2. a `Branch: <name>` line in the task body — the EXISTING delegated-push
   #      binding (DIVE-1462; resolved the same way cmd_push does). delivery_ref
   #      wins when both are present.
-  if [[ "$verb" == "done" ]]; then
+  if [[ "$verb" == "done" ]] && devteam_loaded; then
     local _dref _branch="" _body _task_slug
     _dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
     _body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
@@ -1912,7 +1924,7 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
   # branch-hygiene digest (#139, DIVE-1833) catches any unmerged PR/branch left
   # behind. `--force-merge-gate` is the audited manual escape (a mandatory gate
   # with no escape is a footgun) — logged, and its leftover PR is digest-flagged.
-  if [[ "$verb" == "done" && -z "$_dref" && -z "$_branch" ]]; then
+  if [[ "$verb" == "done" ]] && devteam_loaded && [[ -z "$_dref" && -z "$_branch" ]]; then
     local _auto_hit="" _scan_ran=0
     # DIVE-1955: declared out here, not inside the token branch — they are read by
     # the refusal messages below, and `set -u` turns an unset one into a crash on
@@ -2538,6 +2550,837 @@ $_body"
      --arg h "$handoff_ack" --arg ha "$handoff_ack_at"
 }
 
+# DIVE-6938: this stayed in the core when delivery.sh moved to the devteam plugin.
+# It is the plain maker->verifier hand-off every verifier row takes on `task done`
+# (verify_policy is core), so a box without the plugin still grades writer !=
+# grader. Only its two pull-request checks are the plugin's, and they run when it
+# is loaded; without it a row with a bound PR never gets here (status.sh refuses).
+# DIVE-477: hand a maker-completed task to its verifier instead of closing it.
+# Stash the original maker (first writer wins, so it survives re-routes) so a
+# verify FAIL can bounce straight back, bump the iteration counter, keep the
+# maker's result, and re-queue the task to the verifier as a fresh todo — the
+# heartbeat picks it up on the verifier's next tick exactly like any other todo
+# in their queue (no heartbeat change needed). No status='done' is written: the
+# work is not closed until the verifier signs off.
+_task_route_to_verifier() {
+  local id="$1" vfier="$2" maker="$3" result="$4" want_result="$5" stamp_binding="${6:-0}"
+  local set_result=""
+  (( want_result )) && set_result=", result=$(sqlq_or_null "$result")"
+  # DIVE-2682: stamp the binding's iteration in the SAME UPDATE that bumps the
+  # counter, never in a second statement. Both right-hand sides evaluate against
+  # the PRE-update row, so delivery_ref_iteration and iteration land on the same
+  # number — which is the whole point. Reading the counter at two different
+  # moments is what would false-REFUSE the well-behaved maker who re-points the
+  # binding and delivers in one breath.
+  #
+  # Only cmd_task_deliver passes 1: it is the only caller of THIS helper that
+  # just (re)pointed the binding. DIVE-2316's merge-gate discovery write is a
+  # separate writer on the non-loop close path and never calls this helper.
+  # A plain `task done`
+  # re-delivery passes 0 and deliberately leaves the stamp behind at its old
+  # iteration — that gap IS the signal the gate reads.
+  local set_binding_iter=""
+  # DIVE-2682 + DIVE-2624 interaction, found by rebasing onto 8051cb1: the counter's
+  # bump became CONDITIONAL ("re-delivery of the same pass, not rework" — it only
+  # increments on a first delivery or after a reject). An unconditional +1 here then
+  # stamped the binding at iteration+1 while `iteration` itself stayed put, leaving
+  # bind > iter on every same-pass re-delivery — a state the guard's own predicate
+  # (bind < iter) can never flag, so it fails SILENTLY rather than loudly. The stamp
+  # must mirror the counter's CASE exactly, or the two answers are read from
+  # different moments again, which is the hazard this row's body opens with.
+  (( stamp_binding )) && set_binding_iter=", delivery_ref_iteration=CASE
+              WHEN handoff_delivered_at IS NULL OR handoff_rejected_at IS NOT NULL
+              THEN COALESCE(iteration,0)+1
+              ELSE COALESCE(iteration,0) END"
+  # DIVE-1416 (gap#2): stamp handoff_delivered_at fresh on EVERY delivery (incl.
+  # a re-delivery after a reject/bounce-back) — the dedicated clock the stall
+  # sweep uses to detect a delivery sitting unacknowledged too long. Clear any
+  # prior stale-ping flag so a redelivered task gets a clean shot at surfacing
+  # again if it goes stale a second time.
+  # DIVE-2624 (b): THE COUNTER MEANS "how many times has the verifier sent this
+  # back", because that is what every reader assumes it means — a high iteration
+  # is read as a maker who keeps missing the bar, and `task loops` flags a loop as
+  # STUCK off it. It used to bump on EVERY `task done`, so a delivery that merely
+  # RESTORED a handoff the gate path had just destroyed (DIVE-2624 (a)) inflated it:
+  # DIVE-2594 read iteration 3 for two real passes plus one accounting ghost, and
+  # the maker had to write "that bump was a restore" into the result by hand.
+  #
+  # A pass counts when the verifier REJECTED it, and that is the only signal that
+  # can distinguish the two — handoff_delivered_at IS NOT NULL alone cannot, because
+  # it is equally true of a genuine second pass after a bounce-back. cmd_task_reject
+  # stamps handoff_rejected_at on the bounce, and THIS delivery spends it.
+  #
+  # A TOKEN, NOT A CLOCK COMPARISON, and the first cut got that wrong. Comparing
+  # handoff_rejected_at against handoff_delivered_at looks equivalent and is not:
+  # both are datetime('now') at ONE-SECOND resolution, so a reject and the delivery
+  # that answers it routinely land in the SAME second. Any comparison then has to
+  # pick a side of the tie and is wrong on the other — `>=` leaves the reject looking
+  # permanently outstanding, so every later re-delivery re-bumps; `>` drops a reject
+  # answered inside a second. My local box was slow enough to separate them and
+  # passed; CI was not, and T9 came back iteration=3. Consuming the token has no tie
+  # to break: the reject is spent exactly once, whatever the clock says.
+  # DIVE-4144 (arm 3): THE BARE RE-DELIVER. DIVE-4113 iteration 2 re-delivered
+  # byte-identical text after a reject and the rail recorded it as a fresh pass;
+  # the verifier discovered it by reading the diff. It is graded HERE because this
+  # helper is the ONE funnel every delivery passes through (`task done`'s two
+  # routing forks and `task deliver`), and it must run BEFORE the UPDATE below —
+  # that UPDATE SPENDS the reject token (handoff_rejected_at=NULL), after which
+  # "was there an unanswered reject" is no longer answerable from the row.
+  #
+  # THE OPERAND IS THE MAKER'S RAW SUPPLIED TEXT, and the first cut got this
+  # wrong in a way worth recording. It compared `$result` — which by the time it
+  # reaches here is the MERGED column, because DIVE-2483's guard preserves the
+  # prior text and appends the new one under a seam. Two consequences, both fatal
+  # to the check: the merged blob GROWS on every delivery, so two identical
+  # deliveries never hash alike; and the reject's own output_hash is the hash of a
+  # blob from a different generation. Measured on arm E, which passed the bare
+  # re-deliver straight through.
+  #
+  # So: hash what the maker TYPED (`_TASK_RAW_RESULT`, captured at flag-parse
+  # time before any guard rewrites it) and compare it to what the maker typed on
+  # the previous delivery, which this helper records as `raw_result_hash=` in the
+  # task.delivered ledger detail below. lifecycle_events is append-only and
+  # nothing on the re-delivery path touches it (DIVE-2777's reason for choosing
+  # it), so a new durable column would be a second answer to a question the store
+  # already holds. FORWARD-ONLY: a delivery made before this change carries no
+  # raw hash, so the first pass after the upgrade cannot be compared and is
+  # silent — the same posture DIVE-2777 took, and preferable to guessing.
+  #
+  # BOUNDED, and say so rather than overclaim: this catches an identical RESULT
+  # TEXT, which is the shape measured on DIVE-4113 and the only artifact the store
+  # holds. A maker who edits the prose and pushes no code is NOT caught here — the
+  # graded-sha gate (DIVE-2656) and delivery_ref_iteration (DIVE-2682) are the arms
+  # that see the code. It is a warning-with-teeth on one shape, not a proof of
+  # rework. Skipped when no result is being written at all: a `task done` with no
+  # --result is a re-assertion, and DIVE-2624 already labels it "re-delivery of the
+  # same pass, not rework" in the receipt below.
+  local _rd_ident; _rd_ident=$(ident_of "$id")
+  # DIVE-4576: the evidence rail on the OTHER delivery verb. This helper is the
+  # one funnel every delivery passes through, so `task done`'s two routing forks
+  # meet the same refusal `task deliver` met above; a row with no binding is not
+  # in scope and returns immediately. Ordered with the byte-identical guard and
+  # BEFORE the UPDATE for the same reason: both refusals promise an untouched row.
+  devteam_loaded && _task_guard_delivery_evidence "$id" "$_rd_ident" "hand-off" "${_TASK_RAW_RESULT-${result:-}}" "$want_result"
+  # DIVE-4899: and the unbound-pull-URL refusal, for the same reason — a maker who
+  # hands off with `task done --result=` never reaches `task deliver`'s copy of it,
+  # and the routing fork returns before the close gate that has the other copy.
+  # `task deliver` already ran it before its own write, so it is not run twice.
+  if (( want_result )) && [[ -z "${_TASK_UNBOUND_CHECKED:-}" ]] && devteam_loaded; then
+    local _rd_dref; _rd_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    if [[ -n "$_rd_dref" ]]; then
+      local -a _rd_bound=("$_rd_dref"); local _rd_c _rd_set
+      _rd_set=$(_task_bound_pr_refs "$id"; _task_unbound_refs "$id")
+      while IFS= read -r _rd_c; do [[ -n "$_rd_c" ]] && _rd_bound+=("$_rd_c"); done <<<"$_rd_set"
+      _task_guard_unbound_pr_urls "$_rd_ident" hand-off "${_TASK_RAW_RESULT-${result:-}}" "${no_pr:-0}" "${force_merge_gate:-0}" "${_rd_bound[@]}"
+    fi
+  fi
+  local _rd_rejected _rd_prev_hash _rd_new_hash
+  _rd_rejected=$(db "SELECT COALESCE(handoff_rejected_at,'') FROM tasks WHERE id=${id};")
+  if (( want_result )) && [[ -n "$_rd_rejected" ]] && declare -F ledger_hash >/dev/null 2>&1; then
+    _rd_prev_hash=$(db "SELECT COALESCE(detail,'') FROM lifecycle_events
+                          WHERE ident=$(sqlq "$_rd_ident") AND kind='task.delivered'
+                            AND detail LIKE '%raw_result_hash=%'
+                          ORDER BY id DESC LIMIT 1;" 2>/dev/null || printf '')
+    _rd_prev_hash="${_rd_prev_hash##*raw_result_hash=}"; _rd_prev_hash="${_rd_prev_hash%% *}"
+    _rd_new_hash=$(ledger_hash "${_TASK_RAW_RESULT-${result:-}}")
+    if [[ -n "$_rd_prev_hash" && "$_rd_new_hash" == "$_rd_prev_hash" ]]; then
+      if [[ -n "${_TASK_REDELIVER_FORCE_REASON:-}" ]]; then
+        warn "$_rd_ident: re-delivered BYTE-IDENTICAL text after a reject (--force-redeliver, DIVE-4144) — '${_TASK_REDELIVER_FORCE_REASON}'. The verifier will read an unchanged result; the iteration counter still bumps, so the row will look like rework it is not."
+      else
+        policy_refuse "$E_CONFLICT" deliver-identical-after-reject DIVE-4144 "$_rd_ident" \
+          "$_rd_ident: this delivery's result is BYTE-IDENTICAL to the one the verifier just rejected (same sha256 prefix ${_rd_new_hash}, compared against the task.rejected ledger row). Measured on DIVE-4113 iteration 2: a bare re-deliver reads as a fresh pass and costs the verifier a full cold reload of the PR to discover that nothing changed. NOTHING WAS WRITTEN — the row is still assigned to you and the iteration counter has not moved. The reject's FIX block is in the row's result ('5dive task show $_rd_ident'); address it, then deliver with a result that says what you changed. If the work DID change and only the summary is identical, restate it — that is the cheaper fix. If you are re-delivering unchanged work on purpose (the verifier misread it, or a lost handoff is being restored), say so and it proceeds (audited): '--force-redeliver=\"<why>\"'."
+      fi
+    fi
+  fi
+  local prev_iter; prev_iter=$(db "SELECT COALESCE(iteration,0) FROM tasks WHERE id=${id};")
+  db "UPDATE tasks
+        SET status='todo', assignee=$(sqlq "$vfier"),
+            maker_agent=COALESCE(maker_agent, $(sqlq_or_null "$maker")),
+            iteration=CASE
+              WHEN handoff_delivered_at IS NULL OR handoff_rejected_at IS NOT NULL
+              THEN COALESCE(iteration,0)+1
+              ELSE COALESCE(iteration,0) END,
+            handoff_rejected_at=NULL,
+            started_at=NULL, handoff_ack_at=NULL,
+            handoff_delivered_at=datetime('now'), handoff_stale_pinged_at=NULL${set_result}${set_binding_iter}
+      WHERE id=${id};"
+  # DIVE-3349: close the session segment. This is the ONE status transition that
+  # returns BEFORE `_task_status_cmd`'s funnel, so the hook there cannot see it —
+  # and a delivered row is not being worked (it is sitting in the verifier's
+  # queue), so a segment left open here would keep charging this row for every
+  # later turn of a session that has moved on. `task deliver` with NO distinct
+  # verifier deliberately does NOT reach this line: it leaves the row in_progress
+  # and the maker is still working, so its segment stays open.
+  _task_session_close "$id"
+  # DIVE-3932: and the RUN, for the identical reason — this fork returns before
+  # the status funnel's run hook. `handed_to_verifier` is the maker's end
+  # boundary and it is a COMPLETED run, not an open one: the attempt reached a
+  # durable boundary and the next thing that happens to this row is a different
+  # agent's attempt. Ordered next to the segment close so the two receipts for
+  # one boundary cannot drift apart.
+  _run_event_for_task "$id" task.handoff "{\"verifier\":$(_run_json_str "$vfier")}" || true
+  _run_close_for_task "$id" completed handed_to_verifier || true
+  local iter; iter=$(db "SELECT iteration FROM tasks WHERE id=${id};")
+  local iter_note=""
+  [[ "$iter" == "$prev_iter" ]] && iter_note=" — re-delivery of the same pass, not rework"
+  local ident; ident=$(ident_of "$id")
+  # INST-4: the maker→verifier DELIVERY.
+  #
+  # Emitted here and not from _task_status_cmd, because a `task done` that
+  # delivers never reaches _task_status_cmd — it forks earlier, into this
+  # handoff write. The first cut of this change assumed one funnel and shipped a
+  # ledger with no delivered event at all; the e2e caught it because the row was
+  # simply absent, which is the one shape a ledger cannot self-report.
+  #
+  # The distinction is load-bearing, not cosmetic: a delivery is NOT a close. A
+  # ledger that recorded it as `task.done` would attest that work was finished
+  # while it is still waiting to be graded — the precise overstatement the
+  # verifier rail exists to prevent, asserted by our own evidence base.
+  # DIVE-4144: `raw_result_hash` is the digest of the text the MAKER SUPPLIED, which
+  # is not what `out` carries (that is the merged column, prior text included). It is
+  # the operand the identical-redeliver guard above reads on the NEXT delivery. In
+  # `detail` and not a new column, for DIVE-2518's reason: lifecycle_events is
+  # append-only history and an ALTER leaves every pre-existing row with a NULL that
+  # reads as "the maker typed nothing" rather than "not recorded yet".
+  local _rd_emit_hash=""
+  declare -F ledger_hash >/dev/null 2>&1 && (( want_result )) \
+    && _rd_emit_hash=$(ledger_hash "${_TASK_RAW_RESULT-${result:-}}")
+  ledger_emit task.delivered ident="$ident" task_id="$id" actor="$(task_actor "")" \
+    out="${result:-}" detail="delivered to verifier ${vfier} (iteration ${iter}${iter_note}; awaiting ACK)${_rd_emit_hash:+ raw_result_hash=${_rd_emit_hash}}"
+  # DIVE-4164: the delivery event asks for an ephemeral grader. Emitted HERE, in
+  # the one funnel every delivery passes through, so "never maker-spawned" is
+  # structural — see _grader_spawn_request. `|| true`: the row is already durably
+  # updated and a bookkeeping write must never fail a recorded delivery.
+  declare -F _grader_spawn_request >/dev/null 2>&1 \
+    && _grader_spawn_request "$ident" "$id" "$vfier" "$iter" || true
+
+  # DIVE-3503 — `task deliver` is a terminal boundary for the MAKER even though
+  # the row stays open, so it reaps like done/cancel. Same predicate, same
+  # protections; see src/lib/reap.sh.
+  declare -F _reap_at_task_boundary >/dev/null 2>&1 && _reap_at_task_boundary "deliver" "$ident" || true
+
+  ok "$ident ready for review — delivered to verifier '$vfier' (iteration ${iter}${iter_note}; awaiting ACK)" \
+     '{id:($i|tonumber), ident:$id, status:"todo", routedTo:$v, role:"verifier", handoff:"delivered", acknowledged:false, iteration:($n|tonumber)}' \
+     --arg i "$id" --arg id "$ident" --arg v "$vfier" --arg n "$iter"
+}
+
+# DIVE-6938: `task reject` and everything below it to the end of cmd_task_reject
+# stayed in the core when task/delivery.sh moved to the devteam plugin. A verifier
+# row's bounce is the other half of the hand-off above it (verify_policy is core),
+# the heartbeat's wake nudge reads its FIX block, and task/answer.sh resumes the
+# iteration-cap gate it files. Pull-request delivery, grading and merging are the
+# plugin's.
+# DIVE-477: the verifier's FAIL verdict. The maker's work missed the bar, so
+# bounce the task back to the maker with feedback for another pass — UNLESS we've
+# reached max_iterations, where the loop is stuck and we park it on a human
+# (`task need`) rather than ping-pong forever. Only meaningful mid-loop
+# (maker_agent set); a plain task has no maker to bounce to.
+# DIVE-2777: the ONE emitter for a bounce, shared by both of `reject`'s write
+# sites — the ordinary bounce-back and the max_iterations escalation. It is a
+# function rather than two call-sites-worth of inline `ledger_emit` for the exact
+# reason this ticket exists: DIVE-2483 fixed a class in three places and left a
+# fourth hand-rolled copy, which then survived the fix meant to kill it. The next
+# path added to `reject` should inherit this rather than re-derive it.
+#
+# `out` is the SUPERSEDED text, deliberately, not the rejection line. output_hash
+# is then sha256 of what was on the row when the bounce landed, so it EQUALS the
+# `task.delivered` output_hash for the same ident and a reader can say WHICH
+# delivery this bounce displaced. The rejection text itself is on the row and
+# needs no hash.
+# ── DIVE-4144 — A REJECT THAT NAMES NO FIX BUYS AN EXTRA ITERATION ───────────
+#
+# AXIS: the autonomy number. Every maker<->verifier round is a COLD RELOAD of a
+# PR the maker had closed out, so an iteration is not a cheap retry — it is the
+# most expensive shape the loop has. Measured on DIVE-4113 (2026-09-09): three
+# iterations, of which iteration 2 was a bare re-deliver that changed NOTHING
+# (olivia: "ITERATION 2 CHANGED NOTHING vs iteration 1"). What closed it in
+# iteration 3 was already sitting in olivia's ITERATION-1 reject, in this shape:
+#
+#     FIX (either closes it): (a) ... (b) ...
+#
+# i.e. the information that ended the loop was present two rounds early and was
+# not structured where the maker would act on it. So the three arms here are one
+# change: make the fix SAYABLE (the template), make it REACH the maker (the wake
+# nudge), and make a re-deliver that ignored it VISIBLE (the identical-redeliver
+# refusal). Any one alone leaves the round in place.
+#
+# WHAT COUNTS AS NAMING A FIX, and it is deliberately ONE marker rather than a
+# prose classifier: a `FIX` label followed by a separator and at least one
+# alphanumeric character. Not a judgement about whether the fix is GOOD — that
+# is the maker's read and no regex can hold it — only that the reject carries a
+# labelled, greppable one, which is the property the wake nudge below needs in
+# order to extract anything at all. The leading non-alphanumeric boundary is
+# load-bearing: without it "prefix: ..." satisfies the check.
+_REJECT_FIX_MARKER_RE='(^|[^[:alnum:]])[Ff][Ii][Xx][[:space:]]*([(:=-]|—)[^[:alnum:]]*[[:alnum:]]'
+
+# The text every refusal prints. One string, so the refusal, the `--help` line
+# and the tests cannot drift into describing three different templates.
+_REJECT_TEMPLATE_HINT='FINDING: <what is wrong, and the evidence you read> / FIX: <the concrete testable change that closes it — "(a) ... (b) ..." alternatives are fine> / VERIFY: <what you will re-run to grade the next pass>'
+
+# rc=0 when the feedback names a fix.
+_reject_feedback_names_a_fix() {
+  [[ "${1:-}" =~ $_REJECT_FIX_MARKER_RE ]]
+}
+
+# Print the FIX block of a reject's recorded text — from the LAST `FIX` marker to
+# the end — flattened to one line and capped. The LAST occurrence, not the first,
+# because `_task_guard_result_over_closed` appends: on a re-reject the row carries
+# the superseded text FIRST and the live rejection last, so the first match would
+# hand the maker the fix it has already addressed. Capped at 700 chars because the
+# consumer is a single-line /goal nudge, not a document.
+_reject_fix_block() {
+  printf '%s' "${1:-}" | tr '\n\t' '  ' | awk '
+    { line=$0; low=tolower(line); p=0; i=1
+      while (match(substr(low,i), /fix[ ]*[(:=-]/)) { p = i + RSTART - 1; i = p + 1 }
+      if (p>0) { b=substr(line,p); if (length(b)>700) b=substr(b,1,700) "…"; print b } }'
+}
+
+_task_reject_emit_event() {
+  local ident="$1" id="$2" actor="$3" prev="$4" iter="$5" maxi="$6" disposition="$7"
+  local prior
+  if (( ${#prev} )); then
+    prior="superseded (${#prev} bytes, preserved on the row)"
+  else
+    prior="none"
+  fi
+  ledger_emit task.rejected ident="$ident" task_id="$id" actor="$actor" \
+    out="$prev" \
+    detail="rejected by ${actor} at iteration ${iter}${maxi:+/$maxi}, ${disposition}; prior_result=${prior}"
+  # DIVE-4866: what happens after a failed attempt (retry-action). Both reject
+  # sites come through here, so the escalation is receipted as well as the
+  # bounce. Additive only; see src/lib/reflex.sh.
+  local _rx_res="retry_with_feedback"
+  [[ "$disposition" == escalated* ]] && _rx_res="human"
+  reflex_receipt policy=retry-action ident="$ident" task_id="$id" actor="$actor" \
+    result="$_rx_res" candidates="retry_with_feedback,human" \
+    signals="$(jq -cn --arg i "$iter" --arg m "$maxi" '{iteration:($i|tonumber? // null), max_iterations:($m|tonumber? // null)}' 2>/dev/null)" \
+    effect="$(jq -cn --arg t "$ident" --arg d "$disposition" '{task:$t, disposition:(if ($d|startswith("escalated")) then "escalated" else "bounced" end)}' 2>/dev/null)" \
+    2>/dev/null || true
+  # DIVE-3932: the verdict lands on the VERIFIER's own open run, and closes it —
+  # producing a verdict is the verifier's end boundary. The maker's run for this
+  # iteration was already closed `handed_to_verifier`; it is deliberately NOT
+  # reopened or rewritten, because the rejection is a fact about a later attempt
+  # by a different agent, and rewriting the maker's terminal record is exactly the
+  # silent-overwrite the retry lineage exists to avoid. The maker's next pass gets
+  # its own run, linked by parent_run_id.
+  _run_event_for_task "$id" verifier.rejected \
+    "{\"iteration\":$(_run_json_str "$iter"),\"disposition\":$(_run_json_str "$disposition")}" || true
+  _run_close_for_task "$id" completed verifier_rejected || true
+}
+
+# ============================================================================
+# DIVE-4476 — THE ESCALATION ASK IS WRITTEN BY THE PRODUCT, SO THE PRODUCT
+# COMPOSES IT FROM THE ROW.
+#
+# lodar, 2026-09-14 02:36Z, reading the DIVE-4471 escalation on his phone:
+# "confusing phrasing.. do i [open the PR] and submit approve?" and 02:37Z "our
+# human gate is still unfriendly and not fixed then?". What he was sent was
+# "A piece of work has failed review 2 times and stopped. Decide whether to keep
+# going or drop it." — DIVE-4176's rewrite, which fixed the READABILITY (no ident,
+# no pasted feedback) and left three things broken that readability does not grade:
+#
+#   1. it names NO WORK. "A piece of work" is every row on the board. He cannot
+#      tell what he is deciding about without opening a link.
+#   2. its BUTTON was not either outcome. `--type=manual` renders one "✋ Tap ✅
+#      Done" (src/task/notify.sh) while the sentence offers "keep going or drop
+#      it" — so the only tap available answers neither half of the question.
+#   3. it went to HIM FIRST. `manual` is tier-2 by type, and a two-strike stop is
+#      a lead's call (DIVE-4346/4365: the orchestrator clears first).
+#
+# The fix for all three is the same one: file the DECISION that is actually being
+# taken — `--type=decision`, which defaults to tier 1 and therefore ROUTES to the
+# filing verifier's lead, with two spelled-out options and the lead's default as
+# `--recommend`. The human sees it only when the chart resolves nobody above the
+# verifier, and by then it is a readable sentence with two real buttons.
+#
+# WHY THE COMPOSITION IS DEFENSIVE, AND THIS IS THE LOAD-BEARING PART. Naming the
+# row means interpolating the TITLE, and titles on this board are written by
+# agents for agents: "DIVE-4462 --options seam", "cli-3754 launcher entry point".
+# Every one of those shapes is refused by the readability rule in `task need`,
+# `cmd_task_need` exits rather than returns, and the refusal would make `task
+# reject` ITSELF FAIL at the iteration cap — the exact failure DIVE-4176 hit and
+# recorded (community/wiki/the-readability-rule-is-about-the-reader-not-the-tier.md,
+# section 6: "the one bounce that ends a loop stops producing the gate that ends
+# it"). A product-written ask must therefore be UNCONDITIONALLY fileable.
+#
+# So the subject is built by the SAME classifier that would refuse it
+# (`_gate_ask_jargon_term`), taking words until the first token a person outside
+# our codebase cannot read, and the composed ask is measured against the SAME word
+# cap (`_GATE_ASK_MAX_WORDS`) before it is returned. If either the subject or the
+# finding clause cannot be made readable, it is DROPPED and the sentence degrades
+# to the subject-free form, which is lint-clean by construction. Degrading loses a
+# hint; refusing loses the gate.
+#
+# DIVE-4537 — THE OPTIONS NAME WHAT THE ANSWER DOES, BECAUSE NOW IT DOES IT.
+# "the lead takes it over" described who was left holding the row, not an
+# outcome, and it was not even true: answering this gate cleared the question and
+# left the loop exactly as stopped as it was (iteration == max_iterations, no
+# maker, no resume verb — measured on DIVE-4520, where the disposition "keep
+# going" sat written on the row for 83 minutes because the three verbs that
+# execute it are `task verifier --max-iters`, `need --withdraw` and `task reject`,
+# in that order, and the answering lead holds none of them:
+# community/wiki/a-withdrawn-iteration-cap-gate-leaves-the-loop-with-no-owner-and-no-resume-verb.md).
+# `cmd_task_answer` now performs the resume itself, so each option can say what
+# its tap produces. Keep both readable: these two strings ARE the two buttons.
+_ESCALATION_OPTIONS='keep going — send it back for another pass|drop it — stop the work, keep the findings'
+_ESCALATION_RECOMMEND='keep going — send it back for another pass'
+
+# Print a leading run of <max-words> readable words of <text>, stopping at the
+# first token the gate-ask classifier calls an internal name. Stopping rather
+# than DELETING is deliberate: a title reads as a phrase, and a hole punched in
+# the middle of one ("the seam is unswept") is harder to read than a short one.
+_task_escalation_phrase() { # <text> <max-words> -> phrase (possibly empty)
+  local _ep_raw="${1:-}" _ep_max="${2:-10}" _ep_out="" _ep_w _ep_n=0
+  # A title's tail clause is where the filer puts the mechanism and the
+  # attribution — "… — name the work + two outcomes (lodar 2026-09-14)". Cut it
+  # before word-counting so the budget is spent on the subject, not the aside.
+  _ep_raw="${_ep_raw%%(*}"
+  _ep_raw="${_ep_raw%%—*}"
+  _ep_raw="${_ep_raw%%$'\n'*}"
+  for _ep_w in $_ep_raw; do
+    if declare -F _gate_ask_jargon_term >/dev/null 2>&1; then
+      _gate_ask_jargon_term "$_ep_w" >/dev/null 2>&1 && break
+    fi
+    _ep_out="${_ep_out:+${_ep_out} }${_ep_w}"
+    _ep_n=$(( _ep_n + 1 ))
+    (( _ep_n >= _ep_max )) && break
+  done
+  # Trailing punctuation left behind by the cut reads as a typo on a phone, and
+  # a phrase cut mid-clause ends on a dangling function word ("… writes a machine
+  # ask a"). Strip both, repeatedly, because one exposes the other.
+  local _ep_last
+  while [[ -n "$_ep_out" ]]; do
+    if [[ "$_ep_out" == *[,\;:.-] ]]; then _ep_out="${_ep_out%?}"; continue; fi
+    _ep_last="${_ep_out##* }"
+    case "${_ep_last,,}" in
+      a|an|the|and|but|or|of|to|in|on|for|with|that|is|was|its|it|by|as|at|from|not|no)
+        [[ "$_ep_out" == *" "* ]] || { _ep_out=""; break; }
+        _ep_out="${_ep_out% *}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$_ep_out"
+}
+
+# The one clause of the verifier's last finding that a person can read. Taken
+# from the FINDING half of the reject template (`_REJECT_TEMPLATE_HINT`) when it
+# is present, because the FIX half is addressed to the maker and is machine
+# prose by design. Empty whenever it cannot be made readable, which is the
+# common case and is fine — the full text is on the row's `result`.
+_task_escalation_finding() { # <feedback text> -> clause (possibly empty)
+  local _ef_txt="${1:-}" _ef_cl
+  _ef_txt=$(printf '%s' "$_ef_txt" | tr '\n\t' '  ')
+  # the last FINDING, for the same reason _reject_fix_block takes the last FIX:
+  # a re-reject carries the superseded text first.
+  case "$_ef_txt" in
+    *FINDING:*) _ef_cl="${_ef_txt##*FINDING:}" ;;
+    # DIVE-4476 iteration 3: NO fallback. The call site hands this function
+    # `fb_txt` AFTER `_task_guard_result_over_closed` merged the MAKER's prior
+    # result into it (src/task/status.sh:122), so a "first colon wins" fallback
+    # lands inside the maker's own delivered text and shows the maker's
+    # self-report to the human AS the verifier's finding — on a gate whose two
+    # buttons are keep-going / drop-it, which is to say it argues for the wrong
+    # button in the maker's words. Unlabelled feedback is the COMMON case (the
+    # refusal upstream requires a FIX label only, and `--no-fix=` is a second
+    # legal exit with neither label): 196 of 285 recorded rejects on this board,
+    # 69%. No FINDING label therefore means no clause, which is what the
+    # docstring above already promises and what the composer degrades cleanly for.
+    *) _ef_cl="" ;;
+  esac
+  # one clause only — the first sentence or separator wins. `FIX:` is a separator
+  # too: the template writes "FINDING: … / FIX: …", but that " / " is a convention
+  # and is not enforced, so a finding written "FINDING: the relay never lands FIX:
+  # do X" would otherwise leak the very label the docstring means to exclude.
+  _ef_cl="${_ef_cl%%FIX:*}"
+  _ef_cl="${_ef_cl%%.*}"; _ef_cl="${_ef_cl%%;*}"; _ef_cl="${_ef_cl%% / *}"
+  _ef_cl="${_ef_cl#"${_ef_cl%%[![:space:]]*}"}"
+  _ef_cl=$(_task_escalation_phrase "$_ef_cl" 5)
+  # A one- or two-word fragment is noise, not a hint.
+  local -a _ef_w=(); read -r -a _ef_w <<<"$_ef_cl"
+  (( ${#_ef_w[@]} >= 3 )) || _ef_cl=""
+  printf '%s' "$_ef_cl"
+}
+
+# The ask itself. Contract: the return value ALWAYS passes the `task need`
+# readability rule, whatever is on the row.
+_task_escalation_ask() { # <row id> <iterations> [feedback text]
+  local _ea_id="${1:-}" _ea_iter="${2:-2}" _ea_fb="${3:-}"
+  local _ea_title="" _ea_subj="" _ea_find="" _ea_count _ea_ask _ea_max="${_GATE_ASK_MAX_WORDS:-25}"
+  case "$_ea_iter" in
+    # `max_iterations=1` is legal (tests/task_reject_trace_unit.sh's own fixture
+    # uses it) and rendered "sent back 1 times" to the person deciding.
+    1) _ea_count="once" ;;
+    2) _ea_count="twice" ;;
+    *) _ea_count="${_ea_iter} times" ;;
+  esac
+  # The subject-free sentence is the FLOOR: 14 words, no internal names, and it
+  # is what every degradation below falls back to.
+  local _ea_base="The work was sent back ${_ea_count} and has stopped. Keep going, or drop it?"
+  [[ "$_ea_id" =~ ^[0-9]+$ ]] || { printf '%s' "$_ea_base"; return 0; }
+  _ea_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${_ea_id};" 2>/dev/null) || _ea_title=""
+  _ea_subj=$(_task_escalation_phrase "$_ea_title" 9)
+  # Under three words the subject names nothing ("Loop two-strike" is not a
+  # subject), so it buys a cut title at no readability gain.
+  local -a _ea_sw=(); read -r -a _ea_sw <<<"$_ea_subj"
+  (( ${#_ea_sw[@]} >= 3 )) || _ea_subj=""
+  [[ -z "$_ea_subj" ]] && { printf '%s' "$_ea_base"; return 0; }
+  _ea_find=$(_task_escalation_finding "$_ea_fb")
+  _ea_ask="${_ea_subj}: sent back ${_ea_count} (${_ea_find}) and stopped. Keep going, or drop it?"
+  [[ -n "$_ea_find" ]] || _ea_ask="${_ea_subj}: sent back ${_ea_count} and stopped. Keep going, or drop it?"
+  # MEASURE THE COMPOSED STRING, do not trust the arithmetic of the budget. Drop
+  # the finding first (it is the hint), then the subject (it is the name), then
+  # the floor — each step strictly shorter and strictly more readable.
+  if declare -F _gate_ask_word_count >/dev/null 2>&1; then
+    if (( $(_gate_ask_word_count "$_ea_ask") > _ea_max )); then
+      _ea_ask="${_ea_subj}: sent back ${_ea_count} and stopped. Keep going, or drop it?"
+      (( $(_gate_ask_word_count "$_ea_ask") > _ea_max )) && _ea_ask="$_ea_base"
+    fi
+  fi
+  if declare -F _gate_ask_jargon_term >/dev/null 2>&1; then
+    _gate_ask_jargon_term "$_ea_ask" >/dev/null 2>&1 && _ea_ask="$_ea_base"
+  fi
+  printf '%s' "$_ea_ask"
+}
+
+cmd_task_reject() {
+  tasks_db_init
+  local task="" feedback="" no_fix="" merge_conflict=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --feedback=*) feedback="${1#*=}" ;;
+      --reason=*)   feedback="${1#*=}" ;;
+      # DIVE-4144: the DECLARED exit from the names-a-fix refusal below. A
+      # verifier who has genuinely found a defect it cannot prescribe a fix for
+      # must still be able to bounce — a refusal with no exit converts a
+      # wrong-but-moving row into a stuck one and the next agent routes around
+      # it. It takes a reason rather than being a bare switch for the same
+      # reason --no-pr does: the reason is a claim the verifier can be held to,
+      # and it is what the maker reads instead of a fix.
+      --no-fix=*)   no_fix="${1#*=}" ;;
+      --no-fix)     fail "$E_USAGE" "--no-fix needs a reason: --no-fix=\"<why you cannot name the fix>\" (DIVE-4144)" ;;
+      # DIVE-6753: the merger's bounce for a PASSED delivery that only stopped
+      # being mergeable. Checked against the row below, never taken on trust.
+      --merge-conflict) merge_conflict=1 ;;
+      -*)           fail "$E_USAGE" "unknown flag: $1" ;;
+      *)            [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task reject <id|DIVE-N> [--feedback=\"FINDING: … FIX: … VERIFY: …\"] [--merge-conflict]"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local maker iter maxi vfier
+  maker=$(db "SELECT COALESCE(maker_agent,'')    FROM tasks WHERE id=${id};")
+  iter=$(db  "SELECT COALESCE(iteration,0)       FROM tasks WHERE id=${id};")
+  maxi=$(db  "SELECT COALESCE(max_iterations,0)  FROM tasks WHERE id=${id};")
+  vfier=$(db "SELECT COALESCE(verifier,'')       FROM tasks WHERE id=${id};")
+  [[ -n "$maker" ]] || fail "$E_VALIDATION" \
+    "$ident is not in a maker→verifier loop (no maker to bounce to) — use 'task need'/'task block' for a plain rejection"
+  # DIVE-2112: found by olivia verifying DIVE-2067 — whose refusal text pointed makers HERE.
+  # Measured on a fixture: a MAKER reject of an already-done task returned rc=0, reopened it,
+  # replaced the verifier ACK, and — because the string hard-coded the RECORDED verifier —
+  # recorded the write under a verifier who never made it. dev2 pressed the button, the board
+  # said olivia did. Destroying a record is bad; MANUFACTURING a false one is worse.
+  #
+  # Scoped like DIVE-2067 rather than symmetrically: a lead bouncing an OPEN task is
+  # legitimate and stays working. Only the two cases with nothing to escape from are refused.
+  _rj_actor=$(task_actor "")
+  _rj_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+  # (1) the writer may not grade its own work (DIVE-477) — and a maker reject would otherwise
+  # be filed under the verifier's name, which is the false-record half.
+  if [[ -n "$maker" && "$_rj_actor" == "$maker" ]]; then
+    policy_refuse "$E_CONFLICT" reject-by-maker DIVE-2112 "$ident" \
+      "$ident lists you ('${_rj_actor}') as its MAKER. A reject is the verifier's grade, so this would be the writer grading its own delivery (DIVE-477) and would be recorded under '${vfier:-the verifier}''s name. Ask '${vfier:-the verifier}' to bounce it back, or send them what you found and let them decide."
+  fi
+  # (2) a CLOSED, graded task is not reopened by someone other than its grader. Deliberately
+  # names no alternative verb: this fix exists because DIVE-2067's refusal enumerated one.
+  if [[ "$_rj_st" == 'done' && -n "$vfier" && "$_rj_actor" != "$vfier" ]]; then
+    policy_refuse "$E_CONFLICT" reject-over-closed DIVE-2112 "$ident" \
+      "$ident is already done and was graded by '${vfier}', not by you ('${_rj_actor}'). Reopening it here would discard that grade and file the reopen under '${vfier}''s name. '${vfier}' can reopen their own grade; anyone else should raise a NEW task citing $ident."
+  fi
+  # DIVE-4144 (arm 1): REFUSE A REJECT THAT NAMES NO FIX. Placed AFTER the
+  # DIVE-2112 identity refusals and BEFORE any write, so an unstructured bounce
+  # is a pure no-op — the row keeps the maker's delivered result, the loop counter
+  # does not move, and the verifier re-runs one command. Placed after the identity
+  # checks specifically because "you may not grade your own work" is the stronger
+  # thing to say to a maker who reached this verb: telling them to add a FIX block
+  # first would send them to write one for a reject they are not allowed to file.
+  if ! _reject_feedback_names_a_fix "$feedback"; then
+    if [[ -n "$no_fix" ]]; then
+      warn "$ident: rejected WITHOUT a fix (--no-fix, DIVE-4144) — '${no_fix}'. The maker reads that instead of a FIX block, so expect it to come back asking; if you can name the change, say it and save the round."
+      feedback="${feedback:-no feedback given} [no FIX named — ${no_fix}]"
+    else
+      policy_refuse "$E_VALIDATION" reject-names-no-fix DIVE-4144 "$ident" \
+        "$ident: this reject names no FIX, so it costs the maker a full round to find out what you want. Measured on DIVE-4113: the fix that closed it was already in the iteration-1 reject, and iteration 2 changed nothing because the feedback was not actionable. NOTHING WAS WRITTEN — the row still carries the maker's delivered result and the iteration counter has not moved; re-run this verb with the fix named. TEMPLATE: --feedback=\"${_REJECT_TEMPLATE_HINT}\". A fix is 'named' when the feedback carries a FIX label with something after it; the wording is yours. If you genuinely cannot prescribe one, say why and it proceeds (audited): '5dive task reject $ident --feedback=\"...\" --no-fix=\"<why>\"'."
+    fi
+  fi
+  # DIVE-6753: A MERGE-CONFLICT BOUNCE AFTER A PASS IS NOT AN ITERATION. On
+  # 2026-10-22 three rows (DIVE-6716, -6729, -6717) each graded PASS at the
+  # delivered head, then went CONFLICTING because a sibling merged first; the
+  # merger's reject spent the last of max_iterations=2 and filed a keep-going /
+  # drop-it gate for work nobody had found a defect in. The cap counts quality
+  # rounds, and a rebase is not one. So --merge-conflict bounces WITHOUT spending
+  # one: the bounce below raises max_iterations by one, which is exactly what the
+  # re-delivery's iteration bump then takes back, and the cap branch is skipped.
+  #
+  # The flag is a CLAIM about the row, so it is checked against the row, before
+  # any write: a quality reject must not be able to wear it. Three facts, all
+  # structural columns (never result text, which the maker writes):
+  #   - the latest verdict is a PASS, recorded at or after the current delivery
+  #     and not followed by a reject — a PASS on an older head grades nothing here;
+  #   - the caller is the seat that owes the merge, or the seat that graded it.
+  if (( merge_conflict )); then
+    local _mc_row _mc_verdict _mc_fresh _mc_owner _mc_grader
+    _mc_row=$(db "SELECT COALESCE(graded_verdict,'')||x'1f'||
+        CASE WHEN graded_verdict_at IS NOT NULL AND handoff_delivered_at IS NOT NULL
+              AND graded_verdict_at >= handoff_delivered_at
+              AND (handoff_rejected_at IS NULL OR handoff_rejected_at < graded_verdict_at)
+             THEN 1 ELSE 0 END||x'1f'||
+        COALESCE(merge_owner,'')||x'1f'||COALESCE(graded_by,'')
+      FROM tasks WHERE id=${id};")
+    IFS=$'\x1f' read -r _mc_verdict _mc_fresh _mc_owner _mc_grader <<<"$_mc_row"
+    if [[ "$_mc_verdict" != 'pass' || "$_mc_fresh" != '1' ]]; then
+      policy_refuse "$E_CONFLICT" reject-merge-conflict-without-pass DIVE-6753 "$ident" \
+        "$ident: --merge-conflict says the work PASSED and only the merge is blocked, but this row's current delivery carries no PASS (verdict '${_mc_verdict:-none}'$([[ "$_mc_verdict" == pass ]] && printf ', recorded before the current delivery or since rejected')). NOTHING WAS WRITTEN. If the work has a defect, reject it without --merge-conflict; that bounce counts toward the iteration cap."
+    fi
+    if [[ "$_rj_actor" != "$_mc_owner" && "$_rj_actor" != "$_mc_grader" && "$_rj_actor" != "$vfier" ]]; then
+      policy_refuse "$E_CONFLICT" reject-merge-conflict-not-merger DIVE-6753 "$ident" \
+        "$ident: --merge-conflict is the merger's bounce, and you ('${_rj_actor}') neither owe this merge ('${_mc_owner:-nobody}') nor graded it ('${_mc_grader:-nobody}'). NOTHING WAS WRITTEN. Tell the merge owner the branch conflicts and let them bounce it."
+    fi
+  fi
+  # (3) attribute to the REAL actor, never to the recorded verifier by assumption.
+  local fb_txt="❌ ${_rj_actor} rejected (iteration ${iter}): ${feedback:-no feedback given}"
+  (( merge_conflict )) && fb_txt="❌ ${_rj_actor} rejected for a MERGE CONFLICT after a PASS (iteration ${iter}, not counted toward the cap): ${feedback:-no feedback given}"
+  # (4) never silently discard a landed record — VIA THE SHARED GUARD, not a
+  # private copy of it.
+  #
+  # DIVE-2773. `reject` cannot write a BLANK (a missing --feedback substitutes
+  # "no feedback given" above), so it is not in the first-close-needs-a-reason
+  # population at all. Its defect was the other one, and it is DIVE-2762 EXACTLY,
+  # one verb over: the hand-rolled preservation this replaces read
+  #
+  #     if [[ "$_rj_st" == 'done' && -n "$_rj_prev" ]]; then ... fi
+  #
+  # so the preservation FIRED ONLY ON A `done` ROW. A row delivered to a verifier
+  # is `todo` BY DESIGN — that is the rail's own contract, a correct `task done`
+  # delivers it, status stays todo, assignee moves to the verifier. So on the
+  # ORDINARY reject path, the one the loop manufactures on every bounce, `_rj_st`
+  # is 'todo', the branch did not fire, and the bare UPDATE below replaced the
+  # MAKER'S RESULT with the rejection text. No warning, no marker, no audit of
+  # the overwritten value.
+  #
+  # That is DIVE-2762's finding verbatim: the guard keyed on CLOSED-NESS while
+  # the population is CARRIES-A-RESULT. DIVE-2483 repaired exactly that for
+  # done/deliver/verify by routing all three through
+  # `_task_guard_result_over_closed`. `cmd_task_reject` was never one of its call
+  # sites; it kept a private copy of the OLD, WRONG predicate and so survived the
+  # fix meant to kill the class — while wearing a DIVE-2067 marker that made it
+  # look handled. Fixing a class in three places and leaving a fourth hand-rolled
+  # copy is how this got here, which is why the remedy is one predicate and not a
+  # fourth condition: the next verb added inherits the guard instead of a habit.
+  #
+  # append_result=1 rather than 0, and that is load-bearing: on a CLOSED row the
+  # guard's default is to REFUSE, which would break the one legitimate reopen
+  # DIVE-2112 allows (the recorded verifier withdrawing their own grade) — the
+  # very case the old private branch existed to serve. Asking for the append is
+  # what makes this a strict widening. Note the seam puts the PRIOR text first
+  # now, where the old marker put it last; that is the shared convention's order
+  # and a single grep still finds every superseded record.
+  #
+  # DIVE-2777. Read the prior text BEFORE the guard runs, for the lifecycle event
+  # below — after it, `$fb_txt` is the merged string and the question "was there a
+  # record here to supersede" is no longer answerable from the row.
+  local _rj_prev; _rj_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+  _task_guard_result_over_closed "$id" "$ident" reject "$fb_txt" 1 0 reject-result-over-open
+  fb_txt="$_TASK_GUARDED_RESULT"
+  # DIVE-1495: a reject supersedes any still-open need-gate on this task. Leaving
+  # it 'pending' (need_answered_at NULL) let the DIVE-1490 re-nag ladder keep
+  # firing a question the reject already mooted (CNCL-9: lodar was re-nagged AFTER
+  # the task was rejected). Resolve it as auto:reject so the open-gate predicate
+  # (need_type set AND need_answered_at NULL) stops matching, while preserving the
+  # gate row for audit. The max_iterations branch below then files its OWN fresh
+  # manual gate to a human on purpose.
+  local _open_gate; _open_gate=$(db "SELECT CASE WHEN need_type IS NOT NULL
+        AND need_answered_at IS NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")
+  # DIVE-2196: ...but NOT a tier-2 one. The supersede below writes
+  # need_answered_by='auto:reject' with raw SQL, which is a NON-HUMAN provenance on
+  # a gate the tier-2 floor exists to keep human-only — cmd_task_answer refuses
+  # exactly that write, and this path reaches around it. `task done` over a live
+  # gate is already refused (DIVE-555); reject was the remaining verb by which an
+  # agent could clear a human's pending question as a side effect of its own move.
+  # Scoped to an AGENT actor: a genuine human caller is the very party the gate is
+  # waiting on, and an unattributable one ('none': CI, root cron) is the different
+  # question DIVE-2007 got wrong by answering it here. Tier<=1 keeps DIVE-1495's
+  # supersede untouched — a fleet-actionable gate is one an agent could have
+  # cleared anyway, and leaving it pending is the CNCL-9 re-nag defect.
+  if [[ "$_open_gate" == "1" ]]; then
+    # EXPLICIT tier only. Every gate filed through `task need` writes a tier, so a
+    # NULL one is a legacy or hand-inserted row that predates tiers — inferring a
+    # human-only floor from a missing value would retro-fit this refusal onto rows
+    # nobody ever tiered and silently break DIVE-1495's supersede where it has
+    # always applied (caught by tests/gate_verifier_route_unit.sh, whose DIVE-505
+    # fixture is exactly that shape). Fail-closed on an absent tier belongs where a
+    # gate is being ANSWERED — a grant; here the question is whether a rail that has
+    # worked since DIVE-1495 keeps working.
+    local _og_tier _og_type _og_actor _og_kind
+    _og_tier=$(db "SELECT COALESCE(tier,'')            FROM tasks WHERE id=${id};")
+    _og_type=$(db "SELECT COALESCE(need_type,'gate')   FROM tasks WHERE id=${id};")
+    _og_actor=$(_gate_withdraw_actor)          # "agent <name>" | "human" | "none"
+    _og_kind="${_og_actor%% *}"
+    if [[ -n "$_og_tier" && "$_og_tier" -ge 2 && "$_og_kind" == "agent" ]]; then
+      # MIRROR QUESTION (main, pre-merge): what does this guard make unreachable?
+      # A verifier who grades the work a FAIL while a tier-2 gate stands. If the
+      # only answer were "wait for the human", the rail would convert a
+      # wrong-but-moving state into a correct-but-stuck one and the next agent
+      # would route around it. So the refusal PRINTS the exit, and which exit
+      # depends on who the caller is:
+      #   - you filed the gate  -> you can retire it yourself: `need --withdraw`
+      #     then reject. Two explicit steps, one of them recorded in gate_history
+      #     as a withdrawal, which is the whole difference from a forged answer.
+      #   - someone else filed it -> you cannot retire their ask and must not
+      #     answer it for them, but your GRADE does not have to wait on it:
+      #     `task set-body --append` records the verdict now, the reject lands
+      #     when the gate clears. Nothing is lost, only the loop transition waits.
+      local _og_filer _og_me _og_exit
+      _og_filer=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''), assignee, '') FROM tasks WHERE id=${id};")
+      _og_me="${_og_actor#agent }"
+      if [[ -n "$_og_filer" && "$_og_filer" == "$_og_me" ]]; then
+        _og_exit="You filed this gate, so you can retire it yourself: '5dive task need $ident --withdraw' (a withdrawal, archived to gate_history — not an answer put in a human's mouth), then reject. Do that only if your grade makes the question genuinely moot."
+      else
+        _og_exit="'${_og_filer:-its filer}' or their lead can withdraw it ('5dive task need $ident --withdraw') if your grade makes the question moot — ask them, do not answer it for them. Your grade does not have to wait on that: record it now with '5dive task set-body $ident \"VERDICT: ...\" --append' and send it to the maker, then reject once the gate clears."
+      fi
+      policy_refuse "$E_CONFLICT" reject-over-tier2-gate DIVE-2196 "$ident" \
+        "$ident has an OPEN tier-2 ${_og_type} gate awaiting a human — rejecting it would mark that gate '(superseded)' with provenance 'auto:reject', i.e. an agent clearing a human-only gate as a side effect of its own move (DIVE-1117 floor, DIVE-2196). The wait is on the human, not on you. ${_og_exit} A human answering it ('5dive task answer $ident --value=...') also clears the way."
+    fi
+    local _sup_ts; _sup_ts=$(date -u '+%Y-%m-%d %H:%M:%S')
+    db "UPDATE tasks SET need_answer='(superseded — task rejected, bounced to maker)',
+          need_answered_at=$(sqlq "$_sup_ts"), need_answered_by='auto:reject', gate_pinged_at=NULL
+        WHERE id=${id} AND need_answered_at IS NULL;"
+    # DIVE-2054: task-store state — fenced.
+    _task_store_audit_log "task reject gate-supersede" "ok" 0 -- "task=$ident" || true
+    # DIVE-2410: superseded is settled. This one is the worst stale button of the
+    # set — the gate now reads '(superseded ...)' with provenance auto:reject, so
+    # a human tapping it would believe they authorized something an agent already
+    # closed on their behalf.
+    _task_gate_card_apply "$ident" die "superseded by auto:reject" || true
+  fi
+  # max_iterations reached -> stop bouncing, park it on a human to decide.
+  # DIVE-2477 considered clearing done_at here too, by symmetry with the
+  # bounce-back below, and MEASURED that it would be wrong: this branch does not
+  # reopen the row, it files a gate — and on a row that was CLOSED, `task need`
+  # refuses (rc=5, "is done — a closed row takes no new gate; file a follow-up"), so the status
+  # stays 'done'. Clearing done_at would leave a done row with no close clock: a
+  # NEW contradiction, not a fix. That refusal also means a reject at
+  # max_iterations over a closed row cannot escalate at all (it writes the
+  # feedback, then fails) — a separate pre-existing defect, deliberately not
+  # ridden along here; graded as a documented control in
+  # tests/task_close_preserves_done_at_unit.sh (arm G).
+  if (( maxi > 0 && iter >= maxi && ! merge_conflict )); then
+    db "UPDATE tasks SET result=$(sqlq "$fb_txt") WHERE id=${id};"
+    _five_flush_write_notes
+    # DIVE-2777: THE SECOND WRITE SITE GETS THE EVENT TOO, and this branch is the
+    # one that most needs it — it is the terminal reject, the bounce that ends the
+    # loop and parks it on a human, and it `return`s before the emit below.
+    #
+    # Emitting only from the ordinary path would have rebuilt this row's own
+    # defect in the fix for it: DIVE-2483 routed three verbs through the shared
+    # guard and left `reject`'s fourth site hand-rolled, which is the entire reason
+    # this ticket exists. A trace that covers the routine bounce and goes silent on
+    # the escalation is the same shape — the population is EVERY reject, not every
+    # reject that happens to fall through.
+    _task_reject_emit_event "$ident" "$id" "$_rj_actor" "$_rj_prev" "$iter" "$maxi" \
+      "escalated to human review at the iteration cap (loop stuck, not bounced back)"
+    warn "$ident hit max_iterations ($maxi) — escalating to human review"
+    # DIVE-4176: this ask is written for a person — no ident, no branch, no
+    # interpolated verifier feedback (that text is already on the row's `result`,
+    # written six lines up, and the row is what the gate points at). The
+    # readability refusal in `task need` grades this string like any other, so a
+    # regression here would make `reject` itself fail at the iteration cap; the
+    # composer above is written to be unconditionally fileable for that reason and
+    # tests/escalation_ask_unit.sh grades the string it actually produces.
+    #
+    # DIVE-4476: `decision`, not `manual`. The type is not cosmetic — it is the
+    # ROUTE and it is the BUTTONS. `manual` is tier-2 by type, so it went straight
+    # to the paired human and rendered one "Tap ✅ Done" that answered neither half
+    # of its own question. `decision` defaults to tier 1, which routes to the
+    # filing verifier's lead (a two-strike stop is the orchestrator's call —
+    # DIVE-4346/4365) and renders the two options below as the two taps. The human
+    # is reached only when the chart resolves nobody above the verifier, which is
+    # the fallback, not the destination.
+    cmd_task_need "$id" --type=decision --from="${vfier:-verifier}" \
+      --options="$_ESCALATION_OPTIONS" --recommend="$_ESCALATION_RECOMMEND" \
+      --ask="$(_task_escalation_ask "$id" "$iter" "$fb_txt")"
+    return
+  fi
+  # Otherwise bounce back to the maker for another pass.
+  # DIVE-2477: clear done_at. `task reject` is the one verb that REOPENS a closed
+  # row (DIVE-2112 allows it for the recorded verifier withdrawing their own
+  # grade, and refuses everyone else), and it left the close timestamp in place —
+  # status='todo' on a row carrying a done_at, the same self-contradiction
+  # DIVE-2113 refuses `task start` for. Latent before; load-bearing now that the
+  # close verbs COALESCE, because a stale done_at would be PRESERVED as the real
+  # close time on the next pass instead of stamped fresh.
+  # DIVE-2624 (b): stamp the bounce. This is the ONLY event that makes the next
+  # delivery a genuine second pass rather than a re-delivery of this one, and until
+  # now it left no trace a later `task done` could read — which is why the iteration
+  # counter had to bump on every delivery and so counted restores as rework. It is a
+  # dedicated clock for the same reason handoff_delivered_at is one: updated_at moves
+  # on any row touch and cannot answer "was there a reject since the last delivery".
+  # DIVE-6753: a merge-conflict bounce raises the cap by the one iteration the
+  # re-delivery will add, so the counter moves and the headroom does not.
+  local _rj_cap_sql="" _rj_disp="bounced back to maker ${maker}"
+  if (( merge_conflict )); then
+    (( maxi > 0 )) && { _rj_cap_sql=", max_iterations=COALESCE(max_iterations,0)+1"; maxi=$((maxi + 1)); }
+    _rj_disp="bounced back to maker ${maker} for a merge conflict after a PASS (not counted toward the cap)"
+  fi
+  db "UPDATE tasks SET status='todo', assignee=$(sqlq "$maker"), started_at=NULL, handoff_ack_at=NULL,
+        handoff_rejected_at=datetime('now'),
+        done_at=NULL, result=$(sqlq "$fb_txt")${_rj_cap_sql} WHERE id=${id};"
+  # DIVE-2777: THE BOUNCE IS A LIFECYCLE EVENT. Until now `reject` emitted nothing
+  # — the distinct kinds in the table were gate.answered, gate.filed,
+  # policy.refused, ship, task.cancelled, task.created, task.delivered, task.done,
+  # task.review, task.started, and no `task.rejected` among them. So a reject's
+  # only trace was `handoff_rejected_at`, and :4426 NULLs that on the very next
+  # delivery because it is an iteration-increment signal, not a log. A row that
+  # goes rejected -> re-delivered -> closed therefore left NO machine-readable
+  # trace that a bounce ever happened, which is why the historical count of
+  # DIVE-2762-class destruction is a floor (3 known) rather than a number.
+  #
+  # It goes to lifecycle_events specifically because that table is APPEND-ONLY and
+  # nothing on the re-delivery path touches it — the same property that makes
+  # task.delivered's output_hash survive. A marker in `result` would not do: the
+  # next delivery overwrites the column and takes the marker with it, which is the
+  # design constraint olivia raised and then withdrew once main2 reproduced that
+  # the surviving store already ships. So: emit the event, do NOT invent a new
+  # durable column, and do NOT touch how handoff_rejected_at is spent.
+  #
+  # `out` carries the SUPERSEDED text, not the rejection line. output_hash is then
+  # sha256 of what was on the row when the bounce landed, which is exactly the
+  # value a later reader wants to compare against the task.delivered hash for the
+  # same ident: same hash -> this bounce is the one that displaced that delivery.
+  # The rejection text itself is on the row and needs no hash.
+  #
+  # This buys FORWARD countability only. It cannot backfill: an ordinary verifier
+  # close also replaces `result`, so a destructive reject and a legitimate close
+  # are indistinguishable by hash across the 278 existing task.delivered events
+  # (270 mismatch — essentially the whole population). The census starts here.
+  _task_reject_emit_event "$ident" "$id" "$_rj_actor" "$_rj_prev" "$iter" "$maxi" \
+    "$_rj_disp"
+  ok "$ident rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
+     '{id:($i|tonumber), ident:$id, status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
+     --arg i "$id" --arg id "$ident" --arg m "$maker" --arg n "$iter"
+  # DIVE-3499: the sender-visible receipt. A verifier who has just bounced a row
+  # cannot otherwise tell "the maker will pick this up" from "this vanished", and
+  # closes the gap by pinging them — which costs the maker a full reload of a PR
+  # they had closed out. Cannot fail; see src/lib/routing_receipt.sh.
+  # The `|| true` and the stderr drop are the additive-only contract AT THE CALL
+  # SITE, not belt-and-braces: a tree that sources a SUBSET of src/ — which is
+  # what most harnesses do — has no routing_receipt, and bash turns that into
+  # rc=127 on a verb that had already succeeded. Measured on
+  # tests/task_reject_trace_unit.sh before this line existed. The wrapper's own
+  # containment cannot cover the case where the wrapper is what is missing.
+  routing_receipt "$ident" "$maker" "now owns it (bounced back)" 2>/dev/null || true
+}
+
 # DIVE-1375: fail-loud preflight at `task start` (Bobby gripe #3). Surface the
 # identity/auth/repo gaps that otherwise get discovered mid-task — Marcus hit
 # the git dubious-ownership wall on DIVE-1356. Every check is best-effort and
@@ -2604,7 +3447,10 @@ _task_start_preflight() {
           # here; (b) an agent seat is not SUPPOSED to hold its own login — it pushes
           # through the delegated rail, which the check never asked about. Name the
           # rail that WILL carry the push, and warn only when there is genuinely none.
-          local _rail; _rail=$(gh_credential_rail)
+          # Which push rail is a devteam question (lib/gh_config.sh); without the
+          # plugin there is no delegated rail to name, so nothing is said.
+          local _rail=""
+          if declare -F gh_credential_rail >/dev/null 2>&1; then _rail=$(gh_credential_rail); fi
           case "$_rail" in
             none)
               _pf "origin is an HTTPS remote and NO push credential is reachable from this seat — not your own gh login, not the delegated claude rail, not the machine account. A push will prompt/fail; authenticate (gh auth login) or land it with '5dive push' from a seat that can." ;;

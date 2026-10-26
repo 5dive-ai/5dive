@@ -57,7 +57,7 @@ TMP="$(mktemp -d /tmp/push-md-quotes-unit.XXXXXX)"
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
          lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh \
-         cmd_project.sh cmd_push.sh; do
+         cmd_project.sh; do
   source "$SRC/$f"
 done
 
@@ -85,7 +85,7 @@ mk() { # mk <body> -> task id, body set verbatim (the HAND-EDITED path, which is
 BR=dive-2813-ui-once-cleanup-and-race
 PROSE=$'Branch: `'"$BR"$'` — head `fd81f7b`, PR #521, all 24 check-runs green.\n'
 
-echo "== A. cmd_push.sh's parser (_push_branch_from_body)"
+echo "== A. the push's parser (_push_branch_from_body, lib/broker.sh)"
 want "backticked prose line yields the BARE ref" \
      "[[ \"\$(_push_branch_from_body \"\$PROSE\")\" == \"\$BR\" ]]" \
      "got: $(_push_branch_from_body "$PROSE")"

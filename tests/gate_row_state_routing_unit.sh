@@ -50,7 +50,7 @@ cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-rowstate-unit.XXXXXX)"
 
-# lib/broker.sh + cmd_push.sh are sourced because `_push_branch_from_body` is the
+# lib/broker.sh is sourced because `_push_branch_from_body` is the
 # helper under test on the read side — the SAME function `5dive push` uses to
 # decide which branch this row is bound to. Re-implementing it here would grade a
 # stub, and the whole point of routing on row state is that the router and the
@@ -58,7 +58,7 @@ TMP="$(mktemp -d /tmp/gate-rowstate-unit.XXXXXX)"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh lib/broker.sh cmd_push.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh lib/broker.sh  cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

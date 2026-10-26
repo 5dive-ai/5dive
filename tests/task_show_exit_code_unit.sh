@@ -71,7 +71,7 @@ TMP="$(mktemp -d /tmp/taskshow-rc-unit.XXXXXX)"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh lib/broker.sh cmd_push.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh lib/broker.sh  cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -230,7 +230,9 @@ fi
 # On the pre-fix text this died `line 7385: _dd_residual: unbound variable` before
 # the sentinel; the assertion is the sentinel PLUS the refusal actually naming its
 # term, so a "fix" that silences the path without answering also fails here.
-if declare -F cmd_task_need >/dev/null && declare -F _push_branch_from_body >/dev/null; then
+# (DIVE-6938: _push_branch_from_body is the devteam plugin's now, and need.sh asks
+# `declare -F` before reading a Branch: line, so the path runs without it.)
+if declare -F cmd_task_need >/dev/null; then
   r3id=$(mk "probe row for the rule 3 appeal path")
   r3=$(ident_of "$r3id")
   # DIVE-4175 arm C: reaching Rule 3 needs a gate with `tier_floored == 1`, and the
@@ -251,7 +253,7 @@ if declare -F cmd_task_need >/dev/null && declare -F _push_branch_from_body >/de
     && ok_t "Rule 3 refusal renders and NAMES the surviving term" \
     || bad_t "Rule 3 refusal did not name its term (a silent fix passes the rc arm alone)" "$r3out"
 else
-  bad_t "Rule 3 arm not runnable" "cmd_task_need or _push_branch_from_body did not source"
+  bad_t "Rule 3 arm not runnable" "cmd_task_need did not source"
 fi
 
 # ================= fifth+sixth instance: cmd_project_show (found by main2) ==========

@@ -222,7 +222,7 @@ unset -f _reap_cgroup_in_ref_pre
 # ═══════════════════ B — the weekly pacing fence ═══════════════════
 echo "== B: the weekly window is fenced at its own drift rate =="
 # shellcheck source=/dev/null
-. src/task/grader_pool.sh
+. src/lib/pace.sh
 
 NOW=1789294364
 FUTURE=$(( NOW + 4*86400 ))        # the weekly window has not turned over
@@ -275,10 +275,10 @@ is "fence restored"                       "$(_pace_account_seven acct "$NOW")" "
 # DIVE-4777: the NUMBER is the finding, so it is pinned at its source. ~0.6 %/h
 # of weekly drift over 24h is ~14 points against _GRADER_FLOOR_7D=90; over 4h it
 # is ~2.4. A future widening has to argue past this arm.
-if grep -qE '^_GRADER_READING_WEEKLY_MAX_AGE="\$\{_GRADER_READING_WEEKLY_MAX_AGE:-\$\{QUOTA_SNAPSHOT_WEEKLY_MAX_AGE:-14400\}\}"$' src/task/grader_pool.sh; then
+if grep -qE '^_GRADER_READING_WEEKLY_MAX_AGE="\$\{_GRADER_READING_WEEKLY_MAX_AGE:-\$\{QUOTA_SNAPSHOT_WEEKLY_MAX_AGE:-14400\}\}"$' src/lib/pace.sh; then
   ok "the weekly fence default is 14400s (4h), not 86400s"
 else
-  bad "the weekly fence default is 14400s (4h), not 86400s" "src/task/grader_pool.sh does not read 14400"
+  bad "the weekly fence default is 14400s (4h), not 86400s" "src/lib/pace.sh does not read 14400"
 fi
 # The two fences must not be the same number, or B3 grades nothing.
 if (( _GRADER_READING_WEEKLY_MAX_AGE > _GRADER_READING_MAX_AGE )); then

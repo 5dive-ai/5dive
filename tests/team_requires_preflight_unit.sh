@@ -63,6 +63,9 @@ preflight() {
     step() { printf 'STEP %s\n' "$*"; }
     warn() { printf 'WARN %s\n' "$*" >&2; }
     _compose_self() { printf '%s' "${SELF_CLI:-$TMP/bin-$mode/nosuchcli}"; }
+    # DIVE-6938: a push credential counts only where the devteam plugin is (the push
+    # is its verb); these arms grade the credential, so the plugin is "there".
+    devteam_loaded() { return 0; }
     _compose_requires_preflight "$spec"
     printf 'RC=%s\n' "$?" )
 }
