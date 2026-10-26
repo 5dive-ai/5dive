@@ -40,6 +40,8 @@ SECRET_DROP_PROVISIONING="$TMP/provisioning.env"
 SECRET_DROP_CADDYFILE="$TMP/Caddyfile"
 SECRET_DROP_LOCK="$TMP/drop.lock"
 SECRET_WRITE_LOCK="$TMP/write.lock"
+# DIVE-6973: the Vault key, in TMP (made on the first save).
+SECRET_VAULT_KEY="$TMP/etc5dive/vault.key"
 # DIVE-5806: the kernel's listening-socket table, in TMP. Empty = nothing on the port.
 SECRET_DROP_PROC_NET="$TMP/procnet"; mkdir -p "$SECRET_DROP_PROC_NET"
 procnet_reset() {
@@ -227,6 +229,7 @@ cd "$REPO"
 for f in $LIBS; do source "src/\$f"; done
 STATE_DIR="$STATE_DIR"; TASKS_DIR="$TASKS_DIR"; TASKS_DB="$TASKS_DB"; CONNECTORS_DIR="$CONNECTORS_DIR"
 SECRET_DROP_DIR="$SECRET_DROP_DIR"; SECRET_DROP_LOCK="$SECRET_DROP_LOCK"; SECRET_WRITE_LOCK="$SECRET_WRITE_LOCK"
+SECRET_VAULT_KEY="$SECRET_VAULT_KEY"
 TOOLS_ENV_FILE="$TOOLS_ENV_FILE"; TOOLS_WRITE_LOCK="$TOOLS_WRITE_LOCK"; SECRET_PROJECTS_DIR="$SECRET_PROJECTS_DIR"
 PATH="$MOCKBIN:\$PATH"; export MOCK5DIVE_LOG="$MOCK5DIVE_LOG"
 require_root() { :; }
@@ -900,6 +903,8 @@ kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
 # rewritten only through the one-time link, listed by NAME, removed by name.
 SAVED="$CONNECTORS_DIR/saved.env"
 rm -f "$SAVED"
+# DIVE-6973: a saved line is v1:<ciphertext>; this reads it back with the box key.
+saved_val() { local l; l=$(sed -n "s/^${1}=//p" "$SAVED" | head -n 1); [[ -n "$l" ]] && _vault_dec "$l"; }
 out=$(mint --save=linkedin-password); rc=$?; tok=$(tok_of "$out"); h=$(hash_of "$tok")
 [[ $rc -eq 0 && -n "$tok" && "$(jq -r '.data.save' <<<"$out")" == linkedin-password ]] \
   && grep -qx 'task=' "$SECRET_DROP_DIR/$h" && grep -qx 'save=linkedin-password' "$SECRET_DROP_DIR/$h" \
@@ -924,7 +929,8 @@ code=$(curl -s -o "$TMP/s1.html" -w '%{http_code}' "$B6/$tok")
   || bad_t "L16c the save page" "code=$code $(sed -n 's#.*<main>\(.*\)</main>.*#\1#p' "$TMP/s1.html" | head -c 400)"
 V1='Pa55-word one'
 code=$(curl -s -o "$TMP/s2.html" -w '%{http_code}' --data-urlencode "value=$V1" "$B6/$tok")
-[[ "$code" == 200 && "$(grep -cxF "LINKEDIN_PASSWORD=$V1" "$SAVED")" == 1 && "$(stat -c %a "$SAVED")" == 600 ]] \
+[[ "$code" == 200 && "$(grep -c '^LINKEDIN_PASSWORD=v1:' "$SAVED")" == 1 && "$(saved_val LINKEDIN_PASSWORD)" == "$V1" && "$(stat -c %a "$SAVED")" == 600 ]] \
+  && ! grep -qF "$V1" "$SAVED" \
   && grep -q '<b>linkedin-password</b> is on your server now' "$TMP/s2.html" \
   && ! grep -qF "$V1" "$TMP/s2.html" && ! grep -qF "$V1" "$TMP/server6.log" \
   && ok_t "L16d POST saves it once in saved.env (600), and the value is in neither the page nor the log" \
@@ -938,7 +944,7 @@ o1=$(mint --save=linkedin-password); t1=$(tok_of "$o1")
 o2=$(mint --save=linkedin-password); t2=$(tok_of "$o2")
 V2='new-Pa55'
 code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode "value=$V2" "$B6/$t2")
-[[ "$code" == 200 && "$(grep -c '^LINKEDIN_PASSWORD=' "$SAVED")" == 1 ]] && grep -qxF "LINKEDIN_PASSWORD=$V2" "$SAVED" \
+[[ "$code" == 200 && "$(grep -c '^LINKEDIN_PASSWORD=' "$SAVED")" == 1 && "$(saved_val LINKEDIN_PASSWORD)" == "$V2" ]] \
   && ! grep -qF "$V1" "$SAVED" && [[ ! -f "$SECRET_DROP_DIR/$(hash_of "$t1")" ]] \
   && [[ "$(cat "$CONNECTORS_DIR/saved.hosts")" == 'GITHUB_TOKEN=github.com' ]] \
   && ok_t "L16f rewrite: a new link for the name replaces the value (one line), burns the name's other link, and frees it from its old site" \
@@ -962,11 +968,139 @@ ls_out=$( (JSON_MODE=1; _secret_saved ls) 2>&1 )
 rm_out=$( (JSON_MODE=1; _secret_saved rm linkedin-password) 2>&1 ); rc=$?
 rm2=$( (_secret_saved rm linkedin-password) 2>&1 ); rc2=$?
 [[ $rc -eq 0 && $rc2 -ne 0 && "$(jq -c '.data.names' <<<"$( (JSON_MODE=1; _secret_saved ls) 2>&1 )")" == '["github-token"]' ]] \
-  && grep -qx 'GITHUB_TOKEN=ghp-fixture-6844' "$SAVED" \
+  && [[ "$(saved_val GITHUB_TOKEN)" == ghp-fixture-6844 ]] \
   && printf 'GITHUB_TOKEN=github.com\n' > "$CONNECTORS_DIR/saved.hosts" && ( _secret_saved rm github-token ) >/dev/null 2>&1 \
   && [[ ! -s "$CONNECTORS_DIR/saved.hosts" ]] \
   && ok_t "L16j saved rm <name> forgets that one (and its site) and keeps the rest; a second rm says nothing is saved" \
   || bad_t "L16j remove" "rc=$rc out=$rm_out rc2=$rc2 out2=$rm2 env=$(cat "$SAVED")"
+
+# --- L17: DIVE-6973 — Vault v2: encrypted at rest, a login pair, last use ------
+# lodar 2026-10-26: "can vault be encoded?", "login password pair?", "warn to
+# create new account for agents". Every arm that says "never" makes the value
+# reachable first (it is in the store, it was just typed), then counts 0.
+VK="$SECRET_VAULT_KEY"; USAGE="$CONNECTORS_DIR/saved.usage"; HOSTS="$CONNECTORS_DIR/saved.hosts"
+rm -f "$SAVED" "$USAGE" "$HOSTS"
+grep -q 'Best to make a separate account for your agents. On your own account, they can do anything you can.' "$TMP/s1.html" \
+  && ok_t "L17a the one-value save page carries the separate-account tip above the field" \
+  || bad_t "L17a separate-account tip on the plain save page" "$(head -c 300 "$TMP/s1.html")"
+[[ -f "$VK" && "$(stat -c %a "$VK")" == 400 && "$(tr -d '\n' < "$VK" | wc -c)" == 64 ]] \
+  && ok_t "L17b the first save made the box key: 400, 32 random bytes as hex" \
+  || bad_t "L17b vault.key" "$(ls -la "$VK" 2>&1)"
+# An old (DIVE-6844) one-value item for the same name, bound to a site, so the
+# pair can be seen to replace it and free the site.
+printf 'old-one-value' | ( _secret_write GITHUB --connector=saved ) >/dev/null 2>&1
+printf 'GITHUB=github.com\nOTHER=example.org\n' > "$HOSTS"
+PL='owner@example.com'; PP='Pa55 w0rd with spaces '; PS='jbsw y3dp ehpk 3pxp'; SEED=JBSWY3DPEHPK3PXP
+o=$(mint --save=github --pair); tp=$(tok_of "$o"); hp=$(hash_of "$tp")
+[[ "$(jq -r '.data.pair' <<<"$o")" == true ]] && grep -qx 'pair=1' "$SECRET_DROP_DIR/$hp" \
+  && ! mint --pair >/dev/null 2>&1 && ! mint DIVE-11 --pair >/dev/null 2>&1 \
+  && ok_t "L17c secret link --save=<name> --pair mints a pair link; --pair without --save is refused" \
+  || bad_t "L17c pair link" "$o"
+PORT7=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+python3 "$TMP/server.py" 127.0.0.1 "$PORT7" "$WRAP" "$SECRET_DROP_DIR" 0 2> "$TMP/server7.log" & SRV_PID=$!
+for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT7/healthz" >/dev/null 2>&1 && break; sleep 0.1; done
+B7="http://127.0.0.1:$PORT7"
+code=$(curl -s -o "$TMP/p1.html" -w '%{http_code}' "$B7/$tp")
+[[ "$code" == 200 ]] && grep -q '>Login</label>' "$TMP/p1.html" && grep -q '>Password</label>' "$TMP/p1.html" \
+  && grep -q '>2FA setup key (optional)</label>' "$TMP/p1.html" \
+  && grep -q 'Best to make a separate account for your agents. On your own account, they can do anything you can.' "$TMP/p1.html" \
+  && grep -q 'With this, your agents can sign in without you. Use it on an account made for them.' "$TMP/p1.html" \
+  && grep -q '<textarea id=f-password name=password class=secret' "$TMP/p1.html" && ! grep -q 'type=password' "$TMP/p1.html" \
+  && ok_t "L17d the pair page asks Login, Password, '2FA setup key (optional)', with both warning lines; the password is masked, never type=password" \
+  || bad_t "L17d pair page" "code=$code $(sed -n 's#.*<main>\(.*\)</main>.*#\1#p' "$TMP/p1.html" | head -c 600)"
+code=$(curl -s -o "$TMP/p2.html" -w '%{http_code}' --data-urlencode "login=$PL" --data-urlencode $'password=two\nlines' --data-urlencode "totp=" "$B7/$tp")
+code2=$(curl -s -o "$TMP/p3.html" -w '%{http_code}' --data-urlencode "login=$PL" --data-urlencode "password=$PP" --data-urlencode "totp=not-a-key!" "$B7/$tp")
+[[ "$code" == 400 && "$code2" == 400 && -f "$SECRET_DROP_DIR/$hp" ]] && grep -q 'letters A-Z and digits 2-7' "$TMP/p3.html" \
+  && [[ "$(saved_val GITHUB)" == old-one-value ]] && ! grep -q '^GITHUB__' "$SAVED" \
+  && ok_t "L17e a two-line password or a bad 2FA key is refused whole (nothing written), with the rule, and the link still works" \
+  || bad_t "L17e pair refusal" "code=$code code2=$code2 env=$(cat "$SAVED")"
+code=$(curl -s -o "$TMP/p4.html" -w '%{http_code}' --data-urlencode "login=$PL" --data-urlencode "password=$PP" --data-urlencode "totp=$PS" "$B7/$tp")
+[[ "$code" == 200 && ! -f "$SECRET_DROP_DIR/$hp" ]] && grep -q 'sign in with it' "$TMP/p4.html" \
+  && [[ "$(saved_val GITHUB__LOGIN)" == "$PL" && "$(saved_val GITHUB__PASSWORD)" == "$PP" && "$(saved_val GITHUB__2FA)" == "$SEED" ]] \
+  && ! grep -q '^GITHUB=' "$SAVED" && [[ "$(cat "$HOSTS")" == 'OTHER=example.org' ]] \
+  && ok_t "L17f a pair POST writes login, password and the 2FA seed as one item, drops the old one-value line and frees the site" \
+  || bad_t "L17f pair save" "code=$code env=$(cat "$SAVED") hosts=$(cat "$HOSTS")"
+bad=""
+for v in "$PL" "$PP" "$SEED" 'Pa55' 'owner@' old-one-value; do grep -qF -- "$v" "$SAVED" && bad+="[$v] "; done
+[[ -z "$bad" ]] && [[ "$(grep -cE '^[A-Z][A-Z0-9_]*=' "$SAVED")" == "$(grep -cE '^[A-Z][A-Z0-9_]*=v1:' "$SAVED")" ]] \
+  && ! grep -qF -- "$PP" "$TMP/p4.html" && ! grep -qF -- "$PP" "$TMP/server7.log" \
+  && ok_t "L17g NEGATIVE CONTROL: saved.env holds no value in the clear after a save (every line v1:), and the page and log never echo it" \
+  || bad_t "L17g plaintext in saved.env" "found: $bad file=$(cat "$SAVED")"
+kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
+
+# Migration: a DIVE-6844 box's plain line is encrypted by the first saved verb
+# run as root, and still reveals by its bare name.
+printf 'OLD_ITEM=plain-old-1\n' >> "$SAVED"
+printf 'GITHUB=github.com\n' > "$HOSTS"
+ls_out=$( (JSON_MODE=1; _secret_saved ls) 2>&1 )
+[[ "$(saved_val OLD_ITEM)" == plain-old-1 ]] && ! grep -qF plain-old-1 "$SAVED" && grep -q '^OLD_ITEM=v1:' "$SAVED" \
+  && ok_t "L17h migration: a plain saved line is encrypted in place by the first saved verb, and nothing plain is left" \
+  || bad_t "L17h migration" "$(cat "$SAVED")"
+want='{"names":["github","old-item"],"items":[{"name":"github","fields":["login","password","2fa"],"login":"owner@example.com","host":"github.com","lastUsedAt":null,"lastUsedBy":null},{"name":"old-item","fields":["value"],"login":null,"host":null,"lastUsedAt":null,"lastUsedBy":null}]}'
+[[ "$(jq -c '.data' <<<"$ls_out")" == "$want" ]] \
+  && ok_t "L17i saved ls --json: names kept, items carry fields, the login, the site and last use (none yet)" \
+  || bad_t "L17i ls shape" "$ls_out"
+r=$( (JSON_MODE=0; _secret_reveal --agent=kostya --host=github.com github.login github.password github.2fa old-item) 2>"$TMP/rv.err" ); rc=$?
+[[ $rc -eq 0 && "$(jq -r '."github.login"' <<<"$r")" == "$PL" && "$(jq -r '."github.password"' <<<"$r")" == "$PP" \
+   && "$(jq -r '."github.2fa"' <<<"$r")" == "$SEED" && "$(jq -r '."old-item"' <<<"$r")" == plain-old-1 && "$(jq -r 'keys|length' <<<"$r")" == 4 ]] \
+  && ok_t "L17j _reveal answers each ref with its plaintext; an old one-value item still answers by its bare name" \
+  || bad_t "L17j reveal" "rc=$rc err=$(cat "$TMP/rv.err")"
+[[ "$(wc -l < "$USAGE")" == 2 && "$(stat -c %a "$USAGE")" == 600 ]] \
+  && grep -qE '^github github\.com kostya [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$USAGE" \
+  && grep -qE '^old-item github\.com kostya ' "$USAGE" \
+  && ok_t "L17k _reveal writes ONE usage line per item (<name> <host> <agent> <utc>), 600" \
+  || bad_t "L17k usage" "$(cat "$USAGE" 2>&1)"
+before=$(wc -l < "$USAGE")
+r=$( (JSON_MODE=1; _secret_reveal --agent=kostya --host=github.com github.password nope.password) 2>"$TMP/rv2.err" ); rc=$?
+[[ $rc -eq 4 && -z "$r" && "$(wc -l < "$USAGE")" == "$before" ]] && grep -q 'nope.password' "$TMP/rv2.err" \
+  && ! grep -qF -- "$PP" "$TMP/rv2.err" \
+  && ok_t "L17l NEGATIVE CONTROL: a missing ref -> exit 4 naming it, NOTHING on stdout (even --json) and no usage line" \
+  || bad_t "L17l missing ref" "rc=$rc out=[$r] usage=$(wc -l < "$USAGE") err=$(cat "$TMP/rv2.err")"
+ls_out=$( (JSON_MODE=1; _secret_saved ls) 2>&1 ); ls_h=$( (JSON_MODE=0; _secret_saved ls) 2>&1 )
+bad=""
+for v in "$PP" "$SEED" plain-old-1 'Pa55'; do
+  grep -qF -- "$v" <<<"$ls_out$ls_h" && bad+="[ls:$v] "
+  grep -qF -- "$v" "$USAGE" && bad+="[usage:$v] "
+done
+[[ -z "$bad" && "$(jq -r '.data.items[0].lastUsedBy' <<<"$ls_out")" == kostya && "$(jq -r '.data.items[0].lastUsedAt' <<<"$ls_out")" =~ Z$ ]] \
+  && grep -qx 'github (owner@example.com), used by kostya just now' <<<"$ls_h" \
+  && ok_t "L17m NEGATIVE CONTROL: ls (json and human) and the usage file never hold a password, 2FA key or value; ls shows 'used by kostya just now'" \
+  || bad_t "L17m no value in ls/usage" "bad=$bad ls=$ls_out human=$ls_h"
+# A store copied to a box with another key: names stay, values are refused, never garbage.
+cp -p "$VK" "$TMP/vk.bak"; chmod 600 "$VK"; openssl rand -hex 32 > "$VK"
+r=$( (_secret_reveal --agent=kostya --host=github.com github.password) 2>"$TMP/rv3.err" ); rc=$?
+[[ $rc -eq 5 && -z "$r" ]] && grep -q 'save it again' "$TMP/rv3.err" \
+  && ok_t "L17n under another box's key a value is refused ('save it again'), nothing on stdout" \
+  || bad_t "L17n wrong key" "rc=$rc out=[$r] err=$(cat "$TMP/rv3.err")"
+cp -p "$TMP/vk.bak" "$VK"
+# `secret write` at the terminal: one field of a pair, the 2FA key normalised; a
+# one-value write drops the pair.
+printf 'otpauth://totp/x?secret=NBSWY3DPEB3W64TMMQ&issuer=x' | ( _secret_write GITHUB__2FA --connector=saved ) >/dev/null 2>&1; rc=$?
+printf 'junk!' | ( _secret_write GITHUB__2FA --connector=saved ) >/dev/null 2>&1; rc2=$?
+[[ $rc -eq 0 && $rc2 -ne 0 && "$(saved_val GITHUB__2FA)" == NBSWY3DPEB3W64TMMQ && "$(saved_val GITHUB__PASSWORD)" == "$PP" ]] \
+  && ok_t "L17o secret write <KEY>__2FA takes an otpauth link or a spaced key down to its seed, keeps the pair's other fields, refuses junk" \
+  || bad_t "L17o write a field" "rc=$rc rc2=$rc2"
+printf 'GITHUB=github.com\n' > "$HOSTS"
+out=$( (JSON_MODE=1; _secret_saved rm github) 2>&1 ); rc=$?
+[[ $rc -eq 0 ]] && ! grep -q '^GITHUB' "$SAVED" && [[ ! -s "$HOSTS" ]] && ! grep -q '^github ' "$USAGE" && grep -q '^old-item ' "$USAGE" \
+  && ok_t "L17p saved rm <pair> removes every field, its site and its usage lines, and keeps the rest" \
+  || bad_t "L17p rm pair" "rc=$rc env=$(cat "$SAVED") usage=$(cat "$USAGE")"
+# Key exclusion: the export stage's tripwire refuses the Vault's files by name.
+EXP="$TMP/export-stage"; bad=""
+for nm in vault.key saved.env saved.hosts saved.usage; do
+  rm -rf "$EXP"; mkdir -p "$EXP/etc"; printf 'x\n' > "$EXP/etc/$nm"
+  ( source src/cmd_pack.sh >/dev/null 2>&1; _pack_secret_tripwire "$EXP" ) >/dev/null 2>&1 && bad+="[$nm] "
+done
+rm -rf "$EXP"; mkdir -p "$EXP"; printf 'x\n' > "$EXP/notes-about-vault.md"
+( source src/cmd_pack.sh >/dev/null 2>&1; _pack_secret_tripwire "$EXP" ) >/dev/null 2>&1 || bad+="[false-positive] "
+[[ -z "$bad" ]] \
+  && ok_t "L17q NEGATIVE CONTROL: agent export's tripwire refuses a stage holding vault.key or a saved.* file (and passes a note that names the Vault)" \
+  || bad_t "L17q key exclusion" "let through: $bad"
+# No path in the CLI copies /etc/5dive: a tar/cp/rsync naming it, or the key, is new.
+hits=$(grep -rnE '(\btar\b|\brsync\b|\bcp\b|\bscp\b)[^#]*(/etc/5dive([/" ]|$)|vault\.key|saved\.env)' src scripts install.sh 2>/dev/null || true)
+[[ -z "$hits" ]] \
+  && ok_t "L17r no tar, cp, rsync or scp in the CLI names /etc/5dive, vault.key or saved.env" \
+  || bad_t "L17r a copy path names the Vault" "$hits"
 
 echo
 echo "secret-drop-link unit: $PASS passed, $FAIL failed"
