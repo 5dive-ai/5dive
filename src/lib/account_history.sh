@@ -169,22 +169,39 @@ account_binding_record() {
 # the same statusline cache ten times inserts one row, because a sample is keyed
 # by when the PROVIDER measured, never by when we looked.
 account_usage_sample_record() {
-  local acct="${1:-}" as_of="${2:-}" fp="${3:-}" fr="${4:-}" sp="${5:-}" sr="${6:-}" src="${7:-}" db
-  [[ -n "$acct" && -n "$src" && "$src" != "null" ]] || return 0
-  [[ "$as_of" =~ ^[0-9]+$ ]] || return 0
+  account_usage_sample_stmt "$@" || return 0
+  account_usage_samples_write "$ACCOUNT_USAGE_SAMPLE_SQL"
+}
+
+# account_usage_sample_stmt <same args> — the INSERT account_usage_sample_record
+# runs, left in ACCOUNT_USAGE_SAMPLE_SQL; rc 1 when there is nothing to store.
+# Split out (DIVE-6985) so `account usage` writes every account's sample in one
+# sqlite call instead of two per account.
+ACCOUNT_USAGE_SAMPLE_SQL=""
+account_usage_sample_stmt() {
+  local acct="${1:-}" as_of="${2:-}" fp="${3:-}" fr="${4:-}" sp="${5:-}" sr="${6:-}" src="${7:-}"
+  ACCOUNT_USAGE_SAMPLE_SQL=""
+  [[ -n "$acct" && -n "$src" && "$src" != "null" ]] || return 1
+  [[ "$as_of" =~ ^[0-9]+$ ]] || return 1
   [[ "$fp" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || fp=""
   [[ "$sp" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || sp=""
   # Nothing measured is nothing to store.
-  [[ -n "$fp" || -n "$sp" ]] || return 0
-  _account_history_writable || return 0
-  _account_history_ensure  || return 0
-  db=$(account_history_db)
-  sqlite3 -cmd ".timeout 5000" "$db" \
-    "INSERT OR IGNORE INTO account_usage_samples
+  [[ -n "$fp" || -n "$sp" ]] || return 1
+  ACCOUNT_USAGE_SAMPLE_SQL="INSERT OR IGNORE INTO account_usage_samples
        (account,as_of,five_pct,five_reset,seven_pct,seven_reset,source_agent)
        VALUES ($(sqlq "$acct"), $as_of, ${fp:-NULL}, $(sqlq_or_null "$fr"),
-               ${sp:-NULL}, $(sqlq_or_null "$sr"), $(sqlq "$src"));" \
-    >/dev/null 2>&1 || true
+               ${sp:-NULL}, $(sqlq_or_null "$sr"), $(sqlq "$src"));"
+  return 0
+}
+
+# account_usage_samples_write <stmt>... — run account_usage_sample_stmt's
+# INSERTs in one sqlite call. Best-effort, like every history write.
+account_usage_samples_write() {
+  (( $# )) || return 0
+  _account_history_writable || return 0
+  _account_history_ensure  || return 0
+  local db; db=$(account_history_db)
+  printf '%s\n' "$@" | sqlite3 -cmd ".timeout 5000" "$db" >/dev/null 2>&1 || true
   return 0
 }
 

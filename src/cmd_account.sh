@@ -39,6 +39,12 @@ account_types_authed() {
 
 # account_types_authed_arr <name> — same detection, result left in the global
 # array ACCOUNT_TYPES_AUTHED (reset on every call). Spawns nothing.
+#
+# DIVE-6985: it did spawn — a `$( )` fork per type (nine) and a grep per env var
+# (up to fourteen), ~23 per account, which made it most of `account list`'s
+# 1.5s on poke-two. A profile keeps every per-type credential under
+# <profile>/<type>/, so a type with no such dir is skipped before the fork, and
+# combined.env is read once into the key sets below.
 ACCOUNT_TYPES_AUTHED=()
 account_types_authed_arr() {
   local name="$1" type path
@@ -49,6 +55,7 @@ account_types_authed_arr() {
   # ~150ms each, ~7.5s for `account list` on five accounts — /account in Telegram.
   lazy_need profile_type_auth_path
   for type in "${!TYPE_BIN[@]}"; do
+    [[ -d "${AUTH_PROFILES_DIR}/${name}/${type}" ]] || continue
     path=$(profile_type_auth_path "$name" "$type" 2>/dev/null) || continue
     [[ -n "$path" && -s "$path" ]] || continue
     out+=("$type"); seen+="$type "
@@ -57,13 +64,23 @@ account_types_authed_arr() {
   # — combined.env carries them without a per-type credential file.
   local env_file="${AUTH_PROFILES_DIR}/${name}/combined.env"
   if [[ -s "$env_file" ]]; then
+    # " KEY " sets, matching the greps they replace: `^KEY=` for env_keys,
+    # `^KEY=.+` (a value) for env_vals.
+    local env_keys=" " env_vals=" " line
+    if [[ -r "$env_file" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "${line%%=*}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$line" == *=* ]] || continue
+        env_keys+="${line%%=*} "
+        if [[ -n "${line#*=}" ]]; then env_vals+="${line%%=*} "; fi
+      done <"$env_file"
+    fi
     for type in "${!TYPE_API_VAR[@]}"; do
       # Present by construction (iterating this map's own keys), but the
       # absent-vs-zero contract in header.sh is deliberately exemption-free:
       # a rule with no carve-outs is one a contributor can follow. DIVE-2076.
       local var="${TYPE_API_VAR[$type]:-}"
-      if grep -q "^${var}=" "$env_file" 2>/dev/null \
-         || ([[ "$type" == "claude" ]] && grep -q "^CLAUDE_CODE_OAUTH_TOKEN=" "$env_file" 2>/dev/null); then
+      if [[ -n "$var" && "$env_keys" == *" ${var} "* ]] \
+         || { [[ "$type" == "claude" ]] && [[ "$env_keys" == *" CLAUDE_CODE_OAUTH_TOKEN "* ]]; }; then
         # Dedup: skip if already added via per-type sentinel above.
         if [[ "$seen" != *" $type "* ]]; then
           out+=("$type"); seen+="$type "
@@ -78,7 +95,7 @@ account_types_authed_arr() {
     # can never light up. DIVE-1821.
     local pv
     for pv in "${PI_PROVIDER_VAR[@]}"; do
-      if grep -qE "^${pv}=.+" "$env_file" 2>/dev/null; then
+      if [[ "$env_vals" == *" ${pv} "* ]]; then
         if [[ "$seen" != *" pi "* ]]; then
           out+=("pi"); seen+="pi "
         fi
@@ -108,13 +125,53 @@ account_types_authed_arr() {
 # a provider id via PI_PROVIDER_VAR (DIVE-1821). Everything else just gets a
 # signedInAt mtime so the tile can at least show *when* the user signed in.
 account_signin_detail() {
+  account_signin_detail_v "$@"
+  printf '%s\n' "$ACCOUNT_SIGNIN_DETAIL"
+}
+
+# _acct_json_str <s> — the JSON string literal `jq -cn --arg s "$s" '$s'` prints,
+# left in ACCT_JSON_STR. Printable ASCII is escaped here; anything else goes to
+# jq, so the output matches it byte for byte.
+ACCT_JSON_STR=""
+_acct_json_str() {
+  local LC_ALL=C s="$1"
+  if [[ "$s" == *[!\ -~]* ]]; then
+    ACCT_JSON_STR=$(jq -cn --arg s "$s" '$s')
+    return 0
+  fi
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}
+  ACCT_JSON_STR="\"$s\""
+}
+
+# _acct_env_load <file> — every KEY=value line of an env file into ACCT_ENV, the
+# last one winning: what `grep -E '^KEY=' | tail -1 | cut -d= -f2-` returned per
+# key, read with one pass and no spawn. An unreadable file loads nothing, as the
+# grep found nothing.
+declare -gA ACCT_ENV=()
+_acct_env_load() {
+  local line key
+  ACCT_ENV=()
+  [[ -r "$1" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    key="${line%%=*}"
+    [[ "$line" == *=* && "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    ACCT_ENV[$key]="${line#*=}"
+  done <"$1"
+}
+
+# account_signin_detail_v <name> <type> — account_signin_detail's object, left in
+# ACCOUNT_SIGNIN_DETAIL, so `account list` gets it without a `$( )` fork per
+# (account, type) (DIVE-6985).
+ACCOUNT_SIGNIN_DETAIL=""
+account_signin_detail_v() {
   local name="$1" type="$2"
+  ACCOUNT_SIGNIN_DETAIL='{}'
   local profile_dir="${AUTH_PROFILES_DIR}/${name}"
   local auth_path provider=null model=null signed_at=null credentials='[]'
   case "$type" in
     hermes)
       auth_path="${profile_dir}/hermes/auth.json"
-      [[ -s "$auth_path" ]] || { echo "{}"; return; }
+      [[ -s "$auth_path" ]] || return 0
       signed_at=$(jq -c '.updated_at // null' "$auth_path" 2>/dev/null) || signed_at=null
       # Every key in credential_pool is a separately-usable sign-in within
       # this profile. The dashboard renders one row per credential in the
@@ -136,12 +193,12 @@ account_signin_detail() {
             sub(/^["'\'']/, ""); sub(/["'\'']$/, "")
             print; exit
           }
-        ' "$cfg" 2>/dev/null)
-        [[ -n "$provider_line" ]] && provider=$(jq -cn --arg p "$provider_line" '$p')
+        ' "$cfg" 2>/dev/null) || provider_line=""
+        [[ -n "$provider_line" ]] && { _acct_json_str "$provider_line"; provider=$ACCT_JSON_STR; }
         local default_line
         default_line=$(grep -E '^[[:space:]]*default:' "$cfg" 2>/dev/null | head -1 \
           | sed -E 's/^[[:space:]]*default:[[:space:]]*//; s/^["'\'']//; s/["'\'']$//') || default_line=""
-        [[ -n "$default_line" ]] && model=$(jq -cn --arg m "$default_line" '$m')
+        [[ -n "$default_line" ]] && { _acct_json_str "$default_line"; model=$ACCT_JSON_STR; }
       fi
       # Fall back to the first credential-pool key only if config.yaml
       # didn't yield a provider (cold profile or pre-config-write state).
@@ -163,7 +220,7 @@ account_signin_detail() {
       local oc_root="${profile_dir}/openclaw/.openclaw"
       local oc_cfg="${oc_root}/openclaw.json"
       auth_path="${oc_root}/agents/main/agent/openclaw-agent.sqlite"
-      [[ -s "$auth_path" || -s "$oc_cfg" ]] || { echo "{}"; return; }
+      [[ -s "$auth_path" || -s "$oc_cfg" ]] || return 0
       if [[ -s "$oc_cfg" ]]; then
         provider=$(jq -c '
           (.auth.profiles // {}) | [.[]?.provider?] | map(select(.!=null)) | first // null
@@ -174,8 +231,8 @@ account_signin_detail() {
       fi
       local mtime mtime_src="$auth_path"
       [[ -s "$mtime_src" ]] || mtime_src="$oc_cfg"
-      mtime=$(date -u -r "$mtime_src" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
-      [[ -n "$mtime" ]] && signed_at=$(jq -cn --arg s "$mtime" '$s')
+      mtime=$(date -u -r "$mtime_src" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || mtime=""
+      [[ -n "$mtime" ]] && { _acct_json_str "$mtime"; signed_at=$ACCT_JSON_STR; }
       ;;
     claude)
       # BYO-claude points the runtime at a custom Anthropic-compatible
@@ -187,35 +244,35 @@ account_signin_detail() {
       # The '*)' path can't serve claude: BYO never writes the
       # .credentials.json sentinel it keys on, so it would bail with "{}".
       local env_file="${profile_dir}/combined.env"
-      [[ -s "$env_file" ]] || { echo "{}"; return; }
-      local base_url
-      base_url=$(grep -E '^ANTHROPIC_BASE_URL=' "$env_file" 2>/dev/null \
-        | tail -1 | cut -d= -f2-) || base_url=""
+      [[ -s "$env_file" ]] || return 0
+      _acct_env_load "$env_file"
+      local base_url="${ACCT_ENV[ANTHROPIC_BASE_URL]:-}"
       base_url="${base_url%\"}"; base_url="${base_url#\"}"
       if [[ -n "$base_url" ]]; then
         local cand
         for cand in "${!CLAUDE_PROVIDER_BASEURL[@]}"; do
           if [[ "${CLAUDE_PROVIDER_BASEURL[$cand]}" == "$base_url" ]]; then
-            provider=$(jq -cn --arg p "$cand" '$p'); break
+            { _acct_json_str "$cand"; provider=$ACCT_JSON_STR; }; break
           fi
         done
         # DIVE-5174: the model the account maps its sonnet tier to (a --model
         # override, else the catalog default) — what an agent on it runs. The
         # partner API shows it next to a client's OpenRouter key. A slug, never
         # a secret. A plain subscription has no map, so model stays null.
-        local mapped
-        mapped=$(grep -E '^ANTHROPIC_DEFAULT_SONNET_MODEL=' "$env_file" 2>/dev/null \
-          | tail -1 | cut -d= -f2-) || mapped=""
+        local mapped="${ACCT_ENV[ANTHROPIC_DEFAULT_SONNET_MODEL]:-}"
         mapped="${mapped%\"}"; mapped="${mapped#\"}"
-        [[ -z "$mapped" ]] || model=$(jq -cn --arg m "$mapped" '$m')
+        [[ -z "$mapped" ]] || { _acct_json_str "$mapped"; model=$ACCT_JSON_STR; }
       fi
       # signedInAt: prefer the credential sentinel mtime when present, else
       # fall back to combined.env's (BYO has no .credentials.json).
-      auth_path=$(profile_type_auth_path "$name" "$type" 2>/dev/null) || true
+      # Every per-profile credential lives under <profile>/<type>/: no dir, no
+      # sentinel, so the fork that would only confirm that is skipped.
+      auth_path=""
+      [[ -d "${profile_dir}/${type}" ]] && { auth_path=$(profile_type_auth_path "$name" "$type" 2>/dev/null) || true; }
       [[ -n "$auth_path" && -s "$auth_path" ]] || auth_path="$env_file"
       local mtime
-      mtime=$(date -u -r "$auth_path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
-      [[ -n "$mtime" ]] && signed_at=$(jq -cn --arg s "$mtime" '$s')
+      mtime=$(date -u -r "$auth_path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || mtime=""
+      [[ -n "$mtime" ]] && { _acct_json_str "$mtime"; signed_at=$ACCT_JSON_STR; }
       ;;
     pi)
       # pi is API-key multi-provider with NO active-provider marker of its own
@@ -229,7 +286,7 @@ account_signin_detail() {
       local search_files=() sf
       [[ -s "$env_file" ]] && search_files+=("$env_file")
       [[ -s "$connector_file" ]] && search_files+=("$connector_file")
-      (( ${#search_files[@]} )) || { echo "{}"; return; }
+      (( ${#search_files[@]} )) || return 0
       # Ties (a single file carrying more than one pi *_API_KEY): prefer the
       # provider the agent actually pinned in ~/.pi/agent/settings.json when this
       # name resolves to a live agent (the welcome-DM path calls us with an agent
@@ -247,9 +304,10 @@ account_signin_detail() {
       local found="" chosen_file=""
       for sf in "${search_files[@]}"; do
         local pv var val
+        _acct_env_load "$sf"
         while IFS= read -r pv; do
           var="${PI_PROVIDER_VAR[$pv]}"
-          val=$(grep -E "^${var}=" "$sf" 2>/dev/null | tail -1 | cut -d= -f2-) || val=""
+          val="${ACCT_ENV[$var]:-}"
           val="${val%\"}"; val="${val#\"}"
           [[ -n "$val" ]] || continue
           if [[ -n "$pinned" && "$pv" == "$pinned" ]]; then found="$pv"; break; fi
@@ -257,30 +315,40 @@ account_signin_detail() {
         done < <(printf '%s\n' "${!PI_PROVIDER_VAR[@]}" | sort)
         [[ -n "$found" ]] && { chosen_file="$sf"; break; }
       done
-      [[ -n "$found" ]] || { echo "{}"; return; }
-      provider=$(jq -cn --arg p "$found" '$p')
+      [[ -n "$found" ]] || return 0
+      { _acct_json_str "$found"; provider=$ACCT_JSON_STR; }
       # model: the pinned defaultModel, but only when this name is a live agent
       # (settings.json is agent-scoped, not profile-scoped).
       if [[ -s "$settings" ]]; then
         local pinned_model
         pinned_model=$(jq -r '.defaultModel // empty' "$settings" 2>/dev/null || true)
-        [[ -n "$pinned_model" ]] && model=$(jq -cn --arg m "$pinned_model" '$m')
+        [[ -n "$pinned_model" ]] && { _acct_json_str "$pinned_model"; model=$ACCT_JSON_STR; }
       fi
       local mtime
-      mtime=$(date -u -r "$chosen_file" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
-      [[ -n "$mtime" ]] && signed_at=$(jq -cn --arg s "$mtime" '$s')
+      mtime=$(date -u -r "$chosen_file" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || mtime=""
+      [[ -n "$mtime" ]] && { _acct_json_str "$mtime"; signed_at=$ACCT_JSON_STR; }
       ;;
     *)
+      [[ -d "${profile_dir}/${type}" ]] || return 0
       auth_path=$(profile_type_auth_path "$name" "$type" 2>/dev/null) || true
-      [[ -n "$auth_path" && -s "$auth_path" ]] || { echo "{}"; return; }
+      [[ -n "$auth_path" && -s "$auth_path" ]] || return 0
       local mtime
-      mtime=$(date -u -r "$auth_path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
-      [[ -n "$mtime" ]] && signed_at=$(jq -cn --arg s "$mtime" '$s')
+      mtime=$(date -u -r "$auth_path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || mtime=""
+      [[ -n "$mtime" ]] && { _acct_json_str "$mtime"; signed_at=$ACCT_JSON_STR; }
       ;;
   esac
-  jq -cn --argjson p "$provider" --argjson m "$model" --argjson s "$signed_at" \
-        --argjson c "$credentials" \
-    '{provider:$p, model:$m, signedInAt:$s, credentials:$c}'
+  # hermes and openclaw carry values jq read out of the vendor's own files, so jq
+  # assembles those. Every other branch built its values with _acct_json_str
+  # above and is assembled here as the same compact object.
+  case "$type" in
+    hermes|openclaw)
+      ACCOUNT_SIGNIN_DETAIL=$(jq -cn --argjson p "$provider" --argjson m "$model" --argjson s "$signed_at" \
+            --argjson c "$credentials" \
+        '{provider:$p, model:$m, signedInAt:$s, credentials:$c}') || ACCOUNT_SIGNIN_DETAIL='{}' ;;
+    *)
+      printf -v ACCOUNT_SIGNIN_DETAIL '{"provider":%s,"model":%s,"signedInAt":%s,"credentials":%s}' \
+        "$provider" "$model" "$signed_at" "$credentials" ;;
+  esac
 }
 
 # Iterate every profile dir on disk. Skips entries that don't have a
@@ -306,7 +374,8 @@ account_each() {
 # built with shell builtins only, and ONE jq pass assembles every row, joins
 # the bound-agent index from a SINGLE registry read, and emits the array.
 # Per-account spawns left: account_signin_detail's, and only for authed types.
-# DIVE-3088.
+# DIVE-3088. DIVE-6985: that is one `date` per authed type now (hermes and
+# openclaw add their jq reads), with no `$( )` around the call.
 cmd_account_list() {
   [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account list"
   # DIVE-6430: a standard seat cannot read the other profiles' credential files,
@@ -329,7 +398,8 @@ cmd_account_list() {
     # can show "Anthropic · claude-sonnet-4-5 · signed in May 12" instead of
     # all three orphan profiles reading identically as "Not used yet".
     for t in ${atypes[@]+"${atypes[@]}"}; do
-      detail=$(account_signin_detail "$name" "$t")
+      account_signin_detail_v "$name" "$t"
+      detail="$ACCOUNT_SIGNIN_DETAIL"
       [[ "$detail" != "{}" ]] || continue
       fields+=("$t" "$detail")
     done
@@ -397,8 +467,11 @@ usage_agent_type() {
 # (src/lib/codex_quota.sh). The type comes from the registry, never from which
 # directories happen to exist (DIVE-4034).
 usage_read_ratelimits() {
-  local agent="$1" cache mtime
-  if [[ "$(usage_agent_type "$agent")" == "codex" ]] && declare -f codex_quota_read >/dev/null 2>&1; then
+  local agent="$1" type="${2:-}" cache mtime
+  # DIVE-6985: a caller that already read the registry passes the type, so this
+  # does not re-read it per seat.
+  [[ -n "$type" ]] || type=$(usage_agent_type "$agent")
+  if [[ "$type" == "codex" ]] && declare -f codex_quota_read >/dev/null 2>&1; then
     codex_quota_ratelimits "$(codex_quota_read "$(usage_agent_home "$agent")")"
     return 0
   fi
@@ -1123,7 +1196,12 @@ account_usage_remember() {
   local name="$1" usage="$2" path tmp
   [[ -n "$usage" && "$usage" != "null" ]] || return 0
   path=$(account_usage_record_path "$name")
-  [[ -d "$(dirname "$path")" ]] || return 0
+  [[ -d "${path%/*}" ]] || return 0
+  # DIVE-6985: the same reading is re-read on every pass until a seat renders
+  # again; rewriting identical bytes cost a chmod and a mv per account per run.
+  local cur=""
+  if [[ -r "$path" ]]; then IFS= read -r -d '' cur <"$path" || true; fi
+  [[ "$cur" != "${usage}"$'\n' ]] || return 0
   tmp="${path}.tmp.$$"
   printf '%s\n' "$usage" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
   chmod 0640 "$tmp" 2>/dev/null || true
@@ -1157,22 +1235,42 @@ account_usage_recall() {
 # caches. Callers enforce that; this function does not, so a harness can drive
 # it with fixture accounts.
 account_usage_rows() {
-  local rows="[]" name agents agent rl at best best_at src usage polled burn
+  local name agent rl at best best_at src usage polled burn reg rec acct atype
+  local -a recs=() sql=()
+  # DIVE-6985: the bound seats and their types come from ONE registry read (the
+  # loop read it twice per account and once more per seat), the rows are joined
+  # by ONE jq at the end, and the history samples go to sqlite in ONE call. On
+  # poke-two these per-account spawns were most of a 1.8s `account usage`.
+  local -A bound=() seat_type=()
+  reg=$(registry_read 2>/dev/null) || reg=""
+  [[ -n "$reg" ]] || reg='{"agents":{}}'
+  while IFS=$'\037' read -r acct agent atype; do
+    [[ -n "$agent" ]] || continue
+    seat_type[$agent]="$atype"
+    [[ -n "$acct" ]] && bound[$acct]+="${agent}"$'\037'
+  done < <(jq -r '(.agents // {}) | to_entries[]
+             | [(.value.authProfile | if type == "string" then . else "" end),
+                .key, (.value.type // "claude" | tostring)] | join("\u001f")' <<<"$reg" 2>/dev/null)
   burn=$(account_usage_burn_json "$(date +%s)")
   [[ -n "$burn" ]] || burn='{}'
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    agents=$(account_agents_bound "$name")
     best=""; best_at=-1; src=""
-    while IFS= read -r agent; do
+    local -a seats=()
+    IFS=$'\037' read -r -a seats <<<"${bound[$name]:-}" || true
+    for agent in ${seats[@]+"${seats[@]}"}; do
       [[ -n "$agent" ]] || continue
-      rl=$(usage_read_ratelimits "$agent") || continue
+      rl=$(usage_read_ratelimits "$agent" "${seat_type[$agent]:-claude}") || continue
       [[ -n "$rl" ]] || continue
-      at=$(jq -r '.asOf // -1' <<<"$rl")
+      if [[ "$rl" =~ ^\{\"asOf\":([0-9]+)[,}] ]]; then
+        at="${BASH_REMATCH[1]}"
+      else
+        at=$(jq -r '.asOf // -1' <<<"$rl")
+      fi
       if [[ "$at" =~ ^[0-9]+$ ]] && (( at > best_at )); then
         best_at=$at; best="$rl"; src="$agent"
       fi
-    done < <(jq -r '.[]' <<<"$agents")
+    done
     # DIVE-6713: a reading the poll took competes on asOf like any seat's. A
     # poll that failed since is not a reading; it falls to the recall below,
     # which carries the reason.
@@ -1182,12 +1280,18 @@ account_usage_rows() {
     if [[ -n "$polled" ]]; then
       usage="$polled"
     elif [[ -n "$best" ]]; then
-      usage=$(jq -c --arg src "$src" '{
+      # One jq: the usage object, then the sample fields on a second line.
+      local _s_line=""
+      { IFS= read -r usage; IFS= read -r _s_line; } < <(jq -c -r --arg src "$src" '{
         fiveHour: (if .fiveHourPct == null then null
                    else {pct: .fiveHourPct, resetsAt: .fiveResetsAt} end),
         sevenDay: (if .sevenDayPct == null then null
                    else {pct: .sevenDayPct, resetsAt: .sevenResetsAt} end),
-        asOf: .asOf, source: $src, remembered: false}' <<<"$best")
+        asOf: .asOf, source: $src, remembered: false}
+        | (tojson,
+           ([.asOf, .fiveHour.pct, .fiveHour.resetsAt, .sevenDay.pct, .sevenDay.resetsAt]
+            | map(if . == null or . == false then "" else tostring end) | join("\u001f")))' <<<"$best")
+      [[ -n "$usage" ]] || usage=null
       account_usage_remember "$name" "$usage"
       # DIVE-4589: the JSON record above is the LATEST-state cache and is
       # overwritten every pass; this appends the same reading to history so the
@@ -1195,25 +1299,30 @@ account_usage_rows() {
       # a live seat ($src) behind the number. The recall branch below has no
       # source agent by construction, which is what stops a remembered reading
       # from entering the record as a fresh observation.
-      if declare -F account_usage_sample_record >/dev/null 2>&1; then
+      if declare -F account_usage_sample_stmt >/dev/null 2>&1; then
         local _s_asof _s_fp _s_fr _s_sp _s_sr
-        _s_asof=$(jq -r '.asOf // empty'               <<<"$usage")
-        _s_fp=$(  jq -r '.fiveHour.pct // empty'       <<<"$usage")
-        _s_fr=$(  jq -r '.fiveHour.resetsAt // empty'  <<<"$usage")
-        _s_sp=$(  jq -r '.sevenDay.pct // empty'       <<<"$usage")
-        _s_sr=$(  jq -r '.sevenDay.resetsAt // empty'  <<<"$usage")
-        account_usage_sample_record "$name" "$_s_asof" "$_s_fp" "$_s_fr" \
-                                    "$_s_sp" "$_s_sr" "$src" || true
+        IFS=$'\037' read -r _s_asof _s_fp _s_fr _s_sp _s_sr <<<"$_s_line" || true
+        if account_usage_sample_stmt "$name" "$_s_asof" "$_s_fp" "$_s_fr" \
+                                     "$_s_sp" "$_s_sr" "$src"; then
+          sql+=("$ACCOUNT_USAGE_SAMPLE_SQL")
+        fi
       fi
     else
       # No live mapping carries a cache — fall back to what this ACCOUNT last
       # reported. A profile with zero bound seats still prints its 5H/7D.
       usage=$(account_usage_recall "$name")
     fi
-    rows=$(jq -c --arg n "$name" --argjson a "$agents" --argjson u "$usage" --argjson b "$burn" \
-      '. + [{name:$n, agents:$a, usage:$u, burn5hPerHour: ($b[$n] // null)}]' <<<"$rows")
+    printf -v rec '%s\037%s\037%s' "$name" "${bound[$name]:-}" "$usage"
+    recs+=("$rec")
   done < <(account_each)
-  printf '%s' "$rows"
+  (( ${#sql[@]} == 0 )) || account_usage_samples_write "${sql[@]}"
+  (( ${#recs[@]} )) || { printf '[]'; return 0; }
+  # A record is name, the bound seats (each \037-terminated), then the usage
+  # JSON, which jq -c printed on one line and which holds no raw \037.
+  printf '%s\n' "${recs[@]}" | jq -Rsjc --argjson b "$burn" '
+    split("\n") | map(select(length > 0) | split("\u001f")
+      | {name: .[0], agents: (.[1:-1] | map(select(length > 0))),
+         usage: (.[-1] | fromjson), burn5hPerHour: ($b[.[0]] // null)})'
 }
 
 # account_usage_publish — build the rows and publish the snapshot. NO table, no
