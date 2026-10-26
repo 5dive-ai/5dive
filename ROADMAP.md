@@ -10,7 +10,7 @@ Own it. Run it from your phone.
 
 ## 1. Employees, not tools
 
-Each agent has a name, a face, a voice and a job. It owns that job and is responsible for the result. Hire a ready-made team in one tap and talk to it from your phone.
+Each agent has a name, a face, a voice and a job, and it owns the result. Hire a ready-made team in one tap and shape it to your business: change any agent's job and skills, or build one from scratch. Talk to them from your phone.
 
 ## 2. Yours, built your way
 
@@ -34,4 +34,4 @@ Agents share tasks, use websites, check each other's work and show you the resul
 
 **Works today:** one MIT CLI on any Linux server · chat with your team from the [5dive app](https://5dive.app/self-host), free on your own server · Claude Code, Codex, OpenClaw, Hermes and more side by side · ready-made teams from the [marketplace](https://github.com/5dive-ai/5dive-marketplace) · voice · a real [browser](https://github.com/5dive-ai/5dive-browser) · shared memory.
 
-Want something sooner? Comment on its issue, or open one.
+Want something sooner? Comment on its issue, open one, or ask your agent to [build it as a plugin](https://github.com/5dive-ai/5dive-plugin-template).
