@@ -1539,6 +1539,7 @@ _team_leave() {
   sql+="DELETE FROM team_members WHERE team=$(sqlq "$team") AND agent=$(sqlq "$agent");"
   db "BEGIN; ${sql} COMMIT;" || fail "$E_GENERIC" "could not take $agent out of team '$team'"
   _team_strip_share_block "$team" "$agent" || true
+  _team_handoff_revoke "$team" "$agent" || true
   local _where=" — still in ${others}"
   [[ -n "$others" ]] || _where=" — he is now on his own (fire him with: 5dive agent rm $agent)"
   ok "$agent left team '$team'${_where}" \
@@ -2930,6 +2931,105 @@ open(dest, "w").write(out)
 PY
 }
 
+# ---- DIVE-6991: ONE HANDOFF FOLDER PER TEAM -----------------------------------
+#
+# Every seat's home is its own (0750, a private group), so a file bo makes in his
+# home is a file theo cannot open. Measured in the four-team QA (DIVE-6989 B4):
+# marketing fell back to /tmp, at ~6 extra rounds and two owner messages. Copy
+# and numbers go in the message; an image or a video cannot, so it needs a place
+# the whole team reads and writes.
+#
+# The folder is root:team-<key> 2770, setgid, so what a member makes stays the
+# team's. The group alone is not enough: a seat that is ALREADY running does not
+# pick up a new group until it restarts (DIVE-5690's same finding for keys), and a
+# file is created under its maker's umask. So each member also gets a named ACL
+# entry, plus a default one, which the kernel checks per access whatever the
+# process's groups or umask.
+_team_handoff_path() { printf '%s/teams/%s/handoff' "${STATE_DIR:-/var/lib/5dive}" "$1"; }
+
+# team-<key>, cut to the 32-character group-name cap with a hash tail, so two
+# long keys never land in one group.
+_team_handoff_group() {
+  local g="team-$1"
+  (( ${#g} <= 32 )) || g="${g:0:23}-$(printf '%s' "$1" | sha256sum | cut -c1-8)"
+  printf '%s' "$g"
+}
+
+# _team_handoff_ensure <key> <agent>... — create the folder, open it to each agent
+# on the box, print its path. Idempotent: a re-import re-grants, and a member who
+# joined since gets the files already there too. Returns 1 with nothing printed
+# when the folder itself could not be made.
+_team_handoff_ensure() {
+  local key="$1"; shift
+  local dir grp a u sgrp rc=0
+  [[ -n "$key" ]] || return 1
+  dir=$(_team_handoff_path "$key"); grp=$(_team_handoff_group "$key")
+  _sp_group_exists "$grp" || _sp_groupadd "$grp" || _sp_group_exists "$grp" || return 1
+  mkdir -p "$dir" 2>/dev/null || return 1
+  chmod a+rx "${dir%/*/*}" "${dir%/*}" 2>/dev/null || true
+  { _sp_chgrp "$grp" "$dir" && _sp_chmod 2770 "$dir"; } 2>/dev/null || return 1
+  command -v setfacl >/dev/null 2>&1 || {
+    warn "setfacl is not installed (package acl): team '$key' shares $dir by group only, so a teammate already running cannot open it until it restarts, and a file made 0644 is read-only to the rest"
+    rc=1; }
+  (( rc )) || setfacl -m "d:g:${grp}:rwx,d:m::rwx" "$dir" 2>/dev/null || rc=1
+  sgrp=$(_sp_file_group "${STATE_DIR:-/var/lib/5dive}")
+  for a in "$@"; do
+    u="agent-$a"
+    _sp_user_exists "$u" || continue
+    _sp_is_member "$u" "$grp" || _sp_member_add "$u" "$grp" || rc=1
+    command -v setfacl >/dev/null 2>&1 || continue
+    { setfacl -R -m "u:${u}:rwX" "$dir" && setfacl -R -d -m "u:${u}:rwx" "$dir"; } 2>/dev/null || rc=1
+    # A sandboxed seat is outside $STATE_DIR's group on purpose (DIVE-1033) and
+    # needs traverse to reach the folder: the same grant DIVE-4730 gives it for
+    # the plugin record, on the same one directory.
+    if [[ -n "$sgrp" ]] && ! _sp_is_member "$u" "$sgrp"; then
+      plugin_root_traverse_grant "$u" "$dir" >/dev/null 2>&1 || rc=1
+    fi
+  done
+  (( rc == 0 )) || warn "team '$key''s folder $dir was made, but not every teammate could be given access to it — re-run the import to retry"
+  printf '%s' "$dir"
+}
+
+# The lines that fence the handoff note in a member's instructions, so a re-import
+# does not add it twice and `team leave` takes it back out.
+_team_handoff_marker() {
+  if [[ "${2:-}" == end ]]; then printf '<!-- /5dive team handoff: %s -->' "$1"; else printf '<!-- 5dive team handoff: %s -->' "$1"; fi
+}
+
+# _team_handoff_tell <key> <agent> <dir> — add the folder to <agent>'s
+# instructions, once. Every member, not only the ones this import created: a
+# team imported before the folder existed learns it on its next import.
+_team_handoff_tell() {
+  local key="$1" name="$2" dir="$3" type md cur block
+  type=$(registry_read 2>/dev/null | jq -r --arg n "$name" '.agents[$n].type // "claude"' 2>/dev/null) || type=claude
+  md=$(persona_target "$name" "$type" 2>/dev/null) || return 0
+  cur=$(sudo -u "agent-${name}" cat "$md" 2>/dev/null) || cur=""
+  [[ "$cur" == *"$(_team_handoff_marker "$key")"* ]] && return 0
+  block=$'\n\n'"$(_team_handoff_marker "$key")"$'\n'
+  block+="## Team folder${key:+ (team ${key})}"$'\n'
+  block+="- Your team shares \`${dir}\`: every teammate can open and write it. Put any file you hand to a teammate there (an image, a video, a draft too big to paste) and name its full path in the row result or your message. Never hand over a path in your own home folder: no teammate can open it."$'\n'
+  block+="$(_team_handoff_marker "$key" end)"$'\n'
+  persona_append_block "$name" "$type" "$block"
+}
+
+# _team_handoff_revoke <key> <agent> — `team leave`: he loses the folder and the
+# note. The files he made stay the team's.
+_team_handoff_revoke() {
+  local key="$1" name="$2" dir u="agent-$2" type md old new beg end
+  dir=$(_team_handoff_path "$key")
+  [[ -d "$dir" ]] || return 0
+  _sp_member_del "$u" "$(_team_handoff_group "$key")" || true
+  command -v setfacl >/dev/null 2>&1 && setfacl -R -x "u:${u},d:u:${u}" "$dir" 2>/dev/null
+  type=$(registry_read 2>/dev/null | jq -r --arg n "$name" '.agents[$n].type // "claude"' 2>/dev/null) || type=claude
+  md=$(persona_target "$name" "$type" 2>/dev/null) || return 0
+  old=$(sudo -u "$u" cat "$md" 2>/dev/null) || return 0
+  beg=$(_team_handoff_marker "$key"); end=$(_team_handoff_marker "$key" end)
+  [[ "$old" == *"$beg"* ]] || return 0
+  new=$(awk -v b="$beg" -v e="$end" '$0 == b {skip=1; next} skip && $0 == e {skip=0; next} !skip' <<<"$old")
+  printf '%s\n' "$new" | sudo -u "$u" tee "$md" >/dev/null 2>&1 \
+    || warn "[$name] could not take team '$key''s folder out of $md"
+}
+
 # The message a caller shows when _team_resolve_template did not produce a file.
 _team_resolve_fail() {
   local ref="$1" rc="$2" why
@@ -3312,6 +3412,19 @@ HELP
     local _final="$spec_for_prefix"
     [[ -n "$name_prefix" ]] && _final=$(_compose_apply_name_prefix "$spec_for_prefix" "$name_prefix")
     _team_members_write "$slug_key" "$_final" || true
+    # DIVE-6991: the team's shared folder, after `up` (its members' unix users
+    # must exist). Best-effort, like the rows below: no folder is a warning.
+    local _hdir _hm
+    local -a _hmembers=()
+    mapfile -t _hmembers < <(jq -r '.agents | keys[]' <<<"$_final" 2>/dev/null)
+    if _hdir=$(_team_handoff_ensure "$slug_key" "${_hmembers[@]+"${_hmembers[@]}"}"); then
+      step "team folder: $_hdir (every teammate reads and writes it)"
+      for _hm in "${_hmembers[@]+"${_hmembers[@]}"}"; do
+        _sp_user_exists "agent-${_hm}" && _team_handoff_tell "$slug_key" "$_hm" "$_hdir"
+      done
+    else
+      warn "could not create team '$slug_key''s shared folder $(_team_handoff_path "$slug_key") — teammates can hand over text, but not a file. Re-run the import to retry."
+    fi
   fi
 
   # ---- DIVE-4822: an import now writes the TEAM, not just the roster ---------
@@ -3580,12 +3693,17 @@ HELP
   # policy from and the one to edit. Shown only when it exists on this box.
   local manifest="${COMPOSE_TEAM_MANIFEST:-}"
   [[ -n "$manifest" && -f "$manifest" ]] || manifest=""
+  # DIVE-6991: and the folder its members hand files over in.
+  local handoff=""
+  [[ -n "${_ps_key:-}" ]] && handoff=$(_team_handoff_path "$_ps_key")
+  [[ -n "$handoff" && -d "$handoff" ]] || handoff=""
 
   if (( JSON_MODE )); then
-    ok "" '{file:$f, agents:$rows} + (if $bm == "" then {} else {capabilities:{browser:$bm}} end) + (if $mf == "" then {} else {manifest:$mf} end)' \
-      --arg f "$file" --argjson rows "$rows" --arg bm "$browser_mode" --arg mf "$manifest"
+    ok "" '{file:$f, agents:$rows} + (if $bm == "" then {} else {capabilities:{browser:$bm}} end) + (if $mf == "" then {} else {manifest:$mf} end) + (if $hd == "" then {} else {folder:$hd} end)' \
+      --arg f "$file" --argjson rows "$rows" --arg bm "$browser_mode" --arg mf "$manifest" --arg hd "$handoff"
   else
     [[ -n "$manifest" ]] && echo "MANIFEST    $manifest"
+    [[ -n "$handoff" ]] && echo "FOLDER      $handoff"
     [[ -n "$browser_mode" ]] && echo "PUBLISHING  $browser_mode"
     echo "$rows" | jq -r '
       (["NAME","TYPE","STATE","LOOP SCHEDULES"] | @tsv),

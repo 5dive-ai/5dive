@@ -620,6 +620,14 @@ jobs:
           n=$(grep -c '^ok   - R1' root-arms-lp.txt) || n=0
           echo "R1 ok lines: $n"
           test "$n" -ge 5
+      - name: team_import_handoff_folder_unit as root, R1 required (DIVE-6991)
+        run: |
+          set -o pipefail
+          sudo -E env HO_REQUIRE_ROOT_ARM=1 bash tests/team_import_handoff_folder_unit.sh | tee root-arms-ho.txt
+          if grep -q '^skip - R1' root-arms-ho.txt; then echo "R1 was skipped under root"; exit 1; fi
+          n=$(grep -c '^ok   - R1' root-arms-ho.txt) || n=0
+          echo "R1 ok lines: $n"
+          test "$n" -ge 8
 
   rails-pristine:
     runs-on: ubuntu-latest
