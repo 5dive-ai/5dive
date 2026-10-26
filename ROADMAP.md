@@ -6,7 +6,7 @@ Own it. Run it from your phone.
 
 **Vision:** every small business has an AI team working for it, one it owns, not rents.
 
-**Mission:** hiring an AI team is as easy as hiring one person.
+**Mission:** your team does real work from day one, and every day after.
 
 ## 1. A team you hire and talk to
 
