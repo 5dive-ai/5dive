@@ -98,6 +98,7 @@ CORE_FILES=(
   src/lib/codex_quota.sh
   src/lib/agent_env.sh
   src/lib/verify_policy.sh
+  src/lib/devteam.sh
   src/lib/tasks_db.sh
   src/lib/account_history.sh
   src/lib/runs.sh
@@ -259,6 +260,18 @@ done
 lazy_core_names "${CORE_FILES[@]}" "$CORE_TAIL" | sort -u >"$_lazywork/corenames"
 lazy_build_index "$_lazywork/index" "$_lazywork/corenames" "$_lazywork"
 
+# DIVE-6935: the sha256 of each module the devteam plugin may stand in for, so
+# the loader reads the plugin's copy only while it is this exact file (see the
+# header of src/lib/devteam.sh). A module the core no longer carries gets no line.
+_dt_mods="$(sed -n 's/^readonly DEVTEAM_MODULES="\(.*\)"$/\1/p' src/lib/devteam.sh)"
+[[ -n "$_dt_mods" ]] || { echo "error: no DEVTEAM_MODULES line in src/lib/devteam.sh" >&2; exit 1; }
+: >"$_lazywork/devteam_shas"
+for _m in $_dt_mods; do
+  _f=$(awk -v m="$_m" '$1 == m { print $4 }' "$_lazywork/index")
+  [[ -n "$_f" ]] || continue
+  printf '__DEVTEAM_CORE_SHA[%s]=%s\n' "$_m" "$(sha256sum <"$_f" | cut -d' ' -f1)" >>"$_lazywork/devteam_shas"
+done
+
 # --- assemble ---------------------------------------------------------------
 # Two passes, because the payload's absolute line numbers depend on how long the
 # core is and the core contains those numbers. Only ONE line of the generated
@@ -268,6 +281,7 @@ _assemble() { # <offset> <out>
   {
     cat "${CORE_FILES[@]}"
     lazy_emit "$_lazywork/index" "$_lazywork" "$1"
+    cat "$_lazywork/devteam_shas"
     cat "$CORE_TAIL"
     # `main "$@"` above either exits inside itself or falls through to here.
     # Either way bash never reads a byte past this line, which is the entire
