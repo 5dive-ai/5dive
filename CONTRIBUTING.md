@@ -175,7 +175,7 @@ caught.
   | title starts with | the next release is |
   | --- | --- |
   | `feat:` / `feat(scope):` | a **minor** (`0.x`) |
-  | any type with `!:`, or a `BREAKING CHANGE` trailer | a **major** |
+  | any type with `!:`, or a `BREAKING CHANGE` trailer | a **major** from 1.0 on; a **minor** while the version is `0.x` (1.0 is declared by dispatching `level=major`) |
   | `fix` `test` `chore` `docs` `refactor` `ci` `perf` | a **patch** (`0.x.x`) |
 
   **`feat` is for a new capability only** (lodar 2026-10-09: "we name features
