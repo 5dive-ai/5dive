@@ -7039,6 +7039,8 @@ _hb_gate_shipped_sweep() {
   # Normalize the repo allow-list: commas or spaces both separate.
   local repos; repos="${_HB_GATE_SHIPPED_REPOS//,/ }"
   [[ -n "${repos// }" ]] || return 0
+  # DIVE-6938: the PR reader is the devteam plugin's.
+  devteam_loaded || return 0
   # DIVE-2414: resolve the read-only gh credential ONCE for the whole sweep, not
   # per gate — _gate_gh_token can shell out to sudo and the sweep runs every tick.
   # Empty is a first-class answer: the subject reader returns UNKNOWN, never a

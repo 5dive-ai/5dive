@@ -290,7 +290,10 @@ SITES=(
   # finding (rc=0, empty output) — they were never detectable, on main either, where
   # this entry passed on the gate_evidence sites alone. Coverage is preserved exactly,
   # not widened.
-  "src/cmd_objective.sh:n"      "src/task/gate_evidence.sh:n"  "src/cmd_selfcheck.sh:nwired"
+  # DIVE-6938: the gate_evidence `n` sites left with task/gate_evidence.sh for the
+  # devteam plugin; 5dive-plugins runs this harness whole against this tree with
+  # the plugin's files in place (tests/devteam/unguarded_probe_substitution_unit.sh).
+  "src/cmd_objective.sh:n"      "src/cmd_selfcheck.sh:nwired"
   # DIVE-6985: was "src/cmd_account.sh:base_url". That grep is gone (combined.env
   # is read with builtins now), so the arm follows the same file's remaining
   # grep-probe guard, the hermes `default:` line in account_signin_detail_v.
@@ -323,19 +326,9 @@ for site in "${SITES[@]}"; do
   fi
 done
 
-# ── G. the two shipped instances stay guarded ────────────────────────────────
-# DIVE-2603's `_gate_branch_refs_from_text` caller and DIVE-2566's per-repo
-# installation lookup are the incidents this class is named after. They are in
-# the same tree the scanner just cleared, so E covers them — but only by name
-# here, so a future reader can see they were not forgotten.
-for pair in "src/task/gate_evidence.sh:_gate_branch_refs_from_text" "src/cmd_push.sh:installation"; do
-  f="${pair%:*}"; needle="${pair##*:}"
-  if grep -q "$needle" "$ROOT/$f"; then
-    ok_t "G: $(basename "$f") still carries the $needle site (E cleared it)"
-  else
-    bad_t "G: $needle vanished from $f" "the anchor moved — re-derive this arm rather than deleting it"
-  fi
-done
+# ── G. the two shipped instances (DIVE-2603's `_gate_branch_refs_from_text`
+# caller, DIVE-2566's installation lookup) are in task/gate_evidence.sh and
+# cmd_push.sh, the devteam plugin's since DIVE-6938; arm G runs there.
 
 printf 'unguarded_probe_substitution_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

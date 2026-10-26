@@ -86,7 +86,6 @@ CORE_FILES=(
   src/lib/mod_seat.sh
   src/lib/state.sh
   src/lib/env_overrides.sh
-  src/lib/gh_config.sh
   src/lib/capability.sh
   src/lib/broker.sh
   src/lib/durable.sh
@@ -139,11 +138,8 @@ LAZY_FILES=(
   src/task/dispatch.sh
   src/task/routing.sh
   src/task/crud.sh
-  src/task/gate_evidence.sh
   src/task/status.sh
-  src/task/grader_pool.sh
-  src/task/grader_process.sh
-  src/task/delivery.sh
+  src/lib/pace.sh
   src/task/loops.sh
   src/task/need.sh
   src/task/notify.sh
@@ -182,11 +178,7 @@ LAZY_FILES=(
   src/cmd_usage.sh
   src/cmd_digest.sh
   src/cmd_disk.sh
-  src/cmd_proof.sh
   src/cmd_selfcheck.sh
-  src/cmd_push.sh
-  src/cmd_deploy.sh
-  src/cmd_gh.sh
   src/cmd_bug.sh
   src/cmd_memory.sh
   src/cmd_pack.sh
@@ -260,18 +252,6 @@ done
 lazy_core_names "${CORE_FILES[@]}" "$CORE_TAIL" | sort -u >"$_lazywork/corenames"
 lazy_build_index "$_lazywork/index" "$_lazywork/corenames" "$_lazywork"
 
-# DIVE-6935: the sha256 of each module the devteam plugin may stand in for, so
-# the loader reads the plugin's copy only while it is this exact file (see the
-# header of src/lib/devteam.sh). A module the core no longer carries gets no line.
-_dt_mods="$(sed -n 's/^readonly DEVTEAM_MODULES="\(.*\)"$/\1/p' src/lib/devteam.sh)"
-[[ -n "$_dt_mods" ]] || { echo "error: no DEVTEAM_MODULES line in src/lib/devteam.sh" >&2; exit 1; }
-: >"$_lazywork/devteam_shas"
-for _m in $_dt_mods; do
-  _f=$(awk -v m="$_m" '$1 == m { print $4 }' "$_lazywork/index")
-  [[ -n "$_f" ]] || continue
-  printf '__DEVTEAM_CORE_SHA[%s]=%s\n' "$_m" "$(sha256sum <"$_f" | cut -d' ' -f1)" >>"$_lazywork/devteam_shas"
-done
-
 # --- assemble ---------------------------------------------------------------
 # Two passes, because the payload's absolute line numbers depend on how long the
 # core is and the core contains those numbers. Only ONE line of the generated
@@ -281,7 +261,6 @@ _assemble() { # <offset> <out>
   {
     cat "${CORE_FILES[@]}"
     lazy_emit "$_lazywork/index" "$_lazywork" "$1"
-    cat "$_lazywork/devteam_shas"
     cat "$CORE_TAIL"
     # `main "$@"` above either exits inside itself or falls through to here.
     # Either way bash never reads a byte past this line, which is the entire

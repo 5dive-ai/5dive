@@ -237,7 +237,7 @@ env:
   # on a tree that did not change. Pinned, that arrives as a bump PR that can be
   # graded and reverted. Every clone site in this file MUST use this ref --
   # the pinned-plugins-clone guard in unit-tests.yml fails the build otherwise.
-  PLUGINS_REF: 69f455755811fb4749448c401cfe16a893b93e22
+  PLUGINS_REF: 099ba849774acc54675364609054eb51d8f137fb
 
 jobs:
   # DIVE-2525 (main, reviewing #376): SHARDED, not given a bigger number. The first

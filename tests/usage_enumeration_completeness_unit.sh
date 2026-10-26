@@ -196,9 +196,8 @@ grep -q 'collect|status|install|uninstall|show' "$ROOT/src/cmd_loop.sh" \
   && ok_t 'T3c sweep: `loop uninstall` dispatches and is now named by the loop usage string' \
   || bad_t 'T3c loop uninstall is still missing from the loop enumeration' ''
 
-grep -q 'publish|on|off|status|scorecard|tick' "$ROOT/src/cmd_proof.sh" \
-  && ok_t 'T3d sweep: `proof scorecard` dispatches and is now named by the proof usage string' \
-  || bad_t 'T3d proof scorecard is still missing from the proof enumeration' ''
+# (T3d, `proof scorecard` in the proof usage string, moved to the devteam plugin
+# with cmd_proof.sh in DIVE-6938: 5dive-plugins tests/devteam_core_unit.sh T12.)
 
 # ── T4 the two --help surfaces resolve instead of erroring ────────────────────
 # `5dive agent --help` and `5dive agent auth --help` both died on the catch-all

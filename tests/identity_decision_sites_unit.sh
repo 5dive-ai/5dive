@@ -85,13 +85,13 @@ is_clean() { [[ -z "$(offenders "$1" "${2:-}")" ]]; }
 # --- the eight sites, by identifier ------------------------------------------
 # file | function | item | what the value DECIDES (the axis, which is the payload —
 # the identifier is only the handle).
+# DIVE-6938: items 4, 5 and 6 (cmd_proof.sh, task/gate_evidence.sh) moved to the
+# devteam plugin with their files; 5dive-plugins runs this harness whole against the
+# core with the plugin's files in place (tests/devteam/identity_decision_sites_unit.sh).
 SITES=(
   "src/cmd_agent_runtime.sh|cmd_deliver|1|a2a sender class + the round-cap key"
   "src/cmd_agent_create.sh|cmd_create|2|whether a new agent gets the default skill"
   "src/cmd_agent_create.sh|sudo_grant_lines|3|whose sudo grants may be published as \$user's"
-  "src/cmd_proof.sh|_proof_identity|4|whether the target user's gitconfig is read at all"
-  "src/task/gate_evidence.sh|_gate_gh_token|5|whether the last token arm runs (fail-OPEN gate below)|$EXEMPT_gate_evidence_gh"
-  "src/cmd_proof.sh|_proof_publish|6|the STORED lastPublishedBy.user staleness record"
   "src/cmd_objective.sh|cmd_objective_add|7|the STORED objectives.created_by acting agent"
   "src/task/notify.sh|_task_owner_channel|8|WHICH AGENT'S TELEGRAM BOT a notification reaches"
   # Item 9 is NOT one of the parent's seven, nor the reconciliation's eight. It came out
@@ -176,18 +176,6 @@ is_clean "$ctl_fixed" \
   && ok "CONTROL: the sanctioned actor_routing_agent form passes (the predicate is not vacuously red)" \
   || no "CONTROL FAILED — the predicate rejects the sanctioned form; the arms above cannot distinguish a fix"
 
-# --- the item-5 exemption is load-bearing, not a dead regex -------------------
-# An exemption that matches nothing is indistinguishable from a clean function, and
-# the arm above would read `ok` either way. Show it does work: with the exemption
-# removed the same function must go RED, which also proves the predicate reaches it.
-_ge=$(fn_body src/task/gate_evidence.sh _gate_gh_token)
-if [[ -z "$_ge" ]]; then
-  no "CONTROL: _gate_gh_token not found — the item-5 exemption control is vacuous"
-elif is_clean "$_ge" ""; then
-  no "CONTROL FAILED — _gate_gh_token is clean even WITHOUT the arm-2 exemption, so that exemption is dead text hiding nothing; delete it or the arm is not saying what it claims"
-else
-  ok "CONTROL: the item-5 arm-2 exemption is load-bearing (removing it reddens _gate_gh_token)"
-fi
 
 # --- SUDO_UID: every read is guarded, sanctioned, or a named exemption --------
 # `actor_routing_agent` reads SUDO_UID outside a root check on purpose (a de-elevated

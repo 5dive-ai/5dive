@@ -39,7 +39,7 @@ export FIVE_PACE_READING_CACHE_DIR="$TMPD/pace-reading"
 unset FIVE_PACE_7D_SOFT FIVE_PACE_7D_HARD FIVE_PACE_5H FIVE_PACE_BLIND FIVE_PACE_UNMETERED
 
 # shellcheck disable=SC1090
-for f in lib/error_codes.sh lib/output.sh lib/verify_policy.sh cmd_box_config.sh task/grader_pool.sh; do
+for f in lib/error_codes.sh lib/output.sh lib/verify_policy.sh cmd_box_config.sh lib/pace.sh; do
   source "src/$f"
 done
 require_root() { return 0; }     # the harness is not root; the setter's logic is the subject
@@ -257,8 +257,8 @@ r=$(arm_bad) && ok_ "BAD: 95/85, abc, 85, 85/101, 085/95, -1/50 … and pace-5h 
 # ── MUTANTS: each arm reds against the defect it exists for ─────────────────
 mutant_gp(){ # <sed-expr> -> path of a mutated grader_pool.sh, or empty if the sed matched nothing
   local m="$TMPD/gp_mut.sh"
-  sed "$1" src/task/grader_pool.sh > "$m"
-  cmp -s "$m" src/task/grader_pool.sh && { printf ''; return 0; }
+  sed "$1" src/lib/pace.sh > "$m"
+  cmp -s "$m" src/lib/pace.sh && { printf ''; return 0; }
   printf '%s' "$m"
 }
 run_mut(){ # <mutated-file> <arm-fn> -> rc of the arm against the mutant

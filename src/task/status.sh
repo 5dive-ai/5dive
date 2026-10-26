@@ -652,7 +652,19 @@ _task_status_cmd() {
   # routing below on purpose: a maker's `task done` that delivers rather than
   # closes carries exactly the same claim, and the moment to check it is the
   # moment it is written, not the moment someone later re-reads it.
-  [[ "$verb" == "done" ]] && _gate_version_vs_installed "$ident" done "$result"
+  [[ "$verb" == "done" ]] && devteam_loaded && _gate_version_vs_installed "$ident" done "$result"
+  # DIVE-6938: grading, PR delivery and the merge gate below are the devteam
+  # plugin's. On a box without it a row with no bound pull request closes as an
+  # ordinary close (no verifier round, no merge gate), and a row WITH one refuses:
+  # closing it means answering whether that PR merged, which nothing here can.
+  if [[ "$verb" == "done" ]] && ! devteam_loaded; then
+    local _nd_st _nd_dref
+    _nd_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+    _nd_dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_nd_dref" && "$_nd_st" != "done" && "$_nd_st" != "cancelled" ]]; then
+      devteam_refuse "closing $ident, which has a bound pull request ($_nd_dref),"
+    fi
+  fi
   # DIVE-477: maker→verifier routing. A `task done` on a task that carries a
   # `verifier` distinct from its current assignee is NOT a close — it's a handoff.
   # The maker is claiming the work is ready; the verifier must grade it before the
@@ -661,7 +673,7 @@ _task_status_cmd() {
   # `task done`, where verifier==assignee, falls through to a normal close) or
   # rejects it (`task reject` → bounce back to the maker). Opt-in: ordinary tasks
   # (verifier NULL) and the verifier's own close are untouched.
-  if [[ "$verb" == "done" ]]; then
+  if [[ "$verb" == "done" ]] && devteam_loaded; then
     local _vfier _asignee _route_st
     _vfier=$(db "SELECT COALESCE(verifier,'')  FROM tasks WHERE id=${id};")
     _asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
@@ -1017,7 +1029,7 @@ _task_status_cmd() {
   #   2. a `Branch: <name>` line in the task body — the EXISTING delegated-push
   #      binding (DIVE-1462; resolved the same way cmd_push does). delivery_ref
   #      wins when both are present.
-  if [[ "$verb" == "done" ]]; then
+  if [[ "$verb" == "done" ]] && devteam_loaded; then
     local _dref _branch="" _body _task_slug
     _dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
     _body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
@@ -1912,7 +1924,7 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
   # branch-hygiene digest (#139, DIVE-1833) catches any unmerged PR/branch left
   # behind. `--force-merge-gate` is the audited manual escape (a mandatory gate
   # with no escape is a footgun) — logged, and its leftover PR is digest-flagged.
-  if [[ "$verb" == "done" && -z "$_dref" && -z "$_branch" ]]; then
+  if [[ "$verb" == "done" ]] && devteam_loaded && [[ -z "$_dref" && -z "$_branch" ]]; then
     local _auto_hit="" _scan_ran=0
     # DIVE-1955: declared out here, not inside the token branch — they are read by
     # the refusal messages below, and `set -u` turns an unset one into a crash on
@@ -2604,7 +2616,10 @@ _task_start_preflight() {
           # here; (b) an agent seat is not SUPPOSED to hold its own login — it pushes
           # through the delegated rail, which the check never asked about. Name the
           # rail that WILL carry the push, and warn only when there is genuinely none.
-          local _rail; _rail=$(gh_credential_rail)
+          # Which push rail is a devteam question (lib/gh_config.sh); without the
+          # plugin there is no delegated rail to name, so nothing is said.
+          local _rail=""
+          if declare -F gh_credential_rail >/dev/null 2>&1; then _rail=$(gh_credential_rail); fi
           case "$_rail" in
             none)
               _pf "origin is an HTTPS remote and NO push credential is reachable from this seat — not your own gh login, not the delegated claude rail, not the machine account. A push will prompt/fail; authenticate (gh auth login) or land it with '5dive push' from a seat that can." ;;

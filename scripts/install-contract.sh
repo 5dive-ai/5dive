@@ -102,7 +102,9 @@ DENY='uninstall self-update self_update update paperclip-seed fire hire'
 # its root check. `buzz` came off on 2026-10-25 for the other reason T5 names:
 # DIVE-6934 moved the verb out of core into buzz@5dive-plugins, so it is no
 # longer in the dispatch table at all.
-WAIVED='activity cost deploy gate-proof host objective objectives project projects trace usage'
+# `deploy` came off on 2026-10-26 by leaving the core altogether: it is the devteam
+# plugin's (DIVE-6938), out of the dispatch table, so T5 would call it stale.
+WAIVED='activity cost gate-proof host objective objectives project projects trace usage'
 
 in_list() { local n="$1"; shift; local x; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
 

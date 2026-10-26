@@ -94,7 +94,7 @@ slot() {  # <cur-pct|""> <bound-pct|""> <title>
 }
 
 # ── P1–P3 on the shipping source ─────────────────────────────────────────────
-load_floor src/task/grader_pool.sh
+load_floor src/lib/pace.sh
 
 got=$(band7 "" 63)
 [[ "$got" == 0 ]] && ok_ "P1: the 10-01 fixture (blind meter, remembered 63%) is band 0 — not held" \
@@ -167,8 +167,8 @@ MUT="$TMP/grader_pool.pre5364.sh"
 sed -e 's|^_PACE_DEFAULT_7D_SOFT=95$|_PACE_DEFAULT_7D_SOFT=60|' \
     -e 's|^_PACE_DEFAULT_7D_HARD=95$|_PACE_DEFAULT_7D_HARD=90|' \
     -e 's|^_PACE_BLIND="${FIVE_PACE_BLIND:-open}"$|_PACE_BLIND="${FIVE_PACE_BLIND:-soft}"|' \
-    src/task/grader_pool.sh >"$MUT"
-nchg=$(diff src/task/grader_pool.sh "$MUT" | grep -c '^>')
+    src/lib/pace.sh >"$MUT"
+nchg=$(diff src/lib/pace.sh "$MUT" | grep -c '^>')
 if [[ "$nchg" != 3 ]]; then
   bad_ "N: the pre-5364 mutant did not apply" "$nchg of 3 lines changed — the defaults moved; re-aim the sed"
 else

@@ -725,8 +725,22 @@ _sc_probe_scorecard_honesty() {
     || { _sc_notreached "no-python3" "the scorecard is computed in python3, which is not installed"; return; }
   command -v sqlite3 >/dev/null 2>&1 \
     || { _sc_notreached "no-sqlite3" "an isolated empty task store needs sqlite3"; return; }
+  # DIVE-6938: `proof` is the devteam plugin's. Without it there is no scorecard on
+  # this box to be honest about.
+  devteam_loaded \
+    || { _sc_notreached "no-devteam" "proof scorecard is in the devteam plugin, which is not loaded here (${_DEVTEAM_WHY:-not installed})"; return; }
   local d; d=$(_sc_tmp) || { _sc_notreached "no-tmpdir" "could not create an isolated state dir"; return; }
   mkdir -p "$d/tasks"
+  # The isolated store is a fresh STATE_DIR, which has no plugins; hand it this
+  # box's own devteam plugin (the same pinned dir and record) so the child runs
+  # the scorecard this box would publish. A harness that sourced the files has no
+  # plugin dir and needs none.
+  if [[ -n "${_DEVTEAM_DIR:-}" ]]; then
+    mkdir -p "$d/plugins/enabled"
+    ln -s "$_DEVTEAM_DIR" "$d/plugins/enabled/$DEVTEAM_PLUGIN_KEY"
+    jq --arg k "$DEVTEAM_PLUGIN_KEY" '{($k): .[$k]}' "${STATE_DIR:-/var/lib/5dive}/plugins/installed.json" \
+      > "$d/plugins/installed.json" 2>/dev/null && chmod 644 "$d/plugins/installed.json"
+  fi
   local out rc
   out=$(STATE_DIR="$d" TASKS_DB="$d/tasks/tasks.db" FIVEDIVE_NO_HUMAN_SEND=1 \
         "$self" proof scorecard --7d 2>&1); rc=$?
@@ -932,14 +946,23 @@ _sc_probe_ship_ledger_liveness() {
   # Arming reads the ARTIFACT. Both patterns anchored at column 0 — the writer's
   # definition and the push call site — so neither this file's prose nor this very
   # grep can satisfy them.
+  # DIVE-6938: the push call site lives in the devteam plugin's cmd_push.sh, so
+  # the box is armed when the bundle has the writer AND the pinned plugin has the
+  # call; the window opens at whichever of the two arrived last.
+  local push_src="$bundle"
+  if [[ -n "${_DEVTEAM_DIR:-}" && -r "$_DEVTEAM_DIR/core/cmd_push.sh" ]]; then
+    push_src="$_DEVTEAM_DIR/core/cmd_push.sh"
+  fi
   if ! grep -q '^ship_ledger_record()' "$bundle" 2>/dev/null \
-     || ! grep -q '^_push_record_ship_ledger()' "$bundle" 2>/dev/null; then
+     || ! grep -q '^_push_record_ship_ledger()' "$push_src" 2>/dev/null; then
     _sc_notreached "not-armed" "the running bundle ($bundle) carries no ship-ledger writer, so ship_events cannot fill and its emptiness says nothing about the capture path"
     return
   fi
 
-  local armed_epoch armed_iso now_iso
+  local armed_epoch armed_iso now_iso push_epoch
   armed_epoch=$(stat -c %Y "$bundle" 2>/dev/null) || armed_epoch=""
+  push_epoch=$(stat -c %Y "$push_src" 2>/dev/null) || push_epoch=""
+  [[ "$armed_epoch" =~ ^[0-9]+$ && "$push_epoch" =~ ^[0-9]+$ ]] && (( push_epoch > armed_epoch )) && armed_epoch=$push_epoch
   [[ -n "$armed_epoch" ]] \
     || { _sc_notreached "no-arming-stamp" "the running bundle ($bundle) is armed but its mtime is unreadable, so the observation window has no start"; return; }
   armed_iso=$(date -u -d "@$armed_epoch" +%Y-%m-%dT%H:%M:%S 2>/dev/null)

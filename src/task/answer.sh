@@ -159,6 +159,9 @@ _task_escalation_gate_open() {   # <row id> -> 0 when the open gate is the cap e
   local _eg_id="${1:-}" _eg
   [[ "$_eg_id" =~ ^[0-9]+$ ]] || return 1
   declare -F _task_stuck_loop_pred >/dev/null 2>&1 || return 1
+  # DIVE-6938: the cap escalation and its options string are the devteam
+  # plugin's; read it in first, or there is no such gate to be on this box.
+  devteam_require || return 1
   _eg=$(db "SELECT CASE WHEN $(_task_stuck_loop_pred)
                      AND COALESCE(maker_agent,'') <> ''
                      AND COALESCE(need_options,'') = $(sqlq "${_ESCALATION_OPTIONS:-}")

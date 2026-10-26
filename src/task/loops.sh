@@ -1276,6 +1276,10 @@ _task_verify_merge_binding() {
   body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
   if [[ -n "$dref" ]]; then
     printf 'delivery_ref %s' "$dref"
+  elif ! devteam_loaded; then
+    # DIVE-6938: reading a PR or a branch out of the body is the devteam
+    # plugin's; without it only the bound field counts.
+    :
   elif _gate_text_names_a_ref "$body"; then
     printf 'a PR named in the body'
   else
@@ -1523,7 +1527,7 @@ cmd_task_verify() {
   # states it verified on vX" about a sentence the verifier did not write would be
   # a true finding attributed to the wrong author — the same misattribution
   # DIVE-2725 spent two iterations removing from a probe verdict.
-  _gate_version_vs_installed "$ident" verify "$result_txt"
+  if devteam_loaded; then _gate_version_vs_installed "$ident" verify "$result_txt"; fi
   local _v_guard_st
   _v_guard_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
   if [[ "$_v_guard_st" != "done" && "$_v_guard_st" != "cancelled" ]]; then

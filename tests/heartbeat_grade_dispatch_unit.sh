@@ -30,7 +30,7 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
          lib/verify_policy.sh lib/tasks_db.sh lib/actor.sh \
          cmd_task.sh cmd_org.sh cmd_project.sh cmd_heartbeat.sh \
-         task/grader_pool.sh task/grader_process.sh; do
+         lib/pace.sh ; do
   # The two grader files are sourced EXPLICITLY: `cmd_task.sh`'s lazy loader does
   # not reach them (they arrive through build.sh's bundle manifest in the shipped
   # CLI), so a harness that relied on the loader would grade a process in which
@@ -74,9 +74,9 @@ has "$G" "Budget 25 turns"   && ok_t "the CLONE lane's goal carries the budget" 
 # which is the property that matters (two hand-maintained copies is how the two
 # lanes stop being comparable), and it is stated as a source assertion rather
 # than dressed up as a behavioural one.
-grep -q '_grader_grade_method_clause' src/task/grader_pool.sh \
+grep -q '_grader_grade_method_clause' src/lib/pace.sh \
   && ok_t "the SESSION lane composes the same clause (source assertion)" \
-  || bad_t "the SESSION lane composes the same clause (source assertion)" "no call in src/task/grader_pool.sh"
+  || bad_t "the SESSION lane composes the same clause (source assertion)" "no call in src/lib/pace.sh"
 
 echo "── PART 3 — the heartbeat dispatch, per role ─────────────────────"
 mk() { # <ident> <assignee> <verifier> <maker> -> task id

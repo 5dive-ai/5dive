@@ -50,7 +50,7 @@ env:
   # on a tree that did not change. Pinned, that arrives as a bump PR that can be
   # graded and reverted. Every clone site in this file MUST use this ref --
   # the pinned-plugins-clone guard in unit-tests.yml fails the build otherwise.
-  PLUGINS_REF: 69f455755811fb4749448c401cfe16a893b93e22
+  PLUGINS_REF: 099ba849774acc54675364609054eb51d8f137fb
 
 jobs:
   # DIVE-3315: INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s
@@ -654,11 +654,15 @@ jobs:
       # `test` job, so this allowlist entry costs coverage of the probe's WIRING on
       # a real box, not of its logic — and a real box is exactly where a human runs
       # `5dive selfcheck --only=ship-ledger-liveness`.
+      # DIVE-6938: scorecard-honesty drives `proof scorecard`, which is the devteam
+      # plugin's; these jobs run the core alone, where the probe is NOT-REACHED with
+      # the reason no-devteam. The devteam-harnesses job runs
+      # selfcheck_mutation_e2e.sh with the plugin's files in place, mutation and all.
       - name: Do the rails ACT? (pristine)
         run: |
           # DIVE-2091: bundle is generated at tag time, not committed on main.
           ./build.sh
-          bash ./5dive selfcheck --allow=snapshot-rails,ship-ledger-liveness \
+          bash ./5dive selfcheck --allow=snapshot-rails,ship-ledger-liveness,scorecard-honesty \
             --label=pristine --report=selfcheck-pristine.txt
       - uses: actions/upload-artifact@v4
         if: always()
@@ -821,13 +825,13 @@ jobs:
         run: |
           # DIVE-2091: bundle is generated at tag time, not committed on main.
           ./build.sh
-          bash ./5dive selfcheck --allow=snapshot-rails,ship-ledger-liveness \
+          bash ./5dive selfcheck --allow=snapshot-rails,ship-ledger-liveness,scorecard-honesty \
             --label=installed-host --report=selfcheck-installed.txt
       - name: Do the rails ACT? (installed host, root)
         run: |
           # DIVE-2091: bundle is generated at tag time, not committed on main.
           ./build.sh
-          sudo bash ./5dive selfcheck --allow=snapshot-rails,ship-ledger-liveness \
+          sudo bash ./5dive selfcheck --allow=snapshot-rails,ship-ledger-liveness,scorecard-honesty \
             --label=installed-root --report=selfcheck-root.txt
           sudo chown "$USER" selfcheck-root.txt
       - uses: actions/upload-artifact@v4
@@ -1193,11 +1197,37 @@ jobs:
   # — so the obvious one-line version of these jobs passes the merge gate in precisely the
   # case where the corpus went red. Anything that is not `success` fails here, `skipped`
   # and `cancelled` included.
+  # DIVE-6938: the dev-team tools (PR delivery, graders, gate evidence, proof,
+  # gh/push/deploy) left this repo for the devteam plugin, and their harnesses
+  # went with them to 5dive-plugins/tests/devteam/. They still grade THIS tree:
+  # the plugin's runner clones it, puts the plugin's modules back where they used
+  # to sit, and runs every one. So a change here that breaks a dev-team flow on
+  # our own boxes is red on its own pull request, not at the next plugin PR.
+  devteam-harnesses:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: { shard: [1, 2, 3, 4] }
+    steps:
+      - name: Fetch 5dive-plugins (the devteam plugin and its harnesses)
+        run: |
+          git init --quiet "$RUNNER_TEMP/5dive-plugins"
+          git -C "$RUNNER_TEMP/5dive-plugins" remote add origin https://github.com/5dive-ai/5dive-plugins
+          git -C "$RUNNER_TEMP/5dive-plugins" fetch --quiet --depth 1 origin "$PLUGINS_REF"
+          git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Run the devteam harnesses against this tree (shard ${{ matrix.shard }})
+        run: |
+          bash "$RUNNER_TEMP/5dive-plugins/tests/devteam_core_harnesses.sh" \
+            --core="$GITHUB_WORKSPACE" --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+
   test:
     # core-total-produced is in here on purpose, and it is why this check waits on the
     # installed-host shards too: the honesty instrument being ALIVE is part of what the merge
     # gate covers, and a job nothing requires is a job that can go red for a week.
-    needs: [core-pristine, acp-graded-pristine, core-total-produced, workflow-structure-guards]
+    needs: [core-pristine, acp-graded-pristine, core-total-produced, workflow-structure-guards, devteam-harnesses]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -1205,6 +1235,7 @@ jobs:
         run: |
           rc=0
           for d in "core-pristine=${{ needs['core-pristine'].result }}" \
+                   "devteam-harnesses=${{ needs['devteam-harnesses'].result }}" \
                    "acp-graded-pristine=${{ needs['acp-graded-pristine'].result }}" \
                    "core-total-produced=${{ needs['core-total-produced'].result }}" \
                    "workflow-structure-guards=${{ needs['workflow-structure-guards'].result }}"; do
