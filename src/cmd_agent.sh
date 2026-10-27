@@ -33,7 +33,7 @@ _agent_operational_state() { # <active> <auth-state> <startup-state> [supervisor
   # it. Only `exhausted` gates — `unmeasured` is not evidence about the seat.
   [[ "$quota" == "exhausted" ]] && { printf 'quota-exhausted\n'; return 0; }
   case "$auth:$startup" in
-    needs_login:*|expired:*|*:degraded) printf 'degraded\n'; return 0 ;;
+    needs_login:*|expired:*|refused:*|*:degraded) printf 'degraded\n'; return 0 ;;
     unknown:*|*:unknown)               printf 'unknown\n'; return 0 ;;
   esac
   # The survey deliberately does not run the per-seat output queries. Say what
@@ -704,10 +704,11 @@ except Exception:
 units = [f"5dive-agent@{name}.service" for name in agents]
 active = {}
 enabled = {}
+started = {}
 if units:
     try:
         cp = subprocess.run(
-            ["/usr/bin/systemctl", "show", "--property=Id,ActiveState,UnitFileState", "--no-page", *units],
+            ["/usr/bin/systemctl", "show", "--property=Id,ActiveState,UnitFileState,ActiveEnterTimestamp", "--timestamp=unix", "--no-page", *units],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
         )
         block = {}
@@ -718,6 +719,7 @@ if units:
                     name = unit[len("5dive-agent@"):-len(".service")]
                     active[name] = block.get("ActiveState", "")
                     enabled[name] = block.get("UnitFileState", "")
+                    started[name] = block.get("ActiveEnterTimestamp", "")
                 block = {}
             elif "=" in line:
                 key, value = line.split("=", 1)
@@ -1043,6 +1045,67 @@ def startup_health(name):
         return "clear", None
     return "unknown", "credential-start breadcrumb is not readable from here"
 
+# DIVE-7118: the seat's own last turn, refused by its AI account. The same
+# parse as src/lib/seat_refusal.sh (seat_account_refusal); see that file for why
+# the transcript, and not the probe or the credential file, is the reading.
+SEAT_REFUSAL_TEXT_RE = re.compile(r"credit balance is too low|invalid api key|not logged in|please run /login|oauth token (has expired|revoked)|organization has been disabled", re.I)
+
+def unit_started_epoch(text):
+    # `systemctl show --timestamp=unix` prints "@<epoch>"; unreadable -> 0, which
+    # counts every refusal (unknown is not "restarted since").
+    m = re.match(r"^@([0-9]+)$", (text or "").strip())
+    return int(m.group(1)) if m else 0
+
+def seat_refusal(name, since=0):
+    root = os.path.join(home_root, f"agent-{name}", ".claude", "projects")
+    newest, newest_m = None, -1.0
+    try:
+        for proj in os.listdir(root):
+            d = os.path.join(root, proj)
+            try:
+                for fn in os.listdir(d):
+                    if fn.endswith(".jsonl"):
+                        fp = os.path.join(d, fn)
+                        m = os.stat(fp).st_mtime
+                        if m > newest_m:
+                            newest, newest_m = fp, m
+            except OSError:
+                continue
+    except OSError:
+        return None
+    if not newest:
+        return None
+    try:
+        with open(newest, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 1024 * 1024))
+            lines = fh.read().decode("utf-8", "replace").splitlines()[-400:]
+    except OSError:
+        return None
+    rec = None
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "assistant":
+            rec = obj
+    if not rec or rec.get("isApiErrorMessage") is not True:
+        return None
+    ts = re.sub(r"\.[0-9]+", "", str(rec.get("timestamp") or ""))
+    try:
+        t = int(dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp())
+    except ValueError:
+        t = 0
+    if t < since:
+        return None
+    content = (rec.get("message") or {}).get("content") or []
+    text = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+    if rec.get("error") not in ("billing_error", "authentication_failed") and not SEAT_REFUSAL_TEXT_RE.search(text):
+        return None
+    return (text or rec.get("error") or "refused").replace("\n", " ")[:200]
+
 # DIVE-5104: the agent's portrait, if it has one. Metadata only — the dashboard
 # asks for the bytes with `agent avatar get <name> --data`, keyed on mtime. A
 # symlink, an empty file or one over the cap reads as no avatar, so the
@@ -1169,6 +1232,9 @@ for name, value in agents.items():
                 deaf = True
     asleep = value.get("heartbeat", {}).get("enabled", False) is not True if isinstance(value.get("heartbeat"), dict) else True
     auth_state, auth_exp, auth_refresh = auth_health(agent_type, profile)
+    refusal = seat_refusal(name, unit_started_epoch(started.get(name, "")))
+    if refusal:
+        auth_state, auth_exp, auth_refresh = "refused", None, False
     startup_state, startup_reason = startup_health(name)
     live = active.get(name) or "unknown"
     unit_enabled = enabled.get(name) or "unknown"
@@ -1182,7 +1248,7 @@ for name, value in agents.items():
         # `account usage` printed 101%. A distinct verdict, not a warning worn
         # under a green word.
         operational = "quota-exhausted"
-    elif auth_state in ("needs_login", "expired") or startup_state == "degraded":
+    elif auth_state in ("needs_login", "expired", "refused") or startup_state == "degraded":
         operational = "degraded"
     elif auth_state == "unknown" or startup_state == "unknown":
         operational = "unknown"
@@ -1215,7 +1281,8 @@ for name, value in agents.items():
         "orgBlocksChannels": org_blocks,
         "orgChannelsOff": org_off,
         "health": {"deaf": deaf, "asleep": asleep,
-                   "auth": {"state": auth_state, "expiresAt": iso_time(auth_exp), "refreshable": auth_refresh},
+                   "auth": {"state": auth_state, "expiresAt": iso_time(auth_exp), "refreshable": auth_refresh,
+                            "refusal": refusal},
                    "quota": quota,
                    "startup": {"state": startup_state, "reason": startup_reason}},
     })
@@ -1269,7 +1336,8 @@ cmd_list() {
        ([.[] | select(.active == "active" and ((.health.auth.state == "needs_login") or (.health.auth.state == "expired"))) | .name] | join(", ")),
        ([.[] | select(.sudo.measured | not)] | length),
        ([.[] | select(.sudo.diverges)] | length),
-       ([.[] | select(.sudo.extraEntries)] | length)] | .[]' <<<"$merged")
+       ([.[] | select(.sudo.extraEntries)] | length),
+       ([.[] | select(.health.auth.state == "refused") | .name] | join(", "))] | .[]' <<<"$merged")
     local -a _legend_values=()
     mapfile -t _legend_values <<<"$_legends"
     _lg_login="${_legend_values[0]:-0}"
@@ -1279,6 +1347,11 @@ cmd_list() {
     _lg_unk="${_legend_values[4]:-0}"
     _lg_div="${_legend_values[5]:-0}"
     _lg_ext="${_legend_values[6]:-0}"
+    # DIVE-7118: a seat whose own last turn the AI account refused.
+    if [[ -n "${_legend_values[7]:-}" ]]; then
+      echo
+      echo "AUTH refused = the seat's own last turn was refused by its AI account (no credit, or a bad key), though the credential file is present: ${_legend_values[7]} (5dive agent info <name>)"
+    fi
     if (( _lg_login || _lg_exp )); then
       echo
       echo "AUTH: $(( _lg_login + _lg_exp )) agent(s) have no usable credential (5dive agent auth start <type> --auth-profile=<p>)"
@@ -2072,6 +2145,9 @@ cmd_info() {
   local _info_prof _ha _ha_state _ha_exp _ha_refresh _hs _hs_state _hs_reason _op_state _auth_line
   _info_prof=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
   _ha=$(agent_auth_health "$type" "$_info_prof" "$name" || true)
+  # DIVE-7118: what the account said, for the warning below.
+  local _ha_refusal=""
+  [[ "${_ha%%|*}" == refused ]] && { _ha_refusal=$(seat_account_refusal "$name" 2>/dev/null) || _ha_refusal=""; }
   [[ -n "$_ha" ]] || _ha='unknown|-|false'
   _ha_state="${_ha%%|*}"
   _ha_exp="${_ha#*|}"; _ha_exp="${_ha_exp%%|*}"
@@ -2114,6 +2190,7 @@ cmd_info() {
     --arg cbDetail "$_cb_detail" \
     --arg cbEvidence "$_cb_evidence" \
     --arg haState "$_ha_state" --arg haExp "$_ha_exp" --arg haRefresh "$_ha_refresh" \
+    --arg haRefusal "$_ha_refusal" \
     --arg hsState "$_hs_state" --arg hsReason "$_hs_reason" --arg opState "$_op_state" \
     --arg authLine "$_auth_line" \
     '.agents[$n] as $a | {
@@ -2176,7 +2253,8 @@ cmd_info() {
       health: {
         auth: {state: $haState,
                expiresAt: (if $haExp == "-" then null else ($haExp | tonumber | todate) end),
-               refreshable: ($haRefresh == "true")},
+               refreshable: ($haRefresh == "true"),
+               refusal: (if $haRefusal == "" then null else $haRefusal end)},
         startup: {state: $hsState,
                   reason: (if $hsReason == "" then null else $hsReason end)},
         quota: {state: $qState,
@@ -2246,6 +2324,9 @@ cmd_info() {
        else empty end),
       (if .health.quota.state == "exhausted" then
          "\nWARNING: this seat CANNOT EXECUTE A SINGLE TOKEN. Its auth account \(.authProfile // "?") is at \(.health.quota.pct)% of its \(.health.quota.window) rate limit\(if .health.quota.resetsAt then " and does not reset until \(.health.quota.resetsAt)" else "" end). The process is \(.active), the credential parses, and neither fact matters until the window turns over — this is the one measurement that decides whether the seat can work, and before DIVE-4342 none of `agent list`, `liveness` or `supervisor` consulted it. Move the seat to an account with headroom (`sudo 5dive account usage` to find one, then `5dive agent config set auth-profile=<name> --agent=\(.name)`) or reassign what is queued behind it: 5dive task ls --assignee=\(.name)"
+       else empty end),
+      (if .health.auth.state == "refused" then
+         "\nWARNING: this seat CANNOT ANSWER: its own last turn was refused by its AI account (\(.health.auth.refusal // "refused")). The credential file is present, so every file check reads ok, and a headless probe can still pass on an account that refuses the interactive client the seat runs. Fix the account (add credit, or set a new key with `5dive agent auth set`), which restarts the seat and clears this line (DIVE-7118)."
        else empty end),
       (if (.health.auth.state == "needs_login" or .health.auth.state == "expired" or .health.startup.state == "degraded") then
          "\nWARNING: this seat is DEGRADED: the process is \(.active), but its provider credential is not usable. Repair with `5dive agent auth status --agent=\(.name)` followed by the appropriate `5dive agent auth start ...`, then restart the seat."

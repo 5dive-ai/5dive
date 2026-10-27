@@ -10350,6 +10350,20 @@ cmd_heartbeat_tick() {
       esac
     fi
 
+    # --- DIVE-7118 account-refusal hold -----------------------------------------
+    # The seat's own last turn was refused by its AI account (no credit, a bad
+    # key) since it last started. A row handed to it now is claimed and answered
+    # with the same refusal: the live QA box dispatched /goal into exactly that.
+    # It needs a person to fix the account, not a retry, so nothing is dispatched
+    # until the seat restarts (a new key does that) or a turn gets through.
+    local _refusal=""
+    if declare -F seat_account_refusal >/dev/null 2>&1 \
+       && _refusal=$(seat_account_refusal "$name" "$(seat_started_epoch "$name")"); then
+      sk_capped=$((sk_capped + 1))
+      _hb_log "[$name] not dispatched — its last turn was refused by its AI account ('${_refusal:0:80}'); a row would be claimed and get the same refusal. Fix the account (credit or a new key, which restarts the seat) and dispatch resumes (DIVE-7118)"
+      continue
+    fi
+
     # Wake the agent against ONE concrete todo — the /goal condition needs a
     # concrete DIVE-N to evaluate reliably — but consider the queue IN ORDER
     # until one is actually runnable.
