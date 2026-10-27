@@ -2,7 +2,7 @@
 # DIVE-7128 — a STANDARD seat's secret gate reaches its owner with the one-time
 # link, and the seat never holds it.
 #
-# lodar, 2026-10-27, on oinoa's DIVE-7127 key ask (poke-two, an OSS box): the
+# lodar, 2026-10-27, on a standard seat's DIVE-7127 key ask (poke-two, an OSS box): the
 # alert said "open this task in the 5dive app", and an OSS box has no app. A
 # standard seat cannot mint, because a link is the right to write one key into a
 # root-owned connector file. So the seat hands the gate to one exact-path root
@@ -68,8 +68,8 @@ SEND_ALLOWED=0
 _task_human_send_allowed() { (( SEND_ALLOWED )); }
 _task_store_audit_log() { :; }
 audit_log() { :; }
-mkdir -p "$TMP/ch/oinoa"
-printf '{"allowFrom":["1234567890"]}' >"$TMP/ch/oinoa/access.json"
+mkdir -p "$TMP/ch/alpha"
+printf '{"allowFrom":["1234567890"]}' >"$TMP/ch/alpha/access.json"
 _task_agent_channel() {
   TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE="" TASK_CH_AGENT=""
   [[ -n "$1" && -d "$TMP/ch/$1" ]] || return 1
@@ -120,9 +120,9 @@ sudo() {
   [[ -n "$SUDO_ERR" ]] && printf '%s\n' "$SUDO_ERR" >&2
   printf '%s\n' "$SUDO_OUT"; return "$SUDO_RC"
 }
-id() { [[ "${1:-}" == -un ]] && { printf 'agent-oinoa\n'; return 0; }; command id "$@"; }
+id() { [[ "${1:-}" == -un ]] && { printf 'agent-alpha\n'; return 0; }; command id "$@"; }
 SEAT_TIER=standard
-agent_tier() { [[ "$1" == oinoa ]] && printf '%s\n' "$SEAT_TIER" || printf 'unknown:unregistered\n'; }
+agent_tier() { [[ "$1" == alpha ]] && printf '%s\n' "$SEAT_TIER" || printf 'unknown:unregistered\n'; }
 cross() {
   : >"$SUDO_LOG"; : >"$SUDO_IN"
   TASK_SEND_DELIVERED=0 TASK_SEND_TARGETS="" TASK_GATE_DROP_LINK_TTL="" TASK_GATE_DELIVERY_ROWS=0
@@ -151,7 +151,7 @@ check 'S3 no grant yet: no cross, only the sudo -l probe, and a none line says w
   "rc=$rc sudo=$(cat "$SUDO_LOG") log=$(tail -n1 "$LOG")"
 SUDO_L_RC=0
 
-SUDO_RC=13; SUDO_OUT=""; SUDO_ERR="DIVE-7127's gate was filed by main, not oinoa"
+SUDO_RC=13; SUDO_OUT=""; SUDO_ERR="DIVE-7127's gate was filed by main, not alpha"
 cross; rc=$?
 check 'S4 root refused: the seat falls back (rc 1, nothing credited) and the reason is logged' \
   '[[ "$rc" == 1 && "$TASK_SEND_DELIVERED" == 0 && "$(tail -n1 "$LOG")" == *"result=error tasks=DIVE-7127"*"filed\\ by\\ main"* ]]' \
@@ -170,7 +170,7 @@ unset -f sudo id agent_tier
 
 # ================================ R: the root half ============================
 _gate_is_root() { return 0; }
-_gate_uid_to_agent() { case "$1" in 1101) printf 'oinoa' ;; 1102) printf 'quinn' ;; *) printf '' ;; esac; }
+_gate_uid_to_agent() { case "$1" in 1101) printf 'alpha' ;; 1102) printf 'quinn' ;; *) printf '' ;; esac; }
 root_send() { # stdin text; prints "rc|stdout|stderr"
   local out err rc=0
   out=$( (printf '%s' "$1" | cmd_secret_link_notify_delegated "${@:2}") 2>"$TMP/err" ) || rc=$?
@@ -179,7 +179,7 @@ root_send() { # stdin text; prints "rc|stdout|stderr"
 }
 export SUDO_UID=1101
 
-reset; mk_gate DIVE-7127 oinoa
+reset; mk_gate DIVE-7127 alpha
 got=$(root_send $'DIVE-7127\nnonce-abc\n')
 check "R1 the seat's own open gate: sent, and stdout is exactly one line" \
   '[[ "$got" == "0|sent ttl=30 to=1234567890|" ]]' "got=$got"
@@ -195,28 +195,28 @@ check '  R1d ...minted once, and the gate is stamped pinged' \
 reset; mk_gate DIVE-7127 main
 got=$(root_send $'DIVE-7127\n\n')
 check "R2 another seat's gate is refused, nothing minted or sent" \
-  '[[ "${got%%|*}" != 0 && "$got" == *"filed by main, not oinoa"* && ! -s "$MINT_LOG" && ! -s "$SEND_TEXT" ]]' "got=$got"
+  '[[ "${got%%|*}" != 0 && "$got" == *"filed by main, not alpha"* && ! -s "$MINT_LOG" && ! -s "$SEND_TEXT" ]]' "got=$got"
 
 for shape in answered closed manual nokey; do
   reset
   case "$shape" in
-    answered) mk_gate DIVE-7127 oinoa secret blocked yes ;;
-    closed)   mk_gate DIVE-7127 oinoa secret 'done' ;;
-    manual)   mk_gate DIVE-7127 oinoa manual ;;
-    nokey)    mk_gate DIVE-7127 oinoa secret blocked "" "" ;;
+    answered) mk_gate DIVE-7127 alpha secret blocked yes ;;
+    closed)   mk_gate DIVE-7127 alpha secret 'done' ;;
+    manual)   mk_gate DIVE-7127 alpha manual ;;
+    nokey)    mk_gate DIVE-7127 alpha secret blocked "" "" ;;
   esac
   got=$(root_send $'DIVE-7127\n\n')
   check "R3 refused on a gate that is ${shape}, nothing minted or sent" \
     '[[ "${got%%|*}" != 0 && "$got" == *"no open secret gate"* && ! -s "$MINT_LOG" && ! -s "$SEND_TEXT" ]]' "got=$got"
 done
 
-reset; mk_gate DIVE-7127 oinoa
+reset; mk_gate DIVE-7127 alpha
 printf 'task=DIVE-7127\nkey=CLERK_SECRET_KEY\nconnector=tools\nexpires=%s\n' "$(( $(date +%s) + 600 ))" >"$SECRET_DROP_DIR/live"
 got=$(root_send $'DIVE-7127\n\n')
 check 'R4 a link for the gate is still live: refused, nothing minted or sent (no paging loop)' \
   '[[ "${got%%|*}" != 0 && "$got" == *"already live"* && ! -s "$MINT_LOG" && ! -s "$SEND_TEXT" ]]' "got=$got"
 
-reset; mk_gate DIVE-7127 oinoa
+reset; mk_gate DIVE-7127 alpha
 _gate_is_root() { return 1; }
 got=$(root_send $'DIVE-7127\n\n')
 check 'R5a not root: refused' '[[ "${got%%|*}" != 0 && "$got" == *"privileged internal primitive"* && ! -s "$MINT_LOG" ]]' "got=$got"
@@ -230,7 +230,7 @@ check 'R5d an argument: refused (the grant is the exact path)' '[[ "${got%%|*}" 
 got=$(root_send $'DIVE-7127; rm -rf /\n\n')
 check 'R5e a malformed ident: refused' '[[ "${got%%|*}" != 0 && "$got" == *"expected a task ident"* && ! -s "$MINT_LOG" ]]' "got=$got"
 
-reset; mk_gate DIVE-7127 oinoa; SEND_OK=0
+reset; mk_gate DIVE-7127 alpha; SEND_OK=0
 got=$(root_send $'DIVE-7127\n\n')
 live=$(ls "$SECRET_DROP_DIR" | wc -l | tr -d ' ')
 check 'R6 a send nobody received: refused, and the link it minted is burned' \
@@ -252,7 +252,7 @@ unset FIVEDIVE_NOTIFY_DRYRUN
 MARKUP='{"inline_keyboard":[[{"text":"🔑 Open secure link","url":"'"$URL"'"}]]}'
 nsendfiles() { local f n=0; for f in "${TMPDIR:-/tmp}"/5dive-send.*; do [[ -e "$f" ]] && n=$((n+1)); done; printf '%s' "$n"; }
 before=$(nsendfiles)
-resp=$(_mirror_send tok-oinoa 1234567890 "" "🔑 Paste it here: ${URL}" "$MARKUP")
+resp=$(_mirror_send tok-alpha 1234567890 "" "🔑 Paste it here: ${URL}" "$MARKUP")
 after=$(nsendfiles)
 check 'A1 neither the text nor the keyboard is in curl argv, and both still reach Telegram, byte for byte' \
   '[[ "$(cat "$CURL_ARGV")" != *"$TOKEN"* && "$(cat "$CURL_SEEN")" == "🔑 Paste it here: ${URL}"$'"'"'\n'"'"'"${MARKUP}" && "$resp" == *"\"ok\":true"* ]]' \
@@ -261,9 +261,9 @@ check '  A1b ...and the files are gone afterwards' '[[ "$after" == "$before" ]]'
 unset -f curl
 
 # =================== G: the grant in the standard sudoers template ============
-sud=$(render_standard_sudoers agent-oinoa 0 0)
+sud=$(render_standard_sudoers agent-alpha 0 0)
 check 'G1 the standard template grants the exact verb, no wildcard' \
-  'grep -qx "agent-oinoa ALL=(root) NOPASSWD: /usr/local/bin/5dive _secret_link_notify" <<<"$sud" && ! grep -q "_secret_link_notify \*" <<<"$sud"' \
+  'grep -qx "agent-alpha ALL=(root) NOPASSWD: /usr/local/bin/5dive _secret_link_notify" <<<"$sud" && ! grep -q "_secret_link_notify \*" <<<"$sud"' \
   "$(grep _secret_link_notify <<<"$sud")"
 check '  G1b ...and still classifies cli-scoped with no extra entries' \
   '[[ "$(classify_sudo_grant <<<"$sud")" == "cli-scoped|root|0" ]]' "$(classify_sudo_grant <<<"$sud")"
