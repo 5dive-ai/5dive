@@ -3493,6 +3493,18 @@ cmd_import() {
   # empty there and the manifest value stands.)
   [[ -n "$p_type" ]]   && type="$p_type"
   isolation=$(_import_resolve_isolation "$isolation" "$p_iso" "$p_iso_set")
+  # DIVE-7118: the README's fresh-box path is `init`, then `agent import olivia`.
+  # create makes the FIRST agent on an empty box admin so the box has a lead
+  # (_create_default_isolation), but import always passed the pack's tier, and a
+  # pack's `standard` is an explicit --isolation to create, so the head agent came
+  # up unable to run the team. A pack tier is its author's guess (DIVE-6410), so
+  # here the box's bootstrap rule wins over it; an explicit flag and a pack that
+  # asks to be sandboxed are kept.
+  if (( ! p_iso_set )) && [[ "$isolation" == standard ]] \
+     && [[ "$(registry_read 2>/dev/null | jq -r '(.agents // {}) | length' 2>/dev/null || echo 1)" == 0 ]]; then
+    isolation=admin
+    step "First agent on this box: admin, so it can run the team (pass --isolation=standard to keep it least-privilege)"
+  fi
   [[ -n "$p_model" ]]  && model="$p_model"
   [[ -n "$p_effort" ]] && effort="$p_effort"
   # DIVE-2303: resolve a family ALIAS to the full current id before it reaches
@@ -3559,7 +3571,20 @@ cmd_import() {
       step "No --auth-profile: using this box's one signed-in AI account '$profile'"
     fi
   fi
-  [[ -n "$profile" ]] || profile="$as"
+  # DIVE-7118: `init`'s API-key and sign-in steps save into the box's SHARED
+  # login, not an account, and _create_sole_account steps aside for it ("a seat
+  # with no account uses that"). create does; import did not: the line below
+  # gave the head agent a new, empty per-agent account and deferred its login,
+  # beside the key init had just saved. With the shared login holding this
+  # type's credential, the seat is created on it: no account, no deferral.
+  local shared_login=0
+  lazy_need auth_creds_present
+  if [[ -z "$profile" && -z "$p_provider" && -z "$p_api_key" ]] \
+     && auth_creds_present "$type" >/dev/null 2>&1; then
+    shared_login=1
+    step "No --auth-profile: using this box's shared AI login (the one 5dive init saved)"
+  fi
+  (( shared_login )) || [[ -n "$profile" ]] || profile="$as"
 
   # Build the create argv. Skills are re-added afterwards (best-effort) so one
   # unresolvable ref can't abort the import. Channels default to none unless the
@@ -3599,7 +3624,7 @@ cmd_import() {
   if (( ! byo )) && [[ -n "$model_req" ]]; then
     model=$(resolve_model_for_profile "$model_req" "$profile")
   fi
-  cargs+=("--auth-profile=$profile")
+  [[ -n "$profile" ]] && cargs+=("--auth-profile=$profile")
   if (( byo )); then
     cargs+=("--provider=$p_provider" "--api-key=$p_api_key")
     # Forward the model only when it can be MEANT for this seat: an explicit
@@ -3611,7 +3636,7 @@ cmd_import() {
     if [[ -n "$model" ]] && { [[ -n "$p_model" ]] || [[ "$type" == "claude" ]]; }; then
       cargs+=("--model=$model")
     fi
-  else
+  elif (( ! shared_login )); then
     cargs+=("--defer-auth")
   fi
   if [[ -n "$channels" ]]; then

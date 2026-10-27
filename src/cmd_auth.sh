@@ -526,12 +526,29 @@ cmd_auth_status() {
   # moved it into a db the seed did not carry), and this said `ok` while every
   # message failed. The boot seed's breadcrumb is the seat's own verdict, so a
   # degraded one turns an `ok` into `stale` and says why.
-  local seat_reason=""
+  local seat_reason="" seat_say=""
   if [[ -n "$agent" ]] && declare -F _agent_startup_credential_health >/dev/null 2>&1; then
     local _hs
     _hs=$(_agent_startup_credential_health "$agent" 2>/dev/null || true)
     if [[ "${_hs%%|*}" == degraded ]]; then
-      seat_reason="${_hs#*|}"
+      seat_reason="${_hs#*|}"; seat_say="the agent's own start says: ${seat_reason}"
+      out=$(jq -c --arg t "$t" 'if .[$t] == "ok" then .[$t] = "stale" else . end' <<<"$out")
+    fi
+  fi
+
+  # DIVE-7118: --probe asks the CLI headless, and an account can answer that and
+  # refuse the seat's interactive client. The seat's own last turn is the
+  # reading of the path it actually uses, so a refusal there turns `ok` into
+  # `stale` too.
+  if [[ -n "$agent" && -z "$seat_reason" ]] && declare -F seat_turn_trouble >/dev/null 2>&1; then
+    local _rf
+    if _rf=$(seat_turn_trouble "$agent" "$(seat_started_epoch "$agent")"); then
+      seat_reason="${_rf#*$'\t'}"
+      if [[ "${_rf%%$'\t'*}" == refused ]]; then
+        seat_say="its own last turn was refused by its AI account: ${seat_reason}"
+      else
+        seat_say="its own turns keep failing on its AI login: ${seat_reason}"
+      fi
       out=$(jq -c --arg t "$t" 'if .[$t] == "ok" then .[$t] = "stale" else . end' <<<"$out")
     fi
   fi
@@ -594,7 +611,7 @@ cmd_auth_status() {
   else
     echo "$out" | jq -r 'to_entries[] | "\(.key): \(.value)"' | sort
     echo "scope: ${scope_label}" >&2
-    [[ -z "$seat_reason" ]] || echo "seat: the agent's own start says: ${seat_reason}" >&2
+    [[ -z "$seat_say" ]] || echo "seat: ${seat_say}" >&2
     if [[ "$uncovered_status" != "measured" ]]; then
       echo "COVERAGE UNKNOWN (${uncovered_status#unknown:}): this answer's blind spot could not be measured — it is NOT zero agents, it is unmeasured." >&2
       echo "  re-run as a caller that can read the agent registry, or check one agent at a time: 5dive agent auth status --agent=<name>" >&2
@@ -1162,6 +1179,15 @@ _cred_refreshable() {
 agent_auth_health() {
   local type="$1" profile="${2:-}" name="${3:-}"
   local sentinel="${TYPE_AUTH[$type]:-}"
+  # DIVE-7118: the seat's own turns outrank the credential file. A key the
+  # account refuses (no credit, revoked) is a present, unexpired file — `ok` by
+  # every test below — on a seat that cannot answer one message. `refused` is
+  # that; `failing` is a run of turns that stopped on an API error (witty-palm).
+  local _trouble=""
+  if [[ -n "$name" ]] && declare -F seat_turn_trouble >/dev/null 2>&1 \
+     && _trouble=$(seat_turn_trouble "$name" "$(seat_started_epoch "$name")"); then
+    echo "${_trouble%%$'\t'*}|-|false"; return 0
+  fi
   [[ -n "$sentinel" ]] || { echo "ok|-|false"; return 0; }
   # A codex seat does not run on the profile file: 5dive-agent-start only SEEDS
   # $HOME/.codex/auth.json from it and points CODEX_HOME there, and from then on
