@@ -63,7 +63,10 @@ Agents:
                             [--provider=<id> --api-key=<key|->]
                             [--with-skills=<spec>[,<spec>...]] [--no-skills]
                             [--no-team-bot] [--defer-auth] [--can-push]
-                            [--human=<id>]
+                            [--human=<id>] [--own-login]
+                            # --own-login: a codex/grok hire by an agent uses the
+                            # box's existing sign-in for that provider; this keeps
+                            # the named --auth-profile as a separate sign-in.
                             # --human=<id> names the PERSON this agent belongs to
                             # (a row from '5dive human ls'): their telegram id is
                             # pre-allowed on the new bot, so there is no code to

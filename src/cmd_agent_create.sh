@@ -2952,21 +2952,48 @@ _create_caller_is_agent() {
 # account, printed, rc 0. rc 1 for any other type, for none or several, or when
 # the shared login holds a credential (a seat with no account uses that, as
 # before). The demo AI never counts: it is the owner's trial (DIVE-6843).
+# DIVE-7084: codex and grok too: their sign-in lives in the account's own
+# <type>/ dir, so a Claude-only account is never one of theirs.
 _create_sole_account() {
   local type="${1:-}" d p found=""
-  [[ "$type" == "claude" && -n "${AUTH_PROFILES_DIR:-}" && -d "${AUTH_PROFILES_DIR:-}" ]] || return 1
+  [[ "$type" == "claude" || "$type" == "codex" || "$type" == "grok" ]] || return 1
+  [[ -n "${AUTH_PROFILES_DIR:-}" && -d "${AUTH_PROFILES_DIR:-}" ]] || return 1
   lazy_need auth_creds_present
   auth_creds_present "$type" >/dev/null 2>&1 && return 1
   for d in "${AUTH_PROFILES_DIR}"/*/; do
     [[ -d "$d" ]] || continue
     p=$(basename "$d")
     _create_uses_demo_ai "$p" "" && continue
-    auth_creds_present "$type" "$p" >/dev/null 2>&1 || continue
+    _create_has_login "$type" "$p" || continue
     [[ -z "$found" ]] || return 1
     found="$p"
   done
   [[ -n "$found" ]] || return 1
   printf '%s\n' "$found"
+}
+
+# DIVE-7084: _create_has_login <type> [account] — rc 0 when the account (or, with
+# none, the box's shared login) holds a sign-in for this type. For codex and grok
+# that is the account's own credential file or that harness's API key: the
+# account fallback in auth_creds_present takes ANY key in combined.env, so there
+# a Claude account reads as signed in to Codex, and a codex seat bound to it
+# boots on Codex's sign-in menu. Paths are built here, not by profile_type_dir,
+# which creates the dir it names.
+_create_has_login() {
+  local type="${1:-}" acct="${2:-}" f="" var
+  lazy_need auth_creds_present
+  if [[ -z "$acct" || ( "$type" != "codex" && "$type" != "grok" ) ]]; then
+    auth_creds_present "$type" "$acct" >/dev/null 2>&1
+    return
+  fi
+  case "$type" in
+    codex) f="${AUTH_PROFILES_DIR}/${acct}/codex/auth.json" ;;
+    grok)  f="${AUTH_PROFILES_DIR}/${acct}/grok/.grok/auth.json" ;;
+  esac
+  [[ -s "$f" ]] && return 0
+  var="${TYPE_API_VAR[$type]:-}"
+  [[ -n "$var" ]] || return 1
+  grep -Eq "^${var}=.+" "${AUTH_PROFILES_DIR}/${acct}/combined.env" 2>/dev/null
 }
 
 # DIVE-7028: the marker self-host-link.sh (5dive-api) writes when it links this
@@ -3002,6 +3029,7 @@ cmd_create() {
   local cos_owner_id=""
   local byo_provider="" byo_api_key="" byo_model="" byo_effort="" byo_base_url=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
+  local own_login=0           # DIVE-7084: a separate codex/grok sign-in, on the owner's ask
   local isolation="" isolation_explicit=0 no_team_bot=0
   # DIVE-4269: a created seat is ENROLLED in the heartbeat by default. See the
   # enrolment block near the self-check for why the default flipped.
@@ -3037,6 +3065,7 @@ cmd_create() {
       --no-heartbeat)              no_heartbeat=1 ;;
       --heartbeat-every=*)         heartbeat_every="${1#--heartbeat-every=}" ;;
       --defer-auth)                defer_auth=1 ;;
+      --own-login)                 own_login=1 ;;
       --isolation=*)               isolation="${1#--isolation=}"; isolation_explicit=1 ;;
       --inherit-memory=*)          inherit_memory="${1#--inherit-memory=}" ;;
       --human=*)                   human_id="${1#--human=}" ;;
@@ -3047,7 +3076,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--telegram-profile=lite|default] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--telegram-profile=lite|default] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--own-login] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -3231,9 +3260,39 @@ cmd_create() {
       step "No --auth-profile: using this box's one signed-in AI account '$profile'"
     fi
   fi
+  # DIVE-7084: one sign-in per provider per box. A lead hiring on Codex or Grok
+  # named an account with no sign-in for it (a Claude account, the demo AI, or a
+  # new one named after the hire), so every hire posted a second device link for
+  # an account the owner had already signed in to: 4 sign-ins for 2 agents on
+  # 2026-10-27. When an AGENT does that and the box already holds that provider's
+  # login, the seat uses it. The owner's own surfaces still get the account they
+  # named (the dashboard's "new account" flow signs in to exactly that name), and
+  # --own-login keeps a separate sign-in when the owner asked for one.
+  (( own_login )) && [[ -z "$profile" ]] \
+    && fail "$E_USAGE" "--own-login needs --auth-profile=<new account> to hold that sign-in"
+  if [[ "$type" == "codex" || "$type" == "grok" ]] && (( ! own_login )) \
+     && [[ -z "$byo_provider" && -z "$byo_api_key" && -z "$byo_base_url" ]]; then
+    local _box_login=""
+    if _create_has_login "$type"; then
+      _box_login="(shared)"
+    elif _box_login=$(_create_sole_account "$type"); then
+      :
+    else
+      _box_login=""
+    fi
+    if [[ -n "$_box_login" && -n "$profile" ]] && _create_caller_is_agent \
+       && ! _create_has_login "$type" "$profile"; then
+      step "Account '$profile' has no $type sign-in: using this box's $type login instead of a new one (--own-login keeps a separate sign-in)"
+      profile=""
+      [[ "$_box_login" == "(shared)" ]] || profile="$_box_login"
+    fi
+    if (( defer_auth )) && [[ -z "$profile" && "$_box_login" == "(shared)" ]]; then
+      defer_auth=0
+      step "This box's $type login is signed in: using it instead of deferring auth"
+    fi
+  fi
   if (( defer_auth )) && [[ -n "$profile" && -z "$byo_provider" && -z "$byo_api_key" ]]; then
-    lazy_need auth_creds_present
-    if auth_creds_present "$type" "$profile" >/dev/null 2>&1; then
+    if _create_has_login "$type" "$profile"; then
       defer_auth=0
       step "Account '$profile' is already signed in: using it instead of deferring auth"
     fi
@@ -3386,6 +3445,11 @@ cmd_create() {
   # _create_caller_is_agent). Here, after stdin is drained so a piped demo key is
   # caught too, and before anything is created.
   if _create_uses_demo_ai "$profile" "$byo_api_key" && _create_caller_is_agent; then
+    # DIVE-7084: a codex/grok hire signs in to the box's own login, which every
+    # later hire on that provider then uses; an account per hire is a new link
+    # per hire.
+    [[ "$type" == "codex" || "$type" == "grok" ]] \
+      && fail "$E_VALIDATION" "the box's free demo AI is the owner's trial and cannot run a new agent (one research run uses all of it). Create it with --defer-auth and no --auth-profile instead, then send the owner the sign-in link from: sudo 5dive agent auth start $type (later $type hires use that same sign-in)"
     fail "$E_VALIDATION" "the box's free demo AI is the owner's trial and cannot run a new agent (one research run uses all of it). Create it with --defer-auth --auth-profile=$name instead, then send the owner the sign-in link from: sudo 5dive agent auth start $type --auth-profile=$name"
   fi
   # DIVE-5503: codex takes --model without --provider (it has no BYO path), so
