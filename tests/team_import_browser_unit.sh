@@ -14,7 +14,7 @@
 #   3. the add fails: the team still comes up, the warning names both commands;
 #   4. a team with no browser: nothing about a browser at all;
 #   5. --json carries the word;
-#   6. NEGATIVE CONTROL: origin/main's cmd_compose.sh adds nothing (arm 1 red).
+#   6. NEGATIVE CONTROL: the pre-fix cmd_compose.sh adds nothing (arm 1 red).
 #
 # COVERAGE LIMIT: no seat is really made and no plugin is really fetched. The
 # store at create is tests/agent_create_browser_store_unit.sh; the back-fill and
@@ -23,6 +23,8 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+. "$(dirname "${BASH_SOURCE[0]}")/lib/pinned_baseline.sh" \
+  || printf 'pinned baseline helper: UNRESOLVED (tests/lib/pinned_baseline.sh not reachable)\n' >&2
 TMP=""
 trap 'rc=$?; [[ -n "$TMP" ]] && rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.." || exit 1
@@ -149,17 +151,18 @@ rm -rf "$RECORD"; mkdir -p "$RECORD"; : > "$RECORD/calls"
 J=$( ( JSON_MODE=1; cmd_compose_up -f "$TMP/plain.5dive.yaml" ) 2>/dev/null | tail -n 1 )
 eq_t 'T5b ...and no browser key for a team without one' none "$(jq -r 'if (.data // .) | has("browser") then "has" else "none" end' <<<"$J" 2>/dev/null)"
 
-echo '== 6. NEGATIVE CONTROL: origin/main =='
-if git cat-file -e origin/main:src/cmd_compose.sh 2>/dev/null \
-   && ! git show origin/main:src/cmd_compose.sh | grep -q '_compose_ensure_browser'; then
-  git show origin/main:src/cmd_compose.sh > "$TMP/old_compose.sh"
+echo '== 6. NEGATIVE CONTROL: the pre-fix tree =='
+# Pinned, never origin/main: once this fix merged, origin/main IS the fix and the
+# arm compared post to post (DIVE-7088). Unresolvable is a FAILURE, not a skip.
+PRE_FIX_REF="5546a8675b9acb46dd24995f8ded70f8bb786b95"   # main immediately before DIVE-7075
+if pinned_blob "$PRE_FIX_REF" src/cmd_compose.sh "$TMP/old_compose.sh"; then
   P0=$PASS F0=$FAIL
   ( source "$TMP/old_compose.sh"; stubs; up "$TMP/shop.5dive.yaml"; arm1 T6m; echo "RED=$((FAIL-F0))" ) > "$TMP/old.log" 2>&1
   RED=$(sed -n 's/^RED=//p' "$TMP/old.log")
-  eq_t 'T6 origin/main: the T1 arms go red (>= 4)' yes "$( (( ${RED:-0} >= 4 )) && echo yes || echo "no (red=${RED:-?})")"
+  eq_t 'T6 pre-fix: the T1 arms go red (>= 4)' yes "$( (( ${RED:-0} >= 4 )) && echo yes || echo "no (red=${RED:-?})")"
   has_t 'T6 ...it only says api-only' 'publishing=api-only' "$(cat "$TMP/old.log")"
 else
-  echo 'T6 skipped: origin/main already carries the import half (or is not fetched)'
+  bad_t "T6 pre-fix tree NOT re-measured" "$(pinned_unavailable_msg "$PRE_FIX_REF")"
 fi
 
 echo
