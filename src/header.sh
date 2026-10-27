@@ -465,7 +465,11 @@ declare -A TYPE_INSTALL=(
   [claude]="[[ -x /home/claude/.local/bin/claude ]] || curl -fsSL https://claude.ai/install.sh | bash"
   # devin: same exact-path guard; the installer self-manages the versioned
   # store + ~/.local/bin symlink, so -x makes the recipe idempotent.
-  [devin]="[[ -x /home/claude/.local/bin/devin ]] || curl -fsSL https://cli.devin.ai/install.sh | bash"
+  # DIVE-7115: the installer's last line is `devin setup`, a login prompt. With
+  # no terminal (every hire) it ends "Error: Login canceled" and the script
+  # exits 1 AFTER the binary landed, so every fresh-box devin install failed.
+  # Sign-in is ours to run later, so the recipe's verdict is the binary itself.
+  [devin]="[[ -x /home/claude/.local/bin/devin ]] || { curl -fsSL https://cli.devin.ai/install.sh | bash; [[ -x /home/claude/.local/bin/devin ]]; }"
   # Verify the EXACT TYPE_BIN path (not `command -v codex`): a stray
   # /usr/bin/codex from apt or a codex left over under a non-v24 nvm major
   # would short-circuit the install and surface as "install reported success
