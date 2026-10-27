@@ -2838,7 +2838,7 @@ seed_inherited_memory() {
 # hired onto a box with the plugin enabled box-wide failed its first job at
 # `5dive browser shot` until somebody ran setup for it by hand.
 #
-# Prints one status word on stdout — made | absent | sandboxed | failed — and says
+# Prints one status word on stdout — made | nostack | absent | sandboxed | failed — and says
 # what happened on stderr. Never fails the create: the agent is already provisioned
 # and a missing store is fixable with the one command the warning names.
 #
@@ -2875,6 +2875,11 @@ seed_browser_store_for_seat() {  # <name> <isolation>
   if (( rc == 0 )); then
     step "browser store ready for ${seat} (DIVE-5478): it can browse public pages now"
     echo made
+  elif (( rc == 69 )) && [[ "$(tail -n 1 <<<"$out")" == *"no browser stack"* ]]; then
+    # DIVE-7075: the store IS made; the box lacks the stack, and only a person
+    # installs that (DIVE-6112). The fix is the box's one line, not a per-seat one.
+    step "browser store made for ${seat}; this box has no browser stack yet, so it cannot browse until you run once: sudo 5dive browser setup"
+    echo nostack
   else
     warn "browser setup for ${seat} failed (exit $rc: $(tail -n 1 <<<"$out")). The agent is up but cannot browse. Retry: sudo env FIVEDIVE_BROWSER_SEAT=${seat} FIVEDIVE_BROWSER_AGENT_GROUP=${group} 5dive browser setup"
     echo failed
@@ -4278,6 +4283,7 @@ cmd_create() {
   # DIVE-5478: only on a box whose browser plugin is enabled; `absent` says nothing.
   case "$browser_store" in
     made)   _hc_ok+=("browser store ready") ;;
+    nostack) _hc_issues+=("no browser on this box yet (agent CANNOT BROWSE): sudo 5dive browser setup") ;;
     failed) _hc_issues+=("no browser store (agent CANNOT BROWSE): sudo env FIVEDIVE_BROWSER_SEAT=agent-${name} FIVEDIVE_BROWSER_AGENT_GROUP=${AGENT_SHARED_GROUP:-claude} 5dive browser setup") ;;
   esac
   # auth: deferred login still pending, so the first turn will stall.
