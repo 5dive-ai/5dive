@@ -708,6 +708,39 @@ _install_status() {
   return 0
 }
 
+# DIVE-7103: system libraries an upstream installer needs and cannot install
+# from our non-interactive `sudo -u claude` hop. hermes' installer fetches a
+# glibc Node that links libatomic.so.1, absent on a plain Ubuntu 24.04 cloud
+# image; upstream only caches sudo when it has a terminal, so here its own
+# package step cannot run and it exits "pm install failed" without naming the
+# package. We are root at this point, so install it before the recipe runs, or
+# fail naming it. <type> -> "<soname>:<debian package>".
+declare -A TYPE_SYSLIB=(
+  [hermes]="libatomic.so.1:libatomic1"
+)
+
+_syslib_present() {
+  # grep without -q: reading all of ldconfig's output avoids SIGPIPE under pipefail.
+  { ldconfig -p 2>/dev/null || /sbin/ldconfig -p 2>/dev/null; } | grep -F "$1" >/dev/null
+}
+
+# _install_syslib <type> — no-op unless TYPE_SYSLIB names a missing library.
+_install_syslib() {
+  local spec="${TYPE_SYSLIB[$1]:-}"
+  [[ -n "$spec" ]] || return 0
+  local lib="${spec%%:*}" pkg="${spec#*:}"
+  _syslib_present "$lib" && return 0
+  local hint="$1 needs the system library $lib (Debian/Ubuntu package: $pkg), and it is not installed on this box. Install it (sudo apt-get install -y $pkg), then retry"
+  command -v apt-get >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "$hint"
+  step "Installing $pkg ($1 needs $lib)"
+  local -a apt=(env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120)
+  # A fresh cloud image can ship with empty package lists: refresh once, retry.
+  "${apt[@]}" install -y --no-install-recommends "$pkg" >&2 \
+    || { "${apt[@]}" update >&2 && "${apt[@]}" install -y --no-install-recommends "$pkg" >&2; } \
+    || true
+  _syslib_present "$lib" || fail "$E_NOT_INSTALLED" "$hint"
+}
+
 cmd_install() {
   local type="" upgrade=0 detach=0 status=0
   local usage="usage: 5dive agent install <type> [--upgrade] [--detach | --status]"
@@ -767,7 +800,9 @@ export PATH="$HOME/.local/bin:$PATH"
 LOCALBIN
 ' || true
   fi
+  _install_syslib "$type"
   # -i loads claude's login env (nvm, XDG redirects, etc.)
+  local recipe_rc=0
   if [[ "${FIVE_INSTALL_IN_UNIT:-}" == 1 ]]; then
     # Inside the --detach job's unit, -i must not be used: sudo -i runs the
     # sudo-i PAM stack (common-session -> pam_systemd), which moves the
@@ -777,9 +812,9 @@ LOCALBIN
     # DIVE-4973). Plain sudo runs common-session-noninteractive (no
     # pam_systemd), so the installer stays in the unit's cgroup and dies with
     # it; -H plus bash -l and the cd give it the same login env -i would.
-    sudo -u claude -H bash -lc "cd ~ && ${prelude}${recipe}" >&2
+    sudo -u claude -H bash -lc "cd ~ && ${prelude}${recipe}" >&2 || recipe_rc=$?
   else
-    sudo -u claude -i bash -lc "${prelude}${recipe}" >&2
+    sudo -u claude -i bash -lc "${prelude}${recipe}" >&2 || recipe_rc=$?
   fi
   # DIVE-901: some installers finish async or drop the binary via a late
   # rename — give the bin a short grace before declaring failure. Only sleeps
@@ -823,6 +858,10 @@ LOCALBIN
     ok "$type $verb at $bin" \
        '{type:$t, bin:$b, installed:true, alreadyInstalled:false, upgraded:$u, version:$v}' \
        --arg t "$type" --arg b "$bin" --argjson u "$ujson" --arg v "$_inst_ver"
+  elif (( recipe_rc )); then
+    # DIVE-7103: the installer said it failed. Do not report it as a success;
+    # its own error is the last thing it printed above.
+    fail "$E_GENERIC" "$type install failed (installer exit $recipe_rc) and $bin is missing — see the installer's error above"
   else
     fail "$E_GENERIC" "$type install reported success but $bin still missing — investigate manually"
   fi
