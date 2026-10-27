@@ -248,6 +248,11 @@ _merge_at_close_do() {
 # row (the close path is unguarded when verifier == assignee, measured). Naming
 # neither is what made the refusal un-followable on the branch the fleet's own
 # wake dispatch sends people to.
+# DIVE-7120: THE ALREADY-MERGED VERB LEADS. main closed DIVE-7082 and DIVE-7111
+# with `task done` right after merging them by hand (2026-10-27 11:18Z) and reported
+# re-deliveries; merge-landed was the verb, and it sat at the END of this text,
+# after the escape that re-delivers. A hand merge is the case the reader is most
+# likely in, so it is named first, and a landed row is told NOT to re-deliver.
 _task_done_merge_pending_guard() {
   local id="$1" ident="$2"
   local _mp_pending
@@ -270,7 +275,7 @@ _task_done_merge_pending_guard() {
     return 0
   fi
   policy_refuse "$E_CONFLICT" done-redelivers-a-graded-merge DIVE-4520 "$ident" \
-    "$ident is already graded PASS and is waiting on a MERGE, not on another delivery — REFUSED, and nothing was written. On a loop row \`task done\` re-delivers, and a re-delivery stamps a new delivery clock that strips merge standing from '${_mp_owner:-the grading seat}' — the only seat the merge rail accepts on this row (DIVE-4520, measured on DIVE-4491). The verb for this row is \`5dive task merge $ident\`, run by '${_mp_owner:-the seat named in graded_by}'; ${_mp_dref:-the bound pull request} is what it merges. If the work actually CHANGED since that grade, re-point the binding first — \`task deliver $ident --pr=<url>\` — which is a delivery the grade has not seen and is allowed. If you are re-asserting an unchanged pass on purpose, say why and it proceeds (audited): '--force-redeliver=\"<why>\"'. If ${_mp_dref:-that pull request} has ALREADY MERGED, the verb is \`5dive task merge-landed $ident\` (DIVE-4654): it records the landing the forge already reports, takes the row OUT of the merging stage — which is what stops this row being re-dispatched to a seat with nothing to do — and hands it to '${_mp_vfier:-the seat in the verifier column}', whose own close finishes the row. It merges nothing, needs no credential, and refuses if the pull request has not actually landed. The merge standing this re-delivery would have cost is already spent on a landed pull request, so the audited escape above and \`5dive task assign $ident ${_mp_vfier:-the seat in the verifier column}\` both still reach the same close; merge-landed is the one that also takes the row out of the stage."
+    "$ident is graded PASS and waiting on a MERGE, not on another delivery — REFUSED, and nothing was written (DIVE-4520). If ${_mp_dref:-the bound pull request} has ALREADY MERGED, the verb is \`5dive task merge-landed $ident\` (DIVE-4654): it records the landing the forge reports, takes the row out of the merging stage and hands it to '${_mp_vfier:-the seat in the verifier column}', whose own close finishes the row. It merges nothing, needs no credential, and refuses if the pull request has not landed. Do not re-deliver a landed row: its merge standing is already spent, so a re-delivery buys nothing and only stamps a new delivery clock (\`5dive task assign $ident ${_mp_vfier:-the seat in the verifier column}\` is the other route, and it writes no clock either). If it has NOT merged yet, nobody needs to act: the merge tick merges it within minutes once it is green and clean at the graded sha (DIVE-7120), or '${_mp_owner:-the seat named in graded_by}' runs \`5dive task merge $ident\`. A \`task done\` here would re-deliver and strip '${_mp_owner:-the grading seat}' of the merge standing the rail needs. If the work CHANGED since that grade, re-point the binding — \`task deliver $ident --pr=<url>\` — which is a delivery the grade has not seen and is allowed. To re-assert an unchanged pass on purpose, say why (audited): '--force-redeliver=\"<why>\"'."
 }
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
@@ -3084,6 +3089,15 @@ cmd_task_reject() {
   # Scoped like DIVE-2067 rather than symmetrically: a lead bouncing an OPEN task is
   # legitimate and stays working. Only the two cases with nothing to escape from are refused.
   _rj_actor=$(task_actor "")
+  # DIVE-7120: the merge tick bounces a blocked merge from the heartbeat, with no
+  # seat behind it, so it names itself. Honoured only as a plain shell variable,
+  # which only code in this process can set: one that arrives in the ENVIRONMENT
+  # (`VAR=… 5dive task reject`) is anyone's claim, and is ignored.
+  local _rj_tick=0
+  if [[ -n "${_TASK_MERGE_TICK_ACTOR:-}" ]] \
+     && ! printenv _TASK_MERGE_TICK_ACTOR >/dev/null 2>&1; then
+    _rj_actor="$_TASK_MERGE_TICK_ACTOR"; _rj_tick=1
+  fi
   _rj_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
   # (1) the writer may not grade its own work (DIVE-477) — and a maker reject would otherwise
   # be filed under the verifier's name, which is the false-record half.
@@ -3142,7 +3156,7 @@ cmd_task_reject() {
       policy_refuse "$E_CONFLICT" reject-merge-conflict-without-pass DIVE-6753 "$ident" \
         "$ident: --merge-conflict says the work PASSED and only the merge is blocked, but this row's current delivery carries no PASS (verdict '${_mc_verdict:-none}'$([[ "$_mc_verdict" == pass ]] && printf ', recorded before the current delivery or since rejected')). NOTHING WAS WRITTEN. If the work has a defect, reject it without --merge-conflict; that bounce counts toward the iteration cap."
     fi
-    if [[ "$_rj_actor" != "$_mc_owner" && "$_rj_actor" != "$_mc_grader" && "$_rj_actor" != "$vfier" ]]; then
+    if (( ! _rj_tick )) && [[ "$_rj_actor" != "$_mc_owner" && "$_rj_actor" != "$_mc_grader" && "$_rj_actor" != "$vfier" ]]; then
       policy_refuse "$E_CONFLICT" reject-merge-conflict-not-merger DIVE-6753 "$ident" \
         "$ident: --merge-conflict is the merger's bounce, and you ('${_rj_actor}') neither owe this merge ('${_mc_owner:-nobody}') nor graded it ('${_mc_grader:-nobody}'). NOTHING WAS WRITTEN. Tell the merge owner the branch conflicts and let them bounce it."
     fi

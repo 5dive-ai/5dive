@@ -225,6 +225,7 @@ _task_usage() {
   loops [--stuck] [--escalate-stuck] [--all] [--runs] [--watch[=secs]] [--kill <loopId>]
   merge <id>                                    merge the PR on a row THIS seat graded PASS (DIVE-3474)
   merge-landed <id>                             record that the bound PR MERGED; exit MERGING (DIVE-4654)
+  merge-tick [--dry-run]                        merge graded, green, clean PRs; bounce conflicts/reds to the maker (DIVE-7120)
   merge-declined <id> --reason="<why>"          record that it NEVER WILL (held/superseded/wrong repo);
                                                 exits MERGING, asserts no landing (DIVE-4778)
   unbind-pr <id> <url> --reason="<why>"        drop a pull request from the set the row must see merged
@@ -425,7 +426,7 @@ _task_help_intercept() {
 # DIVE-6938: the delivery, grading and merge verbs live in the devteam plugin.
 # Without it each answers with the one line, `--help` included, instead of
 # `command not found` (or a "no usage text" for the two the surface never lists).
-_TASK_DEVTEAM_SUBVERBS="deliver merge merge-landed merge-declined unbind-pr merge-audit merge-unverified merge-gate-selftest grade-context grader-tick grader-replay"
+_TASK_DEVTEAM_SUBVERBS="deliver merge merge-landed merge-declined unbind-pr merge-audit merge-unverified merge-gate-selftest grade-context grader-tick grader-replay merge-tick"
 _task_devteam() {
   [[ " $_TASK_DEVTEAM_SUBVERBS " == *" $1 "* ]] || return 0
   devteam_loaded || devteam_refuse "task $1"
@@ -467,6 +468,7 @@ cmd_task() {
     merge-audit)     cmd_task_merge_audit "$@" ;;   # DIVE-1935 retrospective sweep
     grader-replay)   cmd_task_grader_replay "$@" ;;  # DIVE-4164 dry-run capacity replay
     grader-tick)     cmd_task_grader_tick "$@" ;;    # DIVE-4164 pool lane (dark by default)
+    merge-tick)      cmd_task_merge_tick "$@" ;;     # DIVE-7120 merge graded+green+clean PRs, no seat turn
     merge-unverified) cmd_task_merge_unverified "$@" ;;  # DIVE-3526 consume the unverified stamp
     merge-gate-selftest) cmd_task_merge_gate_selftest "$@" ;;  # DIVE-1935 instrument check
     verify)          cmd_task_verify "$@" ;;
