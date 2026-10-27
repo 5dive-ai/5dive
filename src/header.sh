@@ -1304,6 +1304,20 @@ profile_env_value() {
   printf '%s' "$v"
 }
 
+# DIVE-7102: box_is_chat_only — rc 0 on a self-hosted box linked to 5dive.app
+# for chat: self-host-link.sh (5dive-api) writes the mark, and nothing on the box
+# listens, so the owner has no dashboard and no Tasks tab. Same file as
+# _create_chat_only_mark (DIVE-7028); here so task and secret verbs can read it.
+box_is_chat_only() { [[ -f "${FIVEDIVE_CHAT_ONLY_MARK:-/etc/5dive/chat-only}" ]]; }
+
+# DIVE-7102: the self-host page where the owner types a secret for this box; the
+# API holds it until the box's reporter fetches it and runs `secret write`.
+selfhost_secret_url() { # <KEY> [agent]
+  local u="https://my.5dive.ai/tg/secret?key=${1}"
+  [[ -n "${2:-}" ]] && u+="&agent=${2}"
+  printf '%s' "$u"
+}
+
 # Resolve a canonical UI id to the agent CLI's native provider id. Empty
 # result means the type doesn't support that vendor and the caller should
 # fail with a clear error.

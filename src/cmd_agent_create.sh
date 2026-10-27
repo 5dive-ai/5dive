@@ -2598,6 +2598,48 @@ seed_openclaw_state_into_seat() { # <name> [profile]
   return 0
 }
 
+# ── DIVE-7102: write a BYO key into the SEAT's own openclaw store ───────────
+# openclaw 2026.8.1+ keeps an API key in ~/.openclaw/state/openclaw.sqlite.
+# Measured 2026-10-27 on openclaw 2026.10.7 in a throwaway HOME: `models auth
+# --agent main paste-api-key` wrote state/openclaw.sqlite and openclaw.json, and
+# made no agents/main/agent/ at all ("Auth state store:
+# ~/.openclaw/state/openclaw.sqlite"). seed_openclaw_state_into_seat above copies
+# only agents/main/agent/openclaw-agent.sqlite, and so does the boot seed in
+# 5dive-agent-start, so a seat given a key (create --provider/--api-key, or
+# `agent auth set openclaw --provider=…`) received the registration in
+# openclaw.json and no key: every turn failed with `No API key found for
+# provider "openrouter"` while the seat looked configured.
+#
+# Copying state/openclaw.sqlite is not the fix: it is openclaw's whole app store,
+# created lazily by openclaw itself (see _openclaw_cred_path, DIVE-3834). Asking
+# openclaw to write the key with HOME set to the seat's home lands it wherever
+# this openclaw version keeps it, owned by the seat, through openclaw's own CLI
+# (the DIVE-3489 rule: never hand-write its store). The key travels on stdin.
+#
+# Best-effort like the seed above (warn, never fail): the agent user and unit
+# already exist when this runs.
+paste_openclaw_key_into_seat() { # <name> <native-provider> <key>
+  local name="$1" native="$2" key="$3"
+  local user="agent-${name}"
+  local home="${AGENT_HOME_ROOT:-/home}/${user}"
+  local node="${OPENCLAW_SEAT_NODE:-/home/claude/.local/bin/node}" bin="${TYPE_BIN[openclaw]}"
+  [[ -d "$home" && -n "$native" && -n "$key" ]] || return 0
+  local pid="${native}:manual" seen=""
+  step "Writing the $native key into agent-${name}'s own openclaw store"
+  if ! printf '%s\n' "$key" \
+      | sudo -u "$user" -H env HOME="$home" PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+          "$node" "$bin" models auth --agent main paste-api-key \
+          --provider "$native" --profile-id "$pid" >&2 2>&1; then
+    warn "openclaw could not store the key in agent-${name}'s own home — it will boot with no AI key and every message fails with 'No API key found'. Re-run: sudo 5dive agent auth set openclaw --provider=<id> --api-key=- --auth-profile=<its account>"
+    return 0
+  fi
+  seen=$(sudo -u "$user" -H env HOME="$home" PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+           "$node" "$bin" models auth --agent main list 2>/dev/null) || seen=""
+  grep -qF "$pid" <<<"$seen" \
+    || warn "openclaw took the key for agent-${name} but does not list '$pid' back in its own home — do not treat this seat as signed in"
+  return 0
+}
+
 # ── DIVE-990: memory-as-onboarding ──────────────────────────────────────────
 # A new hire should boot knowing the company instead of cold-starting. When
 # `create --inherit-memory=<scope>` is passed we seed the new agent's own recall
@@ -3086,6 +3128,87 @@ _create_uses_demo_ai() {
   [[ -n "$profile" && "$(_create_demo_ai_key "$profile")" == "$demo" ]]
 }
 
+# DIVE-7102: _create_api_type_login <openclaw|hermes> [account] — rc 0 when the
+# account (or, with none, the box's shared login) holds a sign-in in this type's
+# OWN store. auth_creds_present cannot answer this for an account: its fallback
+# takes ANY key in combined.env, so a Claude account read as an openclaw login
+# and the seat bound to it booted with no AI (the 2026-10-27 self-host run,
+# `agent config theo set auth-profile=or-test`). Paths are built here, not by
+# profile_type_dir, which creates the dir it names.
+_create_api_type_login() {
+  local type="${1:-}" acct="${2:-}" d
+  lazy_need auth_creds_present _openclaw_cred_path
+  if [[ -z "$acct" ]]; then
+    auth_creds_present "$type" >/dev/null 2>&1
+    return
+  fi
+  d="${AUTH_PROFILES_DIR:-}/${acct}/${type}"
+  case "$type" in
+    openclaw) _openclaw_cred_path "$d" >/dev/null 2>&1 ;;
+    hermes)   { [[ -s "$d/auth.json" ]] && ! jq -e 'length == 0' "$d/auth.json" >/dev/null 2>&1; } \
+                || grep -Eq '^[A-Z][A-Z0-9_]*_API_KEY=.+' "$d/.env" 2>/dev/null ;;
+    *)        return 1 ;;
+  esac
+}
+
+# DIVE-7102: _create_box_api_key <type> [account...] — an AI key this box already
+# holds that a new openclaw/hermes seat can run on: an OpenRouter key or an
+# Anthropic API key in an account's combined.env (a Claude account set up with
+# --provider=openrouter keeps its key as ANTHROPIC_AUTH_TOKEN under the
+# OpenRouter base URL). The accounts named first are tried first (the one the
+# seat was given, then the caller's own), then every other account by name. Never
+# the demo AI, by account or by key, and never its connector file
+# (/etc/5dive/connectors/openrouter.env is not read here at all): that is the
+# owner's trial, not a budget for new agents (DIVE-6843). A Claude sign-in token
+# is not an API key and is skipped. Sets _CREATE_REUSE_{ACCOUNT,PROVIDER,KEY};
+# rc 1 when the box holds none.
+_create_box_api_key() {
+  local type="${1:-}"; shift || true
+  _CREATE_REUSE_ACCOUNT="" _CREATE_REUSE_PROVIDER="" _CREATE_REUSE_KEY=""
+  [[ -n "${AUTH_PROFILES_DIR:-}" && -d "${AUTH_PROFILES_DIR}" ]] || return 1
+  local -a order=()
+  local a d seen=" " demo key prov url
+  for a in "$@"; do [[ -n "$a" ]] && order+=("$a"); done
+  for d in "${AUTH_PROFILES_DIR}"/*/; do [[ -d "$d" ]] && order+=("$(basename "$d")"); done
+  demo=$(_create_demo_ai_key)
+  for a in "${order[@]+"${order[@]}"}"; do
+    [[ "$seen" == *" $a "* ]] && continue
+    seen+="$a "
+    valid_profile_name "$a" || continue
+    [[ "$a" == "$CREATE_DEMO_AI_ACCOUNT" ]] && continue
+    [[ -r "${AUTH_PROFILES_DIR}/${a}/combined.env" ]] || continue
+    prov="" url=$(profile_env_value "$a" ANTHROPIC_BASE_URL)
+    key=$(profile_env_value "$a" OPENROUTER_API_KEY)
+    if [[ -n "$key" ]]; then
+      prov=openrouter
+    else
+      key=$(profile_env_value "$a" ANTHROPIC_AUTH_TOKEN)
+      if [[ -n "$key" && "$url" =~ ^https://openrouter\.ai(/|$) ]]; then
+        prov=openrouter
+      elif [[ -z "$url" || "$url" =~ ^https://api\.anthropic\.com(/|$) ]]; then
+        key=$(profile_env_value "$a" ANTHROPIC_API_KEY)
+        [[ -n "$key" ]] || key=$(profile_env_value "$a" ANTHROPIC_AUTH_TOKEN)
+        [[ -n "$key" && "$key" != sk-ant-oat* ]] && prov=anthropic
+      fi
+    fi
+    [[ -n "$prov" ]] || continue
+    [[ -n "$demo" && "$key" == "$demo" ]] && continue
+    valid_api_key "$key" || continue
+    [[ -n "$(resolve_native_provider "$type" "$prov")" ]] || continue
+    _CREATE_REUSE_ACCOUNT="$a" _CREATE_REUSE_PROVIDER="$prov" _CREATE_REUSE_KEY="$key"
+    return 0
+  done
+  return 1
+}
+
+# DIVE-7102: the account the calling agent runs on, or nothing.
+_create_caller_account() {
+  local who
+  who=$(actor_routing_agent 2>/dev/null) || return 0
+  [[ -n "$who" ]] || return 0
+  registry_read 2>/dev/null | jq -r --arg n "$who" '.agents[$n].authProfile // empty' 2>/dev/null || true
+}
+
 cmd_create() {
   local name="" type="" channels="none" channels_set=0 telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
@@ -3368,6 +3491,45 @@ cmd_create() {
      && [[ -f "$(_create_chat_only_mark)" ]]; then
     channels="dashboard"
     step "This box is linked to 5dive.app chat: turning chat on for '$name'"
+  fi
+  # DIVE-7102: an openclaw or hermes seat with no login of its own type runs on a
+  # key the box already holds, through the same root-side path as
+  # --provider=<p> --api-key=-. On 2026-10-27 a self-hosted lead had no way to
+  # give a new openclaw seat the OpenRouter key she herself ran on ("it sits in a
+  # protected folder that Theo's seat can't read"), so she asked the owner to
+  # paste one in chat. Explicit flags win: a BYO key, or an account that already
+  # holds this type's login, is used as given.
+  if [[ "$type" == "openclaw" || "$type" == "hermes" ]] \
+     && [[ -z "$byo_provider" && -z "$byo_api_key" && -z "$byo_base_url" ]] \
+     && ! _create_api_type_login "$type" "$profile" \
+     && _create_box_api_key "$type" "$profile" "$(_create_caller_account)"; then
+    byo_provider="$_CREATE_REUSE_PROVIDER"
+    byo_api_key="$_CREATE_REUSE_KEY"
+    defer_auth=0
+    # The key lands in a profile, never in the claude user's shared state that
+    # every unprofiled seat of this type would then pick up.
+    [[ -n "$profile" ]] || profile="$name"
+    step "No $type login for '$name': reusing the ${BYO_PROVIDER_LABEL[$byo_provider]:-$byo_provider} key this box already holds (account '$_CREATE_REUSE_ACCOUNT'). Nobody needs to paste a key in chat."
+  fi
+  # DIVE-7102: on a box linked to 5dive.app chat, a new agent's Telegram is one
+  # tap. The owner taps "Connect Telegram" next to it in My team, 5dive's manager
+  # bot makes the bot, and the box's reporter attaches it a minute later
+  # (`agent config <name> set channels=… telegram.token=-`). Asking for a
+  # BotFather token here put one in plain app chat. So --channels=telegram with
+  # no token creates the seat on the app chat instead of failing.
+  local tg_by_tap=0
+  if channel_in_list telegram "$channels" && [[ -z "$telegram_token" && -z "$telegram_cos" ]] \
+     && box_is_chat_only; then
+    tg_by_tap=1
+    local _tg_ch _tg_rest=""
+    for _tg_ch in ${channels//,/ }; do
+      [[ "$_tg_ch" == telegram ]] || _tg_rest="${_tg_rest:+$_tg_rest,}$_tg_ch"
+    done
+    channels="$_tg_rest"
+    if [[ "$type" == "claude" || "$type" == "codex" ]] && ! channel_in_list dashboard "$channels"; then
+      channels="${channels:+$channels,}dashboard"
+    fi
+    [[ -n "$channels" ]] || channels="none"
   fi
   if [[ -n "$profile" ]]; then
     valid_profile_name "$profile" \
@@ -3993,6 +4155,10 @@ cmd_create() {
   # top of the seat's channel/gateway config rather than under it.
   if [[ "$type" == "openclaw" ]]; then
     seed_openclaw_state_into_seat "$name" "$profile"
+    # DIVE-7102: and the key itself, into the seat's own store (see the helper).
+    if [[ -n "$byo_provider" && -n "$byo_api_key" ]]; then
+      paste_openclaw_key_into_seat "$name" "$(resolve_native_provider openclaw "$byo_provider")" "$byo_api_key"
+    fi
   fi
 
   if [[ -n "$telegram_token" ]]; then
@@ -4444,8 +4610,13 @@ cmd_create() {
       warn "could not link '$human_id' to '$name' — the agent is fine; link it with: sudo 5dive human link $human_id --agent=$name"
     fi
   fi
+  # DIVE-7102: said last, so it is the line the lead relays. Never a token ask.
+  if (( tg_by_tap )); then
+    step "Telegram for '$name': the owner taps \"Connect Telegram\" next to $name in My team on 5dive.app. One tap: no BotFather, no token in chat. Do not ask the owner for a bot token."
+  fi
   ok "agent '$name' (type=$type, channels=$channels${profile:+, profile=$profile}) is running." \
-     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, human:(($hu|select(length>0)) // null), skills:{installed:$inst, failed:$fail}, teamBot:$tb, channelWarmRestart:$wr}' \
+     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, human:(($hu|select(length>0)) // null), skills:{installed:$inst, failed:$fail}, teamBot:$tb, channelWarmRestart:$wr, telegramConnect:(if $tt == "1" then "owner-taps-connect-in-my-team" else null end)}' \
+     --arg tt "$tg_by_tap" \
      --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$effective_workdir" --arg p "${profile:-}" \
      --arg hu "${human_id:-}" \
      --arg wr "$warm_restart" \
