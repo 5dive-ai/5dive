@@ -182,6 +182,8 @@ Linux users isolate agents; `systemd` supervises them; SQLite stores tasks; `cro
 
 Agents use `sandboxed`, `standard` or `admin` permissions. The first agent created by `init` is `admin` by default. Human approvals are configurable. No 5dive telemetry; API keys go directly to their providers. Review [`install.sh`](install.sh) before running it as root. To remove 5dive: `sudo 5dive uninstall`.
 
+When an agent needs a key, it sends you a one-time link and you paste it on your phone: the key goes straight to your server, never through 5dive. The first link sets up https on the server by itself; behind a home router, point your own domain at it: `sudo 5dive secret https enable --via=domain --host=box.example.com`.
+
 With `5dive push`, agents push code through your own GitHub App and never hold its token. [Delegated git push →](docs/delegated-push.md) · [Permissions and isolation →](https://5dive.ai/docs/5dive-cli#isolation)
 
 ## Resources
