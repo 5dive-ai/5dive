@@ -757,7 +757,8 @@ fi
 # when channels=telegram. Same shape as the codex block above: a single shared
 # plugin checkout serves every grok agent (server.ts + hooks resolve state
 # from $HOME via homedir()). grok's --always-approve flag (set in ARGS above)
-# auto-trusts plugin/MCP commands so no separate trust-bypass step is needed.
+# auto-approves tool calls, but NOT grok >= 1.0's folder-trust dialog — that is
+# seeded separately below (DIVE-7083).
 #
 # Two files because grok splits the surface:
 #   1. ~/.grok/config.toml  → [mcp_servers.telegram] only. ${GROK_PLUGIN_ROOT}
@@ -1734,6 +1735,67 @@ if [[ "$TYPE" == "claude" && -n "${WORKDIR:-}" ]]; then
   unset _wtr_cfg _wtr_dir _wtr_base _wtr_next _wtr_tmp 2>/dev/null || :
 fi
 
+# DIVE-7083: trust the agent's workdir for grok too, before the first launch.
+#
+# grok >= 1.0 asks "Do you trust the contents of this directory?" at startup in
+# any folder that carries something trust-gated (AGENTS.md, CLAUDE.md, .claude/,
+# .grok/ — an agent workdir always does). --always-approve does NOT answer it.
+# Measured live 2026-10-27 (grok 1.0.70, self-hosted box): a Grok hire sat on the
+# dialog, the first message to it was lost, and it moved only when the box owner
+# pressed "y" by hand. An untrusted folder also holds back grok's OWN hooks
+# (~/.grok/hooks/*.json), so the telegram hooks wired above stay off until trust.
+#
+# The store is ~/.grok/trusted_folders.toml, one table per folder:
+#   [folders."<canonical path>"]
+#   trusted = true
+#   decided_at = <unix seconds>
+# Measured against the 1.0.70 binary with `grok inspect` ("Project trusted:"):
+# the EXACT canonical path is trusted; a trusted PARENT does not cover a non-git
+# child, and a symlinked spelling of the path does not match. So seed the
+# `pwd -P` form of WORKDIR, as the claude block above does. Older grok (0.1.x)
+# never reads this file, so the seed is harmless there.
+#
+# Read-modify-write: grok keeps other folders' decisions in the same file. Drop
+# only our key's table (a "trusted = false" left by a "No" at the dialog would
+# strand the agent on every boot) and append it fresh; skip when it already says
+# true. Boot-time, so it back-fills every existing grok agent on its next
+# restart. Best-effort: this runs under `set -e` and must never stop a launch.
+if [[ "$TYPE" == "grok" && -n "${WORKDIR:-}" ]]; then
+  _gtr_store="$HOME/.grok/trusted_folders.toml"
+  _gtr_dir=$(cd "$WORKDIR" 2>/dev/null && pwd -P) || _gtr_dir=""
+  [[ -n "$_gtr_dir" ]] || _gtr_dir="$WORKDIR"
+  # TOML basic-string escaping, the form grok itself writes the key in.
+  _gtr_key=${_gtr_dir//\\/\\\\}; _gtr_key=${_gtr_key//\"/\\\"}
+  _gtr_hdr="[folders.\"${_gtr_key}\"]"
+  if awk -v h="$_gtr_hdr" '
+       $0 == h { on = 1; next }
+       on && /^[[:space:]]*\[/ { on = 0 }
+       on && /^[[:space:]]*trusted[[:space:]]*=[[:space:]]*true[[:space:]]*$/ { found = 1 }
+       END { exit !found }' "$_gtr_store" 2>/dev/null; then
+    echo "[5dive] agent=${NAME} workdir ${_gtr_dir} is already trusted in ${_gtr_store} — no grok trust seed needed" >&2
+  elif install -d -m 700 "$HOME/.grok" 2>/dev/null \
+       && _gtr_tmp=$(mktemp "${_gtr_store}.XXXXXX" 2>/dev/null); then
+    if { if [[ -f "$_gtr_store" ]]; then
+           awk -v h="$_gtr_hdr" '
+             $0 == h { skip = 1; next }
+             skip && /^[[:space:]]*\[/ { skip = 0 }
+             !skip { print }' "$_gtr_store"
+         fi
+         printf '\n%s\ntrusted = true\ndecided_at = %s\n' "$_gtr_hdr" "$(date +%s)"
+       } > "$_gtr_tmp" 2>/dev/null \
+       && chmod 600 "$_gtr_tmp" 2>/dev/null \
+       && mv "$_gtr_tmp" "$_gtr_store" 2>/dev/null; then
+      echo "[5dive] agent=${NAME} trusted workdir ${_gtr_dir} in ${_gtr_store}" >&2
+    else
+      rm -f "$_gtr_tmp" 2>/dev/null || :
+      echo "[5dive] agent=${NAME} WARN: could not write ${_gtr_store} — grok's folder-trust dialog may arm for ${_gtr_dir}" >&2
+    fi
+  else
+    echo "[5dive] agent=${NAME} WARN: no temp file beside ${_gtr_store} — skipping the grok workdir trust seed" >&2
+  fi
+  unset _gtr_store _gtr_dir _gtr_key _gtr_hdr _gtr_tmp 2>/dev/null || :
+fi
+
 # DIVE-1591: pre-answer Claude Code's custom-API-key gate.
 #
 # A non-empty ANTHROPIC_API_KEY — every BYO-provider auth profile carries one,
@@ -1993,6 +2055,49 @@ if [[ "$TYPE" == "claude" && -n "$RESUME_ID" && -n "$RESUME_PROMPT" ]]; then
     /usr/bin/tmux send-keys -t "$SESSION" Enter
   ) &
 fi
+
+# DIVE-7083: startup check that no harness is parked on a folder-trust prompt.
+#
+# Every fork's workdir trust is pre-seeded above or at create (claude, codex,
+# devin, agy, pi, and grok since this row), so the dialog should never show.
+# When a seed misses — a new CLI release moves its trust store, as grok 1.0
+# did — the agent parks on the dialog, every health signal reads green, and the
+# owner's first message is lost without a word. Watch the boot window and:
+#   * grok: answer its own dialog with "y" once. It is the agent's own workdir,
+#     already trusted by the seed above; this is the backstop for a store change.
+#   * any fork: if a trust prompt is STILL on screen when the window closes, say
+#     so loudly (journal WARN + breadcrumb), so the stall is named, not silent.
+# Patterns are the dialogs' own wording: claude ("Do you trust the files in this
+# folder?"), grok ("Do you trust the contents of this directory?"), pi ("Trust
+# project folder?"), agy ("Do you trust this project?").
+TRUST_PROMPT_RE='Do you trust (the|this) |Trust project folder\?'
+TRUST_PROMPT_WATCH_TICKS="${TRUST_PROMPT_WATCH_TICKS:-30}"
+TRUST_PROMPT_WATCH_SLEEP="${TRUST_PROMPT_WATCH_SLEEP:-2}"
+trust_prompt_breadcrumb_path() { printf '%s/.5dive-trust-prompt-parked' "${HOME:-/tmp}"; }
+trust_prompt_watch() { # <session> <type>
+  local _s="$1" _t="$2" _pane="" _answered=0 _bc
+  for _ in $(seq 1 "$TRUST_PROMPT_WATCH_TICKS"); do
+    sleep "$TRUST_PROMPT_WATCH_SLEEP"
+    _pane="$(/usr/bin/tmux capture-pane -t "$_s" -p -S -40 2>/dev/null)" || return 0
+    if [[ "$_t" == "grok" && "$_answered" == 0 ]] \
+       && printf '%s' "$_pane" | grep -q 'Do you trust the contents of this directory'; then
+      /usr/bin/tmux send-keys -t "$_s" y 2>/dev/null || :
+      _answered=1
+      echo "warn: grok folder-trust dialog showed despite the seed — answered it with y" >&2
+    fi
+  done
+  _bc="$(trust_prompt_breadcrumb_path)"
+  if printf '%s' "$_pane" | grep -Eq "$TRUST_PROMPT_RE"; then
+    printf '%s is PARKED on a folder-trust prompt after boot — it cannot answer messages until someone accepts it in the session\n' \
+      "$_t" > "$_bc" 2>/dev/null || true
+    chmod 640 "$_bc" 2>/dev/null || true
+    echo "warn: ${_t} is PARKED on a folder-trust prompt after boot — messages to it are not being answered (breadcrumb: $_bc)" >&2
+    return 1
+  fi
+  rm -f "$_bc" 2>/dev/null || true
+  return 0
+}
+( trust_prompt_watch "$SESSION" "$TYPE" || true ) &
 
 # Auto-accept codex's first-run "Hooks need review" TUI prompt for telegram
 # codex agents. The prompt blocks an unattended agent until dismissed, and

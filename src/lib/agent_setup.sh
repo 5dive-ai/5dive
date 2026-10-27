@@ -1937,8 +1937,9 @@ grok_plugin_dir() {
 # dir from the agent's own $HOME via homedir()). We (1) write the bot token
 # into ~/.grok/channels/telegram/.env and (2) seed access.json. The MCP server
 # + lifecycle hooks are wired into ~/.grok/config.toml at boot by
-# 5dive-agent-start. grok runs with --always-approve, which also auto-trusts
-# plugin/MCP commands — no separate trust-bypass flag needed.
+# 5dive-agent-start. grok runs with --always-approve, which auto-approves tool
+# calls but NOT grok >= 1.0's folder-trust dialog: 5dive-agent-start seeds the
+# workdir into ~/.grok/trusted_folders.toml on every boot (DIVE-7083).
 install_channel_for_grok_agent() {
   local plugin="$1" name="$2" token="$3" allowed_users="${4:-}"
   local user="agent-${name}"
