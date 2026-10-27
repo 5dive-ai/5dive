@@ -6,7 +6,9 @@
 #      through the REAL _gate_cgroup_human_capable;
 #   2. the demo-AI rule (_create_uses_demo_ai): by account name and by copied key;
 #   3. the import default (_import_demo_ai_default) never binds demo-ai for an agent;
-#   4. the built binary refuses the account, and still passes a normal one on.
+#   5. the built binary refuses the account, and still passes a normal one on.
+#      DIVE-7084: a codex hire there uses the box's codex login when the box has
+#      one, and with none the refusal points at that one box login.
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -108,15 +110,32 @@ if [[ -x ./5dive && -n "$SUDO" ]] && ! _gate_cgroup_human_capable; then
   # This harness runs as a sudo caller outside shelld and a login session, so it
   # IS an agent to the guard. A bad codex --model is the barrier right after it:
   # reaching that error means the guard let the create through.
-  S="$TMP/bin-state"; mkdir -p "$S/auth-profiles/demo-ai" "$S/auth-profiles/mine"
+  # FIVEDIVE_CONNECTOR_DIR keeps a host's shared API key out of the fixture.
+  S="$TMP/bin-state"; mkdir -p "$S/auth-profiles/demo-ai" "$S/connectors"
   printf 'ANTHROPIC_AUTH_TOKEN=sk-or-v1-fixturedemo\n' > "$S/auth-profiles/demo-ai/combined.env"
+  mk() { $SUDO env STATE_DIR="$S" FIVEDIVE_CONNECTOR_DIR="$S/connectors" ./5dive agent create trends "$@" --model='bad model' 2>&1; }
+  # No codex login on the box: still refused. The next step is the box's one
+  # codex sign-in, not an account per hire (DIVE-7084).
+  if $SUDO test -s /home/claude/.codex/auth.json 2>/dev/null; then
+    echo '  skip no-login arms (this host has a shared codex login)'
+  else
+    out=$(mk --type=codex --auth-profile=demo-ai)
+    grep -qF "free demo AI is the owner's trial" <<<"$out" \
+      && ok_t 'binary: an agent creating on demo-ai is refused' || bad_t 'binary: demo-ai not refused' "$out"
+    grep -qF 'sudo 5dive agent auth start codex (later codex hires use that same sign-in)' <<<"$out" \
+      && ok_t 'binary: the refusal names the box sign-in verb' || bad_t 'binary: no box sign-in next step' "$out"
+    grep -qF -- '--auth-profile=trends' <<<"$out" \
+      && bad_t 'binary: the refusal still asks for an account per hire' "$out" || ok_t 'binary: no account per hire'
+  fi
+  # One codex account on the box: the demo-ai hire uses it, past the guard.
+  mkdir -p "$S/auth-profiles/mine"
   printf 'OPENAI_API_KEY=sk-fixture\n' > "$S/auth-profiles/mine/combined.env"
-  out=$($SUDO env STATE_DIR="$S" ./5dive agent create trends --type=codex --auth-profile=demo-ai --model='bad model' 2>&1)
+  out=$(mk --type=codex --auth-profile=demo-ai)
+  grep -qF "using this box's codex login" <<<"$out" && grep -qF "invalid --model" <<<"$out" \
+    && ok_t "binary: a codex hire on demo-ai uses the box's codex login" || bad_t 'binary: demo-ai hire did not use the box login' "$out"
   grep -qF "free demo AI is the owner's trial" <<<"$out" \
-    && ok_t 'binary: an agent creating on demo-ai is refused' || bad_t 'binary: demo-ai not refused' "$out"
-  grep -qF 'auth start codex --auth-profile=trends' <<<"$out" \
-    && ok_t 'binary: the refusal names the sign-in link verb' || bad_t 'binary: no sign-in next step' "$out"
-  out=$($SUDO env STATE_DIR="$S" ./5dive agent create trends --type=codex --auth-profile=mine --model='bad model' 2>&1)
+    && bad_t 'binary: refused although the box has a codex login' "$out" || ok_t 'binary: not refused when the box has a codex login'
+  out=$(mk --type=codex --auth-profile=mine)
   grep -qF "invalid --model" <<<"$out" \
     && ok_t "binary: the owner's own account passes the guard" || bad_t 'binary: own account wrongly refused' "$out"
 else
