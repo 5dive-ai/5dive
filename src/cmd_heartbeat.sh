@@ -10001,6 +10001,84 @@ _hb_quota_probe_sweep() {
   return 0
 }
 
+# --- DIVE-7118 stuck-login sweep ----------------------------------------------
+# witty-palm, 2026-10-27: four seats on the login 'ningidrin' woke every 30 min
+# for 8 hours and stopped with no reply each time (StopFailure 'stop'). Every
+# status read ok and nobody was told: DIVE-6734 silenced every notice from a
+# turn nobody started, which is right for a usage limit (it lifts by itself) and
+# wrong here (nothing resumes until a person signs the login in again). So this
+# is the one exception: when seats read `failing` (seat_turn_trouble), the owner
+# gets ONE message per login, naming it and the fix. The stamp is per login and
+# lives as long as the episode: four seats on one login are one message, and the
+# stamp goes when no seat on that login is failing, so the next episode tells
+# them again. A rate limit never reads `failing`, so it never sends this.
+_hb_stuck_login_text() { # <login, "" = the box's shared login> <seats, comma-joined>
+  local who="the AI login \"$1\""
+  [[ -n "$1" ]] || who="your box's shared AI login"
+  printf '%s' "⚠️ ${who^} has stopped working. $2 keep waking up and stopping with no reply.
+
+To fix it, sign in to it again in Settings → AI subscriptions. Or ask your lead agent to move them to another login."
+}
+
+# One message through the owner's normal channel: the paired chat of the first
+# telegram seat, preferring one that is not stuck itself (its bot works either
+# way: a bot does not use the AI login). 0 only on a Bot API receipt.
+_hb_stuck_login_deliver() { # <text> <stuck seats, comma-joined>
+  local text="$1" stuck=",${2// /}," name pass
+  declare -F _task_agent_channel >/dev/null 2>&1 || return 1
+  declare -F _task_send_owner >/dev/null 2>&1 || return 1
+  for pass in other stuck; do
+    while IFS= read -r name; do
+      [[ -n "$name" && -r "${CONNECTORS_DIR}/telegram-${name}.env" ]] || continue
+      if [[ "$pass" == other ]]; then [[ "$stuck" != *",$name,"* ]] || continue
+      else [[ "$stuck" == *",$name,"* ]] || continue; fi
+      _task_agent_channel "$name" || continue
+      TASK_SEND_DELIVERED=0
+      _task_send_owner "$text"
+      [[ "${TASK_SEND_DELIVERED:-0}" == 1 ]] && return 0
+    done < <(jq -r '.agents | keys[]' "$REGISTRY" 2>/dev/null)
+  done
+  return 1
+}
+
+_hb_stuck_login_sweep() { # <now> <registry json>
+  declare -F seat_turn_trouble >/dev/null 2>&1 || return 0
+  local now="$1" reg="$2" dir="${HB_STUCK_LOGIN_DIR:-${STATE_DIR:-/var/lib/5dive}/stuck-login}"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  local last=0; last=$(cat "$dir/.last" 2>/dev/null) || last=0
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  (( now - last >= ${HB_STUCK_LOGIN_EVERY_SEC:-600} )) || return 0
+  printf '%s\n' "$now" >"$dir/.last" 2>/dev/null || true
+  local -A stuck=()
+  local name login t key f
+  while IFS=$'\t' read -r name login; do
+    [[ -n "$name" ]] || continue
+    t=$(seat_turn_trouble "$name" "$(seat_started_epoch "$name")") || continue
+    [[ "${t%%$'\t'*}" == failing ]] || continue
+    key="${login:-default}"
+    stuck[$key]+="${stuck[$key]:+, }${name}"
+  done < <(jq -r '.agents // {} | to_entries[] | [.key, (.value.authProfile // "" | if . == "default" then "" else . end)] | @tsv' <<<"$reg" 2>/dev/null)
+  for key in "${!stuck[@]}"; do
+    f="$dir/sent-${key//[^A-Za-z0-9._-]/_}"
+    if [[ -e "$f" ]]; then continue; fi
+    login="$key"; [[ "$key" == default ]] && login=""
+    if _hb_stuck_login_deliver "$(_hb_stuck_login_text "$login" "${stuck[$key]}")" "${stuck[$key]}"; then
+      printf '%s\n' "${stuck[$key]}" >"$f" 2>/dev/null || true
+      _hb_log "[stuck-login] told the owner: login '${key}' is stuck on ${stuck[$key]} (DIVE-7118)"
+    else
+      _hb_log "[stuck-login] login '${key}' is stuck on ${stuck[$key]}; the owner could not be reached, retrying next pass (DIVE-7118)"
+    fi
+  done
+  for f in "$dir"/sent-*; do
+    [[ -e "$f" ]] || continue
+    key="${f##*/sent-}"
+    [[ -n "${stuck[$key]+x}" ]] && continue
+    rm -f "$f"
+    _hb_log "[stuck-login] login '${key}' works again (no seat on it is failing) (DIVE-7118)"
+  done
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
@@ -10095,6 +10173,7 @@ cmd_heartbeat_tick() {
   _hb_openagent_inbox_sweep "$now" || _hb_log "[openagent-inbox] pass errored (non-fatal)"
   _hb_a2a_queue_sweep || _hb_log "[a2a-queue] pass errored (non-fatal)"
   _hb_autosleep_sweep "$now" || _hb_log "[autosleep] pass errored (non-fatal)"
+  _hb_stuck_login_sweep "$now" "$reg" || _hb_log "[stuck-login] pass errored (non-fatal)"
   # DIVE-3173: fire any restart `self-update` deferred because the agent was
   # holding an in_progress row. This tick is where the TASK BOUNDARY is observed
   # — the sweep re-asks the board the question self-update asked and bounces the
@@ -10356,9 +10435,14 @@ cmd_heartbeat_tick() {
     # with the same refusal: the live QA box dispatched /goal into exactly that.
     # It needs a person to fix the account, not a retry, so nothing is dispatched
     # until the seat restarts (a new key does that) or a turn gets through.
+    # A `failing` seat (a run of stopped turns, witty-palm) is NOT held: its
+    # login may come back by itself and the next wake is how that is seen. The
+    # stuck-login sweep tells the owner instead.
     local _refusal=""
-    if declare -F seat_account_refusal >/dev/null 2>&1 \
-       && _refusal=$(seat_account_refusal "$name" "$(seat_started_epoch "$name")"); then
+    if declare -F seat_turn_trouble >/dev/null 2>&1 \
+       && _refusal=$(seat_turn_trouble "$name" "$(seat_started_epoch "$name")") \
+       && [[ "${_refusal%%$'\t'*}" == refused ]]; then
+      _refusal="${_refusal#*$'\t'}"
       sk_capped=$((sk_capped + 1))
       _hb_log "[$name] not dispatched — its last turn was refused by its AI account ('${_refusal:0:80}'); a row would be claimed and get the same refusal. Fix the account (credit or a new key, which restarts the seat) and dispatch resumes (DIVE-7118)"
       continue

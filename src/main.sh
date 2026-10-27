@@ -291,6 +291,7 @@ Agents:
   5dive agent stats <name>                           # state, restart count, last exit
   5dive agent install <type> [--upgrade] [--detach|--status]  # install the CLI for a type if missing (--upgrade forces a reinstall; --detach runs it as a background job, --status reads that job)
   5dive agent set-account <agent> <account|default> [--switch-harness]  # rebind to a named account; "default" clears.
+  5dive agent recover <agent> [--to=<account|default>]  # restart a stuck seat, or move it to another login; the admin (lead) seat may run it without sudo.
                                                      # An account for the OTHER harness (Claude <-> ChatGPT) is refused
                                                      # unless --switch-harness, which runs 'agent switch' below
   5dive agent switch <name> --to=claude|codex [--account=<account|default>] [--no-handoff] [--handoff-wait=<s>]
@@ -921,6 +922,11 @@ _agent_verb_dispatch() {
         switch)
           AUDIT_CMD="agent switch"; AUDIT_ARGS=("$@")
           cmd_agent_switch "$@" ;;   # takes the registry lock itself, after the handoff wait
+        recover)
+          # DIVE-7118: the lead moves a stuck seat to another login and restarts
+          # it without root; a non-root admin seat crosses _lead_account.
+          AUDIT_CMD="agent recover"; AUDIT_ARGS=("$@")
+          cmd_agent_recover "$@" ;;
         set-account)
           AUDIT_CMD="agent set-account"; AUDIT_ARGS=("$@")
           # DIVE-5367: a standard seat switching ITSELF crosses its own grant.
@@ -1190,6 +1196,12 @@ main() {
       # (src/cmd_dashboard_relay.sh). Not audited: it is a five-minute poll.
       # Never advertised.
       cmd_dashboard_relay "$@"
+      exit $? ;;
+    _lead_account)
+      # DIVE-7118: hidden root half of `agent recover`. The caller is re-derived
+      # from SUDO_UID and must be an admin seat (src/cmd_account.sh). Not audited
+      # HERE: the parent verb is audited and reaches this through a pipe.
+      cmd_lead_account_delegated "$@"
       exit $? ;;
     _self_account)
       # DIVE-5367: hidden, privileged, self-scoped account rail for a standard

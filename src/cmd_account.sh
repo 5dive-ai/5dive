@@ -2545,3 +2545,92 @@ cmd_self_account_delegated() {
       fail "$E_VALIDATION" "_self_account allows only usage, list, set or rotate." ;;
   esac
 }
+
+# ---------------------------------------------------------------------------
+# DIVE-7118: `agent recover <seat> [--to=<account|default>]` — the lead moves a
+# stuck seat to another login and restarts it, without root.
+#
+# witty-palm, 2026-10-27: four seats on one login stopped answering, and the
+# box's lead could see it and could not act: `agent restart`, `agent set-account`
+# and `agent config set auth-profile` are root verbs. This is the narrow form of
+# the two it needed, on the _self_account template (DIVE-5367): the caller half
+# crosses `sudo -n /usr/local/bin/5dive _lead_account` with the operation on
+# stdin, and the root half re-derives the CALLER from SUDO_UID and lets only a
+# seat the registry records as `admin` through. No sudoers line is added for
+# anyone: an admin seat's grant already reaches the exact path, and a standard
+# seat's does not, so it is refused before the root half runs.
+#
+# What it can do: restart one named seat, or bind it to an account the box
+# already holds (cmd_config refuses one it does not) and restart it — the
+# set-account plumbing, deferred restart included. Nothing that adds, signs in
+# or removes an account.
+cmd_agent_recover() {
+  local seat="" to="" a
+  for a in "$@"; do
+    case "$a" in
+      --to=*) to="${a#--to=}"; [[ -n "$to" ]] || fail "$E_USAGE" "--to needs an account name (or default)" ;;
+      -*)     fail "$E_USAGE" "unknown flag: $a (usage: 5dive agent recover <agent> [--to=<account|default>])" ;;
+      *)      [[ -z "$seat" ]] && seat="$a" || fail "$E_USAGE" "extra arg: $a" ;;
+    esac
+  done
+  [[ -n "$seat" ]] || fail "$E_USAGE" "usage: 5dive agent recover <agent> [--to=<account|default>]"
+  valid_name "$seat" || fail "$E_VALIDATION" "invalid agent name: $seat"
+  [[ -z "$to" || "$to" == default ]] || valid_profile_name "$to" || fail "$E_VALIDATION" "invalid account name: $to"
+  if ! _gate_is_root; then
+    local mode=text rc=0
+    (( ${JSON_MODE:-0} )) && mode=json
+    sudo -n -l /usr/local/bin/5dive _lead_account >/dev/null 2>&1 \
+      || fail "$E_PERMISSION" "only the box's admin (lead) seat can recover another seat. Ask the owner, or the lead, to run: 5dive agent recover ${seat}${to:+ --to=$to}"
+    if [[ -n "$to" ]]; then printf '%s\0' "$mode" set "$seat" "$to"
+    else printf '%s\0' "$mode" restart "$seat"; fi | sudo -n /usr/local/bin/5dive _lead_account || rc=$?
+    (( rc == 0 )) || mark_reported
+    return "$rc"
+  fi
+  _agent_recover_do "$seat" "$to"
+}
+
+# Root side of both paths. The registry lock is taken here, once.
+_agent_recover_do() { # <seat> [account]
+  if [[ -n "${2:-}" ]]; then
+    with_registry_lock cmd_agent_set_account "$1" "$2"
+  else
+    with_registry_lock cmd_restart "$1"
+  fi
+}
+
+# Root half. Reached ONLY through sudo (an admin seat's grant) or by root.
+cmd_lead_account_delegated() {
+  _gate_is_root || fail "$E_PERMISSION" "_lead_account is a privileged internal primitive (reachable only through sudo)."
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "_lead_account takes no arguments (the operation is read from stdin, the caller from the sudo caller)."
+  local -a wire=(); local a
+  while IFS= read -r -d '' a; do wire+=("$a"); done
+  (( ${#wire[@]} >= 3 )) || fail "$E_VALIDATION" "_lead_account requires an output mode, an operation and a seat on stdin."
+  case "${wire[0]}" in
+    json) JSON_MODE=1 ;;
+    text) JSON_MODE=0 ;;
+    *)    fail "$E_VALIDATION" "_lead_account output mode must be json or text." ;;
+  esac
+  local ruid="${SUDO_UID:-}" caller="" iso=""
+  [[ "$ruid" =~ ^[0-9]+$ && "$ruid" != 0 ]] \
+    || fail "$E_AUTH_REQUIRED" "_lead_account requires sudo from an agent seat."
+  caller=$(_gate_uid_to_agent "$ruid")
+  [[ -n "$caller" ]] || fail "$E_AUTH_REQUIRED" "_lead_account caller uid ${ruid} is not an agent seat."
+  # The registry is root-written; the seat cannot raise its own isolation.
+  iso=$(registry_read | jq -r --arg n "$caller" '.agents[$n].isolation // ""')
+  [[ "$iso" == admin ]] \
+    || fail "$E_PERMISSION" "only the box's admin (lead) seat can recover another seat; '${caller}' is '${iso:-unknown}'."
+  local seat="${wire[2]}"
+  valid_name "$seat" || fail "$E_VALIDATION" "_lead_account: invalid agent name."
+  case "${wire[1]}" in
+    restart)
+      (( ${#wire[@]} == 3 )) || fail "$E_VALIDATION" "_lead_account restart takes exactly one seat."
+      _agent_recover_do "$seat" ;;
+    set)
+      (( ${#wire[@]} == 4 )) || fail "$E_VALIDATION" "_lead_account set takes a seat and one account name."
+      [[ "${wire[3]}" == default ]] || valid_profile_name "${wire[3]}" \
+        || fail "$E_VALIDATION" "_lead_account set: invalid account name."
+      _agent_recover_do "$seat" "${wire[3]}" ;;
+    *)
+      fail "$E_VALIDATION" "_lead_account allows only restart or set." ;;
+  esac
+}

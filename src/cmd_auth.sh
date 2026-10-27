@@ -540,10 +540,15 @@ cmd_auth_status() {
   # refuse the seat's interactive client. The seat's own last turn is the
   # reading of the path it actually uses, so a refusal there turns `ok` into
   # `stale` too.
-  if [[ -n "$agent" && -z "$seat_reason" ]] && declare -F seat_account_refusal >/dev/null 2>&1; then
+  if [[ -n "$agent" && -z "$seat_reason" ]] && declare -F seat_turn_trouble >/dev/null 2>&1; then
     local _rf
-    if _rf=$(seat_account_refusal "$agent" "$(seat_started_epoch "$agent")"); then
-      seat_reason="$_rf"; seat_say="its own last turn was refused by its AI account: ${_rf}"
+    if _rf=$(seat_turn_trouble "$agent" "$(seat_started_epoch "$agent")"); then
+      seat_reason="${_rf#*$'\t'}"
+      if [[ "${_rf%%$'\t'*}" == refused ]]; then
+        seat_say="its own last turn was refused by its AI account: ${seat_reason}"
+      else
+        seat_say="its own turns keep failing on its AI login: ${seat_reason}"
+      fi
       out=$(jq -c --arg t "$t" 'if .[$t] == "ok" then .[$t] = "stale" else . end' <<<"$out")
     fi
   fi
@@ -1174,12 +1179,14 @@ _cred_refreshable() {
 agent_auth_health() {
   local type="$1" profile="${2:-}" name="${3:-}"
   local sentinel="${TYPE_AUTH[$type]:-}"
-  # DIVE-7118: the seat's own last turn outranks the credential file. A key the
+  # DIVE-7118: the seat's own turns outrank the credential file. A key the
   # account refuses (no credit, revoked) is a present, unexpired file — `ok` by
-  # every test below — on a seat that cannot answer one message.
-  if [[ -n "$name" ]] && declare -F seat_account_refusal >/dev/null 2>&1 \
-     && seat_account_refusal "$name" "$(seat_started_epoch "$name")" >/dev/null; then
-    echo "refused|-|false"; return 0
+  # every test below — on a seat that cannot answer one message. `refused` is
+  # that; `failing` is a run of turns that stopped on an API error (witty-palm).
+  local _trouble=""
+  if [[ -n "$name" ]] && declare -F seat_turn_trouble >/dev/null 2>&1 \
+     && _trouble=$(seat_turn_trouble "$name" "$(seat_started_epoch "$name")"); then
+    echo "${_trouble%%$'\t'*}|-|false"; return 0
   fi
   [[ -n "$sentinel" ]] || { echo "ok|-|false"; return 0; }
   # A codex seat does not run on the profile file: 5dive-agent-start only SEEDS
