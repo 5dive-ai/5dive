@@ -402,6 +402,52 @@ declare -A TYPE_AUTH=(
   # empirically against devin 3000.2.17.
   [devin]="/home/claude/.local/share/devin/credentials.toml"
 )
+
+# DIVE-7101: openclaw 2026.10.x keeps the key in its app-wide state db,
+# ~/.openclaw/state/openclaw.sqlite (config_machine_state row `authProfiles.store`).
+# OPENCLAW_STATE_AUTH_PY <has|extract|apply> <db>
+#   has      rc 0 when the db's `authProfiles.store` row holds >=1 profile, else 3
+#   extract  the same test, and on rc 0 the auth rows as JSON on stdout
+#   apply    upsert rows read from stdin into an EXISTING db; the profile map is
+#            merged by profile id (the source wins), every other auth row replaced
+# rc 2: not a state db this program understands (no config_machine_state).
+# 5dive-agent-start carries a byte-identical copy (it is not built from src/);
+# tests/openclaw_seat_seed_unit.sh fails when the two drift.
+# shellcheck disable=SC2034  # read by cmd_auth.sh / cmd_agent_create.sh
+OPENCLAW_STATE_AUTH_PY='
+import json, sqlite3, sys
+mode, path = sys.argv[1], sys.argv[2]
+SEL = "SELECT state_key, value_json, updated_at_ms FROM config_machine_state WHERE state_key = ? OR state_key LIKE ?"
+def profiles(value):
+    try:
+        return (json.loads(value) or {}).get("profiles") or {}
+    except Exception:
+        return {}
+try:
+    db = sqlite3.connect(path, timeout=10)
+    if mode in ("has", "extract"):
+        rows = db.execute(SEL, ("auth.sharedStore", "authProfiles.%")).fetchall()
+        if not any(k == "authProfiles.store" and profiles(v) for k, v, _ in rows):
+            sys.exit(3)
+        if mode == "extract":
+            json.dump(rows, sys.stdout)
+        sys.exit(0)
+    rows = json.load(sys.stdin)
+    with db:
+        for k, v, t in rows:
+            if k == "authProfiles.store":
+                cur = db.execute("SELECT value_json FROM config_machine_state WHERE state_key = ?", (k,)).fetchone()
+                if cur:
+                    merged = json.loads(cur[0]) or {}
+                    new = json.loads(v)
+                    merged.update({x: y for x, y in new.items() if x != "profiles"})
+                    merged["profiles"] = {**profiles(cur[0]), **profiles(v)}
+                    v = json.dumps(merged, separators=(",", ":"))
+            db.execute("INSERT INTO config_machine_state (state_key, value_json, updated_at_ms) VALUES (?, ?, ?) "
+                       "ON CONFLICT(state_key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms", (k, v, t))
+except sqlite3.Error:
+    sys.exit(2)
+'
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
 # (caller must hand-install). Idempotent: each recipe checks first.

@@ -233,6 +233,25 @@ check "--auth-profile reports scope kind" "$(jq -r '.scope.kind' <<<"$out")" "pr
 contains "--auth-profile without --type is still refused" \
   "$(run_err --auth-profile=hermes-finn)" "requires --type"
 
+# --- 6. DIVE-7101: the SEAT's own boot verdict outranks the account's ok ----
+# An openclaw account held a good key that never reached the seat; this said
+# `openclaw: ok` while every message failed. The boot seed's breadcrumb is the
+# seat's verdict, and a degraded one must turn ok into stale and say why.
+auth_status_one() { printf 'ok'; }
+_agent_startup_credential_health() {
+  [[ "$1" == ray ]] && { printf 'degraded|openclaw has no API key in its own store\n'; return 0; }
+  printf 'clear|\n'
+}
+out=$(run_json --agent=ray)
+check "a seat whose boot found no key is stale, not ok" "$(jq -r '.data.openclaw' <<<"$out")" "stale"
+check "...and the seat's own reason travels with it" "$(jq -r '.seat.reason' <<<"$out")" "openclaw has no API key in its own store"
+contains "...and text mode says it out loud" "$(run_text_err --agent=ray)" "openclaw has no API key"
+out=$(run_json --agent=finn)
+check "a seat whose boot was clear keeps ok" "$(jq -r '.data.hermes' <<<"$out")" "ok"
+check "...and carries no seat block" "$(jq -r '.seat // "none"' <<<"$out")" "none"
+out=$(run_json --type=openclaw)
+check "a type-level query is the account's answer, untouched" "$(jq -r '.data.openclaw' <<<"$out")" "ok"
+
 # Harness reachability: if cmd_auth_status were undefined every check above
 # would have compared empty-to-empty in some other file's shape.
 if declare -F cmd_auth_status >/dev/null; then

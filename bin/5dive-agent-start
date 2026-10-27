@@ -985,8 +985,105 @@ if [[ "$TYPE" == "openclaw" ]]; then
       fi
     fi
   done
-  # DIVE-1900: loud on the wrong-layer failure (see assert_cred_seeded above).
-  assert_cred_seeded openclaw "$SHARED_OPENCLAW_AUTH" "$LOCAL_OPENCLAW_AUTH"
+  # DIVE-7101: openclaw 2026.10.x keeps the key in its app-wide state db, not in
+  # agents/main/agent/ (which it never creates), so the loop above finds nothing
+  # and the seat boots with no key: every turn dies on `No API key found for
+  # provider "openrouter"` while every status surface read ok. Carry the auth
+  # rows only — the seat's db is its own live state — through a private
+  # snapshot of the source. A seat with no state db yet takes the snapshot whole.
+  # `agent create`, `agent auth set`, `agent restart` and a rebind push the same
+  # rows in as root (openclaw_carry_state_auth in cmd_agent_create.sh); this is
+  # the second chance for a seat that can read its account.
+  # Byte-identical to OPENCLAW_STATE_AUTH_PY in src/header.sh
+  # (tests/openclaw_seat_seed_unit.sh fails when they drift).
+  OPENCLAW_STATE_AUTH_PY='
+import json, sqlite3, sys
+mode, path = sys.argv[1], sys.argv[2]
+SEL = "SELECT state_key, value_json, updated_at_ms FROM config_machine_state WHERE state_key = ? OR state_key LIKE ?"
+def profiles(value):
+    try:
+        return (json.loads(value) or {}).get("profiles") or {}
+    except Exception:
+        return {}
+try:
+    db = sqlite3.connect(path, timeout=10)
+    if mode in ("has", "extract"):
+        rows = db.execute(SEL, ("auth.sharedStore", "authProfiles.%")).fetchall()
+        if not any(k == "authProfiles.store" and profiles(v) for k, v, _ in rows):
+            sys.exit(3)
+        if mode == "extract":
+            json.dump(rows, sys.stdout)
+        sys.exit(0)
+    rows = json.load(sys.stdin)
+    with db:
+        for k, v, t in rows:
+            if k == "authProfiles.store":
+                cur = db.execute("SELECT value_json FROM config_machine_state WHERE state_key = ?", (k,)).fetchone()
+                if cur:
+                    merged = json.loads(cur[0]) or {}
+                    new = json.loads(v)
+                    merged.update({x: y for x, y in new.items() if x != "profiles"})
+                    merged["profiles"] = {**profiles(cur[0]), **profiles(v)}
+                    v = json.dumps(merged, separators=(",", ":"))
+            db.execute("INSERT INTO config_machine_state (state_key, value_json, updated_at_ms) VALUES (?, ?, ?) "
+                       "ON CONFLICT(state_key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms", (k, v, t))
+except sqlite3.Error:
+    sys.exit(2)
+'
+  SHARED_OPENCLAW_STATE="${PROFILE_STATE_DIR:+$PROFILE_STATE_DIR/.openclaw/state/openclaw.sqlite}"
+  SHARED_OPENCLAW_STATE="${SHARED_OPENCLAW_STATE:-/home/claude/.openclaw/state/openclaw.sqlite}"
+  LOCAL_OPENCLAW_STATE="$HOME/.openclaw/state/openclaw.sqlite"
+  # read: 0 not readable, 1 read and carried, 3 read and holds no key
+  _OC_STATE_READ=0
+  _OC_STATE_TMP="$(mktemp -d -p "$HOME/.openclaw" .state-seed.XXXXXX 2>/dev/null)" || _OC_STATE_TMP=""
+  if [[ -n "$_OC_STATE_TMP" ]] && { cat "$SHARED_OPENCLAW_STATE" 2>/dev/null || sudo -n cat "$SHARED_OPENCLAW_STATE" 2>/dev/null; } > "$_OC_STATE_TMP/openclaw.sqlite" \
+     && [[ -s "$_OC_STATE_TMP/openclaw.sqlite" ]]; then
+    { cat "${SHARED_OPENCLAW_STATE}-wal" 2>/dev/null || sudo -n cat "${SHARED_OPENCLAW_STATE}-wal" 2>/dev/null; } > "$_OC_STATE_TMP/openclaw.sqlite-wal" \
+      || rm -f "$_OC_STATE_TMP/openclaw.sqlite-wal"
+    _OC_ROWS_RC=0
+    _OC_ROWS="$(python3 -I -c "$OPENCLAW_STATE_AUTH_PY" extract "$_OC_STATE_TMP/openclaw.sqlite")" || _OC_ROWS_RC=$?
+    if (( _OC_ROWS_RC == 3 )); then
+      _OC_STATE_READ=3
+    elif (( _OC_ROWS_RC == 0 )); then
+      install -d -m 700 "$HOME/.openclaw/state" 2>/dev/null || true
+      if [[ -s "$LOCAL_OPENCLAW_STATE" ]]; then
+        printf '%s' "$_OC_ROWS" | python3 -I -c "$OPENCLAW_STATE_AUTH_PY" apply "$LOCAL_OPENCLAW_STATE" && _OC_STATE_READ=1
+      elif python3 -I -c 'import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close()' \
+             "$_OC_STATE_TMP/openclaw.sqlite" "$_OC_STATE_TMP/seat.sqlite"; then
+        chmod 600 "$_OC_STATE_TMP/seat.sqlite"
+        mv "$_OC_STATE_TMP/seat.sqlite" "$LOCAL_OPENCLAW_STATE" && _OC_STATE_READ=1
+      fi
+    fi
+  fi
+  [[ -z "$_OC_STATE_TMP" ]] || rm -rf "$_OC_STATE_TMP"
+
+  if (( _OC_STATE_READ == 1 )); then
+    cred_seed_ok
+  else
+    # DIVE-1900: loud on the wrong-layer failure (see assert_cred_seeded above).
+    # Skipped when the state db carried the key: on that layout the legacy path
+    # never exists, and its "no credential" warning was the misleading line in
+    # every 10-27 QA boot.
+    assert_cred_seeded openclaw "$SHARED_OPENCLAW_AUTH" "$LOCAL_OPENCLAW_AUTH"
+  fi
+  # DIVE-7101: the verdict is the SEAT's own store, whatever the seed did. A
+  # seat with no key in either layout cannot answer one message, so it must not
+  # read ok anywhere: the breadcrumb is what `agent list` (STATE degraded),
+  # `agent info` and `auth status --agent` read. assert_cred_seeded only
+  # breadcrumbs the UNREADABLE case; an absent key left none, and that was the
+  # whole false green.
+  if [[ ! -s "$LOCAL_OPENCLAW_AUTH" ]] \
+     && ! { [[ -s "$LOCAL_OPENCLAW_STATE" ]] && python3 -I -c "$OPENCLAW_STATE_AUTH_PY" has "$LOCAL_OPENCLAW_STATE" 2>/dev/null; }; then
+    # Provably absent (its dir is readable and the file is not there) reads as
+    # "no key set", the same verdict as an account db that holds none.
+    if (( _OC_STATE_READ == 0 )) && [[ -r "$(dirname "$SHARED_OPENCLAW_STATE")" && ! -e "$SHARED_OPENCLAW_STATE" ]]; then
+      _OC_STATE_READ=3
+    fi
+    case "$_OC_STATE_READ" in
+      3) cred_seed_failed "openclaw has no API key: its account holds none (${SHARED_OPENCLAW_STATE}) — every message will fail with 'Couldn't sign in to the AI service'. Set one: sudo 5dive agent auth set openclaw --provider=<provider> --api-key=- ${PROFILE:+--auth-profile=$PROFILE}" ;;
+      *) cred_seed_failed "openclaw has no API key in its own store, and its account's key store ${SHARED_OPENCLAW_STATE} is not readable by $(id -un) — every message will fail with 'Couldn't sign in to the AI service'. Copy it in as root: sudo 5dive agent restart ${NAME:-<name>}" ;;
+    esac
+  fi
 
   # Inherit the profile's model defaults (`agents.defaults.model.primary`).
   # `openclaw models auth login --set-default` writes that key into the

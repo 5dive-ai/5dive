@@ -255,6 +255,44 @@ blk=$(sed -n '/DIVE-3113: for openclaw, an absent model is not a neutral/,/oc_un
 [[ -n "$blk" ]]   && ok "agent info: the unpinned-model block was located"   || bad "agent info: could not locate the unpinned-model block — this arm graded nothing"
 [[ "$blk" == *'profile_type_auth_path "" openclaw'* ]]   && ok "agent info: default-home seat resolves through the layout ladder"   || bad "agent info: default-home seat still reads TYPE_AUTH directly — suppressed on 2026.8.1"
 
+# --- arm 10 (DIVE-7101): on 2026.10.x the key is a ROW of the state db ------
+# The registration in openclaw.json is only the key's label. The 10-27 QA seat
+# had the label and no row, read ok everywhere, and answered nothing. A real
+# (sqlite) state db now decides: a key row is a credential, no key row is none.
+oc_state_db() { # <db> <with-key 0|1>
+  mkdir -p "$(dirname "$1")"
+  python3 -I - "$1" "$2" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1]); c.execute("PRAGMA journal_mode=WAL")
+c.execute("CREATE TABLE config_machine_state (state_key TEXT NOT NULL PRIMARY KEY, value_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL) STRICT")
+if sys.argv[2] == "1":
+    c.execute("INSERT INTO config_machine_state VALUES ('authProfiles.store', '{\"version\":1,\"profiles\":{\"openrouter:manual\":{\"type\":\"api_key\",\"provider\":\"openrouter\",\"key\":\"sk-or-test-7101\"}}}', 3)")
+c.commit(); c.close()
+PY
+}
+p=v1010-key
+root="$AUTH_PROFILES_DIR/$p/openclaw"
+oc_state_db "$root/.openclaw/state/openclaw.sqlite" 1
+if auth_creds_present openclaw "$p"; then ok "2026.10.x key row: auth_creds_present"
+else bad "2026.10.x key row: reported ABSENT"; fi
+[[ "$(profile_type_auth_path "$p" openclaw)" == "$root/.openclaw/state/openclaw.sqlite" ]] \
+  && ok "2026.10.x key row: the sentinel path IS the state db" \
+  || bad "2026.10.x key row: sentinel path is $(profile_type_auth_path "$p" openclaw)"
+
+p=v1010-label-only
+root="$AUTH_PROFILES_DIR/$p/openclaw"
+oc_state_db "$root/.openclaw/state/openclaw.sqlite" 0
+cat > "$root/.openclaw/openclaw.json" <<'JSON'
+{"auth":{"profiles":{"openrouter:manual":{"provider":"openrouter","mode":"api_key"}}},
+ "agents":{"defaults":{"model":{"primary":"openrouter/auto"}}}}
+JSON
+if auth_creds_present openclaw "$p"; then
+  bad "2026.10.x label without key row: reported PRESENT (the 10-27 false green)"
+else ok "2026.10.x label without key row: auth_creds_present says absent"; fi
+s=$(state_of "$p")
+[[ "$s" == needs_login ]] && ok "2026.10.x label without key row: state=needs_login" \
+                          || bad "2026.10.x label without key row: state=$s, want needs_login"
+
 if (( fails )); then
   printf '\nFAIL: %d assertion(s)\n' "$fails"
 else
