@@ -25,7 +25,7 @@ PRE_FIX='[[ -x /home/claude/.local/bin/devin ]] || curl -fsSL https://cli.devin.
 
 fails=0
 ok_()  { echo "ok   $1"; }
-bad_() { echo "FAIL $1" >&2; fails=$((fails + 1)); }
+bad_() { echo "FAIL $1" >&2; fails=$((fails+1)); }
 
 # run_recipe <recipe> <installer: lands-then-login-fails|fails-without-binary> <binary: present|absent>
 # Prints "rc=<n> curl=<0|1>".
@@ -72,5 +72,5 @@ got=$(run_recipe "$PRE_FIX" lands-then-login-fails absent)
 [[ "$got" == "rc=1 curl=1" ]] && ok_ "N1 negative control: the pre-fix recipe fails D1 ($got)" \
   || bad_ "N1 negative control: the pre-fix recipe should fail D1 with rc=1, got $got"
 
-(( fails == 0 )) || { echo "$fails arm(s) failed" >&2; exit 1; }
-echo "all arms pass"
+echo "$fails arm(s) failed"
+exit $(( fails > 0 ))
