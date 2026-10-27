@@ -73,8 +73,12 @@ _secret_drop_base_url() {
     [[ "$base" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?$ ]] || return 1
     printf '%s' "$base"; return 0
   fi
-  domain=$(_secret_drop_domain) || return 1
-  printf 'https://secrets.%s' "$domain"
+  if domain=$(_secret_drop_domain); then
+    printf 'https://secrets.%s' "$domain"; return 0
+  fi
+  # DIVE-7113: a self-hosted box's own https front (`secret https`).
+  local own; own=$(_secret_https_host) || return 1
+  printf 'https://%s' "$own"
 }
 
 # FIVE_DOMAIN from provisioning, only in a shape safe to put in a Caddyfile.
@@ -215,8 +219,13 @@ _secret_link_mint() {
   local ttl="$1" start="$2" ident="$3" key="$4" connector="$5" save="${6:-}" pair="${7:-0}"
   local base terminal="sudo 5dive secret write ${key} --connector=${connector} --task=${ident}"
   [[ -n "$save" ]] && terminal="sudo 5dive secret write ${key} --connector=${connector}"
-  base=$(_secret_drop_base_url) \
-    || fail "$E_NOT_INSTALLED" "this box has no https name an owner's browser can reach (no FIVE_DOMAIN in $SECRET_DROP_PROVISIONING, no SECRET_DROP_BASE_URL in $SECRET_DROP_CONF). Use the terminal instead: ${terminal}"
+  # DIVE-7113: a self-hosted box with no https name makes one itself, the first
+  # time a link is asked for (an IP certificate, then sslip.io). Only when both
+  # fail does the owner get a step: a domain, or the terminal.
+  if ! base=$(_secret_drop_base_url); then
+    (( start )) && _secret_https_auto && base=$(_secret_drop_base_url) \
+      || fail "$E_NOT_INSTALLED" "$(_secret_https_no_name_msg "$terminal")"
+  fi
 
   ( umask 077; mkdir -p "$SECRET_DROP_DIR" ) || fail "$E_GENERIC" "cannot create $SECRET_DROP_DIR"
   chmod 700 "$SECRET_DROP_DIR" 2>/dev/null || true
@@ -255,9 +264,11 @@ _secret_link_mint() {
     fail "$E_CONFLICT" "$(_secret_drop_squat_msg "$squat_uid")"
   fi
   if (( start )); then
-    local domain
+    local domain own
     if ! _secret_drop_has_base_url && domain=$(_secret_drop_domain); then
       _secret_drop_wait_ready "$domain" "$SECRET_DROP_WAIT_S" && ready=true || ready=false
+    elif ! _secret_drop_has_base_url && own=$(_secret_https_host); then
+      _secret_drop_wait_ready "$own" "$SECRET_DROP_WAIT_S" own && ready=true || ready=false
     fi
   fi
 
@@ -606,18 +617,26 @@ _secret_drop_has_base_url() {
 # token path: a 404 there counts against the page's failed-lookup rate limit.
 _secret_drop_ready() {
   local domain="$1" body
-  body=$(curl -fsS --max-time 3 --resolve "secrets.${domain}:443:${SECRET_DROP_PROBE_ADDR}" \
-    "https://secrets.${domain}/healthz" 2>/dev/null) || return 1
+  if [[ "${2:-}" == own ]]; then
+    # DIVE-7113: the self-hosted front's name is the host itself (an IP or a
+    # name). --connect-to, not --resolve: curl never resolves an IP literal.
+    body=$(curl -fsS --max-time 3 --connect-to "${domain}:443:${SECRET_DROP_PROBE_ADDR}:443" \
+      "https://${domain}/healthz" 2>/dev/null) || return 1
+  else
+    body=$(curl -fsS --max-time 3 --resolve "secrets.${domain}:443:${SECRET_DROP_PROBE_ADDR}" \
+      "https://secrets.${domain}/healthz" 2>/dev/null) || return 1
+  fi
   [[ "$body" == *'"ok":true'* ]]
 }
 
 # Poll _secret_drop_ready until it holds or <seconds> pass. rc 0 = ready.
+# A third argument "own" probes a self-hosted front's host (DIVE-7113).
 _secret_drop_wait_ready() {
-  local domain="$1" secs="$2" deadline
+  local domain="$1" secs="$2" kind="${3:-}" deadline
   [[ "$secs" =~ ^[0-9]+$ ]] || secs=20
   deadline=$(( $(date +%s) + secs ))
   while :; do
-    _secret_drop_ready "$domain" && return 0
+    _secret_drop_ready "$domain" "$kind" && return 0
     (( $(date +%s) >= deadline )) && return 1
     sleep "$SECRET_DROP_POLL_S"
   done
@@ -680,6 +699,286 @@ _secret_drop_ensure_server() {
     (( $(date +%s) >= deadline )) && return 0
     sleep "$SECRET_DROP_POLL_S"
   done
+}
+
+# ---- DIVE-7113: https on a self-hosted box ----------------------------------
+#
+# A hosted box serves its links at secrets.<FIVE_DOMAIN>. A self-hosted box has
+# no FIVE_DOMAIN and no Caddyfile, so it had no link at all and every secret
+# went through a terminal. Now it gets https ON THE BOX: its own Caddy, its own
+# certificate, and the same page behind it. Nothing about a value passes through
+# 5dive's relay, API or app, encrypted or not (lodar 2026-10-27).
+#   ip      a Let's Encrypt certificate for the box's public IPv4 (the 6-day
+#           "shortlived" profile; Caddy >= 2.11, 2.10 refused IP orders,
+#           caddy#7399). No third party's DNS in a secret's path. The default.
+#   sslip   <ip-with-dashes>.sslip.io with a normal certificate. The fallback:
+#           sslip.io's operator answers for the name, and it is not on the Public
+#           Suffix List, so every sslip.io user shares one 50-a-week cert bucket.
+#   domain  the owner's own name, pointed at the box (lodar: "sslip or self").
+# The first `secret link` on such a box tries ip, then sslip, by itself; only
+# when both fail (NAT, closed ports) is the owner asked for a domain or sent to
+# the terminal. Not FIVE_DOMAIN: on a box that sets it, the browser plugin takes
+# it for a hosted box and looks for the hosted relay.
+SECRET_HTTPS_CADDYFILE="/etc/5dive/secret-https.Caddyfile"
+SECRET_HTTPS_UNIT="5dive-secret-https"
+SECRET_HTTPS_UNIT_DIR="/etc/systemd/system"
+SECRET_HTTPS_CADDY_MIN=2.11
+SECRET_HTTPS_LOCK="/run/5dive-secret-https.lock"
+# How long one way gets to show a valid certificate, and how long a box where
+# both automatic ways failed waits before the next `secret link` tries again.
+SECRET_HTTPS_WAIT_S="${SECRET_HTTPS_WAIT_S:-60}"
+SECRET_HTTPS_RETRY_S="${SECRET_HTTPS_RETRY_S:-3600}"
+SECRET_HTTPS_WHY=""
+
+_secret_https_get() { [[ -r "$SECRET_DROP_CONF" ]] && sed -n "s/^$1=//p" "$SECRET_DROP_CONF" | tail -1; }
+# The front's host (an IPv4 or a name), only in a shape safe for a Caddyfile and a URL.
+_secret_https_host() {
+  local h; h=$(_secret_https_get SECRET_HTTPS_HOST)
+  [[ "$h" =~ ^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$ && "$h" == *.* ]] || return 1
+  printf '%s' "$h"
+}
+_secret_https_failed_file() { printf '%s' "${STATE_DIR}/secret-https.failed"; }
+
+# The box's public IPv4 from its own interfaces (the browser plugin's filter).
+# Empty behind NAT, which is the answer: neither automatic way works there.
+_secret_https_public_ipv4() {
+  ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+    | grep -vE '^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' | head -1
+}
+
+# The whole front: every path goes to the page (it 404s what is not a live
+# token), a 410 page while the page is down, no admin endpoint.
+_secret_https_caddyfile() { # <mode> <host>
+  local mode="$1" host="$2" closed_html; closed_html=$(_secret_drop_closed_html)
+  printf '# Written by `5dive secret https` (DIVE-7113). Re-run it to change this.\n{\n\tadmin off\n'
+  [[ "$mode" == ip ]] && printf '\tdefault_sni %s\n' "$host"   # a client never sends an IP as SNI
+  printf '}\n\nhttps://%s {\n' "$host"
+  [[ "$mode" == ip ]] && printf '\ttls {\n\t\tissuer acme {\n\t\t\tprofile shortlived\n\t\t}\n\t}\n'
+  printf '\treverse_proxy 127.0.0.1:%s\n' "$SECRET_DROP_PORT"
+  printf '\thandle_errors {\n\t\t@closed expression `{err.status_code} in [502, 503, 504]`\n\t\thandle @closed {\n'
+  printf '\t\t\theader Content-Type "text/html; charset=utf-8"\n\t\t\theader Cache-Control no-store\n'
+  printf '\t\t\trespond `%s` 410\n\t\t}\n\t}\n}\n' "$closed_html"
+}
+
+# Caddy as user caddy, its config handed in by systemd (DIVE-6980: user caddy
+# cannot read 5dive's own dirs, and must not).
+_secret_https_unit() {
+  cat <<UNIT
+# Written by \`5dive secret https\` (DIVE-7113).
+[Unit]
+Description=5dive one-time secret links: HTTPS on this self-hosted box
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=caddy
+Group=caddy
+StateDirectory=$SECRET_HTTPS_UNIT
+Environment=HOME=/var/lib/$SECRET_HTTPS_UNIT XDG_DATA_HOME=/var/lib/$SECRET_HTTPS_UNIT XDG_CONFIG_HOME=/var/lib/$SECRET_HTTPS_UNIT
+LoadCredential=Caddyfile:$SECRET_HTTPS_CADDYFILE
+ExecStart=/usr/bin/caddy run --config %d/Caddyfile --adapter caddyfile
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+_secret_https_caddy_version() { caddy version 2>/dev/null | sed -n 's/^v\([0-9]*\.[0-9]*\).*/\1/p' | head -1; }
+_secret_https_ver_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
+
+# Caddy >= 2.11 from Caddy's own signed apt source (a distro's is too old for IP
+# certificates). The package starts a stock caddy.service on port 80: stopped
+# and disabled when THIS run installed it, never a Caddy the owner already had.
+_secret_https_install_caddy() {
+  local v; v=$(_secret_https_caddy_version)
+  if [[ -n "$v" ]]; then
+    _secret_https_ver_ge "$v" "$SECRET_HTTPS_CADDY_MIN" && id caddy >/dev/null 2>&1 && return 0
+    dpkg -s caddy >/dev/null 2>&1 \
+      || { SECRET_HTTPS_WHY="this box has Caddy ${v} not from apt, and it needs ${SECRET_HTTPS_CADDY_MIN} or newer with a caddy user"; return 1; }
+  fi
+  command -v apt-get >/dev/null 2>&1 || { SECRET_HTTPS_WHY="no apt-get here to install Caddy ${SECRET_HTTPS_CADDY_MIN}+"; return 1; }
+  local had=0 kr=/usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  dpkg -s caddy >/dev/null 2>&1 && had=1
+  curl -fsSL --max-time 30 https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o "$kr" 2>/dev/null \
+    && printf 'deb [signed-by=%s] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main\n' "$kr" \
+         > /etc/apt/sources.list.d/caddy-stable.list \
+    && DEBIAN_FRONTEND=noninteractive apt-get -qq update >/dev/null 2>&1 \
+    && DEBIAN_FRONTEND=noninteractive apt-get -qq install -y caddy >/dev/null 2>&1 || true
+  (( had )) || systemctl disable --now caddy.service >/dev/null 2>&1 || true
+  v=$(_secret_https_caddy_version)
+  [[ -n "$v" ]] && _secret_https_ver_ge "$v" "$SECRET_HTTPS_CADDY_MIN" && id caddy >/dev/null 2>&1 && return 0
+  SECRET_HTTPS_WHY="could not install Caddy ${SECRET_HTTPS_CADDY_MIN}+ (have: ${v:-none})"
+  return 1
+}
+
+_secret_https_port_busy() { [[ -n "$(ss -Hltn "sport = :$1" 2>/dev/null)" ]]; }
+
+# rc 0 = https://<host>/ completes a handshake on a certificate curl verifies
+# (never -k), through this box's own front. Any HTTP status counts: the page
+# may be down (410) and that is still a working certificate.
+_secret_https_tls_ok() {
+  local host="$1" code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+    --connect-to "${host}:443:${SECRET_DROP_PROBE_ADDR}:443" "https://${host}/healthz" 2>/dev/null) || code=000
+  [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]
+}
+
+_secret_https_conf_set() { # <mode> <host>, keeping every other line of the conf
+  local tmp; tmp=$(mktemp "${SECRET_DROP_CONF}.XXXXXX" 2>/dev/null) || return 1
+  [[ -f "$SECRET_DROP_CONF" ]] && grep -vE '^SECRET_HTTPS_(MODE|HOST)=' "$SECRET_DROP_CONF" > "$tmp"
+  [[ -z "$1" ]] || printf 'SECRET_HTTPS_MODE=%s\nSECRET_HTTPS_HOST=%s\n' "$1" "$2" >> "$tmp"
+  chmod 644 "$tmp" && mv -f "$tmp" "$SECRET_DROP_CONF"
+}
+
+# Turn the front on one way. rc 0 = a verified certificate answers and the conf
+# names the host; otherwise the front is off again and SECRET_HTTPS_WHY says why.
+_secret_https_enable() { # <ip|sslip|domain> [<host>]
+  local mode="$1" host="${2:-}" ip=""
+  SECRET_HTTPS_WHY=""
+  case "$mode" in
+    ip|sslip)
+      ip=$(_secret_https_public_ipv4)
+      [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
+        || { SECRET_HTTPS_WHY="this box has no public IPv4 address (it is behind a router or NAT)"; return 1; }
+      if [[ "$mode" == ip ]]; then host="$ip"; else host="${ip//./-}.sslip.io"; fi ;;
+    domain)
+      host="${host,,}"
+      [[ "$host" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] \
+        || { SECRET_HTTPS_WHY="'${host}' is not a domain name (box.example.com)"; return 1; } ;;
+    *) SECRET_HTTPS_WHY="unknown way '${mode}' (ip, sslip or domain)"; return 1 ;;
+  esac
+  systemctl stop "$SECRET_HTTPS_UNIT" >/dev/null 2>&1 || true
+  if _secret_https_port_busy 443 || _secret_https_port_busy 80; then
+    SECRET_HTTPS_WHY="another program already uses port 80 or 443 on this box"
+    systemctl is-active --quiet 5dive-browser-link-tls 2>/dev/null \
+      && SECRET_HTTPS_WHY="the browser's login-link front already uses ports 80 and 443 on this box"
+    _secret_https_off; return 1
+  fi
+  _secret_https_install_caddy || { _secret_https_off; return 1; }
+  mkdir -p "${SECRET_HTTPS_CADDYFILE%/*}" "$SECRET_HTTPS_UNIT_DIR" "${SECRET_DROP_CONF%/*}" || { SECRET_HTTPS_WHY="cannot write ${SECRET_HTTPS_CADDYFILE%/*}"; return 1; }
+  ( umask 022; _secret_https_caddyfile "$mode" "$host" > "$SECRET_HTTPS_CADDYFILE" ) || { SECRET_HTTPS_WHY="cannot write $SECRET_HTTPS_CADDYFILE"; return 1; }
+  local out
+  if ! out=$(caddy validate --config "$SECRET_HTTPS_CADDYFILE" --adapter caddyfile 2>&1); then
+    SECRET_HTTPS_WHY="Caddy refused the config ($(caddy_validate_why "$out"))"; _secret_https_off; return 1
+  fi
+  ( umask 022; _secret_https_unit > "$SECRET_HTTPS_UNIT_DIR/$SECRET_HTTPS_UNIT.service" ) || { SECRET_HTTPS_WHY="cannot write the unit"; _secret_https_off; return 1; }
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable "$SECRET_HTTPS_UNIT" >/dev/null 2>&1 || true
+  systemctl restart "$SECRET_HTTPS_UNIT" >/dev/null 2>&1 \
+    || { SECRET_HTTPS_WHY="the https front did not start (journalctl -u $SECRET_HTTPS_UNIT)"; _secret_https_off; return 1; }
+  local deadline=$(( $(date +%s) + SECRET_HTTPS_WAIT_S ))
+  until _secret_https_tls_ok "$host"; do
+    if (( $(date +%s) >= deadline )); then
+      SECRET_HTTPS_WHY="no valid certificate for ${host} after ${SECRET_HTTPS_WAIT_S}s (ports 80 and 443 must reach this box from the internet)"
+      _secret_https_off; return 1
+    fi
+    sleep "$SECRET_DROP_POLL_S"
+  done
+  _secret_https_conf_set "$mode" "$host" || { SECRET_HTTPS_WHY="cannot write $SECRET_DROP_CONF"; _secret_https_off; return 1; }
+  rm -f "$(_secret_https_failed_file)"
+  return 0
+}
+
+# Everything the front put on the box, gone (Caddy itself stays installed).
+_secret_https_off() {
+  systemctl disable --now "$SECRET_HTTPS_UNIT" >/dev/null 2>&1 || true
+  rm -f "${SECRET_HTTPS_UNIT_DIR:?}/${SECRET_HTTPS_UNIT:?}.service" "${SECRET_HTTPS_CADDYFILE:?}"
+  [[ -f "$SECRET_DROP_CONF" ]] && _secret_https_conf_set "" ""
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  return 0
+}
+
+# A self-hosted box: no FIVE_DOMAIN and no owner's own base URL. A hosted box
+# never takes any of the paths above.
+_secret_https_selfhosted() { ! _secret_drop_domain >/dev/null && ! _secret_drop_has_base_url; }
+
+# The just-in-time step `secret link` takes on a box with no https name: ip,
+# then sslip. One at a time (two gates at once must not race for port 443), and
+# after both failed, not again for SECRET_HTTPS_RETRY_S (a closed port costs
+# two full waits per try).
+_secret_https_auto() {
+  _secret_https_selfhosted || return 1
+  local ff last=0 now; ff=$(_secret_https_failed_file); now=$(date +%s)
+  [[ -r "$ff" ]] && last=$(sed -n 's/^at=//p' "$ff" | head -1)
+  if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < SECRET_HTTPS_RETRY_S )); then
+    SECRET_HTTPS_WHY="$(sed -n 's/^why=//p' "$ff" | head -1)"; return 1
+  fi
+  exec 9>"$SECRET_HTTPS_LOCK" 2>/dev/null && flock 9 2>/dev/null || true
+  _secret_https_host >/dev/null && { exec 9>&-; return 0; }   # another call made it meanwhile
+  local why_ip=""
+  if _secret_https_enable ip; then exec 9>&-; return 0; fi
+  why_ip="$SECRET_HTTPS_WHY"
+  # sslip.io only helps where the IP certificate itself failed: no public IP, a
+  # busy port or no Caddy fail it the same way, so skip the second wait.
+  if [[ "$why_ip" == "no valid certificate"* || "$why_ip" == "Caddy refused"* ]]; then
+    if _secret_https_enable sslip; then exec 9>&-; return 0; fi
+  fi
+  SECRET_HTTPS_WHY="$why_ip"
+  ( umask 077; printf 'at=%s\nwhy=%s\n' "$now" "$why_ip" > "$ff" ) 2>/dev/null || true
+  exec 9>&-
+  return 1
+}
+
+# What `secret link` says when there is still no https name: written for the
+# agent to pass on as two plain messages (a domain, or the terminal).
+_secret_https_no_name_msg() { # <terminal command>
+  local ip; ip=$(_secret_https_public_ipv4)
+  if ! _secret_https_selfhosted; then
+    printf "this box has no https name an owner's browser can reach (no FIVE_DOMAIN in %s, no SECRET_DROP_BASE_URL in %s). Use the terminal instead: %s" \
+      "$SECRET_DROP_PROVISIONING" "$SECRET_DROP_CONF" "$1"
+    return 0
+  fi
+  local why=""; [[ -n "$SECRET_HTTPS_WHY" ]] && why=", and it could not make one by itself (${SECRET_HTTPS_WHY})"
+  printf 'this box has no secure web address for the link yet%s. Ask your owner first: "Do you have a domain? Point it at %s and tell me the name." With a name, run: sudo 5dive secret https enable --via=domain --host=<name>, then ask for the link again. Without one, the owner types the value on this box instead: %s' \
+    "$why" "${ip:-this box}" "$1"
+}
+
+# `5dive secret https [status|enable --via=ip|sslip|domain [--host=<name>]|disable]`
+_secret_https() {
+  local sub="${1:-status}"; shift || true
+  local via="" host="" a
+  if ! _secret_https_selfhosted; then
+    case "$sub" in
+      status|-h|--help|help) ok "links on this box already use its own https name ($(_secret_drop_base_url 2>/dev/null)); there is nothing to set up." '{on: true, managed: false}'; return 0 ;;
+    esac
+    fail "$E_CONFLICT" "this box already has its https name ($(_secret_drop_base_url 2>/dev/null)), so its links work; nothing changed"
+  fi
+  case "$sub" in
+    status)
+      local h m; h=$(_secret_https_host) || h=""; m=$(_secret_https_get SECRET_HTTPS_MODE)
+      if [[ -n "$h" ]]; then
+        ok "secret links: on, via ${m:-?} - https://${h}/..." '{on: true, managed: true, mode: $m, host: $h}' --arg m "$m" --arg h "$h"
+      else
+        ok "secret links: no https address yet; the first secret link makes one (an IP certificate, then sslip.io). Your own domain: sudo 5dive secret https enable --via=domain --host=<name>" '{on: false, managed: true}'
+      fi ;;
+    enable)
+      for a in "$@"; do
+        case "$a" in
+          --via=*)  via="${a#*=}" ;;
+          --host=*) host="${a#*=}" ;;
+          *) fail "$E_USAGE" "unknown: $a (5dive secret https enable --via=ip|sslip|domain [--host=<name>])" ;;
+        esac
+      done
+      require_root secret https
+      [[ "$via" =~ ^(ip|sslip|domain)$ ]] || fail "$E_USAGE" "--via must be ip, sslip or domain"
+      [[ "$via" == domain && -z "$host" ]] && fail "$E_USAGE" "--via=domain needs --host=<your domain>, pointed at this box"
+      [[ "$via" != domain && -n "$host" ]] && fail "$E_USAGE" "--via=$via makes its own name; --host is for --via=domain"
+      _secret_https_enable "$via" "$host" || fail "$E_NOT_INSTALLED" "secret links stay without https: ${SECRET_HTTPS_WHY}. Nothing was turned on."
+      local h; h=$(_secret_https_host)
+      ok "secret links: on, via ${via} - https://${h}/...$([[ "$via" == sslip ]] && printf '\n  note: sslip.io answers for this name; --via=ip or your own domain keeps any third party out of it.')" \
+        '{on: true, managed: true, mode: $m, host: $h}' --arg m "$via" --arg h "$h" ;;
+    disable)
+      require_root secret https
+      _secret_https_off; rm -f "$(_secret_https_failed_file)"
+      ok "secret links: https off; Caddy stays installed, nothing listens on 80 or 443 for links." '{on: false, managed: true}' ;;
+    -h|--help|help) _secret_usage ;;
+    *) fail "$E_USAGE" "secret https: status, enable or disable" ;;
+  esac
 }
 
 # ---- secret serve ----------------------------------------------------------
