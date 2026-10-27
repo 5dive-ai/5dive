@@ -13,7 +13,9 @@
 #     recipe never runs;
 #   - a present library and a type that does not need it touch apt not at all;
 #   - a recipe that exits non-zero is reported as failed, not as a success;
-#   - the presence probe survives SIGPIPE under pipefail on a long ldconfig.
+#   - the presence probe survives SIGPIPE under pipefail on a long ldconfig;
+#   - the map survives cmd_auth.sh being loaded from function scope, the way
+#     the shipped bundle's _load_module evals it (a plain `declare` is local).
 # ldconfig, apt-get and sudo are PATH stubs; nothing is installed for real.
 #
 # Run: bash tests/hermes_libatomic_install_unit.sh (no root, no network, ~12s: arm 7 waits out cmd_install's 10s bin grace)
@@ -91,7 +93,13 @@ install() {
     # shellcheck disable=SC1091
     source "$ROOT/src/lib/validation.sh"
     # shellcheck disable=SC1091
-    source "$ROOT/src/cmd_auth.sh"
+    if [[ "${LOAD_IN_FUNCTION:-}" == 1 ]]; then
+      # What the bundle does: _load_module evals the module inside a function.
+      __load_cmd_auth() { source "$ROOT/src/cmd_auth.sh"; }
+      __load_cmd_auth
+    else
+      source "$ROOT/src/cmd_auth.sh"
+    fi
     # env_isolation's sudo guard refuses REAL sudo; here sudo is the stub.
     [[ "$(type -P sudo)" == "$TMP/stubs/sudo" ]] && unset -f sudo
     set +e
@@ -101,7 +109,7 @@ install() {
   ) && RC=0 || RC=$?
 }
 calls() { cat "$TMP/calls" 2>/dev/null; }
-reset() { rm -rf "${TMP:?}/bin" "$TMP/calls" "$TMP/has-libatomic" "$TMP/lists-fresh"; unset APT_MODE RECIPE_MODE LDCONFIG_LONG; }
+reset() { rm -rf "${TMP:?}/bin" "$TMP/calls" "$TMP/has-libatomic" "$TMP/lists-fresh"; unset APT_MODE RECIPE_MODE LDCONFIG_LONG LOAD_IN_FUNCTION; }
 
 # --- 1. missing libatomic: installed with apt, before the recipe ------------
 reset
@@ -150,6 +158,12 @@ install hermes
 check "recipe exit 1: exits non-zero" "$([[ $RC -ne 0 ]]; echo $?)" "out=$ALL"
 check "recipe exit 1: reported as failed with the installer's exit" "$(grep -q 'install failed (installer exit 1)' <<<"$ALL"; echo $?)" "$ALL"
 check "recipe exit 1: no 'reported success' line" "$(! grep -q 'reported success' <<<"$ALL"; echo $?)" "$ALL"
+
+# --- 8. cmd_auth.sh loaded from function scope (the shipped bundle) ---------
+reset; export LOAD_IN_FUNCTION=1
+install hermes
+check "function-scope load: apt-get still installs libatomic1 for hermes" "$(calls | grep -q '^apt-get .*install .*libatomic1'; echo $?)" "$(calls)"
+check "function-scope load: hermes install exits 0" "$([[ $RC -eq 0 ]]; echo $?)" "rc=$RC out=$ALL"
 
 echo
 echo "$PASS pass, $FAIL fail"

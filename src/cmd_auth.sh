@@ -714,8 +714,9 @@ _install_status() {
 # image; upstream only caches sudo when it has a terminal, so here its own
 # package step cannot run and it exits "pm install failed" without naming the
 # package. We are root at this point, so install it before the recipe runs, or
-# fail naming it. <type> -> "<soname>:<debian package>".
-declare -A TYPE_SYSLIB=(
+# fail naming it. <type> -> "<soname>:<debian package>". `-g`: _load_module
+# evals this module inside a function, where a plain `declare` stays local.
+declare -gA TYPE_SYSLIB=(
   [hermes]="libatomic.so.1:libatomic1"
 )
 
