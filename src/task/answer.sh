@@ -740,7 +740,7 @@ cmd_task_answer() {
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task answer <id|DIVE-N> --value=\"...\"  (omit --value for a secret gate)"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task answer <id|DIVE-N> --value=\"...\" [--human]  (omit --value for a secret gate; the box owner adds --human in a login shell on the box)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   # Must have a pending (unanswered) gate to answer.
   # ── DIVE-4833 — THE STALE RESPONSE, REFUSED AND RECORDED ────────────────────
@@ -1198,7 +1198,7 @@ cmd_task_answer() {
       elif [[ -n "$_routed_rev" ]]; then
         _who_can="'${_routed_rev}' (its routed reviewer), or a human"
       fi
-      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate and you ('${_caller}') do not hold lead-clear standing on it — it can be cleared by ${_who_can}. A human answers from Telegram (tap the button) or the dashboard."
+      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate and you ('${_caller}') do not hold lead-clear standing on it — it can be cleared by ${_who_can}. A human: $(_gate_human_reach_hint "$id")."
     fi
     # DIVE-2054: routed_reviewer is task-store state for $ident — fenced.
     # DIVE-2099: `standing=` distinguishes the two clearances that reach here.
@@ -1288,7 +1288,7 @@ cmd_task_answer() {
     # --human-proof injection is confirmed live fleet-wide; root then flips
     # `gate-proof enforce on` (Marcus ship-gates the flip).
     if _gate_proof_enforced && (( ! _evid )); then
-      fail "$E_AUTH_REQUIRED" "$ident ($nt) needs a human to clear it — tap the button in Telegram or use the dashboard"
+      fail "$E_AUTH_REQUIRED" "$ident ($nt) needs a human to clear it — $(_gate_human_reach_hint "$id")"
     fi
   fi
 
@@ -1416,7 +1416,7 @@ cmd_task_answer() {
     _task_store_audit_log "task answer gate" error 0 -- \
       "task=$ident" "type=$nt" "tier=$gtier" "reason=non-human answer on tier-2 floor" \
       "human=$human" "caller=$_caller3" "sudo_uid=${SUDO_UID:-}"
-    fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) — only a human can clear it; tap the button in Telegram"
+    fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) — only a human can clear it; $(_gate_human_reach_hint "$id")"
   fi
 
   # DIVE-2233 (second item) — THE TIER-2 HUMAN CLAIM MUST BE PROVED, NOT ASSERTED.
@@ -1490,7 +1490,7 @@ cmd_task_answer() {
       # citation above: omitted, it would clear the evidence block and then be
       # refused here as an unproven claim.
       if (( ! _t2_hp && ! _t2_su && ! _t2_cs && ! _dl_ok )); then
-        fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) and the --human claim is unproven — tap the button in Telegram"
+        fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) and the --human claim is unproven — $(_gate_human_reach_hint "$id")"
       fi
     fi
   fi

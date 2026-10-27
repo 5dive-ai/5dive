@@ -958,6 +958,29 @@ DISKCRON
     fi
   fi
 
+  # DIVE-7077: on a box with no Telegram and no app link, an agent's ask reaches
+  # the owner in their next login shell. The verb decides whether to print (it is
+  # silent when the box has another surface or nothing waits); this only runs it
+  # for a person at a terminal, never for an agent seat. Written only when the
+  # installed bundle carries the verb, removed if a rollback takes it away.
+  if [[ -d /etc/profile.d ]]; then
+    if grep -q '_task_inbox_login' "$BIN_DIR/5dive" 2>/dev/null; then
+      cat > /etc/profile.d/5dive-asks.sh <<'ASKS'
+# 5dive (DIVE-7077): show asks waiting on the box owner when they log in.
+if [ -n "${PS1:-}" ] && [ -t 1 ] && command -v 5dive >/dev/null 2>&1; then
+  case "$(id -un 2>/dev/null)" in
+    agent-*) ;;
+    *) timeout 5 5dive task inbox --login 2>/dev/null ;;
+  esac
+fi
+ASKS
+      chmod 644 /etc/profile.d/5dive-asks.sh
+      ok "/etc/profile.d/5dive-asks.sh (waiting asks shown at login)"
+    else
+      rm -f /etc/profile.d/5dive-asks.sh
+    fi
+  fi
+
   # DIVE-948: cap systemd journal growth. With no explicit limit journald drifts
   # to the distro default (~10% of disk, up to 4G); on the small cx plans that's
   # wasteful (boxes were reaching ~500M+/month). Idempotent drop-in, rewritten
@@ -1864,6 +1887,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   ok "removed CLI binaries"
   rm -f /etc/cron.d/5dive-disk   # DIVE-5190: its target is the binary just removed
   rm -f /etc/cron.d/5dive-heartbeat   # DIVE-6853: same
+  rm -f /etc/profile.d/5dive-asks.sh   # DIVE-7077: same
   if [[ -d "$LIB_DIR" ]]; then
     rm -rf "$LIB_DIR"
     ok "removed $LIB_DIR (hooks, skills, ui)"
