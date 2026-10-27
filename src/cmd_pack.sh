@@ -1632,7 +1632,12 @@ _PACK_SECRET_ASSIGN_RULES=(
 )
 # Anchored at a path segment so a FACT named e.g. 'dive931-secret-drop.md' is not a
 # credential store, but a staged '.env' or 'id_ed25519' is.
-_PACK_SECRET_FILE_RE='(^|/)(\.env(\.[A-Za-z0-9_-]+)?|credentials(\.(json|ya?ml))?|id_(rsa|ed25519|ecdsa)|.*\.(pem|p12|pfx|keystore))$'
+# DIVE-6973: the Vault's key (/etc/5dive/vault.key) and the saved store
+# (connectors/saved.env|hosts|usage) are named too. Nothing stages them today
+# (an export reads a seat's home, never /etc/5dive); this makes "never" a
+# refusal rather than a habit, so a future staging path cannot carry the key
+# that decrypts the owner's saved logins off the box.
+_PACK_SECRET_FILE_RE='(^|/)(\.env(\.[A-Za-z0-9_-]+)?|credentials(\.(json|ya?ml))?|id_(rsa|ed25519|ecdsa)|.*\.(pem|p12|pfx|keystore)|vault\.key|saved\.(env|hosts|usage))$'
 
 _pack_secret_tripwire() {
   local dir="$1" hit=0 rule class re f line rel

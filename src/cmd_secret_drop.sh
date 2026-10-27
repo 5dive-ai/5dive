@@ -155,11 +155,12 @@ _secret_drop_burn_task() {
 # ---- secret link -----------------------------------------------------------
 
 _secret_link() {
-  local ref="" ttl="$SECRET_DROP_TTL_MIN" start=1 again=0 save=""
+  local ref="" ttl="$SECRET_DROP_TTL_MIN" start=1 again=0 save="" pair=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ttl=*)     ttl="${1#*=}" ;;
       --save=*)    save="${1#*=}" ;;   # DIVE-6844: a saved value, no task
+      --pair)      pair=1 ;;   # DIVE-6973: login + password (+ 2FA key) in one page
       --again)     again=1 ;;   # DIVE-6205: mint although a link for the gate is live
       --no-start)  start=0 ;;   # tests / a box whose page is supervised elsewhere
       --*)         fail "$E_USAGE" "unknown flag: $1" ;;
@@ -170,6 +171,7 @@ _secret_link() {
   require_root secret link
   [[ -n "$ref" || -n "$save" ]] || fail "$E_USAGE" "usage: 5dive secret link <DIVE-N> [--ttl=<minutes>] [--again] [--json] | --save=<name>"
   [[ -z "$ref" || -z "$save" ]] || fail "$E_USAGE" "a link is for a task's gate OR a saved value (--save), not both"
+  (( ! pair )) || [[ -n "$save" ]] || fail "$E_USAGE" "--pair is for a saved login: secret link --save=<name> --pair"
   [[ "$ttl" =~ ^[0-9]+$ ]] && (( ttl >= 1 && ttl <= 60 )) || fail "$E_VALIDATION" "--ttl must be 1-60 minutes"
   local ident="" key="" connector=""
   if [[ -n "$save" ]]; then
@@ -179,7 +181,7 @@ _secret_link() {
   else
     _secret_link_gate "$ref" "$again"
   fi
-  _secret_link_mint "$ttl" "$start" "$ident" "$key" "$connector" "$save"
+  _secret_link_mint "$ttl" "$start" "$ident" "$key" "$connector" "$save" "$pair"
 }
 
 # The task's open secret gate, checked. Sets ident, key and connector in the
@@ -210,7 +212,7 @@ _secret_link_gate() {
 
 # Mint and serve one link: for a gate (ident set) or a saved name (save set).
 _secret_link_mint() {
-  local ttl="$1" start="$2" ident="$3" key="$4" connector="$5" save="${6:-}"
+  local ttl="$1" start="$2" ident="$3" key="$4" connector="$5" save="${6:-}" pair="${7:-0}"
   local base terminal="sudo 5dive secret write ${key} --connector=${connector} --task=${ident}"
   [[ -n "$save" ]] && terminal="sudo 5dive secret write ${key} --connector=${connector}"
   base=$(_secret_drop_base_url) \
@@ -226,7 +228,8 @@ _secret_link_mint() {
   hash=$(_secret_drop_hash "$token")
   exp=$(( $(date +%s) + ttl * 60 ))
   ( umask 077; printf 'task=%s\nkey=%s\nconnector=%s\nexpires=%s\n' "$ident" "$key" "$connector" "$exp" > "$SECRET_DROP_DIR/$hash"
-    [[ -z "$save" ]] || printf 'save=%s\n' "$save" >> "$SECRET_DROP_DIR/$hash" ) \
+    [[ -z "$save" ]] || printf 'save=%s\n' "$save" >> "$SECRET_DROP_DIR/$hash"
+    (( ! pair )) || printf 'pair=1\n' >> "$SECRET_DROP_DIR/$hash" ) \
     || fail "$E_GENERIC" "cannot store the link"
 
   # DIVE-5372: the first link on a box appends the secrets.<domain> route and
@@ -264,16 +267,19 @@ _secret_link_mint() {
 not ready yet: the secure page is still getting its certificate. If the link does not open, wait a minute and open it again (it stays valid)."
   local lands="the value lands as ${key} in ${connector}.env and clears ${ident}"
   [[ -n "$save" ]] && lands="the value is saved as ${save}, for agents to type into a site"
+  (( pair )) && lands="the login, password and optional 2FA key are saved as ${save}, for agents to sign in with"
   ok "$url
 single use, expires ${exp_iso} (${ttl} min); ${lands}${note}" \
      '{url: $u, expires_at: $e, ttl_minutes: ($t|tonumber), task: $i, key: $k, connector: $c, ready: ($r|fromjson)}
-      + (if $s == "" then {} else {save: $s} end)' \
+      + (if $s == "" then {} else {save: $s, pair: ($p == "1")} end)' \
      --arg u "$url" --arg e "$exp_iso" --arg t "$ttl" --arg i "$ident" --arg k "$key" --arg c "$connector" --arg r "$ready" \
-     --arg s "$save"
+     --arg s "$save" --arg p "$pair"
 }
 
 # DIVE-6844: the saved name a link writes, or empty for a gate's link.
 _secret_drop_save_of() { sed -n 's/^save=//p' "$1" | head -n 1; }
+# DIVE-6973: 1 when the link asks for a login pair, else 0.
+_secret_drop_pair_of() { [[ "$(sed -n 's/^pair=//p' "$1" | head -n 1)" == 1 ]] && printf 1 || printf 0; }
 
 # Burn every live link for one saved name: a value saved through one makes the
 # others stale, as a gate's links are.
@@ -314,8 +320,9 @@ _secret_drop_peek() {
   fi
   local save; save=$(_secret_drop_save_of "$f")
   if [[ -n "$save" ]]; then
-    ok "save $save" '{task: "", save: $s, key: $k, connector: $c, ask: "", agent: "", expires: ($x|tonumber), rule: $r}' \
-       --arg s "$save" --arg k "$key" --arg c "$connector" --arg x "$exp" --arg r "$(_secret_drop_rule "$connector")"
+    local pair; pair=$(_secret_drop_pair_of "$f")
+    ok "save $save" '{task: "", save: $s, key: $k, connector: $c, ask: "", agent: "", expires: ($x|tonumber), rule: $r, pair: ($p == "1")}' \
+       --arg s "$save" --arg k "$key" --arg c "$connector" --arg x "$exp" --arg r "$(_secret_drop_rule "$connector" "$pair")" --arg p "$pair"
     return 0
   fi
   local id; id=$(_secret_drop_gate_open "$ident" "$key" "$connector")
@@ -335,7 +342,9 @@ _secret_drop_peek() {
 # DIVE-6727: the rule a refused paste broke, in the owner's words, by the gate's
 # connector class. Static text: it names the rule and never carries a byte of the
 # value. The page shows it on a refusal (from _peek), and the agent is told it.
-_secret_drop_rule() { # <connector>
+_secret_drop_rule() { # <connector> [<pair: 1>]
+  [[ "$1" == saved && "${2:-0}" == 1 ]] \
+    && { printf '%s' "The login and the password must each be one line. A 2FA setup key is the code of letters A-Z and digits 2-7 the site shows when you add an authenticator app."; return; }
   case "$1" in
     tools) printf '%s' "It must be one line, with no spaces and no ' mark: only plain keyboard letters, digits and symbols, at most 1024 of them." ;;
     saved) printf '%s' "It must be one line: it is typed into one field of a page." ;;
@@ -435,8 +444,16 @@ _secret_drop_redeem() {
   if [[ -n "$save" ]]; then
     [[ "$connector" == "$SECRET_SAVED_CONNECTOR" && "$key" == "$(_saved_key "$save")" ]] \
       || { rm -f "$f"; fail "$E_CONFLICT" "link is malformed"; }
-    ( _secret_write "$key" --connector="$connector" ) >/dev/null 2>&1 \
-      || fail "$E_VALIDATION" "value refused: $(_secret_drop_rule "$connector")"
+    # DIVE-6973: a pair link writes the whole item (login, password, 2FA key)
+    # in one rename, or nothing; the write frees the name's site itself.
+    local pair; pair=$(_secret_drop_pair_of "$f")
+    if (( pair )); then
+      ( _saved_write_pair "$key" ) >/dev/null 2>&1 \
+        || fail "$E_VALIDATION" "value refused: $(_secret_drop_rule "$connector" 1)"
+    else
+      ( _secret_write "$key" --connector="$connector" ) >/dev/null 2>&1 \
+        || fail "$E_VALIDATION" "value refused: $(_secret_drop_rule "$connector")"
+    fi
     _saved_unbind "$key" || true
     _secret_drop_burn_save "$save"
     exec 8>&-
@@ -726,10 +743,13 @@ CSS = ("body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;
        "textarea{display:block;width:100%;box-sizing:border-box;font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;"
        "padding:.7rem;border:1px solid #bbb;border-radius:8px;margin:.75rem 0;min-height:9rem;resize:vertical}"
        ".secret{-webkit-text-security:disc}"
+       "label{display:block;font-weight:600;margin-top:.75rem}label+textarea{margin-top:.25rem}"
+       ".pair textarea{min-height:0;resize:none}.tip{background:#fff6dc;border-radius:8px;padding:.6rem .75rem}"
        "button{width:100%;font:inherit;font-weight:600;padding:.75rem;border:0;border-radius:8px;background:#1b1b1a;color:#fff}"
        "small{color:#666}code{font-size:.9em}"
        "@media (prefers-color-scheme:dark){body{background:#151514;color:#eee}.ask{background:#1f1f1e;border-color:#333}"
-       "textarea{background:#1f1f1e;color:#eee;border-color:#444}button{background:#eee;color:#151514}small{color:#aaa}}")
+       "textarea{background:#1f1f1e;color:#eee;border-color:#444}button{background:#eee;color:#151514}small{color:#aaa}"
+       ".tip{background:#3a3220}}")
 
 def page(title, body):
     return ("<!doctype html><html lang=en><head><meta charset=utf-8>"
@@ -757,15 +777,43 @@ def run(args, stdin=None):
         return RAN_LONG, b""
 
 # DIVE-6844: the page for a saved login or detail. One field, no task, no agent.
+# DIVE-6973 (lodar 03:22Z): both save pages say, above the fields, to use an
+# account made for the agents. A tip, never a block: some sites only make sense
+# on his own account.
+SEPARATE = ("<p class=tip>Best to make a separate account for your agents. "
+            "On your own account, they can do anything you can.</p>")
+# Masked textareas, never type=password: browsers offer to save every password
+# field, and a login kept for agents is not one the owner's browser should keep.
+FIELD = ("<textarea name=%s class=%s rows=%d autocomplete=off autocapitalize=off "
+         "autocorrect=off spellcheck=false data-1p-ignore data-lpignore=true data-bwignore "
+         "%s aria-label='%s'></textarea>")
+
 def save_form(d):
-    return ("<h1>Save <b>%s</b></h1>" % html.escape(d["save"]) +
+    if d.get("pair"):
+        return save_pair_form(d)
+    return ("<h1>Save <b>%s</b></h1>" % html.escape(d["save"]) + SEPARATE +
             "<p>Your agents can type it into a site for you. They never see it, and it is never shown again.</p>"
-            "<form method=post autocomplete=off>"
-            "<textarea name=value class=secret rows=2 autocomplete=off autocapitalize=off "
-            "autocorrect=off spellcheck=false data-1p-ignore data-lpignore=true data-bwignore "
-            "required autofocus aria-label='Paste the value'></textarea>"
+            "<form method=post autocomplete=off>" +
+            FIELD % ("value", "secret", 2, "required autofocus", "Paste the value") +
             "<button type=submit>Save</button></form>"
             "<p><small>This page is served by your own server. The value goes only there, and this "
+            "link then stops working. Expires at %s UTC.</small></p>"
+            % time.strftime("%H:%M", time.gmtime(int(d["expires"]))))
+
+# DIVE-6973: one item = a login, a password and an optional 2FA setup key, in one page.
+def save_pair_form(d):
+    return ("<h1>Save <b>%s</b></h1>" % html.escape(d["save"]) + SEPARATE +
+            "<p>Your agents can sign in with it for you. They never see the password, and it is never shown again.</p>"
+            "<form method=post autocomplete=off class=pair>"
+            "<label for=f-login>Login</label>" +
+            FIELD.replace("<textarea ", "<textarea id=f-login ", 1) % ("login", "plain", 1, "required autofocus", "Login") +
+            "<label for=f-password>Password</label>" +
+            FIELD.replace("<textarea ", "<textarea id=f-password ", 1) % ("password", "secret", 1, "required", "Password") +
+            "<label for=f-totp>2FA setup key (optional)</label>" +
+            FIELD.replace("<textarea ", "<textarea id=f-totp ", 1) % ("totp", "secret", 1, "", "2FA setup key") +
+            "<p><small>With this, your agents can sign in without you. Use it on an account made for them.</small></p>"
+            "<button type=submit>Save</button></form>"
+            "<p><small>This page is served by your own server. It all goes only there, and this "
             "link then stops working. Expires at %s UTC.</small></p>"
             % time.strftime("%H:%M", time.gmtime(int(d["expires"]))))
 
@@ -840,19 +888,37 @@ class Handler(BaseHTTPRequestHandler):
         if n is None or not n.isdigit() or int(n) > MAX_BODY:
             return self.send_page(413, page("Too long", "<h1>That is too long</h1><p>Nothing was saved.</p>"))
         raw = self.rfile.read(int(n))
-        vals = urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True).get("value", [""])
+        form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
         raw = None
         # A form sends every line break in a textarea as CRLF, whatever was pasted.
         # Back to LF, so a pasted PEM or JSON lands as the owner copied it.
-        value = vals[0].replace("\r\n", "\n").replace("\r", "\n").strip()
-        vals = None
+        def field(k):
+            return form.get(k, [""])[0].replace("\r\n", "\n").replace("\r", "\n")
+        pair = "password" in form
+        if pair:
+            # DIVE-6973: three one-line fields, handed to the box as three lines.
+            # A password keeps its own spaces; only the line ends go.
+            login, password, totp = field("login").strip(), field("password").strip("\n"), field("totp").strip()
+            value = None
+            if login and password.strip() and "\n" not in login + password + totp:
+                value = "%s\n%s\n%s\n" % (login, password, totp)
+            login = password = totp = None
+        else:
+            value = field("value").strip()
+        form = None
         if not value:
-            return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>Nothing was pasted. The link still works.</p>"))
+            return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>%s The link still works.</p>"
+                % ("Each of login and password is needed, one line each." if pair else "Nothing was pasted.")))
         rc, out = run(["_peek", "--hash=" + h])
         if rc != 0:
             value = None
             return self.gone(rc)
         what = json.loads(out).get("data", {})
+        if pair != bool(what.get("pair")):
+            # A form from another page: never write half an item into this one.
+            value = None
+            return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>Open the link again and use "
+                "the form it shows. The link still works.</p>"))
         rc, out = run(["_redeem", "--hash=" + h], stdin=value.encode())
         value = None
         if rc == 3:
@@ -875,6 +941,10 @@ class Handler(BaseHTTPRequestHandler):
                 "working on it. It may have been saved. Ask your agent before trying again.</p>"))
         if rc != 0: return self.gone(rc)
         d = json.loads(out).get("data", {})
+        if d.get("save") and pair:
+            return self.send_page(200, page("Saved", "<h1>Saved</h1><p><b>%s</b> is on your server now. "
+                "Your agents can sign in with it; nobody can see the password. You can close this tab.</p>"
+                % html.escape(d["save"])))
         if d.get("save"):
             return self.send_page(200, page("Saved", "<h1>Saved</h1><p><b>%s</b> is on your server now. "
                 "Your agents can type it into a site; nobody can see it. You can close this tab.</p>"
