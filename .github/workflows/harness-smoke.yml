@@ -1,0 +1,247 @@
+name: harness-smoke
+
+# DIVE-7115 — every AI tool we sell, really installed on a FRESH Ubuntu 22.04 and
+# 24.04, and started up to the point just before sign-in. No key, no model call,
+# zero AI spend.
+#
+# Why this exists: install-smoke.yml stubs the agent binary and stops once 5dive
+# lays down, and the unit corpus mocks every harness install. So an install that
+# needs a system package, an upstream installer change or an OS version was
+# invisible until a customer hired: hermes on a fresh 24.04 (libatomic1,
+# DIVE-7103) shipped broken with every check green.
+#
+# One cell per (type, OS). The type list is read from the tree under test
+# (TYPE_BIN in src/header.sh), so a new agent type joins with no edit here. A
+# red cell is named "<type> / ubuntu-<os>" and its log ends with
+#   HARNESS-SMOKE FAIL type=<type> os=<os> step=<step>: <what failed>
+#
+# WHERE A RED LANDS: release-cut.yml refuses to cut on any red check-run on
+# main's tip. The cells' own check-runs sit on the sha this run started at, and
+# main can move before the 23:50Z cut, so the verdict job ALSO posts one
+# `harness-smoke` check-run onto main's tip as it reads when the run ends. A red
+# therefore holds the next nightly cut (main's call on the row: yes for any
+# harness we list). An upstream outage holds it too; the incident exit is
+# release-cut's required_only lane, which grades the required contexts only.
+#
+# NEGATIVE CONTROL: dispatch with cli_ref=<a sha before a fix> and types=<type>.
+# The smoke scripts come from this run's ref; the CLI installed is cli_ref's.
+# hermes at a tree before DIVE-7103 goes red at step=install on 24.04.
+
+on:
+  schedule:
+    # 19:40Z: GitHub has started schedules up to ~3h late here (release-cut.yml
+    # measured +163/+168 min), and this must finish before the 23:50Z cut reads.
+    - cron: '40 19 * * *'
+  workflow_dispatch:
+    inputs:
+      types:
+        description: 'Comma-separated agent types. Blank = every type the CLI sells.'
+        required: false
+        default: ''
+      os:
+        description: 'Ubuntu versions: both, 22.04 or 24.04.'
+        required: false
+        default: 'both'
+      cli_ref:
+        description: 'Install the CLI from this ref instead of the run ref (negative control). A run with this set never posts to main.'
+        required: false
+        default: ''
+  pull_request:
+    paths:
+      - '.github/workflows/harness-smoke.yml'
+      - 'scripts/harness-smoke.sh'
+      - 'docker/harness-smoke.Dockerfile'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harness-smoke-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      cells: ${{ steps.plan.outputs.cells }}
+      oses: ${{ steps.plan.outputs.oses }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: smoke
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.cli_ref || github.sha }}
+          path: tree
+      - id: plan
+        env:
+          WANT_TYPES: ${{ inputs.types }}
+          WANT_OS: ${{ inputs.os || 'both' }}
+        run: |
+          all=$(bash smoke/scripts/harness-smoke.sh list-types tree/src/header.sh)
+          echo "types the CLI sells: $(echo "$all" | tr '\n' ' ')"
+          types="$all"
+          if [ -n "$WANT_TYPES" ]; then
+            types=""
+            for t in $(echo "$WANT_TYPES" | tr ',' ' '); do
+              echo "$all" | grep -qx "$t" || { echo "::error::unknown agent type '$t' (the CLI sells: $(echo "$all" | tr '\n' ' '))"; exit 1; }
+              types="$types $t"
+            done
+          fi
+          case "$WANT_OS" in
+            both) oses='["22.04","24.04"]' ;;
+            22.04|24.04) oses="[\"$WANT_OS\"]" ;;
+            *) echo "::error::os must be both, 22.04 or 24.04 (got '$WANT_OS')"; exit 1 ;;
+          esac
+          # shellcheck disable=SC2086 # one type per word, split on purpose
+          cells=$(printf '%s\n' $types | jq -Rnc --argjson o "$oses" \
+            '[inputs | select(length > 0)] as $t | {include: [$o[] as $os | $t[] | {type: ., os: $os}]}')
+          echo "cells=$cells" >> "$GITHUB_OUTPUT"
+          echo "oses=$oses" >> "$GITHUB_OUTPUT"
+          echo "$cells" | jq .
+
+  # The fresh box, built once per OS and handed to every cell of that OS.
+  image:
+    needs: plan
+    name: image / ubuntu-${{ matrix.os }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.plan.outputs.oses) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the cloud-image box
+        env:
+          OS: ${{ matrix.os }}
+        run: |
+          mkdir -p /tmp/ctx
+          docker build -f docker/harness-smoke.Dockerfile --build-arg "UBUNTU=$OS" -t "hs:$OS" /tmp/ctx
+          docker save "hs:$OS" | gzip -1 > "/tmp/hs-$OS.tar.gz"
+          ls -lh "/tmp/hs-$OS.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.os }}
+          path: /tmp/hs-${{ matrix.os }}.tar.gz
+          retention-days: 1
+          compression-level: 0
+
+  smoke:
+    needs: [plan, image]
+    name: ${{ matrix.type }} / ubuntu-${{ matrix.os }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.plan.outputs.cells) }}
+    env:
+      TYPE: ${{ matrix.type }}
+      OS: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: smoke
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.cli_ref || github.sha }}
+          path: tree
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ matrix.os }}
+          path: /tmp/img
+      - name: Boot the fresh box
+        run: |
+          gunzip -c "/tmp/img/hs-$OS.tar.gz" | docker load
+          docker run -d --privileged --name hs "hs:$OS"
+          # degraded is normal in a container (a masked unit or two); what is
+          # needed is that systemd finished booting and answers.
+          timeout 120 docker exec hs systemctl is-system-running --wait || true
+          docker exec hs systemctl is-system-running || true
+      - name: Stage the tree under test as the install source
+        run: |
+          (cd tree && ./build.sh)
+          mkdir -p /tmp/bundle
+          cp -r tree/5dive tree/install.sh tree/bin tree/prompts tree/hooks tree/systemd /tmp/bundle/
+          # install.sh fetches the unit as 5dive-agent%40.service; curl decodes
+          # %40 for file:// the same as docker/Dockerfile relies on.
+          ln -s 5dive-agent@.service '/tmp/bundle/systemd/5dive-agent%40.service'
+          docker cp /tmp/bundle/. hs:/opt/5dive-bundle
+          docker cp smoke/scripts/harness-smoke.sh hs:/usr/local/sbin/harness-smoke
+          echo "CLI under test: $(git -C tree rev-parse HEAD)"
+      - name: Install, version, create, start
+        run: |
+          rc=0
+          docker exec hs /usr/local/sbin/harness-smoke run "$TYPE" "ubuntu-$OS" || rc=$?
+          mkdir -p /tmp/result
+          if ! docker cp hs:/harness-smoke-result.json "/tmp/result/$TYPE-$OS.json" 2>/dev/null; then
+            jq -nc --arg t "$TYPE" --arg o "ubuntu-$OS" --arg rc "$rc" \
+              '{type:$t, os:$o, step:"container", result:"fail", detail:("the arm exited " + $rc + " without writing a result")}' \
+              > "/tmp/result/$TYPE-$OS.json"
+            rc=1
+          fi
+          cat "/tmp/result/$TYPE-$OS.json"
+          exit "$rc"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.type }}-${{ matrix.os }}
+          path: /tmp/result/
+          retention-days: 14
+
+  verdict:
+    needs: [plan, image, smoke]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: /tmp/results
+          merge-multiple: true
+      - name: One line per tool and OS
+        env:
+          CELLS: ${{ needs.plan.outputs.cells }}
+          GH_TOKEN: ${{ github.token }}
+          POST: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !inputs.cli_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          red=0 lines=""
+          for row in $(echo "$CELLS" | jq -c '.include[]'); do
+            t=$(echo "$row" | jq -r .type); o=$(echo "$row" | jq -r .os)
+            f="/tmp/results/$t-$o.json"
+            if [ -f "$f" ]; then
+              r=$(jq -r .result "$f"); s=$(jq -r .step "$f"); d=$(jq -r .detail "$f")
+            else
+              r=fail; s=image; d="no result: the cell never ran its arm (see image / ubuntu-$o)"
+            fi
+            if [ "$r" = pass ]; then
+              lines="$lines| $t | ubuntu-$o | ✅ installs and starts | |"$'\n'
+            else
+              red=$((red + 1))
+              lines="$lines| $t | ubuntu-$o | ❌ $s | $d |"$'\n'
+              echo "::error::harness-smoke: $t on ubuntu-$o failed at step=$s: $d"
+            fi
+          done
+          total=$(echo "$CELLS" | jq '.include | length')
+          { echo "## harness-smoke: $((total - red)) of $total green"
+            echo
+            echo "| tool | OS | result | what failed |"
+            echo "|---|---|---|---|"
+            printf '%s' "$lines"; } | tee -a "$GITHUB_STEP_SUMMARY" > /tmp/summary.md
+
+          if [ "$POST" = true ]; then
+            tip=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+            concl=success; title="every AI tool installs and starts on fresh Ubuntu"
+            [ "$red" -eq 0 ] || { concl=failure; title="$red of $total tool/OS installs failed on fresh Ubuntu"; }
+            jq -n --arg sha "$tip" --arg c "$concl" --arg t "$title" --arg url "$RUN_URL" \
+              --rawfile s /tmp/summary.md \
+              '{name:"harness-smoke", head_sha:$sha, status:"completed", conclusion:$c, details_url:$url,
+                output:{title:$t, summary:$s}}' \
+              | gh api "repos/$GITHUB_REPOSITORY/check-runs" --input - --jq '"posted harness-smoke=" + .conclusion + " on main@" + .head_sha'
+          fi
+          [ "$red" -eq 0 ]
