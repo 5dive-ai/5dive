@@ -318,6 +318,12 @@ readonly FIVEDIVE_MOVED_PLUGINS="voice:5dive-voice"
 # purpose: that one is the app's catalogue, which still offers the mirror.
 readonly FIVEDIVE_BARE_ADD_REPO="browser:5dive-browser"
 
+# DIVE-7117: the exact lines that put 5dive-browser on a box — the plugin, then
+# its stack (Chrome, a virtual screen, VNC, Node 22; a self-hosted box has none).
+# One constant because three places say it: the `5dive browser` refusal on a box
+# without the plugin, the plugin table and `market show browser`.
+readonly FIVEDIVE_BROWSER_INSTALL_CMD="sudo 5dive plugin add 5dive-ai/5dive-browser && sudo 5dive browser setup"
+
 # DIVE-4697: claude.ai ACCOUNT-level sync of skills and plugins — the keys that
 # turn it OFF, as one constant for the same reason the channel list above is one
 # (a fixer and the check that gates it drifted, and the check read [ok] either

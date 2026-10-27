@@ -414,6 +414,10 @@ Web UI for this host (org chart, queue, gates, triggers) — now a PLUGIN:
   5dive board [--json]                               # the versioned document the views render (core owns this)
   # the UI moved out of core so a contributor can fork it alone: github.com/5dive-ai/5dive-ui
 
+Real browser (screenshots, clicks, signed-in pages) — a PLUGIN, 5dive-browser:
+  sudo 5dive plugin add 5dive-ai/5dive-browser       # install it once, then: sudo 5dive browser setup
+  5dive market show browser                          # what it does, before you add it
+
 Heartbeat (wake an agent only when it has queued tasks, one per tick):
   5dive heartbeat on  <name> [--every=<dur>] [--fresh]      # enrol (default 30m, fresh off: no /clear between tasks)
   5dive heartbeat off <name>
@@ -1078,12 +1082,23 @@ _buzz_moved_refusal() {
   fail "$E_USAGE" "Buzz is a plugin now: 5dive plugin install buzz"
 }
 
+# DIVE-7117 — browser was never a core verb, so it is not a moved verb either:
+# it is the 5dive-browser plugin, and on a box without it `5dive browser` read
+# "unknown command" with no pointer. An admin head agent asked for a screenshot
+# ran exactly that, found nothing, and hand-built Chrome from nine apt
+# libraries. One line, the exact commands, same E_USAGE exit. `setup` is part
+# of the line because a self-hosted box has no Chrome until it runs.
+_browser_missing_refusal() {
+  fail "$E_USAGE" "browser is a plugin that is not installed on this box. Add it once: $FIVEDIVE_BROWSER_INSTALL_CMD"
+}
+
 # Printed on the way to `unknown command`, never instead of it: the exit stays
 # non-zero and the classifier keeps reading E_USAGE, because from a script's
 # point of view this box genuinely does not answer that verb. What changes is
 # that a human is told WHERE it went rather than being told it never existed.
 _moved_verb_notice() {
   [[ "$1" == buzz ]] && _buzz_moved_refusal
+  [[ "$1" == browser ]] && _browser_missing_refusal
   local repo; repo="$(_moved_verb_repo "$1")" || return 0
   # DIVE-5247: sysadmin is a partner-box feature, not something to offer every
   # box. Its seat, broker grant and approvals only work where 5dive-api routes a

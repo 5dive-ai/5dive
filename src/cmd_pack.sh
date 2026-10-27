@@ -981,6 +981,7 @@ _market_usage() {
   5dive market --rarity=<tier>          # filter by tier (mythical|legendary|epic|rare)
   5dive market --seasoned               # only packs that ship pre-trained memory
   5dive market show <slug>              # preview a persona: tier, model, skills, card, DID
+  5dive market show <plugin>            # or a plugin, with its install line (e.g. browser)
   5dive market --kind=plugin [<kw>]     # browse PLUGINS instead of agents (see: 5dive plugin)
   --json                                # machine-readable (dashboard/agent feed)
 
@@ -1139,11 +1140,19 @@ cmd_market() {
 cmd_market_show() {
   local slug="${1:-}"
   [[ -n "$slug" ]] || fail "$E_USAGE" "usage: 5dive market show <slug>"
-  local idx; idx=$(_marketplace_index) \
-    || fail "$E_GENERIC" "could not reach the agent market ($(_marketplace_base))"
-  local pack; pack=$(jq -c --arg s "$slug" '.packs[] | select(.slug==$s)' <<<"$idx")
-  [[ -n "$pack" && "$pack" != "null" ]] \
-    || fail "$E_NOT_FOUND" "no agent '$slug' in the market (browse: 5dive market)"
+  # DIVE-7117: a name that is no agent may be a PLUGIN — `market show browser`
+  # was "no agent 'browser'", so the one front door (see cmd_market) had no
+  # answer for the one thing a self-hoster asked it for. Agents are looked up
+  # first, as before, and an unreachable agent index no longer hides a plugin.
+  local idx="" pack=""
+  if idx=$(_marketplace_index); then
+    pack=$(jq -c --arg s "$slug" '.packs[] | select(.slug==$s)' <<<"$idx")
+  fi
+  if [[ -z "$pack" || "$pack" == "null" ]]; then
+    _market_show_plugin "$slug" && return 0
+    [[ -n "$idx" ]] || fail "$E_GENERIC" "could not reach the agent market ($(_marketplace_base))"
+    fail "$E_NOT_FOUND" "no agent or plugin '$slug' in the market (agents: 5dive market · plugins: 5dive market --kind=plugin)"
+  fi
 
   local base card path
   base=$(_marketplace_base); path=$(jq -r '.path' <<<"$pack")
@@ -4626,10 +4635,13 @@ _PLUGIN_INSTALL_REF_JQ='install:(.name + "@" + $m)'
 # Reads the registered clone when the box has one (ready:true), else the repo's
 # published marketplace.json. A repo that cannot be read contributes nothing and
 # never fails the listing — the registry rows are the listing's floor.
+# Optional <repos> and <moved> stand in for the two constants; the plugin table
+# passes the FIVEDIVE_BARE_ADD_REPO pairs through them (_market_offer_bare_add).
 _market_standalone_rows() {
-  local rows="$1" repo org idx mname ready
+  local rows="$1" repos="${2-$FIVEDIVE_STANDALONE_PLUGIN_REPOS}" moved_pairs="${3-$FIVEDIVE_MOVED_PLUGINS}"
+  local repo org idx mname ready
   org=$(gh_org)
-  for repo in $FIVEDIVE_STANDALONE_PLUGIN_REPOS; do
+  for repo in $repos; do
     idx="" ready=false
     local lp; lp="$(_plugin_mkt_dir)/${repo}/.claude-plugin/marketplace.json"
     if [[ -r "$lp" ]] && jq -e '.plugins' >/dev/null 2>&1 <"$lp"; then
@@ -4643,7 +4655,7 @@ _market_standalone_rows() {
     # so the row's key matches the installed key the box will report.
     mname="$repo"
     local moved="" mv
-    for mv in $FIVEDIVE_MOVED_PLUGINS; do
+    for mv in $moved_pairs; do
       [[ "${mv#*:}" == "$repo" ]] && moved+="${moved:+ }${mv%%:*}"
     done
     rows=$(jq -c --arg m "$mname" --arg src "${org}/${repo}" --argjson r "$rows" --argjson rd "$ready" \
@@ -4658,17 +4670,38 @@ _market_standalone_rows() {
   printf '%s\n' "$rows"
 }
 
-cmd_market_plugins() {
-  local kw="" a
-  for a in "$@"; do
-    case "$a" in
-      --kind=*) : ;;
-      ls|list|browse|search|find) : ;;
-      --*) fail "$E_USAGE" "unknown flag: $a (see: 5dive plugin --help)" ;;
-      *)   [[ -z "$kw" ]] && kw="$a" || kw="$kw $a" ;;
-    esac
-  done
+# DIVE-7117: what a PERSON or an agent reading the table is offered for a plugin
+# whose bare `plugin add <name>` installs from its own repo (FIVEDIVE_BARE_ADD_REPO,
+# browser today): the repo row, in place of the registry mirror. The mirror's
+# description opens "DEPRECATED — …", so the one place a self-hoster looks for a
+# browser showed a stub with no install line (live QA, 2026-10-27).
+# The --json feed keeps the registry row on purpose: it is the app's catalogue,
+# and its install card and one-click allowlist still install browser@5dive-plugins
+# (the reason FIVEDIVE_MOVED_PLUGINS leaves browser out).
+_market_offer_bare_add() { # <rows-json>
+  local repos="" p
+  for p in ${FIVEDIVE_BARE_ADD_REPO:-}; do repos+="${repos:+ }${p#*:}"; done
+  [[ -n "$repos" ]] || { printf '%s\n' "$1"; return 0; }
+  _market_standalone_rows "$1" "$repos" "$FIVEDIVE_BARE_ADD_REPO"
+}
 
+# The one line that installs <row>: the plugin's own setup step rides along for
+# browser, whose stack a self-hosted box does not have until `browser setup`.
+_market_plugin_install_line() { # <row-json>
+  local name inst
+  name=$(jq -r '.name' <<<"$1"); inst=$(jq -r '.install // (.name + "@" + .marketplace)' <<<"$1")
+  if [[ "$name" == browser && "$inst" == */5dive-browser ]]; then
+    printf '%s\n' "$FIVEDIVE_BROWSER_INSTALL_CMD"
+  else
+    printf 'sudo 5dive plugin add %s\n' "$inst"
+  fi
+}
+
+# Every installable plugin row, as one JSON array — the registered registry clone
+# (else its published manifest), the standalone repos, and the channel rows — plus
+# whether the registry could be read: {"remote":0|1,"rows":[…]}. Shared by the
+# plugin table and `market show <plugin>`.
+_market_plugin_catalog() {
   # ONE source, and that is the point rather than a simplification.
   #
   # DIVE-4202 moved `voice` and `browser` into 5dive-ai/5dive-plugins, so the
@@ -4709,6 +4742,50 @@ cmd_market_plugins() {
   # and voice, whose repo row replaces its registry row — DIVE-4964).
   rows=$(_market_standalone_rows "$rows")
   rows=$(_market_channel_verb_rows "$rows")
+  jq -c --argjson r "$remote_ok" '{remote:$r, rows:.}' <<<"$rows"
+}
+
+# `market show <plugin>` — the plugin's line in the catalogue and the exact
+# install line. Returns 1, printing nothing, when no plugin has that name.
+_market_show_plugin() { # <name>
+  local cat row line
+  cat=$(_market_plugin_catalog) || return 1
+  row=$(_market_offer_bare_add "$(jq -c '.rows' <<<"$cat")" \
+        | jq -c --arg n "$1" 'map(select(.name == $n)) | first // empty')
+  [[ -n "$row" ]] || return 1
+  line=$(_market_plugin_install_line "$row")
+  if (( JSON_MODE )); then
+    ok "" '{plugin:$p, install:$i}' --argjson p "$row" --arg i "$line"
+    return 0
+  fi
+  echo "PLUGIN  $(jq -r '.name' <<<"$row")  — from $(jq -r '.install // .marketplace' <<<"$row")"
+  echo
+  jq -r '.description // ""' <<<"$row" | fold -s -w 76 | sed 's/^/  /'
+  echo
+  echo "  install:  $line"
+  if [[ "$(jq -r '.installs // "box"' <<<"$row")" == agent ]]; then
+    echo "  it attaches to ONE agent, not the box:  5dive agent create <name> --channels=$(jq -r '.name' <<<"$row")"
+  fi
+  echo "  'plugin add' shows who published it and what it is handed before anything installs."
+  return 0
+}
+
+cmd_market_plugins() {
+  local kw="" a
+  for a in "$@"; do
+    case "$a" in
+      --kind=*) : ;;
+      ls|list|browse|search|find) : ;;
+      --*) fail "$E_USAGE" "unknown flag: $a (see: 5dive plugin --help)" ;;
+      *)   [[ -z "$kw" ]] && kw="$a" || kw="$kw $a" ;;
+    esac
+  done
+
+  local cat rows remote_ok base
+  cat=$(_market_plugin_catalog)
+  rows=$(jq -c '.rows' <<<"$cat"); remote_ok=$(jq -r '.remote' <<<"$cat")
+  base=$(_plugin_market_base)
+  (( JSON_MODE )) || rows=$(_market_offer_bare_add "$rows")
 
   # With one registry there is no offline half-list to degrade to: either the
   # registered clone is on disk or the manifest fetch worked. Say which is
@@ -4749,6 +4826,9 @@ cmd_market_plugins() {
   echo "  install:  5dive plugin add <name>"
   local _standalone; _standalone=$(jq -r '[.[] | select(.install != null and (.install | contains("/"))) | "\(.name): 5dive plugin add \(.install)"] | join("; ")' <<<"$filtered")
   [[ -n "$_standalone" ]] && echo "  from its own repo — ${_standalone}"
+  # DIVE-7117: browser needs its stack too, which `plugin add` does not install.
+  local _br; _br=$(jq -c '[.[] | select(.name == "browser" and ((.install // "") | endswith("/5dive-browser")))] | first // empty' <<<"$filtered")
+  [[ -n "$_br" ]] && echo "  browser, the whole install:  $(_market_plugin_install_line "$_br")"
   # A row whose install is <org>/<repo> registers its own source (the line
   # above names it), so only REGISTRY rows need the registry added first.
   local _notready; _notready=$(jq '[.[] | select((.ready|not) and ((.install // "") | contains("/") | not))] | length' <<<"$filtered")
