@@ -902,6 +902,50 @@ _pair_record_human_do() {
   return 0
 }
 
+# _pair_openclaw <name> <channel> <code> <user-id> — approve one pending openclaw
+# DM pairing as the seat (openclaw's own `pairing approve`, so its store format
+# stays openclaw's), then record the sender as a box operator, so the next agent
+# hired with a bot auto-allows them, and send the usual welcome.
+_pair_openclaw() {
+  local name="$1" channel="$2" code="$3" preuser="$4"
+  local user="agent-${name}"
+  [[ "$channel" == telegram ]] \
+    || fail "$E_VALIDATION" "openclaw pairing through 5dive is telegram only (agent '$name' pairs on $channel: sudo -u $user openclaw pairing list)"
+  [[ -z "$preuser" ]] \
+    || fail "$E_USAGE" "openclaw allows a known id through its config, not a pairing: sudo 5dive agent config ${name} set telegram.allowed-users=${preuser}"
+  [[ -n "$code" ]] \
+    || fail "$E_USAGE" "openclaw pairs by the code its bot sends: message the bot, then run: 5dive agent pair ${name} --code=<the code in its reply>"
+  [[ "$code" =~ ^[A-Za-z0-9]{4,16}$ ]] \
+    || fail "$E_VALIDATION" "invalid --code (letters and digits only, as the bot sent it)"
+  id -u "$user" &>/dev/null || fail "$E_NOT_FOUND" "agent user missing: $user"
+
+  local out rc=0
+  out=$(sudo -u "$user" -H env PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+      "${OPENCLAW_NODE:-/home/claude/.local/bin/node}" "${TYPE_BIN[openclaw]}" \
+      pairing approve "$channel" "$code" 2>&1) || rc=$?
+  out=$(sed 's/\x1b\[[0-9;]*m//g' <<<"$out")
+  if (( rc )); then
+    if grep -qi "no pending pairing request" <<<"$out"; then
+      fail "$E_PAIRING" "no pending request for code $code on agent '$name' — the code may be mistyped or already used. Message the bot again for a fresh one, then re-run with that code."
+    fi
+    fail "$E_PAIRING" "openclaw pairing approve failed for agent '$name': $(tail -3 <<<"$out" | tr '\n' ' ')"
+  fi
+  local sender
+  sender=$(grep -oE 'sender [-]?[0-9]+' <<<"$out" | head -1 | awk '{print $2}')
+  if [[ -n "$sender" ]]; then
+    _operator_record "$sender"
+    local bot_token
+    bot_token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "${CONNECTORS_DIR}/telegram-${name}.env" 2>/dev/null | head -1 || true)
+    if [[ -n "$bot_token" ]]; then
+      _pair_record_human "$name" "$sender" "$sender" "$bot_token" || true
+      send_welcome_message "$sender" "$bot_token" "$name" openclaw >/dev/null 2>&1 || true
+    fi
+  fi
+  ok "agent '$name' paired${sender:+ with Telegram user $sender}: they can message the bot now." \
+     '{name:$n, channels:$ch, userId:(if $u == "" then null else $u end), paired:true}' \
+     --arg n "$name" --arg ch "$channel" --arg u "${sender:-}"
+}
+
 # Interactive pairing for a telegram- or discord-enabled claude-family agent.
 # Two paths:
 #   --code=<code>     classic: user DMs bot, bot replies with "pair <code>",
@@ -978,10 +1022,20 @@ cmd_pair() {
   # and hermes are token-only: the bot token alone is enough to authorise the
   # agent, and inbound user approvals flow through openclaw's own `pairing`
   # subcommand rather than this code path.
+  # DIVE-7101: openclaw DOES hand out a code. Its bot answers an unknown sender
+  # with "Pairing code: XXXXXXXX … openclaw pairing approve telegram XXXXXXXX",
+  # a command the owner of a chat-only box cannot run and their agent could only
+  # run with a sudo password. This verb is the no-terminal way through: the owner
+  # pastes the code wherever they talk to their agent, and the agent runs
+  # `5dive agent pair <name> --code=<code>`. No timed listening window either:
+  # the request waits in openclaw's own store until it is approved.
   case "$type" in
     claude|codex|grok|antigravity) ;;
-    openclaw|hermes)
-      fail "$E_VALIDATION" "type=$type does not use pair codes — approve users with: sudo -u agent-${name} openclaw pairing list" ;;
+    openclaw)
+      _pair_openclaw "$name" "$pair_channel" "$precode" "$preuser"
+      return ;;
+    hermes)
+      fail "$E_VALIDATION" "type=hermes does not use pair codes — allow a user with: sudo 5dive agent config ${name} set telegram.allowed-users=<id>" ;;
     *)
       fail "$E_VALIDATION" "pairing only applies to claude, codex, grok and antigravity agents (got type=$type)" ;;
   esac

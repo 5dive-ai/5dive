@@ -2382,6 +2382,42 @@ _apply_byo_openclaw() {
   fi
 }
 
+# ── DIVE-7101: openclaw's key in its app-wide state db ─────────────────────
+# OPENCLAW_STATE_AUTH_PY (header.sh) is the reader/writer of that db's auth rows.
+
+# openclaw_carry_state_auth <src_db> <dst_state_dir> <seat_user> — copy the key
+# rows of one openclaw state db into a seat's. Reads the source through a
+# private snapshot (the db and its -wal), so the source is never opened in place:
+# a root-opened WAL db can leave a root-owned -shm that locks claude out of its
+# own store. rc 0 carried, 3 the source holds no key, other = failure.
+openclaw_carry_state_auth() {
+  local src="$1" dst_dir="$2" user="$3" tmp rows rc=0
+  local dst="${dst_dir}/openclaw.sqlite"
+  tmp=$(mktemp -d) || return 1
+  cat "$src" > "${tmp}/openclaw.sqlite" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+  if [[ -e "${src}-wal" ]]; then cat "${src}-wal" > "${tmp}/openclaw.sqlite-wal" 2>/dev/null || true; fi
+  rows=$(python3 -I -c "$OPENCLAW_STATE_AUTH_PY" extract "${tmp}/openclaw.sqlite") || rc=$?
+  if (( rc )); then rm -rf "$tmp"; return "$rc"; fi
+  install -d -m 700 -o "$user" -g "$user" "$dst_dir" 2>/dev/null || mkdir -p "$dst_dir" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+  if [[ -s "$dst" ]]; then
+    # As the seat, so a -wal/-shm the write creates belongs to the seat.
+    local -a as_seat=()
+    (( EUID == 0 )) && as_seat=(sudo -u "$user")
+    printf '%s' "$rows" | "${as_seat[@]}" python3 -I -c "$OPENCLAW_STATE_AUTH_PY" apply "$dst" || rc=$?
+  else
+    # No state db yet (a seat openclaw has never run in): the snapshot, whole.
+    python3 -I -c 'import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close()' \
+      "${tmp}/openclaw.sqlite" "${tmp}/seat.sqlite" || rc=$?
+    if (( ! rc )); then
+      chown "$user":"$user" "${tmp}/seat.sqlite" 2>/dev/null || true
+      chmod 0600 "${tmp}/seat.sqlite"
+      mv "${tmp}/seat.sqlite" "$dst" || rc=1
+    fi
+  fi
+  rm -rf "$tmp"
+  return "$rc"
+}
+
 # ── DIVE-3442: push openclaw state INTO the seat, as root ───────────────────
 # Everything _apply_byo_openclaw writes lands under /home/claude/.openclaw (or
 # the profile dir) owned by claude. The seat was supposed to pick it up at every
@@ -2441,6 +2477,18 @@ _apply_byo_openclaw() {
 #
 # Best-effort by contract (warn, never fail): the credential is on disk either
 # way, and the boot seed remains as the second chance. Returns 0 always.
+#
+# DIVE-7101: openclaw 2026.10.x moved the key AGAIN, out of any per-agent file:
+# `models auth paste-api-key` now writes it into the app-wide state db,
+# ~/.openclaw/state/openclaw.sqlite, as the `authProfiles.store` row of
+# config_machine_state (beside `auth.sharedStore = {"location":"state-db"}`).
+# agents/main/agent/ is never created, so the copy below found nothing, the
+# seat booted with no key, and every turn died on `No API key found for
+# provider "openrouter"` (measured on 2026.10.7 in a throwaway HOME; same
+# message as the 10-27 QA). That db is ALSO the seat's own live state, so it is
+# never overwritten: only the auth rows are carried, upserted into the seat's db
+# as the seat user (sqlite's own locking, safe beside a running gateway). A seat
+# with no state db yet takes the source db whole.
 seed_openclaw_state_into_seat() { # <name> [profile]
   local name="$1" profile="${2:-}"
   local user="agent-${name}"
@@ -2454,10 +2502,11 @@ seed_openclaw_state_into_seat() { # <name> [profile]
   local src_store="${base}/.openclaw/agents/main/agent/openclaw-agent.sqlite"
   local src_auth="${base}/.openclaw/agents/main/agent/auth-profiles.json"
   local src_cfg="${base}/.openclaw/openclaw.json"
+  local src_state="${base}/.openclaw/state/openclaw.sqlite"
   local dst_dir="${home}/.openclaw/agents/main/agent"
   local dst_cfg="${home}/.openclaw/openclaw.json"
 
-  [[ -s "$src_store" || -s "$src_auth" || -s "$src_cfg" ]] || return 0
+  [[ -s "$src_store" || -s "$src_auth" || -s "$src_cfg" || -s "$src_state" ]] || return 0
   step "Seeding openclaw credential + model default into ${home}/.openclaw"
 
   # -o/-g only work as root; fall back to a plain mkdir so the function stays
@@ -2489,6 +2538,16 @@ seed_openclaw_state_into_seat() { # <name> [profile]
     done
     (( _copied )) \
       || warn "openclaw seed: could not copy the auth store $src_store into $dst_dir — the agent will boot UNAUTHENTICATED and every message will fail with ProviderAuthError"
+  fi
+
+  # DIVE-7101: the 2026.10.x home of the key (see the header above).
+  if [[ -s "$src_state" ]]; then
+    local _oc_rc=0
+    openclaw_carry_state_auth "$src_state" "${home}/.openclaw/state" "$user" || _oc_rc=$?
+    case "$_oc_rc" in
+      0|3) ;;   # carried, or the source holds no key (nothing to carry)
+      *) warn "openclaw seed: could not carry the key from $src_state into ${home}/.openclaw/state — the agent will boot UNAUTHENTICATED and every message will fail with 'No API key found'" ;;
+    esac
   fi
 
   # Legacy JSON, additive: still carried when a pre-DIVE-3489 profile has one, so
