@@ -38,6 +38,9 @@ source src/header.sh
 source src/lib/validation.sh
 # shellcheck disable=SC1091
 source src/cmd_agent_pairing.sh
+# shellcheck disable=SC1091
+[[ -n "${E_PAIRING:-}" ]] || source src/lib/error_codes.sh   # DIVE-7101: the openclaw arms reach fail()
+declare -F fail >/dev/null || source src/lib/output.sh
 
 pass=0
 ok_()  { pass=$((pass+1)); }
@@ -100,5 +103,52 @@ for ch in "discord,dashboard" "dashboard,discord"; do
     || die "channels='$ch' should not error (token/var resolution), got: $out"
   ok_
 done
+
+# DIVE-7101: an openclaw bot answers a stranger with "Pairing code: XXXXXXXX …
+# openclaw pairing approve telegram XXXXXXXX". cmd_pair refused openclaw
+# outright, so a chat-only owner had no way in but a terminal or a timed
+# listening window. Now `agent pair <openclaw> --code=` runs openclaw's own
+# approve AS THE SEAT and records the sender as a box operator.
+run_pair_oc() { # <approve-rc> <approve-output> <cmd_pair args...>
+  local arc="$1" aout="$2"; shift 2
+  local tmp; tmp=$(mktemp -d)
+  printf 'TELEGRAM_BOT_TOKEN=tok-tg\n' > "$tmp/telegram-qa.env"
+  (
+    CONNECTORS_DIR="$tmp"
+    JSON_MODE=0
+    registry_read() { jq -cn '{agents:{qa:{type:"openclaw", channels:"telegram"}}}'; }
+    id() { return 0; }
+    sudo() { echo "SUDO:$*" >> "$tmp/argv"; printf '%s\n' "$aout"; return "$arc"; }
+    _operator_record() { echo "OPERATOR:$1"; }
+    _pair_record_human() { :; }
+    send_welcome_message() { echo "WELCOME:$1" >> "$tmp/argv"; }
+    ok() { echo "OK:$1"; }
+    cmd_pair qa "$@" 2>&1 || echo "ERR:$?"
+    cat "$tmp/argv" 2>/dev/null || true
+  )
+  rm -rf "$tmp"
+}
+out=$(run_pair_oc 0 $'\e[32mApproved\e[0m telegram sender 1234567890.' --code=C3NCY8GH)
+[[ "$out" == *"SUDO:-u agent-qa -H "*" pairing approve telegram C3NCY8GH"* ]] \
+  || die "openclaw --code must run openclaw's own approve as the seat, got: $out"
+ok_
+[[ "$out" == *"OPERATOR:1234567890"* && "$out" == *"WELCOME:1234567890"* ]] \
+  || die "openclaw pair must record the approved sender as an operator and welcome them, got: $out"
+ok_
+[[ "$out" == *"OK:agent 'qa' paired with Telegram user 1234567890"* && "$out" != *"ERR:"* ]] \
+  || die "openclaw pair should succeed, got: $out"
+ok_
+out=$(run_pair_oc 1 'Error: No pending pairing request found for code "ZZZZ9999".' --code=ZZZZ9999)
+[[ "$out" == *"no pending request for code ZZZZ9999"* && "$out" != *"OK:"* ]] \
+  || die "an unknown code must fail and say so, got: $out"
+ok_
+out=$(run_pair_oc 0 'unused')
+[[ "$out" == *"--code=<the code in its reply>"* && "$out" != *"SUDO:"* ]] \
+  || die "openclaw with no code must say how to get one and run nothing, got: $out"
+ok_
+out=$(run_pair_oc 0 'unused' '--code=a;b')
+[[ "$out" == *"invalid --code"* && "$out" != *"SUDO:"* ]] \
+  || die "a code that is not letters/digits must be refused before any exec, got: $out"
+ok_
 
 echo "OK: dive1767_regression_unit — $pass assertions passed"
