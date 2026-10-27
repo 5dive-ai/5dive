@@ -633,6 +633,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _merge_do"*|\
         "/usr/local/bin/5dive _route_do"|"/usr/local/bin/5dive _pkg_do"|\
         "/usr/local/bin/5dive _dashboard_relay"|\
+        "/usr/local/bin/5dive _secret_link_notify"|\
         "/usr/local/bin/5dive sysadmin _broker"|"/usr/local/bin/5dive --json sysadmin _broker") has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
@@ -841,6 +842,13 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _telegram_open
 # sign in a COMMENT is executed and its output lands in the sudoers file. Keep
 # this block free of both.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _merge_do
+# DIVE-7128: let this seat's secret gate reach its owner WITH the one-time link,
+# without the seat ever holding it. EXACT path, NO args, NO wildcard: the task
+# ident travels on stdin and the seat is derived from SUDO_UID. Root refuses
+# unless the gate is open, names a place on this box and was filed by this seat,
+# and while a link for it is live. Root mints and sends the alert itself and
+# prints only that it was sent, so nothing the seat can read carries the link.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _secret_link_notify
 # DIVE-5396: every hired agent can publish its own app and install a system
 # package, without holding root. EXACT paths, NO args, NO wildcard: the
 # operation travels on stdin and the caller is derived from SUDO_UID. The route

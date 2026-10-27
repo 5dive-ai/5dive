@@ -279,11 +279,13 @@ not ready yet: the secure page is still getting its certificate. If the link doe
   local lands="the value lands as ${key} in ${connector}.env and clears ${ident}"
   [[ -n "$save" ]] && lands="the value is saved as ${save}, for agents to type into a site"
   (( pair )) && lands="the login, password and optional 2FA key are saved as ${save}, for agents to sign in with"
-  ok "$url
+  # DIVE-7128: the url reaches jq through the environment, not argv, which any
+  # seat can list while the root side mints a standard seat's link.
+  FIVE_DROP_URL="$url" ok "$url
 single use, expires ${exp_iso} (${ttl} min); ${lands}${note}" \
-     '{url: $u, expires_at: $e, ttl_minutes: ($t|tonumber), task: $i, key: $k, connector: $c, ready: ($r|fromjson)}
+     '{url: $ENV.FIVE_DROP_URL, expires_at: $e, ttl_minutes: ($t|tonumber), task: $i, key: $k, connector: $c, ready: ($r|fromjson)}
       + (if $s == "" then {} else {save: $s, pair: ($p == "1")} end)' \
-     --arg u "$url" --arg e "$exp_iso" --arg t "$ttl" --arg i "$ident" --arg k "$key" --arg c "$connector" --arg r "$ready" \
+     --arg e "$exp_iso" --arg t "$ttl" --arg i "$ident" --arg k "$key" --arg c "$connector" --arg r "$ready" \
      --arg s "$save" --arg p "$pair"
 }
 
