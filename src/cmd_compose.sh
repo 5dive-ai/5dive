@@ -1767,6 +1767,38 @@ _compose_browser_mode() {
   fi
 }
 
+# DIVE-7075 — a team that declares the browser comes up ABLE to browse.
+#
+# `browser: optional` used to buy one log line ("publishing=api-only"), and the
+# Dropshipping Team's Clicker, whose whole job is the browser, came up without
+# one. Now the import adds the plugin BEFORE any seat is created, so each seat
+# gets its store at create (DIVE-5478), and the end of the run names the one line
+# a person runs for the box stack (only a person installs it, DIVE-6112).
+#
+# The template names the capability, never a source: the plugin is our own
+# (--official-only). A failed add is not fatal, the same posture as
+# _compose_requires_preflight: the team still comes up, and the warning names the
+# two commands that finish the job.
+#
+# Prints one word: present | added | failed; nothing when the team declares no browser.
+_compose_ensure_browser() {  # <spec> <self>
+  local spec="$1" self="$2" out rc=0
+  [[ -n "$(jq -r '.team.capabilities.browser // empty' <<<"$spec" 2>/dev/null)" ]] || return 0
+  if bash "$self" browser --help </dev/null >/dev/null 2>&1; then
+    step "browser: the plugin is on, so each agent of this team gets its browser at create"
+    echo present; return 0
+  fi
+  step "browser: this team uses one, so the browser plugin goes on first and each agent gets its browser at create"
+  out=$(bash "$self" plugin add browser --yes --official-only </dev/null 2>&1) || rc=$?
+  if (( rc == 0 )) && bash "$self" browser --help </dev/null >/dev/null 2>&1; then
+    echo added
+  else
+    warn "could not add the browser plugin (exit $rc: $(tail -n 1 <<<"$out")). The team comes up without a browser; give it one with: sudo 5dive plugin add browser && sudo 5dive browser setup"
+    echo failed
+  fi
+  return 0
+}
+
 cmd_compose_up() {
   local file="" type_override="" name_prefix="" start_now=0 _COMPOSE_LANG="" auth_profile=""
   while [[ $# -gt 0 ]]; do
@@ -1912,14 +1944,13 @@ HELP
   fi
   # DIVE-4103: what this team needs from the BOX, answered before anything is
   # provisioned. Never fatal — a missing capability names the reduced mode.
+  self=$(_compose_self)
+  # DIVE-7075: before the preflight reads it and before any seat is created, so
+  # every seat gets its browser store at create.
+  local _COMPOSE_BROWSER
+  _COMPOSE_BROWSER=$(_compose_ensure_browser "$spec" "$self")
   _compose_requires_preflight "$spec"
   spec_dir=$(realpath "$(dirname "$file")")
-  self=$(_compose_self)
-  local _compose_browser_mode_value
-  _compose_browser_mode_value=$(_compose_browser_mode "$spec" "$self")
-  if [[ -n "$_compose_browser_mode_value" ]]; then
-    step "capability preflight: publishing=$_compose_browser_mode_value (browser is optional; API adapters remain available)"
-  fi
   # DIVE-4022: named here so a loop that fails to register can print the exact
   # re-run, not a `<spec>` placeholder the user has to translate.
   local _COMPOSE_SPEC_FILE="$file"
@@ -2211,7 +2242,8 @@ HELP
     # your box, she leads this team" instead of counting a new CEO. `seat` is the
     # template's name for the role; `agent` is who fills it. `adopt_ambiguous`:
     # seats whose persona is on the box more than once, so none was taken.
-    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d, no_channel:$nc, loops:{created:($lc|tonumber), existing:($le|tonumber), errors:($lerr|tonumber), retry:$lr}, adopted:$ad, adopt_ambiguous:$aa, prefer_type:$pt, held:(if $hk == "" then null else {lead:$hl, kickoff:$hk, goals:($hg|tonumber)} end)}' \
+    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d, no_channel:$nc, loops:{created:($lc|tonumber), existing:($le|tonumber), errors:($lerr|tonumber), retry:$lr}, adopted:$ad, adopt_ambiguous:$aa, prefer_type:$pt, held:(if $hk == "" then null else {lead:$hl, kickoff:$hk, goals:($hg|tonumber)} end)} + (if $br == "" then {} else {browser:$br} end)' \
+      --arg br "$_COMPOSE_BROWSER" \
       --arg hk "$_COMPOSE_KICKOFF" --arg hl "$_hold_lead" --arg hg "$_held_goals" \
       --argjson ad "$(printf '%s\n' "${_adopted_names[@]+"${_adopted_names[@]}"}" | jq -R 'select(length>0)' | jq -sc \
           --argjson m "$_seat_applied" --argjson spec "$spec" \
@@ -2238,6 +2270,13 @@ HELP
       echo "── nothing has started yet: $_hold_lead sends you its plan first, and the team's goals and loops wait for your yes."
       echo "     see what is waiting:   sudo 5dive team plan $_hold_lead"
       echo "     start it all now:      sudo 5dive team start $_hold_lead"
+    fi
+    # DIVE-7075: the one step only a person can take, named where they look.
+    if [[ "$_COMPOSE_BROWSER" == added ]]; then
+      echo ""
+      echo "── one step left for the browser: run once, as root:"
+      echo "     sudo 5dive browser setup"
+      echo "   (it installs Chrome and what it needs; each agent's browser is already set up)"
     fi
     if (( ${#_asleep[@]} > 0 )); then
       echo ""
