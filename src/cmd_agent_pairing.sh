@@ -931,7 +931,7 @@ _pair_openclaw() {
     fail "$E_PAIRING" "openclaw pairing approve failed for agent '$name': $(tail -3 <<<"$out" | tr '\n' ' ')"
   fi
   local sender
-  sender=$(grep -oE 'sender [-]?[0-9]+' <<<"$out" | head -1 | awk '{print $2}')
+  sender=$(grep -oE 'sender [-]?[0-9]+' <<<"$out" | head -1 | awk '{print $2}') || sender=""
   if [[ -n "$sender" ]]; then
     _operator_record "$sender"
     local bot_token
