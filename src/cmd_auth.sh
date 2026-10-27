@@ -521,6 +521,21 @@ cmd_auth_status() {
   done
   out+="}"
 
+  # DIVE-7101: an agent's answer is the SEAT's, not only its account's. The
+  # account can hold a good key that never reached the seat (openclaw 2026.10.x
+  # moved it into a db the seed did not carry), and this said `ok` while every
+  # message failed. The boot seed's breadcrumb is the seat's own verdict, so a
+  # degraded one turns an `ok` into `stale` and says why.
+  local seat_reason=""
+  if [[ -n "$agent" ]] && declare -F _agent_startup_credential_health >/dev/null 2>&1; then
+    local _hs
+    _hs=$(_agent_startup_credential_health "$agent" 2>/dev/null || true)
+    if [[ "${_hs%%|*}" == degraded ]]; then
+      seat_reason="${_hs#*|}"
+      out=$(jq -c --arg t "$t" 'if .[$t] == "ok" then .[$t] = "stale" else . end' <<<"$out")
+    fi
+  fi
+
   # DIVE-3104: say WHICH credential scope produced the answer, and — for a
   # query that resolved the DEFAULT scope — name the registered agents this
   # result provably does not cover. A green with no scope attached is the whole
@@ -567,17 +582,19 @@ cmd_auth_status() {
   if (( JSON_MODE )); then
     echo "$out" | jq -c --arg k "$scope_kind" --arg l "$scope_label" \
       --arg a "$agent" --arg p "$profile" --argjson u "$uncovered" \
-      --arg us "$uncovered_status" \
+      --arg us "$uncovered_status" --arg sr "$seat_reason" \
       '{ok:true, data: ., scope:{kind:$k, label:$l,
                                  agent:(if $a == "" then null else $a end),
                                  authProfile:(if $p == "" then null else $p end),
                                  uncoveredAgents:$u,
-                                 uncoveredStatus:$us}}'
+                                 uncoveredStatus:$us}}
+       + (if $sr == "" then {} else {seat:{state:"degraded", reason:$sr}} end)'
     [[ "$uncovered_status" == "measured" ]] \
       || echo "COVERAGE UNKNOWN (${uncovered_status#unknown:}): this answer's blind spot could not be measured — it is NOT zero agents, it is unmeasured." >&2
   else
     echo "$out" | jq -r 'to_entries[] | "\(.key): \(.value)"' | sort
     echo "scope: ${scope_label}" >&2
+    [[ -z "$seat_reason" ]] || echo "seat: the agent's own start says: ${seat_reason}" >&2
     if [[ "$uncovered_status" != "measured" ]]; then
       echo "COVERAGE UNKNOWN (${uncovered_status#unknown:}): this answer's blind spot could not be measured — it is NOT zero agents, it is unmeasured." >&2
       echo "  re-run as a caller that can read the agent registry, or check one agent at a time: 5dive agent auth status --agent=<name>" >&2
@@ -948,11 +965,43 @@ profile_type_env() {
 #      works would be the thing this row punishes.
 # So the ladder is the fallback item 2 asks for when the verb is not usable, and
 # this comment is the "say so in the row" half of that instruction.
+#
+# DIVE-7101: on 2026.10.x the KEY is a row of state/openclaw.sqlite and the
+# openclaw.json registration below is only its label. A seat that got the label
+# and not the row (the 10-27 QA: the seed carried openclaw.json, never the db)
+# passed rung 2 and read ok at every surface while each message died on "No API
+# key found". So when the state db is readable it decides: a key row returns it,
+# no key row is NO credential, whatever openclaw.json says. The note above still
+# holds — the FILE's presence proves nothing — which is why this reads the row.
+# An unreadable db (another seat's home) falls through to rung 2 unchanged.
+_openclaw_state_key() { # <db> — echo has|none|unknown; never opens <db> in place
+  local db="$1" tmp rc=0
+  [[ -e "$db" ]] || { echo unknown; return 0; }
+  [[ -n "${OPENCLAW_STATE_AUTH_PY:-}" ]] || { echo unknown; return 0; }
+  # A snapshot, never the live file: opening a WAL db in place can leave a
+  # -shm owned by whoever asked (root, from `agent list`) in the owner's dir.
+  tmp=$(mktemp -d 2>/dev/null) || { echo unknown; return 0; }
+  if cat "$db" > "$tmp/s.sqlite" 2>/dev/null && [[ -s "$tmp/s.sqlite" ]]; then
+    if [[ -e "${db}-wal" ]]; then cat "${db}-wal" > "$tmp/s.sqlite-wal" 2>/dev/null || true; fi
+    python3 -I -c "$OPENCLAW_STATE_AUTH_PY" has "$tmp/s.sqlite" 2>/dev/null || rc=$?
+    case "$rc" in 0) echo has ;; 3) echo none ;; *) echo unknown ;; esac
+  else
+    echo unknown
+  fi
+  rm -rf "$tmp"
+}
+
 _openclaw_cred_path() {
   local root="$1" p
   # Rung 1 — layouts up to 2026.7.x: the per-agent auth store (DIVE-3489).
   p="${2:-${root}/.openclaw/agents/main/agent/openclaw-agent.sqlite}"
   [[ -s "$p" ]] && { echo "$p"; return 0; }
+  # Rung 1b — 2026.10.x: the key row of the app-wide state db (DIVE-7101).
+  p="${root}/.openclaw/state/openclaw.sqlite"
+  case "$(_openclaw_state_key "$p")" in
+    has)  echo "$p"; return 0 ;;
+    none) return 1 ;;
+  esac
   # Rung 2 — 2026.8.1+: auth profiles live in the top-level config under
   # .auth.profiles (measured on box 62.238.11.92, openclaw 2026.8.1 ea80657:
   # auth.profiles."google:manual".provider / .mode after a BYO key write).
@@ -1145,6 +1194,18 @@ agent_auth_health() {
   # so a bare sentinel-path test marks every healthy claude agent on the box
   # `needs_login` (observed on the control plane before this call replaced it).
   if ! auth_creds_present "$type" "$profile" 2>/dev/null; then
+    # DIVE-7101: an openclaw state db we READ and found no key row in is a
+    # measured absence, even though the legacy path the survey falls back to
+    # has no directory to be observable in (2026.10.x never creates it).
+    if [[ "$type" == openclaw ]]; then
+      local _ocdb
+      if [[ -n "$profile" ]]; then
+        _ocdb="${AUTH_PROFILES_DIR}/${profile}/openclaw/.openclaw/state/openclaw.sqlite"
+      else
+        _ocdb="$(_openclaw_state_root "${TYPE_AUTH[openclaw]:-}" 2>/dev/null)/.openclaw/state/openclaw.sqlite"
+      fi
+      [[ "$(_openclaw_state_key "$_ocdb")" == none ]] && { echo "needs_login|-|false"; return 0; }
+    fi
     # Absent, or unreadable? Absence is only a FACT when we could have seen the
     # file: the containing directory must be readable. An EACCES anywhere in
     # the candidate set means we learned nothing and must say so.

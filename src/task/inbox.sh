@@ -338,9 +338,99 @@ cmd_task_queue() {
   return 0
 }
 
+# ── DIVE-7077 — ON A BOX WITH NO CHANNEL, THE OWNER'S SHELL IS THE CHANNEL ───
+#
+# A self-hosted box with no Telegram and no app link (the Dropshipping trial,
+# DIVE-6902) had no way to tell its owner an agent was waiting: a tier-2 gate sat
+# four hours and nothing said so, and when the owner did find it the refusal told
+# them to tap a Telegram button they did not have. The path that works there was
+# always the owner's own login shell — `_gate_human_principal` admits a non-agent
+# uid in a logind session scope — but no message named it.
+#
+# These helpers are the one place that names it. The tier-2 floor does not move:
+# they only change the WORDS a refusal uses and add a notice; who may clear a gate
+# is still decided by the evidence checks in task answer.
+
+# Does the owner have a surface other than this box's shell? A Telegram channel
+# anywhere on the box, or the box linked to the app (it holds the box token, so
+# the dashboard's "Needs you" card shows its gates). Absent or unreadable reads as
+# "no surface", which only adds a shell hint, never removes a refusal.
+_task_owner_has_surface() {
+  _task_deployment_has_channels && return 0
+  [[ -e "$(_sp_connectord_env)" ]]
+}
+
+# Agent-written text printed to the owner's terminal, with the control bytes (C0
+# and DEL) dropped: an ask or option carrying ESC/BEL could retitle or clear it.
+_gate_plain() { printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177'; }
+
+# One shell word the owner can paste as root: as is when it holds only safe
+# characters, else single-quoted, so no $(...), backtick or quote in it runs.
+_gate_shell_word() { # <text>
+  local v q="'\\''"; v=$(_gate_plain "$1")
+  if [[ "$v" =~ ^[A-Za-z0-9_./:=@%+,-]+$ ]]; then printf '%s' "$v"
+  else printf "'%s'" "${v//"'"/"$q"}"; fi
+}
+
+# The one command that answers <task id> from a login shell on this box. Every
+# value comes from the row, which an agent wrote, so each one is a quoted word.
+_gate_shell_answer_cmd() { # <task id>
+  local row ident nt opts key conn rec
+  row=$(db "SELECT ident||x'1f'||COALESCE(need_type,'')||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'')||x'1f'||replace(COALESCE(recommend,''),x'0a',' ') FROM tasks WHERE id=$1;" 2>/dev/null) || row=""
+  IFS=$'\x1f' read -r ident nt opts key conn rec <<<"$row"
+  [[ -n "$ident" ]] || ident="$1"
+  ident=$(_gate_shell_word "$ident")
+  case "$nt" in
+    # Asks for the value at a hidden prompt, saves it, and clears the gate.
+    secret)  printf 'sudo 5dive secret write %s --connector=%s --task=%s' \
+               "$(_gate_shell_word "${key:-<KEY>}")" "$(_gate_shell_word "${conn:-tools}")" "$ident" ;;
+    approval|access) printf 'sudo 5dive task answer %s --value=approve --human  (or --value=deny)' "$ident" ;;
+    # Not "done": on a manual gate that closes the whole row (DIVE-909), and the
+    # agent waiting on it wants its row back, not closed.
+    manual)  printf 'sudo 5dive task answer %s --value=handled --human' "$ident" ;;
+    # The recommended choice, else the first option (split on '|', trimmed, as the
+    # Telegram buttons split it), else a placeholder for a free-text answer.
+    *)       local v="${rec:-${opts%%|*}}"
+             v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+             v=$(_gate_plain "$v")
+             printf 'sudo 5dive task answer %s --value=%s --human' "$ident" "$(_gate_shell_word "${v:-<your answer>}")" ;;
+  esac
+}
+
+# The tail of every "a human must clear this" refusal: Telegram where the box has
+# it, otherwise the command that works here.
+_gate_human_reach_hint() { # <task id>
+  if _task_deployment_has_channels; then
+    printf 'tap the button in Telegram or use the dashboard'
+  elif [[ -e "$(_sp_connectord_env)" ]]; then
+    printf 'answer it on the dashboard, or in a login shell on this box: %s' "$(_gate_shell_answer_cmd "$1")"
+  else
+    printf 'the box owner answers it in a login shell on this box: %s' "$(_gate_shell_answer_cmd "$1")"
+  fi
+}
+
+# `task inbox --login`: what root's next login shell prints. Silent when the owner
+# has another surface or nothing waits, so it costs a glance only when it matters.
+_task_inbox_login() { # <where> <order>
+  _task_owner_has_surface && return 0
+  local n; n=$(db "SELECT COUNT(*) FROM tasks WHERE $1;" 2>/dev/null) || return 0
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) || return 0
+  if (( n == 1 )); then echo "5dive: 1 ask is waiting for you."
+  else echo "5dive: ${n} asks are waiting for you."; fi
+  local id ident ask
+  while IFS=$'\x1f' read -r id ident ask; do
+    [[ -n "$id" ]] || continue
+    ask=$(_gate_plain "$ask"); ident=$(_gate_plain "$ident")
+    (( ${#ask} > 100 )) && ask="${ask:0:97}..."
+    printf '\n  %s  %s\n  answer: %s\n' "$ident" "$ask" "$(_gate_shell_answer_cmd "$id")"
+  done < <(db "SELECT id||x'1f'||ident||x'1f'||replace(replace(COALESCE(ask,''),x'0a',' '),x'1f',' ') FROM tasks WHERE $1 $2 LIMIT 5;" 2>/dev/null)
+  (( n > 5 )) && printf '\n  +%s more: 5dive task inbox\n' "$((n - 5))"
+  echo
+}
+
 cmd_task_inbox() {
   tasks_db_init
-  local send=0 channel_proof="" only=""
+  local send=0 channel_proof="" only="" login=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --send)            send=1 ;;
@@ -359,6 +449,8 @@ cmd_task_inbox() {
       # them. Accepted as an explicit no-op rather than silently: the listing it
       # produces IS the fleet listing.
       --fleet)           : ;;
+      # DIVE-7077: the login-shell notice (/etc/profile.d/5dive-asks.sh).
+      --login)           login=1 ;;
       --channel-proof=*) channel_proof="${1#*=}" ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  fail "$E_USAGE" "unexpected arg: $1 (inbox takes no positional args)" ;;
@@ -443,6 +535,13 @@ cmd_task_inbox() {
   if (( send )); then
     _task_inbox_send "$channel_proof" "$where" "$order" "$hold_in" "$hold_rows"
     return
+  fi
+  # Every human gate, held ones included: on a box with no other surface this
+  # login is the owner's one look, and a lead's review window is no reason to
+  # hide an ask from the person who will end up answering it.
+  if (( login )); then
+    _task_inbox_login "$where" "$order"
+    return 0
   fi
   [[ -z "$channel_proof" ]] || fail "$E_USAGE" "--channel-proof only applies with --send"
   # What the filter WITHHELD, counted rather than merely not-shown. Without this a

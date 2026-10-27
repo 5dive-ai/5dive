@@ -249,6 +249,121 @@ else
   chmod 0644 "$UNREADABLE"
 fi
 
+# ---------- 5. DIVE-7101: the 2026.10.x key lives in the state db ----------
+# openclaw 2026.10.7 writes a pasted key into ~/.openclaw/state/openclaw.sqlite
+# (config_machine_state row `authProfiles.store`) and never creates
+# agents/main/agent/. Measured in a throwaway HOME against the real 2026.10.7
+# CLI: a seat without that row fails every turn on `No API key found for
+# provider "openrouter"`; a seat given the row by openclaw_carry_state_auth
+# sends the key (OpenRouter answered 401 for the fake key). The fixtures below
+# are that db's real schema; the CLI itself is not run here.
+mkstate() { # <db> <profiles-json|""> [own-row-key] — WAL db, openclaw's schema
+  mkdir -p "$(dirname "$1")"
+  python3 -I - "$@" <<'PY'
+import json, sqlite3, sys
+db, prof = sys.argv[1], sys.argv[2]
+own = sys.argv[3] if len(sys.argv) > 3 else ""
+c = sqlite3.connect(db)
+c.execute("PRAGMA journal_mode=WAL")
+c.execute("CREATE TABLE IF NOT EXISTS config_machine_state (state_key TEXT NOT NULL PRIMARY KEY, value_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL) STRICT")
+c.execute("INSERT OR REPLACE INTO config_machine_state VALUES ('config.lastTouchedAt', '\"x\"', 1)")
+if prof:
+    c.execute("INSERT OR REPLACE INTO config_machine_state VALUES ('auth.sharedStore', '{\"location\":\"state-db\"}', 2)")
+    c.execute("INSERT OR REPLACE INTO config_machine_state VALUES ('authProfiles.store', ?, 3)", (json.dumps({"version": 1, "profiles": json.loads(prof)}),))
+if own:
+    c.execute("INSERT OR REPLACE INTO config_machine_state VALUES (?, '\"seat-own\"', 4)", (own,))
+c.commit(); c.close()
+PY
+}
+profiles_of() { python3 -I -c 'import json,sqlite3,sys; r=sqlite3.connect(sys.argv[1]).execute("SELECT value_json FROM config_machine_state WHERE state_key=?",("authProfiles.store",)).fetchone(); print(",".join(sorted((json.loads(r[0]).get("profiles") or {}).keys())) if r else "")' "$1"; }
+row_of() { python3 -I -c 'import sqlite3,sys; r=sqlite3.connect(sys.argv[1]).execute("SELECT value_json FROM config_machine_state WHERE state_key=?",(sys.argv[2],)).fetchone(); print(r[0] if r else "")' "$1" "$2"; }
+
+OR='{"openrouter:manual":{"type":"api_key","provider":"openrouter","key":"sk-or-test-7101"}}'
+ST="$TMP/st"
+mkstate "$ST/src.sqlite" "$OR"
+mkstate "$ST/nokey.sqlite" ""
+py_has() { local r=0; python3 -I -c "$OPENCLAW_STATE_AUTH_PY" has "$1" 2>/dev/null || r=$?; echo $r; }
+check "state probe: a db holding a profile has a key" "$(py_has "$ST/src.sqlite")" "0"
+check "state probe: a db openclaw only RAN in holds none (rc 3)" "$(py_has "$ST/nokey.sqlite")" "3"
+
+# a. the seat already has its own live db: carry the auth rows only, keep the rest
+mkstate "$ST/seatA/openclaw.sqlite" '{"anthropic:manual":{"type":"api_key","provider":"anthropic","key":"sk-ant-own"}}' gateway.pairing
+rc=0; openclaw_carry_state_auth "$ST/src.sqlite" "$ST/seatA" "$(id -un)" || rc=$?
+check "carry into a live seat db: rc 0" "$rc" "0"
+check "carry merges profiles by id (the seat's own login survives)" "$(profiles_of "$ST/seatA/openclaw.sqlite")" "anthropic:manual,openrouter:manual"
+has "$(row_of "$ST/seatA/openclaw.sqlite" authProfiles.store)" "sk-or-test-7101" "the carried key is the account's"
+check "the seat's own state rows are untouched" "$(row_of "$ST/seatA/openclaw.sqlite" gateway.pairing)" '"seat-own"'
+check "auth.sharedStore travels with the key" "$(row_of "$ST/seatA/openclaw.sqlite" auth.sharedStore)" '{"location":"state-db"}'
+
+# b. a seat openclaw has never run in: it takes the snapshot whole, 0600
+rc=0; openclaw_carry_state_auth "$ST/src.sqlite" "$ST/seatB" "$(id -un)" || rc=$?
+check "carry into a seat with no db: rc 0" "$rc" "0"
+check "the new seat db holds the key" "$(profiles_of "$ST/seatB/openclaw.sqlite")" "openrouter:manual"
+check "the new seat db is 0600" "$(stat -c %a "$ST/seatB/openclaw.sqlite")" "600"
+
+# c. an account db that holds no key carries nothing and says so (rc 3)
+mkstate "$ST/seatC/openclaw.sqlite" "" gateway.pairing
+rc=0; openclaw_carry_state_auth "$ST/nokey.sqlite" "$ST/seatC" "$(id -un)" || rc=$?
+check "no key in the account: rc 3, nothing written" "$rc:$(profiles_of "$ST/seatC/openclaw.sqlite")" "3:"
+
+# d. a key still in the source's -wal (never checkpointed) is not lost
+python3 -I - "$ST/walsrc.sqlite" "$OR" <<'PY'
+import json, os, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("PRAGMA journal_mode=WAL"); c.execute("PRAGMA wal_autocheckpoint=0")
+c.execute("CREATE TABLE config_machine_state (state_key TEXT NOT NULL PRIMARY KEY, value_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL) STRICT")
+c.commit()
+c.execute("INSERT INTO config_machine_state VALUES ('authProfiles.store', ?, 3)", (json.dumps({"version": 1, "profiles": json.loads(sys.argv[2])}),))
+c.commit()
+os._exit(0)   # no close: the row stays in the -wal only
+PY
+check "fixture: the key row is in the -wal, not yet in the main file" "$( [[ -s "$ST/walsrc.sqlite-wal" ]] && echo yes )" "yes"
+rc=0; openclaw_carry_state_auth "$ST/walsrc.sqlite" "$ST/seatD" "$(id -un)" || rc=$?
+check "carry reads through the source's -wal" "$rc:$(profiles_of "$ST/seatD/openclaw.sqlite")" "0:openrouter:manual"
+
+# e. the seed helper itself, on the 2026.10.x layout: no agents/main/agent at
+# all, the key only in state/. This is the 10-27 QA shape, and it reds on the
+# pre-fix helper (it returned at its `-s` guard having copied nothing).
+SH7101="$TMP/shared7101"
+mkstate "$SH7101/.openclaw/state/openclaw.sqlite" "$OR"
+printf '{"auth":{"profiles":{"openrouter:manual":{"provider":"openrouter","mode":"api_key"}}},"agents":{"defaults":{"model":{"primary":"openrouter/auto"}}}}\n' \
+  > "$SH7101/.openclaw/openclaw.json"
+mkdir -p "$SEATS/agent-oc7101/.openclaw"
+printf '{"gateway":{"mode":"local"}}\n' > "$SEATS/agent-oc7101/.openclaw/openclaw.json"
+profile_type_dir() { printf '%s' "$SH7101"; }
+WARNS=""
+AGENT_HOME_ROOT="$SEATS" seed_openclaw_state_into_seat oc7101 theo-or
+check "seed: the 2026.10.x key reaches the seat's state db" \
+      "$(profiles_of "$SEATS/agent-oc7101/.openclaw/state/openclaw.sqlite" 2>/dev/null)" "openrouter:manual"
+hasnt "$WARNS" "could not carry" "seed: no carry warning on the healthy path"
+
+# e2. the create-path witness Olivia trusted ("his own check shows a readable
+# key and a model pin"): a seat with the openclaw.json label + pin but a state
+# db with no key row is the 10-27 seat, and must be an issue, not ok.
+# The witness resolves through _openclaw_cred_path (cmd_auth.sh): without it
+# the witness falls back to the legacy path and these arms would grade that.
+# shellcheck disable=SC1091
+source src/cmd_auth.sh
+step() { :; }
+declare -F _openclaw_cred_path >/dev/null && echo "ok: witness arms run with the real credential ladder" \
+  || { echo "FAIL: _openclaw_cred_path not defined — the witness arms grade nothing"; fail=1; }
+mkdir -p "$TMP/label/agent-oclabel/.openclaw"
+printf '{"auth":{"profiles":{"openrouter:manual":{"provider":"openrouter","mode":"api_key"}}},"agents":{"defaults":{"model":{"primary":"openrouter/auto"}}}}\n' \
+  > "$TMP/label/agent-oclabel/.openclaw/openclaw.json"
+mkstate "$TMP/label/agent-oclabel/.openclaw/state/openclaw.sqlite" ""
+out=$(AGENT_HOME_ROOT="$TMP/label" selfcheck_cred_reached_agent oclabel openclaw "" openrouter 2>&1)
+has "$out" "issue:openclaw credential never reached the seat" \
+    "witness: the label without the key row is flagged (the 10-27 false ok)"
+out=$(AGENT_HOME_ROOT="$SEATS" selfcheck_cred_reached_agent oc7101 openclaw "" openrouter 2>&1)
+has "$out" "ok:openclaw seat has its own credential and model pin" \
+    "witness: the seat the 2026.10.x carry produces passes"
+
+# f. 5dive-agent-start carries the same program; drift would make the boot seed
+# and the root push disagree about what a key is.
+launcher_py=$(awk "/^  OPENCLAW_STATE_AUTH_PY='\$/{on=1; next} on && /^'\$/{exit} on" bin/5dive-agent-start)
+check "launcher's state-db program is byte-identical to the CLI's" \
+      "$( [[ -n "$launcher_py" && $'\n'"$launcher_py"$'\n' == "$OPENCLAW_STATE_AUTH_PY" ]] && echo same )" "same"
+
 # Verdict shape is load-bearing, not style: tests/meta/harness-verdict-probe.sh
 # proves a harness is WIRED by injecting `fail=$((fail+1))` before the verdict and
 # asserting the exit status flips. It recognises `exit $(( VAR > 0 ))` (and a few

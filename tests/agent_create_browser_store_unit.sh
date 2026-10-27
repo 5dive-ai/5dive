@@ -23,7 +23,10 @@
 #       stdout is the bare status word, so nothing leaks into the envelope.
 #   S1  the call site sits AFTER the registry write (setup refuses an agent-*
 #       account missing from the registry) and BEFORE the unit's first boot.
+#   B8  DIVE-7075: setup made the store but the box has no stack (exit 69 with that
+#       sentence): status `nostack`, and the line named is the box's, not a per-seat one.
 #   S2  the self-check reports `failed` as an issue and `made` as ok.
+#   S3  ...and `nostack` as an issue naming `sudo 5dive browser setup`.
 # Run: bash tests/agent_create_browser_store_unit.sh   (no root, no network)
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -58,7 +61,8 @@ cat > "$STATE_DIR/plugins/enabled/$KEY/bin/browser" <<'ENTRY'
   printf 'JSON=%s\n' "${FIVEDIVE_JSON_MODE:-}"
 } >> "$SENTINEL"
 echo "profile store ready"
-if [[ -n "${FIXTURE_SETUP_FAIL:-}" ]]; then echo "setup: cannot create the store" >&2; exit 3; fi
+if [[ -n "${FIXTURE_SETUP_FAIL:-}" ]]; then echo "setup: cannot create the store" >&2; exit "${FIXTURE_FAIL_RC:-3}"; fi
+if [[ -n "${FIXTURE_NO_STACK:-}" ]]; then echo "5dive browser: this box has no browser stack yet (missing Xvfb (xvfb)), so this seat cannot browse. A hire installs nothing; run once, as root: sudo 5dive browser setup" >&2; exit 69; fi
 exit 0
 ENTRY
 chmod +x "$STATE_DIR/plugins/enabled/$KEY/bin/browser"
@@ -118,6 +122,17 @@ t  "B6 failure: the helper still returns 0" "0" "$RC"
 tc "B6 failure: names the exit and the last line" "exit 3: setup: cannot create the store" "$ERR"
 tc "B6 failure: names the retry" "Retry: sudo env FIVEDIVE_BROWSER_SEAT=agent-luna" "$ERR"
 
+# B8 — DIVE-7075: the store is made, the box has no stack (browser setup exits 69
+# with _stack_hire_check's sentence). The fix is the box's one line, not a per-seat one.
+FIXTURE_NO_STACK=1 run seed_browser_store_for_seat luna standard
+t  "B8 no stack: status" "nostack" "$OUT"
+t  "B8 no stack: the helper still returns 0" "0" "$RC"
+tc "B8 no stack: names the box's one line" "cannot browse until you run once: sudo 5dive browser setup" "$ERR"
+t  "B8 no stack: no per-seat retry line" "no" "$([[ "$ERR" == *FIVEDIVE_BROWSER_SEAT* ]] && echo yes || echo no)"
+# B8n — a 69 that is NOT the stack sentence stays a failure.
+FIXTURE_SETUP_FAIL=1 FIXTURE_FAIL_RC=69 run seed_browser_store_for_seat luna standard
+t  "B8n another failure is still failed" "failed" "$OUT"
+
 # B7
 JSON_MODE=1
 run seed_browser_store_for_seat luna standard
@@ -136,6 +151,7 @@ t "S1 call site after the registry write and before first boot" "yes" \
 # S2 — self-check
 tc "S2 failed is an issue" '_hc_issues+=("no browser store (agent CANNOT BROWSE)' "$body"
 tc "S2 made is ok" '_hc_ok+=("browser store ready")' "$body"
+tc "S3 nostack is an issue naming the box line" 'nostack) _hc_issues+=("no browser on this box yet (agent CANNOT BROWSE): sudo 5dive browser setup")' "$body"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]
