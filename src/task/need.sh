@@ -5733,7 +5733,26 @@ db "BEGIN IMMEDIATE;
     dest_note=" [phone ping HELD — off-box gate owner '${_offbox_owner}' answers this box's approval/decision gates; nobody was paged]"
     _nr_note=""
   fi
-  ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note}${unnotified_note}${dest_note}${_nr_note} — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), delivered_to:(($dt|select(length>0)) // null), drop_link_expires_at:(($dle|select(length>0)) // null), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg dt "${TASK_SEND_TARGETS:-}" --arg dle "$_lk_iso" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
+  # DIVE-7102: a self-hosted box (linked to 5dive.app for chat) has no dashboard
+  # and no Tasks tab, so "paste it into the secret request on your dashboard" sent
+  # the owner nowhere, and the token landed in plain chat. Print the self-host
+  # page instead: the value goes from the owner's phone to the API, which hands it
+  # to this box's reporter (`secret write`) within a minute. First in the line, so
+  # it is what the filer relays.
+  local selfhost_note="" _sh_url=""
+  if [[ "$type" == "secret" && -n "$secret_key" ]] && box_is_chat_only; then
+    local _sh_agent=""
+    # Named only when the filer is an agent on this box (the page says whose key).
+    if valid_name "$actor" 2>/dev/null \
+       && registry_read 2>/dev/null | jq -e --arg n "$actor" '.agents[$n] != null' >/dev/null 2>&1; then
+      _sh_agent="$actor"
+    fi
+    _sh_url=$(selfhost_secret_url "$secret_key" "$_sh_agent")
+    selfhost_note=" [self-hosted box: send the owner this link — it puts the value straight onto this box and never into chat: ${_sh_url} — never ask for the value in chat]"
+    unnotified_note=""
+    step "Send the owner this link (self-hosted box; the value never goes in chat): ${_sh_url}"
+  fi
+  ok "$ident needs a human ($type, tier $tier)${selfhost_note}${floor_note}${prec_note}${unnotified_note}${dest_note}${_nr_note} — $ask" \
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), delivered_to:(($dt|select(length>0)) // null), drop_link_expires_at:(($dle|select(length>0)) // null), selfhost_secret_url:(($shu|select(length>0)) // null), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg dt "${TASK_SEND_TARGETS:-}" --arg dle "$_lk_iso" --arg shu "$_sh_url" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }

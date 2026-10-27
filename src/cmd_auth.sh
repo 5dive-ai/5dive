@@ -1836,6 +1836,10 @@ cmd_auth_set() {
       if [[ "$type" == "openclaw" ]] && declare -F seed_openclaw_state_into_seat >/dev/null 2>&1 \
          && [[ "$(registry_read | jq -r --arg n "$_agent" '.agents[$n].type // ""')" == "openclaw" ]]; then
         seed_openclaw_state_into_seat "$_agent" "$profile"
+        # DIVE-7102: openclaw 2026.8.1+ keeps the key where the seed above never
+        # looks; write it into the seat's own store (see the helper).
+        ! declare -F paste_openclaw_key_into_seat >/dev/null 2>&1 \
+          || paste_openclaw_key_into_seat "$_agent" "$(resolve_native_provider openclaw "$byo_provider")" "$api_key"
       fi
       step "Restarting 5dive-agent@${_agent}.service"
       systemctl restart "5dive-agent@${_agent}.service" >&2 2>&1 \

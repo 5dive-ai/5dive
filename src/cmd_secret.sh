@@ -518,6 +518,16 @@ _secret_reveal() {
   printf '%s\n' "$json"
 }
 
+# DIVE-7102: the ident of the one open secret gate naming <key> + <connector>.
+_secret_open_gate_for() { # <key> <connector>
+  local rows
+  declare -F db >/dev/null 2>&1 || return 1
+  rows=$(db "SELECT ident FROM tasks WHERE need_type='secret' AND need_answered_at IS NULL
+               AND secret_key=$(sqlq "$1") AND connector=$(sqlq "$2") ORDER BY id;" 2>/dev/null) || return 1
+  [[ -n "$rows" && "$rows" != *$'\n'* ]] || return 1
+  printf '%s' "$rows"
+}
+
 _secret_write() {
   local key="" connector="" task=""
   while [[ $# -gt 0 ]]; do
@@ -547,6 +557,13 @@ _secret_write() {
   local pfile=""
   if [[ "$connector" == project-* ]]; then
     pfile="$(_secret_project_file "$connector")" || fail "$E_VALIDATION" "--connector=$connector: $pfile. Nothing was saved"
+  fi
+  # DIVE-7102: on a self-hosted box the owner types the value on the self-host
+  # page and the box's reporter writes it with no --task, so the gate that asked
+  # for it would stay open and its agent would never hear. Close the ONE open
+  # secret gate naming this exact key and connector; two or more stay as they are.
+  if [[ -z "$task" ]] && box_is_chat_only; then
+    task=$(_secret_open_gate_for "$key" "$connector") || task=""
   fi
 
   # Value on stdin ONLY, never argv. DIVE-5319: at a terminal (nothing piped) it
