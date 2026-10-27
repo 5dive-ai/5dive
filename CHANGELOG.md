@@ -1,12 +1,5 @@
 # Changelog
 
-## Unreleased — feat(grok): owners of a self-hosted server can turn Grok agents on (DIVE-7066)
-
-`sudo 5dive grok enable` lets your own server make Grok agents. It first shows one warning: Grok's
-tool sends your agent's notes and chat turns to xAI after every turn. You confirm with `y` at a
-terminal; an agent cannot confirm it for you. `sudo 5dive grok disable` turns it off again (Grok
-agents you already have keep running). When Grok is off, the refusal now names the command to run.
-
 ## Unreleased — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
 
 0.26.1 shipped a launcher that could not start any agent (DIVE-4067). The nightly installs the
