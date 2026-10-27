@@ -78,14 +78,16 @@ _secret_usage() {
       5dive browser act <url> --steps='[{"op":"fill","selector":"…","saved":"<name>.password"}]'
       (<name>.login, <name>.password, or <name>.2fa, which types the current
       code; a bare <name> is a one-value item)
-  5dive secret https [status | enable --via=ip|sslip|domain [--host=<name>] | disable]
+  5dive secret https [status | enable --via=ip|sslip|domain|auto [--host=<name>] | disable]
       A self-hosted box (no 5dive domain) has no https name for those links, so
       its FIRST `secret link` makes one by itself: a Let's Encrypt certificate for
       the box's public IP, else <ip>.sslip.io, served by Caddy on this box (ports
       80 and 443). Nothing about a value passes through 5dive's servers. Behind
       NAT or closed ports neither works: point your own domain at the box and run
       `sudo 5dive secret https enable --via=domain --host=box.example.com`, or use
-      `secret write` at a terminal. Root-only (status is not).
+      `secret write` at a terminal. --via=auto keeps the name the box has, else
+      takes those first-link steps. The same front serves the browser's login
+      screen (/browser/viewer/). Root-only (status is not).
   5dive secret serve [--listen=127.0.0.1:3127]
       The page behind those links. Started on demand by `secret link`; exits by
       itself once no link is live. Root-only.

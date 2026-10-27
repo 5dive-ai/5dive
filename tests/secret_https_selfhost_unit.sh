@@ -147,7 +147,8 @@ cf=$(cat "$SECRET_HTTPS_CADDYFILE" 2>/dev/null)
 tc "H1c ip: Let's Encrypt's shortlived profile (the one that issues IP certs)" $'issuer acme {\n\t\t\tprofile shortlived' "$cf"
 tc "H1d ip: default_sni, a client never sends an IP as SNI" $'default_sni 192.0.2.10' "$cf"
 tc "H1e no admin endpoint" $'admin off' "$cf"
-tc "H1f every path goes to the page on loopback" "reverse_proxy 127.0.0.1:3127" "$cf"
+tc "H1f every other path goes to the page on loopback" $'handle {\n\t\treverse_proxy 127.0.0.1:3127' "$cf"
+tc "H1f2 /browser/viewer/ goes to the browser's login screen (DIVE-7133)" $'@viewer path /browser/viewer/*\n\thandle @viewer {\n\t\treverse_proxy 127.0.0.1:3111' "$cf"
 tc "H1g the page down = the closed page, 410" "This request is closed" "$cf"
 u=$(cat "$unitf" 2>/dev/null)
 tc "H1h unit: Caddy runs as user caddy" "User=caddy" "$u"
@@ -242,6 +243,25 @@ out=$( ( _secret_link DIVE-21 --again --no-start ) 2>&1)
 rm -f "$SECRET_DROP_PROVISIONING"; printf 'SECRET_DROP_BASE_URL=https://tunnel.example.net\n' > "$SECRET_DROP_CONF"
 ( _secret_https_auto ) >/dev/null 2>&1; rc=$?
 [[ $rc -ne 0 && ! -e "$unitf" ]] && ok_t "H6c an owner's own SECRET_DROP_BASE_URL: no automatic front" || bad_t "H6c an owner's own SECRET_DROP_BASE_URL: no automatic front" "rc=$rc"
+
+# --- H9: --via=auto, what the browser plugin calls (DIVE-7133) ---------------------
+fresh; export BOX_IP=192.0.2.10 TLS_OK_HOSTS=192.0.2.10
+out=$( ( _secret_https enable --via=auto ) 2>&1); rc=$?
+t  "H9a auto on a fresh box: the IP certificate, host in JSON" "0 192.0.2.10 ip" "$rc $(printf '%s' "$out" | jq -r '"\(.data.host) \(.data.mode)"' 2>/dev/null)"
+: > "$MOCK_LOG"; out=$( ( _secret_https enable --via=auto ) 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ! grep -qE '^(systemctl restart|curl)' "$MOCK_LOG" \
+  && ok_t "H9b auto with a current front: no restart, no certificate wait" || bad_t "H9b auto with a current front: no restart, no certificate wait" "rc=$rc log=$(cat "$MOCK_LOG")"
+printf '# an older front\n{\n\tadmin off\n}\nhttps://192.0.2.10 {\n\treverse_proxy 127.0.0.1:3127\n}\n' > "$SECRET_HTTPS_CADDYFILE"
+: > "$MOCK_LOG"; out=$( ( _secret_https enable --via=auto ) 2>&1); rc=$?
+[[ $rc -eq 0 ]] && grep -qF '/browser/viewer/' "$SECRET_HTTPS_CADDYFILE" && grep -q '^systemctl restart 5dive-secret-https' "$MOCK_LOG" && ! grep -q '^curl' "$MOCK_LOG" \
+  && ok_t "H9c a front from before the viewer route is rewritten and restarted, no new certificate" \
+  || bad_t "H9c a front from before the viewer route is rewritten and restarted, no new certificate" "rc=$rc log=$(cat "$MOCK_LOG")"
+fresh; export BOX_IP="" TLS_OK_HOSTS=""
+out=$( ( _secret_https enable --via=auto ) 2>&1); rc=$?
+[[ $rc -eq $E_NOT_INSTALLED && "$out" == *"no public IPv4"* && ! -e "$unitf" ]] \
+  && ok_t "H9d auto behind NAT: refused with the reason, nothing on" || bad_t "H9d auto behind NAT: refused with the reason, nothing on" "rc=$rc out=$out"
+out=$( ( _secret_https enable --via=auto --host=box.example.org ) 2>&1); rc=$?
+t  "H9e --via=auto takes no --host" "$E_USAGE" "$rc"
 
 # --- H7: a real Caddy adapts both generated files (when one is given) ------------
 if [[ -n "${CADDY_REAL:-}" && -x "${CADDY_REAL}" ]]; then

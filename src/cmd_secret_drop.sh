@@ -731,6 +731,12 @@ SECRET_HTTPS_LOCK="/run/5dive-secret-https.lock"
 SECRET_HTTPS_WAIT_S="${SECRET_HTTPS_WAIT_S:-60}"
 SECRET_HTTPS_RETRY_S="${SECRET_HTTPS_RETRY_S:-3600}"
 SECRET_HTTPS_WHY=""
+# DIVE-7133: the browser's login screen rides this same front. A self-hosted box
+# linked to 5dive.app gets its agents' Connect links on this host, and two fronts
+# cannot share 80/443 (the second refused the first). The browser plugin's
+# login-link server listens here (its LINK_PORT_DEFAULT); with none running, a
+# viewer path gets the same closed page as a spent secret link.
+SECRET_HTTPS_VIEWER_PORT=3111
 
 _secret_https_get() { [[ -r "$SECRET_DROP_CONF" ]] && sed -n "s/^$1=//p" "$SECRET_DROP_CONF" | tail -1; }
 # The front's host (an IPv4 or a name), only in a shape safe for a Caddyfile and a URL.
@@ -748,15 +754,17 @@ _secret_https_public_ipv4() {
     | grep -vE '^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' | head -1
 }
 
-# The whole front: every path goes to the page (it 404s what is not a live
-# token), a 410 page while the page is down, no admin endpoint.
+# The whole front: /browser/viewer/ to the browser's login screen (DIVE-7133),
+# every other path to the page (it 404s what is not a live token), a 410 page
+# while either is down, no admin endpoint.
 _secret_https_caddyfile() { # <mode> <host>
   local mode="$1" host="$2" closed_html; closed_html=$(_secret_drop_closed_html)
   printf '# Written by `5dive secret https` (DIVE-7113). Re-run it to change this.\n{\n\tadmin off\n'
   [[ "$mode" == ip ]] && printf '\tdefault_sni %s\n' "$host"   # a client never sends an IP as SNI
   printf '}\n\nhttps://%s {\n' "$host"
   [[ "$mode" == ip ]] && printf '\ttls {\n\t\tissuer acme {\n\t\t\tprofile shortlived\n\t\t}\n\t}\n'
-  printf '\treverse_proxy 127.0.0.1:%s\n' "$SECRET_DROP_PORT"
+  printf '\t@viewer path /browser/viewer/*\n\thandle @viewer {\n\t\treverse_proxy 127.0.0.1:%s\n\t}\n' "$SECRET_HTTPS_VIEWER_PORT"
+  printf '\thandle {\n\t\treverse_proxy 127.0.0.1:%s\n\t}\n' "$SECRET_DROP_PORT"
   printf '\thandle_errors {\n\t\t@closed expression `{err.status_code} in [502, 503, 504]`\n\t\thandle @closed {\n'
   printf '\t\t\theader Content-Type "text/html; charset=utf-8"\n\t\t\theader Cache-Control no-store\n'
   printf '\t\t\trespond `%s` 410\n\t\t}\n\t}\n}\n' "$closed_html"
@@ -927,6 +935,20 @@ _secret_https_auto() {
   return 1
 }
 
+# DIVE-7133: a front written before the viewer route serves no login screen.
+# Rewrite it for the host it already has; the certificate stays in Caddy's own
+# storage, so this is a restart, not a new order. rc 0 = the route is there.
+_secret_https_refresh() {
+  local h m; h=$(_secret_https_host) || { SECRET_HTTPS_WHY="this box has no https name yet"; return 1; }
+  grep -qF '/browser/viewer/' "$SECRET_HTTPS_CADDYFILE" 2>/dev/null && return 0
+  m=$(_secret_https_get SECRET_HTTPS_MODE)
+  [[ "$m" =~ ^(ip|sslip|domain)$ ]] || { SECRET_HTTPS_WHY="the https conf names no way ($m)"; return 1; }
+  ( umask 022; _secret_https_caddyfile "$m" "$h" > "$SECRET_HTTPS_CADDYFILE" ) || { SECRET_HTTPS_WHY="cannot write $SECRET_HTTPS_CADDYFILE"; return 1; }
+  systemctl restart "$SECRET_HTTPS_UNIT" >/dev/null 2>&1 \
+    || { SECRET_HTTPS_WHY="the https front did not restart (journalctl -u $SECRET_HTTPS_UNIT)"; return 1; }
+  return 0
+}
+
 # What `secret link` says when there is still no https name: written for the
 # agent to pass on as two plain messages (a domain, or the terminal).
 _secret_https_no_name_msg() { # <terminal command>
@@ -941,7 +963,7 @@ _secret_https_no_name_msg() { # <terminal command>
     "$why" "${ip:-this box}" "$1"
 }
 
-# `5dive secret https [status|enable --via=ip|sslip|domain [--host=<name>]|disable]`
+# `5dive secret https [status|enable --via=ip|sslip|domain|auto [--host=<name>]|disable]`
 _secret_https() {
   local sub="${1:-status}"; shift || true
   local via="" host="" a
@@ -964,13 +986,23 @@ _secret_https() {
         case "$a" in
           --via=*)  via="${a#*=}" ;;
           --host=*) host="${a#*=}" ;;
-          *) fail "$E_USAGE" "unknown: $a (5dive secret https enable --via=ip|sslip|domain [--host=<name>])" ;;
+          *) fail "$E_USAGE" "unknown: $a (5dive secret https enable --via=ip|sslip|domain|auto [--host=<name>])" ;;
         esac
       done
       require_root secret https
-      [[ "$via" =~ ^(ip|sslip|domain)$ ]] || fail "$E_USAGE" "--via must be ip, sslip or domain"
+      [[ "$via" =~ ^(ip|sslip|domain|auto)$ ]] || fail "$E_USAGE" "--via must be ip, sslip, domain or auto"
       [[ "$via" == domain && -z "$host" ]] && fail "$E_USAGE" "--via=domain needs --host=<your domain>, pointed at this box"
       [[ "$via" != domain && -n "$host" ]] && fail "$E_USAGE" "--via=$via makes its own name; --host is for --via=domain"
+      if [[ "$via" == auto ]]; then
+        # DIVE-7133: what the browser plugin calls before it sends a Connect link
+        # in 5dive.app: the name the box has, else the first link's own steps
+        # (an IP certificate, then sslip.io, with the same retry window).
+        { _secret_https_auto && _secret_https_refresh; } \
+          || fail "$E_NOT_INSTALLED" "no https name on this box: ${SECRET_HTTPS_WHY:-it could not make one}"
+        local h m; h=$(_secret_https_host); m=$(_secret_https_get SECRET_HTTPS_MODE)
+        ok "https on this box: on, via ${m:-?} - https://${h}/..." '{on: true, managed: true, mode: $m, host: $h}' --arg m "$m" --arg h "$h"
+        return 0
+      fi
       _secret_https_enable "$via" "$host" || fail "$E_NOT_INSTALLED" "secret links stay without https: ${SECRET_HTTPS_WHY}. The https front is off now; the next secret link sets one up again (an IP certificate, then sslip.io)."
       local h; h=$(_secret_https_host)
       ok "secret links: on, via ${via} - https://${h}/...$([[ "$via" == sslip ]] && printf '\n  note: sslip.io answers for this name; --via=ip or your own domain keeps any third party out of it.')" \
