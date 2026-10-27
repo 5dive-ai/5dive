@@ -98,7 +98,7 @@ on:
         required: true
         type: string
       level:
-        description: 'Leave on auto. The level is DERIVED from the commits in the cut (a feat makes it a minor); this can only RAISE it, and a value below the derived one is refused (DIVE-4086).'
+        description: 'Leave on auto. The level is DERIVED from the commits in the cut (a feat, or before 1.0 a breaking change, makes it a minor); this can only RAISE it, and a value below the derived one is refused (DIVE-4086). major on a 0.x tree declares 1.0 (DIVE-7056).'
         required: false
         default: auto
         type: choice
@@ -257,6 +257,15 @@ jobs:
           else
             _forced_by=$(grep -E '^[0-9a-f]+ feat(\([^)]*\))?:' <<<"$_subjects" | head -3) || _forced_by=""
             if [[ -n "$_forced_by" ]]; then _derived=minor; else _derived="patch"; fi
+          fi
+          # DIVE-7056: BEFORE 1.0, A BREAKING CHANGE MOVES THE MINOR. The first `!:` in
+          # this repo's history (#1430) derived major, so the only cut that could pass was
+          # v1.0.0 — an epoch declared by one PR title. lodar chose 0.x (2026-10-26). While
+          # the major is 0 a breaking change is a minor, as in semver's 0.x convention, and
+          # 1.0 is declared on purpose by dispatching level=major, which still raises.
+          if [[ "$_derived" == major && "$_maj" == 0 ]]; then
+            _derived=minor
+            _forced_by="${_forced_by} (pre-1.0: a breaking change cuts a minor; 1.0 is level=major, DIVE-7056)"
           fi
 
           # THE REFUSAL IS BOUNDED BY WHEN THE LINT LANDED, and that boundary is read

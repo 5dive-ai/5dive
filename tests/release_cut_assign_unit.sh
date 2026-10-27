@@ -320,10 +320,36 @@ grep -q '^DERIVED=v0\.27\.2$' <<<"$out" \
   && ok_t 'only fix/test/chore in the range -> PATCH (the rule is a feature, not any commit)' \
   || bad_t 'a range with no feature moved the minor; every nightly would declare an epoch' "rc=$rc out=$out"
 
-out=$(run_derive '0.17.8' v0.27.1 nolint 'feat!: the shape changed'); rc=$?
+out=$(run_derive '0.17.8' v1.2.3 nolint 'feat!: the shape changed'); rc=$?
+grep -q '^DERIVED=v2\.0\.0$' <<<"$out" \
+  && ok_t "from 1.0 on, a '!' in the subject beats feat and cuts a MAJOR" \
+  || bad_t 'a breaking marker on a 1.x tree derived below major' "rc=$rc out=$out"
+
+out=$(run_derive '0.17.8' v1.2.3 nolint $'fix: a thing\n\nBREAKING CHANGE: the shape changed'); rc=$?
+grep -q '^DERIVED=v2\.0\.0$' <<<"$out" \
+  && ok_t 'from 1.0 on, a BREAKING CHANGE trailer cuts a MAJOR' \
+  || bad_t 'a BREAKING CHANGE trailer on a 1.x tree derived below major' "rc=$rc out=$out"
+
+echo "-- DIVE-7056: before 1.0 a breaking change cuts a MINOR, and 1.0 is declared, not triggered"
+out=$(run_derive '0.17.8' v0.102.2 nolint 'feat(plugin)!: the dev-team tools leave the core'); rc=$?
+grep -q '^DERIVED=v0\.103\.0$' <<<"$out" && grep -q 'pre-1.0: a breaking change cuts a minor' <<<"$out" \
+  && ok_t "THE MEASURED CASE: #1430's '!' on v0.102.2 derives v0.103.0 and says why, not v1.0.0" \
+  || bad_t "a '!' on a 0.x tree still declares 1.0 by itself" "rc=$rc out=$out"
+
+out=$(run_derive '0.17.8' v0.27.1 nolint $'fix: a thing\n\nBREAKING CHANGE: the shape changed'); rc=$?
+grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
+  && ok_t 'before 1.0, a BREAKING CHANGE trailer cuts a MINOR too' \
+  || bad_t 'the trailer path still declares 1.0 on a 0.x tree' "rc=$rc out=$out"
+
+out=$(run_stated minor '0.17.8' v0.102.2 nolint 'feat(plugin)!: the dev-team tools leave the core'); rc=$?
+grep -q '^DERIVED=v0\.103\.0$' <<<"$out" \
+  && ok_t "RELEASE_LEVEL=minor over a 0.x '!' passes — run 40421851042's dispatch, which refused" \
+  || bad_t "a stated minor over a 0.x breaking change is still refused as a lowering" "rc=$rc out=$out"
+
+out=$(run_stated major '0.17.8' v0.102.2 nolint 'feat(plugin)!: the dev-team tools leave the core'); rc=$?
 grep -q '^DERIVED=v1\.0\.0$' <<<"$out" \
-  && ok_t "a '!' in the subject beats feat and cuts a MAJOR" \
-  || bad_t 'a breaking marker derived below major' "rc=$rc out=$out"
+  && ok_t 'RELEASE_LEVEL=major on a 0.x tree still declares v1.0.0 (1.0 stays reachable on purpose)' \
+  || bad_t 'there is no longer any way to declare 1.0' "rc=$rc out=$out"
 
 out=$(run_derive '0.17.8' v0.27.1 nolint 'fix: ordinary' 'feat: the headline' 'chore: tidy after'); rc=$?
 grep -q '^DERIVED=v0\.28\.0$' <<<"$out" \
