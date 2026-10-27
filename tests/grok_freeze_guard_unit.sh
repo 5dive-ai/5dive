@@ -27,13 +27,16 @@ bad()  { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
 has()  { grep -qF -- "$2" "$SRC" && ok "$1" || bad "$1 (missing: $2)"; }
 
 echo "== static wiring (DIVE-1222 grok freeze) =="
-has "guard present"            "grok provisioning is frozen"
+has "guard present"            "Grok is off on this server"
 # DIVE-3185: the predicate moved from an env var to a managed-fleet MARKER FILE.
 # Asserting the literal condition (not just "some grok check exists") is what
 # makes a silent revert to a permissive default, or back to an env var, red here.
 has "refuse condition"         'if [[ "$type" == "grok" && ! -e "$grok_arm_marker" ]]; then'
 has "marker path defaulted"    'local grok_arm_marker="${FIVE_GROK_ARM_MARKER:-/etc/5dive/arm/grok-unfreeze}"'
-has "names the unfreeze bar"   "a verified xAI client-side fix"
+# DIVE-7066: the refusal names the owner's ONE command, not our freeze text,
+# so a lead can tell a self-hosted owner exactly what to run.
+has "names the owner command"  "The server owner can turn it on with: sudo 5dive grok enable"
+has "owner opt-in sanctioned"  "THE SECOND SANCTIONED WRITER: THE BOX'S OWN OWNER"
 has "override warns"           "bypassing the DIVE-1221 Grok exfiltration freeze"
 has "guard sits after is_known_type" "DIVE-1221/1222: Grok provisioning is FROZEN"
 # DIVE-3185: these two sentences are load-bearing, not decoration. The first
@@ -124,10 +127,17 @@ if [[ -x "$BIN" && ( $EUID -eq 0 || -n "$SUDO" ) && $have_claude_grp -eq 1 ]]; t
         "$BIN" agent create grokbot --type=grok --channels=bogus 2>&1)"; rc=$?
   # DIVE-2645: assert the VERDICT, not a ticket id. The refusal no longer carries
   # "(DIVE-1221)" — an arm that requires one is what made the archaeology mandatory.
-  if [[ $rc -ne 0 ]] && grep -qF "grok provisioning is frozen" <<<"$out"; then
+  if [[ $rc -ne 0 ]] && grep -qF "Grok is off on this server" <<<"$out"; then
     ok "unmarked host: grok create refused with the freeze error"
   else
     bad "unmarked host: grok create should refuse (rc=$rc, out: $out)"
+  fi
+  # DIVE-7066 acceptance 4: the refusal a lead relays carries the command and
+  # no internal ids.
+  if grep -qF "sudo 5dive grok enable" <<<"$out" && ! grep -qE "DIVE-[0-9]" <<<"$out"; then
+    ok "unmarked host: refusal names 'sudo 5dive grok enable', no internal ids"
+  else
+    bad "unmarked host: refusal should name the enable command and no DIVE ids (out: $out)"
   fi
 
   # ARM B — the MARKED path. This deliberately gets PAST the freeze, so its
@@ -141,7 +151,7 @@ if [[ -x "$BIN" && ( $EUID -eq 0 || -n "$SUDO" ) && $have_claude_grp -eq 1 ]]; t
     printf 'DIVE-3185 test marker\n' >"$marked"
     out2="$($SUDO env -u FIVE_GROK_UNFREEZE_VERIFIED FIVE_GROK_ARM_MARKER="$marked" \
            "$BIN" agent create grokbot --type=grok --channels=bogus 2>&1)"; rc2=$?
-    if grep -qF "grok provisioning is frozen" <<<"$out2"; then
+    if grep -qF "Grok is off on this server" <<<"$out2"; then
       bad "marked host: marker did NOT arm — still hit the freeze (rc=$rc2, out: $out2)"
     elif [[ $rc2 -ne 0 ]] && grep -qF "invalid channels" <<<"$out2"; then
       ok "marked host: guard permitted, stopped at the --channels=bogus barrier"
@@ -152,6 +162,21 @@ if [[ -x "$BIN" && ( $EUID -eq 0 || -n "$SUDO" ) && $have_claude_grp -eq 1 ]]; t
   else
     echo "  skip marked-path arm (mktemp failed)"
   fi
+
+  # DIVE-7066 acceptance 3: `grok disable` removes the marker and the NEXT
+  # create is refused again. Real binary, pinned marker, same bogus-channel
+  # barrier, so a disable that left the marker stops at channels, not here.
+  dmark="$(mktemp -d)/grok-unfreeze"
+  printf 'DIVE-7066 test marker\n' >"$dmark"
+  $SUDO env FIVE_GROK_ARM_MARKER="$dmark" "$BIN" grok disable >/dev/null 2>&1
+  out3="$($SUDO env -u FIVE_GROK_UNFREEZE_VERIFIED FIVE_GROK_ARM_MARKER="$dmark" \
+         "$BIN" agent create grokbot --type=grok --channels=bogus 2>&1)"; rc3=$?
+  if [[ ! -e "$dmark" && $rc3 -ne 0 ]] && grep -qF "Grok is off on this server" <<<"$out3"; then
+    ok "grok disable: marker gone, next grok create refused"
+  else
+    bad "grok disable: marker present=$([[ -e "$dmark" ]] && echo yes || echo no) rc=$rc3 out: $out3"
+  fi
+  $SUDO rm -rf "$(dirname "$dmark")"
 
   post_user=0; id agent-grokbot &>/dev/null && post_user=1
   if [[ $post_user -gt $pre_user ]]; then
@@ -165,6 +190,53 @@ if [[ -x "$BIN" && ( $EUID -eq 0 || -n "$SUDO" ) && $have_claude_grp -eq 1 ]]; t
 else
   echo "  skip functional (need built ./5dive + root/sudo -n + claude group)"
 fi
+
+echo "== grok enable / disable (DIVE-7066, sourced; no root, no live create) =="
+# The owner's opt-in. Sourced with stubs so it needs no root and never reaches
+# a create; the y/N arms run on a REAL pty through util-linux `script`, because
+# "asks only on a terminal" is the property, and a stubbed _grok_on_tty would
+# grade the stub. The no-TTY and agent-seat arms run with plain pipes.
+G="$(mktemp -d)"
+cat >"$G/drive.sh" <<'DRIVE'
+set -uo pipefail
+E_USAGE=2 E_PERMISSION=3 E_GENERIC=1 JSON_MODE=0
+fail() { printf 'FAIL(%s) %s\n' "$1" "$2"; exit 1; }
+ok()   { printf 'OK — %s\n' "$1"; }
+require_root() { :; }
+actor_routing_agent() { [[ -n "${STUB_AGENT:-}" ]] && { printf '%s' "$STUB_AGENT"; return 0; }; return 1; }
+source "$1"; shift
+cmd_grok "$@"
+DRIVE
+gmod="$PWD/src/cmd_grok.sh"
+gm="$G/arm/grok-unfreeze"
+on_pty() {   # <answer> <args...> — run on a pty, feeding <answer> to the prompt
+  local ans="$1"; shift
+  printf '%s\n' "$ans" | FIVE_GROK_ARM_MARKER="$gm" script -qec "bash $G/drive.sh $gmod $*" /dev/null 2>&1
+}
+if command -v script >/dev/null 2>&1; then
+  rm -f "$gm"; o=$(on_pty n enable)
+  [[ ! -e "$gm" ]] && grep -qF "Grok stays off" <<<"$o" \
+    && ok "enable on a tty, answer n: marker absent" || bad "enable/n: marker=$([[ -e "$gm" ]] && echo present) out: $o"
+  rm -f "$gm"; o=$(on_pty y enable)
+  [[ -e "$gm" ]] && grep -qF "Grok's tool sends your agent's notes and chat turns to xAI" <<<"$o" \
+    && ok "enable on a tty, answer y: warning shown, marker present" || bad "enable/y: marker=$([[ -e "$gm" ]] && echo present || echo absent) out: $o"
+else
+  bad "util-linux script missing: the tty arms cannot run"
+fi
+rm -f "$gm"
+o=$(printf 'y\n' | FIVE_GROK_ARM_MARKER="$gm" bash "$G/drive.sh" "$gmod" enable 2>&1); rc=$?
+[[ $rc -ne 0 && ! -e "$gm" ]] && grep -qF "sudo 5dive grok enable" <<<"$o" \
+  && ok "enable with no tty: refused, marker absent, names the command" || bad "enable/no-tty: rc=$rc marker=$([[ -e "$gm" ]] && echo present) out: $o"
+rm -f "$gm"; o=$(STUB_AGENT=olivia on_pty y enable)
+[[ ! -e "$gm" ]] && grep -qF "only the server owner can turn Grok on" <<<"$o" \
+  && ok "enable from an agent seat, even on a tty with y: refused" || bad "enable/agent: marker=$([[ -e "$gm" ]] && echo present) out: $o"
+rm -f "$gm"; o=$(FIVE_GROK_ARM_MARKER="$gm" bash "$G/drive.sh" "$gmod" enable --yes 2>&1); rc=$?
+[[ $rc -ne 0 && ! -e "$gm" ]] && ok "enable --yes: no bypass flag" || bad "enable --yes: rc=$rc out: $o"
+mkdir -p "$(dirname "$gm")"; : >"$gm"
+o=$(FIVE_GROK_ARM_MARKER="$gm" bash "$G/drive.sh" "$gmod" disable 2>&1)
+[[ ! -e "$gm" ]] && grep -qF "keep running" <<<"$o" \
+  && ok "disable: marker removed, says existing agents keep running" || bad "disable: out: $o"
+rm -rf "$G"
 
 echo
 echo "pass=$pass fail=$fail"

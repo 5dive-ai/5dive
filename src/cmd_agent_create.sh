@@ -3091,6 +3091,17 @@ cmd_create() {
   # past this guard is not, and is the thing the sentence below has always meant.
   # The warn below fires on every armed create and is meant to stay noisy.
   #
+  # DIVE-7066 — THE SECOND SANCTIONED WRITER: THE BOX'S OWN OWNER. lodar
+  # (2026-10-27, Yes tap on keep-the-warning) let a self-hosted owner arm their
+  # OWN box with `sudo 5dive grok enable` (src/cmd_grok.sh): one plain warning
+  # line, y/N at a terminal, no --yes, refused for an agent seat. That is the
+  # same knowing acceptance lodar made for the managed fleet, made by the person
+  # whose data it is. It is still NOT a patch, the condition above is still half
+  # met, and a hand-placed marker is still not sanctioned. The refusal below
+  # therefore names that command instead of our internal freeze text, so a lead
+  # can tell the owner exactly what to run. The managed-fleet sweep and its
+  # disarm are unchanged.
+  #
   # DIVE-3185 — WHAT ARMS IT CHANGED, AND WHY IT IS A FILE AND NOT AN ENV VAR.
   # lodar (2026-08-10 19:17Z) accepted the risk for CUSTOMER boxes too, not just
   # the one internal host of DIVE-2910. The scope grew; the mechanism therefore
@@ -3140,10 +3151,10 @@ cmd_create() {
   # speed-bump paragraph above.
   local grok_arm_marker="${FIVE_GROK_ARM_MARKER:-/etc/5dive/arm/grok-unfreeze}"
   if [[ "$type" == "grok" && ! -e "$grok_arm_marker" ]]; then
-    fail "$E_VALIDATION" "grok provisioning is frozen — unfreeze needs a verified xAI client-side fix and a pinnable version"
+    fail "$E_VALIDATION" "Grok is off on this server: its tool sends your agent's notes and chat turns to xAI after every turn. The server owner can turn it on with: sudo 5dive grok enable"
   fi
   if [[ "$type" == "grok" ]]; then
-    warn "managed-fleet arm marker present ($grok_arm_marker), bypassing the DIVE-1221 Grok exfiltration freeze. Owner risk acceptance (lodar 2026-08-10), NOT a patch — the xAI upload path is still unfixed and unpinnable."
+    warn "arm marker present ($grok_arm_marker), bypassing the DIVE-1221 Grok exfiltration freeze. Owner risk acceptance (lodar 2026-08-10 for managed boxes, or this server's owner via 5dive grok enable), NOT a patch — the xAI upload path is still unfixed and unpinnable."
   fi
   valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard|buzz, comma-separable)"
   # DIVE-5406: dashboard chat is OPT-IN. DIVE-856 used to fold `dashboard`
