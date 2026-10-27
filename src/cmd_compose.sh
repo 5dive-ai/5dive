@@ -29,6 +29,13 @@
 #       pack:           <slug>             # import a character pack instead of a
 #                                          # bare create — supplies persona+skills
 #                                          # +model/effort (5dive agent import)
+#       prefer_type:    codex|claude       # DIVE-7080: the harness this seat runs on
+#                                          # WHEN the box has a sign-in for it (Pixel
+#                                          # makes pictures only on Codex). No sign-in:
+#                                          # the seat keeps its type, the summary names
+#                                          # the step. A roster --type= wins over it
+#       prefer_why:     "real pictures"    # DIVE-7080: what that harness gets the owner,
+#                                          # said in the summary's step line
 #       pack_url:       https://…          # DIVE-6088: where THIS seat's pack is
 #                                          # fetched from (a signed link 5dive-api
 #                                          # mints for a partner's private pack);
@@ -111,6 +118,8 @@ KNOWN = {
     "pack_url", # DIVE-6088: the seat's pack by link (agent import --from-url), for
              # a partner's private pack. `pack:` still names the persona.
     "can_push", # DIVE-6543: the push grant is the seat's, not the box's.
+    "prefer_type", # DIVE-7080: the harness a seat takes when the box can sign it in.
+    "prefer_why",  # DIVE-7080: what that harness gets the owner, in their words.
 }
 if "pack_url" in defaults:
     print("error: 'pack_url' is one seat's pack link — it cannot be a default", file=sys.stderr); sys.exit(3)
@@ -129,6 +138,11 @@ for name, spec in agents.items():
     for k in spec:
         if k not in KNOWN:
             print(f"warning: agent '{name}': unknown key '{k}' (ignored)", file=sys.stderr)
+    pt = m.get("prefer_type")
+    if pt is not None and pt not in ("claude", "codex"):
+        print(f"error: agent '{name}': prefer_type must be claude or codex", file=sys.stderr); sys.exit(3)
+    if m.get("prefer_why") is not None and (pt is None or not isinstance(m["prefer_why"], str)):
+        print(f"error: agent '{name}': prefer_why is a line of text and needs prefer_type", file=sys.stderr); sys.exit(3)
     pu = m.get("pack_url")
     if pu is not None:
         if not m.get("pack"):
@@ -456,6 +470,10 @@ _compose_import_args() {
   # agents as codex and the pack agents as whatever the pack was packed as.
   if [[ -n "$type_override" ]]; then
     printf '%s\n' "--type=${type_override}"
+  # DIVE-7080: ...and a seat _compose_apply_prefer_type moved to the harness it
+  # prefers. Only that seat: an inherited `type:` still never reaches a pack.
+  elif [[ "$(jq -r '.prefer_applied // false' <<<"$spec")" == "true" ]]; then
+    printf '%s\n' "--type=$(jq -r '.type' <<<"$spec")"
   fi
   local channels tg_token dc_token profile workdir
   channels=$(jq -r '.channels       // empty' <<<"$spec")
@@ -1645,6 +1663,82 @@ _compose_rename_persona_file() {
     || warn "[$name] could not rewrite teammate names in $md — it may still name the un-namespaced agents"
 }
 
+# DIVE-7080: `prefer_type:` — the harness a seat should run on when this box can
+# sign it in there. Pixel (Dropshipping Team) makes real product pictures only on
+# Codex; on a box with no ChatGPT sign-in she came up on Claude and drew icons in
+# code. The template stays harness-agnostic (lodar, 2026-10-21): nothing is
+# forced, the seat moves only onto an account that already serves the harness.
+#
+# _compose_prefer_account <type> <seat account> — the account the seat would run
+# <type> on, printed, rc 0; rc 1 when there is none. A seat that names its account
+# (the template, or `--auth-profile=` on the import) keeps it: the owner chose it.
+# Otherwise the first account signed in to <type>. The box's shared login is not
+# looked at: an import always binds a named account, so it could not be used.
+_compose_prefer_account() {
+  local t="$1" acct="${2:-}" h d p
+  lazy_need switch_account_harness
+  if [[ -n "$acct" ]]; then
+    h=$(switch_account_harness "$acct" 2>/dev/null) || h=""
+    [[ "$h" == "$t" || "$h" == both ]] || return 1
+    printf '%s\n' "$acct"; return 0
+  fi
+  [[ -n "${AUTH_PROFILES_DIR:-}" && -d "${AUTH_PROFILES_DIR:-}" ]] || return 1
+  for d in "${AUTH_PROFILES_DIR}"/*/; do
+    [[ -d "$d" ]] || continue
+    p=$(basename "$d")
+    valid_profile_name "$p" || continue
+    h=$(switch_account_harness "$p" 2>/dev/null) || h=""
+    [[ "$h" == "$t" || "$h" == both ]] || continue
+    printf '%s\n' "$p"; return 0
+  done
+  return 1
+}
+
+# Rewrite every seat with a `prefer_type:` it is not already on. Moved: `.type`,
+# `.auth_profile`, `.prefer_applied` (the import forwards --type for it) and the
+# Claude-only pins dropped, as `--type=` does for the roster. Not moved:
+# `.prefer_missed`, for the summary's one step. A roster `--type=` wins and this
+# is not called. Prints the spec.
+_compose_apply_prefer_type() {
+  local spec="$1" name t cur acct moved=() missed=()
+  while IFS=$'\t' read -r name t cur acct; do
+    [[ -n "$name" && "$t" != "$cur" ]] || continue
+    if acct=$(_compose_prefer_account "$t" "$acct"); then
+      moved+=("$name"$'\t'"$acct")
+    else
+      missed+=("$name")
+    fi
+  done < <(jq -r '.agents | to_entries[] | select((.value.prefer_type // "") != "")
+                  | [.key, .value.prefer_type, (.value.type // "claude"), (.value.auth_profile // "")] | @tsv' <<<"$spec")
+  jq --argjson mv "$(printf '%s\n' "${moved[@]+"${moved[@]}"}" | jq -R 'select(length>0) | split("\t") | {(.[0]): .[1]}' | jq -sc 'add // {}')" \
+     --argjson ms "$(printf '%s\n' "${missed[@]+"${missed[@]}"}" | jq -R 'select(length>0)' | jq -sc .)" '
+    .agents |= with_entries(.key as $k |
+      if $mv[$k] != null then
+        .value.type = .value.prefer_type | .value.auth_profile = $mv[$k] | .value.prefer_applied = true
+        | if .value.type == "claude" then .
+          else
+            (if ((.value.model // "") | test("^(opus|sonnet|fable|haiku)$|^claude-"))
+             then .value |= del(.model) else . end)
+            | .value |= del(.effort)
+          end
+      elif ($ms | index($k)) != null then .value.prefer_missed = true
+      else . end)
+  ' <<<"$spec"
+}
+
+_compose_prefer_label() {
+  case "$1" in codex) printf 'ChatGPT (Codex)' ;; claude) printf 'Claude' ;; *) printf '%s' "$1" ;; esac
+}
+
+# The step that moves <name> onto <type> later, for a box with no sign-in for it:
+# sign in once, then move the seat onto that account.
+_compose_prefer_hint() {
+  local name="$1" t="$2" acct="chatgpt"
+  [[ "$t" == codex ]] || acct="claude"
+  printf 'sudo 5dive account login %s --type=%s && sudo 5dive agent switch %s --to=%s --account=%s\n' \
+    "$acct" "$t" "$name" "$t" "$acct"
+}
+
 _compose_type_override_pins() {
   local spec="$1" t="$2"
   [[ "$t" == "claude" ]] && { printf ''; return 0; }
@@ -1811,6 +1905,11 @@ HELP
       || fail "$E_VALIDATION" "could not apply --prefix=$name_prefix to the spec"
     step "namespace: the whole roster comes up as ${name_prefix}-<name>, with its own org root"
   fi
+  # DIVE-7080: after the namespace, so the names it records are the final ones.
+  if [[ -z "$type_override" ]]; then
+    spec=$(_compose_apply_prefer_type "$spec") \
+      || fail "$E_VALIDATION" "could not apply the seats' prefer_type to the spec"
+  fi
   # DIVE-4103: what this team needs from the BOX, answered before anything is
   # provisioned. Never fatal — a missing capability names the reduced mode.
   _compose_requires_preflight "$spec"
@@ -1938,6 +2037,9 @@ HELP
     agent_spec=$(jq -c --arg n "$name" '.agents[$n]' <<<"$spec")
     pack_slug=$(jq -r '.pack // empty' <<<"$agent_spec")
     local -a args=(); local brought_up=1 verb=create
+    if [[ "$(jq -r '.prefer_applied // false' <<<"$agent_spec")" == "true" ]]; then
+      step "[$name] on $(jq -r '.type' <<<"$agent_spec") with account '$(jq -r '.auth_profile' <<<"$agent_spec")': the team asks for it there, and this box is signed in to it"
+    fi
     if [[ -n "$pack_slug" ]]; then
       # DIVE-536: spec references a character pack → import it (pack supplies
       # persona+skills+model/effort); wiring below still applies org/goals/overrides.
@@ -2094,18 +2196,32 @@ HELP
     done
   done
 
+  # DIVE-7080: the seats that took, or could not take, the harness their
+  # template prefers. Only what this run brought up, like the channel line above.
+  local -a _prefer_moved=() _prefer_missed=()
+  for _n in "${_brought_up_names[@]+"${_brought_up_names[@]}"}"; do
+    case "$(jq -r --arg n "$_n" '.agents[$n] | if .prefer_applied then "moved" elif .prefer_missed then "missed" else "" end' <<<"$spec" 2>/dev/null)" in
+      moved)  _prefer_moved+=("$_n") ;;
+      missed) _prefer_missed+=("$_n") ;;
+    esac
+  done
+
   if (( JSON_MODE )); then
     # DIVE-5606: `adopted` is what lets a hire screen say "Olivia is already on
     # your box, she leads this team" instead of counting a new CEO. `seat` is the
     # template's name for the role; `agent` is who fills it. `adopt_ambiguous`:
     # seats whose persona is on the box more than once, so none was taken.
-    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d, no_channel:$nc, loops:{created:($lc|tonumber), existing:($le|tonumber), errors:($lerr|tonumber), retry:$lr}, adopted:$ad, adopt_ambiguous:$aa, held:(if $hk == "" then null else {lead:$hl, kickoff:$hk, goals:($hg|tonumber)} end)}' \
+    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d, no_channel:$nc, loops:{created:($lc|tonumber), existing:($le|tonumber), errors:($lerr|tonumber), retry:$lr}, adopted:$ad, adopt_ambiguous:$aa, prefer_type:$pt, held:(if $hk == "" then null else {lead:$hl, kickoff:$hk, goals:($hg|tonumber)} end)}' \
       --arg hk "$_COMPOSE_KICKOFF" --arg hl "$_hold_lead" --arg hg "$_held_goals" \
       --argjson ad "$(printf '%s\n' "${_adopted_names[@]+"${_adopted_names[@]}"}" | jq -R 'select(length>0)' | jq -sc \
           --argjson m "$_seat_applied" --argjson spec "$spec" \
           --argjson sh "$(printf '%s\n' "${_shared_names[@]+"${_shared_names[@]}"}" | jq -R 'select(length>0)' | jq -sc .)" \
           'map(. as $n | {agent: $n, seat: (($m | to_entries | map(select(.value == $n)) | .[0].key) // $n), role: ($spec.agents[$n].role // null), pack: ($spec.agents[$n].pack // null), shared: ($sh | index($n) != null)})')" \
       --argjson aa "${COMPOSE_SEAT_AMBIGUOUS:-[]}" \
+      --argjson pt "$( { printf '%s\n' "${_prefer_moved[@]+"${_prefer_moved[@]}"}" | jq -R 'select(length>0)'
+                        printf '%s\n' "${_prefer_missed[@]+"${_prefer_missed[@]}"}" | jq -R 'select(length>0)'; } \
+          | jq -sc --argjson spec "$spec" 'map(. as $n | $spec.agents[$n] as $a | {agent: $n, type: $a.prefer_type, on: ($a.type // "claude"),
+                account: (if $a.prefer_applied then $a.auth_profile else null end)})')" \
       --arg f "$file" --arg c "$created" --arg s "$started" --arg k "$skipped" --arg e "$errors" \
       --argjson a "$(printf '%s\n' "${_asleep[@]+"${_asleep[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')" \
       --arg sf "${#_degraded[@]}" \
@@ -2148,6 +2264,24 @@ HELP
       echo "── agent(s) created WITHOUT a channel (no bot token was set): $_no_channel_names"
       for _n in $_no_channel_names; do
         echo "     sudo 5dive agent config $_n set telegram.token=<bot-token> && sudo 5dive agent config $_n set channels=telegram"
+      done
+    fi
+    # DIVE-7080: a seat that could not take the harness its job needs says what
+    # it cannot do and the one line that fixes it, in words an owner reads.
+    if (( ${#_prefer_moved[@]} > 0 )); then
+      echo ""
+      for _n in "${_prefer_moved[@]}"; do
+        echo "── $_n runs on $(_compose_prefer_label "$(jq -r --arg n "$_n" '.agents[$n].prefer_type' <<<"$spec")") (account '$(jq -r --arg n "$_n" '.agents[$n].auth_profile' <<<"$spec")'), as this team asks."
+      done
+    fi
+    if (( ${#_prefer_missed[@]} > 0 )); then
+      local _pt _why
+      for _n in "${_prefer_missed[@]}"; do
+        _pt=$(jq -r --arg n "$_n" '.agents[$n].prefer_type' <<<"$spec")
+        echo ""
+        _why=$(jq -r --arg n "$_n" '.agents[$n].prefer_why // empty' <<<"$spec")
+        echo "── $_n needs $(_compose_prefer_label "$_pt")${_why:+ for ${_why}}, and this box is not signed in to it. One line turns it on:"
+        echo "     $(_compose_prefer_hint "$_n" "$_pt")"
       done
     fi
     # DIVE-4022 — same "say it last" rule for a loop that did not install. It is
