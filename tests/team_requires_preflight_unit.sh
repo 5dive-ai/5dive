@@ -43,7 +43,7 @@ command -v python3 >/dev/null && python3 -c 'import yaml' 2>/dev/null || {
 
 # ---- load the units under test, without the rest of the CLI -----------------
 awk '/^_compose_parse\(\)/{f=1} f{print} f&&/^PY$/{p=1} p&&/^}$/{exit}' "$SRC" > "$TMP/parse.sh"
-for fn in _team_capability_label _team_capability_degraded _team_capability_present _compose_requires_preflight _compose_spec_pins_auth_profile; do
+for fn in _team_capability_label _team_capability_degraded _team_capability_present _compose_requires_preflight; do
   sed -n "/^${fn}()/,/^}/p" "$SRC" >> "$TMP/req.sh"
 done
 bash -n "$TMP/parse.sh" && bash -n "$TMP/req.sh" \
@@ -236,33 +236,9 @@ grep -qi 'does not merge unseen' <<<"$cto" \
   && ok_t 'T14 the CTO seat carries the user-facing-surface ship gate' \
   || bad_t 'T14 the CTO prompt does not carry the ship gate' ''
 
-# DIVE-4103: `--auth-profile=` must not pass silently on a template that pins no
-# account. Functional where it can be: the guard is a grep over the spec FILE, so
-# the arm runs that same predicate over both shapes and requires it to separate
-# them. A guard that answers the same for both is inert.
-# Driven through the PRODUCTION predicate extracted above, not a copy of it:
-# these arms previously re-declared the same sed|grep and stayed 31/31 green
-# while the real line in cmd_compose.sh was mutated to a naked grep — which is a
-# live regression, because deploy-team.5dive.yaml explains ${TEAM_AUTH_PROFILE}
-# in a COMMENT, so a naked grep reads this very template as pinned and suppresses
-# the warning the guard exists for. (quinn, DIVE-4103 iteration 1.)
-pins() { ( set -uo pipefail; . "$TMP/req.sh"; _compose_spec_pins_auth_profile "$1" ); }
-( . "$TMP/req.sh"; declare -F _compose_spec_pins_auth_profile >/dev/null ) \
-  && ok_t 'T16e the production auth-profile predicate was extracted — T16/T16n are not grading a missing function' \
-  || bad_t 'T16e _compose_spec_pins_auth_profile was not extracted from the source; T16/T16n are vacuous' ''
-
-if pins "$ROOT/tests/fixtures/team-templates/eng-studio.5dive.yaml" && ! pins "$TPL"; then
-  ok_t 'T16 the inert-flag guard separates a template that pins an account from one that does not'
-else
-  bad_t 'T16 the --auth-profile guard cannot distinguish the two template shapes' "eng=$(pins "$ROOT/tests/fixtures/team-templates/eng-studio.5dive.yaml" && echo yes || echo no) deploy=$(pins "$TPL" && echo yes || echo no)"
-fi
-printf 'version: "2"\n# mentions ${TEAM_AUTH_PROFILE} only in a comment\nagents:\n  a:\n    type: claude\n' > "$TMP/comment-only.yaml"
-pins "$TMP/comment-only.yaml" \
-  && bad_t 'T16n a spec that names the var ONLY in a comment reads as pinned — the warning would be suppressed on exactly the template that needs it' '' \
-  || ok_t 'T16n negative control — a comment mentioning the var does not count as a pin'
-grep -q 'has no effect on this template' "$SRC" \
-  && ok_t 'T16a `team import --auth-profile=` warns rather than passing silently (source-level arm)' \
-  || bad_t 'T16a no warning on an inert --auth-profile' ''
+# T16/T16a/T16e/T16n retired by DIVE-7074: `team import --auth-profile=` now puts
+# every seat that names no account on that account (tests/team_import_auth_profile_unit.sh),
+# so there is no inert flag left to warn about.
 # The flagless import must not be a hard error: an unset ${VAR} in a spec is
 # fatal by design, so a one-tap template must reference none.
 env -u TEAM_AUTH_PROFILE -u TEAM_TG_TOKEN bash -c ':' 2>/dev/null

@@ -6,8 +6,8 @@
 # with `defer_auth: true` and you sign each in afterwards. That is what keeps a
 # one-tap import from the dashboard possible, where there is no shell to export
 # a profile in — an `auth_profile: "${TEAM_AUTH_PROFILE}"` default would make
-# the flagless import a hard error. `team import --auth-profile=` therefore has
-# nothing to bind here and SAYS so rather than passing silently.
+# the flagless import a hard error. `team import --auth-profile=<account>` still
+# puts every seat on that account (DIVE-7074).
 #
 # This is our own engineering subtree (`5dive org tree`), not an invented roster:
 # CTO -> Ops -> Engineer + Verifier, the same four packs the `5dive-team`

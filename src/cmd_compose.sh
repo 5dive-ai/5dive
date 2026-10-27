@@ -896,17 +896,24 @@ _team_capability_degraded() {
 # hang an import on a box with no route out. It answers "does this box hold a
 # credential", not "does that credential carry push on your repo" — a scope read
 # needs a repo we have not been given and a network call we just refused to make.
-# Does this spec actually PIN an account, i.e. would --auth-profile= change what
-# gets provisioned? Comment lines are stripped first: this template EXPLAINS in
-# its header why it pins no account, and a naked grep read that explanation as
-# the pin.
-#
-# Named rather than inlined at the call site so the suite can drive THIS
-# predicate. Its arms previously re-declared the same sed|grep and stayed green
-# while the production line was mutated to a naked grep (quinn, DIVE-4103
-# iteration 1) — a copy of a line is not a test of it.
-_compose_spec_pins_auth_profile() {
-  sed 's/[[:space:]]*#.*$//' "$1" 2>/dev/null | grep -q 'TEAM_AUTH_PROFILE'
+# DIVE-7074: `--auth-profile=<p>` on `up` / `team import` is the owner's
+# account for the roster. A seat whose spec names no account goes on <p>; a seat
+# that names its own keeps it, and a BYO-key seat (provider/api_key/base_url)
+# keeps its own key. Before this, the flag only filled `${TEAM_AUTH_PROFILE}`,
+# which no marketplace template references, so on a box with two Claude logins
+# every seat came up signed out on its own empty profile (the Dropshipping trial,
+# DIVE-6902: `agent config <seat> set auth-profile=mp`, 12 times by hand).
+# `agent create` then uses the account at once when it is signed in, even under
+# the template's defer_auth (DIVE-7028).
+_compose_apply_auth_profile() {
+  local spec="$1" p="$2"
+  jq --arg p "$p" '
+    .agents |= map_values(
+      if ((.auth_profile // "") != "") or ((.provider // "") != "")
+         or ((.api_key // "") != "") or ((.base_url // "") != "")
+      then . else .auth_profile = $p end
+    )
+  ' <<<"$spec"
 }
 
 # rc contract: 0 = present · 1 = absent · 2 = THIS CLI HAS NO PROBE for the key.
@@ -1667,13 +1674,16 @@ _compose_browser_mode() {
 }
 
 cmd_compose_up() {
-  local file="" type_override="" name_prefix="" start_now=0 _COMPOSE_LANG=""
+  local file="" type_override="" name_prefix="" start_now=0 _COMPOSE_LANG="" auth_profile=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--file)    file="$2"; shift ;;
       --file=*)     file="${1#--file=}" ;;
       --type=*)     type_override="${1#--type=}" ;;
       --type)       type_override="$2"; shift ;;
+      # DIVE-7074: the account for every seat that names none.
+      --auth-profile=*) auth_profile="${1#--auth-profile=}" ;;
+      --auth-profile)   auth_profile="$2"; shift ;;
       # DIVE-4822: the roster's namespace. `up` owns APPLYING it; `team import`
       # owns CHOOSING it (that is where the template slug lives, and the slug is
       # the default). Omit it and nothing changes -- the same posture --type takes.
@@ -1686,8 +1696,8 @@ cmd_compose_up() {
       --lang)       _COMPOSE_LANG="$2"; shift ;;
       -h|--help)
         cat >&2 <<HELP
-usage: 5dive up [-f file] [--type=<harness>] [--prefix=<p>] [--start-now]
-                [--lang=ru|en|zh]
+usage: 5dive up [-f file] [--type=<harness>] [--auth-profile=<account>]
+                [--prefix=<p>] [--start-now] [--lang=ru|en|zh]
   Bring up agents declared in 5dive.yaml. Idempotent — existing agents are
   left alone, missing ones are created and started.
   Default file: 5dive.yaml or 5dive.yml in the current directory.
@@ -1712,6 +1722,11 @@ usage: 5dive up [-f file] [--type=<harness>] [--prefix=<p>] [--start-now]
                     spec's type:/defaults.type:. Known: ${!TYPE_BIN[*]}.
                     Claude-only model/effort pins are dropped when the target
                     is not claude. Omit the flag and nothing changes.
+
+  --auth-profile=<account>
+                    Sign every seat that names no account of its own in on this
+                    account (see: 5dive account list). A seat with its own
+                    auth_profile: or its own API key keeps it.
 HELP
         return 0 ;;
       *) fail "$E_USAGE" "unknown flag: $1" ;;
@@ -1727,6 +1742,10 @@ HELP
   if [[ -n "$type_override" ]]; then
     is_known_type "$type_override" \
       || fail "$E_NOT_FOUND" "unknown --type: $type_override (known: ${!TYPE_BIN[*]})"
+  fi
+  if [[ -n "$auth_profile" ]]; then
+    valid_profile_name "$auth_profile" \
+      || fail "$E_VALIDATION" "invalid --auth-profile '$auth_profile' (lowercase letters/digits/_-, start letter, <=32 chars)"
   fi
   # DIVE-4822: the prefix's own shape, checked before the spec is read. The
   # per-name LENGTH check needs the roster and happens after the parse.
@@ -1752,6 +1771,11 @@ HELP
     if [[ -n "$_pins" ]]; then
       warn "dropped Claude-only model/effort pins (not valid on '$type_override'): $_pins — the harness default applies; set one later with: 5dive agent config <name> set model=<id>"
     fi
+  fi
+  if [[ -n "$auth_profile" ]]; then
+    spec=$(_compose_apply_auth_profile "$spec" "$auth_profile") \
+      || fail "$E_VALIDATION" "could not apply --auth-profile=$auth_profile to the spec"
+    step "account: every seat that names none signs in on '$auth_profile'"
   fi
   # DIVE-6088: all pack links answer, or nothing is created. `team import` has
   # already checked them before its own first write, and says so.
@@ -2571,6 +2595,9 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
   ${STATE_DIR:-/var/lib/5dive}/teams/<slug>.5dive.yaml, every role is told that path, and
   'team ps' prints it. Edit it there to change policy (e.g. channel tiers).
 
+  --auth-profile=<account>  Sign every seat in on this account (5dive account
+                    list), on a box with one Claude login or several. A seat
+                    the template gives its own account or API key keeps it.
   --type=<harness>  Create the whole roster on this harness instead of the
                     template's own (every bundled template says claude).
                     Known: ${!TYPE_BIN[*]}.
@@ -3232,19 +3259,10 @@ HELP
   # wired, which is worse than not importing at all.
   _team_assert_schema "$file" "$ref"
 
-  # --auth-profile overrides the template's ${TEAM_AUTH_PROFILE} default.
-  #
-  # DIVE-4103: a template that never references the var takes nothing from the
-  # flag, and passing it read as "the roster is on that account" when the seats
-  # were in fact created unpinned. A silently inert flag on a verb you run once
-  # per company is an account you think you chose — same rule as `--pr-title`
-  # without `--open-pr` in `5dive push`. Warn rather than refuse: the import is
-  # correct, only the caller's belief about it was not.
-  if [[ -n "$profile" ]]; then
-    export TEAM_AUTH_PROFILE="$profile"
-    _compose_spec_pins_auth_profile "$file" || warn \
-      "--auth-profile=$profile has no effect on this template — it does not pin an account (its seats come up with deferred auth, which is what lets a flagless one-tap import work). The roster still comes up; sign each seat in afterwards with: 5dive agent auth <name>"
-  fi
+  # --auth-profile fills the template's ${TEAM_AUTH_PROFILE}, and `up` puts every
+  # seat that names no account on it (DIVE-7074). It used to do only the first,
+  # and warned that it had no effect on a template that references no var.
+  [[ -n "$profile" ]] && export TEAM_AUTH_PROFILE="$profile"
 
   # The lead's optional channel. Curated templates read it as ${TEAM_TG_TOKEN}
   # — ONE token for the whole company (a customer talks to the lead; the rest of
@@ -3399,6 +3417,7 @@ HELP
   step "importing team from $file"
   local -a _up_args=(-f "$file")
   [[ -n "$type_override" ]] && _up_args+=("--type=$type_override")
+  [[ -n "$profile"       ]] && _up_args+=("--auth-profile=$profile")
   [[ -n "$name_prefix"   ]] && _up_args+=("--prefix=$name_prefix")
   (( start_now )) && _up_args+=(--start-now)
   [[ -n "$lang"          ]] && _up_args+=("--lang=$lang")
