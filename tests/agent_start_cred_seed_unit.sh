@@ -288,6 +288,72 @@ if [[ $EUID -ne 0 ]]; then
   chmod 0644 "$OC_SHARED"
 fi
 
+# ---------- openclaw 2026.10.x: the key is in the state db (DIVE-7101) ----------
+# On 2026.10.7 the legacy store above never exists: the key is a row of
+# ~/.openclaw/state/openclaw.sqlite. The boot seed has to carry that row, and a
+# seat left with no key in EITHER layout must leave the breadcrumb that turns
+# `agent list` and `auth status --agent` from ok to degraded/stale. Before this,
+# the absent case printed one journal line and left no breadcrumb at all.
+oc_state() { # <db> <with-key 0|1> — openclaw's config_machine_state, WAL
+  mkdir -p "$(dirname "$1")"
+  python3 -I - "$1" "$2" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1]); c.execute("PRAGMA journal_mode=WAL")
+c.execute("CREATE TABLE config_machine_state (state_key TEXT NOT NULL PRIMARY KEY, value_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL) STRICT")
+c.execute("INSERT INTO config_machine_state VALUES ('config.lastTouchedAt', '\"x\"', 1)")
+if sys.argv[2] == "1":
+    c.execute("INSERT INTO config_machine_state VALUES ('authProfiles.store', '{\"version\":1,\"profiles\":{\"openrouter:manual\":{\"type\":\"api_key\",\"provider\":\"openrouter\",\"key\":\"sk-or-test-7101\"}}}', 3)")
+c.commit(); c.close()
+PY
+}
+oc_has_key() { python3 -I -c 'import sqlite3,sys; r=sqlite3.connect(sys.argv[1]).execute("SELECT value_json FROM config_machine_state WHERE state_key=?",("authProfiles.store",)).fetchone(); print("yes" if r and "openrouter:manual" in r[0] else "no")' "$1" 2>/dev/null || echo no; }
+
+P7101="$TMP/profile-oc7101"
+oc_state "$P7101/.openclaw/state/openclaw.sqlite" 1
+H7101="$TMP/home-oc7101"; mkdir -p "$H7101"
+out=$(run_block "$OC_BLOCK" TYPE=openclaw HOME="$H7101" NAME=theo PROFILE=theo-or \
+        PROFILE_STATE_DIR="$P7101" WORKDIR="$TMP")
+check "openclaw 2026.10.x: the state-db key reaches the seat with sudo unavailable" \
+      "$(oc_has_key "$H7101/.openclaw/state/openclaw.sqlite")" "yes"
+check "openclaw 2026.10.x: a carried key leaves no breadcrumb" \
+      "$( [[ -e "$H7101/.5dive-cred-seed-failed" ]] && echo present || echo absent )" "absent"
+check "openclaw 2026.10.x: no misleading legacy-path 'boot unauthenticated' line" \
+      "$(grep -c 'will boot unauthenticated' <<<"$out")" "0"
+
+# A second boot over the seat's own (now live) db re-carries without clobbering.
+out=$(run_block "$OC_BLOCK" TYPE=openclaw HOME="$H7101" NAME=theo PROFILE=theo-or \
+        PROFILE_STATE_DIR="$P7101" WORKDIR="$TMP")
+check "openclaw 2026.10.x: a re-boot over a live seat db keeps the key" \
+      "$(oc_has_key "$H7101/.openclaw/state/openclaw.sqlite")" "yes"
+
+# The account holds no key (openclaw ran there, nobody pasted one): not ok.
+P7101N="$TMP/profile-oc7101-nokey"
+oc_state "$P7101N/.openclaw/state/openclaw.sqlite" 0
+H7101N="$TMP/home-oc7101-nokey"; mkdir -p "$H7101N"
+out=$(run_block "$OC_BLOCK" TYPE=openclaw HOME="$H7101N" NAME=theo PROFILE=theo-or \
+        PROFILE_STATE_DIR="$P7101N" WORKDIR="$TMP")
+has "$(cat "$H7101N/.5dive-cred-seed-failed" 2>/dev/null)" "has no API key: its account holds none" \
+    "openclaw: a seat whose account holds no key leaves the breadcrumb (was: silent, read ok)"
+
+# No key anywhere at all (fresh account dir, nothing written): the same verdict.
+H7101E="$TMP/home-oc7101-empty"; mkdir -p "$H7101E" "$TMP/profile-oc7101-empty"
+out=$(run_block "$OC_BLOCK" TYPE=openclaw HOME="$H7101E" NAME=theo \
+        PROFILE_STATE_DIR="$TMP/profile-oc7101-empty" WORKDIR="$TMP")
+has "$(cat "$H7101E/.5dive-cred-seed-failed" 2>/dev/null)" "has no API key" \
+    "openclaw: no key in any layout leaves the breadcrumb"
+
+if [[ $EUID -ne 0 ]]; then
+  chmod 0000 "$P7101/.openclaw/state/openclaw.sqlite"
+  H7101U="$TMP/home-oc7101-unread"; mkdir -p "$H7101U"
+  out=$(run_block "$OC_BLOCK" TYPE=openclaw HOME="$H7101U" NAME=theo PROFILE=theo-or \
+          PROFILE_STATE_DIR="$P7101" WORKDIR="$TMP")
+  has "$(cat "$H7101U/.5dive-cred-seed-failed" 2>/dev/null)" "is not readable by" \
+      "openclaw: an unreadable account key store is named as a perms fault, with the root fix"
+  has "$(cat "$H7101U/.5dive-cred-seed-failed" 2>/dev/null)" "sudo 5dive agent restart theo" \
+      "openclaw: the breadcrumb names the command that pushes the key in as root"
+  chmod 0644 "$P7101/.openclaw/state/openclaw.sqlite"
+fi
+
 # ---------- guard: no seed block may be sudo-ONLY again ----------
 # Every credential seed must attempt a plain read before falling back to sudo.
 # Catches a future block (or a revert) that reintroduces the DIVE-1900 shape.

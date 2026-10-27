@@ -23,6 +23,21 @@ normalize_restart_profile_perms() {
   return 0
 }
 
+# DIVE-7101: restart is the documented heal, and on openclaw 2026.10.x the key
+# lives in the account's state db, which a standard seat cannot read. The boot
+# seed then leaves the seat with no key, so push it in as root before the unit
+# comes back (seed_openclaw_state_into_seat, cmd_agent_create.sh). Always 0.
+restart_push_openclaw_state() {
+  local name="$1" reg
+  [[ $EUID -eq 0 ]] || return 0
+  declare -F seed_openclaw_state_into_seat >/dev/null 2>&1 || return 0
+  reg=$(registry_read 2>/dev/null) || return 0
+  [[ "$(jq -r --arg n "$name" '.agents[$n].type // empty' <<<"$reg" 2>/dev/null)" == openclaw ]] || return 0
+  seed_openclaw_state_into_seat "$name" \
+    "$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$reg" 2>/dev/null)" || true
+  return 0
+}
+
 cmd_restart() {
   local name="" defer=0
   while [[ $# -gt 0 ]]; do
@@ -44,6 +59,7 @@ cmd_restart() {
   # here, right before the unit comes back up. Guarded + always-0 so a restart
   # never fails on a perms hiccup.
   normalize_restart_profile_perms "$name"
+  restart_push_openclaw_state "$name"
   if (( defer )); then
     # DIVE-1002: CLI-mediated deferred restart. `sudo 5dive` already runs as
     # root, so the CLI fires systemd-run internally — an (scoped-)admin agent

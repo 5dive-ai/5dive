@@ -412,6 +412,11 @@ cmd_config() {
     if (( profile_dirty )); then
       step "Re-pointing ${ENV_DIR}/${name}-auth.env"
       link_agent_profile "$name" "$new_profile"
+      # DIVE-7101: the restart below boots the seat as itself, and it cannot
+      # read the new account's openclaw key store; push the key in as root.
+      if [[ "$type" == openclaw ]] && declare -F seed_openclaw_state_into_seat >/dev/null 2>&1; then
+        seed_openclaw_state_into_seat "$name" "$new_profile" || true
+      fi
     fi
   fi
   # DIVE-345: removing the channel must strip the stale telegram wiring left on
@@ -471,9 +476,20 @@ cmd_config() {
       step "Writing ${CONNECTORS_DIR}/telegram-${name}.env"
       write_channel_secret telegram "$name" TELEGRAM_BOT_TOKEN "$new_telegram_token"
     fi
+    # DIVE-7101: a bot attached AFTER the hire inherits the box's known
+    # operator id(s), as `agent create` already does, so the owner's first DM
+    # is answered instead of met with a pairing code. First attach only: on an
+    # openclaw seat this write replaces the allowlist, and a rotation must not
+    # drop ids someone added since.
+    local allowed_for_install="$new_allowed_users"
+    if [[ -z "$allowed_for_install" && -n "$new_telegram_token" ]] \
+       && ! channel_in_list telegram "$prev_channels" && declare -F _operator_ids >/dev/null 2>&1; then
+      allowed_for_install=$(_operator_ids)
+      [[ -z "$allowed_for_install" ]] || step "Auto-pairing '$name' to known operator(s): $allowed_for_install"
+    fi
     step "Installing telegram channel for agent '$name' (type=$type)"
     _config_install_channel "$prev_channels" "$type" telegram "$name" \
-      "$token_for_install" "$new_home_channel" "$new_allowed_users"
+      "$token_for_install" "$new_home_channel" "$allowed_for_install"
     # DIVE-6701: a bot attached after the hire answers to the card name too.
     _tg_call_names_seed "$name" "$type" >/dev/null 2>&1 || true
     # DIVE-4413: install_channel_for_agent hands home_channel to the hermes and
