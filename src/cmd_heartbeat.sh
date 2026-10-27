@@ -7249,6 +7249,13 @@ _hb_gate_expire_sweep() {
   return 0
 }
 
+# DIVE-7120 — the merge tick lives in the devteam plugin with the merge rail it
+# reuses; the heartbeat only calls it, and a box without the plugin skips it.
+_hb_merge_tick_sweep() {
+  declare -F _merge_tick_sweep >/dev/null 2>&1 || return 0
+  _merge_tick_sweep
+}
+
 _hb_forge_merge_sweep() {
   [[ "$_HB_FORGE_MERGE_POLL" == "on" || "$_HB_FORGE_MERGE_POLL" == "1" ]] || return 0
   # The probe and the recorder live in src/task/delivery.sh, later in the bundle.
@@ -10142,6 +10149,12 @@ cmd_heartbeat_tick() {
   # the board cannot see until somebody looks. Same isolation contract as every
   # other sweep — a failure here must never abort the wake loop, and its failure
   # direction is already the safe one: it can miss a landing, never invent one.
+  # DIVE-7120: MERGE what needs no judgement before polling for landings — a
+  # graded row whose pull request is green and clean at the graded sha merges
+  # here with no seat turn, and a conflict or a red required check goes back to
+  # the maker. The pass is the devteam plugin's (_merge_tick_sweep); without it
+  # this is a no-op. Same isolation contract as every other sweep.
+  _hb_merge_tick_sweep || _hb_log "[merge-tick] pass errored (non-fatal)"
   _hb_forge_merge_sweep || _hb_log "[forge-merge] pass errored (non-fatal)"
   # CNCL-12: rot-triage stale tier-2 gates via a council convene (re-brief only,
   # NEVER clears). Default OFF (COUNCIL_ROT_TRIAGE=on) — a live convene injects into
