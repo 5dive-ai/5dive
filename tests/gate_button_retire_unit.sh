@@ -547,8 +547,20 @@ SENDS="$TMP/sends.log"; : >"$SENDS"
 # a log whose records are MULTI-LINE is measuring a unit the feature does not have.
 source "$SRC/cmd_agent_runtime.sh"
 mkdir -p "$TMP/bin"
+#
+# A FIELD READ FROM A FILE IS STILL ON THE WIRE (DIVE-7134). Since DIVE-7128
+# _mirror_send hands curl the text and keyboard as `name@<0600 file>`, so argv says
+# `reply_markup@/tmp/…` and the keyboard arm counted 0 while all 3 were sent. The
+# stub resolves `name@file` to `name=<contents>` the way curl's --data-urlencode
+# does, so the log keeps recording what goes on the wire, not where it was staged.
 cat >"$TMP/bin/curl" <<'CURLSTUB'
 #!/usr/bin/env bash
+out=()
+for a in "$@"; do
+  if [[ "$a" =~ ^([a-z_]+)@(/.+)$ && -f "${BASH_REMATCH[2]}" ]]; then a="${BASH_REMATCH[1]}=$(<"${BASH_REMATCH[2]}")"; fi
+  out+=("$a")
+done
+set -- "${out[@]}"
 printf '%s\n' "${*//$'\n'/ }" >>"$SENDS"
 printf '%s' '{"ok":true,"result":{"message_id":15491}}'
 CURLSTUB
