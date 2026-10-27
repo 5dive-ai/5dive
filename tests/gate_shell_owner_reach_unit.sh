@@ -17,6 +17,10 @@
 #   N1-N2  the SAME command from an agent seat, and from root in a non-login
 #          service context, is refused and the gate stays open (the floor holds).
 #   S1     a secret gate's hint is the hidden-prompt `secret write --task=` path.
+#   Q1-Q2  agent-written text cannot run as root or reach the owner's terminal raw:
+#          an option with $(...), backticks and both quotes prints as one quoted
+#          word that a real shell hands to 5dive literally, running nothing; an
+#          ask carrying ESC/BEL comes out of --login with no control bytes.
 # L1 and R1 are red on the pre-fix tree (no --login; "tap the button in Telegram").
 #
 # Seams only what cannot be reassigned in-process, as the sibling gate harnesses
@@ -181,6 +185,41 @@ out=$(cmd_task_inbox --login 2>&1)
 [[ "$out" == *"answer: sudo 5dive secret write SHOPIFY_TOKEN --connector=tools --task=DIVE-2"* ]] \
   && ok_t "S1 a secret gate's login line is the hidden-prompt secret write" \
   || bad_t "S1 secret hint" "out=$out"
+
+# ── Q: agent-written text stays text ────────────────────────────────────────
+# A real shell runs the printed command with sudo and 5dive stubbed on PATH:
+# 5dive writes each argument it got, one per NUL, so the check is byte-exact.
+STUB="$TMP/stub"; mkdir -p "$STUB"
+printf '#!/usr/bin/env bash\nexec "$@"\n' > "$STUB/sudo"
+printf '#!/usr/bin/env bash\nprintf "%%s\\0" "$@" > "%s/args"\n' "$TMP" > "$STUB/5dive"
+chmod +x "$STUB/sudo" "$STUB/5dive"
+# Bare file names (the ask lint refuses a path in --options); the command runs in RUN.
+RUN="$TMP/run"; mkdir -p "$RUN"
+HOSTILE="go \$(touch q-sub) \`touch q-tick\` \"dq\" 'sq'"
+seed_task DIVE-3
+cmd_task_need DIVE-3 --type=decision --tier=2 --needs=human_tap --ask="Pick one" \
+  --options="$HOSTILE|stop" --from=fixture >"$TMP/need3" 2>&1
+out=$(cmd_task_inbox --login 2>&1)
+line=$(printf '%s\n' "$out" | grep -A1 '  DIVE-3  ' | sed -n 's/^  answer: //p')
+rm -f "$TMP/args"
+if [[ -n "$line" ]] && bash -n <<<"$line" 2>/dev/null; then
+  (cd "$RUN" && PATH="$STUB:$PATH" bash -c "$line") >/dev/null 2>&1
+  got=(); mapfile -d '' got < "$TMP/args" 2>/dev/null
+  exact=0; for a in "${got[@]}"; do [[ "$a" == "--value=$HOSTILE" ]] && exact=1; done
+  [[ $exact == 1 && ! -e "$RUN/q-sub" && ! -e "$RUN/q-tick" ]] \
+    && ok_t "Q1 a hostile option prints as one quoted word: 5dive gets it literally, nothing runs" \
+    || bad_t "Q1 hostile option" "line=$line got=${got[*]-} sub=$([[ -e $RUN/q-sub ]] && echo RAN) tick=$([[ -e $RUN/q-tick ]] && echo RAN)"
+else
+  bad_t "Q1 hostile option" "no parseable answer line for DIVE-3: out=$out need=$(cat "$TMP/need3")"
+fi
+
+seed_task DIVE-4
+cmd_task_need DIVE-4 --type=manual --ask=$'Robot check \e]0;owned\a\e[2J done' --from=fixture >/dev/null 2>&1
+out=$(cmd_task_inbox --login 2>&1)
+[[ "$out" == *"DIVE-4"* && "$out" == *"Robot check"* ]] \
+  && ! LC_ALL=C grep -q $'[\x01-\x08\x0b-\x1f\x7f]' <<<"$out" \
+  && ok_t "Q2 an ask carrying ESC/BEL reaches the login notice with no control bytes" \
+  || bad_t "Q2 control bytes" "out=$(printf '%s' "$out" | cat -v)"
 
 SUMMARY_PRINTED=1
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

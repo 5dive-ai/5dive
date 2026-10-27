@@ -360,15 +360,30 @@ _task_owner_has_surface() {
   [[ -e "$(_sp_connectord_env)" ]]
 }
 
-# The one command that answers <task id> from a login shell on this box.
+# Agent-written text printed to the owner's terminal, with the control bytes (C0
+# and DEL) dropped: an ask or option carrying ESC/BEL could retitle or clear it.
+_gate_plain() { printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177'; }
+
+# One shell word the owner can paste as root: as is when it holds only safe
+# characters, else single-quoted, so no $(...), backtick or quote in it runs.
+_gate_shell_word() { # <text>
+  local v q="'\\''"; v=$(_gate_plain "$1")
+  if [[ "$v" =~ ^[A-Za-z0-9_./:=@%+,-]+$ ]]; then printf '%s' "$v"
+  else printf "'%s'" "${v//"'"/"$q"}"; fi
+}
+
+# The one command that answers <task id> from a login shell on this box. Every
+# value comes from the row, which an agent wrote, so each one is a quoted word.
 _gate_shell_answer_cmd() { # <task id>
   local row ident nt opts key conn rec
   row=$(db "SELECT ident||x'1f'||COALESCE(need_type,'')||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'')||x'1f'||replace(COALESCE(recommend,''),x'0a',' ') FROM tasks WHERE id=$1;" 2>/dev/null) || row=""
   IFS=$'\x1f' read -r ident nt opts key conn rec <<<"$row"
   [[ -n "$ident" ]] || ident="$1"
+  ident=$(_gate_shell_word "$ident")
   case "$nt" in
     # Asks for the value at a hidden prompt, saves it, and clears the gate.
-    secret)  printf 'sudo 5dive secret write %s --connector=%s --task=%s' "${key:-<KEY>}" "${conn:-tools}" "$ident" ;;
+    secret)  printf 'sudo 5dive secret write %s --connector=%s --task=%s' \
+               "$(_gate_shell_word "${key:-<KEY>}")" "$(_gate_shell_word "${conn:-tools}")" "$ident" ;;
     approval|access) printf 'sudo 5dive task answer %s --value=approve --human  (or --value=deny)' "$ident" ;;
     # Not "done": on a manual gate that closes the whole row (DIVE-909), and the
     # agent waiting on it wants its row back, not closed.
@@ -377,7 +392,8 @@ _gate_shell_answer_cmd() { # <task id>
     # Telegram buttons split it), else a placeholder for a free-text answer.
     *)       local v="${rec:-${opts%%|*}}"
              v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
-             printf 'sudo 5dive task answer %s --value="%s" --human' "$ident" "${v:-<your answer>}" ;;
+             v=$(_gate_plain "$v")
+             printf 'sudo 5dive task answer %s --value=%s --human' "$ident" "$(_gate_shell_word "${v:-<your answer>}")" ;;
   esac
 }
 
@@ -404,6 +420,7 @@ _task_inbox_login() { # <where> <order>
   local id ident ask
   while IFS=$'\x1f' read -r id ident ask; do
     [[ -n "$id" ]] || continue
+    ask=$(_gate_plain "$ask"); ident=$(_gate_plain "$ident")
     (( ${#ask} > 100 )) && ask="${ask:0:97}..."
     printf '\n  %s  %s\n  answer: %s\n' "$ident" "$ask" "$(_gate_shell_answer_cmd "$id")"
   done < <(db "SELECT id||x'1f'||ident||x'1f'||replace(replace(COALESCE(ask,''),x'0a',' '),x'1f',' ') FROM tasks WHERE $1 $2 LIMIT 5;" 2>/dev/null)
