@@ -1717,8 +1717,10 @@ _task_mint_drop_link() {
     me=$(id -un 2>/dev/null)
     tier=$(agent_tier "${me#agent-}" 2>/dev/null)
     if [[ "$me" != agent-* || "$tier" != admin ]]; then
-      # Not a failure: a standard seat's alert carries the app button instead.
-      _task_drop_link_log none "$ident" "seat ${me:-?} (tier ${tier:-?}) cannot mint; the alert sends the owner to the app"
+      # Not a failure: a standard seat's link is minted and sent by the root side
+      # (DIVE-7128, _task_secret_send_via_root); reaching here means that path
+      # was not taken, so this alert falls back to the app card or the server line.
+      _task_drop_link_log none "$ident" "seat ${me:-?} (tier ${tier:-?}) cannot mint here; the alert falls back to the app card or the server line"
       rm -f "$errf" 2>/dev/null; return 0
     fi
     # A sandboxed agent shell runs with no_new_privs, and sudo cannot run there
@@ -1769,6 +1771,113 @@ _task_drop_link_log() {
   return 0
 }
 
+# DIVE-7128: A STANDARD SEAT'S KEY ASK CARRIES THE LINK, AND THE SEAT NEVER SEES IT.
+# A standard seat cannot mint (_task_mint_drop_link above), so its alert used to
+# send the owner to the app, and an OSS box has no app: the owner got a `sudo`
+# line they cannot run (lodar on poke-two, DIVE-7127). The link is the right to
+# write one key into a root-owned connector file, so it must not reach the seat:
+# not its stdout, its env, its logs, a file it can read, or a process argv it can
+# list. So the whole first alert is rendered, minted and SENT on the root side,
+# through one exact-path grant, and only "sent" comes back.
+#
+# _task_secret_send_via_root <ident> <nonce> — the seat half. rc 0 when root
+# delivered the alert (TASK_SEND_* and TASK_GATE_DROP_LINK_TTL are set from its
+# one-line answer); rc 1 when this path is not taken or failed, and the caller
+# sends its own alert exactly as before (the app card or the server line).
+_task_secret_send_via_root() {
+  local ident="$1" nonce="${2:-}" me tier out errf rc=0
+  _gate_is_root && return 1
+  # Root's own retries (gate-escalate, the DIVE-6760 notifier retry) mint there.
+  [[ -z "${TASK_GATE_ESCALATING:-}" && -z "${TASK_GATE_NOT_VIA:-}" ]] || return 1
+  # Root reads the box's own store. A fixture or dry-run store here would have
+  # root send a real gate that happens to share this ident, so never cross.
+  _task_human_send_allowed 2>/dev/null || return 1
+  [[ -z "${FIVEDIVE_NOTIFY_DRYRUN:-}" || "${FIVEDIVE_NOTIFY_DRYRUN}" == "0" ]] || return 1
+  me=$(id -un 2>/dev/null)
+  [[ "$me" == agent-* ]] || return 1
+  tier=$(agent_tier "${me#agent-}" 2>/dev/null)
+  [[ "$tier" != admin ]] || return 1   # an admin seat mints for itself
+  grep -qE '^NoNewPrivs:[[:space:]]*1' /proc/self/status 2>/dev/null && return 1
+  if ! sudo -n -l /usr/local/bin/5dive _secret_link_notify >/dev/null 2>&1; then
+    _task_drop_link_log none "$ident" "seat ${me} (tier ${tier:-?}) holds no grant for the root link send (its sudoers predates DIVE-7128 and is reconciled on the next update); the alert falls back to the app or the server line"
+    return 1
+  fi
+  errf=$(mktemp "${TMPDIR:-/tmp}/5dive-linksend.XXXXXX" 2>/dev/null) || errf=/dev/null
+  out=$(printf '%s\n%s\n' "$ident" "$nonce" | sudo -n /usr/local/bin/5dive _secret_link_notify 2>"$errf") || rc=$?
+  if (( rc != 0 )) || [[ "$out" != sent* ]]; then
+    _task_drop_link_log error "$ident" "the root link send for seat ${me} did not deliver (rc=${rc}): $(head -c 300 "$errf" 2>/dev/null | tr '\n' ' '). The seat sends its own alert instead"
+    rm -f "$errf" 2>/dev/null; return 1
+  fi
+  rm -f "$errf" 2>/dev/null
+  local w
+  for w in $out; do
+    case "$w" in
+      ttl=*) [[ "${w#ttl=}" =~ ^[0-9]+$ ]] && TASK_GATE_DROP_LINK_TTL="${w#ttl=}" ;;
+      to=*)  TASK_SEND_TARGETS="${w#to=}" ;;
+    esac
+  done
+  TASK_SEND_DELIVERED=1
+  # The root side wrote this gate's delivery row; count it here so the delivery
+  # assertion does not backfill a second one (the gate-escalate rule).
+  TASK_GATE_DELIVERY_ROWS=$(( ${TASK_GATE_DELIVERY_ROWS:-0} + 1 ))
+  return 0
+}
+
+# `5dive _secret_link_notify` — DIVE-7128, the root half. Hidden, reachable by a
+# standard seat only through the exact-path NOPASSWD line render_standard_sudoers
+# writes. No arguments: the task ident and the gate's tap nonce travel on stdin,
+# the seat is derived from SUDO_UID. Refuses unless the task's gate is an OPEN
+# secret gate naming a place on this box AND was filed by that seat, and while a
+# link for it is still live (one send per link lifetime, so a seat cannot page
+# its owner in a loop). Then renders the gate's first alert from the ROW, as
+# root, so _task_mint_drop_link mints, and sends it to the seat's owner. Every
+# line the render path prints goes to /dev/null; stdout is one line,
+# `sent ttl=<min> to=<chat>`, which carries no link.
+cmd_secret_link_notify_delegated() {
+  _gate_is_root || fail "$E_PERMISSION" "_secret_link_notify is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "_secret_link_notify takes no arguments (the task is read from stdin, the seat from the sudo caller)."
+  local ruid="${SUDO_UID:-}" seat ident="" nonce=""
+  [[ "$ruid" =~ ^[0-9]+$ && "$ruid" != 0 ]] \
+    || fail "$E_AUTH_REQUIRED" "_secret_link_notify requires sudo from an agent seat."
+  seat=$(_gate_uid_to_agent "$ruid")
+  [[ -n "$seat" ]] || fail "$E_AUTH_REQUIRED" "_secret_link_notify caller uid ${ruid} is not an agent seat."
+  IFS= read -r ident || true
+  IFS= read -r nonce || true
+  [[ "$ident" =~ ^[A-Za-z]+-[0-9]+$ ]] || fail "$E_VALIDATION" "_secret_link_notify: expected a task ident on stdin."
+  [[ -z "$nonce" || "$nonce" =~ ^[A-Za-z0-9_.:-]{1,256}$ ]] || fail "$E_VALIDATION" "_secret_link_notify: malformed nonce."
+  ident="${ident^^}"
+  tasks_db_init
+  local row
+  row=$(db "SELECT COALESCE(need_type,'')||x'1f'||COALESCE(ask,'')||x'1f'||COALESCE(need_options,'')||x'1f'||
+                   COALESCE(recommend,'')||x'1f'||COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'')||x'1f'||
+                   COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'')
+            FROM tasks
+            WHERE ident=$(sqlq "$ident") AND need_type='secret' AND need_answered_at IS NULL
+              AND status NOT IN ('done','cancelled')
+              AND COALESCE(secret_key,'')<>'' AND COALESCE(connector,'')<>'';" 2>/dev/null) || row=""
+  [[ -n "$row" ]] || fail "$E_CONFLICT" "$ident has no open secret gate naming a place on this box."
+  local nt ask opts rec skey conn filer
+  IFS=$'\x1f' read -r nt ask opts rec skey conn filer <<<"$row"
+  [[ "$filer" == "$seat" ]] \
+    || fail "$E_PERMISSION" "$ident's gate was filed by ${filer:-nobody on record}, not ${seat}: a seat can send the link for its own gate only."
+  _secret_drop_live_for "$ident" >/dev/null 2>&1 \
+    && fail "$E_CONFLICT" "a one-time link for $ident is already live; not sending another."
+
+  TASK_SEND_DELIVERED=0 TASK_SEND_TARGETS="" TASK_GATE_DROP_LINK_TTL="" TASK_GATE_DELIVERY_ROWS=0
+  TASK_GATE_ESCALATING=1 TASK_GATE_FILER="$seat" \
+    _task_need_notify_deliver_now "$ident" "$nt" "$ask" "$opts" "$rec" "$skey" "$conn" "$nonce" "" >/dev/null 2>&1 || true
+  if [[ "${TASK_SEND_DELIVERED:-0}" == 1 ]]; then
+    _task_store_audit_log "secret link-notify" ok 0 -- "task=$ident" "seat=$seat" "link=$([[ -n "$TASK_GATE_DROP_LINK_TTL" ]] && echo yes || echo no)" || true
+    printf 'sent ttl=%s to=%s\n' "${TASK_GATE_DROP_LINK_TTL:-}" "${TASK_SEND_TARGETS:-}"
+    return 0
+  fi
+  # A link minted for a message nobody received is burned, so the seat's own
+  # fallback alert and the re-nag start clean.
+  _secret_drop_burn_task "$ident" 2>/dev/null || true
+  _task_store_audit_log "secret link-notify" error 1 -- "task=$ident" "seat=$seat" || true
+  fail "$E_GENERIC" "$ident: the alert was not delivered from the root side."
+}
+
 # Render the canonical tap keyboard for one gate. Kept separate from the alert
 # prose so heartbeat re-nags can combine N gates into one message without
 # drifting from the callback contract used by the initial task-need alert.
@@ -1817,15 +1926,41 @@ _task_secret_gate_box_line() {
   _gate_t secret_box "$1" "$2" "$3"
 }
 
+# DIVE-7128: is this box linked to the 5dive app? It holds the box token then,
+# and only then does a dashboard card or My team exist for the owner to open.
+# An OSS box has neither, so its alerts must never send the owner there.
+_task_box_has_app() { [[ -e "$(_sp_connectord_env)" ]]; }
+
+# DIVE-7128: the minted-link prose, one line plus the link. On a box linked to
+# the app the owner reads Telegram and has no shell, so the `sudo` line is left
+# out and the app card is named as the way to a fresh link. On an OSS box there
+# is no app to name, and the shell line stays for the self-hoster who has one.
+_task_secret_gate_link_text() { # <ident> <key> <ttl> <url> <connector>
+  local t; t=$(_gate_t secret_link "$1" "$2" "$3" "$4")
+  if _task_box_has_app; then t+=" $(_gate_t secret_again)"
+  else t+=$'\n'"$(_task_secret_gate_box_line "$2" "$5" "$1")"; fi
+  printf '%s' "$t"
+}
+
+# DIVE-7128: no link could be minted. A box linked to the app sends the owner to
+# its card, which mints one through the box's own root path. An OSS box has no
+# card, so the server line is the only way in, and it says so.
+_task_secret_gate_nolink_text() { # <ident> <key> <connector>
+  if _task_box_has_app; then
+    printf '%s' "$(_gate_t secret_app "$1" "$2")"$'\n'"$(_task_secret_gate_box_line "$2" "$3" "$1")"$'\n'"$(_gate_t secret_either)"
+  else
+    _gate_t secret_oss "$1" "$2" "$3"
+  fi
+}
+
 _task_secret_gate_cta() {
   local ident="$1" numid="$2" secret_key="$3" connector="$4" _drop="$5"
   if [[ -n "$_drop" && "$_drop" != "ONBOX" ]]; then
-    local _url="${_drop%%|*}" _ttl="${_drop##*|}"
-    printf '%s' "$(_gate_t secret_link "$ident" "$secret_key" "$_ttl" "$_url") $(_task_secret_gate_box_line "$secret_key" "$connector" "$ident")"
+    _task_secret_gate_link_text "$ident" "$secret_key" "${_drop##*|}" "${_drop%%|*}" "$connector"
   elif [[ -n "$secret_key" && -n "$connector" ]]; then
-    # Target named, no link minted here (a standard seat cannot mint one, or
-    # this box has no reachable name): the app's card mints it, the box takes it.
-    printf '%s' "$(_gate_t secret_app "$ident" "$secret_key")"$'\n'"$(_task_secret_gate_box_line "$secret_key" "$connector" "$ident")"$'\n'"$(_gate_t secret_either)"
+    # Target named, no link minted here (the mint failed, or this box has no
+    # reachable name): the app's card mints it, or the box takes it.
+    _task_secret_gate_nolink_text "$ident" "$secret_key" "$connector"
   else
     local _oob; _oob=$(db "SELECT COALESCE(secret_oob,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
     if [[ -n "$_oob" ]]; then
@@ -2136,6 +2271,8 @@ _gate_t() {
       if [[ "$k" == p_* || -n "$(_task_partner_app_url)" ]]; then
         _gate_t_partner "$k" "$@"; return
       fi ;;
+    # DIVE-7128: an OSS box has no dashboard, so its reminders do not name one.
+    renag_foot|first_foot) _task_box_has_app || k="${k}_oss" ;;
   esac
   if [[ "$(_task_gate_lang)" == ru ]]; then
     case "$k" in
@@ -2170,7 +2307,11 @@ _gate_t() {
       renag_foot)    printf '%s' "Нажмите кнопку, откройте ссылку /task или ответьте в панели управления. Первое напоминание приходит через час, дальше раз в сутки, пока вы не ответите." ;;
       first_head)    printf '%s' "🙋 Ждут вашего ответа ($1):" ;;
       first_foot)    printf '%s' "Нажмите кнопку, откройте ссылку /task или ответьте в панели управления." ;;
-      secret_link)   printf '%s' "🔑 [$1] нужен ключ $2. Откройте эту одноразовую ссылку и вставьте его там (один раз, ссылка действует $3 мин):"$'\n'"$4"$'\n'"Ключ попадёт прямо на этот сервер, не через 5dive и не через этот чат. Не вставляйте его сюда. Ссылка истекла? Карточка задачи в приложении 5dive создаст новую." ;;
+      renag_foot_oss) printf '%s' "Нажмите кнопку или откройте ссылку /task. Первое напоминание приходит через час, дальше раз в сутки, пока вы не ответите." ;;
+      first_foot_oss) printf '%s' "Нажмите кнопку или откройте ссылку /task." ;;
+      secret_link)   printf '%s' "🔑 [$1] Вставьте ключ $2 здесь (один раз, $3 мин): $4"$'\n'"Никогда не в этот чат." ;;
+      secret_again)  printf '%s' "Ссылка истекла? Карточка задачи в приложении 5dive создаст новую." ;;
+      secret_oss)    printf '%s' "🔑 [$1] нужен ключ $2. Одноразовую ссылку сделать не удалось, поэтому ключ вводится на сервере: sudo 5dive secret write $2 --connector=$3 --task=$1 (значение спросит скрыто). Никогда не в этот чат." ;;
       secret_app)    printf '%s' "🔑 [$1] нужен ключ $2. Откройте эту задачу в приложении 5dive (карточка на 5dive.ai/dashboard/tasks или «Моя команда» в приложении 5dive в Telegram) и нажмите «Открыть защищённую ссылку». Ключ вставляется на странице этого сервера, не через 5dive и не через этот чат. Не вставляйте его сюда." ;;
       secret_box)    printf '%s' "Или на сервере: sudo 5dive secret write $1 --connector=$2 --task=$3 (значение спросит скрыто)." ;;
       secret_either) printf '%s' "Любой из способов запишет ключ и сам закроет вопрос." ;;
@@ -2209,7 +2350,11 @@ _gate_t() {
     renag_foot)    printf '%s' "Tap a button, open /task links, or answer from the dashboard. First reminder is after 1h; later reminders are batched every 24h until answered." ;;
     first_head)    printf '%s' "🙋 $1 gates need you:" ;;
     first_foot)    printf '%s' "Tap a button, open /task links, or answer from the dashboard." ;;
-    secret_link)   printf '%s' "🔑 [$1] needs the $2 credential. Open this one-time link and paste it there (single use, expires in $3m):"$'\n'"$4"$'\n'"It goes straight to this server, never through 5dive or this chat. Never paste it here. Link expired? The task's card in the 5dive app makes a fresh one." ;;
+    renag_foot_oss) printf '%s' "Tap a button or open /task links. First reminder is after 1h; later reminders are batched every 24h until answered." ;;
+    first_foot_oss) printf '%s' "Tap a button or open /task links." ;;
+    secret_link)   printf '%s' "🔑 [$1] Paste the $2 key here (one use, $3 min): $4"$'\n'"Never in this chat." ;;
+    secret_again)  printf '%s' "Link expired? The task's card in the 5dive app makes a new one." ;;
+    secret_oss)    printf '%s' "🔑 [$1] needs the $2 key. No one-time link could be made, so it goes in on the server: sudo 5dive secret write $2 --connector=$3 --task=$1 (it asks for the value, hidden). Never in this chat." ;;
     secret_app)    printf '%s' "🔑 [$1] needs the $2 credential. Open this task in the 5dive app (its card on 5dive.ai/dashboard/tasks, or My team in the 5dive app on Telegram) and tap Open secure link. You paste it on a page served by this server, never through 5dive or this chat. Never paste it here." ;;
     secret_box)    printf '%s' "On the box instead: sudo 5dive secret write $1 --connector=$2 --task=$3 (it asks for the value, hidden)." ;;
     secret_either) printf '%s' "Either one writes it and clears this gate by itself." ;;
@@ -3115,6 +3260,13 @@ _task_need_notify_deliver_now() {
   # alert(s) confirmed by Telegram. Resolve before channel routing so even a
   # total no-channel failure can be recorded against the gate.
   local numid; numid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident");")
+  # DIVE-7128: a standard seat's key ask is minted and sent on the root side, so
+  # the owner gets the link and this seat never holds it. Not taken (an admin
+  # seat, root, no grant yet) or failed: this seat sends its own alert below.
+  if [[ "$need_type" == secret && -n "$secret_key" && -n "$connector" ]] \
+     && _task_secret_send_via_root "$ident" "$human_nonce"; then
+    return 0
+  fi
   # Resolve bot token + the human's DM/group targets (TASK_CH_* globals). The
   # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
   # DIVE-1243: never DROP a gate alert silently. The filing agent being unpaired
@@ -3296,7 +3448,8 @@ _task_need_notify_deliver_now() {
     if [[ -n "$_pdrop" && "$_pdrop" != ONBOX ]]; then
       _purl="${_pdrop%%|*}"
       _ptext+="$(_gate_t p_secret_link "$secret_key")"$'\n'"${_purl}"
-      _pbtn=$(jq -nc --arg t "$(_gate_t secret_button)" --arg u "$_purl" '{inline_keyboard: [[{text: $t, url: $u}]]}')
+      # DIVE-7128: through the environment, not argv: any seat can list argv.
+      _pbtn=$(FIVE_DROP_URL="$_purl" jq -nc --arg t "$(_gate_t secret_button)" '{inline_keyboard: [[{text: $t, url: $ENV.FIVE_DROP_URL}]]}')
       _task_send_gate_owner "$_ptext" "$_pbtn" "$numid" "" "$_ptext"
     else
       _ptext+="$(_gate_t p_secret_app "$secret_key")"

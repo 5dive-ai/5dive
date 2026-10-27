@@ -1200,6 +1200,14 @@ main() {
       # Never advertised.
       cmd_dashboard_relay "$@"
       exit $? ;;
+    _secret_link_notify)
+      # DIVE-7128: hidden root half of a standard seat's secret gate alert. The
+      # seat is derived from SUDO_UID and must have filed the open gate named on
+      # stdin; root mints the one-time link and sends the alert itself, so the
+      # link never reaches the seat (src/task/notify.sh). Audited root-side.
+      # Never advertised.
+      cmd_secret_link_notify_delegated "$@"
+      exit $? ;;
     _lead_account)
       # DIVE-7118: hidden root half of `agent recover`. The caller is re-derived
       # from SUDO_UID and must be an admin seat (src/cmd_account.sh). Not audited

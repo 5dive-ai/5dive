@@ -302,6 +302,10 @@ txt=$(_task_secret_gate_cta DIVE-2406 "$(db "SELECT id FROM tasks WHERE ident='D
 # whose card mints one. Either way it keeps the box command and forbids a chat
 # paste. The resume ping tells the asking seat which file the value is now in.
 _drop_id=$(db "SELECT id FROM tasks WHERE ident='DIVE-2405';")
+# DIVE-7128: which shape the owner gets depends on whether the box is linked to
+# the app (it holds connectord.env). Pinned both ways; the app arms first.
+: >"$TMP/connectord.env"
+export FIVEDIVE_CONNECTORD_ENV="$TMP/connectord.env"
 for _shape in ONBOX ""; do
   txt=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "$_shape")
   if [[ "$txt" == *"5dive.ai/dashboard/tasks"* && "$txt" == *"5dive app on Telegram"* \
@@ -314,11 +318,30 @@ for _shape in ONBOX ""; do
 done
 _link="https://secrets.box.example.com/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCd"
 txt=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "${_link}|30")
-[[ "$txt" == *"$_link"* && "$txt" == *"single use, expires in 30m"* && "$txt" == *"never through 5dive or this chat"* \
-   && "$txt" == *"Never paste it here"* \
-   && "$txt" == *"sudo 5dive secret write GH_BOT_TOKEN --connector=github-bot --task=DIVE-2405"* ]] \
-  && ok_t "T9b a minted link goes in the alert with its expiry, and the box command stays" \
-  || bad_t "T9b a minted link goes in the alert with its expiry, and the box command stays" "text: $txt"
+[[ "$txt" == "🔑 [DIVE-2405] Paste the GH_BOT_TOKEN key here (one use, 30 min): ${_link}"$'\n'"Never in this chat."* \
+   && "$txt" == *"The task's card in the 5dive app makes a new one"* \
+   && "$txt" != *"sudo 5dive"* ]] \
+  && ok_t "T9b a minted link on an app-linked box: one line with the link and its expiry, no server command (DIVE-7128)" \
+  || bad_t "T9b a minted link on an app-linked box: one line with the link and its expiry, no server command (DIVE-7128)" "text: $txt"
+# DIVE-7128: an OSS box (no connectord.env) has no dashboard and no app, so no
+# shape may send the owner there. The link shape keeps the server line for a
+# self-hoster with a shell; the no-link shape is the server line alone.
+export FIVEDIVE_CONNECTORD_ENV="$TMP/no-such-connectord.env"
+txt=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "${_link}|30")
+[[ "$txt" == *"$_link"* && "$txt" == *"one use, 30 min"* && "$txt" == *"Never in this chat"* \
+   && "$txt" == *"sudo 5dive secret write GH_BOT_TOKEN --connector=github-bot --task=DIVE-2405"* \
+   && "$txt" != *"dashboard"* && "$txt" != *"5dive app"* && "$txt" != *"My team"* ]] \
+  && ok_t "T9d a minted link on an OSS box names no app or dashboard and keeps the server line (DIVE-7128)" \
+  || bad_t "T9d a minted link on an OSS box names no app or dashboard and keeps the server line (DIVE-7128)" "text: $txt"
+for _shape in ONBOX ""; do
+  txt=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "$_shape")
+  [[ "$txt" == *"sudo 5dive secret write GH_BOT_TOKEN --connector=github-bot --task=DIVE-2405"* \
+     && "$txt" == *"Never in this chat"* \
+     && "$txt" != *"dashboard"* && "$txt" != *"5dive app"* && "$txt" != *"My team"* && "$txt" != *"Open secure link"* ]] \
+    && ok_t "T9e no link on an OSS box (${_shape:-no link}): the server line, no app or dashboard (DIVE-7128)" \
+    || bad_t "T9e no link on an OSS box (${_shape:-no link}): the server line, no app or dashboard (DIVE-7128)" "text: $txt"
+done
+export FIVEDIVE_CONNECTORD_ENV="$TMP/connectord.env"
 _all=""
 for _shape in ONBOX "" "${_link}|30"; do _all+=$(_task_secret_gate_cta DIVE-2405 "$_drop_id" GH_BOT_TOKEN github-bot "$_shape"); done
 [[ "$_all" != *"api.5dive"* && "$_all" != *"/drop/"* ]] \

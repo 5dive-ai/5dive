@@ -132,10 +132,19 @@ check 'R7 a reminder for a secret gate whose link expired carries a fresh one' \
   "mints=$(cat "$MINT_LOG") text: $(txt)"
 
 reset; MINT_OK=0
+: >"$TMP/connectord.env"; export FIVEDIVE_CONNECTORD_ENV="$TMP/connectord.env"   # linked to the app
 mk_gate DIVE-26 secret '-20 minutes' NULL
 _hb_gate_renag_sweep
 check 'R8 no link could be minted: the message says where to get one (the app), not nothing' \
   '[[ "$(txt)" == *"Open this task in the 5dive app"* ]]' "text: $(txt)"
+# DIVE-7128: an OSS box has no app or dashboard; the server line is the way in.
+reset; MINT_OK=0
+export FIVEDIVE_CONNECTORD_ENV="$TMP/no-such-connectord.env"
+mk_gate DIVE-36 secret '-20 minutes' NULL
+_hb_gate_renag_sweep
+check 'R8b no link on an OSS box: the server line, and no app or dashboard anywhere in the message (DIVE-7128)' \
+  '[[ "$(txt)" == *"sudo 5dive secret write HF_TOKEN --connector=tools --task=DIVE-36"* && "$(txt)" != *"dashboard"* && "$(txt)" != *"5dive app"* ]]' "text: $(txt)"
+unset FIVEDIVE_CONNECTORD_ENV
 
 reset
 mk_gate DIVE-27 approval '-2 hours' '-119 minutes'

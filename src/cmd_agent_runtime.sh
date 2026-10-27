@@ -602,9 +602,19 @@ _mirror_send() {
     printf '%s' '{"ok":true,"dry_run":true,"result":{"message_id":0}}'
     return 0
   fi
-  local args=(--data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}")
+  # DIVE-7128: the text and the keyboard reach curl from 0600 files, never argv.
+  # Any seat can read another process's argv (/proc/<pid>/cmdline), and a secret
+  # gate's alert sent on the root side carries a one-time link the seat that
+  # filed it must not see. A file mktemp cannot make falls back to argv.
+  local tf="" mf="" rc=0
+  tf=$(mktemp "${TMPDIR:-/tmp}/5dive-send.XXXXXX" 2>/dev/null) && printf '%s' "$text" >"$tf" 2>/dev/null || tf=""
+  local args=(--data-urlencode "chat_id=${chat}")
+  if [[ -n "$tf" ]]; then args+=(--data-urlencode "text@${tf}"); else args+=(--data-urlencode "text=${text}"); fi
   [[ -n "$thread" ]] && args+=(--data-urlencode "message_thread_id=${thread}")
-  [[ -n "$reply_markup" ]] && args+=(--data-urlencode "reply_markup=${reply_markup}")
+  if [[ -n "$reply_markup" ]]; then
+    mf=$(mktemp "${TMPDIR:-/tmp}/5dive-send.XXXXXX" 2>/dev/null) && printf '%s' "$reply_markup" >"$mf" 2>/dev/null || mf=""
+    if [[ -n "$mf" ]]; then args+=(--data-urlencode "reply_markup@${mf}"); else args+=(--data-urlencode "reply_markup=${reply_markup}"); fi
+  fi
   # DIVE-2712: opt-in SILENT delivery. Set by the /inbox digest for every message
   # after the first, so N gates cost the human ONE buzz and N readable messages
   # instead of N buzzes. Deliberately an env var rather than a 5th positional:
@@ -618,7 +628,9 @@ _mirror_send() {
   # (task_need_notify runs this after the gate UPDATE has already committed;
   # mirror_interagent_outbound likewise). --connect-timeout caps the TCP/TLS
   # handshake, --max-time the whole request (DIVE-115).
-  curl -s --connect-timeout 5 --max-time 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" "${args[@]}" 2>/dev/null
+  curl -s --connect-timeout 5 --max-time 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" "${args[@]}" 2>/dev/null || rc=$?
+  rm -f ${tf:+"$tf"} ${mf:+"$mf"} 2>/dev/null
+  return $rc
 }
 
 # _mirror_edit_markup — DIVE-2410: change (by default REMOVE) the inline keyboard

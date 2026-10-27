@@ -979,6 +979,7 @@ def classify_sudo(text, measurable):
                   command.startswith("/usr/local/bin/5dive _merge_do") or
                   command in ("/usr/local/bin/5dive _route_do", "/usr/local/bin/5dive _pkg_do") or
                   command == "/usr/local/bin/5dive _dashboard_relay" or
+                  command == "/usr/local/bin/5dive _secret_link_notify" or
                   command in ("/usr/local/bin/5dive sysadmin _broker", "/usr/local/bin/5dive --json sysadmin _broker")):
                 has_scoped = True
             else:

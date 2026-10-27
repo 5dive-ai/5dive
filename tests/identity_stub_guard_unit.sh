@@ -94,6 +94,7 @@ SELF="$(basename "${BASH_SOURCE[0]}")"
 # plugin with cmd_proof.sh in DIVE-6938, and its entry with it.)
 declare -A ALLOW=(
   [secret_drop_unit.sh]='_task_mint_drop_link in task/notify.sh genuinely still reads `id -un`, only to skip a sudo a non-admin seat would be refused (DIVE-5319); its T4 arms are its test, and nothing else in the file reads identity'
+  [secret_link_root_send_unit.sh]='DIVE-7128: its S arms test _task_secret_send_via_root (task/notify.sh), which reads `id -un` exactly as _task_mint_drop_link does, to pick the seat whose tier decides the root cross; the stub is removed before the R arms, which pin the root half through _gate_uid_to_agent'
   [secret_gate_now_and_loud_mint_unit.sh]='DIVE-5448: its B arms test _task_mint_drop_link (task/notify.sh), which genuinely still reads `id -un` to pick the seat whose tier decides the mint; nothing else the file exercises reads identity'
 )
 

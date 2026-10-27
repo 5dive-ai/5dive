@@ -6645,8 +6645,11 @@ _hb_gate_renag_batch_one() { # <recipient_agent> <comma-separated task ids> <rou
           'if any($a[][]; .url? == $u) then $a else $a + [[{text: $t, url: $u}]] end' 2>/dev/null) || rows='[]'
       elif [[ -n "$_drop" && "$_drop" != ONBOX ]]; then
         text+=$'\n'"  $(_gate_t secret_link "$ident" "$skey" "${_drop##*|}" "${_drop%%|*}")"
-      else
+      elif _task_box_has_app; then
         text+=$'\n'"  $(_gate_t secret_app "$ident" "$skey")"
+      else
+        # DIVE-7128: an OSS box has no app card to send the owner to.
+        text+=$'\n'"  $(_gate_t secret_oss "$ident" "$skey" "$sconn")"
       fi
     fi
 
