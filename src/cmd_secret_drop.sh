@@ -832,7 +832,8 @@ _secret_https_conf_set() { # <mode> <host>, keeping every other line of the conf
   local tmp; tmp=$(mktemp "${SECRET_DROP_CONF}.XXXXXX" 2>/dev/null) || return 1
   [[ -f "$SECRET_DROP_CONF" ]] && grep -vE '^SECRET_HTTPS_(MODE|HOST)=' "$SECRET_DROP_CONF" > "$tmp"
   [[ -z "$1" ]] || printf 'SECRET_HTTPS_MODE=%s\nSECRET_HTTPS_HOST=%s\n' "$1" "$2" >> "$tmp"
-  chmod 644 "$tmp" && mv -f "$tmp" "$SECRET_DROP_CONF"
+  chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$SECRET_DROP_CONF"
 }
 
 # Turn the front on one way. rc 0 = a verified certificate answers and the conf
@@ -968,7 +969,7 @@ _secret_https() {
       [[ "$via" =~ ^(ip|sslip|domain)$ ]] || fail "$E_USAGE" "--via must be ip, sslip or domain"
       [[ "$via" == domain && -z "$host" ]] && fail "$E_USAGE" "--via=domain needs --host=<your domain>, pointed at this box"
       [[ "$via" != domain && -n "$host" ]] && fail "$E_USAGE" "--via=$via makes its own name; --host is for --via=domain"
-      _secret_https_enable "$via" "$host" || fail "$E_NOT_INSTALLED" "secret links stay without https: ${SECRET_HTTPS_WHY}. Nothing was turned on."
+      _secret_https_enable "$via" "$host" || fail "$E_NOT_INSTALLED" "secret links stay without https: ${SECRET_HTTPS_WHY}. The https front is off now; the next secret link sets one up again (an IP certificate, then sslip.io)."
       local h; h=$(_secret_https_host)
       ok "secret links: on, via ${via} - https://${h}/...$([[ "$via" == sslip ]] && printf '\n  note: sslip.io answers for this name; --via=ip or your own domain keeps any third party out of it.')" \
         '{on: true, managed: true, mode: $m, host: $h}' --arg m "$via" --arg h "$h" ;;
