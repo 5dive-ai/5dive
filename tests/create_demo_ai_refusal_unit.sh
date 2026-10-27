@@ -128,8 +128,10 @@ if [[ -x ./5dive && -n "$SUDO" ]] && ! _gate_cgroup_human_capable; then
       && bad_t 'binary: the refusal still asks for an account per hire' "$out" || ok_t 'binary: no account per hire'
   fi
   # One codex account on the box: the demo-ai hire uses it, past the guard.
-  mkdir -p "$S/auth-profiles/mine"
-  printf 'OPENAI_API_KEY=sk-fixture\n' > "$S/auth-profiles/mine/combined.env"
+  # The create above ran ensure_state, which made $S root:claude 2750, so the
+  # runner can no longer write here: add the account as the binary's user.
+  $SUDO mkdir -p "$S/auth-profiles/mine"
+  printf 'OPENAI_API_KEY=sk-fixture\n' | $SUDO tee "$S/auth-profiles/mine/combined.env" >/dev/null
   out=$(mk --type=codex --auth-profile=demo-ai)
   grep -qF "using this box's codex login" <<<"$out" && grep -qF "invalid --model" <<<"$out" \
     && ok_t "binary: a codex hire on demo-ai uses the box's codex login" || bad_t 'binary: demo-ai hire did not use the box login' "$out"
