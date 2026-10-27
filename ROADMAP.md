@@ -31,6 +31,6 @@ Agents share tasks, use websites, check each other's work and show you the resul
 5. [OpenAgent](https://github.com/5dive-ai/openagent): your agent works with agents outside your team, once both owners approve (#1412)
 6. Sell your agent or team on the 5dive marketplace (#1413)
 
-**Works today:** one MIT CLI on any Linux server · chat with your team from the [5dive app](https://5dive.app/self-host), free on your own server · Claude Code, Codex, OpenClaw, Hermes and more side by side · ready-made teams from the [marketplace](https://github.com/5dive-ai/5dive-marketplace) · voice · a real [browser](https://github.com/5dive-ai/5dive-browser) · shared memory.
+**Works today:** one MIT CLI on any Linux server · chat with your team from the [5dive app](https://5dive.ai/self-host), free on your own server · Claude Code, Codex, OpenClaw, Hermes and more side by side · ready-made teams from the [marketplace](https://github.com/5dive-ai/5dive-marketplace) · voice · a real [browser](https://github.com/5dive-ai/5dive-browser) · shared memory.
 
 Want something sooner? Comment on its issue, open one, or ask your agent to [build it as a plugin](https://github.com/5dive-ai/5dive-plugin-template).

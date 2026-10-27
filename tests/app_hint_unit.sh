@@ -59,7 +59,8 @@ grep -qE '^\s+_app_hint\)$' src/main.sh && ok "main dispatches _app_hint" || bad
 # and none of the retired connector steps (lodar 10-24: «link is wrong»).
 for f in README.md README.zh-CN.md; do
   top="$(sed -n '1,/^## /p' "$f")"
-  for needle in "https://5dive.app/self-host" "docs/readme-demo.png"; do
+  # DIVE-7108: the READMEs print the short link, 5dive.ai/self-host (lodar 10-27).
+  for needle in "https://5dive.ai/self-host" "docs/readme-demo.png"; do
     [[ "$top" == *"$needle"* ]] && ok "$f top has: $needle" || bad "$f top is missing: $needle"
   done
   for gone in "$install_cmd" "$connect_cmd" "5dive-connector"; do
@@ -71,7 +72,7 @@ for f in README.md README.zh-CN.md; do
   next="$(awk 'seen && /^```$/ {fence=1; next} fence && NF {print; exit} /^sudo 5dive init$/ {seen=1}' "$f")"
   [[ "$next" == *"docs/readme-demo.png"* ]] && ok "$f: the demo comes right after the install" \
     || bad "$f: the line after the install is not the demo: $next"
-  [[ "$next" != *"https://5dive.app/self-host"* ]] && ok "$f: the app link is not the headline" \
+  [[ "$next" != *"https://5dive.ai/self-host"* ]] && ok "$f: the app link is not the headline" \
     || bad "$f: the app link is still the line after the install"
   for gone in "5dive cloud" "my.5dive.ai/sign-up"; do
     [[ "$top" != *"$gone"* ]] && ok "$f top has no paid pitch: $gone" || bad "$f top still pitches: $gone"
