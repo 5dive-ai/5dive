@@ -566,6 +566,11 @@ Health:
     box's public key to put on it. Nothing provisioned.
     --note tells Claude Code seats when to use it (DIVE-6143).
 
+  5dive grok enable | disable | status
+    Let this server make Grok agents (DIVE-7066). enable shows one warning
+    and asks the owner to confirm at a terminal; disable stops new Grok
+    agents (existing ones keep running).
+
   5dive doctor [--fix] [--dry-run] [--caps] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|mod|policy|plugins|caps|models]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
@@ -1324,6 +1329,12 @@ main() {
       # (cmd_machine checks); ls is a read. Audited: who attached which machine.
       AUDIT_CMD="machine"; AUDIT_ARGS=("$@")
       cmd_machine "$@" ;;
+    grok)
+      # DIVE-7066: the server owner's own Grok opt-in (src/cmd_grok.sh). enable/
+      # disable write or remove the root-owned arm marker, so cmd_grok checks
+      # root itself; status is a read. Audited: who turned Grok on or off.
+      case "${1:-}" in enable|disable) AUDIT_CMD="grok"; AUDIT_ARGS=("$@") ;; esac
+      cmd_grok "$@" ;;
     doctor)
       # Only audit when a mutating run is requested (--fix/--repair); read-only
       # runs (and --dry-run previews) would spam the log.
