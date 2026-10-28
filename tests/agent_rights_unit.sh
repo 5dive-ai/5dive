@@ -93,14 +93,16 @@ cat >"$REGISTRY" <<'JSON'
  "lena":{"type":"claude","isolation":"standard"},
  "leo":{"type":"claude","isolation":"standard"},
  "ghost":{"type":"claude","isolation":"standard"},
- "nomeas":{"type":"claude"}
+ "nomeas":{"type":"claude"},
+ "boss":{"type":"claude","isolation":"admin"}
 }}
 JSON
 for n in alice bob carol dave lena leo ghost; do printf 'AGENT_ISOLATION=standard\n' >"$ENV_DIR/$n.env"; done
+printf 'AGENT_ISOLATION=admin\n' >"$ENV_DIR/boss.env"   # boss: an admin seat on team acme
 printf 'AGENT_ISOLATION=standard\n' >"$ENV_DIR/sandy.env"   # env says standard, registry says sandboxed
 tasks_db_init >/dev/null 2>&1
 db "INSERT INTO projects (key, prefix, lead_agent) VALUES ('acme','ACME','alice'), ('old','OLD','lena');
-    INSERT INTO team_members (team, agent, reports_to) VALUES ('acme','alice',NULL),('acme','bob','alice'),('acme','sandy','alice');
+    INSERT INTO team_members (team, agent, reports_to) VALUES ('acme','alice',NULL),('acme','bob','alice'),('acme','sandy','alice'),('acme','boss',NULL);
     INSERT INTO agents_org (name, reports_to) VALUES ('alice',NULL),('lena',NULL);
     INSERT INTO agents_org (name, reports_to) VALUES ('bob','alice'),('dave','alice'),('leo','lena'),('carol',NULL);" \
   || nope 'fixture: tasks db seeded'
@@ -110,7 +112,7 @@ ROOT=1
 _gate_is_root() { (( ROOT )); }
 actor_uid_to_name() {
   case "$1" in 1001) echo agent-alice ;; 1002) echo agent-bob ;; 1003) echo agent-carol ;; 1004) echo agent-sandy ;;
-    1005) echo agent-dave ;; 1006) echo agent-leo ;; 1000) echo claude ;; *) echo "user$1" ;; esac
+    1005) echo agent-dave ;; 1006) echo agent-leo ;; 1007) echo agent-boss ;; 1000) echo claude ;; *) echo "user$1" ;; esac
 }
 audit_log() { printf '%s\n' "$*" >>"$TMP/audit"; }
 registry_write() { cat >"$REGISTRY.tmp" && mv "$REGISTRY.tmp" "$REGISTRY"; }
@@ -172,7 +174,7 @@ arm_P11b() { db "INSERT INTO agents_org (name, reports_to) VALUES ('lou','leo');
   mv "$TMP/old.bak" "$STATE_DIR/teams/old.5dive.yaml"
   actor_uid_to_name() {
     case "$1" in 1001) echo agent-alice ;; 1002) echo agent-bob ;; 1003) echo agent-carol ;; 1004) echo agent-sandy ;;
-      1005) echo agent-dave ;; 1006) echo agent-leo ;; 1000) echo claude ;; *) echo "user$1" ;; esac; }
+      1005) echo agent-dave ;; 1006) echo agent-leo ;; 1007) echo agent-boss ;; 1000) echo claude ;; *) echo "user$1" ;; esac; }
   [[ $a == 0 && $b != 0 ]]; }
 check 'P11b legacy subtree: lou (two levels under lena) peeks her; without the team manifest, refused' arm_P11b
 arm_P12() { ROOT=0; SUDO_UID=1001 peek bob; local rc=$RC; ROOT=1; [[ $rc == "$E_PERMISSION" && ! -s "$TMP/tmux" ]]; }
@@ -230,6 +232,16 @@ arm_S10() { SUDO_UID=1001 give sandy good; [[ $RC == "$E_PERMISSION" && ! -s "$T
 check 'S10 sandboxed teammate: refused' arm_S10
 arm_S11() { SUDO_UID=1001 give alice good; [[ $RC != 0 && ! -s "$TMP/as" ]]; }
 check 'S11 self: refused' arm_S11
+
+# ── U: never up a tier (a standard member and its admin teammate) ──────────────
+arm_U1() { SUDO_UID=1001 peek boss; refused_quiet && [[ $RC == "$E_PERMISSION" ]] && grep -q 'wider seat' "$TMP/err" \
+  && grep -q 'agent _peek refused' "$TMP/audit"; }
+check "U1 standard alice peeks admin teammate boss: refused (a key in the lead's pane would leak), audited" arm_U1
+arm_U2() { SUDO_UID=1001 give boss good; [[ $RC == "$E_PERMISSION" ]] && grep -q 'wider seat' "$TMP/err" \
+  && [[ ! -s "$TMP/as" && ! -e "$TMP/home/agent-boss" ]]; }
+check "U2 standard alice gives admin boss a skill: refused before packing (it would load as boss's own instructions)" arm_U2
+arm_U3() { SUDO_UID=1007 peek alice; [[ $RC == 0 && $(grep -c '' "$TMP/out") == 80 ]]; }
+check 'U3 admin boss peeks standard teammate alice: allowed (down a tier)' arm_U3
 arm_S12() { SUDO_UID=1001 give nobody good; [[ $RC == "$E_NOT_FOUND" && ! -s "$TMP/as" ]]; }
 check 'S12 unknown agent: refused' arm_S12
 arm_S13() { local k; for k in ../good .hidden -r a/b 'a b' '' good/..; do SUDO_UID=1001 give bob "$k"; [[ $RC != 0 && ! -s "$TMP/as" ]] || return 1; done; }
@@ -298,6 +310,7 @@ mutant() {  # mutant <label> <sed-expr> <arm> — the arm must go RED on the mut
 }
 mutant 'teammate check removed from the shared scope' 's/^  _rights_teammates "\$by" "\$to" \\$/  true \\/' arm_P4
 mutant 'teammate check removed (skill give)'          's/^  _rights_teammates "\$by" "\$to" \\$/  true \\/' arm_S9
+mutant 'tier check removed from the shared scope'     's/^  (( \$(_rights_tier_rank "\$to" 9) <= \$(_rights_tier_rank "\$by" 0) )) \\$/  true \\/' arm_U1
 mutant 'symlink refusal removed from the tar check'   "s/^      l) printf 'it contains a symlink.*/      l) ;;/" arm_S4
 mutant 'heartbeat _self arg-count check widened'      's/\[\[ \$# -eq 1 && ( "\$1" == on/[[ $# -ge 1 \&\& ( "$1" == on/' arm_H4
 

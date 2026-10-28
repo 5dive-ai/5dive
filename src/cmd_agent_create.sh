@@ -1,13 +1,14 @@
-# DIVE-1002 + DIVE-6410: the tier of a new seat whose create names no
-# --isolation. $1 = how many agents the registry holds before this one.
+# DIVE-1002 + DIVE-6410 + DIVE-7143: the tier of a new seat whose create names
+# no --isolation. $1 = how many agents the registry holds before this one.
+# Under by-role (box_seat_rule, the default) a seat created on its own has no
+# team lead, so it is admin; team import names a member's standard itself.
 _create_default_isolation() {
-  if declare -F box_seat_isolation >/dev/null 2>&1 && [[ "$(box_seat_isolation)" == admin ]]; then
-    printf 'admin'
-  elif [[ "$1" == "0" ]]; then
-    printf 'admin'
-  else
-    printf 'standard'
-  fi
+  local rule=by-role
+  declare -F box_seat_rule >/dev/null 2>&1 && rule=$(box_seat_rule)
+  case "$rule" in
+    standard) [[ "$1" == "0" ]] && printf 'admin' || printf 'standard' ;;
+    *)        printf 'admin' ;;
+  esac
 }
 
 create_agent_user() {
@@ -1180,6 +1181,66 @@ _cmd_agent_grant_admin() {
      --arg a "$name" --arg i "$iso" --arg s "$state" --arg l "$label_changed"
 }
 
+# DIVE-7143: plan for `agent grant <name> standard`, `<state>|<detail>`:
+#   update   a 5dive-managed policy that is not the standard one (admin, root),
+#            or no policy at all.
+#   current  the managed standard policy (no push, no deploy) is installed.
+#   refuse   a file this CLI did not write, as _agent_grant_admin_plan.
+_agent_grant_standard_plan() {
+  local user="$1" d="${SUDOERS_D:-/etc/sudoers.d}" f current grant cls
+  f="${d}/${user}"
+  if [[ ! -r "$f" ]]; then
+    printf 'update|%s holds no sudoers policy — minting the managed standard policy at %s\n' "$user" "$f"
+    return 0
+  fi
+  current=$(cat "$f")
+  if [[ "$current" == "$(render_standard_sudoers "$user" 0 0)" ]]; then
+    printf 'current|%s already enforces the managed standard policy — nothing to do\n' "$user"
+    return 0
+  fi
+  grant=$(printf '%s\n' "$current" | classify_sudo_grant)
+  cls="${grant%%|*}"
+  if [[ "$current" != '# Managed by 5dive '* ]]; then
+    printf 'refuse|%s is not a 5dive-managed policy (no managed header; it enforces a %s grant) — refusing to replace a policy this CLI did not write. Move %s aside first, then re-run\n' "$f" "$cls" "$f"
+    return 0
+  fi
+  printf 'update|%s enforces a %s grant — re-rendering it as the standard policy (exact 5dive verbs only)\n' "$user" "$cls"
+}
+
+# DIVE-7143: the write half, the mirror of _cmd_agent_grant_admin: the standard
+# policy (no push or deploy grant: a builder seat gets those with `agent grant
+# <name> push|deploy` after), the label on both sources, and out of claude-keys.
+# The sudo narrowing holds from the next sudo call; a RUNNING seat keeps the
+# claude-keys group it started with until its next restart, which this does not
+# do (a client's agent mid-task must not die): the nightly update restarts it.
+_cmd_agent_grant_standard() {
+  local name="$1" user="$2" iso="$3"
+  local plan state detail
+  [[ "$iso" != "sandboxed" ]] \
+    || fail "$E_USAGE" "agent '${name}' is sandboxed — narrower than standard already; widening it needs a re-create, not a re-render"
+  plan=$(_agent_grant_standard_plan "$user")
+  state="${plan%%|*}"; detail="${plan#*|}"
+  case "$state" in
+    refuse) fail "$E_USAGE" "$detail" ;;
+    update) write_standard_sudoers "$user" 0 0 ;;
+  esac
+  local label_changed=false
+  if [[ "$iso" != "standard" ]]; then
+    _agent_stamp_isolation "$name" "standard"
+    label_changed=true
+  fi
+  secrets_member_sync "$user" "standard" \
+    || warn "could not take ${user} out of ${SECRETS_GROUP}; 'sudo 5dive _secrets_posture' retries (DIVE-5690)"
+  if [[ "$state" == "current" && "$label_changed" == false ]]; then
+    ok "${name}: already standard (managed policy and label both in place)" \
+       '{agent:$a, capability:"standard", changed:false, labelChanged:false, isolation:"standard", restartPending:false}' --arg a "$name"
+    return 0
+  fi
+  ok "${name}: isolation is now standard (was ${iso}) — exact 5dive verbs only, from its next sudo call; a running seat leaves the claude-keys group at its next restart (not done here)" \
+     '{agent:$a, capability:"standard", changed:($s=="update"), labelChanged:($l=="true"), isolation:"standard", previousIsolation:$i, restartPending:true}' \
+     --arg a "$name" --arg i "$iso" --arg s "$state" --arg l "$label_changed"
+}
+
 # DIVE-4557: stamp the isolation LABEL on both sources of truth at once.
 #
 # There are two, they are independent, and nothing reconciles them (DIVE-2218):
@@ -1265,10 +1326,10 @@ cmd_agent_grant() {
   require_root "agent grant"
   local name="${1:-}" cap="${2:-}"
   [[ $# -eq 2 && -n "$name" && -n "$cap" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent grant <name> <merge|push|deploy|admin|root>"
+    || fail "$E_USAGE" "usage: 5dive agent grant <name> <merge|push|deploy|admin|root|standard>"
   case "$cap" in
-    merge|push|deploy|admin|root) ;;
-    *) fail "$E_USAGE" "unknown capability '${cap}' — one of: merge, push, deploy, admin, root" ;;
+    merge|push|deploy|admin|root|standard) ;;
+    *) fail "$E_USAGE" "unknown capability '${cap}' — one of: merge, push, deploy, admin, root, standard" ;;
   esac
   local user="agent-${name}" reg iso
   reg=$(registry_read)
@@ -1286,6 +1347,12 @@ cmd_agent_grant() {
   # from managed root. Its own path for the same reason as root.
   if [[ "$cap" == "admin" ]]; then
     _cmd_agent_grant_admin "$name" "$user" "$iso"
+    return $?
+  fi
+  # DIVE-7143: `standard` re-isolates an admin (or managed-root) seat DOWN to the
+  # standard tier, the box pass that puts existing seats on the by-role rule.
+  if [[ "$cap" == "standard" ]]; then
+    _cmd_agent_grant_standard "$name" "$user" "$iso"
     return $?
   fi
   [[ "$iso" == "standard" ]] \
@@ -3412,8 +3479,8 @@ cmd_create() {
   # registry below — admin is never re-derived from create-order (which would
   # break if that agent is later deleted or a worker is created first). An
   # explicit --isolation always wins in either direction.
-  # DIVE-6410: a box set to `5dive config seat-isolation=admin` (a partner whose
-  # every seat is admin) gives admin here instead, first seat or not.
+  # DIVE-6410/7143: the box's seat-isolation rule decides it: by-role (the
+  # default) and admin give admin, standard keeps the first-seat-only rule.
   if (( ! isolation_explicit )); then
     isolation=$(_create_default_isolation "$(registry_read | jq -r '(.agents // {}) | length')")
   fi

@@ -374,6 +374,7 @@ _compose_create_args() {
   [[ -n "$profile"   ]] && printf '%s\n' "--auth-profile=${profile}"
   [[ -n "$isolation" ]] && printf '%s\n' "--isolation=${isolation}"
   _compose_push_args "$spec" "$isolation"
+  _compose_role_tier "$spec" "$isolation"
   [[ -n "$provider"  ]] && printf '%s\n' "--provider=${provider}"
   [[ -n "$api_key"   ]] && printf '%s\n' "--api-key=${api_key}"
   # DIVE-2757: a self-hosted endpoint has no catalog row, so `agent create`
@@ -489,9 +490,32 @@ _compose_import_args() {
     local wd_abs; wd_abs=$(_compose_resolve_path "$workdir" "$spec_dir")
     printf '%s\n' "--workdir=${wd_abs}"
   fi
-  # A pack seat's tier is otherwise the manifest's (or the box's); a non-pusher's
-  # is pinned here, to the spec's tier when it names one.
-  _compose_push_args "$spec" "" "$(jq -r '.isolation // empty' <<<"$spec")"
+  # DIVE-7143: the seat's own tier when the spec names one (a template's, or the
+  # one 5dive-api renders per seat), so a pack's manifest never decides a seat in
+  # a team; else the box's by-role rule by where the seat sits. A non-pusher's
+  # is pinned standard when neither names one (DIVE-6543).
+  local iso; iso=$(jq -r '.isolation // empty' <<<"$spec")
+  [[ -n "$iso" ]] && printf '%s\n' "--isolation=${iso}"
+  _compose_push_args "$spec" "$iso"
+  _compose_role_tier "$spec" "$iso"
+}
+
+# DIVE-7143: under the box's by-role rule (box_seat_rule), a seat whose spec
+# names no tier gets one from where it sits: the lead (no reports_to) admin, a
+# member standard. Printed explicitly, so neither create's lone-seat default nor
+# a pack's manifest reads a member as solo. Nothing when the spec named a tier,
+# when DIVE-6543 pinned a non-pusher, or under another rule (the box decides).
+_compose_role_tier() {
+  local spec="$1" emitted="${2:-}"
+  [[ -z "$emitted" ]] || return 0
+  [[ "$(jq -r 'if has("can_push") then (.can_push|tostring) else "" end' <<<"$spec")" != "false" ]] || return 0
+  declare -F box_seat_rule >/dev/null 2>&1 || return 0
+  [[ "$(box_seat_rule)" == by-role ]] || return 0
+  if jq -e '(.reports_to // null) | if type=="array" then length > 0 else (. != null and . != "") end' <<<"$spec" >/dev/null 2>&1; then
+    printf '%s\n' "--isolation=standard"
+  else
+    printf '%s\n' "--isolation=admin"
+  fi
 }
 
 # DIVE-6088: every seat's pack link is fetched BEFORE any seat is created. A
@@ -591,6 +615,8 @@ _compose_write_role_md() {
     for m in "${mgrs[@]}"; do
       block+="- You report to **${m}**. Escalate or sync: \`5dive agent send ${m} '<message>'\`."$'\n'
     done
+    # DIVE-7143: a member's seat is standard; root work goes up to its lead.
+    block+="- Work that needs root (sudo): ask **${mgrs[0]}** with what and why, \`5dive agent send ${mgrs[0]} '<what + why>'\`."$'\n'
   elif [[ -n "$share_team" ]]; then
     block+="- You lead this team; you answer to the human owner for its work."$'\n'
   else

@@ -3233,12 +3233,18 @@ _import_validate_isolation() {
 # a manifest value. The caller's value wins only when the flag was explicit.
 # DIVE-6410: a box set to `seat-isolation=admin` outranks the manifest (a pack's
 # tier is its author's guess; the box owner's setting is a decision), never the flag.
+# DIVE-7143: under by-role (the default) an import on its own has no team lead:
+# admin, which a manifest may narrow (an exported standard seat comes back
+# standard) but never widen. Team import passes a member's tier explicitly.
 _import_resolve_isolation() {
-  local manifest_value="$1" requested_value="$2" requested_set="$3"
+  local manifest_value="$1" requested_value="$2" requested_set="$3" rule=by-role
+  declare -F box_seat_rule >/dev/null 2>&1 && rule=$(box_seat_rule)
   if (( requested_set )); then
     printf '%s' "$requested_value"
-  elif declare -F box_seat_isolation >/dev/null 2>&1 && [[ "$(box_seat_isolation)" == admin ]]; then
+  elif [[ "$rule" == admin ]]; then
     printf 'admin'
+  elif [[ "$rule" == by-role ]]; then
+    case "$manifest_value" in standard|sandboxed) printf '%s' "$manifest_value" ;; *) printf 'admin' ;; esac
   else
     printf '%s' "$manifest_value"
   fi

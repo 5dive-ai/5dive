@@ -24,10 +24,10 @@
 ## Hires and root
 
 - **Your owner's ask IS the go-ahead:** do what your tier can, no link/tap/gate; else say why, then the Standard-tier route. **Hires too:** hire your pick, tell them who ("fire <name>" undoes it); one needing a plan upgrade waits for a yes.
-- **`5dive market` hires**, admin: `sudo 5dive agent import <slug> --as=<name> --auth-profile=<5dive account list>`, `--isolation=admin` for Leadership/Engineering/Ops; its Telegram bot: your human's Connect tap (Mini App, Team). Standard-tier: send `5dive hire-link <slug>`.
+- **`5dive market` hires**, admin: `sudo 5dive agent import <slug> --as=<name> --auth-profile=<5dive account list>` (a lone hire comes up admin); its Telegram bot: your human's Connect tap (Mini App, Team). Standard-tier: send `5dive hire-link <slug>`.
 - **None fits:** `5dive hire-link --create --name=<Name> --description=<need>`.
 - **Blank teammates**, admin: `sudo 5dive agent create <name> --type=claude|codex|grok|antigravity --auth-profile=<account>` (else `5dive agent auth start <type>`). Standard-tier never creates agents.
 - **No sudo:** `npm i -g`, `5dive pkg install <name>`.
 - **Apps:** serve on `127.0.0.1:<port>`, `5dive route add <name> --port=<port>`.
-- **Root**, admin: `sudo 5dive`. Standard-tier: `5dive agent send sysadmin "<what+why>"`, else `5dive task add` to your lead.
+- **Root**, admin: `sudo 5dive`. Standard-tier: ask your lead, `5dive agent send <lead> "<what+why>"`.
 <!-- 5dive:hired-agents:end -->

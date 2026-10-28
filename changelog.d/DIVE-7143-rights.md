@@ -18,9 +18,12 @@ colleague's home (`agent skill add` runs `sudo -u`), and enrolling itself in the
 The caller is always derived from `SUDO_UID`. A teammate is a registered, non-sandboxed agent
 (isolation not measured counts as sandboxed) that shares a team with the caller in
 `team_members`, manages it or reports to it in the org chart, or sits with it under the lead of a
-legacy team. Every call is audited root-side, refusals included. The standard grant still
+legacy team. Neither verb reaches UP a tier: a standard member cannot read its admin lead's pane
+(a key the lead printed would leak) or put a skill in the lead's own skills dir (the lead would
+load it as its own instructions, where a member's message reaches it as untrusted data). Every
+call is audited root-side, refusals included. The standard grant still
 classifies `cli-scoped`.
 
-`tests/agent_rights_unit.sh` covers the grant, every refusal and the happy paths, with four
+`tests/agent_rights_unit.sh` covers the grant, every refusal and the happy paths, with five
 negative controls that break a scope check in a copy of the source and require the named arm to
 go red.

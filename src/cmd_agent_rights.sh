@@ -27,6 +27,8 @@
 #   3. a legacy team (a projects row with a lead and a team manifest on the box
 #      but no team_members rows): both sit in the org subtree under its lead,
 #      the same fallback every team surface reads (_team_members_backfill).
+# And never UP a tier: the target's registry tier may not be wider than the
+# caller's (a standard member cannot read or write into its admin lead).
 # Anything else is refused with one line saying which check failed.
 
 RIGHTS_PEEK_DEFAULT=80
@@ -121,6 +123,20 @@ _rights_scope_target() {
   [[ -z "$by" ]] && return 0
   _rights_teammates "$by" "$to" \
     || _rights_refuse "$verb" "$E_PERMISSION" "$by" "refused: '$to' is not your teammate (you share no team and neither of you manages the other)" "target=$to"
+  # Never UP a tier: a standard member may not read its admin lead's pane (a key
+  # the lead printed would leak) nor plant a skill the lead loads as its own
+  # instructions (a member's messages reach the lead as untrusted data; a skill
+  # in its own dir does not). An unmeasured target counts as the widest.
+  (( $(_rights_tier_rank "$to" 9) <= $(_rights_tier_rank "$by" 0) )) \
+    || _rights_refuse "$verb" "$E_PERMISSION" "$by" "refused: '$to' holds a wider seat than yours, and this verb never reaches up a tier (ask '$to' instead)" "target=$to"
+}
+
+# _rights_tier_rank <name> <default> — the registry tier as a rank; <default>
+# for a seat whose tier is not one of the four.
+_rights_tier_rank() {
+  case "$(agent_tier "$1")" in
+    sandboxed) printf 1 ;; standard) printf 2 ;; admin) printf 3 ;; beyond-admin) printf 4 ;; *) printf '%s' "$2" ;;
+  esac
 }
 
 # ── agent _peek ────────────────────────────────────────────────────────────────

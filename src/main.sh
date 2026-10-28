@@ -125,6 +125,9 @@ Agents:
                                                      # as root), rendered as create --isolation=admin renders it:
                                                      # sudoers, registry + env label, claude-keys. From standard or
                                                      # managed root; refuses sandboxed and hand-written policies.
+  5dive agent grant <name> standard                  # root: re-isolate an admin seat DOWN to standard (DIVE-7143):
+                                                     # the standard sudoers, registry + env label, out of
+                                                     # claude-keys at its next restart. Refuses hand-written policies.
   5dive agent grant <name> root                      # root: CONFER unrestricted root (any command, any user)
                                                      # on a seat of any tier. Writes a managed, visudo-checked
                                                      # drop-in, stamps the label beyond-admin so agent info
