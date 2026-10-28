@@ -434,7 +434,7 @@ BLOCK=$(sed -n '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/p' 
 # go-ahead, but a need is not a yes to a pack the lead picked: the market line
 # itself says the hire waits for it (the custom path's --create output already did).
 for want in 'Standard-tier never creates agents' 'Standard-tier: send `5dive hire-link <slug>`' \
-            '5dive pkg install' '5dive route add <name> --port=<port>' '5dive task add' 'npm i -g' \
+            '5dive pkg install' '5dive route add <name> --port=<port>' 'Standard-tier: ask your lead, `5dive agent send <lead>' 'npm i -g' \
             '**Blank teammates**, admin: `sudo 5dive agent create' '--type=claude|codex|grok|antigravity' \
             '5dive agent auth start <type>' '**`5dive market` hires**, admin:' \
             "its Telegram bot: your human's Connect tap (Mini App, Team)" \
@@ -490,8 +490,12 @@ HIRE=$(grep -F '**`5dive market` hires**' <<<"$BLOCK" | grep -oE '`sudo 5dive ag
 [[ "$HIRE" == 'sudo 5dive agent import <slug> --as=<name> --auth-profile=<5dive account list>' ]] \
   && ok 'the admin hire is one exact sudo agent import line' || bad "admin hire verb ($HIRE)"
 CAT=$(grep -F '**`5dive market` hires**' <<<"$BLOCK")
-grep -qF '`--isolation=admin` for Leadership/Engineering/Ops' <<<"$CAT" \
-  && ok 'the admin hire names the Mini App seat rule' || bad 'the admin hire names the Mini App seat rule'
+# DIVE-7143: the box's by-role default makes a lone import admin, so the line
+# passes no tier (a hand-picked one would undo the rule) and says what comes up.
+grep -qF -- '--isolation' <<<"$CAT" \
+  && bad 'the admin hire passes no --isolation (the by-role default decides)' || ok 'the admin hire passes no --isolation (the by-role default decides)'
+grep -qF '(a lone hire comes up admin)' <<<"$CAT" \
+  && ok 'the admin hire says a lone hire comes up admin' || bad 'the admin hire says a lone hire comes up admin'
 # Drive the REAL cmd_import with that line (placeholders filled the way an agent
 # fills them) up to cmd_create, which records its argv and stops: nothing is made.
 L=${HIRE#sudo 5dive agent import }; L=${L//<slug>/dario}; L=${L//<name>/dario}

@@ -14,12 +14,24 @@ _box_config_read() {
   [[ -r "$f" ]] && cat "$f" 2>/dev/null || printf '{}'
 }
 
-# DIVE-6410: the box's tier for a new seat that names none — "admin" or empty
-# (the built-in rule). Anything else in the file reads as empty, so a hand-edited
-# value can never widen a seat beyond what the setter accepts.
+# DIVE-6410 + DIVE-7143: the box's stored rule for a new seat that names no
+# tier — "by-role", "admin", "standard", or empty (unset). Anything else in the
+# file reads as empty, so a hand-edited value never reaches a seat.
 box_seat_isolation() {
   local v; v=$(jq -r '.seat_isolation // empty' <<<"$(_box_config_read)" 2>/dev/null || true)
-  [[ "$v" == admin ]] && printf 'admin' || true
+  case "$v" in by-role|admin|standard) printf '%s' "$v" ;; esac
+}
+
+# DIVE-7143 (lodar 2026-10-28): the rule in force, unset reading by-role, on
+# every box. by-role = a seat that leads a team or has no team lead is admin, a
+# team member standard (team import pins each seat by where it sits, and
+# 5dive-api adds Leadership/Engineering/Ops members); admin = every new seat
+# admin (DIVE-6410); standard = the DIVE-1002 rule, the first seat on an empty
+# box admin and every later one standard. Read at create time only: no
+# existing seat changes with it.
+box_seat_rule() {
+  local v; v=$(box_seat_isolation)
+  printf '%s' "${v:-by-role}"
 }
 
 cmd_box_config() {
@@ -44,7 +56,7 @@ cmd_box_config() {
         "       5dive config openrouter-key=- < keyfile | clear" \
         "       5dive config mod-seat=on|off|default" \
         "       5dive config telegram-app=on|off|default" \
-        "       5dive config seat-isolation=admin|default" \
+        "       5dive config seat-isolation=by-role|admin|standard|default" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
         "             always          every standard row is graded" \
@@ -118,9 +130,12 @@ cmd_box_config() {
         "             5dive inside Telegram, signed into the box owner's account (DIVE-5185)." \
         "             Default on; off hides nothing else and changes no other command." \
         "  seat-isolation  the tier a NEW agent gets when its create or import names no" \
-        "             --isolation (DIVE-6410). admin = every new seat is admin, including" \
-        "             a pack whose manifest names a tier; an explicit --isolation still wins." \
-        "             Default: the first seat on an empty box is admin, later seats standard." \
+        "             --isolation (DIVE-6410, DIVE-7143). by-role (the default) = a seat" \
+        "             that leads a team, or has no team lead, is admin; a team member is" \
+        "             standard (team import sets each seat by where it sits). A pack's" \
+        "             manifest can narrow a lone import, never widen it. admin = every new" \
+        "             seat admin. standard = the first seat on an empty box admin, later" \
+        "             seats standard. An explicit --isolation always wins." \
         "             Existing seats are not changed: 'agent grant <name> admin' does that." \
         "  account-poll  on = the heartbeat reads every Claude account's 5h/7d usage from" \
         "             the provider every 10 min, busy or not (DIVE-6713). Off by default."
@@ -179,8 +194,8 @@ cmd_box_config() {
     # DIVE-5185: the /app button; anything but "off" is on.
     local ta; ta=$(jq -r '.telegram_app // "on"' <<<"$(_box_config_read)" 2>/dev/null || printf on)
     [[ "$ta" == off ]] || ta=on
-    # DIVE-6410: the tier a new seat gets when nothing names one.
-    local si; si=$(box_seat_isolation); [[ -n "$si" ]] || si=default
+    # DIVE-6410/7143: the rule a new seat gets when nothing names a tier.
+    local si; si=$(box_seat_rule)
     # DIVE-6713: the account-usage poll; anything but "on" is off. The
     # dashboard reads this field's PRESENCE to know the box can take the toggle.
     local ap; ap=$(jq -r '.account_poll // "off"' <<<"$(_box_config_read)" 2>/dev/null || printf off)
@@ -202,7 +217,7 @@ openrouter-key = ${ok_k}
 openrouter-keys = $(jq -r '"reflex: \(.reflex) · " + (if (.plugins | length) == 0 then "every plugin: shared" else ((.plugins | keys | map(. + ": own") | join(" · ")) + " · any other plugin: shared") end)' <<<"$okeys")
 mod-seat = ${ms} (box-wide, default off)
 telegram-app = ${ta} (box-wide, default on)
-seat-isolation = ${si} (box-wide; default = first seat admin, later seats standard)
+seat-isolation = ${si} (box-wide; default by-role = leads and solo agents admin, team members standard)
 account-poll = ${ap} (box-wide, default off)" \
        '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s,
          reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk, reflex_key_source:$rks,
@@ -323,10 +338,9 @@ account-poll = ${ap} (box-wide, default off)" \
       # DIVE-5185. Stored as .telegram_app; `default` clears it (= on).
       telegram-app|telegram_app) [[ "$v" == on || "$v" == off || "$v" == default ]] \
                 || fail "$E_VALIDATION" "telegram-app takes one of: on, off, default — got '$v'" ;;
-      # DIVE-6410. Stored as .seat_isolation; `default` clears it. Only admin is
-      # offered: the built-in default already gives standard to every later seat.
-      seat-isolation|seat_isolation) [[ "$v" == admin || "$v" == default ]] \
-                || fail "$E_VALIDATION" "seat-isolation takes one of: admin, default — got '$v'" ;;
+      # DIVE-6410/7143. Stored as .seat_isolation; `default` clears it (= by-role).
+      seat-isolation|seat_isolation) [[ "$v" == by-role || "$v" == admin || "$v" == standard || "$v" == default ]] \
+                || fail "$E_VALIDATION" "seat-isolation takes one of: by-role, admin, standard, default — got '$v'" ;;
       # DIVE-6713. Stored as .account_poll; `default` clears it (= off). Our
       # own boxes only for now: it polls every Claude account every 10 min.
       account-poll|account_poll) [[ "$v" == on || "$v" == off || "$v" == default ]] \

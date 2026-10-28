@@ -49,7 +49,7 @@ parse_skill_spec() {
 cmd_skill() {
   local name="${1:-}"
   [[ -n "$name" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent skill <name>|--all add|list|rm [...]"
+    || fail "$E_USAGE" "usage: 5dive agent skill <name>|--all add|list|rm|give [...]"
   shift
   # --all only supports `list` (bulk read); add/rm stay per-agent so the
   # blast radius of a mutation is always a single named agent.
@@ -63,13 +63,15 @@ cmd_skill() {
   require_agent "$name"
   local action="${1:-}"
   [[ -n "$action" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent skill $name add|list|rm [...]"
+    || fail "$E_USAGE" "usage: 5dive agent skill $name add|list|rm|give [...]"
   shift
   case "$action" in
     add)       cmd_skill_add  "$name" "$@" ;;
     list)      cmd_skill_list "$name" "$@" ;;
     rm|remove) cmd_skill_rm   "$name" "$@" ;;
-    *) fail "$E_USAGE" "unknown skill action: $action (use add | list | rm)" ;;
+    # DIVE-7143: copy one of YOUR skills to teammate <name> (src/cmd_agent_rights.sh).
+    give)      cmd_agent_skill_give "$name" "$@" ;;
+    *) fail "$E_USAGE" "unknown skill action: $action (use add | list | rm | give)" ;;
   esac
 }
 
