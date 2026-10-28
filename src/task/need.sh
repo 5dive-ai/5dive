@@ -5630,10 +5630,26 @@ db "BEGIN IMMEDIATE;
   # rc 3 = filed, answerable, but nobody was PINGED. Say so on the record instead
   # of letting an unnotified gate read exactly like a notified one — that
   # indistinguishability is the whole defect this ticket started from.
-  local notified=1 unnotified_note=""
+  local notified=1 unnotified_note="" link_note="" _ul_url="" _ul_iso=""
   if [[ "$_nrc" == "3" ]]; then
     notified=0
-    unnotified_note=" [UNNOTIFIED — nobody was pinged; answer on the dashboard or: 5dive task answer ${ident}]"
+    unnotified_note=" [UNNOTIFIED — nobody was pinged; $(_task_gate_answer_where "$ident")]"
+    # DIVE-7151: no alert went out, so no link was minted, and on a box with no
+    # chat channel the filer is the one who must pass it on. Mint it here and put
+    # it first in the line; a failure is warned with its reason and fallback.
+    # A box linked to 5dive.app chat prints its own page below (DIVE-7102).
+    if [[ "$type" == secret && -n "$secret_key" && -n "$connector" ]] && ! box_is_chat_only; then
+      local _ul _ul_exp _ul_ttl
+      _ul=$(_task_unnotified_secret_link "$ident" "$secret_key" "$connector") || _ul=""
+      if [[ "$_ul" == https://*"|"* ]]; then
+        _ul_url="${_ul%%|*}"; _ul_ttl="${_ul##*|}"; [[ "$_ul_ttl" =~ ^[0-9]+$ ]] || _ul_ttl=30
+        _ul_exp=$(date -u -d "+${_ul_ttl} min" '+%H:%M UTC' 2>/dev/null) || _ul_exp="in ${_ul_ttl} min"
+        _ul_iso=$(date -u -d "+${_ul_ttl} min" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || _ul_iso=""
+        link_note=" [no chat channel, so nobody was pinged: send the owner this link yourself — one use, until ${_ul_exp}; the value goes onto this box and never into chat: ${_ul_url}]"
+        unnotified_note=""
+        step "Send the owner this link (one use, until ${_ul_exp}; the value never goes in chat): ${_ul_url}"
+      fi
+    fi
   fi
   # DIVE-4413: SAY WHERE IT WENT, AND — with no human accounts on the box — SAY
   # THAT IT WAS A BROADCAST.
@@ -5684,6 +5700,7 @@ db "BEGIN IMMEDIATE;
     _plan=$(_task_legacy_owner_destinations "${TASK_CH_ACCESS:-}") || _plan=""
     [[ -n "$_plan" ]] && dest_note=" [ping not sent yet (held by the undo window) — it goes to ${_plan}]"
   fi
+  [[ -n "$_ul_iso" ]] && _lk_iso="$_ul_iso"
   if (( _legacy )) && [[ -z "$_offbox_owner" ]] && _task_deployment_has_channels; then
     local _bcast="${_dest:-$_plan}"
     warn "no human accounts on this box (\`5dive human ls\` is empty), so this gate takes the legacy BROADCAST path${_bcast:+ — it goes to ${_bcast}}. Everyone on that chat or topic can read the ask and tap its buttons. Name the person instead: sudo 5dive human add <id> --telegram=<chat id>"
@@ -5752,7 +5769,7 @@ db "BEGIN IMMEDIATE;
     unnotified_note=""
     step "Send the owner this link (self-hosted box; the value never goes in chat): ${_sh_url}"
   fi
-  ok "$ident needs a human ($type, tier $tier)${selfhost_note}${floor_note}${prec_note}${unnotified_note}${dest_note}${_nr_note} — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), delivered_to:(($dt|select(length>0)) // null), drop_link_expires_at:(($dle|select(length>0)) // null), selfhost_secret_url:(($shu|select(length>0)) // null), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg dt "${TASK_SEND_TARGETS:-}" --arg dle "$_lk_iso" --arg shu "$_sh_url" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
+  ok "$ident needs a human ($type, tier $tier)${selfhost_note}${link_note}${floor_note}${prec_note}${unnotified_note}${dest_note}${_nr_note} — $ask" \
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), delivered_to:(($dt|select(length>0)) // null), drop_link_expires_at:(($dle|select(length>0)) // null), selfhost_secret_url:(($shu|select(length>0)) // null), secret_link_url:(($slu|select(length>0)) // null), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg dt "${TASK_SEND_TARGETS:-}" --arg dle "$_lk_iso" --arg shu "$_sh_url" --arg slu "$_ul_url" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }
