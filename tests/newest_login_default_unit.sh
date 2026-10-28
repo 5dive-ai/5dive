@@ -102,6 +102,9 @@ rm -rf "$AUTH_PROFILES_DIR/gpt"
 eq_t 'ChatGPT removed too: no default, hires land on Claude by their own rules' none "$(pick)"
 chatgpt_login gpt
 eq_t 'ChatGPT added again under the same name: it is new again' gpt:codex "$(pick)"
+# Back in time first: gpt2 stamped in the same second as gpt would tie, and the
+# tie goes to the name that sorts first (gpt), not to the login added last.
+age gpt codex 10
 _before=$(cat "$LEDGER")
 chmod a-w "$AUTH_PROFILES_DIR"; chatgpt_login gpt2 2>/dev/null
 if [[ ! -d "$AUTH_PROFILES_DIR/gpt2" ]]; then
