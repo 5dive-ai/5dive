@@ -1,7 +1,33 @@
 # 5dive in Docker
 
-Try `5dive` without touching your host. The container runs systemd as PID 1
-and has the CLI pre-installed.
+Run `5dive` in a container: host it on a Mac mini or a home server, or just try
+it without touching your machine. The container runs systemd as PID 1 and has
+the CLI pre-installed.
+
+## Host it on a Mac mini
+
+Install [Docker Desktop](https://www.docker.com/products/docker-desktop/), then:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/5dive-ai/5dive/main/docker/compose.yaml && docker compose up -d
+docker exec -it 5dive 5dive init
+```
+
+The image is built for Apple Silicon (arm64) and Intel (amd64).
+
+- **Your agents are kept.** Agents, logins and Telegram bots live on Docker
+  volumes, so restarts, recreates and updates keep them. Only
+  `docker compose down -v` deletes them.
+- **It comes back after a reboot.** The container restarts by itself; turn on
+  *Start Docker Desktop when you sign in* in Docker Desktop's settings, and set
+  the Mac to log in automatically.
+- **Update:** `docker compose pull && docker compose up -d`. Pin a release with
+  `FIVEDIVE_TAG=v0.106.0 docker compose up -d`.
+- **Use a machine that is only for 5dive.** The container runs `--privileged`
+  (each agent is a systemd service). That is fine on a Mac mini you keep for
+  this; do not run it on a computer you share or on a shared server.
+
+The same file works on any Linux box with Docker.
 
 ## Build
 
@@ -13,7 +39,7 @@ Build from the **repo root**, not from inside `docker/` — the Dockerfile
 `COPY`s the CLI bundle (`5dive`, `install.sh`, `bin/`, `prompts/`) plus
 `hooks/`, `skills/`, and `systemd/` from the working tree.
 
-## Run
+## Run a throwaway demo
 
 ```sh
 docker run -d --name 5dive-demo --privileged 5dive
@@ -76,12 +102,19 @@ The image (and any auth credentials added inside the container) goes with it.
 
 ## Caveats
 
-- **Not for production.** This image is for evaluation — the systemd-in-Docker
-  setup needs `--privileged`, which is a security trade-off most teams won't
-  want past a kick-the-tires session. For real use, run the host installer.
-- **State is ephemeral.** `docker rm` deletes the agent registry, auth
-  profiles, and Telegram tokens. To persist, mount volumes for
-  `/var/lib/5dive` and `/etc/5dive/connectors`.
+- **`--privileged` is a real trade-off.** systemd-in-Docker needs it. Fine on
+  a machine kept for 5dive (see *Host it on a Mac mini*); on a shared host,
+  run the host installer instead.
+- **A bare `docker run` is ephemeral.** `docker rm` deletes the agent
+  registry, auth profiles, and Telegram tokens. To keep them, use
+  `compose.yaml`: it keeps every path an agent lives on (`/etc`, `/home`,
+  `/root`, `/var/lib/5dive`, `/var/spool/cron`) on named volumes. Named, not
+  bind mounts: Docker seeds an empty named volume from the image, and the CLI
+  needs that seed.
+- **What an update re-applies.** When a newer image starts on saved volumes,
+  it re-runs the installer from the image once, as `5dive self-update` does
+  on a host. Anything else you installed by hand outside those paths (an
+  `apt-get install`) is gone after a recreate.
 - **OAuth flows are awkward.** Device-code flows work; browser-based flows
   inside a headless container don't. Prefer `5dive agent auth set <type>
   --api-key=<key>` when trying the container.
