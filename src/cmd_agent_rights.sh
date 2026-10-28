@@ -52,8 +52,11 @@ _rights_seat_user() { getent passwd "agent-$1" >/dev/null 2>&1; }
 _rights_as()        { local u="$1"; shift; sudo -n -u "$u" -H -- "$@"; }
 
 # The calling seat, from SUDO_UID. Empty (rc 1) for root itself, a non-agent
-# uid, or no sudo stamp at all.
+# uid, or no sudo stamp at all. Every caller is already past _gate_is_root; the
+# guard is repeated here because below EUID 0 SUDO_UID is a plain env var any
+# caller can set (DIVE-1413), and only sudo's own stamp may name the seat.
 _rights_caller() {
+  _gate_is_root || return 1
   local uid="${SUDO_UID:-}" a
   [[ "$uid" =~ ^[0-9]+$ && "$uid" != 0 ]] || return 1
   a=$(_gate_uid_to_agent "$uid")
