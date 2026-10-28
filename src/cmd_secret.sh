@@ -57,6 +57,9 @@ _secret_usage() {
       A value of several lines (a PEM key, JSON) is saved whole in
       /etc/5dive/connectors/<name>.d/<KEY>, and <name>.env gets KEY_FILE=<that path>.
       Run at a terminal with nothing piped, it asks for the value (hidden input).
+      A key with several parts (X's four, AWS's id + secret) is one call:
+      KEY=A,B,C, one line per key on stdin in that order, or one hidden prompt
+      each. All are checked before any is written (DIVE-7184).
       An agent seat with no root runs the same line without sudo for
       --connector=tools: it may add a new key, or replace one it saved itself,
       never one the owner or another seat saved (DIVE-7168).
@@ -102,6 +105,25 @@ EOF
 # Restricting to this charset also makes it safe to interpolate into the
 # `^KEY=` grep pattern below without regex-escaping.
 _valid_env_key() { [[ "$1" =~ ^[A-Z_][A-Z0-9_]*$ ]]; }
+# DIVE-7184: a gate's KEY may be several, comma-joined (A,B,C): one link, one
+# box per key. Each must be a valid name, none twice, at most SECRET_KEYS_MAX.
+SECRET_KEYS_MAX=8
+_valid_env_keys() {
+  local k seen=","
+  [[ "$1" == *[!A-Z0-9_,]* || "$1" == ,* || "$1" == *, || "$1" == *,,* ]] && return 1
+  local -a ks=(); IFS=, read -ra ks <<<"$1"
+  (( ${#ks[@]} >= 1 && ${#ks[@]} <= SECRET_KEYS_MAX )) || return 1
+  for k in "${ks[@]}"; do
+    _valid_env_key "$k" && [[ "$seen" != *",$k,"* ]] || return 1
+    seen+="$k,"
+  done
+}
+# "A,B,C" -> "A, B and C", for a sentence an owner reads.
+_secret_keys_words() {
+  local s="${1//,/, }"
+  [[ "$s" == *", "* ]] && s="${s%, *} and ${s##*, }"
+  printf '%s' "$s"
+}
 # connector filename stem: lower alnum + dashes; no dots/slashes -> no path
 # traversal, no hidden double-extension.
 _valid_connector() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
@@ -534,11 +556,13 @@ _secret_reveal() {
 }
 
 # DIVE-7102: the ident of the one open secret gate naming <key> + <connector>.
+# DIVE-7184: a gate asking for several keys names <key> when it is one of them;
+# it then closes only once the last of them lands (task answer checks them all).
 _secret_open_gate_for() { # <key> <connector>
   local rows
   declare -F db >/dev/null 2>&1 || return 1
   rows=$(db "SELECT ident FROM tasks WHERE need_type='secret' AND need_answered_at IS NULL
-               AND secret_key=$(sqlq "$1") AND connector=$(sqlq "$2") ORDER BY id;" 2>/dev/null) || return 1
+               AND instr(','||secret_key||',', $(sqlq ",$1,")) > 0 AND connector=$(sqlq "$2") ORDER BY id;" 2>/dev/null) || return 1
   [[ -n "$rows" && "$rows" != *$'\n'* ]] || return 1
   printf '%s' "$rows"
 }
@@ -560,6 +584,10 @@ _secret_write() {
     shift
   done
 
+  # DIVE-7184: several keys at once (one gate's link, or the terminal line it prints).
+  if [[ "$key" == *,* ]]; then
+    _secret_write_many "$key" "$connector" "$task"; return
+  fi
   # DIVE-7168: a standard seat saves a key it made itself (tools only, a new
   # name or one it saved before) through its own grant; see _seat_secret_write.
   if [[ "$connector" == tools && -z "$task" ]] && _seat_secret_eligible; then
@@ -817,6 +845,72 @@ _seat_secret_put() {  # <seat> <key> <value>
       > "$SEAT_SECRET_WRITERS.tmp" && mv -f "$SEAT_SECRET_WRITERS.tmp" "$SEAT_SECRET_WRITERS" ) \
     || warn "saved, but who saved $key was not recorded"
   _secret_write_done "$key" tools "$action" "$TOOLS_ENV_FILE" "every agent's environment, as \$${key} (saved by ${seat})" ""
+}
+
+# DIVE-7184: write several keys from one paste: one line per key on stdin, in
+# order, or one hidden prompt each at a terminal. Every value is checked against
+# its store's rule before the first is written, so a refusal saves nothing and
+# the owner's retry is whole. Each key then goes through the one-key path above.
+_secret_write_many() { # <K1,K2,...> <connector> <task>
+  local keys="$1" connector="$2" task="$3" k i
+  require_root secret write
+  _valid_env_keys "$keys" \
+    || fail "$E_USAGE" "invalid KEY list '$keys' (up to $SECRET_KEYS_MAX env-var names, comma-separated, none twice)"
+  _valid_connector "$connector" || fail "$E_USAGE" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]*\$)"
+  [[ "$connector" == "$SECRET_SAVED_CONNECTOR" ]] \
+    && fail "$E_USAGE" "a saved value is one name; for a login use: secret link --save=<name> --pair"
+  local -a ks=() vals=(); IFS=, read -ra ks <<<"$keys"
+  if [[ "$connector" == tools ]]; then
+    for k in "${ks[@]}"; do
+      _tools_var_reserved "$k" && fail "$E_VALIDATION" "$k is not allowed for --connector=tools (a tools key ends _KEY, _TOKEN, _SECRET or _PASSWORD and is not a seat's own). Nothing was saved"
+    done
+  fi
+  if [[ "$connector" == project-* ]]; then
+    local pfile; pfile="$(_secret_project_file "$connector")" || fail "$E_VALIDATION" "--connector=$connector: $pfile. Nothing was saved"
+  fi
+  local v
+  if [[ -t 0 ]]; then
+    for k in "${ks[@]}"; do
+      printf 'Paste the value for %s (hidden), then Enter: ' "$k" >&2
+      IFS= read -rs v || v=""
+      printf '\n' >&2
+      vals+=("$v")
+    done
+  else
+    while IFS= read -r v || [[ -n "$v" ]]; do vals+=("${v%$'\r'}"); done
+  fi
+  v=""
+  local got=${#vals[@]}
+  (( got == ${#ks[@]} )) \
+    || { vals=(); fail "$E_VALIDATION" "${keys} takes ${#ks[@]} values, one line each, got ${got}. Nothing was saved"; }
+  for i in "${!ks[@]}"; do
+    [[ -n "${vals[$i]}" ]] || { vals=(); fail "$E_VALIDATION" "${ks[$i]} is empty. Nothing was saved"; }
+    case "$connector" in
+      tools) _tool_value_ok "${vals[$i]}" ;;
+      project-*) [[ "${vals[$i]}" =~ ^[A-Za-z0-9_./:+=@,~-]+$ ]] ;;
+      *) true ;;
+    esac || { vals=(); fail "$E_VALIDATION" "${ks[$i]}: $(_secret_drop_rule "$connector") Nothing was saved"; }
+  done
+  for i in "${!ks[@]}"; do
+    # printf is a builtin: the value never reaches an argv.
+    printf '%s' "${vals[$i]}" | ( _secret_write "${ks[$i]}" --connector="$connector" ) >/dev/null 2>&1 \
+      || { vals=(); fail "$E_GENERIC" "could not save ${ks[$i]}; $(( i )) of ${#ks[@]} were saved before it. Run the same command again"; }
+  done
+  vals=()
+  local where="$connector"
+  case "$connector" in
+    tools) where="every agent's environment" ;;
+    project-*) where="$(_secret_project_file "$connector")" ;;
+    *) where="${CONNECTORS_DIR}/${connector}.env" ;;
+  esac
+  if [[ -n "$task" ]]; then
+    local _ans_out _ans_rc=0
+    _ans_out=$(5dive task answer "$task" --human --from=drop 2>&1 >/dev/null) || _ans_rc=$?
+    (( _ans_rc == 0 )) || warn "saved, but $task was not marked provided (${_ans_out:-rc $_ans_rc}); tell its agent the values are in ${where}"
+  fi
+  ok "secret saved: $(_secret_keys_words "$keys") -> ${where}" \
+     '{connector: $c, keys: ($k | split(",")), path: $p}' \
+     --arg c "$connector" --arg k "$keys" --arg p "$where"
 }
 
 _secret_write_done() {

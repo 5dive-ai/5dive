@@ -2182,6 +2182,8 @@ cmd_task_answer() {
       if [[ "$_ping_conn" == tools && -n "$_ping_sk" ]]; then
         # DIVE-5370: the tools store is every agent's environment (BASH_ENV).
         pingmsg="${ident} secret gate provided — \$${_ping_sk} is set in your environment from your next command. Resume the task and use it from there, NOT from the task."
+        # DIVE-7184: a gate that asked for several keys.
+        [[ "$_ping_sk" == *,* ]] && pingmsg="${ident} secret gate provided — \$${_ping_sk//,/, \$} are set in your environment from your next command. Resume the task and use them from there, NOT from the task."
       elif [[ -n "$_ping_sk" && -n "$_ping_conn" ]] \
          && grep -qxF "${_ping_sk}_FILE=${_ping_dir}/${_ping_conn}.d/${_ping_sk}" "${_ping_dir}/${_ping_conn}.env" 2>/dev/null; then
         # DIVE-5384: a value of several lines is its own file, named from the .env.

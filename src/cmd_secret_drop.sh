@@ -200,7 +200,7 @@ _secret_link_gate() {
   [[ -z "$answered" ]]    || fail "$E_CONFLICT" "$ident secret gate is already answered"
   [[ -n "$key" && -n "$connector" ]] \
     || fail "$E_CONFLICT" "$ident names no place on this box for the value (it was filed --out-of-band), so a link has nowhere to write it"
-  _valid_env_key "$key" && _valid_connector "$connector" \
+  _valid_env_keys "$key" && _valid_connector "$connector" \
     || fail "$E_VALIDATION" "$ident drop target is malformed (${key} -> ${connector})"
 
   # DIVE-6205: an AGENT asking while a link for this gate is live gets told so,
@@ -277,6 +277,7 @@ _secret_link_mint() {
   [[ "$ready" == false ]] && note="
 not ready yet: the secure page is still getting its certificate. If the link does not open, wait a minute and open it again (it stays valid)."
   local lands="the value lands as ${key} in ${connector}.env and clears ${ident}"
+  [[ "$key" == *,* ]] && lands="the page has one box for each of $(_secret_keys_words "$key"); they land in ${connector}.env and clear ${ident}"
   [[ -n "$save" ]] && lands="the value is saved as ${save}, for agents to type into a site"
   (( pair )) && lands="the login, password and optional 2FA key are saved as ${save}, for agents to sign in with"
   # DIVE-7128: the url reaches jq through the environment, not argv, which any
@@ -340,24 +341,37 @@ _secret_drop_peek() {
   fi
   local id; id=$(_secret_drop_gate_open "$ident" "$key" "$connector")
   if [[ -z "$id" ]]; then
-    _secret_drop_burn_task "$ident"; fail "$E_CONFLICT" "gate no longer open"
+    # DIVE-7184: only THIS link. Burning the task's links here also killed a live
+    # link minted for the gate that replaced this one (link 4 of 4, 30 s after
+    # the owner opened link 1).
+    rm -f "$f"; fail "$E_CONFLICT" "gate no longer open"
   fi
   local ask agent
   ask=$(db "SELECT COALESCE(ask,'') FROM tasks WHERE id=${id};")
   # The seat that filed the gate is the one asking; the assignee can differ (a
   # box's routing may move the row), which made the page name the wrong agent.
   agent=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),assignee,'') FROM tasks WHERE id=${id};")
-  ok "$ident $key" '{task: $i, key: $k, connector: $c, ask: $a, agent: $g, expires: ($x|tonumber), rule: $r}' \
+  local multi=0; [[ "$key" == *,* ]] && multi=1
+  ok "$ident $key" '{task: $i, key: $k, keys: ($k | split(",")), connector: $c, ask: $a, agent: $g, expires: ($x|tonumber), rule: $r}' \
      --arg i "$ident" --arg k "$key" --arg c "$connector" --arg a "$ask" --arg g "$agent" --arg x "$exp" \
-     --arg r "$(_secret_drop_rule "$connector")"
+     --arg r "$(_secret_drop_rule "$connector" 0 "$multi")"
 }
 
 # DIVE-6727: the rule a refused paste broke, in the owner's words, by the gate's
 # connector class. Static text: it names the rule and never carries a byte of the
 # value. The page shows it on a refusal (from _peek), and the agent is told it.
-_secret_drop_rule() { # <connector> [<pair: 1>]
+_secret_drop_rule() { # <connector> [<pair: 1>] [<several keys: 1>]
   [[ "$1" == saved && "${2:-0}" == 1 ]] \
     && { printf '%s' "The login and the password must each be one line. A 2FA setup key is the code of letters A-Z and digits 2-7 the site shows when you add an authenticator app."; return; }
+  # DIVE-7184: one box per key, each one line; all are checked before any is saved.
+  if [[ "${3:-0}" == 1 ]]; then
+    case "$1" in
+      tools) printf '%s' "Every box must be filled, each with one line: no spaces and no ' mark, only plain keyboard letters, digits and symbols. Nothing is saved until all of them fit." ;;
+      project-*) printf '%s' 'Every box must be filled, each with only letters, digits and these marks: _ . / : + = @ , ~ - (no spaces, quotes, $, # or line breaks). Nothing is saved until all of them fit.' ;;
+      *) printf '%s' "Every box must be filled, each with one line. Nothing is saved until all of them are." ;;
+    esac
+    return
+  fi
   case "$1" in
     tools) printf '%s' "It must be one line, with no spaces and no ' mark: only plain keyboard letters, digits and symbols, at most 1024 of them." ;;
     saved) printf '%s' "It must be one line: it is typed into one field of a page." ;;
@@ -431,7 +445,7 @@ _secret_drop_tell_refused() { # <ident> <id> <key> <connector> <link file>
   agent=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),assignee,'') FROM tasks WHERE id=${id};" 2>/dev/null)
   [[ -n "$agent" ]] || { _secret_drop_log "$ident: no agent to tell that a paste for $key was refused"; return 0; }
   printf 'refused_told=%s\n' "$now" >> "$f"
-  _task_answer_ping_detached "$agent" --wake --message="${ident}: your owner's paste for ${key} on the secure link was refused at $(date -u -d "@$now" +%H:%M) UTC; nothing was saved and the link still works. The rule the page showed them: $(_secret_drop_rule "$conn") Do not file a new gate or ask for the value in chat." \
+  _task_answer_ping_detached "$agent" --wake --message="${ident}: your owner's paste for ${key} on the secure link was refused at $(date -u -d "@$now" +%H:%M) UTC; nothing was saved and the link still works. The rule the page showed them: $(_secret_drop_rule "$conn" 0 "$([[ "$key" == *,* ]] && echo 1 || echo 0)") Do not file a new gate or ask for the value in chat." \
     || _secret_drop_log "$ident: could not tell $agent that a paste for $key was refused"
 }
 
@@ -474,7 +488,7 @@ _secret_drop_redeem() {
     return 0
   fi
   if [[ -z "$(_secret_drop_gate_open "$ident" "$key" "$connector")" ]]; then
-    _secret_drop_burn_task "$ident"; fail "$E_CONFLICT" "gate no longer open"
+    rm -f "$f"; fail "$E_CONFLICT" "gate no longer open"   # DIVE-7184: this link only
   fi
   # The write reads stdin and refuses an empty value BEFORE it touches the file;
   # a refusal leaves the link live for a corrected paste. Its
@@ -484,7 +498,8 @@ _secret_drop_redeem() {
   ( _secret_write "$key" --connector="$connector" ) >/dev/null 2>&1 || rc=$?
   if (( rc != 0 )); then
     _secret_drop_tell_refused "$ident" "$id" "$key" "$connector" "$f"
-    fail "$E_VALIDATION" "value refused: $(_secret_drop_rule "$connector")"
+    local _multi=0; [[ "$key" == *,* ]] && _multi=1
+    fail "$E_VALIDATION" "value refused: $(_secret_drop_rule "$connector" 0 "$_multi")"
   fi
   # Clear the gate with the link as the evidence, BEFORE the burn: task answer
   # reads the link back from the store (_gate_drop_link_ok). The page's unit has
@@ -1151,6 +1166,23 @@ def save_pair_form(d):
             "link then stops working. Expires at %s UTC.</small></p>"
             % time.strftime("%H:%M", time.gmtime(int(d["expires"]))))
 
+# DIVE-7184: a key with several parts (X's four values) is one gate and one
+# link: one labelled box per key, all saved by one tap, or none.
+def keys_form(d, who, ask):
+    keys = d["keys"]
+    boxes = "".join(
+        "<label for=f-%d>%s</label>" % (i, html.escape(k)) +
+        FIELD.replace("<textarea ", "<textarea id=f-%d " % i, 1)
+        % ("k%d" % i, "secret", 1, "required" + (" autofocus" if i == 0 else ""), html.escape(k))
+        for i, k in enumerate(keys))
+    return ("<h1>%s needs %d values</h1>" % (who, len(keys)) +
+            ("<p class=ask>%s</p>" % html.escape(ask) if ask else "") +
+            "<form method=post autocomplete=off class=pair>" + boxes +
+            "<button type=submit>Save on the server</button></form>"
+            "<p><small>This page is served by your own server. The values go only there, "
+            "in <code>%s</code>, and this link then stops working. Expires at %s UTC.</small></p>"
+            % (html.escape(d["connector"]), time.strftime("%H:%M", time.gmtime(int(d["expires"])))))
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "5dive"
     sys_version = ""
@@ -1195,6 +1227,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_page(200, page("Save %s" % d["save"], save_form(d)))
         who = html.escape(d.get("agent") or "Your agent")
         ask = d.get("ask") or ""
+        if len(d.get("keys") or []) > 1:
+            return self.send_page(200, page("Provide %s" % d["key"], keys_form(d, who, ask)))
         body = ("<h1>%s needs %s</h1>" % (who, html.escape(d["key"])) +
                 ("<p class=ask>%s</p>" % html.escape(ask) if ask else "") +
                 "<form method=post autocomplete=off>"
@@ -1229,7 +1263,19 @@ class Handler(BaseHTTPRequestHandler):
         def field(k):
             return form.get(k, [""])[0].replace("\r\n", "\n").replace("\r", "\n")
         pair = "password" in form
-        if pair:
+        multi = "k0" in form
+        if multi:
+            # DIVE-7184: one line per box, in the page's order; the box checks
+            # each against its rule before it writes any.
+            vals = []
+            for i in range(8):
+                if "k%d" % i not in form: break
+                vals.append(field("k%d" % i).strip())
+            value = None
+            if vals and all(vals) and not any("\n" in v for v in vals):
+                value = "".join(v + "\n" for v in vals)
+            vals = None
+        elif pair:
             # DIVE-6973: three one-line fields, handed to the box as three lines.
             # A password keeps its own spaces; only the line ends go.
             login, password, totp = field("login").strip(), field("password").strip("\n"), field("totp").strip()
@@ -1242,13 +1288,15 @@ class Handler(BaseHTTPRequestHandler):
         form = None
         if not value:
             return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>%s The link still works.</p>"
-                % ("Each of login and password is needed, one line each." if pair else "Nothing was pasted.")))
+                % ("Every box is needed, one line each." if multi else
+                   "Each of login and password is needed, one line each." if pair else "Nothing was pasted.")))
         rc, out = run(["_peek", "--hash=" + h])
         if rc != 0:
             value = None
             return self.gone(rc)
         what = json.loads(out).get("data", {})
-        if pair != bool(what.get("pair")):
+        if pair != bool(what.get("pair")) or (multi and value.count("\n") != len(what.get("keys") or [])) \
+                or (not multi and len(what.get("keys") or []) > 1):
             # A form from another page: never write half an item into this one.
             value = None
             return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>Open the link again and use "
@@ -1267,7 +1315,7 @@ class Handler(BaseHTTPRequestHandler):
             # has already told the agent itself.
             return self.send_page(200, page("Saved", "<h1>Saved on your server</h1><p><code>%s</code> is saved, "
                 "and your agent has been told it is there. Nothing else to do. You can close this tab.</p>"
-                % html.escape(what.get("key", "The value"))))
+                % html.escape(", ".join(what.get("keys") or [what.get("key", "The value")]))))
         if rc == RAN_LONG:
             # The value may well be on the server by now: the write comes first and
             # the link may already be burned, so "try the link again" would be wrong.
@@ -1283,8 +1331,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_page(200, page("Saved", "<h1>Saved</h1><p><b>%s</b> is on your server now. "
                 "Your agents can type it into a site; nobody can see it. You can close this tab.</p>"
                 % html.escape(d["save"])))
-        return self.send_page(200, page("Saved", "<h1>Saved</h1><p>%s is on your server now, and %s has been told. "
-            "You can close this tab.</p>" % (html.escape(d.get("key", "The value")), html.escape(d.get("task", "the task")))))
+        return self.send_page(200, page("Saved", "<h1>Saved</h1><p>%s %s on your server now, and %s has been told. "
+            "You can close this tab.</p>" % (html.escape(d.get("key", "The value").replace(",", ", ")),
+            "are" if "," in d.get("key", "") else "is", html.escape(d.get("task", "the task")))))
     def other(self):
         return self.send_page(405, page("Not allowed", "<h1>Not allowed</h1>"))
     do_PUT = do_PATCH = do_DELETE = other

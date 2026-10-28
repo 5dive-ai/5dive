@@ -2779,20 +2779,54 @@ cmd_task_need() {
     [[ "$type" == "secret" ]] || fail "$E_VALIDATION" "--secret-key/--connector only apply to --type=secret"
     [[ -n "$secret_key" && -n "$connector" ]] \
       || fail "$E_VALIDATION" "--secret-key and --connector must be given together (both name the drop target)"
-    [[ "$secret_key" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]] \
-      || fail "$E_VALIDATION" "invalid --secret-key '$secret_key' (env-var name: ^[A-Z][A-Z0-9_]{0,63}\$)"
+    # DIVE-7184: a key with several parts (X's four, AWS's id + secret) is ONE
+    # gate, --secret-key=A,B,C: one link, one box per key on its page.
+    secret_key="${secret_key// /}"
+    local _sk1 _sk_seen=","
+    local -a _sks=(); IFS=, read -ra _sks <<<"$secret_key"
+    [[ "$secret_key" != ,* && "$secret_key" != *, && "$secret_key" != *,,* ]] && (( ${#_sks[@]} >= 1 && ${#_sks[@]} <= 8 )) \
+      || fail "$E_VALIDATION" "invalid --secret-key '$secret_key' (one env-var name, or up to 8 comma-separated: --secret-key=A,B)"
+    for _sk1 in "${_sks[@]}"; do
+      [[ "$_sk1" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]] \
+        || fail "$E_VALIDATION" "invalid --secret-key '$_sk1' (env-var name: ^[A-Z][A-Z0-9_]{0,63}\$)"
+      [[ "$_sk_seen" != *",$_sk1,"* ]] || fail "$E_VALIDATION" "--secret-key names $_sk1 twice"
+      _sk_seen+="$_sk1,"
+    done
     [[ "$connector" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
       || fail "$E_VALIDATION" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]{0,63}\$)"
     # DIVE-5370: refuse at filing, not only at `secret write`, so the owner is
     # never sent a link whose answer the box would then refuse.
-    if [[ "$connector" == tools ]] && _tools_var_reserved "$secret_key"; then
-      fail "$E_VALIDATION" "--secret-key=$secret_key is not allowed for --connector=tools: every agent loads tools.sh, so it takes only a key name (ending _KEY, _TOKEN, _SECRET or _PASSWORD, and not a seat's own such as ANTHROPIC_API_KEY); anything else could override $secret_key for every seat on the box. Name the tool's own variable (e.g. ELEVENLABS_API_KEY), or use --connector=project-<app> for one app's variable"
-    fi
+    for _sk1 in "${_sks[@]}"; do
+      if [[ "$connector" == tools ]] && _tools_var_reserved "$_sk1"; then
+        fail "$E_VALIDATION" "--secret-key=$_sk1 is not allowed for --connector=tools: every agent loads tools.sh, so it takes only a key name (ending _KEY, _TOKEN, _SECRET or _PASSWORD, and not a seat's own such as ANTHROPIC_API_KEY); anything else could override $_sk1 for every seat on the box. Name the tool's own variable (e.g. ELEVENLABS_API_KEY), or use --connector=project-<app> for one app's variable"
+      fi
+    done
     # DIVE-5664: an app's own variable lands in its project folder; refuse a link
     # whose answer would have no folder to land in.
     if [[ "$connector" == project-* ]]; then
       local _pf; _pf="$(_secret_project_file "$connector")" \
         || fail "$E_VALIDATION" "--connector=$connector: $_pf — name an existing folder under /home/claude/projects"
+    fi
+  fi
+  # DIVE-7184: a new gate REPLACES the row's pending one, and a secret gate's
+  # one-time links are bound to the key they were minted for. Four `task need
+  # --type=secret` calls on one row, one per part of an X key, printed four links
+  # and only the last could work; nothing said the first three had died. A second
+  # secret gate for a different key is refused (re-filing the same key, as the
+  # council's escalation does, keeps its links working); any other replacement
+  # says what it ended.
+  local _pg; _pg=$(db "SELECT COALESCE(need_type,'')||x'1f'||COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'') FROM tasks WHERE id=${id} AND need_type IS NOT NULL AND need_answered_at IS NULL;")
+  if [[ -n "$_pg" ]]; then
+    local _pg_type="${_pg%%$'\x1f'*}" _pg_rest="${_pg#*$'\x1f'}"
+    local _pg_sk="${_pg_rest%%$'\x1f'*}" _pg_conn="${_pg_rest#*$'\x1f'}"
+    if [[ "$_pg_type" == secret && -n "$_pg_sk" && -n "$_pg_conn" ]]; then
+      if [[ "$type" == secret && ( "$secret_key" != "$_pg_sk" || "$connector" != "$_pg_conn" ) ]]; then
+        fail "$E_CONFLICT" "$ident already waits for ${_pg_sk//,/, } (${_pg_conn}), and its link stops working if this replaces it. Ask for all keys in one gate (--secret-key=${_pg_sk},${secret_key:-<KEY>} --connector=${_pg_conn}) or file the next one on its own row. To drop the first ask: 5dive task need ${ident} --withdraw"
+      elif [[ "$type" != secret ]]; then
+        warn "$ident: this replaces its pending secret gate for ${_pg_sk//,/, }; any link sent for it no longer works — tell the owner not to use it"
+      fi
+    elif [[ "$_pg_type" != secret || "$type" != secret ]]; then
+      warn "$ident: this replaces its pending ${_pg_type} gate; that gate's buttons and link no longer work"
     fi
   fi
   # DIVE-4416: --options=A|B was the shape the usage string taught for years, and
@@ -5776,6 +5810,14 @@ db "BEGIN IMMEDIATE;
     fi
     _sh_url=$(selfhost_secret_url "$secret_key" "$_sh_agent")
     selfhost_note=" [self-hosted box: send the owner this link — it puts the value straight onto this box and never into chat: ${_sh_url} — never ask for the value in chat]"
+    # DIVE-7184: that page takes one key, so a gate for several gets one page
+    # each; the gate closes when the last of them lands.
+    if [[ "$secret_key" == *,* ]]; then
+      local _sh_k; _sh_url=""
+      local -a _sh_ks=(); IFS=, read -ra _sh_ks <<<"$secret_key"
+      for _sh_k in "${_sh_ks[@]}"; do _sh_url+="${_sh_url:+ }$(selfhost_secret_url "$_sh_k" "$_sh_agent")"; done
+      selfhost_note=" [self-hosted box: send the owner these ${#_sh_ks[@]} links, one per key — each puts its value straight onto this box and never into chat: ${_sh_url} — never ask for the values in chat]"
+    fi
     unnotified_note=""
     step "Send the owner this link (self-hosted box; the value never goes in chat): ${_sh_url}"
   fi

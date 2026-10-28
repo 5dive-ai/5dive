@@ -1972,7 +1972,7 @@ _task_unnotified_secret_link() {
 # out and the app card is named as the way to a fresh link. On an OSS box there
 # is no app to name, and the shell line stays for the self-hoster who has one.
 _task_secret_gate_link_text() { # <ident> <key> <ttl> <url> <connector>
-  local t; t=$(_gate_t secret_link "$1" "$2" "$3" "$4")
+  local t; t=$(_gate_t "$([[ "$2" == *,* ]] && echo secret_link_n || echo secret_link)" "$1" "$2" "$3" "$4")
   if _task_box_has_app; then t+=" $(_gate_t secret_again)"
   else t+=$'\n'"$(_task_secret_gate_box_line "$2" "$5" "$1")"; fi
   printf '%s' "$t"
@@ -2346,6 +2346,7 @@ _gate_t() {
       renag_foot_oss) printf '%s' "Нажмите кнопку или откройте ссылку /task. Первое напоминание приходит через час, дальше раз в сутки, пока вы не ответите." ;;
       first_foot_oss) printf '%s' "Нажмите кнопку или откройте ссылку /task." ;;
       secret_link)   printf '%s' "🔑 [$1] Вставьте ключ $2 здесь (один раз, $3 мин): $4"$'\n'"Никогда не в этот чат." ;;
+      secret_link_n) printf '%s' "🔑 [$1] Вставьте ключи ${2//,/, } здесь, каждый в своё поле (один раз, $3 мин): $4"$'\n'"Никогда не в этот чат." ;;
       secret_again)  printf '%s' "Ссылка истекла? Карточка задачи в приложении 5dive создаст новую." ;;
       secret_oss)    printf '%s' "🔑 [$1] нужен ключ $2. Одноразовую ссылку сделать не удалось, поэтому ключ вводится на сервере: sudo 5dive secret write $2 --connector=$3 --task=$1 (значение спросит скрыто). Никогда не в этот чат." ;;
       secret_app)    printf '%s' "🔑 [$1] нужен ключ $2. Откройте эту задачу в приложении 5dive (карточка на 5dive.ai/dashboard/tasks или «Моя команда» в приложении 5dive в Telegram) и нажмите «Открыть защищённую ссылку». Ключ вставляется на странице этого сервера, не через 5dive и не через этот чат. Не вставляйте его сюда." ;;
@@ -2389,6 +2390,7 @@ _gate_t() {
     renag_foot_oss) printf '%s' "Tap a button or open /task links. First reminder is after 1h; later reminders are batched every 24h until answered." ;;
     first_foot_oss) printf '%s' "Tap a button or open /task links." ;;
     secret_link)   printf '%s' "🔑 [$1] Paste the $2 key here (one use, $3 min): $4"$'\n'"Never in this chat." ;;
+    secret_link_n) printf '%s' "🔑 [$1] Paste $(_secret_keys_words "$2") here, one box each (one use, $3 min): $4"$'\n'"Never in this chat." ;;
     secret_again)  printf '%s' "Link expired? The task's card in the 5dive app makes a new one." ;;
     secret_oss)    printf '%s' "🔑 [$1] needs the $2 key. No one-time link could be made, so it goes in on the server: sudo 5dive secret write $2 --connector=$3 --task=$1 (it asks for the value, hidden). Never in this chat." ;;
     secret_app)    printf '%s' "🔑 [$1] needs the $2 credential. Open this task in the 5dive app (its card on 5dive.ai/dashboard/tasks, or My team in the 5dive app on Telegram) and tap Open secure link. You paste it on a page served by this server, never through 5dive or this chat. Never paste it here." ;;
@@ -3483,12 +3485,12 @@ _task_need_notify_deliver_now() {
     [[ -n "$_ptext" ]] && _ptext+=$'\n\n'
     if [[ -n "$_pdrop" && "$_pdrop" != ONBOX ]]; then
       _purl="${_pdrop%%|*}"
-      _ptext+="$(_gate_t p_secret_link "$secret_key")"$'\n'"${_purl}"
+      _ptext+="$(_gate_t p_secret_link "${secret_key//,/, }")"$'\n'"${_purl}"
       # DIVE-7128: through the environment, not argv: any seat can list argv.
       _pbtn=$(FIVE_DROP_URL="$_purl" jq -nc --arg t "$(_gate_t secret_button)" '{inline_keyboard: [[{text: $t, url: $ENV.FIVE_DROP_URL}]]}')
       _task_send_gate_owner "$_ptext" "$_pbtn" "$numid" "" "$_ptext"
     else
-      _ptext+="$(_gate_t p_secret_app "$secret_key")"
+      _ptext+="$(_gate_t p_secret_app "${secret_key//,/, }")"
       _pbtn=$(jq -nc --arg t "$(_gate_t p_app_button)" --arg u "$_papp" '{inline_keyboard: [[{text: $t, url: $u}]]}')
       # The plain fallback has no button, so it carries the app's link itself.
       _task_send_gate_owner "$_ptext" "$_pbtn" "$numid" "" "$_ptext"$'\n'"$_papp"
