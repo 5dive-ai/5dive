@@ -976,6 +976,10 @@ cmd_task_answer() {
   # here; it is verified against the store, so a bare flag raises nothing.
   local _dl_ok=0
   [[ -n "$drop_link" ]] && _gate_drop_link_ok "$id" "$drop_link" && _dl_ok=1
+  # DIVE-7186: the owner's secret pulled from 5dive.app by a self-hosted box's
+  # reporter; `secret write` closes the gate with --from=drop and no link.
+  local _op_ok=0
+  [[ "$from" == drop && "$nt" == secret && -z "$drop_link" ]] && _gate_owner_pull_ok "$id" && _op_ok=1
 
   # DIVE-2412 (DIVE-2382 fix #4): the CITED-MESSAGE form, which a tier-2 gate DOES
   # accept. The chat-only proof above stays tier<2 for the reason lodar scoped it
@@ -1263,7 +1267,7 @@ cmd_task_answer() {
     # routed_reviewer (never secret), so no un-routed human gate is affected.
     # DIVE-2412: _cs_ok is the attested cited-message form. Unlike _cp_ok it is
     # NOT tier-fenced, so it satisfies the evidence rule on a tier-2 approval too.
-    local _evid=$(( _hp || _su || _lead_clear || _cp_ok || _cs_ok || _dl_ok ))
+    local _evid=$(( _hp || _su || _lead_clear || _cp_ok || _cs_ok || _dl_ok || _op_ok ))
     local _caller2; _caller2=$(_gate_caller_user)
     # DIVE-2054: the human-proof/nonce evidence being scored here is stored
     # against $ident in TASKS_DB (not an independent channel/delivery fact like
@@ -1275,8 +1279,8 @@ cmd_task_answer() {
       "task=$ident" "type=$nt" "channel_proof=$([[ -n "$channel_proof" ]] && echo present || echo absent)" "cp_ok=$_cp_ok" \
       "channel_msg=${channel_msg:-none}" "cs_ok=$_cs_ok" "cs_origin=${TASK_CS_ORIGIN:-none}" "cs_age=${TASK_CS_AGE:-none}" \
       "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" "nonce_valid=$_hp" \
-      "sudo_nonagent=$_su" "drop_link=$_dl_ok" "human=$human" \
-      "evidence=$(_gate_evidence_form "$_hp" "$_su" "$_cs_ok" "$_cp_ok" "$_lead_clear" "$_dl_ok")" \
+      "sudo_nonagent=$_su" "drop_link=$_dl_ok" "owner_pull=$_op_ok" "human=$human" \
+      "evidence=$(_gate_evidence_form "$_hp" "$_su" "$_cs_ok" "$_cp_ok" "$_lead_clear" "$_dl_ok" "$_op_ok")" \
       "filer_answered=$(_gate_filer_answered "$id" "$_caller2")" \
       "caller=$_caller2" "sudo_uid=${SUDO_UID:-}" \
       "enforce=$(_gate_proof_enforced && echo on || echo off)"
@@ -1478,18 +1482,18 @@ cmd_task_answer() {
       # human evidence) — and they are passed explicitly rather than omitted so the
       # arity and token order are identical at both sites.
       _task_store_audit_log "task answer t2-human-evidence" \
-        "$([[ $(( _t2_hp || _t2_su || _t2_cs || _dl_ok )) -eq 1 ]] && echo ok || echo error)" 0 -- \
+        "$([[ $(( _t2_hp || _t2_su || _t2_cs || _dl_ok || _op_ok )) -eq 1 ]] && echo ok || echo error)" 0 -- \
         "task=$ident" "type=$nt" "tier=$gtier" "nonce_valid=$_t2_hp" "sudo_nonagent=$_t2_su" \
         "channel_session=$_t2_cs" \
         "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" \
-        "evidence=$(_gate_evidence_form "$_t2_hp" "$_t2_su" "$_t2_cs" 0 0 "$_dl_ok")" \
+        "evidence=$(_gate_evidence_form "$_t2_hp" "$_t2_su" "$_t2_cs" 0 0 "$_dl_ok" "$_op_ok")" \
         "filer_answered=$(_gate_filer_answered "$id" "$_t2_caller")" \
         "caller=$_t2_caller" "sudo_uid=${SUDO_UID:-}" 2>/dev/null || true
       # DIVE-5319: the redeemed drop link is admitted here too, on a secret gate
       # only (_gate_drop_link_ok checks need_type), for the same reason as the
       # citation above: omitted, it would clear the evidence block and then be
-      # refused here as an unproven claim.
-      if (( ! _t2_hp && ! _t2_su && ! _t2_cs && ! _dl_ok )); then
+      # refused here as an unproven claim. DIVE-7186: the owner pull, likewise.
+      if (( ! _t2_hp && ! _t2_su && ! _t2_cs && ! _dl_ok && ! _op_ok )); then
         fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) and the --human claim is unproven — $(_gate_human_reach_hint "$id")"
       fi
     fi
@@ -1550,7 +1554,7 @@ cmd_task_answer() {
   # stop — a new root path must not widen the DIVE-916/1115/2224 forged-human
   # residual, which is open.
   [[ -z "${TASK_ANSWER_DELEGATED:-}" ]] || human=0
-  local _human_evid=$(( _hp || _su || _cp_ok || _dl_ok ))
+  local _human_evid=$(( _hp || _su || _cp_ok || _dl_ok || _op_ok ))
   local _human_claim="$human"
   if (( human && ! _human_evid )) && [[ "$_lead_clear" == "1" ]]; then
     human=0
@@ -1890,7 +1894,7 @@ cmd_task_answer() {
   # `${_t2_*:-0}` because those locals exist only when the tier-2 branch ran.
   local _evform; _evform=$(_gate_evidence_form \
     "$(( ${_hp:-0} || ${_t2_hp:-0} ))" "$(( ${_su:-0} || ${_t2_su:-0} ))" \
-    "${_cs_ok:-0}" "${_cp_ok:-0}" "${_lead_clear:-0}" "${_dl_ok:-0}")
+    "${_cs_ok:-0}" "${_cp_ok:-0}" "${_lead_clear:-0}" "${_dl_ok:-0}" "${_op_ok:-0}")
   db "UPDATE tasks SET human_evidence=$(sqlq "${_evform:-none}") WHERE id=${id};"
   # DIVE-7164: a gate filed with --browser-ask: the owner's yes is that approval.
   # Reads the stored answer and evidence back off the row, as the ledger does.

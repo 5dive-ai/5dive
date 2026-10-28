@@ -3259,17 +3259,23 @@ _create_api_type_login() {
 # the demo AI, by account or by key, and never its connector file
 # (/etc/5dive/connectors/openrouter.env is not read here at all): that is the
 # owner's trial, not a budget for new agents (DIVE-6843). A Claude sign-in token
-# is not an API key and is skipped. Sets _CREATE_REUSE_{ACCOUNT,PROVIDER,KEY};
-# rc 1 when the box holds none.
+# is not an API key and is skipped. DIVE-7186: after every account, the box's
+# default Claude login (connectors/anthropic.env, where `5dive init` saves an
+# Anthropic API key) — its ANTHROPIC_API_KEY only, under no other vendor's URL.
+# Sets _CREATE_REUSE_{ACCOUNT,PROVIDER,KEY}; the account is empty for the default
+# login. rc 1 when the box holds none.
 _create_box_api_key() {
   local type="${1:-}"; shift || true
   _CREATE_REUSE_ACCOUNT="" _CREATE_REUSE_PROVIDER="" _CREATE_REUSE_KEY=""
-  [[ -n "${AUTH_PROFILES_DIR:-}" && -d "${AUTH_PROFILES_DIR}" ]] || return 1
   local -a order=()
-  local a d seen=" " demo key prov url
-  for a in "$@"; do [[ -n "$a" ]] && order+=("$a"); done
-  for d in "${AUTH_PROFILES_DIR}"/*/; do [[ -d "$d" ]] && order+=("$(basename "$d")"); done
+  local a d seen=" " demo key prov url f
   demo=$(_create_demo_ai_key)
+  for a in "$@"; do [[ -n "$a" ]] && order+=("$a"); done
+  if [[ -n "${AUTH_PROFILES_DIR:-}" && -d "${AUTH_PROFILES_DIR}" ]]; then
+    for d in "${AUTH_PROFILES_DIR}"/*/; do [[ -d "$d" ]] && order+=("$(basename "$d")"); done
+  else
+    order=()
+  fi
   for a in "${order[@]+"${order[@]}"}"; do
     [[ "$seen" == *" $a "* ]] && continue
     seen+="$a "
@@ -3297,7 +3303,19 @@ _create_box_api_key() {
     _CREATE_REUSE_ACCOUNT="$a" _CREATE_REUSE_PROVIDER="$prov" _CREATE_REUSE_KEY="$key"
     return 0
   done
-  return 1
+  f="${CONNECTORS_DIR:-/etc/5dive/connectors}/anthropic.env"
+  [[ -r "$f" ]] || return 1
+  url=$(grep -E '^ANTHROPIC_BASE_URL=' "$f" 2>/dev/null | tail -1 | cut -d= -f2-) || url=""
+  url="${url%\"}"; url="${url#\"}"
+  [[ -z "$url" || "$url" =~ ^https://api\.anthropic\.com(/|$) ]] || return 1
+  key=$(grep -E '^ANTHROPIC_API_KEY=' "$f" 2>/dev/null | tail -1 | cut -d= -f2-) || key=""
+  key="${key%\"}"; key="${key#\"}"
+  [[ -n "$key" && "$key" != sk-ant-oat* ]] || return 1
+  [[ -n "$demo" && "$key" == "$demo" ]] && return 1
+  valid_api_key "$key" || return 1
+  [[ -n "$(resolve_native_provider "$type" anthropic)" ]] || return 1
+  _CREATE_REUSE_PROVIDER=anthropic _CREATE_REUSE_KEY="$key"
+  return 0
 }
 
 # DIVE-7102: the account the calling agent runs on, or nothing.
@@ -3614,7 +3632,9 @@ cmd_create() {
     # The key lands in a profile, never in the claude user's shared state that
     # every unprofiled seat of this type would then pick up.
     [[ -n "$profile" ]] || profile="$name"
-    step "No $type login for '$name': reusing the ${BYO_PROVIDER_LABEL[$byo_provider]:-$byo_provider} key this box already holds (account '$_CREATE_REUSE_ACCOUNT'). Nobody needs to paste a key in chat."
+    local reuse_from="the one saved at setup"
+    [[ -z "$_CREATE_REUSE_ACCOUNT" ]] || reuse_from="account '$_CREATE_REUSE_ACCOUNT'"
+    step "No $type login for '$name': reusing the ${BYO_PROVIDER_LABEL[$byo_provider]:-$byo_provider} key this box already holds ($reuse_from). Nobody needs to paste a key in chat."
   fi
   # DIVE-7102: on a box linked to 5dive.app chat, a new agent's Telegram is one
   # tap. The owner taps "Connect Telegram" next to it in My team, 5dive's manager

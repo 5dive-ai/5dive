@@ -113,6 +113,26 @@ eq_t "two keys, none preferred: the first account by name" "emergency-api anthro
 eq_t "the caller's own account is tried first" "or-test openrouter $OR_KEY" "$(pick openclaw "" or-test)"
 box "$ORTEST" "zai:ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic|ANTHROPIC_AUTH_TOKEN=zai-fixture-0123456789"
 eq_t "a key behind another vendor's URL is not taken for OpenRouter or Anthropic" "or-test openrouter $OR_KEY" "$(pick openclaw zai)"
+# DIVE-7186: `5dive init` with an Anthropic API key saves it to the default
+# Claude login (connectors/anthropic.env), in no account. That is a key the box holds.
+INIT_KEY='sk-ant-api03-fixture-init-0123456789'
+initkey() { printf '%s\n' "$@" > "$CONNECTORS_DIR/anthropic.env"; }
+box "$DEMO"; initkey "ANTHROPIC_API_KEY=$INIT_KEY"
+eq_t "the key saved at 5dive init is reused (no account)" " anthropic $INIT_KEY" "$(pick openclaw)"
+eq_t "...for hermes too" " anthropic $INIT_KEY" "$(pick hermes)"
+box "$ORTEST"; initkey "ANTHROPIC_API_KEY=$INIT_KEY"
+eq_t "a named account still comes first" "or-test openrouter $OR_KEY" "$(pick openclaw)"
+box; rm -rf "$AUTH_PROFILES_DIR"; initkey "ANTHROPIC_API_KEY=\"$INIT_KEY\""
+eq_t "a box with no accounts at all: the init key, quotes stripped" " anthropic $INIT_KEY" "$(pick openclaw)"
+box "$DEMO"; initkey 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-fixture-signin'
+eq_t "a Claude sign-in at init is not a key" none "$(pick openclaw)"
+box "$DEMO"; initkey 'ANTHROPIC_API_KEY=sk-ant-oat01-fixture-oauth-in-key-slot'
+eq_t "nor a sign-in token in the key slot" none "$(pick openclaw)"
+box "$DEMO"; initkey 'ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic' "ANTHROPIC_API_KEY=$INIT_KEY"
+eq_t "nor a key behind another vendor's URL" none "$(pick openclaw)"
+box "$DEMO"; initkey "ANTHROPIC_API_KEY=$DEMO_KEY"
+eq_t "nor the demo key copied into it" none "$(pick openclaw)"
+box "$DEMO"
 mkdir -p "$AUTH_PROFILES_DIR/theo-or/openclaw/.openclaw/agents/main/agent"
 printf 'SQLite format 3\000x' > "$AUTH_PROFILES_DIR/theo-or/openclaw/.openclaw/agents/main/agent/openclaw-agent.sqlite"
 eq_t "an account with its own openclaw store is an openclaw login" yes "$(login openclaw theo-or)"
@@ -175,6 +195,12 @@ eq_t "an account that already holds an openclaw login is used as given" \
   'profile=theo-or defer=0 channels=none byo=' "$(made theo --type=openclaw --auth-profile=theo-or)"
 eq_t "a claude seat never takes this path" \
   'profile=or-test defer=0 channels=none byo=' "$(made marcus --type=claude --auth-profile=or-test)"
+box "$DEMO"; initkey "ANTHROPIC_API_KEY=$INIT_KEY"
+eq_t "DIVE-7185's box (init on an Anthropic API key, OpenClaw hired by import): the init key, in the seat's own account" \
+  'profile=theo defer=0 channels=none byo=anthropic' "$(made theo --type=openclaw --auth-profile=theo --defer-auth)"
+eq_t "...applied with that key" "type=openclaw provider=anthropic key=$INIT_KEY profile=theo" "$(applied)"
+grep -qF "reusing the Anthropic key this box already holds (the one saved at setup)" "$TMP/last.log" \
+  && ok_t "create says it reused the key saved at setup" || bad_t "create did not name the setup key" "$(grep STEP "$TMP/last.log" | head -5)"
 box "$DEMO"
 eq_t "a demo-only box: the hire stays deferred (sign in later), the demo key is not handed over" \
   'profile=theo defer=1 channels=none byo=' "$(made theo --type=openclaw --auth-profile=theo --defer-auth)"
