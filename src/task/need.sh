@@ -2180,6 +2180,7 @@ cmd_task_need() {
   # declared none. Declared always wins; this is only ever a fallback.
   local _cu_derived=""
   local gate_owner=""   # DIVE-3342
+  local browser_ask=""  # DIVE-7164
   local urgent=0        # DIVE-3474 arm 2
   local expires_in=""   # DIVE-4833: the approval action's deadline, unset = no deadline
   local self_minted=0 escalate=0   # DIVE-4365 part 1
@@ -2274,6 +2275,8 @@ cmd_task_need() {
       # inferred — inferring it from --type or from the ask text would be the
       # DIVE-2089 mistake one layer up (reading subject matter to guess intent).
       --needs=*)     needs="${1#*=}" ;;
+      # DIVE-7164: the browser ask (the id a browser stop printed) this gate's yes approves.
+      --browser-ask=*) browser_ask="${1#*=}" ;;
       # DIVE-3342: name the PERSON this gate belongs to (humans.id). Optional — the
       # filer usually should not have to say, and when they do not, task_need_notify
       # resolves it from who may CLEAR the gate. Use it when the gate is somebody
@@ -2309,6 +2312,13 @@ cmd_task_need() {
   local recommend_arg="$recommend"
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id> --type=decision|secret|approval|manual|access --ask=\"...\" [--owner=<human>]  (flags: 5dive task --help)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-7164: a browser step is the owner's, so its gate is a person's by
+  # capability (money for a pay, a tap for the rest) and never routes to a lead.
+  if [[ -n "$browser_ask" ]]; then
+    [[ "$type" == approval ]] || fail "$E_USAGE" "--browser-ask goes on an approval gate (--type=approval)"
+    local _ba_needs; _ba_needs=$(_owner_ask_gate_needs "$browser_ask") || exit $?
+    [[ -n "$needs" ]] || needs="$_ba_needs"
+  fi
 
 
   # ── DIVE-4365 part 1 — THE LEAD'S ESCALATION ────────────────────────────────
@@ -5768,6 +5778,11 @@ db "BEGIN IMMEDIATE;
     selfhost_note=" [self-hosted box: send the owner this link — it puts the value straight onto this box and never into chat: ${_sh_url} — never ask for the value in chat]"
     unnotified_note=""
     step "Send the owner this link (self-hosted box; the value never goes in chat): ${_sh_url}"
+  fi
+  if [[ -n "$browser_ask" ]]; then
+    local _ba_line
+    if _ba_line=$(_owner_ask_gate_bind "$id" "$ident" "$browser_ask"); then step "$_ba_line"
+    else warn "$ident is filed, but browser ask $browser_ask is NOT on it: its yes will not approve the browser step"; fi
   fi
   ok "$ident needs a human ($type, tier $tier)${selfhost_note}${link_note}${floor_note}${prec_note}${unnotified_note}${dest_note}${_nr_note} — $ask" \
      '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), delivered_to:(($dt|select(length>0)) // null), drop_link_expires_at:(($dle|select(length>0)) // null), selfhost_secret_url:(($shu|select(length>0)) // null), secret_link_url:(($slu|select(length>0)) // null), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \

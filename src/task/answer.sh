@@ -1892,6 +1892,9 @@ cmd_task_answer() {
     "$(( ${_hp:-0} || ${_t2_hp:-0} ))" "$(( ${_su:-0} || ${_t2_su:-0} ))" \
     "${_cs_ok:-0}" "${_cp_ok:-0}" "${_lead_clear:-0}" "${_dl_ok:-0}")
   db "UPDATE tasks SET human_evidence=$(sqlq "${_evform:-none}") WHERE id=${id};"
+  # DIVE-7164: a gate filed with --browser-ask: the owner's yes is that approval.
+  # Reads the stored answer and evidence back off the row, as the ledger does.
+  [[ "$nt" == approval ]] && declare -F _owner_ask_gate_settle >/dev/null && _owner_ask_gate_settle "$id" "$ident" "$value"
 
   # DIVE-3128: the RELAY and the TAPPING UID, in their own columns.
   #

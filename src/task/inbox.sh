@@ -409,9 +409,52 @@ _gate_human_reach_hint() { # <task id>
   fi
 }
 
+# DIVE-7164: the owner's inbox on a box with no chat for them. `agent send owner`
+# appends to it (_owner_note_send, src/cmd_owner_ask.sh); the owner reads it here.
+_owner_inbox_file() { printf '%s/owner-inbox.jsonl' "${STATE_DIR:-/var/lib/5dive}"; }
+_owner_inbox_seen() { printf '%s/owner-inbox.seen' "${STATE_DIR:-/var/lib/5dive}"; }
+
+# _owner_inbox_print <new|all> — the owner's messages, newest last; `new` prints
+# only what no earlier view showed and then marks it seen. Every byte is an
+# agent's, so control bytes go before it reaches the owner's terminal.
+_owner_inbox_print() {
+  local mode="$1" f seen n=0 total from at text
+  f=$(_owner_inbox_file)
+  [[ -r "$f" && -s "$f" ]] || { [[ "$mode" == all ]] && echo "No messages from your agents."; return 0; }
+  total=$(wc -l < "$f")
+  seen=$(cat "$(_owner_inbox_seen)" 2>/dev/null); [[ "$seen" =~ ^[0-9]+$ ]] || seen=0
+  (( seen > total )) && seen=0
+  local start=1
+  if [[ "$mode" == new ]]; then
+    (( total > seen )) || return 0
+    start=$((seen + 1))
+    (( total - seen == 1 )) && echo "5dive: 1 new message from your agents." \
+      || echo "5dive: $((total - seen)) new messages from your agents."
+  else
+    (( total > 20 )) && start=$((total - 19))
+  fi
+  while IFS=$'\x1f' read -r at from text; do
+    [[ -n "$from" ]] || continue
+    n=$((n + 1))
+    (( n > 10 )) && [[ "$mode" == new ]] && continue
+    text=$(_gate_plain "$text"); from=$(_gate_plain "$from")
+    [[ "$mode" == new ]] && (( ${#text} > 300 )) && text="${text:0:297}..."
+    printf '\n  %s (%s):\n  %s\n' "$from" "$(_gate_plain "$at")" "$text"
+  done < <(tail -n +"$start" -- "$f" | jq -r '[.at // "", .from // "", ((.text // "") | gsub("[\\n\\r\\t]"; " "))] | join("\u001f")' 2>/dev/null)
+  if [[ "$mode" == new ]]; then
+    (( n > 10 )) && printf '\n  +%s more: 5dive task inbox --messages\n' "$((n - 10))"
+    printf '\n  Answer one: sudo 5dive agent send <name> --from=owner "<text>"\n'
+    [[ -w "${f%/*}" ]] && printf '%s\n' "$total" > "$(_owner_inbox_seen)" 2>/dev/null
+  fi
+  echo
+}
+
 # `task inbox --login`: what root's next login shell prints. Silent when the owner
 # has another surface or nothing waits, so it costs a glance only when it matters.
 _task_inbox_login() { # <where> <order>
+  # DIVE-7164: what an agent sent the owner with `agent send owner` on a box with
+  # no chat for them, shown once.
+  _owner_inbox_print new
   _task_owner_has_surface && return 0
   local n; n=$(db "SELECT COUNT(*) FROM tasks WHERE $1;" 2>/dev/null) || return 0
   [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) || return 0
@@ -451,6 +494,8 @@ cmd_task_inbox() {
       --fleet)           : ;;
       # DIVE-7077: the login-shell notice (/etc/profile.d/5dive-asks.sh).
       --login)           login=1 ;;
+      # DIVE-7164: the owner's messages from their agents (the last 20).
+      --messages)        _owner_inbox_print all; return 0 ;;
       --channel-proof=*) channel_proof="${1#*=}" ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  fail "$E_USAGE" "unexpected arg: $1 (inbox takes no positional args)" ;;

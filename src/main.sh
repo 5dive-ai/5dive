@@ -228,6 +228,8 @@ Agents:
   5dive agent send <name> --message-file=<path>|--message-file=-|--message=<text>|<text...>
                                     [--from=<sender>] [--raw] [--wake] [--urgent]
                                     [--reply-to-chat=<id> [--reply-to-msg=<id>]]
+                                                     # <name> owner: your reply to the box owner, in the app chat,
+                                                     # their Telegram, or their login inbox (task inbox --messages).
                                                      # --urgent: JUMP THE QUEUE. A send to a busy seat is normally
                                                      # spooled and delivered at its next idle (DIVE-4214); --urgent
                                                      # types it now, so it is read as soon as the current turn ends
