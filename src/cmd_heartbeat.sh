@@ -921,6 +921,7 @@ _hb_usage() {
   5dive heartbeat on  <name> [--every=<dur>] [--fresh]
                                           # enrol agent; default every=${_HB_DEFAULT_EVERY}m, fresh off
   5dive heartbeat off <name>              # stop waking the agent (keeps its settings)
+  5dive heartbeat self on|off             # enrol or pause YOUR OWN seat (works from a standard seat)
   5dive heartbeat ls                      # show enrolled agents + next-wake + queued count
   5dive heartbeat tick                    # cron driver: wake every due agent that has work
   5dive heartbeat wake-task [--fresh|--no-fresh] <agent> <task_id> [<ident>]
@@ -976,6 +977,10 @@ cmd_heartbeat() {
     held)            cmd_heartbeat_held "$@" ;;
     wake-mode)       cmd_heartbeat_wake_mode "$@" ;;
     install)         cmd_heartbeat_install "$@" ;;
+    # DIVE-7143: a seat enrols or pauses ITSELF; _self is the root half, one exact
+    # sudoers line per op, the seat derived from SUDO_UID (src/cmd_agent_rights.sh).
+    self)            cmd_heartbeat_self "$@" ;;
+    _self)           cmd_heartbeat_self_delegated "$@" ;;
     uninstall)       cmd_heartbeat_uninstall "$@" ;;
     -h|--help|help)  _hb_usage ;;
     *) fail "$E_USAGE" "unknown heartbeat command: $sub (try: 5dive heartbeat --help)" ;;

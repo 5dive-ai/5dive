@@ -634,6 +634,8 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _route_do"|"/usr/local/bin/5dive _pkg_do"|\
         "/usr/local/bin/5dive _dashboard_relay"|\
         "/usr/local/bin/5dive _secret_link_notify"|\
+        "/usr/local/bin/5dive agent _peek *"|"/usr/local/bin/5dive agent _skill_give *"|\
+        "/usr/local/bin/5dive heartbeat _self on"|"/usr/local/bin/5dive heartbeat _self off"|\
         "/usr/local/bin/5dive sysadmin _broker"|"/usr/local/bin/5dive --json sysadmin _broker") has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
@@ -874,6 +876,20 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive reflex pick-ref
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive reflex pick-ref *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive reflex login-marker
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive reflex login-marker *
+# DIVE-7143: three acts a team member needs, each scoped to exactly that act.
+# Peek reads a TEAMMATE pane with one fixed tmux capture, at most 500 lines.
+# Skill give copies one of this seat's own skills into a TEAMMATE skills dir:
+# packed as this seat, placed as the recipient, regular files and dirs only,
+# 5 MB and 500 files at most, never over an existing skill without replace.
+# For both, the caller is derived from SUDO_UID, every argument is validated
+# in the verb and nothing it is given is executed. A teammate is a registered,
+# non-sandboxed agent that shares a team with this seat, or that manages it or
+# reports to it. Heartbeat self takes NO arguments beyond on or off, one exact
+# line each: the seat it enrols or pauses is the sudo caller, never a name.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _peek *
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _skill_give *
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive heartbeat _self on
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive heartbeat _self off
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
     cat <<SUDOERS

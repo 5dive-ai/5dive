@@ -220,6 +220,8 @@ Agents:
                                                      # handle instead of numeric id.
   5dive agent <name> tui                             # attach to an interactive agent tmux session (dispatcher-only seats explain the alternative)
   5dive agent logs <name> [--follow] [--lines=N] [--tmux]
+  5dive agent peek <name> [--lines=N]                # a TEAMMATE's live pane (default 80 lines, max 500); works
+                                                     # from a standard seat: a team you share, or one manages the other.
   5dive agent send <name> --message-file=<path>|--message-file=-|--message=<text>|<text...>
                                     [--from=<sender>] [--raw] [--wake] [--urgent]
                                     [--reply-to-chat=<id> [--reply-to-msg=<id>]]
@@ -421,6 +423,7 @@ Real browser (screenshots, clicks, signed-in pages) — a PLUGIN, 5dive-browser:
 Heartbeat (wake an agent only when it has queued tasks, one per tick):
   5dive heartbeat on  <name> [--every=<dur>] [--fresh]      # enrol (default 30m, fresh off: no /clear between tasks)
   5dive heartbeat off <name>
+  5dive heartbeat self on|off                               # enrol or pause YOUR OWN seat (works from a standard seat)
   5dive heartbeat ls                                        # enrolled agents + next-wake + queued count
   5dive heartbeat tick                                      # cron driver (root); wakes due agents that have work
   # full surface: 5dive heartbeat --help
@@ -717,6 +720,13 @@ _agent_verb_dispatch() {
         # Reached via the scoped render_standard_sudoers grant so a standard
         # agent's /restart + /model work without a raw systemd-run/sudo grant.
         _self_restart) cmd_self_restart "$@" ;;
+        # DIVE-7143: a standard seat's three narrow root verbs (src/cmd_agent_rights.sh).
+        # peek is public: root reads in-process, any other seat crosses _peek.
+        # _peek / _skill_give are hidden, reached only through their exact sudoers
+        # lines; caller from SUDO_UID, target must be a teammate. Audited root-side.
+        peek)        cmd_agent_peek "$@" ;;
+        _peek)       cmd_agent_peek_delegated "$@" ;;
+        _skill_give) cmd_agent_skill_give_delegated "$@" ;;
         # DIVE-5007: hidden root primitive — restart | deferred | held for one
         # agent, from the self-update ledger (busy row or live turn, park,
         # pending-restart marker). Exists so 5dive-host-updates.sh, which
