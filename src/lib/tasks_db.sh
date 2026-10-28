@@ -4432,7 +4432,7 @@ _secret_key_landed() { # <KEY>[,<KEY>...] <connector>
   # DIVE-7184: a gate asking for several keys has landed only when all have.
   if [[ "$key" == *,* ]]; then
     local k rc worst=0
-    local -a ks; IFS=, read -ra ks <<<"$key"
+    local -a ks=(); IFS=, read -ra ks <<<"$key"
     for k in "${ks[@]}"; do
       rc=0; _secret_key_landed "$k" "$conn" || rc=$?
       (( rc > worst )) && worst=$rc

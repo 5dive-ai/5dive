@@ -2783,7 +2783,7 @@ cmd_task_need() {
     # gate, --secret-key=A,B,C: one link, one box per key on its page.
     secret_key="${secret_key// /}"
     local _sk1 _sk_seen=","
-    local -a _sks; IFS=, read -ra _sks <<<"$secret_key"
+    local -a _sks=(); IFS=, read -ra _sks <<<"$secret_key"
     [[ "$secret_key" != ,* && "$secret_key" != *, && "$secret_key" != *,,* ]] && (( ${#_sks[@]} >= 1 && ${#_sks[@]} <= 8 )) \
       || fail "$E_VALIDATION" "invalid --secret-key '$secret_key' (one env-var name, or up to 8 comma-separated: --secret-key=A,B)"
     for _sk1 in "${_sks[@]}"; do
@@ -5814,7 +5814,7 @@ db "BEGIN IMMEDIATE;
     # each; the gate closes when the last of them lands.
     if [[ "$secret_key" == *,* ]]; then
       local _sh_k; _sh_url=""
-      local -a _sh_ks; IFS=, read -ra _sh_ks <<<"$secret_key"
+      local -a _sh_ks=(); IFS=, read -ra _sh_ks <<<"$secret_key"
       for _sh_k in "${_sh_ks[@]}"; do _sh_url+="${_sh_url:+ }$(selfhost_secret_url "$_sh_k" "$_sh_agent")"; done
       selfhost_note=" [self-hosted box: send the owner these ${#_sh_ks[@]} links, one per key — each puts its value straight onto this box and never into chat: ${_sh_url} — never ask for the values in chat]"
     fi

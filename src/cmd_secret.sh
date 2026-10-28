@@ -111,7 +111,7 @@ SECRET_KEYS_MAX=8
 _valid_env_keys() {
   local k seen=","
   [[ "$1" == *[!A-Z0-9_,]* || "$1" == ,* || "$1" == *, || "$1" == *,,* ]] && return 1
-  local -a ks; IFS=, read -ra ks <<<"$1"
+  local -a ks=(); IFS=, read -ra ks <<<"$1"
   (( ${#ks[@]} >= 1 && ${#ks[@]} <= SECRET_KEYS_MAX )) || return 1
   for k in "${ks[@]}"; do
     _valid_env_key "$k" && [[ "$seen" != *",$k,"* ]] || return 1
@@ -859,7 +859,7 @@ _secret_write_many() { # <K1,K2,...> <connector> <task>
   _valid_connector "$connector" || fail "$E_USAGE" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]*\$)"
   [[ "$connector" == "$SECRET_SAVED_CONNECTOR" ]] \
     && fail "$E_USAGE" "a saved value is one name; for a login use: secret link --save=<name> --pair"
-  local -a ks vals=(); IFS=, read -ra ks <<<"$keys"
+  local -a ks=() vals=(); IFS=, read -ra ks <<<"$keys"
   if [[ "$connector" == tools ]]; then
     for k in "${ks[@]}"; do
       _tools_var_reserved "$k" && fail "$E_VALIDATION" "$k is not allowed for --connector=tools (a tools key ends _KEY, _TOKEN, _SECRET or _PASSWORD and is not a seat's own). Nothing was saved"
