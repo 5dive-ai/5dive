@@ -1752,6 +1752,42 @@ _compose_apply_prefer_type() {
   ' <<<"$spec"
 }
 
+# DIVE-7152: a plain seat (no pack) that names no account, no key and no
+# preferred harness goes to the login the owner added last, and its harness
+# follows that login, as a pack seat does in cmd_import. Only claude <-> codex,
+# the pair a roster's seats move between (prefer_type above); the Claude-only
+# pins are dropped as there. A pack seat is left to cmd_import, which knows the
+# harnesses its pack lands on. Prints the spec, unchanged with no login added.
+_compose_apply_newest_login() {
+  local spec="$1"
+  lazy_need account_default_v
+  account_default_v || { printf '%s\n' "$spec"; return 0; }
+  [[ "$ACCOUNT_DEFAULT_TYPE" == claude || "$ACCOUNT_DEFAULT_TYPE" == codex ]] \
+    || { printf '%s\n' "$spec"; return 0; }
+  jq --arg a "$ACCOUNT_DEFAULT_ACCOUNT" --arg t "$ACCOUNT_DEFAULT_TYPE" '
+    .agents |= with_entries(
+      if ((.value.pack // "") == "") and ((.value.auth_profile // "") == "")
+         and ((.value.provider // "") == "") and ((.value.api_key // "") == "")
+         and ((.value.prefer_type // "") == "")
+         and (((.value.type // "claude") == "claude") or (.value.type == "codex"))
+      then
+        .value.auth_profile = $a
+        | if (.value.type // "claude") == $t then .
+          else
+            .value.type = $t
+            | if $t == "claude" then
+                (if ((.value.model // "") != "") and ((.value.model | test("^(opus|sonnet|fable|haiku)$|^claude-")) | not)
+                 then .value |= del(.model) else . end)
+              else
+                (if ((.value.model // "") | test("^(opus|sonnet|fable|haiku)$|^claude-"))
+                 then .value |= del(.model) else . end)
+                | .value |= del(.effort)
+              end
+          end
+      else . end)
+  ' <<<"$spec"
+}
+
 _compose_prefer_label() {
   case "$1" in codex) printf 'ChatGPT (Codex)' ;; claude) printf 'Claude' ;; *) printf '%s' "$1" ;; esac
 }
@@ -1967,6 +2003,8 @@ HELP
   if [[ -z "$type_override" ]]; then
     spec=$(_compose_apply_prefer_type "$spec") \
       || fail "$E_VALIDATION" "could not apply the seats' prefer_type to the spec"
+    spec=$(_compose_apply_newest_login "$spec") \
+      || fail "$E_VALIDATION" "could not apply the login added last to the spec"
   fi
   # DIVE-4103: what this team needs from the BOX, answered before anything is
   # provisioned. Never fatal — a missing capability names the reduced mode.

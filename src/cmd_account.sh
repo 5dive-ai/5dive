@@ -362,6 +362,178 @@ account_each() {
   done
 }
 
+# DIVE-7152: the login the owner added LAST is the default for every new hire
+# (lodar 2026-10-28: "all new hires go to the most recent auth"). Add ChatGPT
+# next to Claude and the next agent hired runs on ChatGPT; agents already hired
+# never move.
+#
+# "Added" cannot be read off the credential files: signedInAt is their mtime,
+# and a token refresh moves it, so a refreshed Codex login would keep taking the
+# default back. So the box keeps a small ledger, <AUTH_PROFILES_DIR>/.logins,
+# one line per (account, type) that holds a login:
+#   <epoch> \t <account> \t <type> \t seen|added|undone
+# The first read on a box writes every login it already holds as `seen`, so an
+# upgrade changes no hire. A login that turns up after that is `added`, stamped
+# when it was first seen. Undo marks it `undone`. Only a login that is signed in
+# right now can be the default, so when the newest one is removed or signed out
+# the next newest one that works is, never an empty one (the DIVE-4204 defect).
+# With no `added` login the hire paths keep their
+# own rules, unchanged. Only a writable ledger (root) is written; a read-only
+# caller sees the same answer, it just does not record it.
+ACCOUNT_DEFAULT_TYPES=(claude codex grok)
+ACCOUNT_DEFAULT_ACCOUNT="" ACCOUNT_DEFAULT_TYPE="" ACCOUNT_DEFAULT_SINCE=""
+
+account_logins_ledger() { printf '%s/.logins' "${AUTH_PROFILES_DIR}"; }
+
+# _account_logins_now — every (account, type) holding a login, as
+# "<account>\t<type>" lines in ACCOUNT_LOGINS_NOW. The demo AI is the owner's
+# trial (DIVE-6843) and `default` is the box's shared login: neither is a login
+# the owner added, so neither can become the default.
+# `account list` has already read every account's types, so it fills the list
+# itself and sets ACCOUNT_LOGINS_PRESCANNED=1 (DIVE-3088: list is on a 3s budget).
+ACCOUNT_LOGINS_NOW=() ACCOUNT_LOGINS_PRESCANNED=0
+_account_logins_now() {
+  local name t
+  if (( ACCOUNT_LOGINS_PRESCANNED )); then ACCOUNT_LOGINS_PRESCANNED=0; return 0; fi
+  ACCOUNT_LOGINS_NOW=()
+  while IFS= read -r name; do
+    [[ -n "$name" && "$name" != demo-ai && "$name" != default ]] || continue
+    account_types_authed_arr "$name"
+    for t in ${ACCOUNT_TYPES_AUTHED[@]+"${ACCOUNT_TYPES_AUTHED[@]}"}; do
+      [[ " ${ACCOUNT_DEFAULT_TYPES[*]} " == *" $t "* ]] || continue
+      ACCOUNT_LOGINS_NOW+=("$name"$'\t'"$t")
+    done
+  done < <(account_each)
+}
+
+# account_logins_sync — bring the ledger up to date with the logins on disk,
+# left in ACCOUNT_LOGINS (assoc "<account>\t<type>" -> "<epoch>\t<state>") and,
+# for the ones signed in right now, ACCOUNT_LOGINS_LIVE ("<account>\t<type>" -> 1).
+# A line is dropped only when its account is gone. A login that is signed out,
+# or whose file is being rewritten by a token refresh, keeps its line: if it
+# lost it, the next read would stamp it `added` and hand it the default.
+declare -gA ACCOUNT_LOGINS=() ACCOUNT_LOGINS_LIVE=()
+account_logins_sync() {
+  local ledger ts acct t state key now changed=0 fresh=0
+  ledger=$(account_logins_ledger)
+  printf -v now '%(%s)T' -1
+  ACCOUNT_LOGINS=() ACCOUNT_LOGINS_LIVE=()
+  if [[ -r "$ledger" ]]; then
+    while IFS=$'\t' read -r ts acct t state; do
+      [[ "$ts" =~ ^[0-9]+$ && -n "$acct" && -n "$t" ]] || continue
+      case "$state" in seen|added|undone) ;; *) continue ;; esac
+      if [[ -d "${AUTH_PROFILES_DIR}/${acct}" ]]; then
+        ACCOUNT_LOGINS["$acct"$'\t'"$t"]="$ts"$'\t'"$state"
+      else
+        changed=1
+      fi
+    done <"$ledger"
+  elif [[ ! -e "$ledger" ]]; then
+    fresh=1 changed=1
+  fi
+  _account_logins_now
+  for key in ${ACCOUNT_LOGINS_NOW[@]+"${ACCOUNT_LOGINS_NOW[@]}"}; do
+    ACCOUNT_LOGINS_LIVE["$key"]=1
+    [[ -z "${ACCOUNT_LOGINS[$key]:-}" ]] || continue
+    if (( fresh )); then
+      ACCOUNT_LOGINS["$key"]="$now"$'\t'seen
+    else
+      ACCOUNT_LOGINS["$key"]="$now"$'\t'added
+    fi
+    changed=1
+  done
+  (( changed )) || return 0
+  _account_logins_write
+}
+
+# _account_logins_write — ACCOUNT_LOGINS to the ledger, atomically. Best effort:
+# a caller that cannot write it (a seat, a read-only box) still gets its answer.
+_account_logins_write() {
+  local ledger tmp key
+  ledger=$(account_logins_ledger)
+  [[ -d "${AUTH_PROFILES_DIR:-}" && -w "${AUTH_PROFILES_DIR}" ]] || return 0
+  tmp="${ledger}.tmp.$$"
+  {
+    for key in "${!ACCOUNT_LOGINS[@]}"; do
+      printf '%s\t%s\n' "${ACCOUNT_LOGINS[$key]%%$'\t'*}" "${key}"$'\t'"${ACCOUNT_LOGINS[$key]#*$'\t'}"
+    done | sort -n
+  } >"$tmp" 2>/dev/null && chmod 600 "$tmp" 2>/dev/null && mv -f "$tmp" "$ledger" 2>/dev/null \
+    || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# account_default_v [type] — the default login for a new hire (of <type>, when
+# given): the newest `added` one that is still signed in. Left in
+# ACCOUNT_DEFAULT_{ACCOUNT,TYPE,SINCE}; rc 1 when there is none, and the caller
+# keeps its own rule.
+account_default_v() {
+  local want="${1:-}" key ts state best_ts=-1 best=""
+  ACCOUNT_DEFAULT_ACCOUNT="" ACCOUNT_DEFAULT_TYPE="" ACCOUNT_DEFAULT_SINCE=""
+  [[ -n "${AUTH_PROFILES_DIR:-}" && -d "${AUTH_PROFILES_DIR}" ]] || return 1
+  account_logins_sync
+  for key in "${!ACCOUNT_LOGINS[@]}"; do
+    ts="${ACCOUNT_LOGINS[$key]%%$'\t'*}" state="${ACCOUNT_LOGINS[$key]#*$'\t'}"
+    [[ "$state" == added && -n "${ACCOUNT_LOGINS_LIVE[$key]:-}" ]] || continue
+    [[ -z "$want" || "${key#*$'\t'}" == "$want" ]] || continue
+    # Two logins first seen in the same second: the one that sorts first wins,
+    # so the answer never depends on the hash order.
+    if (( ts > best_ts )) || { (( ts == best_ts )) && [[ "$key" < "$best" ]]; }; then
+      best_ts=$ts best="$key"
+    fi
+  done
+  [[ -n "$best" ]] || return 1
+  ACCOUNT_DEFAULT_ACCOUNT="${best%%$'\t'*}" ACCOUNT_DEFAULT_TYPE="${best#*$'\t'}"
+  TZ=UTC printf -v ACCOUNT_DEFAULT_SINCE '%(%Y-%m-%dT%H:%M:%SZ)T' "$best_ts"
+  return 0
+}
+
+_account_default_json() {
+  if account_default_v; then
+    jq -cn --arg a "$ACCOUNT_DEFAULT_ACCOUNT" --arg t "$ACCOUNT_DEFAULT_TYPE" --arg s "$ACCOUNT_DEFAULT_SINCE" \
+      '{account:$a, type:$t, since:$s}'
+  else
+    printf 'null\n'
+  fi
+}
+
+# cmd_account_default — `5dive account default [--json]` names the login new
+# hires go to; `5dive account default --undo=<account>:<type>` is the Undo
+# beside "New agents will now use ChatGPT": that login stops being the default
+# (it stays signed in, and agents on it stay on it), and the one before it is
+# the default again. Naming the login, not "the last one", makes a second tap on
+# Undo a no-op instead of undoing the login before it too.
+cmd_account_default() {
+  local undo="" a
+  for a in "$@"; do
+    case "$a" in
+      --undo=*) undo="${a#--undo=}" ;;
+      *) fail "$E_USAGE" "usage: 5dive account default [--undo=<account>:<type>]" ;;
+    esac
+  done
+  if [[ -n "$undo" ]]; then
+    local acct="${undo%%:*}" t="${undo#*:}" key
+    [[ "$undo" == *:* ]] && valid_profile_name "$acct" && [[ " ${ACCOUNT_DEFAULT_TYPES[*]} " == *" $t "* ]] \
+      || fail "$E_VALIDATION" "usage: 5dive account default --undo=<account>:<type> (type: ${ACCOUNT_DEFAULT_TYPES[*]})"
+    require_root
+    account_logins_sync
+    key="$acct"$'\t'"$t"
+    [[ -n "${ACCOUNT_LOGINS_LIVE[$key]:-}" ]] \
+      || fail "$E_NOT_FOUND" "account '$acct' holds no $t login on this box"
+    if [[ "${ACCOUNT_LOGINS[$key]#*$'\t'}" == added ]]; then
+      ACCOUNT_LOGINS["$key"]="${ACCOUNT_LOGINS[$key]%%$'\t'*}"$'\t'undone
+      _account_logins_write
+    fi
+  fi
+  local cur; cur=$(_account_default_json)
+  if (( JSON_MODE )); then
+    jq -cn --argjson d "$cur" '{ok:true, data:$d}'
+  elif [[ "$cur" == null ]]; then
+    echo "No login added since this box started counting: each hire path keeps its own rule."
+  else
+    jq -r '"New agents use \(.account) (\(.type)), added \(.since)."' <<<"$cur"
+  fi
+}
+
 # cmd_account_list is on the hot path for /account in the telegram plugin (a
 # 3s-budgeted `5dive account list --json`) and for the new-agent wizard's
 # profile tiles. It used to fork jq once per account for the row accumulator,
@@ -385,6 +557,7 @@ cmd_account_list() {
   ensure_state_ro
   local rows name t detail rec csv
   local -a recs=() fields=() atypes=()
+  ACCOUNT_LOGINS_NOW=()
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     # Copy out of the global before iterating it: nothing in the loop body calls
@@ -394,6 +567,11 @@ cmd_account_list() {
     atypes=(${ACCOUNT_TYPES_AUTHED[@]+"${ACCOUNT_TYPES_AUTHED[@]}"})
     printf -v csv '%s,' ${atypes[@]+"${atypes[@]}"}
     fields=("$name" "${csv%,}")
+    if [[ "$name" != demo-ai && "$name" != default ]]; then
+      for t in ${atypes[@]+"${atypes[@]}"}; do
+        [[ " ${ACCOUNT_DEFAULT_TYPES[*]} " == *" $t "* ]] && ACCOUNT_LOGINS_NOW+=("$name"$'\t'"$t")
+      done
+    fi
     # Build per-type signin details so the new-agent wizard's profile tiles
     # can show "Anthropic · claude-sonnet-4-5 · signed in May 12" instead of
     # all three orphan profiles reading identically as "Not used yet".
@@ -406,7 +584,12 @@ cmd_account_list() {
     printf -v rec '%s\t' "${fields[@]}"
     recs+=("${rec%$'\t'}")
   done < <(account_each)
-  rows=$(printf '%s\n' ${recs[@]+"${recs[@]}"} | jq -Rsc --argjson reg "$(registry_read)" '
+  # DIVE-7152: the row new hires go to carries `default: <type>`.
+  ACCOUNT_LOGINS_PRESCANNED=1
+  account_default_v || true
+  ACCOUNT_LOGINS_PRESCANNED=0
+  rows=$(printf '%s\n' ${recs[@]+"${recs[@]}"} | jq -Rsc --argjson reg "$(registry_read)" \
+    --arg da "$ACCOUNT_DEFAULT_ACCOUNT" --arg dt "$ACCOUNT_DEFAULT_TYPE" '
     # bound-agent index: profile -> [agent], from ONE registry read. Mirrors
     # account_agents_bound s select(.value.authProfile == $p), per profile.
     ( ($reg.agents // {}) | to_entries
@@ -422,7 +605,8 @@ cmd_account_list() {
               types: (if .[1] == "" then [] else (.[1] | split(",")) end),
               agents: ($bound[$n] // []),
               signins: (reduce range(0; ($sig | length); 2) as $i
-                          ({}; .[$sig[$i]] = ($sig[$i + 1] | fromjson))) })')
+                          ({}; .[$sig[$i]] = ($sig[$i + 1] | fromjson))) }
+            + (if $da != "" and $n == $da then {default: $dt} else {} end))')
   if (( JSON_MODE )); then
     echo "$rows" | jq -c '{ok:true, data: .}'
   else

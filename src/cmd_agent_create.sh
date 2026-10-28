@@ -3531,9 +3531,15 @@ cmd_create() {
   # team template defers because a fresh box has no login, not to refuse the one
   # it has). A named account that is already signed in is used, never deferred.
   # A second account, the shared login or a BYO key leave both as they were.
+  # DIVE-7152: before that, the login of this type the owner added last, so a
+  # box with Claude and a newly added second Claude login hires onto the new one.
   if [[ -z "$profile" && -z "$byo_provider" && -z "$byo_api_key" && -z "$byo_base_url" ]]; then
     local _sole_account
-    if _sole_account=$(_create_sole_account "$type"); then
+    lazy_need account_default_v
+    if account_default_v "$type"; then
+      profile="$ACCOUNT_DEFAULT_ACCOUNT"
+      step "No --auth-profile: using '$profile', the $type login added last on this box"
+    elif _sole_account=$(_create_sole_account "$type"); then
       profile="$_sole_account"
       step "No --auth-profile: using this box's one signed-in AI account '$profile'"
     fi

@@ -312,6 +312,7 @@ Default workdir: ${DEFAULT_WORKDIR}
 Accounts (a named auth profile — group sign-ins so multiple agents share one login):
   5dive account list                                   # name, types signed in, # agents bound
   5dive account show <name>                            # detail incl. env keys present
+  5dive account default [--undo=<acct>:<type>]         # the login new hires go to (the one added last); Undo
   5dive account usage                                  # per-account 5h/7d limit usage (dashboard dots + /usage)
   5dive account usage --history [--7d] [--account=<n>] # provider 5h/7d readings OVER TIME (appended samples, not the latest)
   5dive account poll                                   # read every Claude account's 5h/7d from the provider now (no seat
@@ -1012,7 +1013,7 @@ _agent_verb_dispatch() {
 }
 
 _account_verb_dispatch() {
-      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|usage|poll|add|rename|remove|login|set|set-model|set-active-provider"
+      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|default|usage|poll|add|rename|remove|login|set|set-model|set-active-provider"
       local acctcmd="$1"; shift
       # `--help` after a subverb is a question about THAT verb, not an unknown
       # flag. Answered before the dispatch, through the same helper `task`
@@ -1022,6 +1023,10 @@ _account_verb_dispatch() {
         -h|--help|help) usage ;;
         list)   cmd_account_list "$@" ;;
         show)   cmd_account_show "$@" ;;
+        # DIVE-7152: the login new hires go to, and its Undo.
+        default)
+          AUDIT_CMD="account default"; AUDIT_ARGS=("$@")
+          cmd_account_default "$@" ;;
         usage)  cmd_account_usage "$@" ;;
         poll)   cmd_account_poll "$@" ;;
         add)

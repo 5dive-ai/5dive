@@ -3558,6 +3558,28 @@ cmd_import() {
   fi
   [[ -n "$workdir" ]] || workdir="$m_workdir"
   [[ -n "$profile" ]] || profile="$m_profile"
+  # DIVE-7152: a hire that names no account and no harness goes to the login
+  # the owner added last, and its harness follows it: add ChatGPT next to Claude
+  # and the next pack hired runs on Codex there. Only onto a harness the pack
+  # lands on; a Claude-only model or effort pin is dropped on the way, as
+  # `--type=` drops it. With no login added, the rules below are unchanged.
+  if [[ -z "$profile" && -z "$p_type" && -z "$p_provider" && -z "$p_api_key" ]]; then
+    lazy_need account_default_v
+    if account_default_v \
+       && grep -qxF -- "$ACCOUNT_DEFAULT_TYPE" < <(printf '%s\n' "${_lands[@]+"${_lands[@]}"}"); then
+      profile="$ACCOUNT_DEFAULT_ACCOUNT"
+      if [[ "$ACCOUNT_DEFAULT_TYPE" != "$type" ]]; then
+        type="$ACCOUNT_DEFAULT_TYPE"
+        if [[ "$type" != claude ]]; then
+          [[ "$model_req" =~ ^(opus|sonnet|fable|haiku)$|^claude- ]] && { model=""; model_req=""; }
+          effort=""
+        elif [[ -n "$model_req" && ! "$model_req" =~ ^(opus|sonnet|fable|haiku)$|^claude- ]]; then
+          model=""; model_req=""
+        fi
+      fi
+      step "No --auth-profile: using '$profile', the login added last on this box ($type)"
+    fi
+  fi
   # DIVE-5820: a fresh box's only AI is the free demo-ai account. A hire that
   # names no account (an older dashboard, a script) used to get the empty
   # per-agent profile below and launch DEGRADED next to a working login. Bind
