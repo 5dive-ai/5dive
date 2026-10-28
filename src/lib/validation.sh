@@ -1,7 +1,101 @@
 # -------- helpers --------
 
+# require_root [hint...] — a root-only verb run by a seat that is not root.
+#
+# DIVE-7183 (DIVE-7172's voice fix, here for every caller): the reader of this
+# refusal is an AGENT whose owner has no terminal. "try: sudo 5dive …" made a
+# weak model stop and ask its owner to find root. So:
+#  1. a seat whose sudo allows the exact command (probed with `sudo -n -l`,
+#     which runs nothing, never prompts and mails no refusal) gets the same
+#     argv re-run through `sudo -n`. Already root never reaches the probe, so the
+#     re-run cannot loop.
+#  2. a seat without the grant is told which running admin colleague can do it,
+#     with the `5dive agent send` line, and never to hand its owner a command.
+#
+# Re-run only from the top-level shell of the installed CLI (`$0` is the binary
+# the grant names): inside a pipeline or $(…) the exec would replace a subshell
+# and run the whole command a second time nested in the first; a sourced
+# harness (no FIVE_ARGV) or a worktree bundle never sudo-runs anything.
+# Never re-run what would put a secret into sudo's log line (DIVE-5805), or a
+# command that may already have read its stdin (DIVE-880: a value given as `-`
+# was read before this check on some verbs, so the re-run would get nothing).
+FIVE_ROOT_SUDO="${FIVEDIVE_SUDO:-sudo}"
+FIVE_ROOT_BIN="${FIVEDIVE_BIN:-/usr/local/bin/5dive}"
+
+# A flag whose VALUE is a credential (--api-key=, --token=, telegram.token=,
+# openrouter-key=, …). Names that only NAME a secret (--secret-key=, --key=)
+# and --max-tokens= are not values.
+_root_arg_is_secret() {
+  [[ "$1" == *=* ]] || return 1
+  local n="${1%%=*}" v="${1#*=}"
+  n="${n#--}"
+  [[ -n "$v" && "$v" != "-" ]] || return 1
+  [[ "$n" =~ (^|[-._])(token|api-key|password|secret)$ || "$n" == *openrouter-key ]]
+}
+
+# The argv with each credential value replaced by `-` (read it from stdin), and
+# the same argv as a colleague may be shown it (the value becomes <value>).
+_root_argv_keyless() {
+  local a
+  for a in "$@"; do
+    if _root_arg_is_secret "$a"; then printf '%s\0' "${a%%=*}=-"; else printf '%s\0' "$a"; fi
+  done
+}
+_root_argv_shown() {
+  local a out=()
+  for a in "$@"; do
+    if _root_arg_is_secret "$a"; then out+=("${a%%=*}=<value>"); else out+=("$a"); fi
+  done
+  printf '%s' "${out[*]}"
+}
+
 require_root() {
-  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "must run as root — try: sudo 5dive ${*:-${FIVE_ARGV[*]:-}}"
+  [[ $EUID -eq 0 ]] && return 0
+  [[ -n "${FIVE_ARGV+x}" ]] || fail "$E_PERMISSION" "must run as root (5dive ${*:-})"
+
+  local a secret=0 stdin_arg=0
+  for a in "${FIVE_ARGV[@]}"; do
+    _root_arg_is_secret "$a" && secret=1
+    [[ "$a" == - || "$a" == *=- ]] && stdin_arg=1
+  done
+  # The probe line is logged by sudo too, so a credential never rides it: ask
+  # about the keyless form, which is the one the agent is told to run.
+  local -a argv=()
+  mapfile -d '' -t argv < <(_root_argv_keyless "${FIVE_ARGV[@]}")
+  local shown; shown=$(_root_argv_shown "${FIVE_ARGV[@]}")
+  if (( BASH_SUBSHELL == 0 )) && [[ "$0" -ef "$FIVE_ROOT_BIN" ]] \
+     && "$FIVE_ROOT_SUDO" -n -l "$FIVE_ROOT_BIN" "${argv[@]}" >/dev/null 2>&1; then
+    (( secret )) && fail "$E_PERMISSION" "must run as root. This agent may, but not with a key typed on the command line: it would land in the system log. Pipe the key in instead, with sudo -n in front: sudo -n 5dive ${argv[*]}"
+    (( stdin_arg )) && [[ ! -t 0 ]] && fail "$E_PERMISSION" "must run as root. This agent may, but this command reads its input from stdin, so it was not re-run for you. Run it again with sudo -n in front and pipe the input again: sudo -n 5dive ${argv[*]}"
+    exec "$FIVE_ROOT_SUDO" -n "$FIVE_ROOT_BIN" "${FIVE_ARGV[@]}"
+  fi
+  fail "$E_PERMISSION" "$(_root_refusal "$shown")"
+}
+
+# _root_refusal <shown argv> — for a seat that cannot get root: who on this box
+# can, and the message to send them. Colleagues come from `agent list --json`
+# (any seat may run it), by their MEASURED grant; `.active` is the unit's
+# systemd state as a string, so only "active" counts; a beyond-admin seat (the
+# lead) is named first. FIVE_ROOT_ASKING keeps a
+# root-gated `agent list` from asking itself again.
+_root_admin_colleagues() {
+  local me="${USER:-$(id -un 2>/dev/null)}"
+  me="${me#agent-}"
+  [[ -z "${FIVE_ROOT_ASKING:-}" ]] || return 0
+  local list; list=$(FIVE_ROOT_ASKING=1 "$0" agent list --json </dev/null 2>/dev/null) || true
+  jq -r --arg me "$me" '[(.data // [])[] | select(.name != $me and .active == "active")
+    | select(.sudo.impliedIsolation == "admin" or .sudo.impliedIsolation == "beyond-admin")]
+    | sort_by(.sudo.impliedIsolation != "beyond-admin") | map(.name) | .[:3] | join(" ")' <<<"$list" 2>/dev/null || true
+}
+_root_refusal() {
+  local shown="$1" admins; admins=$(_root_admin_colleagues)
+  printf 'must run as root, and this agent does not have it. Do not ask your owner to run anything: they have no terminal.'
+  if [[ -n "$admins" ]]; then
+    printf ' Ask a colleague on this box who has it (%s), for example:\n  5dive agent send %s "My owner asked for this and it needs root. Please run: sudo 5dive %s"' \
+      "${admins// /, }" "${admins%% *}" "${shown//\"/\\\"}"
+  else
+    printf ' No other agent on this box has it either: tell your owner this cannot be done from this agent (5dive %s).' "$shown"
+  fi
 }
 
 # -------- DIVE-2627: file input for the prose flags --------
