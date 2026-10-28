@@ -55,7 +55,12 @@ task_need_notify() { return "$NOTIFY_RC"; }
 registry_read() { printf '%s\n' '{"agents":{"olivia":{"type":"claude"}}}'; }
 SUDO_LOG="$TMP/sudo.log"; SUDO_RC=0; SUDO_OUT=''
 sudo() { echo "$*" >> "$SUDO_LOG"; printf '%s' "$SUDO_OUT"; return "$SUDO_RC"; }
+# The seat's tier check (_task_unnotified_secret_link) reads `id -un`, so that stub
+# stays; the gate's own actor comes from the sealed derivation, so pin its seams too
+# (DIVE-7158) — otherwise the caller is whoever runs the suite on the host.
 id() { [[ "${1:-}" == -un ]] && { printf 'agent-olivia\n'; return 0; }; command id "$@"; }
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
+actor_seam_as olivia
 SEAT_TIER=admin
 agent_tier() { [[ "$1" == olivia ]] && printf '%s\n' "$SEAT_TIER" || printf 'unknown:unregistered\n'; }
 N=0
@@ -70,6 +75,10 @@ file_gate() { # [type] — files a fresh gate; sets OUT ERR JS
 }
 okline() { grep -m1 '^OK — ' <<<"$OUT"; }
 LINK='https://203-0-113-7.sslip.io/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCd'
+
+_pin_got="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
+check 'S0 the actor seam is pinned: the real resolver derives olivia, not the host user' \
+  '[[ "$_pin_got" == olivia ]]' "resolver derived '${_pin_got:-<nothing>}'"
 
 echo '== no channel, an admin seat: the link is printed =='
 SUDO_OUT="{\"ok\":true,\"data\":{\"url\":\"$LINK\",\"ttl_minutes\":30}}"
