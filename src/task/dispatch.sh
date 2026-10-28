@@ -175,6 +175,8 @@ _task_usage() {
                    just means the wrong thing.
       [--needs=<capability>] [--discusses=<why>] [--rubber-stamp-ok="<why>"]
       [--owner=<human>]   route the gate to that person (a human account: 5dive human ls)
+      [--browser-ask=<id>] (approval) the id a browser stop printed: the owner's yes on
+                   this gate IS that approval, once; you are told to re-run with --approved=<id>
       [--ask-ok="<why>"]   DIVE-4176: a gate that reaches the PAIRED HUMAN is refused
                    when its --ask runs over 25 words or names an ident/sha/branch/
                    path/flag — that text is all he sees. Rewrite it as a choice
@@ -219,6 +221,7 @@ _task_usage() {
   inbox [--send [--channel-proof=<chat>] [--only=<id>]]  every unanswered human gate IN THE FLEET (already
                                                 fleet-wide; --fleet accepted as a no-op); --send DMs the owner,
                                                 --only re-sends that one gate's alert
+  inbox --messages                              what your agents sent you with \`agent send owner\` (the last 20)
   gates                                         alias of \`inbox\` (DIVE-4310)
   coordinator [--json]                          the agent fronting the needs-you banner
 

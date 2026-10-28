@@ -371,6 +371,180 @@ _owner_ask_tap() {
   ok "${answer}: ${OA_ID}" '{result: $r, id: $id, seat: $s}' --arg r "$answer" --arg id "$OA_ID" --arg s "$OA_SEAT"
 }
 
+# ── DIVE-7164 — ONE OWNER YES, AND A REPLY THAT REACHES THE OWNER ──────────────
+#
+# Two gaps from the Dropshipping trial's clean rerun (DIVE-6902), both on a
+# self-hosted box with no chat channel.
+#
+# ONE YES. The owner said yes on the row's gate, and the browser then stopped
+# again for its own approval, which only a shell user could give: two yeses for
+# one step. A gate filed with `task need <row> --type=approval --browser-ask=<id>`
+# is now that approval. Filing writes a fresh proof's sha256 into the browser's
+# request as root (the same rewrite `owner-ask browser` does) and keeps the proof
+# in a root-only file beside the row. When the gate is answered "yes" by a
+# PERSON — need_answered_by human:* with a tap's nonce, an on-box human login or
+# a drop link as its evidence, never a lead's or a cited chat's — the CLI runs
+# `browser approve <id> --human-proof=<proof>` and wakes the seat. A "no" runs
+# --deny. Anything else leaves the ask as it was and says so.
+#
+# THE REPLY. An agent answering the owner had nowhere to write: `agent send` takes
+# an agent name, and the owner is not one, so its answer to an `agent send
+# --from=owner` landed only in its own transcript. `5dive agent send owner <text>`
+# now reaches the owner where they read: the 5dive app chat on a box linked to the
+# app, else the seat's Telegram, else the owner's inbox on this box, printed at
+# their next login (task inbox --login) and by `5dive task inbox --messages`.
+
+_owner_gate_dir() { printf '%s/owner-ask-gates' "${STATE_DIR:-/var/lib/5dive}"; }
+
+# _owner_ask_gate_needs <browser ask id> — checked before the gate is written:
+# the ask is live and the caller's own. Prints the capability the gate declares.
+_owner_ask_gate_needs() {
+  local ask="$1" d cls
+  _owner_ask_is_root || fail "$E_PERMISSION" "--browser-ask needs root (sudo 5dive task need …)"
+  [[ "$ask" =~ ^(agent-[a-z0-9][a-z0-9._-]*)-([0-9a-f]{12})$ ]] \
+    || fail "$E_VALIDATION" "--browser-ask takes the id a browser stop printed (<seat>-<12 hex>), not '$ask'"
+  if [[ "${SUDO_USER:-}" == agent-* && "$SUDO_USER" != "${BASH_REMATCH[1]}" ]]; then
+    fail "$E_PERMISSION" "$SUDO_USER cannot put ${BASH_REMATCH[1]}'s browser ask on a gate"
+  fi
+  d=$(_owner_ask_dir_of "${BASH_REMATCH[1]}") || fail "$E_NOT_FOUND" "no seat ${BASH_REMATCH[1]} on this box"
+  ( _owner_ask_load "$d/$ask.json" ) >/dev/null || fail "$E_NOT_FOUND" "no pending browser ask $ask (it was already answered, or never asked)"
+  cls=$(_owner_ask_cat_as "${BASH_REMATCH[1]}" "$d/$ask.json" 2>/dev/null | jq -r '.class // ""' 2>/dev/null)
+  if [[ "$cls" == pay ]]; then printf 'spend_authority'; else printf 'human_tap'; fi
+}
+
+# _owner_ask_gate_bind <task id> <ident> <browser ask id> — run by `task need` as
+# root, after the gate is written. Prints one line for the filer.
+_owner_ask_gate_bind() {
+  local id="$1" ident="$2" ask="$3" dir nonce hash
+  _owner_ask_is_root || fail "$E_PERMISSION" "--browser-ask needs root (sudo 5dive task need …)"
+  [[ "$ask" =~ ^(agent-[a-z0-9][a-z0-9._-]*)-([0-9a-f]{12})$ ]] \
+    || fail "$E_VALIDATION" "--browser-ask takes the id a browser stop printed (<seat>-<12 hex>), not '$ask'"
+  local seat="${BASH_REMATCH[1]}"
+  # A seat binds only its own ask: sudo stamps SUDO_USER truthfully at EUID 0.
+  if [[ "${SUDO_USER:-}" == agent-* && "$SUDO_USER" != "$seat" ]]; then
+    fail "$E_PERMISSION" "$SUDO_USER cannot put ${seat}'s browser ask on a gate"
+  fi
+  local d; d=$(_owner_ask_dir_of "$seat") || fail "$E_NOT_FOUND" "no seat $seat on this box"
+  _owner_ask_load "$d/$ask.json"
+  nonce=$(_human_nonce_mint) || fail "$E_GENERIC" "could not mint the owner's proof"
+  hash=$(_human_nonce_sha "$nonce")
+  [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || fail "$E_GENERIC" "could not hash the owner's proof"
+  _owner_ask_rewrite '. + {nonce_hash: $h, gate: $g}' --arg h "$hash" --arg g "$ident" \
+    || fail "$E_GENERIC" "could not write the owner's proof into $OA_DIR/$OA_ID.json"
+  dir=$(_owner_gate_dir)
+  # 711: a non-root `task answer` can see THAT a gate carries an ask (to warn), never read it.
+  ( umask 077; mkdir -p -- "$dir" && chmod 711 -- "$dir" \
+      && jq -nc --arg a "$OA_ID" --arg s "$OA_SEAT" --arg n "$nonce" --arg i "$ident" \
+           '{ask:$a, seat:$s, nonce:$n, ident:$i}' > "$dir/$id.json" ) \
+    || fail "$E_GENERIC" "could not record the browser ask on $ident"
+  printf 'browser ask %s is on this gate: the owner'"'"'s yes approves it, once, and you are told to re-run with --approved=%s\n' "$OA_ID" "$OA_ID"
+}
+
+# _owner_ask_gate_settle <task id> <ident> <answer> — run by `task answer` after
+# the answer is stored. Silent when the gate carries no browser ask.
+_owner_ask_gate_settle() {
+  local id="$1" ident="$2" value="$3" f row by ev verdict out w
+  f="$(_owner_gate_dir)/$id.json"
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  if ! _owner_ask_is_root; then
+    warn "$ident: the gate is answered, but its browser ask is still open: only root settles it. The owner approves it with: sudo 5dive browser approve <the ask id the stop printed>"
+    return 0
+  fi
+  row=$(db "SELECT COALESCE(need_answered_by,'')||x'1f'||COALESCE(human_evidence,'') FROM tasks WHERE id=${id};" 2>/dev/null) || row=""
+  IFS=$'\x1f' read -r by ev <<<"$row"
+  w=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[^a-z]*//; s/[^a-z].*$//')
+  case "$w" in
+    yes|y|ok|okay|approve|approved|allow|allowed|go) verdict=approve ;;
+    no|n|deny|denied|decline|declined|reject|rejected|stop) verdict=deny ;;
+    *) verdict="" ;;
+  esac
+  local ask seat nonce
+  ask=$(jq -r '.ask // ""' "$f" 2>/dev/null); seat=$(jq -r '.seat // ""' "$f" 2>/dev/null); nonce=$(jq -r '.nonce // ""' "$f" 2>/dev/null)
+  if [[ "$by" != human:* || ! "+${ev}+" =~ \+(nonce|sudo-uid|drop-link)\+ ]]; then
+    warn "$ident: browser ask $ask was NOT approved — only the owner's own answer approves a browser step (this one: ${by:-unrecorded}, evidence ${ev:-none}). The ask stays open: sudo 5dive browser approve $ask"
+    return 0
+  fi
+  if [[ -z "$verdict" ]]; then
+    warn "$ident: the answer is neither a yes nor a no, so browser ask $ask was left as it was. The owner approves it with: sudo 5dive browser approve $ask"
+    return 0
+  fi
+  local -a deny=()
+  [[ "$verdict" == deny ]] && deny=(--deny)
+  if out=$(_owner_ask_browser_approve "$ask" "$nonce" "${deny[@]}" 2>&1); then
+    rm -f -- "$f"
+    if [[ "$verdict" == approve ]]; then
+      step "$ident: the owner's yes approved browser ask $ask — once, for exactly those steps"
+      _owner_ask_wake "${seat#agent-}" "The owner said yes on ${ident}, which approves browser ask ${ask}. Re-run the waiting act with --approved=${ask}." \
+        || warn "could not wake ${seat#agent-}"
+    else
+      step "$ident: the owner's no declined browser ask $ask"
+      _owner_ask_wake "${seat#agent-}" "The owner said no on ${ident}, which declines browser ask ${ask}. Do not re-run it." \
+        || warn "could not wake ${seat#agent-}"
+    fi
+  else
+    warn "$ident: browser approve failed for ${ask}: ${out##*$'\n'}"
+  fi
+  return 0
+}
+
+# ---- the reply ------------------------------------------------------------------
+
+# Is this box linked to the 5dive app? Sets OWNER_APP_API and OWNER_APP_TOKEN.
+_owner_app_linked() {
+  local env api tok mark="${FIVEDIVE_CHAT_ONLY_MARK:-/etc/5dive/chat-only}"
+  OWNER_APP_API="" OWNER_APP_TOKEN=""
+  env=$(_sp_connectord_env)
+  [[ -r "$env" ]] || return 1
+  tok=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$env" 2>/dev/null | head -n 1)
+  [[ -n "$tok" ]] || return 1
+  api=$(sed -n 's/^API=//p' "$mark" 2>/dev/null | head -n 1)
+  [[ "$api" =~ ^https?://[A-Za-z0-9.:-]+(/[A-Za-z0-9._/-]*)?$ ]] || api=$(_dash_relay_api_base)
+  OWNER_APP_API="${api%/}" OWNER_APP_TOKEN="$tok"
+}
+
+# _owner_note_send <agent name> <text> — root. One message from <agent> to the
+# owner, by the first route that takes it. Prints where it went.
+_owner_note_send() {
+  local name="$1" text="$2" body out code
+  [[ "$name" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || fail "$E_VALIDATION" "only an agent sends to the owner (send it from the agent's seat)"
+  [[ -n "${text//[[:space:]]/}" ]] || fail "$E_USAGE" "message is empty"
+  (( ${#text} <= 65536 )) || fail "$E_VALIDATION" "the message is over 64 KiB"
+  # 1. The app chat, on a box linked to the app: the owner reads every agent there.
+  if _owner_app_linked; then
+    body=$(jq -nc --arg a "$name" --arg b "$text" '{agent:$a, body:$b, metadata:{}}')
+    out=$( (_dash_relay_call POST "${OWNER_APP_API}/server/messages/event" "$body" "$OWNER_APP_TOKEN" 20) 2>/dev/null ) || out=""
+    code="${out%%$'\n'*}"
+    if [[ "$code" =~ ^2[0-9][0-9]$ ]]; then
+      ok "sent to the owner in your 5dive app chat" '{sent:true, via:"app"}'
+      return 0
+    fi
+    warn "the 5dive app did not take the message (${code:-no answer}); trying the next way to the owner"
+  fi
+  # 2. The seat's Telegram, to the person its asks go to.
+  if _owner_ask_route "$name"; then
+    _task_send_gate_owner "💬 ${name}: ${text}" "" "" "$OA_OWNER_HID"
+    if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
+      ok "sent to the owner on Telegram" '{sent:true, via:"telegram"}'
+      return 0
+    fi
+  fi
+  # 3. The owner's inbox on this box: printed at their next login.
+  local f; f=$(_owner_inbox_file)
+  ( umask 077; mkdir -p -- "${f%/*}" \
+      && jq -nc --arg f "$name" --arg t "$text" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{at:$at, from:$f, text:$t}' >> "$f" ) \
+    || fail "$E_GENERIC" "could not write to the owner's inbox ($f)"
+  # Kept to the last 200; what was already seen stays seen.
+  local keep=200 total seen tmp
+  total=$(wc -l < "$f")
+  if (( total > keep * 2 )); then
+    seen=$(cat "$(_owner_inbox_seen)" 2>/dev/null); [[ "$seen" =~ ^[0-9]+$ ]] || seen=0
+    seen=$(( seen > total - keep ? seen - (total - keep) : 0 ))
+    tmp=$(mktemp "${f}.XXXXXX") && tail -n "$keep" -- "$f" > "$tmp" && mv -f -- "$tmp" "$f" \
+      && printf '%s\n' "$seen" > "$(_owner_inbox_seen)"
+  fi
+  ok "this box has no chat for the owner, so it waits in their inbox here: they see it when they next log in (or with: 5dive task inbox --messages)" '{sent:true, via:"inbox"}'
+}
+
 cmd_owner_ask() {
   [[ $# -gt 0 ]] || { _owner_ask_usage; mark_reported; exit "$E_USAGE"; }
   local sub="$1"; shift

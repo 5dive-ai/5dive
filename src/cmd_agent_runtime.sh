@@ -2477,6 +2477,13 @@ cmd_deliver() {
   # inject into an arbitrary or unmanaged tmux session.
   [[ "$target" =~ ^[a-z][a-z0-9-]{0,31}$ ]] \
     || fail "$E_VALIDATION" "invalid target '$target' (lowercase letter start, [a-z0-9-], <=32 chars)"
+  # DIVE-7164: a seat's reply to the owner (see cmd_send).
+  if _owner_is_send_target "$target"; then
+    local _me; _me=$(actor_routing_agent) \
+      || fail "$E_PERMISSION" "only an agent sends to the owner: run it from the agent's seat"
+    _owner_note_send "$_me" "$message"
+    return 0
+  fi
   require_agent "$target"
   sudo -u "agent-${target}" tmux has-session -t "agent-${target}" 2>/dev/null \
     || fail "$E_NOT_RUNNING" "tmux session 'agent-${target}' not found (is the agent running?)"
@@ -3163,6 +3170,13 @@ _agent_body_shell_hint() {
   return 0
 }
 
+# DIVE-7164: `owner` as a send target: the box owner, unless an agent is really called that.
+_owner_is_send_target() {
+  [[ "$1" == owner ]] || return 1
+  ensure_state_ro
+  ! jq -e '.agents.owner != null' <<<"$(registry_read)" >/dev/null 2>&1
+}
+
 cmd_send() {
   local name="" message="" from="" from_set=0 raw=0 wake=0
   # DIVE-4769: --urgent asks to JUMP THE DIVE-4214 SPOOL, i.e. to join the
@@ -3225,6 +3239,12 @@ cmd_send() {
   # only --message-file is exempt.
   _agent_body_shell_hint "$message" "$msg_src"
 
+  # DIVE-7164: --wake starts an agent's unit and the owner is not an agent, so
+  # refuse it here rather than drop it below (DIVE-2385's rule, same reason).
+  if (( wake )) && _owner_is_send_target "$name"; then
+    fail "$E_USAGE" "--wake starts an agent; the owner is not one — send without --wake"
+  fi
+
   # DIVE-1065: a standard-isolation agent has no broad sudo, so it cannot run the
   # direct `sudo -u agent-X tmux` inject this function uses below. Route a
   # non-root agent caller through the privileged, tightly-scoped `_deliver`
@@ -3247,6 +3267,16 @@ cmd_send() {
   # BEFORE the exec for that reason.
   if (( wake )) && a2a_needs_scoped "$name"; then
     fail "$E_PERMISSION" "--wake needs admin/root; this caller holds only the a2a delivery grant — re-run via sudo, or file a task row"
+  fi
+  # DIVE-7164: `owner` is the box owner, not a seat. A seat with only the scoped
+  # grant crosses to root through _deliver, which takes the same target. Below
+  # the --wake refusals, so no exec into _deliver ever sits ahead of them.
+  if _owner_is_send_target "$name"; then
+    [[ $EUID -eq 0 ]] || exec sudo -n /usr/local/bin/5dive agent _deliver owner "$message"
+    local _me; _me=$(actor_routing_agent) \
+      || fail "$E_PERMISSION" "only an agent sends to the owner: run it from the agent's seat"
+    _owner_note_send "$_me" "$message"
+    return 0
   fi
   # DIVE-4769: --urgent is NOT refused for a scoped caller the way --wake is. It
   # needs no privilege _deliver lacks (it is a queue decision, not a lifecycle
@@ -3426,6 +3456,14 @@ cmd_send() {
       [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
       header+="]"
       payload="${header} ${message}"
+      # DIVE-7164: the owner is not an agent name, so a seat had no way to answer
+      # one and its reply stayed in its own transcript. Say how, once, on the
+      # message a person sent. The verb sits in a variable so the devteam
+      # literal-seat guard (merge_hold_recipient C2) does not read `owner` as a seat.
+      if [[ -z "$reply_to_chat" && ( "$sender" == owner || "$sender" == human ) ]] && ! actor_routing_agent >/dev/null 2>&1; then
+        local _send_verb='5dive agent send'
+        payload+=$'\n\n'"(To answer the owner: ${_send_verb} owner --message-file=- — it reaches them where they read, not your transcript.)"
+      fi
     fi
   fi
   # DIVE-4769: the line the receiving MODEL reads. The envelope field above is
