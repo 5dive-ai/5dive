@@ -36,6 +36,17 @@ _secret_usage() {
   cat >&2 <<'EOF'
 5dive secret — box-side secret store (secure credential drop,)
 
+  5dive secret link <DIVE-N> [--ttl=<minutes>] [--again]
+      Mint a one-time link for an open secret gate: https://secrets.<box>/<token>.
+      The owner opens it, pastes, taps once; the value goes from their browser to
+      this box only, lands as the gate's KEY, and clears the gate. Single use,
+      expires in 30 min by default. Root-only. Returns once the page answers over
+      a valid certificate (at most ~20s on a box's first link); --json carries
+      ready:false if it did not in time (the link still works a moment later).
+      An agent asking while a link for the gate is live (the gate's alert
+      carries one) is refused, exit 3; --again mints another anyway.
+      To get a key from an owner with no terminal, this is the link to send them.
+
   5dive secret write <KEY> --connector=<name> [--task=<DIVE-N>]   (value on STDIN)
       Write/replace KEY in /etc/5dive/connectors/<name>.env. Atomic,
       idempotent, 600 root:claude. The value is read from stdin and never
@@ -52,16 +63,6 @@ _secret_usage() {
       --connector=project-<app> is for an app's own variable (any name): the
       value lands as KEY=value in /home/claude/projects/<app>/.env.local when
       that file exists, else .env, written as the project folder's owner.
-
-  5dive secret link <DIVE-N> [--ttl=<minutes>] [--again]
-      Mint a one-time link for an open secret gate: https://secrets.<box>/<token>.
-      The owner opens it, pastes, taps once; the value goes from their browser to
-      this box only, lands as the gate's KEY, and clears the gate. Single use,
-      expires in 30 min by default. Root-only. Returns once the page answers over
-      a valid certificate (at most ~20s on a box's first link); --json carries
-      ready:false if it did not in time (the link still works a moment later).
-      An agent asking while a link for the gate is live (the gate's alert
-      carries one) is refused, exit 3; --again mints another anyway.
 
   5dive secret link --save=<name> [--pair] [--ttl=<minutes>]
       A one-time link for a SAVED login with no task, kept on this box for

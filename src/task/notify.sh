@@ -1726,7 +1726,7 @@ _task_mint_drop_link() {
     # A sandboxed agent shell runs with no_new_privs, and sudo cannot run there
     # at all. Say so instead of spending a refused sudo on it.
     if grep -qE '^NoNewPrivs:[[:space:]]*1' /proc/self/status 2>/dev/null; then
-      _task_drop_link_log error "$ident" "admin seat ${me} could not mint: its shell runs with no_new_privs (a sandboxed agent shell), so sudo cannot run; the alert sends the owner to the app. Mint by hand: sudo 5dive secret link ${ident}"
+      _task_drop_link_log error "$ident" "admin seat ${me} could not mint: its shell runs with no_new_privs (a sandboxed agent shell), so sudo cannot run; $(_task_nolink_fallback_note). Mint by hand: sudo 5dive secret link ${ident}"
       rm -f "$errf" 2>/dev/null; return 0
     fi
     out=$(sudo -n 5dive --json secret link "$ident" --again 2>"$errf") || rc=$?
@@ -1738,7 +1738,7 @@ _task_mint_drop_link() {
     why=$(printf '%s' "$out" | jq -r '.error.message // .message // empty' 2>/dev/null)
     [[ -n "$why" ]] || why=$(head -c 300 "$errf" 2>/dev/null | tr '\n' ' ')
     [[ -n "$url" ]] && why="not an https link: ${url}"
-    _task_drop_link_log error "$ident" "${me:-root} could not mint (rc=${rc}): ${why:-no output}. The alert sends the owner to the app. Mint by hand: sudo 5dive secret link ${ident}"
+    _task_drop_link_log error "$ident" "${me:-root} could not mint (rc=${rc}): ${why:-no output}. $(_task_nolink_fallback_note). Mint by hand: sudo 5dive secret link ${ident}"
     rm -f "$errf" 2>/dev/null; return 0
   fi
   rm -f "$errf" 2>/dev/null
@@ -1753,6 +1753,13 @@ _task_mint_drop_link() {
 # writes nowhere unless it names FIVEDIVE_GATE_NOTIFY_LOG. An error also goes to
 # the audit log (through the store-fenced _task_store_audit_log, DIVE-2054) and
 # to stderr, so `task need` run by hand shows it too.
+# DIVE-7151: where the owner goes when the mint failed. Only a box linked to the
+# app has a card to send them to; on an OSS box it is the server line.
+_task_nolink_fallback_note() {
+  if _task_box_has_app; then printf 'the alert sends the owner to the app'
+  else printf 'the owner types the value on this box instead (secret write)'; fi
+}
+
 _task_drop_link_log() {
   local result="$1" ident="$2" reason="${3//$'\n'/ }" logf="${FIVEDIVE_GATE_NOTIFY_LOG:-}" prod=0
   if _task_human_send_allowed 2>/dev/null \
@@ -1930,6 +1937,35 @@ _task_secret_gate_box_line() {
 # and only then does a dashboard card or My team exist for the owner to open.
 # An OSS box has neither, so its alerts must never send the owner there.
 _task_box_has_app() { [[ -e "$(_sp_connectord_env)" ]]; }
+
+# DIVE-7151: where an unnotified gate gets its answer. Only a box linked to the
+# app has a dashboard; on an OSS box "answer on the dashboard" sent the agent to
+# tell its owner about a page that does not exist.
+_task_gate_answer_where() { # <ident>
+  if _task_box_has_app; then printf 'answer on the dashboard or: 5dive task answer %s' "$1"
+  else printf 'answer with: 5dive task answer %s' "$1"; fi
+}
+
+# _task_unnotified_secret_link <ident> <key> <connector> — DIVE-7151. A secret
+# gate that no alert carried still needs its link, and the filer is then the only
+# one who can pass it on: minting lived in the alert path alone, so a box with no
+# chat channel printed no link and the agent told its owner to use a dashboard.
+# Echoes "<url>|<ttl>" or nothing; every no-link case is warned with its reason
+# (`no secure link in this alert — …`). A standard seat never holds a link
+# (DIVE-7128) and its root send needs a chat to send to, so it gets the reason
+# and the terminal line instead of a mint.
+_task_unnotified_secret_link() {
+  local ident="$1" skey="$2" conn="$3" me tier
+  if ! _gate_is_root; then
+    me=$(id -un 2>/dev/null)
+    tier=$(agent_tier "${me#agent-}" 2>/dev/null)
+    if [[ "$me" != agent-* || "$tier" != admin ]]; then
+      _task_drop_link_log error "$ident" "no chat channel to send the link to, and ${me:-this user} (tier ${tier:-?}) may not hold one itself. Ask an admin seat to run: 5dive secret link ${ident}. $(_task_secret_gate_box_line "$skey" "$conn" "$ident")"
+      return 0
+    fi
+  fi
+  _task_mint_drop_link "$ident" "$skey" "$conn"
+}
 
 # DIVE-7128: the minted-link prose, one line plus the link. On a box linked to
 # the app the owner reads Telegram and has no shell, so the `sudo` line is left
@@ -2574,7 +2610,7 @@ task_need_notify() {
     else
       _task_gate_delivery_log error "$1" "" "" \
         "no delivery verdict recorded by the notify path (rc=${_rc}) and no confirmed send; delivery is UNVERIFIABLE, treating as unnotified"
-      warn "$1: gate delivery is UNVERIFIABLE — the notify path exited (rc=${_rc}) with neither a confirmed send nor a recorded verdict, so nobody can show a human was reached. Treated as FILED UNNOTIFIED: the re-nag will escalate it. Answer on the dashboard or: 5dive task answer $1"
+      warn "$1: gate delivery is UNVERIFIABLE — the notify path exited (rc=${_rc}) with neither a confirmed send nor a recorded verdict, so nobody can show a human was reached. Treated as FILED UNNOTIFIED: the re-nag will escalate it. $(_task_gate_answer_where "$1")"
       (( _rc == 0 )) && _rc=3
     fi
   fi
@@ -3371,7 +3407,7 @@ _task_need_notify_deliver_now() {
         # and will deliver. Refusing would turn a delayed gate into a lost one —
         # literally the DIVE-1926 case, which the 07:10 re-nag rescued.
         TASK_NOTIFY_FAIL_REASON="the privileged re-send to ${_paired} failed, so delivery is unconfirmed"
-        warn "$ident: could not hand this gate to ${_paired} from here — FILED UNNOTIFIED; the heartbeat re-nag escalates it (<=15 min). Answerable now on the dashboard or: 5dive task answer ${ident}"
+        warn "$ident: could not hand this gate to ${_paired} from here — FILED UNNOTIFIED; the heartbeat re-nag escalates it (<=15 min). Answerable now: $(_task_gate_answer_where "$ident")"
         _task_gate_delivery_log error "$numid" "" "" "privileged re-send to ${_paired} failed${TASK_GATE_ESCALATE_ERR:+ (${TASK_GATE_ESCALATE_ERR})}; gate filed unnotified, re-nag will escalate"
         return 3
       fi
@@ -3391,12 +3427,12 @@ _task_need_notify_deliver_now() {
       if _task_deployment_has_channels; then
         local _shape; _shape=$(_task_filer_chain_shape "${_self:-}")
         TASK_NOTIFY_FAIL_REASON="${_self:-the filer} has no paired channel and neither does anyone above it in the org chart (${_shape})"
-        warn "$ident: NO paired channel for ${_self:-?} or anyone above it in the org chart [${_shape}] — gate FILED UNNOTIFIED on a deployment that notifies. Nobody was pinged; answer on the dashboard or: 5dive task answer ${ident}"
+        warn "$ident: NO paired channel for ${_self:-?} or anyone above it in the org chart [${_shape}] — gate FILED UNNOTIFIED on a deployment that notifies. Nobody was pinged; $(_task_gate_answer_where "$ident")"
         _task_gate_delivery_log error "$numid" "" "" "no paired channel for filer ${_self:-?} or anyone above it; shape=${_shape}; gate filed unnotified on a channel-having deployment"
       else
         TASK_NOTIFY_FAIL_REASON=""
-        warn "$ident: no channels configured on this deployment — gate filed UNNOTIFIED. Answer it on the dashboard, or: 5dive task answer ${ident}"
-        _task_gate_delivery_log error "$numid" "" "" "no channel configured on this deployment; gate filed unnotified (dashboard-answerable)"
+        warn "$ident: no channels configured on this deployment — gate filed UNNOTIFIED. Nobody was pinged; $(_task_gate_answer_where "$ident")"
+        _task_gate_delivery_log error "$numid" "" "" "no channel configured on this deployment; gate filed unnotified (answerable with task answer)"
       fi
       return 3
     fi
