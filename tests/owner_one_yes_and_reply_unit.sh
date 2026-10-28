@@ -242,8 +242,12 @@ _owner_is_send_target owner && bad_t "M9 an agent named owner" "treated as the b
   || ok_t "M9 a seat really named 'owner' keeps its name"
 rm -f "$REGISTRY"
 grep -q '_owner_is_send_target "\$name"' "$SRC/cmd_agent_runtime.sh" \
-  && grep -q 'To answer the owner: 5dive agent send owner' "$SRC/cmd_agent_runtime.sh" \
+  && grep -q 'To answer the owner: ${_send_verb} owner' "$SRC/cmd_agent_runtime.sh" \
   && ok_t "M10 agent send routes owner, and a person's message says how to answer" || bad_t "M10 cmd_send wiring" ""
+n0=$(wc -l < "$TMP/owner-inbox.jsonl")
+out=$( (cmd_send owner --wake --message="Woken?") 2>&1); rc=$?
+[[ $rc -ne 0 && "$out" == *"owner is not one"* && "$(wc -l < "$TMP/owner-inbox.jsonl")" == "$n0" ]] \
+  && ok_t "M11 agent send owner --wake is refused out loud, nothing sent" || bad_t "M11 owner --wake" "rc=$rc out=$out"
 
 SUMMARY_PRINTED=1
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
