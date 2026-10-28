@@ -1249,6 +1249,13 @@ main() {
       # HERE: the parent verb is audited and reaches this through a pipe.
       cmd_lead_account_delegated "$@"
       exit $? ;;
+    _seat_secret)
+      # DIVE-7168: hidden, privileged, self-scoped key save for a standard seat
+      # (src/cmd_secret.sh). Reachable ONLY via the exact-path NOPASSWD line
+      # render_standard_sudoers writes; key and value on stdin, the seat from
+      # SUDO_UID. Not audited HERE: the parent verb is. Never advertised.
+      cmd_seat_secret_write "$@"
+      exit $? ;;
     _self_account)
       # DIVE-5367: hidden, privileged, self-scoped account rail for a standard
       # seat. Reachable ONLY via the exact-path NOPASSWD line render_standard_sudoers

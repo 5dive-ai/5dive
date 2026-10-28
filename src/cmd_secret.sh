@@ -57,6 +57,9 @@ _secret_usage() {
       A value of several lines (a PEM key, JSON) is saved whole in
       /etc/5dive/connectors/<name>.d/<KEY>, and <name>.env gets KEY_FILE=<that path>.
       Run at a terminal with nothing piped, it asks for the value (hidden input).
+      An agent seat with no root runs the same line without sudo for
+      --connector=tools: it may add a new key, or replace one it saved itself,
+      never one the owner or another seat saved (DIVE-7168).
       --connector=tools is the one store every agent reads: the key lands in
       /etc/5dive/connectors/tools.sh and agents see $KEY from their next command
       (one line, no spaces or quotes). Every other connector file is root-only.
@@ -557,6 +560,11 @@ _secret_write() {
     shift
   done
 
+  # DIVE-7168: a standard seat saves a key it made itself (tools only, a new
+  # name or one it saved before) through its own grant; see _seat_secret_write.
+  if [[ "$connector" == tools && -z "$task" ]] && _seat_secret_eligible; then
+    _seat_secret_cross "$key"
+  fi
   require_root secret write
   [[ -n "$key" ]]       || fail "$E_USAGE" "usage: 5dive secret write <KEY> --connector=<name> (value on stdin)"
   [[ -n "$connector" ]] || fail "$E_USAGE" "--connector=<name> is required"
@@ -637,6 +645,8 @@ _secret_write() {
   if [[ "$connector" == tools ]]; then
     [[ " $(_tool_set_vars | tr '\n' ' ') " == *" $key "* ]] && action="updated"
     _tool_put_var "$key" "$value"
+    # DIVE-7168: the owner's write makes it the owner's key; no seat may replace it.
+    [[ -f "$SEAT_SECRET_WRITERS" ]] && _seat_secret_forget "$key"
     where="every agent's environment, as \$${key}"
     _secret_write_done "$key" "$connector" "$action" "$TOOLS_ENV_FILE" "$where" "$task"
     return 0
@@ -726,6 +736,89 @@ _secret_write() {
 }
 
 # The tail both stores share: clear the gate, then report where the value is.
+# ---- DIVE-7168: a seat saves a key it made ---------------------------------
+#
+# Under lodar's rule (10-28, "from now all browser does any job - human not
+# needed") the browser seat makes the accounts and API keys a team needs. It
+# could not keep one: `secret write` is root, and a standard seat's grant holds
+# neither it nor the root CLI, so Clicker's CJ_API_KEY had to be read off the
+# page a second time by the lead.
+#
+# One sudoers line, exact path, NO args (render_standard_sudoers), on the
+# _self_account template. The key name and the value travel on stdin, the seat
+# is derived from SUDO_UID, and only --connector=tools is reachable, under the
+# same reserved-name rule as a root write. A seat may NOT replace a key it did
+# not save: a name already in tools.sh that this seat did not write first is
+# refused, so a seat can add a key to every agent's environment but can never
+# swap the owner's (or another seat's) key for its own. Who saved what is kept
+# in tools.writers (root 600, beside tools.sh). The value is never printed.
+SEAT_SECRET_WRITERS="${CONNECTORS_DIR}/tools.writers"
+
+_seat_secret_forget() {  # <key> — no seat saved it any more
+  ( umask 077; awk -v k="$1" '$1 != k' "$SEAT_SECRET_WRITERS" > "$SEAT_SECRET_WRITERS.tmp" \
+      && mv -f "$SEAT_SECRET_WRITERS.tmp" "$SEAT_SECRET_WRITERS" ) || warn "could not clear who saved $1"
+}
+
+_seat_secret_eligible() {
+  _gate_is_root && return 1
+  sudo -n -l /usr/local/bin/5dive _seat_secret >/dev/null 2>&1
+}
+
+# Caller half: validate what needs no root, read the value, cross, exit.
+_seat_secret_cross() {
+  local key="$1" value rc=0
+  [[ -n "$key" ]] || fail "$E_USAGE" "usage: 5dive secret write <KEY> --connector=tools (value on stdin)"
+  _valid_env_key "$key" || fail "$E_USAGE" "invalid KEY '$key' (env-var name: ^[A-Z_][A-Z0-9_]*\$)"
+  if [[ -t 0 ]]; then
+    printf 'Paste the value for %s (hidden), then Enter: ' "$key" >&2
+    IFS= read -rs value || value=""
+    printf '\n' >&2
+  else
+    value="$(cat)"
+  fi
+  printf '%s\0%s' "$key" "$value" | sudo -n /usr/local/bin/5dive _seat_secret || rc=$?
+  value=""
+  (( rc == 0 )) || mark_reported
+  exit "$rc"
+}
+
+# Root half. Reached ONLY through the exact-path NOPASSWD grant (or by root).
+cmd_seat_secret_write() {
+  _gate_is_root || fail "$E_PERMISSION" "_seat_secret is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "_seat_secret takes no arguments (the key and value are read from stdin, the seat from the sudo caller)."
+  local ruid="${SUDO_UID:-}" seat key value
+  [[ "$ruid" =~ ^[0-9]+$ && "$ruid" != 0 ]] || fail "$E_AUTH_REQUIRED" "_seat_secret requires sudo from an agent seat."
+  seat=$(_gate_uid_to_agent "$ruid")
+  [[ -n "$seat" ]] || fail "$E_AUTH_REQUIRED" "_seat_secret caller uid ${ruid} is not an agent seat."
+  IFS= read -r -d '' key || fail "$E_VALIDATION" "_seat_secret needs a key name, NUL-terminated, then the value on stdin."
+  value="$(cat)"
+  _seat_secret_put "$seat" "$key" "$value"
+}
+
+# The write itself, for <seat>. Split from the uid check so a harness can run it.
+_seat_secret_put() {  # <seat> <key> <value>
+  local seat="$1" key="$2" value="$3" action="created" prev=""
+  _valid_env_key "$key" || fail "$E_USAGE" "invalid KEY '$key' (env-var name: ^[A-Z_][A-Z0-9_]*\$)"
+  _tools_var_reserved "$key" \
+    && fail "$E_VALIDATION" "$key is not allowed: every agent loads tools.sh, so it takes only a key name (ending _KEY, _TOKEN, _SECRET or _PASSWORD, and not a seat's own such as ANTHROPIC_API_KEY). Nothing was saved"
+  value="${value%$'\n'}"; value="${value%$'\r'}"
+  [[ -n "$value" ]] || fail "$E_USAGE" "empty secret on stdin — nothing to write"
+  [[ "$value" != *$'\n'* ]] || fail "$E_VALIDATION" "$key must be one line. Nothing was saved"
+  if [[ " $(_tool_set_vars | tr '\n' ' ') " == *" $key "* ]]; then
+    [[ -f "$SEAT_SECRET_WRITERS" ]] && prev=$(awk -v k="$key" '$1 == k { w = $2 } END { print w }' "$SEAT_SECRET_WRITERS")
+    [[ "$prev" == "$seat" ]] \
+      || fail "$E_PERMISSION" "$key is already saved on this box by ${prev:-the owner}, so this agent cannot replace it. Save yours under another name, or ask the owner to replace it. Nothing was saved"
+    action="updated"
+  fi
+  _tool_put_var "$key" "$value"
+  value=""
+  ( umask 077
+    { [[ -f "$SEAT_SECRET_WRITERS" ]] && awk -v k="$key" '$1 != k' "$SEAT_SECRET_WRITERS"; printf '%s %s\n' "$key" "$seat"; } \
+      > "$SEAT_SECRET_WRITERS.tmp" && mv -f "$SEAT_SECRET_WRITERS.tmp" "$SEAT_SECRET_WRITERS" ) \
+    || warn "saved, but who saved $key was not recorded"
+  _secret_write_done "$key" tools "$action" "$TOOLS_ENV_FILE" "every agent's environment, as \$${key} (saved by ${seat})" ""
+}
+
 _secret_write_done() {
   local key="$1" connector="$2" action="$3" target="$4" where="$5" task="$6" vfile="${7:-}"
   # DIVE-931 gate auto-resolve: the credential is now safely on the box, so clear

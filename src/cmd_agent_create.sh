@@ -629,6 +629,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive reflex pick-ref"|"/usr/local/bin/5dive reflex pick-ref *"|\
         "/usr/local/bin/5dive reflex login-marker"|"/usr/local/bin/5dive reflex login-marker *"|\
         "/usr/local/bin/5dive _self_account"*|\
+        "/usr/local/bin/5dive _seat_secret"|\
         "/usr/local/bin/5dive browser _connect"|\
         "/usr/local/bin/5dive agent _telegram_open"|\
         "/usr/local/bin/5dive _merge_do"*|\
@@ -813,6 +814,13 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _dashboard_relay
 # _self_account, so there is no target to name and no other seat to reach. It
 # cannot add, sign in, rename or remove an account, and nothing box-wide.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _self_account
+# DIVE-7168: let this seat save an API key it made itself (the browser seat
+# signs up for a supplier and makes the key). EXACT path, NO args, NO wildcard:
+# the key name and value travel on stdin, the seat is derived from SUDO_UID, and
+# only the shared tools store is reachable, under the reserved-name rule. It
+# adds a new key or replaces one THIS seat saved; one the owner or another seat
+# saved is refused, so it cannot swap anyone's key for its own.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _seat_secret
 # DIVE-5495: let this seat ask its paired owner, over Telegram, to get it past a
 # login or a captcha (browser connect-request), and let the owner's tap on that
 # button open the one-time viewer. EXACT path, NO args beyond the verb, NO
