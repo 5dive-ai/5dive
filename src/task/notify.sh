@@ -1177,7 +1177,7 @@ _task_board_write_allowed() {
 # nonce-only class stops being a reconstruction and becomes a fact the row states
 # about itself — which is what makes the population countable and a floor legible
 # AS a floor.
-_gate_evidence_form() { # <nonce> <sudo_uid> <channel_session> <channel_chat> <lead> [<drop_link>]
+_gate_evidence_form() { # <nonce> <sudo_uid> <channel_session> <channel_chat> <lead> [<drop_link>] [<owner_pull>]
   local out=""
   if [[ "${1:-0}" == "1" ]]; then out+="${out:++}nonce"; fi
   if [[ "${2:-0}" == "1" ]]; then out+="${out:++}sudo-uid"; fi
@@ -1186,6 +1186,8 @@ _gate_evidence_form() { # <nonce> <sudo_uid> <channel_session> <channel_chat> <l
   if [[ "${5:-0}" == "1" ]]; then out+="${out:++}lead"; fi
   # DIVE-5319: the redeemed one-time drop link (_gate_drop_link_ok).
   if [[ "${6:-0}" == "1" ]]; then out+="${out:++}drop-link"; fi
+  # DIVE-7186: the owner's secret pulled from 5dive.app (_gate_owner_pull_ok).
+  if [[ "${7:-0}" == "1" ]]; then out+="${out:++}owner-pull"; fi
   printf '%s' "${out:-none}"
 }
 

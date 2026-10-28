@@ -4423,6 +4423,31 @@ _gate_drop_link_ok() { # <task id> <link hash>
   _secret_key_landed "$key" "$conn"
 }
 
+# DIVE-7186: the OWNER PULL, the evidence form of a secret the owner sent from
+# 5dive.app (POST /server/selfhost-secret, signed in) to a self-hosted box. The
+# box's reporter (5dive-chat-report.service, root, on a timer) pulls the value and
+# runs `secret write` with no --task, which closes the one open gate for that key
+# (DIVE-7102). It has no SUDO_UID and a system.slice cgroup, so neither
+# _gate_human_principal nor a drop link admits it: on 2026-10-28 (DIVE-7185) the
+# value landed and the gate stayed open under `gate-proof enforce on`. Admitted
+# only when ALL of these read true: the caller is root with no SUDO_UID, its
+# cgroup IS the reporter's unit (hardcoded, no knob: the ACCEPT 1 rule above), the
+# box is linked to 5dive.app chat, the gate is an open secret gate, and its KEY is
+# already in its connector file. Residual, DIVE-916's class: a root-equivalent
+# seat can start a unit under that name.
+_gate_owner_pull_ok() { # <task id>
+  local id="$1" cg row nt answered key conn
+  _gate_is_root || return 1
+  [[ -z "${SUDO_UID:-}" ]] || return 1
+  box_is_chat_only || return 1
+  cg=$(_gate_caller_cgroup) || return 1
+  [[ "$cg" == "/system.slice/5dive-chat-report.service" ]] || return 1
+  row=$(db "SELECT COALESCE(need_type,'')||x'1f'||COALESCE(need_answered_at,'')||x'1f'||COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'') FROM tasks WHERE id=${id};")
+  IFS=$'\x1f' read -r nt answered key conn <<<"$row"
+  [[ "$nt" == "secret" && -z "$answered" && -n "$key" && -n "$conn" ]] || return 1
+  _secret_key_landed "$key" "$conn"
+}
+
 # _secret_key_landed <KEY> <connector> — is KEY in the store the drop write uses
 # for that connector? 0 = it is, 1 = it is not, 2 = this process cannot read the
 # store, so it cannot tell. Shared by the redeemed-link check above and by
