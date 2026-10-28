@@ -11,18 +11,30 @@
 #
 # Teardown:
 #   docker rm -f 5dive-demo
+#
+# To HOST it (a Mac mini, a home server) use docker/compose.yaml instead: it
+# runs the published image with the state on named volumes and restarts it
+# after a reboot (DIVE-6802, docker/README.md).
 FROM ubuntu:22.04
+
+LABEL org.opencontainers.image.source="https://github.com/5dive-ai/5dive" \
+      org.opencontainers.image.description="5dive: a team of AI agents on one box" \
+      org.opencontainers.image.licenses="MIT"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     container=docker
 
 # systemd + the apt deps install.sh installs on a host. ca-certificates and
 # sudo are pulled in explicitly because the base image is minimal.
+# sqlite3 (the task board) and cron (heartbeat, digest and disk drivers, which
+# install.sh only writes when /etc/cron.d exists) are on every real host; a box
+# someone hosts on needs them too (DIVE-6802).
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends \
       systemd systemd-sysv \
       sudo ca-certificates curl \
       jq tmux git python3-yaml \
+      sqlite3 cron \
  && rm -rf /var/lib/apt/lists/*
 
 # Mask units that fail noisily or are pointless in a container. The container
@@ -89,7 +101,15 @@ RUN ln -sf /bin/true /usr/local/bin/systemctl \
  && REPO=file:///opt/5dive-bundle bash /opt/5dive-bundle/install.sh \
  && rm -f /usr/local/bin/systemctl
 
+# DIVE-6802: record which CLI laid down this state. docker/entrypoint.sh
+# compares it on every start and re-runs install.sh only when a newer image
+# boots over saved volumes. A fresh named volume is seeded from the image, so
+# it carries this marker and the first boot skips the re-run.
+COPY docker/entrypoint.sh /usr/local/sbin/5dive-entrypoint
+RUN /usr/local/bin/5dive --version | tr -d '\n' > /var/lib/5dive/image-cli-version \
+ && echo >> /var/lib/5dive/image-cli-version
+
 # systemd discovers /etc/systemd/system/5dive-agent@.service automatically
 # on first boot, so no extra `daemon-reload` is needed.
 STOPSIGNAL SIGRTMIN+3
-ENTRYPOINT ["/sbin/init"]
+ENTRYPOINT ["/usr/local/sbin/5dive-entrypoint"]

@@ -1,0 +1,138 @@
+name: docker-image
+# DIVE-6802: publish the 5dive image (linux/amd64 + linux/arm64, so a Mac mini on
+# Apple Silicon runs it natively) to ghcr.io/5dive-ai/5dive for every release tag,
+# and prove on BOTH architectures, before anything is pushed, that
+# docker/compose.yaml keeps an agent through a recreate, a Docker restart and an
+# update (docker/persistence-test.sh).
+#
+# WHY workflow_run AND NOT `push: tags`. release-cut.yml pushes its tag with
+# github.token, and a github.token push never starts another workflow, so a
+# tag trigger here would simply never fire. This runs after each release-cut run
+# instead, reads the newest tag with install.sh's own rule (strict vX.Y.Z,
+# sort -V), and skips when that tag is already published. workflow_dispatch
+# (re)publishes one named tag by hand.
+#
+# Pull requests that touch the image build and test it on both arches and
+# push nothing. Not a required check.
+on:
+  workflow_run:
+    workflows: [release-cut]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (vX.Y.Z). Empty = newest.'
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - 'docker/Dockerfile'
+      - 'docker/compose.yaml'
+      - 'docker/entrypoint.sh'
+      - 'docker/persistence-test.sh'
+      - '.github/workflows/docker-image.yml'
+
+concurrency:
+  group: docker-image-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/5dive-ai/5dive
+
+jobs:
+  plan:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.p.outputs.ref }}
+      tag: ${{ steps.p.outputs.tag }}
+      publish: ${{ steps.p.outputs.publish }}
+      latest: ${{ steps.p.outputs.latest }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: p
+        env:
+          WANT: ${{ inputs.tag }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            printf 'ref=%s\ntag=pr-%s\npublish=false\n' "${{ github.sha }}" "${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # install.sh's resolve_gh_tag() rule, the same one release-cut.yml re-implements.
+          newest=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          tag="${WANT:-$newest}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::not a release tag: '$tag'"; exit 1; }
+          git rev-parse -q --verify "refs/tags/$tag" >/dev/null || { echo "::error::no such tag: $tag"; exit 1; }
+          publish=true
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if [[ "$EVENT" == workflow_run ]] \
+             && docker manifest inspect "$IMAGE:$tag" >/dev/null 2>&1; then
+            echo "$IMAGE:$tag is already published; nothing to do"
+            publish=false
+          fi
+          # A hand re-publish of an older tag must not move latest backwards.
+          latest=false; [[ "$tag" == "$newest" ]] && latest=true
+          printf 'ref=refs/tags/%s\ntag=%s\npublish=%s\nlatest=%s\n' "$tag" "$tag" "$publish" "$latest" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true' || github.event_name == 'pull_request'
+    name: build / ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      PUBLISH: ${{ needs.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+      - name: Build the image
+        run: |
+          # A release tag carries its built bundle; a PR tree does not (DIVE-2091).
+          [[ -f 5dive ]] || ./build.sh
+          docker build -f docker/Dockerfile -t "$IMAGE:$TAG" .
+          docker run --rm --entrypoint /usr/local/bin/5dive "$IMAGE:$TAG" --version
+      - name: Saved state survives recreate, Docker restart and update
+        run: docker/persistence-test.sh "$TAG"
+      - name: Push ${{ matrix.arch }}
+        if: env.PUBLISH == 'true'
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag "$IMAGE:$TAG" "$IMAGE:$TAG-${{ matrix.arch }}"
+          docker push "$IMAGE:$TAG-${{ matrix.arch }}"
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      LATEST: ${{ needs.plan.outputs.latest }}
+    steps:
+      - name: One multi-arch tag, and latest when it is the newest release
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          tags=(-t "$IMAGE:$TAG")
+          [[ "$LATEST" == true ]] && tags+=(-t "$IMAGE:latest")
+          docker buildx imagetools create "${tags[@]}" "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
+          docker buildx imagetools inspect "$IMAGE:$TAG"

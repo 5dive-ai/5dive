@@ -1,0 +1,34 @@
+# 5dive on one machine you own (a Mac mini, a home server). DIVE-6802.
+#
+#   curl -fsSLO https://raw.githubusercontent.com/5dive-ai/5dive/main/docker/compose.yaml && docker compose up -d
+#   docker exec -it 5dive 5dive init
+#
+# Everything an agent is lives on the named volumes below, so `docker compose
+# down && docker compose up -d`, a newer image, a Docker restart and a reboot all
+# keep your agents, their logins and their Telegram bots. `docker compose down -v`
+# is the one command that deletes them.
+#
+# Update: docker compose pull && docker compose up -d
+# Pin a release instead of latest: FIVEDIVE_TAG=v0.106.0 docker compose up -d
+services:
+  5dive:
+    image: ghcr.io/5dive-ai/5dive:${FIVEDIVE_TAG:-latest}
+    container_name: 5dive
+    hostname: 5dive
+    # systemd runs as PID 1 and every agent is a systemd unit, which needs this.
+    # Fine on a machine that is only for 5dive; do not run it on a shared host.
+    privileged: true
+    restart: unless-stopped
+    volumes:
+      - etc:/etc                  # agent users, sudoers, enabled units, keys
+      - home:/home                # agents' homes, harnesses, Telegram tokens
+      - root:/root
+      - state:/var/lib/5dive      # registry, task board, logins
+      - cron:/var/spool/cron      # agents' own schedules
+
+volumes:
+  etc:
+  home:
+  root:
+  state:
+  cron:
