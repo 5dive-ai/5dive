@@ -432,7 +432,8 @@ _owner_ask_gate_bind() {
   _owner_ask_rewrite '. + {nonce_hash: $h, gate: $g}' --arg h "$hash" --arg g "$ident" \
     || fail "$E_GENERIC" "could not write the owner's proof into $OA_DIR/$OA_ID.json"
   dir=$(_owner_gate_dir)
-  ( umask 077; mkdir -p -- "$dir" && chmod 700 -- "$dir" \
+  # 711: a non-root `task answer` can see THAT a gate carries an ask (to warn), never read it.
+  ( umask 077; mkdir -p -- "$dir" && chmod 711 -- "$dir" \
       && jq -nc --arg a "$OA_ID" --arg s "$OA_SEAT" --arg n "$nonce" --arg i "$ident" \
            '{ask:$a, seat:$s, nonce:$n, ident:$i}' > "$dir/$id.json" ) \
     || fail "$E_GENERIC" "could not record the browser ask on $ident"
@@ -445,7 +446,10 @@ _owner_ask_gate_settle() {
   local id="$1" ident="$2" value="$3" f row by ev verdict out w
   f="$(_owner_gate_dir)/$id.json"
   [[ -f "$f" && ! -L "$f" ]] || return 0
-  _owner_ask_is_root || return 0
+  if ! _owner_ask_is_root; then
+    warn "$ident: the gate is answered, but its browser ask is still open: only root settles it. The owner approves it with: sudo 5dive browser approve <the ask id the stop printed>"
+    return 0
+  fi
   row=$(db "SELECT COALESCE(need_answered_by,'')||x'1f'||COALESCE(human_evidence,'') FROM tasks WHERE id=${id};" 2>/dev/null) || row=""
   IFS=$'\x1f' read -r by ev <<<"$row"
   w=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[^a-z]*//; s/[^a-z].*$//')

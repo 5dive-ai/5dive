@@ -7,7 +7,8 @@
 #      filed with `task need --type=approval --browser-ask=<id>` is now that
 #      approval: the owner's own yes runs `browser approve <id> --human-proof=…`
 #      once and wakes the seat; a no declines it; an agent's or a lead's answer,
-#      or a cited chat, approves nothing.
+#      or a cited chat, approves nothing; a non-root answer settles nothing and
+#      says the ask is still open.
 #   M  THE REPLY. `agent send owner <text>` reaches the owner: the app chat on a
 #      linked box, else the owner's inbox here, printed once at their next login
 #      and by `task inbox --messages`. A message the owner sends says how to answer.
@@ -167,6 +168,11 @@ settle_as DIVE-4 human:lodar sudo-uid "maybe later"
 settle_as DIVE-4 human:lodar nonce+channel-session ok
 [[ "$(grep -c '^browser approve' "$RUNLOG")" == 1 ]] \
   && ok_t "Y11 the owner's tap (nonce) approves" || bad_t "Y11 tap" "run=$(cat "$RUNLOG")"
+
+bindrow DIVE-8 6666666666ff
+( _owner_ask_is_root() { return 1; }; settle_as DIVE-8 human:lodar sudo-uid approve )
+[[ ! -s "$RUNLOG" && "$(cat "$TMP/err")" == *"browser ask is still open"* ]] \
+  && ok_t "Y17 a non-root answer settles no browser ask, and says the ask is still open" || bad_t "Y17 non-root" "run=$(cat "$RUNLOG") err=$(cat "$TMP/err")"
 
 # MUTANT: the evidence check removed — Y9's cited chat then approves a payment.
 bindrow DIVE-5 3333333333cc
