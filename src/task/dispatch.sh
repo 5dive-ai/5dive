@@ -196,7 +196,7 @@ _task_usage() {
       [--mode=approve-to-send|confirm-after-send]   --type=approval: is the action
                                                     already DONE? (default: not yet)
       [--probe='<cmd>']                           --type=access: self-check the block
-      [--secret-key=<ENV> --connector=<stem> | --out-of-band="<where>"]   (--type=secret needs one)
+      [--secret-key=<ENV>[,<ENV>...] --connector=<stem> | --out-of-band="<where>"]   (--type=secret needs one; a key with several parts is ONE gate: --secret-key=A,B)
       WHO CAN CLEAR IT, by type (DIVE-3228 — check this BEFORE you file, not after
       'task answer' refuses you):
         decision            any agent. Tier 1 by default.

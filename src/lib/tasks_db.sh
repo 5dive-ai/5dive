@@ -4427,8 +4427,18 @@ _gate_drop_link_ok() { # <task id> <link hash>
 # for that connector? 0 = it is, 1 = it is not, 2 = this process cannot read the
 # store, so it cannot tell. Shared by the redeemed-link check above and by
 # `task answer` (DIVE-6856), so a ✅ Provided tap and the page ask the same file.
-_secret_key_landed() { # <KEY> <connector>
+_secret_key_landed() { # <KEY>[,<KEY>...] <connector>
   local key="$1" conn="$2"
+  # DIVE-7184: a gate asking for several keys has landed only when all have.
+  if [[ "$key" == *,* ]]; then
+    local k rc worst=0
+    local -a ks; IFS=, read -ra ks <<<"$key"
+    for k in "${ks[@]}"; do
+      rc=0; _secret_key_landed "$k" "$conn" || rc=$?
+      (( rc > worst )) && worst=$rc
+    done
+    return "$worst"
+  fi
   local cdir="${CONNECTORS_DIR:-/etc/5dive/connectors}"
   # DIVE-5772: two connectors do not write `<conn>.env`, so reading only that file
   # refused EVERY drop to them and the gate stayed open after the value landed
