@@ -11,9 +11,18 @@
 #   C  Docker daemon restart (restart: unless-stopped brings it back by itself)
 #   D  update: a different CLI boots over the saved volumes; the entrypoint
 #      re-runs install.sh, and the agent, key and token are all still there
+# DIVE-7266: the README's "Without compose" `docker run` line, read out of
+# docker/README.md and run as written (only the tag is swapped), so the guide
+# cannot drift from what this proves:
+#   E  fresh run of that line: agent created, unit active, key and token saved
+#   F  container replaced (docker rm -f + the same line again, volumes kept)
+#   G  Docker daemon restart (--restart unless-stopped brings it back)
+#   H  the same image without --privileged: systemd never comes up
 #
 # Needs network (installs the claude harness) and sudo for the daemon restart.
-# Creates and then deletes the compose project `fivedive-ptest` and its volumes.
+# Creates and then deletes the compose project `fivedive-ptest` and its volumes,
+# then the README line's container and volumes (it refuses to start if any of
+# them already exist, so it never touches a real 5dive on the machine).
 set -euo pipefail
 
 tag="${1:?usage: docker/persistence-test.sh <image tag>}"
@@ -24,10 +33,20 @@ key=sk-ant-persistence-test-0000000000
 tg=123456789:persistence-test-token
 pass=0
 
+run_vols=(5dive-etc 5dive-home 5dive-root 5dive-state 5dive-cron)
+ran=0
+
 dc() { docker compose -f compose.yaml "$@"; }
 dx() { docker exec 5dive "$@"; }
-die() { echo "FAIL: $*" >&2; dc logs --tail=50 >&2 || true; exit 1; }
-cleanup() { dc down -v >/dev/null 2>&1 || true; }
+die() { echo "FAIL: $*" >&2; docker logs --tail=50 5dive >&2 || true; exit 1; }
+cleanup() {
+  dc down -v >/dev/null 2>&1 || true
+  docker rm -f 5dive-noprivileged >/dev/null 2>&1 || true
+  if (( ran )); then
+    docker rm -f 5dive >/dev/null 2>&1 || true
+    docker volume rm "${run_vols[@]}" >/dev/null 2>&1 || true
+  fi
+}
 trap cleanup EXIT
 
 booted() {
@@ -108,4 +127,58 @@ got=$(dx cat /var/lib/5dive/image-cli-version)
 [[ "$got" == "$want" ]] || die "D: the entrypoint did not re-apply (marker '$got', CLI '$want')"
 dx test -s /var/log/5dive-image-sync.log || die "D: no install.sh re-run log"
 
-echo "$pass/4 arms pass on $(uname -m)"
+dc down -v
+
+# E-H: the README's `docker run` line, exactly as the guide prints it.
+line=$(awk '
+  /^### Without compose/ { sect = 1; next }
+  sect && /^```sh/ { code = 1; next }
+  code && /^```/ { exit }
+  code { print }
+' README.md | sed -e ':a' -e '/\\$/N; s/\\\n//; ta' | grep -m1 '^docker run ')
+[[ -n "$line" ]] || die "no docker run line under \"Without compose\" in docker/README.md"
+[[ "$line" == *" ghcr.io/5dive-ai/5dive:latest" ]] || die "the README line does not end in the published image: $line"
+line="${line% ghcr.io/5dive-ai/5dive:latest} ghcr.io/5dive-ai/5dive:${tag}"
+echo "README line: $line"
+for v in "${run_vols[@]}"; do
+  docker volume inspect "$v" >/dev/null 2>&1 && die "volume $v already exists; not touching a real 5dive"
+done
+for want in "${run_vols[@]/#/-v }" --privileged "--restart unless-stopped" "--hostname 5dive"; do
+  [[ "$line" == *" $want"* ]] || die "the README line is missing: $want"
+done
+docker container inspect 5dive >/dev/null 2>&1 && die "a container named 5dive already exists"
+ran=1
+
+eval "$line"
+booted
+dx 5dive agent install claude
+dx 5dive agent create "$agent" --type=claude --channels=none --defer-auth
+dx 5dive agent auth set claude --api-key="$key"
+dx bash -c "install -d -o agent-${agent} -m 700 /home/agent-${agent}/.claude/channels/telegram \
+  && printf 'TELEGRAM_BOT_TOKEN=%s\n' '${tg}' > /home/agent-${agent}/.claude/channels/telegram/.env"
+agent_up
+before=$(fingerprint) || die "E: fingerprint unreadable on the fresh box"
+echo "PASS E fresh docker run"; pass=$((pass + 1))
+
+docker rm -f 5dive
+eval "$line"
+check "F container replaced"
+
+sudo systemctl restart docker
+check "G docker daemon restart"
+
+# H: the guide says a run without --privileged does not start. Systemd is PID 1
+# and every agent is a unit, so "never reaches running" is that claim.
+docker run -d --name 5dive-noprivileged "ghcr.io/5dive-ai/5dive:${tag}"
+for _ in $(seq 1 45); do
+  state=$(timeout 10 docker exec 5dive-noprivileged systemctl is-system-running 2>/dev/null || true)
+  case "$state" in running|degraded)
+    die "H: systemd came up ($state) without --privileged; the README is wrong" ;;
+  esac
+  sleep 2
+done
+echo "H: after 90s without --privileged: ${state:-no answer}"
+docker logs --tail=5 5dive-noprivileged 2>&1 || true
+echo "PASS H no --privileged, no start"; pass=$((pass + 1))
+
+echo "$pass/8 arms pass on $(uname -m)"

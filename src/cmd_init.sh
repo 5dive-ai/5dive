@@ -48,11 +48,13 @@ _init_note() {
 
 # DIVE-6781: the open-source install never told its users the app exists. One
 # block, printed after install.sh and at the end of `5dive init`. DIVE-6815: the
-# block is one link, 5dive.app/self-host, which signs you in and hands you the
+# block is one link, 5dive.ai/self-host, which signs you in and hands you the
 # one command that links the server, so the old three pairing-code steps are gone
-# (two ways in, in one block, was the wall). Silent where it would be noise: a box
-# 5dive built (provisioning.env, already linked to its owner's account) or a box
-# whose connector is already linked. FIVEDIVE_APP_HINT=0 turns it off.
+# (two ways in, in one block, was the wall). DIVE-7266: the link is on 5dive.ai,
+# the domain we keep (5dive.app lands on the same page today, but we may lose it).
+# Silent where it would be noise: a box 5dive built (provisioning.env, already
+# linked to its owner's account) or a box whose connector is already linked.
+# FIVEDIVE_APP_HINT=0 turns it off.
 cmd_app_hint() {
   local prov="${APP_HINT_PROVISIONING_ENV:-/etc/5dive/provisioning.env}"
   local tok="${APP_HINT_CONNECTOR_TOKEN:-/etc/5dive/connectord.env}"
@@ -64,7 +66,7 @@ cmd_app_hint() {
   cat <<'HINT'
 
 Optional: chat with your agents from your phone, free:
-  https://5dive.app/self-host
+  https://5dive.ai/self-host
 
 HINT
 }
