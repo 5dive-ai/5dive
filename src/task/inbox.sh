@@ -422,7 +422,10 @@ _owner_inbox_print() {
   f=$(_owner_inbox_file)
   [[ -r "$f" && -s "$f" ]] || { [[ "$mode" == all ]] && echo "No messages from your agents."; return 0; }
   total=$(wc -l < "$f")
-  seen=$(cat "$(_owner_inbox_seen)" 2>/dev/null); [[ "$seen" =~ ^[0-9]+$ ]] || seen=0
+  # DIVE-7236: no .seen file before the first view; under set -e a bare
+  # failing $(cat) killed --messages and --login on the first message.
+  seen=$(cat "$(_owner_inbox_seen)" 2>/dev/null) || seen=0
+  [[ "$seen" =~ ^[0-9]+$ ]] || seen=0
   (( seen > total )) && seen=0
   local start=1
   if [[ "$mode" == new ]]; then

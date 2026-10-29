@@ -122,6 +122,33 @@ eq_ "by-role, create path: a member (reports_to as a string) is pinned standard"
 eq_ "by-role, create path: the lead is pinned admin" "$(_compose_create_args '{"type":"claude"}' kostya . | iso_of)" "--isolation=admin"
 eq_ "a spec's own tier is forwarded on the pack path, once, and wins" "$(_compose_import_args "$OWN" lena lena . | iso_of)" "--isolation=admin"
 eq_ "DIVE-6543: a non-pusher is pinned standard once, by the push pin" "$(_compose_import_args "$NONPUSH" q q . | iso_of)" "--isolation=standard"
+# DIVE-7236: a template's `defaults: isolation: standard` reaches every seat
+# through the parser's merge; it must not take the lead's admin away.
+cat > "$TMPD/team.yaml" <<'YAML'
+defaults:
+  type: claude
+  isolation: standard
+agents:
+  clip: {}
+  desk: {reports_to: clip}
+YAML
+cat > "$TMPD/team-own.yaml" <<'YAML'
+defaults: {type: claude, isolation: admin}
+agents:
+  clip: {isolation: standard}
+  desk: {reports_to: clip}
+YAML
+TEAM=$(_compose_parse "$TMPD/team.yaml" 2>/dev/null)
+TEAM_OWN=$(_compose_parse "$TMPD/team-own.yaml" 2>/dev/null)
+seat(){ jq -c --arg n "$2" '.agents[$n]' <<<"$1"; }
+eq_ "DIVE-7236: a template default of standard leaves the lead admin (create path)" "$(_compose_create_args "$(seat "$TEAM" clip)" clip . | iso_of)" "--isolation=admin"
+eq_ "DIVE-7236: ...and on the pack path" "$(_compose_import_args "$(seat "$TEAM" clip)" clip clip . | iso_of)" "--isolation=admin"
+eq_ "DIVE-7236: a member keeps the template default" "$(_compose_create_args "$(seat "$TEAM" desk)" desk . | iso_of)" "--isolation=standard"
+eq_ "DIVE-7236: a lead that names its own tier keeps it" "$(_compose_create_args "$(seat "$TEAM_OWN" clip)" clip . | iso_of)" "--isolation=standard"
+eq_ "DIVE-7236: a member keeps a default it did not name, even admin" "$(_compose_create_args "$(seat "$TEAM_OWN" desk)" desk . | iso_of)" "--isolation=admin"
+setcfg '{"seat_isolation":"standard"}'
+eq_ "DIVE-7236: under seat-isolation=standard the template default stands for the lead" "$(_compose_create_args "$(seat "$TEAM" clip)" clip . | iso_of)" "--isolation=standard"
+rm -f "$BOX_CONFIG"
 setcfg '{"seat_isolation":"admin"}'
 eq_ "seat-isolation=admin: nothing added (the box default decides)" "$(_compose_import_args "$MEMBER" artyom artyom . | iso_of)" ""
 setcfg '{"seat_isolation":"standard"}'
@@ -199,6 +226,12 @@ rm -f "$BOX_CONFIG"
   [[ -z "$m" && "$(_import_resolve_isolation '' '' 0)" == admin ]] && echo red-compose
 ) > "$TMPD/mut2"
 eq_ "a compose without the member pin leaves a member to import's lone-seat admin" "$(grep -c red-compose "$TMPD/mut2")" "1"
+
+(
+  _compose_seat_isolation() { jq -r '.isolation // empty' <<<"$1"; }   # the pre-7236 read
+  [[ "$(_compose_create_args "$(seat "$TEAM" clip)" clip . | iso_of)" == "--isolation=standard" ]] && echo red-default
+) > "$TMPD/mut3"
+eq_ "the pre-7236 read (defaults win) leaves the lead standard" "$(grep -c red-default "$TMPD/mut3")" "1"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

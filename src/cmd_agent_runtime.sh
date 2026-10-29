@@ -3177,6 +3177,12 @@ _owner_is_send_target() {
   ! jq -e '.agents.owner != null' <<<"$(registry_read)" >/dev/null 2>&1
 }
 
+# DIVE-7164/7236: a send a person made: --from=owner|human from a caller that is
+# no agent seat (root's login shell). An agent cannot claim it from its seat.
+_send_from_person() {
+  [[ "$1" == owner || "$1" == human ]] && ! actor_routing_agent >/dev/null 2>&1
+}
+
 cmd_send() {
   local name="" message="" from="" from_set=0 raw=0 wake=0
   # DIVE-4769: --urgent asks to JUMP THE DIVE-4214 SPOOL, i.e. to join the
@@ -3328,9 +3334,13 @@ cmd_send() {
   # re-exec — and never counted twice for one send. Before require_agent only in
   # the sense that it costs nothing; the refusal itself lands before a keystroke
   # reaches the target's pane either way.
+  # DIVE-7236: the guard is agent-to-agent. A person's message is never an ack
+  # to drop: the owner's bare "yes" to "say yes" was refused as one.
   local _a2a_from _a2a_refusal
   _a2a_from="$(_envelope_caller)"
-  if ! _a2a_refusal="$(a2a_round_guard "$_a2a_from" "$name" "$message")"; then
+  if (( from_set )) && _send_from_person "$from"; then
+    :
+  elif ! _a2a_refusal="$(a2a_round_guard "$_a2a_from" "$name" "$message")"; then
     fail "$E_VALIDATION" "$_a2a_refusal"
   fi
 
@@ -3460,7 +3470,7 @@ cmd_send() {
       # one and its reply stayed in its own transcript. Say how, once, on the
       # message a person sent. The verb sits in a variable so the devteam
       # literal-seat guard (merge_hold_recipient C2) does not read `owner` as a seat.
-      if [[ -z "$reply_to_chat" && ( "$sender" == owner || "$sender" == human ) ]] && ! actor_routing_agent >/dev/null 2>&1; then
+      if [[ -z "$reply_to_chat" ]] && _send_from_person "$sender"; then
         local _send_verb='5dive agent send'
         payload+=$'\n\n'"(To answer the owner: ${_send_verb} owner --message-file=- — it reaches them where they read, not your transcript.)"
       fi
