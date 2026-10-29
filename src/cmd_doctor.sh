@@ -364,11 +364,12 @@ doctor_check_forge_merge_poll() {
   f="${STATE_DIR:-/var/lib/5dive}/forge-merge-poll.reading"
   if [[ ! -r "$f" ]]; then
     # DIVE-7244: with no devteam plugin the poll is off, not merely unmeasured.
-    # Same test as _hb_forge_merge_sweep's quiet skip: the helpers must be missing
-    # too, or the sweep runs (a tree that carries them, e.g. the plugin harnesses).
-    if { ! declare -F _merge_landed_probe >/dev/null 2>&1 \
-         || ! declare -F _task_merge_landed_record >/dev/null 2>&1 \
-         || ! declare -F _gate_slug_from_url >/dev/null 2>&1; } \
+    # Same test as _hb_forge_merge_sweep's quiet skip: none of its helpers may be
+    # defined either, or the sweep runs (a tree that carries them, e.g. the plugin
+    # harnesses) or says it did not (a partial tree).
+    if ! declare -F _merge_landed_probe >/dev/null 2>&1 \
+       && ! declare -F _task_merge_landed_record >/dev/null 2>&1 \
+       && ! declare -F _gate_slug_from_url >/dev/null 2>&1 \
        && declare -F _devteam_init >/dev/null 2>&1; then
       (( ${_DEVTEAM_INIT_DONE:-0} )) || _devteam_init
       if [[ "$_DEVTEAM_WHY" == "not installed" ]]; then

@@ -116,6 +116,9 @@ tc "D9d a tree that carries the helpers runs the poll, so doctor does not call i
    "$( ( set +u; source src/header.sh 2>/dev/null; set +e; source src/lib/devteam.sh; source src/cmd_doctor.sh
         _merge_landed_probe() { :; }; _task_merge_landed_record() { :; }; _gate_slug_from_url() { :; }
         doctor_add() { printf '%s %s\n' "$3" "$4"; }; doctor_check_forge_merge_poll ) 2>&1 )"
+tc "D9e a partial tree (one helper, no plugin) still logs the loud line" "$NOTRUN (devteam: not installed)" \
+   "$( ( set +u; source src/header.sh 2>/dev/null; set +e; source src/lib/devteam.sh; source src/cmd_heartbeat.sh
+        _gate_slug_from_url() { :; }; _hb_log() { printf '%s\n' "$1"; }; _hb_forge_merge_sweep ) 2>&1 )"
 tc "D9b a harness with no plugin loader still gets the loud line" "$NOTRUN —" \
    "$( ( set +u; source src/header.sh 2>/dev/null; set +e; source src/cmd_heartbeat.sh
         _hb_log() { printf '%s\n' "$1"; }; _hb_forge_merge_sweep ) 2>&1 )"
