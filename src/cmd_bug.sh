@@ -96,9 +96,15 @@ _bug_spool() {
 # DIVE-6616: a self-installed box (the curl install) has no key file at all —
 # only boxes on our control plane get one — so every report it filed spooled
 # forever. When the file is ABSENT the same payload goes, unauthenticated, to
-# POST /bug-reports (capped per IP by the API). A file that is there but this
-# seat cannot read, or that holds no key, is still "no-token": that box is ours,
-# and its report belongs on the authenticated route.
+# POST /bug-reports (capped per IP by the API). A file that is there but holds
+# no key is still "no-token": that box is ours, and its key is broken.
+#
+# DIVE-7248: a file that is there but this seat cannot read (every non-root seat
+# on one of our boxes, the box lead included) also goes keyless. Spooling it
+# instead meant the report never left: the spool only drains from the same seat,
+# which still cannot read the key. _BUG_KEYLESS says why the open route was
+# taken: 1 no key file, 2 a key file this seat cannot read. The payload's
+# install_method still tells triage it came from one of our boxes.
 _BUG_HTTP=""; _BUG_ID=""; _BUG_KEYLESS=0
 _bug_post() {
   local payload="$1" tok="" trc=0 out="" url auth
@@ -110,6 +116,9 @@ _bug_post() {
   elif (( trc == 2 )) && [[ ! -e "$(_partner_connectord_env)" ]]; then
     url="$(_partner_api_base)/bug-reports"
     auth=""; _BUG_KEYLESS=1
+  elif (( trc == 1 )); then
+    url="$(_partner_api_base)/bug-reports"
+    auth=""; _BUG_KEYLESS=2
   else
     _BUG_HTTP="no-token"; return 1
   fi
@@ -237,8 +246,9 @@ Preview freely; send it only after your owner agrees.
                   fields underneath them)
 
   --file          re-print the SAME payload, then send it to 5dive's API with
-                  this box's own key (a self-installed box has none and sends
-                  it without one). Nothing goes to GitHub or anywhere public.
+                  this box's own key (a self-installed box, or a seat that
+                  cannot read the key, sends it without one). Nothing goes to
+                  GitHub or anywhere public.
   --owner-approved
                   required with --file when there is no TTY (an agent): ask
                   your owner in one line, naming what failed, and pass this
@@ -500,11 +510,10 @@ cmd_bug() {
     *)
       local why="could not reach 5dive's API (HTTP ${_BUG_HTTP})" envf
       envf=$(_partner_connectord_env)
-      # DIVE-6616: only a file that is there and unreadable is an access problem.
-      if [[ "$_BUG_HTTP" == "no-token" && -e "$envf" && ! -r "$envf" ]]; then
-        why="this seat cannot read the box's key ($envf)"
-      elif [[ "$_BUG_HTTP" == "no-token" ]]; then
+      if [[ "$_BUG_HTTP" == "no-token" ]]; then
         why="the box's key file ($envf) holds no 5dive key"
+      elif (( _BUG_KEYLESS == 2 )); then
+        why="this seat cannot read the box's key ($envf), and 5dive's API could not take the report without it (HTTP ${_BUG_HTTP})"
       elif (( _BUG_KEYLESS )); then
         why="this box has no 5dive key (self-installed), and 5dive's API could not take the report without one (HTTP ${_BUG_HTTP})"
       fi
