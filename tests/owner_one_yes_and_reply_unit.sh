@@ -202,6 +202,15 @@ as_root_login
 out=$(_owner_note_send clip $'Store renamed.\e]0;pwned\a Three drafts are up.' 2>&1)
 [[ "$out" == *"waits in their inbox"* && "$(wc -l < "$TMP/owner-inbox.jsonl")" == 1 ]] \
   && ok_t "M1 no chat for the owner: the reply waits in their inbox on this box" || bad_t "M1 inbox" "out=$out"
+# DIVE-7236: the real CLI runs under `set -e`; the first view has no .seen file.
+rm -f "$TMP/owner-inbox.seen"
+out=$(set -e; cmd_task_inbox --messages 2>&1); rc=$?
+[[ $rc -eq 0 && "$out" == *"Store renamed."* ]] \
+  && ok_t "M1b under set -e, the first --messages (no seen file yet) prints the message" || bad_t "M1b --messages set -e" "rc=$rc out=$out"
+out=$(set -e; cmd_task_inbox --login 2>&1); rc=$?
+[[ $rc -eq 0 && "$out" == *"1 new message from your agents"* ]] \
+  && ok_t "M1c under set -e, the first --login (no seen file yet) prints the message" || bad_t "M1c --login set -e" "rc=$rc out=$out"
+rm -f "$TMP/owner-inbox.seen"
 out=$(cmd_task_inbox --login 2>&1)
 [[ "$out" == *"1 new message from your agents"* && "$out" == *"clip ("*"Store renamed."*"Three drafts are up."* && "$out" == *"agent send <name> --from=owner"* ]] \
   && ok_t "M2 the owner's next login shows it, who sent it, and how to answer" || bad_t "M2 login" "out=$out"
@@ -244,6 +253,20 @@ rm -f "$REGISTRY"
 grep -q '_owner_is_send_target "\$name"' "$SRC/cmd_agent_runtime.sh" \
   && grep -q 'To answer the owner: ${_send_verb} owner' "$SRC/cmd_agent_runtime.sh" \
   && ok_t "M10 agent send routes owner, and a person's message says how to answer" || bad_t "M10 cmd_send wiring" ""
+# DIVE-7236: the owner's bare "yes" is an answer, not an ack to drop; an agent's still is.
+ACKMSG='every word of it is'
+as_root_login
+nosudo_send() { ( a2a_needs_scoped() { return 1; }; sudo() { return 1; }; cmd_send nosuchseat "$@" ) 2>&1; }
+actor_routing_agent() { return 1; }   # root's login shell is no seat
+out=$(nosudo_send --from=owner --message=yes)
+[[ "$out" != *"$ACKMSG"* && "$out" == *nosuchseat* ]] && ok_t "M12 the owner's bare yes (--from=owner, root's shell) passes the ack filter" || bad_t "M12 owner yes" "out=$out"
+actor_routing_agent() { printf 'clip'; }   # a seat
+out=$(nosudo_send --from=owner --message=yes)
+[[ "$out" == *"$ACKMSG"* ]] \
+  && ok_t "M13 an agent seat claiming --from=owner gets no exemption" || bad_t "M13 agent claims owner" "out=$out"
+as_root_login
+out=$(nosudo_send --message=yes)
+[[ "$out" == *"$ACKMSG"* ]] && ok_t "M14 without --from=owner a bare yes is still refused as an ack" || bad_t "M14 bare yes" "out=$out"
 n0=$(wc -l < "$TMP/owner-inbox.jsonl")
 out=$( (cmd_send owner --wake --message="Woken?") 2>&1); rc=$?
 [[ $rc -ne 0 && "$out" == *"owner is not one"* && "$(wc -l < "$TMP/owner-inbox.jsonl")" == "$n0" ]] \

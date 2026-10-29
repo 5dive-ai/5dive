@@ -132,6 +132,10 @@ for name, spec in agents.items():
     if not isinstance(spec, dict):
         print(f"error: agent '{name}' must be a map", file=sys.stderr); sys.exit(3)
     m = dict(defaults); m.update(spec)
+    # DIVE-7236: a tier the seat got only from `defaults:` is the template's
+    # team-wide tier, not this seat's — the lead-is-admin rule may override it.
+    if "isolation" in defaults and "isolation" not in spec:
+        m["isolation_default"] = True
     merged[name] = m
     if m.get("instructions") and m.get("instructions_file"):
         print(f"error: agent '{name}': instructions and instructions_file are mutually exclusive", file=sys.stderr); sys.exit(3)
@@ -354,7 +358,7 @@ _compose_create_args() {
   dc_token=$(jq  -r '.discord_token    // empty' <<<"$spec")
   workdir=$(jq   -r '.workdir          // empty' <<<"$spec")
   profile=$(jq   -r '.auth_profile     // empty' <<<"$spec")
-  isolation=$(jq -r '.isolation        // empty' <<<"$spec")
+  isolation=$(_compose_seat_isolation "$spec")
   provider=$(jq  -r '.provider         // empty' <<<"$spec")
   api_key=$(jq   -r '.api_key          // empty' <<<"$spec")
   base_url=$(jq  -r '.base_url         // empty' <<<"$spec")
@@ -494,10 +498,35 @@ _compose_import_args() {
   # one 5dive-api renders per seat), so a pack's manifest never decides a seat in
   # a team; else the box's by-role rule by where the seat sits. A non-pusher's
   # is pinned standard when neither names one (DIVE-6543).
-  local iso; iso=$(jq -r '.isolation // empty' <<<"$spec")
+  local iso; iso=$(_compose_seat_isolation "$spec")
   [[ -n "$iso" ]] && printf '%s\n' "--isolation=${iso}"
   _compose_push_args "$spec" "$iso"
   _compose_role_tier "$spec" "$iso"
+}
+
+# DIVE-7236: the tier a seat's spec names, as the arg builders forward it. A
+# tier that came only from the template's `defaults:` does not stop the lead
+# (no reports_to) being admin under by-role: the dropshipping template's
+# `defaults: isolation: standard` left its lead without root. A member keeps
+# the default, and a tier the seat names itself always stands.
+_compose_seat_isolation() {
+  local spec="$1" iso
+  iso=$(jq -r '.isolation // empty' <<<"$spec")
+  if [[ -n "$iso" && "$(jq -r '.isolation_default // false' <<<"$spec")" == true ]] \
+     && _compose_by_role && ! _compose_is_member "$spec"; then
+    iso=""
+  fi
+  printf '%s' "$iso"
+}
+
+_compose_by_role() {
+  declare -F box_seat_rule >/dev/null 2>&1 || return 1
+  [[ "$(box_seat_rule)" == by-role ]]
+}
+
+# A member reports to someone; the lead reports to no one.
+_compose_is_member() {
+  jq -e '(.reports_to // null) | if type=="array" then length > 0 else (. != null and . != "") end' <<<"$1" >/dev/null 2>&1
 }
 
 # DIVE-7143: under the box's by-role rule (box_seat_rule), a seat whose spec
@@ -509,9 +538,8 @@ _compose_role_tier() {
   local spec="$1" emitted="${2:-}"
   [[ -z "$emitted" ]] || return 0
   [[ "$(jq -r 'if has("can_push") then (.can_push|tostring) else "" end' <<<"$spec")" != "false" ]] || return 0
-  declare -F box_seat_rule >/dev/null 2>&1 || return 0
-  [[ "$(box_seat_rule)" == by-role ]] || return 0
-  if jq -e '(.reports_to // null) | if type=="array" then length > 0 else (. != null and . != "") end' <<<"$spec" >/dev/null 2>&1; then
+  _compose_by_role || return 0
+  if _compose_is_member "$spec"; then
     printf '%s\n' "--isolation=standard"
   else
     printf '%s\n' "--isolation=admin"

@@ -35,6 +35,9 @@ awk '/^_compose_parse\(\)/{f=1} f{print} f&&/^PY$/{p=1} p&&/^}$/{exit}' "$SRC" >
   sed -n '/^_compose_resolve_path()/,/^}/p' "$SRC"
   sed -n '/^_compose_create_args()/,/^}/p'  "$SRC"
   sed -n '/^_compose_push_args()/,/^}/p'    "$SRC"
+  sed -n '/^_compose_seat_isolation()/,/^}/p' "$SRC"   # DIVE-7236: the tier both builders forward
+  sed -n '/^_compose_by_role()/,/^}/p'      "$SRC"
+  sed -n '/^_compose_is_member()/,/^}/p'    "$SRC"
   sed -n '/^_compose_import_args()/,/^}/p'  "$SRC"
 } > "$TMP/args.sh"
 bash -n "$TMP/parse.sh" && bash -n "$TMP/args.sh" && grep -q '_compose_push_args()' "$TMP/args.sh" \
