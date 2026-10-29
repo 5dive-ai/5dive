@@ -1564,6 +1564,13 @@ _pack_usage() {
                                   # A pack holding a secret-shaped string is refused.
   5dive agent pack-sync <name> [--from-url=<https-url>|--marketplace=<slug>] [--dry-run] [--no-restart]
   5dive agent pack-sync --all [--dry-run] [--no-restart]
+  5dive agent update <name> --from-pack[=<https-link>|<slug>] [--dry-run] [--no-restart]
+                                  # DIVE-7275: bring ONE hired agent to its pack's version even
+                                  # where pack-sync reports drift: the pack's section of its
+                                  # instructions is replaced up to the CLI's own blocks (they and
+                                  # anything below are kept; the old file is backed up), edited
+                                  # pack skills are reinstalled (extra files kept). Bot, chat,
+                                  # memory and auth are untouched. --dry-run prints the diff.
                                   # DIVE-5205: bring a hired agent's pack SKILLS up to the
                                   # pack's current version. Touches only ids the pack lists;
                                   # a pack skill the owner edited is left and reported as
@@ -4361,7 +4368,7 @@ _pack_sync_persona() {
 #     version and an owner's edit look the same without one;
 #   - anything else was edited by the agent or its owner: left alone, `drift`.
 _pack_sync_claudemd() {
-  local stage="$1" name="$2" type="$3" rec="$4" dry="$5" md new nb osha ob
+  local stage="$1" name="$2" type="$3" rec="$4" dry="$5" reclaim="${6:-0}" md new nb osha ob
   [[ -s "$stage/CLAUDE.md" ]] || { echo "absent - -"; return 0; }
   md=$(PERSONA_HOME_ROOT="${AGENT_HOME_ROOT:-${PERSONA_HOME_ROOT:-/home}}" persona_target "$name" "$type" 2>/dev/null)     || { echo "failed - -"; return 1; }
   new=$(_pack_file_sha "$stage/CLAUDE.md"); nb=$(wc -c <"$stage/CLAUDE.md" | tr -d ' ')
@@ -4388,17 +4395,77 @@ _pack_sync_claudemd() {
     fi
   elif _pack_head_is "$name" "$md" "$nb" "$new"; then
     [[ -n "$osha" ]] && echo "unchanged $new $nb" || echo "baselined $new $nb"
+  elif (( reclaim )); then
+    _pack_reclaim_claudemd "$stage" "$name" "$md" "$new" "$nb" "$dry"
   else
     [[ -n "$osha" ]] && echo "drift - -" || echo "drift-unrecorded - -"
   fi
 }
 
-# _pack_sync_one <agent> <url> <dry:0|1> <restart:0|1> [<marketplace-slug>] — one
-# JSON result on stdout. The slug names the pack for an agent hired before the
-# record existed (5dive-api knows it; the box does not).
+# DIVE-7275: the lines the CLI itself starts a seat's instructions file with, before
+# an import prepends the pack's section (agent_setup.sh: the telegram fragment, the
+# model-tiering and working-comms blocks, the team block; a codex seat's baseline).
+# The first of them that opens a paragraph is where the pack's section ENDED, edited
+# or not — the one boundary a drifted file still carries.
+_PACK_TAIL_MARKERS=(
+  "# Telegram-paired agent"
+  "# Subagent model choice"
+  "# Working comms (chat / Telegram / team)"
+  "<!-- 5dive:team:begin"
+  "<!-- ${CODEX_BASELINE_MARKER:-5dive:codex-operating-baseline}:begin"
+)
+
+# _pack_tail_offset <file> -> the byte offset of the FIRST line that opens with a
+# marker. 0 = the file starts with the CLI's own block (no pack section above it);
+# nothing = no marker, or the first one does not open a paragraph (no clean cut).
+_pack_tail_offset() {
+  LC_ALL=C awk -v list="$(printf '%s\n' "${_PACK_TAIL_MARKERS[@]}")" '
+    BEGIN { n = split(list, mk, "\n") }
+    { for (i = 1; i <= n; i++) if (mk[i] != "" && index($0, mk[i]) == 1) { if (NR == 1 || prev == "") print off + 0; exit } }
+    { prev = $0; off += length($0) + 1 }' "$1"
+}
+
+# _pack_reclaim_claudemd <stage> <agent> <md> <sha> <bytes> <dry> -> "<status> <sha> <bytes>"
+# `agent update` only: the head no longer matches any recorded section (a by-hand
+# push or an older pack), so the sync would leave it as drift forever. Cut the file
+# at the CLI's own first block instead: the pack's current section goes in above it,
+# that block and everything after it (CLI blocks, lines the agent or owner added
+# below) are kept byte for byte, and the old file is kept beside it as a backup.
+# Refused (left alone) when there is no such block, or the new section itself
+# carries one of the markers and the cut would be ambiguous next time.
+_pack_reclaim_claudemd() {
+  local stage="$1" name="$2" md="$3" new="$4" nb="$5" dry="$6" live off m bak
+  for m in "${_PACK_TAIL_MARKERS[@]}"; do
+    grep -qF -- "$m" "$stage/CLAUDE.md" && { echo "drift-noboundary - -"; return 0; }
+  done
+  live="$stage/.md.live"
+  _pack_as "$name" cat -- "$md" >"$live" 2>/dev/null || { echo "failed - -"; return 1; }
+  off=$(_pack_tail_offset "$live")
+  [[ "$off" =~ ^[0-9]+$ ]] && (( off > 0 )) || { echo "drift-noboundary - -"; return 0; }
+  { cat "$stage/CLAUDE.md"; printf '\n'; tail -c +"$((off + 1))" "$live"; } >"$stage/.md.new" || { echo "failed - -"; return 1; }
+  if (( dry )); then
+    # The diff --dry-run prints: what the swap would change, nothing written.
+    diff -u --label "$md" --label "$md (after update)" "$live" "$stage/.md.new" >"$stage/.md.diff" 2>/dev/null
+    echo "reclaimed - -"; return 0
+  fi
+  # The caller reads the backup's path from the stage (this runs in a subshell).
+  bak="$md.bak-pack-$(date -u +%Y%m%dT%H%M%SZ)"
+  _pack_write_as "$name" "$live" "$bak" 644 || { echo "failed - -"; return 1; }
+  printf '%s' "$bak" >"$stage/.md.bak"
+  if _pack_write_as "$name" "$stage/.md.new" "$md" --reference; then
+    echo "reclaimed $new $nb"
+  else
+    echo "failed - -"; return 1
+  fi
+}
+
+# _pack_sync_one <agent> <url> <dry:0|1> <restart:0|1> [<marketplace-slug>] [<reclaim:0|1>]
+# — one JSON result on stdout. The slug names the pack for an agent hired before the
+# record existed (5dive-api knows it; the box does not). <reclaim> is `agent update`
+# (DIVE-7275): what the nightly leaves as drift is brought to the pack's version.
 # rc 0 = synced or nothing to do; 1 = could not sync this agent.
 _pack_sync_one() {
-  local name="$1" url="$2" dry="$3" restart="$4" mslug="${5:-}"
+  local name="$1" url="$2" dry="$3" restart="$4" mslug="${5:-}" reclaim="${6:-0}"
   local res; res=$(jq -nc --arg n "$name" '{name:$n, status:"error"}')
   _ps_out() { jq -c "$@" <<<"$res"; }
   local reg rec src slug tgz="" rc
@@ -4480,7 +4547,7 @@ _pack_sync_one() {
         fi
         live_sha=$(_pack_tree_sha "$dir/$id" 2>/dev/null) \
           && shas=$(jq -c --arg k "$id" --arg v "$live_sha" '.[$k] = $v' <<<"$shas")
-      elif [[ -n "$live_sha" && -n "$rec_sha" && "$live_sha" != "$rec_sha" ]]; then
+      elif (( ! reclaim )) && [[ -n "$live_sha" && -n "$rec_sha" && "$live_sha" != "$rec_sha" ]]; then
         drift+=("$id")   # edited since the pack installed it — not ours to clobber
         # DIVE-6796: ...but a file it LACKS is restored; the edit is never touched.
         if (( ! dry )) && [[ -n "$(_pack_skill_backfill "$name" "$stage/skills/$id" "$dir/$id")" ]]; then
@@ -4515,13 +4582,16 @@ _pack_sync_one() {
   local members='{}' p_st="failed" p_sha="-" c_st="failed" c_sha="-" c_nb="-" mchanged=0
   if _pack_sync_render_identity "$stage" "$name" "${type:-claude}"; then
     read -r p_st p_sha < <(_pack_sync_persona "$stage" "$name" "$rec" "$dry")
-    read -r c_st c_sha c_nb < <(_pack_sync_claudemd "$stage" "$name" "${type:-claude}" "$rec" "$dry")
+    read -r c_st c_sha c_nb < <(_pack_sync_claudemd "$stage" "$name" "${type:-claude}" "$rec" "$dry" "$reclaim")
   fi
+  local c_diff="" c_bak=""
+  [[ -f "$stage/.md.diff" ]] && c_diff=$(cat "$stage/.md.diff")
+  [[ -f "$stage/.md.bak" ]] && c_bak=$(cat "$stage/.md.bak")
   rm -rf "$stage"
   [[ "$p_sha" != "-" ]] && members=$(jq -c --arg v "$p_sha" '.persona = $v' <<<"$members")
   [[ "$c_sha" != "-" ]] && members=$(jq -c --arg v "$c_sha" --argjson b "$c_nb" '.claudeMd = {sha:$v, bytes:$b}' <<<"$members")
   [[ "$p_st" == added || "$p_st" == updated ]] && mchanged=$((mchanged + 1))
-  [[ "$c_st" == updated ]] && mchanged=$((mchanged + 1))
+  [[ "$c_st" == updated || "$c_st" == reclaimed ]] && mchanged=$((mchanged + 1))
   [[ "$p_st" == failed ]] && failed+=("persona.yaml")
   [[ "$c_st" == failed ]] && failed+=("CLAUDE.md")
 
@@ -4543,12 +4613,14 @@ _pack_sync_one() {
       --argjson f "$(_j "${failed[@]+"${failed[@]}"}")" --argjson m "$(_j "${managed[@]+"${managed[@]}"}")" \
       --argjson b "$(_j "${backfilled[@]+"${backfilled[@]}"}")" \
       --arg r "$restart_note" --argjson dry "$dry" \
-      --arg ps "$p_st" --arg cs "$c_st" --argjson mc "$mchanged" \
+      --arg ps "$p_st" --arg cs "$c_st" --argjson mc "$mchanged" --arg cdiff "$c_diff" --arg cbak "$c_bak" \
       '.status = (if ($f|length) > 0 then "partial" elif (($a|length)+($u|length)+($b|length)+$mc) > 0 then (if $dry == 1 then "would-change" else "changed" end) else "unchanged" end)
        | .added = $a | .updated = $u | .backfilled = $b | .unchanged = $c | .drift = $d | .failed = $f | .managedElsewhere = $m | .restart = $r
        | .persona = {status:$ps}
-       | .claudeMd = ({status:(if $cs == "drift-unrecorded" or $cs == "drift-link" then "drift" else $cs end)}
-           + (if $cs == "drift" then {reason:"edited since the pack installed it — left alone"}
+       | .claudeMd = ({status:(if $cs == "drift-unrecorded" or $cs == "drift-link" or $cs == "drift-noboundary" then "drift" else $cs end)}
+           + (if $cdiff != "" then {diff:$cdiff} else {} end) + (if $cbak != "" then {backup:$cbak} else {} end)
+           + (if $cs == "drift" then {reason:"edited since the pack installed it — left alone (`agent update --from-pack` replaces it)"}
+              elif $cs == "drift-noboundary" then {reason:"cannot tell where the pack section ends (no 5dive block after it) — left alone"}
               elif $cs == "drift-link" then {reason:"the instructions file is a symlink or not a regular file — never written through, left alone"}
               elif $cs == "drift-unrecorded" then {reason:"no install record, and the file does not start with the current pack section — left alone"}
               else {} end))' <<<"$res")
@@ -4593,7 +4665,7 @@ cmd_pack_sync() {
       + (if (.backfilled|length? // 0) > 0 then "; restored missing files in \(.backfilled|join(","))" else "" end)
       + (if (.drift|length? // 0) > 0 then "; LEFT (edited since install) \(.drift|join(","))" else "" end)
       + (if (.persona.status // "") | test("^(added|updated|drift)$") then "; persona.yaml \(.persona.status)" else "" end)
-      + (if (.claudeMd.status // "") | test("^(updated|baselined|drift)$") then "; CLAUDE.md section \(.claudeMd.status)" + (if .claudeMd.reason then " (\(.claudeMd.reason))" else "" end) else "" end)
+      + (if (.claudeMd.status // "") | test("^(updated|baselined|reclaimed|drift)$") then "; CLAUDE.md section \(.claudeMd.status)" + (if .claudeMd.reason then " (\(.claudeMd.reason))" else "" end) else "" end)
       + (if (.failed|length? // 0) > 0 then "; FAILED \(.failed|join(","))" else "" end)
       + (if (.restart // "none") != "none" then "; restart \(.restart)" else "" end)' <<<"${line:-null}")"
   done
@@ -4601,6 +4673,64 @@ cmd_pack_sync() {
     fail "$E_GENERIC" "pack-sync '$name': $(jq -r '.[0].reason // ("failed: " + ((.[0].failed // []) | join(",")))' <<<"$results")"
   fi
   ok "pack-sync: ${#names[@]} agent(s), $bad not fully synced" '{agents:$r}' --argjson r "$results"
+}
+
+# -------- 5dive agent update --from-pack (DIVE-7275) ------------------------
+# pack-sync never overwrites what it cannot prove the pack wrote: an instructions
+# file pushed by hand (every partner agent, by the root bundles) or hired from an older
+# pack is drift, and stays drift — so each pack change needed root on the box. This
+# is the deliberate overwrite, run on ONE named agent by whoever ships the pack (the
+# control plane over the exec tunnel, or the owner):
+#   - the pack's section at the head of the instructions file is replaced even when
+#     edited; the cut is the CLI's own first block (_pack_reclaim_claudemd), so the
+#     CLI tail and anything written below it survive, and the old file is backed up;
+#   - a pack skill edited since install is reinstalled from the pack, keeping files
+#     the pack does not ship (_install_bundled_skill); other ids are never touched,
+#     and a skill the pack dropped is not removed;
+#   - bot binding, chat, memory, auth and persona.yaml edits are not touched;
+#   - the record is rewritten, so the nightly pack-sync takes it from here.
+# --from-pack alone uses the pack recorded at import; =<https-link> or =<slug>
+# names it. An agent with no recorded pack and no named one is refused.
+cmd_agent_update() {
+  require_root "agent update"
+  local name="" from="" have_from=0 dry=0 restart=1 url="" mslug=""
+  local usage="usage: 5dive agent update <name> --from-pack[=<https-link>|<slug>] [--dry-run] [--no-restart]"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from-pack)   have_from=1 ;;
+      --from-pack=*) have_from=1; from="${1#--from-pack=}" ;;
+      --dry-run)     dry=1 ;;
+      --no-restart)  restart=0 ;;
+      -*)            fail "$E_USAGE" "unknown flag: $1 — $usage" ;;
+      *)             [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "$usage" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" ]] && valid_name "$name" || fail "$E_USAGE" "$usage"
+  (( have_from )) || fail "$E_USAGE" "say where the update comes from: --from-pack — $usage"
+  local reg; reg=$(registry_read)
+  jq -e --arg n "$name" '.agents[$n]' <<<"$reg" >/dev/null 2>&1 || fail "$E_NOT_FOUND" "no agent named '$name'"
+  if [[ "$from" == https://* ]]; then url="$from"
+  elif [[ -n "$from" ]]; then mslug="$from"
+  elif ! jq -e --arg n "$name" '.agents[$n].pack.slug // empty' <<<"$reg" >/dev/null 2>&1; then
+    fail "$E_VALIDATION" "'$name' was not hired from a pack — there is nothing to update it from (name one: --from-pack=<link|slug>)"
+  elif [[ "$(jq -r --arg n "$name" '.agents[$n].pack.source // ""' <<<"$reg")" == url ]]; then
+    fail "$E_VALIDATION" "'$name' came from a partner pack link — pass a fresh one: --from-pack=<https-link>"
+  fi
+  local line rc=0
+  line=$(_pack_sync_one "$name" "$url" "$dry" "$restart" "$mslug" 1) || rc=1
+  if (( ! JSON_MODE )); then
+    step "$(jq -r '"\(.name): \(.status)" + (if .reason then " — \(.reason)" else "" end)
+      + (if (.added|length? // 0) > 0 then "; added \(.added|join(","))" else "" end)
+      + (if (.updated|length? // 0) > 0 then "; updated \(.updated|join(","))" else "" end)
+      + (if (.claudeMd.status // "") | test("^(updated|reclaimed|drift)$") then "; instructions \(.claudeMd.status)" + (if .claudeMd.reason then " (\(.claudeMd.reason))" else "" end) else "" end)
+      + (if .claudeMd.backup then "; old file kept at \(.claudeMd.backup)" else "" end)
+      + (if (.failed|length? // 0) > 0 then "; FAILED \(.failed|join(","))" else "" end)
+      + (if (.restart // "none") != "none" then "; restart \(.restart)" else "" end)' <<<"${line:-null}")"
+    (( dry )) && jq -r '.claudeMd.diff // empty' <<<"${line:-null}"
+  fi
+  (( rc == 0 )) || fail "$E_GENERIC" "agent update '$name': $(jq -r '.reason // ("failed: " + ((.failed // []) | join(",")))' <<<"${line:-null}")"
+  ok "agent update '$name': $(jq -r .status <<<"$line")" '{agent:$r}' --argjson r "$line"
 }
 
 # `5dive market --kind=plugin` (DIVE-4020 §7.2) — the discovery half of the
