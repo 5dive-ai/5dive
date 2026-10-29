@@ -13,8 +13,10 @@
 # (same defect -> "already asked on <date>", another defect the same day -> "today");
 # a token-shaped --what is refused; and the negative control that no GitHub route
 # is left in cmd_bug.sh. DIVE-6616 (arm 5): no key file -> the open /bug-reports
-# route and its spool drain; an unreadable key -> the access message; a readable
-# one -> the keyed route, unchanged.
+# route and its spool drain; a readable one -> the keyed route, unchanged.
+# DIVE-7248 (5d): an unreadable key (a non-root seat on one of our boxes) -> the
+# open route too, and it drains what that seat spooled before; only if the open
+# route fails is it spooled, with the access reason.
 set -uo pipefail
 
 TMP=""; SRV_PID=""
@@ -173,21 +175,38 @@ chk "5c both over the open route" "/bug-reports|/bug-reports|" "$(for i in 0 1; 
 chk "5c the spool is empty" 0 "$(find "$SPOOL" -name '*.json' | wc -l)"
 [[ "$out" == *"also sent 1 saved earlier"* ]] && ok_t "5c the drain is reported" || fail_t "5c text: $out"
 
-# 5d. the key file EXISTS but this seat cannot read it: the access message, spooled,
-# nothing sent anywhere (that box is ours; its report belongs on the keyed route).
+# 5d. DIVE-7248: the key file EXISTS but this seat cannot read it (every non-root
+# seat on one of our boxes). It goes keyless, like a self-installed box, instead of
+# a spool that same seat could never drain.
 rm -f "$TMP"/reqs/*
 printf 'CONNECTORD_TOKEN=fake-file-token-1111\n' > "$TMP/locked.env"; chmod 000 "$TMP/locked.env"
 if [[ -r "$TMP/locked.env" ]]; then
   ok_t "5d SKIP: running as root, a 000 file is still readable"
 else
-  err=$(CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/locked.env" cmd_bug --verb=task --exit=1 --what="locked key" --no-probes --file --owner-approved </dev/null 2>&1)
-  chk "5d unreadable key: exits E_TIMEOUT (spooled)" "$E_TIMEOUT" "$?"
-  [[ "$err" == *"this seat cannot read the box's key ($TMP/locked.env)"* ]] && ok_t "5d the access message names the file" || fail_t "5d text: $err"
-  chk "5d nothing reached the endpoint" 0 "$(nreq)"
+  # 5d1. the open route is not there (an older API): spooled, and the reason is access.
+  echo 404 > "$TMP/status"
+  err=$(CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/locked.env" cmd_bug --verb=task --exit=1 --what="locked key, old api" --no-probes --file --owner-approved </dev/null 2>&1)
+  chk "5d1 unreadable key + 404: exits E_TIMEOUT (spooled)" "$E_TIMEOUT" "$?"
+  [[ "$err" == *"this seat cannot read the box's key ($TMP/locked.env), and 5dive's API could not take the report without it (HTTP 404)"* ]] \
+    && ok_t "5d1 the access reason names the file and the status" || fail_t "5d1 text: $err"
+  chk "5d1 it tried the open route" "/bug-reports" "$(req 0 .path)"
+  chk "5d1 one spool file (the report chill-gorge's head was left with)" 1 "$(find "$SPOOL" -name '*.json' | wc -l)"
+  # 5d2. the open route answers: sent, exit 0, and the spooled one goes with it.
+  rm -f "$TMP/status" "$TMP"/reqs/*
+  out=$(CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/locked.env" cmd_bug --verb=task --exit=1 --what="locked key" --no-probes --file --owner-approved </dev/null 2>&1)
+  chk "5d2 unreadable key: exits 0 (sent)" 0 "$?"
+  [[ "$out" == *"bug report sent to 5dive (report 42); also sent 1 saved earlier"* ]] && ok_t "5d2 says sent, with the id and the drain" || fail_t "5d2 text: $out"
+  chk "5d2 it sent itself plus the spooled one" 2 "$(nreq)"
+  chk "5d2 both over the open route" "/bug-reports|/bug-reports|" "$(for i in 0 1; do req "$i" .path; done | tr '\n' '|')"
+  chk "5d2 with no Authorization header" "null|null|" "$(for i in 0 1; do req "$i" .auth; done | tr '\n' '|')"
+  chk "5d2 the body is the same allowlist" \
+    '["bash_version","exit_code","install_method","invocation","os","probes","verb","version","what"]' \
+    "$(req 0 .body | jq -cS keys)"
+  chk "5d2 the spool is empty" 0 "$(find "$SPOOL" -name '*.json' | wc -l)"
 fi
-chmod 600 "$TMP/locked.env"; rm -f "$SPOOL"/*.json
+chmod 600 "$TMP/locked.env"; rm -f "$TMP/status" "$SPOOL"/*.json
 
-# 5e. the key file is readable: today's keyed route, unchanged.
+# 5e. NEGATIVE CONTROL for 5d: the key file is readable: the keyed route, unchanged.
 rm -f "$TMP"/reqs/*
 printf 'CONNECTORD_TOKEN="fake-file-token-2222"\n' > "$TMP/box.env"
 ( CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/box.env" cmd_bug --verb=task --exit=1 --what="readable key" --no-probes --file --owner-approved </dev/null ) >/dev/null 2>&1
