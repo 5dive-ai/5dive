@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DIVE-6675 — `agent telegram-access groups <name> [--answer=name|every]`, the
+# DIVE-6675 — `agent telegram-access groups <name> [--answer=name|every|owner]`, the
 # box half of the app's "In groups, answer: when called by name · every message".
 # Grades the read (stored key, derived value, mixed), the write (every group's
 # requireMention + groupsRequireMention for groups added later, other keys kept),
@@ -148,7 +148,7 @@ _tg_bot_first_name() { return 1; }
 # --- refusals ---------------------------------------------------------------
 cp "$STATE/access.json" "$TMP/keep"
 run olivia --answer=all >/dev/null && bad 'accepted --answer=all' \
-  || { grep -q 'name (when called by name) or every' "$TMP/err" && okk 'a bad --answer is refused and says the two values' || bad "bad-answer msg: $(cat "$TMP/err")"; }
+  || { grep -q 'name (when called by name), every (every message) or owner' "$TMP/err" && okk 'a bad --answer is refused and says the three values' || bad "bad-answer msg: $(cat "$TMP/err")"; }
 cmp -s "$TMP/keep" "$STATE/access.json" && okk 'a refused write touches nothing' || bad 'refused write changed the file'
 run nobody >/dev/null && bad 'accepted an unknown agent' || okk 'an unknown agent is refused'
 run mute >/dev/null && bad 'accepted an agent without telegram' || okk 'an agent without telegram is refused'
@@ -156,6 +156,49 @@ run oc >/dev/null && bad 'accepted an openclaw agent' || okk 'a type with no acc
 printf 'not json' >"$STATE/access.json"
 run olivia --answer=every >/dev/null && bad 'wrote over a broken access.json' || okk 'a broken access.json is refused, not overwritten'
 [[ "$(cat "$STATE/access.json")" == 'not json' ]] && okk 'the broken file is left as it was' || bad 'broken file replaced'
+
+# --- DIVE-7250: --answer=owner, "When I call it by name" -------------------
+# 1 = the owner (owners record, still in allowFrom), 2 = a guest let into DMs.
+OWNER_ACCESS='{"dmPolicy":"allowlist","allowFrom":["1","2"],"owners":["1"],"groups":{"-100":{"requireMention":false,"allowFrom":[]},"-200":{"requireMention":true,"allowFrom":["5"],"message_thread_id":7}}}'
+printf '%s' "$OWNER_ACCESS" >"$STATE/access.json"
+_tg_owner_only_ok() { return 1; }
+out=$(run olivia) && [[ "$(jq -c '.data.answers' <<<"$out")" == '["name","every"]' ]] \
+  && okk 'an agent whose plugin lacks owner only does not offer it' || bad "answers without plugin: $out"
+cp "$STATE/access.json" "$TMP/keep"
+run olivia --answer=owner >/dev/null && bad 'owner accepted on a plugin without it' \
+  || { cmp -s "$TMP/keep" "$STATE/access.json" && grep -q 'too old' "$TMP/err" && okk 'owner on an old plugin is refused and writes nothing' || bad "old plugin owner: $(cat "$TMP/err")"; }
+_tg_owner_only_ok() { return 0; }
+out=$(run olivia) && [[ "$(jq -c '.data.answers' <<<"$out")" == '["name","every","owner"]' && "$(field answer)" != owner ]] \
+  && okk 'a plugin that knows it, with an owner on record: owner is offered' || bad "answers with plugin: $out"
+out=$(run olivia --answer=owner) && [[ "$(field answer)" == owner && "$(field mixed)" == false ]] \
+  && okk '--answer=owner reads back owner, not mixed' || bad "write owner: $out"
+[[ "$(jq -c '[.groups[] | [.requireMention, .allowFrom]]' "$STATE/access.json")" == '[[true,["1"]],[true,["1"]]]' ]] \
+  && okk 'every group: by name, the owner alone let in (the guest is not)' || bad "groups after owner: $(jq -c .groups "$STATE/access.json")"
+[[ "$(jq -c '[.groupsOwnerOnly, .groupsRequireMention]' "$STATE/access.json")" == '[true,true]' ]] \
+  && okk 'groupsOwnerOnly stored for a group added later' || bad "keys after owner: $(jq -c . "$STATE/access.json")"
+[[ "$(jq '.groups["-200"].message_thread_id' "$STATE/access.json")" == 7 ]] && okk "owner keeps a group's own fields" || bad 'owner lost message_thread_id'
+out=$(run olivia) && [[ "$(field answer)" == owner ]] && okk 'a read says owner' || bad "read owner: $out"
+jq '.groups["-100"].allowFrom=[]' "$STATE/access.json" >"$TMP/a" && cp "$TMP/a" "$STATE/access.json"
+out=$(run olivia) && [[ "$(field answer)" == owner && "$(field mixed)" == true ]] \
+  && okk 'a group open to everyone under owner reads mixed' || bad "owner mixed: $out"
+out=$(run olivia --answer=name) && [[ "$(field answer)" == name ]] \
+  && [[ "$(jq -c '[.groups[] | [.requireMention, .allowFrom]]' "$STATE/access.json")" == '[[true,[]],[true,[]]]' ]] \
+  && [[ "$(jq 'has("groupsOwnerOnly")' "$STATE/access.json")" == false ]] \
+  && okk 'leaving owner opens the groups it closed and drops the key' || bad "owner->name: $(jq -c . "$STATE/access.json")"
+printf '%s' "$OWNER_ACCESS" >"$STATE/access.json"
+jq '.groups["-100"].allowFrom=["1"] | .groupsOwnerOnly=true | .groups["-200"].allowFrom=["5"]' "$STATE/access.json" >"$TMP/a" && cp "$TMP/a" "$STATE/access.json"
+run olivia --answer=every >/dev/null && [[ "$(jq -c '[.groups[].allowFrom]' "$STATE/access.json")" == '[[],["5"]]' ]] \
+  && okk 'leaving owner keeps an allowFrom it did not write' || bad "owner->every: $(jq -c .groups "$STATE/access.json")"
+printf '{"dmPolicy":"allowlist","allowFrom":["1"],"groups":{"-100":{"requireMention":true,"allowFrom":[]}}}' >"$STATE/access.json"
+cp "$STATE/access.json" "$TMP/keep"
+out=$(run olivia) && [[ "$(jq -c '.data.answers' <<<"$out")" == '["name","every"]' ]] \
+  && okk 'no owners record: owner is not offered' || bad "answers no owner: $out"
+run olivia --answer=owner >/dev/null && bad 'owner accepted with no owner on record' \
+  || { cmp -s "$TMP/keep" "$STATE/access.json" && grep -q 'no owner on record' "$TMP/err" && okk 'owner with no owner on record is refused, nothing written' || bad "no owner: $(cat "$TMP/err")"; }
+jq '.owners=["1"] | .allowFrom=["2"]' "$TMP/keep" >"$STATE/access.json"
+run olivia --answer=owner >/dev/null && bad 'owner accepted when the owner is no longer let in' \
+  || okk 'an owner the bot no longer answers is not an owner'
+_tg_owner_only_ok() { return 1; }
 
 # --- a failure with no message names what failed: read or write -----------
 sudo() { return 1; }
@@ -168,9 +211,9 @@ sudo() { [[ "$1" == -u ]] && shift 2; "$@"; }
 # --- dispatch ---------------------------------------------------------------
 grep -q 'groups)' "$ROOT/src/main.sh" && grep -q 'cmd_telegram_access_groups "\$@"' "$ROOT/src/main.sh" \
   && okk 'main.sh routes telegram-access groups' || bad 'main.sh does not route groups'
-grep -q 'telegram-access groups <name> \[--answer=name|every\]' "$ROOT/src/main.sh" \
+grep -q 'telegram-access groups <name> \[--answer=name|every|owner\]' "$ROOT/src/main.sh" \
   && okk 'agent usage documents the verb' || bad 'usage line missing'
-grep -q 'telegram-access groups <name> \[--answer=name|every\] \[--names=' "$ROOT/src/main.sh" \
+grep -q 'telegram-access groups <name> \[--answer=name|every|owner\] \[--names=' "$ROOT/src/main.sh" \
   && okk 'agent usage documents --names' || bad 'usage line lacks --names'
 grep -qF '" $* " == *" --names="*' "$ROOT/src/main.sh" && okk 'a --names write is audited' || bad '--names write not audited'
 

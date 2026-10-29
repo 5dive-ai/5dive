@@ -202,15 +202,27 @@ PY
 #   5dive agent telegram-access groups <name>                 # read
 #   5dive agent telegram-access groups <name> --answer=name   # when called by name
 #   5dive agent telegram-access groups <name> --answer=every  # every message
+#   5dive agent telegram-access groups <name> --answer=owner  # when I call it by name
 #   5dive agent telegram-access groups <name> --names="Оля,Liv,奥利维亚"  # also answers to
 #   5dive agent telegram-access groups <name> --names=          # clear them
 #
-# data: {name, answer: "name"|"every", groups: <approved groups>, mixed: bool,
-#        names: [...]}.
+# data: {name, answer: "name"|"every"|"owner", answers: [...], groups: <approved
+#        groups>, mixed: bool, names: [...]}.
 # `answer` is the stored key, else "every" when every group already answers
 # every message, else "name". `mixed` = some group differs from `answer` (one
 # was flipped on its own in Who can talk to); a write clears it. The plugin
 # re-reads access.json per message, so no restart.
+#
+# DIVE-7250 (lodar 2026-10-29: add his agent to a shared group "without anyone
+# getting into my account through it"): `owner` is "When I call it by name".
+# Every group answers by name AND lets in the owners alone (`allowFrom`, which
+# any telegram plugin honours), and `groupsOwnerOnly` makes the plugin (0.5.124+)
+# drop anyone else's group message before the agent or its group log sees it,
+# in a group added later too. The owners are the plugin's `owners` record that
+# allowFrom still holds; with none, owner is refused. `answers` lists what this
+# agent can take: owner only for a claude agent whose installed plugin knows
+# the key (an older one would rewrite access.json without it). Leaving owner
+# empties the allowFrom it wrote, and only that one.
 #
 # DIVE-6684: `--names=` is the app's "Also answers to": extra names that call
 # the agent in a group, in any language, stored as `groupsCallNames` (telegram
@@ -235,6 +247,7 @@ import json, os, re, sys, tempfile, unicodedata
 
 state = os.environ['STATE']
 want = os.environ.get('ANSWER', '')
+owner_ok = os.environ.get('OWNER_OK') == '1'
 names_set = os.environ.get('NAMES_SET') == '1'
 replace = names_set
 
@@ -270,6 +283,15 @@ groups = access.get('groups')
 if not isinstance(groups, dict):
     groups = {}
 cfgs = [g for g in groups.values() if isinstance(g, dict)]
+allow = access.get('allowFrom') if isinstance(access.get('allowFrom'), list) else []
+owners_rec = access.get('owners') if isinstance(access.get('owners'), list) else []
+owners = [o for o in owners_rec if isinstance(o, str) and o.isdigit() and o in allow]
+was_owner = access.get('groupsOwnerOnly') is True
+if want == 'owner':
+    if not owner_ok:
+        print("owner: this agent's Telegram plugin is too old for it; it updates on its own", file=sys.stderr); sys.exit(2)
+    if not owners:
+        print("owner: this agent has no owner on record yet; pair it with its owner first", file=sys.stderr); sys.exit(2)
 
 # DIVE-6701: NAMES_ADD appends to the names already kept (the hire's card name),
 # skipping one already there in any case and stopping at 10. Nothing to add
@@ -288,11 +310,19 @@ if seed and not names_set:
 
 if want or names_set:
     if want:
-        on = want == 'name'
+        on = want != 'every'
         for g in cfgs:
             g['requireMention'] = on
+            if want == 'owner':
+                g['allowFrom'] = list(owners)
+            elif was_owner and isinstance(g.get('allowFrom'), list) and sorted(g['allowFrom']) == sorted(owners):
+                g['allowFrom'] = []
         access['groups'] = groups
         access['groupsRequireMention'] = on
+        if want == 'owner':
+            access['groupsOwnerOnly'] = True
+        else:
+            access.pop('groupsOwnerOnly', None)
     if replace:
         access['groupsCallNames'] = names
         access['groupsCallNamesComplete'] = True
@@ -310,6 +340,9 @@ if isinstance(stored, bool):
 else:
     on = not (cfgs and all(g.get('requireMention') is False for g in cfgs))
 mixed = any((g.get('requireMention') is not False) != on for g in cfgs)
+owner_mode = access.get('groupsOwnerOnly') is True
+if owner_mode:
+    mixed = mixed or any(sorted(g.get('allowFrom') or []) != sorted(owners) for g in cfgs)
 stored_names = access.get('groupsCallNames')
 names = [n for n in stored_names if call_name(n)][:10] if isinstance(stored_names, list) else []
 # The plugin's callName(): the first run of letters and marks in the bot's
@@ -330,8 +363,9 @@ elif not complete:
     own = bot_word(os.environ.get('BOT_FIRST', ''))
     if own:
         names = [own] + [n for n in names if n.casefold() != own.casefold()]
-out = {'answer': 'name' if on else 'every', 'groups': len(cfgs), 'mixed': mixed, 'names': names,
-       'namesComplete': known}
+out = {'answer': 'owner' if owner_mode else 'name' if on else 'every',
+       'answers': ['name', 'every'] + (['owner'] if owner_ok and owners else []),
+       'groups': len(cfgs), 'mixed': mixed, 'names': names, 'namesComplete': known}
 if seed:
     out['added'] = added
 print(json.dumps(out))
@@ -350,6 +384,17 @@ _tg_bot_first_name() {
   jq -r '.result.first_name // ""' <<<"$resp"
 }
 
+# DIVE-7250: the installed telegram plugin knows `groupsOwnerOnly` (0.5.124+).
+# Checked in the installed copy rather than by number. Claude agents only: the
+# other bridges keep no owners record.
+_tg_owner_only_ok() {
+  local user="$1" type="$2" dir
+  [[ "$type" == claude ]] || return 1
+  dir=$(sudo -u "$user" jq -r '.plugins["telegram@5dive-plugins"][0].installPath // empty' \
+    "${AGENT_HOME_ROOT:-/home}/${user}/.claude/plugins/installed_plugins.json" 2>/dev/null) || return 1
+  [[ -n "$dir" ]] && sudo -u "$user" grep -q 'groupsOwnerOnly' "$dir/groupjoin.ts" 2>/dev/null
+}
+
 cmd_telegram_access_groups() {
   local name="" answer="" names="" names_set=0
   while [[ $# -gt 0 ]]; do
@@ -361,10 +406,10 @@ cmd_telegram_access_groups() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-access groups <name> [--answer=name|every] [--names=<a,b,...>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-access groups <name> [--answer=name|every|owner] [--names=<a,b,...>]"
   case "$answer" in
-    ""|name|every) ;;
-    *) fail "$E_USAGE" "--answer must be name (when called by name) or every (every message), got '$answer'" ;;
+    ""|name|every|owner) ;;
+    *) fail "$E_USAGE" "--answer must be name (when called by name), every (every message) or owner (when I call it by name), got '$answer'" ;;
   esac
   ensure_state
   local reg type channels
@@ -390,13 +435,14 @@ cmd_telegram_access_groups() {
   if [[ "$names_set" != 1 ]] && bot_first=$(_tg_bot_first_name "$name"); then
     bot_known=1
   fi
-  local out
+  local out owner_ok=0
+  _tg_owner_only_ok "$user" "$type" && owner_ok=1
   if ! out=$(sudo -u "$user" env STATE="$state_dir" ANSWER="$answer" NAMES="$names" NAMES_SET="$names_set" \
-      BOT_FIRST="$bot_first" BOT_KNOWN="$bot_known" python3 -c "$(_tg_group_answer_py)" 2>&1); then
+      BOT_FIRST="$bot_first" BOT_KNOWN="$bot_known" OWNER_OK="$owner_ok" python3 -c "$(_tg_group_answer_py)" 2>&1); then
     fail "$E_VALIDATION" "${out:-telegram access.json ${verb} failed for agent '$name'}"
   fi
   local said
-  said=$(jq -r '"\(if .answer == "name" then "when called by name" else "every message" end) (\(.groups) group(s)\(if .mixed then ", some set apart" else "" end))\(if (.names // []) != [] then "; answers to: \(.names | join(", "))" elif .namesComplete then "; answers to no name, only an @mention or a reply" else "" end)"' <<<"$out")
+  said=$(jq -r '"\(if .answer == "owner" then "only when you call it by name" elif .answer == "name" then "when called by name" else "every message" end) (\(.groups) group(s)\(if .mixed then ", some set apart" else "" end))\(if (.names // []) != [] then "; answers to: \(.names | join(", "))" elif .namesComplete then "; answers to no name, only an @mention or a reply" else "" end)"' <<<"$out")
   ok "in groups, '$name' answers: $said" '{name:$n} + $r' --arg n "$name" --argjson r "$out"
 }
 
