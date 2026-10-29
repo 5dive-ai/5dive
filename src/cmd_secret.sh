@@ -192,17 +192,24 @@ cmd_secret() {
 # `secret _reveal` for it and types it in (5dive-browser, DIVE-6844/6973).
 #
 # DIVE-6973, the item shapes (`__` cannot come from a name: names forbid `--`):
-#   one value   KEY=v1:<b64>                       (DIVE-6844's items, unchanged)
-#   a pair      KEY__LOGIN=v1:… KEY__PASSWORD=v1:… [KEY__2FA=v1:<base32 seed>]
+#   one value   KEY=v2:<b64>                       (DIVE-6844's items, unchanged)
+#   a pair      KEY__LOGIN=v2:… KEY__PASSWORD=v2:… [KEY__2FA=v2:<base32 seed>]
 # Saving one shape under a name drops the other, so a name is one item.
 #
 # DIVE-6973, encrypted at rest (lodar 03:24Z "can vault be encoded?"). Every
-# value line is `v1:` + `openssl enc -aes-256-cbc -pbkdf2` under a per-box key,
+# value line is `v2:` + `openssl enc -aes-256-cbc -pbkdf2` under a per-box key,
 # /etc/5dive/vault.key (400 root, 32 random bytes as hex, made on the first
 # save). openssl reads the plaintext on STDIN and the key from its file, so no
 # value and no key is ever on a command line; a value is decrypted only into a
 # pipe or a shell variable, never a file. A plain line (a DIVE-6844 box) is
 # encrypted in place the first time any saved verb runs as root.
+# DIVE-7274, why v2: AES-CBC alone does not know its key. Under a wrong key
+# openssl fails only on bad padding, and ~1 in 256 the padding comes out valid,
+# so v1 answered garbage that the browser would type into a site. A v2 value
+# encrypts SAVED_ENC_CHECK ahead of the plaintext and `_vault_dec` requires it
+# back, so a wrong key is refused every time (no MAC: that would put the key on
+# a command line). A v1 line is still read, behind a text check, and the same
+# first root saved verb rewrites it as v2.
 # WHAT IT IS NOT: a wall against root. Root can read vault.key, so an admin seat
 # (the lead, anything with sudo) can decrypt. It keeps the values out of every
 # copy of the file (a backup, a tar of /etc/5dive, a support paste); the
@@ -218,7 +225,9 @@ cmd_secret() {
 # whose values `_reveal` refuses ("save it again"), never as garbage typed in.
 SECRET_SAVED_CONNECTOR="saved"
 SECRET_VAULT_KEY="/etc/5dive/vault.key"
-SAVED_ENC_TAG="v1:"
+SAVED_ENC_TAG="v2:"
+SAVED_ENC_V1="v1:"
+SAVED_ENC_CHECK="5DV2:"
 _saved_name_ok() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,39}$ && "$1" != *- && "$1" != *--* ]]; }
 _saved_key() { local k="${1^^}"; printf '%s' "${k//-/_}"; }
 _saved_name_of() { local n="${1,,}"; printf '%s' "${n//_/-}"; }
@@ -257,21 +266,44 @@ _vault_key_ensure() {
   chown root:root "$tmp" 2>/dev/null || true
   chmod 400 "$tmp" && mv -f "$tmp" "$k" || { rm -f "$tmp"; return 1; }
 }
-# Plaintext on stdin -> `v1:<base64>` on stdout. The key is read from its file.
+# Plaintext on stdin -> `v2:<base64>` on stdout. The key is read from its file.
 _vault_enc() {
   local c
-  c=$(openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -salt -a -A -pass "file:${SECRET_VAULT_KEY}" 2>/dev/null) \
+  c=$( { printf '%s' "$SAVED_ENC_CHECK"; cat; } \
+    | openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -salt -a -A -pass "file:${SECRET_VAULT_KEY}" 2>/dev/null) \
     && [[ -n "$c" ]] || return 1
   printf '%s%s' "$SAVED_ENC_TAG" "$c"
 }
-# <v1:…> -> the plaintext on stdout (a pipe or a $(…), never a file).
+# <base64> -> what it decrypts to under the box key, NUL read as \x01 (no real
+# value holds a NUL, and bash would drop it with a warning). rc 1 = bad padding.
+_vault_open() {
+  ( set -o pipefail
+    printf '%s' "$1" \
+      | openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -a -A -pass "file:${SECRET_VAULT_KEY}" 2>/dev/null \
+      | tr '\0' '\1' )
+}
+# <v2:…> or <v1:…> -> the plaintext on stdout (a pipe or a $(…), never a file).
+# rc 1 = not readable here (no key, another box's key, not a value line).
 _vault_dec() {
-  [[ "$1" == "$SAVED_ENC_TAG"?* && -r "$SECRET_VAULT_KEY" ]] || return 1
-  printf '%s' "${1#"$SAVED_ENC_TAG"}" \
-    | openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -a -A -pass "file:${SECRET_VAULT_KEY}" 2>/dev/null
+  [[ -r "$SECRET_VAULT_KEY" ]] || return 1
+  local p
+  if [[ "$1" == "$SAVED_ENC_TAG"?* ]]; then
+    p=$(_vault_open "${1#"$SAVED_ENC_TAG"}") && [[ "$p" == "$SAVED_ENC_CHECK"* ]] || return 1
+    printf '%s' "${p#"$SAVED_ENC_CHECK"}"
+  elif [[ "$1" == "$SAVED_ENC_V1"?* ]]; then
+    # v1 carries no check, so a wrong key is caught by what it decrypts to: a
+    # typed value is UTF-8 text, the garbage almost never is.
+    p=$(_vault_open "${1#"$SAVED_ENC_V1"}") || return 1
+    local LC_ALL=C ctl=$'[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]'
+    [[ "$p" != *$ctl* ]] || return 1
+    printf '%s' "$p" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || return 1
+    printf '%s' "$p"
+  else
+    return 1
+  fi
 }
 
-# rc 0 = the file still holds a value in the clear.
+# rc 0 = the file still holds a value that is not v2 (in the clear, or v1).
 _saved_has_plain() {
   [[ -f "$1" ]] || return 1
   awk -v t="$SAVED_ENC_TAG" '/^[A-Z][A-Z0-9_]*=/ && substr($0, index($0, "=") + 1, length(t)) != t { f = 1; exit }
@@ -279,25 +311,33 @@ _saved_has_plain() {
 }
 
 # DIVE-6973 migration (lock held, root): encrypt every plain line in place, one
-# rename. After it no value is in the file in the clear. Every other line is
-# carried as it is.
+# rename. After it no value is in the file in the clear. DIVE-7274: a v1 line
+# this box can read is rewritten as v2; one it cannot (another box's key) is
+# kept as it is, and `_reveal` refuses it. Every other line is carried as it is.
 _saved_migrate() {
   local f; f=$(_saved_file)
   _saved_has_plain "$f" || return 0
   _vault_key_ensure || fail "$E_GENERIC" "could not make the Vault key $SECRET_VAULT_KEY; nothing was changed"
-  local tmp line enc
+  local tmp line enc mk val plain changed=0
   tmp=$(umask 077; mktemp "${f}.XXXXXX") || fail "$E_GENERIC" "mktemp failed"
   chmod 600 "$tmp"
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ && "${BASH_REMATCH[2]}" != "$SAVED_ENC_TAG"* ]]; then
-      local mk="${BASH_REMATCH[1]}"
-      enc=$(printf '%s' "${BASH_REMATCH[2]}" | _vault_enc) \
-        || { rm -f "$tmp"; fail "$E_GENERIC" "could not encrypt the saved store; nothing was changed"; }
-      printf '%s=%s\n' "$mk" "$enc" >> "$tmp"
+      mk="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+      if [[ "$val" == "$SAVED_ENC_V1"* ]]; then
+        plain=$(_vault_dec "$val") || { printf '%s\n' "$line" >> "$tmp"; continue; }
+        enc=$(printf '%s' "$plain" | _vault_enc); plain=""
+      else
+        enc=$(printf '%s' "$val" | _vault_enc)
+      fi
+      [[ -n "$enc" ]] || { rm -f "$tmp"; fail "$E_GENERIC" "could not encrypt the saved store; nothing was changed"; }
+      printf '%s=%s\n' "$mk" "$enc" >> "$tmp"; changed=1
     else
       printf '%s\n' "$line" >> "$tmp"
     fi
   done < "$f"
+  val=""
+  (( changed )) || { rm -f "$tmp"; return 0; }
   chown root:claude "$tmp" 2>/dev/null || true
   chmod 600 "$tmp"
   mv -f "$tmp" "$f"
