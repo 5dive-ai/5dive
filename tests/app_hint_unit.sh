@@ -26,12 +26,12 @@ export APP_HINT_CONNECTOR_TOKEN="$tmp/connectord.env"
 
 # 1. A self-hosted, unlinked box gets the block: one line and the full link.
 out="$(cmd_app_hint)"
-for needle in "Optional: chat with your agents from your phone, free:" "https://5dive.app/self-host"; do
+for needle in "Optional: chat with your agents from your phone, free:" "https://5dive.ai/self-host"; do
   [[ "$out" == *"$needle"* ]] && ok "block names: $needle" || bad "block is missing: $needle"
 done
 # The old pairing-code steps are gone: one way in, not two.
 for gone in "Paste this on your server" "$install_cmd" "$connect_cmd" \
-            "Your server shows a code" "Type the code" "my.5dive.ai"; do
+            "Your server shows a code" "Type the code" "my.5dive.ai" "5dive.app"; do
   [[ "$out" != *"$gone"* ]] && ok "block no longer has: $gone" || bad "block still has: $gone"
 done
 

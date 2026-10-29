@@ -17,8 +17,12 @@
 # after a reboot (DIVE-6802, docker/README.md).
 FROM ubuntu:22.04
 
+# DIVE-7266: the package page on ghcr.io shows the description and links to the
+# guide. The multi-arch tag ghcr shows is an index, which has no labels of its own,
+# so docker-image.yml's publish job copies description and documentation onto it.
 LABEL org.opencontainers.image.source="https://github.com/5dive-ai/5dive" \
       org.opencontainers.image.description="5dive: a team of AI agents on one box" \
+      org.opencontainers.image.documentation="https://github.com/5dive-ai/5dive/blob/main/docker/README.md" \
       org.opencontainers.image.licenses="MIT"
 
 ENV DEBIAN_FRONTEND=noninteractive \

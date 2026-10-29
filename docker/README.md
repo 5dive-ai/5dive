@@ -6,6 +6,9 @@ the CLI pre-installed.
 
 ## Host it on a Mac mini
 
+The image is `ghcr.io/5dive-ai/5dive` (`latest`, or a release such as
+`v0.107.0`). The compose file below pulls it for you.
+
 Install [Docker Desktop](https://www.docker.com/products/docker-desktop/), then:
 
 ```sh
@@ -28,6 +31,23 @@ The image is built for Apple Silicon (arm64) and Intel (amd64).
   this; do not run it on a computer you share or on a shared server.
 
 The same file works on any Linux box with Docker.
+
+### Without compose
+
+The same thing as one `docker run`:
+
+```sh
+docker run -d --name 5dive --hostname 5dive --privileged --restart unless-stopped \
+  -v 5dive-etc:/etc -v 5dive-home:/home -v 5dive-root:/root \
+  -v 5dive-state:/var/lib/5dive -v 5dive-cron:/var/spool/cron \
+  ghcr.io/5dive-ai/5dive:latest
+docker exec -it 5dive 5dive init
+```
+
+Keep all five volumes. A bare `docker run ghcr.io/5dive-ai/5dive` has none, so
+your agents are gone when the container is replaced, and without `--privileged`
+it does not start at all. To update, `docker pull` the image, `docker rm -f 5dive`
+and run the same line again: the volumes keep your agents.
 
 ## Build
 

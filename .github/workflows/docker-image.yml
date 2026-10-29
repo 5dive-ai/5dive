@@ -30,6 +30,7 @@ on:
       - 'docker/compose.yaml'
       - 'docker/entrypoint.sh'
       - 'docker/persistence-test.sh'
+      - 'docker/README.md'
       - '.github/workflows/docker-image.yml'
 
 concurrency:
@@ -134,5 +135,13 @@ jobs:
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           tags=(-t "$IMAGE:$TAG")
           [[ "$LATEST" == true ]] && tags+=(-t "$IMAGE:latest")
-          docker buildx imagetools create "${tags[@]}" "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
+          # DIVE-7266: ghcr's package page reads the description off the multi-arch
+          # index, not off the per-arch images' labels, so the index carries it too.
+          notes=(
+            --annotation "index:org.opencontainers.image.description=5dive: a team of AI agents on one box"
+            --annotation "index:org.opencontainers.image.documentation=https://github.com/5dive-ai/5dive/blob/main/docker/README.md"
+            --annotation "index:org.opencontainers.image.source=https://github.com/5dive-ai/5dive"
+            --annotation "index:org.opencontainers.image.licenses=MIT"
+          )
+          docker buildx imagetools create "${tags[@]}" "${notes[@]}" "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
           docker buildx imagetools inspect "$IMAGE:$TAG"
