@@ -3180,7 +3180,8 @@ _owner_is_send_target() {
 # DIVE-7164/7236: a send a person made: --from=owner|human from a caller that is
 # no agent seat (root's login shell). An agent cannot claim it from its seat.
 _send_from_person() {
-  [[ "$1" == owner || "$1" == human ]] && ! actor_routing_agent >/dev/null 2>&1
+  [[ "$1" == owner || "$1" == human ]] || return 1
+  ! actor_routing_agent >/dev/null 2>&1
 }
 
 cmd_send() {
