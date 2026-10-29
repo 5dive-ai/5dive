@@ -11,7 +11,8 @@
 # never runs (four of these verbs are root sudo grants). Part C runs mutants of
 # the built bundle and requires each to turn an arm red. Part A grades the
 # install gate: `core` installs only as devteam@5dive-plugins from 5dive's own
-# source, and no plugin may declare a dev-team verb.
+# source, and no plugin may declare a dev-team verb. The D9/B8 arms grade the
+# heartbeat's forge-merge sweep, whose helpers moved into the plugin (DIVE-7244).
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -48,6 +49,15 @@ dv() {  # run the bundle under test (BIN, default BUNDLE): OUT, ERR, RC
   OUT=$(cd "$TMP" && FIVE_LAZY_TRACE=1 bash "$b" "$@" 2>"$TMP/.e"); RC=$?; ERR=$(cat "$TMP/.e")
 }
 LINE="is in the devteam plugin: 5dive plugin install devteam"
+NOTRUN="sweep did NOT run"
+fm() {  # one forge-merge pass, sourced as a tick runs it: prints what it logged
+  ( set +u; source src/header.sh 2>/dev/null; set +e
+    source src/lib/devteam.sh; source src/cmd_heartbeat.sh
+    _hb_log() { printf '%s\n' "$1"; }; db() { :; }   # an empty board
+    _tasks_merge_owner_sql() { printf "''"; }; _TASKS_TFV_SQL=0
+    _devteam_init   # before main, as src/main.sh runs it
+    _hb_forge_merge_sweep ) 2>&1
+}
 
 # =============================================================================
 # Part D — no plugin: the one line, and `done` with and without a bound PR
@@ -94,6 +104,17 @@ tn "D5c no 'command not found' anywhere above" "command not found" "$ERR"
 tc "D6 doctor's line on a box without it" "not installed — this box has no dev-team tools" "$(cat "$TMP/.s")"
 dv selfcheck --only=scorecard-honesty
 tc "D7 selfcheck's scorecard probe is not-reached without it, never a red or a fake pass" "no-devteam" "$OUT$ERR"
+# DIVE-7244: the sweep's helpers are the plugin's, so their absence here is the
+# answer and a tick says nothing (it said "did NOT run" 288 times a day).
+t  "D9 without the plugin a forge-merge pass logs nothing" "" "$(fm)"
+dfm() {  # doctor's forge-merge-poll line: <status> <message>
+  ( set +u; source src/header.sh 2>/dev/null; set +e; source src/lib/devteam.sh; source src/cmd_doctor.sh
+    doctor_add() { printf '%s %s\n' "$3" "$4"; }; doctor_check_forge_merge_poll ) 2>&1
+}
+tc "D9c and doctor says the poll is off, not unmeasured" "ok the forge merge poll is off on this box" "$(dfm)"
+tc "D9b a harness with no plugin loader still gets the loud line" "$NOTRUN —" \
+   "$( ( set +u; source src/header.sh 2>/dev/null; set +e; source src/cmd_heartbeat.sh
+        _hb_log() { printf '%s\n' "$1"; }; _hb_forge_merge_sweep ) 2>&1 )"
 
 # =============================================================================
 # Part B — a fixture plugin, and who may supply it
@@ -115,7 +136,10 @@ fx cmd_deploy.sh 'cmd_deploy() { echo "DEVTEAM-DEPLOY"; }
 cmd_deploy_do() { echo "DEVTEAM-DEPLOY-DO"; }'
 fx lib/gh_config.sh 'gh_config_dir() { echo /nonexistent; }'
 fx task/delivery.sh 'cmd_task_deliver() { echo "DEVTEAM-DELIVER $*"; }
-cmd_task_merge_do() { echo "DEVTEAM-MERGE-DO"; }'
+cmd_task_merge_do() { echo "DEVTEAM-MERGE-DO"; }
+_merge_landed_probe() { :; }
+_task_merge_landed_record() { :; }
+_gate_slug_from_url() { :; }'
 fx task/gate_evidence.sh '_devteam_fixture_gate() { :; }'
 fx task/grader_pool.sh '_devteam_fixture_pool() { :; }'
 fx task/grader_process.sh '_devteam_fixture_process() { :; }'
@@ -145,6 +169,9 @@ for p in "gh x:DEVTEAM-GH x" "push x:DEVTEAM-PUSH x" "push setup:DEVTEAM-PUSH-SE
 done
 ( set +u; source src/header.sh 2>/dev/null; source src/lib/devteam.sh; devteam_status_line ) > "$TMP/.s" 2>&1
 tc "B1f doctor's line names where they come from" "loaded from $VDIR (9 modules)" "$(cat "$TMP/.s")"
+rm -f "$STATE_DIR/forge-merge-poll.reading"
+t  "B1g with the plugin loaded a forge-merge pass logs nothing on an empty board" "" "$(fm)"
+tc "B1h because it ran: it recorded its reading" "class=ok" "$(cat "$STATE_DIR/forge-merge-poll.reading" 2>&1)"
 
 FIVEDIVE_DEVTEAM=0 dv proof x
 tc "B2 FIVEDIVE_DEVTEAM=0 skips the plugin" "$LINE" "$ERR"
@@ -159,6 +186,9 @@ chmod 664 "$VDIR/core/task/delivery.sh"; dv proof x
 tc "B6 a group-writable module is not loaded" "$LINE" "$ERR"
 ( set +u; source src/header.sh 2>/dev/null; source src/lib/devteam.sh; devteam_status_line ) > "$TMP/.s" 2>&1
 tc "B6b and doctor says which file, with the way out" "core/task/delivery.sh is writable by someone other than root. Reinstall" "$(cat "$TMP/.s")"
+tc "B8 a plugin refused at load still logs the forge-merge line, with the reason" \
+   "$NOTRUN (devteam: core/task/delivery.sh is writable by someone other than root" "$(fm)"
+tc "B8b and doctor does not call the poll off" "has taken no reading" "$(rm -f "$STATE_DIR/forge-merge-poll.reading"; dfm)"
 chmod 644 "$VDIR/core/task/delivery.sh"
 chmod 777 "$VDIR/core/task"; dv proof x
 tc "B7 a world-writable module directory is not loaded" "$LINE" "$ERR"
