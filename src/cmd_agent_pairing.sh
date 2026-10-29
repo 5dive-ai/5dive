@@ -392,7 +392,8 @@ _tg_owner_only_ok() {
   [[ "$type" == claude ]] || return 1
   dir=$(sudo -u "$user" jq -r '.plugins["telegram@5dive-plugins"][0].installPath // empty' \
     "${AGENT_HOME_ROOT:-/home}/${user}/.claude/plugins/installed_plugins.json" 2>/dev/null) || return 1
-  [[ -n "$dir" ]] && sudo -u "$user" grep -q 'groupsOwnerOnly' "$dir/groupjoin.ts" 2>/dev/null
+  [[ -n "$dir" ]] || return 1
+  sudo -u "$user" grep -q 'groupsOwnerOnly' "$dir/groupjoin.ts" 2>/dev/null
 }
 
 cmd_telegram_access_groups() {
