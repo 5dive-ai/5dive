@@ -903,7 +903,7 @@ kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
 # rewritten only through the one-time link, listed by NAME, removed by name.
 SAVED="$CONNECTORS_DIR/saved.env"
 rm -f "$SAVED"
-# DIVE-6973: a saved line is v1:<ciphertext>; this reads it back with the box key.
+# DIVE-6973: a saved line is v2:<ciphertext> (DIVE-7274; v1 before it); this reads it back with the box key.
 saved_val() { local l; l=$(sed -n "s/^${1}=//p" "$SAVED" | head -n 1); [[ -n "$l" ]] && _vault_dec "$l"; }
 out=$(mint --save=linkedin-password); rc=$?; tok=$(tok_of "$out"); h=$(hash_of "$tok")
 [[ $rc -eq 0 && -n "$tok" && "$(jq -r '.data.save' <<<"$out")" == linkedin-password ]] \
@@ -929,7 +929,7 @@ code=$(curl -s -o "$TMP/s1.html" -w '%{http_code}' "$B6/$tok")
   || bad_t "L16c the save page" "code=$code $(sed -n 's#.*<main>\(.*\)</main>.*#\1#p' "$TMP/s1.html" | head -c 400)"
 V1='Pa55-word one'
 code=$(curl -s -o "$TMP/s2.html" -w '%{http_code}' --data-urlencode "value=$V1" "$B6/$tok")
-[[ "$code" == 200 && "$(grep -c '^LINKEDIN_PASSWORD=v1:' "$SAVED")" == 1 && "$(saved_val LINKEDIN_PASSWORD)" == "$V1" && "$(stat -c %a "$SAVED")" == 600 ]] \
+[[ "$code" == 200 && "$(grep -c '^LINKEDIN_PASSWORD=v2:' "$SAVED")" == 1 && "$(saved_val LINKEDIN_PASSWORD)" == "$V1" && "$(stat -c %a "$SAVED")" == 600 ]] \
   && ! grep -qF "$V1" "$SAVED" \
   && grep -q '<b>linkedin-password</b> is on your server now' "$TMP/s2.html" \
   && ! grep -qF "$V1" "$TMP/s2.html" && ! grep -qF "$V1" "$TMP/server6.log" \
@@ -1022,9 +1022,9 @@ code=$(curl -s -o "$TMP/p4.html" -w '%{http_code}' --data-urlencode "login=$PL" 
   || bad_t "L17f pair save" "code=$code env=$(cat "$SAVED") hosts=$(cat "$HOSTS")"
 bad=""
 for v in "$PL" "$PP" "$SEED" 'Pa55' 'owner@' old-one-value; do grep -qF -- "$v" "$SAVED" && bad+="[$v] "; done
-[[ -z "$bad" ]] && [[ "$(grep -cE '^[A-Z][A-Z0-9_]*=' "$SAVED")" == "$(grep -cE '^[A-Z][A-Z0-9_]*=v1:' "$SAVED")" ]] \
+[[ -z "$bad" ]] && [[ "$(grep -cE '^[A-Z][A-Z0-9_]*=' "$SAVED")" == "$(grep -cE '^[A-Z][A-Z0-9_]*=v2:' "$SAVED")" ]] \
   && ! grep -qF -- "$PP" "$TMP/p4.html" && ! grep -qF -- "$PP" "$TMP/server7.log" \
-  && ok_t "L17g NEGATIVE CONTROL: saved.env holds no value in the clear after a save (every line v1:), and the page and log never echo it" \
+  && ok_t "L17g NEGATIVE CONTROL: saved.env holds no value in the clear after a save (every line v2:), and the page and log never echo it" \
   || bad_t "L17g plaintext in saved.env" "found: $bad file=$(cat "$SAVED")"
 kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
 
@@ -1033,7 +1033,7 @@ kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
 printf 'OLD_ITEM=plain-old-1\n' >> "$SAVED"
 printf 'GITHUB=github.com\n' > "$HOSTS"
 ls_out=$( (JSON_MODE=1; _secret_saved ls) 2>&1 )
-[[ "$(saved_val OLD_ITEM)" == plain-old-1 ]] && ! grep -qF plain-old-1 "$SAVED" && grep -q '^OLD_ITEM=v1:' "$SAVED" \
+[[ "$(saved_val OLD_ITEM)" == plain-old-1 ]] && ! grep -qF plain-old-1 "$SAVED" && grep -q '^OLD_ITEM=v2:' "$SAVED" \
   && ok_t "L17h migration: a plain saved line is encrypted in place by the first saved verb, and nothing plain is left" \
   || bad_t "L17h migration" "$(cat "$SAVED")"
 want='{"names":["github","old-item"],"items":[{"name":"github","fields":["login","password","2fa"],"login":"owner@example.com","host":"github.com","lastUsedAt":null,"lastUsedBy":null},{"name":"old-item","fields":["value"],"login":null,"host":null,"lastUsedAt":null,"lastUsedBy":null}]}'
@@ -1073,6 +1073,45 @@ r=$( (_secret_reveal --agent=kostya --host=github.com github.password) 2>"$TMP/r
   && ok_t "L17n under another box's key a value is refused ('save it again'), nothing on stdout" \
   || bad_t "L17n wrong key" "rc=$rc out=[$r] err=$(cat "$TMP/rv3.err")"
 cp -p "$TMP/vk.bak" "$VK"
+# DIVE-7274: L17n was a 1-in-256 flake because CBC under a wrong key passes its
+# padding check that often and v1 then answered garbage. A v2 value carries a
+# known prefix, so EVERY wrong key is refused: 400 fresh keys, 0 accepted (the
+# pre-fix tree accepts ~1.5 of them). v1 lines are judged by their text.
+v2line=$(sed -n 's/^GITHUB__PASSWORD=//p' "$SAVED" | head -n 1)
+v1line="v1:$(printf '%s' "$PP" | openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -salt -a -A -pass "file:$VK" 2>/dev/null)"
+[[ "$(_vault_dec "$v1line")" == "$PP" ]] || bad_t "L17s1 a v1 value reads under its own key" "[$(_vault_dec "$v1line")]"
+cp -p "$VK" "$TMP/vk.bak"; chmod 600 "$VK"
+acc2=0 acc1=0 pad=0
+for _ in $(seq 400); do
+  openssl rand -hex 32 > "$VK"
+  _vault_dec "$v2line" >/dev/null 2>&1 && acc2=$((acc2 + 1))
+  _vault_open "${v1line#v1:}" >/dev/null 2>&1 && pad=$((pad + 1))
+  _vault_dec "$v1line" >/dev/null 2>&1 && acc1=$((acc1 + 1))
+done
+cp -p "$TMP/vk.bak" "$VK"
+[[ "$v2line" == v2:* && $acc2 -eq 0 && $acc1 -eq 0 ]] \
+  && ok_t "L17s NEGATIVE CONTROL: 400 fresh wrong keys: every v2 and every v1 value refused ($pad v1 decrypts passed the padding check and were still refused)" \
+  || bad_t "L17s wrong keys accepted" "v2=$acc2 v1=$acc1 pad=$pad line=${v2line:0:3}"
+# A garbage decrypt that passed its padding, as v2 sees it: the right key, no check prefix.
+forged="v2:$(printf 'Pa55-no-prefix' | openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -salt -a -A -pass "file:$VK" 2>/dev/null)"
+r=$(_vault_dec "$forged"); rc=$?
+[[ $rc -ne 0 && -z "$r" ]] \
+  && ok_t "L17t a v2 value whose plaintext lacks the check prefix is refused, nothing on stdout (deterministic L17s)" \
+  || bad_t "L17t forged v2" "rc=$rc out=[$r]"
+# Migration v1 -> v2: a v1 line this box can read becomes v2 on the first root
+# saved verb and reveals the same value; one under another key stays byte-equal.
+cp -p "$SAVED" "$TMP/saved.bak"
+openssl rand -hex 32 > "$TMP/other.key"
+v1other="v1:$(printf 'other-box' | openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -salt -a -A -pass "file:$TMP/other.key" 2>/dev/null)"
+printf 'V1_ITEM=%s\nV1_OTHER=%s\n' "$v1line" "$v1other" >> "$SAVED"
+( (JSON_MODE=1; _secret_saved ls) >/dev/null 2>&1 )
+r=$( (_secret_reveal --agent=kostya --host=github.com v1-item) 2>/dev/null ); rc=$?
+r2=$( (_secret_reveal --agent=kostya --host=github.com v1-other) 2>"$TMP/rv4.err" ); rc2=$?
+[[ "$(sed -n 's/^V1_ITEM=//p' "$SAVED")" == v2:* && "$(saved_val V1_ITEM)" == "$PP" && $rc -eq 0 && "$(jq -r '."v1-item"' <<<"$r")" == "$PP" ]] \
+  && grep -qxF "V1_OTHER=$v1other" "$SAVED" && [[ $rc2 -eq 5 && -z "$r2" ]] && grep -q 'save it again' "$TMP/rv4.err" \
+  && ok_t "L17u migration v1 -> v2: a readable v1 line is rewritten v2 and reveals the same value; another box's v1 line is kept as is and refused" \
+  || bad_t "L17u v1 migration" "rc=$rc rc2=$rc2 env=$(grep '^V1_' "$SAVED")"
+cp -p "$TMP/saved.bak" "$SAVED"
 # `secret write` at the terminal: one field of a pair, the 2FA key normalised; a
 # one-value write drops the pair.
 printf 'otpauth://totp/x?secret=NBSWY3DPEB3W64TMMQ&issuer=x' | ( _secret_write GITHUB__2FA --connector=saved ) >/dev/null 2>&1; rc=$?
