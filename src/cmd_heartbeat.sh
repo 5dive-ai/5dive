@@ -7271,9 +7271,25 @@ _hb_forge_merge_sweep() {
   # mid-self-update can hold a partial tree. Degrade to a no-op — but SAY SO:
   # a silent skip here is indistinguishable from "nothing had merged", which is
   # the exact failure class DIVE-2003 measured one sweep over.
+  #
+  # DIVE-7244: since DIVE-6938 those helpers live in the devteam plugin, so a box
+  # WITHOUT the plugin is a third cause, and on it the absence IS the answer: skip
+  # quietly, as _hb_merge_tick_sweep does. A plugin that is installed but refused
+  # at load keeps the loud line and says why, or it reads like the normal state.
   if ! declare -F _merge_landed_probe      >/dev/null 2>&1 \
      || ! declare -F _task_merge_landed_record >/dev/null 2>&1 \
      || ! declare -F _gate_slug_from_url   >/dev/null 2>&1; then
+    if declare -F _devteam_init >/dev/null 2>&1; then
+      (( ${_DEVTEAM_INIT_DONE:-0} )) || _devteam_init
+      # A box without the plugin has NONE of the three; one present is a partial tree.
+      [[ "$_DEVTEAM_WHY" == "not installed" ]] \
+        && ! declare -F _merge_landed_probe >/dev/null 2>&1 \
+        && ! declare -F _task_merge_landed_record >/dev/null 2>&1 \
+        && ! declare -F _gate_slug_from_url >/dev/null 2>&1 \
+        && return 0
+      _hb_log "[forge-merge] the merge-landing helpers are not loaded in this context; sweep did NOT run (devteam: ${_DEVTEAM_WHY:-loaded but helpers missing}) — no row was read and nothing was written (this is not 'nothing had merged')"
+      return 0
+    fi
     _hb_log "[forge-merge] the merge-landing helpers are not loaded in this context; sweep did NOT run — no row was read and nothing was written (this is not 'nothing had merged')"
     return 0
   fi
