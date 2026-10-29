@@ -806,6 +806,10 @@ _agent_verb_dispatch() {
           # boxes via 5dive-api with a fresh signed --from-url link).
           AUDIT_CMD="agent pack-sync"; AUDIT_ARGS=("<redacted>")
           with_registry_lock cmd_pack_sync "$@" ;;
+        update)
+          # DIVE-7275: re-apply a hired agent's pack over drift (one agent).
+          AUDIT_CMD="agent update"; AUDIT_ARGS=("<redacted>")
+          with_registry_lock cmd_agent_update "$@" ;;
         inspect)
           # DIVE-995: read-only pack disclosure ("this pack runs X") — no lock,
           # no root; the safety precondition before importing a third-party pack.
