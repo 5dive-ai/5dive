@@ -748,24 +748,39 @@ _install_status() {
 # image; upstream only caches sudo when it has a terminal, so here its own
 # package step cannot run and it exits "pm install failed" without naming the
 # package. We are root at this point, so install it before the recipe runs, or
-# fail naming it. <type> -> "<soname>:<debian package>". `-g`: _load_module
-# evals this module inside a function, where a plain `declare` stays local.
+# fail naming it. <type> -> space-separated "<probe>:<debian package>", where
+# a probe with ".so" in it is a library (ldconfig) and anything else a package
+# that must be installed (dpkg-query).
+# DIVE-7330: the pinned hermes (0.21.5) installer refuses to go on without a C++
+# compiler (it builds node-pty) and can only apt-get one with a cached sudo.
+# `-g`: _load_module evals this module inside a function, where a plain
+# `declare` stays local.
 declare -gA TYPE_SYSLIB=(
-  [hermes]="libatomic.so.1:libatomic1"
+  [hermes]="libatomic.so.1:libatomic1 build-essential:build-essential"
 )
 
 _syslib_present() {
+  if [[ "$1" != *.so* ]]; then
+    [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" == "install ok installed" ]]
+    return
+  fi
   # grep without -q: reading all of ldconfig's output avoids SIGPIPE under pipefail.
   { ldconfig -p 2>/dev/null || /sbin/ldconfig -p 2>/dev/null; } | grep -F "$1" >/dev/null
 }
 
-# _install_syslib <type> — no-op unless TYPE_SYSLIB names a missing library.
+# _install_syslib <type> — no-op unless TYPE_SYSLIB names something missing.
 _install_syslib() {
-  local spec="${TYPE_SYSLIB[$1]:-}"
-  [[ -n "$spec" ]] || return 0
+  local spec
+  for spec in ${TYPE_SYSLIB[$1]:-}; do
+    _install_syslib_one "$1" "$spec"
+  done
+}
+
+_install_syslib_one() {
+  local spec="$2"
   local lib="${spec%%:*}" pkg="${spec#*:}"
   _syslib_present "$lib" && return 0
-  local hint="$1 needs the system library $lib (Debian/Ubuntu package: $pkg), and it is not installed on this box. Install it (sudo apt-get install -y $pkg), then retry"
+  local hint="$1 needs $lib (Debian/Ubuntu package: $pkg), and it is not installed on this box. Install it (sudo apt-get install -y $pkg), then retry"
   command -v apt-get >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "$hint"
   step "Installing $pkg ($1 needs $lib)"
   local -a apt=(env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120)

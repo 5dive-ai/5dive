@@ -55,12 +55,24 @@ echo "apt-get \$*" >>"$TMP/calls"
 case "\$*" in
   *" update"*) touch "$TMP/lists-fresh"; exit 0 ;;
 esac
+mark() {
+  case "\$*" in *libatomic1*) touch "$TMP/has-libatomic" ;; esac
+  case "\$*" in *build-essential*) touch "$TMP/has-build-essential" ;; esac
+}
 case "\${APT_MODE:-ok}" in
-  ok) touch "$TMP/has-libatomic"; exit 0 ;;
+  ok) mark "\$@"; exit 0 ;;
   needs-update) [[ -f "$TMP/lists-fresh" ]] || { echo "E: Unable to locate package libatomic1" >&2; exit 100; }
-                touch "$TMP/has-libatomic"; exit 0 ;;
+                mark "\$@"; exit 0 ;;
   *) echo "E: Unable to locate package libatomic1" >&2; exit 100 ;;
 esac
+STUB
+# dpkg-query -W -f='${Status}' <pkg>: installed once the "package" marker exists
+# (DIVE-7330: build-essential, which the pinned hermes installer needs for g++).
+cat >"$TMP/stubs/dpkg-query" <<STUB
+#!/usr/bin/env bash
+pkg="\${@: -1}"
+[[ -f "$TMP/has-\$pkg" ]] && printf 'install ok installed'
+exit 0
 STUB
 # sudo: the recipe hop (bash -lc). RECIPE_MODE ok lands the binary; fail plays
 # upstream's "pm install failed" exit 1 with nothing landed, and so does a
@@ -109,7 +121,7 @@ install() {
   ) && RC=0 || RC=$?
 }
 calls() { cat "$TMP/calls" 2>/dev/null; }
-reset() { rm -rf "${TMP:?}/bin" "$TMP/calls" "$TMP/has-libatomic" "$TMP/lists-fresh"; unset APT_MODE RECIPE_MODE LDCONFIG_LONG LOAD_IN_FUNCTION; }
+reset() { rm -rf "${TMP:?}/bin" "$TMP/calls" "$TMP/has-libatomic" "$TMP/has-build-essential" "$TMP/lists-fresh"; unset APT_MODE RECIPE_MODE LDCONFIG_LONG LOAD_IN_FUNCTION; }
 
 # --- 1. missing libatomic: installed with apt, before the recipe ------------
 reset
@@ -136,13 +148,13 @@ check "apt broken: the recipe never ran" "$(! calls | grep -q '^recipe'; echo $?
 check "apt broken: no 'reported success' line" "$(! grep -q 'reported success' <<<"$ALL"; echo $?)" "$ALL"
 
 # --- 4. already present: apt untouched ----------------------------------------
-reset; touch "$TMP/has-libatomic"
+reset; touch "$TMP/has-libatomic" "$TMP/has-build-essential"
 install hermes
 check "present: exits 0" "$([[ $RC -eq 0 ]]; echo $?)" "rc=$RC out=$ALL"
 check "present: apt-get not called" "$(! calls | grep -q '^apt-get'; echo $?)" "$(calls)"
 
 # --- 5. present at the top of a long ldconfig listing (SIGPIPE) ---------------
-reset; touch "$TMP/has-libatomic"; export LDCONFIG_LONG=1
+reset; touch "$TMP/has-libatomic" "$TMP/has-build-essential"; export LDCONFIG_LONG=1
 install hermes
 check "long ldconfig: still read as present, apt-get not called" "$(! calls | grep -q '^apt-get'; echo $?)" "$(calls)"
 
@@ -153,7 +165,7 @@ check "codex: the install path ran (recipe reached)" "$(calls | grep -q '^recipe
 check "codex: apt-get not called for a type without a system library" "$(! calls | grep -q '^apt-get'; echo $?)" "$(calls)"
 
 # --- 7. the recipe itself fails: say failed, not "reported success" ----------
-reset; touch "$TMP/has-libatomic"; export RECIPE_MODE=fail
+reset; touch "$TMP/has-libatomic" "$TMP/has-build-essential"; export RECIPE_MODE=fail
 install hermes
 check "recipe exit 1: exits non-zero" "$([[ $RC -ne 0 ]]; echo $?)" "out=$ALL"
 check "recipe exit 1: reported as failed with the installer's exit" "$(grep -q 'install failed (installer exit 1)' <<<"$ALL"; echo $?)" "$ALL"
@@ -164,6 +176,20 @@ reset; export LOAD_IN_FUNCTION=1
 install hermes
 check "function-scope load: apt-get still installs libatomic1 for hermes" "$(calls | grep -q '^apt-get .*install .*libatomic1'; echo $?)" "$(calls)"
 check "function-scope load: hermes install exits 0" "$([[ $RC -eq 0 ]]; echo $?)" "rc=$RC out=$ALL"
+
+# --- 9. DIVE-7330: the pinned installer needs a C++ compiler ------------------
+reset; touch "$TMP/has-libatomic"
+install hermes
+check "no compiler: apt-get installs build-essential" "$(calls | grep -q '^apt-get .*install .*build-essential'; echo $?)" "$(calls)"
+check "no compiler: build-essential lands BEFORE the recipe" \
+  "$(a=$(calls | grep -n 'build-essential' | head -1 | cut -d: -f1); r=$(calls | grep -n '^recipe' | head -1 | cut -d: -f1)
+     [[ -n "$a" && -n "$r" && "$a" -lt "$r" ]]; echo $?)" "$(calls)"
+check "no compiler: libatomic1 (present) is not reinstalled" "$(! calls | grep -q 'install .*libatomic1'; echo $?)" "$(calls)"
+check "no compiler: hermes install exits 0" "$([[ $RC -eq 0 ]]; echo $?)" "rc=$RC out=$ALL"
+reset; touch "$TMP/has-libatomic"; export APT_MODE=broken
+install hermes
+check "no compiler, apt broken: fails naming build-essential, recipe never runs" \
+  "$([[ $RC -ne 0 ]] && grep -q 'build-essential' <<<"$ALL" && ! calls | grep -q '^recipe'; echo $?)" "rc=$RC $(calls) $ALL"
 
 echo
 echo "$PASS pass, $FAIL fail"

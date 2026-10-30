@@ -133,10 +133,14 @@ run_arm() {
   (( up )) || finish fail
 
   # The unit and the pane stay up while the harness inside dies: the seat's
-  # tmux loop restarts it forever. Ask the binary itself, as the seat.
+  # tmux loop restarts it forever. Ask the binary itself, as the seat, with the
+  # PATH the seat gets: 5dive-agent-start loads claude's nvm for every type.
   step seat-version
   rc=0
-  out=$(cd / && sudo -u "agent-${name}" -H timeout 60 "$bin" --version 2>&1) || rc=$?
+  out=$(cd / && sudo -u "agent-${name}" -H bash -c 'unset NPM_CONFIG_PREFIX
+    export NVM_DIR=/home/claude/.nvm
+    [[ -s "$NVM_DIR/nvm.sh" ]] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
+    exec timeout 60 "$0" --version' "$bin" 2>&1) || rc=$?
   printf '%s\n' "$out" | tail -5
   (( rc == 0 )) || { DETAIL="$bin --version as agent-${name} exited $rc: $(printf '%s' "$out" | grep -v '^[[:space:]]*$' | tail -1)"; finish fail; }
 

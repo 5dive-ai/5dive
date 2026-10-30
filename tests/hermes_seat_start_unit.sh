@@ -121,7 +121,7 @@ create_src=$(cat src/cmd_agent_create.sh)
 [[ "$create_src" == *'elif [[ -z "$profile" && -s /home/claude/.hermes/config.yaml ]]; then'* ]] \
   && ok_t "no openai-codex pin over the box's own hermes config" || bad_t "the openai-codex pin still runs over the box config"
 smoke_src=$(cat scripts/harness-smoke.sh)
-[[ "$smoke_src" == *'step seat-version'* && "$smoke_src" == *'sudo -u "agent-${name}" -H timeout 60 "$bin" --version'* ]] \
+[[ "$smoke_src" == *'step seat-version'* && "$smoke_src" == *'sudo -u "agent-${name}" -H bash -c'* && "$smoke_src" == *'exec timeout 60 "$0" --version'* ]] \
   && ok_t "the nightly harness smoke runs the harness as the seat" || bad_t "harness smoke has no seat-level start step"
 
 TOTAL=$((PASS+FAIL))
