@@ -86,5 +86,19 @@ en="$(awk '/<!-- apt-lines:start -->/{s=1;next} /<!-- apt-lines:end -->/{s=0} s 
 zh_ok=1; while read -r l; do grep -qxF "$l" README.zh-CN.md || zh_ok=0; done <<<"$en"
 (( zh_ok )) && ok "README.zh-CN carries the same two lines" || bad "README.zh-CN apt lines differ from README.md"
 
+# 6. The upgrade arm's postinst match holds on apt's real output: dpkg runs on
+#    a pty, so each line ends "\r\n" (5dive#1490's first CI run). Still exact.
+apt_out=$'Setting up 5dive (0.108.0) ...\r\nNext: sudo 5dive-setup\r\nSetting up git (1:2.43.0) ...\r'
+up_out=$'Next: sudo 5dive-setup (moves this box from 0.108.0 to 0.108.1)\r'
+if ( . $pk/test-apt.sh
+     said 'Next: sudo 5dive-setup' "$apt_out" \
+     && said 'Next: sudo 5dive-setup (moves this box from 0.108.0 to 0.108.1)' "$up_out" \
+     && ! said 'Next: sudo 5dive-setup' "$up_out" \
+     && ! said 'Next: sudo 5dive-setup' $'xNext: sudo 5dive-setup\r' ); then
+  ok "postinst line matched exactly on CRLF apt output"
+else
+  bad "postinst line match: misses CRLF apt output, or matches a different line"
+fi
+
 echo "# $pass passed, $fail failed"
 (( fail == 0 ))

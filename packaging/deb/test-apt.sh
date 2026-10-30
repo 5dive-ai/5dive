@@ -44,6 +44,15 @@ readme_lines() {
 
 cli_version() { grep -m1 'readonly FIVE_VERSION=' /usr/local/bin/5dive | sed -E 's/.*="([^"]+)".*/\1/'; }
 pkg_version() { dpkg-query -W -f='${Version}' 5dive; }
+# apt runs dpkg (and so postinst) on a pseudo-terminal (Dpkg::Use-Pty), whose
+# ONLCR turns every line postinst prints into "...\r\n". The CI log hides the
+# \r, so an exact-line match on raw apt output never hits. Strip it, then match
+# the WHOLE line: a prefix or a different message is still a miss. No pipe:
+# under pipefail an early-exiting grep -q would SIGPIPE its writer and miss.
+said() { grep -qxF -- "$1" <<<"${2//$'\r'/}"; } # <exact line> <apt output>
+
+# Sourced (tests/apt_package_unit.sh), only the helpers above are defined.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 case "${1:-}" in
   signature)
@@ -82,14 +91,14 @@ case "${1:-}" in
     bash -euo pipefail -c "$(readme_lines "$base" | head -1)"
     apt-get update -qq
     out="$(apt-get install -y "5dive=$old" 2>&1)" || fail "install of $old failed: $out"
-    grep -qx 'Next: sudo 5dive-setup' <<<"$out" || fail "postinst on a new box did not print 'Next: sudo 5dive-setup': $out"
+    said 'Next: sudo 5dive-setup' "$out" || fail "postinst on a new box did not print 'Next: sudo 5dive-setup': $out"
     pass "postinst on a new box: 'Next: sudo 5dive-setup'"
     5dive-setup > /tmp/setup-old.log 2>&1 || { tail -40 /tmp/setup-old.log; fail "5dive-setup at $old failed"; }
     [[ "$(cli_version)" == "$old" ]] || fail "after setup at $old the box runs $(cli_version)"
     pass "box set up at $old"
     out="$(apt-get upgrade -y 2>&1)" || fail "apt-get upgrade failed: $out"
     [[ "$(pkg_version)" == "$new" ]] || fail "apt-get upgrade left the package at $(pkg_version), not $new"
-    grep -qx "Next: sudo 5dive-setup (moves this box from $old to $new)" <<<"$out" \
+    said "Next: sudo 5dive-setup (moves this box from $old to $new)" "$out" \
       || fail "postinst on upgrade did not name the move: $out"
     pass "apt-get upgrade moved the package $old -> $new and said what to run"
     5dive-setup > /tmp/setup-new.log 2>&1 || { tail -40 /tmp/setup-new.log; fail "5dive-setup at $new failed"; }
