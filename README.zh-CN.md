@@ -34,6 +34,15 @@ sudo 5dive init
 
 你只需要一台 Linux 服务器（Ubuntu 22.04 或更新版本），以及你自己的 AI 订阅或 API key，无需 5dive 账号。
 
+**更喜欢用软件包？** 在 Ubuntu 或 Debian 上，先添加我们签名的 apt 源，再安装：
+
+```sh
+curl -fsSL https://5dive-ai.github.io/5dive/apt/5dive.gpg | sudo tee /usr/share/keyrings/5dive.gpg >/dev/null && echo "deb [signed-by=/usr/share/keyrings/5dive.gpg] https://5dive-ai.github.io/5dive/apt stable main" | sudo tee /etc/apt/sources.list.d/5dive.list
+sudo apt update && sudo apt install 5dive && sudo 5dive-setup
+```
+
+然后运行 `sudo 5dive init`。`sudo apt upgrade` 之后，运行 `sudo 5dive-setup` 应用新版本。
+
 整个团队一个应用，无需 bot token：在 [5dive.ai/self-host](https://5dive.ai/self-host) 免费连接你的服务器。
 
 ## 为什么选 5dive

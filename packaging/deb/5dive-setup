@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# DIVE-6800: set up (or update) this box from the installed `5dive` package.
+#
+# Runs the package's own copy of the tag's install.sh against the bundle the
+# package unpacked (REPO=file://), so the box gets exactly the version apt
+# installed and install.sh stays the one place that knows the layout. A box
+# that already has the CLI gets `--upgrade` (keeps agents and state); a new one
+# gets the full install, which is the step that fetches runtimes and creates
+# the `claude` user — the things a Debian postinst must not do.
+set -euo pipefail
+
+BUNDLE="${FIVE_DEB_BUNDLE:-/usr/share/5dive/bundle}"
+LIVE="${FIVE_DEB_LIVE_BIN:-/usr/local/bin/5dive}"
+
+[[ $EUID -eq 0 ]] || { echo "error: run as root: sudo 5dive-setup" >&2; exit 1; }
+[[ -f "$BUNDLE/install.sh" ]] || { echo "error: $BUNDLE/install.sh is missing — reinstall the package: sudo apt install --reinstall 5dive" >&2; exit 1; }
+
+# GH_ORG set skips install.sh's org probe; REPO set skips tag resolution, so
+# what is installed is the bundle on disk and nothing else.
+export REPO="file://$BUNDLE" GH_ORG="${GH_ORG:-5dive-ai}"
+if [[ -x "$LIVE" ]]; then
+  exec bash "$BUNDLE/install.sh" --upgrade
+fi
+exec bash "$BUNDLE/install.sh"

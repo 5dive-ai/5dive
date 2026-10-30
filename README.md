@@ -34,6 +34,17 @@ sudo 5dive init
 
 You need a Linux server (Ubuntu 22.04 or newer) and your own AI subscription or API key, no 5dive account.
 
+**Prefer a package?** On Ubuntu or Debian, add our signed apt repo, then install:
+
+<!-- apt-lines:start -->
+```sh
+curl -fsSL https://5dive-ai.github.io/5dive/apt/5dive.gpg | sudo tee /usr/share/keyrings/5dive.gpg >/dev/null && echo "deb [signed-by=/usr/share/keyrings/5dive.gpg] https://5dive-ai.github.io/5dive/apt stable main" | sudo tee /etc/apt/sources.list.d/5dive.list
+sudo apt update && sudo apt install 5dive && sudo 5dive-setup
+```
+<!-- apt-lines:end -->
+
+Then `sudo 5dive init`. After `sudo apt upgrade`, run `sudo 5dive-setup` to apply the new version.
+
 One app for your whole team, no bot tokens: link your server free at [5dive.ai/self-host](https://5dive.ai/self-host).
 
 ## Why 5dive
