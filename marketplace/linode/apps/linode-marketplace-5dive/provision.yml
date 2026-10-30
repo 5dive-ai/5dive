@@ -1,0 +1,13 @@
+---
+# linode ansible playbook
+
+# linodes
+- name: Setting up environment
+  hosts: localhost
+  connection: local
+  any_errors_fatal: true
+  user: root
+  vars_files: [group_vars/linode/vars]
+  tasks:
+    - name: Generating sudo user password
+      import_tasks: ../linode_helpers/roles/sudouser/tasks/main.yml

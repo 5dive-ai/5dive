@@ -1,0 +1,11 @@
+#!/bin/sh
+# DIVE-6801: the one line a server made from the 5dive image shows at login
+# (SSH and console), until the server is linked to a 5dive account.
+#
+# `5dive _app_hint` owns the "is this server linked?" answer: it prints nothing
+# on a box 5dive built or once the connector holds its token. So the line goes
+# away by itself after linking, and the rule lives in one place.
+cli="${FIVEDIVE_CLI:-/usr/local/bin/5dive}"
+[ -x "$cli" ] || exit 0
+[ -n "$("$cli" _app_hint 2>/dev/null)" ] || exit 0
+echo "Link this server to your 5dive account: https://5dive.ai/self-host"

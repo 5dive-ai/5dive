@@ -1,0 +1,19 @@
+---
+# set app specific ufw rules
+- name: Allow all access to tcp port 22
+  community.general.ufw:
+    rule: allow
+    port: '22'
+    proto: tcp
+
+- name: Allow http
+  community.general.ufw:
+    rule: allow
+    port: '80'
+    proto: tcp
+
+- name: Allow https
+  community.general.ufw:
+    rule: allow
+    port: '443'
+    proto: tcp

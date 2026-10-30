@@ -1,0 +1,26 @@
+---
+# The 5dive installer, from the newest release, the same way a person installs
+# it. It lays down its own packages, the `claude` system user and the CLI.
+- name: Download the 5dive installer
+  ansible.builtin.get_url:
+    url: https://install.5dive.ai
+    dest: /tmp/5dive-install.sh
+    mode: '0700'
+
+- name: Run the 5dive installer
+  ansible.builtin.command:
+    cmd: bash /tmp/5dive-install.sh
+    creates: /usr/local/bin/5dive
+
+- name: Remove the installer
+  ansible.builtin.file:
+    path: /tmp/5dive-install.sh
+    state: absent
+
+# The one login line: how to link this server to a 5dive account. It goes
+# silent by itself once the server is linked.
+- name: Install the 5dive login line
+  ansible.builtin.copy:
+    src: 99-5dive
+    dest: /etc/update-motd.d/99-5dive
+    mode: '0755'
