@@ -881,6 +881,9 @@ wait_agent_input_ready() {
 #             "Detected OPENAI_API_KEY environment variable."
 #   claude  `~/.local/share/claude/versions/2.1.220` (strings)
 #             "Claude account with subscription" / "Anthropic Console account"
+#   grok    `~/.grok/downloads/grok-linux-x86_64` 1.0.70 (strings; DIVE-7340)
+#             "Approve in your browser to finish signing in." / "Waiting for approval..."
+#             "Sign in to Grok" / "Open this URL in your browser to approve:"
 # The codex pair independently CONFIRMS the two rows A-MO7SEN quoted from his own
 # pane in gh#214. Strings we could NOT confirm against a shipped artifact (e.g.
 # "Select login method", "Enter your API key") are deliberately NOT matched here —
@@ -910,6 +913,13 @@ _agent_pane_credential_prompt() {
     && grep -qF 'Sign in with Device Code' <<<"$pane" && return 0
   grep -qF 'Claude account with subscription' <<<"$pane" \
     && grep -qF 'Anthropic Console account' <<<"$pane" && return 0
+  # DIVE-7340: Grok's own sign-in screen (strings of the shipped grok 1.0.70
+  # binary; the first pair is what a signed-out seat showed on a fresh box).
+  # Without it, ask typed the question into this screen and reported OK.
+  grep -qF 'Approve in your browser to finish signing in' <<<"$pane" \
+    && grep -qF 'Waiting for approval' <<<"$pane" && return 0
+  grep -qF 'Sign in to Grok' <<<"$pane" \
+    && grep -qF 'Open this URL in your browser to approve' <<<"$pane" && return 0
 
   # Tier 2 — SECRET ENTRY FIELD, live prompt region only.
   tail_region="$(tail -n 15 <<<"$pane")"
@@ -1034,7 +1044,8 @@ _agent_credential_refusal_msg() {
     return 0
   fi
   why="$(_agent_cred_seed_failure "$name")"
-  local m="refused to send: agent '${name}' is parked on a CREDENTIAL/LOGIN prompt, not a chat input"
+  # DIVE-7340: lead with the plain fact; a newcomer's first ask lands here.
+  local m="refused to send: agent '${name}' is not signed in — it is parked on a CREDENTIAL/LOGIN prompt, not a chat input"
   m+=" — typing there would store the message body as its API key (DIVE-2137, gh#214)."
   if [[ -n "$why" ]]; then
     m+=" Root cause at boot: ${why}"
@@ -2098,37 +2109,103 @@ _ask_timeout_diag() { # <msg-id> <pane-file> [scoped] [warned] [name]
 # fence for it can only be this ask's reply; the echoed instruction holds the
 # two markers adjacent, and _ask_reply_window's fence pass already refuses a
 # pair that encloses nothing. FENCE-ONLY by construction (allow_unfenced=0), so
-# this can never return scraped text. A seat with no Claude transcript (codex,
-# grok, …) simply yields nothing and the pane path is unchanged.
+# this can never return scraped text. A seat with neither transcript (codex, …)
+# simply yields nothing and the pane path is unchanged.
+#
+# DIVE-7340: Grok too. Its full-screen interface never paints the answer at all
+# (measured on a fresh box: the pane showed the question, blank rows and "Worked
+# for 2.3s" while the fenced reply sat in the session file), so on a Grok seat
+# this is the ONLY read that can see a reply. Grok keeps the conversation in
+# ~/.grok/sessions/<cwd>/<session-id>/updates.jsonl, one ACP session update per
+# line; the answer is streamed as `agent_message_chunk` records, so the text is
+# their chunks joined in order. User chunks (the question, which carries the two
+# markers adjacent) are never read.
 #
 # Read AS the seat (the transcript is 0600) and bounded: only the newest two
 # session files, only their last 4 MiB, and a cheap byte test for the opener
 # before any JSON is parsed — this runs once per poll while a reply is missing.
-# FIVE_ASK_TRANSCRIPT_ROOT overrides the projects dir (tests only).
+# FIVE_ASK_TRANSCRIPT_ROOT / FIVE_ASK_GROK_SESSIONS_ROOT override the two
+# directories (tests only).
 _ask_transcript_reply() { # <agent> <msg-id>
   local name="$1" mid="$2" text reply
   [[ "$mid" =~ ^[A-Za-z0-9]{1,32}$ ]] || return 1
   text=$(sudo -n -u "agent-${name}" python3 -c '
 import sys, os, pwd, glob, json
-root, mid = sys.argv[1], sys.argv[2]
+root, mid, groot = sys.argv[1], sys.argv[2], sys.argv[3]
+home = pwd.getpwuid(os.getuid()).pw_dir
 if not root:
-    root = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".claude", "projects")
+    root = os.path.join(home, ".claude", "projects")
+if not groot:
+    groot = os.path.join(home, ".grok", "sessions")
 op = ("<5dive-r:" + mid + ">").encode()
-files = []
-for f in glob.glob(os.path.join(root, "*", "*.jsonl")):
-    try:
-        files.append((os.path.getmtime(f), f))
-    except OSError:
-        pass
-for _, f in sorted(files, reverse=True)[:2]:
+
+def newest(pattern):
+    files = []
+    for f in glob.glob(pattern):
+        try:
+            files.append((os.path.getmtime(f), f))
+        except OSError:
+            pass
+    return [f for _, f in sorted(files, reverse=True)[:2]]
+
+def tail(f):
     try:
         with open(f, "rb") as h:
             h.seek(0, 2)
             n = h.tell()
             h.seek(max(0, n - 4 * 1024 * 1024))
-            raw = h.read()
+            return h.read()
     except OSError:
+        return b""
+
+def find_update(o, depth=0):
+    # The ACP update carrying `sessionUpdate`, wherever the line nests it.
+    if isinstance(o, dict):
+        if isinstance(o.get("sessionUpdate"), str):
+            return o
+        if depth < 4:
+            for v in o.values():
+                u = find_update(v, depth + 1)
+                if u is not None:
+                    return u
+    return None
+
+def chunk_text(c):
+    if isinstance(c, str):
+        return c
+    if isinstance(c, dict):
+        return c.get("text") if c.get("type", "text") == "text" and isinstance(c.get("text"), str) else ""
+    if isinstance(c, list):
+        return "".join(chunk_text(x) for x in c)
+    return ""
+
+for f in newest(os.path.join(groot, "*", "*", "updates.jsonl")):
+    raw = tail(f)
+    if op not in raw:
         continue
+    out, cur = [], []
+    for line in raw.split(b"\n"):
+        if b"sessionUpdate" not in line:
+            continue
+        try:
+            u = find_update(json.loads(line))
+        except ValueError:
+            continue                       # the cut first line, or a half-written last one
+        if u is None:
+            continue
+        if u["sessionUpdate"] == "agent_message_chunk":
+            cur.append(chunk_text(u.get("content")) or "")
+        elif cur:
+            out.append("".join(cur)); cur = []
+    if cur:
+        out.append("".join(cur))
+    text = "\n".join(t for t in out if t)
+    if op.decode() in text:
+        sys.stdout.write(text[text.find(op.decode()):])
+        sys.exit(0)
+
+for f in newest(os.path.join(root, "*", "*.jsonl")):
+    raw = tail(f)
     if op not in raw:
         continue
     out, seen = [], False
@@ -2154,7 +2231,7 @@ for _, f in sorted(files, reverse=True)[:2]:
     if out:
         sys.stdout.write("\n".join(out))
         break
-' "${FIVE_ASK_TRANSCRIPT_ROOT:-}" "$mid" 2>/dev/null) || return 1
+' "${FIVE_ASK_TRANSCRIPT_ROOT:-}" "$mid" "${FIVE_ASK_GROK_SESSIONS_ROOT:-}" 2>/dev/null) || return 1
   [[ -n "$text" ]] || return 1
   reply=$(_ask_reply_window /dev/null /dev/null "$mid" 0 0 <<<"$text") || return 1
   [[ -n "$reply" ]] || return 1

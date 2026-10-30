@@ -1665,9 +1665,15 @@ resolve_agent_model() {
     claude)
       f="$home/.claude/settings.json"
       priv_read "$f" jq -r '.model // empty' "$f" ;;
-    codex|grok)
-      f="$home/.${type}/config.toml"
+    codex)
+      f="$home/.codex/config.toml"
       { priv_read "$f" sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
+        "$f" | head -1; } || true ;;
+    grok)
+      # DIVE-7340: `[models] default` is the key Grok runs on (its /model writes
+      # it); the top-level `model` the old write left behind is ignored by Grok.
+      f="$home/.grok/config.toml"
+      { priv_read "$f" sed -nE '/^[[:space:]]*\[models\][[:space:]]*(#.*)?$/,/^[[:space:]]*\[/s/^[[:space:]]*default[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
         "$f" | head -1; } || true ;;
     antigravity)
       f="$home/.gemini/antigravity-cli/settings.json"
@@ -1735,6 +1741,12 @@ resolve_codex_setting() {
 #     so the key stays document-root-level, never binds to a [section] and never
 #     duplicates (matches telegram-{codex,grok} writeConfigModel()).
 #   - JSON: merge-write the top-level `.model` key, preserving every other key.
+#   - grok TOML (DIVE-7340): Grok reads `[models] default`, not a top-level
+#     `model` — the old top-level write said OK and changed nothing, and xAI's
+#     remote settings went on picking the model. `[models] default` is what
+#     Grok's own /model writes and outranks the remote pick. A stale top-level
+#     `model =` line from the old write is dropped. The value is read back
+#     before we return, so a write Grok would not see fails instead of OK.
 # The runtime config must already exist (every provisioned+started agent has
 # one) — we refuse to create it, both because a bare new file would drop the
 # other required settings and because pre-seeding codex's config.toml would make
@@ -1746,7 +1758,7 @@ write_runtime_model() {
   case "$type" in
     claude)      file="$home/.claude/settings.json"; fmt=json ;;
     codex)       file="$home/.codex/config.toml";     fmt=toml ;;
-    grok)        file="$home/.grok/config.toml";       fmt=toml ;;
+    grok)        file="$home/.grok/config.toml";       fmt=grok ;;
     antigravity) file="$home/.gemini/antigravity-cli/settings.json"; fmt=json ;;
     *) fail "$E_VALIDATION" "type '$type' has no model config (can't set model=)" ;;
   esac
@@ -1770,6 +1782,26 @@ if fmt == "json":
         sys.stderr.write("existing %s is not a JSON object\n" % src); sys.exit(3)
     data["model"] = val
     out = json.dumps(data, indent=2) + "\n"
+elif fmt == "grok":  # [models] default; drop a stale top-level model line
+    line = 'default = "%s"' % val
+    m = re.search(r'^\s*\[', orig, re.M)
+    head = orig if m is None else orig[:m.start()]
+    tail = "" if m is None else orig[m.start():]
+    head = re.sub(r'^[ \t]*model[ \t]*=.*\n?', '', head, flags=re.M)
+    sec = re.search(r'^[ \t]*\[models\][ \t]*(#.*)?$', tail, re.M)
+    if sec is None:
+        body = (head + tail).rstrip("\n")
+        out = (body + "\n\n" if body else "") + "[models]\n" + line + "\n"
+    else:
+        start = sec.end()
+        nxt = re.search(r'^\s*\[', tail[start:], re.M)
+        end = len(tail) if nxt is None else start + nxt.start()
+        block = tail[start:end]
+        if re.search(r'^[ \t]*default[ \t]*=.*$', block, re.M):
+            block = re.sub(r'^[ \t]*default[ \t]*=.*$', line, block, count=1, flags=re.M)
+        else:
+            block = "\n" + line + block
+        out = head + tail[:start] + block + tail[end:]
 else:  # toml — only ever touch the preamble before the first [table] header
     m = re.search(r'^\s*\[', orig, re.M)
     head = orig if m is None else orig[:m.start()]
@@ -1788,6 +1820,12 @@ PY
   chown "$own" "$tmp" 2>/dev/null || true
   chmod 600 "$tmp"
   mv -f "$tmp" "$file"
+  if [[ "$type" == grok ]]; then
+    local got
+    got=$(resolve_agent_model grok "$name")
+    [[ "$got" == "$model" ]] \
+      || fail "$E_GENERIC" "wrote model=$model into $file but Grok would read '${got:-nothing}' there — the model did NOT change"
+  fi
 }
 
 # Write the reasoning effort into claude's settings.json — the top-level
