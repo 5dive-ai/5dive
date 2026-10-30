@@ -105,6 +105,9 @@ install() {
     # guard is lifted only once that is proven.
     [[ "$(type -P sudo)" == "$TMP/stubs/sudo" ]] && unset -f sudo
     set +e
+    # The system-package step (libatomic, build-essential) is hermes_libatomic_install_unit's;
+    # here it would apt-get for real on a runner that lacks one (DIVE-7330).
+    TYPE_SYSLIB[hermes]=""
     # shellcheck disable=SC2034,SC2154  # all read by the sourced cmd_install
     JSON_MODE=1 INSTALL_JOB_DIR="$TMP/jobs" FIVE_INSTALL_SELF="$TMP/fake-5dive" TYPE_BIN[hermes]="$TMP/bin/hermes"
     cmd_install "$@" 2>/dev/null
