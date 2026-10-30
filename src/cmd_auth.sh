@@ -352,7 +352,13 @@ heal_claude_shadow_creds() {
 # the seats that seed from it (profile_creds_secure, src/lib/validation.sh).
 normalize_profile_seed_perms() {
   local profile="${1:-}"
-  [[ -n "$profile" ]] || return 0
+  # DIVE-7335: no account means the default logins (codex/grok write theirs
+  # 0600), so a sign-in on the dashboard or a restart_profile_agents "" heals
+  # them too, not just an account's.
+  if [[ -z "$profile" ]]; then
+    ! declare -F default_creds_secure >/dev/null || default_creds_secure
+    return 0
+  fi
   local root="${AUTH_PROFILES_DIR}/${profile}"
   local type path dir
   for type in codex grok hermes openclaw antigravity; do
