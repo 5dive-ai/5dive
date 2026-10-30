@@ -2935,12 +2935,41 @@ _team_resolve_template() {
     idx=$(_teams_registry_index); rc=$?   # never inside `if !` — see _teams_registry_index
     if (( rc != 0 )); then return $(( 20 + rc )); fi
   fi
-  entry=$(jq -e --arg s "$ref" '.companies[] | select(.slug==$s)' <<<"$idx" 2>/dev/null) || return 1
+  entry=$(_team_registry_entry "$ref" "$idx") || return 1
   path=$(jq -r '.path // empty' <<<"$entry"); [[ -n "$path" ]] || return 3
-  dest="$(mktemp -d)/${ref}.5dive.yaml"
+  dest="$(mktemp -d)/$(jq -r '.slug' <<<"$entry").5dive.yaml"
   _teams_get "$(_teams_registry_base)/$path" "$dest"; rc=$?
   if (( rc != 0 )); then rm -rf "$(dirname "$dest")"; return 4; fi
   printf '%s' "$dest"
+}
+
+# DIVE-7289: a renamed team keeps its old name. An index entry's `aliases` are
+# slugs it used to have (dropshipping -> ecommerce), so a saved command or link
+# still imports it, and `team ls` lists it once, under the new slug.
+# <ref> <index-json> -> that entry, or rc 1.
+_team_registry_entry() {
+  jq -ce --arg s "$1" '
+    [.companies[] | select(.slug == $s or ((.aliases // []) | any(. == $s)))][0]
+    // error("none")' <<<"$2" 2>/dev/null
+}
+
+# <ref> <index-json> -> the project key the team lives under ON THIS BOX. A box
+# that imported it under an old name keeps that key: a new one would record a
+# second team holding the same agents. A box with neither gets the new slug.
+_team_registry_key() {
+  local ref="$1" entry k
+  entry=$(_team_registry_entry "$ref" "$2") || { _team_slug_key "$ref"; return 0; }
+  while IFS= read -r k; do
+    [[ -n "$k" && -n "$(_team_project_row "$k")" ]] && { printf '%s' "$k"; return 0; }
+  done < <(jq -r '.slug, ((.aliases // [])[] | strings)' <<<"$entry")
+  jq -r '.slug' <<<"$entry"
+}
+
+# "1" when this box has a project row for <key>, else nothing.
+_team_project_row() {
+  declare -F db >/dev/null 2>&1 || return 0
+  tasks_db_init 2>/dev/null || return 0
+  db "SELECT 1 FROM projects WHERE key=$(sqlq "$1");" 2>/dev/null | head -1
 }
 
 # -------- DIVE-4822: a team import writes the TEAM ---------------------------
@@ -3357,11 +3386,16 @@ HELP
       local ps_ref="${1:-}"
       if [[ -n "$ps_ref" && "$ps_ref" != --* ]]; then
         shift || true
-        local ps_file ps_rc
-        ps_file=$(_team_resolve_template "$ps_ref") || { ps_rc=$?; _team_resolve_fail "$ps_ref" "$ps_rc"; }
+        local ps_file ps_rc ps_one_idx="" ps_key
+        if [[ ! -f "$ps_ref" ]]; then
+          ps_one_idx=$(_teams_registry_index) || { ps_rc=$(( 20 + $? )); _team_resolve_fail "$ps_ref" "$ps_rc"; }
+        fi
+        ps_file=$(_team_resolve_template "$ps_ref" "$ps_one_idx") || { ps_rc=$?; _team_resolve_fail "$ps_ref" "$ps_rc"; }
         _team_assert_schema "$ps_file" "$ps_ref"
+        ps_key=$(_team_slug_key "$ps_ref")
+        [[ -n "$ps_one_idx" ]] && ps_key=$(_team_registry_key "$ps_ref" "$ps_one_idx")
         local COMPOSE_TEAM_MANIFEST
-        COMPOSE_TEAM_MANIFEST=$(_team_manifest_path "$(_team_slug_key "$ps_ref")")
+        COMPOSE_TEAM_MANIFEST=$(_team_manifest_path "$ps_key")
         cmd_compose_ps -f "$ps_file" "$@"
         return 0
       fi
@@ -3414,7 +3448,7 @@ HELP
         ps_spec=$(TEAM_AUTH_PROFILE="${TEAM_AUTH_PROFILE:-__team_ps__}" _compose_parse "$ps_candidate" 2>/dev/null) || continue
         # DIVE-5606: a seat filled by an agent of another name is present.
         ps_spec=$(_compose_apply_seat_map "$ps_spec" \
-                    "$(_team_seat_map_read "$(_team_slug_key "$ps_slug")" "$ps_reg")") || continue
+                    "$(_team_seat_map_read "$(_team_registry_key "$ps_slug" "$ps_idx")" "$ps_reg")") || continue
         if jq -e --argjson reg "$ps_reg" \
           '(.agents | length) > 0 and ([.agents | keys[] as $n | $reg.agents[$n] != null] | all)' \
           <<<"$ps_spec" >/dev/null; then
@@ -3435,7 +3469,7 @@ HELP
         if (( ${#ps_matches[@]} > 1 )); then
           echo "TEAM  ${ps_names[$ps_i]}"
         fi
-        COMPOSE_TEAM_MANIFEST=$(_team_manifest_path "$(_team_slug_key "${ps_names[$ps_i]}")") \
+        COMPOSE_TEAM_MANIFEST=$(_team_manifest_path "$(_team_registry_key "${ps_names[$ps_i]}" "$ps_idx")") \
           cmd_compose_ps -f "$ps_file" "$@"
         ps_i=$((ps_i+1))
       done
@@ -3496,7 +3530,7 @@ HELP
   [[ -z "$lang" || -n "$(_compose_kickoff_lang_norm "$lang")" ]] \
     || fail "$E_USAGE" "unknown --lang: $lang (known: ru, en, zh)"
 
-  local file="" resolve_rc=0 template_dir=""
+  local file="" resolve_rc=0 template_dir="" reg_idx=""
   if [[ -n "$template_src" ]]; then
     # DIVE-6088: the template is handed in (5dive-api reads it from a partner's
     # private registry, which this box has no credential for). The registry is
@@ -3517,7 +3551,12 @@ HELP
     fi
     [[ -s "$file" ]] || { rm -rf "$template_dir"; fail "$E_USAGE" "the template is empty"; }
   else
-    file=$(_team_resolve_template "$ref") || { resolve_rc=$?; _team_resolve_fail "$ref" "$resolve_rc"; }
+    # Fetched here rather than inside the resolver, so the same index also
+    # names the project key below (DIVE-7289: an old name keeps its key).
+    if [[ ! -f "$ref" ]]; then
+      reg_idx=$(_teams_registry_index) || { resolve_rc=$(( 20 + $? )); _team_resolve_fail "$ref" "$resolve_rc"; }
+    fi
+    file=$(_team_resolve_template "$ref" "$reg_idx") || { resolve_rc=$?; _team_resolve_fail "$ref" "$resolve_rc"; }
   fi
   # Refuse a template this binary cannot read BEFORE the parser sees it. A
   # half-parsed newer schema comes up as a roster missing whatever the new keys
@@ -3580,6 +3619,7 @@ HELP
   # column. That is also why the write happens even when the prefix is empty.
   local slug_key spec_for_prefix root_name
   slug_key=$(_team_slug_key "$ref")
+  [[ -n "$reg_idx" ]] && slug_key=$(_team_registry_key "$ref" "$reg_idx")
 
   # DIVE-5038: persisted BEFORE `up`, because the role text naming it is written
   # on create only. Read by _compose_write_role_md through dynamic scope.
