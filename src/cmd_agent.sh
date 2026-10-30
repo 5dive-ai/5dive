@@ -739,10 +739,16 @@ enabled = {}
 started = {}
 if units:
     try:
-        cp = subprocess.run(
-            ["/usr/bin/systemctl", "show", "--property=Id,ActiveState,UnitFileState,ActiveEnterTimestamp", "--timestamp=unix", "--no-page", *units],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
-        )
+        # DIVE-7331: --timestamp=unix needs systemd 251. Ubuntu 22.04's 249
+        # refuses the whole call ("Invalid value: unix.") and every agent read
+        # STATE unknown, so fall back to --timestamp=utc (247+).
+        for ts_flag in ("--timestamp=unix", "--timestamp=utc"):
+            cp = subprocess.run(
+                ["/usr/bin/systemctl", "show", "--property=Id,ActiveState,UnitFileState,ActiveEnterTimestamp", ts_flag, "--no-page", *units],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
+            )
+            if cp.returncode == 0 or cp.stdout.strip():
+                break
         block = {}
         for line in cp.stdout.splitlines() + [""]:
             if not line:
@@ -1093,10 +1099,17 @@ SEAT_FAILING_TURNS = int(os.environ.get("SEAT_FAILING_TURNS") or 3)
 SEAT_FAILING_SECS = int(os.environ.get("SEAT_FAILING_SECS") or 3600)
 
 def unit_started_epoch(text):
-    # `systemctl show --timestamp=unix` prints "@<epoch>"; unreadable -> 0, which
-    # counts every refusal (unknown is not "restarted since").
-    m = re.match(r"^@([0-9]+)$", (text or "").strip())
-    return int(m.group(1)) if m else 0
+    # `systemctl show --timestamp=unix` prints "@<epoch>", the --timestamp=utc
+    # fallback (systemd 249) "Sun 2026-07-19 13:13:35 UTC"; unreadable -> 0,
+    # which counts every refusal (unknown is not "restarted since").
+    text = (text or "").strip()
+    m = re.match(r"^@([0-9]+)$", text)
+    if m:
+        return int(m.group(1))
+    m = re.match(r"^[A-Za-z]{3} ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)? UTC$", text)
+    if m:
+        return int(dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp())
+    return 0
 
 def _iso_epoch(v):
     ts = re.sub(r"\.[0-9]+", "", str(v or ""))
