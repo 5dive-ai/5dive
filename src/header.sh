@@ -454,6 +454,10 @@ try:
 except sqlite3.Error:
     sys.exit(2)
 '
+# The Hermes release every new install gets (DIVE-7330, see [hermes] below).
+HERMES_PIN_TAG=v2026.9.24
+HERMES_PIN_COMMIT=f97608f178d1ffeca59860195ab7da295f7c8e5f
+
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
 # (caller must hand-install). Idempotent: each recipe checks first.
@@ -550,7 +554,13 @@ declare -A TYPE_INSTALL=(
   # users from traversing it to exec the venv binary — the unit then
   # crash-loops with `binary not installed`. chmod back to 0775 to match
   # the live perms of /home/claude/.opencode and .local/share/claude.
-  [hermes]="[[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup && chmod 0775 /home/claude/.hermes; }"
+  # DIVE-7330: PINNED to Hermes 0.21.5 (tag v2026.9.24), installer and tree
+  # from the same commit. From 0.21.6 on, hermes keeps its dependency env per
+  # HERMES_HOME (<home>/installs/<key>) and refuses to start without one; a
+  # seat runs with its OWN ~/.hermes, so every seat died on its first start
+  # ("no dependency environment is committed for this install"). Move the pin
+  # only after harness-smoke's seat-version step passes on the new commit.
+  [hermes]="[[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_PIN_COMMIT}/scripts/install.sh | bash -s -- --skip-setup --branch ${HERMES_PIN_TAG} --commit ${HERMES_PIN_COMMIT} && chmod 0775 /home/claude/.hermes; }"
   # openclaw's launcher is `#!/usr/bin/env node`, so symlinking only the CLI
   # into ~/.local/bin leaves it unexecutable in systemd/create-time envs where
   # nvm's per-version bin directory is absent from PATH. Install a supported

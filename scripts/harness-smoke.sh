@@ -14,6 +14,9 @@
 #   version        the installed binary does not answer --version
 #   create         `5dive agent create --defer-auth` refused or died
 #   start          the seat's unit or its tmux session did not come up and stay up
+#   seat-version   the binary does not answer --version as the SEAT (its own uid
+#                  and HOME): `version` runs it as claude, whose home holds the
+#                  install, so a harness that only works there passed (DIVE-7330)
 #
 # "Up to just before sign-in" is what --defer-auth means: the seat is made and
 # started with no credential, the state a dashboard "set up later" hire is in.
@@ -128,6 +131,18 @@ run_arm() {
   echo "--- journal ($unit) ---"
   journalctl -u "$unit" --no-pager -n 40 2>/dev/null || true
   (( up )) || finish fail
+
+  # The unit and the pane stay up while the harness inside dies: the seat's
+  # tmux loop restarts it forever. Ask the binary itself, as the seat, with the
+  # PATH the seat gets: 5dive-agent-start loads claude's nvm for every type.
+  step seat-version
+  rc=0
+  out=$(cd / && sudo -u "agent-${name}" -H bash -c 'unset NPM_CONFIG_PREFIX
+    export NVM_DIR=/home/claude/.nvm
+    [[ -s "$NVM_DIR/nvm.sh" ]] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
+    exec timeout 60 "$0" --version' "$bin" 2>&1) || rc=$?
+  printf '%s\n' "$out" | tail -5
+  (( rc == 0 )) || { DETAIL="$bin --version as agent-${name} exited $rc: $(printf '%s' "$out" | grep -v '^[[:space:]]*$' | tail -1)"; finish fail; }
 
   STEP="" DETAIL=""
   finish pass

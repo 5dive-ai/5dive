@@ -105,6 +105,9 @@ install() {
     # guard is lifted only once that is proven.
     [[ "$(type -P sudo)" == "$TMP/stubs/sudo" ]] && unset -f sudo
     set +e
+    # The system-package step (libatomic, build-essential) is hermes_libatomic_install_unit's;
+    # here it would apt-get for real on a runner that lacks one (DIVE-7330).
+    TYPE_SYSLIB[hermes]=""
     # shellcheck disable=SC2034,SC2154  # all read by the sourced cmd_install
     JSON_MODE=1 INSTALL_JOB_DIR="$TMP/jobs" FIVE_INSTALL_SELF="$TMP/fake-5dive" TYPE_BIN[hermes]="$TMP/bin/hermes"
     cmd_install "$@" 2>/dev/null
@@ -206,7 +209,7 @@ check "only systemd-run starts the job (inert systemd-run -> no install ran)" "$
 # which moves the installer into a logind scope outside the unit: a stop or
 # RuntimeMaxSec then leaves it running (measured on a box, DIVE-4973). The job's
 # own run of the recipe must hop WITHOUT -i; the plain blocking path keeps it.
-recipe_hop() { grep -F 'hermes-agent.nousresearch.com/install.sh' "$TMP/sudo-argv" 2>/dev/null | head -1; }
+recipe_hop() { grep -F 'NousResearch/hermes-agent/' "$TMP/sudo-argv" 2>/dev/null | head -1; }
 reset
 FIVE_INSTALL_IN_UNIT=1 install hermes
 hop=$(recipe_hop)
