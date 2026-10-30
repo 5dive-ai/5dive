@@ -2202,11 +2202,22 @@ echo "5dive installed successfully."
 echo
 
 # Show health state immediately so a fresh user knows whether anything is
-# missing (e.g. agent type binaries) before they try to create an agent.
+# missing before they try to create an agent.
 # Fail-soft: doctor itself always exits 0, but `|| true` guards against
 # future regressions so a doctor crash never breaks the install.
+# DIVE-7333: as ONE line. The full report on a fresh box is ~50 checks and ~15
+# warnings that are all expected before `5dive init` (no agent binary yet, no
+# memory pass yet), and it pushed the next step off the screen. Only errors are
+# worth a newcomer's attention here; `5dive doctor` prints the whole report.
 say "Running health check"
-5dive doctor || true
+_doctor_errors=$(5dive doctor --json 2>/dev/null | jq -r '.data.summary.errors // empty' 2>/dev/null || true)
+if [[ "$_doctor_errors" =~ ^[0-9]+$ ]] && (( _doctor_errors > 0 )); then
+  echo "Health check: ${_doctor_errors} problem(s) found. See them with: sudo 5dive doctor"
+elif [[ "$_doctor_errors" =~ ^[0-9]+$ ]]; then
+  echo "Health check: OK"
+else
+  echo "Health check did not finish. Run it with: sudo 5dive doctor"
+fi
 
 # DIVE-758: secure-by-default — new boxes get gate-proof enforcement ON (same as
 # the --upgrade path flips it for existing boxes). Best-effort; never block install.
@@ -2217,10 +2228,10 @@ say "Running health check"
 5dive secret _prewarm >/dev/null 2>&1 || true
 
 echo
-echo "Next steps:"
-echo "  5dive agent list                          # list agents"
-echo "  5dive doctor --repair                     # auto-install agent type binaries"
-echo "  5dive agent create my-agent --type=claude # create your first agent"
+# DIVE-7333: one step, the wizard. It installs the agent's CLI, signs it in and
+# picks a chat, which the three commands that used to be here each skipped.
+echo "Next step: set up your first agent"
+echo "  sudo 5dive init"
 echo
 echo "To upgrade later: sudo 5dive self-update"
 echo "Fallback: curl -fsSL $REPO/install.sh | sudo bash -s -- --upgrade"

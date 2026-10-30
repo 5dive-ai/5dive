@@ -77,6 +77,16 @@ _init_warn() {
   printf '  %s!%s %s\n' "$amber" "$reset" "$*" >&2
 }
 
+# DIVE-7333: Grok agents need the owner's opt-in (5dive grok enable). Run that
+# same warning and y/N here, in a subshell so a refusal (not root, an agent
+# seat) prints its reason and returns instead of ending the wizard.
+_init_grok_on() {
+  [[ -e "$(_grok_marker)" ]] && return 0
+  _init_note "Grok is off on this server. Turn it on first:"
+  ( cmd_grok_enable ) >&2 || true
+  [[ -e "$(_grok_marker)" ]]
+}
+
 # _init_pick <out-var> <title> <default-1-based> <value|label|description>...
 # Arrow keys + j/k move, Enter accepts, and 1-9 are fast direct shortcuts.
 # TERM=dumb gets a plain numbered prompt so serial consoles remain usable.
@@ -309,13 +319,20 @@ USAGE
     [pi]="Pi"
     [devin]="Devin"
   )
+  # DIVE-7333: Grok is off until the owner turns it on, and create refuses it then.
+  # Say so in the menu and ask BEFORE the install and sign-in, not after them.
+  [[ -e "$(_grok_marker)" ]] || type_desc[grok]="xAI Grok CLI — off here, you'll be asked to turn it on"
   local -a type_menu=()
   local t
   for t in "${types[@]}"; do
     type_menu+=("$t|${type_label[$t]}|${type_desc[$t]}")
   done
   local type
-  _init_pick type "Pick an agent type:" 1 "${type_menu[@]}"
+  while true; do
+    _init_pick type "Pick an agent type:" 1 "${type_menu[@]}"
+    if [[ "$type" != "grok" ]] || _init_grok_on; then break; fi
+    _init_note "Grok stays off. Pick another agent type."
+  done
 
   # --- Step 2: install binary if missing ---
   _init_section 2 4 "Connect ${type_label[$type]}" \

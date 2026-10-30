@@ -2044,9 +2044,26 @@ sys.exit(1)
 # [warned] is 1 only when THIS process printed the input-prompt warning; the
 # hint used to point at it unconditionally, and a target with a delivery inbox,
 # or any scoped ask (the warning is _deliver's stderr), never prints one.
-_ask_timeout_diag() { # <msg-id> <pane-file> [scoped] [warned]
-  local mid="$1" f="$2" scoped="${3:-0}" warned="${4:-0}"
-  if _ask_fence_opened "$mid" "$f"; then
+#
+# DIVE-7333: a seat whose AI account refused the turn ("Credit balance too low",
+# a bad key) never fences either, and the "ignored the [reply-format]" verdict
+# sent a newcomer, on init's own first command, to look at formatting. [name]
+# turns on the seat's own transcript reading (seat_account_refusal); the pane
+# text arm covers a seat with no transcript. Lines carrying the question's own
+# marker are skipped, so a question ABOUT a login cannot trip it.
+ASK_PANE_REFUSAL_RE='credit balance (is )?too low|invalid api key|not logged in|please run /login|oauth token (has expired|revoked)|organization has been disabled|billing_error|authentication_(error|failed)'
+_ask_timeout_diag() { # <msg-id> <pane-file> [scoped] [warned] [name]
+  local mid="$1" f="$2" scoped="${3:-0}" warned="${4:-0}" name="${5:-}" refusal=""
+  if [[ -n "$name" ]] && declare -F seat_account_refusal >/dev/null 2>&1; then
+    refusal=$(seat_account_refusal "$name" "$(seat_started_epoch "$name")" 2>/dev/null) || refusal=""
+  fi
+  if [[ -z "$refusal" && -r "$f" ]]; then
+    refusal=$(grep -vF -e "id=${mid}" -e "5dive-r:${mid}" "$f" 2>/dev/null \
+      | grep -ioE "$ASK_PANE_REFUSAL_RE" | head -1) || refusal=""
+  fi
+  if [[ -n "$refusal" ]]; then
+    printf '%s' " — the seat's AI account REFUSED the turn (${refusal}): this is a credit or login problem, not a formatting one, and no retry will answer until it is fixed. Top up or fix the AI account the seat runs on${name:+, then check it: 5dive agent auth status --agent=${name}}"
+  elif _ask_fence_opened "$mid" "$f"; then
     printf '%s' " — the reply fence was OPENED but never completed, so nothing was returned rather than returning the pane's furniture; the seat may still be writing, or its reply scrolled past between polls (try a smaller --poll-secs)"
   elif [[ "$scoped" == 1 ]]; then
     if grep -q '[^[:space:]]' "$f" 2>/dev/null; then
@@ -4070,7 +4087,7 @@ cmd_ask() {
       # with no marker at all (seat ignored the format, or never got the message),
       # and the two need different fixes. Guessing between them cost a round trip.
       local diag
-      diag=$(_ask_timeout_diag "$msg_id" "$acc_file" "$use_scoped" "$ready_warned")
+      diag=$(_ask_timeout_diag "$msg_id" "$acc_file" "$use_scoped" "$ready_warned" "$name")
       if [[ -n "${FIVE_ASK_DEBUG_DIR:-}" ]] && mkdir -p "$FIVE_ASK_DEBUG_DIR" 2>/dev/null; then
         cp -f "$baseline_file" "${FIVE_ASK_DEBUG_DIR}/${msg_id}.baseline" 2>/dev/null || true
         cp -f "$acc_file"      "${FIVE_ASK_DEBUG_DIR}/${msg_id}.transcript" 2>/dev/null || true

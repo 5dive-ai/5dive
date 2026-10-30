@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # DIVE-1380: post-install output promotes the supported self-update command,
 # no longer offers a root crontab (DIVE-6799: `self-update --on` replaces it),
-# and preserves the raw installer upgrade as a fallback.
+# and preserves the raw installer upgrade as a fallback. DIVE-7333: its next
+# step is `sudo 5dive init`, after a one-line health result.
 set -uo pipefail
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
@@ -28,8 +29,26 @@ fi
 
 # Execute only the side-effect-free final echo block so assertions cover the
 # rendered user-facing text (including variable expansion), not just source.
-output="$(sed -n '/^echo "Next steps:"/,$p' install.sh \
+output="$(sed -n '/^echo "Next step: /,$p' install.sh \
   | REPO=https://example.invalid/5dive GH_ORG=5dive-ai bash)"
+
+# DIVE-7333: the one next step is the wizard, and the install no longer ends on
+# the full doctor report (~50 checks, ~15 expected warnings on a fresh box).
+if [[ "$(head -2 <<<"$output" | tail -1)" == "  sudo 5dive init" ]]; then
+  ok_t "the next step on screen is sudo 5dive init"
+else
+  bad_t "next step is not the wizard" "$output"
+fi
+if ! grep -Eq 'doctor --repair|agent create my-agent' <<<"$output"; then
+  ok_t "the old three-command list is gone"
+else
+  bad_t "old next-steps list still printed" "$output"
+fi
+if ! grep -Eq '^5dive doctor( \|\| true)?$' install.sh && grep -Fq '5dive doctor --json' install.sh; then
+  ok_t "install prints a one-line health result, not the doctor report"
+else
+  bad_t "install still dumps the doctor report" "$(grep -n '5dive doctor' install.sh)"
+fi
 
 if grep -Fq 'To upgrade later: sudo 5dive self-update' <<<"$output"; then
   ok_t "self-update is the primary upgrade path"
