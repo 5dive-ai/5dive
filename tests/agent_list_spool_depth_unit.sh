@@ -17,11 +17,14 @@
 #      the legend says the message landed;
 #   E. negative control: an empty spool renders byte-identical to a row from
 #      before the field existed, and prints no spool legend;
-#   F. the `idle (no work)` legend no longer says there was nothing to dispatch.
+#   F. the `idle (no work)` legend no longer says there was nothing to dispatch;
+#   G. the Python snapshot `agent list` really runs (DIVE-4100) reads the same
+#      marker, rootless.
 #
 # MUTATION: drop the `_a2a_spool_mark` call from `_a2a_queue_put` and arm A goes
 # red; drop the one in the sweep's scan loop and arm C goes red; drop `sp_tag`
-# from the row and arm D goes red. On the pre-fix tree the helpers do not exist
+# from the row and arm D goes red; drop `a2aSpooled` from the shaper and arm G
+# goes red. On the pre-fix tree the helpers do not exist
 # and arms A-D fail on the first read.
 #
 # Boundaries only are stubbed: sudo, systemd, tmux delivery, the registry, the
@@ -137,6 +140,16 @@ hasnt 'and no spool legend is printed'         "$ZERO" 'waiting in its spool'
 echo "== F. the idle legend no longer says nothing was waiting =="
 hasnt 'the old claim is gone'                 "$ZERO" 'the tick had nothing to dispatch'
 has   'it points at the spool marker'         "$ZERO" 'N spooled'
+
+echo "== G. the production snapshot (the rootless shaper) reads the marker =="
+SNAP="${TMPROOT}/snap"; mkdir -p "$SNAP/a2a-spool"
+printf '{"agents":{"scout":{"type":"claude","channels":"none"},"head":{"type":"claude","channels":"none"}}}\n' >"$SNAP/agents.json"
+printf '1\n' >"$SNAP/a2a-spool/scout"
+sed -n '/^# __5DIVE_AGENT_LIST_PY_BEGIN__$/,/^# __5DIVE_AGENT_LIST_PY_END__$/p' "$SRC/cmd_agent.sh" >"$SNAP/shaper.py"
+SJ=$(AGENT_ENV_DIR="$SNAP/none" QUOTA_SNAPSHOT_FILE="$SNAP/none" python3 -I "$SNAP/shaper.py" \
+       "$SNAP/agents.json" "$SNAP/none" "$SNAP/none" "$SNAP/none" "$SNAP/none" /w 2>/dev/null)
+is  'a spooled seat carries its depth'      "$(jq -r '.[] | select(.name=="scout") | .a2aSpooled' <<<"$SJ")" '1'
+is  'an empty spool reads 0'                "$(jq -r '.[] | select(.name=="head") | .a2aSpooled' <<<"$SJ")" '0'
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

@@ -1282,6 +1282,18 @@ def org_channel_policy(name, agent_type, channels, profile=""):
 def org_blocked_channels(name, agent_type, channels, profile=""):
     return org_channel_policy(name, agent_type, channels, profile)[0]
 
+# DIVE-7307: a2a messages waiting in the seat's spool. The spool itself sits in
+# the seat's home; its root writers keep this count beside the registry, so the
+# rootless fallback and the root helper read the same number. Absent = 0.
+SPOOL_MARK_DIR = os.path.join(os.path.dirname(registry_path), "a2a-spool")
+
+def a2a_spooled(name):
+    if not name or "/" in name or name.startswith("."):
+        return 0
+    text = read_text(os.path.join(SPOOL_MARK_DIR, name)) or ""
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return int(digits) if digits else 0
+
 def iso_time(epoch):
     if epoch is None:
         return None
@@ -1356,6 +1368,7 @@ for name, value in agents.items():
         "enabled": unit_enabled,
         "operationalState": operational,
         "botToBotEnabled": b2b,
+        "a2aSpooled": a2a_spooled(name),
         "model": model,
         "effort": effort,
         "liveModel": live_model,
