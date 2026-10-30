@@ -231,11 +231,19 @@ t  "arm3: CONTROL — no picker, no new class" "healthy" "$cls"
 t  "arm3: CONTROL — the old detail is unchanged" "active" "$detail"
 
 # A verification challenge outranks it: that is account state a person must
-# clear, and it is the older, louder obligation.
-crow=$(_sup_classify running 1 active agent-dev2 alive n/a 0 1 30 false "" "verify your identity" 0 0 -1 "" unknown \
+# clear, and it is the older, louder obligation. DIVE-7325: a challenge freezes
+# the session, so the seat here is stalled (900s) — the verify branch only fires
+# once the transcript has stopped moving.
+crow=$(_sup_classify running 1 active agent-dev2 alive n/a 0 1 900 false "" "verify your identity" 0 0 -1 "" unknown \
          "Enter to select" recommended)
 t  "arm3: verify-challenge still wins over blocked-on-prompt" \
    "verify-challenge" "$(cut -d$'\x1f' -f1 <<<"$crow")"
+# ...but a challenge PHRASE on a seat whose transcript moved 30s ago is not a
+# challenge (DIVE-7325), so the live picker is what the seat is blocked on.
+crow=$(_sup_classify running 1 active agent-dev2 alive n/a 0 1 30 false "" "verify your identity" 0 0 -1 "" unknown \
+         "Enter to select" recommended)
+t  "DIVE-7325: a challenge phrase with fresh activity yields to the picker" \
+   "blocked-on-prompt" "$(cut -d$'\x1f' -f1 <<<"$crow")"
 
 # ── ARM 4: THE MUTATION ─────────────────────────────────────────────────────
 # Drop the hook install from agent_setup.sh and the channel-less arm must red.
