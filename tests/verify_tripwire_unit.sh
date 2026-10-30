@@ -128,6 +128,61 @@ t "DIVE-4405 control: the same signature without the marker still trips" "trippe
   "$(hit 'To continue, please verify your identity with a government-issued ID')"
 t "DIVE-4405: an all-echo pane is clean, not an error" "clean" "$(hit "$ALERT_ECHO"$'\n'"$ALERT_ECHO")"
 
+# --- DIVE-7325: the agent's own transcript is not a challenge ---------------
+# Page 2 on 2026-10-30: agent-main's reply quoted the positive-control phrase
+# while describing the DIVE-7324 fix. The pattern cannot tell that from a real
+# screen; where the line sits can. Claude's transcript render (an assistant or
+# tool block under ●/⏺, a result under ⎿, a user turn under >, plus indented
+# continuation rows) is dropped before the match.
+CHALLENGE='To continue, please verify your identity with a government-issued ID'
+REPLY=$'● Fixed the word boundary. The positive-control arm still feeds
+  "'"$CHALLENGE"$'" and expects it to trip.
+
+  Pushed as #1481.'
+t "DIVE-7325: an assistant reply quoting the phrase on its lead line is clean" "clean" \
+  "$(hit "● The control line is: $CHALLENGE")"
+t "DIVE-7325: ...the same with the macOS ⏺ lead" "clean" "$(hit "⏺ The control line is: $CHALLENGE")"
+t "DIVE-7325: ...and on an indented continuation row (past a blank row)" "clean" "$(hit "$REPLY")"
+t "DIVE-7325: a tool result quoting it under ⎿ is clean" "clean" \
+  "$(hit $'● Bash(grep -n verify tests/verify_tripwire_unit.sh)\n  ⎿  52:hit()\n     54:'"$CHALLENGE")"
+t "DIVE-7325: a user turn quoting it under > is clean" "clean" "$(hit "> why did '$CHALLENGE' page you?")"
+t "DIVE-7325: an orphaned continuation run at the window top (lead scrolled off) is clean" "clean" \
+  "$(hit $'  '"$CHALLENGE"$'\n  and that is the arm.')"
+# The real shapes still trip: screen text after the transcript, a ╭ dialog drawn
+# indented right under a reply, and the harness's own API Error print with its
+# wrapped continuation.
+t "DIVE-7325: a column-0 screen line after a reply still trips" "tripped" \
+  "$(hit "$REPLY"$'\n'"$CHALLENGE")"
+t "DIVE-7325: an indented ╭ dialog right under a reply still trips" "tripped" \
+  "$(hit "$REPLY"$'\n  ╭──────────────╮\n  │ '"$CHALLENGE"$' │\n  ╰──────────────╯')"
+t "DIVE-7325: ⎿ API Error with the challenge on its wrapped row still trips" "tripped" \
+  "$(hit $'● Working on it.\n  ⎿  API Error: 403 {"error":"permission_error",\n     "message":"'"$CHALLENGE"$'"}')"
+# NEGATIVE CONTROL: drop the transcript filter and the quoting reply trips — the
+# clean arms above prove the filter, not an inert payload.
+( _sup_pane_drop_transcript() { cat; }
+  [[ -n "$(printf '%s\n' "$REPLY" | _sup_verify_match)" ]] && echo tripped || echo clean
+) > "$TMP/nofilter"
+t "DIVE-7325 control: without the transcript filter the quoting reply trips" "tripped" "$(cat "$TMP/nofilter")"
+
+# --- DIVE-7325: the stall gate (pure, in _sup_classify) ----------------------
+# A hit counts only when the transcript has not moved for _SUP_VERIFY_STALL_MIN.
+# args as tests/supervisor_classify_unit.sh: … act_age(9) … verify_excerpt(12)
+vcls() { _sup_classify "" 1 active s unknown n/a 0 1 "$1" false "" "$2" 0 | cut -f1 -d $'\x1f'; }
+t "DIVE-7325: a hit with transcript activity in the window stays clean" "healthy" \
+  "$(vcls 60 "$CHALLENGE")"
+t "DIVE-7325: ...one second inside the window is still clean" "healthy" \
+  "$(vcls $(( _SUP_VERIFY_STALL_MIN * 60 - 1 )) "$CHALLENGE")"
+t "DIVE-7325: a hit with no progress for the stall window trips" "verify-challenge" \
+  "$(vcls $(( _SUP_VERIFY_STALL_MIN * 60 )) "$CHALLENGE")"
+t "DIVE-7325: an unknown transcript age does not clear the hit" "verify-challenge" \
+  "$(vcls -1 "$CHALLENGE")"
+t "DIVE-7325: the stalled detail names how long the transcript sat still" \
+  "pane shows an ID/age-verification challenge and the transcript has not moved for 25m" \
+  "$(_sup_classify "" 1 active s unknown n/a 0 1 1500 false "" "$CHALLENGE" 0 | cut -f3 -d $'\x1f')"
+# NEGATIVE CONTROL: with the window at 0 (gate off) the active seat trips.
+( _SUP_VERIFY_STALL_MIN=0; vcls 60 "$CHALLENGE" ) > "$TMP/nogate"
+t "DIVE-7325 control: drop the stall gate and the active seat trips" "verify-challenge" "$(cat "$TMP/nogate")"
+
 # --- env override: SUPERVISOR_VERIFY_PAT retunes without a release ----------
 ( export SUPERVISOR_VERIFY_PAT='banana-challenge'
   # re-source so the constant picks up the override

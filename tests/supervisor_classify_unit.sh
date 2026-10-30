@@ -129,6 +129,8 @@ t "DIVE-3272: quota signature -> quota-exhausted" \
   $'quota-exhausted\x1fquota-exhausted' "$(cls "" 1 active s unknown n/a 0 1 -1 false "" "" 0 0 -1 "429 quota exhausted")"
 t "DIVE-3272: quota-exhausted beats loop-stuck and no-progress (it explains them)" \
   $'quota-exhausted\x1fquota-exhausted' "$(cls "" 1 active s unknown n/a 1 1 $((_SUP_T_STUCK_MIN * 60)) false "" "" 0 20 "$N" "429 quota exhausted")"
+t "DIVE-7325: a verify hit on a seat whose transcript moved 2m ago falls through to quota-exhausted" \
+  $'quota-exhausted\x1fquota-exhausted' "$(cls "" 1 active s unknown n/a 0 1 120 false "" "ID check pane" 0 0 -1 "429 quota exhausted")"
 t "DIVE-3272: verify-challenge still outranks quota-exhausted" \
   $'verify-challenge\x1fid-verification' "$(cls "" 1 active s unknown n/a 0 1 -1 false "" "ID check pane" 0 0 -1 "429 quota exhausted")"
 t "DIVE-3272: tmux-dead still outranks quota-exhausted (dead unit is more specific)" \
