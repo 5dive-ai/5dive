@@ -179,6 +179,12 @@ _AGENT_LIST_HB_DEFS='
          + (if hb_overdue then "!" else "" end)
          + (if hb_working then " " + hb_reason else "" end)
     end;
+  # DIVE-7307: a2a messages waiting in the spool of the seat. Empty renders nothing,
+  # so a seat with no spool keeps its row byte for byte.
+  def sp_n: (.a2aSpooled // 0) | if type == "number" then . else 0 end;
+  def sp_tag:
+    if sp_n > 0 then (if hb_working then ", " else " " end) + (sp_n | tostring) + " spooled"
+    else "" end;
 '
 
 # The derived heartbeat verdict, for `--json`. The reason string must be
@@ -209,7 +215,7 @@ _agent_list_table() {
   /usr/bin/jq -r --argjson now "$now" "$_AGENT_LIST_HB_DEFS"'
     if length == 0 then "no agents" else
       (["NAME","TYPE","CHANNELS","PROFILE","AUTH","SUDO","STATE","ENABLED"] | @tsv),
-      (.[] | [(.name + hb_badge), .type, .channels, (.authProfile // "-"),
+      (.[] | [(.name + hb_badge + sp_tag), .type, .channels, (.authProfile // "-"),
               (.health.auth.state // "unknown"),
               (if (.sudo.measured | not) then "unknown"
                else .sudo.grant + (if .sudo.diverges then "!" else "" end) + (if .sudo.extraEntries then "+" else "" end) end),
@@ -230,7 +236,15 @@ _agent_list_table() {
     echo
     echo "∿age/cadence — past its cadence, but the last tick's own decision for this seat was not a stall: ${_hb_working}"
     echo "      busy/mid-turn: the age is how long it has been WORKING, not silent — the verb is split the queue or look at the pane, not kick the seat."
-    echo "      idle (no work): the tick had nothing to dispatch. That is not proof of life — for that ask the seat's own artifacts: 5dive liveness --agent=<name> (DIVE-4278)"
+    echo "      idle (no work): the tick had no board task to dispatch. Messages sent to the seat can still be waiting — those show as \`N spooled\` on its row. Not proof of life either — for that ask the seat's own artifacts: 5dive liveness --agent=<name> (DIVE-4278)"
+  fi
+  local _sp_named
+  _sp_named=$(/usr/bin/jq -r --argjson now "$now" "$_AGENT_LIST_HB_DEFS"'
+    [.[] | select(sp_n > 0) | .name + " (" + (sp_n | tostring) + ")"] | join(", ")' <<<"$merged")
+  if [[ -n "$_sp_named" ]]; then
+    echo
+    echo "N spooled — sent while the seat was busy, waiting in its spool: ${_sp_named}"
+    echo "      the message landed: it is typed in at the seat's next idle tick, whatever the row's idle label says. Do not re-send it (DIVE-7307)."
   fi
 }
 
@@ -392,6 +406,11 @@ _cmd_list_legacy() {
     _sg_runas="${_sg#*|}"; _sg_runas="${_sg_runas%%|*}"
     _sg_extra="${_sg##*|}"
     _sg_implied=$(isolation_implied_by_grant "$_sg_class")
+    # DIVE-7307: messages waiting in the seat's a2a spool, from the marker the
+    # root writers keep (the spool itself needs sudo -u; this read does not).
+    local _spooled=0
+    declare -F _a2a_spool_marked >/dev/null 2>&1 && _spooled=$(_a2a_spool_marked "$name" || true)
+    [[ "$_spooled" =~ ^[0-9]+$ ]] || _spooled=0
     enriched=$(jq -c --arg n "$name" --arg a "$active" --arg e "$sub" --argjson b2b "$b2b" \
       --arg model "$amodel" --arg effort "$aeffort" \
       --arg approval "$aapproval" --arg sandbox "$asandbox" --arg configSource "$aconfig_source" \
@@ -402,7 +421,8 @@ _cmd_list_legacy() {
       --arg qState "$_q_state" \
       --arg sgClass "$_sg_class" --arg sgRunas "$_sg_runas" \
       --arg sgExtra "$_sg_extra" --arg sgImplied "$_sg_implied" \
-      '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b,
+      --argjson spooled "$_spooled" \
+      '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b, a2aSpooled: $spooled,
                 model: (if $model == "" then null else $model end),
                 effort: (if $effort == "" then null else $effort end),
                 approvalPolicy: (if $approval == "" then null else $approval end),
@@ -442,6 +462,7 @@ _cmd_list_legacy() {
     enabled: ($live[.key].enabled // "unknown"),
     operationalState: ($live[.key].operationalState // "unknown"),
     botToBotEnabled: ($live[.key].botToBotEnabled // false),
+    a2aSpooled: ($live[.key].a2aSpooled // 0),
     model: ($live[.key].model // null),
     effort: ($live[.key].effort // null),
     approvalPolicy: ($live[.key].approvalPolicy // null),
@@ -1261,6 +1282,18 @@ def org_channel_policy(name, agent_type, channels, profile=""):
 def org_blocked_channels(name, agent_type, channels, profile=""):
     return org_channel_policy(name, agent_type, channels, profile)[0]
 
+# DIVE-7307: a2a messages waiting in the seat's spool. The spool itself sits in
+# the seat's home; its root writers keep this count beside the registry, so the
+# rootless fallback and the root helper read the same number. Absent = 0.
+SPOOL_MARK_DIR = os.path.join(os.path.dirname(registry_path), "a2a-spool")
+
+def a2a_spooled(name):
+    if not name or "/" in name or name.startswith("."):
+        return 0
+    text = read_text(os.path.join(SPOOL_MARK_DIR, name)) or ""
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return int(digits) if digits else 0
+
 def iso_time(epoch):
     if epoch is None:
         return None
@@ -1335,6 +1368,7 @@ for name, value in agents.items():
         "enabled": unit_enabled,
         "operationalState": operational,
         "botToBotEnabled": b2b,
+        "a2aSpooled": a2a_spooled(name),
         "model": model,
         "effort": effort,
         "liveModel": live_model,
