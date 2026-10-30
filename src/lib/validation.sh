@@ -236,6 +236,13 @@ valid_channel() {
   return 0
 }
 
+# DIVE-7347: the runtimes the web chat (channels=dashboard) can reach — Claude
+# by native push, Codex through its dispatcher, Grok through the dashboard
+# server's pane bridge. The one list every channels=dashboard check reads.
+type_has_web_chat() {
+  case "${1:-}" in claude|codex|grok) return 0 ;; *) return 1 ;; esac
+}
+
 # True when <channel> appears in the comma-separated channels <list>.
 # Every consumer of AGENT_CHANNELS / registry .channels must use this instead
 # of an exact string compare — "telegram,dashboard" != "telegram" silently

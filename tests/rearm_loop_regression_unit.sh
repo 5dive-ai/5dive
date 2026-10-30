@@ -134,6 +134,10 @@ kick_block_pattern() { # <type>
     codex)
       printf '%s\n' '^if \[\[ "\$TYPE" == "codex" && "\$CHANNELS" == "telegram" && "\$BIN" == "\$CODEX_REAL_BIN" \]\]; then$'
       ;;
+    # DIVE-7347: a web-chat-only grok seat is kicked too.
+    grok)
+      printf '%s\n' '^if \[\[ "\$TYPE" == "grok" && \( ",\$\{CHANNELS\}," == \*,telegram,\* \|\| ",\$\{CHANNELS\}," == \*,dashboard,\* \) \]\]; then$'
+      ;;
     *)
       printf '%s\n' '^if \[\[ "\$TYPE" == "'"$1"'" && "\$CHANNELS" == "telegram" \]\]; then$'
       ;;

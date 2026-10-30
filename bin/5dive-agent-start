@@ -288,7 +288,8 @@ case "$CH" in
     case "$TYPE" in
       claude) ARGS+=(--channels "plugin:dashboard@5dive-plugins") ;;
       codex) : ;; # app-server dispatcher selected in the type dispatch
-      *) echo "channels=dashboard requires type=claude or codex (got type=$TYPE)" >&2; exit 2 ;;
+      grok) : ;;  # DIVE-7347: MCP server wired into ~/.grok/config.toml below
+      *) echo "channels=dashboard requires type=claude, codex or grok (got type=$TYPE)" >&2; exit 2 ;;
     esac ;;
   # DIVE-2895 Buzz (Nostr) channel — claude-only, same shape as dashboard. The
   # plugin polls the relay itself and reads its keypair + watched channel UUIDs
@@ -771,7 +772,7 @@ fi
 #      up in the merged set). Atomic mv-into-place so we can re-render on
 #      every boot to pick up plugin-dir changes without leaving a partial
 #      file under a crash.
-if [[ "$TYPE" == "grok" ]] && [[ "$CHANNELS" == "telegram" ]]; then
+if [[ "$TYPE" == "grok" ]] && [[ ",${CHANNELS}," == *,telegram,* ]]; then
   AGENT_GROK_HOME="$HOME/.grok"
   install -d -m 700 "$AGENT_GROK_HOME"
   GROK_PLUGIN_DIR=""
@@ -831,6 +832,43 @@ HOOKS_JSON
     mv "$HOOKS_TMP" "$AGENT_GROK_HOME/hooks/5dive-telegram.json"
   else
     echo "warn: telegram channel set for grok agent '$NAME' but telegram-grok plugin not found (TELEGRAM_GROK_PLUGIN_DIR / /usr/local/lib/5dive/telegram-grok / 5dive-plugins checkout) — MCP + hooks not wired" >&2
+  fi
+fi
+
+# DIVE-7347: the web chat for a grok agent. Grok spawns the dashboard server
+# like its Telegram one; `--runtime=grok` makes that server type each web-chat
+# message into this pane and read Grok's answer back from its session file
+# (plugins/dashboard/grokdispatch.ts). The block is rewritten on every boot and
+# removed when dashboard leaves CHANNELS, so turning the chat off really stops
+# the server that answers it.
+if [[ "$TYPE" == "grok" ]]; then
+  AGENT_GROK_HOME="$HOME/.grok"
+  GROK_CFG="$AGENT_GROK_HOME/config.toml"
+  if [[ -f "$GROK_CFG" ]] && grep -q '^\[mcp_servers\.dashboard\]' "$GROK_CFG" 2>/dev/null; then
+    # Drop the old block: from its header to the next table header.
+    GROK_CFG_TMP=$(mktemp -p "$AGENT_GROK_HOME" .config.toml.XXXXXX)
+    awk '/^\[/ { skip = ($0 == "[mcp_servers.dashboard]") } !skip' "$GROK_CFG" > "$GROK_CFG_TMP" \
+      && chmod 600 "$GROK_CFG_TMP" && mv "$GROK_CFG_TMP" "$GROK_CFG" || rm -f "$GROK_CFG_TMP"
+  fi
+  if [[ ",${CHANNELS}," == *,dashboard,* ]]; then
+    DASH_PLUGIN_DIR=""
+    for _c in "${DASHBOARD_PLUGIN_DIR:-}" \
+              /usr/local/lib/5dive/dashboard \
+              /home/claude/projects/5dive/5dive-plugins/plugins/dashboard; do
+      [[ -n "$_c" && -f "$_c/server.ts" ]] && { DASH_PLUGIN_DIR="$_c"; break; }
+    done
+    if [[ -n "$DASH_PLUGIN_DIR" ]]; then
+      install -d -m 700 "$AGENT_GROK_HOME"
+      [[ -f "$GROK_CFG" ]] || { : > "$GROK_CFG"; chmod 600 "$GROK_CFG"; }
+      cat >> "$GROK_CFG" <<TOML
+
+[mcp_servers.dashboard]
+command = "bun"
+args = ["${DASH_PLUGIN_DIR}/server.ts", "--runtime=grok"]
+TOML
+    else
+      echo "warn: dashboard channel set for grok agent '$NAME' but the dashboard plugin was not found (DASHBOARD_PLUGIN_DIR / /usr/local/lib/5dive/dashboard / 5dive-plugins checkout) — web chat not wired" >&2
+    fi
   fi
 fi
 
@@ -2302,8 +2340,13 @@ coldstart_kick_never_typed() { # <label> <why: marker|pane>
 # — the server-side watchdog handles every subsequent re-arm. The send is
 # coldstart_kick_submit, which VERIFIES its own Enter (DIVE-3791); it used to
 # fire Enter blind under a comment noting this TUI drops folded Enters.
-if [[ "$TYPE" == "grok" && "$CHANNELS" == "telegram" ]]; then
+# DIVE-7347: a web-chat-only grok seat needs the same kick (its dashboard MCP
+# server loads with the session), but it has no Telegram loop to start.
+if [[ "$TYPE" == "grok" && ( ",${CHANNELS}," == *,telegram,* || ",${CHANNELS}," == *,dashboard,* ) ]]; then
   (
+    if [[ ",${CHANNELS}," != *,telegram,* ]]; then
+      COLDSTART_KICK_TEXT='Automated start: the 5dive web chat is connected to this session. Nothing to do now; end your turn.'
+    fi
     # Loop exhaustion is a REPORTED outcome, not a fall-through (DIVE-3793).
     _kick_state=marker
     for _ in $(seq 1 24); do
