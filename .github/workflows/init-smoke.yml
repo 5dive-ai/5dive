@@ -1,0 +1,252 @@
+name: init-smoke
+
+# DIVE-7337 — what a new customer does, every night: a FRESH Ubuntu 22.04 and
+# 24.04, install.sh, `5dive init` answered on a real terminal, then one real
+# question to the new agent, graded on the agent's own answer.
+#
+# Why this exists: harness-smoke.yml stops just before sign-in and makes no AI
+# call, so it was green on everything the 2026-10-30 init QA found: a Hermes
+# agent dead on arrival (DIVE-7330), Codex and Grok signed out (DIVE-7335),
+# `agent list` blind on 22.04 (DIVE-7331). Both the self-check and `agent
+# list` said "ready" on the dead agent; only its reply could not lie.
+#
+# One cell per (agent type with a key path, OS): Claude Code, OpenClaw and
+# Hermes (sandboxed and standard) on the Anthropic test key, Codex on the
+# OpenAI one. Sign-in-only paths (ChatGPT, Grok) stay manual. Every seat is
+# pinned to the cheapest model before its first message: about 10 short turns
+# a night. A red cell is named "<cell> / ubuntu-<os>" and its log ends with
+#   INIT-SMOKE FAIL cell=<cell> os=<os> step=<step>: <what failed>
+#
+# KEYS: repo secrets INIT_SMOKE_ANTHROPIC_API_KEY and INIT_SMOKE_OPENAI_API_KEY.
+# A cell whose secret is unset still runs install, init and the model pin on a
+# placeholder key, and reports SKIP at step=reply (neutral, not red). Pull
+# requests never get a key: they check the rig, and spend nothing.
+#
+# WHERE A RED LANDS: like harness-smoke, the verdict job posts one `init-smoke`
+# check-run onto main's tip, which release-cut.yml reads, so a red holds the
+# next nightly cut. All-skip posts `neutral`, which the cut does not hold on.
+#
+# NEGATIVE CONTROL: dispatch with cli_ref=<a sha before a fix> and cells=<cell>.
+
+on:
+  schedule:
+    # 20:10Z: after harness-smoke (19:40Z), before the 23:50Z cut even when
+    # GitHub starts a schedule ~3h late.
+    - cron: '10 20 * * *'
+  workflow_dispatch:
+    inputs:
+      cells:
+        description: 'Comma-separated cells (claude, openclaw, hermes-sandboxed, hermes-standard, codex). Blank = all.'
+        required: false
+        default: ''
+      os:
+        description: 'Ubuntu versions: both, 22.04 or 24.04.'
+        required: false
+        default: 'both'
+      cli_ref:
+        description: 'Install the CLI from this ref instead of the run ref (negative control). A run with this set never posts to main.'
+        required: false
+        default: ''
+  pull_request:
+    paths:
+      - '.github/workflows/init-smoke.yml'
+      - 'scripts/init-smoke.sh'
+      - 'scripts/init-smoke-drive.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: init-smoke-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      cells: ${{ steps.plan.outputs.cells }}
+      oses: ${{ steps.plan.outputs.oses }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        env:
+          WANT_CELLS: ${{ inputs.cells }}
+          WANT_OS: ${{ inputs.os || 'both' }}
+        run: |
+          all=$(bash scripts/init-smoke.sh list-cells)
+          cells="$all"
+          if [ -n "$WANT_CELLS" ]; then
+            cells=""
+            for c in $(echo "$WANT_CELLS" | tr ',' ' '); do
+              echo "$all" | grep -qx "$c" || { echo "::error::unknown cell '$c' (cells: $(echo "$all" | tr '\n' ' '))"; exit 1; }
+              cells="$cells $c"
+            done
+          fi
+          case "$WANT_OS" in
+            both) oses='["22.04","24.04"]' ;;
+            22.04|24.04) oses="[\"$WANT_OS\"]" ;;
+            *) echo "::error::os must be both, 22.04 or 24.04 (got '$WANT_OS')"; exit 1 ;;
+          esac
+          # shellcheck disable=SC2086 # one cell per word, split on purpose
+          m=$(printf '%s\n' $cells | jq -Rnc --argjson o "$oses" \
+            '[inputs | select(length > 0)] as $c | {include: [$o[] as $os | $c[] | {cell: ., os: $os}]}')
+          echo "cells=$m" >> "$GITHUB_OUTPUT"
+          echo "oses=$oses" >> "$GITHUB_OUTPUT"
+          echo "$m" | jq .
+
+  # The fresh box: harness-smoke's cloud-image Dockerfile, built once per OS.
+  image:
+    needs: plan
+    name: image / ubuntu-${{ matrix.os }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.plan.outputs.oses) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the cloud-image box
+        env:
+          OS: ${{ matrix.os }}
+        run: |
+          mkdir -p /tmp/ctx
+          docker build -f docker/harness-smoke.Dockerfile --build-arg "UBUNTU=$OS" -t "is:$OS" /tmp/ctx
+          docker save "is:$OS" | gzip -1 > "/tmp/is-$OS.tar.gz"
+          ls -lh "/tmp/is-$OS.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.os }}
+          path: /tmp/is-${{ matrix.os }}.tar.gz
+          retention-days: 1
+          compression-level: 0
+
+  smoke:
+    needs: [plan, image]
+    name: ${{ matrix.cell }} / ubuntu-${{ matrix.os }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan.outputs.cells) }}
+    env:
+      CELL: ${{ matrix.cell }}
+      OS: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: smoke
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.cli_ref || github.sha }}
+          path: tree
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ matrix.os }}
+          path: /tmp/img
+      - name: Boot the fresh box
+        run: |
+          gunzip -c "/tmp/img/is-$OS.tar.gz" | docker load
+          docker run -d --privileged --name is "is:$OS"
+          timeout 120 docker exec is systemctl is-system-running --wait || true
+          docker exec is systemctl is-system-running || true
+      - name: Stage the tree under test as the install source
+        run: |
+          (cd tree && ./build.sh)
+          mkdir -p /tmp/bundle
+          cp -r tree/5dive tree/install.sh tree/bin tree/prompts tree/hooks tree/systemd /tmp/bundle/
+          ln -s 5dive-agent@.service '/tmp/bundle/systemd/5dive-agent%40.service'
+          docker cp /tmp/bundle/. is:/opt/5dive-bundle
+          docker cp smoke/scripts/init-smoke.sh is:/usr/local/sbin/init-smoke
+          docker cp smoke/scripts/init-smoke-drive.py is:/usr/local/sbin/init-smoke-drive
+          echo "CLI under test: $(git -C tree rev-parse HEAD)"
+      - name: Install, init, pin the cheapest model, first reply
+        env:
+          # Pull requests never get a key (they run the rig on a placeholder).
+          ANTHROPIC_KEY: ${{ github.event_name != 'pull_request' && secrets.INIT_SMOKE_ANTHROPIC_API_KEY || '' }}
+          OPENAI_KEY: ${{ github.event_name != 'pull_request' && secrets.INIT_SMOKE_OPENAI_API_KEY || '' }}
+        run: |
+          case "$CELL" in codex) key="$OPENAI_KEY" ;; *) key="$ANTHROPIC_KEY" ;; esac
+          rc=0
+          INIT_SMOKE_KEY="$key" docker exec -e INIT_SMOKE_KEY is /usr/local/sbin/init-smoke run "$CELL" "ubuntu-$OS" || rc=$?
+          mkdir -p /tmp/result
+          if ! docker cp is:/init-smoke-result.json "/tmp/result/$CELL-$OS.json" 2>/dev/null; then
+            jq -nc --arg c "$CELL" --arg o "ubuntu-$OS" --arg rc "$rc" \
+              '{cell:$c, os:$o, step:"container", result:"fail", detail:("the arm exited " + $rc + " without writing a result")}' \
+              > "/tmp/result/$CELL-$OS.json"
+            rc=1
+          fi
+          cat "/tmp/result/$CELL-$OS.json"
+          exit "$rc"
+      - if: always()
+        name: Keep the init log
+        run: docker cp is:/tmp/init.log "/tmp/result/$CELL-$OS-init.log" 2>/dev/null || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.cell }}-${{ matrix.os }}
+          path: /tmp/result/
+          retention-days: 14
+
+  verdict:
+    needs: [plan, image, smoke]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: /tmp/results
+          merge-multiple: true
+      - name: One line per agent type and OS
+        env:
+          CELLS: ${{ needs.plan.outputs.cells }}
+          GH_TOKEN: ${{ github.token }}
+          POST: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !inputs.cli_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          red=0 skip=0 lines=""
+          for row in $(echo "$CELLS" | jq -c '.include[]'); do
+            c=$(echo "$row" | jq -r .cell); o=$(echo "$row" | jq -r .os)
+            f="/tmp/results/$c-$o.json"
+            if [ -f "$f" ]; then
+              r=$(jq -r .result "$f"); s=$(jq -r .step "$f"); d=$(jq -r .detail "$f")
+            else
+              r=fail; s=image; d="no result: the cell never ran its arm (see image / ubuntu-$o)"
+            fi
+            case "$r" in
+              pass) lines="$lines| $c | ubuntu-$o | ✅ answered its first question | |"$'\n' ;;
+              skip) skip=$((skip + 1))
+                    lines="$lines| $c | ubuntu-$o | ⏭ no test key | $d |"$'\n' ;;
+              *)    red=$((red + 1))
+                    lines="$lines| $c | ubuntu-$o | ❌ $s | $d |"$'\n'
+                    echo "::error::init-smoke: $c on ubuntu-$o failed at step=$s: $d" ;;
+            esac
+          done
+          total=$(echo "$CELLS" | jq '.include | length')
+          { echo "## init-smoke: $((total - red - skip)) of $total answered, $red failed, $skip without a key"
+            echo
+            echo "| agent | OS | result | what failed |"
+            echo "|---|---|---|---|"
+            printf '%s' "$lines"; } | tee -a "$GITHUB_STEP_SUMMARY" > /tmp/summary.md
+
+          if [ "$POST" = true ]; then
+            tip=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+            if [ "$red" -gt 0 ]; then
+              concl=failure; title="$red of $total new agents failed between install and their first reply"
+            elif [ "$skip" -gt 0 ]; then
+              concl=neutral; title="$skip of $total cells had no test key; the rest answered"
+            else
+              concl=success; title="every new agent answered its first question on fresh Ubuntu"
+            fi
+            jq -n --arg sha "$tip" --arg c "$concl" --arg t "$title" --arg url "$RUN_URL" \
+              --rawfile s /tmp/summary.md \
+              '{name:"init-smoke", head_sha:$sha, status:"completed", conclusion:$c, details_url:$url,
+                output:{title:$t, summary:$s}}' \
+              | gh api "repos/$GITHUB_REPOSITORY/check-runs" --input - --jq '"posted init-smoke=" + .conclusion + " on main@" + .head_sha'
+          fi
+          [ "$red" -eq 0 ]
