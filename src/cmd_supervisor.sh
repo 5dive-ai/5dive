@@ -409,6 +409,13 @@ _sup_restart_verify() {
 # (e.g. this very task's chatter). claude-only — the lever is consumer-auth.
 _SUP_VERIFY_PANE_LINES="${SUPERVISOR_VERIFY_PANE_LINES:-40}"
 [[ "$_SUP_VERIFY_PANE_LINES" =~ ^[0-9]+$ ]] || _SUP_VERIFY_PANE_LINES=40
+# DIVE-7325: a hit trips only once the transcript has not moved for this many
+# minutes. A real challenge blocks the session; an agent describing one keeps
+# writing turns. Read off the same act_age the stuck/slow branches use, and an
+# UNKNOWN age (unreadable transcript root) does not clear the hit: a gate that
+# could not look is not evidence of progress.
+_SUP_VERIFY_STALL_MIN="${SUPERVISOR_VERIFY_STALL_MIN:-10}"
+[[ "$_SUP_VERIFY_STALL_MIN" =~ ^[0-9]+$ ]] || _SUP_VERIFY_STALL_MIN=10
 # Alerts are deduped one-per-account per this window (same-day intent) so a
 # challenge that persists across ticks pings main+lodar once, not every 10m.
 _SUP_ALERT_WINDOW_H="${SUPERVISOR_ALERT_WINDOW_H:-24}"
@@ -556,12 +563,44 @@ _sup_probe_state() {
   printf 'ok'
 }
 
+# ── DIVE-7325: THE AGENT'S OWN TRANSCRIPT IS NOT A CHALLENGE ───────────────
+#
+# 2026-10-30 13:3xZ: agent-main's own reply quoted the tripwire's positive-
+# control phrase while describing a fix to it, and lodar was paged. The pattern
+# cannot help (the text WAS a directive phrase); what tells it apart is WHERE it
+# sits. Claude renders the transcript as blocks — an assistant turn or a tool
+# call under the `●`/`⏺` lead, a tool result under `⎿`, a user turn under `>`,
+# each followed by indented continuation rows — and a challenge is a harness
+# screen OUTSIDE that render. So the verify match only reads what is left
+# after these blocks are dropped:
+#   - a lead line drops itself and the indented/blank rows under it;
+#   - an indented run at the TOP of the window is an orphaned continuation
+#     whose lead scrolled off, and drops the same way;
+#   - a column-0 line, or a `╭` dialog frame (Ink's rounded box; markdown
+#     tables render square `┌`), is screen and restores reading;
+#   - an `API Error` behind `●`/`⎿` is the harness's own print, not the
+#     agent's, and is READ with its continuation — an account refusal is the
+#     likeliest shape a real challenge arrives in.
+# RESIDUAL, signed: an interstitial drawn INDENTED, with no `╭` frame, right
+# under a transcript block is dropped as continuation. The stall gate in
+# _sup_classify is the second layer, not a backstop for that.
+_sup_pane_drop_transcript() {  # <pane-text-on-stdin>
+  awk '
+    /^[[:space:]]*(●|⏺|⎿)[[:space:]]*API Error/ { keep = 1; print; next }
+    /^[[:space:]]*(●|⏺|⎿|>)/                     { keep = 0; next }
+    /^[[:space:]]*╭/                              { keep = 1; print; next }
+    /^[[:space:]]/ || /^$/                        { if (keep) print; next }
+                                                  { keep = 1; print }
+  '
+}
+
 # DIVE-1127: pure signature match, no I/O — echoes the first pane line that looks
 # like an ID/age-verification challenge (trimmed), empty otherwise. Split out from
 # _sup_verify_challenge so the false-positive-critical regex is unit-testable
 # without a live tmux (mirrors how _sup_act_plan is the pure, tested core).
 _sup_verify_match() {  # <pane-text-on-stdin>
-  _sup_pane_drop_echoes | grep -iE "$_SUP_VERIFY_PAT" 2>/dev/null | head -1 \
+  _sup_pane_drop_echoes | _sup_pane_drop_transcript \
+    | grep -iE "$_SUP_VERIFY_PAT" 2>/dev/null | head -1 \
     | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
 }
 
@@ -2451,9 +2490,19 @@ _sup_classify() {
   # DIVE-1127: the verification-challenge tripwire wins FIRST — it is the highest
   # priority signal (same-day alert obligation) and, when present, explains any
   # concurrent stall (a challenge freezes the session). Alerting is the tick's job.
-  if [[ -n "$verify_excerpt" ]]; then
+  # DIVE-7325: and only on a seat that is actually STALLED — the alert says
+  # "looks STALLED", and until this gate nothing checked it. A hit on a seat
+  # whose transcript moved inside _SUP_VERIFY_STALL_MIN falls through to the
+  # other branches; the excerpt still rides in `signals` (read vs holds).
+  if [[ -n "$verify_excerpt" ]] \
+     && ! (( act_age >= 0 && act_age < _SUP_VERIFY_STALL_MIN * 60 )); then
     class="verify-challenge"; cause="id-verification"
     detail="pane shows an ID/age-verification challenge"
+    if (( act_age >= 0 )); then
+      detail+=" and the transcript has not moved for $(( act_age / 60 ))m"
+    else
+      detail+=" (transcript age unknown)"
+    fi
   elif [[ -n "$wedged" ]]; then
     # DIVE-4642 — ranked here, above every inference, for the same reason the two
     # branches around it are: a wedged composer FREEZES the seat, so it explains
