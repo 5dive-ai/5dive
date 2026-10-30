@@ -89,7 +89,9 @@ check 0 "$(gateway_for hermes none 0)"              'A: hermes + none           
 check 0 "$(gateway_for hermes telegram,discord 1)"  'A: --defer-auth               -> no gateway'
 check 0 "$(gateway_for claude telegram 0)"          'A: non-hermes type            -> no gateway'
 # A substring compare (the other tempting "fix") would match these; channel_in_list must not.
-check 0 "$(gateway_for hermes dashboard 0)"         'A: dashboard only             -> no gateway'
+check 0 "$(gateway_for hermes xtelegram,buzz 0)"    'A: telegram as a substring    -> no gateway'
+# DIVE-7349: the web chat is answered inside the gateway (its 5dive channel plugin).
+check 1 "$(gateway_for hermes dashboard 0)"         'A: dashboard only             -> gateway installed'
 
 # --- site B: bot_username resolution ----------------------------------------
 GUARD_B=$(extract_guard '# Resolve bot @username via Telegram getMe so the dashboard')

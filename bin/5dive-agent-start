@@ -289,7 +289,8 @@ case "$CH" in
       claude) ARGS+=(--channels "plugin:dashboard@5dive-plugins") ;;
       codex) : ;; # app-server dispatcher selected in the type dispatch
       grok) : ;;  # DIVE-7347: MCP server wired into ~/.grok/config.toml below
-      *) echo "channels=dashboard requires type=claude, codex or grok (got type=$TYPE)" >&2; exit 2 ;;
+      hermes|openclaw) : ;;  # DIVE-7349: the dashboard server runs beside the seat, below
+      *) echo "channels=dashboard requires type=claude, codex, grok, hermes or openclaw (got type=$TYPE)" >&2; exit 2 ;;
     esac ;;
   # DIVE-2895 Buzz (Nostr) channel — claude-only, same shape as dashboard. The
   # plugin polls the relay itself and reads its keypair + watched channel UUIDs
@@ -2459,6 +2460,35 @@ if [[ "$TYPE" == "codex" && "$CHANNELS" == "telegram" && "$BIN" == "$CODEX_REAL_
       *) coldstart_kick_never_typed codex "$_kick_state" || true ;;
     esac
   ) &
+fi
+
+# DIVE-7349: the web chat for a hermes or openclaw seat. Neither runtime spawns
+# MCP servers for a channel, so the dashboard server runs here, beside the
+# session, for as long as the session lives (respawned if it exits; the unit's
+# stop takes it down with the rest of the seat). `--runtime=<type>` makes it
+# leave each web-chat message in a local spool and send back what lands in the
+# spool's outbox: on hermes the 5dive channel plugin inside the messaging
+# gateway answers there, on openclaw the server itself asks the gateway with
+# `openclaw agent`.
+if [[ "$TYPE" == "hermes" || "$TYPE" == "openclaw" ]] && [[ ",${CHANNELS}," == *,dashboard,* ]]; then
+  DASH_PLUGIN_DIR=""
+  for _c in "${DASHBOARD_PLUGIN_DIR:-}" \
+            /usr/local/lib/5dive/dashboard \
+            /home/claude/projects/5dive/5dive-plugins/plugins/dashboard; do
+    [[ -n "$_c" && -f "$_c/server.ts" ]] && { DASH_PLUGIN_DIR="$_c"; break; }
+  done
+  DASH_BUN="$(resolve_bun)" || DASH_BUN=""
+  if [[ -z "$DASH_PLUGIN_DIR" || -z "$DASH_BUN" ]]; then
+    echo "warn: dashboard channel set for $TYPE agent '$NAME' but the dashboard plugin or bun was not found — web chat not wired" >&2
+  else
+    (
+      while /usr/bin/tmux has-session -t "$SESSION" 2>/dev/null; do
+        "$DASH_BUN" "$DASH_PLUGIN_DIR/server.ts" "--runtime=$TYPE" </dev/null || true
+        echo "warn: $TYPE web chat bridge exited; restarting in 5s" >&2
+        sleep 5
+      done
+    ) &
+  fi
 fi
 
 # Block so systemd keeps the unit "active" as long as the session lives.
