@@ -19,7 +19,7 @@ trap 'rc=$?; rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 
-PASS=0 FAIL=0
+PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); echo "ok   $1"; }
 bad_t() { FAIL=$((FAIL+1)); echo "FAIL $1${2:+ — $2}"; }
 
