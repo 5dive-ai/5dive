@@ -288,6 +288,12 @@ bounced katya && ok_t "U7 an explicit null desiredState restarts" \
 # park must survive it. Its one start (step 7) reads the registry desiredState and
 # leaves a stopped agent down — tests/agent_switch_harness_unit.sh P1/P2.
 #
+# `scripts/init-smoke.sh` (DIVE-7337) is CANNOT-RESURRECT, read per call site:
+# its two `systemctl restart` lines (openclaw and hermes model pins) sit in
+# pin_model, which runs only after seat_up saw the unit is-active (a down seat
+# exits at step=init first). The seat is one the script created a moment earlier
+# with `5dive init` inside a throwaway CI container, so there is no park to honour.
+#
 # A1 asserts the inventory is EXACT in both directions. A new restart path
 # anywhere in the repo turns it red — because what DIVE-4033 shipped was not a
 # wrong verdict, it was a file nobody looked at.
@@ -299,6 +305,7 @@ declare -A RESTART_PATHS=(
   [src/cmd_host.sh]=GUARDED
   [src/cmd_agent_switch.sh]=GUARDED
   [src/cmd_doctor.sh]=CANNOT-RESURRECT
+  [scripts/init-smoke.sh]=CANNOT-RESURRECT
   [src/cmd_agent_lifecycle.sh]=OPERATOR-VERB
   [src/cmd_agent_config.sh]=OPERATOR-VERB
   [src/cmd_agent_teambot.sh]=OPERATOR-VERB
