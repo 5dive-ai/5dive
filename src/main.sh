@@ -155,7 +155,7 @@ Agents:
                                                      # park one account for this seat until <epoch>
   5dive agent rotation clear-cooldown <agent> [<account>]
                                                      # lift the cooldown on one account (or all of them)
-  5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity)
+  5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity/openclaw/hermes)
   5dive agent config <name> set effort=<low|medium|high|xhigh|max>
                                                      # claude only — reasoning effort (effortLevel);
                                                      # xhigh/max are Opus-tier (Sonnet caps at high)

@@ -7,7 +7,10 @@ cmd_config() {
   #                                buzz is claude-only and token-free)
   #     model                     (model id for the agent's CLI — claude/codex/
   #                                grok/antigravity; written into the type's
-  #                                runtime config, applied on the deferred restart)
+  #                                runtime config, applied on the deferred restart.
+  #                                openclaw/hermes: kept as the seat's AGENT_MODEL,
+  #                                which 5dive-agent-start applies after the
+  #                                account's config is synced in. DIVE-7333)
   #     effort                    (low|medium|high|xhigh|max; claude/codex)
   #     approval-policy           (on-request|never; codex only)
   #     sandbox                   (read-only|workspace-write|danger-full-access;
@@ -101,6 +104,8 @@ cmd_config() {
   local autonomy_changed=0
   # DIVE-6345: same preserve-unless-overridden discipline, stamped as AGENT_CHROME.
   local _CHROME_OVERRIDE=""
+  # DIVE-7333: the openclaw/hermes model pin, stamped as AGENT_MODEL.
+  local _MODEL_OVERRIDE=""
   # applied_keys: names of keys that were actually changed, for the JSON payload.
   local -a applied_keys=()
   for kv in "$@"; do
@@ -226,6 +231,25 @@ cmd_config() {
           || fail "$E_VALIDATION" "invalid model '$v' (allowed chars: letters/digits/._:/-)"
         case "$type" in
           claude|codex|grok|antigravity) ;;
+          openclaw|hermes)
+            # DIVE-7333: these two re-copy their account's config into the seat
+            # on every boot, so a model written into the seat's own file would
+            # be gone after the restart below. The pin lives in the seat's env
+            # file instead and the boot applies it last.
+            if [[ "$type" == "openclaw" && "$v" != */* ]]; then
+              # openclaw ids carry the provider (anthropic/claude-haiku-5-5);
+              # a bare id keeps the provider the seat is on now.
+              local _oc_cur
+              _oc_cur=$(resolve_agent_model openclaw "$name" || true)
+              [[ "$_oc_cur" == */* ]] \
+                || fail "$E_VALIDATION" "openclaw needs the provider in the model id, e.g. anthropic/$v"
+              v="${_oc_cur%%/*}/$v"
+            fi
+            _MODEL_OVERRIDE="$v"
+            env_dirty=1
+            applied_keys+=("model")
+            continue
+            ;;
           *) fail "$E_VALIDATION" "type '$type' does not support 'model' config" ;;
         esac
         new_model="$v"

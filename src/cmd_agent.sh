@@ -162,7 +162,18 @@ _AGENT_LIST_HB_DEFS='
   # cadence (30m -> 3600s) is judged exactly as before.
   def hb_window: (hb_every * 120) | if . < 900 then 900 else . end;
   def hb_seen_fresh: hb_on and (hb_seen > 0) and (hb_seen_age <= hb_window);
-  def hb_stale: hb_on and ((hb_last <= 0) or (hb_age > hb_window));
+  # DIVE-7333: a seat made a minute ago has not had its first tick yet, and
+  # `agent list` straight after `5dive init` called it OVERDUE. Never-run is the
+  # alarm only once the seat is older than the same window. createdAt is
+  # `date -Iseconds` (with its UTC offset); no or unparseable stamp keeps the alarm.
+  def hb_born: (.createdAt // "") as $c
+    | try (if ($c | type) == "string" and ($c | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}")) then
+             (($c[0:19] + "Z") | fromdateiso8601)
+             - ((($c | capture("(?<s>[+-])(?<h>[0-9]{2}):?(?<m>[0-9]{2})$"))
+                 | (.h | tonumber) * 3600 + (.m | tonumber) * 60 | if $c[-6:-5] == "-" then -. else . end) // 0)
+           else 0 end) catch 0;
+  def hb_newborn: (hb_born > 0) and (($now - hb_born) <= hb_window);
+  def hb_stale: hb_on and (((hb_last <= 0) and (hb_newborn | not)) or (hb_age > hb_window));
   def hb_overdue: hb_stale and (hb_seen_fresh | not);
   # Stale by wake-age, but the tick saw it working: the row shows the reason.
   def hb_working: hb_stale and hb_seen_fresh;
@@ -1661,6 +1672,18 @@ resolve_agent_model() {
     antigravity)
       f="$home/.gemini/antigravity-cli/settings.json"
       priv_read "$f" jq -r '.model // .selectedModel // empty' "$f" ;;
+    openclaw)
+      # model is `{primary: …}` or a bare string (see selfcheck_cred_reached_agent).
+      f="$home/.openclaw/openclaw.json"
+      { priv_read "$f" jq -r '(.agents.defaults.model) as $m
+        | if ($m|type) == "object" then ($m.primary // empty)
+          elif ($m|type) == "string" then $m else empty end' "$f"; } || true ;;
+    hermes)
+      # `model:` block's `default:` key, or a bare `model: <id>`.
+      f="$home/.hermes/config.yaml"
+      { priv_read "$f" sed -nE -e 's/^model:[[:space:]]*["'"'"']?([^"'"'"'#[:space:]]+).*/\1/p' \
+          -e '/^model:/,/^[^[:space:]]/s/^[[:space:]]+default:[[:space:]]*["'"'"']?([^"'"'"'#[:space:]]+).*/\1/p' "$f" \
+          | head -1; } || true ;;
     *) printf '' ;;
   esac
 }
