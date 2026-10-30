@@ -59,7 +59,8 @@ if [[ -n "$deb" ]]; then
   cont="$(dpkg-deb -c "$deb")"
   list="$(awk '{print $6}' <<<"$cont" | sed -n 's#^\./usr/share/5dive/bundle/##p')"
   want="$(grep -oE '\$REPO/[^" )]+' install.sh | sed 's#^\$REPO/##; s#\${PIN_BIN}#bin/#; s#\${PIN_PROMPTS}#prompts/#' \
-          | grep -vE '\$|<|…|^5dive\.sha256$' | sort -u)"
+          | grep -vE '\$|<|…|^5dive\.sha256$' | sort -u)" || want=""
+  [[ -n "$want" ]] || bad "read no \$REPO paths from install.sh"
   want+=$'\n'"$(grep -vE '^\s*(#|$)' bin/host-scripts.manifest | awk '{print "bin/"$1}')"
   want+=$'\n'"$(cd hooks && ls | sed 's#^#hooks/#')"
   miss=""
