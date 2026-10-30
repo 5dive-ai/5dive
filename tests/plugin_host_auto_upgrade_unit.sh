@@ -18,6 +18,10 @@
 #       (accept 3)
 #   T6  install.sh --upgrade runs it from the fresh CLI, survives its failure,
 #       and skips an older CLI that lacks the verb
+#   T7  DIVE-7345: setup ran through the verb (no `.setup.ok`) and the engine is
+#       on the box -> the new version's files-only `wrapper` step runs; a box
+#       already at the newest version with an old engine is backfilled; no
+#       engine on the box -> still owed, nothing started
 #
 # LABELS. [D] = red on the pre-fix tree (origin/main 95e38edb; accept 2, the
 # negative control). [C] = a control, green on both trees. [F] = a fence that
@@ -53,6 +57,8 @@ export STATE_DIR="$TMP/state"
 unset FIVEDIVE_PLUGIN_REGISTRY
 export GH_ORG=5dive-ai; unset _GH_ORG_RESOLVED
 JSON_MODE=0
+# The voice engine this box "has" (DIVE-7345) — never the host's real one.
+export FIVEDIVE_VOICE_ENGINE_BIN="$TMP/engine/5dive-speak"
 
 PASS=0; FAIL=0
 t()  { if [[ "$2" == "$3" ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); printf 'FAIL: %s\n   expected: %s\n   got:      %s\n' "$1" "$2" "$3"; fi; }
@@ -95,6 +101,10 @@ bump() {
   case "$what" in
     engine)   printf '#!/bin/sh\necho engine %s\n' "$v" > "$d/$p/bin/installer" ;;
     readme)   printf 'notes for %s\n' "$v" > "$d/$p/README.md" ;;
+    speak)    mkdir -p "$d/$p/lib"
+              printf '# speak %s\nVOICE_EDGE_BACKOFF="1 2 4 8 8"\n' "$v" > "$d/$p/lib/5dive-speak.sh"
+              printf '#!/usr/bin/env bash\n[ "$1" = wrapper ] || exit 9\ncp "$(dirname "$0")/../lib/5dive-speak.sh" "$FIVEDIVE_VOICE_ENGINE_BIN"\n' \
+                > "$d/$p/bin/5dive-setup-voice" ;;
     badgrant) jq '.fivedive.grants = ["not-a-grant"]' "$d/$p/.claude-plugin/plugin.json" > "$TMP/x" \
                 && mv "$TMP/x" "$d/$p/.claude-plugin/plugin.json" ;;
   esac
@@ -243,6 +253,43 @@ LINE_AU=$(grep -n 'plugin auto-upgrade 2>&1' install.sh | head -1 | cut -d: -f1)
 LINE_RP=$(grep -n '"$BIN_DIR/5dive-refresh-plugins.sh" 2>&1' install.sh | head -1 | cut -d: -f1)
 t  "T6g [D] it runs BEFORE the seat refresh, so seats re-pin at the new version" "yes" \
   "$([[ -n "$LINE_AU" && -n "$LINE_RP" && "$LINE_AU" -lt "$LINE_RP" ]] && echo yes || echo no)"
+
+# =============================================================================
+# T7 — DIVE-7345: set up through `5dive voice setup`, which records no `.setup.ok`
+# =============================================================================
+jq '.["voice@5dive-voice"].setup = {hint:"engine", command:"touch '"$SETUP_MARK"'"}' "$(_plugin_installed_json)" > "$TMP/x" \
+  && mv "$TMP/x" "$(_plugin_installed_json)"
+rm -f "$SETUP_MARK"; mkdir -p "$TMP/engine"
+printf '# speak 1.12.0, no retry\n' > "$FIVEDIVE_VOICE_ENGINE_BIN"
+bump 5dive-ai/5dive-voice voice 1.13.0 speak
+run cmd_plugin_auto_upgrade
+# (good@5dive-good still fails from T4, so the verb's own exit is not voice's.)
+t  "T7a [C] voice 1.12.0 -> 1.13.0 with no recorded setup" "1.13.0" "$(ver voice@5dive-voice)"
+tn "T7a2 [F] ...and voice is not among the failed" "FAILED (good@5dive-good, voice" "$ERR"
+t  "T7b [D] the engine on the box gets the new 5dive-speak (VOICE_EDGE_BACKOFF)" "1" \
+  "$(grep -c VOICE_EDGE_BACKOFF "$FIVEDIVE_VOICE_ENGINE_BIN")"
+tc "T7c [D] ...and says so" "refreshed voice@5dive-voice's engine files on this box (5dive-setup-voice wrapper)" "$ERR"
+tn "T7d [D] ...and it is not named as owed" "setup owed" "$ERR"
+t  "T7e [C] the full setup was NOT run" "absent" "$([[ -e "$SETUP_MARK" ]] && echo ran || echo absent)"
+# T7i-k: the box that already moved (poke-two, reports 592/593): voice is at its
+# newest version and the engine on the box is still the old one.
+run cmd_plugin_auto_upgrade
+tn "T7i [C] a second pass with a current engine refreshes nothing" "refreshed voice" "$ERR"
+printf '# speak 1.11.2, no retry\n' > "$FIVEDIVE_VOICE_ENGINE_BIN"
+run cmd_plugin_auto_upgrade
+t  "T7j [D] already at 1.13.0 with an old engine: the backfill writes the shipped one" "1|1.13.0" \
+  "$(grep -c VOICE_EDGE_BACKOFF "$FIVEDIVE_VOICE_ENGINE_BIN")|$(ver voice@5dive-voice)"
+tc "T7k [D] ...and says why" "they were older than the voice@5dive-voice it runs" "$ERR"
+rm -f "$FIVEDIVE_VOICE_ENGINE_BIN"
+run cmd_plugin_auto_upgrade
+t  "T7l [C] backfill with no engine on the box writes nothing" "absent" \
+  "$([[ -e "$FIVEDIVE_VOICE_ENGINE_BIN" ]] && echo written || echo absent)"
+bump 5dive-ai/5dive-voice voice 1.14.0 speak
+run cmd_plugin_auto_upgrade
+t  "T7f [C] no engine on the box: still upgraded" "1.14.0" "$(ver voice@5dive-voice)"
+tc "T7g [C] ...and the setup is still named as owed" "setup owed: touch $SETUP_MARK" "$ERR"
+t  "T7h [C] ...and no engine was written, no setup started" "absent|absent" \
+  "$([[ -e "$FIVEDIVE_VOICE_ENGINE_BIN" ]] && echo written || echo absent)|$([[ -e "$SETUP_MARK" ]] && echo ran || echo absent)"
 
 echo
 echo "$PASS passed, $FAIL failed"
