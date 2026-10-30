@@ -2565,6 +2565,35 @@ _plugin_setup_inputs_changed() {
       --exclude=node_modules --exclude=.git --exclude='*.md' "$old" "$new" >/dev/null 2>&1
 }
 
+# DIVE-7345: a setup that ran but was never RECORDED. `.setup.ok` is written only
+# by `plugin setup`; voice's own command is the verb (`sudo 5dive voice setup`),
+# which records nothing, so every box set up the normal way read "setup owed" on
+# upgrade and kept the old `5dive-speak` — voice 1.11.3's edge-tts retry never
+# reached a self-hosted box (reports 592, 593). Managed boxes get it from
+# 5dive-api's update.sh (DIVE-7302); a curl box never runs that.
+#
+# The evidence the setup ran is the engine itself, on the box. When it is there
+# and differs from the copy the enabled version ships, that version's files-only
+# step is run — the same `wrapper` step the managed nightly runs: it rewrites the
+# wrappers and the lib, never apt, pip or a new service. No engine on the box
+# means nobody set it up: still owed, not started. Comparing against the shipped
+# copy (not "did the version move") is what also reaches a box that ALREADY
+# moved to 1.11.3 with the old engine — the backfill pass below.
+# Sets _PH_REFRESH (argv) and returns 0 only when that step applies.
+_plugin_setup_refresh_cmd() {
+  local plugin="$1" dir="$2" installer engine
+  _PH_REFRESH=()
+  case "$plugin" in
+    voice)
+      installer="$dir/bin/5dive-setup-voice"
+      engine="${FIVEDIVE_VOICE_ENGINE_BIN:-/usr/local/bin/5dive-speak}"
+      [[ -f "$installer" && -f "$dir/lib/5dive-speak.sh" && -e "$engine" ]] || return 1
+      ! cmp -s "$dir/lib/5dive-speak.sh" "$engine" || return 1
+      _PH_REFRESH=(bash "$installer" wrapper) ;;
+    *) return 1 ;;
+  esac
+}
+
 # `5dive plugin auto-upgrade` — the self-update pass. Every outcome is said per
 # plugin, and a plugin that could not be moved is this verb's OWN non-zero exit
 # with its own reason, so the caller never has to explain a bare exit 1.
@@ -2631,11 +2660,37 @@ cmd_plugin_auto_upgrade() {
         warn "$key $now changed its host setup and re-running it failed (exit $rc): $(tail -n 3 "$errf" | tr '\n' ' ') — run it yourself: $scmd"
         failed=$(jq -c --arg k "$key" --arg c "$scmd" '. + [{plugin:$k, setup:$c}]' <<<"$failed")
       fi
+    elif _plugin_setup_refresh_cmd "$plugin" "$(_plugin_cache_dir)/$mkt/$plugin/$now"; then
+      rc=0; "${_PH_REFRESH[@]}" >/dev/null 2>"$errf" || rc=$?
+      if (( rc == 0 )); then
+        step "refreshed $key's engine files on this box (${_PH_REFRESH[1]##*/} ${_PH_REFRESH[2]}) — $now changed what its setup installs"
+        sran=$(jq -c --arg k "$key" '. + [$k]' <<<"$sran")
+      else
+        warn "$key $now changed its engine files and refreshing them failed (exit $rc): $(tail -n 3 "$errf" | tr '\n' ' ') — run it yourself: $scmd"
+        failed=$(jq -c --arg k "$key" --arg c "$scmd" '. + [{plugin:$k, setup:$c}]' <<<"$failed")
+      fi
     else
       warn "$key $now changed its host setup, and this box still has what $had's setup installed. Run: $scmd"
       sowed=$(jq -c --arg k "$key" --arg c "$scmd" '. + [{plugin:$k, command:$c}]' <<<"$sowed")
     fi
   done <<<"$entries"
+
+  # DIVE-7345 backfill: a plugin already at its newest version whose engine on
+  # this box is still an older version's (the upgrade ran before this pass
+  # existed). Same rule and same step as above; one `cmp` when nothing is stale.
+  while IFS=$'\t' read -r key plugin mkt had enabled; do
+    [[ -n "$key" && "$enabled" != false ]] || continue
+    jq -e --arg k "$key" 'index($k)' <<<"$sran" >/dev/null && continue
+    _plugin_setup_refresh_cmd "$plugin" "$(_plugin_enabled_dir)/$key" || continue
+    rc=0; "${_PH_REFRESH[@]}" >/dev/null 2>"$errf" || rc=$?
+    if (( rc == 0 )); then
+      step "refreshed $key's engine files on this box (${_PH_REFRESH[1]##*/} ${_PH_REFRESH[2]}) — they were older than the $key it runs"
+      sran=$(jq -c --arg k "$key" '. + [$k]' <<<"$sran")
+    else
+      warn "$key's engine files on this box are older than the version it runs, and refreshing them failed (exit $rc): $(tail -n 3 "$errf" | tr '\n' ' ')"
+      failed=$(jq -c --arg k "$key" '. + [{plugin:$k, setup:"refresh"}]' <<<"$failed")
+    fi
+  done <<<"$(_plugin_host_entries)"
   rm -f "$errf"
 
   local nu nb nf prose
