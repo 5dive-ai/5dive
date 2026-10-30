@@ -2175,9 +2175,18 @@ KIMI_ENV
   # auth.json with no --api-key argv. Passing --api-key "$api_key" here would
   # expose the BYO secret in /proc/<pid>/cmdline + ps for the life of the call
   # (DIVE-1818).
-  printf '%s' "$api_key" | sudo -u claude -H env HERMES_HOME="$hermes_home" \
-    "$bin" auth add "$native" --type api-key --label "${canonical}-byo" >&2 \
-    || fail "$E_GENERIC" "hermes auth add $native failed"
+  # DIVE-7330: "no tty" has to be made, not assumed. Run from `5dive init` on a
+  # real terminal, getpass opened /dev/tty, ignored the pipe and asked the
+  # person for the key a second time ("Paste your API key:"), which looked like
+  # a hang. setsid (inside sudo: use_pty gives the command a pty of its own)
+  # drops the controlling terminal, so getpass falls back to stdin; its
+  # fallback chatter (and the prompt) is shown only on a failure.
+  local _auth_out
+  if ! _auth_out=$(printf '%s' "$api_key" | sudo -u claude -H setsid -w env HERMES_HOME="$hermes_home" \
+      "$bin" auth add "$native" --type api-key --label "${canonical}-byo" 2>&1); then
+    printf '%s\n' "$_auth_out" >&2
+    fail "$E_GENERIC" "hermes auth add $native failed"
+  fi
   sudo -u claude -H env HERMES_HOME="$hermes_home" \
     "$bin" config set model.provider "$native" >&2 \
     || warn "hermes config set model.provider=$native failed (rerun: sudo -u claude -H $bin config set model.provider $native)"
@@ -4424,9 +4433,17 @@ cmd_create() {
   # config.yaml at the per-user path, beating the seed's content-diff and
   # silently routing the agent back to chatgpt.com regardless of what the
   # profile says. Matches the same skip we apply when --provider is on argv.
+  # DIVE-7330: with no profile the seed is the box's own /home/claude/.hermes
+  # (agent-start's SHARED_HERMES_DIR default), which `5dive init` and
+  # `agent auth set hermes` write, and hermes' installer always leaves one.
+  # agent-start copies it over the seat's at every start, so the openai-codex
+  # pin below never survived there; it only told an Anthropic seat's owner to
+  # set openai-codex. Skip it there too.
   local _profile_has_hermes_cfg=0
   if [[ -n "$profile" ]] \
      && [[ -s "${AUTH_PROFILES_DIR}/${profile}/hermes/config.yaml" ]]; then
+    _profile_has_hermes_cfg=1
+  elif [[ -z "$profile" && -s /home/claude/.hermes/config.yaml ]]; then
     _profile_has_hermes_cfg=1
   fi
   if [[ "$type" == "hermes" ]] && (( ! defer_auth )) && [[ -z "$byo_provider" ]] \
@@ -4715,6 +4732,18 @@ cmd_create() {
         issue:*) _hc_issues+=("${_cred_line#issue:}") ;;
       esac
     done < <(selfcheck_cred_reached_agent "$name" "$type" "$profile" "$byo_provider")
+  fi
+  # DIVE-7330: the harness itself, run the way the seat runs it (its own uid and
+  # HOME). Hermes 0.21.6+ died on every seat's first start while the unit, the
+  # pane and this check all said up: its tmux loop restarts a dead binary forever.
+  if [[ "$type" == hermes ]]; then
+    local _start_out _start_rc=0
+    _start_out=$(cd / && sudo -u "agent-${name}" -H timeout 60 "${TYPE_BIN[hermes]}" --version 2>&1) || _start_rc=$?
+    if (( _start_rc == 0 )); then
+      _hc_ok+=("hermes starts")
+    else
+      _hc_issues+=("hermes does NOT start as agent-${name} (agent is DEAD — exit ${_start_rc}: $(printf '%s' "$_start_out" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-200)) — check: sudo -u agent-${name} -H ${TYPE_BIN[hermes]} --version")
+    fi
   fi
   if (( ${#_hc_issues[@]} == 0 )); then
     warn "self-check PASS for '$name' — reachable & autonomous (${_hc_ok[*]})."

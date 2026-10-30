@@ -206,7 +206,7 @@ check "only systemd-run starts the job (inert systemd-run -> no install ran)" "$
 # which moves the installer into a logind scope outside the unit: a stop or
 # RuntimeMaxSec then leaves it running (measured on a box, DIVE-4973). The job's
 # own run of the recipe must hop WITHOUT -i; the plain blocking path keeps it.
-recipe_hop() { grep -F 'hermes-agent.nousresearch.com/install.sh' "$TMP/sudo-argv" 2>/dev/null | head -1; }
+recipe_hop() { grep -F 'NousResearch/hermes-agent/' "$TMP/sudo-argv" 2>/dev/null | head -1; }
 reset
 FIVE_INSTALL_IN_UNIT=1 install hermes
 hop=$(recipe_hop)
