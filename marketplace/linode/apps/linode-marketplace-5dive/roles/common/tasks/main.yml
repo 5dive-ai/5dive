@@ -1,0 +1,35 @@
+---
+# set_hostname
+- name: Setting up hostname
+  import_role:
+    name: hostname
+
+# sets customer supplied ssh pubkey to limited user
+- name: Set ssh pubkey
+  import_role:
+    name: sshkey
+
+# disable root login w/wo pubkey
+- name: Secure ssh
+  import_role:
+    name: securessh
+  when: disable_root is defined
+
+# apt_setup_update
+- name: Update system packages
+  import_role:
+    name: update_pkgs
+
+# ufw_install
+- name: Enabling ufw
+  import_role:
+    name: ufw
+
+# ufw rules: ssh, plus 80/443 for the server's own HTTPS secret links
+- name: Apply ufw rules
+  import_tasks: ufw_rules.yml
+
+# fail2ban
+- name: Enabling fail2ban
+  import_role:
+    name: fail2ban_install

@@ -1,0 +1,10 @@
+---
+skip_list:
+  - command-instead-of-shell
+  - no-changed-when
+  - no-jinja-when
+  - fqcn-builtins
+exclude_paths:
+  - .cache/
+  - .github/
+  - tests/

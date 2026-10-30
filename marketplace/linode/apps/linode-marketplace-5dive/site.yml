@@ -1,0 +1,30 @@
+---
+- name: Install 5dive
+  hosts: localhost
+  connection: local
+  any_errors_fatal: true
+  user: root
+  vars_files: [group_vars/linode/vars]
+  tasks:
+    - name: Running app in staging mode
+      when: "mode == 'staging'"
+      block:
+        - name: Run roles
+          include_role:
+            name: "{{ item }}"
+          loop: [common, fivedive, post]
+        - name: Deployment passed
+          import_tasks: ../linode_helpers/roles/cilog/tasks/main.yml
+          vars:
+            deploy_status: successful
+      rescue:
+        - name: Deployment failed
+          import_tasks: ../linode_helpers/roles/cilog/tasks/main.yml
+          vars:
+            deploy_status: failed
+
+    - name: Running app normally
+      include_role:
+        name: "{{ item }}"
+      loop: [common, fivedive, post]
+      when: "mode == 'production'"
