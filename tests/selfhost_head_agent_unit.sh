@@ -309,6 +309,44 @@ eq_t "L6b ...restart when no login is named" "rc=0|text|restart|claude-mario||" 
 eq_t "L7 control: a seat whose grant does not reach the rail is refused before anything runs" "rc=1||" "$(caller_half 0 claude-mario --to=work | rc1)"
 grep -q 'cmd_agent_recover "\$@"' src/main.sh && grep -q 'cmd_lead_account_delegated "\$@"' src/main.sh && grep -q ' _lead_account ' src/cmd_plugin.sh \
   && ok_t "L8 main dispatches agent recover and the hidden _lead_account" || bad_t "L8 main dispatches agent recover and the hidden _lead_account" "dispatch or builtin verb missing"
+echo '== T: the start time on Ubuntu 22.04 (systemd 249, DIVE-7331) =='
+# A systemctl that answers `show` the way each systemd does. 249 (22.04) refuses
+# --timestamp=unix and the whole call with it ("Invalid value: unix.", rc 1, no
+# stdout, measured on 249.11-0ubuntu3.23) and prints --timestamp=utc as below.
+FB="$TMP/fakebin"; mkdir -p "$FB"
+cat > "$FB/systemctl" <<'STUB'
+#!/usr/bin/env bash
+ts="" value=0 units=()
+for a in "$@"; do
+  case "$a" in
+    --timestamp=*) ts="${a#*=}" ;; --value) value=1 ;;
+    show|-p|--no-page|--property=*|ActiveEnterTimestamp) ;; *) units+=("$a") ;;
+  esac
+done
+if [[ "$ts" == unix && "${SD_MODE:-255}" == 249 ]]; then echo "Invalid value: unix." >&2; exit 1; fi
+case "$ts" in unix) stamp="@${SD_EPOCH}" ;; *) stamp="${SD_UTC}" ;; esac
+if (( value )); then printf '%s\n' "$stamp"; exit 0; fi
+for u in "${units[@]}"; do printf 'Id=%s\nActiveState=active\nUnitFileState=enabled\nActiveEnterTimestamp=%s\n\n' "$u" "$stamp"; done
+STUB
+chmod +x "$FB/systemctl"
+export SD_EPOCH="$T0" SD_UTC="Tue 2026-10-27 10:18:33 UTC"
+started() { ( PATH="$FB:$PATH"; unset -f seat_started_epoch; source src/lib/seat_refusal.sh; SD_MODE="$1" seat_started_epoch qa7331 ); }
+eq_t "T1 22.04: the seat's start time is read (utc fallback), not 0" "$T0" "$(started 249)"
+eq_t "T2 control: systemd 251+ reads it from --timestamp=unix as before" "$T0" "$(started 255)"
+eq_t "T3 control: a start time that is not one ('n/a', never started) reads 0" 0 "$(SD_UTC=n/a started 249)"
+sed "s#\"/usr/bin/systemctl\"#\"$FB/systemctl\"#" "$PY" > "$TMP/snapshot-sd.py"
+snap_sd() { SD_MODE="$1" python3 "$TMP/snapshot-sd.py" "$TMP/agents.json" "$TMP/profiles" "$TMP/connectors" "$TMP/home" "$TMP/sudoers" /default 2>/dev/null; }
+eq_t "T4 22.04: agent list shows the unit's real state and enabled, not unknown" "active|enabled" "$(snap_sd 249 | jq -r '.[0] | "\(.active)|\(.enabled)"')"
+eq_t "T4b control: the same on systemd 251+" "active|enabled" "$(snap_sd 255 | jq -r '.[0] | "\(.active)|\(.enabled)"')"
+# A refusal written before the seat last started is fixed (the start is the fix).
+{ err_rec 2026-10-27T10:00:00Z billing_error "Credit balance is too low"; } > "$T/s1.jsonl"
+eq_t "T5 22.04: a refusal from before the start no longer counts in agent list" ok "$(snap_sd 249 | jq -r '.[0].health.auth.state')"
+eq_t "T5b ...nor in the bash reader" none "$(refusal "$(started 249)")"
+eq_t "T5c control: on systemd 251+ it does not count either" ok "$(snap_sd 255 | jq -r '.[0].health.auth.state')"
+{ err_rec 2026-10-27T10:30:00Z billing_error "Credit balance is too low"; } > "$T/s1.jsonl"
+eq_t "T6 control: a refusal after the start still counts on 22.04" refused "$(snap_sd 249 | jq -r '.[0].health.auth.state')"
+rm -f "$T"/*.jsonl
+
 echo
 printf 'DIVE-7118 self-host head agent: %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1

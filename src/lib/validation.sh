@@ -751,11 +751,14 @@ _sp_cred_seats() {
   done
 }
 
-# _sp_cred_secure <file> <seats> — one vendor login file: off group claude if
-# it is still there, then its seat readers set to <seats>. A file that is not
-# group-readable moves but gains no reader: setfacl would raise its mask.
+# _sp_cred_secure <file> <seats> [open] — one vendor login file: off group
+# claude if it is still there, then its seat readers set to <seats>. A file that
+# is not group-readable moves but gains no reader: setfacl would raise its mask.
+# With `open`, an owner-only file gets its seat readers anyway (DIVE-7335, see
+# default_creds_secure): the raised mask is the only group bit, and its group
+# entry stays ---, so the secrets group itself still reads nothing.
 _sp_cred_secure() {
-  local f="$1" seats="$2" g
+  local f="$1" seats="$2" open="${3:-}" g
   [[ -f "$f" && ! -L "$f" ]] || return 0
   g=$(secrets_group)
   [[ "$g" != "$(_sp_shared_group)" ]] || return 0
@@ -765,7 +768,7 @@ _sp_cred_secure() {
   # A refused chgrp (not root) leaves the group as it was: the ACLs wait for
   # the root heartbeat tick.
   [[ "$(_sp_file_group "$f")" == "$g" ]] || return 0
-  _sp_group_readable "$(_sp_mode "$f")" || return 0
+  [[ "$open" == open ]] || _sp_group_readable "$(_sp_mode "$f")" || return 0
   _sp_seat_readers_sync "$f" "$seats"
 }
 
@@ -820,6 +823,10 @@ _sp_default_cred_dir() {
 # default_creds_secure — every default vendor login. Idempotent; called by
 # link_agent_profile, agent create (after its hermes chmod), agent restart and
 # the reconcile. Always returns 0.
+# DIVE-7335: these seeds are given readers even when owner-only. `codex login`
+# and `grok login` write ~/.codex/auth.json and ~/.grok/auth.json 0600 and no
+# account normalizes them (an account login is made 0640 first), so a seat on
+# no account could not read its own login and booted signed out.
 default_creds_secure() {
   local t dir seats seeds f c
   for t in $SP_CRED_TYPES; do
@@ -828,7 +835,7 @@ default_creds_secure() {
     seats=$(_sp_cred_seats "" "$t")
     seeds=$(_sp_cred_seeds "$t" | sed "s#^#$dir/#")
     while IFS= read -r f; do
-      _sp_cred_secure "$f" "$seats"
+      _sp_cred_secure "$f" "$seats" open
       for c in "$f".* "$f"-*; do
         grep -qxF "$c" <<<"$seeds" || _sp_cred_secure "$c" ""
       done

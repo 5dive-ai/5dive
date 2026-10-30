@@ -1861,6 +1861,12 @@ write_agent_env() {
   if [[ -z "$chrome" && -r "$env_file" ]]; then
     chrome=$(sed -n 's/^AGENT_CHROME=//p' "$env_file" | head -1)
   fi
+  # DIVE-7333: the openclaw/hermes model pin (`agent config set model=`), same
+  # discipline. Empty = no line: the seat runs its account's model.
+  local model_pin="${_MODEL_OVERRIDE:-}"
+  if [[ -z "$model_pin" && -r "$env_file" ]]; then
+    model_pin=$(sed -n 's/^AGENT_MODEL=//p' "$env_file" | head -1)
+  fi
   {
     printf 'AGENT_NAME=%s\n' "$name"
     printf 'AGENT_TYPE=%s\n' "$type"
@@ -1872,6 +1878,7 @@ write_agent_env() {
     [[ "$can_push" == "1" ]] && printf 'AGENT_CAN_PUSH=1\n'
     [[ "$can_deploy" == "1" ]] && printf 'AGENT_CAN_DEPLOY=1\n'
     [[ "$chrome" == "1" ]] && printf 'AGENT_CHROME=1\n'
+    [[ -n "$model_pin" ]] && valid_model "$model_pin" && printf 'AGENT_MODEL=%s\n' "$model_pin"
     # New telegram agents flow through our 5dive-plugins fork (bundled
     # hooks, richer slash commands). 5dive-agent-start reads this var to
     # build the runtime --channels arg, defaulting to claude-plugins-official
@@ -2968,6 +2975,11 @@ selfcheck_cred_reached_agent() { # <name> <type> <profile> <byo_provider>
           "$_oc_cfg" "$name"
       else
         printf 'ok:openclaw seat has its own credential and model pin (%s)\n' "$_oc_primary"
+        # DIVE-7333: the key reached the seat, and that is the whole question.
+        # Root carries it in from the account's store (create, and restart:
+        # DIVE-7101), which a seat is not meant to read, so witness 2 below
+        # would call that by-design layout a perms fault.
+        return 0
       fi
     fi
   fi
@@ -3005,6 +3017,30 @@ selfcheck_cred_reached_agent() { # <name> <type> <profile> <byo_provider>
       "$src" "$user" "$name"
   fi
   return 0
+}
+
+# selfcheck_allow_count <type> <name> <channel> — how many senders the seat's
+# <channel> allowlist holds, as create's self-check reads it; 0 when the store
+# is missing or unreadable. DIVE-7333: openclaw keeps it in openclaw.json
+# (channels.<ch>.allowFrom) and hermes in ~/.hermes/.env (<CH>_ALLOWED_USERS),
+# where install_channel_for_openclaw_agent / _hermes_agent write it. Reading
+# access.json for those two called a paired, answering seat DEAF.
+selfcheck_allow_count() {
+  local type="$1" name="$2" ch="$3" home n=0
+  home="${AGENT_HOME_ROOT:-/home}/agent-${name}"
+  case "$type" in
+    openclaw)
+      [[ -f "$home/.openclaw/openclaw.json" ]] \
+        && n=$(jq -r --arg c "$ch" '(.channels[$c].allowFrom // []) | length' "$home/.openclaw/openclaw.json" 2>/dev/null) || n=0 ;;
+    hermes)
+      [[ -f "$home/.hermes/.env" ]] \
+        && n=$(sed -n "s/^${ch^^}_ALLOWED_USERS=//p" "$home/.hermes/.env" | tail -1 | tr ',' '\n' | grep -c '[^[:space:]]') || n=0 ;;
+    *)
+      [[ -f "$home/.${type}/channels/${ch}/access.json" ]] \
+        && n=$(jq -r '(.allowFrom // []) | length' "$home/.${type}/channels/${ch}/access.json" 2>/dev/null) || n=0 ;;
+  esac
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s\n' "$n"
 }
 
 # Top-level seeding (root): builds the target store, seeds every resolved
@@ -4608,12 +4644,11 @@ cmd_create() {
   # reachability: channel allowlist non-empty (deaf check) for each personal bot.
   # claude-family plugins persist access.json under ~/.<type>/channels/<ch>/;
   # a missing file or empty allowFrom means every inbound DM is refused.
-  local _ch _access _n_allow _idlabel
+  # DIVE-7333: openclaw and hermes keep theirs elsewhere (selfcheck_allow_count).
+  local _ch _n_allow _idlabel
   for _ch in telegram discord; do
     channel_in_list "$_ch" "$channels" || continue
-    _access="/home/agent-${name}/.${type}/channels/${_ch}/access.json"
-    _n_allow=0
-    [[ -f "$_access" ]] && _n_allow=$(jq -r '(.allowFrom // []) | length' "$_access" 2>/dev/null || echo 0)
+    _n_allow=$(selfcheck_allow_count "$type" "$name" "$_ch")
     if (( _n_allow > 0 )); then
       _hc_ok+=("$_ch paired (${_n_allow} allowed)")
     else

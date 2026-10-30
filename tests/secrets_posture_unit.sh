@@ -31,7 +31,8 @@
 #     the read; the seed list matches 5dive-agent-start (T13, T9 as root)
 #   * DIVE-5714: the same for the default (no-account) logins in /home/claude
 #     (.hermes/auth.json, config.yaml, ...): read by the seats of that type on
-#     no account; a non-seed file and the codex symlink are left alone (T14, T9)
+#     no account; a non-seed file and the codex symlink are left alone (T14, T9);
+#     a fresh box's 0600 codex/grok login still reaches its seat (T15)
 #   * AS ROOT ONLY (CI: the root-arms job, SP_REQUIRE_ROOT_ARM=1 makes a skip
 #     a failure): the same reconcile on real files and a real group, and a
 #     real non-member uid in the workspace group is refused every key and still
@@ -460,6 +461,40 @@ for t in $SP_CRED_TYPES; do
 done
 [[ -z "$drift" ]] && ok_t "T14 every default login TYPE_AUTH names is in the default seed list" || bad_t "T14 default drift" "$drift"
 rm -f "$ENV_DIR"/hm_*.env "$ENV_DIR"/cx_free2.env "$ENV_DIR"/hm_new-auth.env
+
+# --- T15: a fresh box's codex/grok login is 0600 and still reaches its seat ---
+# (DIVE-7335) `codex login` / `grok login` with no account write a plain 0600
+# file: the codex one is NOT the symlink T14 assumes. The seat on no account must
+# get its read (a per-seat ACL entry; the group entry stays ---, so the secrets
+# group itself gains nothing), and no other seat may.
+# A new login is a new file: drop the fake ACL rows T14 left at these paths.
+awk -F'\t' -v a="$H/.codex/auth.json" -v b="$H/.grok/auth.json" '$1!=a && $1!=b' "$OS/acl" > "$OS/acl.tmp"; mv "$OS/acl.tmp" "$OS/acl"
+rm -f "$H/.codex/auth.json"; cred "$H/.codex/auth.json" 600
+rm -f "$H/.grok/auth.json"; cred "$H/.grok/auth.json" 600; cred "$H/.grok/auth.json.bak-20260101T000000Z" 600
+printf 'agent-cx_fresh\nagent-gk_fresh\nagent-gk_acme\n' >> "$OS/users"
+seat_env cx_fresh codex; seat_env gk_fresh grok; seat_env gk_acme grok acme
+default_creds_secure
+[[ "$(_sp_file_group "$H/.codex/auth.json")" == claude-keys && "$(acl_of "$H/.codex/auth.json")" == "u:agent-cx_fresh:r " ]] \
+  && ok_t "T15 a 0600 default codex login: claude-keys, read by the codex seat on no account" \
+  || bad_t "T15 codex" "$(_sp_file_group "$H/.codex/auth.json") $(acl_of "$H/.codex/auth.json")"
+[[ "$(_sp_file_group "$H/.grok/auth.json")" == claude-keys && "$(acl_of "$H/.grok/auth.json")" == "u:agent-gk_fresh:r " ]] \
+  && ok_t "T15 a 0600 default grok login: read by the grok seat on no account, not the one on an account" \
+  || bad_t "T15 grok" "$(_sp_file_group "$H/.grok/auth.json") $(acl_of "$H/.grok/auth.json")"
+[[ "$(stat -c %a "$H/.grok/auth.json")" == 600 && "$(stat -c %a "$H/.codex/auth.json")" == 600 ]] \
+  && ok_t "T15 no chmod g+r: only the seat's own ACL entry opens it" || bad_t "T15 mode" "$(stat -c %a "$H/.grok/auth.json") $(stat -c %a "$H/.codex/auth.json")"
+[[ -z "$(acl_of "$H/.grok/auth.json.bak-20260101T000000Z")" ]] \
+  && ok_t "T15 a 0600 backup beside the login gains no reader" || bad_t "T15 backup" "$(acl_of "$H/.grok/auth.json.bak-20260101T000000Z")"
+[[ "$(acl_of "$P/acme/grok/.grok/auth.json")" != *agent-gk_fresh* ]] \
+  && ok_t "T15 an account's 0600 login is not opened by the default pass" || bad_t "T15 account opened" "$(acl_of "$P/acme/grok/.grok/auth.json")"
+# The heals the self-check names (agent restart) and the dashboard sign-in
+# (restart_profile_agents "") reach this pass for both types.
+lc=$(awk '/^normalize_restart_profile_perms\(\)/,/^}/' src/cmd_agent_lifecycle.sh)
+[[ "$(awk '/profile=codex/{f=1} f&&/default_creds_secure/{print "y"; exit} /^  fi/{if(f)exit}' <<<"$lc")" == y ]] \
+  && ok_t "T15 agent restart of an unbound codex seat secures the default codex login too" || bad_t "T15 restart codex heal missing"
+np=$(awk '/^normalize_profile_seed_perms\(\)/,/^}/' src/cmd_auth.sh)
+[[ "$np" == *'if [[ -z "$profile" ]]; then'*default_creds_secure* ]] \
+  && ok_t "T15 a sign-in with no account (normalize_profile_seed_perms \"\") secures the default logins" || bad_t "T15 no-account normalize missing"
+rm -f "$ENV_DIR"/cx_fresh.env "$ENV_DIR"/gk_fresh.env "$ENV_DIR"/gk_acme.env
 
 # --- T9: AS ROOT, real files, a real group, a real non-member uid -------------
 if (( EUID == 0 )) && command -v groupadd >/dev/null && command -v setpriv >/dev/null; then

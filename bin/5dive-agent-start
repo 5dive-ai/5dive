@@ -911,6 +911,13 @@ if [[ "$TYPE" == "hermes" ]]; then
   }
   seed_one auth.json   mtime
   seed_one config.yaml content
+  # DIVE-7333: the content seed above makes the account's config.yaml win on
+  # every boot, so the seat's own pin (`5dive agent config <name> set model=`)
+  # is written after it, before the gateway restart below picks it up.
+  if [[ -n "${AGENT_MODEL:-}" && -x "$BIN" ]]; then
+    "$BIN" config set model.default "$AGENT_MODEL" >/dev/null 2>&1 \
+      || echo "warn: hermes model pin ($AGENT_MODEL) failed — the seat runs its account's model" >&2
+  fi
   # hermes' messaging gateway is a long-lived user daemon that survives
   # `systemctl restart 5dive-agent@<name>` (cmd_restart bounces the tmux
   # unit; the gateway is a separate `loginctl enable-linger`'d process that
@@ -1077,6 +1084,14 @@ except sqlite3.Error:
 
   if (( _OC_STATE_READ == 1 )); then
     cred_seed_ok
+  elif (( _OC_STATE_READ == 0 )) && [[ -s "$LOCAL_OPENCLAW_STATE" ]] \
+       && python3 -I -c "$OPENCLAW_STATE_AUTH_PY" has "$LOCAL_OPENCLAW_STATE" 2>/dev/null; then
+    # DIVE-7333: the seat cannot read its account's state db and already holds
+    # the key. That is the designed layout, not a fault: root copies the key in
+    # at create and on every restart (seed_openclaw_state_into_seat, DIVE-7101),
+    # so a re-auth does reach it. assert_cred_seeded below would read the legacy
+    # path instead and breadcrumb this healthy seat STALE (degraded in list).
+    cred_seed_ok
   else
     # DIVE-1900: loud on the wrong-layer failure (see assert_cred_seeded above).
     # Skipped when the state db carried the key: on that layout the legacy path
@@ -1155,10 +1170,22 @@ if isinstance(m, dict):
 elif isinstance(m, str):
     print(m)
 ' 2>/dev/null || true)"
-    if [[ -n "$PROFILE_DEFAULTS" && "$LOCAL_PRIMARY" != "$PROFILE_PRIMARY" ]]; then
+    if [[ -z "${AGENT_MODEL:-}" && -n "$PROFILE_DEFAULTS" && "$LOCAL_PRIMARY" != "$PROFILE_PRIMARY" ]]; then
       printf '%s' "$PROFILE_DEFAULTS" \
         | /home/claude/.local/bin/openclaw config patch --stdin >/dev/null 2>&1 \
         || echo "warn: openclaw config patch (model defaults) failed" >&2
+    fi
+  fi
+  # DIVE-7333: the seat's own pin (`5dive agent config <name> set model=`) wins
+  # over the account's default, so it is applied after that sync, and only when
+  # the seat is not on it already.
+  if [[ -n "${AGENT_MODEL:-}" && -f "$LOCAL_OPENCLAW_CFG" ]]; then
+    if [[ "$(jq -r '(.agents.defaults.model) as $m
+          | if ($m|type) == "object" then ($m.primary // "")
+            elif ($m|type) == "string" then $m else "" end' "$LOCAL_OPENCLAW_CFG" 2>/dev/null)" != "$AGENT_MODEL" ]]; then
+      jq -cn --arg m "$AGENT_MODEL" '{agents: {defaults: {model: {primary: $m}}}}' \
+        | /home/claude/.local/bin/openclaw config patch --stdin >/dev/null 2>&1 \
+        || echo "warn: openclaw model pin ($AGENT_MODEL) failed — the seat runs its account's model" >&2
     fi
   fi
 fi

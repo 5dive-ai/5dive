@@ -162,7 +162,18 @@ _AGENT_LIST_HB_DEFS='
   # cadence (30m -> 3600s) is judged exactly as before.
   def hb_window: (hb_every * 120) | if . < 900 then 900 else . end;
   def hb_seen_fresh: hb_on and (hb_seen > 0) and (hb_seen_age <= hb_window);
-  def hb_stale: hb_on and ((hb_last <= 0) or (hb_age > hb_window));
+  # DIVE-7333: a seat made a minute ago has not had its first tick yet, and
+  # `agent list` straight after `5dive init` called it OVERDUE. Never-run is the
+  # alarm only once the seat is older than the same window. createdAt is
+  # `date -Iseconds` (with its UTC offset); no or unparseable stamp keeps the alarm.
+  def hb_born: (.createdAt // "") as $c
+    | try (if ($c | type) == "string" and ($c | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}")) then
+             (($c[0:19] + "Z") | fromdateiso8601)
+             - ((($c | capture("(?<s>[+-])(?<h>[0-9]{2}):?(?<m>[0-9]{2})$"))
+                 | (.h | tonumber) * 3600 + (.m | tonumber) * 60 | if $c[-6:-5] == "-" then -. else . end) // 0)
+           else 0 end) catch 0;
+  def hb_newborn: (hb_born > 0) and (($now - hb_born) <= hb_window);
+  def hb_stale: hb_on and (((hb_last <= 0) and (hb_newborn | not)) or (hb_age > hb_window));
   def hb_overdue: hb_stale and (hb_seen_fresh | not);
   # Stale by wake-age, but the tick saw it working: the row shows the reason.
   def hb_working: hb_stale and hb_seen_fresh;
@@ -728,10 +739,16 @@ enabled = {}
 started = {}
 if units:
     try:
-        cp = subprocess.run(
-            ["/usr/bin/systemctl", "show", "--property=Id,ActiveState,UnitFileState,ActiveEnterTimestamp", "--timestamp=unix", "--no-page", *units],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
-        )
+        # DIVE-7331: --timestamp=unix needs systemd 251. Ubuntu 22.04's 249
+        # refuses the whole call ("Invalid value: unix.") and every agent read
+        # STATE unknown, so fall back to --timestamp=utc (247+).
+        for ts_flag in ("--timestamp=unix", "--timestamp=utc"):
+            cp = subprocess.run(
+                ["/usr/bin/systemctl", "show", "--property=Id,ActiveState,UnitFileState,ActiveEnterTimestamp", ts_flag, "--no-page", *units],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
+            )
+            if cp.returncode == 0 or cp.stdout.strip():
+                break
         block = {}
         for line in cp.stdout.splitlines() + [""]:
             if not line:
@@ -1082,10 +1099,17 @@ SEAT_FAILING_TURNS = int(os.environ.get("SEAT_FAILING_TURNS") or 3)
 SEAT_FAILING_SECS = int(os.environ.get("SEAT_FAILING_SECS") or 3600)
 
 def unit_started_epoch(text):
-    # `systemctl show --timestamp=unix` prints "@<epoch>"; unreadable -> 0, which
-    # counts every refusal (unknown is not "restarted since").
-    m = re.match(r"^@([0-9]+)$", (text or "").strip())
-    return int(m.group(1)) if m else 0
+    # `systemctl show --timestamp=unix` prints "@<epoch>", the --timestamp=utc
+    # fallback (systemd 249) "Sun 2026-07-19 13:13:35 UTC"; unreadable -> 0,
+    # which counts every refusal (unknown is not "restarted since").
+    text = (text or "").strip()
+    m = re.match(r"^@([0-9]+)$", text)
+    if m:
+        return int(m.group(1))
+    m = re.match(r"^[A-Za-z]{3} ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)? UTC$", text)
+    if m:
+        return int(dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp())
+    return 0
 
 def _iso_epoch(v):
     ts = re.sub(r"\.[0-9]+", "", str(v or ""))
@@ -1661,6 +1685,18 @@ resolve_agent_model() {
     antigravity)
       f="$home/.gemini/antigravity-cli/settings.json"
       priv_read "$f" jq -r '.model // .selectedModel // empty' "$f" ;;
+    openclaw)
+      # model is `{primary: …}` or a bare string (see selfcheck_cred_reached_agent).
+      f="$home/.openclaw/openclaw.json"
+      { priv_read "$f" jq -r '(.agents.defaults.model) as $m
+        | if ($m|type) == "object" then ($m.primary // empty)
+          elif ($m|type) == "string" then $m else empty end' "$f"; } || true ;;
+    hermes)
+      # `model:` block's `default:` key, or a bare `model: <id>`.
+      f="$home/.hermes/config.yaml"
+      { priv_read "$f" sed -nE -e 's/^model:[[:space:]]*["'"'"']?([^"'"'"'#[:space:]]+).*/\1/p' \
+          -e '/^model:/,/^[^[:space:]]/s/^[[:space:]]+default:[[:space:]]*["'"'"']?([^"'"'"'#[:space:]]+).*/\1/p' "$f" \
+          | head -1; } || true ;;
     *) printf '' ;;
   esac
 }

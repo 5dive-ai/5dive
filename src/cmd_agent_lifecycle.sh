@@ -11,8 +11,11 @@ normalize_restart_profile_perms() {
   profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$reg" 2>/dev/null) || return 0
   # DIVE-5701: an unbound codex seat seeds from the canonical codex account,
   # whose readers are kept per seat now.
+  # DIVE-7335: and when that account is empty (a fresh box), from the default
+  # login `codex login` left in /home/claude/.codex, so heal that one too.
   if [[ -z "$profile" && "$(jq -r --arg n "$name" '.agents[$n].type // empty' <<<"$reg" 2>/dev/null)" == codex ]]; then
     profile=codex
+    ! declare -F default_creds_secure >/dev/null || default_creds_secure
   fi
   # DIVE-5714: a seat on no account seeds from the default logins.
   if [[ -z "$profile" ]]; then

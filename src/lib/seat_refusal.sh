@@ -29,10 +29,19 @@ SEAT_REFUSAL_TEXT_RE='credit balance is too low|invalid api key|not logged in|pl
 
 # seat_started_epoch <name> — when the seat's unit last became active, 0 when
 # that cannot be read (0 counts every refusal: unknown is not "restarted since").
+# DIVE-7331: --timestamp=unix needs systemd 251. Ubuntu 22.04's 249 refuses the
+# whole call ("Invalid value: unix."), so fall back to --timestamp=utc (247+),
+# which prints "Sun 2026-07-19 13:13:35 UTC".
 seat_started_epoch() {
-  local ts="" e=""
-  ts=$(systemctl show -p ActiveEnterTimestamp --value --timestamp=unix "5dive-agent@${1}.service" 2>/dev/null) || ts=""
+  local ts="" e="" flag
+  for flag in --timestamp=unix --timestamp=utc; do
+    ts=$(systemctl show -p ActiveEnterTimestamp --value "$flag" "5dive-agent@${1}.service" 2>/dev/null) && break
+    ts=""
+  done
   e="${ts#@}"
+  if [[ "$ts" =~ ^[A-Za-z]{3}\ ([0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?\ UTC$ ]]; then
+    e=$(date -u -d "${BASH_REMATCH[1]}" +%s 2>/dev/null) || e=0
+  fi
   [[ "$e" =~ ^[0-9]+$ ]] || e=0
   printf '%s\n' "$e"
 }
