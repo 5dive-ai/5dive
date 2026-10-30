@@ -72,6 +72,16 @@ t "verification tests"                         "clean" "$(hit '39/39 verificatio
 t "identity of the caller (code talk)"         "clean" "$(hit 'we assert the identity of the caller matches')"
 t "empty pane"                                 "clean" "$(hit '')"
 
+# --- 2026-10-30: `age` is a whole word, not the start of `agents` ------------
+# ops' idle summary paged lodar as an ID challenge on the bare `age` prefix.
+t "confirm agents (ops idle summary)"          "clean" \
+  "$(hit "    runs 5dive doctor --category=plugins to confirm agents' plugin")"
+t "verify agents' copies"                      "clean" "$(hit 'verify agents are on the new build')"
+# POSITIVE CONTROLS for the boundary: age at the end of a wrapped line, and
+# followed by punctuation, must still trip.
+t "confirm your age (end of line)"             "tripped" "$(hit 'To keep chatting, confirm your age')"
+t "verify your age. (punctuation)"             "tripped" "$(hit 'Please verify your age.')"
+
 # --- DIVE-4405: the stem `verif` is not a challenge -------------------------
 # On 2026-09-13 lodar was paged twice for idle accounts. The clause
 # `(to continue|you must)[^.]{0,30}verif` matched an ordinary closure line
