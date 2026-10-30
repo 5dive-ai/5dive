@@ -38,9 +38,9 @@ locals {
   snapshot_name = "5dive-ubuntu-24-04-${formatdate("YYYYMMDD-hhmm", timestamp())}"
   # DigitalOcean's clean-up and image-check scripts, pinned to a commit and to
   # their sha256. A newer upstream copy is a deliberate bump of all three.
-  do_tools_ref     = "b70878804ca27c01d5f5e882d26485defbaba210"
-  do_cleanup_sha   = "5e2fe7ce30892a26ed2731238d9f26c40ae8b1084b070ce095f3b99ab1a2cc81"
-  do_imgcheck_sha  = "91ff2b1880439c97ccdc49554c5ed8901b89ef250c8ac5fffe52811c68abac49"
+  do_tools_ref    = "b70878804ca27c01d5f5e882d26485defbaba210"
+  do_cleanup_sha  = "5e2fe7ce30892a26ed2731238d9f26c40ae8b1084b070ce095f3b99ab1a2cc81"
+  do_imgcheck_sha = "91ff2b1880439c97ccdc49554c5ed8901b89ef250c8ac5fffe52811c68abac49"
 }
 
 source "digitalocean" "fivedive" {
