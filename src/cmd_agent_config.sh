@@ -116,8 +116,8 @@ cmd_config() {
         if [[ "$v" != "none" ]] && [[ "${TYPE_CHANNELS[$type]:-0}" != "1" ]]; then
           fail "$E_VALIDATION" "type '$type' does not support channels"
         fi
-        if [[ "$type" != "claude" && "$type" != "codex" ]] && channel_in_list dashboard "$v"; then
-          fail "$E_VALIDATION" "channels=dashboard requires type=claude or codex (agent '$name' is type $type)"
+        if ! type_has_web_chat "$type" && channel_in_list dashboard "$v"; then
+          fail "$E_VALIDATION" "channels=dashboard requires type=claude, codex or grok (agent '$name' is type $type)"
         fi
         # DIVE-3333: same claude-only rule for buzz (agent_setup.sh refuses it
         # in install_channel_for_agent, and 5dive-agent-start refuses it again).
