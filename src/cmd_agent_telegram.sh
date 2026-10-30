@@ -6,13 +6,22 @@
 # blocks for up to <poll_secs> waiting for an update. <poll_secs> is capped
 # below the upstream exec timeout so the HTTP layer doesn't kill the call
 # mid-poll. Pure curl + jq — no extra deps.
+#
+# --since=<unix-ts> (DIVE-7332): only a message SENT at or after that time
+# counts. Older pending updates are skipped and confirmed (getUpdates offset),
+# so a message someone sent the bot before setup began is never mistaken for
+# the owner's /start — bot usernames are public. drop_pending_updates below
+# does not do this on its own: init QA measured a pairing 0.7 s after the
+# prompt, from a message that was already queued. Without --since the first
+# pending message wins, as before.
 cmd_telegram_discover() {
-  local token="" agent="" poll_secs=50
+  local token="" agent="" poll_secs=50 since=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --token=*)      token="${1#--token=}" ;;
       --agent=*)      agent="${1#--agent=}" ;;
       --poll-secs=*)  poll_secs="${1#--poll-secs=}" ;;
+      --since=*)      since="${1#--since=}" ;;
       -*)             fail "$E_USAGE" "unknown flag: $1" ;;
       *)              fail "$E_USAGE" "extra arg: $1" ;;
     esac
@@ -41,11 +50,13 @@ cmd_telegram_discover() {
     token=$(cat)
     token="${token//[$'\r\n\t ']/}"
   fi
-  [[ -n "$token" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-discover {--token=<bot-token>|--token=-|--agent=<name>} [--poll-secs=N]  (--token=- reads the token from stdin)"
+  [[ -n "$token" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-discover {--token=<bot-token>|--token=-|--agent=<name>} [--poll-secs=N] [--since=<unix-ts>]  (--token=- reads the token from stdin)"
   valid_telegram_token "$token" \
     || fail "$E_VALIDATION" "telegram token format looks wrong (expected <digits>:<20+ chars>)"
   [[ "$poll_secs" =~ ^[0-9]+$ ]] && (( poll_secs >= 1 && poll_secs <= 90 )) \
     || fail "$E_VALIDATION" "--poll-secs must be 1..90"
+  [[ "$since" =~ ^[0-9]+$ ]] \
+    || fail "$E_VALIDATION" "--since must be a unix timestamp in seconds"
 
   # deleteWebhook + drop_pending_updates clears any existing webhook AND
   # discards stale updates so the first message we surface is one the user
@@ -58,44 +69,59 @@ cmd_telegram_discover() {
 
   # Long-poll. timeout=N tells Telegram to hold the connection open for up
   # to N seconds waiting for an update, returning earlier if one arrives.
-  # curl's max-time is set just above so the socket survives the wait.
-  local resp
-  resp=$(curl -sS -m "$((poll_secs + 5))" \
-    --data-urlencode "timeout=${poll_secs}" \
-    --data-urlencode "limit=1" \
-    --data-urlencode "allowed_updates=[\"message\"]" \
-    "https://api.telegram.org/bot${token}/getUpdates" 2>/dev/null || true)
+  # curl's max-time is set just above so the socket survives the wait. With
+  # --since, a round that brings only older updates confirms them (offset)
+  # and polls again for what is left of the budget.
+  local resp count upd="" offset=0 remain
+  local deadline=$(( $(date +%s) + poll_secs ))
+  while true; do
+    remain=$(( deadline - $(date +%s) ))
+    (( remain < 0 )) && remain=0
+    local -a q=(--data-urlencode "timeout=${remain}" --data-urlencode "limit=100"
+                --data-urlencode "allowed_updates=[\"message\"]")
+    (( offset > 0 )) && q+=(--data-urlencode "offset=${offset}")
+    resp=$(curl -sS -m "$((remain + 5))" "${q[@]}" \
+      "https://api.telegram.org/bot${token}/getUpdates" 2>/dev/null || true)
 
-  # Empty / non-JSON response → treat as no message yet (dashboard re-polls).
-  if ! jq -e . >/dev/null 2>&1 <<<"$resp"; then
-    ok "" '{found:false}'
-    return
-  fi
-  if [[ "$(jq -r '.ok' <<<"$resp" 2>/dev/null)" != "true" ]]; then
-    local desc
-    desc=$(jq -r '.description // "telegram api error"' <<<"$resp" 2>/dev/null)
-    fail "$E_GENERIC" "telegram: $desc"
-  fi
-  local count
-  count=$(jq -r '.result | length' <<<"$resp")
-  if [[ "$count" == "0" ]]; then
+    # Empty / non-JSON response → treat as no message yet (dashboard re-polls).
+    if ! jq -e . >/dev/null 2>&1 <<<"$resp"; then
+      ok "" '{found:false}'
+      return
+    fi
+    if [[ "$(jq -r '.ok' <<<"$resp" 2>/dev/null)" != "true" ]]; then
+      local desc
+      desc=$(jq -r '.description // "telegram api error"' <<<"$resp" 2>/dev/null)
+      fail "$E_GENERIC" "telegram: $desc"
+    fi
+    count=$(jq -r '.result | length' <<<"$resp")
+    if [[ "$count" != "0" ]]; then
+      upd=$(jq -c --argjson s "$since" \
+        'first(.result[] | select((.message.date // 0) >= $s)) // empty' <<<"$resp")
+      [[ -n "$upd" ]] && break
+      offset=$(jq -r '[.result[].update_id] | max + 1' <<<"$resp")
+    fi
+    (( remain > 0 )) || break
+  done
+  if [[ -z "$upd" ]]; then
     ok "" '{found:false}'
     return
   fi
 
   # Pull the message's `from` (user) + `chat`. For private DMs they're the
   # same numeric id, but allowing them to differ keeps groups working too.
-  local user_id chat_id username first_name
-  user_id=$(jq -r '.result[0].message.from.id // empty' <<<"$resp")
-  chat_id=$(jq -r '.result[0].message.chat.id // empty' <<<"$resp")
-  username=$(jq -r '.result[0].message.from.username // empty' <<<"$resp")
-  first_name=$(jq -r '.result[0].message.from.first_name // empty' <<<"$resp")
+  local user_id chat_id username first_name sent_at
+  user_id=$(jq -r '.message.from.id // empty' <<<"$upd")
+  chat_id=$(jq -r '.message.chat.id // empty' <<<"$upd")
+  username=$(jq -r '.message.from.username // empty' <<<"$upd")
+  first_name=$(jq -r '.message.from.first_name // empty' <<<"$upd")
+  sent_at=$(jq -r '.message.date // empty' <<<"$upd")
   [[ -n "$user_id" && -n "$chat_id" ]] \
     || fail "$E_GENERIC" "telegram update missing from.id or chat.id"
 
   ok "discovered chat $chat_id (user $user_id)" \
-     '{found:true, userId:$u, chatId:$c, username:$un, firstName:$fn}' \
-     --arg u "$user_id" --arg c "$chat_id" --arg un "$username" --arg fn "$first_name"
+     '{found:true, userId:$u, chatId:$c, username:$un, firstName:$fn, sentAt:$d}' \
+     --arg u "$user_id" --arg c "$chat_id" --arg un "$username" --arg fn "$first_name" \
+     --arg d "$sent_at"
 }
 
 # Token -> bot username via Telegram getMe. Returns username on stdout (exit 0)
