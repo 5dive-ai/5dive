@@ -78,14 +78,14 @@ sudo 5dive agent create scout --type=codex --auth-profile=gpt
 
 ## Hire agents and teams
 
-Hire ready-made agents from the [marketplace](https://5dive.ai/marketplace?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme), from a CEO and a CTO to legal counsel and support, or a whole team at once, like a startup or a small online shop. Each agent brings its own persona, model and skills; a team adds roles, an org chart and a starting backlog.
+Hire ready-made agents from the [marketplace](https://5dive.ai/marketplace?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme), from a CEO and a CTO to legal counsel and support, or a whole team at once, like a startup or an online shop. Each agent brings its own persona, model and skills; a team adds roles, an org chart and a starting backlog.
 
 ```sh
 sudo 5dive agent import olivia --as=ceo                     # hire one agent
 sudo 5dive team import startup --auth-profile=<account>     # hire a team: CEO, CMO, CTO, researcher, creative
 ```
 
-Ready-made teams: `startup`, `marketing`, `dropshipping` (a small online shop), `deploy-team` and `trading-desk` (trading research).
+Ready-made teams: `startup`, `marketing`, `dropshipping` (the Ecommerce Team), `deploy-team` and `trading-desk`.
 
 ## Ask, tell, task
 
