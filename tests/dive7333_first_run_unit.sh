@@ -11,6 +11,8 @@
 #   E  `config set model=` had no openclaw/hermes arm: the pin rides the seat's
 #      env file (AGENT_MODEL), and the model readers know both config files
 #   F  the boot seed breadcrumbed that same healthy openclaw seat STALE
+#   G  init offered Grok while it was off, installed it, ran the sign-in, and
+#      only then had create refuse it; it now asks to turn Grok on first
 # install.sh's last screen is tests/install_update_hint_unit.sh.
 #
 # Pure: no root, no systemd, no network. Run: bash tests/dive7333_first_run_unit.sh
@@ -119,6 +121,23 @@ has 'the boot applies AGENT_MODEL to hermes'            "$start" 'config set mod
 echo "== F: the boot does not breadcrumb a seat that holds its key =="
 seed=$(sed -n '/if (( _OC_STATE_READ == 1 )); then/,/assert_cred_seeded openclaw/p' bin/5dive-agent-start)
 has 'a seat-held key with an unreadable account db is cred_seed_ok' "$seed" '"$OPENCLAW_STATE_AUTH_PY" has "$LOCAL_OPENCLAW_STATE"'
+
+echo "== G: init asks to turn Grok on before the install and sign-in =="
+# shellcheck source=/dev/null
+source "$SRC/cmd_grok.sh"; source "$SRC/cmd_init.sh"; set +e
+export FIVE_GROK_ARM_MARKER="$TMP/arm/grok-unfreeze"
+ENABLED=0
+cmd_grok_enable() { ENABLED=1; [[ "${ANSWER:-n}" == y ]] && { mkdir -p "$TMP/arm"; : >"$FIVE_GROK_ARM_MARKER"; }; return 0; }
+ANSWER=n; _init_grok_on 2>/dev/null; is 'Grok off and the owner says no: init does not go on with Grok' "$?" 1
+ANSWER=y; _init_grok_on 2>/dev/null; is 'the owner says yes: init goes on with Grok'                     "$?" 0
+ENABLED=0; _init_grok_on 2>/dev/null; is 'already on: no second question'                                "$ENABLED/$?" 0/0
+cmd_grok_enable() { fail "$E_PERMISSION" "only the server owner can turn Grok on"; }
+rm -f "$FIVE_GROK_ARM_MARKER"
+( _init_grok_on 2>/dev/null; echo "rc=$?" ) >"$TMP/g.out"
+is 'a refused enable returns to the wizard instead of ending it' "$(tail -1 "$TMP/g.out")" 'rc=1'
+BODY=$(declare -f cmd_init)
+pre=${BODY%%cmd_install \"\$type\"*}; pre=${pre%%auth login*}
+[[ "$pre" == *_init_grok_on* ]]; is 'the Grok question comes before the install and the sign-in' "$?" 0
 
 echo
 echo "$PASS passed, $FAIL failed"
