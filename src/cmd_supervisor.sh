@@ -433,8 +433,12 @@ _SUP_ALERT_WINDOW_H="${SUPERVISOR_ALERT_WINDOW_H:-24}"
 # (`verify your` / `verify you`) — the bare stem appears in no alternative. No
 # trailing space is required after it: a TUI wraps, and "…please verify your"
 # can legitimately be the last thing on a line.
+#
+# The first clause ends on a whole word: a bare `age` admitted `agents`, so
+# ops' idle summary "…to confirm agents' plugin copies…" paged lodar as an ID
+# challenge on 2026-10-30.
 _SUP_VERIFY_PAT="${SUPERVISOR_VERIFY_PAT:-}"
-[[ -n "$_SUP_VERIFY_PAT" ]] || _SUP_VERIFY_PAT='(verify|confirm)[[:space:]]+(your[[:space:]]+)?(identity|age)|please[[:space:]]+verify[[:space:]]+your|(to[[:space:]]+continue|you[[:space:]]+must)[^.]{0,30}verify[[:space:]]+(your|you)|government[- ]?issued[[:space:]]+(photo[[:space:]]+)?id|verify[[:space:]]+that[[:space:]]+you[[:space:]]+are[[:space:]]+(over|at[[:space:]]+least)|age[[:space:]-]*restricted'
+[[ -n "$_SUP_VERIFY_PAT" ]] || _SUP_VERIFY_PAT='(verify|confirm)[[:space:]]+(your[[:space:]]+)?(identity|age)([^[:alnum:]]|$)|please[[:space:]]+verify[[:space:]]+your|(to[[:space:]]+continue|you[[:space:]]+must)[^.]{0,30}verify[[:space:]]+(your|you)|government[- ]?issued[[:space:]]+(photo[[:space:]]+)?id|verify[[:space:]]+that[[:space:]]+you[[:space:]]+are[[:space:]]+(over|at[[:space:]]+least)|age[[:space:]-]*restricted'
 
 # ── DIVE-4405: OUR OWN ALERT, RENDERED INTO A PANE, IS NOT PANE EVIDENCE ─────
 #
