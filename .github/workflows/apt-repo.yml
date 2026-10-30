@@ -1,0 +1,194 @@
+name: apt-repo
+# DIVE-6800: `sudo apt install 5dive` — a signed apt repo, built from each
+# release tag, served by GitHub Pages at https://5dive-ai.github.io/5dive/apt.
+# A second install option next to the curl one-liner, for a sysadmin who wants
+# a signed package and `apt upgrade` instead of `curl | bash`.
+#
+# WHAT A PUBLISH IS. The newest release tag plus the two before it (so
+# `apt install 5dive=<previous>` is a rollback), each packaged by
+# packaging/deb/build-deb.sh from its own tag tree, laid out and signed by
+# build-repo.sh, then proven by test-apt.sh BEFORE the deploy: the signature is
+# checked and a changed InRelease is refused; the README's two lines install and
+# set up the newest version on a clean ubuntu:24.04; and the previous version
+# moves to the newest with `apt-get upgrade` + `5dive-setup`. A red arm deploys
+# nothing; the live repo keeps the last good publish.
+#
+# Old .debs are not stored anywhere: every publish rebuilds them from their
+# tags, and build-deb.sh is reproducible so the same tag gives the same bytes.
+#
+# WHY workflow_run (the same reason as docker-image.yml): release-cut.yml pushes
+# its tag with github.token, and a github.token push starts no workflow, so a
+# tag trigger here would never fire. The newest tag is read with install.sh's
+# rule (strict vX.Y.Z, sort -V), minus the tags .release-hold names, and a tag
+# already in the live pool is skipped. workflow_dispatch republishes by hand.
+#
+# ONE-TIME SETUP, by a repo admin, before the first publish (a publish without
+# it goes red naming what is missing):
+#   1. Pages on, source "GitHub Actions" (repo Settings > Pages).
+#   2. Repo secret APT_SIGNING_KEY: an armored, passphrase-less OpenPGP secret
+#      key (ed25519, signing only). Its public half is what users trust; it is
+#      published as apt/5dive.gpg on every deploy. Losing the secret means a new
+#      key and every user re-running the README's first line.
+#
+# Pull requests that touch packaging build and test against the existing tags
+# with a throwaway key and deploy nothing. Not a required check.
+on:
+  workflow_run:
+    workflows: [release-cut]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Newest release tag to publish (vX.Y.Z). Empty = newest.'
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - 'packaging/deb/**'
+      - '.github/workflows/apt-repo.yml'
+      - 'README.md'
+
+concurrency:
+  group: apt-repo-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
+
+env:
+  APT_BASE: https://5dive-ai.github.io/5dive/apt
+  KEEP: '3'
+
+jobs:
+  plan:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.p.outputs.tags }}
+      newest: ${{ steps.p.outputs.newest }}
+      old: ${{ steps.p.outputs.old }}
+      publish: ${{ steps.p.outputs.publish }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: p
+        env:
+          WANT: ${{ inputs.tag }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # Held tags: a bare vX.Y.Z at column 1 of .release-hold (its own header).
+          held="$(grep -oE '^v[0-9]+\.[0-9]+\.[0-9]+' .release-hold || true)"
+          mapfile -t all < <(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
+          if [[ -n "$WANT" ]]; then
+            printf '%s\n' "${all[@]}" | grep -qx "$WANT" || { echo "::error::no release tag $WANT"; exit 1; }
+          fi
+          picked=()
+          for (( i=${#all[@]}-1; i>=0 && ${#picked[@]}<KEEP; i-- )); do
+            t="${all[i]}"
+            if [[ -n "$WANT" && "$(printf '%s\n%s\n' "$t" "$WANT" | sort -V | tail -1)" != "$WANT" ]]; then continue; fi
+            if grep -qx "$t" <<<"$held"; then echo "skip $t: held in .release-hold"; continue; fi
+            # Tags before the DIVE-6849 layout are not packaged (build-deb.sh refuses them).
+            git cat-file -e "$t:bin/host-scripts.manifest" 2>/dev/null || break
+            picked=("$t" "${picked[@]}")
+          done
+          (( ${#picked[@]} )) || { echo "::error::no packageable release tag"; exit 1; }
+          newest="${picked[-1]}"
+          old=""; (( ${#picked[@]} > 1 )) && old="${picked[-2]}"
+          publish=false
+          case "$EVENT" in
+            workflow_dispatch) publish=true ;;
+            workflow_run)
+              code="$(curl -sS -o /dev/null -w '%{http_code}' -I "$APT_BASE/pool/main/5/5dive/5dive_${newest#v}_all.deb" || true)"
+              if [[ "$code" == 200 ]]; then echo "$newest is already in the live pool — nothing to publish"; else publish=true; fi ;;
+          esac
+          echo "tags: ${picked[*]}  newest: $newest  old: ${old:-none}  publish: $publish"
+          { echo "tags=${picked[*]}"; echo "newest=$newest"; echo "old=$old"; echo "publish=$publish"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true' || github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils dpkg-dev gnupg >/dev/null
+
+      - name: Signing key
+        env:
+          PUBLISH: ${{ needs.plan.outputs.publish }}
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"; install -d -m 700 "$GNUPGHOME"
+          if [[ "$PUBLISH" == true ]]; then
+            [[ -n "$APT_SIGNING_KEY" ]] || { echo "::error::repo secret APT_SIGNING_KEY is not set — see this workflow's ONE-TIME SETUP header (DIVE-6800)"; exit 1; }
+            gpg --batch --quiet --import <<<"$APT_SIGNING_KEY"
+          else
+            gpg --batch --quiet --passphrase '' --quick-gen-key '5dive apt PR test key <noreply@example.com>' ed25519 sign 1d
+          fi
+          fpr="$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')"
+          [[ -n "$fpr" ]] || { echo "::error::no secret key in the keyring"; exit 1; }
+          { echo "GNUPGHOME=$GNUPGHOME"; echo "APT_GPG_KEY_ID=$fpr"; } >> "$GITHUB_ENV"
+          echo "signing with $fpr"
+
+      - name: Build the .debs
+        env:
+          TAGS: ${{ needs.plan.outputs.tags }}
+        run: |
+          set -euo pipefail
+          for t in $TAGS; do
+            git worktree add -q --detach "$RUNNER_TEMP/tree-$t" "$t"
+            bash packaging/deb/build-deb.sh "$RUNNER_TEMP/tree-$t" "$RUNNER_TEMP/debs"
+          done
+
+      - name: Lay out and sign the repo
+        env:
+          PUBLISH: ${{ needs.plan.outputs.publish }}
+        run: |
+          set -euo pipefail
+          live=""; [[ "$PUBLISH" == true ]] && live="$APT_BASE"
+          bash packaging/deb/build-repo.sh "$RUNNER_TEMP/debs" site/apt $live
+
+      - name: Arm — signature verified, a changed InRelease refused
+        run: bash packaging/deb/test-apt.sh signature site/apt
+
+      - name: Arm — README lines on a clean ubuntu:24.04, then apt upgrade old -> new
+        env:
+          NEWEST: ${{ needs.plan.outputs.newest }}
+          OLD: ${{ needs.plan.outputs.old }}
+        run: |
+          set -euo pipefail
+          (cd site/apt && exec python3 -m http.server 8765 --bind 127.0.0.1) >/dev/null 2>&1 &
+          for _ in $(seq 30); do curl -fsS -o /dev/null http://127.0.0.1:8765/5dive.gpg && break; sleep 1; done
+          docker run --rm --network host -v "$PWD:/src:ro" ubuntu:24.04 \
+            bash /src/packaging/deb/test-apt.sh fresh http://127.0.0.1:8765
+          if [[ -n "$OLD" ]]; then
+            docker run --rm --network host -v "$PWD:/src:ro" ubuntu:24.04 \
+              bash /src/packaging/deb/test-apt.sh upgrade http://127.0.0.1:8765 "${OLD#v}" "${NEWEST#v}"
+          else
+            echo "::warning::only one packageable tag — the upgrade arm did not run"
+          fi
+
+      - if: needs.plan.outputs.publish == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.d.outputs.page_url }}apt/
+    steps:
+      - id: d
+        uses: actions/deploy-pages@v4

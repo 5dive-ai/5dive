@@ -1,0 +1,18 @@
+#!/bin/sh
+# DIVE-6800: one line, nothing else. No network, no users, no services: the
+# box setup is `sudo 5dive-setup`, run by the owner (Debian norms; the row).
+set -e
+
+if [ "$1" = configure ]; then
+  live=/usr/local/bin/5dive
+  pkg=$(grep -m1 'readonly FIVE_VERSION=' /usr/share/5dive/bundle/5dive | sed 's/.*="\([^"]*\)".*/\1/')
+  if [ ! -x "$live" ]; then
+    echo "Next: sudo 5dive-setup"
+  else
+    cur=$(grep -m1 'readonly FIVE_VERSION=' "$live" 2>/dev/null | sed 's/.*="\([^"]*\)".*/\1/' || true)
+    if [ "$cur" != "$pkg" ]; then
+      echo "Next: sudo 5dive-setup (moves this box from ${cur:-?} to $pkg)"
+    fi
+  fi
+fi
+exit 0
