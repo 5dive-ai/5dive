@@ -140,15 +140,20 @@ else
 #!/bin/bash
 # 0.21.5: no unit installed -> restart runs the gateway in the foreground.
 echo "$*" >> "$REC/argv"
-[[ "$1 $2" == "gateway restart" ]] && exec sleep 30
+[[ "$1 $2" == "gateway restart" ]] && { echo $$ > "$REC/gwpid"; exec sleep 30; }
 exit 0
 FAKE
   chmod +x "$TMP/gw/hermes"
   run_blk() { # HOME BIN -> rc of the block under a 5s cap
-    REC="$TMP/gw/rec" HOME="$1" XDG_CONFIG_HOME="" BIN="$2" timeout 5 bash -c "$fn"$'\n'"$blk" 2>/dev/null
+    # setsid: timeout's group kill must not reach this harness
+    REC="$TMP/gw/rec" HOME="$1" XDG_CONFIG_HOME="" BIN="$2" \
+      timeout 5 setsid bash -c "$fn"$'\n'"$blk" >/dev/null 2>&1
+    local rc=$?
+    [[ -s "$TMP/gw/rec/gwpid" ]] && kill "$(cat "$TMP/gw/rec/gwpid")" 2>/dev/null
+    return "$rc"
   }
   : > "$TMP/gw/rec/argv"
-  run_blk "$TMP/gw/home" "$TMP/gw/hermes"; rc=$?
+  rc=0; run_blk "$TMP/gw/home" "$TMP/gw/hermes" || rc=$?
   (( rc != 124 )) && ok_t "with no gateway unit, start goes on to tmux" \
     || bad_t "with no gateway unit, start blocks on the foreground gateway" "rc=$rc"
   [[ ! -s "$TMP/gw/rec/argv" ]] && ok_t "with no gateway unit, no gateway restart is run" \
@@ -157,7 +162,7 @@ FAKE
   : > "$TMP/gw/home/.config/systemd/user/hermes-gateway.service"
   printf '#!/bin/bash\necho "$*" >> "$REC/argv"\n' > "$TMP/gw/hermes-svc"; chmod +x "$TMP/gw/hermes-svc"
   : > "$TMP/gw/rec/argv"
-  run_blk "$TMP/gw/home" "$TMP/gw/hermes-svc"
+  run_blk "$TMP/gw/home" "$TMP/gw/hermes-svc" || :
   grep -qx 'gateway restart' "$TMP/gw/rec/argv" \
     && ok_t "with the gateway unit installed, start still bounces it" \
     || bad_t "an installed gateway is no longer restarted on start" "$(cat "$TMP/gw/rec/argv")"
