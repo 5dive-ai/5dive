@@ -849,6 +849,18 @@ fi
 # false and the seed silently no-ops — leaving the agent with no auth.json
 # and hermes erroring "No Codex credentials stored." on every message.
 # Route both checks through `sudo -n test` (same fix as openclaw below).
+# hermes names the unit hermes-gateway.service, or hermes-gateway-<profile>
+# / -<hash> for a non-default HERMES_HOME, in the user unit dir or (for
+# `gateway install --system`) the system one.
+hermes_gateway_unit_installed() {
+  local f
+  for f in "${XDG_CONFIG_HOME:-$HOME/.config}"/systemd/user/hermes-gateway*.service \
+           /etc/systemd/system/hermes-gateway*.service; do
+    [[ -e "$f" ]] && return 0
+  done
+  return 1
+}
+
 if [[ "$TYPE" == "hermes" ]]; then
   AGENT_HERMES_HOME="$HOME/.hermes"
   install -d -m 700 "$AGENT_HERMES_HOME"
@@ -907,8 +919,13 @@ if [[ "$TYPE" == "hermes" ]]; then
   # changes — even when the change landed outside the profile dir (e.g.
   # the operator edited `/home/claude/.hermes/config.yaml` directly or
   # used hermes' own CLI) and the seed loop above had nothing to copy.
-  if [[ -x "$BIN" ]]; then
-    "$BIN" gateway restart >&2 2>&1 \
+  # Only when the gateway unit is installed (ensure_hermes_gateway, i.e. the
+  # seat has a channel): with no unit, hermes 0.21+ `gateway restart` runs
+  # the gateway in the FOREGROUND, so this script never reached tmux
+  # new-session and the seat came up with no session (DIVE-7330). Older
+  # hermes made the same case a no-op, so skipping it keeps their behaviour.
+  if [[ -x "$BIN" ]] && hermes_gateway_unit_installed; then
+    "$BIN" gateway restart >&2 2>&1 </dev/null \
       || echo "warn: hermes gateway restart failed — new config will only take effect on next boot" >&2
   fi
 fi

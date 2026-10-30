@@ -124,6 +124,45 @@ smoke_src=$(cat scripts/harness-smoke.sh)
 [[ "$smoke_src" == *'step seat-version'* && "$smoke_src" == *'sudo -u "agent-${name}" -H bash -c'* && "$smoke_src" == *'exec timeout 60 "$0" --version'* ]] \
   && ok_t "the nightly harness smoke runs the harness as the seat" || bad_t "harness smoke has no seat-level start step"
 
+# --- 4. the start script never hands its foreground to the gateway -----------
+# hermes 0.21+ `gateway restart` with no installed gateway unit RUNS the
+# gateway in the foreground, so the start script never reached tmux and the
+# seat had no session (harness-smoke step=start, 180s). Driven here with the
+# start script's own block and a fake hermes whose restart never returns.
+start_src=bin/5dive-agent-start
+fn=$(sed -n '/^hermes_gateway_unit_installed() {/,/^}/p' "$start_src")
+blk=$(awk '/^  if \[\[ -x "\$BIN" \]\].*hermes_gateway_unit_installed/,/^  fi$/' "$start_src")
+if [[ -z "$fn" || -z "$blk" ]]; then
+  bad_t "the guarded gateway-restart block is not in the start script"
+else
+  mkdir -p "$TMP/gw/home" "$TMP/gw/rec"
+  cat > "$TMP/gw/hermes" <<'FAKE'
+#!/bin/bash
+# 0.21.5: no unit installed -> restart runs the gateway in the foreground.
+echo "$*" >> "$REC/argv"
+[[ "$1 $2" == "gateway restart" ]] && exec sleep 30
+exit 0
+FAKE
+  chmod +x "$TMP/gw/hermes"
+  run_blk() { # HOME BIN -> rc of the block under a 5s cap
+    REC="$TMP/gw/rec" HOME="$1" XDG_CONFIG_HOME="" BIN="$2" timeout 5 bash -c "$fn"$'\n'"$blk" 2>/dev/null
+  }
+  : > "$TMP/gw/rec/argv"
+  run_blk "$TMP/gw/home" "$TMP/gw/hermes"; rc=$?
+  (( rc != 124 )) && ok_t "with no gateway unit, start goes on to tmux" \
+    || bad_t "with no gateway unit, start blocks on the foreground gateway" "rc=$rc"
+  [[ ! -s "$TMP/gw/rec/argv" ]] && ok_t "with no gateway unit, no gateway restart is run" \
+    || bad_t "gateway restart ran with no unit" "$(cat "$TMP/gw/rec/argv")"
+  mkdir -p "$TMP/gw/home/.config/systemd/user"
+  : > "$TMP/gw/home/.config/systemd/user/hermes-gateway.service"
+  printf '#!/bin/bash\necho "$*" >> "$REC/argv"\n' > "$TMP/gw/hermes-svc"; chmod +x "$TMP/gw/hermes-svc"
+  : > "$TMP/gw/rec/argv"
+  run_blk "$TMP/gw/home" "$TMP/gw/hermes-svc"
+  grep -qx 'gateway restart' "$TMP/gw/rec/argv" \
+    && ok_t "with the gateway unit installed, start still bounces it" \
+    || bad_t "an installed gateway is no longer restarted on start" "$(cat "$TMP/gw/rec/argv")"
+fi
+
 TOTAL=$((PASS+FAIL))
 if (( FAIL )); then echo "FAIL: $FAIL of $TOTAL hermes seat-start arms failed"
 else echo "PASS: $PASS of $TOTAL hermes seat-start arms"; fi
