@@ -56,7 +56,7 @@ mkdir -p "$TMP/reg/teams"
 cat > "$TMP/reg/teams/index.json" <<'JSON'
 {"registryFormat":1,"companies":[
  {"slug":"startup","name":"Lean SaaS startup","size":1,"roster":[{"key":"ceo","role":"CEO"}],
-  "path":"teams/startup.5dive.yaml","schemaVersion":2},
+  "path":"teams/startup.5dive.yaml","schemaVersion":2,"aliases":["old-startup"]},
  {"slug":"from-the-future","name":"Future","size":1,"roster":[{"key":"ceo","role":"CEO"}],
   "path":"teams/from-the-future.5dive.yaml","schemaVersion":9}
 ]}
@@ -285,6 +285,37 @@ else
   bad_t 'T14 one unreadable template suppressed a readable roster' "rc=$rc out=$out"
 fi
 eval "$_teams_get_ok"
+
+# --- T15-T17 DIVE-7289: a renamed team keeps its old name --------------------
+# `aliases` lists slugs an entry used to have. The old name must import the SAME
+# template (named by the new slug), and a box that imported it under the old
+# name keeps that project key, or the rename splits one team into two records.
+: > "$GETLOG"; REG_RC=0; BODY_RC=0
+f=$(_team_resolve_template old-startup); rc=$?
+if (( rc == 0 )) && [[ "${f##*/}" == startup.5dive.yaml ]] && grep -q 'slug: startup' "$f"; then
+  ok_t 'T15 an old name resolves to the renamed template, saved under the new slug'
+else
+  bad_t 'T15 an alias does not resolve to its team' "rc=$rc file=$f"
+fi
+idx=$(_teams_registry_index)
+PROJECT_ROWS=""
+tasks_db_init() { :; }
+sqlq() { printf "'%s'" "$1"; }
+db() { local k; for k in $PROJECT_ROWS; do [[ "$1" == *"key='$k'"* ]] && echo 1; done; return 0; }
+k1=$(_team_registry_key old-startup "$idx")
+PROJECT_ROWS="old-startup"; k2=$(_team_registry_key startup "$idx")
+PROJECT_ROWS="startup old-startup"; k3=$(_team_registry_key old-startup "$idx")
+if [[ "$k1" == startup ]]; then
+  ok_t 'T16 a box with neither name records the team under the new slug'
+else
+  bad_t 'T16 a fresh import via the old name is not keyed by the new slug' "got $k1"
+fi
+if [[ "$k2" == old-startup && "$k3" == startup ]]; then
+  ok_t 'T17 a box that has the team under its old name keeps that key; the new slug wins when both exist'
+else
+  bad_t 'T17 the project key ignores the row already on the box' "old-only=$k2 both=$k3"
+fi
+unset -f db sqlq tasks_db_init
 
 echo "-----"
 echo "team_registry_unit: $PASS passed, $FAIL failed"
