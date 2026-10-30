@@ -1373,6 +1373,7 @@ _a2a_queue_put() {
   if [[ "${_WAKE_VOUCH:-0}" == "1" ]]; then
     sudo -u "agent-${name}" touch "${dir}/${id}.vouch" 2>/dev/null || true
   fi
+  _a2a_spool_mark "$name"
   return 0
 }
 
@@ -1381,6 +1382,45 @@ _a2a_queue_depth() {
   local name="$1" dir
   dir="$(_a2a_queue_dir "$name")"
   sudo -u "agent-${name}" find "$dir" -maxdepth 1 -name '*.msg' 2>/dev/null | wc -l
+}
+
+# DIVE-7307 — THE DEPTH, WHERE `agent list` CAN READ IT. The spool lives in the
+# target's home and only `sudo -u agent-<seat>` can count it, while `agent list`
+# is a rootless read (DIVE-1074): a cli-scoped lead saw `idle (no work)` with an
+# order still spooled, read it as "never landed", and nearly re-sent it. So every
+# root party that moves the spool (put, and the tick's sweep, which also re-reads
+# every seat each pass) records the count here, beside the registry and readable
+# the same way. Absent file = empty spool, so a seat that never spooled has none.
+_a2a_spool_mark_dir() { printf '%s\n' "${STATE_DIR:-/var/lib/5dive}/a2a-spool"; }
+
+# <seat> [depth] — record the depth (re-counted when not given); 0 removes the
+# marker. Best-effort and always rc 0: a lost marker costs the hint, never a send.
+_a2a_spool_mark() {
+  local name="$1" depth="${2-}" dir tmp
+  [[ -n "$depth" ]] || depth="$(_a2a_queue_depth "$name" 2>/dev/null || true)"
+  depth="${depth//[^0-9]/}"
+  [[ -n "$depth" ]] || return 0
+  dir="$(_a2a_spool_mark_dir)"
+  if (( depth > 0 )); then
+    mkdir -p "$dir" 2>/dev/null || return 0
+    # Same read class as the registry (0640, group claude via the setgid parent),
+    # spelled out so a writer's umask can never hide it from the rootless reader.
+    chmod 2750 "$dir" 2>/dev/null || true
+    tmp="${dir}/.${name}.$$"
+    { printf '%s\n' "$depth" > "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" "${dir}/${name}"; } 2>/dev/null \
+      || rm -f "$tmp" 2>/dev/null || true
+  else
+    rm -f "${dir}/${name}" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# <seat> -> the recorded depth on stdout, 0 when there is none. No sudo.
+_a2a_spool_marked() {
+  local n=""
+  n="$(cat "$(_a2a_spool_mark_dir)/${1}" 2>/dev/null || true)"
+  n="${n//[^0-9]/}"
+  printf '%s\n' "${n:-0}"
 }
 
 # Should this send be spooled instead of typed? Deliberately a separate pure-ish

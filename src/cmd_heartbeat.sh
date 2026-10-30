@@ -532,6 +532,10 @@ _hb_a2a_queue_sweep() {
   for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
     depth=$(_a2a_queue_depth "$name")
     [[ "$depth" =~ ^[0-9]+$ ]] || continue
+    # DIVE-7307: every seat, every tick, BEFORE the skips below — this is what
+    # clears a marker the spool's own writers did not (a drained or hand-emptied
+    # spool, a stopped seat's), so `agent list` is never more than a tick stale.
+    _a2a_spool_mark "$name" "$depth"
     (( depth > 0 )) || continue
     systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null || continue
     seats+=("$name")
@@ -551,6 +555,7 @@ _hb_a2a_queue_sweep() {
       else
         depth=$(_a2a_queue_depth "$name")
       fi
+      [[ "$depth" =~ ^[0-9]+$ ]] && _a2a_spool_mark "$name" "$depth"
       [[ "$depth" =~ ^[0-9]+$ ]] && (( depth > 0 )) && remaining+=("$name")
     done
     seats=( ${remaining[@]+"${remaining[@]}"} )
