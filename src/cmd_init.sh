@@ -551,33 +551,62 @@ USAGE
 
     # Resolve bot @username up front (degrade silently on any failure —
     # discover still works, we just lose the tap-to-open hint).
-    local getme_json
+    local getme_json tg_where="your bot"
     getme_json=$(5dive agent telegram-getme --token="$telegram_token" --json 2>/dev/null || true)
     if jq -e '.ok and .data.username' <<<"$getme_json" >/dev/null 2>&1; then
       username=$(jq -r '.data.username' <<<"$getme_json")
-      _init_note "Open Telegram → @$username → send /start. Waiting up to ~2 min…"
-    else
-      _init_note "Open Telegram → your bot → send /start. Waiting up to ~2 min…"
+      tg_where="@$username"
     fi
 
     # Long-poll for the first inbound DM so we can auto-allowlist the user
     # without a manual pair-code paste — same ~2-min budget as the
     # dashboard's discover loop. On miss, fall back to manual pair-code.
-    local attempt discover_json
-    for attempt in 1 2; do
-      discover_json=$(5dive agent telegram-discover --token="$telegram_token" --poll-secs=60 --json 2>/dev/null || true)
-      if jq -e '.ok and .data.found' <<<"$discover_json" >/dev/null 2>&1; then
-        telegram_user_id=$(jq -r '.data.userId' <<<"$discover_json")
-        local who
-        who=$(jq -r '.data.username // .data.firstName // empty' <<<"$discover_json")
-        _init_ok "Telegram connected${who:+ ($who)}"
-        break
+    # DIVE-7332: bot usernames are public, so only a message sent AFTER this
+    # prompt counts (--since), and the owner confirms who sent it before that
+    # person goes on the allowlist. Every type's Telegram path runs through here.
+    local discover_json tg_since tg_deadline tg_remain tg_misses=0 tg_who tg_confirm
+    tg_since=$(date +%s)
+    tg_deadline=$((tg_since + 120))
+    _init_note "Open Telegram → $tg_where → send /start. Waiting up to ~2 min…"
+    while (( tg_misses < 4 )); do
+      tg_remain=$((tg_deadline - $(date +%s)))
+      (( tg_remain >= 1 )) || break
+      (( tg_remain > 60 )) && tg_remain=60
+      discover_json=$(5dive agent telegram-discover --token="$telegram_token" --poll-secs="$tg_remain" --since="$tg_since" --json 2>/dev/null || true)
+      if ! jq -e '.ok and .data.found' <<<"$discover_json" >/dev/null 2>&1; then
+        (( tg_misses++ == 0 )) && _init_note "Still waiting for /start…"
+        continue
       fi
-      (( attempt == 1 )) && _init_note "Still waiting for /start…"
+      tg_who=$(jq -r '
+        .data as $d
+        | ($d.firstName // "") as $fn | ($d.username // "") as $un
+        | if $fn != "" and $un != "" then "\($fn) (@\($un))"
+          elif $un != "" then "@\($un)"
+          elif $fn != "" then "\($fn) (id \($d.userId))"
+          else "user id \($d.userId)" end' <<<"$discover_json")
+      _init_pick tg_confirm "Message from $tg_who. Let them talk to $name?" 1 \
+        "yes|Yes, that's me|Only this Telegram account can talk to $name" \
+        "wait|No, keep waiting|Ignore it, wait for your own /start" \
+        "skip|No, pair later|Create $name without a Telegram user"
+      case "$tg_confirm" in
+        yes)
+          telegram_user_id=$(jq -r '.data.userId' <<<"$discover_json")
+          _init_ok "Telegram connected ($tg_who)"
+          break
+          ;;
+        wait)
+          tg_since=$(date +%s)
+          tg_deadline=$((tg_since + 120))
+          tg_misses=0
+          tg_who=""
+          _init_note "Send /start to $tg_where from your own Telegram. Waiting up to ~2 min…"
+          ;;
+        *) tg_who=""; break ;;
+      esac
     done
 
     if [[ -z "$telegram_user_id" ]]; then
-      _init_warn "No message yet; you can pair after setup."
+      _init_warn "No Telegram user paired yet; you can pair after setup."
       _init_note "5dive agent pair $name --code=<code-from-bot>"
     fi
     echo >&2
@@ -620,6 +649,7 @@ USAGE
   _init_review_row "Isolation" "$isolation"
   if [[ "$channels" == "telegram" ]]; then
     _init_review_row "Channel" "Telegram${username:+ (@$username)}"
+    [[ -n "$telegram_user_id" ]] && _init_review_row "Telegram user" "$tg_who"
   else
     _init_review_row "Channel" "Terminal only"
   fi
