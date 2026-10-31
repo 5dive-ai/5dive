@@ -238,12 +238,49 @@ notify_user_skill_src() {
   printf '%s\n' "$AGENT_SKILLS_DIR/notify-user/SKILL.md"
 }
 
+# agent_owned_dir <user> <home> <dir> — make <dir> and every missing parent below
+# <home> owned by the seat, and give the seat back any one of them a root write
+# left root-owned. DIVE-7420: the pack import ran `mkdir -p ~/.grok/skills` as root,
+# so the seat could not create ~/.grok/skills/notify-user when Telegram was
+# connected — the install failed, channels rolled back, and the bot never
+# answered. Never follows a link: rc 1 on a symlinked or non-directory component.
+agent_owned_dir() {
+  local user="$1" home="${2%/}" dir="${3%/}" cur part
+  local -a parts
+  [[ "$dir" == "$home"/* ]] || return 1
+  IFS=/ read -ra parts <<<"${dir#"$home"/}"
+  cur="$home"
+  for part in "${parts[@]}"; do
+    [[ -n "$part" ]] || continue
+    [[ "$part" != "." && "$part" != ".." ]] || return 1
+    cur="$cur/$part"
+    if [[ -L "$cur" ]]; then
+      return 1
+    elif [[ -d "$cur" ]]; then
+      [[ "$(_agent_dir_uid "$cur")" == 0 ]] || continue
+    elif [[ -e "$cur" ]]; then
+      return 1
+    else
+      mkdir "$cur" || return 1
+    fi
+    # Best-effort like the skill body's own chown: an unprivileged caller (the
+    # harnesses) cannot chown, and the dir it made is already its own.
+    chown "${user}:${user}" "$cur" 2>/dev/null || true
+  done
+}
+
+# Seam for the harnesses: the uid that owns a dir.
+_agent_dir_uid() { stat -c %u -- "$1"; }
+
 # seed_notify_user_skill <user> <skills-dir> [<channel-plugin-dir>] — copy the
 # resolved SKILL.md to <skills-dir>/notify-user/. No source on the box is a
 # silent no-op, the same best-effort contract the per-type copies always had.
 seed_notify_user_skill() {
   local user="$1" dest="$2" src
   src=$(notify_user_skill_src "${3:-}") || return 0
+  # DIVE-7420: a skills dir an older pack import left root-owned would refuse the
+  # mkdir below, failing the channel install. Hand it back to the seat first.
+  agent_owned_dir "$user" "/home/${user}" "$dest" || true
   sudo -u "$user" mkdir -p "$dest/notify-user"
   sudo -u "$user" cp "$src" "$dest/notify-user/SKILL.md"
 }

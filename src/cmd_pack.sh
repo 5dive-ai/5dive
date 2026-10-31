@@ -496,7 +496,9 @@ _install_bundled_skill() {
   local dest="$home/$install_dir/$id"
   # DIVE-6796: a reinstall KEEPS a file the bundle lacks (see _pack_skill_merged).
   local merged; merged=$(_pack_skill_merged "$srcdir" "$dest" "$user") || return 1
-  rm -rf "$dest"; mkdir -p "$home/$install_dir" || { rm -rf "$merged"; return 1; }
+  # DIVE-7420: the dir chain as the seat, never root — a root-owned ~/.grok/skills
+  # broke every later skill write the seat makes, notify-user's included.
+  rm -rf "$dest"; agent_owned_dir "$user" "$home" "$home/$install_dir" || { rm -rf "$merged"; return 1; }
   cp -r "$merged" "$dest" || { rm -rf "$merged"; return 1; }
   rm -rf "$merged"
   chown -R "${user}:${user}" "$dest" 2>/dev/null || true
