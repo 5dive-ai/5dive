@@ -19,7 +19,8 @@
 #   init           `5dive init` stopped, asked something unexpected, or failed
 #   pin            the seat could not be put on the cheapest model
 #   reply          the agent's own answer never arrived, or was wrong
-#   webchat        (hermes, openclaw) a 5dive app chat message got no answer, or a wrong one
+#   webchat        (hermes, openclaw) a 5dive app chat message got no answer, or a wrong one,
+#                  or one was answered while the web chat was still off (negative control)
 #   readme         (claude on 24.04) a command the README shows failed on this box
 #                  (DIVE-7370, scripts/init-smoke-readme.py; it runs on a skipped
 #                  reply too, since most README commands need no model)
@@ -216,6 +217,12 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
 PY
 }
 
+# drop_inbox <inbox> <text>: the shelld drop contract, a temp name then a rename to *.json.
+drop_inbox() {
+  jq -cn --arg t "$2" '{text: $t, chat_id: "dashboard"}' \
+    | sudo -u "agent-${NAME}" bash -c 'mkdir -p "$1" && cat > "$1/.m.tmp" && mv "$1/.m.tmp" "$1/m.json"' _ "$1"
+}
+
 webchat_arm() {
   local home inbox a b want out _
   home=$(getent passwd "agent-${NAME}" | cut -d: -f6)
@@ -226,16 +233,26 @@ webchat_arm() {
   printf 'DASHBOARD_API_BASE=http://127.0.0.1:%s\nCONNECTORD_TOKEN=init-smoke-not-a-token\n' "$FAKE_API_PORT" \
     > "$home/.claude/channels/dashboard/.env"
   chown "agent-${NAME}" "$home/.claude/channels/dashboard/.env"
+  inbox="$home/.claude/channels/dashboard/agent-inbox"
+  # DIVE-7387 negative control: the same drop with the web chat still off must
+  # go unanswered, so the answer below came through the web chat and nothing else.
+  a=$((RANDOM % 400 + 100)) b=$((RANDOM % 400 + 500))
+  drop_inbox "$inbox" "What is $a + $b? Reply with only the number."
+  sleep 30
+  if grep -q . /tmp/webchat-replies.jsonl; then
+    DETAIL="negative control: with the web chat off, a dropped message was still answered: $(jq -r '.body // empty' /tmp/webchat-replies.jsonl | tail -1 | cut -c1-300)"
+    return 1
+  fi
+  # Unanswered, as it should be; gone before the bridge's first look at the inbox.
+  rm -f "$inbox/m.json"
+  echo "control: with the web chat off, a message asking $a + $b got no reply in 30s"
   out=$(5dive agent config "$NAME" set channels=dashboard 2>&1) || {
     DETAIL="agent config set channels=dashboard failed: $(printf '%s' "$out" | tail -1)"; return 1; }
   printf '%s\n' "$out" | tail -5
   seat_up || { DETAIL="the seat did not come back up with the web chat on"; return 1; }
   sleep 20
   a=$((RANDOM % 400 + 100)) b=$((RANDOM % 400 + 500)) want=$((a + b))
-  inbox="$home/.claude/channels/dashboard/agent-inbox"
-  # The shelld drop contract: a temp name, then a rename to *.json.
-  jq -cn --arg t "What is $a + $b? Reply with only the number." '{text: $t, chat_id: "dashboard"}' \
-    | sudo -u "agent-${NAME}" bash -c 'mkdir -p "$1" && cat > "$1/.m.tmp" && mv "$1/.m.tmp" "$1/m.json"' _ "$inbox"
+  drop_inbox "$inbox" "What is $a + $b? Reply with only the number."
   for _ in $(seq 1 100); do
     grep -q . /tmp/webchat-replies.jsonl 2>/dev/null && break
     sleep 3
