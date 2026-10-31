@@ -271,7 +271,7 @@ eq_t "E6 the notifier's fallback is scoped, not board-wide" "olivia" "$(_task_re
 # goes back to board-wide for that path only.
 declare -a SITES=(
   "src/task/crud.sh|_task_resolve_coordinator \"\$(task_actor"
-  "src/cmd_goal.sh|_task_resolve_coordinator \"\$(task_actor"
+  "src/cmd_goal.sh|_task_resolve_planner \"\$(task_actor"
   "src/task/loops.sh|_task_resolve_coordinator \"\$creator\""
   "src/cmd_heartbeat.sh|_task_resolve_coordinator \"\$filer\""
   "src/task/routing.sh|_task_resolve_coordinator \"\$_assignee\""
@@ -284,6 +284,20 @@ for _s in "${SITES[@]}"; do
     && ok_t "F ${_f##*/} passes a subject: ${_pat}" \
     || fail_t "F ${_f##*/} does NOT pass a subject — expected to find: ${_pat}"
 done
+# goal add calls `_task_resolve_planner` (DIVE-7380), which adds a lone-agent
+# fallback for an EMPTY chart. The site guard above only means "the filer's
+# team decides" if the planner hands its subject on to the coordinator, so that
+# is asserted on a two-root chart, where a dropped subject resolves nothing.
+chart
+place olivia 'AI CEO'                     -
+place main   'engineering — coordinator'  olivia
+place dev3   'feature work'               main
+place marcus 'ops root'                   -
+place ops    'ops work'                   marcus
+eq_t "F planner passes its subject on: olivia's subtree picks its coordinator" "main"   "$(_task_resolve_planner dev3)"
+eq_t "F planner passes its subject on: marcus's subtree picks its own root"    "marcus" "$(_task_resolve_planner ops)"
+eq_t "F planner on a non-empty chart adds no lone-agent guess off-chart"       "$(_task_resolve_coordinator nobody-here)" "$(_task_resolve_planner nobody-here)"
+
 # The two objective planners resolve the subject from the row rather than a
 # local, so they are matched on the query shape instead of a variable name.
 _obj_n=$(grep -cF '_task_resolve_coordinator "$(db "SELECT COALESCE(created_by,'"''"') FROM objectives' src/cmd_objective.sh)
