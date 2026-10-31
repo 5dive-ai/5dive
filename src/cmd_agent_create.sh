@@ -635,6 +635,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _merge_do"*|\
         "/usr/local/bin/5dive _route_do"|"/usr/local/bin/5dive _pkg_do"|\
         "/usr/local/bin/5dive _dashboard_relay"|\
+        "/usr/local/bin/5dive _chat_e2e"|\
         "/usr/local/bin/5dive _secret_link_notify"|\
         "/usr/local/bin/5dive agent _peek *"|"/usr/local/bin/5dive agent _skill_give *"|\
         "/usr/local/bin/5dive heartbeat _self on"|"/usr/local/bin/5dive heartbeat _self off"|\
@@ -807,6 +808,11 @@ ${user} ALL=(root) NOPASSWD: /usr/local/lib/5dive/push-notify.sh *
 # and is the agent of every call, so it reads and replies as ITSELF only. The
 # root side builds each body itself and posts to one of three fixed URLs.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _dashboard_relay
+# DIVE-6878: and, on a server with encrypted chat, opens and seals each message
+# through root, so the box key never reaches this seat. EXACT path, NO args, NO
+# wildcard: one JSON request on stdin (open, seal, seal-file only); root writes
+# the message type itself, so a seat cannot make a body read as a device list.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _chat_e2e
 # DIVE-5367: let this seat read the account usage board and switch ITSELF
 # between accounts the box already holds, so the owner Telegram /account
 # picker and /usage work on a standard seat. EXACT path, NO args, NO wildcard:
