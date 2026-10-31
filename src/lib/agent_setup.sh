@@ -1567,8 +1567,11 @@ install_channel_for_openclaw_agent() {
     prepare_dashboard_bridge "$user"
     step "Setting openclaw gateway.mode for $user"
     # The gateway refuses to start with gateway.mode unset (see below).
-    sudo -u "$user" -H bash -c 'export NVM_DIR=/home/claude/.nvm; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; export PATH="/home/claude/.local/bin:$PATH"; /home/claude/.local/bin/openclaw config set gateway.mode local 2>&1 | tail -3' >&2 \
-      || warn "openclaw config set gateway.mode failed for agent '$name' (rerun: sudo -u $user -H openclaw config set gateway.mode local)"
+    # DIVE-7355: and bind it to loopback by name. In a container openclaw's
+    # default bind is 0.0.0.0, which it refuses without a gateway token, so
+    # every web chat message got "OpenClaw could not answer just now".
+    sudo -u "$user" -H bash -c 'export NVM_DIR=/home/claude/.nvm; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; export PATH="/home/claude/.local/bin:$PATH"; /home/claude/.local/bin/openclaw config set gateway.mode local 2>&1 | tail -3 && /home/claude/.local/bin/openclaw config set gateway.bind loopback 2>&1 | tail -3' >&2 \
+      || warn "openclaw config set gateway.mode/gateway.bind failed for agent '$name' (rerun: sudo -u $user -H openclaw config set gateway.mode local; sudo -u $user -H openclaw config set gateway.bind loopback)"
     return 0
   fi
   [[ -n "$token" ]] || fail "$E_VALIDATION" "openclaw $plugin channel requires a bot token"
@@ -1623,6 +1626,9 @@ chmod 600 "$TOKEN_FILE"
 # "suspicious or clobbered config" guard), so set it explicitly. `local`
 # matches the binding the agent uses (loopback on 127.0.0.1:18789).
 "$OPENCLAW" config set gateway.mode local 2>&1 | tail -3
+# DIVE-7355: say loopback, or a container's default bind (0.0.0.0) makes the
+# gateway refuse to start without a token.
+"$OPENCLAW" config set gateway.bind loopback 2>&1 | tail -3
 
 # `openclaw channels add` is idempotent — re-running with the same channel/
 # account just updates the stored token, which is what we want when an agent

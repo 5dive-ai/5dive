@@ -3668,6 +3668,12 @@ _hb_agent_pane_idle() {
     case "$st" in *"esc to interrupt"*) return 1 ;; esac
     grep -qE '…[[:space:]]*\([0-9]+[smh]' <<<"$st" && return 1
   fi
+  # DIVE-7355: hermes draws this in its composer exactly while a turn runs
+  # (hermes_cli/cli_tui_mixin.py, _agent_running). Its pane can sit byte-stable
+  # for a whole sample while it starts the model, and hermes has no idle marker,
+  # so without this a running turn read as idle: `ask` pressed Enter five times
+  # and reported its own question unconfirmed (init-smoke 10-31, 3 of 4 cells).
+  case "$a" in *"msg=interrupt · /queue"*) return 1 ;; esac
   sleep "$gap"
   b=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 2
   [[ "$a" == "$b" ]] || return 1

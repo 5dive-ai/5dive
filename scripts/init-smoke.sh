@@ -12,8 +12,8 @@
 # `run` expects docker/harness-smoke.Dockerfile, booted, with the tree staged at
 # /opt/5dive-bundle and the driver at /usr/local/sbin/init-smoke-drive. The key
 # comes in $INIT_SMOKE_KEY. It writes /init-smoke-result.json; result is pass,
-# fail, or skip (no test key: install and init still ran, on a placeholder key,
-# and the reply was not asked). A red names the cell, the OS and the step:
+# fail, or skip (no test key, or a test key out of credit: install and init
+# still ran, and the reply was not asked or not graded). A red names the cell, the OS and the step:
 #
 #   install-5dive  install.sh from the tree under test did not finish
 #   init           `5dive init` stopped, asked something unexpected, or failed
@@ -303,6 +303,13 @@ run_arm() {
     fi
     STEP="" DETAIL=""
     finish pass
+  fi
+  # DIVE-7355: an empty balance on the CI test key is funding, not the product:
+  # skip (neutral, like no key) until it is topped up. Anything else stays red.
+  if grep -qi 'credit balance is too low' <<<"$out"; then
+    DETAIL="the $(cell_key "$CELL") test key is out of credit (the seat's AI account refused the turn): install, init and pin ran; the reply was not graded"
+    show_seat
+    finish skip
   fi
   DETAIL="asked $a + $b, the reply did not say $want (ask exited $rc): $(printf '%s' "$out" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-300)"
   show_seat

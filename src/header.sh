@@ -565,7 +565,14 @@ declare -A TYPE_INSTALL=(
   # then build tools), and `5dive init` has a terminal, so init stopped at a
   # Hermes question nobody explained. With no terminal it takes its own
   # non-interactive branch; TYPE_SYSLIB (cmd_auth.sh) has installed what it asks for.
-  [hermes]="[[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_PIN_COMMIT}/scripts/install.sh | setsid -w bash -s -- --skip-setup --branch ${HERMES_PIN_TAG} --commit ${HERMES_PIN_COMMIT} && chmod 0775 /home/claude/.hermes; }"
+  # DIVE-7355: then the Anthropic SDK, through Hermes's own installer for it
+  # (tools/lazy_deps, pinned by Hermes). Hermes leaves it out and installs it at
+  # the seat's first turn, but the venv is claude's and a seat runs as agent-*,
+  # so on 24.04 every first message died with "The 'anthropic' package is
+  # required". Idempotent: a no-op once it is there, so a box already on Hermes
+  # gets it on its next install too. A failure is a warning, not a dead install:
+  # other providers do not need it.
+  [hermes]="{ [[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_PIN_COMMIT}/scripts/install.sh | setsid -w bash -s -- --skip-setup --branch ${HERMES_PIN_TAG} --commit ${HERMES_PIN_COMMIT} && chmod 0775 /home/claude/.hermes; }; } && { (cd /home/claude/.hermes/hermes-agent && ./venv/bin/python -c 'from tools.lazy_deps import ensure; ensure(\"provider.anthropic\", prompt=False)') || echo 'warn: could not install the Anthropic SDK into Hermes; a Hermes agent on Anthropic will not answer until it is installed' >&2; }"
   # openclaw's launcher is `#!/usr/bin/env node`, so symlinking only the CLI
   # into ~/.local/bin leaves it unexecutable in systemd/create-time envs where
   # nvm's per-version bin directory is absent from PATH. Install a supported
