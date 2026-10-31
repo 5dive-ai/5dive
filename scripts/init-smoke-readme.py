@@ -47,10 +47,7 @@ MODEL = {'agent ask': 'no test key: the agent cannot answer'}
 # every night: a failure is reported as KNOWN with the row, not as red, and a
 # pass is reported as a pass (then delete the entry). Never a skip by another
 # name: each entry names an open row whose DONE WHEN removes it.
-KNOWN = {
-    'goal add': 'DIVE-7380',
-    'agent export': 'DIVE-7380',
-}
+KNOWN = {}
 
 # Flags the README leaves to a person at a terminal (a confirmation prompt).
 ADD = {'plugin add': ['--yes']}

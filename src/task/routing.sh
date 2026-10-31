@@ -129,6 +129,23 @@ _task_resolve_coordinator() {
   fi
 }
 
+# DIVE-7380 — WHO PLANS ON A BOX NOBODY HAS CHARTED. The coordinator above
+# reads the org chart, and a fresh box has none: `init` makes one agent and
+# places it nowhere, so every tier misses and the README's `goal add "<outcome>"`
+# was a new user's first refusal ("no project lead / org coordinator"). With an
+# EMPTY chart and exactly ONE agent on the box there is no choice to get wrong,
+# so that agent plans. Planner call sites only: the coordinator itself is left
+# alone, because an empty chart leaving an unassigned row unassigned is a
+# decision `task add` documents (DIVE-4555's "degrade, do not guess").
+_task_resolve_planner() {
+  local _p; _p=$(_task_resolve_coordinator "${1:-}")
+  if [[ -n "$_p" ]]; then printf '%s' "$_p"; return 0; fi
+  [[ "$(db "SELECT COUNT(*) FROM agents_org;" 2>/dev/null)" == "0" ]] || return 0
+  local _names; _names=$(registry_read 2>/dev/null | jq -r '(.agents // {}) | keys[]' 2>/dev/null) || return 0
+  [[ -n "$_names" && "$(wc -l <<<"$_names")" -eq 1 ]] && printf '%s' "$_names"
+  return 0
+}
+
 # DIVE-4365 part 3 — WHICH BOT RINGS THE PHONE, split out from WHO OWNS THE QUEUE.
 #
 # These were one knob and they are two jobs. `_task_resolve_coordinator` above is
