@@ -15,7 +15,10 @@
 #   - a recipe that exits non-zero is reported as failed, not as a success;
 #   - the presence probe survives SIGPIPE under pipefail on a long ldconfig;
 #   - the map survives cmd_auth.sh being loaded from function scope, the way
-#     the shipped bundle's _load_module evals it (a plain `declare` is local).
+#     the shipped bundle's _load_module evals it (a plain `declare` is local);
+#   - DIVE-7353: everything upstream would otherwise ASK to install (ripgrep,
+#     ffmpeg, its build tools) goes in one apt-get with one line on screen, and
+#     the installer runs with no terminal (setsid), so init never stops at it.
 # ldconfig, apt-get and sudo are PATH stubs; nothing is installed for real.
 #
 # Run: bash tests/hermes_libatomic_install_unit.sh (no root, no network, ~12s: arm 7 waits out cmd_install's 10s bin grace)
@@ -56,8 +59,12 @@ case "\$*" in
   *" update"*) touch "$TMP/lists-fresh"; exit 0 ;;
 esac
 mark() {
-  case "\$*" in *libatomic1*) touch "$TMP/has-libatomic" ;; esac
-  case "\$*" in *build-essential*) touch "$TMP/has-build-essential" ;; esac
+  local a
+  for a in "\$@"; do
+    case "\$a" in -*|install|env|*=*) continue ;; esac
+    touch "$TMP/has-\$a"
+    [[ "\$a" == libatomic1 ]] && touch "$TMP/has-libatomic"
+  done
 }
 case "\${APT_MODE:-ok}" in
   ok) mark "\$@"; exit 0 ;;
@@ -121,7 +128,10 @@ install() {
   ) && RC=0 || RC=$?
 }
 calls() { cat "$TMP/calls" 2>/dev/null; }
-reset() { rm -rf "${TMP:?}/bin" "$TMP/calls" "$TMP/has-libatomic" "$TMP/has-build-essential" "$TMP/lists-fresh"; unset APT_MODE RECIPE_MODE LDCONFIG_LONG LOAD_IN_FUNCTION; }
+reset() { rm -rf "${TMP:?}/bin" "$TMP/calls" "$TMP/"has-* "$TMP/lists-fresh"; unset APT_MODE RECIPE_MODE LDCONFIG_LONG LOAD_IN_FUNCTION; }
+# Every package hermes' TYPE_SYSLIB names, as dpkg-query reads them.
+HERMES_PKGS=(build-essential ripgrep ffmpeg python3-dev libffi-dev)
+present_all() { touch "$TMP/has-libatomic"; for p in "${HERMES_PKGS[@]}"; do touch "$TMP/has-$p"; done; }
 
 # --- 1. missing libatomic: installed with apt, before the recipe ------------
 reset
@@ -131,7 +141,7 @@ check "missing: apt-get installs libatomic1" "$(calls | grep -q '^apt-get .*inst
 check "missing: apt runs BEFORE the recipe" \
   "$(a=$(calls | grep -n '^apt-get' | head -1 | cut -d: -f1); r=$(calls | grep -n '^recipe' | head -1 | cut -d: -f1)
      [[ -n "$a" && -n "$r" && "$a" -lt "$r" ]]; echo $?)" "$(calls)"
-check "missing: the step names the package" "$(grep -q 'Installing libatomic1' <<<"$ALL"; echo $?)" "$ALL"
+check "missing: the step names the package" "$(grep -q 'Installing system packages hermes needs: .*libatomic1' <<<"$ALL"; echo $?)" "$ALL"
 
 # --- 2. empty package lists: one update, then a retry -------------------------
 reset; export APT_MODE=needs-update
@@ -148,13 +158,13 @@ check "apt broken: the recipe never ran" "$(! calls | grep -q '^recipe'; echo $?
 check "apt broken: no 'reported success' line" "$(! grep -q 'reported success' <<<"$ALL"; echo $?)" "$ALL"
 
 # --- 4. already present: apt untouched ----------------------------------------
-reset; touch "$TMP/has-libatomic" "$TMP/has-build-essential"
+reset; present_all
 install hermes
 check "present: exits 0" "$([[ $RC -eq 0 ]]; echo $?)" "rc=$RC out=$ALL"
 check "present: apt-get not called" "$(! calls | grep -q '^apt-get'; echo $?)" "$(calls)"
 
 # --- 5. present at the top of a long ldconfig listing (SIGPIPE) ---------------
-reset; touch "$TMP/has-libatomic" "$TMP/has-build-essential"; export LDCONFIG_LONG=1
+reset; present_all; export LDCONFIG_LONG=1
 install hermes
 check "long ldconfig: still read as present, apt-get not called" "$(! calls | grep -q '^apt-get'; echo $?)" "$(calls)"
 
@@ -165,7 +175,7 @@ check "codex: the install path ran (recipe reached)" "$(calls | grep -q '^recipe
 check "codex: apt-get not called for a type without a system library" "$(! calls | grep -q '^apt-get'; echo $?)" "$(calls)"
 
 # --- 7. the recipe itself fails: say failed, not "reported success" ----------
-reset; touch "$TMP/has-libatomic" "$TMP/has-build-essential"; export RECIPE_MODE=fail
+reset; present_all; export RECIPE_MODE=fail
 install hermes
 check "recipe exit 1: exits non-zero" "$([[ $RC -ne 0 ]]; echo $?)" "out=$ALL"
 check "recipe exit 1: reported as failed with the installer's exit" "$(grep -q 'install failed (installer exit 1)' <<<"$ALL"; echo $?)" "$ALL"
@@ -178,7 +188,7 @@ check "function-scope load: apt-get still installs libatomic1 for hermes" "$(cal
 check "function-scope load: hermes install exits 0" "$([[ $RC -eq 0 ]]; echo $?)" "rc=$RC out=$ALL"
 
 # --- 9. DIVE-7330: the pinned installer needs a C++ compiler ------------------
-reset; touch "$TMP/has-libatomic"
+reset; present_all; rm -f "$TMP/has-build-essential"
 install hermes
 check "no compiler: apt-get installs build-essential" "$(calls | grep -q '^apt-get .*install .*build-essential'; echo $?)" "$(calls)"
 check "no compiler: build-essential lands BEFORE the recipe" \
@@ -186,10 +196,35 @@ check "no compiler: build-essential lands BEFORE the recipe" \
      [[ -n "$a" && -n "$r" && "$a" -lt "$r" ]]; echo $?)" "$(calls)"
 check "no compiler: libatomic1 (present) is not reinstalled" "$(! calls | grep -q 'install .*libatomic1'; echo $?)" "$(calls)"
 check "no compiler: hermes install exits 0" "$([[ $RC -eq 0 ]]; echo $?)" "rc=$RC out=$ALL"
-reset; touch "$TMP/has-libatomic"; export APT_MODE=broken
+reset; present_all; rm -f "$TMP/has-build-essential"; export APT_MODE=broken
 install hermes
 check "no compiler, apt broken: fails naming build-essential, recipe never runs" \
   "$([[ $RC -ne 0 ]] && grep -q 'build-essential' <<<"$ALL" && ! calls | grep -q '^recipe'; echo $?)" "rc=$RC $(calls) $ALL"
+
+# --- 10. DIVE-7353: nothing left for upstream's installer to ask about ---------
+# A fresh cloud image has none of them: upstream asked "Install ripgrep ...
+# ffmpeg ...? [Y/n]" on init's terminal and init stopped there.
+reset
+install hermes
+check "fresh box: ONE apt-get install carries every package hermes asks for" \
+  "$([[ $(calls | grep -c '^apt-get .*install') -eq 1 ]] \
+     && for p in libatomic1 "${HERMES_PKGS[@]}"; do calls | grep '^apt-get .*install' | grep -qw -- "$p" || exit 1; done; echo $?)" "$(calls)"
+check "fresh box: one line on screen says what is installed" \
+  "$([[ $(grep -c 'Installing system packages hermes needs: libatomic1 build-essential ripgrep ffmpeg python3-dev libffi-dev' <<<"$ALL") -eq 1 ]]; echo $?)" "$ALL"
+check "fresh box: hermes install exits 0" "$([[ $RC -eq 0 ]]; echo $?)" "rc=$RC out=$ALL"
+reset; present_all; rm -f "$TMP/has-ffmpeg"
+install hermes
+check "only ffmpeg missing: apt installs ffmpeg alone" \
+  "$(calls | grep '^apt-get .*install' | grep -qw ffmpeg && ! calls | grep '^apt-get .*install' | grep -qw ripgrep; echo $?)" "$(calls)"
+reset; present_all; rm -f "$TMP/has-ripgrep"; export APT_MODE=broken
+install hermes
+check "apt broken: fails naming ripgrep, recipe never runs" \
+  "$([[ $RC -ne 0 ]] && grep -q 'ripgrep' <<<"$ALL" && ! calls | grep -q '^recipe'; echo $?)" "rc=$RC $(calls) $ALL"
+# The recipe hands upstream's installer no terminal: with one, it reads its
+# questions from /dev/tty even though its stdin is curl's pipe.
+recipe=$(source "$ROOT/src/header.sh" >/dev/null 2>&1; printf '%s' "${TYPE_INSTALL[hermes]}")
+check "recipe: upstream's install.sh runs under setsid (no terminal to ask on)" \
+  "$(grep -qE 'install\.sh \| setsid -w bash -s -- --skip-setup' <<<"$recipe"; echo $?)" "$recipe"
 
 echo
 echo "$PASS pass, $FAIL fail"

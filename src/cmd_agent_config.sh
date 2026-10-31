@@ -679,8 +679,11 @@ cmd_config() {
   # SIGTERMs our own sudo subprocess → caller sees a spurious failure even
   # though the config write committed. systemd-run --on-active=1 --collect
   # fires the restart ~1s later as a transient unit that survives our exit.
+  # DIVE-7353: AccuracySec, or "~1s" is anywhere up to a minute (systemd's
+  # default timer slack): a pin then a message, as init-smoke and a person do,
+  # had the restart land mid-reply 15s later and kill the session answering it.
   step "Restarting agent to apply (deferred ~1s)"
-  systemd-run --on-active=1 --collect \
+  systemd-run --on-active=1 --timer-property=AccuracySec=100ms --collect \
     /bin/systemctl restart "5dive-agent@${name}.service" >&2
   local applied_json
   applied_json=$(printf '%s\n' "${applied_keys[@]+"${applied_keys[@]}"}" | jq -R . | jq -cs '. | map(select(length > 0))')

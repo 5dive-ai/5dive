@@ -560,7 +560,12 @@ declare -A TYPE_INSTALL=(
   # seat runs with its OWN ~/.hermes, so every seat died on its first start
   # ("no dependency environment is committed for this install"). Move the pin
   # only after harness-smoke's seat-version step passes on the new commit.
-  [hermes]="[[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_PIN_COMMIT}/scripts/install.sh | bash -s -- --skip-setup --branch ${HERMES_PIN_TAG} --commit ${HERMES_PIN_COMMIT} && chmod 0775 /home/claude/.hermes; }"
+  # DIVE-7353: setsid runs the installer with no terminal at all. Upstream reads
+  # its questions from /dev/tty even when piped (`[Y/n]` for optional packages,
+  # then build tools), and `5dive init` has a terminal, so init stopped at a
+  # Hermes question nobody explained. With no terminal it takes its own
+  # non-interactive branch; TYPE_SYSLIB (cmd_auth.sh) has installed what it asks for.
+  [hermes]="[[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_PIN_COMMIT}/scripts/install.sh | setsid -w bash -s -- --skip-setup --branch ${HERMES_PIN_TAG} --commit ${HERMES_PIN_COMMIT} && chmod 0775 /home/claude/.hermes; }"
   # openclaw's launcher is `#!/usr/bin/env node`, so symlinking only the CLI
   # into ~/.local/bin leaves it unexecutable in systemd/create-time envs where
   # nvm's per-version bin directory is absent from PATH. Install a supported
