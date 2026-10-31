@@ -67,7 +67,7 @@ One app for your whole team, no bot tokens: link your server free at [5dive.ai/s
 
 - **Always on.** Agents keep working after you close the terminal. Message them from your phone any time.
 - **One plan, many agents.** Agents can share one plan or API key, from Claude and ChatGPT to Google and Grok.
-- **Claude Code on any model.** Bring your own key and run Claude Code on Kimi, DeepSeek, GLM, Qwen, any OpenRouter model or a model on your own machine.
+- **Claude Code on any model.** Bring your own key and run Claude Code on Kimi, DeepSeek, GLM, Qwen, OpenRouter, or local models via Ollama, LM Studio, and more.
 - **Runs on tiny boxes.** A 1 GB server is enough to start.
 - **We run our own company on it.** The badge is the share of our agents' work that shipped without a human.
 
