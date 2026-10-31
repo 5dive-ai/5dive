@@ -32,6 +32,19 @@ name: init-smoke
 # check-run onto main's tip, which release-cut.yml reads, so a red holds the
 # next nightly cut. All-skip posts `neutral`, which the cut does not hold on.
 #
+# README ARM (DIVE-7370): on the Claude Code / 24.04 cell, after its reply
+# (or its skip), every `5dive` command README.md shows runs for real on the
+# box (scripts/init-smoke-readme.py; its SKIP list is the one hand-kept part,
+# each skip printed with its reason). A failing command turns the cell red at
+# step=readme. The README is the tree under test's, so a pull request that
+# edits README.md runs its own commands.
+#
+# A SKIP IS NOT A PASS (10-31: 10 green jobs were read as "12 of 12 passed";
+# 4 of 10 had answered). The summary and the check-run title both lead with
+# "init-smoke: N of M setups answered, R failed, S skipped (why)": quote that
+# line, never a count of green jobs. A skipped cell's job carries a step named
+# "SKIPPED, not a pass" and a warning annotation.
+#
 # NEGATIVE CONTROL: dispatch with cli_ref=<a sha before a fix> and cells=<cell>.
 
 on:
@@ -58,6 +71,8 @@ on:
       - '.github/workflows/init-smoke.yml'
       - 'scripts/init-smoke.sh'
       - 'scripts/init-smoke-drive.py'
+      - 'scripts/init-smoke-readme.py'
+      - 'README.md'
 
 permissions:
   contents: read
@@ -166,8 +181,11 @@ jobs:
           docker cp /tmp/bundle/. is:/opt/5dive-bundle
           docker cp smoke/scripts/init-smoke.sh is:/usr/local/sbin/init-smoke
           docker cp smoke/scripts/init-smoke-drive.py is:/usr/local/sbin/init-smoke-drive
+          docker cp smoke/scripts/init-smoke-readme.py is:/usr/local/sbin/init-smoke-readme
+          docker cp tree/README.md is:/opt/init-smoke-README.md
           echo "CLI under test: $(git -C tree rev-parse HEAD)"
       - name: Install, init, pin the cheapest model, first reply
+        id: arm
         env:
           # Pull requests never get a key (they run the rig on a placeholder).
           ANTHROPIC_KEY: ${{ github.event_name != 'pull_request' && secrets.INIT_SMOKE_ANTHROPIC_API_KEY || '' }}
@@ -189,7 +207,17 @@ jobs:
             rc=1
           fi
           cat "/tmp/result/$CELL-$OS.json"
+          docker cp is:/init-smoke-readme.json "/tmp/result/$CELL-$OS-readme.json" 2>/dev/null \
+            && jq -r .line "/tmp/result/$CELL-$OS-readme.json"
+          echo "result=$(jq -r .result "/tmp/result/$CELL-$OS.json")" >> "$GITHUB_OUTPUT"
           exit "$rc"
+      - if: steps.arm.outputs.result == 'skip'
+        name: SKIPPED, not a pass (the agent's reply was not graded)
+        run: |
+          d=$(jq -r .detail "/tmp/result/$CELL-$OS.json")
+          echo "::warning title=$CELL / ubuntu-$OS SKIPPED, not a pass::$d"
+          echo "### ⏭ $CELL / ubuntu-$OS: SKIPPED, not a pass" >> "$GITHUB_STEP_SUMMARY"
+          echo "$d" >> "$GITHUB_STEP_SUMMARY"
       - if: always()
         name: Keep the init log
         run: docker cp is:/tmp/init.log "/tmp/result/$CELL-$OS-init.log" 2>/dev/null || true
@@ -220,7 +248,7 @@ jobs:
           POST: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !inputs.cli_ref }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          red=0 skip=0 lines=""
+          red=0 skip=0 lines="" why=""
           for row in $(echo "$CELLS" | jq -c '.include[]'); do
             c=$(echo "$row" | jq -r .cell); o=$(echo "$row" | jq -r .os)
             f="/tmp/results/$c-$o.json"
@@ -232,27 +260,50 @@ jobs:
             case "$r" in
               pass) lines="$lines| $c | ubuntu-$o | ✅ answered its first question | |"$'\n' ;;
               skip) skip=$((skip + 1))
-                    lines="$lines| $c | ubuntu-$o | ⏭ no test key | $d |"$'\n' ;;
+                    case "$d" in
+                      *"out of credit"*) w="test key out of credit" ;;
+                      *"test key"*) w="no test key" ;;
+                      *) w="other" ;;
+                    esac
+                    why="$why$w"$'\n'
+                    lines="$lines| $c | ubuntu-$o | ⏭ SKIPPED, not a pass: $w | $d |"$'\n' ;;
               *)    red=$((red + 1))
                     lines="$lines| $c | ubuntu-$o | ❌ $s | $d |"$'\n'
                     echo "::error::init-smoke: $c on ubuntu-$o failed at step=$s: $d" ;;
             esac
           done
           total=$(echo "$CELLS" | jq '.include | length')
-          { echo "## init-smoke: $((total - red - skip)) of $total answered, $red failed, $skip without a key"
+          # "4 no test key, 2 test key out of credit"
+          why=$(printf '%s' "$why" | sort | uniq -c | sort -rn | awk '{n=$1; $1=""; printf "%s%d%s", (NR>1?", ":""), n, $0}')
+          head="init-smoke: $((total - red - skip)) of $total setups answered, $red failed, $skip skipped${why:+ ($why)}"
+          # DIVE-7370: the README arm's own line, from whichever cell ran it.
+          readme=""
+          for f in /tmp/results/*-readme.json; do [ -f "$f" ] && readme="$f" && break; done
+          { echo "## $head"
             echo
             echo "| agent | OS | result | what failed |"
             echo "|---|---|---|---|"
-            printf '%s' "$lines"; } | tee -a "$GITHUB_STEP_SUMMARY" > /tmp/summary.md
+            printf '%s' "$lines"
+            if [ -n "$readme" ]; then
+              echo
+              echo "### $(jq -r .line "$readme")"
+              echo
+              echo "| README line | command | result | why |"
+              echo "|---|---|---|---|"
+              jq -r '.commands[] | select(.status != "pass")
+                | "| \(.line) | `\(.readme)` | \(if .status == "fail" then "❌ failed" elif .status == "known" then "⚠️ known-broken" else "⏭ skipped" end) | \(.why) |"' "$readme"
+            fi; } | tee -a "$GITHUB_STEP_SUMMARY" > /tmp/summary.md
+          echo "$head"
+          [ -n "$readme" ] && jq -r .line "$readme"
 
           if [ "$POST" = true ]; then
             tip=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
-            if [ "$red" -gt 0 ]; then
-              concl=failure; title="$red of $total new agents failed between install and their first reply"
-            elif [ "$skip" -gt 0 ]; then
-              concl=neutral; title="$skip of $total cells had no test key; the rest answered"
-            else
-              concl=success; title="every new agent answered its first question on fresh Ubuntu"
+            # The title IS the N-of-M line, whatever the conclusion: the release
+            # cut and the owner's digest quote it, never a count of green jobs.
+            title="$head"
+            if [ "$red" -gt 0 ]; then concl=failure
+            elif [ "$skip" -gt 0 ]; then concl=neutral
+            else concl=success
             fi
             jq -n --arg sha "$tip" --arg c "$concl" --arg t "$title" --arg url "$RUN_URL" \
               --rawfile s /tmp/summary.md \
