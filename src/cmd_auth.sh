@@ -552,6 +552,8 @@ cmd_auth_status() {
       seat_reason="${_rf#*$'\t'}"
       if [[ "${_rf%%$'\t'*}" == refused ]]; then
         seat_say="its own last turn was refused by its AI account: ${seat_reason}"
+      elif [[ "${_rf%%$'\t'*}" == cannot-send ]]; then
+        seat_say="${seat_reason}"
       else
         seat_say="its own turns keep failing on its AI login: ${seat_reason}"
       fi

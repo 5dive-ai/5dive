@@ -4070,6 +4070,14 @@ cmd_create() {
       fail "$E_NOT_INSTALLED" "$type is not installed and no installer is configured (expected at ${TYPE_BIN[$type]})"
     fi
   fi
+  # DIVE-7373: Hermes was already here, so the recipe (and its SDK step) did not
+  # run. A box that installed Hermes before that step existed has no Anthropic
+  # SDK, and every agent made on it would drop its first message. Add it now,
+  # as claude; a no-op test when it is there.
+  if [[ "$type" == hermes && "$(hermes_sdk_state)" == missing ]]; then
+    step "Installing the Anthropic package Hermes needs (as user 'claude')"
+    sudo -u claude -i bash -lc "$HERMES_SDK_STEP" >&2 || true
+  fi
 
   # BYO API-key path: write the credential into the shared (or profile-scoped)
   # state dir before the auth gate runs — auth_status_one then sees the

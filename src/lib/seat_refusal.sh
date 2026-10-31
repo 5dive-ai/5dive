@@ -89,13 +89,60 @@ printf "{\"__stop_ms\":%s}\n" "$m"'
   printf '%s\n' "$raw"
 }
 
-# seat_turn_trouble <name> [since-epoch] — "<refused|failing>\t<what happened>",
-# rc 0, when the seat cannot answer; rc 1 for anything else, including an
-# unreadable transcript: no reading is not trouble, and this must never turn a
-# healthy seat red. Only turns at or after since count.
+# DIVE-7373 — the third way a seat cannot answer, and the one that is known
+# BEFORE a turn: a Hermes seat whose AI provider needs a package that is not in
+# Hermes's venv. Hermes (0.21.5) leaves the Anthropic SDK out of its install and
+# adds it at the seat's first message, which a seat cannot do: the venv is
+# claude's, the seat's own ~/.hermes/bin has no uv, and Ubuntu's python3 has no
+# ensurepip. The pane says "Your message was not sent" while the credential file
+# is present, so `agent list` read AUTH ok / ready. The venv is the reading: it
+# is what Hermes imports from. The fix installs into it as claude
+# (TYPE_INSTALL[hermes] re-runs the step on `agent install hermes --upgrade`).
+# Test seam: HERMES_AGENT_DIR.
+HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-/home/claude/.hermes/hermes-agent}"
+HERMES_SDK_FIX="sudo 5dive agent install hermes --upgrade"
+
+# hermes_sdk_state — "present", "missing", or "unknown" (no Hermes here, or a
+# venv this caller cannot read).
+hermes_sdk_state() {
+  local lib="$HERMES_AGENT_DIR/venv/lib"
+  if [[ ! -d "$HERMES_AGENT_DIR/tools" || ! -r "$lib" || ! -x "$lib" ]]; then echo unknown
+  elif compgen -G "$lib/python3*/site-packages/anthropic/__init__.py" >/dev/null; then echo present
+  else echo missing; fi
+}
+
+# hermes_missing_sdk <name> — the package name, rc 0, when <name> is a Hermes
+# seat on a provider whose package Hermes's venv lacks. rc 1 for anything else,
+# and for anything this caller cannot read: no reading is not trouble.
+hermes_missing_sdk() {
+  local name="$1" cfg provider=""
+  [[ "$(hermes_sdk_state)" == missing ]] || return 1
+  declare -F agent_type >/dev/null 2>&1 || return 1
+  [[ "$(agent_type "$name" 2>/dev/null)" == hermes ]] || return 1
+  # The seat's own config.yaml (re-seeded from claude's at every start), else
+  # claude's: model.provider is what the seat connects with.
+  for cfg in "${AGENT_HOME_ROOT:-/home}/agent-${name}/.hermes/config.yaml" /home/claude/.hermes/config.yaml; do
+    [[ -r "$cfg" ]] || continue
+    provider=$(awk '/^model:/{m=1; next} /^[^[:space:]#]/{m=0} m && /^[[:space:]]+provider:/{gsub(/["\047]/, "", $2); print $2; exit}' "$cfg")
+    break
+  done
+  [[ "$provider" == anthropic ]] || return 1
+  printf 'anthropic\n'
+}
+
+# seat_turn_trouble <name> [since-epoch] — "<refused|failing|cannot-send>\t<what
+# happened>", rc 0, when the seat cannot answer; rc 1 for anything else,
+# including an unreadable transcript: no reading is not trouble, and this must
+# never turn a healthy seat red. Only turns at or after since count; a
+# cannot-send seat (DIVE-7373) is a fact about the box, not a turn, so it counts
+# whenever it is read.
 seat_turn_trouble() {
-  local name="$1" since="${2:-0}" raw out
+  local name="$1" since="${2:-0}" raw out pkg
   [[ "$since" =~ ^[0-9]+$ ]] || since=0
+  if pkg=$(hermes_missing_sdk "$name"); then
+    printf "cannot-send\tHermes cannot send a message: the '%s' package its AI provider needs is not installed. Install it: %s\n" "$pkg" "$HERMES_SDK_FIX"
+    return 0
+  fi
   raw=$(_seat_recent_records "$name") || return 1
   # A turn is a prompt (a user record that is not a tool result) and the last
   # assistant record after it. fromjson? because `tail` can cut a record.
@@ -143,7 +190,7 @@ seat_turn_trouble() {
 }
 
 # seat_account_refusal <name> [since-epoch] — what went wrong, rc 0, when the
-# seat cannot answer (either kind). The kind is seat_turn_trouble's first field.
+# seat cannot answer (any kind). The kind is seat_turn_trouble's first field.
 seat_account_refusal() {
   local t
   t=$(seat_turn_trouble "$@") || return 1
