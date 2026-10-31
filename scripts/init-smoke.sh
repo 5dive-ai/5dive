@@ -264,6 +264,8 @@ webchat_arm() {
   done
   echo "--- web chat replies ---"; cat /tmp/webchat-replies.jsonl
   if ! grep -q . /tmp/webchat-replies.jsonl; then
+    # DIVE-7417: on hermes the answer comes from its gateway; show why it is not up.
+    [[ -r "$home/.hermes/gateway-fallback.log" ]] && { echo "--- hermes gateway (run by the seat) ---"; tail -20 "$home/.hermes/gateway-fallback.log"; }
     DETAIL="a web chat message got no reply in 300s"; return 1
   fi
   if ! jq -r '.body // empty' /tmp/webchat-replies.jsonl | grep -qw -- "$want"; then

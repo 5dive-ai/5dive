@@ -191,5 +191,26 @@ eq_t "smoke: claude keeps its Anthropic steps" "Anthropic API key" "$(bash "$SM"
 grep -qE "grep -qiE '[^']*insufficient credits" "$SM" \
   && ok_t "smoke: an empty OpenRouter balance is a skip, like Anthropic's" || bad_t "smoke: OpenRouter's out-of-credit reply is not recognised"
 
+# Hermes web chat with no per-user service manager: the seat runs the gateway itself.
+AS=bin/5dive-agent-start
+_scan=$(sed -n '/for _p in "\${FIVE_PROC_ROOT:-\/proc}"\/\[0-9\]\*; do/,/^ *done$/p' "$AS")
+[[ -n "$_scan" ]] && ok_t "start: the gateway scan is there" || bad_t "start: no gateway scan in the start script"
+gw_up() { local _gw="" _p; eval "$_scan"; [[ -n "$_gw" ]]; }
+fakeproc() { # <dir> <cmdline>...: one fake /proc entry per cmdline, NUL-separated like the kernel's
+  local d="$1" i=100; shift; rm -rf "$d"; mkdir -p "$d"
+  for c in "$@"; do mkdir "$d/$i"; printf '%s' "$c" | tr ' ' '\0' > "$d/$i/cmdline"; i=$((i+1)); done
+}
+fakeproc "$TMP/proc" "/bin/bash /usr/local/bin/5dive-agent-start my-agent" "grep -q hermes_cli[.]main gateway run" "bun server.ts --runtime=hermes"
+FIVE_PROC_ROOT="$TMP/proc" gw_up && bad_t "start: the scan sees a gateway with none running (it matched its own grep?)" || ok_t "start: the scan finds no gateway when none runs"
+fakeproc "$TMP/proc" "/bin/bash /usr/local/bin/5dive-agent-start my-agent" "/home/claude/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main gateway run"
+FIVE_PROC_ROOT="$TMP/proc" gw_up && ok_t "start: the scan finds a service-run gateway" || bad_t "start: the scan misses a running gateway"
+bash -c 'exec -a "python -m hermes_cli.main gateway run" sleep 30' & _fake=$!
+sleep 0.3
+gw_up && ok_t "start: the scan finds a real gateway process in /proc" || bad_t "start: the scan misses a real gateway process"
+kill "$_fake" 2>/dev/null; wait "$_fake" 2>/dev/null || true
+grep -qE '^ *"\$BIN" gateway run </dev/null' "$AS" && ! grep -qE '"\$BIN" gateway run --replace' "$AS" \
+  && ok_t "start: the fallback runs the gateway without --replace, so it never kills a service-run one" \
+  || bad_t "start: the fallback gateway run is missing or uses --replace"
+
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

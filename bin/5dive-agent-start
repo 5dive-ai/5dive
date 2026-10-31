@@ -2514,6 +2514,30 @@ if [[ "$TYPE" == "hermes" || "$TYPE" == "openclaw" ]] && [[ ",${CHANNELS}," == *
       done
     ) &
   fi
+  # DIVE-7417: on hermes the answers come from the messaging gateway, which
+  # ensure_hermes_gateway runs as a `systemctl --user` service. A box with no
+  # per-user service manager (a container: measured on every init-smoke hermes
+  # cell, "hermes gateway start failed") never gets one, so every web chat
+  # message went unanswered. When no gateway is up once the user service has
+  # had its chance, run one here for as long as the session lives. hermes
+  # refuses a second gateway on the same home by itself, so this cannot double
+  # one that the user service starts later.
+  if [[ "$TYPE" == "hermes" && -x "${BIN:-}" ]]; then
+    (
+      sleep 20
+      while /usr/bin/tmux has-session -t "$SESSION" 2>/dev/null; do
+        _gw=""
+        for _p in "${FIVE_PROC_ROOT:-/proc}"/[0-9]*; do   # no procps on a minimal box; the root is overridable for tests
+          [[ -O "$_p" ]] && tr '\0' ' ' <"$_p/cmdline" 2>/dev/null | grep -q 'hermes_cli[.]main gateway run' && { _gw=1; break; }
+        done
+        if [[ -z "$_gw" ]]; then
+          echo "dashboard channel: no hermes gateway is running; starting one beside the seat" >&2
+          "$BIN" gateway run </dev/null >>"$HOME/.hermes/gateway-fallback.log" 2>&1 || true
+        fi
+        sleep 15
+      done
+    ) &
+  fi
 fi
 
 # Block so systemd keeps the unit "active" as long as the session lives.
