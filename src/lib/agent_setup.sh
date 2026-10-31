@@ -246,7 +246,7 @@ notify_user_skill_src() {
 # answered. Never follows a link: rc 1 on a symlinked or non-directory component.
 agent_owned_dir() {
   local user="$1" home="${2%/}" dir="${3%/}" cur part
-  local -a parts
+  local -a parts=()
   [[ "$dir" == "$home"/* ]] || return 1
   IFS=/ read -ra parts <<<"${dir#"$home"/}"
   cur="$home"
