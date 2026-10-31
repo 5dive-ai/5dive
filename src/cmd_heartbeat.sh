@@ -8233,6 +8233,20 @@ _hb_stall_sweep() {
   # (c) GAP#3 canary — pinger liveness (DIVE-1434 class). Independent of
   # _hb_gate_ttl_sweep's own predicate/throttle — a canary sharing the suspect
   # code can go dark with it.
+  #
+  # DIVE-7384: a gate the batch found UNDELIVERABLE (owner has no paired
+  # channel) is stamped gate_renag_failed_at, NOT gate_pinged_at, and the batch
+  # skips it for 24h (DIVE-4911). Without this clause that gate sat in the
+  # eligible set forever and tripped "batch looks dead" whenever no other gate
+  # had been pinged in the hour — 70 false trips on one box. The clause
+  # re-states the back-off WINDOW (+30m grace, as on the 72h mark), not "IS
+  # NULL": the batch re-tries every 24h and re-stamps, so a fresh stamp is
+  # itself proof of life, and a dead batch stops re-stamping — the gate then
+  # re-enters the set and the canary trips as it should. `IS NULL` would make a
+  # box whose only stale gates are undeliverable blind to a dead batch. The
+  # undeliverable gate stays loud in doctor's channels/gate-owner-delivery.
+  # (The batch's re-ask arm needs no mirror: a re-ask moves need_asked_at, and
+  # the 72h+30m clause below already keeps that gate out.)
   local eligible; eligible=$(db "SELECT COUNT(*) FROM tasks
                WHERE need_type IS NOT NULL AND need_answered_at IS NULL
                  AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL)
@@ -8240,6 +8254,8 @@ _hb_stall_sweep() {
                  AND COALESCE(need_asked_at, updated_at) <= datetime('now','-72 hours','-30 minutes')
                  AND (gate_pinged_at IS NULL OR gate_pinged_at <= datetime('now','-7 days'))
                  AND NOT ${_GATE_OFFBOX_HELD_SQL:-0}
+                 AND (gate_renag_failed_at IS NULL
+                      OR gate_renag_failed_at <= datetime('now','-24 hours','-30 minutes'))
                  AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
   [[ "$eligible" =~ ^[0-9]+$ ]] || eligible=0
   if (( eligible == 0 )); then
