@@ -33,7 +33,7 @@ _agent_operational_state() { # <active> <auth-state> <startup-state> [supervisor
   # it. Only `exhausted` gates — `unmeasured` is not evidence about the seat.
   [[ "$quota" == "exhausted" ]] && { printf 'quota-exhausted\n'; return 0; }
   case "$auth:$startup" in
-    needs_login:*|expired:*|refused:*|failing:*|*:degraded) printf 'degraded\n'; return 0 ;;
+    needs_login:*|expired:*|refused:*|failing:*|cannot-send:*|*:degraded) printf 'degraded\n'; return 0 ;;
     unknown:*|*:unknown)               printf 'unknown\n'; return 0 ;;
   esac
   # The survey deliberately does not run the per-seat output queries. Say what
@@ -1143,6 +1143,29 @@ def _is_prompt(obj):
         return True
     return not any(isinstance(x, dict) and x.get("type") == "tool_result" for x in (c or []))
 
+# DIVE-7373: a Hermes seat on a provider whose package Hermes's venv lacks
+# cannot send a message at all. Same reading as src/lib/seat_refusal.sh
+# (hermes_missing_sdk); unreadable is not trouble.
+HERMES_AGENT_DIR = os.environ.get("HERMES_AGENT_DIR") or "/home/claude/.hermes/hermes-agent"
+
+def hermes_missing_sdk(name):
+    lib = os.path.join(HERMES_AGENT_DIR, "venv", "lib")
+    if not os.path.isdir(os.path.join(HERMES_AGENT_DIR, "tools")) or not os.access(lib, os.R_OK | os.X_OK):
+        return None
+    import glob
+    if glob.glob(os.path.join(lib, "python3*", "site-packages", "anthropic", "__init__.py")):
+        return None
+    for cfg in (os.path.join(home_root, f"agent-{name}", ".hermes", "config.yaml"), "/home/claude/.hermes/config.yaml"):
+        try:
+            with open(cfg, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        m = re.search(r"^model:[^\n]*\n((?:[ \t]+[^\n]*\n|[ \t]*\n)*)", text + "\n", re.M)
+        p = re.search(r"^[ \t]+provider:[ \t]*[\"']?([A-Za-z0-9_.-]+)", m.group(1), re.M) if m else None
+        return "anthropic" if p and p.group(1) == "anthropic" else None
+    return None
+
 def seat_refusal(name, since=0):
     root = os.path.join(home_root, f"agent-{name}", ".claude", "projects")
     files = []
@@ -1354,6 +1377,8 @@ for name, value in agents.items():
     asleep = value.get("heartbeat", {}).get("enabled", False) is not True if isinstance(value.get("heartbeat"), dict) else True
     auth_state, auth_exp, auth_refresh = auth_health(agent_type, profile)
     trouble, refusal = seat_refusal(name, unit_started_epoch(started.get(name, "")))
+    if agent_type == "hermes" and hermes_missing_sdk(name):
+        trouble, refusal = "cannot-send", "Hermes cannot send a message: the 'anthropic' package its AI provider needs is not installed. Install it: sudo 5dive agent install hermes --upgrade"
     if trouble:
         auth_state, auth_exp, auth_refresh = trouble, None, False
     startup_state, startup_reason = startup_health(name)
@@ -1369,7 +1394,7 @@ for name, value in agents.items():
         # `account usage` printed 101%. A distinct verdict, not a warning worn
         # under a green word.
         operational = "quota-exhausted"
-    elif auth_state in ("needs_login", "expired", "refused", "failing") or startup_state == "degraded":
+    elif auth_state in ("needs_login", "expired", "refused", "failing", "cannot-send") or startup_state == "degraded":
         operational = "degraded"
     elif auth_state == "unknown" or startup_state == "unknown":
         operational = "unknown"
@@ -1460,7 +1485,8 @@ cmd_list() {
        ([.[] | select(.sudo.diverges)] | length),
        ([.[] | select(.sudo.extraEntries)] | length),
        ([.[] | select(.health.auth.state == "refused") | .name] | join(", ")),
-       ([.[] | select(.health.auth.state == "failing") | "\(.name) (\(.authProfile // "shared login"))"] | join(", "))] | .[]' <<<"$merged")
+       ([.[] | select(.health.auth.state == "failing") | "\(.name) (\(.authProfile // "shared login"))"] | join(", ")),
+       ([.[] | select(.health.auth.state == "cannot-send") | .name] | join(", "))] | .[]' <<<"$merged")
     local -a _legend_values=()
     mapfile -t _legend_values <<<"$_legends"
     _lg_login="${_legend_values[0]:-0}"
@@ -2324,7 +2350,7 @@ cmd_info() {
   _ha=$(agent_auth_health "$type" "$_info_prof" "$name" || true)
   # DIVE-7118: what the account said, for the warning below.
   local _ha_refusal=""
-  [[ "${_ha%%|*}" == refused || "${_ha%%|*}" == failing ]] \
+  [[ "${_ha%%|*}" == refused || "${_ha%%|*}" == failing || "${_ha%%|*}" == cannot-send ]] \
     && { _ha_refusal=$(seat_account_refusal "$name" "$(seat_started_epoch "$name")" 2>/dev/null) || _ha_refusal=""; }
   [[ -n "$_ha" ]] || _ha='unknown|-|false'
   _ha_state="${_ha%%|*}"
@@ -2505,6 +2531,9 @@ cmd_info() {
        else empty end),
       (if .health.auth.state == "refused" then
          "\nWARNING: this seat CANNOT ANSWER: its own last turn was refused by its AI account (\(.health.auth.refusal // "refused")). The credential file is present, so every file check reads ok, and a headless probe can still pass on an account that refuses the interactive client the seat runs. Fix the account (add credit, or set a new key with `5dive agent auth set`), which restarts the seat and clears this line (DIVE-7118)."
+       else empty end),
+      (if .health.auth.state == "cannot-send" then
+         "\nWARNING: this seat CANNOT SEND A MESSAGE: \(.health.auth.refusal // "its AI package is missing"). It starts, its credential is present, and it drops every message with \"Your message was not sent\" (DIVE-7373)."
        else empty end),
       (if .health.auth.state == "failing" then
          "\nWARNING: the login this seat runs on is STUCK: \(.health.auth.refusal // "its recent turns failed"). Every wake stops with no reply, though the process runs and the credential file is present. Sign the login \(.authProfile // "(the shared box login)") in again, or move the seat to another login and restart it: 5dive agent recover \(.name) --to=<login> (DIVE-7118)."

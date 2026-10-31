@@ -2063,16 +2063,26 @@ sys.exit(1)
 # text arm covers a seat with no transcript. Lines carrying the question's own
 # marker are skipped, so a question ABOUT a login cannot trip it.
 ASK_PANE_REFUSAL_RE='credit balance (is )?too low|invalid api key|not logged in|please run /login|oauth token (has expired|revoked)|organization has been disabled|billing_error|authentication_(error|failed)'
+# DIVE-7373: the seat could not open its model connection, so the question
+# never left the box (Hermes: "couldn't start the model connection: ... Your
+# message was not sent"). Not a refusal: the AI account was never asked.
+ASK_PANE_NOSEND_RE="couldn't start the model connection: .*|package is required for the [A-Za-z0-9_ -]+ provider"
 _ask_timeout_diag() { # <msg-id> <pane-file> [scoped] [warned] [name]
-  local mid="$1" f="$2" scoped="${3:-0}" warned="${4:-0}" name="${5:-}" refusal=""
-  if [[ -n "$name" ]] && declare -F seat_account_refusal >/dev/null 2>&1; then
+  local mid="$1" f="$2" scoped="${3:-0}" warned="${4:-0}" name="${5:-}" refusal="" nosend="" pkg=""
+  if [[ -n "$name" ]] && declare -F hermes_missing_sdk >/dev/null 2>&1 && pkg=$(hermes_missing_sdk "$name" 2>/dev/null); then
+    nosend="Hermes needs the '${pkg}' package for its AI provider and it is not installed; install it: ${HERMES_SDK_FIX}"
+  elif [[ -n "$name" ]] && declare -F seat_account_refusal >/dev/null 2>&1; then
     refusal=$(seat_account_refusal "$name" "$(seat_started_epoch "$name")" 2>/dev/null) || refusal=""
   fi
-  if [[ -z "$refusal" && -r "$f" ]]; then
-    refusal=$(grep -vF -e "id=${mid}" -e "5dive-r:${mid}" "$f" 2>/dev/null \
+  if [[ -z "$refusal$nosend" && -r "$f" ]]; then
+    nosend=$(grep -vF -e "id=${mid}" -e "5dive-r:${mid}" "$f" 2>/dev/null \
+      | grep -ioE "$ASK_PANE_NOSEND_RE" | head -1) || nosend=""
+    [[ -n "$nosend" ]] || refusal=$(grep -vF -e "id=${mid}" -e "5dive-r:${mid}" "$f" 2>/dev/null \
       | grep -ioE "$ASK_PANE_REFUSAL_RE" | head -1) || refusal=""
   fi
-  if [[ -n "$refusal" ]]; then
+  if [[ -n "$nosend" ]]; then
+    printf '%s' " — the seat NEVER SENT the question to its AI (${nosend%"${nosend##*[![:space:]]}"}): this is a setup problem, not a formatting or credit one${name:+. Check the seat: 5dive agent info ${name}}"
+  elif [[ -n "$refusal" ]]; then
     printf '%s' " — the seat's AI account REFUSED the turn (${refusal}): this is a credit or login problem, not a formatting one, and no retry will answer until it is fixed. Top up or fix the AI account the seat runs on${name:+, then check it: 5dive agent auth status --agent=${name}}"
   elif _ask_fence_opened "$mid" "$f"; then
     printf '%s' " — the reply fence was OPENED but never completed, so nothing was returned rather than returning the pane's furniture; the seat may still be writing, or its reply scrolled past between polls (try a smaller --poll-secs)"
@@ -3955,6 +3965,15 @@ cmd_ask() {
     "msg_id=${msg_id}"
     "scoped=${use_scoped}"
   )
+
+  # DIVE-7373: a Hermes seat whose provider package is not installed drops every
+  # message ("Your message was not sent"), and the wait that followed blamed the
+  # reply format after 124s (sandboxed) or said "unconfirmed" (standard). It is
+  # known before the question is typed: say so now, with the fix.
+  local _cs_pkg
+  if declare -F hermes_missing_sdk >/dev/null 2>&1 && _cs_pkg=$(hermes_missing_sdk "$name"); then
+    fail "$E_NOT_INSTALLED" "agent '$name' cannot send a message: Hermes needs the '${_cs_pkg}' package for its AI provider and it is not installed, so the question was not asked. Install it: ${HERMES_SDK_FIX}"
+  fi
 
   # DIVE-1901: snapshot the pane BEFORE injecting. Two uses, both load-bearing:
   # the baseline is the chrome list (everything already on screen is furniture,

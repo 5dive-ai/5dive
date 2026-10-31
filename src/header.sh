@@ -457,6 +457,11 @@ except sqlite3.Error:
 # The Hermes release every new install gets (DIVE-7330, see [hermes] below).
 HERMES_PIN_TAG=v2026.9.24
 HERMES_PIN_COMMIT=f97608f178d1ffeca59860195ab7da295f7c8e5f
+# DIVE-7355/7373: the Anthropic SDK, through Hermes's own installer for it
+# (tools/lazy_deps, pinned by Hermes), run as claude. Shared by the hermes recipe
+# and `agent create` (a box that installed Hermes before this step existed has
+# Hermes and no SDK, and create skips the recipe when Hermes is there).
+HERMES_SDK_STEP="{ (cd /home/claude/.hermes/hermes-agent && ./venv/bin/python -c 'from tools.lazy_deps import ensure; ensure(\"provider.anthropic\", prompt=False)') || echo 'warn: could not install the Anthropic SDK into Hermes; a Hermes agent on Anthropic will not answer until it is installed (retry: sudo 5dive agent install hermes --upgrade)' >&2; }"
 
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
@@ -572,7 +577,7 @@ declare -A TYPE_INSTALL=(
   # required". Idempotent: a no-op once it is there, so a box already on Hermes
   # gets it on its next install too. A failure is a warning, not a dead install:
   # other providers do not need it.
-  [hermes]="{ [[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_PIN_COMMIT}/scripts/install.sh | setsid -w bash -s -- --skip-setup --branch ${HERMES_PIN_TAG} --commit ${HERMES_PIN_COMMIT} && chmod 0775 /home/claude/.hermes; }; } && { (cd /home/claude/.hermes/hermes-agent && ./venv/bin/python -c 'from tools.lazy_deps import ensure; ensure(\"provider.anthropic\", prompt=False)') || echo 'warn: could not install the Anthropic SDK into Hermes; a Hermes agent on Anthropic will not answer until it is installed' >&2; }"
+  [hermes]="{ [[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_PIN_COMMIT}/scripts/install.sh | setsid -w bash -s -- --skip-setup --branch ${HERMES_PIN_TAG} --commit ${HERMES_PIN_COMMIT} && chmod 0775 /home/claude/.hermes; }; } && ${HERMES_SDK_STEP}"
   # openclaw's launcher is `#!/usr/bin/env node`, so symlinking only the CLI
   # into ~/.local/bin leaves it unexecutable in systemd/create-time envs where
   # nvm's per-version bin directory is absent from PATH. Install a supported

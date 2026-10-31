@@ -1129,6 +1129,22 @@ TOOLENV
     systemctl enable --now 5dive-hermes-perms.path >/dev/null 2>&1 || true
   fi
 
+  # DIVE-7373: a box that installed Hermes before 5dive added its Anthropic
+  # package (DIVE-7355) has Hermes and no package, and every Hermes agent on
+  # Anthropic drops its messages ("Your message was not sent"). Add it on the
+  # update, as claude, through Hermes's own installer for it. Same step as
+  # HERMES_SDK_STEP in src/header.sh. Skipped when there is no Hermes or the
+  # package is there; a failure is a warning (other providers do not need it).
+  _hsdk=/home/claude/.hermes/hermes-agent
+  if [[ -x /home/claude/.local/bin/hermes && -d "$_hsdk/tools" ]] \
+     && ! compgen -G "$_hsdk/venv/lib/python3*/site-packages/anthropic/__init__.py" >/dev/null; then
+    if sudo -u claude -H bash -lc "cd $_hsdk && ./venv/bin/python -c 'from tools.lazy_deps import ensure; ensure(\"provider.anthropic\", prompt=False)'" >/dev/null 2>&1; then
+      ok "Hermes: Anthropic package installed"
+    else
+      echo "  ! Hermes: could not install its Anthropic package; a Hermes agent on Anthropic will not answer until it is (retry: sudo 5dive agent install hermes --upgrade)" >&2
+    fi
+  fi
+
   install -d -m 755 "$LIB_DIR" "$LIB_DIR/skills/notify-user"
   # Remove the deprecated sender-side PreToolUse mirror: it read the
   # pre-expansion command string, so it couldn't see heredoc bodies. The
