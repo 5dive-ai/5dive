@@ -73,7 +73,7 @@ One app for your whole team, no bot tokens: link your server free at [5dive.ai/s
 
 ## The 5dive skill
 
-Add the [5dive skill](https://github.com/5dive-ai/skills) to Claude Code, Codex or another coding agent and run your whole team by chatting. Paste this:
+Add the [5dive skill](https://skills.sh/5dive-ai/skills/5dive-cli) (3K+ installs on skills.sh, [source](https://github.com/5dive-ai/skills)) to Claude Code, Codex or another coding agent and run your whole team by chatting. Paste this:
 
 ```text
 Install 5dive on this server: curl -fsSL https://install.5dive.ai | sudo bash

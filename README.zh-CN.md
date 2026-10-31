@@ -71,7 +71,7 @@ docker exec -it 5dive 5dive init
 
 ## 5dive 技能
 
-把 [5dive 技能](https://github.com/5dive-ai/skills)加到 Claude Code、Codex 或其他编程智能体，就能通过聊天管理整支团队。把下面这段粘贴给它：
+把 [5dive 技能](https://skills.sh/5dive-ai/skills/5dive-cli)（在 skills.sh 上已有 3K+ 次安装，[源码](https://github.com/5dive-ai/skills)）加到 Claude Code、Codex 或其他编程智能体，就能通过聊天管理整支团队。把下面这段粘贴给它：
 
 ```text
 在这台服务器上安装 5dive：curl -fsSL https://install.5dive.ai | sudo bash
