@@ -34,7 +34,12 @@ sudo 5dive init
 
 你只需要一台 Linux 服务器（Ubuntu 22.04 或更新版本），以及你自己的 AI 订阅或 API key，无需 5dive 账号。
 
-**更喜欢用软件包？** 在 Ubuntu 或 Debian 上，先添加我们签名的 apt 源，再安装：
+建议：运行 `sudo 5dive self-update --on` 开启每晚自动更新，修复会自动到达你的服务器。
+
+<details>
+<summary><b>其他安装方式：</b>apt 软件包、Docker、Mac mini</summary>
+
+**apt**（Ubuntu 或 Debian），从我们签名的软件源安装：
 
 ```sh
 curl -fsSL https://5dive-ai.github.io/5dive/apt/5dive.gpg | sudo tee /usr/share/keyrings/5dive.gpg >/dev/null && echo "deb [signed-by=/usr/share/keyrings/5dive.gpg] https://5dive-ai.github.io/5dive/apt stable main" | sudo tee /etc/apt/sources.list.d/5dive.list
@@ -42,6 +47,17 @@ sudo apt update && sudo apt install 5dive && sudo 5dive-setup
 ```
 
 然后运行 `sudo 5dive init`。`sudo apt upgrade` 之后，运行 `sudo 5dive-setup` 应用新版本。
+
+**Docker**（Mac mini、家用服务器，或只想试试）：安装 Docker Desktop，然后：
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/5dive-ai/5dive/main/docker/compose.yaml && docker compose up -d
+docker exec -it 5dive 5dive init
+```
+
+详见 [docker/README.md](docker/README.md)。
+
+</details>
 
 整个团队一个应用，无需 bot token：在 [5dive.ai/self-host](https://5dive.ai/self-host) 免费连接你的服务器。
 
