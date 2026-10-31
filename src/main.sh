@@ -304,12 +304,13 @@ Agents:
   5dive agent install <type> [--upgrade] [--detach|--status]  # install the CLI for a type if missing (--upgrade forces a reinstall; --detach runs it as a background job, --status reads that job)
   5dive agent set-account <agent> <account|default> [--switch-harness]  # rebind to a named account; "default" clears.
   5dive agent recover <agent> [--to=<account|default>]  # restart a stuck seat, or move it to another login; the admin (lead) seat may run it without sudo.
-                                                     # An account for the OTHER harness (Claude <-> ChatGPT) is refused
+                                                     # An account for ANOTHER harness (Claude, ChatGPT, Grok) is refused
                                                      # unless --switch-harness, which runs 'agent switch' below
-  5dive agent switch <name> --to=claude|codex [--account=<account|default>] [--no-handoff] [--handoff-wait=<s>]
-                                                     # move an agent between Claude Code and Codex IN PLACE: same name,
+  5dive agent switch <name> --to=claude|codex|grok [--account=<account|default>] [--no-handoff] [--handoff-wait=<s>]
+                                                     # move an agent between Claude Code, Codex and Grok IN PLACE: same name,
                                                      # unix user, bot, tasks and grants; memory + instructions converted,
-                                                     # the old side's files kept so switching back is instant (DIVE-5501)
+                                                     # the old side's files kept so switching back is instant (DIVE-5501).
+                                                     # To Grok needs Grok turned on (5dive grok enable) (DIVE-7414)
 
 Default workdir: ${DEFAULT_WORKDIR}
 
