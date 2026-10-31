@@ -10489,7 +10489,9 @@ cmd_heartbeat_tick() {
     local _refusal=""
     if declare -F seat_turn_trouble >/dev/null 2>&1 \
        && _refusal=$(seat_turn_trouble "$name" "$(seat_started_epoch "$name")") \
-       && [[ "${_refusal%%$'\t'*}" == refused ]]; then
+       && [[ "${_refusal%%$'\t'*}" == refused || "${_refusal%%$'\t'*}" == cannot-send ]]; then
+      # DIVE-7373: a cannot-send seat (Hermes without its provider's package)
+      # drops every message the same way, until the package is installed.
       _refusal="${_refusal#*$'\t'}"
       sk_capped=$((sk_capped + 1))
       _hb_log "[$name] not dispatched — its last turn was refused by its AI account ('${_refusal:0:80}'); a row would be claimed and get the same refusal. Fix the account (credit or a new key, which restarts the seat) and dispatch resumes (DIVE-7118)"
