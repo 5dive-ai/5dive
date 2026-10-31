@@ -117,6 +117,10 @@ for needle in 'image         = "ubuntu-24-04-x64"' 'bash /tmp/5dive-image/build.
 done
 [[ "$(grep -n 'build.sh' $pkr | head -1 | cut -d: -f1)" -lt "$(grep -n 'bash 99-img-check.sh' $pkr | cut -d: -f1)" ]] \
   && ok "packer: the image check runs after our build" || bad "packer: image check is not last"
+# DigitalOcean's base image ships droplet-agent; their check FAILs on /opt/digitalocean (DIVE-7368).
+[[ -n "$(grep -n 'purge droplet-agent' $pkr | head -1)" ]] \
+  && [[ "$(grep -n 'purge droplet-agent' $pkr | head -1 | cut -d: -f1)" -lt "$(grep -n 'bash 99-img-check.sh' $pkr | cut -d: -f1)" ]] \
+  && ok "packer: droplet-agent is purged before the image check" || bad "packer: droplet-agent is not purged before the image check"
 
 # 7. The Linode app is whole: the deploy script names this app, every role exists.
 grep -q '^export MARKETPLACE_APP="apps/linode-marketplace-5dive"$' $lin/deployment_scripts/linode-marketplace-5dive/5dive-deploy.sh \
