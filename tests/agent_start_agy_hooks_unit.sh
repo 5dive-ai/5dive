@@ -37,11 +37,11 @@ command -v jq >/dev/null 2>&1 || { echo "FAIL: jq not installed (precondition)";
 
 fail=0
 ok()  { echo "ok: $1"; }
-bad() { echo "FAIL: $1"; fail=1; }
+bad() { echo "FAIL: $1"; fail=$((fail+1)); }
 check() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (want=$3 got=$2)"; fi; }
 
 BLOCK="$TMP/block.sh"
-awk 'index($0, "if [[ \"$TYPE\" == \"antigravity\" ]] && [[ \"$CHANNELS\" == \"telegram\" ]]; then") == 1 { on=1 }
+awk '/^if \[\[ "\$TYPE" == "antigravity" \]\] && .*telegram/ { on=1 }
      on { print }
      on && $0 == "fi" { exit }' "$START" > "$BLOCK"
 grep -q 'hooks.json' "$BLOCK" || { echo "FAIL: antigravity+telegram block not found in $START"; exit 1; }
@@ -131,5 +131,5 @@ run_block "$H5"
 if schema_ok "$H5/.gemini/config/hooks.json"; then ok "garbage: rewritten into agy's schema"; else bad "garbage: still broken"; fi
 
 [[ -s "$TMP/stderr" ]] && { echo "--- block stderr:"; cat "$TMP/stderr"; }
-if (( fail )); then echo "RESULT: FAIL"; exit 1; fi
-echo "RESULT: PASS"
+if (( fail )); then echo "RESULT: FAIL ($fail)"; else echo "RESULT: PASS"; fi
+[[ "$fail" -eq 0 ]]
