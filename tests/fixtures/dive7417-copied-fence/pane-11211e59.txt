@@ -1,0 +1,20 @@
+e pattern matching only
+────────────────────────────────────────
+● [5dive-msg from=ask id=11211e59 tier=unknown:no-caller via=unknown:no-caller]
+What is 393 + 605? Reply with only the number. [reply-format] Put your answer
+between these two marker lines: <5dive-r:11211e59></5dive-r:11211e59> — the
+opening marker alone on one line, your answer next, the closing marker alone on
+the last line.
+Initializing agent...
+────────────────────────────────────────
+  ┊ 🐍 preparing execute_code…
+  ┊ 🐍 exec      print(393 + 605)  0.1s
+╭─ ☤ Hermes ───────────────────────────────────────────────────────────────────╮
+<5dive-r:11211e59></5dive-r:11211e59>
+998
+<5dive-r:11211e59></5dive-r:11211e59>
+╰──────────────────────────────────────────────────────────────────────────────╯
+ ☤ gpt-6-luna │ ~11K/1.1M │ [░░░░░░░░░░] ~1% │ ◎ 49.6% │  ─ Calculate 393 + 605
+────────────────────────────────────────────────────────────────────────────────
+❯ Summarize what's in this folder
+────────────────────────────────────────────────────────────────────────────────

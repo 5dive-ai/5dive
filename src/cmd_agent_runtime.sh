@@ -2434,6 +2434,50 @@ if mid:
                 sys.exit(0)
             body.append(l)
 
+    # --- 0c. the COPIED PAIR (DIVE-7417). A smaller model copies the hint
+    # marker pair verbatim as its opening line, and sometimes as its closing one:
+    #
+    #     • <5dive-r:ID></5dive-r:ID>          codex on openai/gpt-6-luna
+    #       808
+    #       </5dive-r:ID>
+    #
+    #     <5dive-r:ID></5dive-r:ID>            hermes on the same model
+    #     817
+    #     <5dive-r:ID></5dive-r:ID>
+    #
+    # Six of six init-smoke cells answered like this and all six timed out, since
+    # an adjacent pair is exactly what 0b skips as the echo. A PAIR LINE (the pair
+    # and nothing word-like around it) opens a block here, and a pair line or a
+    # closer ends it. The echo can still never come back: its pair has prose
+    # beside it, and when a wrap isolates it, the hint tail ("the opening
+    # marker alone on one line ...") lands in the block, which rejects any block
+    # that names a marker. Runs last, so no seat that works today changes.
+    def is_pair(l):
+        core = re.sub(r"^[^\w<]+", "", l.strip())
+        if not core.startswith(op):
+            return False
+        rest = core[len(op):].lstrip()
+        return rest.startswith(cl) and not re.search(r"\w", rest[len(cl):])
+    for i in reversed([i for i, l in enumerate(lines) if is_pair(l)]):
+        body = []
+        for l in lines[i + 1:]:
+            if is_pair(l):
+                pre = ""
+            elif op in l or "[5dive-msg" in l:
+                break
+            elif cl in l:
+                pre = l[:l.index(cl)]
+            else:
+                body.append(l)
+                continue
+            blk = body + ([pre] if wordy(pre) else [])
+            real = [b for b in blk if b.strip()]
+            if not [b for b in blk if wordy(b)] or any("marker" in b for b in blk):
+                break               # nothing inside, or the hint tail
+            pad = min(len(b) - len(b.lstrip()) for b in real)
+            sys.stdout.write("\n".join(b[pad:].rstrip() for b in blk).strip("\n"))
+            sys.exit(0)
+
     # FENCE-ONLY (DIVE-1901 iteration 2). Everything this ticket has ever caught
     # fabricating came from the scraping fallback below, never from the fence:
     # 0.14.7 returned the token PLUS the footer on antigravity and PURE BOX-DRAWING

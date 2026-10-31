@@ -568,6 +568,31 @@ TOML
     rm -f "$seed"
   }
   apply_codex_model_seed "$AGENT_CODEX_HOME"
+  # DIVE-7417: the third-party provider `agent create --provider` chose (three
+  # seed lines: id, base_url, env var). Same one-shot rules as the model seed:
+  # the top-level `model_provider` is prepended only when config.toml names
+  # none, and the [model_providers.<id>] table is appended, whole, only when it
+  # is absent (an appended whole table is TOML-safe; a bare key is not). The key
+  # stays in the environment: env_key names the variable, never its value.
+  apply_codex_provider_seed() {   # apply_codex_provider_seed <codex-home>
+    local seed="$1/.5dive-provider-seed" cfg="$1/config.toml" id url var tmp
+    [[ -f "$seed" ]] || return 0
+    { read -r id; read -r url; read -r var; } < "$seed"
+    if [[ "$id" =~ ^[a-z][a-z0-9-]*$ && "$url" =~ ^https://[A-Za-z0-9._/:-]+$ && "$var" =~ ^[A-Z][A-Z0-9_]*$ && -f "$cfg" ]]; then
+      if ! awk '/^[ \t]*\[/ { exit } /^[ \t]*model_provider[ \t]*=/ { found = 1; exit } END { exit !found }' "$cfg"; then
+        tmp="$cfg.seed.$$"
+        { printf 'model_provider = "%s"\n' "$id"; cat "$cfg"; } > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$cfg" \
+          || { rm -f "$tmp"; echo "warn: could not write the seeded codex provider ($id)" >&2; }
+      fi
+      grep -q "^[[:space:]]*\[model_providers\.${id}\][[:space:]]*\$" "$cfg" \
+        || printf '\n[model_providers.%s]\nname = "%s"\nbase_url = "%s"\nenv_key = "%s"\nwire_api = "responses"\n' \
+             "$id" "$id" "$url" "$var" >> "$cfg"
+    else
+      echo "warn: ignoring a malformed codex provider seed ($seed)" >&2
+    fi
+    rm -f "$seed"
+  }
+  apply_codex_provider_seed "$AGENT_CODEX_HOME"
   # Wire the telegram-codex MCP server + lifecycle hooks into config.toml when
   # this agent has the telegram channel. We append complete [sections] only
   # when [mcp_servers.telegram] isn't already present — appending whole tables

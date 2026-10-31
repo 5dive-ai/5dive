@@ -1,0 +1,20 @@
+e pattern matching only
+────────────────────────────────────────
+● [5dive-msg from=ask id=fc3a041c tier=unknown:no-caller via=unknown:no-caller]
+What is 324 + 774? Reply with only the number. [reply-format] Put your answer
+between these two marker lines: <5dive-r:fc3a041c></5dive-r:fc3a041c> — the
+opening marker alone on one line, your answer next, the closing marker alone on
+the last line.
+Initializing agent...
+────────────────────────────────────────
+  ┊ 🐍 preparing execute_code…
+  ┊ 🐍 exec      print(324 + 774)  0.1s
+╭─ ☤ Hermes ───────────────────────────────────────────────────────────────────╮
+<5dive-r:fc3a041c></5dive-r:fc3a041c>
+1098
+</5dive-r:fc3a041c></5dive-r:fc3a041c>
+╰──────────────────────────────────────────────────────────────────────────────╯
+ ☤ gpt-6-luna │ ~12.3K/1.1M │ [░░░░░░░░░░] ~1% │ ◎ 49.7% │ .. ─ Add 324 and 774
+────────────────────────────────────────────────────────────────────────────────
+❯ Turn these notes into a to-do list
+────────────────────────────────────────────────────────────────────────────────

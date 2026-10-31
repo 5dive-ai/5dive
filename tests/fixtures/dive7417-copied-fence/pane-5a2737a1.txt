@@ -1,0 +1,20 @@
+e pattern matching only
+────────────────────────────────────────
+● [5dive-msg from=ask id=5a2737a1 tier=unknown:no-caller via=unknown:no-caller]
+What is 207 + 895? Reply with only the number. [reply-format] Put your answer
+between these two marker lines: <5dive-r:5a2737a1></5dive-r:5a2737a1> — the
+opening marker alone on one line, your answer next, the closing marker alone on
+the last line.
+Initializing agent...
+────────────────────────────────────────
+  ┊ 🐍 preparing execute_code…
+  ┊ 🐍 exec      print(207 + 895)  0.1s
+╭─ ☤ Hermes ───────────────────────────────────────────────────────────────────╮
+<5dive-r:5a2737a1></5dive-r:5a2737a1>
+1102
+</5dive-r:5a2737a1>
+╰──────────────────────────────────────────────────────────────────────────────╯
+ ☤ gpt-6-luna │ ~10.6K/1.1M │ [░░░░░░░░░░] ~1% │ ◎...  ─ Calculate 207 plus 895
+────────────────────────────────────────────────────────────────────────────────
+❯ Turn these notes into a to-do list
+────────────────────────────────────────────────────────────────────────────────

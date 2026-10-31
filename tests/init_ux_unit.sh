@@ -42,7 +42,7 @@ for needle in \
   '_init_secret key "Anthropic API key"' \
   '_init_secret key "OpenAI API key"' \
   '_init_secret byo_key "${byo_provider} API key"' \
-  '_init_secret pi_key "$provider API key"' \
+  '_init_secret create_key "$provider API key"' \
   '_init_secret telegram_token "Telegram bot token"'
 do
   [[ "$body" == *"$needle"* ]] || { echo "FAIL: missing masked-input wiring: $needle" >&2; exit 1; }

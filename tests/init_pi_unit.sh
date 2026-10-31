@@ -35,8 +35,8 @@ assert_has '[pi]="Extension-based coding agent — bring your own provider"' \
 # DIVE-1269: pi provider+key are deferred to `agent create` (NOT wired via an
 # early `auth set`) so create runs pi_apply_provider_key + pi_apply_model_default
 # and the agent boots with defaultProvider set + the key persisted.
-assert_has 'pi_provider="$provider"' "pi provider must be captured for create"
-assert_has '--provider=$pi_provider" "--api-key=-' \
+assert_has 'create_provider="$provider"' "pi provider must be captured for create"
+assert_has '--provider=$create_provider" "--api-key=-' \
   "pi provider+key must be forwarded to create (mirrors agent create --provider path)"
 [[ "$body" != *'auth set pi'* ]] || {
   echo "FAIL: pi must NOT use the early 'auth set' path (leaves defaultProvider empty — DIVE-1269)" >&2
@@ -50,6 +50,6 @@ assert_has '--isolation=$isolation' \
 
 assert_has 'provider" == "openrouter"' "openrouter provider must trigger a model prompt"
 assert_has 'openrouter needs a model' "openrouter model must be required (empty rejected)"
-assert_has '--model=$pi_model' "chosen pi model must be pinned at create via --model"
+assert_has '--model=$create_model' "chosen pi model must be pinned at create via --model"
 
 echo "PASS: init wizard exposes and provisions pi through the guarded paths"

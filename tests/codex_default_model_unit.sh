@@ -62,7 +62,7 @@ seed_codex_model emptyseed ""; _rc=$?
 # The codex branch of cmd_create seeds --model when given, else the default, and
 # validates --model before anything is created.
 _branch="$(awk '/preseed_codex_return_channel "\$name"/ { on = 1 } on { print } on && /^  fi$/ { exit }' "$CREATE")"
-grep -q '_codex_model="${byo_model:-$(codex_model_default)}"' <<<"$_branch" \
+grep -qF '_codex_model="${byo_model:-${byo_provider:+openai/}$(codex_model_default)}"' <<<"$_branch" \
   && ok_t "create: codex seeds --model, else codex_model_default" \
   || bad_t "create: the codex branch does not choose --model-else-default"
 grep -q 'seed_codex_model "$name" "$_codex_model"' <<<"$_branch" \

@@ -3791,11 +3791,11 @@ cmd_create() {
     [[ -n "$byo_provider" ]] || byo_provider="$CLAUDE_CUSTOM_PROVIDER_ID"
   fi
   if [[ -n "$byo_provider" || -n "$byo_api_key" ]]; then
-    # pi and opencode are API-key multi-provider types: --provider names the
-    # vendor and the key is injected as its native environment variable, so
-    # they skip the hermes/openclaw/claude BYO catalog checks below.
-    [[ "$type" == "hermes" || "$type" == "openclaw" || "$type" == "claude" || "$type" == "pi" || "$type" == "opencode" ]] \
-      || fail "$E_VALIDATION" "--provider/--api-key only supported for hermes/openclaw/claude/pi/opencode (got: $type)"
+    # pi, opencode and codex (DIVE-7417) are API-key types here: --provider
+    # names the vendor and the key is injected as its native environment
+    # variable, so they skip the hermes/openclaw/claude BYO catalog checks below.
+    [[ "$type" == "hermes" || "$type" == "openclaw" || "$type" == "claude" || "$type" == "pi" || "$type" == "opencode" || "$type" == "codex" ]] \
+      || fail "$E_VALIDATION" "--provider/--api-key only supported for hermes/openclaw/claude/pi/opencode/codex (got: $type)"
     # claude BYO points the harness at an Anthropic-compatible third-party
     # endpoint and stores the override env vars in the auth-profile's
     # combined.env — so it requires a profile to scope the creds to this agent
@@ -3813,6 +3813,11 @@ cmd_create() {
     elif [[ "$type" == "opencode" ]]; then
       opencode_provider_var "$byo_provider" >/dev/null \
         || fail "$E_VALIDATION" "opencode provider '$byo_provider' not supported (known: ${!OPENCODE_PROVIDER_VAR[*]})"
+    elif [[ "$type" == "codex" ]]; then
+      # DIVE-7417: an OpenAI key or ChatGPT sign-in needs no --provider; this
+      # is the third-party route (Codex on any OpenRouter model).
+      codex_provider_var "$byo_provider" >/dev/null \
+        || fail "$E_VALIDATION" "codex provider '$byo_provider' not supported (known: ${!CODEX_PROVIDER_VAR[*]})"
     elif [[ -n "$byo_base_url" ]]; then
       # The endpoint came from argv, so there is no catalog row to validate the
       # provider id against — it is a label. Still constrain its SHAPE: it names
@@ -3856,8 +3861,8 @@ cmd_create() {
       && fail "$E_VALIDATION" "the box's free demo AI is the owner's trial and cannot run a new agent (one research run uses all of it). Create it with --defer-auth and no --auth-profile instead, then send the owner the sign-in link from: sudo 5dive agent auth start $type (later $type hires use that same sign-in)"
     fail "$E_VALIDATION" "the box's free demo AI is the owner's trial and cannot run a new agent (one research run uses all of it). Create it with --defer-auth --auth-profile=$name instead, then send the owner the sign-in link from: sudo 5dive agent auth start $type --auth-profile=$name"
   fi
-  # DIVE-5503: codex takes --model without --provider (it has no BYO path), so
-  # the shape check above never ran for it. Refuse before anything is created:
+  # DIVE-5503: codex takes --model without --provider (the OpenAI and ChatGPT
+  # paths need none), so the shape check above may not have run for it. Refuse before anything is created:
   # the id is written into the seat's config.toml on first start.
   if [[ "$type" == "codex" && -n "$byo_model" ]]; then
     valid_model "$byo_model" \
@@ -4095,6 +4100,10 @@ cmd_create() {
       # DIVE-1206: keep this on the same helper as `agent auth set` so a
       # create-time OpenRouter key reaches OPENROUTER_API_KEY, not OPENAI_API_KEY.
       opencode_apply_provider_key "$byo_provider" "$byo_api_key" "$profile"
+    elif [[ "$type" == "codex" ]]; then
+      # DIVE-7417: the key goes to the env var the provider table names; the
+      # table itself is seeded below and written on first start.
+      codex_apply_provider_key "$byo_provider" "$byo_api_key" "$profile"
     else
       apply_byo_provider "$type" "$byo_provider" "$byo_api_key" "$profile" "$byo_model" "$byo_base_url"
     fi
@@ -4237,7 +4246,13 @@ cmd_create() {
     # DIVE-5503: the model this seat starts on, the operator's --model or the
     # current Sol default. Before this nothing pinned it, so a new seat ran on
     # whatever the Codex CLI defaulted to (gpt-6-astra on poke-two).
-    local _codex_model="${byo_model:-$(codex_model_default)}"
+    # DIVE-7417: on OpenRouter the same model goes by its openai/ slug.
+    local _codex_model="${byo_model:-${byo_provider:+openai/}$(codex_model_default)}"
+    if [[ -n "$byo_provider" ]]; then
+      step "Codex provider for agent-${name}: ${byo_provider} (applied on first start)"
+      seed_codex_provider "$name" "$byo_provider" \
+        || fail "$E_GENERIC" "could not seed the codex provider for agent-${name}: without it the seat would start on OpenAI with no OpenAI key"
+    fi
     step "Codex model for agent-${name}: ${_codex_model} (applied on first start)"
     seed_codex_model "$name" "$_codex_model" \
       || warn "could not seed the codex model for agent-${name} — it will start on the Codex CLI default (rerun: 5dive agent config ${name} set model=${_codex_model} after its first start)"
