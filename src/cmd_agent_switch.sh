@@ -1,5 +1,5 @@
-# DIVE-5501: `agent switch <name> --to=claude|codex` — move ONE agent between
-# Claude Code and Codex IN PLACE.
+# DIVE-5501: `agent switch <name> --to=claude|codex|grok` — move ONE agent between
+# Claude Code, Codex and Grok IN PLACE (Grok since DIVE-7414).
 #
 # The trigger is the account move. An account is a Claude sign-in or a ChatGPT
 # (Codex) sign-in, never a neutral one (wiki: an-auth-profile-serves-one-harness),
@@ -28,10 +28,21 @@
 #      what changed since (the carried block, codex atoms) is rewritten.
 #   7. start, and report whether the unit came back.
 # Nothing is mutated until every pre-flight check passes.
+#
+# DIVE-7414: Grok both ways. A Grok agent could never move: a new login is the
+# default for new hires (DIVE-7152), so an agent hired on a Grok login was on
+# Grok for good. Grok reads ~/.claude/CLAUDE.md (TYPE_PERSONA_FILE) and its
+# memory is the 5dive store, so Claude <-> Grok shares both files: nothing is
+# copied, the carried block only points at the handoff (and, to Grok, which
+# loads no MEMORY.md, the memory index). To Grok also needs the owner's switch
+# (`5dive grok enable`), the same one `agent create --type=grok` asks for.
 
 SWITCH_CARRY_MARKER="5dive:carried-instructions"
 SWITCH_CODEX_MEM_MARKER="5dive:codex-memory"
 SWITCH_HANDOFF_FILE=".5dive-handoff.md"
+# The harnesses this verb moves between, in the order an account that serves
+# several of them is read (claude first: it is the one every box can run).
+SWITCH_TYPES=(claude codex grok)
 # Carried memory index budget: AGENTS.md is loaded every turn, so the index is
 # cut at a byte budget and the rest is reached by search (DIVE-3821's lesson).
 SWITCH_INDEX_BUDGET="${FIVEDIVE_SWITCH_INDEX_BUDGET:-8000}"
@@ -45,36 +56,55 @@ SWITCH_INSTR_BUDGET="${FIVEDIVE_SWITCH_INSTR_BUDGET:-15000}"
 _switch_home() { printf '%s/agent-%s\n' "${SWITCH_HOME_ROOT:-/home}" "$1"; }
 
 _switch_label() {
-  case "$1" in claude) printf 'Claude Code' ;; codex) printf 'Codex' ;; *) printf '%s' "$1" ;; esac
+  case "$1" in claude) printf 'Claude Code' ;; codex) printf 'Codex' ;; grok) printf 'Grok' ;; *) printf '%s' "$1" ;; esac
 }
+
+_switch_is_type() { [[ " ${SWITCH_TYPES[*]} " == *" ${1:-} "* ]]; }
+
+# The owner's switch for Grok agents (cmd_grok.sh): the marker create reads.
+_switch_grok_on() { [[ -e "${FIVE_GROK_ARM_MARKER:-/etc/5dive/arm/grok-unfreeze}" ]]; }
 
 # The plain sentence every surface shows before a switch. One string, so the
 # CLI refusal, the Mini App and the dashboard cannot drift apart.
 switch_harness_warning() { # <name> <from> <to>
   local plan
-  [[ "$3" == codex ]] && plan="ChatGPT" || plan="Claude"
+  case "$3" in codex) plan="ChatGPT" ;; grok) plan="Grok" ;; *) plan="Claude" ;; esac
   printf 'Moving %s to your %s plan switches it from %s to %s. Its memory and instructions are converted; this chat'"'"'s history is not. You can switch back any time.' \
     "$1" "$plan" "$(_switch_label "$2")" "$(_switch_label "$3")"
 }
 
-# The harness an account signs in for, among the two this verb moves between.
-# Prints claude, codex, both, or nothing. "" = the box default credentials.
-switch_account_harness() { # <profile>
-  local p="${1:-}" t c=0 x=0 path
+# The harnesses an account signs in for, among those this verb moves between,
+# one per line in SWITCH_TYPES order. "" = the box default credentials.
+switch_account_types() { # <profile>
+  local p="${1:-}" t path
+  local -a got=()
   if [[ -z "$p" || "$p" == default ]]; then
-    for t in claude codex; do
+    for t in "${SWITCH_TYPES[@]}"; do
       path=$(profile_type_auth_path "" "$t" 2>/dev/null) || path=""
-      if [[ -n "$path" && -s "$path" ]]; then
-        [[ "$t" == claude ]] && c=1 || x=1
-      fi
+      [[ -n "$path" && -s "$path" ]] && got+=("$t")
     done
   else
     account_types_authed_arr "$p"
-    for t in ${ACCOUNT_TYPES_AUTHED[@]+"${ACCOUNT_TYPES_AUTHED[@]}"}; do
-      [[ "$t" == claude ]] && c=1
-      [[ "$t" == codex ]] && x=1
-    done
+    got=(${ACCOUNT_TYPES_AUTHED[@]+"${ACCOUNT_TYPES_AUTHED[@]}"})
   fi
+  for t in "${SWITCH_TYPES[@]}"; do
+    [[ " ${got[*]-} " == *" $t "* ]] && printf '%s\n' "$t"
+  done
+  return 0
+}
+
+# Does <profile> hold a sign-in for <type>?
+switch_account_serves() { # <profile> <type>
+  switch_account_types "$1" | grep -qx -- "$2"
+}
+
+# The Claude/Codex half of switch_account_types, as compose reads it: claude,
+# codex, both, or nothing.
+switch_account_harness() { # <profile>
+  local h c=0 x=0
+  h=$(switch_account_types "${1:-}")
+  grep -qx claude <<<"$h" && c=1
+  grep -qx codex <<<"$h" && x=1
   if (( c && x )); then printf 'both\n'
   elif (( c )); then printf 'claude\n'
   elif (( x )); then printf 'codex\n'
@@ -82,17 +112,29 @@ switch_account_harness() { # <profile>
 }
 
 # Is moving a <type> seat to <profile> a harness switch? Prints the target type
-# when the account serves the OTHER harness and not this one; nothing otherwise
-# (same harness, both, or an account with no sign-in yet — those bind as before).
+# when the account does not serve this harness and does serve another (the first
+# in SWITCH_TYPES order); nothing otherwise (same harness, or an account with no
+# sign-in yet — those bind as before).
 switch_target_for_account() { # <type> <profile>
   local type="$1" h
-  [[ "$type" == claude || "$type" == codex ]] || return 0
-  h=$(switch_account_harness "$2")
-  case "$h" in
-    claude) [[ "$type" == codex ]] && printf 'claude\n' ;;
-    codex)  [[ "$type" == claude ]] && printf 'codex\n' ;;
-  esac
+  _switch_is_type "$type" || return 0
+  h=$(switch_account_types "$2")
+  grep -qx -- "$type" <<<"$h" && return 0
+  [[ -n "$h" ]] && printf '%s\n' "$(head -1 <<<"$h")"
   return 0
+}
+
+# The standing instructions a carried block in <file> holds (from an earlier
+# Codex trip), so a Claude <-> Grok switch, which rewrites the block in the same
+# file, keeps them instead of dropping them with the old block.
+_switch_block_instructions() { # <file>
+  [[ -f "$1" ]] || return 0
+  awk -v id="$SWITCH_CARRY_MARKER" '
+    index($0, "<!-- " id ":begin") { inb = 1; next }
+    inb && index($0, "<!-- " id ":end") { inb = 0; on = 0; next }
+    inb && $0 == "## Standing instructions" { on = 1; next }
+    inb && on && $0 == "## Memory" { on = 0 }
+    on { print }' "$1"
 }
 
 # Remove one marker block (<!-- id:begin ... --> .. <!-- id:end -->) from stdin.
@@ -261,15 +303,21 @@ _switch_index_codex_atoms() { # <memdir> [user] [home]
   _switch_install_file "$user" "$tmp" "$idx" 644 "$home"; rm -f "$tmp"
 }
 
-# All claude memory index text of a seat, for carrying into AGENTS.md.
-_switch_claude_index_text() { # <name> <out-file>
+# All claude memory index text of a seat, for carrying into AGENTS.md (or, to
+# Grok, the carried block of CLAUDE.md). The codex block is left out going to
+# Codex, which has those facts in its own store; Grok has no other copy of them.
+_switch_claude_index_text() { # <name> <out-file> [to]
   local home d
   home=$(_switch_home "$1")
   : >"$2"
   for d in "$home"/.claude/projects/*/memory; do
     [[ -f "$d/MEMORY.md" ]] || continue
     _switch_no_symlink "$d/MEMORY.md" "$home" || continue
-    _switch_strip_block "$SWITCH_CODEX_MEM_MARKER" <"$d/MEMORY.md" >>"$2"
+    if [[ "${3:-codex}" == codex ]]; then
+      _switch_strip_block "$SWITCH_CODEX_MEM_MARKER" <"$d/MEMORY.md" >>"$2"
+    else
+      cat "$d/MEMORY.md" >>"$2"
+    fi
   done
 }
 
@@ -373,10 +421,10 @@ cmd_agent_switch() {
     shift
   done
   [[ -n "$name" && -n "$to" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent switch <name> --to=claude|codex [--account=<account|default>] [--no-handoff] [--handoff-wait=<seconds>]"
+    || fail "$E_USAGE" "usage: 5dive agent switch <name> --to=claude|codex|grok [--account=<account|default>] [--no-handoff] [--handoff-wait=<seconds>]"
   [[ "$handoff_wait" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--handoff-wait must be a number of seconds"
-  [[ "$to" == claude || "$to" == codex ]] \
-    || fail "$E_VALIDATION" "--to must be claude or codex (got '$to')"
+  _switch_is_type "$to" \
+    || fail "$E_VALIDATION" "--to must be claude, codex or grok (got '$to')"
   ensure_state
   local reg from channels workdir prev_profile isolation
   reg=$(registry_read)
@@ -387,17 +435,21 @@ cmd_agent_switch() {
   workdir=$(jq -r --arg n "$name" '.agents[$n].workdir // empty' <<<"$reg")
   prev_profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
   isolation=$(jq -r --arg n "$name" '.agents[$n].isolation // "standard"' <<<"$reg")
-  [[ "$from" == claude || "$from" == codex ]] \
-    || fail "$E_VALIDATION" "agent '$name' is type $from — switch moves between claude and codex only"
+  _switch_is_type "$from" \
+    || fail "$E_VALIDATION" "agent '$name' is type $from — switch moves between claude, codex and grok only"
   [[ "$from" != "$to" ]] || fail "$E_VALIDATION" "agent '$name' already runs $(_switch_label "$to")"
+  # The owner's own opt-in, the one `agent create --type=grok` refuses without.
+  if [[ "$to" == grok ]] && ! _switch_grok_on; then
+    fail "$E_VALIDATION" "Grok is off on this server: its tool sends your agent's notes and chat turns to xAI after every turn. The server owner can turn it on with: sudo 5dive grok enable"
+  fi
 
   # ---- pre-flight: every refusal below changes nothing ----
   local ch
   for ch in ${channels//,/ }; do
     case "$ch" in
       none|telegram|dashboard) ;;
-      *) [[ "$to" == codex ]] && fail "$E_VALIDATION" \
-           "agent '$name' uses the $ch channel, which Codex does not have — remove it first (5dive agent config $name set channels=…)" ;;
+      *) [[ "$to" != claude ]] && fail "$E_VALIDATION" \
+           "agent '$name' uses the $ch channel, which $(_switch_label "$to") does not have — remove it first (5dive agent config $name set channels=…)" ;;
     esac
   done
   (( account_set )) || account="$prev_profile"
@@ -407,9 +459,7 @@ cmd_agent_switch() {
     [[ -f "${AUTH_PROFILES_DIR}/${account}/combined.env" ]] \
       || fail "$E_NOT_FOUND" "account '$account' is not configured"
   fi
-  local serves
-  serves=$(switch_account_harness "$account")
-  if [[ "$serves" != "$to" && "$serves" != both ]]; then
+  if ! switch_account_serves "$account" "$to"; then
     if (( account_set )); then
       fail "$E_VALIDATION" "account '${account:-default}' has no $(_switch_label "$to") sign-in — sign in first (5dive agent auth start $to --auth-profile=<account>), then pass it with --account="
     fi
@@ -425,6 +475,10 @@ cmd_agent_switch() {
     if [[ "$to" == codex ]]; then
       codex_plugin_dir >/dev/null \
         || fail "$E_NOT_INSTALLED" "the Codex Telegram bridge (telegram-codex) is not deployed on this box"
+    fi
+    if [[ "$to" == grok ]]; then
+      grok_plugin_dir >/dev/null \
+        || fail "$E_NOT_INSTALLED" "the Grok Telegram bridge (telegram-grok) is not deployed on this box"
     fi
   fi
   if [[ ! -x "${TYPE_BIN[$to]}" ]]; then
@@ -485,8 +539,17 @@ _agent_switch_apply() {
     || fail "$E_GENERIC" "no instructions file is known for $from or $to — nothing switched; the unit is stopped, start it with: 5dive agent start $name"
   carry_from="$home/$pf_from"
   carry_to="$home/$pf_to"
+  # Claude <-> Grok: one file serves both, so there is nothing to carry across;
+  # the block is still rewritten (it points at the handoff, and to Grok holds
+  # the memory index), and the text outside it is kept as it is.
+  local carry_src="$carry_from" kept_block=""
+  if [[ "$pf_from" == "$pf_to" ]]; then
+    kept_block=$(mktemp)
+    _switch_no_symlink "$carry_from" "$home" && _switch_block_instructions "$carry_from" >"$kept_block"
+    carry_src="$kept_block"
+  fi
   local -a frags=()
-  if [[ "$from" == claude ]]; then
+  if [[ "$from" == claude || "$from" == grok ]]; then
     frags=("$TELEGRAM_AGENT_CLAUDE_MD" "$MODEL_TIERING_CLAUDE_MD" "$OPERATIONAL_COMMS_CLAUDE_MD")
   fi
 
@@ -519,12 +582,12 @@ _agent_switch_apply() {
     else
       warn "Telegram allowlist NOT merged: an access.json is reached through a symlink"
     fi
-    if [[ "$to" == codex ]] && grep -q '^TELEGRAM_PROFILE=lite' "$home/.claude/channels/telegram/.env" 2>/dev/null; then
-      tg_note="telegram lite profile (Codex's bridge has no lite mode)"
+    if [[ "$to" != claude ]] && grep -q '^TELEGRAM_PROFILE=lite' "$home/.claude/channels/telegram/.env" 2>/dev/null; then
+      tg_note="telegram lite profile ($(_switch_label "$to")'s bridge has no lite mode)"
     fi
   fi
   if channel_in_list dashboard "$channels"; then
-    if [[ "$to" == codex || ! -d "$home/.claude/plugins/cache/5dive-plugins/dashboard" ]]; then
+    if [[ "$to" != claude || ! -d "$home/.claude/plugins/cache/5dive-plugins/dashboard" ]]; then
       install_channel_for_agent "$to" dashboard "$name" ""
     fi
   fi
@@ -539,34 +602,40 @@ _agent_switch_apply() {
     mod_seat_ensure "$name" || warn "the mod guard was NOT seated on $user"
   fi
 
-  # Memory.
-  if [[ "$to" == codex ]]; then
-    memidx=$(mktemp)
-    _switch_claude_index_text "$name" "$memidx"
-    local atoms
-    atoms=$({ find "$home"/.claude/projects/*/memory -maxdepth 1 -name '*.md' ! -name MEMORY.md 2>/dev/null || true; } | wc -l)
-    mem_json=$(jq -cn --argjson n "$atoms" '{direction:"claude->codex", atoms:$n, store:"5dive (memory search)", indexCarried:true}')
-  else
+  # Memory. The atoms live in the 5dive store (~/.claude/projects/*/memory) for
+  # Claude and Grok alike; only Codex keeps its own documents, converted on the
+  # way out of it. Claude loads MEMORY.md itself; Codex and Grok get its index
+  # in the carried block.
+  local atoms
+  if [[ "$from" == codex ]]; then
     local mdir counts _a _u _r _s
     mdir=$(switch_claude_memdir "$name" "$workdir")
     counts=$(switch_codex_memory_to_atoms "$home/.codex/memories" "$mdir" "$user" "$home") \
       || warn "the Codex memory was NOT converted: $mdir is reached through a symlink"
     chown -R "$user:$user" "$home/.claude/projects" 2>/dev/null || true
     read -r _a _u _r _s <<<"$counts"
-    mem_json=$(jq -cn --arg d "$mdir" --argjson a "${_a:-0}" --argjson u "${_u:-0}" --argjson r "${_r:-0}" --argjson s "${_s:-0}" \
-      '{direction:"codex->claude", memdir:$d, added:$a, updated:$u, removed:$r, unchanged:$s}')
+    mem_json=$(jq -cn --arg d "$mdir" --arg dir "codex->$to" --argjson a "${_a:-0}" --argjson u "${_u:-0}" --argjson r "${_r:-0}" --argjson s "${_s:-0}" \
+      '{direction:$dir, memdir:$d, added:$a, updated:$u, removed:$r, unchanged:$s}')
+  else
+    atoms=$({ find "$home"/.claude/projects/*/memory -maxdepth 1 -name '*.md' ! -name MEMORY.md 2>/dev/null || true; } | wc -l)
+    mem_json=$(jq -cn --arg dir "$from->$to" --argjson n "$atoms" --argjson c "$([[ "$to" == claude ]] && echo false || echo true)" \
+      '{direction:$dir, atoms:$n, store:"5dive (memory search)", indexCarried:$c}')
+  fi
+  if [[ "$to" != claude ]]; then
+    memidx=$(mktemp)
+    _switch_claude_index_text "$name" "$memidx" "$to"
   fi
 
   # Instructions, AFTER the channel install (claude's installer writes CLAUDE.md).
   tmpdoc=$(mktemp)
   if _switch_no_symlink "$carry_from" "$home" && _switch_no_symlink "$carry_to" "$home"; then
-    switch_carry_doc "$carry_from" "$carry_to" "$from" "$to" "$memidx" ${frags[@]+"${frags[@]}"} >"$tmpdoc"
+    switch_carry_doc "$carry_src" "$carry_to" "$from" "$to" "$memidx" ${frags[@]+"${frags[@]}"} >"$tmpdoc"
     _switch_install_file "$user" "$tmpdoc" "$carry_to" 644 "$home" \
       || warn "could not write $carry_to"
   else
     warn "instructions NOT carried: $carry_from or $carry_to is reached through a symlink"
   fi
-  rm -f "$tmpdoc" ${memidx:+"$memidx"}
+  rm -f "$tmpdoc" ${memidx:+"$memidx"} ${kept_block:+"$kept_block"}
 
   # ---- 5. registry, env, account ----
   reg=$(registry_read)

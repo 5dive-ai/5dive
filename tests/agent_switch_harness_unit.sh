@@ -338,5 +338,124 @@ w=$(switch_harness_warning Theo claude codex)
 [[ "$w" == "Moving Theo to your ChatGPT plan switches it from Claude Code to Codex. Its memory and instructions are converted; this chat's history is not. You can switch back any time." ]] \
   && ok_t "C2 the warning sentence is the one every surface shows" || bad_t "C2 warning" "$w"
 
+# =========================================================== G: Grok (DIVE-7414)
+# Dude was hired on a Grok login (a new login is the default for new hires,
+# DIVE-7152) and could never move: switch refused every grok seat. Grok reads
+# ~/.claude/CLAUDE.md and its memory is the 5dive store, so Claude <-> Grok
+# shares both files; Codex <-> Grok converts like Codex <-> Claude.
+mkdir -p "$AUTH_PROFILES_DIR/grokacct/grok/.grok"
+: >"$AUTH_PROFILES_DIR/grokacct/combined.env"
+printf '{"access_token":"x"}\n' >"$AUTH_PROFILES_DIR/grokacct/grok/.grok/auth.json"
+export FIVE_GROK_ARM_MARKER="$TMP/grok-unfreeze"; rm -f "$FIVE_GROK_ARM_MARKER"
+grok_plugin_dir() { echo "$TMP/telegram-grok"; }
+TYPE_BIN[grok]=/bin/true
+DH="$SWITCH_HOME_ROOT/agent-dude"; DMEM="$DH/.claude/projects/-home-claude-projects/memory"
+TOKEN_D='7000000002:AAddddddddddddddddddddddddddddddddd'
+LD='Dude signs every reply with a dog emoji — owner-written line LD.'
+mkdir -p "$DH/.grok/channels/telegram" "$DH/.grok/skills/grok-only" "$DMEM"
+printf '# Dude\n\n%s\n' "$LD" >"$DH/.claude/CLAUDE.md"
+printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN_D" >"$DH/.grok/channels/telegram/.env"
+printf '{"dmPolicy":"allowlist","allowFrom":["555"],"groups":{},"pending":{}}\n' >"$DH/.grok/channels/telegram/access.json"
+printf -- '---\nname: dude-ships-fridays\ndescription: "releases go out on Fridays"\nmetadata:\n  type: project\n---\n\nFridays.\n' >"$DMEM/project_dude_ships_fridays.md"
+printf '# Memory Index\n\n- [dude-ships-fridays](project_dude_ships_fridays.md) — releases go out on Fridays\n' >"$DMEM/MEMORY.md"
+REGD=$(jq -c '.agents.dude = {"type":"grok","channels":"telegram","authProfile":"grokacct","isolation":"standard"}' "$TMP/reg")
+printf '%s' "$REGD" >"$TMP/reg"
+blocks() { grep -c '5dive:carried-instructions:begin' "$1"; }
+
+[[ "$(switch_account_types grokacct)" == grok && "$(switch_target_for_account grok claudeacct)" == claude \
+   && "$(switch_target_for_account grok chatgpt)" == codex && "$(switch_target_for_account claude grokacct)" == grok \
+   && "$(switch_target_for_account codex grokacct)" == grok && -z "$(switch_target_for_account grok grokacct)" \
+   && -z "$(switch_account_harness grokacct)" ]] \
+  && ok_t "G0 a Grok account is read as one; a Grok agent on a Claude/ChatGPT account (and back) is a switch; compose's claude/codex answer is unchanged" \
+  || bad_t "G0 grok account kinds" "types=$(switch_account_types grokacct) g->c=$(switch_target_for_account grok claudeacct) c->g=$(switch_target_for_account claude grokacct)"
+snap_reg=$(sha256sum <"$TMP/reg")
+rc=$(run cmd_config dude set auth-profile=claudeacct)
+[[ "$rc" != 0 ]] && grep -q 'switches it from Grok to Claude Code' "$TMP/err" && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" ]] \
+  && ok_t "G1 a plain account move of a Grok agent onto a Claude account is refused with the sentence (RED on main: it binds)" \
+  || bad_t "G1 grok rebind not refused" "rc=$rc err=$(<"$TMP/err")"
+
+# grok -> claude
+: >"$TMP/active"; : >"$TMP/calls"
+rc=$(run agent_account_move_switch config dude set auth-profile=claudeacct --switch-harness)
+[[ "$rc" == 0 && "$(jq -r .agents.dude.type "$TMP/reg")" == claude && "$(jq -r .agents.dude.authProfile "$TMP/reg")" == claudeacct ]] \
+  && grep -q '^AGENT_TYPE=claude$' "$ENV_DIR/dude.env" && [[ -f "$TMP/active" ]] \
+  && ok_t "G2 grok -> claude: the confirmed move (the app's argv) makes Dude a Claude agent on the Claude account and starts it" \
+  || bad_t "G2 grok->claude" "rc=$rc err=$(tail -5 "$TMP/err") reg=$(jq -c .agents.dude "$TMP/reg")"
+grep -q "^channel claude telegram dude $TOKEN_D  555$" "$TMP/calls" \
+  && jq -e '.allowFrom == ["555"]' "$DH/.claude/channels/telegram/access.json" >/dev/null 2>&1 \
+  && grep -q '^preseed dude telegram' "$TMP/calls" \
+  && ok_t "G3 grok -> claude: Claude is preseeded (first time) and its bridge gets the SAME bot token and allowlist" \
+  || bad_t "G3 bridge" "$(cat "$TMP/calls")"
+[[ "$(grep -cF "$LD" "$DH/.claude/CLAUDE.md")" == 1 && "$(blocks "$DH/.claude/CLAUDE.md")" == 1 ]] \
+  && grep -q 'from=grok' "$DH/.claude/CLAUDE.md" && ! grep -q '^## Memory' "$DH/.claude/CLAUDE.md" \
+  && grep -q "$SWITCH_HANDOFF_FILE" "$DH/.claude/CLAUDE.md" \
+  && ok_t "G4 grok -> claude: the shared CLAUDE.md keeps LD exactly once, one block pointing at the handoff, no memory copy (Claude loads MEMORY.md)" \
+  || bad_t "G4 CLAUDE.md" "$(cat "$DH/.claude/CLAUDE.md")"
+[[ -f "$DMEM/project_dude_ships_fridays.md" ]] && jq -e '.data.memory.direction == "grok->claude" and .data.memory.atoms == 1 and .data.from == "grok" and (.data.dropped | index("grok-only"))' "$TMP/out" >/dev/null \
+  && ok_t "G5 grok -> claude: the memory atoms stay where both read them; the result lists the Grok-only skill that did not carry" \
+  || bad_t "G5 memory/result" "$(<"$TMP/out")"
+
+# claude -> grok, owner's switch off, then on
+snap_reg=$(sha256sum <"$TMP/reg"); snap_home=$(find "$DH" -type f -exec sha256sum {} + | sort | sha256sum)
+rc=$(run cmd_agent_switch dude --to=grok --account=grokacct)
+[[ "$rc" != 0 ]] && grep -q 'Grok is off on this server' "$TMP/err" && grep -q 'sudo 5dive grok enable' "$TMP/err" \
+  && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" && "$(find "$DH" -type f -exec sha256sum {} + | sort | sha256sum)" == "$snap_home" ]] \
+  && ok_t "G6 claude -> grok with Grok turned off is refused with the reason and how to turn it on; nothing changes" \
+  || bad_t "G6 unarmed" "rc=$rc err=$(<"$TMP/err")"
+: >"$FIVE_GROK_ARM_MARKER"
+rc=$(run cmd_agent_switch dude --to=grok --account=claudeacct)
+[[ "$rc" != 0 ]] && grep -q 'no Grok sign-in' "$TMP/err" && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" ]] \
+  && ok_t "G7 claude -> grok onto an account with no Grok sign-in is refused, nothing changes" \
+  || bad_t "G7 no grok login" "rc=$rc err=$(<"$TMP/err")"
+: >"$TMP/calls"
+rc=$(run cmd_agent_switch dude --to=grok --account=grokacct)
+[[ "$rc" == 0 && "$(jq -r .agents.dude.type "$TMP/reg")" == grok && "$(jq -r .agents.dude.authProfile "$TMP/reg")" == grokacct ]] \
+  && grep -q "^channel grok telegram dude $TOKEN_D  555$" "$TMP/calls" \
+  && ok_t "G8 claude -> grok (Grok on): Grok agent again, same token on the Grok bridge" \
+  || bad_t "G8 claude->grok" "rc=$rc err=$(tail -5 "$TMP/err") calls=$(cat "$TMP/calls")"
+[[ "$(grep -cF "$LD" "$DH/.claude/CLAUDE.md")" == 1 && "$(blocks "$DH/.claude/CLAUDE.md")" == 1 ]] \
+  && grep -q '^## Memory' "$DH/.claude/CLAUDE.md" && grep -q 'dude-ships-fridays' "$DH/.claude/CLAUDE.md" \
+  && jq -e '.data.memory.indexCarried == true' "$TMP/out" >/dev/null \
+  && ok_t "G9 claude -> grok: LD once, one block, and the memory index is in it (Grok loads no MEMORY.md)" \
+  || bad_t "G9 CLAUDE.md to grok" "$(cat "$DH/.claude/CLAUDE.md")"
+
+# grok -> codex, and codex -> grok
+rc=$(run cmd_agent_switch dude --to=codex --account=chatgpt)
+DAG="$DH/.codex/AGENTS.md"
+[[ "$rc" == 0 && "$(jq -r .agents.dude.type "$TMP/reg")" == codex ]] && grep -qF "$LD" "$DAG" \
+  && grep -q 'dude-ships-fridays' "$DAG" && [[ "$(blocks "$DAG")" == 1 ]] \
+  && [[ "$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$DH/.codex/channels/telegram/.env")" == "$TOKEN_D" ]] \
+  && ok_t "G10 grok -> codex: LD and the memory index carried into AGENTS.md, same bot token" \
+  || bad_t "G10 grok->codex" "rc=$rc err=$(tail -5 "$TMP/err") $(cat "$DAG" 2>/dev/null)"
+printf '\nCodex-era Dude line.\n' >>"$DAG"
+mkdir -p "$DH/.codex/memories"
+printf '# Task Group: invoices\n\n## Reusable knowledge\n\nInvoices close on the 3rd.\n' >"$DH/.codex/memories/MEMORY.md"
+rc=$(run cmd_agent_switch dude --to=grok --account=grokacct)
+[[ "$rc" == 0 && "$(jq -r .agents.dude.type "$TMP/reg")" == grok ]] \
+  && [[ "$(grep -cF "$LD" "$DH/.claude/CLAUDE.md")" == 1 && "$(blocks "$DH/.claude/CLAUDE.md")" == 1 ]] \
+  && grep -q 'Codex-era Dude line' "$DH/.claude/CLAUDE.md" \
+  && ok_t "G11 codex -> grok: what the owner added on Codex is carried into CLAUDE.md, LD once, one block" \
+  || bad_t "G11 codex->grok" "rc=$rc err=$(tail -5 "$TMP/err") $(cat "$DH/.claude/CLAUDE.md")"
+ls "$DMEM"/codex-tg-*invoices*.md >/dev/null 2>&1 && grep -q 'codex-tg-.*invoices' "$DH/.claude/CLAUDE.md" \
+  && jq -e '.data.memory.direction == "codex->grok"' "$TMP/out" >/dev/null \
+  && ok_t "G12 codex -> grok: the Codex memory is converted into atoms and their index reaches Grok" \
+  || bad_t "G12 codex memory to grok" "$(ls "$DMEM") $(<"$TMP/out")"
+rc=$(run cmd_agent_switch dude --to=claude --account=claudeacct)
+[[ "$rc" == 0 ]] && grep -q 'Codex-era Dude line' "$DH/.claude/CLAUDE.md" \
+  && [[ "$(grep -cF "$LD" "$DH/.claude/CLAUDE.md")" == 1 && "$(blocks "$DH/.claude/CLAUDE.md")" == 1 ]] \
+  && ! grep -q '^## Memory' "$DH/.claude/CLAUDE.md" \
+  && ok_t "G13 grok -> claude after a Codex trip keeps the carried Codex-era line (same-file switch does not drop it)" \
+  || bad_t "G13 kept block" "rc=$rc $(cat "$DH/.claude/CLAUDE.md")"
+jq '.agents.dude.channels = "telegram,buzz"' "$TMP/reg" >"$TMP/reg.t" && mv "$TMP/reg.t" "$TMP/reg"
+snap_reg=$(sha256sum <"$TMP/reg")
+rc=$(run cmd_agent_switch dude --to=grok --account=grokacct)
+[[ "$rc" != 0 ]] && grep -q 'buzz channel, which Grok does not have' "$TMP/err" && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" ]] \
+  && ok_t "G14 a channel Grok lacks is refused up front" || bad_t "G14" "rc=$rc err=$(<"$TMP/err")"
+w=$(switch_harness_warning Dude grok claude); w2=$(switch_harness_warning Theo claude grok)
+[[ "$w" == "Moving Dude to your Claude plan switches it from Grok to Claude Code. Its memory and instructions are converted; this chat's history is not. You can switch back any time." \
+   && "$w2" == "Moving Theo to your Grok plan switches it from Claude Code to Grok. Its memory and instructions are converted; this chat's history is not. You can switch back any time." ]] \
+  && ok_t "G15 the sentence names Grok both ways" || bad_t "G15 warning" "$w | $w2"
+unset FIVE_GROK_ARM_MARKER
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
