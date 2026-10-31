@@ -2104,8 +2104,25 @@ install_channel_for_antigravity_agent() {
   local plugin="$1" name="$2" token="$3" allowed_users="${4:-}"
   local user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
-  [[ "$plugin" == "telegram" ]] \
-    || fail "$E_VALIDATION" "antigravity channel plugin unsupported: $plugin (telegram only)"
+  [[ "$plugin" == "telegram" || "$plugin" == "dashboard" ]] \
+    || fail "$E_VALIDATION" "antigravity channel plugin unsupported: $plugin (telegram and dashboard only)"
+  if [[ "$plugin" == "dashboard" ]]; then
+    # DIVE-7351: the web chat. agy spawns the dashboard server from
+    # ~/.gemini/config/mcp_config.json (written at boot by 5dive-agent-start);
+    # that server types each message into agy's pane and agy answers with its
+    # reply tool. No token: it reads the box connectord bearer.
+    dashboard_plugin_dir >/dev/null \
+      || fail "$E_NOT_INSTALLED" \
+         "dashboard plugin not found (looked in /usr/local/lib/5dive/dashboard and the 5dive-plugins checkout). Set DASHBOARD_PLUGIN_DIR or run '5dive self-update'."
+    if ! ensure_bun_for_agent "$user"; then
+      fail "$E_NOT_INSTALLED" \
+        "bun unavailable for $user (required by the dashboard chat) and automatic install failed. Check network access to bun.sh, or install bun to /usr/local/bin manually, then retry."
+    fi
+    step "Preparing dashboard inbox for $user"
+    sudo -u "$user" -H bash -c \
+      'mkdir -p "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now"; chmod 700 "$HOME/.claude" "$HOME/.claude/channels" "$HOME/.claude/channels/dashboard" "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now" 2>/dev/null || true'
+    return 0
+  fi
   [[ -n "$token" ]] || fail "$E_VALIDATION" "antigravity telegram channel requires a bot token"
   if [[ -n "$allowed_users" ]]; then
     valid_telegram_chat_id_list "$allowed_users" \
@@ -2643,10 +2660,10 @@ PI_EXT
 install_channel_for_agent() {
   local type="$1" plugin="$2" name="$3" token="$4" home_channel="${5:-}" allowed_users="${6:-}"
   # Dashboard has native-push support in Claude, a dispatcher adapter in Codex
-  # and a pane bridge in Grok (DIVE-7347). Other runtimes still have no
-  # dashboard transport.
+  # and a pane bridge in Grok (DIVE-7347) and Antigravity (DIVE-7351). Other
+  # runtimes still have no dashboard transport.
   if [[ "$plugin" == "dashboard" ]] && ! type_has_web_chat "$type"; then
-    fail "$E_VALIDATION" "channels=dashboard requires type=claude, codex or grok (agent '$name' is type $type)"
+    fail "$E_VALIDATION" "channels=dashboard requires type=claude, codex, grok or antigravity (agent '$name' is type $type)"
   fi
   # DIVE-2895: same for buzz — it is a claude channel plugin (MCP notification
   # inbound), and the poll-fork runtimes have no Buzz variant. Refuse here so

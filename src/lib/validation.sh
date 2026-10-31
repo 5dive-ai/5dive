@@ -237,10 +237,11 @@ valid_channel() {
 }
 
 # DIVE-7347: the runtimes the web chat (channels=dashboard) can reach — Claude
-# by native push, Codex through its dispatcher, Grok through the dashboard
-# server's pane bridge. The one list every channels=dashboard check reads.
+# by native push, Codex through its dispatcher, Grok and Antigravity (DIVE-7351)
+# through the dashboard server's pane bridge. The one list every
+# channels=dashboard check reads.
 type_has_web_chat() {
-  case "${1:-}" in claude|codex|grok) return 0 ;; *) return 1 ;; esac
+  case "${1:-}" in claude|codex|grok|antigravity) return 0 ;; *) return 1 ;; esac
 }
 
 # True when <channel> appears in the comma-separated channels <list>.

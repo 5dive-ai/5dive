@@ -3742,10 +3742,10 @@ cmd_create() {
     fail "$E_VALIDATION" "type '$type' supports --channels=telegram only (no discord build)"
   fi
   # Dashboard has native-push support in Claude, an app-server dispatcher
-  # adapter in Codex, and a pane bridge in Grok (DIVE-7347). Other runtimes
-  # still have no dashboard transport.
+  # adapter in Codex, and a pane bridge in Grok (DIVE-7347) and Antigravity
+  # (DIVE-7351). Other runtimes still have no dashboard transport.
   if ! type_has_web_chat "$type" && channel_in_list dashboard "$channels"; then
-    fail "$E_VALIDATION" "channels=dashboard requires type=claude, codex or grok (got type=$type)"
+    fail "$E_VALIDATION" "channels=dashboard requires type=claude, codex, grok or antigravity (got type=$type)"
   fi
 
   # DIVE-906: secrets via stdin, never argv. The "-" sentinel on --api-key,
