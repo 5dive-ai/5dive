@@ -86,10 +86,18 @@ run nf "$TMP/nf.md"; rc=$?
 (( rc == 1 )) && ok_t "5dive's own 'command not found' on exit 0 is red" || bad_t "nf rc=$rc"
 
 # --- 3. KNOWN: a failure a row owns is reported with the row, still run nightly ---
-GOAL_FAIL=1 run known README.md --no-model; rc=$?
+# DIVE-7380 emptied the shipped list (its two entries were fixed), so the
+# mechanism is graded on a copy carrying one entry; the shipped script is graded
+# for the other half: with no entry, the same failure is red again.
+sed "s/^KNOWN = {}$/KNOWN = {'goal add': 'DIVE-0'}/" "$R" >"$TMP/known.py"
+grep -q "^KNOWN = {'goal add'" "$TMP/known.py" || bad_t "could not plant a KNOWN entry (KNOWN line moved?)"
+R="$TMP/known.py" GOAL_FAIL=1 run known README.md --no-model; rc=$?
 line=$(jq -r .line "$TMP/known.json")
-(( rc == 0 )) && [[ "$line" == *"1 known-broken (goal add DIVE-7380)"* ]] && grep -q '^goal add ' "$TMP/known.log" \
+(( rc == 0 )) && [[ "$line" == *"1 known-broken (goal add DIVE-0)"* ]] && grep -q '^goal add ' "$TMP/known.log" \
   && ok_t "a KNOWN failure runs, names its row, holds nothing: $line" || bad_t "known rc=$rc" "$line"
+GOAL_FAIL=1 run unknown README.md --no-model; rc=$?
+(( rc == 1 )) && jq -r .line "$TMP/unknown.json" | grep -q '1 failed' \
+  && ok_t "shipped list is empty: a goal add failure is red, not known-broken" || bad_t "goal add failure not red" "rc=$rc $(jq -r .line "$TMP/unknown.json")"
 jq -e '[.commands[] | select(.readme | startswith("5dive goal add"))][0].status == "pass"' "$TMP/good.json" >/dev/null \
   && ok_t "a KNOWN command that passes is a pass" || bad_t "a passing KNOWN command not counted as a pass"
 

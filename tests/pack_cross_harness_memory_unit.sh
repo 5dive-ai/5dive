@@ -474,11 +474,11 @@ fi
 # So the arms below grade the output and the draft dir. An arm that read rc, or
 # that matched the text of the OLD failure, passes on both.
 #
-# Why this fixture cannot assert rc==0: in knowledge mode atoms come only from
-# MEMORY.md's task groups, so `grep -c` returns 0 exactly when the conversion
-# produced 0 atoms — which is always the "nothing shareable" refusal. The
-# guard's no-match branch is UNREACHABLE on a successful export. The rc==0
-# post-condition is therefore graded by arm 10b below, on a store that has one.
+# In knowledge mode atoms come only from MEMORY.md's task groups, so `grep -c`
+# returns 0 exactly when the conversion produced 0 atoms — the "nothing
+# shareable" case. DIVE-7380 made that case export the agent WITHOUT memory
+# (a day-one seat is not an error), so this arm now also grades rc==0 and a
+# pack that says it carries no memory; the draft is still cleaned up.
 EMPTYTG="$TMP/empty-tg"; mkdir -p "$EMPTYTG"
 printf '## Reusable knowledge\n\n- a fact with no task-group heading\n' > "$EMPTYTG/MEMORY.md"
 _pack_memory_kind() { printf 'codex\n'; }
@@ -488,7 +488,7 @@ _pack_memory_dir()  { printf '%s\n' "$EMPTYTG"; }
 # create /home/agent-cx on a real host.
 _pack_draft_dir()   { printf '%s\n' "$TMP/draft-phase"; }
 rm -rf "$TMP/draft-phase"
-out=$( set -e; cmd_export cx --memory=distilled --audience=self 2>&1 ); rc=$?
+out=$( set -e; cmd_export cx --memory=distilled --audience=self -o "$TMP/cx-zero.tar.gz" 2>&1 ); rc=$?
 # (1) the refusal is REACHED and NAMED. Empty output IS the bug: the product
 # died mid-function with nothing on stdout or stderr.
 case "$out" in
@@ -499,6 +499,13 @@ case "$out" in
   *)   bad_t "a zero-task-group codex MEMORY.md refuses OUT LOUD, not silently" \
              "rc=$rc, unexpected: $out" ;;
 esac
+# (1b) DIVE-7380: zero facts exports the agent, and the pack says no memory.
+zmem=$(tar -xzOf "$TMP/cx-zero.tar.gz" ./manifest.json 2>/dev/null | jq -r '.includes.memory' 2>/dev/null)
+if [[ $rc -eq 0 && "$zmem" == "false" ]]; then
+  ok_t "zero shareable facts still exports the agent (rc=0, includes.memory=false)"
+else
+  bad_t "zero shareable facts still exports the agent (rc=0, includes.memory=false)" "rc=$rc memory=[$zmem] out=$out"
+fi
 # (2) the refusal ran its own cleanup. `fail` is preceded by `rm -rf "$draft"`;
 # an abort at the assignment skips it and orphans a half-written draft dir that
 # _pack_atoms_index had already populated.

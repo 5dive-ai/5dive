@@ -2819,6 +2819,7 @@ cmd_export() {
   local mem_src="" mem_tmp=""   # SEAL phase: scoped temp dir of approved memory to pack
   local mem_shape="atoms"       # DIVE-4541: shape of the staged memory bytes
   local mem_kind_staged; mem_kind_staged=$(_pack_memory_kind "$name")
+  local mem_zero=0              # DIVE-7380: --with-memory found 0 shareable facts
   if (( with_memory )); then
     if [[ -z "$approve_memory" ]]; then
       # --- DRAFT phase: scope (L1) + tripwire (L3), write a review draft, STOP.
@@ -2875,39 +2876,49 @@ cmd_export() {
         if [[ "$memory_mode" == "raw" ]]; then
           fail "$E_GENERIC" "agent '$name' has no memory files to export. Nothing written."
         fi
-        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private or opted-out). Only metadata.type 'reference' or 'project' facts are eligible — 'user' and 'feedback' are never exported. Nothing written."
+        # DIVE-7380: ZERO FACTS IS A DAY-ONE AGENT, NOT AN ERROR. The README's
+        # `agent export <name> --with-memory` run on a fresh box's init agent
+        # used to exit 1 here, so a new user's first export was a refusal. There
+        # is nothing to review, so there is no draft to stop at: say why nothing
+        # carried, then export the agent itself — the same config pack a plain
+        # `agent export` writes. The deny-by-default filter is untouched; what
+        # changes is only that an empty result is a pack, not a failure.
+        warn "nothing shareable: 0 reference/project knowledge facts ($excluded private or opted-out). Only metadata.type 'reference' or 'project' facts are eligible — 'user' and 'feedback' are never exported. Exporting the agent without memory."
+        mem_zero=1
       fi
-      # RAW WARNS, DISTILLED REFUSES (lodar, 2026-09-01: "but warn them"). The
-      # scan is identical; only the consequence differs, because a distilled
-      # pack is publishable and a raw one is the operator's own backup that they
-      # have asked for by name. Warning without naming the files would be
-      # atmospheric, so the tripwire's own file:line output is what they see.
-      if [[ "$memory_mode" == "raw" ]]; then
-        if ! _pack_secret_tripwire "$draft"; then
-          warn "RAW EXPORT: the lines above look like credentials, and they WILL be in this file. It is a personal backup — do not publish it, do not paste it, and rotate anything real that appears there."
+      if (( ! mem_zero )); then
+        # RAW WARNS, DISTILLED REFUSES (lodar, 2026-09-01: "but warn them"). The
+        # scan is identical; only the consequence differs, because a distilled
+        # pack is publishable and a raw one is the operator's own backup that they
+        # have asked for by name. Warning without naming the files would be
+        # atmospheric, so the tripwire's own file:line output is what they see.
+        if [[ "$memory_mode" == "raw" ]]; then
+          if ! _pack_secret_tripwire "$draft"; then
+            warn "RAW EXPORT: the lines above look like credentials, and they WILL be in this file. It is a personal backup — do not publish it, do not paste it, and rotate anything real that appears there."
+          fi
+          warn "RAW EXPORT: this carries the agent's memory verbatim — including its private notes about you ('user'/'feedback' facts) and any fact tagged private, none of which a distilled pack contains."
+        elif ! _pack_secret_tripwire "$draft"; then
+          rm -rf "$draft"
+          # DIVE-2679: name the ONE wrong turn this refusal invites. The reporter's next
+          # move was --audience=self, because the usage text presents it as the escape
+          # hatch; it is not one, and finding that out by re-running is a wasted cycle.
+          fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (file:line: rule above) — remove the credential or tag the fact 'private: true' (--audience=self does NOT bypass this)"
         fi
-        warn "RAW EXPORT: this carries the agent's memory verbatim — including its private notes about you ('user'/'feedback' facts) and any fact tagged private, none of which a distilled pack contains."
-      elif ! _pack_secret_tripwire "$draft"; then
-        rm -rf "$draft"
-        # DIVE-2679: name the ONE wrong turn this refusal invites. The reporter's next
-        # move was --audience=self, because the usage text presents it as the escape
-        # hatch; it is not one, and finding that out by re-running is a wasted cycle.
-        fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (file:line: rule above) — remove the credential or tag the fact 'private: true' (--audience=self does NOT bypass this)"
+        # DIVE-2567: the draft exists to be REVIEWED, so here the leak-check REPORTS
+        # rather than refuses — refusing to write the draft would leave the human
+        # nothing to edit. The refusal is at seal time, over the same scan.
+        local leaky=0
+        if [[ "$audience" != "self" ]] && ! _pack_memory_leakscan "$draft" "$name"; then
+          leaky=1
+          warn "the lines above (file:line:category) carry operational detail a PUBLISHED pack must not: distill each one — state the LESSON without the host, name, id or path — or delete it. Sealing REFUSES while any remain (--audience=self exports it unscanned for your own backup)."
+        fi
+        chown -R "agent-${name}:agent-${name}" "/home/agent-${name}/.claude/pack-staging" 2>/dev/null || true
+        ok "memory DRAFT ready for review — kept $kept knowledge fact(s), excluded $excluded private/opted-out (deny-by-default). REVIEW + EDIT: $draft — then SEAL: 5dive agent export $name --approve-memory=$draft. Nothing is packed until you approve." \
+           '{name:$n, phase:"draft", draft:$d, kept:$k, excluded:$e, leakCheck:(if $lk==1 then "hits" elif $a=="self" then "skipped" else "clean" end)}' \
+           --arg n "$name" --arg d "$draft" --argjson k "$kept" --argjson e "$excluded" \
+           --argjson lk "$leaky" --arg a "$audience"
+        return 0
       fi
-      # DIVE-2567: the draft exists to be REVIEWED, so here the leak-check REPORTS
-      # rather than refuses — refusing to write the draft would leave the human
-      # nothing to edit. The refusal is at seal time, over the same scan.
-      local leaky=0
-      if [[ "$audience" != "self" ]] && ! _pack_memory_leakscan "$draft" "$name"; then
-        leaky=1
-        warn "the lines above (file:line:category) carry operational detail a PUBLISHED pack must not: distill each one — state the LESSON without the host, name, id or path — or delete it. Sealing REFUSES while any remain (--audience=self exports it unscanned for your own backup)."
-      fi
-      chown -R "agent-${name}:agent-${name}" "/home/agent-${name}/.claude/pack-staging" 2>/dev/null || true
-      ok "memory DRAFT ready for review — kept $kept knowledge fact(s), excluded $excluded private/opted-out (deny-by-default). REVIEW + EDIT: $draft — then SEAL: 5dive agent export $name --approve-memory=$draft. Nothing is packed until you approve." \
-         '{name:$n, phase:"draft", draft:$d, kept:$k, excluded:$e, leakCheck:(if $lk==1 then "hits" elif $a=="self" then "skipped" else "clean" end)}' \
-         --arg n "$name" --arg d "$draft" --argjson k "$kept" --argjson e "$excluded" \
-         --argjson lk "$leaky" --arg a "$audience"
-      return 0
     else
       # --- SEAL phase: the human reviewed/edited this dir; re-validate + pack it.
       # CRITICAL: re-apply deny-by-default scoping here too, so the type-gate holds
@@ -3140,6 +3151,10 @@ cmd_export() {
     ok "exported '$name' (with distilled persona memory) -> $out" \
        '{name:$n, pack:$o, withMemory:true, memory:$m, skills:$s}' \
        --arg n "$name" --arg o "$out" --arg m "$mem_inc" --argjson s "$skills"
+  elif (( mem_zero )); then
+    ok "exported '$name' (0 memory facts carried — none shareable yet) -> $out" \
+       '{name:$n, pack:$o, withMemory:false, memoryFacts:0, skills:$s}' \
+       --arg n "$name" --arg o "$out" --argjson s "$skills"
   else
     ok "exported '$name' (config pack, no memory) -> $out" \
        '{name:$n, pack:$o, withMemory:false, skills:$s}' \
