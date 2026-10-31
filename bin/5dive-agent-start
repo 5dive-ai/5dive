@@ -1344,11 +1344,12 @@ fi
 #      server.ts path (${AGY_PLUGIN_DIR}/server.ts); ${CLAUDE_PLUGIN_ROOT} in
 #      the plugin's own mcp_config.json isn't expanded for a globally-wired
 #      server, so we write the absolute path here.
-#   2. ~/.gemini/config/hooks.json → PreToolUse/Stop/Notification hooks with
-#      absolute `bun <plugin>/hooks/*.ts` commands (same absolute-path lesson as
-#      grok). silence-watchdog stays opt-in via AGY_SILENCE_WATCHDOG_ENABLED=1.
-# Both files are create-only (idempotent): we don't clobber a config the user
-# may have edited — skipped when the telegram MCP server is already present.
+#   2. ~/.gemini/config/hooks.json → one NAMED hook, "5dive-telegram", with
+#      PreToolUse/Stop handlers as absolute `bun <plugin>/hooks/*.ts` commands
+#      (same absolute-path lesson as grok). silence-watchdog stays opt-in via
+#      AGY_SILENCE_WATCHDOG_ENABLED=1.
+# mcp_config.json is create-only: we don't clobber a config the user may have
+# edited. hooks.json is kept in step on every boot, but only our named hook.
 if [[ "$TYPE" == "antigravity" ]] && [[ ",${CHANNELS}," == *,telegram,* ]]; then
   AGY_CONFIG_DIR="$HOME/.gemini/config"
   install -d -m 700 "$HOME/.gemini" "$AGY_CONFIG_DIR"
@@ -1397,36 +1398,36 @@ MCPJSON
       fi
     fi
 
+    # agy reads hooks.json as NAMED hooks: each top-level key is a hook name
+    # holding its events, and Stop takes a flat list of handlers, not Claude
+    # Code's {"hooks":[...]} groups (agy 1.4.12's own hooks doc). The Claude
+    # Code shape this block wrote until DIVE-7427 loads as one hook named
+    # "hooks", fails "command hook must specify 'command'", and agy skips the
+    # WHOLE file, so no turn-complete ping and no error relay ever fired.
+    # We own the "5dive-telegram" key only. It is rewritten on every boot when
+    # it differs from what this box wants, so an old file heals and a moved
+    # plugin dir follows. Other named hooks survive. A top-level "hooks" key is
+    # dropped: agy cannot parse it, and while it is there no hook in the file runs.
+    # agy has no Notification event, so the error relay rides Stop, whose
+    # payload names terminationReason. Only once the staged relay reads that
+    # payload, though: an older relay would post every turn's payload as an error.
     AGY_HOOKS="$AGY_CONFIG_DIR/hooks.json"
-    if [[ ! -s "$AGY_HOOKS" ]] || ! grep -q 'notify-stop.ts' "$AGY_HOOKS" 2>/dev/null; then
+    AGY_RELAY=false
+    grep -q 'terminationReason' "$AGY_PLUGIN_DIR/hooks/notification-relay.ts" 2>/dev/null && AGY_RELAY=true
+    AGY_HOOK=$(jq -cn --arg dir "$AGY_PLUGIN_DIR" --argjson relay "$AGY_RELAY" '{
+      PreToolUse: [{matcher: "*", hooks: [
+        {type: "command", command: "bun \($dir)/hooks/silence-watchdog.ts", timeout: 5}]}],
+      Stop: ([{type: "command", command: "bun \($dir)/hooks/notify-stop.ts", timeout: 10}]
+        + if $relay then [{type: "command", command: "bun \($dir)/hooks/notification-relay.ts", timeout: 10}] else [] end)
+    }' 2>/dev/null)
+    if [[ -n "$AGY_HOOK" ]] && ! jq -e --argjson want "$AGY_HOOK" \
+         '.["5dive-telegram"] == $want and (has("hooks") | not)' "$AGY_HOOKS" >/dev/null 2>&1; then
       HOOKS_TMP=$(mktemp -p "$AGY_CONFIG_DIR" .hooks.json.XXXXXX)
-      cat > "$HOOKS_TMP" <<HOOKSJSON
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "hooks": [
-          { "type": "command", "command": "bun ${AGY_PLUGIN_DIR}/hooks/silence-watchdog.ts", "timeout": 5 }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          { "type": "command", "command": "bun ${AGY_PLUGIN_DIR}/hooks/notify-stop.ts", "timeout": 10 }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "hooks": [
-          { "type": "command", "command": "bun ${AGY_PLUGIN_DIR}/hooks/notification-relay.ts", "timeout": 10 }
-        ]
-      }
-    ]
-  }
-}
-HOOKSJSON
+      # Merge into the existing file; a missing or unparseable one starts fresh.
+      jq --argjson want "$AGY_HOOK" \
+         '(if type == "object" then . else {} end) | del(.hooks) | .["5dive-telegram"] = $want' \
+         "$AGY_HOOKS" > "$HOOKS_TMP" 2>/dev/null && [[ -s "$HOOKS_TMP" ]] \
+        || jq -n --argjson want "$AGY_HOOK" '{"5dive-telegram": $want}' > "$HOOKS_TMP"
       chmod 600 "$HOOKS_TMP"; mv "$HOOKS_TMP" "$AGY_HOOKS"
     fi
   else
