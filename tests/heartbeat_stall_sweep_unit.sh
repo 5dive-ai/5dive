@@ -551,6 +551,40 @@ _hb_stall_sweep >/dev/null 2>&1
   && ok_t "recent fleet-wide gate_pinged_at -> pinger looks alive, canary does not trip" \
   || bad_t "canary false-tripped while pinger is alive" "$(cat "$SEND_LOG")"
 
+# --- C5 (DIVE-7384): an UNDELIVERABLE gate inside the batch's 24h back-off is not
+#     evidence of a dead batch. The batch stamped gate_renag_failed_at 1h ago and
+#     is deliberately skipping it (DIVE-4911); nothing else was pinged in 2h.
+#     Pre-fix this tripped "batch looks dead" ~4x/day on teal-fox (70 trips).
+reset_all
+g=$(addt --assignee=dev -- "undeliverable gate, batch backing off")
+db "UPDATE tasks SET status='blocked', need_type='manual', tier=2,
+       need_asked_at=datetime('now','-4 days'), gate_pinged_at=NULL,
+       gate_renag_failed_at=datetime('now','-1 hour'), gate_renag_failed_via='filer'
+     WHERE id=${g};"
+other=$(addt --assignee=dev -- "a gate pinged long ago")
+db "UPDATE tasks SET status='blocked', need_type='approval', tier=2,
+       need_asked_at=datetime('now','-10 days'), gate_pinged_at=datetime('now','-2 hours'),
+       need_answered_at=datetime('now','-1 hour')
+     WHERE id=${other};"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
+_hb_stall_sweep >/dev/null 2>&1
+! grep -q 'pinger-liveness canary tripped' "$SEND_LOG" \
+  && [[ -z "$(db "SELECT value FROM task_prefs WHERE key='pinger_canary_alerted_at';")" ]] \
+  && ok_t "C5 undeliverable gate inside its 24h back-off -> canary does not trip" \
+  || bad_t "C5 canary tripped on a gate the batch is deliberately backing off" "$(cat "$SEND_LOG")"
+
+# --- C6 (DIVE-7384): NEGATIVE CONTROL — same gate, stamp 26h old. The batch should
+#     have re-tried and re-stamped by now; it did not, so it may be dead -> trip.
+#     This is why the clause is a WINDOW, not `gate_renag_failed_at IS NULL`.
+#     The throttle stamp is cleared so this arm grades the predicate alone, not C5's outcome.
+db "UPDATE tasks SET gate_renag_failed_at=datetime('now','-26 hours') WHERE id=${g};"
+db "DELETE FROM task_prefs WHERE key='pinger_canary_alerted_at';"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
+_hb_stall_sweep >/dev/null 2>&1
+grep -q $'^ops\t.*pinger-liveness canary tripped' "$SEND_LOG" \
+  && ok_t "C6 NEGATIVE CONTROL: back-off stamp 26h old (not re-stamped) -> canary trips" \
+  || bad_t "C6 canary blind to a dead batch when the only stale gate is undeliverable" "$(cat "$SEND_LOG")"
+
 
 # =============================================================================
 # (d) DIVE-2122 — the alarm must MEASURE idleness, not infer it from a proxy
