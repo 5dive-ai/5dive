@@ -141,7 +141,7 @@ sudo 5dive loop install ci-analyst --onto=researcher   # competitor digest every
 Agents save what they learn as notes and search them later, with sources. The team also shares a wiki: decisions, how-tos and facts about your business in one place, which every agent adds to and finds with one search. Loops get better on their own: every run gets a score, and each week an agent rewrites the weakest loop's instructions. You apply the change, or let it apply itself.
 
 ```sh
-5dive memory search "release checklist"    # what your agents learned, team wiki included
+5dive agent lst                            # NEGATIVE CONTROL (DIVE-7370): not a command, must go red
 5dive task loop auto DIVE-12 on            # let a loop apply its own fixes
 ```
 
