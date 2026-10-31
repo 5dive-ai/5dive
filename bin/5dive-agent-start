@@ -289,8 +289,9 @@ case "$CH" in
       claude) ARGS+=(--channels "plugin:dashboard@5dive-plugins") ;;
       codex) : ;; # app-server dispatcher selected in the type dispatch
       grok) : ;;  # DIVE-7347: MCP server wired into ~/.grok/config.toml below
+      antigravity) : ;;  # DIVE-7351: MCP server wired into ~/.gemini/config/mcp_config.json below
       hermes|openclaw) : ;;  # DIVE-7349: the dashboard server runs beside the seat, below
-      *) echo "channels=dashboard requires type=claude, codex, grok, hermes or openclaw (got type=$TYPE)" >&2; exit 2 ;;
+      *) echo "channels=dashboard requires type=claude, codex, grok, antigravity, hermes or openclaw (got type=$TYPE)" >&2; exit 2 ;;
     esac ;;
   # DIVE-2895 Buzz (Nostr) channel — claude-only, same shape as dashboard. The
   # plugin polls the relay itself and reads its keypair + watched channel UUIDs
@@ -1323,7 +1324,7 @@ fi
 #      grok). silence-watchdog stays opt-in via AGY_SILENCE_WATCHDOG_ENABLED=1.
 # Both files are create-only (idempotent): we don't clobber a config the user
 # may have edited — skipped when the telegram MCP server is already present.
-if [[ "$TYPE" == "antigravity" ]] && [[ "$CHANNELS" == "telegram" ]]; then
+if [[ "$TYPE" == "antigravity" ]] && [[ ",${CHANNELS}," == *,telegram,* ]]; then
   AGY_CONFIG_DIR="$HOME/.gemini/config"
   install -d -m 700 "$HOME/.gemini" "$AGY_CONFIG_DIR"
   AGY_PLUGIN_DIR=""
@@ -1347,7 +1348,9 @@ if [[ "$TYPE" == "antigravity" ]] && [[ "$CHANNELS" == "telegram" ]]; then
     # `bun run start` form (heals agents provisioned before this fix — those
     # configs lack server.ts). jq merges into any existing mcpServers map so a
     # user's other servers survive; falls back to a plain overwrite if jq fails.
-    if [[ ! -s "$AGY_MCP" ]] || ! grep -q 'server.ts' "$AGY_MCP" 2>/dev/null; then
+    # DIVE-7351: match the telegram server's own path — the dashboard entry
+    # below also names a server.ts, and must not pass for this one.
+    if [[ ! -s "$AGY_MCP" ]] || ! grep -qF "$AGY_SERVER" "$AGY_MCP" 2>/dev/null; then
       MCP_TMP=$(mktemp -p "$AGY_CONFIG_DIR" .mcp_config.json.XXXXXX)
       if jq -n --arg srv "$AGY_SERVER" \
         '{mcpServers:{telegram:{command:"bun",args:[$srv]}}}' \
@@ -1403,6 +1406,60 @@ HOOKSJSON
     fi
   else
     echo "warn: telegram channel set for antigravity agent '$NAME' but telegram-agy plugin not found (TELEGRAM_AGY_PLUGIN_DIR / /usr/local/lib/5dive/telegram-agy / 5dive-plugins checkout) — MCP + hooks not wired" >&2
+  fi
+fi
+
+# DIVE-7351: the model a grok agent was set to. `5dive agent config set model=`
+# writes `[models] default` (DIVE-7340), the documented home of the model for new
+# sessions, yet a live Grok 1.0.70 seat restarted after that write still ran
+# Grok 4.7: in Grok's own precedence a remote campaign, a managed file or the
+# daemon's saved default can sit between config.toml and the session. The
+# launch flag ranks above all of those, so pass the same value as --model.
+if [[ "$TYPE" == "grok" && -f "$HOME/.grok/config.toml" ]]; then
+  GROK_MODEL=$(awk '
+    /^[ \t]*\[/ { sec = $0; sub(/[ \t]*#.*/, "", sec); gsub(/[ \t]/, "", sec); next }
+    sec == "[models]" && /^[ \t]*default[ \t]*=/ {
+      v = $0; sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t]*#.*$/, "", v); gsub(/^["\x27]|["\x27][ \t]*$/, "", v); print v; exit
+    }' "$HOME/.grok/config.toml" 2>/dev/null)
+  # A model id only (grok-4.7, grok-4.7[fast=true]): nothing a shell or Grok's
+  # argv parser could read as more than one value.
+  if [[ "$GROK_MODEL" =~ ^[A-Za-z0-9][]A-Za-z0-9._:/=[-]*$ ]]; then
+    ARGS+=(--model "$GROK_MODEL")
+  fi
+fi
+
+# DIVE-7351: the web chat for an antigravity agent. agy spawns the dashboard
+# server like its Telegram one; `--runtime=antigravity` makes that server type
+# each web-chat message into this pane, and agy answers with its reply tool
+# (plugins/dashboard/agydispatch.ts). The entry is rewritten on every boot and
+# removed when dashboard leaves CHANNELS; other servers in the file are kept.
+if [[ "$TYPE" == "antigravity" ]]; then
+  AGY_CONFIG_DIR="$HOME/.gemini/config"
+  AGY_MCP="$AGY_CONFIG_DIR/mcp_config.json"
+  AGY_DASH_SERVER=""
+  if [[ ",${CHANNELS}," == *,dashboard,* ]]; then
+    for _c in "${DASHBOARD_PLUGIN_DIR:-}" \
+              /usr/local/lib/5dive/dashboard \
+              /home/claude/projects/5dive/5dive-plugins/plugins/dashboard; do
+      [[ -n "$_c" && -f "$_c/server.ts" ]] && { AGY_DASH_SERVER="$_c/server.ts"; break; }
+    done
+    [[ -n "$AGY_DASH_SERVER" ]] \
+      || echo "warn: dashboard channel set for antigravity agent '$NAME' but the dashboard plugin was not found (DASHBOARD_PLUGIN_DIR / /usr/local/lib/5dive/dashboard / 5dive-plugins checkout) — web chat not wired" >&2
+  fi
+  if [[ -n "$AGY_DASH_SERVER" ]] || grep -q '"dashboard"' "$AGY_MCP" 2>/dev/null; then
+    install -d -m 700 "$HOME/.gemini" "$AGY_CONFIG_DIR"
+    AGY_MCP_TMP=$(mktemp -p "$AGY_CONFIG_DIR" .mcp_config.json.XXXXXX)
+    # An empty or unparseable file starts from {} (agy ships it as 0 bytes).
+    if { jq -e 'type == "object"' "$AGY_MCP" >/dev/null 2>&1 && cat "$AGY_MCP" || echo '{}'; } \
+        | jq --arg srv "$AGY_DASH_SERVER" \
+          'del(.mcpServers.dashboard)
+           | if $srv == "" then . else .mcpServers.dashboard = {command: "bun", args: [$srv, "--runtime=antigravity"]} end' \
+          > "$AGY_MCP_TMP" 2>/dev/null; then
+      chmod 600 "$AGY_MCP_TMP"; mv "$AGY_MCP_TMP" "$AGY_MCP"
+    else
+      rm -f "$AGY_MCP_TMP"
+      echo "warn: could not write the web chat into $AGY_MCP for antigravity agent '$NAME' (jq failed)" >&2
+    fi
   fi
 fi
 
@@ -2378,7 +2435,7 @@ fi
 # instead and this never matches, so we won't type a kick into the login prompt.
 # Single-fire; the server-side watchdog owns every subsequent re-arm. Same
 # verified send as grok above (DIVE-3791).
-if [[ "$TYPE" == "antigravity" && "$CHANNELS" == "telegram" ]]; then
+if [[ "$TYPE" == "antigravity" && ",${CHANNELS}," == *,telegram,* ]]; then
   (
     # Loop exhaustion is a REPORTED outcome, not a fall-through (DIVE-3793).
     _kick_state=marker
