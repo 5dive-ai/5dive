@@ -35,7 +35,7 @@ recipe="${TYPE_INSTALL[hermes]}"
   && ok_t "the installer checks out the pinned tree" || bad_t "the tree is not pinned" "$recipe"
 [[ "$recipe" != *"hermes-agent.nousresearch.com/install.sh"* ]] \
   && ok_t "no unpinned upstream installer" || bad_t "the unpinned installer is still used" "$recipe"
-[[ "$recipe" == "[[ -x ${TYPE_BIN[hermes]} ]] ||"* ]] \
+[[ "$recipe" == "{ [[ -x ${TYPE_BIN[hermes]} ]] ||"* ]] \
   && ok_t "the recipe still skips an installed hermes" || bad_t "the idempotence guard moved" "$recipe"
 
 # --- 2. the key goes in once, from the pipe, on a real terminal ---------------

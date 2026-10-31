@@ -14,8 +14,9 @@
 # the type pick sits behind the agent tool's own install, so it gets more.
 #
 # init that stops at a prompt no step expects (hermes asking for the key a
-# second time, DIVE-7330) times out on the next step's wait, and the result
-# names the last line init printed. The key never reaches the log.
+# second time, DIVE-7330) fails as soon as it has sat QUIET_SECS on a line that
+# reads as a question (DIVE-7355: Hermes's "[Y/n]" cost 1500s a cell), and the
+# result names that line. The key never reaches the log.
 import json, os, pty, re, select, sys, time
 
 steps_path, log_path, result_path = sys.argv[1:4]
@@ -51,11 +52,16 @@ if pid == 0:
 
 buf = ''
 seen = ''
+fresh = ''  # printed since the last answer: an answered prompt is not stuck
+last_out = time.time()
+QUIET_SECS = int(os.environ.get('INIT_SMOKE_QUIET_SECS', '90'))
+# The unfinished last line of a prompt: "[Y/n]", "(y/N)", or ending in "?" / ":".
+PROMPT_RE = re.compile(r'(\[[YyNn]/[YyNn]\]|\([YyNn]/[YyNn]\)|[?:])\s*$')
 
 
 def pump(t):
     """Read what init printed; False once the pty is closed (init exited)."""
-    global buf, seen
+    global buf, seen, fresh, last_out
     r, _, _ = select.select([fd], [], [], t)
     if not r:
         return True
@@ -67,6 +73,8 @@ def pump(t):
         return False
     buf += d
     seen = (seen + d)[-20000:]
+    fresh = (fresh + d)[-20000:]
+    last_out = time.time()
     log.write(redact(d))
     log.flush()
     return True
@@ -75,6 +83,14 @@ def pump(t):
 def last_line():
     lines = [l.strip() for l in re.split(r'[\r\n]+', seen) if l.strip()]
     return redact(lines[-1])[:300] if lines else '(init printed nothing)'
+
+
+def stuck_prompt():
+    """The question init has sat on for QUIET_SECS with no newline after it, else None."""
+    if time.time() - last_out < QUIET_SECS or not fresh or fresh.endswith(('\n', '\r')):
+        return None
+    tail = redact(re.split(r'[\r\n]', fresh)[-1].strip())
+    return tail[:300] if tail and PROMPT_RE.search(tail) else None
 
 
 EXIT = None
@@ -103,6 +119,9 @@ for i, st in enumerate(steps):
             break
         if not pump(1):
             break
+        q = stuck_prompt()
+        if q:
+            finish(False, f'init stopped at a question no step answers (quiet {QUIET_SECS}s, waiting for {pat!r}): {q}')
     if not m:
         rc = reap()
         if rc is not None:
@@ -110,6 +129,7 @@ for i, st in enumerate(steps):
         finish(False, f'init never asked {pat!r} (waited {st.get("secs", 300)}s); its last line: {last_line()}')
     shown = m.group(0)
     buf = buf[m.end():]
+    fresh = buf
     time.sleep(0.3)
     if 'pick' in st:
         n = None
@@ -139,6 +159,10 @@ while time.time() < end and pump(1):
     rc = reap()
     if rc is not None:
         break
+    q = stuck_prompt()
+    if q:
+        os.kill(pid, 15)
+        finish(False, f'init stopped at a question no step answers (quiet {QUIET_SECS}s, after the last answer): {q}')
 rc = reap()
 if rc is None:
     if time.time() >= end:
