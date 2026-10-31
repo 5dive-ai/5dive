@@ -3748,8 +3748,8 @@ cmd_create() {
     fail "$E_VALIDATION" "type '$type' supports --channels=telegram only (no discord build)"
   fi
   # Dashboard has native-push support in Claude, an app-server dispatcher
-  # adapter in Codex, a pane bridge in Grok (DIVE-7347) and a spool bridge in
-  # Hermes and OpenClaw (DIVE-7349). Other runtimes still have no dashboard
+  # adapter in Codex, a pane bridge in Grok (DIVE-7347) and Antigravity
+  # (DIVE-7351), and a spool bridge in Hermes and OpenClaw (DIVE-7349). Other runtimes still have no dashboard
   # transport.
   if ! type_has_web_chat "$type" && channel_in_list dashboard "$channels"; then
     fail "$E_VALIDATION" "channels=dashboard requires type=$(web_chat_types_text) (got type=$type)"

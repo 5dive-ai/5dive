@@ -138,6 +138,10 @@ kick_block_pattern() { # <type>
     grok)
       printf '%s\n' '^if \[\[ "\$TYPE" == "grok" && \( ",\$\{CHANNELS\}," == \*,telegram,\* \|\| ",\$\{CHANNELS\}," == \*,dashboard,\* \) \]\]; then$'
       ;;
+    # DIVE-7351: an antigravity seat with Telegram AND the web chat keeps its kick.
+    antigravity)
+      printf '%s\n' '^if \[\[ "\$TYPE" == "antigravity" && ",\$\{CHANNELS\}," == \*,telegram,\* \]\]; then$'
+      ;;
     *)
       printf '%s\n' '^if \[\[ "\$TYPE" == "'"$1"'" && "\$CHANNELS" == "telegram" \]\]; then$'
       ;;
